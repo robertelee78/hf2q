@@ -35,10 +35,14 @@
 
 use std::collections::HashMap;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
+use super::cache::{
+    cache_file_path, load_dwq_from_path, save_dwq_to_path, SensitivityCacheKey,
+    SENSITIVITY_ALGORITHM_VERSION,
+};
 use super::calibrator::{
-    CalibrationCorpus, CalibrationData, CalibrationError, Calibrator,
+    corpus_sha, model_fingerprint, CalibrationCorpus, CalibrationData, CalibrationError, Calibrator,
 };
 use super::dwq::{DwqArch, DwqConfig};
 use super::dwq_activation::capture_activations_to_sensitive_ranges;
@@ -149,7 +153,7 @@ impl Calibrator for DwqCalibrator {
 
     fn calibrate(
         &mut self,
-        _model: &LazyTensorMap,
+        model: &LazyTensorMap,
         meta: &ModelMetadata,
         corpus: &CalibrationCorpus,
         progress: &ProgressReporter,
@@ -172,11 +176,12 @@ impl Calibrator for DwqCalibrator {
         // ─────────── No-fallback guard ───────────
         // arch.requires_activation_capture() == true → capture MUST
         // be Some(...). Bail with a typed error otherwise.
-        let capture = self.capture.as_mut().ok_or_else(|| {
-            CalibrationError::ForwardPassUnavailable {
-                arch: format!("{:?}", self.arch),
-            }
-        })?;
+        let capture =
+            self.capture
+                .as_mut()
+                .ok_or_else(|| CalibrationError::ForwardPassUnavailable {
+                    arch: format!("{:?}", self.arch),
+                })?;
 
         // The corpus is informational for DWQ — calibration tokens
         // are derived from `meta.vocab_size` inside
@@ -186,6 +191,51 @@ impl Calibrator for DwqCalibrator {
         // misuse early).
         if corpus.is_empty() {
             return Err(CalibrationError::EmptyCorpus);
+        }
+
+        let cache_key = SensitivityCacheKey::with_algorithm_version(
+            model_fingerprint(model, meta),
+            corpus_sha(corpus),
+            SENSITIVITY_ALGORITHM_VERSION,
+        );
+        let cache_path = match cache_file_path(&cache_key) {
+            Ok(path) => Some(path),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "dwq sensitivity cache path unavailable; running forward pass"
+                );
+                None
+            }
+        };
+
+        if let Some(path) = cache_path.as_deref() {
+            match load_dwq_from_path(path, &cache_key) {
+                Ok(Some(map)) => {
+                    info!(
+                        cache_key = %cache_key.hash(),
+                        path = %path.display(),
+                        entries = map.len(),
+                        "dwq sensitivity cache HIT"
+                    );
+                    return Ok(CalibrationData::Dwq(map));
+                }
+                Ok(None) => {
+                    info!(
+                        cache_key = %cache_key.hash(),
+                        path = %path.display(),
+                        "dwq sensitivity cache MISS"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        cache_key = %cache_key.hash(),
+                        path = %path.display(),
+                        "dwq sensitivity cache MISS; load failed, recomputing"
+                    );
+                }
+            }
         }
 
         let pb = progress.bar(meta.num_layers as u64, "DWQ activation capture");
@@ -207,14 +257,12 @@ impl Calibrator for DwqCalibrator {
             ..DwqConfig::default()
         };
 
-        let sensitive_ranges = capture_activations_to_sensitive_ranges(
-            meta,
-            &dwq_config,
-            capture.as_mut(),
-        )
-        .map_err(|e| CalibrationError::Other {
-            message: format!("dwq activation capture failed: {e}"),
-        })?;
+        let sensitive_ranges =
+            capture_activations_to_sensitive_ranges(meta, &dwq_config, capture.as_mut()).map_err(
+                |e| CalibrationError::Other {
+                    message: format!("dwq activation capture failed: {e}"),
+                },
+            )?;
 
         // Flatten the range list into a per-layer flag (1.0 sensitive,
         // 0.0 base) for the downstream `Dwq` map shape.
@@ -246,6 +294,17 @@ impl Calibrator for DwqCalibrator {
             "dwq sensitivity flags populated"
         );
 
+        if let Some(path) = cache_path.as_deref() {
+            if let Err(err) = save_dwq_to_path(path, &cache_key, &map) {
+                warn!(
+                    error = %err,
+                    cache_key = %cache_key.hash(),
+                    path = %path.display(),
+                    "dwq sensitivity cache save failed; calibration result will still be returned"
+                );
+            }
+        }
+
         Ok(CalibrationData::Dwq(map))
     }
 }
@@ -253,7 +312,66 @@ impl Calibrator for DwqCalibrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::models::qwen35::activation_capture::MockActivationCapture;
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use crate::calibrate::cache::{
+        cache_file_path, save_dwq_to_path, SensitivityCacheKey, SENSITIVITY_ALGORITHM_VERSION,
+    };
+    use crate::calibrate::calibrator::{corpus_sha, model_fingerprint};
+    use crate::inference::models::qwen35::activation_capture::{
+        LayerActivations, MockActivationCapture,
+    };
+    use crate::ir::lazy::LazyTensorMap;
+    use crate::ir::ModelMetadata;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, path: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, path);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    struct CountingMockActivationCapture {
+        inner: MockActivationCapture,
+        counter: Arc<AtomicUsize>,
+    }
+
+    impl CountingMockActivationCapture {
+        fn new(num_layers: u32, hidden_size: u32, counter: Arc<AtomicUsize>) -> Self {
+            Self {
+                inner: MockActivationCapture::new(num_layers, hidden_size),
+                counter,
+            }
+        }
+    }
+
+    impl ActivationCapture for CountingMockActivationCapture {
+        fn run_calibration_prompt(&mut self, tokens: &[u32]) -> anyhow::Result<LayerActivations> {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+            self.inner.run_calibration_prompt(tokens)
+        }
+    }
 
     fn dummy_metadata(num_layers: u32, hidden_size: u32) -> ModelMetadata {
         ModelMetadata {
@@ -298,6 +416,18 @@ mod tests {
             chunks: vec![vec![1u32, 2, 3, 4]],
             name: "test".into(),
         }
+    }
+
+    fn dwq_cache_key(
+        model: &LazyTensorMap,
+        meta: &ModelMetadata,
+        corpus: &CalibrationCorpus,
+    ) -> SensitivityCacheKey {
+        SensitivityCacheKey::with_algorithm_version(
+            model_fingerprint(model, meta),
+            corpus_sha(corpus),
+            SENSITIVITY_ALGORITHM_VERSION,
+        )
     }
 
     /// `name() == "dwq"` — the dispatch key.
@@ -355,7 +485,10 @@ mod tests {
         let err2 = calib_dense
             .calibrate(&lazy_map, &meta, &corpus, &progress)
             .expect_err("Qwen35Dense without capture must error");
-        assert!(matches!(err2, CalibrationError::ForwardPassUnavailable { .. }));
+        assert!(matches!(
+            err2,
+            CalibrationError::ForwardPassUnavailable { .. }
+        ));
     }
 
     /// `DwqArch::Other` returns `Ok(CalibrationData::Dwq(empty))` —
@@ -402,8 +535,7 @@ mod tests {
         let hidden_size = 8u32;
         let capture: Box<dyn ActivationCapture + Send + Sync> =
             Box::new(MockActivationCapture::new(num_layers, hidden_size));
-        let mut calib =
-            DwqCalibrator::new(DwqArch::Qwen35MoE, Some(capture), 4, 6, 16);
+        let mut calib = DwqCalibrator::new(DwqArch::Qwen35MoE, Some(capture), 4, 6, 16);
         let lazy_map = LazyTensorMap::new();
         let meta = dummy_metadata(num_layers, hidden_size);
         let progress = ProgressReporter::new();
@@ -453,6 +585,149 @@ mod tests {
             sensitive_count <= num_layers as usize,
             "sensitive_count {sensitive_count} must not exceed num_layers"
         );
+    }
+
+    #[test]
+    fn dwq_cache_hit_skips_forward_pass_same_key() {
+        let _lock = crate::calibrate::test_support::CACHE_ENV_LOCK
+            .lock()
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set_path("XDG_CACHE_HOME", tmp.path());
+
+        let num_layers = 4u32;
+        let hidden_size = 8u32;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let lazy_map = LazyTensorMap::new();
+        let meta = dummy_metadata(num_layers, hidden_size);
+        let progress = ProgressReporter::new();
+        let corpus = nonempty_corpus();
+
+        let capture1: Box<dyn ActivationCapture + Send + Sync> = Box::new(
+            CountingMockActivationCapture::new(num_layers, hidden_size, Arc::clone(&counter)),
+        );
+        let mut calib1 = DwqCalibrator::new(DwqArch::Qwen35MoE, Some(capture1), 4, 6, 16);
+        let first = calib1
+            .calibrate(&lazy_map, &meta, &corpus, &progress)
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let capture2: Box<dyn ActivationCapture + Send + Sync> = Box::new(
+            CountingMockActivationCapture::new(num_layers, hidden_size, Arc::clone(&counter)),
+        );
+        let mut calib2 = DwqCalibrator::new(DwqArch::Qwen35MoE, Some(capture2), 4, 6, 16);
+        let second = calib2
+            .calibrate(&lazy_map, &meta, &corpus, &progress)
+            .unwrap();
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "second same-key call must be served from cache"
+        );
+        match (first, second) {
+            (CalibrationData::Dwq(a), CalibrationData::Dwq(b)) => assert_eq!(a, b),
+            other => panic!("expected DWQ maps, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dwq_cache_miss_when_corpus_changes_runs_forward_again() {
+        let _lock = crate::calibrate::test_support::CACHE_ENV_LOCK
+            .lock()
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set_path("XDG_CACHE_HOME", tmp.path());
+
+        let num_layers = 4u32;
+        let hidden_size = 8u32;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let lazy_map = LazyTensorMap::new();
+        let meta = dummy_metadata(num_layers, hidden_size);
+        let progress = ProgressReporter::new();
+        let corpus_a = CalibrationCorpus {
+            chunks: vec![vec![1u32, 2, 3, 4]],
+            name: "a".into(),
+        };
+        let corpus_b = CalibrationCorpus {
+            chunks: vec![vec![4u32, 3, 2, 1]],
+            name: "b".into(),
+        };
+
+        for corpus in [&corpus_a, &corpus_b] {
+            let capture: Box<dyn ActivationCapture + Send + Sync> = Box::new(
+                CountingMockActivationCapture::new(num_layers, hidden_size, Arc::clone(&counter)),
+            );
+            let mut calib = DwqCalibrator::new(DwqArch::Qwen35MoE, Some(capture), 4, 6, 16);
+            calib
+                .calibrate(&lazy_map, &meta, corpus, &progress)
+                .unwrap();
+        }
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "different corpus SHA must miss and run capture again"
+        );
+    }
+
+    #[test]
+    fn dwq_corrupt_cache_warns_and_recomputes() {
+        let _lock = crate::calibrate::test_support::CACHE_ENV_LOCK
+            .lock()
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set_path("XDG_CACHE_HOME", tmp.path());
+
+        let num_layers = 4u32;
+        let hidden_size = 8u32;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let lazy_map = LazyTensorMap::new();
+        let meta = dummy_metadata(num_layers, hidden_size);
+        let progress = ProgressReporter::new();
+        let corpus = nonempty_corpus();
+        let key = dwq_cache_key(&lazy_map, &meta, &corpus);
+        let path = cache_file_path(&key).unwrap();
+        fs::write(&path, b"{not-json").unwrap();
+
+        let capture: Box<dyn ActivationCapture + Send + Sync> = Box::new(
+            CountingMockActivationCapture::new(num_layers, hidden_size, Arc::clone(&counter)),
+        );
+        let mut calib = DwqCalibrator::new(DwqArch::Qwen35MoE, Some(capture), 4, 6, 16);
+        let data = calib
+            .calibrate(&lazy_map, &meta, &corpus, &progress)
+            .unwrap();
+
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert!(matches!(data, CalibrationData::Dwq(_)));
+    }
+
+    #[test]
+    fn dwq_cache_does_not_bypass_forward_pass_unavailable() {
+        let _lock = crate::calibrate::test_support::CACHE_ENV_LOCK
+            .lock()
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set_path("XDG_CACHE_HOME", tmp.path());
+
+        let lazy_map = LazyTensorMap::new();
+        let meta = dummy_metadata(4, 8);
+        let progress = ProgressReporter::new();
+        let corpus = nonempty_corpus();
+        let key = dwq_cache_key(&lazy_map, &meta, &corpus);
+        let path = cache_file_path(&key).unwrap();
+        let mut cached = HashMap::new();
+        cached.insert("blk.0.sensitivity".to_string(), vec![1.0]);
+        save_dwq_to_path(&path, &key, &cached).unwrap();
+
+        let mut calib = DwqCalibrator::new(DwqArch::Qwen35MoE, None, 4, 6, 16);
+        let err = calib
+            .calibrate(&lazy_map, &meta, &corpus, &progress)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CalibrationError::ForwardPassUnavailable { .. }
+        ));
     }
 
     /// Object-safe trait usage — required for the dispatch helper.

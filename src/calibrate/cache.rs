@@ -11,10 +11,11 @@
 //! forward pass from scratch, wasting tens of minutes per variant.
 //!
 //! This cache stores the per-layer sensitivity vector keyed on the
-//! triple `(model_sha, corpus_sha, sensitivity_algorithm_version)`. The
-//! second `hf2q convert ... --quant dwq-4-8` (after a `dwq-4-6` run on
-//! the same model + same corpus) gets a cache hit and skips the
-//! forward pass entirely.
+//! triple `(model_meta_fingerprint, corpus_sha,
+//! sensitivity_algorithm_version)`. The second
+//! `hf2q convert ... --quant dwq-4-8` (after a `dwq-4-6` run on the
+//! same model + same corpus) gets a cache hit and skips the forward
+//! pass entirely.
 //!
 //! ## Cache layout
 //!
@@ -34,12 +35,15 @@
 //! `$HOME` from `std::env::var`. P7 will reuse this cache module when
 //! the calibrator orchestration moves to `src/calibrate/`.
 
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+use super::imatrix::Stats as ImatrixStats;
 
 /// Pinned version string for the sensitivity computation algorithm.
 /// Bump when [`crate::calibrate::sensitivity::compute_layer_sensitivity`]
@@ -71,7 +75,9 @@ pub enum CacheError {
         source: serde_json::Error,
     },
 
-    #[error("sensitivity cache: cannot resolve cache directory ($XDG_CACHE_HOME and $HOME both unset)")]
+    #[error(
+        "sensitivity cache: cannot resolve cache directory ($XDG_CACHE_HOME and $HOME both unset)"
+    )]
     NoHome,
 
     #[error("sensitivity cache: hit on key {key} but algorithm version mismatch (cached {cached}, current {current})")]
@@ -79,6 +85,13 @@ pub enum CacheError {
         key: String,
         cached: String,
         current: String,
+    },
+
+    #[error("sensitivity cache: payload mismatch at {path}: expected {expected}, got {actual}")]
+    PayloadMismatch {
+        path: String,
+        expected: &'static str,
+        actual: &'static str,
     },
 }
 
@@ -88,11 +101,9 @@ pub enum CacheError {
 /// every run.
 #[derive(Debug, Clone)]
 pub struct SensitivityCacheKey {
-    /// SHA-256 of the model's safetensors bytes (or, for cache use,
-    /// any deterministic per-model content hash). Callers typically
-    /// pass the SHA from `tokenizer.json` or a hashed concatenation
-    /// of the model's tensor data — anything that uniquely identifies
-    /// "the model whose activations we're calibrating".
+    /// SHA-256 model metadata fingerprint used for cache keying. ADR-014 P5
+    /// uses tensor names/shapes/dtypes plus selected model metadata; ADR-015
+    /// may upgrade this field to a byte-content hash.
     pub model_sha: String,
 
     /// SHA-256 of the calibration corpus tokens. Different corpora
@@ -144,8 +155,8 @@ impl SensitivityCacheKey {
     }
 }
 
-/// On-disk JSON payload. Carries the sensitivity vector plus the
-/// inputs that produced the key so a diagnostic dump can verify the
+/// On-disk JSON envelope. Carries the typed calibration payload plus
+/// the inputs that produced the key so a diagnostic dump can verify the
 /// expected algorithm version.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensitivityCacheEntry {
@@ -159,12 +170,38 @@ pub struct SensitivityCacheEntry {
     pub model_sha: String,
     pub corpus_sha: String,
 
-    /// Per-layer sensitivity vector. Mirrors the public shape of
-    /// [`crate::calibrate::sensitivity::LayerSensitivity`] for direct
-    /// round-trip; the JSON field names match. Stored here as plain
-    /// f64 fields for serde-friendliness without depending on the
-    /// `LayerSensitivity` type (which lives in src/quantize/ until P7).
-    pub layers: Vec<CachedLayerSensitivity>,
+    /// Typed payload. The tag prevents a DWQ sensitivity flag map from
+    /// being loaded as imatrix stats or vice versa when tests use an
+    /// explicit path, and makes schema drift a loud cache miss.
+    pub payload: CachedCalibrationPayload,
+}
+
+/// Calibration payload variants stored in the shared sensitivity-cache
+/// envelope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", content = "data")]
+pub enum CachedCalibrationPayload {
+    /// Raw layer-sensitivity vector used by the cache module's original
+    /// unit tests and lower-level sensitivity helpers.
+    LayerSensitivity { layers: Vec<CachedLayerSensitivity> },
+
+    /// DWQ calibrator output: synthetic per-layer sensitivity flags.
+    Dwq { map: BTreeMap<String, Vec<f32>> },
+
+    /// Imatrix calibrator output: per-tensor accumulation stats.
+    Imatrix {
+        stats: BTreeMap<String, CachedImatrixStats>,
+    },
+}
+
+impl CachedCalibrationPayload {
+    fn kind(&self) -> &'static str {
+        match self {
+            CachedCalibrationPayload::LayerSensitivity { .. } => "layer_sensitivity",
+            CachedCalibrationPayload::Dwq { .. } => "dwq",
+            CachedCalibrationPayload::Imatrix { .. } => "imatrix",
+        }
+    }
 }
 
 /// Serde-friendly mirror of `LayerSensitivity` (lives in
@@ -177,6 +214,32 @@ pub struct CachedLayerSensitivity {
     pub variance: f64,
     pub max_magnitude: f64,
     pub score: f64,
+}
+
+/// Serde-friendly mirror of imatrix [`Stats`]. Kept local so the
+/// algorithm type does not need serde derives solely for cache I/O.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CachedImatrixStats {
+    pub values: Vec<f32>,
+    pub counts: Vec<i64>,
+}
+
+impl From<&ImatrixStats> for CachedImatrixStats {
+    fn from(stats: &ImatrixStats) -> Self {
+        Self {
+            values: stats.values.clone(),
+            counts: stats.counts.clone(),
+        }
+    }
+}
+
+impl From<CachedImatrixStats> for ImatrixStats {
+    fn from(stats: CachedImatrixStats) -> Self {
+        Self {
+            values: stats.values,
+            counts: stats.counts,
+        }
+    }
 }
 
 /// Resolve the sensitivity cache directory, creating it if necessary.
@@ -233,11 +296,58 @@ pub fn save_to_path(
     key: &SensitivityCacheKey,
     layers: &[CachedLayerSensitivity],
 ) -> Result<(), CacheError> {
+    save_payload_to_path(
+        path,
+        key,
+        CachedCalibrationPayload::LayerSensitivity {
+            layers: layers.to_vec(),
+        },
+    )
+}
+
+/// Save a DWQ sensitivity map under an explicit path.
+pub fn save_dwq_to_path(
+    path: &Path,
+    key: &SensitivityCacheKey,
+    map: &HashMap<String, Vec<f32>>,
+) -> Result<(), CacheError> {
+    save_payload_to_path(
+        path,
+        key,
+        CachedCalibrationPayload::Dwq {
+            map: map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        },
+    )
+}
+
+/// Save an imatrix stats map under an explicit path.
+pub fn save_imatrix_to_path(
+    path: &Path,
+    key: &SensitivityCacheKey,
+    stats: &HashMap<String, ImatrixStats>,
+) -> Result<(), CacheError> {
+    save_payload_to_path(
+        path,
+        key,
+        CachedCalibrationPayload::Imatrix {
+            stats: stats
+                .iter()
+                .map(|(k, v)| (k.clone(), CachedImatrixStats::from(v)))
+                .collect(),
+        },
+    )
+}
+
+fn save_payload_to_path(
+    path: &Path,
+    key: &SensitivityCacheKey,
+    payload: CachedCalibrationPayload,
+) -> Result<(), CacheError> {
     let entry = SensitivityCacheEntry {
         algorithm_version: key.algorithm_version.clone(),
         model_sha: key.model_sha.clone(),
         corpus_sha: key.corpus_sha.clone(),
-        layers: layers.to_vec(),
+        payload,
     };
     let serialised = serde_json::to_string_pretty(&entry).map_err(|e| CacheError::Json {
         path: path.display().to_string(),
@@ -278,9 +388,7 @@ pub fn save_to_path(
 ///   `key.algorithm_version` — unusual (since the algorithm version is
 ///   part of the key derivation), but possible if a caller wrote with
 ///   one version and reads with another.
-pub fn load(
-    key: &SensitivityCacheKey,
-) -> Result<Option<Vec<CachedLayerSensitivity>>, CacheError> {
+pub fn load(key: &SensitivityCacheKey) -> Result<Option<Vec<CachedLayerSensitivity>>, CacheError> {
     let path = cache_file_path(key)?;
     load_from_path(&path, key)
 }
@@ -290,6 +398,67 @@ pub fn load_from_path(
     path: &Path,
     key: &SensitivityCacheKey,
 ) -> Result<Option<Vec<CachedLayerSensitivity>>, CacheError> {
+    let payload = match load_payload_from_path(path, key)? {
+        Some(payload) => payload,
+        None => return Ok(None),
+    };
+    match payload {
+        CachedCalibrationPayload::LayerSensitivity { layers } => Ok(Some(layers)),
+        other => Err(CacheError::PayloadMismatch {
+            path: path.display().to_string(),
+            expected: "layer_sensitivity",
+            actual: other.kind(),
+        }),
+    }
+}
+
+/// Load a DWQ sensitivity map from an explicit path.
+pub fn load_dwq_from_path(
+    path: &Path,
+    key: &SensitivityCacheKey,
+) -> Result<Option<HashMap<String, Vec<f32>>>, CacheError> {
+    let payload = match load_payload_from_path(path, key)? {
+        Some(payload) => payload,
+        None => return Ok(None),
+    };
+    match payload {
+        CachedCalibrationPayload::Dwq { map } => Ok(Some(map.into_iter().collect())),
+        other => Err(CacheError::PayloadMismatch {
+            path: path.display().to_string(),
+            expected: "dwq",
+            actual: other.kind(),
+        }),
+    }
+}
+
+/// Load an imatrix stats map from an explicit path.
+pub fn load_imatrix_from_path(
+    path: &Path,
+    key: &SensitivityCacheKey,
+) -> Result<Option<HashMap<String, ImatrixStats>>, CacheError> {
+    let payload = match load_payload_from_path(path, key)? {
+        Some(payload) => payload,
+        None => return Ok(None),
+    };
+    match payload {
+        CachedCalibrationPayload::Imatrix { stats } => Ok(Some(
+            stats
+                .into_iter()
+                .map(|(k, v)| (k, ImatrixStats::from(v)))
+                .collect(),
+        )),
+        other => Err(CacheError::PayloadMismatch {
+            path: path.display().to_string(),
+            expected: "imatrix",
+            actual: other.kind(),
+        }),
+    }
+}
+
+fn load_payload_from_path(
+    path: &Path,
+    key: &SensitivityCacheKey,
+) -> Result<Option<CachedCalibrationPayload>, CacheError> {
     if !path.exists() {
         return Ok(None);
     }
@@ -310,7 +479,7 @@ pub fn load_from_path(
             current: key.algorithm_version.clone(),
         });
     }
-    Ok(Some(entry.layers))
+    Ok(Some(entry.payload))
 }
 
 #[cfg(test)]
@@ -390,6 +559,65 @@ mod tests {
         assert_eq!(loaded, Some(layers));
     }
 
+    #[test]
+    fn cache_dwq_payload_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = SensitivityCacheKey::with_algorithm_version("model", "corpus", "dwq-test");
+        let path = tmp.path().join(format!("{}.json", key.hash()));
+
+        let mut map = HashMap::new();
+        map.insert("blk.0.sensitivity".to_string(), vec![1.0]);
+        map.insert("blk.1.sensitivity".to_string(), vec![0.0]);
+        save_dwq_to_path(&path, &key, &map).unwrap();
+
+        let loaded = load_dwq_from_path(&path, &key).unwrap().unwrap();
+        assert_eq!(loaded, map);
+    }
+
+    #[test]
+    fn cache_imatrix_payload_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = SensitivityCacheKey::with_algorithm_version("model", "corpus", "imatrix-test");
+        let path = tmp.path().join(format!("{}.json", key.hash()));
+
+        let mut stats = HashMap::new();
+        stats.insert(
+            "blk.0.layer_input".to_string(),
+            ImatrixStats {
+                values: vec![0.25, 0.5],
+                counts: vec![3],
+            },
+        );
+        save_imatrix_to_path(&path, &key, &stats).unwrap();
+
+        let loaded = load_imatrix_from_path(&path, &key).unwrap().unwrap();
+        let got = loaded.get("blk.0.layer_input").unwrap();
+        assert_eq!(got.values, vec![0.25, 0.5]);
+        assert_eq!(got.counts, vec![3]);
+    }
+
+    #[test]
+    fn cache_payload_kind_mismatch_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = SensitivityCacheKey::with_algorithm_version("model", "corpus", "dwq-test");
+        let path = tmp.path().join(format!("{}.json", key.hash()));
+
+        let mut map = HashMap::new();
+        map.insert("blk.0.sensitivity".to_string(), vec![1.0]);
+        save_dwq_to_path(&path, &key, &map).unwrap();
+
+        let result = load_imatrix_from_path(&path, &key);
+        match result {
+            Err(CacheError::PayloadMismatch {
+                expected, actual, ..
+            }) => {
+                assert_eq!(expected, "imatrix");
+                assert_eq!(actual, "dwq");
+            }
+            other => panic!("expected PayloadMismatch, got {other:?}"),
+        }
+    }
+
     /// Cache miss returns `Ok(None)`, not an error.
     #[test]
     fn cache_load_miss_returns_none() {
@@ -405,13 +633,11 @@ mod tests {
     #[test]
     fn cache_algorithm_version_mismatch_errors() {
         let tmp = tempfile::tempdir().unwrap();
-        let key_v1 =
-            SensitivityCacheKey::with_algorithm_version("model", "corpus", "v1.alpha");
+        let key_v1 = SensitivityCacheKey::with_algorithm_version("model", "corpus", "v1.alpha");
         let path = tmp.path().join("entry.json");
         save_to_path(&path, &key_v1, &fixture_layers()).unwrap();
 
-        let key_v2 =
-            SensitivityCacheKey::with_algorithm_version("model", "corpus", "v2.beta");
+        let key_v2 = SensitivityCacheKey::with_algorithm_version("model", "corpus", "v2.beta");
         let result = load_from_path(&path, &key_v2);
         match result {
             Err(CacheError::AlgorithmVersionMismatch {

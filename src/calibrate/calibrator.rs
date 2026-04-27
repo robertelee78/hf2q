@@ -34,6 +34,7 @@
 
 use std::collections::HashMap;
 
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::imatrix::Stats as ImatrixStats;
@@ -96,6 +97,54 @@ impl CalibrationCorpus {
     pub fn is_empty(&self) -> bool {
         self.chunks.is_empty() || self.chunks.iter().all(|c| c.is_empty())
     }
+}
+
+/// Return a deterministic metadata-fingerprint hash, not byte-content hash,
+/// for cache keying. The tensor tuples are read from `LazyTensorMap` metadata
+/// only, in its BTreeMap iteration order, so this never materialises tensor
+/// bytes. TODO-future ADR-015 byte-hash upgrade: replace this with a true
+/// model-content digest once the streaming byte-hash path lands.
+pub fn model_fingerprint(
+    model: &crate::ir::lazy::LazyTensorMap,
+    meta: &crate::ir::ModelMetadata,
+) -> String {
+    let mut h = Sha256::new();
+    update_hash_str(&mut h, "hf2q-model-fingerprint-v1");
+    update_hash_str(&mut h, &meta.architecture);
+    h.update(meta.num_layers.to_le_bytes());
+    h.update(meta.hidden_size.to_le_bytes());
+
+    for (name, tensor) in model.iter() {
+        update_hash_str(&mut h, name);
+        h.update((tensor.shape().len() as u64).to_le_bytes());
+        for dim in tensor.shape() {
+            h.update((*dim as u64).to_le_bytes());
+        }
+        update_hash_str(&mut h, &format!("{:?}", tensor.dtype()));
+    }
+
+    hex::encode(h.finalize())
+}
+
+/// SHA-256 over corpus token chunks. Tokens are encoded as little-endian
+/// `u32`; chunks are separated by four `0xFF` bytes so adjacent chunks cannot
+/// collide with one longer chunk.
+pub fn corpus_sha(corpus: &CalibrationCorpus) -> String {
+    let mut h = Sha256::new();
+    for (idx, chunk) in corpus.chunks.iter().enumerate() {
+        if idx > 0 {
+            h.update([0xFF_u8; 4]);
+        }
+        for token in chunk {
+            h.update(token.to_le_bytes());
+        }
+    }
+    hex::encode(h.finalize())
+}
+
+fn update_hash_str(h: &mut Sha256, value: &str) {
+    h.update((value.len() as u64).to_le_bytes());
+    h.update(value.as_bytes());
 }
 
 /// Calibration data — the per-tensor output of a calibrator. Consumed
@@ -171,9 +220,7 @@ impl CalibrationData {
     /// reads `stats.values.as_slice()` for the imatrix-weighted
     /// codebook search; counts are preserved for round-trip but not
     /// consumed at row-quantize time.
-    pub fn from_imatrix_gguf(
-        path: &std::path::Path,
-    ) -> Result<Self, super::imatrix::ImatrixError> {
+    pub fn from_imatrix_gguf(path: &std::path::Path) -> Result<Self, super::imatrix::ImatrixError> {
         let (collector, _datasets) = super::imatrix::ImatrixCollector::load_imatrix_gguf(path)?;
         Ok(Self::from_imatrix_collector(&collector))
     }
@@ -279,7 +326,11 @@ impl Calibrator for NoneCalibrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::lazy::LazyTensorMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+    use crate::ir::DType;
 
     fn dummy_metadata() -> crate::ir::ModelMetadata {
         crate::ir::ModelMetadata {
@@ -317,6 +368,19 @@ mod tests {
             output_router_logits: None,
             router_aux_loss_coef: None,
         }
+    }
+
+    fn lazy_tensor(name: &str, shape: Vec<usize>, dtype: DType) -> LazyTensor {
+        let meta = LazyMeta::new(name.to_string(), shape, dtype);
+        LazyTensor::from_bytes(meta.clone(), vec![0_u8; meta.byte_len])
+    }
+
+    fn map_with_tensors(tensors: Vec<LazyTensor>) -> LazyTensorMap {
+        let mut map = LazyTensorMap::new();
+        for tensor in tensors {
+            map.insert(tensor);
+        }
+        map
     }
 
     #[test]
@@ -409,6 +473,93 @@ mod tests {
         assert_eq!(all_empty_chunks.n_chunks(), 2);
     }
 
+    #[test]
+    fn corpus_sha_is_deterministic_for_same_chunks() {
+        let a = CalibrationCorpus {
+            chunks: vec![vec![1, 2, 3], vec![4]],
+            name: "a".into(),
+        };
+        let b = CalibrationCorpus {
+            chunks: vec![vec![1, 2, 3], vec![4]],
+            name: "different-name-ignored".into(),
+        };
+        assert_eq!(corpus_sha(&a), corpus_sha(&b));
+        assert_eq!(corpus_sha(&a).len(), 64);
+        assert!(corpus_sha(&a).chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn corpus_sha_separates_chunk_boundaries() {
+        let chunked = CalibrationCorpus {
+            chunks: vec![vec![1, 2], vec![3, 4]],
+            name: "chunked".into(),
+        };
+        let flat = CalibrationCorpus {
+            chunks: vec![vec![1, 2, 3, 4]],
+            name: "flat".into(),
+        };
+        assert_ne!(corpus_sha(&chunked), corpus_sha(&flat));
+    }
+
+    #[test]
+    fn corpus_sha_uses_little_endian_u32_tokens() {
+        let corpus = CalibrationCorpus {
+            chunks: vec![vec![0x0102_0304]],
+            name: "endian".into(),
+        };
+        let mut h = Sha256::new();
+        h.update([0x04, 0x03, 0x02, 0x01]);
+        assert_eq!(corpus_sha(&corpus), hex::encode(h.finalize()));
+    }
+
+    #[test]
+    fn model_fingerprint_is_deterministic_in_btree_order() {
+        let meta = dummy_metadata();
+        let map_a = map_with_tensors(vec![
+            lazy_tensor("b.weight", vec![2, 2], DType::F16),
+            lazy_tensor("a.weight", vec![4], DType::F32),
+        ]);
+        let map_b = map_with_tensors(vec![
+            lazy_tensor("a.weight", vec![4], DType::F32),
+            lazy_tensor("b.weight", vec![2, 2], DType::F16),
+        ]);
+
+        assert_eq!(
+            model_fingerprint(&map_a, &meta),
+            model_fingerprint(&map_b, &meta)
+        );
+    }
+
+    #[test]
+    fn model_fingerprint_changes_with_metadata_shape_or_dtype() {
+        let meta = dummy_metadata();
+        let map = map_with_tensors(vec![lazy_tensor("w", vec![2, 2], DType::F16)]);
+        let shape_changed = map_with_tensors(vec![lazy_tensor("w", vec![4, 1], DType::F16)]);
+        let dtype_changed = map_with_tensors(vec![lazy_tensor("w", vec![2, 2], DType::BF16)]);
+        let mut meta_changed = dummy_metadata();
+        meta_changed.hidden_size += 1;
+
+        let base = model_fingerprint(&map, &meta);
+        assert_ne!(base, model_fingerprint(&shape_changed, &meta));
+        assert_ne!(base, model_fingerprint(&dtype_changed, &meta));
+        assert_ne!(base, model_fingerprint(&map, &meta_changed));
+    }
+
+    #[test]
+    fn model_fingerprint_does_not_materialise_lazy_tensors() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+        let meta = LazyMeta::new("pending.weight".to_string(), vec![2], DType::F32);
+        let lazy = LazyTensor::from_closure(meta, move || {
+            counter_clone.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![0_u8; 8])
+        });
+        let map = map_with_tensors(vec![lazy]);
+
+        let _ = model_fingerprint(&map, &dummy_metadata());
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
     /// Trait is object-safe (can be used as `&dyn Calibrator` /
     /// `Box<dyn Calibrator>`) — required for runtime dispatch from
     /// the CLI variant resolver.
@@ -463,8 +614,13 @@ mod tests {
         let mut col = ImatrixCollector::new();
         col.accumulate_dense("blk.0.attn_q.weight", &[1.0, 2.0, 3.0, 4.0], 4, 1)
             .unwrap();
-        col.accumulate_dense("blk.1.ffn_down.weight", &[0.5, 0.5, 0.5, 0.5, 0.5, 0.5], 6, 1)
-            .unwrap();
+        col.accumulate_dense(
+            "blk.1.ffn_down.weight",
+            &[0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+            6,
+            1,
+        )
+        .unwrap();
         col.record_chunk();
 
         let dir = std::env::temp_dir().join("hf2q-calibration-bridge-test");
@@ -527,7 +683,8 @@ mod tests {
         for v in activations.iter_mut().take(64) {
             *v = 10.0;
         }
-        col.accumulate_dense("test.weight", &activations, 1, QK_K).unwrap();
+        col.accumulate_dense("test.weight", &activations, 1, QK_K)
+            .unwrap();
         col.record_chunk();
 
         let dir = std::env::temp_dir().join("hf2q-bridge-codec-test");
@@ -540,14 +697,16 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         // Quantize the same input row through the codec via the imatrix path.
-        let row: Vec<f32> = (0..QK_K)
-            .map(|i| (i as f32 - 128.0) / 128.0)
-            .collect();
+        let row: Vec<f32> = (0..QK_K).map(|i| (i as f32 - 128.0) / 128.0).collect();
         let bytes_imatrix =
             quantize_row_to_bytes(&row, KQuantTarget::Q4K, &calib, "test.weight").unwrap();
-        let bytes_ref =
-            quantize_row_to_bytes(&row, KQuantTarget::Q4K, &CalibrationData::None, "test.weight")
-                .unwrap();
+        let bytes_ref = quantize_row_to_bytes(
+            &row,
+            KQuantTarget::Q4K,
+            &CalibrationData::None,
+            "test.weight",
+        )
+        .unwrap();
 
         assert_eq!(bytes_imatrix.len(), bytes_ref.len(), "same on-disk size");
         // The imatrix-weighted codebook search differs from _ref on

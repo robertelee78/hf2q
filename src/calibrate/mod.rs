@@ -35,3 +35,9 @@ pub mod dwq_calibrator;
 pub mod imatrix;
 pub mod imatrix_calibrator;
 pub mod sensitivity;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Serialises tests that mutate process-wide cache environment variables.
+    pub(crate) static CACHE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}

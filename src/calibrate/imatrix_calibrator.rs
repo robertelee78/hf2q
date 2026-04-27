@@ -44,10 +44,13 @@
 //! per-Linear-tensor weights inside that layer when applying the
 //! per-row imatrix-weighted MSE.
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
+use super::cache::{
+    cache_file_path, load_imatrix_from_path, save_imatrix_to_path, SensitivityCacheKey,
+};
 use super::calibrator::{
-    CalibrationCorpus, CalibrationData, CalibrationError, Calibrator,
+    corpus_sha, model_fingerprint, CalibrationCorpus, CalibrationData, CalibrationError, Calibrator,
 };
 use super::imatrix::ImatrixCollector;
 use crate::inference::models::qwen35::activation_capture::ActivationCapture;
@@ -69,6 +72,8 @@ pub const LAYER_INPUT_TENSOR_PREFIX: &str = "blk";
 /// Synthetic suffix completing the tensor name `blk.<l>.layer_input`.
 #[allow(dead_code)]
 pub const LAYER_INPUT_TENSOR_SUFFIX: &str = "layer_input";
+/// Cache namespace tag for the imatrix calibrator payload schema.
+pub const IMATRIX_ALGORITHM_VERSION: &str = "imatrix-v1.0";
 
 /// `ImatrixCalibrator` — drives a forward pass over a
 /// [`CalibrationCorpus`] and accumulates per-layer activation
@@ -140,7 +145,7 @@ impl Calibrator for ImatrixCalibrator {
 
     fn calibrate(
         &mut self,
-        _model: &LazyTensorMap,
+        model: &LazyTensorMap,
         meta: &ModelMetadata,
         corpus: &CalibrationCorpus,
         progress: &ProgressReporter,
@@ -171,6 +176,51 @@ impl Calibrator for ImatrixCalibrator {
             });
         }
 
+        let cache_key = SensitivityCacheKey::with_algorithm_version(
+            model_fingerprint(model, meta),
+            corpus_sha(corpus),
+            IMATRIX_ALGORITHM_VERSION,
+        );
+        let cache_path = match cache_file_path(&cache_key) {
+            Ok(path) => Some(path),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "imatrix sensitivity cache path unavailable; running forward pass"
+                );
+                None
+            }
+        };
+
+        if let Some(path) = cache_path.as_deref() {
+            match load_imatrix_from_path(path, &cache_key) {
+                Ok(Some(stats)) => {
+                    info!(
+                        cache_key = %cache_key.hash(),
+                        path = %path.display(),
+                        entries = stats.len(),
+                        "imatrix sensitivity cache HIT"
+                    );
+                    return Ok(CalibrationData::ImatrixWithStats(stats));
+                }
+                Ok(None) => {
+                    info!(
+                        cache_key = %cache_key.hash(),
+                        path = %path.display(),
+                        "imatrix sensitivity cache MISS"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        cache_key = %cache_key.hash(),
+                        path = %path.display(),
+                        "imatrix sensitivity cache MISS; load failed, recomputing"
+                    );
+                }
+            }
+        }
+
         info!(
             arch = %meta.architecture,
             num_layers = self.num_layers,
@@ -190,14 +240,11 @@ impl Calibrator for ImatrixCalibrator {
                 continue;
             }
 
-            let activations =
-                self.capture
-                    .run_calibration_prompt(chunk)
-                    .map_err(|e| CalibrationError::Other {
-                        message: format!(
-                            "imatrix forward pass failed at chunk {chunk_idx}: {e}"
-                        ),
-                    })?;
+            let activations = self.capture.run_calibration_prompt(chunk).map_err(|e| {
+                CalibrationError::Other {
+                    message: format!("imatrix forward pass failed at chunk {chunk_idx}: {e}"),
+                }
+            })?;
 
             activations
                 .validate()
@@ -232,12 +279,7 @@ impl Calibrator for ImatrixCalibrator {
 
             for (layer_idx, layer_acts) in activations.layer_inputs.iter().enumerate() {
                 let tensor_name = Self::layer_tensor_name(layer_idx);
-                collector.accumulate_dense(
-                    &tensor_name,
-                    layer_acts,
-                    seq_len,
-                    hidden,
-                )?;
+                collector.accumulate_dense(&tensor_name, layer_acts, seq_len, hidden)?;
             }
 
             collector.record_chunk();
@@ -271,6 +313,17 @@ impl Calibrator for ImatrixCalibrator {
             });
         }
 
+        if let Some(path) = cache_path.as_deref() {
+            if let Err(err) = save_imatrix_to_path(path, &cache_key, collector.stats()) {
+                warn!(
+                    error = %err,
+                    cache_key = %cache_key.hash(),
+                    path = %path.display(),
+                    "imatrix sensitivity cache save failed; calibration result will still be returned"
+                );
+            }
+        }
+
         Ok(data)
     }
 }
@@ -279,9 +332,63 @@ impl Calibrator for ImatrixCalibrator {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
+    use crate::calibrate::cache::SensitivityCacheKey;
+    use crate::calibrate::calibrator::{corpus_sha, model_fingerprint};
     use crate::calibrate::imatrix::ImatrixCollector;
-    use crate::inference::models::qwen35::activation_capture::MockActivationCapture;
+    use crate::inference::models::qwen35::activation_capture::{
+        ActivationCapture, LayerActivations, MockActivationCapture,
+    };
+    use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+    use crate::ir::{DType, ModelMetadata};
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, path: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, path);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    struct CountingMockActivationCapture {
+        inner: MockActivationCapture,
+        counter: Arc<AtomicUsize>,
+    }
+
+    impl CountingMockActivationCapture {
+        fn new(num_layers: u32, hidden_size: u32, counter: Arc<AtomicUsize>) -> Self {
+            Self {
+                inner: MockActivationCapture::new(num_layers, hidden_size),
+                counter,
+            }
+        }
+    }
+
+    impl ActivationCapture for CountingMockActivationCapture {
+        fn run_calibration_prompt(&mut self, tokens: &[u32]) -> anyhow::Result<LayerActivations> {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+            self.inner.run_calibration_prompt(tokens)
+        }
+    }
 
     fn dummy_metadata(num_layers: u32, hidden_size: u32) -> ModelMetadata {
         ModelMetadata {
@@ -326,6 +433,39 @@ mod tests {
             Box::new(MockActivationCapture::new(num_layers, hidden_size)),
             num_layers,
             hidden_size,
+        )
+    }
+
+    fn make_counting_calibrator(
+        num_layers: u32,
+        hidden_size: u32,
+        counter: Arc<AtomicUsize>,
+    ) -> ImatrixCalibrator {
+        ImatrixCalibrator::new(
+            Box::new(CountingMockActivationCapture::new(
+                num_layers,
+                hidden_size,
+                counter,
+            )),
+            num_layers,
+            hidden_size,
+        )
+    }
+
+    fn lazy_tensor(name: &str, shape: Vec<usize>, dtype: DType) -> LazyTensor {
+        let meta = LazyMeta::new(name.to_string(), shape, dtype);
+        LazyTensor::from_bytes(meta.clone(), vec![0_u8; meta.byte_len])
+    }
+
+    fn imatrix_cache_key(
+        model: &LazyTensorMap,
+        meta: &ModelMetadata,
+        corpus: &CalibrationCorpus,
+    ) -> SensitivityCacheKey {
+        SensitivityCacheKey::with_algorithm_version(
+            model_fingerprint(model, meta),
+            corpus_sha(corpus),
+            IMATRIX_ALGORITHM_VERSION,
         )
     }
 
@@ -430,6 +570,89 @@ mod tests {
         }
     }
 
+    #[test]
+    fn imatrix_cache_hit_skips_forward_pass_same_key() {
+        let _lock = crate::calibrate::test_support::CACHE_ENV_LOCK
+            .lock()
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set_path("XDG_CACHE_HOME", tmp.path());
+
+        let num_layers = 2u32;
+        let hidden_size = 4u32;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let lazy_map = LazyTensorMap::new();
+        let meta = dummy_metadata(num_layers, hidden_size);
+        let progress = ProgressReporter::new();
+        let corpus = CalibrationCorpus {
+            chunks: vec![vec![1u32, 2, 3]],
+            name: "single-chunk".into(),
+        };
+
+        let mut calib1 = make_counting_calibrator(num_layers, hidden_size, Arc::clone(&counter));
+        let first = calib1
+            .calibrate(&lazy_map, &meta, &corpus, &progress)
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let mut calib2 = make_counting_calibrator(num_layers, hidden_size, Arc::clone(&counter));
+        let second = calib2
+            .calibrate(&lazy_map, &meta, &corpus, &progress)
+            .unwrap();
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "second same-key imatrix call must be served from cache"
+        );
+        match (first, second) {
+            (CalibrationData::ImatrixWithStats(a), CalibrationData::ImatrixWithStats(b)) => {
+                assert_eq!(a.len(), b.len());
+                assert_eq!(
+                    a.get("blk.0.layer_input").unwrap().values,
+                    b.get("blk.0.layer_input").unwrap().values
+                );
+            }
+            other => panic!("expected imatrix stats maps, got {other:?}"),
+        }
+
+        let key = imatrix_cache_key(&lazy_map, &meta, &corpus);
+        assert_eq!(key.algorithm_version, IMATRIX_ALGORITHM_VERSION);
+    }
+
+    #[test]
+    fn imatrix_cache_miss_when_model_fingerprint_changes() {
+        let _lock = crate::calibrate::test_support::CACHE_ENV_LOCK
+            .lock()
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvVarGuard::set_path("XDG_CACHE_HOME", tmp.path());
+
+        let num_layers = 2u32;
+        let hidden_size = 4u32;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let model_a = LazyTensorMap::new();
+        let mut model_b = LazyTensorMap::new();
+        model_b.insert(lazy_tensor("model.layers.0.weight", vec![2, 2], DType::F16));
+        let meta = dummy_metadata(num_layers, hidden_size);
+        let progress = ProgressReporter::new();
+        let corpus = CalibrationCorpus {
+            chunks: vec![vec![1u32, 2, 3]],
+            name: "single-chunk".into(),
+        };
+
+        for model in [&model_a, &model_b] {
+            let mut calib = make_counting_calibrator(num_layers, hidden_size, Arc::clone(&counter));
+            calib.calibrate(model, &meta, &corpus, &progress).unwrap();
+        }
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "different model fingerprint must miss and run capture again"
+        );
+    }
+
     /// Object-safe trait usage — required for the dispatch helper in
     /// `select_calibrator(...)` returning `Box<dyn Calibrator>`.
     #[test]
@@ -486,9 +709,7 @@ mod tests {
                 for (j, slot) in values.iter_mut().enumerate() {
                     let mut sumf = 0.0_f32;
                     for &tok in chunk {
-                        let v = (tok as f32) * 0.001
-                            + (l as f32) * 0.01
-                            + (j as f32) * 0.0001;
+                        let v = (tok as f32) * 0.001 + (l as f32) * 0.01 + (j as f32) * 0.0001;
                         sumf += v * v;
                     }
                     *slot += sumf / n_tokens;
