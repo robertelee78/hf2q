@@ -451,6 +451,50 @@ at `1c056c6` regardless of the misleading commit subject.  This
 follow-up commit (queue-correct subject) adds only this commit-history
 note for traceability.
 
+### 2026-04-27 — P0 Gemma baseline (iter4) reshapes the phasing budget
+
+**Measured:** hf2q gemma at 0.840× of llama.cpp at HEAD (P0 iter4).
+
+**Implications for Phasing P3 / P3b ordering:**
+
+1. **The gemma-side gap is *larger* than the qwen35 gap at ADR-012 closure
+   (0.840× vs 0.94×).**  The diagnosis-update CB-count budget assumed
+   qwen35's ~540 µs/token gap was the bigger problem; the gemma gap is
+   ~16% (~1820 µs/token at decode wall ≈ 11.4 ms vs llama ≈ 9.57 ms),
+   substantially deeper.  Per the P1 audit (merged) — gemma decode CB /
+   GraphSession boundaries — gemma is ALREADY at 1–2 CBs/token; the gap
+   does **not** live in CB-count.  All ~16% lives elsewhere: per-dispatch
+   encoding, Rust-orchestration overhead (P3b's residual), and gemma-
+   specific paths (TQ KV encode, fused MLP+MoE B8/B9/B10/B11 groups,
+   iter-21 Track B Lloyd-Max codebook).
+
+2. **D1 (single-CB rewrite for gemma) confirmed as refactor-for-uniformity
+   not perf lever.**  The P1 audit already flagged this; the live P0
+   measurement confirms it.  Gemma's decode ratio cannot improve from
+   single-CB collapse alone — it is already there.
+
+3. **P3b is the lever for both families, with shared root causes.**  The
+   §P3a' rank-1 (`alloc_buffer` Mach-IPC chain), rank-3
+   (`command_encoder()` churn — bigger on qwen35), rank-4
+   (`build_rope_multi_buffers` — closed by iter1 for qwen35, no analog
+   on gemma since gemma uses a different rope kernel chain) all live
+   *under* both forward paths because both families use the same
+   `mlx-native` substrate.  **Therefore: rank-1 alloc_buffer pool
+   (iter7) is the highest-leverage shared lever.**
+
+4. **The Wave 2b apex MoE re-measurement (hard gate #1) gates iter7 for
+   the qwen35 family.  It does NOT block applying the same pool to the
+   gemma path** — gemma's allocation sites are different (TQ KV encode
+   + B8/B9/B10/B11 groups + sliding/global attention) and need their
+   own measurement.  **Add gemma-side §P3a''.**
+
+5. **Existing iter1 (rope_multi cache) wins are 0 µs on gemma** — gemma's
+   `apply_imrope` analog is not in the qwen35 module path that iter1
+   touched.  Gemma uses `forward_mlx.rs` rope dispatches; same kernel
+   substrate, but the per-call alloc happens through different helpers.
+   **Track B for iter5/iter6: port the rope_multi cache to gemma's
+   `forward_mlx.rs` rope call sites.**
+
 ### Phase plan implication
 
 Original P3 (qwen35 single-CB rewrite) recovers ~30% of the gap.
@@ -487,14 +531,19 @@ lever is wrong; fix it, don't gate the primary path off (per
     ADR-012 closure: hf2q 109.1 t/s vs llama.cpp 116.0 t/s = **0.94×**.
   - **gemma:** `gemma-4-26B-A4B-it-ara-abliterated-dwq` `n=256` decode
     median **≥ 1.00× of llama.cpp** same-day median (same methodology).
-    Reference baseline must be re-measured at P0 (no committed value
-    on file as of 2026-04-26 — see Open Question Q1).
+    **§P0 measured 2026-04-27 (iter4):** hf2q 87.8 t/s (per-trial 87.7 / 87.8 / 88.0;
+    extremely tight, σ ≈ 0.15) vs llama-bench 104.52 t/s
+    (per-trial 103.96 / 104.58 / 104.52) = **0.840×**.  Recovery
+    required: **+19.0%** (multiply by 1.190 → 1.000).  Captured at
+    hf2q@`35fdcc8` / mlx-native@`19f5569` on M5 Max macOS 26.4.1
+    via `scripts/bench-baseline.sh`; raw artifacts at
+    `/tmp/adr015-bench/baseline-gemma-26B-dwq-p0-20260427T045841Z.*`.
 
 ## Phasing
 
 | Phase | Deliverable | Definition of done |
 |---|---|---|
-| **P0 — Gemma baseline** | Same-day `gemma-4-26B-A4B-it-ara-abliterated-dwq` `n=256` decode median: 3 cold runs of `hf2q` + 3 of `llama-bench`. Establishes the gemma-side ratio. | Numbers recorded in this ADR as the baseline gemma-family bar. |
+| **P0 — Gemma baseline** ✅ **Done 2026-04-27 (iter4)** | Same-day `gemma-4-26B-A4B-it-ara-abliterated-dwq` `n=256` decode median: 3 cold runs of `hf2q` + 3 of `llama-bench` via `scripts/bench-baseline.sh`. Result: hf2q 87.8 t/s vs llama 104.52 t/s = **0.840×**.  Recovery required: **+19.0%**. | hf2q 87.8 (87.7 / 87.8 / 88.0) vs llama-bench 104.52 (103.96 / 104.58 / 104.52); ratio recorded in D4 above. |
 | **P1 — Audit** | Map every cross-CB synchronization point in `forward_gpu` (qwen35) and `forward_decode` (Gemma) paths. List of `(commit/commit_and_wait → next encoder)` transitions and the buffer dependencies that justify each one. Output: a markdown table per family in this ADR. | Every CB boundary in each family's live path is annotated with the data dependency it protects, OR documented as legacy / removable. |
 | **P2 — Empty-CB cost calibration** | ✅ **Done 2026-04-26** — `mlx-native/examples/cb_cost_calibration.rs` measures async/sync/alloc-only µs/CB on M5 Max.  Result: **async µs/CB ≈ 1.6 µs at N≥100, NOT ~5 µs**.  Single-CB upper bound = ~160 µs / token of the ~500 µs gap (~32%). | Numbers published in §Diagnosis update above. |
 | **P3a — Per-dispatch cost calibration** | ✅ **Done 2026-04-26** — `mlx-native/examples/dispatch_cost_calibration.rs` measures `scalar_mul_bf16` encode cost.  Result: **µs/dispatch ≈ 0.16 µs** at N≥500, within ±15% of llama.cpp's implied 0.14 µs/dispatch.  Shader-launch path is competitive; lever is Rust orchestration. | Numbers published in §P3a calibration data above. |
@@ -1151,6 +1200,7 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - **2026-04-26 — P3a calibration empirical:** `µs/dispatch ≈ 0.16 µs` at N≥500 — within ±15% of llama.cpp's ~0.14 µs/dispatch.  Shader-launch path is **not** materially slower.  Budget reconciliation: ~252 µs of the 540 µs gap is encode-time (CB + dispatch); ~288 µs (~53%) is **residual unaccounted** that lives in Rust-side orchestration.  P3b (Rust orchestration sweep) added as parallel phase to P3 single-CB rewrite.  Together P3 + P3b target ≥1.00× exit criteria.
 - **2026-04-26 — Literature foundations infused.**  11 arxiv papers fetched + verified pre-training-cutoff, organized into Kernel-level (FlashAttention 1+2), System architecture (vLLM, SGLang, Sarathi-Serve), Decode acceleration (Speculative Decoding, Medusa, EAGLE, Lookahead), and Graph compilation (TVM, Hidet) categories.  Each entry calls out Apple-Silicon applicability honestly.  Apple-Silicon-specific gap acknowledged: no pre-cutoff arxiv work on M-series LLM inference perf that I could verify by direct fetch.  Added §Architectural implications given full-stack ownership — single-CB is the conservative first lever; megakernel + cross-token pipelining open as next-octave levers given we own both layers.
 - **2026-04-27 — §"P3a' live profile pass" infused (CFA Wave 2a, `cfa-20260426-adr015-wave2a-p3aprime`).** xctrace TimeProfiler captured 3 cold-SoC trials × 64 decode tokens on macOS 26.4.1 / M5 Max with the qwen3.6-27b-dwq46 dense fixture.  Decode-only stack filtering (`forward_gpu_greedy`) yields the live ranked residual: rank 1 is `MlxDevice::alloc_buffer` → `IOGPUResourceCreate` → `mach_msg2_trap` at 3719 µs/token (Mach-IPC kernel-call dominated, ~1 IPC per GPU resource × ~hundreds of decode-token allocations); rank 3 is `command_encoder()` churn at 724 µs/token (closes under P3 single-CB); rank 4's `build_rope_multi_buffers` at 208 µs/token is independently fixable by hoisting per-call rope-params buffers to model-load time.  Hypothesis register: H1 (`gpu_ffn.rs:397-404` proj alloc) NOT FOUND at literal site (dense path doesn't call proj()) but the underlying *category* CONFIRMED at 37× the static estimate via the rank-1 alloc_buffer chain; H2 (apply_imrope) CONFIRMED 5.8× larger than estimated; H3 (command_encoder churn) CONFIRMED 13× larger; H4 (memory_barrier) FALSIFIED at literal site (sub-1ms-sample at 1ms granularity); H5 (with_context allocation) FALSIFIED — confirms Codex Wave 1 prior (`format!` lazy via closure).  Coverage gap flagged: dense fixture does not exercise the apex MoE expert proj path; Wave 2b must re-validate H1's literal site against the apex 35B-A3B fixture before committing P3b reductions to MoE-specific call sites.  Supersession note added to §Diagnosis pointing at §P3a'.  NAX questions Q-NAX-1, Q-NAX-3, Q-NAX-4 received in-row updates where the trace informed them (Q-NAX-3: confirmed macOS 26.4.1 ≥ 26.2 NAX threshold; Q-NAX-1, Q-NAX-4: noted that decode-only TimeProfiler trace cannot inform GPU-counter / long-K-prefill questions, both remain open).  Trace artifacts referenced by absolute path (not committed); only `scripts/profile-p3aprime.sh`, this ADR section, and `docs/perf-traces/.gitkeep` land in git.  The 9th static-evidence kernel hypothesis class (Wave 1 P3b suspect list) joins the falsified-by-live-evidence list per `project_metal_compiler_auto_optimizes_static_levers` — the Mach-IPC / IOGPU-resource-creation overhead was not on Wave 1's static suspect list because grep against Rust source can't see kernel boundary crossings.
+- **2026-04-27 — P0 gemma baseline measured (iter4).**  hf2q `35fdcc8` / mlx-native `19f5569` measured against same-day llama-bench on `gemma-4-26B-A4B-it-ara-abliterated-dwq` n=256 cold-SoC: hf2q **87.8 t/s** (per-trial 87.7 / 87.8 / 88.0; σ ≈ 0.15) vs llama-bench **104.52 t/s** (per-trial 103.96 / 104.58 / 104.52) = **0.840×**, recovery required **+19.0%**.  Fills D4 second-bullet placeholder + closes Phasing P0 row.  Bench harness `scripts/bench-baseline.sh` lands alongside (RAM-headroom precheck + thermal-gate + JSON metadata + tee summary).  Two harness bugs caught + fixed in the follow-up commit (`run_*_trial` progress echo bled into captured stdout; llama-bench awk grabbed std-dev not median).  New diagnosis subsection ("2026-04-27 — P0 Gemma baseline (iter4) reshapes the phasing budget") captures the implications: gemma gap is structurally larger than qwen35 ADR-012 baseline (0.840× vs 0.94×) AND lives entirely outside CB-count (gemma is already at 1-2 CBs/token), so D1's gemma half is refactor-for-uniformity not perf lever; the lever is shared P3b orchestration, particularly rank-1 alloc_buffer pool which can apply to both families.  Adds a Track B for iter5/iter6: port the iter1 rope_multi cache pattern to gemma's `forward_mlx.rs` rope call sites.
 - **2026-04-27 — Wave 2b iter3 landed (aggregate_decode.py rewrite + 5-trial median harness).**  hf2q @ `bcd08dd` lands `scripts/aggregate_decode.py` + `scripts/aggregate_hypotheses.json` + `scripts/profile-p3aprime.sh` (default `N_TRIALS=5`).  Replaces the volatile `/tmp/cfa-adr015-wave2a-p3a-prime/aggregate_decode.py` working-copy that had AF3 (overlapping-inclusive-frame double-count) + AF4 (rank-stability split-on-tuple) bugs and used 3-trial mean instead of 5-trial median.  The new aggregator: (a) reports ONE canonical frame per hypothesis via the regex in `scripts/aggregate_hypotheses.json`, (b) lists named subcomponents side-by-side without summing them into the primary, (c) keeps frame names as `str` end-to-end with a typed dataclass for trial state, (d) defaults to 5-trial median (outlier-absorbing without silent discard).  Hypothesis register includes the new H6-Wave2b-AllocBuffer entry pointing at `MlxDevice::alloc_buffer::` for the rank-1 P3b lever.  H4's regex now targets `issue_metal_buffer_barrier` (the new `#[inline(never)]` frame from iter2) so TimeProfiler can attribute it; the `BARRIER_COUNT`/`BARRIER_NS` counters from iter2 provide the authoritative number.  Smoke-tested on synthetic xctrace XML — correct per-trial totals, median, subcomponent isolation, rank-stability table.  Closes Wave 2b hard gates #3, #4, #5.  Remaining Wave 2b hard gates: #1 (apex 35B-A3B MoE 5-cold-trial × 64-decode-token re-measurement) and #2 (already closed by iter2 BARRIER counters).
 - **2026-04-27 — Wave 2b iter2 landed (H4 counter-based barrier accounting).**  mlx-native @ `19f5569` adds atomic `BARRIER_COUNT` (always tracked) + `BARRIER_NS` (env-gated under `MLX_PROFILE_BARRIERS=1`) around the `memoryBarrierWithScope:` `objc::msg_send!` site at `/opt/mlx-native/src/encoder.rs:498-512`.  The objc dispatch is moved into a `#[inline(never)]` helper (`issue_metal_buffer_barrier`) so xctrace / Instruments has a stable Rust frame to attribute barrier time against, rather than being inlined / hidden under sibling Objective-C frames as it was at 1 ms TimeProfiler resolution in Wave 2a.  Public API: `mlx_native::barrier_count() -> u64`, `mlx_native::barrier_total_ns() -> u64`, `reset_counters()` extended.  Hot-path cost: 1 atomic fetch_add (~5 ns) + 1 OnceLock load when env-disabled (default); 2 × `Instant::now()` (~100-200 ns) when `MLX_PROFILE_BARRIERS=1` (opt-in only — adds ~22-44 µs/token at 440 barriers/token, comparable to what is being measured).  Tests in `tests/test_barrier_counter.rs` cover: pre-dispatch no-op skip, capture-mode skip, +3-after-3-barriers post-active-dispatch, ns-stays-0 with profile disabled.  Closes Wave 2b hard gate #2 (the H4 OPEN status from §"P3a' live profile pass" hypothesis register).
 - **2026-04-27 — P3b iter1 landed (rank-4 rope_multi hoist).**  mlx-native @ `a50c224` adds `dispatch_rope_multi_cached` (per-thread cache keyed by device + rope config) + bit-exact parity tests (`test_rope_multi_cached_matches_uncached_qwen35_decode_shape`, `test_rope_multi_cached_seq_len_variation`).  hf2q @ `74c28b9` switches `apply_imrope` (`gpu_full_attn.rs:361-417`) to the cached path; `mtp.rs` call sites pick up the change automatically (no signature change).  Closes the rank-4 lever from §"P3a' live profile pass" (208 µs/token measured on qwen3.6-27b-dwq46 dense fixture; 32 calls/token × 3 fresh `MlxBuffer` allocs/call dominated by mach_msg2_trap / IOGPUResourceCreate).  Steady-state qwen35 decode hot path now hits 2 stable cache entries (Q-config + K-config, seq_len=1) and amortizes the alloc cost across all decode tokens.  Bit-exact verified end-to-end via `qwen35::gpu_full_attn::tests::imrope_matches_cpu_ref` and `qwen35::gpu_full_attn::tests::full_layer_gpu_matches_cpu_ref` (full FullAttn layer including both apply_imrope calls); all tests use `to_bits()` equality.  Apex-MoE 35B-A3B re-measurement (Wave 2b hard gate) still required before ADR-012-baseline µs credit can be claimed against the 288 µs residual; this iter contributes a measured-on-dense lever, not a credited apex µs.
