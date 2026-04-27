@@ -1,10 +1,11 @@
-# ADR-015: mlx-native — single-CB decode forward pass for qwen35
+# ADR-015: mlx-native — general decode-path speed improvements (qwen35 + gemma)
 
-- **Status:** Proposed
-- **Date:** 2026-04-26
+- **Status:** Proposed (Phase 1 single-CB hypothesis revised by P2 calibration — see Diagnosis update §2026-04-26)
+- **Date:** 2026-04-26 (initial); revised same-day after P2 empirical data
 - **Authors:** Robert E. Lee + Claude Code
 - **Successor of:** ADR-012 §Optimize / Task #15 (closed at 0.94× of llama.cpp; cited the need for a "new mlx-native perf ADR")
-- **Sibling of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten)
+- **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
+- **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
 ## Context
 
@@ -44,39 +45,103 @@ The lever for decode is **single-CB forward pass**, not parallel encoding.
 
 (Prefill is a separate axis — see Non-Goals.)
 
+### 2026-04-26 — DIAGNOSIS UPDATE FROM P2 CALIBRATION
+
+The working assumption above (~5 µs/CB) was a citation, not a measurement.
+P2 (mlx-native `examples/cb_cost_calibration.rs`) measured it directly on
+M5 Max:
+
+| N    | regime     | wall_ms (median of 5) | µs/CB |
+|-----:|:-----------|----------------------:|------:|
+|   10 | async      |                 0.056 |  5.61 |
+|   10 | sync       |                 0.154 | 15.39 |
+|   10 | alloc+cmit |                 0.041 |  4.05 |
+|  100 | async      |                 0.174 |  1.74 |
+|  100 | sync       |                 1.694 | 16.94 |
+|  100 | alloc+cmit |                 0.179 |  1.79 |
+|  500 | async      |                 0.858 |  1.72 |
+|  500 | sync       |                 6.688 | 13.38 |
+|  500 | alloc+cmit |                 0.826 |  1.65 |
+| 1000 | async      |                 1.583 |  1.58 |
+| 1000 | sync       |                13.484 | 13.48 |
+| 1000 | alloc+cmit |                 1.617 |  1.62 |
+
+The **production hot path is `async`** (`enc.commit()` per layer, single
+terminal `commit_and_wait` for argmax download).  Steady-state
+**async µs/CB ≈ 1.6 µs** at N≥100 — **3.1× lower than the working
+assumption**.
+
+**Re-derived budget for hf2q qwen35 decode:**
+
+| Component | CBs | µs/CB | total |
+|---|---:|---:|---:|
+| hf2q qwen35 (102 CBs) | 102 | 1.6 | **163 µs** |
+| llama.cpp (1–2 CBs) | 1.5 | 1.6 | **2 µs** |
+| **CB-overhead gap** | | | **~160 µs** |
+
+Measured hf2q→llama.cpp gap = **~500 µs / token** (`fa3f9d6` /
+ADR-012 §Optimize).  CB-count alone explains **~32%** of the gap, not the
+~100% the original 5 µs/CB working assumption implied.
+
+**Implication: single-CB rewrite is necessary but insufficient.**  Even a
+perfect 102→1 CB collapse leaves ~340 µs / token (~68% of the gap)
+unexplained.  The remaining cost likely lives in **per-dispatch
+encoding** (hf2q decode issues ~1070 dispatches/token vs llama.cpp's
+similar count, but with a different per-dispatch cost profile) and/or
+**Rust-side orchestration overhead** (helper-function indirection,
+buffer-pool acquisition, barrier bookkeeping).
+
+ADR-015 phasing is updated below: **P3a** measures per-dispatch cost
+directly before P3 commits to the single-CB rewrite, so the upper bound
+on the rewrite's win is established empirically before multi-day
+implementation work is spent.
+
 ## Decision
 
-**D1.** Migrate `qwen35` decode forward to a **single `GraphSession`** (1 CB
-per forward pass), mirroring llama.cpp's `encode_async`
-(`ggml-metal-context.m:676–722`) — one logical command buffer encoded with
-explicit `encoder.memory_barrier()` between dependent op stages.
+**D1.** Migrate **both** `qwen35` and `gemma` decode forward paths to a
+**single `GraphSession`** (1 CB per forward pass), mirroring llama.cpp's
+`encode_async` (`ggml-metal-context.m:676–722`) — one logical command
+buffer encoded with explicit `encoder.memory_barrier()` between dependent
+op stages.  Order: `qwen35` first (proves the pattern on the harder MoE
++ DeltaNet shape), `gemma` second (port the established pattern to the
+dense-only path).
 
-**D2.** Keep the existing per-layer-encoder path as the legacy
-implementation behind `HF2Q_LEGACY_PER_LAYER_CB=1`. After a 7-day soak +
-sourdough-pass on the new path, delete the legacy path entirely (per
+**D2.** Keep the existing per-layer-encoder paths as the legacy
+implementation behind a single env var `HF2Q_LEGACY_PER_LAYER_CB=1` (covers
+both families).  After a 7-day soak + sourdough-pass on each family's new
+path, delete the legacy path for that family entirely (per
 `feedback_no_broken_windows`).
 
-**D3.** Bit-exact parity gate vs the current `forward_gpu_greedy` is
-mandatory (within 1e-5 max-abs logit error on the 16-prompt smoke set).
-No fallback path is shipped — if parity fails, the lever is wrong, fix
-it; don't gate the primary path off (per
+**D3.** Bit-exact parity gate vs the current decode entry points is
+mandatory **per family** (within 1e-5 max-abs logit error on each
+family's smoke set).  No fallback path is shipped — if parity fails, the
+lever is wrong; fix it, don't gate the primary path off (per
 `feedback_never_ship_fallback_without_rootcause`).
 
-**D4.** Exit criteria: `dwq46` `n=256` decode median **≥ 1.00× of llama.cpp**
-same-day median, 3 cold runs each, M5 Max, cold SoC per
-`feedback_perf_gate_thermal_methodology`.
+**D4.** Exit criteria — **both** families must clear the bar:
+  - **qwen35:** `dwq46` `n=256` decode median **≥ 1.00× of llama.cpp**
+    same-day median (3 cold runs each, M5 Max, cold SoC per
+    `feedback_perf_gate_thermal_methodology`).  Reference baseline from
+    ADR-012 closure: hf2q 109.1 t/s vs llama.cpp 116.0 t/s = **0.94×**.
+  - **gemma:** `gemma-4-26B-A4B-it-ara-abliterated-dwq` `n=256` decode
+    median **≥ 1.00× of llama.cpp** same-day median (same methodology).
+    Reference baseline must be re-measured at P0 (no committed value
+    on file as of 2026-04-26 — see Open Question Q1).
 
 ## Phasing
 
 | Phase | Deliverable | Definition of done |
 |---|---|---|
-| **P1 — Audit** | Map every cross-CB synchronization point in `forward_gpu` for the qwen35 path. List of `(commit/commit_and_wait → next encoder)` transitions and the buffer dependencies that justify each one. Output: a markdown table in this ADR. | Every CB boundary in the live qwen35 path is annotated with the data dependency it protects, OR documented as legacy / removable. |
-| **P2 — Empty-CB cost calibration** | Stand-alone bench: encode N (1, 10, 100, 1000) empty CBs in a tight loop on M5 Max; time wall-clock; compute µs/CB. Confirms or refutes the ~5 µs/CB working assumption. | Number is published in this ADR; if µs/CB ≪ 5, the upper bound on this ADR's win shrinks proportionally and we re-scope before P3. |
-| **P3 — Implementation** | New `forward_gpu_single_cb` in `src/inference/models/qwen35/forward_gpu.rs` — one `GraphSession`, all dispatches encoded, explicit `memory_barrier()` for cross-stage dependencies, single `commit()` at end. | Builds in release. Compiles without `unsafe` beyond what `mlx-native` already requires. |
-| **P4 — Parity gate** | 16-prompt smoke (`scripts/smoke-dwq46.sh` or equivalent) on the new path produces logits within 1e-5 max-abs of legacy path. | Logged in commit message. |
-| **P5 — Bench gate** | 3 cold runs of `hf2q --benchmark` on `dwq46` at `n=256` (cold SoC). Same-day llama-bench `-p 0 -n 256 -r 3` on the same model. Ratio computed. | Ratio ≥ 1.00× recorded in ADR + commit message. |
-| **P6 — Default cut-over** | `HF2Q_LEGACY_PER_LAYER_CB=1` is the only way back to legacy. Default = single-CB. | Smoke + bench gate green on default-default settings. |
-| **P7 — Soak + delete legacy** | 7-day window, no regressions. Then delete `forward_gpu_greedy` (legacy) entirely. | Diff-stat ≥ 1000 LOC removed. |
+| **P0 — Gemma baseline** | Same-day `gemma-4-26B-A4B-it-ara-abliterated-dwq` `n=256` decode median: 3 cold runs of `hf2q` + 3 of `llama-bench`. Establishes the gemma-side ratio. | Numbers recorded in this ADR as the baseline gemma-family bar. |
+| **P1 — Audit** | Map every cross-CB synchronization point in `forward_gpu` (qwen35) and `forward_decode` (Gemma) paths. List of `(commit/commit_and_wait → next encoder)` transitions and the buffer dependencies that justify each one. Output: a markdown table per family in this ADR. | Every CB boundary in each family's live path is annotated with the data dependency it protects, OR documented as legacy / removable. |
+| **P2 — Empty-CB cost calibration** | ✅ **Done 2026-04-26** — `mlx-native/examples/cb_cost_calibration.rs` measures async/sync/alloc-only µs/CB on M5 Max.  Result: **async µs/CB ≈ 1.6 µs at N≥100, NOT ~5 µs**.  Single-CB upper bound = ~160 µs / token of the ~500 µs gap (~32%). | Numbers published in §Diagnosis update above. |
+| **P3a — Per-dispatch cost calibration** ⬅ **NEW** | Stand-alone bench: encode N noop / 1-thread dispatches into 1 CB on M5 Max, measure µs/dispatch.  Compare hf2q's per-dispatch encoding cost to the per-dispatch budget llama.cpp implies (~150 µs CPU encode for ~1070 dispatches = ~0.14 µs/dispatch). | If hf2q per-dispatch ≈ llama.cpp per-dispatch, the 340 µs residual is orchestration / pool / barrier overhead → ADR-015 P4 picks "Rust-side orchestration sweep" as the second lever. If hf2q per-dispatch ≫ llama.cpp's, the lever is shader-launch overhead reduction. |
+| **P3 — Single-CB implementation (qwen35 first, gemma second)** | New `forward_gpu_single_cb` in `inference/models/qwen35/forward_gpu.rs` and `forward_decode_single_cb` in `serve/forward_mlx.rs`.  Each: one `GraphSession`, all dispatches encoded, explicit `memory_barrier()` for cross-stage dependencies, single `commit()` at end. | Builds in release.  No new `unsafe`. |
+| **P4 — Second-lever implementation** | Whichever lever P3a indicated (Rust-side orchestration sweep OR shader-launch overhead reduction).  Scope and approach defined post-P3a. | Lever's empirical win measured in isolation against the already-shipped P3 single-CB baseline. |
+| **P5 — Parity gate (per family)** | 16-prompt smoke on each family's new path produces logits within 1e-5 max-abs of legacy path. | Logged in commit message. |
+| **P6 — Bench gate (per family)** | 3 cold runs of `hf2q --benchmark` on `dwq46` and `gemma-4-26B-A4B-it-ara-abliterated-dwq` at `n=256` (cold SoC).  Same-day `llama-bench -p 0 -n 256 -r 3` on the same model.  Ratio computed per family. | Ratio ≥ 1.00× recorded for **both** families in ADR + commit message. |
+| **P7 — Default cut-over** | `HF2Q_LEGACY_PER_LAYER_CB=1` is the only way back to legacy.  Default = single-CB on both families. | Smoke + bench gate green on default-default settings. |
+| **P8 — Soak + delete legacy** | 7-day window, no regressions.  Then delete `forward_gpu_greedy` (qwen35 legacy) and the per-layer-GraphSession Gemma legacy entirely. | Diff-stat ≥ 1000 LOC removed across both families. |
 
 ## Open questions / risks
 
@@ -94,7 +159,6 @@ same-day median, 3 cold runs each, M5 Max, cold SoC per
 1. **Prefill parity** — `pp≥1024` parity inversion at `-ub 512` matched batching is a separate axis, owned by a future ADR. ADR-015 measures decode only.
 2. **Speculative / MTP decode** — ADR-013 P14 territory.
 3. **Sampler upgrades beyond greedy** — ADR-008 placement decision stands; sampling lives in hf2q `sampler_pure.rs`.
-4. **Apply to non-qwen35 paths** — Gemma's 30-CB / pass is a separate refactor. If P5 succeeds and the architecture pattern proves sound, a successor ADR can port Gemma.
 
 ## Alternatives considered
 
@@ -115,4 +179,6 @@ same-day median, 3 cold runs each, M5 Max, cold SoC per
 
 ## Changelog
 
-- **2026-04-26 — Proposed.** Diagnosis pivot from ADR-012 §Optimize: gap is CB-count, not CB-encode-time. Single-CB forward pass selected over `dispatch_apply` based on llama.cpp's own n_cb data.
+- **2026-04-26 — Proposed (initial).** Diagnosis pivot from ADR-012 §Optimize: gap is CB-count, not CB-encode-time. Single-CB forward pass selected over `dispatch_apply` based on llama.cpp's own n_cb data.
+- **2026-04-26 — Title broadened to "general decode-path speed improvements" + scope extended to gemma family** per standing directive *"we need this coherence and speed for qwen and gemma families of models"*.
+- **2026-04-26 — P2 calibration empirical:** `async µs/CB ≈ 1.6 µs` (3.1× lower than working assumption).  Single-CB recovers ~32% of the 500 µs gap, not ~100%.  Plan revised: P3a per-dispatch cost calibration inserted before P3; P4 added as a second-lever phase whose target is determined by P3a.  Title kept "single-CB" because that's still the first lever; scope is honestly "general decode speed improvements" with the single-CB rewrite as Phase 1 of N.
