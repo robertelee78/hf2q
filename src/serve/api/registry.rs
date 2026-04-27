@@ -2383,4 +2383,312 @@ mod tests {
         assert!(result.is_err(), "expected Err for unknown family");
         assert!(result.unwrap_err().contains("unknown_llama"));
     }
+
+    // -----------------------------------------------------------------------
+    // Wave 2.5 B1 — Required parameter enforcement tests
+    // -----------------------------------------------------------------------
+
+    /// B1 Gemma4: schema with `required` — required key present → accept.
+    #[test]
+    fn b1_gemma4_required_present_accept() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "units": {"type": "string"}
+            },
+            "required": ["city"]
+        }"#;
+        let mut rt = gemma4_runtime("get_weather", schema);
+        // city is required; units is optional but we include it too.
+        let input = b"call:get_weather{city:<|\"|>Paris<|\"|>,units:<|\"|>metric<|\"|>}";
+        assert!(rt.accept_bytes(input), "required key present should be accepted");
+        assert!(rt.is_accepted());
+    }
+
+    /// B1 Gemma4: schema with `required` — required key absent → reject.
+    #[test]
+    fn b1_gemma4_required_missing_reject() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "units": {"type": "string"}
+            },
+            "required": ["city"]
+        }"#;
+        let mut rt = gemma4_runtime("get_weather", schema);
+        // Only units supplied; city (required) is absent.
+        let input = b"call:get_weather{units:<|\"|>metric<|\"|>}";
+        let ok = rt.accept_bytes(input);
+        assert!(!(ok && rt.is_accepted()), "missing required key must be rejected");
+    }
+
+    /// B1 Gemma4: required key permuted (opposite order) → still accepted.
+    #[test]
+    fn b1_gemma4_required_permuted_accept() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "a": {"type": "integer"},
+                "b": {"type": "integer"}
+            },
+            "required": ["a", "b"]
+        }"#;
+        let mut rt = gemma4_runtime("add", schema);
+        // b before a — permutation grammar must accept both orderings.
+        let input = b"call:add{b:2,a:1}";
+        assert!(rt.accept_bytes(input), "permuted required keys must be accepted");
+        assert!(rt.is_accepted());
+    }
+
+    /// B1 Gemma4: schema with 17 required keys → EmitterError::TooManyRequiredKeys.
+    #[test]
+    fn b1_gemma4_too_many_required_keys_err() {
+        // Build a schema with 17 required keys (> MAX_REQUIRED_KEYS = 16).
+        let mut props = serde_json::Map::new();
+        let mut required = Vec::new();
+        for i in 0..17usize {
+            let k = format!("key{}", i);
+            props.insert(k.clone(), serde_json::json!({"type": "string"}));
+            required.push(serde_json::Value::String(k));
+        }
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": props,
+            "required": required
+        });
+        let result = GEMMA4.tool_call_gbnf("f", &schema);
+        assert!(result.is_err(), "17 required keys must return Err");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("17"), "error message should mention count: {}", msg);
+        assert!(msg.contains("16"), "error message should mention cap: {}", msg);
+    }
+
+    /// B1 Qwen35: required key present → accept.
+    #[test]
+    fn b1_qwen35_required_present_accept() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "units": {"type": "string"}
+            },
+            "required": ["city"]
+        }"#;
+        let mut rt = qwen35_runtime("get_weather", schema);
+        let input = b"<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=units>\nmetric\n</parameter>\n</function>";
+        assert!(rt.accept_bytes(input), "required key present should be accepted");
+        assert!(rt.is_accepted());
+    }
+
+    /// B1 Qwen35: required key absent → reject.
+    #[test]
+    fn b1_qwen35_required_missing_reject() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "units": {"type": "string"}
+            },
+            "required": ["city"]
+        }"#;
+        let mut rt = qwen35_runtime("get_weather", schema);
+        // Only units supplied; city (required) is absent.
+        let input = b"<function=get_weather>\n<parameter=units>\nmetric\n</parameter>\n</function>";
+        let ok = rt.accept_bytes(input);
+        assert!(!(ok && rt.is_accepted()), "missing required key must be rejected");
+    }
+
+    /// B1 Qwen35: required keys permuted → accept.
+    #[test]
+    fn b1_qwen35_required_permuted_accept() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "a": {"type": "integer"},
+                "b": {"type": "integer"}
+            },
+            "required": ["a", "b"]
+        }"#;
+        let mut rt = qwen35_runtime("add", schema);
+        // b before a.
+        let input = b"<function=add>\n<parameter=b>\n2\n</parameter>\n<parameter=a>\n1\n</parameter>\n</function>";
+        assert!(rt.accept_bytes(input), "permuted required keys must be accepted");
+        assert!(rt.is_accepted());
+    }
+
+    /// B1 Qwen35: 17 required keys → EmitterError::TooManyRequiredKeys.
+    #[test]
+    fn b1_qwen35_too_many_required_keys_err() {
+        let mut props = serde_json::Map::new();
+        let mut required = Vec::new();
+        for i in 0..17usize {
+            let k = format!("key{}", i);
+            props.insert(k.clone(), serde_json::json!({"type": "string"}));
+            required.push(serde_json::Value::String(k));
+        }
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": props,
+            "required": required
+        });
+        let result = QWEN35.tool_call_gbnf("f", &schema);
+        assert!(result.is_err(), "17 required keys must return Err");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("17"), "error message should mention count: {}", msg);
+        assert!(msg.contains("16"), "error message should mention cap: {}", msg);
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave 2.5 B3 — Nested schema rejection tests
+    // -----------------------------------------------------------------------
+
+    /// B3 Gemma4: `array` type parameter → structured Err.
+    #[test]
+    fn b3_gemma4_array_param_returns_err() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "items": {"type": "array"},
+                "name": {"type": "string"}
+            }
+        }"#;
+        let result = GEMMA4.tool_call_gbnf("process", &serde_json::from_str(schema).unwrap());
+        assert!(result.is_err(), "array type must return Err");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("array"), "error must mention type 'array': {}", msg);
+        assert!(msg.contains("items"), "error must mention param name: {}", msg);
+        assert!(msg.contains("process"), "error must mention function name: {}", msg);
+    }
+
+    /// B3 Gemma4: `object` type parameter → structured Err.
+    #[test]
+    fn b3_gemma4_nested_object_returns_err() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "config": {"type": "object"}
+            }
+        }"#;
+        let result = GEMMA4.tool_call_gbnf("configure", &serde_json::from_str(schema).unwrap());
+        assert!(result.is_err(), "object type must return Err");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("object"), "error must mention type 'object': {}", msg);
+    }
+
+    /// B3 Qwen35: `array` type parameter → structured Err.
+    #[test]
+    fn b3_qwen35_array_param_returns_err() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "tags": {"type": "array"}
+            }
+        }"#;
+        let result = QWEN35.tool_call_gbnf("tag_item", &serde_json::from_str(schema).unwrap());
+        assert!(result.is_err(), "array type must return Err");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("array"), "error must mention type 'array': {}", msg);
+        assert!(msg.contains("tags"), "error must mention param name: {}", msg);
+    }
+
+    /// B3 Qwen35: `object` type parameter → structured Err.
+    #[test]
+    fn b3_qwen35_nested_object_returns_err() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "metadata": {"type": "object"}
+            }
+        }"#;
+        let result = QWEN35.tool_call_gbnf("set_meta", &serde_json::from_str(schema).unwrap());
+        assert!(result.is_err(), "object type must return Err");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("object"), "error must mention type 'object': {}", msg);
+    }
+
+    /// B3 integration: both models, scalar params unaffected.
+    #[test]
+    fn b3_scalar_params_unaffected() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "count": {"type": "integer"},
+                "enabled": {"type": "boolean"}
+            }
+        });
+        assert!(GEMMA4.tool_call_gbnf("f", &schema).is_ok(), "scalars must not be rejected by B3");
+        assert!(QWEN35.tool_call_gbnf("f", &schema).is_ok(), "scalars must not be rejected by B3");
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave 2.5 B6 — str-char escape rule and trailing-newline audit tests
+    // -----------------------------------------------------------------------
+
+    /// B6 audit: Gemma4 grammar accepts a string value containing a backslash
+    /// sequence (e.g. `C:\Users\test`).  The `[^<\\] | [\\] [^\x00-\x1F]` rule
+    /// handles `\U` as backslash + non-control char.
+    /// Template reference: chat_template.jinja:113 emits `<|"|>arg<|"|>` raw;
+    /// no HTML escaping of backslash.  The grammar rule is therefore
+    /// conservative-correct: allows the escape pattern the model may produce.
+    #[test]
+    fn b6_gemma4_str_char_accepts_backslash_sequence() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {"path": {"type": "string"}}
+        }"#;
+        let mut rt = gemma4_runtime("read_file", schema);
+        // path contains a backslash sequence
+        let input = "call:read_file{path:<|\"|>C:\\Users\\test<|\"|>}";
+        assert!(
+            rt.accept_bytes(input.as_bytes()),
+            "backslash sequence in Gemma string must be accepted"
+        );
+        assert!(rt.is_accepted());
+    }
+
+    /// B6 audit: Qwen35 trailing newline rule — every `</parameter>` is
+    /// followed by `\n`.  Confirmed from tokenizer_config.json chat_template:
+    /// `{{- '\n</parameter>\n' }}`.  Grammar emits `newline_lit param_close_lit
+    /// newline_lit` for each block, including the last block before `</function>`.
+    #[test]
+    fn b6_qwen35_trailing_newline_on_last_param_required() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "location": {"type": "string"}
+            }
+        }"#;
+        let mut rt = qwen35_runtime("weather", schema);
+        // Canonical template emission: every </parameter> has trailing \n.
+        let correct = b"<function=weather>\n<parameter=location>\nParis\n</parameter>\n</function>";
+        assert!(
+            rt.accept_bytes(correct),
+            "trailing \\n after </parameter> must be accepted"
+        );
+        assert!(rt.is_accepted(), "must be accepted");
+    }
+
+    /// B6 audit: Qwen35 grammar rejects emission without trailing newline
+    /// after `</parameter>`.  The template always emits the trailing newline,
+    /// so a grammar that accepted the no-newline form would be too permissive.
+    #[test]
+    fn b6_qwen35_no_trailing_newline_rejected() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "location": {"type": "string"}
+            }
+        }"#;
+        let mut rt = qwen35_runtime("weather", schema);
+        // Missing trailing \n after </parameter>.
+        let wrong = b"<function=weather>\n<parameter=location>\nParis\n</parameter></function>";
+        let ok = rt.accept_bytes(wrong);
+        assert!(
+            !(ok && rt.is_accepted()),
+            "emission without trailing \\n after </parameter> must be rejected"
+        );
+    }
 }

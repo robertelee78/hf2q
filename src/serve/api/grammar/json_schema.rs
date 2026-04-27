@@ -476,120 +476,227 @@ impl Converter {
             return Ok(r#""{" space "}" space"#.into());
         }
 
-        // Required keys: any-order permutation (O(2^N) rules).
-        let req_rule_ref: Option<String> = if required_keys.is_empty() {
-            None
-        } else {
-            Some(self.build_required_permutation(&slug, &required_keys, &kv_rule_name))
-        };
+        // Cap: true any-position interleaving encodes state as a bitmask of
+        // (required_remaining, optional_remaining) — O(2^N_req * 2^N_opt) rules.
+        // Reject schemas that would generate more state than the grammar engine
+        // can reasonably compile.
+        let n_total = required_keys.len() + optional_keys.len();
+        if n_total > 32 {
+            return Err(SchemaError {
+                path: path.to_string(),
+                message: format!(
+                    "object schema has {} properties (required={} + optional={}); \
+                     max supported for any-position grammar is 32",
+                    n_total,
+                    required_keys.len(),
+                    optional_keys.len(),
+                ),
+            });
+        }
 
-        // Optional keys + extra-kv wildcard (O(N^2) rules).
-        let opt_suffix = self.build_optional_suffix(
-            &slug,
-            &optional_keys,
-            &kv_rule_name,
-            !additional_closed,
-        );
+        // Build extra-kv wildcard rule (shared across all states if allowed).
+        if !additional_closed {
+            let extra_kv_name = format!("{}-extra-kv", slug);
+            self.rules
+                .entry(extra_kv_name)
+                .or_insert_with(|| "string \":\" space value".to_string());
+        }
 
-        // Compose: required_block [optional_suffix]
-        let inner = match (&req_rule_ref, opt_suffix.as_str()) {
-            (None, "") => {
+        // Unified any-position inner rule.  State = (req_remaining_bitmask,
+        // opt_remaining_bitmask).  At each position the grammar may emit any
+        // not-yet-emitted required key, any not-yet-emitted optional key, or
+        // any extra key (if additionalProperties is permissive).  All required
+        // keys must appear exactly once; optional keys at most once; extra keys
+        // may repeat.
+        //
+        // Compute the inner rule reference (the first key-value pair and all
+        // subsequent ones).
+        let inner = if required_keys.is_empty() {
+            // No required keys: the whole object body is optional.
+            // Build an opt-chain for the possible keys and wrap it in `( ... )?`
+            // so `{}` is also accepted.
+            let mut entries: Vec<(String, bool)> = optional_keys
+                .iter()
+                .map(|k| (kv_rule_name[k].clone(), false))
+                .collect();
+            if !additional_closed {
+                let extra_kv_name = format!("{}-extra-kv", slug);
+                entries.push((extra_kv_name, true));
+            }
+            if entries.is_empty() {
                 return Ok(r#""{" space "}" space"#.into());
             }
-            (Some(req), "") => req.clone(),
-            (None, opt) => opt.to_string(),
-            (Some(req), opt) => format!("{} {}", req, opt),
+            let chain = self.build_optional_chain(&slug, &entries);
+            format!("( {} )?", chain)
+        } else {
+            // Full initial bitmasks: all bits set for all required / optional keys.
+            let req_full: u32 = (1u32 << required_keys.len()) - 1;
+            let opt_full: u32 = if optional_keys.is_empty() {
+                0
+            } else {
+                (1u32 << optional_keys.len()) - 1
+            };
+            self.build_unified_inner(
+                &slug,
+                req_full,
+                opt_full,
+                &required_keys,
+                &optional_keys,
+                &kv_rule_name,
+                !additional_closed,
+            )
         };
 
         Ok(format!(r#""{{" space {} "}}" space"#, inner))
     }
 
-    /// Build the any-order permutation grammar for a non-empty set of
-    /// required keys. Returns the name of the top-level permutation rule
-    /// for the full set.
+    /// Build the unified any-position inner rule for state
+    /// `(req_remaining, opt_remaining)`.  Returns the name of the emitted
+    /// GBNF rule.
     ///
-    /// Algorithm: for each subset S of required keys, emit a rule
-    /// `slug-req-<sorted-names>` that alternates over "which key comes
-    /// first". Base case: singleton set — just reference the kv rule.
-    /// Memoized so each distinct subset is emitted exactly once.
-    fn build_required_permutation(
+    /// # Contract
+    ///
+    /// `req_remaining` MUST be non-zero on entry (the caller uses
+    /// `build_optional_chain` for the all-optional case).
+    ///
+    /// Rule semantics: emits the first key-value pair of the current slot,
+    /// then either:
+    ///   - A comma + space + the next state rule, OR
+    ///   - Nothing (closes the object) — only when req_remaining has a single
+    ///     bit set AND opt_remaining/extra are handled by the opt-suffix tail.
+    ///
+    /// # Naming
+    ///
+    /// `{slug}-up-r{req_remaining:08x}-o{opt_remaining:08x}` — "up" for
+    /// Unified Permutation; hex bitmasks are fixed-width for readability.
+    fn build_unified_inner(
         &mut self,
         slug: &str,
-        required: &[String],
+        req_remaining: u32,
+        opt_remaining: u32,
+        required_keys: &[String],
+        optional_keys: &[String],
         kv_rule_name: &HashMap<String, String>,
+        allow_extra_kv: bool,
     ) -> String {
-        let mut sorted = required.to_vec();
-        sorted.sort();
-
-        let id_parts: Vec<String> = sorted.iter().map(|k| sanitize_rule_name(k)).collect();
-        let rule_name = format!("{}-req-{}", slug, id_parts.join("-"));
+        let rule_name = format!(
+            "{}-up-r{:08x}-o{:08x}",
+            slug, req_remaining, opt_remaining
+        );
 
         if self.rules.contains_key(&rule_name) {
             return rule_name;
         }
 
-        if sorted.len() == 1 {
-            // Base case: rule body is just the kv rule name (a reference).
-            let kv = kv_rule_name[&sorted[0]].clone();
-            self.rules.insert(rule_name.clone(), kv);
-            return rule_name;
-        }
-
-        // Insert placeholder before recursing to allow memoization check
-        // to short-circuit on any path that would re-enter (defensive; the
-        // required set is finite and strictly shrinking so no true cycles).
+        // Placeholder prevents re-entrant infinite loops (defensive; the
+        // state strictly decrements so no true cycles except via the extra-kv
+        // self-loop which is inlined, not recursive on the same state).
         self.rules.insert(rule_name.clone(), String::new());
 
         let mut alts: Vec<String> = Vec::new();
-        for (i, k) in sorted.iter().enumerate() {
+
+        // --- Alternatives: emit one required key ---
+        for (i, k) in required_keys.iter().enumerate() {
+            if req_remaining & (1u32 << i) == 0 {
+                continue; // already emitted
+            }
             let kv = kv_rule_name[k].clone();
-            let remaining: Vec<String> = sorted
-                .iter()
-                .enumerate()
-                .filter(|(j, _)| *j != i)
-                .map(|(_, s)| s.clone())
-                .collect();
-            let rest = self.build_required_permutation(slug, &remaining, kv_rule_name);
-            alts.push(format!("{} \",\" space {}", kv, rest));
+            let new_req = req_remaining & !(1u32 << i);
+
+            if new_req == 0 {
+                // Last required key: after it, object may close or continue
+                // with optional / extra keys.  Build the optional tail suffix.
+                let opt_suffix = self.build_optional_suffix_masked(
+                    slug,
+                    opt_remaining,
+                    optional_keys,
+                    kv_rule_name,
+                    allow_extra_kv,
+                );
+                let alt = if opt_suffix.is_empty() {
+                    kv.clone()
+                } else {
+                    format!("{} {}", kv, opt_suffix)
+                };
+                alts.push(alt);
+            } else {
+                // More required keys remain: comma is mandatory.
+                let next = self.build_unified_inner(
+                    slug,
+                    new_req,
+                    opt_remaining,
+                    required_keys,
+                    optional_keys,
+                    kv_rule_name,
+                    allow_extra_kv,
+                );
+                alts.push(format!("{} \",\" space {}", kv, next));
+            }
         }
+
+        // --- Alternatives: emit one optional key before all required are done ---
+        for (j, o) in optional_keys.iter().enumerate() {
+            if opt_remaining & (1u32 << j) == 0 {
+                continue; // already emitted
+            }
+            let kv = kv_rule_name[o].clone();
+            let new_opt = opt_remaining & !(1u32 << j);
+            // Required state unchanged; comma mandatory (required keys still remain).
+            let next = self.build_unified_inner(
+                slug,
+                req_remaining,
+                new_opt,
+                required_keys,
+                optional_keys,
+                kv_rule_name,
+                allow_extra_kv,
+            );
+            alts.push(format!("{} \",\" space {}", kv, next));
+        }
+
+        // --- Alternative: emit one extra key before all required are done ---
+        // Extra keys can repeat (wildcard), so this creates a self-loop via
+        // the same state.  We inline this as an alternative that references
+        // the current rule_name so GBNF handles the Kleene-star semantics.
+        if allow_extra_kv {
+            let extra_kv_name = format!("{}-extra-kv", slug);
+            // Self-referential: extra-kv "," space <this rule>
+            alts.push(format!("{} \",\" space {}", extra_kv_name, rule_name));
+        }
+
         let body = alts.join(" | ");
         self.rules.insert(rule_name.clone(), body);
         rule_name
     }
 
-    /// Build the optional-key suffix: a GBNF fragment of the form
-    /// `( "," space <opt-chain-rule> )?` if there are optional entries,
-    /// or an empty string if there is nothing optional to add.
+    /// Build the optional suffix for the tail AFTER the last required key has
+    /// been emitted.  Only optional keys still in `opt_mask` are considered.
     ///
-    /// `allow_extra_kv`: if true, a `string ":" space value` wildcard is
-    /// added to the optional chain so unknown keys are silently accepted
-    /// (the JSON Schema default when additionalProperties is unset/true).
-    fn build_optional_suffix(
+    /// Returns a GBNF fragment of the form `( "," space <chain> )?` or an
+    /// empty string when there are no optional keys and no extra-kv.
+    fn build_optional_suffix_masked(
         &mut self,
         slug: &str,
+        opt_mask: u32,
         optional_keys: &[String],
         kv_rule_name: &HashMap<String, String>,
         allow_extra_kv: bool,
     ) -> String {
-        let mut entries: Vec<(String, bool)> = optional_keys
-            .iter()
-            .map(|k| (kv_rule_name[k].clone(), false))
-            .collect();
-
+        let mut entries: Vec<(String, bool)> = Vec::new();
+        for (j, o) in optional_keys.iter().enumerate() {
+            if opt_mask & (1u32 << j) != 0 {
+                entries.push((kv_rule_name[o].clone(), false));
+            }
+        }
         if allow_extra_kv {
             let extra_kv_name = format!("{}-extra-kv", slug);
-            self.rules
-                .entry(extra_kv_name.clone())
-                .or_insert_with(|| "string \":\" space value".to_string());
             entries.push((extra_kv_name, true));
         }
-
         if entries.is_empty() {
             return String::new();
         }
-
-        let top = self.build_optional_chain(slug, &entries);
-        format!("( \",\" space {} )?", top)
+        let chain = self.build_optional_chain(slug, &entries);
+        format!("( \",\" space {} )?", chain)
     }
 
     /// Recursively build the optional-chain rule for `entries`.
@@ -1256,5 +1363,229 @@ mod tests {
             "rejected extra key when additionalProperties unset (must be permissive)"
         );
         assert!(rt.is_accepted());
+    }
+
+    // -----------------------------------------------------------------
+    // Wave-2.5 W-δ C2 additions — T1.8 prereq + large-schema guard
+    // -----------------------------------------------------------------
+
+    /// T1.8 prereq object: optional key BEFORE required key.
+    ///
+    /// When a schema has both optional and required properties the
+    /// grammar must accept any interleaving, including optional-first.
+    #[test]
+    fn prereq_optional_key_before_required() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "name":  {"type": "string"},
+                "title": {"type": "string"}
+            },
+            "required": ["name"]
+        }"#;
+        // title (optional) before name (required).
+        let mut rt = runtime(schema);
+        assert!(
+            rt.accept_bytes(br#"{"title":"Dr","name":"Alice"}"#),
+            "optional key before required key was rejected"
+        );
+        assert!(rt.is_accepted(), "not accepted after optional-before-required");
+    }
+
+    /// T1.8 prereq object: extra keys interspersed around required key.
+    ///
+    /// extras-then-required-then-extras (with additionalProperties unset
+    /// so extra keys are permissive).
+    #[test]
+    fn prereq_extras_surrounding_required_key() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer"}
+            },
+            "required": ["id"]
+        }"#;
+        // extra before, id in middle, extra after.
+        let mut rt = runtime(schema);
+        assert!(
+            rt.accept_bytes(br#"{"before":"x","id":1,"after":"y"}"#),
+            "extras-then-required-then-extras was rejected (additionalProperties unset)"
+        );
+        assert!(rt.is_accepted());
+    }
+
+    /// T1.8 prereq object: only extra keys, no required keys → accept when
+    /// additionalProperties is unset (permissive) and there are no required fields.
+    #[test]
+    fn prereq_only_extra_keys_no_required() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {}
+        }"#;
+        // No required fields; extra keys must be accepted.
+        let mut rt = runtime(schema);
+        assert!(
+            rt.accept_bytes(br#"{"anything":"goes"}"#),
+            "no-required-keys object with only extra keys was rejected"
+        );
+        assert!(rt.is_accepted());
+    }
+
+    /// T1.8 prereq object: multiple extra keys before and after multiple
+    /// required keys.
+    #[test]
+    fn prereq_extras_before_and_after_two_required() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "a": {"type": "integer"},
+                "b": {"type": "integer"}
+            },
+            "required": ["a", "b"]
+        }"#;
+        // extra, a, extra, b, extra.
+        let mut rt = runtime(schema);
+        assert!(
+            rt.accept_bytes(br#"{"z":0,"a":1,"y":0,"b":2,"x":0}"#),
+            "extras interspersed between two required keys was rejected"
+        );
+        assert!(rt.is_accepted());
+    }
+
+    /// T1.8 prereq object: extra keys before all required keys.
+    #[test]
+    fn prereq_multiple_extras_then_required() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"}
+            },
+            "required": ["name"]
+        }"#;
+        // Two extra keys, then the required key.
+        let mut rt = runtime(schema);
+        assert!(
+            rt.accept_bytes(br#"{"x":"v1","y":"v2","name":"Alice"}"#),
+            "multiple extras before required key was rejected"
+        );
+        assert!(rt.is_accepted());
+    }
+
+    /// B4 — extras BEFORE required key with additionalProperties:false → reject.
+    ///
+    /// When additionalProperties is false the grammar is closed: only declared
+    /// property keys are accepted.  An extra key appearing before the required
+    /// key must cause the grammar to reject the input.
+    #[test]
+    fn extras_before_required_additional_properties_false_rejects() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"}
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }"#;
+        // Extra key before required key — must be rejected.
+        let mut rt = runtime(schema);
+        let ok = rt.accept_bytes(br#"{"extra":"x","name":"Alice"}"#);
+        assert!(
+            !(ok && rt.is_accepted()),
+            "accepted extra key before required when additionalProperties:false"
+        );
+        // Just the required key — must be accepted.
+        let mut rt = runtime(schema);
+        assert!(rt.accept_bytes(br#"{"name":"Alice"}"#));
+        assert!(rt.is_accepted());
+    }
+
+    /// B4 — key duplication → reject (one-time semantics).
+    ///
+    /// An optional key that has already been emitted must not be re-emittable
+    /// at a later position.  We verify this by checking that a duplicate
+    /// optional key causes the runtime to fail (either accept_bytes returns
+    /// false or is_accepted returns false after the whole input).
+    #[test]
+    fn duplicate_optional_key_rejected() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "name":  {"type": "string"},
+                "title": {"type": "string"}
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }"#;
+        // Duplicate optional key "title" — grammar must reject.
+        let mut rt = runtime(schema);
+        let ok = rt.accept_bytes(br#"{"name":"Alice","title":"Dr","title":"Prof"}"#);
+        assert!(
+            !(ok && rt.is_accepted()),
+            "accepted duplicate optional key 'title'"
+        );
+        // Unique keys — must be accepted.
+        let mut rt = runtime(schema);
+        assert!(rt.accept_bytes(br#"{"name":"Alice","title":"Dr"}"#));
+        assert!(rt.is_accepted());
+    }
+
+    /// T1.8 large-schema guard: a schema with 33 properties must return
+    /// `Err(SchemaError)` because the any-position grammar state-machine
+    /// cap is 32 (n_total > 32 check at json_schema.rs:484).
+    ///
+    /// This validates W-γ2 B4: the emitter rejects oversize schemas with a
+    /// clear error rather than generating an exponentially large grammar.
+    #[test]
+    fn large_schema_33_properties_returns_error() {
+        // Build a schema with 33 properties, all required.
+        let mut props = serde_json::Map::new();
+        let mut required = Vec::new();
+        for i in 0..33usize {
+            let key = format!("prop{:02}", i);
+            props.insert(key.clone(), serde_json::json!({"type": "string"}));
+            required.push(serde_json::Value::String(key));
+        }
+        let schema = serde_json::Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("type".into(), serde_json::json!("object"));
+            m.insert("properties".into(), serde_json::Value::Object(props));
+            m.insert("required".into(), serde_json::Value::Array(required));
+            m
+        });
+
+        let err = schema_to_gbnf(&schema).unwrap_err();
+        assert!(
+            err.message.contains("33") || err.message.contains("max supported"),
+            "expected error mentioning property count or 'max supported'; got: {:?}",
+            err.message
+        );
+    }
+
+    /// T1.8 large-schema guard: a schema with exactly 32 properties must
+    /// compile successfully (boundary condition: 32 is the last allowed value).
+    #[test]
+    fn large_schema_32_properties_compiles_ok() {
+        let mut props = serde_json::Map::new();
+        let mut required = Vec::new();
+        for i in 0..32usize {
+            let key = format!("prop{:02}", i);
+            props.insert(key.clone(), serde_json::json!({"type": "string"}));
+            required.push(serde_json::Value::String(key));
+        }
+        let schema = serde_json::Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("type".into(), serde_json::json!("object"));
+            m.insert("properties".into(), serde_json::Value::Object(props));
+            m.insert("required".into(), serde_json::Value::Array(required));
+            m
+        });
+
+        // Must not error — 32 is exactly the cap.
+        let result = schema_to_gbnf(&schema);
+        assert!(
+            result.is_ok(),
+            "32-property schema failed to compile (must be <= cap=32): {:?}",
+            result.err()
+        );
     }
 }

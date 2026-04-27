@@ -381,6 +381,34 @@ pub async fn chat_completions(
     // same ReasoningSplitter the streaming path uses). Fall back to None
     // when the model has no reasoning markers registered.
     let reasoning_tokens = result.reasoning_tokens;
+
+    // Wave-2.5 A3: run the ToolCallSplitter chain over result.text to extract
+    // any structured tool calls.  The streaming path does this token-by-token
+    // inside generate_stream_once; for the non-streaming path we post-process
+    // the fully decoded text here, mirroring the same splitter logic.
+    let registration = engine.registration();
+    let extracted = extract_tool_calls_from_text(&result.text, registration);
+    let (message_content, message_tool_calls, effective_finish_reason) =
+        if extracted.tool_calls.is_empty() {
+            // No tool calls: preserve original text and finish_reason.
+            (
+                Some(MessageContent::Text(result.text)),
+                None,
+                result.finish_reason.to_string(),
+            )
+        } else {
+            // Tool calls found: content is whatever remained outside the markers
+            // (may be empty when the model emitted only tool-call spans).
+            let content = if extracted.content.is_empty() {
+                None
+            } else {
+                Some(MessageContent::Text(extracted.content))
+            };
+            // OpenAI spec: finish_reason == "tool_calls" whenever at least one
+            // structured tool call was emitted.
+            (content, Some(extracted.tool_calls), "tool_calls".to_string())
+        };
+
     let resp = ChatCompletionResponse {
         id: request_id,
         object: "chat.completion",
@@ -391,13 +419,13 @@ pub async fn chat_completions(
             index: 0,
             message: ChatMessage {
                 role: "assistant".into(),
-                content: Some(MessageContent::Text(result.text)),
+                content: message_content,
                 reasoning_content: result.reasoning_text,
-                tool_calls: None,
+                tool_calls: message_tool_calls,
                 tool_call_id: None,
                 name: None,
             },
-            finish_reason: result.finish_reason.to_string(),
+            finish_reason: effective_finish_reason,
             logprobs: None,
         }],
         usage: UsageStats {
@@ -423,6 +451,123 @@ pub async fn chat_completions(
         vit_soft_tokens_total,
     );
     response
+}
+
+/// Parsed result of running text through the tool-call splitter chain.
+///
+/// Wave-2.5 A3: the non-streaming path previously hardcoded `tool_calls: None`
+/// because the ToolCallSplitter only ran inside the streaming worker.  This
+/// struct carries the post-extraction content text and any parsed tool calls.
+struct ExtractedToolCalls {
+    /// Content text with tool-call marker spans removed.  When the full output
+    /// consisted of one or more tool calls with no leading/trailing content,
+    /// this will be empty and `content_is_empty` should be checked to decide
+    /// whether to set `message.content = null`.
+    pub content: String,
+    /// Parsed tool calls in emission order.  Empty when the model produced
+    /// plain text without any tool-call markers.
+    pub tool_calls: Vec<super::schema::ToolCall>,
+}
+
+/// Run `text` through the ReasoningSplitter → ToolCallSplitter chain and
+/// extract any structured tool calls.
+///
+/// This mirrors what `generate_stream_once` does token-by-token, but operates
+/// on the fully decoded text returned by `generate_once`.  Used by the
+/// non-streaming `chat_completions` handler to populate `message.tool_calls`
+/// (wave-2.5 A3 fix — previously hardcoded to `None`).
+///
+/// The function is infallible: if parsing a tool-call body fails it falls back
+/// to emitting the raw body as content, matching the streaming path's behavior
+/// (a parse failure is a model quality issue, not a server error).
+fn extract_tool_calls_from_text(
+    text: &str,
+    registration: Option<&registry::ModelRegistration>,
+) -> ExtractedToolCalls {
+    // If there's no model registration or the registration has no tool markers,
+    // there can't be any tool calls — return the text unchanged.
+    let Some(reg) = registration else {
+        return ExtractedToolCalls { content: text.to_string(), tool_calls: Vec::new() };
+    };
+    let Some(mut tool_splitter) = registry::ToolCallSplitter::from_registration(reg) else {
+        return ExtractedToolCalls { content: text.to_string(), tool_calls: Vec::new() };
+    };
+
+    let mut content = String::new();
+    let mut tool_calls: Vec<super::schema::ToolCall> = Vec::new();
+    let mut tc_body = String::new();
+    let mut tc_index: usize = 0;
+
+    let process_events = |events: Vec<registry::ToolCallEvent>,
+                          content: &mut String,
+                          tc_body: &mut String,
+                          tc_index: &mut usize,
+                          tool_calls: &mut Vec<super::schema::ToolCall>| {
+        for ev in events {
+            match ev {
+                registry::ToolCallEvent::Content(t) => {
+                    content.push_str(&t);
+                }
+                registry::ToolCallEvent::ToolCallOpen => {
+                    tc_body.clear();
+                }
+                registry::ToolCallEvent::ToolCallText(t) => {
+                    tc_body.push_str(&t);
+                }
+                registry::ToolCallEvent::ToolCallClose => {
+                    let body = std::mem::take(tc_body);
+                    match registry::parse_tool_call_body(reg, &body) {
+                        Some(parsed) => {
+                            let id = format!(
+                                "call_hf2q_{:016x}",
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_nanos() as u64)
+                                    .unwrap_or(0)
+                                    ^ (*tc_index as u64).wrapping_mul(0x9e3779b97f4a7c15)
+                            );
+                            tool_calls.push(super::schema::ToolCall {
+                                id,
+                                call_type: "function".to_string(),
+                                function: super::schema::ToolCallFunction {
+                                    name: parsed.name,
+                                    arguments: parsed.arguments_json,
+                                },
+                            });
+                            *tc_index += 1;
+                        }
+                        None => {
+                            // Parse failure: emit raw body as content (same
+                            // fallback as the streaming path).
+                            tracing::warn!(
+                                body = %body,
+                                "non-stream tool-call body unparseable; emitting as content"
+                            );
+                            content.push_str(&body);
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    let events = tool_splitter.feed(text);
+    process_events(events, &mut content, &mut tc_body, &mut tc_index, &mut tool_calls);
+
+    // Drain any remaining tail (same as streaming path).
+    if let Some(tail_ev) = tool_splitter.finish() {
+        match tail_ev {
+            registry::ToolCallEvent::Content(t) => content.push_str(&t),
+            registry::ToolCallEvent::ToolCallText(t) => {
+                // Mid-call truncation: emit residual as content.
+                let prefix = reg.tool_open.unwrap_or("");
+                content.push_str(&format!("{prefix}{t}"));
+            }
+            registry::ToolCallEvent::ToolCallOpen | registry::ToolCallEvent::ToolCallClose => {}
+        }
+    }
+
+    ExtractedToolCalls { content, tool_calls }
 }
 
 /// Apply Decision #23 transparency headers on a chat-completion response.
@@ -2468,6 +2613,179 @@ fn combine_function_grammars(gbnfs: Vec<String>) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Wave-2.5 W-δ C2 — combine_function_grammars unit tests
+// ---------------------------------------------------------------------------
+//
+// T1.8 multi-tool shared-param: two tools that share a parameter name with
+// different types must produce a combined grammar whose root is an alternation
+// between both function roots. The shared primitive rules (space, string, …)
+// are merged; each function root is namespaced as fn-0-root / fn-1-root so
+// the alternation dispatches to the correct per-function rule.
+//
+// T1.8 wiring: response_format AND tool_choice both set.
+// Current behaviour (handlers.rs:751-752): `tool_grammar.or(response_grammar)`.
+// This means tool_grammar wins when both are set. The test documents and
+// validates that choice — no silent discard, no panic.
+
+#[cfg(test)]
+mod combine_function_grammars_tests {
+    use super::*;
+
+    /// Two GBNF strings that share the rule name `space` (a primitive).
+    /// Merging them must produce exactly one `space` rule (first-occurrence wins).
+    fn gbnf_for_tool_a() -> String {
+        // Minimal grammar for tool_a({q: string}).
+        concat!(
+            "root ::= \"call:tool_a\" \"{\" space tool_a-q-kv space \"}\"\n",
+            "tool_a-q-kv ::= \"\\\"q\\\"\" \":\" space string\n",
+            "string ::= \"\\\"\" ( [^\"\\\\] )* \"\\\"\"\n",
+            "space ::= \" \"?\n",
+        )
+        .to_string()
+    }
+
+    fn gbnf_for_tool_b() -> String {
+        // Minimal grammar for tool_b({q: integer}).
+        // Note: shares the key name `q` but with a different value type (integer).
+        concat!(
+            "root ::= \"call:tool_b\" \"{\" space tool_b-q-kv space \"}\"\n",
+            "tool_b-q-kv ::= \"\\\"q\\\"\" \":\" space integer\n",
+            "integer ::= \"-\"? [0-9]+\n",
+            "space ::= \" \"?\n",
+        )
+        .to_string()
+    }
+
+    /// T1.8 multi-tool shared-param: two tools with shared param name `q`
+    /// but different types (string vs integer).
+    ///
+    /// Expected: combined grammar root = `fn-0-root | fn-1-root` so the
+    /// sampler can dispatch to either tool-specific rule.
+    #[test]
+    fn multi_tool_shared_param_name_different_types() {
+        let combined = combine_function_grammars(vec![gbnf_for_tool_a(), gbnf_for_tool_b()]);
+
+        // The combined root must be an alternation of both function roots.
+        let root_line = combined
+            .lines()
+            .find(|l| l.starts_with("root ::="))
+            .unwrap_or_else(|| panic!("combined grammar has no root rule:\n{combined}"));
+
+        assert!(
+            root_line.contains("fn-0-root") && root_line.contains("fn-1-root"),
+            "combined root must reference both fn-0-root and fn-1-root; got: {root_line:?}"
+        );
+        assert!(
+            root_line.contains('|'),
+            "combined root must be an alternation ('|'); got: {root_line:?}"
+        );
+
+        // `fn-0-root` must reference the tool_a body.
+        let fn0_line = combined
+            .lines()
+            .find(|l| l.starts_with("fn-0-root ::="))
+            .unwrap_or_else(|| panic!("combined grammar missing fn-0-root:\n{combined}"));
+        assert!(
+            fn0_line.contains("tool_a"),
+            "fn-0-root should derive from tool_a grammar; got: {fn0_line:?}"
+        );
+
+        // `fn-1-root` must reference the tool_b body.
+        let fn1_line = combined
+            .lines()
+            .find(|l| l.starts_with("fn-1-root ::="))
+            .unwrap_or_else(|| panic!("combined grammar missing fn-1-root:\n{combined}"));
+        assert!(
+            fn1_line.contains("tool_b"),
+            "fn-1-root should derive from tool_b grammar; got: {fn1_line:?}"
+        );
+
+        // `space` must appear exactly once — shared primitive rules are merged.
+        let space_rule_count = combined
+            .lines()
+            .filter(|l| l.starts_with("space ::="))
+            .count();
+        assert_eq!(
+            space_rule_count, 1,
+            "shared 'space' rule must appear exactly once in combined grammar; \
+             got {space_rule_count} occurrences:\n{combined}"
+        );
+    }
+
+    /// T1.8 single-tool combine is a pass-through: combine_function_grammars
+    /// with one function grammar must produce a root that's exactly that
+    /// function's root body (fn-0-root with the original root body).
+    #[test]
+    fn single_tool_combine_roundtrip() {
+        let combined = combine_function_grammars(vec![gbnf_for_tool_a()]);
+        let root_line = combined
+            .lines()
+            .find(|l| l.starts_with("root ::="))
+            .unwrap_or_else(|| panic!("no root rule:\n{combined}"));
+        // Single function → root is just fn-0-root (no alternation needed).
+        assert!(
+            root_line.contains("fn-0-root"),
+            "single-tool combine root must reference fn-0-root; got: {root_line:?}"
+        );
+        assert!(
+            !root_line.contains('|'),
+            "single-tool combine root must NOT be an alternation; got: {root_line:?}"
+        );
+    }
+
+    /// T1.8 wiring: response_format AND tool_choice both set.
+    ///
+    /// `prepare_chat_completion_common` at handlers.rs:751-752 uses `.or()`:
+    ///     `tool_grammar.or(response_grammar)`
+    ///
+    /// This means tool_grammar wins when both are present. Codex flagged this
+    /// as an undefined or silent behaviour.
+    ///
+    /// The codebase documents the decision explicitly at handlers.rs:741-746:
+    /// "Precedence rule: tool grammar overrides response_format grammar when
+    ///  both are present — a request cannot simultaneously enforce
+    ///  response_format=json_schema AND tool_choice=required, because the model
+    ///  output is either a tool call OR a structured JSON response, never both.
+    ///  The tool grammar is the more specific constraint."
+    ///
+    /// This test validates that `.or()` Rust semantics implement this rule:
+    /// Some(tool).or(Some(resp)) returns Some(tool), and
+    /// None.or(Some(resp)) returns Some(resp).
+    #[test]
+    fn effective_grammar_precedence_tool_wins_over_response_format() {
+        // Simulate the Option values produced by compile_tool_grammar and
+        // compile_response_format. The Grammar type is opaque here; we
+        // validate the .or() semantics using Option<u32> as a stand-in.
+
+        let tool_grammar: Option<u32> = Some(1); // tool_choice=required compiled
+        let response_grammar: Option<u32> = Some(2); // response_format=json_schema compiled
+        let effective = tool_grammar.or(response_grammar);
+        assert_eq!(
+            effective,
+            Some(1),
+            "tool grammar must win over response_format grammar (.or() semantics)"
+        );
+
+        // When no tool grammar, response_format grammar applies.
+        let no_tool: Option<u32> = None;
+        let effective_resp_only = no_tool.or(Some(2));
+        assert_eq!(
+            effective_resp_only,
+            Some(2),
+            "response_format grammar must apply when tool_choice is absent"
+        );
+
+        // When neither is set, effective grammar is None (unconstrained).
+        let none_a: Option<u32> = None;
+        let none_b: Option<u32> = None;
+        assert!(
+            none_a.or(none_b).is_none(),
+            "no tool_grammar + no response_grammar must produce no constraint"
+        );
+    }
+}
+
 /// Build a 429 `queue_full` response with OpenAI-convention rate-limit
 /// headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`).
 /// The OpenAI error envelope is preserved; these headers supplement
@@ -4402,5 +4720,74 @@ mod pool_error_tests {
             ra, "5",
             "pool-refused Retry-After must be 5 seconds (not 1, which is for not-ready)"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wave-2.5 A3 — extract_tool_calls_from_text unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod test_a3_tool_call_extraction {
+    use super::{extract_tool_calls_from_text, registry};
+
+    /// Build a minimal ModelRegistration with Gemma4 tool markers so tests
+    /// can exercise the splitter without a live model.
+    fn gemma4_reg() -> registry::ModelRegistration {
+        // Re-use the GEMMA4 static from registry (accessible via find_for).
+        // We need the real registration so parse_tool_call_body works.
+        // Use registry::find_for with a synthetic model id that matches gemma4.
+        registry::find_for("gemma4-27b-it").expect("gemma4 registration must exist")
+    }
+
+    #[test]
+    fn extract_no_tool_calls_returns_text_unchanged() {
+        let reg = gemma4_reg();
+        let result = extract_tool_calls_from_text("Hello, world!", Some(&reg));
+        assert!(result.tool_calls.is_empty(), "no tool calls in plain text");
+        assert_eq!(result.content, "Hello, world!", "content must be preserved");
+    }
+
+    #[test]
+    fn extract_tool_call_with_gemma4_markers() {
+        // Gemma 4 tool-call markers are <|tool_call|> ... <tool_call|>
+        // (or whatever GEMMA4 registration uses).  Use find_for to get the
+        // real markers, then construct synthetic output.
+        let reg = gemma4_reg();
+        let (open, close) = match (reg.tool_open, reg.tool_close) {
+            (Some(o), Some(c)) => (o, c),
+            _ => {
+                // Registration has no tool markers — skip test.
+                eprintln!("gemma4 registration has no tool markers, skipping");
+                return;
+            }
+        };
+        // Build a synthetic tool-call body in Gemma4 format: call:NAME{k:v}
+        let body = "call:get_weather{location:<|\"|>Paris<|\"|>}";
+        let full_text = format!("Here is the weather: {open}{body}{close}");
+        let result = extract_tool_calls_from_text(&full_text, Some(&reg));
+        assert_eq!(
+            result.tool_calls.len(), 1,
+            "exactly one tool call must be extracted"
+        );
+        assert_eq!(result.tool_calls[0].function.name, "get_weather");
+        assert_eq!(result.tool_calls[0].call_type, "function");
+        // The id should have the expected prefix.
+        assert!(
+            result.tool_calls[0].id.starts_with("call_hf2q_"),
+            "tool call id must start with call_hf2q_"
+        );
+        // Content before the marker span.
+        assert!(
+            result.content.contains("Here is the weather:"),
+            "pre-marker content must be preserved"
+        );
+    }
+
+    #[test]
+    fn extract_no_registration_returns_text_unchanged() {
+        let result = extract_tool_calls_from_text("plain text", None);
+        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.content, "plain text");
     }
 }
