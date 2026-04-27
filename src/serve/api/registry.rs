@@ -1792,4 +1792,278 @@ mod tests {
         }
         out
     }
+
+    // -----------------------------------------------------------------------
+    // T1.8 Option B — tool_call_gbnf accept/reject tests
+    //
+    // Each test:
+    //   1. Calls `reg.tool_call_gbnf(fn_name, params_schema)` → GBNF string.
+    //   2. Parses it with `grammar::parser::parse` → `Grammar`.
+    //   3. Runs `GrammarRuntime::new` → `GrammarRuntime`.
+    //   4. Feeds a candidate byte string with `accept_bytes`; asserts
+    //      `is_accepted()` for valid inputs and `!(ok && is_accepted())`
+    //      for invalid ones.
+    //
+    // Import from the sibling grammar module (available as
+    // `crate::serve::api::grammar::*` inside the test context).
+    // -----------------------------------------------------------------------
+
+    fn grammar_runtime_for_gbnf(gbnf: &str) -> crate::serve::api::grammar::sampler::GrammarRuntime {
+        let g = crate::serve::api::grammar::parser::parse(gbnf)
+            .unwrap_or_else(|e| panic!("parse GBNF:\n{}\nerror: {}", gbnf, e));
+        let rid = g.rule_id("root")
+            .unwrap_or_else(|| panic!("no root rule in GBNF:\n{}", gbnf));
+        crate::serve::api::grammar::sampler::GrammarRuntime::new(g, rid)
+            .unwrap_or_else(|| panic!("GrammarRuntime::new returned None for GBNF:\n{}", gbnf))
+    }
+
+    fn gemma4_runtime(fn_name: &str, schema_json: &str) -> crate::serve::api::grammar::sampler::GrammarRuntime {
+        let schema: serde_json::Value = serde_json::from_str(schema_json).unwrap();
+        let gbnf = GEMMA4.tool_call_gbnf(fn_name, &schema)
+            .unwrap_or_else(|e| panic!("tool_call_gbnf error: {}", e));
+        grammar_runtime_for_gbnf(&gbnf)
+    }
+
+    fn qwen35_runtime(fn_name: &str, schema_json: &str) -> crate::serve::api::grammar::sampler::GrammarRuntime {
+        let schema: serde_json::Value = serde_json::from_str(schema_json).unwrap();
+        let gbnf = QWEN35.tool_call_gbnf(fn_name, &schema)
+            .unwrap_or_else(|e| panic!("tool_call_gbnf error: {}", e));
+        grammar_runtime_for_gbnf(&gbnf)
+    }
+
+    // -----------------------------------------------------------------------
+    // Gemma 4 grammar tests
+    // -----------------------------------------------------------------------
+
+    /// Canonical Gemma 4 emission for `get_weather(location: "SF", unit: "F")`.
+    /// The grammar must accept the exact string that `parse_gemma4_tool_call`
+    /// would successfully parse.
+    #[test]
+    fn gemma4_tool_call_grammar_accepts_canonical_emission() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "location": {"type": "string"},
+                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+            }
+        }"#;
+        let mut rt = gemma4_runtime("get_weather", schema);
+        // Canonical emission: `call:get_weather{location:<|"|>SF<|"|>,unit:<|"|>fahrenheit<|"|>}`
+        let input = b"call:get_weather{location:<|\"|>SF<|\"|>,unit:<|\"|>fahrenheit<|\"|>}";
+        assert!(rt.accept_bytes(input), "canonical emission rejected");
+        assert!(rt.is_accepted(), "not accepted at end");
+    }
+
+    /// The grammar must also accept the case where keys appear in the
+    /// opposite order (unit before location) — since `parse_gemma4_tool_call`
+    /// is order-agnostic and we use a Kleene-star kv-list.
+    #[test]
+    fn gemma4_tool_call_grammar_accepts_reversed_key_order() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "location": {"type": "string"},
+                "unit": {"type": "string"}
+            }
+        }"#;
+        let mut rt = gemma4_runtime("get_weather", schema);
+        let input = b"call:get_weather{unit:<|\"|>celsius<|\"|>,location:<|\"|>London<|\"|>}";
+        assert!(rt.accept_bytes(input), "reversed key order rejected");
+        assert!(rt.is_accepted(), "not accepted at end");
+    }
+
+    /// The grammar must accept a numeric argument (no `<|"|>` wrapping).
+    #[test]
+    fn gemma4_tool_call_grammar_accepts_numeric_arg() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "count": {"type": "integer"},
+                "enabled": {"type": "boolean"}
+            }
+        }"#;
+        let mut rt = gemma4_runtime("do_thing", schema);
+        let input = b"call:do_thing{count:42,enabled:true}";
+        assert!(rt.accept_bytes(input), "numeric+boolean args rejected");
+        assert!(rt.is_accepted(), "not accepted");
+    }
+
+    /// A malformed wrapper prefix (`call_:` with underscore instead of `:`)
+    /// must be rejected.
+    #[test]
+    fn gemma4_tool_call_grammar_rejects_malformed_wrapper_prefix() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {"location": {"type": "string"}}
+        }"#;
+        let mut rt = gemma4_runtime("get_weather", schema);
+        // `call_:get_weather{...}` — underscore between `call` and `:`.
+        let input = b"call_:get_weather{location:<|\"|>SF<|\"|>}";
+        let ok = rt.accept_bytes(input);
+        assert!(!(ok && rt.is_accepted()), "malformed prefix accepted (should reject)");
+    }
+
+    /// A wrong delimiter (parentheses instead of braces) must be rejected.
+    #[test]
+    fn gemma4_tool_call_grammar_rejects_wrong_delimiter() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {"location": {"type": "string"}}
+        }"#;
+        let mut rt = gemma4_runtime("get_weather", schema);
+        // `call:get_weather(SF)` — parentheses instead of braces.
+        let input = b"call:get_weather(SF)";
+        let ok = rt.accept_bytes(input);
+        assert!(!(ok && rt.is_accepted()), "wrong delimiter accepted (should reject)");
+    }
+
+    /// When additionalProperties:false is not explicitly declared in the
+    /// parameters schema, the grammar uses a Kleene-star kv-list that accepts
+    /// any key from the declared set. An *undeclared* key wrapped in
+    /// `<|"|>` should still be accepted because the grammar uses an item
+    /// alternation (any known key) — however a key name that doesn't match
+    /// any known literal WILL be rejected because the item rule only contains
+    /// the declared key literals.
+    ///
+    /// Note: unlike json_schema's additionalProperties enforcement, the Gemma
+    /// kv-list grammar does not try to reject unknown keys — that would require
+    /// the O(2^N) permutation algorithm with "used-key" tracking. Instead,
+    /// extra fields at runtime are handled by parse_gemma4_tool_call (which
+    /// ignores them) or by the schema-level validation at the API layer.
+    #[test]
+    fn gemma4_tool_call_grammar_empty_args_accepted() {
+        let schema = r#"{"type": "object", "properties": {}}"#;
+        let mut rt = gemma4_runtime("noop", schema);
+        let input = b"call:noop{}";
+        assert!(rt.accept_bytes(input), "empty args form rejected");
+        assert!(rt.is_accepted(), "not accepted");
+    }
+
+    // -----------------------------------------------------------------------
+    // Qwen 3.5/3.6 grammar tests
+    // -----------------------------------------------------------------------
+
+    /// Canonical Qwen 3.5 emission for `get_weather(location: "Paris")`.
+    #[test]
+    fn qwen35_tool_call_grammar_accepts_canonical_emission() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "location": {"type": "string"},
+                "unit": {"type": "string"}
+            }
+        }"#;
+        let mut rt = qwen35_runtime("get_weather", schema);
+        // Canonical Qwen emission (template emits `\n` around values):
+        let input = b"<function=get_weather>\n<parameter=location>\nParis\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>";
+        assert!(rt.accept_bytes(input), "canonical Qwen35 emission rejected");
+        assert!(rt.is_accepted(), "not accepted at end");
+    }
+
+    /// Reversed parameter order must be accepted (Kleene-star approach).
+    #[test]
+    fn qwen35_tool_call_grammar_accepts_reversed_param_order() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "location": {"type": "string"},
+                "unit": {"type": "string"}
+            }
+        }"#;
+        let mut rt = qwen35_runtime("get_weather", schema);
+        let input = b"<function=get_weather>\n<parameter=unit>\nfahrenheit\n</parameter>\n<parameter=location>\nSF\n</parameter>\n</function>";
+        assert!(rt.accept_bytes(input), "reversed param order rejected");
+        assert!(rt.is_accepted(), "not accepted");
+    }
+
+    /// A malformed function wrapper (wrong tag syntax) must be rejected.
+    #[test]
+    fn qwen35_tool_call_grammar_rejects_malformed_wrapper() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {"location": {"type": "string"}}
+        }"#;
+        let mut rt = qwen35_runtime("get_weather", schema);
+        // `[function=get_weather]` — square brackets instead of angle brackets.
+        let input = b"[function=get_weather]\n[parameter=location]\nParis\n[/parameter]\n[/function]";
+        let ok = rt.accept_bytes(input);
+        assert!(!(ok && rt.is_accepted()), "malformed wrapper accepted (should reject)");
+    }
+
+    /// Empty parameter list (no arguments).
+    #[test]
+    fn qwen35_tool_call_grammar_accepts_empty_params() {
+        let schema = r#"{"type": "object", "properties": {}}"#;
+        let mut rt = qwen35_runtime("ping", schema);
+        let input = b"<function=ping></function>";
+        assert!(rt.accept_bytes(input), "empty params form rejected");
+        assert!(rt.is_accepted(), "not accepted");
+    }
+
+    /// Verify the GBNF round-trips: grammar accepts output that
+    /// `parse_qwen35_tool_call` can also parse back.  Closes the loop:
+    /// grammar-constrained → parseable.
+    #[test]
+    fn qwen35_grammar_accepted_output_is_parseable() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "location": {"type": "string"},
+                "unit": {"type": "string"}
+            }
+        }"#;
+        let body = "<function=get_weather>\n<parameter=location>\nParis\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>";
+        // Grammar accepts it.
+        let mut rt = qwen35_runtime("get_weather", schema);
+        assert!(rt.accept_bytes(body.as_bytes()), "grammar rejected body");
+        assert!(rt.is_accepted());
+        // parse_qwen35_tool_call also parses it.
+        let parsed = parse_tool_call_body(&QWEN35, body).expect("parse_tool_call_body failed");
+        assert_eq!(parsed.name, "get_weather");
+        let v: serde_json::Value = serde_json::from_str(&parsed.arguments_json).unwrap();
+        assert_eq!(v["location"], "Paris");
+        assert_eq!(v["unit"], "celsius");
+    }
+
+    /// Verify the Gemma 4 grammar round-trip: grammar accepts output that
+    /// `parse_gemma4_tool_call` can also parse back.
+    #[test]
+    fn gemma4_grammar_accepted_output_is_parseable() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "location": {"type": "string"},
+                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+            }
+        }"#;
+        let body = "call:get_weather{location:<|\"|>San Francisco<|\"|>,unit:<|\"|>celsius<|\"|>}";
+        // Grammar accepts it.
+        let mut rt = gemma4_runtime("get_weather", schema);
+        assert!(rt.accept_bytes(body.as_bytes()), "grammar rejected body");
+        assert!(rt.is_accepted());
+        // parse_gemma4_tool_call also parses it.
+        let parsed = parse_tool_call_body(&GEMMA4, body).expect("parse_tool_call_body failed");
+        assert_eq!(parsed.name, "get_weather");
+        let v: serde_json::Value = serde_json::from_str(&parsed.arguments_json).unwrap();
+        assert_eq!(v["location"], "San Francisco");
+        assert_eq!(v["unit"], "celsius");
+    }
+
+    /// Unknown model family returns Err from tool_call_gbnf.
+    #[test]
+    fn unknown_family_tool_call_gbnf_returns_err() {
+        let unknown = ModelRegistration {
+            family: "unknown_llama",
+            id_substrings: &["unknown_llama"],
+            reasoning_open: None,
+            reasoning_close: None,
+            tool_open: None,
+            tool_close: None,
+            tool_preamble: None,
+        };
+        let schema: serde_json::Value = serde_json::json!({});
+        let result = unknown.tool_call_gbnf("f", &schema);
+        assert!(result.is_err(), "expected Err for unknown family");
+        assert!(result.unwrap_err().contains("unknown_llama"));
+    }
 }
