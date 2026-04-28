@@ -5735,6 +5735,98 @@ mod tests {
         }
     }
 
+    /// ADR-014 P7 iter-49 — `quantize_via_streaming_borrowed` byte-identity
+    /// to `quantize_model` on the ImatrixAdaptive path (VariantKQuantizer +
+    /// real imatrix calibration data).  Pins the iter-49 main.rs wire-up
+    /// at the ImatrixAdaptive arm (line 1430+) under
+    /// `HF2Q_STREAMING_PHASE3=1`.
+    ///
+    /// Critical signal: iter-48's gate covered Q4_K_M with
+    /// `CalibrationData::None`.  This iter exercises the ImatrixAdaptive
+    /// path explicitly with non-uniform importance — proving the
+    /// streaming dispatch threads imatrix through to the codec for
+    /// VariantKQuantizer's per-tensor target dispatch.
+    #[test]
+    fn quantize_via_streaming_borrowed_byte_identical_under_imatrix_variant_kquantizer() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::calibrate::imatrix::ImatrixCollector;
+        use crate::ir::TensorMap;
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+
+        const QK_K: usize = 256;
+        const N_LAYERS: usize = 32;
+
+        let make_payload = |seed: f32| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(QK_K * 2);
+            for i in 0..QK_K {
+                let v = (i as f32 / QK_K as f32) * 2.0 - 1.0 + seed * 0.001;
+                bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+            }
+            bytes
+        };
+
+        let tensors: Vec<&str> = vec![
+            "blk.0.attn_v.weight",
+            "blk.0.ffn_down.weight",
+            "blk.5.attn_q.weight",
+        ];
+
+        let mut tensor_map = TensorMap::new();
+        for (i, name) in tensors.iter().enumerate() {
+            tensor_map.insert(crate::ir::TensorRef {
+                name: name.to_string(),
+                shape: vec![1, QK_K],
+                dtype: DType::F16,
+                data: make_payload(i as f32),
+            });
+        }
+
+        // Non-uniform importance per tensor.
+        let acts: Vec<f32> = (0..QK_K)
+            .map(|i| if i < 16 { 100.0 } else { 0.01 })
+            .collect();
+        let mut col = ImatrixCollector::new();
+        for name in &tensors {
+            col.accumulate_dense(name, &acts, 1, QK_K).unwrap();
+        }
+        col.record_chunk();
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+
+        let q1 = VariantKQuantizer::new(
+            KQuantVariant::Q4_K_M,
+            CalibrationData::from_imatrix_collector(&col),
+            N_LAYERS,
+        );
+        let q2 = VariantKQuantizer::new(
+            KQuantVariant::Q4_K_M,
+            CalibrationData::from_imatrix_collector(&col),
+            N_LAYERS,
+        );
+
+        let eager = quantize_model(&tensor_map, &metadata, &q1, 0, 0, &progress)
+            .expect("quantize_model");
+        let borrowed =
+            quantize_via_streaming_borrowed(&tensor_map, &metadata, &q2, 0, 0, &progress)
+                .expect("quantize_via_streaming_borrowed");
+
+        for tname in &tensors {
+            let e = eager.tensors.get(*tname).unwrap();
+            let b = borrowed.tensors.get(*tname).unwrap();
+            assert_eq!(
+                e.quant_info.ggml_type, b.quant_info.ggml_type,
+                "{tname}: ggml_type"
+            );
+            assert_eq!(
+                e.data, b.data,
+                "{tname}: bytes differ — imatrix-VariantKQuantizer streaming path \
+                 has lost byte-identity vs eager"
+            );
+        }
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
