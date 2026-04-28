@@ -1688,16 +1688,40 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     .context("Failed to create quantizer")
                     .map_err(AppError::Conversion)?;
 
-                quantize::quantize_model(
-                    &tensor_map,
-                    &metadata,
-                    &quantizer,
-                    bits,
-                    config.group_size,
-                    &progress,
-                )
-                .context("Quantization failed")
-                .map_err(AppError::Conversion)?
+                // ADR-014 P7 iter-50 (2026-04-28): same env-flag-gated
+                // streaming wire-up as iter-48/49.  StaticQuantizer is
+                // the catch-all for non-K-quant non-DWQ methods (F16,
+                // BF16, Q2/Q4/Q8 legacy).  All paths through the
+                // StaticQuantizer's `quantize_tensor` impl are
+                // deterministic + Send+Sync, so streaming dispatch is
+                // byte-identical (proven by iter-47's
+                // `quantize_streaming_byte_identical_to_quantize_model`
+                // which uses StaticQuantizer in the smoke fixture).
+                let streaming_phase3 =
+                    std::env::var("HF2Q_STREAMING_PHASE3").as_deref() == Ok("1");
+                let quant_result = if streaming_phase3 {
+                    tracing::info!("ADR-014 P7 iter-50: HF2Q_STREAMING_PHASE3=1 → quantize_via_streaming_borrowed (StaticQuantizer)");
+                    quantize::quantize_via_streaming_borrowed(
+                        &tensor_map,
+                        &metadata,
+                        &quantizer,
+                        bits,
+                        config.group_size,
+                        &progress,
+                    )
+                    .context("Quantization failed (streaming path)")
+                } else {
+                    quantize::quantize_model(
+                        &tensor_map,
+                        &metadata,
+                        &quantizer,
+                        bits,
+                        config.group_size,
+                        &progress,
+                    )
+                    .context("Quantization failed")
+                };
+                quant_result.map_err(AppError::Conversion)?
             }
         })
     };
