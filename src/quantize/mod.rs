@@ -1258,7 +1258,8 @@ mod tests {
         use crate::quantize::variant_quantizer::VariantKQuantizer;
         use crate::calibrate::calibrator::CalibrationData;
         use crate::quantize::k_quant::{
-            dequantize_row_q3_k_bytes, dequantize_row_q5_k_bytes, dequantize_row_q6_k_bytes,
+            dequantize_row_q3_k_bytes, dequantize_row_q4_k_bytes,
+            dequantize_row_q5_k_bytes, dequantize_row_q6_k_bytes,
         };
 
         const QK_K: usize = 256;
@@ -1301,6 +1302,19 @@ mod tests {
             (
                 KQuantVariant::Q3_K_L, "Q3_K", N_BLOCKS * 110, 0.10,
                 dequantize_row_q3_k_bytes as DequantFn,
+            ),
+            // Q4_K_S lands at Q4_K base on attn_q (i_layer=5 ≥ 4 so the
+            // Q4_K_S attn_v `i<4 → Q5_K` upgrade doesn't apply — and
+            // attn_q is never bumped anyway); RMSE bound matches the
+            // direct-codec gate (≤ 0.05 on smooth ramp).
+            (
+                KQuantVariant::Q4_K_S, "Q4_K", N_BLOCKS * 144, 0.05,
+                dequantize_row_q4_k_bytes as DequantFn,
+            ),
+            // Q5_K_S has no upgrades anywhere — every tensor at Q5_K base.
+            (
+                KQuantVariant::Q5_K_S, "Q5_K", N_BLOCKS * 176, 0.025,
+                dequantize_row_q5_k_bytes as DequantFn,
             ),
             (
                 KQuantVariant::Q5_K_M, "Q5_K", N_BLOCKS * 176, 0.025,
