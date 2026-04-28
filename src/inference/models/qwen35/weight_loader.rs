@@ -1087,7 +1087,7 @@ pub fn load_dense_ffn(
 }
 
 /// Load a dense FFN layer's weights, keeping projections in their native GGML
-/// quantization (e.g. Q4_K, Q6_K) — the production path for 27B dense GGUFs.
+/// quantization (Q4_0/Q8_0/Q6_K) — the production path for 27B dense GGUFs.
 ///
 /// Gate/up/down projection buffers are loaded via `GgufFile::load_tensor` (raw
 /// GGML blocks, DType::U8 on Metal) rather than `load_tensor_f32`.  This
@@ -1118,12 +1118,12 @@ pub fn load_dense_ffn_quantized(
     // Reject float types — callers must use `load_dense_ffn` for those.
     let supported = |t: GgmlType| matches!(
         t,
-        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q6_K
+        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q6_K
     );
     if !supported(ggml_type_gate_up) {
         return Err(anyhow!(
             "layer {layer_idx}: gate/up dense weights have unsupported quant type {:?} \
-             (expected Q4_0, Q8_0, Q4_K, or Q6_K for the quantized dense path; \
+             (expected Q4_0, Q8_0, or Q6_K for the quantized dense path; \
              use load_dense_ffn for F32/F16 weights)",
             ggml_type_gate_up
         ));
@@ -1131,7 +1131,7 @@ pub fn load_dense_ffn_quantized(
     if !supported(ggml_type_down) {
         return Err(anyhow!(
             "layer {layer_idx}: down dense weight has unsupported quant type {:?} \
-             (expected Q4_0, Q8_0, Q4_K, or Q6_K for the quantized dense path; \
+             (expected Q4_0, Q8_0, or Q6_K for the quantized dense path; \
              use load_dense_ffn for F32/F16 weights)",
             ggml_type_down
         ));

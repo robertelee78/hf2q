@@ -30,7 +30,7 @@ use super::VitConvertError;
 const GGUF_MAGIC: [u8; 4] = [0x47, 0x47, 0x55, 0x46]; // "GGUF"
 const GGUF_VERSION: u32 = 3;
 const GGML_TYPE_F16: u32 = 1;
-const GGML_TYPE_F32: u32 = 0;
+pub const GGML_TYPE_F32: u32 = 0;
 const ALIGNMENT: u64 = 32;
 
 /// GGUF metadata value types (subset used by mmproj writer).
@@ -55,9 +55,8 @@ pub fn write_mmproj_gguf(
     vision_config: &VisionConfig,
     tensors: &HashMap<String, VitTensor>,
 ) -> Result<(), VitConvertError> {
-    let file = File::create(output).map_err(|e| {
-        VitConvertError::GgufEmit(format!("create {:?}: {}", output, e))
-    })?;
+    let file = File::create(output)
+        .map_err(|e| VitConvertError::GgufEmit(format!("create {:?}: {}", output, e)))?;
     let mut w = BufWriter::new(file);
 
     // Sort tensor names for deterministic output (same-input byte-identical).
@@ -146,13 +145,18 @@ pub fn write_mmproj_gguf(
         }
     }
 
-    w.flush().map_err(|e| VitConvertError::GgufEmit(format!("flush: {}", e)))?;
+    w.flush()
+        .map_err(|e| VitConvertError::GgufEmit(format!("flush: {}", e)))?;
     Ok(())
 }
 
 fn align_up(n: u64, to: u64) -> u64 {
     let r = n % to;
-    if r == 0 { n } else { n + (to - r) }
+    if r == 0 {
+        n
+    } else {
+        n + (to - r)
+    }
 }
 
 fn current_pos<W: Write>(_w: &mut BufWriter<W>) -> std::io::Result<u64> {
@@ -170,11 +174,7 @@ fn write_gguf_string<W: Write>(w: &mut W, s: &str) -> std::io::Result<()> {
 }
 
 /// Write one KV pair: key-string + value-type-u32 + value bytes.
-fn write_kv<W: Write>(
-    w: &mut W,
-    key: &str,
-    value: &MetaValue,
-) -> std::io::Result<()> {
+fn write_kv<W: Write>(w: &mut W, key: &str, value: &MetaValue) -> std::io::Result<()> {
     write_gguf_string(w, key)?;
     match value {
         MetaValue::String(s) => {
@@ -206,20 +206,56 @@ fn write_kv<W: Write>(
 /// Keys per clip-model.h / `src/inference/vision/mmproj.rs` (load side).
 fn build_metadata(cfg: &VisionConfig) -> Vec<(String, MetaValue)> {
     vec![
-        ("general.architecture".into(), MetaValue::String("clip".into())),
-        ("general.name".into(), MetaValue::String("hf2q-mmproj".into())),
+        (
+            "general.architecture".into(),
+            MetaValue::String("clip".into()),
+        ),
+        (
+            "general.name".into(),
+            MetaValue::String("hf2q-mmproj".into()),
+        ),
         ("clip.has_vision_encoder".into(), MetaValue::Uint32(1)),
         ("clip.has_text_encoder".into(), MetaValue::Uint32(0)),
-        ("clip.projector_type".into(), MetaValue::String(cfg.projector_type.clone())),
-        ("clip.vision.image_size".into(), MetaValue::Uint32(cfg.image_size)),
-        ("clip.vision.patch_size".into(), MetaValue::Uint32(cfg.patch_size)),
-        ("clip.vision.embedding_length".into(), MetaValue::Uint32(cfg.hidden_size)),
-        ("clip.vision.feed_forward_length".into(), MetaValue::Uint32(cfg.intermediate_size)),
-        ("clip.vision.attention.head_count".into(), MetaValue::Uint32(cfg.num_attention_heads)),
-        ("clip.vision.block_count".into(), MetaValue::Uint32(cfg.num_hidden_layers)),
-        ("clip.vision.attention.layer_norm_epsilon".into(), MetaValue::Float32(cfg.layer_norm_eps)),
-        ("clip.vision.image_mean".into(), MetaValue::ArrayFloat32(cfg.image_mean.to_vec())),
-        ("clip.vision.image_std".into(), MetaValue::ArrayFloat32(cfg.image_std.to_vec())),
+        (
+            "clip.projector_type".into(),
+            MetaValue::String(cfg.projector_type.clone()),
+        ),
+        (
+            "clip.vision.image_size".into(),
+            MetaValue::Uint32(cfg.image_size),
+        ),
+        (
+            "clip.vision.patch_size".into(),
+            MetaValue::Uint32(cfg.patch_size),
+        ),
+        (
+            "clip.vision.embedding_length".into(),
+            MetaValue::Uint32(cfg.hidden_size),
+        ),
+        (
+            "clip.vision.feed_forward_length".into(),
+            MetaValue::Uint32(cfg.intermediate_size),
+        ),
+        (
+            "clip.vision.attention.head_count".into(),
+            MetaValue::Uint32(cfg.num_attention_heads),
+        ),
+        (
+            "clip.vision.block_count".into(),
+            MetaValue::Uint32(cfg.num_hidden_layers),
+        ),
+        (
+            "clip.vision.attention.layer_norm_epsilon".into(),
+            MetaValue::Float32(cfg.layer_norm_eps),
+        ),
+        (
+            "clip.vision.image_mean".into(),
+            MetaValue::ArrayFloat32(cfg.image_mean.to_vec()),
+        ),
+        (
+            "clip.vision.image_std".into(),
+            MetaValue::ArrayFloat32(cfg.image_std.to_vec()),
+        ),
     ]
 }
 

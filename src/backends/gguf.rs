@@ -11,8 +11,7 @@ use tracing::{debug, info, warn};
 
 use crate::backends::{BackendError, OutputBackend};
 use crate::ir::{
-    FormatWarning, OutputFile, OutputManifest, QuantizedModel, TensorQuantInfo,
-    WarningSeverity,
+    FormatWarning, OutputFile, OutputManifest, QuantizedModel, TensorQuantInfo, WarningSeverity,
 };
 use crate::progress::ProgressReporter;
 
@@ -134,35 +133,38 @@ impl OutputBackend for GgufBackend {
         progress: &ProgressReporter,
     ) -> Result<OutputManifest, BackendError> {
         // If output_dir is a .gguf file path, use it directly; otherwise treat as directory
-        let (out_path, filename) = if output_dir.extension().and_then(|e| e.to_str()) == Some("gguf") {
-            if let Some(parent) = output_dir.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent)?;
+        let (out_path, filename) =
+            if output_dir.extension().and_then(|e| e.to_str()) == Some("gguf") {
+                if let Some(parent) = output_dir.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent)?;
+                    }
                 }
-            }
-            let fname = output_dir
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-            (output_dir.to_path_buf(), fname)
-        } else {
-            std::fs::create_dir_all(output_dir)?;
-            // Use the output directory name as the base filename
-            let dir_name = output_dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| sanitize_model_type(&model.metadata.model_type));
-            let fname = format!("{}.gguf", dir_name);
-            (output_dir.join(&fname), fname)
-        };
+                let fname = output_dir
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                (output_dir.to_path_buf(), fname)
+            } else {
+                std::fs::create_dir_all(output_dir)?;
+                // Use the output directory name as the base filename
+                let dir_name = output_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| sanitize_model_type(&model.metadata.model_type));
+                let fname = format!("{}.gguf", dir_name);
+                (output_dir.join(&fname), fname)
+            };
         info!("Writing GGUF to {}", out_path.display());
 
         // Collect tensors in deterministic order.
         // Filter out vision/audio tensors — llama.cpp expects those in a separate
         // mmproj GGUF file, not in the text model GGUF. If they're included, the
         // text model loader rejects the file with "wrong number of tensors".
-        let mut tensor_names: Vec<&String> = model.tensors.keys()
+        let mut tensor_names: Vec<&String> = model
+            .tensors
+            .keys()
             .filter(|name| {
                 // Skip vision/audio tensors — they belong in a separate mmproj GGUF.
                 // Three namespace conventions seen in the wild:
@@ -185,8 +187,16 @@ impl OutputBackend for GgufBackend {
         // llama.cpp expects attn_v.weight to exist. Duplicate K data as V for these layers.
         let mut v_duplicates: Vec<(String, &String)> = Vec::new(); // (gguf_v_name, source_k_hf_name)
         if model.metadata.model_type == "gemma4" {
-            let tc = model.metadata.raw_config.get("text_config").cloned().unwrap_or_default();
-            let k_eq_v = tc.get("attention_k_eq_v").and_then(|v| v.as_bool()).unwrap_or(true);
+            let tc = model
+                .metadata
+                .raw_config
+                .get("text_config")
+                .cloned()
+                .unwrap_or_default();
+            let k_eq_v = tc
+                .get("attention_k_eq_v")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
             if k_eq_v {
                 let layer_types = tc.get("layer_types").and_then(|v| v.as_array());
                 if let Some(lt) = layer_types {
@@ -194,7 +204,9 @@ impl OutputBackend for GgufBackend {
                         if lt_val.as_str() == Some("full_attention") {
                             // Find the K tensor for this layer
                             let k_hf_suffix = format!("layers.{}.self_attn.k_proj.weight", i);
-                            if let Some(k_name) = tensor_names.iter().find(|n| n.ends_with(&k_hf_suffix)) {
+                            if let Some(k_name) =
+                                tensor_names.iter().find(|n| n.ends_with(&k_hf_suffix))
+                            {
                                 let v_gguf_name = format!("blk.{}.attn_v.weight", i);
                                 v_duplicates.push((v_gguf_name, k_name));
                             }
@@ -211,7 +223,8 @@ impl OutputBackend for GgufBackend {
 
         // Build metadata key-value pairs
         let metadata = build_metadata(model, input_dir);
-        let tensor_count = (tensor_names.len() + synthetic_tensors.len() + v_duplicates.len()) as u64;
+        let tensor_count =
+            (tensor_names.len() + synthetic_tensors.len() + v_duplicates.len()) as u64;
         let kv_count = metadata.len() as u64;
 
         let file = File::create(&out_path).map_err(|e| BackendError::WriteFailed {
@@ -242,11 +255,8 @@ impl OutputBackend for GgufBackend {
 
         for name in &tensor_names {
             let qt = &model.tensors[*name];
-            let gguf_name = hf_name_to_gguf(
-                name,
-                &resolved_arch_for_tensors,
-                model.metadata.num_layers,
-            );
+            let gguf_name =
+                hf_name_to_gguf(name, &resolved_arch_for_tensors, model.metadata.num_layers);
             let mut ggml_type = quant_info_to_ggml_type(&qt.quant_info);
 
             // 1D scale/scalar tensors must be F32 — llama.cpp's Metal kernels
@@ -306,8 +316,10 @@ impl OutputBackend for GgufBackend {
                         if row_dim % QK4_0 == 0 {
                             debug!(
                                 "Tensor '{}': ne[0]={} not K-quant compatible, {} → {}",
-                                gguf_name, row_dim,
-                                ggml_type_name(ggml_type), ggml_type_name(fb)
+                                gguf_name,
+                                row_dim,
+                                ggml_type_name(ggml_type),
+                                ggml_type_name(fb)
                             );
                             ggml_type = fb;
                         } else {
@@ -325,14 +337,14 @@ impl OutputBackend for GgufBackend {
                 // divisible by 32 → fall back to F16. Catches ssm_conv1d
                 // (K=4) and any other small-row-dim weight that slipped
                 // past the K-quant fallback.
-                let block_32_quant = matches!(
-                    ggml_type,
-                    GGML_TYPE_Q4_0 | GGML_TYPE_Q5_0 | GGML_TYPE_Q8_0
-                );
+                let block_32_quant =
+                    matches!(ggml_type, GGML_TYPE_Q4_0 | GGML_TYPE_Q5_0 | GGML_TYPE_Q8_0);
                 if block_32_quant && row_dim % QK4_0 != 0 {
                     debug!(
                         "Tensor '{}': ne[0]={} not block-32 aligned, {} → F16",
-                        gguf_name, row_dim, ggml_type_name(ggml_type)
+                        gguf_name,
+                        row_dim,
+                        ggml_type_name(ggml_type)
                     );
                     ggml_type = GGML_TYPE_F16;
                 }
@@ -342,7 +354,10 @@ impl OutputBackend for GgufBackend {
             let total_elements: usize = qt.shape.iter().product();
             let repacked_size = if needs_f32 {
                 total_elements * 4 // F32 = 4 bytes per element
-            } else if qt.quant_info.preserved || ggml_type == GGML_TYPE_F16 || ggml_type == GGML_TYPE_F32 {
+            } else if qt.quant_info.preserved
+                || ggml_type == GGML_TYPE_F16
+                || ggml_type == GGML_TYPE_F32
+            {
                 qt.data.len() // preserved/f16/f32 pass through unchanged
             } else {
                 ggml_tensor_size(total_elements, ggml_type)
@@ -381,10 +396,17 @@ impl OutputBackend for GgufBackend {
             let k_ggml_type = quant_info_to_ggml_type(&k_qt.quant_info);
             let total_elements: usize = k_qt.shape.iter().product();
             let needs_f32 = k_qt.quant_info.preserved && k_qt.shape.len() <= 1;
-            let effective_type = if needs_f32 && k_ggml_type == GGML_TYPE_F16 { GGML_TYPE_F32 } else { k_ggml_type };
+            let effective_type = if needs_f32 && k_ggml_type == GGML_TYPE_F16 {
+                GGML_TYPE_F32
+            } else {
+                k_ggml_type
+            };
             let repacked_size = if needs_f32 {
                 total_elements * 4
-            } else if k_qt.quant_info.preserved || effective_type == GGML_TYPE_F16 || effective_type == GGML_TYPE_F32 {
+            } else if k_qt.quant_info.preserved
+                || effective_type == GGML_TYPE_F16
+                || effective_type == GGML_TYPE_F32
+            {
                 k_qt.data.len()
             } else {
                 ggml_tensor_size(total_elements, effective_type)
@@ -455,7 +477,10 @@ impl OutputBackend for GgufBackend {
         // --- Write V=K duplicate tensors (Gemma4 full-attention layers) ---
         for (v_name, k_hf_name) in &v_duplicates {
             let k_qt = &model.tensors[*k_hf_name];
-            let info = tensor_infos.iter().find(|i| i.gguf_name == *v_name).unwrap();
+            let info = tensor_infos
+                .iter()
+                .find(|i| i.gguf_name == *v_name)
+                .unwrap();
 
             // Pad to alignment
             let current = w.stream_position()?;
@@ -488,7 +513,11 @@ impl OutputBackend for GgufBackend {
         );
 
         let manifest_dir = if output_dir.extension().and_then(|e| e.to_str()) == Some("gguf") {
-            output_dir.parent().unwrap_or(output_dir).to_string_lossy().into_owned()
+            output_dir
+                .parent()
+                .unwrap_or(output_dir)
+                .to_string_lossy()
+                .into_owned()
         } else {
             output_dir.to_string_lossy().into_owned()
         };
@@ -529,10 +558,7 @@ impl OutputBackend for GgufBackend {
 /// Inserts `-mmproj` before the `.gguf` extension:
 ///   `model-text.gguf` -> `model-text-mmproj.gguf`
 fn mmproj_path_from_text(text_path: &Path) -> std::path::PathBuf {
-    let stem = text_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let stem = text_path.file_stem().unwrap_or_default().to_string_lossy();
     let new_name = format!("{}-mmproj.gguf", stem);
     text_path.with_file_name(new_name)
 }
@@ -544,8 +570,16 @@ fn mmproj_path_from_text(text_path: &Path) -> std::path::PathBuf {
 /// format expected by llama.cpp's clip.cpp loader.
 fn build_mmproj_metadata(model: &QuantizedModel) -> Vec<(String, MetaValue)> {
     let meta = &model.metadata;
-    let vc = meta.raw_config.get("vision_config").cloned().unwrap_or_default();
-    let tc = meta.raw_config.get("text_config").cloned().unwrap_or_default();
+    let vc = meta
+        .raw_config
+        .get("vision_config")
+        .cloned()
+        .unwrap_or_default();
+    let tc = meta
+        .raw_config
+        .get("text_config")
+        .cloned()
+        .unwrap_or_default();
 
     // Projector type — Gemma4 uses "gemma4v"
     let projector_type = match meta.model_type.as_str() {
@@ -555,59 +589,100 @@ fn build_mmproj_metadata(model: &QuantizedModel) -> Vec<(String, MetaValue)> {
     };
 
     // Vision geometry parameters from vision_config.
-    let image_size = vc.get("image_size")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(224) as u32;
-    let patch_size = vc.get("patch_size")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(14) as u32;
-    let vision_hidden_size = vc.get("hidden_size")
+    let image_size = vc.get("image_size").and_then(|v| v.as_u64()).unwrap_or(224) as u32;
+    let patch_size = vc.get("patch_size").and_then(|v| v.as_u64()).unwrap_or(14) as u32;
+    let vision_hidden_size = vc
+        .get("hidden_size")
         .and_then(|v| v.as_u64())
         .unwrap_or(1024) as u32;
-    let vision_intermediate_size = vc.get("intermediate_size")
+    let vision_intermediate_size = vc
+        .get("intermediate_size")
         .and_then(|v| v.as_u64())
         .unwrap_or(4096) as u32;
-    let vision_block_count = vc.get("num_hidden_layers")
+    let vision_block_count = vc
+        .get("num_hidden_layers")
         .and_then(|v| v.as_u64())
         .unwrap_or(24) as u32;
-    let vision_head_count = vc.get("num_attention_heads")
+    let vision_head_count = vc
+        .get("num_attention_heads")
         .and_then(|v| v.as_u64())
         .unwrap_or(16) as u32;
-    let layer_norm_eps = vc.get("layer_norm_eps")
+    let layer_norm_eps = vc
+        .get("layer_norm_eps")
         .or_else(|| vc.get("rms_norm_eps"))
         .and_then(|v| v.as_f64())
         .unwrap_or(1e-6) as f32;
 
     // Projection dimension = text model hidden size (the target dim for the projection).
-    let text_hidden_size = tc.get("hidden_size")
+    let text_hidden_size = tc
+        .get("hidden_size")
         .and_then(|v| v.as_u64())
         .or_else(|| meta.raw_config.get("hidden_size").and_then(|v| v.as_u64()))
         .unwrap_or(meta.hidden_size) as u32;
 
     vec![
         // Core identification — mmproj uses "clip" architecture.
-        ("general.architecture".into(), MetaValue::String("clip".into())),
+        (
+            "general.architecture".into(),
+            MetaValue::String("clip".into()),
+        ),
         ("general.type".into(), MetaValue::String("mmproj".into())),
-        ("general.file_type".into(), MetaValue::Uint32(ggml_ftype_from_bits(model.bits))),
+        (
+            "general.file_type".into(),
+            MetaValue::Uint32(ggml_ftype_from_bits(model.bits)),
+        ),
         ("clip.has_vision_encoder".into(), MetaValue::Bool(true)),
         // NOTE: projector_type is un-namespaced in llama.cpp — the only top-level `clip.*`
         // key in this metadata block. See vendored clip-impl.h:23 (KEY_PROJ_TYPE).
         // Loader counterpart: src/inference/vision/mmproj.rs:148.
-        ("clip.projector_type".into(), MetaValue::String(projector_type.into())),
+        (
+            "clip.projector_type".into(),
+            MetaValue::String(projector_type.into()),
+        ),
         // Vision geometry.
-        ("clip.vision.image_size".into(), MetaValue::Uint32(image_size)),
-        ("clip.vision.patch_size".into(), MetaValue::Uint32(patch_size)),
-        ("clip.vision.embedding_length".into(), MetaValue::Uint32(vision_hidden_size)),
-        ("clip.vision.feed_forward_length".into(), MetaValue::Uint32(vision_intermediate_size)),
-        ("clip.vision.block_count".into(), MetaValue::Uint32(vision_block_count)),
-        ("clip.vision.attention.head_count".into(), MetaValue::Uint32(vision_head_count)),
-        ("clip.vision.attention.layer_norm_epsilon".into(), MetaValue::Float32(layer_norm_eps)),
-        ("clip.vision.projection_dim".into(), MetaValue::Uint32(text_hidden_size)),
+        (
+            "clip.vision.image_size".into(),
+            MetaValue::Uint32(image_size),
+        ),
+        (
+            "clip.vision.patch_size".into(),
+            MetaValue::Uint32(patch_size),
+        ),
+        (
+            "clip.vision.embedding_length".into(),
+            MetaValue::Uint32(vision_hidden_size),
+        ),
+        (
+            "clip.vision.feed_forward_length".into(),
+            MetaValue::Uint32(vision_intermediate_size),
+        ),
+        (
+            "clip.vision.block_count".into(),
+            MetaValue::Uint32(vision_block_count),
+        ),
+        (
+            "clip.vision.attention.head_count".into(),
+            MetaValue::Uint32(vision_head_count),
+        ),
+        (
+            "clip.vision.attention.layer_norm_epsilon".into(),
+            MetaValue::Float32(layer_norm_eps),
+        ),
+        (
+            "clip.vision.projection_dim".into(),
+            MetaValue::Uint32(text_hidden_size),
+        ),
         // Image mean/std — Gemma4 uses standardization via tensors (std_bias/std_scale),
         // but llama.cpp still expects these metadata fields. Use [0.5, 0.5, 0.5] as the
         // default for Gemma4 (ImageNet-style normalization when no preprocessor_config).
-        ("clip.vision.image_mean".into(), MetaValue::ArrayFloat32(vec![0.5, 0.5, 0.5])),
-        ("clip.vision.image_std".into(), MetaValue::ArrayFloat32(vec![0.5, 0.5, 0.5])),
+        (
+            "clip.vision.image_mean".into(),
+            MetaValue::ArrayFloat32(vec![0.5, 0.5, 0.5]),
+        ),
+        (
+            "clip.vision.image_std".into(),
+            MetaValue::ArrayFloat32(vec![0.5, 0.5, 0.5]),
+        ),
     ]
 }
 
@@ -635,7 +710,9 @@ fn write_mmproj_gguf(
     info!("Writing mmproj GGUF to {}", mmproj_path.display());
 
     // Collect vision tensors in deterministic order
-    let mut vision_tensor_names: Vec<&String> = model.tensors.keys()
+    let mut vision_tensor_names: Vec<&String> = model
+        .tensors
+        .keys()
         .filter(|name| {
             let n = name.as_str();
             n.contains("vision_tower") || n.contains("embed_vision")
@@ -686,11 +763,8 @@ fn write_mmproj_gguf(
 
     for name in &vision_tensor_names {
         let qt = &model.tensors[*name];
-        let gguf_name = hf_name_to_gguf(
-            name,
-            &model.metadata.model_type,
-            model.metadata.num_layers,
-        );
+        let gguf_name =
+            hf_name_to_gguf(name, &model.metadata.model_type, model.metadata.num_layers);
         let mut ggml_type = quant_info_to_ggml_type(&qt.quant_info);
 
         // ADR-005 Phase 2c iter-116a (renamed iter-116f): clamp-scalar
@@ -750,9 +824,7 @@ fn write_mmproj_gguf(
         let is_one_d = qt.shape.len() <= 1;
         let is_norm_weight = gguf_name.ends_with("_norm.weight");
         let is_position_embd = gguf_name == "v.position_embd.weight";
-        if (is_one_d || is_norm_weight || is_position_embd)
-            && (ggml_type == GGML_TYPE_F16)
-        {
+        if (is_one_d || is_norm_weight || is_position_embd) && (ggml_type == GGML_TYPE_F16) {
             ggml_type = GGML_TYPE_F32;
         }
 
@@ -788,8 +860,7 @@ fn write_mmproj_gguf(
         // GGUF writer reverses dims on emit (see `write_tensor_info`),
         // so the on-disk `ne[]` becomes `[w, h, c, n_embd]` = `[16, 16, 3, 1152]`,
         // which matches `a->ne[2] = c = 3` for the im2col assert.
-        let is_patch_embd_conv =
-            gguf_name == "v.patch_embd.weight" && emit_shape.len() == 2;
+        let is_patch_embd_conv = gguf_name == "v.patch_embd.weight" && emit_shape.len() == 2;
         if is_patch_embd_conv {
             let n_embd = emit_shape[0];
             let hwc = emit_shape[1];
@@ -813,7 +884,10 @@ fn write_mmproj_gguf(
 
         // Vision tensors are preserved as F16 — no repacking needed, data passes through
         let total_elements: usize = emit_shape.iter().product();
-        let repacked_size = if qt.quant_info.preserved || ggml_type == GGML_TYPE_F16 || ggml_type == GGML_TYPE_F32 {
+        let repacked_size = if qt.quant_info.preserved
+            || ggml_type == GGML_TYPE_F16
+            || ggml_type == GGML_TYPE_F32
+        {
             // F16→F32 upcast: each input element becomes 4 bytes instead
             // of 2, so the on-disk size for an F16 source promoted to
             // F32 is 2× the input byte count.  This also covers F32→F32
@@ -853,7 +927,10 @@ fn write_mmproj_gguf(
     }
 
     let data_block_start = w.stream_position()?;
-    debug!("Mmproj tensor data block starts at offset {}", data_block_start);
+    debug!(
+        "Mmproj tensor data block starts at offset {}",
+        data_block_start
+    );
 
     // --- Pass 2: Repack and write one tensor at a time ---
     for (i, name) in vision_tensor_names.iter().enumerate() {
@@ -869,11 +946,10 @@ fn write_mmproj_gguf(
 
         // Repack and write (vision tensors are typically preserved F16, so this
         // is usually a passthrough copy)
-        let mut data = repack_to_ggml_blocks(qt, info.ggml_type).map_err(|e| {
-            BackendError::WriteFailed {
+        let mut data =
+            repack_to_ggml_blocks(qt, info.ggml_type).map_err(|e| BackendError::WriteFailed {
                 reason: format!("Failed to repack vision tensor '{}': {}", name, e),
-            }
-        })?;
+            })?;
 
         // ADR-005 Phase 2c iter-116g: if this tensor is the gemma4v
         // patch-embd Conv2d weight (we know because Pass 1 promoted its
@@ -892,9 +968,7 @@ fn write_mmproj_gguf(
                 _ => 0,
             };
             if elem_size > 0 && data.len() == n_embd * c * h * w_dim * elem_size {
-                data = transpose_patch_embd_hwc_to_chw(
-                    &data, n_embd, h, w_dim, c, elem_size,
-                );
+                data = transpose_patch_embd_hwc_to_chw(&data, n_embd, h, w_dim, c, elem_size);
             } else {
                 warn!(
                     "v.patch_embd.weight: cannot transpose (ggml_type={} data_len={} elems_expected={})",
@@ -974,25 +1048,23 @@ fn transpose_patch_embd_hwc_to_chw(
 fn ggml_type_from_name(name: &str) -> Option<u32> {
     // Normalize: uppercase, strip optional prefix
     let upper = name.trim().to_uppercase();
-    let key = upper
-        .strip_prefix("GGML_TYPE_")
-        .unwrap_or(&upper);
+    let key = upper.strip_prefix("GGML_TYPE_").unwrap_or(&upper);
     match key {
-        "F32"      => Some(GGML_TYPE_F32),
-        "F16"      => Some(GGML_TYPE_F16),
-        "Q4_0"     => Some(GGML_TYPE_Q4_0),
-        "Q4_1"     => Some(GGML_TYPE_Q4_1),
-        "Q5_0"     => Some(GGML_TYPE_Q5_0),
-        "Q5_1"     => Some(GGML_TYPE_Q5_1),
-        "Q8_0"     => Some(GGML_TYPE_Q8_0),
-        "Q8_1"     => Some(GGML_TYPE_Q8_1),
-        "Q2_K"     => Some(GGML_TYPE_Q2_K),
+        "F32" => Some(GGML_TYPE_F32),
+        "F16" => Some(GGML_TYPE_F16),
+        "Q4_0" => Some(GGML_TYPE_Q4_0),
+        "Q4_1" => Some(GGML_TYPE_Q4_1),
+        "Q5_0" => Some(GGML_TYPE_Q5_0),
+        "Q5_1" => Some(GGML_TYPE_Q5_1),
+        "Q8_0" => Some(GGML_TYPE_Q8_0),
+        "Q8_1" => Some(GGML_TYPE_Q8_1),
+        "Q2_K" => Some(GGML_TYPE_Q2_K),
         "Q3_K_S" | "Q3_K_M" | "Q3_K_L" | "Q3_K" => Some(GGML_TYPE_Q3_K),
         "Q4_K_S" | "Q4_K_M" | "Q4_K" => Some(GGML_TYPE_Q4_K),
         "Q5_K_S" | "Q5_K_M" | "Q5_K" => Some(GGML_TYPE_Q5_K),
-        "Q6_K"     => Some(GGML_TYPE_Q6_K),
-        "IQ2_XXS"  => Some(GGML_TYPE_IQ2_XXS),
-        "IQ2_XS"   => Some(GGML_TYPE_IQ2_XS),
+        "Q6_K" => Some(GGML_TYPE_Q6_K),
+        "IQ2_XXS" => Some(GGML_TYPE_IQ2_XXS),
+        "IQ2_XS" => Some(GGML_TYPE_IQ2_XS),
         _ => None,
     }
 }
@@ -1157,7 +1229,11 @@ fn repack_q4_0(
     total_elements: usize,
 ) -> Result<Vec<u8>, BackendError> {
     let info = &qt.quant_info;
-    let group_size = if info.group_size == 0 { 32 } else { info.group_size };
+    let group_size = if info.group_size == 0 {
+        32
+    } else {
+        info.group_size
+    };
 
     // Decode f16 scales: 2 bytes each
     let scales_f32: Vec<f32> = scales_bytes
@@ -1190,7 +1266,11 @@ fn repack_q4_0(
         let start = g * group_size;
         let end = (start + group_size).min(total_elements);
         for i in start..end {
-            let q = if i < signed_values.len() { signed_values[i] } else { 0 };
+            let q = if i < signed_values.len() {
+                signed_values[i]
+            } else {
+                0
+            };
             f32_values.push(q as f32 * scale);
         }
     }
@@ -1275,7 +1355,11 @@ fn repack_q8_0(
     total_elements: usize,
 ) -> Result<Vec<u8>, BackendError> {
     let info = &qt.quant_info;
-    let group_size = if info.group_size == 0 { 32 } else { info.group_size };
+    let group_size = if info.group_size == 0 {
+        32
+    } else {
+        info.group_size
+    };
 
     // Decode f16 scales
     let scales_f32: Vec<f32> = scales_bytes
@@ -1299,7 +1383,11 @@ fn repack_q8_0(
         let start = g * group_size;
         let end = (start + group_size).min(total_elements);
         for i in start..end {
-            let q = if i < signed_values.len() { signed_values[i] } else { 0 };
+            let q = if i < signed_values.len() {
+                signed_values[i]
+            } else {
+                0
+            };
             f32_values.push(q as f32 * scale);
         }
     }
@@ -1373,7 +1461,11 @@ fn repack_q6_k(
     total_elements: usize,
 ) -> Result<Vec<u8>, BackendError> {
     let info = &qt.quant_info;
-    let group_size = if info.group_size == 0 { 64 } else { info.group_size };
+    let group_size = if info.group_size == 0 {
+        64
+    } else {
+        info.group_size
+    };
 
     // Decode f16 scales: 2 bytes each
     let scales_f32: Vec<f32> = scales_bytes
@@ -1397,7 +1489,11 @@ fn repack_q6_k(
         let start = g * group_size;
         let end = (start + group_size).min(total_elements);
         for i in start..end {
-            let q = if i < signed_values.len() { signed_values[i] } else { 0 };
+            let q = if i < signed_values.len() {
+                signed_values[i]
+            } else {
+                0
+            };
             f32_values.push(q as f32 * scale);
         }
     }
@@ -1469,12 +1565,16 @@ fn repack_q6_k(
                 let l = l.clamp(-32, 31);
                 l_values[i] = l as i8;
                 let lu = (l + 32) as i64; // unsigned offset form for weighted computation
-                // rmse_type=1: weight = x[i]^2
+                                          // rmse_type=1: weight = x[i]^2
                 let w = (x[i] as f64) * (x[i] as f64);
                 sumlx += w * (x[i] as f64) * ((lu - 32) as f64);
                 suml2 += w * ((lu - 32) as f64) * ((lu - 32) as f64);
             }
-            let scale = if suml2 > 0.0 { (sumlx / suml2) as f32 } else { 1.0 / iscale };
+            let scale = if suml2 > 0.0 {
+                (sumlx / suml2) as f32
+            } else {
+                1.0 / iscale
+            };
 
             sub_scales[ib] = scale;
 
@@ -1570,10 +1670,20 @@ fn repack_q6_k(
 /// Human-readable name for a GGML type code (for debug logging).
 fn ggml_type_name(t: u32) -> &'static str {
     match t {
-        0 => "F32", 1 => "F16", 2 => "Q4_0", 3 => "Q4_1",
-        6 => "Q5_0", 7 => "Q5_1", 8 => "Q8_0", 9 => "Q8_1",
-        10 => "Q2_K", 11 => "Q3_K", 12 => "Q4_K", 13 => "Q5_K",
-        14 => "Q6_K", 15 => "Q8_K",
+        0 => "F32",
+        1 => "F16",
+        2 => "Q4_0",
+        3 => "Q4_1",
+        6 => "Q5_0",
+        7 => "Q5_1",
+        8 => "Q8_0",
+        9 => "Q8_1",
+        10 => "Q2_K",
+        11 => "Q3_K",
+        12 => "Q4_K",
+        13 => "Q5_K",
+        14 => "Q6_K",
+        15 => "Q8_K",
         _ => "unknown",
     }
 }
@@ -1617,21 +1727,29 @@ fn generate_synthetic_tensors(
 
     if arch == "gemma4" {
         // Extract partial_rotary_factor and global_head_dim from raw_config
-        let tc = metadata.raw_config.get("text_config").cloned().unwrap_or_default();
-        let global_head_dim = tc.get("global_head_dim")
+        let tc = metadata
+            .raw_config
+            .get("text_config")
+            .cloned()
+            .unwrap_or_default();
+        let global_head_dim = tc
+            .get("global_head_dim")
             .and_then(|v| v.as_u64())
             .unwrap_or(512) as usize;
-        let partial_rotary_factor = tc.get("rope_parameters")
+        let partial_rotary_factor = tc
+            .get("rope_parameters")
             .and_then(|rp| rp.get("full_attention"))
             .and_then(|fa| fa.get("partial_rotary_factor"))
             .and_then(|v| v.as_f64())
             .unwrap_or(0.25);
 
         // Find the first full-attention layer index from layer_types
-        let first_full_layer = tc.get("layer_types")
+        let first_full_layer = tc
+            .get("layer_types")
             .and_then(|v| v.as_array())
             .and_then(|arr| {
-                arr.iter().position(|v| v.as_str() == Some("full_attention"))
+                arr.iter()
+                    .position(|v| v.as_str() == Some("full_attention"))
             });
 
         if first_full_layer.is_some() {
@@ -1855,7 +1973,10 @@ fn qwen35_nextn_wrapper_layer_map() -> &'static [(&'static str, &'static str)] {
 fn qwen35_linear_attn_layer_map() -> &'static [(&'static str, &'static str)] {
     &[
         // llama-arch.cpp:367 LLM_TENSOR_ATTN_POST_NORM → "blk.%d.post_attention_norm"
-        ("post_attention_layernorm.weight", "post_attention_norm.weight"),
+        (
+            "post_attention_layernorm.weight",
+            "post_attention_norm.weight",
+        ),
         // llama-arch.cpp:382 LLM_TENSOR_ATTN_QKV → "blk.%d.attn_qkv"
         // (in_proj_qkvz is split → in_proj_qkv + in_proj_z by Phase 1.7)
         ("linear_attn.in_proj_qkv.weight", "attn_qkv.weight"),
@@ -1907,13 +2028,25 @@ fn layer_map_for_arch(arch: &str) -> Vec<(&'static str, &'static str)> {
         // NOT the FFN pre-norm. The FFN pre-norm is pre_feedforward_layernorm.
         "gemma4" | "gemma3" | "gemma2" => {
             map.extend_from_slice(&[
-                ("post_attention_layernorm.weight", "post_attention_norm.weight"),
+                (
+                    "post_attention_layernorm.weight",
+                    "post_attention_norm.weight",
+                ),
                 // pre_feedforward_layernorm is FFN_PRE_NORM (alias of FFN_NORM)
                 ("pre_feedforward_layernorm.weight", "ffn_norm.weight"),
                 // MoE norms
-                ("post_feedforward_layernorm_1.weight", "post_ffw_norm_1.weight"),
-                ("post_feedforward_layernorm_2.weight", "post_ffw_norm_2.weight"),
-                ("pre_feedforward_layernorm_2.weight", "pre_ffw_norm_2.weight"),
+                (
+                    "post_feedforward_layernorm_1.weight",
+                    "post_ffw_norm_1.weight",
+                ),
+                (
+                    "post_feedforward_layernorm_2.weight",
+                    "post_ffw_norm_2.weight",
+                ),
+                (
+                    "pre_feedforward_layernorm_2.weight",
+                    "pre_ffw_norm_2.weight",
+                ),
                 ("post_feedforward_layernorm.weight", "post_ffw_norm.weight"),
                 // MoE routing
                 ("router.proj.weight", "ffn_gate_inp.weight"),
@@ -1968,9 +2101,15 @@ fn layer_map_for_arch(arch: &str) -> Vec<(&'static str, &'static str)> {
                 // src/models/qwen35/moe.rs:90 — shared-expert scalar gate.
                 ("mlp.shared_expert_gate.weight", "ffn_gate_inp_shexp.weight"),
                 // Shared-expert per-projection tensors (src/models/qwen35/moe.rs:138-140).
-                ("mlp.shared_expert.gate_proj.weight", "ffn_gate_shexp.weight"),
+                (
+                    "mlp.shared_expert.gate_proj.weight",
+                    "ffn_gate_shexp.weight",
+                ),
                 ("mlp.shared_expert.up_proj.weight", "ffn_up_shexp.weight"),
-                ("mlp.shared_expert.down_proj.weight", "ffn_down_shexp.weight"),
+                (
+                    "mlp.shared_expert.down_proj.weight",
+                    "ffn_down_shexp.weight",
+                ),
                 // Merged expert tensors — post-merge names produced by
                 // merge_moe_experts_in_place at src/models/qwen35/moe.rs:494-497.
                 // Shape [N_experts, out_features, in_features].
@@ -1983,9 +2122,7 @@ fn layer_map_for_arch(arch: &str) -> Vec<(&'static str, &'static str)> {
         // post_attention_layernorm IS the FFN pre-norm (there is no separate
         // pre_feedforward_layernorm in these architectures).
         _ => {
-            map.extend_from_slice(&[
-                ("post_attention_layernorm.weight", "ffn_norm.weight"),
-            ]);
+            map.extend_from_slice(&[("post_attention_layernorm.weight", "ffn_norm.weight")]);
         }
     }
 
@@ -2005,7 +2142,7 @@ fn layer_map_for_arch(arch: &str) -> Vec<(&'static str, &'static str)> {
 /// scope and threading it through every test caller would balloon the diff.
 /// Instead the placeholder is emitted there, and resolved here from the
 /// `ModelMetadata` the production caller already holds.
-pub(crate) fn resolve_mtp_block_index(gguf_name: &str, num_hidden_layers: u32) -> String {
+pub fn resolve_mtp_block_index(gguf_name: &str, num_hidden_layers: u32) -> String {
     if let Some(rest) = gguf_name.strip_prefix("blk.mtp") {
         if let Some(dot_pos) = rest.find('.') {
             let idx_str = &rest[..dot_pos];
@@ -2045,8 +2182,14 @@ fn hf_name_to_gguf(hf_name: &str, arch: &str, num_hidden_layers: u32) -> String 
         ("model.norm.weight", "output_norm.weight"),
         ("lm_head.weight", "output.weight"),
         // Vision static tensors
-        ("model.vision_tower.patch_embedder.input_proj.weight", "v.patch_embd.weight"),
-        ("model.vision_tower.patch_embedder.position_embedding_table", "v.position_embd.weight"),
+        (
+            "model.vision_tower.patch_embedder.input_proj.weight",
+            "v.patch_embd.weight",
+        ),
+        (
+            "model.vision_tower.patch_embedder.position_embedding_table",
+            "v.position_embd.weight",
+        ),
         ("model.vision_tower.std_bias", "v.std_bias"),
         ("model.vision_tower.std_scale", "v.std_scale"),
         // ADR-005 Phase 2c iter-116f: gemma4v projector base name must be
@@ -2060,7 +2203,10 @@ fn hf_name_to_gguf(hf_name: &str, arch: &str, num_hidden_layers: u32) -> String 
         // (`mmproj_weights::mm_0_weight`) still looks up `mm.0.weight` —
         // self-load drift is tracked separately; this iter's gate is
         // llama-mtmd-cli's CLIP loader (`HF2Q_LLAMA_MMPROJ_COMPAT_MODEL_LOAD`).
-        ("model.embed_vision.embedding_projection.weight", "mm.input_projection.weight"),
+        (
+            "model.embed_vision.embedding_projection.weight",
+            "mm.input_projection.weight",
+        ),
         // Gemma4ClippableLinear scalar bounds for the multimodal projection.
         // Each is a single-f32 tensor in HF (PyTorch 0-D scalar); the
         // llama.cpp converter `unsqueeze(0)`s them to GGUF 1-D `[1]`
@@ -2068,10 +2214,22 @@ fn hf_name_to_gguf(hf_name: &str, arch: &str, num_hidden_layers: u32) -> String 
         // (clip.cpp:1941-1959 substitutes `.weight` -> `.input_min` etc on
         // the same base name), so they MUST share the `mm.input_projection`
         // prefix. Reference: `/opt/llama.cpp/tools/mtmd/clip.cpp:1935-1959`.
-        ("model.embed_vision.embedding_projection.input_min", "mm.input_projection.input_min"),
-        ("model.embed_vision.embedding_projection.input_max", "mm.input_projection.input_max"),
-        ("model.embed_vision.embedding_projection.output_min", "mm.input_projection.output_min"),
-        ("model.embed_vision.embedding_projection.output_max", "mm.input_projection.output_max"),
+        (
+            "model.embed_vision.embedding_projection.input_min",
+            "mm.input_projection.input_min",
+        ),
+        (
+            "model.embed_vision.embedding_projection.input_max",
+            "mm.input_projection.input_max",
+        ),
+        (
+            "model.embed_vision.embedding_projection.output_min",
+            "mm.input_projection.output_min",
+        ),
+        (
+            "model.embed_vision.embedding_projection.output_max",
+            "mm.input_projection.output_max",
+        ),
     ];
 
     for &(hf, gguf) in static_map {
@@ -2202,10 +2360,10 @@ fn hf_name_to_gguf(hf_name: &str, arch: &str, num_hidden_layers: u32) -> String 
                 let mtp_idx: u32 = rest[..dot_pos].parse().unwrap_or(0);
                 let suffix = &rest[dot_pos + 1..];
                 let nextn_suffix = match suffix {
-                    "enorm.weight"        => Some("nextn.enorm.weight"),
-                    "hnorm.weight"        => Some("nextn.hnorm.weight"),
+                    "enorm.weight" => Some("nextn.enorm.weight"),
+                    "hnorm.weight" => Some("nextn.hnorm.weight"),
                     "embed_tokens.weight" => Some("nextn.embed_tokens.weight"),
-                    "eh_proj.weight"      => Some("nextn.eh_proj.weight"),
+                    "eh_proj.weight" => Some("nextn.eh_proj.weight"),
                     _ => None,
                 };
                 if let Some(ns) = nextn_suffix {
@@ -2269,12 +2427,18 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
         Ok(contents) => match serde_json::from_str(&contents) {
             Ok(v) => v,
             Err(e) => {
-                warn!("Failed to parse tokenizer.json: {}; skipping tokenizer embedding", e);
+                warn!(
+                    "Failed to parse tokenizer.json: {}; skipping tokenizer embedding",
+                    e
+                );
                 return None;
             }
         },
         Err(e) => {
-            warn!("Failed to read tokenizer.json: {}; skipping tokenizer embedding", e);
+            warn!(
+                "Failed to read tokenizer.json: {}; skipping tokenizer embedding",
+                e
+            );
             return None;
         }
     };
@@ -2302,7 +2466,10 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
 
     // Build ordered token string list
     // Fill gaps with empty strings (shouldn't happen for well-formed vocabs)
-    let max_id = vocab_entries.last().map(|(_, id)| *id as usize).unwrap_or(0);
+    let max_id = vocab_entries
+        .last()
+        .map(|(_, id)| *id as usize)
+        .unwrap_or(0);
     let total_tokens = max_id + 1;
     let mut tokens: Vec<String> = vec![String::new(); total_tokens];
     for (token, id) in &vocab_entries {
@@ -2315,11 +2482,16 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
     info!("Loaded {} merges", merges.len());
 
     // Build set of added token IDs and special token IDs
-    let added_tokens_arr = tokenizer_json.get("added_tokens").and_then(|v| v.as_array());
+    let added_tokens_arr = tokenizer_json
+        .get("added_tokens")
+        .and_then(|v| v.as_array());
     let mut special_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
     if let Some(added) = added_tokens_arr {
         for entry in added {
-            let is_special = entry.get("special").and_then(|v| v.as_bool()).unwrap_or(false);
+            let is_special = entry
+                .get("special")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if is_special {
                 if let Some(id) = entry.get("id").and_then(|v| v.as_u64()) {
                     special_ids.insert(id as u32);
@@ -2330,8 +2502,13 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
 
     // Gemma4 set_vocab marks certain tokens as USER_DEFINED for chat parser visibility
     let visible_tokens: std::collections::HashSet<&str> = [
-        "<|channel>", "<channel|>", "<|tool_call>", "<tool_call|>",
-        "<|tool_response>", "<tool_response|>", "<|\"|>",
+        "<|channel>",
+        "<channel|>",
+        "<|tool_call>",
+        "<tool_call|>",
+        "<|tool_response>",
+        "<tool_response|>",
+        "<|\"|>",
     ]
     .iter()
     .copied()
@@ -2373,13 +2550,25 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
     // are appended below.
     let mut kv: Vec<(String, MetaValue)> = vec![
         // Required: tokenizer model name.
-        ("tokenizer.ggml.model".into(), MetaValue::String(tokenizer_model_name.clone())),
+        (
+            "tokenizer.ggml.model".into(),
+            MetaValue::String(tokenizer_model_name.clone()),
+        ),
         // Token strings.
-        ("tokenizer.ggml.tokens".into(), MetaValue::ArrayString(tokens)),
+        (
+            "tokenizer.ggml.tokens".into(),
+            MetaValue::ArrayString(tokens),
+        ),
         // Scores.
-        ("tokenizer.ggml.scores".into(), MetaValue::ArrayFloat32(scores)),
+        (
+            "tokenizer.ggml.scores".into(),
+            MetaValue::ArrayFloat32(scores),
+        ),
         // Token types.
-        ("tokenizer.ggml.token_type".into(), MetaValue::ArrayInt32(token_types)),
+        (
+            "tokenizer.ggml.token_type".into(),
+            MetaValue::ArrayInt32(token_types),
+        ),
     ];
 
     // Merges
@@ -2392,16 +2581,10 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
 
     // Special token IDs
     if let Some(id) = bos_id {
-        kv.push((
-            "tokenizer.ggml.bos_token_id".into(),
-            MetaValue::Uint32(id),
-        ));
+        kv.push(("tokenizer.ggml.bos_token_id".into(), MetaValue::Uint32(id)));
     }
     if let Some(id) = eos_id {
-        kv.push((
-            "tokenizer.ggml.eos_token_id".into(),
-            MetaValue::Uint32(id),
-        ));
+        kv.push(("tokenizer.ggml.eos_token_id".into(), MetaValue::Uint32(id)));
     }
     if let Some(id) = unk_id {
         kv.push((
@@ -2417,10 +2600,7 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
     }
 
     // Bool flags
-    kv.push((
-        "tokenizer.ggml.add_bos_token".into(),
-        MetaValue::Bool(true),
-    ));
+    kv.push(("tokenizer.ggml.add_bos_token".into(), MetaValue::Bool(true)));
     kv.push((
         "tokenizer.ggml.add_space_prefix".into(),
         MetaValue::Bool(false),
@@ -2449,16 +2629,14 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
     let template_str: Option<String> = if chat_template_path.exists() {
         std::fs::read_to_string(&chat_template_path).ok()
     } else {
-        tokenizer_config.as_ref()
+        tokenizer_config
+            .as_ref()
             .and_then(|c: &serde_json::Value| c.get("chat_template"))
             .and_then(|v: &serde_json::Value| v.as_str())
             .map(|s| s.to_string())
     };
     if let Some(tmpl) = template_str {
-        kv.push((
-            "tokenizer.chat_template".into(),
-            MetaValue::String(tmpl),
-        ));
+        kv.push(("tokenizer.chat_template".into(), MetaValue::String(tmpl)));
     }
 
     info!(
@@ -2656,10 +2834,7 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
         "general.name".into(),
         MetaValue::String(meta.architecture.clone()),
     ));
-    kv.push((
-        "general.quantization_version".into(),
-        MetaValue::Uint32(2),
-    ));
+    kv.push(("general.quantization_version".into(), MetaValue::Uint32(2)));
     // ADR-013 P14: qwen35 / qwen35moe block_count includes appended MTP
     // blocks when present. Other arches keep their historical layer count.
     //
@@ -2727,8 +2902,13 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
     ));
 
     // Context length — required by llama.cpp as {arch}.context_length
-    let tc = meta.raw_config.get("text_config").cloned().unwrap_or_default();
-    let ctx_len = tc.get("max_position_embeddings")
+    let tc = meta
+        .raw_config
+        .get("text_config")
+        .cloned()
+        .unwrap_or_default();
+    let ctx_len = tc
+        .get("max_position_embeddings")
         .or_else(|| meta.raw_config.get("max_position_embeddings"))
         .and_then(|v| v.as_u64())
         .unwrap_or(131072) as u32;
@@ -2740,7 +2920,8 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
     // Gemma4-specific metadata required by llama.cpp
     if arch == "gemma4" {
         // RMS norm epsilon
-        let rms_eps = tc.get("rms_norm_eps")
+        let rms_eps = tc
+            .get("rms_norm_eps")
             .and_then(|v| v.as_f64())
             .unwrap_or(1e-6) as f32;
         kv.push((
@@ -2749,7 +2930,8 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
         ));
 
         // Sliding window size
-        let swa = tc.get("sliding_window")
+        let swa = tc
+            .get("sliding_window")
             .and_then(|v| v.as_u64())
             .unwrap_or(1024) as u32;
         kv.push((
@@ -2759,7 +2941,8 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
 
         // Sliding window pattern (bool array: true = sliding, false = full)
         if let Some(layer_types) = tc.get("layer_types").and_then(|v| v.as_array()) {
-            let swa_pattern: Vec<bool> = layer_types.iter()
+            let swa_pattern: Vec<bool> = layer_types
+                .iter()
                 .map(|v| v.as_str() == Some("sliding_attention"))
                 .collect();
             kv.push((
@@ -2769,7 +2952,8 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
         }
 
         // Head dimensions: key_length (global), value_length (global)
-        let global_head_dim = tc.get("global_head_dim")
+        let global_head_dim = tc
+            .get("global_head_dim")
             .and_then(|v| v.as_u64())
             .unwrap_or(512) as u32;
         kv.push((
@@ -2782,9 +2966,7 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
         ));
 
         // Head dimensions: key_length_swa, value_length_swa (sliding)
-        let swa_head_dim = tc.get("head_dim")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(256) as u32;
+        let swa_head_dim = tc.get("head_dim").and_then(|v| v.as_u64()).unwrap_or(256) as u32;
         kv.push((
             format!("{}.attention.key_length_swa", arch),
             MetaValue::Uint32(swa_head_dim),
@@ -2795,7 +2977,8 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
         ));
 
         // Per-layer embedding (hidden_size_per_layer_input, 0 if absent)
-        let n_pl_embd = tc.get("hidden_size_per_layer_input")
+        let n_pl_embd = tc
+            .get("hidden_size_per_layer_input")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
         kv.push((
@@ -2804,7 +2987,8 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
         ));
 
         // Expert feed-forward length (moe_intermediate_size)
-        if let Some(moe_ff) = tc.get("moe_intermediate_size")
+        if let Some(moe_ff) = tc
+            .get("moe_intermediate_size")
             .or_else(|| tc.get("expert_intermediate_size"))
             .and_then(|v| v.as_u64())
         {
@@ -2815,7 +2999,8 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
         }
 
         // Rope freq base (global attention)
-        let rope_theta = tc.get("rope_parameters")
+        let rope_theta = tc
+            .get("rope_parameters")
             .and_then(|rp| rp.get("full_attention"))
             .and_then(|fa| fa.get("rope_theta"))
             .and_then(|v| v.as_f64())
@@ -2826,7 +3011,8 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
         ));
 
         // Rope freq base for SWA (sliding attention)
-        let rope_theta_swa = tc.get("rope_parameters")
+        let rope_theta_swa = tc
+            .get("rope_parameters")
             .and_then(|rp| rp.get("sliding_attention"))
             .and_then(|sa| sa.get("rope_theta"))
             .and_then(|v| v.as_f64())
@@ -2838,7 +3024,8 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
 
         // Rope dimension counts
         let rope_dim_full = global_head_dim;
-        let partial_rotary_factor_swa = tc.get("rope_parameters")
+        let partial_rotary_factor_swa = tc
+            .get("rope_parameters")
             .and_then(|rp| rp.get("sliding_attention"))
             .and_then(|sa| sa.get("partial_rotary_factor"))
             .and_then(|v| v.as_f64())
@@ -2854,15 +3041,24 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
         ));
 
         // KV head counts per layer (array: different for sliding vs global)
-        let num_kv_heads_swa = tc.get("num_key_value_heads")
+        let num_kv_heads_swa = tc
+            .get("num_key_value_heads")
             .and_then(|v| v.as_u64())
             .unwrap_or(8) as u32;
-        let num_kv_heads_full = tc.get("num_global_key_value_heads")
+        let num_kv_heads_full = tc
+            .get("num_global_key_value_heads")
             .and_then(|v| v.as_u64())
             .unwrap_or(2) as u32;
         if let Some(layer_types) = tc.get("layer_types").and_then(|v| v.as_array()) {
-            let kv_heads_arr: Vec<u32> = layer_types.iter()
-                .map(|v| if v.as_str() == Some("sliding_attention") { num_kv_heads_swa } else { num_kv_heads_full })
+            let kv_heads_arr: Vec<u32> = layer_types
+                .iter()
+                .map(|v| {
+                    if v.as_str() == Some("sliding_attention") {
+                        num_kv_heads_swa
+                    } else {
+                        num_kv_heads_full
+                    }
+                })
                 .collect();
             kv.push((
                 format!("{}.attention.head_count_kv", arch),
@@ -2940,11 +3136,17 @@ fn emit_qwen35_metadata(
         // llama-arch.cpp:268 LLM_KV_SSM_CONV_KERNEL → "%s.ssm.conv_kernel"
         // llama-model.cpp:2811/2842 mandatory read
         if let Some(conv_k) = meta.linear_conv_kernel_dim {
-            kv.push((format!("{}.ssm.conv_kernel", arch), MetaValue::Uint32(conv_k)));
+            kv.push((
+                format!("{}.ssm.conv_kernel", arch),
+                MetaValue::Uint32(conv_k),
+            ));
         }
         // llama-arch.cpp:269 LLM_KV_SSM_INNER_SIZE → "%s.ssm.inner_size"
         // llama-model.cpp:2812/2843 mandatory read
-        kv.push((format!("{}.ssm.inner_size", arch), MetaValue::Uint32(vdim * vheads)));
+        kv.push((
+            format!("{}.ssm.inner_size", arch),
+            MetaValue::Uint32(vdim * vheads),
+        ));
     }
     // llama-arch.cpp:270 LLM_KV_SSM_STATE_SIZE → "%s.ssm.state_size"
     // llama-model.cpp:2813/2844 mandatory read = ssm_d_state = linear_key_head_dim
@@ -2954,35 +3156,58 @@ fn emit_qwen35_metadata(
     // llama-arch.cpp:271 LLM_KV_SSM_TIME_STEP_RANK → "%s.ssm.time_step_rank"
     // llama-model.cpp:2814/2845 mandatory read = ssm_dt_rank = linear_num_value_heads
     if let Some(vheads) = meta.linear_num_value_heads {
-        kv.push((format!("{}.ssm.time_step_rank", arch), MetaValue::Uint32(vheads)));
+        kv.push((
+            format!("{}.ssm.time_step_rank", arch),
+            MetaValue::Uint32(vheads),
+        ));
     }
     // llama-arch.cpp:272 LLM_KV_SSM_GROUP_COUNT → "%s.ssm.group_count"
     // llama-model.cpp:2815/2846 mandatory read = ssm_n_group = linear_num_key_heads
     if let Some(kheads) = meta.linear_num_key_heads {
-        kv.push((format!("{}.ssm.group_count", arch), MetaValue::Uint32(kheads)));
+        kv.push((
+            format!("{}.ssm.group_count", arch),
+            MetaValue::Uint32(kheads),
+        ));
     }
 
     // RMS norm epsilon — llama-arch.cpp:220 LLM_KV_ATTENTION_LAYERNORM_RMS_EPS
     // llama-model.cpp:2807/2837 mandatory read
-    let rms_eps = meta.raw_config
+    let rms_eps = meta
+        .raw_config
         .get("rms_norm_eps")
         .and_then(|v| v.as_f64())
         .unwrap_or(1e-6) as f32;
-    kv.push((format!("{}.attention.layer_norm_rms_epsilon", arch), MetaValue::Float32(rms_eps)));
+    kv.push((
+        format!("{}.attention.layer_norm_rms_epsilon", arch),
+        MetaValue::Float32(rms_eps),
+    ));
 
     // head_dim: key_length and value_length — llama-arch.cpp:217-218
     // convert_hf_to_gguf.py:1192-1193  add_key_length / add_value_length from hparams["head_dim"]
     if let Some(hd) = meta.head_dim {
-        kv.push((format!("{}.attention.key_length", arch), MetaValue::Uint32(hd)));
-        kv.push((format!("{}.attention.value_length", arch), MetaValue::Uint32(hd)));
+        kv.push((
+            format!("{}.attention.key_length", arch),
+            MetaValue::Uint32(hd),
+        ));
+        kv.push((
+            format!("{}.attention.value_length", arch),
+            MetaValue::Uint32(hd),
+        ));
     }
 
     // RoPE freq_base — llama-arch.cpp:249 LLM_KV_ROPE_FREQ_BASE
     // convert_hf_to_gguf.py:1157-1159  add_rope_freq_base from rope_parameters.rope_theta
     if let Some(ref rp) = meta.rope_parameters {
         // rope_theta = 10_000_000 for Qwen3.5-MoE apex (rope_parameters.rope_theta)
-        let rope_theta = if rp.rope_theta > 0.0 { rp.rope_theta } else { 10_000_000.0 };
-        kv.push((format!("{}.rope.freq_base", arch), MetaValue::Float32(rope_theta as f32)));
+        let rope_theta = if rp.rope_theta > 0.0 {
+            rp.rope_theta
+        } else {
+            10_000_000.0
+        };
+        kv.push((
+            format!("{}.rope.freq_base", arch),
+            MetaValue::Float32(rope_theta as f32),
+        ));
 
         // RoPE dimension_sections — llama-arch.cpp:248 LLM_KV_ROPE_DIMENSION_SECTIONS
         // llama-model.cpp:2808/2839 mandatory read via get_key_or_arr
@@ -2992,7 +3217,10 @@ fn emit_qwen35_metadata(
             sections.push(0);
         }
         let sections_u32: Vec<u32> = sections.iter().take(4).copied().collect();
-        kv.push((format!("{}.rope.dimension_sections", arch), MetaValue::ArrayUint32(sections_u32)));
+        kv.push((
+            format!("{}.rope.dimension_sections", arch),
+            MetaValue::ArrayUint32(sections_u32),
+        ));
 
         // RoPE dimension_count — llama-arch.cpp:246 LLM_KV_ROPE_DIMENSION_COUNT
         // convert_hf_to_gguf.py:4783  rope_dim = int(head_dim * partial_rotary_factor)
@@ -3004,14 +3232,20 @@ fn emit_qwen35_metadata(
                 meta.partial_rotary_factor.unwrap_or(0.25)
             };
             let rope_dim = (hd as f32 * prf) as u32;
-            kv.push((format!("{}.rope.dimension_count", arch), MetaValue::Uint32(rope_dim)));
+            kv.push((
+                format!("{}.rope.dimension_count", arch),
+                MetaValue::Uint32(rope_dim),
+            ));
         }
     }
 
     // full_attention_interval — llama-arch.cpp:211 LLM_KV_FULL_ATTENTION_INTERVAL
     // llama-model.cpp:2820/2851 optional read, default 4
     let fai = meta.full_attention_interval.unwrap_or(4);
-    kv.push((format!("{}.full_attention_interval", arch), MetaValue::Uint32(fai)));
+    kv.push((
+        format!("{}.full_attention_interval", arch),
+        MetaValue::Uint32(fai),
+    ));
 
     // nextn_predict_layers — llama-arch.cpp:194 LLM_KV_NEXTN_PREDICT_LAYERS
     // optional, default 0; MTP block count.  mtp_num_hidden_layers = 1 for the apex model.
@@ -3019,7 +3253,10 @@ fn emit_qwen35_metadata(
     if std::env::var("HF2Q_QWEN35_DROP_MTP").as_deref() != Ok("1") {
         if let Some(mtp) = meta.mtp_num_hidden_layers {
             if mtp > 0 {
-                kv.push((format!("{}.nextn_predict_layers", arch), MetaValue::Uint32(mtp)));
+                kv.push((
+                    format!("{}.nextn_predict_layers", arch),
+                    MetaValue::Uint32(mtp),
+                ));
             }
         }
     }
@@ -3029,12 +3266,18 @@ fn emit_qwen35_metadata(
         // llama-arch.cpp:175 LLM_KV_EXPERT_FEED_FORWARD_LENGTH → "%s.expert_feed_forward_length"
         // llama-model.cpp:2835 optional read
         if let Some(ff_exp) = meta.moe_intermediate_size {
-            kv.push((format!("{}.expert_feed_forward_length", arch), MetaValue::Uint32(ff_exp)));
+            kv.push((
+                format!("{}.expert_feed_forward_length", arch),
+                MetaValue::Uint32(ff_exp),
+            ));
         }
         // llama-arch.cpp:176 LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH → "%s.expert_shared_feed_forward_length"
         // llama-model.cpp:2836 optional read
         if let Some(ff_shexp) = meta.shared_expert_intermediate_size {
-            kv.push((format!("{}.expert_shared_feed_forward_length", arch), MetaValue::Uint32(ff_shexp)));
+            kv.push((
+                format!("{}.expert_shared_feed_forward_length", arch),
+                MetaValue::Uint32(ff_shexp),
+            ));
         }
         // Note: expert_count and expert_used_count are already emitted by the common
         // path in build_metadata (lines 2004-2015) using meta.num_experts / meta.top_k_experts.
@@ -3047,14 +3290,14 @@ fn emit_qwen35_metadata(
 /// For K-quant models the ftype is selected based on the dominant bit width.
 fn ggml_ftype_from_bits(bits: u8) -> u32 {
     match bits {
-        16 => 1,  // MOSTLY_F16
-        8 => 7,   // MOSTLY_Q8_0
-        4 => 15,  // MOSTLY_Q4_K_M
-        3 => 12,  // MOSTLY_Q3_K_M
-        2 => 10,  // MOSTLY_Q2_K
-        5 => 17,  // MOSTLY_Q5_K_M
-        6 => 18,  // MOSTLY_Q6_K
-        _ => 1,   // default to F16
+        16 => 1, // MOSTLY_F16
+        8 => 7,  // MOSTLY_Q8_0
+        4 => 15, // MOSTLY_Q4_K_M
+        3 => 12, // MOSTLY_Q3_K_M
+        2 => 10, // MOSTLY_Q2_K
+        5 => 17, // MOSTLY_Q5_K_M
+        6 => 18, // MOSTLY_Q6_K
+        _ => 1,  // default to F16
     }
 }
 
@@ -3201,7 +3444,13 @@ pub(crate) fn arch_gguf_name(metadata: &crate::ir::ModelMetadata) -> String {
 fn sanitize_model_type(model_type: &str) -> String {
     model_type
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -3216,39 +3465,76 @@ mod tests {
 
     fn meta() -> ModelMetadata {
         ModelMetadata {
-            architecture: "LlamaForCausalLM".into(), model_type: "llama".into(),
-            param_count: 7_000_000_000, hidden_size: 4096, num_layers: 32,
-            layer_types: vec!["attention".into()], num_attention_heads: 32,
-            num_kv_heads: Some(8), vocab_size: 32000, dtype: "float16".into(),
-            shard_count: 1, num_experts: None, top_k_experts: None,
-            intermediate_size: Some(11008), raw_config: serde_json::Value::Null,
-            explicit_layer_types: None, full_attention_interval: None,
-            attn_output_gate: None, head_dim: None, partial_rotary_factor: None,
-            rope_parameters: None, linear_conv_kernel_dim: None,
-            linear_key_head_dim: None, linear_num_key_heads: None,
-            linear_value_head_dim: None, linear_num_value_heads: None,
-            mamba_ssm_dtype: None, moe_intermediate_size: None,
-            shared_expert_intermediate_size: None, mtp_num_hidden_layers: None,
-            mtp_use_dedicated_embeddings: None, output_router_logits: None,
+            architecture: "LlamaForCausalLM".into(),
+            model_type: "llama".into(),
+            param_count: 7_000_000_000,
+            hidden_size: 4096,
+            num_layers: 32,
+            layer_types: vec!["attention".into()],
+            num_attention_heads: 32,
+            num_kv_heads: Some(8),
+            vocab_size: 32000,
+            dtype: "float16".into(),
+            shard_count: 1,
+            num_experts: None,
+            top_k_experts: None,
+            intermediate_size: Some(11008),
+            raw_config: serde_json::Value::Null,
+            explicit_layer_types: None,
+            full_attention_interval: None,
+            attn_output_gate: None,
+            head_dim: None,
+            partial_rotary_factor: None,
+            rope_parameters: None,
+            linear_conv_kernel_dim: None,
+            linear_key_head_dim: None,
+            linear_num_key_heads: None,
+            linear_value_head_dim: None,
+            linear_num_value_heads: None,
+            mamba_ssm_dtype: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
+            output_router_logits: None,
             router_aux_loss_coef: None,
         }
     }
 
     fn tensor(name: &str, bits: u8, preserved: bool) -> QuantizedTensor {
         QuantizedTensor {
-            name: name.into(), shape: vec![32, 32], original_dtype: DType::F16,
+            name: name.into(),
+            shape: vec![32, 32],
+            original_dtype: DType::F16,
             data: vec![0u8; 32 * 32 * 2],
             quant_info: TensorQuantInfo {
-                method: if preserved { "passthrough".into() } else { format!("q{}", bits) },
-                bits, group_size: 64, preserved, scales: None, biases: None,
+                method: if preserved {
+                    "passthrough".into()
+                } else {
+                    format!("q{}", bits)
+                },
+                bits,
+                group_size: 64,
+                preserved,
+                scales: None,
+                biases: None,
                 ggml_type: None,
             },
         }
     }
 
     fn model(tensors: Vec<(&str, u8, bool)>, bits: u8) -> QuantizedModel {
-        let map = tensors.into_iter().map(|(n, b, p)| (n.into(), tensor(n, b, p))).collect();
-        QuantizedModel { metadata: meta(), tensors: map, quant_method: format!("q{}", bits), group_size: 64, bits }
+        let map = tensors
+            .into_iter()
+            .map(|(n, b, p)| (n.into(), tensor(n, b, p)))
+            .collect();
+        QuantizedModel {
+            metadata: meta(),
+            tensors: map,
+            quant_method: format!("q{}", bits),
+            group_size: 64,
+            bits,
+        }
     }
 
     fn model_with_metadata(metadata: ModelMetadata) -> QuantizedModel {
@@ -3278,31 +3564,78 @@ mod tests {
     #[test]
     fn test_name_mapping_llama() {
         // Static mappings (arch-independent)
-        assert_eq!(hf_name_to_gguf_no_mtp("model.embed_tokens.weight", "llama"), "token_embd.weight");
-        assert_eq!(hf_name_to_gguf_no_mtp("model.norm.weight", "llama"), "output_norm.weight");
-        assert_eq!(hf_name_to_gguf_no_mtp("lm_head.weight", "llama"), "output.weight");
+        assert_eq!(
+            hf_name_to_gguf_no_mtp("model.embed_tokens.weight", "llama"),
+            "token_embd.weight"
+        );
+        assert_eq!(
+            hf_name_to_gguf_no_mtp("model.norm.weight", "llama"),
+            "output_norm.weight"
+        );
+        assert_eq!(
+            hf_name_to_gguf_no_mtp("lm_head.weight", "llama"),
+            "output.weight"
+        );
         // Layer mappings for LLaMA-family
         let cases = [
-            ("model.layers.0.self_attn.q_proj.weight", "blk.0.attn_q.weight"),
-            ("model.layers.15.self_attn.k_proj.weight", "blk.15.attn_k.weight"),
-            ("model.layers.31.self_attn.v_proj.weight", "blk.31.attn_v.weight"),
-            ("model.layers.0.self_attn.o_proj.weight", "blk.0.attn_output.weight"),
-            ("model.layers.3.mlp.gate_proj.weight", "blk.3.ffn_gate.weight"),
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                "blk.0.attn_q.weight",
+            ),
+            (
+                "model.layers.15.self_attn.k_proj.weight",
+                "blk.15.attn_k.weight",
+            ),
+            (
+                "model.layers.31.self_attn.v_proj.weight",
+                "blk.31.attn_v.weight",
+            ),
+            (
+                "model.layers.0.self_attn.o_proj.weight",
+                "blk.0.attn_output.weight",
+            ),
+            (
+                "model.layers.3.mlp.gate_proj.weight",
+                "blk.3.ffn_gate.weight",
+            ),
             ("model.layers.3.mlp.up_proj.weight", "blk.3.ffn_up.weight"),
-            ("model.layers.3.mlp.down_proj.weight", "blk.3.ffn_down.weight"),
-            ("model.layers.0.input_layernorm.weight", "blk.0.attn_norm.weight"),
-            ("model.layers.0.post_attention_layernorm.weight", "blk.0.ffn_norm.weight"),
+            (
+                "model.layers.3.mlp.down_proj.weight",
+                "blk.3.ffn_down.weight",
+            ),
+            (
+                "model.layers.0.input_layernorm.weight",
+                "blk.0.attn_norm.weight",
+            ),
+            (
+                "model.layers.0.post_attention_layernorm.weight",
+                "blk.0.ffn_norm.weight",
+            ),
         ];
-        for (hf, gguf) in cases { assert_eq!(hf_name_to_gguf_no_mtp(hf, "llama"), gguf, "mapping failed for {}", hf); }
+        for (hf, gguf) in cases {
+            assert_eq!(
+                hf_name_to_gguf_no_mtp(hf, "llama"),
+                gguf,
+                "mapping failed for {}",
+                hf
+            );
+        }
         // Unknown passthrough
-        assert_eq!(hf_name_to_gguf_no_mtp("model.layers.5.some_new.weight", "llama"), "blk.5.some_new.weight");
-        assert_eq!(hf_name_to_gguf_no_mtp("decoder.block.0.weight", "llama"), "decoder.block.0.weight");
+        assert_eq!(
+            hf_name_to_gguf_no_mtp("model.layers.5.some_new.weight", "llama"),
+            "blk.5.some_new.weight"
+        );
+        assert_eq!(
+            hf_name_to_gguf_no_mtp("decoder.block.0.weight", "llama"),
+            "decoder.block.0.weight"
+        );
         // Verify LLaMA-like archs all behave the same
         for arch in &["mistral", "qwen3", "qwen2", "phi"] {
             assert_eq!(
                 hf_name_to_gguf_no_mtp("model.layers.0.post_attention_layernorm.weight", arch),
                 "blk.0.ffn_norm.weight",
-                "LLaMA-like arch '{}' should map post_attention_layernorm to ffn_norm", arch,
+                "LLaMA-like arch '{}' should map post_attention_layernorm to ffn_norm",
+                arch,
             );
         }
     }
@@ -3321,15 +3654,24 @@ mod tests {
         );
         // MoE norms
         assert_eq!(
-            hf_name_to_gguf_no_mtp("model.layers.5.post_feedforward_layernorm_1.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp(
+                "model.layers.5.post_feedforward_layernorm_1.weight",
+                "gemma4"
+            ),
             "blk.5.post_ffw_norm_1.weight",
         );
         assert_eq!(
-            hf_name_to_gguf_no_mtp("model.layers.5.post_feedforward_layernorm_2.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp(
+                "model.layers.5.post_feedforward_layernorm_2.weight",
+                "gemma4"
+            ),
             "blk.5.post_ffw_norm_2.weight",
         );
         assert_eq!(
-            hf_name_to_gguf_no_mtp("model.layers.5.pre_feedforward_layernorm_2.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp(
+                "model.layers.5.pre_feedforward_layernorm_2.weight",
+                "gemma4"
+            ),
             "blk.5.pre_ffw_norm_2.weight",
         );
         assert_eq!(
@@ -3382,7 +3724,10 @@ mod tests {
         );
         // language_model. prefix stripping still works
         assert_eq!(
-            hf_name_to_gguf_no_mtp("language_model.model.layers.0.pre_feedforward_layernorm.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp(
+                "language_model.model.layers.0.pre_feedforward_layernorm.weight",
+                "gemma4"
+            ),
             "blk.0.ffn_norm.weight",
         );
     }
@@ -3390,7 +3735,12 @@ mod tests {
     #[test]
     fn test_dtype_mapping() {
         let qi = |bits, preserved| TensorQuantInfo {
-            method: "t".into(), bits, group_size: 64, preserved, scales: None, biases: None,
+            method: "t".into(),
+            bits,
+            group_size: 64,
+            preserved,
+            scales: None,
+            biases: None,
             ggml_type: None,
         };
         assert_eq!(quant_info_to_ggml_type(&qi(16, false)), GGML_TYPE_F16);
@@ -3406,13 +3756,19 @@ mod tests {
     fn test_validate_clean_and_unsupported() {
         let backend = GgufBackend::new();
         // Clean model: no warnings
-        let w = backend.validate(&model(vec![("t1", 4, false), ("t2", 16, true)], 4)).unwrap();
+        let w = backend
+            .validate(&model(vec![("t1", 4, false), ("t2", 16, true)], 4))
+            .unwrap();
         assert!(w.is_empty(), "Expected no warnings: {:?}", w);
         // 6-bit is now supported (Q6_K) — no warnings
-        let w = backend.validate(&model(vec![("odd", 6, false)], 6)).unwrap();
+        let w = backend
+            .validate(&model(vec![("odd", 6, false)], 6))
+            .unwrap();
         assert!(w.is_empty(), "6-bit should produce no warnings: {:?}", w);
         // Truly unsupported bit width (e.g. 3-bit): 1 warning
-        let w = backend.validate(&model(vec![("odd", 3, false)], 3)).unwrap();
+        let w = backend
+            .validate(&model(vec![("odd", 3, false)], 3))
+            .unwrap();
         assert_eq!(w.len(), 1);
         assert!(w[0].message.contains("3-bit"));
         assert_eq!(w[0].severity, WarningSeverity::Warning);
@@ -3421,19 +3777,27 @@ mod tests {
     #[test]
     fn test_write_gguf_header() {
         let backend = GgufBackend::new();
-        let m = model(vec![
-            ("model.layers.0.self_attn.q_proj.weight", 4, false),
-            ("model.embed_tokens.weight", 16, true),
-        ], 4);
+        let m = model(
+            vec![
+                ("model.layers.0.self_attn.q_proj.weight", 4, false),
+                ("model.embed_tokens.weight", 16, true),
+            ],
+            4,
+        );
         let tmp = tempfile::tempdir().unwrap();
-        let manifest = backend.write(&m, tmp.path(), tmp.path(), &ProgressReporter::new()).unwrap();
+        let manifest = backend
+            .write(&m, tmp.path(), tmp.path(), &ProgressReporter::new())
+            .unwrap();
         assert_eq!(manifest.shard_count, 1);
         assert_eq!(manifest.files.len(), 1);
         assert!(manifest.files[0].filename.ends_with(".gguf"));
         // Verify binary header
         let data = std::fs::read(tmp.path().join(&manifest.files[0].filename)).unwrap();
         assert_eq!(&data[0..4], &GGUF_MAGIC);
-        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), GGUF_VERSION);
+        assert_eq!(
+            u32::from_le_bytes(data[4..8].try_into().unwrap()),
+            GGUF_VERSION
+        );
         assert_eq!(u64::from_le_bytes(data[8..16].try_into().unwrap()), 2);
     }
 
@@ -3449,11 +3813,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let kv = build_metadata(&model(vec![], 4), tmp.path());
         let keys: Vec<&str> = kv.iter().map(|(k, _)| k.as_str()).collect();
-        for expected in ["general.architecture", "general.name", "llama.block_count",
-            "llama.embedding_length", "llama.attention.head_count",
-            "llama.attention.head_count_kv", "llama.feed_forward_length", "general.file_type"]
-        {
-            assert!(keys.contains(&expected), "Missing metadata key: {}", expected);
+        for expected in [
+            "general.architecture",
+            "general.name",
+            "llama.block_count",
+            "llama.embedding_length",
+            "llama.attention.head_count",
+            "llama.attention.head_count_kv",
+            "llama.feed_forward_length",
+            "general.file_type",
+        ] {
+            assert!(
+                keys.contains(&expected),
+                "Missing metadata key: {}",
+                expected
+            );
         }
     }
 
@@ -3490,7 +3864,10 @@ mod tests {
         assert_eq!(ggml_type_from_name("q6_k"), Some(GGML_TYPE_Q6_K));
 
         // With GGML_TYPE_ prefix
-        assert_eq!(ggml_type_from_name("GGML_TYPE_Q4_K_M"), Some(GGML_TYPE_Q4_K));
+        assert_eq!(
+            ggml_type_from_name("GGML_TYPE_Q4_K_M"),
+            Some(GGML_TYPE_Q4_K)
+        );
 
         // Unknown returns None
         assert_eq!(ggml_type_from_name("Q99_Z"), None);
@@ -3523,8 +3900,13 @@ mod tests {
         #[cfg(not(debug_assertions))]
         {
             let qi_override = TensorQuantInfo {
-                method: "apex".into(), bits: 4, group_size: 64, preserved: false,
-                scales: None, biases: None, ggml_type: Some("Q4_K_M".into()),
+                method: "apex".into(),
+                bits: 4,
+                group_size: 64,
+                preserved: false,
+                scales: None,
+                biases: None,
+                ggml_type: Some("Q4_K_M".into()),
             };
             assert_eq!(
                 quant_info_to_ggml_type(&qi_override),
@@ -3540,15 +3922,25 @@ mod tests {
         // does not need the codec-direct sentinel to disambiguate
         // bytes (Q6_K kernel + repack arms exist).
         let qi_q6k = TensorQuantInfo {
-            method: "apex".into(), bits: 8, group_size: 64, preserved: false,
-            scales: None, biases: None, ggml_type: Some("Q6_K".into()),
+            method: "apex".into(),
+            bits: 8,
+            group_size: 64,
+            preserved: false,
+            scales: None,
+            biases: None,
+            ggml_type: Some("Q6_K".into()),
         };
         assert_eq!(quant_info_to_ggml_type(&qi_q6k), GGML_TYPE_Q6_K);
 
         // Non-K-quant explicit type is still honored.
         let qi_q4_0 = TensorQuantInfo {
-            method: "custom".into(), bits: 4, group_size: 32, preserved: false,
-            scales: None, biases: None, ggml_type: Some("Q4_0".into()),
+            method: "custom".into(),
+            bits: 4,
+            group_size: 32,
+            preserved: false,
+            scales: None,
+            biases: None,
+            ggml_type: Some("Q4_0".into()),
         };
         assert_eq!(quant_info_to_ggml_type(&qi_q4_0), GGML_TYPE_Q4_0);
 
@@ -3557,16 +3949,26 @@ mod tests {
         // the Iter C defence-in-depth guard and lands in the
         // bits-based table — same observable as pre-Iter C.
         let qi_unknown = TensorQuantInfo {
-            method: "apex".into(), bits: 4, group_size: 64, preserved: false,
-            scales: None, biases: None, ggml_type: Some("Q99_Z".into()),
+            method: "apex".into(),
+            bits: 4,
+            group_size: 64,
+            preserved: false,
+            scales: None,
+            biases: None,
+            ggml_type: Some("Q99_Z".into()),
         };
         assert_eq!(quant_info_to_ggml_type(&qi_unknown), GGML_TYPE_Q4_0);
 
         // preserved=true always returns F16 regardless of ggml_type
         // — short-circuits before the K-quant guard.
         let qi_preserved = TensorQuantInfo {
-            method: "passthrough".into(), bits: 16, group_size: 0, preserved: true,
-            scales: None, biases: None, ggml_type: Some("Q4_K_M".into()),
+            method: "passthrough".into(),
+            bits: 16,
+            group_size: 0,
+            preserved: true,
+            scales: None,
+            biases: None,
+            ggml_type: Some("Q4_K_M".into()),
         };
         assert_eq!(quant_info_to_ggml_type(&qi_preserved), GGML_TYPE_F16);
     }
@@ -3597,8 +3999,13 @@ mod tests {
     fn test_ggml_type_none_falls_back_to_bits() {
         // Confirms backward compatibility: ggml_type=None uses bits mapping
         let qi = |bits| TensorQuantInfo {
-            method: "t".into(), bits, group_size: 64, preserved: false,
-            scales: None, biases: None, ggml_type: None,
+            method: "t".into(),
+            bits,
+            group_size: 64,
+            preserved: false,
+            scales: None,
+            biases: None,
+            ggml_type: None,
         };
         assert_eq!(quant_info_to_ggml_type(&qi(16)), GGML_TYPE_F16);
         assert_eq!(quant_info_to_ggml_type(&qi(8)), GGML_TYPE_Q8_0);
@@ -3716,7 +4123,9 @@ mod tests {
     #[test]
     fn codec_direct_repack_q5_k_returns_raw_bytes_unchanged() {
         let block_size = crate::quantize::k_quant::BLOCK_Q5_K_SIZE;
-        let bytes: Vec<u8> = (0..block_size * 2).map(|i| ((i * 7) & 0xFF) as u8).collect();
+        let bytes: Vec<u8> = (0..block_size * 2)
+            .map(|i| ((i * 7) & 0xFF) as u8)
+            .collect();
         let qt = QuantizedTensor {
             name: "blk.0.attn_v.weight".into(),
             shape: vec![2, 256],
@@ -3779,9 +4188,8 @@ mod tests {
             data: bytes,
             quant_info: qi_codec_direct("Q4_K"),
         };
-        let err = repack_to_ggml_blocks(&qt, GGML_TYPE_F32).expect_err(
-            "codec-direct + unsupported target ggml_type must surface as Err",
-        );
+        let err = repack_to_ggml_blocks(&qt, GGML_TYPE_F32)
+            .expect_err("codec-direct + unsupported target ggml_type must surface as Err");
         let msg = format!("{err}");
         assert!(
             msg.contains("unsupported target ggml_type") && msg.contains("refusing"),
@@ -3791,14 +4199,14 @@ mod tests {
 
     #[test]
     fn test_ftype_kquant_bits() {
-        assert_eq!(ggml_ftype_from_bits(16), 1);  // MOSTLY_F16
-        assert_eq!(ggml_ftype_from_bits(8), 7);   // MOSTLY_Q8_0
-        assert_eq!(ggml_ftype_from_bits(4), 15);  // MOSTLY_Q4_K_M
-        assert_eq!(ggml_ftype_from_bits(3), 12);  // MOSTLY_Q3_K_M
-        assert_eq!(ggml_ftype_from_bits(2), 10);  // MOSTLY_Q2_K
-        assert_eq!(ggml_ftype_from_bits(5), 17);  // MOSTLY_Q5_K_M
-        assert_eq!(ggml_ftype_from_bits(6), 18);  // MOSTLY_Q6_K
-        assert_eq!(ggml_ftype_from_bits(1), 1);   // unknown → F16
+        assert_eq!(ggml_ftype_from_bits(16), 1); // MOSTLY_F16
+        assert_eq!(ggml_ftype_from_bits(8), 7); // MOSTLY_Q8_0
+        assert_eq!(ggml_ftype_from_bits(4), 15); // MOSTLY_Q4_K_M
+        assert_eq!(ggml_ftype_from_bits(3), 12); // MOSTLY_Q3_K_M
+        assert_eq!(ggml_ftype_from_bits(2), 10); // MOSTLY_Q2_K
+        assert_eq!(ggml_ftype_from_bits(5), 17); // MOSTLY_Q5_K_M
+        assert_eq!(ggml_ftype_from_bits(6), 18); // MOSTLY_Q6_K
+        assert_eq!(ggml_ftype_from_bits(1), 1); // unknown → F16
     }
 
     #[test]
@@ -3839,9 +4247,12 @@ mod tests {
         let expected_size = expected_blocks * BLOCK_Q4_0_BYTES;
         assert_eq!(expected_blocks, 2);
         assert_eq!(expected_size, 36);
-        assert_eq!(repacked.len(), expected_size,
+        assert_eq!(
+            repacked.len(),
+            expected_size,
             "Repacked Q4_0 size should be {} bytes (2 blocks * 18), got {}",
-            expected_size, repacked.len()
+            expected_size,
+            repacked.len()
         );
 
         // Verify each block starts with a 2-byte f16 scale followed by 16 bytes of nibbles
@@ -3858,12 +4269,19 @@ mod tests {
 
         // 32 elements at group_size=32: 1 group, 1 scale
         // Values: [1.0, -1.0, 0.5, -0.5, ...] (repeat)
-        let f32_vals: Vec<f32> = (0..32).map(|i| {
-            if i % 4 == 0 { 1.0 }
-            else if i % 4 == 1 { -1.0 }
-            else if i % 4 == 2 { 0.5 }
-            else { -0.5 }
-        }).collect();
+        let f32_vals: Vec<f32> = (0..32)
+            .map(|i| {
+                if i % 4 == 0 {
+                    1.0
+                } else if i % 4 == 1 {
+                    -1.0
+                } else if i % 4 == 2 {
+                    0.5
+                } else {
+                    -0.5
+                }
+            })
+            .collect();
 
         // Quantize like hf2q does: symmetric, scale = absmax / 7
         let absmax = 1.0f32;
@@ -3872,16 +4290,23 @@ mod tests {
         let scales = scale_f16.to_le_bytes().to_vec();
 
         // Quantize to signed i4
-        let signed_qs: Vec<i8> = f32_vals.iter().map(|&v| {
-            let q = (v / scale).round() as i8;
-            q.clamp(-7, 7)
-        }).collect();
+        let signed_qs: Vec<i8> = f32_vals
+            .iter()
+            .map(|&v| {
+                let q = (v / scale).round() as i8;
+                q.clamp(-7, 7)
+            })
+            .collect();
 
         // Pack as hf2q does: consecutive pairs, lo nibble first
         let mut packed = Vec::with_capacity(total_elements / 2);
         for pair in signed_qs.chunks(2) {
             let lo = (pair[0] & 0x0F) as u8;
-            let hi = if pair.len() > 1 { ((pair[1] & 0x0F) as u8) << 4 } else { 0 };
+            let hi = if pair.len() > 1 {
+                ((pair[1] & 0x0F) as u8) << 4
+            } else {
+                0
+            };
             packed.push(lo | hi);
         }
 
@@ -3925,7 +4350,14 @@ mod tests {
         // Check that dequantized values are close to originals (within quantization error)
         for (i, (&orig, &deq)) in f32_vals.iter().zip(dequantized.iter()).enumerate() {
             let err = (orig - deq).abs();
-            assert!(err < 0.2, "Element {}: orig={}, deq={}, err={}", i, orig, deq, err);
+            assert!(
+                err < 0.2,
+                "Element {}: orig={}, deq={}, err={}",
+                i,
+                orig,
+                deq,
+                err
+            );
         }
     }
 
@@ -4021,20 +4453,36 @@ mod tests {
             architecture: "Qwen3_5ForCausalLM".into(),
             model_type: "qwen3_5_text".into(), // HF model_type is NOT the GGUF arch
             param_count: 27_000_000_000,
-            hidden_size: 5120, num_layers: 64, layer_types: vec![],
-            num_attention_heads: 40, num_kv_heads: Some(8), vocab_size: 248320,
-            dtype: "bfloat16".into(), shard_count: 1, num_experts: None,
-            top_k_experts: None, intermediate_size: Some(13824),
+            hidden_size: 5120,
+            num_layers: 64,
+            layer_types: vec![],
+            num_attention_heads: 40,
+            num_kv_heads: Some(8),
+            vocab_size: 248320,
+            dtype: "bfloat16".into(),
+            shard_count: 1,
+            num_experts: None,
+            top_k_experts: None,
+            intermediate_size: Some(13824),
             raw_config: serde_json::Value::Null,
-            explicit_layer_types: None, full_attention_interval: Some(4),
-            attn_output_gate: Some(true), head_dim: Some(256),
-            partial_rotary_factor: Some(0.25), rope_parameters: None,
-            linear_conv_kernel_dim: Some(4), linear_key_head_dim: Some(128),
-            linear_num_key_heads: Some(16), linear_value_head_dim: Some(128),
-            linear_num_value_heads: Some(32), mamba_ssm_dtype: None,
-            moe_intermediate_size: None, shared_expert_intermediate_size: None,
-            mtp_num_hidden_layers: Some(1), mtp_use_dedicated_embeddings: Some(false),
-            output_router_logits: None, router_aux_loss_coef: None,
+            explicit_layer_types: None,
+            full_attention_interval: Some(4),
+            attn_output_gate: Some(true),
+            head_dim: Some(256),
+            partial_rotary_factor: Some(0.25),
+            rope_parameters: None,
+            linear_conv_kernel_dim: Some(4),
+            linear_key_head_dim: Some(128),
+            linear_num_key_heads: Some(16),
+            linear_value_head_dim: Some(128),
+            linear_num_value_heads: Some(32),
+            mamba_ssm_dtype: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            mtp_num_hidden_layers: Some(1),
+            mtp_use_dedicated_embeddings: Some(false),
+            output_router_logits: None,
+            router_aux_loss_coef: None,
         }
     }
 
@@ -4043,13 +4491,22 @@ mod tests {
             architecture: "Qwen3_5MoeForCausalLM".into(),
             model_type: "qwen3_5_moe_text".into(), // HF model_type is NOT the GGUF arch
             param_count: 35_000_000_000,
-            hidden_size: 2048, num_layers: 40, layer_types: vec![],
-            num_attention_heads: 16, num_kv_heads: Some(2), vocab_size: 248320,
-            dtype: "bfloat16".into(), shard_count: 1, num_experts: Some(256),
-            top_k_experts: Some(8), intermediate_size: None,
+            hidden_size: 2048,
+            num_layers: 40,
+            layer_types: vec![],
+            num_attention_heads: 16,
+            num_kv_heads: Some(2),
+            vocab_size: 248320,
+            dtype: "bfloat16".into(),
+            shard_count: 1,
+            num_experts: Some(256),
+            top_k_experts: Some(8),
+            intermediate_size: None,
             raw_config: serde_json::json!({"rms_norm_eps": 1e-6}),
-            explicit_layer_types: None, full_attention_interval: Some(4),
-            attn_output_gate: Some(true), head_dim: Some(256),
+            explicit_layer_types: None,
+            full_attention_interval: Some(4),
+            attn_output_gate: Some(true),
+            head_dim: Some(256),
             partial_rotary_factor: Some(0.25),
             rope_parameters: Some(crate::ir::RopeParameters {
                 mrope_interleaved: true,
@@ -4058,13 +4515,18 @@ mod tests {
                 rope_type: "default".into(),
                 partial_rotary_factor: 0.25,
             }),
-            linear_conv_kernel_dim: Some(4), linear_key_head_dim: Some(128),
-            linear_num_key_heads: Some(16), linear_value_head_dim: Some(128),
-            linear_num_value_heads: Some(32), mamba_ssm_dtype: None,
+            linear_conv_kernel_dim: Some(4),
+            linear_key_head_dim: Some(128),
+            linear_num_key_heads: Some(16),
+            linear_value_head_dim: Some(128),
+            linear_num_value_heads: Some(32),
+            mamba_ssm_dtype: None,
             moe_intermediate_size: Some(512),
             shared_expert_intermediate_size: Some(512),
-            mtp_num_hidden_layers: Some(1), mtp_use_dedicated_embeddings: Some(false),
-            output_router_logits: None, router_aux_loss_coef: None,
+            mtp_num_hidden_layers: Some(1),
+            mtp_use_dedicated_embeddings: Some(false),
+            output_router_logits: None,
+            router_aux_loss_coef: None,
         }
     }
 
@@ -4183,7 +4645,10 @@ mod tests {
             "qwen35: post_attention_layernorm must map to post_attention_norm, not ffn_norm"
         );
         assert_eq!(
-            hf_name_to_gguf_no_mtp("model.layers.5.post_attention_layernorm.weight", "qwen35moe"),
+            hf_name_to_gguf_no_mtp(
+                "model.layers.5.post_attention_layernorm.weight",
+                "qwen35moe"
+            ),
             "blk.5.post_attention_norm.weight",
             "qwen35moe: post_attention_layernorm must map to post_attention_norm"
         );
@@ -4196,7 +4661,8 @@ mod tests {
             assert_eq!(
                 hf_name_to_gguf_no_mtp("model.layers.0.post_attention_layernorm.weight", arch),
                 "blk.0.ffn_norm.weight",
-                "LLaMA-like arch '{}' must still map to ffn_norm", arch
+                "LLaMA-like arch '{}' must still map to ffn_norm",
+                arch
             );
         }
     }
@@ -4265,7 +4731,7 @@ mod tests {
         for unaffected in &[
             "blk.0.attn_norm.weight",
             "blk.39.ssm_a",
-            "blk.mtpfoo.weight",  // not parseable as u32 → unchanged
+            "blk.mtpfoo.weight", // not parseable as u32 → unchanged
             "token_embd.weight",
         ] {
             assert_eq!(resolve_mtp_block_index(unaffected, 40), *unaffected);
@@ -4295,12 +4761,20 @@ mod tests {
                 "[{arch}] input_max mapping"
             );
             assert_eq!(
-                hf_name_to_gguf("model.embed_vision.embedding_projection.output_min", arch, 0),
+                hf_name_to_gguf(
+                    "model.embed_vision.embedding_projection.output_min",
+                    arch,
+                    0
+                ),
                 "mm.input_projection.output_min",
                 "[{arch}] output_min mapping"
             );
             assert_eq!(
-                hf_name_to_gguf("model.embed_vision.embedding_projection.output_max", arch, 0),
+                hf_name_to_gguf(
+                    "model.embed_vision.embedding_projection.output_max",
+                    arch,
+                    0
+                ),
                 "mm.input_projection.output_max",
                 "[{arch}] output_max mapping"
             );

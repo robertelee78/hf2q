@@ -2,6 +2,11 @@
 # Wave 5b.26 — lift FFN pooled-output buffers to prefill scope + add
 # 11 DnFfn* sub-bucket instrumentation.
 #
+# 2026-04-28 drift note: this script is historical. Current qwen35 source no
+# longer contains `HF2Q_PROFILE_W5B26` or `HF2Q_FFN_OUTPUT_LIFT_LEGACY`, so the
+# env vars below do not prove a live NEW-vs-LEGACY A/B. Revalidate source before
+# using these results for architectural decisions.
+#
 # Lands the W-5b.25 audit's #1 candidate: cache the 9 per-FFN-call
 # `pooled_alloc_buffer` calls (`ids` / `weights` / `gate_all` / `up_all`
 # / `h_all` / `y_all` / `h_s` / `out` / `silu_params`) in a thread-local

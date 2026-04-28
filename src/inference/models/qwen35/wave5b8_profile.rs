@@ -5,9 +5,10 @@
 //! at `forward_gpu.rs:698`).
 //!
 //! Purpose: capture per-section CPU wall-clock for the chunk-pipeline
-//! prefill body so the W-5b.8 measurement spike (8.5× wall-clock gap
-//! vs llama.cpp at pp4096) can be ranked by absolute ms contribution
-//! instead of analytical guess. Zero kernel changes; no GPU
+//! prefill body. The original W-5b.8 measurement spike targeted a historical
+//! 8.5× wall-clock gap vs llama.cpp at pp4096; current runs must use the
+//! emitted bucket table because the live gap and owners have changed. Zero
+//! kernel changes; no GPU
 //! timestamping (per memory `project_m5max_no_dispatch_boundary_sampling`,
 //! M5 Max only supports stage-boundary GPU counter sampling — CPU wall
 //! captures encoder-split + commit_and_wait + memcpy + kernel-launch
@@ -225,6 +226,22 @@ pub enum SectionKind {
     /// DN layers). Should land within rounding-error of the
     /// `LayerLinearTotal` − DN-attn-buckets residual.
     DnOuterChoreographyTotal,
+    // -- Current FFN dispatch sub-buckets (additive; gated on
+    // HF2Q_PROFILE_W5B8 through `Section::start`). These partition the
+    // production `build_moe_ffn_layer_gpu_q_into` span that currently owns
+    // the largest warm-prefill bucket.
+    FfnAllocScratch,
+    FfnPhaseAProj,
+    FfnBarrierAB,
+    FfnPhaseBRouteSilu,
+    FfnBarrierBC,
+    FfnPhaseCGateUpSharedDown,
+    FfnBarrierCD,
+    FfnPhaseDSilu,
+    FfnBarrierDE,
+    FfnPhaseEDown,
+    FfnBarrierEF,
+    FfnPhaseFReduce,
 }
 
 impl SectionKind {
@@ -262,9 +279,21 @@ impl SectionKind {
             SectionKind::DnOuterFfnDispatch => "dn.outer_ffn_dispatch",
             SectionKind::DnOuterPostFfnResidual => "dn.outer_post_ffn_residual",
             SectionKind::DnOuterChoreographyTotal => "dn.outer_choreography_total",
+            SectionKind::FfnAllocScratch => "ffn.alloc_scratch",
+            SectionKind::FfnPhaseAProj => "ffn.phase_a_proj",
+            SectionKind::FfnBarrierAB => "ffn.barrier_ab",
+            SectionKind::FfnPhaseBRouteSilu => "ffn.phase_b_route_silu",
+            SectionKind::FfnBarrierBC => "ffn.barrier_bc",
+            SectionKind::FfnPhaseCGateUpSharedDown => "ffn.phase_c_gate_up_shared_down",
+            SectionKind::FfnBarrierCD => "ffn.barrier_cd",
+            SectionKind::FfnPhaseDSilu => "ffn.phase_d_silu",
+            SectionKind::FfnBarrierDE => "ffn.barrier_de",
+            SectionKind::FfnPhaseEDown => "ffn.phase_e_down",
+            SectionKind::FfnBarrierEF => "ffn.barrier_ef",
+            SectionKind::FfnPhaseFReduce => "ffn.phase_f_reduce",
         }
     }
-    const COUNT: usize = 29;
+    const COUNT: usize = 41;
 }
 
 #[derive(Default, Clone)]
@@ -369,14 +398,22 @@ pub struct Section {
 
 impl Section {
     pub fn start(kind: SectionKind) -> Self {
-        let t0 = if w5b8_enabled() { Some(Instant::now()) } else { None };
+        let t0 = if w5b8_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         Self { kind, t0 }
     }
 
     /// Variant gated on `HF2Q_PROFILE_W5B17=1`. Use for the four W-5b.17
     /// `Dn*` sub-buckets so they default off independently of W-5b.8.
     pub fn start_w5b17(kind: SectionKind) -> Self {
-        let t0 = if w5b17_enabled() { Some(Instant::now()) } else { None };
+        let t0 = if w5b17_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         Self { kind, t0 }
     }
 
@@ -384,7 +421,11 @@ impl Section {
     /// `DnOuter*` sub-buckets so they default off independently of
     /// W-5b.8 and W-5b.17.
     pub fn start_w5b22(kind: SectionKind) -> Self {
-        let t0 = if w5b22_enabled() { Some(Instant::now()) } else { None };
+        let t0 = if w5b22_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         Self { kind, t0 }
     }
 }
@@ -452,6 +493,19 @@ pub fn w5b8_print_and_reset(label: &str) {
             SectionKind::DnOuterFfnDispatch,
             SectionKind::DnOuterPostFfnResidual,
             SectionKind::DnOuterChoreographyTotal,
+            // Current FFN dispatch sub-buckets:
+            SectionKind::FfnAllocScratch,
+            SectionKind::FfnPhaseAProj,
+            SectionKind::FfnBarrierAB,
+            SectionKind::FfnPhaseBRouteSilu,
+            SectionKind::FfnBarrierBC,
+            SectionKind::FfnPhaseCGateUpSharedDown,
+            SectionKind::FfnBarrierCD,
+            SectionKind::FfnPhaseDSilu,
+            SectionKind::FfnBarrierDE,
+            SectionKind::FfnPhaseEDown,
+            SectionKind::FfnBarrierEF,
+            SectionKind::FfnPhaseFReduce,
         ];
         for k in kinds {
             let acc = &state.accs[k.idx()];

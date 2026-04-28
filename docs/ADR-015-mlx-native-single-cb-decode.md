@@ -14,6 +14,158 @@ ADR-012 closed the qwen35moe **conversion** scope at 0.94× of llama.cpp on
 `project_end_gate_reality_check`). Per-CB GPU time matches llama.cpp; the
 gap is **CPU-side encoding/scheduling overhead**.
 
+### 2026-04-28 live code/test update
+
+Ground truth for this update is current source plus live commands on `/opt/hf2q`
+HEAD `cfc5358` with `/opt/mlx-native` HEAD `a7d2b95`; docs and historical
+script comments are treated as hypotheses only.
+
+- `cargo test --release qwen35::gpu_ffn::tests::moe_ffn_gpu_q_parity -- --nocapture`
+  passes outside the sandbox with Metal visible:
+  `moe_ffn_gpu_q_parity_vs_cpu_ref ... ok`, `max_abs_err=3.12e-6`.
+- `cargo test --release real_apex -- --ignored --nocapture` passes 7/7 against
+  the real apex GGUF: config parse, MTP absence check, Q5_K dequant smoke,
+  linear-attn layer load, full-attn layer load, global tensor load, and full
+  `Qwen35Model::load_from_gguf` shape.
+- Current decode is near peer on the apex dwq46 fixture in a short same-machine
+  live run: `scripts/bench-baseline.sh` with `N_TRIALS=1 NGEN=64` reports hf2q
+  `114.4 tok/s`, llama-bench `116.78 tok/s`, ratio `0.9796`. This is not the
+  final 5-trial cold-SoC gate, but it falsifies treating decode as a 4x
+  remaining gap at current HEAD.
+- Current PP4106 prefill remains the larger live gap on the 27B dense fixture:
+  `TRIALS=1 COOLDOWN_S=0 scripts/bench-w5b27-phase-a-cold.sh` reports hf2q
+  prefill `13716 ms`; same-run llama-completion reports `7477.40`, `7441.52`,
+  `7858.66 ms` across its three prompt-eval trials. That is roughly a
+  1.7-1.8x prefill wall gap in this non-cold smoke.
+- Follow-up calibrated length sweep (`scripts/qwen35_prefill_coherence_sweep.py`,
+  baseline-vs-identical-candidate plus llama timing) shows the gap is
+  length-dependent and worst at short prompts:
+
+  | target tokens | hf2q actual | hf2q prefill | llama prompt eval | hf2q tok/s | llama tok/s |
+  |---:|---:|---:|---:|---:|---:|
+  | 512 | 511 | 5788 ms | 793.31 ms | 88 | 645.40 |
+  | 1024 | 1024 | 6615 ms | 1605.77 ms | 155 | 638.32 |
+  | 2048 | 2048 | 8906 ms | 3691.97 ms | 230 | 554.99 |
+  | 4096 | 4096 | 13749 ms | 9395.85 ms | 298 | 436.04 |
+
+  The same sweep also validates why coherence must be measured beside speed:
+  identical baseline/candidate envs kept top-1 and top-10 stable at all lengths,
+  but last-prefill-logit max-abs drift was nonzero at longer prompts
+  (`1.1459` at 1024, `0.3011` at 2048, `0.2324` at 4096; cosine remained
+  `>=0.999199`). Until that repeatability envelope is tightened, candidate
+  gates must compare against an identical-env repeatability baseline rather than
+  assuming bitwise logits across separate processes.
+- Live bucket profile (`scripts/qwen35_prefill_bucket_profile.py`, W5B8/W5B17/
+  W5B22 source-gated profiler) ran exact 512/1024/2048/4096 token prompts with
+  `HF2Q_CHUNK_SCAN_PREFILL=1`; the code emitted `chunk-pipeline ENGAGED` for
+  all four lengths. The CLI timing includes first-use GPU weight upload
+  (`upload_weights` ~= 3.33-3.38 s per fresh process), so both inclusive and
+  upload-subtracted views matter:
+
+  | target | hf2q prefill | llama prompt eval | upload_weights | hf2q minus upload | largest live buckets |
+  |---:|---:|---:|---:|---:|---|
+  | 512 | 5481 ms | 822.72 ms | 3327.77 ms | 2153 ms | FFN 597.92, linear 880.14, full 239.55, chunk_call 198.33 |
+  | 1024 | 6591 ms | 1607.33 ms | 3350.71 ms | 3240 ms | FFN 1115.81, linear 1614.79, full 461.22, chunk_call 373.53 |
+  | 2048 | 8729 ms | 3200.51 ms | 3363.36 ms | 5366 ms | FFN 2169.51, linear 3065.89, full 924.44, chunk_call 704.35 |
+  | 4096 | 13460 ms | 7429.29 ms | 3379.16 ms | 10081 ms | FFN 4435.33, linear 6203.68, full 2035.69, chunk_call 1460.40 |
+
+  This falsifies a chunk-kernel-only priority. The chunk path is live, but the
+  biggest growing bucket is `layer.ffn_dispatch` / `dn.outer_ffn_dispatch`;
+  `layer.chunk_call` is material but smaller. Short-prompt CLI numbers are also
+  dominated by lazy first-use weight upload, so prefill gates must distinguish
+  server/warm-cache steady state from fresh-process CLI timing.
+- Warm-cache in-process sweep (`scripts/qwen35_prefill_warm_sweep.py`, hidden
+  env `HF2Q_QWEN35_PREFILL_SWEEP`) loads the model once and calls the production
+  Qwen3.6 prefill path repeatedly. A 512-token smoke proves the
+  harness separates first-use effects: trial0 `8129.152 ms`, trial1
+  `1219.767 ms`, same first token `11`. Full 3-trial run:
+
+  | target | trial0 | trial1 | trial2 | first token |
+  |---:|---:|---:|---:|---:|
+  | 512 | 8212.943 ms | 1238.858 ms | 1236.578 ms | 11 |
+  | 1024 | 2290.761 ms | 2286.667 ms | 2299.083 ms | 27502 |
+  | 2048 | 4568.825 ms | 4622.712 ms | 4679.219 ms | 9640 |
+  | 4096 | 9741.695 ms | 22369.571 ms | 15316.334 ms | 264 |
+
+  A 4096-only rerun reproduced the high-variance long-prompt behavior:
+  `22891.582`, `14870.379`, `14020.743`, `12014.130`, `11969.785 ms`, all
+  first token `264`. Therefore the warm steady-state gate is valid at 512-2048
+  today, but 4096 needs explicit shape warmup and variance reporting before it
+  can be used as a single-number pass/fail. This is a runtime scheduling /
+  memory-pressure symptom to investigate, not a result to average away.
+- Warm-sweep hardening added explicit shape warmups and W5B bucket attachment.
+  4096-only profiled run with 2 warmups + 10 measured trials still varied:
+  measured min/median/max `11751.643 / 14204.745 / 16514.620 ms`; first token
+  stayed `264` for every row. Bucket delta from measured trial0 to trial9:
+  `layer.linear_total +4262.374 ms`, `layer.ffn_dispatch +2425.415 ms`,
+  `layer.chunk_call +1920.952 ms`, `chunk.commit_wait +1918.256 ms`,
+  `layer.full_total +1066.698 ms`. The variance is therefore inside named GPU
+  waits/dispatch buckets, not JSON parsing, model reload, tokenizer, or output
+  sampling.
+- Existing dense FFN allocation-policy A/B was tested before changing code:
+  `HF2Q_DENSE_Q_ARENA_RESET=0` (device scratches for prefill) is rejected. On
+  4096 it produced one warmup row at `48939.816 ms` with
+  `layer.ffn_dispatch=29281.867 ms`, then failed on the next forward:
+  `commit fused-DenseQ layer 16: Command buffer error`. Keep the default pooled
+  prefill scratch path; device scratches are not a viable speed/variance fix.
+- Last-logits prefill (2026-04-28) is a live hf2q-side win, not an mlx-native
+  runtime fix. Source check: `/opt/mlx-native/src/encoder.rs` binds
+  `KernelArg::Buffer` with `MlxBuffer::byte_offset()`, and
+  `/opt/mlx-native/src/buffer.rs::slice_view` documents the same contract, so a
+  zero-copy final-hidden-row view belongs in hf2q. `Qwen35Model::forward_gpu`
+  remains the full `[seq_len, vocab]` control path; production prefill now calls
+  `forward_gpu_last_logits`, which applies RMSNorm + lm-head to only the final
+  prompt row and downloads one vocab row. Coherence gate:
+  `scripts/qwen35_prefill_warm_sweep.py --compare-full-last` preserved top-1
+  and top-10 at 512 and 4096 (`512: token 11/11, max_abs 0.244398355, cosine
+  0.999930649437, top10 10/10`; `4096: token 264/264, max_abs 0.29414767,
+  cosine 0.999770509447, top10 10/10`). Same-build 4096 profile with 2 warmups:
+  full-logits control measured `10996.801`, `12031.931`, `11516.048 ms`; the
+  last-logits path measured `9077.491`, `9149.613`, `9631.109`, `10124.166`,
+  `10122.516 ms`, all first token `264`. This reduces memory pressure and
+  long-prompt latency but does not close the peer gap alone; remaining live
+  buckets are still `layer.ffn_dispatch`, `layer.chunk_call`, and
+  `layer.full_total`.
+- Post-last-logits current length sweep (2026-04-28, 2 shape warmups + 3
+  measured trials, `HF2Q_PROFILE_W5B8/W5B17/W5B22=1`) gives the current
+  warm-cache truth: 512 `1093.997/1103.618/1099.246 ms`; 1024
+  `2152.036/2152.819/2203.246 ms`; 2048 `4389.548/4388.677/4442.931 ms`;
+  4096 `9226.076/9237.314/9241.614 ms`, with stable first tokens
+  `11/27502/9640/264`. At 4096 the dominant buckets were
+  `layer.ffn_dispatch` ~= `4.90-4.93 s`, `layer.full_total` ~= `2.31 s`,
+  and `layer.chunk_call` ~= `1.71-1.73 s`.
+- Dense-Q FFN subprofile (same source, 4096 prompt) shows `layer.ffn_dispatch`
+  is GPU execution, not Rust encode or allocation overhead. The actual 27B
+  dense fixture takes the DenseQ path, not MoE-Q. Env-gated sub-buckets inside
+  `build_dense_ffn_layer_gpu_q_into_pooled` accounted for only ~= `1.0 ms`
+  total across 64 layers (`ffn.alloc_scratch` ~= `0.83-0.87 ms`; phase encode
+  timers near zero), while the surrounding `layer.ffn_dispatch` was
+  `4543.508/4882.974 ms`. Therefore the next FFN lever belongs in
+  mlx-native's quantized dense matmul kernels or a split-commit GPU timing
+  diagnostic, not in hf2q allocation cleanup.
+- Source scan shows `HF2Q_PROFILE_W5B26`,
+  `HF2Q_FFN_OUTPUT_LIFT_LEGACY`, and `HF2Q_FFN_DENSE_LIFT_LEGACY` remain in
+  historical scripts, not in the current qwen35 source paths. Do not use those
+  gates as proof that a live A/B still exists.
+
+Implication: the best next architectural path is prefill-first. Decode work is
+still needed to clear the exact D4 peer bar, but the current short live ratio is
+within ~2%; the large measured wall gap is prompt-prefill. Candidate work should
+therefore target batched/chunked prefill regime engagement, prefill kernel
+throughput, and prefill scheduling before another round of decode-only
+micro-optimizations.
+
+Peer-code anchor for the prefill path: `/opt/llama.cpp/common/common.h` sets
+`n_ubatch = 512` as the default physical prompt-processing batch size, while
+`/opt/llama.cpp/src/llama-context.cpp` clamps `cparams.n_ubatch` to
+`n_batch`, splits work into `llama_ubatch`, reuses graph topology when
+`graph_params` match, then calls `graph_compute(..., ubatch.n_tokens > 1)`.
+The qwen35 builders in `/opt/llama.cpp/src/models/qwen35.cpp` consume
+`ubatch.n_seq_tokens`, `ubatch.n_seqs`, and assert equal-sequence ubatches for
+linear-attention layers. That is the concrete peer pattern to mirror: stable
+physical prefill microbatches and graph/pipeline reuse, not another script-only
+FFN allocation toggle.
+
 ### The structural diagnosis
 
 > **§Supersession note (Wave 2a, 2026-04-26 / 2026-04-27 UTC; rev1

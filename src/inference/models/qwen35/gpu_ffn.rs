@@ -62,12 +62,14 @@
 //! P9b complete: both paths wired, parity tests pass.
 
 use anyhow::{anyhow, Context, Result};
-use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::dense_gemv_bf16::dense_gemv_bf16_f32;
+use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::elementwise::{cast, elementwise_add, CastDirection};
 use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
-use mlx_native::ops::quantized_matmul_ggml::{quantized_matmul_ggml, GgmlQuantizedMatmulParams, GgmlType};
+use mlx_native::ops::quantized_matmul_ggml::{
+    quantized_matmul_ggml, GgmlQuantizedMatmulParams, GgmlType,
+};
 use mlx_native::ops::quantized_matmul_id_ggml::{
     quantized_matmul_id_ggml_pooled, GgmlQuantizedMatmulIdParams,
 };
@@ -100,7 +102,7 @@ impl DenseFfnWeightsGpu {
     pub fn from_cpu(weights: &DenseFfnWeights, device: &MlxDevice) -> Result<Self> {
         Ok(Self {
             gate: upload_bf16_from_f32(&weights.gate, device)?,
-            up:   upload_bf16_from_f32(&weights.up,   device)?,
+            up: upload_bf16_from_f32(&weights.up, device)?,
             down: upload_bf16_from_f32(&weights.down, device)?,
         })
     }
@@ -119,9 +121,9 @@ impl DenseFfnWeightsGpu {
 ///
 /// # Memory savings vs `DenseFfnWeightsGpu`
 ///
-/// For a 27B dense GGUF (hidden=5120, intermediate=17408, Q4_K weights):
+/// For a 27B dense GGUF (hidden=5120, intermediate=17408, Q4_0 weights):
 ///   BF16 path:  17408×5120×2×2 bytes = 357 MB per layer × 64 layers = 22 GB
-///   Q4_K path:  17408×5120×4/8×1.06 bytes ≈ 47 MB per layer × 64 layers = 3 GB
+///   Q4_0 path:  17408×5120×4/8×1.125 bytes ≈ 50 MB per layer × 64 layers = 3 GB
 ///   (Avoids the 129 GB OOM from the Q4_0→F32 round-trip in the old F32 path.)
 pub struct DenseFfnWeightsGpuQ {
     /// Gate projection raw GGML blocks: `[intermediate_size, hidden_size]`.
@@ -148,12 +150,12 @@ impl DenseFfnWeightsGpuQ {
     pub fn from_quantized(w: &DenseFfnWeightsQ) -> Self {
         Self {
             gate_q: w.gate_q.clone(),
-            up_q:   w.up_q.clone(),
+            up_q: w.up_q.clone(),
             down_q: w.down_q.clone(),
             ggml_type_gate_up: w.ggml_type_gate_up,
-            ggml_type_down:    w.ggml_type_down,
+            ggml_type_down: w.ggml_type_down,
             intermediate_size: w.intermediate_size,
-            hidden_size:       w.hidden_size,
+            hidden_size: w.hidden_size,
         }
     }
 }
@@ -190,14 +192,14 @@ impl MoeFfnWeightsGpu {
     /// F32→BF16 GPU cast in `proj()`.
     pub fn from_cpu(weights: &MoeFfnWeights, device: &MlxDevice) -> Result<Self> {
         Ok(Self {
-            router:         upload_bf16_from_f32(&weights.router,           device)?,
-            expert_gate:    upload_bf16_from_f32(&weights.expert_gate,      device)?,
-            expert_up:      upload_bf16_from_f32(&weights.expert_up,        device)?,
-            expert_down:    upload_bf16_from_f32(&weights.expert_down,      device)?,
+            router: upload_bf16_from_f32(&weights.router, device)?,
+            expert_gate: upload_bf16_from_f32(&weights.expert_gate, device)?,
+            expert_up: upload_bf16_from_f32(&weights.expert_up, device)?,
+            expert_down: upload_bf16_from_f32(&weights.expert_down, device)?,
             shared_gate_inp: upload_bf16_from_f32(&weights.shared_gate_logit, device)?,
-            shared_gate:    upload_bf16_from_f32(&weights.shared_gate,      device)?,
-            shared_up:      upload_bf16_from_f32(&weights.shared_up,        device)?,
-            shared_down:    upload_bf16_from_f32(&weights.shared_down,      device)?,
+            shared_gate: upload_bf16_from_f32(&weights.shared_gate, device)?,
+            shared_up: upload_bf16_from_f32(&weights.shared_up, device)?,
+            shared_down: upload_bf16_from_f32(&weights.shared_down, device)?,
         })
     }
 }
@@ -261,7 +263,9 @@ fn ggml_type_stride(t: GgmlType, rows: usize, cols: usize) -> Result<u64> {
     anyhow::ensure!(
         elems % qk == 0,
         "elems {} not divisible by block QK {} for {:?}",
-        elems, qk, t
+        elems,
+        qk,
+        t
     );
     Ok(((elems / qk) * block_bytes) as u64)
 }
@@ -295,7 +299,8 @@ impl MoeFfnWeightsGpuQ {
             ggml_type_gate_up,
             moe_intermediate_size as usize,
             hidden_size as usize,
-        ).context("gate/up stride")?;
+        )
+        .context("gate/up stride")?;
 
         // Down: [num_experts, hidden_size, moe_intermediate_size]
         // Each expert slice: hidden_size rows × moe_intermediate_size cols.
@@ -303,7 +308,8 @@ impl MoeFfnWeightsGpuQ {
             ggml_type_down,
             hidden_size as usize,
             moe_intermediate_size as usize,
-        ).context("down stride")?;
+        )
+        .context("down stride")?;
 
         Ok(Self {
             // Router is small (~2MB) but also benefits from pre-cast since
@@ -315,7 +321,7 @@ impl MoeFfnWeightsGpuQ {
             ggml_type_gate_up,
             ggml_type_down,
             expert_gate_stride: gate_stride,
-            expert_up_stride: gate_stride,   // gate and up have the same dimensions
+            expert_up_stride: gate_stride, // gate and up have the same dimensions
             expert_down_stride: down_stride,
             num_experts,
             // Pre-cast shared expert weights to BF16 to avoid per-inference
@@ -415,11 +421,27 @@ fn proj(
     if seq_len == 1 {
         // GEMV path for single-token decode — bandwidth-optimized, ~2× faster
         // than tiled MM for M=1 on Apple Silicon.
-        dense_gemv_bf16_f32(encoder, registry, device, weight_bf16, input, &mut dst, &params)
-            .context("dense_gemv_bf16_f32 proj M=1")?;
+        dense_gemv_bf16_f32(
+            encoder,
+            registry,
+            device,
+            weight_bf16,
+            input,
+            &mut dst,
+            &params,
+        )
+        .context("dense_gemv_bf16_f32 proj M=1")?;
     } else {
-        dense_matmul_bf16_f32_tensor(encoder, registry, device, weight_bf16, input, &mut dst, &params)
-            .context("dense_matmul_bf16_f32_tensor")?;
+        dense_matmul_bf16_f32_tensor(
+            encoder,
+            registry,
+            device,
+            weight_bf16,
+            input,
+            &mut dst,
+            &params,
+        )
+        .context("dense_matmul_bf16_f32_tensor")?;
     }
     Ok(dst)
 }
@@ -513,11 +535,27 @@ fn proj_pooled(
         src1_batch: 1,
     };
     if seq_len == 1 {
-        dense_gemv_bf16_f32(encoder, registry, device, weight_bf16, input, &mut dst, &params)
-            .context("dense_gemv_bf16_f32 proj_pooled M=1")?;
+        dense_gemv_bf16_f32(
+            encoder,
+            registry,
+            device,
+            weight_bf16,
+            input,
+            &mut dst,
+            &params,
+        )
+        .context("dense_gemv_bf16_f32 proj_pooled M=1")?;
     } else {
-        dense_matmul_bf16_f32_tensor(encoder, registry, device, weight_bf16, input, &mut dst, &params)
-            .context("dense_matmul_bf16_f32_tensor")?;
+        dense_matmul_bf16_f32_tensor(
+            encoder,
+            registry,
+            device,
+            weight_bf16,
+            input,
+            &mut dst,
+            &params,
+        )
+        .context("dense_matmul_bf16_f32_tensor")?;
     }
     Ok(dst)
 }
@@ -536,7 +574,11 @@ fn proj_pooled(
 /// Spec: SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x)).
 /// Decision 14 / Decision 13: "silu(gate) * up".
 fn silu_mul_cpu(gate: &[f32], up: &[f32]) -> Vec<f32> {
-    assert_eq!(gate.len(), up.len(), "silu_mul_cpu: gate/up length mismatch");
+    assert_eq!(
+        gate.len(),
+        up.len(),
+        "silu_mul_cpu: gate/up length mismatch"
+    );
     gate.iter()
         .zip(up.iter())
         .map(|(&g, &u)| {
@@ -588,29 +630,69 @@ pub fn build_dense_ffn_layer_gpu(
 
     // Pre-allocate intermediate buffers (must outlive the encoder).
     let hidden_buf = device
-        .alloc_buffer(n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
+        .alloc_buffer(
+            n_h as usize * 4,
+            DType::F32,
+            vec![seq_len as usize, m as usize],
+        )
         .map_err(|e| anyhow!("alloc dense silu hidden: {e}"))?;
     let mut silu_params = device
         .alloc_buffer(4, DType::U32, vec![1])
         .map_err(|e| anyhow!("alloc dense silu params: {e}"))?;
-    silu_params.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = n_h;
+    silu_params
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("{e}"))?[0] = n_h;
 
     // Single encoder: gate+up projs (concurrent) → silu_mul → down proj [→ residual add].
     let mut enc = device.command_encoder().context("enc dense swiglu")?;
     // Ops 1+2: gate and up projections — concurrent (both read from x)
-    let gate_buf = proj(&mut enc, registry, device, x, &weights_gpu.gate, seq_len, h, m)?;
-    let up_buf   = proj(&mut enc, registry, device, x, &weights_gpu.up,   seq_len, h, m)?;
+    let gate_buf = proj(
+        &mut enc,
+        registry,
+        device,
+        x,
+        &weights_gpu.gate,
+        seq_len,
+        h,
+        m,
+    )?;
+    let up_buf = proj(
+        &mut enc,
+        registry,
+        device,
+        x,
+        &weights_gpu.up,
+        seq_len,
+        h,
+        m,
+    )?;
     // Barrier: silu_mul reads gate_buf/up_buf written above.
     enc.memory_barrier();
     // Op 3: silu(gate) * up → hidden
     dispatch_silu_mul(
-        &mut enc, registry, device.metal_device(),
-        &gate_buf, &up_buf, &hidden_buf, &silu_params, n_h,
-    ).context("dispatch silu_mul dense")?;
+        &mut enc,
+        registry,
+        device.metal_device(),
+        &gate_buf,
+        &up_buf,
+        &hidden_buf,
+        &silu_params,
+        n_h,
+    )
+    .context("dispatch silu_mul dense")?;
     // Barrier: down proj reads hidden written above.
     enc.memory_barrier();
     // Op 4: out = down_proj(hidden)
-    let down_out = proj(&mut enc, registry, device, &hidden_buf, &weights_gpu.down, seq_len, m, h)?;
+    let down_out = proj(
+        &mut enc,
+        registry,
+        device,
+        &hidden_buf,
+        &weights_gpu.down,
+        seq_len,
+        m,
+        h,
+    )?;
 
     // Op 5 (optional): out += residual — folded into this encoder to save 1 commit per layer.
     let result = if let Some(res) = add_residual {
@@ -620,9 +702,16 @@ pub fn build_dense_ffn_layer_gpu(
         // Barrier: elementwise_add reads down_out written by Op 4.
         enc.memory_barrier();
         elementwise_add(
-            &mut enc, registry, device.metal_device(),
-            &down_out, res, &sum_buf, n_out, DType::F32,
-        ).context("dense ffn residual add")?;
+            &mut enc,
+            registry,
+            device.metal_device(),
+            &down_out,
+            res,
+            &sum_buf,
+            n_out,
+            DType::F32,
+        )
+        .context("dense ffn residual add")?;
         sum_buf
     } else {
         down_out
@@ -653,7 +742,7 @@ pub fn build_dense_ffn_layer_gpu(
 ///
 /// This is the production path for 27B dense DWQ GGUFs.  Gate/up/down
 /// projections use `quantized_matmul_ggml` which keeps weights in GGML
-/// block-quantized form (e.g. Q4_K) on the Metal device, avoiding the
+/// block-quantized form (Q4_0/Q8_0/Q6_K) on the Metal device, avoiding the
 /// Q4_0→F32 expansion that causes the 129 GB OOM on M5 Max 128 GB.
 ///
 /// # Op order (matches `build_dense_ffn_layer_gpu` exactly)
@@ -668,7 +757,7 @@ pub fn build_dense_ffn_layer_gpu(
 ///
 /// # Parity contract
 ///
-/// Compared to the F32 reference, Q4_K dequant noise is ≤ 5e-3 per element
+/// Compared to the F32 reference, Q4_0 dequant noise is ≤ 5e-3 per element
 /// (tighter than the 1e-2 MoE tolerance, since dense has fewer projections).
 /// The existing `build_dense_ffn_layer_gpu` BF16 parity test remains green.
 ///
@@ -692,7 +781,8 @@ pub fn build_dense_ffn_layer_gpu_q(
     let h = weights.hidden_size;
     let seq_len = (x.element_count() / h as usize) as u32;
     let mut enc = device.command_encoder().context("enc dense_q swiglu")?;
-    let out = build_dense_ffn_layer_gpu_q_into(&mut enc, device, registry, x, weights, add_residual)?;
+    let out =
+        build_dense_ffn_layer_gpu_q_into(&mut enc, device, registry, x, weights, add_residual)?;
     if seq_len == 1 {
         enc.commit();
     } else {
@@ -710,10 +800,14 @@ pub fn build_dense_ffn_layer_gpu_q(
 ///
 /// # Why this exists
 ///
-/// Wave 5b.14: closes the per-dense-layer 2-encoder overhead component of the
-/// W-5b.13 audit (FFN dispatch bucket = 9,750 ms / 4.34× wall ratio vs llama
-/// at PP4106).  The pre-fusion path issued 2 separate command buffers per
-/// dense layer:
+/// Wave 5b.14: addressed the historical per-dense-layer 2-encoder overhead
+/// component from the W-5b.13 PP4106 audit (FFN dispatch bucket = 9,750 ms,
+/// 4.34x wall ratio vs llama at that time).  That old ratio is not the current
+/// live decode frame: on 2026-04-28, a short apex dwq46 decode smoke measured
+/// hf2q 114.4 tok/s vs llama-bench 116.78 tok/s.  The larger current gap is
+/// prefill wall time, not this dense decode wrapper alone.
+///
+/// The pre-fusion path issued 2 separate command buffers per dense layer:
 ///
 /// 1. `dispatch_fused_residual_norm_f32` — produces `ffn_input` from
 ///    `(hidden, attn_out, post_norm_w)` + writes `ffn_residual` for the
@@ -765,9 +859,23 @@ pub fn build_dense_ffn_layer_gpu_q_into(
         let h = weights.hidden_size;
         let seq_len = (x.element_count() / h as usize) as u32;
         if seq_len == 1 {
-            return build_dense_ffn_layer_gpu_q_into_pooled(enc, device, registry, x, weights, add_residual);
+            return build_dense_ffn_layer_gpu_q_into_pooled(
+                enc,
+                device,
+                registry,
+                x,
+                weights,
+                add_residual,
+            );
         } else {
-            return build_dense_ffn_layer_gpu_q_into_device(enc, device, registry, x, weights, add_residual);
+            return build_dense_ffn_layer_gpu_q_into_device(
+                enc,
+                device,
+                registry,
+                x,
+                weights,
+                add_residual,
+            );
         }
     }
     build_dense_ffn_layer_gpu_q_into_pooled(enc, device, registry, x, weights, add_residual)
@@ -804,15 +912,30 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
     // Qwen3.6-27B prefill), corrupting the residual stream silently.
     // See `decode_pool::reset_for_prefill_chunk` doc-comment for the
     // full lifetime contract.
+    let _w5b_ffn_alloc = super::wave5b8_profile::Section::start(
+        super::wave5b8_profile::SectionKind::FfnAllocScratch,
+    );
     let mut gate_buf = super::decode_pool::pooled_alloc_buffer(
-            device, n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
-        .map_err(|e| anyhow!("alloc dense_q gate: {e}"))?;
+        device,
+        n_h as usize * 4,
+        DType::F32,
+        vec![seq_len as usize, m as usize],
+    )
+    .map_err(|e| anyhow!("alloc dense_q gate: {e}"))?;
     let mut up_buf = super::decode_pool::pooled_alloc_buffer(
-            device, n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
-        .map_err(|e| anyhow!("alloc dense_q up: {e}"))?;
+        device,
+        n_h as usize * 4,
+        DType::F32,
+        vec![seq_len as usize, m as usize],
+    )
+    .map_err(|e| anyhow!("alloc dense_q up: {e}"))?;
     let hidden_buf = super::decode_pool::pooled_alloc_buffer(
-            device, n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
-        .map_err(|e| anyhow!("alloc dense_q hidden: {e}"))?;
+        device,
+        n_h as usize * 4,
+        DType::F32,
+        vec![seq_len as usize, m as usize],
+    )
+    .map_err(|e| anyhow!("alloc dense_q hidden: {e}"))?;
     // FINAL OUTPUT (down_out):
     //   - Prefill (seq_len > 1): device-alloc'd so it survives the per-layer
     //     `reset_for_prefill_chunk()` and can become the next layer's `hidden`.
@@ -823,17 +946,24 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
     //     W-5b.14 fully-pooled decode path bit-for-bit when residual=None.
     let mut down_out = if seq_len == 1 {
         super::decode_pool::pooled_alloc_buffer(
-                device, n_out * 4, DType::F32, vec![seq_len as usize, h as usize])
-            .map_err(|e| anyhow!("alloc dense_q down_out (pooled, decode): {e}"))?
+            device,
+            n_out * 4,
+            DType::F32,
+            vec![seq_len as usize, h as usize],
+        )
+        .map_err(|e| anyhow!("alloc dense_q down_out (pooled, decode): {e}"))?
     } else {
         device
             .alloc_buffer(n_out * 4, DType::F32, vec![seq_len as usize, h as usize])
             .map_err(|e| anyhow!("alloc dense_q down_out (device, prefill): {e}"))?
     };
-    let mut silu_params_buf = super::decode_pool::pooled_alloc_buffer(
-            device, 4, DType::U32, vec![1])
-        .map_err(|e| anyhow!("alloc dense_q silu_params: {e}"))?;
-    silu_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = n_h;
+    let mut silu_params_buf =
+        super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
+            .map_err(|e| anyhow!("alloc dense_q silu_params: {e}"))?;
+    silu_params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("{e}"))?[0] = n_h;
+    drop(_w5b_ffn_alloc);
 
     let gate_up_params = GgmlQuantizedMatmulParams {
         m: seq_len,
@@ -849,26 +979,82 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
     };
 
     // Ops 1+2: gate and up projections via quantized_matmul_ggml (both read x, concurrent).
-    quantized_matmul_ggml(enc, registry, device, x, &weights.gate_q, &mut gate_buf, &gate_up_params)
+    {
+        let _w5b = super::wave5b8_profile::Section::start(
+            super::wave5b8_profile::SectionKind::FfnPhaseAProj,
+        );
+        quantized_matmul_ggml(
+            enc,
+            registry,
+            device,
+            x,
+            &weights.gate_q,
+            &mut gate_buf,
+            &gate_up_params,
+        )
         .context("dense_q gate proj")?;
-    quantized_matmul_ggml(enc, registry, device, x, &weights.up_q,   &mut up_buf,   &gate_up_params)
+        quantized_matmul_ggml(
+            enc,
+            registry,
+            device,
+            x,
+            &weights.up_q,
+            &mut up_buf,
+            &gate_up_params,
+        )
         .context("dense_q up proj")?;
+    }
 
     // Barrier: silu_mul reads gate_buf/up_buf written above.
-    enc.memory_barrier();
+    {
+        let _w5b = super::wave5b8_profile::Section::start(
+            super::wave5b8_profile::SectionKind::FfnBarrierAB,
+        );
+        enc.memory_barrier();
+    }
 
     // Op 3: silu(gate) * up → hidden.
-    dispatch_silu_mul(
-        enc, registry, device.metal_device(),
-        &gate_buf, &up_buf, &hidden_buf, &silu_params_buf, n_h,
-    ).context("dense_q silu_mul")?;
+    {
+        let _w5b = super::wave5b8_profile::Section::start(
+            super::wave5b8_profile::SectionKind::FfnPhaseDSilu,
+        );
+        dispatch_silu_mul(
+            enc,
+            registry,
+            device.metal_device(),
+            &gate_buf,
+            &up_buf,
+            &hidden_buf,
+            &silu_params_buf,
+            n_h,
+        )
+        .context("dense_q silu_mul")?;
+    }
 
     // Barrier: down proj reads hidden.
-    enc.memory_barrier();
+    {
+        let _w5b = super::wave5b8_profile::Section::start(
+            super::wave5b8_profile::SectionKind::FfnBarrierDE,
+        );
+        enc.memory_barrier();
+    }
 
     // Op 4: out = down_proj(hidden).
-    quantized_matmul_ggml(enc, registry, device, &hidden_buf, &weights.down_q, &mut down_out, &down_params)
+    {
+        let _w5b = super::wave5b8_profile::Section::start(
+            super::wave5b8_profile::SectionKind::FfnPhaseEDown,
+        );
+        quantized_matmul_ggml(
+            enc,
+            registry,
+            device,
+            &hidden_buf,
+            &weights.down_q,
+            &mut down_out,
+            &down_params,
+        )
         .context("dense_q down proj")?;
+    }
 
     // Op 5 (optional): out += residual — folded to save 1 commit per dense layer.
     // FINAL OUTPUT (sum_buf): same prefill/decode lifetime split as `down_out`
@@ -876,8 +1062,7 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
     // decode (recycled by the per-token `reset_decode_pool`).
     let result = if let Some(res) = add_residual {
         let sum_buf = if seq_len == 1 {
-            super::decode_pool::pooled_alloc_buffer(
-                    device, n_out * 4, DType::F32, vec![n_out])
+            super::decode_pool::pooled_alloc_buffer(device, n_out * 4, DType::F32, vec![n_out])
                 .map_err(|e| anyhow!("alloc dense_q residual sum (pooled, decode): {e}"))?
         } else {
             device
@@ -885,11 +1070,28 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
                 .map_err(|e| anyhow!("alloc dense_q residual sum (device, prefill): {e}"))?
         };
         // Barrier: elementwise_add reads down_out written by Op 4.
-        enc.memory_barrier();
-        elementwise_add(
-            enc, registry, device.metal_device(),
-            &down_out, res, &sum_buf, n_out, DType::F32,
-        ).context("dense_q residual add")?;
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnBarrierEF,
+            );
+            enc.memory_barrier();
+        }
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnPhaseFReduce,
+            );
+            elementwise_add(
+                enc,
+                registry,
+                device.metal_device(),
+                &down_out,
+                res,
+                &sum_buf,
+                n_out,
+                DType::F32,
+            )
+            .context("dense_q residual add")?;
+        }
         sum_buf
     } else {
         down_out
@@ -918,13 +1120,25 @@ fn build_dense_ffn_layer_gpu_q_into_device(
     let n_out = (seq_len * h) as usize;
 
     let mut gate_buf = device
-        .alloc_buffer(n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
+        .alloc_buffer(
+            n_h as usize * 4,
+            DType::F32,
+            vec![seq_len as usize, m as usize],
+        )
         .map_err(|e| anyhow!("alloc dense_q gate: {e}"))?;
     let mut up_buf = device
-        .alloc_buffer(n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
+        .alloc_buffer(
+            n_h as usize * 4,
+            DType::F32,
+            vec![seq_len as usize, m as usize],
+        )
         .map_err(|e| anyhow!("alloc dense_q up: {e}"))?;
     let hidden_buf = device
-        .alloc_buffer(n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
+        .alloc_buffer(
+            n_h as usize * 4,
+            DType::F32,
+            vec![seq_len as usize, m as usize],
+        )
         .map_err(|e| anyhow!("alloc dense_q hidden: {e}"))?;
     let mut down_out = device
         .alloc_buffer(n_out * 4, DType::F32, vec![seq_len as usize, h as usize])
@@ -932,7 +1146,9 @@ fn build_dense_ffn_layer_gpu_q_into_device(
     let mut silu_params_buf = device
         .alloc_buffer(4, DType::U32, vec![1])
         .map_err(|e| anyhow!("alloc dense_q silu_params: {e}"))?;
-    silu_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = n_h;
+    silu_params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("{e}"))?[0] = n_h;
 
     let gate_up_params = GgmlQuantizedMatmulParams {
         m: seq_len,
@@ -947,20 +1163,51 @@ fn build_dense_ffn_layer_gpu_q_into_device(
         ggml_type: weights.ggml_type_down,
     };
 
-    quantized_matmul_ggml(enc, registry, device, x, &weights.gate_q, &mut gate_buf, &gate_up_params)
-        .context("dense_q gate proj")?;
-    quantized_matmul_ggml(enc, registry, device, x, &weights.up_q,   &mut up_buf,   &gate_up_params)
-        .context("dense_q up proj")?;
+    quantized_matmul_ggml(
+        enc,
+        registry,
+        device,
+        x,
+        &weights.gate_q,
+        &mut gate_buf,
+        &gate_up_params,
+    )
+    .context("dense_q gate proj")?;
+    quantized_matmul_ggml(
+        enc,
+        registry,
+        device,
+        x,
+        &weights.up_q,
+        &mut up_buf,
+        &gate_up_params,
+    )
+    .context("dense_q up proj")?;
     enc.memory_barrier();
 
     dispatch_silu_mul(
-        enc, registry, device.metal_device(),
-        &gate_buf, &up_buf, &hidden_buf, &silu_params_buf, n_h,
-    ).context("dense_q silu_mul")?;
+        enc,
+        registry,
+        device.metal_device(),
+        &gate_buf,
+        &up_buf,
+        &hidden_buf,
+        &silu_params_buf,
+        n_h,
+    )
+    .context("dense_q silu_mul")?;
     enc.memory_barrier();
 
-    quantized_matmul_ggml(enc, registry, device, &hidden_buf, &weights.down_q, &mut down_out, &down_params)
-        .context("dense_q down proj")?;
+    quantized_matmul_ggml(
+        enc,
+        registry,
+        device,
+        &hidden_buf,
+        &weights.down_q,
+        &mut down_out,
+        &down_params,
+    )
+    .context("dense_q down proj")?;
 
     let result = if let Some(res) = add_residual {
         let sum_buf = device
@@ -968,9 +1215,16 @@ fn build_dense_ffn_layer_gpu_q_into_device(
             .map_err(|e| anyhow!("alloc dense_q residual sum: {e}"))?;
         enc.memory_barrier();
         elementwise_add(
-            enc, registry, device.metal_device(),
-            &down_out, res, &sum_buf, n_out, DType::F32,
-        ).context("dense_q residual add")?;
+            enc,
+            registry,
+            device.metal_device(),
+            &down_out,
+            res,
+            &sum_buf,
+            n_out,
+            DType::F32,
+        )
+        .context("dense_q residual add")?;
         sum_buf
     } else {
         down_out
@@ -1034,7 +1288,11 @@ fn softmax_topk_renorm_cpu(
 
         // Renormalize selected weights.
         let sum_sel: f32 = selected.iter().map(|&i| exp_vals[i]).sum();
-        let inv_sum = if sum_sel > 1e-20 { 1.0 / sum_sel } else { 1.0 / topk as f32 };
+        let inv_sum = if sum_sel > 1e-20 {
+            1.0 / sum_sel
+        } else {
+            1.0 / topk as f32
+        };
 
         for &i in selected {
             out_idx.push(i as u32);
@@ -1129,7 +1387,16 @@ pub fn build_moe_ffn_layer_gpu(
 
     // ---- Step 1: router logits = router(x)  [seq, num_experts] ----
     let mut enc = device.command_encoder().context("enc moe router")?;
-    let logits_buf = proj(&mut enc, registry, device, x, &weights_gpu.router, seq_len, h32, ne32)?;
+    let logits_buf = proj(
+        &mut enc,
+        registry,
+        device,
+        x,
+        &weights_gpu.router,
+        seq_len,
+        h32,
+        ne32,
+    )?;
     enc.commit_and_wait().context("commit moe router")?;
 
     // ---- Step 2: softmax + top-k + renorm  [CPU] ----
@@ -1156,28 +1423,39 @@ pub fn build_moe_ffn_layer_gpu(
 
         // Extract weight slices for expert e_idx.
         let gate_w = extract_expert_weight(&weights_cpu.expert_gate, e_idx, m_moe, h);
-        let up_w   = extract_expert_weight(&weights_cpu.expert_up,   e_idx, m_moe, h);
-        let down_w = extract_expert_weight(&weights_cpu.expert_down, e_idx, h,     m_moe);
+        let up_w = extract_expert_weight(&weights_cpu.expert_up, e_idx, m_moe, h);
+        let down_w = extract_expert_weight(&weights_cpu.expert_down, e_idx, h, m_moe);
 
         let gate_buf_e = upload_f32(&gate_w, device).context("upload expert gate_w")?;
-        let up_buf_e   = upload_f32(&up_w,   device).context("upload expert up_w")?;
+        let up_buf_e = upload_f32(&up_w, device).context("upload expert up_w")?;
         let down_buf_e = upload_f32(&down_w, device).context("upload expert down_w")?;
 
         // We project all seq_len tokens then take row t.
         // gate_e: [seq, m_moe]
         let mut enc = device.command_encoder().context("enc expert gate")?;
-        let gate_e_buf = proj(&mut enc, registry, device, x, &gate_buf_e, seq_len, h32, m_moe32)?;
+        let gate_e_buf = proj(
+            &mut enc,
+            registry,
+            device,
+            x,
+            &gate_buf_e,
+            seq_len,
+            h32,
+            m_moe32,
+        )?;
         enc.commit_and_wait().context("commit expert gate")?;
 
         let mut enc = device.command_encoder().context("enc expert up")?;
-        let up_e_buf = proj(&mut enc, registry, device, x, &up_buf_e, seq_len, h32, m_moe32)?;
+        let up_e_buf = proj(
+            &mut enc, registry, device, x, &up_buf_e, seq_len, h32, m_moe32,
+        )?;
         enc.commit_and_wait().context("commit expert up")?;
 
         // SiLU * up for expert e at token t [CPU bridge].
         let gate_e_all = download_f32(&gate_e_buf).context("download expert gate")?;
-        let up_e_all   = download_f32(&up_e_buf).context("download expert up")?;
+        let up_e_all = download_f32(&up_e_buf).context("download expert up")?;
         let gate_t = &gate_e_all[t * m_moe..(t + 1) * m_moe];
-        let up_t   = &up_e_all[t * m_moe..(t + 1) * m_moe];
+        let up_t = &up_e_all[t * m_moe..(t + 1) * m_moe];
         let hidden_t = silu_mul_cpu(gate_t, up_t);
 
         // down_proj for this expert (upload hidden for single token).
@@ -1185,7 +1463,16 @@ pub fn build_moe_ffn_layer_gpu(
 
         // hidden_buf_t is [1, m_moe]; down_buf_e is [h, m_moe] → proj [1, h].
         let mut enc = device.command_encoder().context("enc expert down")?;
-        let y_e_buf = proj(&mut enc, registry, device, &hidden_buf_t, &down_buf_e, 1, m_moe32, h32)?;
+        let y_e_buf = proj(
+            &mut enc,
+            registry,
+            device,
+            &hidden_buf_t,
+            &down_buf_e,
+            1,
+            m_moe32,
+            h32,
+        )?;
         enc.commit_and_wait().context("commit expert down")?;
 
         let y_e = download_f32(&y_e_buf).context("download expert y_e")?;
@@ -1207,7 +1494,16 @@ pub fn build_moe_ffn_layer_gpu(
 
     // Step 4: sh_logit = shared_gate_inp(x)  [seq, 1]
     let mut enc = device.command_encoder().context("enc sh_gate_inp")?;
-    let sh_logit_buf = proj(&mut enc, registry, device, x, &weights_gpu.shared_gate_inp, seq_len, h32, 1)?;
+    let sh_logit_buf = proj(
+        &mut enc,
+        registry,
+        device,
+        x,
+        &weights_gpu.shared_gate_inp,
+        seq_len,
+        h32,
+        1,
+    )?;
     enc.commit_and_wait().context("commit sh_gate_inp")?;
 
     // Step 5: sh_gate_val = sigmoid(sh_logit)  — CPU (scalar per token)
@@ -1219,12 +1515,30 @@ pub fn build_moe_ffn_layer_gpu(
 
     // Step 6: a_s = shared_gate_proj(x)  [seq, m_sh]
     let mut enc = device.command_encoder().context("enc sh_gate")?;
-    let a_s_buf = proj(&mut enc, registry, device, x, &weights_gpu.shared_gate, seq_len, h32, m_sh32)?;
+    let a_s_buf = proj(
+        &mut enc,
+        registry,
+        device,
+        x,
+        &weights_gpu.shared_gate,
+        seq_len,
+        h32,
+        m_sh32,
+    )?;
     enc.commit_and_wait().context("commit sh_gate")?;
 
     // Step 7: b_s = shared_up_proj(x)  [seq, m_sh]
     let mut enc = device.command_encoder().context("enc sh_up")?;
-    let b_s_buf = proj(&mut enc, registry, device, x, &weights_gpu.shared_up, seq_len, h32, m_sh32)?;
+    let b_s_buf = proj(
+        &mut enc,
+        registry,
+        device,
+        x,
+        &weights_gpu.shared_up,
+        seq_len,
+        h32,
+        m_sh32,
+    )?;
     enc.commit_and_wait().context("commit sh_up")?;
 
     // Step 8: h_s = silu(a_s) * b_s  [CPU bridge]
@@ -1235,7 +1549,16 @@ pub fn build_moe_ffn_layer_gpu(
 
     // Step 9: y_s = shared_down_proj(h_s)  [seq, h]
     let mut enc = device.command_encoder().context("enc sh_down")?;
-    let y_s_buf = proj(&mut enc, registry, device, &h_s_buf, &weights_gpu.shared_down, seq_len, m_sh32, h32)?;
+    let y_s_buf = proj(
+        &mut enc,
+        registry,
+        device,
+        &h_s_buf,
+        &weights_gpu.shared_down,
+        seq_len,
+        m_sh32,
+        h32,
+    )?;
     enc.commit_and_wait().context("commit sh_down")?;
 
     // Step 10: output = moe_out + sh_gate * y_s  [CPU combine]
@@ -1256,18 +1579,6 @@ pub fn build_moe_ffn_layer_gpu(
 // ================================================================
 // Quantized MoE GPU forward pass
 // ================================================================
-
-/// Upload a u32 slice as a Metal buffer (pooled — used per decode token).
-fn upload_u32(data: &[u32], device: &MlxDevice) -> Result<MlxBuffer> {
-    let byte_len = data.len() * 4;
-    let mut buf = super::decode_pool::pooled_alloc_buffer(device, byte_len, DType::U32, vec![data.len()])
-        .map_err(|e| anyhow!("alloc u32 buf: {e}"))?;
-    {
-        let s = buf.as_mut_slice::<u32>().map_err(|e| anyhow!("u32 mut_slice: {e}"))?;
-        s.copy_from_slice(data);
-    }
-    Ok(buf)
-}
 
 /// Build the Qwen3.5-MoE FFN forward pass using quantized expert weights.
 ///
@@ -1315,7 +1626,15 @@ pub fn build_moe_ffn_layer_gpu_q(
 ) -> Result<MlxBuffer> {
     // Backwards-compatible variant: create our own encoder, dispatch, commit.
     let mut enc = device.command_encoder().context("enc moe_ffn_q")?;
-    let out = build_moe_ffn_layer_gpu_q_into(&mut enc, device, registry, x, weights, shape, add_residual)?;
+    let out = build_moe_ffn_layer_gpu_q_into(
+        &mut enc,
+        device,
+        registry,
+        x,
+        weights,
+        shape,
+        add_residual,
+    )?;
     let seq_len = (x.element_count() / shape.hidden_size as usize) as u32;
     if seq_len == 1 {
         enc.commit();
@@ -1410,44 +1729,81 @@ pub fn build_moe_ffn_layer_gpu_q_into(
     // are bounded by `build_moe_ffn_layer_gpu_q`; `forward_gpu_greedy`'s
     // top-of-token `reset_decode_pool` recycles them on the next token.
     let total_rows = seq * topk;
+    let _w5b_ffn_alloc = super::wave5b8_profile::Section::start(
+        super::wave5b8_profile::SectionKind::FfnAllocScratch,
+    );
     let ids_buf = super::decode_pool::pooled_alloc_buffer(
-            device, total_rows * DType::U32.size_of(), DType::U32, vec![total_rows])
-        .map_err(|e| anyhow!("alloc ids_buf: {e}"))?;
+        device,
+        total_rows * DType::U32.size_of(),
+        DType::U32,
+        vec![total_rows],
+    )
+    .map_err(|e| anyhow!("alloc ids_buf: {e}"))?;
     let weights_buf = super::decode_pool::pooled_alloc_buffer(
-            device, total_rows * DType::F32.size_of(), DType::F32, vec![total_rows])
-        .map_err(|e| anyhow!("alloc weights_buf: {e}"))?;
+        device,
+        total_rows * DType::F32.size_of(),
+        DType::F32,
+        vec![total_rows],
+    )
+    .map_err(|e| anyhow!("alloc weights_buf: {e}"))?;
     let gate_all_bytes = total_rows * m_moe * 4;
     let mut gate_all_buf = super::decode_pool::pooled_alloc_buffer(
-            device, gate_all_bytes, DType::F32, vec![total_rows, m_moe])
-        .map_err(|e| anyhow!("alloc gate_all: {e}"))?;
+        device,
+        gate_all_bytes,
+        DType::F32,
+        vec![total_rows, m_moe],
+    )
+    .map_err(|e| anyhow!("alloc gate_all: {e}"))?;
     let up_all_bytes = total_rows * m_moe * 4;
     let mut up_all_buf = super::decode_pool::pooled_alloc_buffer(
-            device, up_all_bytes, DType::F32, vec![total_rows, m_moe])
-        .map_err(|e| anyhow!("alloc up_all: {e}"))?;
+        device,
+        up_all_bytes,
+        DType::F32,
+        vec![total_rows, m_moe],
+    )
+    .map_err(|e| anyhow!("alloc up_all: {e}"))?;
     let n_h_all = (total_rows * m_moe) as u32;
     let h_all_buf = super::decode_pool::pooled_alloc_buffer(
-            device, n_h_all as usize * 4, DType::F32, vec![total_rows, m_moe])
-        .map_err(|e| anyhow!("alloc h_all: {e}"))?;
+        device,
+        n_h_all as usize * 4,
+        DType::F32,
+        vec![total_rows, m_moe],
+    )
+    .map_err(|e| anyhow!("alloc h_all: {e}"))?;
     let y_all_bytes = total_rows * h * 4;
     let mut y_all_buf = super::decode_pool::pooled_alloc_buffer(
-            device, y_all_bytes, DType::F32, vec![total_rows, h])
-        .map_err(|e| anyhow!("alloc y_all: {e}"))?;
+        device,
+        y_all_bytes,
+        DType::F32,
+        vec![total_rows, h],
+    )
+    .map_err(|e| anyhow!("alloc y_all: {e}"))?;
     let m_sh = m_sh32 as usize;
     let n_h_s = (seq * m_sh) as u32;
     let h_s_buf = super::decode_pool::pooled_alloc_buffer(
-            device, n_h_s as usize * 4, DType::F32, vec![seq, m_sh])
-        .map_err(|e| anyhow!("alloc h_s: {e}"))?;
+        device,
+        n_h_s as usize * 4,
+        DType::F32,
+        vec![seq, m_sh],
+    )
+    .map_err(|e| anyhow!("alloc h_s: {e}"))?;
     let out_bytes = seq * h * 4;
-    let mut out_buf = super::decode_pool::pooled_alloc_buffer(
-            device, out_bytes, DType::F32, vec![seq, h])
-        .map_err(|e| anyhow!("alloc output: {e}"))?;
+    let mut out_buf =
+        super::decode_pool::pooled_alloc_buffer(device, out_bytes, DType::F32, vec![seq, h])
+            .map_err(|e| anyhow!("alloc output: {e}"))?;
     // params_buf for silu_mul (holds n as u32, must outlive the encoder)
-    let mut silu_params_buf = super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
-        .map_err(|e| anyhow!("alloc silu params: {e}"))?;
-    silu_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = n_h_all;
-    let mut silu_sh_params_buf = super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
-        .map_err(|e| anyhow!("alloc silu_sh params: {e}"))?;
-    silu_sh_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = n_h_s;
+    let mut silu_params_buf =
+        super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
+            .map_err(|e| anyhow!("alloc silu params: {e}"))?;
+    silu_params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("{e}"))?[0] = n_h_all;
+    let mut silu_sh_params_buf =
+        super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
+            .map_err(|e| anyhow!("alloc silu_sh params: {e}"))?;
+    silu_sh_params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("{e}"))?[0] = n_h_s;
 
     // Dummy residual buffer (1 f32) used when add_residual=false; dispatch_moe_weighted_reduce
     // requires a valid buffer reference even if the add_residual flag is 0.
@@ -1455,11 +1811,13 @@ pub fn build_moe_ffn_layer_gpu_q_into(
     let residual_ref: &MlxBuffer = match add_residual {
         Some(buf) => buf,
         None => {
-            dummy_residual_buf = super::decode_pool::pooled_alloc_buffer(device, 4, DType::F32, vec![1])
-                .map_err(|e| anyhow!("alloc dummy residual: {e}"))?;
+            dummy_residual_buf =
+                super::decode_pool::pooled_alloc_buffer(device, 4, DType::F32, vec![1])
+                    .map_err(|e| anyhow!("alloc dummy residual: {e}"))?;
             &dummy_residual_buf
         }
     };
+    drop(_w5b_ffn_alloc);
 
     {
         // ---- Phase A: router + shared expert projections (all read from x, concurrent) ----
@@ -1468,27 +1826,98 @@ pub fn build_moe_ffn_layer_gpu_q_into(
         // dispatch_silu_mul, dispatch_moe_weighted_reduce); no CPU
         // download/as_slice path on q_into.  See proj_pooled doc-comment
         // for the full caller-contract verification.
-        let logits_buf   = proj_pooled(enc, registry, device, x, &weights.router,          seq_len, h32, ne32)?;
-        let sh_logit_buf = proj_pooled(enc, registry, device, x, &weights.shared_gate_inp, seq_len, h32, 1)?;
-        let a_s_buf      = proj_pooled(enc, registry, device, x, &weights.shared_gate,     seq_len, h32, m_sh32)?;
-        let b_s_buf      = proj_pooled(enc, registry, device, x, &weights.shared_up,       seq_len, h32, m_sh32)?;
+        let (logits_buf, sh_logit_buf, a_s_buf, b_s_buf) = {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnPhaseAProj,
+            );
+            let logits_buf = proj_pooled(
+                enc,
+                registry,
+                device,
+                x,
+                &weights.router,
+                seq_len,
+                h32,
+                ne32,
+            )?;
+            let sh_logit_buf = proj_pooled(
+                enc,
+                registry,
+                device,
+                x,
+                &weights.shared_gate_inp,
+                seq_len,
+                h32,
+                1,
+            )?;
+            let a_s_buf = proj_pooled(
+                enc,
+                registry,
+                device,
+                x,
+                &weights.shared_gate,
+                seq_len,
+                h32,
+                m_sh32,
+            )?;
+            let b_s_buf = proj_pooled(
+                enc,
+                registry,
+                device,
+                x,
+                &weights.shared_up,
+                seq_len,
+                h32,
+                m_sh32,
+            )?;
+            (logits_buf, sh_logit_buf, a_s_buf, b_s_buf)
+        };
 
         // Barrier A→B: softmax_topk reads logits_buf; silu_mul reads a_s/b_s.
-        enc.memory_barrier();
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnBarrierAB,
+            );
+            enc.memory_barrier();
+        }
 
         // ---- Phase B: GPU softmax+topk + shared silu_mul (concurrent) ----
-        dispatch_moe_softmax_topk(
-            enc, registry, device,
-            &logits_buf, &ids_buf, &weights_buf,
-            seq_len, ne32, shape.num_experts_per_tok,
-        ).map_err(|e| anyhow!("moe_softmax_topk: {e}"))?;
-        dispatch_silu_mul(
-            enc, registry, device.metal_device(),
-            &a_s_buf, &b_s_buf, &h_s_buf, &silu_sh_params_buf, n_h_s,
-        ).map_err(|e| anyhow!("silu_mul sh: {e}"))?;
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnPhaseBRouteSilu,
+            );
+            dispatch_moe_softmax_topk(
+                enc,
+                registry,
+                device,
+                &logits_buf,
+                &ids_buf,
+                &weights_buf,
+                seq_len,
+                ne32,
+                shape.num_experts_per_tok,
+            )
+            .map_err(|e| anyhow!("moe_softmax_topk: {e}"))?;
+            dispatch_silu_mul(
+                enc,
+                registry,
+                device.metal_device(),
+                &a_s_buf,
+                &b_s_buf,
+                &h_s_buf,
+                &silu_sh_params_buf,
+                n_h_s,
+            )
+            .map_err(|e| anyhow!("silu_mul sh: {e}"))?;
+        }
 
         // Barrier B→C: gate/up matmuls need ids_buf; shared_down needs h_s.
-        enc.memory_barrier();
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnBarrierBC,
+            );
+            enc.memory_barrier();
+        }
 
         // ---- Phase C: expert gate+up matmuls + shared down proj (concurrent) ----
         //
@@ -1525,30 +1954,71 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             expert_stride: weights.expert_up_stride,
             ..gate_params
         };
-        super::decode_pool::with_id_mm_scratch(
-            super::decode_pool::MmIdSlot::Gate,
-            device, ne32, seq_len * shape.num_experts_per_tok,
-            |scratch| quantized_matmul_id_ggml_pooled(
-                enc, registry, device,
-                x, &weights.expert_gate_q, &ids_buf, &mut gate_all_buf,
-                scratch, &gate_params,
-            ),
-        ).map_err(|e| anyhow!("gate_all qmatmul_id_pooled: {e}"))?;
-        super::decode_pool::with_id_mm_scratch(
-            super::decode_pool::MmIdSlot::Up,
-            device, ne32, seq_len * shape.num_experts_per_tok,
-            |scratch| quantized_matmul_id_ggml_pooled(
-                enc, registry, device,
-                x, &weights.expert_up_q, &ids_buf, &mut up_all_buf,
-                scratch, &up_params,
-            ),
-        ).map_err(|e| anyhow!("up_all qmatmul_id_pooled: {e}"))?;
-        // ADR-015 iter7b — pooled (q_into path; y_s_buf flows into
-        // dispatch_moe_weighted_reduce, no CPU download).
-        let y_s_buf = proj_pooled(enc, registry, device, &h_s_buf, &weights.shared_down, seq_len, m_sh32, h32)?;
+        let y_s_buf = {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnPhaseCGateUpSharedDown,
+            );
+            super::decode_pool::with_id_mm_scratch(
+                super::decode_pool::MmIdSlot::Gate,
+                device,
+                ne32,
+                seq_len * shape.num_experts_per_tok,
+                |scratch| {
+                    quantized_matmul_id_ggml_pooled(
+                        enc,
+                        registry,
+                        device,
+                        x,
+                        &weights.expert_gate_q,
+                        &ids_buf,
+                        &mut gate_all_buf,
+                        scratch,
+                        &gate_params,
+                    )
+                },
+            )
+            .map_err(|e| anyhow!("gate_all qmatmul_id_pooled: {e}"))?;
+            super::decode_pool::with_id_mm_scratch(
+                super::decode_pool::MmIdSlot::Up,
+                device,
+                ne32,
+                seq_len * shape.num_experts_per_tok,
+                |scratch| {
+                    quantized_matmul_id_ggml_pooled(
+                        enc,
+                        registry,
+                        device,
+                        x,
+                        &weights.expert_up_q,
+                        &ids_buf,
+                        &mut up_all_buf,
+                        scratch,
+                        &up_params,
+                    )
+                },
+            )
+            .map_err(|e| anyhow!("up_all qmatmul_id_pooled: {e}"))?;
+            // ADR-015 iter7b — pooled (q_into path; y_s_buf flows into
+            // dispatch_moe_weighted_reduce, no CPU download).
+            proj_pooled(
+                enc,
+                registry,
+                device,
+                &h_s_buf,
+                &weights.shared_down,
+                seq_len,
+                m_sh32,
+                h32,
+            )?
+        };
 
         // Barrier C→D: silu_mul reads gate_all/up_all.
-        enc.memory_barrier();
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnBarrierCD,
+            );
+            enc.memory_barrier();
+        }
 
         // ---- Phase D: h_all = silu(gate_all) * up_all ----
         //
@@ -1564,13 +2034,30 @@ pub fn build_moe_ffn_layer_gpu_q_into(
         // remain in mlx-native for future re-evaluation but are NOT
         // wired here.  9th confirmed M5 Max static-evidence kernel
         // hypothesis falsified.
-        dispatch_silu_mul(
-            enc, registry, device.metal_device(),
-            &gate_all_buf, &up_all_buf, &h_all_buf, &silu_params_buf, n_h_all,
-        ).map_err(|e| anyhow!("silu_mul dispatch: {e}"))?;
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnPhaseDSilu,
+            );
+            dispatch_silu_mul(
+                enc,
+                registry,
+                device.metal_device(),
+                &gate_all_buf,
+                &up_all_buf,
+                &h_all_buf,
+                &silu_params_buf,
+                n_h_all,
+            )
+            .map_err(|e| anyhow!("silu_mul dispatch: {e}"))?;
+        }
 
         // Barrier D→E: expert_down reads h_all.
-        enc.memory_barrier();
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnBarrierDE,
+            );
+            enc.memory_barrier();
+        }
 
         // ---- Phase E: y_all = expert_down(h_all) ----
         //
@@ -1589,33 +2076,62 @@ pub fn build_moe_ffn_layer_gpu_q_into(
         };
         // W-5b.25 sunset: the legacy un-pooled branch was removed.  See
         // the Phase C sunset comment-block above for the audit trail.
-        super::decode_pool::with_id_mm_scratch(
-            super::decode_pool::MmIdSlot::Down,
-            device, ne32, total_rows as u32,
-            |scratch| quantized_matmul_id_ggml_pooled(
-                enc, registry, device,
-                &h_all_buf, &weights.expert_down_q, &ids_buf, &mut y_all_buf,
-                scratch, &down_params,
-            ),
-        ).map_err(|e| anyhow!("y_all qmatmul_id_pooled: {e}"))?;
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnPhaseEDown,
+            );
+            super::decode_pool::with_id_mm_scratch(
+                super::decode_pool::MmIdSlot::Down,
+                device,
+                ne32,
+                total_rows as u32,
+                |scratch| {
+                    quantized_matmul_id_ggml_pooled(
+                        enc,
+                        registry,
+                        device,
+                        &h_all_buf,
+                        &weights.expert_down_q,
+                        &ids_buf,
+                        &mut y_all_buf,
+                        scratch,
+                        &down_params,
+                    )
+                },
+            )
+            .map_err(|e| anyhow!("y_all qmatmul_id_pooled: {e}"))?;
+        }
 
         // Barrier E→F: moe_weighted_reduce reads y_all, y_s_buf, sh_logit_buf.
-        enc.memory_barrier();
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnBarrierEF,
+            );
+            enc.memory_barrier();
+        }
 
         // ---- Phase F: fused weighted accumulate + sigmoid(sh_logit)*y_s + residual ----
-        dispatch_moe_weighted_reduce(
-            enc, registry, device,
-            &weights_buf,
-            &y_all_buf,
-            &sh_logit_buf,
-            &y_s_buf,
-            residual_ref,
-            &mut out_buf,
-            seq_len,
-            shape.num_experts_per_tok,
-            h32,
-            add_residual.is_some(),
-        ).map_err(|e| anyhow!("moe_weighted_reduce: {e}"))?;
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnPhaseFReduce,
+            );
+            dispatch_moe_weighted_reduce(
+                enc,
+                registry,
+                device,
+                &weights_buf,
+                &y_all_buf,
+                &sh_logit_buf,
+                &y_s_buf,
+                residual_ref,
+                &mut out_buf,
+                seq_len,
+                shape.num_experts_per_tok,
+                h32,
+                add_residual.is_some(),
+            )
+            .map_err(|e| anyhow!("moe_weighted_reduce: {e}"))?;
+        }
 
         // NOTE: this `_into` variant does NOT commit.  The caller is
         // responsible for committing the encoder, allowing fusion with
@@ -1631,11 +2147,11 @@ pub fn build_moe_ffn_layer_gpu_q_into(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::ffn::{
         dense_swiglu_cpu_ref, moe_ffn_cpu_ref, DenseFfnShape, DenseFfnWeights, MoeFfnShape,
         MoeFfnWeights,
     };
+    use super::*;
 
     fn mk_rand(seed: &mut u32, n: usize, scale: f32) -> Vec<f32> {
         (0..n)
@@ -1671,7 +2187,7 @@ mod tests {
         let mut seed = 0xABCD_u32;
         let weights_cpu = DenseFfnWeights {
             gate: mk_rand(&mut seed, m * h, 0.15),
-            up:   mk_rand(&mut seed, m * h, 0.15),
+            up: mk_rand(&mut seed, m * h, 0.15),
             down: mk_rand(&mut seed, h * m, 0.15),
         };
         let x_cpu = mk_rand(&mut seed, seq_len * h, 0.5);
@@ -1738,7 +2254,7 @@ mod tests {
         let mut seed = 0x1111_u32;
         let weights_cpu = DenseFfnWeights {
             gate: mk_rand(&mut seed, m * h, 0.1),
-            up:   mk_rand(&mut seed, m * h, 0.1),
+            up: mk_rand(&mut seed, m * h, 0.1),
             down: mk_rand(&mut seed, h * m, 0.1),
         };
         let x_cpu = mk_rand(&mut seed, h, 0.5);
@@ -1761,7 +2277,10 @@ mod tests {
 
         for (i, (&g, &c)) in gpu_out.iter().zip(cpu_out.iter()).enumerate() {
             let err = (g - c).abs();
-            assert!(err < 1e-3, "single-token dense i={i}: gpu={g}, cpu={c}, err={err}");
+            assert!(
+                err < 1e-3,
+                "single-token dense i={i}: gpu={g}, cpu={c}, err={err}"
+            );
         }
     }
 
@@ -1778,7 +2297,7 @@ mod tests {
         let m = shape.intermediate_size as usize;
         let weights_cpu = DenseFfnWeights {
             gate: vec![0.0; m * h],
-            up:   vec![0.0; m * h],
+            up: vec![0.0; m * h],
             down: vec![0.0; h * m],
         };
         let x_cpu: Vec<f32> = (0..2 * h).map(|i| i as f32 * 0.01).collect();
@@ -1821,21 +2340,21 @@ mod tests {
             moe_intermediate_size: 32,
             shared_intermediate_size: 32,
         };
-        let h  = shape.hidden_size as usize;
+        let h = shape.hidden_size as usize;
         let ne = shape.num_experts as usize;
-        let m  = shape.moe_intermediate_size as usize;
+        let m = shape.moe_intermediate_size as usize;
         let ms = shape.shared_intermediate_size as usize;
 
         let mut seed = 0xBEEF_u32;
         let weights_cpu = MoeFfnWeights {
-            router:           mk_rand(&mut seed, ne * h,      0.3),
-            expert_gate:      mk_rand(&mut seed, ne * m * h,  0.1),
-            expert_up:        mk_rand(&mut seed, ne * m * h,  0.1),
-            expert_down:      mk_rand(&mut seed, ne * h * m,  0.1),
-            shared_gate_logit: mk_rand(&mut seed, h,           0.1),
-            shared_gate:      mk_rand(&mut seed, ms * h,       0.1),
-            shared_up:        mk_rand(&mut seed, ms * h,       0.1),
-            shared_down:      mk_rand(&mut seed, h * ms,       0.1),
+            router: mk_rand(&mut seed, ne * h, 0.3),
+            expert_gate: mk_rand(&mut seed, ne * m * h, 0.1),
+            expert_up: mk_rand(&mut seed, ne * m * h, 0.1),
+            expert_down: mk_rand(&mut seed, ne * h * m, 0.1),
+            shared_gate_logit: mk_rand(&mut seed, h, 0.1),
+            shared_gate: mk_rand(&mut seed, ms * h, 0.1),
+            shared_up: mk_rand(&mut seed, ms * h, 0.1),
+            shared_down: mk_rand(&mut seed, h * ms, 0.1),
         };
         let seq_len = 3usize;
         let x_cpu = mk_rand(&mut seed, seq_len * h, 0.4);
@@ -1893,21 +2412,21 @@ mod tests {
             moe_intermediate_size: 32,
             shared_intermediate_size: 32,
         };
-        let h  = shape.hidden_size as usize;
+        let h = shape.hidden_size as usize;
         let ne = shape.num_experts as usize;
-        let m  = shape.moe_intermediate_size as usize;
+        let m = shape.moe_intermediate_size as usize;
         let ms = shape.shared_intermediate_size as usize;
 
         let mut seed = 0xCAFE_u32;
         let weights_cpu = MoeFfnWeights {
-            router:           mk_rand(&mut seed, ne * h,      0.5),
-            expert_gate:      mk_rand(&mut seed, ne * m * h,  0.1),
-            expert_up:        mk_rand(&mut seed, ne * m * h,  0.1),
-            expert_down:      mk_rand(&mut seed, ne * h * m,  0.1),
-            shared_gate_logit: mk_rand(&mut seed, h,           0.1),
-            shared_gate:      mk_rand(&mut seed, ms * h,       0.1),
-            shared_up:        mk_rand(&mut seed, ms * h,       0.1),
-            shared_down:      mk_rand(&mut seed, h * ms,       0.1),
+            router: mk_rand(&mut seed, ne * h, 0.5),
+            expert_gate: mk_rand(&mut seed, ne * m * h, 0.1),
+            expert_up: mk_rand(&mut seed, ne * m * h, 0.1),
+            expert_down: mk_rand(&mut seed, ne * h * m, 0.1),
+            shared_gate_logit: mk_rand(&mut seed, h, 0.1),
+            shared_gate: mk_rand(&mut seed, ms * h, 0.1),
+            shared_up: mk_rand(&mut seed, ms * h, 0.1),
+            shared_down: mk_rand(&mut seed, h * ms, 0.1),
         };
         let x_cpu = mk_rand(&mut seed, h, 0.4); // 1 token
 
@@ -1915,7 +2434,12 @@ mod tests {
         let weights_gpu = MoeFfnWeightsGpu::from_cpu(&weights_cpu, &device).expect("upload");
         let x_buf = upload_f32(&x_cpu, &device).expect("upload x");
         let gpu_buf = build_moe_ffn_layer_gpu(
-            &device, &mut registry, &x_buf, &weights_gpu, &weights_cpu, shape,
+            &device,
+            &mut registry,
+            &x_buf,
+            &weights_gpu,
+            &weights_cpu,
+            shape,
         )
         .expect("gpu moe ffn");
         let gpu_out = download_f32(&gpu_buf).expect("download");
@@ -1943,36 +2467,29 @@ mod tests {
             moe_intermediate_size: 32,
             shared_intermediate_size: 32,
         };
-        let h  = shape.hidden_size as usize;
+        let h = shape.hidden_size as usize;
         let ne = shape.num_experts as usize;
-        let m  = shape.moe_intermediate_size as usize;
+        let m = shape.moe_intermediate_size as usize;
         let ms = shape.shared_intermediate_size as usize;
 
         let mut seed = 0xDEAD_u32;
         let base_weights = MoeFfnWeights {
-            router:            mk_rand(&mut seed, ne * h,     0.5),
-            expert_gate:       mk_rand(&mut seed, ne * m * h, 0.1),
-            expert_up:         mk_rand(&mut seed, ne * m * h, 0.1),
-            expert_down:       mk_rand(&mut seed, ne * h * m, 0.1),
+            router: mk_rand(&mut seed, ne * h, 0.5),
+            expert_gate: mk_rand(&mut seed, ne * m * h, 0.1),
+            expert_up: mk_rand(&mut seed, ne * m * h, 0.1),
+            expert_down: mk_rand(&mut seed, ne * h * m, 0.1),
             shared_gate_logit: vec![0.0f32; h], // zero → sigmoid(0)=0.5
-            shared_gate:       mk_rand(&mut seed, ms * h,     0.1),
-            shared_up:         mk_rand(&mut seed, ms * h,     0.1),
-            shared_down:       mk_rand(&mut seed, h * ms,     0.1),
+            shared_gate: mk_rand(&mut seed, ms * h, 0.1),
+            shared_up: mk_rand(&mut seed, ms * h, 0.1),
+            shared_down: mk_rand(&mut seed, h * ms, 0.1),
         };
         let x_cpu = mk_rand(&mut seed, h, 0.4);
 
         let mut run_gpu = |weights: &MoeFfnWeights| -> Vec<f32> {
             let wg = MoeFfnWeightsGpu::from_cpu(weights, &device).expect("upload");
             let xb = upload_f32(&x_cpu, &device).expect("upload x");
-            let ob = build_moe_ffn_layer_gpu(
-                &device,
-                &mut registry,
-                &xb,
-                &wg,
-                weights,
-                shape,
-            )
-            .expect("gpu moe");
+            let ob = build_moe_ffn_layer_gpu(&device, &mut registry, &xb, &wg, weights, shape)
+                .expect("gpu moe");
             download_f32(&ob).expect("download")
         };
 
@@ -2007,8 +2524,8 @@ mod tests {
     fn silu_mul_cpu_known_values() {
         // SiLU(0) = 0, SiLU(1) ≈ 0.7311, SiLU(-1) ≈ -0.2689.
         let gate = vec![0.0, 1.0, -1.0, 2.0];
-        let up   = vec![1.0, 2.0,  3.0, 0.5];
-        let out  = silu_mul_cpu(&gate, &up);
+        let up = vec![1.0, 2.0, 3.0, 0.5];
+        let out = silu_mul_cpu(&gate, &up);
         let expected = [
             0.0f32,
             0.7310586f32 * 2.0,
@@ -2034,7 +2551,10 @@ mod tests {
         assert_eq!(idx[0], 0, "top expert must be idx 0");
         // Weights must sum to ~1 after renorm.
         let wsum: f32 = w.iter().sum();
-        assert!((wsum - 1.0).abs() < 1e-5, "weights must sum to 1, got {wsum}");
+        assert!(
+            (wsum - 1.0).abs() < 1e-5,
+            "weights must sum to 1, got {wsum}"
+        );
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -2066,48 +2586,56 @@ mod tests {
 
         let mut seed = 0xDADA_u32;
         let mut r = |n: usize, scale: f32| -> Vec<f32> {
-            (0..n).map(|_| {
-                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
-                ((seed as i32 as f32) / (i32::MAX as f32)) * scale
-            }).collect()
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                    ((seed as i32 as f32) / (i32::MAX as f32)) * scale
+                })
+                .collect()
         };
 
         let gate_f32 = r(m * h, 0.1);
-        let up_f32   = r(m * h, 0.1);
+        let up_f32 = r(m * h, 0.1);
         let down_f32 = r(h * m, 0.1);
-        let x_cpu    = r(seq_len * h, 0.5);
+        let x_cpu = r(seq_len * h, 0.5);
 
         // Encode weights as Q4_0.
         let gate_q4 = encode_q4_0(&gate_f32);
-        let up_q4   = encode_q4_0(&up_f32);
+        let up_q4 = encode_q4_0(&up_f32);
         let down_q4 = encode_q4_0(&down_f32);
 
         // Dequantize for CPU oracle (mirrors what the GPU kernel does).
         let gate_dq = dequant_q4_0(&gate_q4, m * h);
-        let up_dq   = dequant_q4_0(&up_q4,   m * h);
+        let up_dq = dequant_q4_0(&up_q4, m * h);
         let down_dq = dequant_q4_0(&down_q4, h * m);
 
         // CPU oracle using dequantized weights.
         let cpu_weights = DenseFfnWeights {
             gate: gate_dq,
-            up:   up_dq,
+            up: up_dq,
             down: down_dq,
         };
-        let shape = DenseFfnShape { hidden_size, intermediate_size };
+        let shape = DenseFfnShape {
+            hidden_size,
+            intermediate_size,
+        };
         let cpu_out = dense_swiglu_cpu_ref(&x_cpu, &cpu_weights, shape);
 
         // Build quantized GPU weight container directly (mirrors DenseFfnWeightsGpuQ).
         let ggml_type = GgmlType::Q4_0;
         let make_buf = |data: &[u8]| -> MlxBuffer {
-            let mut buf = device.alloc_buffer(data.len(), DType::U8, vec![data.len()])
+            let mut buf = device
+                .alloc_buffer(data.len(), DType::U8, vec![data.len()])
                 .expect("alloc q4_0 buf");
-            buf.as_mut_slice::<u8>().expect("q-buf slice").copy_from_slice(data);
+            buf.as_mut_slice::<u8>()
+                .expect("q-buf slice")
+                .copy_from_slice(data);
             buf
         };
 
         let weights_q = DenseFfnWeightsGpuQ {
             gate_q: make_buf(&gate_q4),
-            up_q:   make_buf(&up_q4),
+            up_q: make_buf(&up_q4),
             down_q: make_buf(&down_q4),
             ggml_type_gate_up: ggml_type,
             ggml_type_down: ggml_type,
@@ -2116,9 +2644,8 @@ mod tests {
         };
 
         let x_buf = upload_f32(&x_cpu, &device).expect("upload x");
-        let gpu_buf = build_dense_ffn_layer_gpu_q(
-            &device, &mut registry, &x_buf, &weights_q, None,
-        ).expect("build_dense_ffn_layer_gpu_q");
+        let gpu_buf = build_dense_ffn_layer_gpu_q(&device, &mut registry, &x_buf, &weights_q, None)
+            .expect("build_dense_ffn_layer_gpu_q");
 
         // W-5b.14: result may be pool-allocated with bucket-rounded byte_len.
         // Use the buffer's logical element_count() (= product of shape dims),
@@ -2126,10 +2653,14 @@ mod tests {
         // production decode-path consumers use (apply_output_head_gpu_greedy +
         // next layer's fused_residual_norm operate on shape, not byte_len).
         let n_logical = gpu_buf.element_count();
-        let gpu_out: Vec<f32> = gpu_buf.as_slice::<f32>()
-            .expect("gpu_buf as_slice")[..n_logical].to_vec();
+        let gpu_out: Vec<f32> =
+            gpu_buf.as_slice::<f32>().expect("gpu_buf as_slice")[..n_logical].to_vec();
 
-        assert_eq!(gpu_out.len(), cpu_out.len(), "dense_q gpu/cpu length mismatch");
+        assert_eq!(
+            gpu_out.len(),
+            cpu_out.len(),
+            "dense_q gpu/cpu length mismatch"
+        );
 
         // Guard against Metal device contention under parallel test execution.
         let all_zero = gpu_out.iter().all(|&v| v == 0.0);
@@ -2142,7 +2673,9 @@ mod tests {
         let mut max_err = 0.0f32;
         for (i, (&g, &c)) in gpu_out.iter().zip(cpu_out.iter()).enumerate() {
             let err = (g - c).abs();
-            if err > max_err { max_err = err; }
+            if err > max_err {
+                max_err = err;
+            }
             assert!(
                 err < 2e-2,
                 "dense_q parity FAIL at i={i}: gpu={g}, cpu={c}, err={err}"
@@ -2204,10 +2737,12 @@ mod tests {
         // because per-layer-DIFFERENT weights are not the invariant under test).
         let mut seed = 0xCAFEu32;
         let mut r = |n: usize, scale: f32| -> Vec<f32> {
-            (0..n).map(|_| {
-                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
-                ((seed as i32 as f32) / (i32::MAX as f32)) * scale
-            }).collect()
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                    ((seed as i32 as f32) / (i32::MAX as f32)) * scale
+                })
+                .collect()
         };
         let gate_f32 = r(m * h, 0.1);
         let up_f32 = r(m * h, 0.1);
@@ -2217,14 +2752,17 @@ mod tests {
         let up_q4 = encode_q4_0(&up_f32);
         let down_q4 = encode_q4_0(&down_f32);
         let make_q_buf = |data: &[u8]| -> MlxBuffer {
-            let mut buf = device.alloc_buffer(data.len(), DType::U8, vec![data.len()])
+            let mut buf = device
+                .alloc_buffer(data.len(), DType::U8, vec![data.len()])
                 .expect("alloc q4_0 buf");
-            buf.as_mut_slice::<u8>().expect("q-buf slice").copy_from_slice(data);
+            buf.as_mut_slice::<u8>()
+                .expect("q-buf slice")
+                .copy_from_slice(data);
             buf
         };
         let weights = DenseFfnWeightsGpuQ {
             gate_q: make_q_buf(&gate_q4),
-            up_q:   make_q_buf(&up_q4),
+            up_q: make_q_buf(&up_q4),
             down_q: make_q_buf(&down_q4),
             ggml_type_gate_up: GgmlType::Q4_0,
             ggml_type_down: GgmlType::Q4_0,
@@ -2255,10 +2793,16 @@ mod tests {
         for layer_idx in 0..NUM_LAYERS {
             // Fresh encoder per "layer" — mirrors `forward_gpu_impl`'s
             // per-layer encoder lifecycle.
-            let mut enc = device.command_encoder()
+            let mut enc = device
+                .command_encoder()
                 .unwrap_or_else(|e| panic!("enc layer {layer_idx}: {e}"));
             let out = build_dense_ffn_layer_gpu_q_into(
-                &mut enc, &device, &mut registry, &x_buf, &weights, None,
+                &mut enc,
+                &device,
+                &mut registry,
+                &x_buf,
+                &weights,
+                None,
             )
             .unwrap_or_else(|e| panic!("dense_q_into layer {layer_idx}: {e}"));
             // Match the production fused-CB call site: commit_and_wait at
@@ -2276,7 +2820,9 @@ mod tests {
             // Sample first/last element to confirm genuine compute (not all-zero).
             let slice = out.as_slice::<f32>().expect("as_slice");
             let layer_all_zero = slice[..n_out].iter().all(|&v| v == 0.0);
-            if layer_all_zero { all_zero_count += 1; }
+            if layer_all_zero {
+                all_zero_count += 1;
+            }
 
             // Drop `out` (device-alloc'd at prefill — its ARC clone is local
             // to this iteration and falls out of scope here, mirroring how
@@ -2316,7 +2862,8 @@ mod tests {
             all_zero_count <= 2,
             "{}/{} layers returned all-zero output — \
              dense-Q `_into_pooled` body did not execute",
-            all_zero_count, NUM_LAYERS,
+            all_zero_count,
+            NUM_LAYERS,
         );
 
         eprintln!(
@@ -2402,49 +2949,51 @@ mod tests {
             moe_intermediate_size: 32,
             shared_intermediate_size: 32,
         };
-        let h  = shape.hidden_size as usize;
+        let h = shape.hidden_size as usize;
         let ne = shape.num_experts as usize;
-        let m  = shape.moe_intermediate_size as usize;
+        let m = shape.moe_intermediate_size as usize;
         let ms = shape.shared_intermediate_size as usize;
 
         let mut seed = 0xF00D_u32;
         let mut r = |n: usize, scale: f32| -> Vec<f32> {
-            (0..n).map(|_| {
-                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
-                ((seed as i32 as f32) / (i32::MAX as f32)) * scale
-            }).collect()
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                    ((seed as i32 as f32) / (i32::MAX as f32)) * scale
+                })
+                .collect()
         };
 
-        let router_f32      = r(ne * h, 0.3);
+        let router_f32 = r(ne * h, 0.3);
         let expert_gate_f32 = r(ne * m * h, 0.1);
-        let expert_up_f32   = r(ne * m * h, 0.1);
+        let expert_up_f32 = r(ne * m * h, 0.1);
         let expert_down_f32 = r(ne * h * m, 0.1);
         let shared_gate_logit = r(h, 0.1);
         let shared_gate_f32 = r(ms * h, 0.1);
-        let shared_up_f32   = r(ms * h, 0.1);
+        let shared_up_f32 = r(ms * h, 0.1);
         let shared_down_f32 = r(h * ms, 0.1);
         let seq_len = 2usize;
-        let x_cpu   = r(seq_len * h, 0.4);
+        let x_cpu = r(seq_len * h, 0.4);
 
         // Encode expert weights as Q4_0.
         let gate_q4 = encode_q4_0(&expert_gate_f32);
-        let up_q4   = encode_q4_0(&expert_up_f32);
+        let up_q4 = encode_q4_0(&expert_up_f32);
         let down_q4 = encode_q4_0(&expert_down_f32);
 
         // Dequantize for the CPU oracle (simulates what the GPU kernel does).
         let expert_gate_dq = dequant_q4_0(&gate_q4, ne * m * h);
-        let expert_up_dq   = dequant_q4_0(&up_q4,   ne * m * h);
+        let expert_up_dq = dequant_q4_0(&up_q4, ne * m * h);
         let expert_down_dq = dequant_q4_0(&down_q4, ne * h * m);
 
         // CPU oracle using dequantized weights.
         let cpu_weights = MoeFfnWeights {
             router: router_f32.clone(),
             expert_gate: expert_gate_dq,
-            expert_up:   expert_up_dq,
+            expert_up: expert_up_dq,
             expert_down: expert_down_dq,
             shared_gate_logit: shared_gate_logit.clone(),
             shared_gate: shared_gate_f32.clone(),
-            shared_up:   shared_up_f32.clone(),
+            shared_up: shared_up_f32.clone(),
             shared_down: shared_down_f32.clone(),
         };
         let cpu_out = moe_ffn_cpu_ref(&x_cpu, &cpu_weights, shape);
@@ -2457,53 +3006,64 @@ mod tests {
         let down_stride = ((h * m / qk) * block_bytes) as u64;
 
         let make_buf = |data: &[u8]| -> MlxBuffer {
-            let mut buf = device.alloc_buffer(data.len(), DType::U8, vec![data.len()])
+            let mut buf = device
+                .alloc_buffer(data.len(), DType::U8, vec![data.len()])
                 .expect("alloc q-buf");
-            buf.as_mut_slice::<u8>().expect("q-buf slice").copy_from_slice(data);
+            buf.as_mut_slice::<u8>()
+                .expect("q-buf slice")
+                .copy_from_slice(data);
             buf
         };
         let expert_gate_buf = make_buf(&gate_q4);
-        let expert_up_buf   = make_buf(&up_q4);
+        let expert_up_buf = make_buf(&up_q4);
         let expert_down_buf = make_buf(&down_q4);
 
         let weights_q = MoeFfnWeightsGpuQ {
             router: upload_f32(&router_f32, &device).expect("router"),
             expert_gate_q: expert_gate_buf,
-            expert_up_q:   expert_up_buf,
+            expert_up_q: expert_up_buf,
             expert_down_q: expert_down_buf,
             ggml_type_gate_up: ggml_type,
             ggml_type_down: ggml_type,
             expert_gate_stride: gate_stride,
-            expert_up_stride:   gate_stride,
+            expert_up_stride: gate_stride,
             expert_down_stride: down_stride,
             num_experts: ne as u32,
             shared_gate_inp: upload_f32(&shared_gate_logit, &device).expect("sh_gate_inp"),
-            shared_gate:  upload_f32(&shared_gate_f32, &device).expect("sh_gate"),
-            shared_up:    upload_f32(&shared_up_f32, &device).expect("sh_up"),
-            shared_down:  upload_f32(&shared_down_f32, &device).expect("sh_down"),
+            shared_gate: upload_f32(&shared_gate_f32, &device).expect("sh_gate"),
+            shared_up: upload_f32(&shared_up_f32, &device).expect("sh_up"),
+            shared_down: upload_f32(&shared_down_f32, &device).expect("sh_down"),
         };
 
         let x_buf = upload_f32(&x_cpu, &device).expect("upload x");
-        let gpu_buf = build_moe_ffn_layer_gpu_q(
-            &device, &mut registry, &x_buf, &weights_q, shape, None,
-        ).expect("build_moe_ffn_layer_gpu_q");
+        let gpu_buf =
+            build_moe_ffn_layer_gpu_q(&device, &mut registry, &x_buf, &weights_q, shape, None)
+                .expect("build_moe_ffn_layer_gpu_q");
 
         let gpu_out = download_f32(&gpu_buf).expect("download gpu out");
 
-        assert_eq!(gpu_out.len(), cpu_out.len(), "moe_q gpu/cpu length mismatch");
+        assert_eq!(
+            gpu_out.len(),
+            cpu_out.len(),
+            "moe_q gpu/cpu length mismatch"
+        );
 
         // Guard against Metal device contention under parallel test execution.
         let all_zero = gpu_out.iter().all(|&v| v == 0.0);
         let cpu_nonzero = cpu_out.iter().any(|&v| v != 0.0);
         if all_zero && cpu_nonzero {
-            eprintln!("moe_ffn_gpu_q_parity: GPU output all-zero under parallel contention — skipping");
+            eprintln!(
+                "moe_ffn_gpu_q_parity: GPU output all-zero under parallel contention — skipping"
+            );
             return;
         }
 
         let mut max_err = 0.0f32;
         for (i, (&g, &c)) in gpu_out.iter().zip(cpu_out.iter()).enumerate() {
             let err = (g - c).abs();
-            if err > max_err { max_err = err; }
+            if err > max_err {
+                max_err = err;
+            }
             assert!(
                 err < 2e-2,
                 "moe_q parity FAIL at i={i}: gpu={g}, cpu={c}, err={err}"

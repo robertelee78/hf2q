@@ -38,21 +38,21 @@
 //! ≈8 projections across the 4-layer stack).
 
 use anyhow::{anyhow, Context, Result};
-use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 use mlx_native::ops::elementwise::elementwise_add;
+use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 use std::sync::OnceLock;
 
+use super::activation_capture::LayerActivations;
 use super::delta_net::DeltaNetLayerShape;
 use super::ffn::{DenseFfnShape, MoeFfnShape};
 use super::full_attn::FullAttnShape;
-use super::activation_capture::LayerActivations;
 use super::gpu_delta_net::{
     build_delta_net_layer, build_delta_net_layer_decode_into, DeltaNetWeightsGpu,
 };
 use super::gpu_ffn::{
-    build_dense_ffn_layer_gpu, build_dense_ffn_layer_gpu_q_into,
-    build_moe_ffn_layer_gpu, build_moe_ffn_layer_gpu_q, build_moe_ffn_layer_gpu_q_into,
-    DenseFfnWeightsGpu, DenseFfnWeightsGpuQ, MoeFfnWeightsGpu, MoeFfnWeightsGpuQ,
+    build_dense_ffn_layer_gpu, build_dense_ffn_layer_gpu_q_into, build_moe_ffn_layer_gpu,
+    build_moe_ffn_layer_gpu_q, build_moe_ffn_layer_gpu_q_into, DenseFfnWeightsGpu,
+    DenseFfnWeightsGpuQ, MoeFfnWeightsGpu, MoeFfnWeightsGpuQ,
 };
 use super::gpu_full_attn::{
     apply_gated_attn_layer_decode_into, apply_linear_projection_f32,
@@ -62,9 +62,9 @@ use super::gpu_full_attn::{
 use super::io_heads::embed_tokens;
 use super::kv_cache::HybridKvCache;
 use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
+use mlx_native::ops::argmax::dispatch_argmax_f32;
 use mlx_native::ops::fused_norm_add::dispatch_fused_residual_norm_f32;
 use mlx_native::ops::rms_norm;
-use mlx_native::ops::argmax::dispatch_argmax_f32;
 
 // ================================================================
 // Debug dump helpers (HF2Q_DUMP_LAYER_N / HF2Q_DUMP_LAYER_ACTIVATIONS env gates)
@@ -85,7 +85,9 @@ fn dump_layer_n() -> Option<usize> {
 /// `<prefix>NN.bin` after each layer's residual add.
 fn dump_layer_activations_prefix() -> Option<String> {
     static CACHE: OnceLock<Option<String>> = OnceLock::new();
-    CACHE.get_or_init(|| std::env::var("HF2Q_DUMP_LAYER_ACTIVATIONS").ok()).clone()
+    CACHE
+        .get_or_init(|| std::env::var("HF2Q_DUMP_LAYER_ACTIVATIONS").ok())
+        .clone()
 }
 
 /// Write the last-token row of `hidden` [seq, H] as f32 bytes to `path`.
@@ -95,9 +97,8 @@ fn dump_layer_bin(path: &str, buf: &MlxBuffer, seq_len: u32, hidden_size: u32) {
             let h = hidden_size as usize;
             let last_start = ((seq_len as usize).saturating_sub(1)) * h;
             let row = &data[last_start..last_start + h.min(data.len().saturating_sub(last_start))];
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len() * 4)
-            };
+            let bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len() * 4) };
             if let Err(e) = std::fs::write(path, bytes) {
                 eprintln!("[DUMP_LAYER] write {path} failed: {e}");
             } else {
@@ -128,13 +129,18 @@ fn dump_hidden_stats(label: &str, buf: &MlxBuffer, seq_len: u32, hidden_size: u3
             let max_tok: f32 = if seq > 0 {
                 let tok0 = &data[0..h];
                 tok0.iter().map(|x| x.abs()).fold(0.0f32, f32::max)
-            } else { 0.0 };
+            } else {
+                0.0
+            };
             eprintln!(
                 "[DUMP] {} last-tok: rms={:.4} max_abs={:.4} tok0_max_abs={:.4} seq={} h={}",
                 label, rms, max_abs, max_tok, seq, h
             );
             // Also print first 8 values of last token
-            let preview: Vec<String> = row[..8.min(row.len())].iter().map(|x| format!("{:.4}", x)).collect();
+            let preview: Vec<String> = row[..8.min(row.len())]
+                .iter()
+                .map(|x| format!("{:.4}", x))
+                .collect();
             eprintln!("[DUMP]   first8={}", preview.join(", "));
         }
         Err(e) => eprintln!("[DUMP] {} download failed: {e}", label),
@@ -145,14 +151,18 @@ fn dump_hidden_stats(label: &str, buf: &MlxBuffer, seq_len: u32, hidden_size: u3
 // Per-session GPU state cache
 // ================================================================
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputHeadMode {
+    All,
+    Last,
+}
+
 /// Pre-allocated decode buffers for `forward_gpu_greedy` (seq_len == 1).
 ///
 /// All buffers have fixed shape `[1, hidden_size]` for single-token decode.
 /// Reusing these across decode tokens eliminates ~80 Metal `newBuffer` calls
 /// per token (2 per layer × 40 layers), saving ~1ms/token CPU overhead.
 struct DecodeBuffers {
-    /// `hidden_size` for which these were allocated (shape check).
-    hidden_size: u32,
     /// Token embedding scratch: `[1, hidden_size]` F32 (CPU gather → upload here).
     /// Avoids one Metal `newBuffer` + `memcpy` per decode token for embedding.
     embed_buf: MlxBuffer,
@@ -238,8 +248,6 @@ enum FfnWeightsGpu {
 
 struct OutputHeadGpu {
     norm_w: MlxBuffer,
-    /// F32 lm_head weight buffer `[vocab_size, hidden_size]`. Used for prefill (M > 1).
-    lm_head: MlxBuffer,
     /// BF16 pre-cast of lm_head — used for prefill (M > 1) where MM kernel is optimal.
     lm_head_bf16: MlxBuffer,
     /// Q4_0 quantized lm_head — used for single-token decode (M=1) for 3.57×
@@ -354,6 +362,37 @@ fn apply_output_head_gpu(
     download_f32(&logits_buf).context("download logits")
 }
 
+/// Apply the final output head only to the last prefill row.
+///
+/// Generation samples from the final prompt position only, so materializing
+/// `[seq_len, vocab]` logits is unnecessary for normal prefill.  At 4096 tokens
+/// and Qwen3.6's 248k vocab that full buffer is ~4 GB.  This path takes a
+/// zero-copy Metal slice view of the final hidden row and reuses the same
+/// output-head implementation with `seq_len=1`, returning `[vocab]` logits.
+fn apply_output_head_gpu_last(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden: &MlxBuffer,
+    head: &OutputHeadGpu,
+    seq_len: u32,
+    hidden_size: u32,
+    vocab_size: u32,
+    eps: f32,
+) -> Result<Vec<f32>> {
+    anyhow::ensure!(seq_len > 0, "apply_output_head_gpu_last: empty sequence");
+    let byte_offset = ((seq_len as u64 - 1) * hidden_size as u64) * 4;
+    let last_hidden = hidden.slice_view(byte_offset, hidden_size as usize);
+    apply_output_head_gpu(
+        device,
+        registry,
+        &last_hidden,
+        head,
+        1,
+        hidden_size,
+        vocab_size,
+        eps,
+    )
+}
 
 /// Single source of `&mut DecodeBuffers.logits_buf` from a `&DecodeBuffers`.
 ///
@@ -390,13 +429,11 @@ fn apply_output_head_gpu_greedy(
     _eps: f32,
     bufs: &DecodeBuffers,
 ) -> Result<u32> {
-    let seq_len = 1u32;
-
     // Use pre-allocated buffers from DecodeBuffers (zero Metal alloc overhead).
-    let normed        = &bufs.norm_out_buf;
-    let norm_params   = &bufs.norm_params_buf;
-    let out_index     = &bufs.argmax_index_buf;
-    let out_value     = &bufs.argmax_value_buf;
+    let normed = &bufs.norm_out_buf;
+    let norm_params = &bufs.norm_params_buf;
+    let out_index = &bufs.argmax_index_buf;
+    let out_value = &bufs.argmax_value_buf;
     let argmax_params = &bufs.argmax_params_buf;
     // logits_buf is &mut because apply_linear_projection_f32_into writes into it.
     // Centralized via `logits_buf_mut` (single unsafe site for the whole file).
@@ -410,12 +447,23 @@ fn apply_output_head_gpu_greedy(
     // audit, which must remain a real wait).
     apply_output_head_gpu_greedy_into(
         None, // no caller-supplied encoder; we open + commit our own
-        device, registry, hidden, head, hidden_size, vocab_size,
-        normed, norm_params, &out_index, &out_value, argmax_params, logits_buf,
+        device,
+        registry,
+        hidden,
+        head,
+        hidden_size,
+        vocab_size,
+        normed,
+        norm_params,
+        &out_index,
+        &out_value,
+        argmax_params,
+        logits_buf,
     )?;
 
     // Download only 4 bytes (the winning token ID).
-    let token_id = out_index.as_slice::<u32>()
+    let token_id = out_index
+        .as_slice::<u32>()
         .map_err(|e| anyhow!("out_index as_slice: {e}"))?[0];
     Ok(token_id)
 }
@@ -472,46 +520,91 @@ fn apply_output_head_gpu_greedy_into(
     ) -> Result<()> {
         // Stage 1: output_norm → normed.
         rms_norm::dispatch_rms_norm(
-            enc, registry, device.metal_device(),
-            hidden, &head.norm_w, normed, norm_params,
-            seq_len, hidden_size,
-        ).context("dispatch_rms_norm output greedy (single-CB)")?;
+            enc,
+            registry,
+            device.metal_device(),
+            hidden,
+            &head.norm_w,
+            normed,
+            norm_params,
+            seq_len,
+            hidden_size,
+        )
+        .context("dispatch_rms_norm output greedy (single-CB)")?;
         // Barrier: lm_head reads `normed` written above.  Replaces the
         // legacy CB boundary at forward_gpu.rs:400→:404.
         enc.memory_barrier();
 
         // Stage 2: lm_head_q4 → logits_buf.
         apply_linear_projection_f32_into(
-            enc, registry, device, normed,
-            &head.lm_head_q4, logits_buf, seq_len, hidden_size, vocab_size,
-        ).context("lm_head projection greedy (single-CB)")?;
+            enc,
+            registry,
+            device,
+            normed,
+            &head.lm_head_q4,
+            logits_buf,
+            seq_len,
+            hidden_size,
+            vocab_size,
+        )
+        .context("lm_head projection greedy (single-CB)")?;
         // Barrier: argmax reads `logits_buf` written above.  Replaces the
         // legacy CB boundary at forward_gpu.rs:410→:413.
         enc.memory_barrier();
 
         // Stage 3: argmax → out_index, out_value.
         dispatch_argmax_f32(
-            enc, registry, device.metal_device(),
-            logits_buf, out_index, out_value, argmax_params, vocab_size,
-        ).context("dispatch_argmax_f32 greedy (single-CB)")?;
+            enc,
+            registry,
+            device.metal_device(),
+            logits_buf,
+            out_index,
+            out_value,
+            argmax_params,
+            vocab_size,
+        )
+        .context("dispatch_argmax_f32 greedy (single-CB)")?;
         Ok(())
     }
 
     if let Some(enc) = caller_enc {
         // Caller-driven path (S4 orchestrator): caller commits at the end.
         encode_into(
-            enc, registry, device, hidden, head,
-            hidden_size, vocab_size, seq_len,
-            normed, norm_params, out_index, out_value, argmax_params, logits_buf,
+            enc,
+            registry,
+            device,
+            hidden,
+            head,
+            hidden_size,
+            vocab_size,
+            seq_len,
+            normed,
+            norm_params,
+            out_index,
+            out_value,
+            argmax_params,
+            logits_buf,
         )
     } else {
         // Standalone path (legacy / non-S4): open + terminal wait.
-        let mut enc = device.command_encoder()
+        let mut enc = device
+            .command_encoder()
             .context("enc output_head.fused_norm_lm_argmax (greedy)")?;
         encode_into(
-            &mut enc, registry, device, hidden, head,
-            hidden_size, vocab_size, seq_len,
-            normed, norm_params, out_index, out_value, argmax_params, logits_buf,
+            &mut enc,
+            registry,
+            device,
+            hidden,
+            head,
+            hidden_size,
+            vocab_size,
+            seq_len,
+            normed,
+            norm_params,
+            out_index,
+            out_value,
+            argmax_params,
+            logits_buf,
         )?;
         // Terminal commit_and_wait: the only fuse_safe=NO row in the P1
         // audit — host read of out_index follows immediately.
@@ -539,38 +632,62 @@ fn apply_output_head_gpu_greedy_legacy(
 ) -> Result<u32> {
     let seq_len = 1u32;
 
-    let normed        = &bufs.norm_out_buf;
-    let norm_params   = &bufs.norm_params_buf;
-    let out_index     = &bufs.argmax_index_buf;
-    let out_value     = &bufs.argmax_value_buf;
+    let normed = &bufs.norm_out_buf;
+    let norm_params = &bufs.norm_params_buf;
+    let out_index = &bufs.argmax_index_buf;
+    let out_value = &bufs.argmax_value_buf;
     let argmax_params = &bufs.argmax_params_buf;
     // Centralized via `logits_buf_mut` (single unsafe site for the whole file).
     let logits_buf = logits_buf_mut(bufs);
 
     let mut enc_norm = device.command_encoder().context("enc output_norm legacy")?;
     rms_norm::dispatch_rms_norm(
-        &mut enc_norm, registry, device.metal_device(),
-        hidden, &head.norm_w, &normed, &norm_params,
-        seq_len, hidden_size,
-    ).context("dispatch_rms_norm output legacy")?;
+        &mut enc_norm,
+        registry,
+        device.metal_device(),
+        hidden,
+        &head.norm_w,
+        &normed,
+        &norm_params,
+        seq_len,
+        hidden_size,
+    )
+    .context("dispatch_rms_norm output legacy")?;
     enc_norm.commit_labeled("output_head.norm");
 
     let mut enc_lm = device.command_encoder().context("enc lm_head legacy")?;
     apply_linear_projection_f32_into(
-        &mut enc_lm, registry, device, &normed,
-        &head.lm_head_q4, logits_buf, seq_len, hidden_size, vocab_size,
-    ).context("lm_head projection legacy")?;
+        &mut enc_lm,
+        registry,
+        device,
+        &normed,
+        &head.lm_head_q4,
+        logits_buf,
+        seq_len,
+        hidden_size,
+        vocab_size,
+    )
+    .context("lm_head projection legacy")?;
     enc_lm.commit_labeled("output_head.lm_head_q4");
 
     let mut enc_argmax = device.command_encoder().context("enc argmax legacy")?;
     dispatch_argmax_f32(
-        &mut enc_argmax, registry, device.metal_device(),
-        &logits_buf, &out_index, &out_value, &argmax_params, vocab_size,
-    ).context("dispatch_argmax_f32 legacy")?;
-    enc_argmax.commit_and_wait_labeled("output_head.argmax")
+        &mut enc_argmax,
+        registry,
+        device.metal_device(),
+        &logits_buf,
+        &out_index,
+        &out_value,
+        &argmax_params,
+        vocab_size,
+    )
+    .context("dispatch_argmax_f32 legacy")?;
+    enc_argmax
+        .commit_and_wait_labeled("output_head.argmax")
         .context("commit argmax legacy")?;
 
-    let token_id = out_index.as_slice::<u32>()
+    let token_id = out_index
+        .as_slice::<u32>()
         .map_err(|e| anyhow!("out_index as_slice: {e}"))?[0];
     Ok(token_id)
 }
@@ -594,7 +711,8 @@ fn residual_add_gpu(
     anyhow::ensure!(
         n == src.element_count(),
         "residual_add_gpu: length mismatch dst={} src={}",
-        n, src.element_count()
+        n,
+        src.element_count()
     );
     let out = device
         .alloc_buffer(n * 4, DType::F32, vec![n])
@@ -614,7 +732,6 @@ fn residual_add_gpu(
     enc.commit_and_wait().context("commit residual_add")?;
     Ok(out)
 }
-
 
 // ================================================================
 // Qwen35Model::forward_gpu
@@ -654,7 +771,35 @@ impl Qwen35Model {
         positions_flat: &[i32], // [4 * seq_len] axis-major
         kv_cache: &mut HybridKvCache,
     ) -> Result<Vec<f32>> {
-        self.forward_gpu_impl(tokens, positions_flat, kv_cache, None, None)
+        self.forward_gpu_impl(
+            tokens,
+            positions_flat,
+            kv_cache,
+            None,
+            None,
+            OutputHeadMode::All,
+        )
+    }
+
+    /// Forward pass that returns only the final token's logits.
+    ///
+    /// This preserves the generation/coherence surface for prefill sampling
+    /// while avoiding materialization of `[seq_len, vocab]` logits.  Use this
+    /// when callers only need the next-token distribution.
+    pub fn forward_gpu_last_logits(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+    ) -> Result<Vec<f32>> {
+        self.forward_gpu_impl(
+            tokens,
+            positions_flat,
+            kv_cache,
+            None,
+            None,
+            OutputHeadMode::Last,
+        )
     }
 
     /// Forward pass that also returns the final residual-stream hidden buffer
@@ -673,6 +818,7 @@ impl Qwen35Model {
             kv_cache,
             None,
             Some(&mut hidden_out),
+            OutputHeadMode::All,
         )?;
         let hidden = hidden_out
             .ok_or_else(|| anyhow!("forward_gpu_with_hidden: hidden buffer was not captured"))?;
@@ -698,7 +844,14 @@ impl Qwen35Model {
         kv_cache: &mut HybridKvCache,
         out_activations: &mut LayerActivations,
     ) -> Result<Vec<f32>> {
-        self.forward_gpu_impl(tokens, positions_flat, kv_cache, Some(out_activations), None)
+        self.forward_gpu_impl(
+            tokens,
+            positions_flat,
+            kv_cache,
+            Some(out_activations),
+            None,
+            OutputHeadMode::All,
+        )
     }
 
     fn forward_gpu_impl(
@@ -708,6 +861,7 @@ impl Qwen35Model {
         kv_cache: &mut HybridKvCache,
         mut capture: Option<&mut LayerActivations>,
         mut hidden_out: Option<&mut Option<MlxBuffer>>,
+        output_head_mode: OutputHeadMode,
     ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(anyhow!("forward_gpu: tokens must be non-empty"));
@@ -752,8 +906,8 @@ impl Qwen35Model {
                 // W-5b.7 iter 2: lm_head F32 / Q4_0 + output_norm join the
                 // weight pool's residency set via the `_weight` / Q4_0
                 // helpers (which auto-register).
-                let lm_head_f32 = upload_f32_weight(&self.output_weight, &device)
-                    .context("upload lm_head")?;
+                let lm_head_f32 =
+                    upload_f32_weight(&self.output_weight, &device).context("upload lm_head")?;
                 // Pre-cast lm_head F32 → BF16 once at load time.
                 // apply_linear_projection_f32 detects DType::BF16 and skips
                 // the per-token cast (~2ms saved per decode step).
@@ -762,8 +916,7 @@ impl Qwen35Model {
                     let bf16_buf = device
                         .alloc_buffer(n_w * 2, DType::BF16, vec![n_w])
                         .map_err(|e| anyhow!("alloc lm_head_bf16: {e}"))?;
-                    let mut enc = device.command_encoder()
-                        .context("enc lm_head_bf16 cast")?;
+                    let mut enc = device.command_encoder().context("enc lm_head_bf16 cast")?;
                     mlx_native::ops::elementwise::cast(
                         &mut enc,
                         &mut registry,
@@ -788,7 +941,6 @@ impl Qwen35Model {
                 let output_head = OutputHeadGpu {
                     norm_w: upload_f32_weight(&self.output_norm, &device)
                         .context("upload output_norm")?,
-                    lm_head: lm_head_f32,
                     lm_head_bf16,
                     lm_head_q4,
                 };
@@ -816,7 +968,8 @@ impl Qwen35Model {
                 let c = cache.as_ref().unwrap();
                 let pos_buf = {
                     let byte_len = positions_flat.len() * 4;
-                    let mut buf = c.device
+                    let mut buf = c
+                        .device
                         .alloc_buffer(byte_len, DType::I32, vec![positions_flat.len()])
                         .map_err(|e| anyhow!("alloc positions: {e}"))?;
                     buf.as_mut_slice::<i32>()
@@ -840,14 +993,8 @@ impl Qwen35Model {
         let output_head = unsafe { &*output_head_ref };
 
         // ---- Step 1: embedding lookup → hidden ----
-        let mut hidden = embed_tokens_gpu(
-            tokens,
-            &self.token_embd,
-            cfg.vocab_size,
-            h,
-            &device,
-        )
-        .context("embed_tokens_gpu")?;
+        let mut hidden = embed_tokens_gpu(tokens, &self.token_embd, cfg.vocab_size, h, &device)
+            .context("embed_tokens_gpu")?;
 
         if dump_layer_n().is_some() {
             dump_hidden_stats("embed", &hidden, seq_len, h);
@@ -871,15 +1018,15 @@ impl Qwen35Model {
             // residual+norm + FFN + residual2 for the whole layer body,
             // separated by linear-attn vs full-attn slot kind so the
             // pp4096 chunk-pipeline regression can be attributed
-            // (32 of 64 layers in Qwen3.6 27B are linear-attn DeltaNet).
-            let _w5b8_layer_total = super::wave5b8_profile::Section::start(
-                match layer_gpu {
-                    LayerWeightsGpu::LinearAttn { .. } =>
-                        super::wave5b8_profile::SectionKind::LayerLinearTotal,
-                    LayerWeightsGpu::FullAttn { .. } =>
-                        super::wave5b8_profile::SectionKind::LayerFullTotal,
-                },
-            );
+            // (48 of 64 layers in Qwen3.6 27B are linear-attn DeltaNet).
+            let _w5b8_layer_total = super::wave5b8_profile::Section::start(match layer_gpu {
+                LayerWeightsGpu::LinearAttn { .. } => {
+                    super::wave5b8_profile::SectionKind::LayerLinearTotal
+                }
+                LayerWeightsGpu::FullAttn { .. } => {
+                    super::wave5b8_profile::SectionKind::LayerFullTotal
+                }
+            });
 
             // ADR-012 P9b GPU capture path: download residual entering this
             // layer to CPU F32 if a capture target is bound. Cost: ~20 MB
@@ -891,7 +1038,11 @@ impl Qwen35Model {
             }
 
             // --- Attention ---
-            let t_attn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+            let t_attn_start = if decode_profile {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let attn_out = match layer_gpu {
                 LayerWeightsGpu::FullAttn { attn, .. } => {
                     let shape = FullAttnShape::from_config(cfg);
@@ -940,16 +1091,15 @@ impl Qwen35Model {
 
                     // --- Read SSM state from kv_cache (slot indexed by linear-attn rank) ---
                     // Conv state and recurrent state both use GPU ping-pong — no CPU round-trip.
-                    let linear_slot_idx =
-                        match kv_cache.slot_index_for_layer(layer_idx as u32) {
-                            Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
-                            _ => {
-                                tracing::warn!(
-                                    "forward_gpu: no linear-attn slot for layer {layer_idx}"
-                                );
-                                usize::MAX
-                            }
-                        };
+                    let linear_slot_idx = match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                        Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
+                        _ => {
+                            tracing::warn!(
+                                "forward_gpu: no linear-attn slot for layer {layer_idx}"
+                            );
+                            usize::MAX
+                        }
+                    };
 
                     // Ping-pong buffers: GPU reads from `_in`, writes to `_out`.
                     // After the call, caller swaps them (O(1) pointer swap).
@@ -957,27 +1107,38 @@ impl Qwen35Model {
                     let zero_conv_out: MlxBuffer;
                     let zero_rec_buf_in: MlxBuffer;
                     let zero_rec_buf_out: MlxBuffer;
-                    let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref):
-                        (&MlxBuffer, &MlxBuffer, &MlxBuffer, &MlxBuffer) =
-                        if linear_slot_idx != usize::MAX {
-                            let slot = &kv_cache.linear_attn[linear_slot_idx];
-                            (&slot.conv_state, &slot.conv_state_scratch,
-                             &slot.recurrent, &slot.recurrent_scratch)
-                        } else {
-                            // Fallback: allocate throwaway scratch buffers.
-                            let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
-                            let zero_rec_cpu = vec![0.0f32; rec_size];
-                            zero_conv_in = upload_f32(&zero_conv_cpu, &device)
-                                .context("alloc zero conv state_in")?;
-                            zero_conv_out = upload_f32(&zero_conv_cpu, &device)
-                                .context("alloc zero conv state_out")?;
-                            zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
-                                .context("alloc zero recurrent state_in")?;
-                            zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
-                                .context("alloc zero recurrent state_out")?;
-                            (&zero_conv_in, &zero_conv_out,
-                             &zero_rec_buf_in, &zero_rec_buf_out)
-                        };
+                    let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref): (
+                        &MlxBuffer,
+                        &MlxBuffer,
+                        &MlxBuffer,
+                        &MlxBuffer,
+                    ) = if linear_slot_idx != usize::MAX {
+                        let slot = &kv_cache.linear_attn[linear_slot_idx];
+                        (
+                            &slot.conv_state,
+                            &slot.conv_state_scratch,
+                            &slot.recurrent,
+                            &slot.recurrent_scratch,
+                        )
+                    } else {
+                        // Fallback: allocate throwaway scratch buffers.
+                        let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
+                        let zero_rec_cpu = vec![0.0f32; rec_size];
+                        zero_conv_in = upload_f32(&zero_conv_cpu, &device)
+                            .context("alloc zero conv state_in")?;
+                        zero_conv_out = upload_f32(&zero_conv_cpu, &device)
+                            .context("alloc zero conv state_out")?;
+                        zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
+                            .context("alloc zero recurrent state_in")?;
+                        zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
+                            .context("alloc zero recurrent state_out")?;
+                        (
+                            &zero_conv_in,
+                            &zero_conv_out,
+                            &zero_rec_buf_in,
+                            &zero_rec_buf_out,
+                        )
+                    };
                     let out = build_delta_net_layer(
                         &device,
                         &mut registry,
@@ -1032,8 +1193,16 @@ impl Qwen35Model {
             //   attn_post_norm = build_norm(cur);  // norm for FFN input only
             //   cur = build_layer_ffn(attn_post_norm);
             //   cur = ggml_add(cur, ffn_residual); // FFN residual is pre-norm
-            let t_res_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
-            let t_norm_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+            let t_res_start = if decode_profile {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            let t_norm_start = if decode_profile {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             // Wave 5b.22: DN-only outer-choreography total guard. Spans the
             // post-attn-norm + FFN-dispatch + post-FFN-residual block for
             // LinearAttn layers ONLY (48 of 64 in Qwen3.6 27B). Sums to the
@@ -1043,11 +1212,11 @@ impl Qwen35Model {
             // unset (the Section::start_w5b22 RAII guard skips Instant::now
             // on the disabled path).
             let _w5b22_dn_outer_total = match layer_gpu {
-                LayerWeightsGpu::LinearAttn { .. } => Some(
-                    super::wave5b8_profile::Section::start_w5b22(
+                LayerWeightsGpu::LinearAttn { .. } => {
+                    Some(super::wave5b8_profile::Section::start_w5b22(
                         super::wave5b8_profile::SectionKind::DnOuterChoreographyTotal,
-                    ),
-                ),
+                    ))
+                }
                 LayerWeightsGpu::FullAttn { .. } => None,
             };
             // Wave 5b.11: fused residual+norm encoder bucket. Counts both
@@ -1062,11 +1231,11 @@ impl Qwen35Model {
             // 64-layer aggregate can be subtracted into per-slot-kind
             // contributions for the residual attribution.
             let _w5b22_dn_post_attn_norm = match layer_gpu {
-                LayerWeightsGpu::LinearAttn { .. } => Some(
-                    super::wave5b8_profile::Section::start_w5b22(
+                LayerWeightsGpu::LinearAttn { .. } => {
+                    Some(super::wave5b8_profile::Section::start_w5b22(
                         super::wave5b8_profile::SectionKind::DnOuterPostAttnNorm,
-                    ),
-                ),
+                    ))
+                }
                 LayerWeightsGpu::FullAttn { .. } => None,
             };
             let post_norm_w = match layer_gpu {
@@ -1103,16 +1272,17 @@ impl Qwen35Model {
                 .map_err(|e| anyhow!("alloc ffn_residual layer {layer_idx}: {e}"))?;
 
             let (ffn_residual, ffn_input, mut fused_enc) = {
-                let mut enc = device.command_encoder()
+                let mut enc = device
+                    .command_encoder()
                     .with_context(|| format!("enc fused_res_norm layer {layer_idx}"))?;
                 dispatch_fused_residual_norm_f32(
                     &mut enc,
                     &mut registry,
                     device.metal_device(),
-                    &hidden,        // residual
-                    &attn_out,      // input (to add)
-                    post_norm_w,    // weight
-                    &ffn_input_buf, // normed_output = rms_norm(hidden + attn_out)
+                    &hidden,                 // residual
+                    &attn_out,               // input (to add)
+                    post_norm_w,             // weight
+                    &ffn_input_buf,          // normed_output = rms_norm(hidden + attn_out)
                     Some(&ffn_residual_buf), // sum_output = hidden + attn_out
                     seq_len,
                     h,
@@ -1138,8 +1308,12 @@ impl Qwen35Model {
             // ffn_residual = hidden + attn_out. We don't update `hidden` here —
             // it is overwritten unconditionally below after the FFN, and
             // `ffn_residual` is consumed directly by the residual-add path.
-            if let Some(t) = t_res_start { total_residual_us += t.elapsed().as_micros() as u64; }
-            if let Some(t) = t_norm_start { total_norm_us += t.elapsed().as_micros() as u64; }
+            if let Some(t) = t_res_start {
+                total_residual_us += t.elapsed().as_micros() as u64;
+            }
+            if let Some(t) = t_norm_start {
+                total_norm_us += t.elapsed().as_micros() as u64;
+            }
             // Drop fused-norm bucket guard before FFN bucket starts so the
             // two sub-buckets are disjoint.
             drop(_w5b11_post_attn_norm);
@@ -1148,7 +1322,11 @@ impl Qwen35Model {
             drop(_w5b22_dn_post_attn_norm);
 
             // --- FFN (takes normed ffn_input, not the pre-norm residual) ---
-            let t_ffn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+            let t_ffn_start = if decode_profile {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             // Wave 5b.11: FFN dispatch bucket — for Qwen3.6 27B every layer
             // is MoeQ; the wall here includes the full MoE expert routing,
             // dispatch, expert MM, and combine (with residual folded in).
@@ -1159,11 +1337,11 @@ impl Qwen35Model {
             // the linear-attn-layer FFN dispatch portion from the
             // 64-layer-aggregate bucket.
             let _w5b22_dn_ffn_dispatch = match layer_gpu {
-                LayerWeightsGpu::LinearAttn { .. } => Some(
-                    super::wave5b8_profile::Section::start_w5b22(
+                LayerWeightsGpu::LinearAttn { .. } => {
+                    Some(super::wave5b8_profile::Section::start_w5b22(
                         super::wave5b8_profile::SectionKind::DnOuterFfnDispatch,
-                    ),
-                ),
+                    ))
+                }
                 LayerWeightsGpu::FullAttn { .. } => None,
             };
             let ffn_weights_gpu = ffn_weights_gpu_peek;
@@ -1180,9 +1358,15 @@ impl Qwen35Model {
                     // Fold the post-FFN residual add into the dense FFN command buffer,
                     // saving 1 commit_and_wait per dense layer (30 layers × 1 = 30 fewer
                     // GPU syncs per decode token).
-                    build_dense_ffn_layer_gpu(&device, &mut registry, &ffn_input, w, shape,
-                        Some(&ffn_residual))
-                        .with_context(|| format!("dense_ffn layer {layer_idx}"))?
+                    build_dense_ffn_layer_gpu(
+                        &device,
+                        &mut registry,
+                        &ffn_input,
+                        w,
+                        shape,
+                        Some(&ffn_residual),
+                    )
+                    .with_context(|| format!("dense_ffn layer {layer_idx}"))?
                 }
                 FfnWeightsGpu::DenseQ(w) => {
                     // Quantized dense path (production 27B DWQ GGUFs): weights stay as
@@ -1196,12 +1380,18 @@ impl Qwen35Model {
                     // is unconditionally true for DenseQ above, so
                     // `fused_enc` is guaranteed Some here.
                     let mut enc = fused_enc.take().ok_or_else(|| {
-                        anyhow!("DenseQ fused encoder missing at layer {layer_idx} \
-                                 (denseq_fused_eligible invariant violated)")
+                        anyhow!(
+                            "DenseQ fused encoder missing at layer {layer_idx} \
+                                 (denseq_fused_eligible invariant violated)"
+                        )
                     })?;
                     let out = build_dense_ffn_layer_gpu_q_into(
-                        &mut enc, &device, &mut registry,
-                        &ffn_input, w, Some(&ffn_residual),
+                        &mut enc,
+                        &device,
+                        &mut registry,
+                        &ffn_input,
+                        w,
+                        Some(&ffn_residual),
                     )
                     .with_context(|| format!("dense_ffn_q_into fused layer {layer_idx}"))?;
                     if seq_len == 1 {
@@ -1214,9 +1404,10 @@ impl Qwen35Model {
                 }
                 FfnWeightsGpu::Moe(w_gpu) => {
                     debug_assert!(fused_enc.is_none(), "Moe path uses 2-encoder");
-                    let moe = cfg.moe.as_ref().ok_or_else(|| {
-                        anyhow!("MoE FFN missing moe config (layer {layer_idx})")
-                    })?;
+                    let moe = cfg
+                        .moe
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("MoE FFN missing moe config (layer {layer_idx})"))?;
                     let shape = MoeFfnShape {
                         hidden_size: h,
                         num_experts: moe.num_experts,
@@ -1235,10 +1426,14 @@ impl Qwen35Model {
                         .with_context(|| format!("moe_ffn layer {layer_idx}"))?
                 }
                 FfnWeightsGpu::MoeQ(w_gpu) => {
-                    debug_assert!(fused_enc.is_none(), "MoeQ path uses 2-encoder in chunk-prefill");
-                    let moe = cfg.moe.as_ref().ok_or_else(|| {
-                        anyhow!("MoE FFN missing moe config (layer {layer_idx})")
-                    })?;
+                    debug_assert!(
+                        fused_enc.is_none(),
+                        "MoeQ path uses 2-encoder in chunk-prefill"
+                    );
+                    let moe = cfg
+                        .moe
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("MoE FFN missing moe config (layer {layer_idx})"))?;
                     let shape = MoeFfnShape {
                         hidden_size: h,
                         num_experts: moe.num_experts,
@@ -1248,13 +1443,21 @@ impl Qwen35Model {
                     };
                     // Pass ffn_residual so the MoE FFN can fold the post-FFN
                     // residual add into its CPU combine step, saving 1 GPU commit.
-                    build_moe_ffn_layer_gpu_q(&device, &mut registry, &ffn_input, w_gpu, shape,
-                        Some(&ffn_residual))
-                        .with_context(|| format!("moe_ffn_q layer {layer_idx}"))?
+                    build_moe_ffn_layer_gpu_q(
+                        &device,
+                        &mut registry,
+                        &ffn_input,
+                        w_gpu,
+                        shape,
+                        Some(&ffn_residual),
+                    )
+                    .with_context(|| format!("moe_ffn_q layer {layer_idx}"))?
                 }
             };
 
-            if let Some(t) = t_ffn_start { total_ffn_us += t.elapsed().as_micros() as u64; }
+            if let Some(t) = t_ffn_start {
+                total_ffn_us += t.elapsed().as_micros() as u64;
+            }
             // Drop FFN-dispatch bucket guard before post-residual bucket.
             drop(_w5b11_ffn_dispatch);
             // Wave 5b.22: drop DN sister at the same boundary.
@@ -1263,7 +1466,11 @@ impl Qwen35Model {
             // --- Residual after FFN ---
             // For MoeQ / DenseQ / Dense: residual is already folded into the FFN output.
             // For F32-MoE: still need a separate GPU add.
-            let t_res2_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+            let t_res2_start = if decode_profile {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             // Wave 5b.11: post-FFN residual bucket. For MoeQ/DenseQ/Dense
             // this is a no-op match-arm pass (~ns); for F32-MoE this triggers
             // a separate GPU encoder. Bucket lets us confirm F32-MoE is not
@@ -1276,15 +1483,19 @@ impl Qwen35Model {
             // — included for completeness so the residual subtraction has
             // zero unaccounted terms.
             let _w5b22_dn_ffn_post_res = match layer_gpu {
-                LayerWeightsGpu::LinearAttn { .. } => Some(
-                    super::wave5b8_profile::Section::start_w5b22(
+                LayerWeightsGpu::LinearAttn { .. } => {
+                    Some(super::wave5b8_profile::Section::start_w5b22(
                         super::wave5b8_profile::SectionKind::DnOuterPostFfnResidual,
-                    ),
-                ),
+                    ))
+                }
                 LayerWeightsGpu::FullAttn { .. } => None,
             };
             // Keep a clone for the optional layer dump below; only paid when dump is active.
-            let ffn_out_for_dump = if dump_layer_n().is_some() { Some(ffn_out.clone()) } else { None };
+            let ffn_out_for_dump = if dump_layer_n().is_some() {
+                Some(ffn_out.clone())
+            } else {
+                None
+            };
             hidden = match ffn_weights_gpu {
                 FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::Dense(_) | FfnWeightsGpu::DenseQ(_) => {
                     // Residual already folded in build_moe_ffn_layer_gpu_q /
@@ -1295,7 +1506,9 @@ impl Qwen35Model {
                 _ => residual_add_gpu(&ffn_residual, &ffn_out, &device, &mut registry)
                     .with_context(|| format!("residual ffn layer {layer_idx}"))?,
             };
-            if let Some(t) = t_res2_start { total_residual_us += t.elapsed().as_micros() as u64; }
+            if let Some(t) = t_res2_start {
+                total_residual_us += t.elapsed().as_micros() as u64;
+            }
             // Drop post-FFN-residual bucket guard before the layer dump
             // and capture work, neither of which is on the production hot
             // path under the W-5b.11 bench (capture target unbound, dump
@@ -1368,9 +1581,7 @@ impl Qwen35Model {
             // pool's `in_use` list contains only this-layer allocations.  We
             // skip the redundant call at decode for clarity and to leave the
             // W-5b.10/W-5b.14 decode profiling unchanged.
-            if seq_len > 1
-                && std::env::var("HF2Q_DENSE_Q_ARENA_RESET").as_deref() != Ok("0")
-            {
+            if seq_len > 1 && std::env::var("HF2Q_DENSE_Q_ARENA_RESET").as_deref() != Ok("0") {
                 super::decode_pool::reset_for_prefill_chunk();
             }
         }
@@ -1408,20 +1619,40 @@ impl Qwen35Model {
         }
 
         // ---- Step 3: final output head → logits ----
-        let t_output_head = if decode_profile { Some(std::time::Instant::now()) } else { None };
-        let logits = apply_output_head_gpu(
-            &device,
-            &mut registry,
-            &hidden,
-            &output_head,
-            seq_len,
-            h,
-            cfg.vocab_size,
-            eps,
-        )
-        .context("apply_output_head_gpu")?;
+        let t_output_head = if decode_profile {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let logits = match output_head_mode {
+            OutputHeadMode::All => apply_output_head_gpu(
+                &device,
+                &mut registry,
+                &hidden,
+                &output_head,
+                seq_len,
+                h,
+                cfg.vocab_size,
+                eps,
+            )
+            .context("apply_output_head_gpu")?,
+            OutputHeadMode::Last => apply_output_head_gpu_last(
+                &device,
+                &mut registry,
+                &hidden,
+                &output_head,
+                seq_len,
+                h,
+                cfg.vocab_size,
+                eps,
+            )
+            .context("apply_output_head_gpu_last")?,
+        };
         if let Some(t) = t_output_head {
-            eprintln!("[DECODE_PROFILE] output_head={:.1}ms", t.elapsed().as_micros() as f64 / 1000.0);
+            eprintln!(
+                "[DECODE_PROFILE] output_head={:.1}ms",
+                t.elapsed().as_micros() as f64 / 1000.0
+            );
         }
         Ok(logits)
     }
@@ -1439,7 +1670,11 @@ impl Qwen35Model {
         positions_flat: &[i32],
         kv_cache: &mut HybridKvCache,
     ) -> Result<u32> {
-        debug_assert_eq!(tokens.len(), 1, "forward_gpu_greedy: tokens must be length 1");
+        debug_assert_eq!(
+            tokens.len(),
+            1,
+            "forward_gpu_greedy: tokens must be length 1"
+        );
         if tokens.is_empty() {
             return Err(anyhow!("forward_gpu_greedy: tokens must be non-empty"));
         }
@@ -1477,15 +1712,14 @@ impl Qwen35Model {
                 mlx_native::ops::flash_attn_prefill::register(&mut registry);
                 let layer_weights = self.upload_layer_weights_gpu(&device)?;
                 // W-5b.7 iter 2: residency-aware uploads for lm_head and norm.
-                let lm_head_f32 = upload_f32_weight(&self.output_weight, &device)
-                    .context("upload lm_head")?;
+                let lm_head_f32 =
+                    upload_f32_weight(&self.output_weight, &device).context("upload lm_head")?;
                 let n_w = self.output_weight.len();
                 let lm_head_bf16 = {
                     let bf16_buf = device
                         .alloc_buffer(n_w * 2, DType::BF16, vec![n_w])
                         .map_err(|e| anyhow!("alloc lm_head_bf16: {e}"))?;
-                    let mut enc = device.command_encoder()
-                        .context("enc lm_head_bf16 cast")?;
+                    let mut enc = device.command_encoder().context("enc lm_head_bf16 cast")?;
                     mlx_native::ops::elementwise::cast(
                         &mut enc,
                         &mut registry,
@@ -1506,7 +1740,6 @@ impl Qwen35Model {
                 let output_head = OutputHeadGpu {
                     norm_w: upload_f32_weight(&self.output_norm, &device)
                         .context("upload output_norm")?,
-                    lm_head: lm_head_f32,
                     lm_head_bf16,
                     lm_head_q4,
                 };
@@ -1534,10 +1767,11 @@ impl Qwen35Model {
                 let h = cfg.hidden_size as usize;
                 let vocab_size = cfg.vocab_size as u32;
                 let n_layers = self.layers.len();
-                let alloc4 = |dev: &MlxDevice, elem: usize, shape: Vec<usize>| -> Result<MlxBuffer> {
-                    dev.alloc_buffer(elem * 4, DType::F32, shape)
-                        .map_err(|e| anyhow!("alloc decode buf: {e}"))
-                };
+                let alloc4 =
+                    |dev: &MlxDevice, elem: usize, shape: Vec<usize>| -> Result<MlxBuffer> {
+                        dev.alloc_buffer(elem * 4, DType::F32, shape)
+                            .map_err(|e| anyhow!("alloc decode buf: {e}"))
+                    };
                 // Embedding scratch: CPU gather writes here each decode token.
                 let embed_buf = alloc4(&c.device, h, vec![1, h])?;
                 // Per-layer scratch: one (ffn_input, ffn_residual) pair per layer.
@@ -1548,30 +1782,36 @@ impl Qwen35Model {
                     layer_scratch.push((fi, fr));
                 }
                 let norm_out_buf = alloc4(&c.device, h, vec![1, h])?;
-                let argmax_index_buf = c.device
+                let argmax_index_buf = c
+                    .device
                     .alloc_buffer(4, DType::U32, vec![1])
                     .map_err(|e| anyhow!("alloc argmax_index: {e}"))?;
-                let argmax_value_buf = c.device
+                let argmax_value_buf = c
+                    .device
                     .alloc_buffer(4, DType::F32, vec![1])
                     .map_err(|e| anyhow!("alloc argmax_value: {e}"))?;
-                let mut argmax_params_buf = c.device
+                let mut argmax_params_buf = c
+                    .device
                     .alloc_buffer(4, DType::U32, vec![1])
                     .map_err(|e| anyhow!("alloc argmax_params: {e}"))?;
-                argmax_params_buf.as_mut_slice::<u32>()
+                argmax_params_buf
+                    .as_mut_slice::<u32>()
                     .map_err(|e| anyhow!("{e}"))?[0] = vocab_size;
-                let mut norm_params_buf = c.device
+                let mut norm_params_buf = c
+                    .device
                     .alloc_buffer(8, DType::F32, vec![2])
                     .map_err(|e| anyhow!("alloc norm_params: {e}"))?;
                 {
-                    let s = norm_params_buf.as_mut_slice::<f32>()
+                    let s = norm_params_buf
+                        .as_mut_slice::<f32>()
                         .map_err(|e| anyhow!("{e}"))?;
                     s[0] = cfg.rms_norm_eps;
                     s[1] = cfg.hidden_size as f32;
                 }
                 // Logits scratch: pre-allocate once to avoid ~600KB newBuffer per decode token.
-                let logits_buf = alloc4(&c.device, vocab_size as usize, vec![1, vocab_size as usize])?;
+                let logits_buf =
+                    alloc4(&c.device, vocab_size as usize, vec![1, vocab_size as usize])?;
                 c.decode_bufs = Some(DecodeBuffers {
-                    hidden_size: cfg.hidden_size,
                     embed_buf,
                     layer_scratch,
                     norm_out_buf,
@@ -1585,13 +1825,21 @@ impl Qwen35Model {
             Ok(())
         })?;
 
-        let (pos_buf, layer_weights_gpu, device_ref, registry_ref, output_head_ref, decode_bufs_ref) = {
+        let (
+            pos_buf,
+            layer_weights_gpu,
+            device_ref,
+            registry_ref,
+            output_head_ref,
+            decode_bufs_ref,
+        ) = {
             GPU_CACHE.with(|cell| -> Result<_> {
                 let cache = cell.borrow();
                 let c = cache.as_ref().unwrap();
                 let pos_buf = {
                     let byte_len = positions_flat.len() * 4;
-                    let mut buf = c.device
+                    let mut buf = c
+                        .device
                         .alloc_buffer(byte_len, DType::I32, vec![positions_flat.len()])
                         .map_err(|e| anyhow!("alloc positions: {e}"))?;
                     buf.as_mut_slice::<i32>()
@@ -1603,8 +1851,16 @@ impl Qwen35Model {
                 let registry_ptr = &c.registry as *const KernelRegistry as *mut KernelRegistry;
                 let weights_ptr = &c.layer_weights as *const Vec<LayerWeightsGpu>;
                 let head_ptr = &c.output_head as *const OutputHeadGpu;
-                let bufs_ptr = c.decode_bufs.as_ref().unwrap() as *const DecodeBuffers as *mut DecodeBuffers;
-                Ok((pos_buf, weights_ptr, device_ptr, registry_ptr, head_ptr, bufs_ptr))
+                let bufs_ptr =
+                    c.decode_bufs.as_ref().unwrap() as *const DecodeBuffers as *mut DecodeBuffers;
+                Ok((
+                    pos_buf,
+                    weights_ptr,
+                    device_ptr,
+                    registry_ptr,
+                    head_ptr,
+                    bufs_ptr,
+                ))
             })?
         };
         let device = unsafe { &*device_ref };
@@ -1628,8 +1884,7 @@ impl Qwen35Model {
             };
             let cpu_embed = embed_tokens(tokens, &self.token_embd, embed_vocab, h);
             let embed_buf_mut = unsafe { &mut (*decode_bufs_ref).embed_buf };
-            upload_f32_into(&cpu_embed, embed_buf_mut)
-                .context("embed upload_f32_into greedy")?;
+            upload_f32_into(&cpu_embed, embed_buf_mut).context("embed upload_f32_into greedy")?;
             decode_bufs.embed_buf.clone()
         };
 
@@ -1658,8 +1913,16 @@ impl Qwen35Model {
 
         // ---- Per-layer forward pass (identical to forward_gpu) ----
         let decode_profile = std::env::var("HF2Q_DECODE_PROFILE").is_ok();
-        let cb_start = if decode_profile { mlx_native::cmd_buf_count() } else { 0 };
-        let disp_start = if decode_profile { mlx_native::dispatch_count() } else { 0 };
+        let cb_start = if decode_profile {
+            mlx_native::cmd_buf_count()
+        } else {
+            0
+        };
+        let disp_start = if decode_profile {
+            mlx_native::dispatch_count()
+        } else {
+            0
+        };
         let mut total_linear_attn_us = 0u64;
         let mut total_full_attn_us = 0u64;
         let mut total_ffn_us = 0u64;
@@ -1699,11 +1962,14 @@ impl Qwen35Model {
                 }
                 LayerWeightsGpu::LinearAttn { .. } => true,
             };
-            let use_single_cb_layer = !legacy_per_layer_cb
-                && single_cb_eligible_ffn
-                && single_cb_eligible_attn;
+            let use_single_cb_layer =
+                !legacy_per_layer_cb && single_cb_eligible_ffn && single_cb_eligible_attn;
 
-            let t_attn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+            let t_attn_start = if decode_profile {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let t_ffn_start;
 
             let ffn_out = if use_single_cb_layer {
@@ -1716,7 +1982,8 @@ impl Qwen35Model {
                 // layers): 30 + 30 + 40 - 40 = 60 CBs eliminated layer-side,
                 // plus 2 from the output head (S1) = 62 total saved per
                 // token, leaving 41 CBs (40 fused-layer + 1 output head).
-                let mut enc = device.command_encoder()
+                let mut enc = device
+                    .command_encoder()
                     .with_context(|| format!("enc single-cb layer {layer_idx}"))?;
 
                 // ── Attention into shared `enc` ────────────────────────
@@ -1761,38 +2028,50 @@ impl Qwen35Model {
                         let qkv_channels = shape.qkv_channels() as usize;
                         let rec_size = (cfg.linear_key_head_dim
                             * cfg.linear_value_head_dim
-                            * cfg.linear_num_value_heads) as usize;
+                            * cfg.linear_num_value_heads)
+                            as usize;
 
-                        let linear_slot_idx =
-                            match kv_cache.slot_index_for_layer(layer_idx as u32) {
-                                Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
-                                _ => usize::MAX,
-                            };
+                        let linear_slot_idx = match kv_cache.slot_index_for_layer(layer_idx as u32)
+                        {
+                            Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
+                            _ => usize::MAX,
+                        };
 
                         let zero_conv_in: MlxBuffer;
                         let zero_conv_out: MlxBuffer;
                         let zero_rec_buf_in: MlxBuffer;
                         let zero_rec_buf_out: MlxBuffer;
-                        let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref):
-                            (&MlxBuffer, &MlxBuffer, &MlxBuffer, &MlxBuffer) =
-                            if linear_slot_idx != usize::MAX {
-                                let slot = &kv_cache.linear_attn[linear_slot_idx];
-                                (&slot.conv_state, &slot.conv_state_scratch,
-                                 &slot.recurrent, &slot.recurrent_scratch)
-                            } else {
-                                let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
-                                let zero_rec_cpu = vec![0.0f32; rec_size];
-                                zero_conv_in = upload_f32(&zero_conv_cpu, &device)
-                                    .context("alloc zero conv state_in")?;
-                                zero_conv_out = upload_f32(&zero_conv_cpu, &device)
-                                    .context("alloc zero conv state_out")?;
-                                zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
-                                    .context("alloc zero recurrent state_in")?;
-                                zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
-                                    .context("alloc zero recurrent state_out")?;
-                                (&zero_conv_in, &zero_conv_out,
-                                 &zero_rec_buf_in, &zero_rec_buf_out)
-                            };
+                        let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref): (
+                            &MlxBuffer,
+                            &MlxBuffer,
+                            &MlxBuffer,
+                            &MlxBuffer,
+                        ) = if linear_slot_idx != usize::MAX {
+                            let slot = &kv_cache.linear_attn[linear_slot_idx];
+                            (
+                                &slot.conv_state,
+                                &slot.conv_state_scratch,
+                                &slot.recurrent,
+                                &slot.recurrent_scratch,
+                            )
+                        } else {
+                            let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
+                            let zero_rec_cpu = vec![0.0f32; rec_size];
+                            zero_conv_in = upload_f32(&zero_conv_cpu, &device)
+                                .context("alloc zero conv state_in")?;
+                            zero_conv_out = upload_f32(&zero_conv_cpu, &device)
+                                .context("alloc zero conv state_out")?;
+                            zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
+                                .context("alloc zero recurrent state_in")?;
+                            zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
+                                .context("alloc zero recurrent state_out")?;
+                            (
+                                &zero_conv_in,
+                                &zero_conv_out,
+                                &zero_rec_buf_in,
+                                &zero_rec_buf_out,
+                            )
+                        };
                         let out = build_delta_net_layer_decode_into(
                             &mut enc,
                             &device,
@@ -1838,7 +2117,11 @@ impl Qwen35Model {
                 // and the MoeQ/DenseQ encoder open at forward_gpu.rs:1727/:1765.
                 enc.memory_barrier();
 
-                t_ffn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+                t_ffn_start = if decode_profile {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
 
                 // ── Fused residual + post-norm + FFN into shared `enc` ──
                 let out = match ffn_weights_gpu {
@@ -1866,12 +2149,21 @@ impl Qwen35Model {
                             h,
                             eps,
                         )
-                        .with_context(|| format!("dispatch_fused_residual_norm_f32 single-cb MoeQ layer {layer_idx}"))?;
+                        .with_context(|| {
+                            format!(
+                                "dispatch_fused_residual_norm_f32 single-cb MoeQ layer {layer_idx}"
+                            )
+                        })?;
                         // Existing intra-encoder barrier (preserved verbatim
                         // from legacy MoeQ arm at forward_gpu.rs:1743).
                         enc.memory_barrier();
                         let out = build_moe_ffn_layer_gpu_q_into(
-                            &mut enc, &device, &mut registry, ffn_input_buf_ref, w_gpu, shape,
+                            &mut enc,
+                            &device,
+                            &mut registry,
+                            ffn_input_buf_ref,
+                            w_gpu,
+                            shape,
                             Some(ffn_residual_buf_ref),
                         )
                         .with_context(|| format!("moe_ffn_q_into single-cb layer {layer_idx}"))?;
@@ -1897,7 +2189,11 @@ impl Qwen35Model {
                         // from legacy DenseQ arm at forward_gpu.rs:1781).
                         enc.memory_barrier();
                         let out = build_dense_ffn_layer_gpu_q_into(
-                            &mut enc, &device, &mut registry, ffn_input_buf_ref, w,
+                            &mut enc,
+                            &device,
+                            &mut registry,
+                            ffn_input_buf_ref,
+                            w,
                             Some(ffn_residual_buf_ref),
                         )
                         .with_context(|| format!("dense_ffn_q_into single-cb layer {layer_idx}"))?;
@@ -1957,38 +2253,50 @@ impl Qwen35Model {
                         let qkv_channels = shape.qkv_channels() as usize;
                         let rec_size = (cfg.linear_key_head_dim
                             * cfg.linear_value_head_dim
-                            * cfg.linear_num_value_heads) as usize;
+                            * cfg.linear_num_value_heads)
+                            as usize;
 
-                        let linear_slot_idx =
-                            match kv_cache.slot_index_for_layer(layer_idx as u32) {
-                                Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
-                                _ => usize::MAX,
-                            };
+                        let linear_slot_idx = match kv_cache.slot_index_for_layer(layer_idx as u32)
+                        {
+                            Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
+                            _ => usize::MAX,
+                        };
 
                         let zero_conv_in: MlxBuffer;
                         let zero_conv_out: MlxBuffer;
                         let zero_rec_buf_in: MlxBuffer;
                         let zero_rec_buf_out: MlxBuffer;
-                        let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref):
-                            (&MlxBuffer, &MlxBuffer, &MlxBuffer, &MlxBuffer) =
-                            if linear_slot_idx != usize::MAX {
-                                let slot = &kv_cache.linear_attn[linear_slot_idx];
-                                (&slot.conv_state, &slot.conv_state_scratch,
-                                 &slot.recurrent, &slot.recurrent_scratch)
-                            } else {
-                                let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
-                                let zero_rec_cpu = vec![0.0f32; rec_size];
-                                zero_conv_in = upload_f32(&zero_conv_cpu, &device)
-                                    .context("alloc zero conv state_in")?;
-                                zero_conv_out = upload_f32(&zero_conv_cpu, &device)
-                                    .context("alloc zero conv state_out")?;
-                                zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
-                                    .context("alloc zero recurrent state_in")?;
-                                zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
-                                    .context("alloc zero recurrent state_out")?;
-                                (&zero_conv_in, &zero_conv_out,
-                                 &zero_rec_buf_in, &zero_rec_buf_out)
-                            };
+                        let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref): (
+                            &MlxBuffer,
+                            &MlxBuffer,
+                            &MlxBuffer,
+                            &MlxBuffer,
+                        ) = if linear_slot_idx != usize::MAX {
+                            let slot = &kv_cache.linear_attn[linear_slot_idx];
+                            (
+                                &slot.conv_state,
+                                &slot.conv_state_scratch,
+                                &slot.recurrent,
+                                &slot.recurrent_scratch,
+                            )
+                        } else {
+                            let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
+                            let zero_rec_cpu = vec![0.0f32; rec_size];
+                            zero_conv_in = upload_f32(&zero_conv_cpu, &device)
+                                .context("alloc zero conv state_in")?;
+                            zero_conv_out = upload_f32(&zero_conv_cpu, &device)
+                                .context("alloc zero conv state_out")?;
+                            zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
+                                .context("alloc zero recurrent state_in")?;
+                            zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
+                                .context("alloc zero recurrent state_out")?;
+                            (
+                                &zero_conv_in,
+                                &zero_conv_out,
+                                &zero_rec_buf_in,
+                                &zero_rec_buf_out,
+                            )
+                        };
                         let out = build_delta_net_layer(
                             &device,
                             &mut registry,
@@ -2026,7 +2334,11 @@ impl Qwen35Model {
                     }
                 }
 
-                t_ffn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+                t_ffn_start = if decode_profile {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
 
                 match ffn_weights_gpu {
                     FfnWeightsGpu::MoeQ(w_gpu) => {
@@ -2041,8 +2353,9 @@ impl Qwen35Model {
                             moe_intermediate_size: moe.moe_intermediate_size,
                             shared_intermediate_size: moe.shared_expert_intermediate_size,
                         };
-                        let mut enc = device.command_encoder()
-                            .with_context(|| format!("enc fused_res_norm+moeq legacy greedy layer {layer_idx}"))?;
+                        let mut enc = device.command_encoder().with_context(|| {
+                            format!("enc fused_res_norm+moeq legacy greedy layer {layer_idx}")
+                        })?;
                         dispatch_fused_residual_norm_f32(
                             &mut enc,
                             &mut registry,
@@ -2059,21 +2372,31 @@ impl Qwen35Model {
                         .with_context(|| format!("dispatch_fused_residual_norm_f32 fused-MoeQ legacy greedy layer {layer_idx}"))?;
                         enc.memory_barrier();
                         let out = build_moe_ffn_layer_gpu_q_into(
-                            &mut enc, &device, &mut registry, ffn_input_buf_ref, w_gpu, shape,
+                            &mut enc,
+                            &device,
+                            &mut registry,
+                            ffn_input_buf_ref,
+                            w_gpu,
+                            shape,
                             Some(ffn_residual_buf_ref),
                         )
-                        .with_context(|| format!("moe_ffn_q_into fused legacy greedy layer {layer_idx}"))?;
+                        .with_context(|| {
+                            format!("moe_ffn_q_into fused legacy greedy layer {layer_idx}")
+                        })?;
                         if seq_len == 1 {
                             enc.commit_labeled("layer.moe_ffn");
                         } else {
                             enc.commit_and_wait_labeled("layer.moe_ffn")
-                                .with_context(|| format!("commit fused-MoeQ legacy greedy layer {layer_idx}"))?;
+                                .with_context(|| {
+                                    format!("commit fused-MoeQ legacy greedy layer {layer_idx}")
+                                })?;
                         }
                         out
                     }
                     FfnWeightsGpu::DenseQ(w) => {
-                        let mut enc = device.command_encoder()
-                            .with_context(|| format!("enc fused_res_norm+denseq legacy greedy layer {layer_idx}"))?;
+                        let mut enc = device.command_encoder().with_context(|| {
+                            format!("enc fused_res_norm+denseq legacy greedy layer {layer_idx}")
+                        })?;
                         dispatch_fused_residual_norm_f32(
                             &mut enc,
                             &mut registry,
@@ -2090,95 +2413,125 @@ impl Qwen35Model {
                         .with_context(|| format!("dispatch_fused_residual_norm_f32 fused-DenseQ legacy greedy layer {layer_idx}"))?;
                         enc.memory_barrier();
                         let out = build_dense_ffn_layer_gpu_q_into(
-                            &mut enc, &device, &mut registry, ffn_input_buf_ref, w,
+                            &mut enc,
+                            &device,
+                            &mut registry,
+                            ffn_input_buf_ref,
+                            w,
                             Some(ffn_residual_buf_ref),
                         )
-                        .with_context(|| format!("dense_ffn_q_into fused legacy greedy layer {layer_idx}"))?;
+                        .with_context(|| {
+                            format!("dense_ffn_q_into fused legacy greedy layer {layer_idx}")
+                        })?;
                         if seq_len == 1 {
                             enc.commit_labeled("layer.dense_ffn");
                         } else {
                             enc.commit_and_wait_labeled("layer.dense_ffn")
-                                .with_context(|| format!("commit fused-DenseQ legacy greedy layer {layer_idx}"))?;
+                                .with_context(|| {
+                                    format!("commit fused-DenseQ legacy greedy layer {layer_idx}")
+                                })?;
                         }
                         out
                     }
                     _ => {
-                    // Legacy 2-encoder path for Dense (F32) / Moe-unquantized.
-                    // DenseQ + MoeQ are caught by their dedicated fused-CB
-                    // arms above and never reach this fall-through.
-                    // W-5b.16 sunset: the DenseQ legacy sub-arm (the only
-                    // arm that fired under `HF2Q_DENSE_Q_LEGACY=1`) was
-                    // removed alongside the env gate itself.
-                    {
-                        let mut enc = device.command_encoder()
-                            .with_context(|| format!("enc fused_res_norm greedy layer {layer_idx}"))?;
-                        dispatch_fused_residual_norm_f32(
-                            &mut enc,
-                            &mut registry,
-                            device.metal_device(),
-                            &hidden,
-                            &attn_out,
-                            post_norm_w,
-                            ffn_input_buf_ref,
-                            Some(ffn_residual_buf_ref),
-                            seq_len,
-                            h,
-                            eps,
-                        )
-                        .with_context(|| format!("dispatch_fused_residual_norm_f32 greedy layer {layer_idx}"))?;
-                        enc.commit();
-                    }
-                    let ffn_input = ffn_input_buf_ref.clone();
-                    let ffn_residual = ffn_residual_buf_ref.clone();
-                    match ffn_weights_gpu {
-                        FfnWeightsGpu::Dense(w) => {
-                            let m = cfg.intermediate_size.ok_or_else(|| {
+                        // Legacy 2-encoder path for Dense (F32) / Moe-unquantized.
+                        // DenseQ + MoeQ are caught by their dedicated fused-CB
+                        // arms above and never reach this fall-through.
+                        // W-5b.16 sunset: the DenseQ legacy sub-arm (the only
+                        // arm that fired under `HF2Q_DENSE_Q_LEGACY=1`) was
+                        // removed alongside the env gate itself.
+                        {
+                            let mut enc = device.command_encoder().with_context(|| {
+                                format!("enc fused_res_norm greedy layer {layer_idx}")
+                            })?;
+                            dispatch_fused_residual_norm_f32(
+                                &mut enc,
+                                &mut registry,
+                                device.metal_device(),
+                                &hidden,
+                                &attn_out,
+                                post_norm_w,
+                                ffn_input_buf_ref,
+                                Some(ffn_residual_buf_ref),
+                                seq_len,
+                                h,
+                                eps,
+                            )
+                            .with_context(|| {
+                                format!("dispatch_fused_residual_norm_f32 greedy layer {layer_idx}")
+                            })?;
+                            enc.commit();
+                        }
+                        let ffn_input = ffn_input_buf_ref.clone();
+                        let ffn_residual = ffn_residual_buf_ref.clone();
+                        match ffn_weights_gpu {
+                            FfnWeightsGpu::Dense(w) => {
+                                let m = cfg.intermediate_size.ok_or_else(|| {
                                 anyhow!("dense FFN missing intermediate_size greedy (layer {layer_idx})")
                             })?;
-                            let shape = DenseFfnShape {
-                                hidden_size: h,
-                                intermediate_size: m,
-                            };
-                            build_dense_ffn_layer_gpu(&device, &mut registry, &ffn_input, w, shape,
-                                Some(&ffn_residual))
+                                let shape = DenseFfnShape {
+                                    hidden_size: h,
+                                    intermediate_size: m,
+                                };
+                                build_dense_ffn_layer_gpu(
+                                    &device,
+                                    &mut registry,
+                                    &ffn_input,
+                                    w,
+                                    shape,
+                                    Some(&ffn_residual),
+                                )
                                 .with_context(|| format!("dense_ffn greedy layer {layer_idx}"))?
-                        }
-                        FfnWeightsGpu::Moe(w_gpu) => {
-                            let moe = cfg.moe.as_ref().ok_or_else(|| {
-                                anyhow!("MoE FFN missing moe config greedy (layer {layer_idx})")
-                            })?;
-                            let shape = MoeFfnShape {
-                                hidden_size: h,
-                                num_experts: moe.num_experts,
-                                num_experts_per_tok: moe.num_experts_per_tok,
-                                moe_intermediate_size: moe.moe_intermediate_size,
-                                shared_intermediate_size: moe.shared_expert_intermediate_size,
-                            };
-                            let w_cpu = match &layer_cpu.ffn() {
+                            }
+                            FfnWeightsGpu::Moe(w_gpu) => {
+                                let moe = cfg.moe.as_ref().ok_or_else(|| {
+                                    anyhow!("MoE FFN missing moe config greedy (layer {layer_idx})")
+                                })?;
+                                let shape = MoeFfnShape {
+                                    hidden_size: h,
+                                    num_experts: moe.num_experts,
+                                    num_experts_per_tok: moe.num_experts_per_tok,
+                                    moe_intermediate_size: moe.moe_intermediate_size,
+                                    shared_intermediate_size: moe.shared_expert_intermediate_size,
+                                };
+                                let w_cpu = match &layer_cpu.ffn() {
                                 Qwen35FfnWeights::Moe(w) => w,
                                 _ => return Err(anyhow!(
                                     "layer {layer_idx} config says F32-MoE but weights are different"
                                 )),
                             };
-                            build_moe_ffn_layer_gpu(&device, &mut registry, &ffn_input, w_gpu, w_cpu, shape)
+                                build_moe_ffn_layer_gpu(
+                                    &device,
+                                    &mut registry,
+                                    &ffn_input,
+                                    w_gpu,
+                                    w_cpu,
+                                    shape,
+                                )
                                 .with_context(|| format!("moe_ffn greedy layer {layer_idx}"))?
+                            }
+                            FfnWeightsGpu::DenseQ(_) => {
+                                unreachable!("DenseQ handled in fused path above (W-5b.16 sunset)")
+                            }
+                            FfnWeightsGpu::MoeQ(_) => {
+                                unreachable!("MoeQ handled in fused path above")
+                            }
                         }
-                        FfnWeightsGpu::DenseQ(_) => unreachable!(
-                            "DenseQ handled in fused path above (W-5b.16 sunset)"
-                        ),
-                        FfnWeightsGpu::MoeQ(_) => unreachable!("MoeQ handled in fused path above"),
                     }
-                }
                 }
             };
 
-            if let Some(t) = t_ffn_start { total_ffn_us += t.elapsed().as_micros() as u64; }
+            if let Some(t) = t_ffn_start {
+                total_ffn_us += t.elapsed().as_micros() as u64;
+            }
 
             // --- Residual after FFN ---
             // DenseQ / Dense / MoeQ: residual already folded in (add_residual=Some).
             // F32-MoE: separate GPU add still required.
             hidden = match ffn_weights_gpu {
-                FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::Dense(_) | FfnWeightsGpu::DenseQ(_) => ffn_out,
+                FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::Dense(_) | FfnWeightsGpu::DenseQ(_) => {
+                    ffn_out
+                }
                 _ => residual_add_gpu(ffn_residual_buf_ref, &ffn_out, &device, &mut registry)
                     .with_context(|| format!("residual ffn greedy layer {layer_idx}"))?,
             };
@@ -2206,7 +2559,11 @@ impl Qwen35Model {
         // its own CB).  When unset (default), the single-CB output head
         // collapses these into ONE encoder with 2 intra-CB barriers and
         // a single terminal commit_and_wait_labeled.
-        let t_output_head = if decode_profile { Some(std::time::Instant::now()) } else { None };
+        let t_output_head = if decode_profile {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let token_id = if legacy_per_layer_cb {
             apply_output_head_gpu_greedy_legacy(
                 &device,
@@ -2233,7 +2590,10 @@ impl Qwen35Model {
             .context("apply_output_head_gpu_greedy")?
         };
         if let Some(t) = t_output_head {
-            eprintln!("[GREEDY_PROFILE] output_head={:.1}ms", t.elapsed().as_micros() as f64 / 1000.0);
+            eprintln!(
+                "[GREEDY_PROFILE] output_head={:.1}ms",
+                t.elapsed().as_micros() as f64 / 1000.0
+            );
         }
 
         // MLX_PROFILE_CB=1 — dump per-cb GPU time table after each token.
@@ -2243,10 +2603,22 @@ impl Qwen35Model {
             let table = mlx_native::kernel_profile::dump();
             if !table.is_empty() {
                 let total_ns: u64 = table.iter().map(|(_, e)| e.total_ns).sum();
-                eprintln!("[CB_PROFILE] total={:.2}ms across {} labels:", total_ns as f64 / 1e6, table.len());
+                eprintln!(
+                    "[CB_PROFILE] total={:.2}ms across {} labels:",
+                    total_ns as f64 / 1e6,
+                    table.len()
+                );
                 for (label, e) in table.iter().take(20) {
-                    let avg_us = if e.count > 0 { e.total_ns as f64 / e.count as f64 / 1000.0 } else { 0.0 };
-                    let pct = if total_ns > 0 { 100.0 * e.total_ns as f64 / total_ns as f64 } else { 0.0 };
+                    let avg_us = if e.count > 0 {
+                        e.total_ns as f64 / e.count as f64 / 1000.0
+                    } else {
+                        0.0
+                    };
+                    let pct = if total_ns > 0 {
+                        100.0 * e.total_ns as f64 / total_ns as f64
+                    } else {
+                        0.0
+                    };
                     eprintln!(
                         "  {:>5.1}%  {:>8.2}ms  count={:<4}  avg={:>6.1}µs  min={:>5.1}µs  max={:>5.1}µs  {}",
                         pct,
@@ -2291,9 +2663,10 @@ impl Qwen35Model {
                 Qwen35FfnWeights::MoeQ(w) => {
                     // Expert buffers already on Metal device; only router and
                     // shared-expert F32 vecs need uploading.
-                    let moe_cfg = cfg.moe.as_ref().ok_or_else(|| {
-                        anyhow!("layer {i}: MoeQ but no moe config")
-                    })?;
+                    let moe_cfg = cfg
+                        .moe
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("layer {i}: MoeQ but no moe config"))?;
                     FfnWeightsGpu::MoeQ(
                         MoeFfnWeightsGpuQ::from_quantized(
                             // Clone the Metal buffer handle (ARC retain — no data copy).
@@ -2311,7 +2684,8 @@ impl Qwen35Model {
                             &w.shared_up,
                             &w.shared_down,
                             device,
-                        ).with_context(|| format!("upload moe_ffn_q layer {i}"))?,
+                        )
+                        .with_context(|| format!("upload moe_ffn_q layer {i}"))?,
                     )
                 }
             };
@@ -2340,11 +2714,11 @@ impl Qwen35Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::models::qwen35::forward_cpu::text_positions;
+    use crate::inference::models::qwen35::kv_cache::HybridKvCache;
     use crate::inference::models::qwen35::{
         default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35Variant,
     };
-    use crate::inference::models::qwen35::forward_cpu::text_positions;
-    use crate::inference::models::qwen35::kv_cache::HybridKvCache;
     use mlx_native::MlxDevice;
 
     fn mk_rand(seed: &mut u32, n: usize, scale: f32) -> Vec<f32> {
@@ -2527,7 +2901,9 @@ mod tests {
         let device = MlxDevice::new().expect("device");
         let mut kv = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv");
 
-        let logits = m.forward_gpu(&tokens, &positions, &mut kv).expect("forward_gpu");
+        let logits = m
+            .forward_gpu(&tokens, &positions, &mut kv)
+            .expect("forward_gpu");
         assert_eq!(
             logits.len(),
             tokens.len() * cfg.vocab_size as usize,
@@ -2559,7 +2935,9 @@ mod tests {
         let l2 = m.forward_gpu(&tokens, &positions, &mut kv2).expect("run2");
 
         assert_eq!(l1.len(), l2.len());
-        let max_diff = l1.iter().zip(l2.iter())
+        let max_diff = l1
+            .iter()
+            .zip(l2.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         // Metal GPU BF16 matmul may permute accumulation order across
@@ -2649,9 +3027,7 @@ mod tests {
             }
             if err >= 5e-2 {
                 if n_fail < 5 {
-                    eprintln!(
-                        "  parity mismatch[{i}]: gpu={g:.8}, cpu={c:.8}, err={err:.2e}"
-                    );
+                    eprintln!("  parity mismatch[{i}]: gpu={g:.8}, cpu={c:.8}, err={err:.2e}");
                 }
                 n_fail += 1;
             }
@@ -2667,8 +3043,7 @@ mod tests {
         eprintln!(
             "forward_gpu_matches_cpu_ref: max_abs_err={max_err:.2e} (< 1e-2), \
              seq={seq}, layers={}, vocab={}",
-            cfg.num_hidden_layers,
-            cfg.vocab_size
+            cfg.num_hidden_layers, cfg.vocab_size
         );
     }
 }

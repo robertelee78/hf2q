@@ -13,9 +13,9 @@ pub mod forward_prefill;
 pub mod forward_prefill_batched;
 pub mod gpu;
 pub mod header;
-pub mod parity_quality;
 #[allow(dead_code)]
 pub mod multi_model;
+pub mod parity_quality;
 #[allow(dead_code)]
 pub mod provenance;
 #[allow(dead_code)]
@@ -54,8 +54,8 @@ fn build_warmed_embedding_registry(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("registry warmup: EmbeddingModel has no arch"))?;
 
-    let device = MlxDevice::new()
-        .map_err(|e| anyhow::anyhow!("registry warmup: MlxDevice::new: {e}"))?;
+    let device =
+        MlxDevice::new().map_err(|e| anyhow::anyhow!("registry warmup: MlxDevice::new: {e}"))?;
     let mut registry = KernelRegistry::new();
 
     // Synthetic warmup input: a single padded-to-32 sequence of [PAD]
@@ -70,10 +70,8 @@ fn build_warmed_embedding_registry(
         .map_err(|e| anyhow::anyhow!("registry warmup: alloc ids: {e}"))?;
     // SAFETY: just-allocated u32 buffer; exclusive access.
     unsafe {
-        let s: &mut [u32] = std::slice::from_raw_parts_mut(
-            ids_buf.contents_ptr() as *mut u32,
-            seq_len as usize,
-        );
+        let s: &mut [u32] =
+            std::slice::from_raw_parts_mut(ids_buf.contents_ptr() as *mut u32, seq_len as usize);
         s.copy_from_slice(&ids);
     }
 
@@ -186,9 +184,7 @@ fn find_config(model_path: &Path, explicit: Option<&Path>) -> Result<std::path::
             }
         }
     }
-    anyhow::bail!(
-        "Cannot find config.json. Use --config to specify the path explicitly."
-    )
+    anyhow::bail!("Cannot find config.json. Use --config to specify the path explicitly.")
 }
 
 /// Resolve the prompt text from either `--prompt` or `--prompt-file`.
@@ -199,7 +195,11 @@ fn resolve_prompt(args: &cli::GenerateArgs) -> Result<String> {
             let content = std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read prompt file: {}", path.display()))?;
             let trimmed = content.trim().to_string();
-            anyhow::ensure!(!trimmed.is_empty(), "Prompt file is empty: {}", path.display());
+            anyhow::ensure!(
+                !trimmed.is_empty(),
+                "Prompt file is empty: {}",
+                path.display()
+            );
             Ok(trimmed)
         }
         (None, None) => anyhow::bail!("Either --prompt or --prompt-file must be specified"),
@@ -243,7 +243,10 @@ fn render_chat_template(
 
     // Priority 2: CLI --chat-template-file
     if let Some(path) = args.chat_template_file.as_deref() {
-        tracing::info!("Chat template: loading from --chat-template-file {}", path.display());
+        tracing::info!(
+            "Chat template: loading from --chat-template-file {}",
+            path.display()
+        );
         let tmpl = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read --chat-template-file {}", path.display()))?;
         return render_jinja_template(&tmpl, user_prompt);
@@ -300,22 +303,18 @@ fn render_jinja_template(template_str: &str, user_prompt: &str) -> Result<String
         let s = value.as_str().unwrap_or("");
         match method {
             "startswith" => {
-                let prefix = args.first()
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let prefix = args.first().and_then(|v| v.as_str()).unwrap_or("");
                 Ok(minijinja::Value::from(s.starts_with(prefix)))
             }
             "endswith" => {
-                let suffix = args.first()
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let suffix = args.first().and_then(|v| v.as_str()).unwrap_or("");
                 Ok(minijinja::Value::from(s.ends_with(suffix)))
             }
-            other => Err(minijinja::Error::from(
-                minijinja::ErrorKind::UnknownMethod,
-            ).with_source(std::io::Error::other(format!(
-                "string has no method named {other}"
-            ))))
+            other => Err(
+                minijinja::Error::from(minijinja::ErrorKind::UnknownMethod).with_source(
+                    std::io::Error::other(format!("string has no method named {other}")),
+                ),
+            ),
         }
     });
 
@@ -345,16 +344,18 @@ fn render_jinja_template(template_str: &str, user_prompt: &str) -> Result<String
 /// the Gemma4 path, so the two model families share the same CLI surface.
 pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     let model_path = &args.model;
-    anyhow::ensure!(model_path.exists(), "Model not found: {}", model_path.display());
+    anyhow::ensure!(
+        model_path.exists(),
+        "Model not found: {}",
+        model_path.display()
+    );
 
     // --- Architecture detection (fast: metadata-only GGUF open) ---
     {
         let gguf_peek = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open (arch peek): {e}"))?;
         if let Some(arch) = gguf_peek.metadata_string("general.architecture") {
-            use crate::inference::models::qwen35::{
-                is_qwen36_gguf, ARCH_QWEN35, ARCH_QWEN35MOE,
-            };
+            use crate::inference::models::qwen35::{is_qwen36_gguf, ARCH_QWEN35, ARCH_QWEN35MOE};
             if arch == ARCH_QWEN35 || arch == ARCH_QWEN35MOE {
                 // Wave 5a (ADR-005 Phase 4 ACs 5468/5470 partial): the
                 // Qwen3.5 forward path is autoregressive-only (per-token
@@ -388,12 +389,15 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     tracing::info!("Config:    {}", config_path.display());
 
     // Parse model config
-    let cfg = Gemma4Config::from_config_json(&config_path)
-        .context("Failed to parse config.json")?;
+    let cfg =
+        Gemma4Config::from_config_json(&config_path).context("Failed to parse config.json")?;
     tracing::info!(
         "Gemma4 A4B: {} layers, {} heads, hidden={}, {} experts (top-{})",
-        cfg.num_hidden_layers, cfg.num_attention_heads, cfg.hidden_size,
-        cfg.num_experts, cfg.top_k_experts,
+        cfg.num_hidden_layers,
+        cfg.num_attention_heads,
+        cfg.hidden_size,
+        cfg.num_experts,
+        cfg.top_k_experts,
     );
 
     // Initialize mlx-native GPU context. Timing starts here; ends once
@@ -401,8 +405,8 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // line 2 ("loaded in Xs").
     let load_start = std::time::Instant::now();
     tracing::info!("Initializing mlx-native GPU context");
-    let mut ctx = gpu::GpuContext::new()
-        .map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
+    let mut ctx =
+        gpu::GpuContext::new().map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
     let backend_chip = ctx.gpu_name().to_string();
     tracing::info!("mlx-native backend: {}", backend_chip);
 
@@ -410,8 +414,11 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     tracing::info!("Loading GGUF model");
     let gguf = mlx_native::gguf::GgufFile::open(model_path)
         .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
-    tracing::debug!("GGUF loaded: {} tensors, {} metadata keys",
-        gguf.tensor_count(), gguf.metadata_count());
+    tracing::debug!(
+        "GGUF loaded: {} tensors, {} metadata keys",
+        gguf.tensor_count(),
+        gguf.metadata_count()
+    );
 
     // Extract human-readable model name from GGUF metadata, with fallback
     // to the file stem. Consumed by the header printer in Step 5.
@@ -424,7 +431,10 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "unknown".to_string())
         });
-    tracing::debug!("Model name (GGUF general.name or file stem): {}", model_name);
+    tracing::debug!(
+        "Model name (GGUF general.name or file stem): {}",
+        model_name
+    );
 
     tracing::info!("Loading model weights from GGUF into mlx-native buffers");
     let stderr_is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
@@ -433,19 +443,22 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // (verbosity >= 1) — the tracing debug/info stream already gives
     // per-layer visibility, and mixing \r overwrites with log lines is
     // garbled. Equivalent to "show progress only at default verbosity".
-    let verbosity = if tracing::enabled!(tracing::Level::INFO) { 1 } else { 0 };
-    let mut load_progress = header::LoadProgress::new(
-        stderr_is_tty,
-        verbosity,
-        cfg.num_hidden_layers,
-    );
-    let mut mlx_w = forward_mlx::MlxModelWeights::load_from_gguf(
-        &gguf, &cfg, &mut ctx, &mut load_progress,
-    )?;
+    let verbosity = if tracing::enabled!(tracing::Level::INFO) {
+        1
+    } else {
+        0
+    };
+    let mut load_progress =
+        header::LoadProgress::new(stderr_is_tty, verbosity, cfg.num_hidden_layers);
+    let mut mlx_w =
+        forward_mlx::MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut ctx, &mut load_progress)?;
     let n_layers = mlx_w.layers.len();
     let load_elapsed = load_start.elapsed();
-    tracing::info!("mlx-native weights loaded ({} layers) in {:.1}s",
-        n_layers, load_elapsed.as_secs_f64());
+    tracing::info!(
+        "mlx-native weights loaded ({} layers) in {:.1}s",
+        n_layers,
+        load_elapsed.as_secs_f64()
+    );
 
     // Default-mode header lines 1 and 2 — product output on stdout,
     // dimmed on TTY. Line 3 (prefill stats) renders after prefill completes.
@@ -488,15 +501,18 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         return Ok(());
     }
 
-    let encoding = tokenizer.encode(prompt_text.as_str(), false)
+    let encoding = tokenizer
+        .encode(prompt_text.as_str(), false)
         .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
     let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
     tracing::info!("Prompt: {} tokens", prompt_tokens.len());
     if INVESTIGATION_ENV.dump_prompt_tokens {
-        eprintln!("HF2Q_DUMP_PROMPT_TOKENS: first10={:?} last10={:?} total={}",
+        eprintln!(
+            "HF2Q_DUMP_PROMPT_TOKENS: first10={:?} last10={:?} total={}",
             &prompt_tokens[..prompt_tokens.len().min(10)],
             &prompt_tokens[prompt_tokens.len().saturating_sub(10)..],
-            prompt_tokens.len());
+            prompt_tokens.len()
+        );
     }
 
     let params = sampler_pure::SamplingParams {
@@ -543,9 +559,14 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     };
     header::print_header_prefill(
         &mut stdout,
-        &header::HeaderInfoPrefill { prefill_n, prefill_ms, prefill_tok_s },
+        &header::HeaderInfoPrefill {
+            prefill_n,
+            prefill_ms,
+            prefill_tok_s,
+        },
         stdout_is_tty,
-    ).context("print header prefill")?;
+    )
+    .context("print header prefill")?;
 
     // Decode
     let mut all_tokens = prompt_tokens.to_vec();
@@ -569,8 +590,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         let pos = all_tokens.len() - 1;
 
         if kernel_profile_mode {
-            let (tok, kp) = mlx_w.forward_decode_kernel_profile(
-                next_token, pos, &mut ctx)?;
+            let (tok, kp) = mlx_w.forward_decode_kernel_profile(next_token, pos, &mut ctx)?;
             next_token = tok;
             if generated > kernel_profile_warmup {
                 kernel_profiles.push(kp);
@@ -598,10 +618,16 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     }
     let decode_elapsed = decode_start.elapsed();
     let tok_per_sec = generated as f64 / decode_elapsed.as_secs_f64();
-    let (td, tr) = if stderr_is_tty { ("\x1b[2m", "\x1b[0m") } else { ("", "") };
+    let (td, tr) = if stderr_is_tty {
+        ("\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
     eprintln!(
         "\n\n{td}--- mlx-native: {} tokens in {:.2}s ({:.1} tok/s) ---{tr}",
-        generated, decode_elapsed.as_secs_f64(), tok_per_sec,
+        generated,
+        decode_elapsed.as_secs_f64(),
+        tok_per_sec,
     );
 
     // Print profiling summary if enabled
@@ -637,13 +663,20 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         let syncs = mlx_native::sync_count();
         let prompt_n = prompt_tokens.len() as u64;
         let decode_n = generated as u64;
-        let dispatches_per_prompt_tok = if prompt_n > 0 { dispatches as f64 / prompt_n as f64 } else { 0.0 };
-        let syncs_per_decode_tok = if decode_n > 0 { syncs as f64 / decode_n as f64 } else { 0.0 };
+        let dispatches_per_prompt_tok = if prompt_n > 0 {
+            dispatches as f64 / prompt_n as f64
+        } else {
+            0.0
+        };
+        let syncs_per_decode_tok = if decode_n > 0 {
+            syncs as f64 / decode_n as f64
+        } else {
+            0.0
+        };
         eprintln!(
             "[MLX_COUNTERS] dispatches={} syncs={} prompt_tokens={} decode_tokens={} \
              dispatches_per_prompt_tok={:.2} syncs_per_decode_tok={:.2}",
-            dispatches, syncs, prompt_n, decode_n,
-            dispatches_per_prompt_tok, syncs_per_decode_tok,
+            dispatches, syncs, prompt_n, decode_n, dispatches_per_prompt_tok, syncs_per_decode_tok,
         );
     }
 
@@ -653,6 +686,274 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
 // ================================================================
 // Qwen3.5 generate path (ADR-013 P13.1)
 // ================================================================
+
+const QWEN35_PREFILL_SWEEP_TEXT: &str =
+    "The benchmark prompt describes a careful engineering investigation. \
+     It repeats neutral facts about measuring model speed, preserving token \
+     probabilities, checking coherence, and comparing current code against \
+     peer implementations. ";
+
+fn qwen35_sweep_token_count(tokenizer: &tokenizers::Tokenizer, text: &str) -> Result<usize> {
+    let encoding = tokenizer
+        .encode(text, false)
+        .map_err(|e| anyhow::anyhow!("qwen35 prefill sweep tokenization failed: {e}"))?;
+    Ok(encoding.get_ids().len())
+}
+
+fn qwen35_sweep_prompt(
+    tokenizer: &tokenizers::Tokenizer,
+    target_tokens: usize,
+) -> Result<(String, Vec<u32>)> {
+    let repeated = QWEN35_PREFILL_SWEEP_TEXT.repeat((target_tokens / 20) + 500);
+    let ids = tokenizer
+        .encode(repeated.as_str(), false)
+        .map_err(|e| anyhow::anyhow!("qwen35 prefill sweep base tokenization failed: {e}"))?
+        .get_ids()
+        .to_vec();
+    anyhow::ensure!(
+        ids.len() >= target_tokens,
+        "qwen35 prefill sweep base prompt produced only {} tokens for target {}",
+        ids.len(),
+        target_tokens,
+    );
+
+    let mut best_text = tokenizer
+        .decode(&ids[..target_tokens], false)
+        .map_err(|e| anyhow::anyhow!("qwen35 prefill sweep decode failed: {e}"))?;
+    let mut best_n = qwen35_sweep_token_count(tokenizer, &best_text)?;
+    if best_n == target_tokens {
+        let enc = tokenizer
+            .encode(best_text.as_str(), false)
+            .map_err(|e| anyhow::anyhow!("qwen35 prefill sweep final tokenization failed: {e}"))?;
+        return Ok((best_text, enc.get_ids().to_vec()));
+    }
+
+    let lo = target_tokens.saturating_sub(256).max(1);
+    let hi = (target_tokens + 256).min(ids.len());
+    for n_ids in lo..=hi {
+        let text = tokenizer
+            .decode(&ids[..n_ids], false)
+            .map_err(|e| anyhow::anyhow!("qwen35 prefill sweep decode failed: {e}"))?;
+        let n = qwen35_sweep_token_count(tokenizer, &text)?;
+        if n == target_tokens {
+            let enc = tokenizer.encode(text.as_str(), false).map_err(|e| {
+                anyhow::anyhow!("qwen35 prefill sweep final tokenization failed: {e}")
+            })?;
+            return Ok((text, enc.get_ids().to_vec()));
+        }
+        if n.abs_diff(target_tokens) < best_n.abs_diff(target_tokens) {
+            best_text = text;
+            best_n = n;
+        }
+    }
+
+    let enc = tokenizer
+        .encode(best_text.as_str(), false)
+        .map_err(|e| anyhow::anyhow!("qwen35 prefill sweep final tokenization failed: {e}"))?;
+    Ok((best_text, enc.get_ids().to_vec()))
+}
+
+fn qwen35_positions(seq_len: usize) -> Vec<i32> {
+    let mut flat = vec![0i32; 4 * seq_len];
+    for axis in 0..4 {
+        for t in 0..seq_len {
+            flat[axis * seq_len + t] = t as i32;
+        }
+    }
+    flat
+}
+
+fn maybe_run_qwen35_prefill_sweep(
+    model: &crate::inference::models::qwen35::model::Qwen35Model,
+    tokenizer: &tokenizers::Tokenizer,
+) -> Result<bool> {
+    let Ok(lengths_raw) = std::env::var("HF2Q_QWEN35_PREFILL_SWEEP") else {
+        return Ok(false);
+    };
+    let lengths: Vec<usize> = lengths_raw
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            s.trim().parse::<usize>().with_context(|| {
+                format!("HF2Q_QWEN35_PREFILL_SWEEP contains non-integer length {s:?}")
+            })
+        })
+        .collect::<Result<_>>()?;
+    anyhow::ensure!(
+        !lengths.is_empty(),
+        "HF2Q_QWEN35_PREFILL_SWEEP must contain at least one length"
+    );
+    let trials = std::env::var("HF2Q_QWEN35_PREFILL_SWEEP_TRIALS")
+        .ok()
+        .map(|s| {
+            s.parse::<usize>()
+                .context("parse HF2Q_QWEN35_PREFILL_SWEEP_TRIALS")
+        })
+        .transpose()?
+        .unwrap_or(3)
+        .max(1);
+    let warmups = std::env::var("HF2Q_QWEN35_PREFILL_SWEEP_WARMUPS")
+        .ok()
+        .map(|s| {
+            s.parse::<usize>()
+                .context("parse HF2Q_QWEN35_PREFILL_SWEEP_WARMUPS")
+        })
+        .transpose()?
+        .unwrap_or(1);
+
+    use crate::inference::models::qwen35::io_heads::greedy_argmax_last_token;
+    use crate::inference::models::qwen35::kv_cache::HybridKvCache;
+    use mlx_native::MlxDevice;
+
+    fn top_n_indices(values: &[f32], n: usize) -> Vec<usize> {
+        let mut indexed: Vec<(usize, f32)> = values.iter().copied().enumerate().collect();
+        indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        indexed.into_iter().take(n).map(|(idx, _)| idx).collect()
+    }
+
+    fn logit_row_metrics(a: &[f32], b: &[f32]) -> (f32, f64, usize) {
+        let mut max_abs = 0.0f32;
+        let mut dot = 0.0f64;
+        let mut a2 = 0.0f64;
+        let mut b2 = 0.0f64;
+        for (&av, &bv) in a.iter().zip(b) {
+            max_abs = max_abs.max((av - bv).abs());
+            let af = av as f64;
+            let bf = bv as f64;
+            dot += af * bf;
+            a2 += af * af;
+            b2 += bf * bf;
+        }
+        let cosine = if a2 > 0.0 && b2 > 0.0 {
+            dot / (a2.sqrt() * b2.sqrt())
+        } else {
+            f64::NAN
+        };
+        let top_a = top_n_indices(a, 10);
+        let top_b = top_n_indices(b, 10);
+        let overlap = top_a.iter().filter(|idx| top_b.contains(idx)).count();
+        (max_abs, cosine, overlap)
+    }
+
+    let device = MlxDevice::new()
+        .map_err(|e| anyhow::anyhow!("qwen35 prefill sweep MlxDevice::new: {e}"))?;
+    println!(
+        "{{\"event\":\"qwen35_prefill_sweep_start\",\"lengths\":{:?},\"warmups\":{},\"trials\":{}}}",
+        lengths, warmups, trials
+    );
+
+    for target in lengths {
+        let (_prompt, prompt_tokens) = qwen35_sweep_prompt(tokenizer, target)?;
+        let prompt_len = prompt_tokens.len();
+        let positions = qwen35_positions(prompt_len);
+        let max_seq = (prompt_len + 65)
+            .max(128)
+            .min(model.cfg.max_position_embeddings as usize);
+
+        for iteration in 0..(warmups + trials) {
+            let phase = if iteration < warmups {
+                "warmup"
+            } else {
+                "measure"
+            };
+            let trial = if phase == "warmup" {
+                iteration
+            } else {
+                iteration - warmups
+            };
+            let mut kv_cache = HybridKvCache::new(&model.cfg, &device, max_seq as u32, 1)
+                .context("qwen35 prefill sweep HybridKvCache::new")?;
+            let t0 = std::time::Instant::now();
+            let full_logits =
+                std::env::var("HF2Q_QWEN35_PREFILL_SWEEP_FULL_LOGITS").as_deref() == Ok("1");
+            let compare_full_last =
+                std::env::var("HF2Q_QWEN35_PREFILL_SWEEP_COMPARE_FULL_LAST").as_deref() == Ok("1");
+            let logits = if compare_full_last {
+                let mut full_kv = HybridKvCache::new(&model.cfg, &device, max_seq as u32, 1)
+                    .context("qwen35 prefill sweep compare full HybridKvCache::new")?;
+                let full = model
+                    .forward_gpu(&prompt_tokens, &positions, &mut full_kv)
+                    .context("qwen35 prefill sweep compare forward_gpu")?;
+                let mut last_kv = HybridKvCache::new(&model.cfg, &device, max_seq as u32, 1)
+                    .context("qwen35 prefill sweep compare last HybridKvCache::new")?;
+                let last = model
+                    .forward_gpu_last_logits(&prompt_tokens, &positions, &mut last_kv)
+                    .context("qwen35 prefill sweep compare forward_gpu_last_logits")?;
+                let vocab = model.cfg.vocab_size as usize;
+                anyhow::ensure!(
+                    full.len() == prompt_len * vocab,
+                    "qwen35 prefill sweep compare full logits.len()={} != expected {}",
+                    full.len(),
+                    prompt_len * vocab,
+                );
+                anyhow::ensure!(
+                    last.len() == vocab,
+                    "qwen35 prefill sweep compare last logits.len()={} != expected {}",
+                    last.len(),
+                    vocab,
+                );
+                let full_last = &full[full.len() - vocab..];
+                let full_token = greedy_argmax_last_token(full_last, model.cfg.vocab_size);
+                let last_token = greedy_argmax_last_token(&last, model.cfg.vocab_size);
+                let (max_abs, cosine, top10_overlap) = logit_row_metrics(full_last, &last);
+                println!(
+                    "{{\"event\":\"qwen35_prefill_sweep_compare\",\"target_tokens\":{},\"actual_tokens\":{},\"phase\":\"{}\",\"iteration\":{},\"trial\":{},\"full_token\":{},\"last_token\":{},\"max_abs\":{:.9},\"cosine\":{:.12},\"top10_overlap\":{}}}",
+                    target,
+                    prompt_len,
+                    phase,
+                    iteration,
+                    trial,
+                    full_token,
+                    last_token,
+                    max_abs,
+                    cosine,
+                    top10_overlap,
+                );
+                last
+            } else if full_logits {
+                model
+                    .forward_gpu(&prompt_tokens, &positions, &mut kv_cache)
+                    .context("qwen35 prefill sweep forward_gpu")?
+            } else {
+                model
+                    .forward_gpu_last_logits(&prompt_tokens, &positions, &mut kv_cache)
+                    .context("qwen35 prefill sweep forward_gpu_last_logits")?
+            };
+            let elapsed = t0.elapsed();
+            let vocab = model.cfg.vocab_size as usize;
+            let expected_logits = if full_logits && !compare_full_last {
+                prompt_len * vocab
+            } else {
+                vocab
+            };
+            anyhow::ensure!(
+                logits.len() == expected_logits,
+                "qwen35 prefill sweep logits.len()={} != expected {} (full_logits={})",
+                logits.len(),
+                expected_logits,
+                full_logits,
+            );
+            let last_logits = &logits[logits.len() - vocab..];
+            let first_token = greedy_argmax_last_token(last_logits, model.cfg.vocab_size);
+            let ms = elapsed.as_secs_f64() * 1000.0;
+            let tps = prompt_len as f64 / elapsed.as_secs_f64();
+            println!(
+                "{{\"event\":\"qwen35_prefill_sweep\",\"target_tokens\":{},\"actual_tokens\":{},\"phase\":\"{}\",\"iteration\":{},\"trial\":{},\"prefill_ms\":{:.3},\"prefill_tps\":{:.3},\"first_token\":{},\"output_head\":\"{}\"}}",
+                target,
+                prompt_len,
+                phase,
+                iteration,
+                trial,
+                ms,
+                tps,
+                first_token,
+                if full_logits { "all" } else { "last" },
+            );
+        }
+    }
+    println!("{{\"event\":\"qwen35_prefill_sweep_end\"}}");
+    Ok(true)
+}
 
 /// Generate subcommand dispatch for `qwen35` / `qwen35moe` GGUF architectures.
 ///
@@ -679,12 +980,9 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
 /// from and writes back to the `kv_cache.linear_attn` slots on every call.
 /// For full-attention layers the SDPA is re-run from scratch on each decode
 /// token (the KV-append incremental path is a future optimisation).
-fn cmd_generate_qwen35(
-    args: cli::GenerateArgs,
-    gguf: mlx_native::gguf::GgufFile,
-) -> Result<()> {
-    use crate::inference::models::qwen35::kv_cache::HybridKvCache;
+fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile) -> Result<()> {
     use crate::inference::models::qwen35::io_heads::greedy_argmax_last_token;
+    use crate::inference::models::qwen35::kv_cache::HybridKvCache;
     use crate::inference::models::qwen35::model::Qwen35Model;
     use mlx_native::MlxDevice;
     use std::io::Write;
@@ -698,8 +996,7 @@ fn cmd_generate_qwen35(
     // ---- Load model ----
     let load_start = std::time::Instant::now();
     tracing::info!("Loading Qwen3.5 model from GGUF");
-    let model = Qwen35Model::load_from_gguf(&gguf)
-        .context("Qwen35Model::load_from_gguf")?;
+    let model = Qwen35Model::load_from_gguf(&gguf).context("Qwen35Model::load_from_gguf")?;
     let load_elapsed = load_start.elapsed();
     tracing::info!(
         "Qwen3.5 model loaded ({} layers, variant={:?}) in {:.2}s",
@@ -723,6 +1020,10 @@ fn cmd_generate_qwen35(
     tokenizer
         .with_truncation(None)
         .map_err(|e| anyhow::anyhow!("Tokenizer truncation: {e}"))?;
+
+    if maybe_run_qwen35_prefill_sweep(&model, &tokenizer)? {
+        return Ok(());
+    }
 
     // ---- Resolve + render prompt ----
     let prompt_text_raw = resolve_prompt(&args)?;
@@ -858,10 +1159,9 @@ fn cmd_generate_qwen35(
     }
 
     // ---- Allocate HybridKvCache ----
-    let device = MlxDevice::new()
-        .map_err(|e| anyhow::anyhow!("MlxDevice::new: {e}"))?;
-    let mut kv_cache = HybridKvCache::new(&model.cfg, &device, max_seq as u32, 1)
-        .context("HybridKvCache::new")?;
+    let device = MlxDevice::new().map_err(|e| anyhow::anyhow!("MlxDevice::new: {e}"))?;
+    let mut kv_cache =
+        HybridKvCache::new(&model.cfg, &device, max_seq as u32, 1).context("HybridKvCache::new")?;
     tracing::info!(
         "Qwen3.5 KV cache allocated: max_seq={}, {} MB",
         max_seq,
@@ -883,19 +1183,17 @@ fn cmd_generate_qwen35(
     tracing::info!("Qwen3.5 prefill: seq_len={}", prompt_len);
     let prefill_start = std::time::Instant::now();
     let prefill_logits = model
-        .forward_gpu(&prompt_tokens, &prefill_positions, &mut kv_cache)
-        .context("Qwen35Model::forward_gpu (prefill)")?;
+        .forward_gpu_last_logits(&prompt_tokens, &prefill_positions, &mut kv_cache)
+        .context("Qwen35Model::forward_gpu_last_logits (prefill)")?;
     let prefill_elapsed = prefill_start.elapsed();
 
     // Sanity-check logits shape.
     let vocab_size = model.cfg.vocab_size;
     anyhow::ensure!(
-        prefill_logits.len() == prompt_len * vocab_size as usize,
-        "forward_gpu (prefill) returned logits.len()={} != prompt_len({}) * vocab({}) = {}",
+        prefill_logits.len() == vocab_size as usize,
+        "forward_gpu_last_logits (prefill) returned logits.len()={} != vocab({})",
         prefill_logits.len(),
-        prompt_len,
         vocab_size,
-        prompt_len * vocab_size as usize,
     );
 
     let prefill_tok_s = prompt_len as f64 / prefill_elapsed.as_secs_f64();
@@ -913,25 +1211,25 @@ fn cmd_generate_qwen35(
     // HF2Q_DUMP_LOGITS=1: write the last-token logit vector to /tmp/hf2q_logits_t0.bin
     // and exit immediately. Used for first-token logit comparison vs llama.cpp.
     if std::env::var("HF2Q_DUMP_LOGITS").as_deref() == Ok("1") {
-        let last_logits = &prefill_logits[prefill_logits.len() - vocab_size as usize..];
+        let last_logits = &prefill_logits;
         let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                last_logits.as_ptr() as *const u8,
-                last_logits.len() * 4,
-            )
+            std::slice::from_raw_parts(last_logits.as_ptr() as *const u8, last_logits.len() * 4)
         };
         std::fs::write("/tmp/hf2q_logits_t0.bin", bytes)
             .context("HF2Q_DUMP_LOGITS: write /tmp/hf2q_logits_t0.bin")?;
         // Top-3 to stderr for quick sanity check.
         let mut indexed: Vec<(usize, f32)> = last_logits.iter().copied().enumerate().collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        eprintln!("HF2Q_DUMP_LOGITS: wrote {} f32 values to /tmp/hf2q_logits_t0.bin", last_logits.len());
+        eprintln!(
+            "HF2Q_DUMP_LOGITS: wrote {} f32 values to /tmp/hf2q_logits_t0.bin",
+            last_logits.len()
+        );
         eprintln!("  top-3: {:?}", &indexed[..3.min(indexed.len())]);
         return Ok(());
     }
 
     // Sample the first token from prefill logits (last token's row).
-    let last_prefill_logits = &prefill_logits[prefill_logits.len() - vocab_size as usize..];
+    let last_prefill_logits = &prefill_logits;
     let mut next_token = greedy_argmax_last_token(last_prefill_logits, vocab_size);
     tracing::info!("Qwen3.5 first decoded token: {}", next_token);
 
@@ -975,12 +1273,17 @@ fn cmd_generate_qwen35(
         // Eliminates ~5ms/token vocabulary download for greedy decode.
         let _t_step = if std::env::var("HF2Q_STEP_PROFILE").is_ok() {
             Some(std::time::Instant::now())
-        } else { None };
+        } else {
+            None
+        };
         next_token = model
             .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache)
             .with_context(|| format!("forward_gpu_greedy decode step {step}"))?;
         if let Some(t) = _t_step {
-            eprintln!("[STEP_PROFILE] step={step} total={:.2}ms", t.elapsed().as_micros() as f64 / 1000.0);
+            eprintln!(
+                "[STEP_PROFILE] step={step} total={:.2}ms",
+                t.elapsed().as_micros() as f64 / 1000.0
+            );
         }
         generated += 1;
 
@@ -1062,15 +1365,8 @@ pub fn pool_key_for_path(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-pub fn load_engine(
-    path: &Path,
-    config: &multi_model::EngineConfig,
-) -> Result<api::engine::Engine> {
-    anyhow::ensure!(
-        path.exists(),
-        "Model not found: {}",
-        path.display()
-    );
+pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<api::engine::Engine> {
+    anyhow::ensure!(path.exists(), "Model not found: {}", path.display());
     // Header-only parse surfaces bad magic immediately without loading
     // any tensor data.
     {
@@ -1143,14 +1439,15 @@ pub fn load_engine(
 ///   3. Build the axum router and bind the listener.
 ///   4. Serve until SIGINT / SIGTERM (graceful shutdown per Decision #17).
 pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
-    use api::state::ServerConfig;
     use api::schema::OverflowPolicy;
+    use api::state::ServerConfig;
 
     // --- Resolve config ---
-    let auth_token = args
-        .auth_token
-        .clone()
-        .or_else(|| std::env::var("HF2Q_AUTH_TOKEN").ok().filter(|s| !s.is_empty()));
+    let auth_token = args.auth_token.clone().or_else(|| {
+        std::env::var("HF2Q_AUTH_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
 
     let overflow_policy = match args.overflow_policy {
         cli::OverflowPolicyArg::Reject => OverflowPolicy::Reject,
@@ -1158,7 +1455,10 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         cli::OverflowPolicyArg::Summarize => OverflowPolicy::Summarize,
     };
 
-    let cache_dir = args.cache_dir.clone().or_else(api::state::default_cache_dir);
+    let cache_dir = args
+        .cache_dir
+        .clone()
+        .or_else(api::state::default_cache_dir);
 
     let config = ServerConfig {
         host: args.host.clone(),
@@ -1250,9 +1550,7 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             .repo_id
             .clone()
             .unwrap_or_else(|| pool_key_for_path(&resolved.gguf_path));
-        let pool_quant = resolved
-            .quant
-            .unwrap_or(quant_select::QuantType::Q4_K_M);
+        let pool_quant = resolved.quant.unwrap_or(quant_select::QuantType::Q4_K_M);
         let engine_config = multi_model::EngineConfig {
             tokenizer_path: args.tokenizer.clone(),
             config_path: args.config.clone(),
@@ -1321,11 +1619,10 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("BERT GGUF config parse failed: {e}"))?;
                 crate::inference::models::bert::weights::validate_tensor_set(&gguf, &cfg)
                     .map_err(|e| anyhow::anyhow!("BERT GGUF tensor validation: {e}"))?;
-                let weights =
-                    crate::inference::models::bert::weights::LoadedBertWeights::load(
-                        &gguf, &cfg, device,
-                    )
-                    .map_err(|e| anyhow::anyhow!("BERT weights load failed: {e}"))?;
+                let weights = crate::inference::models::bert::weights::LoadedBertWeights::load(
+                    &gguf, &cfg, device,
+                )
+                .map_err(|e| anyhow::anyhow!("BERT weights load failed: {e}"))?;
                 tracing::info!(
                     path = %emb_path.display(),
                     arch = "bert",
@@ -1342,15 +1639,15 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
                 }
             }
             "nomic-bert" => {
-                let cfg = crate::inference::models::nomic_bert::NomicBertConfig::from_gguf(&gguf)
-                    .map_err(|e| anyhow::anyhow!("nomic-bert GGUF config parse failed: {e}"))?;
+                let cfg =
+                    crate::inference::models::nomic_bert::NomicBertConfig::from_gguf(&gguf)
+                        .map_err(|e| anyhow::anyhow!("nomic-bert GGUF config parse failed: {e}"))?;
                 crate::inference::models::nomic_bert::validate_tensor_set(&gguf, &cfg)
                     .map_err(|e| anyhow::anyhow!("nomic-bert GGUF tensor validation: {e}"))?;
-                let weights =
-                    crate::inference::models::nomic_bert::LoadedNomicBertWeights::load(
-                        &gguf, &cfg, device,
-                    )
-                    .map_err(|e| anyhow::anyhow!("nomic-bert weights load failed: {e}"))?;
+                let weights = crate::inference::models::nomic_bert::LoadedNomicBertWeights::load(
+                    &gguf, &cfg, device,
+                )
+                .map_err(|e| anyhow::anyhow!("nomic-bert weights load failed: {e}"))?;
                 tracing::info!(
                     path = %emb_path.display(),
                     arch = "nomic-bert",
@@ -1431,8 +1728,7 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         // the bug is in `LoadedMmprojWeights::load`'s buffer-alloc
         // / dequant path; if NaN persists, the bug is somewhere
         // earlier (the GGUF mmap itself).
-        let skip_mmproj_load =
-            std::env::var("HF2Q_SKIP_MMPROJ_LOAD").as_deref() == Ok("1");
+        let skip_mmproj_load = std::env::var("HF2Q_SKIP_MMPROJ_LOAD").as_deref() == Ok("1");
         let device = mlx_native::MlxDevice::new()
             .map_err(|e| anyhow::anyhow!("create MlxDevice for mmproj load: {e}"))?;
         let mmp_weights = if skip_mmproj_load {
@@ -1443,7 +1739,9 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             crate::inference::vision::mmproj_weights::LoadedMmprojWeights::empty(device)
         } else {
             crate::inference::vision::mmproj_weights::LoadedMmprojWeights::load(
-                &gguf, &mmp_config, device,
+                &gguf,
+                &mmp_config,
+                device,
             )
             .map_err(|e| anyhow::anyhow!("mmproj weight load: {e}"))?
         };
@@ -1473,8 +1771,7 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         // logits, the bug lives in `warmup_vit_gpu`'s leftover GPU
         // state; if NaN persists, the bug lives in
         // `LoadedMmprojWeights::load`.
-        let skip_vit_warmup =
-            std::env::var("HF2Q_SKIP_VIT_WARMUP").as_deref() == Ok("1");
+        let skip_vit_warmup = std::env::var("HF2Q_SKIP_VIT_WARMUP").as_deref() == Ok("1");
         if skip_vit_warmup {
             tracing::warn!(
                 "HF2Q_SKIP_VIT_WARMUP=1 — skipping ViT GPU warmup; first \
@@ -1557,11 +1854,7 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         // (chat warmup BEFORE mmproj load) is preserved by the call
         // ordering above (pre-warm runs before mmproj load).
         {
-            let pool_state_log = state_for_warmup
-                .pool
-                .read()
-                .ok()
-                .map(|m| m.pool_stats());
+            let pool_state_log = state_for_warmup.pool.read().ok().map(|m| m.pool_stats());
             if let Some(stats) = pool_state_log {
                 tracing::info!(
                     loaded = stats.loaded_count,
@@ -1632,8 +1925,7 @@ async fn shutdown_signal() {
     };
     #[cfg(unix)]
     let terminate = async {
-        if let Ok(mut s) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         {
             s.recv().await;
         }
@@ -1665,8 +1957,7 @@ async fn shutdown_signal() {
 pub fn cmd_cache(args: cli::CacheArgs) -> Result<()> {
     use cli::CacheAction;
 
-    let mut cache = cache::ModelCache::open()
-        .context("open model cache")?;
+    let mut cache = cache::ModelCache::open().context("open model cache")?;
     match args.action {
         CacheAction::List => cmd_cache_list(&cache),
         CacheAction::Size => cmd_cache_size(&cache),
@@ -1697,20 +1988,14 @@ fn cmd_cache_list(cache: &cache::ModelCache) -> Result<()> {
             // so it's visible to `cache list`.
             println!(
                 "{:<48} {:<10} {:>12} {:>20}",
-                view.repo_id,
-                "(none)",
-                "-",
-                view.model.last_accessed_secs,
+                view.repo_id, "(none)", "-", view.model.last_accessed_secs,
             );
             continue;
         }
         for (quant, qe) in &view.model.quantizations {
             println!(
                 "{:<48} {:<10} {:>12} {:>20}",
-                view.repo_id,
-                quant,
-                qe.bytes,
-                view.model.last_accessed_secs,
+                view.repo_id, quant, qe.bytes, view.model.last_accessed_secs,
             );
         }
     }
@@ -1773,8 +2058,8 @@ fn cmd_cache_clear(
     // --model is set (validated above).  --quant optional.
     let repo = model.expect("validated above");
     if let Some(q_str) = quant {
-        let q = QuantType::from_canonical_str(&q_str)
-            .map_err(|e| anyhow::anyhow!("--quant: {}", e))?;
+        let q =
+            QuantType::from_canonical_str(&q_str).map_err(|e| anyhow::anyhow!("--quant: {}", e))?;
         let freed = cache
             .invalidate(&repo, q)
             .with_context(|| format!("clear {}@{}", repo, q.as_str()))?;
@@ -1871,9 +2156,7 @@ pub fn cmd_parity(args: cli::ParityArgs) -> Result<()> {
             tq_quality,
         } => {
             if tq_quality {
-                parity_quality::cmd_parity_capture_tq_quality(
-                    &model, &output, &prompt, max_tokens,
-                )
+                parity_quality::cmd_parity_capture_tq_quality(&model, &output, &prompt, max_tokens)
             } else {
                 cmd_parity_capture(&model, &output, &prompt, max_tokens)
             }
@@ -1894,7 +2177,11 @@ fn cmd_parity_check(
 
     // Load prompt
     let prompt_file = evals_dir.join("prompts").join(format!("{prompt_name}.txt"));
-    anyhow::ensure!(prompt_file.exists(), "Prompt file not found: {}", prompt_file.display());
+    anyhow::ensure!(
+        prompt_file.exists(),
+        "Prompt file not found: {}",
+        prompt_file.display()
+    );
     let prompt_text = std::fs::read_to_string(&prompt_file)?.trim().to_string();
 
     // Load reference. Default: llama.cpp-anchored parity (*_llama.txt).
@@ -1903,24 +2190,25 @@ fn cmd_parity_check(
     // expected.
     let ref_suffix = if self_baseline { "_hf2q" } else { "_llama" };
     let ref_file = ref_dir.join(format!("{prompt_name}{ref_suffix}.txt"));
-    anyhow::ensure!(ref_file.exists(), "Reference file not found: {}", ref_file.display());
+    anyhow::ensure!(
+        ref_file.exists(),
+        "Reference file not found: {}",
+        ref_file.display()
+    );
     let ref_bytes = std::fs::read(&ref_file)?;
 
     // Determine settings
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(ref_dir.join("MANIFEST.json"))?
-    )?;
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ref_dir.join("MANIFEST.json"))?)?;
     let prompt_meta = &manifest["prompts"][prompt_name];
-    let tokens = max_tokens.unwrap_or_else(||
-        prompt_meta["max_tokens"].as_u64().unwrap_or(1000) as usize
-    );
+    let tokens =
+        max_tokens.unwrap_or_else(|| prompt_meta["max_tokens"].as_u64().unwrap_or(1000) as usize);
     let threshold = min_prefix.unwrap_or_else(||
         // Parse from gate field like "common_prefix >= 3094"
         prompt_meta["parity_gate"].as_str()
             .and_then(|s| s.split(">=").nth(1))
             .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(0)
-    );
+            .unwrap_or(0));
 
     // Run hf2q
     eprintln!("=== Parity Check: {} ===", prompt_name);
@@ -1933,39 +2221,43 @@ fn cmd_parity_check(
     let tokenizer_path = find_tokenizer(model_path, None)?;
     let config_path = find_config(model_path, None)?;
     let cfg = config::Gemma4Config::from_config_json(&config_path)?;
-    let mut ctx = gpu::GpuContext::new()
-        .map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
+    let mut ctx = gpu::GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
     let gguf = mlx_native::gguf::GgufFile::open(model_path)
         .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
     // cmd_parity has its own output contract — no progress line.
     let mut parity_progress = header::LoadProgress::new(false, 1, 0);
-    let mut mlx_w = forward_mlx::MlxModelWeights::load_from_gguf(
-        &gguf, &cfg, &mut ctx, &mut parity_progress,
-    )?;
+    let mut mlx_w =
+        forward_mlx::MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut ctx, &mut parity_progress)?;
 
     let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Tokenizer: {e}"))?;
-    tokenizer.with_truncation(None)
+    tokenizer
+        .with_truncation(None)
         .map_err(|e| anyhow::anyhow!("Tokenizer truncation: {e}"))?;
 
-    let rendered = render_chat_template(&gguf, &cli::GenerateArgs {
-        model: model_path.to_path_buf(),
-        prompt: Some(prompt_text.clone()),
-        prompt_file: None,
-        tokenizer: None,
-        config: None,
-        temperature: 0.0,
-        top_p: 1.0,
-        top_k: 0,
-        repetition_penalty: 1.0,
-        max_tokens: tokens,
-        chat_template: None,
-        chat_template_file: None,
-        benchmark: false,
-        speculative: false,
-    }, &prompt_text)?;
+    let rendered = render_chat_template(
+        &gguf,
+        &cli::GenerateArgs {
+            model: model_path.to_path_buf(),
+            prompt: Some(prompt_text.clone()),
+            prompt_file: None,
+            tokenizer: None,
+            config: None,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            max_tokens: tokens,
+            chat_template: None,
+            chat_template_file: None,
+            benchmark: false,
+            speculative: false,
+        },
+        &prompt_text,
+    )?;
 
-    let encoding = tokenizer.encode(rendered.as_str(), false)
+    let encoding = tokenizer
+        .encode(rendered.as_str(), false)
         .map_err(|e| anyhow::anyhow!("Tokenize: {e}"))?;
     let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
@@ -1999,7 +2291,11 @@ fn cmd_parity_check(
     }
 
     eprintln!();
-    let ref_label = if self_baseline { "frozen hf2q" } else { "llama.cpp" };
+    let ref_label = if self_baseline {
+        "frozen hf2q"
+    } else {
+        "llama.cpp"
+    };
     println!("Reference: {} bytes ({})", ref_bytes.len(), ref_label);
     println!("hf2q:      {} bytes", hf2q_bytes.len());
     println!("Common:    {} bytes", common);
@@ -2008,14 +2304,18 @@ fn cmd_parity_check(
         // byte in the common-prefix comparison was equal.
         let identical = hf2q_bytes.len() == ref_bytes.len() && common == ref_bytes.len();
         if identical {
-            println!("PASS: byte-identical to frozen hf2q baseline ({} bytes)", common);
+            println!(
+                "PASS: byte-identical to frozen hf2q baseline ({} bytes)",
+                common
+            );
         } else {
             println!("FAIL: not byte-identical to frozen hf2q baseline");
             if common < n {
                 let ctx_start = common;
                 let ctx_end = (common + 80).min(n);
                 let ref_snip = String::from_utf8_lossy(&ref_bytes[ctx_start..ctx_end]);
-                let hf2q_snip = String::from_utf8_lossy(&hf2q_bytes[ctx_start..ctx_end.min(hf2q_bytes.len())]);
+                let hf2q_snip =
+                    String::from_utf8_lossy(&hf2q_bytes[ctx_start..ctx_end.min(hf2q_bytes.len())]);
                 println!();
                 println!("Divergence at byte {}:", common);
                 println!("  frozen: {:?}", ref_snip);
@@ -2037,7 +2337,8 @@ fn cmd_parity_check(
                 let ctx_start = common;
                 let ctx_end = (common + 80).min(n);
                 let ref_snip = String::from_utf8_lossy(&ref_bytes[ctx_start..ctx_end]);
-                let hf2q_snip = String::from_utf8_lossy(&hf2q_bytes[ctx_start..ctx_end.min(hf2q_bytes.len())]);
+                let hf2q_snip =
+                    String::from_utf8_lossy(&hf2q_bytes[ctx_start..ctx_end.min(hf2q_bytes.len())]);
                 println!();
                 println!("Divergence at byte {}:", common);
                 println!("  llama: {:?}", ref_snip);
@@ -2060,7 +2361,11 @@ fn cmd_parity_capture(
     let evals_dir = Path::new("tests/evals");
 
     let prompts: Vec<String> = if prompt_name == "all" {
-        vec!["sourdough".into(), "short_hello".into(), "sliding_wrap".into()]
+        vec![
+            "sourdough".into(),
+            "short_hello".into(),
+            "sliding_wrap".into(),
+        ]
     } else {
         vec![prompt_name.to_string()]
     };
@@ -2069,22 +2374,26 @@ fn cmd_parity_capture(
     let tokenizer_path = find_tokenizer(model_path, None)?;
     let config_path = find_config(model_path, None)?;
     let cfg = config::Gemma4Config::from_config_json(&config_path)?;
-    let mut ctx = gpu::GpuContext::new()
-        .map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
+    let mut ctx = gpu::GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
     let gguf = mlx_native::gguf::GgufFile::open(model_path)
         .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
     // Model loaded once here; individual prompts re-create weights below to reset KV state
     let _gguf_preload = &gguf; // keep gguf alive
     let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Tokenizer: {e}"))?;
-    tokenizer.with_truncation(None)
+    tokenizer
+        .with_truncation(None)
         .map_err(|e| anyhow::anyhow!("Tokenizer truncation: {e}"))?;
 
     std::fs::create_dir_all(output_dir)?;
 
     for pname in &prompts {
         let prompt_file = evals_dir.join("prompts").join(format!("{pname}.txt"));
-        anyhow::ensure!(prompt_file.exists(), "Prompt not found: {}", prompt_file.display());
+        anyhow::ensure!(
+            prompt_file.exists(),
+            "Prompt not found: {}",
+            prompt_file.display()
+        );
         let prompt_text = std::fs::read_to_string(&prompt_file)?.trim().to_string();
 
         let tokens = max_tokens.unwrap_or(match pname.as_str() {
@@ -2101,27 +2410,35 @@ fn cmd_parity_capture(
         // cmd_parity has its own output contract — no progress line.
         let mut parity_progress = header::LoadProgress::new(false, 1, 0);
         let mut mlx_w_fresh = forward_mlx::MlxModelWeights::load_from_gguf(
-            &gguf, &cfg, &mut ctx, &mut parity_progress,
+            &gguf,
+            &cfg,
+            &mut ctx,
+            &mut parity_progress,
         )?;
 
-        let rendered = render_chat_template(&gguf, &cli::GenerateArgs {
-            model: model_path.to_path_buf(),
-            prompt: Some(prompt_text.clone()),
-            prompt_file: None,
-            tokenizer: None,
-            config: None,
-            temperature: 0.0,
-            top_p: 1.0,
-            top_k: 0,
-            repetition_penalty: 1.0,
-            max_tokens: tokens,
-            chat_template: None,
-            chat_template_file: None,
-            benchmark: false,
-            speculative: false,
-        }, &prompt_text)?;
+        let rendered = render_chat_template(
+            &gguf,
+            &cli::GenerateArgs {
+                model: model_path.to_path_buf(),
+                prompt: Some(prompt_text.clone()),
+                prompt_file: None,
+                tokenizer: None,
+                config: None,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                repetition_penalty: 1.0,
+                max_tokens: tokens,
+                chat_template: None,
+                chat_template_file: None,
+                benchmark: false,
+                speculative: false,
+            },
+            &prompt_text,
+        )?;
 
-        let encoding = tokenizer.encode(rendered.as_str(), false)
+        let encoding = tokenizer
+            .encode(rendered.as_str(), false)
             .map_err(|e| anyhow::anyhow!("Tokenize: {e}"))?;
         let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
@@ -2162,9 +2479,18 @@ mod tests {
     fn jinja_template_renders_single_user_turn() {
         let tmpl = "{{ bos_token }}{% for m in messages %}<|turn|>{{ m.role }}\n{{ m.content }}<|end|>\n{% endfor %}{% if add_generation_prompt %}<|turn|>model\n{% endif %}";
         let out = render_jinja_template(tmpl, "hello").expect("render ok");
-        assert!(out.starts_with("<bos>"), "output should start with bos_token: {out}");
-        assert!(out.contains("<|turn|>user\nhello<|end|>"), "user turn missing: {out}");
-        assert!(out.ends_with("<|turn|>model\n"), "generation prompt missing: {out}");
+        assert!(
+            out.starts_with("<bos>"),
+            "output should start with bos_token: {out}"
+        );
+        assert!(
+            out.contains("<|turn|>user\nhello<|end|>"),
+            "user turn missing: {out}"
+        );
+        assert!(
+            out.ends_with("<|turn|>model\n"),
+            "generation prompt missing: {out}"
+        );
     }
 
     /// Parse failure on an invalid Jinja template should surface as an error.

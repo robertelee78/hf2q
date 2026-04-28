@@ -1,6 +1,11 @@
 #!/bin/bash
 # Wave 5b.27 Phase B — DenseFfnOutputCache A/B bench at PP4106.
 #
+# 2026-04-28 drift note: this script is historical. Current qwen35 source no
+# longer contains `HF2Q_FFN_DENSE_LIFT_LEGACY`, so the env var below does not
+# prove a live lifted-vs-legacy A/B. Revalidate source before using these
+# results for architectural decisions.
+#
 # Compares hf2q NEW path (default, lifted DenseFfnOutputCache) vs
 # hf2q LEGACY path (HF2Q_FFN_DENSE_LIFT_LEGACY=1, per-layer
 # pooled_alloc_buffer) at PP4106 with W-5b.8/W-5b.17/W-5b.22
