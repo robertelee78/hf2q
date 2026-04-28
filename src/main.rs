@@ -337,7 +337,7 @@ fn select_calibrator(
                 }
             }
         }
-        ImatrixQ4KM | ImatrixQ5KM | ImatrixQ6K | ImatrixAdaptive => {
+        ImatrixQ3KS | ImatrixQ3KM | ImatrixQ3KL | ImatrixQ4KM | ImatrixQ5KM | ImatrixQ6K | ImatrixAdaptive => {
             // ADR-014 Decision 13 + ADR-013 D13: no NoneCalibrator silent
             // fallback when the forward-pass driver is absent. Surface a
             // typed error so the caller can either supply a capture or
@@ -360,7 +360,7 @@ fn select_calibrator(
                 ),
             ))
         }
-        Auto | F16 | Bf16 | Q2 | Q4 | Q8 | Q4KM | Q5KM | Q6K => {
+        Auto | F16 | Bf16 | Q2 | Q4 | Q8 | Q3KS | Q3KM | Q3KL | Q4KM | Q5KM | Q6K => {
             Ok(Box::new(calibrate::calibrator::NoneCalibrator::new()))
         }
     }
@@ -683,9 +683,15 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 "q2" => cli::QuantMethod::Q2,
                 "q4" => cli::QuantMethod::Q4,
                 "q8" => cli::QuantMethod::Q8,
+                "q3_k_s" => cli::QuantMethod::Q3KS,
+                "q3_k_m" => cli::QuantMethod::Q3KM,
+                "q3_k_l" => cli::QuantMethod::Q3KL,
                 "q4_k_m" => cli::QuantMethod::Q4KM,
                 "q5_k_m" => cli::QuantMethod::Q5KM,
                 "q6_k" => cli::QuantMethod::Q6K,
+                "imatrix-q3_k_s" => cli::QuantMethod::ImatrixQ3KS,
+                "imatrix-q3_k_m" => cli::QuantMethod::ImatrixQ3KM,
+                "imatrix-q3_k_l" => cli::QuantMethod::ImatrixQ3KL,
                 "imatrix-q4_k_m" => cli::QuantMethod::ImatrixQ4KM,
                 "imatrix-q5_k_m" => cli::QuantMethod::ImatrixQ5KM,
                 "imatrix-q6_k" => cli::QuantMethod::ImatrixQ6K,
@@ -1294,13 +1300,27 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             // imatrix-calibrated) route through the unified
             // KQuantCodecQuantizer — final GGUF block bytes in one pass,
             // no IR-quantize → repack indirection.
-            cli::QuantMethod::Q4KM
+            cli::QuantMethod::Q3KS
+            | cli::QuantMethod::Q3KM
+            | cli::QuantMethod::Q3KL
+            | cli::QuantMethod::Q4KM
             | cli::QuantMethod::Q5KM
             | cli::QuantMethod::Q6K
+            | cli::QuantMethod::ImatrixQ3KS
+            | cli::QuantMethod::ImatrixQ3KM
+            | cli::QuantMethod::ImatrixQ3KL
             | cli::QuantMethod::ImatrixQ4KM
             | cli::QuantMethod::ImatrixQ5KM
             | cli::QuantMethod::ImatrixQ6K => {
                 let target = match config.quant {
+                    cli::QuantMethod::Q3KS
+                    | cli::QuantMethod::Q3KM
+                    | cli::QuantMethod::Q3KL
+                    | cli::QuantMethod::ImatrixQ3KS
+                    | cli::QuantMethod::ImatrixQ3KM
+                    | cli::QuantMethod::ImatrixQ3KL => {
+                        quantize::k_quant_codec::KQuantTarget::Q3K
+                    }
                     cli::QuantMethod::Q4KM | cli::QuantMethod::ImatrixQ4KM => {
                         quantize::k_quant_codec::KQuantTarget::Q4K
                     }
@@ -2305,6 +2325,9 @@ fn quantizer_default_bits(method: &cli::QuantMethod) -> u8 {
         cli::QuantMethod::Q8 => 8,
         cli::QuantMethod::Q4 => 4,
         cli::QuantMethod::Q2 => 2,
+        cli::QuantMethod::Q3KS | cli::QuantMethod::ImatrixQ3KS => 3,
+        cli::QuantMethod::Q3KM | cli::QuantMethod::ImatrixQ3KM => 3,
+        cli::QuantMethod::Q3KL | cli::QuantMethod::ImatrixQ3KL => 3,
         cli::QuantMethod::Q4KM | cli::QuantMethod::ImatrixQ4KM => 4,
         cli::QuantMethod::Q5KM | cli::QuantMethod::ImatrixQ5KM => 5,
         cli::QuantMethod::Q6K | cli::QuantMethod::ImatrixQ6K => 6,

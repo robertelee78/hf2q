@@ -719,6 +719,19 @@ pub enum QuantMethod {
     /// `q8` — flat 8-bit (Q8_0).
     #[value(alias = "q8_0")]
     Q8,
+    /// `q3_k_s` — uncalibrated K-quant Q3_K, "small" variant. Base Q3_K
+    /// everywhere except output (→ Q6_K). 3.4375 bpw base.
+    #[value(name = "q3_k_s")]
+    Q3KS,
+    /// `q3_k_m` — Q3_K "medium" with attn_v Q5_K (i_layer<2) / Q4_K
+    /// upgrade per `llama-quant.cpp:527-528`, ffn_down Q5_K
+    /// (i_layer<n/16) / Q4_K (use_more_bits) / Q3_K per `:578-582`.
+    #[value(name = "q3_k_m")]
+    Q3KM,
+    /// `q3_k_l` — Q3_K "large" with attn_v → Q5_K (`:530`) and
+    /// ffn_down → Q5_K (`:587-588`).  Output bumps to Q6_K.
+    #[value(name = "q3_k_l")]
+    Q3KL,
     /// `q4_k_m` — uncalibrated K-quant Q4_K with per-tensor `_M`
     /// upgrades (output/token_embd → Q6_K, attn_v / ffn_down on
     /// `use_more_bits` layers).
@@ -730,6 +743,15 @@ pub enum QuantMethod {
     /// `q6_k` — uncalibrated K-quant Q6_K.
     #[value(name = "q6_k")]
     Q6K,
+    /// `imatrix-q3_k_s` — Q3_K_S with imatrix-weighted codebook search.
+    #[value(name = "imatrix-q3_k_s")]
+    ImatrixQ3KS,
+    /// `imatrix-q3_k_m` — Q3_K_M with imatrix-weighted codebook search.
+    #[value(name = "imatrix-q3_k_m")]
+    ImatrixQ3KM,
+    /// `imatrix-q3_k_l` — Q3_K_L with imatrix-weighted codebook search.
+    #[value(name = "imatrix-q3_k_l")]
+    ImatrixQ3KL,
     /// `imatrix-q4_k_m` — K-quant Q4_K (`_M` variant) with imatrix-
     /// weighted codebook search (llama.cpp PR #4861 / commit `ec893798`).
     #[value(name = "imatrix-q4_k_m")]
@@ -772,9 +794,15 @@ impl std::fmt::Display for QuantMethod {
             Self::Q2 => write!(f, "q2"),
             Self::Q4 => write!(f, "q4"),
             Self::Q8 => write!(f, "q8"),
+            Self::Q3KS => write!(f, "q3_k_s"),
+            Self::Q3KM => write!(f, "q3_k_m"),
+            Self::Q3KL => write!(f, "q3_k_l"),
             Self::Q4KM => write!(f, "q4_k_m"),
             Self::Q5KM => write!(f, "q5_k_m"),
             Self::Q6K => write!(f, "q6_k"),
+            Self::ImatrixQ3KS => write!(f, "imatrix-q3_k_s"),
+            Self::ImatrixQ3KM => write!(f, "imatrix-q3_k_m"),
+            Self::ImatrixQ3KL => write!(f, "imatrix-q3_k_l"),
             Self::ImatrixQ4KM => write!(f, "imatrix-q4_k_m"),
             Self::ImatrixQ5KM => write!(f, "imatrix-q5_k_m"),
             Self::ImatrixQ6K => write!(f, "imatrix-q6_k"),
@@ -821,9 +849,15 @@ impl QuantMethod {
             | Self::Q2
             | Self::Q4
             | Self::Q8
+            | Self::Q3KS
+            | Self::Q3KM
+            | Self::Q3KL
             | Self::Q4KM
             | Self::Q5KM
             | Self::Q6K
+            | Self::ImatrixQ3KS
+            | Self::ImatrixQ3KM
+            | Self::ImatrixQ3KL
             | Self::ImatrixQ4KM
             | Self::ImatrixQ5KM
             | Self::ImatrixQ6K
@@ -1231,10 +1265,18 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
         | QuantMethod::Q8 => {
             // Flat float / legacy block-quant variants.
         }
-        QuantMethod::Q4KM | QuantMethod::Q5KM | QuantMethod::Q6K => {
+        QuantMethod::Q3KS
+        | QuantMethod::Q3KM
+        | QuantMethod::Q3KL
+        | QuantMethod::Q4KM
+        | QuantMethod::Q5KM
+        | QuantMethod::Q6K => {
             // Uncalibrated K-quant (NoneCalibrator + KQuantCodecQuantizer).
         }
-        QuantMethod::ImatrixQ4KM
+        QuantMethod::ImatrixQ3KS
+        | QuantMethod::ImatrixQ3KM
+        | QuantMethod::ImatrixQ3KL
+        | QuantMethod::ImatrixQ4KM
         | QuantMethod::ImatrixQ5KM
         | QuantMethod::ImatrixQ6K => {
             // imatrix-calibrated K-quant (ImatrixCalibrator + KQuantCodecQuantizer).
@@ -1523,6 +1565,40 @@ mod tests {
     // (base_bits=4, sensitive_bits=6) — byte-identical to pre-change behaviour.
     // This guard will fail if any future refactor silently changes the Gemma-4
     // quantization parameters.
+
+    /// ADR-014 P8 iter-10: Q3_K family must round-trip through Display
+    /// + dwq_bit_pair (None for non-DWQ) + filename suffix.  Locks the
+    /// CLI surface for `q3_k_s`/`q3_k_m`/`q3_k_l` (and their imatrix
+    /// counterparts) so a future refactor can't silently rename them.
+    #[test]
+    fn test_q3_k_family_cli_surface_iter10() {
+        // Display strings match the canonical wire names.
+        assert_eq!(QuantMethod::Q3KS.to_string(), "q3_k_s");
+        assert_eq!(QuantMethod::Q3KM.to_string(), "q3_k_m");
+        assert_eq!(QuantMethod::Q3KL.to_string(), "q3_k_l");
+        assert_eq!(QuantMethod::ImatrixQ3KS.to_string(), "imatrix-q3_k_s");
+        assert_eq!(QuantMethod::ImatrixQ3KM.to_string(), "imatrix-q3_k_m");
+        assert_eq!(QuantMethod::ImatrixQ3KL.to_string(), "imatrix-q3_k_l");
+
+        // Q3 family is K-quant, not DWQ.
+        for v in [
+            QuantMethod::Q3KS,
+            QuantMethod::Q3KM,
+            QuantMethod::Q3KL,
+            QuantMethod::ImatrixQ3KS,
+            QuantMethod::ImatrixQ3KM,
+            QuantMethod::ImatrixQ3KL,
+        ] {
+            assert_eq!(v.dwq_bit_pair(), None, "{v:?} should not be DWQ");
+            assert!(v.is_quantized(), "{v:?} should report is_quantized");
+        }
+
+        // Default filename suffix matches Display (no special-case for K-quant).
+        assert_eq!(QuantMethod::Q3KS.default_filename_suffix(), "q3_k_s");
+        assert_eq!(QuantMethod::Q3KM.default_filename_suffix(), "q3_k_m");
+        assert_eq!(QuantMethod::Q3KL.default_filename_suffix(), "q3_k_l");
+        assert_eq!(QuantMethod::ImatrixQ3KS.default_filename_suffix(), "imatrix-q3_k_s");
+    }
 
     #[test]
     fn test_gemma4_regression_dwq46_dispatch_unchanged() {

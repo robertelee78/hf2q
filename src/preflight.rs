@@ -445,6 +445,9 @@ fn estimate_output_size(metadata: &ModelMetadata, quant: &QuantMethod, bits: Opt
             let b = bits.unwrap_or(2) as f64;
             b * 1.1
         }
+        QuantMethod::Q3KS | QuantMethod::ImatrixQ3KS => 3.4375,
+        QuantMethod::Q3KM | QuantMethod::ImatrixQ3KM => 3.4375,
+        QuantMethod::Q3KL | QuantMethod::ImatrixQ3KL => 3.4375,
         QuantMethod::Q4KM | QuantMethod::ImatrixQ4KM => 4.5,
         QuantMethod::Q5KM | QuantMethod::ImatrixQ5KM => 5.5,
         QuantMethod::Q6K | QuantMethod::ImatrixQ6K => 6.5625,
