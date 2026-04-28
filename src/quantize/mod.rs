@@ -5246,6 +5246,105 @@ mod tests {
         );
     }
 
+    /// ADR-014 P7 iter-42 — streaming output flows cleanly through
+    /// backend validate.  Audit gate ahead of P2 iter-3 (production
+    /// `materialize_all()` bridge removal in `main.rs:1147`).
+    ///
+    /// Finding from this audit: `quantize_streaming` is built and
+    /// gated by 50+ tests but is NEVER called from production
+    /// `main.rs` — the `materialize_all()` bridge at line 1147 still
+    /// runs upfront, defeating the streaming-pipeline memory-budget
+    /// purpose.  P2 iter-3 (StreamingBackend production wiring +
+    /// per-tensor write-and-drop) remains the wedge.
+    ///
+    /// This test pins the contract that `quantize_streaming`'s output
+    /// shape is validation-clean against `GgufBackend::validate` — the
+    /// drop-in replacement for `quantize_model` is structurally safe.
+    /// When iter-3 lands, the wire-up should be a no-op behaviorally.
+    ///
+    /// Multi-tensor fixture spanning categorically-distinct layers:
+    /// streamingly quantize through Q4_K, then run the resulting
+    /// `QuantizedModel` through `GgufBackend::validate`.  Asserts: zero
+    /// warnings of severity≥`Error`.
+    #[test]
+    fn streaming_output_validates_clean_against_gguf_backend() {
+        use crate::backends::{gguf::GgufBackend, OutputBackend};
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::k_quant_codec::KQuantTarget;
+        use crate::quantize::k_quant_codec_quantizer::KQuantCodecQuantizer;
+
+        const QK_K: usize = 256;
+
+        // Multi-tensor fixture: a small but realistic shape that the
+        // backend's validate sees in production.  All non-vision, all
+        // weight-shaped, all 256-multiple — should validate clean.
+        let tensors: Vec<&str> = vec![
+            "blk.0.attn_q.weight",
+            "blk.0.attn_k.weight",
+            "blk.0.attn_v.weight",
+            "blk.0.attn_output.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_down.weight",
+            "blk.0.ffn_gate.weight",
+        ];
+
+        let make_payload = |seed: f32| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(QK_K * 2);
+            for i in 0..QK_K {
+                let v = (i as f32 / QK_K as f32) * 2.0 - 1.0 + seed * 0.001;
+                bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+            }
+            bytes
+        };
+
+        let mut lazy_map = LazyTensorMap::new();
+        for (i, name) in tensors.iter().enumerate() {
+            lazy_map.insert(LazyTensor::from_bytes(
+                LazyMeta::new(name.to_string(), vec![1, QK_K], DType::F16),
+                make_payload(i as f32),
+            ));
+        }
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+        let q = KQuantCodecQuantizer::new("Q4_K", KQuantTarget::Q4K, CalibrationData::None);
+
+        let model = quantize_streaming(lazy_map, &metadata, &q, 0, 0, &progress, false)
+            .expect("streaming quantize");
+
+        // Backend validate the output.  The validate contract is the
+        // gate main.rs:1147+ must satisfy when iter-3 wires
+        // `quantize_streaming` directly.  Any backend-level structural
+        // requirement (tensor name, ggml_type, byte count) the
+        // streaming path violates would surface here BEFORE the
+        // expensive write step.
+        let backend = GgufBackend::new();
+        let warnings = backend
+            .validate(&model)
+            .expect("validate must not error");
+
+        // Backend validate may emit informational warnings (e.g. about
+        // tensor count or naming conventions on a synthetic fixture)
+        // but must not emit Error-severity ones — those would block
+        // the iter-3 drop-in replacement.
+        let errors: Vec<_> = warnings
+            .iter()
+            .filter(|w| {
+                let s = format!("{:?}", w);
+                s.to_lowercase().contains("error")
+            })
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "streaming output failed validate with {} error-severity \
+             warnings: {:?} — `quantize_streaming` is NOT a drop-in \
+             replacement for `quantize_model` against GgufBackend",
+            errors.len(),
+            errors
+        );
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the

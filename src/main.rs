@@ -1144,6 +1144,18 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     // directly; until P2 lands, bridge through `materialize_all` once,
     // immediately before Phase 2's backend dispatch. After P2 the
     // bridge becomes test-only.
+    //
+    // **ADR-014 P7 iter-42 audit (2026-04-28)**: P2 iter-3 (production
+    // wiring of `quantize_streaming` into Phase 3 dispatch) remains
+    // pending.  `quantize::quantize_streaming` ships and is gated by
+    // 50+ matrix tests + the `streaming_output_validates_clean_against_gguf_backend`
+    // contract test in `quantize::tests`.  Drop-in is structurally
+    // safe against `GgufBackend::validate`; what's left is the surgery
+    // to skip `materialize_all()` here and pass `lazy_map` directly to
+    // the K-quant codec / variant / DwqK Phase 3 arms.  Phase 4.5
+    // quality measurement still requires `tensor_map` for the F32
+    // reference, so the wire-up needs a coherent story for that
+    // dependency (either lazy quality measurement or a re-read pass).
     let mut tensor_map = lazy_map
         .materialize_all()
         .context("Failed to materialise lazy tensor map (P1→P2 bridge)")
