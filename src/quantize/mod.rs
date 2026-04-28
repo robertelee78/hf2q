@@ -4541,6 +4541,122 @@ mod tests {
         }
     }
 
+    /// ADR-014 P7 iter-36 — pin iter-34's bug-fix contract permanently.
+    /// Direct regression-direction test for the bug fix landed in iter-34
+    /// (`5f42942`): `KQuantCodecQuantizer::quantize_tensor` was applying
+    /// `should_emit_f16_for_kquant`'s 256-multiple arm unconditionally,
+    /// causing legacy targets (which use 32-element blocks) to falsely
+    /// F16-passthrough on any 32-multiple-but-not-256-multiple row.
+    ///
+    /// Row length 96 = 3 × 32 (legal for legacy formats, NOT 256-multiple)
+    /// is the canonical falsification fixture: pre-iter-34, every legacy
+    /// target on this row would emit `ggml_type = "F16"` with 192 payload
+    /// bytes; post-iter-34, each emits its own legacy codec output.
+    ///
+    /// This test pins the gate so a future code-cleanup that removes the
+    /// `is_k_quant_target` branch (or "simplifies" the predicate to
+    /// always apply) is caught immediately.  Mirrors the iter-34
+    /// `legacy_target_streaming_round_trip_rmse_bounds` coverage that
+    /// originally exposed the bug, but at the row-length boundary
+    /// rather than the round-trip RMSE boundary.
+    #[test]
+    fn legacy_target_non_256_multiple_emits_legacy_not_f16() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::k_quant_codec::KQuantTarget;
+        use crate::quantize::k_quant_codec_quantizer::KQuantCodecQuantizer;
+
+        // Row length 96 = 3 × 32 elements: legal for every legacy codec
+        // (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 use 32-element blocks).  NOT a
+        // multiple of 256, so the K-quant alignment predicate fires —
+        // this is exactly the bug fixture from iter-34.
+        const ROW_LEN: usize = 96;
+        const N_BLOCKS_LEGACY: usize = ROW_LEN / 32;
+        const TENSOR: &str = "blk.0.attn_q.weight";
+
+        // Confirm pre-condition: `should_emit_f16_for_kquant` reports
+        // `true` on row_len=96 (the bug surface) — if this changes, the
+        // test fixture itself is no longer the canonical falsification.
+        assert!(
+            crate::quantize::layer_mix::should_emit_f16_for_kquant(TENSOR, ROW_LEN),
+            "ROW_LEN=96 must trigger the K-quant alignment predicate \
+             — otherwise this test fixture no longer falsifies the iter-34 bug"
+        );
+
+        // F16 payload for the row.
+        let payload: Vec<u8> = (0..ROW_LEN)
+            .map(|i| (i as f32 / ROW_LEN as f32) * 2.0 - 1.0)
+            .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+
+        let make_lazy_map = || -> LazyTensorMap {
+            let mut m = LazyTensorMap::new();
+            m.insert(LazyTensor::from_bytes(
+                LazyMeta::new(TENSOR.to_string(), vec![1, ROW_LEN], DType::F16),
+                payload.clone(),
+            ));
+            m
+        };
+
+        // (target, name, ggml_type, bytes_per_block)
+        let cases: Vec<(KQuantTarget, &str, &str, usize)> = vec![
+            (KQuantTarget::Q4Legacy,  "Q4_0", "Q4_0", 18),
+            (KQuantTarget::Q4Legacy1, "Q4_1", "Q4_1", 20),
+            (KQuantTarget::Q5Legacy0, "Q5_0", "Q5_0", 22),
+            (KQuantTarget::Q5Legacy1, "Q5_1", "Q5_1", 24),
+            (KQuantTarget::Q8Legacy,  "Q8_0", "Q8_0", 34),
+        ];
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+
+        for (target, name, ggml_type, bytes_per_block) in cases {
+            let q = KQuantCodecQuantizer::new(name, target, CalibrationData::None);
+            let out = quantize_streaming(make_lazy_map(), &metadata, &q, 0, 0, &progress, false)
+                .unwrap_or_else(|e| panic!("{name} streaming on row_len=96: {e:?}"));
+
+            let t = out
+                .tensors
+                .get(TENSOR)
+                .unwrap_or_else(|| panic!("{name} missing {TENSOR}"));
+
+            // Bug fixture: pre-iter-34 emitted `ggml_type=Some("F16")`,
+            // 192 bytes (96 × 2-byte F16).  Post-iter-34 must emit the
+            // requested legacy codec.
+            assert_eq!(
+                t.quant_info.ggml_type.as_deref(),
+                Some(ggml_type),
+                "{name} on row_len=96: emitted {:?} instead of {ggml_type} \
+                 — the iter-34 `is_k_quant_target` gate has regressed",
+                t.quant_info.ggml_type
+            );
+            assert_ne!(
+                t.quant_info.ggml_type.as_deref(),
+                Some("F16"),
+                "{name} on row_len=96: emitted F16 — the K-quant alignment \
+                 predicate has been re-applied to legacy targets"
+            );
+            assert_eq!(
+                t.data.len(),
+                N_BLOCKS_LEGACY * bytes_per_block,
+                "{name} on row_len=96: byte budget = N_BLOCKS_LEGACY × \
+                 bytes_per_block = {} × {} = {}",
+                N_BLOCKS_LEGACY,
+                bytes_per_block,
+                N_BLOCKS_LEGACY * bytes_per_block
+            );
+            // Cross-check: emitted bytes are NOT the F16 fallback (which
+            // would be 192 bytes for row_len=96).
+            assert_ne!(
+                t.data.len(),
+                ROW_LEN * 2,
+                "{name} on row_len=96: produced {} bytes (= F16 byte count) — \
+                 fell into the F16 passthrough arm",
+                ROW_LEN * 2
+            );
+        }
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
