@@ -76,6 +76,16 @@ pub enum LayerMixError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum KQuantVariant {
+    /// `Q3_K_S` — base Q3_K, minimal upgrades. Output bumps to Q6_K
+    /// per `llama-quant.cpp:439-460`.
+    Q3_K_S,
+    /// `Q3_K_M` — base Q3_K with attn_v Q5_K (i_layer<2) / Q4_K bump
+    /// per `llama-quant.cpp:527-528`, ffn_down Q5_K (i_layer<n/16) /
+    /// Q4_K (use_more_bits) / Q3_K bump per `:578-582`.
+    Q3_K_M,
+    /// `Q3_K_L` — base Q3_K with attn_v → Q5_K (`:530`) and ffn_down
+    /// → Q5_K (`:587-588`).  Output bumps to Q6_K.
+    Q3_K_L,
     /// `Q4_K_S` — base Q4_K, minimal upgrades.
     Q4_K_S,
     /// `Q4_K_M` — base Q4_K with token_embd/output → Q6_K, attn_v
@@ -95,6 +105,9 @@ impl KQuantVariant {
     /// Parse a user-supplied variant string.
     pub fn parse(variant: &str) -> Result<Self, LayerMixError> {
         match variant {
+            "Q3_K_S" | "q3_k_s" => Ok(Self::Q3_K_S),
+            "Q3_K_M" | "q3_k_m" | "Q3_K" | "q3_k" => Ok(Self::Q3_K_M),
+            "Q3_K_L" | "q3_k_l" => Ok(Self::Q3_K_L),
             "Q4_K_S" | "q4_k_s" => Ok(Self::Q4_K_S),
             "Q4_K_M" | "q4_k_m" | "Q4_K" | "q4_k" => Ok(Self::Q4_K_M),
             "Q5_K_S" | "q5_k_s" => Ok(Self::Q5_K_S),
@@ -110,6 +123,7 @@ impl KQuantVariant {
     /// per-tensor upgrades).
     pub fn base_target(&self) -> KQuantTarget {
         match self {
+            Self::Q3_K_S | Self::Q3_K_M | Self::Q3_K_L => KQuantTarget::Q3K,
             Self::Q4_K_S | Self::Q4_K_M => KQuantTarget::Q4K,
             Self::Q5_K_S | Self::Q5_K_M => KQuantTarget::Q5K,
             Self::Q6_K => KQuantTarget::Q6K,
@@ -119,6 +133,9 @@ impl KQuantVariant {
     /// Canonical name for logging / `quant_info.method` strings.
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Q3_K_S => "Q3_K_S",
+            Self::Q3_K_M => "Q3_K_M",
+            Self::Q3_K_L => "Q3_K_L",
             Self::Q4_K_S => "Q4_K_S",
             Self::Q4_K_M => "Q4_K_M",
             Self::Q5_K_S => "Q5_K_S",
@@ -133,6 +150,9 @@ impl KQuantVariant {
     /// the variants by hand.
     pub fn all() -> &'static [Self] {
         &[
+            Self::Q3_K_S,
+            Self::Q3_K_M,
+            Self::Q3_K_L,
             Self::Q4_K_S,
             Self::Q4_K_M,
             Self::Q5_K_S,
@@ -380,7 +400,15 @@ pub fn target_for(
 
     match category {
         TensorCategory::Output | TensorCategory::TokenEmbd => match variant {
-            KQuantVariant::Q4_K_M | KQuantVariant::Q5_K_M => KQuantTarget::Q6K,
+            // Q3_K_S/M/L all bump output → Q6_K per `llama-quant.cpp:439-460`
+            // (the OUTPUT branch falls through `else if (new_type !=
+            // GGML_TYPE_Q8_0) new_type = GGML_TYPE_Q6_K;` for K-family
+            // ftypes).
+            KQuantVariant::Q3_K_S
+            | KQuantVariant::Q3_K_M
+            | KQuantVariant::Q3_K_L
+            | KQuantVariant::Q4_K_M
+            | KQuantVariant::Q5_K_M => KQuantTarget::Q6K,
             _ => base,
         },
         // ATTENTION_V, ATTENTION_QKV, ATTENTION_KV_B — `category_is_attn_v`
@@ -403,6 +431,16 @@ pub fn target_for(
                     base
                 }
             }
+            // Q3_K_M: i_layer < 2 → Q5_K, else → Q4_K (`llama-quant.cpp:527-528`).
+            KQuantVariant::Q3_K_M => {
+                if i_layer < 2 {
+                    KQuantTarget::Q5K
+                } else {
+                    KQuantTarget::Q4K
+                }
+            }
+            // Q3_K_L: attn_v → Q5_K (`llama-quant.cpp:530`).
+            KQuantVariant::Q3_K_L => KQuantTarget::Q5K,
             _ => base,
         },
         TensorCategory::FfnDown => match variant {
@@ -413,6 +451,22 @@ pub fn target_for(
                     base
                 }
             }
+            // Q3_K_M ffn_down (`llama-quant.cpp:578-582`):
+            //   i_layer < n/16    → Q5_K
+            //   use_more_bits     → Q4_K
+            //   else              → Q3_K (base)
+            // (Falcon-arch override deferred — IR has no arch field here.)
+            KQuantVariant::Q3_K_M => {
+                if i_layer < n_layers / 16 {
+                    KQuantTarget::Q5K
+                } else if use_more_bits(i_layer, n_layers) {
+                    KQuantTarget::Q4K
+                } else {
+                    base
+                }
+            }
+            // Q3_K_L: ffn_down → Q5_K (`llama-quant.cpp:587-588`, non-Falcon path).
+            KQuantVariant::Q3_K_L => KQuantTarget::Q5K,
             _ => base,
         },
         // ATTENTION_K, ATTENTION_Q, ATTENTION_OUTPUT, FFN_UP, FFN_GATE,
@@ -471,9 +525,11 @@ mod tests {
 
     #[test]
     fn variant_parse_unknown_errors() {
-        let err = KQuantVariant::parse("Q3_K_M").unwrap_err();
+        // Q3_K_M is now a real variant (iter-9); use a still-unsupported
+        // IQ-family name to exercise the error path.
+        let err = KQuantVariant::parse("IQ2_M").unwrap_err();
         match err {
-            LayerMixError::UnknownVariant { variant } => assert_eq!(variant, "Q3_K_M"),
+            LayerMixError::UnknownVariant { variant } => assert_eq!(variant, "IQ2_M"),
         }
         assert!(KQuantVariant::parse("IQ4_NL").is_err());
         assert!(KQuantVariant::parse("garbage").is_err());
@@ -481,6 +537,9 @@ mod tests {
 
     #[test]
     fn variant_base_targets() {
+        assert_eq!(KQuantVariant::Q3_K_S.base_target(), KQuantTarget::Q3K);
+        assert_eq!(KQuantVariant::Q3_K_M.base_target(), KQuantTarget::Q3K);
+        assert_eq!(KQuantVariant::Q3_K_L.base_target(), KQuantTarget::Q3K);
         assert_eq!(KQuantVariant::Q4_K_S.base_target(), KQuantTarget::Q4K);
         assert_eq!(KQuantVariant::Q4_K_M.base_target(), KQuantTarget::Q4K);
         assert_eq!(KQuantVariant::Q5_K_S.base_target(), KQuantTarget::Q5K);
@@ -851,13 +910,16 @@ mod tests {
     #[test]
     fn variant_all_round_trips_through_name_and_parse() {
         let all = KQuantVariant::all();
-        assert_eq!(all.len(), 5, "exactly 5 supported variants");
+        assert_eq!(all.len(), 8, "exactly 8 supported variants (Q3_K_S/M/L added iter-9)");
         // canonical order matches the enum declaration
-        assert_eq!(all[0], KQuantVariant::Q4_K_S);
-        assert_eq!(all[1], KQuantVariant::Q4_K_M);
-        assert_eq!(all[2], KQuantVariant::Q5_K_S);
-        assert_eq!(all[3], KQuantVariant::Q5_K_M);
-        assert_eq!(all[4], KQuantVariant::Q6_K);
+        assert_eq!(all[0], KQuantVariant::Q3_K_S);
+        assert_eq!(all[1], KQuantVariant::Q3_K_M);
+        assert_eq!(all[2], KQuantVariant::Q3_K_L);
+        assert_eq!(all[3], KQuantVariant::Q4_K_S);
+        assert_eq!(all[4], KQuantVariant::Q4_K_M);
+        assert_eq!(all[5], KQuantVariant::Q5_K_S);
+        assert_eq!(all[6], KQuantVariant::Q5_K_M);
+        assert_eq!(all[7], KQuantVariant::Q6_K);
         // every variant round-trips through its name string
         for v in all {
             let parsed = KQuantVariant::parse(v.name())
@@ -972,6 +1034,136 @@ mod tests {
         assert_eq!(
             TensorCategory::classify("blk.0.attn_output.weight"),
             TensorCategory::AttentionOutput
+        );
+    }
+
+    // ── iter-9: Q3_K_S/M/L policy tests ───────────────────────────
+
+    /// Q3_K_S: minimal upgrades — base Q3_K everywhere except output
+    /// (Q6_K bump per `llama-quant.cpp:439-460`).
+    #[test]
+    fn target_q3_k_s_minimal_upgrades() {
+        assert_eq!(
+            target_for(KQuantVariant::Q3_K_S, "output.weight", 0, 32),
+            KQuantTarget::Q6K,
+            "Q3_K_S output should bump to Q6_K"
+        );
+        // attn_v stays Q3_K base
+        assert_eq!(
+            target_for(KQuantVariant::Q3_K_S, "blk.0.attn_v.weight", 0, 32),
+            KQuantTarget::Q3K,
+        );
+        // ffn_down stays Q3_K base
+        assert_eq!(
+            target_for(KQuantVariant::Q3_K_S, "blk.0.ffn_down.weight", 0, 32),
+            KQuantTarget::Q3K,
+        );
+        assert_eq!(
+            target_for(KQuantVariant::Q3_K_S, "blk.5.attn_q.weight", 5, 32),
+            KQuantTarget::Q3K,
+        );
+    }
+
+    /// Q3_K_M: attn_v `i_layer<2 → Q5_K, else → Q4_K`
+    /// (`llama-quant.cpp:527-528`); ffn_down per :578-582.
+    #[test]
+    fn target_q3_k_m_attn_v_first_two_layers_q5k() {
+        // layer 0, 1 → Q5_K
+        assert_eq!(
+            target_for(KQuantVariant::Q3_K_M, "blk.0.attn_v.weight", 0, 32),
+            KQuantTarget::Q5K,
+        );
+        assert_eq!(
+            target_for(KQuantVariant::Q3_K_M, "blk.1.attn_v.weight", 1, 32),
+            KQuantTarget::Q5K,
+        );
+        // layer 2+ → Q4_K
+        assert_eq!(
+            target_for(KQuantVariant::Q3_K_M, "blk.2.attn_v.weight", 2, 32),
+            KQuantTarget::Q4K,
+        );
+        assert_eq!(
+            target_for(KQuantVariant::Q3_K_M, "blk.30.attn_v.weight", 30, 32),
+            KQuantTarget::Q4K,
+        );
+    }
+
+    /// Q3_K_M ffn_down policy:
+    ///   i_layer < n_layer/16     → Q5_K
+    ///   use_more_bits(i, n)      → Q4_K
+    ///   else                     → Q3_K (base)
+    #[test]
+    fn target_q3_k_m_ffn_down_layer_bands() {
+        const N: usize = 32; // n/16 = 2; n/8 = 4; 7n/8 = 28
+        // i_layer = 0, 1 (i < n/16=2) → Q5_K
+        assert_eq!(
+            target_for(KQuantVariant::Q3_K_M, "blk.0.ffn_down.weight", 0, N),
+            KQuantTarget::Q5K
+        );
+        assert_eq!(
+            target_for(KQuantVariant::Q3_K_M, "blk.1.ffn_down.weight", 1, N),
+            KQuantTarget::Q5K
+        );
+        // i_layer = 2, 3 (i ≥ n/16, but i < n/8 → use_more_bits=true) → Q4_K
+        assert_eq!(
+            target_for(KQuantVariant::Q3_K_M, "blk.2.ffn_down.weight", 2, N),
+            KQuantTarget::Q4K
+        );
+        assert_eq!(
+            target_for(KQuantVariant::Q3_K_M, "blk.3.ffn_down.weight", 3, N),
+            KQuantTarget::Q4K
+        );
+        // i_layer = 30, 31 (last 1/8 → use_more_bits=true) → Q4_K
+        assert_eq!(
+            target_for(KQuantVariant::Q3_K_M, "blk.30.ffn_down.weight", 30, N),
+            KQuantTarget::Q4K
+        );
+        // i_layer = 6 (every-3rd-after-eighth: (6-4)%3=2 → use_more_bits=true) → Q4_K
+        assert_eq!(
+            target_for(KQuantVariant::Q3_K_M, "blk.6.ffn_down.weight", 6, N),
+            KQuantTarget::Q4K
+        );
+        // i_layer = 5 (middle, not every-3rd) → use_more_bits=false → Q3_K base
+        assert_eq!(
+            target_for(KQuantVariant::Q3_K_M, "blk.5.ffn_down.weight", 5, N),
+            KQuantTarget::Q3K
+        );
+    }
+
+    /// Q3_K_L: attn_v always Q5_K (`:530`); ffn_down always Q5_K (`:587-588`).
+    #[test]
+    fn target_q3_k_l_attn_v_and_ffn_down_q5k() {
+        for i_layer in [0_usize, 5, 15, 30] {
+            assert_eq!(
+                target_for(
+                    KQuantVariant::Q3_K_L,
+                    &format!("blk.{i_layer}.attn_v.weight"),
+                    i_layer,
+                    32
+                ),
+                KQuantTarget::Q5K,
+                "Q3_K_L attn_v at i={i_layer} should be Q5_K"
+            );
+            assert_eq!(
+                target_for(
+                    KQuantVariant::Q3_K_L,
+                    &format!("blk.{i_layer}.ffn_down.weight"),
+                    i_layer,
+                    32
+                ),
+                KQuantTarget::Q5K,
+                "Q3_K_L ffn_down at i={i_layer} should be Q5_K"
+            );
+        }
+        // output bumps to Q6_K
+        assert_eq!(
+            target_for(KQuantVariant::Q3_K_L, "output.weight", 0, 32),
+            KQuantTarget::Q6K,
+        );
+        // attn_q stays Q3_K base
+        assert_eq!(
+            target_for(KQuantVariant::Q3_K_L, "blk.5.attn_q.weight", 5, 32),
+            KQuantTarget::Q3K,
         );
     }
 }

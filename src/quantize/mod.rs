@@ -1615,6 +1615,7 @@ mod tests {
         for variant in KQuantVariant::all() {
             // expected block size from the variant's base target
             let (expected_type, expected_bytes): (&str, usize) = match variant.base_target() {
+                crate::quantize::k_quant_codec::KQuantTarget::Q3K => ("Q3_K", 110),
                 crate::quantize::k_quant_codec::KQuantTarget::Q4K => ("Q4_K", 144),
                 crate::quantize::k_quant_codec::KQuantTarget::Q5K => ("Q5_K", 176),
                 crate::quantize::k_quant_codec::KQuantTarget::Q6K => ("Q6_K", 210),

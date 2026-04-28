@@ -123,6 +123,7 @@ fn tensor_to_f32(tensor: &TensorRef) -> Result<Vec<f32>, QuantizeError> {
 /// Map a [`KQuantTarget`] back to its canonical GGUF name string.
 fn target_to_ggml_name(target: KQuantTarget) -> String {
     match target {
+        KQuantTarget::Q3K => "Q3_K".to_string(),
         KQuantTarget::Q4K => "Q4_K".to_string(),
         KQuantTarget::Q5K => "Q5_K".to_string(),
         KQuantTarget::Q6K => "Q6_K".to_string(),

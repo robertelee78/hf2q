@@ -318,6 +318,7 @@ impl Quantizer for DwqKQuantizer {
 /// read-only fence on that file.
 fn kquant_target_short_name(target: KQuantTarget) -> &'static str {
     match target {
+        KQuantTarget::Q3K => "q3_k",
         KQuantTarget::Q4K => "q4_k",
         KQuantTarget::Q5K => "q5_k",
         KQuantTarget::Q6K => "q6_k",

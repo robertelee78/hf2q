@@ -33,6 +33,7 @@ use thiserror::Error;
 
 use crate::calibrate::calibrator::CalibrationData;
 use crate::quantize::k_quant::{
+    quantize_row_q3_k_imatrix_to_bytes, quantize_row_q3_k_to_bytes,
     quantize_row_q4_k_imatrix_to_bytes, quantize_row_q4_k_to_bytes,
     quantize_row_q5_k_imatrix_to_bytes, quantize_row_q5_k_to_bytes,
     quantize_row_q6_k_imatrix_to_bytes, quantize_row_q6_k_to_bytes, KQuantError,
@@ -52,6 +53,12 @@ use crate::quantize::q_legacy::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KQuantTarget {
     // K-family (256-element super-blocks).
+    /// `Q3_K_M` / `Q3_K_S` / `Q3_K_L` / `Q3_K`. 3.4375 bpw, super-block
+    /// scale only (no min term), 16 sub-blocks of 16 elements.
+    /// Per-element 3 bits = 1 bit (hmask) + 2 bits (qs); per-sub-block
+    /// scales packed at 6 bits each. 110 bytes/block (smaller than
+    /// Q4_K's 144 bytes).
+    Q3K,
     /// `Q4_K_M` / `Q4_K_S` / `Q4_K`. 4.5 bpw, super-block scale +
     /// per-sub-block min term, 8 sub-blocks of 32 elements.
     Q4K,
@@ -89,6 +96,7 @@ impl KQuantTarget {
             6 => Some(Self::Q5Legacy0), // GGML_TYPE_Q5_0
             7 => Some(Self::Q5Legacy1), // GGML_TYPE_Q5_1
             8 => Some(Self::Q8Legacy),  // GGML_TYPE_Q8_0
+            11 => Some(Self::Q3K),      // GGML_TYPE_Q3_K
             12 => Some(Self::Q4K),      // GGML_TYPE_Q4_K
             13 => Some(Self::Q5K),      // GGML_TYPE_Q5_K
             14 => Some(Self::Q6K),      // GGML_TYPE_Q6_K
@@ -104,6 +112,7 @@ impl KQuantTarget {
             Self::Q5Legacy0 => 6,
             Self::Q5Legacy1 => 7,
             Self::Q8Legacy => 8,
+            Self::Q3K => 11,
             Self::Q4K => 12,
             Self::Q5K => 13,
             Self::Q6K => 14,
@@ -113,6 +122,7 @@ impl KQuantTarget {
     /// Bytes per block on disk.
     pub fn bytes_per_block(&self) -> usize {
         match self {
+            Self::Q3K => crate::quantize::k_quant::BLOCK_Q3_K_SIZE,
             Self::Q4K => crate::quantize::k_quant::BLOCK_Q4_K_SIZE,
             Self::Q5K => crate::quantize::k_quant::BLOCK_Q5_K_SIZE,
             Self::Q6K => crate::quantize::k_quant::BLOCK_Q6_K_SIZE,
@@ -127,7 +137,7 @@ impl KQuantTarget {
     /// Number of elements per block. K-family: 256. Legacy: 32.
     pub fn elements_per_block(&self) -> usize {
         match self {
-            Self::Q4K | Self::Q5K | Self::Q6K => crate::quantize::k_quant::QK_K,
+            Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => crate::quantize::k_quant::QK_K,
             Self::Q4Legacy => crate::quantize::q_legacy::QK4_0,
             Self::Q4Legacy1 => crate::quantize::q_legacy::QK4_1,
             Self::Q5Legacy0 => crate::quantize::q_legacy::QK5_0,
@@ -139,13 +149,14 @@ impl KQuantTarget {
     /// Whether this target supports imatrix-weighted codebook search.
     /// Only K-family does — legacy formats use the `_ref` path.
     pub fn supports_imatrix(&self) -> bool {
-        matches!(self, Self::Q4K | Self::Q5K | Self::Q6K)
+        matches!(self, Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K)
     }
 
     /// Bits per weight (effective storage cost). Includes per-block
     /// metadata overhead.
     pub fn bpw(&self) -> f32 {
         match self {
+            Self::Q3K => 3.4375,
             Self::Q4K => 4.5,
             Self::Q5K => 5.5,
             Self::Q6K => 6.5625,
@@ -164,6 +175,7 @@ impl KQuantTarget {
     /// test fixtures.
     pub fn all() -> &'static [Self] {
         &[
+            Self::Q3K,
             Self::Q4K,
             Self::Q5K,
             Self::Q6K,
@@ -270,6 +282,8 @@ pub fn quantize_row_to_bytes(
 
     let bytes = match (target, weights) {
         // K-family: imatrix-weighted when available, else _ref.
+        (KQuantTarget::Q3K, Some(w)) => quantize_row_q3_k_imatrix_to_bytes(row, w)?,
+        (KQuantTarget::Q3K, None) => quantize_row_q3_k_to_bytes(row)?,
         (KQuantTarget::Q4K, Some(w)) => quantize_row_q4_k_imatrix_to_bytes(row, w)?,
         (KQuantTarget::Q4K, None) => quantize_row_q4_k_to_bytes(row)?,
         (KQuantTarget::Q5K, Some(w)) => quantize_row_q5_k_imatrix_to_bytes(row, w)?,
@@ -370,6 +384,7 @@ mod tests {
     #[test]
     fn target_ggml_type_round_trip() {
         for t in [
+            KQuantTarget::Q3K,
             KQuantTarget::Q4K,
             KQuantTarget::Q5K,
             KQuantTarget::Q6K,
@@ -392,6 +407,7 @@ mod tests {
     #[test]
     fn target_bytes_per_block() {
         // K-family
+        assert_eq!(KQuantTarget::Q3K.bytes_per_block(), 110);
         assert_eq!(KQuantTarget::Q4K.bytes_per_block(), 144);
         assert_eq!(KQuantTarget::Q5K.bytes_per_block(), 176);
         assert_eq!(KQuantTarget::Q6K.bytes_per_block(), 210);
@@ -405,6 +421,7 @@ mod tests {
     /// `KQuantTarget::elements_per_block`: 256 for K-family, 32 for legacy.
     #[test]
     fn target_elements_per_block() {
+        assert_eq!(KQuantTarget::Q3K.elements_per_block(), 256);
         assert_eq!(KQuantTarget::Q4K.elements_per_block(), 256);
         assert_eq!(KQuantTarget::Q5K.elements_per_block(), 256);
         assert_eq!(KQuantTarget::Q6K.elements_per_block(), 256);
@@ -418,6 +435,7 @@ mod tests {
     /// codebook search.
     #[test]
     fn target_supports_imatrix() {
+        assert!(KQuantTarget::Q3K.supports_imatrix());
         assert!(KQuantTarget::Q4K.supports_imatrix());
         assert!(KQuantTarget::Q5K.supports_imatrix());
         assert!(KQuantTarget::Q6K.supports_imatrix());
@@ -427,9 +445,10 @@ mod tests {
         assert!(!KQuantTarget::Q8Legacy.supports_imatrix());
     }
 
-    /// `bpw` returns documented values for all 7 targets.
+    /// `bpw` returns documented values for all 9 targets (Q3_K added iter-9).
     #[test]
     fn target_bpw() {
+        assert!((KQuantTarget::Q3K.bpw() - 3.4375).abs() < 1e-4);
         assert!((KQuantTarget::Q4K.bpw() - 4.5).abs() < 1e-4);
         assert!((KQuantTarget::Q5K.bpw() - 5.5).abs() < 1e-4);
         assert!((KQuantTarget::Q6K.bpw() - 6.5625).abs() < 1e-4);
@@ -886,7 +905,8 @@ mod tests {
         n: usize,
     ) -> Vec<f32> {
         use crate::quantize::k_quant::{
-            dequantize_row_q4_k_bytes, dequantize_row_q5_k_bytes, dequantize_row_q6_k_bytes,
+            dequantize_row_q3_k_bytes, dequantize_row_q4_k_bytes, dequantize_row_q5_k_bytes,
+            dequantize_row_q6_k_bytes,
         };
         use crate::quantize::q_legacy::{
             dequantize_row_q4_0_bytes, dequantize_row_q5_0_bytes, dequantize_row_q5_1_bytes,
@@ -895,6 +915,9 @@ mod tests {
 
         let mut out = vec![0.0_f32; n];
         match target {
+            KQuantTarget::Q3K => {
+                dequantize_row_q3_k_bytes(bytes, &mut out).unwrap();
+            }
             KQuantTarget::Q4K => {
                 dequantize_row_q4_k_bytes(bytes, &mut out).unwrap();
             }
@@ -926,6 +949,7 @@ mod tests {
 
     fn rmse_bound_for(target: KQuantTarget) -> f64 {
         match target {
+            KQuantTarget::Q3K => 0.10,
             KQuantTarget::Q4K => 0.05,
             KQuantTarget::Q5K => 0.025,
             KQuantTarget::Q6K => 0.012,
@@ -1326,17 +1350,18 @@ mod tests {
     #[test]
     fn target_all_round_trips_metadata() {
         let all = KQuantTarget::all();
-        assert_eq!(all.len(), 8, "exactly 8 supported codec targets");
+        assert_eq!(all.len(), 9, "exactly 9 supported codec targets (Q3_K added iter-9)");
 
         // canonical order: K-family first, then legacy
-        assert_eq!(all[0], KQuantTarget::Q4K);
-        assert_eq!(all[1], KQuantTarget::Q5K);
-        assert_eq!(all[2], KQuantTarget::Q6K);
-        assert_eq!(all[3], KQuantTarget::Q4Legacy);
-        assert_eq!(all[4], KQuantTarget::Q4Legacy1);
-        assert_eq!(all[5], KQuantTarget::Q5Legacy0);
-        assert_eq!(all[6], KQuantTarget::Q5Legacy1);
-        assert_eq!(all[7], KQuantTarget::Q8Legacy);
+        assert_eq!(all[0], KQuantTarget::Q3K);
+        assert_eq!(all[1], KQuantTarget::Q4K);
+        assert_eq!(all[2], KQuantTarget::Q5K);
+        assert_eq!(all[3], KQuantTarget::Q6K);
+        assert_eq!(all[4], KQuantTarget::Q4Legacy);
+        assert_eq!(all[5], KQuantTarget::Q4Legacy1);
+        assert_eq!(all[6], KQuantTarget::Q5Legacy0);
+        assert_eq!(all[7], KQuantTarget::Q5Legacy1);
+        assert_eq!(all[8], KQuantTarget::Q8Legacy);
 
         // every target round-trips through ggml_type
         for &target in all {
@@ -1354,7 +1379,7 @@ mod tests {
 
             // K-family supports imatrix; legacy doesn't.
             let expected_imatrix = matches!(target,
-                KQuantTarget::Q4K | KQuantTarget::Q5K | KQuantTarget::Q6K);
+                KQuantTarget::Q3K | KQuantTarget::Q4K | KQuantTarget::Q5K | KQuantTarget::Q6K);
             assert_eq!(
                 target.supports_imatrix(), expected_imatrix,
                 "{target:?}: supports_imatrix mismatch"
