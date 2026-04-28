@@ -101,6 +101,11 @@ pub fn quantize_f32_to_q8_0_buffer(
     let mut buf = device
         .alloc_buffer(total_bytes, DType::U8, shape)
         .map_err(|e| anyhow!("quantize_f32_to_q8_0_buffer: alloc_buffer: {e}"))?;
+    // W-5b.7 iter 2: register the Q8_0 weight buffer with the weight pool's
+    // residency set so it joins MTLResidencySet for cold-page-fault avoidance
+    // on the first forward pass.  No-op when HF2Q_NO_RESIDENCY=1.
+    super::weight_pool::register_weight_buffer(device, &buf)
+        .map_err(|e| anyhow!("quantize_f32_to_q8_0_buffer: register_weight_buffer: {e}"))?;
 
     {
         let dst: &mut [u8] = buf

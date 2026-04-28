@@ -54,7 +54,8 @@ use super::gpu_ffn::{
 };
 use super::gpu_full_attn::{
     apply_linear_projection_f32, apply_linear_projection_f32_into, build_gated_attn_layer,
-    download_f32, upload_f32, upload_f32_into, upload_q4_0_from_f32, FullAttnWeightsGpu,
+    download_f32, upload_f32, upload_f32_into, upload_f32_weight, upload_q4_0_from_f32,
+    FullAttnWeightsGpu,
 };
 use super::io_heads::embed_tokens;
 use super::kv_cache::HybridKvCache;
@@ -586,7 +587,10 @@ impl Qwen35Model {
                 let device = MlxDevice::new().context("forward_gpu: MlxDevice::new")?;
                 let mut registry = KernelRegistry::new();
                 let layer_weights = self.upload_layer_weights_gpu(&device)?;
-                let lm_head_f32 = upload_f32(&self.output_weight, &device)
+                // W-5b.7 iter 2: lm_head F32 / Q4_0 + output_norm join the
+                // weight pool's residency set via the `_weight` / Q4_0
+                // helpers (which auto-register).
+                let lm_head_f32 = upload_f32_weight(&self.output_weight, &device)
                     .context("upload lm_head")?;
                 // Pre-cast lm_head F32 → BF16 once at load time.
                 // apply_linear_projection_f32 detects DType::BF16 and skips
@@ -609,6 +613,9 @@ impl Qwen35Model {
                     )
                     .context("cast lm_head F32→BF16 at load")?;
                     enc.commit_and_wait().context("commit lm_head cast")?;
+                    // W-5b.7 iter 2: register the BF16 lm_head copy.
+                    super::weight_pool::register_weight_buffer(&device, &bf16_buf)
+                        .map_err(|e| anyhow!("register lm_head_bf16: {e}"))?;
                     bf16_buf
                 };
                 // Pre-quantize lm_head to Q4_0 for decode (M=1) — 3.57× less
@@ -617,7 +624,7 @@ impl Qwen35Model {
                 let lm_head_q4 = upload_q4_0_from_f32(&self.output_weight, &device)
                     .context("upload lm_head_q4")?;
                 let output_head = OutputHeadGpu {
-                    norm_w: upload_f32(&self.output_norm, &device)
+                    norm_w: upload_f32_weight(&self.output_norm, &device)
                         .context("upload output_norm")?,
                     lm_head: lm_head_f32,
                     lm_head_bf16,
@@ -1110,7 +1117,8 @@ impl Qwen35Model {
                 let device = MlxDevice::new().context("forward_gpu_greedy: MlxDevice::new")?;
                 let mut registry = KernelRegistry::new();
                 let layer_weights = self.upload_layer_weights_gpu(&device)?;
-                let lm_head_f32 = upload_f32(&self.output_weight, &device)
+                // W-5b.7 iter 2: residency-aware uploads for lm_head and norm.
+                let lm_head_f32 = upload_f32_weight(&self.output_weight, &device)
                     .context("upload lm_head")?;
                 let n_w = self.output_weight.len();
                 let lm_head_bf16 = {
@@ -1130,12 +1138,14 @@ impl Qwen35Model {
                     )
                     .context("cast lm_head F32→BF16 at load")?;
                     enc.commit_and_wait().context("commit lm_head cast")?;
+                    super::weight_pool::register_weight_buffer(&device, &bf16_buf)
+                        .map_err(|e| anyhow!("register lm_head_bf16 greedy: {e}"))?;
                     bf16_buf
                 };
                 let lm_head_q4 = upload_q4_0_from_f32(&self.output_weight, &device)
                     .context("upload lm_head_q4 greedy")?;
                 let output_head = OutputHeadGpu {
-                    norm_w: upload_f32(&self.output_norm, &device)
+                    norm_w: upload_f32_weight(&self.output_norm, &device)
                         .context("upload output_norm")?,
                     lm_head: lm_head_f32,
                     lm_head_bf16,

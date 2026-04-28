@@ -78,7 +78,7 @@ use mlx_native::ops::ssm_norm_gate::{build_ssm_norm_gate_params, dispatch_ssm_no
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::delta_net::DeltaNetLayerWeights;
-use super::gpu_full_attn::{download_f32, upload_f32, upload_q4_0_from_f32};
+use super::gpu_full_attn::{download_f32, upload_f32, upload_f32_weight, upload_q4_0_from_f32};
 use crate::debug::INVESTIGATION_ENV;
 
 /// Wave 5b iter 5 — chunk-pipeline prefill threshold.
@@ -178,15 +178,17 @@ impl DeltaNetWeightsGpu {
         );
         Ok(Self {
             // Small F32 weights: consumed by custom kernels (rms_norm, ssm_conv,
-            // compute_g_beta, ssm_norm_gate) that require F32 input.
-            attn_norm: upload_f32(&weights.attn_norm, device)?,
-            post_attn_norm: upload_f32(&weights.post_attn_norm, device)?,
-            ssm_conv1d: upload_f32(&conv1d_t, device)?,
-            ssm_dt_bias: upload_f32(&weights.ssm_dt_bias, device)?,
+            // compute_g_beta, ssm_norm_gate) that require F32 input.  W-5b.7
+            // iter 2: registered with the weight pool's residency set via the
+            // `_weight` helper so they're pinned for cold first-forward.
+            attn_norm: upload_f32_weight(&weights.attn_norm, device)?,
+            post_attn_norm: upload_f32_weight(&weights.post_attn_norm, device)?,
+            ssm_conv1d: upload_f32_weight(&conv1d_t, device)?,
+            ssm_dt_bias: upload_f32_weight(&weights.ssm_dt_bias, device)?,
             ssm_dt_bias_cpu: weights.ssm_dt_bias.clone(),
-            ssm_a: upload_f32(&weights.ssm_a, device)?,
+            ssm_a: upload_f32_weight(&weights.ssm_a, device)?,
             ssm_a_cpu: weights.ssm_a.clone(),
-            ssm_norm: upload_f32(&weights.ssm_norm, device)?,
+            ssm_norm: upload_f32_weight(&weights.ssm_norm, device)?,
             ssm_norm_cpu: weights.ssm_norm.clone(),
             // Large projection weights: quantized to Q4_0 GGML blocks for 3.56×
             // bandwidth reduction vs BF16.  Uses quantized_matmul_ggml dispatch_mv

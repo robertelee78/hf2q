@@ -97,15 +97,18 @@ impl FullAttnWeightsGpu {
     /// precise but produces the same token selections in practice (sourdough gate
     /// must confirm).
     pub fn from_cpu(weights: &FullAttnLayerWeights, device: &MlxDevice) -> Result<Self> {
+        // W-5b.7 iter 2: F32 norm weights uploaded via the residency-aware
+        // helper so they join MTLResidencySet alongside the Q4_0 projection
+        // buffers (`upload_q4_0_from_f32` registers internally).
         Ok(Self {
-            attn_norm: upload_f32(&weights.attn_norm, device)?,
-            post_attn_norm: upload_f32(&weights.post_attn_norm, device)?,
+            attn_norm: upload_f32_weight(&weights.attn_norm, device)?,
+            post_attn_norm: upload_f32_weight(&weights.post_attn_norm, device)?,
             wq:     upload_q4_0_from_f32(&weights.wq, device)?,
             wk:     upload_q4_0_from_f32(&weights.wk, device)?,
             wv:     upload_q4_0_from_f32(&weights.wv, device)?,
             w_gate: upload_q4_0_from_f32(&weights.w_gate, device)?,
-            attn_q_norm: upload_f32(&weights.attn_q_norm, device)?,
-            attn_k_norm: upload_f32(&weights.attn_k_norm, device)?,
+            attn_q_norm: upload_f32_weight(&weights.attn_q_norm, device)?,
+            attn_k_norm: upload_f32_weight(&weights.attn_k_norm, device)?,
             wo:     upload_q4_0_from_f32(&weights.wo, device)?,
         })
     }
@@ -161,6 +164,10 @@ fn f32_to_bf16_rne(v: f32) -> u16 {
 /// can skip the per-inference F32→BF16 cast in `apply_linear_projection_f32`.
 /// One-time cost at model load vs repeated ~33MB cast per decode step.
 /// Uses round-to-nearest-even to match Metal hardware BF16 rounding.
+///
+/// **Wave 5b.7 iter 2:** the resulting buffer is registered with the
+/// thread-local weight pool's `MTLResidencySet` so it stays hinted-resident
+/// across forward passes (no-op when `HF2Q_NO_RESIDENCY=1`).
 pub fn upload_bf16_from_f32(data: &[f32], device: &MlxDevice) -> Result<MlxBuffer> {
     let n = data.len();
     let byte_len = n * 2; // 2 bytes per bf16
@@ -175,6 +182,8 @@ pub fn upload_bf16_from_f32(data: &[f32], device: &MlxDevice) -> Result<MlxBuffe
             slice[i] = f32_to_bf16_rne(v);
         }
     }
+    super::weight_pool::register_weight_buffer(device, &buf)
+        .map_err(|e| anyhow!("register_weight_buffer bf16 len={n}: {e}"))?;
     Ok(buf)
 }
 
@@ -229,6 +238,9 @@ pub fn upload_q4_0_from_f32(data: &[f32], device: &MlxDevice) -> Result<MlxBuffe
             .map_err(|e| anyhow!("mut_slice q4_0: {e}"))?;
         slice.copy_from_slice(&blocks);
     }
+    // Wave 5b.7 iter 2: register with the weight pool's residency set.
+    super::weight_pool::register_weight_buffer(device, &buf)
+        .map_err(|e| anyhow!("register_weight_buffer q4_0 len={byte_len}: {e}"))?;
     Ok(buf)
 }
 
@@ -247,6 +259,25 @@ pub fn upload_f32(data: &[f32], device: &MlxDevice) -> Result<MlxBuffer> {
             .map_err(|e| anyhow!("mut_slice: {e}"))?;
         slice.copy_from_slice(data);
     }
+    Ok(buf)
+}
+
+/// Same as [`upload_f32`] but additionally registers the resulting buffer
+/// with the thread-local weight pool's `MTLResidencySet` so it stays
+/// hinted-resident across forward passes.
+///
+/// **Wave 5b.7 iter 2:** call this for *long-lived weight tensors* (norm
+/// weights, embedding tables, LM-head copies, MTP head weights).  Do **not**
+/// call this for transient per-forward activations — `MlxBufferPool`
+/// retains the Metal allocation in its residency hashmap, which would
+/// pin transient buffers across forward boundaries (effective memory
+/// leak).
+///
+/// No-op when `HF2Q_NO_RESIDENCY=1` is set.
+pub fn upload_f32_weight(data: &[f32], device: &MlxDevice) -> Result<MlxBuffer> {
+    let buf = upload_f32(data, device)?;
+    super::weight_pool::register_weight_buffer(device, &buf)
+        .map_err(|e| anyhow!("register_weight_buffer f32 len={}: {e}", data.len()))?;
     Ok(buf)
 }
 

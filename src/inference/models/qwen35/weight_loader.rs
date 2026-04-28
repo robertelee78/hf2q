@@ -124,6 +124,30 @@ pub fn load_f32_tensor(
     Ok(slice.to_vec())
 }
 
+/// Load a quantized tensor as raw GGML blocks (DType::U8 on Metal) and
+/// register the resulting Metal buffer with the thread-local weight pool's
+/// `MTLResidencySet`.
+///
+/// **Wave 5b.7 iter 2:** this is the residency-aware drop-in for the bare
+/// `GgufFile::load_tensor` calls used by per-layer MoE / dense quantized
+/// loaders.  It is a thin wrapper around the public
+/// [`mlx_native::gguf::GgufFile::load_tensor`] + the public
+/// [`super::weight_pool::register_weight_buffer`] helper.  No bucket-rounding
+/// — buffers are allocated at their exact GGML byte length.  No-op for the
+/// residency call when `HF2Q_NO_RESIDENCY=1`.
+fn load_tensor_with_residency(
+    gguf: &GgufFile,
+    name: &str,
+    device: &MlxDevice,
+) -> Result<MlxBuffer> {
+    let buf = gguf
+        .load_tensor(name, device)
+        .map_err(|e| anyhow!("load_tensor({name}): {e}"))?;
+    super::weight_pool::register_weight_buffer(device, &buf)
+        .map_err(|e| anyhow!("register_weight_buffer({name}): {e}"))?;
+    Ok(buf)
+}
+
 /// Load the global tensors (`token_embd`, `output`, `output_norm`) from
 /// a GGUF into flat f32 vectors.
 pub fn load_global_tensors(
@@ -475,6 +499,10 @@ fn upload_lazy_raw_u8(
             .map_err(|e| anyhow!("as_mut_slice({name}): {e}"))?;
         dst.copy_from_slice(&tensor.data);
     }
+    // W-5b.7 iter 2: register lazy-loaded raw U8 weight blocks with the
+    // weight pool's residency set.
+    super::weight_pool::register_weight_buffer(device, &buf)
+        .map_err(|e| anyhow!("register_weight_buffer({name}): {e}"))?;
     Ok(buf)
 }
 
@@ -988,15 +1016,16 @@ pub fn load_moe_ffn_quantized(
     let shared_down = load_f32_tensor(gguf, &format!("{p}.ffn_down_shexp.weight"), device)?;
 
     // Expert weights: load raw GGML blocks, preserving quantization.
-    let expert_gate_q = gguf
-        .load_tensor(&format!("{p}.ffn_gate_exps.weight"), device)
-        .with_context(|| format!("layer {layer_idx} ffn_gate_exps (quantized)"))?;
-    let expert_up_q = gguf
-        .load_tensor(&format!("{p}.ffn_up_exps.weight"), device)
-        .with_context(|| format!("layer {layer_idx} ffn_up_exps (quantized)"))?;
-    let expert_down_q = gguf
-        .load_tensor(&format!("{p}.ffn_down_exps.weight"), device)
-        .with_context(|| format!("layer {layer_idx} ffn_down_exps (quantized)"))?;
+    // W-5b.7 iter 2: residency-aware via `load_tensor_with_residency`.
+    let expert_gate_q = load_tensor_with_residency(
+        gguf, &format!("{p}.ffn_gate_exps.weight"), device,
+    ).with_context(|| format!("layer {layer_idx} ffn_gate_exps (quantized)"))?;
+    let expert_up_q = load_tensor_with_residency(
+        gguf, &format!("{p}.ffn_up_exps.weight"), device,
+    ).with_context(|| format!("layer {layer_idx} ffn_up_exps (quantized)"))?;
+    let expert_down_q = load_tensor_with_residency(
+        gguf, &format!("{p}.ffn_down_exps.weight"), device,
+    ).with_context(|| format!("layer {layer_idx} ffn_down_exps (quantized)"))?;
 
     // Gate and up may have a different quant type than down (e.g. Q5_K vs Q6_K
     // in the apex GGUF).  Read each separately.
@@ -1109,15 +1138,16 @@ pub fn load_dense_ffn_quantized(
     }
 
     // Load raw GGML blocks — DType::U8 on Metal, no F32 expansion.
-    let gate_q = gguf
-        .load_tensor(&format!("{p}.ffn_gate.weight"), device)
-        .with_context(|| format!("layer {layer_idx} ffn_gate.weight (quantized)"))?;
-    let up_q = gguf
-        .load_tensor(&format!("{p}.ffn_up.weight"), device)
-        .with_context(|| format!("layer {layer_idx} ffn_up.weight (quantized)"))?;
-    let down_q = gguf
-        .load_tensor(&format!("{p}.ffn_down.weight"), device)
-        .with_context(|| format!("layer {layer_idx} ffn_down.weight (quantized)"))?;
+    // W-5b.7 iter 2: residency-aware via `load_tensor_with_residency`.
+    let gate_q = load_tensor_with_residency(
+        gguf, &format!("{p}.ffn_gate.weight"), device,
+    ).with_context(|| format!("layer {layer_idx} ffn_gate.weight (quantized)"))?;
+    let up_q = load_tensor_with_residency(
+        gguf, &format!("{p}.ffn_up.weight"), device,
+    ).with_context(|| format!("layer {layer_idx} ffn_up.weight (quantized)"))?;
+    let down_q = load_tensor_with_residency(
+        gguf, &format!("{p}.ffn_down.weight"), device,
+    ).with_context(|| format!("layer {layer_idx} ffn_down.weight (quantized)"))?;
 
     // Use config values as authoritative (already validated against GGUF metadata
     // by Qwen35Config::from_gguf).

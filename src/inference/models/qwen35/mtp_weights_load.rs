@@ -4,7 +4,7 @@ use mlx_native::{MlxBuffer, MlxDevice};
 
 use super::ffn::DenseFfnWeights;
 use super::gpu_ffn::{DenseFfnWeightsGpu};
-use super::gpu_full_attn::{upload_bf16_from_f32, upload_f32};
+use super::gpu_full_attn::{upload_bf16_from_f32, upload_f32_weight};
 use super::mtp::{MtpFullAttnWeightsGpu, MtpWeights};
 use super::weight_loader::load_f32_tensor;
 use super::Qwen35Config;
@@ -193,7 +193,9 @@ fn load_mtp_ffn(
 fn load_norm_gpu(gguf: &GgufFile, name: &str, len: usize, device: &MlxDevice) -> Result<MlxBuffer> {
     let data = load_f32_tensor(gguf, name, device).with_context(|| name.to_string())?;
     ensure!(data.len() == len, "{name} length {} != {len}", data.len());
-    upload_f32(&data, device).with_context(|| format!("upload {name}"))
+    // W-5b.7 iter 2: MTP norm weights are static / reused across decode tokens —
+    // route them through the residency-aware helper.
+    upload_f32_weight(&data, device).with_context(|| format!("upload {name}"))
 }
 
 fn upload_bf16_required(gguf: &GgufFile, name: &str, device: &MlxDevice) -> Result<MlxBuffer> {
