@@ -1121,6 +1121,44 @@ impl Qwen35Model {
                 let path = format!("{prefix}{:02}.bin", layer_idx);
                 dump_layer_bin(&path, &hidden, seq_len, h);
             }
+
+            // W-5b.15: per-layer prefill arena reset.
+            //
+            // At prefill (seq_len > 1), the dense-Q FFN, attention pre-norms,
+            // imrope, and DeltaNet `apply_proj` allocate ~1 GB of pool-scoped
+            // scratches per dense layer at the Qwen3.6-27B working set
+            // (M=4096, h=5120, m=17408).  Without a per-layer reset, the pool
+            // accumulates ~33 GB by layer 33 and overruns Metal's residency-set
+            // quota — the W-5b.14 architectural-limit failure.
+            //
+            // Lifetime safety:
+            // * Same-layer locals (`attn_out`, `q_normed`, `ffn_residual_buf`,
+            //   `ffn_input_buf`, FFN gate/up/hidden scratches, etc.) are bound
+            //   inside this loop body and dropped at the closing brace below.
+            // * `hidden` is the only ARC clone that crosses iteration boundary.
+            //   At prefill, the dense-Q FFN's `_into_pooled` variant writes its
+            //   FINAL output to a `device.alloc_buffer` (W-5b.15 split — see
+            //   `gpu_ffn::build_dense_ffn_layer_gpu_q_into_pooled` doc-comment),
+            //   so `hidden`'s underlying storage is NOT in the pool's free list
+            //   after this reset and cannot be aliased by the next layer's
+            //   pool allocations.
+            // * The encoder for THIS layer was `commit_and_wait`'d above, so
+            //   no in-flight Metal work references the pool's in-use list.
+            //
+            // Gating: `HF2Q_DENSE_Q_ARENA_RESET=0` reverts to the W-5b.14
+            // pre-reset behavior (dense-Q `_into_device` for prefill scratches,
+            // no per-layer reset).  Default ON.  Decode (seq_len == 1) is a
+            // no-op here in spirit — `forward_gpu_greedy` already issues a
+            // per-token `reset_decode_pool` at the top of every token, and
+            // calling reset again after each layer is harmless because the
+            // pool's `in_use` list contains only this-layer allocations.  We
+            // skip the redundant call at decode for clarity and to leave the
+            // W-5b.10/W-5b.14 decode profiling unchanged.
+            if seq_len > 1
+                && std::env::var("HF2Q_DENSE_Q_ARENA_RESET").as_deref() != Ok("0")
+            {
+                super::decode_pool::reset_for_prefill_chunk();
+            }
         }
 
         if decode_profile {

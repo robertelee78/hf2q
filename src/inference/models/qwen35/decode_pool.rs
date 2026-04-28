@@ -81,6 +81,44 @@ pub fn reset_decode_pool() {
     DECODE_POOL.with(|cell| cell.borrow_mut().reset());
 }
 
+/// Reset the thread-local pool at a per-prefill-layer boundary.
+///
+/// Bytewise identical to [`reset_decode_pool`]; the separate name documents
+/// a distinct lifecycle: called between prefill layer iterations in
+/// `forward_gpu_impl` after every layer has issued its
+/// [`mlx_native::CommandEncoder::commit_and_wait`] (so all in-flight Metal
+/// work referencing the layer-scoped scratches has drained), recycling the
+/// dense-Q FFN scratches, attention pre-norm/per-head-norm/imrope scratches,
+/// and DeltaNet apply_proj scratches before the next layer's allocations.
+///
+/// # Caller contract (W-5b.15)
+///
+/// At call time **no pool-allocated `MlxBuffer` may have an outstanding ARC
+/// clone whose underlying Metal storage matches a power-of-two bucket the
+/// next layer's [`pooled_alloc_buffer`] calls will request**.  In particular:
+///
+/// * The cross-layer `hidden` buffer (the residual stream consumed by the
+///   next layer's attention) **must not** be pool-allocated.  Production
+///   path: `embed_tokens_gpu` returns a `device.alloc_buffer` for the first
+///   layer, and the dense-Q FFN's pooled `_into` variant (W-5b.15) writes
+///   its FINAL output (the buffer that becomes the next `hidden`) to a
+///   `device.alloc_buffer` — internal scratches stay pooled.
+/// * Same-layer locals (`attn_out`, `q_normed`, FFN gate/up/hidden scratches,
+///   etc.) are bound only inside the loop body and are dropped at the closing
+///   brace before this reset fires from the *next* iteration's top.
+///
+/// At chunk-prefill working set (Qwen3.6-27B, seq_len=4096, h=5120, m=17408)
+/// without per-layer reset, the dense-Q FFN's 5 pooled scratches alone
+/// accumulate ~1 GB / dense layer × 33 dense layers ≈ 33 GB cumulative
+/// before layer 33, overrunning Metal's residency-set quota and producing
+/// "GPU command buffer completed with error status" — the W-5b.14
+/// architectural-limit failure.  The per-layer reset closes this lifecycle
+/// gap so dense-Q `_into` can use the pool unconditionally and capture the
+/// W-5b.13 audit's projected ~30–40% allocation-churn savings.
+pub fn reset_for_prefill_chunk() {
+    DECODE_POOL.with(|cell| cell.borrow_mut().reset());
+}
+
 /// Diagnostic accessor: number of buffers currently in-use (alloc'd but
 /// not yet reset).  Surfaced for the `HF2Q_DECODE_PROFILE` instrumentation.
 #[allow(dead_code)]

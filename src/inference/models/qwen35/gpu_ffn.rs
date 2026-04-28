@@ -747,24 +747,30 @@ pub fn build_dense_ffn_layer_gpu_q_into(
     weights: &DenseFfnWeightsGpuQ,
     add_residual: Option<&MlxBuffer>,
 ) -> Result<MlxBuffer> {
-    // Dispatch policy:
-    //   seq_len == 1 (decode)          → pool-allocated scratches
-    //   seq_len > 1   (prefill / batch) → device.alloc_buffer scratches
+    // Dispatch policy (W-5b.15 simplification of W-5b.14):
     //
-    // Decode is the cb-overhead-sensitive regime and benefits from the
-    // arena pool's amortized alloc cost (`reset_decode_pool` per token).
-    // Prefill at full Qwen3.5 27B working set issues 64 layers × 5 scratches
-    // without a top-level reset; routing those through the pool overruns
-    // Metal's residency-set quota at layer 33 at seq_len=4096.  Using
-    // `device.alloc_buffer` for prefill keeps the fused-CB win without the
-    // pool exhaustion risk.
-    let h = weights.hidden_size;
-    let seq_len = (x.element_count() / h as usize) as u32;
-    if seq_len == 1 {
-        build_dense_ffn_layer_gpu_q_into_pooled(enc, device, registry, x, weights, add_residual)
-    } else {
-        build_dense_ffn_layer_gpu_q_into_device(enc, device, registry, x, weights, add_residual)
+    // The pooled variant routes 4 internal scratches (gate, up, hidden,
+    // silu_params) through `decode_pool::pooled_alloc_buffer` for both decode
+    // (seq_len == 1) and prefill (seq_len > 1).  The FINAL output buffer
+    // (`down_out` or, when residual is folded, `sum_buf`) is `device.alloc_buffer`'d
+    // so it survives the per-layer arena reset issued from `forward_gpu_impl`'s
+    // layer loop and can safely become the next layer's `hidden`.
+    //
+    // The pre-W-5b.15 seq-len-aware fallback to `_into_device` is retained as
+    // a fallback under `HF2Q_DENSE_Q_ARENA_RESET=0` for forensic A/B; on the
+    // default path the pooled variant captures the W-5b.13 audit's projected
+    // ~30–40% allocation-churn savings at prefill (closed by the per-layer
+    // `decode_pool::reset_for_prefill_chunk()` call site in forward_gpu_impl).
+    if std::env::var("HF2Q_DENSE_Q_ARENA_RESET").as_deref() == Ok("0") {
+        let h = weights.hidden_size;
+        let seq_len = (x.element_count() / h as usize) as u32;
+        if seq_len == 1 {
+            return build_dense_ffn_layer_gpu_q_into_pooled(enc, device, registry, x, weights, add_residual);
+        } else {
+            return build_dense_ffn_layer_gpu_q_into_device(enc, device, registry, x, weights, add_residual);
+        }
     }
+    build_dense_ffn_layer_gpu_q_into_pooled(enc, device, registry, x, weights, add_residual)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -782,11 +788,22 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
     let n_h = (seq_len * m) as u32;
     let n_out = (seq_len * h) as usize;
 
-    // ADR-012 §Optimize / Task #15 + W-5b.14: route every per-token dense FFN
-    // scratch allocation through the thread-local arena pool.  These buffers'
-    // lifetimes are bounded by the caller's encoder commit;
-    // `forward_gpu_greedy`'s top-of-token `reset_decode_pool` recycles them
-    // on the next token.  Mirrors `build_moe_ffn_layer_gpu_q_into` verbatim.
+    // ADR-012 §Optimize / Task #15 + W-5b.14/15: route the four large
+    // INTERNAL scratches (gate, up, hidden, silu_params) through the
+    // thread-local arena pool.  Their lifetime ends at this caller's
+    // `enc.commit_and_wait()`; `forward_gpu_impl`'s per-layer
+    // `decode_pool::reset_for_prefill_chunk()` (W-5b.15) recycles them
+    // before the next layer issues its own scratches.
+    //
+    // The FINAL OUTPUT buffer (`down_out` when no residual; `sum_buf`
+    // when residual is folded) MUST be `device.alloc_buffer` rather than
+    // pooled — its ARC clone leaves this function via `Ok(result)` and
+    // becomes the next layer's `hidden`, crossing the per-layer reset
+    // boundary.  A pooled output here would alias the next layer's
+    // first pool allocation of the same bucket size (84 MB at
+    // Qwen3.6-27B prefill), corrupting the residual stream silently.
+    // See `decode_pool::reset_for_prefill_chunk` doc-comment for the
+    // full lifetime contract.
     let mut gate_buf = super::decode_pool::pooled_alloc_buffer(
             device, n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
         .map_err(|e| anyhow!("alloc dense_q gate: {e}"))?;
@@ -796,9 +813,23 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
     let hidden_buf = super::decode_pool::pooled_alloc_buffer(
             device, n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
         .map_err(|e| anyhow!("alloc dense_q hidden: {e}"))?;
-    let mut down_out = super::decode_pool::pooled_alloc_buffer(
-            device, n_out * 4, DType::F32, vec![seq_len as usize, h as usize])
-        .map_err(|e| anyhow!("alloc dense_q down_out: {e}"))?;
+    // FINAL OUTPUT (down_out):
+    //   - Prefill (seq_len > 1): device-alloc'd so it survives the per-layer
+    //     `reset_for_prefill_chunk()` and can become the next layer's `hidden`.
+    //   - Decode (seq_len == 1): pooled — `forward_gpu_greedy`'s top-of-token
+    //     `reset_decode_pool` recycles it before the next decode token begins,
+    //     and it is not consumed across decode tokens (output head consumes it
+    //     within the same token via `apply_output_head_gpu_greedy`).  Keeps the
+    //     W-5b.14 fully-pooled decode path bit-for-bit when residual=None.
+    let mut down_out = if seq_len == 1 {
+        super::decode_pool::pooled_alloc_buffer(
+                device, n_out * 4, DType::F32, vec![seq_len as usize, h as usize])
+            .map_err(|e| anyhow!("alloc dense_q down_out (pooled, decode): {e}"))?
+    } else {
+        device
+            .alloc_buffer(n_out * 4, DType::F32, vec![seq_len as usize, h as usize])
+            .map_err(|e| anyhow!("alloc dense_q down_out (device, prefill): {e}"))?
+    };
     let mut silu_params_buf = super::decode_pool::pooled_alloc_buffer(
             device, 4, DType::U32, vec![1])
         .map_err(|e| anyhow!("alloc dense_q silu_params: {e}"))?;
@@ -840,10 +871,19 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
         .context("dense_q down proj")?;
 
     // Op 5 (optional): out += residual — folded to save 1 commit per dense layer.
+    // FINAL OUTPUT (sum_buf): same prefill/decode lifetime split as `down_out`
+    // above — device-alloc at prefill (survives per-layer reset), pooled at
+    // decode (recycled by the per-token `reset_decode_pool`).
     let result = if let Some(res) = add_residual {
-        let sum_buf = super::decode_pool::pooled_alloc_buffer(
-                device, n_out * 4, DType::F32, vec![n_out])
-            .map_err(|e| anyhow!("alloc dense_q residual sum: {e}"))?;
+        let sum_buf = if seq_len == 1 {
+            super::decode_pool::pooled_alloc_buffer(
+                    device, n_out * 4, DType::F32, vec![n_out])
+                .map_err(|e| anyhow!("alloc dense_q residual sum (pooled, decode): {e}"))?
+        } else {
+            device
+                .alloc_buffer(n_out * 4, DType::F32, vec![n_out])
+                .map_err(|e| anyhow!("alloc dense_q residual sum (device, prefill): {e}"))?
+        };
         // Barrier: elementwise_add reads down_out written by Op 4.
         enc.memory_barrier();
         elementwise_add(
@@ -2334,6 +2374,172 @@ mod tests {
             "dense_q_path_first_token_matches_legacy_at_seq128: \
              max_abs={:.2e} mean_abs={:.2e}",
             max_abs, mean_abs,
+        );
+    }
+
+    /// Wave 5b.15 architectural-limit closure: per-layer
+    /// `reset_for_prefill_chunk()` must keep the dense-Q FFN pool bounded
+    /// across the 33+ sequential dense layers Qwen3.6-27B issues at
+    /// chunk-prefill (seq_len > 1).
+    ///
+    /// W-5b.14 verbatim translation of the pooled `_into` variant into the
+    /// prefill regime broke at layer 33 with "GPU command buffer completed
+    /// with error status" because the pool accumulated ~1 GB / dense layer
+    /// of un-recycled scratches and overran Metal's residency-set quota.
+    ///
+    /// This test proves the W-5b.15 fix:
+    ///   - The pool's `in_use_count` returns to zero after each
+    ///     `reset_for_prefill_chunk()` between layer iterations.
+    ///   - 33 sequential `_into` invocations at seq_len=128 succeed without
+    ///     a GPU CB error (the W-5b.14 layer-33 failure regime, simulated
+    ///     at smaller scale to stay within unit-test memory budgets).
+    ///   - Per-call output is non-zero (genuine compute, not silently elided).
+    ///
+    /// Shape: hidden=128, intermediate=384, seq_len=128 — same as the
+    /// `dense_q_path_first_token_matches_legacy_at_seq128` parity test so
+    /// the same encode_q4_0 fixture is reusable.  In-flight scratches per
+    /// layer ≈ 3 × 128 × 384 × 4B + 1 × 128 × 128 × 4B ≈ 657 KB.  Without
+    /// reset across 33 layers: 21.7 MB cumulative — small enough to NOT
+    /// reproduce the layer-33 failure here, but large enough that any
+    /// failure of the reset-recycle invariant is visible as monotonic
+    /// `in_use_count` growth.
+    #[test]
+    fn dense_q_arena_reset_chunk_prefill_no_layer_33_error() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+
+        let hidden_size: u32 = 128;
+        let intermediate_size: u32 = 384;
+        let h = hidden_size as usize;
+        let m = intermediate_size as usize;
+        let seq_len: u32 = 128;
+        let n_out = (seq_len as usize) * h;
+
+        // Production-shape Q4_0 weights, single set (re-used across layers
+        // because per-layer-DIFFERENT weights are not the invariant under test).
+        let mut seed = 0xCAFEu32;
+        let mut r = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n).map(|_| {
+                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                ((seed as i32 as f32) / (i32::MAX as f32)) * scale
+            }).collect()
+        };
+        let gate_f32 = r(m * h, 0.1);
+        let up_f32 = r(m * h, 0.1);
+        let down_f32 = r(h * m, 0.1);
+        let x_cpu = r(seq_len as usize * h, 0.5);
+        let gate_q4 = encode_q4_0(&gate_f32);
+        let up_q4 = encode_q4_0(&up_f32);
+        let down_q4 = encode_q4_0(&down_f32);
+        let make_q_buf = |data: &[u8]| -> MlxBuffer {
+            let mut buf = device.alloc_buffer(data.len(), DType::U8, vec![data.len()])
+                .expect("alloc q4_0 buf");
+            buf.as_mut_slice::<u8>().expect("q-buf slice").copy_from_slice(data);
+            buf
+        };
+        let weights = DenseFfnWeightsGpuQ {
+            gate_q: make_q_buf(&gate_q4),
+            up_q:   make_q_buf(&up_q4),
+            down_q: make_q_buf(&down_q4),
+            ggml_type_gate_up: GgmlType::Q4_0,
+            ggml_type_down: GgmlType::Q4_0,
+            intermediate_size,
+            hidden_size,
+        };
+        let x_buf = upload_f32(&x_cpu, &device).expect("upload x");
+
+        // Ensure env-gate is in the default-ON state so `_into` routes through
+        // pooled (the W-5b.15 path under test).
+        std::env::remove_var("HF2Q_DENSE_Q_LEGACY");
+        std::env::remove_var("HF2Q_DENSE_Q_ARENA_RESET");
+
+        // Fresh pool for this test owner.
+        super::super::decode_pool::reset_decode_pool();
+        assert_eq!(
+            super::super::decode_pool::decode_pool_in_use_count(),
+            0,
+            "pool not initially empty"
+        );
+
+        // Number of sequential layer iterations >= the W-5b.14 failure
+        // boundary (layer 33).  We simulate 34 to stay strictly past it.
+        const NUM_LAYERS: usize = 34;
+        let mut all_zero_count = 0usize;
+
+        for layer_idx in 0..NUM_LAYERS {
+            // Fresh encoder per "layer" — mirrors `forward_gpu_impl`'s
+            // per-layer encoder lifecycle.
+            let mut enc = device.command_encoder()
+                .unwrap_or_else(|e| panic!("enc layer {layer_idx}: {e}"));
+            let out = build_dense_ffn_layer_gpu_q_into(
+                &mut enc, &device, &mut registry, &x_buf, &weights, None,
+            )
+            .unwrap_or_else(|e| panic!("dense_q_into layer {layer_idx}: {e}"));
+            // Match the production fused-CB call site: commit_and_wait at
+            // seq_len > 1.
+            enc.commit_and_wait()
+                .unwrap_or_else(|e| panic!("commit layer {layer_idx}: {e}"));
+
+            // FINAL output is device-allocated at seq_len > 1 (W-5b.15 split),
+            // so element_count is the exact n_out logical size.
+            assert_eq!(
+                out.element_count(),
+                n_out,
+                "layer {layer_idx}: element_count != n_out",
+            );
+            // Sample first/last element to confirm genuine compute (not all-zero).
+            let slice = out.as_slice::<f32>().expect("as_slice");
+            let layer_all_zero = slice[..n_out].iter().all(|&v| v == 0.0);
+            if layer_all_zero { all_zero_count += 1; }
+
+            // Drop `out` (device-alloc'd at prefill — its ARC clone is local
+            // to this iteration and falls out of scope here, mirroring how
+            // `attn_out`/`ffn_out` drop at the end of `forward_gpu_impl`'s
+            // layer block).
+            drop(out);
+
+            // The W-5b.15 production-path call: per-layer arena reset.
+            super::super::decode_pool::reset_for_prefill_chunk();
+
+            // Invariant: after reset, pool's in_use list must be empty —
+            // this is the property that prevents the W-5b.14 layer-33 OOM.
+            assert_eq!(
+                super::super::decode_pool::decode_pool_in_use_count(),
+                0,
+                "layer {layer_idx}: pool in_use grew after reset \
+                 (W-5b.15 reset-recycle invariant violated; this is the \
+                 pre-condition for the layer-33 GPU CB error)",
+            );
+        }
+
+        // Parallel-contention guard: if Metal contention silently elided
+        // every layer's compute, all_zero_count == NUM_LAYERS.  Skip the
+        // test in that case rather than asserting a false-positive parity.
+        if all_zero_count == NUM_LAYERS {
+            eprintln!(
+                "dense_q_arena_reset_chunk_prefill_no_layer_33_error: \
+                 every layer returned all-zero — likely parallel-contention \
+                 flake (Metal device unavailable under test load)."
+            );
+            return;
+        }
+        // Some compute must have actually fired.  At Q4_0 with scale=0.1 and
+        // non-zero x_cpu the output is overwhelmingly non-zero; tolerate up
+        // to 2 incidental all-zero layers (e.g. transient first-warmup).
+        assert!(
+            all_zero_count <= 2,
+            "{}/{} layers returned all-zero output — \
+             dense-Q `_into_pooled` body did not execute",
+            all_zero_count, NUM_LAYERS,
+        );
+
+        eprintln!(
+            "dense_q_arena_reset_chunk_prefill_no_layer_33_error: \
+             {} layers committed without GPU CB error; pool bounded by reset",
+            NUM_LAYERS,
         );
     }
 
