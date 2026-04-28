@@ -499,3 +499,159 @@ No swap thrash; no jetsam pressure; >25 GB free at every point including peak lo
 - Bench script: `scripts/bench-w5b7-iter2-residency.sh` (stays in repo for iter-3 if architecture refactor lands).
 - Raw bench logs: `/tmp/w5b7-iter2-bench.log` (2-trial), `/tmp/w5b7-iter2-bench-3trial.log` (3-trial).
 - Implementation commits: `eb09cad`, `8f7c6fb`.
+
+---
+
+## Wave 5b.8 PP4096 measurement spike
+
+**Status:** **CLOSED — measurement spike landed; top-3 contributors identified; recommendation FA-prefill audit before any chunk-side optimization**
+**Date:** 2026-04-27
+**Worker:** Wave 5b.8 (ADR-005 PP4096 per-section measurement spike)
+**HEAD at start:** `1515d8d` (W-5b.7 closure docs); mlx-native at `84bf1af` (W-5b.7 iter 2 register_existing API)
+**Binary:** rebuilt this iter (`cargo build --release --bin hf2q` clean: 0 errors, 72 warnings, 11.78 s)
+**Instrumentation commit:** `0e73883` (`feat(adr-005 wave-5b.8): env-gated PP4096 per-section profile harness`)
+**Concurrent-session check at start:** clean (mcp-brain-server at 0% CPU, no foreign process > 5% CPU, no CFA worker active)
+**Concurrent-session check during bench:** all 6 hf2q trials + 3 llama trials gated on `pgrep -f bitwidth\|cfa-2026 = empty`; first llama trial discarded after `ggml_metal_synchronize: error: command buffer 0 failed with status 5` triggered by `bitwidth_ab` test from `/opt/mlx-native/.cfa-worktrees/cfa-20260427-adr015-iter8e-resint-merged` running at 100% CPU. Re-run after the CFA test cleared produced clean numbers.
+**RAM at start:** 63.5 GiB free (Pages free 4 161 788 × 16 KB)
+**RAM at finish:** 109.1 GiB free (Pages free 7 147 556 × 16 KB)
+**mlx-native HEAD at finish:** `5d9bb2e3` — drift detected vs start `84bf1af` (orthogonal CFA worker landed an iter-8e residency-set patch during the bench window; the binary I measured was linked against `84bf1af`, captured before drift).
+
+### (1) Pre-flight audit
+
+| Check | Result |
+|---|---|
+| RAM free pre-bench | 63.5 GiB (>32 GiB threshold; PASS) |
+| Top non-sccache process at start | `mcp-brain-server` 0.0% CPU, 2.4 GB RSS (PASS — < 5% threshold per `feedback_bench_process_audit`) |
+| Other 100% CPU bursts during bench | `bitwidth_ab` (CFA worker, mlx-native ADR-015 iter 8e) — caught + re-run |
+| Concurrent inference | None at start; concurrent `qwen3.6-35B-a3b` `--benchmark` started at 8:02 PM AFTER all 6 W-5b.8 trials had completed |
+
+### (2) Same-day llama.cpp baseline (validation gate)
+
+3 cold trials of `llama-completion --batch-size 4096 --ubatch-size 4096 --n-predict 1 --no-warmup -no-cnv --perf` against the W-5b.4 `walkbar-pp4096-prompt.txt` (23 038 bytes, 4 096 tokens):
+
+| trial | prompt eval (ms) | tok/s | real (s) |
+|---|---:|---:|---:|
+| T1 | 6 451.5 | 634.9 | 8.62 |
+| T2 | 6 461.4 | 633.9 | 8.64 |
+| T3 | 6 572.5 | 623.2 | 8.62 |
+| **mean** | **6 495.1** | **630.7** | **8.63** |
+| stdev | 65.1 | 5.7 | 0.01 |
+
+Same-day llama prefill is **6 495 ms ± 65** at pp4096 — within 0.5% of W-5b.4's 6 528 ms baseline. Environment validated; gap math uses `LLAMA_REF = 6495 ms`.
+
+### (3) hf2q per-section table — 3 cold trials × 2 paths
+
+`HF2Q_PROFILE_W5B8=1 HF2Q_QWEN36_AUTOREG=1 HF2Q_UNSAFE_EXPERIMENTS=1` set on every trial. Chunk path additionally has `HF2Q_CHUNK_SCAN_PREFILL=1`. Same `walkbar-pp4096-prompt.txt`. All 6 runs produced first-decoded `,` (token id 11) — instrumentation did not perturb correctness.
+
+#### Chunk path (n=3 cold)
+
+| section | n_samples | T1 ms | T2 ms | T3 ms | mean ms | stdev ms |
+|---|---:|---:|---:|---:|---:|---:|
+| upload_weights (one-time) | 1 | 5 629.2 | 5 572.2 | 5 559.8 | 5 587.1 | 37.0 |
+| layer.ops1_3 | 48 | 3 651.7 | 1 493.6 | 1 357.1 | 2 167.5 | 1 287.2 |
+| layer.qkv_deinterleave | 48 | 1 732.7 | 1 902.0 | 1 439.8 | 1 691.5 | 233.8 |
+| layer.chunk_prep | 48 | 642.1 | 217.0 | 179.8 | 346.3 | 256.8 |
+| **layer.chunk_call** | 48 | 5 281.9 | 3 188.9 | 3 506.9 | **3 992.6** | 1 127.9 |
+| └ chunk.gqa_expand | 48 | 1 153.6 | 882.3 | 781.5 | 939.1 | 192.5 |
+| └ chunk.allocs | 48 | 20.4 | 77.3 | 3.7 | 33.8 | 38.6 |
+| └ chunk.enc_build | 48 | 27.2 | 6.2 | 5.3 | 12.9 | 12.4 |
+| └ chunk.commit_wait | 48 | 4 079.1 | 2 222.7 | 2 716.0 | **3 005.9** | 961.6 |
+| layer.chunk_ops8_9 | 48 | 2 619.7 | 727.0 | 663.4 | 1 336.7 | 1 111.6 |
+| **layer.linear_total** (per DN layer) | 48 | 27 210.1 | 16 427.3 | 14 246.4 | **19 294.6** | 6 941.2 |
+| **layer.full_total** (per FA layer) | 16 | 23 774.4 | 24 302.2 | 21 447.6 | **23 174.7** | 1 518.9 |
+| **PREFILL TOTAL (binary timer)** | — | 65 799 | 49 310 | 43 884 | **52 998** | 11 413 |
+
+Peak RSS: 60.0, 53.4, 68.3 GB (mean 60.6 GB) — well below the 128 GB unified-memory cap.
+
+#### Autoreg path (n=3 cold)
+
+| section | n_samples | T1 ms | T2 ms | T3 ms | mean ms | stdev ms |
+|---|---:|---:|---:|---:|---:|---:|
+| upload_weights (one-time) | 1 | 5 582.7 | 5 559.0 | 5 640.3 | 5 594.0 | 41.8 |
+| layer.ops1_3 | 48 | 1 570.2 | 1 400.6 | 1 379.0 | 1 449.9 | 104.7 |
+| layer.qkv_deinterleave | 48 | 3 164.9 | 1 441.4 | 1 516.4 | 2 040.9 | 974.1 |
+| **layer.autoreg_ops5_9** | 48 | 5 521.1 | 4 853.2 | 4 935.3 | **5 103.2** | 364.2 |
+| **layer.linear_total** (per DN layer) | 48 | 31 069.2 | 16 340.3 | 18 279.9 | **21 896.5** | 8 002.8 |
+| **layer.full_total** (per FA layer) | 16 | 29 797.0 | 21 250.0 | 20 607.4 | **23 884.8** | 5 130.2 |
+| **PREFILL TOTAL (binary timer)** | — | 70 163 | 45 761 | 47 239 | **54 388** | 13 682 |
+
+Peak RSS: 66.4, 62.2, 62.2 GB (mean 63.6 GB).
+
+### (4) Top-3 contributors to the 8.2× chunk gap
+
+Chunk prefill mean = **52 998 ms**; same-day llama = **6 495 ms**; absolute gap = **46 503 ms (8.2×)**. Subtracting the one-time `upload_weights` (5 587 ms, NOT included in llama's `prompt eval time`) gives a fairer chunk forward of 47 411 ms, gap **40 916 ms (7.3×)**. Either denominator yields the same top-3 ranking:
+
+| rank | section | mean ms | % of chunk prefill | δ vs autoreg | notes |
+|:---:|---|---:|---:|---:|---|
+| **1** | **`layer.full_total`** (16 layers) | **23 175** | **43.7 %** | −710 | full-attention layers cost ~1.45 s/layer at pp4096 — dominates absolute time despite being only 25 % of layers. Chunk vs autoreg is within noise here (chunk path neither helps nor hurts FA layers, by construction). |
+| **2** | **`layer.linear_total`** (48 layers) | **19 295** | **36.4 %** | −2 602 | DeltaNet layers, chunk-path savings ≈ 2.6 s vs autoreg (consistent with W-5b.5 cost-model prediction "chunk net advantage 0.8–1.3 s" once wrapper overhead is subtracted; closer to the high end of that range thanks to the 4 s `chunk_ops8-9` shrink). |
+| **3** | **`upload_weights`** (one-time) | **5 587** | **10.5 %** | ≈ 0 | first-call materialization of ~17 GB Q4 onto Metal heap. NOT part of llama's `prompt eval time`; informational only — the comparable apples-to-apples gap excludes this. |
+
+Sub-ranks (within `layer.linear_total`'s chunk path):
+
+| sub-section | mean ms | % of layer.linear_total |
+|---|---:|---:|
+| `chunk.commit_wait` (48× GPU wall, 6 chunk kernels + 4 casts) | 3 006 | 15.6 % |
+| `layer.ops1_3` (pre_norm + qkv_proj + ssm_conv) | 2 168 | 11.2 % |
+| `layer.qkv_deinterleave` (CPU memcpy + 3 GPU re-uploads) | 1 692 | 8.8 % |
+| `layer.chunk_ops8_9` (ssm_norm_gate + out_proj) | 1 337 | 6.9 % |
+| `chunk.gqa_expand` (CPU tiled GQA) | 939 | 4.9 % |
+| `layer.chunk_prep` (l2_norm + alpha/beta/q_scale/g_beta) | 346 | 1.8 % |
+| `chunk.allocs` (BF16 + state + output buffers) | 34 | 0.2 % |
+| `chunk.enc_build` (encoder build, no commit) | 13 | 0.1 % |
+| residual (linear_total − instrumented) | ~9 760 | 50.6 % |
+
+Notable: ~50 % of `layer.linear_total` is **not captured** by my instrumented sub-buckets. That residual is the chunk-pipeline kernel time on the GPU itself, plus encoder-launch / Metal-driver overhead between the CPU-side timing markers — i.e. it's the body of `dispatch_chunk_gated_delta_rule_fwd` (and the autoreg `dispatch_gated_delta_net`) plus `commit_and_wait` overhead on the autoreg path. Future iterations should add named encoder labels and a per-kernel breakdown via `enc.commit_labeled` so that residual collapses.
+
+### (5) Falsifications
+
+This iter's data falsifies three prior hypotheses:
+
+1. **W-5b.5 estimate "GQA F32 expansion ~3-6 s at T=4096"** — actual is **939 ms** (5–6× over-estimated). Wrapper-side CPU expansion is NOT a meaningful contributor.
+2. **W-5b.5 estimate "encoder-split barriers ~10 ms"** — `chunk_prep` + `chunk_ops8_9` total wall = **1 683 ms**, ~170× the estimate. Either the split overhead is real and large, or these encoders are doing real GPU work whose cost was uncounted in W-5b.5's analytic model. The latter is more likely (apply_proj / l2_norm / scalar_mul each issue real Metal kernels).
+3. **W-5b.4 informational claim "8.5–10.6× slower than llama.cpp at pp4096"** — corrected. **Apples-to-apples (excluding `upload_weights` from hf2q since llama loads model separately) the ratio is 7.3× / 40 916 ms absolute gap.**
+
+### (6) Recommendation table for the next iter
+
+| top-3 bucket | follow-up exists? | measurement-first hypothesis | est. effort | risk class |
+|---|---|---|---:|---|
+| **`layer.full_total` (43.7 %)** | NO open W-5b candidate. ADR-005 W-5a tracked DeltaNet specifically; full-attention has not been profiled at pp4096. | hf2q `gpu_full_attn` likely doing per-token serial KV writeback, while llama batched-prefill does it as one large dispatch. Audit with `HF2Q_PROFILE_FA=1` (already wired in `forward_prefill_batched.rs:1064`) at pp4096 and llama-bench `-p 4096 --flash-attn`. **Per-FA-layer hf2q ≈ 1450 ms, hf2q ≥ 3.6× per-FA-layer slower than llama's whole prefill divided by 16.** Most likely root cause: hf2q's full_attn path is not using a flash-attention-style fused kernel for prefill. | 1–2 days for audit; kernel work depends on root cause | medium — lots of unknowns; could find a single-kernel win OR a deep refactor depending on what the audit shows |
+| **`layer.linear_total` (36.4 %)** | YES — W-5b candidate #1 (chunk-pipeline kernel optimization), candidate #3 (encoder-merge to reduce 3-stage commit_and_wait split). The 50 % uninstrumented residual is the natural next target. | residual ≈ 9 760 ms is the chunk-kernel GPU body (`dispatch_chunk_gated_delta_rule_fwd` and its 6 sub-dispatches). Land per-kernel `enc.commit_labeled` at the chunk-pipeline kernel layer in mlx-native and re-run W-5b.8 to attribute the residual. | 0.5–1 day for finer-grained instrumentation in mlx-native; production change depends on the resulting data | low — mlx-native owns the kernel timing primitives and W-5b.7 already validated public-API conventions for this kind of additive surface |
+| **`upload_weights` (10.5 %)** | NO. W-5b.7 already tested `MTLResidencySet` adoption at T=256 and got sub-1-σ noise; this captures the full pp4096 first-call cost, but at T=4096 the hot path is forward compute, not weight load. | nothing to optimize here — model materialization is a one-time bootstrapping cost that is not on the per-prefill critical path in a real serve loop. Excluded from comparison-grade gap math. | 0 (do not optimize) | n/a |
+
+### (7) Recommendation for W-5b.9
+
+**Audit the full-attention prefill path BEFORE any further chunk-pipeline kernel work.** Rationale: `layer.full_total` at 23.2 s is **larger than `layer.linear_total` at 19.3 s**, despite there being 3× fewer FA layers (16 vs 48). Per-layer FA at pp4096 is 1.45 s while per-DN-layer chunk-path is 0.40 s — full-attention is **3.6× slower per layer** even though llama and hf2q share the same 16/48 split. Optimizing chunk DeltaNet kernels can never close the gap when ~44 % of the chunk wall-clock is spent on FA layers we haven't instrumented.
+
+Concretely, W-5b.9 should:
+1. Wire `HF2Q_PROFILE_FA=1` (already implemented in `forward_prefill_batched.rs:1064`) into the hf2q forward-bench command at pp4096 and capture per-stage FA breakdown.
+2. Compare to llama's `-p 4096 --flash-attn` on the same prompt — same-day delta on FA wall.
+3. If the FA path is missing flash-attention/online-softmax: open W-5b.9 as a kernel-port iteration. If FA is using the hf2q gated_attn kernel correctly and is just bandwidth-bound at long T: open W-5b.9 as a representation/quantization iteration (Q4 KV vs F32, page-attention layout).
+4. ONLY THEN return to `layer.linear_total` residual breakdown.
+
+This is the inverse priority to W-5a/W-5b's chunk-DeltaNet emphasis, but the data demands it: the gap is not where W-5b assumed.
+
+### (8) Honest caveats and methodology limits
+
+- **High variance across cold trials (T1 vs T2/T3).** Trial 1 of every path is consistently 25–40 % slower than trials 2–3. This is the W-5b.4 "10 % spread" pattern amplified — most likely Metal shader cache warming + thermal step-down between trials. A "warm" comparison would be tighter, but cold is the spec.
+- **CFA worker contention.** During the first attempt at the llama baseline, a `bitwidth_ab` test from `/opt/mlx-native/.cfa-worktrees/cfa-20260427-adr015-iter8e-resint-merged` running at 100 % CPU triggered a `ggml_metal_synchronize: error: command buffer 0 failed with status 5` and inflated llama prefill from 6.5 s → 120 s. The clean re-run used `pgrep -f "bitwidth\|cfa-2026"` as a pre-flight gate. All 6 hf2q trials passed this gate. **If the next iter cannot fence off the CFA worktree, the bench is unreliable.**
+- **Instrumentation overhead.** Every `Section::start` allocates an `Instant` (rdtsc, ~2 ns) even when the env gate is off. Inside `apply_gated_delta_net_chunk` we use 4 nested guards, and inside `build_delta_net_layer` 2–3 more, all once per layer × 48 DN layers + 16 FA layers = ~400 timestamps per forward. At ~50 ns CPU-side per pair, total instrumentation overhead is ≪ 1 ms and indistinguishable from the noise floor.
+- **CPU wall, not GPU wall.** Per memory `project_m5max_no_dispatch_boundary_sampling`, M5 Max only supports stage-boundary GPU counter sampling — per-dispatch GPU timestamps are hardware-impossible. Each `chunk.commit_wait` bucket measures the CPU's wait for `MTLCommandBuffer.waitUntilCompleted`, which conflates queue submit, GPU compute, and CPU wakeup latency. The numbers are still the right wall for "how long was the program blocked on this," which is what "the gap is made of."
+- **`layer.linear_total` residual is large (~50 %).** That's the chunk-pipeline kernel body, not yet broken down. Future iterations should add `enc.commit_labeled` calls inside `dispatch_chunk_gated_delta_rule_fwd` so the kkt / recompute_w_u / inter_state / chunk_o / tri_solve_invert / cumsum_g sub-kernels become individually measurable.
+- **Only one mlx-native HEAD measured.** Build was against `84bf1af` (the W-5b.7 iter-2 SHA). HEAD drifted to `5d9bb2e3` mid-bench (an ADR-015 iter-8e CFA worker landed something), but the binary I measured was already linked. If the next iter rebuilds, re-record the SHA and consider whether the residency-set change in mlx-native materially affects `upload_weights`.
+
+### (9) Inputs / outputs preserved
+
+- Bench prompt: `/tmp/walkbar-pp4096-prompt.txt` (23 038 bytes, identical SHA to W-5b.4)
+- Raw trial logs (incl. `time -l` blocks): `/tmp/w5b8-{chunk,autoreg}-T{1,2,3}.log`, `/tmp/w5b8-llama-T{1,2,3}.log`
+- Aggregation script: `/tmp/w5b8-analysis.py` (stdlib-only)
+- Instrumentation source: `src/inference/models/qwen35/wave5b8_profile.rs`, plus calls in `forward_gpu.rs`, `gpu_delta_net.rs` (commit `0e73883`)
+- Discarded contention run: `/tmp/w5b8-llama-trial1-merged.txt` (120 s real, Metal recovery — kept for forensics; do NOT use for gap math)
+
+### (10) Closure
+
+Wave 5b.8 measurement spike: **CLOSED — top-3 contributors identified.**
+
+The W-5b.5 cost-model premise that "the gap is in the chunk-pipeline wrapper" is **partially correct but mis-prioritised**: the chunk wrapper's documented overheads (GQA expansion, F32→BF16 staging, encoder-split barriers) total ~2 s, not the 5–10 s that the model assumed. The dominant contributor is **full-attention prefill (`layer.full_total` = 23.2 s, 43.7 % of chunk prefill, 3.6× slower than llama per-FA-layer)**, which neither W-5a nor W-5b ever profiled. The next iter (W-5b.9) should be a full-attention prefill audit, not a continuation of chunk-pipeline kernel work.
+
+ADR-005 AC-tier impact: NONE — perf-bar gate at AC 5468 / 5470 was already informational (W-5b.4 closed both as full `[x]`); this iter neither adds nor removes any gating.
