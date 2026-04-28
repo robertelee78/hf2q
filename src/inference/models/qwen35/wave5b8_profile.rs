@@ -159,32 +159,23 @@ pub enum SectionKind {
     // chunk wrapper's `chunk_call` already partitions into gqa_expand +
     // allocs + enc_build + commit_wait). These W-5b.17 buckets carve up
     // the unprofiled corners:
-    //   - `dn.qkv_download` (download_f32 of the fused QKV-conv tensor)
-    //   - `dn.qkv_cpu_loop` (CPU triple-loop de-interleave into Q/K/V vecs)
-    //   - `dn.qkv_uploads`  (3× upload_f32 of Q, K, V back to GPU)
+    //   - `dn.qkv_gpu_split` (W-5b.18 GPU `dispatch_qkv_split_f32` dispatch +
+    //     `commit_and_wait`; replaced the legacy CPU round-trip). The
+    //     `dn.qkv_download` / `dn.qkv_cpu_loop` / `dn.qkv_uploads` buckets
+    //     were removed in W-5b.19 alongside the legacy gate they tracked.
     //   - `dn.state_pingpong_memcpy` (the unsafe copy_nonoverlapping at
     //     gpu_delta_net.rs:1625-1628 — n_state F32 per layer × 48 layers
     //     across the chunk-final-state → caller-state-out ping-pong slot).
-    /// `download_f32(&qkv_conv_out)` at gpu_delta_net.rs:1441 — fused QKV
-    /// tensor GPU→CPU transfer ahead of the CPU de-interleave loop.
-    DnQkvDownload,
-    /// CPU triple-loop de-interleave at gpu_delta_net.rs:1442-1452 —
-    /// reshuffles the fused QKV-conv layout into separate Q, K, V slabs.
-    DnQkvCpuLoop,
-    /// 3× `upload_f32` at gpu_delta_net.rs:1453-1455 — Q, K, V CPU→GPU
-    /// uploads to feed `apply_gated_delta_net_chunk`.
-    DnQkvUploads,
     /// Chunk-pipeline final_state → caller state_out ping-pong copy at
     /// gpu_delta_net.rs:1625-1628 (`std::ptr::copy_nonoverlapping`,
     /// n_state = d_k × d_v × n_v_heads × 4 B per layer ≈ 4 MB × 48
     /// layers ≈ 200 MB CPU memcpy total at PP4096).
     DnStatePingpongMemcpy,
-    /// W-5b.18 NEW path replacement for `DnQkvDownload + DnQkvCpuLoop +
-    /// DnQkvUploads`: a single `mlx_native::ops::qkv_split::
-    /// dispatch_qkv_split_f32` GPU dispatch + `commit_and_wait`. Per
-    /// linear-attn layer, prefill seq>1 only. Default-on; with
-    /// `HF2Q_QKV_SPLIT_LEGACY=1` the three legacy buckets fire instead
-    /// and this one stays at zero.
+    /// W-5b.18 GPU `dispatch_qkv_split_f32` dispatch + `commit_and_wait`.
+    /// Per linear-attn layer, prefill seq>1 only. The default and only
+    /// path post-W-5b.19 (the legacy CPU round-trip and its
+    /// `HF2Q_QKV_SPLIT_LEGACY=1` env gate were removed after a 30/30
+    /// parity audit at PP4106).
     DnQkvGpuSplit,
 }
 
@@ -217,14 +208,11 @@ impl SectionKind {
             SectionKind::LayerPostAttnFusedNorm => "layer.post_attn_fused_norm",
             SectionKind::LayerFfnDispatch => "layer.ffn_dispatch",
             SectionKind::LayerFfnPostResidual => "layer.ffn_post_residual",
-            SectionKind::DnQkvDownload => "dn.qkv_download",
-            SectionKind::DnQkvCpuLoop => "dn.qkv_cpu_loop",
-            SectionKind::DnQkvUploads => "dn.qkv_uploads",
             SectionKind::DnStatePingpongMemcpy => "dn.state_pingpong_memcpy",
             SectionKind::DnQkvGpuSplit => "dn.qkv_gpu_split",
         }
     }
-    const COUNT: usize = 28;
+    const COUNT: usize = 25;
 }
 
 #[derive(Default, Clone)]
@@ -383,12 +371,11 @@ pub fn w5b8_print_and_reset(label: &str) {
             SectionKind::LayerPostAttnFusedNorm,
             SectionKind::LayerFfnDispatch,
             SectionKind::LayerFfnPostResidual,
-            // Wave 5b.17 DN-wrapper-overhead sub-buckets:
-            SectionKind::DnQkvDownload,
-            SectionKind::DnQkvCpuLoop,
-            SectionKind::DnQkvUploads,
+            // Wave 5b.17 DN-wrapper-overhead sub-buckets (legacy CPU
+            // qkv_download/cpu_loop/uploads removed in W-5b.19 alongside
+            // the gate they tracked).
             SectionKind::DnStatePingpongMemcpy,
-            // Wave 5b.18 GPU-side QKV split:
+            // Wave 5b.18 GPU-side QKV split (the only path post-W-5b.19):
             SectionKind::DnQkvGpuSplit,
         ];
         for k in kinds {

@@ -1229,7 +1229,11 @@ pub fn build_delta_net_layer(
     let _km1 = (k_width - 1) as usize;
     let _channels = qkv_channels as usize;
     let seq = seq_len as usize;
-    let nk = n_k_heads as usize;
+    // `nk` was consumed by the W-5b.18-era legacy CPU triple-loop path
+    // removed in W-5b.19; the new `dispatch_qkv_split_f32` GPU kernel
+    // takes `q_sp` / `k_sp` directly. Kept under a `_` prefix to preserve
+    // documentation of the head-count value in this scope.
+    let _nk = n_k_heads as usize;
     let nv = n_v_heads as usize;
     let dk = d_k as usize;
     let dv = d_v as usize;
@@ -1435,109 +1439,74 @@ pub fn build_delta_net_layer(
         // conv_state_out now holds the updated conv state (caller swaps ping-pong).
 
         // De-interleave the fused QKV-conv tensor into separate Q / K / V
-        // GPU buffers.
+        // GPU buffers via the `mlx_native::ops::qkv_split::
+        // dispatch_qkv_split_f32` GPU kernel — a single dispatch that writes
+        // Q / K / V outputs in-place on Apple unified memory, no CPU↔GPU
+        // transfer involved.
         //
-        // **W-5b.18 (default path)**: a single
-        // `mlx_native::ops::qkv_split::dispatch_qkv_split_f32` GPU dispatch
-        // replaces the prior `download_f32 + CPU triple-loop split + 3×
-        // upload_f32` round-trip (838 ms / 17.5 ms-per-layer at PP4106 per
-        // the W-5b.17 audit).  The GPU kernel writes Q/K/V outputs in-place
-        // on Apple unified memory; no CPU↔GPU transfer is involved.  Forensic
-        // A/B fallback: set `HF2Q_QKV_SPLIT_LEGACY=1` to fire the old CPU
-        // path (no ack required — both paths are bit-identical by the
-        // kernel's unit test in `mlx-native/tests/test_qkv_split.rs`).
+        // W-5b.18 landed this kernel as the default with a forensic
+        // `HF2Q_QKV_SPLIT_LEGACY=1` env-gated A/B fallback to the old
+        // download_f32 + CPU triple-loop split + 3× upload_f32 path.
+        // W-5b.19 sunset audit (commit `<this commit>`): 30/30 PASS at PP4106
+        // (5 cold loads × 3 cold prefills × 2 paths, all token id 11) →
+        // gate REMOVED. Standing parity bar: the bit-identical CPU
+        // reference test in `mlx-native/tests/test_qkv_split.rs`.
         let v_sp = nv * dv;
         let (q_gpu, k_gpu, v_gpu) = {
             let _w5b8 = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::LayerQkvDeinterleave,
             );
-            if INVESTIGATION_ENV.qkv_split_legacy {
-                // ---- LEGACY CPU round-trip (forensic A/B) ----
-                let qkv_conv_cpu = {
-                    let _w5b17 = super::wave5b8_profile::Section::start_w5b17(
-                        super::wave5b8_profile::SectionKind::DnQkvDownload,
-                    );
-                    download_f32(&qkv_conv_out)?
-                };
-                let (q_cpu, k_cpu, v_cpu) = {
-                    let _w5b17 = super::wave5b8_profile::Section::start_w5b17(
-                        super::wave5b8_profile::SectionKind::DnQkvCpuLoop,
-                    );
-                    let mut q_cpu = vec![0.0f32; seq * nk * dk];
-                    let mut k_cpu = vec![0.0f32; seq * nk * dk];
-                    let mut v_cpu = vec![0.0f32; seq * v_sp];
-                    for t in 0..seq {
-                        let base = t * qkv_ch;
-                        q_cpu[t * q_sp..(t + 1) * q_sp]
-                            .copy_from_slice(&qkv_conv_cpu[base..base + q_sp]);
-                        k_cpu[t * k_sp..(t + 1) * k_sp]
-                            .copy_from_slice(&qkv_conv_cpu[base + q_sp..base + q_sp + k_sp]);
-                        v_cpu[t * v_sp..(t + 1) * v_sp]
-                            .copy_from_slice(&qkv_conv_cpu[base + q_sp + k_sp..base + qkv_ch]);
-                    }
-                    (q_cpu, k_cpu, v_cpu)
-                };
-                let _w5b17 = super::wave5b8_profile::Section::start_w5b17(
-                    super::wave5b8_profile::SectionKind::DnQkvUploads,
-                );
-                let q_gpu = upload_f32(&q_cpu, device)?;
-                let k_gpu = upload_f32(&k_cpu, device)?;
-                let v_gpu = upload_f32(&v_cpu, device)?;
-                (q_gpu, k_gpu, v_gpu)
-            } else {
-                // ---- NEW W-5b.18 GPU split kernel (default) ----
-                let _w5b17 = super::wave5b8_profile::Section::start_w5b17(
-                    super::wave5b8_profile::SectionKind::DnQkvGpuSplit,
-                );
-                // Allocate the three output buffers from the per-prefill-layer
-                // arena pool; lifetimes are bounded by `build_delta_net_layer`.
-                let q_gpu = super::decode_pool::pooled_alloc_buffer(
-                    device,
-                    seq * q_sp * 4,
-                    DType::F32,
-                    vec![seq, q_sp],
-                )
-                .map_err(|e| anyhow!("alloc q_gpu (W-5b.18): {e}"))?;
-                let k_gpu = super::decode_pool::pooled_alloc_buffer(
-                    device,
-                    seq * k_sp * 4,
-                    DType::F32,
-                    vec![seq, k_sp],
-                )
-                .map_err(|e| anyhow!("alloc k_gpu (W-5b.18): {e}"))?;
-                let v_gpu = super::decode_pool::pooled_alloc_buffer(
-                    device,
-                    seq * v_sp * 4,
-                    DType::F32,
-                    vec![seq, v_sp],
-                )
-                .map_err(|e| anyhow!("alloc v_gpu (W-5b.18): {e}"))?;
+            let _w5b17 = super::wave5b8_profile::Section::start_w5b17(
+                super::wave5b8_profile::SectionKind::DnQkvGpuSplit,
+            );
+            // Allocate the three output buffers from the per-prefill-layer
+            // arena pool; lifetimes are bounded by `build_delta_net_layer`.
+            let q_gpu = super::decode_pool::pooled_alloc_buffer(
+                device,
+                seq * q_sp * 4,
+                DType::F32,
+                vec![seq, q_sp],
+            )
+            .map_err(|e| anyhow!("alloc q_gpu (W-5b.18): {e}"))?;
+            let k_gpu = super::decode_pool::pooled_alloc_buffer(
+                device,
+                seq * k_sp * 4,
+                DType::F32,
+                vec![seq, k_sp],
+            )
+            .map_err(|e| anyhow!("alloc k_gpu (W-5b.18): {e}"))?;
+            let v_gpu = super::decode_pool::pooled_alloc_buffer(
+                device,
+                seq * v_sp * 4,
+                DType::F32,
+                vec![seq, v_sp],
+            )
+            .map_err(|e| anyhow!("alloc v_gpu (W-5b.18): {e}"))?;
 
-                let params = QkvSplitParams {
-                    seq: seq_len,
-                    q_sp: q_sp as u32,
-                    k_sp: k_sp as u32,
-                    v_sp: v_sp as u32,
-                };
+            let params = QkvSplitParams {
+                seq: seq_len,
+                q_sp: q_sp as u32,
+                k_sp: k_sp as u32,
+                v_sp: v_sp as u32,
+            };
 
-                let mut enc = device
-                    .command_encoder()
-                    .context("enc qkv_split (W-5b.18) prefill")?;
-                dispatch_qkv_split_f32(
-                    &mut enc,
-                    registry,
-                    device.metal_device(),
-                    &qkv_conv_out,
-                    &q_gpu,
-                    &k_gpu,
-                    &v_gpu,
-                    &params,
-                )
-                .map_err(|e| anyhow!("dispatch_qkv_split_f32 (W-5b.18): {e}"))?;
-                enc.commit_and_wait()
-                    .context("commit qkv_split (W-5b.18) prefill")?;
-                (q_gpu, k_gpu, v_gpu)
-            }
+            let mut enc = device
+                .command_encoder()
+                .context("enc qkv_split (W-5b.18) prefill")?;
+            dispatch_qkv_split_f32(
+                &mut enc,
+                registry,
+                device.metal_device(),
+                &qkv_conv_out,
+                &q_gpu,
+                &k_gpu,
+                &v_gpu,
+                &params,
+            )
+            .map_err(|e| anyhow!("dispatch_qkv_split_f32 (W-5b.18): {e}"))?;
+            enc.commit_and_wait()
+                .context("commit qkv_split (W-5b.18) prefill")?;
+            (q_gpu, k_gpu, v_gpu)
         };
 
         // Wave 5b iter 5 — chunk-pipeline prefill route.
@@ -2454,106 +2423,11 @@ mod tests {
         );
     }
 
-    /// Wave 5b.18 — `dispatch_qkv_split_f32` GPU kernel matches the legacy
-    /// CPU triple-loop split byte-for-byte at the Qwen3.6-27B production shape.
-    ///
-    /// Uploads a fused QKV-conv tensor at `seq=128, q_sp=k_sp=256, v_sp=2048`
-    /// (the chunk-pipeline path's first sub-batch shape on Qwen3.6-27B), runs
-    /// both paths, and asserts every Q/K/V output byte matches.  Pure copy
-    /// op → bit-exact equality is the right tolerance.
-    ///
-    /// Companion to the kernel-level test in
-    /// `mlx-native/tests/test_qkv_split.rs`; this hf2q-side test additionally
-    /// exercises the `pooled_alloc_buffer` path and the `commit_and_wait`
-    /// barrier the production prefill branch uses.
-    #[test]
-    fn qkv_split_path_matches_legacy_at_seq128() {
-        let device = MlxDevice::new().expect("device");
-        let mut registry = KernelRegistry::new();
-
-        // Qwen3.6-27B Gated DeltaNet shape (matches build_delta_net_layer).
-        let seq: usize = 128;
-        let nk: usize = 2;
-        let nv: usize = 16;
-        let dk: usize = 128;
-        let dv: usize = 128;
-        let q_sp: usize = nk * dk;
-        let k_sp: usize = nk * dk;
-        let v_sp: usize = nv * dv;
-        let qkv_ch: usize = q_sp + k_sp + v_sp;
-
-        // Deterministic input — distinguishable per element so a misrouted
-        // copy fails the byte-equality check.
-        let mut seed: u32 = 0xC0FFEE;
-        let qkv_cpu: Vec<f32> = mk_rand(&mut seed, seq * qkv_ch, 1.0);
-
-        // ---- LEGACY: CPU triple-loop ----
-        let mut q_legacy = vec![0.0f32; seq * q_sp];
-        let mut k_legacy = vec![0.0f32; seq * k_sp];
-        let mut v_legacy = vec![0.0f32; seq * v_sp];
-        for t in 0..seq {
-            let base = t * qkv_ch;
-            q_legacy[t * q_sp..(t + 1) * q_sp]
-                .copy_from_slice(&qkv_cpu[base..base + q_sp]);
-            k_legacy[t * k_sp..(t + 1) * k_sp]
-                .copy_from_slice(&qkv_cpu[base + q_sp..base + q_sp + k_sp]);
-            v_legacy[t * v_sp..(t + 1) * v_sp]
-                .copy_from_slice(&qkv_cpu[base + q_sp + k_sp..base + qkv_ch]);
-        }
-
-        // ---- NEW: GPU split kernel ----
-        let qkv_buf = upload_f32(&qkv_cpu, &device).expect("upload qkv");
-        let q_gpu_buf = device
-            .alloc_buffer(seq * q_sp * 4, DType::F32, vec![seq, q_sp])
-            .expect("alloc q");
-        let k_gpu_buf = device
-            .alloc_buffer(seq * k_sp * 4, DType::F32, vec![seq, k_sp])
-            .expect("alloc k");
-        let v_gpu_buf = device
-            .alloc_buffer(seq * v_sp * 4, DType::F32, vec![seq, v_sp])
-            .expect("alloc v");
-
-        let params = QkvSplitParams {
-            seq: seq as u32,
-            q_sp: q_sp as u32,
-            k_sp: k_sp as u32,
-            v_sp: v_sp as u32,
-        };
-
-        let mut enc = device.command_encoder().expect("encoder");
-        dispatch_qkv_split_f32(
-            &mut enc,
-            &mut registry,
-            device.metal_device(),
-            &qkv_buf,
-            &q_gpu_buf,
-            &k_gpu_buf,
-            &v_gpu_buf,
-            &params,
-        )
-        .expect("dispatch_qkv_split_f32");
-        enc.commit_and_wait().expect("commit_and_wait");
-
-        let q_new = download_f32(&q_gpu_buf).expect("download q");
-        let k_new = download_f32(&k_gpu_buf).expect("download k");
-        let v_new = download_f32(&v_gpu_buf).expect("download v");
-
-        // Pure strided copy → bit-exact equality.
-        assert_eq!(q_new.len(), q_legacy.len(), "Q length mismatch");
-        assert_eq!(k_new.len(), k_legacy.len(), "K length mismatch");
-        assert_eq!(v_new.len(), v_legacy.len(), "V length mismatch");
-        for (i, (n, l)) in q_new.iter().zip(q_legacy.iter()).enumerate() {
-            assert_eq!(n.to_bits(), l.to_bits(), "Q bit-mismatch at {i}");
-        }
-        for (i, (n, l)) in k_new.iter().zip(k_legacy.iter()).enumerate() {
-            assert_eq!(n.to_bits(), l.to_bits(), "K bit-mismatch at {i}");
-        }
-        for (i, (n, l)) in v_new.iter().zip(v_legacy.iter()).enumerate() {
-            assert_eq!(n.to_bits(), l.to_bits(), "V bit-mismatch at {i}");
-        }
-
-        eprintln!("qkv_split_path_matches_legacy_at_seq128: PASS (byte-identical)");
-    }
+    // Wave 5b.18 `qkv_split_path_matches_legacy_at_seq128` test deleted in
+    // W-5b.19 alongside the legacy CPU path it exercised. Standing parity
+    // bar: the bit-identical CPU reference test in
+    // `mlx-native/tests/test_qkv_split.rs::test_qkv_split_qwen36_27b_shape_seq128`
+    // (and the matching `_pp4106` case for full prefill scale).
 
     /// Wave 5b iter 5 — chunk wrapper rejects `seq_len` not a multiple of BT.
     ///
