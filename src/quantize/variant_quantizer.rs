@@ -39,8 +39,8 @@
 use crate::calibrate::calibrator::CalibrationData;
 use crate::ir::{DType, QuantizedTensor, TensorQuantInfo, TensorRef};
 use crate::quantize::k_quant_codec::{quantize_tensor_2d_to_bytes, KQuantTarget};
-use crate::quantize::k_quant_codec_quantizer::METHOD_K_QUANT_CODEC_DIRECT;
-use crate::quantize::layer_mix::{target_for, KQuantVariant};
+use crate::quantize::k_quant_codec_quantizer::{f16_passthrough, METHOD_K_QUANT_CODEC_DIRECT};
+use crate::quantize::layer_mix::{should_emit_f16_for_kquant, target_for, KQuantVariant};
 use crate::quantize::{LayerQuantConfig, Quantizer, QuantizeError};
 
 /// Variant-aware K-quant Quantizer. Each tensor gets the target the
@@ -152,6 +152,13 @@ impl Quantizer for VariantKQuantizer {
         // norms, biases, vision tensors, explicit-preserve flags pass
         // through at original precision.  Also catches the layer_mix
         // skip rule for `ffn_gate_inp.weight` (`llama-quant.cpp:307`).
+        //
+        // **Ordering note (Iter D)**: same as `KQuantCodecQuantizer` —
+        // explicit `config.preserve` (and the `ffn_gate_inp` skip rule)
+        // wins over the implicit Iter D skip so the legacy
+        // `method = "passthrough"` shape is unchanged at every existing
+        // preserve site.  Iter D's skip runs only when neither preserve
+        // signal triggered.
         let must_preserve = config.preserve
             || crate::quantize::layer_mix::should_skip_quantization(&tensor.name);
         if must_preserve {
@@ -178,6 +185,23 @@ impl Quantizer for VariantKQuantizer {
                     ggml_type: None,
                 },
             });
+        }
+
+        // ADR-014 P11-prereq Iter D (2026-04-27): vision-tensor +
+        // non-256-multiple skip → F16 passthrough. See
+        // `KQuantCodecQuantizer::quantize_tensor` for the full doc;
+        // the skip is plumbed identically into all three K-quant
+        // dispatch sites so production `--quant q4_k_m` (this file)
+        // and DWQ paths (`DwqKQuantizer`) share the predicate.
+        let row_len_for_skip = tensor.shape.last().copied().unwrap_or(0);
+        if should_emit_f16_for_kquant(&tensor.name, row_len_for_skip) {
+            tracing::info!(
+                tensor = %tensor.name,
+                row_len = row_len_for_skip,
+                variant = self.variant.name(),
+                "K-quant skip → F16 passthrough (vision or non-256-multiple)"
+            );
+            return f16_passthrough(tensor, &tensor.name);
         }
 
         // Pick the per-tensor target via the policy.
@@ -399,6 +423,52 @@ mod tests {
         assert_eq!(out.quant_info.method, "passthrough");
         assert!(out.quant_info.preserved);
         assert_eq!(out.data, tensor.data);
+    }
+
+    /// **Iter D**: vision-tensor blocker shape (1152-dim
+    /// `model.visual.…`) emits F16 passthrough through the variant
+    /// dispatcher — pre-empts the codec's row-alignment rejection.
+    #[test]
+    fn variant_q4km_vision_tensor_emits_f16_passthrough() {
+        let row: Vec<f32> = (0..1152).map(|i| (i as f32 - 576.0) / 576.0).collect();
+        let tensor = make_f32_tensor(
+            "model.visual.blocks.0.attn.proj.weight",
+            vec![1152],
+            &row,
+        );
+        let cfg = LayerQuantConfig {
+            bits: 0,
+            group_size: 0,
+            preserve: false,
+        };
+        let q = VariantKQuantizer::new(KQuantVariant::Q4_K_M, CalibrationData::None, 32);
+        let out = q.quantize_tensor(&tensor, &cfg).unwrap();
+        assert_eq!(out.quant_info.method, "f16");
+        assert_eq!(out.quant_info.bits, 16);
+        assert!(out.quant_info.preserved);
+        assert_eq!(out.quant_info.ggml_type.as_deref(), Some("F16"));
+        assert_eq!(out.data.len(), 1152 * 2);
+    }
+
+    /// **Iter D**: aligned language tensor under the same variant still
+    /// routes through the codec — proves the skip is narrowly scoped.
+    #[test]
+    fn variant_q4km_aligned_language_tensor_routes_through_codec() {
+        const QK_K: usize = 256;
+        let row: Vec<f32> = (0..QK_K).map(|i| (i as f32) / QK_K as f32).collect();
+        let tensor = make_f32_tensor("blk.5.attn_q.weight", vec![QK_K], &row);
+        let cfg = LayerQuantConfig {
+            bits: 0,
+            group_size: 0,
+            preserve: false,
+        };
+        let q = VariantKQuantizer::new(KQuantVariant::Q4_K_M, CalibrationData::None, 32);
+        let out = q.quantize_tensor(&tensor, &cfg).unwrap();
+        assert_eq!(
+            out.quant_info.method,
+            crate::quantize::k_quant_codec_quantizer::METHOD_K_QUANT_CODEC_DIRECT
+        );
+        assert_eq!(out.quant_info.ggml_type.as_deref(), Some("Q4_K"));
     }
 
     /// `Quantizer::name` reports the variant name.

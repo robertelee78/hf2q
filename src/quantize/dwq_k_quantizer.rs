@@ -87,7 +87,8 @@ use std::ops::RangeInclusive;
 use crate::calibrate::calibrator::CalibrationData;
 use crate::ir::{QuantizedTensor, TensorRef};
 use crate::quantize::k_quant_codec::KQuantTarget;
-use crate::quantize::k_quant_codec_quantizer::KQuantCodecQuantizer;
+use crate::quantize::k_quant_codec_quantizer::{f16_passthrough, KQuantCodecQuantizer};
+use crate::quantize::layer_mix::should_emit_f16_for_kquant;
 use crate::quantize::{LayerQuantConfig, Quantizer, QuantizeError};
 
 /// DWQ-class K-quant variant.  Maps to a (base, sensitive) pair of
@@ -248,6 +249,35 @@ impl Quantizer for DwqKQuantizer {
         tensor: &TensorRef,
         config: &LayerQuantConfig,
     ) -> Result<QuantizedTensor, QuantizeError> {
+        // ADR-014 P11-prereq Iter D (2026-04-27): vision-tensor +
+        // non-256-multiple skip → F16 passthrough.  The check fires
+        // BEFORE per-tensor target dispatch so DWQ's base/sensitive
+        // routing never sees a tensor the K-quant codec cannot encode
+        // (e.g. Qwen3.6-27B vision-attn proj at row_len = 1152, the
+        // LIVE blocker for the four DWQ re-emits documented in
+        // ADR-014 § "P11-prereq Iter D" 2026-04-27).  Plumbed here
+        // (not just at the inner `KQuantCodecQuantizer` site) so the
+        // skip signal is logged with the DWQ variant context AND so a
+        // future refactor that swaps the inner codec cannot regress
+        // the predicate on the DWQ path.
+        //
+        // **Ordering note**: `config.preserve` wins (handled by the
+        // inner `KQuantCodecQuantizer` at delegation time).  Iter D
+        // skip fires only when the caller did NOT opt into preserve
+        // — symmetric with the in-source ordering at
+        // `KQuantCodecQuantizer::quantize_tensor` and
+        // `VariantKQuantizer::quantize_tensor`.
+        let row_len = tensor.shape.last().copied().unwrap_or(0);
+        if !config.preserve && should_emit_f16_for_kquant(&tensor.name, row_len) {
+            tracing::info!(
+                tensor = %tensor.name,
+                row_len,
+                variant = self.variant.name(),
+                "DWQ K-quant skip → F16 passthrough (vision or non-256-multiple)"
+            );
+            return f16_passthrough(tensor, &tensor.name);
+        }
+
         let target = match self.target_for(&tensor.name) {
             Some(t) => t,
             None => {
@@ -736,6 +766,84 @@ mod tests {
         assert_eq!(out.shape, vec![n_rows, QK_K]);
         assert_eq!(out.data.len(), n_rows * BLOCK_Q4_K_SIZE);
         assert_eq!(out.quant_info.ggml_type.as_deref(), Some("Q4_K"));
+    }
+
+    /// **Iter D**: vision-tensor blocker shape (1152-dim
+    /// `model.visual.…`) emits F16 passthrough through the DWQ
+    /// dispatcher — pre-empts the codec's row-alignment rejection.
+    /// Matches the LIVE blocker that killed the first P11 re-emit
+    /// attempt at `commit base 87c6242` (qwen3.6-27B → dwq46).
+    #[test]
+    fn dwq_p46_vision_tensor_blocker_shape_emits_f16() {
+        let row: Vec<f32> = (0..1152).map(|i| (i as f32 - 576.0) / 576.0).collect();
+        let data: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tensor = TensorRef {
+            name: "model.visual.blocks.0.attn.proj.weight".to_string(),
+            shape: vec![1152],
+            dtype: DType::F32,
+            data,
+        };
+        let q = DwqKQuantizer::new(DwqKVariant::P46, &[], CalibrationData::None);
+        let out = q.quantize_tensor(&tensor, &default_layer_config()).unwrap();
+        assert_eq!(out.quant_info.method, "f16");
+        assert_eq!(out.quant_info.bits, 16);
+        assert!(out.quant_info.preserved);
+        assert_eq!(out.quant_info.ggml_type.as_deref(), Some("F16"));
+        assert_eq!(out.data.len(), 1152 * 2);
+    }
+
+    /// **Iter D**: same vision tensor under DWQ-P28 (the variant whose
+    /// base bucket would otherwise return the typed Q2_K-deferred
+    /// error).  The Iter D skip predicate fires BEFORE the
+    /// base-target dispatch, so the path is F16 passthrough — NOT
+    /// the typed Q2_K error.  Locks the ordering: vision skip runs
+    /// before per-variant target lookup.
+    #[test]
+    fn dwq_p28_vision_tensor_emits_f16_not_q2k_deferred_error() {
+        let row: Vec<f32> = (0..1152).map(|i| (i as f32) / 1152.0).collect();
+        let data: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tensor = TensorRef {
+            name: "model.visual.blocks.0.attn.proj.weight".to_string(),
+            shape: vec![1152],
+            dtype: DType::F32,
+            data,
+        };
+        let q = DwqKQuantizer::new(DwqKVariant::P28, &[], CalibrationData::None);
+        let out = q.quantize_tensor(&tensor, &default_layer_config()).unwrap();
+        assert_eq!(out.quant_info.method, "f16");
+        assert_eq!(out.quant_info.ggml_type.as_deref(), Some("F16"));
+    }
+
+    /// **Iter D**: aligned non-vision tensor still routes through the
+    /// codec under DWQ — proves the skip is narrowly scoped.
+    #[test]
+    fn dwq_p46_aligned_language_tensor_still_routes_through_codec() {
+        let tensor = make_block_aligned_f32_tensor(
+            "model.layers.0.self_attn.q_proj.weight",
+        );
+        let q = DwqKQuantizer::new(DwqKVariant::P46, &[], CalibrationData::None);
+        let out = q.quantize_tensor(&tensor, &default_layer_config()).unwrap();
+        assert_eq!(out.quant_info.method, METHOD_K_QUANT_CODEC_DIRECT);
+        assert_eq!(out.quant_info.ggml_type.as_deref(), Some("Q4_K"));
+    }
+
+    /// **Iter D**: defensive non-256-multiple arm fires for a
+    /// synthetic non-vision name on the DWQ path (independent of the
+    /// vision substring match).
+    #[test]
+    fn dwq_p46_non_256_multiple_emits_f16() {
+        let row: Vec<f32> = (0..1153).map(|i| (i as f32) / 1153.0).collect();
+        let data: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tensor = TensorRef {
+            name: "model.layers.0.attn_weird.weight".to_string(),
+            shape: vec![1153],
+            dtype: DType::F32,
+            data,
+        };
+        let q = DwqKQuantizer::new(DwqKVariant::P46, &[], CalibrationData::None);
+        let out = q.quantize_tensor(&tensor, &default_layer_config()).unwrap();
+        assert_eq!(out.quant_info.method, "f16");
+        assert_eq!(out.data.len(), 1153 * 2);
     }
 
     #[test]

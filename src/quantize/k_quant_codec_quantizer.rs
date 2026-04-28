@@ -41,6 +41,7 @@
 use crate::calibrate::calibrator::CalibrationData;
 use crate::ir::{DType, QuantizedTensor, TensorQuantInfo, TensorRef};
 use crate::quantize::k_quant_codec::{quantize_tensor_2d_to_bytes, KQuantTarget};
+use crate::quantize::layer_mix::should_emit_f16_for_kquant;
 use crate::quantize::{LayerQuantConfig, Quantizer, QuantizeError};
 
 /// Quantizer that produces final GGUF block bytes via [`k_quant_codec`].
@@ -113,6 +114,85 @@ fn tensor_to_f32(tensor: &TensorRef) -> Result<Vec<f32>, QuantizeError> {
 /// write. P4 GGUF backend wiring uses this to skip the repack path.
 pub const METHOD_K_QUANT_CODEC_DIRECT: &str = "k_quant_codec_direct";
 
+/// Build a F16-passthrough [`QuantizedTensor`] for a tensor that the
+/// K-quant codec cannot encode (vision-encoder tensors, non-256-multiple
+/// row lengths). The output `QuantizedTensor` carries:
+///
+///   * `method = "f16"` — routed through the F16 arm in
+///     `repack_to_ggml_blocks` (`src/backends/gguf.rs:1049`).
+///   * `bits = 16`, `preserved = true` — `quant_info_to_ggml_type`
+///     short-circuits to `GGML_TYPE_F16` on the very first line
+///     (`src/backends/gguf.rs:1681`).
+///   * `ggml_type = Some("F16")` — explicit, defends against any future
+///     loss of the `preserved` short-circuit.
+///
+/// The `data` field is the tensor's bytes converted to F16 LE:
+///   * BF16 → F16 via the existing `TensorRef::to_f16` helper (lossy
+///     re-cast through F32; matches the convert pipeline's pre-quant
+///     cast at `src/main.rs::convert_bf16_to_f16`).
+///   * F32 → F16 via `half::f16::from_f32` per element (lossy on values
+///     outside F16's [-65504, 65504] range; vision tensors are bounded
+///     and never trigger overflow in practice).
+///   * F16 → F16 unchanged.
+///   * Any other dtype: typed `QuantizeError::TensorQuantizeFailed`.
+///
+/// Used by the Iter D vision-tensor + non-256-multiple skip predicate
+/// (`should_emit_f16_for_kquant`) at the top of every K-quant
+/// dispatch site (this module's `KQuantCodecQuantizer`,
+/// `VariantKQuantizer`, `DwqKQuantizer`).
+pub fn f16_passthrough(
+    tensor: &TensorRef,
+    name: &str,
+) -> Result<QuantizedTensor, QuantizeError> {
+    let f16_data: Vec<u8> = match tensor.dtype {
+        DType::F16 => tensor.data.clone(),
+        DType::BF16 => {
+            // Re-use the canonical BF16→F16 helper. Map IrError into a
+            // typed quantize error so callers see a uniform error surface.
+            let converted = tensor.to_f16().map_err(|e| {
+                QuantizeError::TensorQuantizeFailed {
+                    tensor: name.to_string(),
+                    reason: format!("f16-passthrough: BF16→F16 cast failed: {e}"),
+                }
+            })?;
+            converted.data
+        }
+        DType::F32 => {
+            let mut out = Vec::with_capacity(tensor.data.len() / 2);
+            for chunk in tensor.data.chunks_exact(4) {
+                let bits = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                out.extend_from_slice(&half::f16::from_f32(bits).to_le_bytes());
+            }
+            out
+        }
+        other => {
+            return Err(QuantizeError::TensorQuantizeFailed {
+                tensor: name.to_string(),
+                reason: format!(
+                    "f16-passthrough: unsupported source dtype {other} \
+                     (expected F32 / F16 / BF16)"
+                ),
+            });
+        }
+    };
+
+    Ok(QuantizedTensor {
+        name: name.to_string(),
+        shape: tensor.shape.clone(),
+        original_dtype: tensor.dtype,
+        data: f16_data,
+        quant_info: TensorQuantInfo {
+            method: "f16".to_string(),
+            bits: 16,
+            group_size: 0,
+            preserved: true,
+            scales: None,
+            biases: None,
+            ggml_type: Some("F16".to_string()),
+        },
+    })
+}
+
 /// Map `KQuantTarget` to the canonical GGML type name string used by
 /// `TensorQuantInfo.ggml_type` (preserves compatibility with the
 /// existing per-tensor type field).
@@ -150,6 +230,16 @@ impl Quantizer for KQuantCodecQuantizer {
         // norms, biases, vision tensors, and explicit preserve flags
         // pass through at original precision (BF16 → F16 conversion
         // is the caller's job via `convert_bf16_to_f16` upstream).
+        //
+        // **Ordering note (Iter D)**: `config.preserve` is the explicit,
+        // opt-in preserve channel set by the caller — honour it FIRST
+        // so the legacy `method = "passthrough"` shape is unchanged for
+        // every existing per-tensor preserve site (norms, biases, the
+        // pre-quant `is_weight()` filter at `src/main.rs`).  The
+        // implicit Iter D skip (vision + non-256-multiple) runs AFTER,
+        // as a defensive fallback for K-quant dispatchers that the
+        // upstream `is_vision_tensor`/`is_weight` predicates did not
+        // already mark `preserve = true`.
         if config.preserve {
             // Caller asked for passthrough — return as-is, marking the
             // method "passthrough" so GGUF backend handles via F16 path.
@@ -176,6 +266,28 @@ impl Quantizer for KQuantCodecQuantizer {
                     ggml_type: None,
                 },
             });
+        }
+
+        // ADR-014 P11-prereq Iter D (2026-04-27): vision-tensor +
+        // non-256-multiple skip → F16 passthrough. Pre-empts the
+        // K-quant codec's row-alignment rejection at
+        // `quantize_row_to_bytes` (e.g. Qwen3.6-27B vision-attn
+        // proj at row_len = 1152, the LIVE blocker recorded in
+        // ADR-014 § "P11-prereq Iter D" 2026-04-27). See
+        // `should_emit_f16_for_kquant` doc for the full pattern list.
+        // Runs AFTER `config.preserve` (legacy passthrough takes
+        // priority — see ordering note above) but BEFORE the codec
+        // dispatch so codec rejections never surface for predicate-
+        // matched tensors.
+        let row_len_for_skip = tensor.shape.last().copied().unwrap_or(0);
+        if should_emit_f16_for_kquant(&tensor.name, row_len_for_skip) {
+            tracing::info!(
+                tensor = %tensor.name,
+                row_len = row_len_for_skip,
+                target = ?self.target,
+                "K-quant skip → F16 passthrough (vision or non-256-multiple)"
+            );
+            return f16_passthrough(tensor, &tensor.name);
         }
 
         // Convert to F32 for the codec.
@@ -380,10 +492,21 @@ mod tests {
         );
     }
 
-    /// Mismatched row length (not a multiple of QK_K=256) surfaces
-    /// a typed `TensorQuantizeFailed` error.
+    /// Mismatched row length (not a multiple of QK_K=256) at the
+    /// dispatcher level is caught by Iter D's defensive non-256-multiple
+    /// arm and emitted as F16 passthrough — NOT a typed error.
+    ///
+    /// **History**: pre-Iter D this test asserted that
+    /// `KQuantCodecQuantizer::quantize_tensor` surfaced a
+    /// `TensorQuantizeFailed` for misaligned rows. Iter D added the
+    /// `should_emit_f16_for_kquant` predicate which fires before the
+    /// codec dispatch, converting the rejection-error path into a
+    /// graceful F16 passthrough. The codec-level rejection (the actual
+    /// `KQuantCodecError::NotBlockAligned` typed error) is still
+    /// exercised at `src/quantize/k_quant_codec.rs::tests::rejects_…`
+    /// for callers that bypass this dispatcher.
     #[test]
-    fn rejects_misaligned_row() {
+    fn dispatcher_misaligned_row_routes_to_f16_passthrough() {
         let row: Vec<f32> = vec![0.0_f32; 200]; // not a multiple of 256
         let tensor = make_f32_tensor("blk.0.weird.weight", vec![200], &row);
         let cfg = LayerQuantConfig {
@@ -392,14 +515,123 @@ mod tests {
             preserve: false,
         };
         let q = KQuantCodecQuantizer::new("q4_k_m", KQuantTarget::Q4K, CalibrationData::None);
-        let err = q.quantize_tensor(&tensor, &cfg).unwrap_err();
-        match err {
-            QuantizeError::TensorQuantizeFailed { tensor: name, reason } => {
-                assert_eq!(name, "blk.0.weird.weight");
-                assert!(reason.contains("k-quant-codec"));
-            }
-            _ => panic!("expected TensorQuantizeFailed"),
-        }
+        let out = q.quantize_tensor(&tensor, &cfg).unwrap();
+        assert_eq!(out.quant_info.method, "f16");
+        assert!(out.quant_info.preserved);
+        assert_eq!(out.quant_info.ggml_type.as_deref(), Some("F16"));
+        // F16 bytes: 2 per element × 200 elements.
+        assert_eq!(out.data.len(), 200 * 2);
+    }
+
+    /// **Iter D**: vision tensor with the LIVE blocker shape
+    /// (`model.visual.blocks.0.attn.proj.weight`, row_len = 1152) is
+    /// emitted as F16 passthrough — NOT rejected by the codec. Pre-Iter D
+    /// this same tensor surfaced the `k-quant: input length 1152 is not
+    /// a multiple of QK_K (256)` error documented in ADR-014 § "P11-prereq
+    /// Iter D" 2026-04-27.
+    #[test]
+    fn vision_tensor_blocker_shape_emits_f16_not_codec_rejection() {
+        let row: Vec<f32> = (0..1152).map(|i| (i as f32 - 576.0) / 576.0).collect();
+        let tensor = make_f32_tensor(
+            "model.visual.blocks.0.attn.proj.weight",
+            vec![1152],
+            &row,
+        );
+        let cfg = LayerQuantConfig {
+            bits: 0,
+            group_size: 0,
+            preserve: false,
+        };
+        let q = KQuantCodecQuantizer::new("q4_k_m", KQuantTarget::Q4K, CalibrationData::None);
+        let out = q.quantize_tensor(&tensor, &cfg).unwrap();
+        assert_eq!(out.quant_info.method, "f16");
+        assert_eq!(out.quant_info.bits, 16);
+        assert!(out.quant_info.preserved);
+        assert_eq!(out.quant_info.ggml_type.as_deref(), Some("F16"));
+        // F16 bytes: 2 per element × 1152 elements.
+        assert_eq!(out.data.len(), 1152 * 2);
+        assert_eq!(out.shape, vec![1152]);
+        assert_eq!(out.original_dtype, DType::F32);
+    }
+
+    /// **Iter D**: aligned non-vision tensor still routes through the
+    /// codec (the skip predicate is narrowly scoped — does NOT divert
+    /// language-tensor paths).
+    #[test]
+    fn aligned_language_tensor_still_routes_through_codec() {
+        let row: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) / 128.0).collect();
+        let tensor = make_f32_tensor("blk.0.attn_q.weight", vec![256], &row);
+        let cfg = LayerQuantConfig {
+            bits: 0,
+            group_size: 0,
+            preserve: false,
+        };
+        let q = KQuantCodecQuantizer::new("q4_k_m", KQuantTarget::Q4K, CalibrationData::None);
+        let out = q.quantize_tensor(&tensor, &cfg).unwrap();
+        assert_eq!(out.quant_info.method, METHOD_K_QUANT_CODEC_DIRECT);
+        assert_eq!(out.quant_info.ggml_type.as_deref(), Some("Q4_K"));
+        assert_eq!(out.data.len(), 144);
+    }
+
+    /// **Iter D**: BF16 vision tensor → F16 passthrough via the existing
+    /// `TensorRef::to_f16` helper. Matches the convert pipeline's
+    /// pre-quant cast path (`convert_bf16_to_f16` upstream).
+    #[test]
+    fn bf16_vision_tensor_emits_f16_via_to_f16_helper() {
+        let row: Vec<f32> = (0..1152).map(|i| (i as f32 - 576.0) / 576.0).collect();
+        let tensor = make_bf16_tensor(
+            "model.visual.blocks.0.attn.proj.weight",
+            vec![1152],
+            &row,
+        );
+        let cfg = LayerQuantConfig {
+            bits: 0,
+            group_size: 0,
+            preserve: false,
+        };
+        let q = KQuantCodecQuantizer::new("q4_k_m", KQuantTarget::Q4K, CalibrationData::None);
+        let out = q.quantize_tensor(&tensor, &cfg).unwrap();
+        assert_eq!(out.quant_info.method, "f16");
+        assert_eq!(out.original_dtype, DType::BF16);
+        assert_eq!(out.data.len(), 1152 * 2);
+    }
+
+    /// **Iter D**: defensive non-256-multiple arm fires on a synthetic
+    /// non-vision name (proves the predicate is independent of the
+    /// vision pattern).
+    #[test]
+    fn non_256_multiple_non_vision_tensor_emits_f16() {
+        let row: Vec<f32> = (0..1153).map(|i| (i as f32) / 1153.0).collect();
+        let tensor = make_f32_tensor("blk.0.attn_weird.weight", vec![1153], &row);
+        let cfg = LayerQuantConfig {
+            bits: 0,
+            group_size: 0,
+            preserve: false,
+        };
+        let q = KQuantCodecQuantizer::new("q4_k_m", KQuantTarget::Q4K, CalibrationData::None);
+        let out = q.quantize_tensor(&tensor, &cfg).unwrap();
+        assert_eq!(out.quant_info.method, "f16");
+        assert_eq!(out.data.len(), 1153 * 2);
+    }
+
+    /// **Iter D**: `f16_passthrough` direct unit test — verifies the
+    /// helper's quant_info shape independent of the dispatcher wiring.
+    #[test]
+    fn f16_passthrough_helper_shapes_quant_info_correctly() {
+        let row: Vec<f32> = vec![0.5_f32; 16];
+        let tensor = make_f32_tensor("any.tensor.name", vec![16], &row);
+        let out = f16_passthrough(&tensor, "any.tensor.name").unwrap();
+        assert_eq!(out.quant_info.method, "f16");
+        assert_eq!(out.quant_info.bits, 16);
+        assert_eq!(out.quant_info.group_size, 0);
+        assert!(out.quant_info.preserved);
+        assert!(out.quant_info.scales.is_none());
+        assert!(out.quant_info.biases.is_none());
+        assert_eq!(out.quant_info.ggml_type.as_deref(), Some("F16"));
+        assert_eq!(out.data.len(), 16 * 2);
+        assert_eq!(out.shape, vec![16]);
+        assert_eq!(out.original_dtype, DType::F32);
+        assert_eq!(out.name, "any.tensor.name");
     }
 
     /// `name()`, `requires_calibration()`, `target()` accessors.

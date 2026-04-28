@@ -282,6 +282,52 @@ pub fn should_skip_quantization(tensor_name: &str) -> bool {
     tensor_name.contains("ffn_gate_inp.weight")
 }
 
+/// Returns `true` if this tensor should NOT be K-quant-encoded — instead emit
+/// as F16 passthrough. Triggers:
+///
+///   1. **Vision encoder tensors** (HF naming variants:
+///      `model.visual.*`, `vision_tower.*`, `vision_model.*`, `vit.*`,
+///      `visual.*`, and `.visual.*` substring for prefix-stripped layouts).
+///      Vision encoders are tiny relative to language tensors; F16 preserves
+///      quality with negligible file-size cost AND matches the `is_vision_tensor`
+///      preserve-at-full-precision policy at `src/ir/mod.rs:138`.
+///   2. **Defensive:** any tensor whose row length (last dim) is not divisible
+///      by `QK_K = 256`. The K-quant codec at
+///      `src/quantize/k_quant_codec.rs::quantize_row_to_bytes` rejects
+///      misaligned rows with a typed error; pre-empting that rejection here
+///      keeps the convert pipeline alive on shapes the codec cannot encode
+///      (e.g. Qwen3.6-27B vision-attn `proj.weight` at row_len = 1152, the
+///      LIVE blocker recorded in ADR-014 § "P11-prereq Iter D" 2026-04-27).
+///
+/// **Pattern matching is substring-based** so this catches both raw HF names
+/// (pre-prefix-strip) AND the prefix-stripped `language_model.` variants.
+/// Mirrors the substring style of `should_skip_quantization` and
+/// `TensorCategory::classify` in this module.
+///
+/// Used by `KQuantCodecQuantizer`, `VariantKQuantizer`, and `DwqKQuantizer`
+/// at the top of their `quantize_tensor` impls — skipped tensors emit as F16
+/// via `crate::quantize::k_quant_codec_quantizer::f16_passthrough`, which
+/// routes correctly through the F16 arms in `repack_to_ggml_blocks` AND
+/// `quant_info_to_ggml_type` in `src/backends/gguf.rs`.
+pub fn should_emit_f16_for_kquant(tensor_name: &str, row_len: usize) -> bool {
+    // Vision encoder patterns. Order doesn't matter (any match wins).
+    if tensor_name.contains("model.visual.")
+        || tensor_name.contains("vision_tower.")
+        || tensor_name.contains("vision_model.")
+        || tensor_name.contains("vit.")
+        || tensor_name.starts_with("visual.")
+        || tensor_name.contains(".visual.")
+    {
+        return true;
+    }
+    // Defensive: any non-256-multiple row length cannot encode under any
+    // K-quant target (Q4_K/Q5_K/Q6_K all use QK_K = 256).
+    if row_len % 256 != 0 {
+        return true;
+    }
+    false
+}
+
 /// llama.cpp's `use_more_bits` predicate (line 417-419):
 /// `i_layer < n_layers/8 || i_layer >= 7*n_layers/8 || (i_layer - n_layers/8) % 3 == 2`.
 /// The "first 1/8 + last 1/8 + every-3rd-after-1/8" rule that's used
@@ -820,6 +866,91 @@ mod tests {
             // Display matches name
             assert_eq!(format!("{v}"), v.name(), "Display matches name for {}", v.name());
         }
+    }
+
+    // ── Iter D: should_emit_f16_for_kquant predicate tests ─────────
+
+    /// Qwen3.6 vision-encoder proj tensor at row_len = 1152 (the live
+    /// blocker recorded in ADR-014 P11-prereq Iter D, 2026-04-27).
+    /// Both the vision pattern AND the non-256-multiple defensive
+    /// trigger fire here; either alone would suffice.
+    #[test]
+    fn vision_tensor_qwen35_proj_returns_true() {
+        assert!(should_emit_f16_for_kquant(
+            "model.visual.blocks.0.attn.proj.weight",
+            1152,
+        ));
+    }
+
+    /// CLIP-style `vision_tower.…` HF naming with an aligned row_len —
+    /// the vision pattern alone must trigger.
+    #[test]
+    fn vision_tensor_clip_qkv_returns_true() {
+        assert!(should_emit_f16_for_kquant(
+            "vision_tower.encoder.layers.0.self_attn.k_proj.weight",
+            1024,
+        ));
+    }
+
+    /// Aligned language tensor with a non-256-multiple row_len fires
+    /// the defensive arm. Synthetic name (no real model has 1153-dim
+    /// attn_q today; the predicate is forward-looking).
+    #[test]
+    fn non_256_multiple_returns_true() {
+        assert!(should_emit_f16_for_kquant("blk.0.attn_q.weight", 1153));
+    }
+
+    /// Standard 4096-dim attn_q in `blk.<N>.…` GGUF naming — pure
+    /// language tensor, perfectly aligned. Must NOT trigger.
+    #[test]
+    fn aligned_language_tensor_returns_false() {
+        assert!(!should_emit_f16_for_kquant("blk.0.attn_q.weight", 4096));
+    }
+
+    /// Boundary case: row_len exactly equal to QK_K = 256. Must be
+    /// treated as aligned (the defensive arm uses `% 256 != 0`).
+    #[test]
+    fn aligned_language_tensor_at_256_returns_false() {
+        assert!(!should_emit_f16_for_kquant("blk.0.attn_q.weight", 256));
+    }
+
+    /// Coverage for every vision-pattern variant in the predicate so a
+    /// future regression that drops one of them surfaces here directly.
+    /// All names use aligned row_len = 256 so only the vision arm can
+    /// be the trigger — proves each pattern fires independently.
+    #[test]
+    fn every_vision_pattern_variant_returns_true() {
+        // model.visual.* (Qwen3.6 raw HF naming)
+        assert!(should_emit_f16_for_kquant(
+            "model.visual.blocks.0.attn.proj.weight",
+            256,
+        ));
+        // vision_tower.* (CLIP / SigLIP raw HF naming)
+        assert!(should_emit_f16_for_kquant(
+            "vision_tower.encoder.layers.0.self_attn.q_proj.weight",
+            256,
+        ));
+        // vision_model.* (HF AutoModel naming)
+        assert!(should_emit_f16_for_kquant(
+            "vision_model.encoder.layers.5.mlp.fc1.weight",
+            256,
+        ));
+        // vit.* (DeiT / ViT-original naming)
+        assert!(should_emit_f16_for_kquant(
+            "vit.encoder.layer.0.attention.self.query.weight",
+            256,
+        ));
+        // visual.* (top-level prefix-stripped naming)
+        assert!(should_emit_f16_for_kquant(
+            "visual.blocks.0.attn.proj.weight",
+            256,
+        ));
+        // *.visual.* (mid-name substring — handles `language_model.visual.…`
+        // and other prefix-prepended layouts)
+        assert!(should_emit_f16_for_kquant(
+            "language_model.visual.blocks.0.attn.proj.weight",
+            256,
+        ));
     }
 
     /// `output.weight` and `token_embd.weight` still match exactly —
