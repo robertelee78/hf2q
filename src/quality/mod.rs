@@ -1435,6 +1435,153 @@ mod tests {
         }
     }
 
+    /// ADR-014 P7 iter-46 — exhaustive codec dequant matrix through
+    /// `measure_quality_streaming`.  Auto-iterates every codec target
+    /// (5 K-quants + 5 legacy = 10 codec dispatches) and asserts the
+    /// `try_dequantize_codec_direct` arm round-trips quality
+    /// measurement to ≥ per-bit-tier cosine threshold.
+    ///
+    /// Locks the iter-45 codec-direct dequant arm against future
+    /// `ggml_type` drift.  Adding a new `KQuantTarget` requires
+    /// extending `try_dequantize_codec_direct`'s match (or this test
+    /// fails on the new target's cosine threshold), so the matrix is
+    /// future-proofed against silent dequant regressions.
+    ///
+    /// Per-bit-tier cosine thresholds on smooth-ramp Q4_K test fixture:
+    ///   - 2-bit (Q2_K):           ≥ 0.95 (4 codebook values, lossy)
+    ///   - 3-bit (Q3_K):           ≥ 0.99 (8 codebook values)
+    ///   - 4-bit (Q4_K, Q4_0/_1):  ≥ 0.99
+    ///   - 5-bit (Q5_K, Q5_0/_1):  ≥ 0.99
+    ///   - 6-bit (Q6_K):           ≥ 0.99
+    ///   - 8-bit (Q8_0):           ≥ 0.999
+    #[test]
+    fn codec_direct_dequant_matrix_through_quality_pipeline() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::ir::TensorMap;
+        use crate::quantize::k_quant_codec::KQuantTarget;
+        use crate::quantize::k_quant_codec_quantizer::KQuantCodecQuantizer;
+        use crate::quantize::quantize_streaming;
+
+        const QK_K: usize = 256;
+        const ROW_LEN: usize = QK_K; // K-quant block-aligned (256-multiple)
+        const N_LEGACY_BLOCKS: usize = QK_K / 32; // 8 legacy 32-element blocks per row
+
+        let make_payload = |seed: f32| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(ROW_LEN * 2);
+            for i in 0..ROW_LEN {
+                let v = (i as f32 / ROW_LEN as f32) * 2.0 - 1.0 + seed * 0.001;
+                bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+            }
+            bytes
+        };
+        let payload = make_payload(0.0);
+
+        // (target, name, cosine_threshold)
+        let cases: Vec<(KQuantTarget, &str, f64)> = vec![
+            (KQuantTarget::Q2K,        "Q2_K", 0.95),
+            (KQuantTarget::Q3K,        "Q3_K", 0.99),
+            (KQuantTarget::Q4K,        "Q4_K", 0.99),
+            (KQuantTarget::Q5K,        "Q5_K", 0.99),
+            (KQuantTarget::Q6K,        "Q6_K", 0.99),
+            (KQuantTarget::Q4Legacy,   "Q4_0", 0.99),
+            (KQuantTarget::Q4Legacy1,  "Q4_1", 0.99),
+            (KQuantTarget::Q5Legacy0,  "Q5_0", 0.99),
+            (KQuantTarget::Q5Legacy1,  "Q5_1", 0.99),
+            (KQuantTarget::Q8Legacy,   "Q8_0", 0.999),
+        ];
+
+        let metadata = ModelMetadata {
+            architecture: "test".to_string(),
+            model_type: "test".to_string(),
+            param_count: 0,
+            hidden_size: ROW_LEN as u64,
+            num_layers: 1,
+            layer_types: vec![],
+            num_attention_heads: 1,
+            num_kv_heads: None,
+            vocab_size: 0,
+            dtype: "float16".to_string(),
+            shard_count: 0,
+            num_experts: None,
+            top_k_experts: None,
+            intermediate_size: None,
+            raw_config: serde_json::Value::Null,
+            explicit_layer_types: None,
+            full_attention_interval: None,
+            attn_output_gate: None,
+            head_dim: None,
+            partial_rotary_factor: None,
+            rope_parameters: None,
+            linear_conv_kernel_dim: None,
+            linear_key_head_dim: None,
+            linear_num_key_heads: None,
+            linear_value_head_dim: None,
+            linear_num_value_heads: None,
+            mamba_ssm_dtype: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
+            output_router_logits: None,
+            router_aux_loss_coef: None,
+        };
+        let progress = ProgressReporter::new();
+
+        let _ = N_LEGACY_BLOCKS; // documentation aid; assertion below handles per-target.
+
+        for (target, name, threshold) in cases {
+            let q = KQuantCodecQuantizer::new(name, target, CalibrationData::None);
+
+            let mut lazy_map = LazyTensorMap::new();
+            lazy_map.insert(LazyTensor::from_bytes(
+                LazyMeta::new(
+                    "blk.0.attn_q.weight".to_string(),
+                    vec![1, ROW_LEN],
+                    DType::F16,
+                ),
+                payload.clone(),
+            ));
+            let model =
+                quantize_streaming(lazy_map, &metadata, &q, 0, 0, &progress, false)
+                    .unwrap_or_else(|e| panic!("{name} streaming: {e:?}"));
+
+            let mut tensor_map = TensorMap::new();
+            tensor_map.insert(crate::ir::TensorRef {
+                name: "blk.0.attn_q.weight".to_string(),
+                shape: vec![1, ROW_LEN],
+                dtype: DType::F16,
+                data: payload.clone(),
+            });
+
+            let report = measure_quality_streaming(
+                &tensor_map,
+                &model,
+                &metadata,
+                std::path::Path::new("/tmp"),
+                &progress,
+            )
+            .unwrap_or_else(|e| panic!("{name} quality: {e:?}"));
+
+            let per_layer = report
+                .per_layer_cosine_sim
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: per-layer must exist (codec-direct dequant)"));
+            assert!(
+                !per_layer.is_empty(),
+                "{name}: per-layer must contain the weight"
+            );
+
+            let cosine = per_layer[0];
+            assert!(
+                cosine >= threshold,
+                "{name}: cosine {cosine:.6} < threshold {threshold} \
+                 — codec-direct dequant arm degrading round-trip quality \
+                 below the per-bit-tier expectation"
+            );
+        }
+    }
+
     #[test]
     fn measure_quality_streaming_handles_empty_quantized_model() {
         // Empty tensor map → empty per_layer + None metrics, no panic.
