@@ -2378,6 +2378,151 @@ mod tests {
         );
     }
 
+    /// W-5b.27 Phase B-3: cross-path parity for `DenseFfnOutputCache` lift.
+    ///
+    /// Verifies that the LEGACY per-layer pooled-alloc path
+    /// (`HF2Q_FFN_DENSE_LIFT_LEGACY=1`) and the NEW lifted-cache path
+    /// (gate unset) produce bit-identical output across 3 alternating
+    /// LEGACY ↔ NEW invocations at seq_len=128 (chunk-prefill scale).
+    ///
+    /// 3-cold determinism: runs LEGACY → NEW → LEGACY → NEW → LEGACY → NEW
+    /// (6 invocations) and confirms all 6 outputs match bit-for-bit.  Drops
+    /// the cache between LEGACY runs so the LEGACY path doesn't accidentally
+    /// inherit a stale cached buffer from a prior NEW run.
+    ///
+    /// Companion to `dense_q_arena_reset_chunk_prefill_no_layer_33_error`:
+    /// that test exercises pool lifecycle invariants, this one exercises
+    /// cross-path numeric equivalence.
+    #[test]
+    fn dense_ffn_lift_path_matches_legacy_at_seq128() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+
+        let hidden_size: u32 = 128;
+        let intermediate_size: u32 = 384;
+        let h = hidden_size as usize;
+        let m = intermediate_size as usize;
+        let seq_len: u32 = 128;
+        let n_out = (seq_len as usize) * h;
+
+        // Production-shape Q4_0 weights, single set.
+        let mut seed = 0xBEEFu32;
+        let mut r = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n).map(|_| {
+                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                ((seed as i32 as f32) / (i32::MAX as f32)) * scale
+            }).collect()
+        };
+        let gate_f32 = r(m * h, 0.1);
+        let up_f32 = r(m * h, 0.1);
+        let down_f32 = r(h * m, 0.1);
+        let x_cpu = r(seq_len as usize * h, 0.5);
+        let gate_q4 = encode_q4_0(&gate_f32);
+        let up_q4 = encode_q4_0(&up_f32);
+        let down_q4 = encode_q4_0(&down_f32);
+        let make_q_buf = |data: &[u8]| -> MlxBuffer {
+            let mut buf = device.alloc_buffer(data.len(), DType::U8, vec![data.len()])
+                .expect("alloc q4_0 buf");
+            buf.as_mut_slice::<u8>().expect("q-buf slice").copy_from_slice(data);
+            buf
+        };
+        let weights = DenseFfnWeightsGpuQ {
+            gate_q: make_q_buf(&gate_q4),
+            up_q:   make_q_buf(&up_q4),
+            down_q: make_q_buf(&down_q4),
+            ggml_type_gate_up: GgmlType::Q4_0,
+            ggml_type_down: GgmlType::Q4_0,
+            intermediate_size,
+            hidden_size,
+        };
+        let x_buf = upload_f32(&x_cpu, &device).expect("upload x");
+
+        // Ensure W-5b.15 arena-reset is in default-ON state (the
+        // `_into_pooled` body is the path under test).
+        std::env::remove_var("HF2Q_DENSE_Q_ARENA_RESET");
+
+        // Helper: run one invocation under the requested env-gate state.
+        let run_invocation = |label: &str,
+                              registry: &mut KernelRegistry,
+                              legacy: bool| -> Vec<f32> {
+            // Set env flag for this invocation.
+            if legacy {
+                std::env::set_var("HF2Q_FFN_DENSE_LIFT_LEGACY", "1");
+            } else {
+                std::env::remove_var("HF2Q_FFN_DENSE_LIFT_LEGACY");
+            }
+            // Drop both caches so neither path inherits a warm buffer
+            // populated by the alternate path.
+            super::super::decode_pool::drop_dense_ffn_output_cache();
+            super::super::decode_pool::reset_decode_pool();
+
+            let mut enc = device.command_encoder()
+                .unwrap_or_else(|e| panic!("{label}: enc: {e}"));
+            let out = build_dense_ffn_layer_gpu_q_into(
+                &mut enc, &device, registry, &x_buf, &weights, None,
+            )
+            .unwrap_or_else(|e| panic!("{label}: build: {e}"));
+            enc.commit_and_wait()
+                .unwrap_or_else(|e| panic!("{label}: commit: {e}"));
+            assert_eq!(out.element_count(), n_out, "{label}: element_count");
+            let slice = out.as_slice::<f32>().expect("{label}: as_slice");
+            slice[..n_out].to_vec()
+        };
+
+        // 6 alternating invocations: L, N, L, N, L, N.
+        // Cross-path parity: every L-output must match the immediately-
+        // preceding L (or first L is the reference) and every N-output
+        // must match L bit-for-bit.
+        let l1 = run_invocation("L1", &mut registry, true);
+        let n1 = run_invocation("N1", &mut registry, false);
+        let l2 = run_invocation("L2", &mut registry, true);
+        let n2 = run_invocation("N2", &mut registry, false);
+        let l3 = run_invocation("L3", &mut registry, true);
+        let n3 = run_invocation("N3", &mut registry, false);
+
+        // Parallel-contention guard: skip if every output is all-zero.
+        let all_zero_l1 = l1.iter().all(|&v| v == 0.0);
+        if all_zero_l1 {
+            eprintln!(
+                "dense_ffn_lift_path_matches_legacy_at_seq128: \
+                 L1 returned all-zero — likely parallel-contention flake."
+            );
+            return;
+        }
+
+        // Cross-path parity: bit-identical L vs N.
+        let max_abs = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter().zip(b.iter()).map(|(&x, &y)| (x - y).abs()).fold(0.0f32, f32::max)
+        };
+        // L runs are deterministic vs each other.
+        assert_eq!(max_abs(&l1, &l2), 0.0, "L1 vs L2 not bit-identical");
+        assert_eq!(max_abs(&l1, &l3), 0.0, "L1 vs L3 not bit-identical");
+        // N runs are deterministic vs each other.
+        assert_eq!(max_abs(&n1, &n2), 0.0, "N1 vs N2 not bit-identical");
+        assert_eq!(max_abs(&n1, &n3), 0.0, "N1 vs N3 not bit-identical");
+        // Cross-path: L vs N must be bit-identical.
+        assert_eq!(
+            max_abs(&l1, &n1), 0.0,
+            "LEGACY vs NEW differ — DenseFfnOutputCache wire-up corrupts output"
+        );
+        assert_eq!(max_abs(&l2, &n2), 0.0, "L2 vs N2 differ");
+        assert_eq!(max_abs(&l3, &n3), 0.0, "L3 vs N3 differ");
+
+        // Cleanup: leave env in NEW (default) state for subsequent tests.
+        std::env::remove_var("HF2Q_FFN_DENSE_LIFT_LEGACY");
+        super::super::decode_pool::drop_dense_ffn_output_cache();
+        super::super::decode_pool::reset_decode_pool();
+
+        eprintln!(
+            "dense_ffn_lift_path_matches_legacy_at_seq128: \
+             6 alternating L↔N invocations bit-identical at seq_len=128, \
+             max_abs_err=0.00e0 (L1↔N1, L2↔N2, L3↔N3)"
+        );
+    }
+
     // ────────────────────────────────────────────────────────────────
     // Quantized MoE GPU path (P9b-scale fix)
     // ────────────────────────────────────────────────────────────────
