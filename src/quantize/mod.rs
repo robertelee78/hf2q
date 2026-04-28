@@ -5135,6 +5135,117 @@ mod tests {
         );
     }
 
+    /// ADR-014 P7 iter-41 — F16-passthrough paths × parallelism orthogonality.
+    /// Closes Decision 5 (byte-identity for parallel) for the F16-passthrough
+    /// decision tree pinned in iter-40.  Both Path A (streaming preserve)
+    /// and Path B (codec gate) must produce byte-identical output through
+    /// `quantize_streaming_parallel` vs serial, in the same fixture
+    /// alongside a non-vision tensor that goes through the actual codec.
+    ///
+    /// Without this gate, a regression in `quantize_streaming_parallel`
+    /// that mishandles preserve=true tensors (Path A) or that re-enters
+    /// the codec gate non-deterministically (Path B) could silently break
+    /// vision-tensor preservation under multi-worker dispatch.
+    ///
+    /// Multi-fixture (3 tensors):
+    ///   - `vision_tower.encoder.layers.5.attn.q_proj.weight` → Path A
+    ///   - `model.visual.layers.5.attn.q_proj.weight`         → Path B
+    ///   - `blk.5.attn_q.weight`                              → codec dispatch
+    ///
+    /// Asserts serial ≡ parallel for ALL three tensors AND the dual-path
+    /// contract from iter-40 holds in the parallel output (vision-tensor
+    /// data byte-equivalent across both paths).
+    #[test]
+    fn vision_passthrough_paths_parallel_byte_identity() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::k_quant_codec::KQuantTarget;
+        use crate::quantize::k_quant_codec_quantizer::KQuantCodecQuantizer;
+
+        const ROW_LEN: usize = 256;
+
+        let payload: Vec<u8> = (0..ROW_LEN)
+            .map(|i| (i as f32 / ROW_LEN as f32) * 2.0 - 1.0)
+            .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+
+        let tensors: Vec<&str> = vec![
+            "vision_tower.encoder.layers.5.attn.q_proj.weight", // Path A
+            "model.visual.layers.5.attn.q_proj.weight",         // Path B
+            "blk.5.attn_q.weight",                              // codec dispatch
+        ];
+
+        let make_lazy_map = || -> LazyTensorMap {
+            let mut m = LazyTensorMap::new();
+            for n in &tensors {
+                m.insert(LazyTensor::from_bytes(
+                    LazyMeta::new(n.to_string(), vec![1, ROW_LEN], DType::F16),
+                    payload.clone(),
+                ));
+            }
+            m
+        };
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+        let q_serial = KQuantCodecQuantizer::new("Q4_K", KQuantTarget::Q4K, CalibrationData::None);
+        let q_parallel = KQuantCodecQuantizer::new("Q4_K", KQuantTarget::Q4K, CalibrationData::None);
+
+        let out_serial =
+            quantize_streaming(make_lazy_map(), &metadata, &q_serial, 0, 0, &progress, false)
+                .expect("serial streaming");
+        let out_parallel = quantize_streaming_parallel(
+            make_lazy_map(),
+            &metadata,
+            &q_parallel,
+            0,
+            0,
+            &progress,
+            false,
+            None,
+        )
+        .expect("parallel streaming");
+
+        for tname in &tensors {
+            let t_s = out_serial
+                .tensors
+                .get(*tname)
+                .unwrap_or_else(|| panic!("serial missing {tname}"));
+            let t_p = out_parallel
+                .tensors
+                .get(*tname)
+                .unwrap_or_else(|| panic!("parallel missing {tname}"));
+
+            assert_eq!(
+                t_s.quant_info.method, t_p.quant_info.method,
+                "{tname}: method differs serial vs parallel"
+            );
+            assert_eq!(
+                t_s.quant_info.ggml_type, t_p.quant_info.ggml_type,
+                "{tname}: ggml_type differs serial vs parallel"
+            );
+            assert_eq!(
+                t_s.quant_info.preserved, t_p.quant_info.preserved,
+                "{tname}: preserved flag differs serial vs parallel"
+            );
+            assert_eq!(
+                t_s.data, t_p.data,
+                "{tname}: bytes differ serial vs parallel — Decision 5 \
+                 byte-identity contract violated for F16-passthrough path"
+            );
+        }
+
+        // Re-assert iter-40's cross-path contract under parallel dispatch:
+        // vision-tensor byte data is equivalent across Path A and Path B.
+        let path_a_bytes = &out_parallel.tensors[tensors[0]].data;
+        let path_b_bytes = &out_parallel.tensors[tensors[1]].data;
+        assert_eq!(
+            path_a_bytes, path_b_bytes,
+            "iter-40 dual-predicate contract: parallel output must \
+             still emit byte-equivalent F16 data across both paths"
+        );
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
