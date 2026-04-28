@@ -586,7 +586,14 @@ impl Qwen35Model {
             if cache.as_ref().map_or(true, |c| c.model_ptr != self_ptr) {
                 let device = MlxDevice::new().context("forward_gpu: MlxDevice::new")?;
                 let mut registry = KernelRegistry::new();
-                let layer_weights = self.upload_layer_weights_gpu(&device)?;
+                // Wave 5b.8: time the one-time `upload_layer_weights_gpu`
+                // first-call cost (~17 GB Q4 materialization onto Metal heap).
+                let layer_weights = {
+                    let _t = super::wave5b8_profile::Section::start(
+                        super::wave5b8_profile::SectionKind::UploadWeights,
+                    );
+                    self.upload_layer_weights_gpu(&device)?
+                };
                 // W-5b.7 iter 2: lm_head F32 / Q4_0 + output_norm join the
                 // weight pool's residency set via the `_weight` / Q4_0
                 // helpers (which auto-register).
@@ -704,6 +711,20 @@ impl Qwen35Model {
         let mut total_full_attn_us = 0u64;
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
             let layer_cpu = &self.layers[layer_idx];
+
+            // Wave 5b.8: per-layer total wall-clock — captures attn +
+            // residual+norm + FFN + residual2 for the whole layer body,
+            // separated by linear-attn vs full-attn slot kind so the
+            // pp4096 chunk-pipeline regression can be attributed
+            // (32 of 64 layers in Qwen3.6 27B are linear-attn DeltaNet).
+            let _w5b8_layer_total = super::wave5b8_profile::Section::start(
+                match layer_gpu {
+                    LayerWeightsGpu::LinearAttn { .. } =>
+                        super::wave5b8_profile::SectionKind::LayerLinearTotal,
+                    LayerWeightsGpu::FullAttn { .. } =>
+                        super::wave5b8_profile::SectionKind::LayerFullTotal,
+                },
+            );
 
             // ADR-012 P9b GPU capture path: download residual entering this
             // layer to CPU F32 if a capture target is bound. Cost: ~20 MB
@@ -1039,6 +1060,14 @@ impl Qwen35Model {
                 total_us as f64 / 1000.0,
             );
         }
+
+        // Wave 5b.8: print per-section profile summary and reset
+        // accumulators. Gated on `HF2Q_PROFILE_W5B8=1`; no-op otherwise.
+        super::wave5b8_profile::w5b8_print_and_reset(&format!(
+            "forward_gpu seq_len={} layers={}",
+            seq_len,
+            self.layers.len()
+        ));
 
         // Stamp shape metadata onto the activation capture (ADR-012 P9b).
         if let Some(ref mut acts) = capture {

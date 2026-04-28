@@ -877,6 +877,13 @@ pub fn apply_gated_delta_net_chunk(
     // dispatch before invoking this wrapper (see forward_gpu.rs:1404
     // `commit chunk-prep prefill` for the prefill call site, and the unit
     // tests use upload_f32 which is immediately CPU-readable).
+    //
+    // Wave 5b.8 measurement spike: time the GQA expansion + the BF16 +
+    // output-buffer allocations + the encoder build + the final
+    // commit_and_wait separately. All gated on `HF2Q_PROFILE_W5B8=1`.
+    let _w5b8_expand = crate::inference::models::qwen35::wave5b8_profile::Section::start(
+        crate::inference::models::qwen35::wave5b8_profile::SectionKind::ChunkGqaExpand,
+    );
     let q_expanded = device
         .alloc_buffer(q_elems_exp * 4, DType::F32, vec![q_elems_exp])
         .map_err(|e| anyhow!("alloc q_expanded f32: {e}"))?;
@@ -932,6 +939,12 @@ pub fn apply_gated_delta_net_chunk(
         }
     }
 
+    // Drop the GQA-expand timer here so its bucket excludes the BF16
+    // alloc bucket below.
+    drop(_w5b8_expand);
+    let _w5b8_allocs = crate::inference::models::qwen35::wave5b8_profile::Section::start(
+        crate::inference::models::qwen35::wave5b8_profile::SectionKind::ChunkAllocs,
+    );
     // ---- Allocate BF16 scratch for q/k/v (chunk pipeline input dtype) ----
     let q_bf16 = device
         .alloc_buffer(q_elems_exp * 2, DType::BF16, vec![q_elems_exp])
@@ -985,6 +998,10 @@ pub fn apply_gated_delta_net_chunk(
     // All ops happen on the same Metal serial queue with explicit barriers
     // between RAW dependencies.
     // ------------------------------------------------------------------
+    drop(_w5b8_allocs);
+    let _w5b8_encbuild = crate::inference::models::qwen35::wave5b8_profile::Section::start(
+        crate::inference::models::qwen35::wave5b8_profile::SectionKind::ChunkEncBuild,
+    );
     let mut enc = device
         .command_encoder()
         .context("enc apply_gated_delta_net_chunk")?;
@@ -1078,8 +1095,14 @@ pub fn apply_gated_delta_net_chunk(
     )
     .context("cast output BF16→F32")?;
 
-    enc.commit_and_wait()
-        .context("commit apply_gated_delta_net_chunk")?;
+    drop(_w5b8_encbuild);
+    {
+        let _w5b8_commit = crate::inference::models::qwen35::wave5b8_profile::Section::start(
+            crate::inference::models::qwen35::wave5b8_profile::SectionKind::ChunkCommitWait,
+        );
+        enc.commit_and_wait()
+            .context("commit apply_gated_delta_net_chunk")?;
+    }
 
     // Return (output, final_state) — both F32, identical shape contract to
     // the autoregressive `apply_gated_delta_net` return type.
@@ -1382,6 +1405,9 @@ pub fn build_delta_net_layer(
         // output to extract per-token Q/K/V buffers, so the two-encoder approach
         // is retained.
         let (x_norm, qkv_conv_out, z) = {
+            let _w5b8 = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::LayerOps1to3,
+            );
             let mut enc = device.command_encoder().context("enc ops1-3 prefill")?;
             let x_norm = apply_pre_norm(
                 &mut enc, registry, device, x, &weights.attn_norm,
@@ -1408,21 +1434,27 @@ pub fn build_delta_net_layer(
         // conv_state_out now holds the updated conv state (caller swaps ping-pong).
 
         // Download and de-interleave.
-        let qkv_conv_cpu = download_f32(&qkv_conv_out)?;
-        let mut q_cpu = vec![0.0f32; seq * nk * dk];
-        let mut k_cpu = vec![0.0f32; seq * nk * dk];
-        let mut v_cpu = vec![0.0f32; seq * nv * dv];
-        for t in 0..seq {
-            let base = t * qkv_ch;
-            q_cpu[t * q_sp..(t + 1) * q_sp].copy_from_slice(&qkv_conv_cpu[base..base + q_sp]);
-            k_cpu[t * k_sp..(t + 1) * k_sp]
-                .copy_from_slice(&qkv_conv_cpu[base + q_sp..base + q_sp + k_sp]);
-            v_cpu[t * (nv * dv)..(t + 1) * (nv * dv)]
-                .copy_from_slice(&qkv_conv_cpu[base + q_sp + k_sp..base + qkv_ch]);
-        }
-        let q_gpu = upload_f32(&q_cpu, device)?;
-        let k_gpu = upload_f32(&k_cpu, device)?;
-        let v_gpu = upload_f32(&v_cpu, device)?;
+        let (q_gpu, k_gpu, v_gpu) = {
+            let _w5b8 = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::LayerQkvDeinterleave,
+            );
+            let qkv_conv_cpu = download_f32(&qkv_conv_out)?;
+            let mut q_cpu = vec![0.0f32; seq * nk * dk];
+            let mut k_cpu = vec![0.0f32; seq * nk * dk];
+            let mut v_cpu = vec![0.0f32; seq * nv * dv];
+            for t in 0..seq {
+                let base = t * qkv_ch;
+                q_cpu[t * q_sp..(t + 1) * q_sp].copy_from_slice(&qkv_conv_cpu[base..base + q_sp]);
+                k_cpu[t * k_sp..(t + 1) * k_sp]
+                    .copy_from_slice(&qkv_conv_cpu[base + q_sp..base + q_sp + k_sp]);
+                v_cpu[t * (nv * dv)..(t + 1) * (nv * dv)]
+                    .copy_from_slice(&qkv_conv_cpu[base + q_sp + k_sp..base + qkv_ch]);
+            }
+            let q_gpu = upload_f32(&q_cpu, device)?;
+            let k_gpu = upload_f32(&k_cpu, device)?;
+            let v_gpu = upload_f32(&v_cpu, device)?;
+            (q_gpu, k_gpu, v_gpu)
+        };
 
         // Wave 5b iter 5 — chunk-pipeline prefill route.
         //
@@ -1480,6 +1512,9 @@ pub fn build_delta_net_layer(
             // so the ping-pong contract at `forward_gpu.rs:818-823` keeps
             // working unchanged.
             let k_normed_buf = {
+                let _w5b8 = super::wave5b8_profile::Section::start(
+                    super::wave5b8_profile::SectionKind::LayerChunkPrep,
+                );
                 let mut enc = device.command_encoder().context("enc chunk-prep prefill")?;
                 let q_l2 = apply_l2_norm_per_head(
                     &mut enc, registry, device, &q_gpu, seq_len, n_k_heads, d_k, rms_norm_eps,
@@ -1516,23 +1551,28 @@ pub fn build_delta_net_layer(
             };
 
             // Stage: chunk-parallel delta-rule pipeline (own encoder).
-            let (chunk_attn_out, chunk_final_state) = apply_gated_delta_net_chunk(
-                device,
-                registry,
-                &q_scaled,
-                &k_normed_buf,
-                &v_gpu,
-                &g_buf,
-                &beta_buf,
-                state_in,
-                seq_len,
-                n_k_heads,
-                n_v_heads,
-                d_k,
-                d_v,
-                /* use_qk_l2norm = */ false,
-            )
-            .context("apply_gated_delta_net_chunk prefill")?;
+            let (chunk_attn_out, chunk_final_state) = {
+                let _w5b8 = super::wave5b8_profile::Section::start(
+                    super::wave5b8_profile::SectionKind::LayerChunkCall,
+                );
+                apply_gated_delta_net_chunk(
+                    device,
+                    registry,
+                    &q_scaled,
+                    &k_normed_buf,
+                    &v_gpu,
+                    &g_buf,
+                    &beta_buf,
+                    state_in,
+                    seq_len,
+                    n_k_heads,
+                    n_v_heads,
+                    d_k,
+                    d_v,
+                    /* use_qk_l2norm = */ false,
+                )
+                .context("apply_gated_delta_net_chunk prefill")?
+            };
 
             // Copy chunk-pipeline `final_state` into the caller-provided
             // `state_out` ping-pong buffer. Apple unified memory: the
@@ -1591,6 +1631,9 @@ pub fn build_delta_net_layer(
             // E2: ops 8+9 (ssm_norm_gate, out_proj). Reads chunk_attn_out
             // (the F32 attention output from the chunk pipeline) instead of
             // the autoregressive attn_out_buf.
+            let _w5b8_ops89 = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::LayerChunkOps8to9,
+            );
             let mut enc = device
                 .command_encoder()
                 .context("enc chunk ops8-9 prefill")?;
@@ -1609,6 +1652,9 @@ pub fn build_delta_net_layer(
             output
         } else {
             // ---- AUTOREGRESSIVE PREFILL (iter-4 unchanged path) ----
+            let _w5b8 = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::LayerAutoregOps5to9,
+            );
             let mut enc = device.command_encoder().context("enc ops5-9 prefill")?;
             let q_l2 = apply_l2_norm_per_head(
                 &mut enc, registry, device, &q_gpu, seq_len, n_k_heads, d_k, rms_norm_eps,
