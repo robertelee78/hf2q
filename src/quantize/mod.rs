@@ -3800,6 +3800,155 @@ mod tests {
         }
     }
 
+    /// ADR-014 P7 iter-31 — exhaustive variant-pair base-target consistency
+    /// matrix.  Auto-iterates every unordered pair from
+    /// `KQuantVariant::all()` and asserts the streaming-output invariant
+    /// on a guaranteed-base-routed tensor (`blk.5.attn_q.weight`):
+    ///
+    ///   bytes_a == bytes_b  ⇔  variant_a.base_target() == variant_b.base_target()
+    ///
+    /// Tensor choice rationale: `attn_q.weight` classifies as
+    /// `TensorCategory::AttentionQ` per `llama-quant.cpp:115-150` →
+    /// falls through `target_for`'s match arms to `_ => base` for every
+    /// variant (no upgrades).  The byte-data therefore depends ONLY on
+    /// the variant's `base_target()`, making this a clean per-codec
+    /// matrix gate.
+    ///
+    /// Catches:
+    ///   - A new variant whose base_target() drifts from its `target_for`
+    ///     dispatch on attn_q (would mismatch a same-base pair).
+    ///   - A future variant added to `all()` without its base codec wired
+    ///     correctly (would mismatch every existing variant).
+    ///   - A regression where two distinct base targets produce the same
+    ///     bytes (e.g. codec aliasing).
+    ///
+    /// The test is *exhaustive over the variant matrix*, so adding a new
+    /// variant to `KQuantVariant::all()` automatically extends coverage
+    /// (zero new test code required) — this is the future-proofing
+    /// counterpart to iter-3v's smoke test.
+    #[test]
+    fn variant_pair_matrix_base_target_consistency() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+
+        const QK_K: usize = 256;
+        const N_LAYERS: usize = 32;
+        const TENSOR: &str = "blk.5.attn_q.weight";
+
+        let make_f16_payload = |len: usize| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(len * 2);
+            for i in 0..len {
+                let v = (i as f32 / len as f32) * 2.0 - 1.0;
+                let h = half::f16::from_f32(v);
+                bytes.extend_from_slice(&h.to_le_bytes());
+            }
+            bytes
+        };
+        let payload = make_f16_payload(QK_K);
+
+        let make_lazy_map = || -> LazyTensorMap {
+            let mut m = LazyTensorMap::new();
+            m.insert(LazyTensor::from_bytes(
+                LazyMeta::new(TENSOR.to_string(), vec![1, QK_K], DType::F16),
+                payload.clone(),
+            ));
+            m
+        };
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+
+        // Quantize every variant once; collect (variant, bytes, base_target).
+        let variants: &'static [KQuantVariant] = KQuantVariant::all();
+        let mut results: Vec<(
+            KQuantVariant,
+            Vec<u8>,
+            crate::quantize::k_quant_codec::KQuantTarget,
+        )> = Vec::with_capacity(variants.len());
+        for v in variants {
+            let q = VariantKQuantizer::new(*v, CalibrationData::None, N_LAYERS);
+            let out = quantize_streaming(make_lazy_map(), &metadata, &q, 0, 0, &progress, false)
+                .unwrap_or_else(|e| panic!("variant {v:?} streaming failed: {e:?}"));
+            let t = out
+                .tensors
+                .get(TENSOR)
+                .unwrap_or_else(|| panic!("variant {v:?} missing {TENSOR}"));
+            results.push((*v, t.data.clone(), v.base_target()));
+        }
+
+        // Sanity: at least one variant per base target → the matrix has
+        // at least one same-base pair AND at least one different-base pair.
+        let unique_targets: std::collections::HashSet<crate::quantize::k_quant_codec::KQuantTarget> =
+            results.iter().map(|(_, _, t)| *t).collect();
+        assert!(
+            unique_targets.len() >= 2,
+            "Variant menu must cover at least 2 distinct base targets \
+             for the matrix to be meaningful; got {} targets",
+            unique_targets.len()
+        );
+
+        // Exhaustive unordered-pair iteration.  C(N,2) pairs.
+        let n = results.len();
+        let mut same_base_pairs = 0usize;
+        let mut diff_base_pairs = 0usize;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let (va, bytes_a, ta) = (&results[i].0, &results[i].1, results[i].2);
+                let (vb, bytes_b, tb) = (&results[j].0, &results[j].1, results[j].2);
+
+                if ta == tb {
+                    same_base_pairs += 1;
+                    assert_eq!(
+                        bytes_a, bytes_b,
+                        "Pair ({va:?}, {vb:?}) shares base_target = {ta:?} \
+                         but produced different bytes on {TENSOR} \
+                         (uncalibrated, base-routed) — base codec dispatch \
+                         is variant-discriminant when it should not be"
+                    );
+                } else {
+                    diff_base_pairs += 1;
+                    assert_ne!(
+                        bytes_a, bytes_b,
+                        "Pair ({va:?}, {vb:?}) has different base_targets \
+                         ({ta:?} vs {tb:?}) but produced byte-identical \
+                         output on {TENSOR} — distinct base codecs are \
+                         silently aliasing"
+                    );
+                    // Also: byte-counts must differ (different bpw → different
+                    // block sizes), the strongest cheap invariant.
+                    assert_ne!(
+                        bytes_a.len(), bytes_b.len(),
+                        "Pair ({va:?}, {vb:?}) base_target bytes_per_block \
+                         must differ when targets differ"
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            same_base_pairs + diff_base_pairs,
+            n * (n - 1) / 2,
+            "Exhaustive pair enumeration miscounted"
+        );
+        // Sanity floor: with the current 10-variant menu we expect 6
+        // same-base pairs (Q2 family: 1, Q3 family: 3, Q4 family: 1,
+        // Q5 family: 1, Q6 alone: 0).  Don't lock the exact count to
+        // keep the test stable as the menu grows; just assert > 0 on
+        // each side so the matrix is genuinely exercising both branches.
+        assert!(
+            same_base_pairs > 0,
+            "Variant menu has no same-base pairs — same-base branch is \
+             untested"
+        );
+        assert!(
+            diff_base_pairs > 0,
+            "Variant menu has no different-base pairs — diff-base branch \
+             is untested"
+        );
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
