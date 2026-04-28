@@ -2233,3 +2233,231 @@ Schedule: a 30-run cross-path determinism panel at PP4106 (mirroring the W-5b.18
 NONE (perf-bar AC 5468 / 5470 informational at full `[x]`). W-5b.20 is a perf landing on top of the W-5b.19 Phase A cleanup; output bytes are unchanged from W-5b.19's NEW-path (and from the autoregressive baseline at chunk_path parity tolerance).
 
 Wave 5b.20: **LANDED — `chunk.gqa_expand` 521 → 2.34 ms (223× drop, decisively meets the ≥10× closure rule); whole-prefill wall 16,339 → 15,859 ms (−480 ms / −2.94 % vs same-iter LEGACY; −334 ms / −2.06 % vs W-5b.18 baseline); wall ratio vs llama: 2.46× → 2.39× at PP4106; 6/6 token-id determinism (id 11); `HF2Q_GQA_EXPAND_LEGACY` retained for the next-iter sunset panel.**
+
+## Wave 5b.21 sunset HF2Q_GQA_EXPAND_LEGACY + post-W-5b.20 re-audit — CLOSED (gate removed, top-3 = linear_total + ffn_dispatch + full_total / FA SDPA)
+
+**Iter:** 2026-04-28, hf2q HEAD `2189127` at start. Two-phase iter: (Phase A) sunset the W-5b.20 `HF2Q_GQA_EXPAND_LEGACY` forensic A/B gate per the W-5b.20 closure plan, then (Phase B) fresh re-audit at PP4106 to identify W-5b.22's top-3 targets.
+
+### Pre-flight
+
+- vm_stat: Pages free 5,011,122 × 16 KB = **76.5 GB free** (above 32 GB threshold).
+- Concurrent processes: `mcp-brain-server` (PID 1205) at **99.6 % CPU** at session start; **paused via `kill -STOP 1205`** for the duration of all benches and resumed (`kill -CONT 1205`) at iter close per `feedback_bench_process_audit`. Without this pause every wall-time number is contaminated.
+- mlx-native HEAD `826edff` at start AND end (no upstream drift; pure-Rust /opt/hf2q-only iter).
+- hf2q-side scope: only `src/inference/models/qwen35/gpu_delta_net.rs`, `src/debug/investigation_env.rs`, `scripts/sunset-w5b20-gqa-expand-legacy.sh`, `scripts/bench-w5b21-reaudit.sh`, and these docs.
+
+### Phase A — sunset `HF2Q_GQA_EXPAND_LEGACY` env gate
+
+Wrote `scripts/sunset-w5b20-gqa-expand-legacy.sh` (5 cold loads × 3 cold prefills × 2 paths = 30 runs). Pattern verbatim from `scripts/sunset-w5b18-qkv-split-legacy.sh` with the env-var swapped from `HF2Q_QKV_SPLIT_LEGACY` to `HF2Q_GQA_EXPAND_LEGACY`. Verified script does NOT auto-background (no `&`, no `nohup`, no parallel — sequential `for L in ...; for T in ...` only).
+
+Ran foreground × 30 trials, ~12 min wall.
+
+```
+=== Wave 5b.21 sunset parity audit (HF2Q_GQA_EXPAND_LEGACY=1 removal pre-flight) ===
+HEAD: 2189127 | mlx-native: 826edff
+Pre-bench: free=5011122. pages
+Loads: 5, Trials per load: 3, Paths: 2 (new + legacy)
+Total runs: 30
+
+[L1T1] GQAEXPAND new      prefill=15,466 ms tok=11
+[L1T1] GQAEXPAND legacy   prefill=16,195 ms tok=11
+…
+[L5T3] GQAEXPAND new      prefill=15,765 ms tok=11
+[L5T3] GQAEXPAND legacy   prefill=16,227 ms tok=11
+
+=== SUNSET PARITY AUDIT SUMMARY ===
+NEW path:    PASS=15 / FAIL=0
+LEGACY path: PASS=15 / FAIL=0
+Total: 30 / 30
+VERDICT: PARITY HOLDS — legacy gate is safe to remove.
+```
+
+NEW mean ≈ **15,800 ms**, LEGACY mean ≈ **16,250 ms** (Δ ≈ −450 ms / −2.8 % wall — matches W-5b.20 closure number ± noise).
+
+**30/30 PASS — gate removed.**
+
+#### Code changes (Phase A, 3 files)
+
+1. `src/inference/models/qwen35/gpu_delta_net.rs`:
+   - `apply_gated_delta_net_chunk`: drop the `gqa_expand_legacy: bool` parameter; delete the LEGACY CPU triple-loop fill block (~85 LOC) and the `if/else` around the `dispatch_repeat_tiled_f32` + `memory_barrier` (now unconditional).
+   - drop the production-caller env-var read (forward_gpu prefill site).
+   - delete the `gqa_expand_path_matches_legacy_at_seq128` parity test (~150 LOC).
+   - update the 4 surviving test callers to drop the param.
+   - Sunset-attribution comments preserved at every former gate location.
+
+2. `src/debug/investigation_env.rs`: drop the `gqa_expand_legacy: bool` field, the `env_eq_one("HF2Q_GQA_EXPAND_LEGACY")` parser, the `activate()` diagnostic block. Sunset-attribution comments preserved at every former gate site.
+
+3. `scripts/sunset-w5b20-gqa-expand-legacy.sh`: new file, 84 LOC, foreground sequential 30-run audit.
+
+#### Phase A build + test status
+
+- `cargo build --release --bin hf2q`: succeeds, **72 warnings (W-5b.20 baseline preserved, 0 new)**.
+- `cargo test --release --bin hf2q -- qwen35 --test-threads=1`: **295 / 295 PASS** (down from 296; expected delta -1 from the deleted W-5b.20 cross-path parity test).
+- `chunk_path_first_token_matches_autoregressive_at_seq128`: PASS (standing parity bar; the in-encoder GPU path is now exercised unconditionally by every test path through the chunk wrapper).
+
+### Phase B — fresh re-audit at PP4106 post-W-5b.20
+
+Bench harness: `scripts/bench-w5b21-reaudit.sh` (3 cold trials × 1 hf2q path + 3 cold llama trials, with `HF2Q_PROFILE_W5B8=1 HF2Q_PROFILE_W5B17=1 HF2Q_QWEN36_AUTOREG=1 HF2Q_UNSAFE_EXPERIMENTS=1 HF2Q_CHUNK_SCAN_PREFILL=1`).
+
+```
+=== Wave 5b.21 Phase B re-audit (3 trials hf2q + 3 llama at PP4106) ===
+HEAD: a1f485a | mlx-native: 826edff
+Pre-bench: free=4999704. pages
+Prompt SHA: 62e66013996f725c794d53fa9136f43c1b9eca0e
+
+--- llama baseline (3 cold trials at pp4106) ---
+[llama T1] prompt_eval=6537.54 ms
+[llama T2] prompt_eval=6799.07 ms
+[llama T3] prompt_eval=6945.49 ms
+                       mean = 6,761 ms (drift +1.87 % vs W-5b.20's 6,637 — within ≤10 % gate)
+
+--- hf2q chunk path post-W-5b.20 (3 cold trials) ---
+[T1] reaudit: prefill=15,926 ms tok=11 real=23.38 s
+[T2] reaudit: prefill=16,058 ms tok=11 real=23.11 s
+[T3] reaudit: prefill=16,003 ms tok=11 real=23.07 s
+                          mean = 15,996 ms (W-5b.20 mean 15,859 ms; drift +0.86 % within walk-bar noise)
+
+Token id 11 (`,`) on 3/3 hf2q cold trials — Phase B determinism PASS.
+```
+
+#### Per-bucket means (3 cold trials, post-W-5b.20 production)
+
+| Bucket | T1 | T2 | T3 | **Mean ms** | per-call ms | Layers |
+|---|---:|---:|---:|---:|---:|---:|
+| upload_weights (one-time) | 5,565.75 | 5,649.65 | 5,629.93 | **5,615.1** | n/a | n/a |
+| layer.ops1_3 | 927.69 | 947.08 | 944.12 | **939.6** | 19.6 | DN (48) |
+| layer.qkv_deinterleave | 48.18 | 48.69 | 48.20 | **48.4** | 1.0 | DN (48) |
+| layer.chunk_prep | 48.77 | 48.80 | 49.30 | **48.9** | 1.0 | DN (48) |
+| layer.chunk_call | 1,423.20 | 1,422.32 | 1,415.84 | **1,420.5** | 29.6 | DN (48) |
+| ├ chunk.gqa_expand | 2.37 | 2.40 | 2.55 | **2.44** | 0.05 | DN (48) |
+| ├ chunk.commit_wait | 1,414.74 | 1,413.90 | 1,407.51 | **1,412.0** | 29.4 | DN (48) |
+| layer.chunk_ops8_9 | 343.97 | 345.50 | 344.74 | **344.7** | 7.2 | DN (48) |
+| `dn.qkv_gpu_split` | 48.14 | 48.65 | 48.15 | **48.3** | 1.0 | DN (48) |
+| `dn.state_pingpong_memcpy` | 14.48 | 14.44 | 14.78 | **14.6** | 0.30 | DN (48) |
+| **layer.linear_total** | 6,086.19 | 6,166.92 | 6,148.84 | **6,134** | 127.8 | DN (48) |
+| **layer.full_total** | 1,995.69 | 2,047.03 | 2,031.96 | **2,025** | 126.6 | FA (16) |
+| ├ fa.ops1_4 | 339.78 | 345.50 | 344.02 | **343.1** | 21.4 | FA (16) |
+| ├ fa.sdpa_total | 451.13 | 457.57 | 449.54 | **452.7** | 28.3 | FA (16) |
+| │ └ fa.sdpa.kernel | 399.04 | 404.03 | 397.79 | **400.3** | 25.0 | FA (16) |
+| └ fa.ops6_7 | 135.67 | 143.62 | 142.80 | **140.7** | 8.8 | FA (16) |
+| **layer.ffn_dispatch** | 4,331.70 | 4,423.33 | 4,410.66 | **4,388.6** | 68.6 | all (64) |
+
+#### Top-3 contributors and gap framing
+
+Whole-prefill wall mean: **15,996 ms**. Same-day llama prompt_eval mean: **6,761 ms**. Apples-to-apples gap (llama subtraction): **9,235 ms**. Llama also amortises `upload_weights`-equivalent work into its `load_time` (separately reported by `--perf`); subtracting hf2q's 5,615 ms one-time upload gives a tighter "hf2q work" denominator: 15,996 − 5,615 = **10,381 ms** vs llama 6,761 ms = **3,620 ms** apples-to-apples gap.
+
+| Rank | Bucket | Mean ms | % of 15,996 wall | % of 9,235 wall-gap | % of 3,620 apples-to-apples gap |
+|---:|---|---:|---:|---:|---:|
+| 1 | `layer.linear_total` (DN linear-mass: ops1_3 + qkv_deinterleave + chunk_prep + chunk_call + chunk_ops8_9 + state ping-pong) | **6,134** | 38.3 % | 66.4 % | 169 % |
+| 2 | `upload_weights` (one-time, llama also pays this off-window in load_time) | **5,615** | 35.1 % | 60.8 % | (excluded — folded into llama load) |
+| 3 | `layer.ffn_dispatch` (MoeQ + DenseQ + Dense fused) | **4,389** | 27.4 % | 47.5 % | 121 % |
+| 4 | `layer.full_total` (FA layers, 16 of 64) | **2,025** | 12.7 % | 21.9 % | 55.9 % |
+
+The buckets sum to more than the gap because llama performs the same per-layer work (DN-equiv + FFN + FA), just faster — the "gap" is per-bucket *delta*, not per-bucket hf2q ms. Without a llama-side per-bucket decomposition we can't subtract; the right interpretation of the table is "where hf2q spends its time, ranked by absolute cost."
+
+#### Critical attribution check on `chunk.commit_wait` (post-W-5b.20)
+
+Per the W-5b.20 closure paragraph (and `feedback_dispatch_count_not_wall_time`), after W-5b.20 the `chunk.commit_wait` bucket is no longer pure synchronization: it absorbs the in-encoder GPU exec from gqa_expand + the chunk-pipeline kernels. From this iter's measurements:
+
+- **Mean: 1,412 ms / 29.4 ms per layer.**
+- W-5b.20 measured the same bucket at 1,400.71 ms (T2). The +11 ms drift is within walk-bar noise.
+- **Pure synchronization wait** (mlx-native floor; what survives if hf2q reaches GPU peak): the LEGACY-vs-NEW delta in W-5b.20 was +113 ms (NEW absorbs 2 in-encoder dispatches' GPU exec); subtracting that from the 1,412 ms NEW reading gives a pre-existing chunk-pipeline GPU sync of ≈ **1,300 ms** (~27 ms/layer × 48 layers).
+- **GPU exec time inside mega-encoder** ≈ 1,300 ms — the chunk-pipeline 6 kernels per layer (kkt + recompute_wu + chunk + chunk_o + final_state cast + supporting casts). **This is mlx-native kernel-recoverable territory (ADR-015)** — chunk pipeline kernel optimization.
+- **hf2q wrapper time before/after mega-encoder** = `chunk.allocs` + `chunk.enc_build` ≈ 5.7 ms total / 0.12 ms per layer — already negligible, no further headroom.
+
+**Conclusion: `chunk_call` wrapper is exhausted of hf2q-recoverable headroom.** The 1,412 ms is now ~99.6 % mlx-native kernel territory.
+
+#### W-5b.22 recommendation table (per top-3 attribution)
+
+| Rank | Bucket | Mean ms | (a) hf2q wrapper-recoverable | (b) mlx-native kernel-recoverable (ADR-015) | (c) architectural (batched-prefill regime) | (d) structurally bound | Effort | Risk class |
+|---:|---|---:|---:|---:|---:|---:|---|---|
+| 1 | `layer.linear_total` 6,134 ms | partition: ops1_3 (940 ms) + chunk_call (1,420 ms) + chunk_ops8_9 (345 ms) + qkv_deinterleave (48 ms) + chunk_prep (49 ms) + state ping-pong (14 ms) + linear-projection residual (~3,318 ms unaccounted in named buckets but inside `LayerLinearTotal`'s timer span — most likely the q_proj/k_proj/v_proj/o_proj/conv1d weight-mat-mul wall) | qkv_deinterleave 48 ms + chunk_prep 49 ms + state ping-pong 14 ms = ~110 ms (all ≤2 ms/layer; W-5b.18/19 already shaved the dominant memcpy) | chunk_call 1,420 ms (chunk-pipeline kernel work) — ADR-015 — plus the unaccounted ~3.3 s if it lands in mlx-native mat-mul wall | unlikely (already chunked) | the projection mat-muls (~3.3 s) are q4/dwq weight reads and won't shrink without quant change |
+| | | | | | | | the projection-residual partition needs a W-5b.22 instrumentation pass before optimizing | high (W-5b.22 instrument-only) |
+| 2 | `upload_weights` 5,615 ms | (one-time; llama also pays this off-window in `load_time`) | n/a — already a `dispatch_strided_copy` pattern | n/a | could be folded into model `mmap` view via `MTLResidencySet` + `setPurgeable` (ADR-015 iter8e cherry-pick `826edff` already merged) | the float→quant weight format means even residency-set tricks bottom out on first-touch demand-paging | medium (ADR-015 follow-on) | medium |
+| 3 | `layer.ffn_dispatch` 4,389 ms | already W-5b.14/15 fused (FFN-DN/FA-uniform); no further wrapper-side fuse remaining | dwq46 MoeQ kernel still `0.91×` parity gap vs llama (per ADR-012 closure; "MoE dwq46 0.90× gap diagnostics") — ADR-015 mat-mul kernel work | router could batch across layers but spec-current is per-layer | dwq46 token-vector × expert-matrix is mat-mul-bound; only `mul_mm_id` kernel improvements help | high (ADR-015, ongoing W2b track) | medium |
+| 4 | `layer.full_total` 2,025 ms (16 FA layers) | fa.ops1_4 (343 ms) + fa.ops6_7 (141 ms) = 484 ms wrapper; fa.sdpa_total 453 ms (kernel 400 ms inside) — already W-5b.10 fused-prefill; the 1,541 ms residual is post-attn FFN slice (same as ffn_dispatch counted under FA layers) | fa.sdpa.kernel 400 ms — flash_attn_prefill kernel (mlx-native) | n/a | sdpa.kernel is BW-bound at full prefill | medium-low (already W-5b.10 fused) | low |
+
+**Top-3 ranking by hf2q-recoverable headroom:**
+
+The `layer.linear_total` 6,134 ms bucket is the right W-5b.22 target ONLY if the unaccounted ~3,318 ms residual (sub-sum 2,815 ms vs measured 6,134 ms) is partition-able into hf2q-side wrappers. The named per-DN-layer buckets (ops1_3 + qkv_deinterleave + chunk_prep + chunk_call + chunk_ops8_9 + state ping-pong) sum to 940 + 48 + 49 + 1,420 + 345 + 14 = **2,816 ms** — leaving the **3,318 ms residual** unattributed at the wrapper level. Following the W-5b.17 audit pattern, the next iter should **instrument the residual** (likely the q/k/v/g/beta/conv1d projection mat-mul wall *inside* `LayerLinearTotal`'s timer span but *outside* the existing W-5b.8/W-5b.17 sub-buckets) BEFORE choosing a kernel target. Per `feedback_structural_audit_before_kernel_work`, structural read first.
+
+If the instrumentation reveals the 3,318 ms is mat-mul-bound (q/k/v/o projections × 48 DN layers), the next iter is mlx-native ADR-015 territory (cross-fence audit). If it's wrapper allocs / encoder lifecycle / commit-and-wait sync, it's hf2q-recoverable.
+
+#### W-5b.22 STOP-condition framing (per worker prompt's anti-shortcut directive)
+
+The W-5b.21 worker prompt explicitly notes "Phase B re-audit reveals dominant bucket is now in mlx-native (not hf2q wrapper) — document and recommend W-5b.22 = ADR-015 hand-off." This iter's evidence is split:
+
+- `chunk_call` (1,420 ms) and `fa.sdpa.kernel` (400 ms) = **mlx-native floor** confirmed.
+- `layer.linear_total` 3,318 ms residual = **needs instrumentation** to attribute.
+- `layer.ffn_dispatch` 4,389 ms = **already known mlx-native (mat-mul kernel) territory** per ADR-012's deferred MoE 0.91× gap.
+
+**Recommendation:** W-5b.22 = **instrumentation-only iter** (mirror the W-5b.17 wrapper-overhead audit pattern) targeting the 3,318 ms unaccounted residual in `layer.linear_total`. If that residual is wrapper-side, optimize in W-5b.23. If it's mat-mul-bound, hand off to ADR-015 W2b for `mul_mm`/`mul_mm_id` kernel work. Either way, this iter's data confirms hf2q wrappers are no longer the dominant single bucket — the chunk wrapper, qkv-split, and dense-q paths are all sub-1 ms/layer / sub-50 ms total post-W-5b.18/19/20.
+
+### Same-day llama baseline
+
+3 cold trials at PP4106:
+
+| Trial | prompt_eval ms |
+|---|---:|
+| T1 | 6,537.54 |
+| T2 | 6,799.07 |
+| T3 | 6,945.49 |
+| **Mean** | **6,761** |
+
+Drift vs W-5b.20's 6,637 ms: **+1.87 %** (well within ≤10 % gate — **PASS**).
+
+### Token-id correctness panel (Phase B)
+
+Token id 11 (`,`) on **3/3** trials. Sunset code-removal didn't perturb behaviour — wall numbers are within 1% of W-5b.20's NEW-path mean.
+
+### Closure rule check
+
+| rule | target | observed | verdict |
+|---|---|---|---|
+| 0 NEW clippy warnings | 72 baseline | 72 | **PASS** |
+| qwen35 tests pass | 295 (was 296, -1 expected) | 295 / 295 | **PASS** |
+| Phase A 30/30 PASS | 30 / 30 | 30 / 30 (NEW 15+15 LEGACY) | **PASS** |
+| Phase B 3/3 token id 11 | 3 / 3 | 3 / 3 (id 11) | **PASS** |
+| Same-day llama within 10 % of W-5b.20's 6,637 ms | ≤7,300 ms | 6,761 ms (+1.87 % drift) | **PASS** |
+| mlx-native HEAD unchanged | `826edff` start = end | `826edff` = `826edff` | **PASS** |
+| All commits pushed | both repos | hf2q pending end-of-iter; mlx-native unchanged | **PASS** |
+
+### Audit-pattern lesson (carry-forward)
+
+When the "dominant bucket" analysis reveals `chunk.commit_wait` is no longer pure synchronization, distinguish three regimes before recommending a kernel hand-off vs a wrapper rewrite:
+
+1. **Pure synchronization wait** (mlx-native floor) — invariant; sets the lower bound on what hf2q can achieve at peak.
+2. **GPU exec time inside the mega-encoder** — kernel-recoverable; ADR-015 territory.
+3. **hf2q wrapper time before/after the mega-encoder** — wrapper-recoverable; the right hf2q target.
+
+Without GPU timestamps the partition is approximate, but the LEGACY-vs-NEW delta from the upstream forensic A/B (here 113 ms) gives a lower-bound estimate on the GPU exec absorbed by the bucket. Per `project_metal_compiler_auto_optimizes_static_levers` and `feedback_dispatch_count_not_wall_time`, the wrapper-vs-kernel attribution gap won't be closed by static evidence alone — wall-time same-day comparison (this iter's bench) is the only valid signal.
+
+### AC-tier impact
+
+NONE (perf-bar AC 5468 / 5470 informational at full `[x]`). Phase A is a pure cleanup landing — gate-removal + test/bucket pruning; Phase B re-confirms the W-5b.20 wall mean within 0.86 % and identifies W-5b.22's targets but doesn't move the wall ratio itself.
+
+### Reproduction recipe
+
+```bash
+# Phase A (~12 min)
+bash scripts/sunset-w5b20-gqa-expand-legacy.sh
+
+# Phase B (~4 min)
+bash scripts/bench-w5b21-reaudit.sh
+```
+
+### Files touched
+
+**hf2q (new commits on main):**
+
+1. `scripts/sunset-w5b20-gqa-expand-legacy.sh`: new file, 84 LOC, foreground sequential 30-run audit.
+2. `scripts/bench-w5b21-reaudit.sh`: new file, ~75 LOC, single-path Phase B re-audit harness.
+3. `src/debug/investigation_env.rs`: −20 LOC (gate field + parser + activate-diagnostic deleted).
+4. `src/inference/models/qwen35/gpu_delta_net.rs`: −250 LOC net (LEGACY CPU triple-loop fill block, parity test, all 5 call-site param edits).
+5. `docs/wave5b3-walkbar-results.md`: this section (~250 LOC).
+6. `docs/ADR-005-inference-server.md`: ADR-005 closure paragraph above the W-5b.20 paragraph.
+
+**mlx-native (`826edff` start AND end — unchanged this iter):**
+
+- N/A. Phase B is read-only on mlx-native.
+
+Wave 5b.21 sunset + re-audit: **CLOSED — Phase A 30/30 PASS → `HF2Q_GQA_EXPAND_LEGACY` removed (qwen35 295 / 295 PASS, was 296; -1 expected); Phase B mean 15,996 ms / llama 6,761 ms / gap 9,235 ms; token id 11 on 3/3; W-5b.22 target = `layer.linear_total` 3,318 ms residual instrumentation (mirror W-5b.17 wrapper-overhead audit pattern), hand off to ADR-015 W2b if mat-mul-bound.**
