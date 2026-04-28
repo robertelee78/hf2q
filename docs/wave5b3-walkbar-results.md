@@ -1517,3 +1517,155 @@ cargo test --release --bin hf2q dense_q_path_first_token_matches_legacy_at_seq12
 ```
 
 Wave 5b.15 dense_q arena reset: **CLOSED — FFN bucket drop 2.71× (target ≥1.5× exceeded by 1.8×); whole-prefill wall ratio 4.20× → 2.59× (-38%); token-id parity 6/6.**
+
+## Wave 5b.16 re-audit + HF2Q_DENSE_Q_LEGACY sunset — CLOSED (gate removed, parity 30/30)
+
+**Iter:** 2026-04-28, hf2q commit `fd60fac` at start. Two-phase iter: (Phase A) re-audit the post-W-5b.15 contributor mix to PP4106 prefill so W-5b.17 has fresh top-3 targets, then (Phase B) sunset the W-5b.14 `HF2Q_DENSE_Q_LEGACY` forensic A/B gate per the W-5b.15 closure plan.
+
+**Pre-flight**
+- vm_stat: Pages free 6,225,399 × 16 KB = **95 GB free** (above 32 GB threshold).
+- Concurrent processes: `mcp-brain-server` (PID 1205) at 99.7 % CPU at session start; **paused via `kill -STOP 1205`** for the duration of all benches and resumed (`kill -CONT`) at iter close per `feedback_bench_process_audit`. Wall-times below are therefore lower-noise than W-5b.15's (which ran with mcp-brain-server live at ~99 %). No CFA workers > 50 % CPU.
+- mlx-native HEAD `6875c925` at start AND end (no upstream drift; pure-Rust /opt/hf2q-only iter).
+- hf2q-side scope: only `src/inference/models/qwen35/{forward_gpu,gpu_ffn}.rs`, `scripts/sunset-w5b14-legacy-dense-q.sh`, and these docs.
+
+### Phase A — re-audit at PP4106 (NEW path = HF2Q_DENSE_Q_ARENA_RESET default ON)
+
+Bench harness: re-ran `scripts/bench-w5b15-dense-q-arena-reset.sh` × 1 (3 cold trials × 2 paths + 3 cold llama trials).
+
+```
+=== Wave 5b.15 dense_q arena-reset bench (3 trials × 2 paths × 1 llama) ===
+HEAD: fd60fac | mlx-native: 6875c92
+Pre-bench: free=6225399 pages (95 GB)
+Prompt SHA: 62e66013996f725c794d53fa9136f43c1b9eca0e
+
+--- llama baseline (3 cold trials at pp4106) ---
+[llama T1] prompt_eval=6439.88 ms
+[llama T2] prompt_eval=6666.46 ms
+[llama T3] prompt_eval=6842.38 ms
+                       mean = 6,650 ms (within 0.25 % of W-5b.15's 6,633 ms — PASS ≤10 % drift)
+
+--- hf2q NEW path (default = arena reset ON, 3 cold trials) ---
+[T1] NEW: prefill=16,951 ms tok=11 real=24.24 s
+[T2] NEW: prefill=17,050 ms tok=11 real=23.97 s
+[T3] NEW: prefill=17,151 ms tok=11 real=24.08 s
+                          mean = 17,050 ms (W-5b.15 mean 17,150 ms; within 0.6 %)
+
+Token id 11 (`,`) on 3/3 NEW cells — Phase A determinism PASS.
+```
+
+**Top-3 contributors to the 17,050 ms whole-prefill wall (mean of 3 cold NEW trials)**
+
+| Rank | Bucket | Sum ms (mean) | per-layer | % of 17,050 wall | Layers |
+|---:|---|---:|---:|---:|---:|
+| 1 | `layer.linear_total` (DN, post-attn already excluded into ffn_dispatch) | **7,287** | 152 ms × 48 | 42.7 % | 48 linear |
+| 2 | `upload_weights` (one-time, llama also pays this off-window) | **5,576** | n/a | 32.7 % | n/a |
+| 3 | `layer.ffn_dispatch` (MoeQ + DenseQ + Dense fused dispatch wall) | **4,324** | 68 ms × 64 | 25.4 % | 64 |
+| 4 | `layer.full_total` (FA) | 1,990 | 124 ms × 16 | 11.7 % | 16 full |
+
+**Apples-to-apples gap framing.** Llama's `prompt eval time` excludes `load time` (verified in `/tmp/w5b15/llama-T2.log`; load time 6,673 ms is reported separately). hf2q's `whole-prefill wall` includes `upload_weights` since it's measured CPU-side from generate kickoff. Subtracting upload from hf2q to make it llama-comparable: 17,050 − 5,576 = **11,474 ms hf2q work** vs llama's 6,650 ms = **4,824 ms gap** (apples-to-apples, excluding upload from both sides since llama also pre-amortises in its load time).
+
+If instead the framing is whole-prefill-wall vs llama-prompt-eval (as W-5b.15's "10,517 ms gap" cited): 17,050 − 6,650 = **10,400 ms** (within 1 % of W-5b.15's 10,517).
+
+**Top-3 in absolute ms × % of remaining apples-to-apples 4,824 ms gap**
+
+| Rank | Bucket | mean ms | % of 4,824 ms gap (over-attribution OK because llama also runs the analogous work, faster) |
+|---:|---|---:|---:|
+| 1 | `layer.linear_total` | 7,287 | 151 % |
+| 2 | `layer.ffn_dispatch` | 4,324 | 90 % |
+| 3 | `layer.full_total` | 1,990 | 41 % |
+
+The buckets sum to more than the gap because llama performs the same per-layer work (DN-equiv + FFN + FA) just faster — the "gap" is the per-bucket *delta*, not the per-bucket hf2q ms. Without a llama-side per-bucket decomposition we can't subtract; the right interpretation of the table is "where hf2q spends its time, ranked by absolute cost," and the W-5b.17 worker should choose its target based on which bucket has known-recoverable headroom.
+
+**W-5b.17 next-target recommendation**
+
+`layer.linear_total` is the largest single bucket (7,287 ms ≈ 1.5× the apples-to-apples gap by itself), and it's already partitioned by W-5b.11's sub-buckets:
+
+- `layer.qkv_deinterleave` 829 ms (~17 ms/layer × 48): wrapper-side memory shuffling. Recoverable in pure hf2q.
+- `layer.ops1_3` 904 ms (~19 ms/layer × 48): pre-DN dispatch. Recoverable.
+- `layer.chunk_call` 1,768 ms total (subdivided: `chunk.gqa_expand` 486 ms + `chunk.commit_wait` 1,274 ms + `chunk.allocs/enc_build` ~8 ms): the actual DN kernel call. `chunk.commit_wait` 1,274 ms is the GPU-side wall (~26.5 ms × 48 layers); this is mlx-native territory.
+- `layer.chunk_ops8_9` 343 ms (~7 ms/layer × 48): post-DN. Recoverable in hf2q.
+- Residual ~3,400 ms unaccounted-for is likely scattered across barriers + descriptor-set thrash + KV-cache writes — a W-5b.17 sub-instrumentation pass should split this further before optimizing.
+
+The DN bucket's *own-kernel* portion (`chunk.commit_wait` = 1,274 ms) is ~17.5 % of `layer.linear_total`; the other 82.5 % is wrapper-side, so **the DN bucket is plausibly hf2q-recoverable** (analogous to the W-5b.15 DenseQ outcome, where wrapper-side alloc-churn dominated and the kernel floor was small). Recommend W-5b.17 = **DN wrapper-overhead audit** (instrument `chunk.commit_wait` + a new pre-prepare bucket, then mirror the W-5b.15 arena-reset pattern in `gpu_delta_net::apply_proj` if alloc-churn is the dominant residual). Recommend NOT W-5b.17 = mlx-native hand-off (chunk.commit_wait at 1,274 ms is small enough that the kernel floor is already in striking range of llama's full per-layer cost; ADR-015 would have to re-audit its own DN kernel anyway).
+
+### Phase B — sunset HF2Q_DENSE_Q_LEGACY env gate
+
+Wrote `scripts/sunset-w5b14-legacy-dense-q.sh` (5 cold loads × 3 cold prefills × 2 paths = 30 runs). Pattern verbatim from `scripts/bench-w5b11-sunset-parity.sh` with the env-var swapped from `HF2Q_QWEN35_FA_LEGACY` to `HF2Q_DENSE_Q_LEGACY`. Verified script does NOT auto-background (no `&`, no `nohup`, no parallel — sequential `for L in ...; for T in ...` only).
+
+Ran foreground × 30 trials, ~12 min wall.
+
+```
+=== Wave 5b.16 sunset parity audit (HF2Q_DENSE_Q_LEGACY=1 removal pre-flight) ===
+HEAD: fd60fac | mlx-native: 6875c92
+Pre-bench: free=6392074 pages
+Loads: 5, Trials per load: 3, Paths: 2 (new + legacy)
+Total runs: 30
+
+[L1T1] DENSEQ new      prefill=16,784 ms tok=11
+[L1T1] DENSEQ legacy   prefill=17,791 ms tok=11
+…
+[L5T3] DENSEQ new      prefill=17,055 ms tok=11
+[L5T3] DENSEQ legacy   prefill=17,882 ms tok=11
+
+=== SUNSET PARITY AUDIT SUMMARY ===
+NEW path:    PASS=15 / FAIL=0
+LEGACY path: PASS=15 / FAIL=0
+Total: 30 / 30
+VERDICT: PARITY HOLDS — legacy gate is safe to remove.
+```
+
+Per-cell prefill wall is consistent: NEW mean ≈ 17,054 ms, LEGACY mean ≈ 17,889 ms (835 ms = 4.7 % LEGACY-slower, exactly the W-5b.15 1.78× → 1.05× re-confirmation when you fold the per-load process-launch noise back in).
+
+**30/30 PASS — gate removed.**
+
+### Code changes (3 files)
+
+1. `src/inference/models/qwen35/gpu_ffn.rs`:
+   - `build_dense_ffn_layer_gpu_q`: env-check at fn entry stripped.
+   - `build_dense_ffn_layer_gpu_q_legacy`: function deleted (107 LOC + leading `#[allow(clippy::too_many_arguments)]`).
+   - `dense_q_path_first_token_matches_legacy_at_seq128` test: deleted (170 LOC).
+   - `dense_q_arena_reset_chunk_prefill_no_layer_33_error` test: stale `std::env::remove_var("HF2Q_DENSE_Q_LEGACY")` line removed.
+   - Sunset-attribution comments preserve the audit trail at every former gate location.
+
+2. `src/inference/models/qwen35/forward_gpu.rs`:
+   - `forward_gpu_impl` (prefill path): `dense_q_legacy_prefill` env-check removed; `denseq_fused_eligible` simplified to `matches!(_, FfnWeightsGpu::DenseQ(_))`.
+   - DenseQ match arm: `if let Some(mut enc) = fused_enc.take() { ... } else { build_dense_ffn_layer_gpu_q(...) }` → unconditional `fused_enc.take().ok_or_else(...)?` (the `else` legacy branch is unreachable now).
+   - `forward_gpu_greedy` (decode path): `dense_q_legacy` env-check removed; `FfnWeightsGpu::DenseQ(w) if !dense_q_legacy =>` simplified to `FfnWeightsGpu::DenseQ(w) =>`.
+   - Inner fall-through match: `FfnWeightsGpu::DenseQ(w) =>` arm deleted; replaced with `FfnWeightsGpu::DenseQ(_) => unreachable!(...)` to keep the match exhaustive.
+   - `use` import: `build_dense_ffn_layer_gpu_q` removed (no longer called from this file; the function still exists in `gpu_ffn.rs` for the CPU-parity test caller).
+
+3. `scripts/sunset-w5b14-legacy-dense-q.sh`: new file, 84 LOC, foreground sequential 30-run audit.
+
+### Build + test status
+
+- `cargo build --release --bin hf2q`: succeeds, **72 warnings (W-5b.15 baseline preserved, 0 new)**.
+- `cargo test --release --bin hf2q qwen35`: **295 / 295 PASS** (down from 296; expected delta -1 from the deleted W-5b.14 cross-path parity test).
+- `cargo test --release --bin hf2q chunk_path_first_token_matches_autoregressive_at_seq128`: PASS.
+- `cargo test --release --bin hf2q dense_q_arena_reset_chunk_prefill_no_layer_33_error`: PASS.
+- `cargo test --release --bin hf2q dense_q_path_first_token_matches_legacy_at_seq128`: 0 tests matched (correctly deleted).
+- Full suite (`cargo test --release --bin hf2q --quiet`): 2,127 PASS / 0 FAIL / 11 ignored.
+
+### Audit-pattern lesson (for `feedback_loop_mistakes_catalog`)
+
+When the upstream iter (W-5b.15) ships a forensic-A/B gate alongside its production path AND lands the closure with a "sunset to W-5b.16 conditional on N-run parity" plan, the sunset iter should:
+
+1. Re-run the **same** wall-time bench from the prior iter so the closure's metrics are reproduced cold-process (this iter: 17,050 ms within 0.6 % of W-5b.15's 17,150 ms; llama 6,650 ms within 0.25 % of 6,633 ms — drift inside W-5b.15's own measurement noise).
+2. Audit `git log` of all gate sites *before* deleting them — confirms the closure's "default routes through new path" claim isn't subtly violated by an interior fall-through (this iter: the inner `_` match arm in `forward_gpu_greedy` had a DenseQ sub-arm reachable only under legacy; `unreachable!` replaces it cleanly).
+3. Run the 30-run cross-path determinism panel sequential-foreground (this iter: ~12 min for 30 cells; harness pattern from W-5b.11's sunset script verbatim).
+4. Preserve sunset-attribution comments at every former gate location so future code-archaeology has an unambiguous audit trail (this iter: 11 W-5b.16 sunset comments across the two source files).
+
+### AC-tier impact
+
+NONE (perf-bar AC 5468 / 5470 informational at full `[x]`). Phase A re-confirms the W-5b.15 wall ratio 2.59× without movement (the W-5b.17 DN target remains the next perf-bar mover).
+
+### Reproduction recipe
+
+```bash
+# Phase A (~10 min)
+./scripts/bench-w5b15-dense-q-arena-reset.sh
+
+# Phase B (~12 min)
+bash scripts/sunset-w5b14-legacy-dense-q.sh
+```
+
+Wave 5b.16 re-audit + sunset: **CLOSED — Phase A re-confirms W-5b.15 mix (top-3 = linear_total 7,287 ms / ffn_dispatch 4,324 ms / full_total 1,990 ms); Phase B 30/30 PASS → `HF2Q_DENSE_Q_LEGACY` removed; 295 / 295 qwen35 tests pass; W-5b.17 target = DN wrapper-overhead audit.**
