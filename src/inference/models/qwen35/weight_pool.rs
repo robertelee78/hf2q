@@ -82,12 +82,48 @@ thread_local! {
 /// The pool does **not** take ownership of `buffer` — the caller retains
 /// the `MlxBuffer` handle and is responsible for keeping it alive for as
 /// long as the residency hint should stay active.
+///
+/// # Multi-device tolerance (W-5b.7 iter 2)
+///
+/// `MlxBufferPool::register_existing` enforces a single-`ResidencySet`
+/// invariant — every buffer registered with one pool must come from
+/// `MlxDevice` instances whose `ResidencySet` Arcs are pointer-equal.
+/// hf2q's current architecture creates multiple `MlxDevice` instances
+/// (one in `serve::gpu::GpuContext`, one in `forward_gpu`'s `GPU_CACHE`
+/// init, one inside `in_memory_loader::quantize_f32_to_q8_0_buffer`'s
+/// caller, …); each has its own `ResidencySet`.  The first call to
+/// `register_weight_buffer` claims the pool for its device's residency
+/// set; subsequent calls from a different device fail mlx-native's
+/// `same_owner` check with `MlxError::InvalidArgument("MlxBufferPool
+/// cannot mix residency-enabled devices")`.
+///
+/// We treat that mismatch as a *tolerated soft fallback*: the buffer
+/// stays unregistered (no residency hint) but loading continues
+/// successfully.  In practice the dominant ~14 GB MoE / dense weight
+/// slice loaded inside `forward_gpu`'s cache init all uses **one**
+/// device, so it claims the pool and gets full residency benefit; the
+/// smaller cross-device slice (Q8_0 quantize, MTP norms, etc.) falls
+/// back transparently.  An iter-3 architectural refactor consolidating
+/// hf2q on a single shared `MlxDevice` would eliminate the soft fallback
+/// and let the remaining ~3 GB also join a residency set.
 #[inline]
 pub fn register_weight_buffer(
     device: &MlxDevice,
     buffer: &MlxBuffer,
 ) -> std::result::Result<(), MlxError> {
-    WEIGHT_POOL.with(|cell| cell.borrow_mut().register_existing(device, buffer))
+    WEIGHT_POOL.with(|cell| match cell.borrow_mut().register_existing(device, buffer) {
+        Ok(()) => Ok(()),
+        // Tolerate the cross-device case: hf2q's loader spans multiple
+        // `MlxDevice` instances, each with its own `ResidencySet`.  The
+        // first registration claims the pool; later devices' buffers stay
+        // unregistered (no residency hint) but loading must not fail.
+        Err(MlxError::InvalidArgument(ref msg))
+            if msg.contains("cannot mix residency-enabled devices") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    })
 }
 
 /// Diagnostic accessor: number of buffers tracked in the residency set
