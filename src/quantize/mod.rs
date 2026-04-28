@@ -2432,6 +2432,267 @@ mod tests {
         );
     }
 
+    /// ADR-014 P7 iter-23 — Q2_K imatrix-vs-none divergence gate.
+    /// Mirrors iter-13's Q3_K_M divergence test for the Q2_K codec
+    /// path (landed in iter-19+iter-20).  Without this gate, a
+    /// regression that silently routes the Q2_K imatrix dispatch
+    /// through `quantize_row_q2_k_to_bytes` (uncalibrated) instead of
+    /// `quantize_row_q2_k_imatrix_to_bytes` would pass every
+    /// structural test but quietly degrade dwq28 quality on real
+    /// models with non-uniform activation importance.
+    ///
+    /// Tensor: `blk.5.attn_q.weight` at layer 5/32 — attn_q never
+    /// bumps for any Q2 variant, so both paths land on the Q2_K base
+    /// target (84-byte block).
+    #[test]
+    fn variant_imatrix_q2k_diverges_from_none_through_streaming() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::calibrate::imatrix::ImatrixCollector;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+
+        const QK_K: usize = 256;
+        const N_LAYERS: usize = 32;
+        const TENSOR: &str = "blk.5.attn_q.weight";
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+
+        let make_f16_payload = |len: usize| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(len * 2);
+            for i in 0..len {
+                let v = (i as f32 / len as f32) * 2.0 - 1.0;
+                let h = half::f16::from_f32(v);
+                bytes.extend_from_slice(&h.to_le_bytes());
+            }
+            bytes
+        };
+
+        let make_lazy_map = || -> LazyTensorMap {
+            let mut m = LazyTensorMap::new();
+            m.insert(LazyTensor::from_bytes(
+                LazyMeta::new(TENSOR.to_string(), vec![1, QK_K], DType::F16),
+                make_f16_payload(QK_K),
+            ));
+            m
+        };
+
+        // Non-uniform importance: 100× boost first 16 columns, 0.01× rest.
+        let mut col = ImatrixCollector::new();
+        let acts: Vec<f32> = (0..QK_K)
+            .map(|i| if i < 16 { 100.0 } else { 0.01 })
+            .collect();
+        col.accumulate_dense(TENSOR, &acts, 1, QK_K).unwrap();
+        col.record_chunk();
+        let imatrix = CalibrationData::from_imatrix_collector(&col);
+
+        let q_none = VariantKQuantizer::new(
+            KQuantVariant::Q2_K,
+            CalibrationData::None,
+            N_LAYERS,
+        );
+        let q_imatrix =
+            VariantKQuantizer::new(KQuantVariant::Q2_K, imatrix, N_LAYERS);
+
+        let out_none = quantize_streaming(
+            make_lazy_map(),
+            &metadata,
+            &q_none,
+            0,
+            0,
+            &progress,
+            false,
+        )
+        .unwrap();
+        let out_imatrix = quantize_streaming(
+            make_lazy_map(),
+            &metadata,
+            &q_imatrix,
+            0,
+            0,
+            &progress,
+            false,
+        )
+        .unwrap();
+
+        let t_none = out_none
+            .tensors
+            .get(TENSOR)
+            .expect("none-path missing");
+        let t_imatrix = out_imatrix
+            .tensors
+            .get(TENSOR)
+            .expect("imatrix-path missing");
+
+        assert_eq!(t_none.data.len(), 84, "Q2_K block size");
+        assert_eq!(t_imatrix.data.len(), 84, "Q2_K block size");
+        assert_eq!(
+            t_none.quant_info.ggml_type.as_deref(),
+            Some("Q2_K")
+        );
+        assert_eq!(
+            t_imatrix.quant_info.ggml_type.as_deref(),
+            Some("Q2_K")
+        );
+
+        assert_ne!(
+            t_none.data, t_imatrix.data,
+            "Q2_K imatrix-weighted bytes must differ from uncalibrated \
+             when importance is non-uniform — otherwise the Q2_K imatrix \
+             dispatch in `quantize_row_to_bytes` is broken"
+        );
+    }
+
+    /// ADR-014 P7 iter-23 — Q2_K imatrix lowers importance-weighted
+    /// error vs uncalibrated.  Directional-correctness gate that
+    /// mirrors iter-14's Q3_K_M pattern but for the Q2_K codec path.
+    ///
+    /// Without this, a regression that flips the Q2_K imatrix codebook
+    /// search to minimise the wrong objective (or inverts the
+    /// importance vector) would still pass iter-23's "bytes differ"
+    /// gate but would silently degrade real-model quality on dwq28.
+    ///
+    /// Adversarial input pattern matches iter-3z/iter-14: high-importance
+    /// columns get wide-magnitude data; low-importance get small steady
+    /// values, forcing the codebook to choose between accuracy on
+    /// high-mag/high-importance vs low-mag/low-importance.
+    #[test]
+    fn variant_imatrix_q2k_lowers_importance_weighted_error() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::calibrate::imatrix::ImatrixCollector;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::k_quant::dequantize_row_q2_k_bytes;
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+
+        const QK_K: usize = 256;
+        const N_BLOCKS: usize = 4;
+        const TOTAL: usize = N_BLOCKS * QK_K;
+        const TENSOR: &str = "blk.5.attn_q.weight";
+        const HIGH_IMPORTANCE_COLS: usize = 16;
+
+        // accumulate_dense → values[c] = sum_t activations[c]^2.
+        // 100×/0.01× activations → 10000× importance ratio.
+        let acts: Vec<f32> = (0..QK_K)
+            .map(|c| {
+                if c < HIGH_IMPORTANCE_COLS {
+                    10.0
+                } else {
+                    0.1
+                }
+            })
+            .collect();
+        let mut col = ImatrixCollector::new();
+        col.accumulate_dense(TENSOR, &acts, 1, QK_K).unwrap();
+        col.record_chunk();
+        let imatrix = CalibrationData::from_imatrix_collector(&col);
+
+        let importance: Vec<f64> = (0..QK_K)
+            .map(|c| {
+                if c < HIGH_IMPORTANCE_COLS {
+                    100.0_f64
+                } else {
+                    0.01_f64
+                }
+            })
+            .collect();
+
+        // Adversarial input: wide-mag high-importance, small-steady low-importance.
+        let original_f32: Vec<f32> = (0..TOTAL)
+            .map(|i| {
+                let c = i % QK_K;
+                let r = (i / QK_K) as f32;
+                if c < HIGH_IMPORTANCE_COLS {
+                    let t = (c as f32 / HIGH_IMPORTANCE_COLS as f32) + r * 0.5;
+                    -3.0 + 6.0 * (t.fract())
+                } else {
+                    let t = ((c as f32) / QK_K as f32) + r * 0.01;
+                    -0.1 + 0.2 * (t.fract())
+                }
+            })
+            .collect();
+        let f16_bytes: Vec<u8> = original_f32
+            .iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+            .collect();
+        let expected_post_f16: Vec<f32> = original_f32
+            .iter()
+            .map(|v| half::f16::from_f32(*v).to_f32())
+            .collect();
+
+        let make_lazy_map = || -> LazyTensorMap {
+            let mut m = LazyTensorMap::new();
+            m.insert(LazyTensor::from_bytes(
+                LazyMeta::new(TENSOR.to_string(), vec![N_BLOCKS, QK_K], DType::F16),
+                f16_bytes.clone(),
+            ));
+            m
+        };
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+        let q_none = VariantKQuantizer::new(
+            KQuantVariant::Q2_K,
+            CalibrationData::None,
+            32,
+        );
+        let q_imatrix = VariantKQuantizer::new(KQuantVariant::Q2_K, imatrix, 32);
+
+        let out_none = quantize_streaming(
+            make_lazy_map(),
+            &metadata,
+            &q_none,
+            0,
+            0,
+            &progress,
+            false,
+        )
+        .unwrap();
+        let out_imatrix = quantize_streaming(
+            make_lazy_map(),
+            &metadata,
+            &q_imatrix,
+            0,
+            0,
+            &progress,
+            false,
+        )
+        .unwrap();
+
+        let bytes_none = &out_none.tensors[TENSOR].data;
+        let bytes_imatrix = &out_imatrix.tensors[TENSOR].data;
+        assert_eq!(bytes_none.len(), N_BLOCKS * 84);
+        assert_eq!(bytes_imatrix.len(), N_BLOCKS * 84);
+
+        let mut decoded_none = vec![0.0_f32; TOTAL];
+        let mut decoded_imatrix = vec![0.0_f32; TOTAL];
+        dequantize_row_q2_k_bytes(bytes_none, &mut decoded_none).unwrap();
+        dequantize_row_q2_k_bytes(bytes_imatrix, &mut decoded_imatrix).unwrap();
+
+        let weighted_sse = |decoded: &[f32]| -> f64 {
+            let mut s = 0.0_f64;
+            for r in 0..N_BLOCKS {
+                for c in 0..QK_K {
+                    let i = r * QK_K + c;
+                    let e = (decoded[i] as f64) - (expected_post_f16[i] as f64);
+                    s += importance[c] * e * e;
+                }
+            }
+            s
+        };
+
+        let wsse_none = weighted_sse(&decoded_none);
+        let wsse_imatrix = weighted_sse(&decoded_imatrix);
+
+        assert!(
+            wsse_imatrix < wsse_none,
+            "Q2_K imatrix-weighted SSE {wsse_imatrix:.6} should be \
+             < uncalibrated SSE {wsse_none:.6} — imatrix Q2_K path is \
+             failing to minimise the importance-weighted objective"
+        );
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
