@@ -586,6 +586,10 @@ impl Qwen35Model {
             if cache.as_ref().map_or(true, |c| c.model_ptr != self_ptr) {
                 let device = MlxDevice::new().context("forward_gpu: MlxDevice::new")?;
                 let mut registry = KernelRegistry::new();
+                // Wave 5b.10: register flash_attn_prefill kernel family for
+                // the Qwen3.5 FA prefill path (replaces legacy `sdpa`).
+                // Mirrors `src/serve/gpu.rs:64` (Gemma's GpuContext).
+                mlx_native::ops::flash_attn_prefill::register(&mut registry);
                 // Wave 5b.8: time the one-time `upload_layer_weights_gpu`
                 // first-call cost (~17 GB Q4 materialization onto Metal heap).
                 let layer_weights = {
@@ -1145,6 +1149,9 @@ impl Qwen35Model {
             if cache.as_ref().map_or(true, |c| c.model_ptr != self_ptr) {
                 let device = MlxDevice::new().context("forward_gpu_greedy: MlxDevice::new")?;
                 let mut registry = KernelRegistry::new();
+                // Wave 5b.10: register flash_attn_prefill kernel family for
+                // the Qwen3.5 FA prefill path (replaces legacy `sdpa`).
+                mlx_native::ops::flash_attn_prefill::register(&mut registry);
                 let layer_weights = self.upload_layer_weights_gpu(&device)?;
                 // W-5b.7 iter 2: residency-aware uploads for lm_head and norm.
                 let lm_head_f32 = upload_f32_weight(&self.output_weight, &device)
