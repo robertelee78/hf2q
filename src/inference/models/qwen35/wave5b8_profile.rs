@@ -179,6 +179,13 @@ pub enum SectionKind {
     /// n_state = d_k × d_v × n_v_heads × 4 B per layer ≈ 4 MB × 48
     /// layers ≈ 200 MB CPU memcpy total at PP4096).
     DnStatePingpongMemcpy,
+    /// W-5b.18 NEW path replacement for `DnQkvDownload + DnQkvCpuLoop +
+    /// DnQkvUploads`: a single `mlx_native::ops::qkv_split::
+    /// dispatch_qkv_split_f32` GPU dispatch + `commit_and_wait`. Per
+    /// linear-attn layer, prefill seq>1 only. Default-on; with
+    /// `HF2Q_QKV_SPLIT_LEGACY=1` the three legacy buckets fire instead
+    /// and this one stays at zero.
+    DnQkvGpuSplit,
 }
 
 impl SectionKind {
@@ -214,9 +221,10 @@ impl SectionKind {
             SectionKind::DnQkvCpuLoop => "dn.qkv_cpu_loop",
             SectionKind::DnQkvUploads => "dn.qkv_uploads",
             SectionKind::DnStatePingpongMemcpy => "dn.state_pingpong_memcpy",
+            SectionKind::DnQkvGpuSplit => "dn.qkv_gpu_split",
         }
     }
-    const COUNT: usize = 27;
+    const COUNT: usize = 28;
 }
 
 #[derive(Default, Clone)]
@@ -380,6 +388,8 @@ pub fn w5b8_print_and_reset(label: &str) {
             SectionKind::DnQkvCpuLoop,
             SectionKind::DnQkvUploads,
             SectionKind::DnStatePingpongMemcpy,
+            // Wave 5b.18 GPU-side QKV split:
+            SectionKind::DnQkvGpuSplit,
         ];
         for k in kinds {
             let acc = &state.accs[k.idx()];

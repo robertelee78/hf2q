@@ -257,6 +257,18 @@ pub struct InvestigationEnv {
     /// gated by `env_eq_one("HF2Q_UNSAFE_EXPERIMENTS")`.
     pub chunk_scan_prefill: bool,
 
+    /// `HF2Q_QKV_SPLIT_LEGACY=1` — Wave 5b.18 forensic A/B fallback. Default
+    /// `false` → the prefill DN qkv_deinterleave step uses the new
+    /// `mlx_native::ops::qkv_split::dispatch_qkv_split_f32` GPU kernel.
+    /// When set, the legacy CPU round-trip path (download_f32 + triple-loop
+    /// split + 3× upload_f32) fires instead, so a 30-run forensic A/B can
+    /// confirm token-id determinism + measure the kernel's wall-clock win.
+    /// **No ack gate** — this is a same-output benchmarking switch (both
+    /// paths are bit-identical by the kernel's unit test).  Sunset target:
+    /// W-5b.19 after a 30-run forensic A/B at PP4106 confirms determinism
+    /// (mirrors W-5b.10/14 → W-5b.16 sunset cadence).
+    pub qkv_split_legacy: bool,
+
     // ========================================================================
     // Category 4 — SDPA regime selector (HF2Q_USE_DENSE / HF2Q_LAYER_POLICY).
     // These two vars select per-layer dense vs TQ SDPA dispatch.
@@ -464,6 +476,11 @@ impl InvestigationEnv {
             split_timing: env_eq_one("HF2Q_SPLIT_TIMING"),
             mlx_kernel_profile: env_eq_one("HF2Q_MLX_KERNEL_PROFILE"),
             mlx_profile: env_eq_one("HF2Q_MLX_PROFILE"),
+
+            // Wave 5b.18 forensic A/B (no ack gate — same output by
+            // construction; the new GPU kernel passes a bit-identical CPU
+            // reference test in mlx-native's `tests/test_qkv_split.rs`).
+            qkv_split_legacy: env_eq_one("HF2Q_QKV_SPLIT_LEGACY"),
 
             unsafe_experiments_acked: ack,
             raw,

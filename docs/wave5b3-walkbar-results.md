@@ -1854,3 +1854,78 @@ kill -CONT <mcp-brain-server-pid>
 NONE (perf-bar AC 5468 / 5470 informational at full `[x]`). Audit-only iter — surfaces the W-5b.18 implementation target (mlx-native `dispatch_qkv_split` kernel + hf2q wrapper-side delete) but does not move the wall-clock by itself. The W-5b.18 recoverable ceiling (1,349 ms) is consistent with the W-5b.15 dense_q outcome (which closed 17 % of the prefill wall in a single day at low risk by attacking a similar wrapper-side architectural cost).
 
 Wave 5b.17 DN wrapper-overhead audit: **CLOSED — sub-bucket coverage 99.5 % of `layer.linear_total`; top-3 hf2q-recoverable contributors = `layer.qkv_deinterleave` 838 ms (W-5b.18-A target) / `chunk.gqa_expand` 497 ms (W-5b.18-B mlx-native) / `dn.state_pingpong_memcpy` 14 ms (W-5b.18-C cleanup); `chunk.commit_wait` 1,285 ms confirmed mlx-native floor.**
+
+## Wave 5b.18 qkv_split GPU kernel — CLOSED (838 ms → 48 ms; 17.4× drop)
+
+**Iter:** 2026-04-27 (cross-repo). hf2q HEAD `25412e2` at start (post-W-5b.17 commit); mlx-native HEAD `6875c92` at start, `5983377` at end (new commit `feat(mlx-native ops): add dispatch_qkv_split_f32`). The W-5b.17 audit's recommendation-A target (eliminate the `layer.qkv_deinterleave` CPU round-trip via a 1-input → 3-output strided GPU kernel) is implemented as the production default with `HF2Q_QKV_SPLIT_LEGACY=1` retained as a forensic A/B fallback (no ack required — both paths are bit-identical by the kernel's unit test).
+
+### Implementation summary
+
+**mlx-native (sibling crate, public API addition):**
+
+- `src/shaders/qkv_split.metal` — single MSL kernel `qkv_split_f32`. Grid `(qkv_ch, seq, 1)` — one thread per input element; routes to `q[row * q_sp + col]` / `k[row * k_sp + (col − q_sp)]` / `v[row * v_sp + (col − q_sp − k_sp)]` based on column. Pure strided copy (no compute, no reductions, no barriers).
+- `src/ops/qkv_split.rs` — `dispatch_qkv_split_f32` wrapper + `QkvSplitParams { seq, q_sp, k_sp, v_sp }`. Mirrors the `copy::dispatch_strided_copy_f32` convention (buffer-size guards on all four bindings; `encode_with_args` dispatch).
+- `src/kernel_registry.rs` — auto-loads the shader source via `include_str!` at registry construction (matches the `copy.metal` precedent).
+- `tests/test_qkv_split.rs` — 6 cases including the Qwen3.6-27B production shape at both seq=128 (chunk pipeline) and seq=4106 (PP prefill); every case asserts `to_bits()`-identical equality vs the CPU triple-loop reference.
+
+**hf2q (wire-up + forensic A/B):**
+
+- `src/inference/models/qwen35/gpu_delta_net.rs:1437-1541` — replaces the prior `download_f32 + CPU triple-loop split + 3× upload_f32` block with a single `dispatch_qkv_split_f32` call (default) plus a `HF2Q_QKV_SPLIT_LEGACY=1` fall-back that re-runs the legacy CPU path verbatim. Three `pooled_alloc_buffer` allocations from the per-prefill-layer arena pool (lifetimes bounded by `build_delta_net_layer`).
+- `src/debug/investigation_env.rs` — adds `qkv_split_legacy: bool` field; parsed via `env_eq_one("HF2Q_QKV_SPLIT_LEGACY")`. **No ack gate** — same-output forensic A/B switch.
+- `src/inference/models/qwen35/wave5b8_profile.rs` — adds `SectionKind::DnQkvGpuSplit` ("dn.qkv_gpu_split"); registered in the `kinds[]` print loop next to the legacy `dn.qkv_*` triplet.
+
+**Test:** `qkv_split_path_matches_legacy_at_seq128` (new) — uploads a fused QKV-conv tensor at production shape (`seq=128, n_k=2, n_v=16, d_k=d_v=128` ⇒ `qkv_ch=2,560`), runs the GPU kernel and the legacy CPU loop on the same input, asserts every output byte matches via `to_bits()`. PASSES.
+
+### Wall-time bench (3 cold × NEW + 3 cold × LEGACY + 3 cold llama at PP4106)
+
+`HF2Q_PROFILE_W5B8=1 HF2Q_PROFILE_W5B17=1 HF2Q_QWEN36_AUTOREG=1 HF2Q_UNSAFE_EXPERIMENTS=1 HF2Q_CHUNK_SCAN_PREFILL=1` set on every hf2q trial; the LEGACY column additionally has `HF2Q_QKV_SPLIT_LEGACY=1`. Llama trials use the W-5b.16/17 fixed flags. Fresh-cold every trial (process exits between trials; mcp-brain-server `kill -STOP`-paused for the whole bench, resumed at close per `feedback_bench_process_audit`).
+
+| trial | NEW prefill (ms) | LEGACY prefill (ms) | llama prompt_eval (ms) |
+|------:|------------------:|--------------------:|-----------------------:|
+| T1    | 16,236            | 17,072              | 6,627                  |
+| T2    | 16,203            | 17,057              | 7,183                  |
+| T3    | 16,139            | 17,023              | 7,573                  |
+| **mean** | **16,193**     | **17,051**          | **7,127**              |
+
+**Per-bucket telemetry (T2; representative):**
+
+| bucket | LEGACY (ms) | NEW (ms) | Δ |
+|---|---:|---:|---:|
+| `layer.qkv_deinterleave` | 837.3 | **47.8** | **−789 ms (−94 %, 17.4× drop)** |
+| `dn.qkv_download` | 230.3 | — | bucket vacated |
+| `dn.qkv_cpu_loop` | 203.9 | — | bucket vacated |
+| `dn.qkv_uploads` | 402.9 | — | bucket vacated |
+| `dn.qkv_gpu_split` | — | **47.7** | new bucket; ~1 ms/layer × 48 |
+| `layer.linear_total` | 7,303 | 6,472 | −831 ms (−11.4 %) |
+
+Whole-prefill wall mean drops 17,051 → 16,193 ms (−858 ms / −5.0 %). Wall ratio vs same-day llama: 17,051 / 7,127 = 2.39× (LEGACY) vs 16,193 / 7,127 = **2.27× NEW** (W-5b.16 baseline ratio 2.59× was measured against a 6,650 ms llama; the same-day llama drifted +7.2 % to 7,127 ms — within the 10 % gate; LEGACY-vs-NEW comparison is the apples-to-apples mover and reads the −858 ms straight). Token id 11 (`,`) on **6/6** trials — both paths byte-equivalent by construction (kernel unit test) and by observed first-decoded-token determinism.
+
+### AC-tier impact
+
+NONE (perf-bar AC 5468 / 5470 informational at full `[x]`). The W-5b.18 win lands the W-5b.17 audit's recommendation-A target precisely (838 ms → 48 ms; predicted ≥10×, achieved 17.4×). Closes the largest single hf2q-recoverable bucket on the chunk-prefill path.
+
+### Sunset plan for `HF2Q_QKV_SPLIT_LEGACY`
+
+Mirrors the W-5b.10/14 → W-5b.16 forensic-gate sunset cadence:
+
+- **Now:** retained as the forensic A/B fallback. Default fires the GPU kernel; setting `HF2Q_QKV_SPLIT_LEGACY=1` reverts to the CPU round-trip for parity panels.
+- **W-5b.19 (next iter):** run a 30-run cross-path determinism panel at PP4106 (token id 11 across all 30 NEW + all 30 LEGACY) plus one apex 35B-A3B prefill verification. On PASS, delete the `qkv_split_legacy` field, the `HF2Q_QKV_SPLIT_LEGACY` env-var, the LEGACY arm of the `if` in `gpu_delta_net.rs`, and the `dn.qkv_download` / `dn.qkv_cpu_loop` / `dn.qkv_uploads` SectionKind variants. The kernel-level bit-identical unit test in `mlx-native/tests/test_qkv_split.rs` then becomes the standing parity bar.
+
+### Bench reproducibility
+
+```bash
+# Pre-flight
+ps aux | grep -v sccache | sort -k6 -nr | head -10
+kill -STOP <mcp-brain-server-pid>
+
+# Build (path-override pulls mlx-native HEAD via /opt/hf2q/.cargo/config.toml)
+RUSTC_WRAPPER= cargo build --release --bin hf2q
+
+# Bench: 3 cold trials × (NEW + LEGACY) + 3 cold llama
+bash /opt/hf2q/scripts/bench-w5b18-qkv-split.sh
+
+# Cleanup
+kill -CONT <mcp-brain-server-pid>
+```
+
+Wave 5b.18 qkv_split GPU kernel: **CLOSED — `layer.qkv_deinterleave` 837 → 48 ms (17.4× drop); whole-prefill wall 17,051 → 16,193 ms (−5.0 %); wall ratio 2.59× → 2.27× vs same-day llama; 6/6 token-id determinism; `HF2Q_QKV_SPLIT_LEGACY` retained for W-5b.19 sunset panel.**
