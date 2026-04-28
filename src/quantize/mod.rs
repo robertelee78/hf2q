@@ -4657,6 +4657,111 @@ mod tests {
         }
     }
 
+    /// ADR-014 P7 iter-37 — vision-tensor F16 passthrough applies to
+    /// legacy targets too.  Bug discovered while pinning iter-34's
+    /// regression contract: iter-34's `is_k_quant_target` gate
+    /// collapsed the vision-pattern arm too, so vision tensors routed
+    /// to legacy targets (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) would silently
+    /// quantize through the legacy codec instead of F16-passthrough.
+    ///
+    /// Vision tensors are F16-passthrough *policy-driven*, not
+    /// block-size-driven — quality loss propagates to multimodal input
+    /// representation regardless of which codec the rest of the model
+    /// uses.  The fix: split the predicate into `is_vision_tensor_pattern`
+    /// (universal) and `is_kquant_row_misaligned` (K-quant only); the
+    /// codec dispatch ORs them with `is_k_quant_target`.
+    ///
+    /// Test: vision tensor `vit.proj_out.weight` with row_len=256
+    /// (legal for both K-quant AND legacy block sizes — isolates the
+    /// vision-pattern axis from the alignment axis).  All 5 legacy
+    /// targets MUST emit F16 passthrough (512 bytes = 256 × 2-byte F16),
+    /// not legacy codec output.
+    ///
+    /// Catches a future "consolidation" of the predicates back into a
+    /// single condition or removal of the universal vision-pattern arm.
+    #[test]
+    fn legacy_target_vision_tensor_emits_f16_passthrough() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::k_quant_codec::KQuantTarget;
+        use crate::quantize::k_quant_codec_quantizer::KQuantCodecQuantizer;
+
+        const ROW_LEN: usize = 256; // 256-multiple AND 32-multiple — isolates vision axis
+        const TENSOR: &str = "vit.proj_out.weight";
+
+        // Pre-conditions confirming the fixture isolates the vision axis:
+        assert!(
+            crate::quantize::layer_mix::is_vision_tensor_pattern(TENSOR),
+            "TENSOR must match the vision-pattern arm"
+        );
+        assert!(
+            !crate::quantize::layer_mix::is_kquant_row_misaligned(ROW_LEN),
+            "ROW_LEN=256 must NOT trigger the K-quant-misalignment arm — \
+             this isolates the test to the vision-pattern axis"
+        );
+
+        let payload: Vec<u8> = (0..ROW_LEN)
+            .map(|i| (i as f32 / ROW_LEN as f32) * 2.0 - 1.0)
+            .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+
+        let make_lazy_map = || -> LazyTensorMap {
+            let mut m = LazyTensorMap::new();
+            m.insert(LazyTensor::from_bytes(
+                LazyMeta::new(TENSOR.to_string(), vec![1, ROW_LEN], DType::F16),
+                payload.clone(),
+            ));
+            m
+        };
+
+        // (target, name) — iter over all 5 legacy targets AND a K-quant
+        // target for the orthogonality assertion.
+        let cases: Vec<(KQuantTarget, &str)> = vec![
+            (KQuantTarget::Q4Legacy,  "Q4_0"),
+            (KQuantTarget::Q4Legacy1, "Q4_1"),
+            (KQuantTarget::Q5Legacy0, "Q5_0"),
+            (KQuantTarget::Q5Legacy1, "Q5_1"),
+            (KQuantTarget::Q8Legacy,  "Q8_0"),
+            // K-quant control: also F16-passthrough'd via vision arm.
+            (KQuantTarget::Q4K,       "Q4_K"),
+        ];
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+
+        for (target, name) in cases {
+            let q = KQuantCodecQuantizer::new(name, target, CalibrationData::None);
+            let out = quantize_streaming(make_lazy_map(), &metadata, &q, 0, 0, &progress, false)
+                .unwrap_or_else(|e| panic!("{name} on vision tensor: {e:?}"));
+
+            let t = out
+                .tensors
+                .get(TENSOR)
+                .unwrap_or_else(|| panic!("{name} missing {TENSOR}"));
+
+            assert_eq!(
+                t.quant_info.ggml_type.as_deref(),
+                Some("F16"),
+                "{name} on vision tensor: emitted {:?} instead of F16 — \
+                 the iter-37 vision-pattern universal-passthrough has regressed",
+                t.quant_info.ggml_type
+            );
+            assert!(
+                t.quant_info.preserved,
+                "{name} on vision tensor: preserved flag must be true \
+                 for F16 passthrough"
+            );
+            assert_eq!(
+                t.data.len(),
+                ROW_LEN * 2,
+                "{name} on vision tensor: expected {} bytes (= F16 byte budget), \
+                 got {} — fell into the codec dispatch arm",
+                ROW_LEN * 2,
+                t.data.len()
+            );
+        }
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the

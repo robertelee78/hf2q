@@ -346,22 +346,41 @@ pub fn should_skip_quantization(tensor_name: &str) -> bool {
 /// routes correctly through the F16 arms in `repack_to_ggml_blocks` AND
 /// `quant_info_to_ggml_type` in `src/backends/gguf.rs`.
 pub fn should_emit_f16_for_kquant(tensor_name: &str, row_len: usize) -> bool {
-    // Vision encoder patterns. Order doesn't matter (any match wins).
-    if tensor_name.contains("model.visual.")
+    is_vision_tensor_pattern(tensor_name) || is_kquant_row_misaligned(row_len)
+}
+
+/// Vision-tensor name pattern check (policy-driven F16 passthrough).
+///
+/// Vision encoder weights ship as F16 in production GGUFs regardless
+/// of the surrounding quantization target — they're a small share of
+/// the model and any quality loss propagates to multimodal input
+/// representation.  Independent of block-size constraints.
+///
+/// ADR-014 P7 iter-37: split out from `should_emit_f16_for_kquant` so
+/// the codec dispatch can apply the vision policy to legacy targets
+/// (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) as well.  Legacy targets accept
+/// 32-multiple rows so the row-misalignment arm does NOT apply to them
+/// (per iter-34's `is_k_quant_target` gate), but the vision-policy arm
+/// applies universally.
+#[inline]
+pub fn is_vision_tensor_pattern(tensor_name: &str) -> bool {
+    tensor_name.contains("model.visual.")
         || tensor_name.contains("vision_tower.")
         || tensor_name.contains("vision_model.")
         || tensor_name.contains("vit.")
         || tensor_name.starts_with("visual.")
         || tensor_name.contains(".visual.")
-    {
-        return true;
-    }
-    // Defensive: any non-256-multiple row length cannot encode under any
-    // K-quant target (Q4_K/Q5_K/Q6_K all use QK_K = 256).
-    if row_len % 256 != 0 {
-        return true;
-    }
-    false
+}
+
+/// K-quant row-length misalignment check (block-size constraint).
+///
+/// Q2_K through Q6_K all use a super-block of 256 elements.  Any
+/// non-256-multiple row length cannot encode under any K-quant target.
+/// Does NOT apply to legacy targets (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 use
+/// 32-element blocks).
+#[inline]
+pub fn is_kquant_row_misaligned(row_len: usize) -> bool {
+    row_len % 256 != 0
 }
 
 /// llama.cpp's `use_more_bits` predicate (line 417-419):

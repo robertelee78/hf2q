@@ -41,7 +41,7 @@
 use crate::calibrate::calibrator::CalibrationData;
 use crate::ir::{DType, QuantizedTensor, TensorQuantInfo, TensorRef};
 use crate::quantize::k_quant_codec::{quantize_tensor_2d_to_bytes, KQuantTarget};
-use crate::quantize::layer_mix::should_emit_f16_for_kquant;
+use crate::quantize::layer_mix::{is_kquant_row_misaligned, is_vision_tensor_pattern};
 use crate::quantize::{LayerQuantConfig, Quantizer, QuantizeError};
 
 /// Quantizer that produces final GGUF block bytes via [`k_quant_codec`].
@@ -288,9 +288,14 @@ impl Quantizer for KQuantCodecQuantizer {
         // use 32-element blocks).  Without this gate, any 32-multiple
         // row that's not also 256-multiple would falsely passthrough
         // as F16 instead of being quantized to the requested legacy
-        // target.  The vision-pattern arm still applies regardless of
-        // target — vision tensors are F16-passthrough policy-driven,
-        // not block-size-driven.
+        // target.
+        //
+        // ADR-014 P7 iter-37 (2026-04-28): the vision-pattern arm
+        // applies regardless of target — vision tensors are
+        // F16-passthrough policy-driven, not block-size-driven.  The
+        // iter-34 gate accidentally collapsed the vision arm too.
+        // Split the predicate so vision-policy applies universally
+        // while alignment-policy applies only to K-quant targets.
         let row_len_for_skip = tensor.shape.last().copied().unwrap_or(0);
         let is_k_quant_target = matches!(
             self.target,
@@ -300,12 +305,14 @@ impl Quantizer for KQuantCodecQuantizer {
                 | KQuantTarget::Q5K
                 | KQuantTarget::Q6K
         );
-        if is_k_quant_target && should_emit_f16_for_kquant(&tensor.name, row_len_for_skip) {
+        let f16_passthrough_required = is_vision_tensor_pattern(&tensor.name)
+            || (is_k_quant_target && is_kquant_row_misaligned(row_len_for_skip));
+        if f16_passthrough_required {
             tracing::info!(
                 tensor = %tensor.name,
                 row_len = row_len_for_skip,
                 target = ?self.target,
-                "K-quant skip → F16 passthrough (vision or non-256-multiple)"
+                "Codec skip → F16 passthrough (vision policy or K-quant row misalignment)"
             );
             return f16_passthrough(tensor, &tensor.name);
         }
