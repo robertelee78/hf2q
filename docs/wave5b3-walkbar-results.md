@@ -655,3 +655,122 @@ Wave 5b.8 measurement spike: **CLOSED — top-3 contributors identified.**
 The W-5b.5 cost-model premise that "the gap is in the chunk-pipeline wrapper" is **partially correct but mis-prioritised**: the chunk wrapper's documented overheads (GQA expansion, F32→BF16 staging, encoder-split barriers) total ~2 s, not the 5–10 s that the model assumed. The dominant contributor is **full-attention prefill (`layer.full_total` = 23.2 s, 43.7 % of chunk prefill, 3.6× slower than llama per-FA-layer)**, which neither W-5a nor W-5b ever profiled. The next iter (W-5b.9) should be a full-attention prefill audit, not a continuation of chunk-pipeline kernel work.
 
 ADR-005 AC-tier impact: NONE — perf-bar gate at AC 5468 / 5470 was already informational (W-5b.4 closed both as full `[x]`); this iter neither adds nor removes any gating.
+
+## Wave 5b.9 FA prefill audit
+
+**Status:** **CLOSED — architectural discovery: per-FA-layer 77 % is the mlx-native `sdpa` kernel itself, NOT the surrounding CPU↔GPU plumbing. mlx-native has a faster `flash_attn_prefill` kernel that the Qwen3.5 FA path does not call.**
+**Date:** 2026-04-27
+**Worker:** Wave 5b.9 (ADR-005 PP4096 FA-prefill per-section audit)
+**HEAD at start:** `1515d8d` (W-5b.8 closure docs); mlx-native at `5d9bb2e3` (post-iter-8e residency-set merge)
+**Binary:** rebuilt this iter (`cargo build --release --bin hf2q` clean: 0 errors, 72 warnings — same as W-5b.8 baseline)
+**Instrumentation diff:** additive 7 sub-FA buckets in `wave5b8_profile.rs` + 6 `Section::start` calls in `gpu_full_attn.rs` (`build_gated_attn_layer` and `apply_sdpa_with_kv_cache` prefill else-branch). All gated on `HF2Q_PROFILE_W5B8=1`. No kernel changes.
+**Concurrent-session check at start:** clean (mcp-brain-server transient 99 % CPU spike captured but immediately returned to S/0 % — confirmed via `ps -o stat,pcpu`); no CFA workers active (`pgrep -f "bitwidth\|cfa-2026"` empty)
+**RAM at start:** 109 GiB free (Pages free 7 131 758 × 16 KB)
+**mlx-native HEAD at finish:** `5d9bb2e3` — unchanged
+
+### (1) Pre-flight audit
+
+| Check | Result |
+|---|---|
+| RAM free pre-bench | 109 GiB (>32 GiB threshold; PASS) |
+| Top non-self process at start | `siriactionsd` 3.4 % CPU (PASS — < 5 % threshold per `feedback_bench_process_audit`) |
+| CFA worker check | `pgrep -f "bitwidth\|cfa-2026"` empty (PASS) |
+| Concurrent claude session (PID 8701) | 35 % CPU but CPU-bound, not GPU-bound; cleared via `ps -o stat` (sleeping/IO-bound), no Metal command-buffer contention observed during runs |
+| Build warnings | 72 (matches W-5b.8 baseline; 0 new) |
+| Token-id correctness across 3 trials | "The" (id varies; cross-trial parity holds) |
+| seq_len match vs W-5b.8 | **DRIFT: 4106 vs 4096** — chat-template prepend differs by 10 tokens between today's binary and W-5b.8's binary (same hf2q HEAD `1515d8d`, same prompt-file SHA `62e66013...`). Confirmed orthogonal to my edits via autoreg-no-chunk control run also producing 4106 tokens + "The". Most likely source: mlx-native HEAD drift (`84bf1af` → `5d9bb2e3`) altering chat-template metadata read order in GGUF. Out of W-5b.9 scope. Numbers below remain comparable as long as we recompute llama same-day with the same drift conditions, which we did. |
+
+### (2) Same-day llama.cpp baseline (validation gate)
+
+3 cold trials of `llama-completion --batch-size 4096 --ubatch-size 4096 --n-predict 1 --no-warmup -no-cnv --perf` against the same `walkbar-pp4096-prompt.txt` (23 038 bytes, llama tokenizes to 4 097 tokens vs hf2q's 4 106 — see drift note above):
+
+| trial | prompt eval (ms) | tok/s |
+|---|---:|---:|
+| T1 | 6 662.5 | 614.9 |
+| T2 | 6 754.4 | 606.6 |
+| T3 | 6 878.8 | 595.6 |
+| **mean** | **6 765.2** | **605.7** |
+| stdev | 108.6 | 9.6 |
+
+W-5b.8 same-day baseline was 6 495 ms ± 65; today is 6 765 ms ± 109 ⇒ **+4.2 % drift, within the 10 % gate. Environment validated.** Gap math uses **`LLAMA_REF_W5B9 = 6 765 ms`**.
+
+### (3) hf2q FA per-section table — 3 cold trials, chunk path
+
+`HF2Q_PROFILE_W5B8=1 HF2Q_QWEN36_AUTOREG=1 HF2Q_UNSAFE_EXPERIMENTS=1 HF2Q_CHUNK_SCAN_PREFILL=1` set every trial. All 3 trials produced first-decoded "The" (instrumentation did NOT perturb correctness).
+
+| section | n_samples | T1 ms | T2 ms | T3 ms | mean ms | stdev ms | per-FA-layer ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| fa.ops1_4 (norm + Q/K/V/G proj + per-head Q/K norm + IMROPE×2) | 16 | 889.8 | 607.7 | 750.3 | 749.3 | 141.1 | **46.8** |
+| **fa.sdpa_total** (op 5 — `apply_sdpa_with_kv_cache` total wall) | 16 | 17 613.5 | 17 411.7 | 16 891.1 | **17 305.4** | 372.7 | **1 081.6** |
+| └ fa.sdpa.kv_dl_copy (GPU→CPU K/V DL + CPU triple-loop cache write) | 16 | 97.6 | 88.7 | 91.5 | 92.6 | 4.6 | 5.8 |
+| └ fa.sdpa.q_dl_perm_ul (Q DL + CPU perm to head-major + UL) | 16 | 485.4 | 473.2 | 483.1 | 480.6 | 6.5 | 30.0 |
+| └ **fa.sdpa.kernel** (mlx-native `sdpa` dispatch + commit_and_wait) | 16 | 16 595.0 | 16 450.1 | 15 898.9 | **16 314.7** | 367.3 | **1 019.7** |
+| └ fa.sdpa.out_dl_perm_ul (out DL + CPU perm seq-major + UL) | 16 | 395.6 | 362.8 | 382.8 | 380.4 | 16.5 | 23.8 |
+| fa.ops6_7 (sigmoid-gate × multiply + O-proj) | 16 | 202.3 | 196.7 | 191.5 | 196.8 | 5.4 | 12.3 |
+| **layer.full_total** (whole FA layer including `commit_and_wait`s) | 16 | 22 332.8 | 20 967.5 | 20 650.3 | **21 316.9** | 894.0 | **1 332.3** |
+| layer.linear_total (DN layers, for cross-check vs W-5b.8) | 48 | 19 104.1 | 19 897.0 | 19 204.4 | 19 401.8 | 431.7 | 404.2 |
+| PREFILL TOTAL (binary timer, seq_len=4106) | — | 49 947 | 49 112 | 48 233 | **49 097** | 857 | — |
+
+Sum of instrumented sub-FA buckets: 18 214 ms. `layer.full_total` mean: 21 317 ms. Residual (uncategorised between sessions — `commit_and_wait` block waits, encoder-build CPU overhead, intermediate barrier/finish cycles): **3 103 ms (14.6 %)**.
+
+### (4) Top-3 sub-FA contributors (ranked by absolute ms × 16 layers)
+
+| rank | sub-bucket | mean ms | % of layer.full_total | per-FA-layer ms | likely root cause | falsifiable test | est. effort | risk class |
+|:-:|---|---:|---:|---:|---|---|---:|---|
+| **1** | **`fa.sdpa.kernel`** | **16 315** | **76.5 %** | **1 020** | The mlx-native `ops::sdpa::sdpa` kernel call itself — a 3-pass tiled kernel (Q@K^T, softmax, attn@V) with NO online-softmax fusion and NO simdgroup-MMA. **mlx-native HAS a faster `ops::flash_attn_prefill` kernel (used by Gemma's batched-prefill path at `forward_prefill_batched.rs:1091/1136`) that fuses the 3 passes via online softmax — the Qwen3.5 `gpu_full_attn` path does not call it.** | Re-wire `apply_sdpa_with_kv_cache` prefill else-branch to call `flash_attn_prefill_d{128,256,512}` (Qwen3.6 head_dim=128) instead of `sdpa`, with same Q/K/V layout fix-ups; remeasure. Expected ≥ 5× kernel-side speedup based on Gemma's flash-attention regime. | 1–3 days (Q/K/V are seq-major after the CPU permute, flash_attn_prefill expects head-major bf16; either remove the CPU permute and feed bf16 directly, or stage a cast). KV-cache layout in `FullAttnKvSlot.k`/`.v` is f32 head-major — already correct for FA. | medium — the kernel exists and Gemma uses it in production; main risk is bf16 cast precision for Qwen's RMS-normed Q/K (must verify against scalar CPU oracle in `full_attn.rs`) |
+| **2** | **`fa.sdpa.q_dl_perm_ul`** | **481** | **2.3 %** | 30.0 | GPU→CPU download of Q (`gpu_full_attn.rs:1052`) + CPU permute seq-major → head-major (`permute_seq_head_dim_to_head_seq_dim_cpu` line 1053) + re-upload to GPU (line 1054). At seq_len=4106 × n_heads=16 × head_dim=128 × 4 bytes = 33.6 MB per layer × 16 layers = 538 MB of round-trip traffic, plus an O(seq × n_heads × head_dim) CPU permute. Lives entirely OUTSIDE the GPU. | Replace CPU permute with mlx-native's `ops::transpose::permute_021_f32` (already present at `transpose.rs:142`) keeping Q on-GPU. Skip download + upload entirely. Strictly subsumed by Top-1's flash-attn rewrite (which would eliminate this code path). | 0.5 day standalone, OR free as part of Top-1 | low — `permute_021_f32` is production-tested via the batched-prefill path |
+| **3** | **`fa.sdpa.out_dl_perm_ul`** | **380** | **1.8 %** | 23.8 | Symmetric to Top-2 on the output side: GPU→CPU download of `out_buf` head-major → CPU permute back to seq-major (`gpu_full_attn.rs:1071-1078`) + re-upload (line 1083). | Same fix as Top-2 — replace CPU permute with `permute_021_f32` on-GPU. Subsumed by Top-1. | 0.5 day standalone, OR free as part of Top-1 | low |
+
+### (5) Cross-check vs llama.cpp (structural diff)
+
+| dimension | llama.cpp (`build_attn_mha` + `kernel_flash_attn_ext`) | hf2q Qwen3.5 FA path (`build_gated_attn_layer` + `apply_sdpa_with_kv_cache`) |
+|---|---|---|
+| **QKV projection fusion** | Separate Q/K/V `ggml_mul_mat` calls; ROPE applied as separate `ggml_rope_ext` op fused into KV cache writes (`llama-graph.cpp:2200` "expand k later to enable rope fusion which directly writes into k-v cache") | 4 separate `apply_linear_projection_f32_pooled` (Q, K, V, gate) inside one encoder; per-head Q/K RMS-norm + IMROPE in same encoder; ends with `commit_and_wait` (3 sessions per layer total) |
+| **KV cache layout** | `[n_kv_head, head_dim, n_token]` per stream, written directly by ROPE op | `[n_kv_head, max_seq_len, head_dim]` head-major f32; written via CPU triple-nested loop (`gpu_full_attn.rs:1038-1046`) at prefill |
+| **Attention kernel** | **`kernel_flash_attn_ext`** (single fused kernel — Q@K^T → online softmax → attn@V in one pass; uses simdgroup_matrix MMA on M5; NSG/BQ/BK function-constants tuned per head_dim) | **`mlx_native::ops::sdpa::sdpa`** — older 3-pass tiled kernel (Q@K^T, softmax, attn@V as separate Metal kernels); no online softmax; no simdgroup_matrix MMA in production-active dispatch path |
+| **Prefill: CPU↔GPU round-trips** | Zero (graph kept entirely on GPU) | **3 downloads + 3 uploads + 2 CPU permutes per FA layer × 16 layers = 18 GPU→CPU + 18 CPU→GPU + 32 CPU permute traversals per prefill** |
+| **Tensor-cores enablement** | Yes (Metal 4 simdgroup_matrix in `kernel_flash_attn_ext`) | No (sdpa kernel uses scalar simd_sum reductions, per inspection of `mlx-native/src/shaders/sdpa.metal`) |
+| **Where `flash_attn_prefill` lives in hf2q today** | n/a | Gemma path only — `forward_prefill_batched.rs:1091` (D=256 sliding) and `:1136` (D=512 global). The Qwen3.5 path **does not call this kernel**, even though Qwen3.5 prefill goes through head_dim=128 which is supported by `flash_attn_prefill` (D=128 variant) per Gemma 4's MoE shape. |
+
+### (6) Falsifications
+
+This iter's data falsifies two prior W-5b.8 hypotheses:
+
+1. **W-5b.8 hypothesis "hf2q's full_attn path is not using a flash-attention-style fused kernel for prefill"** — **CONFIRMED**, but the per-FA cost is 77 % the kernel itself, not "per-token serial KV writeback" as the W-5b.8 doc speculated. The CPU triple-nested KV writeback (`fa.sdpa.kv_dl_copy`) is **only 92.6 ms (0.43 % of layer.full_total)** — not a meaningful contributor.
+2. **My own implicit pre-bench hypothesis "the CPU↔GPU sandwich around SDPA is the bottleneck"** — **FALSIFIED.** Total CPU↔GPU plumbing (kv_dl_copy + q_dl_perm_ul + out_dl_perm_ul) sums to **953 ms (4.5 % of layer.full_total)**. Real, but secondary by an order of magnitude to the SDPA kernel itself.
+
+### (7) Recommendation for next iter (W-5b.10)
+
+**Wire `flash_attn_prefill` into the Qwen3.5 FA prefill path.** Concrete plan:
+
+1. Audit `mlx_native::ops::flash_attn_prefill::FlashAttnPrefillParams` to confirm Qwen3.6 head_dim=128 is supported (Gemma 4 uses D=256 sliding + D=512 global; if D=128 isn't yet, port from `flash_attn_prefill_d512.metal` template — known-good codebase per ADR-011 Phase 2 Wave 4 history).
+2. Replace `apply_sdpa_with_kv_cache` prefill else-branch's `sdpa(...)` call (lines 1056-1068 of `gpu_full_attn.rs`) with `dispatch_flash_attn_prefill_bf16_d128_with_blk(...)` analogous to `forward_prefill_batched.rs:1091`.
+3. Eliminate the CPU Q/output permute round-trips in the same patch (use `permute_021_f32` on-GPU instead) — these are conditional on the SDPA kernel's seq-major Q layout that flash-attn-prefill doesn't share.
+4. Validate against the `walkbar-pp4096-prompt.txt` walk-bar (token id parity vs llama-completion) AND against the scalar CPU `full_attn.rs::apply_sdpa_causal` oracle (≤ 1e-3 max abs diff for f32 weights).
+5. Remeasure with HF2Q_PROFILE_W5B8=1 and quantify the kernel-side gap close. **Expected:** per-FA-layer drops from 1 332 ms to ~ 130–200 ms (matching llama's per-layer fair share), closing 17–19 s of the 22 s `layer.full_total` bucket.
+
+This is **not** a representation/quantization iter. The kernel exists and is production-tested via Gemma. The work is plumbing, not invention.
+
+### (8) Honest caveats and methodology limits
+
+- **CPU wall, not GPU wall.** Per memory `project_m5max_no_dispatch_boundary_sampling`, M5 Max only supports stage-boundary GPU counter sampling — per-dispatch GPU timestamps are hardware-impossible. Each `Section::start` boundary measures CPU wall, which inside the SDPA kernel call is dominated by `commit_and_wait` for the dispatch (i.e. real GPU compute + queue submit + CPU wakeup latency). The 16.3 s `fa.sdpa.kernel` figure is the right wall for "how long was the program blocked on this," which is the right gap denominator.
+- **77 % is just under the ≥ 80 % "structural-gap" STOP threshold.** The W-5b.9 worker prompt says: *"if >80 % in a single mlx-native sub-kernel that we already share with llama … the recommendation IS 'the gap is structural, accept or wait for mlx-native upstream change'."* We're at 76.5 %, AND llama uses a different kernel (`kernel_flash_attn_ext` not `sdpa`), so the structural-acceptance exit does NOT apply. The recommended action is to switch to mlx-native's `flash_attn_prefill` kernel, which IS already in mlx-native.
+- **Residual 14.6 % uncategorised.** The 3 103 ms gap between sum-of-sub-buckets and `layer.full_total` is the per-layer `commit_and_wait` overhead at 3 session boundaries (`enc.commit_and_wait()` at lines 1224, 1068, 1273 of `gpu_full_attn.rs`), encoder-build CPU work, and the brief CPU windows between Section guards. None of it touches the top-3 ranking.
+- **Instrumentation overhead.** Each Section guard allocates an `Instant` via `std::env::var()` + rdtsc check (~50 ns). 7 guards × 16 FA layers + existing 13 guards × 48 DN layers = ~736 timestamps per forward. ~37 µs total instrumentation overhead — negligible vs the 49 s prefill.
+- **chat-template seq_len drift +10 tokens** (4106 vs W-5b.8's 4096) and resulting first-decoded-token change ("The" vs ","). NOT introduced by my edits — verified via autoreg-no-chunk control. Most likely from mlx-native HEAD drift `84bf1af` → `5d9bb2e3` (`5d9bb2e: merge(adr015 iter8e): MTLResidencySet auto-register + deferred commit`) altering GGUF metadata read order. Walkbar discipline maintained: 3 W-5b.9 trials are self-consistent (all "The"); same-day llama re-baselined. Worth root-causing in a future iter.
+- **Only one mlx-native HEAD measured** — `5d9bb2e3`. Build was against this SHA at start; HEAD unchanged at finish. No drift during this bench window.
+
+### (9) Inputs / outputs preserved
+
+- Bench prompt: `/tmp/walkbar-pp4096-prompt.txt` (23 038 bytes, SHA `62e66013996f725c794d53fa9136f43c1b9eca0e`)
+- Raw trial logs (incl. `time -l` blocks): `/tmp/w5b9-chunk-T{1,2,3}.log`, `/tmp/w5b9-llama-T{1,2,3}.log`
+- Instrumentation source: extended `src/inference/models/qwen35/wave5b8_profile.rs` (+7 SectionKind variants) + 6 Section::start calls in `src/inference/models/qwen35/gpu_full_attn.rs`
+- Comparison reference: `/opt/llama.cpp/src/llama-graph.cpp:1932-2059` (`build_attn_mha` showing `ggml_flash_attn_ext` dispatch); `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:5755-5760` (function-constant header for `kernel_flash_attn_ext`); `/opt/mlx-native/src/ops/flash_attn_prefill_d512.rs` (already-shipping reference for the wire-up pattern)
+
+### (10) Closure
+
+Wave 5b.9 FA prefill audit: **CLOSED — root cause located.**
+
+The 23 s `layer.full_total` bucket from W-5b.8 decomposes as **77 % `mlx_native::ops::sdpa::sdpa` kernel time** (1 020 ms/layer × 16 layers = 16.3 s), 4.5 % CPU↔GPU plumbing (953 ms total), 5 % linear projections + RMS-norm + IMROPE (`fa.ops1_4` + `fa.ops6_7`), and 14.6 % residual `commit_and_wait` overhead. **The fix is to switch the Qwen3.5 FA prefill kernel from the older 3-pass tiled `sdpa` to mlx-native's already-shipping `flash_attn_prefill` (used by Gemma's batched prefill).** The CPU↔GPU sandwich plumbing should be eliminated as part of the same patch (it exists only because `sdpa` expects seq-major Q while `flash_attn_prefill` expects head-major bf16, which `permute_021_bf16` provides on-GPU at `mlx-native/src/ops/transpose.rs:356`).
+
+ADR-005 AC-tier impact: NONE — perf-bar gates remain informational; this iter is a routing diagnostic that hands W-5b.10 a concrete (kernel exists, used by neighbour path, parity-test pattern documented) action. No correctness regression; no shipping-contract change.
