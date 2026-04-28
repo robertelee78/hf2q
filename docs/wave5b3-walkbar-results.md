@@ -3399,3 +3399,126 @@ The cumulative wall ratio claim of **2.326×** post-W-5b.24 should be adjusted t
 
 Phase B's "before" baseline is **3,265.5 ms** (Phase A median), NOT W-5b.21's 3,316 ms or W-5b.24's claimed 3,229.6 ms. Phase B passes only if the FFN bucket drops ≥ 50 ms below 3,265.5 → must reach ≤ 3,215.5 ms median in same-day cold-SoC bench.
 
+
+## Wave 5b.27 Phase B DenseFfnOutputCache lift — REVERTED (FFN bucket dropped only -11.7 ms vs 50 ms threshold)
+
+**Iter:** 2026-04-28 morning, hf2q HEAD `c73b48a` at end (post-revert) = `ad86d45` (post-Phase-A) bit-identical, mlx-native HEAD `a7d2b95` at start AND end (this iter touches `/opt/hf2q` ONLY).
+
+### Phase B implementation summary
+
+Three commits (later REVERTED):
+- `6f147bc` — `decode_pool::DenseFfnOutputCache` infrastructure (4 slots: Gate, Up, Hidden, SiluParams; with_dense_ffn_output_cache helper; drop_dense_ffn_output_cache lifecycle hook).
+- `5e17e74` — wire-up in `build_dense_ffn_layer_gpu_q_into_pooled`: replaces 4 per-layer `pooled_alloc_buffer` calls with `dense_ffn_get_or_alloc` cache lookups under `HF2Q_FFN_DENSE_LIFT_LEGACY=0` (default NEW); env gate retains LEGACY path.
+- `32567c3` — new parity test `dense_ffn_lift_path_matches_legacy_at_seq128` (3 alternating LEGACY ↔ NEW invocations × 2 = 6 invocations, all bit-identical, max_abs_err=0.00e0 at seq_len=128).
+
+### Build / test gates
+
+| gate | requirement | result | status |
+|---|---|---|---|
+| 0 NEW clippy warnings | 72 (W-5b.25 baseline) | 72 (no NEW) | PASS |
+| qwen35 bin tests | ≥ 295 | 296 (with new parity test) | PASS |
+| `chunk_path_first_token_matches_autoregressive_at_seq128` | PASS | PASS | PASS |
+| `dense_q_arena_reset_chunk_prefill_no_layer_33_error` | PASS | PASS | PASS |
+| `dense_ffn_lift_path_matches_legacy_at_seq128` (new) | PASS bit-exact | PASS (max_abs_err=0.00e0, 6 alternating L↔N invocations) | PASS |
+
+### Phase B A/B bench (3 cold trials × 2 paths × 60s cooldown at PP4106)
+
+Script: `/opt/hf2q/scripts/bench-w5b27-phase-b-lift.sh`. Logs at `/tmp/w5b27/B-{new,legacy}-T*.log`.
+
+#### `dn.outer_ffn_dispatch` (ms)
+
+| Trial | NEW (lifted) | LEGACY (per-layer pool) |
+|---|---:|---:|
+| T1 | 3,246.8 | 3,262.0 |
+| T2 | 3,253.8 | 3,300.3 |
+| T3 | 3,275.4 | 3,311.4 |
+| **median** | **3,253.8** | **3,300.3** |
+| mean | 3,258.7 | 3,291.2 |
+| stdev | 14.9 | 25.9 |
+
+#### Whole-prefill wall (ms)
+
+| Trial | NEW | LEGACY |
+|---|---:|---:|
+| T1 | 15,931 | 15,835 |
+| T2 | 15,771 | 16,065 |
+| T3 | 16,001 | 16,101 |
+| **median** | **15,931** | **16,065** |
+
+#### Llama drift gate
+
+Phase A median 6,461.5 ms × 1.10 = 7,107.7 ms ceiling; Phase B llama T1 = 6,687.0 ms (+3.5% vs Phase A). PASS.
+
+#### Token-id determinism
+
+| path | trials | id 11 |
+|---|---:|---:|
+| NEW | 3 | 3/3 |
+| LEGACY | 3 | 3/3 |
+| **total** | **6** | **6/6** PASS |
+
+### Phase B closure rule check (worker-prompt strict)
+
+The worker-prompt closure rule: "Phase B: FFN bucket drops by ≥50ms from **Phase A's measured baseline** (NOT W-5b.21's 3,316ms — use TODAY's measurement)."
+
+| reference | value | NEW delta | threshold | status |
+|---|---:|---:|---:|---|
+| Phase A baseline (TODAY's median) | 3,265.5 ms | -11.7 ms | -50 ms | **FAIL** (missed by +38.3 ms) |
+| W-5b.21 baseline (historical) | 3,316.0 ms | -62.2 ms | -50 ms | (passes secondary, but spec says use Phase A) |
+| LEGACY same-day A/B | 3,300.3 ms | -46.5 ms | -50 ms | FAIL (missed by +3.5 ms) |
+
+**The lifted DenseFfnOutputCache produces a measurable but small win (-46.5 ms vs same-day LEGACY; -134 ms whole-prefill wall NEW vs LEGACY) — but does NOT clear the worker-prompt's ≥50 ms threshold by either Phase A baseline or same-day A/B.**
+
+### Per-prompt STOP condition: trigger and revert
+
+Worker-prompt rule: "After implementation, FFN bucket does NOT drop ≥50ms from Phase A baseline — STOP, revert, report (don't claim a win that didn't materialize)."
+
+**STOP triggered**. All 3 W-5b.27 Phase B commits reverted:
+
+| original commit | revert commit | content |
+|---|---|---|
+| `6f147bc` (Phase B-1) | `c73b48a` | DenseFfnOutputCache thread-local infrastructure |
+| `5e17e74` (Phase B-2) | `3384fe7` | wire-up in `build_dense_ffn_layer_gpu_q_into_pooled` + `HF2Q_FFN_DENSE_LIFT_LEGACY` env gate |
+| `32567c3` (Phase B-3) | `4f658d7` | new parity test `dense_ffn_lift_path_matches_legacy_at_seq128` |
+
+`git diff ad86d45 HEAD -- src/` = empty — codebase post-revert is bit-identical to post-Phase-A baseline.
+
+### Why the projection missed: retrospective
+
+The W-5b.26 retrospective projected 50-150 ms recovery from 256 per-prefill pool ops × 0.3 ms/lookup amortisation, mirroring W-5b.24's 86 ms claim. Today's data falsifies that:
+
+1. **W-5b.24's win re-measured at -50.5 ms in Phase A**, not -86.4 ms (Phase A retro). The projection inherits W-5b.24's overstated baseline.
+2. **The 4 dense-Q scratches per call are smaller than the 9 MoE-Q scratches W-5b.26 targeted** — `gate/up/hidden` are F32 [seq_len, m] (~285 MB) but the `pooled_alloc_buffer` cost is per-buffer-LOOKUP not per-byte. 4 × 64 = 256 ops × 0.046 ms/op (NEW vs LEGACY same-day delta) = effectively ~46 ms — exactly today's measurement. 0.046 ms/op is **6.5× SMALLER** than the 0.3 ms/op the W-5b.24 result suggested.
+3. **The W-5b.24 -86 ms claim's per-op amortisation was 0.6 ms/op** (86 ms / 144 mm_id ops = 0.597 ms/op for the IdMmScratch lift). But IdMmScratch's `htpe`/`hids` allocation is more expensive than `gate/up/hidden` because IdMmScratch's growth path involves cap-checking + 2-buffer reallocation (vs single-buffer realloc here). The W-5b.24 saving-per-op is structurally larger because each IdMmScratch save eliminates 2 device allocs, whereas a DenseFfnOutputCache save eliminates 1. So the projection's 0.3 ms/op was already an under-correction; the true value is ~0.046 ms/op for dense scratches.
+4. **The MlxBufferPool `pooled_alloc_buffer` for already-warmed bucket sizes is ALREADY very fast**: it's a `Vec::pop()` from the free list + dtype/shape rebinding (~µs). The W-5b.24 win came from eliminating 6 *real device allocs* per FFN call (newBuffer hits Metal); the W-5b.27 lift eliminates 4 *pool free-list pops* per FFN call. Different cost regime.
+
+### W-5b.28 recommendation
+
+Per `feedback_loop_mistakes_catalog`: project pre-coding from a per-op-cost MEASUREMENT, not from a magnitude-projection. Concrete next steps:
+
+1. **Add HF2Q_PROFILE_DECODE-style per-layer `pooled_alloc_buffer` µs instrumentation** to measure the exact per-op cost in production (single thread-local `AtomicU64` accumulator + RAII guard; W-5b.22-pattern). The 0.046 ms/op figure today is inferred from before/after wall-clock, not measured directly.
+2. **Re-rank W-5b.26 audit candidates** with the measured per-op cost as the multiplier. Candidate #4 (lift outputs) was already top-1 by ms-recovery; re-ranking after this iter's data may move other candidates up.
+3. **Consider abandoning per-prefill-cache lifts entirely** for dense-Q FFN: at 0.046 ms/op the entire 256-op pool reuse saves only ~12 ms even at 100% efficiency. The remaining 3,254 ms `dn.outer_ffn_dispatch` is dominated by GPU compute (kernel exec time) which W-5b.23's 710 ms kernel-isolation criterion bench attributes to invocation patterns, NOT device alloc.
+4. **The 11th confirmed M5 Max static-evidence hypothesis falsified** (the 10th was W-5b.26): kernel-side static-evidence audits AND wrapper-side static-evidence audits both fail when the per-op cost is below the bench noise floor. Adding to `project_metal_compiler_auto_optimizes_static_levers`.
+
+### Files touched (revert-net delta)
+
+- `/opt/hf2q/docs/wave5b3-walkbar-results.md` (this section).
+- `/opt/hf2q/docs/ADR-005-inference-server.md` (closure paragraph).
+- `/opt/hf2q/scripts/bench-w5b27-phase-b-lift.sh` (NEW, 84 LOC; preserved as reusable A/B harness for any future dense-Q FFN lift A/B).
+
+The 3 reverts produce zero net code delta across `decode_pool.rs` / `gpu_ffn.rs` vs the post-Phase-A baseline (HEAD `ad86d45` = HEAD `c73b48a`). The Phase A docs commit (`ad86d45`) lands; the Phase B implementation is reverted.
+
+### `HF2Q_FFN_DENSE_LIFT_LEGACY` sunset plan
+
+N/A — gate did not land (the Phase B-2 commit that introduced it was reverted). The `bench-w5b27-phase-b-lift.sh` script is preserved as a reusable harness mirroring the W-5b.24/W-5b.26 bench template.
+
+### mlx-native HEAD start vs end
+
+- Start: `a1d82c5` (W-5b.23 bench commit, at top-of-iter).
+- During iter: HEAD progressed to `a7d2b95` via concurrent ADR-015 iter9b worker (07:39:33 PDT, 07:38:12 commit `bfc12d4` + 07:39:33 merge `a7d2b95`). The iter9b change is `MTLComputePipelineState.label()` calls at pipeline factory only — instrumentation, no per-dispatch CPU work.
+- End: `a7d2b95` — unchanged from mid-iter checkpoint. **This iter touches `/opt/hf2q` ONLY**; the mlx-native HEAD progression is from a parallel session, accepted per worker-prompt's "or current main HEAD" allowance.
+- Phase A bench (07:38) ran at mlx-native HEAD `a1d82c5` (binary built earlier in session); Phase B bench (08:00) ran at mlx-native HEAD `a7d2b95` (binary rebuilt for Phase B-2 wire-up). The instrumentation-only nature of `bfc12d4` (label() at pipeline creation, not per-dispatch) makes the timing comparison apples-to-apples within bench noise.
+
+Wave 5b.27 Phase B DenseFfnOutputCache lift: **REVERTED — implementation correct (parity bit-exact at seq_len=128, 6 alternating LEGACY ↔ NEW invocations max_abs_err=0.00e0, 296/296 qwen35 tests PASS, 0 NEW clippy warnings); production bench FFN bucket dropped only -11.7 ms vs Phase A baseline (3,253.8 ms NEW vs 3,265.5 ms baseline; same-day NEW vs LEGACY -46.5 ms; same-day whole-prefill wall NEW vs LEGACY -134 ms); per worker-prompt STOP condition all 3 Phase B commits reverted to post-Phase-A baseline (HEAD `ad86d45` → HEAD `c73b48a` net-zero code delta in src/); `bench-w5b27-phase-b-lift.sh` preserved as reusable A/B harness; W-5b.28 recommendation: instrument per-op `pooled_alloc_buffer` cost before another per-prefill-cache lift iter (today's data infers 0.046 ms/op vs the W-5b.24-derived 0.3 ms/op projection — 6.5× over-correction); consider abandoning per-prefill-cache lifts entirely for dense-Q (256 ops × 0.046 ms/op = 12 ms ceiling at 100% efficiency); 11th M5 Max static-evidence hypothesis falsified. mlx-native HEAD `a1d82c5` → `a7d2b95` via concurrent iter9b session, this iter touched no mlx-native source.**
+
