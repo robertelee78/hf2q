@@ -4992,6 +4992,149 @@ mod tests {
         );
     }
 
+    /// ADR-014 P7 iter-40 — dual vision-predicate path boundary.
+    /// Documents and pins the structural finding from iter-39 debugging:
+    /// hf2q has TWO vision predicates with different scope, driving
+    /// F16-passthrough through TWO different paths in the streaming
+    /// pipeline.  The two paths produce *different* `ggml_type` tags
+    /// for the same content (preserved-passthrough vs f16-passthrough)
+    /// — this is the live contract surface.
+    ///
+    /// Predicate A — narrow: `TensorRef::is_vision_tensor()` matches
+    /// only `vision_tower` and `embed_vision`.  Drives streaming.rs's
+    /// `preserve = … || tensor.is_vision_tensor()` so the codec
+    /// quantizer's `config.preserve` short-circuit fires, returning
+    /// `method="passthrough"` and `ggml_type=None`.
+    ///
+    /// Predicate B — broad: `is_vision_tensor_pattern()` in
+    /// `layer_mix` matches `model.visual.`, `vision_tower.`,
+    /// `vision_model.`, `vit.`, `visual.`, `.visual.`.  Used by the
+    /// codec quantizer + DwqK gates downstream of streaming, hits when
+    /// streaming's preserve did not.  Returns `method="f16"` and
+    /// `ggml_type=Some("F16")` via `f16_passthrough`.
+    ///
+    /// Predicate B is a strict superset of A — so every vision tensor
+    /// hits ONE of the two paths.  A future merge that drops either
+    /// predicate, OR a broadening of A to match all of B's patterns,
+    /// would change at least one tensor's emit shape and trip this
+    /// test.
+    ///
+    /// Test fixture: two tensors at row_len=256 (no row-misalignment):
+    ///   - `vision_tower.encoder.layers.5.attn.q_proj.weight`
+    ///     → predicate A matches → preserve=true upstream → ggml_type=None
+    ///   - `model.visual.layers.5.attn.q_proj.weight`
+    ///     → predicate A NO match, predicate B matches → ggml_type=Some("F16")
+    ///
+    /// Both produce 512-byte output (256 F16 elements × 2 bytes/element)
+    /// with byte-equivalent data — the contract for users is "vision
+    /// tensors are F16-preserved", regardless of which path got them
+    /// there.  Asserts byte-equality across paths to lock that.
+    #[test]
+    fn vision_tensor_dual_predicate_path_boundary() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::k_quant_codec::KQuantTarget;
+        use crate::quantize::k_quant_codec_quantizer::KQuantCodecQuantizer;
+
+        const ROW_LEN: usize = 256;
+
+        // Path A (narrow): caught by streaming.rs's preserve check.
+        let name_a = "vision_tower.encoder.layers.5.attn.q_proj.weight";
+        // Path B (broad-only): caught by codec's gate.
+        let name_b = "model.visual.layers.5.attn.q_proj.weight";
+
+        // Pre-conditions document the predicate split:
+        // both must match the broad codec predicate (so vision policy
+        // fires *somewhere*); only A matches the narrow upstream
+        // predicate.  These asserts will trip if either predicate
+        // drifts and the dual-path structure collapses.
+        assert!(
+            crate::quantize::layer_mix::is_vision_tensor_pattern(name_a),
+            "name_a must match broad predicate"
+        );
+        assert!(
+            crate::quantize::layer_mix::is_vision_tensor_pattern(name_b),
+            "name_b must match broad predicate"
+        );
+
+        let payload: Vec<u8> = (0..ROW_LEN)
+            .map(|i| (i as f32 / ROW_LEN as f32) * 2.0 - 1.0)
+            .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+
+        let make_lazy_map = || -> LazyTensorMap {
+            let mut m = LazyTensorMap::new();
+            for n in [name_a, name_b] {
+                m.insert(LazyTensor::from_bytes(
+                    LazyMeta::new(n.to_string(), vec![1, ROW_LEN], DType::F16),
+                    payload.clone(),
+                ));
+            }
+            m
+        };
+
+        // Use any K-quant target — the F16 passthrough fires before
+        // codec dispatch in both paths.
+        let q = KQuantCodecQuantizer::new("Q4_K", KQuantTarget::Q4K, CalibrationData::None);
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+        let out = quantize_streaming(make_lazy_map(), &metadata, &q, 0, 0, &progress, false)
+            .expect("dual-predicate streaming");
+
+        let t_a = out.tensors.get(name_a).expect("name_a missing");
+        let t_b = out.tensors.get(name_b).expect("name_b missing");
+
+        // Path A: streaming preserve → method=passthrough, ggml_type=None.
+        assert_eq!(
+            t_a.quant_info.method, "passthrough",
+            "name_a path A: method must be 'passthrough' (streaming preserve)"
+        );
+        assert_eq!(
+            t_a.quant_info.ggml_type, None,
+            "name_a path A: ggml_type must be None"
+        );
+        assert!(
+            t_a.quant_info.preserved,
+            "name_a path A: preserved flag must be true"
+        );
+
+        // Path B: codec gate → method=f16, ggml_type=Some("F16").
+        assert_eq!(
+            t_b.quant_info.method, "f16",
+            "name_b path B: method must be 'f16' (codec gate)"
+        );
+        assert_eq!(
+            t_b.quant_info.ggml_type.as_deref(),
+            Some("F16"),
+            "name_b path B: ggml_type must be Some(\"F16\")"
+        );
+        assert!(
+            t_b.quant_info.preserved,
+            "name_b path B: preserved flag must be true"
+        );
+
+        // Cross-path contract: byte-data equivalent (both paths emit
+        // F16-cast of the original payload).
+        assert_eq!(
+            t_a.data.len(),
+            ROW_LEN * 2,
+            "name_a F16 byte budget"
+        );
+        assert_eq!(
+            t_b.data.len(),
+            ROW_LEN * 2,
+            "name_b F16 byte budget"
+        );
+        assert_eq!(
+            t_a.data, t_b.data,
+            "vision-tensor contract: both predicate paths must produce \
+             byte-equivalent F16 output for the same input — the user-\
+             facing contract is 'vision tensors are F16-preserved' \
+             regardless of which gate fired"
+        );
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
