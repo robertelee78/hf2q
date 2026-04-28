@@ -225,6 +225,60 @@ pub enum SectionKind {
     /// DN layers). Should land within rounding-error of the
     /// `LayerLinearTotal` − DN-attn-buckets residual.
     DnOuterChoreographyTotal,
+    // -- Wave 5b.26 FFN sub-buckets (additive; gated on a SEPARATE
+    // `HF2Q_PROFILE_W5B26=1` env so default-off is preserved even when
+    // `HF2Q_PROFILE_W5B8=1` and/or `HF2Q_PROFILE_W5B22=1` are set). --
+    //
+    // Mission: attribute the `DnOuterFfnDispatch` 3,229 ms post-W-5b.24
+    // baseline.  Carves `build_moe_ffn_layer_gpu_q_into`
+    // (`gpu_ffn.rs:1366-1626`) into the 11 dispatch sub-phases the audit
+    // doc-comment lays out (`gpu_ffn.rs:1395-1407` Phase A→F sequence).
+    // Sum of these sub-buckets should land within ±5 % of the parent
+    // `DnOuterFfnDispatch` bucket; the residual fingers any
+    // un-instrumented overhead (e.g. `pooled_alloc_buffer` lookups, 2
+    // `silu_params_buf.as_mut_slice` writes, 6 `enc.memory_barrier()`
+    // calls).
+    /// Phase A — `proj_pooled(router)` (`gpu_ffn.rs:1471`).  One
+    /// `dense_matmul_bf16_f32_tensor` dispatch per MoE layer (Phase A,
+    /// concurrent with the 3 shared-expert projections below).
+    DnFfnProjRouter,
+    /// Phase A — `proj_pooled(shared_gate_inp)` (`gpu_ffn.rs:1472`).
+    /// Single-output (out_features=1) projection that drives the shared
+    /// expert sigmoid gate.
+    DnFfnProjShLogit,
+    /// Phase A — `proj_pooled(shared_gate)` (`gpu_ffn.rs:1473`).  Shared
+    /// expert gate projection feeding the SwiGLU activation in Phase B.
+    DnFfnProjAS,
+    /// Phase A — `proj_pooled(shared_up)` (`gpu_ffn.rs:1474`).  Shared
+    /// expert up projection feeding the SwiGLU activation in Phase B.
+    DnFfnProjBS,
+    /// Phase B — `dispatch_moe_softmax_topk` (`gpu_ffn.rs:1480-1484`).
+    /// GPU softmax over router logits + top-k selection writing
+    /// `(ids_buf, weights_buf)`.
+    DnFfnSoftmaxTopk,
+    /// Phase C — gate `quantized_matmul_id_ggml_pooled` for routed
+    /// experts (`gpu_ffn.rs:1528-1536`).  Sparse mm_id matmul writing
+    /// `gate_all_buf` over `ids_buf`.
+    DnFfnGateMmId,
+    /// Phase C — up `quantized_matmul_id_ggml_pooled` for routed
+    /// experts (`gpu_ffn.rs:1537-1545`).  Concurrent with `DnFfnGateMmId`
+    /// inside Phase C; same params except `expert_stride`.
+    DnFfnUpMmId,
+    /// Phase D — `dispatch_silu_mul(gate_all, up_all → h_all)`
+    /// (`gpu_ffn.rs:1567-1570`).  SwiGLU activation across all routed
+    /// expert tokens.
+    DnFfnSiluMulPhase,
+    /// Phase C — `proj_pooled(shared_down(h_s))` (`gpu_ffn.rs:1548`).
+    /// Shared expert down projection.  Concurrent with gate/up mm_id
+    /// inside Phase C.
+    DnFfnSharedDown,
+    /// Phase E — down `quantized_matmul_id_ggml_pooled` for routed
+    /// experts (`gpu_ffn.rs:1592-1600`).  Sparse mm_id writing `y_all_buf`.
+    DnFfnDownMmId,
+    /// Phase F — `dispatch_moe_weighted_reduce`
+    /// (`gpu_ffn.rs:1606-1618`).  Fused reduce-and-add: top-k weighted
+    /// sum + sigmoid(sh_logit) × y_s + optional residual.
+    DnFfnWeightedReduce,
 }
 
 impl SectionKind {
@@ -262,9 +316,20 @@ impl SectionKind {
             SectionKind::DnOuterFfnDispatch => "dn.outer_ffn_dispatch",
             SectionKind::DnOuterPostFfnResidual => "dn.outer_post_ffn_residual",
             SectionKind::DnOuterChoreographyTotal => "dn.outer_choreography_total",
+            SectionKind::DnFfnProjRouter => "dn.ffn.proj_router",
+            SectionKind::DnFfnProjShLogit => "dn.ffn.proj_sh_logit",
+            SectionKind::DnFfnProjAS => "dn.ffn.proj_a_s",
+            SectionKind::DnFfnProjBS => "dn.ffn.proj_b_s",
+            SectionKind::DnFfnSoftmaxTopk => "dn.ffn.softmax_topk",
+            SectionKind::DnFfnGateMmId => "dn.ffn.gate_mm_id",
+            SectionKind::DnFfnUpMmId => "dn.ffn.up_mm_id",
+            SectionKind::DnFfnSiluMulPhase => "dn.ffn.silu_mul_phase",
+            SectionKind::DnFfnSharedDown => "dn.ffn.shared_down",
+            SectionKind::DnFfnDownMmId => "dn.ffn.down_mm_id",
+            SectionKind::DnFfnWeightedReduce => "dn.ffn.weighted_reduce",
         }
     }
-    const COUNT: usize = 29;
+    const COUNT: usize = 40;
 }
 
 #[derive(Default, Clone)]
@@ -358,6 +423,18 @@ pub fn w5b22_enabled() -> bool {
     std::env::var("HF2Q_PROFILE_W5B22").is_ok()
 }
 
+/// True when `HF2Q_PROFILE_W5B26=1` is set in the environment.
+///
+/// Separate gate from W-5b.8/W-5b.17/W-5b.22 so the 11 `DnFfn*`
+/// sub-buckets (audit of the `DnOuterFfnDispatch` 3,229 ms post-W-5b.24
+/// baseline) only fire during W-5b.26 audits.  Sum of the 11 sub-buckets
+/// should land within ±5 % of `DnOuterFfnDispatch` — see the
+/// W-5b.26 SectionKind comment block above for the bucket breakdown.
+#[inline]
+pub fn w5b26_enabled() -> bool {
+    std::env::var("HF2Q_PROFILE_W5B26").is_ok()
+}
+
 /// RAII guard. `Section::start(kind)` records the elapsed wall-clock
 /// into the thread-local accumulator on drop; no-ops when the env gate
 /// is off (the constructor still allocates an Instant, but that's a
@@ -387,6 +464,14 @@ impl Section {
         let t0 = if w5b22_enabled() { Some(Instant::now()) } else { None };
         Self { kind, t0 }
     }
+
+    /// Variant gated on `HF2Q_PROFILE_W5B26=1`. Use for the 11 W-5b.26
+    /// `DnFfn*` sub-buckets so they default off independently of
+    /// W-5b.8, W-5b.17, and W-5b.22.
+    pub fn start_w5b26(kind: SectionKind) -> Self {
+        let t0 = if w5b26_enabled() { Some(Instant::now()) } else { None };
+        Self { kind, t0 }
+    }
 }
 
 impl Drop for Section {
@@ -404,7 +489,7 @@ impl Drop for Section {
 /// w5b17_enabled()` so W-5b.17 audits surface their sub-buckets even
 /// when W-5b.8 is off.
 pub fn w5b8_print_and_reset(label: &str) {
-    if !w5b8_enabled() && !w5b17_enabled() && !w5b22_enabled() {
+    if !w5b8_enabled() && !w5b17_enabled() && !w5b22_enabled() && !w5b26_enabled() {
         return;
     }
     W5B8.with(|cell| {
@@ -452,6 +537,19 @@ pub fn w5b8_print_and_reset(label: &str) {
             SectionKind::DnOuterFfnDispatch,
             SectionKind::DnOuterPostFfnResidual,
             SectionKind::DnOuterChoreographyTotal,
+            // Wave 5b.26 FFN sub-buckets (11 phases inside
+            // `build_moe_ffn_layer_gpu_q_into`):
+            SectionKind::DnFfnProjRouter,
+            SectionKind::DnFfnProjShLogit,
+            SectionKind::DnFfnProjAS,
+            SectionKind::DnFfnProjBS,
+            SectionKind::DnFfnSoftmaxTopk,
+            SectionKind::DnFfnGateMmId,
+            SectionKind::DnFfnUpMmId,
+            SectionKind::DnFfnSiluMulPhase,
+            SectionKind::DnFfnSharedDown,
+            SectionKind::DnFfnDownMmId,
+            SectionKind::DnFfnWeightedReduce,
         ];
         for k in kinds {
             let acc = &state.accs[k.idx()];
