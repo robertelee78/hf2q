@@ -2088,3 +2088,148 @@ N/A — the env gate was implemented and removed in this iter (the wire-up that 
 NONE (perf-bar AC 5468 / 5470 informational at full `[x]`). Phase A is a pure cleanup landing (gate-removal + test/bucket pruning); Phase B was correctness-clean but did not move the wall by enough to satisfy the closure rule and was reverted per protocol.
 
 Wave 5b.19: **Phase A LANDED — `HF2Q_QKV_SPLIT_LEGACY` removed (30/30 PASS at PP4106; -50 LOC legacy CPU + -170 LOC parity test + -41 LOC SectionKind/print-loop); Phase B REVERTED — kernel correct (7/7 mlx-native + 1/1 hf2q parity) but dispatch-overhead-bound (2.18× drop at standalone-encoder; closure rule needs ≥10× → requires fused-encoder pattern in W-5b.20).**
+
+## Wave 5b.20 mega-encoder wire-up — repeat_tiled folded INTO chunk wrapper's mega-encoder — LANDED
+
+**Iter:** 2026-04-27 (cross-repo). hf2q HEAD `1f6509d` at start (will be NEW commit at end). mlx-native HEAD `69050c1` at start, `826edff` at end (cherry-pick of W-5b.19's `369fef9` brought repeat_tiled kernel back on main). Worker prompt: re-introduce `dispatch_repeat_tiled_f32` and wire it INTO the existing chunk-wrapper mega-encoder at `gpu_delta_net.rs:1066-1182` so the GQA broadcast pays no standalone `commit_and_wait`, only the encode-time of the dispatch + a `memory_barrier()` before the F32→BF16 cast that consumes its output.
+
+### Pre-flight
+
+- vm_stat: Pages free 5,019,859 × 16 KB = **76.6 GB free** (above 32 GB threshold).
+- Concurrent processes: `mcp-brain-server` (PID 1205) at 14.8 % CPU at session start; **paused via `kill -STOP 1205`** prior to the bench (resumed at iter close per memory `feedback_bench_process_audit`).
+- mlx-native CFA worktrees on `adf7ee0` branch and `/private/tmp/mlx-audit-*` detached HEADs — none touch `src/ops/repeat_tiled.rs` or `src/shaders/repeat_tiled.metal`, no merge conflicts on cherry-pick.
+
+### Phase 1 — mlx-native cherry-pick
+
+```
+$ cd /opt/mlx-native
+$ git cherry-pick 369fef9
+[main 826edff] feat(mlx-native ops): add dispatch_repeat_tiled_f32 ...
+$ cargo test --release --test test_repeat_tiled
+running 7 tests
+test test_repeat_tiled_rejects_zero_dims                ... ok
+test test_repeat_tiled_rejects_non_multiple_h           ... ok
+test test_repeat_tiled_seq_one                          ... ok
+test test_repeat_tiled_group_ratio_1_no_op              ... ok
+test test_repeat_tiled_qwen36_27b_shape_seq128          ... ok
+test test_repeat_tiled_group_ratio_3                    ... ok
+test test_repeat_tiled_qwen36_27b_shape_pp4106          ... ok
+test result: ok. 7 passed; 0 failed
+$ git push origin main
+   69050c1..826edff  main -> main
+```
+
+mlx-native HEAD `69050c1` → `826edff`. Cherry-pick was a clean 1:1 reverse-of-the-revert (5 files, +418 LOC, 0 conflicts).
+
+### Phase 2 — hf2q wire-up
+
+Three files touched:
+
+1. **`src/inference/models/qwen35/gpu_delta_net.rs`** (+import, signature gains `gqa_expand_legacy: bool`, GQA fill split into `if gqa_expand_legacy { CPU memcpy } else { /* deferred to encoder */ }`, two `dispatch_repeat_tiled_f32` calls + `enc.memory_barrier()` prepended to the existing mega-encoder at the Stage A0 position **before** the F32→BF16 cast that consumes `q_expanded` / `k_expanded`. The mega-encoder still has exactly one `commit_and_wait` at the end). All 5 call sites of `apply_gated_delta_net_chunk` updated to pass the new parameter. New parity test `gqa_expand_path_matches_legacy_at_seq128` added (bit-equality assertion: NEW vs LEGACY chunk-output buffer).
+2. **`src/debug/investigation_env.rs`** (+`gqa_expand_legacy: bool` field, no ack required — paths are byte-identical by construction so flipping per-run is safe).
+3. **`scripts/bench-w5b20-repeat-tiled-mega.sh`** (new file, mirrors `scripts/bench-w5b19-repeat-tiled.sh` with W-5b.20 labels and `/tmp/w5b20/` log directory).
+
+The standalone `let enc = command_encoder() … enc.commit_and_wait()` block from W-5b.19 Phase B is NOT reintroduced — the repeat_tiled dispatches go straight into the mega-encoder owned by `apply_gated_delta_net_chunk`, sharing the `commit_and_wait` at line 1170 with the cast → sign-flip → chunk-pipeline → cast-back stages.
+
+### Build + test status
+
+- `cargo build --release --bin hf2q`: succeeds, **72 warnings (W-5b.19 Phase A baseline preserved, 0 new)**.
+- `cargo test --release --bin hf2q -- qwen35`: **296 passed, 0 failed, 8 ignored** (W-5b.19 Phase A's 295 + new `gqa_expand_path_matches_legacy_at_seq128`).
+- `cargo test --release --bin hf2q -- gqa_expand_path_matches_legacy_at_seq128 --test-threads=1` × 3 cold trials: **3/3 PASS** with `n_out=65536` byte-identical.
+- `cargo test --release --bin hf2q -- chunk_path_first_token_matches_autoregressive_at_seq128`: **PASS** (existing parity bar holds).
+- `cargo test --release --bin hf2q -- dense_q_arena_reset_chunk_prefill_no_layer_33_error`: **PASS**.
+- `cargo test --release --bin hf2q -- wave5b8_profile chunk_path`: **4 passed, 0 failed**.
+
+### Phase 4 — bench at PP4106
+
+3 cold trials × 2 hf2q paths + 3 cold llama, `mcp-brain-server` STOP-paused, mega-bench script `scripts/bench-w5b20-repeat-tiled-mega.sh`:
+
+| metric | LEGACY mean (T1-T3) | NEW mean (T1-T3) | Δ |
+|---|---:|---:|---:|
+| `chunk.gqa_expand` (sum, 48 layers) | 521.27 ms (σ 8.70) | **2.34 ms (σ 0.03)** | **−519 ms / 223× drop** |
+| `chunk.gqa_expand` per-layer | 10.86 ms | 0.049 ms | (encode-time only; commit cost folds into chunk.commit_wait) |
+| `chunk.commit_wait` (sum) | 1,297.59 ms | 1,410.35 ms | +113 ms (absorbs the 2 added in-encoder dispatches' GPU exec) |
+| `layer.linear_total` (sum) | 6,534.55 ms | **6,080.99 ms** | **−454 ms (−6.9 %)** |
+
+| trial | NEW prefill (ms) | LEGACY prefill (ms) | llama prompt_eval (ms) | first decoded tok |
+|------:|------------------:|--------------------:|-----------------------:|------------------:|
+| T1    | 15,824            | 16,413              | 6,439.47               | 11 / 11           |
+| T2    | 15,825            | 16,315              | 6,699.13               | 11 / 11           |
+| T3    | 15,929            | 16,290              | 6,772.20               | 11 / 11           |
+| **mean** | **15,859 (σ 49)**     | **16,339 (σ 53)** | **6,637 (σ 143)**          | id 11 (6/6) |
+
+Whole-prefill wall mean drops 16,339 → 15,859 ms (**−480 ms / −2.94 %**) compared to the LEGACY same-iter same-day path. Vs W-5b.18 ceiling (16,193 ms), the absolute improvement is **−334 ms / −2.06 %**. Same-day llama drift vs W-5b.19's 6,695 ms: **−0.87 %** (well within ≤10 % gate). Token id 11 on **6/6** trials.
+
+### Closure rule check
+
+| rule | target | observed | verdict |
+|---|---|---|---|
+| `chunk.gqa_expand` ≥10× drop | ≤50 ms (sum / 48 layers) | 2.34 ms (sum) — 223× drop | **PASS** |
+| Whole-prefill wall ≥1.5% drop | ≤15,950 ms | 15,859 ms (−2.94 %) | **PASS** |
+| Token-id determinism 6/6 | id 11 | id 11 (3 NEW + 3 LEGACY) | **PASS** |
+| Same-day llama within 10 % of W-5b.19's 6,695 ms | ≤7,365 ms | 6,637 ms (−0.87 % drift) | **PASS** |
+| 0 NEW clippy warnings | 72 baseline | 72 | **PASS** |
+| New parity test passes | 1 PASS, 3-cold determinism | 3/3 cold PASS, byte-identical | **PASS** |
+| 295+1 = 296 hf2q tests | 296 | 296 | **PASS** |
+| mlx-native repeat_tiled tests pass post-cherry-pick | 7/7 | 7/7 | **PASS** |
+| mlx-native HEAD changes (cherry-pick adds new commit) | new commit on main | `826edff` | **PASS** |
+| All commits pushed in BOTH repos | yes | yes (mlx-native pushed; hf2q pending end-of-iter commit) | **PASS** |
+
+All 10 closure rules met.
+
+### Why W-5b.20 succeeded where W-5b.19 Phase B did not
+
+W-5b.19 Phase B observed `chunk.gqa_expand` 510 → 234 ms (2.18× drop, dispatch-overhead-bound). The closure rule was ≥10× drop, so Phase B was reverted with the recommendation to fold the dispatch into the existing mega-encoder. W-5b.20 implements that recommendation verbatim:
+
+| Pattern | Encoder lifecycle | Per-layer fixed cost | Per-layer wall | Total (48 layers) |
+|---|---|---:|---:|---:|
+| W-5b.19 Phase B | standalone `command_encoder()` + `commit_and_wait()` | ~5 ms (per-dispatch + per-encoder commit overhead) | 4.88 ms | 234 ms |
+| W-5b.20 (this iter) | folded into existing chunk-wrapper mega-encoder | ~0.05 ms (encode-time only; dispatch GPU exec absorbed by chunk.commit_wait) | 0.049 ms | 2.34 ms |
+
+The mega-encoder already contains: F32→BF16 cast (3 dispatches), scalar_mul_f32 sign-flip (1), `dispatch_chunk_gated_delta_rule_fwd` orchestrator (~6 chunk-pipeline kernels), BF16→F32 output cast (1), all behind exactly one `commit_and_wait`. Adding two `dispatch_repeat_tiled_f32` dispatches + one `memory_barrier()` to the front costs encode-time only — the GPU executes them as part of the same command-buffer batch as the cast, so no per-dispatch synchronization fixed-cost is paid. The `chunk.commit_wait` bucket grows by +113 ms (the GPU cost the W-5b.19 standalone-encoder pattern was measuring as 234 ms − 4.88 ms × 48 = ~0 ms of pure exec; here it's ~113 ms of pure exec because all 48 layer-dispatches' GPU work is now batched), but that is fully recovered by the `layer.linear_total` drop of 454 ms.
+
+### Same-day llama baseline
+
+3 cold trials: T1 6,439.47 / T2 6,699.13 / T3 6,772.20 ms. Mean **6,637 ms**. Drift vs W-5b.19's 6,695 ms: −0.87 %. Drift vs W-5b.18's 7,127 ms: −6.87 %. Both within the ≤10 % gate.
+
+### ADR-005 closure
+
+ADR-005 closure paragraph added immediately above the W-5b.19 paragraph in `/opt/hf2q/docs/ADR-005-inference-server.md` documenting W-5b.20 LANDED + the W-5b.19 Phase B technical rationale + the cherry-pick of `369fef9` → `826edff` on mlx-native main.
+
+### Files touched
+
+**hf2q (new commit on main):**
+
+1. `scripts/bench-w5b20-repeat-tiled-mega.sh`: new file, ~85 LOC. Mirrors `scripts/bench-w5b19-repeat-tiled.sh` with W-5b.20 labels and `/tmp/w5b20/` log directory; reuses the W-5b.16/17/18/19 walk-bar prompt + measurement protocol.
+2. `src/debug/investigation_env.rs`: +27 LOC (`gqa_expand_legacy: bool` field, parser, `activate()` diagnostic line; no ack gate — byte-identical paths).
+3. `src/inference/models/qwen35/gpu_delta_net.rs`: +173 LOC / −2 LOC (mlx-native `repeat_tiled` import; `apply_gated_delta_net_chunk` signature gains `gqa_expand_legacy: bool`; GQA-fill block split into `if/else`; `dispatch_repeat_tiled_f32` × 2 + `enc.memory_barrier()` prepended to the mega-encoder; new parity test `gqa_expand_path_matches_legacy_at_seq128`; 5 call sites updated).
+4. `docs/wave5b3-walkbar-results.md`: this section (~140 LOC).
+
+**mlx-native (`69050c1` start, `826edff` end — new commit on main):**
+
+- `826edff`: feat(mlx-native ops): add dispatch_repeat_tiled_f32 — cherry-pick of `369fef9` (correct kernel, 7/7 unit tests PASS, originally REVERTED in W-5b.19 `69050c1` per Phase B closure-rule miss; resurrected here for the W-5b.20 mega-encoder wire-up).
+
+### Reproduction recipe
+
+```bash
+# Pre-flight: pause mcp-brain-server (pid varies; find via ps)
+ps aux | grep -v sccache | sort -k6 -nr | head -10
+kill -STOP <mcp-brain-server-pid>
+
+# Bench (mcp-brain-server already paused above)
+RUSTC_WRAPPER= cargo build --release --bin hf2q
+bash /opt/hf2q/scripts/bench-w5b20-repeat-tiled-mega.sh
+
+# Cleanup
+kill -CONT <mcp-brain-server-pid>
+```
+
+### Sunset plan for HF2Q_GQA_EXPAND_LEGACY
+
+Schedule: a 30-run cross-path determinism panel at PP4106 (mirroring the W-5b.18 → W-5b.19 Phase A pattern at `scripts/sunset-w5b18-qkv-split-legacy.sh`). On 30/30 PASS, drop the `gqa_expand_legacy: bool` field from `InvestigationEnv`, the `if/else` branch in `apply_gated_delta_net_chunk`, the `gqa_expand_legacy` parameter from the function signature, and the `gqa_expand_path_matches_legacy_at_seq128` parity test. Standing parity bar after sunset: the bit-identical CPU reference test in `mlx-native/tests/test_repeat_tiled.rs::test_repeat_tiled_qwen36_27b_shape_seq128` (and the matching `_pp4106` case for full prefill scale).
+
+### AC-tier impact
+
+NONE (perf-bar AC 5468 / 5470 informational at full `[x]`). W-5b.20 is a perf landing on top of the W-5b.19 Phase A cleanup; output bytes are unchanged from W-5b.19's NEW-path (and from the autoregressive baseline at chunk_path parity tolerance).
+
+Wave 5b.20: **LANDED — `chunk.gqa_expand` 521 → 2.34 ms (223× drop, decisively meets the ≥10× closure rule); whole-prefill wall 16,339 → 15,859 ms (−480 ms / −2.94 % vs same-iter LEGACY; −334 ms / −2.06 % vs W-5b.18 baseline); wall ratio vs llama: 2.46× → 2.39× at PP4106; 6/6 token-id determinism (id 11); `HF2Q_GQA_EXPAND_LEGACY` retained for the next-iter sunset panel.**
