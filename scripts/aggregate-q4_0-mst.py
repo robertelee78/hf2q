@@ -429,6 +429,314 @@ def shader_list_summary(rows: List[dict]) -> dict:
 
 
 # --------------------------------------------------------------------- #
+# iter12: Per-encoder attribution                                       #
+# --------------------------------------------------------------------- #
+#
+# Why this exists:
+#   iter11 produced hf2q per-layer comparison via debug-group bucketing
+#   on metal-application-encoders-list, but llama side was unattributed
+#   (1 trace only, plus llama.cpp does not pushDebugGroup so no per-layer
+#   debug-group labels are available). iter12 adds a CLI-only per-encoder
+#   attribution path that works for BOTH binaries:
+#
+#     1. Read metal-application-encoders-list rows.
+#     2. Filter to event-type="Encoding" and process matching the binary.
+#     3. Bucket by (cmdbuffer-label, encoder-label) — both are short generic
+#        names like "Command Buffer 0" / "Compute Command 0" / "Blit Command 0"
+#        because neither llama.cpp nor mlx-native sets MTLCommandBuffer.label
+#        / MTLComputeCommandEncoder.label or pushes debug groups.
+#     4. The encoders-list duration is the encoder LIFETIME (host-side
+#        encoding wall-clock), NOT GPU execution time. For GPU time, JOIN
+#        encoders-list rows to metal-gpu-execution-points by encoder-id,
+#        which exposes per-encoder GPU durations after we re-pair fn=1/2.
+#     5. Sum per-bucket GPU µs/token; report side-by-side hf2q vs llama
+#        with Δµs/tok and Δ%.
+#
+# Granularity caveat: "encoder bucket" here is COARSER than per-kernel-name
+# attribution. On a typical decode token both hf2q and llama emit a single
+# Compute encoder containing many dispatches, so per-encoder attribution
+# nets out to roughly per-CB attribution. This is still useful for iter12
+# because it answers the question "is the gap in compute encoders or in
+# blit/setup encoders?" — which is a structurally different question from
+# the per-dispatch (per-kernel) bucketing that BUCKETS handles upstream.
+# --------------------------------------------------------------------- #
+
+
+def parse_encoders_list_with_ids(xml_text: str, target_process_prefix: str = "") -> List[dict]:
+    """Like parse_encoders_list but also captures cmdbuffer-id + encoder-id.
+
+    Filters by process when target_process_prefix is non-empty so that
+    parallel-process compositor frames (cmux/Safari/etc. that share the
+    Metal trace) don't pollute the per-binary count.
+
+    The xctrace XML uses NESTED id/ref dictionaries: e.g. col 2 (thread)
+    contains a nested <process id=5 fmt="llama-bench (8455)">, and col 3
+    (process) is just <process ref=5/>.  resolve() only handles direct
+    id/ref so we need a pre-pass that walks all sub-elements of each row
+    to register their fmt values into the id table.
+
+    Schema columns (verified 2026-04-28 against iter11 llama trace):
+      0: start-time (ns)
+      1: duration (ns)
+      2: thread (nested <tid> + <process id=N fmt="...">)
+      3: process (ref to nested process id from col 2)
+      4: gpu (metal-device-name)
+      5: frame-number
+      6: cmdbuffer-label
+      7: cmdbuffer-label-indexed
+      8: encoder-label
+      9: encoder-label-indexed
+     10: event-type
+     11: cmdbuffer-id
+     12: encoder-id
+    """
+    root = ET.fromstring(xml_text)
+    rows = []
+    table: Dict[str, str] = {}
+
+    def _register_subtree(elem):
+        """Walk elem and all descendants; populate id->fmt table."""
+        rid = elem.get("id")
+        if rid is not None:
+            fmt = elem.get("fmt")
+            if fmt is not None:
+                table[rid] = fmt
+            else:
+                t = (elem.text or "").strip()
+                if t:
+                    table[rid] = t
+        for child in elem:
+            _register_subtree(child)
+
+    for row in root.iter("row"):
+        # Pre-pass: register all id/fmt pairs for this row's subtree.
+        _register_subtree(row)
+
+        children = list(row)
+        if len(children) < 13:
+            continue
+
+        t_text = (children[0].text or "").strip()
+        try:
+            t_ns = int(t_text) if t_text else int(resolve(children[0], table))
+        except ValueError:
+            continue
+
+        d_text = (children[1].text or "").strip()
+        try:
+            dur_ns = int(d_text) if d_text else int(resolve(children[1], table))
+        except ValueError:
+            continue
+
+        # Resolve process via the registered table (col 3 is a ref to a
+        # nested id under col 2's thread element).
+        proc_elem = children[3]
+        proc_str = resolve(proc_elem, table) or ""
+        # If still empty, pull directly from ref->table.
+        if not proc_str:
+            ref = proc_elem.get("ref")
+            if ref is not None:
+                proc_str = table.get(ref, "") or ""
+
+        encoder_label = resolve(children[8], table)
+        cmdbuffer_label = resolve(children[6], table)
+        event_type = resolve(children[10], table)
+
+        cmdbuf_id = None
+        enc_id = None
+        if len(children) > 11:
+            cmdbuf_id = resolve(children[11], table)
+        if len(children) > 12:
+            enc_id = resolve(children[12], table)
+
+        if target_process_prefix and not proc_str.startswith(target_process_prefix):
+            continue
+
+        rows.append(dict(
+            start_ns=t_ns,
+            duration_ns=dur_ns,
+            encoder_label=encoder_label,
+            cmdbuffer_label=cmdbuffer_label,
+            event_type=event_type,
+            cmdbuffer_id=cmdbuf_id,
+            encoder_id=enc_id,
+            process=proc_str,
+        ))
+    return rows
+
+
+def encoder_family(enc_label: str) -> str:
+    """Coarsen encoder label to a stable family for cross-trial comparison."""
+    if not enc_label:
+        return "(unknown)"
+    if enc_label.startswith("Compute Command"):
+        return "compute"
+    if enc_label.startswith("Blit Command"):
+        return "blit"
+    if enc_label.startswith("Render Command"):
+        return "render"
+    if enc_label.startswith("Acceleration"):
+        return "accel"
+    return enc_label.split(" ")[0].lower() or "(unknown)"
+
+
+def parse_submission_to_encoder_map(xml_text: str, target_process_prefix: str = "") -> Dict[str, str]:
+    """Build sub_id -> encoder_id map from metal-gpu-submission-to-command-buffer-id.
+
+    Schema columns (verified 2026-04-28 against iter11 llama trace):
+      0: timestamp
+      1: cmdbuffer-id
+      2: gpu-submission-id  ← matches metal-gpu-execution-points.sub_id
+      3: segment-id
+      4: segmentlist-id
+      5: encoder-id         ← matches metal-application-encoders-list.encoder_id
+      6: accelerator-id
+      ...
+     12: process            ← filter target
+
+    Filtered to the target binary's process so cmux/Safari compositor frames
+    don't pollute the per-binary join.
+    """
+    root = ET.fromstring(xml_text)
+    out: Dict[str, str] = {}
+    table: Dict[str, str] = {}
+
+    def _register_subtree(elem):
+        rid = elem.get("id")
+        if rid is not None:
+            fmt = elem.get("fmt")
+            if fmt is not None:
+                table[rid] = fmt
+            else:
+                t = (elem.text or "").strip()
+                if t:
+                    table[rid] = t
+        for child in elem:
+            _register_subtree(child)
+
+    for row in root.iter("row"):
+        _register_subtree(row)
+        children = list(row)
+        if len(children) < 13:
+            continue
+        sub_id = resolve(children[2], table) or ""
+        enc_id = resolve(children[5], table) or ""
+        proc_elem = children[12]
+        proc_str = resolve(proc_elem, table) or ""
+        if not proc_str:
+            ref = proc_elem.get("ref")
+            if ref is not None:
+                proc_str = table.get(ref, "") or ""
+        if target_process_prefix and not proc_str.startswith(target_process_prefix):
+            continue
+        if sub_id and enc_id:
+            out[sub_id] = enc_id
+    return out
+
+
+def encoder_gpu_summary(
+    encoders: List[dict],
+    paired_dispatches: List[dict],
+    sub_to_enc: Dict[str, str],
+) -> Dict[str, dict]:
+    """Bucket encoders by family and accumulate GPU duration via dispatch joins.
+
+    JOIN PATH (verified 2026-04-28 against iter11 llama trial-1):
+        1. metal-gpu-execution-points fn=1/2 paired by sub_id
+                → paired dispatches with `sub_id`
+        2. metal-gpu-submission-to-command-buffer-id maps sub_id → encoder_id
+                → produces per-dispatch encoder attribution
+        3. metal-application-encoders-list maps encoder_id → label
+                → groups into family (compute / blit / render / accel)
+
+    Without the submission-to-cb-id intermediary, sub_id and encoder_id
+    live in DIFFERENT id namespaces (sub_id is 32-bit GPU submission counter,
+    encoder_id is 40-bit MTLObject id) — the iter12 fix is to wire that
+    table in.
+
+    Returns: { family -> { count_encoders, gpu_sum_ns, host_sum_ns,
+                           count_dispatches_in_encoder_family } }
+    """
+    enc_by_id: Dict[str, str] = {}
+    enc_count_by_family: Dict[str, int] = defaultdict(int)
+    enc_host_sum_by_family: Dict[str, int] = defaultdict(int)
+    seen_ids = set()
+    for e in encoders:
+        eid = e.get("encoder_id")
+        if not eid or eid in seen_ids:
+            continue
+        seen_ids.add(eid)
+        fam = encoder_family(e.get("encoder_label", ""))
+        enc_by_id[eid] = fam
+        enc_count_by_family[fam] += 1
+        enc_host_sum_by_family[fam] += e.get("duration_ns", 0)
+
+    enc_gpu_sum_by_family: Dict[str, int] = defaultdict(int)
+    enc_disp_count_by_family: Dict[str, int] = defaultdict(int)
+    matched = 0
+    unmatched = 0
+    unmapped = 0
+    for p in paired_dispatches:
+        sid = p.get("sub_id")
+        eid = sub_to_enc.get(sid)
+        if eid is None:
+            unmapped += 1
+            continue
+        fam = enc_by_id.get(eid)
+        if fam is None:
+            unmatched += 1
+            continue
+        matched += 1
+        enc_gpu_sum_by_family[fam] += p.get("duration_ns", 0)
+        enc_disp_count_by_family[fam] += 1
+
+    out: Dict[str, dict] = {}
+    families = set(enc_by_id.values())
+    families.update(enc_gpu_sum_by_family.keys())
+    for fam in sorted(families):
+        out[fam] = dict(
+            count_encoders=enc_count_by_family.get(fam, 0),
+            count_dispatches_in_encoder_family=enc_disp_count_by_family.get(fam, 0),
+            host_sum_ns=enc_host_sum_by_family.get(fam, 0),
+            gpu_sum_ns=enc_gpu_sum_by_family.get(fam, 0),
+        )
+    out["_meta"] = dict(
+        matched_dispatches=matched,
+        unmatched_dispatches=unmatched,  # mapped to enc_id but family unknown (rare)
+        unmapped_dispatches=unmapped,    # sub_id not in submission-map (cross-process)
+        total_encoders=len(seen_ids),
+    )
+    return out
+
+
+def median_encoder_summaries(per_trial: List[Dict[str, dict]], n_tokens_list: List[int]) -> Dict[str, dict]:
+    """Median across trials for each encoder family."""
+    if not per_trial:
+        return {}
+    families = set()
+    for s in per_trial:
+        families.update(k for k in s.keys() if not k.startswith("_"))
+    out: Dict[str, dict] = {}
+    for fam in sorted(families):
+        gpu_us_per_tok = []
+        host_us_per_tok = []
+        n_enc_per_tok = []
+        for s, n_tok in zip(per_trial, n_tokens_list):
+            n_tok = max(n_tok, 1)
+            b = s.get(fam) or {}
+            gpu_us_per_tok.append(b.get("gpu_sum_ns", 0) / 1000.0 / n_tok)
+            host_us_per_tok.append(b.get("host_sum_ns", 0) / 1000.0 / n_tok)
+            n_enc_per_tok.append(b.get("count_encoders", 0) / n_tok)
+        out[fam] = dict(
+            median_gpu_us_per_token=statistics.median(gpu_us_per_tok),
+            median_host_us_per_token=statistics.median(host_us_per_tok),
+            median_encoders_per_token=statistics.median(n_enc_per_tok),
+            gpu_us_per_token_per_trial=gpu_us_per_tok,
+        )
+    return out
+
+
+# --------------------------------------------------------------------- #
 # Bucketing by dispatch duration                                        #
 # --------------------------------------------------------------------- #
 
@@ -498,6 +806,24 @@ def summarize_trace(trace_path: str, n_tokens: int, target_process_prefix: str =
     enc_xml = export_table(trace_path, "metal-application-encoders-list")
     encoders = parse_encoders_list(enc_xml)
 
+    # iter12: per-encoder attribution.  Reparse encoders with process
+    # filter + encoder/cmdbuffer ids so we can join to per-dispatch GPU
+    # times by sub_id.  Filter to the binary's process so cmux/Safari
+    # compositor frames don't pollute counts.
+    encoders_filtered = parse_encoders_list_with_ids(
+        enc_xml, target_process_prefix=target_process_prefix or ""
+    )
+    # iter12: load submission-to-cb-id table for sub_id -> encoder_id join.
+    sub_to_enc: Dict[str, str] = {}
+    try:
+        map_xml = export_table(trace_path, "metal-gpu-submission-to-command-buffer-id")
+        sub_to_enc = parse_submission_to_encoder_map(
+            map_xml, target_process_prefix=target_process_prefix or ""
+        )
+    except Exception:
+        pass
+    encoder_gpu = encoder_gpu_summary(encoders_filtered, paired, sub_to_enc)
+
     # iter11: surface the now-populated shader-list registry. Returns {} on
     # any error (e.g. older traces) so iter9 archived bundles still work.
     shader_registry: Dict[str, List[str]] = {}
@@ -541,6 +867,9 @@ def summarize_trace(trace_path: str, n_tokens: int, target_process_prefix: str =
         shader_registry=shader_registry,
         shader_count=shader_count,
         shader_timeline_rows=shader_timeline_rows,
+        # iter12 additions: per-encoder bucket attribution
+        encoder_filtered_count=len(encoders_filtered),
+        encoder_gpu=encoder_gpu,
     )
 
 
@@ -560,9 +889,14 @@ def median_summaries(summaries: List[dict]) -> dict:
         (s.get("shader_timeline_rows", 0) for s in summaries), default=0
     )
 
+    # iter12: median encoder attribution across trials
+    encoder_gpu_per_trial = [s.get("encoder_gpu", {}) for s in summaries]
+    n_tokens_per_trial = [s["n_tokens"] for s in summaries]
+    encoder_gpu_med = median_encoder_summaries(encoder_gpu_per_trial, n_tokens_per_trial)
+
     out = {
         "n_trials": len(summaries),
-        "n_tokens_per_trial": [s["n_tokens"] for s in summaries],
+        "n_tokens_per_trial": n_tokens_per_trial,
         "paired_per_trial": [s["paired"] for s in summaries],
         "gpu_us_per_token_per_trial": [s["gpu_us_per_token"] for s in summaries],
         "median_dispatches_per_token": statistics.median(
@@ -575,6 +909,9 @@ def median_summaries(summaries: List[dict]) -> dict:
         # iter11 additions
         "shader_registry": registry_out,
         "shader_timeline_rows": shader_timeline_rows_max,
+        # iter12 additions
+        "encoder_gpu": encoder_gpu_med,
+        "encoder_gpu_per_trial": encoder_gpu_per_trial,
     }
     for name, _, _ in BUCKETS:
         counts_per_tok = []
@@ -728,6 +1065,94 @@ def write_report(out_path: str, hf2q: dict, llama: dict, hf2q_trials: List[dict]
         lines.append("")
     else:
         lines.append("(no traces summarised)")
+
+    # iter12: per-encoder attribution side-by-side.  This is iter12's primary
+    # deliverable — fills the missing "what does llama spend µs on per encoder
+    # bucket?" half of iter11's per-layer comparison.
+    if hf2q and llama and (hf2q.get("encoder_gpu") or llama.get("encoder_gpu")):
+        lines.append("")
+        lines.append("=" * 110)
+        lines.append("iter12 — Per-encoder GPU-time attribution (xctrace MST CLI-only)")
+        lines.append("=" * 110)
+        lines.append("Methodology: encoders bucketed by family (compute / blit / render / accel),")
+        lines.append("  filtered to target binary's process.  GPU time = sum of paired dispatch")
+        lines.append("  durations joined to the encoder by THREADING the join through the")
+        lines.append("  metal-gpu-submission-to-command-buffer-id table (sub_id -> encoder_id),")
+        lines.append("  because sub_id and encoder_id live in different id namespaces (sub_id is")
+        lines.append("  a 32-bit GPU submission counter; encoder_id is a 40-bit MTLObject id).")
+        lines.append("  Host time = encoder lifetime from metal-application-encoders-list")
+        lines.append("  (encoding wall-clock, not GPU wall-clock — kept for reference).")
+        lines.append("")
+        lines.append("Granularity caveat: both llama.cpp and mlx-native emit only generic encoder")
+        lines.append("  labels ('Compute Command N' / 'Blit Command N') — neither pushes debug")
+        lines.append("  groups nor sets MTLObject labels.  Per-encoder attribution is therefore")
+        lines.append("  COARSER than per-kernel; on a typical decode token both binaries emit a")
+        lines.append("  single Compute encoder containing many dispatches, so per-encoder GPU sum")
+        lines.append("  is roughly per-CB GPU sum.")
+        lines.append("")
+        header = (f"{'family':<10s}  "
+                  f"{'hf2q enc/tok':>13s}  {'hf2q gpu_µs/tok':>15s}  "
+                  f"{'llama enc/tok':>14s}  {'llama gpu_µs/tok':>16s}  "
+                  f"{'Δgpu_µs/tok':>12s}  {'Δ%':>8s}")
+        lines.append(header)
+        lines.append("-" * len(header))
+        all_families = sorted(
+            set((hf2q.get("encoder_gpu") or {}).keys())
+            | set((llama.get("encoder_gpu") or {}).keys())
+        )
+        # Sort by Δgpu_µs/tok desc so the largest gap is on top
+        rows_sorted = []
+        for fam in all_families:
+            hb = (hf2q.get("encoder_gpu") or {}).get(fam) or {}
+            lb = (llama.get("encoder_gpu") or {}).get(fam) or {}
+            h_gpu = hb.get("median_gpu_us_per_token", 0.0)
+            l_gpu = lb.get("median_gpu_us_per_token", 0.0)
+            d_us = h_gpu - l_gpu
+            d_pct = (d_us / l_gpu * 100) if l_gpu > 0 else 0.0
+            rows_sorted.append((fam, hb, lb, d_us, d_pct))
+        rows_sorted.sort(key=lambda r: -r[3])
+        for fam, hb, lb, d_us, d_pct in rows_sorted:
+            lines.append(
+                f"{fam:<10s}  "
+                f"{hb.get('median_encoders_per_token', 0):>13.2f}  "
+                f"{hb.get('median_gpu_us_per_token', 0):>15.1f}  "
+                f"{lb.get('median_encoders_per_token', 0):>14.2f}  "
+                f"{lb.get('median_gpu_us_per_token', 0):>16.1f}  "
+                f"{d_us:>+12.1f}  "
+                f"{d_pct:>+7.1f}%"
+            )
+        # Totals across families
+        h_total = sum(b.get("median_gpu_us_per_token", 0)
+                      for b in (hf2q.get("encoder_gpu") or {}).values())
+        l_total = sum(b.get("median_gpu_us_per_token", 0)
+                      for b in (llama.get("encoder_gpu") or {}).values())
+        lines.append("-" * len(header))
+        lines.append(
+            f"{'TOTAL':<10s}  "
+            f"{'-':>13s}  "
+            f"{h_total:>15.1f}  "
+            f"{'-':>14s}  "
+            f"{l_total:>16.1f}  "
+            f"{(h_total - l_total):>+12.1f}  "
+            f"{((h_total - l_total) / l_total * 100 if l_total else 0):>+7.1f}%"
+        )
+        lines.append("")
+        lines.append("Per-trial encoder gpu µs/tok (compute family only) for stat visibility:")
+        for fam in ["compute", "blit"]:
+            for trace_label, side in [("hf2q ", hf2q), ("llama", llama)]:
+                if not side:
+                    continue
+                rows_pt = side.get("encoder_gpu_per_trial") or []
+                vals = []
+                for s, n_tok in zip(rows_pt, side.get("n_tokens_per_trial") or []):
+                    if not s:
+                        continue
+                    b = s.get(fam) or {}
+                    vals.append(b.get("gpu_sum_ns", 0) / 1000.0 / max(n_tok, 1))
+                if vals:
+                    lines.append(f"  {trace_label} {fam:<7s}: "
+                                 f"{', '.join(f'{x:.1f}' for x in vals)}")
+        lines.append("")
 
     # iter11: surface the kernel registry per binary so reviewers can confirm
     # iter9b labels propagated end-to-end through xctrace.
