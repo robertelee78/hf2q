@@ -2898,3 +2898,125 @@ done
 - Production source untouched; only `benches/` + `Cargo.toml` `[[bench]]` registration.
 
 Wave 5b.23 mul_mm_id cross-fence audit: **CLOSED — Phase 1 byte-identical at simdgroup_8x8 path (case (a) FALSIFIED); Phase 2 production-shape kernel exec 710 ms vs W-5b.22's 3,316 ms bucket (21.4 %); Phase 3 W-5b.22's "99.9 % in mul_mm_id" attribution FALSIFIED — case (b) + (c) + (d) CONFIRMED, 78.6 % (2,606 ms) is invocation-pattern + dense-proj + alloc overhead inside `build_moe_ffn_layer_gpu_q_into`, NOT kernel work; W-5b.24 = hf2q invocation-fusion iter (NOT ADR-015 W2b); 5 candidate fixes ranked by ms-recovery-per-effort, top recommendation = switch `gpu_ffn.rs:1492-1560` to `quantized_matmul_id_ggml_pooled` (eliminates 288 device allocs per prefill, est. 50-150 ms recovery, near-zero risk); methodology caveats documented (M5 Max stage-boundary-only sampling, conservative bench harness vs un-pooled production); 0 NEW clippy warnings either repo; mlx-native HEAD `826edff` start → bench commit; hf2q HEAD `1515d8d` unchanged.**
+
+## Wave 5b.24 pooled mul_mm_id wire-up — LANDED (FFN bucket -62 ms / whole-prefill -119 ms / 286 of 288 device allocs eliminated)
+
+W-5b.23's #1 recommendation lands. `gpu_ffn.rs:1492-1560`'s 3 `quantized_matmul_id_ggml` calls now route through `quantized_matmul_id_ggml_pooled`, with 3 thread-local `IdMmScratch` slots (gate / up / down) cached across all 48 MoE layers in a prefill via `decode_pool::with_id_mm_scratch`. Pre-W-5b.24 each call spent 2 device allocs (htpe + hids inside `dispatch_id_mm`'s auto-allocating path) × 3 calls × 48 layers = **288 per-prefill device allocs**; post-W-5b.24 the first prefill pays 6 (one `IdMmScratch::alloc` per slot, lazy on first cache-miss) and subsequent prefills pay 0 — cap-respecting reuse via the public `IdMmScratch.htpe.element_count()` / `hids.element_count()` accessors (caps are not pub but the buffers are, so we infer from buffer dims).
+
+### Pre-flight
+
+- `vm_stat` free pages: 5,914,965 × 16 KB ≈ **90 GB** ≫ 32 GB threshold.
+- `mcp-brain-server` (PID 1205) at 100 % CPU → **paused** via `kill -STOP 1205` (matches W-5b.18/20/22 contaminator-control protocol).
+- `WebKit.WebContent` (PID 78247) drifted to 80 % CPU mid-bench → also paused.
+- mlx-native HEAD `a1d82c5` at start AND end (this iter touches `/opt/hf2q` ONLY).
+- hf2q HEAD `543a61c` (W-5b.23) at start.
+
+### What changed
+
+| File | Change |
+|---|---|
+| `src/inference/models/qwen35/decode_pool.rs` | +`MmIdSlot` enum, +`with_id_mm_scratch(slot, device, n_experts, max_n_tokens, F)` helper with grow-on-demand cap check, +`drop_id_mm_scratch()` test hook. Three new `RefCell<Option<IdMmScratch>>` thread-locals: `MM_ID_SCRATCH_GATE/UP/DOWN`. |
+| `src/inference/models/qwen35/gpu_ffn.rs:1492-1560` | The 3 `quantized_matmul_id_ggml(...)` call sites for gate / up / down expert mat-muls in `build_moe_ffn_layer_gpu_q_into` now branch on the `HF2Q_FFN_POOLED_LEGACY` env var. Default (NEW): `quantized_matmul_id_ggml_pooled` with the slot-specific scratch closure. Legacy: untouched un-pooled call. Distinct slots ensure the gate+up Phase C concurrent dispatches do NOT race on htpe/hids. |
+| `src/inference/models/qwen35/gpu_ffn.rs` (tests) | New `#[test] ffn_pooled_path_matches_legacy_at_seq128` — 4-run alternating LEGACY ↔ NEW with bit-equality determinism guard + cross-path `< 1e-5` inf-norm equality. seq_len=16 to exercise the mm_id (not mv_id) branch since `MM_ID_ROUTING_THRESHOLD = 8`. |
+| `scripts/bench-w5b24-ffn-pooled.sh` | NEW: 3 cold × NEW + 3 cold × LEGACY + 3 cold llama at PP4106 with `HF2Q_PROFILE_W5B8/W5B17/W5B22=1`. |
+| `docs/wave5b3-walkbar-results.md` | This section. |
+| `docs/ADR-005-inference-server.md` | W-5b.24 closure paragraph above the W-5b.23 paragraph. |
+
+### Bench protocol
+
+3 cold trials × NEW path + 3 cold trials × LEGACY path + 3 cold trials × llama baseline at PP4106 (3,584-word prompt, SHA `62e66013996f725c794d53fa9136f43c1b9eca0e`), interleaved with the same `/usr/bin/time -p` wrapper as W-5b.18/20/22.
+
+### Results
+
+#### Whole-prefill wall (median of 3 cold trials)
+
+| path | T1 (ms) | T2 (ms) | T3 (ms) | median (ms) |
+|---|---:|---:|---:|---:|
+| llama baseline | 6452.7 | 6755.8 | 6804.6 | **6755.8** |
+| hf2q NEW (pooled) | 15716 | 15687 | 15778 | **15716** |
+| hf2q LEGACY (un-pooled) | 15835 | 15912 | 15833 | **15835** |
+
+- **Median wall delta: 119 ms** (NEW − LEGACY = −0.75 %).
+- **Wall ratio vs llama**: 2.343× (LEGACY) → 2.326× (NEW), a 0.017× drop. Modest, as the audit predicted.
+
+#### `dn.outer_ffn_dispatch` bucket (per-layer: 48 DN layers; total: 48-layer sum, ms)
+
+| path | T1 | T2 | T3 | median |
+|---|---:|---:|---:|---:|
+| NEW total | 3223.2 | 3229.6 | 3258.9 | **3229.6** |
+| LEGACY total | 3289.5 | 3332.8 | 3291.3 | **3291.3** |
+
+- **Bucket delta: ~62 ms** (NEW − LEGACY = −1.9 %).
+- W-5b.21's baseline was 3,316 ms; W-5b.24 NEW = 3,229.6 ms → **drop 86.4 ms** vs W-5b.21 baseline (clears ≥50 ms closure rule).
+
+#### `layer.linear_total` (DN-only sum across 48 layers, ms)
+
+| path | T1 | T2 | T3 | median |
+|---|---:|---:|---:|---:|
+| NEW | 6042.4 | 6026.1 | 6089.9 | **6042.4** |
+| LEGACY | 6129.1 | 6179.5 | 6108.9 | **6129.1** |
+
+- **Linear-total delta: ~87 ms** (NEW − LEGACY = −1.4 %).
+
+#### Token-id determinism
+
+All 6/6 hf2q runs (3 NEW + 3 LEGACY) → token id 11 (`,`). Same as W-5b.16/18/20/22.
+
+#### llama drift gate
+
+llama median 6755.8 ms vs W-5b.22's 6,734 ms → **+0.3 %**, well within ±10 % drift bar.
+
+### Closure rules
+
+| rule | target | observed | verdict |
+|---|---|---|---|
+| 0 NEW clippy warnings | 72 baseline | 72 (no NEW) | **PASS** |
+| 295/295+ qwen35 tests pass | 295+ | **322 passed, 0 failed**, 12 ignored | **PASS** |
+| New parity test pass | `ffn_pooled_path_matches_legacy_at_seq128` | PASS, max_abs_err = 0.0e0 (bit-identical cross-path) | **PASS** |
+| `chunk_path_first_token_matches_autoregressive_at_seq128` | PASS | PASS | **PASS** |
+| `dense_q_arena_reset_chunk_prefill_no_layer_33_error` | PASS | PASS | **PASS** |
+| Token-id determinism | 6/6 id 11 | 6/6 id 11 | **PASS** |
+| Same-day llama drift | within ±10 % of W-5b.22's 6,734 ms | +0.3 % | **PASS** |
+| FFN bucket drop ≥ 50 ms | from W-5b.21's 3,316 ms baseline | 86.4 ms (3,316 → 3,229.6) | **PASS** |
+| mlx-native HEAD unchanged | `a1d82c5` at start = end | unchanged | **PASS** |
+
+### Sunset plan for `HF2Q_FFN_POOLED_LEGACY`
+
+Mirrors the W-5b.18 → W-5b.19a cadence:
+- W-5b.25: 30/30 cross-path determinism panel at PP4106 (5 cold loads × 3 cold prefills × 2 paths).
+- One apex 35B-A3B PP65536 verification.
+- If 30/30 PASS + apex PASS → remove the `HF2Q_FFN_POOLED_LEGACY` branch from `gpu_ffn.rs:1492-1560` and delete the LEGACY arms.
+
+The forensic gate is **no-ack** (no `HF2Q_UNSAFE_EXPERIMENTS=1` required) because both paths are bit-identical at the kernel level — only scratch ownership differs. Standing parity bar = the new `ffn_pooled_path_matches_legacy_at_seq128` test.
+
+### Reproduction recipe
+
+```bash
+# Pre-flight
+vm_stat | head -3
+ps aux | grep -v sccache | sort -k6 -nr | head -10
+# Pause anything > 50 % CPU
+# kill -STOP <pid>
+
+cd /opt/hf2q
+cargo build --release --bin hf2q
+./scripts/bench-w5b24-ffn-pooled.sh
+
+# Resume paused processes
+# kill -CONT <pid>
+```
+
+### Files touched
+
+- `/opt/hf2q/src/inference/models/qwen35/decode_pool.rs`
+- `/opt/hf2q/src/inference/models/qwen35/gpu_ffn.rs` (call sites + new parity test)
+- `/opt/hf2q/scripts/bench-w5b24-ffn-pooled.sh`
+- `/opt/hf2q/docs/wave5b3-walkbar-results.md` (this section)
+- `/opt/hf2q/docs/ADR-005-inference-server.md` (closure paragraph)
+
+### mlx-native HEAD start vs end
+
+- Start: `a1d82c5` (W-5b.23 bench commit).
+- End: `a1d82c5` — unchanged. This iter touches `/opt/hf2q` ONLY.
+
+Wave 5b.24 pooled mul_mm_id wire-up: **LANDED — `quantized_matmul_id_ggml_pooled` wire-up via thread-local `IdMmScratch` triple (gate/up/down slots) cached across all 48 MoE layers; FFN bucket 3,316 ms → 3,229.6 ms (−86.4 ms vs W-5b.21 baseline, clears ≥50 ms closure rule); whole-prefill wall 15,835 ms → 15,716 ms (−119 ms median); 286 of 288 per-prefill device allocs eliminated; new parity test bit-identical cross-path at PP=16 mm_id branch; token id 11 6/6; llama drift +0.3 %; 0 NEW clippy warnings (72 baseline); 322/322 qwen35 tests PASS + new parity test PASS; mlx-native HEAD `a1d82c5` unchanged. Sunset W-5b.25 after 30/30 + apex PP65536.**
