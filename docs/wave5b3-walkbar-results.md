@@ -3168,3 +3168,152 @@ done > /tmp/walkbar-pp65536-prompt.txt
 - End: `a1d82c5` — unchanged. This iter touches `/opt/hf2q` ONLY.
 
 Wave 5b.25 sunset + W-5b.26 audit re-prioritisation: **CLOSED — Phase A 27B 30/30 token-id 11 PARITY HOLDS at PP4106, apex 35B-A3B PP65536 FFN equivalence verified (both paths complete identical 40-layer prefill, fail identically at downstream lm_head buffer-sizing — separate ADR territory); `HF2Q_FFN_POOLED_LEGACY` env gate REMOVED from `gpu_ffn.rs:1493-1618`, parity test `ffn_pooled_path_matches_legacy_at_seq128` REMOVED (-1 qwen35 bin test, 296 → 295); 0 NEW clippy warnings (72 baseline preserved); standing parity tests `chunk_path_first_token_matches_autoregressive_at_seq128` + `dense_q_arena_reset_chunk_prefill_no_layer_33_error` PASS. Phase B re-ranking of W-5b.23 candidates 2-5 post-W-5b.24: top-1 for W-5b.26 = lift 9 `pooled_alloc_buffer` outputs to prefill scope (50-150 ms recovery, LOW-MED effort, LOW risk; mirrors W-5b.24 amortisation pattern); recommend bundling sub-bucket instrumentation (W-5b.23 candidate 2) at near-zero marginal cost. mlx-native HEAD `a1d82c5` unchanged.**
+
+## Wave 5b.26 lift FFN pooled outputs + sub-bucket instrumentation — REVERTED (audit target FALSIFIED, production bench model is Dense-FFN not MoE-FFN)
+
+**Iter:** 2026-04-28, hf2q HEAD `30d923f` at start, mlx-native HEAD `a1d82c5` at start AND end (this iter touches `/opt/hf2q` ONLY).
+
+Implements the W-5b.25 audit's top-1 candidate (lift 9 `pooled_alloc_buffer` outputs in `build_moe_ffn_layer_gpu_q_into` to a thread-local `FfnOutputCache`) plus the W-5b.23 audit's #2 candidate (11 `DnFfn*` sub-bucket SectionKinds gated on `HF2Q_PROFILE_W5B26=1`). **Implementation correct (parity test bit-exact); production-path target FALSIFIED (mid-bench observation that the production 27B DWQ46 bench model is dense, not MoE — `n_expert=0` per `llama-completion` model metadata; `forward_gpu_impl` `FfnWeightsGpu` variant for every layer is `DenseQ`, NOT `MoeQ`).** Per the worker prompt's STOP condition `After implementation, FFN bucket does NOT drop ≥50ms — STOP, revert, report; don't claim a win that didn't materialize`, all three W-5b.26 commits reverted.
+
+### Pre-flight
+
+- `vm_stat`: 4,763,214 free pages × 16 KB ≈ **72.7 GB** ≫ 32 GB threshold.
+- Concurrent processes: `WebKit.WebContent` PID 78247 at 81.4 % CPU pre-bench; **paused via `kill -STOP 78247`** for the bench window. `mcp-brain-server` PID 1205 at 0.0 % CPU (idle, no pause needed).
+- mlx-native HEAD `a1d82c5` (W-5b.23 bench commit) at start AND end.
+- hf2q HEAD `30d923f` (W-5b.25 closure docs commit) at start.
+
+### Phase A — `FfnOutputCache` design + wire-up
+
+#### `decode_pool::FfnOutputCache` (W-5b.26 phase A scaffolding)
+
+Mirrors W-5b.24's `IdMmScratch` lifecycle pattern at the next layer up: thread-local cache with 9 `Option<MlxBuffer>` slots (`Ids` / `Weights` / `GateAll` / `UpAll` / `HAll` / `YAll` / `HS` / `Out` / `SiluParams`). Grow-on-demand via power-of-two bucket rounding mirroring the pool's `bucket_size` semantics; `MlxBuffer::clone` returns from cache (Arc bump on storage; shared residency-set guard, no double-registration; kernel byte-len checks use `<` so the over-allocated tail is harmless).
+
+Distinct from `MlxBufferPool` — the cache survives `reset_for_prefill_chunk` (W-5b.15) so the cross-layer `out_buf` reuse is sound (the W-5b.15 hidden-buffer hazard is pool-specific: reset hands buckets back to free list while the next layer's first pool alloc could alias; the cache does NOT participate in the pool's reset).
+
+#### Wire-up + sub-bucket instrumentation (`gpu_ffn.rs::build_moe_ffn_layer_gpu_q_into`)
+
+Replaces the 9 per-layer `pooled_alloc_buffer` calls with `ffn_output_get_or_alloc(FfnOutputSlot::*, ...)` lookups behind a `HF2Q_FFN_OUTPUT_LIFT_LEGACY=1` forensic env gate (default OFF = lifted; gate ON = legacy per-layer path verbatim).
+
+Adds 11 `Section::start_w5b26` RAII guards inside `build_moe_ffn_layer_gpu_q_into` for the per-dispatch CPU encode-time sub-buckets — `dn.ffn.{proj_router, proj_sh_logit, proj_a_s, proj_b_s, softmax_topk, gate_mm_id, up_mm_id, silu_mul_phase, shared_down, down_mm_id, weighted_reduce}` — gated on `HF2Q_PROFILE_W5B26=1` (default OFF, separate from W-5b.8/W-5b.17/W-5b.22 gates so each audit's sub-buckets are independently surfaceable). `SectionKind::COUNT` 29 → 40.
+
+#### Phase A parity test — `ffn_output_lift_path_matches_legacy_at_seq128` PASS
+
+4 alternating LEGACY ↔ NEW invocations at seq_len=16 with full 6-pair bit-equality check: `max_abs_err = 0.00e0` across all pairs. Confirms the lift is bit-identical to the per-layer pool-alloc path.
+
+| metric | observed |
+|---|---|
+| Build (post-wire-up) | 0 NEW clippy warnings (72 baseline) |
+| qwen35 test count | 296 PASS / 0 FAIL (was 295; +1 = `ffn_output_lift_path_matches_legacy_at_seq128`) |
+| `chunk_path_first_token_matches_autoregressive_at_seq128` | PASS |
+| `dense_q_arena_reset_chunk_prefill_no_layer_33_error` | PASS |
+| Full bin suite | 2128 PASS / 0 FAIL / 11 ignored |
+
+### Phase B — A/B bench + production-path falsification
+
+Bench harness `/opt/hf2q/scripts/bench-w5b26-ffn-output-lift.sh` (NEW this iter, 86 LOC; mirrors `bench-w5b24-ffn-pooled.sh` template with `HF2Q_FFN_OUTPUT_LIFT_LEGACY=1` env-gate slot). 3 cold trials × 2 paths (NEW + LEGACY) at PP4106 with `HF2Q_PROFILE_W5B8=1 HF2Q_PROFILE_W5B17=1 HF2Q_PROFILE_W5B22=1 HF2Q_PROFILE_W5B26=1`, plus 3 cold trials llama drift gate.
+
+#### Cross-path PP4106 wall + token-id parity
+
+| metric | NEW (lifted) | LEGACY (per-layer pool) | delta |
+|---|---:|---:|---:|
+| T1 prefill ms | 16,094 | 15,930 | +164 |
+| T2 prefill ms | 15,932 | 16,115 | -183 |
+| T3 prefill ms | 16,029 | 15,825 | +204 |
+| **median prefill ms** | **16,029** | **15,930** | **+99 (regression)** |
+| token id (all 6 runs) | **11** | **11** | **PASS 6/6** |
+
+| metric | NEW T1 | NEW T2 | NEW T3 | NEW median | LEGACY T1 | LEGACY T2 | LEGACY T3 | LEGACY median | delta |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `dn.outer_ffn_dispatch` ms | 3,352.86 | 3,314.38 | 3,343.48 | **3,343.5** | 3,298.36 | 3,288.91 | 3,237.09 | **3,288.9** | **+54.6 (regression)** |
+
+#### llama drift gate
+
+| trial | prompt_eval ms | gate (≤7,431 ms = 110 % of W-5b.24's 6,755.8 ms) |
+|---|---:|---|
+| T1 | 6,484.44 | PASS |
+| T2 | 6,923.97 | PASS |
+| T3 | 6,698.62 | PASS |
+
+llama median 6,698.62 ms — within +0.86 % of W-5b.24's 6,755.8 ms median. Drift gate clears.
+
+#### W-5b.26 sub-bucket distribution — `dn.ffn.*` buckets EMPTY
+
+The 11 `DnFfn*` sub-buckets recorded **0 samples each** despite `HF2Q_PROFILE_W5B26=1` being set. Initial hypothesis (instrumentation wiring bug) FALSIFIED via two debug eprintln probes:
+
+1. `[W5B26_DEBUG] ENTERED build_moe_ffn_layer_gpu_q_into` — added at function head; **never fires** at runtime despite the function being defined and the symbol present in the binary (`strings target/release/hf2q | grep "ENTERED build_moe"` confirms).
+2. `[W5B26_DEBUG] forward_gpu_impl layer N FFN variant: <variant>` — added at the FFN dispatch site; for layers 0 and 1 prints `DenseQ`. For every layer of the 27B DWQ46 prefill the variant is `DenseQ`, NOT `MoeQ`.
+
+**Independent corroboration via `llama-completion` model metadata:**
+
+```text
+print_info: n_expert              = 0
+print_info: n_expert_used         = 0
+print_info: n_expert_groups       = 0
+```
+
+The 27B DWQ46 production bench model is **dense** (no experts). The MoE FFN code path in `build_moe_ffn_layer_gpu_q_into` (and its parent `build_moe_ffn_layer_gpu_q`) is **never invoked** for this model. The W-5b.25 audit's recommendation table cites "9 `pooled_alloc_buffer` outputs in `build_moe_ffn_layer_gpu_q_into`" as the top-1 candidate, but that function never executes on the bench model — the lift cannot recover any time on the 27B DWQ46 path.
+
+**Cross-link to predecessor falsification**: this is the **10th confirmed M5 Max static-evidence hypothesis falsified** (per `project_metal_compiler_auto_optimizes_static_levers`); the kernel-side hypotheses are all about Metal compiler auto-optimisation, but THIS one is structural — the audit recommended optimising a function that doesn't fire on the production bench. Adding to the loop-mistakes catalog (`feedback_loop_mistakes_catalog`).
+
+#### W-5b.24 retrospective discrepancy — UNRESOLVED
+
+W-5b.24 closure (commit `a8777d1`) claimed -86 ms FFN bucket recovery + -119 ms whole-prefill via `quantized_matmul_id_ggml_pooled` wire-up in the same `build_moe_ffn_layer_gpu_q_into` function on the same 27B DWQ46 model. If MoeQ never fires for that model, W-5b.24's wire-up should also be inert. Yet the bench numbers W-5b.24 reported moved by exactly the projected magnitude. Two hypotheses for the W-5b.24 result, neither validated this iter:
+
+1. **W-5b.24's bench was noise.** The 86 ms / 119 ms moves are within the cold-process noise envelope observed this iter (NEW trials span 162 ms, LEGACY trials 290 ms; W-5b.24's claimed delta is well within the standard deviation across cold processes).
+2. **The model variant detection is non-deterministic.** Some path (model loading, quantize-aware shape detection) might dispatch through MoeQ for the same GGUF under specific conditions not currently understood.
+
+Neither hypothesis is investigated here — the W-5b.26 STOP condition is unambiguous and forecloses further bench iteration without root-cause. Recorded for ADR-005 follow-up: re-audit the W-5b.24 result against the `n_expert=0` evidence; if H1 holds, the W-5b.24 -86 ms claim is in noise and W-5b.21's 3,316 ms baseline is the actual standing FFN bucket size, not the W-5b.24-claimed 3,229 ms.
+
+#### W-5b.26 closure rules
+
+| rule | target | observed | verdict |
+|---|---|---|---|
+| 0 NEW clippy warnings | 72 (W-5b.24/25 baseline) | 72 (no NEW) | PASS |
+| qwen35 bin tests | ≥ 295 (W-5b.25 baseline) | 296 (post-revert: 295) | PASS by construction |
+| `chunk_path_first_token_matches_autoregressive_at_seq128` | PASS | PASS | PASS |
+| `dense_q_arena_reset_chunk_prefill_no_layer_33_error` | PASS | PASS | PASS |
+| Full bin suite | 2127+ (W-5b.25 baseline) | 2128 (post-revert: 2127) | PASS |
+| 27B 6/6 token id 11 | 6/6 | 6/6 | PASS |
+| FFN bucket drops by ≥ 50 ms | -50 to -150 ms (audit projection) | **+54.6 ms (REGRESSION)** | **FAIL → STOP-condition triggered** |
+| Whole-prefill drops by 50-150 ms | -50 to -150 ms | **+99 ms (REGRESSION)** | **FAIL → STOP-condition triggered** |
+| Same-day llama drift | within ±10 % of W-5b.24's 6,756 ms | +0.86 % (PASS) | PASS |
+| mlx-native HEAD unchanged | `a1d82c5` start = end | unchanged | PASS |
+
+**Verdict**: PASS on all build / parity / determinism / mlx-native-isolation gates. **FAIL on the perf gate by audit-target-falsification**: the lift cannot recover ms on a code path that does not execute. Per STOP condition, all 3 W-5b.26 commits reverted.
+
+### Reverts
+
+| commit | revert commit | content |
+|---|---|---|
+| `21ba91e` (W-5b.26 phase A) | `fb93a43` | `decode_pool::FfnOutputCache` infrastructure |
+| `270d481` (W-5b.26 phase B) | `00ba6b2` | 11 `DnFfn*` SectionKind variants + `start_w5b26` |
+| `7ad323d` (W-5b.26 wire-up) | `da803a1` | `gpu_ffn.rs` lift + parity test + LEGACY env gate |
+
+Codebase is now bit-identical to post-W-5b.25 baseline (HEAD `30d923f` → `fb93a43`, with 3 reverts in between). Build clean (72 warnings = baseline), 295 qwen35 tests + 2127 full bin tests PASS, mlx-native HEAD `a1d82c5` unchanged.
+
+### `HF2Q_FFN_OUTPUT_LIFT_LEGACY` sunset plan
+
+N/A — gate did not land. The `bench-w5b26-ffn-output-lift.sh` script is preserved as a reusable harness (mirrors W-5b.24's bench template) for any future iter that needs the same A/B form.
+
+### Files touched (revert-net delta)
+
+- `/opt/hf2q/docs/wave5b3-walkbar-results.md` (this section).
+- `/opt/hf2q/docs/ADR-005-inference-server.md` (closure paragraph).
+- `/opt/hf2q/scripts/bench-w5b26-ffn-output-lift.sh` (NEW, 86 LOC; preserved as reusable A/B harness).
+
+The 3 reverts produce zero net code delta across `decode_pool.rs` / `gpu_ffn.rs` / `wave5b8_profile.rs` vs the post-W-5b.25 baseline.
+
+### W-5b.27 recommendation
+
+The W-5b.25 audit's recommendation table needs a **per-model FFN-variant correction pass** before any new W-5b.27 iter targets MoE-side optimisation. Action items:
+
+1. **Audit the production bench**: confirm the 27B DWQ46 file is the intended PP4106 walkbar model. If yes, re-audit the FFN bucket against DenseQ (`build_dense_ffn_layer_gpu_q_into_pooled` at `gpu_ffn.rs:777-901`) — that function has 4 pooled scratches (gate / up / hidden / silu_params) plus a `device.alloc_buffer` final output. The 4 pooled scratches × 64 layers (DenseQ fires for ALL 64 layers in the 27B path, not just the 48 LinearAttn) = 256 per-prefill pool ops eligible for the same lift pattern.
+2. **Validate the W-5b.24 result**: re-run W-5b.24's bench script against the `n_expert=0` model and check whether the -86 ms claim reproduces. If not, the W-5b.21 3,316 ms baseline is the standing FFN bucket size (not 3,229 ms).
+3. **Apex 35B-A3B verification**: the `FfnOutputCache` and `start_w5b26` instrumentation ARE correct for the apex MoE-Q path. A future apex audit (when the lm_head buffer-sizing OOM at PP65536 is resolved per W-5b.25's apex partial-pass note) can re-land both via `git revert -n fb93a43 00ba6b2 da803a1` (effectively un-reverting), then bench against the actual MoE-FFN dispatch path.
+
+### mlx-native HEAD start vs end
+
+- Start: `a1d82c5` (W-5b.23 bench commit).
+- End: `a1d82c5` — unchanged. This iter touches `/opt/hf2q` ONLY.
+
+Wave 5b.26 lift FFN pooled outputs + sub-bucket instrumentation: **REVERTED — implementation correct (parity bit-exact at PP=16, 4 alternating LEGACY ↔ NEW invocations max_abs_err=0.00e0); production-path target FALSIFIED (27B DWQ46 bench model has `n_expert=0`, so `build_moe_ffn_layer_gpu_q_into` never fires; FFN bucket regressed +54.6 ms / whole-prefill +99 ms vs LEGACY, both within cold-process noise but outside the audit's projected -50 to -150 ms recovery); per worker-prompt STOP condition (`FFN bucket does NOT drop ≥50ms → STOP, revert, report`) all 3 W-5b.26 commits reverted to post-W-5b.25 baseline (HEAD `30d923f` → `fb93a43` net-zero code delta); `bench-w5b26-ffn-output-lift.sh` preserved as reusable A/B harness; W-5b.27 recommendation: per-model FFN-variant correction pass + W-5b.24 result validation against `n_expert=0` evidence + apex 35B-A3B re-land via `git revert -n` of the 3 reverts when the apex lm_head OOM is resolved. mlx-native HEAD `a1d82c5` unchanged.**
