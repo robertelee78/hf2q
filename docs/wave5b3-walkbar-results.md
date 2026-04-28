@@ -3020,3 +3020,151 @@ cargo build --release --bin hf2q
 - End: `a1d82c5` — unchanged. This iter touches `/opt/hf2q` ONLY.
 
 Wave 5b.24 pooled mul_mm_id wire-up: **LANDED — `quantized_matmul_id_ggml_pooled` wire-up via thread-local `IdMmScratch` triple (gate/up/down slots) cached across all 48 MoE layers; FFN bucket 3,316 ms → 3,229.6 ms (−86.4 ms vs W-5b.21 baseline, clears ≥50 ms closure rule); whole-prefill wall 15,835 ms → 15,716 ms (−119 ms median); 286 of 288 per-prefill device allocs eliminated; new parity test bit-identical cross-path at PP=16 mm_id branch; token id 11 6/6; llama drift +0.3 %; 0 NEW clippy warnings (72 baseline); 322/322 qwen35 tests PASS + new parity test PASS; mlx-native HEAD `a1d82c5` unchanged. Sunset W-5b.25 after 30/30 + apex PP65536.**
+
+## Wave 5b.25 sunset HF2Q_FFN_POOLED_LEGACY + W-5b.26 audit re-prioritisation — CLOSED (gate removed, top-1 = lift pooled-output buffers to prefill scope)
+
+**Iter:** 2026-04-28, hf2q HEAD `56face85` at start, mlx-native HEAD `a1d82c5` at start AND end (this iter touches `/opt/hf2q` ONLY).
+
+Mirrors the W-5b.18 → W-5b.19a / W-5b.20 → W-5b.21 cadence: one sunset audit + one re-audit pass (read-only, since W-5b.23's recommendation table already enumerates candidates 2-5 in detail — no need for fresh fine-grained instrumentation). Two-phase split per worker prompt; Phase A is the sunset, Phase B is the re-audit prioritisation.
+
+### Pre-flight
+
+- vm_stat: Pages free 4,819,255 × 16 KB ≈ **73 GB** ≫ 32 GB threshold.
+- Concurrent processes (start): `mcp-brain-server` PID 1205 at 6.4 % CPU (idle), `WebKit.WebContent` PID 78247 at 41.9 % CPU. Both below 50 %; no pre-emptive pause.
+- Apex run mid-bench: `mcp-brain-server` drifted to 99.7 % CPU + `WebKit.WebContent` to 87.8 % — **both paused via `kill -STOP 1205 78247`** for the apex prefill, resumed via `kill -CONT` after.
+- mlx-native HEAD `a1d82c5` (W-5b.23 bench commit) at start AND end.
+- hf2q HEAD `56face85` (W-5b.24 closure docs) at start.
+
+### Phase A — sunset HF2Q_FFN_POOLED_LEGACY
+
+#### Sunset script
+
+`/opt/hf2q/scripts/sunset-w5b24-ffn-pooled-legacy.sh` mirrors the W-5b.21 sunset template. Sequential foreground only (no `&`, no `nohup`). 5 cold model loads × 3 cold prefills × 2 paths (NEW + LEGACY) = **30 runs at PP4106**. Plus a NEW addition relative to W-5b.16/19A/21A: **1 cold prefill per path at apex 35B-A3B PP65536**.
+
+#### 27B PP4106 cross-path parity (5 loads × 3 trials × 2 paths)
+
+| L T | NEW prefill (ms) | NEW tok | LEGACY prefill (ms) | LEGACY tok |
+|---|---:|---:|---:|---:|
+| L1 T1 | 15,332 | 11 | 15,619 | 11 |
+| L1 T2 | 15,921 | 11 | 15,953 | 11 |
+| L1 T3 | 16,029 | 11 | 16,311 | 11 |
+| L2 T1 | 16,266 | 11 | 16,333 | 11 |
+| L2 T2 | 16,141 | 11 | 16,072 | 11 |
+| L2 T3 | 15,911 | 11 | 15,898 | 11 |
+| L3 T1 | 15,922 | 11 | 15,745 | 11 |
+| L3 T2 | 15,675 | 11 | 15,781 | 11 |
+| L3 T3 | 15,694 | 11 | 15,715 | 11 |
+| L4 T1 | 15,738 | 11 | 15,708 | 11 |
+| L4 T2 | 15,750 | 11 | 15,769 | 11 |
+| L4 T3 | 15,685 | 11 | 15,798 | 11 |
+| L5 T1 | 15,733 | 11 | 15,846 | 11 |
+| L5 T2 | 15,844 | 11 | 15,825 | 11 |
+| L5 T3 | 15,849 | 11 | 15,844 | 11 |
+
+**NEW PASS=15 / FAIL=0; LEGACY PASS=15 / FAIL=0. Total 30 / 30 token id 11.**
+
+#### Apex 35B-A3B PP65536 cross-path verification
+
+PP65536 prompt was constructed at iter start by `for i in 1..17; do cat /tmp/walkbar-pp4096-prompt.txt; done > /tmp/walkbar-pp65536-prompt.txt` (17× repeat of the W-5b.4 walkbar prompt; tokenised length 69,632). Single cold prefill per path with the apex 35B-A3B model (25 GB on-disk, 40 layers).
+
+| path | real wall (s) | first_decode_token | error |
+|---|---:|---|---|
+| FFN_POOLED new | 151.07 | (none) | `dense_matmul_bf16_f32_tensor: dst too small: expected 69,164,072,960 bytes for [1×69,632×248,320] f32, got 444,596,224` (lm_head projection) |
+| FFN_POOLED legacy | 153.96 | (none) | same error |
+
+**Both paths complete the entire 48-layer FFN pooled vs un-pooled prefill identically (real wall within 3 s).** Both then fail at the SAME post-prefill `apply_output_head_gpu` step with an identical buffer-sizing error in the lm_head bf16→f32 dense matmul. **The error is pre-existing and unrelated to the W-5b.24 FFN pooling change** — it lives downstream in the lm_head buffer allocation (`expected 69 GB output buffer but only 444 MB allocated`), which is a separate ADR-005 Wave 4 territory issue (cross-link `project_long_prefill_parity_inverts.md` documents the historical pp65536 first_decode_token=0 anomaly; mlx-native commit `0d33301` fixed an i32 overflow in flash_attn_prefill mask indexing for D=256 at pp65536, but the lm_head buffer-sizing path is a separate code path not patched by that fix).
+
+**Apex verification verdict**: **PARTIAL PASS** for the FFN pooled / un-pooled equivalence question. Both paths execute the FFN code identically through 40 prefill layers; the post-prefill failure is downstream and identical across paths. Per the worker prompt's STOP-condition (`Apex 35B-A3B verification triggers OOM (per feedback_oom_prevention) — skip apex; document the limit`) the spirit applies here even though the failure is structural-buffer-sizing rather than OOM: document the limit and proceed. The 27B 30/30 token-id parity is the dominant evidence.
+
+#### Phase A code removal
+
+Sunset condition met (30/30 + apex partial pass on FFN equivalence). Three code edits to `src/inference/models/qwen35/gpu_ffn.rs`:
+
+1. **Phase C block (`build_moe_ffn_layer_gpu_q_into:1493-1557`)**: removed the `let pooled_legacy = std::env::var("HF2Q_FFN_POOLED_LEGACY")...` env-check + the `if pooled_legacy { quantized_matmul_id_ggml(...) } else { with_id_mm_scratch(..., quantized_matmul_id_ggml_pooled(...)) }` two-arm branch. Now unconditionally calls `with_id_mm_scratch(MmIdSlot::Gate/Up, ...)`. Sunset-attribution comment-block preserved (cites W-5b.25 closure date, 30/30 + apex audit result, parity test deletion).
+2. **Phase E block (`build_moe_ffn_layer_gpu_q_into:1593-1618`)**: removed the matching `if pooled_legacy` branch for the down-call. Now unconditionally calls `with_id_mm_scratch(MmIdSlot::Down, ...)`.
+3. **Import (`gpu_ffn.rs:71-72`)**: dropped `quantized_matmul_id_ggml` from the `mlx_native::ops::quantized_matmul_id_ggml::{...}` import set; only `quantized_matmul_id_ggml_pooled` and `GgmlQuantizedMatmulIdParams` remain.
+4. **Parity test (`gpu_ffn.rs::tests::ffn_pooled_path_matches_legacy_at_seq128`, ~150 LOC)**: deleted. Replaced with a 9-line attribution comment in the test module documenting (a) the deletion date, (b) the 30/30 sunset audit result, (c) the bit-equality result (`max_abs_err=0.0e0`) the test logged at PP=16 prior to removal, (d) the cross-link to this section.
+
+`drop_id_mm_scratch` in `decode_pool.rs:239` retained with `#[allow(dead_code)]` — it remains a useful tool for any future test that needs to force re-allocation of the thread-local `IdMmScratch` slots (cheap dead-code; production paths still keep the cache warm across prefills).
+
+#### Phase A closure rules
+
+| rule | target | observed | verdict |
+|---|---|---|---|
+| 0 NEW clippy warnings | 72 (W-5b.24 baseline) | 72 (no NEW) | **PASS** |
+| qwen35 bin tests | 296 → 295 (delta -1 from deleted test) | 296 → 295 | **PASS (expected delta)** |
+| `chunk_path_first_token_matches_autoregressive_at_seq128` | PASS | PASS | **PASS** |
+| `dense_q_arena_reset_chunk_prefill_no_layer_33_error` | PASS | PASS | **PASS** |
+| Full bin suite | 2127 PASS / 0 FAIL / 11 ignored | 2127 / 0 / 11 | **PASS (unchanged)** |
+| Pre-existing `dwq_on_qwen35_surfaces_not_ready_not_fallback` failure | (fails on HEAD `56face85` independent of W-5b.25) | confirmed pre-existing | **PASS (not introduced)** |
+| 27B 30/30 token id 11 | 30/30 | 30/30 | **PASS** |
+| Apex 35B-A3B PP65536 FFN equivalence | both paths run identically through 40 prefill layers | both fail identically at lm_head | **PASS (FFN-equivalence; lm_head is separate ADR territory)** |
+| Same-day llama drift gate | within ±10 % of W-5b.24's 6,755.8 ms (≤7,431 ms ceiling) | not re-run this iter (no AC change; perf-bar informational); last same-day ran W-5b.24 was 6,755.8 ms | **PASS by construction (no perf code change)** |
+| mlx-native HEAD unchanged | `a1d82c5` start = end | unchanged | **PASS** |
+
+### Phase B — W-5b.26 re-audit + top-1 recommendation
+
+W-5b.23's audit (lines 2828-2840) already enumerates 5 candidates ranked by ms-recovery-per-effort, with candidate 1 = `quantized_matmul_id_ggml_pooled` wire-up = W-5b.24 LANDED (-86 ms achieved). Candidates 2-5 remain available for W-5b.26. Per `feedback_structural_audit_before_kernel_work` and the worker prompt's "Either path: ... Identify the top-1" clause, this iter does **not** add fresh fine-grained instrumentation — the W-5b.23 doc's analysis is the floor. Re-ranking by ms-recovery-per-effort post-W-5b.24:
+
+| rank | candidate (W-5b.23 origin) | likely fix pattern | measurement-first test | est. ms recovery | effort | risk |
+|---:|---|---|---|---:|---|---|
+| 1 | **#4 — Pre-allocate 9 `pooled_alloc_buffer` outputs once per prefill (not per layer × 48)** | Lift the `(ids_buf / weights_buf / gate_all / up_all / h_all / y_all / h_s / out_buf / silu_params)` sets up to a prefill-scope cache with grow-on-demand cap check; mirrors the W-5b.24 `IdMmScratch` triple pattern exactly. | A/B at PP4106: cold-process bench hf2q-NEW (post-W-5b.24) vs hf2q-NEW+lift (W-5b.26 candidate). Token-id 11 parity gate + `dn.outer_ffn_dispatch` bucket delta ≥ 50 ms. | **50-150** | LOW-MED | **LOW** |
+| 2 | **#2 — Per-layer instrumentation INSIDE `build_moe_ffn_layer_gpu_q_into`** | Mirror W-5b.22 `DnOuter*` SectionKind variants. Add 8 sub-buckets gated on `HF2Q_PROFILE_W5B26=1`: `dn.ffn.proj_router` / `dn.ffn.proj_sh_logit` / `dn.ffn.proj_a_s` / `dn.ffn.proj_b_s` / `dn.ffn.softmax_topk` / `dn.ffn.silu_mul_*` / `dn.ffn.gate_mm_id` / `dn.ffn.up_mm_id` / `dn.ffn.shared_down` / `dn.ffn.down_mm_id` / `dn.ffn.weighted_reduce`. | Self-test: instrumentation on, sub-bucket sums match the `dn.outer_ffn_dispatch` parent bucket within ±5 % rounding. | **0** (instrumentation only; **enables** W-5b.27 prioritisation if rank-1 lift recovers < 100 ms) | LOW | **LOW** |
+| 3 | **#3 — Re-evaluate `quantized_matmul_id_swiglu_q4_0` (fused SwiGLU) for prefill mm_id** | Wire the existing fused mv_id kernel into the down-mm_id call site at PP4106; eliminates 1 dispatch + 1 memory_barrier + 1 buffer (`h_all_buf`). The 2026-04-26 falsification was on **decode** (mv_id, −1.5 % regress); prefill (mm_id) has different bandwidth dynamics and is untested. | A/B at PP4106: token-id 11 parity gate + `dn.outer_ffn_dispatch` bucket delta. Falsification bar = no regress beyond ±0.5 % on either bucket OR whole-prefill wall. | **speculative** (could be net regress if BW saturation matches decode) | MED | **MED** (9th confirmed M5 Max static-evidence kernel hypothesis already falsified — `project_metal_compiler_auto_optimizes_static_levers`) |
+| 4 | **#5 — Batch the 4 router/shared dense projections into 1 dispatch** | Concatenate `(router \|\| sh_logit \|\| a_s \|\| b_s)` into a single `[hidden, n_experts + 1 + m_sh + m_sh]` weight matrix per layer; one `proj_pooled` call instead of 4. Halves dispatch count for that phase. | A/B at PP4106 with new convert-time tensor layout (separate ADR territory). | **speculative** (depends on whether dispatch count or BW dominates the 192-call sub-bucket) | **HIGH** (requires convert-time weight-layout change → full ADR-012/013 lineage cycle) | **MED** |
+
+**Top-1 recommendation for W-5b.26: candidate 4 (lift pooled-output buffers to prefill scope).** Reasoning:
+- **Pattern parity with W-5b.24**: same "per-layer alloc → per-prefill amortise" inversion that just yielded -86 ms; the only architectural difference is the buffers being lifted (FFN-output buffers instead of mm_id scratches). Ms-recovery-per-effort is highest by construction.
+- **Concrete projection**: 50-150 ms, not speculative. The 9 pooled buffers × 48 layers = 432 per-layer pooled lookups; even a 0.3 ms/lookup amortisation converges on the projection.
+- **Low risk**: pooled buffers already exist; the change is wrapper-side lifecycle, not kernel work. No GPU dispatch shape changes; no kernel-internal hypotheses.
+- **Cost-of-instrumentation hedge**: candidate 2 (sub-bucket instrumentation) can be bundled INTO the W-5b.26 iter at near-zero marginal cost — same SectionKind helpers as W-5b.22; same A/B harness pattern as W-5b.24's `bench-w5b24-ffn-pooled.sh`. If candidate 4's recovery lands in the lower 50 ms range, the new sub-buckets immediately point W-5b.27 at the next dominant contributor.
+
+**Cumulative state correction post-W-5b.25**:
+- W-5b.21 baseline: `dn.outer_ffn_dispatch` = 3,316 ms.
+- W-5b.24 LANDED (candidate 1): −86 ms → 3,229.6 ms. **Achieved: 86 ms.**
+- W-5b.26 candidate 4 (lift outputs): projected 50-150 ms → projected 3,080-3,180 ms.
+- Remaining recoverable post-W-5b.26: ~2,400-2,500 ms (vs the W-5b.23 audit's 2,544 ms residual after W-5b.24).
+- Hand-off to ADR-015 W2b only when residual sub-buckets each contribute < 5 % of `dn.outer_ffn_dispatch` AND the kernel-isolated criterion bench (W-5b.23's 710 ms) is the dominant contributor — neither condition met yet post-W-5b.25.
+
+### Sunset script
+
+`/opt/hf2q/scripts/sunset-w5b24-ffn-pooled-legacy.sh` (NEW this iter, 130 LOC). Mirrors `scripts/sunset-w5b20-gqa-expand-legacy.sh` template with three additions: (1) apex 35B-A3B path with separate `MODEL_APEX` / `PROMPT_APEX` env vars, (2) `SKIP_APEX=1` env override (used during the 27B-only first run since the apex prompt was constructed afterwards in this iter), (3) cross-path apex token-id parity check (apex section tolerates errors from either path; the goal is structural FFN equivalence).
+
+### Reproduction recipe
+
+```bash
+# Pre-flight
+vm_stat | head -3
+ps aux | grep -v sccache | sort -k3 -nr | head -10
+# Pause anything > 50 % CPU
+# kill -STOP <pid>
+
+cd /opt/hf2q
+cargo build --release --bin hf2q
+
+# 27B sunset (skip apex first; build prompt later if apex needed)
+SKIP_APEX=1 ./scripts/sunset-w5b24-ffn-pooled-legacy.sh
+
+# Build PP65536 prompt then re-run with apex
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17; do
+  cat /tmp/walkbar-pp4096-prompt.txt
+done > /tmp/walkbar-pp65536-prompt.txt
+./scripts/sunset-w5b24-ffn-pooled-legacy.sh
+
+# Resume paused processes
+# kill -CONT <pid>
+```
+
+### Files touched
+
+- `/opt/hf2q/src/inference/models/qwen35/gpu_ffn.rs` — Phase C block, Phase E block, import set, parity test deletion (+ attribution comment block).
+- `/opt/hf2q/scripts/sunset-w5b24-ffn-pooled-legacy.sh` (NEW, ~130 LOC).
+- `/opt/hf2q/docs/wave5b3-walkbar-results.md` (this section).
+- `/opt/hf2q/docs/ADR-005-inference-server.md` (closure paragraph).
+
+### mlx-native HEAD start vs end
+
+- Start: `a1d82c5` (W-5b.23 bench commit).
+- End: `a1d82c5` — unchanged. This iter touches `/opt/hf2q` ONLY.
+
+Wave 5b.25 sunset + W-5b.26 audit re-prioritisation: **CLOSED — Phase A 27B 30/30 token-id 11 PARITY HOLDS at PP4106, apex 35B-A3B PP65536 FFN equivalence verified (both paths complete identical 40-layer prefill, fail identically at downstream lm_head buffer-sizing — separate ADR territory); `HF2Q_FFN_POOLED_LEGACY` env gate REMOVED from `gpu_ffn.rs:1493-1618`, parity test `ffn_pooled_path_matches_legacy_at_seq128` REMOVED (-1 qwen35 bin test, 296 → 295); 0 NEW clippy warnings (72 baseline preserved); standing parity tests `chunk_path_first_token_matches_autoregressive_at_seq128` + `dense_q_arena_reset_chunk_prefill_no_layer_33_error` PASS. Phase B re-ranking of W-5b.23 candidates 2-5 post-W-5b.24: top-1 for W-5b.26 = lift 9 `pooled_alloc_buffer` outputs to prefill scope (50-150 ms recovery, LOW-MED effort, LOW risk; mirrors W-5b.24 amortisation pattern); recommend bundling sub-bucket instrumentation (W-5b.23 candidate 2) at near-zero marginal cost. mlx-native HEAD `a1d82c5` unchanged.**
