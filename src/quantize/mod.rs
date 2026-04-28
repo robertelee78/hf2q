@@ -3949,6 +3949,181 @@ mod tests {
         );
     }
 
+    /// ADR-014 P7 iter-32 — exhaustive variant × calibrator matrix.
+    /// Auto-iterates every variant in `KQuantVariant::all()` and asserts
+    /// the calibrator-orthogonality invariants on a guaranteed-base-routed
+    /// tensor (`blk.5.attn_q.weight`):
+    ///
+    ///   For every variant V:
+    ///     1. quant_method(V, None) == quant_method(V, Imatrix)
+    ///        — calibration must NOT change the variant identity tag.
+    ///     2. ggml_type(V, None) == ggml_type(V, Imatrix)
+    ///        — calibration must NOT change the routing decision.
+    ///     3. byte_count(V, None) == byte_count(V, Imatrix)
+    ///        — same target → same block size.
+    ///     4. If V's base target supports imatrix:
+    ///        bytes(V, None) != bytes(V, Imatrix)
+    ///        — non-uniform importance MUST flow through to the codec
+    ///          search and produce different quantized bytes.
+    ///        Else (theoretical, no current variant base targets fail this):
+    ///        bytes(V, None) == bytes(V, Imatrix)
+    ///        — calibration silently no-ops on non-supporting codec.
+    ///
+    /// Mirrors iter-31's exhaustive variant-pair matrix but on the
+    /// orthogonal calibrator dimension.  Per Decisions 9+11, calibrator
+    /// and OutputFormat (variant→target) are independent — this test
+    /// pins that orthogonality through the streaming pipeline.
+    ///
+    /// Future-proofing: adding a new variant to `all()` automatically
+    /// extends matrix coverage.  Adding a new `KQuantTarget` with
+    /// `supports_imatrix = false` would land in the else branch and
+    /// require zero test changes.
+    #[test]
+    fn variant_calibrator_matrix_through_streaming() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::calibrate::imatrix::ImatrixCollector;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+
+        const QK_K: usize = 256;
+        const N_BLOCKS: usize = 4;
+        const TOTAL: usize = N_BLOCKS * QK_K;
+        const N_LAYERS: usize = 32;
+        const TENSOR: &str = "blk.5.attn_q.weight";
+        const HIGH_IMPORTANCE_COLS: usize = 16;
+
+        // Adversarial input pattern (iter-3z/iter-14/iter-23):
+        // wide-range values in high-importance columns + small steady
+        // values in low-importance.  Combined with the 100× / 0.01×
+        // importance ratio, every K-quant codec including Q6_K should
+        // make a different codebook choice between None and Imatrix
+        // calibration paths.
+        let original_f32: Vec<f32> = (0..TOTAL)
+            .map(|i| {
+                let c = i % QK_K;
+                let r = (i / QK_K) as f32;
+                if c < HIGH_IMPORTANCE_COLS {
+                    let t = (c as f32 / HIGH_IMPORTANCE_COLS as f32) + r * 0.5;
+                    -3.0 + 6.0 * t.fract()
+                } else {
+                    let t = (c as f32 / QK_K as f32) + r * 0.01;
+                    -0.1 + 0.2 * t.fract()
+                }
+            })
+            .collect();
+        let payload: Vec<u8> = original_f32
+            .iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+            .collect();
+
+        let make_lazy_map = || -> LazyTensorMap {
+            let mut m = LazyTensorMap::new();
+            m.insert(LazyTensor::from_bytes(
+                LazyMeta::new(TENSOR.to_string(), vec![N_BLOCKS, QK_K], DType::F16),
+                payload.clone(),
+            ));
+            m
+        };
+
+        // Non-uniform importance (10000× ratio).
+        let acts: Vec<f32> = (0..QK_K)
+            .map(|c| {
+                if c < HIGH_IMPORTANCE_COLS {
+                    10.0
+                } else {
+                    0.1
+                }
+            })
+            .collect();
+        let mut col = ImatrixCollector::new();
+        col.accumulate_dense(TENSOR, &acts, 1, QK_K).unwrap();
+        col.record_chunk();
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+
+        let variants: &'static [KQuantVariant] = KQuantVariant::all();
+
+        for v in variants {
+            // None-calibrated path.
+            let q_none = VariantKQuantizer::new(*v, CalibrationData::None, N_LAYERS);
+            let out_none =
+                quantize_streaming(make_lazy_map(), &metadata, &q_none, 0, 0, &progress, false)
+                    .unwrap_or_else(|e| panic!("variant {v:?} None streaming: {e:?}"));
+
+            // Imatrix-calibrated path (rebuild calibration each iter to
+            // avoid sharing state — collector::from_imatrix_collector
+            // takes &col, doesn't consume).
+            let imatrix = CalibrationData::from_imatrix_collector(&col);
+            let q_imatrix = VariantKQuantizer::new(*v, imatrix, N_LAYERS);
+            let out_imatrix =
+                quantize_streaming(make_lazy_map(), &metadata, &q_imatrix, 0, 0, &progress, false)
+                    .unwrap_or_else(|e| panic!("variant {v:?} Imatrix streaming: {e:?}"));
+
+            // Invariant 1: quant_method tag stable across calibrators.
+            assert_eq!(
+                out_none.quant_method, out_imatrix.quant_method,
+                "variant {v:?}: quant_method changed between None ({}) and \
+                 Imatrix ({}) — calibrator is leaking into variant identity",
+                out_none.quant_method, out_imatrix.quant_method
+            );
+
+            let t_none = out_none
+                .tensors
+                .get(TENSOR)
+                .unwrap_or_else(|| panic!("variant {v:?} None missing {TENSOR}"));
+            let t_imatrix = out_imatrix
+                .tensors
+                .get(TENSOR)
+                .unwrap_or_else(|| panic!("variant {v:?} Imatrix missing {TENSOR}"));
+
+            // Invariant 2: ggml_type stable across calibrators.
+            assert_eq!(
+                t_none.quant_info.ggml_type, t_imatrix.quant_info.ggml_type,
+                "variant {v:?}: ggml_type changed between None ({:?}) and \
+                 Imatrix ({:?}) — calibrator is mis-routing the codec dispatch",
+                t_none.quant_info.ggml_type, t_imatrix.quant_info.ggml_type
+            );
+
+            // Invariant 3: byte-count stable across calibrators.
+            assert_eq!(
+                t_none.data.len(),
+                t_imatrix.data.len(),
+                "variant {v:?}: byte-count changed between None ({}) and \
+                 Imatrix ({}) — block-size drift across calibration",
+                t_none.data.len(),
+                t_imatrix.data.len()
+            );
+
+            // Invariant 4: bytes diverge IFF base codec supports imatrix.
+            // The adversarial 4-super-block fixture combined with the
+            // 100× importance ratio is sharp enough to force divergence
+            // across every K-quant family (Q2-Q6) — proven by per-codec
+            // tests iter-13/14 (Q3_K_M), iter-3w/3z (Q4_K_M), iter-23
+            // (Q2_K), iter-25 (Q2_K_S).  Q5_K_M and Q6_K extend the
+            // surface here.
+            let supports = v.base_target().supports_imatrix();
+            if supports {
+                assert_ne!(
+                    t_none.data, t_imatrix.data,
+                    "variant {v:?} (base {:?} supports imatrix): None and \
+                     Imatrix produced byte-identical output — imatrix \
+                     payload is being silently stripped before the codec",
+                    v.base_target()
+                );
+            } else {
+                assert_eq!(
+                    t_none.data, t_imatrix.data,
+                    "variant {v:?} (base {:?} does NOT support imatrix): \
+                     None and Imatrix produced different output — codec \
+                     is silently using imatrix despite supports_imatrix=false",
+                    v.base_target()
+                );
+            }
+        }
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
