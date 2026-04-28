@@ -157,6 +157,27 @@ fi
 } > "$META_OUT"
 echo "wrote run metadata: $META_OUT"
 
+# Provenance: SHA of the worktree that produced HF2Q_BIN (iter11 codex
+# review #5; iter12 wired this in).  Run-wide, written before any trials.
+# Resolves to the worktree by walking dirname / dirname / dirname from
+# HF2Q_BIN (e.g. /opt/hf2q/target/release/hf2q -> /opt/hf2q).
+BIN_SHA_OUT="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.binary-source-sha.txt"
+{
+  hf2q_bin_dir="$(dirname "$HF2Q_BIN")"
+  hf2q_target_dir="$(dirname "$hf2q_bin_dir")"
+  hf2q_worktree_root="$(dirname "$hf2q_target_dir")"
+  echo "hf2q_bin=$HF2Q_BIN"
+  echo "worktree_root=$hf2q_worktree_root"
+  if [[ -d "$hf2q_worktree_root/.git" || -f "$hf2q_worktree_root/.git" ]]; then
+    echo "binary_source_sha=$(git -C "$hf2q_worktree_root" rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "binary_source_branch=$(git -C "$hf2q_worktree_root" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+  else
+    echo "binary_source_sha=unknown (no .git at $hf2q_worktree_root)"
+  fi
+  echo "hf2q_main_repo_sha=$(git -C /opt/hf2q rev-parse HEAD 2>/dev/null || echo unknown)"
+} > "$BIN_SHA_OUT"
+echo "wrote binary source sha: $BIN_SHA_OUT"
+
 # ----------------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------------
@@ -253,16 +274,42 @@ capture_process_audit() {
     > "$outpath" 2>/dev/null || true
 }
 
+# Per-trial pmset / vm_stat / brain-stat archival.  Added 2026-04-28
+# (iter12 codex review #4-#5): iter11 only archived run-wide pre-bench
+# state, leaving no per-trial evidence that the cold-SoC and STOPped
+# brain held throughout each trial.
+capture_trial_gates() {
+  local stage="$1"     # "pre" | "post"
+  local label_path="$2"  # e.g. baseline-...-LABEL-DATE.{hf2q,llama}.trial-N
+  pmset -g therm > "${label_path}.${stage}.pmset-therm" 2>&1 || true
+  vm_stat        > "${label_path}.${stage}.vm_stat"      2>&1 || true
+  # mcp-brain-server pid lookup is best-effort; if it isn't running, skip.
+  local brain_pid
+  brain_pid="$(pgrep -f 'mcp-brain-server' | head -1 || true)"
+  if [[ -n "$brain_pid" ]]; then
+    ps -p "$brain_pid" -o pid,stat,pcpu,comm \
+      > "${label_path}.${stage}.brain-stat" 2>&1 || true
+  fi
+}
+
+# NOTE: provenance capture (iter11 codex review #5) is performed inline at
+# the metadata block above (search for `BIN_SHA_OUT`).  An earlier draft
+# defined a separate `capture_binary_source_sha` helper here; codex iter12
+# review #12 caught it as dead code, so the helper was removed and the
+# inline path is the single source of truth.
+
 # Run a single hf2q cold trial.
 run_hf2q_trial() {
   local trial="$1"
-  local stdout_out="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.hf2q.trial-${trial}.stdout"
-  local stderr_out="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.hf2q.trial-${trial}.stderr"
-  local audit_out="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.hf2q.trial-${trial}.process-audit"
+  local label_path="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.hf2q.trial-${trial}"
+  local stdout_out="${label_path}.stdout"
+  local stderr_out="${label_path}.stderr"
+  local audit_out="${label_path}.process-audit"
   # Progress messages to STDERR — function's stdout must contain ONLY
   # the parsed tok/s value, since the caller captures it via $().
   echo "  hf2q trial $trial → $stdout_out" >&2
   capture_process_audit "$audit_out"
+  capture_trial_gates "pre" "$label_path"
   set +e
   "$HF2Q_BIN" generate \
     --model "$MODEL" \
@@ -273,6 +320,7 @@ run_hf2q_trial() {
       > "$stdout_out" 2> "$stderr_out"
   local rc=$?
   set -e
+  capture_trial_gates "post" "$label_path"
   if [[ $rc -ne 0 ]]; then
     echo "    WARN: hf2q exit $rc; see $stderr_out" >&2
   fi
@@ -282,13 +330,15 @@ run_hf2q_trial() {
 # Run a single llama-bench cold trial.
 run_llama_trial() {
   local trial="$1"
-  local stdout_out="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.llama.trial-${trial}.stdout"
-  local stderr_out="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.llama.trial-${trial}.stderr"
-  local audit_out="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.llama.trial-${trial}.process-audit"
+  local label_path="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.llama.trial-${trial}"
+  local stdout_out="${label_path}.stdout"
+  local stderr_out="${label_path}.stderr"
+  local audit_out="${label_path}.process-audit"
   # Progress messages to STDERR — function's stdout must contain ONLY
   # the parsed tok/s value (caller captures via $()).
   echo "  llama-bench trial $trial → $stdout_out" >&2
   capture_process_audit "$audit_out"
+  capture_trial_gates "pre" "$label_path"
   set +e
   "$LLAMA_BENCH_BIN" \
     -m "$MODEL" \
@@ -298,6 +348,7 @@ run_llama_trial() {
       > "$stdout_out" 2> "$stderr_out"
   local rc=$?
   set -e
+  capture_trial_gates "post" "$label_path"
   if [[ $rc -ne 0 ]]; then
     echo "    WARN: llama-bench exit $rc; see $stderr_out" >&2
   fi
