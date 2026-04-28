@@ -1145,17 +1145,52 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     // immediately before Phase 2's backend dispatch. After P2 the
     // bridge becomes test-only.
     //
-    // **ADR-014 P7 iter-42 audit (2026-04-28)**: P2 iter-3 (production
-    // wiring of `quantize_streaming` into Phase 3 dispatch) remains
-    // pending.  `quantize::quantize_streaming` ships and is gated by
-    // 50+ matrix tests + the `streaming_output_validates_clean_against_gguf_backend`
-    // contract test in `quantize::tests`.  Drop-in is structurally
-    // safe against `GgufBackend::validate`; what's left is the surgery
-    // to skip `materialize_all()` here and pass `lazy_map` directly to
-    // the K-quant codec / variant / DwqK Phase 3 arms.  Phase 4.5
-    // quality measurement still requires `tensor_map` for the F32
-    // reference, so the wire-up needs a coherent story for that
-    // dependency (either lazy quality measurement or a re-read pass).
+    // **ADR-014 P7 iter-53 survey (2026-04-28)** — remaining tensor_map
+    // consumers downstream of this bridge, in order of dependency:
+    //
+    //   ✅ Phase 3 dispatch (4 arms)            iter-48-51 wired (env-flag)
+    //   ✅ Phase 4.5 quality measurement        iter-52 wired (env-flag)
+    //
+    //   ⏳ Telemetry (cheap):
+    //         - tensor_map.total_size_bytes()   needs `LazyTensorMap::total_size_bytes`
+    //         - tensor_map.len()                LazyTensorMap::len() exists
+    //
+    //   ⏳ bf16→f16 in-place conversion at line ~1188:
+    //         - needs `LazyTensorMap::convert_bf16_to_f16`
+    //         - quantize_streaming already handles per-tensor bf16→f16
+    //           via its `bf16_to_f16: bool` arg; the upfront mutation
+    //           here is for non-streaming paths.
+    //
+    //   ⏳ DWQ calibrator path (line 1275-1277):
+    //         - clone_tensor_map_to_lazy(&tensor_map) / from_eager_borrowed
+    //         - already builds lazy map from tensor_map; trivially flips
+    //           when the source is already a LazyTensorMap
+    //
+    //   ⏳ bit_overrides scan (lines 1765, 1789):
+    //         - tensor_map.tensors.keys() → swap to lazy_map.names()
+    //
+    //   🔴 Phase 4.6 native backend (line 1898):
+    //         - backend.quantize_and_write(&tensor_map, ...) — trait
+    //           contract requires &TensorMap
+    //         - Two options: (A) add quantize_and_write_lazy variant
+    //           to OutputBackend trait, (B) keep materialize_all but
+    //           move it INSIDE the native arm.  Option B simpler.
+    //
+    // Plan for the wholesale skip (queued for iter-54+):
+    //   1. Replace this `materialize_all()` with conditional bridge:
+    //        if backend.requires_native_quantization() {
+    //            // native path needs eager tensor_map; materialize here
+    //            tensor_map = lazy_map.materialize_all()?;
+    //        } else {
+    //            // non-native path stays lazy through Phase 3 + 4.5;
+    //            // tensor_map is never materialised
+    //        }
+    //   2. Add LazyTensorMap::total_size_bytes + convert_bf16_to_f16.
+    //   3. Carry lazy_map through Phase 3 + 4.5 + bit_overrides + telemetry.
+    //
+    // Until then, this bridge runs upfront and `HF2Q_STREAMING_PHASE3=1`
+    // (iter-48 onwards) exercises the streaming code path through the
+    // resident eager tensor_map (TEST INTEGRATION not memory win).
     let mut tensor_map = lazy_map
         .materialize_all()
         .context("Failed to materialise lazy tensor map (P1→P2 bridge)")
