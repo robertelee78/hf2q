@@ -442,6 +442,181 @@ pub fn measure_quality_streaming(
     Ok(report)
 }
 
+/// ADR-014 P7 iter-43 — `LazyTensorMap`-aware quality measurement.
+///
+/// Drop-in replacement for [`measure_quality_streaming`] that takes a
+/// borrowed [`crate::ir::lazy::LazyTensorMap`] instead of a fully
+/// materialised [`TensorMap`].  Each tensor is materialized via
+/// `LazyTensor::materialize_cloned` (borrowed access — does not
+/// consume the lazy map), F32-cast, compared against the dequantized
+/// counterpart, then dropped before the next iteration.
+///
+/// **Memory budget**: ~max(original_tensor_F32, dequant_tensor_F32) × 2
+/// peak — same per-tensor bound as the eager-input variant, but the
+/// caller no longer needs to keep the entire `TensorMap` resident.
+/// This is the iter-3 wedge for `main.rs:1147`'s `materialize_all()`
+/// bridge: with this variant in place, Phase 4.5 quality measurement
+/// can run directly off the same `lazy_map` that Phase 1.x produced,
+/// removing the materialization-bridge dependency.
+///
+/// Returns the same shape of [`QualityReport`] as the eager variant,
+/// so downstream consumers ([`print_quality_summary`],
+/// [`check_thresholds`]) work unchanged.
+///
+/// **Byte-identity to `measure_quality_streaming`**: when both are
+/// invoked on the same logical tensor set with the same weight-name
+/// filter, the per-layer cosine values are byte-identical (modulo
+/// floating-point ordering).  Verified by
+/// `quality::tests::measure_quality_streaming_lazy_matches_eager`.
+pub fn measure_quality_streaming_lazy(
+    original_lazy: &crate::ir::lazy::LazyTensorMap,
+    quantized: &QuantizedModel,
+    _metadata: &ModelMetadata,
+    _model_dir: &Path,
+    progress: &ProgressReporter,
+) -> Result<QualityReport, QualityError> {
+    let mut weight_names: Vec<&String> = quantized
+        .tensors
+        .keys()
+        .filter(|name| {
+            // Materialize-borrowed for is_weight() — this is metadata
+            // (shape) + name only, so no byte payload is read.  The
+            // borrowed materialize path on a Materialized variant is
+            // a clone (cheap for metadata-only); on a Lazy variant it
+            // would read the bytes — but we only need the metadata
+            // here, so we just check via a TensorRef built from
+            // metadata fields.
+            original_lazy
+                .get(*name)
+                .map(|lt| {
+                    let meta = lt.meta();
+                    is_weight_from_metadata(&meta.name, &meta.shape)
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    weight_names.sort();
+
+    let pb = progress.bar(weight_names.len() as u64, "Quality measurement (lazy streaming)");
+
+    let mut report = QualityReport::empty();
+    let mut per_layer: Vec<f64> = Vec::with_capacity(weight_names.len());
+    let mut min_val: f64 = 1.0;
+    let mut min_idx: usize = 0;
+
+    for (idx, name) in weight_names.iter().enumerate() {
+        let lazy_orig = match original_lazy.get(*name) {
+            Some(l) => l,
+            None => {
+                pb.inc(1);
+                continue;
+            }
+        };
+        let qt = &quantized.tensors[*name];
+
+        // Materialize the original on a borrow (cloned bytes if Lazy
+        // variant; cheap clone if Materialized).
+        let orig_tensor = match lazy_orig.materialize_cloned() {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Failed to materialize {} for quality: {}", name, e);
+                pb.inc(1);
+                continue;
+            }
+        };
+
+        // Dequantize the quantized side; drop after F32 cast.
+        let dequant_ref = dequantize_single_tensor(name, qt);
+
+        let orig_f32 = tensor_ref_to_f32(&orig_tensor);
+        let dequant_f32 = tensor_ref_to_f32(&dequant_ref);
+        // Drop the byte buffers as soon as F32 is in hand — the
+        // memory-budget point of streaming.
+        drop(orig_tensor);
+        drop(dequant_ref);
+
+        if orig_f32.is_empty() || dequant_f32.is_empty() {
+            pb.inc(1);
+            continue;
+        }
+
+        let len = orig_f32.len().min(dequant_f32.len());
+        let sim = match cosine_sim::cosine_similarity(&orig_f32[..len], &dequant_f32[..len]) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Cosine similarity failed for tensor '{}': {}", name, e);
+                pb.inc(1);
+                continue;
+            }
+        };
+
+        if sim < min_val {
+            min_val = sim;
+            min_idx = idx;
+        }
+        per_layer.push(sim);
+        drop(orig_f32);
+        drop(dequant_f32);
+        pb.inc(1);
+    }
+
+    pb.finish_with_message("Quality measurement complete (lazy)");
+
+    if !per_layer.is_empty() {
+        let average = per_layer.iter().sum::<f64>() / per_layer.len() as f64;
+        report.cosine_sim_average = Some(average);
+        report.cosine_sim_min = Some(min_val);
+        report.cosine_sim_min_layer = Some(min_idx);
+        report.per_layer_cosine_sim = Some(per_layer);
+    } else {
+        warn!("No matching weight tensors found for lazy quality measurement");
+    }
+
+    info!(
+        weight_pairs = report
+            .per_layer_cosine_sim
+            .as_ref()
+            .map(|v| v.len())
+            .unwrap_or(0),
+        "Lazy weight-level quality measurement complete"
+    );
+
+    Ok(report)
+}
+
+/// Mirror `TensorRef::is_weight` predicate without needing materialised
+/// bytes.  Used by `measure_quality_streaming_lazy` to filter weight
+/// names from `LazyTensor` metadata only.  Stays in sync with
+/// `TensorRef::is_weight` — duplicate logic until that helper accepts
+/// `(&str, &[usize])` directly.
+fn is_weight_from_metadata(name: &str, shape: &[usize]) -> bool {
+    if name.contains("layernorm") || name.contains("layer_norm") || name.contains("_norm.weight") {
+        return false;
+    }
+    if name.contains("bias") {
+        return false;
+    }
+    if name.contains("layer_scalar")
+        || name.contains("router.scale")
+        || name.contains("router.per_expert_scale")
+    {
+        return false;
+    }
+    if name.contains("embed_tokens") || name.contains("embedding_projection") {
+        return false;
+    }
+    if shape.len() >= 2 {
+        let row_dim = *shape.last().unwrap();
+        if row_dim < 32 {
+            return false;
+        }
+    }
+    if shape.len() >= 2 {
+        return name.contains("weight") || name.contains("proj") || name.contains("experts.");
+    }
+    false
+}
+
 /// Unpack bit-packed quantized values back to i8.
 fn unpack_quantized(data: &[u8], num_elements: usize, bits: u8) -> Vec<i8> {
     match bits {
@@ -949,6 +1124,89 @@ mod tests {
                 "layer {} streaming cosine {} should be ~1.0 for lossless dequant",
                 i,
                 v,
+            );
+        }
+    }
+
+    /// ADR-014 P7 iter-43 — `measure_quality_streaming_lazy` byte-identity
+    /// to `measure_quality_streaming` on the same fixture, modulo the
+    /// input being a `LazyTensorMap` borrow vs `&TensorMap`.
+    /// Pins the iter-3 wedge contract: when main.rs:1147 swaps
+    /// `materialize_all` for direct `lazy_map` flow, Phase 4.5 quality
+    /// reports the same numbers.
+    #[test]
+    fn measure_quality_streaming_lazy_matches_eager() {
+        let (orig, model) = build_streaming_test_model();
+        let progress = ProgressReporter::new();
+        let metadata = model.metadata.clone();
+        let tmp = std::path::PathBuf::from("/tmp");
+
+        // Eager-input path (existing).
+        let eager = measure_quality_streaming(&orig, &model, &metadata, &tmp, &progress)
+            .expect("eager streaming quality should succeed");
+
+        // Lazy-input path (new in iter-43).  Bridge eager → lazy by
+        // rebuilding the LazyTensorMap from the original tensors'
+        // metadata + bytes (TensorMap doesn't impl Clone, and
+        // `from_eager_borrowed` is metadata-only — its closures return
+        // Err, so `materialize_cloned` would fail).
+        let mut lazy_map = crate::ir::lazy::LazyTensorMap::new();
+        for (_, t) in orig.tensors.iter() {
+            let meta = crate::ir::lazy::LazyMeta::new(
+                t.name.clone(),
+                t.shape.clone(),
+                t.dtype,
+            );
+            lazy_map.insert(crate::ir::lazy::LazyTensor::from_bytes(
+                meta,
+                t.data.clone(),
+            ));
+        }
+        let lazy = measure_quality_streaming_lazy(&lazy_map, &model, &metadata, &tmp, &progress)
+            .expect("lazy streaming quality should succeed");
+
+        // Same number of weight pairs.
+        assert_eq!(
+            eager.per_layer_cosine_sim.as_ref().map(|v| v.len()),
+            lazy.per_layer_cosine_sim.as_ref().map(|v| v.len()),
+            "lazy and eager must report the same number of weight pairs"
+        );
+
+        // Average within fp tolerance.
+        let e_avg = eager.cosine_sim_average.expect("eager avg");
+        let l_avg = lazy.cosine_sim_average.expect("lazy avg");
+        assert!(
+            (e_avg - l_avg).abs() < 1e-9,
+            "eager avg {} ≈ lazy avg {}",
+            e_avg,
+            l_avg
+        );
+
+        // Min and min_layer_idx exact match.
+        let e_min = eager.cosine_sim_min.expect("eager min");
+        let l_min = lazy.cosine_sim_min.expect("lazy min");
+        assert!(
+            (e_min - l_min).abs() < 1e-9,
+            "eager min {} ≈ lazy min {}",
+            e_min,
+            l_min
+        );
+        assert_eq!(
+            eager.cosine_sim_min_layer,
+            lazy.cosine_sim_min_layer,
+            "eager and lazy must agree on min_layer_idx"
+        );
+
+        // Per-layer values agree element-wise.
+        let e_per = eager.per_layer_cosine_sim.expect("eager per-layer");
+        let l_per = lazy.per_layer_cosine_sim.expect("lazy per-layer");
+        for (i, (e, l)) in e_per.iter().zip(l_per.iter()).enumerate() {
+            assert!(
+                (e - l).abs() < 1e-9,
+                "layer {}: eager {} ≈ lazy {}",
+                i,
+                e,
+                l
             );
         }
     }
