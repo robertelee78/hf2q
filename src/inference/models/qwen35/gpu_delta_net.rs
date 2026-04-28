@@ -828,19 +828,114 @@ pub fn apply_gated_delta_net_chunk(
     let n_seqs = 1u32; // hf2q forward path is single-seq.
 
     // Element counts.
-    let q_elems = (seq_len * n_k_heads * d_k) as usize; // [T, Hg, K]
+    // Wave 5b.4: GQA-tiled expansion of q/k from Hg=n_k_heads to H=n_v_heads.
+    //
+    // The chunk-pipeline kernels (kkt, recompute_wu, chunk, chunk_o) compute
+    // their GQA mapping as `kh = i_h / group_ratio` (block-style), inherited
+    // from FLA's chunk_delta_h.py:64. The autoregressive Metal kernel and
+    // mlx-native cpu_reference_f32 both use `k_head = v_head % n_k_heads`
+    // (tiled-style), inherited from llama.cpp's `ggml_repeat` semantics
+    // (ops.cpp:1695-1737, the row-broadcast convention used in
+    // `delta-net-base.cpp:357 k = ggml_repeat(ctx0, k, s)`).
+    //
+    // For Qwen3.6 GGUF tensor layout, **tiled** is the correct mapping —
+    // confirmed by Wave 5b.3 pp4096 reproducer (commit c3e88a0): with
+    // HF2Q_QWEN36_AUTOREG=1, hf2q matches llama-completion at token id 11.
+    //
+    // FLA's block-style mapping arises from HF transformers' default
+    // GroupNorm-then-repeat_interleave layout, which Qwen3.6 GGUFs do NOT
+    // honor. Wave 5b.4 audit (2026-04-27 HIGH) found this divergence at
+    // unit-test seq_len=128, max_diff=1.6432e-2 (>300× the bf16-staging
+    // expected ~5e-5).
+    //
+    // Fix: this wrapper pre-expands q and k from [T, Hg, K] to [T, H, K]
+    // with TILED replication (`expanded[t, h, k] = src[t, h % Hg, k]`)
+    // before dispatching to the chunk pipeline with `Hg' = H' = H`. The
+    // chunk-pipeline kernels then degenerate to the no-GQA case where
+    // `kh = i_h / 1 = i_h`, which (after our tiled pre-expansion) is the
+    // tiled GQA convention. Cost: 2× memory + bandwidth on q/k for
+    // n_v_heads/n_k_heads=2 (Qwen3.6 27B's actual ratio); still net 6.7×
+    // faster than autoregressive at pp4096.
+    //
+    // No mlx-native kernel changes (per Wave 5b.4 directive: "Any of the
+    // 6 chunk-pipeline kernel files for non-investigation purposes (only
+    // add diagnostic instrumentation, behind a feature flag if it changes
+    // hot-path semantics)" — wrapper-side fix only).
+    let q_elems_orig = (seq_len * n_k_heads * d_k) as usize; // [T, Hg, K]
+    let q_elems_exp = (seq_len * n_v_heads * d_k) as usize; // [T, H,  K] expanded
     let v_elems = (seq_len * n_v_heads * d_v) as usize; // [T, H, V]
     let g_elems = (seq_len * n_v_heads) as usize; // [T, H]
     let state_elems = (d_k * d_v * n_v_heads) as usize; // [H, V, K] (n_seqs=1)
     let out_elems_bf16 = v_elems; // [T, H, V] bf16
     let out_elems_f32 = (n_v_heads * seq_len * d_v) as usize; // matches autoregressive
 
+    // ---- GQA pre-expansion: tiled-replicate q and k to [T, H, K] in F32. ----
+    // Apple unified memory: CPU-side memcpy from input GPU buffers is safe
+    // here because callers commit_and_wait the upstream q_scale / l2-norm
+    // dispatch before invoking this wrapper (see forward_gpu.rs:1404
+    // `commit chunk-prep prefill` for the prefill call site, and the unit
+    // tests use upload_f32 which is immediately CPU-readable).
+    let q_expanded = device
+        .alloc_buffer(q_elems_exp * 4, DType::F32, vec![q_elems_exp])
+        .map_err(|e| anyhow!("alloc q_expanded f32: {e}"))?;
+    let k_expanded = device
+        .alloc_buffer(q_elems_exp * 4, DType::F32, vec![q_elems_exp])
+        .map_err(|e| anyhow!("alloc k_expanded f32: {e}"))?;
+    {
+        let q_src = q
+            .as_slice::<f32>()
+            .map_err(|e| anyhow!("apply_gated_delta_net_chunk: read q: {e}"))?;
+        let k_src = k
+            .as_slice::<f32>()
+            .map_err(|e| anyhow!("apply_gated_delta_net_chunk: read k: {e}"))?;
+        if q_src.len() < q_elems_orig {
+            return Err(anyhow!(
+                "apply_gated_delta_net_chunk: q has {} f32 elements, expected >= {}",
+                q_src.len(), q_elems_orig
+            ));
+        }
+        if k_src.len() < q_elems_orig {
+            return Err(anyhow!(
+                "apply_gated_delta_net_chunk: k has {} f32 elements, expected >= {}",
+                k_src.len(), q_elems_orig
+            ));
+        }
+        // SAFETY: q_expanded / k_expanded are freshly allocated and not yet
+        // referenced by any encoder; we hold the only reference.
+        let mut q_expanded_mut = q_expanded.clone();
+        let mut k_expanded_mut = k_expanded.clone();
+        let q_dst = q_expanded_mut
+            .as_mut_slice::<f32>()
+            .map_err(|e| anyhow!("apply_gated_delta_net_chunk: q_expanded as_mut_slice: {e}"))?;
+        let k_dst = k_expanded_mut
+            .as_mut_slice::<f32>()
+            .map_err(|e| anyhow!("apply_gated_delta_net_chunk: k_expanded as_mut_slice: {e}"))?;
+        let t_usz = seq_len as usize;
+        let hg_usz = n_k_heads as usize;
+        let hv_usz = n_v_heads as usize;
+        let dk_usz = d_k as usize;
+        // dest[t, h, :] = src[t, h % Hg, :]
+        for t in 0..t_usz {
+            let src_t_base = t * hg_usz * dk_usz;
+            let dst_t_base = t * hv_usz * dk_usz;
+            for h in 0..hv_usz {
+                let kh = h % hg_usz;
+                let src_off = src_t_base + kh * dk_usz;
+                let dst_off = dst_t_base + h * dk_usz;
+                q_dst[dst_off..dst_off + dk_usz]
+                    .copy_from_slice(&q_src[src_off..src_off + dk_usz]);
+                k_dst[dst_off..dst_off + dk_usz]
+                    .copy_from_slice(&k_src[src_off..src_off + dk_usz]);
+            }
+        }
+    }
+
     // ---- Allocate BF16 scratch for q/k/v (chunk pipeline input dtype) ----
     let q_bf16 = device
-        .alloc_buffer(q_elems * 2, DType::BF16, vec![q_elems])
+        .alloc_buffer(q_elems_exp * 2, DType::BF16, vec![q_elems_exp])
         .map_err(|e| anyhow!("alloc q_bf16: {e}"))?;
     let k_bf16 = device
-        .alloc_buffer(q_elems * 2, DType::BF16, vec![q_elems])
+        .alloc_buffer(q_elems_exp * 2, DType::BF16, vec![q_elems_exp])
         .map_err(|e| anyhow!("alloc k_bf16: {e}"))?;
     let v_bf16 = device
         .alloc_buffer(v_elems * 2, DType::BF16, vec![v_elems])
@@ -865,10 +960,16 @@ pub fn apply_gated_delta_net_chunk(
 
     // Build chunk-pipeline params. scale=1.0 because callers already applied
     // the K^-0.5 scale; use_qk_l2norm=false because callers already l2-normed.
+    //
+    // Wave 5b.4 fix: hg = h = n_v_heads after the tiled-GQA pre-expansion
+    // above. The chunk-pipeline kernels' internal `kh = i_h / group_ratio`
+    // mapping then reduces to `kh = i_h / 1 = i_h`, which (after our tiled
+    // pre-expansion) is the tiled GQA convention — matching autoregressive
+    // and llama.cpp ggml_repeat semantics for Qwen3.6.
     let p = ChunkGatedDeltaRuleParams {
         b: n_seqs,
         t: seq_len,
-        hg: n_k_heads,
+        hg: n_v_heads,
         h: n_v_heads,
         k: d_k,
         v: d_v,
@@ -886,28 +987,32 @@ pub fn apply_gated_delta_net_chunk(
         .command_encoder()
         .context("enc apply_gated_delta_net_chunk")?;
 
-    // Stage A: cast q/k/v from F32 → BF16. Three independent dispatches
-    // (no inter-dependency), fused into one barrier-free batch.
+    // Stage A: cast q_expanded/k_expanded/v from F32 → BF16. Three independent
+    // dispatches (no inter-dependency), fused into one barrier-free batch.
+    // Wave 5b.4: q/k are sourced from the GQA-tiled-expanded F32 buffers
+    // (q_expanded/k_expanded) so the chunk-pipeline kernels see matched
+    // [T, H, K] layouts and the internal `kh = i_h / group_ratio` mapping
+    // (now group_ratio=1) becomes a no-op.
     cast(
         &mut enc,
         registry,
         device.metal_device(),
-        q,
+        &q_expanded,
         &q_bf16,
-        q_elems,
+        q_elems_exp,
         CastDirection::F32ToBF16,
     )
-    .context("cast q F32→BF16")?;
+    .context("cast q_expanded F32→BF16")?;
     cast(
         &mut enc,
         registry,
         device.metal_device(),
-        k,
+        &k_expanded,
         &k_bf16,
-        q_elems,
+        q_elems_exp,
         CastDirection::F32ToBF16,
     )
-    .context("cast k F32→BF16")?;
+    .context("cast k_expanded F32→BF16")?;
     cast(
         &mut enc,
         registry,
@@ -2282,5 +2387,283 @@ mod tests {
             msg.contains("use_qk_l2norm"),
             "expected error to cite use_qk_l2norm, got: {msg}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Wave 5b.4 — chunk-vs-autoregressive divergence scaling investigation.
+    //
+    // Wave 5b.3 (commit c3e88a0) reproduced the chunk-pipeline / autoregressive
+    // first-token mismatch at pp4096 on Qwen3.6 27B DWQ46:
+    //   llama-completion              -> token id 11 (`,`)
+    //   hf2q HF2Q_QWEN36_AUTOREG=1    -> token id 11 (`,`)   MATCH
+    //   hf2q + HF2Q_CHUNK_SCAN_PREFILL -> token id 42824 (` spans`)  DIVERGE
+    //
+    // The unit test `chunk_path_first_token_matches_autoregressive_at_seq128`
+    // reports max_diff = 1.6432e-2 abs at seq_len=128 (NT=2 chunks). That gap
+    // compounds along the recurrence and flips argmax stability somewhere in
+    // 128 < seq_len <= 4096.
+    //
+    // This test family at seq_len in {128, 256, 512, 1024, 2048} characterizes
+    // the divergence scaling and adds a CPU f32 ground-truth comparison so we
+    // can see WHICH path drifts (or whether both diverge symmetrically).
+    //
+    // Three cross-references per seq_len:
+    //   max_diff_auto_vs_chunk : the prior-test signal, parametrized.
+    //   max_diff_auto_vs_cpu   : autoregressive vs mlx_native cpu_reference_f32.
+    //   max_diff_chunk_vs_cpu  : chunk pipeline vs the same f32 reference.
+    //
+    // CPU reference uses the SAME recurrence as our autoregressive Metal
+    // kernel and llama.cpp build_delta_net_autoregressive (post-decay state
+    // for `err = v - alpha*S @ k`). FLA's fused_recurrent_gated_delta_rule
+    // (vllm/.../fused_recurrent.py:134-149) uses the same convention.
+    //
+    // Expected scaling shapes:
+    //   - linear in NT (chunk_count) -> per-chunk constant -> bf16-cast at
+    //     chunk boundary
+    //   - linear in seq_len -> per-token constant -> bf16-noise compounding
+    //   - super-linear in seq_len -> recurrence amplification (math bug)
+    //
+    // This test is gated behind HF2Q_W5B4_DIVERGENCE=1 to keep CI fast. Run
+    // with: `HF2Q_W5B4_DIVERGENCE=1 cargo test --release --lib \
+    //         chunk_vs_autoreg_divergence_scaling -- --nocapture`.
+    // -------------------------------------------------------------------
+
+    /// Build the CPU f32 ground truth via mlx-native's authoritative reference.
+    fn cpu_ref_recurrence(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        g: &[f32],
+        beta: &[f32],
+        state_in: &[f32],
+        seq_len: u32,
+        n_k_heads: u32,
+        n_v_heads: u32,
+        d_k: u32,
+        d_v: u32,
+    ) -> Vec<f32> {
+        use mlx_native::ops::gated_delta_net::cpu_reference_f32 as gdn_cpu_ref;
+        let p = GatedDeltaNetParams {
+            d_k,
+            d_v,
+            n_k_heads,
+            n_v_heads,
+            n_tokens: seq_len,
+            n_seqs: 1,
+        };
+        let (out, _state) = gdn_cpu_ref(q, k, v, g, beta, state_in, p);
+        out
+    }
+
+    /// FLA-naive recurrence: pre-decay state for err.
+    /// S' = alpha*S + beta*outer(v - S@k, k)  (NOT the llama.cpp/fused_recurrent form).
+    /// This is the math the chunk_gated_delta_rule_fwd_oracle.py implements.
+    /// We compute it here to disambiguate which convention each path matches.
+    fn cpu_ref_recurrence_pre_decay(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        g: &[f32],
+        beta: &[f32],
+        state_in: &[f32],
+        seq_len: u32,
+        n_k_heads: u32,
+        n_v_heads: u32,
+        d_k: u32,
+        d_v: u32,
+    ) -> Vec<f32> {
+        let d_k = d_k as usize;
+        let d_v = d_v as usize;
+        let nh_k = n_k_heads as usize;
+        let nh_v = n_v_heads as usize;
+        let n_t = seq_len as usize;
+        let kq_token_stride = nh_k * d_k;
+        let v_token_stride = nh_v * d_v;
+        let scalar_stride = nh_v;
+        let state_head_stride = d_v * d_k;
+        let mut output = vec![0.0f32; n_t * v_token_stride];
+        let mut state = state_in.to_vec();
+
+        for vh in 0..nh_v {
+            let kh = vh % nh_k;
+            for t in 0..n_t {
+                let kq_base = t * kq_token_stride + kh * d_k;
+                let v_base = t * v_token_stride + vh * d_v;
+                let sc_idx = t * scalar_stride + vh;
+                let beta_val = beta[sc_idx];
+                let g_val = g[sc_idx];
+                let alpha = (-g_val).exp();
+                let state_base = vh * state_head_stride;
+
+                // Step 1: err uses PRE-decay state.
+                let mut delta = vec![0.0f32; d_v];
+                for i in 0..d_v {
+                    let mut sk = 0.0f32;
+                    for j in 0..d_k {
+                        sk += state[state_base + i * d_k + j] * k[kq_base + j];
+                    }
+                    delta[i] = v[v_base + i] - sk;
+                }
+
+                // Step 2: decay state THEN add outer.
+                for i in 0..d_v {
+                    let beta_delta = beta_val * delta[i];
+                    for j in 0..d_k {
+                        let idx = state_base + i * d_k + j;
+                        state[idx] = alpha * state[idx] + beta_delta * k[kq_base + j];
+                    }
+                }
+
+                // Output = post-update state @ q.
+                for i in 0..d_v {
+                    let mut acc = 0.0f32;
+                    for j in 0..d_k {
+                        acc += state[state_base + i * d_k + j] * q[kq_base + j];
+                    }
+                    output[v_base + i] = acc;
+                }
+            }
+        }
+
+        output
+    }
+
+    fn run_seqlen_with_heads(
+        seq_len: u32,
+        n_k_heads: u32,
+        n_v_heads: u32,
+    ) -> (f32, f32, f32, f32, f32) {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+
+        let d_k: u32 = 128;
+        let d_v: u32 = 128;
+
+        let n_q_elems = (seq_len * n_k_heads * d_k) as usize;
+        let n_v_elems = (seq_len * n_v_heads * d_v) as usize;
+        let n_g_elems = (seq_len * n_v_heads) as usize;
+        let n_state = (d_k * d_v * n_v_heads) as usize;
+        let n_out = (n_v_heads * seq_len * d_v) as usize;
+
+        let mut seed: u32 = 0xDEAD;
+        let q_cpu: Vec<f32> = mk_rand(&mut seed, n_q_elems, 0.05);
+        let k_cpu: Vec<f32> = mk_rand(&mut seed, n_q_elems, 0.05);
+        let v_cpu: Vec<f32> = mk_rand(&mut seed, n_v_elems, 0.1);
+        let g_cpu: Vec<f32> = (0..n_g_elems)
+            .map(|i| 0.001 + 0.0001 * (i as f32 % 7.0))
+            .collect();
+        let beta_cpu: Vec<f32> = (0..n_g_elems)
+            .map(|i| 0.5 + 0.01 * ((i as f32 % 11.0) - 5.0))
+            .collect();
+        let state_zeros = vec![0.0f32; n_state];
+
+        // Auto path
+        let q_a = upload_f32(&q_cpu, &device).expect("upload");
+        let k_a = upload_f32(&k_cpu, &device).expect("upload");
+        let v_a = upload_f32(&v_cpu, &device).expect("upload");
+        let g_a = upload_f32(&g_cpu, &device).expect("upload");
+        let b_a = upload_f32(&beta_cpu, &device).expect("upload");
+        let s_a = upload_f32(&state_zeros, &device).expect("upload");
+        let (auto_out, _) = apply_gated_delta_net(
+            &device, &mut registry, &q_a, &k_a, &v_a, &g_a, &b_a, &s_a,
+            seq_len, n_k_heads, n_v_heads, d_k, d_v,
+        )
+        .expect("auto");
+        let auto_cpu = download_f32(&auto_out).expect("dl auto");
+        assert_eq!(auto_cpu.len(), n_out);
+
+        // Chunk path
+        let q_c = upload_f32(&q_cpu, &device).expect("upload");
+        let k_c = upload_f32(&k_cpu, &device).expect("upload");
+        let v_c = upload_f32(&v_cpu, &device).expect("upload");
+        let g_c = upload_f32(&g_cpu, &device).expect("upload");
+        let b_c = upload_f32(&beta_cpu, &device).expect("upload");
+        let s_c = upload_f32(&state_zeros, &device).expect("upload");
+        let (chunk_out, _) = apply_gated_delta_net_chunk(
+            &device, &mut registry, &q_c, &k_c, &v_c, &g_c, &b_c, &s_c,
+            seq_len, n_k_heads, n_v_heads, d_k, d_v, false,
+        )
+        .expect("chunk");
+        let chunk_cpu = download_f32(&chunk_out).expect("dl chunk");
+
+        // CPU reference (post-decay-err — llama.cpp / FLA fused_recurrent form).
+        let cpu_post = cpu_ref_recurrence(
+            &q_cpu, &k_cpu, &v_cpu, &g_cpu, &beta_cpu, &state_zeros,
+            seq_len, n_k_heads, n_v_heads, d_k, d_v,
+        );
+        // CPU reference (pre-decay-err — FLA chunk_gated_delta_rule_fwd_oracle form).
+        let cpu_pre = cpu_ref_recurrence_pre_decay(
+            &q_cpu, &k_cpu, &v_cpu, &g_cpu, &beta_cpu, &state_zeros,
+            seq_len, n_k_heads, n_v_heads, d_k, d_v,
+        );
+
+        let mut max_ac: f32 = 0.0;
+        let mut max_a_cpost: f32 = 0.0;
+        let mut max_c_cpost: f32 = 0.0;
+        let mut max_a_cpre: f32 = 0.0;
+        let mut max_c_cpre: f32 = 0.0;
+        let mut max_abs_auto: f32 = 0.0;
+        let mut max_abs_chunk: f32 = 0.0;
+        let mut sum_sq_diff: f64 = 0.0;
+        let mut sum_sq_auto: f64 = 0.0;
+        let mut argmax_idx: usize = 0;
+        for i in 0..n_out {
+            let a = auto_cpu[i];
+            let c = chunk_cpu[i];
+            let cpost = cpu_post[i];
+            let cpre = cpu_pre[i];
+            let d_ac = (a - c).abs();
+            if d_ac > max_ac {
+                max_ac = d_ac;
+                argmax_idx = i;
+            }
+            max_a_cpost = max_a_cpost.max((a - cpost).abs());
+            max_c_cpost = max_c_cpost.max((c - cpost).abs());
+            max_a_cpre = max_a_cpre.max((a - cpre).abs());
+            max_c_cpre = max_c_cpre.max((c - cpre).abs());
+            max_abs_auto = max_abs_auto.max(a.abs());
+            max_abs_chunk = max_abs_chunk.max(c.abs());
+            sum_sq_diff += (a as f64 - c as f64) * (a as f64 - c as f64);
+            sum_sq_auto += (a as f64) * (a as f64);
+        }
+        let rms_diff = (sum_sq_diff / n_out as f64).sqrt() as f32;
+        let rms_auto = (sum_sq_auto / n_out as f64).sqrt() as f32;
+        let argmax_t = argmax_idx / (n_v_heads as usize * d_v as usize);
+        let argmax_h = (argmax_idx / d_v as usize) % n_v_heads as usize;
+        let argmax_v = argmax_idx % d_v as usize;
+        eprintln!(
+            "[w5b4] seq_len={:5}  auto_vs_chunk={:.4e}  \
+             auto_vs_cpu_post={:.4e}  chunk_vs_cpu_post={:.4e}  \
+             auto_vs_cpu_pre={:.4e}  chunk_vs_cpu_pre={:.4e}  \
+             max|auto|={:.4e}  max|chunk|={:.4e}  \
+             rel_drift={:.4e}  rms_drift={:.4e}  rms_auto={:.4e}  \
+             argmax(t={},h={},v={})  auto_at={:.6}  chunk_at={:.6}",
+            seq_len, max_ac, max_a_cpost, max_c_cpost, max_a_cpre, max_c_cpre,
+            max_abs_auto, max_abs_chunk, max_c_cpost / max_abs_auto.max(1e-9),
+            rms_diff, rms_auto, argmax_t, argmax_h, argmax_v,
+            auto_cpu[argmax_idx], chunk_cpu[argmax_idx]
+        );
+        (max_ac, max_a_cpost, max_c_cpost, max_a_cpre, max_c_cpre)
+    }
+
+    /// Wave 5b.4 — divergence scaling sweep across seq_len.
+    /// Gated behind HF2Q_W5B4_DIVERGENCE=1 (slow; CPU f32 reference is O(T·D_k·D_v)).
+    #[test]
+    fn chunk_vs_autoreg_divergence_scaling() {
+        if std::env::var("HF2Q_W5B4_DIVERGENCE").as_deref() != Ok("1") {
+            eprintln!(
+                "chunk_vs_autoreg_divergence_scaling: skipped \
+                 (set HF2Q_W5B4_DIVERGENCE=1 to enable)"
+            );
+            return;
+        }
+        eprintln!("---- GQA case: n_k=2, n_v=4 (group_ratio=2; tiled vs block differ) ----");
+        for &n in &[128u32, 256, 512, 1024, 2048] {
+            run_seqlen_with_heads(n, 2, 4);
+        }
+        eprintln!("---- No-GQA case: n_k=2, n_v=2 (group_ratio=1; tiled == block) ----");
+        for &n in &[128u32, 256, 512, 1024, 2048] {
+            run_seqlen_with_heads(n, 2, 2);
+        }
     }
 }
