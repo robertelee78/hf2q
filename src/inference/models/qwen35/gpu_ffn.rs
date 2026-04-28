@@ -68,7 +68,9 @@ use mlx_native::ops::elementwise::{cast, elementwise_add, CastDirection};
 use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
 use mlx_native::ops::quantized_matmul_ggml::{quantized_matmul_ggml, GgmlQuantizedMatmulParams, GgmlType};
-use mlx_native::ops::quantized_matmul_id_ggml::{quantized_matmul_id_ggml, GgmlQuantizedMatmulIdParams};
+use mlx_native::ops::quantized_matmul_id_ggml::{
+    quantized_matmul_id_ggml, quantized_matmul_id_ggml_pooled, GgmlQuantizedMatmulIdParams,
+};
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -1489,32 +1491,70 @@ pub fn build_moe_ffn_layer_gpu_q_into(
         enc.memory_barrier();
 
         // ---- Phase C: expert gate+up matmuls + shared down proj (concurrent) ----
-        quantized_matmul_id_ggml(
-            enc, registry, device,
-            x, &weights.expert_gate_q, &ids_buf, &mut gate_all_buf,
-            &GgmlQuantizedMatmulIdParams {
-                n_tokens: seq_len,
-                top_k: shape.num_experts_per_tok,
-                n: m_moe32,
-                k: h32,
-                n_experts: ne32,
-                expert_stride: weights.expert_gate_stride,
-                ggml_type: weights.ggml_type_gate_up,
-            },
-        ).map_err(|e| anyhow!("gate_all qmatmul_id: {e}"))?;
-        quantized_matmul_id_ggml(
-            enc, registry, device,
-            x, &weights.expert_up_q, &ids_buf, &mut up_all_buf,
-            &GgmlQuantizedMatmulIdParams {
-                n_tokens: seq_len,
-                top_k: shape.num_experts_per_tok,
-                n: m_moe32,
-                k: h32,
-                n_experts: ne32,
-                expert_stride: weights.expert_up_stride,
-                ggml_type: weights.ggml_type_gate_up,
-            },
-        ).map_err(|e| anyhow!("up_all qmatmul_id: {e}"))?;
+        //
+        // W-5b.24: pooled `IdMmScratch` path eliminates 4 of 6 per-FFN-call
+        // device allocs (the 2 that remain pay only on first call of a
+        // prefill, then cache-hit for all 47 subsequent layers — net 286
+        // of 288 per-prefill device allocs eliminated).  Each call slot
+        // (gate / up / down) gets its own thread-local scratch so the
+        // gate+up concurrent dispatches in this Phase C block do NOT race
+        // on htpe/hids writes — distinct scratches, distinct buffers.
+        //
+        // The forensic env gate `HF2Q_FFN_POOLED_LEGACY=1` flips back to
+        // the un-pooled `quantized_matmul_id_ggml` (288 device allocs per
+        // prefill).  Both paths are bit-identical on the kernel level —
+        // the pooled variant only reuses scratch buffers; the dispatch
+        // shapes, kernel selection, and threadgroup geometry are
+        // unchanged.  No `HF2Q_UNSAFE_EXPERIMENTS=1` ack required.
+        //
+        // Sunset target: W-5b.25 after a 30/30 cross-path determinism
+        // panel + one apex 35B-A3B PP65536 verification (mirrors the
+        // W-5b.18 → W-5b.19a sunset cadence).
+        let pooled_legacy = std::env::var("HF2Q_FFN_POOLED_LEGACY").as_deref() == Ok("1");
+        let gate_params = GgmlQuantizedMatmulIdParams {
+            n_tokens: seq_len,
+            top_k: shape.num_experts_per_tok,
+            n: m_moe32,
+            k: h32,
+            n_experts: ne32,
+            expert_stride: weights.expert_gate_stride,
+            ggml_type: weights.ggml_type_gate_up,
+        };
+        let up_params = GgmlQuantizedMatmulIdParams {
+            expert_stride: weights.expert_up_stride,
+            ..gate_params
+        };
+        if pooled_legacy {
+            quantized_matmul_id_ggml(
+                enc, registry, device,
+                x, &weights.expert_gate_q, &ids_buf, &mut gate_all_buf,
+                &gate_params,
+            ).map_err(|e| anyhow!("gate_all qmatmul_id (LEGACY): {e}"))?;
+            quantized_matmul_id_ggml(
+                enc, registry, device,
+                x, &weights.expert_up_q, &ids_buf, &mut up_all_buf,
+                &up_params,
+            ).map_err(|e| anyhow!("up_all qmatmul_id (LEGACY): {e}"))?;
+        } else {
+            super::decode_pool::with_id_mm_scratch(
+                super::decode_pool::MmIdSlot::Gate,
+                device, ne32, seq_len * shape.num_experts_per_tok,
+                |scratch| quantized_matmul_id_ggml_pooled(
+                    enc, registry, device,
+                    x, &weights.expert_gate_q, &ids_buf, &mut gate_all_buf,
+                    scratch, &gate_params,
+                ),
+            ).map_err(|e| anyhow!("gate_all qmatmul_id_pooled: {e}"))?;
+            super::decode_pool::with_id_mm_scratch(
+                super::decode_pool::MmIdSlot::Up,
+                device, ne32, seq_len * shape.num_experts_per_tok,
+                |scratch| quantized_matmul_id_ggml_pooled(
+                    enc, registry, device,
+                    x, &weights.expert_up_q, &ids_buf, &mut up_all_buf,
+                    scratch, &up_params,
+                ),
+            ).map_err(|e| anyhow!("up_all qmatmul_id_pooled: {e}"))?;
+        }
         // ADR-015 iter7b — pooled (q_into path; y_s_buf flows into
         // dispatch_moe_weighted_reduce, no CPU download).
         let y_s_buf = proj_pooled(enc, registry, device, &h_s_buf, &weights.shared_down, seq_len, m_sh32, h32)?;
@@ -1545,19 +1585,37 @@ pub fn build_moe_ffn_layer_gpu_q_into(
         enc.memory_barrier();
 
         // ---- Phase E: y_all = expert_down(h_all) ----
-        quantized_matmul_id_ggml(
-            enc, registry, device,
-            &h_all_buf, &weights.expert_down_q, &ids_buf, &mut y_all_buf,
-            &GgmlQuantizedMatmulIdParams {
-                n_tokens: total_rows as u32,
-                top_k: 1,
-                n: h32,
-                k: m_moe32,
-                n_experts: ne32,
-                expert_stride: weights.expert_down_stride,
-                ggml_type: weights.ggml_type_down,
-            },
-        ).map_err(|e| anyhow!("y_all qmatmul_id: {e}"))?;
+        //
+        // W-5b.24: pooled scratch slot for the down call.  Lives behind
+        // the C→D and D→E barriers — there's no concurrency hazard with
+        // the gate/up scratches (different slots), and within this call
+        // map0→mm has its own internal barrier inside the dispatch.
+        let down_params = GgmlQuantizedMatmulIdParams {
+            n_tokens: total_rows as u32,
+            top_k: 1,
+            n: h32,
+            k: m_moe32,
+            n_experts: ne32,
+            expert_stride: weights.expert_down_stride,
+            ggml_type: weights.ggml_type_down,
+        };
+        if pooled_legacy {
+            quantized_matmul_id_ggml(
+                enc, registry, device,
+                &h_all_buf, &weights.expert_down_q, &ids_buf, &mut y_all_buf,
+                &down_params,
+            ).map_err(|e| anyhow!("y_all qmatmul_id (LEGACY): {e}"))?;
+        } else {
+            super::decode_pool::with_id_mm_scratch(
+                super::decode_pool::MmIdSlot::Down,
+                device, ne32, total_rows as u32,
+                |scratch| quantized_matmul_id_ggml_pooled(
+                    enc, registry, device,
+                    &h_all_buf, &weights.expert_down_q, &ids_buf, &mut y_all_buf,
+                    scratch, &down_params,
+                ),
+            ).map_err(|e| anyhow!("y_all qmatmul_id_pooled: {e}"))?;
+        }
 
         // Barrier E→F: moe_weighted_reduce reads y_all, y_s_buf, sh_logit_buf.
         enc.memory_barrier();

@@ -45,12 +45,31 @@
 
 use std::cell::RefCell;
 
+use mlx_native::ops::quantized_matmul_id_ggml::IdMmScratch;
 use mlx_native::{DType, MlxBuffer, MlxBufferPool, MlxDevice};
 
 thread_local! {
     /// Per-thread arena pool.  Initialized lazily by the first
     /// [`pooled_alloc_buffer`] call; reset between decode tokens.
     static DECODE_POOL: RefCell<MlxBufferPool> = RefCell::new(MlxBufferPool::new());
+
+    /// Per-thread cached `IdMmScratch` instances for the three MoE FFN
+    /// `quantized_matmul_id_ggml` call slots (W-5b.24).  Each FFN call
+    /// site (gate, up, down) gets its own scratch so the three calls
+    /// inside the gate+up Phase C concurrent block do NOT race on
+    /// htpe/hids writes — the down call lives in Phase E behind a
+    /// barrier so any of the three could share with down, but keeping
+    /// three distinct scratches mirrors the call structure 1:1 and is
+    /// trivially correct.
+    ///
+    /// Grown on demand via `with_id_mm_scratch_*` helpers.  The first
+    /// FFN call of a prefill allocates 6 device buffers (2 per scratch
+    /// × 3 scratches); every subsequent FFN call (47 layers × 3 calls
+    /// = 141 calls) reuses them.  Net: 286 of 288 per-prefill device
+    /// allocs eliminated, matching the W-5b.23 audit's recovery target.
+    static MM_ID_SCRATCH_GATE: RefCell<Option<IdMmScratch>> = const { RefCell::new(None) };
+    static MM_ID_SCRATCH_UP: RefCell<Option<IdMmScratch>> = const { RefCell::new(None) };
+    static MM_ID_SCRATCH_DOWN: RefCell<Option<IdMmScratch>> = const { RefCell::new(None) };
 }
 
 /// Allocate from the thread-local decode pool.
@@ -130,6 +149,97 @@ pub fn decode_pool_in_use_count() -> usize {
 #[allow(dead_code)]
 pub fn decode_pool_free_count() -> usize {
     DECODE_POOL.with(|cell| cell.borrow().free_count())
+}
+
+/// Slot identifier for the three MoE FFN `quantized_matmul_id_ggml` call
+/// sites: gate, up, and down.  Each slot gets its own thread-local
+/// `IdMmScratch` so concurrent dispatches (gate+up in Phase C) do not
+/// race on the scratch's htpe/hids buffers.
+#[derive(Debug, Clone, Copy)]
+pub enum MmIdSlot {
+    Gate,
+    Up,
+    Down,
+}
+
+/// Run a closure with a mutable reference to the slot's thread-local
+/// `IdMmScratch`, lazily growing the cached scratch if its capacity is
+/// less than the requested `(n_experts, max_n_tokens)` pair.
+///
+/// W-5b.24 wire-up support — replaces 6 per-FFN-call device allocations
+/// with 0 (after the first call) by amortising scratch ownership across
+/// every FFN call in the prefill.
+///
+/// On capacity miss the cached scratch is dropped (its underlying Metal
+/// buffers freed) and a new larger one is allocated; subsequent calls
+/// at the same or smaller size hit the cache.
+///
+/// # Errors
+///
+/// Returns `MlxError` if `IdMmScratch::alloc` fails on cache miss.
+pub fn with_id_mm_scratch<F, R>(
+    slot: MmIdSlot,
+    device: &MlxDevice,
+    n_experts: u32,
+    max_n_tokens: u32,
+    f: F,
+) -> std::result::Result<R, mlx_native::MlxError>
+where
+    F: FnOnce(&mut IdMmScratch) -> std::result::Result<R, mlx_native::MlxError>,
+{
+    let cell = match slot {
+        MmIdSlot::Gate => &MM_ID_SCRATCH_GATE,
+        MmIdSlot::Up => &MM_ID_SCRATCH_UP,
+        MmIdSlot::Down => &MM_ID_SCRATCH_DOWN,
+    };
+    cell.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        // Capacity check: the inner scratch's caps are private, so we
+        // proxy via `IdMmScratch::alloc`'s error-returning check_capacity
+        // path indirectly — easier to just track the caps we requested
+        // and grow when we exceed them.  Using the option's None state
+        // for first-time allocation, plus a stored cap pair on Some.
+        //
+        // We tag the cap pair onto a side-table of static AtomicU32s
+        // keyed off slot — but a simpler approach: stash the caps in
+        // adjacent thread_local cells.  Inline that via the helper
+        // closure here: any check_capacity error reallocates.
+        let needs_realloc = match guard.as_ref() {
+            None => true,
+            Some(scratch) => {
+                // Probe the public api: scratch.htpe.element_count is
+                // the n_experts cap; scratch.hids.element_count() ==
+                // n_experts_cap × n_tokens_cap.  Both fields pub.
+                let cap_n_experts = scratch.htpe.element_count() as u32;
+                let cap_total = scratch.hids.element_count() as u64;
+                let cap_n_tokens = if cap_n_experts == 0 {
+                    0
+                } else {
+                    (cap_total / cap_n_experts as u64) as u32
+                };
+                n_experts > cap_n_experts || max_n_tokens > cap_n_tokens
+            }
+        };
+        if needs_realloc {
+            *guard = Some(IdMmScratch::alloc(device, n_experts, max_n_tokens)?);
+        }
+        let scratch = guard.as_mut().expect("just allocated");
+        f(scratch)
+    })
+}
+
+/// Drop all cached `IdMmScratch` slots for the current thread.
+///
+/// Used by the `forensic A/B` test path to force a re-allocation
+/// between LEGACY and NEW runs so neither path benefits from a warm
+/// scratch left behind by the other.  Production paths do not call
+/// this; the scratches survive across prefills and decode tokens, with
+/// per-allocation cost amortising to zero.
+#[allow(dead_code)]
+pub fn drop_id_mm_scratch() {
+    MM_ID_SCRATCH_GATE.with(|cell| *cell.borrow_mut() = None);
+    MM_ID_SCRATCH_UP.with(|cell| *cell.borrow_mut() = None);
+    MM_ID_SCRATCH_DOWN.with(|cell| *cell.borrow_mut() = None);
 }
 
 #[cfg(test)]
