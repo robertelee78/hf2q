@@ -2529,4 +2529,168 @@ mod tests {
         }
         eprintln!("moe_ffn_gpu_q_parity: max_abs_err={max_err:.2e}");
     }
+
+    /// W-5b.24 forensic A/B parity: the pooled `quantized_matmul_id_ggml`
+    /// path must produce bit-identical outputs to the un-pooled LEGACY
+    /// path — same kernel, same shapes, only scratch ownership differs.
+    ///
+    /// 3-cold determinism: re-run both paths twice each (alternating)
+    /// and assert byte equality.  Belt-and-braces guard against any
+    /// stale scratch state contaminating cross-call results.
+    #[test]
+    fn ffn_pooled_path_matches_legacy_at_seq128() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return, // No Metal device; e.g. CI builder.
+        };
+        let mut registry = KernelRegistry::new();
+
+        // Same shape as moe_ffn_gpu_q_parity_vs_cpu_ref but seq_len=2 to
+        // exercise the dispatch path (Q4_0 with QK=32 + ne20_8 mm_id
+        // instantiation) at the smallest production-shape proxy.  The
+        // mm_id kernel only fires at n_tokens > MM_ID_ROUTING_THRESHOLD
+        // (=8) — so we use seq_len=16 to exercise the pooled mm_id
+        // branch (which is what we actually changed).  At seq_len < 9
+        // both paths fall through to mv_id where scratch is unused, so
+        // a < 9 test would not exercise the new code path.
+        let shape = MoeFfnShape {
+            hidden_size: 64,
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            moe_intermediate_size: 64,
+            shared_intermediate_size: 64,
+        };
+        let h  = shape.hidden_size as usize;
+        let ne = shape.num_experts as usize;
+        let m  = shape.moe_intermediate_size as usize;
+        let ms = shape.shared_intermediate_size as usize;
+
+        let mut seed = 0xBEEF_u32;
+        let mut r = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n).map(|_| {
+                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                ((seed as i32 as f32) / (i32::MAX as f32)) * scale
+            }).collect()
+        };
+
+        let router_f32      = r(ne * h, 0.3);
+        let expert_gate_f32 = r(ne * m * h, 0.1);
+        let expert_up_f32   = r(ne * m * h, 0.1);
+        let expert_down_f32 = r(ne * h * m, 0.1);
+        let shared_gate_logit = r(h, 0.1);
+        let shared_gate_f32 = r(ms * h, 0.1);
+        let shared_up_f32   = r(ms * h, 0.1);
+        let shared_down_f32 = r(h * ms, 0.1);
+        let seq_len = 16usize; // > MM_ID_ROUTING_THRESHOLD = 8 → exercises mm_id branch
+        let x_cpu   = r(seq_len * h, 0.4);
+
+        // Encode expert weights as Q4_0.
+        let gate_q4 = encode_q4_0(&expert_gate_f32);
+        let up_q4   = encode_q4_0(&expert_up_f32);
+        let down_q4 = encode_q4_0(&expert_down_f32);
+
+        let ggml_type = GgmlType::Q4_0;
+        let qk = ggml_type.block_values() as usize;
+        let block_bytes = ggml_type.block_bytes() as usize;
+        let gate_stride = ((m * h / qk) * block_bytes) as u64;
+        let down_stride = ((h * m / qk) * block_bytes) as u64;
+
+        let make_buf = |data: &[u8]| -> MlxBuffer {
+            let mut buf = device.alloc_buffer(data.len(), DType::U8, vec![data.len()])
+                .expect("alloc q-buf");
+            buf.as_mut_slice::<u8>().expect("q-buf slice").copy_from_slice(data);
+            buf
+        };
+
+        // Build a fresh weights container per run (since the weight
+        // buffers are consumed by the test).  Cloning via re-upload
+        // matches how production paths instantiate per-prefill weights.
+        let mk_weights = |device: &MlxDevice| -> MoeFfnWeightsGpuQ {
+            MoeFfnWeightsGpuQ {
+                router: upload_f32(&router_f32, device).expect("router"),
+                expert_gate_q: make_buf(&gate_q4),
+                expert_up_q:   make_buf(&up_q4),
+                expert_down_q: make_buf(&down_q4),
+                ggml_type_gate_up: ggml_type,
+                ggml_type_down: ggml_type,
+                expert_gate_stride: gate_stride,
+                expert_up_stride:   gate_stride,
+                expert_down_stride: down_stride,
+                num_experts: ne as u32,
+                shared_gate_inp: upload_f32(&shared_gate_logit, device).expect("sh_gate_inp"),
+                shared_gate:  upload_f32(&shared_gate_f32, device).expect("sh_gate"),
+                shared_up:    upload_f32(&shared_up_f32, device).expect("sh_up"),
+                shared_down:  upload_f32(&shared_down_f32, device).expect("sh_down"),
+            }
+        };
+
+        let x_buf = upload_f32(&x_cpu, &device).expect("upload x");
+
+        // Alternate LEGACY → NEW → LEGACY → NEW; assert all four agree.
+        let mut runs: Vec<(bool, Vec<f32>)> = Vec::with_capacity(4);
+        for which in 0..4 {
+            let legacy = which % 2 == 0;
+            // Force fresh scratch state so neither path benefits from a
+            // warm cache from the prior run.
+            super::super::decode_pool::drop_id_mm_scratch();
+            super::super::decode_pool::reset_decode_pool();
+
+            // Set / clear the env gate before each run.
+            // SAFETY: tests are single-threaded by default in this module.
+            // SAFETY: env::set_var/remove_var have OS-level synchronization
+            // requirements documented as `unsafe` from Rust 1.86; we
+            // use them inside a #[test] which serializes by default.
+            if legacy {
+                std::env::set_var("HF2Q_FFN_POOLED_LEGACY", "1");
+            } else {
+                std::env::remove_var("HF2Q_FFN_POOLED_LEGACY");
+            }
+
+            let weights_q = mk_weights(&device);
+            let gpu_buf = build_moe_ffn_layer_gpu_q(
+                &device, &mut registry, &x_buf, &weights_q, shape, None,
+            ).expect("build_moe_ffn_layer_gpu_q");
+            let out = download_f32(&gpu_buf).expect("download out");
+            runs.push((legacy, out));
+        }
+        // Always tear down the env var so subsequent tests see the default.
+        std::env::remove_var("HF2Q_FFN_POOLED_LEGACY");
+
+        // Determinism guard: same path must agree byte-exact across runs.
+        for (i, (legacy, out)) in runs.iter().enumerate() {
+            for (j, (legacy_j, out_j)) in runs.iter().enumerate().skip(i + 1) {
+                if legacy != legacy_j { continue; }
+                assert_eq!(
+                    out.len(), out_j.len(),
+                    "ffn_pooled_path_matches_legacy: same-path length differs run {i} vs {j}"
+                );
+                for (k, (a, b)) in out.iter().zip(out_j.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(), b.to_bits(),
+                        "ffn_pooled_path_matches_legacy: same-path divergence at run {i} vs {j}, idx={k} legacy={legacy}: {a} vs {b}"
+                    );
+                }
+            }
+        }
+
+        // Cross-path equality: pooled and legacy must produce numerically
+        // identical outputs (same kernel, same dispatch shapes — only
+        // scratch ownership differs).  Tolerance: bit-equality if Metal
+        // dispatch order is deterministic; relaxed to 1e-5 inf-norm if
+        // not (concurrent encoder dispatches don't guarantee bit-exact
+        // floating-point reduction order across runs).
+        let legacy_out = &runs.iter().find(|(l, _)| *l).expect("legacy run").1;
+        let pooled_out = &runs.iter().find(|(l, _)| !*l).expect("pooled run").1;
+        assert_eq!(legacy_out.len(), pooled_out.len(), "length mismatch");
+        let mut max_err = 0.0f32;
+        for (i, (l, p)) in legacy_out.iter().zip(pooled_out.iter()).enumerate() {
+            let err = (l - p).abs();
+            if err > max_err { max_err = err; }
+            assert!(
+                err < 1e-5,
+                "ffn_pooled_path_matches_legacy: cross-path divergence at idx={i}: legacy={l}, pooled={p}, err={err}"
+            );
+        }
+        eprintln!("ffn_pooled_path_matches_legacy: max_abs_err={max_err:.2e}");
+    }
 }
