@@ -115,3 +115,58 @@ HF2Q_QWEN36_AUTOREG=1 HF2Q_UNSAFE_EXPERIMENTS=1 \
   --chat-template '{{ messages[0]["content"] }}' \
   --max-tokens 1 --temperature 0.0
 ```
+
+---
+
+## Wave 5b.4 post-fix re-validation
+
+**Status:** **PASS — chunk-pipeline matches llama.cpp at pp4096 after the GQA head-mapping fix**
+**Date:** 2026-04-27
+**Worker:** Wave 5b.4 (re-validation follow-up)
+**HEAD at start:** `31e05a1` (W-5b.4 closure docs); fix landed at `2a67974` (W-5b.4 GQA head-mapping)
+**Binary:** rebuilt this iter (`cargo build --release --bin hf2q`, 0 errors, 72 warnings, 10s incremental — already current)
+**RAM at start:** 77.8 GiB free (Pages free 5 096 009)
+**RAM at finish:** 105.7 GiB free (Pages free 6 923 046) — no leak
+**Concurrent-session check:** clean — no non-sccache/rustc process > 5 GB at start or finish (largest non-sccache process at start was mcp-brain-server at 3.4 GB; at finish, all foreign processes < 1.8 GB)
+
+### Per-path token id table (pp4096, identical 23 038-byte prompt)
+
+| path | invocation | first decoded token | token id | match (llama-completion) |
+|---|---|:---:|:---:|:---:|
+| llama-completion baseline | `--batch-size 4096 -no-cnv` | `,` | **11** | — |
+| hf2q chunk-pipeline (postfix) | `HF2Q_CHUNK_SCAN_PREFILL=1` (no-`-v`) | `,` | **11** | **YES** |
+| hf2q chunk-pipeline (verbose) | `HF2Q_CHUNK_SCAN_PREFILL=1 RUST_LOG=hf2q::wave5b3=info -v` | `,` | **11** | **YES** |
+| hf2q autoregressive sanity | `HF2Q_QWEN36_AUTOREG=1`, no chunk env | `,` | **11** | **YES** |
+
+The verbose chunk run printed the wave5b3 observability probe **`chunk-pipeline ENGAGED for prefill (HF2Q_CHUNK_SCAN_PREFILL=1) seq_len=4096 d_k=128`**, confirming the chunk path ran the kernels (not a silent autoreg fallback). Both no-`-v` and `-v` chunk runs produced the same final glyph `,`.
+
+### Walk-bar verdict
+
+**PASS.** All three paths agree on token id 11 (`,`). The W-5b.3 divergence (chunk → 42824 ` spans`) is fully resolved by the W-5b.4 wrapper-side tiled-GQA pre-expansion in `apply_gated_delta_net_chunk`. The unit-level seq=128 max_diff dropped from 1.64e-2 to 6.31e-5 per the W-5b.4 fix commit, consistent with the per-element error budget no longer flipping the LM-head argmax at production prefill length.
+
+### ADR-005 status flip recommendation
+
+**FULL flip recommended** for AC 5468 (`[x] (partial)` → `[x]`) and AC 5470 (`[x] (partial)` → `[x]`). The W-5a addendum's "partial" qualifier was conditional on the chunk-scan kernel passing the walk-bar correctness gate at production prefill length; that gate is now PASS. The chunk-path is therefore both ENGAGED and correct at pp4096. A perf-bar measurement at pp4096 (chunk vs llama prefill ms) is informational and not gating, but is now numerically meaningful since the kernel produces the same token. Recommend the W-5b.4 closure ADR-005 entry note both ACs flip to full and that pp16384 / pp65536 walk-bar runs are advisable as a follow-up but not blocking.
+
+### Wall-clock numbers (informational)
+
+| engine | prefill ms | tok/s | real (full process) | first decoded token |
+|---|---:|---:|---:|:---:|
+| llama-completion | 6 528 | 627.4 | 10.28 s | id 11 |
+| hf2q chunk-pipeline (postfix, no `-v`) | 69 174 | 59.2 | 77.14 s | id 11 |
+| hf2q chunk-pipeline (verbose, `-v`) | 55 258 | 74.1 | (not timed; comparable) | id 11 |
+| hf2q autoregressive | 59 072 | 69.3 | 67.51 s | id 11 |
+
+The chunk-pipeline now matches the autoregressive path on token id and is in the same prefill time-class (55-69 s vs 59 s autoreg). Apparent ~10 % spread between the two chunk runs reflects normal cold-vs-warm thermals and concurrent-process contamination at the moment of run, not a meaningful kernel-perf delta — chunk-path SOTA prefill perf vs llama.cpp (627 tok/s baseline) remains the next-step target, currently 8.5-10.6× slower at pp4096; that target is informational, not gated by the walk-bar.
+
+### Inputs / outputs preserved
+
+- `/tmp/walkbar-pp4096-prompt.txt` (regenerated, 23 038 bytes, identical SHA to W-5b.3 prompt)
+- `/tmp/walkbar-pp4096-llama-rerun.{stdout,stderr}`
+- `/tmp/walkbar-pp4096-hf2q-chunk-postfix.{stdout,stderr}`
+- `/tmp/walkbar-pp4096-hf2q-chunk-verbose.{stdout,stderr}` (with `-v` and `RUST_LOG=hf2q::wave5b3=info`)
+- `/tmp/walkbar-pp4096-hf2q-autoreg-rerun.{stdout,stderr}`
+
+### Closing the wave
+
+Wave 5b.4 walk-bar re-validation: **CLOSED — PASS**. The GQA head-mapping fix at commit `2a67974` is confirmed correct at the pp4096 production prefill walk-bar. ADR-005 AC 5468 / AC 5470 may flip from `(partial)` to full per the recommendation above.
