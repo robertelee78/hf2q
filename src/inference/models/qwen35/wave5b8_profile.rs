@@ -114,6 +114,38 @@ pub enum SectionKind {
     /// Implementation: `gpu_full_attn.rs:1251-1276` (single encoder, ends
     /// with `commit_and_wait` for prefill seq>1).
     FaOps6to7,
+    // -- Wave 5b.11 post-attention sub-buckets (additive; reuses
+    // HF2Q_PROFILE_W5B8 gate). --
+    //
+    // The W-5b.8/9 closure showed that `layer.linear_total` (~402 ms/layer
+    // chunk path × 48 DN layers ≈ 19.3 s) is only ~199 ms/layer accounted
+    // for by the existing `layer.ops1_3 + qkv_deinterleave + chunk_prep
+    // + chunk_call + chunk_ops8_9` buckets — leaving ~203 ms/layer
+    // unprofiled. That residual lives **outside** the `apply_gated_delta_net_chunk`
+    // wrapper, in the post-attention path: fused residual+norm encoder
+    // (`forward_gpu.rs:906-927`), FFN dispatch (MoE-Q for Qwen3.6 27B
+    // linear-attn layers; line 999-1001), and the post-FFN residual
+    // (line 1013-1022; folded into FFN for MoeQ/Dense*). The buckets below
+    // partition that residual.
+    /// Fused residual + post-attention RMSNorm encoder. One encoder +
+    /// `commit()` (no wait) per layer; runs `dispatch_fused_residual_norm_f32`
+    /// (`forward_gpu.rs:906-927`). Counts both linear-attn and full-attn
+    /// layers.
+    LayerPostAttnFusedNorm,
+    /// FFN dispatch wall. For Qwen3.6 27B: dense layers go through
+    /// `build_dense_ffn_layer_gpu_q`, MoE layers go through
+    /// `build_moe_ffn_layer_gpu_q` (`forward_gpu.rs:957-1001`). Residual
+    /// is folded into the dispatch via `Some(&ffn_residual)`. One bucket
+    /// across all FFN variants — the trial summary documents which variant
+    /// fired by inspecting the model architecture (Qwen3.6 27B = MoeQ for
+    /// every layer index that's a linear-attn layer).
+    LayerFfnDispatch,
+    /// Post-FFN residual fall-through wall. For MoeQ/DenseQ/Dense the
+    /// residual is folded into the FFN dispatch above so this is a no-op
+    /// match-arm pass-through (~ns). For F32-MoE this triggers the separate
+    /// `residual_add_gpu` GPU encoder (`forward_gpu.rs:1020-1021`) — measured
+    /// here so we know whether F32-MoE is engaged anywhere.
+    LayerFfnPostResidual,
 }
 
 impl SectionKind {
@@ -142,9 +174,12 @@ impl SectionKind {
             SectionKind::FaSdpaKernel => "fa.sdpa.kernel",
             SectionKind::FaSdpaOutDownloadPermuteUpload => "fa.sdpa.out_dl_perm_ul",
             SectionKind::FaOps6to7 => "fa.ops6_7",
+            SectionKind::LayerPostAttnFusedNorm => "layer.post_attn_fused_norm",
+            SectionKind::LayerFfnDispatch => "layer.ffn_dispatch",
+            SectionKind::LayerFfnPostResidual => "layer.ffn_post_residual",
         }
     }
-    const COUNT: usize = 20;
+    const COUNT: usize = 23;
 }
 
 #[derive(Default, Clone)]
@@ -280,6 +315,10 @@ pub fn w5b8_print_and_reset(label: &str) {
             SectionKind::FaSdpaKernel,
             SectionKind::FaSdpaOutDownloadPermuteUpload,
             SectionKind::FaOps6to7,
+            // Wave 5b.11 post-attention sub-buckets:
+            SectionKind::LayerPostAttnFusedNorm,
+            SectionKind::LayerFfnDispatch,
+            SectionKind::LayerFfnPostResidual,
         ];
         for k in kinds {
             let acc = &state.accs[k.idx()];

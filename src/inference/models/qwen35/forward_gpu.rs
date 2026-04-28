@@ -883,6 +883,14 @@ impl Qwen35Model {
             //   cur = ggml_add(cur, ffn_residual); // FFN residual is pre-norm
             let t_res_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
             let t_norm_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+            // Wave 5b.11: fused residual+norm encoder bucket. Counts both
+            // linear-attn and full-attn layers; the W-5b.8 measurement
+            // showed `layer.linear_total` had ~203 ms/layer unprofiled
+            // beyond the wrapper-internal sub-buckets, and this is one of
+            // the two candidate locations (the other is FFN dispatch).
+            let _w5b11_post_attn_norm = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::LayerPostAttnFusedNorm,
+            );
             let (ffn_residual, ffn_input) = {
                 let post_norm_w = match layer_gpu {
                     LayerWeightsGpu::FullAttn { attn, .. } => &attn.post_attn_norm,
@@ -931,9 +939,18 @@ impl Qwen35Model {
             // `ffn_residual` is consumed directly by the residual-add path.
             if let Some(t) = t_res_start { total_residual_us += t.elapsed().as_micros() as u64; }
             if let Some(t) = t_norm_start { total_norm_us += t.elapsed().as_micros() as u64; }
+            // Drop fused-norm bucket guard before FFN bucket starts so the
+            // two sub-buckets are disjoint.
+            drop(_w5b11_post_attn_norm);
 
             // --- FFN (takes normed ffn_input, not the pre-norm residual) ---
             let t_ffn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+            // Wave 5b.11: FFN dispatch bucket — for Qwen3.6 27B every layer
+            // is MoeQ; the wall here includes the full MoE expert routing,
+            // dispatch, expert MM, and combine (with residual folded in).
+            let _w5b11_ffn_dispatch = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::LayerFfnDispatch,
+            );
             let ffn_weights_gpu = match layer_gpu {
                 LayerWeightsGpu::FullAttn { ffn, .. } => ffn,
                 LayerWeightsGpu::LinearAttn { ffn, .. } => ffn,
@@ -1003,11 +1020,20 @@ impl Qwen35Model {
             };
 
             if let Some(t) = t_ffn_start { total_ffn_us += t.elapsed().as_micros() as u64; }
+            // Drop FFN-dispatch bucket guard before post-residual bucket.
+            drop(_w5b11_ffn_dispatch);
 
             // --- Residual after FFN ---
             // For MoeQ / DenseQ / Dense: residual is already folded into the FFN output.
             // For F32-MoE: still need a separate GPU add.
             let t_res2_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+            // Wave 5b.11: post-FFN residual bucket. For MoeQ/DenseQ/Dense
+            // this is a no-op match-arm pass (~ns); for F32-MoE this triggers
+            // a separate GPU encoder. Bucket lets us confirm F32-MoE is not
+            // silently engaged anywhere on the production-DWQ path.
+            let _w5b11_ffn_post_res = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::LayerFfnPostResidual,
+            );
             // Keep a clone for the optional layer dump below; only paid when dump is active.
             let ffn_out_for_dump = if dump_layer_n().is_some() { Some(ffn_out.clone()) } else { None };
             hidden = match ffn_weights_gpu {
@@ -1021,6 +1047,11 @@ impl Qwen35Model {
                     .with_context(|| format!("residual ffn layer {layer_idx}"))?,
             };
             if let Some(t) = t_res2_start { total_residual_us += t.elapsed().as_micros() as u64; }
+            // Drop post-FFN-residual bucket guard before the layer dump
+            // and capture work, neither of which is on the production hot
+            // path under the W-5b.11 bench (capture target unbound, dump
+            // env unset).
+            drop(_w5b11_ffn_post_res);
 
             // ADR-012 P9b GPU capture path: download residual leaving this
             // layer to CPU F32 if a capture target is bound. Pairs with the
