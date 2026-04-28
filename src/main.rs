@@ -1814,20 +1814,61 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         tracing::info!("Quality measurement skipped (--skip-quality)");
         quality::QualityReport::empty()
     } else if let Some(ref qm) = quantized_model {
-        match quality::measure_quality_streaming(
-            &tensor_map,
-            qm,
-            &metadata,
-            &config.input_dir,
-            &progress,
-        ) {
-            Ok(qr) => {
-                quality::print_quality_summary(&qr);
-                qr
+        // ADR-014 P7 iter-52 (2026-04-28): env-flag-gated wire-up of
+        // `measure_quality_streaming_lazy` (iter-43).  Builds a parallel
+        // LazyTensorMap from the resident `tensor_map` for the quality
+        // measurement.  Byte-identity to the eager variant proven by
+        // iter-43's `measure_quality_streaming_lazy_matches_eager`
+        // gate.  Default OFF.  Memory profile during this iter:
+        // unchanged from eager (the lazy_map clones bytes per-tensor).
+        // The actual memory-budget win lands when iter-3 wholesale
+        // removes `materialize_all()` and sources `lazy_map` directly
+        // from `read_tensors_lazy`, bypassing eager materialise.
+        let streaming_phase3 =
+            std::env::var("HF2Q_STREAMING_PHASE3").as_deref() == Ok("1");
+        if streaming_phase3 {
+            tracing::info!("ADR-014 P7 iter-52: HF2Q_STREAMING_PHASE3=1 → measure_quality_streaming_lazy");
+            // Build a LazyTensorMap parallel view from the eager
+            // tensor_map (per-tensor `from_bytes` clone — same memory
+            // profile as the iter-48 wedge).
+            let mut lazy_map = ir::lazy::LazyTensorMap::new();
+            for (_, t) in tensor_map.tensors.iter() {
+                let meta =
+                    ir::lazy::LazyMeta::new(t.name.clone(), t.shape.clone(), t.dtype);
+                lazy_map.insert(ir::lazy::LazyTensor::from_bytes(meta, t.data.clone()));
             }
-            Err(e) => {
-                warn!("Quality measurement failed: {}. Continuing.", e);
-                quality::QualityReport::empty()
+            match quality::measure_quality_streaming_lazy(
+                &lazy_map,
+                qm,
+                &metadata,
+                &config.input_dir,
+                &progress,
+            ) {
+                Ok(qr) => {
+                    quality::print_quality_summary(&qr);
+                    qr
+                }
+                Err(e) => {
+                    warn!("Quality measurement (lazy) failed: {}. Continuing.", e);
+                    quality::QualityReport::empty()
+                }
+            }
+        } else {
+            match quality::measure_quality_streaming(
+                &tensor_map,
+                qm,
+                &metadata,
+                &config.input_dir,
+                &progress,
+            ) {
+                Ok(qr) => {
+                    quality::print_quality_summary(&qr);
+                    qr
+                }
+                Err(e) => {
+                    warn!("Quality measurement failed: {}. Continuing.", e);
+                    quality::QualityReport::empty()
+                }
             }
         }
     } else {
