@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ADR-015 iter9 aggregator: kernel attribution from xctrace MST traces
+ADR-015 iter9/iter11 aggregator: kernel attribution from xctrace MST traces
 for hf2q vs llama-cli on the Q4_0-dominated dwq46 apex workload.
 
 Why this exists (vs aggregate_decode_mst.py):
@@ -9,24 +9,58 @@ Why this exists (vs aggregate_decode_mst.py):
   kernel-name attribution. iter9 spec S3 requires kernel-name attribution
   to identify the iter10 attack target.
 
-Schema discovery (run on a smoke trace 2026-04-28T13:58Z, hf2q dwq46):
+Schema status (iter11 re-discovery, 2026-04-28, mlx-native@a7d2b95 post-iter9b):
   Available schemas in MST trace:
     - metal-application-encoders-list  (per-encoder: cmd-buf, encoder, duration)
-    - metal-application-event-interval (DEBUG GROUPS — empty; mlx-native does not pushDebugGroup)
+    - metal-application-event-interval (DEBUG GROUPS — STILL empty; mlx-native does
+                                        not pushDebugGroup. iter11b candidate enabler.)
     - metal-driver-intervals           (Command Buffer / Command Encoder labels — generic)
     - metal-object-label               (CoreAnimation surfaces, AGXHeaps — no shader fn names)
-    - metal-shader-profiler-shader-list (compiled shaders — empty in this template)
+    - metal-shader-profiler-shader-list (compiled-shader REGISTRY — NOW POPULATED post-iter9b
+                                         with kernel_mul_mv_q4_0_f32 / kernel_mul_mv_id_q4_0_f32
+                                         / kernel_mul_mm_q6_K_tensor_f32 / kernel_mul_mm_id_*
+                                         labels and PC ranges. iter11 surfaces this; iter9 audit
+                                         claim "shader-list empty" was stale w.r.t. iter9b.)
+    - metal-shader-profiler-intervals  (Shader Timeline samples — STILL EMPTY without the
+                                        GUI-only "Shader Timeline" checkbox in the template's
+                                        Metal Application instrument settings. iter11 verified
+                                        4 incantations cannot toggle this from CLI:
+                                          (a) default `Metal System Trace`
+                                          (b) MST + --instrument "Metal GPU Counters"
+                                              + --instrument "Metal Performance Overview"
+                                              + --instrument "Advanced Graphics Statistics"
+                                          (c) MST + (b) + --instrument "Metal Application"
+                                              + --instrument "GPU"
+                                          (d) `Game Performance` template (sibling GPU.instrdst)
+                                        All produce shader-list rows but ZERO Shader Timeline
+                                        sample rows. .tracetemplate is NSKeyedArchiver bplist
+                                        and the Shader Timeline toggle does not surface as a
+                                        plain XML key — surgical patching from CLI is not
+                                        feasible without a GUI Instruments.app pass.)
+    - gpu-shader-profiler-interval     (Shader Timeline by-PC intervals — empty, same reason)
+    - gpu-shader-profiler-sample       (Shader Timeline PC samples — empty, same reason)
     - metal-gpu-execution-points       (per-dispatch start/end pairs by gpu-submission-id)
 
-  Conclusion: with default "Metal System Trace" template + mlx-native binary
-  (which does NOT label MTLComputePipelineState or pushDebugGroup),
-  KERNEL-NAME ATTRIBUTION VIA xctrace IS NOT POSSIBLE. The closest signal
-  available is the per-encoder duration in metal-application-encoders-list,
-  cross-joined with the per-dispatch GPU times in metal-gpu-execution-points
-  by command-buffer-id. We then BUCKET by dispatch duration histogram —
-  Q4_0 mat-vec dispatches sit in a known time band (~5–60 µs per dispatch
-  on the dwq46 apex workload at decode), distinct from flash-attention
-  (~50–500 µs) or RMS-norm (~1–10 µs).
+  Conclusion (iter11 update of iter9 conclusion): mlx-native@a7d2b95 EXPOSES kernel labels
+  via metal-shader-profiler-shader-list (PSO-id → label registry). However, the JOIN from
+  per-dispatch GPU times (metal-gpu-execution-points) → PSO-id → label is BROKEN: nothing in
+  the per-dispatch tables carries pso-id, and Shader Timeline (which records per-PC samples
+  joinable to shader-list pc-ranges) cannot be enabled from xctrace CLI. PER-KERNEL-NAME
+  µs/token ATTRIBUTION VIA xctrace MST IS THEREFORE STILL NOT POSSIBLE without one of:
+    (1) iter11b enabler in mlx-native: pushDebugGroup(label) + popDebugGroup() around each
+        kernel dispatch in src/encoder.rs; populates metal-application-event-interval with
+        per-dispatch labeled intervals joinable to GPU duration. (recommended)
+    (2) iter11c enabler in mlx-native: MTLCounterSampleBuffer programmatic sampling with
+        per-dispatch begin/end stage-boundary GPU counter reads. M5 Max supports stage-
+        boundary sampling per `project_m5max_no_dispatch_boundary_sampling`.
+    (3) GUI Instruments.app run with Shader Timeline checkbox manually enabled, exporting
+        the trace and re-running this aggregator with --enable-shader-timeline.
+  The closest CLI-only signal remains the per-encoder duration in metal-application-encoders-list
+  cross-joined with metal-gpu-execution-points by command-buffer-id, then BUCKETED by
+  dispatch duration histogram — Q4_0 mat-vec dispatches sit in a known time band
+  (~5–60 µs per dispatch on the dwq46 apex workload at decode), distinct from flash-attention
+  (~50–500 µs) or RMS-norm (~1–10 µs). This is what we report as the "best-available"
+  attribution alongside the kernel-label registry surfaced from shader-list.
 
 Output (/tmp/adr015-iter9/aggregate-q4_0.txt):
   Per-binary, per-trial, the dispatch-duration histogram with bucketed
@@ -273,6 +307,128 @@ def parse_encoders_list(xml_text: str) -> List[dict]:
 
 
 # --------------------------------------------------------------------- #
+# Schema 3: metal-shader-profiler-shader-list (iter9b kernel registry)  #
+# Schema columns (verified from probe2 trace 2026-04-28T22:00Z, MST     #
+# template, mlx-native@a7d2b95):                                        #
+#   0: timestamp (ns)                                                    #
+#   1: name           (metal-object-label)  e.g. "kernel_mul_mv_q4_0_f32 (35)"
+#   2: label          (metal-object-label)  function label, often empty
+#   3: pso-name       (metal-object-label)  e.g. "kernel_mul_mv_q4_0_f32"
+#   4: id             (uint64)              cache_id from KernelRegistry
+#   5: pc-start       (uint64)              GPU instruction-pointer start
+#   6: pc-end         (uint64)              GPU instruction-pointer end
+#   7: shader-type    (string)              "Compute" | "Vertex" | "Fragment"
+#   8: process        (process)             e.g. "hf2q (93824)"
+#   9: gpu            (metal-device-name)   "M5 Max"                     #
+# --------------------------------------------------------------------- #
+
+def parse_shader_list(xml_text: str, target_process_prefix: str) -> List[dict]:
+    """Extract the kernel-label registry for a target process.
+
+    Filter on process prefix (e.g. 'hf2q' / 'llama-cli') so we drop UI shaders
+    from com.apple.WebKit.GPU and other system processes that share the trace.
+    """
+    root = ET.fromstring(xml_text)
+    rows = []
+    table = {}
+    for row in root.iter("row"):
+        children = list(row)
+        if len(children) < 10:
+            continue
+
+        # name (col 1) — the kernel label with optional cache-id suffix " (N)"
+        name = resolve(children[1], table)
+        # pso-name (col 3) — the bare kernel label
+        pso_name = resolve(children[3], table)
+        cache_id = resolve(children[4], table)
+        pc_start = resolve(children[5], table)
+        pc_end = resolve(children[6], table)
+        shader_type = resolve(children[7], table)
+        proc = resolve(children[8], table)
+
+        if not proc.startswith(target_process_prefix):
+            continue
+        if not name:
+            continue
+
+        rows.append(dict(
+            name=name,
+            pso_name=pso_name,
+            cache_id=cache_id,
+            pc_start=pc_start,
+            pc_end=pc_end,
+            shader_type=shader_type,
+            process=proc,
+        ))
+    return rows
+
+
+def kernel_family(label: str) -> str:
+    """Group a labeled kernel into a coarse family for reporting.
+
+    The labels come from mlx-native's KernelRegistry get_pipeline naming
+    convention (iter9b). Strip optional cache-id suffix " (N)" and trailing
+    function-constant key " | 0:b1 | 3:i32".
+    """
+    base = label.split("|", 1)[0].split(" (", 1)[0].strip()
+    if not base.startswith("kernel_"):
+        return base or "(unknown)"
+    body = base[len("kernel_"):]
+    # Common family prefixes — match longest first.
+    families = [
+        ("mul_mm_id_map0",        "moe_map0"),
+        ("mul_mm_id_q4_0_tensor", "moe_q4_0_mm"),
+        ("mul_mm_id_q5_K_tensor", "moe_q5_K_mm"),
+        ("mul_mm_id_q6_K_tensor", "moe_q6_K_mm"),
+        ("mul_mm_id",             "moe_mm"),
+        ("mul_mv_id_q4_0",        "moe_q4_0_mv"),
+        ("mul_mv_id_q5_K",        "moe_q5_K_mv"),
+        ("mul_mv_id_q6_K",        "moe_q6_K_mv"),
+        ("mul_mv_id_q8_0",        "moe_q8_0_mv"),
+        ("mul_mv_id",             "moe_mv"),
+        ("mul_mm_q4_0_tensor",    "dense_q4_0_mm"),
+        ("mul_mm_q5_K_tensor",    "dense_q5_K_mm"),
+        ("mul_mm_q6_K_tensor",    "dense_q6_K_mm"),
+        ("mul_mm_q8_0_tensor",    "dense_q8_0_mm"),
+        ("mul_mm",                "dense_mm"),
+        ("mul_mv_q4_0",           "dense_q4_0_mv"),
+        ("mul_mv_q5_K",           "dense_q5_K_mv"),
+        ("mul_mv_q6_K",           "dense_q6_K_mv"),
+        ("mul_mv_q8_0",           "dense_q8_0_mv"),
+        ("mul_mv",                "dense_mv"),
+        ("flash_attn",            "flash_attn"),
+        ("rms_norm",              "rms_norm"),
+        ("rope",                  "rope"),
+        ("silu",                  "silu"),
+        ("swiglu",                "swiglu"),
+        ("kv_cache_copy",         "kv_cache"),
+        ("argmax",                "argmax"),
+        ("permute",               "permute"),
+        ("cast",                  "cast"),
+        ("residual_add",          "residual_add"),
+        ("fused_norm",            "fused_norm"),
+    ]
+    for prefix, fam in families:
+        if body.startswith(prefix):
+            return fam
+    return "other_" + body.split("_", 1)[0]
+
+
+def shader_list_summary(rows: List[dict]) -> dict:
+    """Group registered shaders by family and dedupe by pso_name."""
+    by_family = defaultdict(set)
+    for r in rows:
+        fam = kernel_family(r["name"])
+        # Dedupe by pso-name (which is the bare label without cache-id suffix);
+        # function-constant variants share pso-name in iter9b.
+        by_family[fam].add(r.get("pso_name", "") or r["name"])
+    out = {}
+    for fam, names in by_family.items():
+        out[fam] = sorted(n for n in names if n)
+    return out
+
+
+# --------------------------------------------------------------------- #
 # Bucketing by dispatch duration                                        #
 # --------------------------------------------------------------------- #
 
@@ -328,14 +484,41 @@ def bucket_summary(paired: List[dict]) -> Dict[str, dict]:
 # Per-trace summary                                                     #
 # --------------------------------------------------------------------- #
 
-def summarize_trace(trace_path: str, n_tokens: int) -> dict:
-    """Return per-trace bucketed dispatch summary."""
+def summarize_trace(trace_path: str, n_tokens: int, target_process_prefix: str = "") -> dict:
+    """Return per-trace bucketed dispatch summary plus iter11 shader registry.
+
+    target_process_prefix filters the iter11 shader-list registry to the
+    binary under test (e.g. "hf2q" / "llama-cli") so UI shaders from the
+    system browser/window-server don't pollute the report.
+    """
     xml = export_table(trace_path, "metal-gpu-execution-points")
     rows = parse_gpu_execution_points(xml)
     paired, unpaired_ends, leftover = pair_dispatches(rows)
 
     enc_xml = export_table(trace_path, "metal-application-encoders-list")
     encoders = parse_encoders_list(enc_xml)
+
+    # iter11: surface the now-populated shader-list registry. Returns {} on
+    # any error (e.g. older traces) so iter9 archived bundles still work.
+    shader_registry: Dict[str, List[str]] = {}
+    shader_count = 0
+    try:
+        sl_xml = export_table(trace_path, "metal-shader-profiler-shader-list")
+        sl_rows = parse_shader_list(sl_xml, target_process_prefix or "")
+        shader_count = len(sl_rows)
+        shader_registry = shader_list_summary(sl_rows)
+    except Exception:
+        pass
+
+    # iter11: probe Shader Timeline samples — expected to be empty until
+    # iter11b enabler lands or GUI Instruments.app is used.
+    shader_timeline_rows = 0
+    try:
+        st_xml = export_table(trace_path, "metal-shader-profiler-intervals")
+        # Cheap row count without full parse.
+        shader_timeline_rows = st_xml.count("<row")
+    except Exception:
+        pass
 
     buckets = bucket_summary(paired)
     total_gpu_ns = buckets["_total"]["sum_ns"]
@@ -354,6 +537,10 @@ def summarize_trace(trace_path: str, n_tokens: int) -> dict:
         # Per-token attribution
         dispatches_per_token=total_dispatches / max(n_tokens, 1),
         gpu_us_per_token=total_gpu_ns / 1000.0 / max(n_tokens, 1),
+        # iter11 additions
+        shader_registry=shader_registry,
+        shader_count=shader_count,
+        shader_timeline_rows=shader_timeline_rows,
     )
 
 
@@ -361,10 +548,23 @@ def median_summaries(summaries: List[dict]) -> dict:
     """Combine N per-trial summaries into a single median view."""
     if not summaries:
         return {}
+    # iter11: union the shader-registry across trials (set by family,
+    # alphabetical for reporting).
+    registry_union: Dict[str, set] = defaultdict(set)
+    for s in summaries:
+        for fam, names in (s.get("shader_registry") or {}).items():
+            registry_union[fam].update(names)
+    registry_out = {fam: sorted(names) for fam, names in registry_union.items()}
+
+    shader_timeline_rows_max = max(
+        (s.get("shader_timeline_rows", 0) for s in summaries), default=0
+    )
+
     out = {
         "n_trials": len(summaries),
         "n_tokens_per_trial": [s["n_tokens"] for s in summaries],
         "paired_per_trial": [s["paired"] for s in summaries],
+        "gpu_us_per_token_per_trial": [s["gpu_us_per_token"] for s in summaries],
         "median_dispatches_per_token": statistics.median(
             [s["dispatches_per_token"] for s in summaries]
         ),
@@ -372,6 +572,9 @@ def median_summaries(summaries: List[dict]) -> dict:
             [s["gpu_us_per_token"] for s in summaries]
         ),
         "buckets": {},
+        # iter11 additions
+        "shader_registry": registry_out,
+        "shader_timeline_rows": shader_timeline_rows_max,
     }
     for name, _, _ in BUCKETS:
         counts_per_tok = []
@@ -406,17 +609,28 @@ def fmt_int(v) -> str:
 def write_report(out_path: str, hf2q: dict, llama: dict, hf2q_trials: List[dict], llama_trials: List[dict]):
     lines = []
     lines.append("=" * 110)
-    lines.append("ADR-015 iter9 — Q4_0 dispatch-duration attribution (xctrace MST)")
+    lines.append("ADR-015 iter9/iter11 — Q4_0 dispatch attribution (xctrace MST)")
     lines.append("=" * 110)
     lines.append("")
     lines.append("Methodology:")
     lines.append("  - canonical frame: metal-gpu-execution-points fn=1/2 paired by sub_id (per AC2)")
     lines.append("  - encoders sidecar: metal-application-encoders-list (informational; not summed)")
-    lines.append("  - kernel-name attribution: NOT POSSIBLE in this MST template (mlx-native does")
-    lines.append("    not pushDebugGroup or label MTLComputePipelineState; metal-application-event-interval")
-    lines.append("    and metal-shader-profiler-shader-list are empty).")
-    lines.append("  - bucketing strategy: per-dispatch duration histogram into 5 bands, where each")
-    lines.append("    band cleanly maps to a kernel class on the dwq46 decode workload:")
+    lines.append("  - iter11 status: kernel REGISTRY surfaced via metal-shader-profiler-shader-list")
+    lines.append("    (now populated post-iter9b labels at mlx-native@a7d2b95).  Per-dispatch")
+    lines.append("    PSO→duration JOIN STILL BLOCKED: no per-dispatch table carries pso-id, and")
+    lines.append("    Shader Timeline (the metal-shader-profiler-intervals row source) cannot be")
+    lines.append("    enabled from xctrace CLI.  iter11 verified 4 incantations:")
+    lines.append("      (a) default `Metal System Trace`")
+    lines.append("      (b) MST + --instrument 'Metal GPU Counters' / 'Metal Performance Overview'")
+    lines.append("              + --instrument 'Advanced Graphics Statistics'")
+    lines.append("      (c) MST + (b) + --instrument 'Metal Application' + --instrument 'GPU'")
+    lines.append("      (d) `Game Performance` template")
+    lines.append("    All produce the kernel-name registry but ZERO Shader Timeline samples.")
+    lines.append("    Recommended pivot: iter11b enabler = mlx-native pushDebugGroup(label) +")
+    lines.append("    popDebugGroup() around each kernel dispatch in src/encoder.rs.")
+    lines.append("  - bucketing strategy (best-available CLI signal): per-dispatch duration")
+    lines.append("    histogram into 5 bands, where each band cleanly maps to a kernel class on")
+    lines.append("    the dwq46 decode workload:")
     lines.append("      xs_<2us     : rms_norm, scalar mul, reshape")
     lines.append("      sm_2_8us    : rope, soft-cap, small mat-vec")
     lines.append("      md_8_32us   : Q4_0 MoE mat-vec_id (gate/up/down), dense Q4_0 mat-vec")
@@ -515,6 +729,48 @@ def write_report(out_path: str, hf2q: dict, llama: dict, hf2q_trials: List[dict]
     else:
         lines.append("(no traces summarised)")
 
+    # iter11: surface the kernel registry per binary so reviewers can confirm
+    # iter9b labels propagated end-to-end through xctrace.
+    lines.append("")
+    lines.append("=" * 110)
+    lines.append("iter11 — Kernel registry (metal-shader-profiler-shader-list, post-iter9b labels)")
+    lines.append("=" * 110)
+    if hf2q and hf2q.get("shader_registry"):
+        lines.append("")
+        lines.append("hf2q registry (PSO labels by family, deduped):")
+        for fam in sorted(hf2q["shader_registry"].keys()):
+            names = hf2q["shader_registry"][fam]
+            lines.append(f"  {fam:>20s}  ({len(names):>2d}): {', '.join(names[:5])}"
+                         f"{' …' if len(names) > 5 else ''}")
+        lines.append(f"  Shader Timeline samples (metal-shader-profiler-intervals): "
+                     f"{hf2q.get('shader_timeline_rows', 0)} rows "
+                     f"({'EMPTY (CLI cannot toggle)' if hf2q.get('shader_timeline_rows', 0) == 0 else 'populated'})")
+    if llama and llama.get("shader_registry"):
+        lines.append("")
+        lines.append("llama-cli registry (PSO labels by family, deduped):")
+        for fam in sorted(llama["shader_registry"].keys()):
+            names = llama["shader_registry"][fam]
+            lines.append(f"  {fam:>20s}  ({len(names):>2d}): {', '.join(names[:5])}"
+                         f"{' …' if len(names) > 5 else ''}")
+        lines.append(f"  Shader Timeline samples: "
+                     f"{llama.get('shader_timeline_rows', 0)} rows")
+    lines.append("")
+    lines.append("Verdict: kernel-NAME attribution per dispatch is BLOCKED on Shader Timeline")
+    lines.append("toggle which xctrace CLI cannot enable. iter11b enabler (mlx-native")
+    lines.append("pushDebugGroup) is the recommended unblock; expected to populate")
+    lines.append("metal-application-event-interval with per-dispatch labeled intervals")
+    lines.append("joinable to GPU duration via canonical fn=1/2 sub_id pairs.")
+    lines.append("")
+
+    # iter11: per-trial gpu_us_per_token for statistical visibility.
+    if hf2q and hf2q.get("gpu_us_per_token_per_trial"):
+        lines.append(f"hf2q  per-trial gpu µs/tok: "
+                     f"{', '.join(f'{x:.1f}' for x in hf2q['gpu_us_per_token_per_trial'])}")
+    if llama and llama.get("gpu_us_per_token_per_trial"):
+        lines.append(f"llama per-trial gpu µs/tok: "
+                     f"{', '.join(f'{x:.1f}' for x in llama['gpu_us_per_token_per_trial'])}")
+    lines.append("")
+
     text = "\n".join(lines) + "\n"
     with open(out_path, "w") as f:
         f.write(text)
@@ -552,18 +808,29 @@ def main():
     hf2q_trials = []
     for t in args.hf2q_trace:
         try:
-            s = summarize_trace(t, args.n_tokens)
+            s = summarize_trace(t, args.n_tokens, target_process_prefix="hf2q")
             hf2q_trials.append(s)
-            print(f"ok: hf2q {t}: {s['paired']} paired", file=sys.stderr)
+            print(
+                f"ok: hf2q {t}: {s['paired']} paired, "
+                f"{s.get('shader_count', 0)} shaders, "
+                f"{s.get('shader_timeline_rows', 0)} timeline samples",
+                file=sys.stderr,
+            )
         except Exception as e:
             print(f"WARN: hf2q {t}: {e}", file=sys.stderr)
 
     llama_trials = []
     for t in args.llama_trace:
         try:
-            s = summarize_trace(t, args.n_tokens)
+            # llama-cli registers as either "llama-cli" or "llama-bench"
+            s = summarize_trace(t, args.n_tokens, target_process_prefix="llama")
             llama_trials.append(s)
-            print(f"ok: llama {t}: {s['paired']} paired", file=sys.stderr)
+            print(
+                f"ok: llama {t}: {s['paired']} paired, "
+                f"{s.get('shader_count', 0)} shaders, "
+                f"{s.get('shader_timeline_rows', 0)} timeline samples",
+                file=sys.stderr,
+            )
         except Exception as e:
             print(f"WARN: llama {t}: {e}", file=sys.stderr)
 
