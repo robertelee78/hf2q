@@ -1178,3 +1178,119 @@ Wave 5b.12 sunset audit + legacy-gate removal: **CLOSED — production fix lande
 The legacy `mlx_native::ops::sdpa` path remains in code for non-production-prefill regimes (head_dim ≠ 256 OR cur_len > 0) per Chesterton's fence — it is the correct fallback for incremental prefill on top of an existing KV cache, even if the live Qwen3.5/3.6 prefill-from-zero path no longer reaches it. The forensic env gate that allowed runtime A/B is removed.
 
 ADR-005 AC-tier impact: NONE (W-5b.10 already closed perf-bar to informational; this iter is operational hygiene). The next-iter target identified in W-5b.11 (`mlx_native::ops::moe_q::*` dispatch optimization, mlx-native scope) is unchanged.
+
+## Wave 5b.13 mlx-native moe_q audit (cross-fence)
+
+**Worker:** Wave 5b.13 cross-fence read-only audit (this paragraph).
+**Repo state:** mlx-native HEAD `5d9bb2e3` (unchanged at start AND end). No production source modifications in either repo.
+**Pre-flight:** 111.9 GiB free RAM (Pages free 6 993 390 × 16 KB), `mcp-brain-server` at 1.5% CPU only (no CFA workers > 50%). Two CFA worktrees `cfa-20260427-adr015-w2b/{claude,codex}` exist on separate branches at `adf7ee0`, not affecting `main`.
+
+### Objective
+Identify the source of W-5b.11's `layer.ffn_dispatch` 9 750 ms (47.4% of `layer.linear_total`) and decide whether the next 4.34× → ±5% closure lives in mlx-native (ADR-015) or hf2q (ADR-005).
+
+### Bench protocol
+1. **Production-shape kernel-isolation bench** added at `/opt/mlx-native/benches/bench_moe_q_qwen36_shape.rs` (additive only — `cargo bench` registration in `Cargo.toml`, NO production source changes). Mirrors the existing Gemma 4 `bench_prefill_qmatmul_shapes.rs` pattern but uses Qwen3.6 27B DWQ46 production shapes derived from `/opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf` direct GGUF inspection: hidden=5120, intermediate=17408, all FFN gate/up/down Q4_0.
+2. **3 cold trials**, warmup=3, measure=10, median per shape. `commit_and_wait` per iteration so each sample is a full kernel dispatch + GPU completion.
+
+### Bench results
+
+| shape    | M    | N     | K     | qtype | T1 ms | T2 ms | T3 ms | TFLOP/s | layers × calls | total_ms |
+|----------|-----:|------:|------:|:-----:|------:|------:|------:|--------:|---------------:|---------:|
+| FFN_gate | 4096 | 17408 | 5120  | Q4_0  | 17.94 | 18.00 | 17.91 | 40.7    | 64             | ~1148    |
+| FFN_up   | 4096 | 17408 | 5120  | Q4_0  | 17.92 | 17.97 | 17.87 | 40.7    | 64             | ~1147    |
+| FFN_down | 4096 | 5120  | 17408 | Q4_0  | 19.87 | 19.89 | 19.91 | 36.7    | 64             | ~1273    |
+
+**Total kernel-only FFN qmatmul wall at pp4096 (median across 3 cold trials): 3 567 ms**.
+Cross-trial variance < 0.4%.
+
+### Discovery #1 — W-5b.11 hand-off label was misnamed
+
+The 27B DWQ46 GGUF is **dense FFN with Q4_0**, NOT MoE. Direct inspection (851 tensors, 31 KV pairs):
+- `general.architecture = qwen35`, `general.name = Qwen3_5ForConditionalGeneration`
+- Per-layer: `ffn_gate.weight` Q4_0 (5120, 17408), `ffn_up.weight` Q4_0 (5120, 17408), `ffn_down.weight` Q4_0 (17408, 5120)
+- NO `_exps` tensors (no MoE expert blocks)
+- Tensor type counts: 474 Q4_0 + 353 F32 + 23 Q6_K + 1 F16
+
+The actual dispatch path is `quantized_matmul_ggml::dispatch_mm` → `kernel_mul_mm_q4_0_tensor_f32`, NOT `mlx_native::ops::moe_q::*`. The W-5b.11 hand-off naming was driven by the (stale) comment at `forward_gpu.rs:949` "every layer is MoeQ" — actual dispatch goes through the `DenseQ` branch at line 974.
+
+### Discovery #2 — Kernel is byte-identical to llama.cpp (already SOTA)
+
+| component | mlx-native | llama.cpp | status |
+|-----------|------------|-----------|--------|
+| Tile geometry | NR0=64, NR1=32, NK=32 (`quantized_matmul_mm_tensor.metal:7-9`) | NR0=64, NR1=32, NK=32 (`ggml-metal.metal:9340-9341`) | identical |
+| MMA engine | `mpp::tensor_ops::matmul2d` | `mpp::tensor_ops::matmul2d` | identical |
+| Dequant function | `dequantize_q4_0` | `dequantize_q4_0` | identical |
+| Routing threshold | `MM_ROUTING_THRESHOLD = 8` | `ne11_mm_min = 8` | identical |
+| Tensor-API gate | `OnceLock` runtime probe | `GGML_METAL_HAS_TENSOR` compile-time | both produce same kernel name on M5 Max |
+| MoE `_id` mm tile | NR0=64, NR1=32, NK=32 | same | identical |
+| MoE `_id` map0 templates | `ne20_1`, `ne20_8` | 1/2/4/5/6/8/10/16/22 | mlx-native has narrower set (sufficient for current production: dense=N/A, 35B-A3B uses 8, Gemma 4 uses 1+8) |
+| Activation fusion (silu_mul into mm) | NOT fused (separate `dispatch_silu_mul`) | NOT fused (separate kernel) | parity (and a 2026-04-26 fusion attempt at `4efeec0` regressed −1.5%, 9th falsified static-evidence kernel hypothesis) |
+| Concurrent dispatch | `enc.memory_barrier()` between dispatches | `ggml_metal_op_concurrency_reset` | parity |
+
+The kernel is at 36.7–40.7 TFLOP/s on Q4_0 mm at pp4096 — **within the M5 Max tensor-core envelope for Q4_0 dequant + MMA**.
+
+### Discovery #3 — Wrapper accounts for 63.4% of the bucket
+
+| measurement | total ms | source |
+|-------------|---------:|--------|
+| `layer.ffn_dispatch` (W-5b.11 measurement, all 64 layers) | 9 750 | `docs/wave5b3-walkbar-results.md` "Wave 5b.11" |
+| Kernel-only qmatmul (this audit, 3 cold trials median) | **3 567** | `bench_moe_q_qwen36_shape` |
+| **Wrapper / dispatch / barrier overhead** | **6 184** | difference (63.4% of bucket) |
+
+### Top-3 sub-bottleneck (re-ranked after kernel isolation)
+
+| rank | bucket | total ms (est.) | per-layer | % of 9 750 ms | location |
+|------|--------|----------------:|----------:|--------------:|----------|
+| 1 | Wrapper allocation churn (5–6 fresh `device.alloc_buffer` per layer × 64 layers, ~118 GB total allocate-and-zero) | ~3 000–4 000 | ~50–60 ms | ~30–40% | `gpu_ffn.rs:690–704` (hf2q) — bypasses the `decode_pool` arena |
+| 2 | 2-encoder commit-and-wait pattern (DenseQ uses 2 separate CBs per layer; MoE-Q has the fused-residual-norm-in-same-CB optimization, DenseQ does not) | ~2 000–3 000 | ~30–45 ms | ~20–30% | `forward_gpu.rs:1530-1548` vs MoE-Q at lines 1499-1525 |
+| 3 | `silu_mul` + `elementwise_add` for residual fold | ~500–1 000 | ~10–15 ms | ~5–10% | `gpu_ffn.rs:733, 752` |
+| — | Kernel-only qmatmul (this audit) | **3 567 measured** | 55.7 | **36.6%** | `mlx_native::quantized_matmul_ggml::dispatch_mm` — already SOTA |
+
+### Recommendation for next implementation iter
+
+**Mirror the MoE-Q optimizations into the dense_q path** in hf2q (NOT mlx-native):
+
+1. Add `build_dense_ffn_layer_gpu_q_into` external-encoder variant (parallel to `build_moe_ffn_layer_gpu_q_into` at `gpu_ffn.rs:1145-1366`).
+2. Route all 5–6 scratch buffers (gate_buf, up_buf, hidden_buf, down_out, sum_buf, silu_params_buf) through `super::decode_pool::pooled_alloc_buffer` (the per-decode-token arena built specifically for this in ADR-012 §Optimize / Task #15).
+3. Update the DenseQ branch in `forward_gpu.rs:1564-1568` to fuse `dispatch_fused_residual_norm_f32` + the FFN body into one command buffer (mirror lines 1499-1525).
+
+**Effort:** small — 1 iter, 2–4 hours. Mechanical translation; no new kernels.
+**Risk:** low. Same kernel calls, same byte-level correctness. Parity test pattern is the existing dense_q parity test (no new test surface required).
+**Expected outcome:** `layer.ffn_dispatch` drops from 9 750 ms to 4 000–5 500 ms (kernel-only floor + small commit residual). Wall-clock ratio vs llama.cpp at pp4096 shifts from 4.34× to approximately 3.4–3.7×.
+
+### STOP condition applied
+
+Per worker prompt: "if the audit reveals moe_q already uses simdgroup_matrix MMA + online activation fusion + optimal tile shape — there's no easy wire-up win; recommend a different next-iter focus." The kernel IS SOTA (byte-identical to llama.cpp); the recommendation pivots to hf2q wrapper (ADR-005), NOT mlx-native (ADR-015). The W-5b.11 hand-off's "lives in mlx-native" framing should be revised when this audit is consumed.
+
+### Files touched this iter
+- `/opt/mlx-native/benches/bench_moe_q_qwen36_shape.rs` (new bench, additive only)
+- `/opt/mlx-native/Cargo.toml` (`[[bench]]` registration, 3 lines)
+- `/opt/mlx-native/docs/moe-q-perf-audit-2026-04-27.md` (full hand-off doc)
+- `/opt/hf2q/docs/ADR-005-inference-server.md` (W-5b.13 paragraph above W-5b.12)
+- `/opt/hf2q/docs/wave5b3-walkbar-results.md` (this section)
+
+NO `/opt/mlx-native/src/` modifications.
+NO `/opt/hf2q/src/` modifications.
+NO `/opt/llama.cpp` modifications (read-only reference).
+
+### Reproduction recipe
+
+```bash
+# Pre-flight (RAM + processes)
+vm_stat | head -5
+ps aux | grep -v sccache | sort -k6 -nr | head -20
+
+# Build + run bench (3 cold trials)
+cd /opt/mlx-native
+RUSTC_WRAPPER= cargo bench --bench bench_moe_q_qwen36_shape
+
+# Verify mlx-native HEAD unchanged
+git -C /opt/mlx-native rev-parse HEAD
+# Expected: 5d9bb2e3ded2cb68daadcd1c093e88dde9800457
+
+# Compare to W-5b.11 instrumented bench (already committed):
+HF2Q_PROFILE_W5B8=1 /opt/hf2q/scripts/bench-w5b11-post-attn.sh
+# Look for "layer.ffn_dispatch" line in the bucket table (~9 750 ms total).
+```
+
+Wave 5b.13 cross-fence audit: **CLOSED — kernel is SOTA, fix lives in hf2q wrapper (ADR-005), not mlx-native (ADR-015).**
