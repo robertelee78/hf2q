@@ -4887,6 +4887,111 @@ mod tests {
         );
     }
 
+    /// ADR-014 P7 iter-39 — vision policy overrides DwqK Q8_0 routing.
+    /// Orthogonal control gate to iter-38: pin that the vision-pattern
+    /// arm STILL fires for DwqK even when the per-tensor routing target
+    /// is the legacy Q8_0 sensitive-bucket.  Vision-policy F16 passthrough
+    /// is universal (multimodal-quality reasons), it must not be
+    /// short-circuited by the iter-38 routing-aware split.
+    ///
+    /// Test fixture: `model.visual.layers.5.attn.q_proj.weight`
+    ///   - Matches `is_vision_tensor_pattern` (contains "model.visual.")
+    ///   - Does NOT match `TensorRef::is_vision_tensor()` (which only
+    ///     matches "vision_tower" / "embed_vision") — so streaming.rs's
+    ///     `preserve = … || tensor.is_vision_tensor()` does NOT fire,
+    ///     forcing the test through DwqK's gate path.
+    ///   - `extract_layer_index` resolves layer 5
+    ///   - Layer 5 marked sensitive → Q8_0 routing
+    ///   - Row_len=256 (256-multiple AND 32-multiple — isolates vision axis
+    ///     from row-misalignment axis)
+    ///
+    /// Pre-iter-37 (with the merged predicate): F16 passthrough fires
+    /// via the universal vision arm.
+    /// Post-iter-37/38 (split predicate, routing-aware): F16 passthrough
+    /// STILL fires via the universal `is_vision_tensor_pattern` OR clause.
+    ///
+    /// Without this test, a future "simplification" of the routing-aware
+    /// gate that drops the vision arm (or wraps the entire OR in
+    /// `is_kquant_routing`) would silently route vision tensors to the
+    /// Q8_0 codec — degrading multimodal quality with no test signal.
+    #[test]
+    fn dwq_vision_tensor_on_sensitive_layer_emits_f16_passthrough() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::dwq_k_quantizer::{DwqKQuantizer, DwqKVariant};
+
+        const ROW_LEN: usize = 256; // 256-multiple — alignment axis is OFF
+
+        // Tensor name that simultaneously: (a) matches the codec
+        // vision-pattern, (b) parses to a layer index for DwqK
+        // sensitivity routing, (c) does NOT match streaming.rs's
+        // `TensorRef::is_vision_tensor()` (narrower; only "vision_tower"
+        // or "embed_vision") — this is necessary so the test exercises
+        // DwqK's gate path and not the upstream `preserve=true` shortcut.
+        let tensor_name = "model.visual.layers.5.attn.q_proj.weight";
+
+        // Pre-conditions:
+        assert!(
+            crate::quantize::layer_mix::is_vision_tensor_pattern(tensor_name),
+            "fixture must match vision-pattern arm"
+        );
+        assert!(
+            !crate::quantize::layer_mix::is_kquant_row_misaligned(ROW_LEN),
+            "ROW_LEN=256 must NOT trigger row-misalignment arm — \
+             this test isolates the vision-policy axis from the alignment axis"
+        );
+
+        let payload: Vec<u8> = (0..ROW_LEN)
+            .map(|i| (i as f32 / ROW_LEN as f32) * 2.0 - 1.0)
+            .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+
+        let make_lazy_map = || -> LazyTensorMap {
+            let mut m = LazyTensorMap::new();
+            m.insert(LazyTensor::from_bytes(
+                LazyMeta::new(tensor_name.to_string(), vec![1, ROW_LEN], DType::F16),
+                payload.clone(),
+            ));
+            m
+        };
+
+        // P48 = Q4_K base + Q8_0 sensitive.  Layer 5 sensitive →
+        // routing_target=Q8_0 (legacy).  Vision arm must still fire.
+        let q = DwqKQuantizer::new(
+            DwqKVariant::P48,
+            &[5..=5],
+            CalibrationData::None,
+        );
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+        let out = quantize_streaming(make_lazy_map(), &metadata, &q, 0, 0, &progress, false)
+            .expect("DwqK::P48 streaming with vision tensor");
+
+        let t = out
+            .tensors
+            .get(tensor_name)
+            .unwrap_or_else(|| panic!("missing {tensor_name}"));
+
+        assert_eq!(
+            t.quant_info.ggml_type.as_deref(),
+            Some("F16"),
+            "vision tensor on sensitive Q8_0 layer emitted {:?} instead of F16 \
+             — vision-policy universal F16 passthrough has been short-circuited \
+             by iter-38's routing-aware gate",
+            t.quant_info.ggml_type
+        );
+        assert!(
+            t.quant_info.preserved,
+            "vision tensor: preserved flag must be true for F16 passthrough"
+        );
+        assert_eq!(
+            t.data.len(),
+            ROW_LEN * 2,
+            "vision tensor F16 byte budget"
+        );
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
