@@ -355,6 +355,23 @@ fn apply_output_head_gpu(
 }
 
 
+/// Single source of `&mut DecodeBuffers.logits_buf` from a `&DecodeBuffers`.
+///
+/// SAFETY: `decode_bufs` is borrowed via a `*mut DecodeBuffers` (see `forward_gpu_greedy`
+/// at line ~1593) for the entire decode token; greedy-decode is single-threaded and
+/// the same `bufs` reference is not aliased concurrently with this `&mut` borrow.
+/// Only `logits_buf` is exposed mutably — no other field is touched.
+///
+/// This helper centralizes the pre-existing baseline interior-mutability cast so both
+/// the single-CB output head (`apply_output_head_gpu_greedy_into`) and the legacy
+/// 3-encoder fallback (`apply_output_head_gpu_greedy_legacy`) share ONE unsafe site
+/// instead of duplicating the cast at every call site.
+#[inline]
+fn logits_buf_mut(bufs: &DecodeBuffers) -> &mut MlxBuffer {
+    // SAFETY: see function-level doc.
+    unsafe { &mut (*(bufs as *const DecodeBuffers as *mut DecodeBuffers)).logits_buf }
+}
+
 /// Decode-only greedy variant of `apply_output_head_gpu`.
 ///
 /// Runs RMSNorm → lm_head GEMM → GPU argmax, then downloads 4 bytes
@@ -382,11 +399,8 @@ fn apply_output_head_gpu_greedy(
     let out_value     = &bufs.argmax_value_buf;
     let argmax_params = &bufs.argmax_params_buf;
     // logits_buf is &mut because apply_linear_projection_f32_into writes into it.
-    // SAFETY: decode_bufs is behind a *mut DecodeBuffers (exclusive access during
-    // this call — same token, no concurrent access).
-    let logits_buf = unsafe {
-        &mut (*(bufs as *const DecodeBuffers as *mut DecodeBuffers)).logits_buf
-    };
+    // Centralized via `logits_buf_mut` (single unsafe site for the whole file).
+    let logits_buf = logits_buf_mut(bufs);
 
     // ADR-015 P3 Stage 1 (S1): collapse the legacy 3-encoder output head
     // (norm + lm_head + argmax) into ONE encoder with two intra-CB
@@ -530,9 +544,8 @@ fn apply_output_head_gpu_greedy_legacy(
     let out_index     = &bufs.argmax_index_buf;
     let out_value     = &bufs.argmax_value_buf;
     let argmax_params = &bufs.argmax_params_buf;
-    let logits_buf = unsafe {
-        &mut (*(bufs as *const DecodeBuffers as *mut DecodeBuffers)).logits_buf
-    };
+    // Centralized via `logits_buf_mut` (single unsafe site for the whole file).
+    let logits_buf = logits_buf_mut(bufs);
 
     let mut enc_norm = device.command_encoder().context("enc output_norm legacy")?;
     rms_norm::dispatch_rms_norm(
