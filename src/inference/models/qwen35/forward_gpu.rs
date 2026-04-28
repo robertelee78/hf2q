@@ -48,7 +48,7 @@ use super::full_attn::FullAttnShape;
 use super::activation_capture::LayerActivations;
 use super::gpu_delta_net::{build_delta_net_layer, DeltaNetWeightsGpu};
 use super::gpu_ffn::{
-    build_dense_ffn_layer_gpu, build_dense_ffn_layer_gpu_q, build_dense_ffn_layer_gpu_q_into,
+    build_dense_ffn_layer_gpu, build_dense_ffn_layer_gpu_q_into,
     build_moe_ffn_layer_gpu, build_moe_ffn_layer_gpu_q, build_moe_ffn_layer_gpu_q_into,
     DenseFfnWeightsGpu, DenseFfnWeightsGpuQ, MoeFfnWeightsGpu, MoeFfnWeightsGpuQ,
 };
@@ -903,9 +903,10 @@ impl Qwen35Model {
             // can fuse the fused_residual_norm + DenseQ FFN dispatch into
             // a single command buffer (eliminates the inter-encoder
             // commit-and-wait per dense layer × 64 layers per prefill chunk).
-            let dense_q_legacy_prefill = std::env::var("HF2Q_DENSE_Q_LEGACY").is_ok();
-            let denseq_fused_eligible = matches!(ffn_weights_gpu_peek, FfnWeightsGpu::DenseQ(_))
-                && !dense_q_legacy_prefill;
+            // W-5b.16 sunset: the `HF2Q_DENSE_Q_LEGACY` env gate was removed
+            // after a 30/30 cross-path parity audit at PP4106; DenseQ now
+            // unconditionally takes the fused path.
+            let denseq_fused_eligible = matches!(ffn_weights_gpu_peek, FfnWeightsGpu::DenseQ(_));
 
             // Allocate the two outputs up-front (live past the encoder).
             let ffn_input_buf = device
@@ -948,10 +949,10 @@ impl Qwen35Model {
                     enc.memory_barrier();
                     (ffn_residual_buf, ffn_input_buf, Some(enc))
                 } else {
-                    // Legacy 2-encoder path for Dense (F32) / Moe / MoeQ /
-                    // DenseQ-when-HF2Q_DENSE_Q_LEGACY=1.  commit() without
-                    // wait — Metal serial queue guarantees ordering; the
-                    // FFN commit_and_wait() provides the eventual sync.
+                    // Legacy 2-encoder path for Dense (F32) / Moe / MoeQ.
+                    // commit() without wait — Metal serial queue guarantees
+                    // ordering; the FFN commit_and_wait() provides the
+                    // eventual sync.
                     enc.commit();
                     (ffn_residual_buf, ffn_input_buf, None)
                 }
@@ -995,27 +996,29 @@ impl Qwen35Model {
                     // Quantized dense path (production 27B DWQ GGUFs): weights stay as
                     // GGML blocks; quantized_matmul_ggml dequantizes on-the-fly.
                     // Residual folded in, same as Dense path.
-                    if let Some(mut enc) = fused_enc.take() {
-                        // Wave 5b.14 fused-CB DenseQ path: same encoder as
-                        // fused_residual_norm above, single commit_and_wait.
-                        let out = build_dense_ffn_layer_gpu_q_into(
-                            &mut enc, &device, &mut registry,
-                            &ffn_input, w, Some(&ffn_residual),
-                        )
-                        .with_context(|| format!("dense_ffn_q_into fused layer {layer_idx}"))?;
-                        if seq_len == 1 {
-                            enc.commit();
-                        } else {
-                            enc.commit_and_wait()
-                                .with_context(|| format!("commit fused-DenseQ layer {layer_idx}"))?;
-                        }
-                        out
+                    //
+                    // W-5b.14 fused-CB DenseQ path: same encoder as
+                    // fused_residual_norm above, single commit_and_wait.
+                    // W-5b.16 sunset: the `HF2Q_DENSE_Q_LEGACY=1` 2-encoder
+                    // forensic A/B was removed; `denseq_fused_eligible`
+                    // is unconditionally true for DenseQ above, so
+                    // `fused_enc` is guaranteed Some here.
+                    let mut enc = fused_enc.take().ok_or_else(|| {
+                        anyhow!("DenseQ fused encoder missing at layer {layer_idx} \
+                                 (denseq_fused_eligible invariant violated)")
+                    })?;
+                    let out = build_dense_ffn_layer_gpu_q_into(
+                        &mut enc, &device, &mut registry,
+                        &ffn_input, w, Some(&ffn_residual),
+                    )
+                    .with_context(|| format!("dense_ffn_q_into fused layer {layer_idx}"))?;
+                    if seq_len == 1 {
+                        enc.commit();
                     } else {
-                        // Legacy 2-encoder DenseQ path (HF2Q_DENSE_Q_LEGACY=1).
-                        build_dense_ffn_layer_gpu_q(&device, &mut registry, &ffn_input, w,
-                            Some(&ffn_residual))
-                            .with_context(|| format!("dense_ffn_q layer {layer_idx}"))?
+                        enc.commit_and_wait()
+                            .with_context(|| format!("commit fused-DenseQ layer {layer_idx}"))?;
                     }
+                    out
                 }
                 FfnWeightsGpu::Moe(w_gpu) => {
                     debug_assert!(fused_enc.is_none(), "Moe path uses 2-encoder");
@@ -1548,7 +1551,9 @@ impl Qwen35Model {
             //
             // Wave 5b.14 follow-up: DenseQ joins the fused single-CB path via the
             // mirror `build_dense_ffn_layer_gpu_q_into` (production 27B DWQ GGUFs).
-            // Forensic A/B retained behind `HF2Q_DENSE_Q_LEGACY=1`.
+            // W-5b.16 sunset: the `HF2Q_DENSE_Q_LEGACY` env gate was removed
+            // after a 30/30 cross-path parity audit at PP4106; DenseQ now
+            // unconditionally takes the fused single-CB path.
             //
             // Dense (F32) and Moe-unquantized still use the legacy 2-encoder path
             // because their dispatchers have not been converted to the `_into` API
@@ -1564,8 +1569,6 @@ impl Qwen35Model {
                 LayerWeightsGpu::LinearAttn { ffn, .. } => ffn,
             };
             let t_ffn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
-
-            let dense_q_legacy = std::env::var("HF2Q_DENSE_Q_LEGACY").is_ok();
 
             let ffn_out = match ffn_weights_gpu {
                 FfnWeightsGpu::MoeQ(w_gpu) => {
@@ -1610,12 +1613,14 @@ impl Qwen35Model {
                     }
                     out
                 }
-                FfnWeightsGpu::DenseQ(w) if !dense_q_legacy => {
+                FfnWeightsGpu::DenseQ(w) => {
                     // Wave 5b.14: fused DenseQ path mirrors MoE-Q exactly — one
                     // command buffer for fused_res_norm + entire dense FFN.  Saves
                     // 1 command buffer per layer × 64 layers per Qwen3.5 27B
-                    // decode token (64 fewer GPU sync barriers).  Forensic legacy
-                    // 2-encoder path retained behind `HF2Q_DENSE_Q_LEGACY=1`.
+                    // decode token (64 fewer GPU sync barriers).
+                    // W-5b.16 sunset: the `HF2Q_DENSE_Q_LEGACY=1` 2-encoder
+                    // forensic A/B was removed after a 30/30 cross-path parity
+                    // audit at PP4106.
                     let mut enc = device.command_encoder()
                         .with_context(|| format!("enc fused_res_norm+denseq greedy layer {layer_idx}"))?;
                     dispatch_fused_residual_norm_f32(
@@ -1647,8 +1652,12 @@ impl Qwen35Model {
                     out
                 }
                 _ => {
-                    // Legacy 2-encoder path for Dense (F32) / Moe-unquantized
-                    // and DenseQ when `HF2Q_DENSE_Q_LEGACY=1` (forensic A/B).
+                    // Legacy 2-encoder path for Dense (F32) / Moe-unquantized.
+                    // DenseQ + MoeQ are caught by their dedicated fused-CB
+                    // arms above and never reach this fall-through.
+                    // W-5b.16 sunset: the DenseQ legacy sub-arm (the only
+                    // arm that fired under `HF2Q_DENSE_Q_LEGACY=1`) was
+                    // removed alongside the env gate itself.
                     {
                         let mut enc = device.command_encoder()
                             .with_context(|| format!("enc fused_res_norm greedy layer {layer_idx}"))?;
@@ -1683,13 +1692,6 @@ impl Qwen35Model {
                                 Some(&ffn_residual))
                                 .with_context(|| format!("dense_ffn greedy layer {layer_idx}"))?
                         }
-                        FfnWeightsGpu::DenseQ(w) => {
-                            // Reached only when HF2Q_DENSE_Q_LEGACY=1; build_dense_ffn_layer_gpu_q
-                            // dispatches its own legacy device-alloc + own-encoder body.
-                            build_dense_ffn_layer_gpu_q(&device, &mut registry, &ffn_input, w,
-                                Some(&ffn_residual))
-                                .with_context(|| format!("dense_ffn_q greedy layer {layer_idx}"))?
-                        }
                         FfnWeightsGpu::Moe(w_gpu) => {
                             let moe = cfg.moe.as_ref().ok_or_else(|| {
                                 anyhow!("MoE FFN missing moe config greedy (layer {layer_idx})")
@@ -1710,6 +1712,9 @@ impl Qwen35Model {
                             build_moe_ffn_layer_gpu(&device, &mut registry, &ffn_input, w_gpu, w_cpu, shape)
                                 .with_context(|| format!("moe_ffn greedy layer {layer_idx}"))?
                         }
+                        FfnWeightsGpu::DenseQ(_) => unreachable!(
+                            "DenseQ handled in fused path above (W-5b.16 sunset)"
+                        ),
                         FfnWeightsGpu::MoeQ(_) => unreachable!("MoeQ handled in fused path above"),
                     }
                 }
