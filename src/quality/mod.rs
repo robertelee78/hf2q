@@ -266,6 +266,24 @@ pub fn dequantize_single_tensor(name: &str, qt: &QuantizedTensor) -> TensorRef {
         };
     }
 
+    // ADR-014 P7 iter-45 — K-quant codec arm.  Recognise
+    // `METHOD_K_QUANT_CODEC_DIRECT` (and the DwqK variant tag suffix
+    // `dwq-k-mixed-*-*`) and dispatch to the codec-direct dequant
+    // path keyed by `ggml_type`.  Pre-iter-45 this fell into the
+    // "no scales" warn → returns zeros → cosine fails surface
+    // discovered by iter-44's end-to-end flow gate.
+    //
+    // Covers: K-quants (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K) + the legacy codec
+    // outputs (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) emitted by KQuantCodecQuantizer
+    // and DwqKQuantizer's delegated codec dispatch.  All have
+    // `quant_info.scales = None` (the codec stores scales inline in
+    // the block bytes, not the QuantizedTensor's separate scales field).
+    if qt.quant_info.scales.is_none() && qt.quant_info.ggml_type.is_some() {
+        if let Some(dequant) = try_dequantize_codec_direct(name, qt) {
+            return dequant;
+        }
+    }
+
     let numel: usize = qt.shape.iter().product();
     let bits = qt.quant_info.bits;
     let group_size = qt.quant_info.group_size;
@@ -582,6 +600,83 @@ pub fn measure_quality_streaming_lazy(
     );
 
     Ok(report)
+}
+
+/// ADR-014 P7 iter-45 — codec-direct dequant arm for `dequantize_single_tensor`.
+/// Recognises K-quant + legacy codec outputs (where `ggml_type` is the
+/// authoritative format and scales live inline in the block bytes).
+/// Returns `None` if the `ggml_type` is not a recognised codec
+/// — caller falls through to the legacy scales-based path or the
+/// "no scales" warn.
+fn try_dequantize_codec_direct(name: &str, qt: &QuantizedTensor) -> Option<TensorRef> {
+    use crate::quantize::k_quant::{
+        dequantize_row_q2_k_bytes, dequantize_row_q3_k_bytes, dequantize_row_q4_k_bytes,
+        dequantize_row_q5_k_bytes, dequantize_row_q6_k_bytes,
+    };
+    use crate::quantize::q_legacy::{
+        dequantize_row_q4_0_bytes, dequantize_row_q4_1_bytes, dequantize_row_q5_0_bytes,
+        dequantize_row_q5_1_bytes, dequantize_row_q8_0_bytes,
+    };
+
+    let ggml_type = qt.quant_info.ggml_type.as_deref()?;
+    let numel: usize = qt.shape.iter().product();
+    let mut decoded_f32 = vec![0.0_f32; numel];
+
+    let dequant_result = match ggml_type {
+        "Q2_K" => dequantize_row_q2_k_bytes(&qt.data, &mut decoded_f32)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}")),
+        "Q3_K" => dequantize_row_q3_k_bytes(&qt.data, &mut decoded_f32)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}")),
+        "Q4_K" => dequantize_row_q4_k_bytes(&qt.data, &mut decoded_f32)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}")),
+        "Q5_K" => dequantize_row_q5_k_bytes(&qt.data, &mut decoded_f32)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}")),
+        "Q6_K" => dequantize_row_q6_k_bytes(&qt.data, &mut decoded_f32)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}")),
+        "Q4_0" => dequantize_row_q4_0_bytes(&qt.data, &mut decoded_f32)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}")),
+        "Q4_1" => dequantize_row_q4_1_bytes(&qt.data, &mut decoded_f32)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}")),
+        "Q5_0" => dequantize_row_q5_0_bytes(&qt.data, &mut decoded_f32)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}")),
+        "Q5_1" => dequantize_row_q5_1_bytes(&qt.data, &mut decoded_f32)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}")),
+        "Q8_0" => dequantize_row_q8_0_bytes(&qt.data, &mut decoded_f32)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}")),
+        _ => return None,
+    };
+
+    if let Err(e) = dequant_result {
+        warn!(
+            "Codec-direct dequant for {name} ({ggml_type}) failed: {e}; \
+             falling through to legacy scales path"
+        );
+        return None;
+    }
+
+    // Pack F32 into F16 LE for the TensorRef contract (matches the
+    // existing scales-based path's output dtype).
+    let mut f16_data = Vec::with_capacity(numel * 2);
+    for v in &decoded_f32 {
+        f16_data.extend_from_slice(&half::f16::from_f32(*v).to_le_bytes());
+    }
+
+    Some(TensorRef {
+        name: name.to_string(),
+        shape: qt.shape.clone(),
+        dtype: DType::F16,
+        data: f16_data,
+    })
 }
 
 /// Mirror `TensorRef::is_weight` predicate without needing materialised
@@ -1207,6 +1302,135 @@ mod tests {
                 i,
                 e,
                 l
+            );
+        }
+    }
+
+    /// ADR-014 P7 iter-45 — codec-direct dequant arm round-trips
+    /// quality measurement for K-quant + legacy codec outputs.
+    ///
+    /// Pre-iter-45, `dequantize_single_tensor` ignored `ggml_type` for
+    /// codec outputs (no `scales` field) and fell into the "no scales"
+    /// warn path returning zeros.  Cosine similarity vs original then
+    /// failed (zero-magnitude), per-layer stayed empty, and the
+    /// QualityReport had None metrics.  iter-45 added a
+    /// `try_dequantize_codec_direct` arm that recognises K-quant
+    /// (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K) and legacy (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0)
+    /// `ggml_type` and dispatches to the matching `dequantize_row_q*_bytes`.
+    ///
+    /// Test runs the full `measure_quality_streaming` pipeline with a
+    /// `KQuantCodecQuantizer` Q4_K output and asserts the QualityReport
+    /// has non-empty per-layer cosine sim with values close to 1.0
+    /// (Q4_K dequant tolerance on a smooth ramp).
+    #[test]
+    fn kquant_codec_direct_dequant_round_trip_via_quality_pipeline() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::ir::TensorMap;
+        use crate::quantize::k_quant_codec::KQuantTarget;
+        use crate::quantize::k_quant_codec_quantizer::KQuantCodecQuantizer;
+        use crate::quantize::quantize_streaming;
+
+        const QK_K: usize = 256;
+
+        let tensors: Vec<&str> = vec![
+            "blk.0.attn_q.weight",
+            "blk.0.ffn_down.weight",
+        ];
+
+        let make_payload = |seed: f32| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(QK_K * 2);
+            for i in 0..QK_K {
+                let v = (i as f32 / QK_K as f32) * 2.0 - 1.0 + seed * 0.001;
+                bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+            }
+            bytes
+        };
+
+        // Build lazy_map for quantize.
+        let mut lazy_map = LazyTensorMap::new();
+        for (i, name) in tensors.iter().enumerate() {
+            lazy_map.insert(LazyTensor::from_bytes(
+                LazyMeta::new(name.to_string(), vec![1, QK_K], DType::F16),
+                make_payload(i as f32),
+            ));
+        }
+
+        // Build TensorMap for quality reference (mirror byte content).
+        let mut tensor_map = TensorMap::new();
+        for (i, name) in tensors.iter().enumerate() {
+            tensor_map.insert(crate::ir::TensorRef {
+                name: name.to_string(),
+                shape: vec![1, QK_K],
+                dtype: DType::F16,
+                data: make_payload(i as f32),
+            });
+        }
+
+        // Use the quantize_streaming variant with K-quant codec.
+        let metadata = ModelMetadata {
+            architecture: "test".to_string(),
+            model_type: "test".to_string(),
+            param_count: 0,
+            hidden_size: QK_K as u64,
+            num_layers: 1,
+            layer_types: vec![],
+            num_attention_heads: 1,
+            num_kv_heads: None,
+            vocab_size: 0,
+            dtype: "float16".to_string(),
+            shard_count: 0,
+            num_experts: None,
+            top_k_experts: None,
+            intermediate_size: None,
+            raw_config: serde_json::Value::Null,
+            explicit_layer_types: None,
+            full_attention_interval: None,
+            attn_output_gate: None,
+            head_dim: None,
+            partial_rotary_factor: None,
+            rope_parameters: None,
+            linear_conv_kernel_dim: None,
+            linear_key_head_dim: None,
+            linear_num_key_heads: None,
+            linear_value_head_dim: None,
+            linear_num_value_heads: None,
+            mamba_ssm_dtype: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
+            output_router_logits: None,
+            router_aux_loss_coef: None,
+        };
+        let progress = ProgressReporter::new();
+        let q = KQuantCodecQuantizer::new("Q4_K", KQuantTarget::Q4K, CalibrationData::None);
+        let model = quantize_streaming(lazy_map, &metadata, &q, 0, 0, &progress, false)
+            .expect("quantize_streaming should succeed");
+
+        // Run quality through the codec-direct dequant arm.
+        let report = measure_quality_streaming(
+            &tensor_map,
+            &model,
+            &metadata,
+            std::path::Path::new("/tmp"),
+            &progress,
+        )
+        .expect("quality should succeed");
+
+        let per_layer = report
+            .per_layer_cosine_sim
+            .as_ref()
+            .expect("per-layer must exist post-iter-45");
+        assert!(
+            !per_layer.is_empty(),
+            "per-layer must contain at least one weight pair"
+        );
+        for (i, &v) in per_layer.iter().enumerate() {
+            assert!(
+                (v - 1.0).abs() < 0.01,
+                "tensor {i}: cosine {v} should be close to 1.0 (Q4_K codec dequant on smooth ramp) \
+                 — codec-direct dequant arm is not round-tripping correctly"
             );
         }
     }

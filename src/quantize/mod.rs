@@ -5359,17 +5359,16 @@ mod tests {
     /// `TensorMap` is ever resident.  This is the architectural shape
     /// `main.rs:1147` will adopt when iter-3 lands.
     ///
-    /// **Iter-3 prerequisite surfaced by this test**: this iter
-    /// originally used `KQuantCodecQuantizer` and discovered that
-    /// `quality::dequantize_single_tensor` does NOT handle the
-    /// `METHOD_K_QUANT_CODEC_DIRECT` method — it falls into the
-    /// "no scales" warn path and returns zeros, so cosine_similarity
-    /// fails and the QualityReport has empty per-layer.  Iter-3
-    /// production wire-up of K-quant codec models therefore needs a
-    /// K-quant-aware dequant-for-quality (queued for a separate iter).
-    /// In the meantime, this iter uses `StaticQuantizer` (bits=8) to
-    /// exercise the iter-3 flow shape with a quantizer whose dequant
-    /// path is already wired through `quality::dequantize_single_tensor`.
+    /// **Iter-3 prerequisite surfaced + resolved**: iter-44 originally
+    /// used `KQuantCodecQuantizer` and discovered that
+    /// `quality::dequantize_single_tensor` did NOT handle the
+    /// `METHOD_K_QUANT_CODEC_DIRECT` method — it fell into the
+    /// "no scales" warn path and returned zeros.  iter-45 (`<TBD>`)
+    /// added the codec-direct dequant arm dispatching off `ggml_type`
+    /// for K-quants (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K) and legacy codec outputs
+    /// (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0).  This iter still uses StaticQuantizer
+    /// for the smaller fixture; the K-quant path is now exercised via
+    /// the iter-45 byte-identity gate `kquant_codec_direct_dequant_round_trip`.
     ///
     /// Synthetic fixture (in-memory, no on-disk safetensors required):
     /// build the same set of tensors twice (once for quantize, once for
