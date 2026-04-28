@@ -1282,20 +1282,26 @@ pub fn apply_sdpa_with_kv_cache(
         // re-borrow at sdpa(&slot.k, &slot.v, ...) below is sound without an
         // explicit drop. (drop() on a reference is a no-op anyway.)
 
-        // ── Wave 5b.10: production path uses flash_attn_prefill_bf16_d256 ──
+        // ── Production path: flash_attn_prefill_bf16_d256 ──
         //
         // The legacy `sdpa` 3-pass tiled kernel (no online softmax, no
         // simdgroup_matrix MMA) was 76.5 % of per-FA-layer cost at PP4096
-        // (W-5b.9 audit). The replacement is the same-purpose
+        // (W-5b.9 audit). It has been replaced by the same-purpose
         // `flash_attn_prefill_bf16_d256` kernel that Gemma 4 has used in
         // production since ADR-011 Phase 2 Wave 4 (commit `953dc1b`).
+        //
+        // Wave 5b.10 (commits a0cab10 + 43090a8 + 9ccaabb + c4a3e02) wired
+        // the new path with a forensic A/B env gate `HF2Q_QWEN35_FA_LEGACY=1`.
+        // Wave 5b.12 sunset audit (5 cold model loads × 3 cold prefills × 2
+        // paths = 30 runs, all token id 11) confirmed parity holds, so the
+        // env gate has been removed; the new path is now the unconditional
+        // production codepath for the prefill-from-zero regime.
         //
         // Eligibility for the new path:
         //   - head_dim == 256 (Qwen3.5/3.6 production value)
         //   - cur_len == 0   (full prefill from offset 0; the kernel
         //     processes the chunk Q/K/V directly, not the full slot
         //     buffer — kv_seq_len equals seq_len in this regime)
-        //   - HF2Q_QWEN35_FA_LEGACY env var NOT set (forensic escape hatch)
         //
         // Cases that fall through to the legacy path:
         //   - head_dim != 256 (no D=256 dispatcher coverage; D=64 / D=512
@@ -1304,25 +1310,18 @@ pub fn apply_sdpa_with_kv_cache(
         //     cache; the new kernel reads chunk Q against chunk K/V only.
         //     This case is not exercised by the production prefill path
         //     at this iter — full-prefill-from-zero is the live regime —
-        //     but the legacy path is preserved as a correct fallback)
-        //   - HF2Q_QWEN35_FA_LEGACY=1 (forensic A/B comparison)
-        //
-        // The forensic env gate `HF2Q_QWEN35_FA_LEGACY=1` is documented to
-        // be removed in Wave 5b.11 once cross-path parity has been verified
-        // over multiple model loads (per `feedback_no_shortcuts.md`: a
-        // fallback without a sunset plan is the antipattern).
-        let use_legacy = std::env::var("HF2Q_QWEN35_FA_LEGACY").is_ok();
-        let new_path_eligible = head_dim == 256 && cur_len == 0 && !use_legacy;
+        //     but the legacy path is preserved as a correct fallback for
+        //     non-prefill-from-zero correctness)
+        let new_path_eligible = head_dim == 256 && cur_len == 0;
         if new_path_eligible {
-            // The Wave 5b.10 fast path: dispatch flash_attn_prefill on the
-            // chunk seq-major Q/K/V directly. Output is seq-major F32,
-            // matching the legacy path's return shape.
+            // Dispatch flash_attn_prefill on the chunk seq-major Q/K/V
+            // directly. Output is seq-major F32, matching the legacy
+            // path's return shape.
             //
-            // Wave 5b.9 instrumentation: the new path is bucketed under
-            // `fa.sdpa.kernel` (the dominant W-5b.9 bucket). Q/out
-            // permute round-trips disappear (no CPU permute, no
-            // download_f32/upload_f32) — sub-buckets q_dl_perm_ul and
-            // out_dl_perm_ul will read ~0 ms/layer in W-5b.10.
+            // Wave 5b.9 instrumentation: bucketed under `fa.sdpa.kernel`
+            // (the dominant W-5b.9 bucket). Q/out permute round-trips
+            // disappear (no CPU permute, no download_f32/upload_f32) —
+            // sub-buckets q_dl_perm_ul and out_dl_perm_ul read ~0 ms/layer.
             let _w5b10_kernel = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FaSdpaKernel,
             );
@@ -1337,10 +1336,12 @@ pub fn apply_sdpa_with_kv_cache(
             return Ok(out_uploaded);
         }
 
-        // ── Legacy path (HF2Q_QWEN35_FA_LEGACY=1 OR head_dim != 256 OR
-        //    cur_len > 0). Dispatched against the older `sdpa` kernel +
-        //    CPU permute round-trips. Preserved bit-exactly for forensic
-        //    A/B comparison and for incremental-prefill correctness. ──
+        // ── Fallback path (head_dim != 256 OR cur_len > 0). Dispatched
+        //    against the older `sdpa` kernel + CPU permute round-trips.
+        //    Preserved bit-exactly for incremental-prefill correctness.
+        //    Not exercised by the production Qwen3.5/3.6 prefill-from-zero
+        //    path; kept for future model classes whose head_dim or
+        //    incremental-prefill semantics differ. ──
         let q_gpu = {
             let _w5b9_q_dl_perm_ul = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FaSdpaQDownloadPermuteUpload,
@@ -2359,172 +2360,14 @@ mod tests {
         );
     }
 
-    /// **Wave 5b.10 parity test**: the new flash_attn_prefill bridge
-    /// produces output matching the legacy sdpa kernel within a documented
-    /// numerical tolerance.
-    ///
-    /// Both paths share a single forward through Q/K/V projections + IMROPE
-    /// (so the test isolates the SDPA-kernel substitution), then dispatch
-    /// `apply_sdpa_with_kv_cache` once with `HF2Q_QWEN35_FA_LEGACY=1` set
-    /// (legacy `sdpa` 3-pass tiled kernel) and once with it cleared (new
-    /// `flash_attn_prefill_bf16_d256` path).
-    ///
-    /// Tolerance budget (per ADR-011 Phase 2 Wave 4 numerics — same kernel
-    /// family, same f32 accumulator, BF16 I/O at the kernel boundary):
-    ///   - max abs ≤ 5e-2 — accounts for the F32→BF16 cast at the bridge
-    ///     boundary plus the difference in softmax algorithm (3-pass tiled
-    ///     vs online); BF16 has ~3 decimal digits of mantissa, so a
-    ///     few-percent magnitude error per sigmoid-attended head is the
-    ///     expected drift.
-    ///   - mean abs ≤ 5e-3 — bulk of elements should agree to 3 digits.
-    ///
-    /// **Functional equivalence is byte-exact at the token-id level**
-    /// (verified by the W-5b.10 walk-bar parity check at PP4106 — see
-    /// `docs/wave5b3-walkbar-results.md` "Wave 5b.10" section). This test
-    /// asserts the kernel-numeric tolerance only; downstream argmax is
-    /// the production correctness gate.
-    #[test]
-    fn fa_path_first_token_matches_legacy_at_seq128() {
-        // FullAttnKvSlot is imported at module scope (line 66).
-        let device = MlxDevice::new().expect("device");
-        let mut registry = KernelRegistry::new();
-        // Register the flash_attn_prefill kernel family — production code
-        // does this in `GpuContext::new` (`src/serve/gpu.rs:64`); the test
-        // registry is fresh, so we register the same set here so the
-        // dispatcher can resolve `flash_attn_prefill_bf16_d256` at runtime.
-        mlx_native::ops::flash_attn_prefill::register(&mut registry);
-
-        // Realistic Qwen3.6 27B FA shape (mod.rs:712-715): n_heads=16,
-        // n_kv=2, head_dim=256. seq_len=128 keeps test under ~30 ms while
-        // exercising both kernels' prefill regime (BQ=32 → 4 tile rows;
-        // multiple kv tiles).  Note: function name is "_seq128" for
-        // historical naming alignment with the chunk-path test, but we
-        // use seq_len = 128 here too (deliberate, not a typo).
-        let seq_len: u32 = 128;
-        let n_heads: u32 = 16;
-        let n_kv_heads: u32 = 2;
-        let head_dim: u32 = 256;
-        let max_seq_len: u32 = 256;
-
-        let q_elems = (seq_len * n_heads * head_dim) as usize;
-        let kv_elems = (seq_len * n_kv_heads * head_dim) as usize;
-
-        // Deterministic small-magnitude inputs.
-        // Q/K post-RMSNorm have unit-ish norm — use the 0.1 scale that
-        // approximates the post-norm magnitude regime.  V is unscaled
-        // (post-projection F32, no per-head norm).
-        let mut seed: u32 = 0xCAFE;
-        let q_cpu: Vec<f32> = mk_rand(&mut seed, q_elems, 0.1);
-        let k_cpu: Vec<f32> = mk_rand(&mut seed, kv_elems, 0.1);
-        let v_cpu: Vec<f32> = mk_rand(&mut seed, kv_elems, 0.05);
-
-        // Helper: allocate a fresh KV slot for one path's call.  Both paths
-        // get independent slots so the legacy CPU triple-loop write doesn't
-        // race the new path's ownership semantics.
-        let alloc_slot = |dev: &MlxDevice| -> FullAttnKvSlot {
-            let elems = (n_kv_heads * max_seq_len * head_dim) as usize;
-            let bytes = elems * 4;
-            let shape = vec![1, n_kv_heads as usize, max_seq_len as usize, head_dim as usize];
-            let k = dev.alloc_buffer(bytes, DType::F32, shape.clone()).expect("alloc K");
-            let v = dev.alloc_buffer(bytes, DType::F32, shape).expect("alloc V");
-            FullAttnKvSlot {
-                k,
-                v,
-                current_len: vec![0],
-            }
-        };
-
-        // Run the legacy path: HF2Q_QWEN35_FA_LEGACY=1.
-        let legacy_out_cpu = {
-            std::env::set_var("HF2Q_QWEN35_FA_LEGACY", "1");
-            let q_buf = upload_f32(&q_cpu, &device).expect("upload Q legacy");
-            let k_buf = upload_f32(&k_cpu, &device).expect("upload K legacy");
-            let v_buf = upload_f32(&v_cpu, &device).expect("upload V legacy");
-            let mut slot = alloc_slot(&device);
-            let out = apply_sdpa_with_kv_cache(
-                &device, &mut registry,
-                &q_buf, &k_buf, &v_buf,
-                &mut slot,
-                seq_len, n_heads, n_kv_heads, head_dim, max_seq_len,
-            ).expect("apply_sdpa_with_kv_cache legacy");
-            let cpu = download_f32(&out).expect("download legacy out");
-            std::env::remove_var("HF2Q_QWEN35_FA_LEGACY");
-            cpu
-        };
-
-        // Run the new path: env gate cleared (default).
-        let new_out_cpu = {
-            assert!(
-                std::env::var("HF2Q_QWEN35_FA_LEGACY").is_err(),
-                "env gate must be cleared for the new-path branch"
-            );
-            let q_buf = upload_f32(&q_cpu, &device).expect("upload Q new");
-            let k_buf = upload_f32(&k_cpu, &device).expect("upload K new");
-            let v_buf = upload_f32(&v_cpu, &device).expect("upload V new");
-            let mut slot = alloc_slot(&device);
-            let out = apply_sdpa_with_kv_cache(
-                &device, &mut registry,
-                &q_buf, &k_buf, &v_buf,
-                &mut slot,
-                seq_len, n_heads, n_kv_heads, head_dim, max_seq_len,
-            ).expect("apply_sdpa_with_kv_cache new");
-            download_f32(&out).expect("download new out")
-        };
-
-        assert_eq!(legacy_out_cpu.len(), new_out_cpu.len(),
-            "output length parity: legacy={}, new={}",
-            legacy_out_cpu.len(), new_out_cpu.len());
-
-        // Parallel-contention guard (pattern from
-        // `chunk_path_first_token_matches_autoregressive_at_seq128`):
-        // skip cleanly when BOTH paths return all-zero (Metal contention),
-        // FAIL hard when only one does (real divergence).
-        let legacy_all_zero = legacy_out_cpu.iter().all(|&v| v == 0.0);
-        let new_all_zero = new_out_cpu.iter().all(|&v| v == 0.0);
-        if legacy_all_zero && new_all_zero {
-            eprintln!(
-                "fa_path_first_token_matches_legacy_at_seq128: BOTH paths \
-                 returned all-zero — likely parallel-contention flake; \
-                 re-run in isolation with --test-threads=1 to confirm."
-            );
-            return;
-        }
-        assert!(!legacy_all_zero, "legacy path output unexpectedly all-zero");
-        assert!(!new_all_zero, "new path output unexpectedly all-zero");
-
-        // Numerical-tolerance comparison.
-        let mut max_abs = 0.0f32;
-        let mut sum_abs = 0.0f64;
-        let mut argmax_idx = 0usize;
-        for (i, (&l, &n)) in legacy_out_cpu.iter().zip(new_out_cpu.iter()).enumerate() {
-            let d = (l - n).abs();
-            if d > max_abs {
-                max_abs = d;
-                argmax_idx = i;
-            }
-            sum_abs += d as f64;
-        }
-        let mean_abs = (sum_abs / legacy_out_cpu.len() as f64) as f32;
-
-        // Tolerances chosen from W-4 ADR-011 Phase-2 numerics: BF16 I/O at
-        // kernel boundary + softmax algorithm difference (3-pass tiled vs
-        // online).  Updated tolerance bounds (max 5e-2, mean 5e-3) reflect
-        // the per-element drift; argmax/token-id parity is the production
-        // contract verified at walk-bar level, not here.
-        const MAX_TOL: f32 = 5e-2;
-        const MEAN_TOL: f32 = 5e-3;
-        assert!(
-            max_abs < MAX_TOL,
-            "fa_path parity max_abs={:.4e} >= {:.0e} \
-             (at idx {} of {}; legacy={:.6}, new={:.6})",
-            max_abs, MAX_TOL,
-            argmax_idx, legacy_out_cpu.len(),
-            legacy_out_cpu[argmax_idx], new_out_cpu[argmax_idx],
-        );
-        assert!(
-            mean_abs < MEAN_TOL,
-            "fa_path parity mean_abs={:.4e} >= {:.0e}",
-            mean_abs, MEAN_TOL,
-        );
-    }
+    // The `fa_path_first_token_matches_legacy_at_seq128` parity test that
+    // lived here in W-5b.10 was deleted in W-5b.12 alongside the
+    // `HF2Q_QWEN35_FA_LEGACY` env gate. With the gate gone, the legacy
+    // sdpa branch is no longer reachable from `apply_sdpa_with_kv_cache`
+    // for the production prefill-from-zero regime (head_dim=256, cur_len=0),
+    // so an A/B test against it is no longer meaningful. The 30-run sunset
+    // audit (5 cold model loads × 3 cold prefills × 2 paths, all token id
+    // 11) at full PP4106 walk-bar scale supersedes the seq=128 unit-level
+    // numerical-tolerance check; see `docs/wave5b3-walkbar-results.md`
+    // "Wave 5b.12" section for the audit table.
 }

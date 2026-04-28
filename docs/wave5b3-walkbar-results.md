@@ -1095,3 +1095,86 @@ The instrumentation commit `269faee` correctly partitioned the post-attention pa
 4. **The residual cost lives in mlx-native, not hf2q.** `layer.ffn_dispatch` is dispatched into `mlx_native::ops::moe_q::*`. Per the worker prompt's STOP condition: "If the per-DN-layer measurement reveals the dominant cost is in mlx-native … that's mlx-native scope (out of hf2q); document and STOP."
 
 ADR-005 AC-tier impact: NONE — perf-bar AC 5468 / 5470 already informational at full `[x]`. W-5b.11 hands W-5b.12 a concrete next-iter target: `mlx_native::ops::moe_q::*` dispatch optimization, scope = mlx-native repo.
+
+## Wave 5b.12 sunset audit + HF2Q_QWEN35_FA_LEGACY removal
+
+**Date:** 2026-04-27
+**Worker:** Wave 5b.12 (ADR-005 W-5b.10 forensic env-gate sunset)
+**Scope:** Run the 30-run sunset parity audit deferred from W-5b.11, then either remove the `HF2Q_QWEN35_FA_LEGACY=1` env gate (parity holds) or keep it and document the failure mode (parity fails).
+
+### (1) Pre-flight + concurrent-session check
+
+- Free RAM 6,549,244 pages × 16 KB = ~99.9 GB (well above 32 GB threshold)
+- No CFA worker > 50% CPU; highest non-system process was Safari at 41.7%
+- mlx-native HEAD `5d9bb2e3ded2cb68daadcd1c093e88dde9800457` at start AND end (no upstream drift)
+
+### (2) Audit protocol
+
+Driver script: `scripts/bench-w5b11-sunset-parity.sh` (landed in W-5b.11 commit `269faee`).
+
+```
+LOADS=5 TRIALS_PER_LOAD=3 → 5 × 3 × 2 paths = 30 runs
+prompt:   /tmp/walkbar-pp4096-prompt.txt (sha 62e66013, 23,038 bytes, pp4106 tokens)
+model:    /opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf
+target:   first-decoded-token id == 11 (`,`) on ALL 30 runs
+flags:    HF2Q_QWEN36_AUTOREG=1 HF2Q_UNSAFE_EXPERIMENTS=1 HF2Q_CHUNK_SCAN_PREFILL=1
+legacy:   adds HF2Q_QWEN35_FA_LEGACY=1 to the above
+```
+
+The harness auto-backgrounded the initial 30-run script invocation despite no `&` / `nohup` (Bash-tool wrapper behavior, not a script bug). The harness was killed after 10 runs completed (5 NEW + 5 LEGACY for L1-L2.T1-T2 + L1-T3, all token id 11). The remaining 20 runs were re-issued one trial at a time as individual foreground Bash invocations, each well under the harness 2-min auto-background threshold. Each run is a fresh hf2q process, so cross-run state is impossible — the split has no semantic effect on the audit.
+
+### (3) Audit result — 30/30 PASS
+
+| Load | Trial | NEW tok | NEW prefill ms | LEGACY tok | LEGACY prefill ms |
+|---:|---:|:---:|---:|:---:|---:|
+| 1 | 1 | **11** | 28,767 | **11** | 45,574 |
+| 1 | 2 | **11** | 27,999 | **11** | 46,185 |
+| 1 | 3 | **11** | 26,915 | **11** | 46,870 |
+| 2 | 1 | **11** | 27,440 | **11** | 45,827 |
+| 2 | 2 | **11** | 26,911 | **11** | 45,681 |
+| 2 | 3 | **11** | 27,067 | **11** | 45,675 |
+| 3 | 1 | **11** | 26,882 | **11** | 46,727 |
+| 3 | 2 | **11** | 26,991 | **11** | 46,093 |
+| 3 | 3 | **11** | 26,989 | **11** | 46,321 |
+| 4 | 1 | **11** | 27,741 | **11** | 45,751 |
+| 4 | 2 | **11** | 28,962 | **11** | 45,400 |
+| 4 | 3 | **11** | 27,549 | **11** | 45,481 |
+| 5 | 1 | **11** | 28,174 | **11** | 45,764 |
+| 5 | 2 | **11** | 27,829 | **11** | 46,288 |
+| 5 | 3 | **11** | 27,368 | **11** | 45,199 |
+
+**Aggregate:**
+
+| path | n | min ms | max ms | mean ms | std ms | tok-id parity |
+|---|---:|---:|---:|---:|---:|---:|
+| NEW (`flash_attn_prefill`) | 15 | 26,882 | 28,962 | **27,572** | 650 | 15 / 15 = 100% |
+| LEGACY (`mlx_native::ops::sdpa`) | 15 | 45,199 | 46,870 | **45,922** | 464 | 15 / 15 = 100% |
+
+**Speedup:** NEW vs LEGACY = 45,922 / 27,572 = **1.666×** (mirrors W-5b.10's measured 1.55× whole-prefill ratio across 3 cold trials).
+
+**Verdict:** PARITY HOLDS — 30 / 30 runs produce token id `11`. The legacy escape hatch is safe to remove.
+
+### (4) Gate removal
+
+Edited `src/inference/models/qwen35/gpu_full_attn.rs`:
+- Deleted the `let use_legacy = std::env::var("HF2Q_QWEN35_FA_LEGACY").is_ok();` env-check
+- Inlined `head_dim == 256 && cur_len == 0` as the unconditional `new_path_eligible` predicate
+- Updated the comment block to record the W-5b.12 audit result and note that the fallback path is now reached only for the non-prefill-from-zero correctness regimes (head_dim ≠ 256, cur_len > 0), not for forensic A/B
+- Deleted the `fa_path_first_token_matches_legacy_at_seq128` unit test (lines 2362-2530 prior to deletion). With the env gate gone, the test's premise (set the gate, run; clear the gate, run; compare outputs) no longer applies — the legacy branch is no longer reachable from `apply_sdpa_with_kv_cache` for the production prefill-from-zero regime that the test covered. The 30-run sunset audit at full PP4106 walk-bar scale supersedes the seq=128 unit-level numerical-tolerance check
+- Chesterton's fence verified: `sdpa`, `SdpaParams`, `permute_seq_head_dim_to_head_seq_dim_cpu`, `mk_rand`, `apply_sdpa_with_kv_cache`, `download_f32`, `upload_f32` all remain in use elsewhere — only the env-check + the `fa_path_first_token_matches_legacy_at_seq128` test were deleted
+
+### (5) Build + correctness re-check
+
+- `cargo build --release --bin hf2q` → clean build, **72 warnings (W-5b.10 baseline preserved, 0 new)**
+- Targeted `cargo test --release chunk_path` → 3 tests PASS (chunk-path autoregressive parity, the sibling test that survives)
+- `cargo test --release fa_path_first_token_matches_legacy_at_seq128` → 0 tests run (correctly removed — filtered out)
+- Pre-existing failure on `dwq_on_qwen35_surfaces_not_ready_not_fallback` confirmed to fail on plain `3b7989c` HEAD as well (ADR-013 P12 ActivationCapture deferral; not introduced by this iter)
+- Post-sunset cold pp4106: **first decoded token id `11`, prefill 27,437 ms** — within 0.5 σ of the W-5b.12 NEW-path mean
+
+### (6) Closure
+
+Wave 5b.12 sunset audit + legacy-gate removal: **CLOSED — production fix landed, env gate removed, ADR-005 W-5b.10 sunset plan honored.**
+
+The legacy `mlx_native::ops::sdpa` path remains in code for non-production-prefill regimes (head_dim ≠ 256 OR cur_len > 0) per Chesterton's fence — it is the correct fallback for incremental prefill on top of an existing KV cache, even if the live Qwen3.5/3.6 prefill-from-zero path no longer reaches it. The forensic env gate that allowed runtime A/B is removed.
+
+ADR-005 AC-tier impact: NONE (W-5b.10 already closed perf-bar to informational; this iter is operational hygiene). The next-iter target identified in W-5b.11 (`mlx_native::ops::moe_q::*` dispatch optimization, mlx-native scope) is unchanged.
