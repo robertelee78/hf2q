@@ -1125,6 +1125,38 @@ CFA Claude-team audit at base SHA `4c887f2` HARD-STOPPED the original "1-line fi
 
 - **LOC**: src/main.rs +169/-31 (~115 production code + 54 doc/comment + 31 deleted lines for the legacy in-place dispatch refactor); src/backends/gguf.rs +110/-16 (~26 production code in the swallow-removal + defence-in-depth guard + 84 doc/comment in the Iter C audit comment + replaced test); tests/cmd_convert_dispatch.rs +14/-6 (one-line behavioural delta + 7-line comment refresh).  Production-code change ~141 LOC across both src/ files combined, well under the 250 LOC HARD-STOP (excluding the 512-LOC new integration-test crate, which the spec excludes).
 
+### P11 first-attempt blocker discovered (2026-04-27, real-model bisect)
+
+First attempted re-emit of `qwen3.6-27B → dwq-4-6` (commit base `87c6242`) **died silently in `calibrator.calibrate()` at 16:38 PT**.  Bisect via `--quant q4_k_m` (no DWQ; pure Iter A path) on the same source surfaced the actual failure mode loudly:
+
+```
+ERROR hf2q: K-quant codec quantization failed: Quantization failed for tensor
+'model.visual.blocks.0.attn.proj.weight': k-quant-codec: k-quant codec: k-quant:
+input length 1152 is not a multiple of QK_K (256)
+```
+
+**Root cause** — Qwen3.6-27B-dense ships a vision tower (`model.visual.*`).  Vision-encoder attention projection has hidden dim 1152, which is **NOT divisible by Q4_K's 256-element super-block size**.  The K-quant codec at `src/quantize/k_quant_codec.rs::quantize_row_to_bytes` correctly rejects the input.  The dispatcher at `src/quantize/k_quant_codec_quantizer.rs::quantize_tensor` does not pre-classify vision tensors — it routes everything through the codec.  `should_skip_quantization` at `src/quantize/layer_mix.rs:281` only matches `ffn_gate_inp.weight` (MoE router gate); vision patterns are not in scope.
+
+**Iter A correctly surfaced a pre-existing latent bug** — pre-Iter-A this would have hit the K-quant fall-through swallow at `gguf.rs:1645-1659` → reported `GGML_TYPE_F16` → silently emitted F16 bytes for the vision tensor (the malformed-GGUF bug Iter A documented).  The DWQ failure at `calibrator.calibrate()` is the same shape one phase earlier — `DwqKQuantizer` (Iter B) constructs `KQuantCodecQuantizer` per tensor, which rejects the vision tensor's 1152 dim.  Pre-Iter-A nobody noticed because the silent F16 fallback hid every K-quant codec rejection.
+
+**Bisect evidence** — `tail /tmp/p11-bisect-q4km.log`:
+- Phases 1.42 + 1.8 (lazy vocab-pad fix, bf16→f16 cast for 1151 tensors): all complete
+- "K-quant codec quantizer dispatched (ADR-014 P8 Decision 12 + P2 iter-2) quant=q4_k_m target=Q4K calibration=false" — entered quantize loop
+- ERROR at first vision tensor encountered (`model.visual.blocks.0.attn.proj.weight`, 1152 input length, layer 0)
+- Process exited cleanly (no jetsam, no signal); RAM dropped 87 GB → 56 GB used (no leak)
+
+**Memory observation** (orthogonal but recorded): peak `PhysMem 126G used / 472M unused` during the quantize phase before the vision-tensor error fired.  At 27B-F16 (~54 GB) + intermediate per-tensor working buffers, the streaming pipeline's working-set bound is real.  `--skip-quality` (used) avoids the Phase 4.5 `tensor_map + F32-dequant` ~170 GB overhead but the bf16→f16 cast still doubles memory in-place during the cast (logged at `Converted bf16 tensors to f16 converted=1151`).  No OOM kill — process exited via the codec error; memory tightness is a separate work item, not the immediate blocker.
+
+### P11-prereq Iter D — pending (vision-tensor + non-256-multiple skip predicate)
+
+| Iter | Sub-tasks | Files | LOC est. |
+|---|---|---|---:|
+| **D** | Extend `should_skip_quantization` (or add sibling `should_emit_f16_for_kquant`) to recognise (a) vision tensor patterns: `model.visual.*`, `vision_tower.*`, `visual.*`, `vit.*` per common HF naming; (b) defensive: any tensor whose row-len is not divisible by `QK_K = 256` (catches future model surprises).  Plumb into `KQuantCodecQuantizer::quantize_tensor` + `VariantKQuantizer::quantize_tensor` + `DwqKQuantizer::quantize_tensor` so skipped tensors emit as F16 passthrough (`QuantizedTensor { method: "f16", bits: 16, scales: None, ggml_type: Some("F16"), preserved: true }`) which routes correctly through Iter A's codec-direct fast-path AND `repack_to_ggml_blocks` F16 arm.  Always-on regression tests: synthetic 1152-dim "vision" tensor → all three quantizers emit F16 sentinel; synthetic 256-dim regular tensor → all three quantizers emit K-quant codec direct.  `#[ignore]`-gated end-to-end test: `--quant q4_k_m` on Qwen3.6-27B → completes without error; vision tensors appear in GGUF as F16, language tensors as Q4_K. | `src/quantize/layer_mix.rs`, `src/quantize/k_quant_codec_quantizer.rs`, `src/quantize/variant_quantizer.rs`, `src/quantize/dwq_k_quantizer.rs`, `tests/vision_tensor_skip_predicate.rs` (NEW) | ~150 |
+
+After Iter D lands, retry the four P11 re-emits (27B-dwq46 → 27B-dwq48 → 35B-A3B-dwq46 → 35B-A3B-dwq48).  Memory note: re-emit serially; check `vm_stat` between runs; expect ≥ 60 GB peak working set per 27B-class model.
+
+**P11 pause status (2026-04-27)**: P11 stays ⏳ pending Iter D (vision-tensor skip) + the four re-emits.  No fabricated artefacts shipped — the four `*-q4km/` output directories at `/opt/hf2q/models/qwen3.6-{27b,35b-a3b-...}-dwq{46,48}-q4km/` are empty.  The original ADR-012 GGUFs at `/opt/hf2q/models/qwen3.6-{27b,35b-a3b-...}-dwq{46,48}/*.gguf` (Apr 25-26, MixedBitQuantizer→Q4_0 path) remain in place untouched — production users keep the legacy artefacts during the transition window.
+
 **P11-prereq closed**.  Cross-ref:
 
 - **ADR-015 D4**: bench-matrix LOSS rows (dwq46 0.93×, gemma 0.83×) become re-measurable now that the kernel-family switch is in production.  ADR-015 iter8c-prep can re-run the bench matrix to validate the wall-time gap closes.  iter8c can close as "lever moved to ADR-014 P11 fix" pending the re-bench measurement.
