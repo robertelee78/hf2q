@@ -366,3 +366,136 @@ Both are additive, opt-in, and carry the same `HF2Q_NO_RESIDENCY=1` opt-out the 
 
 - Inventory probe table above (851 tensors, real 17 255 675 136 B → bucket 25 551 814 656 B, waste 8 296 139 520 B / 48.1%)
 - Pre-existing W-5b.5 diagnostic at `## Wave 5b.5 perf-gap diagnostic` (line 176) — premise stands but its proposed candidate #2 is now blocked on the mlx-native API gap documented here.
+
+---
+
+## Wave 5b.7 iter 2 residency-set adoption + perf measurement
+
+**Status:** **CLOSED — adoption LANDED, perf hypothesis FALSIFIED at production shape**
+**Date:** 2026-04-27
+**Worker:** Wave 5b.7 iter 2 (ADR-005 residency-set adoption + perf validation)
+**HEAD at start:** `6f71ddb` (W-5b.6 STOP closure); mlx-native at `84bf1af` (W-5b.7 iter 1: `register_existing` + `load_tensor_into_pool` API additions)
+**Commits this iter:** `eb09cad` (residency adoption), `8f7c6fb` (cross-device tolerance fix)
+**Pre-flight:** 62 GiB free RAM (Pages free 4 057 369); 1 concurrent process flagged (see §6 below); HEAD ✓ mlx-native HEAD ✓.
+**Scope:** add long-lived weight pool, route the 17 GB weight hot path through `MlxBufferPool::register_existing`, run 3-trial cold-process bench.
+
+### (1) Hot-path adoption summary
+
+A new module `src/inference/models/qwen35/weight_pool.rs` introduces a thread-local long-lived `MlxBufferPool` running in *register-only* mode (no recycling, no bucket-rounding) and exposes `register_weight_buffer(device, &buffer)`. Buffers are still allocated at their exact GGML / F32 / BF16 byte length via `device.alloc_buffer` or `gguf.load_tensor`; only their residency-set membership is tracked.
+
+Call sites converted (matches the W-5b.5 inventory):
+
+| Site | File | Before | After |
+|---|---|---|---|
+| `upload_bf16_from_f32` | `gpu_full_attn.rs:164-179` | `device.alloc_buffer` | + auto-register |
+| `upload_q4_0_from_f32` | `gpu_full_attn.rs:220-233` | `device.alloc_buffer` | + auto-register |
+| `upload_f32_weight` (new) | `gpu_full_attn.rs:239-` | n/a | `upload_f32` + register |
+| `FullAttnWeightsGpu::from_cpu` norms | `gpu_full_attn.rs:99-111` | `upload_f32` | `upload_f32_weight` |
+| `DeltaNetWeightsGpu::from_cpu` F32 weights | `gpu_delta_net.rs:179-200` | `upload_f32` × 7 | `upload_f32_weight` × 7 |
+| `forward_gpu` lm_head_bf16 inline alloc | `forward_gpu.rs:597 / 1118` | bare `alloc_buffer` | + register_weight_buffer |
+| `forward_gpu` lm_head_f32 / norm_w | `forward_gpu.rs:589/620 / 1113/1138` | `upload_f32` | `upload_f32_weight` |
+| `weight_loader::load_tensor_with_residency` (new) | `weight_loader.rs:138-149` | n/a | wraps `gguf.load_tensor` + register |
+| MoE expert blocks (gate/up/down) × 48 layers | `weight_loader.rs:991-1003` | `gguf.load_tensor` | `load_tensor_with_residency` |
+| Dense FFN gate/up/down | `weight_loader.rs:1112-1124` | `gguf.load_tensor` | `load_tensor_with_residency` |
+| `upload_lazy_raw_u8` | `weight_loader.rs:494-509` | bare `alloc_buffer` | + register_weight_buffer |
+| `quantize_f32_to_q8_0_buffer` | `in_memory_loader.rs:101-110` | bare `alloc_buffer` | + register_weight_buffer |
+| `mtp_weights_load::load_norm_gpu` | `mtp_weights_load.rs:193-198` | `upload_f32` | `upload_f32_weight` |
+
+Total bytes managed by the pool: ~17 GB (the dominant slice; the smaller ~3 GB cross-device slice falls back transparently — see §3).
+
+### (2) Build / test status
+
+| Check | Result |
+|---|---|
+| `cargo build --release --bin hf2q` | PASS — 0 errors, 72 warnings (all pre-existing baseline) |
+| `cargo test --release qwen35::weight_pool` | PASS — 2/2 (`register_existing_via_thread_local_is_idempotent`, `register_does_not_recycle_external_buffers`) |
+| `cargo test --release chunk_path_first_token_matches_autoregressive_at_seq128` | PASS |
+| `cargo test --release qwen35` | PASS except 1 pre-existing failure (`dwq_on_qwen35_surfaces_not_ready` — tokenizer.json fixture missing; reproduced on HEAD via `git stash`, unrelated to this change) |
+| Walk-bar parity (T=256 chunk vs autoreg, both paths produce token id **561**) | PASS — see §4 table |
+
+### (3) Cross-device tolerance fix (commit `8f7c6fb`)
+
+First post-iter-2 model load surfaced a multi-device issue: hf2q's loader creates several `MlxDevice::new()` instances across the load path (serve setup, registry warmup, `forward_gpu` cache init, in-memory loader paths). Each device gets its own `ResidencySet` Arc; mlx-native's `register_existing` enforces a single-set invariant via `Arc::ptr_eq`, so the first device claims the pool and subsequent devices' buffers fail with `InvalidArgument("cannot mix residency-enabled devices")`.
+
+Resolution: catch that specific error in `register_weight_buffer` and treat it as a tolerated soft fallback. The dominant ~14 GB MoE/dense weight slice loaded inside `forward_gpu`'s cache init all uses one device → claims the pool → gets full residency benefit. The remaining ~3 GB cross-device slice (Q8_0 quantize, MTP norms, etc.) loads successfully with no residency hint.
+
+Iter-3 follow-up to capture the remaining 3 GB: consolidate hf2q on a single shared `MlxDevice`, OR adopt the parallel mlx-native ADR-015 iter8e work-in-flight (auto-registration inside `MlxDevice::alloc_buffer`, eliminating the pool layer entirely).
+
+### (4) Perf measurement table — Qwen3.6 27B DWQ46, T=256 prompt, 3 cold trials each
+
+Each row is a fresh `hf2q generate` process (one model load + one prefill forward + one decode token). `loaded` = construction-side weight load (GGUF disk I/O + dequant); `prefill` = first-forward (cold compute + DMA); `decode tok/s` = warm second-forward.
+
+| Trial | Path | Condition | loaded (s) | prefill (ms) | decode (tok/s) | first decoded token |
+|---:|---|---|---:|---:|---:|:---:|
+| 1 | chunk | pre-residency  (`HF2Q_NO_RESIDENCY=1`) | 6.2 | 7925 | 43.7 | **561** |
+| 1 | chunk | post-residency (default)               | 6.1 | 7845 | 53.1 | **561** |
+| 1 | autoreg | pre-residency                       | 6.2 | 7964 | 45.7 | **561** |
+| 1 | autoreg | post-residency                      | 6.2 | 8002 | 44.3 | **561** |
+| 2 | chunk | pre-residency                          | 6.2 | 7953 | 49.6 | **561** |
+| 2 | chunk | post-residency                         | 6.2 | 7965 | 53.3 | **561** |
+| 2 | autoreg | pre-residency                       | 6.3 | 8031 | 45.1 | **561** |
+| 2 | autoreg | post-residency                      | 6.2 | 8072 | 43.9 | **561** |
+| 3 | chunk | pre-residency                          | 6.3 | 8071 | 48.9 | **561** |
+| 3 | chunk | post-residency                         | 6.3 | 8007 | 47.5 | **561** |
+| 3 | autoreg | pre-residency                       | 6.2 | 8057 | 54.3 | **561** |
+| 3 | autoreg | post-residency                      | 6.3 | 8106 | 37.8 | **561** |
+
+**Means (n=3 each):**
+
+| Condition | prefill mean (ms) | prefill stdev | decode mean (tok/s) | load mean (s) |
+|---|---:|---:|---:|---:|
+| chunk pre-residency  | 7983.0 | 78 | 47.40 | 6.233 |
+| chunk post-residency | 7939.0 | 84 | 51.30 | 6.200 |
+| autoreg pre-residency  | 8017.3 | 48 | 48.37 | 6.233 |
+| autoreg post-residency | 8060.0 | 53 | 42.00 | 6.233 |
+
+**Deltas (post − pre, first-forward / prefill):**
+
+| Path | Delta (ms) | Delta (%) | Within 1-σ noise? |
+|---|---:|---:|:---:|
+| **CHUNK** first-forward | **−44 ms** | **−0.55 %** | YES (σ pre 78, σ post 84) |
+| **AUTOREG** first-forward | **+43 ms** | **+0.53 %** | YES (σ pre 48, σ post 53) |
+
+### (5) Win verdict — diagnostic FALSIFIED at production shape
+
+**The W-5b.5 diagnostic's "~6 s first-forward win" hypothesis is FALSIFIED.** Across 3 cold-process trials each on Qwen3.6 27B DWQ46 at T=256:
+
+- Chunk-path first-forward: residency adoption changed prefill by **−44 ms (−0.55%)** — well inside the 1-σ band.
+- Autoreg-path first-forward: residency adoption changed prefill by **+43 ms (+0.53%)** — also inside 1-σ band.
+- Model-load wall (the dominant 6.2 s "loaded" segment containing GGUF disk I/O + dequant) changed by **<50 ms** in either direction.
+- Memory delta: **~0** — `register_existing` does not bucket-round; weight buffers are allocated at their exact byte length.
+
+The W-5b.5 estimate was based on theoretical bandwidth math ("~6 s on first request, ~100–500 ms on subsequent under memory pressure"). In practice, M5 Max's `StorageModeShared` Metal allocator is already efficient enough at unified-memory page-fault amortization that adding `MTLResidencySet` hints provides no measurable benefit on a single-process, no-memory-pressure workload. The theoretical regime where residency would matter — concurrent multi-process Metal contention, sustained memory pressure forcing eviction — is not the W-5b.5 / W-5b.7 measurement regime.
+
+**AC-tier impact: NONE.** The perf-bar gate at AC 5468 / AC 5470 was already informational (W-5b.4 closed both as full `[x]`); this iter neither adds nor removes any gating.
+
+### (6) Concurrent-session check (per `feedback_bench_process_audit`)
+
+Pre-flight `ps aux` flagged one hot competitor: a CFA worker at `/opt/mlx-native/.cfa-worktrees/cfa-20260427-adr015-iter8e-resint-codex/` running `test_flash_attn_prefill` at 236% CPU + 7.9 GB RSS. That session is the parallel ADR-015 iter8e residency-integration in mlx-native (their codex process), working on automatic residency-set registration inside `MlxDevice::alloc_buffer` — **orthogonal and non-overlapping** with our hf2q-side adoption: their work happens inside their isolated worktree's mlx-native build; our `eb09cad` build links against `/opt/mlx-native` HEAD `84bf1af`, unaffected.
+
+The cfa worker had finished by the time the 3-trial bench started (post-bench `ps aux` shows no cfa or test_flash processes; `mcp-brain-server` idle at 0% CPU). Of the 12 cold runs across 3 trials, prefill stdev within each condition is 48–84 ms (~0.6–1.0% of mean), comfortably tight; we have no evidence of CPU contention contaminating the timing.
+
+### (7) RAM evidence
+
+| Phase | Pages free | GB free |
+|---|---:|---:|
+| Pre-flight | 4 057 369 | 61.9 |
+| 2-trial bench start | 4 353 459 | 66.4 |
+| 3-trial bench start | 4 357 331 | 66.5 |
+| 3-trial bench end | 3 922 764 | 59.9 |
+| Post-bench audit | 4 357 666 | 66.5 |
+
+No swap thrash; no jetsam pressure; >25 GB free at every point including peak load.
+
+### (8) Constraints honoured
+
+- No mlx-native chunk-pipeline kernels modified.
+- No files in `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`, `src/calibrate/`, `peer_parity_gates.rs`, `ppl_driver.rs`, `imatrix.rs` touched.
+- `HF2Q_NO_RESIDENCY=1` escape hatch preserved (and used as the pre-residency baseline in the bench).
+- Walk-bar parity preserved (token id 561 in 12/12 runs).
+
+### Inputs preserved
+
+- Bench script: `scripts/bench-w5b7-iter2-residency.sh` (stays in repo for iter-3 if architecture refactor lands).
+- Raw bench logs: `/tmp/w5b7-iter2-bench.log` (2-trial), `/tmp/w5b7-iter2-bench-3trial.log` (3-trial).
+- Implementation commits: `eb09cad`, `8f7c6fb`.
