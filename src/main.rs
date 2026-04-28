@@ -1386,16 +1386,42 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     "K-quant codec quantizer dispatched (ADR-014 P8 Decision 12 + P2 iter-2)"
                 );
 
-                quantize::quantize_model(
-                    &tensor_map,
-                    &metadata,
-                    &kq,
-                    bits,
-                    config.group_size,
-                    &progress,
-                )
-                .context("K-quant codec quantization failed")
-                .map_err(AppError::Conversion)?
+                // ADR-014 P7 iter-48 (2026-04-28): env-flag-gated
+                // exercise of the streaming code path in production.
+                // `HF2Q_STREAMING_PHASE3=1` routes through
+                // `quantize_via_streaming_borrowed` which is
+                // byte-identical to `quantize_model` per iter-47/48
+                // gates.  This is a TEST INTEGRATION not a memory win
+                // — the borrowed wedge holds 2× peak briefly during
+                // the per-tensor clone.  The actual memory savings
+                // land when iter-3 surgery removes the downstream
+                // `tensor_map` dependency.  Default OFF.
+                let streaming_phase3 =
+                    std::env::var("HF2Q_STREAMING_PHASE3").as_deref() == Ok("1");
+                if streaming_phase3 {
+                    tracing::info!("ADR-014 P7 iter-48: HF2Q_STREAMING_PHASE3=1 → quantize_via_streaming_borrowed");
+                    quantize::quantize_via_streaming_borrowed(
+                        &tensor_map,
+                        &metadata,
+                        &kq,
+                        bits,
+                        config.group_size,
+                        &progress,
+                    )
+                    .context("K-quant codec quantization failed (streaming path)")
+                    .map_err(AppError::Conversion)?
+                } else {
+                    quantize::quantize_model(
+                        &tensor_map,
+                        &metadata,
+                        &kq,
+                        bits,
+                        config.group_size,
+                        &progress,
+                    )
+                    .context("K-quant codec quantization failed")
+                    .map_err(AppError::Conversion)?
+                }
             }
             // ADR-014 P8 Decision 12: imatrix-adaptive routes through
             // VariantKQuantizer with per-tensor target dispatch via

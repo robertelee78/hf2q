@@ -131,6 +131,44 @@ pub fn validate_group_size(tensor: &TensorRef, group_size: usize) -> Result<(), 
 /// **Error path:** materialise / bf16-cast / quantize errors all bail
 /// the loop with the failed tensor's name in the error context.
 /// Partial accumulation is dropped on `?`.
+/// ADR-014 P7 iter-48 — borrowing wire-up wedge.  Drop-in replacement
+/// for [`quantize_model`] (`&TensorMap` borrow signature) that routes
+/// through the streaming pipeline by cloning bytes into a transient
+/// `LazyTensorMap`.
+///
+/// **Peak memory caveat**: this helper temporarily holds both the
+/// borrowed `tensor_map` AND a per-tensor clone in the LazyTensorMap
+/// during quantize.  Peak memory is therefore HIGHER than `quantize_model`
+/// during the call (~2× the largest tensor's bytes briefly) — it is
+/// NOT a memory win on its own.
+///
+/// **Use case**: env-flag-gated production exercise of the streaming
+/// code path in main.rs Phase 3 dispatch arms that still need to pass
+/// `&tensor_map` to downstream phases (4.5 quality, 4.6 native backend).
+/// The actual memory-budget win lands when iter-3 surgery removes the
+/// downstream `tensor_map` dependency and the streaming-consuming
+/// variant ([`quantize_via_streaming_consuming`]) becomes the call site.
+///
+/// Byte-identical to `quantize_model` on the same fixture, verified
+/// by `quantize_via_streaming_borrowed_byte_identical_to_quantize_model`.
+pub fn quantize_via_streaming_borrowed(
+    tensor_map: &crate::ir::TensorMap,
+    metadata: &crate::ir::ModelMetadata,
+    quantizer: &dyn Quantizer,
+    bits: u8,
+    group_size: usize,
+    progress: &ProgressReporter,
+) -> Result<crate::ir::QuantizedModel, QuantizeError> {
+    use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+
+    let mut lazy_map = LazyTensorMap::new();
+    for (_, t) in tensor_map.tensors.iter() {
+        let meta = LazyMeta::new(t.name.clone(), t.shape.clone(), t.dtype);
+        lazy_map.insert(LazyTensor::from_bytes(meta, t.data.clone()));
+    }
+    quantize_streaming(lazy_map, metadata, quantizer, bits, group_size, progress, false)
+}
+
 /// ADR-014 P7 iter-47 — iter-3 wire-up wedge.  Drop-in replacement
 /// for [`quantize_model`] that takes ownership of an eager
 /// [`crate::ir::TensorMap`] and routes through the streaming
@@ -5623,6 +5661,76 @@ mod tests {
                 e.data, s.data,
                 "{tname}: bytes differ between eager and streaming-consuming \
                  — iter-3 wire-up wedge would break byte-identity contract"
+            );
+        }
+    }
+
+    /// ADR-014 P7 iter-48 — `quantize_via_streaming_borrowed` byte-identity
+    /// to `quantize_model`.  Pins the borrowing wedge contract: the
+    /// env-flag-gated `HF2Q_STREAMING_PHASE3=1` swap in main.rs Phase 3
+    /// produces byte-equal output to the eager path.
+    ///
+    /// Unlike iter-47's `quantize_via_streaming_consuming` which moves
+    /// bytes, this wedge clones them — peak memory is HIGHER during
+    /// the call.  The byte-identity contract is the same; the memory
+    /// caveat is documented (it's a transitional production-exercise
+    /// helper, not an end-state).
+    #[test]
+    fn quantize_via_streaming_borrowed_byte_identical_to_quantize_model() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::TensorMap;
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+
+        const QK_K: usize = 256;
+        const N_LAYERS: usize = 32;
+
+        let make_payload = |seed: f32| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(QK_K * 2);
+            for i in 0..QK_K {
+                let v = (i as f32 / QK_K as f32) * 2.0 - 1.0 + seed * 0.001;
+                bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+            }
+            bytes
+        };
+
+        let tensors: Vec<&str> = vec![
+            "output.weight",
+            "blk.0.attn_v.weight",
+            "blk.0.ffn_down.weight",
+            "blk.5.attn_q.weight",
+        ];
+
+        let mut tensor_map = TensorMap::new();
+        for (i, name) in tensors.iter().enumerate() {
+            tensor_map.insert(crate::ir::TensorRef {
+                name: name.to_string(),
+                shape: vec![1, QK_K],
+                dtype: DType::F16,
+                data: make_payload(i as f32),
+            });
+        }
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+        let q1 = VariantKQuantizer::new(KQuantVariant::Q4_K_M, CalibrationData::None, N_LAYERS);
+        let q2 = VariantKQuantizer::new(KQuantVariant::Q4_K_M, CalibrationData::None, N_LAYERS);
+
+        let eager = quantize_model(&tensor_map, &metadata, &q1, 0, 0, &progress)
+            .expect("quantize_model");
+        let borrowed = quantize_via_streaming_borrowed(&tensor_map, &metadata, &q2, 0, 0, &progress)
+            .expect("quantize_via_streaming_borrowed");
+
+        assert_eq!(eager.quant_method, borrowed.quant_method);
+        assert_eq!(eager.tensors.len(), borrowed.tensors.len());
+
+        for tname in &tensors {
+            let e = eager.tensors.get(*tname).unwrap();
+            let b = borrowed.tensors.get(*tname).unwrap();
+            assert_eq!(e.quant_info.ggml_type, b.quant_info.ggml_type, "{tname}");
+            assert_eq!(
+                e.data, b.data,
+                "{tname}: bytes differ between eager and borrowed-streaming"
             );
         }
     }
