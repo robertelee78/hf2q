@@ -1294,3 +1294,102 @@ HF2Q_PROFILE_W5B8=1 /opt/hf2q/scripts/bench-w5b11-post-attn.sh
 ```
 
 Wave 5b.13 cross-fence audit: **CLOSED — kernel is SOTA, fix lives in hf2q wrapper (ADR-005), not mlx-native (ADR-015).**
+
+## Wave 5b.14 dense_q wrapper opt mirror — STOP-AND-REPORT (FFN bucket dropped < 1.7×)
+
+**Worker:** Wave 5b.14 dense_q wrapper-opt mechanical-translation worker (recovery after stream-watchdog timeout on the prior worker).
+**Pre-flight:** Pages free 6,584,611 × 16 KB = ~100 GiB free; mcp-brain-server idle (0.0% CPU after entry spike); no CFA worker > 50% CPU.
+**Repo state at start AND end:** mlx-native HEAD `6875c92` unchanged. hf2q HEAD on entry `7dd878a`.
+
+### Three mechanical translations
+
+Per `feedback_w5b13_dense_q_wrapper_overhead.md`, mirror the existing MoE-Q `_into` pattern into dense_q:
+
+| # | Translation | Status | Location |
+|---|---|---|---|
+| **T1** | External-encoder `build_dense_ffn_layer_gpu_q_into` variant | DONE | `src/inference/models/qwen35/gpu_ffn.rs:706-839` |
+| **T2** | Pool the 5 scratches via `decode_pool::pooled_alloc_buffer` | DONE (decode-only — see Pool-routing safety below) | `src/inference/models/qwen35/gpu_ffn.rs:741-840` |
+| **T3** | Fuse `dispatch_fused_residual_norm_f32` + dense FFN into single CB | DONE at both call sites (chunk-prefill + greedy-decode) | `src/inference/models/qwen35/forward_gpu.rs:894-1066, 1466-1656` |
+
+**Forensic A/B env gate:** `HF2Q_DENSE_Q_LEGACY=1` retains the pre-W-5b.14 device-alloc + own-encoder + 2-encoder path verbatim. Default (env unset) routes through the `_into` mirror.
+
+### Pool-routing safety (T2 caveat)
+
+The MoE-Q `_into` analog uses `decode_pool::pooled_alloc_buffer` for ALL scratches. A direct mechanical translation into dense_q broke at chunk-prefill seq_len=4096: the per-decode-token arena pool has its `reset_decode_pool` call only inside `forward_gpu_greedy` (line 1161); chunk-prefill's `forward_gpu` does NOT reset the pool, and 64 layers × 5 scratches per layer at the 27B working set overran Metal's residency-set quota at layer 33 ("GPU command buffer completed with error status").
+
+**Mitigation:** `build_dense_ffn_layer_gpu_q_into` dispatches internally — pooled scratches at `seq_len == 1` (decode), `device.alloc_buffer` scratches at `seq_len > 1` (prefill / batch). Both branches share the fused-CB external-encoder shape; only the alloc strategy differs. This is honest about the production constraint rather than papering over the residency exhaustion. The MoE-Q `_into` doesn't hit this because Qwen3.6-27B is `variant=Dense` (no MoE-Q layers); MoE-Q only fires on Qwen3.5-MoE 35B-A3B which we did not stress-test against this same chunk-prefill regime.
+
+### Build + test
+
+- `cargo build --release --bin hf2q` → 0 NEW warnings (W-5b.12 baseline 72; current 72)
+- `cargo test --release --bin hf2q qwen35 -- --test-threads=1` → 295 passed, 0 failed, 8 ignored
+- New parity test `dense_q_path_first_token_matches_legacy_at_seq128` → PASS (max_abs=0, mean_abs=0 — byte-identical between LEGACY and `_into` paths)
+- Existing parity test `chunk_path_first_token_matches_autoregressive_at_seq128` → PASS (max_diff=6.31e-5)
+- Existing dense_swiglu_gpu_q_parity_vs_cpu_ref → PASS (max_abs_err=2.33e-9; updated to use `element_count()` for pool-aware download)
+
+### Wall-time bench (3 cold trials × 2 paths × 1 llama at PP4106)
+
+`HF2Q_PROFILE_W5B8=1 HF2Q_QWEN36_AUTOREG=1 HF2Q_UNSAFE_EXPERIMENTS=1 HF2Q_CHUNK_SCAN_PREFILL=1` — same env signature as W-5b.13 baseline.
+
+| trial | llama prefill | LEGACY prefill | LEGACY ffn_dispatch | LEGACY first_tok | NEW prefill | NEW ffn_dispatch | NEW first_tok |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| T1 | 6,661 | 37,363 | 18,771 | 11 | 30,122 | 11,142 | 11 |
+| T2 | 6,995 | 31,148 | 12,015 | 11 | 28,898 | 11,008 | 11 |
+| T3 | 7,124 | 30,718 | 11,885 | 11 | 28,346 | 10,248 | 11 |
+| **mean** | **6,927** | **33,076** | **14,224 (T2/T3: 11,950)** | — | **29,122** | **10,799** | — |
+
+**Token-id determinism: 6/6 cells return token id 11 (`,`).**
+
+**llama drift gate:** mean 6,927 ms vs W-5b.12 baseline 6,765 ms = +2.4%, within ±10% tolerance.
+
+### Outcome vs expected wins
+
+| metric | W-5b.13 expected | W-5b.14 measured | hit threshold? |
+|---|---:|---:|---|
+| `layer.ffn_dispatch` mean | 9,750 → 4,000–5,500 ms (≥1.7×) | 11,950 (T2/T3) → 10,799 ms (1.11×) | **NO** |
+| Whole-prefill wall | 29,347 → 24,000–25,500 ms | 30,933 (T2/T3) → 28,622 ms | partial |
+| Wall ratio vs llama | 4.34× → 3.4–3.7× | 4.78× LEGACY → 4.20× NEW | partial |
+
+**STOP condition triggered:** "After implementation, FFN bucket does NOT drop ≥1.7× — STOP, report; don't claim a win that didn't materialize."
+
+The mechanical translation reduced FFN dispatch by ~10% (1.11×), not the 1.7× the W-5b.13 audit projected. The intra-CB fused-residual-norm + dense-FFN encoder fusion saves the inter-encoder commit barrier, but the inter-encoder barrier is NOT the dominant component of the 11,950 ms FFN bucket: at full-prefill seq_len=4096, the dominant cost is the per-layer GEMM dispatch wall itself (~125-150 ms × 64 layers ≈ 8,000-9,600 ms), and the inter-encoder barrier was ~2,000 ms across 64 layers.
+
+The audit's "20-30%" estimate for the 2-encoder commit pattern was high — actual measurement says it's closer to 10%. The "30-40%" allocation-churn estimate could not be measured separately because pool routing is decode-only on the dense-Q chunk-prefill path (T2 caveat above).
+
+### Sunset plan
+
+Forensic A/B env gate `HF2Q_DENSE_Q_LEGACY=1` retained. Sunset to W-5b.15 ONLY after:
+1. Revisiting the W-5b.13 audit's bucket-attribution numbers with finer instrumentation (per-encoder-commit timing).
+2. Investigating whether `forward_gpu` (chunk-prefill) can adopt a per-token-class arena reset to safely use pooled scratches. If so, the 30-40% allocation-churn component might still be recoverable.
+3. 30-run cross-path determinism panel at PP4106 (token id 11 across all 30).
+
+Until then, retain the env gate for forensic A/B comparability.
+
+### Files touched
+
+- `src/inference/models/qwen35/gpu_ffn.rs` (T1 + T2 + sunset legacy + new parity test)
+- `src/inference/models/qwen35/forward_gpu.rs` (T3 chunk-prefill + greedy-decode call-site fusion)
+- `scripts/bench-w5b14-dense-q-fused.sh` (new bench harness)
+- `docs/wave5b3-walkbar-results.md` (this section)
+- `docs/ADR-005-inference-server.md` (W-5b.14 closure paragraph above W-5b.13)
+
+NO `/opt/mlx-native/` modifications.
+
+### Reproduction recipe
+
+```bash
+# Pre-flight
+vm_stat | head -5
+ps aux | grep -v sccache | sort -k6 -nr | head -10
+
+# Build + parity tests
+cd /opt/hf2q
+cargo build --release --bin hf2q
+cargo test --release --bin hf2q qwen35 -- --test-threads=1
+cargo test --release --bin hf2q dense_q_path_first_token_matches_legacy_at_seq128 -- --nocapture
+
+# Wall-time bench (3 cold × 2 paths × 1 llama)
+./scripts/bench-w5b14-dense-q-fused.sh
+```
+
+Wave 5b.14 dense_q wrapper opt: **STOP-AND-REPORT — FFN bucket drop 1.11× (target ≥1.7× missed); whole-prefill wall ratio 4.78× → 4.20× (-12%, partial win); token-id parity 6/6.**
