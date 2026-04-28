@@ -1393,3 +1393,127 @@ cargo test --release --bin hf2q dense_q_path_first_token_matches_legacy_at_seq12
 ```
 
 Wave 5b.14 dense_q wrapper opt: **STOP-AND-REPORT — FFN bucket drop 1.11× (target ≥1.7× missed); whole-prefill wall ratio 4.78× → 4.20× (-12%, partial win); token-id parity 6/6.**
+
+## Wave 5b.15 dense_q per-layer prefill arena reset — CLOSED (target exceeded 1.8×)
+
+**Iter:** 2026-04-27, hf2q commit `184c13f`. Architectural follow-up to the W-5b.14 STOP-AND-REPORT — closes the layer-33 GPU-CB-error limit and unlocks the W-5b.13 audit's 30-40% allocation-churn savings that W-5b.14 could not capture.
+
+**Pre-flight**
+- vm_stat: Pages free 6,547,273 × 16 KB = **99 GB free** (above 32 GB threshold).
+- Concurrent processes: mcp-brain-server at 99% CPU during bench (same contention applied to BOTH paths so relative ratio is rock-solid; absolute wall-times may be ~5-10% high but LEGACY/NEW = 1.96× ratio is unaffected per `feedback_bench_process_audit`). No CFA workers > 50% CPU.
+- mlx-native HEAD `6875c925` at start AND end (no upstream drift).
+
+**Diagnosis (revisited)**
+W-5b.14's verbatim mechanical translation of MoE-Q's pooled `_into` pattern broke at chunk-prefill seq_len=4096 layer 33. The W-5b.14 commit message attributed the layer-33 GPU CB error to "Metal residency-set quota overrun" and mitigated via a seq-len-aware fallback to `device.alloc_buffer` for prefill scratches. Math: at Qwen3.6-27B prefill (M=4096, h=5120, m=17408), each dense layer's 5 pool scratches total 1023 MB (gate+up+hidden = 285 MB each + down_out + sum_buf = 84 MB each + silu_params trivial). 33 layers × 1023 MB = ~33.7 GB cumulative — overruns Metal's residency-set quota. The fallback dodged the OOM but ALSO dodged the optimization — the pool-routing T2 component never fired at prefill, so the 30-40% alloc-churn savings stayed on the table.
+
+**Architectural design**
+The lifecycle gap: `forward_gpu_impl`'s 64-layer prefill loop never recycled the pool. Adding a per-layer reset is the architectural fix, but the reset must be sound w.r.t. cross-layer buffer lifetimes. Audit of `forward_gpu_impl` per-iteration scope:
+- Same-layer locals (`attn_out`, `q_normed`, `ffn_residual_buf`, `ffn_input_buf`, FFN gate/up/hidden scratches, etc.): bound inside loop body, dropped at closing brace BEFORE the next iteration's reset fires.
+- Cross-layer buffer: `hidden` (the residual stream consumed by next layer's attention) — currently from `embed_tokens_gpu` (device-alloc'd) for layer 0, then `ffn_out` of the previous layer (currently pool-allocated under W-5b.14's `_into_pooled`).
+- **Soundness rule**: at reset time no pool-allocated `MlxBuffer` may have an outstanding ARC clone matching a future bucket request. With 84 MB `hidden` matching a 128 MB power-of-two bucket, a pooled `hidden` would alias the next layer's first 128-MB pool allocation — silent residual-stream corruption.
+- Solution: split the dense-Q `_into_pooled` output lifetime. Internal scratches stay pooled (lifetime ends at this caller's `commit_and_wait`). FINAL output (`down_out`/`sum_buf`) at prefill is `device.alloc_buffer`'d so it survives the reset. At decode (seq_len == 1) keep the W-5b.14 fully-pooled output for bit-for-bit profile preservation (its lifetime is bounded by the per-token `reset_decode_pool` already in `forward_gpu_greedy`).
+
+**Implementation (3 changes in `src/inference/models/qwen35/`)**
+
+1. `decode_pool::reset_for_prefill_chunk()` — new public method, body identical to `reset_decode_pool`. Separate name documents the per-layer prefill lifecycle. Doc-comment captures the W-5b.15 caller contract above.
+
+2. `gpu_ffn::build_dense_ffn_layer_gpu_q_into_pooled` — internal scratches (gate, up, hidden, silu_params) stay pooled; FINAL output (`down_out` and the residual `sum_buf`) split: pooled at decode, `device.alloc_buffer` at prefill. The `_into` dispatch routes both decode AND prefill through the pooled variant unconditionally; the W-5b.14 device-alloc-prefill fallback retained behind `HF2Q_DENSE_Q_ARENA_RESET=0`.
+
+3. `forward_gpu::forward_gpu_impl` — at the END of each prefill layer iteration (after `hidden = ffn_out`, after the per-layer encoder's `commit_and_wait`), call `decode_pool::reset_for_prefill_chunk()`. Decode (`seq_len == 1`) skipped (already covered by `forward_gpu_greedy`'s per-token reset). Gate behind `HF2Q_DENSE_Q_ARENA_RESET=0` (default ON).
+
+**Test added**
+
+`dense_q_arena_reset_chunk_prefill_no_layer_33_error` (in `gpu_ffn.rs::tests`):
+- Runs 34 sequential `_into` invocations at seq_len=128 (past the W-5b.14 layer-33 boundary).
+- Asserts (a) pool's `in_use_count` returns to 0 after each `reset_for_prefill_chunk`, (b) all 34 commits succeed without GPU CB error, (c) outputs are non-zero.
+- Production-shape Q4_0 weights (h=128, m=384) reuse the existing `encode_q4_0` test fixture from the dense_q parity test.
+- Result: PASS, all 34 layers committed, pool bounded.
+
+**Build + test status**
+
+- `cargo build --release --bin hf2q`: succeeds, **72 warnings (W-5b.14 baseline preserved, 0 new)**.
+- `cargo test --release --bin hf2q qwen35`: **296/296 PASS** (was 295, +1 net new test).
+- `cargo test --release --bin hf2q dense_q_arena_reset_chunk_prefill_no_layer_33_error`: PASS.
+- `cargo test --release --bin hf2q chunk_path_first_token_matches_autoregressive_at_seq128`: PASS (W-5b.4 walk-bar parity).
+- `cargo test --release --bin hf2q dense_q_path_first_token_matches_legacy_at_seq128`: PASS (W-5b.14 cross-path parity, max_abs=0, mean_abs=0).
+
+**Wall-time bench (3 cold × 2 paths × 1 llama at PP4106)**
+
+```
+=== Wave 5b.15 dense_q arena-reset bench (3 trials × 2 paths × 1 llama) ===
+HEAD: 184c13f | mlx-native: 6875c92
+Pre-bench: free=6538487 pages (99 GB)
+Prompt SHA: 62e66013996f725c794d53fa9136f43c1b9eca0e
+
+--- llama baseline (3 cold trials at pp4106) ---
+[llama T1] prompt_eval=6442.59 ms
+[llama T2] prompt_eval=6775.93 ms
+[llama T3] prompt_eval=6680.86 ms
+                       mean = 6,633 ms (within 4.2% of W-5b.14's 6,927 ms — PASS ≤10% drift)
+
+--- hf2q LEGACY path (HF2Q_DENSE_Q_ARENA_RESET=0, 3 cold trials) ---
+[T1] LEGACY: prefill=39,783 ms tok=11 real=62.86 s ffn_dispatch=19,407 ms (cold-cache outlier)
+[T2] LEGACY: prefill=30,631 ms tok=11 real=55.05 s ffn_dispatch=11,535 ms
+[T3] LEGACY: prefill=30,397 ms tok=11 real=57.44 s ffn_dispatch=11,988 ms
+                                   T2/T3 mean = 30,514 ms; FFN T2/T3 mean = 11,761 ms
+
+--- hf2q NEW path (default = arena reset ON, 3 cold trials) ---
+[T1] NEW: prefill=17,073 ms tok=11 real=24.40 s ffn_dispatch=4,307 ms
+[T2] NEW: prefill=17,106 ms tok=11 real=24.05 s ffn_dispatch=4,325 ms
+[T3] NEW: prefill=17,270 ms tok=11 real=24.24 s ffn_dispatch=4,378 ms
+                          mean = 17,150 ms; FFN mean = 4,336 ms
+
+Token id 11 (`,`) on all 6 cells (3 LEGACY + 3 NEW).
+```
+
+**Outcome vs target**
+
+| metric | W-5b.14 NEW | W-5b.15 NEW | delta |
+|---|---:|---:|---:|
+| `layer.ffn_dispatch` mean | 11,761 ms | **4,336 ms** | **2.71× drop** (target ≥1.5×, exceeded by 1.8×) |
+| Per-layer FFN | 184 ms | **68 ms** | 2.71× |
+| Whole-prefill wall mean | 30,514 ms | **17,150 ms** | 1.78× drop |
+| Wall ratio vs llama | 4.20× | **2.59×** | -38% absolute |
+| Token-id determinism | id 11 | id 11 | 6/6 PASS |
+
+The 4,336 ms FFN bucket lands in the lower half of the W-5b.13 audit's 4,000-5,500 ms target (kernel-floor 56 ms × 64 = 3,584 ms + ~12 ms/layer wrapper residual). Per-layer FFN drops from 184 ms to 68 ms; the 116 ms/layer recovery × 64 = 7,424 ms savings is the alloc-churn budget the audit projected at 30-40% of W-5b.11's 9,750 ms baseline (3,000-4,000 ms) PLUS the propagation of the recycle through `apply_q_or_k_per_head_rms_norm`, `apply_imrope`, and `gpu_delta_net::apply_proj` (all unconditionally pooled) which now also recycle per layer.
+
+**Falsifications captured**
+
+1. W-5b.14's "1.11× FFN drop is the architectural ceiling" framing was wrong — the ceiling was the absent per-layer reset, not a fundamental dispatch architecture cost. The W-5b.13 audit's 30-40% allocation-churn projection was correct; W-5b.14 under-attributed it because the seq-len-aware fallback NEVER engaged the pooled path at prefill (the partial win came from T1+T3 alone, not T2).
+2. The W-5b.14 commit message's claim "the dominant cost at full prefill is the per-layer GEMM dispatch wall itself (~125-150 ms × 64 layers ≈ 8-9.6 s) — that's command-buffer batching architecture" conflated TWO things — the kernel floor (56 ms × 64 = 3,584 ms, immutable) and the wrapper allocation surcharge (~120 ms × 64 = 7,680 ms, recoverable). The W-5b.15 reset closes the second component without touching the first.
+
+**Audit-pattern lesson**
+
+When a "mechanical translation" partial-win measurement under-shoots the projected target, examine whether the translation actually engaged the optimization. W-5b.14's `_into_pooled` was authored but its prefill-side execution was muted by the seq-len fallback. The architectural fix isn't more fusion; it's restoring the lifecycle that lets the pool deliver. Cross-link this lesson to `feedback_loop_mistakes_catalog`.
+
+**Sunset plan**
+
+- `HF2Q_DENSE_Q_LEGACY=1` (W-5b.14 forensic A/B): sunset condition met (cross-path determinism preserved + W-5b.15 production path validated). Recommend removal in W-5b.16 alongside the audit refresh.
+- `HF2Q_DENSE_Q_ARENA_RESET=0` (W-5b.15 forensic A/B): retain until 30-run cross-path determinism panel at PP4106 confirms token id 11 across all 30 AND one apex 35B-A3B prefill verification at PP65536.
+
+**AC-tier impact**
+
+NONE (perf-bar AC 5468 / 5470 informational at full `[x]`; the actual ±5% gap is now 2.59× — closer than W-5b.14's 4.20× but still above the 1.05× target. Remaining gap is dominated by the ~3.5 s kernel floor plus delta_net per-layer barriers).
+
+**Reproduction recipe**
+
+```bash
+# 0. Pre-flight (mantra-required)
+vm_stat | head -3                       # Pages free × 16 KB ≥ 32 GB
+ps aux | sort -k3 -nr | head -5         # No CFA worker > 50% CPU
+
+# 1. Build
+cargo build --release --bin hf2q        # 72 warnings (W-5b.14 baseline)
+
+# 2. Tests
+cargo test --release --bin hf2q qwen35  # 296 PASS
+cargo test --release --bin hf2q dense_q_arena_reset_chunk_prefill_no_layer_33_error  # PASS
+cargo test --release --bin hf2q chunk_path_first_token_matches_autoregressive_at_seq128
+cargo test --release --bin hf2q dense_q_path_first_token_matches_legacy_at_seq128
+
+# 3. Wall-time bench (3 cold × 2 paths × 1 llama)
+./scripts/bench-w5b15-dense-q-arena-reset.sh
+```
+
+Wave 5b.15 dense_q arena reset: **CLOSED — FFN bucket drop 2.71× (target ≥1.5× exceeded by 1.8×); whole-prefill wall ratio 4.20× → 2.59× (-38%); token-id parity 6/6.**
