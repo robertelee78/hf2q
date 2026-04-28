@@ -3348,6 +3348,154 @@ mod tests {
         }
     }
 
+    /// ADR-014 P7 iter-28 — Q4_K_S vs Q4_K_M cross-variant divergence gate.
+    /// Mirrors iter-26/27 for the Q4 family.  Per `llama-quant.cpp:439-460`
+    /// (output bump), `:530-536` (attn_v), `:578-582` (ffn_down):
+    ///
+    ///   Q4_K_M:
+    ///     - output           → Q6_K (210)
+    ///     - attn_v   use_more_bits → Q6_K (210), else → Q4_K base (144)
+    ///     - ffn_down use_more_bits → Q6_K (210), else → Q4_K base (144)
+    ///   Q4_K_S:
+    ///     - output           → Q4_K base (144)   (NO _M output bump)
+    ///     - attn_v   i<4    → Q5_K (176), else → Q4_K base (144)
+    ///     - ffn_down any    → Q4_K base (144)
+    ///
+    /// At n_layers=32 (n/8=4), the test exercises 5 cases:
+    ///   - output.weight              :        Q4_K_M → Q6_K (210) vs Q4_K_S → Q4_K (144) (divergent)
+    ///   - blk.0.attn_v.weight  (i=0): Q4_K_M → Q6_K (210, use_more_bits=true) vs Q4_K_S → Q5_K (176, i<4) (divergent)
+    ///   - blk.9.ffn_down.weight(i=9): Q4_K_M → Q6_K (210, use_more_bits=true) vs Q4_K_S → Q4_K (144) (divergent)
+    ///   - blk.5.attn_v.weight  (i=5): both → Q4_K (144) (control: same; use_more_bits=false, i≥4)
+    ///   - blk.5.attn_q.weight  (i=5): both → Q4_K (144) (control: same)
+    ///
+    /// Without this gate, a regression that gives Q4_K_S the _M output
+    /// bump (or strips _M's use_more_bits→Q6_K) would still pass every
+    /// same-variant policy-lock test (iter-3t/iter-3u) but would
+    /// silently make _S into _M (or a hybrid).
+    #[test]
+    fn variant_streaming_q4ks_vs_q4km_cross_variant_divergence() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+
+        const QK_K: usize = 256;
+        const N_LAYERS: usize = 32;
+
+        let make_f16_payload = |seed: f32, len: usize| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(len * 2);
+            for i in 0..len {
+                let v = (i as f32 / len as f32) * 2.0 - 1.0 + seed * 0.01;
+                let h = half::f16::from_f32(v);
+                bytes.extend_from_slice(&h.to_le_bytes());
+            }
+            bytes
+        };
+
+        // (name, q4km_type, q4km_bytes, q4ks_type, q4ks_bytes, divergent?)
+        let cases: Vec<(&str, &str, usize, &str, usize, bool)> = vec![
+            ("output.weight",            "Q6_K", 210, "Q4_K", 144, true),
+            ("blk.0.attn_v.weight",      "Q6_K", 210, "Q5_K", 176, true),
+            ("blk.9.ffn_down.weight",    "Q6_K", 210, "Q4_K", 144, true),
+            ("blk.5.attn_v.weight",      "Q4_K", 144, "Q4_K", 144, false),
+            ("blk.5.attn_q.weight",      "Q4_K", 144, "Q4_K", 144, false),
+        ];
+
+        let mut lazy_map_q4km = LazyTensorMap::new();
+        let mut lazy_map_q4ks = LazyTensorMap::new();
+        for (i, (name, _, _, _, _, _)) in cases.iter().enumerate() {
+            let payload = make_f16_payload(i as f32, QK_K);
+            lazy_map_q4km.insert(LazyTensor::from_bytes(
+                LazyMeta::new(name.to_string(), vec![1, QK_K], DType::F16),
+                payload.clone(),
+            ));
+            lazy_map_q4ks.insert(LazyTensor::from_bytes(
+                LazyMeta::new(name.to_string(), vec![1, QK_K], DType::F16),
+                payload,
+            ));
+        }
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+
+        let q_q4km = VariantKQuantizer::new(
+            KQuantVariant::Q4_K_M,
+            CalibrationData::None,
+            N_LAYERS,
+        );
+        let q_q4ks = VariantKQuantizer::new(
+            KQuantVariant::Q4_K_S,
+            CalibrationData::None,
+            N_LAYERS,
+        );
+
+        let out_q4km =
+            quantize_streaming(lazy_map_q4km, &metadata, &q_q4km, 0, 0, &progress, false)
+                .expect("Q4_K_M streaming");
+        let out_q4ks =
+            quantize_streaming(lazy_map_q4ks, &metadata, &q_q4ks, 0, 0, &progress, false)
+                .expect("Q4_K_S streaming");
+
+        assert_eq!(out_q4km.quant_method, "Q4_K_M");
+        assert_eq!(out_q4ks.quant_method, "Q4_K_S");
+
+        for (name, q4km_type, q4km_bytes, q4ks_type, q4ks_bytes, divergent) in cases {
+            let t_q4km = out_q4km
+                .tensors
+                .get(name)
+                .unwrap_or_else(|| panic!("Q4_K_M missing {name}"));
+            let t_q4ks = out_q4ks
+                .tensors
+                .get(name)
+                .unwrap_or_else(|| panic!("Q4_K_S missing {name}"));
+
+            assert_eq!(
+                t_q4km.quant_info.ggml_type.as_deref(),
+                Some(q4km_type),
+                "Q4_K_M on {name}: expected {q4km_type}, got {:?}",
+                t_q4km.quant_info.ggml_type
+            );
+            assert_eq!(
+                t_q4km.data.len(),
+                q4km_bytes,
+                "Q4_K_M on {name}: expected {q4km_bytes} bytes"
+            );
+
+            assert_eq!(
+                t_q4ks.quant_info.ggml_type.as_deref(),
+                Some(q4ks_type),
+                "Q4_K_S on {name}: expected {q4ks_type}, got {:?}",
+                t_q4ks.quant_info.ggml_type
+            );
+            assert_eq!(
+                t_q4ks.data.len(),
+                q4ks_bytes,
+                "Q4_K_S on {name}: expected {q4ks_bytes} bytes"
+            );
+
+            if divergent {
+                assert_ne!(
+                    t_q4km.quant_info.ggml_type, t_q4ks.quant_info.ggml_type,
+                    "Q4_K_M and Q4_K_S must route {name} to DIFFERENT codecs \
+                     per output / attn_v / ffn_down policy divergence — \
+                     _S has accidentally inherited _M's tiered upgrades \
+                     (or _M's bumps got stripped)"
+                );
+            } else {
+                assert_eq!(
+                    t_q4km.quant_info.ggml_type, t_q4ks.quant_info.ggml_type,
+                    "Q4_K_M and Q4_K_S must route shared-base {name} to \
+                     the SAME codec — divergence here would be a fixture bug"
+                );
+                assert_eq!(
+                    t_q4km.data, t_q4ks.data,
+                    "Q4_K_M and Q4_K_S on shared-base {name} must produce \
+                     byte-identical output (uncalibrated, deterministic)"
+                );
+            }
+        }
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
