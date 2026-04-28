@@ -76,6 +76,44 @@ pub enum SectionKind {
     /// Per full-attn layer total wall — includes the gated-attn
     /// build_gated_attn_layer call (no chunk pipeline involved).
     LayerFullTotal,
+    // -- Wave 5b.9 sub-FA buckets (additive; reuses HF2Q_PROFILE_W5B8 gate). --
+    // The W-5b.8 closure recommended a per-FA-layer breakdown to attribute
+    // the 23.2 s `LayerFullTotal` bucket. The buckets below carve up
+    // `build_gated_attn_layer` (`gpu_full_attn.rs:1119`) into:
+    //   1. ops 1–4 session (pre-norm + 4 projections + per-head Q/K norm + IMROPE×2)
+    //   2. ops 5 SDPA prefill else-branch in `apply_sdpa_with_kv_cache`,
+    //      itself sub-divided into the 6 CPU↔GPU stages it performs
+    //      around the actual `sdpa` kernel call
+    //   3. ops 6–7 session (sigmoid-gate multiply + O-proj)
+    /// FA op group 1 — pre-norm + Q/K/V/G linear projections + per-head Q/K
+    /// RMS-norm + IMROPE on Q and K. Per FA layer (16 layers in Qwen3.6 27B).
+    /// Implementation: `gpu_full_attn.rs:1156-1227` (single encoder, ends with
+    /// `commit_and_wait` for prefill seq>1).
+    FaOps1to4,
+    /// FA op 5 — `apply_sdpa_with_kv_cache` total wall (prefill else-branch
+    /// at `gpu_full_attn.rs:1027-1084`). This is the CPU↔GPU sandwich
+    /// containing 3 GPU→CPU downloads, a CPU triple-loop KV cache write, a
+    /// CPU permute, an upload, the SDPA kernel itself, an output download,
+    /// an output CPU permute, and a final upload.
+    FaSdpaTotal,
+    /// Inside FA op 5: GPU→CPU downloads of K and V (lines 1030-1031)
+    /// + CPU triple-nested loop writing them into the head-major KV cache
+    /// (lines 1033-1046).
+    FaSdpaKvDownloadCopy,
+    /// Inside FA op 5: GPU→CPU download of Q + CPU permute to head-major +
+    /// re-upload to GPU (lines 1052-1054).
+    FaSdpaQDownloadPermuteUpload,
+    /// Inside FA op 5: the actual `sdpa` kernel dispatch + commit_and_wait
+    /// (lines 1065-1068). This is mlx-native's tiled SDPA kernel — the
+    /// "real GPU work" inside the bucket.
+    FaSdpaKernel,
+    /// Inside FA op 5: output GPU→CPU download + CPU permute back to
+    /// seq-major + final re-upload (lines 1071-1083).
+    FaSdpaOutDownloadPermuteUpload,
+    /// FA op group 6–7 — sigmoid gate × multiply + O-proj projection.
+    /// Implementation: `gpu_full_attn.rs:1251-1276` (single encoder, ends
+    /// with `commit_and_wait` for prefill seq>1).
+    FaOps6to7,
 }
 
 impl SectionKind {
@@ -97,9 +135,16 @@ impl SectionKind {
             SectionKind::LayerAutoregOps5to9 => "layer.autoreg_ops5_9",
             SectionKind::LayerLinearTotal => "layer.linear_total",
             SectionKind::LayerFullTotal => "layer.full_total",
+            SectionKind::FaOps1to4 => "fa.ops1_4",
+            SectionKind::FaSdpaTotal => "fa.sdpa_total",
+            SectionKind::FaSdpaKvDownloadCopy => "fa.sdpa.kv_dl_copy",
+            SectionKind::FaSdpaQDownloadPermuteUpload => "fa.sdpa.q_dl_perm_ul",
+            SectionKind::FaSdpaKernel => "fa.sdpa.kernel",
+            SectionKind::FaSdpaOutDownloadPermuteUpload => "fa.sdpa.out_dl_perm_ul",
+            SectionKind::FaOps6to7 => "fa.ops6_7",
         }
     }
-    const COUNT: usize = 13;
+    const COUNT: usize = 20;
 }
 
 #[derive(Default, Clone)]
@@ -227,6 +272,14 @@ pub fn w5b8_print_and_reset(label: &str) {
             SectionKind::LayerAutoregOps5to9,
             SectionKind::LayerLinearTotal,
             SectionKind::LayerFullTotal,
+            // Wave 5b.9 FA sub-buckets:
+            SectionKind::FaOps1to4,
+            SectionKind::FaSdpaTotal,
+            SectionKind::FaSdpaKvDownloadCopy,
+            SectionKind::FaSdpaQDownloadPermuteUpload,
+            SectionKind::FaSdpaKernel,
+            SectionKind::FaSdpaOutDownloadPermuteUpload,
+            SectionKind::FaOps6to7,
         ];
         for k in kinds {
             let acc = &state.accs[k.idx()];

@@ -1027,60 +1027,91 @@ pub fn apply_sdpa_with_kv_cache(
     } else {
         // Prefill path (seq > 1) or non-standard head_dim:
         // CPU K/V permute is required for the head-major cache layout.
-        let k_cpu_new = download_f32(k_seq_major)?;
-        let v_cpu_new = download_f32(v_seq_major)?;
+        //
+        // Wave 5b.9: instrument the 4 CPU↔GPU sub-stages around the
+        // SDPA kernel call (gated on HF2Q_PROFILE_W5B8=1, no-op otherwise).
+        // The buckets together account for `FaSdpaTotal` measured by
+        // `build_gated_attn_layer`.
+        let (k_cpu_new, v_cpu_new) = {
+            let _w5b9_kv_dl_copy = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FaSdpaKvDownloadCopy,
+            );
+            let k_cpu_new = download_f32(k_seq_major)?;
+            let v_cpu_new = download_f32(v_seq_major)?;
 
-        let k_cache_cpu = slot.k.as_mut_slice::<f32>()
-            .map_err(|e| anyhow!("kv_cache k as_mut_slice: {e}"))?;
-        let v_cache_cpu = slot.v.as_mut_slice::<f32>()
-            .map_err(|e| anyhow!("kv_cache v as_mut_slice: {e}"))?;
+            let k_cache_cpu = slot.k.as_mut_slice::<f32>()
+                .map_err(|e| anyhow!("kv_cache k as_mut_slice: {e}"))?;
+            let v_cache_cpu = slot.v.as_mut_slice::<f32>()
+                .map_err(|e| anyhow!("kv_cache v as_mut_slice: {e}"))?;
 
-        for t in 0..kv_write_tokens {
-            let abs_pos = cur_len + t;
-            for h in 0..nkv {
-                let src_base = (t * nkv + h) * d;
-                let dst_base = h * max_sl * d + abs_pos * d;
-                k_cache_cpu[dst_base..dst_base + d].copy_from_slice(&k_cpu_new[src_base..src_base + d]);
-                v_cache_cpu[dst_base..dst_base + d].copy_from_slice(&v_cpu_new[src_base..src_base + d]);
+            for t in 0..kv_write_tokens {
+                let abs_pos = cur_len + t;
+                for h in 0..nkv {
+                    let src_base = (t * nkv + h) * d;
+                    let dst_base = h * max_sl * d + abs_pos * d;
+                    k_cache_cpu[dst_base..dst_base + d].copy_from_slice(&k_cpu_new[src_base..src_base + d]);
+                    v_cache_cpu[dst_base..dst_base + d].copy_from_slice(&v_cpu_new[src_base..src_base + d]);
+                }
             }
-        }
+            (k_cpu_new, v_cpu_new)
+        };
+        // Suppress unused-variable warnings: k_cpu_new/v_cpu_new are kept alive
+        // only to ensure the bucket boundary above closes before the SDPA call.
+        let _ = (k_cpu_new, v_cpu_new);
         // k_cache_cpu / v_cache_cpu are &mut [f32] borrowed from slot.k / slot.v;
         // NLL releases them at their last use (the loop above), so the immutable
         // re-borrow at sdpa(&slot.k, &slot.v, ...) below is sound without an
         // explicit drop. (drop() on a reference is a no-op anyway.)
 
-        let q_cpu = download_f32(q_seq_major)?;
-        let q_hm = permute_seq_head_dim_to_head_seq_dim_cpu(&q_cpu, seq, nh, d);
-        let q_gpu = upload_f32(&q_hm, device)?;
-
-        let params = SdpaParams {
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            seq_len,
-            kv_seq_len,
-            scale: 1.0 / (d as f32).sqrt(),
-            kv_capacity: max_seq_len,
+        let q_gpu = {
+            let _w5b9_q_dl_perm_ul = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FaSdpaQDownloadPermuteUpload,
+            );
+            let q_cpu = download_f32(q_seq_major)?;
+            let q_hm = permute_seq_head_dim_to_head_seq_dim_cpu(&q_cpu, seq, nh, d);
+            upload_f32(&q_hm, device)?
         };
-        let mut enc = device.command_encoder().context("enc sdpa kv-cache prefill")?;
-        sdpa(&mut enc, registry, device, &q_gpu, &slot.k, &slot.v, &out_buf, &params, 1)
-            .context("sdpa with kv cache prefill")?;
-        enc.commit_and_wait().context("commit sdpa kv-cache prefill")?;
 
-        // Permute output from head-major [n_heads, seq, head_dim] → seq-major.
-        let out_hm_cpu = download_f32(&out_buf)?;
-        let mut out_sm = vec![0.0f32; seq * nh * d];
-        for h in 0..nh {
-            for t in 0..seq {
-                let src = (h * seq + t) * d;
-                let dst = (t * nh + h) * d;
-                out_sm[dst..dst + d].copy_from_slice(&out_hm_cpu[src..src + d]);
-            }
+        {
+            let _w5b9_kernel = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FaSdpaKernel,
+            );
+            let params = SdpaParams {
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                seq_len,
+                kv_seq_len,
+                scale: 1.0 / (d as f32).sqrt(),
+                kv_capacity: max_seq_len,
+            };
+            let mut enc = device.command_encoder().context("enc sdpa kv-cache prefill")?;
+            sdpa(&mut enc, registry, device, &q_gpu, &slot.k, &slot.v, &out_buf, &params, 1)
+                .context("sdpa with kv cache prefill")?;
+            enc.commit_and_wait().context("commit sdpa kv-cache prefill")?;
         }
+
+        // Permute output from head-major [n_heads, seq, head_dim] → seq-major
+        // and re-upload back to GPU for op 6-7.
+        let out_uploaded = {
+            let _w5b9_out_dl_perm_ul = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FaSdpaOutDownloadPermuteUpload,
+            );
+            let out_hm_cpu = download_f32(&out_buf)?;
+            let mut out_sm = vec![0.0f32; seq * nh * d];
+            for h in 0..nh {
+                for t in 0..seq {
+                    let src = (h * seq + t) * d;
+                    let dst = (t * nh + h) * d;
+                    out_sm[dst..dst + d].copy_from_slice(&out_hm_cpu[src..src + d]);
+                }
+            }
+            upload_f32(&out_sm, device)?
+        };
         // --- Update current_len cursor (prefill path) ---
         let new_len = kv_seq_len;
         slot.current_len[0] = new_len;
-        return upload_f32(&out_sm, device);
+        return Ok(out_uploaded);
     }
 
     // --- Update current_len cursor (decode path) ---
@@ -1153,7 +1184,12 @@ pub fn build_gated_attn_layer(
     // short per-layer workloads. Keep the original 3-encoder path.
     //
     // For seq > 1 (prefill): CPU K/V permute is required for head-major layout.
+    // Wave 5b.9: per-FA-layer ops1-4 wall (gated on HF2Q_PROFILE_W5B8=1).
+    // Guard scoped to the inner `{ ... }` so the section closes before the SDPA call.
     let (x_norm, q_flat, k_flat, v_flat, gate_flat, q_normed, k_normed, q_rope, k_rope) = {
+        let _w5b9_ops1to4 = super::wave5b8_profile::Section::start(
+            super::wave5b8_profile::SectionKind::FaOps1to4,
+        );
         let mut enc = device.command_encoder().context("enc ops1-4")?;
 
         // Op 1: pre-attention RMSNorm → x_norm
@@ -1230,25 +1266,35 @@ pub fn build_gated_attn_layer(
     let _ = (x_norm, q_flat, k_flat, q_normed, k_normed);
 
     // ---- Op 5: SDPA (causal, GQA) with optional KV-cache threading ----
-    let attn_out = match kv_cache_slot {
-        Some(slot) => apply_sdpa_with_kv_cache(
-            device, registry,
-            &q_rope, &k_rope, &v_flat,
-            slot, seq_len, n_heads, n_kv_heads, head_dim, max_seq_len,
-        )?,
-        None => {
-            let mut enc = device.command_encoder().context("enc op5")?;
-            apply_sdpa_causal_from_seq_major(
-                &mut enc, registry, device,
+    // Wave 5b.9: per-FA-layer SDPA op5 wall (gated on HF2Q_PROFILE_W5B8=1).
+    let attn_out = {
+        let _w5b9_sdpa_total = super::wave5b8_profile::Section::start(
+            super::wave5b8_profile::SectionKind::FaSdpaTotal,
+        );
+        match kv_cache_slot {
+            Some(slot) => apply_sdpa_with_kv_cache(
+                device, registry,
                 &q_rope, &k_rope, &v_flat,
-                seq_len, n_heads, n_kv_heads, head_dim,
-            )?
+                slot, seq_len, n_heads, n_kv_heads, head_dim, max_seq_len,
+            )?,
+            None => {
+                let mut enc = device.command_encoder().context("enc op5")?;
+                apply_sdpa_causal_from_seq_major(
+                    &mut enc, registry, device,
+                    &q_rope, &k_rope, &v_flat,
+                    seq_len, n_heads, n_kv_heads, head_dim,
+                )?
+            }
         }
     };
     // attn_out is now [seq * n_heads, head_dim] seq-major.
 
     // ---- Ops 6–7: sigmoid-gate multiply + output projection ----
     let out = {
+        // Wave 5b.9: per-FA-layer ops6-7 wall (gated on HF2Q_PROFILE_W5B8=1).
+        let _w5b9_ops6to7 = super::wave5b8_profile::Section::start(
+            super::wave5b8_profile::SectionKind::FaOps6to7,
+        );
         let n_elem = seq_len * q_total;
         let mut enc = device.command_encoder().context("enc ops6-7")?;
         let gated = apply_sigmoid_gate_multiply(
