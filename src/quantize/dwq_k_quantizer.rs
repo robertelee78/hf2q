@@ -110,15 +110,18 @@ pub enum DwqKVariant {
 
 impl DwqKVariant {
     /// The K-quant target for *non-sensitive* tensors under this variant.
-    /// Returns `None` for `P28` (Q2_K codec deferred).
+    /// All variants now return `Some(target)` — the iter-20 Q2_K codec
+    /// land unblocked `P28`'s base.
+    ///
+    /// Return type stays `Option<KQuantTarget>` for back-compat with
+    /// callers that still check via `if let Some(t) = base_target()`.
     pub fn base_target(&self) -> Option<KQuantTarget> {
         match self {
             Self::P46 | Self::P48 => Some(KQuantTarget::Q4K),
             Self::P68 => Some(KQuantTarget::Q6K),
-            // Q2_K codec not yet available in `KQuantTarget`.  Kept as
-            // `None` rather than a panicking sentinel so the
-            // `Quantizer::quantize_tensor` impl can surface a typed error.
-            Self::P28 => None,
+            // iter-20: Q2_K codec landed in `KQuantTarget::Q2K`,
+            // unblocking the dwq28 base path.
+            Self::P28 => Some(KQuantTarget::Q2K),
         }
     }
 
@@ -318,6 +321,7 @@ impl Quantizer for DwqKQuantizer {
 /// read-only fence on that file.
 fn kquant_target_short_name(target: KQuantTarget) -> &'static str {
     match target {
+        KQuantTarget::Q2K => "q2_k",
         KQuantTarget::Q3K => "q3_k",
         KQuantTarget::Q4K => "q4_k",
         KQuantTarget::Q5K => "q5_k",
@@ -417,10 +421,10 @@ mod tests {
     }
 
     #[test]
-    fn variant_targets_p28_base_unavailable() {
-        // Q2_K codec deferred; base target is None until it lands.
-        assert_eq!(DwqKVariant::P28.base_target(), None);
-        // Sensitive target is Q8_0 — already supported by KQuantTarget.
+    fn variant_targets_p28_base_now_available() {
+        // iter-20: Q2_K codec landed → P28 base = Q2_K.
+        assert_eq!(DwqKVariant::P28.base_target(), Some(KQuantTarget::Q2K));
+        // Sensitive target is Q8_0 — unchanged.
         assert_eq!(DwqKVariant::P28.sensitive_target(), KQuantTarget::Q8Legacy);
     }
 
@@ -488,12 +492,12 @@ mod tests {
     }
 
     #[test]
-    fn target_for_p28_base_layer_returns_none() {
-        // P28 + base bucket → None (caller surfaces typed error).
+    fn target_for_p28_base_now_q2_k() {
+        // iter-20: Q2_K codec landed → P28 base = Q2_K.
         let q = DwqKQuantizer::new(DwqKVariant::P28, &[3..=3], CalibrationData::None);
         assert_eq!(
             q.target_for("model.layers.0.self_attn.q_proj.weight"),
-            None
+            Some(KQuantTarget::Q2K)
         );
         // Sensitive layer still routes to Q8_0.
         assert_eq!(
@@ -601,32 +605,24 @@ mod tests {
     }
 
     #[test]
-    fn end_to_end_p28_base_returns_typed_error_no_panic() {
+    fn end_to_end_p28_base_now_routes_to_q2_k_bytes() {
+        // iter-20: P28 base bucket now routes to Q2_K codec
+        // (formerly returned typed error pending codec land).
         let q = DwqKQuantizer::new(
             DwqKVariant::P28,
             &[3..=3],
             CalibrationData::None,
         );
-        // Layer 0 NOT in sensitive set → base = Q2_K (deferred) → typed error.
+        // Layer 0 NOT in sensitive set → base = Q2_K → emits 84-byte block.
         let tensor =
             make_block_aligned_f32_tensor("model.layers.0.self_attn.q_proj.weight");
-        let err = q
+        let out = q
             .quantize_tensor(&tensor, &default_layer_config())
-            .unwrap_err();
-        match err {
-            QuantizeError::TensorQuantizeFailed { tensor: name, reason } => {
-                assert_eq!(name, "model.layers.0.self_attn.q_proj.weight");
-                assert!(
-                    reason.contains("Q2_K") && reason.contains("dwq-k-quantizer"),
-                    "expected error to mention Q2_K + dwq-k-quantizer, got: {reason}"
-                );
-                assert!(
-                    reason.contains("codec land pending"),
-                    "expected error to point at deferred codec land, got: {reason}"
-                );
-            }
-            other => panic!("expected TensorQuantizeFailed, got {other:?}"),
-        }
+            .expect("P28 base should now quantize via Q2_K codec");
+        assert_eq!(out.quant_info.method, METHOD_K_QUANT_CODEC_DIRECT);
+        assert_eq!(out.quant_info.ggml_type.as_deref(), Some("Q2_K"));
+        assert_eq!(out.data.len(), KQuantTarget::Q2K.bytes_per_block());
+        assert_eq!(out.data.len(), 84); // cross-check
     }
 
     #[test]

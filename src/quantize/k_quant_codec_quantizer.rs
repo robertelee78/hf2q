@@ -198,6 +198,7 @@ pub fn f16_passthrough(
 /// existing per-tensor type field).
 fn target_to_ggml_name(target: KQuantTarget) -> String {
     match target {
+        KQuantTarget::Q2K => "Q2_K".to_string(),
         KQuantTarget::Q3K => "Q3_K".to_string(),
         KQuantTarget::Q4K => "Q4_K".to_string(),
         KQuantTarget::Q5K => "Q5_K".to_string(),
