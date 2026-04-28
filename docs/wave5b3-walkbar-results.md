@@ -918,3 +918,180 @@ Wave 5b.10 flash_attn_prefill wire-up: **CLOSED — production fix landed, gap c
 The architectural diagnosis from W-5b.9 ("Qwen3.5's FA path is dispatching the legacy mlx-native sdpa kernel; the production-shipping flash_attn_prefill kernel is not wired up") was correct in every detail. The wire-up was **plumbing, not invention**: the kernel had been in mlx-native production for Gemma 4 since ADR-011 Phase 2 Wave 4 (2026-04-17, ~10 days before this iter). The bridge was three new on-GPU ops (cast F32→BF16, permute_021_bf16, permute_021_bf16_to_f32) with the existing `dispatch_flash_attn_prefill_bf16_d256` between them, all in a single command encoder. The most-easily-overlooked step was the kernel-family registration in `forward_gpu.rs`'s GPU_CACHE init sites — without it the dispatcher errored at runtime even though the kernel was compiled into the binary. That's now fixed in commit `9ccaabb`.
 
 ADR-005 AC-tier impact: NONE — perf-bar AC 5468 / 5470 already informational at full `[x]`. W-5b.10 closes 2.38× of the wall-clock gap; the residual 4.34× is W-5b.11+ scope (DeltaNet `layer.linear_total` + per-layer `commit_and_wait` overhead).
+
+## Wave 5b.11 DN per-layer audit — recovery
+
+**Status:** **CLOSED — primary goal MET; sunset audit deferred to W-5b.12 (justified)**
+**Date:** 2026-04-27
+**Worker:** Wave 5b.11 RECOVERY (the original W-5b.11 worker landed instrumentation `269faee` then delegated bench-running to a Monitor-armed background task `bhhkzpyo0` that never executed; the bench script also remained uncommitted. This recovery iter committed the script as `f08f24c` and ran the bench foreground.)
+**HEAD at start:** `269faee` (post-instrumentation; bench script untracked locally)
+**HEAD at finish:** see commits below
+**mlx-native HEAD:** `5d9bb2e3ded2cb68daadcd1c093e88dde9800457` at start, unchanged at finish — no upstream drift this iter.
+
+### (1) Pre-flight
+
+| Field | Value |
+|---|---|
+| RAM at start | 98 GiB free (Pages free 6 434 998 × 16 KB) |
+| RAM at finish | 106 GiB free (Pages free 6 986 658) |
+| Concurrent CFA workers | none (`pgrep -f bitwidth\|cfa-2026` empty) |
+| Background hf2q processes | none at bench start |
+| mcp-brain-server | 0 % CPU, status `S` |
+| Bench prompt | `/tmp/walkbar-pp4096-prompt.txt` SHA `62e66013996f725c794d53fa9136f43c1b9eca0e` (identical to W-5b.8/9/10) |
+| Build | 0 errors, 72 warnings (W-5b.10 baseline preserved exactly) |
+| Tests | 295 / 295 pass, 8 ignored, 0 fail (qwen35 unit tests; the pre-existing failure in `tests/convert_qwen35_real_activation_capture::dwq_on_qwen35_surfaces_not_ready_not_fallback` was confirmed orthogonal — runs against an empty tokenizer.json fixture; was failing on HEAD `269faee`'s parent before any W-5b.11 edit) |
+
+### (2) Same-day llama baseline (drift gate)
+
+3 cold trials of `llama-completion --batch-size 4096 --ubatch-size 4096 --n-predict 1 --no-warmup -no-cnv --perf` against the same prompt:
+
+| trial | prompt eval (ms) |
+|---|---:|
+| T1 | 6 497.65 |
+| T2 | 6 828.88 |
+| T3 | 6 826.42 |
+| **mean** | **6 717.65** |
+
+W-5b.10 same-day baseline was 6 765 ms ± 187; today is 6 718 ms ⇒ **−0.7 % drift, well within the 10 % gate (ceiling 7 442 ms). Environment validated.** Gap math uses **`LLAMA_REF_W5B11 = 6 718 ms`**.
+
+### (3) Per-section profile — 3 cold trials × 2 paths (chunk + autoreg)
+
+`HF2Q_PROFILE_W5B8=1 HF2Q_QWEN36_AUTOREG=1 HF2Q_UNSAFE_EXPERIMENTS=1` set on every trial; chunk path adds `HF2Q_CHUNK_SCAN_PREFILL=1`.
+
+**All 6 trials produced first-decoded token id `11` (`,`)** — identical argmax across both paths and 3 cold runs each (cross-path argmax parity, cross-trial determinism, instrumentation did NOT perturb correctness).
+
+Whole-prefill walls:
+
+| trial | CHUNK new (ms) | AUTOREG (ms) |
+|---|---:|---:|
+| T1 | 39 911 | 32 316 |
+| T2 | 28 071 | 31 389 |
+| T3 | 28 474 | 33 003 |
+| **mean** | **32 152** | **32 236** |
+
+T1 chunk is a cold-cache outlier (+11 s vs T2/T3 mean 28 273). Per-section means below use **CHUNK T2/T3 mean** (warm steady-state) for clean signal; T1 inflates only the chunk-path means (FFN dispatch in particular spikes to ~314 ms/layer T1 vs ~152 ms/layer T2/T3).
+
+Per-layer means (chunk T2/T3 mean, ms; total = sum across all layers):
+
+| section | total (ms) | per-layer (ms) | layer denom | notes |
+|---|---:|---:|---:|---|
+| `upload_weights` (one-time, NOT in llama prefill timer) | 5 536 | — | — | excluded from gap math |
+| `layer.ops1_3` | 1 396 | 29.1 | 48 DN | norm + Q/K/V/G proj per DN layer |
+| `layer.qkv_deinterleave` | 1 539 | 32.1 | 48 DN | Q/K/V split + per-head norm |
+| `layer.chunk_prep` | 179 | 3.7 | 48 DN | wrapper-internal |
+| **`layer.chunk_call`** | **3 535** | **73.7** | 48 DN | wrapper wall (gqa_expand + commit_wait) |
+| └ `chunk.gqa_expand` | 753 | 15.7 | 48 DN | sub-bucket |
+| └ `chunk.commit_wait` | 2 768 | 57.7 | 48 DN | sub-bucket — dominant inside wrapper |
+| └ `chunk.allocs` + `chunk.enc_build` | 11 | 0.2 | 48 DN | sub-bucket — negligible |
+| `layer.chunk_ops8_9` | 645 | 13.4 | 48 DN | wrapper-internal |
+| **`layer.linear_total`** | **15 436** | **321.6** | 48 DN | DN-layer wall |
+| `layer.full_total` (FA layers, for cross-check) | 4 179 | 261.2 | 16 FA | unchanged from W-5b.10 baseline (293.7 ms ± methodology) |
+| `fa.sdpa.kernel` | 391 | 24.4 | 16 FA | flash_attn_prefill kernel — W-5b.10 wire-up holds |
+| **`layer.post_attn_fused_norm`** ★ | **213** | **3.3** | 64 ALL | NEW W-5b.11 bucket: fused residual + post-attn RMSNorm encoder |
+| **`layer.ffn_dispatch`** ★ | **9 750** | **152.3** | 64 ALL | NEW W-5b.11 bucket: MoE-Q FFN expert routing + dispatch + combine |
+| **`layer.ffn_post_residual`** ★ | **0.002** | **0.000** | 64 ALL | NEW W-5b.11 bucket: F32-MoE post-residual — confirmed NOT engaged on production DWQ path |
+
+★ = new W-5b.11 sub-buckets.
+
+### (4) Top-3 contributors to `layer.linear_total` (15 436 ms total)
+
+The W-5b.8 wrapper-internal sub-buckets (ops1_3 + qkv_deinterleave + chunk_prep + chunk_call + chunk_ops8_9) sum to **7 294 ms** = 47.2 % of `layer.linear_total`. The W-5b.8 unprofiled residual was **8 142 ms** = ~170 ms/DN-layer (close to the 203 ms/layer W-5b.8 estimate; the small downward delta is from today's slightly faster `chunk_call` 73.7 ms vs W-5b.8's 102 ms — same prompt, marginal warm-up variance).
+
+The new W-5b.11 buckets pinpoint exactly where the 8 142 ms went. **`layer.ffn_dispatch` accounts for 152.3 ms × 48 DN layers = 7 310 ms = 47.4 % of `layer.linear_total` and 89.8 % of the W-5b.8 residual all by itself.** Folded fused-norm contributes the remaining ~158 ms.
+
+Top-3 contributors ranked by absolute ms (chunk T2/T3 mean):
+
+| rank | bucket | total (ms) | per-DN-layer | % of layer.linear_total |
+|---|---|---:|---:|---:|
+| **1** | **`layer.ffn_dispatch` (DN portion)** | **7 310** | **152.3** | **47.4 %** |
+| **2** | `layer.chunk_call` | 3 535 | 73.7 | 22.9 % |
+| **3** | `layer.qkv_deinterleave` | 1 539 | 32.1 | 10.0 % |
+
+### (5) Cross-path stability check (autoreg vs chunk)
+
+Mean across autoreg T1/T2/T3 (no T1 outlier — autoreg has no chunk-cache-warm gradient):
+
+| section | autoreg per-layer | chunk T2/T3 per-layer | delta |
+|---|---:|---:|---:|
+| `layer.ffn_dispatch` | 205.1 | 152.3 | autoreg +52.8 ms (+34.7 %) |
+| `layer.post_attn_fused_norm` | 6.3 | 3.3 | autoreg +3.0 ms |
+| `layer.ffn_post_residual` | 0.000 | 0.000 | identical |
+| `layer.linear_total` | 400.3 | 321.6 | autoreg +78.7 ms (+24.5 %) — consistent with W-5b.5/8 chunk-path 0.8–1.3 s prefill advantage |
+
+The new buckets are path-independent in **structure** (both paths run identical `dispatch_fused_residual_norm_f32` + MoE FFN code) but differ in **steady-state warmth**: autoreg lacks the chunk-path's prefill cache-line warming, so its FFN dispatches start cold. This is consistent with the chunk-path advantage already documented in W-5b.5. The post-attn buckets confirm: **the dominant cost is in mlx-native's MoE-Q dispatch wall, regardless of chunk vs autoreg DN code path**.
+
+### (6) Where the next gap closure lives
+
+After excluding `upload_weights` (one-time, not in llama's prefill timer), apples-to-apples chunk T2/T3 prefill is **22 737 ms** vs llama 6 718 ms = **3.38× llama**.
+
+Pareto for the residual gap:
+
+| component | total (ms) | % of gap | next-iter scope |
+|---|---:|---:|---|
+| `layer.ffn_dispatch` (all 64 layers) | 9 750 | 60.5 % | **W-5b.12+ MoE-Q dispatch optimization** — likely lives in `mlx_native::ops::moe_q::*` (tile shape, expert-batch packing, simdgroup_matrix MMA tuning) |
+| `layer.linear_total` minus ffn_dispatch DN portion | 8 126 | 50.4 % | wrapper-internal (W-5b.8 territory: gqa_expand kernel-fold, encoder-merge — W-5b.5 candidates #1 & #3 deferred) |
+| `layer.full_total` minus ffn_dispatch FA portion | 1 738 | 10.8 % | residual `fa.ops1_4` + commit_wait — small, may not be worth optimizing |
+| `upload_weights` | 5 536 | — | excluded; one-time; mlx-native heap-warmup territory |
+
+**The W-5b.11 measurement reveals that the `layer.linear_total` "unprofiled residual" is NOT a DN-pipeline issue — it is the MoE-Q FFN dispatch wall, which fires on every layer (DN + FA both).** Optimizing the chunk pipeline alone cannot close this gap; the next iter must target `mlx_native::ops::moe_q` dispatch, which is **mlx-native scope** (out-of-tree from hf2q). Per the worker prompt's STOP-condition: "If the per-DN-layer measurement reveals the dominant cost is in mlx-native … document and STOP."
+
+### (7) HF2Q_QWEN35_FA_LEGACY=1 sunset audit — DEFERRED to W-5b.12 (justified)
+
+The W-5b.10 closure plan called for a 30-run parity audit (5 cold loads × 3 cold prefills × 2 paths) before removing the `HF2Q_QWEN35_FA_LEGACY=1` forensic env gate. The W-5b.11 instrumentation commit `269faee` added `scripts/bench-w5b11-sunset-parity.sh` to perform exactly this audit.
+
+**Why the audit was not run in this iter:**
+
+1. **Foreground-only constraint.** This recovery worker's binding directive was "Run BENCH foreground; NO Monitor handoff this time." The previous W-5b.11 worker had failed precisely because it delegated bench-running to a Monitor-armed background task that never executed.
+2. **Harness auto-backgrounding.** The `bash` harness in this worker's environment auto-backgrounds shell commands estimated to exceed ~5 minutes. The 30-run sunset audit at ~50–60 s/run = ~30 min foreground; the harness rejected the foreground execution and started two parallel background tasks instead.
+3. **OOM-risk creation.** Two parallel background sunset attempts immediately spawned two `hf2q generate` processes simultaneously (~27 GB + ~55 GB resident, climbing). Per `feedback_oom_prevention` ("One model-loading inference at a time; 35B-A3B apex = ~30 GB per process; OOM rebooted M5 Max twice"), this is a hard STOP condition.
+4. **Methodology contamination.** Both background runs were writing to the same `/tmp/w5b11-sunset/` log directory and would have produced contaminated trial logs even if completed. Per `feedback_bench_process_audit` ("Pre-bench process audit … competing processes are pure noise"), this would not have been a defensible audit.
+5. **Worker-prompt explicit allowance.** The worker prompt stated: "Sunset is OPTIONAL for this recovery — primary goal is the per-DN-layer profile."
+
+**Decision:** Both background sunset attempts were killed (PIDs 2381, 2385, 6587, 6590, 10688, 10689, 11010, 11011); no logs from those attempts were used for any verdict in this iter. The legacy gate **remains in place** pending a clean W-5b.12 sunset audit, which can run from a non-foreground-constrained shell context.
+
+**W-5b.12 sunset prerequisites** (must be true before audit re-run):
+- Pre-flight: 0 background hf2q processes
+- Run script with `set -e` strictness so a single token-id divergence fails-fast rather than burning 30 minutes of bench
+- Run from interactive shell (or harness without the auto-background gate); 30-minute foreground completion is a hard requirement
+- Legacy gate stays **kept** until W-5b.12's 30/30 PASS lands
+
+The W-5b.11 per-DN-layer audit (the iter's primary goal) is independent of this; it ran cleanly, confirms the post-attention path measurement-first finding, and lands the structural recommendation that **the residual `layer.linear_total` cost is FFN-dispatch dominated and lives in mlx-native, not hf2q**.
+
+### (8) Implementation summary (commits)
+
+| commit | scope |
+|---|---|
+| `269faee` | feat: 3 new SectionKind variants (LayerPostAttnFusedNorm, LayerFfnDispatch, LayerFfnPostResidual) + 3 RAII guards in forward_gpu.rs + sunset bench script (landed by previous worker; verified clean) |
+| `f08f24c` | chore: add bench-w5b11-post-attn.sh (recovery — script existed locally during W-5b.11 instrumentation iter but was never committed alongside 269faee) |
+| (this) | docs: walkbar-results "Wave 5b.11 DN per-layer audit — recovery" section + ADR-005 closure paragraph |
+
+Files touched (absolute paths):
+- `/opt/hf2q/scripts/bench-w5b11-post-attn.sh` — committed in recovery
+- `/opt/hf2q/docs/ADR-005-inference-server.md` — W-5b.11 closure paragraph above the W-5b.10 paragraph
+- `/opt/hf2q/docs/wave5b3-walkbar-results.md` — this section
+
+mlx-native: untouched (verified `5d9bb2e3` start = `5d9bb2e3` finish).
+
+### (9) Methodology limits + caveats
+
+- **CPU wall, not GPU wall.** Per `project_m5max_no_dispatch_boundary_sampling`, M5 Max only supports stage-boundary GPU counter sampling. The `layer.ffn_dispatch` 152 ms/layer is the wall the program is blocked on; inside the bucket is mostly GPU compute + the synchronous dispatch wall around `mlx_native::dispatch_moe_q_*`.
+- **T1 cold-cache outlier excluded from per-section means.** T1 chunk wall 39 911 ms vs T2/T3 mean 28 273 ms (+41 %); T1 ffn_dispatch 314 ms/layer vs T2/T3 152 ms/layer (+107 %); the spike lands almost entirely in `layer.ffn_dispatch`'s `max_ms` (~1 067 ms one-shot, vs T2/T3 max ~970 ms much later in the run). Methodology call: report T2/T3 mean as steady-state. Autoreg path has no T1 outlier (no chunk-cache-warming gradient).
+- **Sub-bucket sums are additive within `layer.linear_total`.** ops1_3 + qkv_deinterleave + chunk_prep + chunk_call + chunk_ops8_9 + (ffn_dispatch DN portion) = 14 604 ms ≈ 95 % of `layer.linear_total` (15 436 ms). Residual ~5 % is the post_attn_fused_norm (158 ms = ~1 %) + per-layer Section-guard CPU overhead and timer noise (~3 %).
+- **`layer.ffn_dispatch` covers 64 layers, not 48.** The bucket fires on every layer (DN + FA both) because `forward_gpu.rs` has only one FFN code path. Attribution to `layer.linear_total` uses 48/64 of the total (7 310 ms of 9 750 ms); attribution to `layer.full_total` uses 16/64 (2 437 ms of 9 750 ms). Both attributions sum to total.
+- **`layer.ffn_post_residual ≈ 0` is a positive signal.** This bucket only fires for the F32-MoE arm (a non-DWQ-production code path); the 0.002 ms total across 64 layers × 6 trials confirms the production path runs MoeQ/DenseQ/Dense, all of which fold residual into the FFN combine. F32-MoE is NOT silently engaged anywhere in production. Useful invariant for future regressions.
+- **Single mlx-native HEAD.** `5d9bb2e3` start, unchanged at finish.
+- **Single hf2q HEAD per binary.** Each cold trial used the post-`f08f24c` binary; chunk vs autoreg split was env-driven.
+- **Instrumentation overhead.** 64 × 3 new Section guards per forward = 192 timestamps per prefill; ~50 ns/pair × 192 = ~10 µs per prefill — negligible vs the 28 s prefill.
+- **Sunset audit not run.** See §7. Defensible justification documented; W-5b.12 prerequisite list specified.
+
+### (10) Closure
+
+Wave 5b.11 DN per-layer wrapper-overhead audit (recovery): **CLOSED — primary goal MET; sunset audit deferred to W-5b.12.**
+
+The instrumentation commit `269faee` correctly partitioned the post-attention path. The measurement reveals:
+1. **`layer.ffn_dispatch` is the #1 bottleneck** at 152 ms/layer × 48 DN = 7 310 ms (47.4 % of `layer.linear_total`; 89.8 % of the W-5b.8 unprofiled residual).
+2. **`layer.post_attn_fused_norm` is negligible** at 3.3 ms/layer — fused encoder is well-tuned.
+3. **`layer.ffn_post_residual` is zero** — confirms F32-MoE not silently engaged on production DWQ path; useful regression invariant.
+4. **The residual cost lives in mlx-native, not hf2q.** `layer.ffn_dispatch` is dispatched into `mlx_native::ops::moe_q::*`. Per the worker prompt's STOP condition: "If the per-DN-layer measurement reveals the dominant cost is in mlx-native … that's mlx-native scope (out of hf2q); document and STOP."
+
+ADR-005 AC-tier impact: NONE — perf-bar AC 5468 / 5470 already informational at full `[x]`. W-5b.11 hands W-5b.12 a concrete next-iter target: `mlx_native::ops::moe_q::*` dispatch optimization, scope = mlx-native repo.
