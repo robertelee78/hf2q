@@ -281,8 +281,26 @@ impl Quantizer for KQuantCodecQuantizer {
         // priority — see ordering note above) but BEFORE the codec
         // dispatch so codec rejections never surface for predicate-
         // matched tensors.
+        //
+        // ADR-014 P7 iter-34 (2026-04-28): the predicate's 256-multiple
+        // arm fires on K-quant block-size constraints (QK_K=256) and
+        // MUST NOT apply to legacy targets (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0
+        // use 32-element blocks).  Without this gate, any 32-multiple
+        // row that's not also 256-multiple would falsely passthrough
+        // as F16 instead of being quantized to the requested legacy
+        // target.  The vision-pattern arm still applies regardless of
+        // target — vision tensors are F16-passthrough policy-driven,
+        // not block-size-driven.
         let row_len_for_skip = tensor.shape.last().copied().unwrap_or(0);
-        if should_emit_f16_for_kquant(&tensor.name, row_len_for_skip) {
+        let is_k_quant_target = matches!(
+            self.target,
+            KQuantTarget::Q2K
+                | KQuantTarget::Q3K
+                | KQuantTarget::Q4K
+                | KQuantTarget::Q5K
+                | KQuantTarget::Q6K
+        );
+        if is_k_quant_target && should_emit_f16_for_kquant(&tensor.name, row_len_for_skip) {
             tracing::info!(
                 tensor = %tensor.name,
                 row_len = row_len_for_skip,

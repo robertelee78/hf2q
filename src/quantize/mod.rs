@@ -4288,6 +4288,130 @@ mod tests {
         }
     }
 
+    /// ADR-014 P7 iter-34 — legacy block-format streaming round-trip RMSE.
+    /// K-quant variants got per-bit-tier RMSE bounds via iter-3x/3y
+    /// (Q4/5/6_K), iter-11 (Q3_K), iter-17 (Q4_K_S/Q5_K_S), iter-22
+    /// (Q2_K/Q2_K_S).  This iter closes the legacy targets — Q4_0,
+    /// Q4_1, Q5_0, Q5_1, Q8_0 — through the same `quantize_streaming` +
+    /// matching `dequantize_row_q*_bytes` round-trip pattern.
+    ///
+    /// Legacy targets dispatch through `KQuantCodecQuantizer` directly
+    /// (they are not exposed via `KQuantVariant` since variants are
+    /// K-quant-policy-only — Decisions 12+13).  This test pins the
+    /// legacy codec quality through the production streaming path.
+    ///
+    /// RMSE bounds chosen per bit-tier on a 4-super-block smooth ramp
+    /// (1024 elements, range -1..+1):
+    ///   - Q4_0 / Q4_1: 4-bit quants → ≤ 0.05
+    ///   - Q5_0 / Q5_1: 5-bit quants → ≤ 0.025
+    ///   - Q8_0:        8-bit quants → ≤ 0.005
+    ///
+    /// Catches:
+    ///   - A regression in `quantize_row_q*_to_bytes` that emits
+    ///     structurally-valid bytes that round-trip to garbage.
+    ///   - A `KQuantCodecQuantizer` Quantizer-trait wiring regression
+    ///     that mis-routes legacy targets.
+    ///   - Drift between the codec's `bytes_per_block` and the
+    ///     streaming pipeline's per-row byte budget.
+    ///
+    /// Note: legacy targets do NOT support imatrix (per
+    /// `KQuantTarget::supports_imatrix`); this test exercises the
+    /// uncalibrated path only.
+    #[test]
+    fn legacy_target_streaming_round_trip_rmse_bounds() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::k_quant_codec::KQuantTarget;
+        use crate::quantize::k_quant_codec_quantizer::KQuantCodecQuantizer;
+        use crate::quantize::q_legacy::{
+            dequantize_row_q4_0_bytes, dequantize_row_q4_1_bytes,
+            dequantize_row_q5_0_bytes, dequantize_row_q5_1_bytes,
+            dequantize_row_q8_0_bytes,
+        };
+
+        const QK: usize = 32; // legacy block size
+        const N_BLOCKS: usize = 32; // 32 × 32 = 1024 elements
+        const TOTAL: usize = QK * N_BLOCKS;
+        const TENSOR: &str = "blk.0.attn_q.weight";
+
+        // Smooth ramp -1..+1 over 1024 elements; matches K-quant RMSE
+        // test fixtures' shape so the comparisons are apples-to-apples.
+        let original_f32: Vec<f32> = (0..TOTAL)
+            .map(|i| (i as f32 / TOTAL as f32) * 2.0 - 1.0)
+            .collect();
+        let payload: Vec<u8> = original_f32
+            .iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+            .collect();
+        let expected_post_f16: Vec<f32> = original_f32
+            .iter()
+            .map(|v| half::f16::from_f32(*v).to_f32())
+            .collect();
+
+        let make_lazy_map = || -> LazyTensorMap {
+            let mut m = LazyTensorMap::new();
+            m.insert(LazyTensor::from_bytes(
+                LazyMeta::new(TENSOR.to_string(), vec![N_BLOCKS, QK], DType::F16),
+                payload.clone(),
+            ));
+            m
+        };
+
+        // (target, name, ggml_type, bytes_per_block, rmse_bound, dequant fn)
+        type DequantFn = fn(&[u8], &mut [f32]) -> Result<usize, crate::quantize::q_legacy::QLegacyError>;
+        let cases: Vec<(KQuantTarget, &str, &str, usize, f64, DequantFn)> = vec![
+            (KQuantTarget::Q4Legacy,  "Q4_0", "Q4_0", 18, 0.05,  dequantize_row_q4_0_bytes),
+            (KQuantTarget::Q4Legacy1, "Q4_1", "Q4_1", 20, 0.05,  dequantize_row_q4_1_bytes),
+            (KQuantTarget::Q5Legacy0, "Q5_0", "Q5_0", 22, 0.025, dequantize_row_q5_0_bytes),
+            (KQuantTarget::Q5Legacy1, "Q5_1", "Q5_1", 24, 0.025, dequantize_row_q5_1_bytes),
+            (KQuantTarget::Q8Legacy,  "Q8_0", "Q8_0", 34, 0.005, dequantize_row_q8_0_bytes),
+        ];
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+
+        for (target, name, ggml_type, bytes_per_block, rmse_bound, dequant) in cases {
+            let q = KQuantCodecQuantizer::new(name, target, CalibrationData::None);
+            let out = quantize_streaming(make_lazy_map(), &metadata, &q, 0, 0, &progress, false)
+                .unwrap_or_else(|e| panic!("{name} streaming: {e:?}"));
+
+            let t = out
+                .tensors
+                .get(TENSOR)
+                .unwrap_or_else(|| panic!("{name} missing {TENSOR}"));
+            assert_eq!(
+                t.quant_info.ggml_type.as_deref(),
+                Some(ggml_type),
+                "{name}: ggml_type"
+            );
+            assert_eq!(
+                t.data.len(),
+                N_BLOCKS * bytes_per_block,
+                "{name}: byte budget = N_BLOCKS × bytes_per_block"
+            );
+
+            let mut decoded = vec![0.0_f32; TOTAL];
+            dequant(&t.data, &mut decoded)
+                .unwrap_or_else(|e| panic!("{name} dequant: {e:?}"));
+
+            let rmse: f64 = {
+                let s: f64 = (0..TOTAL)
+                    .map(|i| {
+                        let e = decoded[i] as f64 - expected_post_f16[i] as f64;
+                        e * e
+                    })
+                    .sum();
+                (s / TOTAL as f64).sqrt()
+            };
+
+            assert!(
+                rmse <= rmse_bound,
+                "{name} round-trip RMSE {rmse:.6} exceeds bound {rmse_bound} \
+                 — codec→streaming→dequant chain has degraded"
+            );
+        }
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
