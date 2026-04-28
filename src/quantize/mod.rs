@@ -1393,6 +1393,165 @@ mod tests {
     /// We use the same input pattern so any divergence between the
     /// streaming path's RMSE and the isolated codec path's RMSE
     /// indicates a layering bug.
+    ///
+    /// ADR-014 P7 iter-12 — Q3_K_M streaming-path policy lock.
+    /// Mirrors iter-3t's Q4_K_M pattern but exercises every distinct
+    /// Q3_K_M policy branch through `quantize_streaming` end-to-end.
+    /// Catches a regression where iter-9's `target_for` per-tensor
+    /// dispatch silently mis-routes one of the bump categories on the
+    /// streaming path while the isolated unit tests still pass.
+    ///
+    /// Branches covered (per `llama-quant.cpp:439-460/527-528/578-582`):
+    ///   1. `output.weight`              → Q6_K (210 bytes)  [output bump]
+    ///   2. `blk.0.attn_v.weight`        → Q5_K (176 bytes)  [attn_v i<2]
+    ///   3. `blk.5.attn_v.weight`        → Q4_K (144 bytes)  [attn_v i≥2]
+    ///   4. `blk.0.ffn_down.weight`      → Q5_K (176 bytes)  [ffn_down i<n/16]
+    ///   5. `blk.6.ffn_down.weight`      → Q4_K (144 bytes)  [ffn_down use_more_bits]
+    ///   6. `blk.5.ffn_down.weight`      → Q3_K (110 bytes)  [ffn_down else→base]
+    ///   7. `blk.10.attn_q.weight`       → Q3_K (110 bytes)  [attn_q never bumps→base]
+    ///
+    /// `n_layers = 32` so `n/16 = 2`, `n/8 = 4`, `7n/8 = 28`. At i=5,
+    /// `use_more_bits` is false ((5-4)%3=1≠2), so ffn_down lands at
+    /// base.  At i=6, (6-4)%3=2 → use_more_bits=true → Q4_K.
+    #[test]
+    fn variant_streaming_q3km_policy_branches() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+        use crate::calibrate::calibrator::CalibrationData;
+
+        const QK_K: usize = 256;
+        const N_LAYERS: usize = 32;
+
+        let make_f16_payload = |seed: f32, len: usize| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(len * 2);
+            for i in 0..len {
+                let v = (i as f32 / len as f32) * 2.0 - 1.0 + seed * 0.01;
+                let h = half::f16::from_f32(v);
+                bytes.extend_from_slice(&h.to_le_bytes());
+            }
+            bytes
+        };
+
+        // (tensor_name, expected_ggml_type, expected_block_bytes)
+        let cases: Vec<(&str, &str, usize)> = vec![
+            ("output.weight",                "Q6_K", 210),
+            ("blk.0.attn_v.weight",          "Q5_K", 176),
+            ("blk.5.attn_v.weight",          "Q4_K", 144),
+            ("blk.0.ffn_down.weight",        "Q5_K", 176),
+            ("blk.6.ffn_down.weight",        "Q4_K", 144),
+            ("blk.5.ffn_down.weight",        "Q3_K", 110),
+            ("blk.10.attn_q.weight",         "Q3_K", 110),
+        ];
+
+        let mut lazy_map = LazyTensorMap::new();
+        for (i, (name, _ty, _bytes)) in cases.iter().enumerate() {
+            lazy_map.insert(LazyTensor::from_bytes(
+                LazyMeta::new(name.to_string(), vec![1, QK_K], DType::F16),
+                make_f16_payload(i as f32, QK_K),
+            ));
+        }
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+        let q = VariantKQuantizer::new(
+            KQuantVariant::Q3_K_M,
+            CalibrationData::None,
+            N_LAYERS,
+        );
+
+        let out = quantize_streaming(
+            lazy_map, &metadata, &q, 0, 0, &progress, /* bf16_to_f16 */ false,
+        )
+        .expect("Q3_K_M streaming should succeed");
+
+        assert_eq!(out.tensors.len(), cases.len(),
+            "expected {} tensors in output", cases.len());
+        assert_eq!(out.quant_method, "Q3_K_M");
+
+        for (name, expected_type, expected_bytes) in cases {
+            let t = out.tensors.get(name)
+                .unwrap_or_else(|| panic!("missing {name} in streaming output"));
+            assert_eq!(
+                t.quant_info.ggml_type.as_deref(), Some(expected_type),
+                "Q3_K_M policy regression on {name}: expected ggml_type={expected_type}, got {:?}",
+                t.quant_info.ggml_type
+            );
+            assert_eq!(
+                t.data.len(), expected_bytes,
+                "Q3_K_M policy regression on {name}: expected {expected_bytes} block bytes, got {}",
+                t.data.len()
+            );
+        }
+    }
+
+    /// ADR-014 P7 iter-12 — Q3_K_L streaming-path policy lock.
+    /// Q3_K_L is the simplest Q3 variant: attn_v ALWAYS Q5_K, ffn_down
+    /// ALWAYS Q5_K, output Q6_K, everything else base Q3_K.  No
+    /// per-layer bands.  Catches a regression where the Q3_K_L→Q5_K
+    /// arms get reverted to the Q3_K_M conditional logic.
+    #[test]
+    fn variant_streaming_q3kl_policy_branches() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+        use crate::calibrate::calibrator::CalibrationData;
+
+        const QK_K: usize = 256;
+        const N_LAYERS: usize = 32;
+
+        let make_f16_payload = |seed: f32, len: usize| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(len * 2);
+            for i in 0..len {
+                let v = (i as f32 / len as f32) * 2.0 - 1.0 + seed * 0.01;
+                let h = half::f16::from_f32(v);
+                bytes.extend_from_slice(&h.to_le_bytes());
+            }
+            bytes
+        };
+
+        let cases: Vec<(&str, &str, usize)> = vec![
+            ("output.weight",                "Q6_K", 210),
+            ("blk.0.attn_v.weight",          "Q5_K", 176),
+            ("blk.15.attn_v.weight",         "Q5_K", 176), // Q3_K_L: attn_v always Q5_K
+            ("blk.0.ffn_down.weight",        "Q5_K", 176),
+            ("blk.5.ffn_down.weight",        "Q5_K", 176), // Q3_K_L: ffn_down always Q5_K (no use_more_bits gate)
+            ("blk.10.attn_q.weight",         "Q3_K", 110),
+        ];
+
+        let mut lazy_map = LazyTensorMap::new();
+        for (i, (name, _ty, _bytes)) in cases.iter().enumerate() {
+            lazy_map.insert(LazyTensor::from_bytes(
+                LazyMeta::new(name.to_string(), vec![1, QK_K], DType::F16),
+                make_f16_payload(i as f32, QK_K),
+            ));
+        }
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+        let q = VariantKQuantizer::new(
+            KQuantVariant::Q3_K_L,
+            CalibrationData::None,
+            N_LAYERS,
+        );
+
+        let out = quantize_streaming(
+            lazy_map, &metadata, &q, 0, 0, &progress, false,
+        )
+        .expect("Q3_K_L streaming should succeed");
+
+        assert_eq!(out.quant_method, "Q3_K_L");
+        for (name, expected_type, expected_bytes) in cases {
+            let t = out.tensors.get(name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(
+                t.quant_info.ggml_type.as_deref(), Some(expected_type),
+                "Q3_K_L on {name}: expected {expected_type}"
+            );
+            assert_eq!(t.data.len(), expected_bytes, "Q3_K_L on {name}");
+        }
+    }
+
     #[test]
     fn variant_streaming_q4km_round_trip_rmse_bound() {
         use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
