@@ -146,6 +146,39 @@ pub enum SectionKind {
     /// `residual_add_gpu` GPU encoder (`forward_gpu.rs:1020-1021`) — measured
     /// here so we know whether F32-MoE is engaged anywhere.
     LayerFfnPostResidual,
+    // -- Wave 5b.17 DN-wrapper-overhead sub-buckets (additive; gated on a
+    // SEPARATE `HF2Q_PROFILE_W5B17=1` env so default-off behaviour is
+    // preserved even when `HF2Q_PROFILE_W5B8=1`). --
+    //
+    // The W-5b.16 closure measured `layer.linear_total` 7,287 ms with sub-
+    // buckets `ops1_3 + qkv_deinterleave + chunk_prep + chunk_call +
+    // chunk_ops8_9 = 3,962 ms` accounted for; the residual ~3,300 ms is
+    // the FFN dispatch portion attributable to DN layers (already named via
+    // `layer.ffn_dispatch`). Of the 3,962 ms DN-attention work,
+    // `qkv_deinterleave` (826 ms) is wholly CPU GPU↔CPU round-trip (the
+    // chunk wrapper's `chunk_call` already partitions into gqa_expand +
+    // allocs + enc_build + commit_wait). These W-5b.17 buckets carve up
+    // the unprofiled corners:
+    //   - `dn.qkv_download` (download_f32 of the fused QKV-conv tensor)
+    //   - `dn.qkv_cpu_loop` (CPU triple-loop de-interleave into Q/K/V vecs)
+    //   - `dn.qkv_uploads`  (3× upload_f32 of Q, K, V back to GPU)
+    //   - `dn.state_pingpong_memcpy` (the unsafe copy_nonoverlapping at
+    //     gpu_delta_net.rs:1625-1628 — n_state F32 per layer × 48 layers
+    //     across the chunk-final-state → caller-state-out ping-pong slot).
+    /// `download_f32(&qkv_conv_out)` at gpu_delta_net.rs:1441 — fused QKV
+    /// tensor GPU→CPU transfer ahead of the CPU de-interleave loop.
+    DnQkvDownload,
+    /// CPU triple-loop de-interleave at gpu_delta_net.rs:1442-1452 —
+    /// reshuffles the fused QKV-conv layout into separate Q, K, V slabs.
+    DnQkvCpuLoop,
+    /// 3× `upload_f32` at gpu_delta_net.rs:1453-1455 — Q, K, V CPU→GPU
+    /// uploads to feed `apply_gated_delta_net_chunk`.
+    DnQkvUploads,
+    /// Chunk-pipeline final_state → caller state_out ping-pong copy at
+    /// gpu_delta_net.rs:1625-1628 (`std::ptr::copy_nonoverlapping`,
+    /// n_state = d_k × d_v × n_v_heads × 4 B per layer ≈ 4 MB × 48
+    /// layers ≈ 200 MB CPU memcpy total at PP4096).
+    DnStatePingpongMemcpy,
 }
 
 impl SectionKind {
@@ -177,9 +210,13 @@ impl SectionKind {
             SectionKind::LayerPostAttnFusedNorm => "layer.post_attn_fused_norm",
             SectionKind::LayerFfnDispatch => "layer.ffn_dispatch",
             SectionKind::LayerFfnPostResidual => "layer.ffn_post_residual",
+            SectionKind::DnQkvDownload => "dn.qkv_download",
+            SectionKind::DnQkvCpuLoop => "dn.qkv_cpu_loop",
+            SectionKind::DnQkvUploads => "dn.qkv_uploads",
+            SectionKind::DnStatePingpongMemcpy => "dn.state_pingpong_memcpy",
         }
     }
-    const COUNT: usize = 23;
+    const COUNT: usize = 27;
 }
 
 #[derive(Default, Clone)]
@@ -253,6 +290,16 @@ pub fn w5b8_enabled() -> bool {
     std::env::var("HF2Q_PROFILE_W5B8").is_ok()
 }
 
+/// True when `HF2Q_PROFILE_W5B17=1` is set in the environment.
+///
+/// Separate gate from W-5b.8 so the four `DnQkv*` / `DnStatePingpongMemcpy`
+/// sub-buckets only fire during W-5b.17 audits — W-5b.8/9/11/15/16 reruns
+/// stay binary-identical when only `HF2Q_PROFILE_W5B8=1` is set.
+#[inline]
+pub fn w5b17_enabled() -> bool {
+    std::env::var("HF2Q_PROFILE_W5B17").is_ok()
+}
+
 /// RAII guard. `Section::start(kind)` records the elapsed wall-clock
 /// into the thread-local accumulator on drop; no-ops when the env gate
 /// is off (the constructor still allocates an Instant, but that's a
@@ -265,6 +312,13 @@ pub struct Section {
 impl Section {
     pub fn start(kind: SectionKind) -> Self {
         let t0 = if w5b8_enabled() { Some(Instant::now()) } else { None };
+        Self { kind, t0 }
+    }
+
+    /// Variant gated on `HF2Q_PROFILE_W5B17=1`. Use for the four W-5b.17
+    /// `Dn*` sub-buckets so they default off independently of W-5b.8.
+    pub fn start_w5b17(kind: SectionKind) -> Self {
+        let t0 = if w5b17_enabled() { Some(Instant::now()) } else { None };
         Self { kind, t0 }
     }
 }
@@ -280,9 +334,11 @@ impl Drop for Section {
 
 /// Print a one-shot summary of all accumulated buckets to stderr and
 /// reset the thread-local state. Called from `forward_gpu_impl` after
-/// the per-layer loop completes (gated on `w5b8_enabled()`).
+/// the per-layer loop completes — gated on `w5b8_enabled() ||
+/// w5b17_enabled()` so W-5b.17 audits surface their sub-buckets even
+/// when W-5b.8 is off.
 pub fn w5b8_print_and_reset(label: &str) {
-    if !w5b8_enabled() {
+    if !w5b8_enabled() && !w5b17_enabled() {
         return;
     }
     W5B8.with(|cell| {
@@ -319,6 +375,11 @@ pub fn w5b8_print_and_reset(label: &str) {
             SectionKind::LayerPostAttnFusedNorm,
             SectionKind::LayerFfnDispatch,
             SectionKind::LayerFfnPostResidual,
+            // Wave 5b.17 DN-wrapper-overhead sub-buckets:
+            SectionKind::DnQkvDownload,
+            SectionKind::DnQkvCpuLoop,
+            SectionKind::DnQkvUploads,
+            SectionKind::DnStatePingpongMemcpy,
         ];
         for k in kinds {
             let acc = &state.accs[k.idx()];

@@ -1669,3 +1669,188 @@ bash scripts/sunset-w5b14-legacy-dense-q.sh
 ```
 
 Wave 5b.16 re-audit + sunset: **CLOSED — Phase A re-confirms W-5b.15 mix (top-3 = linear_total 7,287 ms / ffn_dispatch 4,324 ms / full_total 1,990 ms); Phase B 30/30 PASS → `HF2Q_DENSE_Q_LEGACY` removed; 295 / 295 qwen35 tests pass; W-5b.17 target = DN wrapper-overhead audit.**
+
+## Wave 5b.17 DN wrapper-overhead audit — CLOSED (top-3 identified, mlx-native split-kernel hand-off recommended)
+
+**Iter:** 2026-04-27, hf2q HEAD `46ca437` at start. Read-only audit per the W-5b.17 worker prompt: NO production source rewrites — only additive, default-off env-gated instrumentation under a SEPARATE `HF2Q_PROFILE_W5B17=1` gate (W-5b.8 reruns stay binary-identical when only `HF2Q_PROFILE_W5B8=1` is set). Goal: identify whether the 5,519 ms / 122 ms-per-layer `layer.linear_total` residual unaccounted by W-5b.16's named buckets is hf2q-recoverable wrapper overhead, mlx-native kernel floor, or post-attn FFN attribution mis-framing.
+
+### Pre-flight
+
+- vm_stat: Pages free 5,875,687 × 16 KB = **89.7 GB free** (above 32 GB threshold).
+- Concurrent processes: `mcp-brain-server` (PID 1205) at **99.7 % CPU** at session start; **paused via `kill -STOP 1205`** for the duration of all benches and resumed (`kill -CONT 1205`) at iter close per `feedback_bench_process_audit`. Without this pause, W-5b.16-baseline reproduction would be contaminated. State after `kill -STOP`: `STAT=T, %CPU=2.7` (effectively idle).
+- mlx-native HEAD `6875c925` at start AND end (no upstream drift; pure-Rust /opt/hf2q-only iter).
+- hf2q-side scope: only `src/inference/models/qwen35/{wave5b8_profile.rs, gpu_delta_net.rs}` and a new `scripts/bench-w5b17-dn-wrapper-audit.sh` — no production-path semantics changed.
+
+### Chesterton's-fence audit of existing instrumentation
+
+W-5b.8/9/11 already partition `layer.linear_total` (chunk path) into:
+
+- `layer.ops1_3` — pre-DN encoder (pre-norm + qkv proj + z proj + ssm_conv + commit_and_wait)
+- `layer.qkv_deinterleave` — CPU-only block: download_f32 of fused QKV-conv tensor + CPU triple-loop split into Q/K/V vecs + 3× upload_f32
+- `layer.chunk_prep` — chunk-prep encoder (l2_norm q/k + alpha/beta proj + q_scale + g_beta + commit_and_wait)
+- `layer.chunk_call` — `apply_gated_delta_net_chunk` total wall, further sub-divided into `chunk.gqa_expand + chunk.allocs + chunk.enc_build + chunk.commit_wait`
+- `layer.chunk_ops8_9` — post-DN encoder (ssm_norm_gate + out_proj + commit_and_wait)
+- `layer.ffn_dispatch` — MoeQ/DenseQ/Dense FFN bucket (counts BOTH DN + FA layers; the 48/64 fraction attributable to DN is the "residual" portion of `layer.linear_total`)
+
+W-5b.16 re-measured `layer.linear_total = 7,287 ms` and showed `chunk_call` is only 24 % of it (1,768 ms). The real gap is split across the OTHER per-DN-layer buckets PLUS the post-attn FFN bucket which fires inside `LayerLinearTotal` but is captured separately as `layer.ffn_dispatch`.
+
+What the existing W-5b.8 buckets do NOT capture:
+
+1. **Sub-partition of `layer.qkv_deinterleave`** (download vs CPU loop vs uploads).
+2. **The chunk-final-state → caller-state-out CPU memcpy** at `gpu_delta_net.rs:1625-1628` (`std::ptr::copy_nonoverlapping`, n_state F32 per layer × 48 layers ≈ 200 MB total at PP4096).
+
+Per Chesterton's fence I did NOT add encoder-build vs commit_and_wait sub-partitions for `ops1_3` / `chunk_prep` / `chunk_ops8_9` because the W-5b.16 wrapper-internal data already established that `chunk.enc_build` (the analog) is only **5 ms total** at PP4096, which means encoder-build wall ≪ commit_and_wait wall and the partition would just record three more "almost the entire bucket" numbers.
+
+### Wrapper call-sequence trace — `apply_gated_delta_net_chunk` (gpu_delta_net.rs:784-1110)
+
+Read-only trace of every operation between entry and return:
+
+| # | Lines | Op | Cost class | Bucket |
+|---:|---|---|---|---|
+| 1 | 887-892 | `device.alloc_buffer` × 2 (q_expanded + k_expanded F32) | Per-layer GPU alloc | chunk.gqa_expand |
+| 2 | 893-940 | CPU-side GQA tiled F32 expansion via `as_slice` + nested loop + copy_from_slice | CPU memcpy | chunk.gqa_expand |
+| 3 | 949-974 | `device.alloc_buffer` × 7 (q_bf16, k_bf16, v_bf16, g_log_decay, o_bf16, final_state, output_buf) | Per-layer GPU alloc | chunk.allocs |
+| 4 | 1005-1007 | `device.command_encoder()` | Encoder lifecycle | chunk.enc_build |
+| 5 | 1015-1044 | 3× cast F32→BF16 (q, k, v) | GPU encode-only | chunk.enc_build |
+| 6 | 1048-1057 | scalar_mul_f32 (sign-flip g) | GPU encode-only | chunk.enc_build |
+| 7 | 1061 | encoder.memory_barrier() | Encoder | chunk.enc_build |
+| 8 | 1067-1081 | dispatch_chunk_gated_delta_rule_fwd (6 Metal kernels) | GPU encode-only | chunk.enc_build |
+| 9 | 1084 | encoder.memory_barrier() | Encoder | chunk.enc_build |
+| 10 | 1087-1096 | cast BF16→F32 (output) | GPU encode-only | chunk.enc_build |
+| 11 | 1103-1104 | encoder.commit_and_wait() | GPU compute body | chunk.commit_wait |
+
+Steps 1-2 = 497 ms / 10.4 ms per layer (W-5b.17 measured); steps 3-10 = 8 ms total (W-5b.17 measured); step 11 = 1,285 ms / 26.8 ms per layer (W-5b.17 measured). The wrapper itself is **single-encoder, single-commit_and_wait** — NOT a 3-encoder pattern. There are no per-layer encoder-lifecycle hot loops to hoist; the wrapper is already optimal in its encoder count.
+
+### Per-DN-layer sub-bucket table (3 cold trials, chunk path mean)
+
+| Bucket | T1 ms | T2 ms | T3 ms | **Mean ms** | per-layer ms (×48) | Layer scope |
+|---|---:|---:|---:|---:|---:|---|
+| `layer.ops1_3` | 898.0 | 910.3 | 927.0 | **911.8** | 19.0 | DN (48) |
+| `layer.qkv_deinterleave` | 837.0 | 835.1 | 842.4 | **838.2** | 17.5 | DN (48) |
+| ├ `dn.qkv_download` | 234.4 | 237.2 | 230.3 | **233.9** | 4.9 | DN (48) |
+| ├ `dn.qkv_cpu_loop` | 202.8 | 202.9 | 202.9 | **202.9** | 4.2 | DN (48) |
+| └ `dn.qkv_uploads` | 399.6 | 394.8 | 409.0 | **401.2** | 8.4 | DN (48) |
+| `layer.chunk_prep` | 153.0 | 156.2 | 155.3 | **154.8** | 3.2 | DN (48) |
+| `layer.chunk_call` | 1790.6 | 1781.8 | 1798.0 | **1790.1** | 37.3 | DN (48) |
+| ├ `chunk.gqa_expand` | 495.5 | 495.0 | 500.1 | **496.9** | 10.4 | DN (48) |
+| ├ `chunk.allocs` | 2.9 | 2.7 | 3.0 | **2.9** | 0.06 | DN (48) |
+| ├ `chunk.enc_build` | 4.6 | 4.4 | 4.6 | **4.5** | 0.10 | DN (48) |
+| └ `chunk.commit_wait` | 1287.2 | 1279.3 | 1289.9 | **1285.5** | 26.8 | DN (48) |
+| `dn.state_pingpong_memcpy` | 14.4 | 14.6 | 14.3 | **14.4** | 0.30 | DN (48) |
+| `layer.chunk_ops8_9` | 342.9 | 343.2 | 343.1 | **343.1** | 7.1 | DN (48) |
+| **DN-attention sub-sum** | | | | **4,053** | 84.4 | (above 7 buckets) |
+| `layer.ffn_dispatch` (DN slice 48/64) | 3242.0 | 3255.8 | 3293.4 | **3,263.7** | 68.0 | DN portion of FFN bucket |
+| **Computed `layer.linear_total`** (sub-sum + DN-FFN slice) | | | | **7,317** | 152.4 | |
+| **Measured `layer.linear_total`** | 7314.9 | 7331.6 | 7403.0 | **7,349.8** | 153.1 | DN (48) |
+| **Residual** (measured − computed) | | | | **33** | 0.7 | per-layer Section overhead + timer noise |
+
+Sub-bucket coverage: 99.5 %. The previously-unattributed ~5,500 ms residual is fully accounted for: **3,264 ms = post-attn FFN dispatch (already named `layer.ffn_dispatch`); 838 + 912 + 343 + 155 + 14 ≈ 2,262 ms = the other named per-DN-layer buckets**. There is no W-5b.17 "wrapper-overhead" bucket worth instrumenting beyond what was already there — the 122 ms-per-layer claim in the worker prompt was a re-attribution artefact (the FFN bucket fires INSIDE `LayerLinearTotal`'s timer span but is captured by its own Section guard; their sums therefore both add up correctly without partitioning at the wrapper level).
+
+### Same-day llama baseline
+
+3 cold trials at PP4106:
+
+| Trial | prompt_eval ms |
+|---|---:|
+| T1 | 6,487.7 |
+| T2 | 7,033.3 |
+| T3 | 6,775.3 |
+| **Mean** | **6,765.4** |
+
+Drift vs W-5b.16's 6,650 ms: +1.7 % (within the ≤10 % gate — **PASS**).
+
+### Token-id correctness panel
+
+Token id 11 (`,`) on **6/6** trials (3 chunk + 3 autoreg) — instrumentation didn't perturb behaviour. Plus `chunk_path_first_token_matches_autoregressive_at_seq128` test PASSES on the W-5b.17 binary (max_diff 6.3075e-5 vs tol 5e-2).
+
+### Comparison vs autoregressive path (3 cold trials autoreg)
+
+| Bucket | Chunk mean ms | Autoreg mean ms | Δ ms | Note |
+|---|---:|---:|---:|---|
+| `layer.ops1_3` | 911.8 | 909.2 | +3 | path-invariant (no chunk-specific ops in 1-3) |
+| `layer.qkv_deinterleave` | 838.2 | 828.3 | +10 | path-invariant CPU round-trip |
+| `dn.qkv_download` | 233.9 | 235.6 | -2 | path-invariant |
+| `dn.qkv_cpu_loop` | 202.9 | 202.5 | +0.4 | path-invariant |
+| `dn.qkv_uploads` | 401.2 | 389.9 | +11 | path-invariant |
+| `layer.autoreg_ops5_9` | (n/a) | 4,697.6 | n/a | autoreg fused encoder for ops 5-9 |
+| `layer.chunk_prep + chunk_call + chunk_ops8_9` | 2,288.0 | (n/a) | n/a | chunk-path 3-encoder split |
+| `dn.state_pingpong_memcpy` | 14.4 | (n/a) | n/a | chunk-only (autoreg writes state_out on GPU) |
+| `layer.linear_total` | 7,349.8 | 9,610.2 | -2,260 | chunk wins by 2,260 ms / 47 ms per layer |
+| `layer.ffn_dispatch` | 4,351.5 | 4,223.8 | +128 | path-invariant within noise |
+
+**Path-invariance finding:** `qkv_deinterleave` is **identical between chunk and autoreg paths** (838 vs 828 ms; gap is trial-noise). This means the CPU GPU↔CPU round-trip is hf2q's GENERAL fused-QKV-split architecture, not a chunk-pipeline regression. **Eliminating it benefits BOTH paths.** `dn.state_pingpong_memcpy` is chunk-only but only 14 ms total (negligible; would only become interesting after the 838 ms QKV round-trip is fixed).
+
+### Structural diff vs llama.cpp's DeltaNet (`/opt/llama.cpp/src/models/delta-net-base.cpp`)
+
+llama HAS a chunk-parallel DN at `build_delta_net_chunking` (line 15). It uses ggml graph ops:
+
+- **No CPU round-trip for QKV split**: lines 9-13 use `ggml_view_4d` (zero-copy strided view) to extract Q, K, V from the fused conv1d output. The `qkv_deinterleave` bucket has **no analog in llama** — it's a hf2q architectural cost.
+- **No GQA pre-expansion**: llama's chunk kernel handles GQA broadcast via `ggml_repeat_4d` (line 99) in the graph, which compiles to a fused stride-aware Metal kernel — eliminates our `chunk.gqa_expand` 497 ms CPU memcpy.
+- **No state CPU memcpy**: state ping-pong is a graph dependency, not a CPU-pointer copy.
+
+Net: llama's per-DN-layer prefill cost benefits from ~840 + 497 + 14 = **1,351 ms of "no-CPU-round-trip" architectural advantage** that hf2q gives away by routing fused QKV through CPU. This is consistent with `feedback_walk_means_port_llama_cpp_to_rust`: the 4,824 ms apples-to-apples gap is concentrated in framework-side data-flow choices, not kernel-body compute.
+
+### Top-3 contributors to the 4,053 ms DN-attention work (excluding FFN)
+
+Ranked by absolute ms × hf2q-recoverability:
+
+| Rank | Bucket | Mean ms | Per-layer | Recoverability class |
+|---:|---|---:|---:|---|
+| **1** | `chunk.commit_wait` | **1,285.5** | 26.8 | **mlx-native floor** — GPU compute body of the chunk pipeline (6 kernels). hf2q cannot accelerate without changing kernels. ADR-015 territory. |
+| **2** | `layer.ops1_3` | **911.8** | 19.0 | **Mostly mlx-native floor** — 4 GPU kernels (pre-norm + qkv proj + z proj + ssm_conv) + commit_and_wait. encoder-build is sub-ms (per W-5b.16's analog measurement); commit dominates. ADR-015 territory unless commit can be merged with `layer.qkv_deinterleave` (impossible — qkv_deinterleave does a CPU read of the conv output). |
+| **3** | `layer.qkv_deinterleave` | **838.2** | 17.5 | **PURE hf2q-recoverable** — 100 % CPU round-trip (download 234 + cpu_loop 203 + uploads 401). No kernel body involved. **Replace CPU split with GPU split kernel** (3× `ggml_view`-equivalent) ⇒ eliminates the bucket. |
+
+Honourable mention: `chunk.gqa_expand` 496.9 ms (10.4 ms/layer × 48) is also pure hf2q-recoverable CPU memcpy; the W-5b.4 fix that introduced it is correct but the GQA-tiled expansion belongs INSIDE `dispatch_chunk_gated_delta_rule_fwd` as stride-aware index math (matching llama's `ggml_repeat_4d` graph op).
+
+### Recommendation for W-5b.18
+
+| # | Bucket | Hypothesised root cause | Measurement-first test | Likely fix pattern | Effort | Risk |
+|---:|---|---|---|---|---|---|
+| **A** | `layer.qkv_deinterleave` 838 ms | Fused QKV-conv tensor split is implemented as CPU triple-loop instead of GPU-side stride view. Inherited from the iter-3/4 era when the chunk pipeline didn't exist; never re-architected after iter-5 introduced the chunk path. | Land a `dispatch_qkv_split` mlx-native kernel (3 outputs, single dispatch, stride-only no compute) and time it against the CPU round-trip. Target ≥10× speedup (838 ms → ≤80 ms). | mlx-native split kernel (no compute, just strided copy). hf2q wrapper drops the download+CPU loop+upload blocks entirely. | **0.5–1 day** mlx-native + 0.25 day hf2q wiring. | **low** — strided copy is the simplest possible Metal kernel; hf2q-side is delete-only. |
+| **B** | `chunk.gqa_expand` 497 ms | CPU-side tiled GQA expansion at gpu_delta_net.rs:893-940 because the chunk-pipeline kernels assume `kh = i_h / group_ratio` (block convention) and we needed tiled. | Add the GQA broadcast (k_head = v_head % n_k_heads) inside `dispatch_chunk_gated_delta_rule_fwd`'s thread-group index math; verify per-DN-layer `chunk.gqa_expand` drops to <5 ms (kernel-side) or 0 (folded). | mlx-native kernel-side fix to chunk-pipeline kernels (kkt + recompute_w_u + chunk_o), no compute change just k-head index swap. | **1–2 days** mlx-native (6 kernels touched). | **medium** — touching the chunk-pipeline kernel index math has high parity-test surface. |
+| **C** | `dn.state_pingpong_memcpy` 14 ms | Chunk wrapper allocates its own `final_state` buffer instead of writing through the caller-provided `state_out` directly. | Pass `state_out` into `apply_gated_delta_net_chunk` as a `&MlxBuffer`, write `final_state` directly into it from `dispatch_chunk_gated_delta_rule_fwd`'s last kernel; verify `dn.state_pingpong_memcpy` drops to 0. | mlx-native: parameterize the chunk kernel's state output to accept caller-provided `state_out`. hf2q: thread `state_out` through wrapper. | **0.5 day**. | **low** — straightforward refactor, parity test catches mistakes. |
+
+**Combined ceiling:** A + B + C = ~1,349 ms recoverable per prefill, dropping `layer.linear_total` from 7,350 ms → ~6,000 ms (≈18 % whole-prefill wall reduction; ≈28 % apples-to-apples gap closure 4,824 → 3,475 ms).
+
+**W-5b.18 priority ordering:** A first (lowest risk, single-day, wins 838 ms), then C (half-day mop-up while A is in review, wins 14 ms), then B (multi-day, riskier, wins 497 ms but requires kernel-parity test work).
+
+### NOT recommended for W-5b.18
+
+- **Encoder-lifecycle hoisting** (single encoder per prefill chunk): the wrapper is already 1-encoder-per-layer; the 3-encoder-per-layer pattern in `forward_gpu.rs` (ops1_3 + chunk_prep + chunk_ops8_9) cannot be merged because there are CPU-only steps between them (`qkv_deinterleave` reads conv1d output on CPU). After W-5b.18-A eliminates `qkv_deinterleave`, the 3 encoders MIGHT be mergeable into 1 (saving 2× commit_and_wait), but the gain is `ops1_3 + chunk_prep + chunk_ops8_9 ≈ 1,400 ms` of which ~80 % is commit_wait (kernel body), so the saveable portion is small (~5-10 % of bucket = 70-140 ms). Defer to a hypothetical W-5b.19.
+- **Allocation arena-reset analog** (W-5b.15 pattern applied to DN scratches): chunk-wrapper allocs are 3 ms total — already negligible. No measurable benefit.
+- **BF16 storage of state across all layers** (eliminates inter-layer cast): the state ping-pong is F32 between layers but the chunk kernel writes F32 final_state directly — no cast happens at the wrapper boundary. The hypothesis was wrong.
+- **mlx-native hand-off without hf2q action** (ADR-015 immediately): not appropriate because top-3 bucket #3 is pure hf2q wrapper-side. W-5b.18-A should land on the hf2q side first.
+
+### ADR-005 closure
+
+Per worker prompt directive, ADR-005 closure paragraph added immediately above the W-5b.16 paragraph in `/opt/hf2q/docs/ADR-005-inference-server.md`.
+
+### Build + test status
+
+- `cargo build --release --bin hf2q`: succeeds, **72 warnings (W-5b.16 baseline preserved, 0 new)**.
+- `cargo test --release --bin hf2q chunk_path_first_token_matches_autoregressive_at_seq128`: **PASS** (max_diff 6.3075e-5 vs tol 5e-2).
+- `cargo test --release --bin hf2q wave5b8_profile`: **PASS** (1 / 1).
+- Token id 11 on 6/6 prefill trials.
+
+### Reproduction recipe
+
+```bash
+# Pre-flight: pause mcp-brain-server (pid varies; find via ps)
+ps aux | grep -v sccache | sort -k6 -nr | head -10
+kill -STOP <mcp-brain-server-pid>
+
+# Build (additive instrumentation, no production semantics changed)
+cargo build --release --bin hf2q
+
+# Bench: 3 cold trials × (1 hf2q chunk + 1 hf2q autoreg) + 3 cold llama at PP4106
+bash /opt/hf2q/scripts/bench-w5b17-dn-wrapper-audit.sh
+
+# Cleanup
+kill -CONT <mcp-brain-server-pid>
+```
+
+### AC-tier impact
+
+NONE (perf-bar AC 5468 / 5470 informational at full `[x]`). Audit-only iter — surfaces the W-5b.18 implementation target (mlx-native `dispatch_qkv_split` kernel + hf2q wrapper-side delete) but does not move the wall-clock by itself. The W-5b.18 recoverable ceiling (1,349 ms) is consistent with the W-5b.15 dense_q outcome (which closed 17 % of the prefill wall in a single day at low risk by attacking a similar wrapper-side architectural cost).
+
+Wave 5b.17 DN wrapper-overhead audit: **CLOSED — sub-bucket coverage 99.5 % of `layer.linear_total`; top-3 hf2q-recoverable contributors = `layer.qkv_deinterleave` 838 ms (W-5b.18-A target) / `chunk.gqa_expand` 497 ms (W-5b.18-B mlx-native) / `dn.state_pingpong_memcpy` 14 ms (W-5b.18-C cleanup); `chunk.commit_wait` 1,285 ms confirmed mlx-native floor.**

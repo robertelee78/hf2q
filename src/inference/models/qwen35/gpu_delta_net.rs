@@ -1438,21 +1438,42 @@ pub fn build_delta_net_layer(
             let _w5b8 = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::LayerQkvDeinterleave,
             );
-            let qkv_conv_cpu = download_f32(&qkv_conv_out)?;
-            let mut q_cpu = vec![0.0f32; seq * nk * dk];
-            let mut k_cpu = vec![0.0f32; seq * nk * dk];
-            let mut v_cpu = vec![0.0f32; seq * nv * dv];
-            for t in 0..seq {
-                let base = t * qkv_ch;
-                q_cpu[t * q_sp..(t + 1) * q_sp].copy_from_slice(&qkv_conv_cpu[base..base + q_sp]);
-                k_cpu[t * k_sp..(t + 1) * k_sp]
-                    .copy_from_slice(&qkv_conv_cpu[base + q_sp..base + q_sp + k_sp]);
-                v_cpu[t * (nv * dv)..(t + 1) * (nv * dv)]
-                    .copy_from_slice(&qkv_conv_cpu[base + q_sp + k_sp..base + qkv_ch]);
-            }
-            let q_gpu = upload_f32(&q_cpu, device)?;
-            let k_gpu = upload_f32(&k_cpu, device)?;
-            let v_gpu = upload_f32(&v_cpu, device)?;
+            // W-5b.17 sub-bucket: GPU→CPU download of the fused QKV tensor.
+            let qkv_conv_cpu = {
+                let _w5b17 = super::wave5b8_profile::Section::start_w5b17(
+                    super::wave5b8_profile::SectionKind::DnQkvDownload,
+                );
+                download_f32(&qkv_conv_out)?
+            };
+            // W-5b.17 sub-bucket: CPU triple-loop de-interleave into Q/K/V.
+            let (q_cpu, k_cpu, v_cpu) = {
+                let _w5b17 = super::wave5b8_profile::Section::start_w5b17(
+                    super::wave5b8_profile::SectionKind::DnQkvCpuLoop,
+                );
+                let mut q_cpu = vec![0.0f32; seq * nk * dk];
+                let mut k_cpu = vec![0.0f32; seq * nk * dk];
+                let mut v_cpu = vec![0.0f32; seq * nv * dv];
+                for t in 0..seq {
+                    let base = t * qkv_ch;
+                    q_cpu[t * q_sp..(t + 1) * q_sp]
+                        .copy_from_slice(&qkv_conv_cpu[base..base + q_sp]);
+                    k_cpu[t * k_sp..(t + 1) * k_sp]
+                        .copy_from_slice(&qkv_conv_cpu[base + q_sp..base + q_sp + k_sp]);
+                    v_cpu[t * (nv * dv)..(t + 1) * (nv * dv)]
+                        .copy_from_slice(&qkv_conv_cpu[base + q_sp + k_sp..base + qkv_ch]);
+                }
+                (q_cpu, k_cpu, v_cpu)
+            };
+            // W-5b.17 sub-bucket: 3× upload_f32 of Q, K, V back to GPU.
+            let (q_gpu, k_gpu, v_gpu) = {
+                let _w5b17 = super::wave5b8_profile::Section::start_w5b17(
+                    super::wave5b8_profile::SectionKind::DnQkvUploads,
+                );
+                let q_gpu = upload_f32(&q_cpu, device)?;
+                let k_gpu = upload_f32(&k_cpu, device)?;
+                let v_gpu = upload_f32(&v_cpu, device)?;
+                (q_gpu, k_gpu, v_gpu)
+            };
             (q_gpu, k_gpu, v_gpu)
         };
 
@@ -1622,6 +1643,11 @@ pub fn build_delta_net_layer(
                 //   caller-provided `state_out`.
                 // - Element type matches: both buffers carry F32 state of
                 //   length `n_state` per the validated shape contracts.
+                // W-5b.17 sub-bucket: chunk-final-state → state_out
+                // ping-pong CPU memcpy. n_state F32 per layer.
+                let _w5b17 = super::wave5b8_profile::Section::start_w5b17(
+                    super::wave5b8_profile::SectionKind::DnStatePingpongMemcpy,
+                );
                 unsafe {
                     let dst_ptr = state_out.contents_ptr() as *mut f32;
                     std::ptr::copy_nonoverlapping(src.as_ptr(), dst_ptr, n_state);
