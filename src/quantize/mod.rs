@@ -5827,6 +5827,92 @@ mod tests {
         }
     }
 
+    /// ADR-014 P7 iter-51 — `quantize_via_streaming_borrowed` byte-identity
+    /// to `quantize_model` on the DwqKQuantizer path.  Closes the four-arm
+    /// Phase 3 migration: K-quant codec direct (iter-48), ImatrixAdaptive
+    /// (iter-49), StaticQuantizer (iter-50), DwqK (iter-51).
+    ///
+    /// DwqK has the most complex per-tensor dispatch: sensitive vs base
+    /// routing via `is_sensitive_tensor` + `target_for(tensor_name)`,
+    /// then delegate to KQuantCodecQuantizer.  The streaming path
+    /// preserves this layer-by-layer because each tensor's name is in
+    /// the LazyTensor metadata and routes deterministically.
+    ///
+    /// Test fixture mixes a sensitive layer (Q8_0 routing) and base
+    /// layers (Q4_K routing) under DwqK::P48, asserting the two paths
+    /// (eager `quantize_model` vs streaming-borrowed) emit byte-equal
+    /// output across both routing buckets.
+    #[test]
+    fn quantize_via_streaming_borrowed_byte_identical_under_dwq_k() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::TensorMap;
+        use crate::quantize::dwq_k_quantizer::{DwqKQuantizer, DwqKVariant};
+
+        const QK_K: usize = 256;
+
+        let make_payload = |seed: f32| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(QK_K * 2);
+            for i in 0..QK_K {
+                let v = (i as f32 / QK_K as f32) * 2.0 - 1.0 + seed * 0.001;
+                bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+            }
+            bytes
+        };
+
+        // DwqK uses HF naming (`model.layers.<N>.…`).  Mix sensitive
+        // (layer 5 → Q8_0) + base (layer 0/10 → Q4_K) buckets under P48.
+        let tensors: Vec<&str> = vec![
+            "model.layers.0.self_attn.q_proj.weight",   // base → Q4_K
+            "model.layers.5.self_attn.q_proj.weight",   // sensitive → Q8_0
+            "model.layers.10.mlp.down_proj.weight",     // base → Q4_K
+        ];
+
+        let mut tensor_map = TensorMap::new();
+        for (i, name) in tensors.iter().enumerate() {
+            tensor_map.insert(crate::ir::TensorRef {
+                name: name.to_string(),
+                shape: vec![1, QK_K],
+                dtype: DType::F16,
+                data: make_payload(i as f32),
+            });
+        }
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+        let q1 = DwqKQuantizer::new(DwqKVariant::P48, &[5..=5], CalibrationData::None);
+        let q2 = DwqKQuantizer::new(DwqKVariant::P48, &[5..=5], CalibrationData::None);
+
+        let eager = quantize_model(&tensor_map, &metadata, &q1, 0, 0, &progress)
+            .expect("quantize_model");
+        let borrowed =
+            quantize_via_streaming_borrowed(&tensor_map, &metadata, &q2, 0, 0, &progress)
+                .expect("quantize_via_streaming_borrowed");
+
+        for tname in &tensors {
+            let e = eager.tensors.get(*tname).unwrap();
+            let b = borrowed.tensors.get(*tname).unwrap();
+            assert_eq!(e.quant_info.ggml_type, b.quant_info.ggml_type, "{tname}");
+            assert_eq!(
+                e.data, b.data,
+                "{tname}: bytes differ — DwqK streaming path lost byte-identity vs eager"
+            );
+        }
+
+        // Cross-check: the sensitive layer 5 emitted Q8_0 (272 bytes for
+        // 256 elements), the base layers emitted Q4_K (144 bytes).  Locks
+        // the sensitive/base routing decisions are firing in BOTH paths.
+        let s = borrowed
+            .tensors
+            .get("model.layers.5.self_attn.q_proj.weight")
+            .unwrap();
+        assert_eq!(s.quant_info.ggml_type.as_deref(), Some("Q8_0"));
+        let b0 = borrowed
+            .tensors
+            .get("model.layers.0.self_attn.q_proj.weight")
+            .unwrap();
+        assert_eq!(b0.quant_info.ggml_type.as_deref(), Some("Q4_K"));
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
