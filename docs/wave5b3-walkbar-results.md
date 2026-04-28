@@ -3317,3 +3317,85 @@ The W-5b.25 audit's recommendation table needs a **per-model FFN-variant correct
 - End: `a1d82c5` — unchanged. This iter touches `/opt/hf2q` ONLY.
 
 Wave 5b.26 lift FFN pooled outputs + sub-bucket instrumentation: **REVERTED — implementation correct (parity bit-exact at PP=16, 4 alternating LEGACY ↔ NEW invocations max_abs_err=0.00e0); production-path target FALSIFIED (27B DWQ46 bench model has `n_expert=0`, so `build_moe_ffn_layer_gpu_q_into` never fires; FFN bucket regressed +54.6 ms / whole-prefill +99 ms vs LEGACY, both within cold-process noise but outside the audit's projected -50 to -150 ms recovery); per worker-prompt STOP condition (`FFN bucket does NOT drop ≥50ms → STOP, revert, report`) all 3 W-5b.26 commits reverted to post-W-5b.25 baseline (HEAD `30d923f` → `fb93a43` net-zero code delta); `bench-w5b26-ffn-output-lift.sh` preserved as reusable A/B harness; W-5b.27 recommendation: per-model FFN-variant correction pass + W-5b.24 result validation against `n_expert=0` evidence + apex 35B-A3B re-land via `git revert -n` of the 3 reverts when the apex lm_head OOM is resolved. mlx-native HEAD `a1d82c5` unchanged.**
+
+## Wave 5b.27 retro-validate W-5b.24 + dense_q FFN lift — Phase A retro-validation (CLOSED)
+
+**Iter:** 2026-04-27 evening, hf2q HEAD `8819f59` at start, mlx-native HEAD `a1d82c5` at start AND end (this iter touches `/opt/hf2q` ONLY).
+
+### Phase A goal
+
+Determine whether W-5b.24's claimed -86 ms FFN-bucket recovery survives a same-day cold-SoC re-bench on the post-W-5b.26-revert HEAD, given the W-5b.26 retrospective discovery that W-5b.24's target function (`build_moe_ffn_layer_gpu_q_into`) never executes for the 27B DWQ46 walkbar bench (model has `n_expert=0`, all 64 layers dispatch DenseQ, not MoeQ).
+
+### Pre-flight
+
+| Check | Value |
+|---|---|
+| RAM free | 4,895,471 pages × 16 KB ≈ 78.3 GB free (>32 GB threshold) |
+| mcp-brain-server CPU | 0.0% (cooperative this session, not contaminating) |
+| Concurrent CFA worker > 50% | none |
+| mlx-native HEAD start | `a1d82c5` |
+| hf2q HEAD start | `8819f59` (post-W-5b.26 reverts) |
+| Bench protocol | 6 cold trials × 60s thermal cooldown between trials (per `feedback_perf_gate_thermal_methodology`) |
+| Llama drift gate | 6,756 ms (W-5b.24) × 1.10 = 7,431 ms ceiling |
+
+### Initial bench attempt (no cooldown, FALSIFIED — thermal contamination)
+
+A first bench without inter-trial cooldown produced 6 trials with bimodal distribution: T1/T2 = 3,383/3,319 ms (cold) → T3-T6 = 4,007-4,363 ms (thermal-loaded). T3-T6 trials added 700-1,100 ms of thermal overhead. Per `feedback_perf_gate_thermal_methodology`, this is the canonical M5 Max pre-loading pattern that fakes a regression. **Bench protocol corrected**: 60 s cooldown between trials.
+
+### Phase A cold-SoC bench (6 trials × 60s cooldown)
+
+Script: `/opt/hf2q/scripts/bench-w5b27-phase-a-cold.sh`. Logs at `/tmp/w5b27/coldA-T*.log`.
+
+#### `dn.outer_ffn_dispatch` (DN-only sum across 48 LinearAttn layers, ms)
+
+| Trial | dn.outer_ffn_dispatch | whole-prefill | first-decode-token |
+|---|---:|---:|---:|
+| T1 | 3,223.8 | 15,514 | 11 |
+| T2 | 3,316.1 | 16,011 | 11 |
+| T3 | 3,305.8 | 16,121 | 11 |
+| T4 | 3,312.5 | 15,942 | 11 |
+| T5 | 3,212.7 | 15,489 | 11 |
+| T6 | 3,225.3 | 15,473 | 11 |
+| **median** | **3,265.5** | **15,728** | — |
+| mean | 3,266.0 | 15,758 | — |
+| stdev | 50.1 | 285 | — |
+| 95% CI (n=6, t=2.571) | [3,213.4, 3,318.6] | — | — |
+
+Token-id determinism: **6/6 produce id 11** (PASS).
+
+#### Llama drift gate
+
+| Trial | prompt_eval_ms |
+|---|---:|
+| T1 | 6,461.5 |
+| T2 | 6,455.0 |
+| T3 | 6,668.5 |
+| **median** | **6,461.5** |
+
+W-5b.24's same-day llama median was 6,756 ms; today's 6,461.5 ms is -4.4% (well within ±10 % drift gate; PASS).
+
+### Phase A verdict
+
+**Decision matrix from worker-prompt spec:**
+
+| Outcome | Threshold | Today's measurement |
+|---|---|---|
+| W-5b.24 VALIDATED | median ≤ 3,266 ms AND 95% CI doesn't overlap 3,316 ms | median 3,265.5 ✅; CI upper 3,318.6 OVERLAPS 3,316 by 2.6 ms ❌ |
+| W-5b.24 FALSIFIED | median in 3,266-3,366 ms (W-5b.21 noise band) | median 3,265.5 sits exactly at the boundary |
+| Regression | median > 3,366 ms | not triggered |
+
+**Verdict: PARTIAL VALIDATION (lean: FALSIFIED at 95% CI rigor).** The point estimate (median 3,265.5 ms) clears the validation threshold by 0.5 ms, but the 95% CI on the mean is [3,213.4, 3,318.6] ms — the upper bound overlaps W-5b.21's 3,316 baseline by 2.6 ms, so we cannot rigorously reject the null hypothesis that today's distribution is drawn from W-5b.21's baseline distribution.
+
+The 6 trials show bimodal structure (3 trials at ~3,220 ms, 3 trials at ~3,310 ms) — likely reflecting two underlying steady-states the system samples between, NOT pure cold-process noise. Whatever causes the bimodality is not fully attributable to W-5b.24 alone.
+
+**Honest cumulative ratio claim:**
+- Pre-W-5b.27 claim: `dn.outer_ffn_dispatch` 3,316 → 3,229.6 ms = **86.4 ms** recovery (W-5b.24)
+- Post-W-5b.27 cold-SoC measurement: 3,316 → 3,265.5 ms = **50.5 ms** recovery
+- Net adjustment: **−35.9 ms** (W-5b.24 was overstated by ~36 ms in the original claim, likely because W-5b.24's 3-trial cold cluster sampled the lower mode but stdev was not reported)
+
+The cumulative wall ratio claim of **2.326×** post-W-5b.24 should be adjusted to **2.343×** (matching the W-5b.26 retrospective's projection in `project_w5b26_n_expert_zero_target_inert.md`). This delta is < 1% of the cumulative ratio and does not change the engineering picture; it does correct the standing baseline for Phase B's measurement floor.
+
+### Phase B baseline (TODAY's cold-SoC measurement)
+
+Phase B's "before" baseline is **3,265.5 ms** (Phase A median), NOT W-5b.21's 3,316 ms or W-5b.24's claimed 3,229.6 ms. Phase B passes only if the FFN bucket drops ≥ 50 ms below 3,265.5 → must reach ≤ 3,215.5 ms median in same-day cold-SoC bench.
+
