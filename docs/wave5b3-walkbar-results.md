@@ -2679,3 +2679,222 @@ bash scripts/bench-w5b22-residual-audit.sh
 - N/A. Pure-Rust /opt/hf2q-only iter; mlx-native is read-only.
 
 Wave 5b.22 layer.linear residual audit: **CLOSED — read-first audit falsified W-5b.21's "q/k/v/o projection mat-mul wall" hypothesis (DeltaNet has no separate q/k/v/o); 4 new env-gated `DnOuter*` sub-buckets attribute the 3,318 ms residual to a single dominant contributor — `dn.outer_ffn_dispatch` 3,316 ms / 69.08 ms per DN layer / 99.9 % of residual; this is the dwq46 `mul_mm_id` MoE expert mat-mul kernel (already-known ADR-015 W2b territory per ADR-012 closure's 0.91× MoE parity gap); W-5b.23 = ADR-015 hand-off doc, not hf2q implementation; hf2q wrappers exhausted of recoverable headroom across `chunk_call` / `qkv_split` / `gqa_expand` / `dense_q_fused_residual_norm` / `outer_ffn_dispatch`; 295/295 qwen35 tests PASS; 0 NEW warnings (72 baseline preserved); 3/3 token id 11; llama drift −0.40 %; mlx-native HEAD `826edff` unchanged.**
+
+## Wave 5b.23 mul_mm_id cross-fence audit — CLOSED (W-5b.22 attribution falsified; kernel exec is 21.4 % of bucket, not 99.9 %)
+
+**Iter:** 2026-04-27, hf2q HEAD `1515d8d` at start, mlx-native HEAD `826edff` at start. Cross-fence audit of W-5b.22's "99.9 % in `mul_mm_id`" attribution per the worker prompt's three-phase decision tree (kernel byte-identical verification + production-shape criterion bench + attribution split). Read-only on production source in BOTH repos; one additive criterion bench under `/opt/mlx-native/benches/`.
+
+### Pre-flight
+
+- vm_stat: Pages free 5,023,096 × 16 KB = **76.6 GB free** (above 32 GB threshold).
+- Concurrent processes: WebKit WebContent (PID 78247) at **65.1 % CPU** at session start; **paused via `kill -STOP 78247`** for the duration of all benches and resumed (`kill -CONT 78247`) at iter close per `feedback_bench_process_audit`. `mcp-brain-server` was 0.0 % CPU at start (idle), no pause needed. Without WebKit pause every wall-time number is contaminated.
+- mlx-native HEAD `826edff` at start (post-bench HEAD will reflect the additive bench commit; production source untouched). hf2q HEAD `1515d8d` at start AND end (read-only on hf2q this iter).
+- Concurrent CFA worktrees verified clean of `src/shaders/` and `src/ops/` and `benches/` files (`adr-015-w2b/claude` and `adr-015-w2b/codex` both at `adf7ee0`, no overlapping uncommitted changes per `git status --short`).
+- W-5b.23 scope: `/opt/mlx-native/benches/bench_mul_mm_id_qwen36_ffn.rs` (additive), `/opt/mlx-native/Cargo.toml` (1 `[[bench]]` entry), and these docs.
+
+### Phase 1: byte-identical claim verification (read-only)
+
+`git -C /opt/mlx-native log --since="2026-04-20" --oneline ... -- src/shaders/quantized_matmul*.metal src/ops/quantized_matmul*.rs` lists 6 changes since the 2026-04-20 byte-identical audit:
+- `4efeec0 feat(quantized_matmul_id_ggml): fused-SwiGLU Q4_0 mv_id kernel + parity test` — additive (separate kernel name).
+- `35024a7 docs(quantized_matmul_id): record z-routing dispatch hypothesis falsification` — docs only.
+- `f56e81f docs(quantized_matmul_id): record (32,2) vs (8,8) M5 Max bench result` — docs only.
+- `dd087a9 feat(mlx-native): Q5_K dequant + matmul_id kernel for MoE expert routing` — Q5_K only (not in dwq46 path).
+- `2328e14 feat(adr-013 P5): Q5_K + I16 GGUF type recognition (apex-unblock)` — type-recognition only.
+- `028f45e feat(qmatmul): bf16-input perm021 tensor-mm variant (Wave P4.19)` — non-id variant.
+
+**No drift in the dwq46-relevant `kernel_mul_mm_id_q4_0_f32` since 2026-04-20.**
+
+Side-by-side read of `/opt/mlx-native/src/shaders/quantized_matmul_id_mm.metal:288-477` against `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:9719-10021` confirms structural byte-equivalence on the simdgroup_8x8 path:
+- Tile constants `NR0=64`, `NR1=32`, `NK=32`, `NL0=2`, `NL1=4`, `THREADS_PER_TG=128` — match.
+- A-tile dequant + stage loop, B-tile stage loop, MMA accumulate (4×2 → 8 outputs per simdgroup, 4 simdgroups per threadgroup), shmem write-back — match.
+- map0 preprocessor structure (`hf2q_mul_mm_id_map0_impl<short ne20>` vs `kernel_mul_mm_id_map0<short ne20>`) — match.
+
+**Three meta-differences vs llama.cpp documented (none load-bearing on the simdgroup_8x8 path):**
+1. **Tensor-API path (Metal 4 TensorOps):** llama.cpp has a `#ifdef GGML_METAL_HAS_TENSOR` branch using `mpp::tensor_ops::matmul2d` — mlx-native has the equivalent in a SEPARATE shader file (`quantized_matmul_id_mm_tensor.metal`, 297 lines), gated via `probe_tensor_mm_id` in `quantized_matmul_id_ggml.rs:108-118`. Both targets effectively support the M5 Max tensor-cores route — equivalent capability, different file layout.
+2. **`FOR_UNROLL` macro:** llama.cpp uses `FOR_UNROLL` on the load/store loops in the simdgroup path; mlx-native uses plain `for`. Both will be unrolled by the Metal compiler at -O3 (the IL doesn't expose this difference to the GPU).
+3. **`FC_mul_mm_bc_inp` function constant:** llama.cpp has a runtime function-constant toggle for input bounds-checking; mlx-native always uses bounds-checked input loads (`(loop_k + iy + i < args.ne00) ? *((device float *) y + i) : 0.f`). Conservative; correctness-equivalent.
+
+**Phase 1 conclusion: byte-equivalent at the simdgroup_8x8 path. Llama.cpp's TENSOR_API path equivalent exists in mlx-native via a separate shader; the dispatcher probes for it on first call.** Drift case (a) per worker-prompt decision tree is **FALSIFIED**.
+
+### Phase 1.5: Production-path determination (which kernel actually fires)
+
+Read of `/opt/hf2q/src/inference/models/qwen35/gpu_ffn.rs:1462-1583` (`build_moe_ffn_layer_gpu_q_into`) vs `/opt/mlx-native/src/ops/quantized_matmul_id_ggml.rs:246-256` (router):
+
+```
+if params.n_tokens > MM_ID_ROUTING_THRESHOLD (8)
+    && (params.top_k == 1 || params.top_k == 8)
+    && params.k >= 32
+    && params.ggml_type != GgmlType::Q5_K
+{
+    return dispatch_id_mm(...)   // kernel_mul_mm_id_q4_0_f32
+}
+dispatch_id_mv(...)              // kernel_mul_mv_id_q4_0_f32
+```
+
+At PP4106 prefill: n_tokens=4106 > 8, top_k ∈ {1, 8}, K ∈ {2048, 512} ≥ 32, qtype=Q4_0 → **`dispatch_id_mm` fires** (kernel_mul_mm_id_q4_0_f32 / kernel_mul_mm_id_q4_0_tensor_f32). Decode (n_tokens=1) routes to mv_id instead.
+
+The W-5b.22 PP4106 measurement is therefore on the **mm_id (prefill)** kernel — NOT the mv_id (decode) kernel that the `project_moe_dwq46_parity_gap_diagnostics` 4-acc ILP fix targeted. Two distinct kernels.
+
+### Phase 1.6: Production GGUF expert-tensor types (direct inspection)
+
+Direct GGUF binary read of `/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46.gguf` (Python struct unpack):
+- `blk.0.ffn_gate_exps.weight`: type=**Q4_0** dims=`[2048, 512, 256]`
+- `blk.0.ffn_up_exps.weight`:   type=**Q4_0** dims=`[2048, 512, 256]`
+- `blk.0.ffn_down_exps.weight`: type=**Q4_0** dims=`[512, 2048, 256]`
+- Type counts across all 733 tensors: F16: 1, F32: 221, **Q4_0: 487**, Q6_K: 24
+
+**All 3 expert tensors are Q4_0**, not Q8_0 (the `weight_loader.rs:657-658` Q8_0 lines are for a re-emit path, not GGUF-load).
+
+### Phase 2: Criterion bench at production shape
+
+Bench file: `/opt/mlx-native/benches/bench_mul_mm_id_qwen36_ffn.rs` (additive; pure read-only on production source). Three shape cases from `gpu_ffn.rs:1492-1560` cross-referenced with the GGUF dims:
+
+| label | n_tokens | top_k | N | K | qtype | per-layer | layers |
+|---|---:|---:|---:|---:|:---|---:|---:|
+| FFN_gate | 4106 | 8 | 512 | 2048 | Q4_0 | 1 | 48 |
+| FFN_up   | 4106 | 8 | 512 | 2048 | Q4_0 | 1 | 48 |
+| FFN_down | 32848 (= 4106 × 8) | 1 | 2048 | 512 | Q4_0 | 1 | 48 |
+
+Routing: ids drawn `i % n_experts` (round-robin uniform; per-expert routed count ≈ 4106 × 8 / 256 = 128 rows, well above NR1=32 — every threadgroup in the dispatch grid runs).
+
+Methodology: 3 warmup iters (compile pipelines + thermal stabilisation), 10 measure iters, median per call, 3 cold trials. Pooled scratch (one-time `IdMmScratch::alloc` outside the timing loop) — measures **kernel exec only**, not the per-call `IdMmScratch::alloc` overhead the production `quantized_matmul_id_ggml` (non-pooled) entry point pays.
+
+**Trial-by-trial median ms (across 10 measure iters per trial):**
+
+| shape | T1 | T2 | T3 | median across trials | TFLOP/s | per-prefill ms (× 48) |
+|---|---:|---:|---:|---:|---:|---:|
+| FFN_gate | 2.513 | 2.525 | 2.498 | **2.51** | 27.4 | 120.6 |
+| FFN_up   | 2.525 | 2.514 | 2.499 | **2.51** | 27.3 | 120.7 |
+| FFN_down | 9.770 | 9.770 | 9.749 | **9.77** | 7.05 | 469.0 |
+| **Total** | 14.81 | 14.81 | 14.75 | **14.79** | — | **710.3** |
+
+**Per-prefill kernel exec sum (3 calls × 48 layers = 144 dispatches): 710 ms.**
+
+### Phase 3: Attribution split
+
+Per W-5b.23 worker-prompt decision tree:
+
+```
+W-5b.22 dn.outer_ffn_dispatch          = 3,316 ms  (observed bucket)
+mm_id kernel exec at production shape  =   710 ms  (this bench)
+                                       ----------
+                                         2,606 ms  (78.6 % of bucket)
+                                       ==========
+```
+
+**`710 / 3,316 = 21.4 %`. Kernel exec is ONE-FIFTH of the bucket, not 99.9 %.**
+
+**The W-5b.22 attribution "99.9 % is `mul_mm_id`" is FALSIFIED.** The remaining 78.6 % (2,606 ms) is invocation-pattern overhead and other dispatches inside `build_moe_ffn_layer_gpu_q_into`:
+
+| Component (per `gpu_ffn.rs:1462-1583`) | per-layer count | × 48 | hf2q-recoverable? |
+|---|---:|---:|:---|
+| 4 dense `proj_pooled` (router + sh_logit + a_s + b_s, all f32 bf16-cast) | 4 | 192 | candidate fusion |
+| `dispatch_moe_softmax_topk` | 1 | 48 | already W-5b.14 fused into encoder |
+| 2 `dispatch_silu_mul` (shared + main) | 2 | 96 | candidate fusion (Q4_0 fused-SwiGLU exists, falsified for decode 2026-04-26 — re-test for prefill?) |
+| 1 `proj_pooled` shared_down | 1 | 48 | dense f32 matmul; already pooled |
+| 3 `quantized_matmul_id_ggml` (gate / up / down — UNPOOLED entry, **per-call `IdMmScratch::alloc` = 2 device allocs each**) | 3 | 144 | **switch to pooled `_pooled` entry** — 288 device allocs eliminated |
+| 1 `dispatch_moe_weighted_reduce` | 1 | 48 | already encoder-internal |
+| 5 `enc.memory_barrier()` | 5 | 240 | already at floor |
+| 9 `pooled_alloc_buffer` (ids/weights/gate_all/up_all/h_all/y_all/h_s/out + 2 silu_params) | 9 | 432 | already pooled — at floor |
+| 1 `enc.commit_and_wait()` | 1 | 48 | already W-5b.14/15 fused (single CB per layer) |
+
+**Drift case attribution (per worker-prompt decision tree):**
+- (a) Byte-identical drift since 2026-04-20: **FALSIFIED** (Phase 1).
+- (b) Bucket attribution captures invocation-pattern overhead, not pure kernel exec: **CONFIRMED** at 78.6 %.
+- (c) hf2q invokes the kernel with sub-optimal parameters at production shape: partial — the **non-pooled** `quantized_matmul_id_ggml` entry is used in `gpu_ffn.rs:1492-1560`, costing ~288 device allocations per prefill that the `_pooled` entry would amortise.
+- (d) The W-5b.22 attribution itself was wrong: **CONFIRMED**. W-5b.22 inferred from a wide bucket; this iter is the first per-kernel measurement at production shape.
+
+### Phase 3.5: Structural diff vs llama.cpp's invocation pattern
+
+Read of `/opt/llama.cpp/src/llama-graph.cpp` MoE FFN call site shows llama.cpp's MoE forward composes via `ggml_mul_mat_id` ops in a graph; `ggml-metal-ops.cpp:2353` runs `ggml_metal_op_concurrency_reset` between map0 and mm_id (mirrored in mlx-native via `enc.memory_barrier()` at `quantized_matmul_id_ggml.rs:1000`). llama.cpp dispatches the whole prefill graph via 1-2 command buffers per token batch (per the upstream `n_cb=1 or 2` comment cited in `gpu_ffn.rs:1349`); hf2q **already** issues 1 CB per MoE layer post-W-5b.14/15 fusion. Per-CB count is at parity with llama.cpp's regime.
+
+**Where llama.cpp differs:**
+- **Fused `gate_up_exps` tensor (1 mm_id instead of 2):** `llama-graph.cpp:1512-1535` accepts a fused gate||up expert tensor when present; halves the gate/up dispatch count (2 → 1) for that pair. Per `ADR-012-qwen35moe-conversion.md` line 13: "Verified absent in our dwq46 GGUF — only `ffn_gate_exps` + `ffn_up_exps` exist as separate tensors". hf2q would need a new convert-pipeline emit to use this. Same upstream constraint applies to llama.cpp on the same GGUF, so this is NOT the live wall-time gap source.
+- **Concurrency reset granularity:** llama.cpp inserts concurrency_reset only between `map0 → mm_id` per matmul-id op; mlx-native's `enc.memory_barrier()` is identical placement. Equivalent.
+
+**Phase 3.5 conclusion: llama.cpp's invocation pattern is structurally equivalent to hf2q's W-5b.14/15 fused-CB pattern on this GGUF. The wall-time 3,316 ms vs llama's 6,761 ms total prefill includes the SAME mm_id kernel work for both implementations; the gap lives in dispatches and overhead OUTSIDE the mm_id kernel.**
+
+### Phase 4: Recommendation table for W-5b.24
+
+| Drift case | Status | Recovery target | ms budget | Effort | Risk |
+|---|---|---|---:|---|---|
+| (a) mm_id kernel byte-drift since 2026-04-20 | **FALSIFIED** (Phase 1) | n/a | 0 | n/a | n/a |
+| (b) Bucket captures invocation-pattern, not pure kernel | **CONFIRMED** (Phase 2) | hf2q invocation-fusion in `build_moe_ffn_layer_gpu_q_into` | up to 2,606 ms | medium-high | medium |
+| (c) Non-pooled `quantized_matmul_id_ggml` allocates scratch per call | **CONFIRMED** | switch hf2q to `quantized_matmul_id_ggml_pooled` (entry already exists at `quantized_matmul_id_ggml.rs:269`) | likely 50-150 ms (288 device allocs eliminated) | LOW | LOW |
+| (d) W-5b.22 attribution itself wrong | **CONFIRMED** | per-kernel instrumentation at the boundary between kernel exec and dispatch overhead | n/a (this iter) | n/a | n/a |
+
+**W-5b.24 recommendation: hf2q invocation-fusion iter, NOT ADR-015 W2b kernel work.** The 2,606 ms residual is hf2q-recoverable; the kernel itself is at ~27 TFLOP/s gate/up (within the M5 Max Q4_0 envelope per W-5b.13's dense-mm 36-40 TFLOP/s ceiling at larger M=4096; gate/up is M=4106 N=512 small-N regime where TFLOP/s is BW-not-MMA bound).
+
+**Concrete W-5b.24 candidate fixes (ordered by ms-recovery-per-effort):**
+
+1. **Switch `gpu_ffn.rs:1492-1560` to `quantized_matmul_id_ggml_pooled`** (exists since ADR-011 P3b). Pre-allocate one `IdMmScratch` at prefill start sized to `(n_experts=256, max_n_tokens=4106 or 32848 — pick the larger)`; pass through to all 3 mm_id calls per layer × 48 layers. Eliminates 288 device allocations per prefill at near-zero risk. **Estimated recovery: 50-150 ms.**
+
+2. **Per-layer instrumentation INSIDE `build_moe_ffn_layer_gpu_q_into`** to measure each of the 8 distinct dispatches separately (router proj, sh_logit proj, a_s proj, b_s proj, softmax_topk, silu_mul × 2, gate mm_id, up mm_id, shared_down proj, down mm_id, weighted_reduce). Mirror the W-5b.22 wave5b8_profile pattern with `MoeBuild*` SectionKind variants. Without this, the 2,606 ms residual is still bucketed; W-5b.24 cannot prioritise within it. **Estimated recovery: 0 ms (instrumentation only); enables W-5b.25 prioritisation.**
+
+3. **Re-evaluate `quantized_matmul_id_swiglu_q4_0` (fused SwiGLU mv kernel) for prefill mm_id path.** The 2026-04-26 falsification was on **decode** (mv_id) where it regressed −1.5 % per `gpu_ffn.rs:1527-1538`. The mm_id (prefill) path has different bandwidth dynamics — fusing `silu_mul` into the down mm_id call eliminates 1 dispatch + 1 memory_barrier + 1 buffer (`h_all_buf`). 9th falsification on decode does NOT bind prefill. **Estimated recovery: speculative; needs A/B bench at pp4106.**
+
+4. **Pre-allocate the 9 `pooled_alloc_buffer` outputs once per prefill** (currently allocated per layer × 48). Already pooled → recycled, but `pooled_alloc_buffer` has a per-call lookup cost. Lift one set of (ids_buf / weights_buf / gate_all / up_all / h_all / y_all / h_s / out_buf / silu_params) to the prefill scope and reuse across all 48 layers. **Estimated recovery: 50-150 ms.**
+
+5. **Batch the 4 router/shared dense projections into 1 dispatch.** Concatenate (router || sh_logit || a_s || b_s) into a single `[hidden, n_experts + 1 + m_sh + m_sh]` weight matrix per layer; one `proj_pooled` call instead of 4. Halves dispatch count for that phase. **Estimated recovery: speculative; needs weight-layout change at convert time.**
+
+**STOP-condition guard: mm_id kernel-internal optimisation (ADR-015 W2b) is NOT W-5b.24's target.** The kernel is at TFLOP/s parity with the M5 Max Q4_0 BW-bound envelope at production shape; per `project_metal_compiler_auto_optimizes_static_levers.md` 9 prior static-evidence kernel hypotheses have been falsified. Kernel work would cap at ~710 ms recovery (full kernel time elimination), whereas invocation-fusion targets 2,606 ms. **Wrong-target risk applies to W-5b.22's hand-off recommendation, not this audit.**
+
+### Same-day llama baseline check
+
+Not run (this iter is read-only on production source; no AC change). Last same-day baseline (W-5b.22, 2026-04-28) was 6,734 ms / drift −0.40 % — within ≤ 10 % gate.
+
+### Token-id correctness panel
+
+Not run (no production source changes; preserved by construction). Last 3/3 PASS at token id 11 from W-5b.22.
+
+### Closure rule check
+
+| rule | target | observed | verdict |
+|---|---|---|---|
+| 0 NEW clippy warnings (mlx-native) | 126 baseline | 126 (no `bench_mul_mm_id_qwen36_ffn` warnings in clippy filter) | **PASS** |
+| 0 NEW clippy warnings (hf2q) | (untouched) | (untouched) | **PASS** |
+| 295/295 qwen35 tests | (untouched) | (untouched) | **PASS by construction** |
+| Token-id correctness | (untouched) | (untouched) | **PASS by construction** |
+
+### Methodology caveats
+
+- M5 Max stage-boundary-only sampling (`project_m5max_no_dispatch_boundary_sampling`): per-dispatch GPU timestamps are hardware-impossible. This bench uses CPU wall-clock around `commit_and_wait` — captures kernel exec + commit overhead but not per-stage GPU timestamps. The 710 ms is therefore an **upper bound** on pure kernel exec; 2,606 ms residual is a **lower bound** on hf2q-recoverable invocation overhead.
+- The bench uses `dispatch_id_mm_for_test` (= the same code path as `dispatch_id_mm_pooled`); production calls `quantized_matmul_id_ggml` → `dispatch_id_mm` (un-pooled, allocates `IdMmScratch` per call). The bench is therefore **conservative** on alloc cost — production has additional 144 calls × 2 allocations = 288 per-prefill device allocations not captured here.
+- Bench uses uniform `i % n_experts` ids; production routing is content-derived. For dwq46 we don't know the empirical distribution but at PP4106 with 4106 × 8 = 32848 routed rows / 256 experts, even sharply non-uniform routing keeps min-per-expert ≫ NR1=32 in the typical case.
+- The `48 DN layers` count comes from W-5b.22; config.json reports `num_hidden_layers=40`. The 48 number is likely the W-5b.22 per-doc count (DN-only) vs the model's hybrid 16 FA + 24 DN split; or possibly counts MTP layers separately. We use 48 here so the comparison is apples-to-apples with W-5b.22's bucket; if the true count is 40, kernel-exec ms scales to ~592 ms / `592 / 3,316 = 17.9 %` — still firmly in the "kernel is a small fraction" conclusion.
+
+### Reproduction recipe
+
+```bash
+# Pre-flight
+vm_stat | head -3
+ps aux | grep -v sccache | sort -k6 -nr | head -10
+# Pause anything > 50 % CPU
+# kill -STOP <pid>
+
+cd /opt/mlx-native
+RUSTC_WRAPPER="" cargo bench --bench bench_mul_mm_id_qwen36_ffn --no-run
+for i in 1 2 3; do
+  echo "=== TRIAL $i ==="
+  ./target/release/deps/bench_mul_mm_id_qwen36_ffn-*
+  sleep 2
+done
+
+# Resume paused processes
+# kill -CONT <pid>
+```
+
+### Files touched
+
+- `/opt/mlx-native/benches/bench_mul_mm_id_qwen36_ffn.rs` (NEW, ~250 lines, additive)
+- `/opt/mlx-native/Cargo.toml` (+4 lines: 1 `[[bench]]` entry)
+- `/opt/hf2q/docs/wave5b3-walkbar-results.md` (this section)
+- `/opt/hf2q/docs/ADR-005-inference-server.md` (closure paragraph update)
+
+### mlx-native HEAD start vs end
+
+- Start: `826edff` (feat dispatch_repeat_tiled_f32)
+- End: post-bench commit `feat(mlx-native): add mul_mm_id Qwen3.6 FFN shape bench for ADR-005 W-5b.23 cross-fence audit`
+- Production source untouched; only `benches/` + `Cargo.toml` `[[bench]]` registration.
+
+Wave 5b.23 mul_mm_id cross-fence audit: **CLOSED — Phase 1 byte-identical at simdgroup_8x8 path (case (a) FALSIFIED); Phase 2 production-shape kernel exec 710 ms vs W-5b.22's 3,316 ms bucket (21.4 %); Phase 3 W-5b.22's "99.9 % in mul_mm_id" attribution FALSIFIED — case (b) + (c) + (d) CONFIRMED, 78.6 % (2,606 ms) is invocation-pattern + dense-proj + alloc overhead inside `build_moe_ffn_layer_gpu_q_into`, NOT kernel work; W-5b.24 = hf2q invocation-fusion iter (NOT ADR-015 W2b); 5 candidate fixes ranked by ms-recovery-per-effort, top recommendation = switch `gpu_ffn.rs:1492-1560` to `quantized_matmul_id_ggml_pooled` (eliminates 288 device allocs per prefill, est. 50-150 ms recovery, near-zero risk); methodology caveats documented (M5 Max stage-boundary-only sampling, conservative bench harness vs un-pooled production); 0 NEW clippy warnings either repo; mlx-native HEAD `826edff` start → bench commit; hf2q HEAD `1515d8d` unchanged.**
