@@ -78,22 +78,6 @@ use super::ffn::{DenseFfnShape, DenseFfnWeights, MoeFfnShape, MoeFfnWeights};
 use super::gpu_full_attn::{download_f32, upload_bf16_from_f32, upload_f32};
 use super::weight_loader::DenseFfnWeightsQ;
 
-/// W-5b.26 forensic A/B gate.  When `HF2Q_FFN_OUTPUT_LIFT_LEGACY=1` is
-/// set, `build_moe_ffn_layer_gpu_q_into` retains the per-layer
-/// `pooled_alloc_buffer` allocation path (LEGACY).  Default (env unset)
-/// is the lifted `FfnOutputCache` path (NEW).
-///
-/// Mirrors the W-5b.10/14/18/20/24 forensic env-gate pattern.  Gate
-/// sunset target: same protocol as W-5b.25 — once a 30/30 cross-path
-/// 27B PP4106 token-id determinism panel + apex 35B-A3B PP65536
-/// FFN equivalence verification PASS, this gate is removed in the
-/// next iter alongside its sister parity test
-/// `ffn_output_lift_path_matches_legacy_at_seq128`.
-#[inline]
-fn ffn_output_lift_legacy_enabled() -> bool {
-    std::env::var("HF2Q_FFN_OUTPUT_LIFT_LEGACY").is_ok()
-}
-
 // ================================================================
 // GPU weight containers
 // ================================================================
@@ -1425,122 +1409,42 @@ pub fn build_moe_ffn_layer_gpu_q_into(
     // allocation through the thread-local arena pool.  These buffers' lifetimes
     // are bounded by `build_moe_ffn_layer_gpu_q`; `forward_gpu_greedy`'s
     // top-of-token `reset_decode_pool` recycles them on the next token.
-    //
-    // W-5b.26: 9 of these allocations (`ids_buf`, `weights_buf`, `gate_all`,
-    // `up_all`, `h_all`, `y_all`, `h_s`, `out`, `silu_params`) are now lifted
-    // to a thread-local `FfnOutputCache` (`decode_pool::FfnOutputSlot::*`)
-    // that survives across all 48 prefill MoE layers and across decode
-    // tokens.  First-prefill: 9 device allocs (one per slot).  Subsequent
-    // 47 layers in the same prefill + every subsequent prefill / decode
-    // step: 9 cache hits per call, zero device allocs.  Net: 432
-    // (9 × 48) per-prefill `pooled_alloc_buffer` calls become 9 first-call
-    // device allocs + 423 cache hits.
-    //
-    // The `silu_sh_params_buf` and `dummy_residual_buf` remain pool-allocated
-    // (each is 4 bytes, outside the W-5b.25 audit's 9-buffer scope; the
-    // marginal recovery from caching them is sub-noise per the audit's
-    // ms-recovery-per-effort framing).
-    //
-    // LEGACY env-gate: `HF2Q_FFN_OUTPUT_LIFT_LEGACY=1` retains the
-    // pre-W-5b.26 path (every alloc through `pooled_alloc_buffer`).
-    // Default (gate unset) takes the NEW lifted path.  See
-    // `ffn_output_lift_legacy_enabled` doc-comment for sunset
-    // protocol.
     let total_rows = seq * topk;
-    let m_sh = m_sh32 as usize;
+    let ids_buf = super::decode_pool::pooled_alloc_buffer(
+            device, total_rows * DType::U32.size_of(), DType::U32, vec![total_rows])
+        .map_err(|e| anyhow!("alloc ids_buf: {e}"))?;
+    let weights_buf = super::decode_pool::pooled_alloc_buffer(
+            device, total_rows * DType::F32.size_of(), DType::F32, vec![total_rows])
+        .map_err(|e| anyhow!("alloc weights_buf: {e}"))?;
+    let gate_all_bytes = total_rows * m_moe * 4;
+    let mut gate_all_buf = super::decode_pool::pooled_alloc_buffer(
+            device, gate_all_bytes, DType::F32, vec![total_rows, m_moe])
+        .map_err(|e| anyhow!("alloc gate_all: {e}"))?;
+    let up_all_bytes = total_rows * m_moe * 4;
+    let mut up_all_buf = super::decode_pool::pooled_alloc_buffer(
+            device, up_all_bytes, DType::F32, vec![total_rows, m_moe])
+        .map_err(|e| anyhow!("alloc up_all: {e}"))?;
     let n_h_all = (total_rows * m_moe) as u32;
+    let h_all_buf = super::decode_pool::pooled_alloc_buffer(
+            device, n_h_all as usize * 4, DType::F32, vec![total_rows, m_moe])
+        .map_err(|e| anyhow!("alloc h_all: {e}"))?;
+    let y_all_bytes = total_rows * h * 4;
+    let mut y_all_buf = super::decode_pool::pooled_alloc_buffer(
+            device, y_all_bytes, DType::F32, vec![total_rows, h])
+        .map_err(|e| anyhow!("alloc y_all: {e}"))?;
+    let m_sh = m_sh32 as usize;
     let n_h_s = (seq * m_sh) as u32;
-    let lift_legacy = ffn_output_lift_legacy_enabled();
-    let (ids_buf, weights_buf, mut gate_all_buf, mut up_all_buf, h_all_buf, mut y_all_buf, h_s_buf, mut out_buf, silu_params_buf) =
-        if lift_legacy {
-            // LEGACY: per-layer `pooled_alloc_buffer` calls (pre-W-5b.26).
-            let ids_buf = super::decode_pool::pooled_alloc_buffer(
-                    device, total_rows * DType::U32.size_of(), DType::U32, vec![total_rows])
-                .map_err(|e| anyhow!("alloc ids_buf: {e}"))?;
-            let weights_buf = super::decode_pool::pooled_alloc_buffer(
-                    device, total_rows * DType::F32.size_of(), DType::F32, vec![total_rows])
-                .map_err(|e| anyhow!("alloc weights_buf: {e}"))?;
-            let gate_all_buf = super::decode_pool::pooled_alloc_buffer(
-                    device, total_rows * m_moe * 4, DType::F32, vec![total_rows, m_moe])
-                .map_err(|e| anyhow!("alloc gate_all: {e}"))?;
-            let up_all_buf = super::decode_pool::pooled_alloc_buffer(
-                    device, total_rows * m_moe * 4, DType::F32, vec![total_rows, m_moe])
-                .map_err(|e| anyhow!("alloc up_all: {e}"))?;
-            let h_all_buf = super::decode_pool::pooled_alloc_buffer(
-                    device, n_h_all as usize * 4, DType::F32, vec![total_rows, m_moe])
-                .map_err(|e| anyhow!("alloc h_all: {e}"))?;
-            let y_all_buf = super::decode_pool::pooled_alloc_buffer(
-                    device, total_rows * h * 4, DType::F32, vec![total_rows, h])
-                .map_err(|e| anyhow!("alloc y_all: {e}"))?;
-            let h_s_buf = super::decode_pool::pooled_alloc_buffer(
-                    device, n_h_s as usize * 4, DType::F32, vec![seq, m_sh])
-                .map_err(|e| anyhow!("alloc h_s: {e}"))?;
-            let out_buf = super::decode_pool::pooled_alloc_buffer(
-                    device, seq * h * 4, DType::F32, vec![seq, h])
-                .map_err(|e| anyhow!("alloc output: {e}"))?;
-            let silu_params_buf = super::decode_pool::pooled_alloc_buffer(
-                    device, 4, DType::U32, vec![1])
-                .map_err(|e| anyhow!("alloc silu params: {e}"))?;
-            (ids_buf, weights_buf, gate_all_buf, up_all_buf, h_all_buf, y_all_buf, h_s_buf, out_buf, silu_params_buf)
-        } else {
-            // NEW (default): cache-backed allocations.  9 per-FFN-call
-            // `pooled_alloc_buffer` calls become 9 cache lookups; on the
-            // first call of a prefill the cache lazily allocates via
-            // `MlxDevice::alloc_buffer` (one per slot).
-            use super::decode_pool::{ffn_output_get_or_alloc, FfnOutputSlot};
-            let ids_buf = ffn_output_get_or_alloc(
-                FfnOutputSlot::Ids, device, total_rows * DType::U32.size_of(),
-                DType::U32, vec![total_rows],
-            ).map_err(|e| anyhow!("ffn cache alloc ids: {e}"))?;
-            let weights_buf = ffn_output_get_or_alloc(
-                FfnOutputSlot::Weights, device, total_rows * DType::F32.size_of(),
-                DType::F32, vec![total_rows],
-            ).map_err(|e| anyhow!("ffn cache alloc weights: {e}"))?;
-            let gate_all_buf = ffn_output_get_or_alloc(
-                FfnOutputSlot::GateAll, device, total_rows * m_moe * 4,
-                DType::F32, vec![total_rows, m_moe],
-            ).map_err(|e| anyhow!("ffn cache alloc gate_all: {e}"))?;
-            let up_all_buf = ffn_output_get_or_alloc(
-                FfnOutputSlot::UpAll, device, total_rows * m_moe * 4,
-                DType::F32, vec![total_rows, m_moe],
-            ).map_err(|e| anyhow!("ffn cache alloc up_all: {e}"))?;
-            let h_all_buf = ffn_output_get_or_alloc(
-                FfnOutputSlot::HAll, device, n_h_all as usize * 4,
-                DType::F32, vec![total_rows, m_moe],
-            ).map_err(|e| anyhow!("ffn cache alloc h_all: {e}"))?;
-            let y_all_buf = ffn_output_get_or_alloc(
-                FfnOutputSlot::YAll, device, total_rows * h * 4,
-                DType::F32, vec![total_rows, h],
-            ).map_err(|e| anyhow!("ffn cache alloc y_all: {e}"))?;
-            let h_s_buf = ffn_output_get_or_alloc(
-                FfnOutputSlot::HS, device, n_h_s as usize * 4,
-                DType::F32, vec![seq, m_sh],
-            ).map_err(|e| anyhow!("ffn cache alloc h_s: {e}"))?;
-            let out_buf = ffn_output_get_or_alloc(
-                FfnOutputSlot::Out, device, seq * h * 4,
-                DType::F32, vec![seq, h],
-            ).map_err(|e| anyhow!("ffn cache alloc output: {e}"))?;
-            let silu_params_buf = ffn_output_get_or_alloc(
-                FfnOutputSlot::SiluParams, device, 4,
-                DType::U32, vec![1],
-            ).map_err(|e| anyhow!("ffn cache alloc silu params: {e}"))?;
-            (ids_buf, weights_buf, gate_all_buf, up_all_buf, h_all_buf, y_all_buf, h_s_buf, out_buf, silu_params_buf)
-        };
-    // CPU-side write to `silu_params_buf` slot[0] = n_h_all.  Safe
-    // across cached buffer reuse: `n_h_all = total_rows * m_moe` is
-    // identical for every layer in a prefill (no inter-layer change in
-    // expert routing fan-out), so the CPU write is a re-write of the
-    // same value.  GPU read of `silu_params_buf` (in
-    // `dispatch_silu_mul` Phase D) is gated behind the C→D barrier on
-    // the same encoder, AND the per-layer `commit_and_wait` (prefill,
-    // `forward_gpu.rs:1671`) drains the previous layer's silu_mul read
-    // before the next layer's CPU write — no GPU-CPU race even on the
-    // shared cache buffer.
-    let mut silu_params_buf = silu_params_buf;
+    let h_s_buf = super::decode_pool::pooled_alloc_buffer(
+            device, n_h_s as usize * 4, DType::F32, vec![seq, m_sh])
+        .map_err(|e| anyhow!("alloc h_s: {e}"))?;
+    let out_bytes = seq * h * 4;
+    let mut out_buf = super::decode_pool::pooled_alloc_buffer(
+            device, out_bytes, DType::F32, vec![seq, h])
+        .map_err(|e| anyhow!("alloc output: {e}"))?;
+    // params_buf for silu_mul (holds n as u32, must outlive the encoder)
+    let mut silu_params_buf = super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
+        .map_err(|e| anyhow!("alloc silu params: {e}"))?;
     silu_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = n_h_all;
-    // `silu_sh_params_buf` and `dummy_residual_buf` retain pool-alloc
-    // (each is 4 bytes; outside the W-5b.25 audit's 9-buffer scope —
-    // marginal recovery from caching is sub-noise).
     let mut silu_sh_params_buf = super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
         .map_err(|e| anyhow!("alloc silu_sh params: {e}"))?;
     silu_sh_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = n_h_s;
@@ -1564,56 +1468,20 @@ pub fn build_moe_ffn_layer_gpu_q_into(
         // dispatch_silu_mul, dispatch_moe_weighted_reduce); no CPU
         // download/as_slice path on q_into.  See proj_pooled doc-comment
         // for the full caller-contract verification.
-        //
-        // W-5b.26 sub-bucket instrumentation: each phase's CPU encode
-        // wall is captured in a `DnFfn*` SectionKind variant gated on
-        // `HF2Q_PROFILE_W5B26=1`.  These buckets measure CPU encode time
-        // ONLY; the actual GPU dispatch wall is captured in the parent
-        // `DnOuterFfnDispatch` bucket via the per-layer `commit_and_wait`
-        // at `forward_gpu.rs:1671`.  Sum-of-children << parent at long
-        // prefill (CPU encode is ~µs vs GPU dispatch ~ms), but the
-        // sub-bucket DISTRIBUTION ranks the next dominant FFN-side
-        // encode-time contributor for W-5b.27 prioritisation.
-        let logits_buf = {
-            let _t = super::wave5b8_profile::Section::start_w5b26(
-                super::wave5b8_profile::SectionKind::DnFfnProjRouter);
-            proj_pooled(enc, registry, device, x, &weights.router, seq_len, h32, ne32)?
-        };
-        let sh_logit_buf = {
-            let _t = super::wave5b8_profile::Section::start_w5b26(
-                super::wave5b8_profile::SectionKind::DnFfnProjShLogit);
-            proj_pooled(enc, registry, device, x, &weights.shared_gate_inp, seq_len, h32, 1)?
-        };
-        let a_s_buf = {
-            let _t = super::wave5b8_profile::Section::start_w5b26(
-                super::wave5b8_profile::SectionKind::DnFfnProjAS);
-            proj_pooled(enc, registry, device, x, &weights.shared_gate, seq_len, h32, m_sh32)?
-        };
-        let b_s_buf = {
-            let _t = super::wave5b8_profile::Section::start_w5b26(
-                super::wave5b8_profile::SectionKind::DnFfnProjBS);
-            proj_pooled(enc, registry, device, x, &weights.shared_up, seq_len, h32, m_sh32)?
-        };
+        let logits_buf   = proj_pooled(enc, registry, device, x, &weights.router,          seq_len, h32, ne32)?;
+        let sh_logit_buf = proj_pooled(enc, registry, device, x, &weights.shared_gate_inp, seq_len, h32, 1)?;
+        let a_s_buf      = proj_pooled(enc, registry, device, x, &weights.shared_gate,     seq_len, h32, m_sh32)?;
+        let b_s_buf      = proj_pooled(enc, registry, device, x, &weights.shared_up,       seq_len, h32, m_sh32)?;
 
         // Barrier A→B: softmax_topk reads logits_buf; silu_mul reads a_s/b_s.
         enc.memory_barrier();
 
         // ---- Phase B: GPU softmax+topk + shared silu_mul (concurrent) ----
-        {
-            let _t = super::wave5b8_profile::Section::start_w5b26(
-                super::wave5b8_profile::SectionKind::DnFfnSoftmaxTopk);
-            dispatch_moe_softmax_topk(
-                enc, registry, device,
-                &logits_buf, &ids_buf, &weights_buf,
-                seq_len, ne32, shape.num_experts_per_tok,
-            ).map_err(|e| anyhow!("moe_softmax_topk: {e}"))?;
-        }
-        // Note: `dispatch_silu_mul` for the shared-expert path is NOT
-        // separately bucketed in W-5b.26 — the audit's 11-bucket scope
-        // only covers the routed-expert silu_mul (Phase D, captured by
-        // `DnFfnSiluMulPhase`).  The shared-silu-mul wall is small
-        // (n_h_s ≈ seq × m_sh = ~17K elements vs n_h_all = total_rows ×
-        // m_moe = ~2M elements at PP4106).
+        dispatch_moe_softmax_topk(
+            enc, registry, device,
+            &logits_buf, &ids_buf, &weights_buf,
+            seq_len, ne32, shape.num_experts_per_tok,
+        ).map_err(|e| anyhow!("moe_softmax_topk: {e}"))?;
         dispatch_silu_mul(
             enc, registry, device.metal_device(),
             &a_s_buf, &b_s_buf, &h_s_buf, &silu_sh_params_buf, n_h_s,
@@ -1657,39 +1525,27 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             expert_stride: weights.expert_up_stride,
             ..gate_params
         };
-        {
-            let _t = super::wave5b8_profile::Section::start_w5b26(
-                super::wave5b8_profile::SectionKind::DnFfnGateMmId);
-            super::decode_pool::with_id_mm_scratch(
-                super::decode_pool::MmIdSlot::Gate,
-                device, ne32, seq_len * shape.num_experts_per_tok,
-                |scratch| quantized_matmul_id_ggml_pooled(
-                    enc, registry, device,
-                    x, &weights.expert_gate_q, &ids_buf, &mut gate_all_buf,
-                    scratch, &gate_params,
-                ),
-            ).map_err(|e| anyhow!("gate_all qmatmul_id_pooled: {e}"))?;
-        }
-        {
-            let _t = super::wave5b8_profile::Section::start_w5b26(
-                super::wave5b8_profile::SectionKind::DnFfnUpMmId);
-            super::decode_pool::with_id_mm_scratch(
-                super::decode_pool::MmIdSlot::Up,
-                device, ne32, seq_len * shape.num_experts_per_tok,
-                |scratch| quantized_matmul_id_ggml_pooled(
-                    enc, registry, device,
-                    x, &weights.expert_up_q, &ids_buf, &mut up_all_buf,
-                    scratch, &up_params,
-                ),
-            ).map_err(|e| anyhow!("up_all qmatmul_id_pooled: {e}"))?;
-        }
+        super::decode_pool::with_id_mm_scratch(
+            super::decode_pool::MmIdSlot::Gate,
+            device, ne32, seq_len * shape.num_experts_per_tok,
+            |scratch| quantized_matmul_id_ggml_pooled(
+                enc, registry, device,
+                x, &weights.expert_gate_q, &ids_buf, &mut gate_all_buf,
+                scratch, &gate_params,
+            ),
+        ).map_err(|e| anyhow!("gate_all qmatmul_id_pooled: {e}"))?;
+        super::decode_pool::with_id_mm_scratch(
+            super::decode_pool::MmIdSlot::Up,
+            device, ne32, seq_len * shape.num_experts_per_tok,
+            |scratch| quantized_matmul_id_ggml_pooled(
+                enc, registry, device,
+                x, &weights.expert_up_q, &ids_buf, &mut up_all_buf,
+                scratch, &up_params,
+            ),
+        ).map_err(|e| anyhow!("up_all qmatmul_id_pooled: {e}"))?;
         // ADR-015 iter7b — pooled (q_into path; y_s_buf flows into
         // dispatch_moe_weighted_reduce, no CPU download).
-        let y_s_buf = {
-            let _t = super::wave5b8_profile::Section::start_w5b26(
-                super::wave5b8_profile::SectionKind::DnFfnSharedDown);
-            proj_pooled(enc, registry, device, &h_s_buf, &weights.shared_down, seq_len, m_sh32, h32)?
-        };
+        let y_s_buf = proj_pooled(enc, registry, device, &h_s_buf, &weights.shared_down, seq_len, m_sh32, h32)?;
 
         // Barrier C→D: silu_mul reads gate_all/up_all.
         enc.memory_barrier();
@@ -1708,14 +1564,10 @@ pub fn build_moe_ffn_layer_gpu_q_into(
         // remain in mlx-native for future re-evaluation but are NOT
         // wired here.  9th confirmed M5 Max static-evidence kernel
         // hypothesis falsified.
-        {
-            let _t = super::wave5b8_profile::Section::start_w5b26(
-                super::wave5b8_profile::SectionKind::DnFfnSiluMulPhase);
-            dispatch_silu_mul(
-                enc, registry, device.metal_device(),
-                &gate_all_buf, &up_all_buf, &h_all_buf, &silu_params_buf, n_h_all,
-            ).map_err(|e| anyhow!("silu_mul dispatch: {e}"))?;
-        }
+        dispatch_silu_mul(
+            enc, registry, device.metal_device(),
+            &gate_all_buf, &up_all_buf, &h_all_buf, &silu_params_buf, n_h_all,
+        ).map_err(|e| anyhow!("silu_mul dispatch: {e}"))?;
 
         // Barrier D→E: expert_down reads h_all.
         enc.memory_barrier();
@@ -1737,41 +1589,33 @@ pub fn build_moe_ffn_layer_gpu_q_into(
         };
         // W-5b.25 sunset: the legacy un-pooled branch was removed.  See
         // the Phase C sunset comment-block above for the audit trail.
-        {
-            let _t = super::wave5b8_profile::Section::start_w5b26(
-                super::wave5b8_profile::SectionKind::DnFfnDownMmId);
-            super::decode_pool::with_id_mm_scratch(
-                super::decode_pool::MmIdSlot::Down,
-                device, ne32, total_rows as u32,
-                |scratch| quantized_matmul_id_ggml_pooled(
-                    enc, registry, device,
-                    &h_all_buf, &weights.expert_down_q, &ids_buf, &mut y_all_buf,
-                    scratch, &down_params,
-                ),
-            ).map_err(|e| anyhow!("y_all qmatmul_id_pooled: {e}"))?;
-        }
+        super::decode_pool::with_id_mm_scratch(
+            super::decode_pool::MmIdSlot::Down,
+            device, ne32, total_rows as u32,
+            |scratch| quantized_matmul_id_ggml_pooled(
+                enc, registry, device,
+                &h_all_buf, &weights.expert_down_q, &ids_buf, &mut y_all_buf,
+                scratch, &down_params,
+            ),
+        ).map_err(|e| anyhow!("y_all qmatmul_id_pooled: {e}"))?;
 
         // Barrier E→F: moe_weighted_reduce reads y_all, y_s_buf, sh_logit_buf.
         enc.memory_barrier();
 
         // ---- Phase F: fused weighted accumulate + sigmoid(sh_logit)*y_s + residual ----
-        {
-            let _t = super::wave5b8_profile::Section::start_w5b26(
-                super::wave5b8_profile::SectionKind::DnFfnWeightedReduce);
-            dispatch_moe_weighted_reduce(
-                enc, registry, device,
-                &weights_buf,
-                &y_all_buf,
-                &sh_logit_buf,
-                &y_s_buf,
-                residual_ref,
-                &mut out_buf,
-                seq_len,
-                shape.num_experts_per_tok,
-                h32,
-                add_residual.is_some(),
-            ).map_err(|e| anyhow!("moe_weighted_reduce: {e}"))?;
-        }
+        dispatch_moe_weighted_reduce(
+            enc, registry, device,
+            &weights_buf,
+            &y_all_buf,
+            &sh_logit_buf,
+            &y_s_buf,
+            residual_ref,
+            &mut out_buf,
+            seq_len,
+            shape.num_experts_per_tok,
+            h32,
+            add_residual.is_some(),
+        ).map_err(|e| anyhow!("moe_weighted_reduce: {e}"))?;
 
         // NOTE: this `_into` variant does NOT commit.  The caller is
         // responsible for committing the encoder, allowing fusion with
@@ -2677,169 +2521,4 @@ mod tests {
     // LEGACY ↔ NEW invocations at seq_len=16 prior to removal.  See
     // `docs/wave5b3-walkbar-results.md` "Wave 5b.25" section for the
     // sunset audit trail.
-
-    /// W-5b.26 forensic A/B parity test.  Runs `build_moe_ffn_layer_gpu_q`
-    /// with the `HF2Q_FFN_OUTPUT_LIFT_LEGACY=1` gate set and unset, on
-    /// the same inputs, and asserts the two output buffers match
-    /// bit-for-bit (`max_abs_err = 0.0`).
-    ///
-    /// Mirrors the W-5b.16 / W-5b.21 / W-5b.25 forensic-test pattern:
-    /// 4 alternating LEGACY ↔ NEW invocations at seq_len=16 to catch
-    /// any warm-cache vs cold-cache drift in the lifted `FfnOutputCache`
-    /// path.
-    ///
-    /// Invariant: bit-identical outputs.  The lift only changes WHERE
-    /// the 9 internal scratches come from (cache vs pool); both paths
-    /// dispatch the same kernels with the same inputs in the same
-    /// order, so bit-equality is the correct bar.
-    ///
-    /// Sunset target: alongside the `HF2Q_FFN_OUTPUT_LIFT_LEGACY` env
-    /// gate after a 30/30 cross-path token-id determinism panel at
-    /// PP4106 PASSES.  See `docs/wave5b3-walkbar-results.md` "Wave 5b.26"
-    /// section for the live audit trail.
-    #[test]
-    fn ffn_output_lift_path_matches_legacy_at_seq128() {
-        let device = MlxDevice::new().expect("Metal device unavailable");
-        let mut registry = KernelRegistry::new();
-
-        let shape = MoeFfnShape {
-            hidden_size: 32,
-            num_experts: 4,
-            num_experts_per_tok: 2,
-            moe_intermediate_size: 32,
-            shared_intermediate_size: 32,
-        };
-        let h  = shape.hidden_size as usize;
-        let ne = shape.num_experts as usize;
-        let m  = shape.moe_intermediate_size as usize;
-        let ms = shape.shared_intermediate_size as usize;
-
-        let mut seed = 0xCAFE_u32;
-        let mut r = |n: usize, scale: f32| -> Vec<f32> {
-            (0..n).map(|_| {
-                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
-                ((seed as i32 as f32) / (i32::MAX as f32)) * scale
-            }).collect()
-        };
-
-        let router_f32      = r(ne * h, 0.3);
-        let expert_gate_f32 = r(ne * m * h, 0.1);
-        let expert_up_f32   = r(ne * m * h, 0.1);
-        let expert_down_f32 = r(ne * h * m, 0.1);
-        let shared_gate_logit = r(h, 0.1);
-        let shared_gate_f32 = r(ms * h, 0.1);
-        let shared_up_f32   = r(ms * h, 0.1);
-        let shared_down_f32 = r(h * ms, 0.1);
-        // seq_len=16 so total_rows = 16 * 2 = 32 (matches Q4_0 block QK=32 alignment).
-        let seq_len = 16usize;
-        let x_cpu   = r(seq_len * h, 0.4);
-
-        let gate_q4 = encode_q4_0(&expert_gate_f32);
-        let up_q4   = encode_q4_0(&expert_up_f32);
-        let down_q4 = encode_q4_0(&expert_down_f32);
-
-        let ggml_type = GgmlType::Q4_0;
-        let qk = ggml_type.block_values() as usize;
-        let block_bytes = ggml_type.block_bytes() as usize;
-        let gate_stride = ((m * h / qk) * block_bytes) as u64;
-        let down_stride = ((h * m / qk) * block_bytes) as u64;
-
-        let make_buf = |data: &[u8]| -> MlxBuffer {
-            let mut buf = device.alloc_buffer(data.len(), DType::U8, vec![data.len()])
-                .expect("alloc q-buf");
-            buf.as_mut_slice::<u8>().expect("q-buf slice").copy_from_slice(data);
-            buf
-        };
-        let expert_gate_buf = make_buf(&gate_q4);
-        let expert_up_buf   = make_buf(&up_q4);
-        let expert_down_buf = make_buf(&down_q4);
-
-        let weights_q = MoeFfnWeightsGpuQ {
-            router: upload_f32(&router_f32, &device).expect("router"),
-            expert_gate_q: expert_gate_buf,
-            expert_up_q:   expert_up_buf,
-            expert_down_q: expert_down_buf,
-            ggml_type_gate_up: ggml_type,
-            ggml_type_down: ggml_type,
-            expert_gate_stride: gate_stride,
-            expert_up_stride:   gate_stride,
-            expert_down_stride: down_stride,
-            num_experts: ne as u32,
-            shared_gate_inp: upload_f32(&shared_gate_logit, &device).expect("sh_gate_inp"),
-            shared_gate:  upload_f32(&shared_gate_f32, &device).expect("sh_gate"),
-            shared_up:    upload_f32(&shared_up_f32, &device).expect("sh_up"),
-            shared_down:  upload_f32(&shared_down_f32, &device).expect("sh_down"),
-        };
-
-        let x_buf = upload_f32(&x_cpu, &device).expect("upload x");
-
-        // Force a clean cache between paths so the LEGACY run doesn't
-        // accidentally consume a buffer the NEW run cached (and
-        // vice-versa) — the cache buffers are bit-equivalent across
-        // paths for the same shapes, but resetting eliminates one axis
-        // of potential confounds in the bit-equality check.
-        let run_path = |legacy: bool, registry: &mut KernelRegistry| -> Vec<f32> {
-            super::super::decode_pool::drop_ffn_output_cache();
-            super::super::decode_pool::drop_id_mm_scratch();
-            super::super::decode_pool::reset_decode_pool();
-            if legacy {
-                std::env::set_var("HF2Q_FFN_OUTPUT_LIFT_LEGACY", "1");
-            } else {
-                std::env::remove_var("HF2Q_FFN_OUTPUT_LIFT_LEGACY");
-            }
-            let buf = build_moe_ffn_layer_gpu_q(
-                &device, registry, &x_buf, &weights_q, shape, None,
-            ).expect("build_moe_ffn_layer_gpu_q");
-            download_f32(&buf).expect("download")
-        };
-
-        // 4 alternating invocations: NEW, LEGACY, NEW, LEGACY.  Catches
-        // any warm-cache drift in the lifted path.
-        let new_a    = run_path(false, &mut registry);
-        let legacy_a = run_path(true,  &mut registry);
-        let new_b    = run_path(false, &mut registry);
-        let legacy_b = run_path(true,  &mut registry);
-
-        // Guard for Metal contention under parallel test execution
-        // (mirrors the carve-out in moe_ffn_gpu_q_parity_vs_cpu_ref).
-        let any_all_zero = [&new_a, &legacy_a, &new_b, &legacy_b]
-            .iter().any(|v| v.iter().all(|&x| x == 0.0));
-        if any_all_zero {
-            eprintln!("ffn_output_lift_parity: GPU output all-zero under parallel contention — skipping");
-            std::env::remove_var("HF2Q_FFN_OUTPUT_LIFT_LEGACY");
-            return;
-        }
-
-        // Bit-equality check across all 6 cross-path pairs.  Output
-        // length must match too.
-        let pairs: &[(&str, &Vec<f32>, &Vec<f32>)] = &[
-            ("new_a vs legacy_a",  &new_a,    &legacy_a),
-            ("new_a vs new_b",     &new_a,    &new_b),
-            ("legacy_a vs legacy_b", &legacy_a, &legacy_b),
-            ("new_b vs legacy_b",  &new_b,    &legacy_b),
-            ("new_a vs legacy_b",  &new_a,    &legacy_b),
-            ("legacy_a vs new_b",  &legacy_a, &new_b),
-        ];
-        let mut overall_max_err = 0.0f32;
-        for (label, a, b) in pairs {
-            assert_eq!(a.len(), b.len(), "ffn_output_lift_parity: length mismatch ({label})");
-            for (i, (&av, &bv)) in a.iter().zip(b.iter()).enumerate() {
-                let err = (av - bv).abs();
-                if err > overall_max_err { overall_max_err = err; }
-                assert_eq!(
-                    av.to_bits(), bv.to_bits(),
-                    "ffn_output_lift_parity FAIL at i={i} ({label}): a={av} b={bv} err={err}",
-                );
-            }
-        }
-
-        // Cleanup so subsequent tests in the same process see the
-        // default (NEW) path.
-        std::env::remove_var("HF2Q_FFN_OUTPUT_LIFT_LEGACY");
-        super::super::decode_pool::drop_ffn_output_cache();
-        super::super::decode_pool::drop_id_mm_scratch();
-        super::super::decode_pool::reset_decode_pool();
-
-        eprintln!("ffn_output_lift_parity: 4 alternating NEW/LEGACY runs matched bit-exactly (max_abs_err={overall_max_err:.2e})");
-    }
 }
