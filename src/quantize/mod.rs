@@ -3645,6 +3645,161 @@ mod tests {
         }
     }
 
+    /// ADR-014 P7 iter-30 — Q3_K_S vs Q3_K_M cross-variant divergence gate.
+    /// Completes the Q3 family triangle (M↔L iter-27, M↔S here, L↔S
+    /// transitively gated via the two pairs).  Per `llama-quant.cpp`:
+    ///
+    ///   Q3_K_M:
+    ///     - output                → Q6_K (210, K-family fall-through)
+    ///     - attn_v   i<2          → Q5_K (176)
+    ///     - attn_v   i≥2          → Q4_K (144)
+    ///     - ffn_down i<n/16       → Q5_K (176)
+    ///     - ffn_down use_more_bits → Q4_K (144)
+    ///     - ffn_down else         → Q3_K base (110)
+    ///   Q3_K_S:
+    ///     - output                → Q6_K (210, SHARED K-family fall-through)
+    ///     - attn_v   any          → Q3_K base (110)   (NO _M tiered upgrades)
+    ///     - ffn_down any          → Q3_K base (110)   (NO _M tiered upgrades)
+    ///
+    /// At n_layers=32 (n/8=4, 7n/8=28, n/16=2):
+    ///   - output.weight              :        BOTH → Q6_K (210) (control: shared K-family fall-through)
+    ///   - blk.0.attn_v.weight  (i=0):         Q3_K_M → Q5_K (176) vs Q3_K_S → Q3_K (110) (divergent)
+    ///   - blk.5.attn_v.weight  (i=5):         Q3_K_M → Q4_K (144) vs Q3_K_S → Q3_K (110) (divergent)
+    ///   - blk.9.ffn_down.weight(i=9, ub=true): Q3_K_M → Q4_K (144) vs Q3_K_S → Q3_K (110) (divergent)
+    ///   - blk.13.ffn_down.weight(i=13):       BOTH → Q3_K (110) (control)
+    ///   - blk.5.attn_q.weight  (i=5):         BOTH → Q3_K (110) (control)
+    ///
+    /// The `output.weight` control is structurally novel (it asserts the
+    /// shared K-family fall-through is preserved across both variants) —
+    /// catches a regression that strips the Q6_K output bump from _S
+    /// while leaving _M intact.
+    #[test]
+    fn variant_streaming_q3ks_vs_q3km_cross_variant_divergence() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+
+        const QK_K: usize = 256;
+        const N_LAYERS: usize = 32;
+
+        let make_f16_payload = |seed: f32, len: usize| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(len * 2);
+            for i in 0..len {
+                let v = (i as f32 / len as f32) * 2.0 - 1.0 + seed * 0.01;
+                let h = half::f16::from_f32(v);
+                bytes.extend_from_slice(&h.to_le_bytes());
+            }
+            bytes
+        };
+
+        // (name, q3km_type, q3km_bytes, q3ks_type, q3ks_bytes, divergent?)
+        let cases: Vec<(&str, &str, usize, &str, usize, bool)> = vec![
+            ("output.weight",            "Q6_K", 210, "Q6_K", 210, false),
+            ("blk.0.attn_v.weight",      "Q5_K", 176, "Q3_K", 110, true),
+            ("blk.5.attn_v.weight",      "Q4_K", 144, "Q3_K", 110, true),
+            ("blk.9.ffn_down.weight",    "Q4_K", 144, "Q3_K", 110, true),
+            ("blk.13.ffn_down.weight",   "Q3_K", 110, "Q3_K", 110, false),
+            ("blk.5.attn_q.weight",      "Q3_K", 110, "Q3_K", 110, false),
+        ];
+
+        let mut lazy_map_q3km = LazyTensorMap::new();
+        let mut lazy_map_q3ks = LazyTensorMap::new();
+        for (i, (name, _, _, _, _, _)) in cases.iter().enumerate() {
+            let payload = make_f16_payload(i as f32, QK_K);
+            lazy_map_q3km.insert(LazyTensor::from_bytes(
+                LazyMeta::new(name.to_string(), vec![1, QK_K], DType::F16),
+                payload.clone(),
+            ));
+            lazy_map_q3ks.insert(LazyTensor::from_bytes(
+                LazyMeta::new(name.to_string(), vec![1, QK_K], DType::F16),
+                payload,
+            ));
+        }
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+
+        let q_q3km = VariantKQuantizer::new(
+            KQuantVariant::Q3_K_M,
+            CalibrationData::None,
+            N_LAYERS,
+        );
+        let q_q3ks = VariantKQuantizer::new(
+            KQuantVariant::Q3_K_S,
+            CalibrationData::None,
+            N_LAYERS,
+        );
+
+        let out_q3km =
+            quantize_streaming(lazy_map_q3km, &metadata, &q_q3km, 0, 0, &progress, false)
+                .expect("Q3_K_M streaming");
+        let out_q3ks =
+            quantize_streaming(lazy_map_q3ks, &metadata, &q_q3ks, 0, 0, &progress, false)
+                .expect("Q3_K_S streaming");
+
+        assert_eq!(out_q3km.quant_method, "Q3_K_M");
+        assert_eq!(out_q3ks.quant_method, "Q3_K_S");
+
+        for (name, q3km_type, q3km_bytes, q3ks_type, q3ks_bytes, divergent) in cases {
+            let t_q3km = out_q3km
+                .tensors
+                .get(name)
+                .unwrap_or_else(|| panic!("Q3_K_M missing {name}"));
+            let t_q3ks = out_q3ks
+                .tensors
+                .get(name)
+                .unwrap_or_else(|| panic!("Q3_K_S missing {name}"));
+
+            assert_eq!(
+                t_q3km.quant_info.ggml_type.as_deref(),
+                Some(q3km_type),
+                "Q3_K_M on {name}: expected {q3km_type}, got {:?}",
+                t_q3km.quant_info.ggml_type
+            );
+            assert_eq!(
+                t_q3km.data.len(),
+                q3km_bytes,
+                "Q3_K_M on {name}: expected {q3km_bytes} bytes"
+            );
+
+            assert_eq!(
+                t_q3ks.quant_info.ggml_type.as_deref(),
+                Some(q3ks_type),
+                "Q3_K_S on {name}: expected {q3ks_type}, got {:?}",
+                t_q3ks.quant_info.ggml_type
+            );
+            assert_eq!(
+                t_q3ks.data.len(),
+                q3ks_bytes,
+                "Q3_K_S on {name}: expected {q3ks_bytes} bytes"
+            );
+
+            if divergent {
+                assert_ne!(
+                    t_q3km.quant_info.ggml_type, t_q3ks.quant_info.ggml_type,
+                    "Q3_K_M and Q3_K_S must route {name} to DIFFERENT codecs \
+                     per attn_v/ffn_down policy divergence — _S has \
+                     accidentally inherited _M's tiered upgrades \
+                     (or _M's bumps got stripped)"
+                );
+            } else {
+                assert_eq!(
+                    t_q3km.quant_info.ggml_type, t_q3ks.quant_info.ggml_type,
+                    "Q3_K_M and Q3_K_S must route shared-policy {name} to \
+                     the SAME codec — divergence here would catch a \
+                     regression in the K-family output fall-through or \
+                     base-route policy"
+                );
+                assert_eq!(
+                    t_q3km.data, t_q3ks.data,
+                    "Q3_K_M and Q3_K_S on shared-policy {name} must produce \
+                     byte-identical output (uncalibrated, deterministic)"
+                );
+            }
+        }
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
