@@ -3053,6 +3053,152 @@ mod tests {
         );
     }
 
+    /// ADR-014 P7 iter-26 — Q2_K_S vs Q2_K cross-variant divergence gate.
+    /// Mid-policy regression catcher: the two Q2 variants share the same
+    /// codec for the base bucket but their policies diverge on `ffn_down`
+    /// per `llama-quant.cpp:571-574`:
+    ///   - Q2_K:    ffn_down → Q3_K always (110 bytes/super-block)
+    ///   - Q2_K_S:  ffn_down i<n/8 → Q4_K (144 bytes), else → Q2_K (84 bytes)
+    ///
+    /// Without this gate, a regression that collapses both variants into
+    /// the same dispatch (e.g. variant→target table mis-keyed, or
+    /// `target_for` losing the variant discriminant) would still pass
+    /// every same-variant test but silently make Q2_K_S a Q2_K alias.
+    ///
+    /// At n_layers=32, n/8=4, so:
+    ///   - `blk.0.ffn_down.weight` (i=0):   Q2_K → 110 bytes; Q2_K_S → 144 bytes
+    ///   - `blk.10.ffn_down.weight` (i=10): Q2_K → 110 bytes; Q2_K_S →  84 bytes
+    ///   - `blk.5.attn_q.weight`   (i=5):   both → 84 bytes (control: same)
+    ///
+    /// Asserts byte-size + ggml_type divergence on the two ffn_down cases
+    /// AND byte-size match on the attn_q control (proves the gate is
+    /// catching policy-driven divergence, not test-fixture-driven noise).
+    #[test]
+    fn variant_streaming_q2k_vs_q2ks_cross_variant_divergence() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+
+        const QK_K: usize = 256;
+        const N_LAYERS: usize = 32;
+
+        let make_f16_payload = |seed: f32, len: usize| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(len * 2);
+            for i in 0..len {
+                let v = (i as f32 / len as f32) * 2.0 - 1.0 + seed * 0.01;
+                let h = half::f16::from_f32(v);
+                bytes.extend_from_slice(&h.to_le_bytes());
+            }
+            bytes
+        };
+
+        // (name, q2k_type, q2k_bytes, q2ks_type, q2ks_bytes, divergent?)
+        let cases: Vec<(&str, &str, usize, &str, usize, bool)> = vec![
+            ("blk.0.ffn_down.weight",  "Q3_K", 110, "Q4_K", 144, true),
+            ("blk.10.ffn_down.weight", "Q3_K", 110, "Q2_K",  84, true),
+            ("blk.5.attn_q.weight",    "Q2_K",  84, "Q2_K",  84, false),
+        ];
+
+        let mut lazy_map_q2k = LazyTensorMap::new();
+        let mut lazy_map_q2ks = LazyTensorMap::new();
+        for (i, (name, _t1, _b1, _t2, _b2, _div)) in cases.iter().enumerate() {
+            let payload = make_f16_payload(i as f32, QK_K);
+            lazy_map_q2k.insert(LazyTensor::from_bytes(
+                LazyMeta::new(name.to_string(), vec![1, QK_K], DType::F16),
+                payload.clone(),
+            ));
+            lazy_map_q2ks.insert(LazyTensor::from_bytes(
+                LazyMeta::new(name.to_string(), vec![1, QK_K], DType::F16),
+                payload,
+            ));
+        }
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+
+        let q_q2k = VariantKQuantizer::new(
+            KQuantVariant::Q2_K,
+            CalibrationData::None,
+            N_LAYERS,
+        );
+        let q_q2ks = VariantKQuantizer::new(
+            KQuantVariant::Q2_K_S,
+            CalibrationData::None,
+            N_LAYERS,
+        );
+
+        let out_q2k =
+            quantize_streaming(lazy_map_q2k, &metadata, &q_q2k, 0, 0, &progress, false)
+                .expect("Q2_K streaming");
+        let out_q2ks =
+            quantize_streaming(lazy_map_q2ks, &metadata, &q_q2ks, 0, 0, &progress, false)
+                .expect("Q2_K_S streaming");
+
+        assert_eq!(out_q2k.quant_method, "Q2_K");
+        assert_eq!(out_q2ks.quant_method, "Q2_K_S");
+
+        for (name, q2k_type, q2k_bytes, q2ks_type, q2ks_bytes, divergent) in cases {
+            let t_q2k = out_q2k
+                .tensors
+                .get(name)
+                .unwrap_or_else(|| panic!("Q2_K missing {name}"));
+            let t_q2ks = out_q2ks
+                .tensors
+                .get(name)
+                .unwrap_or_else(|| panic!("Q2_K_S missing {name}"));
+
+            assert_eq!(
+                t_q2k.quant_info.ggml_type.as_deref(),
+                Some(q2k_type),
+                "Q2_K on {name}: expected {q2k_type}, got {:?}",
+                t_q2k.quant_info.ggml_type
+            );
+            assert_eq!(
+                t_q2k.data.len(),
+                q2k_bytes,
+                "Q2_K on {name}: expected {q2k_bytes} bytes"
+            );
+
+            assert_eq!(
+                t_q2ks.quant_info.ggml_type.as_deref(),
+                Some(q2ks_type),
+                "Q2_K_S on {name}: expected {q2ks_type}, got {:?}",
+                t_q2ks.quant_info.ggml_type
+            );
+            assert_eq!(
+                t_q2ks.data.len(),
+                q2ks_bytes,
+                "Q2_K_S on {name}: expected {q2ks_bytes} bytes"
+            );
+
+            if divergent {
+                // Divergent policy → ggml_type must differ across variants.
+                // (Byte-data also differs trivially via byte-count, but the
+                // type tag is the contract surface — bytes can change for
+                // many reasons; ggml_type only changes on a routing change.)
+                assert_ne!(
+                    t_q2k.quant_info.ggml_type, t_q2ks.quant_info.ggml_type,
+                    "Q2_K and Q2_K_S must route {name} to DIFFERENT codecs \
+                     per ffn_down policy divergence — Q2_K_S has collapsed \
+                     into a Q2_K alias"
+                );
+            } else {
+                // Control: shared base → same codec, same bytes (deterministic).
+                assert_eq!(
+                    t_q2k.quant_info.ggml_type, t_q2ks.quant_info.ggml_type,
+                    "Q2_K and Q2_K_S must route shared-base {name} to the \
+                     SAME codec — divergence here would be a fixture bug"
+                );
+                assert_eq!(
+                    t_q2k.data, t_q2ks.data,
+                    "Q2_K and Q2_K_S on shared-base {name} must produce \
+                     byte-identical output (uncalibrated, deterministic)"
+                );
+            }
+        }
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
