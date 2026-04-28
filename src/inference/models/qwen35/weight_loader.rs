@@ -87,10 +87,10 @@ pub struct MoeFfnWeightsQ {
 /// exactly as they came off disk.  The Metal `quantized_matmul_ggml` kernel
 /// dequantizes on-the-fly during the matmul, so no F32 expansion occurs.
 ///
-/// For a 27B dense GGUF (hidden=5120, intermediate=17408, Q4_K weights):
-///   F32 expansion: 17408×5120×2×4 bytes ≈ 714 MB per layer × 64 layers ≈ 46 GB
-///   Q4_K on-disk:  ≈ 7 GB per layer (4 bits/weight × 1.06× overhead)
-///   Total savings: ~39 GB Metal working set, eliminating the 129 GB OOM.
+/// On the current Qwen3.6 27B DWQ GGUF, most dense FFN projection tensors are
+/// Q4_0 and the final layers are Q6_K.  Keeping those blocks native avoids
+/// expanding gate/up/down to F32 scratch weights during load, which was the
+/// path that pushed the 27B dense fixture over Metal's working-set limits.
 pub struct DenseFfnWeightsQ {
     /// Gate projection raw GGML blocks: `[intermediate_size, hidden_size]`.
     pub gate_q: MlxBuffer,

@@ -559,15 +559,13 @@ fn proj_pooled(
 }
 
 // ================================================================
-// CPU SiLU helper
+// CPU SiLU helper for legacy parity-only paths
 // ================================================================
 
 /// Apply SiLU * up element-wise on CPU: `out[i] = gate[i] / (1 + exp(-gate[i])) * up[i]`.
 ///
-/// This is the CPU bridge for the SwiGLU activation step.  Used for both
-/// Dense and MoE paths in the P9b parity test.  Same rationale as P7b's
-/// `permute_seq_head_dim_to_head_seq_dim_cpu`: a correct CPU step while
-/// waiting for a standalone GPU SiLU kernel.
+/// This remains only for F32 reference/parity helpers and legacy CPU-bridged
+/// paths.  The production DenseQ path uses `dispatch_silu_mul` on GPU.
 ///
 /// Spec: SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x)).
 /// Decision 14 / Decision 13: "silu(gate) * up".

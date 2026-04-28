@@ -123,11 +123,10 @@ pub enum SectionKind {
     // for by the existing `layer.ops1_3 + qkv_deinterleave + chunk_prep
     // + chunk_call + chunk_ops8_9` buckets — leaving ~203 ms/layer
     // unprofiled. That residual lives **outside** the `apply_gated_delta_net_chunk`
-    // wrapper, in the post-attention path: fused residual+norm encoder
-    // (`forward_gpu.rs:906-927`), FFN dispatch (MoE-Q for Qwen3.6 27B
-    // linear-attn layers; line 999-1001), and the post-FFN residual
-    // (line 1013-1022; folded into FFN for MoeQ/Dense*). The buckets below
-    // partition that residual.
+    // wrapper, in the post-attention path: fused residual+norm encoder,
+    // FFN dispatch (DenseQ on the current 27B dense fixture; MoeQ on MoE
+    // fixtures), and the post-FFN residual (folded into FFN for
+    // MoeQ/Dense*). The buckets below partition that residual.
     /// Fused residual + post-attention RMSNorm encoder. One encoder +
     /// `commit()` (no wait) per layer; runs `dispatch_fused_residual_norm_f32`
     /// (`forward_gpu.rs:906-927`). Counts both linear-attn and full-attn
@@ -138,8 +137,7 @@ pub enum SectionKind {
     /// `build_moe_ffn_layer_gpu_q` (`forward_gpu.rs:957-1001`). Residual
     /// is folded into the dispatch via `Some(&ffn_residual)`. One bucket
     /// across all FFN variants — the trial summary documents which variant
-    /// fired by inspecting the model architecture (Qwen3.6 27B = MoeQ for
-    /// every layer index that's a linear-attn layer).
+    /// fired by inspecting the model architecture and the bucket split.
     LayerFfnDispatch,
     /// Post-FFN residual fall-through wall. For MoeQ/DenseQ/Dense the
     /// residual is folded into the FFN dispatch above so this is a no-op
