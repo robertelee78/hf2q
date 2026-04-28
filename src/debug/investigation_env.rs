@@ -258,22 +258,13 @@ pub struct InvestigationEnv {
     pub chunk_scan_prefill: bool,
 
     // ========================================================================
-    // Wave 5b.20 — chunk-wrapper GQA pre-expansion forensic A/B (no ack).
-    //
-    // Selects between the legacy CPU triple-loop tiled-replicate (kept for
-    // forensic A/B audit) and the W-5b.20 GPU `dispatch_repeat_tiled_f32`
-    // call folded into the chunk wrapper's mega-encoder. Both paths produce
-    // bit-identical output (the kernel is a pure strided f32 copy matching
-    // `dst[t,h,k] = src[t, h % Hg, k]` to the byte). No model-math change;
-    // safe to flip per-run, hence no ack gate.
+    // Wave 5b.20 `gqa_expand_legacy` field + `HF2Q_GQA_EXPAND_LEGACY` env gate
+    // removed in W-5b.21 after a 30/30 cross-path determinism audit at PP4106
+    // (id 11 on every cell) confirmed parity. The GPU
+    // `dispatch_repeat_tiled_f32` path is now unconditional in
+    // `apply_gated_delta_net_chunk`. Standing parity bar:
+    // `mlx-native/tests/test_repeat_tiled.rs::test_repeat_tiled_qwen36_27b_shape_seq128`.
     // ========================================================================
-    /// `HF2Q_GQA_EXPAND_LEGACY=1` — fall back to the W-5b.4 CPU triple-loop
-    /// tiled-GQA pre-expansion in `apply_gated_delta_net_chunk`. When unset
-    /// (default), the W-5b.20 in-encoder `dispatch_repeat_tiled_f32` GPU
-    /// kernel is used (mlx-native commit `369fef9`/`826edff`). Both paths
-    /// are byte-identical by construction. Wave 5b.20.
-    /// Original parse (none — new field): `env_eq_one("HF2Q_GQA_EXPAND_LEGACY")`.
-    pub gqa_expand_legacy: bool,
 
     // ========================================================================
     // Category 4 — SDPA regime selector (HF2Q_USE_DENSE / HF2Q_LAYER_POLICY).
@@ -468,9 +459,9 @@ impl InvestigationEnv {
             // alter forward-pass math, just unblocks dispatch).
             qwen36_autoreg: env_eq_one("HF2Q_QWEN36_AUTOREG"),
 
-            // Wave 5b.20 GQA-expand forensic A/B (no ack — byte-identical
-            // alternative paths). Default off (NEW GPU kernel path active).
-            gqa_expand_legacy: env_eq_one("HF2Q_GQA_EXPAND_LEGACY"),
+            // Wave 5b.20 `HF2Q_GQA_EXPAND_LEGACY` env parser deleted in
+            // W-5b.21 (30/30 PASS at PP4106 — gate removed; production now
+            // unconditionally runs the GPU `dispatch_repeat_tiled_f32` path).
 
             // SDPA regime selectors.
             use_dense: matches!(env::var("HF2Q_USE_DENSE").as_deref(), Ok("1")),
@@ -686,13 +677,9 @@ impl InvestigationEnv {
                  deferred to W-5b chunk-scan kernel)".into(),
             );
         }
-        if self.gqa_expand_legacy {
-            diagnostics.push(
-                "HF2Q_GQA_EXPAND_LEGACY=1 (Wave 5b.20 forensic A/B: legacy CPU triple-loop \
-                 tiled-GQA pre-expansion; default is in-encoder GPU dispatch_repeat_tiled_f32)"
-                    .into(),
-            );
-        }
+        // Wave 5b.20 `HF2Q_GQA_EXPAND_LEGACY` activate-diagnostic deleted in
+        // W-5b.21 alongside the field + env parser (30/30 cross-path
+        // determinism PASS at PP4106).
         if self.use_dense {
             diagnostics.push("HF2Q_USE_DENSE=1".into());
         }

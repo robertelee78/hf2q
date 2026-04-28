@@ -798,16 +798,13 @@ pub fn apply_gated_delta_net_chunk(
     d_k: u32,
     d_v: u32,
     use_qk_l2norm: bool,
-    // Wave 5b.20: when `false` (default), the GQA pre-expansion is folded
-    // into the chunk wrapper's mega-encoder via
-    // `mlx_native::ops::repeat_tiled::dispatch_repeat_tiled_f32` (one
-    // dispatch per q/k, both inside the same encoder + memory_barrier as
-    // the downstream F32→BF16 cast). When `true`, falls back to the W-5b.4
-    // CPU triple-loop tiled-replicate (kept for forensic A/B audit;
-    // byte-identical output by construction). Production callers thread
-    // `INVESTIGATION_ENV.gqa_expand_legacy` here; tests can drive both
-    // branches by explicit bool.
-    gqa_expand_legacy: bool,
+    // Wave 5b.21 sunset (W-5b.20 forensic A/B closed): the `gqa_expand_legacy`
+    // bool parameter and `HF2Q_GQA_EXPAND_LEGACY` env gate were removed after a
+    // 30/30 PASS cross-path determinism audit at PP4106 (id 11 on every cell).
+    // The GPU `dispatch_repeat_tiled_f32` path is now unconditional (folded
+    // into the mega-encoder below). Standing parity bar:
+    // `mlx-native/tests/test_repeat_tiled.rs::test_repeat_tiled_qwen36_27b_shape_seq128`
+    // (and the matching `_pp4106` case) — bit-identical CPU reference.
 ) -> Result<(MlxBuffer, MlxBuffer)> {
     // Iter 5 contract: callers must already have applied l2-norm + q-scale
     // (matching the autoregressive `apply_gated_delta_net` interface).
@@ -875,7 +872,6 @@ pub fn apply_gated_delta_net_chunk(
     // 6 chunk-pipeline kernel files for non-investigation purposes (only
     // add diagnostic instrumentation, behind a feature flag if it changes
     // hot-path semantics)" — wrapper-side fix only).
-    let q_elems_orig = (seq_len * n_k_heads * d_k) as usize; // [T, Hg, K]
     let q_elems_exp = (seq_len * n_v_heads * d_k) as usize; // [T, H,  K] expanded
     let v_elems = (seq_len * n_v_heads * d_v) as usize; // [T, H, V]
     let g_elems = (seq_len * n_v_heads) as usize; // [T, H]
@@ -885,31 +881,25 @@ pub fn apply_gated_delta_net_chunk(
 
     // ---- GQA pre-expansion: tiled-replicate q and k to [T, H, K] in F32. ----
     //
-    // Two paths, byte-identical by construction (see
+    // The fill is a Metal compute dispatch (`dispatch_repeat_tiled_f32`)
+    // folded into the mega-encoder below. It writes
+    // `dst[t, h, k] = src[t, h % Hg, k]` straight into the buffers consumed
+    // by the F32→BF16 cast in stage A. A `memory_barrier()` separates the
+    // writes from the cast reads (RAW dependency in the same encoder).
+    //
+    // Standing parity bar (post-W-5b.21 sunset of the legacy CPU triple-loop
+    // path, 30/30 PASS at PP4106): the kernel is bit-identical to the
+    // CPU reference at production shape — see
     // `mlx-native/tests/test_repeat_tiled.rs::test_repeat_tiled_qwen36_27b_shape_seq128`
-    // for the bit-exact CPU vs GPU equivalence at production shape):
-    //
-    //   * NEW (default, `gqa_expand_legacy=false`): only the destination
-    //     buffers are allocated here. The actual fill is dispatched as the
-    //     first stage of the mega-encoder below via
-    //     `dispatch_repeat_tiled_f32`, which writes
-    //     `dst[t, h, k] = src[t, h % Hg, k]` straight into the same
-    //     buffers consumed by the F32→BF16 cast in stage A. A
-    //     `memory_barrier()` separates the writes from the cast reads
-    //     (RAW dependency in the same encoder).
-    //
-    //   * LEGACY (`HF2Q_GQA_EXPAND_LEGACY=1`): retains the W-5b.4 CPU
-    //     triple-loop fill. Apple unified memory: CPU-side memcpy from
-    //     input GPU buffers is safe here because callers commit_and_wait
-    //     the upstream q_scale / l2-norm dispatch before invoking this
-    //     wrapper (see forward_gpu.rs:1404 `commit chunk-prep prefill`,
-    //     and the unit tests use upload_f32 which is immediately
-    //     CPU-readable). Kept gated for forensic A/B audit until the
-    //     W-5b.20 sunset panel.
+    // (and the matching `_pp4106` case for full prefill scale).
     //
     // Wave 5b.8 measurement spike: time the GQA expansion + the BF16 +
     // output-buffer allocations + the encoder build + the final
     // commit_and_wait separately. All gated on `HF2Q_PROFILE_W5B8=1`.
+    // Post-W-5b.20 the GPU fill runs inside the mega-encoder, so this
+    // CPU-wall bucket only includes the buffer alloc (~µs); the actual GPU
+    // work shows up under `chunk.enc_build` (encode-time) + `chunk.commit_wait`
+    // (GPU execution).
     let _w5b8_expand = crate::inference::models::qwen35::wave5b8_profile::Section::start(
         crate::inference::models::qwen35::wave5b8_profile::SectionKind::ChunkGqaExpand,
     );
@@ -919,70 +909,6 @@ pub fn apply_gated_delta_net_chunk(
     let k_expanded = device
         .alloc_buffer(q_elems_exp * 4, DType::F32, vec![q_elems_exp])
         .map_err(|e| anyhow!("alloc k_expanded f32: {e}"))?;
-    if gqa_expand_legacy {
-        // ---- LEGACY CPU triple-loop fill (forensic A/B). ----
-        let q_src = q
-            .as_slice::<f32>()
-            .map_err(|e| anyhow!("apply_gated_delta_net_chunk: read q: {e}"))?;
-        let k_src = k
-            .as_slice::<f32>()
-            .map_err(|e| anyhow!("apply_gated_delta_net_chunk: read k: {e}"))?;
-        if q_src.len() < q_elems_orig {
-            return Err(anyhow!(
-                "apply_gated_delta_net_chunk: q has {} f32 elements, expected >= {}",
-                q_src.len(), q_elems_orig
-            ));
-        }
-        if k_src.len() < q_elems_orig {
-            return Err(anyhow!(
-                "apply_gated_delta_net_chunk: k has {} f32 elements, expected >= {}",
-                k_src.len(), q_elems_orig
-            ));
-        }
-        // SAFETY: q_expanded / k_expanded are freshly allocated and not yet
-        // referenced by any encoder; we hold the only reference.
-        let mut q_expanded_mut = q_expanded.clone();
-        let mut k_expanded_mut = k_expanded.clone();
-        let q_dst = q_expanded_mut
-            .as_mut_slice::<f32>()
-            .map_err(|e| anyhow!("apply_gated_delta_net_chunk: q_expanded as_mut_slice: {e}"))?;
-        let k_dst = k_expanded_mut
-            .as_mut_slice::<f32>()
-            .map_err(|e| anyhow!("apply_gated_delta_net_chunk: k_expanded as_mut_slice: {e}"))?;
-        let t_usz = seq_len as usize;
-        let hg_usz = n_k_heads as usize;
-        let hv_usz = n_v_heads as usize;
-        let dk_usz = d_k as usize;
-        // dest[t, h, :] = src[t, h % Hg, :]
-        for t in 0..t_usz {
-            let src_t_base = t * hg_usz * dk_usz;
-            let dst_t_base = t * hv_usz * dk_usz;
-            for h in 0..hv_usz {
-                let kh = h % hg_usz;
-                let src_off = src_t_base + kh * dk_usz;
-                let dst_off = dst_t_base + h * dk_usz;
-                q_dst[dst_off..dst_off + dk_usz]
-                    .copy_from_slice(&q_src[src_off..src_off + dk_usz]);
-                k_dst[dst_off..dst_off + dk_usz]
-                    .copy_from_slice(&k_src[src_off..src_off + dk_usz]);
-            }
-        }
-    } else {
-        // NEW path: defer the fill into the mega-encoder below. Buffers are
-        // already allocated, and `dispatch_repeat_tiled_f32` will write into
-        // them via a Metal compute dispatch on the same encoder that runs
-        // the F32→BF16 cast — eliminating the standalone CPU memcpy bucket
-        // and the standalone commit_and_wait that W-5b.19 Phase B's
-        // separate-encoder approach paid (see W-5b.19 closure: 510 → 234 ms,
-        // 2.18× drop, dispatch-overhead-bound). The defensive `q.byte_len()`
-        // bound check is performed by `dispatch_repeat_tiled_f32` itself.
-    }
-
-    // Drop the GQA-expand timer here so its bucket excludes the BF16
-    // alloc bucket below. NEW path: the fill kernel runs inside the
-    // mega-encoder; this CPU-wall bucket only includes the buffer alloc
-    // (~µs) — the actual GPU work shows up under `chunk.enc_build`
-    // (encode-time) + `chunk.commit_wait` (GPU execution).
     drop(_w5b8_expand);
     let _w5b8_allocs = crate::inference::models::qwen35::wave5b8_profile::Section::start(
         crate::inference::models::qwen35::wave5b8_profile::SectionKind::ChunkAllocs,
@@ -1048,45 +974,43 @@ pub fn apply_gated_delta_net_chunk(
         .command_encoder()
         .context("enc apply_gated_delta_net_chunk")?;
 
-    // Stage A0 (Wave 5b.20, NEW path only): GPU tiled-GQA broadcast
+    // Stage A0 (Wave 5b.20): GPU tiled-GQA broadcast
     //   `q_expanded[t, h, :] = q[t, h % Hg, :]`  (and same for k)
     // dispatched into the SAME mega-encoder as the cast that consumes them.
     // The `enc.memory_barrier()` after this block enforces the RAW
     // dependency on `q_expanded` / `k_expanded` between the repeat_tiled
     // writes and the F32→BF16 cast reads.
     //
-    // LEGACY path (`HF2Q_GQA_EXPAND_LEGACY=1`) skips this stage; the CPU
-    // triple-loop above already filled q_expanded/k_expanded synchronously
-    // before this encoder was opened, so no GPU barrier is needed.
-    if !gqa_expand_legacy {
-        let rt_params = RepeatTiledParams {
-            seq: seq_len,
-            hg: n_k_heads,
-            h: n_v_heads,
-            k: d_k,
-        };
-        dispatch_repeat_tiled_f32(
-            &mut enc,
-            registry,
-            device.metal_device(),
-            q,
-            &q_expanded,
-            &rt_params,
-        )
-        .map_err(|e| anyhow!("dispatch_repeat_tiled_f32 q (W-5b.20): {e}"))?;
-        dispatch_repeat_tiled_f32(
-            &mut enc,
-            registry,
-            device.metal_device(),
-            k,
-            &k_expanded,
-            &rt_params,
-        )
-        .map_err(|e| anyhow!("dispatch_repeat_tiled_f32 k (W-5b.20): {e}"))?;
-        // RAW: q_expanded / k_expanded are written above and read by
-        // the F32→BF16 cast immediately below.
-        enc.memory_barrier();
-    }
+    // Wave 5b.21 sunset note: the legacy CPU triple-loop fill (gated on
+    // `HF2Q_GQA_EXPAND_LEGACY=1`) was removed after a 30/30 cross-path
+    // determinism audit at PP4106; this dispatch is now unconditional.
+    let rt_params = RepeatTiledParams {
+        seq: seq_len,
+        hg: n_k_heads,
+        h: n_v_heads,
+        k: d_k,
+    };
+    dispatch_repeat_tiled_f32(
+        &mut enc,
+        registry,
+        device.metal_device(),
+        q,
+        &q_expanded,
+        &rt_params,
+    )
+    .map_err(|e| anyhow!("dispatch_repeat_tiled_f32 q (W-5b.20): {e}"))?;
+    dispatch_repeat_tiled_f32(
+        &mut enc,
+        registry,
+        device.metal_device(),
+        k,
+        &k_expanded,
+        &rt_params,
+    )
+    .map_err(|e| anyhow!("dispatch_repeat_tiled_f32 k (W-5b.20): {e}"))?;
+    // RAW: q_expanded / k_expanded are written above and read by
+    // the F32→BF16 cast immediately below.
+    enc.memory_barrier();
 
     // Stage A: cast q_expanded/k_expanded/v from F32 → BF16. Three independent
     // dispatches (no inter-dependency), fused into one barrier-free batch.
@@ -1704,12 +1628,6 @@ pub fn build_delta_net_layer(
                     d_k,
                     d_v,
                     /* use_qk_l2norm = */ false,
-                    // Wave 5b.20: forensic A/B gate. Default `false` means
-                    // GPU `dispatch_repeat_tiled_f32` runs in the chunk
-                    // wrapper's mega-encoder. `HF2Q_GQA_EXPAND_LEGACY=1`
-                    // restores the W-5b.4 CPU triple-loop fill.
-                    /* gqa_expand_legacy = */
-                    crate::debug::INVESTIGATION_ENV.gqa_expand_legacy,
                 )
                 .context("apply_gated_delta_net_chunk prefill")?
             };
@@ -2394,7 +2312,6 @@ mod tests {
             d_k,
             d_v,
             /* use_qk_l2norm = */ false,
-            /* gqa_expand_legacy = */ false,
         )
         .expect("apply_gated_delta_net_chunk");
         let chunk_out_cpu = download_f32(&chunk_out).expect("download chunk out");
@@ -2518,158 +2435,12 @@ mod tests {
     // `mlx-native/tests/test_qkv_split.rs::test_qkv_split_qwen36_27b_shape_seq128`
     // (and the matching `_pp4106` case for full prefill scale).
 
-    /// Wave 5b.20 — chunk wrapper's NEW (in-encoder GPU repeat_tiled) path
-    /// produces bit-identical outputs to the LEGACY (CPU triple-loop) path.
-    ///
-    /// Both paths feed the exact same buffers into the same downstream
-    /// chunk pipeline; the only difference is HOW `q_expanded` /
-    /// `k_expanded` are filled (CPU triple-loop vs in-encoder
-    /// `dispatch_repeat_tiled_f32`). The mlx-native side already proves
-    /// the kernel itself is byte-identical to a CPU reference at the
-    /// same shape (`mlx-native/tests/test_repeat_tiled.rs::
-    /// test_repeat_tiled_qwen36_27b_shape_seq128`); this test extends
-    /// that proof up to the chunk wrapper boundary by running both paths
-    /// end-to-end and asserting bit-equality on the chunk output buffer.
-    ///
-    /// The strict `to_bits()` assertion is justified because every step
-    /// past the q_expanded / k_expanded fill is identical between the
-    /// two paths: same F32→BF16 cast, same chunk-pipeline kernels, same
-    /// BF16→F32 output cast. The 7/7 mlx-native unit test guarantees the
-    /// fills are bit-equal; if they are, every downstream op is too.
-    #[test]
-    fn gqa_expand_path_matches_legacy_at_seq128() {
-        let device = MlxDevice::new().expect("device");
-        let mut registry = KernelRegistry::new();
-
-        // Same shape as `chunk_path_first_token_matches_autoregressive_at_seq128`.
-        // n_v_heads / n_k_heads = 2 → group_ratio=2, exercising the tiled
-        // `h % Hg` index pattern (not the no-op group_ratio=1 case).
-        let seq_len: u32 = 128;
-        let n_k_heads: u32 = 2;
-        let n_v_heads: u32 = 4;
-        let d_k: u32 = 128;
-        let d_v: u32 = 128;
-
-        let n_q_elems = (seq_len * n_k_heads * d_k) as usize;
-        let n_v_elems = (seq_len * n_v_heads * d_v) as usize;
-        let n_g_elems = (seq_len * n_v_heads) as usize;
-        let n_state = (d_k * d_v * n_v_heads) as usize;
-        let n_out = (n_v_heads * seq_len * d_v) as usize;
-
-        // Deterministic small-magnitude inputs (chunk wrapper's
-        // use_qk_l2norm=false contract: pre-l2-normed + pre-scaled q).
-        let mut seed: u32 = 0xBEEF_F00D;
-        let q_cpu: Vec<f32> = mk_rand(&mut seed, n_q_elems, 0.05);
-        let k_cpu: Vec<f32> = mk_rand(&mut seed, n_q_elems, 0.05);
-        let v_cpu: Vec<f32> = mk_rand(&mut seed, n_v_elems, 0.1);
-        let g_cpu: Vec<f32> = (0..n_g_elems)
-            .map(|i| 0.001 + 0.0001 * (i as f32 % 7.0))
-            .collect();
-        let beta_cpu: Vec<f32> = (0..n_g_elems)
-            .map(|i| 0.5 + 0.01 * ((i as f32 % 11.0) - 5.0))
-            .collect();
-        let state_zeros = vec![0.0f32; n_state];
-
-        // Two independent copies of every input — each path may receive
-        // queue-ordered buffers and we want byte-isolation.
-        let q_new = upload_f32(&q_cpu, &device).expect("upload q new");
-        let k_new = upload_f32(&k_cpu, &device).expect("upload k new");
-        let v_new = upload_f32(&v_cpu, &device).expect("upload v new");
-        let g_new = upload_f32(&g_cpu, &device).expect("upload g new");
-        let beta_new = upload_f32(&beta_cpu, &device).expect("upload beta new");
-        let state_new = upload_f32(&state_zeros, &device).expect("upload state new");
-
-        let q_leg = upload_f32(&q_cpu, &device).expect("upload q leg");
-        let k_leg = upload_f32(&k_cpu, &device).expect("upload k leg");
-        let v_leg = upload_f32(&v_cpu, &device).expect("upload v leg");
-        let g_leg = upload_f32(&g_cpu, &device).expect("upload g leg");
-        let beta_leg = upload_f32(&beta_cpu, &device).expect("upload beta leg");
-        let state_leg = upload_f32(&state_zeros, &device).expect("upload state leg");
-
-        // Path NEW: in-encoder GPU repeat_tiled (W-5b.20 default).
-        let (out_new, _state_new_out) = apply_gated_delta_net_chunk(
-            &device,
-            &mut registry,
-            &q_new,
-            &k_new,
-            &v_new,
-            &g_new,
-            &beta_new,
-            &state_new,
-            seq_len,
-            n_k_heads,
-            n_v_heads,
-            d_k,
-            d_v,
-            /* use_qk_l2norm = */ false,
-            /* gqa_expand_legacy = */ false,
-        )
-        .expect("apply_gated_delta_net_chunk NEW");
-        let out_new_cpu = download_f32(&out_new).expect("download NEW out");
-
-        // Path LEGACY: CPU triple-loop (HF2Q_GQA_EXPAND_LEGACY=1 equivalent).
-        let (out_leg, _state_leg_out) = apply_gated_delta_net_chunk(
-            &device,
-            &mut registry,
-            &q_leg,
-            &k_leg,
-            &v_leg,
-            &g_leg,
-            &beta_leg,
-            &state_leg,
-            seq_len,
-            n_k_heads,
-            n_v_heads,
-            d_k,
-            d_v,
-            /* use_qk_l2norm = */ false,
-            /* gqa_expand_legacy = */ true,
-        )
-        .expect("apply_gated_delta_net_chunk LEGACY");
-        let out_leg_cpu = download_f32(&out_leg).expect("download LEGACY out");
-
-        // Parallel-test guard (matches the auto-vs-chunk test): if both
-        // produce all-zero, treat as device contention rather than a real
-        // divergence; if only one does, fail loudly.
-        let new_all_zero = out_new_cpu.iter().all(|&v| v == 0.0);
-        let leg_all_zero = out_leg_cpu.iter().all(|&v| v == 0.0);
-        if new_all_zero && leg_all_zero {
-            eprintln!(
-                "gqa_expand_path_matches_legacy_at_seq128: BOTH paths returned \
-                 all-zero — likely parallel-contention flake; re-run with \
-                 --test-threads=1 to confirm."
-            );
-            return;
-        }
-        assert!(!new_all_zero, "NEW path returned all-zero while LEGACY did not");
-        assert!(!leg_all_zero, "LEGACY path returned all-zero while NEW did not");
-
-        // Bit-exact equality. Since the only diff between the two paths is
-        // a pure strided f32 copy that mlx-native already proved byte-equal
-        // (test_repeat_tiled_qwen36_27b_shape_seq128), and every downstream
-        // op is identical, the chunk output buffer must be bit-identical.
-        assert_eq!(out_new_cpu.len(), n_out, "NEW output length");
-        assert_eq!(out_leg_cpu.len(), n_out, "LEGACY output length");
-        let mut first_mismatch: Option<(usize, u32, u32)> = None;
-        for (i, (n, l)) in out_new_cpu.iter().zip(out_leg_cpu.iter()).enumerate() {
-            if n.to_bits() != l.to_bits() {
-                first_mismatch = Some((i, n.to_bits(), l.to_bits()));
-                break;
-            }
-        }
-        if let Some((i, nb, lb)) = first_mismatch {
-            panic!(
-                "gqa_expand_path_matches_legacy_at_seq128: bit-mismatch at i={i}, \
-                 NEW=0x{nb:08x} ({:.6e}), LEGACY=0x{lb:08x} ({:.6e})",
-                f32::from_bits(nb),
-                f32::from_bits(lb),
-            );
-        }
-        eprintln!(
-            "gqa_expand_path_matches_legacy_at_seq128: PASS \
-             (byte-identical, n_out={n_out})"
-        );
-    }
+    // Wave 5b.20 `gqa_expand_path_matches_legacy_at_seq128` test deleted in
+    // W-5b.21 alongside the legacy CPU triple-loop fill it exercised
+    // (30/30 cross-path determinism PASS at PP4106 → gate removed). Standing
+    // parity bar: the bit-identical CPU reference test in
+    // `mlx-native/tests/test_repeat_tiled.rs::test_repeat_tiled_qwen36_27b_shape_seq128`
+    // (and the matching `_pp4106` case for full prefill scale).
 
     /// Wave 5b iter 5 — chunk wrapper rejects `seq_len` not a multiple of BT.
     ///
@@ -2699,7 +2470,6 @@ mod tests {
             /* d_k = */ 8,
             /* d_v = */ 8,
             /* use_qk_l2norm = */ false,
-            /* gqa_expand_legacy = */ false,
         )
         .expect_err("seq_len=65 must be rejected (not a multiple of BT=64)");
         let msg = err.to_string();
@@ -2735,7 +2505,6 @@ mod tests {
             /* d_k = */ 8,
             /* d_v = */ 8,
             /* use_qk_l2norm = */ true,
-            /* gqa_expand_legacy = */ false,
         )
         .expect_err("use_qk_l2norm=true must be rejected at iter 5");
         let msg = err.to_string();
@@ -2937,7 +2706,7 @@ mod tests {
         let s_c = upload_f32(&state_zeros, &device).expect("upload");
         let (chunk_out, _) = apply_gated_delta_net_chunk(
             &device, &mut registry, &q_c, &k_c, &v_c, &g_c, &b_c, &s_c,
-            seq_len, n_k_heads, n_v_heads, d_k, d_v, false, false,
+            seq_len, n_k_heads, n_v_heads, d_k, d_v, false,
         )
         .expect("chunk");
         let chunk_cpu = download_f32(&chunk_out).expect("dl chunk");
