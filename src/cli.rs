@@ -719,6 +719,14 @@ pub enum QuantMethod {
     /// `q8` — flat 8-bit (Q8_0).
     #[value(alias = "q8_0")]
     Q8,
+    /// `q2_k_s` — Q2_K "small" variant. 2.625 bpw base. Output → Q6_K,
+    /// attn_v → Q4_K, ffn_down i<n/8 → Q4_K else base.
+    #[value(name = "q2_k_s")]
+    Q2KS,
+    /// `q2_k` — default Q2_K variant. Output → Q6_K, attn_v → Q4_K,
+    /// ffn_down → Q3_K always.
+    #[value(name = "q2_k")]
+    Q2K,
     /// `q3_k_s` — uncalibrated K-quant Q3_K, "small" variant. Base Q3_K
     /// everywhere except output (→ Q6_K). 3.4375 bpw base.
     #[value(name = "q3_k_s")]
@@ -750,6 +758,12 @@ pub enum QuantMethod {
     /// `q6_k` — uncalibrated K-quant Q6_K.
     #[value(name = "q6_k")]
     Q6K,
+    /// `imatrix-q2_k_s` — Q2_K_S with imatrix-weighted codebook search.
+    #[value(name = "imatrix-q2_k_s")]
+    ImatrixQ2KS,
+    /// `imatrix-q2_k` — default Q2_K with imatrix-weighted codebook search.
+    #[value(name = "imatrix-q2_k")]
+    ImatrixQ2K,
     /// `imatrix-q3_k_s` — Q3_K_S with imatrix-weighted codebook search.
     #[value(name = "imatrix-q3_k_s")]
     ImatrixQ3KS,
@@ -807,6 +821,8 @@ impl std::fmt::Display for QuantMethod {
             Self::Q2 => write!(f, "q2"),
             Self::Q4 => write!(f, "q4"),
             Self::Q8 => write!(f, "q8"),
+            Self::Q2KS => write!(f, "q2_k_s"),
+            Self::Q2K => write!(f, "q2_k"),
             Self::Q3KS => write!(f, "q3_k_s"),
             Self::Q3KM => write!(f, "q3_k_m"),
             Self::Q3KL => write!(f, "q3_k_l"),
@@ -815,6 +831,8 @@ impl std::fmt::Display for QuantMethod {
             Self::Q5KS => write!(f, "q5_k_s"),
             Self::Q5KM => write!(f, "q5_k_m"),
             Self::Q6K => write!(f, "q6_k"),
+            Self::ImatrixQ2KS => write!(f, "imatrix-q2_k_s"),
+            Self::ImatrixQ2K => write!(f, "imatrix-q2_k"),
             Self::ImatrixQ3KS => write!(f, "imatrix-q3_k_s"),
             Self::ImatrixQ3KM => write!(f, "imatrix-q3_k_m"),
             Self::ImatrixQ3KL => write!(f, "imatrix-q3_k_l"),
@@ -866,6 +884,8 @@ impl QuantMethod {
             | Self::Q2
             | Self::Q4
             | Self::Q8
+            | Self::Q2KS
+            | Self::Q2K
             | Self::Q3KS
             | Self::Q3KM
             | Self::Q3KL
@@ -874,6 +894,8 @@ impl QuantMethod {
             | Self::Q5KS
             | Self::Q5KM
             | Self::Q6K
+            | Self::ImatrixQ2KS
+            | Self::ImatrixQ2K
             | Self::ImatrixQ3KS
             | Self::ImatrixQ3KM
             | Self::ImatrixQ3KL
@@ -1286,7 +1308,9 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
         | QuantMethod::Q8 => {
             // Flat float / legacy block-quant variants.
         }
-        QuantMethod::Q3KS
+        QuantMethod::Q2KS
+        | QuantMethod::Q2K
+        | QuantMethod::Q3KS
         | QuantMethod::Q3KM
         | QuantMethod::Q3KL
         | QuantMethod::Q4KS
@@ -1296,7 +1320,9 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
         | QuantMethod::Q6K => {
             // Uncalibrated K-quant (NoneCalibrator + KQuantCodecQuantizer).
         }
-        QuantMethod::ImatrixQ3KS
+        QuantMethod::ImatrixQ2KS
+        | QuantMethod::ImatrixQ2K
+        | QuantMethod::ImatrixQ3KS
         | QuantMethod::ImatrixQ3KM
         | QuantMethod::ImatrixQ3KL
         | QuantMethod::ImatrixQ4KS

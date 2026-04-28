@@ -14,10 +14,10 @@ pub mod k_quant;
 pub mod k_quant_codec;
 pub mod k_quant_codec_quantizer;
 pub mod layer_mix;
-pub mod q_legacy;
-pub mod variant_quantizer;
 pub mod mixed;
+pub mod q_legacy;
 pub mod static_quant;
+pub mod variant_quantizer;
 
 use thiserror::Error;
 
@@ -154,18 +154,20 @@ pub fn quantize_streaming(
     // bf16-to-f16 cast → quantise → accumulate → drop materialised
     // input.
     for (name, lazy) in map.into_iter() {
-        let mut tensor =
-            lazy.materialize()
-                .map_err(|e| QuantizeError::TensorQuantizeFailed {
-                    tensor: name.clone(),
-                    reason: format!("materialize: {e}"),
-                })?;
+        let mut tensor = lazy
+            .materialize()
+            .map_err(|e| QuantizeError::TensorQuantizeFailed {
+                tensor: name.clone(),
+                reason: format!("materialize: {e}"),
+            })?;
 
         if bf16_to_f16 && tensor.dtype == crate::ir::DType::BF16 {
-            tensor = tensor.to_f16().map_err(|e| QuantizeError::TensorQuantizeFailed {
-                tensor: name.clone(),
-                reason: format!("bf16→f16: {e}"),
-            })?;
+            tensor = tensor
+                .to_f16()
+                .map_err(|e| QuantizeError::TensorQuantizeFailed {
+                    tensor: name.clone(),
+                    reason: format!("bf16→f16: {e}"),
+                })?;
             bf16_converted += 1;
         }
 
@@ -302,57 +304,58 @@ pub fn quantize_streaming_parallel(
         .install(|| {
             entries
                 .into_par_iter()
-                .map(|(name, lazy)| -> Result<(String, crate::ir::QuantizedTensor), QuantizeError> {
-                    let mut tensor = lazy.materialize().map_err(|e| {
-                        QuantizeError::TensorQuantizeFailed {
-                            tensor: name.clone(),
-                            reason: format!("materialize: {e}"),
-                        }
-                    })?;
-
-                    if bf16_to_f16 && tensor.dtype == crate::ir::DType::BF16 {
-                        tensor = tensor.to_f16().map_err(|e| {
+                .map(
+                    |(name, lazy)| -> Result<(String, crate::ir::QuantizedTensor), QuantizeError> {
+                        let mut tensor = lazy.materialize().map_err(|e| {
                             QuantizeError::TensorQuantizeFailed {
                                 tensor: name.clone(),
-                                reason: format!("bf16→f16: {e}"),
+                                reason: format!("materialize: {e}"),
                             }
                         })?;
-                        bf16_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
 
-                    if let Err(e) = validate_group_size(&tensor, group_size) {
-                        tracing::debug!("{}", e);
-                    }
+                        if bf16_to_f16 && tensor.dtype == crate::ir::DType::BF16 {
+                            tensor = tensor.to_f16().map_err(|e| {
+                                QuantizeError::TensorQuantizeFailed {
+                                    tensor: name.clone(),
+                                    reason: format!("bf16→f16: {e}"),
+                                }
+                            })?;
+                            bf16_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
 
-                    let config = LayerQuantConfig {
-                        bits,
-                        group_size,
-                        preserve: !tensor.is_weight() || tensor.is_vision_tensor(),
-                    };
+                        if let Err(e) = validate_group_size(&tensor, group_size) {
+                            tracing::debug!("{}", e);
+                        }
 
-                    if tensor.is_vision_tensor() && tensor.is_weight() {
-                        tracing::debug!("Preserving vision tensor as F16: {}", name);
-                    }
+                        let config = LayerQuantConfig {
+                            bits,
+                            group_size,
+                            preserve: !tensor.is_weight() || tensor.is_vision_tensor(),
+                        };
 
-                    let quantized = quantizer.quantize_tensor(&tensor, &config)?;
+                        if tensor.is_vision_tensor() && tensor.is_weight() {
+                            tracing::debug!("Preserving vision tensor as F16: {}", name);
+                        }
 
-                    // Per-worker progress increment under mutex —
-                    // ProgressReporter::ProgressBar is internally
-                    // atomic-counter-backed but the API requires
-                    // &self. Mutex is fine; contention is bounded by
-                    // worker count (8-16).
-                    if let Ok(pb) = pb_mutex.lock() {
-                        pb.inc(1);
-                    }
+                        let quantized = quantizer.quantize_tensor(&tensor, &config)?;
 
-                    Ok((name, quantized))
-                })
+                        // Per-worker progress increment under mutex —
+                        // ProgressReporter::ProgressBar is internally
+                        // atomic-counter-backed but the API requires
+                        // &self. Mutex is fine; contention is bounded by
+                        // worker count (8-16).
+                        if let Ok(pb) = pb_mutex.lock() {
+                            pb.inc(1);
+                        }
+
+                        Ok((name, quantized))
+                    },
+                )
                 .collect()
         });
 
-    let quantized_tensors: HashMap<String, crate::ir::QuantizedTensor> = quantized_results?
-        .into_iter()
-        .collect();
+    let quantized_tensors: HashMap<String, crate::ir::QuantizedTensor> =
+        quantized_results?.into_iter().collect();
 
     if let Ok(pb) = pb_mutex.into_inner() {
         let bf16 = bf16_counter.load(std::sync::atomic::Ordering::Relaxed);
@@ -584,12 +587,24 @@ mod tests {
             };
             let mut m = LazyTensorMap::new();
             for (name, shape, seed) in [
-                ("model.layers.0.self_attn.q_proj.weight", vec![64, 64], 0x10u8),
-                ("model.layers.0.self_attn.k_proj.weight", vec![64, 32], 0x20u8),
+                (
+                    "model.layers.0.self_attn.q_proj.weight",
+                    vec![64, 64],
+                    0x10u8,
+                ),
+                (
+                    "model.layers.0.self_attn.k_proj.weight",
+                    vec![64, 32],
+                    0x20u8,
+                ),
                 ("model.layers.0.mlp.gate_proj.weight", vec![64, 64], 0x30u8),
                 ("model.layers.0.mlp.up_proj.weight", vec![64, 64], 0x40u8),
                 ("model.layers.0.mlp.down_proj.weight", vec![64, 64], 0x50u8),
-                ("model.layers.1.self_attn.q_proj.weight", vec![64, 64], 0x60u8),
+                (
+                    "model.layers.1.self_attn.q_proj.weight",
+                    vec![64, 64],
+                    0x60u8,
+                ),
                 ("model.layers.0.input_layernorm.weight", vec![64], 0x70u8),
             ] {
                 let len = shape.iter().product::<usize>() * 2;
@@ -636,11 +651,16 @@ mod tests {
                 n_workers
             );
             for (name, s) in &serial.tensors {
-                let p = parallel.tensors.get(name).unwrap_or_else(|| {
-                    panic!("n_workers={}: missing tensor {}", n_workers, name)
-                });
+                let p = parallel
+                    .tensors
+                    .get(name)
+                    .unwrap_or_else(|| panic!("n_workers={}: missing tensor {}", n_workers, name));
                 assert_eq!(s.shape, p.shape, "n_workers={} {name} shape", n_workers);
-                assert_eq!(s.original_dtype, p.original_dtype, "n_workers={} {name} dtype", n_workers);
+                assert_eq!(
+                    s.original_dtype, p.original_dtype,
+                    "n_workers={} {name} dtype",
+                    n_workers
+                );
                 assert_eq!(s.data, p.data, "n_workers={} {name} bytes", n_workers);
                 assert_eq!(s.quant_info.method, p.quant_info.method);
                 assert_eq!(s.quant_info.bits, p.quant_info.bits);
@@ -709,7 +729,8 @@ mod tests {
 
         // Synthetic bf16 tensor — known value 1.0.
         let bf16_one_bytes = half::bf16::from_f32(1.0).to_le_bytes();
-        let bf16_data: Vec<u8> = (0..64 * 64 * 2).step_by(2)
+        let bf16_data: Vec<u8> = (0..64 * 64 * 2)
+            .step_by(2)
             .flat_map(|_| bf16_one_bytes)
             .collect();
 
@@ -784,7 +805,8 @@ mod tests {
         let result = quantize_model(&tensor_map, &metadata, &quantizer, 4, 32, &progress).unwrap();
 
         // Vision tensor should be preserved (F16)
-        let vision_t = &result.tensors["model.vision_tower.encoder.layers.0.self_attn.q_proj.weight"];
+        let vision_t =
+            &result.tensors["model.vision_tower.encoder.layers.0.self_attn.q_proj.weight"];
         assert!(
             vision_t.quant_info.preserved,
             "Vision weight tensor should be preserved at full precision"
@@ -813,10 +835,10 @@ mod tests {
     /// surface that production cmd_convert will call.
     #[test]
     fn variant_streaming_byte_identical_to_eager() {
+        use crate::calibrate::calibrator::CalibrationData;
         use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
         use crate::quantize::layer_mix::KQuantVariant;
         use crate::quantize::variant_quantizer::VariantKQuantizer;
-        use crate::calibrate::calibrator::CalibrationData;
 
         const QK_K: usize = 256;
         const N_LAYERS: usize = 32;
@@ -842,10 +864,10 @@ mod tests {
         //   4. blk.10.ffn_down.weight → Q4_K (use_more_bits=false at
         //      layer 10 of 32: 10 ≥ n/8=4, 10 < 7n/8=28, (10-4)%3=0)
         let fixtures: Vec<(&str, Vec<usize>, &str, usize)> = vec![
-            ("output.weight",            vec![1, QK_K], "Q6_K", 210),
-            ("blk.0.attn_v.weight",      vec![1, QK_K], "Q6_K", 210),
-            ("blk.5.attn_q.weight",      vec![1, QK_K], "Q4_K", 144),
-            ("blk.10.ffn_down.weight",   vec![1, QK_K], "Q4_K", 144),
+            ("output.weight", vec![1, QK_K], "Q6_K", 210),
+            ("blk.0.attn_v.weight", vec![1, QK_K], "Q6_K", 210),
+            ("blk.5.attn_q.weight", vec![1, QK_K], "Q4_K", 144),
+            ("blk.10.ffn_down.weight", vec![1, QK_K], "Q4_K", 144),
         ];
 
         let mut tensor_map = TensorMap::new();
@@ -867,16 +889,12 @@ mod tests {
         }
 
         let metadata = dummy_metadata();
-        let quantizer = VariantKQuantizer::new(
-            KQuantVariant::Q4_K_M,
-            CalibrationData::None,
-            N_LAYERS,
-        );
+        let quantizer =
+            VariantKQuantizer::new(KQuantVariant::Q4_K_M, CalibrationData::None, N_LAYERS);
         let progress = crate::progress::ProgressReporter::new();
 
         // Eager and streaming paths against same input.
-        let eager =
-            quantize_model(&tensor_map, &metadata, &quantizer, 0, 0, &progress).unwrap();
+        let eager = quantize_model(&tensor_map, &metadata, &quantizer, 0, 0, &progress).unwrap();
         let streaming = quantize_streaming(
             lazy_map, &metadata, &quantizer, 0, 0, &progress, /* bf16_to_f16 */ false,
         )
@@ -887,7 +905,10 @@ mod tests {
         assert_eq!(streaming.tensors.len(), 4);
         for (name, _shape, expected_type, expected_bytes) in &fixtures {
             let e = eager.tensors.get(*name).expect("eager tensor missing");
-            let s = streaming.tensors.get(*name).expect("streaming tensor missing");
+            let s = streaming
+                .tensors
+                .get(*name)
+                .expect("streaming tensor missing");
 
             // Policy branch: per-tensor target picked correctly.
             assert_eq!(
@@ -904,11 +925,13 @@ mod tests {
             // Codec path: bytes-per-block emitted by the codec match the
             // target's canonical block size.
             assert_eq!(
-                e.data.len(), *expected_bytes,
+                e.data.len(),
+                *expected_bytes,
                 "eager {name} block size mismatch"
             );
             assert_eq!(
-                s.data.len(), *expected_bytes,
+                s.data.len(),
+                *expected_bytes,
                 "streaming {name} block size mismatch"
             );
 
@@ -959,10 +982,10 @@ mod tests {
     /// compile rather than runs and produces garbage.
     #[test]
     fn variant_streaming_parallel_byte_identical_to_serial() {
+        use crate::calibrate::calibrator::CalibrationData;
         use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
         use crate::quantize::layer_mix::KQuantVariant;
         use crate::quantize::variant_quantizer::VariantKQuantizer;
-        use crate::calibrate::calibrator::CalibrationData;
 
         // compile-time Send + Sync guard: this fn won't compile if
         // VariantKQuantizer or CalibrationData lose Send+Sync.
@@ -987,12 +1010,12 @@ mod tests {
         // distribution across tensors with heterogeneous targets and
         // confirms parallel dispatch handles each branch correctly.
         let fixtures: Vec<(&str, Vec<usize>)> = vec![
-            ("output.weight",                vec![1, QK_K]),     // Q6_K bump
-            ("blk.0.attn_v.weight",          vec![1, QK_K]),     // Q6_K bump
-            ("blk.5.attn_q.weight",          vec![1, QK_K]),     // Q4_K base
-            ("blk.10.ffn_down.weight",       vec![1, QK_K]),     // Q4_K base
-            ("blk.20.ffn_down_exps.weight",  vec![1, QK_K]),     // Q4_K base (MoE)
-            ("blk.5.attn_norm.weight",       vec![16]),          // 1-D < 32 → preserve
+            ("output.weight", vec![1, QK_K]),               // Q6_K bump
+            ("blk.0.attn_v.weight", vec![1, QK_K]),         // Q6_K bump
+            ("blk.5.attn_q.weight", vec![1, QK_K]),         // Q4_K base
+            ("blk.10.ffn_down.weight", vec![1, QK_K]),      // Q4_K base
+            ("blk.20.ffn_down_exps.weight", vec![1, QK_K]), // Q4_K base (MoE)
+            ("blk.5.attn_norm.weight", vec![16]),           // 1-D < 32 → preserve
         ];
 
         let make_lazy_map = || -> LazyTensorMap {
@@ -1010,52 +1033,63 @@ mod tests {
 
         let metadata = dummy_metadata();
         let progress = crate::progress::ProgressReporter::new();
-        let q = VariantKQuantizer::new(
-            KQuantVariant::Q4_K_M,
-            CalibrationData::None,
-            N_LAYERS,
-        );
+        let q = VariantKQuantizer::new(KQuantVariant::Q4_K_M, CalibrationData::None, N_LAYERS);
 
-        let serial = quantize_streaming(
-            make_lazy_map(), &metadata, &q, 0, 0, &progress, false,
-        )
-        .unwrap();
+        let serial =
+            quantize_streaming(make_lazy_map(), &metadata, &q, 0, 0, &progress, false).unwrap();
 
         // Force >1 worker so rayon fan-out fires.  None defaults to
         // num_cpus; passing Some(4) clamps for determinism.
         let parallel = quantize_streaming_parallel(
-            make_lazy_map(), &metadata, &q, 0, 0, &progress, false, Some(4),
+            make_lazy_map(),
+            &metadata,
+            &q,
+            0,
+            0,
+            &progress,
+            false,
+            Some(4),
         )
         .unwrap();
 
-        assert_eq!(serial.tensors.len(), parallel.tensors.len(),
-            "tensor count diverged");
+        assert_eq!(
+            serial.tensors.len(),
+            parallel.tensors.len(),
+            "tensor count diverged"
+        );
         assert_eq!(serial.quant_method, parallel.quant_method);
         assert_eq!(serial.bits, parallel.bits);
         assert_eq!(serial.group_size, parallel.group_size);
 
         for (name, _shape) in &fixtures {
-            let s = serial.tensors.get(*name)
+            let s = serial
+                .tensors
+                .get(*name)
                 .unwrap_or_else(|| panic!("serial missing {name}"));
-            let p = parallel.tensors.get(*name)
+            let p = parallel
+                .tensors
+                .get(*name)
                 .unwrap_or_else(|| panic!("parallel missing {name}"));
             assert_eq!(s.shape, p.shape, "{name} shape");
             assert_eq!(s.original_dtype, p.original_dtype, "{name} dtype");
-            assert_eq!(s.quant_info.method, p.quant_info.method,
-                "{name} method");
+            assert_eq!(s.quant_info.method, p.quant_info.method, "{name} method");
             assert_eq!(
                 s.quant_info.ggml_type.as_deref(),
                 p.quant_info.ggml_type.as_deref(),
                 "{name} ggml_type"
             );
-            assert_eq!(s.quant_info.preserved, p.quant_info.preserved,
-                "{name} preserved");
+            assert_eq!(
+                s.quant_info.preserved, p.quant_info.preserved,
+                "{name} preserved"
+            );
             // The actual byte-identity check.
-            assert_eq!(s.data, p.data,
+            assert_eq!(
+                s.data, p.data,
                 "{name}: parallel bytes diverged from serial — \
                  rayon work distribution is non-deterministic for \
                  the variant Quantizer or VariantKQuantizer is not \
-                 thread-safe");
+                 thread-safe"
+            );
         }
     }
 
@@ -1078,12 +1112,12 @@ mod tests {
     /// high-importance accuracy).
     #[test]
     fn variant_imatrix_lowers_importance_weighted_error() {
-        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
-        use crate::quantize::layer_mix::KQuantVariant;
-        use crate::quantize::variant_quantizer::VariantKQuantizer;
         use crate::calibrate::calibrator::CalibrationData;
         use crate::calibrate::imatrix::ImatrixCollector;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
         use crate::quantize::k_quant::dequantize_row_q4_k_bytes;
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
 
         const QK_K: usize = 256;
         const N_BLOCKS: usize = 4;
@@ -1107,7 +1141,13 @@ mod tests {
         // Per-column importance weight for the SSE computation: square
         // of the activation magnitude (matches what the codec sees).
         let importance: Vec<f64> = (0..QK_K)
-            .map(|c| if c < HIGH_IMPORTANCE_COLS { 100.0_f64 } else { 0.01_f64 })
+            .map(|c| {
+                if c < HIGH_IMPORTANCE_COLS {
+                    100.0_f64
+                } else {
+                    0.01_f64
+                }
+            })
             .collect();
 
         // Adversarial-ish input that exposes codebook tradeoffs:
@@ -1152,19 +1192,22 @@ mod tests {
         let metadata = dummy_metadata();
         let progress = crate::progress::ProgressReporter::new();
 
-        let q_none = VariantKQuantizer::new(
-            KQuantVariant::Q4_K_M, CalibrationData::None, 32,
-        );
-        let q_imatrix = VariantKQuantizer::new(
-            KQuantVariant::Q4_K_M, imatrix, 32,
-        );
+        let q_none = VariantKQuantizer::new(KQuantVariant::Q4_K_M, CalibrationData::None, 32);
+        let q_imatrix = VariantKQuantizer::new(KQuantVariant::Q4_K_M, imatrix, 32);
 
-        let out_none = quantize_streaming(
-            make_lazy_map(), &metadata, &q_none, 0, 0, &progress, false,
-        ).unwrap();
+        let out_none =
+            quantize_streaming(make_lazy_map(), &metadata, &q_none, 0, 0, &progress, false)
+                .unwrap();
         let out_imatrix = quantize_streaming(
-            make_lazy_map(), &metadata, &q_imatrix, 0, 0, &progress, false,
-        ).unwrap();
+            make_lazy_map(),
+            &metadata,
+            &q_imatrix,
+            0,
+            0,
+            &progress,
+            false,
+        )
+        .unwrap();
 
         let bytes_none = &out_none.tensors[TENSOR].data;
         let bytes_imatrix = &out_imatrix.tensors[TENSOR].data;
@@ -1253,14 +1296,14 @@ mod tests {
     /// attn_q per `llama-quant.cpp`).
     #[test]
     fn variant_streaming_q5km_q6k_round_trip_rmse_bounds() {
+        use crate::calibrate::calibrator::CalibrationData;
         use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::k_quant::{
+            dequantize_row_q3_k_bytes, dequantize_row_q4_k_bytes, dequantize_row_q5_k_bytes,
+            dequantize_row_q6_k_bytes,
+        };
         use crate::quantize::layer_mix::KQuantVariant;
         use crate::quantize::variant_quantizer::VariantKQuantizer;
-        use crate::calibrate::calibrator::CalibrationData;
-        use crate::quantize::k_quant::{
-            dequantize_row_q3_k_bytes, dequantize_row_q4_k_bytes,
-            dequantize_row_q5_k_bytes, dequantize_row_q6_k_bytes,
-        };
 
         const QK_K: usize = 256;
         const N_BLOCKS: usize = 4;
@@ -1285,22 +1328,31 @@ mod tests {
         let progress = crate::progress::ProgressReporter::new();
 
         // Per-variant: (variant, expected_target, expected_block_size, rmse_bound, dequant_fn)
-        type DequantFn = fn(&[u8], &mut [f32])
-            -> Result<usize, crate::quantize::k_quant::KQuantError>;
+        type DequantFn =
+            fn(&[u8], &mut [f32]) -> Result<usize, crate::quantize::k_quant::KQuantError>;
         let cases: Vec<(KQuantVariant, &str, usize, f64, DequantFn)> = vec![
             // Q3_K family lands at base Q3_K on attn_q (no policy bumps for
             // any Q3_K variant on attn_q per `llama-quant.cpp`); RMSE bound
             // matches iter-7's `quantize_q3_k_round_trip_smooth_ramp_rmse`.
             (
-                KQuantVariant::Q3_K_S, "Q3_K", N_BLOCKS * 110, 0.10,
+                KQuantVariant::Q3_K_S,
+                "Q3_K",
+                N_BLOCKS * 110,
+                0.10,
                 dequantize_row_q3_k_bytes as DequantFn,
             ),
             (
-                KQuantVariant::Q3_K_M, "Q3_K", N_BLOCKS * 110, 0.10,
+                KQuantVariant::Q3_K_M,
+                "Q3_K",
+                N_BLOCKS * 110,
+                0.10,
                 dequantize_row_q3_k_bytes as DequantFn,
             ),
             (
-                KQuantVariant::Q3_K_L, "Q3_K", N_BLOCKS * 110, 0.10,
+                KQuantVariant::Q3_K_L,
+                "Q3_K",
+                N_BLOCKS * 110,
+                0.10,
                 dequantize_row_q3_k_bytes as DequantFn,
             ),
             // Q4_K_S lands at Q4_K base on attn_q (i_layer=5 ≥ 4 so the
@@ -1308,20 +1360,32 @@ mod tests {
             // attn_q is never bumped anyway); RMSE bound matches the
             // direct-codec gate (≤ 0.05 on smooth ramp).
             (
-                KQuantVariant::Q4_K_S, "Q4_K", N_BLOCKS * 144, 0.05,
+                KQuantVariant::Q4_K_S,
+                "Q4_K",
+                N_BLOCKS * 144,
+                0.05,
                 dequantize_row_q4_k_bytes as DequantFn,
             ),
             // Q5_K_S has no upgrades anywhere — every tensor at Q5_K base.
             (
-                KQuantVariant::Q5_K_S, "Q5_K", N_BLOCKS * 176, 0.025,
+                KQuantVariant::Q5_K_S,
+                "Q5_K",
+                N_BLOCKS * 176,
+                0.025,
                 dequantize_row_q5_k_bytes as DequantFn,
             ),
             (
-                KQuantVariant::Q5_K_M, "Q5_K", N_BLOCKS * 176, 0.025,
+                KQuantVariant::Q5_K_M,
+                "Q5_K",
+                N_BLOCKS * 176,
+                0.025,
                 dequantize_row_q5_k_bytes as DequantFn,
             ),
             (
-                KQuantVariant::Q6_K, "Q6_K", N_BLOCKS * 210, 0.012,
+                KQuantVariant::Q6_K,
+                "Q6_K",
+                N_BLOCKS * 210,
+                0.012,
                 dequantize_row_q6_k_bytes as DequantFn,
             ),
         ];
@@ -1339,17 +1403,21 @@ mod tests {
             )
             .unwrap_or_else(|e| panic!("streaming failed for {variant}: {e}"));
 
-            let t = out.tensors.get(TENSOR)
+            let t = out
+                .tensors
+                .get(TENSOR)
                 .unwrap_or_else(|| panic!("{variant}: missing tensor"));
 
             // structural: variant routed to the expected base target
             assert_eq!(
-                t.data.len(), expected_bytes,
+                t.data.len(),
+                expected_bytes,
                 "{variant}: bytes ({}) != expected ({expected_bytes})",
                 t.data.len()
             );
             assert_eq!(
-                t.quant_info.ggml_type.as_deref(), Some(expected_type),
+                t.quant_info.ggml_type.as_deref(),
+                Some(expected_type),
                 "{variant}: ggml_type mismatch"
             );
 
@@ -1357,8 +1425,10 @@ mod tests {
             let mut decoded = vec![0.0_f32; TOTAL];
             let n_decoded = dequant(&t.data, &mut decoded)
                 .unwrap_or_else(|e| panic!("{variant}: dequant failed: {e:?}"));
-            assert_eq!(n_decoded, TOTAL,
-                "{variant}: dequant should populate every element");
+            assert_eq!(
+                n_decoded, TOTAL,
+                "{variant}: dequant should populate every element"
+            );
 
             // RMSE bound vs F16-cast original (apples-to-apples — codec
             // saw the F16-cast values).
@@ -1429,10 +1499,10 @@ mod tests {
     /// base.  At i=6, (6-4)%3=2 → use_more_bits=true → Q4_K.
     #[test]
     fn variant_streaming_q3km_policy_branches() {
+        use crate::calibrate::calibrator::CalibrationData;
         use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
         use crate::quantize::layer_mix::KQuantVariant;
         use crate::quantize::variant_quantizer::VariantKQuantizer;
-        use crate::calibrate::calibrator::CalibrationData;
 
         const QK_K: usize = 256;
         const N_LAYERS: usize = 32;
@@ -1449,13 +1519,13 @@ mod tests {
 
         // (tensor_name, expected_ggml_type, expected_block_bytes)
         let cases: Vec<(&str, &str, usize)> = vec![
-            ("output.weight",                "Q6_K", 210),
-            ("blk.0.attn_v.weight",          "Q5_K", 176),
-            ("blk.5.attn_v.weight",          "Q4_K", 144),
-            ("blk.0.ffn_down.weight",        "Q5_K", 176),
-            ("blk.6.ffn_down.weight",        "Q4_K", 144),
-            ("blk.5.ffn_down.weight",        "Q3_K", 110),
-            ("blk.10.attn_q.weight",         "Q3_K", 110),
+            ("output.weight", "Q6_K", 210),
+            ("blk.0.attn_v.weight", "Q5_K", 176),
+            ("blk.5.attn_v.weight", "Q4_K", 144),
+            ("blk.0.ffn_down.weight", "Q5_K", 176),
+            ("blk.6.ffn_down.weight", "Q4_K", 144),
+            ("blk.5.ffn_down.weight", "Q3_K", 110),
+            ("blk.10.attn_q.weight", "Q3_K", 110),
         ];
 
         let mut lazy_map = LazyTensorMap::new();
@@ -1468,31 +1538,35 @@ mod tests {
 
         let metadata = dummy_metadata();
         let progress = crate::progress::ProgressReporter::new();
-        let q = VariantKQuantizer::new(
-            KQuantVariant::Q3_K_M,
-            CalibrationData::None,
-            N_LAYERS,
-        );
+        let q = VariantKQuantizer::new(KQuantVariant::Q3_K_M, CalibrationData::None, N_LAYERS);
 
         let out = quantize_streaming(
             lazy_map, &metadata, &q, 0, 0, &progress, /* bf16_to_f16 */ false,
         )
         .expect("Q3_K_M streaming should succeed");
 
-        assert_eq!(out.tensors.len(), cases.len(),
-            "expected {} tensors in output", cases.len());
+        assert_eq!(
+            out.tensors.len(),
+            cases.len(),
+            "expected {} tensors in output",
+            cases.len()
+        );
         assert_eq!(out.quant_method, "Q3_K_M");
 
         for (name, expected_type, expected_bytes) in cases {
-            let t = out.tensors.get(name)
+            let t = out
+                .tensors
+                .get(name)
                 .unwrap_or_else(|| panic!("missing {name} in streaming output"));
             assert_eq!(
-                t.quant_info.ggml_type.as_deref(), Some(expected_type),
+                t.quant_info.ggml_type.as_deref(),
+                Some(expected_type),
                 "Q3_K_M policy regression on {name}: expected ggml_type={expected_type}, got {:?}",
                 t.quant_info.ggml_type
             );
             assert_eq!(
-                t.data.len(), expected_bytes,
+                t.data.len(),
+                expected_bytes,
                 "Q3_K_M policy regression on {name}: expected {expected_bytes} block bytes, got {}",
                 t.data.len()
             );
@@ -1506,10 +1580,10 @@ mod tests {
     /// arms get reverted to the Q3_K_M conditional logic.
     #[test]
     fn variant_streaming_q3kl_policy_branches() {
+        use crate::calibrate::calibrator::CalibrationData;
         use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
         use crate::quantize::layer_mix::KQuantVariant;
         use crate::quantize::variant_quantizer::VariantKQuantizer;
-        use crate::calibrate::calibrator::CalibrationData;
 
         const QK_K: usize = 256;
         const N_LAYERS: usize = 32;
@@ -1525,12 +1599,12 @@ mod tests {
         };
 
         let cases: Vec<(&str, &str, usize)> = vec![
-            ("output.weight",                "Q6_K", 210),
-            ("blk.0.attn_v.weight",          "Q5_K", 176),
-            ("blk.15.attn_v.weight",         "Q5_K", 176), // Q3_K_L: attn_v always Q5_K
-            ("blk.0.ffn_down.weight",        "Q5_K", 176),
-            ("blk.5.ffn_down.weight",        "Q5_K", 176), // Q3_K_L: ffn_down always Q5_K (no use_more_bits gate)
-            ("blk.10.attn_q.weight",         "Q3_K", 110),
+            ("output.weight", "Q6_K", 210),
+            ("blk.0.attn_v.weight", "Q5_K", 176),
+            ("blk.15.attn_v.weight", "Q5_K", 176), // Q3_K_L: attn_v always Q5_K
+            ("blk.0.ffn_down.weight", "Q5_K", 176),
+            ("blk.5.ffn_down.weight", "Q5_K", 176), // Q3_K_L: ffn_down always Q5_K (no use_more_bits gate)
+            ("blk.10.attn_q.weight", "Q3_K", 110),
         ];
 
         let mut lazy_map = LazyTensorMap::new();
@@ -1543,23 +1617,20 @@ mod tests {
 
         let metadata = dummy_metadata();
         let progress = crate::progress::ProgressReporter::new();
-        let q = VariantKQuantizer::new(
-            KQuantVariant::Q3_K_L,
-            CalibrationData::None,
-            N_LAYERS,
-        );
+        let q = VariantKQuantizer::new(KQuantVariant::Q3_K_L, CalibrationData::None, N_LAYERS);
 
-        let out = quantize_streaming(
-            lazy_map, &metadata, &q, 0, 0, &progress, false,
-        )
-        .expect("Q3_K_L streaming should succeed");
+        let out = quantize_streaming(lazy_map, &metadata, &q, 0, 0, &progress, false)
+            .expect("Q3_K_L streaming should succeed");
 
         assert_eq!(out.quant_method, "Q3_K_L");
         for (name, expected_type, expected_bytes) in cases {
-            let t = out.tensors.get(name)
+            let t = out
+                .tensors
+                .get(name)
                 .unwrap_or_else(|| panic!("missing {name}"));
             assert_eq!(
-                t.quant_info.ggml_type.as_deref(), Some(expected_type),
+                t.quant_info.ggml_type.as_deref(),
+                Some(expected_type),
                 "Q3_K_L on {name}: expected {expected_type}"
             );
             assert_eq!(t.data.len(), expected_bytes, "Q3_K_L on {name}");
@@ -1582,10 +1653,10 @@ mod tests {
     ///   7. `blk.10.attn_q.weight`     → Q4_K (base)
     #[test]
     fn variant_streaming_q4ks_policy_branches() {
+        use crate::calibrate::calibrator::CalibrationData;
         use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
         use crate::quantize::layer_mix::KQuantVariant;
         use crate::quantize::variant_quantizer::VariantKQuantizer;
-        use crate::calibrate::calibrator::CalibrationData;
 
         const QK_K: usize = 256;
         const N_LAYERS: usize = 32;
@@ -1601,13 +1672,13 @@ mod tests {
         };
 
         let cases: Vec<(&str, &str, usize)> = vec![
-            ("output.weight",                "Q4_K", 144),
-            ("blk.0.attn_v.weight",          "Q5_K", 176),
-            ("blk.3.attn_v.weight",          "Q5_K", 176),
-            ("blk.4.attn_v.weight",          "Q4_K", 144),
-            ("blk.20.attn_v.weight",         "Q4_K", 144),
-            ("blk.0.ffn_down.weight",        "Q4_K", 144),
-            ("blk.10.attn_q.weight",         "Q4_K", 144),
+            ("output.weight", "Q4_K", 144),
+            ("blk.0.attn_v.weight", "Q5_K", 176),
+            ("blk.3.attn_v.weight", "Q5_K", 176),
+            ("blk.4.attn_v.weight", "Q4_K", 144),
+            ("blk.20.attn_v.weight", "Q4_K", 144),
+            ("blk.0.ffn_down.weight", "Q4_K", 144),
+            ("blk.10.attn_q.weight", "Q4_K", 144),
         ];
 
         let mut lazy_map = LazyTensorMap::new();
@@ -1620,28 +1691,28 @@ mod tests {
 
         let metadata = dummy_metadata();
         let progress = crate::progress::ProgressReporter::new();
-        let q = VariantKQuantizer::new(
-            KQuantVariant::Q4_K_S,
-            CalibrationData::None,
-            N_LAYERS,
-        );
+        let q = VariantKQuantizer::new(KQuantVariant::Q4_K_S, CalibrationData::None, N_LAYERS);
 
-        let out = quantize_streaming(
-            lazy_map, &metadata, &q, 0, 0, &progress, false,
-        )
-        .expect("Q4_K_S streaming should succeed");
+        let out = quantize_streaming(lazy_map, &metadata, &q, 0, 0, &progress, false)
+            .expect("Q4_K_S streaming should succeed");
 
         assert_eq!(out.quant_method, "Q4_K_S");
         for (name, expected_type, expected_bytes) in cases {
-            let t = out.tensors.get(name)
+            let t = out
+                .tensors
+                .get(name)
                 .unwrap_or_else(|| panic!("missing {name}"));
             assert_eq!(
-                t.quant_info.ggml_type.as_deref(), Some(expected_type),
+                t.quant_info.ggml_type.as_deref(),
+                Some(expected_type),
                 "Q4_K_S on {name}: expected {expected_type}, got {:?}",
                 t.quant_info.ggml_type
             );
-            assert_eq!(t.data.len(), expected_bytes,
-                "Q4_K_S on {name}: expected {expected_bytes} bytes");
+            assert_eq!(
+                t.data.len(),
+                expected_bytes,
+                "Q4_K_S on {name}: expected {expected_bytes} bytes"
+            );
         }
     }
 
@@ -1655,10 +1726,10 @@ mod tests {
     /// llama.cpp).
     #[test]
     fn variant_streaming_q5ks_policy_all_base() {
+        use crate::calibrate::calibrator::CalibrationData;
         use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
         use crate::quantize::layer_mix::KQuantVariant;
         use crate::quantize::variant_quantizer::VariantKQuantizer;
-        use crate::calibrate::calibrator::CalibrationData;
 
         const QK_K: usize = 256;
         const N_LAYERS: usize = 32;
@@ -1693,22 +1764,20 @@ mod tests {
 
         let metadata = dummy_metadata();
         let progress = crate::progress::ProgressReporter::new();
-        let q = VariantKQuantizer::new(
-            KQuantVariant::Q5_K_S,
-            CalibrationData::None,
-            N_LAYERS,
-        );
+        let q = VariantKQuantizer::new(KQuantVariant::Q5_K_S, CalibrationData::None, N_LAYERS);
 
-        let out = quantize_streaming(
-            lazy_map, &metadata, &q, 0, 0, &progress, false,
-        ).expect("Q5_K_S streaming should succeed");
+        let out = quantize_streaming(lazy_map, &metadata, &q, 0, 0, &progress, false)
+            .expect("Q5_K_S streaming should succeed");
 
         assert_eq!(out.quant_method, "Q5_K_S");
         for name in names {
-            let t = out.tensors.get(name)
+            let t = out
+                .tensors
+                .get(name)
                 .unwrap_or_else(|| panic!("missing {name}"));
             assert_eq!(
-                t.quant_info.ggml_type.as_deref(), Some("Q5_K"),
+                t.quant_info.ggml_type.as_deref(),
+                Some("Q5_K"),
                 "Q5_K_S on {name}: should always land at Q5_K base"
             );
             assert_eq!(t.data.len(), 176, "Q5_K_S {name}: 176 bytes (Q5_K block)");
@@ -1717,11 +1786,11 @@ mod tests {
 
     #[test]
     fn variant_streaming_q4km_round_trip_rmse_bound() {
+        use crate::calibrate::calibrator::CalibrationData;
         use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::k_quant::dequantize_row_q4_k_bytes;
         use crate::quantize::layer_mix::KQuantVariant;
         use crate::quantize::variant_quantizer::VariantKQuantizer;
-        use crate::calibrate::calibrator::CalibrationData;
-        use crate::quantize::k_quant::dequantize_row_q4_k_bytes;
 
         // Use multiple super-blocks (4 × QK_K = 1024 elements) so RMSE
         // averages over enough samples to be statistically meaningful
@@ -1751,11 +1820,7 @@ mod tests {
 
         let metadata = dummy_metadata();
         let progress = crate::progress::ProgressReporter::new();
-        let q = VariantKQuantizer::new(
-            KQuantVariant::Q4_K_M,
-            CalibrationData::None,
-            32,
-        );
+        let q = VariantKQuantizer::new(KQuantVariant::Q4_K_M, CalibrationData::None, 32);
 
         let out = quantize_streaming(
             lazy_map, &metadata, &q, 0, 0, &progress, /* bf16_to_f16 */ false,
@@ -1764,8 +1829,12 @@ mod tests {
 
         let t = out.tensors.get(TENSOR).expect("missing tensor");
         // structural sanity: 4 super-blocks × 144 bytes = 576 bytes Q4_K
-        assert_eq!(t.data.len(), N_BLOCKS * 144,
-            "Q4_K bytes count mismatch: {} blocks × 144", N_BLOCKS);
+        assert_eq!(
+            t.data.len(),
+            N_BLOCKS * 144,
+            "Q4_K bytes count mismatch: {} blocks × 144",
+            N_BLOCKS
+        );
         assert_eq!(t.quant_info.ggml_type.as_deref(), Some("Q4_K"));
 
         // Dequantize back to F32 via the same flat-bytes path the GGUF
@@ -1773,8 +1842,7 @@ mod tests {
         let mut decoded = vec![0.0_f32; TOTAL];
         let n_decoded = dequantize_row_q4_k_bytes(&t.data, &mut decoded)
             .expect("dequantize_row_q4_k_bytes failed");
-        assert_eq!(n_decoded, TOTAL,
-            "dequant should populate every element");
+        assert_eq!(n_decoded, TOTAL, "dequant should populate every element");
 
         // The F16 cast at input introduces ~6e-4 RMSE at most — well
         // below the Q4_K bound — so we compare decoded vs the F16-cast
@@ -1807,8 +1875,10 @@ mod tests {
         // Sanity: decoded values are not all-zero (catches a bytes-tag
         // mismatch where dequant treats the buffer as zeros).
         let nonzero_count = decoded.iter().filter(|v| v.abs() > 1e-6).count();
-        assert!(nonzero_count > TOTAL / 2,
-            "decoded output is mostly zero — likely a target/tag mismatch");
+        assert!(
+            nonzero_count > TOTAL / 2,
+            "decoded output is mostly zero — likely a target/tag mismatch"
+        );
     }
 
     /// ADR-014 P7 iter-3w — proves the imatrix calibration path is
@@ -1833,11 +1903,11 @@ mod tests {
     /// to different codebooks → different quantized bytes.
     #[test]
     fn variant_imatrix_diverges_from_none_through_streaming() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::calibrate::imatrix::ImatrixCollector;
         use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
         use crate::quantize::layer_mix::KQuantVariant;
         use crate::quantize::variant_quantizer::VariantKQuantizer;
-        use crate::calibrate::calibrator::CalibrationData;
-        use crate::calibrate::imatrix::ImatrixCollector;
 
         const QK_K: usize = 256;
         const N_LAYERS: usize = 32;
@@ -1881,34 +1951,40 @@ mod tests {
         assert!(imatrix.is_some(), "imatrix should be populated");
 
         // Run the SAME input through BOTH paths.
-        let q_none = VariantKQuantizer::new(
-            KQuantVariant::Q4_K_M,
-            CalibrationData::None,
-            N_LAYERS,
-        );
-        let q_imatrix = VariantKQuantizer::new(
-            KQuantVariant::Q4_K_M,
-            imatrix,
-            N_LAYERS,
-        );
+        let q_none = VariantKQuantizer::new(KQuantVariant::Q4_K_M, CalibrationData::None, N_LAYERS);
+        let q_imatrix = VariantKQuantizer::new(KQuantVariant::Q4_K_M, imatrix, N_LAYERS);
 
-        let out_none = quantize_streaming(
-            make_lazy_map(), &metadata, &q_none, 0, 0, &progress, false,
-        )
-        .unwrap();
+        let out_none =
+            quantize_streaming(make_lazy_map(), &metadata, &q_none, 0, 0, &progress, false)
+                .unwrap();
         let out_imatrix = quantize_streaming(
-            make_lazy_map(), &metadata, &q_imatrix, 0, 0, &progress, false,
+            make_lazy_map(),
+            &metadata,
+            &q_imatrix,
+            0,
+            0,
+            &progress,
+            false,
         )
         .unwrap();
 
         let t_none = out_none.tensors.get(TENSOR).expect("none-path missing");
-        let t_imatrix = out_imatrix.tensors.get(TENSOR).expect("imatrix-path missing");
+        let t_imatrix = out_imatrix
+            .tensors
+            .get(TENSOR)
+            .expect("imatrix-path missing");
 
         // Both produce Q4_K blocks (same target, same size).
-        assert_eq!(t_none.data.len(), 144,
-            "none path should emit one Q4_K block");
-        assert_eq!(t_imatrix.data.len(), 144,
-            "imatrix path should emit one Q4_K block");
+        assert_eq!(
+            t_none.data.len(),
+            144,
+            "none path should emit one Q4_K block"
+        );
+        assert_eq!(
+            t_imatrix.data.len(),
+            144,
+            "imatrix path should emit one Q4_K block"
+        );
         assert_eq!(
             t_none.quant_info.ggml_type.as_deref(),
             t_imatrix.quant_info.ggml_type.as_deref(),
@@ -1945,11 +2021,11 @@ mod tests {
     /// target and bytes are directly comparable (110 byte block).
     #[test]
     fn variant_imatrix_q3km_diverges_from_none_through_streaming() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::calibrate::imatrix::ImatrixCollector;
         use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
         use crate::quantize::layer_mix::KQuantVariant;
         use crate::quantize::variant_quantizer::VariantKQuantizer;
-        use crate::calibrate::calibrator::CalibrationData;
-        use crate::calibrate::imatrix::ImatrixCollector;
 
         const QK_K: usize = 256;
         const N_LAYERS: usize = 32;
@@ -1988,38 +2064,48 @@ mod tests {
         assert!(imatrix.is_some(), "imatrix calibration should be populated");
 
         // Run SAME input through Q3_K_M with NoneCalibrator vs imatrix.
-        let q_none = VariantKQuantizer::new(
-            KQuantVariant::Q3_K_M,
-            CalibrationData::None,
-            N_LAYERS,
-        );
-        let q_imatrix = VariantKQuantizer::new(
-            KQuantVariant::Q3_K_M,
-            imatrix,
-            N_LAYERS,
-        );
+        let q_none = VariantKQuantizer::new(KQuantVariant::Q3_K_M, CalibrationData::None, N_LAYERS);
+        let q_imatrix = VariantKQuantizer::new(KQuantVariant::Q3_K_M, imatrix, N_LAYERS);
 
-        let out_none = quantize_streaming(
-            make_lazy_map(), &metadata, &q_none, 0, 0, &progress, false,
-        ).unwrap();
+        let out_none =
+            quantize_streaming(make_lazy_map(), &metadata, &q_none, 0, 0, &progress, false)
+                .unwrap();
         let out_imatrix = quantize_streaming(
-            make_lazy_map(), &metadata, &q_imatrix, 0, 0, &progress, false,
-        ).unwrap();
+            make_lazy_map(),
+            &metadata,
+            &q_imatrix,
+            0,
+            0,
+            &progress,
+            false,
+        )
+        .unwrap();
 
         let t_none = out_none.tensors.get(TENSOR).expect("none-path missing");
-        let t_imatrix = out_imatrix.tensors.get(TENSOR).expect("imatrix-path missing");
+        let t_imatrix = out_imatrix
+            .tensors
+            .get(TENSOR)
+            .expect("imatrix-path missing");
 
         // Both produce Q3_K blocks (same target, same size).
-        assert_eq!(t_none.data.len(), 110,
-            "none path should emit one Q3_K block (110 bytes)");
-        assert_eq!(t_imatrix.data.len(), 110,
-            "imatrix path should emit one Q3_K block (110 bytes)");
         assert_eq!(
-            t_none.quant_info.ggml_type.as_deref(), Some("Q3_K"),
+            t_none.data.len(),
+            110,
+            "none path should emit one Q3_K block (110 bytes)"
+        );
+        assert_eq!(
+            t_imatrix.data.len(),
+            110,
+            "imatrix path should emit one Q3_K block (110 bytes)"
+        );
+        assert_eq!(
+            t_none.quant_info.ggml_type.as_deref(),
+            Some("Q3_K"),
             "none path should tag Q3_K"
         );
         assert_eq!(
-            t_imatrix.quant_info.ggml_type.as_deref(), Some("Q3_K"),
+            t_imatrix.quant_info.ggml_type.as_deref(),
+            Some("Q3_K"),
             "imatrix path should tag Q3_K"
         );
 
@@ -2058,12 +2144,12 @@ mod tests {
     /// low-mag/low-importance.
     #[test]
     fn variant_imatrix_q3km_lowers_importance_weighted_error() {
-        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
-        use crate::quantize::layer_mix::KQuantVariant;
-        use crate::quantize::variant_quantizer::VariantKQuantizer;
         use crate::calibrate::calibrator::CalibrationData;
         use crate::calibrate::imatrix::ImatrixCollector;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
         use crate::quantize::k_quant::dequantize_row_q3_k_bytes;
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
 
         const QK_K: usize = 256;
         const N_BLOCKS: usize = 4;
@@ -2085,7 +2171,13 @@ mod tests {
         // Per-column importance for the SSE computation (matches the
         // codec's per-column weighting).
         let importance: Vec<f64> = (0..QK_K)
-            .map(|c| if c < HIGH_IMPORTANCE_COLS { 100.0_f64 } else { 0.01_f64 })
+            .map(|c| {
+                if c < HIGH_IMPORTANCE_COLS {
+                    100.0_f64
+                } else {
+                    0.01_f64
+                }
+            })
             .collect();
 
         // Adversarial input: high-importance cols get wide range,
@@ -2123,19 +2215,22 @@ mod tests {
 
         let metadata = dummy_metadata();
         let progress = crate::progress::ProgressReporter::new();
-        let q_none = VariantKQuantizer::new(
-            KQuantVariant::Q3_K_M, CalibrationData::None, 32,
-        );
-        let q_imatrix = VariantKQuantizer::new(
-            KQuantVariant::Q3_K_M, imatrix, 32,
-        );
+        let q_none = VariantKQuantizer::new(KQuantVariant::Q3_K_M, CalibrationData::None, 32);
+        let q_imatrix = VariantKQuantizer::new(KQuantVariant::Q3_K_M, imatrix, 32);
 
-        let out_none = quantize_streaming(
-            make_lazy_map(), &metadata, &q_none, 0, 0, &progress, false,
-        ).unwrap();
+        let out_none =
+            quantize_streaming(make_lazy_map(), &metadata, &q_none, 0, 0, &progress, false)
+                .unwrap();
         let out_imatrix = quantize_streaming(
-            make_lazy_map(), &metadata, &q_imatrix, 0, 0, &progress, false,
-        ).unwrap();
+            make_lazy_map(),
+            &metadata,
+            &q_imatrix,
+            0,
+            0,
+            &progress,
+            false,
+        )
+        .unwrap();
 
         let bytes_none = &out_none.tensors[TENSOR].data;
         let bytes_imatrix = &out_imatrix.tensors[TENSOR].data;
@@ -2183,10 +2278,10 @@ mod tests {
     /// test exercises it without code changes here.
     #[test]
     fn variant_menu_smoke_through_streaming() {
+        use crate::calibrate::calibrator::CalibrationData;
         use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
         use crate::quantize::layer_mix::KQuantVariant;
         use crate::quantize::variant_quantizer::VariantKQuantizer;
-        use crate::calibrate::calibrator::CalibrationData;
 
         const QK_K: usize = 256;
         const N_LAYERS: usize = 32;
@@ -2209,6 +2304,7 @@ mod tests {
         for variant in KQuantVariant::all() {
             // expected block size from the variant's base target
             let (expected_type, expected_bytes): (&str, usize) = match variant.base_target() {
+                crate::quantize::k_quant_codec::KQuantTarget::Q2K => ("Q2_K", 84),
                 crate::quantize::k_quant_codec::KQuantTarget::Q3K => ("Q3_K", 110),
                 crate::quantize::k_quant_codec::KQuantTarget::Q4K => ("Q4_K", 144),
                 crate::quantize::k_quant_codec::KQuantTarget::Q5K => ("Q5_K", 176),
@@ -2238,11 +2334,15 @@ mod tests {
                 "{variant}: ggml_type"
             );
             assert_eq!(
-                t.data.len(), expected_bytes,
+                t.data.len(),
+                expected_bytes,
                 "{variant}: emitted block size"
             );
-            assert_eq!(out.quant_method, variant.name(),
-                "{variant}: quant_method tag");
+            assert_eq!(
+                out.quant_method,
+                variant.name(),
+                "{variant}: quant_method tag"
+            );
         }
     }
 
@@ -2259,10 +2359,10 @@ mod tests {
     ///    where MoE expert tensors fell through to the `Other` category).
     #[test]
     fn variant_streaming_honors_iter3u_moe_classification() {
+        use crate::calibrate::calibrator::CalibrationData;
         use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
         use crate::quantize::layer_mix::KQuantVariant;
         use crate::quantize::variant_quantizer::VariantKQuantizer;
-        use crate::calibrate::calibrator::CalibrationData;
 
         const QK_K: usize = 256;
         const N_LAYERS: usize = 32;
@@ -2288,9 +2388,24 @@ mod tests {
         //                                            the documented
         //                                            iter-3u behavior)
         let fixtures: Vec<(&str, Vec<usize>, &str, Option<&str>)> = vec![
-            ("blk.0.ffn_gate_inp.weight",  vec![1, QK_K], "passthrough",         None),
-            ("blk.0.ffn_down_exps.weight", vec![1, QK_K], "k_quant_codec_direct", Some("Q6_K")),
-            ("blk.0.ffn_up_exps.weight",   vec![1, QK_K], "k_quant_codec_direct", Some("Q4_K")),
+            (
+                "blk.0.ffn_gate_inp.weight",
+                vec![1, QK_K],
+                "passthrough",
+                None,
+            ),
+            (
+                "blk.0.ffn_down_exps.weight",
+                vec![1, QK_K],
+                "k_quant_codec_direct",
+                Some("Q6_K"),
+            ),
+            (
+                "blk.0.ffn_up_exps.weight",
+                vec![1, QK_K],
+                "k_quant_codec_direct",
+                Some("Q4_K"),
+            ),
         ];
 
         let mut lazy_map = LazyTensorMap::new();
@@ -2304,11 +2419,8 @@ mod tests {
         }
 
         let metadata = dummy_metadata();
-        let quantizer = VariantKQuantizer::new(
-            KQuantVariant::Q4_K_M,
-            CalibrationData::None,
-            N_LAYERS,
-        );
+        let quantizer =
+            VariantKQuantizer::new(KQuantVariant::Q4_K_M, CalibrationData::None, N_LAYERS);
         let progress = crate::progress::ProgressReporter::new();
 
         let result = quantize_streaming(
@@ -2317,8 +2429,10 @@ mod tests {
         .unwrap();
 
         for (name, _shape, expected_method, expected_type) in &fixtures {
-            let t = result.tensors.get(*name).unwrap_or_else(||
-                panic!("streaming output missing {name}"));
+            let t = result
+                .tensors
+                .get(*name)
+                .unwrap_or_else(|| panic!("streaming output missing {name}"));
             assert_eq!(
                 t.quant_info.method, *expected_method,
                 "{name} method mismatch (iter-3u)"
@@ -2334,7 +2448,8 @@ mod tests {
                 // preserved 1:1, NOT block-quantized.
                 let len: usize = QK_K;
                 assert_eq!(
-                    t.data.len(), len * 2,
+                    t.data.len(),
+                    len * 2,
                     "{name} should preserve F16 bytes (2 per element)"
                 );
                 assert!(t.quant_info.preserved, "{name} should be marked preserved");
@@ -2347,7 +2462,8 @@ mod tests {
                     _ => unreachable!(),
                 };
                 assert_eq!(
-                    t.data.len(), expected_bytes,
+                    t.data.len(),
+                    expected_bytes,
                     "{name} should emit {expected_bytes}-byte blocks for {}",
                     expected_type.unwrap()
                 );

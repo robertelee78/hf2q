@@ -76,6 +76,15 @@ pub enum LayerMixError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum KQuantVariant {
+    /// `Q2_K_S` — base Q2_K, minimal upgrades.  Output → Q6_K (K-family
+    /// fall-through `llama-quant.cpp:439-460`); attn_v → Q4_K (modern
+    /// n_gqa>=4 default per `:515-517`); ffn_down i_layer<n_layer/8
+    /// → Q4_K else base (`:572-574`).
+    Q2_K_S,
+    /// `Q2_K` — default Q2 variant.  Output → Q6_K; attn_v → Q4_K
+    /// (modern n_gqa>=4 default per `:512-514`); ffn_down → Q3_K
+    /// always (`:571`).
+    Q2_K,
     /// `Q3_K_S` — base Q3_K, minimal upgrades. Output bumps to Q6_K
     /// per `llama-quant.cpp:439-460`.
     Q3_K_S,
@@ -105,6 +114,8 @@ impl KQuantVariant {
     /// Parse a user-supplied variant string.
     pub fn parse(variant: &str) -> Result<Self, LayerMixError> {
         match variant {
+            "Q2_K_S" | "q2_k_s" => Ok(Self::Q2_K_S),
+            "Q2_K" | "q2_k" => Ok(Self::Q2_K),
             "Q3_K_S" | "q3_k_s" => Ok(Self::Q3_K_S),
             "Q3_K_M" | "q3_k_m" | "Q3_K" | "q3_k" => Ok(Self::Q3_K_M),
             "Q3_K_L" | "q3_k_l" => Ok(Self::Q3_K_L),
@@ -123,6 +134,7 @@ impl KQuantVariant {
     /// per-tensor upgrades).
     pub fn base_target(&self) -> KQuantTarget {
         match self {
+            Self::Q2_K_S | Self::Q2_K => KQuantTarget::Q2K,
             Self::Q3_K_S | Self::Q3_K_M | Self::Q3_K_L => KQuantTarget::Q3K,
             Self::Q4_K_S | Self::Q4_K_M => KQuantTarget::Q4K,
             Self::Q5_K_S | Self::Q5_K_M => KQuantTarget::Q5K,
@@ -133,6 +145,8 @@ impl KQuantVariant {
     /// Canonical name for logging / `quant_info.method` strings.
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Q2_K_S => "Q2_K_S",
+            Self::Q2_K => "Q2_K",
             Self::Q3_K_S => "Q3_K_S",
             Self::Q3_K_M => "Q3_K_M",
             Self::Q3_K_L => "Q3_K_L",
@@ -150,6 +164,8 @@ impl KQuantVariant {
     /// the variants by hand.
     pub fn all() -> &'static [Self] {
         &[
+            Self::Q2_K_S,
+            Self::Q2_K,
             Self::Q3_K_S,
             Self::Q3_K_M,
             Self::Q3_K_L,
@@ -404,7 +420,9 @@ pub fn target_for(
             // (the OUTPUT branch falls through `else if (new_type !=
             // GGML_TYPE_Q8_0) new_type = GGML_TYPE_Q6_K;` for K-family
             // ftypes).
-            KQuantVariant::Q3_K_S
+            KQuantVariant::Q2_K_S
+            | KQuantVariant::Q2_K
+            | KQuantVariant::Q3_K_S
             | KQuantVariant::Q3_K_M
             | KQuantVariant::Q3_K_L
             | KQuantVariant::Q4_K_M
@@ -441,6 +459,11 @@ pub fn target_for(
             }
             // Q3_K_L: attn_v → Q5_K (`llama-quant.cpp:530`).
             KQuantVariant::Q3_K_L => KQuantTarget::Q5K,
+            // Q2_K + Q2_K_S: modern n_gqa>=4 default → Q4_K
+            // (`llama-quant.cpp:512-517`).  Pre-modern dense-only models
+            // (n_gqa<4) would route to Q3_K (Q2_K) / base (Q2_K_S);
+            // since hf2q targets modern GQA, we pick the n_gqa>=4 branch.
+            KQuantVariant::Q2_K | KQuantVariant::Q2_K_S => KQuantTarget::Q4K,
             _ => base,
         },
         TensorCategory::FfnDown => match variant {
@@ -467,6 +490,17 @@ pub fn target_for(
             }
             // Q3_K_L: ffn_down → Q5_K (`llama-quant.cpp:587-588`, non-Falcon path).
             KQuantVariant::Q3_K_L => KQuantTarget::Q5K,
+            // Q2_K: ffn_down always Q3_K (`llama-quant.cpp:571`).
+            KQuantVariant::Q2_K => KQuantTarget::Q3K,
+            // Q2_K_S: ffn_down i_layer<n_layer/8 → Q4_K, else base
+            // (`:572-574`).
+            KQuantVariant::Q2_K_S => {
+                if i_layer < n_layers / 8 {
+                    KQuantTarget::Q4K
+                } else {
+                    base
+                }
+            }
             _ => base,
         },
         // ATTENTION_K, ATTENTION_Q, ATTENTION_OUTPUT, FFN_UP, FFN_GATE,
@@ -910,16 +944,18 @@ mod tests {
     #[test]
     fn variant_all_round_trips_through_name_and_parse() {
         let all = KQuantVariant::all();
-        assert_eq!(all.len(), 8, "exactly 8 supported variants (Q3_K_S/M/L added iter-9)");
-        // canonical order matches the enum declaration
-        assert_eq!(all[0], KQuantVariant::Q3_K_S);
-        assert_eq!(all[1], KQuantVariant::Q3_K_M);
-        assert_eq!(all[2], KQuantVariant::Q3_K_L);
-        assert_eq!(all[3], KQuantVariant::Q4_K_S);
-        assert_eq!(all[4], KQuantVariant::Q4_K_M);
-        assert_eq!(all[5], KQuantVariant::Q5_K_S);
-        assert_eq!(all[6], KQuantVariant::Q5_K_M);
-        assert_eq!(all[7], KQuantVariant::Q6_K);
+        assert_eq!(all.len(), 10, "exactly 10 supported variants (Q2_K_S/Q2_K added iter-21)");
+        // canonical order matches the enum declaration (low → high bit)
+        assert_eq!(all[0], KQuantVariant::Q2_K_S);
+        assert_eq!(all[1], KQuantVariant::Q2_K);
+        assert_eq!(all[2], KQuantVariant::Q3_K_S);
+        assert_eq!(all[3], KQuantVariant::Q3_K_M);
+        assert_eq!(all[4], KQuantVariant::Q3_K_L);
+        assert_eq!(all[5], KQuantVariant::Q4_K_S);
+        assert_eq!(all[6], KQuantVariant::Q4_K_M);
+        assert_eq!(all[7], KQuantVariant::Q5_K_S);
+        assert_eq!(all[8], KQuantVariant::Q5_K_M);
+        assert_eq!(all[9], KQuantVariant::Q6_K);
         // every variant round-trips through its name string
         for v in all {
             let parsed = KQuantVariant::parse(v.name())
