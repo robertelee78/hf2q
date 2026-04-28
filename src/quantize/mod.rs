@@ -4124,6 +4124,170 @@ mod tests {
         }
     }
 
+    /// ADR-014 P7 iter-33 — exhaustive variant × calibrator × parallelism
+    /// orthogonality matrix.  Auto-iterates every variant in
+    /// `KQuantVariant::all()` × every calibrator in {None, Imatrix} ×
+    /// every dispatch path in {serial `quantize_streaming`, rayon
+    /// `quantize_streaming_parallel`} and asserts byte-identity:
+    ///
+    ///   For every (variant V, calibrator C):
+    ///     bytes_serial(V, C) == bytes_parallel(V, C)
+    ///
+    /// At the current 10-variant menu × 2 calibrators = 20 (V, C)
+    /// combinations, each running on a 4-tensor multi-fixture (1 sensitive
+    /// blk.5.attn_q + 3 categorically-distinct tensors).  iter-4 only
+    /// covered Q4_K_M + None on a 6-tensor fixture; iter-33 closes the
+    /// remaining 9 variants × 2 calibrators = 18 (V, C) combinations.
+    ///
+    /// Catches:
+    ///   - A future variant whose `quantize_tensor` impl is non-deterministic
+    ///     (e.g. uses rayon-internal mutex with non-deterministic ordering).
+    ///   - A regression where `quantize_streaming_parallel` swaps tensor
+    ///     order in the output `HashMap` (would still produce same set
+    ///     but per-tensor bytes might be cross-contaminated).
+    ///   - A `Send + Sync` bound regression on `VariantKQuantizer` that
+    ///     forces a slower lock path.
+    ///
+    /// Mirrors iter-31 (variant-pair matrix) and iter-32 (variant ×
+    /// calibrator matrix) to close the third orthogonality dimension —
+    /// per Decision 5, parallelism is byte-identity-preserving.  Adding
+    /// a new variant to `all()` extends matrix coverage automatically.
+    #[test]
+    fn variant_calibrator_parallelism_matrix_through_streaming() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::calibrate::imatrix::ImatrixCollector;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+
+        const QK_K: usize = 256;
+        const N_BLOCKS: usize = 2;
+        const TOTAL: usize = N_BLOCKS * QK_K;
+        const N_LAYERS: usize = 32;
+        const HIGH_IMPORTANCE_COLS: usize = 16;
+
+        // Multi-tensor fixture spanning categorically-distinct tensors —
+        // ensures the parallel iter exercises real ordering, not just a
+        // single-tensor degenerate case.  Using HF/llama-canonical
+        // GGUF names so layer_mix routing is identical to production.
+        let tensors: Vec<&str> = vec![
+            "blk.5.attn_q.weight",   // base bucket for all variants
+            "blk.5.attn_v.weight",   // V-policy upgrades on _M variants
+            "blk.0.ffn_down.weight", // ffn_down policy upgrades
+            "output.weight",         // K-family output bump
+        ];
+
+        let make_adversarial_payload = |seed: f32| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(TOTAL * 2);
+            for i in 0..TOTAL {
+                let c = i % QK_K;
+                let r = (i / QK_K) as f32;
+                let v = if c < HIGH_IMPORTANCE_COLS {
+                    let t = (c as f32 / HIGH_IMPORTANCE_COLS as f32) + r * 0.5 + seed * 0.01;
+                    -3.0 + 6.0 * t.fract()
+                } else {
+                    let t = (c as f32 / QK_K as f32) + r * 0.01 + seed * 0.001;
+                    -0.1 + 0.2 * t.fract()
+                };
+                bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+            }
+            bytes
+        };
+
+        let make_lazy_map = || -> LazyTensorMap {
+            let mut m = LazyTensorMap::new();
+            for (i, name) in tensors.iter().enumerate() {
+                m.insert(LazyTensor::from_bytes(
+                    LazyMeta::new(name.to_string(), vec![N_BLOCKS, QK_K], DType::F16),
+                    make_adversarial_payload(i as f32),
+                ));
+            }
+            m
+        };
+
+        // Imatrix non-uniform on every tensor (use `*` for collector
+        // to apply the same activation profile across the fixture's
+        // shape).
+        let acts: Vec<f32> = (0..QK_K)
+            .map(|c| if c < HIGH_IMPORTANCE_COLS { 10.0 } else { 0.1 })
+            .collect();
+        let mut col = ImatrixCollector::new();
+        for name in &tensors {
+            col.accumulate_dense(name, &acts, 1, QK_K).unwrap();
+        }
+        col.record_chunk();
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+        let variants: &'static [KQuantVariant] = KQuantVariant::all();
+
+        // (variant, calibrator_label) pairs.  Use a Fn closure to
+        // re-build the calibrator each call since CalibrationData is
+        // moved into VariantKQuantizer.
+        let calibrator_labels = ["None", "Imatrix"];
+
+        for v in variants {
+            for cal_label in &calibrator_labels {
+                let make_calibration = || match *cal_label {
+                    "None" => CalibrationData::None,
+                    "Imatrix" => CalibrationData::from_imatrix_collector(&col),
+                    _ => unreachable!(),
+                };
+
+                let q_serial = VariantKQuantizer::new(*v, make_calibration(), N_LAYERS);
+                let q_parallel = VariantKQuantizer::new(*v, make_calibration(), N_LAYERS);
+
+                let out_serial =
+                    quantize_streaming(make_lazy_map(), &metadata, &q_serial, 0, 0, &progress, false)
+                        .unwrap_or_else(|e| panic!("({v:?}, {cal_label}) serial: {e:?}"));
+                let out_parallel = quantize_streaming_parallel(
+                    make_lazy_map(),
+                    &metadata,
+                    &q_parallel,
+                    0,
+                    0,
+                    &progress,
+                    false,
+                    None, // worker count = system parallelism
+                )
+                .unwrap_or_else(|e| panic!("({v:?}, {cal_label}) parallel: {e:?}"));
+
+                assert_eq!(
+                    out_serial.quant_method, out_parallel.quant_method,
+                    "({v:?}, {cal_label}): quant_method differs serial vs parallel"
+                );
+                assert_eq!(
+                    out_serial.tensors.len(),
+                    out_parallel.tensors.len(),
+                    "({v:?}, {cal_label}): tensor count differs serial vs parallel"
+                );
+
+                for tname in &tensors {
+                    let t_serial = out_serial
+                        .tensors
+                        .get(*tname)
+                        .unwrap_or_else(|| panic!("({v:?}, {cal_label}) serial missing {tname}"));
+                    let t_parallel = out_parallel
+                        .tensors
+                        .get(*tname)
+                        .unwrap_or_else(|| panic!("({v:?}, {cal_label}) parallel missing {tname}"));
+
+                    assert_eq!(
+                        t_serial.quant_info.ggml_type, t_parallel.quant_info.ggml_type,
+                        "({v:?}, {cal_label}) on {tname}: ggml_type differs serial \
+                         ({:?}) vs parallel ({:?})",
+                        t_serial.quant_info.ggml_type, t_parallel.quant_info.ggml_type
+                    );
+                    assert_eq!(
+                        t_serial.data, t_parallel.data,
+                        "({v:?}, {cal_label}) on {tname}: bytes differ serial vs \
+                         parallel — Decision 5 byte-identity contract violated"
+                    );
+                }
+            }
+        }
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
