@@ -131,6 +131,48 @@ pub fn validate_group_size(tensor: &TensorRef, group_size: usize) -> Result<(), 
 /// **Error path:** materialise / bf16-cast / quantize errors all bail
 /// the loop with the failed tensor's name in the error context.
 /// Partial accumulation is dropped on `?`.
+/// ADR-014 P7 iter-47 — iter-3 wire-up wedge.  Drop-in replacement
+/// for [`quantize_model`] that takes ownership of an eager
+/// [`crate::ir::TensorMap`] and routes through the streaming
+/// pipeline ([`quantize_streaming`]) under the hood.
+///
+/// **Why this signature**: the iter-3 wire-up swaps `main.rs:1147`'s
+/// `materialize_all()` bridge for direct lazy_map consumption.  But
+/// each Phase 3 dispatch arm in main.rs currently calls
+/// `quantize_model(&tensor_map, ...)` — borrowing the tensor_map.
+/// Migrating arm-by-arm needs a streaming entry point that can be
+/// dropped in WITHOUT changing the main.rs control flow yet (because
+/// later phases like 4.5/4.6 may still need the tensor_map).
+///
+/// This helper takes ownership of the TensorMap and consumes it via
+/// `LazyTensorMap::from_eager` internally, so each arm of main.rs's
+/// Phase 3 can choose between:
+///   - The legacy eager path: `quantize_model(&tensor_map, ...)`
+///   - The streaming path: `quantize_via_streaming_consuming(tensor_map, ...)`
+/// with byte-identical output.
+///
+/// Memory profile: the consumed TensorMap's bytes are MOVED into the
+/// LazyTensor wrappers (no clone), so peak memory is unchanged from
+/// the eager path during this transitional iter.  The actual
+/// memory-budget win lands when iter-3 wires the safetensors-direct
+/// streaming path (`read_tensors_lazy`) bypassing eager materialise.
+///
+/// **Byte-identity contract**: `quantize_via_streaming_consuming(m, ...)`
+/// produces a QuantizedModel byte-equal to `quantize_model(&m, ...)`
+/// on the same fixture, verified by
+/// `quantize_via_streaming_consuming_byte_identical_to_quantize_model`.
+pub fn quantize_via_streaming_consuming(
+    tensor_map: crate::ir::TensorMap,
+    metadata: &crate::ir::ModelMetadata,
+    quantizer: &dyn Quantizer,
+    bits: u8,
+    group_size: usize,
+    progress: &ProgressReporter,
+) -> Result<crate::ir::QuantizedModel, QuantizeError> {
+    let lazy_map = crate::ir::lazy::LazyTensorMap::from_eager(tensor_map);
+    quantize_streaming(lazy_map, metadata, quantizer, bits, group_size, progress, false)
+}
+
 pub fn quantize_streaming(
     map: crate::ir::lazy::LazyTensorMap,
     metadata: &crate::ir::ModelMetadata,
@@ -5472,6 +5514,117 @@ mod tests {
             "iter-3 flow QuantizedModel failed validate: {:?}",
             errors
         );
+    }
+
+    /// ADR-014 P7 iter-47 — `quantize_via_streaming_consuming` byte-identity
+    /// to `quantize_model` on the same fixture.
+    ///
+    /// Pins the iter-3 wire-up wedge contract: when main.rs Phase 3
+    /// arms swap `quantize_model(&tensor_map, ...)` for
+    /// `quantize_via_streaming_consuming(tensor_map, ...)`, the
+    /// QuantizedModel output is byte-equal so backend write + Phase 4.5
+    /// quality + Phase 4.6 native paths all see the same bytes.
+    ///
+    /// 5-tensor multi-fixture spans the categorical-routing surface
+    /// (output bump, attn_v, ffn_down, attn_q base, embedding) so a
+    /// regression in any per-tensor dispatch path surfaces.  Q4_K_M
+    /// variant chosen because it exercises the `_M` upgrade ladder.
+    #[test]
+    fn quantize_via_streaming_consuming_byte_identical_to_quantize_model() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::TensorMap;
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+
+        const QK_K: usize = 256;
+        const N_LAYERS: usize = 32;
+
+        let make_payload = |seed: f32| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(QK_K * 2);
+            for i in 0..QK_K {
+                let v = (i as f32 / QK_K as f32) * 2.0 - 1.0 + seed * 0.001;
+                bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+            }
+            bytes
+        };
+
+        let tensors: Vec<&str> = vec![
+            "output.weight",
+            "blk.0.attn_v.weight",
+            "blk.0.ffn_down.weight",
+            "blk.5.attn_q.weight",
+            "blk.10.ffn_up.weight",
+        ];
+
+        // Build two identical TensorMaps so we can consume one
+        // (streaming-path) and borrow the other (eager-path).
+        let build_map = || -> TensorMap {
+            let mut m = TensorMap::new();
+            for (i, name) in tensors.iter().enumerate() {
+                m.insert(crate::ir::TensorRef {
+                    name: name.to_string(),
+                    shape: vec![1, QK_K],
+                    dtype: DType::F16,
+                    data: make_payload(i as f32),
+                });
+            }
+            m
+        };
+        let map_for_eager = build_map();
+        let map_for_streaming = build_map();
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+
+        let q_eager =
+            VariantKQuantizer::new(KQuantVariant::Q4_K_M, CalibrationData::None, N_LAYERS);
+        let q_streaming =
+            VariantKQuantizer::new(KQuantVariant::Q4_K_M, CalibrationData::None, N_LAYERS);
+
+        let eager_out = quantize_model(&map_for_eager, &metadata, &q_eager, 0, 0, &progress)
+            .expect("quantize_model");
+        let streaming_out = quantize_via_streaming_consuming(
+            map_for_streaming,
+            &metadata,
+            &q_streaming,
+            0,
+            0,
+            &progress,
+        )
+        .expect("quantize_via_streaming_consuming");
+
+        // Same shape contract.
+        assert_eq!(eager_out.quant_method, streaming_out.quant_method);
+        assert_eq!(eager_out.tensors.len(), streaming_out.tensors.len());
+
+        for tname in &tensors {
+            let e = eager_out
+                .tensors
+                .get(*tname)
+                .unwrap_or_else(|| panic!("eager missing {tname}"));
+            let s = streaming_out
+                .tensors
+                .get(*tname)
+                .unwrap_or_else(|| panic!("streaming missing {tname}"));
+
+            assert_eq!(
+                e.quant_info.ggml_type, s.quant_info.ggml_type,
+                "{tname}: ggml_type"
+            );
+            assert_eq!(
+                e.quant_info.method, s.quant_info.method,
+                "{tname}: method"
+            );
+            assert_eq!(
+                e.quant_info.preserved, s.quant_info.preserved,
+                "{tname}: preserved"
+            );
+            assert_eq!(
+                e.data, s.data,
+                "{tname}: bytes differ between eager and streaming-consuming \
+                 — iter-3 wire-up wedge would break byte-identity contract"
+            );
+        }
     }
 
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
