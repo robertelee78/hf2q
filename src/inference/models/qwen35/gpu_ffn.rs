@@ -69,7 +69,7 @@ use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
 use mlx_native::ops::quantized_matmul_ggml::{quantized_matmul_ggml, GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::quantized_matmul_id_ggml::{
-    quantized_matmul_id_ggml, quantized_matmul_id_ggml_pooled, GgmlQuantizedMatmulIdParams,
+    quantized_matmul_id_ggml_pooled, GgmlQuantizedMatmulIdParams,
 };
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
@@ -1500,17 +1500,18 @@ pub fn build_moe_ffn_layer_gpu_q_into(
         // gate+up concurrent dispatches in this Phase C block do NOT race
         // on htpe/hids writes — distinct scratches, distinct buffers.
         //
-        // The forensic env gate `HF2Q_FFN_POOLED_LEGACY=1` flips back to
-        // the un-pooled `quantized_matmul_id_ggml` (288 device allocs per
-        // prefill).  Both paths are bit-identical on the kernel level —
-        // the pooled variant only reuses scratch buffers; the dispatch
-        // shapes, kernel selection, and threadgroup geometry are
-        // unchanged.  No `HF2Q_UNSAFE_EXPERIMENTS=1` ack required.
-        //
-        // Sunset target: W-5b.25 after a 30/30 cross-path determinism
-        // panel + one apex 35B-A3B PP65536 verification (mirrors the
-        // W-5b.18 → W-5b.19a sunset cadence).
-        let pooled_legacy = std::env::var("HF2Q_FFN_POOLED_LEGACY").as_deref() == Ok("1");
+        // W-5b.25 sunset (2026-04-28): the `HF2Q_FFN_POOLED_LEGACY=1`
+        // forensic A/B gate was REMOVED after a 30/30 cross-path
+        // token-id determinism panel at PP4106 (5 cold loads × 3 cold
+        // prefills × 2 paths) PASSED on token id 11 with the apex
+        // 35B-A3B PP65536 cross-path verification confirming both paths
+        // complete an identical 48-layer prefill (the post-prefill
+        // lm_head buffer-sizing bug at PP69632 is a pre-existing,
+        // separate issue unrelated to FFN pooling — both paths fail
+        // identically there).  The standing parity bar is the
+        // `ffn_pooled_path_matches_legacy_at_seq128` test (deleted with
+        // the legacy code path; see W-5b.18 → W-5b.19a precedent for
+        // sister-test deletion alongside gate removal).
         let gate_params = GgmlQuantizedMatmulIdParams {
             n_tokens: seq_len,
             top_k: shape.num_experts_per_tok,
@@ -1524,37 +1525,24 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             expert_stride: weights.expert_up_stride,
             ..gate_params
         };
-        if pooled_legacy {
-            quantized_matmul_id_ggml(
+        super::decode_pool::with_id_mm_scratch(
+            super::decode_pool::MmIdSlot::Gate,
+            device, ne32, seq_len * shape.num_experts_per_tok,
+            |scratch| quantized_matmul_id_ggml_pooled(
                 enc, registry, device,
                 x, &weights.expert_gate_q, &ids_buf, &mut gate_all_buf,
-                &gate_params,
-            ).map_err(|e| anyhow!("gate_all qmatmul_id (LEGACY): {e}"))?;
-            quantized_matmul_id_ggml(
+                scratch, &gate_params,
+            ),
+        ).map_err(|e| anyhow!("gate_all qmatmul_id_pooled: {e}"))?;
+        super::decode_pool::with_id_mm_scratch(
+            super::decode_pool::MmIdSlot::Up,
+            device, ne32, seq_len * shape.num_experts_per_tok,
+            |scratch| quantized_matmul_id_ggml_pooled(
                 enc, registry, device,
                 x, &weights.expert_up_q, &ids_buf, &mut up_all_buf,
-                &up_params,
-            ).map_err(|e| anyhow!("up_all qmatmul_id (LEGACY): {e}"))?;
-        } else {
-            super::decode_pool::with_id_mm_scratch(
-                super::decode_pool::MmIdSlot::Gate,
-                device, ne32, seq_len * shape.num_experts_per_tok,
-                |scratch| quantized_matmul_id_ggml_pooled(
-                    enc, registry, device,
-                    x, &weights.expert_gate_q, &ids_buf, &mut gate_all_buf,
-                    scratch, &gate_params,
-                ),
-            ).map_err(|e| anyhow!("gate_all qmatmul_id_pooled: {e}"))?;
-            super::decode_pool::with_id_mm_scratch(
-                super::decode_pool::MmIdSlot::Up,
-                device, ne32, seq_len * shape.num_experts_per_tok,
-                |scratch| quantized_matmul_id_ggml_pooled(
-                    enc, registry, device,
-                    x, &weights.expert_up_q, &ids_buf, &mut up_all_buf,
-                    scratch, &up_params,
-                ),
-            ).map_err(|e| anyhow!("up_all qmatmul_id_pooled: {e}"))?;
-        }
+                scratch, &up_params,
+            ),
+        ).map_err(|e| anyhow!("up_all qmatmul_id_pooled: {e}"))?;
         // ADR-015 iter7b — pooled (q_into path; y_s_buf flows into
         // dispatch_moe_weighted_reduce, no CPU download).
         let y_s_buf = proj_pooled(enc, registry, device, &h_s_buf, &weights.shared_down, seq_len, m_sh32, h32)?;
@@ -1599,23 +1587,17 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             expert_stride: weights.expert_down_stride,
             ggml_type: weights.ggml_type_down,
         };
-        if pooled_legacy {
-            quantized_matmul_id_ggml(
+        // W-5b.25 sunset: the legacy un-pooled branch was removed.  See
+        // the Phase C sunset comment-block above for the audit trail.
+        super::decode_pool::with_id_mm_scratch(
+            super::decode_pool::MmIdSlot::Down,
+            device, ne32, total_rows as u32,
+            |scratch| quantized_matmul_id_ggml_pooled(
                 enc, registry, device,
                 &h_all_buf, &weights.expert_down_q, &ids_buf, &mut y_all_buf,
-                &down_params,
-            ).map_err(|e| anyhow!("y_all qmatmul_id (LEGACY): {e}"))?;
-        } else {
-            super::decode_pool::with_id_mm_scratch(
-                super::decode_pool::MmIdSlot::Down,
-                device, ne32, total_rows as u32,
-                |scratch| quantized_matmul_id_ggml_pooled(
-                    enc, registry, device,
-                    &h_all_buf, &weights.expert_down_q, &ids_buf, &mut y_all_buf,
-                    scratch, &down_params,
-                ),
-            ).map_err(|e| anyhow!("y_all qmatmul_id_pooled: {e}"))?;
-        }
+                scratch, &down_params,
+            ),
+        ).map_err(|e| anyhow!("y_all qmatmul_id_pooled: {e}"))?;
 
         // Barrier E→F: moe_weighted_reduce reads y_all, y_s_buf, sh_logit_buf.
         enc.memory_barrier();
@@ -2530,167 +2512,13 @@ mod tests {
         eprintln!("moe_ffn_gpu_q_parity: max_abs_err={max_err:.2e}");
     }
 
-    /// W-5b.24 forensic A/B parity: the pooled `quantized_matmul_id_ggml`
-    /// path must produce bit-identical outputs to the un-pooled LEGACY
-    /// path — same kernel, same shapes, only scratch ownership differs.
-    ///
-    /// 3-cold determinism: re-run both paths twice each (alternating)
-    /// and assert byte equality.  Belt-and-braces guard against any
-    /// stale scratch state contaminating cross-call results.
-    #[test]
-    fn ffn_pooled_path_matches_legacy_at_seq128() {
-        let device = match MlxDevice::new() {
-            Ok(d) => d,
-            Err(_) => return, // No Metal device; e.g. CI builder.
-        };
-        let mut registry = KernelRegistry::new();
-
-        // Same shape as moe_ffn_gpu_q_parity_vs_cpu_ref but seq_len=2 to
-        // exercise the dispatch path (Q4_0 with QK=32 + ne20_8 mm_id
-        // instantiation) at the smallest production-shape proxy.  The
-        // mm_id kernel only fires at n_tokens > MM_ID_ROUTING_THRESHOLD
-        // (=8) — so we use seq_len=16 to exercise the pooled mm_id
-        // branch (which is what we actually changed).  At seq_len < 9
-        // both paths fall through to mv_id where scratch is unused, so
-        // a < 9 test would not exercise the new code path.
-        let shape = MoeFfnShape {
-            hidden_size: 64,
-            num_experts: 4,
-            num_experts_per_tok: 2,
-            moe_intermediate_size: 64,
-            shared_intermediate_size: 64,
-        };
-        let h  = shape.hidden_size as usize;
-        let ne = shape.num_experts as usize;
-        let m  = shape.moe_intermediate_size as usize;
-        let ms = shape.shared_intermediate_size as usize;
-
-        let mut seed = 0xBEEF_u32;
-        let mut r = |n: usize, scale: f32| -> Vec<f32> {
-            (0..n).map(|_| {
-                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
-                ((seed as i32 as f32) / (i32::MAX as f32)) * scale
-            }).collect()
-        };
-
-        let router_f32      = r(ne * h, 0.3);
-        let expert_gate_f32 = r(ne * m * h, 0.1);
-        let expert_up_f32   = r(ne * m * h, 0.1);
-        let expert_down_f32 = r(ne * h * m, 0.1);
-        let shared_gate_logit = r(h, 0.1);
-        let shared_gate_f32 = r(ms * h, 0.1);
-        let shared_up_f32   = r(ms * h, 0.1);
-        let shared_down_f32 = r(h * ms, 0.1);
-        let seq_len = 16usize; // > MM_ID_ROUTING_THRESHOLD = 8 → exercises mm_id branch
-        let x_cpu   = r(seq_len * h, 0.4);
-
-        // Encode expert weights as Q4_0.
-        let gate_q4 = encode_q4_0(&expert_gate_f32);
-        let up_q4   = encode_q4_0(&expert_up_f32);
-        let down_q4 = encode_q4_0(&expert_down_f32);
-
-        let ggml_type = GgmlType::Q4_0;
-        let qk = ggml_type.block_values() as usize;
-        let block_bytes = ggml_type.block_bytes() as usize;
-        let gate_stride = ((m * h / qk) * block_bytes) as u64;
-        let down_stride = ((h * m / qk) * block_bytes) as u64;
-
-        let make_buf = |data: &[u8]| -> MlxBuffer {
-            let mut buf = device.alloc_buffer(data.len(), DType::U8, vec![data.len()])
-                .expect("alloc q-buf");
-            buf.as_mut_slice::<u8>().expect("q-buf slice").copy_from_slice(data);
-            buf
-        };
-
-        // Build a fresh weights container per run (since the weight
-        // buffers are consumed by the test).  Cloning via re-upload
-        // matches how production paths instantiate per-prefill weights.
-        let mk_weights = |device: &MlxDevice| -> MoeFfnWeightsGpuQ {
-            MoeFfnWeightsGpuQ {
-                router: upload_f32(&router_f32, device).expect("router"),
-                expert_gate_q: make_buf(&gate_q4),
-                expert_up_q:   make_buf(&up_q4),
-                expert_down_q: make_buf(&down_q4),
-                ggml_type_gate_up: ggml_type,
-                ggml_type_down: ggml_type,
-                expert_gate_stride: gate_stride,
-                expert_up_stride:   gate_stride,
-                expert_down_stride: down_stride,
-                num_experts: ne as u32,
-                shared_gate_inp: upload_f32(&shared_gate_logit, device).expect("sh_gate_inp"),
-                shared_gate:  upload_f32(&shared_gate_f32, device).expect("sh_gate"),
-                shared_up:    upload_f32(&shared_up_f32, device).expect("sh_up"),
-                shared_down:  upload_f32(&shared_down_f32, device).expect("sh_down"),
-            }
-        };
-
-        let x_buf = upload_f32(&x_cpu, &device).expect("upload x");
-
-        // Alternate LEGACY → NEW → LEGACY → NEW; assert all four agree.
-        let mut runs: Vec<(bool, Vec<f32>)> = Vec::with_capacity(4);
-        for which in 0..4 {
-            let legacy = which % 2 == 0;
-            // Force fresh scratch state so neither path benefits from a
-            // warm cache from the prior run.
-            super::super::decode_pool::drop_id_mm_scratch();
-            super::super::decode_pool::reset_decode_pool();
-
-            // Set / clear the env gate before each run.
-            // SAFETY: tests are single-threaded by default in this module.
-            // SAFETY: env::set_var/remove_var have OS-level synchronization
-            // requirements documented as `unsafe` from Rust 1.86; we
-            // use them inside a #[test] which serializes by default.
-            if legacy {
-                std::env::set_var("HF2Q_FFN_POOLED_LEGACY", "1");
-            } else {
-                std::env::remove_var("HF2Q_FFN_POOLED_LEGACY");
-            }
-
-            let weights_q = mk_weights(&device);
-            let gpu_buf = build_moe_ffn_layer_gpu_q(
-                &device, &mut registry, &x_buf, &weights_q, shape, None,
-            ).expect("build_moe_ffn_layer_gpu_q");
-            let out = download_f32(&gpu_buf).expect("download out");
-            runs.push((legacy, out));
-        }
-        // Always tear down the env var so subsequent tests see the default.
-        std::env::remove_var("HF2Q_FFN_POOLED_LEGACY");
-
-        // Determinism guard: same path must agree byte-exact across runs.
-        for (i, (legacy, out)) in runs.iter().enumerate() {
-            for (j, (legacy_j, out_j)) in runs.iter().enumerate().skip(i + 1) {
-                if legacy != legacy_j { continue; }
-                assert_eq!(
-                    out.len(), out_j.len(),
-                    "ffn_pooled_path_matches_legacy: same-path length differs run {i} vs {j}"
-                );
-                for (k, (a, b)) in out.iter().zip(out_j.iter()).enumerate() {
-                    assert_eq!(
-                        a.to_bits(), b.to_bits(),
-                        "ffn_pooled_path_matches_legacy: same-path divergence at run {i} vs {j}, idx={k} legacy={legacy}: {a} vs {b}"
-                    );
-                }
-            }
-        }
-
-        // Cross-path equality: pooled and legacy must produce numerically
-        // identical outputs (same kernel, same dispatch shapes — only
-        // scratch ownership differs).  Tolerance: bit-equality if Metal
-        // dispatch order is deterministic; relaxed to 1e-5 inf-norm if
-        // not (concurrent encoder dispatches don't guarantee bit-exact
-        // floating-point reduction order across runs).
-        let legacy_out = &runs.iter().find(|(l, _)| *l).expect("legacy run").1;
-        let pooled_out = &runs.iter().find(|(l, _)| !*l).expect("pooled run").1;
-        assert_eq!(legacy_out.len(), pooled_out.len(), "length mismatch");
-        let mut max_err = 0.0f32;
-        for (i, (l, p)) in legacy_out.iter().zip(pooled_out.iter()).enumerate() {
-            let err = (l - p).abs();
-            if err > max_err { max_err = err; }
-            assert!(
-                err < 1e-5,
-                "ffn_pooled_path_matches_legacy: cross-path divergence at idx={i}: legacy={l}, pooled={p}, err={err}"
-            );
-        }
-        eprintln!("ffn_pooled_path_matches_legacy: max_abs_err={max_err:.2e}");
-    }
+    // W-5b.25 sunset (2026-04-28): `ffn_pooled_path_matches_legacy_at_seq128`
+    // was REMOVED alongside the `HF2Q_FFN_POOLED_LEGACY` env gate after a
+    // 30/30 cross-path token-id determinism panel at PP4106 PASSED on token
+    // id 11.  The legacy un-pooled path no longer exists; the test would
+    // have only the pooled path to compare against itself.  Cross-path
+    // bit-equality was logged at `max_abs_err=0.0e0` over 4 alternating
+    // LEGACY ↔ NEW invocations at seq_len=16 prior to removal.  See
+    // `docs/wave5b3-walkbar-results.md` "Wave 5b.25" section for the
+    // sunset audit trail.
 }
