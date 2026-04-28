@@ -1946,6 +1946,103 @@ mod tests {
         }
     }
 
+    /// ADR-014 P7 iter-24 — DwqK::P28 streaming-path end-to-end policy lock.
+    ///
+    /// Mirrors iter-12 (Q3_K_M) and iter-22 (Q2_K) for the DWQ class:
+    /// drives `DwqKQuantizer::new(P28, sensitive_layers, None)` end-to-end
+    /// through `quantize_streaming` on a multi-tensor fixture spanning
+    /// both buckets and asserts the byte-level routing contract.
+    ///
+    /// Pre-iter-24 the P28 contract was only gated by isolated
+    /// `quantize_tensor`-call tests in `dwq_k_quantizer.rs`; this test
+    /// pins the contract through the actual streaming loop on a `LazyTensorMap`
+    /// — the production code path.  Closes the gap left when iter-20
+    /// unblocked P28 base→Q2_K routing.
+    ///
+    /// P28 policy:
+    /// - Sensitive layers (`is_sensitive_tensor` ⇒ true) → Q8_0 (34 bytes/block).
+    /// - Base layers + non-`model.layers.<N>.…` names → Q2_K (84 bytes/block).
+    ///
+    /// `DwqKQuantizer` uses the HF naming convention (`model.layers.<N>.…`),
+    /// not GGUF (`blk.<N>.…`), per `extract_layer_index`'s contract.
+    #[test]
+    fn variant_streaming_dwq28_policy_branches() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::dwq_k_quantizer::{DwqKQuantizer, DwqKVariant};
+
+        const QK_K: usize = 256;
+
+        let make_f32_payload = |seed: f32, len: usize| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(len * 4);
+            for i in 0..len {
+                let v = (i as f32 / len as f32) * 2.0 - 1.0 + seed * 0.01;
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            bytes
+        };
+
+        // Sensitive set: layers 3, 5, 12.  All other layers → base bucket.
+        // Mix of both buckets + a non-layer tensor (output.weight) which
+        // falls through to base per `extract_layer_index` returning None.
+        //
+        // Per-row byte budgets at 256 elements:
+        //   Q8_0  block = 32 elems × 34 bytes/block → 8 × 34 = 272 bytes
+        //   Q2_K  super-block = 256 elems × 84 bytes/super-block → 84 bytes
+        let cases: Vec<(&str, &str, usize)> = vec![
+            // Sensitive bucket → Q8_0 (272 bytes/row at QK_K=256).
+            ("model.layers.3.self_attn.q_proj.weight",  "Q8_0", 272),
+            ("model.layers.5.mlp.down_proj.weight",     "Q8_0", 272),
+            ("model.layers.12.self_attn.v_proj.weight", "Q8_0", 272),
+            // Base bucket → Q2_K (84 bytes/row at QK_K=256).
+            ("model.layers.0.self_attn.q_proj.weight", "Q2_K", 84),
+            ("model.layers.4.self_attn.v_proj.weight", "Q2_K", 84),
+            ("model.layers.20.mlp.down_proj.weight",   "Q2_K", 84),
+            // Non-`model.layers.<N>.…` → falls through to base bucket.
+            ("output.weight",                          "Q2_K", 84),
+            ("lm_head.weight",                         "Q2_K", 84),
+        ];
+
+        let mut lazy_map = LazyTensorMap::new();
+        for (i, (name, _ty, _bytes)) in cases.iter().enumerate() {
+            lazy_map.insert(LazyTensor::from_bytes(
+                LazyMeta::new(name.to_string(), vec![1, QK_K], DType::F32),
+                make_f32_payload(i as f32, QK_K),
+            ));
+        }
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+        let q = DwqKQuantizer::new(
+            DwqKVariant::P28,
+            &[3..=3, 5..=5, 12..=12],
+            CalibrationData::None,
+        );
+
+        let out = quantize_streaming(lazy_map, &metadata, &q, 0, 0, &progress, false)
+            .expect("DwqK::P28 streaming should succeed");
+
+        assert_eq!(out.quant_method, "dwq-k-mixed-2-8");
+        assert_eq!(out.tensors.len(), cases.len());
+        for (name, expected_type, expected_bytes) in cases {
+            let t = out
+                .tensors
+                .get(name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(
+                t.quant_info.ggml_type.as_deref(),
+                Some(expected_type),
+                "P28 on {name}: expected {expected_type}, got {:?}",
+                t.quant_info.ggml_type
+            );
+            assert_eq!(
+                t.data.len(),
+                expected_bytes,
+                "P28 on {name}: expected {expected_bytes} bytes"
+            );
+        }
+    }
+
     #[test]
     fn variant_streaming_q4km_round_trip_rmse_bound() {
         use crate::calibrate::calibrator::CalibrationData;
