@@ -145,11 +145,13 @@ script comments are treated as hypotheses only.
   diagnostic, not in hf2q allocation cleanup.
 - Split-commit DenseQ diagnostic (2026-04-28, gated by
   `HF2Q_PROFILE_DENSE_Q_SPLIT_COMMITS=1` plus `MLX_PROFILE_CB=1`) now measures
-  the FFN GPU phases without changing production scheduling. Control 512
-  profile: `layer.dense_ffn` CB total `501.28 ms` across 64 layers, first token
-  `11`. Split 512 profile preserved first token `11` and decomposed the same
-  `501.07 ms`: gate/up `308.24 ms` (61.5%), down `177.70 ms` (35.5%), SiLU
-  `11.40 ms` (2.3%), residual `3.73 ms` (0.7%). Target-size split at 4096
+  the FFN GPU phases by intentionally splitting the production fused FFN command
+  buffer. This is diagnostic-only and changes scheduling by design; compare it
+  to the fused control path, not as a production-preserving profiler. Control
+  512 profile: `layer.dense_ffn` CB total `501.28 ms` across 64 layers, first
+  token `11`. Split 512 profile preserved first token `11` and decomposed the
+  same `501.07 ms`: gate/up `308.24 ms` (61.5%), down `177.70 ms` (35.5%),
+  SiLU `11.40 ms` (2.3%), residual `3.73 ms` (0.7%). Target-size split at 4096
   preserved first token `264` and decomposed `3827.19 ms`: gate/up
   `2381.48 ms` (62.2%), down `1305.62 ms` (34.1%), SiLU `99.61 ms` (2.6%),
   residual `40.49 ms` (1.1%). GGUF tensor-table inspection shows 61/64 dense
@@ -160,6 +162,35 @@ script comments are treated as hypotheses only.
   `HF2Q_FFN_OUTPUT_LIFT_LEGACY`, and `HF2Q_FFN_DENSE_LIFT_LEGACY` remain in
   historical scripts, not in the current qwen35 source paths. Do not use those
   gates as proof that a live A/B still exists.
+- **Source-grounded correction (2026-04-28).** Current qwen35 decode has already
+  landed P3 Stage 1 inside `forward_gpu_greedy`, not as a new
+  `forward_gpu_single_cb` entry point and not as one command buffer for the
+  entire model. The default path uses one encoder per transformer layer plus one
+  fused output-head encoder; `HF2Q_DECODE_PROFILE=1` reports **41
+  command buffers/token** on the production apex path, while
+  `HF2Q_LEGACY_PER_LAYER_CB=1` reports **103 command buffers/token**. This
+  matches `src/inference/models/qwen35/forward_gpu.rs`: the default branch opens
+  `device.command_encoder()` per layer, encodes attention + post-norm + FFN into
+  that encoder, then `commit_labeled("layer.attn_*")`; output norm + lm-head +
+  argmax are fused in one final encoder. Therefore any remaining "one
+  GraphSession / one CB per full qwen35 forward" language below is a historical
+  target for a future Stage 2, not the current shipped implementation.
+- **Source-grounded correction (2026-04-28).** `mlx-native` now has the ADR-015
+  substrate that older hard gates requested: `CommandEncoder::memory_barrier`
+  increments `BARRIER_COUNT` and can accumulate `BARRIER_NS` under
+  `MLX_PROFILE_BARRIERS=1`; `MlxDevice::alloc_buffer` auto-registers buffers
+  with a device-level `ResidencySet`; residency commits are deferred and flushed
+  at `CommandEncoder::commit*` boundaries. Do not treat H4 counter accounting or
+  residency integration as future work unless the question is specifically about
+  a new measurement or the still-open hf2q multi-`MlxDevice` fragmentation issue.
+- **Source-grounded correction (2026-04-28).** The Gemma `forward_mlx.rs`
+  rustdoc at line ~1309 still says "MVP: one GraphSession per layer", but the
+  function body below line ~1486 is the live contract: `SINGLE SESSION:
+  Embedding + All 30 Layers + Head`, with one `exec.begin()` and one terminal
+  finish in the default no-diagnostic path. The only production split is the
+  intentional `HF2Q_DUAL_BUFFER` async-overlap split; dump and timing gates can
+  also force diagnostic re-begins. Treat any ADR/changelog statement that uses
+  the old rustdoc as evidence for 30 Gemma sessions as superseded by source.
 
 Implication: the best next architectural path is prefill-first. Decode work is
 still needed to clear the exact D4 peer bar, but the current short live ratio is
@@ -834,39 +865,53 @@ The CPU work that IS sampled is: dispatching threadgroups + barriers + encoder b
 
 
 
-Original P3 (qwen35 single-CB rewrite) recovers ~30% of the gap.
-**A new P3b (Rust-orchestration profiling sweep) is added** that targets
-the ~53% residual.  P3 and P3b can run in parallel; the P5 bench gate
-requires both wins to clear ≥1.00× of llama.cpp.
+Original P3 projected that a full qwen35 single-CB rewrite would recover
+~30% of the gap.  Current source has only landed **P3 Stage 1**: layer-local
+encoder fusion plus output-head fusion, reducing 103 → 41 CB/token and moving
+the apex ratio to 0.9456× in the recorded 2026-04-28 AC6 run.  The remaining
+decode gap is not explained by already-landed CPU allocation cleanup alone:
+iter7 pooling and residency-set integration were neutral on wall time because
+the workload is mostly GPU-bound and async CPU work overlaps GPU execution.
+Further decode closure must be treated as either P3 Stage 2 multi-layer encoder
+fusion, per-kernel GPU attribution/fixes, or the hf2q single-`MlxDevice`
+residency-fragmentation experiment, not as the original broad "Rust
+orchestration sweep" in isolation.
 
 ## Decision
 
-**D1.** Migrate **both** `qwen35` and `gemma` decode forward paths to a
-**single `GraphSession`** (1 CB per forward pass), mirroring llama.cpp's
-`encode_async` (`ggml-metal-context.m:676–722`) — one logical command
-buffer encoded with explicit `encoder.memory_barrier()` between dependent
-op stages.  Order: `qwen35` first (proves the pattern on the harder MoE
-+ DeltaNet shape), `gemma` second (port the established pattern to the
-dense-only path).
+**D1.** Migrate decode scheduling toward fewer command-buffer submissions, but
+do it in measured stages rather than assuming "one CB for the entire model" is
+the only valid endpoint.  **Current qwen35 status:** P3 Stage 1 is landed in
+`forward_gpu_greedy`: one encoder per layer plus one fused output-head encoder
+(41 CB/token default, 103 CB/token with `HF2Q_LEGACY_PER_LAYER_CB=1`).  **Future
+qwen35 Stage 2:** evaluate multi-layer encoder fusion only if it remains a
+measured wall-time lever after per-kernel GPU attribution.  **Current Gemma
+status:** despite a stale rustdoc line, `forward_decode` is already a single
+GraphSession for embedding + all layers + head in the default path, with an
+intentional dual-buffer async split as the normal production optimization.
+Gemma decode remains GPU-bound in TimeProfiler, so the next Gemma lever needs
+Metal System Trace / kernel attribution rather than another CPU-side
+GraphSession rewrite.
 
-**D2.** Keep the existing per-layer-encoder paths as the legacy
-implementation behind a single env var `HF2Q_LEGACY_PER_LAYER_CB=1` (covers
-both families).  After a 7-day soak + sourdough-pass on each family's new
-path, delete the legacy path for that family entirely (per
-`feedback_no_broken_windows`).
+**D2.** Keep the qwen35 legacy per-helper path behind
+`HF2Q_LEGACY_PER_LAYER_CB=1` for the Stage-1 soak window.  Do not describe this
+as covering both families until Gemma has an equivalent live gate in
+`forward_mlx.rs`.  After a 7-day soak + sourdough-pass on a family's new path,
+delete that family's legacy path entirely (per `feedback_no_broken_windows`).
 
-**D3.** Bit-exact parity gate vs the current decode entry points is
-mandatory **per family** (within 1e-5 max-abs logit error on each
-family's smoke set).  No fallback path is shipped — if parity fails, the
-lever is wrong; fix it, don't gate the primary path off (per
-`feedback_never_ship_fallback_without_rootcause`).
+**D3.** Parity gate vs the current decode entry points is mandatory **per
+family**.  For token-level greedy paths, byte-identical token output across the
+smoke prompts is required; for logits-producing paths, use the established
+family tolerance rather than inventing a new loose fallback.  No fallback path
+is shipped as the answer — if parity fails, the lever is wrong; fix it, don't
+gate the primary path off (per `feedback_never_ship_fallback_without_rootcause`).
 
 **D4.** Exit criteria — **both** families must clear the bar:
   - **qwen35:** `dwq46` `n=256` decode median **≥ 1.00× of llama.cpp**
     same-day median (3 cold runs each, M5 Max, cold SoC per
     `feedback_perf_gate_thermal_methodology`).  Reference baseline from
     ADR-012 closure: hf2q 109.1 t/s vs llama.cpp 116.0 t/s = **0.94×**.
-    **§iter6 measured 2026-04-27 (apex post-iter1):** hf2q 110.0 t/s
+    **Historical §iter6 measurement on 2026-04-27 (apex post-iter1):** hf2q 110.0 t/s
     (per-trial 110.0 / 109.3 / 110.2; σ ≈ 0.4) vs llama-bench 118.71 t/s
     (per-trial 118.71 / 117.90 / 119.20) = **0.9266×**.  hf2q absolute
     moved +0.9 t/s (iter1 contributed positively); llama-bench drifted
@@ -876,6 +921,12 @@ lever is wrong; fix it, don't gate the primary path off (per
     hf2q@`4214f7c` / mlx-native@`19f5569` via `scripts/bench-baseline.sh`;
     raw artifacts at
     `/tmp/adr015-bench/baseline-apex-35b-a3b-dwq46-post-iter1-20260427T123407Z.*`.
+    **Current committed Stage-1 decode baseline on 2026-04-28:** hf2q
+    111.300 t/s median (5 cold trials) vs llama-bench 117.700 t/s median =
+    **0.9456×** at hf2q@`13a4d3b` / mlx-native@`a7d2b95`.  This supersedes
+    the 0.9266× number for current decode planning, but still misses D4 by
+    about 5.4 percentage points; the top-of-document 0.9796 short smoke is
+    useful sanity evidence, not the final cold-SoC gate.
   - **gemma:** `gemma-4-26B-A4B-it-ara-abliterated-dwq` `n=256` decode
     median **≥ 1.00× of llama.cpp** same-day median (same methodology).
     **§P0 measured 2026-04-27 (iter4):** hf2q 87.8 t/s (per-trial 87.7 / 87.8 / 88.0;
@@ -894,12 +945,12 @@ lever is wrong; fix it, don't gate the primary path off (per
 | **P1 — Audit** | Map every cross-CB synchronization point in `forward_gpu` (qwen35) and `forward_decode` (Gemma) paths. List of `(commit/commit_and_wait → next encoder)` transitions and the buffer dependencies that justify each one. Output: a markdown table per family in this ADR. | Every CB boundary in each family's live path is annotated with the data dependency it protects, OR documented as legacy / removable. |
 | **P2 — Empty-CB cost calibration** | ✅ **Done 2026-04-26** — `mlx-native/examples/cb_cost_calibration.rs` measures async/sync/alloc-only µs/CB on M5 Max.  Result: **async µs/CB ≈ 1.6 µs at N≥100, NOT ~5 µs**.  Single-CB upper bound = ~160 µs / token of the ~500 µs gap (~32%). | Numbers published in §Diagnosis update above. |
 | **P3a — Per-dispatch cost calibration** | ✅ **Done 2026-04-26** — `mlx-native/examples/dispatch_cost_calibration.rs` measures `scalar_mul_bf16` encode cost.  Result: **µs/dispatch ≈ 0.16 µs** at N≥500, within ±15% of llama.cpp's implied 0.14 µs/dispatch.  Shader-launch path is competitive; lever is Rust orchestration. | Numbers published in §P3a calibration data above. |
-| **P3 — Single-CB rewrite** (qwen35 first, gemma second) | New `forward_gpu_single_cb` in `inference/models/qwen35/forward_gpu.rs` and `forward_decode_single_cb` in `serve/forward_mlx.rs`.  Each: one `GraphSession`, all dispatches encoded, explicit `memory_barrier()` for cross-stage dependencies, single `commit()` at end. | Builds in release.  No new `unsafe`.  Recovers ~30% of the 540 µs gap (~161 µs). |
-| **P3b — Rust orchestration sweep** ⬅ **NEW (parallel to P3)** | Profile-guided reduction of the ~288 µs residual from helper-function indirection, buffer pool acquisition, barrier bookkeeping, KV-cursor updates.  Use `cargo flamegraph` or `instruments -t TimeProfiler` on a hot decode loop.  Target: shrink the residual by ≥50% (~140 µs). | At least 5 profile-driven specific reductions landed (each cited with profile evidence in the commit message).  Combined with P3, restores ≥0.99× ratio (one cold-run iteration). |
+| **P3 — Command-buffer reduction** | ✅ **Stage 1 landed for qwen35 2026-04-28** — `forward_gpu_greedy` default path now fuses attention + post-norm + FFN per layer and fuses output norm + lm-head + argmax, without adding a separate `forward_gpu_single_cb` function.  Source-reported shape: 41 CB/token default vs 103 with `HF2Q_LEGACY_PER_LAYER_CB=1`; dispatch count unchanged.  **Stage 2 candidate:** multi-layer encoder fusion (replace per-layer `commit_labeled` with inter-layer barriers) only after measurement says CB boundaries still matter.  Gemma remains separate and needs GPU-side profiling first. | Stage 1: release build, no net new `unsafe`, legacy bypass parity smoke, AC6 ratio 0.9456× recorded in changelog.  Stage 2 is not pre-approved by this table; it needs a fresh profile/bench justification. |
+| **P3b — Orchestration / allocation / residency sweep** | Partially landed and partially falsified as a wall-time lever.  Rope cache, decode pool, DenseQ pooled prefill scratches, barrier counters, and residency defer-and-flush are live.  Apex alloc/residency work removed CPU cost but did not close wall time; Gemma's alloc-buffer analog measured 0 µs/token.  Remaining qwen35 residency question is specifically multi-`MlxDevice` fragmentation, not generic "add residency". | Treat future P3b work as hypothesis-specific: cite the live profile frame, prove the code path still exists, and bench wall movement.  Do not assume five small CPU cleanups will restore ≥0.99×; current data says CPU-only wins can overlap away. |
 | **P5 — Parity gate (per family)** | 16-prompt smoke on each family's new path produces logits within 1e-5 max-abs of legacy path. | Logged in commit message. |
 | **P6 — Bench gate (per family)** | 3 cold runs of `hf2q --benchmark` on `dwq46` and `gemma-4-26B-A4B-it-ara-abliterated-dwq` at `n=256` (cold SoC).  Same-day `llama-bench -p 0 -n 256 -r 3` on the same model.  Ratio computed per family. | Ratio ≥ 1.00× recorded for **both** families in ADR + commit message. |
-| **P7 — Default cut-over** | `HF2Q_LEGACY_PER_LAYER_CB=1` is the only way back to legacy.  Default = single-CB on both families. | Smoke + bench gate green on default-default settings. |
-| **P8 — Soak + delete legacy** | 7-day window, no regressions.  Then delete `forward_gpu_greedy` (qwen35 legacy) and the per-layer-GraphSession Gemma legacy entirely. | Diff-stat ≥ 1000 LOC removed across both families. |
+| **P7 — Default cut-over** | qwen35 Stage 1 default is already the fused-layer path; `HF2Q_LEGACY_PER_LAYER_CB=1` is its escape hatch during soak.  Gemma must not be claimed cut over until a live `forward_mlx.rs` gate/default exists. | Smoke + bench gate green on default-default settings for the family being cut over. |
+| **P8 — Soak + delete legacy** | 7-day window, no regressions.  Then delete the qwen35 legacy per-helper branches and, separately, any Gemma legacy path after its own cut-over.  Do not delete `forward_gpu_greedy` itself; it is the production greedy decode entry point containing the fused Stage-1 path. | Diff-stat and deletion target must name the actual legacy branches/files, not the active decode entry point. |
 
 ### P1 audit (merged) — qwen35 decode CB boundaries
 
@@ -1533,13 +1584,17 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m:448-614` — main encode loop; `:550` `dispatch_apply`; `:458` "optimal n_cb is 1 or 2"
 - `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m:670-722` — `encode_async` block, the per-CB encoding worker
 - `/opt/hf2q/docs/ADR-012-qwen35moe-conversion.md:215-256` — diagnosis + closure
-- `/opt/hf2q/src/inference/models/qwen35/forward_gpu.rs` — current per-layer-encoder qwen35 forward (target of P3 rewrite)
-- `/opt/hf2q/src/serve/forward_mlx.rs:1309` — Gemma's "one GraphSession per layer" baseline (30 CBs / pass)
+- `/opt/hf2q/src/inference/models/qwen35/forward_gpu.rs` — current qwen35 greedy decode: P3 Stage 1 fused-layer default path plus `HF2Q_LEGACY_PER_LAYER_CB=1` legacy bypass
+- `/opt/hf2q/src/serve/forward_mlx.rs:1486+` — Gemma's live default decode contract: one session for embedding + all layers + head, with optional dual-buffer split; the older line-1309 "one GraphSession per layer" rustdoc is stale
 - mlx-native: `mlx_native::GraphSession`, `mlx_native::CommandEncoder::memory_barrier()`
 - mlx-native examples: `cb_cost_calibration.rs`, `dispatch_cost_calibration.rs` (P2 + P3a empirical benches)
 - Memory pins: `feedback_perf_gate_thermal_methodology`, `feedback_shippability_standing_directive`, `feedback_never_ship_fallback_without_rootcause`, `feedback_no_broken_windows`, `project_metal_compiler_auto_optimizes_static_levers`, `project_end_gate_reality_check`, `feedback_ground_truth_is_what_we_can_measure_now`
 
 ## Changelog
+
+- **2026-04-28 — iter10 EXHAUSTED — P3 Stage 2 single-CB FFN extension (multi-layer chain encoder) FALSIFIED on M5 Max apex 35B-A3B-dwq46.**  CFA session `cfa-20260428-adr015-iter10-p3-stage2`, dual-mode (Claude + Codex worktrees competitive).  Goal was to fold the 40 per-layer FFN `commit_labeled` sites into a single chain `CommandEncoder` covering the whole forward pass, targeting 1 CB/decode-token and a ≥+1.0pp wall-time recovery vs cfc5358's 0.9456× baseline.  **Both teams produced parity-clean implementations** (max_abs_err = 3.12e-6 = sourdough threshold); both correctly wired 39 cross-layer `enc.memory_barrier()` calls; Claude's variant (`0e52207` + panic-fix `64a4f98`) added an explicit final FFN-out → rms_norm RAW barrier at the call site that Codex's variant (`0df6a40`) missed (cross-review found this as the deciding correctness defect).  **Phase-3 AC6 cold-SoC bench on Claude-fixed variant (`64a4f98`):** 5 cold trials × n_gen=256 on apex 35B-A3B-dwq46 — hf2q median **101.8 tok/s** (per-trial 96.4 / 102.2 / 102.1 / 101.8 / 100.7) vs llama-bench median **117.34 tok/s** (per-trial 118.33 / 98.15 / 116.27 / 118.62 / 117.34) = **0.8676×**.  delta_pp vs cfc5358 baseline 0.9456× = **-7.80pp**.  Verdict: **EXHAUSTED**, far below the +0.5pp re-run threshold and below the +1.0pp LANDED threshold.  Stage 2 was confirmed active on the bench: trial-2 stdout reports `Qwen3_5MoeForCausalLM · 40 layers`, all FFN arms are MoeQ → `all_layers_single_cb_eligible = true` → `chain_enc = Some(...)` → 39 cross-layer barriers fire on the single-CB path (the tester's `aggregate.json` note claiming "n_expert=0 / chain_enc=None on this fixture" was a memory-confusion error vs the separate 27B-dwq46 dense fixture and is overridden by the trial stdout).  **Confounder caveat (pending future work):** baseline 0.9456× was measured at `cfc5358`; intervening ADR-014/005 main-branch commits land between `cfc5358` and `8944a4f` (iter10 base).  No same-day cold-5-trial bench was run on `8944a4f` (stage-1-only) to fully separate iter10 contribution from drift.  The live 2026-04-28 short-trial line at the top of this ADR (114.4 tok/s decode at HEAD) is N=1 NGEN=64, not gate-quality, but suggests stage-1 baseline drift is small (≤2pp) — the bulk of the 7.8pp swing is plausibly stage-2 itself.  **Implication:** confirms the user's 2026-04-28 ADR-correction-pass reframe of P3 Stage 2 ("not pre-approved by this table; needs a fresh profile/bench justification") and matches the P3b reframe ("Apex alloc/residency work removed CPU cost but did not close wall time because the workload is mostly GPU-bound and async CPU work overlaps GPU execution").  Single-CB chain encoders not only fail to recover wall time on this workload — they appear to *cost* wall time, plausibly because Metal's per-CB async-overlap (commit layer N → CPU encodes layer N+1 while GPU runs layer N) is removed when one chain encoder holds all 40 layers' dispatches before any commit fires.  This is the **10th confirmed M5 Max static-evidence kernel/scheduling hypothesis falsified by live bench** in the `project_metal_compiler_auto_optimizes_static_levers` track record.  **No-merge:** neither `64a4f98` nor `0df6a40` merged to main.  Worktrees `iter10-claude` / `iter10-codex` deleted; branches archived.  **Bench environment caveat:** Final Cut Pro at 22-29% CPU during hf2q trials 1-2 and `XprotectService` at 29% during trial 1; trial-1 hf2q at 96.4 t/s likely contaminated; excluding trial 1 the 4-trial median is 101.95 t/s → ratio 0.869 → verdict unchanged.  mcp-brain-server `kill -STOP` for bench window per user directive; `kill -CONT` confirmed post-bench (PID 1205 returned to R state).  Bench artifacts at `/tmp/cfa-20260428-adr015-iter10-p3-stage2/bench/claude-fixed/` (51 wall-clock minutes; aggregate.json + decision.md + 5 hf2q + 5 llama trial logs + per-trial pmset-therm + ps-audit).  CFA reviewer artifacts at `/tmp/cfa-20260428-adr015-iter10-p3-stage2/reviews/{claude-on-codex.json, codex-on-claude.json}`.  **Pivot:** profile-first per `feedback_evidence_first_no_blind_kernel_rewrites` — next iter (proposed iter11) runs `HF2Q_DECODE_PROFILE=1` + xctrace Metal System Trace (now possible with iter9b labels at mlx-native@`a7d2b95`) on apex dwq46 to attribute the residual ~13% wall-time gap to specific kernel families before any further code change.  Task #2 (iter10c single-MlxDevice consolidation) is gated on profile-first evidence that residency is still a candidate lever, not pre-approved by iter10's null result.
+
+- **2026-04-28 — source-grounded ADR correction pass (logic errors found during live repo read).**  Updated the live-status, Decision, Phasing, and References sections to match current `/opt/hf2q` + `/opt/mlx-native` code instead of stale ADR targets.  Corrections: (1) P3 qwen35 did **not** land as a new `forward_gpu_single_cb` nor as one CB for the whole model; it landed inside `forward_gpu_greedy` as Stage 1 fused-layer scheduling, 41 CB/token default vs 103 legacy.  (2) `HF2Q_LEGACY_PER_LAYER_CB=1` is a qwen35 live gate today; do not claim it covers Gemma until `forward_mlx.rs` has an equivalent gate.  (3) P8 must not say "delete `forward_gpu_greedy`"; that function is the active production greedy entry point containing the fused path.  Delete legacy branches after soak, not the entry point.  (4) Split-commit DenseQ profiling intentionally changes scheduling and must be read as diagnostic decomposition against a fused-control path, not as production-preserving instrumentation.  (5) H4 barrier counters, residency-set auto-registration, and residency defer-and-flush are live in `mlx-native`; future work is measurement or hf2q multi-`MlxDevice` fragmentation, not "add the missing substrate."  (6) Gemma's line-1309 "one GraphSession per layer" rustdoc is stale; the body below line ~1486 is the live default, one session for embedding + all layers + head with optional dual-buffer split.  No code changes in this correction pass.
 
 - **2026-04-28 — iter9c FINDING — residency lever fragmented by hf2q multi-MlxDevice architecture (NOT yet measured; iter10c candidate).**  Surfaced by direct user pushback "what about residency" on the iter9 deep-read pivot.  Reading `/opt/hf2q/src/inference/models/qwen35/weight_pool.rs:88-115` (W-5b.7 iter 2 doc): hf2q creates **multiple `MlxDevice` instances** (one in `serve::gpu::GpuContext`, one in `forward_gpu`'s `GPU_CACHE` init, one inside `in_memory_loader::quantize_f32_to_q8_0_buffer`'s caller, …); each has its OWN `ResidencySet`.  `MlxBufferPool::register_existing` enforces a single-`ResidencySet` invariant via `same_owner` `Arc::ptr_eq` check (iter8e codex variant addition); the first call claims the pool, subsequent calls from a different device return `MlxError::InvalidArgument("MlxBufferPool cannot mix residency-enabled devices")`.  hf2q `weight_pool.rs:113-122` **silently absorbs that mismatch as a tolerated soft fallback** (`Err(InvalidArgument) where msg.contains("cannot mix residency-enabled devices") => Ok(())` — buffer stays unregistered, no residency hint, but loading continues).  In-source comment names the architectural fix: *"An iter-3 architectural refactor consolidating hf2q on a single shared `MlxDevice` would eliminate the soft fallback and let the remaining ~3 GB also join a residency set."*  **Implication for the iter8e AC6 result (0.9157× ratio, neutral movement vs pre-iter8e):** the 19 GB model + per-token decode buffers may be SPLIT across 3+ residency sets (~14 GB in one set, ~3 GB in others, KV cache + FFN scratch in yet others depending on which device is in scope at allocation time).  Metal's residency hint is per-set, not unified — fragmented sets give fragmented hints.  iter8e never tested the unified-set regime.  **Violates `feedback_never_ship_fallback_without_rootcause`**: the soft fallback was shipped without dating an exit condition.  iter10c candidate scope: **consolidate hf2q to a single `MlxDevice`**, eliminate the `weight_pool.rs:113-122` swallow-on-Err pattern, re-run AC6 to test whether unified residency closes the dwq46 gap.  If still neutral after consolidation: residency truly is not the lever and we close that branch definitively (today's test was inconclusive due to fragmentation, not the lever itself).  Sequencing: iter10c is gated on parallel ADR-005 session settling (currently active in `forward_gpu.rs` + `gpu_ffn.rs` + `gpu_delta_net.rs` per W-5b.26+ commits).
 
@@ -1555,7 +1610,7 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - **2026-04-26 — P3a calibration empirical:** `µs/dispatch ≈ 0.16 µs` at N≥500 — within ±15% of llama.cpp's ~0.14 µs/dispatch.  Shader-launch path is **not** materially slower.  Budget reconciliation: ~252 µs of the 540 µs gap is encode-time (CB + dispatch); ~288 µs (~53%) is **residual unaccounted** that lives in Rust-side orchestration.  P3b (Rust orchestration sweep) added as parallel phase to P3 single-CB rewrite.  Together P3 + P3b target ≥1.00× exit criteria.
 - **2026-04-26 — Literature foundations infused.**  11 arxiv papers fetched + verified pre-training-cutoff, organized into Kernel-level (FlashAttention 1+2), System architecture (vLLM, SGLang, Sarathi-Serve), Decode acceleration (Speculative Decoding, Medusa, EAGLE, Lookahead), and Graph compilation (TVM, Hidet) categories.  Each entry calls out Apple-Silicon applicability honestly.  Apple-Silicon-specific gap acknowledged: no pre-cutoff arxiv work on M-series LLM inference perf that I could verify by direct fetch.  Added §Architectural implications given full-stack ownership — single-CB is the conservative first lever; megakernel + cross-token pipelining open as next-octave levers given we own both layers.
 - **2026-04-27 — §"P3a' live profile pass" infused (CFA Wave 2a, `cfa-20260426-adr015-wave2a-p3aprime`).** xctrace TimeProfiler captured 3 cold-SoC trials × 64 decode tokens on macOS 26.4.1 / M5 Max with the qwen3.6-27b-dwq46 dense fixture.  Decode-only stack filtering (`forward_gpu_greedy`) yields the live ranked residual: rank 1 is `MlxDevice::alloc_buffer` → `IOGPUResourceCreate` → `mach_msg2_trap` at 3719 µs/token (Mach-IPC kernel-call dominated, ~1 IPC per GPU resource × ~hundreds of decode-token allocations); rank 3 is `command_encoder()` churn at 724 µs/token (closes under P3 single-CB); rank 4's `build_rope_multi_buffers` at 208 µs/token is independently fixable by hoisting per-call rope-params buffers to model-load time.  Hypothesis register: H1 (`gpu_ffn.rs:397-404` proj alloc) NOT FOUND at literal site (dense path doesn't call proj()) but the underlying *category* CONFIRMED at 37× the static estimate via the rank-1 alloc_buffer chain; H2 (apply_imrope) CONFIRMED 5.8× larger than estimated; H3 (command_encoder churn) CONFIRMED 13× larger; H4 (memory_barrier) FALSIFIED at literal site (sub-1ms-sample at 1ms granularity); H5 (with_context allocation) FALSIFIED — confirms Codex Wave 1 prior (`format!` lazy via closure).  Coverage gap flagged: dense fixture does not exercise the apex MoE expert proj path; Wave 2b must re-validate H1's literal site against the apex 35B-A3B fixture before committing P3b reductions to MoE-specific call sites.  Supersession note added to §Diagnosis pointing at §P3a'.  NAX questions Q-NAX-1, Q-NAX-3, Q-NAX-4 received in-row updates where the trace informed them (Q-NAX-3: confirmed macOS 26.4.1 ≥ 26.2 NAX threshold; Q-NAX-1, Q-NAX-4: noted that decode-only TimeProfiler trace cannot inform GPU-counter / long-K-prefill questions, both remain open).  Trace artifacts referenced by absolute path (not committed); only `scripts/profile-p3aprime.sh`, this ADR section, and `docs/perf-traces/.gitkeep` land in git.  The 9th static-evidence kernel hypothesis class (Wave 1 P3b suspect list) joins the falsified-by-live-evidence list per `project_metal_compiler_auto_optimizes_static_levers` — the Mach-IPC / IOGPU-resource-creation overhead was not on Wave 1's static suspect list because grep against Rust source can't see kernel boundary crossings.
-  Source dive in `src/serve/forward_mlx.rs:1309` confirms gemma's `forward_decode` is documented as *"MVP: one GraphSession per layer (30 sessions per forward pass)"*.  Each of gemma4's 30 layers opens a fresh `GraphSession` and commits at end-of-layer — explicit MVP placeholder that has not been improved.  Compared to qwen35's `forward_gpu_greedy` which uses ONE GraphSession with multiple `commit_labeled` calls within, gemma issues 30 distinct CBs per token from session boundaries alone.  Metal-system-trace measured 28.8 CBs/token on gemma vs 13.8 on llama-bench — the 30-session MVP design accounts for nearly all of the gap.  **Combined with the Q4_0 kernel-family penalty** (per the bench-matrix LOCALIZATION above, hf2q's `kernel_mul_mv_q4_0_f32` underperforms llama.cpp's on M5 Max), gemma's -17% gap (vs qwen35-dwq46's -7%) decomposes as: ~+7pp closeable by ADR-014 Q4_K_M fix (commit `a27e386` queued) + ~+5-10pp closeable by single-GraphSession refactor of `forward_decode` (gemma-specific iter8c work).  Plus gemma-arch-specific complications that may need additional work: **variable `head_count_kv` per layer** (`[8, 8, 8, 8, 8, 2, ...]` — different attention dispatch shapes per layer), **sliding window 1024 with 5:1 alternation pattern** (different SDPA kernel paths per layer), **128 experts** (vs apex's 256).  Iter8c scope clarified: post-ADR-014-fix, gemma needs (a) consolidate 30 GraphSessions → 1, (b) explicit barriers between layer-dependency edges (avoiding iter8a antipattern by NOT placing barriers between ops within a layer where the Metal driver tracks dependencies via concurrent dispatch already; only between layers where there's a residual-add data hazard), (c) handle variable-KV-heads dispatch shape efficiently (likely via per-layer-class kernel instantiation rather than runtime branching).  qwen35-dwq46 should reach D4 first bullet (≥1.00×) on the ADR-014 Q4_K_M fix alone; gemma needs both stacked levers.
+  **SUPERSEDED 2026-04-28:** this paragraph trusted the stale line-1309 rustdoc. Current source below line ~1486 uses one live session for embedding + all layers + head, with optional dual-buffer split. The old "30 sessions" premise, the derived "single-GraphSession refactor" plan, and the arithmetic credited to that plan must not be used for future work.
 
 - **2026-04-27 — RETRACTION: ADR-012's "0.93× is the practical M5 Max ceiling for pure-Rust mlx-native architecture" framing is wrong, and switching DWQ to Q4_K_M (commit `a27e386` in ADR-014) is NOT the answer to the ADR-015 D4 perf gap.**  Per Robert direct critique 2026-04-27: *"if llama.cpp is faster for SAME QUANTIZED MODEL, ON SAME EXACT M5 HARDWARE — then the core premise is retarded"*, *"I don't agree that we should be slower on q4_0 unless our implementation is wrong"*, and *"it's like a kid asking for a different homework assignment because they couldn't figure out the assignment"*.  Correct framing: same bytes + same hardware + byte-equivalent kernel source ⇒ if the wall-time differs, **mlx-native has an implementation defect we have not found**.  ADR-012's "9 falsified hypotheses" line was a stopping point, not a conclusion.  The ADR-014 Q4_K_M fix is good on its own merits (better quality, modern format, matches mlx-lm/llama.cpp convention) BUT must NOT be sold as the ADR-015 D4 closure path.  iter8c is rescoped: **find every implementation difference between mlx-native's and llama.cpp's Metal Q4_0 dispatch path, fix them, until the ratio closes**.
 
@@ -1565,7 +1620,7 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 - **2026-04-27 — Concrete defect candidate #1: mlx-native does NOT use Metal Residency Sets; llama.cpp does (gated on macOS ≥ 15.0, we're on 26.4.1).**  llama.cpp `ggml-metal-device.m:540-600` constructs `ggml_metal_rsets_init` with a 3-minute keep-alive and a background heartbeat thread that periodically calls `[res->data[i] requestResidency]` on every active set.  Buffer-level routing also branches on residency: `ggml-metal-device.m:1358` *"if (!buf->use_residency_sets)"* takes a different code path, and per-buffer `use_residency_sets` is wired through `ggml_metal_buffer_init` (line 1482) and `ggml_metal_split_buffer_init` (line 1579).  mlx-native: zero references to `useResource`, `residencySet`, `MTLResidencySet`, or `MTLResourceUsage` across `/opt/mlx-native/src/`.  **Why this matches the bench-matrix pattern**: residency-set absence imposes a per-dispatch fixed driver-validation overhead.  For Q4_0 mat-vec at decode m=1 (per-dispatch GPU work ≈ 17 µs p50 measured), even ~1 µs of fixed overhead is a 6% penalty.  For K-quant mat-vec at decode (more bits to decode + larger inner-product → more compute per dispatch), the same fixed overhead is a smaller fraction.  For dense bandwidth-bound workloads, DRAM saturation hides the fixed overhead entirely.  This is testable empirically: run `GGML_METAL_NO_RESIDENCY=1 llama-bench -m dwq46.gguf -p 0 -n 256 -r 5` and compare to default (residency sets enabled).  If llama.cpp's ratio drops to hf2q's level under no-residency, residency sets are confirmed as the (or a) root cause — implementation work for hf2q is to add `MTLResidencySet` support to mlx-native (probably in `MlxBufferPool` and `MlxDevice` boot path).  If llama.cpp's ratio is unaffected, there's another factor and the investigation continues with a #2 candidate.
 
-- **2026-04-27 — Gemma's gap is STACKED, distinct from qwen35-dwq46's:**  Source dive in `src/serve/forward_mlx.rs:1309` confirms gemma's `forward_decode` is documented as *"MVP: one GraphSession per layer (30 sessions per forward pass)"* — explicit MVP placeholder.  Combined with whatever's making Q4_0 slow (residency-set candidate above + possibly more), gemma's -17% gap (vs qwen35-dwq46's -7%) decomposes as: ~+7pp closeable by closing the Q4_0 implementation gap (residency sets + others) + ~+5-10pp closeable by single-GraphSession refactor of `forward_decode` (gemma-specific iter8c work).  Plus gemma-arch-specific complications: variable `head_count_kv` per layer (`[8,8,8,8,8,2,...]`), sliding window 1024 with 5:1 alternation, 128 experts.  qwen35-dwq46 is single-cause (Q4_0 implementation gap); gemma is multi-cause (Q4_0 + 30-session MVP + arch).
+- **2026-04-27 — Gemma's gap is STACKED, distinct from qwen35-dwq46's:**  **SUPERSEDED 2026-04-28:** this entry trusted the stale line-1309 rustdoc; current source below line ~1486 is already one live session plus optional dual-buffer split. The "30-session MVP" component and the derived single-GraphSession-refactor recovery estimate are invalid. Keep only the broader unresolved point: Gemma needs GPU-side kernel/dispatch attribution, not another CPU-side session-count assumption.
 
 - **2026-04-27 — Bench-matrix REFINED: gap is the Q4_0 + Q6_K *mix* (not Q4_0 alone).**  Dense 27B-dwq48 5-trial result: hf2q `[28.2, 27.2, 28.5, 28.1, 28.3]` median **28.200**; llama `[27.79, 27.76, 26.71, 27.34, 27.72]` median **27.720**; ratio **1.0173×** (hf2q WINS).  Tensor breakdown: 459 Q4_0 + 38 Q8_0.  Compared to dense 27B-dwq46 (487 Q4_0 + 24 Q6_K, ratio 0.99×): same Q4_0 dominance, only the 24 Q6_K replaced with 38 Q8_0 — and the ratio shifts from TIE to WIN.  **Refined pattern**: the loss is on fixtures with **Q4_0 + Q6_K** mix; gain is on fixtures with **Q4_0 + Q8_0** OR pure K-quants.  Specific kernel attribution: in MoE workloads, `ffn_down_exps.weight` is **Q6_K** in apex.gguf (which WINS at 1.04×) BUT also Q6_K appears in dwq46 (which LOSES at 0.93×); difference is that apex's gate/up are also Q5_K (faster K-quant kernels) while dwq46's gate/up are Q4_0.  **Conclusion: the Q4_0 mat-vec-id kernel for expert-gate/expert-up is slow per-dispatch on M5 Max compared to llama.cpp's same-named kernel.**  Dense bandwidth-bound workloads tie because DRAM saturation hides per-kernel-speed differences.  iter8c CFA Wave 1 should target the `kernel_mul_mv_id_q4_0_f32` kernel specifically — disassemble compiled bytecode (`xcrun metal -S` or `metal-air-as -dump`) on both binaries' Q4_0 kernels and diff.  If the compiled bytecode differs (instruction selection, register pressure, vectorization), Wave 1 lever is shader-attribute / pragma fixes (low-risk, high-yield).  If the bytecode is identical, Wave 1 lever is dispatch consolidation (the kernel can't be made faster per-call, so reduce calls).  Bench-matrix sweep complete for the qwen35 row; gemma row needs same-day rebench post-clean-state to confirm 0.83× holds; embedding (BERT) row needs separate methodology.
 
