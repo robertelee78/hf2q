@@ -1235,15 +1235,22 @@ mod tests {
     /// dequantize to numerically meaningful values within the
     /// canonical bounds:
     ///
+    /// - Q3_K: ≤ 0.10 RMSE (3.4375-bpw codebook → ~2× Q4_K error;
+    ///   matches iter-7 isolated-codec gate)
     /// - Q5_K: ≤ 0.025 RMSE (5.5-bpw codebook → ~half Q4_K error)
     /// - Q6_K: ≤ 0.012 RMSE (6.5-bpw codebook → ~quarter Q4_K error)
     ///
     /// Uses the same `blk.5.attn_q.weight` layer-5/32 setup as iter-3x
     /// so attn_q never bumps and each variant lands at its base
-    /// target — Q5_K_M → Q5_K, Q6_K → Q6_K.  This means a regression
-    /// in the policy that silently routes Q5_K_M to Q4_K (or any other
-    /// target) would round-trip with wrong bytes-per-block AND wrong
-    /// RMSE.  The two assertions catch the bug at different layers.
+    /// target — Q3_K_S/M/L → Q3_K, Q5_K_M → Q5_K, Q6_K → Q6_K.  This
+    /// means a regression in the policy that silently routes any
+    /// variant to a different target would round-trip with wrong
+    /// bytes-per-block AND wrong RMSE.  The two assertions catch the
+    /// bug at different layers.
+    ///
+    /// iter-11: extended to cover Q3_K_S/M/L (all three lock to Q3_K
+    /// base on attn_q since none of them apply policy upgrades to
+    /// attn_q per `llama-quant.cpp`).
     #[test]
     fn variant_streaming_q5km_q6k_round_trip_rmse_bounds() {
         use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
@@ -1251,7 +1258,7 @@ mod tests {
         use crate::quantize::variant_quantizer::VariantKQuantizer;
         use crate::calibrate::calibrator::CalibrationData;
         use crate::quantize::k_quant::{
-            dequantize_row_q5_k_bytes, dequantize_row_q6_k_bytes,
+            dequantize_row_q3_k_bytes, dequantize_row_q5_k_bytes, dequantize_row_q6_k_bytes,
         };
 
         const QK_K: usize = 256;
@@ -1280,6 +1287,21 @@ mod tests {
         type DequantFn = fn(&[u8], &mut [f32])
             -> Result<usize, crate::quantize::k_quant::KQuantError>;
         let cases: Vec<(KQuantVariant, &str, usize, f64, DequantFn)> = vec![
+            // Q3_K family lands at base Q3_K on attn_q (no policy bumps for
+            // any Q3_K variant on attn_q per `llama-quant.cpp`); RMSE bound
+            // matches iter-7's `quantize_q3_k_round_trip_smooth_ramp_rmse`.
+            (
+                KQuantVariant::Q3_K_S, "Q3_K", N_BLOCKS * 110, 0.10,
+                dequantize_row_q3_k_bytes as DequantFn,
+            ),
+            (
+                KQuantVariant::Q3_K_M, "Q3_K", N_BLOCKS * 110, 0.10,
+                dequantize_row_q3_k_bytes as DequantFn,
+            ),
+            (
+                KQuantVariant::Q3_K_L, "Q3_K", N_BLOCKS * 110, 0.10,
+                dequantize_row_q3_k_bytes as DequantFn,
+            ),
             (
                 KQuantVariant::Q5_K_M, "Q5_K", N_BLOCKS * 176, 0.025,
                 dequantize_row_q5_k_bytes as DequantFn,
