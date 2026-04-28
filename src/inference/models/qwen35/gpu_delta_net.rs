@@ -1776,6 +1776,231 @@ pub fn build_delta_net_layer(
 }
 
 // ================================================================
+// ADR-015 P3 Stage 1: caller-driven single-CB DeltaNet (decode-only)
+// ================================================================
+
+/// Decode-only Qwen3.5/3.6 DeltaNet layer, encoded into the caller's
+/// command buffer.
+///
+/// Mirrors [`build_delta_net_layer`] for `seq_len == 1` (decode), but
+/// takes `enc: &mut CommandEncoder` from the caller and DOES NOT commit.
+/// The caller (forward_gpu_greedy single-CB orchestrator) is responsible
+/// for committing the shared encoder once all per-layer attention work
+/// is encoded.
+///
+/// ADR-015 P3 Stage 1: collapses 1 CB/DeltaNet-layer into the shared
+/// caller encoder.  All 7 intra-encoder barriers from the legacy decode
+/// path are preserved bit-for-bit (P1 audit row :899/:909/:916/:932/:945
+/// /:953/:961, separating op1 → ops2a/b/c → op3 ssm_conv → ops5/6 →
+/// q_scale+g_beta → op7 GDN → op8 → op9):
+///
+/// ```text
+///   op1 (pre_norm) → BARRIER →
+///   ops2a+2b+2c (qkv_proj, z_proj concurrent) → BARRIER →
+///   op3 (ssm_conv) → BARRIER →
+///   ops5+6a+6b (l2_norm_q, l2_norm_k, alpha, beta) → BARRIER →
+///   q_scale + g_beta → BARRIER →
+///   op7 (GDN) → BARRIER →
+///   op8 (ssm_norm_gate) → BARRIER →
+///   op9 (out_proj)
+/// ```
+///
+/// # Errors
+///
+/// - `seq_len != 1` (decode-only path).
+/// - Any underlying mlx-native dispatch failure.
+#[allow(clippy::too_many_arguments)]
+pub fn build_delta_net_layer_decode_into(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    weights: &DeltaNetWeightsGpu,
+    conv_state_in: &MlxBuffer,
+    conv_state_out: &MlxBuffer,
+    state_in: &MlxBuffer,
+    state_out: &MlxBuffer,
+    seq_len: u32,
+    hidden_size: u32,
+    n_k_heads: u32,
+    n_v_heads: u32,
+    d_k: u32,
+    d_v: u32,
+    k_width: u32,
+    rms_norm_eps: f32,
+) -> Result<MlxBuffer> {
+    debug_assert_eq!(seq_len, 1, "build_delta_net_layer_decode_into: seq_len must be 1");
+
+    let qkv_channels = 2 * n_k_heads * d_k + n_v_heads * d_v;
+    let z_channels = n_v_heads * d_v;
+    let q_span = n_k_heads * d_k;
+    let k_span = n_k_heads * d_k;
+
+    let nv = n_v_heads as usize;
+    let dk = d_k as usize;
+    let dv = d_v as usize;
+    let qkv_ch = qkv_channels as usize;
+    let q_sp = q_span as usize;
+    let k_sp = k_span as usize;
+
+    let n_q_elems = (seq_len * n_k_heads * d_k) as usize;
+    let q_scale_val = 1.0_f32 / (dk as f32).sqrt();
+    let g_n = (seq_len * n_v_heads) as usize;
+    let rows_op8 = seq_len * n_v_heads;
+    let gated_elems = (rows_op8 * d_v) as usize;
+    let n_seqs = 1u32;
+    let out_elems = (n_v_heads * seq_len * d_v) as usize;
+
+    // ---- Pool-allocated scratch buffers (same layout as legacy decode) ----
+    let qkv_conv = super::decode_pool::pooled_alloc_buffer(
+            device,
+            (seq_len * qkv_channels) as usize * 4,
+            DType::F32,
+            vec![seq_len as usize, qkv_ch],
+        )
+        .map_err(|e| anyhow!("alloc qkv_conv (decode_into): {e}"))?;
+    let mut ssm_params_buf = super::decode_pool::pooled_alloc_buffer(
+            device, 4 * 4, DType::U32, vec![4])
+        .map_err(|e| anyhow!("alloc ssm params (decode_into): {e}"))?;
+    {
+        let s = ssm_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
+        s[0] = qkv_channels; s[1] = seq_len; s[2] = 1; s[3] = k_width;
+    }
+    let ssm_conv_params = SsmConvParams {
+        channels: qkv_channels,
+        n_tokens: seq_len,
+        n_seqs: 1,
+        k_width,
+    };
+    let q_scaled = super::decode_pool::pooled_alloc_buffer(
+            device, n_q_elems * 4, DType::F32, vec![n_q_elems])
+        .map_err(|e| anyhow!("alloc q_scaled (decode_into): {e}"))?;
+    let g_buf = super::decode_pool::pooled_alloc_buffer(
+            device, g_n * 4, DType::F32, vec![g_n])
+        .map_err(|e| anyhow!("alloc g_buf (decode_into): {e}"))?;
+    let beta_buf = super::decode_pool::pooled_alloc_buffer(
+            device, g_n * 4, DType::F32, vec![g_n])
+        .map_err(|e| anyhow!("alloc beta_buf (decode_into): {e}"))?;
+    let mut g_params_buf = super::decode_pool::pooled_alloc_buffer(
+            device, 8, DType::U32, vec![2])
+        .map_err(|e| anyhow!("alloc g_params (decode_into): {e}"))?;
+    {
+        let s = g_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
+        s[0] = n_v_heads;
+        s[1] = seq_len;
+    }
+    let gated_buf = super::decode_pool::pooled_alloc_buffer(
+            device, gated_elems * 4, DType::F32, vec![gated_elems])
+        .map_err(|e| anyhow!("alloc op8 gated (decode_into): {e}"))?;
+    let op8_params = build_ssm_norm_gate_params(device, rms_norm_eps, d_v)
+        .map_err(|e| anyhow!("op8 params (decode_into): {e}"))?;
+    let attn_out_buf = super::decode_pool::pooled_alloc_buffer(
+            device, out_elems * 4, DType::F32, vec![out_elems])
+        .map_err(|e| anyhow!("alloc gdn output (decode_into): {e}"))?;
+    let gdn_params = GatedDeltaNetParams {
+        d_k, d_v, n_k_heads, n_v_heads, n_tokens: seq_len, n_seqs,
+    };
+    let gdn_params_buf = build_gated_delta_net_params(device, gdn_params)
+        .map_err(|e| anyhow!("build gdn params (decode_into): {e}"))?;
+
+    // ---- Sliced views of qkv_conv (CPU-side only) ----
+    let q_gpu = qkv_conv.slice_view(0, q_sp);
+    let k_gpu = qkv_conv.slice_view((q_sp * 4) as u64, k_sp);
+    let v_gpu = qkv_conv.slice_view(((q_sp + k_sp) * 4) as u64, nv * dv);
+
+    // ---- Op 1: pre_norm ----
+    let x_norm = apply_pre_norm(
+        enc, registry, device, x, &weights.attn_norm,
+        seq_len, hidden_size, rms_norm_eps,
+    )?;
+    // Barrier preserved at legacy gpu_delta_net.rs:899 position.
+    enc.memory_barrier();
+
+    // ---- Ops 2a+2b+2c: qkv_proj, z_proj (concurrent) ----
+    let qkv_raw = apply_proj(
+        enc, registry, device, &x_norm,
+        &weights.attn_qkv, seq_len, hidden_size, qkv_channels,
+    )?;
+    let z = apply_proj(
+        enc, registry, device, &x_norm,
+        &weights.attn_gate, seq_len, hidden_size, z_channels,
+    )?;
+    // Barrier preserved at legacy gpu_delta_net.rs:909 position.
+    enc.memory_barrier();
+
+    // ---- Op 3: ssm_conv ----
+    dispatch_ssm_conv(
+        enc, registry, device.metal_device(),
+        &qkv_raw, &weights.ssm_conv1d, conv_state_in, conv_state_out,
+        &qkv_conv, &ssm_params_buf, ssm_conv_params,
+    ).context("dispatch_ssm_conv ops3 (decode_into)")?;
+    // Barrier preserved at legacy gpu_delta_net.rs:916 position.
+    enc.memory_barrier();
+
+    // ---- Ops 5+6a+6b: l2_norm_q, l2_norm_k, alpha, beta (concurrent) ----
+    let q_l2 = apply_l2_norm_per_head(
+        enc, registry, device, &q_gpu, seq_len, n_k_heads, d_k, rms_norm_eps,
+    )?;
+    let k_normed = apply_l2_norm_per_head(
+        enc, registry, device, &k_gpu, seq_len, n_k_heads, d_k, rms_norm_eps,
+    )?;
+    let alpha_logit_buf = apply_proj(
+        enc, registry, device, &x_norm,
+        &weights.ssm_alpha, seq_len, hidden_size, n_v_heads,
+    )?;
+    let beta_logit_buf = apply_proj(
+        enc, registry, device, &x_norm,
+        &weights.ssm_beta, seq_len, hidden_size, n_v_heads,
+    )?;
+    // Barrier preserved at legacy gpu_delta_net.rs:932 position.
+    enc.memory_barrier();
+
+    // ---- q_scale + g_beta ----
+    scalar_mul_f32(
+        enc, registry, device.metal_device(),
+        &q_l2, &q_scaled, n_q_elems, q_scale_val,
+    ).context("scalar_mul_f32 q_scale (decode_into)")?;
+    dispatch_compute_g_beta(
+        enc, registry, device.metal_device(),
+        &alpha_logit_buf, &beta_logit_buf,
+        &weights.ssm_dt_bias, &weights.ssm_a,
+        &g_buf, &beta_buf, &g_params_buf,
+        seq_len, n_v_heads,
+    ).context("dispatch_compute_g_beta (decode_into)")?;
+    // Barrier preserved at legacy gpu_delta_net.rs:945 position.
+    enc.memory_barrier();
+
+    // ---- Op 7: GDN — reads state_in, writes state_out ----
+    dispatch_gated_delta_net(
+        enc, registry, device.metal_device(),
+        &q_scaled, &k_normed, &v_gpu,
+        &g_buf, &beta_buf, state_in,
+        &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
+    ).context("dispatch_gated_delta_net (decode_into)")?;
+    // Barrier preserved at legacy gpu_delta_net.rs:953 position.
+    enc.memory_barrier();
+
+    // ---- Op 8: ssm_norm_gate ----
+    dispatch_ssm_norm_gate(
+        enc, registry, device.metal_device(),
+        &attn_out_buf, &weights.ssm_norm, &z,
+        &gated_buf, &op8_params,
+        rows_op8, d_v,
+    ).context("dispatch_ssm_norm_gate (decode_into)")?;
+    // Barrier preserved at legacy gpu_delta_net.rs:961 position.
+    enc.memory_barrier();
+
+    // ---- Op 9: out_proj ----
+    let output = apply_proj(
+        enc, registry, device, &gated_buf,
+        &weights.ssm_out, seq_len, z_channels, hidden_size,
+    )?;
+
+    // No commit here — the caller owns the shared encoder.
+    Ok(output)
+}
+
+// ================================================================
 // Tests
 // ================================================================
 

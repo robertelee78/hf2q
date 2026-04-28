@@ -46,16 +46,18 @@ use super::delta_net::DeltaNetLayerShape;
 use super::ffn::{DenseFfnShape, MoeFfnShape};
 use super::full_attn::FullAttnShape;
 use super::activation_capture::LayerActivations;
-use super::gpu_delta_net::{build_delta_net_layer, DeltaNetWeightsGpu};
+use super::gpu_delta_net::{
+    build_delta_net_layer, build_delta_net_layer_decode_into, DeltaNetWeightsGpu,
+};
 use super::gpu_ffn::{
     build_dense_ffn_layer_gpu, build_dense_ffn_layer_gpu_q_into,
     build_moe_ffn_layer_gpu, build_moe_ffn_layer_gpu_q, build_moe_ffn_layer_gpu_q_into,
     DenseFfnWeightsGpu, DenseFfnWeightsGpuQ, MoeFfnWeightsGpu, MoeFfnWeightsGpuQ,
 };
 use super::gpu_full_attn::{
-    apply_linear_projection_f32, apply_linear_projection_f32_into, build_gated_attn_layer,
-    download_f32, upload_f32, upload_f32_into, upload_f32_weight, upload_q4_0_from_f32,
-    FullAttnWeightsGpu,
+    apply_gated_attn_layer_decode_into, apply_linear_projection_f32,
+    apply_linear_projection_f32_into, build_gated_attn_layer, download_f32, upload_f32,
+    upload_f32_into, upload_f32_weight, upload_q4_0_from_f32, FullAttnWeightsGpu,
 };
 use super::io_heads::embed_tokens;
 use super::kv_cache::HybridKvCache;
@@ -386,39 +388,175 @@ fn apply_output_head_gpu_greedy(
         &mut (*(bufs as *const DecodeBuffers as *mut DecodeBuffers)).logits_buf
     };
 
-    // ---- Encoder A: output_norm + lm_head → logits_buf ----
-    // output_norm is pipelined (commit()) into lm_head via serial queue.
-    // Labeled commits: when MLX_PROFILE_CB=1 is set, each commit_labeled
-    // forces sync + records GPU time under the label.  Otherwise async
-    // commit (zero overhead).  ADR-012 §Optimize / Task #15.
-    let mut enc_norm = device.command_encoder().context("enc output_norm greedy")?;
+    // ADR-015 P3 Stage 1 (S1): collapse the legacy 3-encoder output head
+    // (norm + lm_head + argmax) into ONE encoder with two intra-CB
+    // barriers between RAW dependencies.  Single terminal
+    // `commit_and_wait_labeled` drains the GPU before the 4-byte
+    // host read of `out_index` (the only fuse_safe=NO row in the P1
+    // audit, which must remain a real wait).
+    apply_output_head_gpu_greedy_into(
+        None, // no caller-supplied encoder; we open + commit our own
+        device, registry, hidden, head, hidden_size, vocab_size,
+        normed, norm_params, &out_index, &out_value, argmax_params, logits_buf,
+    )?;
+
+    // Download only 4 bytes (the winning token ID).
+    let token_id = out_index.as_slice::<u32>()
+        .map_err(|e| anyhow!("out_index as_slice: {e}"))?[0];
+    Ok(token_id)
+}
+
+/// Caller-driven single-CB output head (norm + lm_head + argmax).
+///
+/// ADR-015 P3 Stage 1 (S1): when `caller_enc` is `Some`, the dispatches
+/// are encoded into the caller's command buffer and NO commit is issued.
+/// When `caller_enc` is `None`, this opens its own encoder and issues a
+/// terminal `commit_and_wait_labeled("output_head.fused_norm_lm_argmax")`.
+///
+/// Either way, only ONE encoder is opened (vs the legacy 3-encoder path
+/// at forward_gpu.rs:393-:417), with two intra-CB barriers:
+///   - norm → barrier → lm_head (RAW: lm_head reads `normed`)
+///   - lm_head → barrier → argmax (RAW: argmax reads `logits_buf`)
+///
+/// The terminal `commit_and_wait` is the only fuse_safe=NO row in the
+/// P1 audit (host read of `out_index` 4-byte token id) and remains a
+/// real wait per ADR-015 invariant.
+#[allow(clippy::too_many_arguments)]
+fn apply_output_head_gpu_greedy_into(
+    caller_enc: Option<&mut mlx_native::CommandEncoder>,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden: &MlxBuffer,
+    head: &OutputHeadGpu,
+    hidden_size: u32,
+    vocab_size: u32,
+    normed: &MlxBuffer,
+    norm_params: &MlxBuffer,
+    out_index: &MlxBuffer,
+    out_value: &MlxBuffer,
+    argmax_params: &MlxBuffer,
+    logits_buf: &mut MlxBuffer,
+) -> Result<()> {
+    let seq_len = 1u32;
+
+    // Helper: encode the 3-stage output head into a given encoder.
+    fn encode_into(
+        enc: &mut mlx_native::CommandEncoder,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        hidden: &MlxBuffer,
+        head: &OutputHeadGpu,
+        hidden_size: u32,
+        vocab_size: u32,
+        seq_len: u32,
+        normed: &MlxBuffer,
+        norm_params: &MlxBuffer,
+        out_index: &MlxBuffer,
+        out_value: &MlxBuffer,
+        argmax_params: &MlxBuffer,
+        logits_buf: &mut MlxBuffer,
+    ) -> Result<()> {
+        // Stage 1: output_norm → normed.
+        rms_norm::dispatch_rms_norm(
+            enc, registry, device.metal_device(),
+            hidden, &head.norm_w, normed, norm_params,
+            seq_len, hidden_size,
+        ).context("dispatch_rms_norm output greedy (single-CB)")?;
+        // Barrier: lm_head reads `normed` written above.  Replaces the
+        // legacy CB boundary at forward_gpu.rs:400→:404.
+        enc.memory_barrier();
+
+        // Stage 2: lm_head_q4 → logits_buf.
+        apply_linear_projection_f32_into(
+            enc, registry, device, normed,
+            &head.lm_head_q4, logits_buf, seq_len, hidden_size, vocab_size,
+        ).context("lm_head projection greedy (single-CB)")?;
+        // Barrier: argmax reads `logits_buf` written above.  Replaces the
+        // legacy CB boundary at forward_gpu.rs:410→:413.
+        enc.memory_barrier();
+
+        // Stage 3: argmax → out_index, out_value.
+        dispatch_argmax_f32(
+            enc, registry, device.metal_device(),
+            logits_buf, out_index, out_value, argmax_params, vocab_size,
+        ).context("dispatch_argmax_f32 greedy (single-CB)")?;
+        Ok(())
+    }
+
+    if let Some(enc) = caller_enc {
+        // Caller-driven path (S4 orchestrator): caller commits at the end.
+        encode_into(
+            enc, registry, device, hidden, head,
+            hidden_size, vocab_size, seq_len,
+            normed, norm_params, out_index, out_value, argmax_params, logits_buf,
+        )
+    } else {
+        // Standalone path (legacy / non-S4): open + terminal wait.
+        let mut enc = device.command_encoder()
+            .context("enc output_head.fused_norm_lm_argmax (greedy)")?;
+        encode_into(
+            &mut enc, registry, device, hidden, head,
+            hidden_size, vocab_size, seq_len,
+            normed, norm_params, out_index, out_value, argmax_params, logits_buf,
+        )?;
+        // Terminal commit_and_wait: the only fuse_safe=NO row in the P1
+        // audit — host read of out_index follows immediately.
+        enc.commit_and_wait_labeled("output_head.fused_norm_lm_argmax")
+            .context("commit output_head.fused_norm_lm_argmax greedy")?;
+        Ok(())
+    }
+}
+
+/// Legacy 3-encoder output head — pixel-identical to HEAD-pre-Stage-1.
+///
+/// Activated by `HF2Q_LEGACY_PER_LAYER_CB=1` for the 7-day soak window.
+/// Same code path as the pre-Stage-1 `apply_output_head_gpu_greedy` body:
+/// 3 separate encoders (output_norm + lm_head + argmax), with the argmax
+/// encoder doing the only `commit_and_wait_labeled`.
+fn apply_output_head_gpu_greedy_legacy(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden: &MlxBuffer,
+    head: &OutputHeadGpu,
+    hidden_size: u32,
+    vocab_size: u32,
+    _eps: f32,
+    bufs: &DecodeBuffers,
+) -> Result<u32> {
+    let seq_len = 1u32;
+
+    let normed        = &bufs.norm_out_buf;
+    let norm_params   = &bufs.norm_params_buf;
+    let out_index     = &bufs.argmax_index_buf;
+    let out_value     = &bufs.argmax_value_buf;
+    let argmax_params = &bufs.argmax_params_buf;
+    let logits_buf = unsafe {
+        &mut (*(bufs as *const DecodeBuffers as *mut DecodeBuffers)).logits_buf
+    };
+
+    let mut enc_norm = device.command_encoder().context("enc output_norm legacy")?;
     rms_norm::dispatch_rms_norm(
         &mut enc_norm, registry, device.metal_device(),
         hidden, &head.norm_w, &normed, &norm_params,
         seq_len, hidden_size,
-    ).context("dispatch_rms_norm output greedy")?;
+    ).context("dispatch_rms_norm output legacy")?;
     enc_norm.commit_labeled("output_head.norm");
 
-    // Use Q4_0 lm_head for decode: 3.57× less bandwidth vs BF16.
-    // Pre-allocated logits_buf avoids ~600KB newBuffer per decode token.
-    let mut enc_lm = device.command_encoder().context("enc lm_head greedy")?;
+    let mut enc_lm = device.command_encoder().context("enc lm_head legacy")?;
     apply_linear_projection_f32_into(
         &mut enc_lm, registry, device, &normed,
         &head.lm_head_q4, logits_buf, seq_len, hidden_size, vocab_size,
-    ).context("lm_head projection greedy")?;
-    // commit() and immediately encode argmax on the same queue.
+    ).context("lm_head projection legacy")?;
     enc_lm.commit_labeled("output_head.lm_head_q4");
 
-    // ---- Encoder B: argmax on logits_buf → out_index ----
-    let mut enc_argmax = device.command_encoder().context("enc argmax greedy")?;
+    let mut enc_argmax = device.command_encoder().context("enc argmax legacy")?;
     dispatch_argmax_f32(
         &mut enc_argmax, registry, device.metal_device(),
         &logits_buf, &out_index, &out_value, &argmax_params, vocab_size,
-    ).context("dispatch_argmax_f32 greedy")?;
+    ).context("dispatch_argmax_f32 legacy")?;
     enc_argmax.commit_and_wait_labeled("output_head.argmax")
-        .context("commit argmax greedy")?;
+        .context("commit argmax legacy")?;
 
-    // Download only 4 bytes (the winning token ID).
     let token_id = out_index.as_slice::<u32>()
         .map_err(|e| anyhow!("out_index as_slice: {e}"))?[0];
     Ok(token_id)
@@ -1482,6 +1620,29 @@ impl Qwen35Model {
             decode_bufs.embed_buf.clone()
         };
 
+        // ---- ADR-015 P3 Stage 1: HF2Q_LEGACY_PER_LAYER_CB env-gate ----
+        //
+        // When set to "1", takes the legacy per-helper-commit path
+        // verbatim (each FullAttn / DeltaNet helper opens + commits its
+        // own encoder; output head uses 3 encoders).  This is the
+        // 7-day soak fallback for the Stage 1 single-CB rewrite; if no
+        // regressions surface on dwq46 production after 2026-05-05 it is
+        // removed in iter11+ (ADR-015 P8).
+        //
+        // When unset (default), takes the new single-CB path: ONE encoder
+        // shared across {attn, fused_residual_norm, MoE/Dense FFN} per
+        // layer for the MoeQ + DenseQ fused arms, plus ONE encoder for
+        // the output head (norm + lm_head + argmax with intra-CB
+        // barriers, single terminal commit_and_wait_labeled).
+        //
+        // Legacy non-fused arms (Dense F32, F32-MoE) keep their original
+        // 2-encoder structure regardless of this env gate — they are not
+        // on the dwq46 production hot path and Stage 1 does not refactor
+        // them.
+        let legacy_per_layer_cb = std::env::var_os("HF2Q_LEGACY_PER_LAYER_CB")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
         // ---- Per-layer forward pass (identical to forward_gpu) ----
         let decode_profile = std::env::var("HF2Q_DECODE_PROFILE").is_ok();
         let cb_start = if decode_profile { mlx_native::cmd_buf_count() } else { 0 };
@@ -1491,227 +1652,444 @@ impl Qwen35Model {
         let mut total_ffn_us = 0u64;
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
             let layer_cpu = &self.layers[layer_idx];
-            let t_attn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
-            let attn_out = match layer_gpu {
-                LayerWeightsGpu::FullAttn { attn, .. } => {
-                    let shape = FullAttnShape::from_config(cfg);
-                    let full_attn_rank = match kv_cache.slot_index_for_layer(layer_idx as u32) {
-                        Some(super::kv_cache::LayerSlot::Full(rank)) => rank as usize,
-                        other => {
-                            return Err(anyhow!(
-                                "layer {layer_idx}: expected FullAttn slot, got {:?}",
-                                other
-                            ))
-                        }
-                    };
-                    let max_seq = kv_cache.max_seq_len;
-                    let slot = &mut kv_cache.full_attn[full_attn_rank];
-                    build_gated_attn_layer(
-                        &device,
-                        &mut registry,
-                        &hidden,
-                        &pos_buf,
-                        attn,
-                        Some(slot),
-                        max_seq,
-                        seq_len,
-                        shape.hidden_size,
-                        shape.n_head,
-                        shape.n_kv,
-                        shape.head_dim,
-                        shape.rotary_dim,
-                        shape.rope_theta,
-                        shape.mrope_section,
-                        shape.rms_norm_eps,
-                    )
-                    .with_context(|| format!("full_attn greedy layer {layer_idx}"))?
-                }
-                LayerWeightsGpu::LinearAttn { attn, .. } => {
-                    let shape = DeltaNetLayerShape::from_config(cfg);
-                    let km1 = (cfg.linear_conv_kernel_dim.saturating_sub(1).max(1)) as usize;
-                    let qkv_channels = shape.qkv_channels() as usize;
-                    let rec_size = (cfg.linear_key_head_dim
-                        * cfg.linear_value_head_dim
-                        * cfg.linear_num_value_heads) as usize;
-
-                    let linear_slot_idx =
-                        match kv_cache.slot_index_for_layer(layer_idx as u32) {
-                            Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
-                            _ => usize::MAX,
-                        };
-
-                    let zero_conv_in: MlxBuffer;
-                    let zero_conv_out: MlxBuffer;
-                    let zero_rec_buf_in: MlxBuffer;
-                    let zero_rec_buf_out: MlxBuffer;
-                    let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref):
-                        (&MlxBuffer, &MlxBuffer, &MlxBuffer, &MlxBuffer) =
-                        if linear_slot_idx != usize::MAX {
-                            let slot = &kv_cache.linear_attn[linear_slot_idx];
-                            (&slot.conv_state, &slot.conv_state_scratch,
-                             &slot.recurrent, &slot.recurrent_scratch)
-                        } else {
-                            let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
-                            let zero_rec_cpu = vec![0.0f32; rec_size];
-                            zero_conv_in = upload_f32(&zero_conv_cpu, &device)
-                                .context("alloc zero conv state_in")?;
-                            zero_conv_out = upload_f32(&zero_conv_cpu, &device)
-                                .context("alloc zero conv state_out")?;
-                            zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
-                                .context("alloc zero recurrent state_in")?;
-                            zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
-                                .context("alloc zero recurrent state_out")?;
-                            (&zero_conv_in, &zero_conv_out,
-                             &zero_rec_buf_in, &zero_rec_buf_out)
-                        };
-                    let out = build_delta_net_layer(
-                        &device,
-                        &mut registry,
-                        &hidden,
-                        attn,
-                        conv_in_ref,
-                        conv_out_ref,
-                        state_in_ref,
-                        state_out_ref,
-                        seq_len,
-                        shape.hidden_size,
-                        shape.n_k_heads,
-                        shape.n_v_heads,
-                        shape.d_k,
-                        shape.d_v,
-                        shape.conv_kernel,
-                        shape.rms_norm_eps,
-                    )
-                    .with_context(|| format!("delta_net greedy layer {layer_idx}"))?;
-
-                    if linear_slot_idx != usize::MAX {
-                        let slot = &mut kv_cache.linear_attn[linear_slot_idx];
-                        slot.swap_conv_state();
-                        slot.swap_recurrent();
-                    }
-                    out
-                }
-            };
-
-            if let Some(t) = t_attn_start {
-                let us = t.elapsed().as_micros() as u64;
-                match layer_gpu {
-                    LayerWeightsGpu::LinearAttn { .. } => total_linear_attn_us += us,
-                    LayerWeightsGpu::FullAttn { .. } => total_full_attn_us += us,
-                }
-            }
-
-            // --- Fused residual + post-attention RMSNorm + FFN (single command buffer) ---
-            //
-            // ADR-012 §Optimize / Task #15 follow-up: the pre-fusion path issued 2
-            // separate command buffers per MoE layer (1 for fused_residual_norm, 1 for
-            // build_moe_ffn_layer_gpu_q).  Fusing them into one encoder saves 40
-            // command buffers per decode token (40 layers × 1 cb saved each), reducing
-            // hf2q's command-buffer count from 140 toward llama.cpp's 1-2 per decode.
-            //
-            // Wave 5b.14 follow-up: DenseQ joins the fused single-CB path via the
-            // mirror `build_dense_ffn_layer_gpu_q_into` (production 27B DWQ GGUFs).
-            // W-5b.16 sunset: the `HF2Q_DENSE_Q_LEGACY` env gate was removed
-            // after a 30/30 cross-path parity audit at PP4106; DenseQ now
-            // unconditionally takes the fused single-CB path.
-            //
-            // Dense (F32) and Moe-unquantized still use the legacy 2-encoder path
-            // because their dispatchers have not been converted to the `_into` API
-            // yet — neither is the production codepath for 27B/35B GGUFs.
             let post_norm_w = match layer_gpu {
                 LayerWeightsGpu::FullAttn { attn, .. } => &attn.post_attn_norm,
                 LayerWeightsGpu::LinearAttn { attn, .. } => &attn.post_attn_norm,
             };
             let (ffn_input_buf_ref, ffn_residual_buf_ref) = &decode_bufs.layer_scratch[layer_idx];
-
             let ffn_weights_gpu = match layer_gpu {
                 LayerWeightsGpu::FullAttn { ffn, .. } => ffn,
                 LayerWeightsGpu::LinearAttn { ffn, .. } => ffn,
             };
-            let t_ffn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
 
-            let ffn_out = match ffn_weights_gpu {
-                FfnWeightsGpu::MoeQ(w_gpu) => {
-                    // Fused MoE-Q path: one command buffer for fused_res_norm + entire MoE FFN.
-                    let moe = cfg.moe.as_ref().ok_or_else(|| {
-                        anyhow!("MoE FFN missing moe config greedy (layer {layer_idx})")
-                    })?;
-                    let shape = MoeFfnShape {
-                        hidden_size: h,
-                        num_experts: moe.num_experts,
-                        num_experts_per_tok: moe.num_experts_per_tok,
-                        moe_intermediate_size: moe.moe_intermediate_size,
-                        shared_intermediate_size: moe.shared_expert_intermediate_size,
-                    };
-                    let mut enc = device.command_encoder()
-                        .with_context(|| format!("enc fused_res_norm+moeq greedy layer {layer_idx}"))?;
-                    dispatch_fused_residual_norm_f32(
-                        &mut enc,
-                        &mut registry,
-                        device.metal_device(),
-                        &hidden,
-                        &attn_out,
-                        post_norm_w,
-                        ffn_input_buf_ref,
-                        Some(ffn_residual_buf_ref),
-                        seq_len,
-                        h,
-                        eps,
-                    )
-                    .with_context(|| format!("dispatch_fused_residual_norm_f32 fused-MoeQ greedy layer {layer_idx}"))?;
-                    enc.memory_barrier();
-                    let out = build_moe_ffn_layer_gpu_q_into(
-                        &mut enc, &device, &mut registry, ffn_input_buf_ref, w_gpu, shape,
-                        Some(ffn_residual_buf_ref),
-                    )
-                    .with_context(|| format!("moe_ffn_q_into fused greedy layer {layer_idx}"))?;
-                    if seq_len == 1 {
-                        enc.commit_labeled("layer.moe_ffn");
-                    } else {
-                        enc.commit_and_wait_labeled("layer.moe_ffn")
-                            .with_context(|| format!("commit fused-MoeQ greedy layer {layer_idx}"))?;
-                    }
-                    out
+            // ---- ADR-015 P3 Stage 1: single-CB layer eligibility ----
+            //
+            // The new path opens ONE encoder spanning {attn → fused_res_norm →
+            // MoE/Dense FFN} for a single layer.  Eligibility:
+            //   - !legacy_per_layer_cb (env gate off)
+            //   - FFN arm is MoeQ or DenseQ (the pre-existing fused-CB arms;
+            //     legacy F32-Dense / F32-MoE arms keep their original 2-encoder
+            //     structure since they are not on the dwq46 production path
+            //     and Stage 1 is decode-only).
+            //   - For FullAttn layers: head_dim % 32 == 0 (SIMD path required
+            //     by `apply_sdpa_with_kv_cache_decode_into` / `dispatch_sdpa_decode`).
+            //     Production qwen3.6 uses head_dim=256 so this is always
+            //     satisfied; the gate is a safety net.
+            let single_cb_eligible_ffn = matches!(
+                ffn_weights_gpu,
+                FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::DenseQ(_)
+            );
+            let single_cb_eligible_attn = match layer_gpu {
+                LayerWeightsGpu::FullAttn { .. } => {
+                    let shape = FullAttnShape::from_config(cfg);
+                    shape.head_dim % 32 == 0
                 }
-                FfnWeightsGpu::DenseQ(w) => {
-                    // Wave 5b.14: fused DenseQ path mirrors MoE-Q exactly — one
-                    // command buffer for fused_res_norm + entire dense FFN.  Saves
-                    // 1 command buffer per layer × 64 layers per Qwen3.5 27B
-                    // decode token (64 fewer GPU sync barriers).
-                    // W-5b.16 sunset: the `HF2Q_DENSE_Q_LEGACY=1` 2-encoder
-                    // forensic A/B was removed after a 30/30 cross-path parity
-                    // audit at PP4106.
-                    let mut enc = device.command_encoder()
-                        .with_context(|| format!("enc fused_res_norm+denseq greedy layer {layer_idx}"))?;
-                    dispatch_fused_residual_norm_f32(
-                        &mut enc,
-                        &mut registry,
-                        device.metal_device(),
-                        &hidden,
-                        &attn_out,
-                        post_norm_w,
-                        ffn_input_buf_ref,
-                        Some(ffn_residual_buf_ref),
-                        seq_len,
-                        h,
-                        eps,
-                    )
-                    .with_context(|| format!("dispatch_fused_residual_norm_f32 fused-DenseQ greedy layer {layer_idx}"))?;
-                    enc.memory_barrier();
-                    let out = build_dense_ffn_layer_gpu_q_into(
-                        &mut enc, &device, &mut registry, ffn_input_buf_ref, w,
-                        Some(ffn_residual_buf_ref),
-                    )
-                    .with_context(|| format!("dense_ffn_q_into fused greedy layer {layer_idx}"))?;
-                    if seq_len == 1 {
-                        enc.commit_labeled("layer.dense_ffn");
-                    } else {
-                        enc.commit_and_wait_labeled("layer.dense_ffn")
-                            .with_context(|| format!("commit fused-DenseQ greedy layer {layer_idx}"))?;
+                LayerWeightsGpu::LinearAttn { .. } => true,
+            };
+            let use_single_cb_layer = !legacy_per_layer_cb
+                && single_cb_eligible_ffn
+                && single_cb_eligible_attn;
+
+            let t_attn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+            let t_ffn_start;
+
+            let ffn_out = if use_single_cb_layer {
+                // ---- SINGLE-CB PATH: one encoder for attn + fused_res_norm + FFN ----
+                //
+                // This collapses, for FullAttn layers: 3 attn CBs (ops1-4 +
+                // sdpa_kv + ops6-7) + 1 FFN CB → 1 CB total (saves 3).
+                // For DeltaNet layers: 1 attn CB + 1 FFN CB → 1 CB total
+                // (saves 1).  Result on dwq46 (10 FullAttn + 30 DeltaNet
+                // layers): 30 + 30 + 40 - 40 = 60 CBs eliminated layer-side,
+                // plus 2 from the output head (S1) = 62 total saved per
+                // token, leaving 41 CBs (40 fused-layer + 1 output head).
+                let mut enc = device.command_encoder()
+                    .with_context(|| format!("enc single-cb layer {layer_idx}"))?;
+
+                // ── Attention into shared `enc` ────────────────────────
+                let attn_out = match layer_gpu {
+                    LayerWeightsGpu::FullAttn { attn, .. } => {
+                        let shape = FullAttnShape::from_config(cfg);
+                        let full_attn_rank = match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                            Some(super::kv_cache::LayerSlot::Full(rank)) => rank as usize,
+                            other => {
+                                return Err(anyhow!(
+                                    "layer {layer_idx}: expected FullAttn slot, got {:?}",
+                                    other
+                                ))
+                            }
+                        };
+                        let max_seq = kv_cache.max_seq_len;
+                        let slot = &mut kv_cache.full_attn[full_attn_rank];
+                        apply_gated_attn_layer_decode_into(
+                            &mut enc,
+                            &device,
+                            &mut registry,
+                            &hidden,
+                            &pos_buf,
+                            attn,
+                            slot,
+                            max_seq,
+                            seq_len,
+                            shape.hidden_size,
+                            shape.n_head,
+                            shape.n_kv,
+                            shape.head_dim,
+                            shape.rotary_dim,
+                            shape.rope_theta,
+                            shape.mrope_section,
+                            shape.rms_norm_eps,
+                        )
+                        .with_context(|| format!("full_attn single-cb layer {layer_idx}"))?
                     }
-                    out
+                    LayerWeightsGpu::LinearAttn { attn, .. } => {
+                        let shape = DeltaNetLayerShape::from_config(cfg);
+                        let km1 = (cfg.linear_conv_kernel_dim.saturating_sub(1).max(1)) as usize;
+                        let qkv_channels = shape.qkv_channels() as usize;
+                        let rec_size = (cfg.linear_key_head_dim
+                            * cfg.linear_value_head_dim
+                            * cfg.linear_num_value_heads) as usize;
+
+                        let linear_slot_idx =
+                            match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                                Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
+                                _ => usize::MAX,
+                            };
+
+                        let zero_conv_in: MlxBuffer;
+                        let zero_conv_out: MlxBuffer;
+                        let zero_rec_buf_in: MlxBuffer;
+                        let zero_rec_buf_out: MlxBuffer;
+                        let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref):
+                            (&MlxBuffer, &MlxBuffer, &MlxBuffer, &MlxBuffer) =
+                            if linear_slot_idx != usize::MAX {
+                                let slot = &kv_cache.linear_attn[linear_slot_idx];
+                                (&slot.conv_state, &slot.conv_state_scratch,
+                                 &slot.recurrent, &slot.recurrent_scratch)
+                            } else {
+                                let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
+                                let zero_rec_cpu = vec![0.0f32; rec_size];
+                                zero_conv_in = upload_f32(&zero_conv_cpu, &device)
+                                    .context("alloc zero conv state_in")?;
+                                zero_conv_out = upload_f32(&zero_conv_cpu, &device)
+                                    .context("alloc zero conv state_out")?;
+                                zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
+                                    .context("alloc zero recurrent state_in")?;
+                                zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
+                                    .context("alloc zero recurrent state_out")?;
+                                (&zero_conv_in, &zero_conv_out,
+                                 &zero_rec_buf_in, &zero_rec_buf_out)
+                            };
+                        let out = build_delta_net_layer_decode_into(
+                            &mut enc,
+                            &device,
+                            &mut registry,
+                            &hidden,
+                            attn,
+                            conv_in_ref,
+                            conv_out_ref,
+                            state_in_ref,
+                            state_out_ref,
+                            seq_len,
+                            shape.hidden_size,
+                            shape.n_k_heads,
+                            shape.n_v_heads,
+                            shape.d_k,
+                            shape.d_v,
+                            shape.conv_kernel,
+                            shape.rms_norm_eps,
+                        )
+                        .with_context(|| format!("delta_net single-cb layer {layer_idx}"))?;
+
+                        if linear_slot_idx != usize::MAX {
+                            let slot = &mut kv_cache.linear_attn[linear_slot_idx];
+                            slot.swap_conv_state();
+                            slot.swap_recurrent();
+                        }
+                        out
+                    }
+                };
+
+                if let Some(t) = t_attn_start {
+                    let us = t.elapsed().as_micros() as u64;
+                    match layer_gpu {
+                        LayerWeightsGpu::LinearAttn { .. } => total_linear_attn_us += us,
+                        LayerWeightsGpu::FullAttn { .. } => total_full_attn_us += us,
+                    }
                 }
-                _ => {
+
+                // INTER-STAGE BARRIER (NEW): attn_out → fused_residual_norm.
+                // The fused norm reads `attn_out` written by attention above.
+                // Replaces the legacy CB boundary between FullAttn ops6-7
+                // (gpu_full_attn.rs:1596) / DeltaNet op9 (gpu_delta_net.rs:1409)
+                // and the MoeQ/DenseQ encoder open at forward_gpu.rs:1727/:1765.
+                enc.memory_barrier();
+
+                t_ffn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+
+                // ── Fused residual + post-norm + FFN into shared `enc` ──
+                let out = match ffn_weights_gpu {
+                    FfnWeightsGpu::MoeQ(w_gpu) => {
+                        let moe = cfg.moe.as_ref().ok_or_else(|| {
+                            anyhow!("MoE FFN missing moe config greedy (layer {layer_idx})")
+                        })?;
+                        let shape = MoeFfnShape {
+                            hidden_size: h,
+                            num_experts: moe.num_experts,
+                            num_experts_per_tok: moe.num_experts_per_tok,
+                            moe_intermediate_size: moe.moe_intermediate_size,
+                            shared_intermediate_size: moe.shared_expert_intermediate_size,
+                        };
+                        dispatch_fused_residual_norm_f32(
+                            &mut enc,
+                            &mut registry,
+                            device.metal_device(),
+                            &hidden,
+                            &attn_out,
+                            post_norm_w,
+                            ffn_input_buf_ref,
+                            Some(ffn_residual_buf_ref),
+                            seq_len,
+                            h,
+                            eps,
+                        )
+                        .with_context(|| format!("dispatch_fused_residual_norm_f32 single-cb MoeQ layer {layer_idx}"))?;
+                        // Existing intra-encoder barrier (preserved verbatim
+                        // from legacy MoeQ arm at forward_gpu.rs:1743).
+                        enc.memory_barrier();
+                        let out = build_moe_ffn_layer_gpu_q_into(
+                            &mut enc, &device, &mut registry, ffn_input_buf_ref, w_gpu, shape,
+                            Some(ffn_residual_buf_ref),
+                        )
+                        .with_context(|| format!("moe_ffn_q_into single-cb layer {layer_idx}"))?;
+                        enc.commit_labeled("layer.attn_moe_ffn");
+                        out
+                    }
+                    FfnWeightsGpu::DenseQ(w) => {
+                        dispatch_fused_residual_norm_f32(
+                            &mut enc,
+                            &mut registry,
+                            device.metal_device(),
+                            &hidden,
+                            &attn_out,
+                            post_norm_w,
+                            ffn_input_buf_ref,
+                            Some(ffn_residual_buf_ref),
+                            seq_len,
+                            h,
+                            eps,
+                        )
+                        .with_context(|| format!("dispatch_fused_residual_norm_f32 single-cb DenseQ layer {layer_idx}"))?;
+                        // Existing intra-encoder barrier (preserved verbatim
+                        // from legacy DenseQ arm at forward_gpu.rs:1781).
+                        enc.memory_barrier();
+                        let out = build_dense_ffn_layer_gpu_q_into(
+                            &mut enc, &device, &mut registry, ffn_input_buf_ref, w,
+                            Some(ffn_residual_buf_ref),
+                        )
+                        .with_context(|| format!("dense_ffn_q_into single-cb layer {layer_idx}"))?;
+                        enc.commit_labeled("layer.attn_dense_ffn");
+                        out
+                    }
+                    _ => unreachable!(
+                        "single-cb path eligibility check filtered to MoeQ/DenseQ only"
+                    ),
+                };
+                out
+            } else {
+                // ---- LEGACY PATH: per-helper-commit encoders ----
+                //
+                // Verbatim pre-Stage-1 structure: each FullAttn / DeltaNet
+                // helper opens + commits its own encoder, then the FFN
+                // helper opens + commits its own encoder.  Activated by
+                // HF2Q_LEGACY_PER_LAYER_CB=1 OR by non-MoeQ/non-DenseQ FFN
+                // arms (Dense F32, F32-MoE — non-production paths).
+                let attn_out = match layer_gpu {
+                    LayerWeightsGpu::FullAttn { attn, .. } => {
+                        let shape = FullAttnShape::from_config(cfg);
+                        let full_attn_rank = match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                            Some(super::kv_cache::LayerSlot::Full(rank)) => rank as usize,
+                            other => {
+                                return Err(anyhow!(
+                                    "layer {layer_idx}: expected FullAttn slot, got {:?}",
+                                    other
+                                ))
+                            }
+                        };
+                        let max_seq = kv_cache.max_seq_len;
+                        let slot = &mut kv_cache.full_attn[full_attn_rank];
+                        build_gated_attn_layer(
+                            &device,
+                            &mut registry,
+                            &hidden,
+                            &pos_buf,
+                            attn,
+                            Some(slot),
+                            max_seq,
+                            seq_len,
+                            shape.hidden_size,
+                            shape.n_head,
+                            shape.n_kv,
+                            shape.head_dim,
+                            shape.rotary_dim,
+                            shape.rope_theta,
+                            shape.mrope_section,
+                            shape.rms_norm_eps,
+                        )
+                        .with_context(|| format!("full_attn legacy greedy layer {layer_idx}"))?
+                    }
+                    LayerWeightsGpu::LinearAttn { attn, .. } => {
+                        let shape = DeltaNetLayerShape::from_config(cfg);
+                        let km1 = (cfg.linear_conv_kernel_dim.saturating_sub(1).max(1)) as usize;
+                        let qkv_channels = shape.qkv_channels() as usize;
+                        let rec_size = (cfg.linear_key_head_dim
+                            * cfg.linear_value_head_dim
+                            * cfg.linear_num_value_heads) as usize;
+
+                        let linear_slot_idx =
+                            match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                                Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
+                                _ => usize::MAX,
+                            };
+
+                        let zero_conv_in: MlxBuffer;
+                        let zero_conv_out: MlxBuffer;
+                        let zero_rec_buf_in: MlxBuffer;
+                        let zero_rec_buf_out: MlxBuffer;
+                        let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref):
+                            (&MlxBuffer, &MlxBuffer, &MlxBuffer, &MlxBuffer) =
+                            if linear_slot_idx != usize::MAX {
+                                let slot = &kv_cache.linear_attn[linear_slot_idx];
+                                (&slot.conv_state, &slot.conv_state_scratch,
+                                 &slot.recurrent, &slot.recurrent_scratch)
+                            } else {
+                                let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
+                                let zero_rec_cpu = vec![0.0f32; rec_size];
+                                zero_conv_in = upload_f32(&zero_conv_cpu, &device)
+                                    .context("alloc zero conv state_in")?;
+                                zero_conv_out = upload_f32(&zero_conv_cpu, &device)
+                                    .context("alloc zero conv state_out")?;
+                                zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
+                                    .context("alloc zero recurrent state_in")?;
+                                zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
+                                    .context("alloc zero recurrent state_out")?;
+                                (&zero_conv_in, &zero_conv_out,
+                                 &zero_rec_buf_in, &zero_rec_buf_out)
+                            };
+                        let out = build_delta_net_layer(
+                            &device,
+                            &mut registry,
+                            &hidden,
+                            attn,
+                            conv_in_ref,
+                            conv_out_ref,
+                            state_in_ref,
+                            state_out_ref,
+                            seq_len,
+                            shape.hidden_size,
+                            shape.n_k_heads,
+                            shape.n_v_heads,
+                            shape.d_k,
+                            shape.d_v,
+                            shape.conv_kernel,
+                            shape.rms_norm_eps,
+                        )
+                        .with_context(|| format!("delta_net legacy greedy layer {layer_idx}"))?;
+
+                        if linear_slot_idx != usize::MAX {
+                            let slot = &mut kv_cache.linear_attn[linear_slot_idx];
+                            slot.swap_conv_state();
+                            slot.swap_recurrent();
+                        }
+                        out
+                    }
+                };
+
+                if let Some(t) = t_attn_start {
+                    let us = t.elapsed().as_micros() as u64;
+                    match layer_gpu {
+                        LayerWeightsGpu::LinearAttn { .. } => total_linear_attn_us += us,
+                        LayerWeightsGpu::FullAttn { .. } => total_full_attn_us += us,
+                    }
+                }
+
+                t_ffn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+
+                match ffn_weights_gpu {
+                    FfnWeightsGpu::MoeQ(w_gpu) => {
+                        // Fused MoE-Q path: one command buffer for fused_res_norm + entire MoE FFN.
+                        let moe = cfg.moe.as_ref().ok_or_else(|| {
+                            anyhow!("MoE FFN missing moe config greedy (layer {layer_idx})")
+                        })?;
+                        let shape = MoeFfnShape {
+                            hidden_size: h,
+                            num_experts: moe.num_experts,
+                            num_experts_per_tok: moe.num_experts_per_tok,
+                            moe_intermediate_size: moe.moe_intermediate_size,
+                            shared_intermediate_size: moe.shared_expert_intermediate_size,
+                        };
+                        let mut enc = device.command_encoder()
+                            .with_context(|| format!("enc fused_res_norm+moeq legacy greedy layer {layer_idx}"))?;
+                        dispatch_fused_residual_norm_f32(
+                            &mut enc,
+                            &mut registry,
+                            device.metal_device(),
+                            &hidden,
+                            &attn_out,
+                            post_norm_w,
+                            ffn_input_buf_ref,
+                            Some(ffn_residual_buf_ref),
+                            seq_len,
+                            h,
+                            eps,
+                        )
+                        .with_context(|| format!("dispatch_fused_residual_norm_f32 fused-MoeQ legacy greedy layer {layer_idx}"))?;
+                        enc.memory_barrier();
+                        let out = build_moe_ffn_layer_gpu_q_into(
+                            &mut enc, &device, &mut registry, ffn_input_buf_ref, w_gpu, shape,
+                            Some(ffn_residual_buf_ref),
+                        )
+                        .with_context(|| format!("moe_ffn_q_into fused legacy greedy layer {layer_idx}"))?;
+                        if seq_len == 1 {
+                            enc.commit_labeled("layer.moe_ffn");
+                        } else {
+                            enc.commit_and_wait_labeled("layer.moe_ffn")
+                                .with_context(|| format!("commit fused-MoeQ legacy greedy layer {layer_idx}"))?;
+                        }
+                        out
+                    }
+                    FfnWeightsGpu::DenseQ(w) => {
+                        let mut enc = device.command_encoder()
+                            .with_context(|| format!("enc fused_res_norm+denseq legacy greedy layer {layer_idx}"))?;
+                        dispatch_fused_residual_norm_f32(
+                            &mut enc,
+                            &mut registry,
+                            device.metal_device(),
+                            &hidden,
+                            &attn_out,
+                            post_norm_w,
+                            ffn_input_buf_ref,
+                            Some(ffn_residual_buf_ref),
+                            seq_len,
+                            h,
+                            eps,
+                        )
+                        .with_context(|| format!("dispatch_fused_residual_norm_f32 fused-DenseQ legacy greedy layer {layer_idx}"))?;
+                        enc.memory_barrier();
+                        let out = build_dense_ffn_layer_gpu_q_into(
+                            &mut enc, &device, &mut registry, ffn_input_buf_ref, w,
+                            Some(ffn_residual_buf_ref),
+                        )
+                        .with_context(|| format!("dense_ffn_q_into fused legacy greedy layer {layer_idx}"))?;
+                        if seq_len == 1 {
+                            enc.commit_labeled("layer.dense_ffn");
+                        } else {
+                            enc.commit_and_wait_labeled("layer.dense_ffn")
+                                .with_context(|| format!("commit fused-DenseQ legacy greedy layer {layer_idx}"))?;
+                        }
+                        out
+                    }
+                    _ => {
                     // Legacy 2-encoder path for Dense (F32) / Moe-unquantized.
                     // DenseQ + MoeQ are caught by their dedicated fused-CB
                     // arms above and never reach this fall-through.
@@ -1778,6 +2156,7 @@ impl Qwen35Model {
                         FfnWeightsGpu::MoeQ(_) => unreachable!("MoeQ handled in fused path above"),
                     }
                 }
+                }
             };
 
             if let Some(t) = t_ffn_start { total_ffn_us += t.elapsed().as_micros() as u64; }
@@ -1808,18 +2187,38 @@ impl Qwen35Model {
         }
 
         // ---- Output head: GPU argmax → 4-byte download ----
+        //
+        // ADR-015 P3 Stage 1 (S1): when HF2Q_LEGACY_PER_LAYER_CB=1, use
+        // the legacy 3-encoder output head (norm, lm_head, argmax — each
+        // its own CB).  When unset (default), the single-CB output head
+        // collapses these into ONE encoder with 2 intra-CB barriers and
+        // a single terminal commit_and_wait_labeled.
         let t_output_head = if decode_profile { Some(std::time::Instant::now()) } else { None };
-        let token_id = apply_output_head_gpu_greedy(
-            &device,
-            &mut registry,
-            &hidden,
-            &output_head,
-            h,
-            cfg.vocab_size,
-            eps,
-            &decode_bufs,
-        )
-        .context("apply_output_head_gpu_greedy")?;
+        let token_id = if legacy_per_layer_cb {
+            apply_output_head_gpu_greedy_legacy(
+                &device,
+                &mut registry,
+                &hidden,
+                &output_head,
+                h,
+                cfg.vocab_size,
+                eps,
+                &decode_bufs,
+            )
+            .context("apply_output_head_gpu_greedy_legacy")?
+        } else {
+            apply_output_head_gpu_greedy(
+                &device,
+                &mut registry,
+                &hidden,
+                &output_head,
+                h,
+                cfg.vocab_size,
+                eps,
+                &decode_bufs,
+            )
+            .context("apply_output_head_gpu_greedy")?
+        };
         if let Some(t) = t_output_head {
             eprintln!("[GREEDY_PROFILE] output_head={:.1}ms", t.elapsed().as_micros() as f64 / 1000.0);
         }

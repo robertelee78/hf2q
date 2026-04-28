@@ -1604,6 +1604,233 @@ pub fn build_gated_attn_layer(
 }
 
 // ================================================================
+// ADR-015 P3 Stage 1: caller-driven single-CB FullAttn (decode-only)
+// ================================================================
+
+/// Decode-only KV-cache + SDPA, encoded into the caller's encoder.
+///
+/// Mirrors the `seq=1 && head_dim%32==0` decode fast path of
+/// [`apply_sdpa_with_kv_cache`] but DOES NOT open or commit its own
+/// command buffer.  All dispatches are encoded into the caller-supplied
+/// `enc`; it is the caller's responsibility to insert any cross-stage
+/// `enc.memory_barrier()` before this call (producer→sdpa) and after
+/// (sdpa→consumer).
+///
+/// ADR-015 P1 audit row `gpu_full_attn.rs:959/:983`: the internal
+/// kv_copy→sdpa_decode RAW barrier is preserved here at the same call
+/// site, position relative to dispatches unchanged.
+///
+/// Returns `[1, n_heads, 1, head_dim]` F32 — same shape and contents as
+/// the legacy decode-fast-path return value.
+///
+/// # Errors
+///
+/// - `seq_len != 1` (decode-only path).
+/// - `head_dim % 32 != 0` (SIMD path requires aligned head_dim).
+/// - Any underlying mlx-native dispatch failure.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_sdpa_with_kv_cache_decode_into(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q_seq_major: &MlxBuffer,
+    k_seq_major: &MlxBuffer,
+    v_seq_major: &MlxBuffer,
+    slot: &mut FullAttnKvSlot,
+    seq_len: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_seq_len: u32,
+) -> Result<MlxBuffer> {
+    debug_assert_eq!(seq_len, 1, "apply_sdpa_with_kv_cache_decode_into: seq_len must be 1");
+    debug_assert_eq!(head_dim % 32, 0, "apply_sdpa_with_kv_cache_decode_into: head_dim must be %32==0");
+
+    let seq = seq_len as usize;
+    let nh = n_heads as usize;
+    let nkv = n_kv_heads as usize;
+    let d = head_dim as usize;
+    let max_sl = max_seq_len as usize;
+    let cur_len = slot.current_len[0] as usize;
+
+    let kv_write_tokens = (seq).min(max_sl.saturating_sub(cur_len));
+    let kv_seq_len = (cur_len + kv_write_tokens).min(max_sl) as u32;
+
+    let _ = nkv; // currently unused; retained for shape doc parity with legacy path.
+
+    let out_buf = super::decode_pool::pooled_alloc_buffer(
+            device, nh * seq * d * 4, DType::F32, vec![1, nh, seq, d])
+        .map_err(|e| anyhow!("alloc sdpa kv-cache output (decode_into): {e}"))?;
+
+    if kv_write_tokens > 0 {
+        dispatch_kv_cache_copy_seq_f32_dual(
+            enc, registry, device.metal_device(),
+            k_seq_major, v_seq_major,
+            &slot.k, &slot.v,
+            n_kv_heads, head_dim, max_seq_len,
+            cur_len as u32, kv_write_tokens as u32, 0,
+        ).context("kv_cache_copy kv-cache decode_into")?;
+        // Barrier: sdpa_decode reads slot.k/slot.v written above.  Same
+        // RAW barrier position as the legacy gpu_full_attn.rs:1231.
+        enc.memory_barrier();
+    }
+    dispatch_sdpa_decode(
+        enc, registry, device,
+        q_seq_major, &slot.k, &slot.v, &out_buf,
+        n_heads, n_kv_heads, head_dim,
+        kv_seq_len, max_seq_len,
+        1.0 / (d as f32).sqrt(),
+    ).context("sdpa_decode kv-cache decode_into")?;
+
+    // Update current_len cursor (CPU-only counter — safe to update before
+    // GPU completes; next read happens on the next token after CB drain).
+    slot.current_len[0] = kv_seq_len;
+
+    Ok(out_buf)
+}
+
+/// Decode-only Qwen3.5/3.6 gated full-attention layer encoded into the
+/// caller's command buffer.
+///
+/// Mirrors [`build_gated_attn_layer`] for `seq_len == 1 && head_dim % 32 == 0`,
+/// but takes `enc: &mut CommandEncoder` from the caller and DOES NOT
+/// commit.  The caller (forward_gpu_greedy single-CB orchestrator) is
+/// responsible for committing the shared encoder once all per-layer
+/// attention work is encoded.
+///
+/// ADR-015 P3 Stage 1: collapses 3 CBs/layer (ops1-4 + sdpa_kv + ops6-7)
+/// into 1 CB shared across the entire layer pipeline.  All intra-encoder
+/// barriers from [`build_gated_attn_layer`]'s decode path are preserved
+/// bit-for-bit (see P1 audit § "Intra-encoder barriers"):
+///   - `apply_pre_attn_rms_norm` → barrier → ops 2 (Q/K/V/G projections)
+///   - ops 2 → barrier → ops 3 (per-head RMSNorm Q+K)
+///   - ops 3 → barrier → ops 4 (IMROPE Q+K)
+///   - ops 4 → INTER-STAGE BARRIER (NEW) → sdpa_kv (replaces former CB
+///     boundary at gpu_full_attn.rs:1537→:1221)
+///   - sdpa_kv → INTER-STAGE BARRIER (NEW) → ops 6-7 (replaces former CB
+///     boundary at gpu_full_attn.rs:1245→:1211)
+///
+/// # Errors
+///
+/// - `seq_len != 1` (decode-only path).
+/// - `head_dim % 32 != 0` (SIMD-aligned head_dim required).
+/// - Any underlying mlx-native dispatch failure.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_gated_attn_layer_decode_into(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    positions: &MlxBuffer,
+    weights_gpu: &FullAttnWeightsGpu,
+    slot: &mut FullAttnKvSlot,
+    max_seq_len: u32,
+    seq_len: u32,
+    hidden_size: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    freq_base: f32,
+    mrope_section: [u32; 4],
+    rms_norm_eps: f32,
+) -> Result<MlxBuffer> {
+    debug_assert_eq!(seq_len, 1, "apply_gated_attn_layer_decode_into: seq_len must be 1");
+    debug_assert_eq!(head_dim % 32, 0, "apply_gated_attn_layer_decode_into: head_dim must be %32==0");
+
+    let q_total = n_heads * head_dim;
+    let kv_total = n_kv_heads * head_dim;
+
+    // ---- Ops 1-4 (pre-attn norm + Q/K/V/G proj + Q/K norm + IMROPE) ----
+    // Op 1: pre-attention RMSNorm → x_norm
+    let x_norm = apply_pre_attn_rms_norm(
+        enc, registry, device, x, weights_gpu,
+        seq_len, hidden_size, rms_norm_eps,
+    )?;
+    // Barrier: ops 2 read from x_norm written above.
+    // Preserved at the same call-site position as the legacy
+    // gpu_full_attn.rs:1480 barrier.
+    enc.memory_barrier();
+
+    // Op 2: Q/K/V/G projections (all read from x_norm).  Pool-aware path.
+    let q_flat = apply_linear_projection_f32_pooled(
+        enc, registry, device, &x_norm,
+        &weights_gpu.wq, seq_len, hidden_size, q_total,
+    )?;
+    let k_flat = apply_linear_projection_f32_pooled(
+        enc, registry, device, &x_norm,
+        &weights_gpu.wk, seq_len, hidden_size, kv_total,
+    )?;
+    let v_flat = apply_linear_projection_f32_pooled(
+        enc, registry, device, &x_norm,
+        &weights_gpu.wv, seq_len, hidden_size, kv_total,
+    )?;
+    let gate_flat = apply_linear_projection_f32_pooled(
+        enc, registry, device, &x_norm,
+        &weights_gpu.w_gate, seq_len, hidden_size, q_total,
+    )?;
+    // Barrier: ops 3 read from q_flat / k_flat written above.  Preserved
+    // at the same call-site position as the legacy gpu_full_attn.rs:1503.
+    enc.memory_barrier();
+
+    // Op 3: per-head RMSNorm on Q and K.
+    let q_normed = apply_q_or_k_per_head_rms_norm(
+        enc, registry, device, &q_flat,
+        &weights_gpu.attn_q_norm, seq_len, n_heads, head_dim, rms_norm_eps,
+    )?;
+    let k_normed = apply_q_or_k_per_head_rms_norm(
+        enc, registry, device, &k_flat,
+        &weights_gpu.attn_k_norm, seq_len, n_kv_heads, head_dim, rms_norm_eps,
+    )?;
+    // Barrier: ops 4 read from q_normed / k_normed written above.  Preserved
+    // at the same call-site position as the legacy gpu_full_attn.rs:1515.
+    enc.memory_barrier();
+
+    // Op 4: IMROPE on Q and K.
+    let q_rope = apply_imrope(
+        enc, registry, device, &q_normed, positions,
+        seq_len, n_heads, head_dim, rotary_dim, freq_base, mrope_section,
+    )?;
+    let k_rope = apply_imrope(
+        enc, registry, device, &k_normed, positions,
+        seq_len, n_kv_heads, head_dim, rotary_dim, freq_base, mrope_section,
+    )?;
+
+    // INTER-STAGE BARRIER (NEW): ops4 → sdpa_kv (replaces the former
+    // CB boundary at legacy :1537 / :1221).  sdpa_decode reads q_rope /
+    // k_rope / v_flat written above.
+    enc.memory_barrier();
+
+    // Suppress unused warnings — same pattern as legacy build_gated_attn_layer.
+    let _ = (x_norm, q_flat, k_flat, q_normed, k_normed);
+
+    // ---- Op 5: SDPA decode-fast-path (kv-cache write + sdpa_decode) ----
+    let attn_out = apply_sdpa_with_kv_cache_decode_into(
+        enc, device, registry,
+        &q_rope, &k_rope, &v_flat,
+        slot, seq_len, n_heads, n_kv_heads, head_dim, max_seq_len,
+    )?;
+
+    // INTER-STAGE BARRIER (NEW): sdpa_kv → ops6-7 (replaces the former
+    // CB boundary at legacy :1245 / :1211).  sigmoid_gate_multiply reads
+    // attn_out written above.
+    enc.memory_barrier();
+
+    // ---- Ops 6-7: sigmoid-gate multiply + output projection ----
+    let n_elem = seq_len * q_total;
+    let gated = apply_sigmoid_gate_multiply(
+        enc, registry, device, &attn_out, &gate_flat, n_elem,
+    )?;
+    let out = apply_linear_projection_f32_pooled(
+        enc, registry, device, &gated,
+        &weights_gpu.wo, seq_len, q_total, hidden_size,
+    )?;
+
+    // No commit here — the caller owns the shared encoder.
+    Ok(out)
+}
+
+// ================================================================
 // Tests
 // ================================================================
 
