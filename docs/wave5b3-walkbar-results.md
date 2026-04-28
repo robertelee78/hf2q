@@ -276,3 +276,93 @@ Side-quest: the wrapper docstring at `gpu_delta_net.rs:857` ("Cost: 2× memory +
 - `/tmp/diag-prompt.txt` (256 tokens, 1418 bytes — exact-T diagnostic prompt)
 - T=256 trial logs captured inline above (chunk × 2 + autoreg × 2)
 - This document section
+
+## Wave 5b.6 MTLResidencySet adoption — STOP-AND-REPORT (API gap)
+
+**Status:** **STOP — `MlxBufferPool` semantics unsuitable for static-weight adoption; W-5b.7 API redesign required**
+**Date:** 2026-04-27
+**Worker:** Wave 5b.6 (ADR-005 MTLResidencySet adoption attempt)
+**HEAD at start:** `1515d8d` (ADR-014 P11-prereq SHA correction); mlx-native at `4be0cfd` (autoregressive docstring fix; merge `5e40d49` `MTLResidencySet` support is in lineage)
+**Pre-flight:** 81 GiB free RAM (Pages free 5 349 165); no non-sccache/rustc process > 5 GB; HEAD includes `7270a3f` and mlx-native `4be0cfd` ✓
+**Scope:** discovery + analysis only — **no source files modified.** A throw-away `examples/wave5b6_inventory.rs` was created during the audit and removed before this append.
+
+### (1) BufferPool API discovery
+
+`mlx_native::MlxBufferPool` (file `/opt/mlx-native/src/buffer_pool.rs`) is the only public path through which a buffer joins the device-level `MTLResidencySet`. Adoption pattern:
+
+| Concern | Behavior |
+|---|---|
+| Construction | `MlxBufferPool::new()` (lifetime-free; device handed in at every `alloc()`) |
+| Residency tie-in | `alloc_inner` → `register_residency_allocation` (lines 262-291) auto-adds the underlying `metal::Buffer` to the pool's residency-set handle on **first** allocation in a bucket; subsequent same-bucket allocs reuse from the free list and are *already* in the set. |
+| Lifetime model | Buffers live as long as the pool. `release(buf)` adds a single buffer to the free list (still resident); `reset()` bulk-recycles `in_use` to free; `clear()` drops the free list **and** removes those buffers from the residency set; `Drop` removes all and commits. |
+| Bucket sizing | **Power-of-two rounding** — `bucket_size(byte_len) = byte_len.next_power_of_two()` (line 319). Designed for the per-decode-token arena (~1750 small allocs/token, ADR-012 Task #15). |
+| Public surface for residency | None besides `MlxBufferPool`. `ResidencySet::new`, `add_allocation`, `remove_allocation`, `commit` are all `pub(crate)` (`/opt/mlx-native/src/residency.rs:63-186`). |
+| Mixing with `device.alloc_buffer()` | Allowed but the direct-alloc buffers do **not** join any residency set. |
+
+### (2) Hot-path map and bucket-rounding waste
+
+The 17.26 GB Qwen3.6 27B DWQ46 weight set was inventoried (probe code: `examples/wave5b6_inventory.rs`, removed after measurement; results captured below). Rounding every tensor's `byte_len` up to its `next_power_of_two` (the only path BufferPool offers) produces:
+
+| Size class | Tensors | Real bytes | Bucket-rounded | Waste |
+|---|---:|---:|---:|---:|
+| < 1 MB | 449 | 0.02 GB | 0.04 GB | **74.5%** |
+| < 16 MB | 32 | 0.10 GB | 0.14 GB | 46.9% |
+| < 128 MB | 368 | 13.88 GB | 20.00 GB | **44.1%** |
+| < 1 GB | 1 | 0.71 GB | 1.07 GB | 50.3% |
+| ≥ 1 GB | 1 | 2.54 GB | 4.29 GB | **69.1%** |
+| **TOTAL** | **851** | **17.26 GB** | **25.55 GB** | **+8.30 GB / 48.1%** |
+
+The 13.88 GB `<128 MB` band is the bulk of the model — these are the per-layer MoE expert blocks (Q5_K / Q6_K), per-layer dense Q4_0 attention projections, and DeltaNet sub-projection blocks. Q*-block byte lengths are never powers of two by construction (Q4_0 = 18 bytes/32 elem; Q5_K = 176 bytes/256 elem; Q6_K = 210 bytes/256 elem), so every tensor incurs the next-power-of-two penalty.
+
+**Conclusion: routing all weight allocations through the only public residency-enabled path bloats Metal-resident memory by 8.30 GB (48.1%).** On the 128 GB M5 Max with concurrent ADR-014 sessions, that is a non-starter; on smaller systems it converts a successful load into an OOM. The only "smallest refactor" the brief permits — adopt BufferPool for the weight hot path — is incompatible with the perf-bar gating constraint.
+
+### (3) Why the W-5b.5 diagnostic understated the gap
+
+W-5b.5 listed `in_memory_loader.rs:102`, `weight_loader.rs:470`, and `forward_gpu.rs upload_*` as the bypass sites. Audit confirms these total **only ~3 GB** of the 17.26 GB hot path (small Q8_0 in-memory weights, raw `U8` lazy lookups, `lm_head` F32/Q4/BF16, output norm, and embedding table). The dominant **~14 GB of MoE expert + per-layer attention block buffers are loaded by `mlx_native::gguf::GgufFile::load_tensor`** (`/opt/mlx-native/src/gguf/mod.rs:990-1054`), which calls `device.alloc_buffer` directly — that is the same *direct-alloc* path BufferPool was supposed to replace, but it lives inside mlx-native rather than in hf2q. hf2q cannot route those allocations through a pool without one of:
+
+- (a) `MlxBufferPool::register_existing(&MlxBuffer)` — public adoption entry that takes an already-allocated buffer (no rounding) and adds it to the residency set, OR
+- (b) `GgufFile::load_tensor_into_pool(&mut MlxBufferPool, …)` overload, OR
+- (c) An optional `&mut MlxBufferPool` argument on `MlxDevice::alloc_buffer` — but that is the API redesign the brief explicitly defers to iter-7.
+
+Even if hf2q adopts BufferPool **only** for the ~3 GB it controls and accepts the ~50% bucket-rounding overhead on that slice, the captured win is at most ~17% of the diagnosed 6 s — and it is gated on the same Metal compaction behaviour (cold-page-fault amortization) that the dominant 14 GB MoE residency would actually exercise. **Partial adoption is therefore both costly (~1.5 GB of bucket waste on the small slice) and low-leverage (~1 s expected at best).**
+
+### (4) Brief stop conditions met
+
+The brief listed two stop conditions:
+
+> "If BufferPool's API has gaps, document them as W-5b.7 follow-ups; don't expand mlx-native's public surface in this iter."
+> "If BufferPool adoption requires breaking changes to hf2q's loader API, STOP and report — that's iter-7 scope (API redesign), not adoption."
+
+Both apply: BufferPool's `next_power_of_two` bucketing is by-design for the per-token decode arena, and there is no public alternative entry point for static-weight adoption. The smallest refactor that would yield the documented 6 s win requires **public-API expansion in mlx-native** (option (a) above) — explicitly out of scope for W-5b.6.
+
+### (5) Tests / build status (no code changes)
+
+| Check | Result |
+|---|---|
+| `cargo build --release --bin hf2q` | PASS (0 errors, 72 warnings — all pre-existing) |
+| `cargo test --release --bin hf2q chunk_path_first_token` | PASS (`chunk_path_first_token_matches_autoregressive_at_seq128 ... ok`, 1 passed; 2133 filtered) |
+| Inventory probe `examples/wave5b6_inventory.rs` | bucket waste = 8.30 GB / 48.1% (full table above), file removed after capture |
+| First-/second-forward perf measurement | **Not executed.** No code change to measure; the empirical inventory falsifies the adoption hypothesis before runtime measurement is informative. |
+
+### (6) Recommendations for W-5b.7
+
+The 6-s first-forward win is real, but capturing it requires mlx-native to expose either:
+
+1. **`MlxBufferPool::register_existing(&MlxBuffer) -> Result<()>`** — adds the buffer to the residency set without bucket-rounding or pool ownership. **Smallest mlx-native diff** (≈30 LOC including a `same_owner` check and a no-op fallback when residency is unavailable). hf2q-side adoption is ~10 lines per `upload_*` helper plus a single residency-aware pool injected into `forward_gpu`'s GPU_CACHE.
+
+2. **`GgufFile::load_tensor` accepts `Option<&mut MlxBufferPool>`** — routes the dominant 14 GB MoE/attention path through residency. Otherwise W-5b.7 with only option (1) leaves the 14 GB outside the set.
+
+Both are additive, opt-in, and carry the same `HF2Q_NO_RESIDENCY=1` opt-out the device-level path already honours. Combined effort: ~1 day in mlx-native, ~½ day in hf2q. Land them and the W-5b.5 perf-gap diagnostic's 6-s figure becomes measurable.
+
+### (7) Constraints honoured
+
+- No source files in hf2q or mlx-native modified.
+- The throw-away inventory probe at `examples/wave5b6_inventory.rs` was deleted after producing the bucket-waste table above.
+- No files in `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`, `src/calibrate/`, `peer_parity_gates.rs`, `ppl_driver.rs`, `imatrix.rs` touched.
+- mlx-native's `pub(crate)` `ResidencySet` API was not made `pub`. No mlx-native changes.
+- ADR-005 AC 5468 / 5470 wording remains as W-5b.4 left it — the perf-bar gap was already informational, and W-5b.6 strengthens that note rather than flipping the AC.
+
+### Inputs preserved
+
+- Inventory probe table above (851 tensors, real 17 255 675 136 B → bucket 25 551 814 656 B, waste 8 296 139 520 B / 48.1%)
+- Pre-existing W-5b.5 diagnostic at `## Wave 5b.5 perf-gap diagnostic` (line 176) — premise stands but its proposed candidate #2 is now blocked on the mlx-native API gap documented here.
