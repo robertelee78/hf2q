@@ -9,10 +9,10 @@
 //! # Dense SwiGLU op order  (Decision 14)
 //!
 //! ```text
-//!  1. gate  = gate_proj(x)        [seq, intermediate]  — apply_linear_projection_f32
-//!  2. up    = up_proj(x)          [seq, intermediate]  — apply_linear_projection_f32
-//!  3. hidden = silu(gate) * up    — CPU silu_mul helper (no GPU SiLU kernel yet)
-//!  4. out   = down_proj(hidden)   [seq, hidden_size]   — apply_linear_projection_f32
+//!  1. gate  = gate_proj(x)        [seq, intermediate]  — quantized_matmul_ggml or BF16 projection
+//!  2. up    = up_proj(x)          [seq, intermediate]  — quantized_matmul_ggml or BF16 projection
+//!  3. hidden = silu(gate) * up    — dispatch_silu_mul
+//!  4. out   = down_proj(hidden)   [seq, hidden_size]   — quantized_matmul_ggml or BF16 projection
 //! ```
 //!
 //! # MoE FFN op order  (Decision 13)
@@ -26,31 +26,29 @@
 //!  for e in topk_idx:
 //!      gate_e = expert_gate[e](x)                 — apply_proj (per expert)
 //!      up_e   = expert_up[e](x)                   — apply_proj (per expert)
-//!      h_e    = silu(gate_e) * up_e               — CPU silu_mul
+//!      h_e    = silu(gate_e) * up_e               — GPU silu_mul / fused expert path
 //!      y_e    = expert_down[e](h_e)               — apply_proj (per expert)
-//!      moe_out += topk_w[e] * y_e                 — CPU accumulate
+//!      moe_out += topk_w[e] * y_e                 — GPU/CPU combine depending on path
 //!
 //!  // Shared expert (sigmoid-gated)
 //!  3. sh_gate_logit = shared_gate_inp(x)          — apply_linear_projection_f32
 //!  4. sh_gate_val   = sigmoid(sh_gate_logit)      — dispatch_sigmoid_mul (on itself)
 //!  5. a_s = shared_gate_proj(x)                   — apply_linear_projection_f32
 //!  6. b_s = shared_up_proj(x)                     — apply_linear_projection_f32
-//!  7. h_s = silu(a_s) * b_s                       — CPU silu_mul
+//!  7. h_s = silu(a_s) * b_s                       — dispatch_silu_mul
 //!  8. y_s = shared_down_proj(h_s)                 — apply_linear_projection_f32
-//!  9. shared_out = sh_gate_val * y_s              — CPU elementwise mul
+//!  9. shared_out = sh_gate_val * y_s              — GPU elementwise mul
 //!
 //!  // Combine
-//!  10. output = moe_out + shared_out              — CPU add
+//!  10. output = moe_out + shared_out              — GPU/CPU combine depending on path
 //! ```
 //!
-//! # Implementation note: CPU SiLU helper
+//! # Implementation note: production DenseQ
 //!
-//! There is no standalone GPU SiLU kernel in mlx-native as of P9b.  For the
-//! parity test we download the gate projection, apply SiLU * up on CPU, and
-//! re-upload.  This is the same "CPU bridge" pattern used by P7b for the SDPA
-//! permute (`permute_seq_head_dim_to_head_seq_dim_cpu`) — fully correct for
-//! the parity oracle; the production P11 path will fuse SiLU into a single
-//! kernel once a GPU SiLU shader lands.
+//! The production 27B DWQ path keeps dense FFN weights in native GGML
+//! block-quantized form and calls `quantized_matmul_ggml` for gate, up, and
+//! down projections.  `dispatch_silu_mul` runs on GPU; there is no CPU SiLU
+//! bridge on the shipping DenseQ path.
 //!
 //! # Parity contract
 //!
@@ -1231,6 +1229,157 @@ fn build_dense_ffn_layer_gpu_q_into_device(
     };
 
     Ok(result)
+}
+
+/// Diagnostic-only DenseQ prefill split used to attribute the single fused
+/// FFN command buffer's GPU time.  This intentionally changes the command
+/// buffer schedule and is only called under
+/// `HF2Q_PROFILE_DENSE_Q_SPLIT_COMMITS=1`; production keeps
+/// [`build_dense_ffn_layer_gpu_q_into`]'s single-CB path.
+#[allow(clippy::too_many_arguments)]
+pub fn build_dense_ffn_layer_gpu_q_split_profile(
+    mut first_enc: mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    weights: &DenseFfnWeightsGpuQ,
+    add_residual: Option<&MlxBuffer>,
+    label_prefix: &str,
+) -> Result<MlxBuffer> {
+    let h = weights.hidden_size;
+    let m = weights.intermediate_size;
+    let seq_len = (x.element_count() / h as usize) as u32;
+    let n_h = (seq_len * m) as u32;
+    let n_out = (seq_len * h) as usize;
+
+    let mut gate_buf = device
+        .alloc_buffer(
+            n_h as usize * 4,
+            DType::F32,
+            vec![seq_len as usize, m as usize],
+        )
+        .map_err(|e| anyhow!("alloc dense_q split gate: {e}"))?;
+    let mut up_buf = device
+        .alloc_buffer(
+            n_h as usize * 4,
+            DType::F32,
+            vec![seq_len as usize, m as usize],
+        )
+        .map_err(|e| anyhow!("alloc dense_q split up: {e}"))?;
+    let hidden_buf = device
+        .alloc_buffer(
+            n_h as usize * 4,
+            DType::F32,
+            vec![seq_len as usize, m as usize],
+        )
+        .map_err(|e| anyhow!("alloc dense_q split hidden: {e}"))?;
+    let mut down_out = device
+        .alloc_buffer(n_out * 4, DType::F32, vec![seq_len as usize, h as usize])
+        .map_err(|e| anyhow!("alloc dense_q split down_out: {e}"))?;
+    let mut silu_params_buf = device
+        .alloc_buffer(4, DType::U32, vec![1])
+        .map_err(|e| anyhow!("alloc dense_q split silu_params: {e}"))?;
+    silu_params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("{e}"))?[0] = n_h;
+
+    let gate_up_params = GgmlQuantizedMatmulParams {
+        m: seq_len,
+        n: m,
+        k: h,
+        ggml_type: weights.ggml_type_gate_up,
+    };
+    let down_params = GgmlQuantizedMatmulParams {
+        m: seq_len,
+        n: h,
+        k: m,
+        ggml_type: weights.ggml_type_down,
+    };
+
+    quantized_matmul_ggml(
+        &mut first_enc,
+        registry,
+        device,
+        x,
+        &weights.gate_q,
+        &mut gate_buf,
+        &gate_up_params,
+    )
+    .context("dense_q split gate proj")?;
+    quantized_matmul_ggml(
+        &mut first_enc,
+        registry,
+        device,
+        x,
+        &weights.up_q,
+        &mut up_buf,
+        &gate_up_params,
+    )
+    .context("dense_q split up proj")?;
+    let label = format!("{label_prefix}.gate_up");
+    first_enc
+        .commit_and_wait_labeled(&label)
+        .context("commit dense_q split gate/up")?;
+
+    let mut silu_enc = device.command_encoder().context("enc dense_q split silu")?;
+    dispatch_silu_mul(
+        &mut silu_enc,
+        registry,
+        device.metal_device(),
+        &gate_buf,
+        &up_buf,
+        &hidden_buf,
+        &silu_params_buf,
+        n_h,
+    )
+    .context("dense_q split silu_mul")?;
+    let label = format!("{label_prefix}.silu");
+    silu_enc
+        .commit_and_wait_labeled(&label)
+        .context("commit dense_q split silu")?;
+
+    let mut down_enc = device.command_encoder().context("enc dense_q split down")?;
+    quantized_matmul_ggml(
+        &mut down_enc,
+        registry,
+        device,
+        &hidden_buf,
+        &weights.down_q,
+        &mut down_out,
+        &down_params,
+    )
+    .context("dense_q split down proj")?;
+    let label = format!("{label_prefix}.down");
+    down_enc
+        .commit_and_wait_labeled(&label)
+        .context("commit dense_q split down")?;
+
+    if let Some(res) = add_residual {
+        let sum_buf = device
+            .alloc_buffer(n_out * 4, DType::F32, vec![n_out])
+            .map_err(|e| anyhow!("alloc dense_q split residual sum: {e}"))?;
+        let mut residual_enc = device
+            .command_encoder()
+            .context("enc dense_q split residual")?;
+        elementwise_add(
+            &mut residual_enc,
+            registry,
+            device.metal_device(),
+            &down_out,
+            res,
+            &sum_buf,
+            n_out,
+            DType::F32,
+        )
+        .context("dense_q split residual add")?;
+        let label = format!("{label_prefix}.residual");
+        residual_enc
+            .commit_and_wait_labeled(&label)
+            .context("commit dense_q split residual")?;
+        Ok(sum_buf)
+    } else {
+        Ok(down_out)
+    }
 }
 
 // NOTE on `build_dense_ffn_layer_gpu_q_into`: the variant does NOT commit.

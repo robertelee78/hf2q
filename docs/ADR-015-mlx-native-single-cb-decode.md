@@ -143,6 +143,19 @@ script comments are treated as hypotheses only.
   `4543.508/4882.974 ms`. Therefore the next FFN lever belongs in
   mlx-native's quantized dense matmul kernels or a split-commit GPU timing
   diagnostic, not in hf2q allocation cleanup.
+- Split-commit DenseQ diagnostic (2026-04-28, gated by
+  `HF2Q_PROFILE_DENSE_Q_SPLIT_COMMITS=1` plus `MLX_PROFILE_CB=1`) now measures
+  the FFN GPU phases without changing production scheduling. Control 512
+  profile: `layer.dense_ffn` CB total `501.28 ms` across 64 layers, first token
+  `11`. Split 512 profile preserved first token `11` and decomposed the same
+  `501.07 ms`: gate/up `308.24 ms` (61.5%), down `177.70 ms` (35.5%), SiLU
+  `11.40 ms` (2.3%), residual `3.73 ms` (0.7%). Target-size split at 4096
+  preserved first token `264` and decomposed `3827.19 ms`: gate/up
+  `2381.48 ms` (62.2%), down `1305.62 ms` (34.1%), SiLU `99.61 ms` (2.6%),
+  residual `40.49 ms` (1.1%). GGUF tensor-table inspection shows 61/64 dense
+  layers use Q4_0 for gate/up/down and the final 3 layers use Q6_K, so the next
+  mlx-native lever is Q4_0 tensor-mm throughput or a paired gate/up dispatch
+  over the same input, not more hf2q-side buffer cleanup.
 - Source scan shows `HF2Q_PROFILE_W5B26`,
   `HF2Q_FFN_OUTPUT_LIFT_LEGACY`, and `HF2Q_FFN_DENSE_LIFT_LEGACY` remain in
   historical scripts, not in the current qwen35 source paths. Do not use those

@@ -120,6 +120,18 @@ hf2q can now quantize HuggingFace models to llama.cpp-compatible GGUF format. Th
    `HF2Q_DENSE_Q_ARENA_RESET=0` dense-FFN device-scratch fallback was tested and
    rejected: `48940 ms` warmup, `29282 ms` FFN bucket, then a Metal command
    buffer failure at DenseQ layer 16.
+   2026-04-28 split-CB profiling narrowed the remaining DenseQ FFN bucket:
+   production control at 512 tokens recorded `layer.dense_ffn` GPU CB total
+   `501.28 ms` across 64 layers with first token `11`; the diagnostic split
+   (`HF2Q_PROFILE_DENSE_Q_SPLIT_COMMITS=1`, not production scheduling) preserved
+   token `11` and split that time into gate/up `308.24 ms`, down `177.70 ms`,
+   SiLU `11.40 ms`, residual `3.73 ms`. At 4096 tokens the same diagnostic
+   preserved first token `264` and split `3827.19 ms` into gate/up
+   `2381.48 ms`, down `1305.62 ms`, SiLU `99.61 ms`, residual `40.49 ms`.
+   The GGUF uses Q4_0 for dense FFN gate/up/down in layers 0-60 and Q6_K in
+   layers 61-63, so the next credible speed work belongs in mlx-native's Q4_0
+   tensor-mm path or a paired gate/up matmul over the same input, with the
+   full-vs-last/top-k coherence gates kept beside every speed run.
 
 7. **Concurrency:** continuous batching (vLLM-style) — batch multiple requests through the model simultaneously for maximum throughput
 

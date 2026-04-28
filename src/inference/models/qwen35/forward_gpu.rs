@@ -50,9 +50,10 @@ use super::gpu_delta_net::{
     build_delta_net_layer, build_delta_net_layer_decode_into, DeltaNetWeightsGpu,
 };
 use super::gpu_ffn::{
-    build_dense_ffn_layer_gpu, build_dense_ffn_layer_gpu_q_into, build_moe_ffn_layer_gpu,
-    build_moe_ffn_layer_gpu_q, build_moe_ffn_layer_gpu_q_into, DenseFfnWeightsGpu,
-    DenseFfnWeightsGpuQ, MoeFfnWeightsGpu, MoeFfnWeightsGpuQ,
+    build_dense_ffn_layer_gpu, build_dense_ffn_layer_gpu_q_into,
+    build_dense_ffn_layer_gpu_q_split_profile, build_moe_ffn_layer_gpu, build_moe_ffn_layer_gpu_q,
+    build_moe_ffn_layer_gpu_q_into, DenseFfnWeightsGpu, DenseFfnWeightsGpuQ, MoeFfnWeightsGpu,
+    MoeFfnWeightsGpuQ,
 };
 use super::gpu_full_attn::{
     apply_gated_attn_layer_decode_into, apply_linear_projection_f32,
@@ -88,6 +89,47 @@ fn dump_layer_activations_prefix() -> Option<String> {
     CACHE
         .get_or_init(|| std::env::var("HF2Q_DUMP_LAYER_ACTIVATIONS").ok())
         .clone()
+}
+
+fn print_and_reset_cb_profile(label: &str) {
+    if std::env::var("MLX_PROFILE_CB").is_err() {
+        return;
+    }
+
+    let table = mlx_native::kernel_profile::dump();
+    if table.is_empty() {
+        return;
+    }
+
+    let total_ns: u64 = table.iter().map(|(_, e)| e.total_ns).sum();
+    eprintln!(
+        "[CB_PROFILE:{label}] total={:.2}ms across {} labels:",
+        total_ns as f64 / 1e6,
+        table.len()
+    );
+    for (entry_label, e) in table.iter().take(20) {
+        let avg_us = if e.count > 0 {
+            e.total_ns as f64 / e.count as f64 / 1000.0
+        } else {
+            0.0
+        };
+        let pct = if total_ns > 0 {
+            100.0 * e.total_ns as f64 / total_ns as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "  {:>5.1}%  {:>8.2}ms  count={:<4}  avg={:>6.1}µs  min={:>5.1}µs  max={:>5.1}µs  {}",
+            pct,
+            e.total_ns as f64 / 1e6,
+            e.count,
+            avg_us,
+            e.min_ns as f64 / 1000.0,
+            e.max_ns as f64 / 1000.0,
+            entry_label,
+        );
+    }
+    mlx_native::kernel_profile::reset();
 }
 
 /// Write the last-token row of `hidden` [seq, H] as f32 bytes to `path`.
@@ -1385,21 +1427,41 @@ impl Qwen35Model {
                                  (denseq_fused_eligible invariant violated)"
                         )
                     })?;
-                    let out = build_dense_ffn_layer_gpu_q_into(
-                        &mut enc,
-                        &device,
-                        &mut registry,
-                        &ffn_input,
-                        w,
-                        Some(&ffn_residual),
-                    )
-                    .with_context(|| format!("dense_ffn_q_into fused layer {layer_idx}"))?;
-                    if seq_len == 1 {
-                        enc.commit();
+                    let out = if seq_len > 1
+                        && std::env::var("HF2Q_PROFILE_DENSE_Q_SPLIT_COMMITS").as_deref() == Ok("1")
+                    {
+                        build_dense_ffn_layer_gpu_q_split_profile(
+                            enc,
+                            &device,
+                            &mut registry,
+                            &ffn_input,
+                            w,
+                            Some(&ffn_residual),
+                            "layer.dense_ffn",
+                        )
+                        .with_context(|| {
+                            format!("dense_ffn_q_split_profile fused layer {layer_idx}")
+                        })?
                     } else {
-                        enc.commit_and_wait()
-                            .with_context(|| format!("commit fused-DenseQ layer {layer_idx}"))?;
-                    }
+                        let out = build_dense_ffn_layer_gpu_q_into(
+                            &mut enc,
+                            &device,
+                            &mut registry,
+                            &ffn_input,
+                            w,
+                            Some(&ffn_residual),
+                        )
+                        .with_context(|| format!("dense_ffn_q_into fused layer {layer_idx}"))?;
+                        if seq_len == 1 {
+                            enc.commit();
+                        } else {
+                            enc.commit_and_wait_labeled("layer.dense_ffn")
+                                .with_context(|| {
+                                    format!("commit fused-DenseQ layer {layer_idx}")
+                                })?;
+                        }
+                        out
+                    };
                     out
                 }
                 FfnWeightsGpu::Moe(w_gpu) => {
@@ -1602,6 +1664,11 @@ impl Qwen35Model {
         // Wave 5b.8: print per-section profile summary and reset
         // accumulators. Gated on `HF2Q_PROFILE_W5B8=1`; no-op otherwise.
         super::wave5b8_profile::w5b8_print_and_reset(&format!(
+            "forward_gpu seq_len={} layers={}",
+            seq_len,
+            self.layers.len()
+        ));
+        print_and_reset_cb_profile(&format!(
             "forward_gpu seq_len={} layers={}",
             seq_len,
             self.layers.len()
@@ -2596,43 +2663,9 @@ impl Qwen35Model {
             );
         }
 
-        // MLX_PROFILE_CB=1 — dump per-cb GPU time table after each token.
-        // Profile mode is slow (forces sync per labeled commit) but gives
-        // per-cb attribution for the ADR-012 §Optimize / Task #15 gap.
-        if std::env::var("MLX_PROFILE_CB").is_ok() {
-            let table = mlx_native::kernel_profile::dump();
-            if !table.is_empty() {
-                let total_ns: u64 = table.iter().map(|(_, e)| e.total_ns).sum();
-                eprintln!(
-                    "[CB_PROFILE] total={:.2}ms across {} labels:",
-                    total_ns as f64 / 1e6,
-                    table.len()
-                );
-                for (label, e) in table.iter().take(20) {
-                    let avg_us = if e.count > 0 {
-                        e.total_ns as f64 / e.count as f64 / 1000.0
-                    } else {
-                        0.0
-                    };
-                    let pct = if total_ns > 0 {
-                        100.0 * e.total_ns as f64 / total_ns as f64
-                    } else {
-                        0.0
-                    };
-                    eprintln!(
-                        "  {:>5.1}%  {:>8.2}ms  count={:<4}  avg={:>6.1}µs  min={:>5.1}µs  max={:>5.1}µs  {}",
-                        pct,
-                        e.total_ns as f64 / 1e6,
-                        e.count,
-                        avg_us,
-                        e.min_ns as f64 / 1000.0,
-                        e.max_ns as f64 / 1000.0,
-                        label,
-                    );
-                }
-                mlx_native::kernel_profile::reset();
-            }
-        }
+        // MLX_PROFILE_CB=1: dump per-CB GPU time table after each token.
+        // Profile mode is slow because labeled async commits become syncs.
+        print_and_reset_cb_profile("forward_gpu_greedy");
 
         Ok(token_id)
     }
