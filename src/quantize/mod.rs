@@ -4412,6 +4412,135 @@ mod tests {
         }
     }
 
+    /// ADR-014 P7 iter-35 — legacy target × parallelism orthogonality.
+    /// Mirrors iter-33's variant × parallelism matrix for legacy targets
+    /// (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0).  Per Decision 5, parallelism is
+    /// byte-identity-preserving regardless of codec — but iter-33 only
+    /// covered `KQuantVariant` (K-quant family).  This iter closes
+    /// `KQuantCodecQuantizer` directly with each legacy target.
+    ///
+    ///   For every legacy target T:
+    ///     bytes_serial(T) == bytes_parallel(T)
+    ///
+    /// Compile-time `Send + Sync` guard on `KQuantCodecQuantizer`
+    /// ensures rayon-eligibility is preserved against future field
+    /// additions to the struct.
+    ///
+    /// Catches:
+    ///   - A regression where `quantize_streaming_parallel` mis-orders
+    ///     legacy-target output across the worker pool.
+    ///   - Non-determinism added to the legacy codec path
+    ///     (e.g. parallel scan).
+    ///   - Loss of `Send + Sync` on `KQuantCodecQuantizer` forcing a
+    ///     slower lock-based dispatch.
+    #[test]
+    fn legacy_target_parallelism_byte_identity() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::k_quant_codec::KQuantTarget;
+        use crate::quantize::k_quant_codec_quantizer::KQuantCodecQuantizer;
+
+        // Compile-time guard: KQuantCodecQuantizer must be Send + Sync
+        // for rayon parallel dispatch.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<KQuantCodecQuantizer>();
+
+        const QK: usize = 32;
+        const N_BLOCKS: usize = 32;
+
+        let make_payload = |seed: f32| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(N_BLOCKS * QK * 2);
+            for i in 0..(N_BLOCKS * QK) {
+                let v = (i as f32 / (N_BLOCKS * QK) as f32) * 2.0 - 1.0 + seed * 0.01;
+                bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+            }
+            bytes
+        };
+
+        // Multi-tensor fixture: 4 tensors so the parallel iter exercises
+        // real ordering across the worker pool.
+        let tensors: Vec<&str> = vec![
+            "blk.0.attn_q.weight",
+            "blk.5.attn_v.weight",
+            "blk.10.ffn_down.weight",
+            "output.weight",
+        ];
+
+        let make_lazy_map = || -> LazyTensorMap {
+            let mut m = LazyTensorMap::new();
+            for (i, name) in tensors.iter().enumerate() {
+                m.insert(LazyTensor::from_bytes(
+                    LazyMeta::new(name.to_string(), vec![N_BLOCKS, QK], DType::F16),
+                    make_payload(i as f32),
+                ));
+            }
+            m
+        };
+
+        let cases: Vec<(KQuantTarget, &str)> = vec![
+            (KQuantTarget::Q4Legacy,  "Q4_0"),
+            (KQuantTarget::Q4Legacy1, "Q4_1"),
+            (KQuantTarget::Q5Legacy0, "Q5_0"),
+            (KQuantTarget::Q5Legacy1, "Q5_1"),
+            (KQuantTarget::Q8Legacy,  "Q8_0"),
+        ];
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+
+        for (target, name) in cases {
+            let q_serial = KQuantCodecQuantizer::new(name, target, CalibrationData::None);
+            let q_parallel = KQuantCodecQuantizer::new(name, target, CalibrationData::None);
+
+            let out_serial =
+                quantize_streaming(make_lazy_map(), &metadata, &q_serial, 0, 0, &progress, false)
+                    .unwrap_or_else(|e| panic!("{name} serial: {e:?}"));
+            let out_parallel = quantize_streaming_parallel(
+                make_lazy_map(),
+                &metadata,
+                &q_parallel,
+                0,
+                0,
+                &progress,
+                false,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{name} parallel: {e:?}"));
+
+            assert_eq!(
+                out_serial.quant_method, out_parallel.quant_method,
+                "{name}: quant_method differs serial vs parallel"
+            );
+            assert_eq!(
+                out_serial.tensors.len(),
+                out_parallel.tensors.len(),
+                "{name}: tensor count differs serial vs parallel"
+            );
+
+            for tname in &tensors {
+                let t_serial = out_serial
+                    .tensors
+                    .get(*tname)
+                    .unwrap_or_else(|| panic!("{name} serial missing {tname}"));
+                let t_parallel = out_parallel
+                    .tensors
+                    .get(*tname)
+                    .unwrap_or_else(|| panic!("{name} parallel missing {tname}"));
+
+                assert_eq!(
+                    t_serial.quant_info.ggml_type,
+                    t_parallel.quant_info.ggml_type,
+                    "{name} on {tname}: ggml_type differs"
+                );
+                assert_eq!(
+                    t_serial.data, t_parallel.data,
+                    "{name} on {tname}: legacy bytes differ serial vs parallel \
+                     — Decision 5 byte-identity contract violated for legacy codec"
+                );
+            }
+        }
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
