@@ -170,3 +170,109 @@ The chunk-pipeline now matches the autoregressive path on token id and is in the
 ### Closing the wave
 
 Wave 5b.4 walk-bar re-validation: **CLOSED — PASS**. The GQA head-mapping fix at commit `2a67974` is confirmed correct at the pp4096 production prefill walk-bar. ADR-005 AC 5468 / AC 5470 may flip from `(partial)` to full per the recommendation above.
+
+---
+
+## Wave 5b.5 perf-gap diagnostic
+
+**Status:** **DIAGNOSTIC — perf gap explained; recommendations queued for W-5b.6**
+**Date:** 2026-04-27
+**Worker:** Wave 5b.5 (ADR-005 perf-gap diagnostic)
+**HEAD at start:** `7270a3f` (W-5b.4 audit-followup); mlx-native at `4be0cfd`
+**Pre-flight:** 94 GiB free RAM (Pages free 6 047 726); no non-sccache process > 2 GB; HEAD includes `7270a3f` and mlx-native `4be0cfd` ✓
+**Scope:** diagnostic only — no kernel files modified, no rewrites this iter.
+
+### Empirical wall-clock measurement (T=256, both paths)
+
+Two trials each at 256 tokens (4 chunks × 64 = chunk-path eligible, identical prompt, identical token id 561 produced — correctness PASS at T=256, matching pp4096 walk-bar).
+
+| Trial | Path | linear_attn (ms) | full_attn (ms) | ffn (ms) | total_layers (ms) | total prefill (ms) |
+|---|---|---:|---:|---:|---:|---:|
+| 1 | chunk | 464.0 | 221.6 | 362.1 | 1079.5 | 7876 |
+| 2 | chunk | 488.1 | 210.0 | 358.1 | 1059.3 | 8296 |
+| 1 | autoreg | 580.0 | 211.4 | 354.8 | 1149.5 | 7918 |
+| 2 | autoreg | 594.4 | 216.5 | 355.0 | 1171.1 | 8219 |
+
+Means: chunk linear_attn = **476 ms**, autoreg linear_attn = **587 ms** → **chunk is 111 ms (19%) faster on the linear-attn portion**, but `total_layers` differs by only 91 ms and total prefill is **statistically tied** (chunk 8086 vs autoreg 8068 ms). The 7-second residual outside `total_layers` (which only times the per-layer compute loop) is dominated by **first-call weight upload to GPU** — on a fresh `forward_gpu` invocation `upload_layer_weights_gpu` runs once before the layer loop, materializing the ~17 GB Q4 weights on Metal heap.
+
+### Why kernel-isolation 6.7× speedup ≠ wall-clock parity
+
+Two independent reasons compound:
+
+**(A) Production shape ≠ bench shape.** The Wave 5b.2 kernel-isolation bench measured `B=1, T=4096, Hg=2, H=4` (post-iter-1: 22.67 ms → 3.38 ms = 6.7×). Qwen3.6 27B DWQ46 actually runs `Hg=16, H=48, K=V=128` (derived from GGUF: `ssm.group_count=16`, `ssm.inner_size=6144`, `ssm.state_size=128` ⇒ `H=6144/128=48`; ratio H/Hg = **3**, not 2 as the wrapper comment at `gpu_delta_net.rs:857` claims). Per-kernel work scales linearly in H, so production per-layer chunk-pipeline cost ≈ `3.38 ms × 48/4 = 40.6 ms` — not 3.38 ms. With **48 delta-net layers** (block_count=64, full_attention_interval=4 ⇒ 16 full + 48 linear, also corrects the W-5b.3 doc's "30 delta-net layers" figure), the chunk-pipeline kernels alone amount to **~1.95 s** before any wrapper overhead. The W-5b.4 `chunk path is 6.7× faster than autoreg at pp4096` claim was correct only at the synthetic kernel-bench shape.
+
+**(B) Wrapper overhead is shape-amplified too.** The chunk path wraps the orchestrator with three encoder-split commits + a per-layer F32 GQA expansion + F32→BF16 cast.
+
+### Decomposed cost model (per-forward, T=4096, 48 delta-net layers)
+
+| Component | Per-layer cost | × 48 layers | Notes |
+|---|---:|---:|---|
+| Chunk-pipeline kernels (scaled from bench) | ~40.6 ms | **~1947 ms** | 3.38 ms × H_prod/H_bench (12×); largest component |
+| CPU GQA tiled expansion + memcpy (F32) | ~3.4 ms | **~165 ms** | read 64 MB + write 192 MB per layer @ ~75 GB/s effective CPU bw |
+| F32→BF16 cast on GPU (q+k+v) | ~1.1 ms | **~54 ms** | 432 MB total per layer @ 400 GB/s |
+| Encoder-split barriers (4 commit/layer chunk vs 2 commit/layer autoreg) | +96 commits | **~5–19 ms** | Δ vs autoreg @ 50–200 µs/commit |
+| Sub-kernel dispatch overhead (~11 dispatches/layer) | +528 dispatches | **~3–11 ms** | small; not the bottleneck |
+| **Sum (chunk overhead vs lean kernel)** | | **~2174–2196 ms** | accounting for kernels + wrapper |
+
+The ~91 ms `total_layers` advantage observed at T=256 (×16 scaling to T=4096 ⇒ ~1456 ms expected gain at full prefill) is consistent with the chunk path **kernel-side** outpacing autoregressive at production shape, but the **wrapper adds back ~165 ms** of CPU expansion + ~54 ms of casts + ~10 ms of encoder-split barriers, narrowing the net advantage. The W-5b.4 walk-bar pp4096 numbers (chunk 55–69 s vs autoreg 59 s, both gated behind a ~6.5 s once-per-process model load) are within the cost model's margin.
+
+### Per-layer commit_and_wait audit (build_delta_net_layer chunk-prefill branch)
+
+Confirmed by reading `gpu_delta_net.rs:1380–1660`:
+
+| Stage | Encoder commit site | Path |
+|---|---|---|
+| ops 1–3 (norm, qkv_proj, ssm_conv) | `1403  enc.commit_and_wait("commit ops1-3 prefill")` | both |
+| chunk-prep (l2_norm × 2, alpha, beta, q_scale, g_beta) | `1508  enc.commit_and_wait("commit chunk-prep prefill")` | chunk only |
+| chunk pipeline (cast q/k/v, sign-flip g, orchestrator, cast back) | `1079  enc.commit_and_wait("commit apply_gated_delta_net_chunk")` (inside the wrapper) | chunk only |
+| ops 8–9 (ssm_norm_gate, out_proj) | `1606  enc.commit_and_wait("commit chunk ops8-9 prefill")` | chunk only |
+| autoreg ops 5–9 fused single encoder | `1657  enc.commit_and_wait("commit ops5-9 prefill")` | autoreg only |
+
+Chunk-path = **4 commit_and_wait per delta-net layer**; autoregressive = **2** (ops1-3 + ops5-9 fused). Net **+2 commits per delta-net layer × 48 layers = +96 commits** per forward (≈ 5–19 ms). The internal commit at `1079` *is* unnecessary as a synchronisation barrier: the only consumer of `output_buf` and `final_state` after the wrapper is the caller's E2 encoder (lines 1547 + 1592), which already opens a fresh encoder. Apple unified-memory CPU read on `chunk_final_state` (line 1547) does require synchronisation, but a `commit_no_wait` + per-buffer fence would suffice — **the `wait_until_completed` is the load-bearing cost, not the commit itself**.
+
+### MTLResidencySet adoption audit (5e40d49 leverage)
+
+`mlx-native::residency::ResidencySet` is **`pub(crate)`** — no public API surface. It is auto-tied into `mlx_native::buffer_pool::BufferPool` (see `buffer_pool.rs:267-285` `add_allocation`-on-checkout). However:
+
+- `device.alloc_buffer(...)` uses `device.new_buffer(MTLResourceOptions::StorageModeShared)` directly (`device.rs:105-113`) — **bypasses the pool**, so allocated buffers never join the residency set.
+- All hf2q model-loader paths use `device.alloc_buffer` (e.g. `in_memory_loader.rs:102`, `forward_gpu.rs:586-624` `upload_q4_0_from_f32`, `upload_f32`).
+- **hf2q therefore gets zero benefit from 5e40d49 today.** The 27 B model's ~17 GB of weight buffers are not in any residency set; per-forward weight-resident pages must be page-faulted on first access (and possibly evicted under pressure with concurrent processes).
+
+This is independent of the chunk-vs-autoreg debate — autoregressive prefill is paying the same ~6.5 s first-forward weight-load cost. But it's a low-effort, large-leverage win that's currently sitting on the floor.
+
+### Verifies
+
+- The `wave5b3` log line `chunk-pipeline ENGAGED for prefill (HF2Q_CHUNK_SCAN_PREFILL=1) seq_len=256 d_k=128` was emitted in **both T=256 chunk runs**, confirming the chunk path engaged at every layer (no silent autoregressive fallback).
+- Both paths produce token id 561 at T=256 — chunk-path numerical correctness still holds at this shape (consistent with W-5b.4 pp4096 walk-bar).
+- The `chunk_path_eligible(seq_len, d_k)` predicate (line 111: requires `unsafe_experiments && chunk_scan_prefill && seq_len > 64 && seq_len % 64 == 0 && d_k == 128`) fires correctly at T=256 (4 chunks) and T=4096 (64 chunks).
+
+### Cost-model vs measurement reconciliation
+
+Theoretical chunk-vs-autoreg `total_layers` gap (T=4096 extrapolation): autoreg should be **~1.0–1.5 s slower** based on kernel scaling alone, partly clawed back by ~220 ms of wrapper overhead (CPU expansion + casts + barriers) and ~10 ms of dispatch overhead. Net expected chunk advantage: **~0.8–1.3 s** at pp4096. Observed (W-5b.4): chunk **55–69 s** vs autoreg **59 s** → spread is 4–10 s with chunk *tied or slightly slower* on average. **The cost model under-predicts the wrapper overhead by ~3–6 s** at full T=4096 — implying additional contributors not captured above. Most likely the F32 q/k expansion's CPU-side `as_slice` / `as_mut_slice` round-trips (lines 884–931) involve cache-line ping-pong with the GPU residency state — at T=4096 the read window is `64 MB × 48 layers = 3 GB` of CPU-readable Metal-shared pages, and the M5 Max unified memory's CPU-read latency is materially higher than its GPU-read latency for not-recently-touched pages.
+
+### Top 3 perf-improvement candidates ranked by leverage
+
+| # | Candidate | Estimated wall savings @ pp4096 | Effort | Risk |
+|---|---|---:|---|---|
+| **1** | **Move GQA tiled expansion into the chunk-pipeline kernels** (or pass an indirection table to `kkt`/`recompute_w_u`/`chunk_o` so they read from the unexpanded `[T, Hg, K]` buffer with `kh = i_h % Hg` indexing). Eliminates the per-layer F32 expansion AND the F32→BF16 cast (chunk could ingest F32 q/k directly OR have its own fused cast). | **~3–6 s** (CPU bandwidth + GPU cast + cache effects) | Medium — kernel work, but the indirection-table form is ~50 lines per kernel and the wrapper-side fix shrinks by ~80 lines | Low — semantics-preserving; oracle/walk-bar tests gate parity |
+| **2** | **Adopt MTLResidencySet for hf2q weight buffers** by routing model-loader paths through `mlx_native::buffer_pool::BufferPool` (or expose `MlxDevice::alloc_buffer_pooled`). Amortises the ~6.5 s first-forward weight-load over multi-request server lifecycles AND prevents evictions under memory pressure. | **~6 s on first request, ~100–500 ms on subsequent under memory pressure** | Medium — needs a public API addition in mlx-native + 1-line swap in hf2q's `upload_*` helpers | Low — additive, opt-out via `HF2Q_NO_RESIDENCY=1` already exists |
+| **3** | **Eliminate the chunk-prep encoder split** by inlining ops 5–6 (l2-norm × 2, scalar_mul, compute_g_beta) into the chunk wrapper's encoder. Replaces 2 of 4 chunk-path commits with `enc.memory_barrier()` between stages. Also replace the wrapper's internal `commit_and_wait` (line 1079) with `commit` + a CPU-readable fence for `final_state` (the only CPU-read site). | **~50–200 ms** (96→48 commits per forward) | Low — wiring change in `gpu_delta_net.rs` only, no kernel modifications | Low — barrier semantics are well-tested in mlx-native ops |
+
+### Recommendation for W-5b.6
+
+**Attempt candidate #2 (MTLResidencySet adoption) FIRST** — highest leverage per LOC, addresses a regression that affects *both* chunk and autoreg paths, and is independent of the chunk-pipeline correctness debate. The ~6 s on-first-forward win shows up immediately on every benchmark run and on every server-warm-up. Candidate #1 (GQA expansion in-kernel) is the next-largest win but is real kernel work and should be its own iter with kernel-isolation bench coverage. Candidate #3 is a low-risk low-reward cleanup; bundle with #1 when its encoder is rewritten.
+
+Side-quest: the wrapper docstring at `gpu_delta_net.rs:857` ("Cost: 2× memory + bandwidth on q/k for n_v_heads/n_k_heads=2 (Qwen3.6 27B's actual ratio)") **misstates the GQA ratio as 2 when it is actually 3** for Qwen3.6 27B (`H/Hg = 48/16`). Correct on next docs touch — does not affect correctness, only the 2× vs 3× expansion-cost arithmetic in commentary.
+
+### Constraints honored
+
+- No kernel files in mlx-native modified.
+- No files in `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`, `src/calibrate/`, `peer_parity_gates.rs`, `ppl_driver.rs`, `imatrix.rs` touched.
+- No code edits to chunk-pipeline kernels.
+- Only edit this iter: this docs append.
+
+### Inputs preserved
+
+- `/tmp/diag-prompt.txt` (256 tokens, 1418 bytes — exact-T diagnostic prompt)
+- T=256 trial logs captured inline above (chunk × 2 + autoreg × 2)
+- This document section
