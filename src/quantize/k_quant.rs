@@ -86,6 +86,15 @@ pub const BLOCK_Q6_K_SIZE: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2;
 /// of 16 elements each).
 pub const BLOCK_Q3_K_SIZE: usize = QK_K / 8 + QK_K / 4 + 12 + 2;
 
+/// `block_q2_K` size on disk (matches `sizeof(block_q2_K)` in C).
+/// 16 byte scales (4-bit scale + 4-bit min, packed per sub-block) +
+/// 64 byte qs (2-bit quants, 4 elements / byte) + 2 × f16 (d, dmin)
+/// = 84 bytes.
+///
+/// Per `ggml-common.h:286-298` (effective 2.625 bpw, 16 sub-blocks
+/// of 16 elements each).
+pub const BLOCK_Q2_K_SIZE: usize = QK_K / 16 + QK_K / 4 + 2 + 2;
+
 /// Errors from k-quant operations.
 #[derive(Error, Debug)]
 pub enum KQuantError {
@@ -881,6 +890,180 @@ pub fn dequantize_row_q3_k_bytes(
         blocks.push(block);
     }
     dequantize_row_q3_k(&blocks, out)
+}
+
+// ────────────────────────── Q2_K block + dequantize ──────────────────────────
+
+/// `block_q2_K` (84 bytes). Pure-Rust mirror of
+/// `ggml-common.h:286-298`:
+///
+/// ```text
+/// uint8_t scales[QK_K/16];  // 16 bytes — packed: low 4 bits scale, high 4 bits min
+/// uint8_t qs[QK_K/4];       // 64 bytes — 2-bit quants, 4 elements per byte
+/// ggml_half d;              // 2 bytes — super-block scale (f16)
+/// ggml_half dmin;           // 2 bytes — super-block min (f16)
+/// ```
+///
+/// Each 2-bit quant `q ∈ [0, 3]` decodes per `ggml-quants.c:899-928`:
+/// ```text
+/// dl = d * (sc & 0xF)
+/// ml = min * (sc >> 4)
+/// y[i] = dl * q - ml
+/// ```
+/// where `sc` is the per-sub-block scale byte (16 sub-blocks of 16
+/// elements each).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ2K {
+    /// 16 bytes — per-sub-block (scale 4-bit, min 4-bit) packed in
+    /// each byte.  16 sub-blocks total.
+    pub scales: [u8; QK_K / 16],
+    /// 64 bytes — 2-bit quants, 4 elements per byte.
+    pub qs: [u8; QK_K / 4],
+    /// Super-block scale `d` (f16 bits).
+    pub d_bits: u16,
+    /// Super-block min `dmin` (f16 bits).
+    pub dmin_bits: u16,
+}
+
+impl BlockQ2K {
+    /// Read a `BlockQ2K` from an 84-byte buffer (little-endian).
+    /// Returns `None` if the buffer is shorter than `BLOCK_Q2_K_SIZE`.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < BLOCK_Q2_K_SIZE {
+            return None;
+        }
+        let mut scales = [0u8; QK_K / 16];
+        scales.copy_from_slice(&bytes[0..QK_K / 16]);
+        let mut qs = [0u8; QK_K / 4];
+        qs.copy_from_slice(&bytes[QK_K / 16..QK_K / 16 + QK_K / 4]);
+        let d_off = QK_K / 16 + QK_K / 4;
+        let d_bits = u16::from_le_bytes([bytes[d_off], bytes[d_off + 1]]);
+        let dmin_bits = u16::from_le_bytes([bytes[d_off + 2], bytes[d_off + 3]]);
+        Some(Self {
+            scales,
+            qs,
+            d_bits,
+            dmin_bits,
+        })
+    }
+
+    /// Serialise to 84-byte little-endian buffer.
+    pub fn to_bytes(&self) -> [u8; BLOCK_Q2_K_SIZE] {
+        let mut out = [0u8; BLOCK_Q2_K_SIZE];
+        out[0..QK_K / 16].copy_from_slice(&self.scales);
+        out[QK_K / 16..QK_K / 16 + QK_K / 4].copy_from_slice(&self.qs);
+        let d_off = QK_K / 16 + QK_K / 4;
+        out[d_off..d_off + 2].copy_from_slice(&self.d_bits.to_le_bytes());
+        out[d_off + 2..d_off + 4].copy_from_slice(&self.dmin_bits.to_le_bytes());
+        out
+    }
+
+    /// Super-block scale `d` as F32.
+    pub fn d(&self) -> f32 {
+        half::f16::from_bits(self.d_bits).to_f32()
+    }
+
+    /// Super-block min `dmin` as F32.
+    pub fn dmin(&self) -> f32 {
+        half::f16::from_bits(self.dmin_bits).to_f32()
+    }
+}
+
+/// Dequantize a sequence of `block_q2_K` blocks to F32. Pure-Rust
+/// port of `dequantize_row_q2_K` (`ggml-quants.c:899-928`).
+///
+/// For each super-block:
+/// 1. d = f16 super-block scale, min = f16 super-block min.
+/// 2. Walk in 128-element halves (n=0, 128). Each half iterates 4
+///    j-values (shift = 0,2,4,6) reading 2 sub-blocks of 16 elements
+///    each (a + b cursor) — 8 sub-blocks per half × 2 halves = 16
+///    sub-blocks total.
+/// 3. Per sub-block: read scale byte from `scales[is]`, decode
+///    `dl = d * (sc & 0xF)`, `ml = min * (sc >> 4)`.  For each of
+///    16 elements: `y = dl * (q & 3) - ml` where q is the 2-bit
+///    quant from `qs[]` at the current shift.
+/// 4. After 4 j-iterations, `q` advances by 32 bytes for the next
+///    half.
+pub fn dequantize_row_q2_k(
+    blocks: &[BlockQ2K],
+    out: &mut [f32],
+) -> Result<usize, KQuantError> {
+    let expected = blocks.len() * QK_K;
+    if out.len() < expected {
+        return Err(KQuantError::BlockSizeMismatch {
+            actual: out.len(),
+            n_blocks: blocks.len(),
+            bytes_per_block: QK_K,
+        });
+    }
+
+    let mut yi = 0usize;
+    for block in blocks {
+        let d = block.d();
+        let dmin = block.dmin();
+        let mut q_off = 0usize;
+        let mut is = 0usize;
+
+        // halves: n = 0 and n = 128
+        for _half in 0..2 {
+            for j in 0..4 {
+                let shift: u32 = (j as u32) * 2;
+
+                // Sub-block a: 16 elements [0..16)
+                let sc_a = block.scales[is] as u32;
+                is += 1;
+                let dl_a = d * ((sc_a & 0xF) as f32);
+                let ml_a = dmin * ((sc_a >> 4) as f32);
+                for l in 0..16 {
+                    let q = ((block.qs[q_off + l] >> shift) & 3) as i8;
+                    out[yi] = dl_a * (q as f32) - ml_a;
+                    yi += 1;
+                }
+
+                // Sub-block b: 16 elements [16..32)
+                let sc_b = block.scales[is] as u32;
+                is += 1;
+                let dl_b = d * ((sc_b & 0xF) as f32);
+                let ml_b = dmin * ((sc_b >> 4) as f32);
+                for l in 0..16 {
+                    let q = ((block.qs[q_off + 16 + l] >> shift) & 3) as i8;
+                    out[yi] = dl_b * (q as f32) - ml_b;
+                    yi += 1;
+                }
+            }
+            q_off += 32;
+        }
+    }
+
+    Ok(expected)
+}
+
+/// Dequantize Q2_K from a flat byte buffer.
+pub fn dequantize_row_q2_k_bytes(
+    data: &[u8],
+    out: &mut [f32],
+) -> Result<usize, KQuantError> {
+    if data.len() % BLOCK_Q2_K_SIZE != 0 {
+        return Err(KQuantError::BlockSizeMismatch {
+            actual: data.len(),
+            n_blocks: data.len() / BLOCK_Q2_K_SIZE,
+            bytes_per_block: BLOCK_Q2_K_SIZE,
+        });
+    }
+    let n_blocks = data.len() / BLOCK_Q2_K_SIZE;
+    let mut blocks = Vec::with_capacity(n_blocks);
+    for i in 0..n_blocks {
+        let start = i * BLOCK_Q2_K_SIZE;
+        let block = BlockQ2K::from_bytes(&data[start..start + BLOCK_Q2_K_SIZE])
+            .ok_or(KQuantError::BlockSizeMismatch {
+                actual: data.len(),
+                n_blocks,
+                bytes_per_block: BLOCK_Q2_K_SIZE,
+            })?;
+        blocks.push(block);
+    }
+    dequantize_row_q2_k(&blocks, out)
 }
 
 // ────────────────────────── Quantize side ──────────────────────────
@@ -4755,5 +4938,155 @@ mod tests {
         }
         let rmse = (sse / total as f64).sqrt();
         assert!(rmse < 0.10, "multi-block Q3_K RMSE {rmse} > 0.10");
+    }
+
+    // ── iter-18: Q2_K block layout + dequantize tests ──
+
+    /// `BLOCK_Q2_K_SIZE` matches the C `sizeof(block_q2_K)` static_assert.
+    /// Per `ggml-common.h:299`: 2*sizeof(ggml_half) + QK_K/16 + QK_K/4 = 84 bytes.
+    #[test]
+    fn block_q2_k_size_matches_c_static_assert() {
+        assert_eq!(BLOCK_Q2_K_SIZE, 4 + QK_K / 16 + QK_K / 4);
+        assert_eq!(BLOCK_Q2_K_SIZE, 84);
+    }
+
+    /// Round-trip BlockQ2K via to_bytes / from_bytes preserves the
+    /// struct byte-for-byte (field order: scales, qs, d_bits, dmin_bits).
+    #[test]
+    fn block_q2_k_byte_round_trip() {
+        let block = BlockQ2K {
+            scales: {
+                let mut a = [0u8; QK_K / 16];
+                for (i, slot) in a.iter_mut().enumerate() {
+                    *slot = ((i * 17 + 3) & 0xFF) as u8;
+                }
+                a
+            },
+            qs: {
+                let mut a = [0u8; QK_K / 4];
+                for (i, slot) in a.iter_mut().enumerate() {
+                    *slot = ((i * 13 + 5) & 0xFF) as u8;
+                }
+                a
+            },
+            d_bits: 0xCAFE,
+            dmin_bits: 0xBEEF,
+        };
+        let bytes = block.to_bytes();
+        assert_eq!(bytes.len(), BLOCK_Q2_K_SIZE);
+        let decoded = BlockQ2K::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.scales, block.scales);
+        assert_eq!(decoded.qs, block.qs);
+        assert_eq!(decoded.d_bits, block.d_bits);
+        assert_eq!(decoded.dmin_bits, block.dmin_bits);
+    }
+
+    /// Field offsets in the serialised buffer match C layout order.
+    #[test]
+    fn block_q2_k_byte_layout_field_order() {
+        let block = BlockQ2K {
+            scales: [0xAA; QK_K / 16],   // bytes [0, 16)
+            qs: [0xBB; QK_K / 4],         // bytes [16, 80)
+            d_bits: 0xCCDD,               // bytes [80, 82) LE
+            dmin_bits: 0xEEFF,            // bytes [82, 84) LE
+        };
+        let bytes = block.to_bytes();
+        for &b in &bytes[0..QK_K / 16] {
+            assert_eq!(b, 0xAA, "scales region");
+        }
+        for &b in &bytes[QK_K / 16..QK_K / 16 + QK_K / 4] {
+            assert_eq!(b, 0xBB, "qs region");
+        }
+        let d_off = QK_K / 16 + QK_K / 4;
+        assert_eq!(bytes[d_off], 0xDD, "d_bits LE byte 0");
+        assert_eq!(bytes[d_off + 1], 0xCC, "d_bits LE byte 1");
+        assert_eq!(bytes[d_off + 2], 0xFF, "dmin_bits LE byte 0");
+        assert_eq!(bytes[d_off + 3], 0xEE, "dmin_bits LE byte 1");
+    }
+
+    /// All-zero block (d=0, dmin=0, all scales=0, all qs=0) → all-zero
+    /// output.  Trivial sanity check.
+    #[test]
+    fn dequantize_q2_k_zero_block() {
+        let block = BlockQ2K {
+            scales: [0u8; QK_K / 16],
+            qs: [0u8; QK_K / 4],
+            d_bits: half::f16::from_f32(0.0).to_bits(),
+            dmin_bits: half::f16::from_f32(0.0).to_bits(),
+        };
+        let mut out = vec![1.0_f32; QK_K]; // pre-fill non-zero
+        let n = dequantize_row_q2_k(std::slice::from_ref(&block), &mut out).unwrap();
+        assert_eq!(n, QK_K);
+        for &v in &out {
+            assert_eq!(v, 0.0);
+        }
+    }
+
+    /// d=1, dmin=1, all scales=0x10 (sc&0xF=0, sc>>4=1 → dl=0, ml=1),
+    /// any qs → every output = 0*q - 1 = -1.0.  Locks the dl/ml
+    /// per-sub-block decode.
+    #[test]
+    fn dequantize_q2_k_known_fixture_dl_zero_ml_one() {
+        let block = BlockQ2K {
+            scales: [0x10u8; QK_K / 16], // sc=0x10 → low=0, high=1
+            qs: [0xFFu8; QK_K / 4],       // any value, irrelevant since dl=0
+            d_bits: half::f16::from_f32(1.0).to_bits(),
+            dmin_bits: half::f16::from_f32(1.0).to_bits(),
+        };
+        let mut out = vec![0.0_f32; QK_K];
+        dequantize_row_q2_k(std::slice::from_ref(&block), &mut out).unwrap();
+        for (i, &v) in out.iter().enumerate() {
+            assert_eq!(v, -1.0, "out[{i}] = {v}, expected -1.0");
+        }
+    }
+
+    /// d=1, dmin=0, all scales=0x01 (sc&0xF=1, sc>>4=0 → dl=1, ml=0),
+    /// qs=0x55 (binary 01010101 → 4 quants of 1 each at shift 0,2,4,6).
+    /// At shift=0: q=1, y=1*1-0=1.  Confirms the quant decode logic.
+    #[test]
+    fn dequantize_q2_k_known_fixture_dl_one_ml_zero() {
+        let block = BlockQ2K {
+            scales: [0x01u8; QK_K / 16], // sc=0x01 → low=1, high=0
+            qs: [0x55u8; QK_K / 4],       // 0x55 = 0b01010101 → q=1 at all 4 shifts
+            d_bits: half::f16::from_f32(1.0).to_bits(),
+            dmin_bits: half::f16::from_f32(0.0).to_bits(),
+        };
+        let mut out = vec![0.0_f32; QK_K];
+        dequantize_row_q2_k(std::slice::from_ref(&block), &mut out).unwrap();
+        for (i, &v) in out.iter().enumerate() {
+            assert_eq!(v, 1.0, "out[{i}] = {v}, expected 1.0");
+        }
+    }
+
+    /// Flat-bytes path matches the in-memory dispatch on identical input.
+    #[test]
+    fn dequantize_q2_k_bytes_matches_blocks() {
+        let block = BlockQ2K {
+            scales: [0x12u8; QK_K / 16],
+            qs: [0xAAu8; QK_K / 4],
+            d_bits: half::f16::from_f32(1.5).to_bits(),
+            dmin_bits: half::f16::from_f32(0.5).to_bits(),
+        };
+        let bytes = block.to_bytes();
+
+        let mut from_blocks = vec![0.0_f32; QK_K];
+        let mut from_bytes = vec![0.0_f32; QK_K];
+        dequantize_row_q2_k(std::slice::from_ref(&block), &mut from_blocks).unwrap();
+        dequantize_row_q2_k_bytes(&bytes, &mut from_bytes).unwrap();
+        assert_eq!(from_blocks, from_bytes,
+            "bytes path diverged from blocks path");
+    }
+
+    /// Misaligned byte length errors instead of panicking.
+    #[test]
+    fn dequantize_q2_k_bytes_misaligned_errors() {
+        let bytes = vec![0u8; BLOCK_Q2_K_SIZE + 7]; // 91 bytes — not a multiple
+        let mut out = vec![0.0_f32; QK_K];
+        let err = dequantize_row_q2_k_bytes(&bytes, &mut out)
+            .expect_err("expected BlockSizeMismatch");
+        match err {
+            KQuantError::BlockSizeMismatch { .. } => {}
+            other => panic!("expected BlockSizeMismatch, got {other:?}"),
+        }
     }
 }
