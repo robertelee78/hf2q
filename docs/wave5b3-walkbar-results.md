@@ -1929,3 +1929,162 @@ kill -CONT <mcp-brain-server-pid>
 ```
 
 Wave 5b.18 qkv_split GPU kernel: **CLOSED — `layer.qkv_deinterleave` 837 → 48 ms (17.4× drop); whole-prefill wall 17,051 → 16,193 ms (−5.0 %); wall ratio 2.59× → 2.27× vs same-day llama; 6/6 token-id determinism; `HF2Q_QKV_SPLIT_LEGACY` retained for W-5b.19 sunset panel.**
+
+## Wave 5b.19 sunset HF2Q_QKV_SPLIT_LEGACY + repeat_tiled GPU kernel — Phase A LANDED, Phase B REVERTED
+
+**Iter:** 2026-04-27 (cross-repo). hf2q HEAD `e88a65a` at start, `b7bd2ab` at end (Phase A landed). mlx-native HEAD `5983377` at start, `69050c1` at end (Phase B kernel landed at `369fef9`, reverted at `69050c1` per closure-rule miss). Bundled-iter worker prompt: (Phase A) sunset `HF2Q_QKV_SPLIT_LEGACY` after a 30-run forensic A/B at PP4106; (Phase B) wire a new `dispatch_repeat_tiled_f32` GPU kernel for `apply_gated_delta_net_chunk`'s GQA pre-expansion to eliminate the 497 ms CPU memcpy bucket.
+
+### Pre-flight
+
+- vm_stat: Pages free 5,055,062 × 16 KB = **77 GB free** (above 32 GB threshold).
+- Concurrent processes: `mcp-brain-server` (PID 1205) at 0% at session start; rose to 99.4 % CPU mid-iter; **paused via `kill -STOP 1205`** prior to Phase B bench, resumed at iter close.
+- mlx-native CFA worktrees on `adf7ee0` branch — no overlap with `src/ops/` or `src/shaders/`.
+
+### Phase A — sunset HF2Q_QKV_SPLIT_LEGACY (LANDED)
+
+30-run cross-path determinism panel at PP4106 (5 cold model loads × 3 cold prefills × 2 paths) via `scripts/sunset-w5b18-qkv-split-legacy.sh`. Verbatim pattern from `scripts/sunset-w5b14-legacy-dense-q.sh` with the env-var name swapped.
+
+```
+=== SUNSET PARITY AUDIT SUMMARY ===
+NEW path:    PASS=15 / FAIL=0
+LEGACY path: PASS=15 / FAIL=0
+Total: 30 / 30
+VERDICT: PARITY HOLDS — legacy gate is safe to remove.
+```
+
+| Path | mean prefill (ms) | σ (ms) | n | tok-id |
+|---|---:|---:|---:|---:|
+| NEW (gpu_split, default) | **16,255** | 67 | 15 | 11 (15/15) |
+| LEGACY (cpu_round_trip)  | **17,108** | 73 | 15 | 11 (15/15) |
+| Δ | **−853 ms (−5.0 %)** | | | matches W-5b.18 closure exactly |
+
+**Removals (commit `b7bd2ab`):**
+
+- `src/debug/investigation_env.rs`: drop the `qkv_split_legacy: bool` field + the `env_eq_one("HF2Q_QKV_SPLIT_LEGACY")` parser. The env var is no longer read by the binary.
+- `src/inference/models/qwen35/gpu_delta_net.rs`: collapse the `if INVESTIGATION_ENV.qkv_split_legacy { LEGACY-CPU } else { GPU }` branch in `apply_proj`'s prefill seq>1 path to the GPU-only arm. The legacy `download_f32 + CPU triple-loop split + 3× upload_f32` block (~50 LOC) is removed; `nk` re-prefixed to `_nk` (the legacy block was its sole consumer post-removal).
+- Delete `qkv_split_path_matches_legacy_at_seq128` test (170 LOC). Standing parity bar: the bit-identical CPU reference test in `mlx-native/tests/test_qkv_split.rs::test_qkv_split_qwen36_27b_shape_seq128` (and the matching `_pp4106` case for full prefill scale).
+- `src/inference/models/qwen35/wave5b8_profile.rs`: delete `SectionKind::DnQkvDownload` / `DnQkvCpuLoop` / `DnQkvUploads` variants (now unreachable post-gate-removal); update `COUNT` 28 → 25; trim the `kinds[]` print loop. `DnQkvGpuSplit` retained as the single bucket for the W-5b.18 GPU dispatch.
+
+**Build + test status post-Phase A:**
+
+- `cargo build --release --bin hf2q`: succeeds, **72 warnings (W-5b.18 baseline preserved, 0 new)**.
+- `cargo test --release --bin hf2q -- qwen35`: **295 passed, 0 failed, 8 ignored**. Test count adjusts: 296 → 295 (-1 from deleted parity test).
+- `cargo test --release --bin hf2q -- wave5b8_profile chunk_path`: **4 passed, 0 failed**.
+
+### Phase B — repeat_tiled GPU kernel (REVERTED — closure-rule miss)
+
+The W-5b.17 audit's recommendation-B target: replace the wrapper-side CPU triple-loop tiled-replicate (`gpu_delta_net.rs:893-940`, ~497 ms / 10.4 ms-per-layer at PP4106) with a single-dispatch GPU broadcast `dst[t, h, k] = src[t, h % Hg, k]` mirroring llama.cpp's `ggml_repeat_4d` graph op. Implementation landed cleanly in mlx-native at `369fef9`:
+
+- `src/shaders/repeat_tiled.metal`: pure strided copy, grid `(K, H, T)`, threadgroup width 256 along K. ~30 LOC.
+- `src/ops/repeat_tiled.rs`: `dispatch_repeat_tiled_f32` + `RepeatTiledParams { seq, hg, h, k }`. Buffer-byte guards on src and dst; rejects `h % hg != 0`. ~50 LOC.
+- `src/kernel_registry.rs` + `src/ops/mod.rs`: kernel registration mirroring the W-5b.18 qkv_split convention.
+- `tests/test_repeat_tiled.rs`: 7 cases including Qwen3.6-27B production shapes (seq=128, seq=4106), the prompt-cited group_ratio=3 config (Hg=16, H=48, K=128), no-op Hg==H, seq=1 edge, and dim-rejection paths. **All to_bits()-identical vs the CPU reference; 7/7 PASS.**
+
+The hf2q-side wire-up (`HF2Q_GQA_EXPAND_LEGACY=1` forensic gate + `gqa_expand_path_matches_legacy_at_seq128` parity test + replacement of the 875-941 CPU memcpy with two `dispatch_repeat_tiled_f32` calls into a fresh encoder + `commit_and_wait`) was implemented and unit-tested. The new parity test PASSES (bit-identical to the legacy CPU reference at production GQA shape). Bench results at PP4106 (3 cold trials × 2 paths × 3 cold llama, mcp-brain-server STOP-paused):
+
+| metric | LEGACY (T2) | NEW (T2) | Δ |
+|---|---:|---:|---:|
+| `chunk.gqa_expand` (sum, 48 layers) | 510.66 ms | **234.28 ms** | **−276 ms (−54 %, 2.18× drop)** |
+| `chunk.gqa_expand` per-layer | 10.64 ms | 4.88 ms | (kernel is dispatch-bound) |
+| `chunk.commit_wait` (sum) | 1,309.93 ms | 1,221.89 ms | −88 ms |
+| `layer.linear_total` (sum) | 6,466.39 ms | 6,204.91 ms | −261 ms |
+
+| trial | NEW prefill (ms) | LEGACY prefill (ms) | llama prompt_eval (ms) |
+|------:|------------------:|--------------------:|-----------------------:|
+| T1    | 15,920            | 16,312              | 6,485                  |
+| T2    | 16,017            | 16,232              | 6,742                  |
+| T3    | 15,959            | 16,228              | 6,858                  |
+| **mean** | **15,965**     | **16,257**          | **6,695**              |
+
+Whole-prefill wall mean drops 16,257 → 15,965 ms (−292 ms / −1.8 %). Same-day llama drift vs W-5b.18's 7,127 ms: −6.1 % (within ≤10 % gate; **PASS**). Token id 11 on **6/6** trials — paths bit-identical by construction (kernel unit test) and observed first-decoded-token determinism.
+
+### Why the kernel is dispatch-bound (root cause)
+
+The bench-time evidence in T2 telemetry, contrasted with W-5b.18's `dn.qkv_gpu_split` performance at the SAME architectural pattern (1 commit_and_wait per layer):
+
+| Pattern | per-layer wall | data moved | per-layer fixed cost |
+|---|---:|---:|---:|
+| W-5b.18 `dn.qkv_gpu_split` (1 dispatch / commit_and_wait) | 0.99 ms | ~42 MB | ~1 ms (commit+kernel small relative to data BW) |
+| W-5b.19 `chunk.gqa_expand` (2 dispatches / commit_and_wait) | 4.88 ms | ~66 MB | ~5 ms (dominated by per-dispatch + commit_and_wait fixed overhead) |
+| LEGACY CPU memcpy on unified mem | 10.64 ms | ~66 MB | ~10 ms (memcpy from unified-memory-mapped GPU buffer → unified-memory-mapped GPU buffer) |
+
+The kernel itself is fast: 33 MB / 600 GB/s ≈ 0.05 ms compute time on M5 Max bandwidth. The 4.88 ms per-layer wall is dominated by the per-encoder-commit_and_wait synchronization fixed cost (~2-3 ms per dispatch + ~2 ms commit_and_wait). Two dispatches × 48 layers × ~5 ms ≈ 234 ms — matches the measurement.
+
+The closure rule "bucket drops by ≥10× (497 → ≤50 ms)" implicitly assumed the bucket was BW-bound (CPU-loop-bound on host-side memcpy with low effective unified-memory throughput). Bench evidence falsifies that hypothesis: the LEGACY path achieves ~6.2 GB/s effective sustained, not the kB/s level a 10× CPU-bound bucket would imply. The CPU memcpy on Apple unified memory is itself near-peak for the `copy_from_slice` pattern; a same-architecture GPU dispatch only beats it by ~2× before per-dispatch overhead dominates.
+
+### Closure rule check
+
+| rule | target | observed | verdict |
+|---|---|---|---|
+| `chunk.gqa_expand` ≥10× drop | ≤50 ms (sum / 48 layers) | 234 ms (sum) | **FAIL — 2.18×** |
+| Whole-prefill wall ≥2 % drop | ≤15,870 ms | 15,965 ms | **FAIL — 1.4 %** |
+| Token-id determinism 6/6 | id 11 | id 11 (3 NEW + 3 LEGACY) | PASS |
+| Same-day llama within 10 % of W-5b.18 ceiling | ≤7,840 ms | 6,695 ms | PASS |
+| 0 NEW clippy warnings | 72 baseline | 72 | PASS |
+| New parity test passes | 1 PASS | 1 PASS | PASS |
+| 295+1=296 hf2q tests | 296 | 296 | PASS (only with hf2q wire-up landed; reverted post-bench) |
+
+Two of two perf closure rules FAIL. Per the worker prompt's STOP condition — "After Phase B, chunk.gqa_expand bucket does NOT drop ≥10× — STOP, revert, report" — the hf2q wire-up was reverted (working-tree only; not committed) and the mlx-native commit `369fef9` was reverted via a public revert at `69050c1` so that mlx-native HEAD reflects no unused-but-published kernel.
+
+### Recommendation for W-5b.20
+
+The kernel is correct (bit-identical parity proven 7/7 mlx-native + 1/1 hf2q). The blocker is **dispatch-overhead-bound**: a 2-dispatch standalone-encoder pattern cannot beat the CPU memcpy by more than ~2× at this data scale. The path to ≥10× is to **fold the GQA broadcast into the existing mega-encoder** at `gpu_delta_net.rs:1066-1182` (`apply_gated_delta_net_chunk`'s `enc.commit_and_wait` covers all of cast→sign-flip→chunk-pipeline→cast-back). Doing so eliminates the standalone commit_and_wait entirely:
+
+1. Re-add the mlx-native `dispatch_repeat_tiled_f32` kernel (cherry-pick `369fef9`).
+2. In the mega-encoder, prepend two `dispatch_repeat_tiled_f32` calls (`q→q_expanded`, `k→k_expanded`) BEFORE the F32→BF16 cast that consumes them.
+3. Add a `enc.memory_barrier()` between the repeat_tiled writes and the cast reads (RAW dependency).
+4. Delete the standalone `command_encoder()` + `commit_and_wait()` for the GQA expansion.
+
+Expected outcome: `chunk.gqa_expand` drops to ~5-10 ms total (only the encode-time, no commit). The 497 ms → ≤50 ms closure rule becomes achievable.
+
+### Same-day llama baseline (Phase B run)
+
+3 cold trials: T1 6,485 / T2 6,742 / T3 6,858 ms. Mean **6,695 ms**. Drift vs W-5b.18's 7,127 ms: −6.1 % (within the ≤10 % gate).
+
+### ADR-005 closure
+
+ADR-005 closure paragraph added immediately above the W-5b.18 paragraph in `/opt/hf2q/docs/ADR-005-inference-server.md` documenting Phase A LANDED + Phase B REVERTED + W-5b.20 mega-encoder follow-up.
+
+### Files touched
+
+**hf2q (`b7bd2ab` commit, on main):**
+
+1. `scripts/sunset-w5b18-qkv-split-legacy.sh`: new file, 84 LOC.
+2. `scripts/bench-w5b19-repeat-tiled.sh`: new file, untracked (Phase B bench script; Phase B wire-up was reverted, but the script is preserved as a reproducer for the W-5b.20 fused-encoder approach).
+3. `src/debug/investigation_env.rs`: −17 LOC (qkv_split_legacy field + parser removed).
+4. `src/inference/models/qwen35/gpu_delta_net.rs`: −156 LOC (legacy CPU round-trip block + qkv_split parity test).
+5. `src/inference/models/qwen35/wave5b8_profile.rs`: −13 LOC (DnQkvDownload/CpuLoop/Uploads variants + their kinds[] entries).
+
+**mlx-native (`5983377` start, `69050c1` end — revert at HEAD):**
+
+- `5983377` (W-5b.18) preserved.
+- `369fef9`: feat(mlx-native ops): add dispatch_repeat_tiled_f32 (correct, 7/7 unit tests PASS, but REVERTED in `69050c1` per closure-rule miss; preserved in git history for W-5b.20 cherry-pick).
+
+### Reproduction recipe
+
+```bash
+# Pre-flight: pause mcp-brain-server (pid varies; find via ps)
+ps aux | grep -v sccache | sort -k6 -nr | head -10
+kill -STOP <mcp-brain-server-pid>
+
+# Phase A sunset audit (5 cold loads × 3 cold prefills × 2 paths)
+RUSTC_WRAPPER= cargo build --release --bin hf2q
+bash /opt/hf2q/scripts/sunset-w5b18-qkv-split-legacy.sh
+
+# Phase B bench (only meaningful if the W-5b.20 fused-encoder wire-up
+# is in place; the W-5b.19 standalone-encoder wire-up was reverted)
+bash /opt/hf2q/scripts/bench-w5b19-repeat-tiled.sh
+
+# Cleanup
+kill -CONT <mcp-brain-server-pid>
+```
+
+### Sunset plan for HF2Q_GQA_EXPAND_LEGACY
+
+N/A — the env gate was implemented and removed in this iter (the wire-up that introduced it was reverted before commit). When W-5b.20 re-attempts the fused-encoder approach, the `HF2Q_GQA_EXPAND_LEGACY` gate should be re-introduced (mirror the W-5b.10/14/18 cadence) and a 30-run sunset audit should run ahead of the gate-removal iter.
+
+### AC-tier impact
+
+NONE (perf-bar AC 5468 / 5470 informational at full `[x]`). Phase A is a pure cleanup landing (gate-removal + test/bucket pruning); Phase B was correctness-clean but did not move the wall by enough to satisfy the closure rule and was reverted per protocol.
+
+Wave 5b.19: **Phase A LANDED — `HF2Q_QKV_SPLIT_LEGACY` removed (30/30 PASS at PP4106; -50 LOC legacy CPU + -170 LOC parity test + -41 LOC SectionKind/print-loop); Phase B REVERTED — kernel correct (7/7 mlx-native + 1/1 hf2q parity) but dispatch-overhead-bound (2.18× drop at standalone-encoder; closure rule needs ≥10× → requires fused-encoder pattern in W-5b.20).**
