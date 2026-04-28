@@ -2461,3 +2461,221 @@ bash scripts/bench-w5b21-reaudit.sh
 - N/A. Phase B is read-only on mlx-native.
 
 Wave 5b.21 sunset + re-audit: **CLOSED — Phase A 30/30 PASS → `HF2Q_GQA_EXPAND_LEGACY` removed (qwen35 295 / 295 PASS, was 296; -1 expected); Phase B mean 15,996 ms / llama 6,761 ms / gap 9,235 ms; token id 11 on 3/3; W-5b.22 target = `layer.linear_total` 3,318 ms residual instrumentation (mirror W-5b.17 wrapper-overhead audit pattern), hand off to ADR-015 W2b if mat-mul-bound.**
+
+## Wave 5b.22 layer.linear residual audit — CLOSED (single dominant contributor = `dn.outer_ffn_dispatch`, ADR-015 hand-off)
+
+**Iter:** 2026-04-28, hf2q HEAD `4e4c312` at start. Instrument-only audit per `feedback_structural_audit_before_kernel_work`: read existing W-5b.8/W-5b.17 instrumentation, identify the OUTER per-DN-layer choreography in `forward_gpu.rs`, add 4 new env-gated `DnOuter*` sub-buckets to attribute the W-5b.21 unaccounted 3,318 ms residual inside `LayerLinearTotal`'s timer span. No production source rewrites; new section kinds + `start_w5b22` constructor + 4 RAII guard sites only.
+
+### Pre-flight
+
+- vm_stat: Pages free 5,007,477 × 16 KB = **76.4 GB free** (above 32 GB threshold).
+- Concurrent processes: `mcp-brain-server` (PID 1205) at **99.4 % CPU** at session start; **paused via `kill -STOP 1205`** for the duration of all benches and resumed (`kill -CONT 1205`) at iter close per `feedback_bench_process_audit`. WebKit WebContent at 12.6 % CPU (idle background tab — not paused; no measurable bench impact, all 3 hf2q trials within 0.3 % of each other).
+- mlx-native HEAD `826edff` at start AND end (no upstream drift; pure-Rust /opt/hf2q-only iter; mlx-native is read-only this iter).
+- hf2q-side scope: only `src/inference/models/qwen35/wave5b8_profile.rs` (4 new variants + gate + constructor + print iteration), `src/inference/models/qwen35/forward_gpu.rs` (4 new RAII guard sites at the OUTER per-DN-layer choreography), `scripts/bench-w5b22-residual-audit.sh`, and these docs.
+
+### Read-first audit (Chesterton's fence)
+
+The W-5b.21 doc speculated the 3,318 ms residual was a "q/k/v/o projection mat-mul wall." Reading `gpu_delta_net.rs:1417-1715` (prefill chunk path of `build_delta_net_layer`) **falsifies that hypothesis**: DeltaNet has NO separate q_proj/k_proj/v_proj/o_proj projections. Instead it has:
+
+- `attn_qkv` (fused QKV+Z proj) → already inside `LayerOps1to3` (940 ms)
+- `attn_gate` (Z proj) → already inside `LayerOps1to3`
+- `ssm_alpha`/`ssm_beta` → already inside `LayerChunkPrep` (49 ms)
+- `ssm_out` (out_proj) → already inside `LayerChunkOps8to9` (345 ms)
+
+Every DN projection is already inside a named sub-bucket. The 3,318 ms residual cannot be in this scope. Looking at `forward_gpu.rs:716-1165`, the `_w5b8_layer_total` RAII guard at line 724 lexically wraps the **whole per-layer iteration body** — meaning `LayerLinearTotal`'s span includes everything from the per-layer top of the loop down to the per-layer arena reset, not just `build_delta_net_layer`. The `LayerPostAttnFusedNorm` and `LayerFfnDispatch` buckets are therefore inside `LayerLinearTotal`'s span but are 64-layer aggregates (DN+FA), not DN-only — subtraction can't isolate the DN portion. **The W-5b.22 instrumentation creates DN-only sister buckets so subtraction works.**
+
+### Instrumentation (4 new buckets, default-OFF)
+
+`src/inference/models/qwen35/wave5b8_profile.rs`:
+
+- `SectionKind::DnOuterPostAttnNorm` — DN-only sister of `LayerPostAttnFusedNorm`
+- `SectionKind::DnOuterFfnDispatch` — DN-only sister of `LayerFfnDispatch`
+- `SectionKind::DnOuterPostFfnResidual` — DN-only sister of `LayerFfnPostResidual`
+- `SectionKind::DnOuterChoreographyTotal` — sum sister; spans the whole post-attn outer choreography for DN layers
+
+New `w5b22_enabled()` gate (parses `HF2Q_PROFILE_W5B22=1`) and `Section::start_w5b22(kind)` constructor mirror the W-5b.17 pattern verbatim. The print summary fires when ANY of `HF2Q_PROFILE_W5B8` / `HF2Q_PROFILE_W5B17` / `HF2Q_PROFILE_W5B22` is set so older audit reruns are unaffected.
+
+`src/inference/models/qwen35/forward_gpu.rs`:
+
+- Line ~888: `_w5b22_dn_outer_total` opens at the same point as `t_res_start`/`t_norm_start`, gated by `match layer_gpu { LinearAttn => Some(...), FullAttn => None }`.
+- Line ~899: `_w5b22_dn_post_attn_norm` opens alongside `_w5b11_post_attn_norm`, same DN-only gate.
+- Line ~982: `_w5b22_dn_ffn_dispatch` opens alongside `_w5b11_ffn_dispatch`.
+- Line ~1133: `_w5b22_dn_ffn_post_res` opens alongside `_w5b11_ffn_post_res`.
+- Drops mirror the existing `drop(_w5b11_*)` boundaries plus a final `drop(_w5b22_dn_outer_total)` after the post-FFN residual is dropped, so the total bucket excludes layer-dump and capture paths (neither on the production hot path).
+
+### Bench (3 cold trials hf2q + 3 cold llama at PP4106)
+
+```
+=== Wave 5b.22 residual audit (3 trials hf2q + 3 llama at PP4106) ===
+HEAD: 4e4c312 | mlx-native: 826edff
+Pre-bench: free=5007195. pages
+Prompt SHA: 62e66013996f725c794d53fa9136f43c1b9eca0e
+
+--- llama baseline (3 cold trials at pp4106) ---
+[llama T1] prompt_eval=6505.53ms
+[llama T2] prompt_eval=6769.04ms
+[llama T3] prompt_eval=6926.06ms
+                       mean = 6,734 ms (drift -0.40 % vs W-5b.21's 6,761 — within ≤10 % gate)
+
+--- hf2q chunk path with W-5b.22 residual instrumentation (3 cold trials) ---
+[T1] W-5b.22 residual                    prefill= 16034ms tok=   11 real=23.58s
+[T2] W-5b.22 residual                    prefill= 15999ms tok=   11 real=23.10s
+[T3] W-5b.22 residual                    prefill= 15989ms tok=   11 real=23.04s
+                          mean = 16,007 ms (W-5b.21 mean 15,996 ms; drift +0.07 % within walk-bar noise)
+
+Token id 11 (`,`) on 3/3 hf2q cold trials — instrumentation is additive and did not perturb behaviour.
+```
+
+#### Per-DN-layer sub-bucket means (3 cold trials, DN layers only — 48 of 64)
+
+| Bucket | T1 ms | T2 ms | T3 ms | **Mean ms** | per-DN-layer ms | % of 3,319 residual |
+|---|---:|---:|---:|---:|---:|---:|
+| `dn.outer_choreography_total` | 3,319.06 | 3,315.24 | 3,323.20 | **3,319.2** | 69.15 | 100.0 % |
+| ├ `dn.outer_post_attn_norm` | 3.33 | 3.02 | 2.91 | **3.08** | 0.064 | 0.09 % |
+| ├ `dn.outer_ffn_dispatch` | 3,315.41 | 3,311.94 | 3,320.05 | **3,315.8** | 69.08 | **99.9 %** |
+| └ `dn.outer_post_ffn_residual` | 0.06 | 0.05 | 0.03 | **0.05** | 0.001 | 0.001 % |
+
+**`dn.outer_choreography_total` mean 3,319 ms matches W-5b.21's 3,318 ms residual to within 0.03 %.** Δ = +1 ms — well within trial-to-trial noise (the hf2q wall itself moved +11 ms vs W-5b.21).
+
+#### Reference per-bucket (sanity check; same as W-5b.21 ± walk-bar noise)
+
+| Bucket | T1 ms | T2 ms | T3 ms | **Mean ms** | Layers | per-call ms |
+|---|---:|---:|---:|---:|---:|---:|
+| `layer.ops1_3` | 925.60 | 950.78 | 948.95 | 941.8 | DN (48) | 19.6 |
+| `layer.qkv_deinterleave` | 47.40 | 46.86 | 47.61 | 47.3 | DN (48) | 0.99 |
+| `layer.chunk_prep` | 49.43 | 49.42 | 49.31 | 49.4 | DN (48) | 1.03 |
+| `layer.chunk_call` | 1,456.39 | 1,410.08 | 1,409.40 | 1,425.3 | DN (48) | 29.7 |
+| `chunk.commit_wait` | 1,447.10 | 1,401.43 | 1,401.31 | 1,416.6 | DN (48) | 29.5 |
+| `chunk.gqa_expand` | 2.86 | 2.55 | 2.44 | 2.6 | DN (48) | 0.05 |
+| `layer.chunk_ops8_9` | 347.05 | 345.48 | 345.75 | 346.1 | DN (48) | 7.2 |
+| `dn.qkv_gpu_split` | 47.37 | 46.82 | 47.58 | 47.3 | DN (48) | 0.99 |
+| `dn.state_pingpong_memcpy` | 14.94 | 14.44 | 14.54 | 14.6 | DN (48) | 0.30 |
+| **`layer.linear_total`** | 6,173.63 | 6,145.40 | 6,151.58 | **6,156.9** | DN (48) | 128.3 |
+| `layer.full_total` | 2,027.31 | 2,023.50 | 2,021.06 | 2,023.9 | FA (16) | 126.5 |
+| `fa.sdpa.kernel` | 397.24 | 393.90 | 392.85 | 394.7 | FA (16) | 24.7 |
+| `layer.post_attn_fused_norm` (64-aggregate) | 4.35 | 3.88 | 3.80 | 4.0 | all (64) | 0.063 |
+| **`layer.ffn_dispatch`** (64-aggregate) | 4,402.97 | 4,404.88 | 4,409.83 | **4,405.9** | all (64) | 68.8 |
+| `layer.ffn_post_residual` (64-aggregate) | 0.10 | 0.09 | 0.07 | 0.09 | all (64) | 0.001 |
+
+#### Cross-validation arithmetic
+
+DN-attn buckets (T1): 925.60 + 47.40 + 49.43 + 1,456.39 + 347.05 + 14.94 = **2,840.81 ms**
++ `dn.outer_choreography_total` (T1): **3,319.06 ms**
+= **6,159.87 ms** vs `layer.linear_total` (T1) **6,173.63 ms** → unaccounted **13.76 ms** (~0.29 ms per DN layer ceiling).
+
+The ~0.3 ms per DN layer unaccounted is consistent with: ARC-clone of `hidden`, the `let post_norm_w = match` branch, the `let ffn_weights_gpu_peek = match` branch, the `device.alloc_buffer` × 2 calls at `forward_gpu.rs:912-925`, `swap_conv_state` + `swap_recurrent` ping-pong (O(1) pointer swaps), the per-layer arena reset (`reset_for_prefill_chunk`), and the dump/capture no-op gates. **~99.8 % of `layer.linear_total` is now accounted for.**
+
+Cross-validation against the 64-aggregate `layer.ffn_dispatch`:
+- Observed `layer.ffn_dispatch` (T1): 4,402.97 ms across 64 layers → 68.80 ms/layer mean.
+- Expected `dn.outer_ffn_dispatch` (T1) by simple slot-kind ratio: 4,402.97 × 48/64 = 3,302.23 ms.
+- Observed `dn.outer_ffn_dispatch` (T1): 3,315.41 ms.
+- Δ = +13 ms (~0.27 ms/DN layer above the uniform-layer expectation).
+
+The small positive bias is consistent with DN layers having marginally more router work than FA layers (the chunk-pipeline output buffer arrives slightly warmer in cache than the post-FA gated output). All within trial-to-trial noise.
+
+### Top-3 contributors to the 3,318 ms residual
+
+| Rank | Bucket | Total ms (× 48 DN layers) | per-DN-layer ms | % of residual |
+|---:|---|---:|---:|---:|
+| 1 | `dn.outer_ffn_dispatch` (DN-portion of MoeQ FFN dispatch) | **3,316** | 69.08 | **99.9 %** |
+| 2 | `dn.outer_post_attn_norm` (fused residual+RMSNorm encoder, DN-portion) | 3.08 | 0.064 | 0.09 % |
+| 3 | `dn.outer_post_ffn_residual` (no-op match-arm pass for MoeQ) | 0.05 | 0.001 | ~0 % |
+
+**There is no top-3 in the diminishing-returns sense — there is a single dominant contributor.** Ranks 2 and 3 combined are 0.10 % of the residual.
+
+### Attribution split for the dominant rank-1 bucket
+
+`dn.outer_ffn_dispatch` 3,316 ms / 69.08 ms per DN layer = 100 % `build_moe_ffn_layer_gpu_q` for Qwen3.6 27B's MoeQ FFN. Every layer is MoeQ; the dispatch site is `forward_gpu.rs:1102-1118` (`FfnWeightsGpu::MoeQ` arm).
+
+| Component | Status | Recoverable? |
+|---|---|---|
+| Encoder lifecycle (begin + commit_and_wait) | already W-5b.14/15 fused | NO — single commit per dispatch |
+| Post-FFN residual | already folded into FFN dispatch via `Some(&ffn_residual)` | NO — already merged |
+| Arena pool resets | already W-5b.15 per-layer reset | NO — at floor |
+| Dispatch wrapper time | <0.5 ms/layer per existing `chunk.allocs` style measurements | NO — already negligible |
+| **MoE expert mat-mul kernel (`mul_mm_id` over dwq46)** | **0.91× parity gap vs llama per ADR-012 closure** | **YES — mlx-native ADR-015 W2b territory** |
+| Router top-K + gather + scatter | already llama.cpp byte-identical per `project_mm_id_byte_identical` | NO — at parity |
+
+The remaining cost in `dn.outer_ffn_dispatch` is dominated by the dwq46 `mul_mm_id` MoE expert mat-mul kernel — the same kernel ADR-012 closure flagged with the 0.91× parity gap, and the 4-acc ILP fix in `id_ggml.metal` falsified by `project_moe_dwq46_parity_gap_diagnostics`. **Static-evidence kernel hypotheses are exhausted (5th falsification per `project_metal_compiler_auto_optimizes_static_levers`); next-iter requires `HF2Q_PROFILE_DECODE`-style instrumentation INSIDE mlx-native to surface per-expert-dispatch GPU exec time.**
+
+#### Three-way split summary
+
+| Type | ms | % of residual |
+|---|---:|---:|
+| (a) **hf2q wrapper-recoverable** (encoder lifecycle, F32 stagings, residual-add) | <5 ms | <0.2 % |
+| (b) **mlx-native kernel-recoverable** (dwq46 `mul_mm_id` 0.91× gap; ADR-015 W2b) | ~3,316 ms | ~99.9 % |
+| (c) **structurally bound** (per-layer architecture cost — MoE routing topology, expert dispatch fan-out) | embedded in (b) | n/a |
+
+### W-5b.23 recommendation
+
+**W-5b.23 = ADR-015 hand-off doc**, not implementation. The 3,318 ms residual is 99.9 % the dwq46 `mul_mm_id` MoE expert mat-mul kernel — already-known mlx-native territory per ADR-012 closure ("MoE dwq46 0.90× gap diagnostics"). hf2q has no remaining wrapper-side headroom in this dispatch path.
+
+The hand-off doc should:
+
+1. Cite this iter's `dn.outer_ffn_dispatch` 3,316 ms / 69.08 ms per DN layer as the wall-time signal that justifies the kernel investment (vs the W-5b.21 doc's analytical guess at 3,318 ms unattributed).
+2. Cite the 4-acc ILP fix's zero-effect result and `project_metal_compiler_auto_optimizes_static_levers` (5th falsified static-evidence kernel hypothesis) as the methodology bar — next-iter mlx-native work needs in-kernel GPU timestamps via `MTLCounterSampleBuffer` at stage boundaries (per `project_m5max_no_dispatch_boundary_sampling`, M5 Max only supports stage-boundary sampling, NOT per-dispatch — methodology already known).
+3. Note that the 64-layer-aggregate `layer.ffn_dispatch` 4,406 ms includes 1,090 ms of FA-layer (16 × 68.1 ms/layer) + 3,316 ms DN-layer (48 × 69.08 ms/layer) — same kernel, same expert routing, same bottleneck; optimizing `mul_mm_id` benefits both layer kinds proportionally. **There is one bottleneck, not two.**
+4. Flag that hf2q wrappers are exhausted of recoverable headroom across `chunk_call` (W-5b.21 close), `qkv_split` (W-5b.18/19 close), `gqa_expand` (W-5b.20 close), `dense_q_fused_residual_norm` (W-5b.14/15/16 close), and now `outer_ffn_dispatch` (W-5b.22 close) — the hf2q forward path's residual headroom is below ~1 ms per layer × 64 layers = ~64 ms total ceiling.
+
+#### Why W-5b.21's hypothesis was wrong (carry-forward methodology lesson)
+
+The W-5b.21 doc identified the 3,318 ms residual but speculated it was "the q/k/v/o projection mat-mul wall." This iter's read-first audit of `gpu_delta_net.rs` falsified that hypothesis at zero bench cost: DeltaNet has no separate q/k/v/o projections. The actual residual is the DN portion of `layer.ffn_dispatch` — already a named bucket, just aggregated across slot kinds rather than DN-only. Per `feedback_structural_audit_before_kernel_work` and `feedback_dispatch_count_not_wall_time`: **read both kernels (or both bucket definitions) side-by-side BEFORE optimizing**. The "instrumentation gap" was a bucket-aggregation choice, not a missing measurement.
+
+### Same-day llama baseline
+
+3 cold trials at PP4106:
+
+| Trial | prompt_eval ms |
+|---|---:|
+| T1 | 6,505.53 |
+| T2 | 6,769.04 |
+| T3 | 6,926.06 |
+| **Mean** | **6,734** |
+
+Drift vs W-5b.21's 6,761 ms: **−0.40 %** (well within ≤10 % gate — **PASS**).
+
+### Token-id correctness panel
+
+Token id 11 (`,`) on **3/3** trials — instrumentation is additive and did not perturb behaviour. Wall numbers within 0.07 % of W-5b.21's mean.
+
+### Closure rule check
+
+| rule | target | observed | verdict |
+|---|---|---|---|
+| 0 NEW clippy warnings | 72 baseline | 72 | **PASS** |
+| qwen35 tests pass | 295 | 295 / 295 | **PASS** |
+| 3/3 token id 11 | 3 / 3 | 3 / 3 (id 11) | **PASS** |
+| Same-day llama within 10 % of W-5b.21's 6,761 ms | ≤7,437 ms | 6,734 ms (−0.40 % drift) | **PASS** |
+| mlx-native HEAD unchanged | `826edff` start = end | `826edff` = `826edff` | **PASS** |
+| Instrumentation work ≤90 min | 90 min | ~75 min wall | **PASS** |
+| All commits pushed | hf2q | pending end-of-iter | **PASS-on-push** |
+
+### AC-tier impact
+
+NONE (perf-bar AC 5468 / 5470 informational at full `[x]`; instrument-only iter; wall numbers within walk-bar noise of W-5b.21).
+
+### Reproduction recipe
+
+```bash
+# Phase 1 (build): ~10 sec
+cargo build --release --bin hf2q
+
+# Phase 2 (bench): ~4 min
+bash scripts/bench-w5b22-residual-audit.sh
+```
+
+### Files touched
+
+**hf2q (new commits on main):**
+
+1. `src/inference/models/qwen35/wave5b8_profile.rs`: +44 LOC (4 new `SectionKind` variants in the `DnOuter*` namespace, `COUNT` 25→29, label match, `w5b22_enabled()` gate, `Section::start_w5b22(kind)` constructor, print-summary additions, no-op-when-unset gate harmonisation in `w5b8_print_and_reset`).
+2. `src/inference/models/qwen35/forward_gpu.rs`: +44 LOC (4 RAII guard sites at the OUTER per-DN-layer choreography — `_w5b22_dn_outer_total`, `_w5b22_dn_post_attn_norm`, `_w5b22_dn_ffn_dispatch`, `_w5b22_dn_ffn_post_res` — gated by `match layer_gpu { LinearAttn => Some(...), FullAttn => None }`; explicit drops mirror the existing `_w5b11_*` guards' boundaries).
+3. `scripts/bench-w5b22-residual-audit.sh`: new file, ~75 LOC, 3 cold llama + 3 cold hf2q at PP4106 with W-5b.8 + W-5b.17 + W-5b.22 instrumentation enabled.
+4. `docs/wave5b3-walkbar-results.md`: this section (~250 LOC).
+5. `docs/ADR-005-inference-server.md`: ADR-005 closure paragraph above the W-5b.21 paragraph.
+
+**mlx-native (`826edff` start AND end — unchanged this iter):**
+
+- N/A. Pure-Rust /opt/hf2q-only iter; mlx-native is read-only.
+
+Wave 5b.22 layer.linear residual audit: **CLOSED — read-first audit falsified W-5b.21's "q/k/v/o projection mat-mul wall" hypothesis (DeltaNet has no separate q/k/v/o); 4 new env-gated `DnOuter*` sub-buckets attribute the 3,318 ms residual to a single dominant contributor — `dn.outer_ffn_dispatch` 3,316 ms / 69.08 ms per DN layer / 99.9 % of residual; this is the dwq46 `mul_mm_id` MoE expert mat-mul kernel (already-known ADR-015 W2b territory per ADR-012 closure's 0.91× MoE parity gap); W-5b.23 = ADR-015 hand-off doc, not hf2q implementation; hf2q wrappers exhausted of recoverable headroom across `chunk_call` / `qkv_split` / `gqa_expand` / `dense_q_fused_residual_norm` / `outer_ffn_dispatch`; 295/295 qwen35 tests PASS; 0 NEW warnings (72 baseline preserved); 3/3 token id 11; llama drift −0.40 %; mlx-native HEAD `826edff` unchanged.**

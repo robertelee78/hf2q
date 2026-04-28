@@ -883,6 +883,22 @@ impl Qwen35Model {
             //   cur = ggml_add(cur, ffn_residual); // FFN residual is pre-norm
             let t_res_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
             let t_norm_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+            // Wave 5b.22: DN-only outer-choreography total guard. Spans the
+            // post-attn-norm + FFN-dispatch + post-FFN-residual block for
+            // LinearAttn layers ONLY (48 of 64 in Qwen3.6 27B). Sums to the
+            // `layer.linear_total` − DN-attn-buckets residual the W-5b.21
+            // post-mortem flagged as 3,318 ms unattributed. Default-off via
+            // separate `HF2Q_PROFILE_W5B22=1` gate; binary-identical when
+            // unset (the Section::start_w5b22 RAII guard skips Instant::now
+            // on the disabled path).
+            let _w5b22_dn_outer_total = match layer_gpu {
+                LayerWeightsGpu::LinearAttn { .. } => Some(
+                    super::wave5b8_profile::Section::start_w5b22(
+                        super::wave5b8_profile::SectionKind::DnOuterChoreographyTotal,
+                    ),
+                ),
+                LayerWeightsGpu::FullAttn { .. } => None,
+            };
             // Wave 5b.11: fused residual+norm encoder bucket. Counts both
             // linear-attn and full-attn layers; the W-5b.8 measurement
             // showed `layer.linear_total` had ~203 ms/layer unprofiled
@@ -891,6 +907,17 @@ impl Qwen35Model {
             let _w5b11_post_attn_norm = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::LayerPostAttnFusedNorm,
             );
+            // Wave 5b.22: DN-only sister of `LayerPostAttnFusedNorm` so the
+            // 64-layer aggregate can be subtracted into per-slot-kind
+            // contributions for the residual attribution.
+            let _w5b22_dn_post_attn_norm = match layer_gpu {
+                LayerWeightsGpu::LinearAttn { .. } => Some(
+                    super::wave5b8_profile::Section::start_w5b22(
+                        super::wave5b8_profile::SectionKind::DnOuterPostAttnNorm,
+                    ),
+                ),
+                LayerWeightsGpu::FullAttn { .. } => None,
+            };
             let post_norm_w = match layer_gpu {
                 LayerWeightsGpu::FullAttn { attn, .. } => &attn.post_attn_norm,
                 LayerWeightsGpu::LinearAttn { attn, .. } => &attn.post_attn_norm,
@@ -965,6 +992,9 @@ impl Qwen35Model {
             // Drop fused-norm bucket guard before FFN bucket starts so the
             // two sub-buckets are disjoint.
             drop(_w5b11_post_attn_norm);
+            // Wave 5b.22: drop DN sister at the same boundary so its span
+            // exactly mirrors the 64-layer-aggregate sister's.
+            drop(_w5b22_dn_post_attn_norm);
 
             // --- FFN (takes normed ffn_input, not the pre-norm residual) ---
             let t_ffn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
@@ -974,6 +1004,17 @@ impl Qwen35Model {
             let _w5b11_ffn_dispatch = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::LayerFfnDispatch,
             );
+            // Wave 5b.22: DN-only sister of `LayerFfnDispatch` to isolate
+            // the linear-attn-layer FFN dispatch portion from the
+            // 64-layer-aggregate bucket.
+            let _w5b22_dn_ffn_dispatch = match layer_gpu {
+                LayerWeightsGpu::LinearAttn { .. } => Some(
+                    super::wave5b8_profile::Section::start_w5b22(
+                        super::wave5b8_profile::SectionKind::DnOuterFfnDispatch,
+                    ),
+                ),
+                LayerWeightsGpu::FullAttn { .. } => None,
+            };
             let ffn_weights_gpu = ffn_weights_gpu_peek;
             let ffn_out = match ffn_weights_gpu {
                 FfnWeightsGpu::Dense(w) => {
@@ -1065,6 +1106,8 @@ impl Qwen35Model {
             if let Some(t) = t_ffn_start { total_ffn_us += t.elapsed().as_micros() as u64; }
             // Drop FFN-dispatch bucket guard before post-residual bucket.
             drop(_w5b11_ffn_dispatch);
+            // Wave 5b.22: drop DN sister at the same boundary.
+            drop(_w5b22_dn_ffn_dispatch);
 
             // --- Residual after FFN ---
             // For MoeQ / DenseQ / Dense: residual is already folded into the FFN output.
@@ -1077,6 +1120,18 @@ impl Qwen35Model {
             let _w5b11_ffn_post_res = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::LayerFfnPostResidual,
             );
+            // Wave 5b.22: DN-only sister of `LayerFfnPostResidual`. For
+            // Qwen3.6 27B's MoeQ FFN this is a no-op (~ns) match-arm pass
+            // — included for completeness so the residual subtraction has
+            // zero unaccounted terms.
+            let _w5b22_dn_ffn_post_res = match layer_gpu {
+                LayerWeightsGpu::LinearAttn { .. } => Some(
+                    super::wave5b8_profile::Section::start_w5b22(
+                        super::wave5b8_profile::SectionKind::DnOuterPostFfnResidual,
+                    ),
+                ),
+                LayerWeightsGpu::FullAttn { .. } => None,
+            };
             // Keep a clone for the optional layer dump below; only paid when dump is active.
             let ffn_out_for_dump = if dump_layer_n().is_some() { Some(ffn_out.clone()) } else { None };
             hidden = match ffn_weights_gpu {
@@ -1095,6 +1150,11 @@ impl Qwen35Model {
             // path under the W-5b.11 bench (capture target unbound, dump
             // env unset).
             drop(_w5b11_ffn_post_res);
+            // Wave 5b.22: drop DN sister + DN outer-total guards at the
+            // same boundary so the totals exclude layer dump / capture
+            // paths (neither on the production hot path).
+            drop(_w5b22_dn_ffn_post_res);
+            drop(_w5b22_dn_outer_total);
 
             // ADR-012 P9b GPU capture path: download residual leaving this
             // layer to CPU F32 if a capture target is bound. Pairs with the

@@ -177,6 +177,54 @@ pub enum SectionKind {
     /// `HF2Q_QKV_SPLIT_LEGACY=1` env gate were removed after a 30/30
     /// parity audit at PP4106).
     DnQkvGpuSplit,
+    // -- Wave 5b.22 OUTER-per-DN-layer-choreography sub-buckets (additive;
+    // gated on a SEPARATE `HF2Q_PROFILE_W5B22=1` env so default-off is
+    // preserved even when `HF2Q_PROFILE_W5B8=1` and/or
+    // `HF2Q_PROFILE_W5B17=1` are set). --
+    //
+    // Mission: attribute the W-5b.21 `layer.linear_total` 3,318 ms residual
+    // (= 6,134 ms LayerLinearTotal − 2,816 ms named DN-attn sub-buckets).
+    // The `_w5b8_layer_total` guard at `forward_gpu.rs:724-731` lexically
+    // wraps the WHOLE per-layer iteration body (lines 724-1165): so the
+    // residual ms include `LayerPostAttnFusedNorm` + `LayerFfnDispatch` +
+    // `LayerFfnPostResidual` even though those have their own buckets —
+    // those existing buckets are 64-layer aggregates (DN+FA), not DN-only,
+    // so subtraction can't isolate the DN portion.
+    //
+    // Pre-implementation read-first per `feedback_structural_audit_before_kernel_work`:
+    // The W-5b.21 doc speculated the residual is a "q/k/v/o projection
+    // mat-mul wall," but reading `build_delta_net_layer`
+    // (`gpu_delta_net.rs:1417-1715` prefill chunk path) shows DeltaNet has
+    // NO separate q_proj/k_proj/v_proj/o_proj — instead it has:
+    //   - `attn_qkv` (fused QKV+Z) inside `LayerOps1to3` already
+    //   - `attn_gate` (Z proj) inside `LayerOps1to3` already
+    //   - `ssm_alpha`/`ssm_beta` inside `LayerChunkPrep` already
+    //   - `ssm_out` (out_proj) inside `LayerChunkOps8to9` already
+    // Every DN projection is already inside a named sub-bucket. So the
+    // 3,318 ms residual is NOT inside `build_delta_net_layer` — it's the
+    // post-attn outer choreography. The buckets below partition that.
+    //
+    /// DN-only sister of `LayerPostAttnFusedNorm`. Same encoder, same
+    /// timer span, but only fires for `LinearAttn` layer slots (48 of 64
+    /// in Qwen3.6 27B). Lets us isolate the DN-layer portion of the
+    /// 64-layer-aggregate `LayerPostAttnFusedNorm` bucket so the
+    /// `LayerLinearTotal` residual subtraction is clean.
+    DnOuterPostAttnNorm,
+    /// DN-only sister of `LayerFfnDispatch`. Same dispatch, same timer
+    /// span, but only fires for `LinearAttn` layer slots. The
+    /// 64-layer-aggregate `LayerFfnDispatch` was 4,389 ms in W-5b.21;
+    /// the DN portion is 48/64 of that ≈ 3,292 ms by simple arithmetic
+    /// — this bucket measures it directly so the attribution is exact.
+    DnOuterFfnDispatch,
+    /// DN-only sister of `LayerFfnPostResidual`. For Qwen3.6 27B's
+    /// MoeQ FFN this is a no-op match-arm pass (~ns); included for
+    /// completeness so the residual subtraction has zero unaccounted
+    /// terms.
+    DnOuterPostFfnResidual,
+    /// Sum of `DnOuter*` sub-buckets (post-attn outer choreography for
+    /// DN layers). Should land within rounding-error of the
+    /// `LayerLinearTotal` − DN-attn-buckets residual.
+    DnOuterChoreographyTotal,
 }
 
 impl SectionKind {
@@ -210,9 +258,13 @@ impl SectionKind {
             SectionKind::LayerFfnPostResidual => "layer.ffn_post_residual",
             SectionKind::DnStatePingpongMemcpy => "dn.state_pingpong_memcpy",
             SectionKind::DnQkvGpuSplit => "dn.qkv_gpu_split",
+            SectionKind::DnOuterPostAttnNorm => "dn.outer_post_attn_norm",
+            SectionKind::DnOuterFfnDispatch => "dn.outer_ffn_dispatch",
+            SectionKind::DnOuterPostFfnResidual => "dn.outer_post_ffn_residual",
+            SectionKind::DnOuterChoreographyTotal => "dn.outer_choreography_total",
         }
     }
-    const COUNT: usize = 25;
+    const COUNT: usize = 29;
 }
 
 #[derive(Default, Clone)]
@@ -296,6 +348,16 @@ pub fn w5b17_enabled() -> bool {
     std::env::var("HF2Q_PROFILE_W5B17").is_ok()
 }
 
+/// True when `HF2Q_PROFILE_W5B22=1` is set in the environment.
+///
+/// Separate gate from W-5b.8/W-5b.17 so the four `DnOuter*` sub-buckets
+/// (audit of the `LayerLinearTotal` 3,318 ms residual via DN-only
+/// outer-choreography sisters) only fire during W-5b.22 audits.
+#[inline]
+pub fn w5b22_enabled() -> bool {
+    std::env::var("HF2Q_PROFILE_W5B22").is_ok()
+}
+
 /// RAII guard. `Section::start(kind)` records the elapsed wall-clock
 /// into the thread-local accumulator on drop; no-ops when the env gate
 /// is off (the constructor still allocates an Instant, but that's a
@@ -317,6 +379,14 @@ impl Section {
         let t0 = if w5b17_enabled() { Some(Instant::now()) } else { None };
         Self { kind, t0 }
     }
+
+    /// Variant gated on `HF2Q_PROFILE_W5B22=1`. Use for the four W-5b.22
+    /// `DnOuter*` sub-buckets so they default off independently of
+    /// W-5b.8 and W-5b.17.
+    pub fn start_w5b22(kind: SectionKind) -> Self {
+        let t0 = if w5b22_enabled() { Some(Instant::now()) } else { None };
+        Self { kind, t0 }
+    }
 }
 
 impl Drop for Section {
@@ -334,7 +404,7 @@ impl Drop for Section {
 /// w5b17_enabled()` so W-5b.17 audits surface their sub-buckets even
 /// when W-5b.8 is off.
 pub fn w5b8_print_and_reset(label: &str) {
-    if !w5b8_enabled() && !w5b17_enabled() {
+    if !w5b8_enabled() && !w5b17_enabled() && !w5b22_enabled() {
         return;
     }
     W5B8.with(|cell| {
@@ -377,6 +447,11 @@ pub fn w5b8_print_and_reset(label: &str) {
             SectionKind::DnStatePingpongMemcpy,
             // Wave 5b.18 GPU-side QKV split (the only path post-W-5b.19):
             SectionKind::DnQkvGpuSplit,
+            // Wave 5b.22 outer-per-DN-layer-choreography sub-buckets:
+            SectionKind::DnOuterPostAttnNorm,
+            SectionKind::DnOuterFfnDispatch,
+            SectionKind::DnOuterPostFfnResidual,
+            SectionKind::DnOuterChoreographyTotal,
         ];
         for k in kinds {
             let acc = &state.accs[k.idx()];
