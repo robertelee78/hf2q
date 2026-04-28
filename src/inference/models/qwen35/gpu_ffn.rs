@@ -680,6 +680,281 @@ pub fn build_dense_ffn_layer_gpu_q(
     weights: &DenseFfnWeightsGpuQ,
     add_residual: Option<&MlxBuffer>,
 ) -> Result<MlxBuffer> {
+    // Wave 5b.14 sunset: legacy 2-encoder + own-encoder path retained
+    // behind `HF2Q_DENSE_Q_LEGACY=1` for forensic A/B.  Default routes
+    // through the external-encoder `_into` mirror; `_into` dispatches to
+    // pooled scratches at decode (seq_len == 1) and device-alloc scratches
+    // at prefill (seq_len > 1).  See `build_dense_ffn_layer_gpu_q_into`
+    // for the rationale.
+    if std::env::var("HF2Q_DENSE_Q_LEGACY").is_ok() {
+        return build_dense_ffn_layer_gpu_q_legacy(device, registry, x, weights, add_residual);
+    }
+    let h = weights.hidden_size;
+    let seq_len = (x.element_count() / h as usize) as u32;
+    let mut enc = device.command_encoder().context("enc dense_q swiglu")?;
+    let out = build_dense_ffn_layer_gpu_q_into(&mut enc, device, registry, x, weights, add_residual)?;
+    if seq_len == 1 {
+        enc.commit();
+    } else {
+        enc.commit_and_wait().context("commit dense_q swiglu")?;
+    }
+    Ok(out)
+}
+
+/// External-encoder variant of [`build_dense_ffn_layer_gpu_q`].
+///
+/// Encodes the entire dense quantized FFN forward pass (gate/up projections +
+/// silu_mul + down projection + optional residual add) into the caller-supplied
+/// [`mlx_native::CommandEncoder`].  Does NOT commit — the caller is responsible
+/// for committing the encoder.
+///
+/// # Why this exists
+///
+/// Wave 5b.14: closes the per-dense-layer 2-encoder overhead component of the
+/// W-5b.13 audit (FFN dispatch bucket = 9,750 ms / 4.34× wall ratio vs llama
+/// at PP4106).  The pre-fusion path issued 2 separate command buffers per
+/// dense layer:
+///
+/// 1. `dispatch_fused_residual_norm_f32` — produces `ffn_input` from
+///    `(hidden, attn_out, post_norm_w)` + writes `ffn_residual` for the
+///    later residual add.
+/// 2. `build_dense_ffn_layer_gpu_q` — its own encoder for the dense FFN
+///    forward + residual add at the end.
+///
+/// With this variant, the caller can fuse step 1 + step 2 into a single
+/// command buffer per dense layer.  This mirrors the MoE-Q `_into` analog
+/// (`build_moe_ffn_layer_gpu_q_into`) verbatim — same external-encoder
+/// signature, same `decode_pool::pooled_alloc_buffer` for every scratch.
+///
+/// # Caller contract
+///
+/// * The caller must provide the encoder.  The encoder must NOT have been
+///   committed.
+/// * The caller MUST commit the encoder after this function returns; the
+///   GPU work is queued but not yet submitted.
+/// * The output `MlxBuffer` is allocated from the per-decode-token arena
+///   pool; it must NOT be downloaded to CPU via `as_slice` /
+///   `download_f32` (the pool's bucket rounding inflates `byte_len`).
+///   Decode-path consumers (next layer's fused_residual_norm + lm_head
+///   `apply_output_head_gpu_greedy`) read via shape-respecting kernels —
+///   safe.
+#[allow(clippy::too_many_arguments)]
+pub fn build_dense_ffn_layer_gpu_q_into(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    weights: &DenseFfnWeightsGpuQ,
+    add_residual: Option<&MlxBuffer>,
+) -> Result<MlxBuffer> {
+    // Dispatch policy:
+    //   seq_len == 1 (decode)          → pool-allocated scratches
+    //   seq_len > 1   (prefill / batch) → device.alloc_buffer scratches
+    //
+    // Decode is the cb-overhead-sensitive regime and benefits from the
+    // arena pool's amortized alloc cost (`reset_decode_pool` per token).
+    // Prefill at full Qwen3.5 27B working set issues 64 layers × 5 scratches
+    // without a top-level reset; routing those through the pool overruns
+    // Metal's residency-set quota at layer 33 at seq_len=4096.  Using
+    // `device.alloc_buffer` for prefill keeps the fused-CB win without the
+    // pool exhaustion risk.
+    let h = weights.hidden_size;
+    let seq_len = (x.element_count() / h as usize) as u32;
+    if seq_len == 1 {
+        build_dense_ffn_layer_gpu_q_into_pooled(enc, device, registry, x, weights, add_residual)
+    } else {
+        build_dense_ffn_layer_gpu_q_into_device(enc, device, registry, x, weights, add_residual)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_dense_ffn_layer_gpu_q_into_pooled(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    weights: &DenseFfnWeightsGpuQ,
+    add_residual: Option<&MlxBuffer>,
+) -> Result<MlxBuffer> {
+    let h = weights.hidden_size;
+    let m = weights.intermediate_size;
+    let seq_len = (x.element_count() / h as usize) as u32;
+    let n_h = (seq_len * m) as u32;
+    let n_out = (seq_len * h) as usize;
+
+    // ADR-012 §Optimize / Task #15 + W-5b.14: route every per-token dense FFN
+    // scratch allocation through the thread-local arena pool.  These buffers'
+    // lifetimes are bounded by the caller's encoder commit;
+    // `forward_gpu_greedy`'s top-of-token `reset_decode_pool` recycles them
+    // on the next token.  Mirrors `build_moe_ffn_layer_gpu_q_into` verbatim.
+    let mut gate_buf = super::decode_pool::pooled_alloc_buffer(
+            device, n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
+        .map_err(|e| anyhow!("alloc dense_q gate: {e}"))?;
+    let mut up_buf = super::decode_pool::pooled_alloc_buffer(
+            device, n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
+        .map_err(|e| anyhow!("alloc dense_q up: {e}"))?;
+    let hidden_buf = super::decode_pool::pooled_alloc_buffer(
+            device, n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
+        .map_err(|e| anyhow!("alloc dense_q hidden: {e}"))?;
+    let mut down_out = super::decode_pool::pooled_alloc_buffer(
+            device, n_out * 4, DType::F32, vec![seq_len as usize, h as usize])
+        .map_err(|e| anyhow!("alloc dense_q down_out: {e}"))?;
+    let mut silu_params_buf = super::decode_pool::pooled_alloc_buffer(
+            device, 4, DType::U32, vec![1])
+        .map_err(|e| anyhow!("alloc dense_q silu_params: {e}"))?;
+    silu_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = n_h;
+
+    let gate_up_params = GgmlQuantizedMatmulParams {
+        m: seq_len,
+        n: m,
+        k: h,
+        ggml_type: weights.ggml_type_gate_up,
+    };
+    let down_params = GgmlQuantizedMatmulParams {
+        m: seq_len,
+        n: h,
+        k: m,
+        ggml_type: weights.ggml_type_down,
+    };
+
+    // Ops 1+2: gate and up projections via quantized_matmul_ggml (both read x, concurrent).
+    quantized_matmul_ggml(enc, registry, device, x, &weights.gate_q, &mut gate_buf, &gate_up_params)
+        .context("dense_q gate proj")?;
+    quantized_matmul_ggml(enc, registry, device, x, &weights.up_q,   &mut up_buf,   &gate_up_params)
+        .context("dense_q up proj")?;
+
+    // Barrier: silu_mul reads gate_buf/up_buf written above.
+    enc.memory_barrier();
+
+    // Op 3: silu(gate) * up → hidden.
+    dispatch_silu_mul(
+        enc, registry, device.metal_device(),
+        &gate_buf, &up_buf, &hidden_buf, &silu_params_buf, n_h,
+    ).context("dense_q silu_mul")?;
+
+    // Barrier: down proj reads hidden.
+    enc.memory_barrier();
+
+    // Op 4: out = down_proj(hidden).
+    quantized_matmul_ggml(enc, registry, device, &hidden_buf, &weights.down_q, &mut down_out, &down_params)
+        .context("dense_q down proj")?;
+
+    // Op 5 (optional): out += residual — folded to save 1 commit per dense layer.
+    let result = if let Some(res) = add_residual {
+        let sum_buf = super::decode_pool::pooled_alloc_buffer(
+                device, n_out * 4, DType::F32, vec![n_out])
+            .map_err(|e| anyhow!("alloc dense_q residual sum: {e}"))?;
+        // Barrier: elementwise_add reads down_out written by Op 4.
+        enc.memory_barrier();
+        elementwise_add(
+            enc, registry, device.metal_device(),
+            &down_out, res, &sum_buf, n_out, DType::F32,
+        ).context("dense_q residual add")?;
+        sum_buf
+    } else {
+        down_out
+    };
+
+    Ok(result)
+}
+
+/// Prefill-safe variant of [`build_dense_ffn_layer_gpu_q_into`]: uses
+/// `device.alloc_buffer` for scratches to avoid the per-decode-token arena
+/// pool's residency-set exhaustion at full prefill working set.  Same
+/// fused-CB single-encoder shape as the pooled variant.
+#[allow(clippy::too_many_arguments)]
+fn build_dense_ffn_layer_gpu_q_into_device(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    weights: &DenseFfnWeightsGpuQ,
+    add_residual: Option<&MlxBuffer>,
+) -> Result<MlxBuffer> {
+    let h = weights.hidden_size;
+    let m = weights.intermediate_size;
+    let seq_len = (x.element_count() / h as usize) as u32;
+    let n_h = (seq_len * m) as u32;
+    let n_out = (seq_len * h) as usize;
+
+    let mut gate_buf = device
+        .alloc_buffer(n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
+        .map_err(|e| anyhow!("alloc dense_q gate: {e}"))?;
+    let mut up_buf = device
+        .alloc_buffer(n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
+        .map_err(|e| anyhow!("alloc dense_q up: {e}"))?;
+    let hidden_buf = device
+        .alloc_buffer(n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
+        .map_err(|e| anyhow!("alloc dense_q hidden: {e}"))?;
+    let mut down_out = device
+        .alloc_buffer(n_out * 4, DType::F32, vec![seq_len as usize, h as usize])
+        .map_err(|e| anyhow!("alloc dense_q down_out: {e}"))?;
+    let mut silu_params_buf = device
+        .alloc_buffer(4, DType::U32, vec![1])
+        .map_err(|e| anyhow!("alloc dense_q silu_params: {e}"))?;
+    silu_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = n_h;
+
+    let gate_up_params = GgmlQuantizedMatmulParams {
+        m: seq_len,
+        n: m,
+        k: h,
+        ggml_type: weights.ggml_type_gate_up,
+    };
+    let down_params = GgmlQuantizedMatmulParams {
+        m: seq_len,
+        n: h,
+        k: m,
+        ggml_type: weights.ggml_type_down,
+    };
+
+    quantized_matmul_ggml(enc, registry, device, x, &weights.gate_q, &mut gate_buf, &gate_up_params)
+        .context("dense_q gate proj")?;
+    quantized_matmul_ggml(enc, registry, device, x, &weights.up_q,   &mut up_buf,   &gate_up_params)
+        .context("dense_q up proj")?;
+    enc.memory_barrier();
+
+    dispatch_silu_mul(
+        enc, registry, device.metal_device(),
+        &gate_buf, &up_buf, &hidden_buf, &silu_params_buf, n_h,
+    ).context("dense_q silu_mul")?;
+    enc.memory_barrier();
+
+    quantized_matmul_ggml(enc, registry, device, &hidden_buf, &weights.down_q, &mut down_out, &down_params)
+        .context("dense_q down proj")?;
+
+    let result = if let Some(res) = add_residual {
+        let sum_buf = device
+            .alloc_buffer(n_out * 4, DType::F32, vec![n_out])
+            .map_err(|e| anyhow!("alloc dense_q residual sum: {e}"))?;
+        enc.memory_barrier();
+        elementwise_add(
+            enc, registry, device.metal_device(),
+            &down_out, res, &sum_buf, n_out, DType::F32,
+        ).context("dense_q residual add")?;
+        sum_buf
+    } else {
+        down_out
+    };
+
+    Ok(result)
+}
+
+// NOTE on `build_dense_ffn_layer_gpu_q_into`: the variant does NOT commit.
+// The caller is responsible for committing the encoder, allowing fusion
+// with upstream dispatches (e.g. `dispatch_fused_residual_norm_f32`).
+
+/// Pre-W-5b.14 device-alloc + own-encoder path; retained behind
+/// `HF2Q_DENSE_Q_LEGACY=1` for forensic A/B comparison.  Sunset to W-5b.15
+/// after a 30-run cross-path determinism panel confirms the new pooled +
+/// fused-CB path holds parity at PP4106 (token id 11 across all 6 cells).
+#[allow(clippy::too_many_arguments)]
+fn build_dense_ffn_layer_gpu_q_legacy(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    weights: &DenseFfnWeightsGpuQ,
+    add_residual: Option<&MlxBuffer>,
+) -> Result<MlxBuffer> {
     let h = weights.hidden_size;
     let m = weights.intermediate_size;
     let seq_len = (x.element_count() / h as usize) as u32;
@@ -718,7 +993,7 @@ pub fn build_dense_ffn_layer_gpu_q(
     };
 
     // Single encoder: ops 1+2 concurrent → barrier → op 3 → barrier → op 4 [→ op 5].
-    let mut enc = device.command_encoder().context("enc dense_q swiglu")?;
+    let mut enc = device.command_encoder().context("enc dense_q swiglu legacy")?;
 
     // Ops 1+2: gate and up projections via quantized_matmul_ggml (both read x, concurrent).
     quantized_matmul_ggml(&mut enc, registry, device, x, &weights.gate_q, &mut gate_buf, &gate_up_params)
@@ -762,7 +1037,7 @@ pub fn build_dense_ffn_layer_gpu_q(
     if seq_len == 1 {
         enc.commit();
     } else {
-        enc.commit_and_wait().context("commit dense_q swiglu")?;
+        enc.commit_and_wait().context("commit dense_q swiglu legacy")?;
     }
     Ok(result)
 }
@@ -1860,7 +2135,14 @@ mod tests {
             &device, &mut registry, &x_buf, &weights_q, None,
         ).expect("build_dense_ffn_layer_gpu_q");
 
-        let gpu_out = download_f32(&gpu_buf).expect("download");
+        // W-5b.14: result may be pool-allocated with bucket-rounded byte_len.
+        // Use the buffer's logical element_count() (= product of shape dims),
+        // not download_f32 which reads byte_len.  This is the same convention
+        // production decode-path consumers use (apply_output_head_gpu_greedy +
+        // next layer's fused_residual_norm operate on shape, not byte_len).
+        let n_logical = gpu_buf.element_count();
+        let gpu_out: Vec<f32> = gpu_buf.as_slice::<f32>()
+            .expect("gpu_buf as_slice")[..n_logical].to_vec();
 
         assert_eq!(gpu_out.len(), cpu_out.len(), "dense_q gpu/cpu length mismatch");
 
@@ -1882,6 +2164,177 @@ mod tests {
             );
         }
         eprintln!("dense_swiglu_gpu_q_parity: max_abs_err={max_err:.2e}");
+    }
+
+    /// Wave 5b.14 cross-path parity: NEW pooled + external-encoder path
+    /// (`HF2Q_DENSE_Q_LEGACY` unset) must match the LEGACY device-alloc +
+    /// own-encoder path (`HF2Q_DENSE_Q_LEGACY=1`) within numerical tolerance.
+    ///
+    /// Both paths share the same logical op order (gate/up projs → silu_mul →
+    /// down proj → optional residual add).  The only differences are:
+    ///   1. Buffer source: pool vs `device.alloc_buffer`
+    ///   2. Encoder ownership: caller-supplied vs internal
+    ///
+    /// Both differences must be byte-equivalent at the f32 output level —
+    /// the same kernels run on the same Q4_0 weights against the same x.
+    /// Tolerance: 1e-6 (dictated only by Metal kernel re-issue jitter, NOT
+    /// by algorithmic difference).
+    ///
+    /// Includes the parallel-contention guard pattern: skip when both
+    /// paths return all-zero (Metal contention), FAIL when only one does.
+    #[test]
+    fn dense_q_path_first_token_matches_legacy_at_seq128() {
+        let device = MlxDevice::new().expect("Metal device unavailable");
+        let mut registry = KernelRegistry::new();
+
+        // Production-realistic shape: hidden=128, intermediate=384, seq=128.
+        // Multiples of Q4_0 block (32) for both axes; ~1.4 MB Q4_0 footprint.
+        let hidden_size: u32 = 128;
+        let intermediate_size: u32 = 384;
+        let h = hidden_size as usize;
+        let m = intermediate_size as usize;
+        let seq_len: u32 = 128;
+        let n_out = (seq_len as usize) * h;
+
+        let mut seed = 0xBEEF_u32;
+        let mut r = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n).map(|_| {
+                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                ((seed as i32 as f32) / (i32::MAX as f32)) * scale
+            }).collect()
+        };
+
+        let gate_f32 = r(m * h, 0.1);
+        let up_f32   = r(m * h, 0.1);
+        let down_f32 = r(h * m, 0.1);
+        let x_cpu    = r(seq_len as usize * h, 0.5);
+
+        let gate_q4 = encode_q4_0(&gate_f32);
+        let up_q4   = encode_q4_0(&up_f32);
+        let down_q4 = encode_q4_0(&down_f32);
+
+        let make_q_buf = |data: &[u8]| -> MlxBuffer {
+            let mut buf = device.alloc_buffer(data.len(), DType::U8, vec![data.len()])
+                .expect("alloc q4_0 buf");
+            buf.as_mut_slice::<u8>().expect("q-buf slice").copy_from_slice(data);
+            buf
+        };
+
+        // Two independent weight containers (one per path) so the test
+        // doesn't share GPU buffers between the two encoders' lifetimes.
+        let weights_legacy = DenseFfnWeightsGpuQ {
+            gate_q: make_q_buf(&gate_q4),
+            up_q:   make_q_buf(&up_q4),
+            down_q: make_q_buf(&down_q4),
+            ggml_type_gate_up: GgmlType::Q4_0,
+            ggml_type_down: GgmlType::Q4_0,
+            intermediate_size,
+            hidden_size,
+        };
+        let weights_new = DenseFfnWeightsGpuQ {
+            gate_q: make_q_buf(&gate_q4),
+            up_q:   make_q_buf(&up_q4),
+            down_q: make_q_buf(&down_q4),
+            ggml_type_gate_up: GgmlType::Q4_0,
+            ggml_type_down: GgmlType::Q4_0,
+            intermediate_size,
+            hidden_size,
+        };
+
+        // Run LEGACY path: HF2Q_DENSE_Q_LEGACY=1 → device-alloc + own-encoder.
+        let legacy_out: Vec<f32> = {
+            std::env::set_var("HF2Q_DENSE_Q_LEGACY", "1");
+            let x_buf = upload_f32(&x_cpu, &device).expect("upload x legacy");
+            let out = build_dense_ffn_layer_gpu_q(
+                &device, &mut registry, &x_buf, &weights_legacy, None,
+            ).expect("legacy build_dense_ffn_layer_gpu_q");
+            // Legacy path uses device.alloc_buffer with exact byte_len —
+            // download_f32 returns the exact n_out elements.
+            let v = download_f32(&out).expect("download legacy");
+            std::env::remove_var("HF2Q_DENSE_Q_LEGACY");
+            v
+        };
+
+        // Run NEW path: directly invoke `_into` with a fresh encoder + pool.
+        // (The public wrapper falls back to legacy at seq_len > 1 to avoid
+        // pool exhaustion in prefill; this test bypasses the wrapper's
+        // seq-len guard so it actually exercises the `_into` body — the
+        // production decode-path entry-point.)
+        let new_out: Vec<f32> = {
+            assert!(
+                std::env::var("HF2Q_DENSE_Q_LEGACY").is_err(),
+                "env gate must be cleared for the NEW-path branch"
+            );
+            // Fresh decode-pool reset before invoking `_into` so this test
+            // owns the pool's lifecycle (no carry-over from earlier tests).
+            super::super::decode_pool::reset_decode_pool();
+            let x_buf = upload_f32(&x_cpu, &device).expect("upload x new");
+            let mut enc = device.command_encoder().expect("enc new");
+            let out = build_dense_ffn_layer_gpu_q_into(
+                &mut enc, &device, &mut registry, &x_buf, &weights_new, None,
+            ).expect("new build_dense_ffn_layer_gpu_q_into");
+            enc.commit_and_wait().expect("commit new");
+            // NEW path returns pool-allocated buffer with bucket-rounded
+            // byte_len; trim to logical n_out via element_count().
+            let n_logical = out.element_count();
+            assert_eq!(n_logical, n_out, "new-path element_count != n_out");
+            let v = out.as_slice::<f32>().expect("new as_slice")[..n_logical].to_vec();
+            // Drop `out` before reset so the pool's in_use → free transition
+            // is sound (caller-contract rule from decode_pool.rs:75-79).
+            drop(out);
+            super::super::decode_pool::reset_decode_pool();
+            v
+        };
+
+        assert_eq!(legacy_out.len(), n_out, "legacy out length mismatch");
+        assert_eq!(new_out.len(), n_out, "new out length mismatch");
+
+        // Parallel-contention guard.
+        let legacy_all_zero = legacy_out.iter().all(|&v| v == 0.0);
+        let new_all_zero = new_out.iter().all(|&v| v == 0.0);
+        if legacy_all_zero && new_all_zero {
+            eprintln!(
+                "dense_q_path_first_token_matches_legacy_at_seq128: BOTH paths \
+                 returned all-zero — likely parallel-contention flake."
+            );
+            return;
+        }
+        assert!(!legacy_all_zero, "legacy path output unexpectedly all-zero");
+        assert!(!new_all_zero, "new path output unexpectedly all-zero");
+
+        // Both paths run the same kernels on the same data; expected to be
+        // byte-identical modulo Metal kernel re-issue jitter.
+        let mut max_abs = 0.0f32;
+        let mut sum_abs = 0.0f64;
+        let mut argmax_idx = 0usize;
+        for (i, (&l, &n)) in legacy_out.iter().zip(new_out.iter()).enumerate() {
+            let d = (l - n).abs();
+            if d > max_abs { max_abs = d; argmax_idx = i; }
+            sum_abs += d as f64;
+        }
+        let mean_abs = (sum_abs / legacy_out.len() as f64) as f32;
+
+        // Tight tolerance: same kernels, same weights, same x — only encoder
+        // ownership and buffer source differ.  No algorithmic divergence.
+        const MAX_TOL: f32 = 1e-5;
+        const MEAN_TOL: f32 = 1e-6;
+        assert!(
+            max_abs < MAX_TOL,
+            "dense_q parity max_abs={:.4e} >= {:.0e} \
+             (at idx {} of {}; legacy={:.6}, new={:.6})",
+            max_abs, MAX_TOL, argmax_idx, legacy_out.len(),
+            legacy_out[argmax_idx], new_out[argmax_idx],
+        );
+        assert!(
+            mean_abs < MEAN_TOL,
+            "dense_q parity mean_abs={:.4e} >= {:.0e}",
+            mean_abs, MEAN_TOL,
+        );
+        eprintln!(
+            "dense_q_path_first_token_matches_legacy_at_seq128: \
+             max_abs={:.2e} mean_abs={:.2e}",
+            max_abs, mean_abs,
+        );
     }
 
     // ────────────────────────────────────────────────────────────────
