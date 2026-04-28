@@ -88,7 +88,7 @@ use crate::calibrate::calibrator::CalibrationData;
 use crate::ir::{QuantizedTensor, TensorRef};
 use crate::quantize::k_quant_codec::KQuantTarget;
 use crate::quantize::k_quant_codec_quantizer::{f16_passthrough, KQuantCodecQuantizer};
-use crate::quantize::layer_mix::should_emit_f16_for_kquant;
+use crate::quantize::layer_mix::{is_kquant_row_misaligned, is_vision_tensor_pattern};
 use crate::quantize::{LayerQuantConfig, Quantizer, QuantizeError};
 
 /// DWQ-class K-quant variant.  Maps to a (base, sensitive) pair of
@@ -258,11 +258,14 @@ impl Quantizer for DwqKQuantizer {
         // routing never sees a tensor the K-quant codec cannot encode
         // (e.g. Qwen3.6-27B vision-attn proj at row_len = 1152, the
         // LIVE blocker for the four DWQ re-emits documented in
-        // ADR-014 § "P11-prereq Iter D" 2026-04-27).  Plumbed here
-        // (not just at the inner `KQuantCodecQuantizer` site) so the
-        // skip signal is logged with the DWQ variant context AND so a
-        // future refactor that swaps the inner codec cannot regress
-        // the predicate on the DWQ path.
+        // ADR-014 § "P11-prereq Iter D" 2026-04-27).
+        //
+        // ADR-014 P7 iter-38 (2026-04-28): the row-misalignment arm is
+        // routing-aware — DWQ's sensitive layers route to Q8_0 (legacy,
+        // 32-element blocks) which DOES handle a 32-multiple row that
+        // is not also 256-multiple.  Pre-iter-38, sensitive Q8_0 layers
+        // with such rows would falsely F16-passthrough.  The vision arm
+        // remains universal (policy-driven, not block-size-driven).
         //
         // **Ordering note**: `config.preserve` wins (handled by the
         // inner `KQuantCodecQuantizer` at delegation time).  Iter D
@@ -271,17 +274,33 @@ impl Quantizer for DwqKQuantizer {
         // `KQuantCodecQuantizer::quantize_tensor` and
         // `VariantKQuantizer::quantize_tensor`.
         let row_len = tensor.shape.last().copied().unwrap_or(0);
-        if !config.preserve && should_emit_f16_for_kquant(&tensor.name, row_len) {
-            tracing::info!(
-                tensor = %tensor.name,
-                row_len,
-                variant = self.variant.name(),
-                "DWQ K-quant skip → F16 passthrough (vision or non-256-multiple)"
+        let routing_target = self.target_for(&tensor.name);
+        if !config.preserve {
+            let is_kquant_routing = matches!(
+                routing_target,
+                Some(
+                    KQuantTarget::Q2K
+                        | KQuantTarget::Q3K
+                        | KQuantTarget::Q4K
+                        | KQuantTarget::Q5K
+                        | KQuantTarget::Q6K
+                )
             );
-            return f16_passthrough(tensor, &tensor.name);
+            let f16_required = is_vision_tensor_pattern(&tensor.name)
+                || (is_kquant_routing && is_kquant_row_misaligned(row_len));
+            if f16_required {
+                tracing::info!(
+                    tensor = %tensor.name,
+                    row_len,
+                    variant = self.variant.name(),
+                    routing_target = ?routing_target,
+                    "DWQ codec skip → F16 passthrough (vision policy or K-quant row misalignment)"
+                );
+                return f16_passthrough(tensor, &tensor.name);
+            }
         }
 
-        let target = match self.target_for(&tensor.name) {
+        let target = match routing_target {
             Some(t) => t,
             None => {
                 // Only reachable for `DwqKVariant::P28` base bucket

@@ -4762,6 +4762,131 @@ mod tests {
         }
     }
 
+    /// ADR-014 P7 iter-38 — DwqK predicate split is routing-aware.
+    /// Bug deferred from iter-37: `dwq_k_quantizer.rs` was still calling
+    /// the merged `should_emit_f16_for_kquant` predicate, applying the
+    /// row-misalignment arm to ALL routing decisions including Q8_0
+    /// sensitive layers.  Q8_0 uses 32-element blocks, so a 32-multiple
+    /// row that is NOT also 256-multiple was falsely F16-passthrough'd
+    /// instead of going through Q8_0.
+    ///
+    /// Fix: split the gate into routing-aware logic — vision is
+    /// universal (policy), K-quant alignment is K-quant-routing-only
+    /// (per `target_for(tensor)` resolution).  Q8_0 sensitive layers
+    /// with 32-multiple-but-not-256-multiple rows now correctly
+    /// quantize through the legacy codec.
+    ///
+    /// Test: DwqKVariant::P48 (Q4_K base + Q8_0 sensitive) with sensitive
+    /// layer 5; tensor `model.layers.5.self_attn.q_proj.weight` at
+    /// row_len=96 (3 × 32 = 96, NOT 256-multiple).  Pre-iter-38 emitted
+    /// F16 (192 bytes); post-iter-38 emits Q8_0 (3 × 34 = 102 bytes).
+    /// Note: P46's sensitive_target is Q6_K not Q8_0 — for THIS test
+    /// we need a variant with a legacy-codec sensitive target.
+    ///
+    /// Companion control case: same row at layer 0 (NOT sensitive) with
+    /// the same variant routes to Q4_K base — which IS a K-quant target
+    /// at a non-256-multiple row, so STILL F16-passthrough'd.  This
+    /// orthogonality assertion proves the fix discriminates correctly:
+    /// sensitive→Q8_0 escapes; base→Q4_K still triggers passthrough.
+    #[test]
+    fn dwq_sensitive_q8_0_layer_with_32_multiple_row_emits_q8_not_f16() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::dwq_k_quantizer::{DwqKQuantizer, DwqKVariant};
+
+        const ROW_LEN: usize = 96; // 3 × 32 (legacy-legal), NOT 256-multiple
+
+        // Pre-condition: row_len must trigger the K-quant alignment arm
+        // so the bug fixture is canonical.
+        assert!(
+            crate::quantize::layer_mix::is_kquant_row_misaligned(ROW_LEN),
+            "ROW_LEN=96 must trigger the K-quant row-misalignment arm — \
+             otherwise this test fixture no longer exercises iter-38"
+        );
+
+        let payload: Vec<u8> = (0..ROW_LEN)
+            .map(|i| (i as f32 / ROW_LEN as f32) * 2.0 - 1.0)
+            .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+
+        // Two tensors: one sensitive (→ Q8_0), one base (→ Q4_K).
+        // Identical row layout so divergence is purely policy-driven.
+        // DwqK uses HF naming (`model.layers.<N>.…`) per
+        // `extract_layer_index`'s contract — `blk.<N>.…` (GGUF) does
+        // not parse so would route to base unconditionally.
+        let sensitive_name = "model.layers.5.self_attn.q_proj.weight";
+        let base_name = "model.layers.0.self_attn.q_proj.weight";
+
+        let make_lazy_map = || -> LazyTensorMap {
+            let mut m = LazyTensorMap::new();
+            for name in [sensitive_name, base_name] {
+                m.insert(LazyTensor::from_bytes(
+                    LazyMeta::new(name.to_string(), vec![1, ROW_LEN], DType::F16),
+                    payload.clone(),
+                ));
+            }
+            m
+        };
+
+        // P48 = Q4_K base + Q8_0 sensitive.  Mark layer 5 sensitive.
+        // (P46's sensitive_target is Q6_K — wrong for this test.)
+        let q = DwqKQuantizer::new(
+            DwqKVariant::P48,
+            &[5..=5],
+            CalibrationData::None,
+        );
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+        let out = quantize_streaming(make_lazy_map(), &metadata, &q, 0, 0, &progress, false)
+            .expect("DwqK::P46 streaming with row_len=96");
+
+        // ── Sensitive layer (Q8_0 routing) ──
+        // Post-iter-38: row_len=96 is 32-multiple, Q8_0 handles it,
+        // emit Q8_0 (3 × 34 = 102 bytes).  Pre-iter-38 emitted F16 (192).
+        let t_sensitive = out
+            .tensors
+            .get(sensitive_name)
+            .expect("sensitive missing");
+        assert_eq!(
+            t_sensitive.quant_info.ggml_type.as_deref(),
+            Some("Q8_0"),
+            "sensitive layer at row_len=96 emitted {:?} instead of Q8_0 \
+             — iter-38 routing-aware F16 gate has regressed",
+            t_sensitive.quant_info.ggml_type
+        );
+        assert_ne!(
+            t_sensitive.quant_info.ggml_type.as_deref(),
+            Some("F16"),
+            "sensitive layer at row_len=96 fell into F16 passthrough — \
+             DwqK is applying K-quant alignment arm to Q8_0 routing"
+        );
+        assert_eq!(
+            t_sensitive.data.len(),
+            (ROW_LEN / 32) * 34,
+            "sensitive layer Q8_0 byte budget"
+        );
+
+        // ── Base layer (Q4_K routing) ──
+        // Q4_K is K-quant + row_len=96 is misaligned → F16 passthrough.
+        // This control proves the routing-aware fix discriminates: the
+        // K-quant alignment arm STILL fires for K-quant routing, just
+        // not for Q8_0 routing.
+        let t_base = out.tensors.get(base_name).expect("base missing");
+        assert_eq!(
+            t_base.quant_info.ggml_type.as_deref(),
+            Some("F16"),
+            "base layer at row_len=96 (K-quant routing) emitted {:?} \
+             instead of F16 — the K-quant alignment arm has been over-fixed",
+            t_base.quant_info.ggml_type
+        );
+        assert_eq!(
+            t_base.data.len(),
+            ROW_LEN * 2,
+            "base layer F16 byte budget"
+        );
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
