@@ -5345,6 +5345,136 @@ mod tests {
         );
     }
 
+    /// ADR-014 P7 iter-44 — end-to-end iter-3 flow integration gate.
+    /// Proves the full iter-3 production wire-up shape works without
+    /// `main.rs:1147`'s `materialize_all()` bridge:
+    ///
+    ///   lazy_map (Phase 1.x) → quantize_streaming → QuantizedModel
+    ///                                              ↓
+    ///   re-read safetensors → lazy_map_2 → measure_quality_streaming_lazy
+    ///                                              ↓
+    ///   GgufBackend::validate(&QuantizedModel)
+    ///
+    /// Each tensor is touched at most once per phase; no full-model
+    /// `TensorMap` is ever resident.  This is the architectural shape
+    /// `main.rs:1147` will adopt when iter-3 lands.
+    ///
+    /// **Iter-3 prerequisite surfaced by this test**: this iter
+    /// originally used `KQuantCodecQuantizer` and discovered that
+    /// `quality::dequantize_single_tensor` does NOT handle the
+    /// `METHOD_K_QUANT_CODEC_DIRECT` method — it falls into the
+    /// "no scales" warn path and returns zeros, so cosine_similarity
+    /// fails and the QualityReport has empty per-layer.  Iter-3
+    /// production wire-up of K-quant codec models therefore needs a
+    /// K-quant-aware dequant-for-quality (queued for a separate iter).
+    /// In the meantime, this iter uses `StaticQuantizer` (bits=8) to
+    /// exercise the iter-3 flow shape with a quantizer whose dequant
+    /// path is already wired through `quality::dequantize_single_tensor`.
+    ///
+    /// Synthetic fixture (in-memory, no on-disk safetensors required):
+    /// build the same set of tensors twice (once for quantize, once for
+    /// quality) — mirrors the production "re-read after quantize"
+    /// pattern.
+    ///
+    /// Asserts:
+    ///   1. quantize_streaming produces a valid QuantizedModel.
+    ///   2. measure_quality_streaming_lazy succeeds on the parallel lazy_map.
+    ///   3. QualityReport has non-empty per_layer_cosine_sim.
+    ///   4. GgufBackend::validate accepts the QuantizedModel.
+    #[test]
+    fn iter3_end_to_end_flow_lazy_quantize_quality_validate() {
+        use crate::backends::{gguf::GgufBackend, OutputBackend};
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quality::measure_quality_streaming_lazy;
+        use crate::quantize::static_quant::StaticQuantizer;
+
+        // Use 64 elements / tensor (StaticQuantizer's group quantization
+        // works for any size; the quality dequant path is wired for it).
+        const N_ELEMENTS: usize = 64;
+
+        let tensors: Vec<&str> = vec![
+            "blk.0.attn_q.weight",
+            "blk.0.attn_v.weight",
+            "blk.0.ffn_down.weight",
+            "blk.0.ffn_up.weight",
+        ];
+
+        let make_payload = |seed: f32| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(N_ELEMENTS * 2);
+            for i in 0..N_ELEMENTS {
+                let v = (i as f32 / N_ELEMENTS as f32) * 2.0 - 1.0 + seed * 0.001;
+                bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+            }
+            bytes
+        };
+
+        // Build lazy_map_a (consumed by quantize_streaming).
+        let mut lazy_map_a = LazyTensorMap::new();
+        for (i, name) in tensors.iter().enumerate() {
+            lazy_map_a.insert(LazyTensor::from_bytes(
+                LazyMeta::new(name.to_string(), vec![2, N_ELEMENTS / 2], DType::F16),
+                make_payload(i as f32),
+            ));
+        }
+        // Build lazy_map_b (consumed by measure_quality_streaming_lazy
+        // — mirrors production "re-read safetensors after quantize").
+        let mut lazy_map_b = LazyTensorMap::new();
+        for (i, name) in tensors.iter().enumerate() {
+            lazy_map_b.insert(LazyTensor::from_bytes(
+                LazyMeta::new(name.to_string(), vec![2, N_ELEMENTS / 2], DType::F16),
+                make_payload(i as f32),
+            ));
+        }
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+        let q = StaticQuantizer::new("q8").expect("StaticQuantizer q8");
+
+        // Phase 3: streaming quantize.
+        let model =
+            quantize_streaming(lazy_map_a, &metadata, &q, 8, 32, &progress, false)
+                .expect("Phase 3 streaming quantize");
+
+        // Phase 4.5: lazy quality measurement on the parallel lazy_map.
+        let report = measure_quality_streaming_lazy(
+            &lazy_map_b,
+            &model,
+            &metadata,
+            std::path::Path::new("/tmp"),
+            &progress,
+        )
+        .expect("Phase 4.5 lazy quality measurement");
+
+        let per_layer = report
+            .per_layer_cosine_sim
+            .as_ref()
+            .expect("per-layer cosine sim must exist for non-empty fixture");
+        assert!(
+            !per_layer.is_empty(),
+            "per-layer must include at least one weight pair"
+        );
+        for (i, &v) in per_layer.iter().enumerate() {
+            assert!(
+                v > 0.99,
+                "tensor {i}: cosine {v} should be > 0.99 for 8-bit static quant \
+                 — quality measurement is degraded under iter-3 flow shape"
+            );
+        }
+
+        // Backend validate.
+        let backend = GgufBackend::new();
+        let warnings = backend.validate(&model).expect("validate must not error");
+        let errors: Vec<_> = warnings
+            .iter()
+            .filter(|w| format!("{:?}", w).to_lowercase().contains("error"))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "iter-3 flow QuantizedModel failed validate: {:?}",
+            errors
+        );
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
