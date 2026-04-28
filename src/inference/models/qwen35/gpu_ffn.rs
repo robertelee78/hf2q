@@ -795,24 +795,64 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
     // `decode_pool::reset_for_prefill_chunk()` (W-5b.15) recycles them
     // before the next layer issues its own scratches.
     //
+    // W-5b.27 Phase B-2: lift the 4 internal scratches (gate, up, hidden,
+    // silu_params) to prefill scope via `decode_pool::DenseFfnOutputCache`.
+    // 4 pooled scratches × 64 layers = 256 per-prefill pool ops are
+    // replaced by 4 first-call device allocs + 252 cache hits.  The cache
+    // is a separate thread-local from `MlxBufferPool` and does NOT
+    // participate in `reset_for_prefill_chunk`, so cached scratches survive
+    // every per-layer reset.
+    //
+    // LEGACY env gate `HF2Q_FFN_DENSE_LIFT_LEGACY=1` retains the pre-W-5b.27
+    // per-layer `pooled_alloc_buffer` path for forensic A/B (mirrors the
+    // W-5b.10/14/18/20/24 forensic env-gate cadence; sunset target same
+    // protocol — 30/30 cross-path token-id determinism + apex 35B-A3B
+    // PP65536 FFN equivalence).
+    //
     // The FINAL OUTPUT buffer (`down_out` when no residual; `sum_buf`
-    // when residual is folded) MUST be `device.alloc_buffer` rather than
-    // pooled — its ARC clone leaves this function via `Ok(result)` and
-    // becomes the next layer's `hidden`, crossing the per-layer reset
-    // boundary.  A pooled output here would alias the next layer's
-    // first pool allocation of the same bucket size (84 MB at
-    // Qwen3.6-27B prefill), corrupting the residual stream silently.
-    // See `decode_pool::reset_for_prefill_chunk` doc-comment for the
-    // full lifetime contract.
-    let mut gate_buf = super::decode_pool::pooled_alloc_buffer(
-            device, n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
-        .map_err(|e| anyhow!("alloc dense_q gate: {e}"))?;
-    let mut up_buf = super::decode_pool::pooled_alloc_buffer(
-            device, n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
-        .map_err(|e| anyhow!("alloc dense_q up: {e}"))?;
-    let hidden_buf = super::decode_pool::pooled_alloc_buffer(
-            device, n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
-        .map_err(|e| anyhow!("alloc dense_q hidden: {e}"))?;
+    // when residual is folded) is NOT lifted to the cache.  It MUST be
+    // `device.alloc_buffer` at prefill rather than cached because:
+    //   - At prefill its ARC clone leaves this function via `Ok(result)`
+    //     and becomes the next layer's `hidden`, crossing the per-layer
+    //     reset boundary.
+    //   - At decode it is consumed by `apply_output_head_gpu_greedy`
+    //     within the same token before the next-token `reset_decode_pool`,
+    //     so `pooled_alloc_buffer` is sound.
+    //   - Caching would alias the previous layer's `hidden` clone (single
+    //     cache slot serving N layers' final outputs) — silent residual
+    //     stream corruption.  See `decode_pool::reset_for_prefill_chunk`
+    //     doc-comment for the full lifetime contract.
+    let lift_legacy = std::env::var("HF2Q_FFN_DENSE_LIFT_LEGACY").as_deref() == Ok("1");
+    let mut gate_buf = if lift_legacy {
+        super::decode_pool::pooled_alloc_buffer(
+                device, n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
+            .map_err(|e| anyhow!("alloc dense_q gate (legacy pool): {e}"))?
+    } else {
+        super::decode_pool::dense_ffn_get_or_alloc(
+                super::decode_pool::DenseFfnSlot::Gate,
+                device, n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
+            .map_err(|e| anyhow!("alloc dense_q gate (lift cache): {e}"))?
+    };
+    let mut up_buf = if lift_legacy {
+        super::decode_pool::pooled_alloc_buffer(
+                device, n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
+            .map_err(|e| anyhow!("alloc dense_q up (legacy pool): {e}"))?
+    } else {
+        super::decode_pool::dense_ffn_get_or_alloc(
+                super::decode_pool::DenseFfnSlot::Up,
+                device, n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
+            .map_err(|e| anyhow!("alloc dense_q up (lift cache): {e}"))?
+    };
+    let hidden_buf = if lift_legacy {
+        super::decode_pool::pooled_alloc_buffer(
+                device, n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
+            .map_err(|e| anyhow!("alloc dense_q hidden (legacy pool): {e}"))?
+    } else {
+        super::decode_pool::dense_ffn_get_or_alloc(
+                super::decode_pool::DenseFfnSlot::Hidden,
+                device, n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
+            .map_err(|e| anyhow!("alloc dense_q hidden (lift cache): {e}"))?
+    };
     // FINAL OUTPUT (down_out):
     //   - Prefill (seq_len > 1): device-alloc'd so it survives the per-layer
     //     `reset_for_prefill_chunk()` and can become the next layer's `hidden`.
@@ -830,9 +870,21 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
             .alloc_buffer(n_out * 4, DType::F32, vec![seq_len as usize, h as usize])
             .map_err(|e| anyhow!("alloc dense_q down_out (device, prefill): {e}"))?
     };
-    let mut silu_params_buf = super::decode_pool::pooled_alloc_buffer(
-            device, 4, DType::U32, vec![1])
-        .map_err(|e| anyhow!("alloc dense_q silu_params: {e}"))?;
+    let mut silu_params_buf = if lift_legacy {
+        super::decode_pool::pooled_alloc_buffer(
+                device, 4, DType::U32, vec![1])
+            .map_err(|e| anyhow!("alloc dense_q silu_params (legacy pool): {e}"))?
+    } else {
+        super::decode_pool::dense_ffn_get_or_alloc(
+                super::decode_pool::DenseFfnSlot::SiluParams,
+                device, 4, DType::U32, vec![1])
+            .map_err(|e| anyhow!("alloc dense_q silu_params (lift cache): {e}"))?
+    };
+    // n_h varies per layer only via seq_len × m; m is constant per model and
+    // seq_len is constant per chunk-prefill, so the cached silu_params hits
+    // the same value 64×; rewriting on every call is a 4-byte CPU op and
+    // mirrors the LEGACY path 1:1 (no skip-if-equal branch — keeps the
+    // semantic invariant trivially identical).
     silu_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = n_h;
 
     let gate_up_params = GgmlQuantizedMatmulParams {
