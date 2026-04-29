@@ -642,10 +642,19 @@ pub fn apply_linear_projection_f32(
         }
         DType::F32 => {
             // Legacy F32 path: cast inline (per-inference cost, not pre-quantized).
+            //
+            // ADR-015 iter14: lift `weight_bf16` cast scratch to the
+            // per-decode-token pool.  This is a function-local helper
+            // scratch consumed by the matmul dispatch in the SAME encoder
+            // but the encoder is not committed by this function (caller
+            // commits).  Safe under retained refs (encoder CB ARC keeps
+            // the buffer alive); pool ARC anchor required under unretained
+            // refs.  Branch is unused on Qwen3.6 dwq46 (Q4_0 takes the
+            // U8 path above) but lifted for hygiene.
             let n_w = (out_features * in_features) as usize;
-            let weight_bf16 = device
-                .alloc_buffer(n_w * 2, DType::BF16, vec![out_features as usize, in_features as usize])
-                .map_err(|e| anyhow!("alloc weight_bf16: {e}"))?;
+            let weight_bf16 = super::decode_pool::pooled_alloc_buffer(
+                    device, n_w * 2, DType::BF16, vec![out_features as usize, in_features as usize])
+                .map_err(|e| anyhow!("alloc weight_bf16 (pooled): {e}"))?;
             cast(encoder, registry, device.metal_device(), weight, &weight_bf16, n_w, CastDirection::F32ToBF16)
                 .context("cast weight F32→BF16")?;
             // Need a barrier: the GEMM reads weight_bf16 which was written by the cast.
@@ -715,10 +724,12 @@ pub fn apply_linear_projection_f32_into(
             }
         }
         DType::F32 => {
+            // ADR-015 iter14: same scratch-lift as `apply_linear_projection_f32`'s
+            // F32 legacy arm above.
             let n_w = (out_features * in_features) as usize;
-            let weight_bf16 = device
-                .alloc_buffer(n_w * 2, DType::BF16, vec![out_features as usize, in_features as usize])
-                .map_err(|e| anyhow!("alloc weight_bf16: {e}"))?;
+            let weight_bf16 = super::decode_pool::pooled_alloc_buffer(
+                    device, n_w * 2, DType::BF16, vec![out_features as usize, in_features as usize])
+                .map_err(|e| anyhow!("alloc weight_bf16 (pooled, into): {e}"))?;
             cast(encoder, registry, device.metal_device(), weight, &weight_bf16, n_w, CastDirection::F32ToBF16)
                 .context("cast weight F32→BF16 (into)")?;
             encoder.memory_barrier();

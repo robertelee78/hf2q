@@ -343,16 +343,25 @@ fn apply_output_head_gpu(
     eps: f32,
 ) -> Result<Vec<f32>> {
     // ---- Final RMSNorm ----
+    // ADR-015 iter14: scratch-lift for unretained-refs gate.  Per the
+    // iter13 docstring at `mlx-native/src/encoder.rs:419-444`, every
+    // helper-allocated transient that is dispatched-into and then
+    // dropped before the eventual `commit_and_wait` must be anchored
+    // by the per-decode-token `MlxBufferPool`'s `in_use` ARC clones
+    // when `MLX_UNRETAINED_REFS=1`.  Switching to `pooled_alloc_buffer`
+    // is a no-op under retained refs (the pool's bucket-rounded
+    // allocations are released by `reset_decode_pool` at the next
+    // forward call) but provides the lifecycle anchor needed under
+    // unretained refs.
     let normed = {
-        let out = device
-            .alloc_buffer(
+        let out = super::decode_pool::pooled_alloc_buffer(
+                device,
                 (seq_len * hidden_size) as usize * 4,
                 DType::F32,
                 vec![seq_len as usize, hidden_size as usize],
             )
             .map_err(|e| anyhow!("alloc normed: {e}"))?;
-        let mut params = device
-            .alloc_buffer(8, DType::F32, vec![2])
+        let mut params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
             .map_err(|e| anyhow!("alloc norm params: {e}"))?;
         {
             let s = params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
@@ -756,8 +765,13 @@ fn residual_add_gpu(
         n,
         src.element_count()
     );
-    let out = device
-        .alloc_buffer(n * 4, DType::F32, vec![n])
+    // ADR-015 iter14: scratch-lift — `residual_add_gpu` is a helper that
+    // allocates `out`, dispatches into it, commits inline (`commit_and_wait`
+    // below), then returns `out`.  The function-level local holds ARC
+    // through the commit, so this is safe under unretained refs already;
+    // the lift normalizes the lifecycle and removes any need for callers
+    // to reason about it.
+    let out = super::decode_pool::pooled_alloc_buffer(device, n * 4, DType::F32, vec![n])
         .map_err(|e| anyhow!("residual_add_gpu alloc: {e}"))?;
     let mut enc = device.command_encoder().context("enc residual_add")?;
     elementwise_add(
@@ -1903,12 +1917,26 @@ impl Qwen35Model {
             GPU_CACHE.with(|cell| -> Result<_> {
                 let cache = cell.borrow();
                 let c = cache.as_ref().unwrap();
+                // ADR-015 iter14: scratch-lift — `pos_buf` is greedy-decode
+                // per-call positions; it is fed into RoPE in every layer
+                // and dropped at function exit.  The greedy path issues
+                // `reset_decode_pool` at function TOP only (no per-layer
+                // reset like prefill's), so a pooled allocation here
+                // survives the entire forward pass and is recycled by the
+                // next greedy call's top-of-function reset.  Per the
+                // unretained-refs caller contract at
+                // `mlx-native/src/encoder.rs:419-444`, the pool's `in_use`
+                // ARC clone provides the lifecycle anchor needed when
+                // `MLX_UNRETAINED_REFS=1`.
                 let pos_buf = {
                     let byte_len = positions_flat.len() * 4;
-                    let mut buf = c
-                        .device
-                        .alloc_buffer(byte_len, DType::I32, vec![positions_flat.len()])
-                        .map_err(|e| anyhow!("alloc positions: {e}"))?;
+                    let mut buf = super::decode_pool::pooled_alloc_buffer(
+                            &c.device,
+                            byte_len,
+                            DType::I32,
+                            vec![positions_flat.len()],
+                        )
+                        .map_err(|e| anyhow!("alloc positions (pooled): {e}"))?;
                     buf.as_mut_slice::<i32>()
                         .map_err(|e| anyhow!("positions mut_slice: {e}"))?
                         .copy_from_slice(positions_flat);

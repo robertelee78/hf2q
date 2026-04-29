@@ -371,13 +371,25 @@ fn proj(
     let weight_bf16: &MlxBuffer = if weight.dtype() == DType::BF16 {
         weight
     } else {
-        let buf = device
-            .alloc_buffer(
+        // ADR-015 iter14: scratch-lift — `proj`'s F32-legacy weight cast
+        // is exactly the helper-allocated transient pattern the iter13
+        // unretained-refs docstring at `mlx-native/src/encoder.rs:419-444`
+        // warned about: `proj()` allocates `buf`, dispatches into it,
+        // returns BEFORE the caller commits the encoder (caller commits
+        // in the FFN encoder which runs the matmul that READS `buf`).
+        // Under retained refs the encoder's CB ARC keeps `buf` alive;
+        // under unretained refs only the local `weight_bf16_owned` ARC
+        // does, so we hand out a pool-anchored buffer.  At iter14 base
+        // this branch only fires for F32 weights (Qwen3.6 dwq46 is Q4_0
+        // U8, so this is a no-op on the apex fixture); lifted for
+        // forward-compatibility and to remove the pattern entirely.
+        let buf = super::decode_pool::pooled_alloc_buffer(
+                device,
                 n_w * 2,
                 DType::BF16,
                 vec![out_features as usize, in_features as usize],
             )
-            .map_err(|e| anyhow!("alloc weight_bf16: {e}"))?;
+            .map_err(|e| anyhow!("alloc weight_bf16 (pooled): {e}"))?;
         cast(
             encoder,
             registry,
@@ -625,16 +637,27 @@ pub fn build_dense_ffn_layer_gpu(
     let n_out = seq_len as usize * h as usize;
 
     // Pre-allocate intermediate buffers (must outlive the encoder).
-    let hidden_buf = device
-        .alloc_buffer(
+    //
+    // ADR-015 iter14: lift `hidden_buf` and `silu_params` to the per-decode-token
+    // pool. At decode (seq=1), this function commits the encoder via `commit()`
+    // WITHOUT wait at line ~738; `hidden_buf` and `silu_params` are NOT
+    // returned, so their function-level locals drop at function return BEFORE
+    // the GPU has executed the silu_mul / down_proj dispatches that read them.
+    // Under retained refs the encoder's CB ARC keeps them alive; under
+    // unretained refs only the pool's `in_use` ARC clone does. This branch
+    // is the non-quantized dense path (Qwen3.6 dwq46 takes the Q4_0 path
+    // which already pools its scratches in `build_dense_ffn_layer_gpu_q_into_pooled`),
+    // but we lift for forward-compat and to remove the unsafe pattern.
+    let hidden_buf = super::decode_pool::pooled_alloc_buffer(
+            device,
             n_h as usize * 4,
             DType::F32,
             vec![seq_len as usize, m as usize],
         )
-        .map_err(|e| anyhow!("alloc dense silu hidden: {e}"))?;
-    let mut silu_params = device
-        .alloc_buffer(4, DType::U32, vec![1])
-        .map_err(|e| anyhow!("alloc dense silu params: {e}"))?;
+        .map_err(|e| anyhow!("alloc dense silu hidden (pooled): {e}"))?;
+    let mut silu_params = super::decode_pool::pooled_alloc_buffer(
+            device, 4, DType::U32, vec![1])
+        .map_err(|e| anyhow!("alloc dense silu params (pooled): {e}"))?;
     silu_params
         .as_mut_slice::<u32>()
         .map_err(|e| anyhow!("{e}"))?[0] = n_h;

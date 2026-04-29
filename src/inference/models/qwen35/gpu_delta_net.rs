@@ -76,7 +76,9 @@ use mlx_native::ops::quantized_matmul_ggml::{
 use mlx_native::ops::repeat_tiled::{dispatch_repeat_tiled_f32, RepeatTiledParams};
 use mlx_native::ops::rms_norm;
 use mlx_native::ops::ssm_conv::{dispatch_ssm_conv, SsmConvParams};
-use mlx_native::ops::ssm_norm_gate::{build_ssm_norm_gate_params, dispatch_ssm_norm_gate};
+// ADR-015 iter14: `build_ssm_norm_gate_params` lifted inline to
+// `pooled_alloc_buffer` at every call site for unretained-refs ARC anchoring.
+use mlx_native::ops::ssm_norm_gate::dispatch_ssm_norm_gate;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::delta_net::DeltaNetLayerWeights;
@@ -400,14 +402,22 @@ pub fn apply_proj(
         }
         DType::F32 => {
             // Legacy inline cast path.
+            //
+            // ADR-015 iter14: lift `weight_bf16` cast scratch to the
+            // per-decode-token pool — function-local scratch consumed by the
+            // matmul dispatch in the SAME encoder; encoder is not committed
+            // here (caller commits).  Pool ARC anchor required under
+            // unretained refs; safe and a no-op under retained refs.
+            // Branch unused on Qwen3.6 dwq46 (Q4_0 takes the U8 path) but
+            // lifted for hygiene.
             let n_w = (out_features * in_features) as usize;
-            let weight_bf16 = device
-                .alloc_buffer(
+            let weight_bf16 = super::decode_pool::pooled_alloc_buffer(
+                    device,
                     n_w * 2,
                     DType::BF16,
                     vec![out_features as usize, in_features as usize],
                 )
-                .map_err(|e| anyhow!("alloc weight_bf16: {e}"))?;
+                .map_err(|e| anyhow!("alloc weight_bf16 (pooled): {e}"))?;
             cast(encoder, registry, device.metal_device(), weight, &weight_bf16, n_w, CastDirection::F32ToBF16)
                 .context("cast weight F32→BF16")?;
             encoder.memory_barrier();
@@ -1292,8 +1302,24 @@ pub fn build_delta_net_layer(
     }
     let gated_buf = super::decode_pool::pooled_alloc_buffer(device, gated_elems * 4, DType::F32, vec![gated_elems])
         .map_err(|e| anyhow!("alloc op8 gated: {e}"))?;
-    let op8_params = build_ssm_norm_gate_params(device, rms_norm_eps, d_v)
-        .map_err(|e| anyhow!("op8 params: {e}"))?;
+    // ADR-015 iter14: lift mlx-native `build_ssm_norm_gate_params` /
+    // `build_gated_delta_net_params` results to the per-decode-token
+    // pool inline.  Both helpers internally do `device.alloc_buffer` and
+    // return; without the lift their `MlxBuffer`'s only ARC anchor is
+    // the local at this caller scope, and the encoder commit at line
+    // ~1417 is `commit_labeled` (NO wait), so under unretained refs the
+    // GPU may execute the dispatches AFTER the function's locals drop
+    // (the next layer's `build_delta_net_layer` invocation, which begins
+    // before the previous layer's GPU work completes).  Constructing
+    // these inline via `pooled_alloc_buffer` puts them under the pool's
+    // `in_use` ARC clone for the duration of the per-decode-token arena.
+    let mut op8_params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
+        .map_err(|e| anyhow!("alloc op8 params (pooled): {e}"))?;
+    {
+        let s = op8_params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
+        s[0] = rms_norm_eps;
+        s[1] = d_v as f32;
+    }
     let attn_out_buf = super::decode_pool::pooled_alloc_buffer(device, out_elems * 4, DType::F32, vec![out_elems])
         .map_err(|e| anyhow!("alloc gdn output: {e}"))?;
     // state_in and state_out are caller-provided buffers (ping-pong).
@@ -1301,8 +1327,20 @@ pub fn build_delta_net_layer(
     let gdn_params = GatedDeltaNetParams {
         d_k, d_v, n_k_heads, n_v_heads, n_tokens: seq_len, n_seqs,
     };
-    let gdn_params_buf = build_gated_delta_net_params(device, gdn_params)
-        .map_err(|e| anyhow!("build gdn params: {e}"))?;
+    let mut gdn_params_buf = super::decode_pool::pooled_alloc_buffer(
+            device, 8 * 4, DType::U32, vec![8])
+        .map_err(|e| anyhow!("alloc gdn params (pooled): {e}"))?;
+    {
+        let s = gdn_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
+        s[0] = gdn_params.d_k;
+        s[1] = gdn_params.d_v;
+        s[2] = gdn_params.n_k_heads;
+        s[3] = gdn_params.n_v_heads;
+        s[4] = gdn_params.n_tokens;
+        s[5] = gdn_params.n_seqs;
+        s[6] = 0;
+        s[7] = 0;
+    }
 
     let output = if seq == 1 {
         // ---- DECODE PATH (seq=1): single encoder for ALL ops 1-9 ----
@@ -1892,16 +1930,38 @@ pub fn build_delta_net_layer_decode_into(
     let gated_buf = super::decode_pool::pooled_alloc_buffer(
             device, gated_elems * 4, DType::F32, vec![gated_elems])
         .map_err(|e| anyhow!("alloc op8 gated (decode_into): {e}"))?;
-    let op8_params = build_ssm_norm_gate_params(device, rms_norm_eps, d_v)
-        .map_err(|e| anyhow!("op8 params (decode_into): {e}"))?;
+    // ADR-015 iter14: same lift as `build_delta_net_layer` decode arm —
+    // mlx-native's `build_*_params` allocators hand out `device.alloc_buffer`
+    // results that drop ARC at function return; under unretained refs the
+    // GPU dispatches that read these params may execute AFTER the drop.
+    // Pool-anchor them inline.
+    let mut op8_params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
+        .map_err(|e| anyhow!("alloc op8 params (decode_into, pooled): {e}"))?;
+    {
+        let s = op8_params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
+        s[0] = rms_norm_eps;
+        s[1] = d_v as f32;
+    }
     let attn_out_buf = super::decode_pool::pooled_alloc_buffer(
             device, out_elems * 4, DType::F32, vec![out_elems])
         .map_err(|e| anyhow!("alloc gdn output (decode_into): {e}"))?;
     let gdn_params = GatedDeltaNetParams {
         d_k, d_v, n_k_heads, n_v_heads, n_tokens: seq_len, n_seqs,
     };
-    let gdn_params_buf = build_gated_delta_net_params(device, gdn_params)
-        .map_err(|e| anyhow!("build gdn params (decode_into): {e}"))?;
+    let mut gdn_params_buf = super::decode_pool::pooled_alloc_buffer(
+            device, 8 * 4, DType::U32, vec![8])
+        .map_err(|e| anyhow!("alloc gdn params (decode_into, pooled): {e}"))?;
+    {
+        let s = gdn_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
+        s[0] = gdn_params.d_k;
+        s[1] = gdn_params.d_v;
+        s[2] = gdn_params.n_k_heads;
+        s[3] = gdn_params.n_v_heads;
+        s[4] = gdn_params.n_tokens;
+        s[5] = gdn_params.n_seqs;
+        s[6] = 0;
+        s[7] = 0;
+    }
 
     // ---- Sliced views of qkv_conv (CPU-side only) ----
     let q_gpu = qkv_conv.slice_view(0, q_sp);
