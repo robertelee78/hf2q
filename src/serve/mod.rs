@@ -1098,7 +1098,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
             Some(eos_token_id),
             max_seq as u32,
         )
-        .context("Qwen3.5 SpecDecode::run_with_eos")?;
+        .context("qwen35 SpecDecode::run_with_eos")?;
 
         let prefill_tok_s = if result.stats.prefill_elapsed.as_secs_f64() > 0.0 {
             prompt_len as f64 / result.stats.prefill_elapsed.as_secs_f64()
@@ -1132,7 +1132,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
             ("", "")
         };
         eprintln!(
-            "\n\n{td}--- mlx-native (Qwen3.5 spec): {} tokens in {:.2}s ({:.1} tok/s, accept {:.1}%) ---{tr}",
+            "\n\n{td}--- mlx-native (qwen35 spec): {} tokens in {:.2}s ({:.1} tok/s, accept {:.1}%) ---{tr}",
             generated,
             result.stats.decode_elapsed.as_secs_f64(),
             tok_per_sec,
@@ -1301,7 +1301,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         ("", "")
     };
     eprintln!(
-        "\n\n{td}--- mlx-native (Qwen3.5): {} tokens in {:.2}s ({:.1} tok/s) ---{tr}",
+        "\n\n{td}--- mlx-native (qwen35): {} tokens in {:.2}s ({:.1} tok/s) ---{tr}",
         generated,
         decode_elapsed.as_secs_f64(),
         tok_per_sec,
