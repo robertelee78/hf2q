@@ -1435,6 +1435,27 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         calibrate::calibrator::CalibrationData::None
     };
 
+    // ADR-014 P4 iter-94 (2026-04-28): explicit Phase 2 → Phase 3 memory hand-off.
+    //
+    // The DWQ qwen35/qwen35moe path holds a `RealActivationCapture` (boxed
+    // `Qwen35Model` with all weights uploaded to GPU + F32-expanded host
+    // copies via `load_lazy_dense_ffn`'s `load_lazy_f32`) inside `calibrator`.
+    // For Qwen3.6 27B that's ~52 GB of resident state on top of the 52 GB
+    // `tensor_map` Phase 3 still needs.
+    //
+    // Without this drop, the implicit drop happens at function-end (after
+    // Phase 3 + Phase 4 + Phase 4.5 + Phase 4.6 all run), so the calibrator's
+    // Qwen35Model + GPU buffers stay alive across the entire quantize phase.
+    // iter-93 measured peak memory = 158 GB (jetsam SIGKILL on M5 Max 128 GB)
+    // for `27b-dwq46`; ADR-012's reference emission Apr 26 recorded ≤ 64 GB.
+    // The 2.5× regression is dominated by this `calibrator` lifetime — the
+    // model is dead state after `calibrate()` returns `CalibrationData`.
+    //
+    // Explicit `drop(calibrator)` here releases the GPU+host weights at the
+    // exact phase boundary they become unreachable from the convert pipeline.
+    // Saves ~52 GB peak on 27B dense, ~70 GB on 35B-MoE.
+    drop(calibrator);
+
     let quantized_model = if backend.requires_native_quantization() {
         tracing::info!("Skipping IR quantization (native backend handles quantization)");
         None
