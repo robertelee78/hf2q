@@ -87,7 +87,16 @@ run_convert() {
     local convert_log="$OUT_ROOT/${label}.convert.log"
     echo "[$label] start: ${env_prefix}hf2q convert --quant $quant"
     echo "[$label] log: $convert_log"
+    # iter-100: HF2Q_QWEN35_DROP_MTP=1 matches the Apr 26 ADR-012 emission
+    # path. Without the drop, hf2q emits blk.{n_layer}.nextn.* alongside
+    # standard blk.{n_layer}.attn_norm.weight / ffn_*.weight / etc.; llama.cpp
+    # reads block_count = n_layer + 1 and demands the full layer-tensor set
+    # for the MTP block, including blk.{n_layer}.ssm_conv1d.weight which the
+    # MTP wrapper does not provide → "missing tensor" load failure. Drop
+    # MTP until llama.cpp gains qwen35 MTP loader (escape-hatch comment in
+    # main.rs:1010 expires by 2026-Q4 if upstream still hasn't landed).
     /usr/bin/time -l env HF2Q_STREAMING_PHASE3="${stream:-0}" \
+            HF2Q_QWEN35_DROP_MTP=1 \
         ./target/release/hf2q convert \
             --input "$src" \
             --format gguf \
