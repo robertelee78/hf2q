@@ -1407,30 +1407,87 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     };
 
     let calibration_data = if calibrator.requires_forward_pass() {
-        let lazy_view = if needs_dwq_lazy_capture {
-            clone_tensor_map_to_lazy(&tensor_map)
-        } else {
-            ir::lazy::LazyTensorMap::from_eager_borrowed(&tensor_map)
-        };
         let corpus = build_calibration_corpus(
             config.calibration_samples,
             metadata.vocab_size,
             "hf2q-cmd-convert-synthetic",
         );
-        tracing::info!(
-            calibrator = %calibrator.name(),
-            n_chunks = corpus.n_chunks(),
-            tokens = corpus.total_tokens(),
-            "ADR-014 P4: running calibrator.calibrate()"
+
+        // ADR-014 P4 iter-103 (2026-04-29): hoist cache HIT short-circuit
+        // ABOVE `clone_tensor_map_to_lazy`.  iter-95 hoisted the cache
+        // check above the Qwen35Model build *inside* `calibrator.calibrate()`,
+        // but the dense + MoE wedge sites here still pay a 70 GB clone in
+        // `clone_tensor_map_to_lazy` BEFORE calibrate() is invoked. For
+        // Qwen3.6 35B-A3B the clone alone pushes peak to ~140 GB (tensor_map
+        // 70 GB + lazy_view clone 70 GB) — jetsam-killed before calibrate()
+        // ever runs. The cache key only depends on tensor metadata
+        // (name/shape/dtype) which `LazyTensorMap::from_eager_borrowed`
+        // exposes without cloning bytes; `model_fingerprint` never calls
+        // `materialize()`. Compute the key from the borrowed view, look up
+        // the cache, and skip the clone + calibrate entirely on HIT.
+        //
+        // 35BMOE re-emit unblocked under this hoist + the
+        // iter-95/iter-100b cache priming (ADR-014 P11 closure path).
+        let borrowed_view = ir::lazy::LazyTensorMap::from_eager_borrowed(&tensor_map);
+        let cache_key = calibrate::cache::SensitivityCacheKey::with_algorithm_version(
+            calibrate::calibrator::model_fingerprint(&borrowed_view, &metadata),
+            calibrate::calibrator::corpus_sha(&corpus),
+            calibrate::cache::SENSITIVITY_ALGORITHM_VERSION,
         );
-        calibrator
-            .calibrate(&lazy_view, &metadata, &corpus, &progress)
-            .map_err(|e| {
-                AppError::Conversion(anyhow::anyhow!(
-                    "ADR-014 P4: calibrator.calibrate() failed for --quant {}: {e:#}",
-                    config.quant
-                ))
-            })?
+        tracing::warn!(
+            arch = ?dwq_arch_for_dispatch,
+            cache_key = %cache_key.hash(),
+            algorithm_version = calibrate::cache::SENSITIVITY_ALGORITHM_VERSION,
+            "DWQ cache key (iter-103 P11 cache-priming aid; pre-clone hoist)"
+        );
+        let pre_clone_cache_hit: Option<calibrate::calibrator::CalibrationData> =
+            match calibrate::cache::cache_file_path(&cache_key) {
+                Ok(path) => match calibrate::cache::load_dwq_from_path(&path, &cache_key) {
+                    Ok(Some(map)) => {
+                        tracing::info!(
+                            cache_key = %cache_key.hash(),
+                            path = %path.display(),
+                            entries = map.len(),
+                            "ADR-014 P4 iter-103: DWQ cache HIT pre-clone — skipping \
+                             clone_tensor_map_to_lazy + calibrate (saves ~tensor_map bytes \
+                             of peak memory on dense + MoE qwen35 sources)"
+                        );
+                        Some(calibrate::calibrator::CalibrationData::Dwq(map))
+                    }
+                    _ => None,
+                },
+                Err(_) => None,
+            };
+
+        match pre_clone_cache_hit {
+            Some(data) => data,
+            None => {
+                // Cache MISS — fall through to the original clone + calibrate
+                // flow. This path still pays the 70 GB clone for 35BMOE on
+                // first-time conversion; the OOM mitigation lives in iter-104+
+                // (per-tensor Arc-shared lazy_view) but cache HIT post-prime
+                // makes that a one-time cost.
+                let lazy_view = if needs_dwq_lazy_capture {
+                    clone_tensor_map_to_lazy(&tensor_map)
+                } else {
+                    ir::lazy::LazyTensorMap::from_eager_borrowed(&tensor_map)
+                };
+                tracing::info!(
+                    calibrator = %calibrator.name(),
+                    n_chunks = corpus.n_chunks(),
+                    tokens = corpus.total_tokens(),
+                    "ADR-014 P4: running calibrator.calibrate() (cache MISS path)"
+                );
+                calibrator
+                    .calibrate(&lazy_view, &metadata, &corpus, &progress)
+                    .map_err(|e| {
+                        AppError::Conversion(anyhow::anyhow!(
+                            "ADR-014 P4: calibrator.calibrate() failed for --quant {}: {e:#}",
+                            config.quant
+                        ))
+                    })?
+            }
+        }
     } else {
         calibrate::calibrator::CalibrationData::None
     };
