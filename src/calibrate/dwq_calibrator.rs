@@ -232,7 +232,83 @@ impl Calibrator for DwqCalibrator {
             return Err(CalibrationError::EmptyCorpus);
         }
 
+        // ─────────── Capture-configured guard (preserves D13) ───────────
+        // ForwardPassUnavailable signals a CALLER misconfiguration —
+        // capture wasn't attached for an arch that requires it. Cache
+        // HIT must NOT mask config errors (test
+        // `dwq_cache_does_not_bypass_forward_pass_unavailable` enforces
+        // this). Surface the typed error BEFORE reading the cache.
+        // Lazy and Eager both count as "configured"; only None bails.
+        match &self.capture {
+            CaptureSource::None => {
+                return Err(CalibrationError::ForwardPassUnavailable {
+                    arch: format!("{:?}", self.arch),
+                });
+            }
+            CaptureSource::Lazy { .. } | CaptureSource::Eager(_) => {}
+        }
+
+        // ─────────── Cache HIT short-circuit (iter-95) ───────────
+        // The cache key is purely a function of `model` (LazyTensorMap),
+        // `meta`, `corpus`, and `SENSITIVITY_ALGORITHM_VERSION` — no
+        // dependency on `self.capture`. Compute it BEFORE materialising
+        // any `CaptureSource::Lazy` so a cache HIT can return without
+        // ever paying the activation-capture model-build cost.
+        //
+        // Pre-iter-95 ordering built `Qwen35Model::load_from_lazy_tensor_map`
+        // even on cache HIT — for Qwen3.6-27B that meant ~100 GB of resident
+        // F32-expanded dense FFN weights via `load_lazy_dense_ffn` →
+        // `load_lazy_f32` (4×-expansion of BF16 → F32 host-side), causing
+        // the iter-93/94 jetsam-OOM at 158-186 GB peak. iter-95 reorder
+        // makes cache HIT the cheap path it was always supposed to be:
+        // ~52 GB resident (just `tensor_map`, no Qwen35Model).
+        let cache_key = SensitivityCacheKey::with_algorithm_version(
+            model_fingerprint(model, meta),
+            corpus_sha(corpus),
+            SENSITIVITY_ALGORITHM_VERSION,
+        );
+        let cache_path = match cache_file_path(&cache_key) {
+            Ok(path) => Some(path),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "dwq sensitivity cache path unavailable; running forward pass"
+                );
+                None
+            }
+        };
+
+        if let Some(path) = cache_path.as_deref() {
+            match load_dwq_from_path(path, &cache_key) {
+                Ok(Some(map)) => {
+                    info!(
+                        cache_key = %cache_key.hash(),
+                        path = %path.display(),
+                        entries = map.len(),
+                        "dwq sensitivity cache HIT (iter-95: pre-Qwen35Model-build short-circuit)"
+                    );
+                    return Ok(CalibrationData::Dwq(map));
+                }
+                Ok(None) => {
+                    info!(
+                        cache_key = %cache_key.hash(),
+                        path = %path.display(),
+                        "dwq sensitivity cache MISS"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        cache_key = %cache_key.hash(),
+                        path = %path.display(),
+                        "dwq sensitivity cache MISS; load failed, recomputing"
+                    );
+                }
+            }
+        }
+
         // ─────────── No-fallback guard + lazy capture build ───────────
+        // Cache MISS — must run the activation capture forward pass.
         // arch.requires_activation_capture() == true → capture MUST
         // be available (either eagerly attached, or constructible from
         // the lazy tensor map). Bail with a typed error otherwise.
@@ -272,51 +348,6 @@ impl Calibrator for DwqCalibrator {
                 });
             }
         };
-
-        let cache_key = SensitivityCacheKey::with_algorithm_version(
-            model_fingerprint(model, meta),
-            corpus_sha(corpus),
-            SENSITIVITY_ALGORITHM_VERSION,
-        );
-        let cache_path = match cache_file_path(&cache_key) {
-            Ok(path) => Some(path),
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    "dwq sensitivity cache path unavailable; running forward pass"
-                );
-                None
-            }
-        };
-
-        if let Some(path) = cache_path.as_deref() {
-            match load_dwq_from_path(path, &cache_key) {
-                Ok(Some(map)) => {
-                    info!(
-                        cache_key = %cache_key.hash(),
-                        path = %path.display(),
-                        entries = map.len(),
-                        "dwq sensitivity cache HIT"
-                    );
-                    return Ok(CalibrationData::Dwq(map));
-                }
-                Ok(None) => {
-                    info!(
-                        cache_key = %cache_key.hash(),
-                        path = %path.display(),
-                        "dwq sensitivity cache MISS"
-                    );
-                }
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        cache_key = %cache_key.hash(),
-                        path = %path.display(),
-                        "dwq sensitivity cache MISS; load failed, recomputing"
-                    );
-                }
-            }
-        }
 
         let pb = progress.bar(meta.num_layers as u64, "DWQ activation capture");
         info!(
