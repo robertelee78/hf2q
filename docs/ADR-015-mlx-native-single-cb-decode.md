@@ -1592,6 +1592,52 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter20-COHERENCE-DIAG — Qwen3.6 forward_gpu path is NONDETERMINISTIC at NGEN≥256 across ALL three Qwen cells; Gemma forward_mlx path is byte-identical-deterministic; the iter11–18 perf-bench results are partially compromised because every "parity gate" since iter11 was implicitly comparing against a moving baseline.  Per user "coherence is more important than speed" — pivot from perf to coherence as the iter20 mission.**
+
+  **A. THE FINDING.**  At temperature=0 greedy decode with the prompt "Hello, my name is", NGEN=256, the same hf2q binary produces *materially different* token sequences across consecutive runs on every Qwen3.6 fixture:
+
+  | fixture | family / forward path | trial-A md5 | trial-B md5 | content drift |
+  |---|---|---|---|---|
+  | qwen3.6-35b-a3b-dwq46 (MoE × Q4/Q6) | qwen35 / `forward_gpu.rs` | A | B | Trial A repeats `1. 1. 1.` degenerate; trial B emits `2025-09-11 14:25:00` repeating; trial-3 from iter18 matrix → unrelated content |
+  | qwen3.6-35b-a3b-apex (MoE × Q5_K) | qwen35 / `forward_gpu.rs` | `15877648` | `76b6de02` | Trial A: `_ _ _ _` repeating; trial B: `_**_**_` (different degenerate pattern) |
+  | qwen3.6-27b-dwq46 (dense) | qwen35 / `forward_gpu.rs` | `cf25a2c7` | `f5372cd7` | Trial A: `Hello, my name is 0 / Hello, my/?`; trial B: `Hello, my few / Hello, each / assistant` (sensible English but different content) |
+  | gemma-26B-dwq | gemma / `forward_mlx.rs` | `e0f008b5` | `17be7df6` | **Token sequence byte-identical**; only load+prefill ms differ |
+
+  **B. ISOLATION.**  The defect is **qwen35-specific**.  Gemma's forward_mlx.rs is single-CB GraphSession (per iter12 §P1 audit) and is fully deterministic — same prompt, same model, byte-identical decoded tokens trial-after-trial.  Qwen35's forward_gpu.rs is the 41-CB-per-token fused-layer pattern shipped in iter11 P3 Stage 1 (and the 103-CB legacy under `HF2Q_LEGACY_PER_LAYER_CB=1`).  Both paths within forward_gpu.rs are nondeterministic; the partial-chain N=2 gate from iter17 (which produced 8/8 byte-identical at NGEN=8) does NOT preserve determinism at NGEN=256 (verified: N=1, N=2, and legacy_per_layer_cb=1 all produce different content at NGEN=256).  iter17's "8/8 at NGEN=8" was too short for the divergence to compound visibly; the underlying nondeterminism existed in iter17 just like it exists today.
+
+  **C. iter20-attempt-1 (two-accumulator sumy port for `kernel_mul_mv_id_q4_0_f32`) — INCONCLUSIVE, NOT FALSIFIED.**  Implemented two-accumulator sumy in `mlx-native/src/shaders/quantized_matmul_id_ggml.metal` (mirroring the non-`_id` sibling's ADR-009 Phase 3A backport).  Built hf2q via local `.cargo/config.toml` patch.  Initial NGEN=256 run produced different output than the baseline (`---` instead of `2025-09-11 14:25:00`).  Looked like a parity break.  But the SAME baseline produces different output on TRIAL 1 vs TRIAL 2 vs TRIAL 3 (all without iter20's change), so the apparent "parity break" is indistinguishable from baseline drift.  Reverted.  iter20-attempt-1 is shelved pending coherent baseline.
+
+  **D. iter11–18 RETROACTIVE READING.**  Every iter that ran a parity smoke against the qwen35 forward path was implicitly comparing against a moving target:
+  - iter11–17: parity smokes at NGEN=8 happened to be CLOSE-ENOUGH-canonical 6/8 trials (iter17 documented this as "pre-existing nondeterminism") — but at NGEN=256 the divergence is GROSS.
+  - iter17 partial-chain N=2 was credited as "8/8 byte-identical" determinism win at NGEN=8.  At NGEN=256 N=2 is also nondeterministic.  The iter17 win is real at NGEN=8 but does not extend to production decode lengths.
+  - iter14 unretained-refs scratch lift — the byte-deterministic ` якобы!!!!!!!` corruption that iter14 traced to mlx-native param-builders is a SEPARATE class of bug (introduced by `MLX_UNRETAINED_REFS=1`); fixed by the lift.  The default-OFF nondeterminism documented here is INDEPENDENT and existed before iter14.
+  - iter18 matrix bench: per-trial t/s variance (e.g. 35B-A3B-dwq46: 111.5 / 111.8 / 105.6 — range ~6 t/s) is partially explained by the nondeterministic content path producing different per-token work amounts.  The Δpp signs are likely robust (apex/27B win, dwq46/gemma lose) because the relative ranking is monotonic in kernel cost; the absolute Δpp values are compromised.
+
+  **E. ANCHORING WITH MEMORY.**  `project_decode_parity_achieved` (older pin, HEAD `9ab4cca`) explicitly states: *"sourdough PASS at 3656 bytes"* — meaning at HEAD `9ab4cca` (pre-Wave-5b) the qwen35 decode was BYTE-IDENTICAL to a 3656-byte reference token sequence.  That known-good SHA is the bisect anchor.  Bisect range: `9ab4cca → faebba0`.
+
+  **F. CANDIDATE OFFENDING COMMITS** (all qwen35-specific, all touch forward_gpu.rs or kernels exclusively dispatched from qwen35):
+  - `49ab86c` / `cf5f420` / `8acd586` — Wave 5b.2 `gated_delta_net_chunk_o.metal` simdgroup_matrix MMA (qwen35 DeltaNet path; runs on 30/40 layers per token).
+  - `a9c67a6` / `4f8819f` (if exists) — Wave 5b.2 `inter_state` simdgroup_matrix MMA.
+  - `5983377` / `369fef9` — Wave 5b.18 `dispatch_qkv_split_f32` (qwen35 attention path).
+  - `826edff` — Wave 5b.19 `dispatch_repeat_tiled_f32` (qwen35 GQA expand).
+  - `ed768ef` / `13a4d3b` — iter11 P3 Stage 1 single-CB qwen35 forward (the 41-CB fused pattern itself).
+
+  Each is a candidate where a missing inter-dispatch barrier in the concurrent-encoder semantics could allow non-deterministic execution order.  Most likely failure mode: a producer→consumer pair where the consumer dispatch is added inside the same encoder without an `enc.memory_barrier()` between them, and Metal's `MTLDispatchTypeConcurrent` runtime reorders the consumer ahead of the producer.  Bisect will localize.
+
+  **G. STANDING PIN UPDATE** — adding `feedback_verify_baseline_determinism_before_perf_bench` to auto-memory.  iter11–18 demonstrates the cost of skipping this gate: every perf bench produces a number, but if the baseline content path varies trial-to-trial, the number is partly noise from content-path variance.  Future iters: BEFORE the perf bench, run two trials of the baseline at full NGEN, diff the decoded tokens — if not byte-identical, the perf bench is invalid until determinism is restored.
+
+  **H. iter21 MISSION.**  Coherence-first.  Before any further perf work on qwen35:
+  1. Bisect `9ab4cca → faebba0` to find the commit that introduced nondeterminism.  Test command: `hf2q generate --prompt "Hello, my name is" --max-tokens 256 --temperature 0 --model dwq46.gguf` × 2 trials → diff token output.  GOOD = byte-identical; BAD = differs.
+  2. Identify the missing barrier / race condition introduced by that commit.
+  3. Fix the barrier (NOT revert the optimization — just add the missing sync).
+  4. Verify determinism: 5-trial NGEN=256 byte-identical across all 3 qwen35 fixtures.
+  5. Re-run iter18 matrix bench; the t/s variance should drop substantially and the absolute Δpp values become trustworthy.
+  6. THEN resume Defect A (Q4_0 _id kernel A/B) work against a coherent baseline.
+
+  Per `feedback_speed_bar_full_matrix` and the user's reframing: *"coherence > speed — but we must be as (or more) coherent than peers and as fast as (or faster than) peers"*.  Currently failing on BOTH axes for Qwen35; gemma is coherent but slow.  iter21 fixes the qwen35 coherence side; iter22+ resumes perf work.
+
+  **I. ARTIFACTS.**  `/tmp/cfa-iter20/{baseline-n256.txt,iter20-n256.txt,baseline-n256-trial2.txt,n1-A.txt,n1-B.txt,n2-A.txt,n2-B.txt,apex-A.txt,apex-B.txt,27b-A.txt,27b-B.txt,gemma-A.txt,gemma-B.txt}` — per-fixture per-trial decoded outputs documenting the determinism state.  iter20-attempt-1 mlx-native worktree at `/opt/mlx-native/.cfa-worktrees/iter20-q4_0-id-twoacc` (kernel reverted; will be removed after iter21 finds the actual root cause).
+
 - **2026-04-29 — iter19-DIAG — quant-inventory crosscheck pinpoints Defect A to `mul_mv_id_q4_0_f32` specifically; `_id` × Q4_0 intersection is the lever, NOT mixed-precision dispatch nor PSO switching.**  Profile-first diagnosis from `gguf-dump` of all four matrix cells; the user's hypothesis "expert matmul dispatch and mixed quant dequant overhead — small scheduling fix may flip it" is partially correct but the schedule lever is narrower than expected: it's a single-kernel issue, not a multi-format encoder pattern.
 
   **Quant inventory facts (gguf-dump, all 40 layers per fixture):**
