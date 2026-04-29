@@ -302,12 +302,25 @@ enum FfnQuantArm {
 
 /// Pure lookup function — does NOT touch GPU buffers, easy to unit-test.
 ///
-/// Decision matrix (iter26 N-curve + iter27 GPU TS + iter29 capture wall):
+/// Decision matrix (iter26 N-curve + iter27 GPU TS + iter29 capture wall;
+/// iter45-RESUMED N-curve recapture on coherent baseline 2026-04-29):
 ///
 ///   - DenseQ + Q4_K (any K-quant Q4_K subtype):       cn = 4
 ///   - MoeQ   + Q4_K:                                  cn = 2
+///   - MoeQ   + Q4_0 (DWQ46/DWQ48 production blocks):  cn = 2  (iter45-RESUMED)
 ///   - MoeQ   + Q5_K / Q6_K (super-block):             cn = 1  (apex flat-negative)
-///   - any other (F32/BF16/F16/Q4_0/Q8_0/I16, etc.):   cn = 1
+///   - any other (F32/BF16/F16/Q8_0/I16, etc.):        cn = 1
+///
+/// **iter45-RESUMED (2026-04-29) Q4_0 MoE arm rationale.**  iter47 surfaced
+/// that DWQ46 / DWQ48 fixtures store expert/projection blocks as Q4_0 —
+/// the previous catch-all `_ => 1` arm caused dwq46 to run at cn=1 (40
+/// layer CBs/decode token), measured 0.9439× vs llama on coherent baseline.
+/// iter45-RESUMED 5-trial cold-process N-curve [1,2,4,8,20] × NGEN=256
+/// measured cn=2 wins at 1.0114× (+6.75pp vs cn=1) for dwq46 35B-MoE.
+/// Phase 5 gate PASS: ≥1pp gain on primary fixture, ≥0pp on apex / 27b /
+/// gemma (apex Q5_K and 27b DenseQ Q4_0 are unaffected by this MoE Q4_0
+/// arm; gemma uses forward_mlx).  iter47 evidence base committed
+/// 2026-04-29 in /tmp/adr015-iter45/bench/N-curve-summary-20260429T190141Z.tsv.
 ///
 /// `cfg_is_moe` is the cross-check from `cfg.moe.is_some()` — if it
 /// disagrees with `arm`, fall through to cn=1 (defensive against
@@ -321,6 +334,8 @@ fn chain_n_for(
     match (arm, quant) {
         (FfnQuantArm::DenseQ, Some(GgmlType::Q4_K)) if !cfg_is_moe => 4,
         (FfnQuantArm::MoeQ, Some(GgmlType::Q4_K)) if cfg_is_moe => 2,
+        // iter45-RESUMED: DWQ46/DWQ48 store as Q4_0; cn=2 measured optimum (+6.75pp on dwq46).
+        (FfnQuantArm::MoeQ, Some(GgmlType::Q4_0)) if cfg_is_moe => 2,
         (FfnQuantArm::MoeQ, Some(GgmlType::Q5_K)) if cfg_is_moe => 1,
         (FfnQuantArm::MoeQ, Some(GgmlType::Q6_K)) if cfg_is_moe => 1,
         // Any other quant class, F32-arm, or arm/cfg mismatch → conservative cn=1.
@@ -3112,7 +3127,10 @@ mod tests {
 
     #[test]
     fn chain_n_for_unknown_quant_returns_1() {
-        // Q4_0, Q8_0, F32, F16: conservative cn=1 (no measured win).
+        // Q8_0, F32, F16: conservative cn=1 (no measured win).
+        // Q4_0 has fixture-specific arms (DenseQ Q4_0 dense → cn=1 catch-all,
+        // MoeQ Q4_0 → cn=2 per iter45-RESUMED N-curve evidence).  See dedicated
+        // test below.
         use mlx_native::ops::quantized_matmul_ggml::GgmlType;
         assert_eq!(
             chain_n_for(FfnQuantArm::DenseQ, Some(GgmlType::Q4_0), false),
@@ -3121,6 +3139,19 @@ mod tests {
         assert_eq!(
             chain_n_for(FfnQuantArm::MoeQ, Some(GgmlType::Q8_0), true),
             1
+        );
+    }
+
+    #[test]
+    fn chain_n_for_dwq46_moe_q4_0_returns_2() {
+        // iter45-RESUMED (2026-04-29) measured-optimum on coherent baseline:
+        // dwq46 35B-MoE (Q4_0 expert blocks) at cn=2 = 1.0114× (+6.75pp vs
+        // cn=1 = 0.9439×).  Sister fixtures unaffected: apex Q5_K stays cn=1,
+        // 27b DenseQ Q4_0 stays cn=1 (catch-all), gemma forward_mlx inert.
+        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+        assert_eq!(
+            chain_n_for(FfnQuantArm::MoeQ, Some(GgmlType::Q4_0), true),
+            2
         );
     }
 

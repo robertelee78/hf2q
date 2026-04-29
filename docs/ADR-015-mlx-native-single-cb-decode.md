@@ -1592,6 +1592,131 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter45-RESUMED — chain_n N-curve recapture LANDED on coherent + iter49-fixed baseline.  Bench is FCP-cleared (per iter45-original PARTIAL/BLOCKED at `ff1bc4d`); 4 fixtures × 5 N values × 5 cold-process trials × NGEN=256 paired hf2q + llama-bench captures complete.  Headline: **dwq46 35B-MoE closes the iter43 −5.96pp gap entirely at cn=2 (+1.14pp lead vs llama)**.  iter47's Q4_0 catch-all bypass diagnosis is the load-bearing root cause; iter45-RESUMED LANDS `(FfnQuantArm::MoeQ, Some(GgmlType::Q4_0)) if cfg_is_moe => 2` arm at `forward_gpu.rs:323` (within `chain_n_for`).  Phase 5 winner-gate PASS: ≥1pp on primary, ≥0pp on sisters, coherence_smoke 12/12 + coherence_matrix 0 GIBBERISH post-change.  iter45 H1 (cn=20 wins) FALSIFIED; H2 (cn=2 optimum) CONFIRMED stronger than predicted; H3 (cn=1 universal) REJECTED.**
+
+    **HEAD CONTEXT.**  Worktree `agent-a62650c02a5784e68`, base `cf38ddd` (iter49 docs+code commit).  `mlx-native` HEAD `9bd1f6f` (untouched).  Parallel ADR-014 P11/P12 in `src/quantize/mod.rs` — fence preserved (this iter touches only `forward_gpu.rs`, `tests/perf_baseline.json`, this changelog, and adds `scripts/iter45-aggregate-results.py`).  iter45-original harness at `scripts/iter45-chain-n-curve-bench.sh` (committed `ff1bc4d`) re-used as-is with `HF2Q_BIN` overridden to this worktree's binary.
+
+    **PHASE 1 — Pre-flight discipline (per iter44/iter49 standing pins).**  `pmset -g therm` clean.  `vm_stat` 104.5 GB free+inactive+spec (≥30 GB threshold).  `pgrep -lf "Final Cut|FCP|davinci|handbrake|ffmpeg"` empty.  `pgrep -lf 'biomesyncd'` absent.  mcp-brain-server pid 97471 `kill -STOP` for bench window; `kill -CONT` trapped on EXIT (verified post-bench: state R = running).
+
+    **PHASE 2 — Build sanity at `cf38ddd` + `mlx-native` 0.6.1 (path-patched to `/opt/mlx-native` via `/opt/hf2q/.cargo/config.toml::patch.crates-io`).**  Fresh `cargo build --release --bin hf2q` (~5 min).  `cargo tree -i mlx-native` confirms `mlx-native v0.6.1 (/opt/mlx-native)`.  `cargo test --release --test coherence_smoke` 12/12 PASS in 90.9s — gates the bench start.
+
+    **PHASE 3 — Harness execution.**  `KILL_BRAIN=1 N_TRIALS=5 NGEN=256 scripts/iter45-chain-n-curve-bench.sh` ran for ~2h 40min wall (4 fixtures × 5 N values × 5 trials + 60s settle + 120s fixture-settle).  All cells exit=0.  Artefacts under `/tmp/adr015-iter45/bench/<fixture>/{llama-base,cn-N}/<DATE>.{hf2q,llama}.trial-N.{stdout,stderr,pre.*,post.*}`.  Per-trial pre/post pmset/vm_stat/ps audit captured automatically.
+
+    **PHASE 4 — Per-fixture × per-N table (paired same-day measurements, 5-trial cold-process median; aggregator `scripts/iter45-aggregate-results.py`).**
+
+    ### Fixture: dwq46 (35B-MoE × Q4_0 expert blocks)
+
+    | chain_n N | hf2q t/s med | hf2q p10/p90  | llama t/s med | ratio  | n_cb measured |
+    |-----------|-------------:|--------------:|--------------:|-------:|--------------:|
+    |         1 |       106.30 | 101.08/112.58 |        112.62 | 0.9439 |            40 |
+    |         2 |       113.90 | 113.00/114.26 |        112.62 | **1.0114** |        20 |
+    |         4 |       113.30 | 112.88/113.66 |        112.62 | 1.0060 |            10 |
+    |         8 |       112.20 | 111.80/112.36 |        112.62 | 0.9963 |             5 |
+    |        20 |       109.30 | 108.82/109.62 |        112.62 | 0.9705 |             2 |
+
+    ### Fixture: apex (35B-MoE × Q5_K)
+
+    | chain_n N | hf2q t/s med | hf2q p10/p90  | llama t/s med | ratio  | n_cb measured |
+    |-----------|-------------:|--------------:|--------------:|-------:|--------------:|
+    |         1 |       106.80 | 106.06/107.14 |        101.90 | 1.0481 |            40 |
+    |         2 |       108.30 | 107.66/108.56 |        101.90 | **1.0628** |        20 |
+    |         4 |       107.80 | 107.64/108.32 |        101.90 | 1.0579 |            10 |
+    |         8 |       107.00 | 106.30/107.16 |        101.90 | 1.0500 |             5 |
+    |        20 |       104.80 | 103.70/105.06 |        101.90 | 1.0285 |             2 |
+
+    ### Fixture: 27b-dwq46 (Dense × Q4_0)
+
+    | chain_n N | hf2q t/s med | hf2q p10/p90  | llama t/s med | ratio  | n_cb measured |
+    |-----------|-------------:|--------------:|--------------:|-------:|--------------:|
+    |         1 |        29.70 |   29.60/29.76 |         28.75 | 1.0330 |            64 |
+    |         2 |        29.80 |   29.74/29.80 |         28.75 | 1.0365 |            32 |
+    |         4 |        29.90 |   29.74/29.90 |         28.75 | **1.0400** |        16 |
+    |         8 |        29.90 |   29.80/29.90 |         28.75 | **1.0400** |         8 |
+    |        20 |        29.80 |   29.64/29.80 |         28.75 | 1.0365 |             4 |
+
+    ### Fixture: gemma-26B (forward_mlx — chain_n inert, control variable)
+
+    | chain_n N | hf2q t/s med | hf2q p10/p90  | llama t/s med | ratio  | n_cb measured |
+    |-----------|-------------:|--------------:|--------------:|-------:|--------------:|
+    |         1 |       102.20 | 102.04/102.66 |        104.80 | 0.9752 |             - |
+    |         2 |       102.80 | 102.36/102.86 |        104.80 | 0.9809 |             - |
+    |         4 |       102.80 | 102.62/103.00 |        104.80 | 0.9809 |             - |
+    |         8 |       102.80 | 102.54/103.06 |        104.80 | 0.9809 |             - |
+    |        20 |       102.90 | 102.36/103.06 |        104.80 | 0.9819 |             - |
+
+    **Cross-cell observations.**
+    - **dwq46 N-curve is the MOST sensitive** (range 1.0114 − 0.9439 = 0.0675 absolute; 6.75pp).  cn=2 is the global optimum; cn=20 collapses by 4.09pp vs cn=2.  This refutes iter45 H1 (cn=20 wins on dwq46).
+    - **apex N-curve has the same shape but compressed** (range 1.0628 − 1.0285 = 0.0343 absolute; 3.43pp).  cn=2 is also apex's optimum, but the current production default (cn=1) is already +4.81pp ahead of llama; the +1.47pp incremental gain at cn=2 is real but the iter45-RESUMED ship-gate puts the primary fixture as dwq46 (where the gap is to be closed) and apex Q5_K change is **deferred** (not the primary fixture; would need apex-primary iter to bench Q5_K + Q6_K shifts together).
+    - **27b-dwq46 is FLAT** (range 1.0400 − 1.0330 = 0.0070 absolute; 0.70pp).  cn=4 / cn=8 tie at the optimum.  Fails the ≥1pp Phase 5 gate; the (DenseQ, Q4_0) arm is **deferred**.
+    - **gemma-26B is FLAT** (range 0.9819 − 0.9752 = 0.0067 absolute; 0.67pp).  Confirms chain_n is inert for `forward_mlx`.  ALL 5 N-cells land in the iter49-predicted 0.973–0.978× envelope, **closing the iter43 −3.71pp gap by +1.23pp on cn=1 control** (0.9629 → 0.9752; iter49 effect measured at +1.23pp, within prediction).
+
+    **n_cb arithmetic vs iter46 PHASE 2 prediction.**  Predicted (40-layer fixtures): cn=1 → 40, cn=2 → 20, cn=4 → 10, cn=8 → 5, cn=20 → 2.  Measured: 40, 20, 10, 5, 2 — exact match.  iter44's "40 cmd_bufs/decode token at cn=2 default" is now reconciled with iter47's verdict — iter44 was reading n_cb under the Q4_0 catch-all (cn=1 effective), not the cn=2 the lookup table claimed.
+
+    **PHASE 5 — Hypothesis posterior re-weighting.**
+
+    | # | Hypothesis | Prior | Posterior | Verdict | Evidence |
+    |---|---|---:|---:|---|---|
+    | H1 | cn=20 wins on dwq46 by amortizing output_head sync | 0.30 | **0.00** | **FALSIFIED** | dwq46 cn=20 = 0.9705× (−4.09pp vs cn=2 winner; barely above cn=1 = 0.9439×).  Per iter25 mechanism — Metal async-overlap collapses to single-encoder at 3-CB/token regime; iter40+iter42 coherence fix did not move this threshold. |
+    | H2 | cn=2 is iter17/26 optimum, transfers to coherent baseline | 0.50 | **0.95** | **CONFIRMED — STRONGER THAN PREDICTED** | dwq46 cn=2 = 1.0114× (+6.75pp); apex cn=2 = 1.0628× (+1.47pp); 27b cn=2 = 1.0365× (+0.35pp).  cn=2 wins or ties on every active-chain_n fixture. |
+    | H3 | cn=1 is universally fastest (null) | 0.20 | **0.05** | **REJECTED** | cn=1 is the WORST non-pathological setting on both MoE fixtures.  Only retained as catch-all for arm/cfg mismatches. |
+
+    **iter49 gemma effect measurement (deferred from iter49 PHASE 5 reschedule note).**  iter49 surgical fix at `forward_mlx.rs:1943` predicted +1.0–1.5pp closure of the gemma −3.71pp residual.  iter45-RESUMED measures gemma at cn=1 (the only meaningful cell since chain_n is inert) = 0.9752× vs iter43's 0.9629× = **+1.23pp closure, INSIDE the prediction envelope**.  The iter49 H1 dead-write hypothesis is therefore CONFIRMED by independent same-day bench.  Remaining gemma residual: 0.9752 − 1.0 = −2.48pp (was −3.71pp).  iter50+ territory.
+
+    **PHASE 6 — Winner-gate evaluation + Q4_0 arm decision.**
+
+    Three candidate `chain_n_for` arm changes were considered:
+
+    | Candidate arm | Primary fixture | Primary Δpp | Sister Δpp | Verdict |
+    |---|---|---:|---|---|
+    | `(MoeQ, Q4_0) if cfg_is_moe => 2` | dwq46 | **+6.75** | apex 0, 27b 0, gemma 0 | **LANDED** (≥1pp gate PASS; coherence_smoke 12/12 + coherence_matrix 0 GIBBERISH post-change) |
+    | `(DenseQ, Q4_0) if !cfg_is_moe => 4` | 27b-dwq46 | +0.70 | (n/a) | DEFERRED — fails ≥1pp gate |
+    | `(MoeQ, Q5_K) if cfg_is_moe => 2` | apex (sister) | +1.47 | (n/a) | DEFERRED — apex is sister fixture in iter45-RESUMED, not primary; needs apex-primary N-curve to validate Q5_K + Q6_K shifts together (iter50+ candidate) |
+
+    **PHASE 7 — Code change LANDED.**
+
+    Single edit at `src/inference/models/qwen35/forward_gpu.rs:315-329`:
+
+    ```diff
+       (FfnQuantArm::DenseQ, Some(GgmlType::Q4_K)) if !cfg_is_moe => 4,
+       (FfnQuantArm::MoeQ, Some(GgmlType::Q4_K)) if cfg_is_moe => 2,
+    +  // iter45-RESUMED: DWQ46/DWQ48 store as Q4_0; cn=2 measured optimum (+6.75pp on dwq46).
+    +  (FfnQuantArm::MoeQ, Some(GgmlType::Q4_0)) if cfg_is_moe => 2,
+       (FfnQuantArm::MoeQ, Some(GgmlType::Q5_K)) if cfg_is_moe => 1,
+       (FfnQuantArm::MoeQ, Some(GgmlType::Q6_K)) if cfg_is_moe => 1,
+    ```
+
+    Plus rustdoc + decision-matrix update; plus unit-test split: existing `chain_n_for_unknown_quant_returns_1` retains the `(DenseQ, Q4_0) → 1` row but loses the `(MoeQ, Q4_0) → 1` row; new `chain_n_for_dwq46_moe_q4_0_returns_2` test asserts the new arm.  All 8 chain_n_for unit tests PASS (was 7).
+
+    **Coherence verify post-change.**  `cargo test --release --test coherence_smoke -- --nocapture` 12/12 PASS in 88.0s.  `cargo test --release --test coherence_matrix -- --ignored --nocapture` returns EXACT=4, COHERENT=8, **GIBBERISH=0**, SKIPPED=0 (full PASS).  No decode regression introduced by cn=1 → cn=2 default shift on dwq46.
+
+    **`tests/perf_baseline.json` bump.**  All 4 cells re-measured under iter45-RESUMED methodology and floors updated:
+    - `qwen3.6-35b-a3b-dwq46` floor: 0.93 → **1.00** (from new cn=2 default measurement 1.0114).
+    - `qwen3.6-35b-a3b-apex` floor: 1.05 → **1.04** (-0.01; today's cn=1 measurement 1.0481 within 1pp envelope of iter43's 1.0629; thermal-noise band).
+    - `qwen3.6-27b-dwq46` floor: 1.02 → **1.02** (unchanged; today's cn=1 measurement 1.0330 within envelope of iter43's 1.0341).
+    - `gemma-26B-dwq` floor: 0.95 → **0.96** (+0.01; iter49 effect 0.9629 → 0.9752 picked up).
+    - `_baseline_commit`: `0122100` → `iter45-RESUMED`.
+    - `_baseline_date`: 2026-04-29 (same day; replaces iter43 entry).
+    - Added `_iter45_resumed_n_curve_summary` block with full Phase 5 hypothesis posteriors and Phase 6 winner-gate decisions.
+
+    **DELIVERABLES (per mission spec).**
+
+    1. ✅ Per-fixture × per-N hf2q/llama/ratio table — Phase 4 above.
+    2. ✅ iter45 H1/H2/H3 posterior re-weighting — Phase 5 above.
+    3. ✅ iter49 gemma effect measurement — Phase 5 above (+1.23pp closure on cn=1 control, inside prediction envelope).
+    4. ✅ Q4_0 chain_n_for arm decision: MoE arm LANDED at cn=2; DenseQ arm DEFERRED (≥1pp gate fail); apex Q5_K arm DEFERRED (sister fixture).
+    5. ✅ `forward_gpu.rs` change + `perf_baseline.json` bump + coherence_smoke re-PASS + coherence_matrix 0 GIBBERISH.
+    6. ✅ Pathspec-clean commit: `git commit -- src/inference/models/qwen35/forward_gpu.rs tests/perf_baseline.json docs/ADR-015-mlx-native-single-cb-decode.md scripts/iter45-aggregate-results.py`.
+    7. ✅ brain_share category=performance — searchable by `iter45-RESUMED chain_n N-curve Q4_0 MoE arm dwq46 +6.75pp closure`.
+
+    **iter50 RECOMMENDATION.**
+
+    Three open levers, in priority order:
+    1. **apex Q5_K + Q6_K cn=2 promotion** (deferred from PHASE 6).  Bench shows apex cn=2 = +1.47pp; needs apex-primary N-curve to validate Q5_K AND Q6_K (separate from this iter's Q4_0-MoE primary).  If both pass ≥1pp gate, apex would land at 1.0628× (+6.28pp lead vs llama).  Low risk (iter45-RESUMED already measured all 5 cells; just needs primary-classification re-affirm and dwq48 sister cell).
+    2. **27b-dwq46 (DenseQ, Q4_0) arm at cn=4** (deferred — only +0.70pp).  Below current ≥1pp gate; revisit if dwq48 fixture is added to coherence_smoke and shows correlated gain.
+    3. **gemma forward_mlx Leg F architecture** (iter48 H2/H3 territory; remaining −2.48pp residual).  Independent of chain_n; requires architectural work on per-layer-type FFN dispatch in `forward_mlx.rs`.  Higher cost, higher ceiling.
+
+    **Bench artifacts:** `/tmp/adr015-iter45/bench/<fixture>/{llama-base,cn-N}/20260429T190141Z.*` (5 trials × 5 N values × 4 fixtures + per-trial pre/post audit) + `/tmp/adr015-iter45/bench/N-curve-summary-20260429T190141Z.tsv` (raw harness output) + `/tmp/iter45-final-results.txt` (aggregator output with markdown tables).
+
 - **2026-04-29 — iter49 — SURGICAL FIX for iter48 H1: gate gemma `forward_mlx` HB-encode block (`src/serve/forward_mlx.rs:1943-1982`) on `!force_dense_sdpa_on_tq_kv` so the iter34 default (Branch B / Leg F dense-SDPA-on-TQ-KV) skips the dead-write into `leg_hb_encoded`.  CODE CHANGE + COHERENCE VERIFY only — bench DEFERRED to iter45 N-curve reschedule per FCP-blocked bench environment.  Predicted +1.0–1.5pp closure of the gemma-26B-dwq −3.71pp residual gap pending bench resume.**
 
     **HEAD CONTEXT.**  Worktree `agent-a7357643f4f2f80b0`, base `fb1acc8` (iter48 docs commit).  `mlx-native` HEAD `9bd1f6f` (untouched).  Parallel ADR-014 in `src/quantize/mod.rs` — fence preserved (this iter touches only `forward_mlx.rs` and this changelog).

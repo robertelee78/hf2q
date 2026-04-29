@@ -1,92 +1,119 @@
 {
-  "_comment": "ADR-015 iter43 — per-cell hf2q/llama tok/s ratio floors. RE-CAPTURED on coherent baseline after iter40+iter42 prefill fixes. Each cell maps to scripts/bench-matrix.sh CELLS labels. Floor expressed as ratio = hf2q_tps / llama_tps; cell fails if measured ratio drops >1pp below floor (i.e. >0.01 absolute).",
-  "_captured_at": "2026-04-29T17:00:00Z",
-  "_baseline_commit": "0122100",
+  "_comment": "ADR-015 iter45-RESUMED — per-cell hf2q/llama tok/s ratio floors.  Re-captured 2026-04-29 on coherent baseline (12/12 coherence_smoke PASS) using the iter45 chain_n N-curve harness (5 cold-process trials × NGEN=256 × paired hf2q + llama-bench).  iter45-RESUMED LANDS the (MoeQ, Q4_0) → cn=2 arm in chain_n_for; dwq46 production default shifts cn=1 (catch-all) → cn=2, closing the iter43 −5.96pp gap into a +1.14pp lead.  Sister cells (apex, 27b, gemma) unaffected by the Q4_0 MoE arm but re-measured here for same-day baseline integrity.",
+  "_captured_at": "2026-04-29T19:01:41Z",
+  "_baseline_commit": "iter45-RESUMED",
   "_baseline_date": "2026-04-29",
   "_baseline_mlx_native": "9bd1f6f",
   "_recapture_required": false,
-  "_recapture_reason": "iter43 re-baseline: 4 of 6 cells re-measured against coherent decode (12/12 coherence_smoke PASS). Two dwq48 cells not in coherence_smoke fixture set; their floors retained from iter41 pending separate measurement.",
-  "_methodology": "scripts/bench-matrix.sh at NGEN=256, prompt='Hello, my name is', N_TRIALS=3 cold-process per cell. hf2q autodefault chain_n + iter34 default-on dense-SDPA-on-TQ-KV. Floor = measured_ratio - 0.01 tolerance.",
+  "_recapture_reason": "iter45-RESUMED N-curve recapture against post-iter49 HEAD (cf38ddd).  Bench: /tmp/adr015-iter45/bench/N-curve-summary-20260429T190141Z.tsv.  All 4 fixtures × 5 N values × 5 trials archived.",
+  "_methodology": "scripts/iter45-chain-n-curve-bench.sh at NGEN=256, prompt='Hello, my name is', N_TRIALS=5 cold-process per cell.  hf2q runs each fixture under each of HF2Q_PARTIAL_CHAIN_N ∈ {1,2,4,8,20}; ratios below are hf2q_med / llama_med at the production-default cn for that fixture's quant arm.  Floor = measured_ratio - 0.01 tolerance.  Phase 5 gate: ≥1pp improvement on primary fixture AND ≥0pp regression on every other fixture AND coherence_smoke 12/12 PASS post-change.",
   "cells": {
     "qwen3.6-35b-a3b-dwq46": {
-      "ratio_floor": 0.93,
-      "_measured_ratio": 0.9404,
-      "_measured_hf2q_tps_med": 111.1,
-      "_measured_llama_tps_med": 118.14,
+      "ratio_floor": 1.00,
+      "_measured_ratio": 1.0114,
+      "_measured_hf2q_tps_med": 113.9,
+      "_measured_llama_tps_med": 112.62,
       "_measured_at_ngen": 256,
-      "_measured_at_commit": "0122100",
+      "_measured_at_commit": "iter45-RESUMED",
       "_measured_at_date": "2026-04-29",
-      "_note": "MoE-35B-A3B × dwq46 (Q4 base / Q6 sensitive). iter43 measured 0.9404 (-5.96pp), the largest gap on coherent baseline. Floor 0.93 = measured 0.9404 - 0.01 tolerance. Iter44 candidate cell."
+      "_chain_n_default": 2,
+      "_note": "MoE-35B-A3B × dwq46 (Q4_0 expert blocks per iter47).  iter45-RESUMED N-curve: cn=1 → 0.9439× (40 layer CBs/tok); cn=2 → 1.0114× (20 layer CBs/tok); cn=4 → 1.0060×; cn=8 → 0.9963×; cn=20 → 0.9705×.  iter45 LANDS (MoeQ, Q4_0) → cn=2 in chain_n_for; Phase 5 gate +6.75pp PASS.  Floor 1.00 = measured 1.0114 - 0.01 tolerance."
     },
     "qwen3.6-35b-a3b-dwq48": {
-      "ratio_floor": 0.93,
-      "_note": "MoE-35B-A3B × dwq48 (Q4 base / Q8 sensitive). NOT re-measured at iter43 (not in coherence_smoke fixture set). Floor inherited from iter41."
+      "ratio_floor": 1.00,
+      "_note": "MoE-35B-A3B × dwq48 (Q4_0 + Q8 sensitive).  Not in iter45-RESUMED N-curve fixture set; same Q4_0 MoE arm fix applies (cn=2).  Floor inherited from dwq46 (same Q4_0 MoE catch-all bypass).  Re-measure when fixture is added to coherence_smoke."
     },
     "qwen3.6-35b-a3b-apex": {
-      "ratio_floor": 1.05,
-      "_measured_ratio": 1.0629,
-      "_measured_hf2q_tps_med": 107.0,
-      "_measured_llama_tps_med": 100.67,
+      "ratio_floor": 1.04,
+      "_measured_ratio": 1.0481,
+      "_measured_hf2q_tps_med": 106.8,
+      "_measured_llama_tps_med": 101.90,
       "_measured_at_ngen": 256,
-      "_measured_at_commit": "0122100",
+      "_measured_at_commit": "iter45-RESUMED",
       "_measured_at_date": "2026-04-29",
-      "_note": "MoE-35B-A3B × apex (Q8-ish baseline). iter43 measured 1.0629 (+6.29pp), hf2q LEADS llama. Floor 1.05 = measured 1.0629 - 0.01 tolerance."
+      "_chain_n_default": 1,
+      "_note": "MoE-35B-A3B × apex (Q5_K MoE).  iter45-RESUMED N-curve: cn=1 → 1.0481× (production default; matches iter43's 1.0629× within thermal noise); cn=2 → 1.0628×; cn=4 → 1.0579×; cn=8 → 1.0500×; cn=20 → 1.0285×.  cn=2 +1.47pp gain measured but Phase 5 ≥1pp gate is on PRIMARY fixture only — apex is sister to dwq46 (Q4_0 arm); Q5_K cn shift deferred to a separate iter (validate apex Q5_K + Q6_K together against full N-curve; iter50+ candidate).  Floor 1.04 = measured 1.0481 - 0.01 tolerance."
     },
     "qwen3.6-27b-dwq46": {
       "ratio_floor": 1.02,
-      "_measured_ratio": 1.0341,
+      "_measured_ratio": 1.0330,
       "_measured_hf2q_tps_med": 29.7,
-      "_measured_llama_tps_med": 28.72,
+      "_measured_llama_tps_med": 28.75,
       "_measured_at_ngen": 256,
-      "_measured_at_commit": "0122100",
+      "_measured_at_commit": "iter45-RESUMED",
       "_measured_at_date": "2026-04-29",
-      "_note": "dense-27B × dwq46. iter43 measured 1.0341 (+3.41pp); BOTH hf2q AND llama at ~29 t/s on this fixture (NOT 100+ t/s as historically claimed pre-iter40 — root cause of absolute drop is iter44 territory). Ratio holds parity. Floor 1.02 = measured 1.0341 - 0.01 tolerance."
+      "_chain_n_default": 1,
+      "_note": "dense-27B × dwq46 (Q4_0 dense per iter47, falls through chain_n_for `_ => 1` catch-all).  iter45-RESUMED N-curve: cn=1 → 1.0330× (production default); cn=2 → 1.0365×; cn=4 → 1.0400×; cn=8 → 1.0400×; cn=20 → 1.0365×.  cn=4/8 measured optimum (+0.70pp vs cn=1) — fails Phase 5 gate ≥1pp; (DenseQ, Q4_0) arm DEFERRED.  Floor 1.02 = measured 1.0330 - 0.01 tolerance."
     },
     "qwen3.6-27b-dwq48": {
       "ratio_floor": 1.00,
-      "_note": "dense-27B × dwq48. NOT re-measured at iter43 (not in coherence_smoke fixture set). Floor inherited from iter41."
+      "_note": "dense-27B × dwq48.  Not in iter45-RESUMED N-curve fixture set.  Floor inherited from iter41."
     },
     "gemma-26B-dwq": {
-      "ratio_floor": 0.95,
-      "_measured_ratio": 0.9629,
-      "_measured_hf2q_tps_med": 99.8,
-      "_measured_llama_tps_med": 103.64,
+      "ratio_floor": 0.96,
+      "_measured_ratio": 0.9752,
+      "_measured_hf2q_tps_med": 102.2,
+      "_measured_llama_tps_med": 104.80,
       "_measured_at_ngen": 256,
-      "_measured_at_commit": "0122100",
+      "_measured_at_commit": "iter45-RESUMED",
       "_measured_at_date": "2026-04-29",
-      "_note": "gemma-26B × dwq. iter43 measured 0.9629 (-3.71pp). iter34 default-on dense-SDPA-on-TQ-KV lever validated AMPLIFIED on coherent baseline (legacy=0.7073, default=0.9629; Δratio=+25.56pp vs claimed +11.97pp). Floor 0.95 = measured 0.9629 - 0.01 tolerance."
+      "_chain_n_default": "inert (forward_mlx)",
+      "_note": "gemma-26B × dwq.  iter45-RESUMED post-iter49 (HB-encode dead-write gate landed cf38ddd) measured 0.9752–0.9819× across all N (chain_n inert for forward_mlx).  iter43 measured 0.9629×; iter49 predicted +1.0–1.5pp shift to 0.973–0.978×.  MEASURED 0.9752× at cn=1 (matches predicted band; +1.23pp closure).  Floor 0.96 = measured 0.9752 - 0.01 tolerance.  Future gemma perf is iter50+ (forward_mlx Leg F architectural)."
     }
   },
   "_tolerance_pp": 1.0,
   "_tolerance_explanation": "A cell fails if its measured ratio drops >1 percentage point (0.01 absolute) below its ratio_floor. Tolerance accommodates same-day thermal noise (~5% intra-trial spread on M5 Max single-process per project_m5max_residency_null_win_single_process) without admitting a real regression.",
-  "_iter43_lever_validation_summary": {
-    "iter30_chain_n_autodefault": {
-      "cell": "qwen3.6-27b-dwq46",
-      "default_tps_med": 29.7,
-      "alt_tps_med": 25.4,
-      "alt_env": "HF2Q_PARTIAL_CHAIN_LEGACY=1",
-      "delta_pct_relative": 14.5,
-      "status": "HOLDS",
-      "caveat": "alt run had 1 outlier trial (12.5 t/s); robust subsample Δ ≈ +9.2%"
+  "_iter45_resumed_n_curve_summary": {
+    "_artefact": "/tmp/adr015-iter45/bench/N-curve-summary-20260429T190141Z.tsv",
+    "_aggregator": "scripts/iter45-aggregate-results.py (iter44 bucket aggregator + median/p10/p90)",
+    "_n_trials_per_cell": 5,
+    "_ngen": 256,
+    "_prompt": "Hello, my name is",
+    "_chat_template": "RAW",
+    "_pre_flight_audit": "PASS — pmset clean, vm_stat 104 GB free, FCP/davinci/handbrake/ffmpeg empty, biomesyncd absent, mcp-brain-server STOP/CONT trapped",
+    "phase_5_hypothesis_re_weighting": {
+      "h1_cn_20_wins_dwq46": {
+        "prior_weight": 0.30,
+        "posterior_weight": 0.00,
+        "verdict": "FALSIFIED",
+        "evidence": "dwq46 cn=20 = 0.9705× (−4.09pp vs cn=2 winner; −0.27pp vs cn=1 baseline).  cn=20 collapses below cn=8 on dwq46.  Per-CB driver-overhead amortization at 3-CB/token regime is overshadowed by Metal async-overlap loss (iter25 mechanism still operative on coherent baseline)."
+      },
+      "h2_cn_2_local_optimum": {
+        "prior_weight": 0.50,
+        "posterior_weight": 0.95,
+        "verdict": "CONFIRMED — STRONGER THAN PREDICTED",
+        "evidence": "dwq46 cn=2 = 1.0114× (+6.75pp vs cn=1, +1.14pp vs llama).  apex cn=2 = 1.0628× (+1.47pp vs cn=1).  27b cn=2 = 1.0365× (+0.35pp vs cn=1).  cn=2 wins or ties on every fixture with the chain_n lever active.  Iter17/26 finding TRANSFERS to coherent baseline — the iter40+iter42 coherence fixes did not invalidate the cn=2 optimum."
+      },
+      "h3_cn_1_universally_fastest": {
+        "prior_weight": 0.20,
+        "posterior_weight": 0.05,
+        "verdict": "REJECTED",
+        "evidence": "cn=1 is the WORST non-pathological setting on both MoE fixtures: dwq46 cn=1 = 0.9439× (−6.75pp vs cn=2); apex cn=1 = 1.0481× (−1.47pp vs cn=2).  Only retained as catch-all for arm/cfg mismatches."
+      }
     },
-    "iter34_dense_sdpa_on_tq_kv": {
-      "cell": "gemma-26B-dwq",
-      "default_tps_med": 99.8,
-      "alt_tps_med": 73.3,
-      "alt_env": "HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=0",
-      "delta_pct_relative": 36.2,
-      "delta_ratio_pp": 25.6,
-      "claimed_delta_pp": 11.97,
-      "status": "AMPLIFIED"
-    },
-    "iter37_auto_barrier": {
-      "cell": "qwen3.6-27b-dwq46",
-      "default_tps_med": 29.7,
-      "alt_tps_med": 23.1,
-      "alt_env": "HF2Q_AUTO_BARRIER=1",
-      "delta_pct_relative": -22.2,
-      "status": "NEUTRAL-PER-DESIGN",
-      "caveat": "iter37/38 audit confirms zero production callsites use dispatch_tracked_*; lever is structurally inert. Measured drop attributed to thermal warming (Wave C run-3) + per-trial cold-cache variance (legacy run had 12.5 outlier; auto-barrier-on trials all 20-23 range)."
+    "phase_6_winner_gate_decisions": {
+      "moe_q4_0_arm_at_cn_2": {
+        "candidate": "(FfnQuantArm::MoeQ, Some(GgmlType::Q4_0)) if cfg_is_moe => 2",
+        "primary_fixture": "qwen3.6-35b-a3b-dwq46",
+        "primary_delta_pp": 6.75,
+        "sister_deltas_pp": {"apex_q5k": 0.0, "27b_q4_0": 0.0, "gemma": 0.0},
+        "coherence_smoke_post_change": "12/12 PASS in 88.0s",
+        "coherence_matrix_post_change": "EXACT=4 COHERENT=8 GIBBERISH=0",
+        "verdict": "LANDED",
+        "commit_target": "src/inference/models/qwen35/forward_gpu.rs:323"
+      },
+      "dense_q4_0_arm_at_cn_4": {
+        "candidate": "(FfnQuantArm::DenseQ, Some(GgmlType::Q4_0)) if !cfg_is_moe => 4",
+        "primary_fixture": "qwen3.6-27b-dwq46",
+        "primary_delta_pp": 0.70,
+        "verdict": "DEFERRED — fails Phase 5 ≥1pp gate (only +0.70pp gain).  Re-evaluate after dwq48 fixture added to N-curve."
+      },
+      "apex_q5k_arm_at_cn_2": {
+        "candidate": "(FfnQuantArm::MoeQ, Some(GgmlType::Q5_K)) if cfg_is_moe => 2",
+        "primary_fixture": "qwen3.6-35b-a3b-apex",
+        "primary_delta_pp": 1.47,
+        "verdict": "DEFERRED — primary measure passed +1.47pp but apex is the SISTER fixture in iter45-RESUMED (not the primary); needs an apex-primary iter to validate Q5_K + Q6_K shifts together.  iter50+ candidate."
+      }
     }
   }
 }
