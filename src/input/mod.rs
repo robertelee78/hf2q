@@ -226,7 +226,13 @@ pub fn truncate_padded_vocab(
         if new_byte_len > tensor.data.len() {
             continue; // shouldn't happen if shape matches, but be defensive
         }
-        tensor.data.truncate(new_byte_len);
+        // ADR-014 P13 step 2 (iter-79): rebuild via slice-to-Vec instead of
+        // in-place `.truncate()` so the same code works whether
+        // `tensor.data` is `Vec<u8>` (today) or `Arc<[u8]>` (post-iter-80+
+        // P13 migration).  `tensor.data[..new_byte_len].to_vec()` allocates
+        // a new Vec sized exactly for the de-padded slice.
+        let truncated_data: Vec<u8> = tensor.data[..new_byte_len].to_vec();
+        tensor.data = truncated_data;
         tensor.shape[0] = new_rows;
         truncated += 1;
         tracing::info!(
