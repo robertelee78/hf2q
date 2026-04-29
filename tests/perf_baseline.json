@@ -1,0 +1,35 @@
+{
+  "_comment": "ADR-015 iter41 — per-cell hf2q/llama tok/s ratio floors. NEEDS RE-CAPTURE after iter40 lands; current values are pre-iter40 broken-decode baseline. Each cell maps to scripts/bench-matrix.sh CELLS labels. Floor expressed as ratio = hf2q_tps / llama_tps; cell fails if measured ratio drops >1pp below floor (i.e. >0.01 absolute).",
+  "_captured_at": "2026-04-28T00:00:00Z",
+  "_recapture_required": true,
+  "_recapture_reason": "iter40 fixes pool-aliasing in build_moe_ffn_layer_gpu_q_into; pre-iter40 ratios were measured against broken decode and may not reflect the corrected code path's true tok/s.",
+  "_methodology": "scripts/bench-matrix.sh at NGEN=256, prompt='Hello, my name is', N_TRIALS=3 cold-process per cell.",
+  "cells": {
+    "qwen3.6-35b-a3b-dwq46": {
+      "ratio_floor": 0.93,
+      "_note": "MoE-35B-A3B × dwq46 (Q4 base / Q6 sensitive). Wave 5b cumulative gap closed from 8.5× to ~2.34× wall; ratio reflects post-iter40 expected baseline."
+    },
+    "qwen3.6-35b-a3b-dwq48": {
+      "ratio_floor": 0.93,
+      "_note": "MoE-35B-A3B × dwq48 (Q4 base / Q8 sensitive)."
+    },
+    "qwen3.6-35b-a3b-apex": {
+      "ratio_floor": 1.00,
+      "_note": "MoE-35B-A3B × apex (Q8-ish baseline). Apex historically ahead of llama on M5 Max single-process."
+    },
+    "qwen3.6-27b-dwq46": {
+      "ratio_floor": 1.00,
+      "_note": "dense-27B × dwq46. Decode parity achieved 2026-04-21 (project_decode_parity_achieved). Floor=1.00 enforces no regression from parity."
+    },
+    "qwen3.6-27b-dwq48": {
+      "ratio_floor": 1.00,
+      "_note": "dense-27B × dwq48."
+    },
+    "gemma-26B-dwq": {
+      "ratio_floor": 0.93,
+      "_note": "gemma-26B × dwq. ADR-015 iter34 default-on SDPA prefill closed peer-prefill gap; decode floor conservative."
+    }
+  },
+  "_tolerance_pp": 1.0,
+  "_tolerance_explanation": "A cell fails if its measured ratio drops >1 percentage point (0.01 absolute) below its ratio_floor. Tolerance accommodates same-day thermal noise (~5% intra-trial spread on M5 Max single-process per project_m5max_residency_null_win_single_process) without admitting a real regression."
+}

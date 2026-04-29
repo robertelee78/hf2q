@@ -3134,3 +3134,108 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - **2026-04-27 — Wave 2b iter2 landed (H4 counter-based barrier accounting).**  mlx-native @ `19f5569` adds atomic `BARRIER_COUNT` (always tracked) + `BARRIER_NS` (env-gated under `MLX_PROFILE_BARRIERS=1`) around the `memoryBarrierWithScope:` `objc::msg_send!` site at `/opt/mlx-native/src/encoder.rs:498-512`.  The objc dispatch is moved into a `#[inline(never)]` helper (`issue_metal_buffer_barrier`) so xctrace / Instruments has a stable Rust frame to attribute barrier time against, rather than being inlined / hidden under sibling Objective-C frames as it was at 1 ms TimeProfiler resolution in Wave 2a.  Public API: `mlx_native::barrier_count() -> u64`, `mlx_native::barrier_total_ns() -> u64`, `reset_counters()` extended.  Hot-path cost: 1 atomic fetch_add (~5 ns) + 1 OnceLock load when env-disabled (default); 2 × `Instant::now()` (~100-200 ns) when `MLX_PROFILE_BARRIERS=1` (opt-in only — adds ~22-44 µs/token at 440 barriers/token, comparable to what is being measured).  Tests in `tests/test_barrier_counter.rs` cover: pre-dispatch no-op skip, capture-mode skip, +3-after-3-barriers post-active-dispatch, ns-stays-0 with profile disabled.  Closes Wave 2b hard gate #2 (the H4 OPEN status from §"P3a' live profile pass" hypothesis register).
 - **2026-04-27 — P3b iter1 landed (rank-4 rope_multi hoist).**  mlx-native @ `a50c224` adds `dispatch_rope_multi_cached` (per-thread cache keyed by device + rope config) + bit-exact parity tests (`test_rope_multi_cached_matches_uncached_qwen35_decode_shape`, `test_rope_multi_cached_seq_len_variation`).  hf2q @ `74c28b9` switches `apply_imrope` (`gpu_full_attn.rs:361-417`) to the cached path; `mtp.rs` call sites pick up the change automatically (no signature change).  Closes the rank-4 lever from §"P3a' live profile pass" (208 µs/token measured on qwen3.6-27b-dwq46 dense fixture; 32 calls/token × 3 fresh `MlxBuffer` allocs/call dominated by mach_msg2_trap / IOGPUResourceCreate).  Steady-state qwen35 decode hot path now hits 2 stable cache entries (Q-config + K-config, seq_len=1) and amortizes the alloc cost across all decode tokens.  Bit-exact verified end-to-end via `qwen35::gpu_full_attn::tests::imrope_matches_cpu_ref` and `qwen35::gpu_full_attn::tests::full_layer_gpu_matches_cpu_ref` (full FullAttn layer including both apply_imrope calls); all tests use `to_bits()` equality.  Apex-MoE 35B-A3B re-measurement (Wave 2b hard gate) still required before ADR-012-baseline µs credit can be claimed against the 288 µs residual; this iter contributes a measured-on-dense lever, not a credited apex µs.
 - **2026-04-26 — §"Capturing M5's GPU Neural Accelerators (Metal 4 TensorOps + NAX)" infused.**  Per ADR-016 research dossier graduation: Apple's measured 3.33–4.06× TTFT vs M4 (1.19–1.27× decode bandwidth-bound) lives in per-GPU-core Neural Accelerators via Metal 4 TensorOps, **not** standalone ANE.  mlx-native already partially routes through `mpp::tensor_ops::matmul2d` in four `*_tensor.metal` kernels but is missing: (a) Morton/Z-order dispatch for large prefill GEMM (Tech Talk 111432: ~50 → ~100 % NAX utilization on 4K×4K matmul); (b) NAX-tuned outer tile sizes + macOS 26.2 / arch-gen ≥ 17 runtime gate (mirroring MLX's `is_nax_available()`); (c) `flash_attn_prefill` inner matmul still on M1-era `simdgroup_matrix` / `simdgroup_multiply_accumulate` — biggest unrouted lever (16 % of prefill compute).  Added new sub-phase **P3c — M5 Neural Accelerator prefill kernels** with three actions; P3c is shader-internal only and **fully orthogonal** to P3 (single-CB) and P3b (orchestration sweep) — opens only after P6 bench gate clears.  All API claims verified against Apple developer docs, MLX commits (`54f1cc6` 2025-11-19 NAX support, `b41b349` 2026-03-18 NAX refactor, `0879a6a` 2026-03-11 M5 tuning), and `/opt/mlx-native` source by direct file:line read — no training-data recall used.  Source brief: `/tmp/cfa-adr016/research-metal4-tensorops.md` + memory key `swarm-cfa-adr016/deep-research/metal4-tensorops`.
+
+## Lessons learned — coherence verification
+
+**iter41 addendum (2026-04-28).** A regression-prevention scaffolding section
+authored alongside iter40's decode-bug fix (commit `03ad80c`).  Captures the
+trap that allowed iter21–iter37 to ship 4 substantive commits against a
+broken-decode baseline without any gate detecting the regression.
+
+### The iter21–iter37 trap
+
+Between iter21 (coherence "fix") and iter37 (mem_ranges dataflow auto-barrier
+port), four substantial commits were measured against a `qwen3.6-…dwq46` /
+apex prefill that produced **gibberish output that was *deterministic***
+across trials.  Sample broken decodes from iter40's PHASE 1 bisect:
+
+- dwq46 / "Hello, my name is" → `якобы ( ) 2025-09-11 14:25:00…`
+- apex / "Hello, my name is" → `…but **_**_**_**_**…`
+- 27b-dwq46 / "Hello, my name is" → `Hello, my name is 0\nuser\n…` (echo)
+
+The iter21 verification harness ran the same prompt 5 times and asserted
+all 5 trials decoded to **byte-identical output**.  The asserts passed
+because the gibberish was deterministic — **same garbage every time**.
+Determinism without peer-parity isn't coherence; it's a tokenizer-equivalent
+unit-circle that the harness mistook for correctness.
+
+### Root cause (cf. iter40 Changelog entry, commit `03ad80c`)
+
+`build_moe_ffn_layer_gpu_q_into` allocated its `out_buf` from the
+per-prefill-layer arena pool, violating the W-5b.15 lifetime-safety
+contract: the per-layer `reset_for_prefill_chunk()` recycled the buffer
+that became the next layer's `hidden`, and the next layer's pooled
+allocations OVERWROTE it.  The corruption happened across the layer
+boundary in the residual stream and affected every prefill layer ≥ 1.
+Layer 0 stayed in tolerance; layer 1 exploded 17–39× in iter40's
+hidden-state bisect.
+
+The bug existed BEFORE iter21's "byte-identical 5/5" sunset.  ALL
+ADR-015 perf work iter11–iter38 was conducted on a broken-decode
+baseline; the 8.5×→2.59× gap-closing trajectory is real but every
+coherence-gate step (sourdough, gate H, etc.) was passing on a
+gibberish output that the gates don't catch.
+
+### Verification rule (standing)
+
+**All coherence claims must compare to a known-good peer (llama-completion
+or equivalent) on the same fixture × prompt.**  Trial-trial determinism
+is a *necessary* but *not sufficient* condition.  The harness contract
+is now a 3-tier classifier (`tests/coherence_matrix.rs::classify`):
+
+- **EXACT** — byte-identical to peer golden.  PASS, log "EXACT".
+- **COHERENT** — first 5 tokens of peer golden share ≥3 with hf2q output
+  AND no token repeats >50% of words AND no degenerate-pattern markers
+  (`якобы`, `<|turn|>`, `**_**_**`, `2- 2- 2-`, etc.).  PASS+WARN.
+- **GIBBERISH** — neither.  FAIL with golden vs actual diff.
+
+Goldens are captured under `tests/coherence_golden/<fixture>-<prompt-slug>.txt`
+from llama-completion at `--temp 0.0 -n 16 -no-cnv --no-display-prompt`,
+4 fixtures × 3 prompts = 12 cells.  Re-capture procedure documented in
+`tests/coherence_golden/README.md`.
+
+### Operational standing rule
+
+**Any iter that touches `forward_gpu` / `forward_mlx` MUST run
+`cargo test --test coherence_smoke --release` before commit.**
+
+The smoke test runs all 12 cells at NGEN=16 (<60 s budget) and applies
+the GIBBERISH_MARKERS detector — failing loudly on the specific patterns
+iter40 surfaced.  It is part of the default `cargo test` set (not `#[ignore]`)
+so it cannot be silently bypassed by a CI that runs only `cargo test`.
+
+The heavyweight `tests/coherence_matrix.rs` is `#[ignore]`-gated and
+runs the full 3-tier classifier; invoke via
+`cargo test --release --test coherence_matrix -- --ignored coherence`.
+
+The combined gate is wired into
+`scripts/coherence_and_speed_regression.sh`:
+
+1. `cargo test --test coherence_smoke --release` — always; refuses to
+   run perf bench against broken decode.
+2. `scripts/bench-matrix.sh` — only on smoke PASS.
+3. Per-cell ratio compared against `tests/perf_baseline.json::cells.*`
+   ratio_floor with 1pp tolerance for thermal noise.
+
+### Why this could not have been caught earlier without the harness
+
+The pre-iter41 toolchain measured *peer parity at the bench level*
+(tok/s ratio) but not at the *output level*.  llama-bench reports tokens
+per second over 256-token decode but the output text is discarded; the
+hf2q `--benchmark` mode does the same.  No automated gate compared decoded
+text against a peer reference until iter41.  The miss isn't a lapse in
+discipline — the harness genuinely didn't exist.  iter41 closes that
+gap.
+
+### Cross-references
+
+- iter40 Changelog entry — root cause + bisect methodology (commit `03ad80c`).
+- `feedback_verify_baseline_determinism_before_perf_bench` — standing rec.
+- `feedback_evidence_first_no_blind_kernel_rewrites` — coherence is the
+  release gate; perf only on coherent baseline.
+- `project_speed_bar_full_matrix` — ≥1.00× across the full
+  (model × quant × length × mode) grid; coherence is the orthogonal axis.
+- `tests/coherence_golden/README.md` — golden capture procedure.
+- `tests/coherence_smoke.rs`, `tests/coherence_matrix.rs` — harness impl.
+- `scripts/coherence_and_speed_regression.sh` — combined gate driver.
+- `tests/perf_baseline.json` — per-cell ratio floors (re-capture pending iter40).
