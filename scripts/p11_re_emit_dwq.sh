@@ -39,13 +39,23 @@ mkdir -p "$OUT_ROOT"
 # ────────────────────────────────────────────────────────────
 ram_check() {
     local label="$1"
-    local free_pages
+    local free_pages inactive_pages
     free_pages=$(vm_stat | awk '/Pages free/ { gsub(/\./, "", $3); print $3 }')
-    local free_gb
+    inactive_pages=$(vm_stat | awk '/Pages inactive/ { gsub(/\./, "", $3); print $3 }')
+    local free_gb inactive_gb
     free_gb=$(( free_pages * 16384 / 1024 / 1024 / 1024 ))
-    echo "[$label] RAM free: ${free_gb} GB"
-    if [ "$free_gb" -lt 30 ]; then
-        echo "[$label] ERROR: <30 GB free — refusing to load model (mantra OOM-prevention)"
+    inactive_gb=$(( inactive_pages * 16384 / 1024 / 1024 / 1024 ))
+    # iter-97: inactive pages on macOS are reclaimable instantly. The
+    # original 30 GB free-only floor was too conservative once iter-95's
+    # cache HIT short-circuit + iter-97's primed sensitivity cache cut
+    # the dense Qwen3.5/3.6 path's peak from 158 GB → ~52 GB. Count
+    # free + inactive as available; gate at ≥30 GB AVAILABLE (override
+    # via HF2Q_P11_MIN_AVAIL_GB env var if needed).
+    local available_gb=$(( free_gb + inactive_gb ))
+    local min_avail="${HF2Q_P11_MIN_AVAIL_GB:-30}"
+    echo "[$label] RAM free: ${free_gb} GB  inactive: ${inactive_gb} GB  available: ${available_gb} GB  (min: ${min_avail} GB)"
+    if [ "$available_gb" -lt "$min_avail" ]; then
+        echo "[$label] ERROR: <${min_avail} GB available — refusing to load model (mantra OOM-prevention)"
         return 1
     fi
 }

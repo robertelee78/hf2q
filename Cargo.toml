@@ -155,6 +155,10 @@ path = "src/bin/iter24_audit.rs"
 name = "iter25_audit"
 path = "src/bin/iter25_audit.rs"
 
+[[bin]]
+name = "extract_dwq_sensitivity"
+path = "src/bin/extract_dwq_sensitivity.rs"
+
 [[bench]]
 name = "quantize_bench"
 harness = false
