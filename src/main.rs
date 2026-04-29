@@ -1103,21 +1103,24 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 .materialize()
                 .context("vocab-pad de-pad materialise failed")
                 .map_err(AppError::Conversion)?;
+            // ADR-014 P13 step 2 (iter-81): rebuild via slice-to-Vec
+            // instead of in-place .truncate() so the same code works
+            // whether `materialised.data` is `Vec<u8>` (today) or
+            // `Arc<[u8]>` (post-iter-82+ P13 type swap).
             if new_byte_len > materialised.data.len() {
                 // Defensive: shouldn't happen if shape matches.
-                let mut data = materialised.data;
                 let new_meta = ir::lazy::LazyMeta::new(
                     materialised.name,
                     vec![original_rows, cols],
                     dtype,
                 );
-                data.truncate(original_rows * cols * elem_size);
+                let truncate_len = original_rows * cols * elem_size;
+                let data: Vec<u8> = materialised.data[..truncate_len].to_vec();
                 lazy_map.insert(ir::lazy::LazyTensor::from_bytes(new_meta, data));
                 continue;
             }
-            let mut data = materialised.data;
-            data.truncate(new_byte_len);
             let new_meta = ir::lazy::LazyMeta::new(key.to_string(), vec![new_rows, cols], dtype);
+            let data: Vec<u8> = materialised.data[..new_byte_len].to_vec();
             lazy_map.insert(ir::lazy::LazyTensor::from_bytes(new_meta, data));
             truncated += 1;
             tracing::info!(
