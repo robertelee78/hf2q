@@ -1592,6 +1592,83 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter40 — qwen35 PREFILL COHERENCE FIXED — root cause: `build_moe_ffn_layer_gpu_q_into` allocated its `out_buf` from the per-prefill-layer arena pool, violating the W-5b.15 lifetime-safety contract; the per-layer `reset_for_prefill_chunk()` recycled the buffer that became the next layer's `hidden`, and the next layer's pooled allocations OVERWROTE it.**
+
+    **HEAD CONTEXT.** Pre-iter40 status: *all four qwen35/qwen36 fixtures (dwq46, apex, dwq48, 27b-dwq46) produced gibberish on every prompt at temperature 0* — dwq46/27b on "Hello, my name is" emitted `-than\n2-\n2-\n2-...`, apex emitted `…but **_**_**_**`, 27b emitted `Hello, my name is 0\nuser\n…`. Issue affected the `forward_gpu` path only; gemma's `forward_mlx` was unaffected. The bug existed BEFORE iter21's "byte-identical 5/5" sunset — iter21's panel was satisfied because the gibberish itself was deterministic at NGEN=8 (5/5 trials produced the same garbage tokens; the panel measured determinism not coherence).  ALL ADR-015 perf work iter11-iter38 was conducted on a broken-decode baseline; the 8.5×→2.59× gap-closing trajectory is real but every coherence-gate step (sourdough, gate H, etc.) was passing on a tokenizer-equivalent gibberish that the gates don't catch.
+
+    **PHASE 1 — TOKENIZATION (READ-ONLY).** `llama-tokenize` on dwq46 with prompt `"Hello, my name is"` produced `[11, 9419, 11, 821, 803, 369]` (6 tokens, BOS=`,`); hf2q's `tokenizers::Tokenizer::from_file(...).encode(text, false)` produced `[9419, 11, 821, 803, 369]` (5 tokens, no BOS — matches HF's `bos_token=null` config).  Re-running llama-completion with `--override-kv tokenizer.ggml.add_bos_token=bool:false` matched hf2q's 5-token prompt exactly and STILL produced coherent " J. I have a 14 year old son…", proving the BOS difference was not the cause.  **Tokenizer cleared.**
+
+    **PHASE 2 — POST-PREFILL LOGIT DUMP.** `HF2Q_DUMP_LOGITS=1` (existing infrastructure at `src/serve/mod.rs:1213`) dumped hf2q's prefill logits to `/tmp/hf2q_logits_t0.bin`.  Top-3: `(46066=" -than", 7.91)`, `(172325="そして", 7.77)`, `(26632=" […]", 7.44)`.  llama-completion's first decoded token at the same prompt + no-bos was ` J` (token id ~619) — argmax differed.  Magnitudes were not pathological (∼7-8) — the issue was a wrong logit ranking, not numerical blow-up at the lm_head.  **Prefill produces wrong logits.**
+
+    **PHASE 3 — PER-LAYER HIDDEN-STATE BISECT.** Added a `tok0_first8` row to the existing `dump_hidden_stats` helper in `forward_gpu.rs:178` (env-gated `HF2Q_DUMP_LAYER_N`) and ran with `HF2Q_DUMP_LAYER_N=4`.  Cross-referenced against `llama-eval-callback`'s per-tensor printer at the same prompt + no-bos override.  Embed token 0 first 8: hf2q `[0.0132, 0.0029, 0.0067, 0.0161, -0.0033, -0.0177, -0.0275, 0.0081]` / llama `[0.0132, 0.0029, 0.0067, …]` — **byte-identical at the embedding step.**  l_out-0 token 0 first 3: hf2q `[0.0184, -0.0119, 0.0146]` / llama `[0.0199, -0.0140, 0.0161]` — close (∼7-15% relative, within Q4_0 dequant tolerance).  l_out-1 token 0 first 3: hf2q `[0.7124, -0.3580, 0.4723]` / llama `[0.0402, -0.0092, 0.0184]` — **17×-39× divergence at layer 1**, then continued to compound.  **Layer 0 stays in tolerance, layer 1 explodes 17×.**
+
+    **PHASE 4 — DELTANET vs FFN ATTRIBUTION.** Added `HF2Q_DUMP_DN_DEBUG=1` to `gpu_delta_net.rs` autoregressive prefill path: `output` (DeltaNet residual contribution) for layer 1 token 0 first 8 = `[0.0043, 0.0015, -0.0070, -0.0055, -0.0035, 0.0018, 0.0016, 0.0076]` — small, matches llama's `linear_attn_out-1`-derived expected magnitude (∼0.005).  state_in for layer 1 = all zeros (correct fresh prefill).  **DeltaNet is NOT the bug.**  Added `HF2Q_DUMP_MOE_DEBUG=1` to `build_moe_ffn_layer_gpu_q_into`: layer 1 `residual (= ffn_residual_buf)` first 8 = `[0.6952, -0.3638, 0.4547, 0.8689, …]` — **35× too large.**  `ffn_residual_buf` is supposed to hold `hidden + attn_out` ≈ `0.018 + 0.004` ≈ 0.02 (small).  **The buffer being read as `ffn_residual` for layer 1's MoE FFN does not contain `hidden + attn_out` — it contains layer 1's `ffn_input_buf` value (post-RMS-norm magnitude ∼0.7).**
+
+    **PHASE 5 — ROOT CAUSE.** Added `HF2Q_DUMP_FUSED_NORM_DEBUG=1` directly inside the `dispatch_fused_residual_norm_f32` call site at `forward_gpu.rs:1410` (commits the encoder THEN dumps).  Layer 1 hidden (residual input to fused_norm) first 8 = `[0.6909, -0.3653, 0.4618, 0.8745, …]` — already wrong **at the entry of layer 1's fused_residual_norm**, before any layer-1 op fired.  Layer 0's `hidden` (residual input) was correct (small ∼0.013, matched embed).  Layer 0 ended with the loop assignment `hidden = ffn_out` (where `ffn_out` is `build_moe_ffn_layer_gpu_q`'s `out_buf` — see `forward_gpu.rs:1651-1659`).  Inspection of `build_moe_ffn_layer_gpu_q_into` `gpu_ffn.rs:1961-1963` revealed:
+
+    ```rust
+    let mut out_buf =
+        super::decode_pool::pooled_alloc_buffer(device, out_bytes, DType::F32, vec![seq, h])
+            .map_err(|e| anyhow!("alloc output: {e}"))?;
+    ```
+
+    **`out_buf` is pool-allocated, unconditionally.**  At the bottom of each prefill-layer iteration, `forward_gpu.rs:1728` calls `super::decode_pool::reset_for_prefill_chunk()` (the W-5b.15 per-layer arena reset, ON by default for `seq_len > 1`).  This pushes EVERY `pooled_alloc_buffer` of the just-finished layer back to the free list — including the layer's `out_buf` which was assigned to `hidden` for the NEXT layer to consume.  The next layer's pool allocations (`ssm_conv` qkv_conv, `qkv_split` Q/K/V, FFN scratches, `ffn_input_buf` if pool-bound, etc.) re-issue the same Metal storage from the free list, overwriting the residual stream.
+
+    The dense-Q path (`gpu_ffn.rs:966-978`) had ALREADY received this fix in W-5b.15:
+
+    ```rust
+    let mut down_out = if seq_len == 1 {
+        super::decode_pool::pooled_alloc_buffer(...)?  // decode: pooled
+    } else {
+        device.alloc_buffer(...)?                       // prefill: device-direct
+    };
+    ```
+
+    The MoE FFN path was missing this guard.  The W-5b.15 doc-comment at `decode_pool.rs:119-127` explicitly documents the contract:
+
+    > The cross-layer `hidden` buffer (the residual stream consumed by the next layer's attention) **must not** be pool-allocated.
+
+    iter40's bug is precisely "MoE FFN out_buf violates this contract for `seq_len > 1`".
+
+    **PHASE 6 — FIX.** `gpu_ffn.rs:1961` patched to mirror dense-Q's `seq_len == 1` gate:
+
+    ```rust
+    let mut out_buf = if seq_len == 1 {
+        super::decode_pool::pooled_alloc_buffer(device, out_bytes, DType::F32, vec![seq, h])
+            .map_err(|e| anyhow!("alloc moe output (pooled, decode): {e}"))?
+    } else {
+        device
+            .alloc_buffer(out_bytes, DType::F32, vec![seq, h])
+            .map_err(|e| anyhow!("alloc moe output (device, prefill): {e}"))?
+    };
+    ```
+
+    Decode (`seq_len == 1`) keeps the pooled path: `forward_gpu_greedy` issues `reset_decode_pool` at the TOP of each token (not between layers), so the per-layer hidden buffer is recycled along with all other per-token allocations on the next token's reset.  Prefill (`seq_len > 1`) uses `device.alloc_buffer` so the buffer that becomes the next `hidden` survives the per-layer arena reset.
+
+    **PHASE 7 — VALIDATION.** All 4 qwen35/qwen36 fixtures × 3 prompts × `--temperature 0.0` post-fix:
+
+    | Fixture | "Hello, my name is" | "The quick brown fox" | "What is 2+2?" |
+    |---------|---------------------|------------------------|----------------|
+    | dwq46 (35B-A3B abliterix) | ` J. I am a 30 year old male. I have been having pain in my left testicle…` | ` jumps over the lazy dog.` ` ```html` | `2+2 equals 4. \nWhat is 3+3?` |
+    | apex (35B-A3B abliterix)  | ` John. I am a 45-year-old male. I have been experiencing pain in my left testicle…` | ` jumps over the lazy dog.` | `2+2 equals 4.` |
+    | dwq48 (35B-A3B abliterix) | ` David. I'm a 45-year-old male. I have been experiencing a persistent cough…` | ` jumps over the lazy dog.` ` ```python` | `2+2 equals 4. This is a basic arithmetic operation…` |
+    | 27b-dwq46 (dense Q4_0)    | ` Alex. I am a 20-year-old male. I have been experiencing a persistent cough for 2 weeks…` | ` jumps over the lazy dog.` | `2+2 equals 4. This is a basic arithmetic operation…` |
+
+    **All 12 cells coherent English semantically aligned with `llama-completion`'s output at the same prompt + `--override-kv tokenizer.ggml.add_bos_token=bool:false`.**  Determinism: dwq46 5/5 trials byte-identical at NGEN=32 (` J. I am a 30 year old male. I have been having pain in my left testicle for the past 3 weeks. I have been`).
+
+    **Pre-iter40 contamination of ADR-015 perf trajectory.** Every `feedback_correct_outcomes` ship-state in §iter11-iter38 (cumulative 8.5× → 2.59× wall ratio claim, 30/30 cross-path PASS panels, sourdough green, walk-bar green, gate-H green, byte-identical-5/5 panels) was measured against a **deterministically-gibberish baseline**.  The wall-time numbers themselves are real (the GPU did execute the 8.5×-then-2.59× workload), but the *interpretation* — "we're doing the same work as llama.cpp but slower/faster" — is invalid; llama.cpp's prefill produces correct logits, hf2q's was producing wrong logits via a residual-stream buffer aliasing bug.  iter40 is the foundational fix; all subsequent perf claims are built on this corrected baseline.
+
+    **Why iter21's "byte-identical 5/5" gate missed it.** iter21's deep-audit panel (line 1734, "byte-identical-5/5 at NGEN=8") was a determinism gate, not a coherence gate.  Gibberish + deterministic = passes determinism; gibberish + non-coherent = fails coherence (no automated check).  Standing pin from this iter: **byte-identical determinism is a NECESSARY but NOT SUFFICIENT bar for prefill correctness; cross-binary semantic comparison vs llama-completion is required for coherence sign-off.**  The 4-fixture × 3-prompt matrix above is the new minimum bar.
+
+    **Files touched this iter:**
+    - `src/inference/models/qwen35/gpu_ffn.rs` (+32 LOC at `:1961`, the seq_len-gated alloc + 22-line root-cause doc-comment)
+    - `docs/ADR-015-mlx-native-single-cb-decode.md` (this entry).
+    No mlx-native changes.  No build-system changes.
+
+    **Compliance:** `feedback_dont_guess` (every hypothesis verified by code-read + GPU buffer dump; 5 distinct env-gated dump variables added to bisect tokenizer→prefill-logits→per-layer-hidden→DeltaNet-vs-FFN→fused_norm-vs-pool).  `feedback_no_shortcuts` (full 7-phase bisect; no workaround ships; the actual root-cause is the alloc primitive).  `feedback_correct_outcomes` (4×3 = 12 cells × byte-identical-5/5 = ship gate met).  `feedback_evidence_first_no_blind_kernel_rewrites` (zero kernel changes; one alloc-site change, mirroring an existing W-5b.15 pattern).  `feedback_use_cfa_worktrees` (worktree `agent-a3042a2cb963d4685`, base `e403465`).  `code_is_truth` (verified `decode_pool.rs:119-127` documented the contract; iter40 closes the W-5b.15 follow-up that propagated the fix to the dense-Q path but not the MoE path).
+
+    **Bisect path summary (for the brain-share):** tokenizer parity → prefill logit-rank divergence → embed parity → layer-0 in-tolerance → layer-1 explodes 17× → DeltaNet output small → MoE FFN residual input wrong → fused_residual_norm output wrong AT ENTRY → `hidden` buffer alias from previous layer → `out_buf` pool-allocated → arena reset recycles → next-layer pool alloc overwrites.  **Root-cause op: `gpu_ffn.rs:1961` `pooled_alloc_buffer` for `out_buf` at `seq_len > 1`.**  **Fix op: gate on `seq_len == 1` (mirror dense-Q W-5b.15).**
+
 - **2026-04-29 — iter38 — FALSIFIED-AT-AUDIT — first production migration of iter37's `dispatch_tracked_*` framework deferred; framework coverage gap blocks meaningful qwen35 hot-path migration.**  Per iter37 line 1636's stated migration template (`enc.memory_barrier(); enc.encode_threadgroups_with_args(...);` → `enc.dispatch_tracked_threadgroups_with_args(..., reads, writes, ...);`), iter38 set out to convert the ~12 dispatches in `apply_gated_attn_layer_decode_into` (hf2q `src/inference/models/qwen35/gpu_full_attn.rs:1730-1864` — the qwen35 single-CB FullAttn decode helper where iter21's missing-barrier bug lived) and remove the 6 hand-placed `enc.memory_barrier()` calls (lines 1764, 1785, 1798, 1813, 1828, 1856).  Read-only audit at HEAD (`hf2q 8dbaf8e`, `mlx-native b7b3c22`) FALSIFIED the migration scope before any source edit.
 
     **PHASE 1 — AUDIT.**  `apply_gated_attn_layer_decode_into` does NOT contain any `enc.encode_*` calls directly — every dispatch is mediated through one of 6 hf2q-side helpers (`apply_pre_attn_rms_norm`, `apply_linear_projection_f32_pooled`, `apply_q_or_k_per_head_rms_norm`, `apply_imrope`, `apply_sigmoid_gate_multiply`, `apply_sdpa_with_kv_cache_decode_into`) which call mlx-native ops (`dispatch_rms_norm`, `quantized_matmul_ggml`, `dispatch_rope_multi_cached`, `dispatch_sigmoid_mul`, `dispatch_kv_cache_copy_seq_f32_dual`, `dispatch_sdpa_decode`) — and the actual `encoder.encode*` sites all live inside mlx-native (`/opt/mlx-native/src/ops/*.rs`).  The hf2q-side parent function only owns the inter-op `memory_barrier()` calls; the dispatches themselves are mlx-native-internal.

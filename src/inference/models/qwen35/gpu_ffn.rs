@@ -1958,9 +1958,38 @@ pub fn build_moe_ffn_layer_gpu_q_into(
     )
     .map_err(|e| anyhow!("alloc h_s: {e}"))?;
     let out_bytes = seq * h * 4;
-    let mut out_buf =
+    // ADR-015 iter40 — bug fix: when this `out_buf` becomes the residual stream
+    // for the NEXT layer (prefill MoE FFN with add_residual=Some), it must NOT
+    // be pool-allocated.  The W-5b.15 per-layer arena reset
+    // (`reset_for_prefill_chunk`) at the bottom of each layer iteration
+    // recycles every pool-allocated buffer back to the free list.  If `out_buf`
+    // is pooled, the next layer's `pooled_alloc_buffer` calls (ssm_conv,
+    // qkv_split, FFN scratches, etc.) can re-issue the same Metal storage,
+    // OVERWRITING the residual stream that the next layer's
+    // `dispatch_fused_residual_norm_f32` reads as `hidden`.
+    //
+    // Symptom: layer 1+ residual values jump from ~0.02 (correct, post-layer-0
+    // residual) to ~0.7 (matches `ffn_input_buf` post-norm magnitude — the
+    // pooled bucket was recycled and re-issued for `ffn_input_buf` in the
+    // current layer).  After 1-2 layers the residual stream becomes garbage
+    // and the lm_head argmax produces gibberish ("-than", "2-2-2-...").
+    //
+    // The dense-Q path already gates on `seq_len == 1` to apply the same
+    // exclusion (line 966-978); MoE was missing this guard.  Mirrors the
+    // W-5b.15 lifetime-safety doc-comment in `decode_pool.rs:119-127`.
+    //
+    // Decode (seq_len == 1) keeps the pooled path: `forward_gpu_greedy` issues
+    // `reset_decode_pool` at the TOP of each token (not between layers), so
+    // the per-layer hidden buffer is safely recycled along with all other
+    // per-token allocations on the next token's reset.
+    let mut out_buf = if seq_len == 1 {
         super::decode_pool::pooled_alloc_buffer(device, out_bytes, DType::F32, vec![seq, h])
-            .map_err(|e| anyhow!("alloc output: {e}"))?;
+            .map_err(|e| anyhow!("alloc moe output (pooled, decode): {e}"))?
+    } else {
+        device
+            .alloc_buffer(out_bytes, DType::F32, vec![seq, h])
+            .map_err(|e| anyhow!("alloc moe output (device, prefill): {e}"))?
+    };
     // params_buf for silu_mul (holds n as u32, must outlive the encoder)
     let mut silu_params_buf =
         super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
@@ -2302,6 +2331,7 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             )
             .map_err(|e| anyhow!("moe_weighted_reduce: {e}"))?;
         }
+
 
         // NOTE: this `_into` variant does NOT commit.  The caller is
         // responsible for committing the encoder, allowing fusion with
