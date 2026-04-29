@@ -194,6 +194,58 @@ pub fn quantize_via_streaming_borrowed(
     quantize_streaming(lazy_map, metadata, quantizer, bits, group_size, progress, false)
 }
 
+/// ADR-014 P7 iter-83 — actual zero-byte-copy streaming wedge.
+/// Drop-in replacement for [`quantize_via_streaming_borrowed`]
+/// (iter-48/77) that takes `&mut TensorMap` instead of `&TensorMap`
+/// and drains each tensor's bytes via
+/// [`crate::ir::TensorRef::take_data_as_arc`] (iter-82) — `mem::take`
+/// on the inner `Vec<u8>`, zero bytes copied.
+///
+/// **Memory profile**: per-tensor working set, no peak inflation.
+/// Each iteration:
+///   1. Borrow `tensor` as `&mut`
+///   2. `take_data_as_arc()` moves the Vec out (replacing with empty)
+///   3. Wrap in `Arc<Vec<u8>>` (no clone)
+///   4. `LazyTensor::from_arc_bytes` (iter-76)
+///   5. Streaming pipeline materializes via `Arc::unwrap_or_clone`
+///      (refcount==1 → unwrap zero-copy)
+///   6. Tensor's bytes flow through quantize and drop, freed
+///
+/// **Caller contract**: after this function returns successfully,
+/// every entry in `tensor_map.tensors` has `data = Vec::new()` (the
+/// bytes were drained).  Callers that need `tensor_map.tensors[name].data`
+/// post-quantize MUST NOT use this wedge.
+///
+/// In production, the natural caller is iter-3 wholesale-skip surgery
+/// in main.rs — Phase 3 dispatch can drain the tensor_map and let
+/// Phase 4.5 quality use the parallel lazy_map (iter-43/52) without
+/// needing the original bytes.
+///
+/// Byte-identical to [`quantize_model`] on the same fixture, verified
+/// by `quantize_via_streaming_consuming_mut_byte_identical_to_quantize_model`.
+pub fn quantize_via_streaming_consuming_mut(
+    tensor_map: &mut crate::ir::TensorMap,
+    metadata: &crate::ir::ModelMetadata,
+    quantizer: &dyn Quantizer,
+    bits: u8,
+    group_size: usize,
+    progress: &ProgressReporter,
+) -> Result<crate::ir::QuantizedModel, QuantizeError> {
+    use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+
+    let mut lazy_map = LazyTensorMap::new();
+    for (_, t) in tensor_map.tensors.iter_mut() {
+        let meta = LazyMeta::new(t.name.clone(), t.shape.clone(), t.dtype);
+        // Zero-byte-copy: mem::take moves the Vec out of t.data,
+        // replacing it with Vec::new().  Refcount==1 at materialise →
+        // Arc::unwrap_or_clone is also zero-copy.  Net byte-copies
+        // through the pipeline: ZERO.
+        let shared = t.take_data_as_arc();
+        lazy_map.insert(LazyTensor::from_arc_bytes(meta, shared));
+    }
+    quantize_streaming(lazy_map, metadata, quantizer, bits, group_size, progress, false)
+}
+
 /// ADR-014 P7 iter-47 — iter-3 wire-up wedge.  Drop-in replacement
 /// for [`quantize_model`] that takes ownership of an eager
 /// [`crate::ir::TensorMap`] and routes through the streaming
@@ -6084,6 +6136,96 @@ mod tests {
             "iter-3 lazy pipeline output must validate clean: {:?}",
             errors
         );
+    }
+
+    /// ADR-014 P7 iter-83 — `quantize_via_streaming_consuming_mut` byte-identity
+    /// to `quantize_model`.  Pins the zero-byte-copy wedge contract: even
+    /// though the function drains tensor bytes (post-call tensor_map.data
+    /// is empty), the QuantizedModel output is byte-equal to what
+    /// `quantize_model(&tensor_map, ...)` produces on the same fixture.
+    ///
+    /// Test fixture is identical to iter-48 (5-tensor multi-fixture) but
+    /// uses two separate TensorMaps (one consumed, one borrowed) to
+    /// satisfy the &mut vs & access patterns simultaneously.
+    #[test]
+    fn quantize_via_streaming_consuming_mut_byte_identical_to_quantize_model() {
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::ir::TensorMap;
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+
+        const QK_K: usize = 256;
+        const N_LAYERS: usize = 32;
+
+        let make_payload = |seed: f32| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(QK_K * 2);
+            for i in 0..QK_K {
+                let v = (i as f32 / QK_K as f32) * 2.0 - 1.0 + seed * 0.001;
+                bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+            }
+            bytes
+        };
+
+        let tensors: Vec<&str> = vec![
+            "output.weight",
+            "blk.0.attn_v.weight",
+            "blk.0.ffn_down.weight",
+            "blk.5.attn_q.weight",
+        ];
+
+        let build_map = || -> TensorMap {
+            let mut m = TensorMap::new();
+            for (i, name) in tensors.iter().enumerate() {
+                m.insert(crate::ir::TensorRef {
+                    name: name.to_string(),
+                    shape: vec![1, QK_K],
+                    dtype: DType::F16,
+                    data: make_payload(i as f32),
+                });
+            }
+            m
+        };
+        let map_for_eager = build_map();
+        let mut map_for_consuming = build_map();
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+        let q1 = VariantKQuantizer::new(KQuantVariant::Q4_K_M, CalibrationData::None, N_LAYERS);
+        let q2 = VariantKQuantizer::new(KQuantVariant::Q4_K_M, CalibrationData::None, N_LAYERS);
+
+        let eager = quantize_model(&map_for_eager, &metadata, &q1, 0, 0, &progress)
+            .expect("quantize_model");
+        let consuming = quantize_via_streaming_consuming_mut(
+            &mut map_for_consuming,
+            &metadata,
+            &q2,
+            0,
+            0,
+            &progress,
+        )
+        .expect("quantize_via_streaming_consuming_mut");
+
+        assert_eq!(eager.quant_method, consuming.quant_method);
+        assert_eq!(eager.tensors.len(), consuming.tensors.len());
+
+        for tname in &tensors {
+            let e = eager.tensors.get(*tname).unwrap();
+            let c = consuming.tensors.get(*tname).unwrap();
+            assert_eq!(e.quant_info.ggml_type, c.quant_info.ggml_type, "{tname}");
+            assert_eq!(
+                e.data, c.data,
+                "{tname}: bytes differ — consuming_mut wedge lost byte-identity vs eager"
+            );
+        }
+
+        // Caller-contract verification: tensor_map's data is now drained.
+        for tname in &tensors {
+            let post = map_for_consuming.tensors.get(*tname).unwrap();
+            assert!(
+                post.data.is_empty(),
+                "{tname}: post-call data must be empty (caller contract)"
+            );
+        }
     }
 
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
