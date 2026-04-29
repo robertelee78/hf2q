@@ -901,3 +901,53 @@ fn streaming_phase3_run_to_run_determinism_q4_k_m() {
         shas[1], shas[2]
     );
 }
+
+// ---------------------------------------------------------------------
+// T15: Eager path run-to-run determinism (iter-66)
+// ---------------------------------------------------------------------
+
+/// ADR-014 P7 iter-66 — mirror iter-65's determinism gate for the
+/// EAGER path.  Without this, a future regression where eager becomes
+/// non-deterministic (e.g. someone adds a HashMap iter that produces
+/// different orderings) would invalidate iter-61-64's eager-vs-streaming
+/// SHA gates: each individual eager run might still equal a same-run
+/// streaming run, but cross-run comparisons would mask the regression.
+///
+/// 3× back-to-back eager convert runs hash identically.
+#[test]
+fn eager_run_to_run_determinism_q4_k_m() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let input_dir = tmp.path().join("input");
+    setup_p2_iter2_fixture(&input_dir);
+
+    let mut shas: Vec<String> = Vec::with_capacity(3);
+    for run in 0..3 {
+        let out_dir = tmp.path().join(format!("eager_run_{}", run));
+        Command::cargo_bin("hf2q")
+            .expect("hf2q binary")
+            .args([
+                "convert",
+                "--input", input_dir.to_str().unwrap(),
+                "--format", "gguf",
+                "--quant", "q4_k_m",
+                "--output", out_dir.to_str().unwrap(),
+                "--skip-quality",
+            ])
+            .assert()
+            .success();
+        shas.push(file_sha256(&locate_gguf(&out_dir)));
+    }
+
+    assert_eq!(
+        shas[0], shas[1],
+        "eager run 0 vs run 1: convert is non-deterministic\n  \
+         run 0: {}\n  run 1: {}",
+        shas[0], shas[1]
+    );
+    assert_eq!(
+        shas[1], shas[2],
+        "eager run 1 vs run 2: convert is non-deterministic\n  \
+         run 1: {}\n  run 2: {}",
+        shas[1], shas[2]
+    );
+}
