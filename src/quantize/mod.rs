@@ -149,6 +149,17 @@ pub fn validate_group_size(tensor: &TensorRef, group_size: usize) -> Result<(), 
 /// downstream `tensor_map` dependency and the streaming-consuming
 /// variant ([`quantize_via_streaming_consuming`]) becomes the call site.
 ///
+/// **iter-72 future-improvement note**: the per-tensor `t.data.clone()`
+/// inside the loop is the dominant memory cost.  Two paths to remove it:
+/// (a) change `TensorRef::data` to `Arc<Vec<u8>>` so cloning becomes
+/// a refcount bump (invasive: `Vec<u8>` is assumed in many sites);
+/// (b) extend `LazyTensor` with a borrowed-bytes constructor under a
+/// borrowed-lifetime variant (would require LazyTensorMap to grow a
+/// lifetime parameter — propagates through the entire pipeline).
+/// Option (a) is the cleaner end-state but requires a separate ADR
+/// (touches the ir::TensorRef contract).  Until then the wedge is
+/// fit-for-purpose as the env-flag transitional toggle.
+///
 /// Byte-identical to `quantize_model` on the same fixture, verified
 /// by `quantize_via_streaming_borrowed_byte_identical_to_quantize_model`.
 pub fn quantize_via_streaming_borrowed(
