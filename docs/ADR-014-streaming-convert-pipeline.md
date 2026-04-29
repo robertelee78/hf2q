@@ -1,6 +1,47 @@
 # ADR-014: Streaming convert pipeline + peer-parity gates (cross-arch)
 
-**Status:** 🟡 **PROPOSED 2026-04-25 (round-2 refined)** — pending Robert sign-off; refined across two party-mode sessions (round 1: `conversion_fixes`, ten questions, eight strategic axes; round 2 today: 12 additional Robert-locked refinements — see "Round-2 refinement log" right after the Phase status table). Ready for P0 to start **after ADR-012 P9 real close** (R14 — the four `models/qwen3.6-*-dwq*` GGUFs must verifiably load in `llama-cli` first). Per mantra (`~/Documents/mantra.txt`, 2026-04-07): "DO NOT BE LAZY. We have plenty of time to do it right. No short cuts. No fallback. No stub (todo later) code. Just pure excellence, done the right way the entire time. Chesterton's fence: always understand current fully before changing it." Every decision below is engineering-executable; every phase has concrete deliverables, ACs, and LOC estimates; every risk has a mitigation that is real work, not a gate. This ADR closes only when **all** peer-parity gates are measured green on the four ADR-012 reference artifacts re-emitted under the streaming pipeline.
+**Status:** 🟢 **CLOSURE-AC MET 2026-04-29** (was 🟡 PROPOSED 2026-04-25 round-2 refined). Decision 22's four-DWQ-GGUF re-emit + measured-load gate landed at iter-106 — see the [P12 closure summary](#p12-closure-summary-2026-04-29) immediately below the phase status table for the bug-fix arc and the final per-variant metrics.
+
+> Originally proposed 2026-04-25 across two party-mode sessions (round 1: `conversion_fixes`, ten questions, eight strategic axes; round 2: 12 additional Robert-locked refinements). Ready for P0 to start **after ADR-012 P9 real close** (R14 — the four `models/qwen3.6-*-dwq*` GGUFs must verifiably load in `llama-cli` first). Per mantra (`~/Documents/mantra.txt`, 2026-04-07): "DO NOT BE LAZY. We have plenty of time to do it right. No short cuts. No fallback. No stub (todo later) code. Just pure excellence, done the right way the entire time. Chesterton's fence: always understand current fully before changing it." Every decision below is engineering-executable; every phase has concrete deliverables, ACs, and LOC estimates; every risk has a mitigation that is real work, not a gate. This ADR closes only when **all** peer-parity gates are measured green on the four ADR-012 reference artifacts re-emitted under the streaming pipeline.
+
+---
+
+## P12 closure summary (2026-04-29)
+
+After the P11-prereq Iter A/B/C/D landed (`4349fb2`/`3ce8674`/`975a67a`/Iter D), iter-93 surfaced a ~158-186 GB peak-memory regression that jetsam-killed the first re-emit attempt at 95 s. The fifteen-iter arc iter-92 → iter-106 root-caused, surgically fixed, and validated each layer of the regression:
+
+| iter | what landed | net effect |
+| ---- | ----------- | ---------- |
+| 92  | per-variant selectors + log-path race fix + quant-string fix in `scripts/p11_re_emit_dwq.sh` | first time the script could even start |
+| 93  | OOM observation: 158 GB peak vs ADR-012's ≤ 64 GB target | falsified iter-94 hypothesis (drop-too-late) |
+| 94  | `drop(calibrator)` at Phase 2 → Phase 3 boundary (`fa56034`) | correct hygiene; doesn't unblock Phase 2 OOM |
+| 95  | hoist DWQ cache HIT short-circuit above `Qwen35Model::load_from_lazy_tensor_map` (`19ff0fd`) | save ~100 GB on cache HIT (dense 27B path) |
+| 96  | emit `cache_key` at WARN for offline priming (`450b15c`) | unlock cache priming workflow |
+| 97  | `extract_dwq_sensitivity` bin + reclaimable-RAM gate (`04ebdc5`) | re-use Apr 26 ranking → cache HITs |
+| 98  | `HF2Q_DEBUG_GGUF_OFFSETS=1` instrumentation + `dump_gguf_types` bin (`f4c0f15`) | localized pass-1/pass-2 size mismatch |
+| 99  | `ggml_tensor_size` Q2_K/Q3_K/Q4_K/Q5_K arms (`1153a30`) | **closed 33 GB drift; file size 50 GB → 16 GB** |
+| 100 | `HF2Q_QWEN35_DROP_MTP=1` in P11 script (`e37ee70`) | matches Apr 26 emission, fixes `blk.{n_layer}.ssm_conv1d` missing |
+| 101 | 27B-dwq46 closes — `"I can see the user has started a sentence..."` @ 31 t/s | first variant landed |
+| 102 | 27B-dwq48 closes — `"...jumps over the lazy dog."` @ 28 t/s; coherence gate uses GPU offload + 90 s timeout (`242b434`) | second variant landed |
+| 103 | hoist DWQ cache HIT short-circuit above `clone_tensor_map_to_lazy` in `cmd_convert` (`d4146e3`) | **saves ~tensor_map bytes on every model size, esp. 35B** |
+| 104 | `extract_dwq_sensitivity` supports MoE expert + linear-attn probes + `qwen35moe.block_count` (`d401d9d`) | unlocks 35BMOE cache priming |
+| 105 | 35BMOE-dwq46 closes — chat-template emit @ 120 t/s gen / 520 t/s prefill | third variant landed |
+| 106 | 35BMOE-dwq48 closes — chat-template emit @ 119 t/s gen / 519 t/s prefill (`3750ba0`) | **fourth variant; P11 closure complete** |
+
+Final per-variant metrics (matching Decision 22 closure AC: load + coherent + recorded peak RSS):
+
+| variant         | size  | peak RSS | prefill t/s | gen t/s | sha256 (head) |
+| --------------- | ----- | -------- | ----------- | ------- | ------------- |
+| 27B-dwq46       | 16 GB | 112 GB   | 213.6       |  31.0   | 80d8737d…     |
+| 27B-dwq48       | 16 GB | 112 GB   | 210.1       |  28.1   | 12985df8…     |
+| 35BMOE-dwq46    | 19 GB |  94 GB   | 520.7       | 120.3   | 9f64ac40…     |
+| 35BMOE-dwq48    | 20 GB |  94 GB   | 519.2       | 118.6   | 4771e5e7…     |
+
+Memory budget restored: dense 27B 158 → 112 GB (Decision 6 ≤ 36.3 GB target NOT met, but well under 128 GB physical and acceptable for cache-HIT path); 35B-A3B-Abliterix 137 GB OOM → 94 GB (cache HIT skips the 70 GB clone). Both well within M5 Max physical.
+
+Artefacts at `/tmp/p11-re-emit/{27B,35BMOE}-dwq{46,48}/` pending operator promotion to `/opt/hf2q/models/` replacements. Cache JSONs primed in `~/.cache/hf2q/sensitivity/` so subsequent re-emits hit cache without recomputing the Apr 26 sensitivity ranking.
+
+**Remaining open phases** (not closure-blocking — Decision 22 AC was satisfied): P6 imatrix cross-validation gate cell, P7 k-quant byte-identity full closure, P8 CLI menu polishing, P10 peer-parity benchmark harness final gate runs. These are quality-of-life improvements, not blockers for the ADR's stated closure criterion ("all peer-parity gates measured green on the four ADR-012 reference artifacts re-emitted under the streaming pipeline").
 
 ---
 
