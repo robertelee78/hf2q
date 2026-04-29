@@ -5913,6 +5913,154 @@ mod tests {
         assert_eq!(b0.quant_info.ggml_type.as_deref(), Some("Q4_K"));
     }
 
+    /// ADR-014 P7 iter-56 — full iter-3 lazy pipeline end-to-end gate.
+    /// Architecturally simulates main.rs's iter-3 wholesale-skip path
+    /// at the unit-test level: every step operates on `LazyTensorMap`
+    /// without `materialize_all()` ever firing on the full model.
+    ///
+    /// Pipeline shape (mirrors what main.rs:1147+ becomes post-iter-3):
+    ///   1. Build LazyTensorMap (mock of `read_tensors_lazy` output)
+    ///   2. lazy_map.convert_bf16_to_f16()    (iter-55)
+    ///   3. lazy_map.total_size_bytes()       (iter-54 — telemetry)
+    ///   4. quantize_streaming(lazy_map_for_q3, …)        (iter-1+47)
+    ///   5. measure_quality_streaming_lazy(lazy_map_for_q45, …)  (iter-43+45)
+    ///   6. backend.validate(&QuantizedModel)
+    ///
+    /// Step 4 consumes lazy_map; step 5 takes a parallel re-read.
+    /// In production this re-read would come from `read_tensors_lazy`
+    /// over the safetensors files; here we build an identical map
+    /// upstream.
+    ///
+    /// This iter does NOT touch main.rs.  Its purpose: prove that
+    /// every iter-54/55 API piece + iter-43/45/47-52 pipeline stage
+    /// composes cleanly under the iter-3 architectural shape, so the
+    /// eventual main.rs surgery (iter-57+) is a transparent code
+    /// shuffle without behavioral risk.
+    ///
+    /// Asserts:
+    ///   - convert_bf16_to_f16 returns expected count
+    ///   - total_size_bytes matches a known sum
+    ///   - QuantizedModel non-empty
+    ///   - QualityReport per-layer cosine ≥ threshold (8-bit dequant)
+    ///   - GgufBackend::validate clean
+    #[test]
+    fn iter3_lazy_pipeline_end_to_end_no_materialize_all() {
+        use crate::backends::{gguf::GgufBackend, OutputBackend};
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quality::measure_quality_streaming_lazy;
+        use crate::quantize::static_quant::StaticQuantizer;
+
+        const N_ELEMENTS: usize = 64;
+
+        // Mixed-dtype fixture: 2 BF16 weights + 1 F16 weight.  Mirrors
+        // what `read_tensors_lazy` would yield on a model with mixed
+        // input precisions.
+        fn bf16_payload(seed: f32) -> Vec<u8> {
+            (0..N_ELEMENTS)
+                .map(|i| (i as f32 / N_ELEMENTS as f32) * 2.0 - 1.0 + seed * 0.001)
+                .flat_map(|v| half::bf16::from_f32(v).to_le_bytes())
+                .collect()
+        }
+        fn f16_payload(seed: f32) -> Vec<u8> {
+            (0..N_ELEMENTS)
+                .map(|i| (i as f32 / N_ELEMENTS as f32) * 2.0 - 1.0 + seed * 0.001)
+                .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+                .collect()
+        }
+
+        let build_lazy_map = || -> LazyTensorMap {
+            let mut m = LazyTensorMap::new();
+            m.insert(LazyTensor::from_bytes(
+                LazyMeta::new(
+                    "blk.0.attn_q.weight".to_string(),
+                    vec![2, N_ELEMENTS / 2],
+                    DType::BF16,
+                ),
+                bf16_payload(0.0),
+            ));
+            m.insert(LazyTensor::from_bytes(
+                LazyMeta::new(
+                    "blk.0.attn_v.weight".to_string(),
+                    vec![2, N_ELEMENTS / 2],
+                    DType::BF16,
+                ),
+                bf16_payload(1.0),
+            ));
+            m.insert(LazyTensor::from_bytes(
+                LazyMeta::new(
+                    "blk.0.ffn_down.weight".to_string(),
+                    vec![2, N_ELEMENTS / 2],
+                    DType::F16,
+                ),
+                f16_payload(2.0),
+            ));
+            m
+        };
+
+        // Step 1+2: build + bf16→f16 (iter-55).
+        let mut lazy_map = build_lazy_map();
+        let converted = lazy_map.convert_bf16_to_f16().expect("bf16 convert");
+        assert_eq!(converted, 2, "two BF16 tensors converted");
+
+        // Step 3: telemetry (iter-54).  Post-conversion all 3 tensors
+        // are F16 (2 bytes) × 64 elems = 128 bytes each → 384 total.
+        let total_bytes = lazy_map.total_size_bytes();
+        assert_eq!(total_bytes, 3 * 64 * 2, "lazy total_size_bytes post-bf16");
+
+        // Step 4: quantize via streaming (iter-1+47).
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+        let q = StaticQuantizer::new("q8").expect("StaticQuantizer q8");
+        let model = quantize_streaming(lazy_map, &metadata, &q, 8, 32, &progress, false)
+            .expect("Phase 3 streaming quantize");
+        assert!(!model.tensors.is_empty(), "QuantizedModel non-empty");
+        assert_eq!(model.tensors.len(), 3, "all three tensors quantized");
+
+        // Step 5: lazy quality on parallel re-read map (iter-43).
+        // In production this comes from `read_tensors_lazy` again;
+        // here we rebuild the same fixture (post-bf16 cast) to mirror
+        // the streaming re-read pattern.
+        let mut lazy_for_quality = build_lazy_map();
+        lazy_for_quality
+            .convert_bf16_to_f16()
+            .expect("bf16 convert (q-side)");
+        let report = measure_quality_streaming_lazy(
+            &lazy_for_quality,
+            &model,
+            &metadata,
+            std::path::Path::new("/tmp"),
+            &progress,
+        )
+        .expect("Phase 4.5 lazy quality");
+        let per_layer = report
+            .per_layer_cosine_sim
+            .as_ref()
+            .expect("per-layer cosine sim must exist");
+        assert!(
+            !per_layer.is_empty(),
+            "per-layer must contain weight pairs"
+        );
+        for (i, &v) in per_layer.iter().enumerate() {
+            assert!(
+                v > 0.99,
+                "tensor {i} cosine {v} ≤ 0.99 — 8-bit static dequant degraded"
+            );
+        }
+
+        // Step 6: backend validate.
+        let backend = GgufBackend::new();
+        let warnings = backend.validate(&model).expect("validate");
+        let errors: Vec<_> = warnings
+            .iter()
+            .filter(|w| format!("{:?}", w).to_lowercase().contains("error"))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "iter-3 lazy pipeline output must validate clean: {:?}",
+            errors
+        );
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
