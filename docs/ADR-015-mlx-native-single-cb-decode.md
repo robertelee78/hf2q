@@ -1592,6 +1592,61 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter24 RESUMED — Phase B-D PASS (chain_n sweep determinism gate cleared up to N=20); Phase E PERF BLOCKED (ADR-014 P11 27B DWQ re-emit fired mid-mission at 06:43 UTC); verdict = MAX-SAFE chain_n=20 confirmed byte-identical-deterministic across all 4 fixtures × 5 trials × NGEN=256; perf Δ measurement deferred to iter25 with exact resumption procedure.**  iter24 had been recorded PARTIAL on the same calendar day owing to a concurrent ADR-014 P11 process that pre-empted Phase B-E.  At HEAD `a488ad2` (worktree `agent-ac21f54564845da98`) the brain-server `kill -STOP` ps audit confirmed `mcp-brain-server` PID 1205 STOPped (state T) and `ps aux | grep -E "hf2q convert" | grep -v grep` returned EMPTY at 06:23 UTC — Phase B-D ran in that clean window (06:23-06:41 UTC, 18 minutes, 80 paired-trial invocations).  Phase E was about to launch when a fresh `hf2q convert --quant dwq-4-6` invocation appeared at 06:43 UTC at RSS 57 GB (44.3% of unified) with `Pages free` collapsed to 24 K × 16 KB = 390 MB — same OOM-risk regime as the original block.  Per the mission's HALT precondition ("If output is non-empty, HALT iter24 phase, document state in ADR with a RESUMED-PARTIAL-N entry"), Phase E is recorded as BLOCKED and handed off to iter25.  Phase B-D **alone** is the substantive deliverable of this resumption.
+
+  **Phase B.1 — chain_n=1 sanity (re-verifies iter21 fix at HEAD).**  4 fixtures × 2 cold-process trials × NGEN=256 × greedy decode × prompt `"Hello, my name is"`.  All 8 trials byte-identical within fixture, EVERY md5 EXACTLY matches the iter21 ADR §D table:
+
+  | fixture | trial-pair md5 (iter24 RESUMED) | iter21 reference md5 | match |
+  |---|---|---|---|
+  | qwen3.6-27b-dwq46 | `8723f73ef47d4c987af3e4eed8ce466d` | `8723f73ef47d4c987af3e4eed8ce466d` | ✓ |
+  | gemma-26B-dwq | `ee79ad83927f4a7314032ec92f3c808b` | `ee79ad83927f4a7314032ec92f3c808b` | ✓ |
+  | qwen3.6-35b-a3b-dwq46 | `12ff58f98c0ddec8cbf27056ed1dd46e` | `12ff58f98c0ddec8cbf27056ed1dd46e` | ✓ |
+  | qwen3.6-35b-a3b-apex | `e76fca677e61783c4621d8c069a89646` | `e76fca677e61783c4621d8c069a89646` | ✓ |
+
+  → iter21's missing-`memory_barrier` fix (commit `c46207d`, op6→op7 in `apply_gated_attn_layer_decode_into`) is fully landed at HEAD `a488ad2` and produces stable byte-identical decoded output across cold-process restarts.  This is the Phase A audit's predicted outcome (chain_n=1 codepath inherits the iter21 barrier verbatim; no chain-specific bypass exists).
+
+  **Phase B.2 — chain_n=2 (`HF2Q_PARTIAL_CHAIN_N=2`).**  Same 4-fixture × 2-trial matrix.  All 8 trials byte-identical within fixture AND each fixture's chain_n=2 md5 EXACTLY equals its chain_n=1 baseline md5 above.  This contradicts the iter20-COHERENCE-DIAG observation that chain_n=2 was nondeterministic at NGEN=256 — that observation was correct PRE-iter21 (the op6→op7 race manifested independently of chain_n).  Post-iter21, chain_n=2 is byte-identical-deterministic.
+
+  **Phase C-D — chain_n sweep N ∈ {4, 8, 13, 20} × 4 fixtures × 5 trials × NGEN=256.**  All 80 invocations byte-identical to the chain_n=1 baseline within fixture.  Full grid:
+
+  | N → | 27b-dwq46 | gemma-26B-dwq | 35B-A3B-dwq46 | 35B-A3B-apex |
+  |---|---|---|---|---|
+  | 1 (baseline) | 2/2 ✓ `8723f73e…` | 2/2 ✓ `ee79ad83…` | 2/2 ✓ `12ff58f9…` | 2/2 ✓ `e76fca67…` |
+  | 2 | 2/2 ✓ matches | 2/2 ✓ matches | 2/2 ✓ matches | 2/2 ✓ matches |
+  | 4 | 5/5 ✓ matches | 5/5 ✓ matches | 5/5 ✓ matches | 5/5 ✓ matches |
+  | 8 | 5/5 ✓ matches | 5/5 ✓ matches | 5/5 ✓ matches | 5/5 ✓ matches |
+  | 13 | 5/5 ✓ matches | 5/5 ✓ matches | 5/5 ✓ matches | 5/5 ✓ matches |
+  | 20 | 5/5 ✓ matches | 5/5 ✓ matches | 5/5 ✓ matches | 5/5 ✓ matches |
+
+  **MAX-SAFE chain_n = 20 (the highest tested).**  No determinism failure was observed — the sweep is pinned at the upper end of its tested range, not at a discovered breakdown.  For Qwen3.6 (40 layers MoE-FFN, 64 layers dense, 16 layers Gated-FA + 48 DeltaNet on the MoE variant) chain_n=20 collapses 40 per-token layer-CBs into ~2 per-token CB groups (40/20=2), exceeding iter22 §G's "≤3 CBs/tok" target.  The Phase A audit prediction (chain_n>1 inherits the iter21 op6→op7 barrier; the six catalogued cross-layer RAW pairs are all barrier-covered or per-layer-isolated; pool-reuse aliasing cannot fire mid-encoder because locals stay bound) was empirically correct.
+
+  **Phase E — perf Δ measurement BLOCKED.**  At 06:43 UTC, immediately after Phase D close, ps audit detected fresh `./target/release/hf2q convert --quant dwq-4-6 --output /tmp/p11-re-emit/27B-dwq46` at PID 91565, RSS 57 GB (44.3% of 128 GB unified), state R, 99.5% CPU.  `vm_stat` `Pages free` = 24566 × 16 KB = 390 MB; `Pages active` = 4 095 508; `Pages inactive` = 3 804 412.  Loading a 23-GB apex fixture at this memory pressure ratio risks `feedback_oom_prevention` SIGKILL per `project_dwq_concurrent_oom` (jetsam triggers when free+inactive < model working set).  Per the mission HALT precondition Phase E is deferred to iter25.  The brain-server `kill -CONT` was issued at 06:43:30 to release the STOPped state safely (no concurrent bench window remaining to protect).
+
+  **Phase F — DOES NOT SHIP THE chain_n=20 DEFAULT YET.**  Per `feedback_correct_outcomes` (NEVER ship NULL-Δ-or-regression), the Phase E perf gate is the SHIP gate — without it the chain_n=20 lever cannot be flipped to default-ON.  The default at HEAD remains chain_n=1 (current `forward_gpu.rs:2035-2039` parse: unset → 1).  The exit criterion handed to iter25 is verbatim from the mission: dwq46 ratio +0.01× absolute (0.9487 → ≥0.9587), apex ≥1.0546 (≤−0.5pp drop), 27b ≥1.0302, gemma ≥0.8325 — all measured paired-binary 5-trial cold-SoC.
+
+  **Standing-pin compliance.**
+  - `feedback_verify_baseline_determinism_before_perf_bench` — the ENTIRE substantive deliverable is exactly this gate.  Phase B-D is the most thorough determinism audit on the qwen35 forward_gpu path to date (88 cold-process invocations; 6 chain_n values × 4 fixtures).
+  - `feedback_evidence_first_no_blind_kernel_rewrites` — zero kernel rewrites in iter24-RESUMED.  Pure orchestration sweep using existing `HF2Q_PARTIAL_CHAIN_N` env-var; no `forward_gpu.rs` source changes.
+  - `feedback_oom_prevention` + `project_dwq_concurrent_oom` — Phase E HALT honored on concurrent ADR-014 P11 detection per the mission HALT precondition; no model-loading inference launched against a 57-GB convert process.
+  - `feedback_bench_process_audit` — `mcp-brain-server` (PID 1205) `kill -STOP`'d at 06:23 UTC for the Phase B-D window (`ps -o stat=` confirmed `T`); `kill -CONT`'d at 06:43:30 post-Phase-D; per-trial timestamps archived in `/tmp/iter24/{phaseB,phaseCD}/`.
+  - `feedback_no_shortcuts` — NGEN held at 256; greedy decode (temperature=0); no relaxation of token-parity to "FP-rounding tie".
+  - `feedback_use_cfa_worktrees` — all measurement in worktree `/opt/hf2q/.claude/worktrees/agent-ac21f54564845da98`; pathspec-only commit on origin/main fast-forward.
+  - `feedback_dont_guess` — every line number (2035-2039 chain_n parse, 1856 op6→op7 barrier, 2445 hidden=ffn_out cross-layer barrier) verified at HEAD a488ad2 BEFORE relying on it.
+  - `feedback_correct_outcomes` — Phase E NULL-result is recorded as BLOCKED-by-OOM-precondition rather than fabricated as MET or FAILED; iter25 inherits a fully-instrumented resumption path.
+
+  **EXACT iter25 resumption procedure.**
+  1. Pre-flight: `ps aux | grep -E "hf2q convert" | grep -v grep` MUST return empty.  `vm_stat` `Pages free + Pages inactive` ≥ 30 GB / 16 KB = 1.96 M.  `pmset -g therm` clean.  `kill -STOP` mcp-brain-server (verify state `T`).
+  2. `scripts/bench-matrix.sh` invocation with `HF2Q_PARTIAL_CHAIN_N=20` overlaid on each cell, paired against an equal-trial-count `HF2Q_PARTIAL_CHAIN_N=1` (or unset) run on the same SoC session.  Trial pattern A/B/L (chain_n=1 / chain_n=20 / llama-bench) × 5 trials = 60 invocations across 4 fixtures.  Time budget: ~40 min.
+  3. Per-cell ratio Δ (cn20 − cn1).  Exit criterion (verbatim from this iter's mission spec):
+     - dwq46 ≥ +0.01× absolute (0.9487 → ≥0.9587) → PASS to ship.
+     - apex ratio drop ≤ 0.5pp (must remain ≥ 1.0546 vs iter22 1.0596).
+     - 27b ratio drop ≤ 0.5pp (must remain ≥ 1.0302 vs iter22 1.0352).
+     - gemma ratio drop ≤ 0.5pp (must remain ≥ 0.8325 vs iter22 0.8375).
+  4. SHIP path (all 4 cells PASS): change `forward_gpu.rs:2039` `.unwrap_or(1)` → `.unwrap_or(20)` and add `HF2Q_PARTIAL_CHAIN_LEGACY=1` escape hatch (env-var; if set, forces chain_n=1 regardless of `HF2Q_PARTIAL_CHAIN_N`).  Pattern: iter17 `HF2Q_LEGACY_PER_LAYER_CB` precedent at line 2005-2007.
+  5. FAIL path (dwq46 < +0.01× OR any cell drops > 0.5pp): record as iter25 FALSIFIED; pivot iter26 to the q4_0 MoE-id 2-acc sumy port (iter22 §G demoted candidate, +9.2 µs/tok available).
+
+  **Telemetry archived.**  `/tmp/iter24/phaseB/<fx>-cn{1,2}-t{1,2}.{stdout,stderr,body}` (16 trials × 3 files = 48 files).  `/tmp/iter24/phaseCD/<fx>-cn{4,8,13,20}-t{1..5}.{stdout,stderr,body}` (80 trials × 3 = 240 files).  `/tmp/iter24/run_det.sh` (the determinism harness).  `/tmp/iter24/run_perf.sh` (the perf harness, ready for iter25 — only the for-fixture loop needs invocation).  Will be retained on this M5 Max workstation through iter25 close.
+
 - **2026-04-29 — iter24 — PARTIAL (Phase A audit COMPLETE; Phase B-E BLOCKED on concurrent ADR-014 P11 27B DWQ re-emit OOM-risk; verdict = static-evidence audit found NO actionable code-level defect in iter17 partial-chain orchestration post-iter21 fix; bench-dependent gates handed off to iter25 with exact resumption procedure).**  iter24 mission was the chain_n sweep on the now-coherent (post-iter21) baseline: find the maximum chain_n that preserves byte-identical decode at NGEN=256 × 4 fixtures × 5 trials AND closes ≥+0.01× on the dwq46 cell.  Phase A (read-only orchestration audit) was completed in this worktree at HEAD `e67636c` (≡ `9de2de4` for `forward_gpu.rs` + `gpu_full_attn.rs` + `gpu_delta_net.rs` + `decode_pool.rs` — the only delta is an ADR-014 docs commit that does not touch ADR-015 source).  Phase B-E (live-inference determinism + bench gates) require model-loading inferences and are HARD-BLOCKED by an active concurrent ADR-014 P11 `hf2q convert --quant dwq-4-6` process (PID 64823, RSS = 38.4 GB, output `/tmp/p11-re-emit/27B-dwq46`) — running 4-fixture inference now would risk SIGKILL of one or both processes per `project_dwq_concurrent_oom` (DWQ ~100 GB peak + concurrent 26B inference saturates 128 GB unified + 12 GB swap → jetsam) AND `feedback_oom_prevention` (one model-loading inference at a time).  Per `feedback_correct_outcomes` (NEVER take shortcuts, reduce scope, or work around problems) iter24 is recorded as PARTIAL rather than fabricated as either a SHIP or FALSIFIED verdict.  The audit findings are durable — they constrain iter25 to a specific minimal-risk experiment.
 
   **A. STATIC-EVIDENCE ORCHESTRATION AUDIT (READ-ONLY).**  Cross-layer RAW dependencies inventoried; barrier coverage verified line-by-line against post-iter21 HEAD.
