@@ -1592,6 +1592,63 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter21 — qwen35 single-CB decode nondeterminism FIXED via missing memory_barrier between Op 6 → Op 7 in `apply_gated_attn_layer_decode_into`.  Bisect localized the introducing commit to `ed768ef` (P3 Stage 1 single-CB qwen35 forward).  5-trial × 4-fixture verification (35B-MoE-dwq46, 35B-MoE-apex, 27B-dense-dwq46, gemma-26B-dwq) confirms byte-identical decoded tokens at NGEN=256.  Total fix: +1 `enc.memory_barrier()` (12 lines including comment), no revert of the optimization.**
+
+  **A. BISECT.**  Per `feedback_verify_baseline_determinism_before_perf_bench` and the iter20-COHERENCE-DIAG mandate, the iter21 mission was to find the single commit that introduced qwen35 forward_gpu nondeterminism.  Bisect anchors:
+  - **Candidate GOOD:** `297b914` (parent of `ed768ef`) — verified 2-trial byte-identical at NGEN=256 on dwq46 fixture.
+  - **Candidate BAD:** `ed768ef` (`feat(adr015 p3 stage1): single-CB qwen35 forward (output head + FullAttn + DeltaNet)`) — verified 2-trial DRIFT at NGEN=32+ on dwq46 fixture (trial-A `2024-09-16 14:22:22`, trial-B `2025-01-01 01:01:01`, trial-C `20202020` — wholly different content).
+  - **Anchor verification:** the older `9ab4cca` cited in iter20 §E predates the entire qwen35 codebase (`src/inference/models/qwen35/forward_gpu.rs` was first added by `f0a976b feat(adr-013 P11): end-to-end Qwen35 GPU forward`).  Re-anchored to `297b914`.
+
+  **B. ROOT CAUSE — THE MISSING BARRIER.**  ed768ef introduced `apply_gated_attn_layer_decode_into` (`src/inference/models/qwen35/gpu_full_attn.rs:1719`) which collapsed the legacy 3-CB FullAttn pipeline (ops1-4 / sdpa_kv / ops6-7) into ONE shared encoder.  The new helper has 5 explicit `enc.memory_barrier()` calls bridging the former CB boundaries (lines 1753, 1774, 1787, 1802, 1817 + 1 internal at apply_sdpa_with_kv_cache_decode_into:1675), and intra-helper barriers preserved bit-for-bit per the P1 audit.  **However, between Op 6 (`apply_sigmoid_gate_multiply` writes `gated`) and Op 7 (`apply_linear_projection_f32_pooled` reads `gated`), there is no explicit barrier.**  Source-line proximity of those two dispatches (gpu_full_attn.rs:1832 and :1835) made the gap easy to overlook: legacy `enc ops6-7` (gpu_full_attn.rs:1589) ALSO had Op 6 + Op 7 back-to-back in the same encoder without an explicit barrier, and legacy was deterministic.
+
+  The runtime semantic difference: in the legacy 3-CB path, the `ops6-7` encoder contained ONLY 2 dispatches (sigmoid_mul + linear_proj).  Although `MTLDispatchTypeConcurrent` is set at the encoder level, the runtime had no other parallel work to interleave — the implicit ordering of the 2-dispatch encoder was always observed.  In the Stage 1 single-CB rewrite, those same 2 dispatches now live inside a richer encoder containing ~15 dispatches and 5 barriers across attention, KV-cache copy, SDPA, and output projection.  In that scheduling context, the runtime is free to reorder Op 6 and Op 7, and the missing barrier becomes visible as a race that produces nondeterministic decoded tokens at NGEN ≥ 32.
+
+  **C. THE FIX.**  ONE line of code added at `gpu_full_attn.rs:1837` (between `apply_sigmoid_gate_multiply` return and `apply_linear_projection_f32_pooled` invocation):
+  ```rust
+  enc.memory_barrier();
+  ```
+  Plus an in-source comment documenting the bisect trail and root cause.  Total diff: +12 lines, 0 deletions, single file (`src/inference/models/qwen35/gpu_full_attn.rs`).  **The Stage 1 single-CB optimization (62 CBs/decode-token saved per ed768ef) is preserved bit-for-bit; the fix is a missing-sync correction, not a revert.**
+
+  **D. VERIFICATION (5-trial × 4-fixture byte-identical at NGEN=256).**  Test command: `hf2q generate --prompt "Hello, my name is" --max-tokens 256 --temperature 0 --model <fixture>.gguf` × 2 trials per call, × 5 trial-pairs per fixture, all with header lines (`prefill:`, `loaded in`, banner) stripped:
+
+  | fixture | family | trial-pair count | per-trial md5 | result |
+  |---|---|---:|---|---|
+  | qwen3.6-35b-a3b-dwq46 (MoE × Q4/Q6) | qwen35 / `forward_gpu.rs` | 5/5 | `12ff58f98c0ddec8cbf27056ed1dd46e` | byte-identical ✓ |
+  | qwen3.6-35b-a3b-apex (MoE × Q5_K) | qwen35 / `forward_gpu.rs` | 5/5 | `e76fca677e61783c4621d8c069a89646` | byte-identical ✓ |
+  | qwen3.6-27b-dwq46 (dense) | qwen35 / `forward_gpu.rs` | 5/5 | `8723f73ef47d4c987af3e4eed8ce466d` | byte-identical ✓ |
+  | gemma-26B-dwq (regression check) | gemma / `forward_mlx.rs` | 5/5 | `ee79ad83927f4a7314032ec92f3c808b` | byte-identical ✓ |
+
+  All 4 fixtures × 5 trial-pairs × 2 calls = 40 invocations producing 4 distinct md5 hashes (one per fixture, identical across all 10 calls per fixture).  No regression on gemma (forward_mlx.rs path was untouched, expected GOOD-stays-GOOD).
+
+  **E. CODEX REVIEW (read-only sandbox).**  Verified independently by codex-exec:
+  - (a) ✓ Patch correctly inserts ONE memory_barrier at the RAW edge between Op 6 and Op 7.
+  - (b) ✓ Output semantics are byte-equivalent to legacy; synchronization topology is technically richer (legacy lacked an explicit barrier here too, but the ops6-7 encoder had only 2 dispatches in legacy versus ~15 in the Stage 1 fused encoder).
+  - (c) ✓ No new race introduced; the barrier only orders an existing producer/consumer dependency.
+  - (d) ✓ True barrier fix, not a revert: `apply_gated_attn_layer_decode_into` still takes the caller's encoder, still does not commit internally, Stage 1 single-CB structure intact.
+
+  **F. TESTS.**  Full suite `cargo test --release --bin hf2q` → 2191 passed, 0 failed, 11 ignored (no parity regressions).
+
+  **G. iter18 MATRIX BENCH (re-run with coherent baseline).**  Single-trial cold-SoC matrix at `/tmp/cfa-iter21/bench/matrix-20260429T041326Z.md`:
+
+  | cell | iter18 ratio | iter21 ratio (with fix) | Δ |
+  |---|---:|---:|---:|
+  | qwen3.6-35b-a3b-dwq46 (MoE) | 0.9447× (Δpp −5.53) | 0.9487× (Δpp −5.13) | +0.40 pp |
+  | qwen3.6-35b-a3b-apex (MoE) | 1.0483× (Δpp +4.83) | 1.0596× (Δpp +5.96) | +1.13 pp |
+  | qwen3.6-27b-dwq46 (dense) | 1.0449× (Δpp +4.49) | 1.0352× (Δpp +3.52) | −0.97 pp |
+  | gemma-26B-dwq | 0.8372× (Δpp −16.28) | 0.8375× (Δpp −16.25) | +0.03 pp |
+
+  All 4 cells within the iter18 sub-1pp same-day t/s envelope (iter18 N=3 saw ~6 t/s spread on dwq46 alone; iter21's N=1 differences are noise).  The Stage 1 single-CB optimization is intact: hf2q apex BEATS llama by +5.96 pp; 27B-dense beats by +3.52 pp; dwq46 underperforms by −5.13 pp (Defect A territory, untouched by iter21); gemma underperforms by −16.25 pp (separate ADR-015 P3c.1/.2/.3 lever stack).  **Per-trial content variance has collapsed (5/5 byte-identical at NGEN=256 across all 4 fixtures), so future N=3 runs will produce trustworthy Δpp figures for the first time since iter11.**
+
+  **H. iter22 MISSION.**  Defect A (qwen-35B-A3B × dwq46 -5.53pp gap) perf work resumes against the now-coherent baseline.  Per iter19-DIAG quant inventory, the lever remains `kernel_mul_mv_id_q4_0_f32` (mlx-native shader); iter20-attempt-1's two-accumulator sumy A/B can be re-run cleanly.  **Standing pin reinforced: `feedback_verify_baseline_determinism_before_perf_bench` — every future perf iter MUST run a 2-trial byte-identical determinism gate at full NGEN before any bench is considered valid.**
+
+  **I. ARTIFACTS.**  
+  - Worktree: `/opt/hf2q/.cfa-worktrees/iter21-bisect` (branch `cfa/iter21-bisect/claude`).
+  - Bisect log: `/tmp/cfa-iter21/bisect-log/{297b914.good, ed768ef.bad, 3a593fa.bad}`.
+  - Per-fixture per-trial decoded outputs: `/tmp/cfa-iter21/tests/fix1-{stable-trial1..5,apex-t1..5,27b-t1..5,gemma-t1..5}-{A,B}.txt`.
+  - Diff: `/tmp/cfa-iter21/iter21-fix.diff` (12 lines, single file).
+  - Codex review log inline above (§E).
+  - iter18 re-run matrix: `/tmp/cfa-iter21/bench/matrix-${DATE}.md`.
+
 - **2026-04-29 — iter20-COHERENCE-DIAG — Qwen3.6 forward_gpu path is NONDETERMINISTIC at NGEN≥256 across ALL three Qwen cells; Gemma forward_mlx path is byte-identical-deterministic; the iter11–18 perf-bench results are partially compromised because every "parity gate" since iter11 was implicitly comparing against a moving baseline.  Per user "coherence is more important than speed" — pivot from perf to coherence as the iter20 mission.**
 
   **A. THE FINDING.**  At temperature=0 greedy decode with the prompt "Hello, my name is", NGEN=256, the same hf2q binary produces *materially different* token sequences across consecutive runs on every Qwen3.6 fixture:

@@ -1832,6 +1832,28 @@ pub fn apply_gated_attn_layer_decode_into(
     let gated = apply_sigmoid_gate_multiply(
         enc, registry, device, &attn_out, &gate_flat, n_elem,
     )?;
+    // ADR-015 iter21: memory_barrier between Op 6 (sigmoid_gate_multiply
+    // writes `gated`) and Op 7 (linear_projection reads `gated`).
+    //
+    // The legacy 3-CB path also lacked an explicit barrier at this RAW
+    // edge (the legacy `enc ops6-7` encoder dispatched sigmoid_mul +
+    // linear_proj back-to-back at gpu_full_attn.rs:1590 / :1593 with no
+    // intervening memory_barrier).  Yet the legacy path was deterministic
+    // at HEAD `297b914` because that ops6-7 encoder contained ONLY those
+    // two dispatches — `MTLDispatchTypeConcurrent` was nominal but the
+    // runtime had no other parallel work to interleave.
+    //
+    // The Stage 1 single-CB rewrite at `ed768ef` (ADR-015 P3) collapsed
+    // ops1-4 + sdpa_kv + ops6-7 into ONE shared encoder containing ~15
+    // dispatches and 5 explicit barriers.  In that richer scheduling
+    // context the runtime is free to reorder Op 6 and Op 7 (both writing
+    // and reading `gated`), and the implicit ordering that legacy got
+    // for free disappeared.  The defect manifested as nondeterministic
+    // decode at NGEN ≥ 32 across all 3 qwen3.6 fixtures — bisect
+    // localized to `ed768ef`, root cause documented in ADR-015 iter20-
+    // COHERENCE-DIAG, fix verified 5-trial × 4-fixture byte-identical
+    // in iter21.
+    enc.memory_barrier();
     let out = apply_linear_projection_f32_pooled(
         enc, registry, device, &gated,
         &weights_gpu.wo, seq_len, q_total, hidden_size,
