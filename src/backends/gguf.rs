@@ -363,6 +363,24 @@ impl OutputBackend for GgufBackend {
                 ggml_tensor_size(total_elements, ggml_type)
             };
 
+            // ADR-014 P11 iter-98: trace pass-1 per-tensor at WARN so 0-bit
+            // codec-direct mismatches surface in the convert log alongside
+            // the validate() warnings.
+            if std::env::var("HF2Q_DEBUG_GGUF_OFFSETS").as_deref() == Ok("1") {
+                tracing::warn!(
+                    hf = %name,
+                    gguf = %gguf_name,
+                    qi_method = %qt.quant_info.method,
+                    qi_bits = qt.quant_info.bits,
+                    qi_preserved = qt.quant_info.preserved,
+                    qi_ggml_type = ?qt.quant_info.ggml_type,
+                    pass1_ggml_type = ggml_type,
+                    pass1_size = repacked_size,
+                    qt_data_len = qt.data.len(),
+                    "iter-98 GGUF pass-1 per-tensor"
+                );
+            }
+
             // Align offset
             tensor_data_offset = align_up(tensor_data_offset, ALIGNMENT);
 

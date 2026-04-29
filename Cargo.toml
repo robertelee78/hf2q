@@ -159,6 +159,10 @@ path = "src/bin/iter25_audit.rs"
 name = "extract_dwq_sensitivity"
 path = "src/bin/extract_dwq_sensitivity.rs"
 
+[[bin]]
+name = "dump_gguf_types"
+path = "src/bin/dump_gguf_types.rs"
+
 [[bench]]
 name = "quantize_bench"
 harness = false
