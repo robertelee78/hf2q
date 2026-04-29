@@ -476,6 +476,60 @@ fn clone_tensor_map_to_lazy(tensor_map: &crate::ir::TensorMap) -> crate::ir::laz
     out
 }
 
+/// ADR-014 P7 iter-90 — extract the duplicated 3-arm Phase 3 dispatch
+/// from each `cli::QuantMethod` arm of `cmd_convert`. Reads the two
+/// env-flag toggles in fixed precedence order (MUT > legacy > eager)
+/// and dispatches to the matching `quantize` entry point.
+///
+/// Precedence:
+///   - `HF2Q_STREAMING_PHASE3_MUT=1` → zero-byte-copy consuming-mut
+///     wedge (iter-83); drains `tensor_map` via `take_data_as_arc`.
+///   - `HF2Q_STREAMING_PHASE3=1`     → borrowed wedge (iter-77);
+///     wraps each `t.data.clone()` into `Arc<Vec<u8>>`.
+///   - else                          → eager `quantize_model`.
+///
+/// Consolidates the four arms (K-quant codec / ImatrixAdaptive / DwqK /
+/// StaticQuantizer) which previously each duplicated the same if/else
+/// block (iter-84/85/87/88 inline). Byte-identity across all 4 arms ×
+/// all 3 paths is locked by the `cmd_convert_dispatch` SHA matrix gates
+/// (iter-61/62/64/66/84/89).
+///
+/// `arm_label` appears in the routing log line so traces stay
+/// attributable to the originating dispatch site.
+fn dispatch_phase3_quantize(
+    tensor_map: &mut crate::ir::TensorMap,
+    metadata: &crate::ir::ModelMetadata,
+    quantizer: &dyn quantize::Quantizer,
+    bits: u8,
+    group_size: usize,
+    progress: &progress::ProgressReporter,
+    arm_label: &'static str,
+) -> Result<crate::ir::QuantizedModel, quantize::QuantizeError> {
+    let phase3_mut = std::env::var("HF2Q_STREAMING_PHASE3_MUT").as_deref() == Ok("1");
+    let phase3 = std::env::var("HF2Q_STREAMING_PHASE3").as_deref() == Ok("1");
+    if phase3_mut {
+        tracing::info!(
+            arm = arm_label,
+            "ADR-014 P7 iter-90 helper: HF2Q_STREAMING_PHASE3_MUT=1 → quantize_via_streaming_consuming_mut (zero-byte-copy)"
+        );
+        quantize::quantize_via_streaming_consuming_mut(
+            tensor_map, metadata, quantizer, bits, group_size, progress,
+        )
+    } else if phase3 {
+        tracing::info!(
+            arm = arm_label,
+            "ADR-014 P7 iter-90 helper: HF2Q_STREAMING_PHASE3=1 → quantize_via_streaming_borrowed"
+        );
+        quantize::quantize_via_streaming_borrowed(
+            tensor_map, metadata, quantizer, bits, group_size, progress,
+        )
+    } else {
+        quantize::quantize_model(
+            tensor_map, metadata, quantizer, bits, group_size, progress,
+        )
+    }
+}
+
 /// Handle the `convert` subcommand.
 fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     use backends::gguf::GgufBackend;
@@ -1467,46 +1521,18 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 // will handle the Phase 4.5 ordering.
                 //
                 // Precedence: STREAMING_PHASE3_MUT > STREAMING_PHASE3 > eager.
-                let streaming_phase3 =
-                    std::env::var("HF2Q_STREAMING_PHASE3").as_deref() == Ok("1");
-                let streaming_phase3_mut =
-                    std::env::var("HF2Q_STREAMING_PHASE3_MUT").as_deref() == Ok("1");
-                if streaming_phase3_mut {
-                    tracing::info!("ADR-014 P7 iter-84: HF2Q_STREAMING_PHASE3_MUT=1 → quantize_via_streaming_consuming_mut (zero-byte-copy)");
-                    quantize::quantize_via_streaming_consuming_mut(
-                        &mut tensor_map,
-                        &metadata,
-                        &kq,
-                        bits,
-                        config.group_size,
-                        &progress,
-                    )
-                    .context("K-quant codec quantization failed (consuming-mut path)")
-                    .map_err(AppError::Conversion)?
-                } else if streaming_phase3 {
-                    tracing::info!("ADR-014 P7 iter-48: HF2Q_STREAMING_PHASE3=1 → quantize_via_streaming_borrowed");
-                    quantize::quantize_via_streaming_borrowed(
-                        &tensor_map,
-                        &metadata,
-                        &kq,
-                        bits,
-                        config.group_size,
-                        &progress,
-                    )
-                    .context("K-quant codec quantization failed (streaming path)")
-                    .map_err(AppError::Conversion)?
-                } else {
-                    quantize::quantize_model(
-                        &tensor_map,
-                        &metadata,
-                        &kq,
-                        bits,
-                        config.group_size,
-                        &progress,
-                    )
-                    .context("K-quant codec quantization failed")
-                    .map_err(AppError::Conversion)?
-                }
+                // ADR-014 P7 iter-90: extracted into dispatch_phase3_quantize.
+                dispatch_phase3_quantize(
+                    &mut tensor_map,
+                    &metadata,
+                    &kq,
+                    bits,
+                    config.group_size,
+                    &progress,
+                    "kquant_codec",
+                )
+                .context("K-quant codec quantization failed")
+                .map_err(AppError::Conversion)?
             }
             // ADR-014 P8 Decision 12: imatrix-adaptive routes through
             // VariantKQuantizer with per-tensor target dispatch via
@@ -1534,48 +1560,19 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 // superset of KQuantCodecQuantizer dispatch (per-tensor
                 // routing via layer_mix), so the same wedge applies.
                 //
-                // ADR-014 P7 iter-85 (2026-04-28): extend _MUT wire-up
-                // to this arm; precedence as iter-84 (MUT > legacy > eager).
-                let streaming_phase3 =
-                    std::env::var("HF2Q_STREAMING_PHASE3").as_deref() == Ok("1");
-                let streaming_phase3_mut =
-                    std::env::var("HF2Q_STREAMING_PHASE3_MUT").as_deref() == Ok("1");
-                if streaming_phase3_mut {
-                    tracing::info!("ADR-014 P7 iter-85: HF2Q_STREAMING_PHASE3_MUT=1 → quantize_via_streaming_consuming_mut (ImatrixAdaptive)");
-                    quantize::quantize_via_streaming_consuming_mut(
-                        &mut tensor_map,
-                        &metadata,
-                        &vq,
-                        bits,
-                        config.group_size,
-                        &progress,
-                    )
-                    .context("imatrix-adaptive (variant K-quant) quantization failed (consuming-mut path)")
-                    .map_err(AppError::Conversion)?
-                } else if streaming_phase3 {
-                    tracing::info!("ADR-014 P7 iter-49: HF2Q_STREAMING_PHASE3=1 → quantize_via_streaming_borrowed (ImatrixAdaptive)");
-                    quantize::quantize_via_streaming_borrowed(
-                        &tensor_map,
-                        &metadata,
-                        &vq,
-                        bits,
-                        config.group_size,
-                        &progress,
-                    )
-                    .context("imatrix-adaptive (variant K-quant) quantization failed (streaming path)")
-                    .map_err(AppError::Conversion)?
-                } else {
-                    quantize::quantize_model(
-                        &tensor_map,
-                        &metadata,
-                        &vq,
-                        bits,
-                        config.group_size,
-                        &progress,
-                    )
-                    .context("imatrix-adaptive (variant K-quant) quantization failed")
-                    .map_err(AppError::Conversion)?
-                }
+                // ADR-014 P7 iter-90: extracted into dispatch_phase3_quantize
+                // (precedence: MUT > legacy > eager).
+                dispatch_phase3_quantize(
+                    &mut tensor_map,
+                    &metadata,
+                    &vq,
+                    bits,
+                    config.group_size,
+                    &progress,
+                    "imatrix_adaptive",
+                )
+                .context("imatrix-adaptive (variant K-quant) quantization failed")
+                .map_err(AppError::Conversion)?
             }
             cli::QuantMethod::Dwq46
             | cli::QuantMethod::Dwq48
@@ -1765,61 +1762,24 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     // gates).  legacy_quant_method override is preserved
                     // post-quantize regardless of which path emitted the
                     // bytes.
-                    // ADR-014 P7 iter-88 (2026-04-28): extend _MUT wire-up to
-                    // DwqK arm — completes the 4-arm zero-byte-copy migration.
-                    // legacy_quant_method override applies regardless of path.
-                    let streaming_phase3 =
-                        std::env::var("HF2Q_STREAMING_PHASE3").as_deref() == Ok("1");
-                    let streaming_phase3_mut =
-                        std::env::var("HF2Q_STREAMING_PHASE3_MUT").as_deref() == Ok("1");
-                    let mut quantized = if streaming_phase3_mut {
-                        tracing::info!("ADR-014 P7 iter-88: HF2Q_STREAMING_PHASE3_MUT=1 → quantize_via_streaming_consuming_mut (DwqK)");
-                        quantize::quantize_via_streaming_consuming_mut(
-                            &mut tensor_map,
-                            &metadata,
-                            &dwq_k,
-                            bits,
-                            config.group_size,
-                            &progress,
-                        )
-                        .map_err(|e| {
-                            AppError::Conversion(anyhow::anyhow!(
-                                "ADR-014 P11-prereq Iter C: DwqKQuantizer \
-                                 byte-emit failed (consuming-mut path): {e:#}"
-                            ))
-                        })?
-                    } else if streaming_phase3 {
-                        tracing::info!("ADR-014 P7 iter-51: HF2Q_STREAMING_PHASE3=1 → quantize_via_streaming_borrowed (DwqK)");
-                        quantize::quantize_via_streaming_borrowed(
-                            &tensor_map,
-                            &metadata,
-                            &dwq_k,
-                            bits,
-                            config.group_size,
-                            &progress,
-                        )
-                        .map_err(|e| {
-                            AppError::Conversion(anyhow::anyhow!(
-                                "ADR-014 P11-prereq Iter C: DwqKQuantizer \
-                                 byte-emit failed (streaming path): {e:#}"
-                            ))
-                        })?
-                    } else {
-                        quantize::quantize_model(
-                            &tensor_map,
-                            &metadata,
-                            &dwq_k,
-                            bits,
-                            config.group_size,
-                            &progress,
-                        )
-                        .map_err(|e| {
-                            AppError::Conversion(anyhow::anyhow!(
-                                "ADR-014 P11-prereq Iter C: DwqKQuantizer \
-                                 byte-emit failed: {e:#}"
-                            ))
-                        })?
-                    };
+                    // ADR-014 P7 iter-90: extracted into dispatch_phase3_quantize
+                    // (precedence: MUT > legacy > eager). legacy_quant_method
+                    // override applies regardless of path.
+                    let mut quantized = dispatch_phase3_quantize(
+                        &mut tensor_map,
+                        &metadata,
+                        &dwq_k,
+                        bits,
+                        config.group_size,
+                        &progress,
+                        "dwq_k",
+                    )
+                    .map_err(|e| {
+                        AppError::Conversion(anyhow::anyhow!(
+                            "ADR-014 P11-prereq Iter C: DwqKQuantizer \
+                             byte-emit failed: {e:#}"
+                        ))
+                    })?;
                     quantized.quant_method = legacy_quant_method;
                     quantized
                 }
@@ -1850,46 +1810,19 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 // byte-identical (proven by iter-47's
                 // `quantize_streaming_byte_identical_to_quantize_model`
                 // which uses StaticQuantizer in the smoke fixture).
-                // ADR-014 P7 iter-87 (2026-04-28): extend _MUT wire-up to
-                // StaticQuantizer arm; precedence MUT > legacy > eager.
-                let streaming_phase3 =
-                    std::env::var("HF2Q_STREAMING_PHASE3").as_deref() == Ok("1");
-                let streaming_phase3_mut =
-                    std::env::var("HF2Q_STREAMING_PHASE3_MUT").as_deref() == Ok("1");
-                let quant_result = if streaming_phase3_mut {
-                    tracing::info!("ADR-014 P7 iter-87: HF2Q_STREAMING_PHASE3_MUT=1 → quantize_via_streaming_consuming_mut (StaticQuantizer)");
-                    quantize::quantize_via_streaming_consuming_mut(
-                        &mut tensor_map,
-                        &metadata,
-                        &quantizer,
-                        bits,
-                        config.group_size,
-                        &progress,
-                    )
-                    .context("Quantization failed (consuming-mut path)")
-                } else if streaming_phase3 {
-                    tracing::info!("ADR-014 P7 iter-50: HF2Q_STREAMING_PHASE3=1 → quantize_via_streaming_borrowed (StaticQuantizer)");
-                    quantize::quantize_via_streaming_borrowed(
-                        &tensor_map,
-                        &metadata,
-                        &quantizer,
-                        bits,
-                        config.group_size,
-                        &progress,
-                    )
-                    .context("Quantization failed (streaming path)")
-                } else {
-                    quantize::quantize_model(
-                        &tensor_map,
-                        &metadata,
-                        &quantizer,
-                        bits,
-                        config.group_size,
-                        &progress,
-                    )
-                    .context("Quantization failed")
-                };
-                quant_result.map_err(AppError::Conversion)?
+                // ADR-014 P7 iter-90: extracted into dispatch_phase3_quantize
+                // (precedence: MUT > legacy > eager).
+                dispatch_phase3_quantize(
+                    &mut tensor_map,
+                    &metadata,
+                    &quantizer,
+                    bits,
+                    config.group_size,
+                    &progress,
+                    "static_quantizer",
+                )
+                .context("Quantization failed")
+                .map_err(AppError::Conversion)?
             }
         })
     };
