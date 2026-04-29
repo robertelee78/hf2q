@@ -63,7 +63,9 @@ fn main() -> anyhow::Result<()> {
 
     let n_layers = gguf
         .metadata_u32("qwen35.block_count")
+        .or_else(|| gguf.metadata_u32("qwen35moe.block_count"))
         .or_else(|| gguf.metadata_u32("qwen3_5.block_count"))
+        .or_else(|| gguf.metadata_u32("qwen3_5moe.block_count"))
         .or_else(|| gguf.metadata_u32("llama.block_count"))
         .ok_or_else(|| anyhow::anyhow!("could not read block_count from GGUF metadata"))?
         as usize;
@@ -78,10 +80,19 @@ fn main() -> anyhow::Result<()> {
     // probe falls back to ffn_gate.weight or attn_k_b.weight).
     let probe_names = |i: usize| -> Vec<String> {
         vec![
+            // Dense Qwen3.5/3.6 (full-attention layers).
             format!("blk.{i}.attn_q.weight"),
             format!("blk.{i}.attn_k_b.weight"),
             format!("blk.{i}.ffn_gate.weight"),
             format!("blk.{i}.ffn_down.weight"),
+            // MoE Qwen3.5/3.6 (35B-A3B / apex shape).
+            format!("blk.{i}.ffn_gate_exps.weight"),
+            format!("blk.{i}.ffn_down_exps.weight"),
+            format!("blk.{i}.ffn_up_exps.weight"),
+            // Linear-attention layers in 3:1 hybrid (attn_qkv fused).
+            format!("blk.{i}.attn_qkv.weight"),
+            format!("blk.{i}.attn_gate.weight"),
+            format!("blk.{i}.ssm_out.weight"),
         ]
     };
 
