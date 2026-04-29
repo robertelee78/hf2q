@@ -1592,6 +1592,143 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter48 — OFFLINE ARCHITECTURAL AUDIT of gemma `forward_mlx` decode path for the −3.71pp residual gap (gemma-26B-dwq 0.9629× vs llama same-day baseline; iter43 measurement).  Zero bench, zero kernel changes, zero `forward_mlx` / `forward_gpu` edits.  Maps the production decode CB shape, cross-diffs against llama.cpp's `gemma4-iswa` graph + Metal n_cb=1 backend, and identifies one HIGH-CONFIDENCE dead-write hypothesis (H1 below).  Surfaces ADR-014 metadata-vs-actual drift on the gemma GGUF (`general.file_type=15`/Q4_K_M but blocks Q6_K/Q8_0) — same class as iter47's dwq46 finding.**
+
+    **HEAD CONTEXT.**  Worktree `agent-a3602a444328268a2`, base `e2b5503` (iter47 docs commit).  `mlx-native` HEAD `9bd1f6f` (untouched).  Parallel ADR-014 P11/P12 in `src/quantize/mod.rs`; iter48 touches only this changelog — no collision.
+
+    **PHASE 1 — gemma forward path location at HEAD.**
+
+    `gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf` decode runs in `forward_mlx.rs::MlxModelWeights::forward_decode` (`src/serve/forward_mlx.rs:1378-3690`).  Entry chain: `src/serve/mod.rs:454` (`MlxModelWeights::load_from_gguf`) → `src/serve/mod.rs:601` (`mlx_w.forward_prefill`) → decode loop at `src/serve/mod.rs:660-664` (`mlx_w.forward_decode`).  The qwen35 / qwen3.6 family runs in a STRUCTURALLY DISTINCT `src/inference/models/qwen35/forward_gpu.rs` path with its own per-layer chain_n CB-chunking architecture (iter40-iter47 territory) — gemma `forward_mlx` is a single-monolithic-CB shape that PRE-DATES the chain_n model.  `src/inference/mod.rs:4` documents the split: *"This is the home for architecture-specific inference code that does not fit inside `src/serve/forward_mlx.rs` (which is Gemma-4-shaped)."*
+
+    **PHASE 2 — gemma per-decode-token CB shape at HEAD (env-default).**
+
+    Single session lifecycle: `exec.begin()` at `forward_mlx.rs:1643`, single `s.finish()` at `forward_mlx.rs:3392-3393` (or `3382-3383` when `HF2Q_GRAPH_OPT=1`).  ALL embedding + 30 layers + final-norm + lm_head + softcap + argmax encode into ONE encoder by default.  Mid-pass `s.finish() / s = exec.begin()` pairs at `:1832, :1899, :2011-2086, :2095, :2216-2234, :2387-2447, :2826-2832, :2841-2903, :2933-2938, :3231-3236, :3297-3302` are ALL gated on debug/dump env vars (`HF2Q_DUMP_PRE_QUANT`, `HF2Q_DEBUG_TQ_RMS`, `HF2Q_DUMP_LAYERS`, etc.) — none fire under default env.
+
+    The ONE production split is `HF2Q_DUAL_BUFFER` (env-default `Some(3)` per `src/debug/investigation_env.rs:493-501`): commit buf0 after layer 3, begin buf1 for layers 4..29 + head.  `forward_mlx.rs:3250-3259`.  **Default per-decode-token CB count = 2.**  `HF2Q_SPLIT_TIMING=1` (off by default) inserts a third CB break between body and head for instrumentation only.
+
+    Per-layer dispatch budget under env-default (post-iter34, gemma-26B model: 30 layers × 16 attn × 8 kv [sliding] / 2 kv [global], 5:1 sliding pattern, 128 experts × top_k=8, dense FFN=2112 + MoE FFN=704):
+
+    | Region | Dispatches/layer | hf2q file:line |
+    |---|---|---|
+    | Pre-attn rms_norm | 1 | `:1702-1709` |
+    | Q + K + V qmatmul (V-from-K saves 1 in v_is_k path; not active for gemma) | 3 | `:1719-1735` |
+    | Fused Q norm+RoPE + K norm+RoPE (concurrent) | 2 | `:1757-1778` |
+    | V rms_norm_unit_perhead | 1 | `:1791-1817` |
+    | TQ hadamard_quantize K + V (always-on; kv_caches consumed by Leg F dequant) | 2 | `:1916-1937` |
+    | **HB encode K + V (DEAD-WRITE at default — see H1 below)** | **2** | **`:1955-1979`** |
+    | Leg F dense-SDPA-on-TQ-KV: dequant K + copy K + dequant V + copy V + FWHT-pre + flash_attn_vec ×2 + FWHT-undo | 8 | `:2496-2667` |
+    | O-proj qmatmul | 1 | `:2912-2916` |
+    | Fused post-attn norm+add | 1 | `:2920-2940` |
+    | Pre-FF norm1 + norm2 + router norm (3 concurrent) | 3 | `:2960-2991` |
+    | Dense gate + dense up + router proj (3 concurrent) | 3 | `:2994-3015` |
+    | fused_gelu_mul + fused_moe_routing (2 concurrent) | 2 | `:3024-3050` |
+    | Dense down qmatmul + gate_up_id (2 concurrent) | 2 | `:3070-3097` |
+    | swiglu_batch | 1 | `:3104-3109` |
+    | down_id + post-FF norm1 (2 concurrent) | 2 | `:3115-3152` |
+    | weighted_sum | 1 | `:3160-3166` |
+    | Fused post-FF norm2 + combine | 1 | `:3194-3201` |
+    | Fused end-of-layer (norm + add + scalar) | 1 | `:3210-3219` |
+    | **Total per layer (default)** | **~36** | |
+
+    Layer total × 30 = ~1080 dispatches.  Plus head: embed (1) + final-norm (1) + lm_head (1) + softcap (0 or 1) + argmax (1) = ~4 head dispatches.  **Default per-token total ≈ 1084 dispatches across 2 CBs.**
+
+    SDPA path branch table (`forward_mlx.rs:2282-2818`):
+
+    | Branch | Gate | Dispatches |
+    |---|---|---|
+    | A (dense decode) | `dense_kvs.is_some() && (HF2Q_USE_DENSE=1 OR HF2Q_LAYER_POLICY=dense_all)` | 2 K/V copy + flash_attn_vec ×2 = 4 |
+    | **B (Leg F = dense SDPA on TQ-dequant KV) — DEFAULT** | `!use_dense_sdpa && force_dense_sdpa_on_tq_kv` (post-iter34 default) | **8** |
+    | C (HB native) | `!use_dense_sdpa && !force_dense_sdpa_on_tq_kv && use_native_hb_sdpa` | FWHT-pre + flash_attn_vec_tq_hb ×2 + FWHT-undo = 4 |
+    | D (legacy 4-bit TQ) | `HF2Q_TQ_CODEBOOK_BITS=4` | FWHT-pre + flash_attn_vec_tq + FWHT-undo = 4 |
+
+    iter34 default (`HF2Q_LEGACY_TQ_SDPA` unset, `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV` unset) → branch B.  See `dense_sdpa_on_tq_kv_enabled` (`forward_mlx.rs:80-103`).
+
+    **PHASE 3 — llama.cpp gemma reference.**
+
+    Graph: `/opt/llama.cpp/src/models/gemma4-iswa.cpp:11-260` (`llm_build_gemma4_iswa::llm_build_gemma4_iswa`).  Per-layer (iSWA = interleaved SWA + global):
+
+    1. `attn_norm` (`:52`)
+    2. Q proj (`:65`) + reshape (`:68`) + Q-norm (`:70`) + RoPE (`:73`)
+    3. If `has_kv(il)`: K proj (`:80`) + V proj-or-Kcur (`:83-85`) + reshape (`:88-89`) + K-norm (`:91`) + V-rms-norm (`:92`) + K RoPE (`:97`)
+    4. `build_attn` (`:102-104` for KV-layers, `:107-109` for KV-reuse): single fused `flash_attn_ext` op with O-proj
+    5. `attn_post_norm` (`:117`) + residual (`:122`)
+    6. **Dual-FFN**: dense MLP branch (`build_ffn` GELU PAR, `:129-143`) + MoE branch (`build_moe_ffn` SOFTMAX gating, `:146-176`); fused via `ggml_add` (`:178`)
+    7. `ffn_post_norm` (`:194`) + residual (`:200`) + per-layer-embd (`:203-224`) + `out_scale` (`:227-229`) + `build_cvec` (`:232`)
+
+    Then final norm + lm_head + softcap (`:240-253`).
+
+    **llama Metal CB orchestration** (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m:438-550`): per `graph_compute` call, `n_cb=1` default (`ggml-metal.cpp:608`).  Main thread emits `n_main = max(64, 0.1*n_nodes)` ops into `cmd_buf[n_cb]` (`:511-523`); `dispatch_apply(n_cb, ...)` parallel-encodes the remainder into `cmd_buf[0..n_cb)` (`:530-550`).  At `n_cb=1`, that's exactly **one main CB + one worker CB = 2 CBs per decode-graph-compute** — same total CB count as hf2q's `HF2Q_DUAL_BUFFER=Some(3)` default.
+
+    Per-layer dispatch budget for llama gemma4-iswa (rough — Metal backend fuses many graph nodes into 1 dispatch):
+    - attn_norm: 1
+    - Q proj + Q-norm + RoPE: ~3 (or fused)
+    - K proj + K-norm + RoPE: ~3
+    - V proj + V-rms-norm: ~2
+    - **flash_attn_ext (single fused MMA + softmax + WV) + O-proj: 2**
+    - attn_post_norm + add: 2
+    - **Dual-FFN**: dense ffn (~3 mm + gelu_mul) + MoE (~5: router + topk + gate_up_id + swiglu + down_id + weighted_sum) + add: ~10
+    - ffn_post_norm + add + cvec + scalar: ~4
+    - **Total per layer ≈ 27**
+
+    **PHASE 4 — Cross-diff.**
+
+    | Region | hf2q gemma `forward_mlx` (default) | llama gemma4-iswa | Δ | Notes |
+    |---|---|---|---|---|
+    | Embedding gather + scale | 1 | 1-2 | ~0 | Both `× sqrt(n_embd)` for non-image input |
+    | KV cache update + SDPA per layer | **12** (TQ encode 2 + HB encode 2 [DEAD] + Leg F 8) | **3** (cpy K + cpy V + flash_attn_ext fused) | **+9/layer** | hf2q runs FOUR cache writes (2 TQ + 2 HB-dead) and 8-step Leg F where llama runs single fused FA |
+    | Per-layer attention prep (norms + RoPE) | 7 (Qproj+Kproj+Vproj + Qnorm+RoPE + Knorm+RoPE + Vnorm) | ~7 | ~0 | Roughly equivalent |
+    | Per-layer FFN | ~13 | ~10 | +3 | hf2q's interleaved dense+MoE design; llama same |
+    | Per-layer post + residual | ~3 | ~3 | ~0 | |
+    | Total dispatches/layer | **~36** | **~27** | **+9** | dominated by the dead-write HB-encode + Leg F overhead |
+    | Layers | 30 | 30 | 0 | |
+    | Body dispatches/token | ~1080 | ~810 | **+270** | |
+    | Head dispatches/token | ~4 | ~4 | 0 | |
+    | Total dispatches/token | **~1084** | **~814** | **+270 (≈+33%)** | |
+    | CBs/decode-token | 2 (`HF2Q_DUAL_BUFFER=Some(3)` default) | 2 (n_cb=1 main + 1 worker) | 0 | **CB count is NOT the gap — at 2:2, gemma's hf2q-vs-llama gap is NOT a chain_n analogue.**  Different mechanism than dwq46. |
+
+    The gap is **NOT** in CB orchestration (both are 2 CBs/decode).  The gap IS in per-layer dispatch density: hf2q does ~36 dispatches/layer, llama does ~27.  At the −3.71pp ratio (0.9629×), each percentage point closure requires shaving ~10 dispatches/token.
+
+    **PHASE 5 — Hypothesis brief (3 testable rows).**
+
+    | # | Hypothesis | Predicted Δ vs current baseline | Evidence basis | How a future bench would test |
+    |---|---|---|---|---|
+    | **H1** | **HB-encode at `forward_mlx.rs:1955-1979` is dead-write at default.**  `tq_codebook_bits=8` triggers `use_native_hb_sdpa=true`; the HB encoder runs every layer and writes to `leg_hb_encoded[layer_idx].{k,v}_packed`.  Those buffers are consumed ONLY by branch C (`flash_attn_vec_tq_hb`, `:2722-2733`).  Branch C is gated by `else if !skip_tq_sdpa && use_native_hb_sdpa` AT POSITION 3 in the if/else-if ladder (`:2669`); branch B (Leg F) AT POSITION 2 (`:2496`) takes precedence whenever `force_dense_sdpa_on_tq_kv=true`.  Post-iter34 default has `force_dense_sdpa_on_tq_kv=true`, so branch C never fires and the HB-encoded buffers are written then never read. | **+1.0 to +1.5pp** absolute (60 dispatches × ~5 µs/dispatch overhead ÷ ~10 ms/token decode budget). | A/B: gate the HB-encode block on `!force_dense_sdpa_on_tq_kv` so it runs only when branch C is reachable.  Cold-SoC, NGEN=256, 5 trials, byte-identical determinism check across trials, ratio vs llama same-day baseline.  Risk: if a future env (`HF2Q_LEGACY_TQ_SDPA=1`) re-enables branch C, the HB-encode must re-fire — a stricter gate than just "default off". |
+    | **H2** | **Leg F is structurally heavier than llama's `flash_attn_ext` for a single-token decode.**  Leg F (`forward_mlx.rs:2496-2667`) runs 8 dispatches per layer (2 dequant + 2 cache_copy + 1 FWHT-pre + 2 flash_attn_vec [main+reduce] + 1 FWHT-undo).  llama's `build_attn` emits a SINGLE fused `flash_attn_ext` Metal kernel that does QK^T + softmax + WV in one MMA pass on F16/Q8 KV.  For decode m=1, the FWHT pre/undo + dequant indirection is pure overhead — the TQ representation buys nothing for a single Q vector against a fully-materialized F32 K/V. | **+2.0 to +3.0pp** absolute, or possibly more.  The Leg F path was justified by iter33 (cn=1 ratio 0.8356× → 0.9553×) for the case where TQ KV is already paid for from prefill — but at **decode time**, both paths could run on dense F16/F32 cache instead, eliminating the dequant+FWHT entirely. | A/B: bench `HF2Q_LAYER_POLICY=dense_all` (forces branch A, the dense-cache decode path at `:2329-2495`).  Branch A is 4 dispatches/layer (2 cpy + flash_attn_vec ×2) — half the Leg F count.  Caveats: (1) `dense_kvs` must be allocated at prefill time AND populated continuously through decode (currently overwritten by the dequant→copy chain at `:2566-2571`).  (2) memory cost — dense F32 KV at gemma context-262144 is 30 × 16 × 262144 × 512 × 4 B ≈ 256 GB, infeasible.  At F16 it's 128 GB, still infeasible.  At sliding-window=1024 for SWA layers + 4096 cap for global = mostly bounded; need to cap cache to context actually used.  Test both `dense_all` (F16 KV) and a hybrid `dense_slide_tq_global`. |
+    | **H3** | **5:1 sliding-pattern dispatch asymmetry**.  Layers 5,11,17,23,29 (5 of 30) are global (`is_swa=false`, `head_count_kv=2`, `head_dim=512`), the other 25 are sliding (`head_count_kv=8`, `head_dim=256`).  hf2q's per-layer dispatch shape is identical regardless (same 36-dispatch budget); llama-side, the global layer's `flash_attn_ext` runs on a much larger K/V (cap=context_len for global vs cap=sliding_window=1024 for SWA) — the cost scales with `kv_seq_len`.  At pp=NGEN=256 + decode position N, hf2q + llama BOTH process the same tensor shapes per layer, but llama's fused FA-ext on M5 GPU may amortize global-vs-sliding cost differently than hf2q's Leg F. | **+0.3 to +0.8pp** absolute.  Smaller than H1/H2 because the per-layer budget difference is constant across both layer types; this hypothesis says the global layers benefit more from llama's fused-FA approach. | Per-layer-type profile: enable `HF2Q_MLX_KERNEL_PROFILE=1` (forward_decode_kernel_profile path, `forward_mlx.rs:3690`) at NGEN≥256 and bucket by `is_sliding`.  Compare median sliding-layer wall-time vs global-layer wall-time, then compute the fixed-cost-per-layer-type ratio vs llama's per-layer attribution from `MTL_HUD=1`. |
+
+    **PHASE 6 — ADR-014 metadata-vs-actual drift cross-link.**
+
+    `gguf-dump --no-tensors /opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf` declares `general.file_type = 15` (LLAMA_FTYPE_MOSTLY_Q4_K_M).  The actual block-0 tensors are:
+
+    | Tensor | Declared shape | **Actual quant block** |
+    |---|---|---|
+    | `blk.0.attn_q.weight` | `[2816, 4096]` | **`Q6_K`** |
+    | `blk.0.attn_k.weight` | `[2816, 2048]` | **`Q6_K`** |
+    | `blk.0.attn_v.weight` | `[2816, 2048]` | **`Q6_K`** |
+    | `blk.0.attn_output.weight` | `[4096, 2816]` | **`Q6_K`** |
+    | `blk.0.ffn_gate.weight` (dense) | `[2816, 2112]` | **`Q6_K`** |
+    | `blk.0.ffn_up.weight` (dense) | `[2816, 2112]` | **`Q6_K`** |
+    | `blk.0.ffn_down.weight` (dense) | `[2112, 2816]` | **`Q8_0`** |
+    | `blk.0.ffn_gate_inp.weight` | `[2816, 128]` | **`Q6_K`** |
+    | `blk.0.ffn_gate_up_exps.weight` | `[2816, 1408, 128]` | **`Q6_K`** |
+    | `blk.0.ffn_down_exps.weight` | `[704, 2816, 128]` | **`Q8_0`** |
+
+    **Declared file_type=15 (Q4_K_M) — actual blocks Q6_K + Q8_0.**  This is the SAME class of metadata-vs-actual drift iter47 surfaced for `qwen3.6-27b-dwq46` (declared Q4_K_M, actual Q4_0).  The mechanism is different (gemma is upgraded Q6_K/Q8_0; dwq46 is downgraded Q4_0) but the writer-pass bug is identical: `general.file_type` is set from the source GGUF's metadata before re-emit, but the post-emit blocks reflect the actual extraction/re-quant target.  Cross-link to `feedback_gguf_writer_unit_test_size_predictor` standing memory; the size-predictor unit-test discipline applies symmetrically — every K-quant arm must be covered.
+
+    **Runtime impact for gemma decode:** ZERO.  Load path consults the per-tensor `ggml_type` directly (see `weight_loader` in qwen35 path; gemma uses `load_gguf_qweight` per `forward_mlx.rs:969-1057` which reads tensor type from the tensor header, not `general.file_type`).  Drift is documentation-only at runtime, but operator tooling that filters by `general.file_type` (`gguf-dump | grep file_type`, downstream re-quant scripts) will misclassify the file.
+
+    **PHASE 7 — Code touches.**
+
+    NONE.  Iter48 is offline architectural audit per mission spec.  No `forward_mlx.rs`, no `forward_gpu.rs`, no `mlx-native`, no `quantize/mod.rs`.  Docs-only commit pathspec-clean.
+
+    **DELIVERABLES (per mission spec).**
+    1. ✅ ADR-015 §iter48 entry — gemma `forward_mlx` CB-shape audit (PHASE 2) + llama gemma4-iswa cross-diff (PHASE 4) + 3-row hypothesis table (PHASE 5).
+    2. ✅ ADR-014 metadata-vs-actual drift cross-link on gemma GGUF (PHASE 6).
+    3. ✅ Pathspec-clean commit + push (this entry).
+    4. ✅ brain_share — architecture category, keyword-rich title.
+
+    **Bench artifacts:** none — iter48 is offline audit per FCP-blocked bench environment.  When bench resumes, H1 should run first (lowest-risk, +1.0-1.5pp prediction); H2 second (architectural, depends on dense_kvs sizing for SWA capacity); H3 last (per-layer-type profile to confirm or deny).
+
 - **2026-04-29 — iter47 — RUNTIME `chain_n_for` VERIFICATION on all 4 fixtures — iter46 hypothesis SPLIT VERDICT: find_map FALSIFIED (works correctly), chain_n_for-table-coverage CONFIRMED (Q4_0 not in match arms → catch-all cn=1).  Bench-free verification phase per the iter46 deliverable; one-line `eprintln` instrumentation at `forward_gpu.rs:351` for one decode token per fixture, then removed before commit.  Coherence smoke 12/12 PASS post-instrument-remove.  Docs-only commit; chain_n table NOT extended without measurement evidence (see iter45 follow-up note below).**
 
     **HEAD CONTEXT.**  Worktree `agent-a25dbd8e963742d8a`, base `ee18026` (iter46 docs commit).  `mlx-native` HEAD `9bd1f6f` (untouched).  Parallel ADR-014 P11/P12 in `src/quantize/mod.rs`; iter47 touches only `forward_gpu.rs` (eprintln add+remove) and this changelog — no collision.
