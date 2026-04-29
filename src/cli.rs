@@ -1887,6 +1887,89 @@ mod tests {
         }
     }
 
+    /// ADR-014 P8 iter-111 (2026-04-29) — extend the iter-1 17-variant
+    /// round-trip gate to cover the full menu the QuantMethod enum
+    /// actually exposes today (32 variants). Pre-iter-111 the round-trip
+    /// guard was stuck at the "Decision 12 final 17" set; the K-quant
+    /// `_S` family (Q2_K_S, Q3_K_S/M/L, Q4_K_S, Q5_K_S, Q6_K) + the
+    /// matching `imatrix-*_S` variants + the alias `dwq` (Decision 12
+    /// alias for `dwq-mixed-4-6`) were never round-trip-checked. iter-111
+    /// closes that hole so a future Display ↔ parse drift fails the
+    /// CI gate immediately.
+    #[test]
+    fn test_display_round_trip_for_all_quant_variants_iter111() {
+        let all_variants: Vec<QuantMethod> = vec![
+            // Auto + base + legacy (6).
+            QuantMethod::Auto,
+            QuantMethod::F16,
+            QuantMethod::Bf16,
+            QuantMethod::Q2,
+            QuantMethod::Q4,
+            QuantMethod::Q8,
+            // K-quant family (10): all S/M/L sub-variants for Q2_K..Q5_K + Q6_K.
+            QuantMethod::Q2KS,
+            QuantMethod::Q2K,
+            QuantMethod::Q3KS,
+            QuantMethod::Q3KM,
+            QuantMethod::Q3KL,
+            QuantMethod::Q4KS,
+            QuantMethod::Q4KM,
+            QuantMethod::Q5KS,
+            QuantMethod::Q5KM,
+            QuantMethod::Q6K,
+            // Imatrix-K family (10): same shape as K-quant family.
+            QuantMethod::ImatrixQ2KS,
+            QuantMethod::ImatrixQ2K,
+            QuantMethod::ImatrixQ3KS,
+            QuantMethod::ImatrixQ3KM,
+            QuantMethod::ImatrixQ3KL,
+            QuantMethod::ImatrixQ4KS,
+            QuantMethod::ImatrixQ4KM,
+            QuantMethod::ImatrixQ5KS,
+            QuantMethod::ImatrixQ5KM,
+            QuantMethod::ImatrixQ6K,
+            // Imatrix-adaptive (Apex per-tensor optimal precision) (1).
+            QuantMethod::ImatrixAdaptive,
+            // DWQ family (4): four bit-pair variants. The unparameterized
+            // `Dwq` alias lives in `CalibrationFlag` (the orthogonal
+            // `--calibration` axis from Decision 12 §off-diagonal), not
+            // in `QuantMethod`, so it doesn't round-trip through `--quant`.
+            QuantMethod::Dwq46,
+            QuantMethod::Dwq48,
+            QuantMethod::Dwq68,
+            QuantMethod::Dwq28,
+        ];
+        assert_eq!(
+            all_variants.len(),
+            31,
+            "expected the full 31-variant menu (6 base + 10 K-quant + 10 imatrix-K + ImatrixAdaptive + 4 DWQ)"
+        );
+        for v in all_variants {
+            let s = v.to_string();
+            let cli = Cli::try_parse_from([
+                "hf2q",
+                "convert",
+                "--input",
+                "/tmp/x",
+                "--format",
+                "gguf",
+                "--quant",
+                &s,
+            ])
+            .unwrap_or_else(|e| {
+                panic!("iter-111 Display→parse round trip failed for {v:?} (\"{s}\"): {e}")
+            });
+            let Command::Convert(args) = cli.command else {
+                panic!("iter-111: expected Convert subcommand for variant {v:?}");
+            };
+            assert_eq!(
+                args.quant, v,
+                "iter-111 Display→parse round trip resolved \"{s}\" to {:?}, expected {v:?}",
+                args.quant,
+            );
+        }
+    }
+
     // ---- ADR-014 P8 Decision 12 §off-diagonal: --calibration / --output-format ----
 
     /// S4 test (a): supplying `--calibration` alone (without
