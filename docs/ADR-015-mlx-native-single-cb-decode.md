@@ -1592,6 +1592,72 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter49 — SURGICAL FIX for iter48 H1: gate gemma `forward_mlx` HB-encode block (`src/serve/forward_mlx.rs:1943-1982`) on `!force_dense_sdpa_on_tq_kv` so the iter34 default (Branch B / Leg F dense-SDPA-on-TQ-KV) skips the dead-write into `leg_hb_encoded`.  CODE CHANGE + COHERENCE VERIFY only — bench DEFERRED to iter45 N-curve reschedule per FCP-blocked bench environment.  Predicted +1.0–1.5pp closure of the gemma-26B-dwq −3.71pp residual gap pending bench resume.**
+
+    **HEAD CONTEXT.**  Worktree `agent-a7357643f4f2f80b0`, base `fb1acc8` (iter48 docs commit).  `mlx-native` HEAD `9bd1f6f` (untouched).  Parallel ADR-014 in `src/quantize/mod.rs` — fence preserved (this iter touches only `forward_mlx.rs` and this changelog).
+
+    **PHASE 1 — data-dependency trace evidence.**
+
+    iter48 H1 verified at HEAD `fb1acc8` line numbers:
+
+    - `force_dense_sdpa_on_tq_kv` is set per-decode at `forward_mlx.rs:1589` from `dense_sdpa_on_tq_kv_enabled()` (`forward_mlx.rs:80-103`, `OnceLock`-cached env-derived bool).  Default = `true` (iter34 default; only `HF2Q_LEGACY_TQ_SDPA=1` or `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=0` flip it `false`).
+    - `use_native_hb_sdpa = tq_codebook_bits >= 5` at `forward_mlx.rs:1631`.  Default = `true` (`HF2Q_TQ_CODEBOOK_BITS` unset → 8u32 → ≥5).
+    - HB-encode at `forward_mlx.rs:1943-1982` is gated only on `use_native_hb_sdpa && !skip_tq_encode`.  At default config it ALWAYS fires per layer per token (2 dispatches: K + V × 30 layers = 60 dispatches/token, ~7% of the +270/token excess vs llama identified in iter48 PHASE 2).
+    - SDPA selector chain at `forward_mlx.rs:~2440-2745` is `if/else if/else if`:
+      1. Branch A (~L2440, dense KV cache): `flash_attn_vec` on `dense_kvs` — does not read `leg_hb_encoded`.
+      2. Branch B (`forward_mlx.rs:2496`): `else if !skip_tq_sdpa && force_dense_sdpa_on_tq_kv` — Leg F dense SDPA reads `leg_f_kvs` (TQ-dequantized shadow), NOT `leg_hb_encoded`.
+      3. Branch C (`forward_mlx.rs:2669`): `else if !skip_tq_sdpa && use_native_hb_sdpa` — the ONLY consumer of `leg_hb_encoded` (read at `:2675-:2728`).
+    - `grep -n 'leg_hb_enc\b\|leg_hb_encoded' src/serve/forward_mlx.rs` confirms zero readers outside Branch C and zero writers outside lines 1944-1981.  Therefore at default config (Branch B fires, Branch C unreachable per `else if`), HB-encode output is never read = dead-write.
+
+    **iter48 H1 = CONFIRMED.**
+
+    **PHASE 2 — surgical change.**
+
+    Single edit at `forward_mlx.rs:1943` adds `&& !force_dense_sdpa_on_tq_kv` to the existing `use_native_hb_sdpa && !INVESTIGATION_ENV.skip_tq_encode` guard.  Plus a 2-line comment citing iter49 H1 + Branch B/C line refs.  Bit-exact correctness:
+
+    - Default (`force_dense_sdpa_on_tq_kv=true`): HB-encode skipped — Branch B (Leg F) reads `leg_f_kvs` only, never touched HB buffers anyway.  Allocated-but-unused memory in `leg_hb_encoded` (lazy alloc at `:1476-:1511` is left intact this iter; freeing is out of scope).
+    - Legacy opt-out (`HF2Q_LEGACY_TQ_SDPA=1` or `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=0` → `force_dense_sdpa_on_tq_kv=false`): HB-encode runs as before, Branch C consumes the buffers.  Pre-iter34 behaviour preserved bit-for-bit.
+
+    No changes to `mlx-native`, `forward_gpu`, `quantize/mod.rs`, or any other file.
+
+    **PHASE 3 — coherence verify (the entire iter49 gate; perf bench deferred).**
+
+    1. `cargo build --release --bin hf2q` — clean (13.39s) + (11.98s incremental rebuild for tests).
+    2. `cargo test --release --test coherence_smoke -- --nocapture` — **12/12 PASS**, 0 GIBBERISH, elapsed 90.91s.  All gemma cells PASS (`gemma/hello-my-name-is`, `gemma/the-quick-brown-fox`, `gemma/what-is-22`).
+    3. `cargo test --release --test coherence_matrix -- --ignored coherence_matrix_all_cells -- --nocapture` — **EXACT=4 + COHERENT=8, GIBBERISH=0, SKIPPED=0, elapsed 90.48s**.  All 12 cells PASS.  Gemma sub-matrix: 1 EXACT (`the-quick-brown-fox`) + 2 COHERENT (`hello-my-name-is`, `what-is-22`).
+    4. Gemma reference run, single trial, NGEN=128, temp=0, prompt="Hello, my name is":
+
+       ```
+       prefill: 18 tok in 336ms (54 tok/s)
+       [HF2Q_TQ_CODEBOOK_BITS] 8-bit Lloyd-Max native HB SDPA (default)
+       to complete that sentence, I need a little more information!
+       How would you like to proceed? Here are a few ways we can do this:
+       **1. The "Fill in the Blanks" approach:** ...
+       --- mlx-native: 128 tokens in 1.38s (92.4 tok/s) ---
+       ```
+
+       Output is fluent English with well-formed markdown structure — coherent reference output, no degeneration vs known-good gemma decode.  Single-trial perf number (92.4 tok/s) is **NOT** a perf signal (no warmup, no SoC settle, no cold-process repetition); it is reported here only to confirm the path is alive.  Real perf measurement deferred to iter45 N-curve reschedule.
+
+    **PHASE 4 — ship.**
+
+    Pathspec-clean commit (parallel ADR-014 fence preserved): `git commit -- src/serve/forward_mlx.rs docs/ADR-015-mlx-native-single-cb-decode.md`.  Push to origin/main.  brain_share category=performance with searchable keywords (`iter49 gemma HB-encode dead-write gate forward_mlx +1pp`).
+
+    **PHASE 5 — iter45 reschedule note + monitor.**
+
+    The chain_n N-curve harness at `scripts/iter45-chain-n-curve-bench.sh` is a 4-fixture sweep (apex, dwq46, 27b-dwq46, gemma) and will pick up iter49's gemma effect natively when it reschedules.  Expected gemma cell behaviour post-iter49: ratio shifts from iter43's 0.9629× toward 0.973–0.978× (+1.0–1.5pp predicted).  When iter45 reschedules, `tests/perf_baseline.json::cells.gemma-...` is the resting place for the new ratio_floor.
+
+    **Pre-bench monitor (per iter48 PHASE 5 standing rec).**  FCP no longer running.  biomesyncd was at 68% CPU at 11:59 today — before resuming any bench, run `pgrep -lf 'biomesyncd|finalcut|davinci'` and wait for it to drop below 5% (or settle for 10 minutes if it's not actively syncing).  feedback_bench_process_audit applies; do not bench through a contaminator.
+
+    **DELIVERABLES (per mission spec).**
+    1. ✅ Phase 1 data-dependency trace (this entry — file:line citations + grep audit + `if/else if/else if` proof).
+    2. ✅ ONE surgical change at `forward_mlx.rs:1943` — `if use_native_hb_sdpa && !INVESTIGATION_ENV.skip_tq_encode && !force_dense_sdpa_on_tq_kv`.
+    3. ✅ coherence_smoke 12/12 PASS + coherence_matrix 12/12 PASS + gemma NGEN=128 reference output reproduced above.
+    4. ✅ Pathspec-clean commit + push.
+    5. ✅ brain_share — performance category.
+    6. ✅ iter45 reschedule note + biomesyncd watch.
+
+    **Bench artifacts:** none — perf verification deferred to iter45 N-curve reschedule per FCP-aftermath / feedback_verify_baseline_determinism_before_perf_bench standing rec.
+
 - **2026-04-29 — iter48 — OFFLINE ARCHITECTURAL AUDIT of gemma `forward_mlx` decode path for the −3.71pp residual gap (gemma-26B-dwq 0.9629× vs llama same-day baseline; iter43 measurement).  Zero bench, zero kernel changes, zero `forward_mlx` / `forward_gpu` edits.  Maps the production decode CB shape, cross-diffs against llama.cpp's `gemma4-iswa` graph + Metal n_cb=1 backend, and identifies one HIGH-CONFIDENCE dead-write hypothesis (H1 below).  Surfaces ADR-014 metadata-vs-actual drift on the gemma GGUF (`general.file_type=15`/Q4_K_M but blocks Q6_K/Q8_0) — same class as iter47's dwq46 finding.**
 
     **HEAD CONTEXT.**  Worktree `agent-a3602a444328268a2`, base `e2b5503` (iter47 docs commit).  `mlx-native` HEAD `9bd1f6f` (untouched).  Parallel ADR-014 P11/P12 in `src/quantize/mod.rs`; iter48 touches only this changelog — no collision.

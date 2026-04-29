@@ -1940,7 +1940,9 @@ impl MlxModelWeights {
                 // iter-24: higher-bit (5/6/8-bit) KV encode into leg_hb_encoded.
                 // When HF2Q_TQ_CODEBOOK_BITS=5|6|8, encode K/V to byte-packed HB format
                 // for native HB SDPA dispatch.
-                if use_native_hb_sdpa && !INVESTIGATION_ENV.skip_tq_encode {
+                // iter-49 H1: skip HB-encode under iter34's dense-SDPA default — Leg F path
+                // (Branch B at ~L2496) reads leg_f_kvs, not leg_hb_encoded (Branch C reader at ~L2675).
+                if use_native_hb_sdpa && !INVESTIGATION_ENV.skip_tq_encode && !force_dense_sdpa_on_tq_kv {
                     if let Some(ref leg_hb_enc) = self.leg_hb_encoded {
                         let cache_pos_val = if kv_is_sliding {
                             (kv_write_pos % kv_capacity) as u32
