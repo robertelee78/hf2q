@@ -1708,6 +1708,24 @@ fn ggml_type_name(t: u32) -> &'static str {
 
 /// Compute the expected byte size of a tensor in ggml block format.
 fn ggml_tensor_size(total_elements: usize, ggml_type: u32) -> usize {
+    // ADR-014 P11 iter-99 (2026-04-29): Q2_K/Q3_K/Q4_K/Q5_K added to match
+    // arms. Pre-iter-99 the K-quant family fell through to the F16 fallback
+    // arm, causing pass-1 of the GGUF writer to over-predict K-quant tensor
+    // sizes (50 MB Q4_K → 178 MB F16 prediction for an [17408, 5120] FFN
+    // tensor — 128 MB drift PER FFN tensor). The drift accumulated in the
+    // tensor data offset table; pass-2 padded each tensor's actual data
+    // (correct K-quant bytes from the codec-direct path) up to the inflated
+    // predicted offset, blowing up the on-disk file from ~17 GB → ~50 GB
+    // and producing offsets that violated GGUF v3's tightly-packed layout
+    // requirement, which llama.cpp's loader rejected with
+    //   gguf_init_from_file_ptr: tensor 'token_embd.weight' has offset
+    //   2539970560, expected 714366720
+    // (the cumulative drift surfaced at token_embd because output.weight
+    // immediately preceded it in offset order and was the first sizable
+    // K-quant tensor that mis-predicted as F16). Fix: route every K-quant
+    // family member through `ceil_div(elements, QK_K) * BLOCK_*_SIZE`,
+    // mirroring `quantize_tensor_2d_to_bytes`'s actual emitted byte count.
+    const QK_K: usize = 256;
     match ggml_type {
         GGML_TYPE_F32 => total_elements * 4,
         GGML_TYPE_F16 => total_elements * 2,
@@ -1722,6 +1740,22 @@ fn ggml_tensor_size(total_elements: usize, ggml_type: u32) -> usize {
         GGML_TYPE_Q6_K => {
             let n_blocks = total_elements.div_ceil(QK6_K);
             n_blocks * BLOCK_Q6_K_BYTES
+        }
+        GGML_TYPE_Q2_K => {
+            let n_blocks = total_elements.div_ceil(QK_K);
+            n_blocks * crate::quantize::k_quant::BLOCK_Q2_K_SIZE
+        }
+        GGML_TYPE_Q3_K => {
+            let n_blocks = total_elements.div_ceil(QK_K);
+            n_blocks * crate::quantize::k_quant::BLOCK_Q3_K_SIZE
+        }
+        GGML_TYPE_Q4_K => {
+            let n_blocks = total_elements.div_ceil(QK_K);
+            n_blocks * crate::quantize::k_quant::BLOCK_Q4_K_SIZE
+        }
+        GGML_TYPE_Q5_K => {
+            let n_blocks = total_elements.div_ceil(QK_K);
+            n_blocks * crate::quantize::k_quant::BLOCK_Q5_K_SIZE
         }
         // For any other type, we cannot compute the size; caller should ensure
         // we never reach here for types we don't support.
