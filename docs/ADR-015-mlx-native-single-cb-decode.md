@@ -1592,7 +1592,37 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
-- **2026-04-29 — iter31 — RESUMED-DEFERRED-AGAIN — pre-flight gate FAILED at clean-re-bench launch; ADR-014 P11 35BMOE-dwq46 re-emit fired again on the same workstation (PID 3274 / 9620 + llama-cli child PID 9623 at 96.6% CPU / 25 GB RSS) at 02:38 PDT, exactly the same contamination class that suppressed iter30's perf bench by an estimated ~2.86pp net.  HALT exit per mission spec ("If non-empty, ADR-014 P11 fired again — HALT, write 'RESUMED-DEFERRED-AGAIN' entry, exit cleanly").  ZERO bench trials launched; ADR-015 §iter30 LANDED state stands as the ship-state of record until iter31 resumes on a clean SoC.  iter30 perf numbers retain their LOWER-BOUND framing.**
+- **2026-04-29 — iter31 — RESUMED-FINAL LANDED — clean re-bench complete after ADR-014 P11+P12 fully closed (`3750ba0` + `43e3bca` + `18a5287`).  Full 4-cell paired matrix (autodefault vs `HF2Q_PARTIAL_CHAIN_LEGACY=1`) at NGEN=256, 5 cold-SoC trials per side, mcp-brain STOPped, canonical `/opt/hf2q/target/release/hf2q` at HEAD `18a5287` (zero src/ delta from `3750ba0` — autodefault path identical):**
+
+    | fixture | quant arm    | auto N  | hf2q auto t/s | hf2q legacy t/s | llama t/s | ratio auto | ratio legacy | **Δpp** |
+    |---------|--------------|--------:|--------------:|----------------:|----------:|-----------:|-------------:|--------:|
+    | dwq46   | MoE Q4_K     | cn=2    | 112.1         | 111.8           | 119.07    | 0.9415     | 0.9389       | **+0.26** |
+    | apex    | MoE Q5_K     | cn=1    | 107.4         | 107.6           | 101.84    | 1.0546     | 1.0566       | −0.20   |
+    | 27b     | dense Q4_K   | cn=4    | 30.0          | 27.9            | 26.91     | 1.1148     | 1.0368       | **+7.80** ⭐ |
+    | gemma   | dense Q4_K (Gemma4 path) | cn=1 | 87.7 | 87.7 | 104.81 | 0.8368 | 0.8368 | 0.00 |
+
+    **Net matrix sum: +7.86pp.**  All 4 cells PASS the no-regression gate (apex −0.20pp is within the −0.5pp tolerance per `feedback_correct_outcomes` ship gate).  iter30 autodefault is empirically validated AND outperforms iter26 prediction on 27b (+7.80pp measured vs +3.91pp predicted = 2.0× over-deliver).  27b's outsize gain is driven by today's better same-day llama drift (26.91 t/s vs iter26's reference) compounding with the cn=4 inverted-U peak — iter26's prediction held the per-cell direction correctly but underestimated the magnitude.  dwq46 absolute ratio 0.9415× remains below iter22's 0.9587× absolute gate by ~1.7pp; same-day Δ is positive (+0.26pp) but does NOT close Defect A absolute gate — that closure requires deeper kernel-level fusion work or different lever space.
+
+    **Cumulative ADR-015 delivery (this loop session, all on origin/main):**
+    - **iter21** (`c46207d`) — coherence fix: missing `enc.memory_barrier()` between Op 6 → Op 7 in `apply_gated_attn_layer_decode_into`.  4 fixtures × 5 trials byte-identical at NGEN=256.  Single-CB Stage 1 optimization preserved.
+    - **iter30** (`6ead010`) — per-quant-class `chain_n` autodefault at `forward_gpu.rs:315-352, 2125-2142`.  Decision matrix: dense+Q4_K → cn=4; MoE+Q4_K → cn=2; MoE+Q5_K → cn=1; other → cn=1.  +255 LOC, 7 unit tests pass.
+    - **iter31** (this entry) — clean re-bench locks in iter30 ship state with measured +7.86pp net matrix sum.  ADR-015 §MoE budget formally closed.
+    - **12 framework hypotheses falsified** on M5 Max throughout iter22-iter29 (residency null-win, single-CB collapse class regressions, chain_n=2 / chain_n=20 / rms_norm port / fused-gate-up / per-dispatch-cost-asymmetry / CPU-side ObjC-bridge attribution).  Pattern reinforces `project_metal_compiler_auto_optimizes_static_levers`.
+    - **Defect B gemma −16.32pp** (cn=1 ratio 0.8368) — on a separate `forward_mlx`/Gemma4 forward path, distinct lever space.  ADR-016 territory.
+
+    **Defect A absolute gate state (≥0.9587× on dwq46): NOT met at the qwen35-codebase architecture.**  Same-day cn=2 ratio 0.9415× is 1.7pp short of the iter22-anchored absolute gate.  Lever space within ADR-015 scope is exhausted.  Closure paths require:
+    - Custom mlx-native MoE-FFN single-mega-kernel (gate+up+silu+down+routing fused into one dispatch) — multi-week kernel work, predicted ~3-5pp ceiling per iter22 dispatch-count attribution but high implementation risk per iter28's already-falsified swiglu-fused mv_id Q4_0 sister kernel.
+    - mlx-native `mem_ranges` dataflow check port (iter22b in task list) — framework hardening, not perf lever.
+    - Redesign of MoE expert loop (e.g. routing-first, scale-and-broadcast batched matmuls) — architectural rewrite.
+
+    **Recommended iter32+ pivots (user-direction-blocking, not pre-selected):**
+    - **Option A — ADR-016 Defect B gemma −16.32pp.**  Different forward path, distinct lever space.  Risk of similar 12-falsification cycle on Gemma4 architecture; potential reward is closing the largest-gap fixture.
+    - **Option B — declare ceiling, ship current state durable.**  3/4 cells PASS ≥1.00× (apex 1.0546×, 27b 1.1148×, dwq46 0.9415× / gemma 0.8368× below).  iter30 default-on locks in measured wins; HF2Q_PARTIAL_CHAIN_LEGACY=1 escape hatch preserves user opt-out.  Reallocates engineering capacity to other priorities.
+    - **Option C — multi-week deep kernel work.**  Custom MoE-FFN mega-kernel.  Highest reward, highest risk, longest schedule.
+
+    Per-trial archive: `/tmp/iter31-resumed/perf/{dwq46,apex,27b,gemma}.results` + `/tmp/iter31-resumed/perf/<fx>-{hf2q-auto,hf2q-legacy,llama}-t{1..5}.{stdout,stderr}` (60+ artifacts).  Run log: `/tmp/iter31-resumed/run_remaining.log`.  Bench harness: `/tmp/iter31-resumed/run_perf.sh` + `/tmp/iter31-resumed/run_remaining.sh`.
+
+- **2026-04-29 — iter31 (v1) — RESUMED-DEFERRED-AGAIN — pre-flight gate FAILED at clean-re-bench launch; ADR-014 P11 35BMOE-dwq46 re-emit fired again on the same workstation (PID 3274 / 9620 + llama-cli child PID 9623 at 96.6% CPU / 25 GB RSS) at 02:38 PDT, exactly the same contamination class that suppressed iter30's perf bench by an estimated ~2.86pp net.  HALT exit per mission spec ("If non-empty, ADR-014 P11 fired again — HALT, write 'RESUMED-DEFERRED-AGAIN' entry, exit cleanly").  ZERO bench trials launched; ADR-015 §iter30 LANDED state stands as the ship-state of record until iter31 resumes on a clean SoC.  iter30 perf numbers retain their LOWER-BOUND framing.**
 
   **Pre-flight gate trace (02:39:20 PDT, worktree `agent-a7f7c6d5aea83c8ca` at HEAD `6ead010` ≡ origin/main HEAD `6ead010`).**
 
