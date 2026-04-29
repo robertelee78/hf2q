@@ -1611,7 +1611,39 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
     - Δpp clusters by family ⇒ qwen-family vs gemma-family (e.g. SwiGLU vs gemma-style activation); iter pivots to family-specific lever.
     - Single-cell outlier (only `qwen-35b-dwq46` regresses, other cells at parity) ⇒ iter11–17 was right to focus there but missed the right lever; reconsider what's unique to that cell.
 
-  **D. RESULTS PENDING — placeholder.**  Matrix bench is in flight at this commit; results will be appended to this entry as iter18-PHASE-3 when the run completes (`/tmp/adr015-iter18/bench/matrix-*.md` is the canonical artifact).  This iter18 entry intentionally commits the harness + methodology pivot WITHOUT the result table — the harness is the primary deliverable of iter18 regardless of what the first run shows; future runs feed the same artifact.
+  **D. iter18-PHASE-3 — first matrix run completed 2026-04-29 02:46 UTC** (`/tmp/adr015-iter18/bench/matrix-20260429T020227Z.md`; bash bg `b48b37y2o` wall = 44 min).  4 cells × 3 cold-SoC trials × 2 binaries × NGEN=256.  hf2q HEAD `e43e7fb`, mlx-native HEAD `e92a28c`.  mcp-brain-server `kill -STOP` for entire window; `kill -CONT` confirmed post (PID 1205, R state, 97% CPU returned).
+
+  | cell | arch | quant signature | hf2q t/s (median) | llama t/s (median) | ratio | Δpp from unity |
+  |---|---|---|---:|---:|---:|---:|
+  | qwen3.6-35b-a3b-dwq46 | MoE-A3B (256 experts × 8 active) | Q4 base + Q6 sensitive | 111.900 | 118.450 | **0.9447×** | **−5.53** |
+  | qwen3.6-35b-a3b-apex | MoE-A3B (256 experts × 8 active) | apex (Q8-ish baseline) | 106.500 | 101.590 | **1.0483×** | **+4.83** ✓ |
+  | qwen3.6-27b-dwq46 | dense (no MoE) | Q4 base + Q6 sensitive | 29.300 | 28.040 | **1.0449×** | **+4.49** ✓ |
+  | gemma-26B-dwq | gated-attention (Gemma3) | dwq | 87.300 | 104.270 | **0.8372×** | **−16.28** ⚠️ |
+
+  **Diagnosis — the matrix sharpens what 13 iters of single-cell iteration could not.**
+
+  1. **NOT generalized framework overhead.**  27B-dwq46 wins +4.49pp; apex wins +4.83pp.  If the defect were in CB-count / encoder lifecycle / scratch lifetimes / async-overlap, every cell should show it.  Three of four cells either match or exceed llama.  iter11–17's framework hypotheses were all NULL because the defect doesn't live at the framework layer.
+
+  2. **NOT pure MoE.**  35B-A3B-apex (same MoE arch, 256 × 8 expert routing through `mul_mv_id`) is +4.83pp ahead.  MoE expert dispatch on its own is competitive on M5 Max.
+
+  3. **NOT pure DWQ.**  27B-dwq46 (dense Qwen with the same Q4 base + Q6 sensitive scheme) is +4.49pp ahead.  DWQ on its own is competitive.
+
+  4. **TWO SEPARATE defects:**
+     - **Defect A — qwen-35B-A3B × dwq46 intersection: −5.53pp.**  Specifically when DWQ-mixed-precision routes Q4 base experts AND Q6 sensitive experts through the SAME MoE dispatch.  iter11–17 spent days on this cell; the matrix evidence narrows the lever from "framework" to "MoE expert dispatch when expert weights are heterogeneous bit-widths" — a kernel-side artifact in `mul_mv_id` when indexed experts span Q4_0 and Q6_K formats per token.  apex's +4.83pp on the same MoE arch is the smoking gun that pure-Q8 MoE dispatch is fine; the regression appears only when DWQ promotes a subset of experts to Q6.
+     - **Defect B — gemma-26B-dwq: −16.28pp.**  Entirely different forward path (`/opt/hf2q/src/serve/forward_mlx.rs`), different architecture (gated-attention not hybrid DeltaNet/FullAttn), different KV path (TQ-KV with Hadamard quantize + Lloyd-Max codebook per ADR-007).  iter12 §P3a'' already established gemma decode is **94.3% GPU-bound** vs qwen35's 19% CPU-bound — completely different lever space (NAX TensorOps, kernel-by-kernel comparison, P3c.1 / P3c.2 / P3c.3 territory).  iter11–17 never benched gemma after iter4's P0 baseline; the matrix surfaces that gemma's gap is **3× larger than qwen35's** and structurally separate.
+
+  5. **iter11–17 retroactively re-evaluated.**  All 13 framework-hypothesis falsifications are CONSISTENT with the matrix: the defect doesn't live where iter11–17 looked.  The cleanliness wins shipped (scratch lift, ARC-drop bug fix, setLabel propagation, deterministic decode opt-in, parser-fix recovering 70% of trace data) survive as durable infrastructure.  The methodology lesson (`feedback_harness_first_before_iter_chasing`) is what iter18 ships to prevent the same trap on Defect A and B.
+
+  Standing-pin reading per `feedback_speed_bar_full_matrix`: 2 of 4 cells are below ≥1.00× (Defect A: −5.53pp; Defect B: −16.28pp).  Same-day llama drift envelope (≤±1pp per `project_end_gate_reality_check`) does NOT explain the gaps; both are well outside drift.  The matrix is the durable evidence the standing pin asked for.
+
+  **Rebuilt iter19+ priority ranking based on matrix evidence (NOT speculation):**
+
+  1. **iter19 — pivot to Defect B (gemma-26B-dwq).**  3× larger headroom (−16.28pp vs Defect A's −5.53pp); already-audited GPU-bound (clean attribution path); separate code from iter11–17 territory; zero overlap with parallel ADR-014 session in `src/quantize/`.  Levers: NAX TensorOps tile retune (P3c.2 — bm=64, bn=128, swizzle=2 vs current NR0=64 NR1=32); flash_attn_prefill TensorOps (P3c.3 — current path uses M1-era simdgroup_matrix); Morton-order dispatch for prefill GEMM (P3c.1).
+  2. **iter20 — Defect A (qwen-35B-A3B × dwq46).**  Cell-specific lever: `mul_mv_id` mixed-precision dispatch in `quantized_matmul_id_ggml.rs`.  Read llama's `kernel_mul_mv_id_q4_0_f32` + `kernel_mul_mv_id_q6_K_f32` side-by-side; identify whether llama batches per-format experts together or interleaves them in a single dispatch.
+  3. **gemma single-CB GraphSession** — Phase P5 of the original ADR-015 phasing; gemma already has it (per iter12 §P1 audit); no work needed.
+  4. **All other previously-identified levers** — backlog.  Single-cell iter chasing prohibited per `feedback_harness_first_before_iter_chasing`; future iters re-run the matrix to validate ≥1.00× across all cells before declaring D4 met.
+
+  **Quant-signature note:** the gemma "dwq" file (16 GB) and qwen "dwq46" files use the same DWQ algorithm but different bit-width assignments (Qwen: Q4 base + Q6 sensitive; Gemma fixture: A4B-active = different sensitive promotion).  This iter does not formalize the difference; iter19+ will document the per-fixture quant signature precisely.  The matrix evidence stands regardless of nomenclature: DWQ alone is not the defect (27B-dwq46 wins).
 
   **E. iter11–17 RETROSPECTIVE (honest accounting).**  Cleanliness wins shipped: 14 transient-scratch sites lifted across qwen35 forward path; 1 latent ARC-drop bug in `mlx-native::ops::ssm_norm_gate::build_ssm_norm_gate_params` + `gated_delta_net::build_gated_delta_net_params` (would have surfaced as silent corruption if anyone flipped `MLX_UNRETAINED_REFS=1` default-on); 2 mlx-native env-gate primitives (`MLX_UNRETAINED_REFS=1`, MTLObject `set_label` propagation via `apply_labels`); 1 hf2q opt-in determinism gate (`HF2Q_PARTIAL_CHAIN_N=2` produces 8/8 byte-identical decode where N=1 baseline drifts 6/8 at NGEN=8); 1 aggregator parser fix recovering 70% of dropped trace data (887/2786 → 2786/2786 row coverage); per-trial bench methodology archival (pmset/vm_stat/brain-stat/binary-source-SHA).  **What did NOT ship**: any net D4 ratio movement.  iter11 baseline 0.9342× → iter17 N=1 0.9411× → iter17 N=2 0.9360× — all within same-day llama-bench drift envelope (±1pp per `project_end_gate_reality_check`).  13 confirmed M5-Max framework-hypothesis falsifications added to `project_metal_compiler_auto_optimizes_static_levers` during iter11–17.
 
