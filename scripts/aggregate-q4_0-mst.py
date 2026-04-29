@@ -508,6 +508,31 @@ def parse_encoders_list_with_ids(xml_text: str, target_process_prefix: str = "")
         for child in elem:
             _register_subtree(child)
 
+    # iter16 fix: duration (and start-time) cells store raw nanoseconds in
+    # `<duration ... text>NNN</duration>` when the cell has an `id=`, but
+    # ref'd cells (`<duration ref="58"/>`) drop the raw text and only carry
+    # `fmt="9.62 µs"` via the dictionary. We need a numeric-text store keyed
+    # by id, populated alongside `_register_subtree`'s fmt store. Without
+    # this, ~70% of rows on traces with deduplicated durations fail to parse
+    # and silently drop out of the per-CB aggregation (verified iter16 against
+    # /tmp/adr015-iter16/traces/hf2q-trial-2.trace: 1899/2786 rows failed
+    # with the original logic, recovering only 887 of 2786 encoders).
+    text_table: Dict[str, int] = {}
+
+    def _register_text(elem):
+        rid = elem.get("id")
+        if rid is not None:
+            t = (elem.text or "").strip()
+            if t:
+                try:
+                    text_table[rid] = int(t)
+                except ValueError:
+                    pass
+        for child in elem:
+            _register_text(child)
+
+    _register_text(root)
+
     for row in root.iter("row"):
         # Pre-pass: register all id/fmt pairs for this row's subtree.
         _register_subtree(row)
@@ -518,13 +543,27 @@ def parse_encoders_list_with_ids(xml_text: str, target_process_prefix: str = "")
 
         t_text = (children[0].text or "").strip()
         try:
-            t_ns = int(t_text) if t_text else int(resolve(children[0], table))
+            if t_text:
+                t_ns = int(t_text)
+            else:
+                ref = children[0].get("ref")
+                if ref is not None and ref in text_table:
+                    t_ns = text_table[ref]
+                else:
+                    t_ns = int(resolve(children[0], table))
         except ValueError:
             continue
 
         d_text = (children[1].text or "").strip()
         try:
-            dur_ns = int(d_text) if d_text else int(resolve(children[1], table))
+            if d_text:
+                dur_ns = int(d_text)
+            else:
+                ref = children[1].get("ref")
+                if ref is not None and ref in text_table:
+                    dur_ns = text_table[ref]
+                else:
+                    dur_ns = int(resolve(children[1], table))
         except ValueError:
             continue
 
@@ -737,6 +776,178 @@ def median_encoder_summaries(per_trial: List[Dict[str, dict]], n_tokens_list: Li
 
 
 # --------------------------------------------------------------------- #
+# iter16: Per-CB-label attribution (semantic phase names)               #
+# --------------------------------------------------------------------- #
+#
+# Why this exists (vs iter12 per-encoder family bucketing):
+#   iter12 per-encoder attribution coarsens to {compute, blit, render, accel}
+#   because neither hf2q nor llama set MTLCommandBuffer.label or
+#   MTLComputeCommandEncoder.label. iter15 §E discovered the missing wire-up;
+#   iter16 lands `cmd_buf.set_label(label)` + active-encoder set_label inside
+#   `mlx_native::CommandEncoder::commit_*labeled`, which propagates the
+#   semantic phase string (e.g. "layer.attn_moe_ffn",
+#   "output_head.fused_norm_lm_argmax", "layer.delta_net.ops1-9") to xctrace's
+#   `metal-application-encoders-list.cmdbuffer-label` column.
+#
+# Aggregation:
+#   1. Reuse iter12's parse_encoders_list_with_ids + parse_submission_to_encoder_map
+#      pipeline.
+#   2. Group by `cmdbuffer_label` (semantic phase name) instead of
+#      encoder_family.
+#   3. Sum per-CB GPU duration via the same join (sub_id -> encoder_id ->
+#      cmdbuffer_label).
+#   4. Report side-by-side hf2q vs llama (both should now carry semantic
+#      labels for hf2q; llama still emits generic "Command Buffer N" because
+#      llama.cpp does not setLabel — that's a comparable-axis issue but the
+#      hf2q-side breakdown is the actionable signal for iter17 hypothesis
+#      ranking).
+#
+# Phase-name normalization: strip per-layer indices when present so layer 0
+# through layer 39 collapse into a single "layer.attn_moe_ffn" row instead of
+# 40 separate rows. The current hf2q labels happen to be layer-index-free
+# already (fixed phase names emitted from the inner loop), but
+# `gpu_ffn::proj()` and others use `format!("{label_prefix}.gate_up")` which
+# may inherit a per-layer prefix in the future — preempt that.
+# --------------------------------------------------------------------- #
+
+
+def normalize_phase_label(label: str) -> str:
+    """Collapse per-layer index suffixes / prefixes into a single phase name.
+
+    Examples:
+      "layer.42.attn_moe_ffn"   -> "layer.attn_moe_ffn"
+      "layer.attn_moe_ffn.42"   -> "layer.attn_moe_ffn"
+      "layer.attn_moe_ffn"      -> "layer.attn_moe_ffn"
+      "Command Buffer 0"        -> "Command Buffer 0"   (unchanged generic)
+      "[0] Command Buffer 0"    -> "Command Buffer 0"   (strip index prefix)
+    """
+    if not label:
+        return "(unknown)"
+    # Strip metal-rs-style indexed prefix "[N] " that appears in
+    # cmdbuffer-label-indexed but is sometimes echoed into cmdbuffer-label.
+    if label.startswith("[") and "] " in label:
+        label = label.split("] ", 1)[1]
+    # Drop per-layer numeric segments (forward and reverse).
+    parts = label.split(".")
+    parts = [p for p in parts if not p.isdigit()]
+    return ".".join(parts) if parts else label
+
+
+def cb_label_gpu_summary(
+    encoders: List[dict],
+    paired_dispatches: List[dict],
+    sub_to_enc: Dict[str, str],
+) -> Dict[str, dict]:
+    """Bucket dispatches by the cmdbuffer-label of their owning encoder.
+
+    JOIN PATH (iter16, building on iter12):
+        1. metal-gpu-execution-points fn=1/2 paired by sub_id
+                -> per-dispatch (sub_id, duration_ns)
+        2. metal-gpu-submission-to-command-buffer-id maps sub_id -> encoder_id
+        3. metal-application-encoders-list maps encoder_id -> cmdbuffer_label
+        4. normalize_phase_label collapses per-layer indices.
+
+    Returns: {phase_label -> {count_cbs, count_dispatches, gpu_sum_ns,
+                               host_sum_ns}}
+    """
+    enc_to_phase: Dict[str, str] = {}
+    enc_to_host_ns: Dict[str, int] = {}
+    seen_enc = set()
+    cb_count_by_phase: Dict[str, int] = defaultdict(int)
+    enc_host_sum_by_phase: Dict[str, int] = defaultdict(int)
+
+    for e in encoders:
+        eid = e.get("encoder_id")
+        if not eid or eid in seen_enc:
+            continue
+        seen_enc.add(eid)
+        phase = normalize_phase_label(e.get("cmdbuffer_label", "") or "")
+        enc_to_phase[eid] = phase
+        enc_to_host_ns[eid] = e.get("duration_ns", 0)
+        cb_count_by_phase[phase] += 1
+        enc_host_sum_by_phase[phase] += e.get("duration_ns", 0)
+
+    enc_gpu_sum_by_phase: Dict[str, int] = defaultdict(int)
+    enc_disp_count_by_phase: Dict[str, int] = defaultdict(int)
+    matched = 0
+    unmapped = 0
+    unmatched_phase = 0
+    for p in paired_dispatches:
+        sid = p.get("sub_id")
+        eid = sub_to_enc.get(sid)
+        if eid is None:
+            unmapped += 1
+            continue
+        phase = enc_to_phase.get(eid)
+        if phase is None:
+            unmatched_phase += 1
+            continue
+        matched += 1
+        enc_gpu_sum_by_phase[phase] += p.get("duration_ns", 0)
+        enc_disp_count_by_phase[phase] += 1
+
+    out: Dict[str, dict] = {}
+    phases = set(enc_to_phase.values())
+    phases.update(enc_gpu_sum_by_phase.keys())
+    for phase in sorted(phases):
+        out[phase] = dict(
+            count_cbs=cb_count_by_phase.get(phase, 0),
+            count_dispatches=enc_disp_count_by_phase.get(phase, 0),
+            host_sum_ns=enc_host_sum_by_phase.get(phase, 0),
+            gpu_sum_ns=enc_gpu_sum_by_phase.get(phase, 0),
+        )
+    out["_meta"] = dict(
+        matched_dispatches=matched,
+        unmapped_dispatches=unmapped,
+        unmatched_phase_dispatches=unmatched_phase,
+        total_encoders=len(seen_enc),
+        labelled_encoders=sum(
+            1 for p in enc_to_phase.values()
+            if p and not p.startswith("Command Buffer")
+            and not p.startswith("Compute Command")
+        ),
+    )
+    return out
+
+
+def median_cb_label_summaries(
+    per_trial: List[Dict[str, dict]], n_tokens_list: List[int]
+) -> Dict[str, dict]:
+    """Median across trials for each phase label."""
+    if not per_trial:
+        return {}
+    phases = set()
+    for s in per_trial:
+        phases.update(k for k in s.keys() if not k.startswith("_"))
+    out: Dict[str, dict] = {}
+    for phase in sorted(phases):
+        gpu_us_per_tok = []
+        host_us_per_tok = []
+        cbs_per_tok = []
+        disps_per_tok = []
+        for s, n_tok in zip(per_trial, n_tokens_list):
+            n_tok = max(n_tok, 1)
+            b = s.get(phase) or {}
+            gpu_us_per_tok.append(b.get("gpu_sum_ns", 0) / 1000.0 / n_tok)
+            host_us_per_tok.append(b.get("host_sum_ns", 0) / 1000.0 / n_tok)
+            cbs_per_tok.append(b.get("count_cbs", 0) / n_tok)
+            disps_per_tok.append(b.get("count_dispatches", 0) / n_tok)
+        out[phase] = dict(
+            median_gpu_us_per_token=statistics.median(gpu_us_per_tok),
+            median_host_us_per_token=statistics.median(host_us_per_tok),
+            median_cbs_per_token=statistics.median(cbs_per_tok),
+            median_dispatches_per_token=statistics.median(disps_per_tok),
+            mean_us_per_cb=(
+                statistics.mean(gpu_us_per_tok) / max(statistics.mean(cbs_per_tok), 1e-9)
+                if cbs_per_tok and any(c > 0 for c in cbs_per_tok)
+                else 0.0
+            ),
+            gpu_us_per_token_per_trial=gpu_us_per_tok,
+        )
+    return out
+
+
+# --------------------------------------------------------------------- #
 # Bucketing by dispatch duration                                        #
 # --------------------------------------------------------------------- #
 
@@ -824,6 +1035,10 @@ def summarize_trace(trace_path: str, n_tokens: int, target_process_prefix: str =
         pass
     encoder_gpu = encoder_gpu_summary(encoders_filtered, paired, sub_to_enc)
 
+    # iter16: per-CB-label (semantic phase) attribution. Same join as
+    # iter12 but groups by cmdbuffer-label instead of encoder-family.
+    cb_label_gpu = cb_label_gpu_summary(encoders_filtered, paired, sub_to_enc)
+
     # iter11: surface the now-populated shader-list registry. Returns {} on
     # any error (e.g. older traces) so iter9 archived bundles still work.
     shader_registry: Dict[str, List[str]] = {}
@@ -870,6 +1085,8 @@ def summarize_trace(trace_path: str, n_tokens: int, target_process_prefix: str =
         # iter12 additions: per-encoder bucket attribution
         encoder_filtered_count=len(encoders_filtered),
         encoder_gpu=encoder_gpu,
+        # iter16 addition: per-CB-label semantic-phase attribution
+        cb_label_gpu=cb_label_gpu,
     )
 
 
@@ -894,6 +1111,10 @@ def median_summaries(summaries: List[dict]) -> dict:
     n_tokens_per_trial = [s["n_tokens"] for s in summaries]
     encoder_gpu_med = median_encoder_summaries(encoder_gpu_per_trial, n_tokens_per_trial)
 
+    # iter16: median per-CB-label attribution across trials
+    cb_label_gpu_per_trial = [s.get("cb_label_gpu", {}) for s in summaries]
+    cb_label_gpu_med = median_cb_label_summaries(cb_label_gpu_per_trial, n_tokens_per_trial)
+
     out = {
         "n_trials": len(summaries),
         "n_tokens_per_trial": n_tokens_per_trial,
@@ -912,6 +1133,9 @@ def median_summaries(summaries: List[dict]) -> dict:
         # iter12 additions
         "encoder_gpu": encoder_gpu_med,
         "encoder_gpu_per_trial": encoder_gpu_per_trial,
+        # iter16 additions
+        "cb_label_gpu": cb_label_gpu_med,
+        "cb_label_gpu_per_trial": cb_label_gpu_per_trial,
     }
     for name, _, _ in BUCKETS:
         counts_per_tok = []
@@ -1153,6 +1377,102 @@ def write_report(out_path: str, hf2q: dict, llama: dict, hf2q_trials: List[dict]
                     lines.append(f"  {trace_label} {fam:<7s}: "
                                  f"{', '.join(f'{x:.1f}' for x in vals)}")
         lines.append("")
+
+    # iter16: per-CB-label semantic-phase attribution side-by-side.
+    if hf2q and (hf2q.get("cb_label_gpu") or (llama or {}).get("cb_label_gpu")):
+        lines.append("")
+        lines.append("=" * 110)
+        lines.append("iter16 — Per-CB semantic-phase attribution (xctrace MST CLI-only)")
+        lines.append("=" * 110)
+        lines.append("Methodology: hf2q's `mlx_native::CommandEncoder::commit_*labeled(label)`")
+        lines.append("  now propagates the semantic phase string to MTLCommandBuffer.label and")
+        lines.append("  the active MTLComputeCommandEncoder.label, populating xctrace's")
+        lines.append("  `metal-application-encoders-list.cmdbuffer-label` column. Phases")
+        lines.append("  are joined to per-dispatch GPU duration via")
+        lines.append("  metal-gpu-submission-to-command-buffer-id (sub_id -> encoder_id) ->")
+        lines.append("  metal-application-encoders-list (encoder_id -> cmdbuffer_label).")
+        lines.append("")
+        lines.append("Comparable-axis caveat: llama.cpp does NOT setLabel on its CBs (verified")
+        lines.append("  iter15 Phase 0; iter16 §A.2 Phase 0 probe re-confirmed). llama rows here")
+        lines.append("  bucket under generic 'Command Buffer N' phase names — so this table")
+        lines.append("  shows hf2q's INTERNAL distribution across phases (the actionable signal")
+        lines.append("  for ranking iter17 hypotheses) and llama's TOTAL as a single anchor.")
+        lines.append("")
+        # hf2q labelled-encoder coverage (sanity probe).
+        try:
+            sample_per_trial = hf2q.get("cb_label_gpu_per_trial") or []
+            if sample_per_trial:
+                meta = sample_per_trial[0].get("_meta", {})
+                lines.append(
+                    f"hf2q label coverage (trial 0): {meta.get('labelled_encoders', 0)}"
+                    f" / {meta.get('total_encoders', 0)} encoders carry a semantic label"
+                )
+                lines.append("")
+        except Exception:
+            pass
+        header = (f"{'phase':<48s}  "
+                  f"{'hf2q cbs/tok':>13s}  {'hf2q disp/tok':>14s}  {'hf2q gpu_µs/tok':>15s}  "
+                  f"{'llama cbs/tok':>14s}  {'llama gpu_µs/tok':>16s}  "
+                  f"{'Δgpu_µs/tok':>12s}")
+        lines.append(header)
+        lines.append("-" * len(header))
+        all_phases = sorted(
+            set((hf2q.get("cb_label_gpu") or {}).keys())
+            | set((llama or {}).get("cb_label_gpu", {}).keys() if llama else [])
+        )
+        rows_sorted = []
+        for phase in all_phases:
+            hb = (hf2q.get("cb_label_gpu") or {}).get(phase) or {}
+            lb = ((llama or {}).get("cb_label_gpu") or {}).get(phase) or {}
+            h_gpu = hb.get("median_gpu_us_per_token", 0.0)
+            l_gpu = lb.get("median_gpu_us_per_token", 0.0)
+            d_us = h_gpu - l_gpu
+            rows_sorted.append((phase, hb, lb, d_us))
+        rows_sorted.sort(key=lambda r: -r[1].get("median_gpu_us_per_token", 0.0))
+        for phase, hb, lb, d_us in rows_sorted:
+            lines.append(
+                f"{phase[:48]:<48s}  "
+                f"{hb.get('median_cbs_per_token', 0):>13.2f}  "
+                f"{hb.get('median_dispatches_per_token', 0):>14.2f}  "
+                f"{hb.get('median_gpu_us_per_token', 0):>15.1f}  "
+                f"{lb.get('median_cbs_per_token', 0):>14.2f}  "
+                f"{lb.get('median_gpu_us_per_token', 0):>16.1f}  "
+                f"{d_us:>+12.1f}"
+            )
+        h_total = sum(b.get("median_gpu_us_per_token", 0)
+                      for b in (hf2q.get("cb_label_gpu") or {}).values())
+        l_total = sum(b.get("median_gpu_us_per_token", 0)
+                      for b in ((llama or {}).get("cb_label_gpu") or {}).values())
+        lines.append("-" * len(header))
+        lines.append(
+            f"{'TOTAL':<48s}  "
+            f"{'-':>13s}  "
+            f"{'-':>14s}  "
+            f"{h_total:>15.1f}  "
+            f"{'-':>14s}  "
+            f"{l_total:>16.1f}  "
+            f"{(h_total - l_total):>+12.1f}"
+        )
+        lines.append("")
+        # Top-3 hf2q phases by GPU µs/tok — iter17 candidate ranking.
+        labelled_rows = [
+            r for r in rows_sorted
+            if r[0] and not r[0].startswith("Command Buffer")
+            and not r[0].startswith("Compute Command")
+            and r[0] != "(unknown)"
+        ]
+        if labelled_rows:
+            lines.append("iter17 candidate ranking — top-3 hf2q phases by gpu_µs/token:")
+            for phase, hb, _lb, _d in labelled_rows[:3]:
+                cbs = hb.get("median_cbs_per_token", 0.0)
+                disp = hb.get("median_dispatches_per_token", 0.0)
+                gpu = hb.get("median_gpu_us_per_token", 0.0)
+                mean_per_cb = hb.get("mean_us_per_cb", 0.0)
+                lines.append(
+                    f"  {phase}: {cbs:.2f} cbs/tok × ~{mean_per_cb:.1f} µs/cb"
+                    f" = {gpu:.1f} gpu_µs/tok ({disp:.1f} dispatches/tok)"
+                )
+            lines.append("")
 
     # iter11: surface the kernel registry per binary so reviewers can confirm
     # iter9b labels propagated end-to-end through xctrace.
