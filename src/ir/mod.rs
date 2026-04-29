@@ -131,6 +131,36 @@ impl TensorRef {
         self.numel() * self.dtype.element_size()
     }
 
+    /// ADR-014 P7 iter-82 — P13 step 4: zero-byte-copy conversion of
+    /// the tensor's data to `Arc<Vec<u8>>` via `mem::take`.
+    ///
+    /// Moves the inner `Vec<u8>` out of `self.data` (replacing it with
+    /// an empty `Vec`) and wraps it in `Arc::new`.  No bytes are copied
+    /// — only the Vec's heap-pointer changes ownership.  After this
+    /// call, `self.data` is `Vec::new()` (zero-length), so the caller
+    /// MUST NOT rely on `self.data` thereafter.
+    ///
+    /// Used by transitional iter-3 wedges that have `&mut TensorRef`
+    /// access (e.g. when iterating a mutable `TensorMap`) and want to
+    /// hand the bytes to the streaming pipeline without paying the
+    /// per-tensor deep clone that `from_arc_bytes(Arc::new(t.data.clone()))`
+    /// pays.
+    ///
+    /// **API caveat**: this is a one-shot extractor.  Calling it
+    /// twice on the same `TensorRef` returns an empty Arc the second
+    /// time (the bytes are already gone).  This is the same semantic
+    /// as `Vec::drain` or `mem::take` — caller is responsible for not
+    /// double-extracting.
+    ///
+    /// **Future end-state**: when `TensorRef::data` migrates to
+    /// `Arc<[u8]>` (the full P13 type swap, deferred to a separate
+    /// large-blast-radius iter), this method becomes unnecessary —
+    /// `Arc::clone(&self.data)` will be the cheap-share path with no
+    /// `mem::take` required.  Until then this method is the bridge.
+    pub fn take_data_as_arc(&mut self) -> std::sync::Arc<Vec<u8>> {
+        std::sync::Arc::new(std::mem::take(&mut self.data))
+    }
+
     /// Whether this tensor belongs to a vision encoder or multimodal projector.
     /// Vision tensors should be preserved at full precision (F16) regardless of
     /// whether they pass `is_weight()`, because quantizing vision components
@@ -586,6 +616,44 @@ mod tests {
         assert_eq!(DType::F16.element_size(), 2);
         assert_eq!(DType::BF16.element_size(), 2);
         assert_eq!(DType::U8.element_size(), 1);
+    }
+
+    /// ADR-014 P7 iter-82 — `take_data_as_arc` zero-byte-copies via mem::take.
+    #[test]
+    fn test_take_data_as_arc_moves_bytes_without_clone() {
+        let original_bytes = vec![1u8, 2, 3, 4, 5];
+        let mut t = TensorRef {
+            name: "t".to_string(),
+            shape: vec![5],
+            dtype: DType::U8,
+            data: original_bytes.clone(),
+        };
+
+        let arc = t.take_data_as_arc();
+
+        // Arc holds the bytes.
+        assert_eq!(&**arc, original_bytes.as_slice());
+        // Source TensorRef.data is now empty (mem::take semantic).
+        assert_eq!(t.data, Vec::<u8>::new());
+        // Refcount==1 → unwrap path is zero-copy when the Arc is consumed.
+        assert_eq!(std::sync::Arc::strong_count(&arc), 1);
+    }
+
+    /// Calling twice returns an empty Arc the second time (drain semantic).
+    #[test]
+    fn test_take_data_as_arc_double_take_returns_empty() {
+        let mut t = TensorRef {
+            name: "t".to_string(),
+            shape: vec![3],
+            dtype: DType::U8,
+            data: vec![10, 20, 30],
+        };
+
+        let first = t.take_data_as_arc();
+        assert_eq!(&**first, &[10u8, 20, 30]);
+
+        let second = t.take_data_as_arc();
+        assert_eq!(&**second, &[] as &[u8]);
     }
 
     #[test]
