@@ -70,7 +70,13 @@ run_convert() {
         env_prefix="HF2Q_STREAMING_PHASE3=1 "
     fi
 
+    # iter-92 fix: tee writes to a sibling log path, NOT inside $out_dir.
+    # Race condition: pipeline starts hf2q + tee in parallel; tee creates
+    # convert.log in $out_dir milliseconds before hf2q checks the dir for
+    # emptiness — hf2q rejects "non-empty output dir" and exits code 3.
+    local convert_log="$OUT_ROOT/${label}.convert.log"
     echo "[$label] start: ${env_prefix}hf2q convert --quant $quant"
+    echo "[$label] log: $convert_log"
     /usr/bin/time -l env HF2Q_STREAMING_PHASE3="${stream:-0}" \
         ./target/release/hf2q convert \
             --input "$src" \
@@ -78,7 +84,7 @@ run_convert() {
             --quant "$quant" \
             --output "$out_dir" \
             --skip-quality \
-            2>&1 | tee "$out_dir/convert.log"
+            2>&1 | tee "$convert_log"
 
     local gguf
     gguf=$(find "$out_dir" -maxdepth 1 -name '*.gguf' | head -1)
