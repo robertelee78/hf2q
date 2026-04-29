@@ -1592,6 +1592,44 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter19-DIAG — quant-inventory crosscheck pinpoints Defect A to `mul_mv_id_q4_0_f32` specifically; `_id` × Q4_0 intersection is the lever, NOT mixed-precision dispatch nor PSO switching.**  Profile-first diagnosis from `gguf-dump` of all four matrix cells; the user's hypothesis "expert matmul dispatch and mixed quant dequant overhead — small scheduling fix may flip it" is partially correct but the schedule lever is narrower than expected: it's a single-kernel issue, not a multi-format encoder pattern.
+
+  **Quant inventory facts (gguf-dump, all 40 layers per fixture):**
+
+  | fixture | expert tensors (gate / up / down) | shared-expert tensors | attention QKV | router (ffn_gate_inp) |
+  |---|---|---|---|---|
+  | qwen3.6-35b-a3b-**dwq46** (loses -5.53pp) | 38 × Q4_0 + 2 × Q6_K | 38 × Q4_0 + 2 × Q6_K | all Q4_0 | 38 × Q4_0 + 2 × Q6_K |
+  | qwen3.6-35b-a3b-**apex** (wins +4.83pp) | gate/up: 40 × Q5_K; down: 20 × Q5_K + 20 × Q6_K | gate/up: 40 × Q5_K; down: 20 × Q5_K + 20 × Q6_K | mixed Q5_K + Q6_K (16/14, 6/4) | F32 (not quantized) |
+  | qwen3.6-**27b-dwq46** (wins +4.49pp, dense) | n/a (no MoE) | n/a | Q4_0 (single mat-vec, no `_id`) | n/a |
+
+  **The matrix evidence + quant inventory together rule out the obvious hypotheses:**
+
+  1. **NOT mixed-precision encoder switching.**  apex has FAR more mixed-format dispatches (gate=Q5_K, half of down=Q6_K, attention is mixed Q5_K+Q6_K, etc.) and apex WINS.  PSO-switch overhead is not the lever.
+  2. **NOT general DWQ overhead.**  27B-dwq46 (dense, no MoE) wins +4.49pp using the same Q4_0 quant — DWQ alone is competitive.
+  3. **NOT the Q6_K kernel.**  The 2 layers in dwq46 with Q6_K experts contribute at most ~30 µs/token (6 dispatches × per-dispatch delta); the gap is 540 µs/token.
+
+  **The actual lever: `mul_mv_id_q4_0_f32` specifically.**  Cross-axis evidence:
+  - 35B-A3B-dwq46 (LOSES): 38 × 3 = 114 calls/token to `mul_mv_id_q4_0_f32` for routed experts (top_k=8 of 256 experts, each call dispatches the 8 routed experts × 3 projections).
+  - 35B-A3B-apex (WINS): same 114 calls/token but to `mul_mv_id_q5_K_f32` instead.
+  - 27B-dwq46 (WINS, dense): NO `_id` kernel — uses non-indexed `mul_mv_q4_0_f32` (no expert routing).
+
+  **Q4_0 alone works (27B wins).  MoE-expert-routing alone works (apex wins).  The intersection — `mul_mv_id` × Q4_0 — is the lever.**  Specifically, mlx-native's `kernel_mul_mv_id_q4_0_f32` (`/opt/mlx-native/src/shaders/quantized_matmul_id_ggml.metal:` mid-file) underperforms relative to (a) its non-`_id` sibling `kernel_mul_mv_q4_0_f32` and (b) llama's `kernel_mul_mv_id_q4_0_f32` (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:10351` template).
+
+  **W-5b cycle history says the kernels are byte-equivalent in arithmetic** — but that audit was on the same dwq46 cell and didn't have the apex/27B-dwq46/gemma cells as cross-references.  The matrix evidence now reframes the question: if Q4_0 arithmetic is byte-equivalent and dispatch geometry matches (`N_R0_Q4_0=4`, `N_SG_Q4_0=2` on both sides per `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-impl.h:27-28`), the gap must be in something that differs ONLY in the `_id` indexing path.  Candidates: per-expert-stride pointer arithmetic in the indexed walk, threadgroups-per-grid factoring (mlx-native uses `(ceil(N/2), n_tokens*top_k, 1)` per the Q6_K analog at line 533), expert_stride bind layout, or a routing-dim Y vs Z choice that's been A/B falsified once but not for the Q4_0 specifically on dwq46.
+
+  **iter20 mission (next iter):**
+  1. Read `/opt/mlx-native/src/shaders/quantized_matmul_id_ggml.metal` `kernel_mul_mv_id_q4_0_f32` end-to-end vs `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal` `kernel_mul_mv_id_q4_0_f32` template instantiation at line 10351.
+  2. Cross-fence the dispatch geometry (threadgroups-per-grid, threads-per-tg, simdgroup arrangement, expert_stride / ids buffer layout).
+  3. Identify ONE concrete A/B (e.g. transpose threadgroup Y-routing from per-token to per-expert; merge per-token output rows into a single threadgroup; pre-bind expert offsets in the dispatch params instead of indirecting through ids buffer at runtime).
+  4. Implement, parity-gate (16-prompt smoke byte-identical to baseline), bench via `scripts/bench-matrix.sh CELLS=qwen3.6-35b-a3b-dwq46,qwen3.6-35b-a3b-apex,qwen3.6-27b-dwq46`.
+  5. Ship gate: dwq46 must be ≥+1pp closer to 1.00× without regressing apex or 27B (apex's `mul_mv_id_q5_K_f32` shouldn't be touched; 27B doesn't use `_id` at all so any `_id`-only fix is safe).
+
+  **iter19-DIAG deliverable: NO code change.**  This is profile-first diagnosis; the matrix harness + quant inventory together pinpoint the lever to a specific kernel function name.  iter20 implements + benches.  Per `feedback_harness_first_before_iter_chasing`: matrix is the gate; iter20 must show ≥+1pp on the dwq46 cell across the matrix without regressing other cells before declaring win.
+
+  **Re-prioritization of pending iters:**
+  - iter20 = `mul_mv_id_q4_0_f32` audit + A/B (qwen35-MoE-dwq46 × Q4_0 intersection).  PRIMARY per user "qwen3.6-35b-a3b-dwq46 (MoE × Q4/Q6) is really the one I plan to use most".
+  - iter21+ = gemma-26B-dwq (-16.28pp).  3× larger headroom but secondary use case; gemma's GPU-bound nature requires a different lever stack (NAX TensorOps tile retune, flash_attn TensorOps, Morton dispatch — P3c.1/.2/.3 territory) and is structurally separate from the qwen35 fix.
+
 - **2026-04-29 — iter18 METHODOLOGY PIVOT — stop iterating single-cell fixes; ship a (model × quant × length) bench-matrix harness to localize WHERE the defect lives before any further code change.**  Triggered by direct user feedback after the iter11–17 cycle: *"we've spent days on this and I feel like we're spinning our wheels"*, *"are we going about the diagnosis in a sane way?"*, *"I suspect that our defect is not limited to a specific model family or even quant"*, *"we need to stop making blind changes and hoping it works — we need to instead wire up a test harness that lets us know where we're slower"*, *"then we can devise a plan to fix"*.  The user's instinct aligns with `feedback_speed_bar_full_matrix` (standing pin: hf2q ≥ 1.00× llama.cpp on SAME hardware across ALL quants, conversions, lengths, modes; *"any gap is structural"*) — iter11–17 chased a single (Qwen3.5-MoE-35B-A3B, dwq46, NGEN=256) cell and produced 13 confirmed M5-Max framework-hypothesis falsifications with ~0pp net D4 movement.  The entire iter11–17 cycle is best read as *methodology rigor delivered, headline ratio unmoved, real cost incurred*.  iter18 ships the harness that should have come first.
 
   **A. NEW STANDING PIN — `feedback_harness_first_before_iter_chasing` (auto-memory).**  Future perf-gap investigations: when a single-cell perf gap survives ≥2 falsified single-fix attempts, STOP iterating and instead build a diagnostic harness that maps the search space (matrix of cells × per-bucket attribution).  Single-number bench results are the symptom, not the diagnosis.  iter11–17 retroactively demonstrates the cost of skipping this step: 7 iters spent localizing within one cell while leaving the cross-cell pattern (which would have answered "is this Qwen-MoE-specific or generalized?") completely unmeasured.
