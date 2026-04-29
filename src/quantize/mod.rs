@@ -5443,7 +5443,7 @@ mod tests {
     /// used `KQuantCodecQuantizer` and discovered that
     /// `quality::dequantize_single_tensor` did NOT handle the
     /// `METHOD_K_QUANT_CODEC_DIRECT` method — it fell into the
-    /// "no scales" warn path and returned zeros.  iter-45 (`<TBD>`)
+    /// "no scales" warn path and returned zeros.  iter-45 (`3ebd4da`)
     /// added the codec-direct dequant arm dispatching off `ggml_type`
     /// for K-quants (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K) and legacy codec outputs
     /// (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0).  This iter still uses StaticQuantizer
