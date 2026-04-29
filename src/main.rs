@@ -1533,9 +1533,26 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 // wedge gates; VariantKQuantizer dispatch is a strict
                 // superset of KQuantCodecQuantizer dispatch (per-tensor
                 // routing via layer_mix), so the same wedge applies.
+                //
+                // ADR-014 P7 iter-85 (2026-04-28): extend _MUT wire-up
+                // to this arm; precedence as iter-84 (MUT > legacy > eager).
                 let streaming_phase3 =
                     std::env::var("HF2Q_STREAMING_PHASE3").as_deref() == Ok("1");
-                if streaming_phase3 {
+                let streaming_phase3_mut =
+                    std::env::var("HF2Q_STREAMING_PHASE3_MUT").as_deref() == Ok("1");
+                if streaming_phase3_mut {
+                    tracing::info!("ADR-014 P7 iter-85: HF2Q_STREAMING_PHASE3_MUT=1 → quantize_via_streaming_consuming_mut (ImatrixAdaptive)");
+                    quantize::quantize_via_streaming_consuming_mut(
+                        &mut tensor_map,
+                        &metadata,
+                        &vq,
+                        bits,
+                        config.group_size,
+                        &progress,
+                    )
+                    .context("imatrix-adaptive (variant K-quant) quantization failed (consuming-mut path)")
+                    .map_err(AppError::Conversion)?
+                } else if streaming_phase3 {
                     tracing::info!("ADR-014 P7 iter-49: HF2Q_STREAMING_PHASE3=1 → quantize_via_streaming_borrowed (ImatrixAdaptive)");
                     quantize::quantize_via_streaming_borrowed(
                         &tensor_map,
