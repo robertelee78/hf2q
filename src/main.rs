@@ -1765,9 +1765,30 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     // gates).  legacy_quant_method override is preserved
                     // post-quantize regardless of which path emitted the
                     // bytes.
+                    // ADR-014 P7 iter-88 (2026-04-28): extend _MUT wire-up to
+                    // DwqK arm — completes the 4-arm zero-byte-copy migration.
+                    // legacy_quant_method override applies regardless of path.
                     let streaming_phase3 =
                         std::env::var("HF2Q_STREAMING_PHASE3").as_deref() == Ok("1");
-                    let mut quantized = if streaming_phase3 {
+                    let streaming_phase3_mut =
+                        std::env::var("HF2Q_STREAMING_PHASE3_MUT").as_deref() == Ok("1");
+                    let mut quantized = if streaming_phase3_mut {
+                        tracing::info!("ADR-014 P7 iter-88: HF2Q_STREAMING_PHASE3_MUT=1 → quantize_via_streaming_consuming_mut (DwqK)");
+                        quantize::quantize_via_streaming_consuming_mut(
+                            &mut tensor_map,
+                            &metadata,
+                            &dwq_k,
+                            bits,
+                            config.group_size,
+                            &progress,
+                        )
+                        .map_err(|e| {
+                            AppError::Conversion(anyhow::anyhow!(
+                                "ADR-014 P11-prereq Iter C: DwqKQuantizer \
+                                 byte-emit failed (consuming-mut path): {e:#}"
+                            ))
+                        })?
+                    } else if streaming_phase3 {
                         tracing::info!("ADR-014 P7 iter-51: HF2Q_STREAMING_PHASE3=1 → quantize_via_streaming_borrowed (DwqK)");
                         quantize::quantize_via_streaming_borrowed(
                             &tensor_map,
