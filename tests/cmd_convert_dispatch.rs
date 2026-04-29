@@ -1012,3 +1012,74 @@ fn streaming_phase3_byte_identical_f16() {
          eager:  {eager_sha}\nstream: {stream_sha}"
     );
 }
+
+// ---------------------------------------------------------------------
+// T17: HF2Q_STREAMING_PHASE3 byte-identity for imatrix-adaptive (iter-75)
+// ---------------------------------------------------------------------
+
+/// ADR-014 P7 iter-75 — ImatrixAdaptive SHA gate, deferred-real-weights.
+///
+/// **Coverage gap audit**: of the 4 Phase 3 dispatch arms wired in
+/// iter-48-51, ImatrixAdaptive (iter-49) is the ONLY arm without a
+/// file-level SHA gate.  Decision 13 (no silent fallback) requires
+/// ImatrixCalibrator to have a forward-pass `ActivationCapture` impl
+/// for the source arch; the synthetic Llama fixture (`DwqArch::Other`)
+/// surfaces `ForwardPassUnavailable` instead of running.  The synthetic
+/// qwen35 fixture (`tests/convert_qwen35_*`) has all-zero weights so
+/// `load_from_gguf` rejects mid-pipeline.  Real-weight gate requires
+/// a real qwen35 safetensors source (P11 territory).
+///
+/// This iter lands the gate as `#[ignore]`'d so it (a) documents the
+/// contract, (b) is one-flag-flip away from active when a real-weight
+/// fixture lands.  The 8-cell P10 GateCell matrix's MoE cells (cells
+/// 4-7) cover an adjacent dimension (cross-validator + peer-parity),
+/// not the streaming-vs-eager byte-identity contract specifically.
+///
+/// To activate: set `HF2Q_IMATRIX_ADAPTIVE_FIXTURE` to a real qwen35
+/// safetensors directory and remove `#[ignore]`.
+#[test]
+#[ignore = "ImatrixAdaptive needs real-weight qwen35 fixture (synthetic all-zero rejects in load_from_gguf); P11 hardware territory"]
+fn streaming_phase3_byte_identical_imatrix_adaptive() {
+    let fixture = std::env::var("HF2Q_IMATRIX_ADAPTIVE_FIXTURE")
+        .expect("set HF2Q_IMATRIX_ADAPTIVE_FIXTURE to a real qwen35 safetensors dir");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let eager_dir = tmp.path().join("out_eager_imatrix_adaptive");
+    let stream_dir = tmp.path().join("out_stream_imatrix_adaptive");
+
+    Command::cargo_bin("hf2q")
+        .expect("hf2q binary")
+        .args([
+            "convert",
+            "--input", &fixture,
+            "--format", "gguf",
+            "--quant", "imatrix-adaptive",
+            "--output", eager_dir.to_str().unwrap(),
+            "--skip-quality",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("hf2q")
+        .expect("hf2q binary")
+        .env("HF2Q_STREAMING_PHASE3", "1")
+        .args([
+            "convert",
+            "--input", &fixture,
+            "--format", "gguf",
+            "--quant", "imatrix-adaptive",
+            "--output", stream_dir.to_str().unwrap(),
+            "--skip-quality",
+        ])
+        .assert()
+        .success();
+
+    let eager_sha = file_sha256(&locate_gguf(&eager_dir));
+    let stream_sha = file_sha256(&locate_gguf(&stream_dir));
+
+    assert_eq!(
+        eager_sha, stream_sha,
+        "imatrix-adaptive: HF2Q_STREAMING_PHASE3=1 GGUF must be byte-identical \
+         to eager — VariantKQuantizer + imatrix calibration streaming wedge \
+         regressed at file level.\n  eager:  {eager_sha}\n  stream: {stream_sha}"
+    );
+}
