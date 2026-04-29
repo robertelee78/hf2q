@@ -1592,6 +1592,62 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter47 — RUNTIME `chain_n_for` VERIFICATION on all 4 fixtures — iter46 hypothesis SPLIT VERDICT: find_map FALSIFIED (works correctly), chain_n_for-table-coverage CONFIRMED (Q4_0 not in match arms → catch-all cn=1).  Bench-free verification phase per the iter46 deliverable; one-line `eprintln` instrumentation at `forward_gpu.rs:351` for one decode token per fixture, then removed before commit.  Coherence smoke 12/12 PASS post-instrument-remove.  Docs-only commit; chain_n table NOT extended without measurement evidence (see iter45 follow-up note below).**
+
+    **HEAD CONTEXT.**  Worktree `agent-a25dbd8e963742d8a`, base `ee18026` (iter46 docs commit).  `mlx-native` HEAD `9bd1f6f` (untouched).  Parallel ADR-014 P11/P12 in `src/quantize/mod.rs`; iter47 touches only `forward_gpu.rs` (eprintln add+remove) and this changelog — no collision.
+
+    **PHASE 1 — code reading (file:line citations).**
+
+    DWQ MoE GGUF load path: `weight_loader.rs:1196-1213` — `match cfg.variant { Qwen35Variant::Moe => Qwen35FfnWeights::MoeQ(load_moe_ffn_quantized(...)) }` — preserves the GGUF's native expert-tensor quant in `MoeFfnWeightsQ::ggml_type_gate_up` (set at `:1040` from `gate_info.ggml_type`).  DWQ Dense load path: `weight_loader.rs:1196-1204` — `Qwen35Variant::Dense → load_dense_ffn_quantized → Qwen35FfnWeights::DenseQ(...)` with `ggml_type_gate_up` at `weight_loader.rs:1118`.
+
+    Both paths flow into `upload_layer_weights_gpu` (`forward_gpu.rs:2982-3032`) which directly maps `Qwen35FfnWeights::DenseQ → FfnWeightsGpu::DenseQ` (`:2998`) and `Qwen35FfnWeights::MoeQ → FfnWeightsGpu::MoeQ` (`:3011`).  `default_chain_n` (`forward_gpu.rs:336-353`) `find_map` arms at `:345-:346` match BOTH `DenseQ` and `MoeQ` — there is no path by which a quantized DWQ load surfaces as `FfnQuantArm::Other`.
+
+    **Code-reading conclusion (pre-runtime):** iter46's "find_map miss" hypothesis is structurally implausible.  But the eprintln verification was still cheap, and revealed a related but distinct bug.
+
+    **PHASE 2 — runtime `eprintln` evidence per fixture (one-line probe at `forward_gpu.rs:351`, NGEN=4, temp=0).**
+
+    | Fixture | Expected cn (per iter46 table) | Actual `arm` | Actual `quant` | Actual `cfg_is_moe` | Actual cn | Verdict |
+    |---|---|---|---|---|---|---|
+    | apex `35B-A3B-abliterated-apex` | 1 (MoeQ Q5_K) | `MoeQ` | `Q5_K` | `true` | **1** | ✅ MATCH |
+    | dwq46 `35B-A3B-dwq46` | 2 (MoeQ Q4_K) | `MoeQ` | **`Q4_0`** | `true` | **1** | ❌ MISMATCH (quant ≠ Q4_K) |
+    | 27b-dwq46 `qwen3.6-27b-dwq46` | 4 (DenseQ Q4_K) | `DenseQ` | **`Q4_0`** | `false` | **1** | ❌ MISMATCH (quant ≠ Q4_K) |
+    | gemma `gemma-4-26B-A4B-it-ara-abliterated-dwq` | n/a (forward_mlx, not chain_n) | n/a | n/a | n/a | n/a | n/a (eprintln never fired — confirms gemma bypasses qwen35 forward_gpu) |
+
+    Cross-checked with `gguf-dump`: 35B-dwq46 `blk.0.ffn_gate_exps.weight` storage = `Q4_0`; 27B-dwq46 `blk.0.ffn_gate.weight` storage = `Q4_0`; apex `blk.0.ffn_gate_exps.weight` storage = `Q5_K`.  The `general.file_type=15` (LLAMA_FTYPE_MOSTLY_Q4_K_M) on dwq46 is metadata-only — the actual tensor blocks were materialized as Q4_0, not Q4_K.  Likely root cause: a downstream re-emit step (e.g. `--extract-quant Q4_0` or a converter that fell through K-quant alignment skip per ADR-014 iter34) downgraded the fixtures from K-quant to legacy Q4_0 without updating `general.file_type`.  This matches the standing memory `feedback_gguf_writer_unit_test_size_predictor` warning about catch-all-fallback regression in the writer pass.
+
+    **PHASE 3 — VERDICT (split).**
+
+    1. **iter46 hypothesis "find_map returns None for DWQ" — FALSIFIED.**  `find_map` correctly identifies `DenseQ`/`MoeQ` for all production DWQ fixtures.  The variant-detection code is sound; the production-test unit `chain_n_for_dwq46_moe_q4km_returns_2` (forward_gpu.rs:3084) tests an input shape (`MoeQ + Q4_K`) that **does not occur** in the actual production fixtures.
+
+    2. **iter46 hypothesis "DWQ effective cn=1 not cn=2" — CONFIRMED, but via a DIFFERENT mechanism.**  `chain_n_for` (`forward_gpu.rs:315-329`) only has match arms for `Q4_K`, `Q5_K`, `Q6_K`.  `Q4_0` (and `Q8_0`) fall through to the conservative `_ => 1` catch-all.  Both DWQ46 fixtures hit cn=1 because their expert/projection tensors are stored as Q4_0, not because of a find_map miss.  iter44's measured "40 cmd_bufs/decode token" (= 40 layers × 1 + output_head sync, with cn=1 effective) is internally consistent with this catch-all path.
+
+    3. **iter44 retrospective.**  iter44 attributed the 88% wall to "output_head sync barrier draining 39 prior async-committed layer-chain CBs" assuming cn=2.  At cn=1, the geometry is identical (each layer commits its own CB; output_head still drains them all) — iter44's mechanism description is unchanged but its baseline cn assumption was wrong.  The iter44 finding does NOT need re-derivation; only the cn label changes from "cn=2 autodefault" to "cn=1 catch-all".
+
+    **PHASE 4 — FIX (DEFERRED, evidence-first per `feedback_evidence_first_no_blind_kernel_rewrites`).**
+
+    The natural fix is to extend `chain_n_for` to cover `Q4_0` (and `Q8_0`) so the dwq46 fixtures get a measured-better cn.  But the iter17/26 N-curves that calibrated cn=2 (MoeQ Q4_K) and cn=4 (DenseQ Q4_K) were measured on K-quant tensor shapes; Q4_0 has different per-block dispatch cost (smaller blocks, different mv/mm kernel routing) and there is no measurement basis to choose cn for `(MoeQ, Q4_0)` or `(DenseQ, Q4_0)`.  Picking cn=2 / cn=4 by analogy is exactly the static-evidence-kernel-hypothesis pattern that has been falsified 11 times on M5 Max (per `project_w5b27_per_op_cost_floor_reached`).
+
+    **iter45 (N-curve harness already shipped at `scripts/iter45-chain-n-curve-bench.sh`) is the correct measurement vehicle.**  When FCP (or whatever heavyweight user-CPU contaminator is active) clears, iter45 should re-run the N-curve `[1, 2, 4, 8, 20]` on dwq46 — and the cn=1 baseline it sweeps is the TRUE current production baseline (not cn=2 as iter45's docstring assumed).
+
+    **PHASE 5 — iter45 hypothesis re-weighting note.**
+
+    iter45's three anchored hypotheses (H1: "cn=20 wins on dwq46 by amortizing output_head sync", H2: "cn=2 is local optimum from iter17/26", H3: "cn=1 is universally fastest after the iter40+iter42 coherence fix") need re-weighting:
+    - H2 ("cn=2 is the iter17/26 optimum") was always operating under a **false premise** — the iter26 N-curve was measured on a fixture whose effective production cn was 1, not 2.  H2's posterior should drop.
+    - H1 ("cn=20 wins") is unaffected by this finding — it is still the dominant a-priori candidate from iter44's CB-count attribution.
+    - H3 ("cn=1 is fastest") is now the **null** hypothesis — that's already what runs in production.  H3's posterior should rise as the not-rejected default; the bench question is whether ANY cn>1 beats cn=1 on Q4_0 dwq46.
+
+    **PHASE 6 — Code touches.**
+
+    Phase 2 added a one-line `eprintln!` at `forward_gpu.rs:351` (after `let (arm, quant) = ...`).  Phase 4 (deferred) would extend `chain_n_for` match arms.  Final iter47 commit reverts the eprintln to clean state and ships the docs-only update — no production code changed.  Coherence smoke (`cargo test --release --test coherence_smoke -- --nocapture`) re-PASSES 12/12 in 90s with eprintln removed.  `chain_n_for` unit tests (7/7) still PASS — those tests cover Q4_K/Q5_K/Q6_K rows, which are unchanged; they just don't reflect production reality.
+
+    **DELIVERABLES (per mission spec).**
+    1. ✅ Per-fixture actual-vs-expected table — Phase 2 above.
+    2. ✅ Verdict — Phase 3 split: find_map FALSIFIED, table-coverage gap CONFIRMED.
+    3. ⊖ Fix DEFERRED — extending the table without N-curve evidence violates `feedback_evidence_first_no_blind_kernel_rewrites`; iter45 is the right vehicle.
+    4. ✅ iter45 H1/H2/H3 re-weighting note — Phase 5 above.
+    5. ✅ Pathspec-clean commit + push (this entry).
+    6. ✅ brain_share — debug category, keyword-rich title.
+
 - **2026-04-29 — iter46 — OFFLINE PRE-BENCH AUDIT — chain_n vs llama n_cb cross-architecture diff (zero bench, zero kernel changes, docs-only).  Read llama.cpp Metal backend at HEAD `fc2b005` and hf2q `forward_gpu_greedy` at HEAD `ff1bc4d` side-by-side; write up architectural delta, anchor 3 testable hypotheses for iter45 N-curve resumption, and reconcile iter44's "40 cmd_bufs/tok" claim against the cn=2 autodefault.  Cross-fixture pattern: hf2q wins on apex (+6.29pp) and 27b (+3.41pp) yet loses on dwq46 (−5.96pp) and gemma (−3.71pp) — the Δ vs llama is not monotone in CB count, so the chain_n N-curve alone cannot be the root cause.  Recommendation: iter45 N-curve resume remains the right next test for dwq46 specifically, but a parallel structural audit (apex flat-negative cn-curve mechanism vs dwq46's a-priori cn=20 win) is the architectural lens iter46 supplies.**
 
     **HEAD CONTEXT.**  Worktree `agent-a309cf3445f368bda`, base `ff1bc4d` (≡ origin/main; iter45 already committed).  `mlx-native` HEAD `9bd1f6f` (untouched).  `llama.cpp` HEAD `fc2b005` (read-only reference; never linked).  Parallel ADR-014 P11/P12 may be touching `src/quantize/mod.rs`; iter46 is docs-only and cannot collide.
