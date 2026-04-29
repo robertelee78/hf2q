@@ -951,3 +951,64 @@ fn eager_run_to_run_determinism_q4_k_m() {
         shas[1], shas[2]
     );
 }
+
+// ---------------------------------------------------------------------
+// T16: HF2Q_STREAMING_PHASE3 byte-identity for f16 (StaticQuantizer arm) (iter-67)
+// ---------------------------------------------------------------------
+
+/// ADR-014 P7 iter-67 — extend SHA gate to --quant f16 which routes
+/// through the StaticQuantizer arm wired in iter-50.  This is the
+/// simplest dispatch (no quantization, just F16 conversion) but
+/// crucially has its OWN code path that the K-quant / DwqK gates
+/// don't cover.
+///
+/// 4-arm coverage now complete at the file level:
+///   - K-quant codec direct       (iter-61 q4_k_m, iter-62 q5_k_m/q6_k)
+///   - StaticQuantizer            (iter-67 f16 — THIS)
+///   - DwqK                       (iter-63 dwq-4-6)
+///   - ImatrixAdaptive            (deferred — needs qwen35 fixture)
+#[test]
+fn streaming_phase3_byte_identical_f16() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let input_dir = tmp.path().join("input");
+    let eager_dir = tmp.path().join("out_eager_f16");
+    let stream_dir = tmp.path().join("out_stream_f16");
+    setup_p2_iter2_fixture(&input_dir);
+
+    Command::cargo_bin("hf2q")
+        .expect("hf2q binary")
+        .args([
+            "convert",
+            "--input", input_dir.to_str().unwrap(),
+            "--format", "gguf",
+            "--quant", "f16",
+            "--output", eager_dir.to_str().unwrap(),
+            "--skip-quality",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("hf2q")
+        .expect("hf2q binary")
+        .env("HF2Q_STREAMING_PHASE3", "1")
+        .args([
+            "convert",
+            "--input", input_dir.to_str().unwrap(),
+            "--format", "gguf",
+            "--quant", "f16",
+            "--output", stream_dir.to_str().unwrap(),
+            "--skip-quality",
+        ])
+        .assert()
+        .success();
+
+    let eager_sha = file_sha256(&locate_gguf(&eager_dir));
+    let stream_sha = file_sha256(&locate_gguf(&stream_dir));
+
+    assert_eq!(
+        eager_sha, stream_sha,
+        "f16: HF2Q_STREAMING_PHASE3=1 GGUF must be byte-identical to \
+         eager — StaticQuantizer streaming wedge regressed at file level\n\
+         eager:  {eager_sha}\nstream: {stream_sha}"
+    );
+}
