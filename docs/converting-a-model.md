@@ -383,6 +383,36 @@ Required acknowledgment for the orthogonal `--calibration X
 cells (e.g. `--calibration imatrix --output-format bit-pair-4-6`)
 require the env gate to surface accidental misconfigurations.
 
+### `HF2Q_STREAMING_PHASE3=1`
+
+ADR-014 P7 iter-3 production wire-up.  Routes Phase 3 quantization
+dispatch (all four arms — K-quant codec direct, ImatrixAdaptive,
+StaticQuantizer, DwqK) and Phase 4.5 quality measurement through the
+streaming `LazyTensorMap` pipeline (`quantize_via_streaming_borrowed`
++ `measure_quality_streaming_lazy`) instead of the eager `TensorMap`
+path (`quantize_model` + `measure_quality_streaming`).  Output is
+byte-identical to the eager path — every wired arm has a per-arm
+byte-identity gate in the test suite (`quantize_via_streaming_borrowed_*`).
+
+The env flag is currently a TEST INTEGRATION channel, not a memory
+win: the wedge clones bytes per-tensor into a transient LazyTensorMap
+during the call, so peak memory is ~2× the largest tensor briefly.
+The actual memory-budget improvement lands when iter-3's wholesale
+surgery (replace the unconditional `materialize_all()` upstream with
+a bridge gated on `backend.requires_native_quantization()`) is
+sequenced in.  Default OFF; default behavior unchanged.
+
+```bash
+HF2Q_STREAMING_PHASE3=1 \
+  hf2q convert --repo X --format gguf --quant q4_k_m --output streaming.gguf
+```
+
+Use cases:
+  - Validating the streaming code path against eager output on a real
+    convert run (production exercise).
+  - Smoke-testing iter-3 main.rs surgery in advance of removing the
+    `materialize_all()` bridge.
+
 ---
 
 ## Common errors
