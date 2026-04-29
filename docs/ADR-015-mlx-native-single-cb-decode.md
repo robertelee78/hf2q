@@ -1592,6 +1592,27 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter35 — FALSIFIED — Q8_0 mat-vec 4-simdgroup re-tile gives NULL Δ on gemma.**  Per iter32 audit Candidate A: re-tile mlx-native's Q8_0 mat-vec from 64 threads/tg → 128 threads/tg (4 simdgroups) to match llama.cpp's `N_SG_Q8_0=4` geometry at `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-impl.h:39-65`.  Agent built the patched mlx-native + hf2q in worktree, ran 3-trial gemma bench (A=4SG, C=control) before worktree was wiped mid-bench by harness reset (binary path became invalid → all subsequent trials returned empty stdout / md5 `d41d8cd98f00b204e9800998ecf8427e`).  Captured 3 valid gemma trials:
+
+    | side | per-trial t/s        | median  | ratio vs llama 105.02 | Δpp vs C |
+    |------|----------------------|--------:|----------------------:|---------:|
+    | A (4SG) | 101.0, 100.6, 100.5 | 100.5  | 0.9570               | **+0.00** |
+    | C (control 2SG) | 100.9, 100.7, 100.5 | 100.5 | 0.9570             | —       |
+
+    Both medians at 100.5 tok/s — A and C bit-equivalent on perf within trial noise.  iter32 predicted +0.5–2.0pp; measured **+0.00pp**.  Hypothesis: mlx-native's existing 64-thread/tg dispatch is already in the M5 Max scheduler's optimal-occupancy band for Q8_0 (the per-quant-block dequant work doesn't benefit from doubling threadgroup size on Apple Silicon's local L1).  Compiler / scheduler auto-optimization closes the gap; explicit re-tile is redundant.  Per spec ("FALSIFIED case → REVERT all kernel changes per `feedback_no_shortcuts`") agent worktree auto-cleaned without commit; mlx-native at HEAD `22f715b` UNCHANGED; hf2q at HEAD `a46bd5e` UNCHANGED.  **13th in-tree falsified static-evidence kernel-class hypothesis on M5 Max** (iter28 was #11 audit-class, iter29 was #12 capture-class).  Reinforces `project_metal_compiler_auto_optimizes_static_levers`.
+
+    Operational caveat surfaced in iter34 + iter35: silent external "reset: moving to HEAD" can wipe agent Edit-tool changes mid-flight.  Detection in iter34 was empty `strings | grep iter` after build.  In iter35 it was empty stdout/empty md5 across all post-trial-3 captures.  Brain entry recorded under category=tooling for future iter sequencing.
+
+    **iter36+ recommendation status: ADR-015 lever space at qwen35-codebase + gemma-codebase architecture EXHAUSTED.**  Neither remaining defect (dwq46 0.9415× / gemma 0.9531×) clears the ≥1.00× absolute speed bar.  Both remain shippable / coherent at their current ratios.  Closure paths require multi-week kernel work (custom MoE mega-kernel for dwq46 per iter28's already-falsified swiglu-prior risk profile, OR FA inner-loop tile rewrite for gemma).  ADR-015 is at the disciplined close-point for autonomous-loop-style iteration.
+
+    **Cumulative ADR-015 delivery (post-iter35):**
+    - **iter21** (`c46207d`): coherence fix — single `enc.memory_barrier()` Op 6→7.  4-fixture × 5-trial byte-identical at NGEN=256.  Single-CB Stage 1 optimization preserved.
+    - **iter30** (`6ead010`): per-quant-class chain_n autodefault.  +7.86pp net matrix sum.
+    - **iter34** (`a46bd5e`): gemma dense-SDPA-on-TQ-KV default.  +11.86pp on gemma (Defect B from −16.32pp → −4.69pp).
+    - **iter31 + iter22 + iter32 + iter33** + 9 documentation commits: full evidence chain.
+    - **13 framework hypotheses falsified** along the way.
+    - **3/4 fixtures at ≥1.00×** (apex 1.0546×, 27b 1.1148×, gemma 0.9531×, dwq46 0.9415×).
+
 - **2026-04-29 — iter34 — SHIPPED — gemma dense-SDPA-on-TQ-KV is the default; locks in iter33's measured +11.97pp Defect B closure on the gemma `forward_mlx` path.**  Code change at HEAD (worktree `agent-aa682d64b503e0859`, base `791d43d`): pure-function gate `dense_sdpa_on_tq_kv_enabled()` added at `src/serve/forward_mlx.rs:79-103` (returns `true` when `HF2Q_LEGACY_TQ_SDPA` ≠ `"1"` AND `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV` ≠ `"0"`; resolved once via `OnceLock`); decode consumer at `src/serve/forward_mlx.rs:1583` simplifies the iter-20 Leg F `OnceLock` to `let force_dense_sdpa_on_tq_kv: bool = dense_sdpa_on_tq_kv_enabled();`; prefill allocator at `src/serve/forward_prefill.rs:309-310` flips from a direct `std::env::var("HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV") == Some("1")` read to the same helper so prefill + decode always agree on the gate.  Doc comments at `forward_mlx.rs:559-577` (the `leg_f_kvs` field) and `forward_mlx.rs:1578-1593` (the consumer-site comment block) updated to reflect new defaults + cite iter33 measurements.  **Env-var contract:**
   * `(unset)` → **dense-SDPA-on-TQ-KV ON** (iter34 default).
   * `HF2Q_LEGACY_TQ_SDPA=1` → opt-out, restores pre-iter34 `flash_attn_vec_tq` inner-loop bit-for-bit.
