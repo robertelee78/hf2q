@@ -1139,6 +1139,25 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         }
     }
 
+    // ADR-014 P7 iter-60 (2026-04-28): move backend creation BEFORE
+    // the materialize_all() bridge.  Backend selection is just a
+    // `match config.format` that constructs a struct — no tensor work.
+    // Moving it earlier sets up the iter-61+ conditional bridge:
+    // skip materialize_all when streaming + non-native; materialize
+    // only for the native quantize_and_write path (the trait contract
+    // requires &TensorMap).
+    //
+    // Order pre-iter-60: lazy_map → materialize_all → backend creation
+    // Order post-iter-60: lazy_map → backend creation → materialize_all
+    //
+    // Pure ordering change.  No behavior change this iter.
+    let backend: Box<dyn OutputBackend> = match config.format {
+        cli::OutputFormat::Gguf => Box::new(GgufBackend::new()),
+        cli::OutputFormat::Safetensors => {
+            Box::new(SafetensorsBackend::with_shard_size_gb(config.shard_size_gb))
+        }
+    };
+
     // ADR-014 P1 bridge: every Phase 1.x transform now lifted. The
     // streaming quantize loop (P2) will consume from `lazy_map`
     // directly; until P2 lands, bridge through `materialize_all` once,
@@ -1212,12 +1231,10 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     // ADR-014 P9 iter-1 §S5 — propagate `--shard-size-gb` (default 5.0)
     // into the safetensors emit path. The flag is ignored by the GGUF
     // backend (which writes a single .gguf file regardless of size).
-    let backend: Box<dyn OutputBackend> = match config.format {
-        cli::OutputFormat::Gguf => Box::new(GgufBackend::new()),
-        cli::OutputFormat::Safetensors => {
-            Box::new(SafetensorsBackend::with_shard_size_gb(config.shard_size_gb))
-        }
-    };
+    //
+    // ADR-014 P7 iter-60 (2026-04-28): backend creation moved BEFORE
+    // the materialize_all() bridge (above) — see iter-60 ordering note.
+    // This is now a no-op marker comment kept for git-blame continuity.
 
     if !backend.requires_native_quantization() {
         let bf16_count = tensor_map
