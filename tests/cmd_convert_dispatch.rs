@@ -753,3 +753,92 @@ fn streaming_phase3_byte_identical_dwq_4_6() {
          eager:  {eager_sha}\nstream: {stream_sha}"
     );
 }
+
+// ---------------------------------------------------------------------
+// T13: HF2Q_STREAMING_PHASE3 byte-identity for --format safetensors (iter-64)
+// ---------------------------------------------------------------------
+
+/// SHA-256 of every `.safetensors` file in a directory, concatenated
+/// in deterministic name-sorted order.  Mirrors what `file_sha256`
+/// does for GGUF but handles the multi-shard safetensors backend.
+fn safetensors_dir_sha256(dir: &Path) -> String {
+    let mut entries: Vec<std::path::PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "safetensors")
+                .unwrap_or(false)
+        })
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    assert!(
+        !entries.is_empty(),
+        "no safetensors shards in {}: convert must succeed before SHA can run",
+        dir.display()
+    );
+    let mut h = Sha256::new();
+    for p in &entries {
+        let bytes = fs::read(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
+        // Hash filename + content so rename-only changes also surface.
+        h.update(p.file_name().unwrap().as_encoded_bytes());
+        h.update(&bytes);
+    }
+    hex::encode(h.finalize())
+}
+
+/// ADR-014 P7 iter-64 — extend SHA gate to `--format safetensors`.
+/// Currently all gates use `--format gguf`; the streaming wedge also
+/// needs to be byte-identical against the SafetensorsBackend's write
+/// path.  Sharded output is hashed via `safetensors_dir_sha256` which
+/// concatenates all `.safetensors` files in name-sorted order.
+///
+/// Locks the iter-3 wire-up byte-identity contract across both output
+/// backends (GGUF + Safetensors).
+#[test]
+fn streaming_phase3_byte_identical_safetensors_q4_k_m() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let input_dir = tmp.path().join("input");
+    let eager_dir = tmp.path().join("out_eager_st");
+    let stream_dir = tmp.path().join("out_stream_st");
+    setup_p2_iter2_fixture(&input_dir);
+
+    Command::cargo_bin("hf2q")
+        .expect("hf2q binary")
+        .args([
+            "convert",
+            "--input", input_dir.to_str().unwrap(),
+            "--format", "safetensors",
+            "--quant", "q4_k_m",
+            "--output", eager_dir.to_str().unwrap(),
+            "--skip-quality",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("hf2q")
+        .expect("hf2q binary")
+        .env("HF2Q_STREAMING_PHASE3", "1")
+        .args([
+            "convert",
+            "--input", input_dir.to_str().unwrap(),
+            "--format", "safetensors",
+            "--quant", "q4_k_m",
+            "--output", stream_dir.to_str().unwrap(),
+            "--skip-quality",
+        ])
+        .assert()
+        .success();
+
+    let eager_sha = safetensors_dir_sha256(&eager_dir);
+    let stream_sha = safetensors_dir_sha256(&stream_dir);
+
+    assert_eq!(
+        eager_sha, stream_sha,
+        "safetensors q4_k_m: HF2Q_STREAMING_PHASE3=1 sharded output must \
+         be byte-identical to eager — streaming wedge regressed for the \
+         SafetensorsBackend write path\n  eager:  {eager_sha}\n  stream: {stream_sha}"
+    );
+}
