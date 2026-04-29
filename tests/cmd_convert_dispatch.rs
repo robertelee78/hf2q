@@ -842,3 +842,62 @@ fn streaming_phase3_byte_identical_safetensors_q4_k_m() {
          SafetensorsBackend write path\n  eager:  {eager_sha}\n  stream: {stream_sha}"
     );
 }
+
+// ---------------------------------------------------------------------
+// T14: HF2Q_STREAMING_PHASE3 run-to-run determinism (iter-65)
+// ---------------------------------------------------------------------
+
+/// ADR-014 P7 iter-65 — run-to-run determinism gate.
+///
+/// `quantize_streaming_parallel` distributes per-tensor quantize work
+/// across a rayon thread pool.  Per Decision 5, output is byte-identical
+/// to serial across worker counts.  This file-level gate runs the
+/// streaming convert 3× back-to-back and asserts all three GGUFs hash
+/// to the same SHA-256 — proving the rayon dispatch order doesn't
+/// introduce file-level non-determinism (e.g. via HashMap iter order
+/// or worker-stealing schedule).
+///
+/// Without this gate, a future regression that introduces a Mutex
+/// ordering or a non-deterministic accumulator would produce different
+/// SHAs across runs while still passing the eager-vs-streaming
+/// per-pair gates (since each run is byte-identical to the same eager
+/// run, but the runs differ from each other).
+#[test]
+fn streaming_phase3_run_to_run_determinism_q4_k_m() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let input_dir = tmp.path().join("input");
+    setup_p2_iter2_fixture(&input_dir);
+
+    let mut shas: Vec<String> = Vec::with_capacity(3);
+    for run in 0..3 {
+        let out_dir = tmp.path().join(format!("out_run_{}", run));
+        Command::cargo_bin("hf2q")
+            .expect("hf2q binary")
+            .env("HF2Q_STREAMING_PHASE3", "1")
+            .args([
+                "convert",
+                "--input", input_dir.to_str().unwrap(),
+                "--format", "gguf",
+                "--quant", "q4_k_m",
+                "--output", out_dir.to_str().unwrap(),
+                "--skip-quality",
+            ])
+            .assert()
+            .success();
+        shas.push(file_sha256(&locate_gguf(&out_dir)));
+    }
+
+    // All three runs must hash identically.
+    assert_eq!(
+        shas[0], shas[1],
+        "run 0 vs run 1: streaming convert is non-deterministic\n  \
+         run 0: {}\n  run 1: {}",
+        shas[0], shas[1]
+    );
+    assert_eq!(
+        shas[1], shas[2],
+        "run 1 vs run 2: streaming convert is non-deterministic\n  \
+         run 1: {}\n  run 2: {}",
+        shas[1], shas[2]
+    );
+}
