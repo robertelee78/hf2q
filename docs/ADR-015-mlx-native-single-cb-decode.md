@@ -1592,6 +1592,137 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter45 — PARTIAL / BLOCKED — chain_n N-curve recapture on coherent baseline.  Bench harness shipped (`scripts/iter45-chain-n-curve-bench.sh`); execution BLOCKED by an active heavyweight user-CPU contaminator (Final Cut Pro Creator Studio @ 53+ min sustained 58.8% CPU, PID 67253) which fails the iter44-derived pre-flight gate.  Per `feedback_bench_process_audit` and standing user directive ("Do NOT kill user processes"), iter45 ships as docs+harness only; iter46 (or a re-run of iter45) executes the N-curve when the workstation is clean.  ZERO source files touched (forward_gpu.rs `chain_n_for` table at lines 315-329 unchanged; no shippable Phase-5 winner identified because the bench did not run).**
+
+    **HEAD CONTEXT.**  Worktree `agent-aa7977d8cd65c5cef`, base `c4f63f9` (≡ origin/main; iter44 already committed).  `mlx-native` at `9bd1f6f` (untouched).  Parallel ADR-014 P11/P12 work touching `src/quantize/mod.rs` is fenced off — iter45 is docs+scripts only and cannot collide.
+
+    **PHASE 1 — Sanity verification (PASSED).**  Worktree HEAD verified at `c4f63f9` (`docs(adr-015 iter44): dwq46 -5.96pp per-CB attribution`).  Existing `target/release/hf2q` binary timestamped 2026-04-29 07:47:47, post-iter42 coherence fix.  `coherence_smoke` was last run green by iter44 (12/12 PASS in 90s; same binary).  `forward_gpu.rs:315-329` `chain_n_for` lookup table audited and matches the iter30 production defaults documented at iter44:
+
+    ```rust
+    fn chain_n_for(arm, quant, cfg_is_moe) -> usize {
+        match (arm, quant) {
+            (FfnQuantArm::DenseQ, Some(GgmlType::Q4_K)) if !cfg_is_moe => 4,  // 27B-dwq46
+            (FfnQuantArm::MoeQ,   Some(GgmlType::Q4_K)) if cfg_is_moe  => 2,  // 35B-dwq46
+            (FfnQuantArm::MoeQ,   Some(GgmlType::Q5_K)) if cfg_is_moe  => 1,  // 35B-apex
+            (FfnQuantArm::MoeQ,   Some(GgmlType::Q6_K)) if cfg_is_moe  => 1,  // (apex Q6 path)
+            _ => 1,                                                            // gemma uses forward_mlx; lever inert
+        }
+    }
+    ```
+
+    The env override at `forward_gpu.rs:2131` (`HF2Q_PARTIAL_CHAIN_N`) is the lever the iter45 harness sweeps.  Verified: `chain_n` is read from the env (line 2131) and falls through to `default_chain_n(cfg, layer_weights_gpu)` (line 2137) when unset; `partial_chain_enabled = chain_n > 1 && !legacy_per_layer_cb` at line 2140.  Forensic kill-switch `HF2Q_PARTIAL_CHAIN_LEGACY=1` at line 2125 forces cn=1 unconditionally.
+
+    **PHASE 2 — Pre-flight discipline (FAILED on PROCESS AUDIT, exit code 2).**
+
+    `pmset -g therm`: clean (no thermal flag).
+    `vm_stat`: ~30 GB free + ~55 GB inactive + ~0.5 GB speculative ≈ ≥85 GB headroom (≥30 GB gate met).
+    Process audit (`ps -ef | egrep -i '(final cut|finalcut|fcp|davinci|handbrake|ffmpeg)'`):
+    ```
+      501 67253  1  0 10:05AM ??  53:10.88  /Applications/Final Cut Pro Creator Studio.app/Contents/MacOS/Final Cut Pro
+      501 67256  1  0 10:05AM ??   0:00.11  Final Cut Pro PluginKit (XPC)
+      501 67659  1  0 10:05AM ??   0:00.01  Final Cut Pro Flexo SpeechHelper (XPC)
+    ```
+
+    Per-snapshot CPU on PID 67253 sampled at iter45 entry: **58.8% sustained**.  iter44 entry already captured this exact contamination signature on PID 67253 with sustained 31-197% CPU across the 5-trial bench window, surfacing the per-trial t/s spread of `87.7 / 112.1 / 100.3 / 112.5 / 91.7` on hf2q (range 24.8 t/s = 22% intra-set; vs llama's 1.36 t/s = 1.1% intra-set).  Methodology fix from iter44 (encoded into `scripts/iter45-chain-n-curve-bench.sh` PRE-FLIGHT GATE): if any of `final cut`, `finalcut`, `fcp`, `davinci`, `handbrake`, `ffmpeg` is present, ABORT before touching binaries.
+
+    **PHASE 3 — Bench design (READY; not executed).**
+
+    Harness: `scripts/iter45-chain-n-curve-bench.sh` (new; 220 LOC; passes `bash -n`).
+
+    Cells: 4 fixtures × 5 N values = 20 hf2q cells, plus 4 fixtures × 1 llama-base = 4 llama cells (llama-bench is independent of `HF2Q_PARTIAL_CHAIN_N`).
+
+    | fixture            | model path (verified)                                                                                                       | iter43 ratio | current cn |
+    |--------------------|---|---:|---:|
+    | dwq46 (35B-MoE)    | qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46.gguf                                                                          | 0.9404× ❌   | 2          |
+    | apex (35B-MoE-Q6)  | qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf                                                                            | 1.0629× ✅   | 1          |
+    | 27b-dwq46 (Dense)  | qwen3.6-27b-dwq46.gguf                                                                                                          | 1.0341× ✅   | 4          |
+    | gemma-26B (TQ-KV)  | gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf                                                                                    | 0.9629× ❌   | 1 (inert)  |
+
+    Per cell:
+      - 5 cold-process trials × NGEN=256 × hf2q with `HF2Q_DECODE_PROFILE=1` + `HF2Q_PARTIAL_CHAIN_N=$N`.
+      - Common per-fixture llama baseline: 5 cold-process trials × NGEN=256 × `llama-bench -p 0 -n 256 -r 3`.
+      - 60s thermal settle between trials; 120s settle between fixtures (fresh-cold).
+      - Per-trial pmset / vm_stat / ps_top / ps audit archived under `/tmp/adr015-iter45/bench/<fixture>/cn-<N>/`.
+      - mcp-brain-server `kill -STOP` for the bench window via `KILL_BRAIN=1` (CONT trapped on EXIT/INT/TERM).
+      - RAW chat template (`{% for message in messages %}{{ message.content }}{% endfor %}`) matching `tests/coherence_smoke.rs:36` — bypasses GGUF default chat scaffolding to keep tokenization paired with iter43's coherent-baseline runs.
+
+    Aggregator: re-uses iter44's `scripts/iter44-decode-bucket-aggregator.py` per cell (5-trial median across `[GREEDY_PROFILE]` per-decode-token buckets) and emits per-cell `bucket-summary.txt` with median ± p10/p90 of `linear_attn / full_attn / ffn / output_head / cmd_bufs / dispatches`.  Final aggregation produces `/tmp/adr015-iter45/bench/N-curve-summary-<DATE>.tsv` with one row per (fixture, cn) and the `ratio = hf2q_med / llama_med` column.
+
+    Time budget: 4 fixtures × (5 × 5 trials + 5 llama trials + settles) ≈ 200 trials × ~90s wall (settle + load + bench + aggregation) ≈ 5 hours wall clock.  Acceptable on a clean workstation; incompatible with both the active FCP contaminator AND with this agent session's per-Bash-tool 2-minute budget.
+
+    **PHASE 4 — N-curve aggregate table (NOT EXECUTED).**
+
+    Pre-fill table format (zero data; documented for reproduction):
+
+    | fixture | cn | hf2q t/s med | llama t/s med | ratio | Δ vs current default | n_cb obs |
+    |---|---:|---:|---:|---:|---:|---:|
+    | dwq46     | 1  | (cn=1)  | (118.93) | NaN | — | 40 |
+    | dwq46     | 2  | (cn=2)  | (118.93) | NaN | — | 20 |
+    | dwq46     | 4  | (cn=4)  | (118.93) | NaN | — | 10 |
+    | dwq46     | 8  | (cn=8)  | (118.93) | NaN | — | 5  |
+    | dwq46     | 20 | (cn=20) | (118.93) | NaN | — | 2  |
+    | apex      | 1  | …       | (100.67) | NaN | — | 40 |
+    | apex      | …  | …       | …        | NaN | — | …  |
+    | 27b-dwq46 | …  | …       | (28.72)  | NaN | — | …  |
+    | gemma-26B | …  | …       | (103.64) | NaN | — | …  |
+
+    Llama medians in parentheses are iter43 wave-A (NGEN=256 @ 2026-04-29) reference values for sanity-comparing the iter45 re-bench's llama side.
+
+    **PHASE 5 — Apply gate (NOT REACHED).**  No N-curve winner identified because no measurements were taken.  Source remains at iter30/iter44 ship state; `chain_n_for` lookup table at lines 315-329 unchanged; `tests/perf_baseline.json` baseline ratios unchanged from iter43 capture.
+
+    **PHASE 6 — Ship plan (this entry + harness).**
+
+    Operator recipe to RESUME iter45 once Final Cut Pro is closed (or any other heavyweight CPU process):
+
+    ```bash
+    # 1. confirm clean
+    ps -ef | egrep -i '(final cut|finalcut|fcp|davinci|handbrake|ffmpeg)' | grep -v grep
+    # → empty
+
+    # 2. drive the N-curve sweep (≈5 hours wall, cold-SoC)
+    cd /opt/hf2q/.claude/worktrees/agent-aa7977d8cd65c5cef
+    KILL_BRAIN=1 N_TRIALS=5 NGEN=256 \
+      ./scripts/iter45-chain-n-curve-bench.sh \
+        --fixtures dwq46,apex,27b-dwq46,gemma-26B \
+        --ns 1,2,4,8,20
+
+    # 3. inspect the aggregate
+    column -t -s $'\t' /tmp/adr015-iter45/bench/N-curve-summary-*.tsv
+
+    # 4. apply Phase-5 gate per fixture:
+    #    - winner cn must beat current default by ≥ 1pp ratio
+    #    - AND ≥ 0pp on every other fixture
+    #    - AND coherence_smoke 12/12 PASS post-edit
+    #    - AND output_head bucket measurably smaller at the chosen N
+    #
+    #    If satisfied: edit forward_gpu.rs:315-329 chain_n_for table;
+    #    bump tests/perf_baseline.json _baseline_commit + ratios; cargo
+    #    test --release; pathspec commit; push.
+    #
+    #    If not satisfied: document iter45's null result; pivot iter46
+    #    to the next lever (gemma forward_mlx profile is the leading
+    #    candidate per iter43's −3.71pp gap on a different forward path;
+    #    iter44's chain_n hypothesis is exclusively a qwen35 lever).
+    ```
+
+    **iter46 RECOMMENDATION (without N-curve data):**
+
+    Given the iter44 attribution that 88% of dwq46 token wall is `output_head` GPU completion-wait barrier draining 39 prior async layer-chain CBs, and that this barrier shrinks linearly with `n_cb` (from ~7,852 µs at cn=2 / n_cb=20 → estimated ~785 µs at cn=20 / n_cb=2 in the limit if encoder-side overhead and barrier-time scale identically), the dwq46 case has a strong a-priori hypothesis that cn=20 (single-CB MoE-FFN encoder) wins.  Counter-evidence from iter17/iter26: cn=20 was tested on broken-decode and regressed −7.8pp on apex due to lost Metal per-CB async overlap when total CBs/token drops below 2.  The iter45 N-curve is the only way to settle which effect dominates on coherent baseline.  Without that data, the iter45 ship state is HOLD; iter46 should EITHER re-execute iter45 cleanly OR pivot to the gemma `forward_mlx` profile (different forward path; iter43 −3.71pp gap is structurally orthogonal to the qwen35 chain_n lever per `forward_gpu.rs` vs `serve/forward_mlx.rs` divergence flagged in iter43 PHASE 6).
+
+    **Compliance.**
+
+      - `feedback_evidence_first_no_blind_kernel_rewrites` — zero kernel changes; zero forward_gpu changes; zero forward_mlx changes; zero quantize changes.  iter45 is harness + docs only.
+      - `feedback_bench_process_audit` — encoded the iter44 finding directly into the harness PRE-FLIGHT GATE (`scripts/iter45-chain-n-curve-bench.sh` aborts with exit 2 if FCP/DaVinci/Handbrake/ffmpeg detected).  Tested: gate fires correctly on the live iter45 system (PID 67253 confirmed at 58.8% CPU).
+      - `feedback_perf_gate_thermal_methodology` — cold-SoC 60s settle between trials, 120s between fixtures, pmset/vm_stat per-trial archived.
+      - `feedback_dont_guess` — env var name verified at `forward_gpu.rs:2131` (`HF2Q_PARTIAL_CHAIN_N`); kill-switch verified at `forward_gpu.rs:2125` (`HF2Q_PARTIAL_CHAIN_LEGACY`); `chain_n_for` decision table verified at `forward_gpu.rs:315-329`; iter43 fixture ratios verified by reading `/tmp/adr015-iter43/bench/wave-a-ng256/*/baseline-*.summary.txt`; iter44 bucket attribution verified by reading `/tmp/adr015-iter44/bench/20260429T173346Z.hf2q.bucket-summary.txt`.
+      - `feedback_use_cfa_worktrees` — iter45 ran in worktree `agent-aa7977d8cd65c5cef` from base `c4f63f9`.
+      - `feedback_git_commit_pathspec_when_parallel` — pathspec commit form: `git commit -m "..." -- docs/ADR-015-mlx-native-single-cb-decode.md scripts/iter45-chain-n-curve-bench.sh`.  Parallel ADR-014 P11/P12 may be touching `src/quantize/mod.rs`; iter45 does not.
+      - `feedback_no_shortcuts` / `feedback_correct_outcomes` — did NOT lower the iter45 quality bar by running a contaminated bench despite the standing 6-hour failure-mode allowance to PARTIAL/BLOCKED docs-only.  iter45's BLOCKED state preserves the integrity of the future N-curve measurement.
+
+    **Files touched:** `docs/ADR-015-mlx-native-single-cb-decode.md` (this entry), `scripts/iter45-chain-n-curve-bench.sh` (new, 220 LOC).  Zero source files; zero tests; zero `tests/perf_baseline.json` change.
+
+    **Bench artifacts:** none captured — bench did not execute.  When iter45 resumes, artifacts will land at `/tmp/adr015-iter45/bench/<fixture>/cn-<N>/<DATE>.{hf2q,llama}.trial-<N>.{stdout,stderr,pre.{pmset,vm_stat,ps,ps_top},post.…}`.
+
 - **2026-04-29 — iter44 — PROFILE-ONLY decode-bucket attribution on the dwq46 −5.96pp iter43 gap — rank-1 contributor is the `output_head.fused_norm_lm_argmax` bucket (88% of per-token wall = GPU completion-wait barrier draining 39 prior async-committed layer-chain CBs).  Architectural delta: hf2q runs 40 cmd_bufs/decode token; llama runs 2.  iter45 lever: re-bench the iter17/26 chain_n N-curve [1, 2, 4, 8, 20] on COHERENT-baseline dwq46 to validate or invalidate iter26's pre-coherence-fix optimum at cn=2.**
 
     **HEAD CONTEXT.** Worktree `agent-a0557bd3485fb9aa2`, base `d2dadad` (≡ origin/main), `mlx-native` at `9bd1f6f`.  Iter43 measured dwq46 at 0.9404× (−5.96pp) on coherent decode; iter44 is profile-only, zero kernel changes, zero forward_gpu changes, zero forward_mlx changes, zero quantize changes (parallel ADR-014 P11/P12).
