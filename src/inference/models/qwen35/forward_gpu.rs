@@ -63,6 +63,7 @@ use super::gpu_full_attn::{
 use super::io_heads::embed_tokens;
 use super::kv_cache::HybridKvCache;
 use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
+use super::Qwen35Config;
 use mlx_native::ops::argmax::dispatch_argmax_f32;
 use mlx_native::ops::fused_norm_add::dispatch_fused_residual_norm_f32;
 use mlx_native::ops::rms_norm;
@@ -282,6 +283,73 @@ enum FfnWeightsGpu {
     Moe(MoeFfnWeightsGpu),
     /// Quantized MoE (production GGUF load path — no OOM).
     MoeQ(MoeFfnWeightsGpuQ),
+}
+
+// ================================================================
+// ADR-015 iter30: per-quant-class chain_n default
+// ================================================================
+
+/// Quant-class arm tag for the iter30 `chain_n` lookup table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FfnQuantArm {
+    /// Quantized dense FFN (DenseQ).
+    DenseQ,
+    /// Quantized MoE FFN (MoeQ).
+    MoeQ,
+    /// Non-quantized arm (Dense F32, F32-MoE, BF16) or empty model.
+    Other,
+}
+
+/// Pure lookup function — does NOT touch GPU buffers, easy to unit-test.
+///
+/// Decision matrix (iter26 N-curve + iter27 GPU TS + iter29 capture wall):
+///
+///   - DenseQ + Q4_K (any K-quant Q4_K subtype):       cn = 4
+///   - MoeQ   + Q4_K:                                  cn = 2
+///   - MoeQ   + Q5_K / Q6_K (super-block):             cn = 1  (apex flat-negative)
+///   - any other (F32/BF16/F16/Q4_0/Q8_0/I16, etc.):   cn = 1
+///
+/// `cfg_is_moe` is the cross-check from `cfg.moe.is_some()` — if it
+/// disagrees with `arm`, fall through to cn=1 (defensive against
+/// mid-loaded mismatched configs).
+fn chain_n_for(
+    arm: FfnQuantArm,
+    quant: Option<mlx_native::ops::quantized_matmul_ggml::GgmlType>,
+    cfg_is_moe: bool,
+) -> usize {
+    use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+    match (arm, quant) {
+        (FfnQuantArm::DenseQ, Some(GgmlType::Q4_K)) if !cfg_is_moe => 4,
+        (FfnQuantArm::MoeQ, Some(GgmlType::Q4_K)) if cfg_is_moe => 2,
+        (FfnQuantArm::MoeQ, Some(GgmlType::Q5_K)) if cfg_is_moe => 1,
+        (FfnQuantArm::MoeQ, Some(GgmlType::Q6_K)) if cfg_is_moe => 1,
+        // Any other quant class, F32-arm, or arm/cfg mismatch → conservative cn=1.
+        _ => 1,
+    }
+}
+
+/// Lookup table for the autodefault `HF2Q_PARTIAL_CHAIN_N` value when the
+/// env var is unset.  Inputs are derived from layer 0 of the loaded model.
+///
+/// HF2Q_PARTIAL_CHAIN_N (any N≥1) overrides this table.  HF2Q_PARTIAL_CHAIN_LEGACY=1
+/// forces cn=1 unconditionally (forensic A/B).
+fn default_chain_n(cfg: &Qwen35Config, layer_weights_gpu: &[LayerWeightsGpu]) -> usize {
+    // Find the first layer with a quantized FFN — this fixture's quant class.
+    // Mixed-arch (e.g. some layers MoeQ, others DenseQ) is not a production
+    // shape on Qwen3.5/3.6; if encountered, layer 0 wins and the rest follow.
+    let first_quant_ffn = layer_weights_gpu.iter().find_map(|lg| {
+        let ffn = match lg {
+            LayerWeightsGpu::FullAttn { ffn, .. } | LayerWeightsGpu::LinearAttn { ffn, .. } => ffn,
+        };
+        match ffn {
+            FfnWeightsGpu::DenseQ(w) => Some((FfnQuantArm::DenseQ, Some(w.ggml_type_gate_up))),
+            FfnWeightsGpu::MoeQ(w) => Some((FfnQuantArm::MoeQ, Some(w.ggml_type_gate_up))),
+            _ => None,
+        }
+    });
+
+    let (arm, quant) = first_quant_ffn.unwrap_or((FfnQuantArm::Other, None));
+    chain_n_for(arm, quant, cfg.moe.is_some())
 }
 
 // ================================================================
@@ -2032,11 +2100,43 @@ impl Qwen35Model {
         // group are single_cb_eligible).  On non-eligible layers the chain
         // commits early and resumes at the next eligible layer.  For dwq46
         // (40 layers, all MoeQ) and 27B-dwq46 (64 DenseQ) groups are uniform.
-        let chain_n: usize = std::env::var("HF2Q_PARTIAL_CHAIN_N")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n: &usize| n >= 1)
-            .unwrap_or(1);
+        //
+        // ---- ADR-015 iter30: per-quant-class chain_n default ----
+        //
+        // iter26 N-curve (5-trial cold-SoC, NGEN=256, async-mode wall) +
+        // iter27 per-CB GPU TS verification + iter29 capture-side wall on
+        // CPU-side ObjC-bridge attribution converge on a per-(arch,
+        // quant-class) lookup table:
+        //
+        //   | arch  | quant     | best cn | iter26 Δpp |
+        //   |-------|-----------|--------:|-----------:|
+        //   | dense | Q4_K_*    |       4 |     +3.91  | 27B-DWQ46
+        //   | MoE   | Q4_K_*    |       2 |     +1.27  | 35B-DWQ46
+        //   | MoE   | Q5_K_*/Q6_K |     1 |     -3.47  | 35B-apex (cn≥2 regressed)
+        //   | (any other path)  |       1 |       n/a  | safe fallback
+        //
+        // Gemma is on a different forward path (qwen35::forward_gpu_greedy
+        // is not invoked); its `Defect B` -16.25pp gap is iter31+ territory.
+        //
+        // HF2Q_PARTIAL_CHAIN_N env override remains AUTHORITATIVE — user can
+        // set 1 to opt out of the autodefault, or any N≥2 to override the
+        // shipped lookup-table value.  HF2Q_PARTIAL_CHAIN_LEGACY=1 forces
+        // cn=1 always (forensic A/B per iter17 sunset pattern).
+        let force_legacy_chain = std::env::var_os("HF2Q_PARTIAL_CHAIN_LEGACY")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let chain_n: usize = if force_legacy_chain {
+            1
+        } else {
+            match std::env::var("HF2Q_PARTIAL_CHAIN_N")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n >= 1)
+            {
+                Some(n) => n,
+                None => default_chain_n(cfg, layer_weights_gpu),
+            }
+        };
         let partial_chain_enabled = chain_n > 1 && !legacy_per_layer_cb;
 
         // Persistent partial-chain encoder.  None when partial_chain_enabled
@@ -2961,6 +3061,92 @@ mod tests {
         default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35Variant,
     };
     use mlx_native::MlxDevice;
+
+    // ============================================================
+    // ADR-015 iter30: per-quant-class chain_n default lookup table
+    // ============================================================
+    //
+    // Pure-function tests for `chain_n_for` covering the four production
+    // cells called out in the iter29 §iter30 NEXT STEP decision matrix
+    // plus defensive fallbacks (mismatched arm, unsupported quant).
+
+    #[test]
+    fn chain_n_for_27b_dense_q4km_returns_4() {
+        // 27B-DWQ46 (qwen3.6-27B dense Q4_K_M): peak inverted-U at cn=4 (+3.91pp).
+        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+        assert_eq!(
+            chain_n_for(FfnQuantArm::DenseQ, Some(GgmlType::Q4_K), false),
+            4
+        );
+    }
+
+    #[test]
+    fn chain_n_for_dwq46_moe_q4km_returns_2() {
+        // 35B-DWQ46 (Qwen3.5/3.6 MoE Q4_K_M): cn=2 (+1.27pp), monotone-down beyond.
+        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+        assert_eq!(
+            chain_n_for(FfnQuantArm::MoeQ, Some(GgmlType::Q4_K), true),
+            2
+        );
+    }
+
+    #[test]
+    fn chain_n_for_apex_moe_q5km_returns_1() {
+        // 35B-apex (MoE Q5_K_M): cn=1 — cn≥2 regressed at every N (-3.47pp at cn=2).
+        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+        assert_eq!(
+            chain_n_for(FfnQuantArm::MoeQ, Some(GgmlType::Q5_K), true),
+            1
+        );
+    }
+
+    #[test]
+    fn chain_n_for_apex_moe_q6k_returns_1() {
+        // Apex GGUFs sometimes have Q6_K down — same MoE flat-negative regime.
+        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+        assert_eq!(
+            chain_n_for(FfnQuantArm::MoeQ, Some(GgmlType::Q6_K), true),
+            1
+        );
+    }
+
+    #[test]
+    fn chain_n_for_unknown_quant_returns_1() {
+        // Q4_0, Q8_0, F32, F16: conservative cn=1 (no measured win).
+        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+        assert_eq!(
+            chain_n_for(FfnQuantArm::DenseQ, Some(GgmlType::Q4_0), false),
+            1
+        );
+        assert_eq!(
+            chain_n_for(FfnQuantArm::MoeQ, Some(GgmlType::Q8_0), true),
+            1
+        );
+    }
+
+    #[test]
+    fn chain_n_for_other_arm_returns_1() {
+        // Dense F32 / F32-MoE / no-quant unit-test fixtures fall back to cn=1.
+        assert_eq!(chain_n_for(FfnQuantArm::Other, None, false), 1);
+        assert_eq!(chain_n_for(FfnQuantArm::Other, None, true), 1);
+    }
+
+    #[test]
+    fn chain_n_for_arm_cfg_mismatch_returns_1() {
+        // Defensive: if loaded weights say MoeQ but cfg.moe.is_none() (or vice versa),
+        // fall through to cn=1 instead of trusting an inconsistent config.
+        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+        // DenseQ Q4_K but cfg.moe.is_some() = true → mismatch.
+        assert_eq!(
+            chain_n_for(FfnQuantArm::DenseQ, Some(GgmlType::Q4_K), true),
+            1
+        );
+        // MoeQ Q4_K but cfg.moe.is_some() = false → mismatch.
+        assert_eq!(
+            chain_n_for(FfnQuantArm::MoeQ, Some(GgmlType::Q4_K), false),
+            1
+        );
+    }
 
     fn mk_rand(seed: &mut u32, n: usize, scale: f32) -> Vec<f32> {
         (0..n)
