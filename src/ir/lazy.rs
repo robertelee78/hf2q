@@ -411,6 +411,23 @@ impl LazyTensorMap {
         self.inner.iter()
     }
 
+    /// ADR-014 P7 iter-54 — total bytes across all tensors, computed
+    /// metadata-only.  Mirrors `TensorMap::total_size_bytes` but
+    /// without requiring materialisation: each `LazyMeta::byte_len`
+    /// is pre-computed at construction (`numel × dtype.element_size()`)
+    /// per `LazyMeta::new` invariant.
+    ///
+    /// Required by the iter-3 wholesale-skip plan (iter-53 survey)
+    /// for `main.rs:1166`'s telemetry call site:
+    /// `tensor_map.total_size_bytes()` → `lazy_map.total_size_bytes()`.
+    ///
+    /// Byte-equality to `TensorMap::total_size_bytes` after a round-trip
+    /// through `materialize_all()` is verified by
+    /// `total_size_bytes_matches_post_materialize`.
+    pub fn total_size_bytes(&self) -> usize {
+        self.inner.values().map(|t| t.meta().byte_len).sum()
+    }
+
     /// Iterate names in deterministic order. Metadata-only.
     pub fn names(&self) -> impl Iterator<Item = &String> {
         self.inner.keys()
@@ -744,6 +761,56 @@ mod tests {
             MaterializeError::Io { name, .. } => assert_eq!(name, "io"),
             _ => panic!("expected Io"),
         }
+    }
+
+    /// ADR-014 P7 iter-54 — `LazyTensorMap::total_size_bytes` matches
+    /// `TensorMap::total_size_bytes` after a round-trip through
+    /// `materialize_all()`.  Mid-step in the iter-3 wholesale-skip
+    /// plan: this is the metadata-only telemetry helper that lets
+    /// `main.rs:1166` swap from eager to lazy without changing any
+    /// measured values.
+    ///
+    /// Multi-tensor + multi-dtype fixture: F32, F16, BF16, U8 — covers
+    /// every dtype's `element_size()` cell.
+    #[test]
+    fn test_total_size_bytes_matches_post_materialize() {
+        let mut lazy_map = LazyTensorMap::new();
+        // F32: 4 bytes × 2 elems = 8
+        lazy_map.insert(LazyTensor::from_bytes(
+            meta("a", vec![2], DType::F32),
+            vec![0u8; 8],
+        ));
+        // F16: 2 bytes × 6 elems = 12
+        lazy_map.insert(LazyTensor::from_bytes(
+            meta("b", vec![3, 2], DType::F16),
+            vec![0u8; 12],
+        ));
+        // BF16: 2 bytes × 4 elems = 8
+        lazy_map.insert(LazyTensor::from_bytes(
+            meta("c", vec![4], DType::BF16),
+            vec![0u8; 8],
+        ));
+        // U8: 1 byte × 5 elems = 5
+        lazy_map.insert(LazyTensor::from_bytes(
+            meta("d", vec![5], DType::U8),
+            vec![0u8; 5],
+        ));
+
+        let lazy_total = lazy_map.total_size_bytes();
+        let expected = 8 + 12 + 8 + 5;
+        assert_eq!(
+            lazy_total, expected,
+            "lazy total_size_bytes computes byte_len from metadata"
+        );
+
+        // Round-trip through materialize_all → eager TensorMap.
+        let eager = lazy_map.materialize_all().expect("materialize");
+        assert_eq!(
+            eager.total_size_bytes(),
+            lazy_total,
+            "lazy total_size_bytes must match TensorMap::total_size_bytes \
+             post-materialize — iter-3 telemetry swap is byte-identical"
+        );
     }
 
     #[test]
