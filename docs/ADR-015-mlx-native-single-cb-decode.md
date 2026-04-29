@@ -1592,6 +1592,39 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter36 — CEILING DECLARED (READ-ONLY AUDIT) — autonomous-loop lever space confirmed exhausted; remaining gap requires multi-week kernel rewrites.**  Per iter35's recommendation status (line 1606), iter36 conducted a comprehensive read-only audit at HEAD `10f8662` of the unexplored lever surface to either find an autonomous-feasible iter37 lever or confirm the ceiling with structural evidence.  Audit artifact: `/tmp/iter36-audit.md` (~1500 words, 8 sections).  Zero source edits, zero benches, zero fixtures loaded.  Findings:
+
+    **(1) iter32 candidate inventory closed.**  Candidate A FALSIFIED iter35 (+0.00pp); Candidate C LANDED iter34 (+11.86pp); Candidate D out of scope (prefill, not decode).  Only Candidate B (FA-tq-hb 4-simdgroup re-tile) remained unresolved — flagged HIGH risk + multi-week from inception.
+
+    **(2) K-quant kernel-class divergence does NOT generalize.**  iter35's structural finding — that mlx-native Q8_0 partitions ROWS while llama.cpp partitions K-blocks via cross-simdgroup shmem reduction — was audited against Q4_0, Q4_K, Q5_K, Q6_K to test for transferability.  Result: byte-equivalent algorithm class on ALL K-quants AND on Q4_0.  Cross-fence verification:
+    - **Q4_0** (primary dwq46 hot kernel, gguf.GGUFReader confirms 474/487 tensors are Q4_0 — ADR's "Q4_K" terminology is shorthand, NOT on-disk type): mlx-native `quantized_matmul_id_ggml.metal:148` `first_row = (r0 * nsg + sgitg) * nr` + simd_sum reduce at line 183 vs llama.cpp `ggml-metal.metal:3374` `r0 = (tgpig.x*NSG + sgitg)*NR0` + simd_sum at line 3437 (helper_mv_reduce_and_write **commented out** at line 3434 for Q4_0).  Both 64 threads/tg, 8 rows/tg, NSG=2, NR0=4.  **Byte-equivalent.**
+    - **Q6_K** (gemma attn + dense+MoE gate/up): mlx-native `quantized_matmul_id_ggml.metal:541` `row = 2*r0 + sgitg` + simd_sum at 581 vs llama.cpp `ggml-metal.metal:7968-8074` template common pattern at impl.h:57-58 (NSG=2, NR0=2).  **Byte-equivalent algorithm class.**
+    - **Q5_K** (mlx-native at 410: `row = 2*r0 + sgitg`; llama.cpp impl.h:54-55 NSG=2 NR0=1).  Same class.
+    - **Q8_0** is the ONLY format where llama.cpp uses cross-sg shmem reduction (`ggml-metal.metal:3573-3657` + `helper_mv_reduce_and_write` at line 3313-3352) — exactly as iter35 found.  But iter35's host-side geometry port at +0.00pp closes that lever for autonomous iteration; full kernel rewrite would be multi-week.
+
+    **(3) Flash-attention geometry on gemma is ALREADY matched.**  iter32-audit.md cited a 4× geometry gap (mlx-native NSG=1 vs llama.cpp NSG=2/4).  Verification at HEAD against llama.cpp's template specializations (`ggml-metal.metal:7185-7190`): at gemma's actual head dims (dk=256, dk=512), llama.cpp ALSO uses **NSG=1** (last template arg in `<FA_TYPES, half4, 1, ..., 256, 256, 1>` at line 7186).  iter32's 4× claim was for dk=32/dk=96 templates, not gemma's production dk values.  No geometry port to do; Candidate B becomes a full kernel re-architecture (multi-week).
+
+    **(4) qwen3.6 SDPA decode already uses cross-simdgroup shmem reduction with adaptive n_sg.**  `/opt/mlx-native/src/ops/sdpa_decode.rs:53-60` ramps n_sg ∈ {1,2,4} on kv_seq_len thresholds {32, 128}; this matches llama.cpp's `nsg = std::min(4, (ne00+127)/128)` at `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.cpp:753`.  qwen3.6 SDPA decode is on par with llama.cpp.
+
+    **(5) Autonomous-feasibility filter — zero levers remain.**  Top candidates ranked:
+
+    | Cand | Δpp pred | Cost | Autonomous? |
+    |------|---------:|-----:|:-----------:|
+    | B — FA-vec inner-loop multi-tile rewrite (gemma) | +1.0…+3.0 | multi-week | ❌ |
+    | E — fused MoE mega-kernel (dwq46) | +3.0…+5.0 | multi-week | ❌ — sister swiglu-fused mv_id Q4_0 already −1.5pp at iter28 |
+    | F — Q8_0 K-axis partition kernel rewrite (gemma) | unknown | multi-week | ❌ |
+    | G — `mem_ranges` dataflow check port | 0pp | multi-day | n/a (not perf) |
+    | I — GGUF quant-mix recompose | unknown | multi-day | ❌ violates `feedback_speed_bar_full_matrix` |
+    | J — TQ-encode skip on dwq46 (mirror iter34 lesson) | n/a | n/a | ❌ dwq46 forward path is `forward_gpu` with F32 dense KV — NO TQ to skip; mechanism inapplicable |
+
+    All autonomous-feasible levers (config flips, gate flips, host-side geometry) either already shipped or measured at +0.00pp.  Multi-week kernel-rewrite candidates explicitly out of autonomous scope per `feedback_evidence_first_no_blind_kernel_rewrites` (negative same-class prior on dwq46) and missing prerequisite (Metal System Trace per-kernel attribution, the §P3a'' Wave 2c hard gate #1, never satisfied).
+
+    **(6) Verdict: ceiling declared with structural evidence.**  ADR-015 closes at iter36 in the ceiling-declared state.  Durable HEAD = iter34 ship state (`a46bd5e`).  3/4 cells at ≥1.00× (apex 1.0546×, 27b 1.1148×); 2/4 below (gemma 0.9531×, dwq46 0.9415×).  Per `feedback_correct_outcomes`: honest ceiling > false claim of progress.  Per `feedback_speed_bar_full_matrix`: durable below-bar status recorded; standing pin remains active for any future architectural budget allocation.
+
+    **iter37+ outlook (out of autonomous loop).**  If ADR-015 reopened under multi-week budget, highest-EV candidate is **Candidate E (custom MoE mega-kernel for dwq46)** — largest predicted ceiling (+3-5pp), failing fixture closest to absolute gate (0.9415× vs 0.9587× = 1.7pp deficit).  Pre-conditions: (a) MST per-kernel attribution on paired dwq46 vs apex cn=1 trial pair (Wave 2c hard gate #1), (b) sister-kernel design research to avoid the iter28 swiglu-fused mv_id Q4_0 negative prior.  Multi-week.  For gemma, **Candidate F (Q8_0 K-axis partition + shmem reduce kernel port)** is the only structurally-divergent kernel where rewrite has measured prior of +0.00pp (host-side only) — in-kernel rewrite remains untested.  Multi-week.
+
+    **Compliance:** `feedback_evidence_first_no_blind_kernel_rewrites` (read-only audit, no code touched), `feedback_dont_guess` (live HEAD line numbers + GGUFReader on production GGUFs), `feedback_correct_outcomes` (honest ceiling declaration, no shortcut to "near enough"), `feedback_no_shortcuts` (multiple candidate kernels scanned: Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, FA-vec, SDPA-decode, MoE-id, fused-swiglu — not just "the obvious one"), `feedback_use_cfa_worktrees` (n/a; read-only), `feedback_git_commit_pathspec_when_parallel` (pathspec on commit).  Audit artifact: `/tmp/iter36-audit.md`.  No code changes.  No bench runs.
+
 - **2026-04-29 — iter35 — FALSIFIED — Q8_0 mat-vec 4-simdgroup re-tile gives NULL Δ on gemma.**  Per iter32 audit Candidate A: re-tile mlx-native's Q8_0 mat-vec from 64 threads/tg → 128 threads/tg (4 simdgroups) to match llama.cpp's `N_SG_Q8_0=4` geometry at `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-impl.h:39-65`.  Agent built the patched mlx-native + hf2q in worktree, ran 3-trial gemma bench (A=4SG, C=control) before worktree was wiped mid-bench by harness reset (binary path became invalid → all subsequent trials returned empty stdout / md5 `d41d8cd98f00b204e9800998ecf8427e`).  Captured 3 valid gemma trials:
 
     | side | per-trial t/s        | median  | ratio vs llama 105.02 | Δpp vs C |
