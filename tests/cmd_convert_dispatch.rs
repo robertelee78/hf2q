@@ -1083,3 +1083,65 @@ fn streaming_phase3_byte_identical_imatrix_adaptive() {
          regressed at file level.\n  eager:  {eager_sha}\n  stream: {stream_sha}"
     );
 }
+
+// ---------------------------------------------------------------------
+// T18: HF2Q_STREAMING_PHASE3_MUT byte-identity for q4_k_m (iter-84)
+// ---------------------------------------------------------------------
+
+/// ADR-014 P7 iter-84 — production E2E gate for the zero-byte-copy
+/// `quantize_via_streaming_consuming_mut` wedge wired into the K-quant
+/// codec arm under `HF2Q_STREAMING_PHASE3_MUT=1`.
+///
+/// File-level SHA-256 equality between eager + MUT-streaming paths
+/// confirms that draining tensor_map's bytes mid-Phase-3 doesn't
+/// regress the GGUF output — the structural memory win lands without
+/// affecting byte-identity.
+///
+/// Uses --skip-quality because the iter-84 wire-up doesn't yet
+/// reorder Phase 4.5 quality measurement (which would otherwise see
+/// a drained tensor_map).  iter-85+ handles Phase 4.5 ordering.
+#[test]
+fn streaming_phase3_mut_byte_identical_to_eager_q4_k_m() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let input_dir = tmp.path().join("input");
+    let eager_dir = tmp.path().join("out_eager_mut");
+    let stream_dir = tmp.path().join("out_stream_mut");
+    setup_p2_iter2_fixture(&input_dir);
+
+    Command::cargo_bin("hf2q")
+        .expect("hf2q binary")
+        .args([
+            "convert",
+            "--input", input_dir.to_str().unwrap(),
+            "--format", "gguf",
+            "--quant", "q4_k_m",
+            "--output", eager_dir.to_str().unwrap(),
+            "--skip-quality",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("hf2q")
+        .expect("hf2q binary")
+        .env("HF2Q_STREAMING_PHASE3_MUT", "1")
+        .args([
+            "convert",
+            "--input", input_dir.to_str().unwrap(),
+            "--format", "gguf",
+            "--quant", "q4_k_m",
+            "--output", stream_dir.to_str().unwrap(),
+            "--skip-quality",
+        ])
+        .assert()
+        .success();
+
+    let eager_sha = file_sha256(&locate_gguf(&eager_dir));
+    let stream_sha = file_sha256(&locate_gguf(&stream_dir));
+
+    assert_eq!(
+        eager_sha, stream_sha,
+        "HF2Q_STREAMING_PHASE3_MUT=1 GGUF must be byte-identical to eager — \
+         consuming-mut wedge regressed at file level\n  \
+         eager:  {eager_sha}\n  stream: {stream_sha}"
+    );
+}

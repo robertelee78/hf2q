@@ -1451,9 +1451,39 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 // the per-tensor clone.  The actual memory savings
                 // land when iter-3 surgery removes the downstream
                 // `tensor_map` dependency.  Default OFF.
+                //
+                // ADR-014 P7 iter-84 (2026-04-28): NEW env flag
+                // `HF2Q_STREAMING_PHASE3_MUT=1` routes through
+                // `quantize_via_streaming_consuming_mut` (iter-83) —
+                // ACTUAL zero-byte-copy: drains tensor_map's bytes via
+                // `take_data_as_arc` (iter-82), no clone, no peak
+                // inflation.  Caveat: post-call tensor_map data is
+                // empty.  Phase 4.5 quality (iter-52) builds its own
+                // lazy_map upfront from `tensor_map` — when
+                // HF2Q_STREAMING_PHASE3_MUT is on, Phase 4.5 must
+                // ALSO run to completion BEFORE Phase 3 wedge fires,
+                // OR fall back to skip-quality mode.  This iter wires
+                // the dispatch only on the K-quant codec arm; iter-85+
+                // will handle the Phase 4.5 ordering.
+                //
+                // Precedence: STREAMING_PHASE3_MUT > STREAMING_PHASE3 > eager.
                 let streaming_phase3 =
                     std::env::var("HF2Q_STREAMING_PHASE3").as_deref() == Ok("1");
-                if streaming_phase3 {
+                let streaming_phase3_mut =
+                    std::env::var("HF2Q_STREAMING_PHASE3_MUT").as_deref() == Ok("1");
+                if streaming_phase3_mut {
+                    tracing::info!("ADR-014 P7 iter-84: HF2Q_STREAMING_PHASE3_MUT=1 → quantize_via_streaming_consuming_mut (zero-byte-copy)");
+                    quantize::quantize_via_streaming_consuming_mut(
+                        &mut tensor_map,
+                        &metadata,
+                        &kq,
+                        bits,
+                        config.group_size,
+                        &progress,
+                    )
+                    .context("K-quant codec quantization failed (consuming-mut path)")
+                    .map_err(AppError::Conversion)?
+                } else if streaming_phase3 {
                     tracing::info!("ADR-014 P7 iter-48: HF2Q_STREAMING_PHASE3=1 → quantize_via_streaming_borrowed");
                     quantize::quantize_via_streaming_borrowed(
                         &tensor_map,
