@@ -72,6 +72,7 @@ pub struct SoftTokenInjection<'a> {
 use super::forward_mlx::{
     MlxModelWeights, DenseKvBuffers, HbKvBuffers, dispatch_qmatmul,
     dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs,
+    dense_sdpa_on_tq_kv_enabled,
 };
 use super::config::LayerType;
 use super::gpu::GpuContext;
@@ -299,9 +300,14 @@ impl MlxModelWeights {
         // loop so the per-token populate code (below) can write into it.
         // In iter-20 the allocation appeared at the END of this function (after
         // the loop), so self.leg_f_kvs was always None when the populate block ran.
+        //
+        // iter-34 (ADR-015 §iter34, 2026-04-29): the gating flag is now resolved
+        // through `dense_sdpa_on_tq_kv_enabled()` so the prefill allocator and
+        // the decode consumer (forward_mlx.rs) flip in lockstep — defaulting on
+        // and honouring `HF2Q_LEGACY_TQ_SDPA=1` (or back-compat
+        // `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=0`) as the unified opt-out.
         {
-            let force_dense_on_tq =
-                std::env::var("HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV").ok().as_deref() == Some("1");
+            let force_dense_on_tq = dense_sdpa_on_tq_kv_enabled();
             if force_dense_on_tq {
                 eprintln!("[iter-21 Track A] Allocating Leg F shadow KV cache before prefill loop");
                 let mut leg_f_kvs_vec: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);

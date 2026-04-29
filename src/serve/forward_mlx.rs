@@ -52,6 +52,56 @@ fn profiling_enabled() -> bool {
     INVESTIGATION_ENV.mlx_profile
 }
 
+/// iter-34 (ADR-015 §iter34, 2026-04-29): dense-SDPA-on-TQ-KV is the **default**
+/// for the gemma `forward_mlx` decode path.
+///
+/// Locks in iter33's measured Defect B closure: gemma-26B-dwq cn=1 ratio
+/// 0.8356× → 0.9553× (+11.97pp absolute, +14.32% relative; 5 cold-SoC trials,
+/// median 87.9 → 100.5 t/s, llama same-day median 105.20 t/s — see
+/// `/tmp/iter33-bench/perf/results.txt` and ADR-015 §iter33). Output is
+/// byte-identical across the 5 trials (md5 `dce9cb3b…` text-only) and produces
+/// coherent English semantically aligned with the legacy TQ SDPA path.
+///
+/// Semantics:
+/// * **Default (env unset)** → `true`: K/V are TQ-encoded as before, but
+///   simultaneously dequantized into the F32 shadow cache (`leg_f_kvs`)
+///   and the dense `flash_attn_vec` kernel dispatches on the shadow.
+/// * `HF2Q_LEGACY_TQ_SDPA=1` → `false`: opt-out — restores the pre-iter34
+///   `flash_attn_vec_tq` inner-loop path bit-for-bit.
+/// * `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=0` → `false`: back-compat alias for
+///   the same opt-out (legacy ablation flag, kept so existing scripts
+///   that explicitly turned the gate off continue to do so).
+/// * `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=1` → `true`: back-compat alias for
+///   the new default (no-op; pre-iter34 ablation flag).
+///
+/// Resolved exactly once per process via `OnceLock` (cheap hot-path read).
+/// Affects the gemma `forward_mlx` path only — the qwen35 `forward_gpu`
+/// path is structurally distinct and unchanged by this flip.
+pub(crate) fn dense_sdpa_on_tq_kv_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let legacy_opt_out =
+            std::env::var("HF2Q_LEGACY_TQ_SDPA").ok().as_deref() == Some("1");
+        let force_dense_explicit = std::env::var("HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV").ok();
+        let force_dense_off = force_dense_explicit.as_deref() == Some("0");
+        let enabled = !(legacy_opt_out || force_dense_off);
+        if !enabled {
+            eprintln!(
+                "[HF2Q_LEGACY_TQ_SDPA] iter34: legacy TQ SDPA inner-loop \
+                 restored (opt-out via {})",
+                if legacy_opt_out { "HF2Q_LEGACY_TQ_SDPA=1" }
+                else { "HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=0" }
+            );
+        } else if force_dense_explicit.as_deref() == Some("1") {
+            eprintln!(
+                "[HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV] iter34: explicit =1 alias \
+                 (no-op; matches new default)"
+            );
+        }
+        enabled
+    })
+}
+
 /// Accumulated per-kernel-type timing for one token.
 #[derive(Default, Clone)]
 pub struct KernelTypeProfile {
@@ -506,12 +556,20 @@ pub struct MlxModelWeights {
     pub dense_kvs: Option<Vec<DenseKvBuffers>>,
     /// Tmp buffer for flash_attn_vec when using dense decode.
     pub dense_sdpa_tmp: Option<MlxBuffer>,
-    /// iter-20 Leg F: F32 KV shadow cache filled from TQ dequant each step.
+    /// iter-20 Leg F → iter-34 default: F32 KV shadow cache filled from TQ
+    /// dequant each step.
     ///
-    /// When `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=1`, K/V are still TQ-encoded
-    /// but simultaneously dequantized into these F32 buffers. The dense
-    /// `flash_attn_vec` kernel then operates on the dequantized K/V,
-    /// isolating the SDPA kernel math from TQ representation noise.
+    /// **Default (since ADR-015 §iter34, 2026-04-29):** populated and used.
+    /// K/V are still TQ-encoded but simultaneously dequantized into these F32
+    /// buffers; the dense `flash_attn_vec` kernel then operates on the
+    /// dequantized K/V, isolating SDPA math from TQ representation noise.
+    /// Locks in iter33's measured +11.97pp gemma closure
+    /// (cn=1 ratio 0.8356× → 0.9553× vs llama; see `dense_sdpa_on_tq_kv_enabled`).
+    ///
+    /// **Opt-out (`HF2Q_LEGACY_TQ_SDPA=1` or back-compat
+    /// `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=0`):** the shadow cache is not
+    /// allocated and the legacy `flash_attn_vec_tq` inner-loop runs
+    /// bit-for-bit identical to the pre-iter34 path.
     ///
     /// Same layout as `dense_kvs`: `[nkv_heads, capacity, head_dim]` F32,
     /// ring-buffer for sliding layers, linear for global layers.
@@ -1517,22 +1575,18 @@ impl MlxModelWeights {
             })
         };
 
-        // iter-20 Leg F: dense SDPA on TQ-dequantized K/V ablation gate.
-        // When HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=1: TQ encode proceeds normally,
-        // then K/V are dequantized into leg_f_kvs (F32 shadow cache) and
-        // flash_attn_vec (dense) dispatches on those values instead of
-        // flash_attn_vec_tq. Isolates SDPA kernel math from representation noise.
-        let force_dense_sdpa_on_tq_kv: bool = {
-            static FORCE_DENSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *FORCE_DENSE.get_or_init(|| {
-                let v = std::env::var("HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV").ok().as_deref() == Some("1");
-                if v {
-                    eprintln!("[HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV] Leg F ablation enabled: \
-                               dense SDPA on TQ-dequantized K/V");
-                }
-                v
-            })
-        };
+        // iter-34 (ADR-015 §iter34, 2026-04-29): dense SDPA on TQ-dequantized K/V
+        // is now the DEFAULT for the gemma forward_mlx path. K/V are TQ-encoded
+        // normally, then dequantized into leg_f_kvs (F32 shadow cache) and the
+        // dense `flash_attn_vec` kernel dispatches on those values instead of
+        // `flash_attn_vec_tq`. Locks in iter33's measured +11.97pp closure
+        // (0.8356× → 0.9553× cn=1 ratio vs llama, 5 cold-SoC trials × NGEN=256,
+        // byte-identical determinism — see `/tmp/iter33-bench/perf/results.txt`
+        // and ADR-015 §iter33).  Opt-out: `HF2Q_LEGACY_TQ_SDPA=1` (or back-compat
+        // `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=0`) restores the pre-iter34 TQ SDPA
+        // inner-loop bit-for-bit.  See `dense_sdpa_on_tq_kv_enabled` (forward_mlx.rs)
+        // for the full env-var contract and parity rationale.
+        let force_dense_sdpa_on_tq_kv: bool = dense_sdpa_on_tq_kv_enabled();
 
         // iter-21 Track B + 2026-04-24 post-close default correction.
         // HF2Q_TQ_CODEBOOK_BITS selects the KV codebook width.

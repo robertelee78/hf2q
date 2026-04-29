@@ -1592,6 +1592,53 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter34 — SHIPPED — gemma dense-SDPA-on-TQ-KV is the default; locks in iter33's measured +11.97pp Defect B closure on the gemma `forward_mlx` path.**  Code change at HEAD (worktree `agent-aa682d64b503e0859`, base `791d43d`): pure-function gate `dense_sdpa_on_tq_kv_enabled()` added at `src/serve/forward_mlx.rs:79-103` (returns `true` when `HF2Q_LEGACY_TQ_SDPA` ≠ `"1"` AND `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV` ≠ `"0"`; resolved once via `OnceLock`); decode consumer at `src/serve/forward_mlx.rs:1583` simplifies the iter-20 Leg F `OnceLock` to `let force_dense_sdpa_on_tq_kv: bool = dense_sdpa_on_tq_kv_enabled();`; prefill allocator at `src/serve/forward_prefill.rs:309-310` flips from a direct `std::env::var("HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV") == Some("1")` read to the same helper so prefill + decode always agree on the gate.  Doc comments at `forward_mlx.rs:559-577` (the `leg_f_kvs` field) and `forward_mlx.rs:1578-1593` (the consumer-site comment block) updated to reflect new defaults + cite iter33 measurements.  **Env-var contract:**
+  * `(unset)` → **dense-SDPA-on-TQ-KV ON** (iter34 default).
+  * `HF2Q_LEGACY_TQ_SDPA=1` → opt-out, restores pre-iter34 `flash_attn_vec_tq` inner-loop bit-for-bit.
+  * `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=0` → back-compat alias for the same opt-out.
+  * `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=1` → no-op alias for the new default.
+
+  **Determinism (5 cold-SoC trials × NGEN=256, gemma-26B-dwq, text-only md5 of decoded region):**
+  | Side | Env | Trials 1-5 md5 | Ref |
+  |------|-----|----------------|-----|
+  | D (new default) | unset | `dce9cb3bf8af763274510ff89b573eac` × 5 | **byte-identical to iter33 T1** (FORCE_DENSE=1) |
+  | E (escape hatch) | `HF2Q_LEGACY_TQ_SDPA=1` | `ee79ad83927f4a7314032ec92f3c808b` × 5 | **byte-identical to iter33 C** (legacy) |
+
+  **Perf (5 cold-SoC trials × NGEN=256, gemma-26B-dwq, prompt "Hello, my name is", t/s):**
+  | Side | per-trial | median | ratio vs llama | Δpp vs E |
+  |------|-----------|-------:|---------------:|---------:|
+  | D (new default) | 100.7 100.5 100.4 100.3 100.6 | **100.5** | **0.9531** | **+11.86** |
+  | E (escape hatch) | 88.0 88.1 87.8 87.8 88.0 | 88.0 | 0.8345 | — |
+  | L (llama same-day) | 105.57 105.19 105.40 105.57 105.45 | 105.45 | — | — |
+
+  Llama same-day drift envelope: 105.20 (iter33) → 105.45 (iter34) = +0.24% (≤±1pp gate per `project_end_gate_reality_check`).  iter33 predicted +11.97pp; iter34 measured +11.86pp; -0.11pp delta is within ±2σ run-to-run noise.  **Coherence smoke (3 prompts × NGEN=64 default):** "Hello, my name is" → coherent disambiguation paragraph, "The quick brown fox" → "...jumps over the lazy dog" + pangram explanation, "What is 2+2?" → "2 + 2 = 4" + `<turn|>` stop.  All three semantically correct.
+
+  **qwen35 cross-fixture sanity (forward_gpu path, NGEN=256, qwen3.6-27b-dwq46):** new binary 29.9 t/s md5 `8723f73ef47d4c987af3e4eed8ce466d` vs iter33 base binary `/opt/hf2q/target/release/hf2q` 30.0 t/s md5 `8723f73ef47d4c987af3e4eed8ce466d` → **byte-identical**, t/s Δ −0.1 within noise.  iter34 affects only the gemma `forward_mlx` decode path; qwen35 `forward_gpu` is structurally distinct and unchanged.
+
+  **Compliance:** `feedback_correct_outcomes` (ship correct outcome — passes coherence + perf gate); `feedback_no_shortcuts` (5-trial determinism + multi-prompt coherence + qwen35 cross-fixture); `feedback_dont_guess` (verified HEAD line numbers and measured numbers, NOT predicted); `feedback_perf_gate_thermal_methodology` (cold-SoC bench, mcp-brain stopped via launchctl bootout); `feedback_evidence_first_no_blind_kernel_rewrites` (evidence-driven flip — iter33 measured +11.97pp before iter34 ship); `feedback_use_cfa_worktrees` (changes in `agent-aa682d64b503e0859`).  Bench artifacts: `/tmp/iter34-bench/{run.sh,run.log,perf/results.txt,perf/t{1..5}-{D,E,L}.{stdout,stderr}}`.
+
+  **iter35+ recommendation.**  Defect B is now **0.9531×** = −4.69pp below the speed bar.  The remaining 4.7pp is in the same forward path that iter33 just halved.  Two valid pivots:
+  - **iter35 — Candidate A from iter32 (Q8_0 mat-vec 4-simdgroup re-tile).**  Predicted +0.5…+2.0pp; ~1 day µ-bench cost; medium risk class per the iter32 lever table.  Falsification cost reasonable; even partial recovery brings gemma above 0.97×.
+  - **iter35 — Defect A revisit on qwen35 with iter33's TQ-vs-dense lesson.**  qwen35 `forward_gpu` does NOT route through `flash_attn_vec_tq` (different KV path), so the +11.97pp lever does not transfer mechanically; but iter33's lesson — "TQ inner-loop is more expensive than dequant-then-dense even on M5 Max where dequant is free in unified memory" — generalizes to any cache-decode-then-matmul kernel and is worth re-auditing the qwen35 hot path against.
+
+  Recommendation: **iter35 = Candidate A (Q8_0 mat-vec retile)** as the single-lever follow-up; iter36+ revisits Defect A only if A clears ≥+1pp without regression.  Standing pin `feedback_speed_bar_full_matrix` keeps both fixtures in scope.
+
+- **2026-04-29 — iter33 — LANDED — Defect B Candidate C ablation bench (gemma cn=1 dense-SDPA-on-TQ-KV) measured +11.97pp lift, ship gate cleared.**  Per iter32's recommendation, executed the Candidate C ablation at HEAD `~b2c78b7` against the canonical `/opt/hf2q/target/release/hf2q` binary; mcp-brain-server `kill -STOP` PID 1205 verified state `T` for the duration; `kill -CONT` post-bench.  Harness at `/tmp/iter33-bench/run.sh` (4-side × 5-trial paired bench: T1 = `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=1`, T2 = T1 + `HF2Q_SKIP_TQ_ENCODE=1` for timing upper bound, C = control, L = llama-bench).
+
+  **Per-trial t/s (5 cold-SoC trials × NGEN=256 × gemma-26B-dwq, prompt "Hello, my name is"):**
+  | Side | env | per-trial | median | ratio vs llama | Δpp vs C |
+  |------|-----|-----------|-------:|---------------:|---------:|
+  | T1 (FORCE_DENSE) | `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=1` | 100.5 100.3 100.5 100.5 100.7 | **100.5** | **0.9553** | **+11.97** |
+  | T2 (BOTH, garbage out) | T1 + `HF2Q_SKIP_TQ_ENCODE=1` | 100.6 100.6 100.6 100.5 100.6 | 100.6 | 0.9563 | +12.07 |
+  | C (control)      | (unset)                            |  87.4  88.2  88.0  87.9  87.8 |  87.9 | 0.8356 | — |
+  | L (llama)        | n/a                                | 104.06 105.20 105.36 105.26 105.07 | 105.20 | — | — |
+
+  **Determinism (text-only md5 of decoded region across 5 T1 trials):** `dce9cb3bf8af763274510ff89b573eac` × 5 — **byte-identical**.  Equivalent C trial md5: `ee79ad83927f4a7314032ec92f3c808b` × 5.  T1 differs from C bytewise (different deterministic SDPA path) but both are coherent English; manual inspection of T1 decoded output shows semantically aligned content with C (different FP-rounding, same prompt completion strategy — disambiguation paragraph offering 3 reply formats).
+
+  **Verdict:** Candidate C **PASSES iter32 acceptance gate** (≥0.95× same-day llama).  T2 timing-upper-bound shows TQ-encode itself contributes only ~0.10pp of the +11.97pp lift — the entire savings come from swapping the SDPA inner-loop from `flash_attn_vec_tq` to `flash_attn_vec` operating on the dequantized F32 shadow.  Mechanism: TQ inner-loop's per-step Hadamard-rotated quantized dot product is more expensive on M5 Max than dequantize-then-F32-matmul, even though the dequant adds memory bandwidth — unified memory makes the dequant effectively free.
+
+  **iter34 mandate:** flip the default for the gemma `forward_mlx` path; add escape hatch.  Documentation here is the formal record of the bench; the code change ships in iter34 (next entry, above).
+
 - **2026-04-29 — iter32 — Defect B gemma audit + iter33 hypothesis (READ-ONLY, no code touched).**  Comprehensive audit of the gemma forward path at HEAD `b2c78b7` produced full audit at `/tmp/iter32-audit.md` (~1300 words, 9 sections). Forward-path map confirms gemma decode is **already single-CB / 1-2 CBs/token** (`forward_mlx.rs:1589` exec.begin, modulo HF2Q_DUAL_BUFFER split-after-L3 default), routes through `forward_mlx::forward_decode` (line 1320), with per-layer dispatch at lines 1635-…  GGUF tensor-type spot-check via `gguf.GGUFReader` on layer-0: attn Q/K/V/O + dense gate/up + MoE gate_up_exps + router = **Q6_K**; dense ffn_down + MoE ffn_down_exps = **Q8_0**; norms F32; Q4_K NOT present.  Cross-fence comparison vs llama.cpp (`gemma4-iswa.cpp`, `ggml-metal.metal:7716-8074`, `ggml-metal-impl.h:39-65`) identified four candidate iter33 levers, three in scope for the cn=1 decode bench:
 
     | Rank | Candidate                                | Predicted Δpp  | Falsification cost                              | Risk class |
