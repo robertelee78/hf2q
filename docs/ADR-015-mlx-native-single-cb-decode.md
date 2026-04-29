@@ -1592,6 +1592,59 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter22 — MST per-kernel attribution post-coherence: gap is ORCHESTRATION, not kernel-internal — hf2q runs 13.4× more dispatches/token (44.2 vs 3.3) at 35× smaller p50 size; +772.9 µs/tok (96.8% of total +798.1 µs/tok = +8.9% gap) lives in the xl_>=80us bucket where llama runs ~2 mega-kernels/token vs hf2q's 42.1 medium-sized dispatches; per-CB attribution shows hf2q `layer.attn_moe_ffn` 39.4 CBs/tok × 197.6 µs = 7779.8 µs/tok (80% of hf2q wall) vs llama's 3.05 CBs/tok bundling the entire forward into ~3 enormous compute commands. iter23 single-candidate: rms_norm/fused_residual_norm reduction-pattern parity port (simd_sum vs tree-reduction); deferred orchestration lever (CB-count collapse) to iter24+ pending iter23 evidence.**
+
+  **A. METHODOLOGY.** Profile-only iter per spec — no code changes to mlx-native or hf2q kernel/orchestration. 5 cold-SoC trials × 64 decode tokens × dwq46 apex per binary (`/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46.gguf`), recorded with `xctrace record --template "Metal System Trace"`. 120s thermal settle between trials. `mcp-brain-server` (PID 1205) `kill -STOP`'d for the bench window; `kill -CONT`'d post; `ps -o stat=` confirmed `T → S` transition. hf2q binary at `c46207d` (worktree `worktree-agent-aa2001001c5843089`, includes iter21 single-CB nondeterminism fix). llama-completion@`b8680-15f786e65` substituted for llama-cli — current llama-cli rejects `--no-conversation` (deprecated), and the previous incantation hung at `console::readline` waiting on stdin (verified via `sample` 12+ minutes into trial-1; killed and pivoted). `scripts/profile-iter9-mst.sh` patched to use `llama-completion` + `--no-display-prompt` + `< /dev/null`; same patch adds a `TRIAL_START` env knob so trials 4-5 could resume without re-recording 1-3. Phase 1 smoke gate: prior agent confirmed PASS (`/tmp/adr015-iter22/smoke-{A,B}.txt` decoded tokens byte-identical at NGEN=32 on dwq46).
+
+  **B. ATTRIBUTION TABLE — bucket × kernel-class (medians n=5).** Per-bucket dispatch attribution (sorted Δµs/tok desc):
+
+  | bucket (likely kernel-class) | hf2q disp/tok | hf2q µs/disp p50 | hf2q µs/tok | llama disp/tok | llama µs/disp p50 | llama µs/tok | Δµs/tok | Δ% |
+  |---|---:|---:|---:|---:|---:|---:|---:|---:|
+  | xl_>=80us (prefill mul_mm_id / lm_head / fused mega-kernels) | 42.1 | 194.23 | 9703.2 | 2.0 | 6875.60 | 8930.3 | **+772.9** | +8.7% |
+  | lg_32_80us (flash_attn / pooled mul_mm_id) | 0.3 | 52.17 | 14.8 | 0.0 | 0.00 | 0.0 | +14.8 | +∞ |
+  | md_8_32us (Q4_0 MoE mat-vec_id gate/up/down) | 0.8 | 16.21 | 12.8 | 0.2 | 16.65 | 3.6 | +9.2 | +254.5% |
+  | sm_2_8us (rope / soft-cap / small mat-vec) | 1.0 | 6.21 | 5.4 | 1.0 | 3.79 | 4.0 | +1.4 | +35.4% |
+  | xs_<2us (rms_norm / scalar / reshape) | 0.0 | 0.00 | 0.0 | 0.0 | 0.00 | 0.0 | +0.0 | +0.0% |
+  | **TOTAL** | **44.2** | — | **9735.6** | **3.3** | — | **8937.5** | **+798.1** | **+8.9%** |
+
+  Per-CB semantic-phase attribution (iter16 path, `commit_*labeled` propagation):
+
+  | phase | hf2q cbs/tok | hf2q gpu_µs/tok | llama cbs/tok | llama gpu_µs/tok | Δgpu_µs/tok |
+  |---|---:|---:|---:|---:|---:|
+  | `layer.attn_moe_ffn` | 39.38 | **7779.8** (80%) | 0.00 | 0.0 | +7779.8 |
+  | (llama generic) `Command Buffer 0` | 3.17 | 1362.7 | 3.05 | 8933.8 | −7571.2 |
+  | `output_head.fused_norm_lm_argmax` | 0.98 | 556.2 | 0.00 | 0.0 | +556.2 |
+  | **TOTAL** | — | **9698.7** | — | **8933.8** | **+764.9** |
+
+  **C. CAVEAT — CLI XCTRACE WALL.** Per-kernel-NAME × time JOIN is structurally BLOCKED at xctrace CLI level. `metal-gpu-execution-points` carries `gpu-submission-id` (sub_id) but NOT pso-id; `metal-shader-profiler-intervals` (Shader Timeline) is empty unless GUI Instruments.app toggles it (iter11 documented this and verified four xctrace incantations all produce zero rows). The kernel-name registry IS surfaced (e.g. `kernel_mul_mv_id_q4_0_f32`, `kernel_mul_mm_id_q4_0_tensor_f32`, `rms_norm_f32`, `fused_residual_norm_f32`, `flash_attn_prefill_bf16_d256`, etc. — full list at `/tmp/adr015-iter22/aggregate-q4_0.txt`) but cannot be joined to per-dispatch durations from CLI. Bucket-class mapping is the best-available signal; per-CB semantic-phase (iter16 `commit_*labeled`) closes the orchestration-attribution gap. Unblocking would require iter11b enabler (mlx-native `pushDebugGroup`) OR GUI Instruments capture OR MTLCounterSampleBuffer at stage-boundary granularity (per `project_m5max_no_dispatch_boundary_sampling`, M5 Max does NOT support per-dispatch GPU counter sampling).
+
+  **D. HEADLINE FINDING.** The +798 µs/tok = +8.9% gap is NOT in any single kernel implementation. hf2q does **44.2 dispatches/token at p50≈194 µs/disp**; llama does **3.3 dispatches/token at p50≈6876 µs/disp**. llama bundles whole-forward-pass compute into 2-3 mega-kernels per CB (likely fused via ggml-metal's batched compute graph compilation), while hf2q's `layer.attn_moe_ffn` emits 39.4 separate CBs each containing ~1 dispatch. The bucket data falsifies a "kernel slowness" diagnosis: the md_8_32us Q4_0 MoE mat-vec bucket contributes only +9.2 µs/tok (1.2% of the gap); the small dispatch-count buckets together account for <30 µs/tok. **The lever is dispatch orchestration, not kernel internals.**
+
+  **E. SINGLE iter23 CANDIDATE — rms_norm / fused_residual_norm reduction-pattern parity port.** Smallest discrete kernel-internal change with measurable per-dispatch leverage AND it sets up an orthogonal micro-lever before iter24+ tackles the larger orchestration collapse. Source-level diff to test:
+  - **llama.cpp** `kernel_rms_norm_fuse_impl` at `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:2990-3048` uses `simd_sum` (single simdgroup primitive cycle) at lines 3021 and 3032, with only 2 `threadgroup_barrier` calls regardless of tg_size; templated host_name variants `kernel_rms_norm_f32` / `kernel_rms_norm_mul_f32` / `kernel_rms_norm_mul_add_f32` at lines 3053-3055 fold residual + weight in one pass.
+  - **mlx-native** `rms_norm_f32` at `/opt/mlx-native/src/shaders/rms_norm.metal:18-59` uses tree reduction at lines 41-50 with log2(tg_size) `threadgroup_barrier` calls (8 barriers at tg_size=256 vs llama's 2). Zero `simd_sum` calls anywhere in `rms_norm.metal`, `fused_norm_add_f32.metal`, or `fused_residual_norm_bf16.metal`.
+  - **mlx-native** `fused_residual_norm_f32` at `/opt/mlx-native/src/shaders/fused_norm_add_f32.metal:305-359` carries the same tree-reduction pattern (lines 344-349) and is called per-layer in `forward_gpu.rs` at lines 1334, 2330, 2364, 2625, 2666 — ~64 calls per decode token at NGEN=64.
+
+  Predicted savings: per-call ~6 fewer barriers × ~hundreds of ns each ≈ O(few µs) per dispatch × 64 calls/tok = O(tens of µs/tok). Small relative to the +798 µs/tok total but the cleanest mechanical port that mirrors llama.cpp's exact pattern.
+
+  **F. EXIT CRITERION & FALSIFICATION BUDGET.** Δ ratio ≥ +0.01× (0.9487× → ≥ 0.9587×) at 5-cold-trial × 256-NGEN paired same-day cold-SoC bench. If null at iter23, do NOT iterate on more single-kernel ports per `feedback_evidence_first_no_blind_kernel_rewrites` — pivot to the orchestration lever (`layer.attn_moe_ffn` 39.4 CBs/tok → ≤3 CBs/tok). Note: iter17 partial-chain (N=2 to 8) was already FALSIFIED at null Δ; iter24 candidate would be a single-CB MoE FFN re-architecture testing N=∞ directly (which iter10 falsified at -7.8pp on a different chain shape — but the iter17 narrowing showed the per-CB cost compounds 40× per token, so ALL-MoE-into-1-CB is the architectural endpoint that has not been benched against the now-coherent baseline at the right shape).
+
+  **G. ALTERNATIVE LEVER — q4_0 MoE-id 2-acc sumy port (ADR-015 §H named, lower priority post-iter22).** ADR-015 §H named `kernel_mul_mv_id_q4_0_f32` two-accumulator sumy as the iter22 lever. Side-by-side audit confirms the diff (mlx-native single `sumy = 0` at `/opt/mlx-native/src/shaders/quantized_matmul_id_ggml.metal:165` vs llama.cpp `float sumy[2] = { 0.f, 0.f };` two-accumulator at `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:3412`, where the dense-path mlx-native variant at `/opt/mlx-native/src/shaders/quantized_matmul_ggml.metal:139-150` already adopted the 2-acc pattern via ADR-009 Phase 3A). However, the per-bucket attribution shows md_8_32us (where the q4_0 MoE mat-vec_id lives) contributes only +9.2 µs/tok — 1.2% of the +798 µs/tok gap. Demoting from iter23 primary to alternative because the rms_norm port has a higher-confidence mechanical mapping AND the per-bucket data does not validate the §H prediction that q4_0 MoE-id is the dominant kernel cost. Note `project_moe_dwq46_parity_gap_diagnostics` flags a falsified 4-acc ILP attempt; the **2-accumulator** pattern (matching llama.cpp's exact rounding) has not yet been A/B'd cleanly against the now-coherent baseline.
+
+  **H. ARTEFACTS.**
+  - 5 hf2q traces: `/tmp/adr015-iter22/mst/hf2q-trial-{1,2,3,4,5}.trace`
+  - 5 llama traces: `/tmp/adr015-iter22/mst/llama-trial-{1,2,3,4,5}.trace`
+  - Per-trial metadata + process-audit + ram + thermal-pre + stdout/stderr alongside each trace.
+  - Aggregate text report: `/tmp/adr015-iter22/aggregate-q4_0.txt`
+  - Markdown deliverable: `/tmp/adr015-iter22/attribution-table.md`
+  - Worktree: `/opt/hf2q/.claude/worktrees/agent-aa2001001c5843089` (branch `worktree-agent-aa2001001c5843089`).
+  - Commit: this commit; baseline is `c46207d` (iter21 single-CB fix; no mlx-native or hf2q kernel/orchestration code changes in iter22).
+  - Per-trial gpu µs/tok (n=5): hf2q 9768.9, 9697.5, 9741.1, 9520.9, 9735.6 → median **9735.6**; llama 8944.5, 8937.5, 8935.0, 8973.8, 8917.9 → median **8937.5**. Spreads 2.6% and 0.6% — medians are stable.
+
+  **I. STANDING-PIN COMPLIANCE.** `feedback_evidence_first_no_blind_kernel_rewrites` — iter22 is profile-only, no code changes; iter23 candidate is a single-kernel mechanical port with predicted-Δ-and-falsification budget set; the demoted §H lever has its own predicted-Δ from the per-bucket data falsifying the original prediction. `feedback_dont_guess` — every kernel claim cites file:line at HEAD with measured µs comparator. `feedback_bench_process_audit` — per-trial pmset/process-audit/vm_stat archived; mcp-brain-server STOPped + verified `T` state during bench window. `feedback_use_cfa_worktrees` — all changes in agent worktree. `feedback_structural_audit_before_kernel_work` — both q4_0 mat-vec kernels (id and dense) read side-by-side BEFORE any candidate ranking; the audit redirected the iter23 candidate AWAY from the §H named lever toward rms_norm based on per-bucket evidence. `feedback_no_shortcuts` — llama-cli hung trial-1 was killed and re-run with the correct binary (llama-completion) plus stdin closed and proper non-interactive flags rather than papering over the contamination with a partial dataset.
+
+  **J. NEXT.** iter23 = rms_norm reduction-pattern parity port; Δ-gated decision tree for iter24 (orchestration collapse) vs iter25 (q4_0 MoE-id 2-acc sumy).
+
 - **2026-04-29 — iter21 — qwen35 single-CB decode nondeterminism FIXED via missing memory_barrier between Op 6 → Op 7 in `apply_gated_attn_layer_decode_into`.  Bisect localized the introducing commit to `ed768ef` (P3 Stage 1 single-CB qwen35 forward).  5-trial × 4-fixture verification (35B-MoE-dwq46, 35B-MoE-apex, 27B-dense-dwq46, gemma-26B-dwq) confirms byte-identical decoded tokens at NGEN=256.  Total fix: +1 `enc.memory_barrier()` (12 lines including comment), no revert of the optimization.**
 
   **A. BISECT.**  Per `feedback_verify_baseline_determinism_before_perf_bench` and the iter20-COHERENCE-DIAG mandate, the iter21 mission was to find the single commit that introduced qwen35 forward_gpu nondeterminism.  Bisect anchors:

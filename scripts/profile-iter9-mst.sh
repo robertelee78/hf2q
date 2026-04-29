@@ -45,11 +45,12 @@
 set -euo pipefail
 
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
-LLAMA_BIN="${LLAMA_BIN:-/opt/homebrew/bin/llama-cli}"
+LLAMA_BIN="${LLAMA_BIN:-/opt/homebrew/bin/llama-completion}"
 FIXTURE="${FIXTURE:-/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46.gguf}"
 PROMPT="${PROMPT:-Hello, my name is}"
 N_TOKENS="${N_TOKENS:-64}"
 N_TRIALS="${N_TRIALS:-5}"
+TRIAL_START="${TRIAL_START:-1}"
 THERMAL_SETTLE_SEC="${THERMAL_SETTLE_SEC:-120}"
 MIN_FREE_GB="${MIN_FREE_GB:-30}"
 OUT_DIR="${OUT_DIR:-/tmp/adr015-iter9}"
@@ -232,9 +233,9 @@ run_capture() {
          --prompt "$PROMPT" \
          --n-predict "$N_TOKENS" \
          --temp 0 \
-         --no-conversation \
+         --no-display-prompt \
          --n-gpu-layers 999 \
-      > "$sout" 2> "$serr"
+      < /dev/null > "$sout" 2> "$serr"
   fi
   local rc=$?
   set -e
@@ -277,11 +278,11 @@ case "$ONLY" in
 esac
 
 for binary in "${binaries[@]}"; do
-  for trial in $(seq 1 "$N_TRIALS"); do
+  for trial in $(seq "$TRIAL_START" "$N_TRIALS"); do
     echo
     echo "=== ${binary} trial ${trial}/${N_TRIALS} ==="
 
-    if (( trial > 1 )); then
+    if (( trial > TRIAL_START )); then
       echo "thermal settle ${THERMAL_SETTLE_SEC}s..."
       sleep "$THERMAL_SETTLE_SEC"
     fi
