@@ -2290,6 +2290,12 @@ impl MlxModelWeights {
                     } else {
                         match INVESTIGATION_ENV.layer_policy.as_deref() {
                             Some("dense_all") => true,
+                            // iter50: route iter34 default (force_dense_sdpa_on_tq_kv=true,
+                            // unset env) to Branch A — Leg F dispatches 8/layer (2 dequant +
+                            // 2 cache_copy + 2 FWHT + 2 flash_attn_vec) while Branch A
+                            // dispatches 4/layer (2 cache_copy + 2 flash_attn_vec) on the
+                            // already-allocated dense_kvs. Preserves explicit env opt-ins.
+                            None if force_dense_sdpa_on_tq_kv => true,
                             Some("tq_all") | None => false,
                             Some("tq_slide_dense_global") => !kv_is_sliding,
                             Some("dense_slide_tq_global") => kv_is_sliding,
@@ -2312,6 +2318,8 @@ impl MlxModelWeights {
                             } else {
                                 match INVESTIGATION_ENV.layer_policy.as_deref() {
                                     Some("dense_all") => true,
+                                    // iter50: see gate_h_inactive arm above.
+                                    None if force_dense_sdpa_on_tq_kv => true,
                                     Some("tq_all") | None => false,
                                     Some("tq_slide_dense_global") => !kv_is_sliding,
                                     Some("dense_slide_tq_global") => kv_is_sliding,

@@ -1592,6 +1592,119 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter50 — gemma `forward_mlx` Leg F → Branch A route LANDED.  iter48 H2 architectural hypothesis CONFIRMED at HEAD f1d11a4 + bench-validated: routing the iter34 default (`force_dense_sdpa_on_tq_kv=true`, no env override) through Branch A (4 dispatches/layer on already-allocated dense_kvs) instead of Leg F (8 dispatches/layer with TQ-dequant + FWHT round-trip + dense-on-shadow-cache) closes the −2.48pp residual gemma gap into a +1.43pp lead vs llama.  Phase 5 winner-gate PASS: gemma +3.89pp ≥1pp primary AND every sister fixture within thermal noise of iter45-RESUMED archived AND coherence_smoke 12/12 PASS AND coherence_matrix EXACT=6 COHERENT=6 GIBBERISH=0.  Closes the LAST fixture failing the standing user rule "as or more faster than peers, for all model families × all quantizations".**
+
+    **HEAD CONTEXT.**  Worktree `agent-a15247b6cd149c887`, base `f1d11a4` (iter45-RESUMED commit).  `mlx-native` HEAD `9bd1f6f` (untouched).  Parallel ADR-014 P11/P12 in `src/quantize/mod.rs` — fence preserved (this iter touches only `src/serve/forward_mlx.rs`, `tests/perf_baseline.json`, and this changelog).
+
+    **PHASE 1 — Architectural verification at HEAD (read code, count dispatches).**
+
+    `forward_mlx.rs` SDPA selector (`use_dense_sdpa`) at HEAD f1d11a4 lines 2284-2329.  Three branches downstream consume the gate:
+
+    | Branch | gate | dispatches/layer | file:line |
+    |---|---|---:|---|
+    | A (dense decode) | `use_dense_sdpa=true` | **4** (2 KV copy + 2 flash_attn_vec main+reduce) | `:2331-2497` |
+    | **B (Leg F = dense SDPA on TQ-dequant KV) — DEFAULT** | `!use_dense_sdpa && force_dense_sdpa_on_tq_kv` | **8** (2 dequant + 2 cache_copy + 1 FWHT-pre + 2 flash_attn_vec + 1 FWHT-undo) | `:2498-2670` |
+    | C (HB native) | `!use_dense_sdpa && !force_dense_sdpa_on_tq_kv && use_native_hb_sdpa` | 4 (FWHT-pre + flash_attn_vec_tq_hb main+reduce + FWHT-undo) | `:2671+` |
+
+    Counted by reading every `total_dispatches += N` and `dispatch_*` site in each branch.  iter48 H2 prediction "Branch A is 4 dispatches/layer vs Leg F's 8" matches the code exactly.
+
+    **dense_kvs allocation invariant.**  `forward_prefill.rs:274-286` allocates `dense_kvs_vec` UNCONDITIONALLY before the prefill token loop, with sliding-window-aware per-layer capacity (`capacity = if layer_is_ring { sliding_window } else { seq_len + max_decode_tokens }`).  `forward_prefill.rs:706-739` writes `attn_k_normed`/`v_src` to `dense_kvs_vec[layer_idx].{k,v}` at every prefill token (no env-gating).  Branch A's per-decode-token write at `forward_mlx.rs:2353,2360,2370,2377` extends the same buffers with new decode K/V at `seq_pos`.
+
+    **Conclusion.**  dense_kvs is valid for Branch A regardless of TQ codebook bits, regardless of `force_dense_sdpa_on_tq_kv`, regardless of decode mode.  H2's "Branch A needs sliding-window-aware alloc" caveat from iter48 was already satisfied at HEAD — the post-iter-21 architecture allocates dense_kvs unconditionally.
+
+    **PHASE 2 — Hypothesis verdict.**
+
+    H2 CONFIRMED at HEAD code level; sliding-window concern resolved by reading `forward_prefill.rs` (already sliding-aware, already populated).  Memory cost zero: dense_kvs already allocated; Leg F's `leg_f_kvs` shadow cache also still allocated (memory cleanup deferred to iter51+).  Coherence guaranteed: Branch A is bit-equivalent to `HF2Q_USE_DENSE=1` opt-out path which is the byte-exact-vs-llama gate used in `scripts/release-check.sh`/`parity_check.sh`/`sourdough_gate.sh`.
+
+    **PHASE 3 — Minimal architectural change (forward_mlx.rs:2284-2329 selector).**
+
+    Single match-arm addition in BOTH the `gate_h_inactive` arm (`:2293`) AND the `decode_regime::Default` arm (`:2315`):
+
+    ```rust
+    match INVESTIGATION_ENV.layer_policy.as_deref() {
+        Some("dense_all") => true,
+        // iter50: route iter34 default (force_dense_sdpa_on_tq_kv=true,
+        // unset env) to Branch A — Leg F dispatches 8/layer (2 dequant +
+        // 2 cache_copy + 2 FWHT + 2 flash_attn_vec) while Branch A
+        // dispatches 4/layer (2 cache_copy + 2 flash_attn_vec) on the
+        // already-allocated dense_kvs. Preserves explicit env opt-ins.
+        None if force_dense_sdpa_on_tq_kv => true,
+        Some("tq_all") | None => false,
+        ...
+    }
+    ```
+
+    Match-guard ordering: `None if force_dense_sdpa_on_tq_kv` matches `None` only when iter34 default is on; otherwise falls through to `Some("tq_all") | None => false`.  Explicit `HF2Q_LAYER_POLICY=tq_all` keeps Leg F (byte-exact-vs-iter34 fallback for ablation).  `HF2Q_LEGACY_TQ_SDPA=1` (which sets `force_dense_sdpa_on_tq_kv=false`) preserves the pre-iter34 path bit-for-bit.
+
+    **Net diff.**  4 lines added (2 arms × 2 lines each comment + arm) in `src/serve/forward_mlx.rs`.  No new types, no new fields, no allocator changes, no mlx-native changes.
+
+    **PHASE 4 — Coherence verify (PASS gate).**
+
+    1. `cargo build --release --bin hf2q` — clean in 11.66s + 10.81s.
+    2. `cargo test --release --test coherence_smoke -- --nocapture` — **12/12 PASS in 87.5s**.  All cells gemma/dwq46/apex/27b-dwq46 × {hello-my-name-is, the-quick-brown-fox, what-is-22} OK.
+    3. `cargo test --release --test coherence_matrix -- --ignored coherence_matrix_all_cells --nocapture` — **EXACT=6 COHERENT=6 GIBBERISH=0** in 89.0s.  Gemma fixtures all 3 EXACT (byte-identical to llama golden including the known peer-degenerate `[Description of the Purpose of the Presentation/...]` repetition).
+    4. NGEN=128 reference run (`Hello, my name is`, temp=0):  produces fluent-English with gemma's known `[Name]/[Job Title]/[Description...]` placeholder pattern.  108.3 tok/s single-warmup-less invocation (informational).
+
+    **PHASE 5 — Paired same-day cold-SoC bench (NGEN=256, 5 trials gemma × 3 sides + 3 trials × 3 sister fixtures × iter50 binary).**
+
+    Pre-flight audit: `pmset -g therm` clean.  `vm_stat` 100+ GB free pre-bench.  `pgrep -lf 'Final Cut|FCP|davinci|handbrake|ffmpeg'` empty.  `kill -STOP` mcp-brain-server (PID 97471) trapped on EXIT (CONT confirmed post-bench).  60s thermal settle between trials, 90s between fixtures.
+
+    Side A binary built from clean stash of HEAD f1d11a4 (`/tmp/iter50/hf2q-baseline-f1d11a4`); side B from this worktree (`/tmp/iter50/hf2q-iter50`).  llama-bench `/opt/homebrew/bin/llama-bench` (build 15f786e65) at `-p 0 -n 256 -r 1` per trial.
+
+    **GEMMA results (5 trials × 3 sides):**
+
+    | side | trials | median (tok/s) | p10–p90 | ratio vs llama |
+    |---|---|---:|---:|---:|
+    | A_baseline (HEAD f1d11a4) | 102.8, 102.7, 102.8, 102.8, 102.8 | **102.8** | 102.7–102.8 | **0.9754×** |
+    | **B_iter50 (this iter)** | 106.9, 107.1, 106.8, 107.0, 106.7 | **106.9** | 106.7–107.1 | **1.0143×** |
+    | L_llama (same-day reference) | 105.39, 105.12, 104.79, 105.48, 105.40 | **105.39** | 104.79–105.48 | 1.0× (anchor) |
+
+    Δ B vs A = **+3.99 tok/s = +3.89pp absolute ratio improvement** (0.9754× → 1.0143×).  Inside iter48 H2 prediction envelope (+2.0–3.0pp) on the upper edge — actually exceeds it slightly because iter48 H2 didn't separately credit the leg_f_kvs allocation churn elimination during decode (Leg F writes per-token to `leg_f_kvs[layer_idx]`; Branch A writes per-token to `dense_kvs[layer_idx]` which was already going to be touched anyway under post-iter-21 architecture).
+
+    Side A median 102.8 matches iter45-RESUMED archived 102.2 within 0.6pp thermal noise.  Side B median 106.9 with p90 107.1 exceeds llama p90 105.48 in ALL 5 trials.  llama-bench p90 spread 0.69 pp (104.79–105.48) is wider than B trial spread 0.4 pp (106.7–107.1) — iter50 is genuinely faster than llama on this fixture.
+
+    **SISTER fixtures (3 trials × iter50 binary; should be unaffected — `forward_mlx.rs` change is only consumed by gemma's path):**
+
+    | fixture | iter50 trials | iter50 median | iter45-RESUMED archived | Δ vs archived |
+    |---|---|---:|---:|---:|
+    | qwen3.6-35b-a3b-dwq46 | 114.0, 114.4, 114.2 | 114.2 | 113.9 | +0.3 (within thermal noise) |
+    | qwen3.6-35b-a3b-apex | 107.0, 107.1, 107.1 | 107.1 | 106.8 | +0.3 (within thermal noise) |
+    | qwen3.6-27b-dwq46 | 29.9, 29.8, 29.8 | 29.8 | 29.7 | +0.1 (within thermal noise) |
+
+    All three confirm zero regression and slight noise-band improvements (likely lower mid-bench thermal vs the iter45-RESUMED bench earlier today).
+
+    **Phase 5 ship-gate:**
+    - Gemma post-iter50 ratio **1.0143× ≥ 1.00** ✅
+    - Sister fixtures within 0.5pp of iter45-RESUMED ✅ (max delta +0.3pp)
+    - coherence_smoke 12/12 PASS ✅
+    - coherence_matrix 0 GIBBERISH ✅
+
+    **GATE CLEARS — SHIP.**
+
+    **PHASE 6 — Ship state.**
+
+    `tests/perf_baseline.json::cells.gemma-26B-dwq` ratio_floor 0.96 → **1.00**, _measured_ratio 0.9752 → **1.0143**, _measured_hf2q_tps_med 102.2 → **106.9**, _measured_llama_tps_med 104.80 → **105.39**, _measured_at_commit `iter45-RESUMED` → `iter50`.  Added top-level `_iter50_summary` block with full Phase 5 winner-gate evidence.  `_baseline_commit` `iter45-RESUMED` → `iter50`.
+
+    **iter51+ candidates (deferred):**
+    1. **leg_f_kvs allocation cleanup** — the F32 shadow cache at `forward_prefill.rs:309-334` is now dead-code (Leg F path no longer fires under iter34 default).  Allocating 30 layers × ring/global capacity × nkv × hd × 4 B per request adds ~1-2 GB peak depending on context.  Gate the alloc on `!force_dense_sdpa_on_tq_kv || layer_policy=="tq_all"` to free the memory.
+    2. **TQ encode dead-write** — `forward_mlx.rs:1916-1937` still fires under iter34 default (writes to `kv_caches[layer_idx].{k,v}_packed/_norms` which are now read by nothing in the iter50 default path).  Same gate as (1).  ~2 dispatches/layer = 60 dispatches/token at 30 layers; further +0.5–1.0pp possible.
+    3. **HB-encode dead-write** — already gated by iter49 surgical fix.
+    4. **apex Q5_K cn=2 promotion** — deferred from iter45-RESUMED Phase 6 (apex was sister, not primary).  Standalone iter to validate Q5_K + Q6_K cn=2 against full N-curve.
+
+    **DELIVERABLES (per mission spec).**
+    1. ✅ Phase 1 architectural verification trace (Branch A 4 dispatches vs Leg F 8 dispatches counted from code).
+    2. ✅ Phase 2 H2 verdict: CONFIRMED at HEAD.
+    3. ✅ Phase 3 minimal fix: `src/serve/forward_mlx.rs:2293,2315` (4 lines, 2 arms).
+    4. ✅ Phase 4 coherence: 12/12 smoke + 0 GIBBERISH matrix + NGEN=128 reference.
+    5. ✅ Phase 5 bench: 5 trials × 3 sides on gemma + 3 trials × iter50 on 3 sisters.
+    6. ✅ Pathspec commit + push.
+    7. ✅ brain_share category=performance.
+    8. ✅ ADR-015 §iter50 changelog (this entry).
+
+    **STANDING-PIN COMPLIANCE.**  `feedback_evidence_first_no_blind_kernel_rewrites` — counted dispatches in code (`+= N` arithmetic) before changing routing.  `feedback_dont_guess` — verified `dense_kvs` allocation invariant by reading `forward_prefill.rs:274-286` and population at `:706-739`.  `feedback_correct_outcomes` — pre-bench audit + paired same-day cold-SoC + per-trial settle (no shortcuts on methodology); built side-A binary from clean HEAD stash (not relied on iter45-RESUMED archived numbers as side-A).  `feedback_use_cfa_worktrees` — work in agent worktree; mlx-native untouched.  `feedback_git_commit_pathspec_when_parallel` — pathspec commit only (`src/serve/forward_mlx.rs tests/perf_baseline.json docs/ADR-015-mlx-native-single-cb-decode.md`); does NOT touch `src/quantize/mod.rs` (parallel ADR-014).  `feedback_bench_process_audit` — mcp-brain-server STOP/CONT trapped, FCP/davinci/etc. empty.  `feedback_perf_gate_thermal_methodology` — pmset clean, 60s settles, 90s fixture-settle, paired same-day.  `feedback_check_ram_before_inference` — vm_stat 100+ GB pre-bench.  `project_metal_compiler_auto_optimizes_static_levers` — this is an ORCHESTRATION lever (dispatch count delta from path-routing change), not a static kernel hypothesis; sister to the chain_n + HB-encode dead-write levers that actually moved on M5 Max.  Falsification count: **unchanged** (iter50 ships a hypothesis-and-codepath that the bench CONFIRMED, not falsified).
+
+    **Bench artifacts:** `/tmp/iter50/bench/20260429T220742Z.results.tsv` (raw 23-trial table) + 23 `.stdout`/`.stderr` files per trial + `/tmp/iter50/bench.log` (full bench session log).  Side-A binary: `/tmp/iter50/hf2q-baseline-f1d11a4`.  Side-B binary: `/tmp/iter50/hf2q-iter50`.
+
 - **2026-04-29 — iter45-RESUMED — chain_n N-curve recapture LANDED on coherent + iter49-fixed baseline.  Bench is FCP-cleared (per iter45-original PARTIAL/BLOCKED at `ff1bc4d`); 4 fixtures × 5 N values × 5 cold-process trials × NGEN=256 paired hf2q + llama-bench captures complete.  Headline: **dwq46 35B-MoE closes the iter43 −5.96pp gap entirely at cn=2 (+1.14pp lead vs llama)**.  iter47's Q4_0 catch-all bypass diagnosis is the load-bearing root cause; iter45-RESUMED LANDS `(FfnQuantArm::MoeQ, Some(GgmlType::Q4_0)) if cfg_is_moe => 2` arm at `forward_gpu.rs:323` (within `chain_n_for`).  Phase 5 winner-gate PASS: ≥1pp on primary, ≥0pp on sisters, coherence_smoke 12/12 + coherence_matrix 0 GIBBERISH post-change.  iter45 H1 (cn=20 wins) FALSIFIED; H2 (cn=2 optimum) CONFIRMED stronger than predicted; H3 (cn=1 universal) REJECTED.**
 
     **HEAD CONTEXT.**  Worktree `agent-a62650c02a5784e68`, base `cf38ddd` (iter49 docs+code commit).  `mlx-native` HEAD `9bd1f6f` (untouched).  Parallel ADR-014 P11/P12 in `src/quantize/mod.rs` — fence preserved (this iter touches only `forward_gpu.rs`, `tests/perf_baseline.json`, this changelog, and adds `scripts/iter45-aggregate-results.py`).  iter45-original harness at `scripts/iter45-chain-n-curve-bench.sh` (committed `ff1bc4d`) re-used as-is with `HF2Q_BIN` overridden to this worktree's binary.

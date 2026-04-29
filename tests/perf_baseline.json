@@ -1,11 +1,11 @@
 {
-  "_comment": "ADR-015 iter45-RESUMED — per-cell hf2q/llama tok/s ratio floors.  Re-captured 2026-04-29 on coherent baseline (12/12 coherence_smoke PASS) using the iter45 chain_n N-curve harness (5 cold-process trials × NGEN=256 × paired hf2q + llama-bench).  iter45-RESUMED LANDS the (MoeQ, Q4_0) → cn=2 arm in chain_n_for; dwq46 production default shifts cn=1 (catch-all) → cn=2, closing the iter43 −5.96pp gap into a +1.14pp lead.  Sister cells (apex, 27b, gemma) unaffected by the Q4_0 MoE arm but re-measured here for same-day baseline integrity.",
-  "_captured_at": "2026-04-29T19:01:41Z",
-  "_baseline_commit": "iter45-RESUMED",
+  "_comment": "ADR-015 iter50 — per-cell hf2q/llama tok/s ratio floors.  iter50 LANDS the gemma forward_mlx Leg F → Branch A route at force_dense_sdpa_on_tq_kv default (forward_mlx.rs:2293,2315).  Gemma decode shifts from 8 dispatches/layer (Leg F: 2 dequant + 2 cache_copy + 2 FWHT + 2 flash_attn_vec) to 4 dispatches/layer (Branch A: 2 cache_copy + 2 flash_attn_vec) on already-allocated dense_kvs, closing the −2.48pp residual after iter49 into a +1.43pp lead vs llama.  Sister cells (apex, 27b, dwq46) on qwen35 forward_gpu path are unaffected by this change and confirmed within thermal noise vs iter45-RESUMED.",
+  "_captured_at": "2026-04-29T22:39:58Z",
+  "_baseline_commit": "iter50",
   "_baseline_date": "2026-04-29",
   "_baseline_mlx_native": "9bd1f6f",
   "_recapture_required": false,
-  "_recapture_reason": "iter45-RESUMED N-curve recapture against post-iter49 HEAD (cf38ddd).  Bench: /tmp/adr015-iter45/bench/N-curve-summary-20260429T190141Z.tsv.  All 4 fixtures × 5 N values × 5 trials archived.",
+  "_recapture_reason": "iter50 paired bench: gemma 5 trials × 3 sides {A_baseline=f1d11a4, B_iter50, L_llama-bench} + 3 sister fixtures × 3 trials × iter50 binary.  Bench: /tmp/iter50/bench/20260429T220742Z.results.tsv.",
   "_methodology": "scripts/iter45-chain-n-curve-bench.sh at NGEN=256, prompt='Hello, my name is', N_TRIALS=5 cold-process per cell.  hf2q runs each fixture under each of HF2Q_PARTIAL_CHAIN_N ∈ {1,2,4,8,20}; ratios below are hf2q_med / llama_med at the production-default cn for that fixture's quant arm.  Floor = measured_ratio - 0.01 tolerance.  Phase 5 gate: ≥1pp improvement on primary fixture AND ≥0pp regression on every other fixture AND coherence_smoke 12/12 PASS post-change.",
   "cells": {
     "qwen3.6-35b-a3b-dwq46": {
@@ -50,15 +50,15 @@
       "_note": "dense-27B × dwq48.  Not in iter45-RESUMED N-curve fixture set.  Floor inherited from iter41."
     },
     "gemma-26B-dwq": {
-      "ratio_floor": 0.96,
-      "_measured_ratio": 0.9752,
-      "_measured_hf2q_tps_med": 102.2,
-      "_measured_llama_tps_med": 104.80,
+      "ratio_floor": 1.00,
+      "_measured_ratio": 1.0143,
+      "_measured_hf2q_tps_med": 106.9,
+      "_measured_llama_tps_med": 105.39,
       "_measured_at_ngen": 256,
-      "_measured_at_commit": "iter45-RESUMED",
+      "_measured_at_commit": "iter50",
       "_measured_at_date": "2026-04-29",
       "_chain_n_default": "inert (forward_mlx)",
-      "_note": "gemma-26B × dwq.  iter45-RESUMED post-iter49 (HB-encode dead-write gate landed cf38ddd) measured 0.9752–0.9819× across all N (chain_n inert for forward_mlx).  iter43 measured 0.9629×; iter49 predicted +1.0–1.5pp shift to 0.973–0.978×.  MEASURED 0.9752× at cn=1 (matches predicted band; +1.23pp closure).  Floor 0.96 = measured 0.9752 - 0.01 tolerance.  Future gemma perf is iter50+ (forward_mlx Leg F architectural)."
+      "_note": "gemma-26B × dwq.  iter50 LANDS Leg F → Branch A route default at forward_mlx.rs:2293,2315.  Iter43→iter49 was 0.9629→0.9752 (+1.23pp from iter49 HB-encode gate).  iter50 measures Side A baseline=102.8 (0.9754×, replicates iter45-RESUMED) and Side B iter50=106.9 (1.0143×) vs same-day llama-bench median 105.39.  Δ B vs A = +3.89pp.  Phase 5 winner-gate PASS: ≥1pp on primary AND sister fixtures within thermal noise of iter45-RESUMED archived (dwq46 114.0-114.4 vs 113.9; apex 107.0-107.1 vs 106.8; 27b-dwq46 29.8-29.9 vs 29.7).  Floor 1.00 = measured 1.0143 - 0.01 tolerance, gating regressions to ≥1.00× minimum."
     }
   },
   "_tolerance_pp": 1.0,
@@ -114,6 +114,28 @@
         "primary_delta_pp": 1.47,
         "verdict": "DEFERRED — primary measure passed +1.47pp but apex is the SISTER fixture in iter45-RESUMED (not the primary); needs an apex-primary iter to validate Q5_K + Q6_K shifts together.  iter50+ candidate."
       }
+    }
+  },
+  "_iter50_summary": {
+    "_artefact": "/tmp/iter50/bench/20260429T220742Z.results.tsv",
+    "_n_trials_per_cell": "5 (gemma A/B/L) + 3 (sisters B-only)",
+    "_ngen": 256,
+    "_prompt": "Hello, my name is",
+    "_chat_template": "RAW",
+    "_pre_flight_audit": "PASS — pmset clean, vm_stat 100+ GB pre-bench, FCP/davinci/handbrake/ffmpeg empty, biomesyncd absent, mcp-brain-server STOP/CONT trapped",
+    "h2_phase_5_winner_gate": {
+      "candidate": "Branch A route at force_dense_sdpa_on_tq_kv default — forward_mlx.rs:2293,2315 (None if force_dense_sdpa_on_tq_kv => true)",
+      "primary_fixture": "gemma-26B-dwq",
+      "primary_delta_pp": 3.89,
+      "side_A_baseline_median_tps": 102.8,
+      "side_B_iter50_median_tps": 106.9,
+      "side_L_llama_median_tps": 105.39,
+      "side_A_ratio": 0.9754,
+      "side_B_ratio": 1.0143,
+      "sister_deltas_vs_iter45_resumed": {"dwq46": "+0.3 (114.2 vs 113.9)", "apex": "+0.3 (107.1 vs 106.8)", "27b-dwq46": "+0.1 (29.8 vs 29.7)"},
+      "coherence_smoke_post_change": "12/12 PASS in 87.5s",
+      "coherence_matrix_post_change": "EXACT=6 COHERENT=6 GIBBERISH=0",
+      "verdict": "LANDED — primary +3.89pp exceeds Phase 5 ≥1pp gate AND ≥0pp on every other fixture AND coherence_smoke 12/12 + coherence_matrix 0 GIBBERISH"
     }
   }
 }
