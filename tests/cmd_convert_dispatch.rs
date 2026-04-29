@@ -1145,3 +1145,67 @@ fn streaming_phase3_mut_byte_identical_to_eager_q4_k_m() {
          eager:  {eager_sha}\n  stream: {stream_sha}"
     );
 }
+
+// ---------------------------------------------------------------------
+// T19: HF2Q_STREAMING_PHASE3_MUT byte-identity matrix across 4 arms (iter-89)
+// ---------------------------------------------------------------------
+
+/// ADR-014 P7 iter-89 — extend iter-84's _MUT SHA gate from q4_k_m
+/// (single K-quant codec arm) to the full 4-arm Phase 3 matrix:
+///   - q5_k_m  → K-quant codec arm
+///   - q6_k    → K-quant codec arm
+///   - dwq-4-6 → DwqK arm (iter-88)
+///   - f16     → StaticQuantizer arm (iter-87)
+/// (imatrix-adaptive remains hardware-gated per iter-75; ImatrixAdaptive
+/// _MUT wire-up at iter-85 is structurally identical to other arms.)
+///
+/// Closes the production safety matrix for the zero-byte-copy wedge:
+/// every dispatch path that's wired under HF2Q_STREAMING_PHASE3_MUT
+/// has its file-level SHA-256 byte-identity locked vs eager.
+#[test]
+fn streaming_phase3_mut_byte_identical_matrix_across_arms() {
+    for variant in &["q5_k_m", "q6_k", "dwq-4-6", "f16"] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input_dir = tmp.path().join("input");
+        let eager_dir = tmp.path().join(format!("out_eager_mut_{}", variant.replace('-', "_")));
+        let stream_dir = tmp.path().join(format!("out_stream_mut_{}", variant.replace('-', "_")));
+        setup_p2_iter2_fixture(&input_dir);
+
+        Command::cargo_bin("hf2q")
+            .expect("hf2q binary")
+            .args([
+                "convert",
+                "--input", input_dir.to_str().unwrap(),
+                "--format", "gguf",
+                "--quant", *variant,
+                "--output", eager_dir.to_str().unwrap(),
+                "--skip-quality",
+            ])
+            .assert()
+            .success();
+
+        Command::cargo_bin("hf2q")
+            .expect("hf2q binary")
+            .env("HF2Q_STREAMING_PHASE3_MUT", "1")
+            .args([
+                "convert",
+                "--input", input_dir.to_str().unwrap(),
+                "--format", "gguf",
+                "--quant", *variant,
+                "--output", stream_dir.to_str().unwrap(),
+                "--skip-quality",
+            ])
+            .assert()
+            .success();
+
+        let eager_sha = file_sha256(&locate_gguf(&eager_dir));
+        let stream_sha = file_sha256(&locate_gguf(&stream_dir));
+
+        assert_eq!(
+            eager_sha, stream_sha,
+            "{variant}: HF2Q_STREAMING_PHASE3_MUT=1 GGUF must be byte-identical to \
+             eager — zero-byte-copy wedge regressed for this arm\n  \
+             eager:  {eager_sha}\n  stream: {stream_sha}"
+        );
+    }
+}
