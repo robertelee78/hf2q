@@ -11,12 +11,18 @@
 #   (c) optionally — record peak RSS + wall time via `/usr/bin/time -l`
 #
 # Usage:
-#   bash scripts/p11_re_emit_dwq.sh           # all 4 variants
-#   bash scripts/p11_re_emit_dwq.sh dwq46     # 27B + 35B-MoE dwq46 only
-#   bash scripts/p11_re_emit_dwq.sh dwq48     # 27B + 35B-MoE dwq48 only
-#   bash scripts/p11_re_emit_dwq.sh stream    # all 4 with HF2Q_STREAMING_PHASE3=1
+#   bash scripts/p11_re_emit_dwq.sh                # all 4 variants
+#   bash scripts/p11_re_emit_dwq.sh dwq46          # 27B + 35B-MoE dwq46 only
+#   bash scripts/p11_re_emit_dwq.sh dwq48          # 27B + 35B-MoE dwq48 only
+#   bash scripts/p11_re_emit_dwq.sh 27b-dwq46      # iter-92: 27B dwq46 only (smallest peak)
+#   bash scripts/p11_re_emit_dwq.sh 27b-dwq48      # iter-92: 27B dwq48 only
+#   bash scripts/p11_re_emit_dwq.sh 35bmoe-dwq46   # iter-92: 35B-MoE dwq46 only
+#   bash scripts/p11_re_emit_dwq.sh 35bmoe-dwq48   # iter-92: 35B-MoE dwq48 only
+#   bash scripts/p11_re_emit_dwq.sh stream         # all 4 with HF2Q_STREAMING_PHASE3=1
 #
 # Default behavior is the eager path; `stream` runs all 4 with the env flag on.
+# Per-variant selectors (iter-92 addition) let the loop progress one variant
+# at a time, letting RAM settle between heavy DWQ peaks.
 
 set -euo pipefail
 
@@ -112,15 +118,28 @@ esac
 # iter-92 fix: cli QuantMethod display strings are `dwq-4-6` / `dwq-4-8`
 # (not the legacy `dwq-mixed-*` form). Pre-iter-92 the script would have
 # been rejected by the clap parser at the first variant.
+#
+# iter-92 addition: per-variant selectors so the loop can run one heavy
+# DWQ conversion at a time and let RAM settle between peaks (memory note
+# project_dwq_concurrent_oom: DWQ 100 GB peak + concurrent inference =
+# jetsam SIGKILL).
 case "$selector" in
-    all|dwq46)
+    all|dwq46|27b-dwq46)
         run_convert "27B-dwq46${stream_mode:+-stream}" "$QWEN27_SRC"     "dwq-4-6" "$stream_mode"
+        ;;
+esac
+case "$selector" in
+    all|dwq46|35bmoe-dwq46)
         run_convert "35BMOE-dwq46${stream_mode:+-stream}" "$QWEN35MOE_SRC" "dwq-4-6" "$stream_mode"
         ;;
 esac
 case "$selector" in
-    all|dwq48)
+    all|dwq48|27b-dwq48)
         run_convert "27B-dwq48${stream_mode:+-stream}" "$QWEN27_SRC"     "dwq-4-8" "$stream_mode"
+        ;;
+esac
+case "$selector" in
+    all|dwq48|35bmoe-dwq48)
         run_convert "35BMOE-dwq48${stream_mode:+-stream}" "$QWEN35MOE_SRC" "dwq-4-8" "$stream_mode"
         ;;
 esac
