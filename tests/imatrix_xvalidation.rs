@@ -341,14 +341,73 @@ fn xvalidation_markdown_report_contains_required_columns() {
 /// any caller that re-enables this test before iter-2 is wired in
 /// gets a hard fail (not a fake-green).
 #[test]
-#[ignore = "P6 close gate: needs real model + llama-imatrix subprocess + ~1GB disk for Qwen3.5-0.6B GGUF"]
+#[ignore = "P6 close gate: set HF2Q_P6_HF2Q_IMATRIX_PATH + HF2Q_P6_LLAMA_IMATRIX_PATH to two pre-generated imatrix.gguf files"]
 fn xvalidation_vs_llama_imatrix_qwen35_smoke() {
-    eprintln!("P6 iter-1 — gate machinery only; iter-2 wires real model");
-    let report = XValidationReport::not_measured();
-    // Iter-1 contract: the sentinel cannot pass the gate. Iter-2
-    // replaces this with a real `cross_validate_imatrix_gguf` call.
-    assert!(
-        !report.is_pass(),
-        "iter-1: sentinel must not be mistaken for a passing gate"
-    );
+    // ADR-014 P6 iter-109 (2026-04-29): env-override close gate.
+    // When both env vars resolve to existing files, run the real
+    // `cross_validate_imatrix_gguf` comparison + assert pass at the
+    // ADR-014 §10 abs/rel tolerance defaults (0.01/0.01). Operators
+    // produce the two inputs as follows:
+    //
+    //   # peer side (llama.cpp imatrix subprocess)
+    //   /opt/homebrew/bin/llama-imatrix \
+    //       -m <some.gguf> \
+    //       -f <wikitext-2.txt> \
+    //       --output-format gguf \
+    //       -o llama.imatrix.gguf
+    //
+    //   # hf2q side (calibrator-driven)
+    //   ./target/release/hf2q convert \
+    //       --input <hf-source-dir> \
+    //       --format gguf \
+    //       --calibration imatrix \
+    //       --output-format imatrix-gguf \
+    //       --output hf2q.imatrix.gguf
+    //
+    //   HF2Q_P6_HF2Q_IMATRIX_PATH=hf2q.imatrix.gguf \
+    //   HF2Q_P6_LLAMA_IMATRIX_PATH=llama.imatrix.gguf \
+    //     cargo test --test imatrix_xvalidation -- --ignored \
+    //       xvalidation_vs_llama_imatrix_qwen35_smoke
+    //
+    // When env vars are unset (the always-on CI default), this test
+    // falls back to the iter-1 sentinel-only contract: assert that
+    // `XValidationReport::not_measured()` cannot pass the gate.
+    let hf2q_path = std::env::var("HF2Q_P6_HF2Q_IMATRIX_PATH")
+        .ok()
+        .map(std::path::PathBuf::from);
+    let llama_path = std::env::var("HF2Q_P6_LLAMA_IMATRIX_PATH")
+        .ok()
+        .map(std::path::PathBuf::from);
+
+    match (hf2q_path, llama_path) {
+        (Some(a), Some(b)) if a.exists() && b.exists() => {
+            eprintln!(
+                "P6 iter-109 close-gate ACTIVE — comparing\n  hf2q:  {}\n  llama: {}",
+                a.display(),
+                b.display()
+            );
+            let report = imatrix_xvalidate::cross_validate_imatrix_gguf(&a, &b, 0.01, 0.01)
+                .expect("cross_validate_imatrix_gguf returned XValidationError");
+            // Render the report markdown to the test stderr so the
+            // operator can read which tensors diverged when the gate
+            // fails.
+            eprintln!("\n{}", report.to_markdown());
+            assert!(
+                report.is_pass(),
+                "P6 close gate FAILED at abs_tol=0.01 rel_tol=0.01 — see markdown above"
+            );
+        }
+        _ => {
+            eprintln!(
+                "P6 iter-109 close-gate SKIPPED: HF2Q_P6_HF2Q_IMATRIX_PATH and \
+                 HF2Q_P6_LLAMA_IMATRIX_PATH must both be set + point to existing files. \
+                 Falling back to iter-1 sentinel contract."
+            );
+            let report = XValidationReport::not_measured();
+            assert!(
+                !report.is_pass(),
+                "iter-1 sentinel must not be mistaken for a passing gate"
+            );
+        }
+    }
 }
