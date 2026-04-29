@@ -1829,9 +1829,24 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 // byte-identical (proven by iter-47's
                 // `quantize_streaming_byte_identical_to_quantize_model`
                 // which uses StaticQuantizer in the smoke fixture).
+                // ADR-014 P7 iter-87 (2026-04-28): extend _MUT wire-up to
+                // StaticQuantizer arm; precedence MUT > legacy > eager.
                 let streaming_phase3 =
                     std::env::var("HF2Q_STREAMING_PHASE3").as_deref() == Ok("1");
-                let quant_result = if streaming_phase3 {
+                let streaming_phase3_mut =
+                    std::env::var("HF2Q_STREAMING_PHASE3_MUT").as_deref() == Ok("1");
+                let quant_result = if streaming_phase3_mut {
+                    tracing::info!("ADR-014 P7 iter-87: HF2Q_STREAMING_PHASE3_MUT=1 → quantize_via_streaming_consuming_mut (StaticQuantizer)");
+                    quantize::quantize_via_streaming_consuming_mut(
+                        &mut tensor_map,
+                        &metadata,
+                        &quantizer,
+                        bits,
+                        config.group_size,
+                        &progress,
+                    )
+                    .context("Quantization failed (consuming-mut path)")
+                } else if streaming_phase3 {
                     tracing::info!("ADR-014 P7 iter-50: HF2Q_STREAMING_PHASE3=1 → quantize_via_streaming_borrowed (StaticQuantizer)");
                     quantize::quantize_via_streaming_borrowed(
                         &tensor_map,
