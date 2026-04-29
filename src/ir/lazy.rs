@@ -411,6 +411,52 @@ impl LazyTensorMap {
         self.inner.iter()
     }
 
+    /// ADR-014 P7 iter-55 — convert all BF16 tensors to F16 in-place.
+    /// Mirrors `TensorMap::convert_bf16_to_f16` but operates lazily:
+    /// each BF16 tensor is replaced with a `LazyTensor` that
+    /// materialises → casts → drops the BF16 byte buffer per tensor.
+    ///
+    /// The cast itself is deferred to materialisation time — calling
+    /// this method only rebuilds the closure stack and updates the
+    /// meta dtype.  Memory profile during the call is metadata-only;
+    /// the per-tensor BF16→F16 cost lands at materialise.
+    ///
+    /// Required by iter-3 wholesale-skip plan (iter-53 survey) for
+    /// `main.rs:1188`'s `tensor_map.convert_bf16_to_f16()` call site:
+    ///   tensor_map.convert_bf16_to_f16() → lazy_map.convert_bf16_to_f16()
+    ///
+    /// Returns the count of converted tensors (matches eager variant's
+    /// signature exactly).
+    ///
+    /// **Byte-equality contract** to `TensorMap::convert_bf16_to_f16`:
+    /// after both paths complete, `materialize_all()` produces a
+    /// TensorMap with the same set of (name, F16 bytes) pairs.
+    /// Verified by `convert_bf16_to_f16_matches_eager`.
+    pub fn convert_bf16_to_f16(&mut self) -> Result<usize, MaterializeError> {
+        let bf16_names: Vec<String> = self
+            .inner
+            .iter()
+            .filter(|(_, t)| t.meta().dtype == DType::BF16)
+            .map(|(name, _)| name.clone())
+            .collect();
+        let count = bf16_names.len();
+
+        for name in bf16_names {
+            if let Some(lazy) = self.inner.remove(&name) {
+                let meta = lazy.meta();
+                let new_meta = LazyMeta::new(meta.name.clone(), meta.shape.clone(), DType::F16);
+                let new_lazy = lazy.map_with_meta(new_meta, |tensor| {
+                    tensor.to_f16().map_err(|e| MaterializeError::Transform {
+                        name: tensor.name.clone(),
+                        reason: format!("bf16→f16: {e}"),
+                    })
+                });
+                self.inner.insert(name, new_lazy);
+            }
+        }
+        Ok(count)
+    }
+
     /// ADR-014 P7 iter-54 — total bytes across all tensors, computed
     /// metadata-only.  Mirrors `TensorMap::total_size_bytes` but
     /// without requiring materialisation: each `LazyMeta::byte_len`
@@ -811,6 +857,96 @@ mod tests {
             "lazy total_size_bytes must match TensorMap::total_size_bytes \
              post-materialize — iter-3 telemetry swap is byte-identical"
         );
+    }
+
+    /// ADR-014 P7 iter-55 — `LazyTensorMap::convert_bf16_to_f16` produces
+    /// the same TensorMap (post-materialise) as the eager variant.
+    /// Locks the iter-3 swap at main.rs:1188.
+    #[test]
+    fn test_convert_bf16_to_f16_matches_eager() {
+        // Build identical lazy + eager fixtures with mixed BF16/F16/F32 tensors.
+        fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|v| half::bf16::from_f32(*v).to_le_bytes())
+                .collect()
+        }
+        fn f16_bytes(values: &[f32]) -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+                .collect()
+        }
+
+        let f32_a = [1.0_f32, 2.0, 3.0, 4.0];
+        let f32_b = [-1.5_f32, 0.5, 2.5];
+
+        // Lazy fixture.
+        let mut lazy = LazyTensorMap::new();
+        lazy.insert(LazyTensor::from_bytes(
+            meta("bf16_a", vec![4], DType::BF16),
+            bf16_bytes(&f32_a),
+        ));
+        lazy.insert(LazyTensor::from_bytes(
+            meta("bf16_b", vec![3], DType::BF16),
+            bf16_bytes(&f32_b),
+        ));
+        lazy.insert(LazyTensor::from_bytes(
+            meta("f16_c", vec![3], DType::F16),
+            f16_bytes(&f32_b),
+        ));
+
+        // Eager fixture (same content).
+        let mut eager = TensorMap::new();
+        eager.insert(TensorRef {
+            name: "bf16_a".to_string(),
+            shape: vec![4],
+            dtype: DType::BF16,
+            data: bf16_bytes(&f32_a),
+        });
+        eager.insert(TensorRef {
+            name: "bf16_b".to_string(),
+            shape: vec![3],
+            dtype: DType::BF16,
+            data: bf16_bytes(&f32_b),
+        });
+        eager.insert(TensorRef {
+            name: "f16_c".to_string(),
+            shape: vec![3],
+            dtype: DType::F16,
+            data: f16_bytes(&f32_b),
+        });
+
+        let lazy_count = lazy.convert_bf16_to_f16().expect("lazy convert");
+        let eager_count = eager.convert_bf16_to_f16().expect("eager convert");
+        assert_eq!(lazy_count, eager_count, "convert counts equal");
+        assert_eq!(lazy_count, 2, "exactly two BF16 tensors");
+
+        // Materialize lazy, compare bytes pair-by-pair against eager.
+        let materialized = lazy.materialize_all().expect("materialize");
+        for name in ["bf16_a", "bf16_b", "f16_c"] {
+            let m = materialized
+                .tensors
+                .get(name)
+                .unwrap_or_else(|| panic!("materialized missing {name}"));
+            let e = eager
+                .tensors
+                .get(name)
+                .unwrap_or_else(|| panic!("eager missing {name}"));
+            assert_eq!(
+                m.dtype, e.dtype,
+                "{name}: dtype must match (BF16 → F16 for converted; F16 unchanged)"
+            );
+            assert_eq!(
+                m.dtype,
+                DType::F16,
+                "{name}: post-conversion dtype must be F16"
+            );
+            assert_eq!(
+                m.data, e.data,
+                "{name}: bytes must equal eager-converted output"
+            );
+        }
     }
 
     #[test]
