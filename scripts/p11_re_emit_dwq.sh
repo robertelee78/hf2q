@@ -109,16 +109,19 @@ case "$selector" in
         ;;
 esac
 
+# iter-92 fix: cli QuantMethod display strings are `dwq-4-6` / `dwq-4-8`
+# (not the legacy `dwq-mixed-*` form). Pre-iter-92 the script would have
+# been rejected by the clap parser at the first variant.
 case "$selector" in
     all|dwq46)
-        run_convert "27B-dwq46${stream_mode:+-stream}" "$QWEN27_SRC"     "dwq-mixed-4-6" "$stream_mode"
-        run_convert "35BMOE-dwq46${stream_mode:+-stream}" "$QWEN35MOE_SRC" "dwq-mixed-4-6" "$stream_mode"
+        run_convert "27B-dwq46${stream_mode:+-stream}" "$QWEN27_SRC"     "dwq-4-6" "$stream_mode"
+        run_convert "35BMOE-dwq46${stream_mode:+-stream}" "$QWEN35MOE_SRC" "dwq-4-6" "$stream_mode"
         ;;
 esac
 case "$selector" in
     all|dwq48)
-        run_convert "27B-dwq48${stream_mode:+-stream}" "$QWEN27_SRC"     "dwq-mixed-4-8" "$stream_mode"
-        run_convert "35BMOE-dwq48${stream_mode:+-stream}" "$QWEN35MOE_SRC" "dwq-mixed-4-8" "$stream_mode"
+        run_convert "27B-dwq48${stream_mode:+-stream}" "$QWEN27_SRC"     "dwq-4-8" "$stream_mode"
+        run_convert "35BMOE-dwq48${stream_mode:+-stream}" "$QWEN35MOE_SRC" "dwq-4-8" "$stream_mode"
         ;;
 esac
 
