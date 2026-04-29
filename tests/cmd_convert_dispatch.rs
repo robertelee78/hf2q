@@ -562,3 +562,70 @@ fn auto_routes_per_decision_18_table() {
     let gguf = locate_gguf(&output_dir);
     assert!(gguf.exists(), "auto must produce a GGUF");
 }
+
+// ---------------------------------------------------------------------
+// T10: HF2Q_STREAMING_PHASE3=1 produces byte-identical GGUF (iter-61)
+// ---------------------------------------------------------------------
+
+/// ADR-014 P7 iter-61 — production E2E byte-identity gate for the
+/// streaming wire-up under `HF2Q_STREAMING_PHASE3=1`.
+///
+/// Runs `hf2q convert --quant q4_k_m` twice on the same fixture: once
+/// in default (eager) mode, once with the env flag.  Asserts the
+/// output GGUFs are byte-equal via SHA-256.
+///
+/// This is the missing E2E gate that iter-48-52's per-arm unit tests
+/// don't provide: it proves the env flag's *integrated* effect across
+/// Phase 3 + 4.5 + 4.6 is byte-identical at the file level, not just
+/// at each individual call site.  Without this, the iter-3 wholesale
+/// surgery in iter-62+ would have no production safety signal.
+#[test]
+fn streaming_phase3_byte_identical_to_eager_q4_k_m() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let input_dir = tmp.path().join("input");
+    let eager_dir = tmp.path().join("out_eager");
+    let stream_dir = tmp.path().join("out_stream");
+    setup_p2_iter2_fixture(&input_dir);
+
+    // Eager path (default).
+    Command::cargo_bin("hf2q")
+        .expect("hf2q binary")
+        .args([
+            "convert",
+            "--input", input_dir.to_str().unwrap(),
+            "--format", "gguf",
+            "--quant", "q4_k_m",
+            "--output", eager_dir.to_str().unwrap(),
+            "--skip-quality",
+        ])
+        .assert()
+        .success();
+
+    // Streaming path (env flag on).
+    Command::cargo_bin("hf2q")
+        .expect("hf2q binary")
+        .env("HF2Q_STREAMING_PHASE3", "1")
+        .args([
+            "convert",
+            "--input", input_dir.to_str().unwrap(),
+            "--format", "gguf",
+            "--quant", "q4_k_m",
+            "--output", stream_dir.to_str().unwrap(),
+            "--skip-quality",
+        ])
+        .assert()
+        .success();
+
+    let eager_gguf = locate_gguf(&eager_dir);
+    let stream_gguf = locate_gguf(&stream_dir);
+    let eager_sha = file_sha256(&eager_gguf);
+    let stream_sha = file_sha256(&stream_gguf);
+
+    assert_eq!(
+        eager_sha, stream_sha,
+        "HF2Q_STREAMING_PHASE3=1 GGUF must be byte-identical to eager GGUF \
+         on q4_k_m fixture — env-flag wedge has lost byte-identity at the \
+         file level (per-arm unit tests pass but integrated path differs)\n\
+         eager SHA: {eager_sha}\nstream SHA: {stream_sha}"
+    );
+}
