@@ -1209,3 +1209,105 @@ fn streaming_phase3_mut_byte_identical_matrix_across_arms() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// T20: HF2Q_STREAMING_PHASE3_MUT defensive guard (iter-91)
+// ---------------------------------------------------------------------
+
+/// ADR-014 P7 iter-91 — verify the cmd_convert defensive guard against
+/// HF2Q_STREAMING_PHASE3_MUT × Phase 4.5 mismatch fires correctly.
+///
+/// Background: the _MUT zero-byte-copy wedge drains tensor_map mid-Phase-3
+/// (TensorRef::take_data_as_arc → mem::take on the inner Vec<u8>). Phase 4.5
+/// quality measurement reads tensor_map for the original bytes — under _MUT,
+/// those bytes are gone by the time Phase 4.5 runs, so quality measurement
+/// would silently operate on empty Vec<u8> and produce a degenerate report.
+///
+/// The guard in cmd_convert refuses _MUT × !skip_quality early (before any
+/// expensive work) with a clear error message naming both supported
+/// workarounds (--skip-quality OR HF2Q_STREAMING_PHASE3=1 borrowed wedge).
+///
+/// This test exercises the negative path: invokes the binary with
+/// HF2Q_STREAMING_PHASE3_MUT=1 but WITHOUT --skip-quality, asserts non-zero
+/// exit and that stderr names the offending env var so users get directed
+/// to the workarounds.
+#[test]
+fn streaming_phase3_mut_requires_skip_quality_guard() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let input_dir = tmp.path().join("input");
+    let output_dir = tmp.path().join("out_mut_no_skip");
+    setup_p2_iter2_fixture(&input_dir);
+
+    Command::cargo_bin("hf2q")
+        .expect("hf2q binary")
+        .env("HF2Q_STREAMING_PHASE3_MUT", "1")
+        .args([
+            "convert",
+            "--input", input_dir.to_str().unwrap(),
+            "--format", "gguf",
+            "--quant", "q4_k_m",
+            "--output", output_dir.to_str().unwrap(),
+            // intentionally NO --skip-quality
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("HF2Q_STREAMING_PHASE3_MUT"))
+        .stderr(predicates::str::contains("--skip-quality"));
+}
+
+/// ADR-014 P7 iter-91 — confirm the guard does NOT fire when the user has
+/// opted into the supported workaround (--skip-quality + _MUT). This is the
+/// happy path that all the iter-84/87/88/89 SHA gates already exercise; the
+/// extra explicit test here documents the contract.
+#[test]
+fn streaming_phase3_mut_with_skip_quality_succeeds() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let input_dir = tmp.path().join("input");
+    let output_dir = tmp.path().join("out_mut_skip");
+    setup_p2_iter2_fixture(&input_dir);
+
+    Command::cargo_bin("hf2q")
+        .expect("hf2q binary")
+        .env("HF2Q_STREAMING_PHASE3_MUT", "1")
+        .args([
+            "convert",
+            "--input", input_dir.to_str().unwrap(),
+            "--format", "gguf",
+            "--quant", "q4_k_m",
+            "--output", output_dir.to_str().unwrap(),
+            "--skip-quality",
+        ])
+        .assert()
+        .success();
+
+    // Confirm a GGUF was actually emitted (positive control).
+    let _ = locate_gguf(&output_dir);
+}
+
+/// ADR-014 P7 iter-91 — confirm the borrowed wedge (HF2Q_STREAMING_PHASE3=1)
+/// does NOT trigger the guard. Borrowed mode shares bytes via Arc<Vec<u8>>
+/// (per-tensor t.data.clone() into Arc) and keeps tensor_map populated, so
+/// Phase 4.5 quality measurement still works.
+#[test]
+fn streaming_phase3_borrowed_with_quality_succeeds() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let input_dir = tmp.path().join("input");
+    let output_dir = tmp.path().join("out_borrowed_with_quality");
+    setup_p2_iter2_fixture(&input_dir);
+
+    Command::cargo_bin("hf2q")
+        .expect("hf2q binary")
+        .env("HF2Q_STREAMING_PHASE3", "1")
+        .args([
+            "convert",
+            "--input", input_dir.to_str().unwrap(),
+            "--format", "gguf",
+            "--quant", "q4_k_m",
+            "--output", output_dir.to_str().unwrap(),
+            // intentionally NO --skip-quality — borrowed wedge supports quality
+        ])
+        .assert()
+        .success();
+
+    let _ = locate_gguf(&output_dir);
+}

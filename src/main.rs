@@ -585,6 +585,33 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         "Starting conversion"
     );
 
+    // ADR-014 P7 iter-91 (2026-04-28): defensive guard against _MUT × Phase 4.5
+    // mismatch. HF2Q_STREAMING_PHASE3_MUT drains tensor_map mid-Phase-3 (via
+    // TensorRef::take_data_as_arc → mem::take on the inner Vec<u8>), leaving
+    // Phase 4.5 quality measurement with empty bytes. Until the lazy-from-disk
+    // Phase 4.5 path lands (iter-3 wholesale work), the _MUT wedge must be
+    // paired with --skip-quality. Fail fast with a clear message rather than
+    // silently producing a degenerate quality report from drained tensors.
+    //
+    // Two supported workarounds in the error message:
+    //   1. --skip-quality (use `hf2q validate` post-conversion)
+    //   2. HF2Q_STREAMING_PHASE3=1 (borrowed wedge — shares via Arc, keeps
+    //      tensor_map populated, preserves Phase 4.5 quality measurement)
+    let phase3_mut = std::env::var("HF2Q_STREAMING_PHASE3_MUT").as_deref() == Ok("1");
+    if phase3_mut && !config.skip_quality {
+        return Err(AppError::Conversion(anyhow::anyhow!(
+            "HF2Q_STREAMING_PHASE3_MUT=1 (zero-byte-copy wedge) requires \
+             --skip-quality. The _MUT path drains the in-memory tensor_map \
+             during Phase 3 dispatch, so Phase 4.5 quality measurement would \
+             operate on empty bytes. Workarounds:\n  \
+             1. Re-run with --skip-quality (recommended for memory-constrained \
+                DWQ re-emit; measure quality via `hf2q validate` post-conversion).\n  \
+             2. Use HF2Q_STREAMING_PHASE3=1 instead (borrowed wedge — shares \
+                bytes via Arc, keeps tensor_map populated, preserves Phase 4.5 \
+                quality)."
+        )));
+    }
+
     // Phase 0: Read model metadata for preflight
     //
     // `metadata` is `mut` so Phase 1.8 (vocab-pad de-pad, ADR-012) can
