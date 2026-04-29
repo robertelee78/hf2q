@@ -2006,6 +2006,61 @@ impl Qwen35Model {
             .map(|v| v == "1")
             .unwrap_or(false);
 
+        // ---- ADR-015 iter17: partial-chain MoE-FFN encoder ----
+        //
+        // HF2Q_PARTIAL_CHAIN_N controls how many consecutive single-cb-eligible
+        // decode layers share ONE Metal command buffer (vs 1 CB/layer baseline).
+        //
+        //   unset / 0 / 1 → baseline (40 CBs/token on apex dwq46, the iter11
+        //                   single-cb-per-layer path that gives 0.9342×).
+        //   N ≥ 2         → group N consecutive layers per CB (40/N CBs).
+        //                   Cross-layer RAW barrier (FFN-out → next layer's
+        //                   attn input) preserved via enc.memory_barrier()
+        //                   between layers within a group; commit fires at
+        //                   the end of each group.
+        //
+        // Hypothesis (iter17): per-CB fixed cost (residency-set commit,
+        // pipeline-state binds, completion-handler ARC) compounds 40× per
+        // token; reducing CB count to ~5-10 via N=4 or N=8 should recover
+        // proportional wall iff async-overlap is preserved between groups
+        // (still ≥2 in-flight CBs).  iter10 (full chain N=∞ with output
+        // head also chained) regressed -7.8pp; iter17 narrows to MoE-FFN
+        // encoder grouping only and tests the non-monotonic recovery
+        // surface (iter10 lower bound 0.8676×, iter11 baseline 0.9342×).
+        //
+        // Eligibility: a chain group must be homogeneous (all layers in the
+        // group are single_cb_eligible).  On non-eligible layers the chain
+        // commits early and resumes at the next eligible layer.  For dwq46
+        // (40 layers, all MoeQ) and 27B-dwq46 (64 DenseQ) groups are uniform.
+        let chain_n: usize = std::env::var("HF2Q_PARTIAL_CHAIN_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n >= 1)
+            .unwrap_or(1);
+        let partial_chain_enabled = chain_n > 1 && !legacy_per_layer_cb;
+
+        // Persistent partial-chain encoder.  None when partial_chain_enabled
+        // is false OR between groups (committed at group end, reopened at
+        // next group start).  Lives across the per-layer loop scope.
+        //
+        // Error-path note (codex iter17 review F): if `?` exits the layer body
+        // mid-group (after CPU-side `slot.swap_*()` has run but before the
+        // chain encoder commits), `chain_enc` Drop calls only `end_active_encoder`
+        // and the CB is discarded uncommitted.  Layer N's swap is now CPU-state-
+        // advanced but GPU-state-unchanged, so the kv_cache is in an inconsistent
+        // intermediate state.  However, on `?` propagation, the caller
+        // (`serve::generate`) returns the error to the user and `kv_cache` is
+        // dropped at the call frame's end — the inconsistent state never
+        // reaches a subsequent decode token.  This is the same fail-and-discard
+        // contract pre-iter17 had (single-cb-per-layer pattern is the same:
+        // swap → `?`-able FFN dispatch → commit; an error after swap leaves
+        // kv_cache inconsistent until it falls out of scope).  iter17 chain mode
+        // grows the swap-to-commit window from 1 layer to N layers; for the
+        // shipping default N=2 the window grows by 2× (from ~1 layer to ~2
+        // layers) — same order of magnitude.  For N≥4 the window grows
+        // proportionally; iter17 does not ship N≥4 by default.
+        let mut chain_enc: Option<mlx_native::CommandEncoder> = None;
+
         // ---- Per-layer forward pass (identical to forward_gpu) ----
         let decode_profile = std::env::var("HF2Q_DECODE_PROFILE").is_ok();
         let cb_start = if decode_profile {
@@ -2021,6 +2076,7 @@ impl Qwen35Model {
         let mut total_linear_attn_us = 0u64;
         let mut total_full_attn_us = 0u64;
         let mut total_ffn_us = 0u64;
+        let n_layers = layer_weights_gpu.len();
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
             let layer_cpu = &self.layers[layer_idx];
             let post_norm_w = match layer_gpu {
@@ -2077,9 +2133,49 @@ impl Qwen35Model {
                 // layers): 30 + 30 + 40 - 40 = 60 CBs eliminated layer-side,
                 // plus 2 from the output head (S1) = 62 total saved per
                 // token, leaving 41 CBs (40 fused-layer + 1 output head).
-                let mut enc = device
-                    .command_encoder()
-                    .with_context(|| format!("enc single-cb layer {layer_idx}"))?;
+                //
+                // ADR-015 iter17: when partial_chain_enabled (HF2Q_PARTIAL_CHAIN_N>1),
+                // group `chain_n` consecutive single-cb-eligible layers into ONE
+                // command buffer.  The encoder lives in `chain_enc`; opened at
+                // group start (chain_enc=None and this layer is eligible),
+                // committed at group end (last layer in group OR final layer)
+                // with a label `layer.partial_chain.group_NxK` for xctrace
+                // attribution.  Within a group, cross-layer RAW (FFN-out →
+                // next layer's attn input) is enforced via memory_barrier()
+                // at the per-layer commit site below.
+                //
+                // Open the chain encoder lazily at group start.  When
+                // partial_chain_enabled is false this branch never fires;
+                // the per-layer device.command_encoder() path below runs.
+                if partial_chain_enabled && chain_enc.is_none() {
+                    chain_enc = Some(
+                        device
+                            .command_encoder()
+                            .with_context(|| {
+                                format!("enc partial-chain group-start layer {layer_idx}")
+                            })?,
+                    );
+                }
+                // Per-layer fallback encoder (only allocated when NOT in chain mode).
+                let mut owned_enc: Option<mlx_native::CommandEncoder> = if partial_chain_enabled {
+                    None
+                } else {
+                    Some(
+                        device
+                            .command_encoder()
+                            .with_context(|| format!("enc single-cb layer {layer_idx}"))?,
+                    )
+                };
+                // Borrow whichever encoder is active for this layer.
+                let enc: &mut mlx_native::CommandEncoder = if partial_chain_enabled {
+                    chain_enc
+                        .as_mut()
+                        .expect("chain_enc opened above when partial_chain_enabled")
+                } else {
+                    owned_enc
+                        .as_mut()
+                        .expect("owned_enc opened above when !partial_chain_enabled")
+                };
 
                 // ── Attention into shared `enc` ────────────────────────
                 let attn_out = match layer_gpu {
@@ -2097,7 +2193,7 @@ impl Qwen35Model {
                         let max_seq = kv_cache.max_seq_len;
                         let slot = &mut kv_cache.full_attn[full_attn_rank];
                         apply_gated_attn_layer_decode_into(
-                            &mut enc,
+                            enc,
                             &device,
                             &mut registry,
                             &hidden,
@@ -2168,7 +2264,7 @@ impl Qwen35Model {
                             )
                         };
                         let out = build_delta_net_layer_decode_into(
-                            &mut enc,
+                            enc,
                             &device,
                             &mut registry,
                             &hidden,
@@ -2232,7 +2328,7 @@ impl Qwen35Model {
                             shared_intermediate_size: moe.shared_expert_intermediate_size,
                         };
                         dispatch_fused_residual_norm_f32(
-                            &mut enc,
+                            enc,
                             &mut registry,
                             device.metal_device(),
                             &hidden,
@@ -2253,7 +2349,7 @@ impl Qwen35Model {
                         // from legacy MoeQ arm at forward_gpu.rs:1743).
                         enc.memory_barrier();
                         let out = build_moe_ffn_layer_gpu_q_into(
-                            &mut enc,
+                            enc,
                             &device,
                             &mut registry,
                             ffn_input_buf_ref,
@@ -2262,12 +2358,11 @@ impl Qwen35Model {
                             Some(ffn_residual_buf_ref),
                         )
                         .with_context(|| format!("moe_ffn_q_into single-cb layer {layer_idx}"))?;
-                        enc.commit_labeled("layer.attn_moe_ffn");
                         out
                     }
                     FfnWeightsGpu::DenseQ(w) => {
                         dispatch_fused_residual_norm_f32(
-                            &mut enc,
+                            enc,
                             &mut registry,
                             device.metal_device(),
                             &hidden,
@@ -2284,7 +2379,7 @@ impl Qwen35Model {
                         // from legacy DenseQ arm at forward_gpu.rs:1781).
                         enc.memory_barrier();
                         let out = build_dense_ffn_layer_gpu_q_into(
-                            &mut enc,
+                            enc,
                             &device,
                             &mut registry,
                             ffn_input_buf_ref,
@@ -2292,13 +2387,78 @@ impl Qwen35Model {
                             Some(ffn_residual_buf_ref),
                         )
                         .with_context(|| format!("dense_ffn_q_into single-cb layer {layer_idx}"))?;
-                        enc.commit_labeled("layer.attn_dense_ffn");
                         out
                     }
                     _ => unreachable!(
                         "single-cb path eligibility check filtered to MoeQ/DenseQ only"
                     ),
                 };
+
+                // ---- ADR-015 iter17: group commit / barrier policy ----
+                //
+                // After the layer body has dispatched (attn → fused_norm → FFN
+                // with residual fold), decide whether to:
+                //   (a) commit the chain encoder (group end OR per-layer mode), OR
+                //   (b) issue a cross-layer memory_barrier() and keep the chain
+                //       encoder alive for the next layer.
+                //
+                // Cross-layer RAW: layer N's `out` (= ffn_residual_buf_ref +
+                // FFN result, returned as `out`) is read by layer N+1's attn
+                // input (`hidden = ffn_out` at the end of this loop iteration).
+                // Within a single command buffer, GPU-side dispatches are not
+                // ordered without an explicit barrier — same iter10-Claude-
+                // variant correctness invariant.
+                //
+                // Label naming: `layer.attn_moe_ffn` / `layer.attn_dense_ffn`
+                // preserved when N=1 (legacy single-cb-per-layer path).
+                // When N>1, label encodes both the FFN family and group index
+                // via `layer.partial_chain_n{N}.{family}.g{group_idx}` so
+                // xctrace MST attribution can bucket by group size.
+                let ffn_family_label: &str = match ffn_weights_gpu {
+                    FfnWeightsGpu::MoeQ(_) => "moe_ffn",
+                    FfnWeightsGpu::DenseQ(_) => "dense_ffn",
+                    _ => unreachable!("filtered above"),
+                };
+                if partial_chain_enabled {
+                    // Group-end policy: last layer in group OR final layer.
+                    // Group boundary = (layer_idx + 1) % chain_n == 0.
+                    let group_idx = layer_idx / chain_n;
+                    let last_in_group = (layer_idx + 1) % chain_n == 0;
+                    let last_layer = layer_idx + 1 == n_layers;
+                    if last_in_group || last_layer {
+                        // Drop the &mut borrow before consuming chain_enc.
+                        let _ = enc;
+                        let label = format!(
+                            "layer.partial_chain_n{}.{}.g{}",
+                            chain_n, ffn_family_label, group_idx
+                        );
+                        chain_enc
+                            .take()
+                            .expect("chain_enc opened above when partial_chain_enabled")
+                            .commit_labeled(&label);
+                    } else {
+                        // Mid-group: cross-layer RAW barrier.
+                        // GPU produces ffn_out in layer N's FFN; layer N+1's
+                        // attn reads it via `hidden`.  Barrier guarantees
+                        // the producer's writes are visible to the consumer
+                        // within the same MTLCommandBuffer.
+                        enc.memory_barrier();
+                    }
+                } else {
+                    // Per-layer commit (baseline N=1 behavior, byte-equivalent
+                    // to pre-iter17 path).
+                    let label = match ffn_weights_gpu {
+                        FfnWeightsGpu::MoeQ(_) => "layer.attn_moe_ffn",
+                        FfnWeightsGpu::DenseQ(_) => "layer.attn_dense_ffn",
+                        _ => unreachable!("filtered above"),
+                    };
+                    // Drop the &mut borrow before consuming owned_enc.
+                    let _ = enc;
+                    owned_enc
+                        .take()
+                        .expect("owned_enc opened above when !partial_chain_enabled")
+                        .commit_labeled(label);
+                }
                 out
             } else {
                 // ---- LEGACY PATH: per-helper-commit encoders ----
@@ -2308,6 +2468,17 @@ impl Qwen35Model {
                 // helper opens + commits its own encoder.  Activated by
                 // HF2Q_LEGACY_PER_LAYER_CB=1 OR by non-MoeQ/non-DenseQ FFN
                 // arms (Dense F32, F32-MoE — non-production paths).
+                //
+                // ADR-015 iter17: if a partial-chain encoder is open from a
+                // previous eligible layer, commit it before opening any
+                // legacy per-helper encoder so the GPU FIFO orders the
+                // chain's writes ahead of the legacy reads.  This only
+                // matters on hypothetical mixed-eligibility models; uniform
+                // dwq46 (40 MoeQ) / 27B-dwq46 (64 DenseQ) production paths
+                // always take the single-cb arm.
+                if let Some(mut c) = chain_enc.take() {
+                    c.commit_labeled("layer.partial_chain.flush_before_legacy");
+                }
                 let attn_out = match layer_gpu {
                     LayerWeightsGpu::FullAttn { attn, .. } => {
                         let shape = FullAttnShape::from_config(cfg);
@@ -2645,6 +2816,15 @@ impl Qwen35Model {
                 cb_count,
                 disp_count,
             );
+        }
+
+        // ADR-015 iter17: defensive flush — if the partial-chain encoder is
+        // still open at loop exit (should not happen given the last_layer
+        // commit policy above, but Rust's drop-without-commit would silently
+        // discard pending dispatches), commit it here before the output head.
+        // Logged at debug level via commit_labeled so xctrace MST captures it.
+        if let Some(mut c) = chain_enc.take() {
+            c.commit_labeled("layer.partial_chain.flush_post_loop");
         }
 
         // ---- Output head: GPU argmax → 4-byte download ----
