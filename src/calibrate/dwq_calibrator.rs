@@ -267,6 +267,19 @@ impl Calibrator for DwqCalibrator {
             corpus_sha(corpus),
             SENSITIVITY_ALGORITHM_VERSION,
         );
+
+        // ADR-014 P11 iter-96: emit cache key at WARN so default RUST_LOG=warn
+        // captures it. Lets operators prime ~/.cache/hf2q/sensitivity/ from a
+        // prior emission's sensitivity ranking (e.g. extracting blk.{i}.sensitivity
+        // tensors from an existing dwq46/dwq48 GGUF) without paying the full
+        // activation-capture cost on first-time conversion.
+        warn!(
+            arch = ?self.arch,
+            cache_key = %cache_key.hash(),
+            algorithm_version = SENSITIVITY_ALGORITHM_VERSION,
+            "DWQ cache key (iter-96 P11 cache-priming aid)"
+        );
+
         let cache_path = match cache_file_path(&cache_key) {
             Ok(path) => Some(path),
             Err(err) => {
