@@ -171,11 +171,25 @@ pub fn quantize_via_streaming_borrowed(
     progress: &ProgressReporter,
 ) -> Result<crate::ir::QuantizedModel, QuantizeError> {
     use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+    use std::sync::Arc;
 
     let mut lazy_map = LazyTensorMap::new();
+    // ADR-014 P13 step 5 (iter-77): use `LazyTensor::from_arc_bytes` (iter-76)
+    // instead of `from_bytes` with a deep `t.data.clone()`.  Today this still
+    // costs one Vec→Arc<Vec<u8>> wrap (the underlying bytes are cloned into
+    // a new Vec because `t.data` is still `Vec<u8>` per the un-migrated
+    // `TensorRef` contract).  When P13 step 6+ migrates `TensorRef::data` to
+    // `Arc<[u8]>`, this wrap becomes a refcount bump — zero bytes copied.
+    // The structural shift is captured here so the future migration is a
+    // single-line swap (`Arc::clone(&t.data)` instead of `Arc::new(t.data.clone())`)
+    // rather than a wholesale rewrite of this loop.
     for (_, t) in tensor_map.tensors.iter() {
         let meta = LazyMeta::new(t.name.clone(), t.shape.clone(), t.dtype);
-        lazy_map.insert(LazyTensor::from_bytes(meta, t.data.clone()));
+        // Refcount==1 when materialise() runs (the LazyTensor here is the
+        // sole strong-ref holder; tensor_map's `&Vec<u8>` is a borrow).
+        // → Arc::unwrap_or_clone path inside materialize() is zero-copy.
+        let shared: Arc<Vec<u8>> = Arc::new(t.data.clone());
+        lazy_map.insert(LazyTensor::from_arc_bytes(meta, shared));
     }
     quantize_streaming(lazy_map, metadata, quantizer, bits, group_size, progress, false)
 }
