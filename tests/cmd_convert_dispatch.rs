@@ -629,3 +629,62 @@ fn streaming_phase3_byte_identical_to_eager_q4_k_m() {
          eager SHA: {eager_sha}\nstream SHA: {stream_sha}"
     );
 }
+
+// ---------------------------------------------------------------------
+// T11: HF2Q_STREAMING_PHASE3 byte-identity matrix across K-quant variants (iter-62)
+// ---------------------------------------------------------------------
+
+/// ADR-014 P7 iter-62 — extend iter-61's SHA gate to cover the K-quant
+/// variant matrix (q5_k_m, q6_k) so any future regression where
+/// streaming ≠ eager on a non-q4_k_m variant surfaces immediately.
+///
+/// Each variant runs through eager + streaming and asserts file-level
+/// SHA-256 equality.  The fixture has 256-element rows so every K-quant
+/// codec produces real super-blocks (Q4_K=144, Q5_K=176, Q6_K=210 bytes).
+#[test]
+fn streaming_phase3_byte_identical_matrix_across_kquants() {
+    for variant in &["q5_k_m", "q6_k"] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input_dir = tmp.path().join("input");
+        let eager_dir = tmp.path().join(format!("out_eager_{}", variant));
+        let stream_dir = tmp.path().join(format!("out_stream_{}", variant));
+        setup_p2_iter2_fixture(&input_dir);
+
+        Command::cargo_bin("hf2q")
+            .expect("hf2q binary")
+            .args([
+                "convert",
+                "--input", input_dir.to_str().unwrap(),
+                "--format", "gguf",
+                "--quant", *variant,
+                "--output", eager_dir.to_str().unwrap(),
+                "--skip-quality",
+            ])
+            .assert()
+            .success();
+
+        Command::cargo_bin("hf2q")
+            .expect("hf2q binary")
+            .env("HF2Q_STREAMING_PHASE3", "1")
+            .args([
+                "convert",
+                "--input", input_dir.to_str().unwrap(),
+                "--format", "gguf",
+                "--quant", *variant,
+                "--output", stream_dir.to_str().unwrap(),
+                "--skip-quality",
+            ])
+            .assert()
+            .success();
+
+        let eager_sha = file_sha256(&locate_gguf(&eager_dir));
+        let stream_sha = file_sha256(&locate_gguf(&stream_dir));
+
+        assert_eq!(
+            eager_sha, stream_sha,
+            "{variant}: HF2Q_STREAMING_PHASE3=1 GGUF must be byte-identical \
+             to eager GGUF — env-flag wedge has lost byte-identity at file \
+             level for this variant\n  eager:  {eager_sha}\n  stream: {stream_sha}"
+        );
+    }
+}
