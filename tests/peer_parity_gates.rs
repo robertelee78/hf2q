@@ -896,6 +896,57 @@ fn load_corpus_tokens() -> Option<CorpusSelection> {
 /// (model + backend + calibrator) so the harness's per-cell error
 /// surface names the cell that produced it.
 fn hf2q_model_path(cell: &GateCell) -> std::path::PathBuf {
+    // ADR-014 P10 iter-108 (2026-04-29): post-P11 closure, the
+    // four DWQ variant artefacts exist on disk. Route the matching
+    // gate cells to them via env vars so a non-CI operator can
+    // close cells 3 + 7 (DWQ vs hf2q current pipeline) by exporting
+    // the relevant paths. Sentinel `/var/empty/...deferred.gguf`
+    // remains the default so the always-on smoke tests stay
+    // hardware-independent.
+    //
+    // Env var scheme (one per cell quadrant):
+    //   HF2Q_P10_27B_DENSE_GGUF_NONE_PATH
+    //   HF2Q_P10_27B_DENSE_GGUF_IMATRIX_PATH
+    //   HF2Q_P10_27B_DENSE_SAFETENSORS_DWQ_PATH
+    //   HF2Q_P10_27B_DENSE_GGUF_DWQ_PATH      ← iter-101 27B-dwq46
+    //   HF2Q_P10_APEX_MOE_GGUF_NONE_PATH
+    //   HF2Q_P10_APEX_MOE_GGUF_IMATRIX_PATH
+    //   HF2Q_P10_APEX_MOE_SAFETENSORS_DWQ_PATH
+    //   HF2Q_P10_APEX_MOE_GGUF_DWQ_PATH       ← iter-105 35BMOE-dwq46
+    //
+    // The cells stay sentinel-driven if the matching env var is unset
+    // OR points at a missing path (the runner returns None ⇒ Verdict::
+    // NotMeasured), preserving the iter-2c-3 default behavior.
+    let env_key = format!(
+        "HF2Q_P10_{}_{}_{}_PATH",
+        cell.model_id.replace(' ', "_").to_uppercase(),
+        match cell.backend {
+            BackendKind::Gguf => "GGUF",
+            BackendKind::Safetensors => "SAFETENSORS",
+        },
+        if cell.calibrator_variant.starts_with("None") {
+            "NONE"
+        } else if cell.calibrator_variant.starts_with("Imatrix") {
+            "IMATRIX"
+        } else if cell.calibrator_variant.starts_with("DWQ") {
+            "DWQ"
+        } else {
+            "OTHER"
+        }
+    );
+    if let Ok(path_str) = std::env::var(&env_key) {
+        let path = std::path::PathBuf::from(&path_str);
+        if path.exists() {
+            return path;
+        }
+        // Path declared but missing — surface via tracing so the
+        // operator notices the typo before chasing a NotMeasured
+        // verdict at the table.
+        eprintln!(
+            "[P10 iter-108] {env_key}={path_str} declared but path does not exist; \
+             falling back to sentinel"
+        );
+    }
     std::path::PathBuf::from(format!(
         "/var/empty/{}-{}-{}-deferred.gguf",
         cell.model_id.replace(' ', "-"),
