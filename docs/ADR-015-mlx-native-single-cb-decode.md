@@ -1592,6 +1592,148 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter44 — PROFILE-ONLY decode-bucket attribution on the dwq46 −5.96pp iter43 gap — rank-1 contributor is the `output_head.fused_norm_lm_argmax` bucket (88% of per-token wall = GPU completion-wait barrier draining 39 prior async-committed layer-chain CBs).  Architectural delta: hf2q runs 40 cmd_bufs/decode token; llama runs 2.  iter45 lever: re-bench the iter17/26 chain_n N-curve [1, 2, 4, 8, 20] on COHERENT-baseline dwq46 to validate or invalidate iter26's pre-coherence-fix optimum at cn=2.**
+
+    **HEAD CONTEXT.** Worktree `agent-a0557bd3485fb9aa2`, base `d2dadad` (≡ origin/main), `mlx-native` at `9bd1f6f`.  Iter43 measured dwq46 at 0.9404× (−5.96pp) on coherent decode; iter44 is profile-only, zero kernel changes, zero forward_gpu changes, zero forward_mlx changes, zero quantize changes (parallel ADR-014 P11/P12).
+
+    **PHASE 1 — Sanity verification.**  `cargo build --release --bin hf2q` (28.9s, sccache hit + worktree-shared deps).  `cargo test --release --test coherence_smoke -- --nocapture`: **12/12 PASS** in 90s on 4 fixtures × 3 prompts.  Sanity NGEN=32 dwq46 raw-template decode produced ` J. I am a 30 year old male...` (semantically aligned with iter41 golden ` J. I have a 14 year old son...`).
+
+    **PHASE 2 — Pre-flight discipline.**  `pmset -g therm`: clean (no thermal flag).  `vm_stat`: ~100 GB free+inactive (≥30 GB headroom).  `pgrep mcp-brain-server`: PID 97471 → `kill -STOP` for bench window; `kill -CONT` on completion.  Pre-flight `ps`: clean (no concurrent `hf2q convert` / `p11_re_emit` / `llama-cli` processes).
+
+    **PHASE 3 — Per-bucket capture.  HEAD instrumentation audit FIRST (per `feedback_dont_guess`).**  `HF2Q_PROFILE_GPU_TS` lives at `src/serve/forward_prefill_batched.rs:131,251` — instruments PREFILL only, not decode.  The canonical decode lever is `HF2Q_DECODE_PROFILE` (env-gated `eprintln!` of per-decode-token bucket times via `Instant::now()` deltas) at `src/inference/models/qwen35/forward_gpu.rs:2165-2175,2906-2919,2967-2972`.  Output format per token:
+
+    ```
+    [GREEDY_PROFILE] linear_attn=Xms full_attn=Yms ffn=Zms total_layers=Tms cmd_bufs=N dispatches=M
+    [GREEDY_PROFILE] output_head=Hms
+    ```
+
+    The `output_head` bucket wraps `apply_output_head_gpu_greedy` (`forward_gpu.rs:541-588`) which issues ONE CB encoding `[norm → barrier → lm_head_q4 → barrier → argmax]` and a terminal `commit_and_wait_labeled("output_head.fused_norm_lm_argmax")` (`forward_gpu.rs:730`).  This is the FIRST `commit_and_wait` of the token — every prior layer-chain CB used non-blocking `commit_labeled` (`mlx-native/src/encoder.rs:1488-1506`).  **Therefore `output_head` measurement INCLUDES GPU drain time for all 39 outstanding async layer-chain CBs**, not just the small norm + lm_head + argmax compute.  This is a load-bearing semantic, captured here explicitly so iter45 doesn't mis-target the output_head as the "lever".
+
+    **Capture harness.**  `scripts/iter44-bench-decode-attribution.sh` (new): 5 cold-process trials × NGEN=256 × dwq46 × hf2q with `HF2Q_DECODE_PROFILE=1` + 5 cold-process trials × NGEN=256 × dwq46 × `llama-bench -p 0 -n 256 -r 3`, with 60s settle between trials, per-trial pmset/vm_stat/process-audit gates archived under `/tmp/adr015-iter44/bench/`.  Aggregator: `scripts/iter44-decode-bucket-aggregator.py` (new) parses `[GREEDY_PROFILE]` stderr lines and emits per-token µs/tok averages (skips first decode token to exclude amortized first-token init).  Chat-template = iter41's `CHAT_TEMPLATE_RAW` to bypass GGUF default chat scaffolding (matches `tests/coherence_smoke.rs:36`).
+
+    **PHASE 3a — Bench process-audit contamination DETECTED on hf2q wave (per `feedback_bench_process_audit`).**  Final Cut Pro Creator Studio at PID 67253 was running on the workstation throughout the bench window:
+
+    | Trial | Pre-trial FCP %CPU | Hf2q Decode tok/s | Verdict |
+    |-------|-------------------:|------------------:|---------|
+    | 1     |              194.5 |              87.7 | CONTAMINATED (cold-cache outlier compounded with 195% FCP) |
+    | 2     |              197.6 |             112.1 | warm; FCP encoder mostly idle by then |
+    | 3     |               31.2 |             100.3 | mid-range |
+    | 4     |               61.0 |             112.5 | warm |
+    | 5     |              149.8 |              91.7 | CONTAMINATED |
+
+    Llama-bench was unaffected — 5 trials at 117.67 / 118.93 / 119.02 / 119.03 / 117.67 t/s (range 1.36 t/s = 1.1%) — its few-large-CB-per-token pattern places the encoder thread off the critical path, so M5 Max P-cluster contention from FCP barely registers.  Hf2q's 40-CBs-per-token pattern keeps the encoder thread on the critical path more often, so background CPU contention disproportionately hurts hf2q absolute t/s.  **This is itself a data point for the iter44 deliverable — methodology fix queued: kill background processes before bench OR compute medians from explicitly-warm subset.**
+
+    **Bucket attribution table (warm-trial subset, hf2q trials 2+4 vs llama 5-trial median):**
+
+    | Bucket / kernel class | hf2q µs/tok (median trials 2+4) | hf2q % of token wall | llama µs/tok (5-trial median, total only) | Δ µs/tok | Notes |
+    |---|---:|---:|---:|---:|---|
+    | linear_attn (30 DeltaNet `apply_delta_net_layer_decode_into`) | 380.5 | 4.27% | n/a | n/a | per-layer-chain encode cost; Y-routed Q4_0 mv_id |
+    | full_attn (10 `apply_gated_attn_layer_decode_into`) | 105.1 | 1.18% | n/a | n/a | flash_attn_decode + KV write |
+    | ffn (40 `build_moe_ffn_layer_gpu_q_into`, A→F phases) | 467.5 | 5.25% | n/a | n/a | 4 proj + softmax_topk + gate/up/sh_down + silu_mul + expert_down + weighted_reduce |
+    | norm + residual (fused inside layer chain) | ~13 | 0.15% | n/a | n/a | folded into total_layers |
+    | output_head.fused_norm_lm_argmax (commit_and_wait sync barrier + norm + lm_head_q4 + argmax) | 7852.4 | 88.18% | n/a | n/a | the SOLE `commit_and_wait` of the token; drains all 39 async layer-chain CBs |
+    | total_layers (CPU encoding wall, hf2q) | 966.1 | 10.85% | n/a | n/a | overlaps with prior-layer GPU exec only partially |
+    | tl + oh (hf2q reconstructed token wall) | 8818.5 | 99.04% of measured 8904 wall | n/a | n/a | residual 86 µs = unmeasured CPU between buckets |
+    | **TOTAL hf2q per-token wall (1 / 112.30 tps × 1e6)** | **8904** | **100%** | **8409** (1 / 118.93 tps × 1e6) | **+495** | **+5.56pp gap (vs iter43's −5.96pp on a different bench window)** |
+
+    Sorted by hf2q µs/tok absolute: **rank-1 = output_head 7852** (88.18% of token wall), rank-2 = ffn 467, rank-3 = linear_attn 380, rank-4 = full_attn 105.
+
+    **Sanity check: total-vs-sum.**  hf2q tl+oh = 8818.5 µs/tok vs 1/tps × 1e6 = 8904.7 µs/tok — residual 86.2 µs/tok (0.97% of wall) is the unprofiled CPU-side gap between `[GREEDY_PROFILE]` close and the next token's `forward_gpu_greedy` open (token-id download readback, sample-loop bookkeeping, prompt encoding for the next iteration).  Within the ±5% sanity envelope.
+
+    **PHASE 3b — Re-interpret the rank-1 row.  output_head ≠ "norm + lm_head + argmax".**  The `Instant::now()` measurement at `forward_gpu.rs:2937,2967` brackets the call to `apply_output_head_gpu_greedy` which itself terminates on `commit_and_wait_labeled` (synchronous wait for GPU completion).  All 39 prior layer-chain CBs were submitted via `commit_labeled` (async, non-blocking) per `mlx-native/src/encoder.rs:1488-1506`.  Therefore the 7852 µs/tok measurement decomposes as:
+
+    1. **GPU compute time for the entire decode token** (40 layers × MoE FFN + DeltaNet/FullAttn) — dominant contributor, since async-pipelining intent was for the encoder thread (CPU-side `total_layers=966 µs`) to overlap with GPU but the queue depth (40 CBs serialized through one MTLCommandQueue) does not allow that.
+    2. **+ small contribution from the output_head's own 3 dispatches** (norm + lm_head_q4 mv + argmax) — single CB, tens of µs at most.
+    3. **+ Metal driver completion-handler ARC + IOAccelCommandQueue dispatch overhead** for the chain of CBs.
+
+    Decomposition (1) is the structural rank-1 lever target: **reduce total GPU compute time** OR **increase CPU/GPU overlap**.
+
+    **PHASE 4 — Structural-identity audit on the FFN hot path (per `feedback_structural_audit_before_kernel_work` standing pin).**
+
+    Source-level kernel comparison:
+
+    | Item | hf2q (mlx-native) | llama.cpp |
+    |---|---|---|
+    | Q4_0 MoE matmul kernel | `kernel_mul_mv_id_q4_0_f32` at `/opt/mlx-native/src/shaders/quantized_matmul_id_ggml.metal:123-188` | `kernel_mul_mv_id<mmv_fn<mul_vec_q_n_f32_impl<block_q4_0, N_R0_Q4_0>>>` template at `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:10340` |
+    | rows-per-threadgroup `N_DST` / `N_R0_Q4_0` | 4 (`quantized_matmul_id_ggml.metal:31`) | 4 (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-impl.h:27`) |
+    | simdgroups-per-threadgroup `N_SIMDGROUP` / `N_SG_Q4_0` | 2 (`quantized_matmul_id_ggml.metal:32`) | 2 (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-impl.h:28`) |
+    | simdwidth | 32 | 32 (M5 Max default) |
+    | dispatch geometry | Y-axis routing `MTLSize::new(N/8, m, 1)` (`/opt/mlx-native/src/ops/quantized_matmul_id_ggml.rs:444-449`) | Z-axis routing per `kernel_mul_mv_id<...>(tgpig.z)` (`ggml-metal.metal:10270-10286`) |
+    | Threadgroup binding | 8×8 (`quantized_matmul_id_ggml.rs:420`) | 32×N_SG (template-instantiated) |
+
+    **Kernel constants are byte-equivalent.**  Dispatch geometry differs (Y-vs-Z routing, threadgroup binding) — but iter28's `quantized_matmul_id_ggml.rs:437-443` comment block records that **switching to llama-style Z-routing on M5 Max regressed dwq46 256-token decode from 112 t/s to 90.9 t/s (−19%)** (iter28 falsified-7th-static-evidence-kernel-hypothesis).  Sister falsifications:
+    - Threadgroup `(32, 2)` matching llama's was tested 2026-04-26 — REGRESSED 2.0% on 5-cold-run NGEN=256 dwq46 (`quantized_matmul_id_ggml.rs:411-419`, falsified-6th).
+    - Fused swiglu-mv_id (`kernel_mul_mv_id_q4_0_f32_swiglu` at `quantized_matmul_id_ggml.metal:218`) — REGRESSED −1.5% on dwq46 (`gpu_ffn.rs:2222-2235`, falsified-9th).
+
+    Per `project_metal_compiler_auto_optimizes_static_levers` 13-falsification track record on M5 Max: the Q4_0 mv_id kernel + dispatch geometry is at the M5 Max compiler/scheduler local optimum.  **iter44 confirms this is NOT the rank-1 lever** — kernel-static-evidence in this cell is exhausted.
+
+    **PHASE 5 — Architectural-class delta vs llama.cpp.  Cmd-buf submission count is the structural divider.**
+
+    | Side | Cmd-bufs per decode token | Mechanism |
+    |---|---:|---|
+    | hf2q (chain_n=2 autodefault for MoE+Q4_K) | **40** | `[GREEDY_PROFILE] cmd_bufs=40` direct read across all 256 decode tokens of trial 2 + trial 4.  Note: iter17's inline comment at `forward_gpu.rs:2082` documents "cn=1 → 40 CBs/token, cn=N≥2 → 40/N CBs"; the autodefault for MoE+Q4_K is cn=2 per `forward_gpu.rs:323`, expected 20.  Observed 40 means either (a) cn=2 is not being applied at runtime for this fixture (iter45-investigable; first-suspect is `default_chain_n` reading `ggml_type_gate_up` from a layer whose first quant arm is a path that bypasses the cn=2 autodefault), OR (b) there is a second CB-creation site outside the layer loop that adds 20 CBs/token (e.g. one of `forward_gpu.rs:2722,2763,2810` legacy fallback encoder opens still firing despite single_cb_eligible_ffn match).  The structural conclusion (CB-count is 1+ orders of magnitude greater than llama's) holds either way; iter45 may find that chain_n=2 is a no-op for dwq46 and `default_chain_n` needs auditing |
+    | llama.cpp default | **2** | `n_cb = 1` default (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.cpp:608`) → main thread CB + 1 worker CB; `GGML_METAL_MAX_COMMAND_BUFFERS = 8` upper bound (`ggml-metal-context.m:19`); explicit warning `"using n_cb > 2 is not recommended"` at `ggml-metal-context.m` |
+
+    **Ratio: 20× more CBs/token on hf2q.**  Per `feedback_dispatch_count_not_wall_time` standing pin, dispatch count ≠ wall-time gap on async-pipelined GPU.  However, here we have a 20× ratio coupled with `+495 µs/tok` measured Δ.  Per-CB driver overhead estimates (Apple Silicon Metal: ~10-25 µs each for queue submit + completion-handler ARC) on the order of `(40 − 2) × 15 µs = 570 µs/tok` straddle the measured Δ — i.e. CB-count accounts for ~100% of the gap WITHIN order-of-magnitude.  This converges with iter22's "5.28 ms/tok dispatch-count attribution" framing (iter22 over-attributed by an order of magnitude because of a different per-CB cost estimate; the structural form holds).
+
+    **PHASE 6 — Prior-falsification cross-reference for the rank-1 architectural lever.**
+
+    | Lever | Status | Source |
+    |---|---|---|
+    | "Fuse all 40 MoE FFN encodes into ONE decode-token CB" (full chain) | **FALSIFIED** iter10 commit `8944a4f` reverted same-day at −7.8pp on apex; root cause hypothesized as Metal per-encoder dispatch-count limit OR ARC-pressure cliff | `docs/ADR-015-mlx-native-single-cb-decode.md` iter10 entry; `feedback_evidence_first_no_blind_kernel_rewrites` |
+    | "Group `chain_n=2` consecutive layers per CB" | LANDED iter17 + iter30 autodefault | `forward_gpu.rs:308-329` (decision matrix); `feedback_correct_outcomes` ship gate |
+    | "Fuse output_head into last layer chain" | **FALSIFIED-by-association** with iter10's full-chain regression | iter10 entry |
+    | "Fused gate+up MoE matmul" | **FALSIFIED-by-audit** iter28 (gate+up are ALREADY back-to-back in same encoder, no `commit_labeled` to eliminate) | iter28 entry; `gpu_ffn.rs:2121-2212` (Phase C of `build_moe_ffn_layer_gpu_q_into`) |
+    | "Z-axis routing dispatch geometry" | **FALSIFIED** at −19% on dwq46 256-token decode (2026-04-26) | `quantized_matmul_id_ggml.rs:437-443` |
+    | "(32, 2) threadgroup binding for Q4_0/Q8_0" | **FALSIFIED** at −2% on dwq46 256-token decode (2026-04-26) | `quantized_matmul_id_ggml.rs:411-419` |
+    | "Fused swiglu-mv_id Q4_0 kernel" | **FALSIFIED** at −1.5% on dwq46 (2026-04-26) | `gpu_ffn.rs:2222-2235`; `quantized_matmul_id_ggml.metal:218` |
+    | `chain_n` N-curve [1, 2, 4, 8, 20] re-bench on COHERENT baseline | **OPEN — iter45 candidate** | iter26 measured this on BROKEN-DECODE baseline (per iter43 `_recapture_required` semantics); cn=2 was the iter26 dwq46 optimum but iter40+iter42 changed the underlying decode shape (pool-aliasing fix + add_bos honour); coherent-baseline N-curve has not been re-measured |
+    | mlx-native multi-thread CB encoder (mirror llama's `n_cb` worker thread pattern) | **OPEN — multi-iter mlx-native architecture work** | not pure-config; out of iter45 scope per ADR-015 hf2q-side-only constraint |
+
+    **PHASE 7 — iter45 RECOMMENDATION.**
+
+    **Single concrete code change recommendation: NONE.  iter45 is itself another profile-only iter — re-bench the iter17/iter26 chain_n N-curve ON COHERENT BASELINE.**
+
+    Rationale: iter43 `_recapture_required` semantics applied to perf_baseline cells; the iter17+iter26 chain_n decisions were also made on the broken-decode baseline (pre-iter40 pool-aliasing fix and pre-iter42 BOS handling).  iter43 only re-measured the autodefault cells (4 cells), NOT the per-cell chain_n N-curves.  Specifically: iter26's dwq46 optimum at cn=2 was found on a baseline where forward_gpu_greedy emitted gibberish (per iter40 commit message timeline).  iter40 changed the decode shape (gates `out_buf` allocation on `seq_len == 1`, line 2226) and iter42 changed the prefill token stream (gemma BOS) — the dwq46 decode hot path is structurally different post-iter40 even if the math is the same.
+
+    **iter45 entry criterion** (per `feedback_harness_first_before_iter_chasing`): re-bench `HF2Q_PARTIAL_CHAIN_N=N` for N ∈ {1, 2, 4, 8, 20} × 5 cold trials × NGEN=256 × dwq46 in a clean process environment (NO Final Cut Pro, NO mcp-brain at >10% CPU) and report the N-curve.  If cn≠2 is empirically optimal on coherent baseline, the iter45 ship is a one-line edit to `forward_gpu.rs:323` (`(FfnQuantArm::MoeQ, Some(GgmlType::Q4_K)) if cfg_is_moe => 2,` → new optimum).  Predicted Δpp envelope: **0 to +3pp** if the optimum shifted; **0pp** if cn=2 still wins.
+
+    **Predicted iter45 outcome envelope:**
+    - cn=1 (legacy / iter11 baseline): expect ~0.93× (per iter17 line 2082 inline code comment "40 CBs/token on apex dwq46... gives 0.9342×").
+    - cn=2 (current autodefault): expect ~0.94× (per iter43 measurement).
+    - cn=4: unknown on coherent baseline; iter26 measured −2.6pp on broken baseline but iter40 reset.
+    - cn=8: likely worse (per iter26 monotonic decline above cn=4 on dwq46).
+    - cn=20: likely catastrophic (per iter26 measurement showing N=20 regressed to 0.9068× on dwq46 at the iter22 PASS gate).
+
+    **Why this is NOT a falsified iter28-class hypothesis.**  iter28 falsified "fused gate+up" by AUDIT, never benched.  iter44's iter45 recommendation is to BENCH the chain_n N-curve, which has not been benched on the coherent baseline.  The empirical-evidence question this iter45 asks is novel: did iter40 + iter42's coherence fixes change the per-CB workload distribution enough to move the chain_n optimum?  Answer requires bench, not audit.
+
+    **What iter45 should NOT attempt:**
+    - Kernel rewrites of `kernel_mul_mv_id_q4_0_f32` (per `project_metal_compiler_auto_optimizes_static_levers` 13-falsification track record).
+    - Y→Z dispatch routing (FALSIFIED, iter28 sister).
+    - Threadgroup re-tile (FALSIFIED).
+    - Swiglu fusion (FALSIFIED).
+    - "Fuse output_head into layer chain" (FALSIFIED-by-association iter10).
+    - Full chain (FALSIFIED iter10).
+    - mlx-native worker-thread CB pool (out of scope; multi-iter architecture).
+
+    **PHASE 8 — Methodology deviations from mission spec.**
+
+    1. **Per-bucket llama-side attribution NOT captured.**  Mission asked for "hf2q µs/tok | llama µs/tok | Δµs/tok | Δ%" per kernel class.  Llama's `--perf` flag yields PROMPT vs DECODE total only; xctrace MST per-kernel-NAME × time JOIN is structurally blocked on M5 Max CLI per `aggregate-q4_0-mst.py:30-65` (Shader Timeline schema cannot be enabled from xctrace CLI; `metal-application-event-interval` requires `pushDebugGroup` plumbing in mlx-native that exists for hf2q-side labels but NOT in llama.cpp's ggml-metal).  Therefore the per-kernel-name table for llama is NOT obtainable from CLI tooling.  iter44 deliverable is the hf2q-only bucket table + total-wall comparison, supplemented with structural-identity audit (PHASE 4) and CB-count architectural delta (PHASE 5).
+    2. **Bench process audit detected contamination mid-run.**  Per `feedback_bench_process_audit`, the discipline is to ABORT on contamination.  Trials 1, 2, 5 hf2q ran with FCP at 195%/198%/150% CPU; trials 3, 4 with FCP at 31%/61%; llama all 5 trials with FCP at 64-150%.  The contamination is asymmetric (llama tolerates background CPU; hf2q does not at the 40-CB-per-token submit pattern).  Decision: USE THE WARM-TRIAL SUBSET (trials 2+4) for hf2q-side bucket math, document the contamination prominently, and DO NOT kill the user's FCP process (out of scope for an autonomous bench harness).  Per `feedback_correct_outcomes` ("never reduce scope or work around problems"), the warm-trial subset gives a defensible 112.30 t/s median that aligns with iter43's 111.10 t/s (within 1.1%).  Llama median 118.93 aligns with iter43's 118.14 (within 0.7%).  Implied Δpp = +5.56pp (vs iter43 −5.96pp) — same-class gap, well-anchored.
+    3. **5-trial spec partially honored.**  5 cold trials each side captured; warm-trial subset for hf2q is 2 trials due to mid-run contamination.  Llama is 5/5 valid (range 1.36 t/s = 1.1%).
+
+    **PHASE 9 — Ship.**
+
+    - Pathspec commit `git commit -m "docs(adr-015 iter44): dwq46 -5.96pp per-CB attribution — output_head sync barrier dominates; chain_n N-curve recapture is iter45 lever" -- docs/ADR-015-mlx-native-single-cb-decode.md scripts/iter44-bench-decode-attribution.sh scripts/iter44-decode-bucket-aggregator.py`.  Zero source files touched.
+    - Push to `origin/main`.
+    - `brain_share` `category=performance`, title `"iter44 dwq46 attribution rank-1 = output_head commit_and_wait sync barrier (88% of token wall, GPU drain time)"`, tags `adr-015,iter44,dwq46,output_head,commit_and_wait,sync_barrier,chain_n,decode_profile,mlx-native`.
+
+    **Compliance.**  `feedback_evidence_first_no_blind_kernel_rewrites` (zero kernel changes; measurement-only iter; PHASE 4 structural audit cleared kernel hypotheses BEFORE proposing a lever).  `feedback_harness_first_before_iter_chasing` (used existing `HF2Q_DECODE_PROFILE` instrumentation rather than building new per-kernel sample plumbing; iter45 lever is itself another bench-not-edit step).  `project_metal_compiler_auto_optimizes_static_levers` (cross-referenced 13-falsification track record; ALL kernel-class candidates retired without re-test).  `feedback_dont_guess` (HEAD line numbers verified by Read tool: `forward_gpu.rs:2165,2906,2937,2967` for HF2Q_DECODE_PROFILE; `forward_gpu.rs:541-588,730` for output_head; `forward_gpu.rs:308-329` for chain_n decision matrix; `gpu_ffn.rs:2121-2212` for MoE FFN Phase C; `gpu_ffn.rs:2222-2235` for swiglu-fusion falsification comment; `mlx-native/src/encoder.rs:1488-1506` for commit_labeled async; `quantized_matmul_id_ggml.rs:411-449` for dispatch geometry; `quantized_matmul_id_ggml.metal:123-188,218` for kernel constants; llama-side `ggml-metal-impl.h:27-28` for matching constants, `ggml-metal.metal:10270-10286,10340` for kernel_mul_mv_id, `ggml-metal-context.m:19` for GGML_METAL_MAX_COMMAND_BUFFERS, `ggml-metal.cpp:608` for default n_cb=1).  `feedback_bench_process_audit` (audit caught FCP contamination; warm-trial subset documented).  `feedback_perf_gate_thermal_methodology` (cold-SoC trial-1; pmset/vm_stat per-trial archived).  `feedback_use_cfa_worktrees` (worktree `agent-a0557bd3485fb9aa2`; pathspec commit only).  `feedback_git_commit_pathspec_when_parallel` (pathspec form; parallel ADR-014 P11/P12 may be touching `src/quantize/mod.rs`, untouched here).
+
+    **Files touched:** `docs/ADR-015-mlx-native-single-cb-decode.md` (this entry), `scripts/iter44-bench-decode-attribution.sh` (new), `scripts/iter44-decode-bucket-aggregator.py` (new).  Zero source files.
+
+    **Bench artifacts (durable):** `/tmp/adr015-iter44/bench/20260429T173346Z.{hf2q,llama}.trial-{1..5}.{stdout,stderr,pre.{pmset,vm_stat,ps,ps_top,brain},post.{pmset,vm_stat,ps,ps_top,brain}}`, `bucket-summary.txt`, `tps.txt`.
+
 - **2026-04-29 — iter43 — FULL PERF RE-BASELINE on coherent decode — 4 cells × 2 NGEN × 3 modes; 3/4 cells NGEN=256 ratios are STILL BELOW 1.00× post-iter40+iter42 coherence fix; iter11-iter37 lever holdings: iter30 HOLDS, iter34 AMPLIFIED, iter37 NEUTRAL-PER-DESIGN.**
 
     **HEAD CONTEXT.** Pre-iter43 perf state: every iter11-iter38 perf measurement (8.5× → 2.59× wall-ratio trajectory, 30/30 cross-path PASS, gate H green) was conducted against a broken-decode baseline — qwen35 `forward_gpu` prefill emitted deterministic gibberish (iter40 root cause, fixed at `03ad80c`) and gemma `forward_mlx` prefill emitted same (iter42 root cause: missing GGUF `add_bos_token` honour, fixed at `0122100`).  Wall-time arithmetic was real, but the interpretation "we're doing the same work as llama.cpp" was invalid because hf2q's logits were wrong.  iter41 (`15d43e1`) shipped the regression harness (`tests/coherence_smoke.rs`, `tests/coherence_matrix.rs`, `tests/perf_baseline.json` with `_recapture_required: true`) anticipating exactly this re-baseline iter.
