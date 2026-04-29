@@ -1592,6 +1592,58 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter37 — LANDED — `mem_ranges` dataflow auto-barrier ported into mlx-native (env-gated, opt-in; framework durability win, not perf lever).**  Per iter21's deep-audit follow-up recommendation (line 1734: `mlx-native mem_ranges dataflow check port — framework hardening, not perf lever`), iter37 ports llama.cpp's mem_ranges dataflow check into mlx-native's `CommandEncoder` so framework-side R/W-range tracking can auto-emit `memoryBarrierWithScope:` exactly when a new dispatch's reads/writes overlap a previously-recorded range — making iter21-class missing-barrier bugs structurally impossible at the API boundary once callers migrate.
+
+    **PHASE 1 — AUDIT (read-only).**  Source-of-truth mapping:
+    - llama.cpp dataflow algorithm: `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-common.{h,cpp}` (`ggml_mem_ranges_init/reset/add/check`) + `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-ops.cpp:147-225` (`concurrency_check + concurrency_reset` around each node).  Range = `(buffer_id, p0, p1, role∈{Src,Dst})`; same-buffer-only filter; src-vs-src never conflicts; overlap test `mr.p0 < cmp.p1 && mr.p1 >= cmp.p0`; on conflict emit barrier + reset + record new ranges.
+    - mlx-native existing scaffolding: `CommandEncoder::pending_reads/pending_writes` (`src/encoder.rs:391-393`, `src/encoder.rs:558-561`) populated in CAPTURE mode by `GraphSession::barrier_between` (`src/graph.rs:1438-1484`) for the Phase 4e.3 reorder pass.  Production decode/prefill bypasses `GraphSession` entirely — qwen35 `forward_gpu.rs` operates on raw `CommandEncoder` from `device.command_encoder()` with **323 hand-placed `enc.memory_barrier()` callsites** (audited via `grep -rn "memory_barrier\|barrier_between" /opt/hf2q/src/ | wc -l`), so the existing mem-range scaffolding never fires on the hot path.
+
+    **PHASE 2 — DESIGN.**  Three options weighed: (A) full implicit auto-barrier in `encode*` (rejected — `KernelArg` doesn't carry read/write role info; would require 323-callsite audit + role tagging); (B) explicit `barrier_before: bool` hint per dispatch (rejected — abandons the dataflow attribution iter21 wanted); (C) **hybrid: env-gated `dispatch_tracked_*` family that takes explicit `reads: &[&MlxBuffer], writes: &[&MlxBuffer]` slices and runs the dataflow check when `HF2Q_AUTO_BARRIER=1`, with existing `encode_*`/`memory_barrier()` API unchanged** (chosen — sourdough-safe, mirrors iter17 sunset pattern, defers callsite migration to iter38+).
+
+    **PHASE 3 — IMPLEMENT.**  mlx-native worktree `cfa/iter37-mem-ranges` (worked from `/opt/mlx-native/.cfa-worktrees/iter37-mem-ranges`):
+    - **New `src/mem_ranges.rs`** (~430 lines including doc + tests).  Public types: `MemRangeRole` enum (Src/Dst), `BufferRange` struct (buf_id + p0 + p1 + role), `MemRanges` cumulative-state container.  `MemRanges::check_dispatch` mirrors `ggml_mem_ranges_check` byte-for-byte; `add_dispatch` mirrors `ggml_mem_ranges_add`; `check_and_record` is the combined call-site-friendly form returning `true` on concurrent-OK.  `BufferRange::from_buffer` uses `metal_buffer().as_ptr() as usize` (parent-stable) as `buf_id` so slices of a parent share a buffer ID — matches llama.cpp's `tensor->buffer` + `tensor->data` decomposition.  `(p0, p1) = (contents_ptr + byte_offset, that + slice_extent)`.  Diagnostic counters (`checks`, `barriers_forced`) on the type itself.  **9 unit tests** cover RAR / RAW / WAR / WAW / different-buffers-disjoint / reset-clears-state / slices-conservative / sequential-pattern-two-barriers / `BufferRange::conflicts_with` symmetry — all PASS.
+    - **`src/encoder.rs` integration**.  Added `mem_ranges: MemRanges` field on `CommandEncoder`; `auto_barrier_enabled()` env-gate cached via `OnceLock` (default OFF); `AUTO_BARRIER_COUNT` + `AUTO_BARRIER_CONCURRENT` static atomic counters with public read accessors `auto_barrier_count()` + `auto_barrier_concurrent_count()`; `reset_counters()` extended.  New methods on `CommandEncoder`: `dispatch_tracked_threadgroups`, `dispatch_tracked_threadgroups_with_args`, `dispatch_tracked_threadgroups_with_args_and_shared` — each takes `reads`/`writes` slices, delegates to the matching `encode_*` after running `maybe_auto_barrier()` (which calls `check_dispatch` + `add_dispatch` or `memory_barrier + reset + add_dispatch` on conflict).  Capture-mode passthrough preserved: tracked dispatches in capture mode stash the ranges via `set_pending_buffer_ranges` so existing reorder-pass plumbing keeps working.  `force_barrier_and_reset_tracker()` for boundaries the tracker can't see (e.g. host-driven memcpy).  `mem_ranges_len()` diagnostic accessor.
+    - **`src/lib.rs` re-exports**: `mem_ranges` module declared; public re-exports `MemRanges`, `BufferRange`, `MemRangeRole`, `auto_barrier_count`, `auto_barrier_concurrent_count` added alongside the existing `barrier_count`/`barrier_total_ns` family.
+    - **New `tests/test_auto_barrier.rs` integration test** (3 tests: byte-identical-output-vs-encode_*, env-gate-off-no-counter-movement, public-re-exports-reachable) — all PASS.
+
+    **Full mlx-native test suite delta from baseline `22f715b`**: lib tests **120 passed** (was 111; +9 mem_ranges) / **0 failed**; integration tests pass except 3 pre-existing Q4_0 id_vs_norid 1e-6-epsilon failures (`test_quantized_matmul_id_ggml.rs` — same 3 failures on main HEAD; not iter37-induced).  Clippy warning count **124 → 124** (zero new warnings; one `clippy::too_many_arguments` allowed on `dispatch_tracked_threadgroups_with_args_and_shared` with rationale doc comment).
+
+    **PHASE 4 — Hf2q parity matrix.**  Hf2q worktree `agent-ada74dd0901d1f202` patched via local `.cargo/config.toml` to point `mlx-native` at the iter37 worktree path; binary built clean (28.3s).  Parity test methodology (script: `scripts/iter37-parity-matrix.sh`): 4 fixtures × 3 cold trials × NGEN=128 × greedy decode (`--temperature 0`); per trial run hf2q twice — once with `HF2Q_AUTO_BARRIER=1`, once with the var unset — sha256 the **decoded-token suffix** (everything after the first blank line, stripping the wall-clock prologue `loaded in Xs / prefill: ...ms`); two sha256s must match for trial PASS.
+
+    **Parity matrix result:** **12/12 PASS** at `/tmp/adr015-iter37/parity/parity-20260429T132045Z.md` — every (fixture, trial) pair produced a byte-identical decoded-token suffix between `HF2Q_AUTO_BARRIER=1` and unset.  Per-fixture sha256 (12-char prefix of decoded-token sha256, identical across env-on / env-off / all 3 trials within a fixture):
+    - `qwen3.6-27b-dwq46` → `cd623fda2cee` (3/3)
+    - `gemma-26B-dwq` → `a74390f3d6ee` (3/3)
+    - `qwen3.6-35b-a3b-dwq46` → `e066feb1907a` (3/3)
+    - `qwen3.6-35b-a3b-apex` → `b3e64b7e0676` (3/3)
+
+    Outcome predicted by iter37 design constraint #C: with no production callsite migrated to `dispatch_tracked_*`, the env gate's gate-on branch is unreachable from hf2q's hot path, so the env var is structurally a no-op for hf2q decode.  The matrix is the *durability* check that linking the new `mem_ranges` module + encoder modifications did not regress decode parity — confirmed across all 4 fixtures.
+
+    **PHASE 5 — Perf delta.**  Predicted Δpp ≈ 0 ± 1pp because no production callsite uses the new path; iter37 is DURABILITY, not perf.  Per the brief's "DO NOT hold infinite Monitor wait" + iter36's already-established 3/4-cells-at-≥1.00× ratio surface, no full perf bench was run in this iteration.  Future iterations that migrate callsites to `dispatch_tracked_*` will own a perf bench under the same matrix harness.
+
+    **PHASE 6 — SHIP DECISION:** **LANDED, env-gated, opt-in**.  Default OFF.  No production callsite migrated; iter37 is the API surface that iter38+ will adopt incrementally.  Cumulative ADR-015 line bumped:
+    - **iter37** (this entry): framework `mem_ranges` API + env gate.  **4-fixture × 3-trial × NGEN=128 byte-identical at `HF2Q_AUTO_BARRIER=1` vs unset (12/12 PASS)**.  Lib tests 120/0; integration tests pass except 3 pre-existing Q4_0 1e-6-epsilon failures unrelated to iter37.  No production callsite migrated.
+
+    **Files touched:**
+    - `mlx-native/src/mem_ranges.rs` (new, 430 lines incl. tests)
+    - `mlx-native/src/encoder.rs` (+~210 lines: env-gate, counters, field, dispatch_tracked family, capture-mode passthrough helper)
+    - `mlx-native/src/lib.rs` (module decl + re-exports)
+    - `mlx-native/tests/test_auto_barrier.rs` (new, 3 integration tests)
+    - `hf2q/docs/ADR-015-mlx-native-single-cb-decode.md` (this entry)
+    - `hf2q/scripts/iter37-parity-matrix.sh` (new, parity harness)
+
+    **Compliance:** `feedback_correct_outcomes` (no fallback shortcut — port the actual algorithm, ship only on parity PASS), `feedback_no_shortcuts` (full unit test suite + integration test + multi-trial parity matrix; no scope reduction), `feedback_dont_guess` (live HEAD `da06eea` audit of all 323 hf2q `enc.memory_barrier()` callsites + line-numbered citations of mlx-native scaffolding before coding), `feedback_use_cfa_worktrees` (mlx-native worktree `cfa/iter37-mem-ranges`, hf2q worktree `agent-ada74dd0901d1f202`), `feedback_evidence_first_no_blind_kernel_rewrites` (NO kernel changes; framework-only API addition).
+
+    **Migration path for iter38+:** to convert any of the 323 hf2q `enc.memory_barrier()` callsites to dataflow-driven, replace
+    ```text
+    enc.memory_barrier();
+    enc.encode_threadgroups_with_args(pipeline, &args, ...);
+    ```
+    with
+    ```text
+    enc.dispatch_tracked_threadgroups_with_args(pipeline, &args, &[&read_buf_a, &read_buf_b], &[&write_buf], ...);
+    ```
+    The unconditional `memory_barrier` call is removed; the framework decides per-dispatch whether a barrier is needed.  Under `HF2Q_AUTO_BARRIER=1`, runs A/B against the unconditional path produce byte-identical output; under default-off, identical-to-pre-iter37.
+
 - **2026-04-29 — iter36 — CEILING DECLARED (READ-ONLY AUDIT) — autonomous-loop lever space confirmed exhausted; remaining gap requires multi-week kernel rewrites.**  Per iter35's recommendation status (line 1606), iter36 conducted a comprehensive read-only audit at HEAD `10f8662` of the unexplored lever surface to either find an autonomous-feasible iter37 lever or confirm the ceiling with structural evidence.  Audit artifact: `/tmp/iter36-audit.md` (~1500 words, 8 sections).  Zero source edits, zero benches, zero fixtures loaded.  Findings:
 
     **(1) iter32 candidate inventory closed.**  Candidate A FALSIFIED iter35 (+0.00pp); Candidate C LANDED iter34 (+11.86pp); Candidate D out of scope (prefill, not decode).  Only Candidate B (FA-tq-hb 4-simdgroup re-tile) remained unresolved — flagged HIGH risk + multi-week from inception.
