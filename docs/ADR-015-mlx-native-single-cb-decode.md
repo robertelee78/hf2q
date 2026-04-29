@@ -1592,6 +1592,50 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter31 — RESUMED-DEFERRED-AGAIN — pre-flight gate FAILED at clean-re-bench launch; ADR-014 P11 35BMOE-dwq46 re-emit fired again on the same workstation (PID 3274 / 9620 + llama-cli child PID 9623 at 96.6% CPU / 25 GB RSS) at 02:38 PDT, exactly the same contamination class that suppressed iter30's perf bench by an estimated ~2.86pp net.  HALT exit per mission spec ("If non-empty, ADR-014 P11 fired again — HALT, write 'RESUMED-DEFERRED-AGAIN' entry, exit cleanly").  ZERO bench trials launched; ADR-015 §iter30 LANDED state stands as the ship-state of record until iter31 resumes on a clean SoC.  iter30 perf numbers retain their LOWER-BOUND framing.**
+
+  **Pre-flight gate trace (02:39:20 PDT, worktree `agent-a7f7c6d5aea83c8ca` at HEAD `6ead010` ≡ origin/main HEAD `6ead010`).**
+
+  | Gate                                       | Threshold / expected | Observed                                                                                          | Verdict |
+  |--------------------------------------------|----------------------|---------------------------------------------------------------------------------------------------|--------:|
+  | `ps aux \| grep "hf2q convert"` empty       | empty                | empty (no `hf2q convert` proc)                                                                    | PASS    |
+  | `ps aux \| grep "p11_re_emit"`              | empty                | **5 procs**: 3274 (etime 17:30, S, parent shell), 9620 (etime 01:18, S, child shell), 3268 (eval) | **FAIL**|
+  | `ps aux \| grep "llama-cli.*p11-re-emit"`   | empty                | **PID 9623 R 96.6% CPU 25 GB RSS** (`llama-cli` GPU-offload coherence-gate against `/tmp/p11-re-emit/35BMOE-dwq46/35BMOE-dwq46.gguf`) | **FAIL** |
+  | `vm_stat` Pages free + inactive ≥ 1.96M    | ≥ 1.96M (≥ 31 GB)    | 4.84M free + 0.61M inactive = 5.45M (87 GB)                                                       | PASS    |
+  | `pmset -g therm`                            | clean                | "No thermal warning level has been recorded"                                                      | PASS    |
+  | concurrent ADR-014 P11 absent              | absent               | **35BMOE-dwq46 re-emit mid-coherence-gate** (`/tmp/p11-35bmoe-dwq46b.log` line 75244 = "llama-cli coherence check (GPU-offloaded, 90s timeout)…"; 19 GB GGUF on disk; SHA-256 `9f64ac4…`) | **FAIL** |
+
+  **Why the contention is bench-disqualifying.**  Per `feedback_bench_process_audit` (standing pin) the M5 Max unified-memory workstation cannot bench-cleanly while a 25 GB-RSS llama-cli is burning 96.6% CPU; per `project_concurrent_sessions_adr014_oom` ADR-014 P11 + ADR-015 perf benches must be serialized.  iter30's contamination footprint was concurrent ADR-014 P11 iter-102/103/104 on this same host running mid-bench at 100% CPU — the iter30 agent measured +2.32pp net vs iter26's clean +5.18pp prediction at the dwq46 cell, a ~2.86pp suppression attributed to convert-side contention by the iter30 verdict.  Launching iter31 now would reproduce that contamination class on the same fixture (35BMOE-dwq46 is BOTH the P11 fixture AND the iter31 dwq46 cell), invalidating the entire close-out.
+
+  **Why no shortcuts.**  Per `feedback_correct_outcomes` (standing pin) iter31 does not run with the LOWER-BOUND iter30 numbers as the close-out matrix — that would be a reduce-scope shortcut and would fix the iter30 contamination CAVEAT permanently into the ADR record without ever measuring against it.  Per `feedback_no_shortcuts` iter31 does not lower NGEN, run a 1-trial bench, or skip cells — the close-out matrix is bench-evidence or it isn't.  iter31 RESUMES on a clean SoC, period.
+
+  **Resumption procedure (verbatim, durable).**
+
+  1. **Wait for the in-flight P11 35BMOE-dwq46 re-emit to complete or fail.**  Watch `/tmp/p11-35bmoe-dwq46b.log` for either coherence-PASS or coherence-FAIL terminal lines; PID 9623 (`llama-cli`) and parent PIDs 3274/9620 must exit.  Per `project_dwq_concurrent_oom` do NOT run model-loading inferences on this host while that proc is live.
+  2. **Confirm no chained P11 re-emit follows.**  After 35BMOE-dwq46 settles, `ps aux | grep -E "hf2q convert|p11_re_emit|llama-cli.*p11" | grep -v grep` MUST return empty for ≥ 5 minutes (P11 sometimes serially re-emits 27B-dwq46/27B-dwq48/35BMOE-apex back-to-back; resumption requires the entire P11 wave to be quiescent).
+  3. **Re-run pre-flight at iter31 RESUMED entry**: `ps aux` empty (above) + `vm_stat` Pages free + inactive ≥ 1.96M + `pmset -g therm` clean + `kill -STOP` mcp-brain-server PID 1205 verified state `T` + 120s thermal settle.
+  4. **Same harness as iter30** (`/tmp/iter30/run_perf.sh` + `/tmp/iter30/perf/`): paired patched-binary (autodefault) vs `HF2Q_PARTIAL_CHAIN_LEGACY=1` control × 5 cold-SoC trials × 4 fixtures × NGEN=256.  Build at HEAD `6ead010` (worktree `agent-a7f7c6d5aea83c8ca` already at `6ead010`; `git rev-parse HEAD` confirmed at 02:39:20 PDT).  Binary already-built carry-over is acceptable per `git diff 6ead010 HEAD -- src/ mlx-native/` empty.
+  5. **Per-fixture pre-flight re-gate** (per mission spec): `ps aux | grep "hf2q convert"` empty AT EACH FIXTURE LOAD, not just iter-entry.  If P11 fires again mid-bench, append a follow-up RESUMED-DEFERRED entry rather than partial-cell shipping.
+  6. **Compute clean Δpp matrix**, compare to iter26 N-curve clean Δpp at each cell's best-N, compare to iter30 contamination-suppressed Δpp, document the suppression magnitude per cell.
+  7. **Append §Changelog "iter31 RESUMED LANDED — ADR-015 ship-state close-out"** with the clean perf matrix, cumulative ADR-015 delivery summary, and iter32+ recommendation.  Commit pathspec; push origin/main fast-forward.
+
+  **What stands at HEAD.**  `origin/main` HEAD `6ead010` ships the iter30 per-quant-class `chain_n` lookup table; the autodefault decision matrix at `forward_gpu.rs:315-352` is in production; HF2Q_PARTIAL_CHAIN_LEGACY=1 is the forensic A/B opt-out; HF2Q_PARTIAL_CHAIN_N is the user-authoritative override.  iter30 perf numbers (LOWER-BOUNDS at +2.32pp net dwq46) remain the on-record measurement until iter31 RESUMED produces the clean re-bench.  No code is touched by iter31; this entry is docs-only.
+
+  **Cumulative ADR-015 delivery summary at iter31-DEFERRED HEAD `6ead010`.**
+
+  - **iter21** — coherence fix LANDED (single missing `memory_barrier` in `apply_gated_attn_layer_decode_into` Op 6 → Op 7 at `forward_gpu.rs`); 4-fixture × 5-trial × NGEN=256 byte-identical-deterministic; preserved single-CB optimization.
+  - **iter30** — per-quant-class `chain_n` autodefault LANDED at `forward_gpu.rs:315-352, 2125-2142`; +27 LOC; 7 unit tests PASS; locks in iter26 N-curve wins (dense+Q4_K → cn=4 +3.91pp; MoE+Q4_K → cn=2 +1.27pp; MoE+Q5_K → cn=1 safe).
+  - **12 framework hypotheses falsified on M5 Max** (residency, single-CB collapse, chain_n=2/20, rms_norm port, fused gate+up, per-dispatch-cost-asymmetry, CPU-side ObjC bridge, plus prior — see `project_metal_compiler_auto_optimizes_static_levers`).  ADR-015 lever space at qwen35-codebase architecture is EXHAUSTED at iter30.
+  - **Defect A absolute ≥ 0.9587× gate NOT met** at the dwq46 critical cell (iter22 0.9487× / iter26 cn=2 0.9507×); ADR-015 §MoE perf budget closes ABOVE iter22 baseline but BELOW the absolute ship gate.
+  - **Defect B gemma -16.25pp** is on a separate `forward_mlx` forward path (gemma_gpu, not qwen35_gpu); deferred to ADR-016 territory per `feedback_use_cfa_worktrees` separate-worktree directive.
+
+  **iter32+ recommendation.**  Two valid pivots, equally evidence-supported, awaiting user direction:
+
+  - **Option 1 — ADR-016 Defect B gemma -16.25pp.**  Different forward path (forward_mlx), different lever space, different fixture class.  Per `project_qwen36_perf_gap_is_full_attention` cross-arch parity is the residual single-fixture failure on the speed bar.  Risk: similar 12-falsification cycle on a new forward path.
+  - **Option 2 — Pause ADR-015/016 and declare ceiling.**  Per `feedback_speed_bar_full_matrix` standing pin "speed bar applies to full quant × conversion × length matrix" — declaring ceiling without iter32+ closes the ADR-015/016 perf-bar at "13/14 cells PASS gate, 1 cell (gemma_gpu) -16.25pp below" with the iter30 ship-state as the durable HEAD.  Forensic value of the 12-falsification + 1-LANDED arc is preserved as the §Lessons block; engineering capacity reallocates.
+
+  Per `feedback_correct_outcomes` iter31-DEFERRED-AGAIN does NOT pre-select between Options 1/2 on behalf of the user — both are recorded for the resumption decision.
+
 - **2026-04-29 — iter30 — LANDED — per-quant-class `chain_n` default — config-only ship locks in iter26 N-curve wins, NO REGRESSION across all 4 fixtures under partial ADR-014-convert contamination.**  Per `feedback_evidence_first_no_blind_kernel_rewrites` iter30 ships only the iter26-measured + iter27-GPU-TS-verified + iter29-CPU-attribution-confirmed lookup table; zero kernel changes, zero ObjC-bridge changes, zero crate-version bumps.  Implementation: pure-function `chain_n_for(arm, quant, cfg_is_moe) → usize` at `src/inference/models/qwen35/forward_gpu.rs:315-333` plus `default_chain_n(cfg, layer_weights_gpu)` lookup wrapper at lines 336-352, called at the env-var consumer site at lines 2125-2142 (HEAD line 2035 pre-iter30; +27 lines added).  HF2Q_PARTIAL_CHAIN_N (env override) remains AUTHORITATIVE — user-set N≥1 wins over the autodefault.  HF2Q_PARTIAL_CHAIN_LEGACY=1 added as forensic A/B (forces cn=1 unconditionally, mirrors iter17 sunset pattern).  7 unit tests at `forward_gpu.rs:3074-3151` cover the 4 production cells + defensive fallbacks (Q4_0/Q8_0 → cn=1, F32-arm → cn=1, arm/cfg mismatch → cn=1); all PASS.
 
   **Decision matrix shipped (per iter29 §iter30 NEXT STEP table line 1651-1656).**
