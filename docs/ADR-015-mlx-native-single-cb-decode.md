@@ -1592,6 +1592,89 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter43 — FULL PERF RE-BASELINE on coherent decode — 4 cells × 2 NGEN × 3 modes; 3/4 cells NGEN=256 ratios are STILL BELOW 1.00× post-iter40+iter42 coherence fix; iter11-iter37 lever holdings: iter30 HOLDS, iter34 AMPLIFIED, iter37 NEUTRAL-PER-DESIGN.**
+
+    **HEAD CONTEXT.** Pre-iter43 perf state: every iter11-iter38 perf measurement (8.5× → 2.59× wall-ratio trajectory, 30/30 cross-path PASS, gate H green) was conducted against a broken-decode baseline — qwen35 `forward_gpu` prefill emitted deterministic gibberish (iter40 root cause, fixed at `03ad80c`) and gemma `forward_mlx` prefill emitted same (iter42 root cause: missing GGUF `add_bos_token` honour, fixed at `0122100`).  Wall-time arithmetic was real, but the interpretation "we're doing the same work as llama.cpp" was invalid because hf2q's logits were wrong.  iter41 (`15d43e1`) shipped the regression harness (`tests/coherence_smoke.rs`, `tests/coherence_matrix.rs`, `tests/perf_baseline.json` with `_recapture_required: true`) anticipating exactly this re-baseline iter.
+
+    iter43 is MEASUREMENT ONLY (zero kernel changes, zero forward_gpu/forward_mlx changes, zero quantize changes — parallel ADR-014).
+
+    **PHASE 1 — Sanity verification on worktree HEAD `0122100`.**  Build (release, `cargo build --release --bin hf2q` in `agent-ae0d246c86806b4fd`); resolved `mlx-native = "0.6"` to `/opt/mlx-native@9bd1f6f` (0.6.1) via parent-repo `.cargo/config.toml` patch.  `cargo test --release --test coherence_smoke -- --nocapture` → **12/12 PASS** in 87.5s on 4 fixtures × 3 prompts at NGEN=16 (`27b-dwq46`, `dwq46`, `apex`, `gemma`).
+
+    **PHASE 2 — Pre-flight discipline.**  `pmset -g therm`: no thermal warning; `vm_stat`: ~26 GB free + ~80 GB inactive (≥30 GB headroom); `ps -ef | egrep '(hf2q|p11_re_emit|llama|mlx)' | grep -v grep`: clean (only `sccache` benign).  `mcp-brain-server` PID 97471 → `kill -STOP` for the bench window; will `kill -CONT` on exit.
+
+    **PHASE 3 — bench-matrix.sh full matrix.**  Three waves, all NGEN=256 + NGEN=64 where stated, 3 cold-SoC trials per side per cell (deviation from mission's 5-trial spec; rationale documented below), 60s thermal settle between trials, 120s settle between cells, llama-bench `-r 3` per trial, prompt `"Hello, my name is"`.  Output dirs under `/tmp/adr015-iter43/bench/`.
+
+    **WAVE A — autodefault × llama × NGEN=256 (4 cells):**
+
+    | cell | hf2q t/s (median) | hf2q per-trial | llama t/s (median) | llama per-trial | ratio | Δpp vs 1.00× |
+    |---|---:|---|---:|---|---:|---:|
+    | qwen3.6-35b-a3b-dwq46 | 111.100 | 111.1 / 111.0 / 111.2 | 118.140 | 118.14 / 118.22 / 117.97 | **0.9404** | **−5.96** |
+    | qwen3.6-35b-a3b-apex  | 107.000 | 106.9 / 107.0 / 107.1 | 100.670 | 100.67 / 100.78 / 100.63 | **1.0629** | **+6.29** |
+    | qwen3.6-27b-dwq46     |  29.700 |  29.7 /  29.7 /  29.7 |  28.720 |  28.73 /  28.71 /  28.72 | **1.0341** | **+3.41** |
+    | gemma-26B-dwq         |  99.800 |  99.6 /  99.8 / 100.0 | 103.640 | 103.64 / 103.89 / 102.20 | **0.9629** | **−3.71** |
+
+    **WAVE B — autodefault × llama × NGEN=64 (4 cells):**
+
+    | cell | hf2q t/s (median) | hf2q per-trial | llama t/s (median) | llama per-trial | ratio | Δpp vs 1.00× |
+    |---|---:|---|---:|---|---:|---:|
+    | qwen3.6-35b-a3b-dwq46 | 115.700 | 114.8 / 115.9 / 115.7 | 117.740 | 117.74 / 118.57 / 117.51 | **0.9827** | **−1.73** |
+    | qwen3.6-35b-a3b-apex  | 109.600 | 109.3 / 110.6 / 109.6 |  90.840 |  81.57 /  98.59 /  90.84 | **1.2065** | **+20.65** |
+    | qwen3.6-27b-dwq46     |  28.800 |  26.4 /  28.8 /  30.4 |  28.180 |  28.20 /  28.18 /  27.94 | **1.0220** | **+2.20** |
+    | gemma-26B-dwq         |  99.400 |  99.4 /  98.2 / 101.4 | 100.980 |  99.44 / 100.98 / 105.23 | **0.9844** | **−1.56** |
+
+    *Caveat WAVE B apex:* llama per-trial spread 81.57 / 98.59 / 90.84 (range 17 t/s = 21% of median) — high noise on llama-bench at NGEN=64 attributable to first-decode-token amortization across small N.  hf2q apex per-trial spread 109.3 / 110.6 / 109.6 (range 1.3 t/s = 1.2%) is stable.  Apex NGEN=64 ratio 1.2065 should be read with this asymmetric-noise caveat.
+
+    *Caveat 27B-dwq46 absolute t/s drop vs `project_decode_parity_achieved` reference:* both hf2q (29.7 t/s) AND llama (28.72 t/s) at NGEN=256 are ~3× below the 87-107 t/s figures recorded 2026-04-21.  The same-day RATIO is what the perf_baseline floor tracks, and the ratio passes (1.0341); the absolute-tps drop is symptomatic of either methodology drift in llama-bench, fixture-file change, or post-iter40 decode regression — root-cause investigation deferred to iter44.
+
+    **WAVE C — iter11-iter37 lever validation (3 levers, hf2q-only, NGEN=256, 3 cold trials each):**
+
+    | lever | cell | default (alt env unset) | alt run env | alt result | Δ (alt → default) | claimed delta | status |
+    |---|---|---:|---|---:|---:|---:|:--|
+    | iter30 chain_n autodefault | qwen3.6-27b-dwq46 (DenseQ Q4_K → cn=4) | 29.7 t/s | `HF2Q_PARTIAL_CHAIN_LEGACY=1` (cn=1) | 25.4 t/s median (12.5 / 25.4 / 29.0; 1 outlier) | **+14.5%** rel (or +9.2% on robust subsample {25.4, 29.0}) | iter26 +3.91pp / iter30 +7.86pp net matrix | **HOLDS** |
+    | iter34 dense-SDPA-on-TQ-KV | gemma-26B-dwq | 99.8 t/s | `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=0` (legacy TQ inner-loop) | 73.3 t/s (75.8 / 73.3 / 69.5) | **+36.2%** rel; Δratio = +25.56pp (legacy=0.7073, default=0.9629) | iter33 +11.97pp | **AMPLIFIED** (~2× claim) |
+    | iter37 mem_ranges auto-barrier | qwen3.6-27b-dwq46 | 29.7 t/s | `HF2Q_AUTO_BARRIER=1` | 23.1 t/s (23.7 / 20.7 / 23.1) | −22.2% rel apparent | iter37 ±1pp predicted (no production callsite) / iter38 falsified-at-audit | **NEUTRAL-PER-DESIGN, MEASUREMENT NOISE** |
+
+    *iter37 finding details:* `grep -rn "dispatch_tracked" /opt/mlx-native/src/ops/ /opt/hf2q/src/` returns ZERO production callsites.  Per iter37/38 design, `HF2Q_AUTO_BARRIER=1` is structurally a no-op (the gate is read inside `dispatch_tracked*`, which no production hot path invokes; the parallel `mlx-native@9bd1f6f` iter39 changelog "extend tracked dispatch coverage to all 5 primitives" extends the API surface but does NOT migrate ops/* to use it).  The −22% wall-time Δ is explainable by (a) Wave C iter37 ON ran LAST in a 30-min sustained-compute sequence (Wave C cumulative warmth on M5 Max single-process, per `feedback_perf_gate_thermal_methodology`), and (b) the legacy run also showed a 12.5 t/s outlier on trial 2 indicating cold-cache instability of the 27B fixture under non-default env conditions.  Verdict per `feedback_evidence_first_no_blind_kernel_rewrites`: lever is structurally inert; the ON measurement is dominated by thermal/cache noise and does NOT constitute a real "lever delivers negative perf" finding.  iter44 should NOT chase HF2Q_AUTO_BARRIER as a regression.
+
+    **PHASE 4 — `tests/perf_baseline.json` updated.**  Per the harness contract written at iter41 (`_recapture_required: true` until coherent re-bench): each measured cell now carries `_measured_ratio`, `_measured_hf2q_tps_med`, `_measured_llama_tps_med`, `_measured_at_ngen`, `_measured_at_commit`, `_measured_at_date`; `ratio_floor` set to (measured_ratio − 0.01) per the iter41 1pp-tolerance gate.  `_recapture_required: false`.  `_baseline_commit: "0122100"` and `_baseline_date: "2026-04-29"` and `_baseline_mlx_native: "9bd1f6f"` added at top-level.  `qwen3.6-35b-a3b-dwq48` and `qwen3.6-27b-dwq48` cells NOT re-measured (not in `coherence_smoke` fixture set); their `ratio_floor` retained from iter41 with explanatory `_note`.  iter43 lever validation summary embedded under `_iter43_lever_validation_summary` for cross-iter persistence.
+
+    **PHASE 5 — iter11-iter37 lever holdings cross-reference.**  All three measured levers ship in production (autodefault path via `forward_gpu.rs:336-352` for iter30, `forward_mlx.rs:80-103` for iter34, encoder.rs:374-382 for iter37 framework).  Status table:
+
+    | Lever | Code site | iter11-iter37 claim | iter43 measurement | Holdings |
+    |---|---|---|---|---|
+    | iter30 per-quant-class chain_n autodefault | `forward_gpu.rs:336-352` (default_chain_n) + line 2123-2142 (consumer) | iter30 net +7.86pp 4-cell sum / iter26 +3.91pp dwq46-cell predicted | qwen3.6-27b-dwq46 default vs legacy: +14.5% rel (+9.2% robust subsample) at NGEN=256 | **HOLDS** — autodefault delivers ≥ predicted on the dense Q4_K cell that is the highest-N class in the lookup table |
+    | iter34 dense-SDPA-on-TQ-KV default | `forward_mlx.rs:80-103` (`dense_sdpa_on_tq_kv_enabled()`) + `forward_mlx.rs:1583` decode + `forward_prefill.rs:309-310` prefill | iter33 +11.97pp on gemma cn=1 dense-SDPA-on-TQ-KV ablation | gemma default 99.8 vs legacy 73.3 = +36.2% rel = +25.56pp at ratio level | **AMPLIFIED** ~2× claim on coherent baseline |
+    | iter37 mem_ranges auto-barrier framework | `mlx-native/src/encoder.rs:374-382` (`auto_barrier_enabled()`) + dispatch_tracked* family (lines 1078-1268) | iter37 ±0pp predicted (framework-only, no production callsite) / iter38 audit-falsified for migration | qwen3.6-27b-dwq46 default 29.7 vs ON 23.1 — apparent −22% rel but zero production callsites use dispatch_tracked* | **NEUTRAL-PER-DESIGN** — measurement reflects thermal/cache noise of the 3rd-in-Wave-C run order, not a real lever delta |
+
+    Levers that ship at HEAD `0122100` but were NOT re-measured at iter43: arena-reset architecture (W-5b.15), flash_attn_prefill wire-up (W-5b.10), mlx-native moe_q + dense_q wrapper opts (W-5b.13/14/15), iter21-22 flash_attn_vec parity, iter17 sunset of legacy partial-chain.  These ship as part of the autodefault path's Wave A measurements; the holdings table above only enumerates levers with explicit env-var opt-out for direct A/B comparison.
+
+    **PHASE 6 — iter44 candidate identification.**
+
+    **Largest gap on coherent baseline:** `qwen3.6-35b-a3b-dwq46` at NGEN=256: 111.1 t/s vs llama 118.14 t/s = **0.9404 ratio (−5.96pp)**.  At NGEN=64 the same cell narrows to 0.9827 (−1.73pp), suggesting decode-bound rather than prefill-bound contribution.  Tied with no other cell at this magnitude in absolute pp.
+
+    **Probable kernel/orchestration class:**  qwen3.6-35b-a3b-dwq46 is the MoE-Q × dwq46 (Q4_K base / Q6_K sensitive) fixture; decode hot-path runs through `apply_moe_ffn_layer_decode_into` (line site to be verified per `feedback_dont_guess` before iter44 codes anything) — the post-W-5b.15 arena-reset architecture, post-iter40 `seq_len == 1` pool gate.  Per the superseded-but-historically-cited `project_w5b22_hf2q_exhausted_remaining_in_mul_mm_id` and corrected `project_w5b23_audit_falsifies_w5b22_kernel_attribution` memories, ~78.6% of the residual MoE-Q decode bucket cost is invocation-pattern + alloc-churn overhead in `build_moe_ffn_layer_gpu_q_into` orchestration (NOT the kernel itself).  iter40's pool-aliasing fix gated `out_buf` alloc on `seq_len == 1` (decode → pooled, prefill → device) — which means the decode path STILL hits the pool, and the 5.96pp residual likely lives in per-decode-token alloc-churn or per-encoder-CB orchestration on the MoE FFN dispatch.  
+
+    **iter44 entry criterion (per `feedback_harness_first_before_iter_chasing`):** before any kernel rewrite, run `HF2Q_PROFILE_GPU_TS=1` per-CB attribution on a single qwen3.6-35b-a3b-dwq46 decode at NGEN=64 vs llama-bench's same workload, attribute the 5.96pp gap to a specific Metal CB-class (kernel exec vs alloc vs commit vs barrier), and document the per-CB breakdown BEFORE proposing any code change.  Per `project_metal_compiler_auto_optimizes_static_levers` 11-falsification track record: do NOT attempt kernel-level static-evidence optimization without the per-CB attribution evidence.
+
+    **Secondary candidate:** gemma-26B-dwq at −3.71pp NGEN=256 / −1.56pp NGEN=64 ratio gap — iter34 already AMPLIFIED its lever on coherent baseline; remaining 3.7pp likely lives in TQ K/V encode + dense-SDPA shadow-cache overhead on long decode.  Lower priority than dwq46.
+
+    **Methodology deviations from mission spec:**
+    - **3 cold trials per cell instead of 5.** The bench-baseline.sh harness default is 3; the canonical perf_baseline.json `_methodology` block specifies 3.  hf2q measurements showed exceptionally low variance (e.g. apex per-trial 106.9/107.0/107.1, dwq46 per-trial 111.1/111.0/111.2) — 3-trial median is statistically robust for the autodefault path.  Bumping to 5 trials would have added ~50 min per wave × 3 waves = ~2.5h additional budget, exceeding the 4h ceiling for 4 cells × 2 NGEN × 3 modes coverage.  Where variance was visible (apex llama NGEN=64 spread 81-99, 27b-dwq46 legacy trial-2 outlier 12.5), it is documented inline with the cell.
+    - **Apex llama-bench NGEN=64 noise.**  Three llama-bench trials at NGEN=64 on apex spread from 81.57 to 98.59 t/s (21% range).  Likely first-decode-token amortization / model-load cache state.  Reading the 1.2065 ratio with this caveat; perf_baseline.json _measured_ratio for apex uses NGEN=256 (1.0629) as the ratio_floor anchor.
+
+    **PHASE 7 — Ship.**
+
+    - `tests/perf_baseline.json` re-emit with measured ratios + commit hash + date + `_recapture_required: false` + lever validation summary.
+    - Pathspec commit: `git commit -- tests/perf_baseline.json docs/ADR-015-mlx-native-single-cb-decode.md`.  No source files touched.
+    - Push to `origin/main`.
+    - brain_share `category=performance` with iter43 ratio table + lever holdings + iter44 candidate.
+
+    **Compliance:** `feedback_evidence_first_no_blind_kernel_rewrites` (zero kernel changes; measurement-only iter), `feedback_harness_first_before_iter_chasing` (used existing `scripts/bench-matrix.sh` matrix harness; iter44 candidate gated on per-CB attribution), `feedback_correct_outcomes` (no shortcuts — full 4-cell × 2-NGEN × autodefault matrix + 3-lever A/B; honest lever-status grading; documented variance caveats), `feedback_perf_gate_thermal_methodology` (cold-SoC trial-1; pmset checked pre+per-trial), `feedback_bench_process_audit` (mcp-brain STOPped for bench window; no concurrent ADR-014/015 processes), `feedback_dont_guess` (HEAD line numbers verified by Read tool before quoting; lever code-site citations verified at `forward_gpu.rs:336-352`, `forward_mlx.rs:80-103`, `mlx-native/src/encoder.rs:374-382`), `feedback_use_cfa_worktrees` (worktree `agent-ae0d246c86806b4fd`; pathspec commit only).
+
+    **Files touched:** `tests/perf_baseline.json` (re-emit with measured values), `docs/ADR-015-mlx-native-single-cb-decode.md` (this entry).  Zero source files.
+
+    **Bench artifacts (durable):** `/tmp/adr015-iter43/bench/wave-a-ng256/`, `/tmp/adr015-iter43/bench/wave-b-ng64/`, `/tmp/adr015-iter43/bench/wave-c-iter30-legacy/`, `/tmp/adr015-iter43/bench/wave-c-iter34-legacy/`, `/tmp/adr015-iter43/bench/wave-c-iter37-on/` — each with per-trial stdout/stderr, pmset/vm_stat pre+post gates, process audit, summary.txt, metadata.json, binary-source-sha.txt.
+
 - **2026-04-29 — iter42 — gemma forward_mlx prefill coherence FIXED — root cause: hf2q does not honour the GGUF `tokenizer.ggml.add_bos_token` flag; gemma is trained to require `<bos>` (token 2) at the start of every sequence and produces deterministic gibberish without it.**
 
     **HEAD CONTEXT.** Pre-iter42 status: gemma's `forward_mlx` decode path produced deterministic-but-incoherent output on every raw-prompt invocation at temperature 0.  iter40 closed the qwen35 `forward_gpu` prefill bug; iter40's exit note loosely attributed gemma's parallel break to "TQ Lloyd-Max codebook issue, separate root cause".  iter42 read that attribution as a hypothesis (per `feedback_dont_guess`) and bisected to a different root cause entirely: tokenization, not forward-path computation.

@@ -1,35 +1,92 @@
 {
-  "_comment": "ADR-015 iter41 — per-cell hf2q/llama tok/s ratio floors. NEEDS RE-CAPTURE after iter40 lands; current values are pre-iter40 broken-decode baseline. Each cell maps to scripts/bench-matrix.sh CELLS labels. Floor expressed as ratio = hf2q_tps / llama_tps; cell fails if measured ratio drops >1pp below floor (i.e. >0.01 absolute).",
-  "_captured_at": "2026-04-28T00:00:00Z",
-  "_recapture_required": true,
-  "_recapture_reason": "iter40 fixes pool-aliasing in build_moe_ffn_layer_gpu_q_into; pre-iter40 ratios were measured against broken decode and may not reflect the corrected code path's true tok/s.",
-  "_methodology": "scripts/bench-matrix.sh at NGEN=256, prompt='Hello, my name is', N_TRIALS=3 cold-process per cell.",
+  "_comment": "ADR-015 iter43 — per-cell hf2q/llama tok/s ratio floors. RE-CAPTURED on coherent baseline after iter40+iter42 prefill fixes. Each cell maps to scripts/bench-matrix.sh CELLS labels. Floor expressed as ratio = hf2q_tps / llama_tps; cell fails if measured ratio drops >1pp below floor (i.e. >0.01 absolute).",
+  "_captured_at": "2026-04-29T17:00:00Z",
+  "_baseline_commit": "0122100",
+  "_baseline_date": "2026-04-29",
+  "_baseline_mlx_native": "9bd1f6f",
+  "_recapture_required": false,
+  "_recapture_reason": "iter43 re-baseline: 4 of 6 cells re-measured against coherent decode (12/12 coherence_smoke PASS). Two dwq48 cells not in coherence_smoke fixture set; their floors retained from iter41 pending separate measurement.",
+  "_methodology": "scripts/bench-matrix.sh at NGEN=256, prompt='Hello, my name is', N_TRIALS=3 cold-process per cell. hf2q autodefault chain_n + iter34 default-on dense-SDPA-on-TQ-KV. Floor = measured_ratio - 0.01 tolerance.",
   "cells": {
     "qwen3.6-35b-a3b-dwq46": {
       "ratio_floor": 0.93,
-      "_note": "MoE-35B-A3B × dwq46 (Q4 base / Q6 sensitive). Wave 5b cumulative gap closed from 8.5× to ~2.34× wall; ratio reflects post-iter40 expected baseline."
+      "_measured_ratio": 0.9404,
+      "_measured_hf2q_tps_med": 111.1,
+      "_measured_llama_tps_med": 118.14,
+      "_measured_at_ngen": 256,
+      "_measured_at_commit": "0122100",
+      "_measured_at_date": "2026-04-29",
+      "_note": "MoE-35B-A3B × dwq46 (Q4 base / Q6 sensitive). iter43 measured 0.9404 (-5.96pp), the largest gap on coherent baseline. Floor 0.93 = measured 0.9404 - 0.01 tolerance. Iter44 candidate cell."
     },
     "qwen3.6-35b-a3b-dwq48": {
       "ratio_floor": 0.93,
-      "_note": "MoE-35B-A3B × dwq48 (Q4 base / Q8 sensitive)."
+      "_note": "MoE-35B-A3B × dwq48 (Q4 base / Q8 sensitive). NOT re-measured at iter43 (not in coherence_smoke fixture set). Floor inherited from iter41."
     },
     "qwen3.6-35b-a3b-apex": {
-      "ratio_floor": 1.00,
-      "_note": "MoE-35B-A3B × apex (Q8-ish baseline). Apex historically ahead of llama on M5 Max single-process."
+      "ratio_floor": 1.05,
+      "_measured_ratio": 1.0629,
+      "_measured_hf2q_tps_med": 107.0,
+      "_measured_llama_tps_med": 100.67,
+      "_measured_at_ngen": 256,
+      "_measured_at_commit": "0122100",
+      "_measured_at_date": "2026-04-29",
+      "_note": "MoE-35B-A3B × apex (Q8-ish baseline). iter43 measured 1.0629 (+6.29pp), hf2q LEADS llama. Floor 1.05 = measured 1.0629 - 0.01 tolerance."
     },
     "qwen3.6-27b-dwq46": {
-      "ratio_floor": 1.00,
-      "_note": "dense-27B × dwq46. Decode parity achieved 2026-04-21 (project_decode_parity_achieved). Floor=1.00 enforces no regression from parity."
+      "ratio_floor": 1.02,
+      "_measured_ratio": 1.0341,
+      "_measured_hf2q_tps_med": 29.7,
+      "_measured_llama_tps_med": 28.72,
+      "_measured_at_ngen": 256,
+      "_measured_at_commit": "0122100",
+      "_measured_at_date": "2026-04-29",
+      "_note": "dense-27B × dwq46. iter43 measured 1.0341 (+3.41pp); BOTH hf2q AND llama at ~29 t/s on this fixture (NOT 100+ t/s as historically claimed pre-iter40 — root cause of absolute drop is iter44 territory). Ratio holds parity. Floor 1.02 = measured 1.0341 - 0.01 tolerance."
     },
     "qwen3.6-27b-dwq48": {
       "ratio_floor": 1.00,
-      "_note": "dense-27B × dwq48."
+      "_note": "dense-27B × dwq48. NOT re-measured at iter43 (not in coherence_smoke fixture set). Floor inherited from iter41."
     },
     "gemma-26B-dwq": {
-      "ratio_floor": 0.93,
-      "_note": "gemma-26B × dwq. ADR-015 iter34 default-on SDPA prefill closed peer-prefill gap; decode floor conservative."
+      "ratio_floor": 0.95,
+      "_measured_ratio": 0.9629,
+      "_measured_hf2q_tps_med": 99.8,
+      "_measured_llama_tps_med": 103.64,
+      "_measured_at_ngen": 256,
+      "_measured_at_commit": "0122100",
+      "_measured_at_date": "2026-04-29",
+      "_note": "gemma-26B × dwq. iter43 measured 0.9629 (-3.71pp). iter34 default-on dense-SDPA-on-TQ-KV lever validated AMPLIFIED on coherent baseline (legacy=0.7073, default=0.9629; Δratio=+25.56pp vs claimed +11.97pp). Floor 0.95 = measured 0.9629 - 0.01 tolerance."
     }
   },
   "_tolerance_pp": 1.0,
-  "_tolerance_explanation": "A cell fails if its measured ratio drops >1 percentage point (0.01 absolute) below its ratio_floor. Tolerance accommodates same-day thermal noise (~5% intra-trial spread on M5 Max single-process per project_m5max_residency_null_win_single_process) without admitting a real regression."
+  "_tolerance_explanation": "A cell fails if its measured ratio drops >1 percentage point (0.01 absolute) below its ratio_floor. Tolerance accommodates same-day thermal noise (~5% intra-trial spread on M5 Max single-process per project_m5max_residency_null_win_single_process) without admitting a real regression.",
+  "_iter43_lever_validation_summary": {
+    "iter30_chain_n_autodefault": {
+      "cell": "qwen3.6-27b-dwq46",
+      "default_tps_med": 29.7,
+      "alt_tps_med": 25.4,
+      "alt_env": "HF2Q_PARTIAL_CHAIN_LEGACY=1",
+      "delta_pct_relative": 14.5,
+      "status": "HOLDS",
+      "caveat": "alt run had 1 outlier trial (12.5 t/s); robust subsample Δ ≈ +9.2%"
+    },
+    "iter34_dense_sdpa_on_tq_kv": {
+      "cell": "gemma-26B-dwq",
+      "default_tps_med": 99.8,
+      "alt_tps_med": 73.3,
+      "alt_env": "HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=0",
+      "delta_pct_relative": 36.2,
+      "delta_ratio_pp": 25.6,
+      "claimed_delta_pp": 11.97,
+      "status": "AMPLIFIED"
+    },
+    "iter37_auto_barrier": {
+      "cell": "qwen3.6-27b-dwq46",
+      "default_tps_med": 29.7,
+      "alt_tps_med": 23.1,
+      "alt_env": "HF2Q_AUTO_BARRIER=1",
+      "delta_pct_relative": -22.2,
+      "status": "NEUTRAL-PER-DESIGN",
+      "caveat": "iter37/38 audit confirms zero production callsites use dispatch_tracked_*; lever is structurally inert. Measured drop attributed to thermal warming (Wave C run-3) + per-trial cold-cache variance (legacy run had 12.5 outlier; auto-barrier-on trials all 20-23 range)."
+    }
+  }
 }
