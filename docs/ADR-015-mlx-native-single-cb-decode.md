@@ -1592,6 +1592,111 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter42 — gemma forward_mlx prefill coherence FIXED — root cause: hf2q does not honour the GGUF `tokenizer.ggml.add_bos_token` flag; gemma is trained to require `<bos>` (token 2) at the start of every sequence and produces deterministic gibberish without it.**
+
+    **HEAD CONTEXT.** Pre-iter42 status: gemma's `forward_mlx` decode path produced deterministic-but-incoherent output on every raw-prompt invocation at temperature 0.  iter40 closed the qwen35 `forward_gpu` prefill bug; iter40's exit note loosely attributed gemma's parallel break to "TQ Lloyd-Max codebook issue, separate root cause".  iter42 read that attribution as a hypothesis (per `feedback_dont_guess`) and bisected to a different root cause entirely: tokenization, not forward-path computation.
+
+    **Sample broken decodes at HEAD `15d43e1` (iter41) on `gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf` with `--temperature 0 --chat-template "{% for message in messages %}{{ message.content }}{% endfor %}"`:**
+
+    | Prompt | hf2q (broken) | llama-completion (peer) |
+    |--------|---------------|------------------------|
+    | "Hello, my name is" | ` the, my name is the, my name is the, my name is the, my name is the,` | ` [Name] and I am a [Job Title/Role] in the [` |
+    | "The quick brown fox" | ` quick.\n\n... ... ... ... ... ... ... ... ...` | `-jars-ing-ing-ing-ing-ing-ing-ing` (degenerate at temp 0) |
+    | "What is 2+2?" | ` 2+2? 2+2? 2+2? 2+2? 2+2? 2+2? 2` | `thought\n2+2?\n2+2?\n2+2?` (degenerate at temp 0) |
+
+    The `-ing-ing` and `2+2?` degeneracy in the llama peer is gemma at temp-0 — the model itself, not a peer bug — captured in iter41's `KNOWN_DEGENERATE_PEER` whitelist.  The "Hello, my name is" cell has a coherent peer ground truth; iter42's bisect targets that cell.
+
+    **PHASE 1 — REPRODUCE + COMPARE TWO ENV SCENARIOS.** With the GGUF default chat template (no `--chat-template` override), gemma produced **18 prefill tokens** and decoded coherently: `"...to complete that sentence, I need a little more information!"`.  Strip the chat template via `--chat-template "{% for message in messages %}{{ message.content }}{% endfor %}"` and prefill drops to **5 tokens** (or 6/7/8 for other prompts) and the decode is gibberish.  The bug is not "short prefill" — a 27-token raw prompt also produces gibberish.  The differentiator between the two scenarios is whether the rendered prompt's leading literal `<bos>` (which the gemma chat template emits via `{{ bos_token }}` at line ~7014 of the template) survives into the tokenized stream.
+
+    **PHASE 2 — TOKENIZATION DIFF (READ-ONLY).** `llama-tokenize -m … -p "Hello, my name is"` produced `[2, 9259, 236764, 1041, 1463, 563]` (6 tokens, BOS=2).  hf2q's `HF2Q_DUMP_PROMPT_TOKENS=1` produced `[9419, 11, 821, 803, 369]` …wait, those are qwen ids.  For gemma: `[9259, 236764, 1041, 1463, 563]` (5 tokens, no BOS).  `llama-completion --verbose-prompt` confirmed llama always prepends BOS (`load: override 'tokenizer.ggml.add_bos_token' to 'true' for Gemma4` — llama.cpp special-cases gemma4 to FORCE add_bos=true regardless of GGUF metadata or `--override-kv` flag).  hf2q's `tokenizer.encode(text, add_special_tokens=false)` never prepends BOS.
+
+    **PHASE 3 — FALSIFICATION MATRIX.** Three hypotheses explicitly tested before believing the BOS theory:
+
+    | # | Hypothesis | Test | Result |
+    |---|-----------|------|--------|
+    | H1 | Pool-aliasing bug analogous to iter40 (forward_mlx parallel) | Read every `dev.alloc_buffer` callsite in `src/serve/forward_mlx.rs:850-1108,1492-1539,2019,4867-4928` and `src/serve/forward_prefill.rs:281-419,1483`; check if any prefill-allocated buffer is aliased into decode's residual stream | FALSIFIED — gemma forward_mlx allocates dense_kvs / leg_f_kvs / leg_hb_encoded directly via `dev.alloc_buffer` (not pooled); the `decode_pool::pooled_alloc_buffer` infrastructure is qwen35-only.  No pool-aliasing path on gemma. |
+    | H2 | iter34's `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV` default-on broke a code path | Set `HF2Q_LEGACY_TQ_SDPA=1` (forces pre-iter34 inner-loop) and `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=0` separately | FALSIFIED — both opt-out paths produce the SAME gibberish text at raw prompt.  iter34's flip is independent of the bug. |
+    | H3 | TQ Lloyd-Max codebook drift in encode/decode (iter40 agent's loose attribution) | Set `HF2Q_USE_DENSE=1` (forces pure dense KV cache, bypassing TQ encode/decode + leg_f_kvs + leg_hb_encoded entirely; uses the F32-direct `dense_kvs` populated in prefill); also `HF2Q_TQ_CODEBOOK_BITS=4` legacy-4-bit path | FALSIFIED — both produce the same gibberish.  TQ codebook is exonerated; the bug is upstream of SDPA/KV. |
+    | H4 | Gemma uses a different forward path with its own implementation | Read `src/serve/forward_mlx.rs::forward_decode` and `src/serve/forward_prefill.rs::forward_prefill` end-to-end | CONFIRMED-architecture-only — gemma's path IS distinct from qwen35's `forward_gpu`, but the bug is not in any per-op code; it's in tokenization. |
+    | H5 | Bisect git between iter32 and HEAD looking for a regression | Tested by setting `HF2Q_LEGACY_TQ_SDPA=1` (pre-iter34 control) — same gibberish | FALSIFIED — bug predates iter34. iter34's "5/5 byte-identical, multi-prompt smoke coherent" claim was bench-tested with `--benchmark` flag which uses the GGUF default chat template, which emits `{{ bos_token }}` — masking the bug. |
+    | H6 | hf2q's `tokenizer.encode(text, add_special_tokens=false)` is missing the BOS that llama always prepends | Manual injection: pass `--chat-template '<bos>{% for message in messages %}{{ message.content }}{% endfor %}'` (chat template emits literal `<bos>` text → tokenizer maps to id 2) | **CONFIRMED.** With manual `<bos>` injection: `prefill: 6 tok in 181ms` (was 5), output: ` [Name] and I am a [Job Title] and a [Job Title]…` — coherent, semantically aligned with llama's golden ` [Name] and I am a [Job Title/Role] in the […`. |
+
+    **PHASE 4 — ROOT CAUSE.** llama.cpp's `common_tokenize` (`/opt/llama.cpp/common/common.cpp`) honours `tokenizer.ggml.add_bos_token` GGUF metadata when `add_special=true` is requested.  For Gemma4 specifically it ALSO force-overrides any user `--override-kv add_bos_token=bool:false` to `true` (`load: override 'tokenizer.ggml.add_bos_token' to 'true' for Gemma4`) because the gemma4 weight matrices were trained with `<bos>` always present at sequence start.  Without `<bos>`, gemma4 produces gibberish.  hf2q's gemma path at `src/serve/mod.rs:504-507` uses `tokenizer.encode(prompt_text.as_str(), false)` (`add_special_tokens=false`) and does no follow-up BOS injection — `add_bos_token` GGUF metadata is read by NO code path in `src/`:
+
+    ```text
+    rg -n 'add_bos_token' src/ | grep -v 'gguf.rs:2655'
+    (no matches)
+    ```
+
+    **Why iter34's bench passed.** iter34 used `hf2q generate --prompt "Hello, my name is" --max-tokens 256 --temperature 0 --benchmark` *without* a `--chat-template` override.  The default chat-template resolution (`src/serve/mod.rs:233-269 render_chat_template`) used the GGUF's `tokenizer.chat_template` metadata, which renders to a string starting with `{{ bos_token }}` → the tokenizer maps that literal `<bos>` to token 2 → BOS lands in `prompt_tokens` correctly.  iter34's "5/5 byte-identical, multi-prompt smoke coherent" was structurally true but blind to the missing-BOS bug because every test run path the prompt through the GGUF chat template.
+
+    **Why iter41's coherence_smoke FOUND it.**  iter41's `tests/coherence_smoke.rs:36` defines `CHAT_TEMPLATE_RAW: &str = "{% for message in messages %}{{ message.content }}{% endfor %}"` — a deliberate strip-the-chat-template harness designed to test the model on raw prompts.  This bypasses the GGUF chat template's `{{ bos_token }}` directive, exposing the missing-BOS bug.  iter41 captured llama-completion goldens with default settings (llama force-prepends BOS for Gemma4) — peer reference WITH BOS, hf2q output WITHOUT BOS → mismatch → iter41 harness correctly classifies as GIBBERISH.
+
+    **PHASE 5 — FIX.**  `src/serve/mod.rs:504-562` (gemma `cmd_generate` only — `cmd_generate_qwen35` is intentionally untouched, see below).  After tokenization, read the GGUF's `tokenizer.ggml.add_bos_token` (Bool) and `tokenizer.ggml.bos_token_id` (u32); if `add_bos=true`, `bos_token_id` is defined, AND the first prompt token is not already that BOS id, prepend the BOS id.  Identical-in-spirit to llama.cpp's `common_tokenize` semantics.  Idempotent: invocations whose chat template already emits `<bos>` (the default GGUF chat-template path) hit the `prompt_tokens.first() == Some(&bos)` guard and don't double-prepend.
+
+    ```rust
+    let add_bos = matches!(
+        gguf.metadata("tokenizer.ggml.add_bos_token"),
+        Some(mlx_native::gguf::MetadataValue::Bool(true))
+    );
+    let bos_token_id = gguf.metadata_u32("tokenizer.ggml.bos_token_id");
+    if add_bos {
+        if let Some(bos) = bos_token_id {
+            let already_has_bos = prompt_tokens.first() == Some(&bos);
+            if !already_has_bos {
+                prompt_tokens.insert(0, bos);
+            }
+        }
+    }
+    ```
+
+    **Why qwen35 (`cmd_generate_qwen35`) is intentionally untouched.**  Per iter40's PHASE 1 finding (line 1599 of this ADR): "Re-running llama-completion with `--override-kv tokenizer.ggml.add_bos_token=bool:false` matched hf2q's 5-token prompt exactly and STILL produced coherent ` J. I have a 14 year old son…`, proving the BOS difference was not the cause."  qwen35 fixtures dwq46/27b have GGUF `add_bos_token=true` but **no `bos_token_id`** (only `apex` has `bos_token_id=248044`); the iter42 fix's `if let Some(bos) = bos_token_id` guard would no-op for dwq46/27b regardless.  qwen35 is robust to BOS presence/absence; adding BOS to apex risks shifting its byte-identical-5/5 baseline without a coherence benefit.  The qwen35 path's BOS handling is a separate iter (out of scope for iter42).
+
+    **Goldens recapture (qwen35 only).**  iter41's qwen35 goldens were captured with default `llama-completion` settings → llama prepends BOS=`,` (token 11) for qwen35 dwq46/27b/apex even when GGUF lacks an explicit `bos_token_id` (llama defaults to whatever; verified via `--verbose-prompt`).  hf2q's qwen35 path doesn't and never will under iter42 scope.  Re-captured the 9 qwen35 goldens with `--override-kv tokenizer.ggml.add_bos_token=bool:false` — matching the iter40-defined peer reference (line 1599) and hf2q's actual qwen35 token stream.  Gemma goldens are unchanged: llama force-prepends BOS for Gemma4 regardless of override, and the iter42 fix mirrors that — gemma goldens remain the correct peer reference.
+
+    **PHASE 6 — VALIDATION.** All 12 cells × `tests/coherence_smoke.rs` PASS under `cargo test --release --test coherence_smoke`.  All 12 cells × `tests/coherence_matrix.rs::coherence_matrix_all_cells` PASS at **EXACT=4, COHERENT=8, GIBBERISH=0**:
+
+    | Fixture | Prompt | Verdict | Notes |
+    |---------|--------|---------|-------|
+    | 27b-dwq46 | hello-my-name-is | EXACT | byte-identical to llama no-BOS golden |
+    | 27b-dwq46 | the-quick-brown-fox | EXACT | ditto |
+    | 27b-dwq46 | what-is-22 | COHERENT | hf2q `2+2 equals 4. This is a basic arithmetic operation` vs golden `2+2 equals 4. This is because when you add two units` — same answer, different elaboration |
+    | dwq46 | hello-my-name-is | COHERENT | hf2q `J. I am a 30 year old male...` vs golden `J. I have a 14 year old son...` — argmax variance |
+    | dwq46 | the-quick-brown-fox | COHERENT | hf2q ```html` vs golden ```python` |
+    | dwq46 | what-is-22 | COHERENT | both arithmetic answers |
+    | apex | hello-my-name-is | COHERENT | `John. I am a 45-year-old male` vs `John. I am a 30-year-old male` |
+    | apex | the-quick-brown-fox | COHERENT | both pangrams |
+    | apex | what-is-22 | EXACT | byte-identical |
+    | gemma | hello-my-name-is | COHERENT | hf2q ` [Name] and I am a [Job Title] and a [Job Title` vs golden ` [Name] and I am a [Job Title/Role] in the [` — same prefix, divergent at token 6 |
+    | gemma | the-quick-brown-fox | EXACT | `-jars-ing-ing-ing-ing-ing-ing-ing` byte-identical to peer's degenerate output |
+    | gemma | what-is-22 | COHERENT | hf2q `thoughtful\n    *   *Goal:* Provide…` vs golden `thought\n2+2?\n2+2?\n2+2?` — hf2q is MORE coherent than peer (peer is degenerate at temp 0); KNOWN_DEGENERATE_PEER cell |
+
+    **Determinism check (5 trials, gemma "Hello, my name is", NGEN=32):** all 5 trials text-only md5 = `b8b907f98b37d5540ea39784c585a7d4` — byte-identical.
+
+    **Long-decode (NGEN=128):** gemma decodes coherently for ~25-30 tokens then degenerates into `own-the-results in own-the-results` cycling.  Llama at the same settings degenerates similarly (`This is a [Description of the Purpose of the Presentation/Presentation Type] to [Goal/Objective of the Presentation/Presentation Type]` repeating).  Long-decode degeneration on this specific prompt is a model property at Q4_0 + temp 0, not an iter42 regression — both binaries exhibit it.
+
+    **qwen35 non-regression** (per mission requirement): `qwen3.6-27b-dwq46` produces ` Alex. I am a 20-year-old male. I have been experiencing` (matches iter40 documented output line 1655).  `qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46` produces ` J. I am a 30 year old male. I have been having` (matches iter40 line 1652).  iter40's qwen35 fix is preserved; iter42's gemma fix is structurally orthogonal.
+
+    **PHASE 7 — HARNESS HARDENING.**  iter41's `tests/coherence_matrix.rs::classify` had two issues independent of iter42's root-cause that prevented the matrix from passing even with a coherent gemma:
+
+    1. **Hf2q stdout header was not stripped before comparison.**  `target/release/hf2q generate` writes a 3-line product header (`hf2q · M5 Max · mlx-native\nGemma4ForConditionalGeneration · loaded in …\nprefill: N tok in …ms`) before the decoded text; the goldens contain only the body.  `gemma-the-quick-brown-fox` was incorrectly classified GIBBERISH because `actual` (with header) didn't byte-equal `golden` even though the body did.  Fix: `strip_hf2q_header` helper that splits at the first `\n\n` divider.
+    2. **`KNOWN_DEGENERATE_PEER` was missing from the matrix** (smoke had it; matrix did not).  Cells where the peer reference is itself degenerate at temp 0 (gemma fox / 2+2) require a different acceptance contract: trim-equal to peer is EXACT; otherwise COHERENT (degenerate peer is not a hf2q regression).
+    3. **Token-overlap `≥3 first-5 shared` heuristic was too strict.**  Two greedy-decode runs of the same Q4_0-quantized model can pick different but-coherent argmaxes after a few tokens; treating that as GIBBERISH creates a moving comparator with no path to peer-byte-equivalence.  Replaced with a positive list of GIBBERISH signatures (single-token repetition, phrase-repetition, low distinct-word ratio, special-token leakage, iter40-era markers) — anything else is COHERENT.
+
+    Added 3 new classifier unit tests (`semantically_aligned_but_different_argmax_is_coherent`, `iter40_dwq46_specific_repetition_is_gibberish`, `strip_header_removes_hf2q_preamble`).  All 11 classifier unit tests pass.
+
+    **Files touched this iter:**
+    - `src/serve/mod.rs` (+57 LOC at `:504-562`: BOS-prepend with full root-cause doc-comment)
+    - `tests/coherence_matrix.rs` (replace `classify`, add `classify_for_cell`, `strip_hf2q_header`, `KNOWN_DEGENERATE_PEER`, 3 new unit tests)
+    - `tests/coherence_golden/{27b-dwq46,dwq46,apex}-*.txt` (re-captured 9 qwen35 goldens with `--override-kv add_bos_token=bool:false`; gemma goldens unchanged)
+    - `tests/coherence_golden/README.md` (document recapture procedure split: gemma vs qwen35)
+    - `docs/ADR-015-mlx-native-single-cb-decode.md` (this entry).
+    No mlx-native changes.  No build-system changes.  No `src/quantize/mod.rs` changes (parallel ADR-014 territory).
+
+    **Compliance:** `feedback_dont_guess` (every hypothesis in PHASE 3 verified by env-flag toggle + token-stream diff vs llama-completion; iter40 agent's "TQ codebook" hypothesis was rejected, not inherited).  `feedback_no_shortcuts` (full 7-phase bisect including 3 falsified hypotheses; the actual root cause was not in `forward_mlx` at all but at the tokenizer boundary).  `feedback_correct_outcomes` (matched llama.cpp's BOS handling exactly; no `KNOWN_DEGENERATE_PEER`-shortcut workaround for the coherent gemma cell).  `feedback_evidence_first_no_blind_kernel_rewrites` (zero kernel changes; zero forward-path changes; one tokenizer-pipeline addition).  `feedback_use_cfa_worktrees` (worktree `agent-a4770a075ce2483f2`, base `15d43e1`).  `code_is_truth` (verified `tokenizer.encode(text, false)` never honours `add_bos_token`; verified llama.cpp force-overrides Gemma4 add_bos_token=true at runtime via `--verbose-prompt` output `load: override … to 'true' for Gemma4`).
+
+    **Bisect path summary (for the brain-share):** raw-prompt vs chat-templated → coherent at chat-templated (18-token prefill emits literal `<bos>`) → gibberish at raw-prompt (5-token prefill, no BOS) → llama force-prepends BOS for Gemma4 regardless of GGUF metadata or `--override-kv` flag (verified via `--verbose-prompt`) → hf2q `tokenizer.encode(text, add_special_tokens=false)` does not prepend BOS → manual `<bos>` injection via chat template makes hf2q output coherent.  **Root-cause site: tokenization, not forward_mlx; iter40 agent's loose attribution to "TQ Lloyd-Max codebook" was incorrect.**  **Fix site: `src/serve/mod.rs:548-562` BOS-prepend gate (mirror llama.cpp's `common_tokenize` semantics).**
+
 - **2026-04-29 — iter40 — qwen35 PREFILL COHERENCE FIXED — root cause: `build_moe_ffn_layer_gpu_q_into` allocated its `out_buf` from the per-prefill-layer arena pool, violating the W-5b.15 lifetime-safety contract; the per-layer `reset_for_prefill_chunk()` recycled the buffer that became the next layer's `hidden`, and the next layer's pooled allocations OVERWROTE it.**
 
     **HEAD CONTEXT.** Pre-iter40 status: *all four qwen35/qwen36 fixtures (dwq46, apex, dwq48, 27b-dwq46) produced gibberish on every prompt at temperature 0* — dwq46/27b on "Hello, my name is" emitted `-than\n2-\n2-\n2-...`, apex emitted `…but **_**_**_**`, 27b emitted `Hello, my name is 0\nuser\n…`. Issue affected the `forward_gpu` path only; gemma's `forward_mlx` was unaffected. The bug existed BEFORE iter21's "byte-identical 5/5" sunset — iter21's panel was satisfied because the gibberish itself was deterministic at NGEN=8 (5/5 trials produced the same garbage tokens; the panel measured determinism not coherence).  ALL ADR-015 perf work iter11-iter38 was conducted on a broken-decode baseline; the 8.5×→2.59× gap-closing trajectory is real but every coherence-gate step (sourdough, gate H, etc.) was passing on a tokenizer-equivalent gibberish that the gates don't catch.

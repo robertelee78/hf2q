@@ -33,24 +33,57 @@ Empty trailing newlines are preserved. Multi-line outputs (e.g. the
 
 ## Re-capture procedure
 
-If a fixture or llama-completion version changes, re-capture as follows:
+If a fixture or llama-completion version changes, re-capture as follows.
+
+**ADR-015 iter42 (2026-04-29): qwen35 goldens are captured with
+`--override-kv tokenizer.ggml.add_bos_token=bool:false` because hf2q's
+qwen35 generate path (`cmd_generate_qwen35` in `src/serve/mod.rs`) does
+not prepend BOS — the qwen35 model is robust to BOS presence/absence and
+the iter40 contract (line 1659 of ADR-015) states "All 12 cells coherent
+English semantically aligned with `llama-completion`'s output at the
+same prompt + `--override-kv tokenizer.ggml.add_bos_token=bool:false`."
+Re-capturing without that override would produce a moving comparator
+since llama default-prepends BOS (token 11 = `,`) for qwen35.**
+
+**Gemma goldens use the default llama-completion settings (no override).**
+Llama force-overrides `add_bos_token=true` for Gemma4 architectures
+regardless of GGUF metadata or CLI flags — `<bos>` is a hard requirement
+for Gemma4 coherence (model trained with BOS at sequence start; without
+it, decode produces deterministic gibberish).  The iter42 hf2q gemma
+forward_mlx path now mirrors this: `cmd_generate` prepends BOS based on
+GGUF `tokenizer.ggml.add_bos_token=true` AND `tokenizer.ggml.bos_token_id`
+(both present in Gemma4 GGUFs; absent for qwen35 dwq46/27b which don't
+declare `bos_token_id`).
 
 ```sh
 cd <repo>/tests/coherence_golden
 
-for FIXTURE in 27b-dwq46 dwq46 apex gemma; do
+# Qwen35 fixtures: capture with no-BOS override (matches hf2q's behavior).
+for FIXTURE in 27b-dwq46 dwq46 apex; do
   case "$FIXTURE" in
     27b-dwq46) M=/opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf ;;
     dwq46)     M=/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46.gguf ;;
     apex)      M=/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf ;;
-    gemma)     M=/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf ;;
   esac
   for P in "Hello, my name is" "The quick brown fox" "What is 2+2?"; do
     SLUG=$(echo "$P" | tr -cd 'A-Za-z0-9 ' | tr ' ' '-' | tr 'A-Z' 'a-z' | sed 's/--*/-/g')
     /opt/homebrew/bin/llama-completion -m "$M" -p "$P" -n 16 --temp 0.0 \
-      -no-cnv --no-display-prompt < /dev/null 2>/dev/null \
+      -no-cnv --no-display-prompt \
+      --override-kv tokenizer.ggml.add_bos_token=bool:false \
+      < /dev/null 2>/dev/null \
       | head -c 1000 > "${FIXTURE}-${SLUG}.txt"
   done
+done
+
+# Gemma fixtures: default llama settings (force-prepends <bos> per gemma4
+# special-case in llama.cpp, matching hf2q iter42 cmd_generate behavior).
+M=/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf
+for P in "Hello, my name is" "The quick brown fox" "What is 2+2?"; do
+  SLUG=$(echo "$P" | tr -cd 'A-Za-z0-9 ' | tr ' ' '-' | tr 'A-Z' 'a-z' | sed 's/--*/-/g')
+  /opt/homebrew/bin/llama-completion -m "$M" -p "$P" -n 16 --temp 0.0 \
+    -no-cnv --no-display-prompt \
+    < /dev/null 2>/dev/null \
+    | head -c 1000 > "gemma-${SLUG}.txt"
 done
 ```
 

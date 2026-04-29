@@ -1,6 +1,4 @@
 
 
-2 + 2 equals **4**.
-
-If you have any other questions
+2+2 equals 4. This is because when you add two units
 
