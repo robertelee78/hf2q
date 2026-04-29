@@ -136,6 +136,16 @@ impl LazyMeta {
 enum LazyState {
     /// Bytes already in memory.
     Materialized(Vec<u8>),
+    /// Bytes already in memory, behind a refcounted pointer.  ADR-014 P13
+    /// step 1 (iter-76): added so `quantize_via_streaming_borrowed` and
+    /// other transitional wedges can refcount-share bytes from the
+    /// caller's `tensor_map` rather than deep-cloning per-tensor.  The
+    /// `Arc` is consumed at materialise time — we unwrap or clone the
+    /// inner `Vec<u8>` depending on whether refcount==1.  Equivalent to
+    /// `Materialized` from the streaming consumer's perspective, but
+    /// the upstream caller can hand multiple `LazyTensor`s a shared
+    /// `Arc<Vec<u8>>` without paying N×bytes.
+    MaterializedShared(std::sync::Arc<Vec<u8>>),
     /// Closure that produces bytes on demand. `FnOnce` enforces
     /// consume-once semantics at compile time.
     Pending(Box<dyn FnOnce() -> Result<Vec<u8>, MaterializeError> + Send + 'static>),
@@ -147,6 +157,10 @@ impl fmt::Debug for LazyState {
             LazyState::Materialized(bytes) => f
                 .debug_tuple("Materialized")
                 .field(&format_args!("<{} bytes>", bytes.len()))
+                .finish(),
+            LazyState::MaterializedShared(bytes) => f
+                .debug_tuple("MaterializedShared")
+                .field(&format_args!("<{} bytes, refcount {}>", bytes.len(), std::sync::Arc::strong_count(bytes)))
                 .finish(),
             LazyState::Pending(_) => f.debug_tuple("Pending").field(&"<closure>").finish(),
         }
@@ -177,6 +191,35 @@ impl LazyTensor {
         Self {
             meta,
             state: LazyState::Materialized(bytes),
+        }
+    }
+
+    /// ADR-014 P13 step 1 (iter-76) — construct from refcount-shared
+    /// bytes.  Used by transitional wedges
+    /// ([`crate::quantize::quantize_via_streaming_borrowed`] et al.)
+    /// that want to feed the streaming pipeline without paying a
+    /// per-tensor deep clone.
+    ///
+    /// The `Arc<Vec<u8>>` allows the same bytes to be shared by
+    /// multiple LazyTensors (or stay live in the caller's `TensorRef`
+    /// while the LazyTensor is in flight).  At materialise time, if
+    /// refcount==1 the inner `Vec<u8>` is unwrapped (zero copy); if >1
+    /// the inner is cloned (one copy).
+    ///
+    /// Memory profile vs [`Self::from_bytes`]: same when refcount==1
+    /// (both move the Vec through); strictly better when refcount>1
+    /// because the Arc-shared variant amortises the bytes across all
+    /// holders, while `from_bytes` requires the caller to clone
+    /// upfront.
+    ///
+    /// The full P13 win lands when [`crate::ir::TensorRef::data`]
+    /// itself becomes `Arc<[u8]>` so the upstream tensor_map can
+    /// hand `Arc::clone(&t.data)` to the wedge.  This constructor is
+    /// the API foothold for that future migration.
+    pub fn from_arc_bytes(meta: LazyMeta, bytes: std::sync::Arc<Vec<u8>>) -> Self {
+        Self {
+            meta,
+            state: LazyState::MaterializedShared(bytes),
         }
     }
 
@@ -234,6 +277,13 @@ impl LazyTensor {
         let LazyTensor { meta, state } = self;
         let bytes = match state {
             LazyState::Materialized(bytes) => bytes,
+            LazyState::MaterializedShared(arc) => {
+                // refcount==1 → unwrap zero-copy; >1 → clone the inner
+                // Vec.  Cf. `Arc::try_unwrap` doc; we use the simpler
+                // `Arc::unwrap_or_clone` (stable since 1.76) for the
+                // exact "unwrap if sole owner else clone" semantic.
+                std::sync::Arc::unwrap_or_clone(arc)
+            }
             LazyState::Pending(load) => load()?,
         };
 
@@ -264,6 +314,11 @@ impl LazyTensor {
     pub fn materialize_cloned(&self) -> Result<TensorRef, MaterializeError> {
         let bytes = match &self.state {
             LazyState::Materialized(bytes) => bytes.clone(),
+            LazyState::MaterializedShared(arc) => {
+                // Always clone the Vec — by-reference semantic must keep
+                // the Arc live; only `materialize(self)` consumes it.
+                (**arc).clone()
+            }
             LazyState::Pending(_) => {
                 return Err(MaterializeError::Transform {
                     name: self.meta.name.clone(),
@@ -947,6 +1002,67 @@ mod tests {
                 "{name}: bytes must equal eager-converted output"
             );
         }
+    }
+
+    /// ADR-014 P7 iter-76 — `LazyTensor::from_arc_bytes` materialises
+    /// equivalently to `from_bytes`.  When refcount==1 the inner Vec
+    /// is unwrapped (zero-copy); when >1 the inner is cloned.
+    /// `materialize_cloned` always clones (keeps the Arc live).
+    #[test]
+    fn test_from_arc_bytes_materialize_byte_equal_to_from_bytes() {
+        use std::sync::Arc;
+
+        let m_arc = meta("arc-tensor", vec![3], DType::F32);
+        let m_vec = meta("arc-tensor", vec![3], DType::F32);
+        let payload = f32_bytes(&[1.0, 2.0, 3.0]);
+
+        // refcount==1 → unwrap path
+        let lazy_arc = LazyTensor::from_arc_bytes(m_arc, Arc::new(payload.clone()));
+        let lazy_vec = LazyTensor::from_bytes(m_vec, payload.clone());
+
+        let t_arc = lazy_arc.materialize().expect("arc materialize");
+        let t_vec = lazy_vec.materialize().expect("vec materialize");
+
+        assert_eq!(t_arc.data, t_vec.data, "Arc-path bytes equal Vec-path");
+        assert_eq!(t_arc.shape, t_vec.shape);
+        assert_eq!(t_arc.dtype, t_vec.dtype);
+    }
+
+    #[test]
+    fn test_from_arc_bytes_shared_refcount_clones_inner() {
+        use std::sync::Arc;
+
+        let payload = f32_bytes(&[7.0, 8.0]);
+        let shared: Arc<Vec<u8>> = Arc::new(payload.clone());
+        // Hold a second strong ref to force the clone path on materialise.
+        let _keepalive = Arc::clone(&shared);
+
+        let lazy = LazyTensor::from_arc_bytes(meta("shared", vec![2], DType::F32), shared);
+        let t = lazy.materialize().expect("shared materialize");
+        assert_eq!(t.data, payload, "shared-refcount path returns equal bytes");
+    }
+
+    #[test]
+    fn test_from_arc_bytes_materialize_cloned_keeps_arc_live() {
+        use std::sync::Arc;
+
+        let payload = f32_bytes(&[42.0]);
+        let arc: Arc<Vec<u8>> = Arc::new(payload.clone());
+        let pre_count = Arc::strong_count(&arc);
+
+        let lazy = LazyTensor::from_arc_bytes(meta("kept-live", vec![1], DType::F32), Arc::clone(&arc));
+        let t = lazy.materialize_cloned().expect("borrowed materialize");
+        assert_eq!(t.data, payload);
+
+        // After materialize_cloned, the lazy still owns its Arc clone —
+        // the original `arc` strong count must be ≥ pre_count + 1
+        // (lazy's clone) - 1 (lazy dropped on next line) = pre_count.
+        drop(lazy);
+        assert_eq!(
+            Arc::strong_count(&arc),
+            pre_count,
+            "post-drop refcount restored — materialize_cloned doesn't leak"
+        );
     }
 
     #[test]
