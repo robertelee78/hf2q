@@ -4496,6 +4496,100 @@ mod tests {
         assert_eq!(ggml_tensor_size(1024, GGML_TYPE_F16), 2048);
     }
 
+    /// ADR-014 P11 iter-99 (2026-04-29): lock in the K-quant size formula
+    /// that closed the 33 GB GGUF offset drift. Pre-iter-99 these all fell
+    /// through to `_ => total_elements * 2` (F16 fallback) — pass-1 of the
+    /// GGUF writer over-predicted every K-quant tensor as F16, pass-2
+    /// emitted real K-quant bytes, and the offset-table drift cascaded
+    /// into a 50 GB-vs-16 GB mismatch that llama.cpp rejected at load.
+    /// Numbers are derived from `BLOCK_QX_K_SIZE` constants in
+    /// `src/quantize/k_quant.rs` × `total_elements.div_ceil(QK_K=256)`.
+    #[test]
+    fn test_ggml_tensor_size_q4_k_iter99() {
+        // 256 elements (1 block) × BLOCK_Q4_K_SIZE = 144
+        assert_eq!(ggml_tensor_size(256, GGML_TYPE_Q4_K), 144);
+        // 1024 elements: 4 blocks × 144 = 576
+        assert_eq!(ggml_tensor_size(1024, GGML_TYPE_Q4_K), 576);
+        // 17408 × 5120 (Qwen3.6 27B FFN gate_proj shape, the canonical
+        // iter-99 regression case): 89,128,960 elements / 256 = 348,160
+        // blocks × 144 = 50,135,040 bytes.
+        assert_eq!(
+            ggml_tensor_size(17408 * 5120, GGML_TYPE_Q4_K),
+            50_135_040
+        );
+        // 248044 × 5120 (Qwen3.6 27B token_embd / output.weight shape
+        // post-vocab-depad): 1,269,985,280 elements; div_ceil rounds the
+        // last partial block up to 4,960,880 → × 144 = 714,366,720.
+        // This was the exact "expected 714366720" llama.cpp computed
+        // when the iter-97 GGUF was malformed.
+        assert_eq!(
+            ggml_tensor_size(248_044 * 5120, GGML_TYPE_Q4_K),
+            714_366_720
+        );
+    }
+
+    #[test]
+    fn test_ggml_tensor_size_q5_k_iter99() {
+        // BLOCK_Q5_K_SIZE = 176 bytes per 256-element block.
+        assert_eq!(ggml_tensor_size(256, GGML_TYPE_Q5_K), 176);
+        assert_eq!(ggml_tensor_size(1024, GGML_TYPE_Q5_K), 704);
+    }
+
+    #[test]
+    fn test_ggml_tensor_size_q6_k_iter99() {
+        // BLOCK_Q6_K_SIZE = 210 bytes per 256-element block (already
+        // matched in pre-iter-99 codepath; this test is a regression
+        // guard so the iter-99 Q4_K/Q5_K additions don't shadow it).
+        assert_eq!(ggml_tensor_size(256, GGML_TYPE_Q6_K), 210);
+        assert_eq!(ggml_tensor_size(1024, GGML_TYPE_Q6_K), 840);
+    }
+
+    #[test]
+    fn test_ggml_tensor_size_q3_k_iter99() {
+        // BLOCK_Q3_K_SIZE = 110 bytes per 256-element block.
+        assert_eq!(ggml_tensor_size(256, GGML_TYPE_Q3_K), 110);
+        assert_eq!(ggml_tensor_size(1024, GGML_TYPE_Q3_K), 440);
+    }
+
+    #[test]
+    fn test_ggml_tensor_size_q2_k_iter99() {
+        // BLOCK_Q2_K_SIZE = 84 bytes per 256-element block.
+        assert_eq!(ggml_tensor_size(256, GGML_TYPE_Q2_K), 84);
+        assert_eq!(ggml_tensor_size(1024, GGML_TYPE_Q2_K), 336);
+    }
+
+    /// ADR-014 P11 iter-99: explicit guard that the F16 fallback arm
+    /// is NOT taken for any K-quant family member. Pre-iter-99 each
+    /// K-quant returned `total_elements * 2` (F16 size); a regression
+    /// would surface as an exact F16 size match, which we can't have.
+    #[test]
+    fn test_ggml_tensor_size_kquants_diverge_from_f16_fallback() {
+        for ggml_type in &[
+            GGML_TYPE_Q2_K,
+            GGML_TYPE_Q3_K,
+            GGML_TYPE_Q4_K,
+            GGML_TYPE_Q5_K,
+            GGML_TYPE_Q6_K,
+        ] {
+            // 256 elements: F16 would be 256 * 2 = 512 bytes; every
+            // K-quant block is < 256 bytes (Q2_K=84 / Q3_K=110 /
+            // Q4_K=144 / Q5_K=176 / Q6_K=210), so a regression to the
+            // F16 fallback would always inflate to 512.
+            let actual = ggml_tensor_size(256, *ggml_type);
+            assert_ne!(
+                actual, 512,
+                "ggml_type {} regressed to F16 fallback (returned 512)",
+                ggml_type
+            );
+            assert!(
+                actual < 256,
+                "ggml_type {} returned {} bytes; expected < 256 for one K-quant block",
+                ggml_type,
+                actual
+            );
+        }
+    }
+
     // ---------------------------------------------------------------------------
     // ADR-012 Decision 1: arch routing tests
     // ---------------------------------------------------------------------------
