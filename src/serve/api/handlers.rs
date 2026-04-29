@@ -4781,7 +4781,7 @@ mod combine_function_grammars_tests {
         assert!(rt_single.is_accepted());
 
         // Empty input rejected (min=1 — there must be at least one call).
-        let mut rt_empty = runtime_from_gbnf(&combined);
+        let rt_empty = runtime_from_gbnf(&combined);
         assert!(
             !rt_empty.is_accepted(),
             "parallel grammar must NOT accept empty (min_calls=1)"
