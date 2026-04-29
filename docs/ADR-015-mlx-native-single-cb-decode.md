@@ -1592,6 +1592,24 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 — iter32 — Defect B gemma audit + iter33 hypothesis (READ-ONLY, no code touched).**  Comprehensive audit of the gemma forward path at HEAD `b2c78b7` produced full audit at `/tmp/iter32-audit.md` (~1300 words, 9 sections). Forward-path map confirms gemma decode is **already single-CB / 1-2 CBs/token** (`forward_mlx.rs:1589` exec.begin, modulo HF2Q_DUAL_BUFFER split-after-L3 default), routes through `forward_mlx::forward_decode` (line 1320), with per-layer dispatch at lines 1635-…  GGUF tensor-type spot-check via `gguf.GGUFReader` on layer-0: attn Q/K/V/O + dense gate/up + MoE gate_up_exps + router = **Q6_K**; dense ffn_down + MoE ffn_down_exps = **Q8_0**; norms F32; Q4_K NOT present.  Cross-fence comparison vs llama.cpp (`gemma4-iswa.cpp`, `ggml-metal.metal:7716-8074`, `ggml-metal-impl.h:39-65`) identified four candidate iter33 levers, three in scope for the cn=1 decode bench:
+
+    | Rank | Candidate                                | Predicted Δpp  | Falsification cost                              | Risk class |
+    |-----:|------------------------------------------|---------------:|-------------------------------------------------|-----------:|
+    | 1    | **C — Dense F16 KV ablation**            | **+3.0…+5.0pp**| ≤30 min (Leg F gate already at `forward_mlx.rs:1525-1535`) | **LOW** |
+    | 2    | A — Q8_0 mat-vec 4-simdgroup re-tile     | +0.5…+2.0pp   | ~1 day µ-bench                                   | MEDIUM |
+    | 3    | B — flash_attn_vec_tq_hb 4-simdgroup re-tile | +1.0…+3.0pp | multi-week kernel rewrite                        | HIGH |
+
+    Candidate D (wire `flash_attn_prefill` into per-token prefill, mirrors qwen35 W-5b.10) dropped — addresses prefill, not the cn=1 decode headline metric.
+
+    **iter33 RECOMMENDATION — Candidate C (dense F16 KV) first.**  Reasons: (1) zero new code — ablation gate `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=1` exists at `forward_mlx.rs:1525-1535` (iter-20 Leg F); (2) falsifiable in ≤30 min cold-SoC bench; (3) directly tests §P3a'' ground truth that "the 19% gap lives in GPU compute" by removing G2 Hadamard KV-encode (47 µs/token) and switching FA inner loop to F16; (4) avoids the 12-falsification kernel-internal-static-lever class — C is a representation/gating switch; (5) honors `feedback_evidence_first_no_blind_kernel_rewrites` — produces evidence BEFORE kernel work.
+
+    **iter33 acceptance:** if Leg F + skip_tq_encode gemma cn=1 ratio ≥0.95× same-day llama (cold SoC, 5 trials), ship as iter34 production default.  **iter33 falsification:** if Leg F Δpp ≤+0.5pp, declare C falsified; pivot to Candidate A under a 1-day budget; if A <+1pp, escalate to Metal System Trace + per-kernel attribution per §P3a'' Wave 2c hard gate #1 BEFORE any further candidate.
+
+    **Lever-space-thin disclosure** (per `feedback_correct_outcomes`): beyond C and A, the lever space is structurally thin without prior MST attribution.  ADR-015's 12-falsification track on M5 Max is the dominant prior; if C and A both fail, the honest path is the unfinished §P3a'' Wave 2c hard gate (Metal System Trace of gemma decode — 5 cold trials × 64 tokens with `gpu.counters.shaderUtilization`/`alu`/`l2HitRate`) before any further iteration.
+
+    Audit artifact: `/tmp/iter32-audit.md`. No code touched. No bench run. Pathspec commit + push to origin/main.
+
 - **2026-04-29 — iter31 — RESUMED-FINAL LANDED — clean re-bench complete after ADR-014 P11+P12 fully closed (`3750ba0` + `43e3bca` + `18a5287`).  Full 4-cell paired matrix (autodefault vs `HF2Q_PARTIAL_CHAIN_LEGACY=1`) at NGEN=256, 5 cold-SoC trials per side, mcp-brain STOPped, canonical `/opt/hf2q/target/release/hf2q` at HEAD `18a5287` (zero src/ delta from `3750ba0` — autodefault path identical):**
 
     | fixture | quant arm    | auto N  | hf2q auto t/s | hf2q legacy t/s | llama t/s | ratio auto | ratio legacy | **Δpp** |
