@@ -688,3 +688,68 @@ fn streaming_phase3_byte_identical_matrix_across_kquants() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// T12: HF2Q_STREAMING_PHASE3 byte-identity for DwqK arm via dwq-4-6 (iter-63)
+// ---------------------------------------------------------------------
+
+/// ADR-014 P7 iter-63 — extend the SHA gate to the DwqK arm
+/// (--quant dwq-4-6).  DwqK is the most complex Phase 3 dispatch:
+/// per-tensor sensitive vs base routing via `is_sensitive_tensor` +
+/// `target_for(tensor_name)` + delegate to `KQuantCodecQuantizer` +
+/// `legacy_quant_method` override post-quantize.
+///
+/// On `DwqArch::Other` (Llama-shaped fixture), the activation-capture
+/// path is skipped (per Decision 13: no weight-space fallback for
+/// archs without forward drivers).  The test exercises the calibrator-
+/// driven byte-emit through `run_dwq_with_sensitive_ranges` →
+/// `DwqKQuantizer` → `KQuantCodecQuantizer`, which is the same
+/// streaming-eligible path as the K-quant variants.
+///
+/// File-level SHA-256 equality between eager + streaming paths locks
+/// the iter-51 byte-identity contract end-to-end on DwqK.
+#[test]
+fn streaming_phase3_byte_identical_dwq_4_6() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let input_dir = tmp.path().join("input");
+    let eager_dir = tmp.path().join("out_eager_dwq46");
+    let stream_dir = tmp.path().join("out_stream_dwq46");
+    setup_p2_iter2_fixture(&input_dir);
+
+    Command::cargo_bin("hf2q")
+        .expect("hf2q binary")
+        .args([
+            "convert",
+            "--input", input_dir.to_str().unwrap(),
+            "--format", "gguf",
+            "--quant", "dwq-4-6",
+            "--output", eager_dir.to_str().unwrap(),
+            "--skip-quality",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("hf2q")
+        .expect("hf2q binary")
+        .env("HF2Q_STREAMING_PHASE3", "1")
+        .args([
+            "convert",
+            "--input", input_dir.to_str().unwrap(),
+            "--format", "gguf",
+            "--quant", "dwq-4-6",
+            "--output", stream_dir.to_str().unwrap(),
+            "--skip-quality",
+        ])
+        .assert()
+        .success();
+
+    let eager_sha = file_sha256(&locate_gguf(&eager_dir));
+    let stream_sha = file_sha256(&locate_gguf(&stream_dir));
+
+    assert_eq!(
+        eager_sha, stream_sha,
+        "dwq-4-6: HF2Q_STREAMING_PHASE3=1 GGUF must be byte-identical to \
+         eager — DwqK streaming wedge has lost byte-identity at file level\n\
+         eager:  {eager_sha}\nstream: {stream_sha}"
+    );
+}
