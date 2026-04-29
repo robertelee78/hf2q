@@ -462,7 +462,13 @@ fn tensor_ref_to_f32(mut tensor: TensorRef) -> Result<Vec<f32>> {
             ));
         }
     }
-    tensor.data.clear();
+    // ADR-014 P13 step 2 (iter-80): replace `tensor.data.clear()` (in-place
+    // mutation) with assignment-replacement so the same code works whether
+    // `tensor.data` is `Vec<u8>` (today) or `Arc<[u8]>` (post-iter-82+
+    // P13 type migration).  The early-drop semantic is preserved — the
+    // old Vec/Arc is dropped immediately when the assignment overwrites
+    // the field.
+    tensor.data = Vec::new();
     Ok(out)
 }
 
