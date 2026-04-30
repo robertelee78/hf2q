@@ -1253,6 +1253,30 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     // worse than an external one).  Operators who want to skip the
     // bundle-binding entirely use `--no-integrity` at download time,
     // which keeps `source_shards == None` here.
+    // ADR-005 iter-211b — close the production mmproj_sha256 stub.
+    //
+    // BEFORE iter-211b: this site set `mmproj_sha256: None` even when
+    // the model carried vision tensors and would emit a sibling mmproj
+    // GGUF, because the mmproj writes AFTER main-GGUF metadata is
+    // finalized (legacy: `GgufBackend::write` post-body; ADR-012 P10:
+    // `cmd_convert` Phase 4.8). That `None` was a "todo later" stub
+    // forbidden by the Engineering Mantra; it left auto-pipeline mmproj
+    // integrity unbound from the cache manifest.
+    //
+    // AFTER iter-211b: when vision tensors are present in the source
+    // `LazyTensorMap` (so a sibling mmproj GGUF will land), we emit
+    // `Some(MMPROJ_SHA256_PLACEHOLDER)` — a 64-byte ASCII-zero string
+    // that passes the iter-207 reader's hex validation but is byte-
+    // stable for in-place overwrite. After the mmproj sibling lands on
+    // disk (Phase 4.6 legacy write or Phase 4.8 ADR-012 P10 emit),
+    // Phase 4.85 below computes the sibling's SHA via
+    // `compute_file_sha256` and calls `patch_mmproj_sha256_in_gguf`
+    // to overwrite the 64 placeholder bytes in place — no kv_count
+    // change, no offset shifts, no metadata block re-emit.
+    let mmproj_will_emit = lazy_map.iter().any(|(name, _)| {
+        let n = name.as_str();
+        n.contains("vision_tower") || n.contains("embed_vision")
+    });
     let provenance = config.source_shards.as_ref().and_then(|shards| {
         let cache_shards: Vec<serve::cache::SourceShard> =
             shards.iter().map(serve::cache::SourceShard::from_integrity).collect();
@@ -1260,16 +1284,18 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             backends::gguf::Hf2qProvenance {
                 producer_version: format!("hf2q {}", env!("CARGO_PKG_VERSION")),
                 source_sha256: sha,
-                // mmproj_sha256 stays None: the legacy mmproj path emits
-                // AFTER the main GGUF in `GgufBackend::write` (~line 556)
-                // and the ADR-012 P10 mmproj emits in Phase 4.8 — both
-                // post-write.  A future iter that re-orders Phase 4.6/4.8
-                // can populate this; the writer helper already supports
-                // it via `Hf2qProvenance::mmproj_sha256`.
-                mmproj_sha256: None,
+                mmproj_sha256: if mmproj_will_emit {
+                    Some(backends::gguf::MMPROJ_SHA256_PLACEHOLDER.to_string())
+                } else {
+                    None
+                },
             }
         })
     });
+    let placeholder_emitted = provenance
+        .as_ref()
+        .and_then(|p| p.mmproj_sha256.as_deref())
+        == Some(backends::gguf::MMPROJ_SHA256_PLACEHOLDER);
     if let Some(p) = &provenance {
         tracing::info!(
             producer_version = %p.producer_version,
@@ -2216,6 +2242,104 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             }
             Err(e) => {
                 warn!("vision-tower emission failed: {}", e);
+            }
+        }
+    }
+
+    // Phase 4.85: ADR-005 iter-211b — patch the mmproj_sha256 placeholder
+    // in the main GGUF with the real SHA of the sibling mmproj GGUF.
+    //
+    // The placeholder was emitted during Phase 4.6 when vision tensors
+    // were detected in the source LazyTensorMap (see iter-211b plumbing
+    // above where `provenance.mmproj_sha256` is set). The mmproj sibling
+    // is now on disk (either via the legacy `GgufBackend::write` path or
+    // the ADR-012 P10 path above). Compute its SHA, patch the main GGUF
+    // in place, eliminating the iter-211 "todo later" stub.
+    //
+    // Path resolution: scan the output dir for files ending in
+    // `-mmproj.gguf` or `mmproj-*.gguf` (P10 alternate naming). The
+    // P10 path deleted the legacy file above, so at most one mmproj
+    // remains per the sovereignty rule. The main GGUF is the single
+    // text file in the manifest.
+    if placeholder_emitted {
+        let output_parent = std::path::Path::new(&manifest.output_dir);
+
+        // Find the main GGUF (the one that does NOT end in -mmproj.gguf).
+        let main_gguf_path = manifest
+            .files
+            .iter()
+            .find(|f| {
+                let n = &f.filename;
+                n.ends_with(".gguf")
+                    && !n.ends_with("-mmproj.gguf")
+                    && !n.starts_with("mmproj-")
+            })
+            .map(|f| output_parent.join(&f.filename));
+
+        // Find the mmproj GGUF on disk (legacy or P10 naming).
+        let mmproj_path: Option<std::path::PathBuf> = std::fs::read_dir(output_parent)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| {
+                        (n.ends_with("-mmproj.gguf") || n.starts_with("mmproj-"))
+                            && n.ends_with(".gguf")
+                    })
+                    .unwrap_or(false)
+            });
+
+        match (main_gguf_path, mmproj_path) {
+            (Some(main_p), Some(mmproj_p)) => {
+                let mmproj_sha = serve::cache::compute_file_sha256(&mmproj_p)
+                    .with_context(|| {
+                        format!(
+                            "iter-211b: failed to compute SHA-256 of mmproj at {}",
+                            mmproj_p.display()
+                        )
+                    })
+                    .map_err(AppError::Conversion)?;
+                backends::gguf::patch_mmproj_sha256_in_gguf(&main_p, &mmproj_sha)
+                    .with_context(|| {
+                        format!(
+                            "iter-211b: failed to patch hf2q.mmproj_sha256 placeholder in {}",
+                            main_p.display()
+                        )
+                    })
+                    .map_err(AppError::Conversion)?;
+                tracing::info!(
+                    "ADR-005 iter-211b: patched hf2q.mmproj_sha256 in {} with mmproj SHA {} (from {})",
+                    main_p.display(),
+                    mmproj_sha,
+                    mmproj_p.display()
+                );
+            }
+            (None, _) => {
+                return Err(AppError::Conversion(anyhow::anyhow!(
+                    "iter-211b: placeholder was emitted but no main GGUF found in manifest \
+                     (output_dir={}); cannot resolve mmproj_sha256",
+                    manifest.output_dir
+                )));
+            }
+            (Some(_), None) => {
+                // Vision tensors were present at metadata-write time but
+                // no mmproj landed on disk — refuse the silent leftover
+                // placeholder. This is a structural inconsistency
+                // (vision-tensor detection vs actual mmproj emission)
+                // and the operator should see it loudly per the
+                // Engineering Mantra "no fallback".
+                return Err(AppError::Conversion(anyhow::anyhow!(
+                    "iter-211b: hf2q.mmproj_sha256 placeholder was emitted (vision tensors \
+                     detected in LazyTensorMap) but no mmproj GGUF was produced in {}. \
+                     This indicates a mismatch between vision-tensor detection at metadata-write \
+                     time and the actual emit path. The placeholder MUST not survive in the \
+                     emitted GGUF — either fix the detector or fix the emitter.",
+                    manifest.output_dir
+                )));
             }
         }
     }

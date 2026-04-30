@@ -83,6 +83,24 @@ pub const PROVENANCE_KEY_SOURCE_SHA256: &str = "hf2q.source_sha256";
 /// Mirrors [`crate::serve::provenance::KEY_MMPROJ_SHA256`].
 pub const PROVENANCE_KEY_MMPROJ_SHA256: &str = "hf2q.mmproj_sha256";
 
+/// 64-char ASCII-zero placeholder for `hf2q.mmproj_sha256` (iter-211b).
+///
+/// Emitted by `cmd_convert` when the model has vision tensors and the
+/// mmproj will be written AFTER the main GGUF (the legacy path emits
+/// inside `GgufBackend::write` post-body; the ADR-012 P10 path emits
+/// in `cmd_convert` Phase 4.8 after `backend.write` returns).  After
+/// the mmproj sibling lands on disk, [`patch_mmproj_sha256_in_gguf`]
+/// overwrites these 64 bytes in-place with the real SHA — byte-stable
+/// length means no GGUF offset shifts.  The placeholder is a valid
+/// 64-hex string (passes the iter-207 reader's hex validation) so a
+/// pre-patch read returns `Provenance::Hf2q { mmproj_sha256: Some(...) }`
+/// — and the auto-pipeline integrity check catches the mismatch
+/// against the cache manifest's real mmproj SHA, falling back to
+/// `External` semantics gracefully.  See iter-211b in the Phase 4
+/// reopen subsection of ADR-005 for the patch flow.
+pub const MMPROJ_SHA256_PLACEHOLDER: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
 /// Provenance the writer stamps into the GGUF metadata KV section at
 /// quantize time.  Constructed by the caller (e.g. `cmd_convert`) when
 /// the source bundle is known + hashable; passed into
@@ -91,10 +109,17 @@ pub const PROVENANCE_KEY_MMPROJ_SHA256: &str = "hf2q.mmproj_sha256";
 ///
 /// `mmproj_sha256` is OPTIONAL by the iter-207 reader schema: a paired
 /// vision projector GGUF carries the corresponding hash; non-vision
-/// models leave it `None`.  In iter-211 the production `cmd_convert`
-/// path leaves it `None` regardless because the mmproj is emitted
-/// AFTER the main GGUF (see `GgufBackend::write` line ~556 + Phase 4.8
-/// in `cmd_convert`); a future iter can re-order to set it.
+/// models leave it `None`.
+///
+/// **iter-211b production flow** (post-2026-04-30 closure):
+/// `cmd_convert` sets this to `Some(MMPROJ_SHA256_PLACEHOLDER)` when
+/// vision tensors are present in the source `LazyTensorMap` (so the
+/// legacy `GgufBackend::write` path or the ADR-012 P10 Phase 4.8 path
+/// will produce a sibling mmproj GGUF).  After that mmproj GGUF lands
+/// on disk, `cmd_convert` Phase 4.85 calls [`patch_mmproj_sha256_in_gguf`]
+/// to overwrite the placeholder with the real SHA — eliminating the
+/// pre-iter-211b "todo later" stub that left this field `None` in
+/// production despite the schema and reader supporting both branches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hf2qProvenance {
     /// Verbatim contents of `hf2q.producer_version`.  Canonical writer
@@ -699,7 +724,7 @@ impl OutputBackend for GgufBackend {
 ///
 /// Inserts `-mmproj` before the `.gguf` extension:
 ///   `model-text.gguf` -> `model-text-mmproj.gguf`
-fn mmproj_path_from_text(text_path: &Path) -> std::path::PathBuf {
+pub fn mmproj_path_from_text(text_path: &Path) -> std::path::PathBuf {
     let stem = text_path.file_stem().unwrap_or_default().to_string_lossy();
     let new_name = format!("{}-mmproj.gguf", stem);
     text_path.with_file_name(new_name)
@@ -3553,6 +3578,102 @@ fn write_metadata_kv<W: IoWrite>(w: &mut W, key: &str, value: &MetaValue) -> std
     Ok(())
 }
 
+/// ADR-005 iter-211b: patch the `hf2q.mmproj_sha256` placeholder in an
+/// already-written main GGUF, replacing the 64 zero bytes with the real
+/// 64-hex-char SHA of the sibling mmproj GGUF.
+///
+/// The placeholder ([`MMPROJ_SHA256_PLACEHOLDER`]) is byte-stable length
+/// (64 ASCII chars) so this is a pure in-place overwrite — no offset
+/// shifts, no metadata block re-emit, no risk of corrupting tensor data
+/// offsets downstream.  Only the start of the file (first 4 MiB) is
+/// scanned because GGUF metadata always lives at offset 0 immediately
+/// after the 24-byte header.
+///
+/// Search pattern (102 bytes, vanishingly unlikely to collide elsewhere):
+/// `u64(key_len=18) | "hf2q.mmproj_sha256" | u32(type_tag=8) | u64(val_len=64) | "0"*64`
+///
+/// # Errors
+/// - `InvalidInput` if `real_sha` is not exactly 64 ASCII hex chars
+///   (lowercase or uppercase) — provenance hashes are normalized
+///   lowercase elsewhere; caller's responsibility.
+/// - `InvalidInput` if `real_sha == MMPROJ_SHA256_PLACEHOLDER` — refuses
+///   to no-op-patch onto itself, surfacing the misuse.
+/// - `Other` if the placeholder pattern is not found (the GGUF has no
+///   `hf2q.mmproj_sha256` placeholder — caller skipped placeholder
+///   emission, or the file is not hf2q-stamped).
+/// - I/O errors propagated from open/read/seek/write.
+pub fn patch_mmproj_sha256_in_gguf(
+    path: &Path,
+    real_sha: &str,
+) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    if real_sha.len() != 64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "real_sha must be exactly 64 hex chars, got {}",
+                real_sha.len()
+            ),
+        ));
+    }
+    if !real_sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "real_sha must be ASCII hex digits only",
+        ));
+    }
+    if real_sha == MMPROJ_SHA256_PLACEHOLDER {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to patch placeholder onto placeholder (no-op surfaced as error)",
+        ));
+    }
+
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+
+    // Bound the metadata scan; GGUF metadata block lives at the start
+    // immediately after the 24-byte header. 4 MiB is well above any
+    // production-model metadata block size we have seen (Qwen3.6 27B
+    // DWQ46 metadata is ~150 KB).
+    const META_SCAN_BYTES: usize = 4 * 1024 * 1024;
+    let mut buf = vec![0u8; META_SCAN_BYTES];
+    let n = file.read(&mut buf)?;
+    buf.truncate(n);
+
+    // Build the unique 102-byte search pattern matching the on-disk
+    // encoding written by `write_metadata_kv` for the placeholder KV.
+    let key = PROVENANCE_KEY_MMPROJ_SHA256.as_bytes();
+    let mut pattern = Vec::with_capacity(8 + key.len() + 4 + 8 + 64);
+    pattern.extend_from_slice(&(key.len() as u64).to_le_bytes());
+    pattern.extend_from_slice(key);
+    pattern.extend_from_slice(&GGUF_TYPE_STRING.to_le_bytes());
+    pattern.extend_from_slice(&64u64.to_le_bytes());
+    pattern.extend_from_slice(MMPROJ_SHA256_PLACEHOLDER.as_bytes());
+
+    let pattern_offset = buf
+        .windows(pattern.len())
+        .position(|w| w == pattern.as_slice())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "hf2q.mmproj_sha256 placeholder pattern not found in first {} bytes of {}",
+                    n,
+                    path.display()
+                ),
+            )
+        })?;
+
+    let value_offset = pattern_offset + 8 + key.len() + 4 + 8;
+
+    file.seek(SeekFrom::Start(value_offset as u64))?;
+    file.write_all(real_sha.as_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
 /// Info needed to write a single tensor's header and data.
 struct TensorWriteInfo {
     gguf_name: String,
@@ -5556,5 +5677,242 @@ mod tests {
             3,
             "stamping provenance with mmproj must add exactly 3 KVs"
         );
+    }
+
+    // ── iter-211b: mmproj_sha256 placeholder + post-write patch ─────────
+
+    /// Write a minimal hf2q-stamped GGUF carrying the placeholder, then
+    /// shared by the iter-211b tests below.
+    fn write_gguf_with_mmproj_placeholder() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let prov = Hf2qProvenance {
+            producer_version: "hf2q iter-211b-test".into(),
+            source_sha256: "1".repeat(64),
+            mmproj_sha256: Some(MMPROJ_SHA256_PLACEHOLDER.to_string()),
+        };
+        let backend = GgufBackend::new().with_provenance(prov);
+        let manifest = backend
+            .write(&fixture_model(), tmp.path(), tmp.path(), &ProgressReporter::new())
+            .expect("write must succeed");
+        let path = tmp.path().join(&manifest.files[0].filename);
+        (tmp, path)
+    }
+
+    #[test]
+    fn iter211b_patch_replaces_placeholder_in_place() {
+        // Load-bearing iter-211b happy path: emit GGUF with placeholder,
+        // patch with a real SHA, read back via the iter-207 reader,
+        // assert the patched value round-trips field-by-field.
+        let (_tmp, path) = write_gguf_with_mmproj_placeholder();
+
+        // Pre-patch: reader sees the placeholder.
+        let gguf = GgufFile::open(&path).expect("parse pre-patch GGUF");
+        match serve_provenance::detect(&gguf) {
+            Provenance::Hf2q { mmproj_sha256, .. } => {
+                assert_eq!(mmproj_sha256.as_deref(), Some(MMPROJ_SHA256_PLACEHOLDER));
+            }
+            Provenance::External => panic!("placeholder GGUF must classify Hf2q"),
+        }
+
+        // Patch in place.
+        let real_sha = "abcdef0123456789".repeat(4); // 64 hex chars
+        assert_eq!(real_sha.len(), 64);
+        patch_mmproj_sha256_in_gguf(&path, &real_sha)
+            .expect("patch must succeed against placeholder GGUF");
+
+        // Post-patch: reader sees the real SHA.
+        let gguf = GgufFile::open(&path).expect("parse post-patch GGUF");
+        match serve_provenance::detect(&gguf) {
+            Provenance::Hf2q {
+                mmproj_sha256,
+                producer_version,
+                source_sha256,
+            } => {
+                assert_eq!(
+                    mmproj_sha256.as_deref(),
+                    Some(real_sha.as_str()),
+                    "patched mmproj_sha256 must match"
+                );
+                // Other provenance fields untouched by patch.
+                assert_eq!(producer_version, "hf2q iter-211b-test");
+                assert_eq!(source_sha256, "1".repeat(64));
+            }
+            Provenance::External => panic!("post-patch GGUF must still classify Hf2q"),
+        }
+    }
+
+    #[test]
+    fn iter211b_patch_preserves_kv_count_and_other_keys() {
+        // Wire-format invariant: patch is a 64-byte in-place overwrite
+        // — kv_count + every other metadata key MUST be byte-identical
+        // before and after the patch.
+        let (_tmp, path) = write_gguf_with_mmproj_placeholder();
+
+        let pre_bytes = std::fs::read(&path).unwrap();
+        let pre_kv_count = u64::from_le_bytes(pre_bytes[16..24].try_into().unwrap());
+
+        let real_sha = "fedcba9876543210".repeat(4);
+        patch_mmproj_sha256_in_gguf(&path, &real_sha).unwrap();
+
+        let post_bytes = std::fs::read(&path).unwrap();
+        let post_kv_count = u64::from_le_bytes(post_bytes[16..24].try_into().unwrap());
+
+        assert_eq!(pre_bytes.len(), post_bytes.len(), "file size unchanged");
+        assert_eq!(pre_kv_count, post_kv_count, "kv_count unchanged");
+
+        // Sanity: every byte that differs must lie inside the
+        // 64-byte value window (the placeholder→real-SHA region). The
+        // exact diff COUNT depends on how many of the real-SHA's hex
+        // chars coincide with the placeholder's `0` chars (between 0
+        // and 64), so we don't assert a hard count — only that the
+        // diff window is contiguous and at most 64 bytes wide.
+        let diff_positions: Vec<usize> = pre_bytes
+            .iter()
+            .zip(post_bytes.iter())
+            .enumerate()
+            .filter_map(|(i, (a, b))| if a != b { Some(i) } else { None })
+            .collect();
+        assert!(
+            !diff_positions.is_empty(),
+            "patch must change at least one byte"
+        );
+        let first_diff = diff_positions.first().copied().unwrap();
+        let last_diff = diff_positions.last().copied().unwrap();
+        assert!(
+            last_diff - first_diff < 64,
+            "all diffs must lie within a 64-byte window, got [{}, {}]",
+            first_diff,
+            last_diff
+        );
+        // No diffs outside the SHA's 64-byte window.
+        for &pos in &diff_positions {
+            assert!(
+                pos >= first_diff && pos < first_diff + 64,
+                "diff at pos {} outside expected 64-byte SHA window starting at {}",
+                pos,
+                first_diff
+            );
+        }
+
+        // Pre-existing keys still readable.
+        let gguf = GgufFile::open(&path).expect("post-patch parse");
+        assert_eq!(
+            gguf.metadata_string("general.architecture"),
+            Some("llama")
+        );
+    }
+
+    #[test]
+    fn iter211b_patch_returns_err_when_placeholder_absent() {
+        // Negative path: a GGUF that doesn't carry the placeholder
+        // (either because no provenance was set, or because mmproj_sha256
+        // was None) must NOT be silently mutated. Patch returns Err so
+        // callers see the misuse.
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = GgufBackend::new(); // no provenance
+        let manifest = backend
+            .write(&fixture_model(), tmp.path(), tmp.path(), &ProgressReporter::new())
+            .unwrap();
+        let path = tmp.path().join(&manifest.files[0].filename);
+
+        let real_sha = "0123456789abcdef".repeat(4);
+        let err = patch_mmproj_sha256_in_gguf(&path, &real_sha)
+            .expect_err("patch on placeholder-less GGUF must fail");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("placeholder pattern not found"),
+            "error must name the missing placeholder: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn iter211b_patch_rejects_invalid_real_sha() {
+        // Defensive: caller-side validation. Wrong length or non-hex
+        // chars must be rejected at the API boundary, not silently
+        // written into the GGUF where they would corrupt the
+        // hex-validation in the iter-207 reader.
+        let (_tmp, path) = write_gguf_with_mmproj_placeholder();
+
+        // Wrong length (63).
+        let too_short = "a".repeat(63);
+        let err = patch_mmproj_sha256_in_gguf(&path, &too_short).expect_err("63 chars");
+        assert!(format!("{}", err).contains("64 hex chars"));
+
+        // Wrong length (65).
+        let too_long = "a".repeat(65);
+        let err = patch_mmproj_sha256_in_gguf(&path, &too_long).expect_err("65 chars");
+        assert!(format!("{}", err).contains("64 hex chars"));
+
+        // Non-hex char (z).
+        let mut non_hex: String = "a".repeat(63);
+        non_hex.push('z');
+        let err = patch_mmproj_sha256_in_gguf(&path, &non_hex).expect_err("non-hex");
+        assert!(format!("{}", err).contains("ASCII hex"));
+
+        // Refuse no-op: patching placeholder onto placeholder.
+        let err = patch_mmproj_sha256_in_gguf(&path, MMPROJ_SHA256_PLACEHOLDER)
+            .expect_err("placeholder onto placeholder");
+        assert!(format!("{}", err).contains("placeholder onto placeholder"));
+    }
+
+    #[test]
+    fn iter211b_patch_idempotent_only_on_first_call() {
+        // After a successful patch, the placeholder is GONE — calling
+        // patch again returns Err (placeholder not found). This is a
+        // safety property: a caller that accidentally patches twice
+        // sees the second call fail loudly rather than silently
+        // overwriting good data.
+        let (_tmp, path) = write_gguf_with_mmproj_placeholder();
+
+        let real_sha = "1234567890abcdef".repeat(4);
+        patch_mmproj_sha256_in_gguf(&path, &real_sha).expect("first patch ok");
+
+        let real_sha2 = "fedcba0987654321".repeat(4);
+        let err = patch_mmproj_sha256_in_gguf(&path, &real_sha2)
+            .expect_err("second patch must fail (placeholder consumed)");
+        assert!(format!("{}", err).contains("placeholder pattern not found"));
+
+        // Verify the first patch's value is still intact (not corrupted by the failed second call).
+        let gguf = GgufFile::open(&path).expect("parse after failed second patch");
+        match serve_provenance::detect(&gguf) {
+            Provenance::Hf2q { mmproj_sha256, .. } => {
+                assert_eq!(mmproj_sha256.as_deref(), Some(real_sha.as_str()));
+            }
+            Provenance::External => panic!("must remain Hf2q-classified"),
+        }
+    }
+
+    #[test]
+    fn iter211b_patch_round_trip_with_real_compute_file_sha256() {
+        // End-to-end: emit main GGUF with placeholder, write a fake
+        // mmproj sibling with arbitrary bytes, compute the sibling's
+        // SHA via the production helper, patch the main GGUF, and
+        // verify the reader sees the SAME SHA the helper computed.
+        // This is the production cmd_convert flow in miniature.
+        use crate::serve::cache::compute_file_sha256;
+
+        let (tmp, main_path) = write_gguf_with_mmproj_placeholder();
+        let mmproj_path = tmp.path().join("test-mmproj.gguf");
+        std::fs::write(&mmproj_path, b"fake mmproj contents for SHA computation")
+            .expect("write fake mmproj");
+
+        let mmproj_sha =
+            compute_file_sha256(&mmproj_path).expect("compute_file_sha256 ok");
+        assert_eq!(mmproj_sha.len(), 64);
+
+        patch_mmproj_sha256_in_gguf(&main_path, &mmproj_sha).expect("patch ok");
+
+        let gguf = GgufFile::open(&main_path).unwrap();
+        match serve_provenance::detect(&gguf) {
+            Provenance::Hf2q { mmproj_sha256, .. } => {
+                assert_eq!(
+                    mmproj_sha256.as_deref(),
+                    Some(mmproj_sha.as_str()),
+                    "patched SHA must match compute_file_sha256 result byte-for-byte"
+                );
+            }
+            Provenance::External => panic!("must classify Hf2q"),
+        }
     }
 }
