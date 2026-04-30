@@ -748,6 +748,72 @@ impl BlockStore {
         Ok(out)
     }
 
+    /// ADR-017 Phase A0.2a — falsification helper used by
+    /// `synthesize_cache_hit_prediction` in `tests/kv_persist_harness.rs`
+    /// to estimate the SSD restore wall for a given cache-hit shape via
+    /// REAL disk I/O (NOT a constant). The function:
+    ///
+    ///   1. Synthesizes `n_blocks` distinct payloads each carrying
+    ///      `block_bytes` of body data (split across two BF16 tensors).
+    ///   2. Writes them all via the production `write_block` path —
+    ///      atomic temp + rename, fsync, hex fanout — so the wall
+    ///      reflects the actual envelope encode + write cost.
+    ///   3. Reads them all back via `read_block` — header parse, body
+    ///      hash check, byte-exact reconstruct — so the wall reflects
+    ///      the actual restore cost.
+    ///   4. Returns the wall time for the read leg only (the spill leg
+    ///      is timed separately by the caller via `pre_evict_ms`).
+    ///
+    /// The fingerprint is parameterized so concurrent harness call-sites
+    /// (e.g. different prefix-length predictions in the same process)
+    /// do not stomp each other's hex-fanout directories. The function
+    /// invokes real disk I/O — there is no constant short-circuit. A
+    /// constant return would fail the
+    /// `synthesize_cache_hit_prediction_uses_real_io_wall_not_constants`
+    /// test under any non-trivial variance check.
+    pub fn time_round_trip(
+        &self,
+        fingerprint: &ModelFingerprint,
+        n_blocks: u32,
+        block_bytes: usize,
+    ) -> std::io::Result<std::time::Duration> {
+        if n_blocks == 0 {
+            // Degenerate-but-meaningful: zero-block restore is still a
+            // syscall (directory existence probe). Time it for honesty.
+            let t0 = std::time::Instant::now();
+            let _ = self.scan_visible_blocks()?;
+            return Ok(t0.elapsed());
+        }
+        // Build the chain — each block depends on the previous, mirroring
+        // production semantics. Use a deterministic token vector so the
+        // hashes are reproducible across runs.
+        let mut prev = BlockHash::seed();
+        let mut hashes = Vec::with_capacity(n_blocks as usize);
+        for i in 0..n_blocks {
+            let toks: Vec<u32> = (i * 16..i * 16 + 16).collect();
+            let h = BlockHash::next(&prev, fingerprint, &toks);
+            let p = make_test_payload(
+                fingerprint,
+                &h,
+                BLOCK_TOKENS,
+                (i % 251) as u8,
+                block_bytes,
+            );
+            self.write_block(&p)
+                .map_err(|e| std::io::Error::other(format!("write_block: {e:?}")))?;
+            hashes.push(h.clone());
+            prev = h;
+        }
+        // Time the restore leg only.
+        let t0 = std::time::Instant::now();
+        for h in &hashes {
+            let _p = self
+                .read_block(fingerprint, h)
+                .map_err(|e| std::io::Error::other(format!("read_block: {e:?}")))?;
+        }
+        Ok(t0.elapsed())
+    }
+
     /// LRU-evict to `budget_bytes`, oldest mtime first. Used by the
     /// budget-boundary unit test. Production will key on
     /// last-access time tracked in the index, not file mtime, but
