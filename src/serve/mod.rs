@@ -1423,6 +1423,21 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
     anyhow::ensure!(path.exists(), "Model not found: {}", path.display());
     // Header-only parse surfaces bad magic immediately without loading
     // any tensor data.
+    //
+    // ADR-005 Phase 4 follow-up wedge — arch dispatch on the SERVE path
+    // (chat-model load).  The body below loads the Gemma-shaped
+    // forward_mlx LoadedModel; for qwen35 / qwen35moe GGUFs that path
+    // panics at `forward_mlx.rs:976` because Qwen3.5/3.6's hybrid 3:1
+    // DeltaNet:Attention has no `attn_q.weight` on DeltaNet layers.
+    //
+    // The `generate` subcommand already routes correctly via
+    // `cmd_generate_qwen35` (`serve/mod.rs:357-379`); the `serve`
+    // subcommand's `DefaultModelLoader::load` does not.  Building the
+    // parallel Qwen35Engine + LoadedQwen35Model is multi-day work
+    // (paralleling the cmd_generate_qwen35 inference path).  Until
+    // that lands, fail FAST + LOUD with an operator-actionable error
+    // here rather than the bare slice-OOB / not-found panic in the
+    // Gemma loader.
     {
         let gguf = mlx_native::gguf::GgufFile::open(path)
             .map_err(|e| anyhow::anyhow!("GGUF header parse failed: {e}"))?;
@@ -1432,6 +1447,21 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
             metadata = gguf.metadata_count(),
             "Validated GGUF header"
         );
+        if let Some(arch) = gguf.metadata_string("general.architecture") {
+            if arch == "qwen35" || arch == "qwen35moe" {
+                anyhow::bail!(
+                    "ADR-005 Phase 4 follow-up: SERVE-side load for general.architecture=\"{arch}\" \
+                     is not yet implemented. The Gemma-shaped forward_mlx loader (the only chat-model \
+                     loader on the serve path today) expects `blk.{{i}}.attn_q.weight` on every layer, \
+                     but Qwen3.5/3.6's hybrid 3:1 DeltaNet:Attention has no attn_q on DeltaNet layers. \
+                     The `hf2q generate` subcommand already routes Qwen3.5/3.6 GGUFs correctly via \
+                     `cmd_generate_qwen35`. Wire SERVE-side arch-dispatch to a Qwen35Engine paralleling \
+                     cmd_generate_qwen35 (multi-day model-class enablement). Tracked in ADR-005 \
+                     top-level header as out-of-Phase-4-scope follow-up. Path: {}",
+                    path.display()
+                );
+            }
+        }
     }
 
     let load_opts = api::engine::LoadOptions {
@@ -2556,6 +2586,115 @@ mod tests {
         assert!(
             msg.contains("parse") || msg.contains("Jinja") || msg.contains("template"),
             "expected parse error, got: {msg}"
+        );
+    }
+
+    // ── ADR-005 Phase 4 follow-up — load_engine arch-detect wedge ──
+
+    /// Write a minimal valid GGUF (magic + version + 0 tensors + N
+    /// string KVs) to a tempfile. Just enough structure for the
+    /// header-only parse to succeed and `metadata_string` to find
+    /// the keys.
+    fn write_minimal_gguf_with_arch(arch: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::Builder::new()
+            .suffix(".gguf")
+            .tempfile()
+            .expect("tempfile");
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&1u64.to_le_bytes()); // metadata_kv_count = 1
+        // KV: key="general.architecture" value=<arch>
+        let key = b"general.architecture";
+        buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        buf.extend_from_slice(key);
+        buf.extend_from_slice(&8u32.to_le_bytes()); // GGUF_TYPE_STRING = 8
+        let val = arch.as_bytes();
+        buf.extend_from_slice(&(val.len() as u64).to_le_bytes());
+        buf.extend_from_slice(val);
+        f.write_all(&buf).expect("write");
+        f.flush().expect("flush");
+        f
+    }
+
+    /// load_engine MUST return Err with operator-actionable diagnostic
+    /// when arch=qwen35 (not silently panic in the Gemma-shaped loader
+    /// at forward_mlx.rs:976 with `blk.0.attn_q.weight not found`).
+    #[test]
+    fn load_engine_rejects_qwen35_arch_with_operator_actionable_error() {
+        let tmp = write_minimal_gguf_with_arch("qwen35");
+        let cfg = super::multi_model::EngineConfig {
+            tokenizer_path: None,
+            config_path: None,
+            queue_capacity: 4,
+            warmup_synchronously: false,
+        };
+        let result = super::load_engine(tmp.path(), &cfg);
+        assert!(result.is_err(), "qwen35 arch must be rejected by load_engine");
+        let err = result.err().unwrap();
+        let msg = format!("{err:#}");
+        // Operator-actionable: names the workaround for the generate use case.
+        assert!(
+            msg.contains("cmd_generate_qwen35"),
+            "error must name cmd_generate_qwen35 as the working alternative; got: {msg}"
+        );
+        // Names the architecture so operator can confirm it's the right path.
+        assert!(
+            msg.contains("qwen35"),
+            "error must name the arch; got: {msg}"
+        );
+        // Names the specific Gemma-shape blocker for diagnostic precision.
+        assert!(
+            msg.contains("attn_q.weight") || msg.contains("DeltaNet"),
+            "error must name the underlying blocker; got: {msg}"
+        );
+    }
+
+    /// Symmetric for qwen35moe (the MoE variant — same blocker, same
+    /// dispatch territory).
+    #[test]
+    fn load_engine_rejects_qwen35moe_arch_with_operator_actionable_error() {
+        let tmp = write_minimal_gguf_with_arch("qwen35moe");
+        let cfg = super::multi_model::EngineConfig {
+            tokenizer_path: None,
+            config_path: None,
+            queue_capacity: 4,
+            warmup_synchronously: false,
+        };
+        let result = super::load_engine(tmp.path(), &cfg);
+        assert!(result.is_err(), "qwen35moe arch must be rejected by load_engine");
+        let err = result.err().unwrap();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("qwen35moe"));
+        assert!(msg.contains("cmd_generate_qwen35"));
+    }
+
+    /// Negative-path: an unknown architecture must NOT be rejected at
+    /// the arch-detect wedge — it falls through to the existing
+    /// LoadedModel::load path which has its own validation. Asserts
+    /// the wedge does not over-reject (regression guard against a
+    /// future maintainer accidentally widening the match arm).
+    #[test]
+    fn load_engine_does_not_reject_unknown_arch_at_wedge() {
+        let tmp = write_minimal_gguf_with_arch("totally-fake-arch-name");
+        let cfg = super::multi_model::EngineConfig {
+            tokenizer_path: None,
+            config_path: None,
+            queue_capacity: 4,
+            warmup_synchronously: false,
+        };
+        // We don't care that load_engine ultimately fails (it will,
+        // because the GGUF has no tensors). What we care about is
+        // that the FAILURE is NOT the qwen35 arch-detect wedge.
+        let result = super::load_engine(tmp.path(), &cfg);
+        assert!(result.is_err(), "minimal GGUF must fail downstream load");
+        let err = result.err().unwrap();
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("Phase 4 follow-up: SERVE-side load for general.architecture"),
+            "wedge must not fire on unknown arch; got: {msg}"
         );
     }
 }
