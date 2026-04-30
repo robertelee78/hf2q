@@ -124,7 +124,12 @@ fn build_warmed_embedding_registry(
 }
 
 /// Resolve the tokenizer path: explicit flag, or look next to GGUF / in parent dirs.
-fn find_tokenizer(model_path: &Path, explicit: Option<&Path>) -> Result<std::path::PathBuf> {
+///
+/// Iter-215 Wedge-2: visibility raised to `pub(crate)` so the new
+/// `serve::api::engine_qwen35::Qwen35LoadedModel::load` constructor
+/// can reuse the same tokenizer-resolution logic `cmd_generate_qwen35`
+/// uses (parity with the working CLI chat path).
+pub(crate) fn find_tokenizer(model_path: &Path, explicit: Option<&Path>) -> Result<std::path::PathBuf> {
     if let Some(p) = explicit {
         return Ok(p.to_path_buf());
     }

@@ -27,6 +27,7 @@ pub mod sse;
 pub mod state;
 pub mod middleware;
 pub mod engine;
+pub mod engine_qwen35;
 pub mod grammar;
 pub mod registry;
 pub mod handlers;
