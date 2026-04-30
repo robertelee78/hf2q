@@ -172,6 +172,34 @@
       "verdict": "LANDED — closes the last failing matrix cell at 1.0457×; +4.57pp above D4 ≥1.00× target"
     },
     "_no_regression_followup": "apex Q5_K MoE + 27B-Dense Q4_0 (both DeltaNet-using fixtures) deferred to next iter; gemma is no-risk (does not use DeltaNet kernel). One paired bench each, ~30 min total.",
+    "_no_regression_results_2026_04_30T15_30Z": {
+      "_summary": "BOTH fixtures CONFIRMED no-regression — actually IMPROVED. iter56 fused gated_delta_net_decode is net-positive on every DeltaNet-using cell (3/3 measured).",
+      "apex_q5_k_moe": {
+        "fixture": "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf",
+        "hf2q_per_trial": [116.6, 118.6, 118.5, 117.6, 117.7],
+        "hf2q_median": 117.700,
+        "llama_per_trial": [107.81, 108.48, 108.94, 108.47, 108.54],
+        "llama_median": 108.480,
+        "ratio": 1.0850,
+        "iter51_ratio": 1.0626,
+        "delta_pp": 2.24,
+        "verdict": "IMPROVED — +2.24pp ratio, +8.9 t/s hf2q absolute"
+      },
+      "27b_dense_q4_0": {
+        "fixture": "/opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf",
+        "hf2q_per_trial": [31.4, 31.5, 31.4, 31.4, 31.4],
+        "hf2q_median": 31.400,
+        "llama_per_trial": [29.21, 29.25, 29.18, 29.23, 28.95],
+        "llama_median": 29.210,
+        "ratio": 1.0750,
+        "iter51_ratio": 1.0403,
+        "delta_pp": 3.47,
+        "verdict": "IMPROVED — +3.47pp ratio, +1.2 t/s hf2q absolute"
+      },
+      "gemma_26B_dwq": {
+        "verdict": "DEFERRED — kernel doesn't fire on gemma forward_mlx path (no risk of regression). iter51 baseline 1.0172× stands."
+      }
+    },
     "_artefacts": "/tmp/adr015-bench/baseline-iter56-q4_0-flat-fused-gdn-20260430T140057Z.{summary.txt,metadata.json}, claude commits 641ab78 (mlx-native) + 5ed7a7c (hf2q), patches at /tmp/cfa-cfa-20260430-adr015-iter56-gated-delta-net/claude-{mlx,hf2q}.patch (810+73 lines)",
     "_followups": [
       "No-regression bench on apex Q5_K + 27B-Dense + gemma",
