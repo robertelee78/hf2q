@@ -3,6 +3,7 @@
 //! Trait-based architecture: adding a new format = adding a new file + registry entry.
 //! Every backend validates its output before writing.
 
+pub mod chat_templates;
 pub mod gguf;
 pub mod safetensors_out;
 
