@@ -831,6 +831,40 @@ fn pool_key(repo: &str, quant: QuantType) -> String {
     format!("{repo}@{}", quant.as_str())
 }
 
+/// Inverse of [`pool_key`] for the iter-213 telemetry path.  Given a
+/// victim's composed pool key (`{repo}@{quant_str}`) plus its
+/// canonical quant string (already stored on [`LoadedHandle.quant`] —
+/// no re-parse required), strip the `@<quant>` suffix and re-parse the
+/// quant via [`QuantType::from_canonical_str`].  Returns `None` on
+/// either malformed key (no `@`) or unknown quant variant; callers
+/// silently skip the counter bump in that case (best-effort
+/// telemetry).
+///
+/// Used at the LRU-eviction trigger site in `load_or_get`: each victim
+/// `LoadedHandle` carries a composed `repo_id` rather than the original
+/// `(repo, quant)` pair, so the counter-recording call needs to
+/// reconstruct the (repo, quant) shape that
+/// [`crate::serve::api::state::KvSpillCounters::record_spill`] expects.
+fn unpack_pool_key(pool_key_str: &str, quant_str: &str) -> Option<(String, QuantType)> {
+    // The canonical key shape is `{repo}@{quant}`; the suffix length
+    // is `quant_str.len() + 1` (including the `@`).  We trim that
+    // exactly to recover `repo` even if the repo itself contains `@`
+    // (defensive — current pool_key callers all pass HF-style
+    // `org/name` repos without `@`, but better robust than not).
+    let suffix_len = quant_str.len().checked_add(1)?;
+    if pool_key_str.len() < suffix_len {
+        return None;
+    }
+    let split = pool_key_str.len() - suffix_len;
+    let (repo, sep_and_quant) = pool_key_str.split_at(split);
+    if !sep_and_quant.starts_with('@') || &sep_and_quant[1..] != quant_str {
+        return None;
+    }
+    QuantType::from_canonical_str(quant_str)
+        .ok()
+        .map(|qt| (repo.to_string(), qt))
+}
+
 /// Pool-backed engine cache with LRU eviction.
 ///
 /// Composes [`LoadedPool`] (eviction policy, byte accounting) with a
@@ -870,6 +904,18 @@ pub struct HotSwapManager<E> {
     /// this to `Arc::new(NoopKvSpiller)`; production substitutes via
     /// [`Self::new_with_spiller`].
     spiller: Arc<dyn KvSpiller<E>>,
+    /// Optional KV-spill telemetry counters (ADR-005 Phase 4 reopen
+    /// iter-213, AC 5472).  When `Some(counters)`, the trigger sites in
+    /// `load_or_get` / `evict` bump the per-`(repo, quant, outcome)`
+    /// counter row on every `pre_evict` / `post_admit` outcome (Skipped
+    /// is excluded — see [`SpillOutcome::Skipped`] semantics).  When
+    /// `None`, the trigger sites still call the spiller but no counter
+    /// activity is recorded — preserves the back-compat 2-arg
+    /// [`HotSwapManager::new`] surface for callers that don't surface
+    /// `/metrics` (test fixtures, embedded usages).  Production wiring
+    /// via `AppState::new_for_serve` injects the counters with
+    /// [`Self::set_kv_counters`].
+    kv_counters: Option<Arc<crate::serve::api::state::KvSpillCounters>>,
     /// Parallel map keyed identically to the pool — holds the actual
     /// engine handles.  Invariant: `engines.contains_key(k) ==
     /// pool.get(k).is_some()` for every `k` after every `load_or_get` /
@@ -911,8 +957,26 @@ impl<E> HotSwapManager<E> {
             pool,
             loader,
             spiller,
+            kv_counters: None,
             engines: HashMap::new(),
         }
+    }
+
+    /// Inject KV-spill telemetry counters (ADR-005 Phase 4 reopen
+    /// iter-213, AC 5472).  Production [`crate::serve::api::state::AppState`]
+    /// constructors call this immediately after [`Self::new`] so every
+    /// trigger-site outcome (`pre_evict` / `post_admit`) bumps the
+    /// per-`(repo, quant, outcome)` row that the `/metrics` handler
+    /// emits.  Test paths that don't care about counter telemetry
+    /// (`mgr_with_spiller` etc.) skip this call — Skipped outcomes
+    /// would not increment anyway, and explicit-outcome tests in
+    /// router-level tests construct via `AppState` so the counters
+    /// thread through automatically.
+    pub fn set_kv_counters(
+        &mut self,
+        counters: Arc<crate::serve::api::state::KvSpillCounters>,
+    ) {
+        self.kv_counters = Some(counters);
     }
 
     /// Loaded count + capacity + memory budget — surfaced for diagnostics.
@@ -979,8 +1043,13 @@ impl<E> HotSwapManager<E> {
         // the entry exists (the back-compat defensive `engines.remove`
         // below covers the desync case without firing the hook).
         if let (Some(handle), Some(arc)) = (removed.as_ref(), self.engines.get(&k).cloned()) {
-            let _outcome = self.spiller.pre_evict(handle, &arc);
-            // outcome surfaces to telemetry counters in iter-213
+            let outcome = self.spiller.pre_evict(handle, &arc);
+            // ADR-005 Phase 4 reopen iter-213 (AC 5472): record outcome
+            // to `hf2q_pool_kv_spills_total{repo,quant,outcome=...}`.
+            // Skipped does NOT increment (closed-enum guard).
+            if let Some(counters) = self.kv_counters.as_ref() {
+                counters.record_spill(repo, quant, outcome);
+            }
         }
         // Drop the engines map entry symmetrically.  If the pool didn't
         // know about the key (already-evicted from a prior call), the
@@ -1069,15 +1138,27 @@ impl<E> HotSwapManager<E> {
         for victim in evicted {
             // Eviction-hook trigger (iter-212 / AC 5471).  Fire
             // `pre_evict` per evictee BEFORE dropping the manager's Arc
-            // from `engines`, so the spiller observes a live Arc.  The
-            // returned outcome is intentionally discarded in iter-212;
-            // iter-213 wires it into the
-            // `hf2q_pool_kv_spills_total{outcome=...}` counter.  An
+            // from `engines`, so the spiller observes a live Arc.  An
             // `Error(...)` outcome MUST NOT block eviction — the spill
             // is best-effort.
             if let Some(arc) = self.engines.get(&victim.repo_id).cloned() {
-                let _outcome = self.spiller.pre_evict(&victim, &arc);
-                // outcome surfaces to telemetry counters in iter-213
+                let outcome = self.spiller.pre_evict(&victim, &arc);
+                // ADR-005 Phase 4 reopen iter-213 (AC 5472): record
+                // outcome to
+                // `hf2q_pool_kv_spills_total{repo,quant,outcome=...}`.
+                // Per-call, NOT per-block: EnqueuedBlocks(N) increments
+                // the success row by 1 regardless of N.  The victim's
+                // `repo_id` is the pool key (`format!("{repo}@{quant}")`);
+                // we re-parse it back into (repo, quant) below.  The
+                // pool key shape is enforced by `pool_key()`; both halves
+                // are non-empty by construction.
+                if let Some(counters) = self.kv_counters.as_ref() {
+                    if let Some((victim_repo, victim_quant)) =
+                        unpack_pool_key(&victim.repo_id, &victim.quant)
+                    {
+                        counters.record_spill(&victim_repo, victim_quant, outcome);
+                    }
+                }
             }
             // Drop the manager's Arc — in-flight requests holding their
             // own clones keep the engine alive until they release; the
@@ -1092,8 +1173,12 @@ impl<E> HotSwapManager<E> {
         // binding; the spiller may rehydrate KV state into the engine
         // before any handler can observe it.  An `Error(...)` outcome
         // MUST NOT block admission — the restore is best-effort.
-        let _outcome = self.spiller.post_admit(repo, quant, &loaded_engine);
-        // outcome surfaces to telemetry counters in iter-213
+        let outcome = self.spiller.post_admit(repo, quant, &loaded_engine);
+        // ADR-005 Phase 4 reopen iter-213 (AC 5472): record outcome to
+        // `hf2q_pool_kv_restores_total{repo,quant,outcome=...}`.
+        if let Some(counters) = self.kv_counters.as_ref() {
+            counters.record_restore(repo, quant, outcome);
+        }
 
         self.engines.insert(k, Arc::clone(&loaded_engine));
         Ok(loaded_engine)

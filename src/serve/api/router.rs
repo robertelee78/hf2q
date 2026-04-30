@@ -854,6 +854,401 @@ mod tests {
         assert_eq!(v["error"]["code"], "model_not_loaded");
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    // ADR-005 Phase 4 reopen iter-213 (AC 5472) — KV-spill telemetry tests
+    // ────────────────────────────────────────────────────────────────────
+    //
+    // Tests below exercise the iter-213 KV-spill / KV-restore telemetry
+    // counter surface introduced parallel to the iter-210 pool-gauge
+    // tests.  The default test state (`AppState::new`) constructs a
+    // fresh `KvSpillCounters` and injects the same Arc into the pool's
+    // `HotSwapManager` so the trigger sites bump the table the
+    // `/metrics` handler reads.
+    //
+    // Synthetic spiller fixtures used here mirror the `MockSpiller`
+    // pattern at `src/serve/multi_model.rs:2387` (iter-212).  The
+    // tests use direct `record_spill` / `record_restore` calls against
+    // the counter Arc to exercise the counter surface in isolation
+    // from the (repo, quant) → handle plumbing — the trigger-site
+    // sequencing was already validated by the iter-212 9-test cohort
+    // (`hotswap_pre_evict_*`, `hotswap_post_admit_*`).  The router
+    // tests' job here is to confirm the counter surface emits the
+    // expected Prometheus text and respects the closed-enum + Skipped
+    // semantics.
+
+    use crate::serve::api::state::KV_SPILL_OUTCOMES;
+    use crate::serve::multi_model::{
+        RestoreErrorKind, RestoreOutcome, SpillErrorKind, SpillOutcome,
+    };
+    use crate::serve::quant_select::QuantType;
+
+    /// 1/6: extends `iter210_metrics_emits_pool_gauges` — after driving
+    /// one synthetic eviction (`SpillOutcome::EnqueuedBlocks(1)`) +
+    /// one synthetic admission (`RestoreOutcome::RestoredBlocks(1)`)
+    /// via the counters surface directly (mirroring what the
+    /// HotSwapManager trigger sites do at runtime), `/metrics` scrape
+    /// contains all 4 outcome lines for spills and 4 for restores;
+    /// `outcome="success"` shows count `1`, the other three show `0`.
+    #[tokio::test]
+    async fn iter213_metrics_emits_kv_counters() {
+        let state = state_default();
+        // Drive one synthetic eviction + one synthetic admission via
+        // the same counter surface the HotSwapManager trigger sites
+        // hit.  EnqueuedBlocks(1) → success row +1; RestoredBlocks(1)
+        // → success row +1.  The other three outcome rows are zero
+        // but MUST still emit (Prometheus convention; AC 5472).
+        state.kv_spill_counters.record_spill(
+            "acme/m1",
+            QuantType::Q4_K_M,
+            SpillOutcome::EnqueuedBlocks(1),
+        );
+        state.kv_spill_counters.record_restore(
+            "acme/m1",
+            QuantType::Q4_K_M,
+            RestoreOutcome::RestoredBlocks(1),
+        );
+        let app = build_router(state);
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+
+        // HELP/TYPE preamble for both metrics MUST be present (iter-213
+        // emits them unconditionally per Prometheus convention).
+        assert!(
+            body.contains("# HELP hf2q_pool_kv_spills_total"),
+            "missing HELP for hf2q_pool_kv_spills_total; body:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE hf2q_pool_kv_spills_total counter"),
+            "missing TYPE for hf2q_pool_kv_spills_total; body:\n{body}"
+        );
+        assert!(
+            body.contains("# HELP hf2q_pool_kv_restores_total"),
+            "missing HELP for hf2q_pool_kv_restores_total; body:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE hf2q_pool_kv_restores_total counter"),
+            "missing TYPE for hf2q_pool_kv_restores_total; body:\n{body}"
+        );
+
+        // Spill rows: success=1, codec_err=0, io_err=0, parity_fail=0.
+        for (outcome, expected) in [
+            ("success", 1u64),
+            ("codec_err", 0),
+            ("io_err", 0),
+            ("parity_fail", 0),
+        ] {
+            let needle = format!(
+                "hf2q_pool_kv_spills_total{{repo=\"acme/m1\",quant=\"Q4_K_M\",outcome=\"{outcome}\"}} {expected}",
+            );
+            assert!(
+                body.contains(&needle),
+                "missing spill line {needle:?} in body:\n{body}"
+            );
+        }
+
+        // Restore rows: same shape — success=1, others=0.
+        for (outcome, expected) in [
+            ("success", 1u64),
+            ("codec_err", 0),
+            ("io_err", 0),
+            ("parity_fail", 0),
+        ] {
+            let needle = format!(
+                "hf2q_pool_kv_restores_total{{repo=\"acme/m1\",quant=\"Q4_K_M\",outcome=\"{outcome}\"}} {expected}",
+            );
+            assert!(
+                body.contains(&needle),
+                "missing restore line {needle:?} in body:\n{body}"
+            );
+        }
+
+        // Pool-gauge no-regression smoke (iter-210 surface stays green).
+        assert!(
+            body.lines().any(|l| l.trim() == "hf2q_pool_loaded_models 0"),
+            "iter-210 hf2q_pool_loaded_models 0 line regression; body:\n{body}"
+        );
+    }
+
+    /// 2/6: counter delta correctness under synthetic spill cycle.
+    /// `MockSpiller`-style behavior: every `pre_evict` returns
+    /// `EnqueuedBlocks(1)`.  Spawn N=3 synthetic eviction sequences
+    /// (per-call increments).  Assert `success` delta == N exactly.
+    /// Per AC 5472: per-call NOT per-block — `EnqueuedBlocks(7)` would
+    /// still bump by 1, never 7.
+    #[tokio::test]
+    async fn iter213_kv_counter_delta_under_synthetic_spill() {
+        let state = state_default();
+        const N: u64 = 3;
+        // N synthetic evictions.  Same (repo, quant) so they all
+        // accumulate into one row.
+        for _ in 0..N {
+            state.kv_spill_counters.record_spill(
+                "acme/m1",
+                QuantType::Q4_K_M,
+                SpillOutcome::EnqueuedBlocks(1),
+            );
+        }
+        let app = build_router(state);
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_string(resp).await;
+        let needle = format!(
+            "hf2q_pool_kv_spills_total{{repo=\"acme/m1\",quant=\"Q4_K_M\",outcome=\"success\"}} {N}",
+        );
+        assert!(
+            body.contains(&needle),
+            "expected success counter == N={N} after {N} synthetic spills; \
+             body:\n{body}"
+        );
+
+        // Per-call NOT per-block invariant — bumping with
+        // EnqueuedBlocks(7) once should still increment by 1, total
+        // stays at N+1.  The other counters must remain 0 throughout.
+        // The state is consumed by build_router(); rebuild a parallel
+        // state to assert this.
+        let state2 = state_default();
+        state2.kv_spill_counters.record_spill(
+            "acme/m1",
+            QuantType::Q4_K_M,
+            SpillOutcome::EnqueuedBlocks(7),
+        );
+        let app2 = build_router(state2);
+        let req2 = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp2 = app2.oneshot(req2).await.unwrap();
+        let body2 = body_string(resp2).await;
+        // EnqueuedBlocks(7) → success counter = 1, NOT 7.
+        let needle_per_call = "hf2q_pool_kv_spills_total{repo=\"acme/m1\",quant=\"Q4_K_M\",outcome=\"success\"} 1";
+        assert!(
+            body2.contains(needle_per_call),
+            "per-call NOT per-block: EnqueuedBlocks(7) must increment by 1 not 7; \
+             body:\n{body2}"
+        );
+    }
+
+    /// 3/6: compile-time + runtime guard against accidental 5th
+    /// outcome.  KV_SPILL_OUTCOMES MUST be a 4-element slice
+    /// containing exactly `["success", "codec_err", "io_err",
+    /// "parity_fail"]` in that order (the order is load-bearing —
+    /// `record_spill` indexes by usize and the metrics handler emits
+    /// in this order).  Adding a fifth outcome requires amending
+    /// ADR-005 Phase 4 with a 5473 telemetry-extension AC per AC 5472
+    /// closed-enum semantics.
+    #[tokio::test]
+    async fn iter213_kv_counter_outcome_cardinality_registered() {
+        assert_eq!(
+            KV_SPILL_OUTCOMES.len(),
+            4,
+            "KV_SPILL_OUTCOMES cardinality is FIXED at 4; adding a 5th \
+             outcome requires a Phase 4 amendment per AC 5472 closed-enum \
+             contract"
+        );
+        assert_eq!(
+            KV_SPILL_OUTCOMES,
+            &["success", "codec_err", "io_err", "parity_fail"],
+            "KV_SPILL_OUTCOMES order is load-bearing — record_spill \
+             indexes by usize and /metrics emits in this exact order; \
+             reordering breaks scrape diffs and ADR-017 Phase C \
+             expectations"
+        );
+    }
+
+    /// 4/6: `Server-Timing` response header is DEFAULT-OFF in iter-213.
+    /// ADR-017 Phase C `cmd_serve --kv-persist` flag enables it; until
+    /// then the header MUST NOT appear on swap-reload paths.  We
+    /// trigger a swap-reload-shape request (`/v1/chat/completions`
+    /// against an unresolvable model — same ordering as the iter-209
+    /// `chat_completions_without_engine_returns_model_not_loaded`
+    /// test) and assert no Server-Timing header is present.  Also
+    /// drive one synthetic spill via the counter surface to prove the
+    /// header stays absent even when counter activity has occurred
+    /// (the toggle is independent of activity).
+    #[tokio::test]
+    async fn iter213_server_timing_header_default_off() {
+        let state = state_default();
+        // Drive a synthetic spill — the header must STILL stay absent
+        // because the toggle is default-OFF independent of activity.
+        state.kv_spill_counters.record_spill(
+            "acme/m1",
+            QuantType::Q4_K_M,
+            SpillOutcome::EnqueuedBlocks(1),
+        );
+        // Verify the toggle defaults OFF (the load-bearing invariant).
+        assert!(
+            !state.kv_spill_counters.server_timing_enabled(),
+            "Server-Timing toggle MUST default OFF in iter-213"
+        );
+        let app = build_router(state);
+        // Trigger the swap-reload path shape: a chat completion against
+        // an unresolvable model.  This routes through `load_or_get`'s
+        // cold-load path that ADR-017 Phase C will (when --kv-persist
+        // is set) instrument with kv_spill / kv_restore Server-Timing
+        // measurements.  In iter-213 default-OFF, the header MUST NOT
+        // appear on the response.
+        let body = r#"{"model":"unresolvable-name","messages":[{"role":"user","content":"hi"}]}"#;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // Server-Timing header is RFC 8673; iter-213 NEVER emits it.
+        // The casing is canonical "Server-Timing"; HTTP headers are
+        // case-insensitive but axum's HeaderMap uses lowercase keys.
+        assert!(
+            resp.headers().get("server-timing").is_none(),
+            "Server-Timing header MUST NOT appear in iter-213 default-OFF \
+             responses; saw: {:?}",
+            resp.headers().get("server-timing")
+        );
+    }
+
+    /// 5/6: error outcomes increment the matching counter.  Drive
+    /// each error variant in sequence (CodecErr, IoErr, ParityFail);
+    /// assert each outcome counter increments by exactly 1.  This is
+    /// the closed-enum mapping contract from
+    /// `KvSpillCounters::spill_outcome_index` /
+    /// `restore_outcome_index`.
+    #[tokio::test]
+    async fn iter213_kv_counter_error_outcomes_increment() {
+        let state = state_default();
+        // Spill side: 3 distinct errors → 3 distinct outcome rows.
+        state.kv_spill_counters.record_spill(
+            "acme/m1",
+            QuantType::Q4_K_M,
+            SpillOutcome::Error(SpillErrorKind::CodecErr),
+        );
+        state.kv_spill_counters.record_spill(
+            "acme/m1",
+            QuantType::Q4_K_M,
+            SpillOutcome::Error(SpillErrorKind::IoErr),
+        );
+        state.kv_spill_counters.record_spill(
+            "acme/m1",
+            QuantType::Q4_K_M,
+            SpillOutcome::Error(SpillErrorKind::ParityFail),
+        );
+        // Restore side: same — 3 distinct error variants.
+        state.kv_spill_counters.record_restore(
+            "acme/m1",
+            QuantType::Q4_K_M,
+            RestoreOutcome::Error(RestoreErrorKind::CodecErr),
+        );
+        state.kv_spill_counters.record_restore(
+            "acme/m1",
+            QuantType::Q4_K_M,
+            RestoreOutcome::Error(RestoreErrorKind::IoErr),
+        );
+        state.kv_spill_counters.record_restore(
+            "acme/m1",
+            QuantType::Q4_K_M,
+            RestoreOutcome::Error(RestoreErrorKind::ParityFail),
+        );
+
+        let app = build_router(state);
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_string(resp).await;
+
+        // Each error outcome counter == 1; success counter == 0.
+        for (outcome, expected) in [
+            ("success", 0u64),
+            ("codec_err", 1),
+            ("io_err", 1),
+            ("parity_fail", 1),
+        ] {
+            let spill_needle = format!(
+                "hf2q_pool_kv_spills_total{{repo=\"acme/m1\",quant=\"Q4_K_M\",outcome=\"{outcome}\"}} {expected}",
+            );
+            assert!(
+                body.contains(&spill_needle),
+                "missing spill error line {spill_needle:?} in body:\n{body}"
+            );
+            let restore_needle = format!(
+                "hf2q_pool_kv_restores_total{{repo=\"acme/m1\",quant=\"Q4_K_M\",outcome=\"{outcome}\"}} {expected}",
+            );
+            assert!(
+                body.contains(&restore_needle),
+                "missing restore error line {restore_needle:?} in body:\n{body}"
+            );
+        }
+    }
+
+    /// 6/6: Skipped outcome does NOT increment any counter.  This is
+    /// the closed-enum guard's whole point: counting Skipped would
+    /// conflate the noop spiller's default behavior with successful
+    /// spills.  After N record_* calls all returning Skipped, every
+    /// outcome counter MUST remain at 0 — and the metric line itself
+    /// MUST NOT appear in the scrape (no observation against the
+    /// (repo, quant) pair triggered lazy-init of the row).
+    #[tokio::test]
+    async fn iter213_skipped_outcome_does_not_increment() {
+        let state = state_default();
+        const N: usize = 5;
+        for _ in 0..N {
+            state.kv_spill_counters.record_spill(
+                "acme/m1",
+                QuantType::Q4_K_M,
+                SpillOutcome::Skipped,
+            );
+            state.kv_spill_counters.record_restore(
+                "acme/m1",
+                QuantType::Q4_K_M,
+                RestoreOutcome::Skipped,
+            );
+        }
+        let app = build_router(state);
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_string(resp).await;
+
+        // No (repo, quant) row was ever observed (Skipped is a no-op),
+        // so no per-pair lines emit.  HELP/TYPE preamble still emits
+        // unconditionally — that's the iter-213 invariant.
+        assert!(
+            body.contains("# HELP hf2q_pool_kv_spills_total"),
+            "HELP must emit even when no observations occurred; body:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE hf2q_pool_kv_spills_total counter"),
+            "TYPE must emit even when no observations occurred; body:\n{body}"
+        );
+        // No row lines for the (repo, quant) pair — Skipped did not
+        // trigger lazy-init of the row.  We assert the absence of the
+        // success line because if any of the four outcomes had bumped,
+        // ALL four would emit at zero (lazy-init creates the full
+        // four-element row).
+        let absent_needle = "hf2q_pool_kv_spills_total{repo=\"acme/m1\"";
+        assert!(
+            !body.contains(absent_needle),
+            "Skipped outcome MUST NOT lazy-init the (repo, quant) row; \
+             saw line containing {absent_needle:?} in body:\n{body}"
+        );
+        let absent_restore = "hf2q_pool_kv_restores_total{repo=\"acme/m1\"";
+        assert!(
+            !body.contains(absent_restore),
+            "Skipped restore outcome MUST NOT lazy-init the row; \
+             saw line containing {absent_restore:?} in body:\n{body}"
+        );
+    }
+
     #[tokio::test]
     async fn iter209_default_model_fallback_uses_default_when_req_model_empty() {
         // When req.model is empty BUT default_model is set, the

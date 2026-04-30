@@ -15,6 +15,7 @@
 //! un-loadable input — while previously-cached or repo-id models
 //! auto-swap transparently.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,8 +32,10 @@ use crate::inference::vision::mmproj_weights::LoadedMmprojWeights;
 use crate::intelligence::hardware::HardwareProfile;
 use crate::serve::cache::ModelCache;
 use crate::serve::multi_model::{
-    DefaultModelLoader, HotSwapManager, LoadedPool,
+    DefaultModelLoader, HotSwapManager, LoadedPool, RestoreErrorKind, RestoreOutcome,
+    SpillErrorKind, SpillOutcome,
 };
+use crate::serve::quant_select::QuantType;
 
 /// Server-level configuration, captured at startup from CLI flags + defaults.
 ///
@@ -173,6 +176,209 @@ impl ServerMetrics {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ADR-005 Phase 4 reopen iter-213 (AC 5472) — KV-spill telemetry counters.
+// ---------------------------------------------------------------------------
+
+/// Counter outcome label cardinality.  CLOSED ENUM.  ADR-017 Phase C MUST
+/// satisfy this set; if a fifth outcome is genuinely needed (e.g.
+/// `version_mismatch` for D10 cache-version envelope), amend ADR-005
+/// Phase 4 with a `5473` telemetry-extension AC.  Cardinality additions
+/// are non-breaking (Prometheus tolerates new label values), but the
+/// closed-enum guard is the contract: the iter-212 [`SpillOutcome`] /
+/// [`RestoreOutcome`] enums MUST map onto exactly these four labels.
+///
+/// Order is load-bearing: it matches `record_*` index lookup in
+/// [`KvSpillCounters`] and the emit order in `metrics_handler`, so
+/// scrape diffs stay stable across iters.  Adding a new label MUST
+/// append to the end (not insert mid-array) to preserve scrape-line
+/// ordering.
+pub const KV_SPILL_OUTCOMES: &[&str] = &["success", "codec_err", "io_err", "parity_fail"];
+
+/// Outcome enum-as-usize index helper — keeps [`KvSpillCounters`] table
+/// lookup branchless.  Must stay in sync with [`KV_SPILL_OUTCOMES`].
+const KV_OUTCOME_SUCCESS: usize = 0;
+const KV_OUTCOME_CODEC_ERR: usize = 1;
+const KV_OUTCOME_IO_ERR: usize = 2;
+const KV_OUTCOME_PARITY_FAIL: usize = 3;
+const KV_OUTCOME_COUNT: usize = 4;
+
+/// Process-wide KV-spill / KV-restore telemetry counters surfaced via
+/// `/metrics` (ADR-005 Phase 4 reopen iter-213, AC 5472).  Counters
+/// are keyed by `(repo, quant, outcome)` per the AC's emit format:
+///
+/// ```text
+/// hf2q_pool_kv_spills_total{repo="...",quant="Q4_0",outcome="success"} 0
+/// hf2q_pool_kv_spills_total{repo="...",quant="Q4_0",outcome="codec_err"} 0
+/// hf2q_pool_kv_spills_total{repo="...",quant="Q4_0",outcome="io_err"} 0
+/// hf2q_pool_kv_spills_total{repo="...",quant="Q4_0",outcome="parity_fail"} 0
+/// ```
+///
+/// Key choice: `(repo, quant)` is a `(String, String)` tuple — the
+/// `repo` arrives from `HotSwapManager::load_or_get` (request-time) and
+/// `quant` is the canonical [`QuantType::as_str`] form (matches the
+/// `LoadedHandle.quant` shape).  Behind a `Mutex<HashMap<...>>` because
+/// each `(repo, quant)` slot stores a `[AtomicU64; KV_OUTCOME_COUNT]`
+/// row that is bumped atomically once the slot exists; the Mutex is
+/// taken only on first observation of a new key (lazy init) and on
+/// scrape-time iteration.
+///
+/// Per-call (NOT per-block) increment semantics: when `MockSpiller`
+/// returns `EnqueuedBlocks(N)`, `outcome="success"` increments by 1.
+/// Block count rides on a separate gauge in ADR-017 Phase C if needed.
+///
+/// `Skipped` outcomes do NOT increment any counter — they signal "no
+/// work was done" (the noop spiller's default).  Counting Skipped
+/// would conflate the noop fast path with successful spills, which is
+/// the AC 5472 closed-enum guard's whole point.
+#[derive(Debug, Default)]
+pub struct KvSpillCounters {
+    /// `hf2q_pool_kv_spills_total` storage.  Inner row is indexed by
+    /// `KV_OUTCOME_*` constants.
+    spills: std::sync::Mutex<HashMap<(String, String), [AtomicU64; KV_OUTCOME_COUNT]>>,
+    /// `hf2q_pool_kv_restores_total` storage.  Same shape.
+    restores: std::sync::Mutex<HashMap<(String, String), [AtomicU64; KV_OUTCOME_COUNT]>>,
+    /// `Server-Timing` response-header toggle.  Default `false`
+    /// (iter-213 default-OFF per AC 5472).  ADR-017 Phase C
+    /// `cmd_serve --kv-persist` flag flips this to `true` so spill /
+    /// restore wall-clock surfaces on auto-swap reload responses.
+    server_timing_enabled: AtomicBool,
+}
+
+impl KvSpillCounters {
+    /// Construct an empty counters table with `Server-Timing`
+    /// response-header toggle DEFAULT-OFF (iter-213 invariant).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Map a [`SpillOutcome`] enum variant to its `KV_OUTCOME_*` index
+    /// position.  Returns `None` for [`SpillOutcome::Skipped`] — the
+    /// noop spiller's default outcome — because Skipped is not a
+    /// counted operation per AC 5472 closed-enum semantics.
+    fn spill_outcome_index(outcome: SpillOutcome) -> Option<usize> {
+        match outcome {
+            SpillOutcome::Skipped => None,
+            SpillOutcome::EnqueuedBlocks(_) => Some(KV_OUTCOME_SUCCESS),
+            SpillOutcome::Error(SpillErrorKind::CodecErr) => Some(KV_OUTCOME_CODEC_ERR),
+            SpillOutcome::Error(SpillErrorKind::IoErr) => Some(KV_OUTCOME_IO_ERR),
+            SpillOutcome::Error(SpillErrorKind::ParityFail) => Some(KV_OUTCOME_PARITY_FAIL),
+        }
+    }
+
+    /// Map a [`RestoreOutcome`] variant to its `KV_OUTCOME_*` index.
+    /// Symmetric to [`Self::spill_outcome_index`].
+    fn restore_outcome_index(outcome: RestoreOutcome) -> Option<usize> {
+        match outcome {
+            RestoreOutcome::Skipped => None,
+            RestoreOutcome::RestoredBlocks(_) => Some(KV_OUTCOME_SUCCESS),
+            RestoreOutcome::Error(RestoreErrorKind::CodecErr) => Some(KV_OUTCOME_CODEC_ERR),
+            RestoreOutcome::Error(RestoreErrorKind::IoErr) => Some(KV_OUTCOME_IO_ERR),
+            RestoreOutcome::Error(RestoreErrorKind::ParityFail) => Some(KV_OUTCOME_PARITY_FAIL),
+        }
+    }
+
+    /// Allocate a fresh four-AtomicU64 row for a new `(repo, quant)`
+    /// key.  Inline so the lazy-init path in `record_*` stays terse.
+    fn new_row() -> [AtomicU64; KV_OUTCOME_COUNT] {
+        [
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+        ]
+    }
+
+    /// Record a spill outcome (per-call, NOT per-block).  Lazily
+    /// initializes the `(repo, quant)` row to all-zeros on first
+    /// observation so the scrape-time emit shows the full four-outcome
+    /// cardinality from the moment any spill activity occurs against a
+    /// `(repo, quant)` pair.  Skipped outcomes are a no-op (per AC
+    /// 5472: Skipped does NOT increment).
+    pub fn record_spill(&self, repo: &str, quant: QuantType, outcome: SpillOutcome) {
+        let Some(idx) = Self::spill_outcome_index(outcome) else {
+            return; // Skipped — noop spiller; do NOT increment.
+        };
+        let key = (repo.to_string(), quant.as_str().to_string());
+        let mut guard = self.spills.lock().expect("kv_spill_counters poisoned");
+        let row = guard.entry(key).or_insert_with(Self::new_row);
+        row[idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a restore outcome.  Symmetric to [`Self::record_spill`].
+    pub fn record_restore(&self, repo: &str, quant: QuantType, outcome: RestoreOutcome) {
+        let Some(idx) = Self::restore_outcome_index(outcome) else {
+            return; // Skipped.
+        };
+        let key = (repo.to_string(), quant.as_str().to_string());
+        let mut guard = self.restores.lock().expect("kv_spill_counters poisoned");
+        let row = guard.entry(key).or_insert_with(Self::new_row);
+        row[idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot every observed `(repo, quant)` spill row as
+    /// `((repo, quant), [success, codec_err, io_err, parity_fail])`.
+    /// Used by the `/metrics` handler to emit the four-outcome
+    /// cardinality lines.  Order is sorted lexicographically on
+    /// `(repo, quant)` so successive scrapes are stable for diff
+    /// tooling.
+    pub fn snapshot_spills(&self) -> Vec<((String, String), [u64; KV_OUTCOME_COUNT])> {
+        let guard = self.spills.lock().expect("kv_spill_counters poisoned");
+        let mut out: Vec<_> = guard
+            .iter()
+            .map(|(k, row)| {
+                (
+                    k.clone(),
+                    [
+                        row[0].load(Ordering::Relaxed),
+                        row[1].load(Ordering::Relaxed),
+                        row[2].load(Ordering::Relaxed),
+                        row[3].load(Ordering::Relaxed),
+                    ],
+                )
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Snapshot every observed `(repo, quant)` restore row.  Symmetric
+    /// to [`Self::snapshot_spills`].
+    pub fn snapshot_restores(&self) -> Vec<((String, String), [u64; KV_OUTCOME_COUNT])> {
+        let guard = self.restores.lock().expect("kv_spill_counters poisoned");
+        let mut out: Vec<_> = guard
+            .iter()
+            .map(|(k, row)| {
+                (
+                    k.clone(),
+                    [
+                        row[0].load(Ordering::Relaxed),
+                        row[1].load(Ordering::Relaxed),
+                        row[2].load(Ordering::Relaxed),
+                        row[3].load(Ordering::Relaxed),
+                    ],
+                )
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// `Server-Timing` response-header gate.  Default `false`
+    /// (iter-213 default-OFF).  ADR-017 Phase C `cmd_serve
+    /// --kv-persist` flag flips this to `true`.
+    pub fn server_timing_enabled(&self) -> bool {
+        self.server_timing_enabled.load(Ordering::Acquire)
+    }
+
+    /// Set the Server-Timing toggle.  Wired by ADR-017 Phase C
+    /// `cmd_serve --kv-persist`; iter-213 keeps it default-OFF and
+    /// asserts the default via `iter213_server_timing_header_default_off`.
+    pub fn set_server_timing_enabled(&self, enabled: bool) {
+        self.server_timing_enabled.store(enabled, Ordering::Release);
+    }
+}
+
 /// Shared runtime state threaded through axum handlers.
 ///
 /// Cheap to clone (every field is behind `Arc` or is a plain atomic wrapper).
@@ -246,6 +452,16 @@ pub struct AppState {
     pub mmproj: Option<LoadedMmproj>,
     /// Process-wide metric counters surfaced via `/metrics`.
     pub metrics: Arc<ServerMetrics>,
+    /// KV-spill / KV-restore telemetry counters surfaced via `/metrics`
+    /// (ADR-005 Phase 4 reopen iter-213, AC 5472).  Shared between the
+    /// metrics handler (read path; emits Prometheus text) and the
+    /// HotSwapManager trigger sites in `multi_model.rs::load_or_get` /
+    /// `multi_model.rs::evict` (write path; bumps the per-outcome row
+    /// once per `pre_evict` / `post_admit` call).  The Arc is cloned
+    /// into the manager via [`HotSwapManager::with_kv_counters`] at
+    /// `AppState` construction so both paths see the same counters
+    /// without an extra hop through the pool RwLock.
+    pub kv_spill_counters: Arc<KvSpillCounters>,
 }
 
 /// BERT embedding model, discovered from `--embedding-model <path>` at
@@ -398,7 +614,12 @@ impl AppState {
             .map_err(|e| anyhow::anyhow!("hardware detection: {e}"))?;
         let cache = ModelCache::open()?;
         let pool = LoadedPool::from_hardware(&hardware);
-        let manager = HotSwapManager::new(pool, Arc::new(DefaultModelLoader));
+        // ADR-005 Phase 4 reopen iter-213 (AC 5472): KV-spill counters
+        // are owned by AppState and Arc-cloned into HotSwapManager so the
+        // trigger sites bump the same table the /metrics handler reads.
+        let kv_spill_counters = Arc::new(KvSpillCounters::new());
+        let mut manager = HotSwapManager::new(pool, Arc::new(DefaultModelLoader));
+        manager.set_kv_counters(Arc::clone(&kv_spill_counters));
         Ok(Self {
             config: Arc::new(config),
             started_at: Arc::new(Instant::now()),
@@ -418,6 +639,7 @@ impl AppState {
             embedding_registry: None,
             mmproj: None,
             metrics: Arc::new(ServerMetrics::default()),
+            kv_spill_counters,
         })
     }
 
@@ -434,7 +656,14 @@ impl AppState {
         // budget exists only so PoolError::ZeroCapacity / OversizedHandle
         // paths can be exercised under unit tests.
         let pool = LoadedPool::with_capacity_and_budget(3, 1u64 << 30);
-        let manager = HotSwapManager::new(pool, Arc::new(DefaultModelLoader));
+        // ADR-005 Phase 4 reopen iter-213 (AC 5472): KV-spill counters
+        // wired in the test path identically to `new_for_serve` so router
+        // tests can scrape `/metrics` and observe the four-outcome
+        // cardinality lines.  Counters start at zero per Prometheus
+        // convention.
+        let kv_spill_counters_test = Arc::new(KvSpillCounters::new());
+        let mut manager = HotSwapManager::new(pool, Arc::new(DefaultModelLoader));
+        manager.set_kv_counters(Arc::clone(&kv_spill_counters_test));
         // Synthetic cache root in a per-process tempdir.  Tests that need
         // a specific cache state should construct via `new_for_serve` or
         // hand-build an `AppState` (every field is `pub`).
@@ -467,6 +696,7 @@ impl AppState {
             embedding_registry: None,
             mmproj: None,
             metrics: Arc::new(ServerMetrics::default()),
+            kv_spill_counters: kv_spill_counters_test,
         }
     }
 
