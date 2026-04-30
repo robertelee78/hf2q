@@ -97,3 +97,33 @@ The TTFT now scales linearly-with-quadratic with actual prompt token count, whic
 - **Matrix wall:** 2,659.30 s (~44 min) on M5 Max 128 GiB Q4_0 dense Gemma 4 26B
 - **Verdict:** `PARTIAL` — R-P4 / R-P5 PASS (synthetic predictor); R-P3 FAIL (eviction overhead at L32K, 517 ms vs 200 ms ceiling)
 - **Discipline:** zero shipped `// TODO` markers; ratios reported honestly (substrate must not synthesize ship gates per `feedback_substrate_must_not_synthesize_ship_gates`)
+
+---
+
+## Peer benchmark — llama.cpp on the SAME GGUF, SAME M5 Max (2026-04-30)
+
+Per Robert standing directive: "we want to be as fast as hardware allows -- and we want to benchmark against peers". Per `project_speed_bar_full_matrix` release-gate (hf2q ≥1.00× llama.cpp same-hardware).
+
+**Setup:** mcp-brain-server STOP-paused. Both binaries reading `/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf` (15.3 GB Q4_0 GGUF, hf2q-converted from HF jenerallee78/gemma-4-26B-A4B-it-ara-abliterated). llama-bench from homebrew/ggml 0.9.11 on Apple M5 Max, Metal+bfloat backend, -ngl 99, threads=6.
+
+| Prefix | hf2q TTFT (ms) | hf2q t/s | llama.cpp t/s | hf2q/llama ratio | Verdict |
+|---|---|---|---|---|---|
+| 512 | 4,214 | 97 | 3,819 | 0.025× | 40× slower |
+| 2,048 | 20,359 | 95 | 3,622 | 0.026× | 38× slower |
+| 8,192 | 103,739 | 88 | 3,339 | 0.026× | 38× slower |
+| 32,768 | 568,639 | 70 | 2,047 | 0.034× | 29× slower |
+
+**Decode:** llama.cpp tg16 = 93 t/s. hf2q kv_persist_harness reports 800-880 t/s decode_tok_s_no_cache, which is ~9× faster than llama.cpp greedy decode and ~7× faster than the mlx-lm baseline (`project_benchmark_baselines`). The metric is suspect — likely the harness's `decode_tps` calc includes prompt_tokens in the numerator. Validation deferred to A0.2c iter.
+
+**Verdict vs release-gate:** hf2q PREFILL is decisively below the ≥1.00× bar (0.025-0.034× actual). Closing this gap is **ADR-015 territory**, not ADR-017. References:
+- `project_long_prefill_parity_inverts` — at matched -ub N methodology, hf2q is behind at every pp≥1024.
+- `project_qwen36_perf_gap_is_full_attention` — for Qwen3.6 hybrid, 43.7% of prefill wall is FA layers @ 3.6× per-layer slower; Gemma 4 is ALL-FA so the same root-cause applies directly.
+- `project_w5b10_flash_attn_landed` — flash_attn_prefill landed for Gemma 3 in W-5b.10 closing the FA gap to ~4.3×. Gemma 4 may not yet be wired to use flash_attn_prefill (audit `src/inference/models/gemma4*/forward_*.rs` to verify).
+
+**ADR-017 closure does NOT require closing this gap.** The cache-ratio gate (R-P4/R-P5) is GREEN by 22×/16× margins. ADR-017 ships with the gap explicitly noted; cache-layer wins still hold even on a slow base path because the win is RELATIVE (cache-hit vs no-cache).
+
+**Open questions for future ADR-015 iter (NOT blocking ADR-017):**
+1. Verify Gemma 4 26B Q4_0 dense FA prefill path uses flash_attn_prefill (per W-5b.10) or legacy SDPA.
+2. Validate the harness decode_tok_s metric — should be ~93-124 t/s, not 880 t/s.
+3. Re-baseline llama-bench at -ub matching hf2q's effective ubatch (per `tooling_llama_bench_ub_methodology`) to confirm the 30-40× ratio survives apples-to-apples normalization.
+
