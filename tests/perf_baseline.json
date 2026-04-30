@@ -369,5 +369,33 @@
     "parity": "8/8 token-byte-identical smoke",
     "tests": "241/241",
     "iter58_redirect": "FA K/V GPU copy + DN state GPU writeback + qkv_split wait removal"
+  },
+  "_iter58b_partial_2026_04_30T20_00Z": {
+    "status": "PARTIAL_arch_cleanup_perf_falsified",
+    "commit": "b6f416b",
+    "refactor": "DN state GPU writeback \u2014 apply_gated_delta_net_chunk takes caller-provided output_buf + final_state",
+    "unsafe_blocks_removed": 1,
+    "cpu_memcpys_removed_from_hot_path": 1,
+    "commit_and_waits_removed_per_chunk": 30,
+    "lines_changed": 242,
+    "parity": "16/16 token-byte-identical smoke",
+    "tests": "241/241",
+    "cold_clean_baseline_finding": {
+      "note": "CRITICAL: prior 0.22x baseline was CPU-contaminated (bfs +349%, diskimagesiod +130%); true cold-clean is 0.3190x",
+      "true_cold_clean_prefill_ratio_at_HEAD": 0.319,
+      "hf2q_t_s": 1127.8,
+      "llama_t_s": 3534.94,
+      "llama_stddev": 92.07,
+      "methodology_drift_correction_pp": 9.77,
+      "true_slowdown_factor": "3.13x not 4.47x"
+    },
+    "iter58b_perf_delta_same_day_pp": 0.02,
+    "mechanism_calibration": "30 wait removals * 71us = 2ms = 0.06% wall",
+    "decode_after": {
+      "27b_dwq46": 1.0686,
+      "apex_q5k": 1.1124,
+      "q4_0_flat": 1.0594
+    },
+    "next": "Re-do MST attribution on cold-clean v3; iter58a/iter58 redirect TBD"
   }
 }
