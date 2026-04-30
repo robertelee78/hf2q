@@ -2361,4 +2361,542 @@ mod tests {
             "exactly CAPACITY={CAPACITY} survivors expected post-join; got {survivors}"
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ADR-005 Phase 4 reopen iter-212 (AC 5471) — KvSpiller trigger-site
+    // unit tests.  Mirrors the iter-208 W76 test density for HotSwapManager
+    // (14 in-binary unit tests under MockEngine + MockLoader) — these 9
+    // additional tests assert the trigger-site invariants for the new
+    // KvSpiller<E> hook surface.
+    //
+    // MockSpiller mirrors the MockEngine / MockLoader pattern at
+    // multi_model.rs:1175 (now post-iter-212 ~line 1295): atomic call
+    // counters + optional outcome injection per trigger so tests can
+    // exercise both the happy path AND the Skipped / Error paths without
+    // a real disk-backed spiller.  Captures Arc::strong_count at call
+    // time so the in-flight-Arc invariant from
+    // hotswap_pre_evict_fires_before_engine_drop has a load-bearing
+    // assertion.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Test fixture KvSpiller — mirrors MockEngine / MockLoader pattern.
+    /// Tracks per-trigger call counts and the Arc::strong_count snapshot
+    /// each call observed; tests can also inject a one-shot outcome
+    /// override via `set_pre_evict_outcome` / `set_post_admit_outcome` to
+    /// exercise the Skipped / Error paths.
+    struct MockSpiller {
+        pre_evict_calls: std::sync::atomic::AtomicU64,
+        post_admit_calls: std::sync::atomic::AtomicU64,
+        /// Each entry: (call_index, observed Arc::strong_count of
+        /// engine at trigger-site time).  Captured under a Mutex so
+        /// concurrent test paths (the multi-thread regression test)
+        /// can observe consistent snapshots.
+        pre_evict_strong_counts: std::sync::Mutex<Vec<(u64, usize)>>,
+        post_admit_strong_counts: std::sync::Mutex<Vec<(u64, usize)>>,
+        /// Optional outcome-injection slots.  When `Some(...)`, the
+        /// trigger returns the injected outcome instead of the default
+        /// `Skipped`.  Mirrors MockLoader::fail_on but per-trigger.
+        pre_evict_outcome: std::sync::Mutex<Option<SpillOutcome>>,
+        post_admit_outcome: std::sync::Mutex<Option<RestoreOutcome>>,
+    }
+
+    impl MockSpiller {
+        fn new() -> Self {
+            Self {
+                pre_evict_calls: std::sync::atomic::AtomicU64::new(0),
+                post_admit_calls: std::sync::atomic::AtomicU64::new(0),
+                pre_evict_strong_counts: std::sync::Mutex::new(Vec::new()),
+                post_admit_strong_counts: std::sync::Mutex::new(Vec::new()),
+                pre_evict_outcome: std::sync::Mutex::new(None),
+                post_admit_outcome: std::sync::Mutex::new(None),
+            }
+        }
+        fn pre_evict_count(&self) -> u64 {
+            self.pre_evict_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn post_admit_count(&self) -> u64 {
+            self.post_admit_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn set_pre_evict_outcome(&self, outcome: SpillOutcome) {
+            *self.pre_evict_outcome.lock().expect("lock") = Some(outcome);
+        }
+        fn set_post_admit_outcome(&self, outcome: RestoreOutcome) {
+            *self.post_admit_outcome.lock().expect("lock") = Some(outcome);
+        }
+        fn pre_evict_strong_counts_snapshot(&self) -> Vec<(u64, usize)> {
+            self.pre_evict_strong_counts.lock().expect("lock").clone()
+        }
+    }
+
+    impl ModelLoader<MockEngine> for MockSpiller {
+        // never used — only here to keep the test fixture compact.  The
+        // real loader is MockLoader; MockSpiller only impls KvSpiller.
+        fn load(&self, _path: &Path, _config: &EngineConfig) -> anyhow::Result<MockEngine> {
+            unreachable!("MockSpiller is not a loader")
+        }
+    }
+
+    impl KvSpiller<MockEngine> for MockSpiller {
+        fn pre_evict(
+            &self,
+            _handle: &LoadedHandle,
+            engine: &Arc<LoadedEngine<MockEngine>>,
+        ) -> SpillOutcome {
+            let n = self
+                .pre_evict_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            // Capture Arc::strong_count BEFORE returning so the test
+            // sees the live count at trigger-site time.
+            let sc = Arc::strong_count(engine);
+            self.pre_evict_strong_counts
+                .lock()
+                .expect("lock")
+                .push((n, sc));
+            self.pre_evict_outcome
+                .lock()
+                .expect("lock")
+                .unwrap_or(SpillOutcome::Skipped)
+        }
+        fn post_admit(
+            &self,
+            _repo: &str,
+            _quant: QuantType,
+            engine: &Arc<LoadedEngine<MockEngine>>,
+        ) -> RestoreOutcome {
+            let n = self
+                .post_admit_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let sc = Arc::strong_count(engine);
+            self.post_admit_strong_counts
+                .lock()
+                .expect("lock")
+                .push((n, sc));
+            self.post_admit_outcome
+                .lock()
+                .expect("lock")
+                .unwrap_or(RestoreOutcome::Skipped)
+        }
+    }
+
+    /// Helper: build a manager wired to a MockSpiller alongside the
+    /// existing MockLoader scaffolding.  Returns (manager, loader,
+    /// spiller) so tests can assert against any of them.
+    fn mgr_with_spiller(
+        capacity_models: usize,
+        memory_budget_bytes: u64,
+    ) -> (
+        HotSwapManager<MockEngine>,
+        Arc<MockLoader>,
+        Arc<MockSpiller>,
+    ) {
+        let loader = Arc::new(MockLoader::new());
+        let spiller = Arc::new(MockSpiller::new());
+        let pool = LoadedPool::with_capacity_and_budget(capacity_models, memory_budget_bytes);
+        let mgr = HotSwapManager::<MockEngine>::new_with_spiller(
+            pool,
+            loader.clone(),
+            spiller.clone(),
+        );
+        (mgr, loader, spiller)
+    }
+
+    /// 1/9: capacity-2 pool; admit 3 distinct repos; the third load
+    /// evicts the LRU.  Asserts MockSpiller::pre_evict_calls == 1
+    /// (single LRU evict; no double-fire).
+    #[test]
+    fn hotswap_pre_evict_fires_on_lru_eviction() {
+        let (mut mgr, _loader, spiller) = mgr_with_spiller(2, 1_000_000);
+        let f = synthetic_gguf(1_000);
+        let cfg = empty_config();
+
+        let _ = mgr
+            .load_or_get("a/1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("a");
+        let _ = mgr
+            .load_or_get("b/2", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("b");
+        // a/1 and b/2 admit clean — no eviction yet.
+        assert_eq!(
+            spiller.pre_evict_count(),
+            0,
+            "no eviction at capacity boundary; pre_evict must NOT fire"
+        );
+
+        let _ = mgr
+            .load_or_get("c/3", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("c");
+        // c/3 evicts a/1 (LRU) → exactly one pre_evict call.
+        assert_eq!(
+            spiller.pre_evict_count(),
+            1,
+            "exactly one pre_evict call expected on single LRU eviction"
+        );
+        assert!(mgr.try_get("a/1", QuantType::Q4_K_M).is_none());
+    }
+
+    /// 2/9: explicit evict() — `mgr.evict(repo, quant)` should also
+    /// fire pre_evict.  Symmetric to the LRU-eviction trigger.
+    #[test]
+    fn hotswap_pre_evict_fires_on_explicit_evict() {
+        let (mut mgr, _loader, spiller) = mgr_with_spiller(3, 100_000);
+        let f = synthetic_gguf(500);
+        let cfg = empty_config();
+
+        let _ = mgr
+            .load_or_get("acme/m1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("admit");
+        // pre_evict has not fired yet — only post_admit on cold load.
+        assert_eq!(spiller.pre_evict_count(), 0);
+        assert_eq!(spiller.post_admit_count(), 1);
+
+        let bytes_freed = mgr.evict("acme/m1", QuantType::Q4_K_M);
+        assert_eq!(bytes_freed, 500);
+        assert_eq!(
+            spiller.pre_evict_count(),
+            1,
+            "explicit evict() must fire pre_evict exactly once"
+        );
+
+        // Idempotent evict — second call is a no-op AND must NOT fire
+        // pre_evict (no live entry to spill).
+        let bytes_freed_2 = mgr.evict("acme/m1", QuantType::Q4_K_M);
+        assert_eq!(bytes_freed_2, 0);
+        assert_eq!(
+            spiller.pre_evict_count(),
+            1,
+            "idempotent evict() must NOT double-fire pre_evict"
+        );
+    }
+
+    /// 3/9: post_admit fires on cold load AFTER the loader returns.
+    /// Asserts call sequencing: post_admit_calls == 1 AFTER
+    /// loader.call_count == 1.
+    #[test]
+    fn hotswap_post_admit_fires_on_cold_load() {
+        let (mut mgr, loader, spiller) = mgr_with_spiller(3, 100_000);
+        let f = synthetic_gguf(500);
+        let cfg = empty_config();
+
+        // Pre-load: loader has not been called; spiller untouched.
+        assert_eq!(loader.call_count(), 0);
+        assert_eq!(spiller.post_admit_count(), 0);
+
+        let _ = mgr
+            .load_or_get("acme/m1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("admit");
+
+        // Sequencing invariant: loader fires first; post_admit second.
+        // Both should have fired exactly once.
+        assert_eq!(
+            loader.call_count(),
+            1,
+            "loader must have run before post_admit — sequencing"
+        );
+        assert_eq!(
+            spiller.post_admit_count(),
+            1,
+            "post_admit must fire exactly once on cold load"
+        );
+    }
+
+    /// 4/9: post_admit must NOT fire on a cache hit.  The fast path in
+    /// load_or_get short-circuits before any admission work; the
+    /// spiller MUST NOT observe a phantom admission.
+    #[test]
+    fn hotswap_post_admit_does_not_fire_on_cache_hit() {
+        let (mut mgr, loader, spiller) = mgr_with_spiller(3, 100_000);
+        let f = synthetic_gguf(500);
+        let cfg = empty_config();
+
+        let _ = mgr
+            .load_or_get("acme/m1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("first");
+        assert_eq!(spiller.post_admit_count(), 1);
+        assert_eq!(loader.call_count(), 1);
+
+        // Cache-hit: same (repo, quant) — fast path, no loader.load.
+        let _ = mgr
+            .load_or_get("acme/m1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("cache-hit");
+        assert_eq!(
+            loader.call_count(),
+            1,
+            "cache-hit must not invoke the loader"
+        );
+        assert_eq!(
+            spiller.post_admit_count(),
+            1,
+            "cache-hit must NOT fire post_admit a second time"
+        );
+    }
+
+    /// 5/9: Arc::strong_count invariant.  The pre_evict trigger must
+    /// observe a live Arc (strong_count >= 2: manager's clone +
+    /// pre_evict's borrow).  After pre_evict returns, the manager's
+    /// Arc drops from `engines` and (assuming no other holders) the
+    /// engine drops normally.  This test re-verifies iter-208's
+    /// `hotswap_in_flight_arc_survives_eviction` invariant holds
+    /// post-trigger-insertion.
+    #[test]
+    fn hotswap_pre_evict_fires_before_engine_drop() {
+        // Capacity 1 → second load forces eviction.
+        let (mut mgr, _loader, spiller) = mgr_with_spiller(1, 100_000);
+        let f = synthetic_gguf(500);
+        let cfg = empty_config();
+
+        // Hold an in-flight Arc clone of the first load — mirrors the
+        // iter-208 invariant test.
+        let inflight = mgr
+            .load_or_get("a/1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("a");
+        // strong_count: 1 (manager) + 1 (inflight) = 2.
+        assert_eq!(Arc::strong_count(&inflight), 2);
+
+        // Second load evicts a/1 — pre_evict fires before the manager
+        // drops its Arc from `engines`.
+        let _ = mgr
+            .load_or_get("b/2", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("b");
+
+        // pre_evict observed the live Arc.  At trigger-site time the
+        // manager's Arc was still in the `engines` map AND the
+        // pre_evict signature borrows the Arc (`&Arc<LoadedEngine<E>>`)
+        // — so strong_count at call-time is at least:
+        //   1 (manager's `engines` map slot)
+        //   + 1 (inflight clone held by this test)
+        //   = 2.
+        // The `engines.get(...).cloned()` call site additionally clones
+        // briefly into a local before passing `&arc` — so the snapshot
+        // observed by the spiller may be 3.  Either is correct per
+        // ADR-005 line 666-674: the load-bearing assertion is `>= 2`.
+        let snapshots = spiller.pre_evict_strong_counts_snapshot();
+        assert_eq!(snapshots.len(), 1, "exactly one pre_evict call");
+        let (call_n, observed_count) = snapshots[0];
+        assert_eq!(call_n, 1);
+        assert!(
+            observed_count >= 2,
+            "pre_evict must observe a live Arc (strong_count >= 2); observed = {observed_count}"
+        );
+
+        // Post-eviction invariant: manager's Arc dropped → strong_count
+        // drops to 1 (just inflight).  This mirrors iter-208's
+        // `hotswap_in_flight_arc_survives_eviction` post-condition.
+        assert_eq!(
+            Arc::strong_count(&inflight),
+            1,
+            "manager must have released its Arc on eviction; \
+             pre_evict trigger must NOT extend the Arc lifetime"
+        );
+        // Inflight engine still valid — pre_evict did not interfere.
+        assert_eq!(inflight.repo, "a/1");
+        assert_eq!(inflight.engine.load_serial, 1);
+        // Engines map post-eviction: a/1 absent (the post-pre_evict
+        // remove() ran), b/2 present.
+        assert!(mgr.try_get("a/1", QuantType::Q4_K_M).is_none());
+        assert!(mgr.try_get("b/2", QuantType::Q4_K_M).is_some());
+    }
+
+    /// 6/9: a single load that chains MULTIPLE evictions must fire
+    /// pre_evict per evictee.  Mirrors the existing
+    /// `hotswap_chains_multiple_evictions_in_one_load` shape but
+    /// asserts the spiller call count.
+    #[test]
+    fn hotswap_chained_evictions_fire_pre_evict_per_evictee() {
+        let (mut mgr, _loader, spiller) = mgr_with_spiller(3, 1_500);
+        let f_small = synthetic_gguf(500);
+        let f_big = synthetic_gguf(1_000);
+        let cfg = empty_config();
+
+        // Three 500-byte loads — pool fills exactly at budget.
+        let _ = mgr
+            .load_or_get("a/1", QuantType::Q4_K_M, f_small.path(), &cfg)
+            .expect("a");
+        let _ = mgr
+            .load_or_get("b/2", QuantType::Q4_K_M, f_small.path(), &cfg)
+            .expect("b");
+        let _ = mgr
+            .load_or_get("c/3", QuantType::Q4_K_M, f_small.path(), &cfg)
+            .expect("c");
+        assert_eq!(spiller.pre_evict_count(), 0);
+        assert_eq!(spiller.post_admit_count(), 3);
+
+        // 1000-byte load forces TWO evictions in one call (a/1 then b/2).
+        let _ = mgr
+            .load_or_get("d/4", QuantType::Q4_K_M, f_big.path(), &cfg)
+            .expect("d");
+
+        assert_eq!(
+            spiller.pre_evict_count(),
+            2,
+            "chained eviction must fire pre_evict once PER evictee"
+        );
+        assert_eq!(
+            spiller.post_admit_count(),
+            4,
+            "post_admit fires once for the new admission (d/4)"
+        );
+    }
+
+    /// 7/9: Skipped outcome — pre_evict returning `Skipped` must NOT
+    /// block the eviction.  The spill is best-effort; eviction
+    /// completes regardless.
+    #[test]
+    fn hotswap_pre_evict_skipped_outcome_does_not_block_eviction() {
+        let (mut mgr, _loader, spiller) = mgr_with_spiller(2, 1_000_000);
+        let f = synthetic_gguf(1_000);
+        let cfg = empty_config();
+
+        // Inject Skipped explicitly (default is also Skipped, but this
+        // exercises the override path explicitly).
+        spiller.set_pre_evict_outcome(SpillOutcome::Skipped);
+
+        let _ = mgr
+            .load_or_get("a/1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("a");
+        let _ = mgr
+            .load_or_get("b/2", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("b");
+        let _ = mgr
+            .load_or_get("c/3", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("c");
+
+        // Eviction proceeded normally despite Skipped outcome.
+        assert!(mgr.try_get("a/1", QuantType::Q4_K_M).is_none());
+        assert!(mgr.try_get("b/2", QuantType::Q4_K_M).is_some());
+        assert!(mgr.try_get("c/3", QuantType::Q4_K_M).is_some());
+        let stats = mgr.pool_stats();
+        assert_eq!(
+            stats.loaded_count, 2,
+            "eviction must complete normally regardless of pre_evict outcome"
+        );
+        assert_eq!(spiller.pre_evict_count(), 1);
+    }
+
+    /// 8/9: Error outcome on post_admit must NOT block admission.  The
+    /// restore is best-effort; admission proceeds regardless and the
+    /// engine becomes resident in the pool.  iter-213 surfaces the
+    /// error to a /metrics counter.
+    #[test]
+    fn hotswap_post_admit_error_does_not_block_admission() {
+        let (mut mgr, loader, spiller) = mgr_with_spiller(3, 100_000);
+        let f = synthetic_gguf(500);
+        let cfg = empty_config();
+
+        // Inject a parity-fail error outcome.
+        spiller.set_post_admit_outcome(RestoreOutcome::Error(RestoreErrorKind::ParityFail));
+
+        let arc = mgr
+            .load_or_get("acme/m1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("admission must succeed even when post_admit errors");
+        assert_eq!(arc.repo, "acme/m1");
+        assert_eq!(arc.engine.load_serial, 1);
+
+        // Loader was invoked, post_admit fired, engine is in the pool.
+        assert_eq!(loader.call_count(), 1);
+        assert_eq!(spiller.post_admit_count(), 1);
+        let stats = mgr.pool_stats();
+        assert_eq!(
+            stats.loaded_count, 1,
+            "engine must be admitted to the pool despite post_admit error"
+        );
+        assert!(
+            mgr.try_get("acme/m1", QuantType::Q4_K_M).is_some(),
+            "post-error admission must publish the engine to the engines map"
+        );
+    }
+
+    /// 9/9: TOCTOU regression.  Extends iter-210 W-B1
+    /// `hotswap_concurrent_load_or_get_serializes_under_mutex` with the
+    /// spiller wired in; asserts per-thread pre_evict + post_admit
+    /// counts are consistent with the eviction sequence (no double-fire
+    /// under contention).
+    #[test]
+    fn hotswap_concurrent_load_with_spiller_serializes_under_mutex() {
+        use std::sync::Mutex;
+
+        const CAPACITY: usize = 3;
+        const N_THREADS: usize = 8;
+        let loader = Arc::new(MockLoader::new());
+        let spiller = Arc::new(MockSpiller::new());
+        let pool = LoadedPool::with_capacity_and_budget(CAPACITY, 1_000_000);
+        let mgr = Arc::new(Mutex::new(HotSwapManager::<MockEngine>::new_with_spiller(
+            pool,
+            loader.clone(),
+            spiller.clone(),
+        )));
+
+        let fixtures: Vec<tempfile::NamedTempFile> =
+            (0..N_THREADS).map(|_| synthetic_gguf(500)).collect();
+        let paths: Vec<PathBuf> = fixtures.iter().map(|f| f.path().to_path_buf()).collect();
+        let cfg = Arc::new(empty_config());
+
+        let mut handles = Vec::with_capacity(N_THREADS);
+        for i in 0..N_THREADS {
+            let mgr = Arc::clone(&mgr);
+            let path = paths[i].clone();
+            let cfg = Arc::clone(&cfg);
+            let repo = format!("repo/{i}");
+            handles.push(std::thread::spawn(move || {
+                let mut guard = mgr.lock().expect("lock manager");
+                let _ = guard
+                    .load_or_get(&repo, QuantType::Q4_K_M, &path, &cfg)
+                    .expect("load_or_get");
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        // (a) Loader called exactly N times — no double-load + no
+        // missed load.  This is the pre-existing TOCTOU invariant.
+        assert_eq!(
+            loader.call_count(),
+            N_THREADS as u64,
+            "expected exactly {N_THREADS} loader calls under Mutex serialization"
+        );
+
+        // (b) post_admit fires exactly N times — once per cold load.
+        assert_eq!(
+            spiller.post_admit_count(),
+            N_THREADS as u64,
+            "post_admit must fire exactly once per cold load under contention"
+        );
+
+        // (c) pre_evict count + accounting consistency.  N_THREADS = 8
+        // distinct repos against capacity = 3 → exactly N - CAPACITY
+        // total evictions over the run (each load past capacity evicts
+        // one).  pre_evict fires once per evictee.
+        let expected_evictions = (N_THREADS - CAPACITY) as u64;
+        assert_eq!(
+            spiller.pre_evict_count(),
+            expected_evictions,
+            "pre_evict must fire exactly {expected_evictions} times \
+             (N - CAPACITY = {N_THREADS} - {CAPACITY}) under contention; \
+             observed = {}",
+            spiller.pre_evict_count()
+        );
+
+        // (d) per-call no-double-fire: every captured call_index in the
+        // strong-count snapshot is unique (the AtomicU64 fetch_add gave
+        // each call a distinct sequence number; if any pair shared an
+        // index, fetch_add was bypassed somewhere).
+        let pre_evict_snapshots = spiller.pre_evict_strong_counts_snapshot();
+        let mut seen = std::collections::HashSet::new();
+        for (idx, _) in &pre_evict_snapshots {
+            assert!(
+                seen.insert(*idx),
+                "pre_evict call index {idx} repeated — double-fire under contention"
+            );
+        }
+
+        // (e) final state — capacity strictly enforced.
+        let final_mgr = mgr.lock().expect("lock manager final");
+        let stats = final_mgr.pool_stats();
+        assert_eq!(stats.loaded_count, CAPACITY);
+        assert!(stats.total_resident_bytes <= stats.memory_budget_bytes);
+    }
 }
