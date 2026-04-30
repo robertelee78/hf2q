@@ -799,9 +799,9 @@ pub mod subprocess_driver {
     /// Issue a non-streaming warmup request to settle Metal-kernel
     /// compile + first-prefill cost. Result is for diagnostic only —
     /// callers ignore the wall for measurement purposes.
-    pub fn warm_request(server: &ServerGuard) -> Result<Duration, DriverError> {
+    pub fn warm_request(server: &ServerGuard, model: &str) -> Result<Duration, DriverError> {
         let body = serde_json::json!({
-            "model": "warmup",
+            "model": model,
             "messages": [{"role": "user", "content": "warmup"}],
             "max_tokens": 4,
             "temperature": 0,
@@ -1487,10 +1487,13 @@ fn run_cell_with_subprocess(
     let server = subprocess_driver::spawn_hf2q_serve_subprocess(&cfg)?;
     subprocess_driver::wait_for_readyz(&server)?;
 
-    // Warm up so first-prefill cost is amortized.
-    let _ = subprocess_driver::warm_request(&server)?;
-
     let canonical = subprocess_driver::fetch_canonical_model_id(&server)?;
+
+    // Warm up so first-prefill cost is amortized. Must happen AFTER
+    // fetch_canonical_model_id so we send a model name the server
+    // recognizes (was a hardcoded "warmup" string in the original
+    // A0.2a code, which hf2q serve rejects with HTTP 400 model_not_loaded).
+    let _ = subprocess_driver::warm_request(&server, &canonical)?;
 
     // Build a deterministic prompt of length scaled to the cell's
     // prefix_len; in A0.2a we use a tokenizer-agnostic char-stream
@@ -2312,7 +2315,9 @@ fn warm_request_returns_under_10min_budget() {
     let server = subprocess_driver::spawn_hf2q_serve_subprocess(&cfg)
         .expect("spawn");
     subprocess_driver::wait_for_readyz(&server).expect("readyz");
-    let warm_wall = subprocess_driver::warm_request(&server)
+    let canonical = subprocess_driver::fetch_canonical_model_id(&server)
+        .expect("/v1/models");
+    let warm_wall = subprocess_driver::warm_request(&server, &canonical)
         .expect("warm_request");
     assert!(
         warm_wall <= Duration::from_secs(READYZ_BUDGET_SECS),
@@ -2358,7 +2363,7 @@ fn measure_ttft_parses_sse_first_content_delta() {
     subprocess_driver::wait_for_readyz(&server).expect("readyz");
     let canonical = subprocess_driver::fetch_canonical_model_id(&server)
         .expect("/v1/models");
-    let _ = subprocess_driver::warm_request(&server);
+    let _ = subprocess_driver::warm_request(&server, &canonical);
     let m = subprocess_driver::measure_ttft_subprocess(
         &server,
         &canonical,
