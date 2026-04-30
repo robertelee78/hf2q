@@ -17,9 +17,12 @@
 pub mod block_store;
 pub mod format;
 pub mod index;
+pub mod writer;
 
 #[allow(unused_imports)]
 pub use block_store::{DiskBlockStore, WriteJob, MAX_BLOCK_BYTES};
+#[allow(unused_imports)]
+pub use writer::{AsyncWriterHandle, DEFAULT_CHANNEL_CAPACITY};
 #[allow(unused_imports)]
 pub use format::{
     compute_block_hash, compute_model_fingerprint, read_envelope_body, read_envelope_header,
