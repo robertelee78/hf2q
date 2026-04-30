@@ -577,6 +577,186 @@ impl ModelLoader<Engine> for DefaultModelLoader {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// KvSpiller — eviction-hook trait surface (ADR-005 Phase 4 reopen,
+// iter-212 / AC 5471).
+//
+// Pluggable hook into the manager's eviction + admission lifecycle so
+// ADR-017 (Persistent Block Prefix Cache for serve mode) can spill KV
+// blocks to disk on swap-out and restore them on swap-back-in WITHOUT
+// `HotSwapManager` taking a direct dependency on the persistence
+// implementation.  Mirrors the [`ModelLoader`] injection pattern: a
+// trait + a no-op default ([`NoopKvSpiller`]) + a production wire-up
+// substitution that lives in ADR-017's tree.
+//
+// Phase 4 reopen ships:
+//   - the trait + outcome / error enums + the no-op default
+//   - two trigger sites in `load_or_get` (pre-evict per evictee +
+//     post-admit on cold load)
+//   - one trigger site in `evict()` (symmetric pre-evict)
+//   - a `MockSpiller` test fixture (in the tests module) that mirrors
+//     the existing `MockLoader` shape
+//
+// ADR-017 ships:
+//   - the real `KvSpiller<Engine>` impl that talks to disk
+//   - the `cmd_serve --kv-persist` CLI flag that constructs the real
+//     spiller and feeds it through `HotSwapManager::new_with_spiller`
+//   - the telemetry counter increments that consume `SpillOutcome` /
+//     `RestoreOutcome` (zeroed surface lands iter-213 in this reopen)
+//
+// **Behavior with the noop spiller wired** is byte-identical to the
+// pre-iter-212 manager: the trigger sites call `spiller.pre_evict(...)`
+// / `spiller.post_admit(...)` and discard the outcome (`let _ =
+// outcome;`).  The 39 existing `serve::multi_model::tests` cases pass
+// UNCHANGED — proves the surface is non-disruptive.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Failure mode for [`SpillOutcome::Error`].  Carried separately from
+/// [`RestoreErrorKind`] because the spill path (snapshotting an in-memory
+/// KV block to disk) and the restore path (rehydrating + parity-checking
+/// a previously-spilled block) fail in disjoint ways even though both
+/// share the same broad categories (codec / IO / parity).
+///
+/// `Copy` so trigger-site call-sites can store the outcome in a local
+/// `let _ = ...` slot without an Arc wrapper; `Debug` so test assertions
+/// can match on a specific kind via `matches!(...)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpillErrorKind {
+    /// Codec-level failure: the in-memory KV block could not be encoded
+    /// to the on-disk envelope (e.g. dtype mismatch, layout drift).
+    CodecErr,
+    /// Filesystem failure: write / fsync / truncate refused (disk full,
+    /// permissions, EIO).
+    IoErr,
+    /// Parity check failure on a round-trip verify.
+    ParityFail,
+}
+
+/// Failure mode for [`RestoreOutcome::Error`].  Symmetric to
+/// [`SpillErrorKind`] for the restore path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreErrorKind {
+    /// Codec-level failure: the on-disk envelope could not be decoded
+    /// back to the in-memory KV layout (envelope version drift, header
+    /// mismatch, truncated body).
+    CodecErr,
+    /// Filesystem failure: read / open refused (file vanished, EIO).
+    IoErr,
+    /// Parity check failure: the restored KV bytes did not match the
+    /// recorded SHA / checksum.  Treated as a hard restore-fail; the
+    /// engine continues without the spilled cache (re-prefill on demand).
+    ParityFail,
+}
+
+/// Result of [`KvSpiller::pre_evict`].  The trigger site discards the
+/// outcome with `let _ = ...` in iter-212 (this iter); iter-213 wires
+/// each variant to a `/metrics` counter increment with a fixed
+/// `outcome` label cardinality (`success` / `codec_err` / `io_err` /
+/// `parity_fail` / `skipped`).
+///
+/// `Skipped` is the no-op default's outcome and is NOT a failure — it
+/// signals "no work was attempted" (the noop spiller has nothing to
+/// spill; ADR-017 may also short-circuit on heuristics like "block
+/// list empty" or "in-flight write quota exhausted").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpillOutcome {
+    /// No spill work was attempted.  The noop spiller returns this.
+    Skipped,
+    /// `N` KV blocks were enqueued for spill.  Block count is operator-
+    /// observable; the per-block byte count rides on a separate gauge
+    /// in ADR-017.
+    EnqueuedBlocks(u32),
+    /// Spill attempt failed.  Eviction proceeds regardless — the spill
+    /// is a best-effort hint, not a precondition.
+    Error(SpillErrorKind),
+}
+
+/// Result of [`KvSpiller::post_admit`].  Symmetric to [`SpillOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// No restore work was attempted.
+    Skipped,
+    /// `N` KV blocks were restored from the on-disk envelope.
+    RestoredBlocks(u32),
+    /// Restore attempt failed.  Admission proceeds regardless — the
+    /// restore is a best-effort hint, not a precondition.  The engine
+    /// will re-prefill on demand.
+    Error(RestoreErrorKind),
+}
+
+/// Eviction-hook trait surface for [`HotSwapManager`].
+///
+/// Two trigger sites:
+///
+/// - [`Self::pre_evict`] fires from `HotSwapManager::load_or_get` (per
+///   evicted handle, before the manager's `Arc<LoadedEngine<E>>` drops
+///   from the engines map) AND from `HotSwapManager::evict` (the
+///   explicit-evict path).  The Arc is still live at call time so an
+///   impl can snapshot live KV state without a race.
+/// - [`Self::post_admit`] fires from `HotSwapManager::load_or_get`
+///   between `loader.load()` returning an engine and the manager
+///   publishing the Arc into the engines map.  The Arc is freshly
+///   constructed and held by the manager only at call time, so an
+///   impl can rehydrate KV state into the engine before any handler
+///   sees it.
+///
+/// **Best-effort.**  The manager discards the returned outcome at the
+/// trigger site in iter-212 — eviction + admission proceed regardless
+/// of `Skipped` / `EnqueuedBlocks` / `Error`.  iter-213 wires the
+/// outcomes to `/metrics` counter increments.  An impl returning
+/// `Error(...)` does NOT block the manager's lifecycle.
+///
+/// **Send + Sync** because the manager is held inside an
+/// `Arc<RwLock<HotSwapManager<E>>>` (see `AppState::pool` at
+/// `src/serve/api/state.rs:202`); concurrent handlers may call
+/// `load_or_get` from multiple tokio tasks.
+pub trait KvSpiller<E>: Send + Sync {
+    /// Called BEFORE the manager drops its Arc<LoadedEngine<E>> from the
+    /// engines map.  The Arc is live; the impl may inspect engine state
+    /// (e.g. via interior mutability or worker-thread message-pass) to
+    /// snapshot any KV blocks worth spilling.
+    fn pre_evict(&self, handle: &LoadedHandle, engine: &Arc<LoadedEngine<E>>) -> SpillOutcome;
+
+    /// Called AFTER `loader.load()` succeeds and BEFORE the manager
+    /// publishes the Arc into its engines map.  The impl may rehydrate
+    /// KV blocks into the freshly-loaded engine.
+    fn post_admit(
+        &self,
+        repo: &str,
+        quant: QuantType,
+        engine: &Arc<LoadedEngine<E>>,
+    ) -> RestoreOutcome;
+}
+
+/// No-op default [`KvSpiller`] — every method returns `Skipped` and
+/// performs no work.  Wired by [`HotSwapManager::new`] (the back-compat
+/// 2-arg constructor) so behavior is byte-identical to pre-iter-212
+/// across every existing manager test.
+///
+/// ADR-017 substitutes this with a real impl via
+/// [`HotSwapManager::new_with_spiller`] when the operator passes
+/// `cmd_serve --kv-persist`.
+///
+/// Stateless; cheap to clone.  The manager holds it behind `Arc<dyn
+/// KvSpiller<E>>` so impls that need state (file handles, in-flight
+/// queues) compose without changing the wiring shape.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopKvSpiller;
+
+impl<E> KvSpiller<E> for NoopKvSpiller {
+    fn pre_evict(&self, _handle: &LoadedHandle, _engine: &Arc<LoadedEngine<E>>) -> SpillOutcome {
+        SpillOutcome::Skipped
+    }
+    fn post_admit(
+        &self,
+        _repo: &str,
+        _quant: QuantType,
+        _engine: &Arc<LoadedEngine<E>>,
+    ) -> RestoreOutcome {
+        RestoreOutcome::Skipped
+    }
+}
+
 /// Pool diagnostics — bytes used, count, capacity — surfaced for
 /// `/v1/models` extension fields and `/metrics` Prometheus output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
