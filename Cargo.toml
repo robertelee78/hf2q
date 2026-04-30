@@ -47,10 +47,10 @@ thiserror = "2"
 # development, override via a (gitignored) .cargo/config.toml:
 #   [patch.crates-io]
 #   mlx-native = { path = "/opt/mlx-native" }
-# ADR-015 iter56 — path-pin to the iter56 mlx-native worktree which adds
-# the new `gated_delta_net_decode` op. The launcher will revert this to
-# `mlx-native = "0.6"` at iter56 close (after merging mlx-native upstream).
-mlx-native = { version = "0.6", path = "/opt/mlx-native/.cfa-worktrees/cfa-20260430-adr015-iter56-gated-delta-net-claude" }
+# ADR-015 iter56 — path-pin to local mlx-native (which now has the new
+# `gated_delta_net_decode` op merged at commit 641ab78). Revert to
+# `mlx-native = "0.6"` once mlx-native publishes a 0.7 with this kernel.
+mlx-native = { version = "0.6", path = "/opt/mlx-native" }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).
