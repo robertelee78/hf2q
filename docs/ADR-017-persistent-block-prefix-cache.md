@@ -24,7 +24,7 @@ Source: `~/Documents/mantra.txt` (Robert, undated). Quoted verbatim. This is the
 **Operational reading for ADR-017** (how to apply, not how to interpret — the text above is the source of truth):
 
 - **DO NOT BE LAZY / no short cuts.** Phase A0 falsification harness lands BEFORE any production code touches `HotSwapManager` or any `KvCacheSpill` impl. Per `feedback_harness_first_before_iter_chasing`, this is non-negotiable. The cost of a refuted Phase B–C spike is always larger than the cost of a Phase A0 measurement up front. The "cost" includes: SSD I/O eating the win on M5 Max (R2 below); DeltaNet boundary snapshot exceeding the Walk discipline (R1); TQ codec non-determinism (R3). Every one of these is cheaper to falsify in A0 than to land + revert.
-- **Plenty of time.** The 24–35 person-day estimate is acceptable. Per Robert directive 2026-04-30, the bar is "all families and all quants we support" — no carve-out, no TQ deferral to v2, no dense-only Gemma 4 ship. If hybrid Qwen3.5 boundary snapshot turns out to need 3 weeks instead of 1, we spend the 3 weeks rather than ship a partial path that implies hybrid correctness.
+- **Plenty of time.** The 24–35 man-day estimate is acceptable. Per Robert directive 2026-04-30, the bar is "all families and all quants we support" — no carve-out, no TQ deferral to v2, no dense-only Gemma 4 ship. If hybrid Qwen3.5 boundary snapshot turns out to need 3 weeks instead of 1, we spend the 3 weeks rather than ship a partial path that implies hybrid correctness.
 - **Never make assumptions.** Every ADR-017 design decision (D1–D10) cites either source code (`/opt/omlx/...:line`, `src/serve/multi_model.rs:line`) or measurement evidence (Phase A0 outcome). Claims about M5 Max DRAM economics, NVMe latency, or block-size optimality are pending Phase A0 measurement and are explicitly flagged as such until A0 returns.
 - **Dive deep / use search as needed.** Chesterton's fence on oMLX's design (the dossier already does this — 451 lines, 5 spot-checks against source). Chesterton's fence on `HotSwapManager`'s eviction loop before injecting the trait (already done in ADR-005 Phase 4 reopen rationale). Chesterton's fence on Qwen3.5-MoE's `gpu_delta_net.rs` before B-hybrid (next session work).
 - **Measure 3x, cut once.** Phase A0 is the canonical pre-spike measurement: matrix harness across families × quants × scenarios × prefix lengths × cache states. Per-cell ship-gate or kill-gate. No production code commits until A0 returns numbers; no per-family `KvCacheSpill` impl ships until that family's parity gate is GREEN by measurement.
@@ -288,7 +288,7 @@ Per dossier §4.2 + oMLX comment at `paged_ssd_cache.py:1198-1245`: storing live
 
 For Qwen3.5-MoE / Qwen3.6-MoE hybrid layers: capture `conv_state` + `recurrent` at every block boundary during prefill (`gpu_delta_net.rs:1417-1715` chunk-pipeline path). Store as the block's `linear_attn_state` payload. On restore, choose the latest valid boundary; if the request's prefix exceeds the latest boundary, walk back to the most recent boundary and re-execute the tail (oMLX's `_find_walk_back_truncation_point` pattern, `prefix_cache.py:1401-1437`).
 
-**This is the highest-risk piece** (R1 below). DeltaNet state is not sliceable per-token the way full-attn K/V is; the recurrent state must be captured at exact boundaries. Phase B-hybrid is the longest sub-phase (5–8 person-days) and the kill-criteria most likely to fire are concentrated here.
+**This is the highest-risk piece** (R1 below). DeltaNet state is not sliceable per-token the way full-attn K/V is; the recurrent state must be captured at exact boundaries. Phase B-hybrid is the longest sub-phase (5–8 man-days) and the kill-criteria most likely to fire are concentrated here.
 
 **ADR-017 will not ship Qwen3.5 KV persistence with a fallback path that loses correctness.** Either Phase B-hybrid lands a hybrid-correct snapshot/restore, or the Qwen3.5 `KvCacheSpill` impl waits on a follow-up ADR. Per `feedback_never_ship_fallback_without_rootcause` and the mantra: no stub.
 
@@ -570,7 +570,7 @@ Per the mantra: "No fallback. No stub (todo later) code." If a kill-gate fires, 
 | **D.1** | D | `tests/kv_persist_stress.rs` 24-hour continuous-load harness; corruption-injection harness; `docs/operating-kv-cache.md`. | ~400 test + doc | C.2 |
 | **D.2** | D | Per-family ship-gate read; `docs/ADR-017-per-family-status.md`; ADR-017 status flip Accepted → Closed-Shipped. | ~80 doc + measurement | D.1 |
 
-**Total: ~4,400 src + ~4,000 test LOC across 16 iters.** Estimated 24–35 person-days at current iter cadence. Sequencing: A0 strictly first; A.1–A.3 sequential; B-dense / B-tq / B-hybrid parallel-where-possible (each rides its own dependency tree); C / D sequential after every B-* GREEN.
+**Total: ~4,400 src + ~4,000 test LOC across 16 iters.** Estimated 24–35 man-days at current iter cadence. Sequencing: A0 strictly first; A.1–A.3 sequential; B-dense / B-tq / B-hybrid parallel-where-possible (each rides its own dependency tree); C / D sequential after every B-* GREEN.
 
 ---
 
