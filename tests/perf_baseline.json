@@ -1,12 +1,12 @@
 {
-  "_comment": "ADR-015 iter51 — per-cell hf2q/llama tok/s ratio floors.  iter51 LANDS two small deferred chain_n promotions in chain_n_for at forward_gpu.rs:334-345: (MoeQ, Q5_K) cn=1→2 (apex Q5_K MoE) and adds (DenseQ, Q4_0) cn=4 arm before catch-all (27b-dwq46 dense Q4_0).  Both arms validated by 5-trial × paired same-day cold-SoC bench at TS=20260429T230122Z: apex 108.8 / 102.39 = 1.0626× (predicted 1.0628× from iter45-RESUMED N-curve cn=2), 27b-dwq46 30.2 / 29.03 = 1.0403× (predicted 1.0400× from iter45-RESUMED N-curve cn=4), gemma 107.1 / 105.29 = 1.0172× (no change, +0.29pp thermal noise vs iter50).  dwq46 measures 114.1 / 120.07 = 0.9503× today vs iter45-RESUMED archived 1.0324× (TSV) / 1.0114× (JSON-recorded) — peer-side drift on llama-bench dwq46 (+9.74 t/s same-build 15f786e65 vs iter45 day; hf2q dwq46 essentially unchanged at 114.1 vs 113.9 archived).  iter51 cn lookup table unchanged for (MoeQ, Q4_0) so dwq46 still maps to cn=2 — the regression is exogenous.  iter52+ investigation: re-baseline llama dwq46 + matrix re-run.",
+  "_comment": "ADR-015 iter51 \u2014 per-cell hf2q/llama tok/s ratio floors.  iter51 LANDS two small deferred chain_n promotions in chain_n_for at forward_gpu.rs:334-345: (MoeQ, Q5_K) cn=1\u21922 (apex Q5_K MoE) and adds (DenseQ, Q4_0) cn=4 arm before catch-all (27b-dwq46 dense Q4_0).  Both arms validated by 5-trial \u00d7 paired same-day cold-SoC bench at TS=20260429T230122Z: apex 108.8 / 102.39 = 1.0626\u00d7 (predicted 1.0628\u00d7 from iter45-RESUMED N-curve cn=2), 27b-dwq46 30.2 / 29.03 = 1.0403\u00d7 (predicted 1.0400\u00d7 from iter45-RESUMED N-curve cn=4), gemma 107.1 / 105.29 = 1.0172\u00d7 (no change, +0.29pp thermal noise vs iter50).  dwq46 measures 114.1 / 120.07 = 0.9503\u00d7 today vs iter45-RESUMED archived 1.0324\u00d7 (TSV) / 1.0114\u00d7 (JSON-recorded) \u2014 peer-side drift on llama-bench dwq46 (+9.74 t/s same-build 15f786e65 vs iter45 day; hf2q dwq46 essentially unchanged at 114.1 vs 113.9 archived).  iter51 cn lookup table unchanged for (MoeQ, Q4_0) so dwq46 still maps to cn=2 \u2014 the regression is exogenous.  iter52+ investigation: re-baseline llama dwq46 + matrix re-run.",
   "_captured_at": "2026-04-29T23:01:22Z",
   "_baseline_commit": "iter51",
   "_baseline_date": "2026-04-29",
   "_baseline_mlx_native": "9bd1f6f",
   "_recapture_required": false,
-  "_recapture_reason": "iter51 paired bench: 4 fixtures × 5 trials × 2 sides {B_iter51, L_llama-bench} = 40 trials.  Bench: /tmp/iter51/bench/20260429T230122Z.results.tsv.  iter51 changes affect ONLY apex (Q5_K MoE) and 27b (Q4_0 dense); dwq46 (Q4_0 MoE → cn=2) and gemma (forward_mlx) paths unchanged.",
-  "_methodology": "scripts/iter45-chain-n-curve-bench.sh at NGEN=256, prompt='Hello, my name is', N_TRIALS=5 cold-process per cell.  hf2q runs each fixture under each of HF2Q_PARTIAL_CHAIN_N ∈ {1,2,4,8,20}; ratios below are hf2q_med / llama_med at the production-default cn for that fixture's quant arm.  Floor = measured_ratio - 0.01 tolerance.  Phase 5 gate: ≥1pp improvement on primary fixture AND ≥0pp regression on every other fixture AND coherence_smoke 12/12 PASS post-change.",
+  "_recapture_reason": "iter51 paired bench: 4 fixtures \u00d7 5 trials \u00d7 2 sides {B_iter51, L_llama-bench} = 40 trials.  Bench: /tmp/iter51/bench/20260429T230122Z.results.tsv.  iter51 changes affect ONLY apex (Q5_K MoE) and 27b (Q4_0 dense); dwq46 (Q4_0 MoE \u2192 cn=2) and gemma (forward_mlx) paths unchanged.",
+  "_methodology": "scripts/iter45-chain-n-curve-bench.sh at NGEN=256, prompt='Hello, my name is', N_TRIALS=5 cold-process per cell.  hf2q runs each fixture under each of HF2Q_PARTIAL_CHAIN_N \u2208 {1,2,4,8,20}; ratios below are hf2q_med / llama_med at the production-default cn for that fixture's quant arm.  Floor = measured_ratio - 0.01 tolerance.  Phase 5 gate: \u22651pp improvement on primary fixture AND \u22650pp regression on every other fixture AND coherence_smoke 12/12 PASS post-change.",
   "cells": {
     "qwen3.6-35b-a3b-dwq46": {
       "ratio_floor": 0.94,
@@ -17,12 +17,17 @@
       "_measured_at_commit": "iter51",
       "_measured_at_date": "2026-04-29",
       "_chain_n_default": 2,
-      "_iter45_resumed_archived": {"_measured_ratio": 1.0114, "_measured_hf2q_tps_med": 113.9, "_measured_llama_tps_med": 112.62, "_note": "JSON-recorded iter45-RESUMED ratio 1.0114 disagrees with TSV summary value 1.0324× (113.9 / 110.33).  Both archived for forensic comparison."},
-      "_note": "MoE-35B-A3B × dwq46 (Q4_0 expert blocks per iter47).  iter45-RESUMED N-curve: cn=1 → 0.9439× (40 layer CBs/tok); cn=2 → 1.0114× (20 layer CBs/tok); cn=4 → 1.0060×; cn=8 → 0.9963×; cn=20 → 0.9705×.  iter45 LANDS (MoeQ, Q4_0) → cn=2 in chain_n_for; iter51 cn=2 unchanged.  iter51 5-trial paired same-day measurement: hf2q 114.1 (essentially identical to iter45 archived 113.9; +0.2 noise) but llama-bench dwq46 surged 110.33→120.07 (+9.74 t/s, same build 15f786e65) — peer-side drift, not an hf2q regression.  Other fixtures' llama medians today vs iter45 day: apex 102.39 vs 101.02 (+1.37, +1.4%); 27b 29.03 vs 28.58 (+0.45, +1.6%); gemma 105.29 vs 104.80 (+0.49, +0.5%) — all within thermal-noise band.  Only dwq46 llama is the outlier (+8.8%).  iter52+ investigation: re-baseline llama dwq46 with extended N=10 trials at lower-thermal pre-bench window; possible llama-bench BLAS+MTL caching warm-up effect specific to qwen35moe Q4_K_M architecture detection.  Floor lowered 1.00 → 0.94 = measured 0.9503 - 0.01 tolerance for current peer-state; will be reset once iter52 investigation closes."
+      "_iter45_resumed_archived": {
+        "_measured_ratio": 1.0114,
+        "_measured_hf2q_tps_med": 113.9,
+        "_measured_llama_tps_med": 112.62,
+        "_note": "JSON-recorded iter45-RESUMED ratio 1.0114 disagrees with TSV summary value 1.0324\u00d7 (113.9 / 110.33).  Both archived for forensic comparison."
+      },
+      "_note": "MoE-35B-A3B \u00d7 dwq46 (Q4_0 expert blocks per iter47).  iter45-RESUMED N-curve: cn=1 \u2192 0.9439\u00d7 (40 layer CBs/tok); cn=2 \u2192 1.0114\u00d7 (20 layer CBs/tok); cn=4 \u2192 1.0060\u00d7; cn=8 \u2192 0.9963\u00d7; cn=20 \u2192 0.9705\u00d7.  iter45 LANDS (MoeQ, Q4_0) \u2192 cn=2 in chain_n_for; iter51 cn=2 unchanged.  iter51 5-trial paired same-day measurement: hf2q 114.1 (essentially identical to iter45 archived 113.9; +0.2 noise) but llama-bench dwq46 surged 110.33\u2192120.07 (+9.74 t/s, same build 15f786e65) \u2014 peer-side drift, not an hf2q regression.  Other fixtures' llama medians today vs iter45 day: apex 102.39 vs 101.02 (+1.37, +1.4%); 27b 29.03 vs 28.58 (+0.45, +1.6%); gemma 105.29 vs 104.80 (+0.49, +0.5%) \u2014 all within thermal-noise band.  Only dwq46 llama is the outlier (+8.8%).  iter52+ investigation: re-baseline llama dwq46 with extended N=10 trials at lower-thermal pre-bench window; possible llama-bench BLAS+MTL caching warm-up effect specific to qwen35moe Q4_K_M architecture detection.  Floor lowered 1.00 \u2192 0.94 = measured 0.9503 - 0.01 tolerance for current peer-state; will be reset once iter52 investigation closes."
     },
     "qwen3.6-35b-a3b-dwq48": {
-      "ratio_floor": 1.00,
-      "_note": "MoE-35B-A3B × dwq48 (Q4_0 + Q8 sensitive).  Not in iter45-RESUMED N-curve fixture set; same Q4_0 MoE arm fix applies (cn=2).  Floor inherited from dwq46 (same Q4_0 MoE catch-all bypass).  Re-measure when fixture is added to coherence_smoke."
+      "ratio_floor": 1.0,
+      "_note": "MoE-35B-A3B \u00d7 dwq48 (Q4_0 + Q8 sensitive).  Not in iter45-RESUMED N-curve fixture set; same Q4_0 MoE arm fix applies (cn=2).  Floor inherited from dwq46 (same Q4_0 MoE catch-all bypass).  Re-measure when fixture is added to coherence_smoke."
     },
     "qwen3.6-35b-a3b-apex": {
       "ratio_floor": 1.05,
@@ -33,7 +38,7 @@
       "_measured_at_commit": "iter51",
       "_measured_at_date": "2026-04-29",
       "_chain_n_default": 2,
-      "_note": "MoE-35B-A3B × apex (Q5_K MoE).  iter51 LANDS (MoeQ, Q5_K) cn=1→2 promotion at forward_gpu.rs:343 (chain_n_for); iter45-RESUMED N-curve recorded cn=2 = 1.0628× as the optimum and was deferred at iter45 due to apex being sister-fixture (no primary anchor) and at iter50 because dwq46/gemma was still failing parity gate.  iter51 5-trial paired same-day measurement: 108.8 / 102.39 = 1.0626× — exactly matches the iter45-RESUMED predicted +1.45pp gain over cn=1 (1.0481).  Floor bumped 1.04 → 1.05 = measured 1.0626 - 0.01 tolerance."
+      "_note": "MoE-35B-A3B \u00d7 apex (Q5_K MoE).  iter51 LANDS (MoeQ, Q5_K) cn=1\u21922 promotion at forward_gpu.rs:343 (chain_n_for); iter45-RESUMED N-curve recorded cn=2 = 1.0628\u00d7 as the optimum and was deferred at iter45 due to apex being sister-fixture (no primary anchor) and at iter50 because dwq46/gemma was still failing parity gate.  iter51 5-trial paired same-day measurement: 108.8 / 102.39 = 1.0626\u00d7 \u2014 exactly matches the iter45-RESUMED predicted +1.45pp gain over cn=1 (1.0481).  Floor bumped 1.04 \u2192 1.05 = measured 1.0626 - 0.01 tolerance."
     },
     "qwen3.6-27b-dwq46": {
       "ratio_floor": 1.03,
@@ -44,14 +49,14 @@
       "_measured_at_commit": "iter51",
       "_measured_at_date": "2026-04-29",
       "_chain_n_default": 4,
-      "_note": "dense-27B × dwq46 (Q4_0 dense per iter47).  iter51 ADDS (DenseQ, Q4_0) cn=4 arm at forward_gpu.rs:339 (before catch-all) to lift this fixture from the cn=1 catch-all default; iter45-RESUMED N-curve measured cn=4/8 tied at 1.0400× (+0.70pp vs cn=1 = 1.0330) — was deferred at iter45 due to <1pp Phase 5 gate but promoted at iter51 once all 4 fixtures cleared parity gate and the remaining lever became 'maximize lead'.  iter51 5-trial paired same-day measurement: 30.2 / 29.03 = 1.0403× — exactly matches predicted +0.73pp gain.  Floor bumped 1.02 → 1.03 = measured 1.0403 - 0.01 tolerance."
+      "_note": "dense-27B \u00d7 dwq46 (Q4_0 dense per iter47).  iter51 ADDS (DenseQ, Q4_0) cn=4 arm at forward_gpu.rs:339 (before catch-all) to lift this fixture from the cn=1 catch-all default; iter45-RESUMED N-curve measured cn=4/8 tied at 1.0400\u00d7 (+0.70pp vs cn=1 = 1.0330) \u2014 was deferred at iter45 due to <1pp Phase 5 gate but promoted at iter51 once all 4 fixtures cleared parity gate and the remaining lever became 'maximize lead'.  iter51 5-trial paired same-day measurement: 30.2 / 29.03 = 1.0403\u00d7 \u2014 exactly matches predicted +0.73pp gain.  Floor bumped 1.02 \u2192 1.03 = measured 1.0403 - 0.01 tolerance."
     },
     "qwen3.6-27b-dwq48": {
-      "ratio_floor": 1.00,
-      "_note": "dense-27B × dwq48.  Not in iter45-RESUMED N-curve fixture set.  Floor inherited from iter41."
+      "ratio_floor": 1.0,
+      "_note": "dense-27B \u00d7 dwq48.  Not in iter45-RESUMED N-curve fixture set.  Floor inherited from iter41."
     },
     "gemma-26B-dwq": {
-      "ratio_floor": 1.00,
+      "ratio_floor": 1.0,
       "_measured_ratio": 1.0172,
       "_measured_hf2q_tps_med": 107.1,
       "_measured_llama_tps_med": 105.29,
@@ -59,7 +64,7 @@
       "_measured_at_commit": "iter51",
       "_measured_at_date": "2026-04-29",
       "_chain_n_default": "inert (forward_mlx)",
-      "_note": "gemma-26B × dwq.  iter50 LANDS Leg F → Branch A route default at forward_mlx.rs:2293,2315.  Iter43→iter49 was 0.9629→0.9752 (+1.23pp from iter49 HB-encode gate).  iter50 measures Side A baseline=102.8 (0.9754×, replicates iter45-RESUMED) and Side B iter50=106.9 (1.0143×) vs same-day llama-bench median 105.39.  Δ B vs A = +3.89pp.  iter51 5-trial paired same-day re-measure: hf2q 107.1 (+0.2 vs iter50 archived; thermal noise), llama 105.29 (-0.10 vs iter50; thermal noise) → 1.0172× (+0.29pp vs iter50).  iter51 changes do not touch forward_mlx so this is pure thermal stability check; PASS within 0.5pp of iter50.  Floor 1.00 = measured 1.0172 - 0.01 tolerance ≈ stays at 1.00×."
+      "_note": "gemma-26B \u00d7 dwq.  iter50 LANDS Leg F \u2192 Branch A route default at forward_mlx.rs:2293,2315.  Iter43\u2192iter49 was 0.9629\u21920.9752 (+1.23pp from iter49 HB-encode gate).  iter50 measures Side A baseline=102.8 (0.9754\u00d7, replicates iter45-RESUMED) and Side B iter50=106.9 (1.0143\u00d7) vs same-day llama-bench median 105.39.  \u0394 B vs A = +3.89pp.  iter51 5-trial paired same-day re-measure: hf2q 107.1 (+0.2 vs iter50 archived; thermal noise), llama 105.29 (-0.10 vs iter50; thermal noise) \u2192 1.0172\u00d7 (+0.29pp vs iter50).  iter51 changes do not touch forward_mlx so this is pure thermal stability check; PASS within 0.5pp of iter50.  Floor 1.00 = measured 1.0172 - 0.01 tolerance \u2248 stays at 1.00\u00d7."
     }
   },
   "_tolerance_pp": 1.0,
@@ -71,25 +76,25 @@
     "_ngen": 256,
     "_prompt": "Hello, my name is",
     "_chat_template": "RAW",
-    "_pre_flight_audit": "PASS — pmset clean, vm_stat 104 GB free, FCP/davinci/handbrake/ffmpeg empty, biomesyncd absent, mcp-brain-server STOP/CONT trapped",
+    "_pre_flight_audit": "PASS \u2014 pmset clean, vm_stat 104 GB free, FCP/davinci/handbrake/ffmpeg empty, biomesyncd absent, mcp-brain-server STOP/CONT trapped",
     "phase_5_hypothesis_re_weighting": {
       "h1_cn_20_wins_dwq46": {
-        "prior_weight": 0.30,
-        "posterior_weight": 0.00,
+        "prior_weight": 0.3,
+        "posterior_weight": 0.0,
         "verdict": "FALSIFIED",
-        "evidence": "dwq46 cn=20 = 0.9705× (−4.09pp vs cn=2 winner; −0.27pp vs cn=1 baseline).  cn=20 collapses below cn=8 on dwq46.  Per-CB driver-overhead amortization at 3-CB/token regime is overshadowed by Metal async-overlap loss (iter25 mechanism still operative on coherent baseline)."
+        "evidence": "dwq46 cn=20 = 0.9705\u00d7 (\u22124.09pp vs cn=2 winner; \u22120.27pp vs cn=1 baseline).  cn=20 collapses below cn=8 on dwq46.  Per-CB driver-overhead amortization at 3-CB/token regime is overshadowed by Metal async-overlap loss (iter25 mechanism still operative on coherent baseline)."
       },
       "h2_cn_2_local_optimum": {
-        "prior_weight": 0.50,
+        "prior_weight": 0.5,
         "posterior_weight": 0.95,
-        "verdict": "CONFIRMED — STRONGER THAN PREDICTED",
-        "evidence": "dwq46 cn=2 = 1.0114× (+6.75pp vs cn=1, +1.14pp vs llama).  apex cn=2 = 1.0628× (+1.47pp vs cn=1).  27b cn=2 = 1.0365× (+0.35pp vs cn=1).  cn=2 wins or ties on every fixture with the chain_n lever active.  Iter17/26 finding TRANSFERS to coherent baseline — the iter40+iter42 coherence fixes did not invalidate the cn=2 optimum."
+        "verdict": "CONFIRMED \u2014 STRONGER THAN PREDICTED",
+        "evidence": "dwq46 cn=2 = 1.0114\u00d7 (+6.75pp vs cn=1, +1.14pp vs llama).  apex cn=2 = 1.0628\u00d7 (+1.47pp vs cn=1).  27b cn=2 = 1.0365\u00d7 (+0.35pp vs cn=1).  cn=2 wins or ties on every fixture with the chain_n lever active.  Iter17/26 finding TRANSFERS to coherent baseline \u2014 the iter40+iter42 coherence fixes did not invalidate the cn=2 optimum."
       },
       "h3_cn_1_universally_fastest": {
-        "prior_weight": 0.20,
+        "prior_weight": 0.2,
         "posterior_weight": 0.05,
         "verdict": "REJECTED",
-        "evidence": "cn=1 is the WORST non-pathological setting on both MoE fixtures: dwq46 cn=1 = 0.9439× (−6.75pp vs cn=2); apex cn=1 = 1.0481× (−1.47pp vs cn=2).  Only retained as catch-all for arm/cfg mismatches."
+        "evidence": "cn=1 is the WORST non-pathological setting on both MoE fixtures: dwq46 cn=1 = 0.9439\u00d7 (\u22126.75pp vs cn=2); apex cn=1 = 1.0481\u00d7 (\u22121.47pp vs cn=2).  Only retained as catch-all for arm/cfg mismatches."
       }
     },
     "phase_6_winner_gate_decisions": {
@@ -97,7 +102,11 @@
         "candidate": "(FfnQuantArm::MoeQ, Some(GgmlType::Q4_0)) if cfg_is_moe => 2",
         "primary_fixture": "qwen3.6-35b-a3b-dwq46",
         "primary_delta_pp": 6.75,
-        "sister_deltas_pp": {"apex_q5k": 0.0, "27b_q4_0": 0.0, "gemma": 0.0},
+        "sister_deltas_pp": {
+          "apex_q5k": 0.0,
+          "27b_q4_0": 0.0,
+          "gemma": 0.0
+        },
         "coherence_smoke_post_change": "12/12 PASS in 88.0s",
         "coherence_matrix_post_change": "EXACT=4 COHERENT=8 GIBBERISH=0",
         "verdict": "LANDED",
@@ -106,14 +115,14 @@
       "dense_q4_0_arm_at_cn_4": {
         "candidate": "(FfnQuantArm::DenseQ, Some(GgmlType::Q4_0)) if !cfg_is_moe => 4",
         "primary_fixture": "qwen3.6-27b-dwq46",
-        "primary_delta_pp": 0.70,
-        "verdict": "DEFERRED — fails Phase 5 ≥1pp gate (only +0.70pp gain).  Re-evaluate after dwq48 fixture added to N-curve."
+        "primary_delta_pp": 0.7,
+        "verdict": "DEFERRED \u2014 fails Phase 5 \u22651pp gate (only +0.70pp gain).  Re-evaluate after dwq48 fixture added to N-curve."
       },
       "apex_q5k_arm_at_cn_2": {
         "candidate": "(FfnQuantArm::MoeQ, Some(GgmlType::Q5_K)) if cfg_is_moe => 2",
         "primary_fixture": "qwen3.6-35b-a3b-apex",
         "primary_delta_pp": 1.47,
-        "verdict": "DEFERRED — primary measure passed +1.47pp but apex is the SISTER fixture in iter45-RESUMED (not the primary); needs an apex-primary iter to validate Q5_K + Q6_K shifts together.  iter50+ candidate."
+        "verdict": "DEFERRED \u2014 primary measure passed +1.47pp but apex is the SISTER fixture in iter45-RESUMED (not the primary); needs an apex-primary iter to validate Q5_K + Q6_K shifts together.  iter50+ candidate."
       }
     }
   },
@@ -123,9 +132,9 @@
     "_ngen": 256,
     "_prompt": "Hello, my name is",
     "_chat_template": "RAW",
-    "_pre_flight_audit": "PASS — pmset clean, vm_stat 100+ GB pre-bench, FCP/davinci/handbrake/ffmpeg empty, biomesyncd absent, mcp-brain-server STOP/CONT trapped",
+    "_pre_flight_audit": "PASS \u2014 pmset clean, vm_stat 100+ GB pre-bench, FCP/davinci/handbrake/ffmpeg empty, biomesyncd absent, mcp-brain-server STOP/CONT trapped",
     "h2_phase_5_winner_gate": {
-      "candidate": "Branch A route at force_dense_sdpa_on_tq_kv default — forward_mlx.rs:2293,2315 (None if force_dense_sdpa_on_tq_kv => true)",
+      "candidate": "Branch A route at force_dense_sdpa_on_tq_kv default \u2014 forward_mlx.rs:2293,2315 (None if force_dense_sdpa_on_tq_kv => true)",
       "primary_fixture": "gemma-26B-dwq",
       "primary_delta_pp": 3.89,
       "side_A_baseline_median_tps": 102.8,
@@ -133,14 +142,18 @@
       "side_L_llama_median_tps": 105.39,
       "side_A_ratio": 0.9754,
       "side_B_ratio": 1.0143,
-      "sister_deltas_vs_iter45_resumed": {"dwq46": "+0.3 (114.2 vs 113.9)", "apex": "+0.3 (107.1 vs 106.8)", "27b-dwq46": "+0.1 (29.8 vs 29.7)"},
+      "sister_deltas_vs_iter45_resumed": {
+        "dwq46": "+0.3 (114.2 vs 113.9)",
+        "apex": "+0.3 (107.1 vs 106.8)",
+        "27b-dwq46": "+0.1 (29.8 vs 29.7)"
+      },
       "coherence_smoke_post_change": "12/12 PASS in 87.5s",
       "coherence_matrix_post_change": "EXACT=6 COHERENT=6 GIBBERISH=0",
-      "verdict": "LANDED — primary +3.89pp exceeds Phase 5 ≥1pp gate AND ≥0pp on every other fixture AND coherence_smoke 12/12 + coherence_matrix 0 GIBBERISH"
+      "verdict": "LANDED \u2014 primary +3.89pp exceeds Phase 5 \u22651pp gate AND \u22650pp on every other fixture AND coherence_smoke 12/12 + coherence_matrix 0 GIBBERISH"
     }
   },
   "_iter56_status": {
-    "_status": "LANDED — D4 ≥1.00× target met across the matrix",
+    "_status": "LANDED \u2014 D4 \u22651.00\u00d7 target met across the matrix",
     "_captured_at": "2026-04-30T14:00:57Z",
     "_hf2q_head": "5ed7a7c",
     "_mlx_native_head": "641ab78",
@@ -159,80 +172,126 @@
       "n_trials": 5,
       "ngen": 256,
       "thermal_settle_sec": 120,
-      "hf2q_per_trial": [127.4, 126.5, 126.5, 127.3, 127.3],
+      "hf2q_per_trial": [
+        127.4,
+        126.5,
+        126.5,
+        127.3,
+        127.3
+      ],
       "hf2q_median": 127.3,
       "hf2q_sigma_approx": 0.4,
-      "llama_per_trial": [122.16, 120.95, 120.66, 121.74, 121.91],
+      "llama_per_trial": [
+        122.16,
+        120.95,
+        120.66,
+        121.74,
+        121.91
+      ],
       "llama_median": 121.74,
       "llama_sigma_approx": 0.5,
       "ratio": 1.0457,
       "delta_pp_vs_iter54": 10.87,
       "absolute_hf2q_delta_tps": 14.0,
       "absolute_hf2q_pct": 12.4,
-      "verdict": "LANDED — closes the last failing matrix cell at 1.0457×; +4.57pp above D4 ≥1.00× target"
+      "verdict": "LANDED \u2014 closes the last failing matrix cell at 1.0457\u00d7; +4.57pp above D4 \u22651.00\u00d7 target"
     },
     "_no_regression_followup": "apex Q5_K MoE + 27B-Dense Q4_0 (both DeltaNet-using fixtures) deferred to next iter; gemma is no-risk (does not use DeltaNet kernel). One paired bench each, ~30 min total.",
     "_no_regression_results_2026_04_30T15_30Z": {
-      "_summary": "BOTH fixtures CONFIRMED no-regression — actually IMPROVED. iter56 fused gated_delta_net_decode is net-positive on every DeltaNet-using cell (3/3 measured).",
+      "_summary": "BOTH fixtures CONFIRMED no-regression \u2014 actually IMPROVED. iter56 fused gated_delta_net_decode is net-positive on every DeltaNet-using cell (3/3 measured).",
       "apex_q5_k_moe": {
         "fixture": "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf",
-        "hf2q_per_trial": [116.6, 118.6, 118.5, 117.6, 117.7],
-        "hf2q_median": 117.700,
-        "llama_per_trial": [107.81, 108.48, 108.94, 108.47, 108.54],
-        "llama_median": 108.480,
-        "ratio": 1.0850,
+        "hf2q_per_trial": [
+          116.6,
+          118.6,
+          118.5,
+          117.6,
+          117.7
+        ],
+        "hf2q_median": 117.7,
+        "llama_per_trial": [
+          107.81,
+          108.48,
+          108.94,
+          108.47,
+          108.54
+        ],
+        "llama_median": 108.48,
+        "ratio": 1.085,
         "iter51_ratio": 1.0626,
         "delta_pp": 2.24,
-        "verdict": "IMPROVED — +2.24pp ratio, +8.9 t/s hf2q absolute"
+        "verdict": "IMPROVED \u2014 +2.24pp ratio, +8.9 t/s hf2q absolute"
       },
       "27b_dense_q4_0": {
         "fixture": "/opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf",
-        "hf2q_per_trial": [31.4, 31.5, 31.4, 31.4, 31.4],
-        "hf2q_median": 31.400,
-        "llama_per_trial": [29.21, 29.25, 29.18, 29.23, 28.95],
-        "llama_median": 29.210,
-        "ratio": 1.0750,
+        "hf2q_per_trial": [
+          31.4,
+          31.5,
+          31.4,
+          31.4,
+          31.4
+        ],
+        "hf2q_median": 31.4,
+        "llama_per_trial": [
+          29.21,
+          29.25,
+          29.18,
+          29.23,
+          28.95
+        ],
+        "llama_median": 29.21,
+        "ratio": 1.075,
         "iter51_ratio": 1.0403,
         "delta_pp": 3.47,
-        "verdict": "IMPROVED — +3.47pp ratio, +1.2 t/s hf2q absolute"
+        "verdict": "IMPROVED \u2014 +3.47pp ratio, +1.2 t/s hf2q absolute"
       },
       "gemma_26B_dwq": {
-        "verdict": "DEFERRED — kernel doesn't fire on gemma forward_mlx path (no risk of regression). iter51 baseline 1.0172× stands."
+        "verdict": "DEFERRED \u2014 kernel doesn't fire on gemma forward_mlx path (no risk of regression). iter51 baseline 1.0172\u00d7 stands."
       }
     },
     "_artefacts": "/tmp/adr015-bench/baseline-iter56-q4_0-flat-fused-gdn-20260430T140057Z.{summary.txt,metadata.json}, claude commits 641ab78 (mlx-native) + 5ed7a7c (hf2q), patches at /tmp/cfa-cfa-20260430-adr015-iter56-gated-delta-net/claude-{mlx,hf2q}.patch (810+73 lines)",
     "_followups": [
       "No-regression bench on apex Q5_K + 27B-Dense + gemma",
       "DWQ codec Q4_0 MoE restoration (ADR-014 issue)",
-      "Cargo.toml path-pin → mlx-native = '0.7' once published",
-      "Prefill path unchanged — chunk-prefill out of scope, decode-only iter",
-      "NSG=4 D_k≤128 only; D_k>128 needs NSG=8 entry point"
+      "Cargo.toml path-pin \u2192 mlx-native = '0.7' once published",
+      "Prefill path unchanged \u2014 chunk-prefill out of scope, decode-only iter",
+      "NSG=4 D_k\u2264128 only; D_k>128 needs NSG=8 entry point"
     ]
   },
   "_iter53_status": {
-    "_status": "PARTIAL — BLOCKED-PRE-FLIGHT",
+    "_status": "PARTIAL \u2014 BLOCKED-PRE-FLIGHT",
     "_captured_at": "2026-04-30T00:22:16Z",
     "_hf2q_head": "9c228d0",
     "_mlx_native_head": "9bd1f6f",
     "_worktree": "agent-a2ca20c8b8d51f7b7",
-    "_mission": "Multi-thermal llama-bench dwq46 stability investigation (H3 from iter52); 5 trials × 3 thermal states = 15 llama-bench runs + paired hf2q runs.",
-    "_outcome": "ABORT — pre-flight contamination event.",
-    "_contamination": "Logic Pro Creator Studio (pid 87605) sustained 17.0–18.4% CPU + coreaudiod (pid 408) sustained 6.2–6.7% CPU = ~24-25% sustained audio-DSP load on M5 Max P-core.  Operator is actively using the audio workstation; this is foreground work, not a runaway daemon.  Same magnitude as the mcp-brain-server contamination class documented in feedback_bench_process_audit (which was 18% and confirmed to shift trial medians by +1.5 t/s).",
+    "_mission": "Multi-thermal llama-bench dwq46 stability investigation (H3 from iter52); 5 trials \u00d7 3 thermal states = 15 llama-bench runs + paired hf2q runs.",
+    "_outcome": "ABORT \u2014 pre-flight contamination event.",
+    "_contamination": "Logic Pro Creator Studio (pid 87605) sustained 17.0\u201318.4% CPU + coreaudiod (pid 408) sustained 6.2\u20136.7% CPU = ~24-25% sustained audio-DSP load on M5 Max P-core.  Operator is actively using the audio workstation; this is foreground work, not a runaway daemon.  Same magnitude as the mcp-brain-server contamination class documented in feedback_bench_process_audit (which was 18% and confirmed to shift trial medians by +1.5 t/s).",
     "_pre_flight_clean": "pmset-therm CLEAN (no thermal/perf warning); vm_stat 35.7 GB free + 1.18M speculative; FCP/davinci/handbrake/ffmpeg/hf2q-convert/p11_re_emit pgrep all empty; mcp-brain-server self-quiesced (S state, 0.0% CPU at sample).",
     "_methodology_invariant": "iter53 H3 specifically depends on cross-thermal-state spread.  An external uncontrolled 24-25% sustained CPU load voids the Cold-SoC / Sustained-warm / Post-cool-down state distinction (cold isn't cold, warm can't be cleanly attributed, cool-down can't reach idle).  Per feedback_no_shortcuts + feedback_correct_outcomes: refused to run a confounded bench.",
-    "_dwq46_cell_unchanged": "iter51 multi-run snapshot at 0.9503× remains the standing comparator.  Floor stays at 0.94 (= 0.9503 - 0.01 tolerance per current peer state).  No new measurement = no cell update.",
+    "_dwq46_cell_unchanged": "iter51 multi-run snapshot at 0.9503\u00d7 remains the standing comparator.  Floor stays at 0.94 (= 0.9503 - 0.01 tolerance per current peer state).  No new measurement = no cell update.",
     "_iter54_recommendation": "Retry iter53 H3 protocol verbatim under either (1) operator quiesces Logic Pro + audio-DSP idle (verified by ps audit + Logic Pro pgrep empty + coreaudiod <2% CPU), or (2) scheduled overnight bench window when workstation is idle.  Existing iter45 harness gate enriched at scripts/iter45-chain-n-curve-bench.sh to abort on Logic Pro / logicpro processes as future-proofing per feedback_no_broken_windows.",
     "_artefacts": "/tmp/iter53/preflight/{contamination-summary.txt, pmset-therm.txt, vm_stat.txt, ps-audit.txt, top-cpu.txt, uptime.txt, mcp-brain-pids.txt, timestamp.txt}",
-    "_compliance_pins": ["feedback_check_ram_before_inference (PASS, 35.7 GB free)", "feedback_bench_process_audit (full audit archived; contamination IS the deliverable)", "feedback_perf_gate_thermal_methodology (pre-flight thermal clean; abort is on co-process load not thermal-flag)", "feedback_no_shortcuts (no confounded bench)", "feedback_correct_outcomes (honest negative result)", "feedback_evidence_first_no_blind_kernel_rewrites (zero code changes)", "feedback_use_cfa_worktrees (worktree agent-a2ca20c8b8d51f7b7)", "feedback_git_commit_pathspec_when_parallel (pathspec docs+JSON+harness only; src/quantize/mod.rs ADR-014 fence preserved)", "feedback_ground_truth_is_what_we_can_measure_now (deferred is not measured)"]
+    "_compliance_pins": [
+      "feedback_check_ram_before_inference (PASS, 35.7 GB free)",
+      "feedback_bench_process_audit (full audit archived; contamination IS the deliverable)",
+      "feedback_perf_gate_thermal_methodology (pre-flight thermal clean; abort is on co-process load not thermal-flag)",
+      "feedback_no_shortcuts (no confounded bench)",
+      "feedback_correct_outcomes (honest negative result)",
+      "feedback_evidence_first_no_blind_kernel_rewrites (zero code changes)",
+      "feedback_use_cfa_worktrees (worktree agent-a2ca20c8b8d51f7b7)",
+      "feedback_git_commit_pathspec_when_parallel (pathspec docs+JSON+harness only; src/quantize/mod.rs ADR-014 fence preserved)",
+      "feedback_ground_truth_is_what_we_can_measure_now (deferred is not measured)"
+    ]
   },
   "_iter51_summary": {
     "_artefact": "/tmp/iter51/bench/20260429T230122Z.results.tsv",
-    "_n_trials_per_cell": "5 trials × 4 fixtures × 2 sides = 40 trials",
+    "_n_trials_per_cell": "5 trials \u00d7 4 fixtures \u00d7 2 sides = 40 trials",
     "_ngen": 256,
     "_prompt": "Hello, my name is",
     "_chat_template": "RAW",
-    "_pre_flight_audit": "PASS — pmset clean, vm_stat 99 GB free+inactive pre-bench, FCP/davinci/handbrake/ffmpeg empty, biomesyncd absent, mcp-brain-server STOP/CONT trapped",
-    "_changes": "(MoeQ, Q5_K) cn=1→2 promotion (apex) at forward_gpu.rs:343 + new (DenseQ, Q4_0) cn=4 arm before catch-all (27b-dwq46) at forward_gpu.rs:339",
+    "_pre_flight_audit": "PASS \u2014 pmset clean, vm_stat 99 GB free+inactive pre-bench, FCP/davinci/handbrake/ffmpeg empty, biomesyncd absent, mcp-brain-server STOP/CONT trapped",
+    "_changes": "(MoeQ, Q5_K) cn=1\u21922 promotion (apex) at forward_gpu.rs:343 + new (DenseQ, Q4_0) cn=4 arm before catch-all (27b-dwq46) at forward_gpu.rs:339",
     "phase_4_ship_gate": {
       "apex_q5_k_cn_2_promotion": {
         "primary_fixture": "qwen3.6-35b-a3b-apex",
@@ -242,23 +301,23 @@
         "side_L_llama_median_tps": 102.39,
         "delta_pp_vs_iter45_resumed_cn1": 1.45,
         "gate_threshold": 1.06,
-        "verdict": "LANDED — measured 1.0626× ≥ 1.06 gate; matches iter45-RESUMED prediction within 0.02pp"
+        "verdict": "LANDED \u2014 measured 1.0626\u00d7 \u2265 1.06 gate; matches iter45-RESUMED prediction within 0.02pp"
       },
       "27b_dense_q4_0_cn_4_promotion": {
         "primary_fixture": "qwen3.6-27b-dwq46",
-        "predicted_ratio": 1.0400,
+        "predicted_ratio": 1.04,
         "measured_ratio": 1.0403,
         "side_B_iter51_median_tps": 30.2,
         "side_L_llama_median_tps": 29.03,
         "delta_pp_vs_iter45_resumed_cn1": 0.73,
         "gate_threshold": 1.038,
-        "verdict": "LANDED — measured 1.0403× ≥ 1.038 gate; matches iter45-RESUMED prediction within 0.03pp"
+        "verdict": "LANDED \u2014 measured 1.0403\u00d7 \u2265 1.038 gate; matches iter45-RESUMED prediction within 0.03pp"
       },
       "gemma_thermal_check": {
         "predicted_ratio": 1.0143,
         "measured_ratio": 1.0172,
         "delta_pp_vs_iter50": 0.29,
-        "verdict": "PASS — within 0.5pp tolerance of iter50; iter51 changes do not touch forward_mlx path"
+        "verdict": "PASS \u2014 within 0.5pp tolerance of iter50; iter51 changes do not touch forward_mlx path"
       },
       "dwq46_peer_drift_anomaly": {
         "expected_ratio_iter45_resumed": 1.0114,
@@ -271,13 +330,44 @@
         "iter45_resumed_archived_llama_tps_json_recorded": 112.62,
         "delta_hf2q_pp": "+0.2 (essentially identical; thermal noise)",
         "delta_llama_pp": "+9.74 (+8.8% peer-side speed-up; same build 15f786e65)",
-        "code_path_audit": "iter51 chain_n_for table: (MoeQ, Q4_0) → cn=2 unchanged from iter45-RESUMED.  dwq46 hot path is byte-identical to iter45-RESUMED HEAD.  Regression is exogenous (peer-side llama-bench drift on this fixture).",
-        "other_fixture_llama_drift": "apex llama 102.39 vs iter45 101.02 (+1.4%); 27b 29.03 vs 28.58 (+1.6%); gemma 105.29 vs 104.80 (+0.5%) — all within thermal-noise band.  Only dwq46 llama is the +8.8% outlier.",
-        "verdict": "DOES NOT BLOCK SHIP — iter51 cannot have caused this; isolated to peer-side; docs/perf_baseline.json updated to current measurement; iter52+ investigation territory.  Floor lowered 1.00 → 0.94 (= 0.9503 - 0.01) for current peer state."
+        "code_path_audit": "iter51 chain_n_for table: (MoeQ, Q4_0) \u2192 cn=2 unchanged from iter45-RESUMED.  dwq46 hot path is byte-identical to iter45-RESUMED HEAD.  Regression is exogenous (peer-side llama-bench drift on this fixture).",
+        "other_fixture_llama_drift": "apex llama 102.39 vs iter45 101.02 (+1.4%); 27b 29.03 vs 28.58 (+1.6%); gemma 105.29 vs 104.80 (+0.5%) \u2014 all within thermal-noise band.  Only dwq46 llama is the +8.8% outlier.",
+        "verdict": "DOES NOT BLOCK SHIP \u2014 iter51 cannot have caused this; isolated to peer-side; docs/perf_baseline.json updated to current measurement; iter52+ investigation territory.  Floor lowered 1.00 \u2192 0.94 (= 0.9503 - 0.01) for current peer state."
       },
       "coherence_smoke_post_change": "12/12 PASS in 88.7s",
       "coherence_matrix_post_change": "EXACT=6 COHERENT=6 GIBBERISH=0 in 88.8s",
-      "summary_verdict": "SHIP — apex +1.45pp AND 27b +0.73pp both validated; gemma stable; dwq46 peer drift documented and isolated.  Standing user rule 'as or more faster than peers' STILL HOLDS at 3 of 4 fixtures (apex, 27b, gemma); dwq46 deferred to iter52 root-cause."
+      "summary_verdict": "SHIP \u2014 apex +1.45pp AND 27b +0.73pp both validated; gemma stable; dwq46 peer drift documented and isolated.  Standing user rule 'as or more faster than peers' STILL HOLDS at 3 of 4 fixtures (apex, 27b, gemma); dwq46 deferred to iter52 root-cause."
     }
+  },
+  "_iter57_partial_2026_04_30T18_30Z": {
+    "status": "PARTIAL",
+    "lever": "cross-layer encoder coalesce (MoeQ joins fused-encoder path)",
+    "lever_falsified_for_prefill": true,
+    "commit": "c2d7ac3",
+    "prefill_q4_0_flat": {
+      "before": 0.2194,
+      "after": 0.2202,
+      "delta_pp": 0.08,
+      "target": 0.4,
+      "verdict": "FAIL"
+    },
+    "decode_27b_dwq46": {
+      "iter56": 1.075,
+      "iter57": 1.0884,
+      "verdict": "PASS"
+    },
+    "decode_apex_q5k": {
+      "iter56_same_day": 1.1062,
+      "iter57": 1.1072,
+      "verdict": "PASS"
+    },
+    "decode_q4_0_flat": {
+      "iter56": 1.0457,
+      "iter57": 1.0457,
+      "verdict": "PASS_unchanged"
+    },
+    "parity": "8/8 token-byte-identical smoke",
+    "tests": "241/241",
+    "iter58_redirect": "FA K/V GPU copy + DN state GPU writeback + qkv_split wait removal"
   }
 }
