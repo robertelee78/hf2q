@@ -1367,6 +1367,30 @@ subsection.)
 - `mlx-native@adf7ee0` is the read-only reference for `GraphSession` /
   `CommandEncoder` semantics per ADR-014 fence.
 
+## iter60 fix plan — Q4_0 matmul kernel parity vs llama.cpp
+
+Evidence base: `cfdea4a` peer-repo + goalie research (4-agent, 90% consensus). hf2q `kernel_mul_mm_q4_0_tensor_f32` 191µs/dispatch vs llama.cpp `kernel_mul_mm_q4_0_f32` 169µs (+13%). Three structural gaps identified in `quantized_matmul_mm.metal` + `quantized_matmul_mm_tensor.metal`:
+
+| Sub-iter | Gap | File:line | Est win | Approach |
+|---|---|---|---|---|
+| **iter60a** (PRIMARY) | B-stage per-element store; missing 8-wide vector path for aligned shapes | `mlx-native/src/shaders/quantized_matmul_mm.metal:287-305` | **+5-10pp** | Add `FC_mul_mm_bc_inp` function constant; gate vector path `*(threadgroup S1_2x4 *)(...) = (S1_2x4)(*((device T1_2x4 *) y))` on K%NK==0 + N%32==0 (matching llama.cpp:9569) |
+| **iter60b** (SECONDARY) | f32→half cast in tensor variant B-stage adds 1024 fp32→fp16 ops per K-iteration | `mlx-native/src/shaders/quantized_matmul_mm_tensor.metal:285-287` | **+2-5pp** | Stage B as f32; cast to half at `mpp::tensor_ops::matmul2d<>` call site; verify tensor cores still engage |
+| **iter60c** (TERTIARY) | Always-on bounds-check; missed compile-time elimination | `mlx-native/src/shaders/quantized_matmul_mm.metal:24` | **+0.5-1pp** | Mirror llama.cpp: `FC_mul_mm_bc_inp` + `FC_mul_mm_bc_out` function constants gating bounds-check vs aligned paths |
+
+**Combined estimated upside:** +7.5-16pp prefill at apex q4_0-flat. Cold-clean baseline 0.319× → potential 0.394-0.479×. Still leaves residual gap to ≥1.00× exit — likely structural (kernel not the only limit; encoder + dispatch overhead matter at high token counts).
+
+**MANDATORY pre-merge gates** (per iter58b lesson + user "test test test — no more regressions"):
+- (a) **Sourdough coherence on apex q4_0-flat** — the iter58b-broken fixture; 200+ tok generation diff vs llama-completion bytes-prefix ≥3000 bytes
+- (b) **Sourdough coherence on 27B dwq46** — second fixture, catches different failure modes
+- (c) `cargo test --release qwen35::` — 254/254
+- (d) **16-prompt × 32-tok byte-identical smoke** vs HEAD-pre-iter60
+- (e) **Cold-SoC paired prefill bench** (3 trials × pp4096 × 60s settle, mcp-brain-server SIGSTOP'd) — same-day Δpp ≥+5pp on apex q4_0-flat
+- (f) **4-fixture decode no-regression** (27B dwq46 ≥1.05×, apex Q5_K ≥1.07×, q4_0-flat ≥1.04×, gemma if available)
+- (g) **NO new `unsafe`** in mlx-native or hf2q
+- (h) `cargo build --release` clean both repos
+
+If ANY gate fails → revert + investigate; do NOT silently downgrade.
+
 ## Open questions / risks
 
 | ID | Risk / open question | Mitigation |
