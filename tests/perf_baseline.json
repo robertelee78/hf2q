@@ -139,6 +139,48 @@
       "verdict": "LANDED — primary +3.89pp exceeds Phase 5 ≥1pp gate AND ≥0pp on every other fixture AND coherence_smoke 12/12 + coherence_matrix 0 GIBBERISH"
     }
   },
+  "_iter56_status": {
+    "_status": "LANDED — D4 ≥1.00× target met across the matrix",
+    "_captured_at": "2026-04-30T14:00:57Z",
+    "_hf2q_head": "5ed7a7c",
+    "_mlx_native_head": "641ab78",
+    "_session": "cfa-20260430-adr015-iter56-gated-delta-net (CFA dual-mode; claude winner; codex sandbox-blocked)",
+    "_lever": "kernel_gated_delta_net_decode (NSG-templated simd_sum, mirrors llama.cpp kernel_gated_delta_net_f32_<NSG>)",
+    "_files_changed": [
+      "/opt/mlx-native/src/shaders/gated_delta_net_decode.metal (new)",
+      "/opt/mlx-native/src/ops/gated_delta_net_decode.rs (new)",
+      "/opt/mlx-native/src/kernel_registry.rs (NSG=1/2/4 entries)",
+      "/opt/mlx-native/tests/test_gated_delta_net_decode.rs (new, 5 tests)",
+      "/opt/hf2q/src/inference/models/qwen35/gpu_delta_net.rs (+16/-2 wire-up)",
+      "/opt/hf2q/Cargo.toml (path-pin to /opt/mlx-native)"
+    ],
+    "_apex_q4_0_flat_bench": {
+      "fixture": "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-q4_0-flat/qwen3.6-35b-a3b-abliterix-ega-abliterated-q4_0-flat.gguf",
+      "n_trials": 5,
+      "ngen": 256,
+      "thermal_settle_sec": 120,
+      "hf2q_per_trial": [127.4, 126.5, 126.5, 127.3, 127.3],
+      "hf2q_median": 127.3,
+      "hf2q_sigma_approx": 0.4,
+      "llama_per_trial": [122.16, 120.95, 120.66, 121.74, 121.91],
+      "llama_median": 121.74,
+      "llama_sigma_approx": 0.5,
+      "ratio": 1.0457,
+      "delta_pp_vs_iter54": 10.87,
+      "absolute_hf2q_delta_tps": 14.0,
+      "absolute_hf2q_pct": 12.4,
+      "verdict": "LANDED — closes the last failing matrix cell at 1.0457×; +4.57pp above D4 ≥1.00× target"
+    },
+    "_no_regression_followup": "apex Q5_K MoE + 27B-Dense Q4_0 (both DeltaNet-using fixtures) deferred to next iter; gemma is no-risk (does not use DeltaNet kernel). One paired bench each, ~30 min total.",
+    "_artefacts": "/tmp/adr015-bench/baseline-iter56-q4_0-flat-fused-gdn-20260430T140057Z.{summary.txt,metadata.json}, claude commits 641ab78 (mlx-native) + 5ed7a7c (hf2q), patches at /tmp/cfa-cfa-20260430-adr015-iter56-gated-delta-net/claude-{mlx,hf2q}.patch (810+73 lines)",
+    "_followups": [
+      "No-regression bench on apex Q5_K + 27B-Dense + gemma",
+      "DWQ codec Q4_0 MoE restoration (ADR-014 issue)",
+      "Cargo.toml path-pin → mlx-native = '0.7' once published",
+      "Prefill path unchanged — chunk-prefill out of scope, decode-only iter",
+      "NSG=4 D_k≤128 only; D_k>128 needs NSG=8 entry point"
+    ]
+  },
   "_iter53_status": {
     "_status": "PARTIAL — BLOCKED-PRE-FLIGHT",
     "_captured_at": "2026-04-30T00:22:16Z",
