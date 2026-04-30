@@ -303,12 +303,15 @@ enum FfnQuantArm {
 /// Pure lookup function — does NOT touch GPU buffers, easy to unit-test.
 ///
 /// Decision matrix (iter26 N-curve + iter27 GPU TS + iter29 capture wall;
-/// iter45-RESUMED N-curve recapture on coherent baseline 2026-04-29):
+/// iter45-RESUMED N-curve recapture on coherent baseline 2026-04-29;
+/// iter51 small deferred chain_n promotions 2026-04-29):
 ///
 ///   - DenseQ + Q4_K (any K-quant Q4_K subtype):       cn = 4
+///   - DenseQ + Q4_0 (27b-dwq46 dense blocks):         cn = 4  (iter51)
 ///   - MoeQ   + Q4_K:                                  cn = 2
 ///   - MoeQ   + Q4_0 (DWQ46/DWQ48 production blocks):  cn = 2  (iter45-RESUMED)
-///   - MoeQ   + Q5_K / Q6_K (super-block):             cn = 1  (apex flat-negative)
+///   - MoeQ   + Q5_K (apex MoE):                       cn = 2  (iter51)
+///   - MoeQ   + Q6_K (super-block):                    cn = 1  (apex flat-negative)
 ///   - any other (F32/BF16/F16/Q8_0/I16, etc.):        cn = 1
 ///
 /// **iter45-RESUMED (2026-04-29) Q4_0 MoE arm rationale.**  iter47 surfaced
@@ -333,10 +336,18 @@ fn chain_n_for(
     use mlx_native::ops::quantized_matmul_ggml::GgmlType;
     match (arm, quant) {
         (FfnQuantArm::DenseQ, Some(GgmlType::Q4_K)) if !cfg_is_moe => 4,
+        // iter51: 27b-dwq46 stores dense Q4_0; iter45-RESUMED N-curve cn=4 wins
+        // (+0.70pp vs cn=1 catch-all; ties cn=8).  Promoted in iter51 (small
+        // deferred chain_n promotion) once gemma fix at iter50 cleared all 4
+        // fixtures past the parity gate; remaining lever is "maximize lead".
+        (FfnQuantArm::DenseQ, Some(GgmlType::Q4_0)) if !cfg_is_moe => 4,
         (FfnQuantArm::MoeQ, Some(GgmlType::Q4_K)) if cfg_is_moe => 2,
         // iter45-RESUMED: DWQ46/DWQ48 store as Q4_0; cn=2 measured optimum (+6.75pp on dwq46).
         (FfnQuantArm::MoeQ, Some(GgmlType::Q4_0)) if cfg_is_moe => 2,
-        (FfnQuantArm::MoeQ, Some(GgmlType::Q5_K)) if cfg_is_moe => 1,
+        // iter51: apex Q5_K MoE — iter45-RESUMED N-curve cn=2 wins (+1.47pp vs
+        // cn=1).  Sister-fixture deferral lifted in iter51 once all 4 fixtures
+        // pass parity gate; remaining lever is "maximize lead".
+        (FfnQuantArm::MoeQ, Some(GgmlType::Q5_K)) if cfg_is_moe => 2,
         (FfnQuantArm::MoeQ, Some(GgmlType::Q6_K)) if cfg_is_moe => 1,
         // Any other quant class, F32-arm, or arm/cfg mismatch → conservative cn=1.
         _ => 1,
@@ -3106,12 +3117,16 @@ mod tests {
     }
 
     #[test]
-    fn chain_n_for_apex_moe_q5km_returns_1() {
-        // 35B-apex (MoE Q5_K_M): cn=1 — cn≥2 regressed at every N (-3.47pp at cn=2).
+    fn chain_n_for_apex_moe_q5_k_returns_2() {
+        // iter51 (2026-04-29): 35B-apex (MoE Q5_K_M) — iter45-RESUMED N-curve
+        // measured cn=2 optimum (+1.47pp vs cn=1 = 1.0628× vs 1.0481×).  Initially
+        // deferred at iter45 because apex was a sister fixture (no primary win to
+        // anchor); promoted at iter51 once all 4 fixtures cleared parity gate
+        // and the remaining lever became "maximize lead per standing user rule".
         use mlx_native::ops::quantized_matmul_ggml::GgmlType;
         assert_eq!(
             chain_n_for(FfnQuantArm::MoeQ, Some(GgmlType::Q5_K), true),
-            1
+            2
         );
     }
 
@@ -3128,17 +3143,31 @@ mod tests {
     #[test]
     fn chain_n_for_unknown_quant_returns_1() {
         // Q8_0, F32, F16: conservative cn=1 (no measured win).
-        // Q4_0 has fixture-specific arms (DenseQ Q4_0 dense → cn=1 catch-all,
+        // Q4_0 has fixture-specific arms (DenseQ Q4_0 → cn=4 per iter51,
         // MoeQ Q4_0 → cn=2 per iter45-RESUMED N-curve evidence).  See dedicated
-        // test below.
+        // tests below.
         use mlx_native::ops::quantized_matmul_ggml::GgmlType;
-        assert_eq!(
-            chain_n_for(FfnQuantArm::DenseQ, Some(GgmlType::Q4_0), false),
-            1
-        );
         assert_eq!(
             chain_n_for(FfnQuantArm::MoeQ, Some(GgmlType::Q8_0), true),
             1
+        );
+        assert_eq!(
+            chain_n_for(FfnQuantArm::DenseQ, Some(GgmlType::Q8_0), false),
+            1
+        );
+    }
+
+    #[test]
+    fn chain_n_for_27b_dense_q4_0_returns_4() {
+        // iter51 (2026-04-29): 27b-dwq46 (dense Q4_0 per iter47) — iter45-RESUMED
+        // N-curve measured cn=4 optimum, ties cn=8 at +0.70pp vs cn=1 catch-all
+        // (1.0400× vs 1.0330×).  Initially deferred at iter45 because +0.70pp
+        // failed the ≥1pp Phase 5 gate; promoted at iter51 once all 4 fixtures
+        // cleared parity gate and the remaining lever became "maximize lead".
+        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+        assert_eq!(
+            chain_n_for(FfnQuantArm::DenseQ, Some(GgmlType::Q4_0), false),
+            4
         );
     }
 
