@@ -226,8 +226,38 @@ fn detect_hardware_info() -> (String, u64) {
 
 /// Hardcoded fallback chat template used ONLY when no GGUF-embedded template
 /// exists and the user has not passed `--chat-template` / `--chat-template-file`.
+///
+/// **CLI `generate` path only.** This template uses a literal `{{PROMPT}}`
+/// placeholder consumed by `String::replace` (see `render_chat_template`
+/// below). It is NOT compatible with the API path's minijinja rendering
+/// (which iterates a `messages` array). The API path uses
+/// [`FALLBACK_GEMMA4_API_CHAT_TEMPLATE`] instead.
 pub(crate) const FALLBACK_GEMMA4_CHAT_TEMPLATE: &str =
     "<bos><|turn>system\n<|think|><turn|>\n<|turn>user\n{{PROMPT}}<turn|>\n<|turn>model\n";
+
+/// Hardcoded fallback chat template for the **API path** (consumed by
+/// `src/serve/api/engine.rs::render_chat_prompt_with_tools` via minijinja).
+///
+/// Iterates the `messages` array so `{{m.content}}` actually renders the
+/// caller's user content. The CLI fallback (`FALLBACK_GEMMA4_CHAT_TEMPLATE`)
+/// uses a literal `{{PROMPT}}` placeholder consumed by `String::replace`,
+/// which minijinja treats as an undefined variable — multi-thousand-token
+/// user prompts collapsed to ~14 tokens of boilerplate when the GGUF
+/// shipped no embedded template (observed in ADR-017 Phase A0.2b matrix
+/// run, all SwapBackInSameCtx cells; the chat-template miss is the root
+/// cause of the flat no_cache_ttft sweep that broke ship-gate ratios).
+///
+/// The role mapping mirrors `render_chat_prompt_with_tools`'s
+/// `assistant→model` remap (`<|turn>model` is the assistant marker for
+/// Gemma 4); the legacy CLI template embeds a system + `<|think|>`
+/// preamble which is tokenization-equivalent across single-turn rounds.
+pub(crate) const FALLBACK_GEMMA4_API_CHAT_TEMPLATE: &str = concat!(
+    "<bos>",
+    "{%- for m in messages -%}",
+    "<|turn>{{ m.role }}\n{{ m.content }}<turn|>\n",
+    "{%- endfor -%}",
+    "<|turn>model\n",
+);
 
 /// Resolve the chat template per ADR-005 Phase 1 priority order:
 ///
