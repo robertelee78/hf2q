@@ -17,10 +17,15 @@
 pub mod block_store;
 pub mod format;
 pub mod index;
+pub mod recovery;
 pub mod writer;
 
 #[allow(unused_imports)]
 pub use block_store::{DiskBlockStore, WriteJob, MAX_BLOCK_BYTES};
+#[allow(unused_imports)]
+pub use recovery::{
+    quarantine_corrupted_block, recover_from_disk, QuarantineReason, RecoveryReport,
+};
 #[allow(unused_imports)]
 pub use writer::{AsyncWriterHandle, DEFAULT_CHANNEL_CAPACITY};
 #[allow(unused_imports)]
