@@ -1582,7 +1582,24 @@ fn matrix_max_prefix_override() -> Option<u32> {
 
 // ---------------------------------------------------------------------------
 // Ship / coherence / overhead gate assertions.
+//
+// Phase A0.2a evaluates these against measured CellResult fields when the
+// matrix has been driven via the subprocess driver. Cells whose perf
+// fields are still NaN (default smoke run, or matrix run with no model
+// fixture available) short-circuit with a single diagnostic line per
+// gate so the matrix body is not a sea of repeated eprintlns.
 // ---------------------------------------------------------------------------
+
+/// True when at least one cell has finite TTFT measurements — i.e. the
+/// matrix was driven via the subprocess driver, not just the A0.1
+/// fixture-only path. Gates short-circuit with a single diagnostic when
+/// this is false, instead of asserting on placeholder NaN fields.
+fn matrix_was_measured(results: &[CellResult]) -> bool {
+    results.iter().any(|r| {
+        r.ran
+            && (r.no_cache_ttft_ms.is_finite() || r.cache_hit_ttft_ms.is_finite())
+    })
+}
 
 /// R-P4, R-P5, R-P6 — the three "ship gates" out of ADR-017 §Performance
 /// requirements. Each gate is a hard assertion on a specific cell shape.
@@ -1590,7 +1607,22 @@ fn matrix_max_prefix_override() -> Option<u32> {
 /// NaN (placeholder) so the assertion is "skipped with diagnostic" until
 /// A0.2 fills the perf measurements. This is a spec choice, not a stub:
 /// the A0.1 deliverable is the substrate; A0.2 is the measurement.
+///
+/// A0.2a evaluates each gate against measured fields. The matrix runner
+/// emits a single summary diagnostic when the matrix has not been
+/// measured (no E2E gate / no model fixture); per-cell skip noise is
+/// suppressed.
 pub fn assert_ship_gates(results: &[CellResult]) {
+    if !matrix_was_measured(results) {
+        eprintln!(
+            "ship_gates: matrix not measured (HF2Q_KV_PERSIST_E2E + model \
+             fixture required); skipping R-P4/R-P5/R-P6 with diagnostic. \
+             A0.1/A0.2a substrate semantics: gates assert when measured \
+             fields are present."
+        );
+        return;
+    }
+
     // R-P4 — scenario (e), prefix=32K, gemma4 dense. Ratio cap 0.20.
     let r_p4 = results.iter().find(|r| {
         r.ran
@@ -1605,16 +1637,21 @@ pub fn assert_ship_gates(results: &[CellResult]) {
             assert!(
                 ratio <= 0.20,
                 "R-P4 FAILED: ratio={ratio:.3} > 0.20 at {label}; \
-                 cache_hit_ttft={a}ms no_cache_ttft={b}ms",
+                 cache_hit_ttft={a:.1}ms no_cache_ttft={b:.1}ms",
                 label = r.cell.label(),
                 a = r.cache_hit_ttft_ms,
                 b = r.no_cache_ttft_ms,
             );
-        } else {
             eprintln!(
-                "R-P4: substrate placeholder (NaN perf fields) — A0.2 will fill"
+                "R-P4 PASS: ratio={ratio:.3} <= 0.20 at {label} \
+                 (cache_hit={a:.1}ms / no_cache={b:.1}ms)",
+                label = r.cell.label(),
+                a = r.cache_hit_ttft_ms,
+                b = r.no_cache_ttft_ms,
             );
         }
+    } else {
+        eprintln!("R-P4: no L32K SwapBackInSameCtx Gemma4 dense cell present");
     }
 
     // R-P5 — scenario (a), prefix=32K, ssd_cold_post_restart, dense gemma4. Ratio ≤ 0.15.
@@ -1634,9 +1671,9 @@ pub fn assert_ship_gates(results: &[CellResult]) {
                 "R-P5 FAILED: ratio={ratio:.3} > 0.15 at {label}",
                 label = r.cell.label(),
             );
-        } else {
             eprintln!(
-                "R-P5: substrate placeholder (NaN perf fields) — A0.2 will fill"
+                "R-P5 PASS: ratio={ratio:.3} <= 0.15 at {label}",
+                label = r.cell.label(),
             );
         }
     }
@@ -1657,10 +1694,6 @@ pub fn assert_ship_gates(results: &[CellResult]) {
                 ratio = r.shared_prefix_ratio,
                 label = r.cell.label(),
             );
-        } else {
-            eprintln!(
-                "R-P6: substrate placeholder (NaN perf fields) — A0.2 will fill"
-            );
         }
     }
 }
@@ -1669,7 +1702,15 @@ pub fn assert_ship_gates(results: &[CellResult]) {
 /// max-abs-diff), R-C4 (sourdough byte-exact). A0.1 substrate executes
 /// R-C1 against the fixture; the other coherence gates are placeholders
 /// that A0.2/A0.3 fill.
+///
+/// R-C1 is asserted on every runnable cell regardless of whether the
+/// matrix was driven via the subprocess driver — the K/V byte hash
+/// round-trip is a fixture-side invariant that the driver path doesn't
+/// affect.
 pub fn assert_coherence_gates(results: &[CellResult]) {
+    let mut r_c1_pass = 0u32;
+    let mut r_c2_pass = 0u32;
+    let mut r_c3_pass = 0u32;
     for r in results.iter().filter(|r| r.ran) {
         if matches!(r.cell.kv_path, KvPath::Dense) {
             assert_eq!(
@@ -1680,6 +1721,7 @@ pub fn assert_coherence_gates(results: &[CellResult]) {
                 pre = r.kv_sha256_pre,
                 post = r.kv_sha256_post,
             );
+            r_c1_pass += 1;
         }
         if matches!(r.cell.kv_path, KvPath::TqActive) && r.tq_cosine.is_finite() {
             assert!(
@@ -1688,6 +1730,7 @@ pub fn assert_coherence_gates(results: &[CellResult]) {
                 c = r.tq_cosine,
                 label = r.cell.label(),
             );
+            r_c2_pass += 1;
         }
         if r.first_token_max_abs_diff.is_finite() {
             assert!(
@@ -1696,13 +1739,25 @@ pub fn assert_coherence_gates(results: &[CellResult]) {
                 d = r.first_token_max_abs_diff,
                 label = r.cell.label(),
             );
+            r_c3_pass += 1;
         }
     }
+    eprintln!(
+        "coherence_gates: R-C1 PASS on {r_c1_pass} dense cells; \
+         R-C2 evaluated on {r_c2_pass} TQ cells; \
+         R-C3 evaluated on {r_c3_pass} cells with measured logit diff"
+    );
 }
 
 /// R-P1 — decode tok/s with cache-enabled-but-not-hit ≤ 1% regression.
-/// A0.1 placeholder; A0.2 fills.
+/// A0.2a evaluates this against measured decode tok/s; cells with NaN
+/// decode fields short-circuit with a single summary diagnostic.
 pub fn assert_decode_regression(results: &[CellResult]) {
+    if !matrix_was_measured(results) {
+        eprintln!("decode_regression: matrix not measured; skipping R-P1");
+        return;
+    }
+    let mut evaluated = 0u32;
     for r in results.iter().filter(|r| r.ran) {
         if r.decode_tok_s_no_cache.is_finite() && r.decode_tok_s_cache_enabled_miss.is_finite()
         {
@@ -1710,16 +1765,32 @@ pub fn assert_decode_regression(results: &[CellResult]) {
                 / r.decode_tok_s_no_cache;
             assert!(
                 regression <= 0.01,
-                "R-P1 FAILED: decode regression={r:.4} > 1% at {label}",
-                r = regression,
+                "R-P1 FAILED: decode regression={reg:.4} > 1% at {label}; \
+                 no_cache={a:.2} tok/s, cache_enabled={b:.2} tok/s",
+                reg = regression,
                 label = r.cell.label(),
+                a = r.decode_tok_s_no_cache,
+                b = r.decode_tok_s_cache_enabled_miss,
             );
+            evaluated += 1;
         }
     }
+    eprintln!("decode_regression: R-P1 PASS on {evaluated} cells (≤1% regression)");
 }
 
 /// R-P2 (`insert <= load`), R-P3 (`pre_evict <= 200ms` at 128 blocks).
+///
+/// R-P2 only fires for cells where the matrix runner captured BOTH the
+/// HotSwapManager::insert wall and the comparator load wall — i.e.
+/// scenario (b)/(e) cells driven via measure_swap_eviction_cycle.
+///
+/// R-P3 fires on every L32K cell regardless of the E2E gate — pre_evict
+/// is fixture-side (synthetic spiller) and the cap protects the matrix
+/// runner from a bug in BlockStore::write_block that would otherwise
+/// silently inflate the synchronous-evict wall on the production path.
 pub fn assert_overhead_gates(results: &[CellResult]) {
+    let mut r_p2_eval = 0u32;
+    let mut r_p3_eval = 0u32;
     for r in results.iter().filter(|r| r.ran) {
         // R-P2 — only meaningful when both wall measurements landed.
         if r.insert_ms.is_finite() && r.load_ms.is_finite() {
@@ -1730,6 +1801,7 @@ pub fn assert_overhead_gates(results: &[CellResult]) {
                 l = r.load_ms,
                 label = r.cell.label(),
             );
+            r_p2_eval += 1;
         }
         // R-P3 — synchronous pre_evict ≤ 200 ms at 128-block (32K) spill.
         if matches!(r.cell.prefix_len, PrefixLen::L32K) && r.pre_evict_ms.is_finite() {
@@ -1739,8 +1811,13 @@ pub fn assert_overhead_gates(results: &[CellResult]) {
                 p = r.pre_evict_ms,
                 label = r.cell.label(),
             );
+            r_p3_eval += 1;
         }
     }
+    eprintln!(
+        "overhead_gates: R-P2 PASS on {r_p2_eval} cells (insert<=load); \
+         R-P3 PASS on {r_p3_eval} L32K cells (pre_evict<=200ms)"
+    );
 }
 
 // ---------------------------------------------------------------------------
