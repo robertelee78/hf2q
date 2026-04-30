@@ -51,7 +51,7 @@ use super::gpu_delta_net::{
 };
 use super::gpu_ffn::{
     build_dense_ffn_layer_gpu, build_dense_ffn_layer_gpu_q_into,
-    build_dense_ffn_layer_gpu_q_split_profile, build_moe_ffn_layer_gpu, build_moe_ffn_layer_gpu_q,
+    build_dense_ffn_layer_gpu_q_split_profile, build_moe_ffn_layer_gpu,
     build_moe_ffn_layer_gpu_q_into, DenseFfnWeightsGpu, DenseFfnWeightsGpuQ, MoeFfnWeightsGpu,
     MoeFfnWeightsGpuQ,
 };
@@ -1403,7 +1403,20 @@ impl Qwen35Model {
             // W-5b.16 sunset: the `HF2Q_DENSE_Q_LEGACY` env gate was removed
             // after a 30/30 cross-path parity audit at PP4106; DenseQ now
             // unconditionally takes the fused path.
+            //
+            // ADR-015 iter57: extend the fused-encoder pattern to MoeQ.
+            // The existing `build_moe_ffn_layer_gpu_q_into` already takes
+            // `&mut CommandEncoder` and does NOT commit (added in iter40
+            // territory).  At prefill (seq_len > 1), MoeQ's out_buf is
+            // `device.alloc_buffer` (line 1989 of gpu_ffn.rs — iter40 fix
+            // for residual-stream aliasing), so the cross-encoder
+            // residual handoff to the next layer's `hidden` is safe.
+            // Saves 1 commit_and_wait per MoE layer × N MoE layers per
+            // prefill chunk (e.g. 30 DN-MoE + 10 FA-MoE = 40 saved per
+            // pp4096 chunk on apex 35B-A3B-MoE).
             let denseq_fused_eligible = matches!(ffn_weights_gpu_peek, FfnWeightsGpu::DenseQ(_));
+            let moeq_fused_eligible = matches!(ffn_weights_gpu_peek, FfnWeightsGpu::MoeQ(_));
+            let any_fused_eligible = denseq_fused_eligible || moeq_fused_eligible;
 
             // Allocate the two outputs up-front (live past the encoder).
             let ffn_input_buf = device
@@ -1439,15 +1452,21 @@ impl Qwen35Model {
                     eps,
                 )
                 .with_context(|| format!("dispatch_fused_residual_norm_f32 layer {layer_idx}"))?;
-                if denseq_fused_eligible {
-                    // Keep the encoder open; the DenseQ branch below will
-                    // dispatch the FFN body into the same command buffer
+                if any_fused_eligible {
+                    // Keep the encoder open; the DenseQ / MoeQ branch below
+                    // will dispatch the FFN body into the same command buffer
                     // and commit_and_wait once at the end.  Saves the
                     // inter-encoder GPU sync barrier per layer.
+                    //
+                    // ADR-015 iter57: MoeQ now joins DenseQ in this fused
+                    // path (was 2-encoder pre-iter57).  The MoeQ FFN reads
+                    // ffn_input + ffn_residual via the same encoder; the
+                    // memory_barrier below enforces the RAW dependency
+                    // (fused_residual_norm writes → MoeQ FFN reads).
                     enc.memory_barrier();
                     (ffn_residual_buf, ffn_input_buf, Some(enc))
                 } else {
-                    // Legacy 2-encoder path for Dense (F32) / Moe / MoeQ.
+                    // Legacy 2-encoder path for Dense (F32) / Moe (F32-MoE).
                     // commit() without wait — Metal serial queue guarantees
                     // ordering; the FFN commit_and_wait() provides the
                     // eventual sync.
@@ -1573,7 +1592,7 @@ impl Qwen35Model {
                     out
                 }
                 FfnWeightsGpu::Moe(w_gpu) => {
-                    debug_assert!(fused_enc.is_none(), "Moe path uses 2-encoder");
+                    debug_assert!(fused_enc.is_none(), "F32-Moe path uses 2-encoder");
                     let moe = cfg
                         .moe
                         .as_ref()
@@ -1596,10 +1615,16 @@ impl Qwen35Model {
                         .with_context(|| format!("moe_ffn layer {layer_idx}"))?
                 }
                 FfnWeightsGpu::MoeQ(w_gpu) => {
-                    debug_assert!(
-                        fused_enc.is_none(),
-                        "MoeQ path uses 2-encoder in chunk-prefill"
-                    );
+                    // ADR-015 iter57: MoeQ now uses the fused-encoder path
+                    // (was 2-encoder pre-iter57).  `fused_enc` is guaranteed
+                    // Some here because `moeq_fused_eligible` matched MoeQ
+                    // above and the fused encoder branch ran.
+                    let mut enc = fused_enc.take().ok_or_else(|| {
+                        anyhow!(
+                            "MoeQ fused encoder missing at layer {layer_idx} \
+                                 (moeq_fused_eligible invariant violated)"
+                        )
+                    })?;
                     let moe = cfg
                         .moe
                         .as_ref()
@@ -1611,9 +1636,16 @@ impl Qwen35Model {
                         moe_intermediate_size: moe.moe_intermediate_size,
                         shared_intermediate_size: moe.shared_expert_intermediate_size,
                     };
-                    // Pass ffn_residual so the MoE FFN can fold the post-FFN
-                    // residual add into its CPU combine step, saving 1 GPU commit.
-                    build_moe_ffn_layer_gpu_q(
+                    // Encode the entire MoE FFN (router + shared expert + gated
+                    // expert projections + softmax_topk + silu_mul + weighted
+                    // reduce + fused residual add) into the same command buffer
+                    // as fused_residual_norm above.  Single commit_and_wait per
+                    // MoE layer.  At prefill (seq_len > 1), the MoeQ output
+                    // buffer is `device.alloc_buffer` (gpu_ffn.rs line 1989,
+                    // iter40 fix), so it survives the per-layer pool reset
+                    // and can safely become the next layer's residual stream.
+                    let out = build_moe_ffn_layer_gpu_q_into(
+                        &mut enc,
                         &device,
                         &mut registry,
                         &ffn_input,
@@ -1621,7 +1653,16 @@ impl Qwen35Model {
                         shape,
                         Some(&ffn_residual),
                     )
-                    .with_context(|| format!("moe_ffn_q layer {layer_idx}"))?
+                    .with_context(|| format!("moe_ffn_q_into fused layer {layer_idx}"))?;
+                    if seq_len == 1 {
+                        enc.commit();
+                    } else {
+                        enc.commit_and_wait_labeled("layer.moe_ffn")
+                            .with_context(|| {
+                                format!("commit fused-MoeQ layer {layer_idx}")
+                            })?;
+                    }
+                    out
                 }
             };
 
