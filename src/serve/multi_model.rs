@@ -577,6 +577,186 @@ impl ModelLoader<Engine> for DefaultModelLoader {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// KvSpiller — eviction-hook trait surface (ADR-005 Phase 4 reopen,
+// iter-212 / AC 5471).
+//
+// Pluggable hook into the manager's eviction + admission lifecycle so
+// ADR-017 (Persistent Block Prefix Cache for serve mode) can spill KV
+// blocks to disk on swap-out and restore them on swap-back-in WITHOUT
+// `HotSwapManager` taking a direct dependency on the persistence
+// implementation.  Mirrors the [`ModelLoader`] injection pattern: a
+// trait + a no-op default ([`NoopKvSpiller`]) + a production wire-up
+// substitution that lives in ADR-017's tree.
+//
+// Phase 4 reopen ships:
+//   - the trait + outcome / error enums + the no-op default
+//   - two trigger sites in `load_or_get` (pre-evict per evictee +
+//     post-admit on cold load)
+//   - one trigger site in `evict()` (symmetric pre-evict)
+//   - a `MockSpiller` test fixture (in the tests module) that mirrors
+//     the existing `MockLoader` shape
+//
+// ADR-017 ships:
+//   - the real `KvSpiller<Engine>` impl that talks to disk
+//   - the `cmd_serve --kv-persist` CLI flag that constructs the real
+//     spiller and feeds it through `HotSwapManager::new_with_spiller`
+//   - the telemetry counter increments that consume `SpillOutcome` /
+//     `RestoreOutcome` (zeroed surface lands iter-213 in this reopen)
+//
+// **Behavior with the noop spiller wired** is byte-identical to the
+// pre-iter-212 manager: the trigger sites call `spiller.pre_evict(...)`
+// / `spiller.post_admit(...)` and discard the outcome (`let _ =
+// outcome;`).  The 39 existing `serve::multi_model::tests` cases pass
+// UNCHANGED — proves the surface is non-disruptive.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Failure mode for [`SpillOutcome::Error`].  Carried separately from
+/// [`RestoreErrorKind`] because the spill path (snapshotting an in-memory
+/// KV block to disk) and the restore path (rehydrating + parity-checking
+/// a previously-spilled block) fail in disjoint ways even though both
+/// share the same broad categories (codec / IO / parity).
+///
+/// `Copy` so trigger-site call-sites can store the outcome in a local
+/// `let _ = ...` slot without an Arc wrapper; `Debug` so test assertions
+/// can match on a specific kind via `matches!(...)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpillErrorKind {
+    /// Codec-level failure: the in-memory KV block could not be encoded
+    /// to the on-disk envelope (e.g. dtype mismatch, layout drift).
+    CodecErr,
+    /// Filesystem failure: write / fsync / truncate refused (disk full,
+    /// permissions, EIO).
+    IoErr,
+    /// Parity check failure on a round-trip verify.
+    ParityFail,
+}
+
+/// Failure mode for [`RestoreOutcome::Error`].  Symmetric to
+/// [`SpillErrorKind`] for the restore path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreErrorKind {
+    /// Codec-level failure: the on-disk envelope could not be decoded
+    /// back to the in-memory KV layout (envelope version drift, header
+    /// mismatch, truncated body).
+    CodecErr,
+    /// Filesystem failure: read / open refused (file vanished, EIO).
+    IoErr,
+    /// Parity check failure: the restored KV bytes did not match the
+    /// recorded SHA / checksum.  Treated as a hard restore-fail; the
+    /// engine continues without the spilled cache (re-prefill on demand).
+    ParityFail,
+}
+
+/// Result of [`KvSpiller::pre_evict`].  The trigger site discards the
+/// outcome with `let _ = ...` in iter-212 (this iter); iter-213 wires
+/// each variant to a `/metrics` counter increment with a fixed
+/// `outcome` label cardinality (`success` / `codec_err` / `io_err` /
+/// `parity_fail` / `skipped`).
+///
+/// `Skipped` is the no-op default's outcome and is NOT a failure — it
+/// signals "no work was attempted" (the noop spiller has nothing to
+/// spill; ADR-017 may also short-circuit on heuristics like "block
+/// list empty" or "in-flight write quota exhausted").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpillOutcome {
+    /// No spill work was attempted.  The noop spiller returns this.
+    Skipped,
+    /// `N` KV blocks were enqueued for spill.  Block count is operator-
+    /// observable; the per-block byte count rides on a separate gauge
+    /// in ADR-017.
+    EnqueuedBlocks(u32),
+    /// Spill attempt failed.  Eviction proceeds regardless — the spill
+    /// is a best-effort hint, not a precondition.
+    Error(SpillErrorKind),
+}
+
+/// Result of [`KvSpiller::post_admit`].  Symmetric to [`SpillOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// No restore work was attempted.
+    Skipped,
+    /// `N` KV blocks were restored from the on-disk envelope.
+    RestoredBlocks(u32),
+    /// Restore attempt failed.  Admission proceeds regardless — the
+    /// restore is a best-effort hint, not a precondition.  The engine
+    /// will re-prefill on demand.
+    Error(RestoreErrorKind),
+}
+
+/// Eviction-hook trait surface for [`HotSwapManager`].
+///
+/// Two trigger sites:
+///
+/// - [`Self::pre_evict`] fires from `HotSwapManager::load_or_get` (per
+///   evicted handle, before the manager's `Arc<LoadedEngine<E>>` drops
+///   from the engines map) AND from `HotSwapManager::evict` (the
+///   explicit-evict path).  The Arc is still live at call time so an
+///   impl can snapshot live KV state without a race.
+/// - [`Self::post_admit`] fires from `HotSwapManager::load_or_get`
+///   between `loader.load()` returning an engine and the manager
+///   publishing the Arc into the engines map.  The Arc is freshly
+///   constructed and held by the manager only at call time, so an
+///   impl can rehydrate KV state into the engine before any handler
+///   sees it.
+///
+/// **Best-effort.**  The manager discards the returned outcome at the
+/// trigger site in iter-212 — eviction + admission proceed regardless
+/// of `Skipped` / `EnqueuedBlocks` / `Error`.  iter-213 wires the
+/// outcomes to `/metrics` counter increments.  An impl returning
+/// `Error(...)` does NOT block the manager's lifecycle.
+///
+/// **Send + Sync** because the manager is held inside an
+/// `Arc<RwLock<HotSwapManager<E>>>` (see `AppState::pool` at
+/// `src/serve/api/state.rs:202`); concurrent handlers may call
+/// `load_or_get` from multiple tokio tasks.
+pub trait KvSpiller<E>: Send + Sync {
+    /// Called BEFORE the manager drops its Arc<LoadedEngine<E>> from the
+    /// engines map.  The Arc is live; the impl may inspect engine state
+    /// (e.g. via interior mutability or worker-thread message-pass) to
+    /// snapshot any KV blocks worth spilling.
+    fn pre_evict(&self, handle: &LoadedHandle, engine: &Arc<LoadedEngine<E>>) -> SpillOutcome;
+
+    /// Called AFTER `loader.load()` succeeds and BEFORE the manager
+    /// publishes the Arc into its engines map.  The impl may rehydrate
+    /// KV blocks into the freshly-loaded engine.
+    fn post_admit(
+        &self,
+        repo: &str,
+        quant: QuantType,
+        engine: &Arc<LoadedEngine<E>>,
+    ) -> RestoreOutcome;
+}
+
+/// No-op default [`KvSpiller`] — every method returns `Skipped` and
+/// performs no work.  Wired by [`HotSwapManager::new`] (the back-compat
+/// 2-arg constructor) so behavior is byte-identical to pre-iter-212
+/// across every existing manager test.
+///
+/// ADR-017 substitutes this with a real impl via
+/// [`HotSwapManager::new_with_spiller`] when the operator passes
+/// `cmd_serve --kv-persist`.
+///
+/// Stateless; cheap to clone.  The manager holds it behind `Arc<dyn
+/// KvSpiller<E>>` so impls that need state (file handles, in-flight
+/// queues) compose without changing the wiring shape.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopKvSpiller;
+
+impl<E> KvSpiller<E> for NoopKvSpiller {
+    fn pre_evict(&self, _handle: &LoadedHandle, _engine: &Arc<LoadedEngine<E>>) -> SpillOutcome {
+        SpillOutcome::Skipped
+    }
+    fn post_admit(
+        &self,
+        _repo: &str,
+        _quant: QuantType,
+        _engine: &Arc<LoadedEngine<E>>,
+    ) -> RestoreOutcome {
+        RestoreOutcome::Skipped
+    }
+}
+
 /// Pool diagnostics — bytes used, count, capacity — surfaced for
 /// `/v1/models` extension fields and `/metrics` Prometheus output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -682,6 +862,14 @@ fn pool_key(repo: &str, quant: QuantType) -> String {
 pub struct HotSwapManager<E> {
     pool: LoadedPool,
     loader: Arc<dyn ModelLoader<E>>,
+    /// Eviction-hook surface (ADR-005 Phase 4 reopen iter-212 / AC 5471).
+    /// `Arc<dyn KvSpiller<E>>` parallel to the `ModelLoader<E>` field
+    /// above so ADR-017 can inject a disk-spilling impl without
+    /// `HotSwapManager` taking a direct dependency on the persistence
+    /// stack.  The 2-arg back-compat constructor [`Self::new`] defaults
+    /// this to `Arc::new(NoopKvSpiller)`; production substitutes via
+    /// [`Self::new_with_spiller`].
+    spiller: Arc<dyn KvSpiller<E>>,
     /// Parallel map keyed identically to the pool — holds the actual
     /// engine handles.  Invariant: `engines.contains_key(k) ==
     /// pool.get(k).is_some()` for every `k` after every `load_or_get` /
@@ -694,10 +882,35 @@ impl<E> HotSwapManager<E> {
     /// passes [`LoadedPool::from_hardware`] (or a fixed-budget pool
     /// for tests) and [`DefaultModelLoader`].  The manager starts
     /// empty; the first `load_or_get` admits the first engine.
-    pub fn new(pool: LoadedPool, loader: Arc<dyn ModelLoader<E>>) -> Self {
+    ///
+    /// Defaults the eviction-hook surface to [`NoopKvSpiller`].  Use
+    /// [`Self::new_with_spiller`] when ADR-017's persistence handler
+    /// (or a test fixture) needs to observe eviction + admission.
+    pub fn new(pool: LoadedPool, loader: Arc<dyn ModelLoader<E>>) -> Self
+    where
+        E: 'static,
+    {
+        Self::new_with_spiller(pool, loader, Arc::new(NoopKvSpiller))
+    }
+
+    /// Construct a new manager with an explicit [`KvSpiller`] impl
+    /// (ADR-005 Phase 4 reopen iter-212 / AC 5471).  ADR-017's
+    /// `cmd_serve --kv-persist` substitutes a disk-backed spiller via
+    /// this entry point; tests substitute a `MockSpiller` to assert
+    /// trigger-site invariants.
+    ///
+    /// The manager starts empty; the first `load_or_get` admits the
+    /// first engine and fires `spiller.post_admit(...)` between the
+    /// loader returning a fresh engine and the engines map publication.
+    pub fn new_with_spiller(
+        pool: LoadedPool,
+        loader: Arc<dyn ModelLoader<E>>,
+        spiller: Arc<dyn KvSpiller<E>>,
+    ) -> Self {
         Self {
             pool,
             loader,
+            spiller,
             engines: HashMap::new(),
         }
     }
@@ -748,9 +961,27 @@ impl<E> HotSwapManager<E> {
     /// was not in the pool — idempotent).  In-flight requests holding
     /// their own Arc clones keep the engine alive until they release;
     /// the pool slot becomes available immediately.
+    ///
+    /// **Eviction-hook trigger (iter-212 / AC 5471).**  Fires
+    /// `spiller.pre_evict(handle, &Arc<LoadedEngine<E>>)` BEFORE
+    /// `engines.remove(&k)` drops the manager's Arc.  The Arc is still
+    /// live at call time so the spiller may snapshot KV state without a
+    /// race.  The returned [`SpillOutcome`] is intentionally discarded
+    /// here in iter-212; iter-213 wires it into the
+    /// `hf2q_pool_kv_spills_total{outcome=...}` counter.
     pub fn evict(&mut self, repo: &str, quant: QuantType) -> u64 {
         let k = pool_key(repo, quant);
         let removed = self.pool.remove(&k);
+        // Eviction-hook trigger.  Fire BEFORE the manager's Arc drops
+        // from `engines` so the spiller observes a live Arc.  Lookup
+        // happens before remove() to capture the handle for the call;
+        // we only fire when both the pool AND the engines map agree
+        // the entry exists (the back-compat defensive `engines.remove`
+        // below covers the desync case without firing the hook).
+        if let (Some(handle), Some(arc)) = (removed.as_ref(), self.engines.get(&k).cloned()) {
+            let _outcome = self.spiller.pre_evict(handle, &arc);
+            // outcome surfaces to telemetry counters in iter-213
+        }
         // Drop the engines map entry symmetrically.  If the pool didn't
         // know about the key (already-evicted from a prior call), the
         // engines map shouldn't have it either by the invariant — but
@@ -836,11 +1067,33 @@ impl<E> HotSwapManager<E> {
         };
 
         for victim in evicted {
+            // Eviction-hook trigger (iter-212 / AC 5471).  Fire
+            // `pre_evict` per evictee BEFORE dropping the manager's Arc
+            // from `engines`, so the spiller observes a live Arc.  The
+            // returned outcome is intentionally discarded in iter-212;
+            // iter-213 wires it into the
+            // `hf2q_pool_kv_spills_total{outcome=...}` counter.  An
+            // `Error(...)` outcome MUST NOT block eviction — the spill
+            // is best-effort.
+            if let Some(arc) = self.engines.get(&victim.repo_id).cloned() {
+                let _outcome = self.spiller.pre_evict(&victim, &arc);
+                // outcome surfaces to telemetry counters in iter-213
+            }
             // Drop the manager's Arc — in-flight requests holding their
             // own clones keep the engine alive until they release; the
             // pool slot is already free.
             self.engines.remove(&victim.repo_id);
         }
+
+        // Admission-hook trigger (iter-212 / AC 5471).  Fire
+        // `post_admit` AFTER `loader.load()` returns and BEFORE the
+        // manager publishes the Arc into `engines`.  At call time the
+        // Arc is held only by the manager's local `loaded_engine`
+        // binding; the spiller may rehydrate KV state into the engine
+        // before any handler can observe it.  An `Error(...)` outcome
+        // MUST NOT block admission — the restore is best-effort.
+        let _outcome = self.spiller.post_admit(repo, quant, &loaded_engine);
+        // outcome surfaces to telemetry counters in iter-213
 
         self.engines.insert(k, Arc::clone(&loaded_engine));
         Ok(loaded_engine)
@@ -2107,5 +2360,543 @@ mod tests {
             survivors, CAPACITY,
             "exactly CAPACITY={CAPACITY} survivors expected post-join; got {survivors}"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ADR-005 Phase 4 reopen iter-212 (AC 5471) — KvSpiller trigger-site
+    // unit tests.  Mirrors the iter-208 W76 test density for HotSwapManager
+    // (14 in-binary unit tests under MockEngine + MockLoader) — these 9
+    // additional tests assert the trigger-site invariants for the new
+    // KvSpiller<E> hook surface.
+    //
+    // MockSpiller mirrors the MockEngine / MockLoader pattern at
+    // multi_model.rs:1175 (now post-iter-212 ~line 1295): atomic call
+    // counters + optional outcome injection per trigger so tests can
+    // exercise both the happy path AND the Skipped / Error paths without
+    // a real disk-backed spiller.  Captures Arc::strong_count at call
+    // time so the in-flight-Arc invariant from
+    // hotswap_pre_evict_fires_before_engine_drop has a load-bearing
+    // assertion.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Test fixture KvSpiller — mirrors MockEngine / MockLoader pattern.
+    /// Tracks per-trigger call counts and the Arc::strong_count snapshot
+    /// each call observed; tests can also inject a one-shot outcome
+    /// override via `set_pre_evict_outcome` / `set_post_admit_outcome` to
+    /// exercise the Skipped / Error paths.
+    struct MockSpiller {
+        pre_evict_calls: std::sync::atomic::AtomicU64,
+        post_admit_calls: std::sync::atomic::AtomicU64,
+        /// Each entry: (call_index, observed Arc::strong_count of
+        /// engine at trigger-site time).  Captured under a Mutex so
+        /// concurrent test paths (the multi-thread regression test)
+        /// can observe consistent snapshots.
+        pre_evict_strong_counts: std::sync::Mutex<Vec<(u64, usize)>>,
+        post_admit_strong_counts: std::sync::Mutex<Vec<(u64, usize)>>,
+        /// Optional outcome-injection slots.  When `Some(...)`, the
+        /// trigger returns the injected outcome instead of the default
+        /// `Skipped`.  Mirrors MockLoader::fail_on but per-trigger.
+        pre_evict_outcome: std::sync::Mutex<Option<SpillOutcome>>,
+        post_admit_outcome: std::sync::Mutex<Option<RestoreOutcome>>,
+    }
+
+    impl MockSpiller {
+        fn new() -> Self {
+            Self {
+                pre_evict_calls: std::sync::atomic::AtomicU64::new(0),
+                post_admit_calls: std::sync::atomic::AtomicU64::new(0),
+                pre_evict_strong_counts: std::sync::Mutex::new(Vec::new()),
+                post_admit_strong_counts: std::sync::Mutex::new(Vec::new()),
+                pre_evict_outcome: std::sync::Mutex::new(None),
+                post_admit_outcome: std::sync::Mutex::new(None),
+            }
+        }
+        fn pre_evict_count(&self) -> u64 {
+            self.pre_evict_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn post_admit_count(&self) -> u64 {
+            self.post_admit_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn set_pre_evict_outcome(&self, outcome: SpillOutcome) {
+            *self.pre_evict_outcome.lock().expect("lock") = Some(outcome);
+        }
+        fn set_post_admit_outcome(&self, outcome: RestoreOutcome) {
+            *self.post_admit_outcome.lock().expect("lock") = Some(outcome);
+        }
+        fn pre_evict_strong_counts_snapshot(&self) -> Vec<(u64, usize)> {
+            self.pre_evict_strong_counts.lock().expect("lock").clone()
+        }
+    }
+
+    impl ModelLoader<MockEngine> for MockSpiller {
+        // never used — only here to keep the test fixture compact.  The
+        // real loader is MockLoader; MockSpiller only impls KvSpiller.
+        fn load(&self, _path: &Path, _config: &EngineConfig) -> anyhow::Result<MockEngine> {
+            unreachable!("MockSpiller is not a loader")
+        }
+    }
+
+    impl KvSpiller<MockEngine> for MockSpiller {
+        fn pre_evict(
+            &self,
+            _handle: &LoadedHandle,
+            engine: &Arc<LoadedEngine<MockEngine>>,
+        ) -> SpillOutcome {
+            let n = self
+                .pre_evict_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            // Capture Arc::strong_count BEFORE returning so the test
+            // sees the live count at trigger-site time.
+            let sc = Arc::strong_count(engine);
+            self.pre_evict_strong_counts
+                .lock()
+                .expect("lock")
+                .push((n, sc));
+            self.pre_evict_outcome
+                .lock()
+                .expect("lock")
+                .unwrap_or(SpillOutcome::Skipped)
+        }
+        fn post_admit(
+            &self,
+            _repo: &str,
+            _quant: QuantType,
+            engine: &Arc<LoadedEngine<MockEngine>>,
+        ) -> RestoreOutcome {
+            let n = self
+                .post_admit_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let sc = Arc::strong_count(engine);
+            self.post_admit_strong_counts
+                .lock()
+                .expect("lock")
+                .push((n, sc));
+            self.post_admit_outcome
+                .lock()
+                .expect("lock")
+                .unwrap_or(RestoreOutcome::Skipped)
+        }
+    }
+
+    /// Helper: build a manager wired to a MockSpiller alongside the
+    /// existing MockLoader scaffolding.  Returns (manager, loader,
+    /// spiller) so tests can assert against any of them.
+    fn mgr_with_spiller(
+        capacity_models: usize,
+        memory_budget_bytes: u64,
+    ) -> (
+        HotSwapManager<MockEngine>,
+        Arc<MockLoader>,
+        Arc<MockSpiller>,
+    ) {
+        let loader = Arc::new(MockLoader::new());
+        let spiller = Arc::new(MockSpiller::new());
+        let pool = LoadedPool::with_capacity_and_budget(capacity_models, memory_budget_bytes);
+        let mgr = HotSwapManager::<MockEngine>::new_with_spiller(
+            pool,
+            loader.clone(),
+            spiller.clone(),
+        );
+        (mgr, loader, spiller)
+    }
+
+    /// 1/9: capacity-2 pool; admit 3 distinct repos; the third load
+    /// evicts the LRU.  Asserts MockSpiller::pre_evict_calls == 1
+    /// (single LRU evict; no double-fire).
+    #[test]
+    fn hotswap_pre_evict_fires_on_lru_eviction() {
+        let (mut mgr, _loader, spiller) = mgr_with_spiller(2, 1_000_000);
+        let f = synthetic_gguf(1_000);
+        let cfg = empty_config();
+
+        let _ = mgr
+            .load_or_get("a/1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("a");
+        let _ = mgr
+            .load_or_get("b/2", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("b");
+        // a/1 and b/2 admit clean — no eviction yet.
+        assert_eq!(
+            spiller.pre_evict_count(),
+            0,
+            "no eviction at capacity boundary; pre_evict must NOT fire"
+        );
+
+        let _ = mgr
+            .load_or_get("c/3", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("c");
+        // c/3 evicts a/1 (LRU) → exactly one pre_evict call.
+        assert_eq!(
+            spiller.pre_evict_count(),
+            1,
+            "exactly one pre_evict call expected on single LRU eviction"
+        );
+        assert!(mgr.try_get("a/1", QuantType::Q4_K_M).is_none());
+    }
+
+    /// 2/9: explicit evict() — `mgr.evict(repo, quant)` should also
+    /// fire pre_evict.  Symmetric to the LRU-eviction trigger.
+    #[test]
+    fn hotswap_pre_evict_fires_on_explicit_evict() {
+        let (mut mgr, _loader, spiller) = mgr_with_spiller(3, 100_000);
+        let f = synthetic_gguf(500);
+        let cfg = empty_config();
+
+        let _ = mgr
+            .load_or_get("acme/m1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("admit");
+        // pre_evict has not fired yet — only post_admit on cold load.
+        assert_eq!(spiller.pre_evict_count(), 0);
+        assert_eq!(spiller.post_admit_count(), 1);
+
+        let bytes_freed = mgr.evict("acme/m1", QuantType::Q4_K_M);
+        assert_eq!(bytes_freed, 500);
+        assert_eq!(
+            spiller.pre_evict_count(),
+            1,
+            "explicit evict() must fire pre_evict exactly once"
+        );
+
+        // Idempotent evict — second call is a no-op AND must NOT fire
+        // pre_evict (no live entry to spill).
+        let bytes_freed_2 = mgr.evict("acme/m1", QuantType::Q4_K_M);
+        assert_eq!(bytes_freed_2, 0);
+        assert_eq!(
+            spiller.pre_evict_count(),
+            1,
+            "idempotent evict() must NOT double-fire pre_evict"
+        );
+    }
+
+    /// 3/9: post_admit fires on cold load AFTER the loader returns.
+    /// Asserts call sequencing: post_admit_calls == 1 AFTER
+    /// loader.call_count == 1.
+    #[test]
+    fn hotswap_post_admit_fires_on_cold_load() {
+        let (mut mgr, loader, spiller) = mgr_with_spiller(3, 100_000);
+        let f = synthetic_gguf(500);
+        let cfg = empty_config();
+
+        // Pre-load: loader has not been called; spiller untouched.
+        assert_eq!(loader.call_count(), 0);
+        assert_eq!(spiller.post_admit_count(), 0);
+
+        let _ = mgr
+            .load_or_get("acme/m1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("admit");
+
+        // Sequencing invariant: loader fires first; post_admit second.
+        // Both should have fired exactly once.
+        assert_eq!(
+            loader.call_count(),
+            1,
+            "loader must have run before post_admit — sequencing"
+        );
+        assert_eq!(
+            spiller.post_admit_count(),
+            1,
+            "post_admit must fire exactly once on cold load"
+        );
+    }
+
+    /// 4/9: post_admit must NOT fire on a cache hit.  The fast path in
+    /// load_or_get short-circuits before any admission work; the
+    /// spiller MUST NOT observe a phantom admission.
+    #[test]
+    fn hotswap_post_admit_does_not_fire_on_cache_hit() {
+        let (mut mgr, loader, spiller) = mgr_with_spiller(3, 100_000);
+        let f = synthetic_gguf(500);
+        let cfg = empty_config();
+
+        let _ = mgr
+            .load_or_get("acme/m1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("first");
+        assert_eq!(spiller.post_admit_count(), 1);
+        assert_eq!(loader.call_count(), 1);
+
+        // Cache-hit: same (repo, quant) — fast path, no loader.load.
+        let _ = mgr
+            .load_or_get("acme/m1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("cache-hit");
+        assert_eq!(
+            loader.call_count(),
+            1,
+            "cache-hit must not invoke the loader"
+        );
+        assert_eq!(
+            spiller.post_admit_count(),
+            1,
+            "cache-hit must NOT fire post_admit a second time"
+        );
+    }
+
+    /// 5/9: Arc::strong_count invariant.  The pre_evict trigger must
+    /// observe a live Arc (strong_count >= 2: manager's clone +
+    /// pre_evict's borrow).  After pre_evict returns, the manager's
+    /// Arc drops from `engines` and (assuming no other holders) the
+    /// engine drops normally.  This test re-verifies iter-208's
+    /// `hotswap_in_flight_arc_survives_eviction` invariant holds
+    /// post-trigger-insertion.
+    #[test]
+    fn hotswap_pre_evict_fires_before_engine_drop() {
+        // Capacity 1 → second load forces eviction.
+        let (mut mgr, _loader, spiller) = mgr_with_spiller(1, 100_000);
+        let f = synthetic_gguf(500);
+        let cfg = empty_config();
+
+        // Hold an in-flight Arc clone of the first load — mirrors the
+        // iter-208 invariant test.
+        let inflight = mgr
+            .load_or_get("a/1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("a");
+        // strong_count: 1 (manager) + 1 (inflight) = 2.
+        assert_eq!(Arc::strong_count(&inflight), 2);
+
+        // Second load evicts a/1 — pre_evict fires before the manager
+        // drops its Arc from `engines`.
+        let _ = mgr
+            .load_or_get("b/2", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("b");
+
+        // pre_evict observed the live Arc.  At trigger-site time the
+        // manager's Arc was still in the `engines` map AND the
+        // pre_evict signature borrows the Arc (`&Arc<LoadedEngine<E>>`)
+        // — so strong_count at call-time is at least:
+        //   1 (manager's `engines` map slot)
+        //   + 1 (inflight clone held by this test)
+        //   = 2.
+        // The `engines.get(...).cloned()` call site additionally clones
+        // briefly into a local before passing `&arc` — so the snapshot
+        // observed by the spiller may be 3.  Either is correct per
+        // ADR-005 line 666-674: the load-bearing assertion is `>= 2`.
+        let snapshots = spiller.pre_evict_strong_counts_snapshot();
+        assert_eq!(snapshots.len(), 1, "exactly one pre_evict call");
+        let (call_n, observed_count) = snapshots[0];
+        assert_eq!(call_n, 1);
+        assert!(
+            observed_count >= 2,
+            "pre_evict must observe a live Arc (strong_count >= 2); observed = {observed_count}"
+        );
+
+        // Post-eviction invariant: manager's Arc dropped → strong_count
+        // drops to 1 (just inflight).  This mirrors iter-208's
+        // `hotswap_in_flight_arc_survives_eviction` post-condition.
+        assert_eq!(
+            Arc::strong_count(&inflight),
+            1,
+            "manager must have released its Arc on eviction; \
+             pre_evict trigger must NOT extend the Arc lifetime"
+        );
+        // Inflight engine still valid — pre_evict did not interfere.
+        assert_eq!(inflight.repo, "a/1");
+        assert_eq!(inflight.engine.load_serial, 1);
+        // Engines map post-eviction: a/1 absent (the post-pre_evict
+        // remove() ran), b/2 present.
+        assert!(mgr.try_get("a/1", QuantType::Q4_K_M).is_none());
+        assert!(mgr.try_get("b/2", QuantType::Q4_K_M).is_some());
+    }
+
+    /// 6/9: a single load that chains MULTIPLE evictions must fire
+    /// pre_evict per evictee.  Mirrors the existing
+    /// `hotswap_chains_multiple_evictions_in_one_load` shape but
+    /// asserts the spiller call count.
+    #[test]
+    fn hotswap_chained_evictions_fire_pre_evict_per_evictee() {
+        let (mut mgr, _loader, spiller) = mgr_with_spiller(3, 1_500);
+        let f_small = synthetic_gguf(500);
+        let f_big = synthetic_gguf(1_000);
+        let cfg = empty_config();
+
+        // Three 500-byte loads — pool fills exactly at budget.
+        let _ = mgr
+            .load_or_get("a/1", QuantType::Q4_K_M, f_small.path(), &cfg)
+            .expect("a");
+        let _ = mgr
+            .load_or_get("b/2", QuantType::Q4_K_M, f_small.path(), &cfg)
+            .expect("b");
+        let _ = mgr
+            .load_or_get("c/3", QuantType::Q4_K_M, f_small.path(), &cfg)
+            .expect("c");
+        assert_eq!(spiller.pre_evict_count(), 0);
+        assert_eq!(spiller.post_admit_count(), 3);
+
+        // 1000-byte load forces TWO evictions in one call (a/1 then b/2).
+        let _ = mgr
+            .load_or_get("d/4", QuantType::Q4_K_M, f_big.path(), &cfg)
+            .expect("d");
+
+        assert_eq!(
+            spiller.pre_evict_count(),
+            2,
+            "chained eviction must fire pre_evict once PER evictee"
+        );
+        assert_eq!(
+            spiller.post_admit_count(),
+            4,
+            "post_admit fires once for the new admission (d/4)"
+        );
+    }
+
+    /// 7/9: Skipped outcome — pre_evict returning `Skipped` must NOT
+    /// block the eviction.  The spill is best-effort; eviction
+    /// completes regardless.
+    #[test]
+    fn hotswap_pre_evict_skipped_outcome_does_not_block_eviction() {
+        let (mut mgr, _loader, spiller) = mgr_with_spiller(2, 1_000_000);
+        let f = synthetic_gguf(1_000);
+        let cfg = empty_config();
+
+        // Inject Skipped explicitly (default is also Skipped, but this
+        // exercises the override path explicitly).
+        spiller.set_pre_evict_outcome(SpillOutcome::Skipped);
+
+        let _ = mgr
+            .load_or_get("a/1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("a");
+        let _ = mgr
+            .load_or_get("b/2", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("b");
+        let _ = mgr
+            .load_or_get("c/3", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("c");
+
+        // Eviction proceeded normally despite Skipped outcome.
+        assert!(mgr.try_get("a/1", QuantType::Q4_K_M).is_none());
+        assert!(mgr.try_get("b/2", QuantType::Q4_K_M).is_some());
+        assert!(mgr.try_get("c/3", QuantType::Q4_K_M).is_some());
+        let stats = mgr.pool_stats();
+        assert_eq!(
+            stats.loaded_count, 2,
+            "eviction must complete normally regardless of pre_evict outcome"
+        );
+        assert_eq!(spiller.pre_evict_count(), 1);
+    }
+
+    /// 8/9: Error outcome on post_admit must NOT block admission.  The
+    /// restore is best-effort; admission proceeds regardless and the
+    /// engine becomes resident in the pool.  iter-213 surfaces the
+    /// error to a /metrics counter.
+    #[test]
+    fn hotswap_post_admit_error_does_not_block_admission() {
+        let (mut mgr, loader, spiller) = mgr_with_spiller(3, 100_000);
+        let f = synthetic_gguf(500);
+        let cfg = empty_config();
+
+        // Inject a parity-fail error outcome.
+        spiller.set_post_admit_outcome(RestoreOutcome::Error(RestoreErrorKind::ParityFail));
+
+        let arc = mgr
+            .load_or_get("acme/m1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("admission must succeed even when post_admit errors");
+        assert_eq!(arc.repo, "acme/m1");
+        assert_eq!(arc.engine.load_serial, 1);
+
+        // Loader was invoked, post_admit fired, engine is in the pool.
+        assert_eq!(loader.call_count(), 1);
+        assert_eq!(spiller.post_admit_count(), 1);
+        let stats = mgr.pool_stats();
+        assert_eq!(
+            stats.loaded_count, 1,
+            "engine must be admitted to the pool despite post_admit error"
+        );
+        assert!(
+            mgr.try_get("acme/m1", QuantType::Q4_K_M).is_some(),
+            "post-error admission must publish the engine to the engines map"
+        );
+    }
+
+    /// 9/9: TOCTOU regression.  Extends iter-210 W-B1
+    /// `hotswap_concurrent_load_or_get_serializes_under_mutex` with the
+    /// spiller wired in; asserts per-thread pre_evict + post_admit
+    /// counts are consistent with the eviction sequence (no double-fire
+    /// under contention).
+    #[test]
+    fn hotswap_concurrent_load_with_spiller_serializes_under_mutex() {
+        use std::sync::Mutex;
+
+        const CAPACITY: usize = 3;
+        const N_THREADS: usize = 8;
+        let loader = Arc::new(MockLoader::new());
+        let spiller = Arc::new(MockSpiller::new());
+        let pool = LoadedPool::with_capacity_and_budget(CAPACITY, 1_000_000);
+        let mgr = Arc::new(Mutex::new(HotSwapManager::<MockEngine>::new_with_spiller(
+            pool,
+            loader.clone(),
+            spiller.clone(),
+        )));
+
+        let fixtures: Vec<tempfile::NamedTempFile> =
+            (0..N_THREADS).map(|_| synthetic_gguf(500)).collect();
+        let paths: Vec<PathBuf> = fixtures.iter().map(|f| f.path().to_path_buf()).collect();
+        let cfg = Arc::new(empty_config());
+
+        let mut handles = Vec::with_capacity(N_THREADS);
+        for i in 0..N_THREADS {
+            let mgr = Arc::clone(&mgr);
+            let path = paths[i].clone();
+            let cfg = Arc::clone(&cfg);
+            let repo = format!("repo/{i}");
+            handles.push(std::thread::spawn(move || {
+                let mut guard = mgr.lock().expect("lock manager");
+                let _ = guard
+                    .load_or_get(&repo, QuantType::Q4_K_M, &path, &cfg)
+                    .expect("load_or_get");
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        // (a) Loader called exactly N times — no double-load + no
+        // missed load.  This is the pre-existing TOCTOU invariant.
+        assert_eq!(
+            loader.call_count(),
+            N_THREADS as u64,
+            "expected exactly {N_THREADS} loader calls under Mutex serialization"
+        );
+
+        // (b) post_admit fires exactly N times — once per cold load.
+        assert_eq!(
+            spiller.post_admit_count(),
+            N_THREADS as u64,
+            "post_admit must fire exactly once per cold load under contention"
+        );
+
+        // (c) pre_evict count + accounting consistency.  N_THREADS = 8
+        // distinct repos against capacity = 3 → exactly N - CAPACITY
+        // total evictions over the run (each load past capacity evicts
+        // one).  pre_evict fires once per evictee.
+        let expected_evictions = (N_THREADS - CAPACITY) as u64;
+        assert_eq!(
+            spiller.pre_evict_count(),
+            expected_evictions,
+            "pre_evict must fire exactly {expected_evictions} times \
+             (N - CAPACITY = {N_THREADS} - {CAPACITY}) under contention; \
+             observed = {}",
+            spiller.pre_evict_count()
+        );
+
+        // (d) per-call no-double-fire: every captured call_index in the
+        // strong-count snapshot is unique (the AtomicU64 fetch_add gave
+        // each call a distinct sequence number; if any pair shared an
+        // index, fetch_add was bypassed somewhere).
+        let pre_evict_snapshots = spiller.pre_evict_strong_counts_snapshot();
+        let mut seen = std::collections::HashSet::new();
+        for (idx, _) in &pre_evict_snapshots {
+            assert!(
+                seen.insert(*idx),
+                "pre_evict call index {idx} repeated — double-fire under contention"
+            );
+        }
+
+        // (e) final state — capacity strictly enforced.
+        let final_mgr = mgr.lock().expect("lock manager final");
+        let stats = final_mgr.pool_stats();
+        assert_eq!(stats.loaded_count, CAPACITY);
+        assert!(stats.total_resident_bytes <= stats.memory_budget_bytes);
     }
 }
