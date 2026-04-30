@@ -979,6 +979,50 @@ impl<E> HotSwapManager<E> {
         self.kv_counters = Some(counters);
     }
 
+    /// Iter-215 Wedge-2 test-only admission helper: inject a
+    /// pre-built `LoadedEngine` into the pool without invoking the
+    /// loader.  Used by router / handlers tests that need a
+    /// populated pool to scrape `/metrics`, `/v1/models`, or exercise
+    /// the chat 501 short-circuit, without standing up a real GGUF +
+    /// GPU + tokenizer.
+    ///
+    /// Mirrors the production `load_or_get` admission shape (insert
+    /// into pool + engines map) but skips loader, spiller, and
+    /// counter triggers — those are exercised by other tests.
+    /// Returns `Err(PoolError)` if the pool refuses admission.
+    #[cfg(test)]
+    pub fn admit_for_test(
+        &mut self,
+        repo: &str,
+        quant: QuantType,
+        bytes_resident: u64,
+        engine: E,
+    ) -> Result<Arc<LoadedEngine<E>>, PoolError>
+    where
+        E: 'static,
+    {
+        let k = pool_key(repo, quant);
+        let loaded_engine = Arc::new(LoadedEngine {
+            engine,
+            repo: repo.to_string(),
+            quant,
+            bytes_resident,
+            loaded_at: SystemTime::now(),
+        });
+        let handle = LoadedHandle {
+            repo_id: k.clone(),
+            quant: quant.as_str().to_string(),
+            loaded_at: loaded_engine.loaded_at,
+            bytes_resident,
+        };
+        let evicted = self.pool.insert(handle)?;
+        for victim in evicted {
+            self.engines.remove(&victim.repo_id);
+        }
+        self.engines.insert(k, Arc::clone(&loaded_engine));
+        Ok(loaded_engine)
+    }
+
     /// Loaded count + capacity + memory budget — surfaced for diagnostics.
     pub fn pool_stats(&self) -> PoolStats {
         PoolStats {
