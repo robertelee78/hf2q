@@ -842,8 +842,42 @@ impl MlxModelWeights {
                 source, lm_head_f16_bytes as f64 / 1e6);
             let embed_f32: &[f32] = embed_weight.as_slice()
                 .map_err(|e| anyhow::anyhow!("embed as_slice for q8 quantize: {e}"))?;
-            let rows = cfg.vocab_size;
             let cols = cfg.hidden_size;
+            // ADR-005 iter-214 follow-up — vocab-pad slice OOB fix.
+            //
+            // Derive `rows` from the actual embed tensor's element count,
+            // NOT from `cfg.vocab_size`. ADR-012 Phase 1.8's vocab-pad
+            // de-pad transform strips the trailing padded row from
+            // `token_embd.weight` (e.g., Qwen3.6 27B carries the de-padded
+            // tensor on-disk while `cfg.vocab_size` may still reflect the
+            // padded count read from a different GGUF metadata key) — so
+            // `cfg.vocab_size > embed_f32.len() / cols` by exactly the
+            // pad-stride when de-pad fired upstream.
+            //
+            // The pre-fix code iterated `0..cfg.vocab_size` and hit a
+            // slice-OOB panic at row `embed_rows` (one past the actual
+            // tensor) on `forward_mlx.rs:861` — observed concretely on
+            // /opt/hf2q/models/qwen3.6-27b-dwq46/...gguf where the loop
+            // wanted row 248045 but the tensor had only 248044 rows.
+            //
+            // Per Engineering Mantra "code + test == truth": the tensor's
+            // actual element count is the source of truth here, not the
+            // metadata header. Surface a warn! when they differ so an
+            // upstream cfg-vs-tensor inconsistency stays visible.
+            if embed_f32.len() % cols != 0 {
+                anyhow::bail!(
+                    "embed_weight length {} is not divisible by hidden_size {} \
+                     (cannot derive Q8_0 LMHEAD row count)",
+                    embed_f32.len(), cols);
+            }
+            let rows = embed_f32.len() / cols;
+            if rows != cfg.vocab_size {
+                tracing::warn!(
+                    "Q8_0 LMHEAD: embed_weight has {} rows but cfg.vocab_size={} \
+                     (ADR-012 Phase 1.8 vocab-pad de-pad likely fired; using tensor's \
+                     actual row count for Q8 quantize loop bound)",
+                    rows, cfg.vocab_size);
+            }
             let blocks_per_row = cols / 32;
             let block_bytes: usize = 34;
             let total_bytes = rows * blocks_per_row * block_bytes;
