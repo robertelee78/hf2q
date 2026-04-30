@@ -68,6 +68,11 @@ use mlx_native::ops::elementwise::{cast, scalar_mul_f32, CastDirection};
 use mlx_native::ops::gated_delta_net::{
     build_gated_delta_net_params, dispatch_gated_delta_net, GatedDeltaNetParams,
 };
+// ADR-015 iter56 — decode-only `simd_sum` GDN variant. Drop-in replacement
+// for `dispatch_gated_delta_net` when n_tokens=1; eliminates the 128-thread
+// threadgroup_barrier stalls suffered by the original kernel and fits the
+// state row in registers (NSG=4 for D_k=128 → 16 bytes/thread).
+use mlx_native::ops::gated_delta_net_decode::dispatch_gated_delta_net_decode;
 use mlx_native::ops::l2_norm::dispatch_l2_norm;
 use mlx_native::ops::qkv_split::{dispatch_qkv_split_f32, QkvSplitParams};
 use mlx_native::ops::quantized_matmul_ggml::{
@@ -2031,12 +2036,19 @@ pub fn build_delta_net_layer_decode_into(
     enc.memory_barrier();
 
     // ---- Op 7: GDN — reads state_in, writes state_out ----
-    dispatch_gated_delta_net(
+    // ADR-015 iter56 — decode path uses the `simd_sum` variant which mirrors
+    // llama.cpp's `kernel_gated_delta_net_f32_<NSG>` threading model. Same
+    // bit-equivalent math (cpu_reference + unfused-GPU parity tests under
+    // `mlx-native/tests/test_gated_delta_net_decode.rs`; smoke parity
+    // verified byte-identical to `dispatch_gated_delta_net` on apex
+    // q4_0-flat 4-prompt × 32-token greedy generation) but without the
+    // threadgroup_barrier+shared-memory stalls of the 128-thread variant.
+    dispatch_gated_delta_net_decode(
         enc, registry, device.metal_device(),
         &q_scaled, &k_normed, &v_gpu,
         &g_buf, &beta_buf, state_in,
         &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
-    ).context("dispatch_gated_delta_net (decode_into)")?;
+    ).context("dispatch_gated_delta_net_decode (decode_into)")?;
     // Barrier preserved at legacy gpu_delta_net.rs:953 position.
     enc.memory_barrier();
 
