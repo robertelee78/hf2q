@@ -2168,7 +2168,58 @@ fn kv_persist_matrix_e2e() {
         );
     }
 
-    let results: Vec<CellResult> = cells.into_iter().map(run_cell).collect();
+    // A0.2 scope-limit: HF2Q_KV_PERSIST_E2E_SHIP_GATE_ONLY=1 filters to
+    // just the cells that load-bear ship-gate decisions (R-P4 / R-P5 /
+    // R-P6) plus a decode-regression sweep across prefix lengths. A
+    // full 600-cell run takes 100+ minutes on M5 Max because each cell
+    // spawns a fresh hf2q serve subprocess (~15s startup × 600 = 150min
+    // floor). Scope-limit collapses to 7 ship-gate-relevant cells with
+    // a single quant (Q4_0 — the only quant with a converted GGUF on
+    // this system). All other cells short-circuit with diagnostic.
+    let ship_gate_only = std::env::var("HF2Q_KV_PERSIST_E2E_SHIP_GATE_ONLY")
+        .as_deref()
+        == Ok("1");
+    let cells_to_run: Vec<MatrixCell> = if ship_gate_only {
+        let filtered: Vec<MatrixCell> = cells
+            .into_iter()
+            .filter(|c| {
+                // Only Gemma4_26b dense Q4_0 (the converted fixture).
+                if !matches!(c.family, Family::Gemma4_26b)
+                    || !matches!(c.kv_path, KvPath::Dense)
+                    || !matches!(c.quant, WeightQuant::Q4_0)
+                {
+                    return false;
+                }
+                // Ship-gate cells:
+                //   R-P4: scenario=SwapBackInSameCtx, prefix=L32K, cache=Miss
+                //   R-P5: scenario=ColdResume, prefix=L32K, cache=SsdColdPostRestart
+                //   R-P6: scenario=SharedPrefix4Agents, prefix=L4K-equiv (use L8K closest), cache=Miss
+                // Decode-regression sweep: scenario=ColdResume, cache=Miss,
+                //   across all 5 prefix lengths.
+                let r_p4 = matches!(c.scenario, Scenario::SwapBackInSameCtx)
+                    && matches!(c.prefix_len, PrefixLen::L32K)
+                    && matches!(c.cache_state, CacheState::Miss);
+                let r_p5 = matches!(c.scenario, Scenario::ColdResume)
+                    && matches!(c.prefix_len, PrefixLen::L32K)
+                    && matches!(c.cache_state, CacheState::SsdColdPostRestart);
+                let r_p6 = matches!(c.scenario, Scenario::SharedPrefix4Agents)
+                    && matches!(c.cache_state, CacheState::Miss);
+                let sweep = matches!(c.scenario, Scenario::ColdResume)
+                    && matches!(c.cache_state, CacheState::Miss);
+                r_p4 || r_p5 || r_p6 || sweep
+            })
+            .collect();
+        eprintln!(
+            "kv_persist_matrix_e2e: HF2Q_KV_PERSIST_E2E_SHIP_GATE_ONLY=1 — \
+             filtered to {} ship-gate-relevant cells (R-P4/R-P5/R-P6 + decode-regression sweep)",
+            filtered.len()
+        );
+        filtered
+    } else {
+        cells
+    };
+
+    let results: Vec<CellResult> = cells_to_run.into_iter().map(run_cell).collect();
     let ran = results.iter().filter(|r| r.ran).count();
     let skipped = results.iter().filter(|r| !r.ran).count();
     eprintln!(
@@ -2176,14 +2227,41 @@ fn kv_persist_matrix_e2e() {
         ran, skipped
     );
 
-    assert_ship_gates(&results);
-    assert_coherence_gates(&results);
-    assert_decode_regression(&results);
-    assert_overhead_gates(&results);
+    // Per-cell diagnostic log — prints before gate assertions so a gate
+    // panic doesn't black-hole the measurement evidence.
+    for r in &results {
+        if !r.ran {
+            continue;
+        }
+        eprintln!(
+            "  cell {:?}/{:?}/{:?}/{:?}/{:?}/{:?}: \
+             no_cache_ttft={:.1}ms cache_hit_ttft={:.1}ms \
+             ratio={:.3} decode_no_cache={:.1}t/s decode_miss={:.1}t/s \
+             shared_prefix_ratio={:.3} note={:?}",
+            r.cell.family,
+            r.cell.quant,
+            r.cell.kv_path,
+            r.cell.prefix_len,
+            r.cell.cache_state,
+            r.cell.scenario,
+            r.no_cache_ttft_ms,
+            r.cache_hit_ttft_ms,
+            if r.no_cache_ttft_ms > 0.0 {
+                r.cache_hit_ttft_ms / r.no_cache_ttft_ms
+            } else {
+                f64::NAN
+            },
+            r.decode_tok_s_no_cache,
+            r.decode_tok_s_cache_enabled_miss,
+            r.shared_prefix_ratio,
+            r.note,
+        );
+    }
 
-    // Emit results report into the worktree's docs/ tree (NOT the
-    // main hf2q tree — the operator promotes via the dual-mode
-    // queen merge).
+    // Emit results report BEFORE assertions so failure short-circuits
+    // don't black-hole the measurement evidence (per
+    // feedback_substrate_must_not_synthesize_ship_gates: substrate
+    // failures must surface real numbers, not constants).
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let out_path = PathBuf::from(manifest_dir)
         .join("docs")
@@ -2194,6 +2272,11 @@ fn kv_persist_matrix_e2e() {
         "kv_persist_matrix_e2e: results written to {}",
         out_path.display()
     );
+
+    assert_ship_gates(&results);
+    assert_coherence_gates(&results);
+    assert_decode_regression(&results);
+    assert_overhead_gates(&results);
 
     // Substrate sanity: at least one cell ran with a valid K/V hash
     // round-trip (R-C1 byte-exact). If this fails, the substrate is
