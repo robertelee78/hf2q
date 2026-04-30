@@ -55,15 +55,125 @@ const GGML_TYPE_IQ2_XS: u32 = 20;
 const LARGE_MODEL_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
+// ADR-005 Phase 4 iter-211 — provenance writer surface
+// ---------------------------------------------------------------------------
+//
+// At quantize time the GGUF backend stamps three optional metadata
+// keys identifying hf2q as the producer + binding the output to the
+// source bundle that produced it.  At serve time
+// `serve::provenance::detect` reads these keys and the auto-pipeline
+// short-circuits its 30 GB integrity re-hash on a match.  The reader
+// half landed iter-207; this iter (211) lands the writer half.
+//
+// Schema lives in `serve::provenance` (`KEY_PRODUCER_VERSION` /
+// `KEY_SOURCE_SHA256` / `KEY_MMPROJ_SHA256`).  We mirror the
+// constants here as a Chesterton's-fence guard: if a future refactor
+// renames a key on either side, the `provenance_keys_match_reader`
+// unit test fails — coordinated reader+writer migration becomes
+// mandatory rather than accidental.
+
+/// Mirrors [`crate::serve::provenance::KEY_PRODUCER_VERSION`].  Pinned
+/// here so the writer doesn't reach across into `serve::*` purely to
+/// read a string constant (the writer is otherwise free of `serve::*`
+/// dependencies — keeping it that way preserves the convert-only
+/// build path).
+pub const PROVENANCE_KEY_PRODUCER_VERSION: &str = "hf2q.producer_version";
+/// Mirrors [`crate::serve::provenance::KEY_SOURCE_SHA256`].
+pub const PROVENANCE_KEY_SOURCE_SHA256: &str = "hf2q.source_sha256";
+/// Mirrors [`crate::serve::provenance::KEY_MMPROJ_SHA256`].
+pub const PROVENANCE_KEY_MMPROJ_SHA256: &str = "hf2q.mmproj_sha256";
+
+/// Provenance the writer stamps into the GGUF metadata KV section at
+/// quantize time.  Constructed by the caller (e.g. `cmd_convert`) when
+/// the source bundle is known + hashable; passed into
+/// [`GgufBackend::with_provenance`] before invoking
+/// [`OutputBackend::write`].
+///
+/// `mmproj_sha256` is OPTIONAL by the iter-207 reader schema: a paired
+/// vision projector GGUF carries the corresponding hash; non-vision
+/// models leave it `None`.  In iter-211 the production `cmd_convert`
+/// path leaves it `None` regardless because the mmproj is emitted
+/// AFTER the main GGUF (see `GgufBackend::write` line ~556 + Phase 4.8
+/// in `cmd_convert`); a future iter can re-order to set it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hf2qProvenance {
+    /// Verbatim contents of `hf2q.producer_version`.  Canonical writer
+    /// emits `format!("hf2q {}", env!("CARGO_PKG_VERSION"))`; the
+    /// reader does no parsing beyond presence + non-empty.
+    pub producer_version: String,
+    /// Lowercase-hex SHA-256 of the canonical source-shard manifest
+    /// (output of [`crate::serve::cache::compute_source_bundle_sha256`]).
+    pub source_sha256: String,
+    /// Lowercase-hex SHA-256 of the paired mmproj GGUF, when known at
+    /// main-GGUF write time.  See struct doc for the production
+    /// caveat.
+    pub mmproj_sha256: Option<String>,
+}
+
+impl Hf2qProvenance {
+    /// Build the three (or two, when mmproj is `None`) metadata KV
+    /// pairs the writer appends to the main `build_metadata` output.
+    /// Pure function — no I/O — so unit tests can call directly and
+    /// assert on the (key, value) pairs without spinning up a full
+    /// backend write.
+    ///
+    /// Returns the pairs in canonical order:
+    ///   1. `hf2q.producer_version`
+    ///   2. `hf2q.source_sha256`
+    ///   3. `hf2q.mmproj_sha256` (omitted entirely when `None`)
+    ///
+    /// Callers append the result to their existing metadata Vec
+    /// before computing `kv_count`.
+    fn to_metadata_kvs(&self) -> Vec<(String, MetaValue)> {
+        let mut out = Vec::with_capacity(3);
+        out.push((
+            PROVENANCE_KEY_PRODUCER_VERSION.to_string(),
+            MetaValue::String(self.producer_version.clone()),
+        ));
+        out.push((
+            PROVENANCE_KEY_SOURCE_SHA256.to_string(),
+            MetaValue::String(self.source_sha256.clone()),
+        ));
+        if let Some(sha) = &self.mmproj_sha256 {
+            out.push((
+                PROVENANCE_KEY_MMPROJ_SHA256.to_string(),
+                MetaValue::String(sha.clone()),
+            ));
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Backend struct
 // ---------------------------------------------------------------------------
 
 /// GGUF output backend — writes a single `.gguf` file from quantized IR.
-pub struct GgufBackend;
+///
+/// Optional `provenance` field (ADR-005 Phase 4 iter-211): when `Some`,
+/// the three [`PROVENANCE_KEY_*`] keys are stamped into the main GGUF's
+/// metadata KV section so a serve-time auto-pipeline cache hit can
+/// short-circuit the per-load 30 GB SHA-256 integrity re-check.  Set
+/// via the [`Self::with_provenance`] builder.  When `None` (default),
+/// no provenance keys are written and the GGUF parses as `External`
+/// per `serve::provenance::detect` — byte-identical with pre-iter-211
+/// behaviour.
+pub struct GgufBackend {
+    provenance: Option<Hf2qProvenance>,
+}
 
 impl GgufBackend {
     pub fn new() -> Self {
-        Self
+        Self { provenance: None }
+    }
+
+    /// Builder: stamp the supplied provenance into the GGUF's metadata
+    /// at write time.  Mirrors `SafetensorsBackend::with_shard_size_gb`
+    /// — additive on top of `new()`, no behaviour change for any caller
+    /// that doesn't opt in.
+    pub fn with_provenance(mut self, provenance: Hf2qProvenance) -> Self {
+        self.provenance = Some(provenance);
+        self
     }
 }
 
@@ -222,7 +332,21 @@ impl OutputBackend for GgufBackend {
         );
 
         // Build metadata key-value pairs
-        let metadata = build_metadata(model, input_dir);
+        let mut metadata = build_metadata(model, input_dir);
+        // ADR-005 Phase 4 iter-211 — append the three (or two, when
+        // mmproj is None) hf2q.provenance.* keys when the caller
+        // configured a provenance binding via
+        // `GgufBackend::with_provenance`.  When the field is `None`
+        // (the default), no provenance keys are emitted and the GGUF
+        // continues to parse as `External` per
+        // `serve::provenance::detect` — byte-identical with
+        // pre-iter-211 behaviour.  The append happens BEFORE
+        // `kv_count` is computed so the count + on-disk emit stay in
+        // sync (a future refactor that hoists this into
+        // `build_metadata` would also be correct).
+        if let Some(prov) = &self.provenance {
+            metadata.extend(prov.to_metadata_kvs());
+        }
         let tensor_count =
             (tensor_names.len() + synthetic_tensors.len() + v_duplicates.len()) as u64;
         let kv_count = metadata.len() as u64;
@@ -4989,5 +5113,448 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ADR-005 Phase 4 iter-211 — GGUF provenance writer
+    //
+    // Mirrors iter-207 W74's test density (10 tests for `provenance.rs::detect`)
+    // for the writer half: 11 in-binary unit tests asserting the
+    // (Hf2qProvenance → GGUF metadata KV → mlx_native::gguf parse →
+    // serve::provenance::detect) round-trip is byte-symmetric.
+    //
+    // Test fixtures use `model(...)` from the existing test scaffolding so
+    // a synthetic 32×32 4-bit weight + a 32×32 f16 embedding produce a
+    // valid GGUF that `GgufFile::open` accepts without warning.  No real
+    // model is loaded; no network; no conversion subprocess.
+    // ─────────────────────────────────────────────────────────────────────
+
+    use crate::serve::cache::{compute_source_bundle_sha256, SourceShard};
+    use crate::serve::provenance::{
+        self as serve_provenance, Provenance, KEY_MMPROJ_SHA256, KEY_PRODUCER_VERSION,
+        KEY_SOURCE_SHA256,
+    };
+    use mlx_native::gguf::GgufFile;
+
+    /// Fabricate a tiny model the GGUF backend accepts.  Borrows the
+    /// shape of `test_write_gguf_header` — minimum tensors that pass
+    /// `validate()` clean.
+    fn fixture_model() -> QuantizedModel {
+        model(
+            vec![
+                ("model.layers.0.self_attn.q_proj.weight", 4, false),
+                ("model.embed_tokens.weight", 16, true),
+            ],
+            4,
+        )
+    }
+
+    /// Three synthetic source shards mirroring iter-207's
+    /// `synthetic_shards` in `serve::auto_pipeline::tests`.  The
+    /// canonical bundle SHA produced by `compute_source_bundle_sha256`
+    /// is deterministic across both places — the iter-211 writer + the
+    /// iter-207 reader hash the same input bytes.
+    fn fixture_shards() -> Vec<SourceShard> {
+        vec![
+            SourceShard {
+                filename: "model-00001-of-00002.safetensors".into(),
+                bytes: 100,
+                sha256: Some("a".repeat(64)),
+                hf_etag: "a".repeat(64),
+                is_lfs: true,
+                verified_at_secs: 1,
+            },
+            SourceShard {
+                filename: "model-00002-of-00002.safetensors".into(),
+                bytes: 200,
+                sha256: Some("b".repeat(64)),
+                hf_etag: "b".repeat(64),
+                is_lfs: true,
+                verified_at_secs: 1,
+            },
+            SourceShard {
+                filename: "config.json".into(),
+                bytes: 1024,
+                sha256: None, // non-LFS — never enters the bundle hash
+                hf_etag: "git-blob-sha".into(),
+                is_lfs: false,
+                verified_at_secs: 1,
+            },
+        ]
+    }
+
+    fn fixture_provenance() -> Hf2qProvenance {
+        Hf2qProvenance {
+            producer_version: format!("hf2q {}", env!("CARGO_PKG_VERSION")),
+            source_sha256: compute_source_bundle_sha256(&fixture_shards())
+                .expect("synthetic shards must produce a bundle SHA"),
+            mmproj_sha256: None,
+        }
+    }
+
+    // ── Helper-level tests (no I/O) ──────────────────────────────────────
+
+    #[test]
+    fn iter211_to_metadata_kvs_emits_two_keys_when_mmproj_absent() {
+        let prov = Hf2qProvenance {
+            producer_version: "hf2q 0.1.0-test".into(),
+            source_sha256: "a".repeat(64),
+            mmproj_sha256: None,
+        };
+        let kvs = prov.to_metadata_kvs();
+        assert_eq!(kvs.len(), 2, "without mmproj exactly two keys are emitted");
+        assert_eq!(kvs[0].0, PROVENANCE_KEY_PRODUCER_VERSION);
+        assert_eq!(kvs[1].0, PROVENANCE_KEY_SOURCE_SHA256);
+        // mmproj key absent — not emitted as empty string (would fool the reader)
+        assert!(
+            !kvs.iter()
+                .any(|(k, _)| k == PROVENANCE_KEY_MMPROJ_SHA256),
+            "mmproj key MUST be absent (not empty-string) when None"
+        );
+    }
+
+    #[test]
+    fn iter211_to_metadata_kvs_emits_three_keys_when_mmproj_present() {
+        let prov = Hf2qProvenance {
+            producer_version: "hf2q 0.1.0-test".into(),
+            source_sha256: "a".repeat(64),
+            mmproj_sha256: Some("d".repeat(64)),
+        };
+        let kvs = prov.to_metadata_kvs();
+        assert_eq!(kvs.len(), 3, "with mmproj exactly three keys are emitted");
+        assert_eq!(kvs[0].0, PROVENANCE_KEY_PRODUCER_VERSION);
+        assert_eq!(kvs[1].0, PROVENANCE_KEY_SOURCE_SHA256);
+        assert_eq!(kvs[2].0, PROVENANCE_KEY_MMPROJ_SHA256);
+        match &kvs[2].1 {
+            MetaValue::String(s) => assert_eq!(s, &"d".repeat(64)),
+            _ => panic!("mmproj value must be MetaValue::String"),
+        }
+    }
+
+    #[test]
+    fn iter211_provenance_keys_match_reader() {
+        // Chesterton's-fence guard: the writer's constants MUST equal
+        // the reader's constants.  If a future refactor renames a key
+        // on either side, this fails BEFORE any production GGUF goes
+        // out the door with the wrong key — coordinated reader+writer
+        // migration becomes mandatory rather than accidental.
+        assert_eq!(PROVENANCE_KEY_PRODUCER_VERSION, KEY_PRODUCER_VERSION);
+        assert_eq!(PROVENANCE_KEY_SOURCE_SHA256, KEY_SOURCE_SHA256);
+        assert_eq!(PROVENANCE_KEY_MMPROJ_SHA256, KEY_MMPROJ_SHA256);
+    }
+
+    #[test]
+    fn iter211_backend_default_carries_no_provenance() {
+        // Back-compat invariant: a `GgufBackend::new()` without any
+        // `with_provenance` call MUST emit zero provenance keys (every
+        // existing caller's behaviour stays byte-identical).  We assert
+        // here at the type level + on the `Hf2qProvenance` field.
+        let backend = GgufBackend::new();
+        assert!(backend.provenance.is_none());
+        let backend2 = GgufBackend::default();
+        assert!(backend2.provenance.is_none());
+    }
+
+    #[test]
+    fn iter211_with_provenance_sets_field() {
+        let prov = fixture_provenance();
+        let backend = GgufBackend::new().with_provenance(prov.clone());
+        assert_eq!(backend.provenance.as_ref(), Some(&prov));
+    }
+
+    // ── Round-trip tests (writer → mlx_native parse → reader) ────────────
+
+    #[test]
+    fn iter211_writer_round_trip_without_mmproj() {
+        // Load-bearing test: the production "no mmproj" path emits two
+        // keys + the reader returns Provenance::Hf2q with the same
+        // values.  This is the canonical iter-211 happy path.
+        let tmp = tempfile::tempdir().unwrap();
+        let prov = fixture_provenance();
+        let backend = GgufBackend::new().with_provenance(prov.clone());
+
+        let manifest = backend
+            .write(&fixture_model(), tmp.path(), tmp.path(), &ProgressReporter::new())
+            .expect("write must succeed");
+        let path = tmp.path().join(&manifest.files[0].filename);
+
+        let gguf = GgufFile::open(&path).expect("hf2q-emitted GGUF must parse");
+        let detected = serve_provenance::detect(&gguf);
+        match detected {
+            Provenance::Hf2q {
+                producer_version,
+                source_sha256,
+                mmproj_sha256,
+            } => {
+                assert_eq!(producer_version, prov.producer_version);
+                assert_eq!(source_sha256, prov.source_sha256);
+                assert_eq!(mmproj_sha256, None);
+            }
+            Provenance::External => panic!("must classify as Hf2q, got External"),
+        }
+    }
+
+    #[test]
+    fn iter211_writer_round_trip_with_mmproj() {
+        // Symmetric test for the OPTIONAL mmproj field.  Production
+        // `cmd_convert` doesn't set this in iter-211 (the mmproj is
+        // emitted AFTER the main GGUF; ordering doc'd on
+        // `Hf2qProvenance`), but the reader handles it correctly so
+        // the writer ships ready for a future iter that re-orders.
+        let tmp = tempfile::tempdir().unwrap();
+        let mmproj_sha = "d".repeat(64);
+        let prov = Hf2qProvenance {
+            producer_version: "hf2q 0.1.0-test".into(),
+            source_sha256: "c".repeat(64),
+            mmproj_sha256: Some(mmproj_sha.clone()),
+        };
+        let backend = GgufBackend::new().with_provenance(prov.clone());
+
+        let manifest = backend
+            .write(&fixture_model(), tmp.path(), tmp.path(), &ProgressReporter::new())
+            .expect("write must succeed");
+        let path = tmp.path().join(&manifest.files[0].filename);
+
+        let gguf = GgufFile::open(&path).expect("hf2q-emitted GGUF must parse");
+        let detected = serve_provenance::detect(&gguf);
+        match detected {
+            Provenance::Hf2q {
+                producer_version,
+                source_sha256,
+                mmproj_sha256,
+            } => {
+                assert_eq!(producer_version, prov.producer_version);
+                assert_eq!(source_sha256, prov.source_sha256);
+                assert_eq!(mmproj_sha256.as_deref(), Some(mmproj_sha.as_str()));
+            }
+            Provenance::External => panic!("must classify as Hf2q, got External"),
+        }
+    }
+
+    #[test]
+    fn iter211_writer_default_emits_external_classifiable_gguf() {
+        // Control: a `GgufBackend::new()` without `with_provenance`
+        // must produce a GGUF that the reader classifies as
+        // `External`.  Byte-identical with pre-iter-211 behaviour.
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = GgufBackend::new(); // NO with_provenance
+
+        let manifest = backend
+            .write(&fixture_model(), tmp.path(), tmp.path(), &ProgressReporter::new())
+            .expect("write must succeed");
+        let path = tmp.path().join(&manifest.files[0].filename);
+
+        let gguf = GgufFile::open(&path).expect("backend-default GGUF must parse");
+        assert_eq!(
+            serve_provenance::detect(&gguf),
+            Provenance::External,
+            "default GgufBackend must NOT emit provenance keys"
+        );
+    }
+
+    #[test]
+    fn iter211_writer_emits_canonical_source_bundle_sha() {
+        // Symmetry test: the SHA the writer stamps MUST equal the
+        // SHA `compute_source_bundle_sha256` produces from the cache
+        // manifest's recorded shards.  This is the load-bearing
+        // invariant the auto-pipeline short-circuit relies on — if
+        // they drift, `lookup_and_verify` returns Err on every cache
+        // hit (mismatch branch), bricking the production short-circuit.
+        let shards = fixture_shards();
+        let bundle_sha = compute_source_bundle_sha256(&shards)
+            .expect("synthetic shards produce a bundle SHA");
+
+        let prov = Hf2qProvenance {
+            producer_version: "hf2q 0.1.0".into(),
+            source_sha256: bundle_sha.clone(),
+            mmproj_sha256: None,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = GgufBackend::new().with_provenance(prov);
+        let manifest = backend
+            .write(&fixture_model(), tmp.path(), tmp.path(), &ProgressReporter::new())
+            .expect("write must succeed");
+        let path = tmp.path().join(&manifest.files[0].filename);
+
+        // Read back the source_sha256 + recompute from the same shards
+        // — they MUST match.
+        let gguf = GgufFile::open(&path).expect("parse hf2q GGUF");
+        let read_sha = gguf
+            .metadata_string(KEY_SOURCE_SHA256)
+            .expect("source_sha256 key must be present");
+        let recomputed = compute_source_bundle_sha256(&shards).unwrap();
+        assert_eq!(read_sha, recomputed, "writer SHA must match reader recompute");
+        assert_eq!(read_sha, bundle_sha, "writer SHA must match the input");
+    }
+
+    #[test]
+    fn iter211_writer_emit_does_not_break_existing_metadata_keys() {
+        // Regression guard: stamping provenance keys must NOT drop
+        // any of the pre-existing metadata keys
+        // (`general.architecture`, `general.name`, `llama.*`,
+        // tokenizer.*, etc.).  We verify by re-reading the same set
+        // `test_metadata_keys` checks, but on a hf2q-stamped GGUF.
+        let tmp = tempfile::tempdir().unwrap();
+        let prov = fixture_provenance();
+        let backend = GgufBackend::new().with_provenance(prov);
+
+        let manifest = backend
+            .write(&fixture_model(), tmp.path(), tmp.path(), &ProgressReporter::new())
+            .expect("write must succeed");
+        let path = tmp.path().join(&manifest.files[0].filename);
+        let gguf = GgufFile::open(&path).expect("parse hf2q GGUF");
+
+        // Pre-iter-211 keys still present.
+        assert_eq!(
+            gguf.metadata_string("general.architecture"),
+            Some("llama")
+        );
+        assert!(gguf.metadata_string("general.name").is_some());
+        // Post-iter-211 keys also present.
+        assert!(gguf.metadata_string(KEY_PRODUCER_VERSION).is_some());
+        assert!(gguf.metadata_string(KEY_SOURCE_SHA256).is_some());
+    }
+
+    #[test]
+    fn iter211_writer_mismatched_sha_classifies_as_hf2q_with_wrong_sha() {
+        // Negative-path test: a writer that stamps a deliberately
+        // wrong source_sha256 produces a Hf2q-classified GGUF whose
+        // reader-side `source_sha256` does NOT match the cache's
+        // recorded shards.  At the auto-pipeline level (iter-207's
+        // `auto_pipeline_errors_on_hf2q_provenance_mismatch` test)
+        // this maps to Err — but the read-side detection itself MUST
+        // still classify the GGUF as Hf2q.  Asserts the reader
+        // doesn't hide the mismatch behind a silent External
+        // classification (which would let the W71 SHA path silently
+        // re-quantize on tampering).
+        let tmp = tempfile::tempdir().unwrap();
+        let real_bundle_sha = compute_source_bundle_sha256(&fixture_shards()).unwrap();
+        let wrong_sha = "9".repeat(64);
+        assert_ne!(real_bundle_sha, wrong_sha);
+
+        let prov = Hf2qProvenance {
+            producer_version: "hf2q 0.1.0-test".into(),
+            source_sha256: wrong_sha.clone(),
+            mmproj_sha256: None,
+        };
+        let backend = GgufBackend::new().with_provenance(prov);
+        let manifest = backend
+            .write(&fixture_model(), tmp.path(), tmp.path(), &ProgressReporter::new())
+            .expect("write must succeed");
+        let path = tmp.path().join(&manifest.files[0].filename);
+
+        let gguf = GgufFile::open(&path).expect("parse hf2q GGUF");
+        match serve_provenance::detect(&gguf) {
+            Provenance::Hf2q { source_sha256, .. } => {
+                assert_eq!(source_sha256, wrong_sha);
+                assert_ne!(source_sha256, real_bundle_sha);
+            }
+            Provenance::External => panic!(
+                "tampered/mismatched provenance must still classify as Hf2q \
+                 (so the auto-pipeline can refuse with Err); got External"
+            ),
+        }
+    }
+
+    #[test]
+    fn iter211_writer_uppercase_hex_round_trips_lowercase() {
+        // Defensive: a writer that uppercase-hexes (or mixed-case-
+        // hexes) the SHA must round-trip to lowercase via the reader's
+        // normalization (iter-207 reader test
+        // `detect_handles_uppercase_hex_in_sha256`).  Asserts the
+        // reader's normalization actually fires on a real on-disk
+        // GGUF, not just on the HashMap fixture.
+        let tmp = tempfile::tempdir().unwrap();
+        let prov = Hf2qProvenance {
+            producer_version: "hf2q 0.1.0".into(),
+            source_sha256: "A".repeat(64), // UPPERCASE
+            mmproj_sha256: Some("B".repeat(64)),
+        };
+        let backend = GgufBackend::new().with_provenance(prov);
+        let manifest = backend
+            .write(&fixture_model(), tmp.path(), tmp.path(), &ProgressReporter::new())
+            .expect("write must succeed");
+        let path = tmp.path().join(&manifest.files[0].filename);
+
+        let gguf = GgufFile::open(&path).expect("parse hf2q GGUF");
+        match serve_provenance::detect(&gguf) {
+            Provenance::Hf2q {
+                source_sha256,
+                mmproj_sha256,
+                ..
+            } => {
+                // Reader normalized to lowercase.
+                assert_eq!(source_sha256, "a".repeat(64));
+                assert_eq!(mmproj_sha256.as_deref(), Some("b".repeat(64).as_str()));
+            }
+            Provenance::External => panic!("must classify as Hf2q after normalization"),
+        }
+
+        // Wire-level: the on-disk bytes are still UPPERCASE — the
+        // writer didn't pre-normalize, the reader did.
+        let raw_source = gguf
+            .metadata_string(KEY_SOURCE_SHA256)
+            .expect("source_sha256 must be present");
+        assert_eq!(raw_source, "A".repeat(64), "writer keeps caller-supplied case");
+    }
+
+    #[test]
+    fn iter211_writer_kv_count_matches_emitted_pairs() {
+        // Wire-format invariant: the GGUF header's `kv_count` field
+        // (offset 16..24) MUST equal the number of metadata KV pairs
+        // actually emitted.  If we forget to recompute kv_count after
+        // the provenance append, downstream parsers will read fewer
+        // KVs than were written and produce a corrupt parse.
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Same model, two backends — one with provenance, one without.
+        // The kv_count delta MUST equal the number of provenance keys
+        // appended (2 here, since mmproj is None).
+        let backend_no_prov = GgufBackend::new();
+        let m1 = backend_no_prov
+            .write(&fixture_model(), tmp.path(), &tmp.path().join("a.gguf"), &ProgressReporter::new())
+            .expect("write A");
+        let kv_count_no_prov = {
+            let bytes = std::fs::read(tmp.path().join(&m1.files[0].filename)).unwrap();
+            u64::from_le_bytes(bytes[16..24].try_into().unwrap())
+        };
+
+        let backend_with = GgufBackend::new().with_provenance(fixture_provenance());
+        let m2 = backend_with
+            .write(&fixture_model(), tmp.path(), &tmp.path().join("b.gguf"), &ProgressReporter::new())
+            .expect("write B");
+        let kv_count_with = {
+            let bytes = std::fs::read(tmp.path().join(&m2.files[0].filename)).unwrap();
+            u64::from_le_bytes(bytes[16..24].try_into().unwrap())
+        };
+
+        // 2 extra keys (producer_version + source_sha256; mmproj=None).
+        assert_eq!(
+            kv_count_with - kv_count_no_prov,
+            2,
+            "stamping provenance must add exactly 2 KVs (mmproj=None)"
+        );
+
+        // With mmproj it's 3.
+        let prov_with_mmproj = Hf2qProvenance {
+            producer_version: "hf2q 0.1.0".into(),
+            source_sha256: "c".repeat(64),
+            mmproj_sha256: Some("d".repeat(64)),
+        };
+        let backend_with_mmproj =
+            GgufBackend::new().with_provenance(prov_with_mmproj);
+        let m3 = backend_with_mmproj
+            .write(&fixture_model(), tmp.path(), &tmp.path().join("c.gguf"), &ProgressReporter::new())
+            .expect("write C");
+        let kv_count_with_mmproj = {
+            let bytes = std::fs::read(tmp.path().join(&m3.files[0].filename)).unwrap();
+            u64::from_le_bytes(bytes[16..24].try_into().unwrap())
+        };
+        assert_eq!(
+            kv_count_with_mmproj - kv_count_no_prov,
+            3,
+            "stamping provenance with mmproj must add exactly 3 KVs"
+        );
     }
 }
