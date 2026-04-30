@@ -1235,8 +1235,57 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     // Order post-iter-60: lazy_map → backend creation → materialize_all
     //
     // Pure ordering change.  No behavior change this iter.
+    // ADR-005 Phase 4 iter-211 — derive source-bundle SHA from the
+    // verified shards (when available) and stamp three
+    // `hf2q.provenance.*` metadata keys at GGUF emit time.  A serve-time
+    // auto-pipeline cache hit will short-circuit the per-load 30 GB
+    // SHA-256 integrity re-check on a match (iter-207 reader half).
+    //
+    // `compute_source_bundle_sha256` returns `None` when the shard list
+    // has no LFS records (local-source `--input` runs, all-non-LFS
+    // shard manifests).  In that case we don't stamp provenance keys —
+    // the emitted GGUF parses as `External` and `verify_quantized`
+    // runs exactly as pre-iter-211 (byte-identical fall-through).
+    //
+    // Provenance is mandatory for hf2q-emitted GGUFs WHEN the binding
+    // can be computed; there is intentionally NO operator opt-out
+    // (`--no-provenance` rejected by design — a half-stamped GGUF is
+    // worse than an external one).  Operators who want to skip the
+    // bundle-binding entirely use `--no-integrity` at download time,
+    // which keeps `source_shards == None` here.
+    let provenance = config.source_shards.as_ref().and_then(|shards| {
+        let cache_shards: Vec<serve::cache::SourceShard> =
+            shards.iter().map(serve::cache::SourceShard::from_integrity).collect();
+        serve::cache::compute_source_bundle_sha256(&cache_shards).map(|sha| {
+            backends::gguf::Hf2qProvenance {
+                producer_version: format!("hf2q {}", env!("CARGO_PKG_VERSION")),
+                source_sha256: sha,
+                // mmproj_sha256 stays None: the legacy mmproj path emits
+                // AFTER the main GGUF in `GgufBackend::write` (~line 556)
+                // and the ADR-012 P10 mmproj emits in Phase 4.8 — both
+                // post-write.  A future iter that re-orders Phase 4.6/4.8
+                // can populate this; the writer helper already supports
+                // it via `Hf2qProvenance::mmproj_sha256`.
+                mmproj_sha256: None,
+            }
+        })
+    });
+    if let Some(p) = &provenance {
+        tracing::info!(
+            producer_version = %p.producer_version,
+            source_sha256 = %p.source_sha256,
+            "ADR-005 iter-211: stamping hf2q.provenance.* keys at GGUF emit"
+        );
+    }
+
     let backend: Box<dyn OutputBackend> = match config.format {
-        cli::OutputFormat::Gguf => Box::new(GgufBackend::new()),
+        cli::OutputFormat::Gguf => {
+            let mut b = GgufBackend::new();
+            if let Some(p) = provenance {
+                b = b.with_provenance(p);
+            }
+            Box::new(b)
+        }
         cli::OutputFormat::Safetensors => {
             Box::new(SafetensorsBackend::with_shard_size_gb(config.shard_size_gb))
         }

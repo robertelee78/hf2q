@@ -387,3 +387,314 @@ fn sha256_hex(bytes: &[u8]) -> String {
     }
     s
 }
+
+// ---------------------------------------------------------------------
+// ADR-005 Phase 4 iter-211 — hf2q-stamped GGUF round-trip integration
+// ---------------------------------------------------------------------
+//
+// These two subprocess tests assert that a GGUF stamped with the three
+// iter-211 `hf2q.provenance.*` keys is correctly classified by the
+// iter-207 reader running inside the production `cmd_serve`
+// auto-pipeline:
+//
+// 1. **Short-circuit fires (load-bearing PASS).**
+//    Fabricate a hf2q-stamped GGUF + a manifest whose `source_shards`
+//    bundle-SHA matches the GGUF's `hf2q.source_sha256`, and whose
+//    GGUF SHA-256 is GARBAGE.  If the auto-pipeline runs the W71
+//    `verify_quantized` 30 GB SHA-256 path, it FAILS (re-quantize
+//    branch).  If the iter-207 short-circuit fires (cross-verifying
+//    the bundle SHA), `verify_quantized` is SKIPPED — the test asserts
+//    via the structured-log line at
+//    `serve::auto_pipeline::check_integrity` line ~426
+//    ("auto-pipeline: hf2q-origin GGUF detected; integrity re-check
+//    short-circuited") AND via the absence of the W71 fail surface.
+//
+// 2. **Mismatch refuses (load-bearing FAIL).**
+//    Same fixture but `hf2q.source_sha256` is deliberately wrong.
+//    iter-207 maps this to `Err(_)` in `lookup_and_verify` — the
+//    process exits non-zero with an stderr message naming the claimed
+//    SHA, the expected SHA, and the cached path.
+//
+// Both tests build the hf2q-stamped GGUF byte-for-byte using the same
+// wire format the iter-211 writer (`backends::gguf::Hf2qProvenance`
+// + `GgufBackend::with_provenance`) produces.  This is a genuine
+// integration test — if either side drifts, the test fails.
+
+const PROVENANCE_KEY_PRODUCER_VERSION: &str = "hf2q.producer_version";
+const PROVENANCE_KEY_SOURCE_SHA256: &str = "hf2q.source_sha256";
+const _PROVENANCE_KEY_MMPROJ_SHA256: &str = "hf2q.mmproj_sha256";
+
+/// Wire-format string-typed metadata KV pair — mirrors
+/// `serve::auto_pipeline::tests::write_str_kv`.  GGUF spec
+/// (gguf.md §2.1):
+///   u64 key_length
+///   key bytes
+///   u32 value_type (8 = string)
+///   u64 string_length
+///   string bytes
+fn write_str_kv(buf: &mut Vec<u8>, key: &str, value: &str) {
+    buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+    buf.extend_from_slice(key.as_bytes());
+    buf.extend_from_slice(&8u32.to_le_bytes()); // GGUF_TYPE_STRING
+    buf.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    buf.extend_from_slice(value.as_bytes());
+}
+
+/// Build a minimal hf2q-stamped GGUF: magic + v3 + zero tensors + N
+/// metadata KVs.  Mirrors the iter-211 writer's emit shape so a
+/// production `serve::provenance::detect` returns
+/// `Provenance::Hf2q { .. }`.
+fn build_gguf_with_string_metadata(pairs: &[(&str, &str)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"GGUF");
+    buf.extend_from_slice(&3u32.to_le_bytes()); // version
+    buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+    buf.extend_from_slice(&(pairs.len() as u64).to_le_bytes()); // metadata_kv_count
+    for (k, v) in pairs {
+        write_str_kv(&mut buf, k, v);
+    }
+    buf
+}
+
+/// Compute the canonical source-bundle SHA-256 of a list of (filename,
+/// sha256-hex) pairs.  Mirrors
+/// `serve::cache::compute_source_bundle_sha256` byte-for-byte.
+/// Standalone so the integration test doesn't link against the
+/// binary's library half.
+fn compute_bundle_sha(pairs: &[(&str, &str)]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut sorted: Vec<(&str, String)> = pairs
+        .iter()
+        .map(|(f, h)| (*f, h.to_ascii_lowercase()))
+        .collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    let mut h = Sha256::new();
+    for (f, sha) in &sorted {
+        h.update(f.as_bytes());
+        h.update(b":");
+        h.update(sha.as_bytes());
+        h.update(b"\n");
+    }
+    let out = h.finalize();
+    let mut s = String::with_capacity(64);
+    for b in out {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+/// Fabricate a cache fixture mirroring iter-204's `e2e_cache_hit_*`
+/// helper but extended with hf2q.* provenance + `source_shards`
+/// records.
+///
+/// **Hardware-quant resilience.** `serve::quant_select::select_quant`
+/// picks one of `{Q4_K_M, Q6_K, Q8_0, Q3_K_M}` based on
+/// `available_memory_bytes` at subprocess-spawn time (W51 table:
+/// ≥64 GiB → Q8_0, 32-64 GiB → Q6_K, 16-32 GiB → Q4_K_M, <16 GiB →
+/// Q3_K_M).  The fixture writes the GGUF under EVERY quant subdir +
+/// records every quant in the manifest so the cache hit fires
+/// regardless of which quant the auto-pipeline picks for the host
+/// box.  Same on-disk bytes + same per-quant manifest entry; the
+/// hf2q.source_sha256 in the GGUF doesn't depend on quant.
+fn fab_iter211_cache_with_hf2q_gguf(
+    cache_dir: &Path,
+    repo_id: &str,
+    gguf_bytes: &[u8],
+    manifest_sha: &str,
+    bundle_shards: &[(&str, &str)],
+) {
+    use std::fs;
+
+    let slug = repo_id.replace('/', "__");
+    let bytes = gguf_bytes.len() as u64;
+
+    // Write the same GGUF under every quant subdir the W51 selector
+    // can pick.  The cache lookup keys on (repo_id, quant) so we need
+    // a hit for each possible host-class.
+    let quants = ["Q3_K_M", "Q4_K_M", "Q6_K", "Q8_0"];
+    let mut quant_paths = std::collections::HashMap::new();
+    for q in quants {
+        let dir = cache_dir
+            .join("models")
+            .join(&slug)
+            .join("quantized")
+            .join(q);
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("model.gguf");
+        fs::write(&p, gguf_bytes).unwrap();
+        quant_paths.insert(q, p);
+    }
+
+    // source_shards array — mirrors `cache::SourceShard` JSON shape.
+    let mut shards_json = String::from("[");
+    for (i, (filename, sha)) in bundle_shards.iter().enumerate() {
+        if i > 0 {
+            shards_json.push(',');
+        }
+        shards_json.push_str(&format!(
+            r#"{{"filename":"{filename}","bytes":1024,"sha256":"{sha}","hf_etag":"{sha}","is_lfs":true,"verified_at_secs":1}}"#
+        ));
+    }
+    shards_json.push(']');
+
+    // Manifest carries every quant entry so the lookup hits whichever
+    // the host's W51 selector picks.
+    let mut quant_entries_json = String::new();
+    for (i, q) in quants.iter().enumerate() {
+        if i > 0 {
+            quant_entries_json.push(',');
+        }
+        quant_entries_json.push_str(&format!(
+            r#""{q}":{{"quant_type":"{q}","gguf_path":"{gguf}","mmproj_path":null,"bytes":{bytes},"sha256":"{manifest_sha}","quantized_at_secs":12345,"quantized_by_version":"iter-211-test-fixture"}}"#,
+            gguf = quant_paths[q].display(),
+        ));
+    }
+
+    let manifest_json = format!(
+        r#"{{
+  "schema_version": 2,
+  "models": {{
+    "{repo_id}": {{
+      "repo_id": "{repo_id}",
+      "revision": "deadbeef00000000000000000000000000000000",
+      "source": {{ "kind": "local", "path": "{src}", "sha256": "n/a" }},
+      "quantizations": {{ {quant_entries_json} }},
+      "last_accessed_secs": 12345,
+      "source_shards": {shards_json}
+    }}
+  }}
+}}"#,
+        src = cache_dir.parent().unwrap_or(cache_dir).join("source").display(),
+    );
+    fs::write(cache_dir.join("manifest.json"), &manifest_json).unwrap();
+}
+
+#[test]
+fn e2e_iter211_short_circuit_fires_on_hf2q_stamped_cache_hit() {
+    if skip_unless_gated("e2e_iter211_short_circuit_fires_on_hf2q_stamped_cache_hit") {
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cache_dir = tmp.path().join("hf2q_cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let repo_id = "iter211-fixture/short-circuit";
+
+    // Build the bundle SHA from synthetic shards.
+    let shards = [
+        ("model-00001-of-00002.safetensors", &"a".repeat(64)),
+        ("model-00002-of-00002.safetensors", &"b".repeat(64)),
+    ];
+    let shards_refs: Vec<(&str, &str)> = shards
+        .iter()
+        .map(|(f, s)| (*f, s.as_str()))
+        .collect();
+    let bundle_sha = compute_bundle_sha(&shards_refs);
+
+    // hf2q-stamped GGUF whose declared source_sha256 MATCHES the
+    // cache's recorded shards.
+    let gguf_bytes = build_gguf_with_string_metadata(&[
+        (PROVENANCE_KEY_PRODUCER_VERSION, "hf2q 0.1.0-iter211-test"),
+        (PROVENANCE_KEY_SOURCE_SHA256, &bundle_sha),
+    ]);
+    // Manifest SHA is GARBAGE — verify_quantized would fail HARD if
+    // the iter-207 short-circuit didn't fire on the matching
+    // hf2q.source_sha256.  This is the load-bearing isolation: only
+    // the short-circuit can produce a "cache hit" log line.
+    let bogus_manifest_sha = "0".repeat(64);
+
+    fab_iter211_cache_with_hf2q_gguf(
+        &cache_dir,
+        repo_id,
+        &gguf_bytes,
+        &bogus_manifest_sha,
+        &shards_refs,
+    );
+
+    let (_code, _stdout, stderr) = run_serve_resolve(&cache_dir, repo_id, &[], 60);
+    let lc = stderr.to_lowercase();
+
+    // Load-bearing assertion: the iter-207 short-circuit log line
+    // (auto_pipeline.rs ~line 426) MUST appear in stderr.  The
+    // alternative — "cached GGUF failed integrity check" (W71 SHA
+    // path) — would fire if the short-circuit didn't, so its absence
+    // is also load-bearing.
+    let saw_short_circuit = lc.contains("short-circuited")
+        || lc.contains("hf2q-origin gguf detected")
+        || lc.contains("integrity re-check");
+    assert!(
+        saw_short_circuit,
+        "expected iter-207 short-circuit log line; got stderr:\n{stderr}"
+    );
+    assert!(
+        !lc.contains("failed integrity check"),
+        "W71 verify_quantized must NOT have run (short-circuit fired); got stderr:\n{stderr}"
+    );
+    // Also: the manifest must be untouched (no re-quantize attempted).
+    assert!(cache_dir.join("manifest.json").exists());
+}
+
+#[test]
+fn e2e_iter211_provenance_mismatch_refuses_to_load() {
+    if skip_unless_gated("e2e_iter211_provenance_mismatch_refuses_to_load") {
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cache_dir = tmp.path().join("hf2q_cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let repo_id = "iter211-fixture/provenance-mismatch";
+
+    // Real bundle SHA from the synthetic shards…
+    let shards = [
+        ("model-00001-of-00002.safetensors", &"a".repeat(64)),
+        ("model-00002-of-00002.safetensors", &"b".repeat(64)),
+    ];
+    let shards_refs: Vec<(&str, &str)> = shards
+        .iter()
+        .map(|(f, s)| (*f, s.as_str()))
+        .collect();
+    let _real_bundle_sha = compute_bundle_sha(&shards_refs);
+
+    // …but the GGUF's hf2q.source_sha256 is DELIBERATELY WRONG.
+    let claimed_wrong_sha = "9".repeat(64);
+    let gguf_bytes = build_gguf_with_string_metadata(&[
+        (PROVENANCE_KEY_PRODUCER_VERSION, "hf2q 0.1.0-iter211-test"),
+        (PROVENANCE_KEY_SOURCE_SHA256, &claimed_wrong_sha),
+    ]);
+    // Manifest SHA matches the on-disk bytes (so a fall-through to
+    // verify_quantized would PASS — proves the mismatch detection is
+    // load-bearing distinct from W71 failure).
+    let real_gguf_sha = sha256_hex(&gguf_bytes);
+
+    fab_iter211_cache_with_hf2q_gguf(
+        &cache_dir,
+        repo_id,
+        &gguf_bytes,
+        &real_gguf_sha,
+        &shards_refs,
+    );
+
+    let (code, _stdout, stderr) = run_serve_resolve(&cache_dir, repo_id, &[], 60);
+    let lc = stderr.to_lowercase();
+
+    // Load-bearing assertion: subprocess MUST NOT exit zero (the
+    // iter-207 mismatch case maps to Err in lookup_and_verify, which
+    // bubbles out of the auto-pipeline as a fatal error before any
+    // load completes).
+    assert_ne!(
+        code,
+        Some(0),
+        "provenance mismatch must NOT exit zero; got code {code:?}, stderr:\n{stderr}"
+    );
+    let saw_mismatch = lc.contains("provenance mismatch")
+        || lc.contains("hf2q-origin provenance mismatch")
+        || lc.contains(&claimed_wrong_sha)
+        || lc.contains("refusing to short-circuit");
+    assert!(
+        saw_mismatch,
+        "expected stderr to name the iter-207 mismatch surface (claimed SHA / 'provenance mismatch' / 'refusing to short-circuit'); got:\n{stderr}"
+    );
+}

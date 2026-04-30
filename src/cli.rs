@@ -1156,6 +1156,18 @@ pub struct ConvertConfig {
     /// ADR-014 P9 iter-1 §S5 — target shard size in GB for the
     /// safetensors directory layout. Default 5.0; range 0.5..=50.0.
     pub shard_size_gb: f64,
+    /// ADR-005 Phase 4 iter-211 — per-shard integrity records returned
+    /// by [`crate::input::integrity::verify_repo`] during the
+    /// `--repo` resolution path.  When `Some`, `cmd_convert` derives a
+    /// canonical source-bundle SHA via
+    /// [`crate::serve::cache::compute_source_bundle_sha256`] and the
+    /// GGUF backend stamps it into `hf2q.source_sha256` so the
+    /// auto-pipeline short-circuit can fire on the next cache hit.
+    /// `None` for `--input` (local) runs and `--no-integrity` runs —
+    /// no source bundle binding is available, GGUF parses as External,
+    /// auto-pipeline runs the W71 30 GB SHA-256 re-hash exactly as
+    /// before.
+    pub source_shards: Option<Vec<crate::input::integrity::ShardIntegrity>>,
 }
 
 /// Custom value parser for `--shard-size-gb` (ADR-014 P9 iter-1 §S5).
@@ -1222,6 +1234,12 @@ pub fn parse_sensitive_layers(spec: &str) -> anyhow::Result<Vec<std::ops::RangeI
 #[allow(dead_code)]
 /// Build a ConvertConfig from parsed CLI ConvertArgs.
 pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfig> {
+    // ADR-005 Phase 4 iter-211 — capture per-shard integrity records
+    // from verify_repo and surface them on `ConvertConfig` so the
+    // GGUF backend can stamp `hf2q.source_sha256` at write time.
+    // `None` for the local-path / `--no-integrity` paths (no source
+    // bundle binding is available; GGUF parses as External post-write).
+    let mut source_shards: Option<Vec<crate::input::integrity::ShardIntegrity>> = None;
     let input_dir = match (&args.input, &args.repo) {
         (Some(path), None) => {
             if !path.exists() {
@@ -1257,8 +1275,9 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
                     .filter(|s| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()))
                     .unwrap_or("main")
                     .to_string();
-                crate::input::integrity::verify_repo(repo_id, &revision, &dir)
+                let shards = crate::input::integrity::verify_repo(repo_id, &revision, &dir)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
+                source_shards = Some(shards);
             }
             dir
         }
@@ -1367,6 +1386,7 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
         calibration: args.calibration,
         output_format: args.output_format,
         shard_size_gb: args.shard_size_gb,
+        source_shards,
     })
 }
 

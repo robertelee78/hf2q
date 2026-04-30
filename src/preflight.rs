@@ -742,6 +742,7 @@ mod tests {
             calibration: None,
             output_format: None,
             shard_size_gb: 5.0,
+            source_shards: None,
         };
 
         let report = validate(&config, &metadata).unwrap();
@@ -788,6 +789,7 @@ mod tests {
             calibration: None,
             output_format: None,
             shard_size_gb: 5.0,
+            source_shards: None,
         };
 
         let report = validate(&config, &metadata).unwrap();
@@ -830,6 +832,7 @@ mod tests {
             calibration: None,
             output_format: None,
             shard_size_gb: 5.0,
+            source_shards: None,
         };
 
         let result = validate(&config, &metadata);
