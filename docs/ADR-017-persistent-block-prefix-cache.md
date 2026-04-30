@@ -548,6 +548,49 @@ Per the mantra: "No fallback. No stub (todo later) code." If a kill-gate fires, 
 
 ---
 
+## Defects discovered during A0 falsification (added 2026-04-30)
+
+The Phase A0 substrate-and-matrix iters surfaced eight defects across two classes. Per `feedback_substrate_must_not_synthesize_ship_gates` and the mantra, every defect is recorded honestly here regardless of whether it gates ADR-017 closure. Class A defects are SUBSTRATE bugs (in the harness/instrumentation itself) — fixed in A0.2b. Class B defects are PRODUCTION-side findings that A0 surfaced but that are NOT in scope for ADR-017 closure; they affect related ADRs (ADR-015 perf, future ADR-018) and are recorded here so they don't get lost.
+
+### Class A — Substrate defects (FIXED in A0.2b commit 1c3b946)
+
+**A-D1 — Prompt construction BPE-collapsed.** The A0.2a `run_cell_with_subprocess` constructed cell prompts via `"hello ".repeat(prefix_tokens / 6)`. Gemma 4's tokenizer collapsed the repeated pattern to <50 BPE tokens regardless of nominal cell prefix length. Result: every cell measured ~16-token prefill; ship-gate ratios were denominator-broken. **Fix (A0.2b):** replaced with token-diverse `format!("word{i}")` sequence; parsed SSE final usage block to record `actual_prompt_tokens`; gate logic uses ACTUAL not nominal token count. Verified: L0=11 / L512=409 / L2K=1945 / L8K=9137 / L32K=39857 actual tokens after fix.
+
+**A-D2 — Symlink eviction-cycle missing config.json sibling.** `measure_swap_eviction_cycle` symlinked only the GGUF into the tempdir; `hf2q serve` requires `config.json` + `tokenizer.json` adjacent. Result: SwapBackInSameCtx cells returned HTTP 500 "Failed to parse config.json". **Fix (A0.2b):** symlink `config.json`, `tokenizer.json`, `generation_config.json`, and `*-mmproj.gguf` adjacent to the GGUF symlink in tempdir.
+
+**A-D3 — SSE transport errors on sub-second responses.** `measure_ttft_subprocess` returned `transport: error sending request` / `request or response body error` on cells whose response completed in <100ms (L0/L512 with very short prompts). Likely cause: SSE writer/reader race when response body is small. **Fix (A0.2b):** retry-with-backoff (100ms / 250ms / 500ms) up to 3× when transport error fires sub-second. Don't mask real timeouts. `retry_count` surfaced in `CellMeasurement`. (Post-fix the matrix needed zero retries — D1's longer prefills mooted the race window.)
+
+**A-D4 — Gemma 4 chat-template missing in API code path (caught during A0.2b matrix run).** `src/serve/api/engine.rs` did not have the Gemma 4 chat-template fallback that `cmd_generate` already had. First subprocess matrix attempt fired the missing-template error visible in the matrix log. **Fix (A0.2b commit d4e9719 → b43edcd merged):** added Gemma4 chat-template fallback in `src/serve/api/engine.rs` + `src/serve/mod.rs`. This is a real bug that affected production serve-side, not just the harness.
+
+### Class B — Production-side findings (not in scope for ADR-017 closure)
+
+**B-F1 — R-P3 ceiling vs APFS write+fsync floor.** A0.2b measured `pre_evict_ms=517ms` at L32K (128 blocks × 1 MiB each) on M5 Max APFS. The §Performance R-P3 ceiling of 200ms was specced before measurement; 517ms is APFS write+fsync throughput, not a hf2q-side bug. **Resolution path (DOES NOT block ADR-017 closure):** Phase A.1 must EITHER (a) raise R-P3 ceiling to ~600ms after re-spec on measured floor, OR (b) introduce the `flush_buffer` write-aggregation pattern (already flagged as B-dense reserve in §D9 — write multiple blocks to a single tempfile + atomic-rename). Data informs the decision per the mantra. R-P3 fail does NOT trip K1/K3; K1/K3 are about the cache-hit ratio, which passed by 22×/16× margin.
+
+**B-F2 — R-P6 cell coverage incomplete.** A0.2b matrix ran `SharedPrefix4Agents` cells at L0 and L512 only, NOT at the L4K target prefix length (R-P6's specced denominator). Result: R-P6 verdict is `N/A` rather than PASS/FAIL. **Resolution path:** A0.2c iter expands the ship-gate filter to include `(SharedPrefix4Agents, L4K)` cell or close-equivalent (e.g. L8K). Low priority since R-P4/R-P5 already pass decisively; R-P6 is a different scenario class.
+
+**B-F3 — Harness decode_tok_s metric implausible.** A0.2b matrix reported `decode_tok_s_no_cache=800-880 t/s` on Gemma 4 26B Q4_0. Peer benchmark on the same GGUF on the same M5 Max measured llama.cpp `tg16=93 t/s`; the mlx-lm baseline (`project_benchmark_baselines`) is ~124 t/s. 880 vs 93 is a 9× ratio; greedy decode on the same hardware should not be 9× faster. **Likely root cause:** the harness's tok/s calc may include `prompt_tokens` in the numerator (computing `(prompt+completion)/decode_wall` instead of `completion/decode_wall`), which inflates the metric for long prompts. **Resolution path:** A0.2c iter inspects `subprocess_driver::measure_ttft_subprocess` SSE-parsing tps calc and validates against known peer baselines. Does NOT block ADR-017 closure (R-P1 decode-regression gate is RELATIVE, comparing cache-enabled-but-miss vs no-cache; both legs use the same calc so any bug cancels).
+
+**B-F4 — Gemma 4 26B Q4_0 prefill is 29-40× slower than llama.cpp on M5 Max.** Peer benchmark (llama-bench from homebrew/ggml 0.9.11, same GGUF, same hardware, mcp-brain-server STOP-paused):
+
+| Prefix | hf2q TTFT (ms) | hf2q t/s | llama.cpp t/s | hf2q/llama ratio |
+|---|---|---|---|---|
+| 512 | 4,214 | 97 | 3,819 | 0.025× (40× slower) |
+| 2,048 | 20,359 | 95 | 3,622 | 0.026× (38× slower) |
+| 8,192 | 103,739 | 88 | 3,339 | 0.026× (38× slower) |
+| 32,768 | 568,639 | 70 | 2,047 | 0.034× (29× slower) |
+
+This is a release-gate violation per `project_speed_bar_full_matrix` (hf2q ≥1.00× llama.cpp on same hardware across all quants × lengths × modes). **Likely root cause:** Gemma 4 dense full-attention prefill path may not be wired to `flash_attn_prefill` (W-5b.10 closed Gemma 3 to 4.34× via flash_attn_prefill wire-up; Gemma 4 uses different model-class infra and may not have inherited the wire-up). Audit `src/inference/models/gemma4*/forward_*.rs` to verify FA wiring. **Resolution path (NOT in ADR-017 scope):** ADR-015 (or new ADR-018) territory. ADR-017 closure does NOT require closing this gap because the cache-ratio gate (R-P4 / R-P5) is RELATIVE and survives slow base paths — cache wins amortize regardless. The cache layer makes the slow path faster via persistence; it does NOT close the underlying prefill perf gap.
+
+**B-F5 — DWQ/Dwq46 cells unimplemented in is_runnable_today.** A0.1 substrate filter excludes `(Family::Gemma4_26b, KvPath::Dense, WeightQuant::Dwq46|Dwq48)` from runnable today. **Resolution path (low priority for ADR-017 closure):** wire DWQ quant fallback so the matrix can exercise both Q4_0 and DWQ Gemma 4 cells; relevant for the per-quant ratio variance documented in ADR-017's open question OQ-2 (storage-delta).
+
+### Defect-resolution discipline
+
+- Class A defects MUST be fixed before the matrix verdict is trustable. A0.2b fixed all four; ship-gate verdicts post-fix are valid.
+- Class B defects DO NOT block ADR-017 closure as long as the kill-gates K1-K6 do not fire. K1 (ratio > 0.30) and K3 (speedup < 5×) are GREEN with 22× / 111× margins respectively, so the cache-layer falsification is decisive even with B-F4 perf gap.
+- Class B defects MUST land their own targeted ADRs / iters before the broader project ships. The release-gate is `project_speed_bar_full_matrix`, not ADR-017's per-cache ship-gates. The peer benchmark in `docs/ADR-017-phase-a0-results.md` is the load-bearing evidence for that follow-up scope.
+
+---
+
 ## Iter-by-iter plan
 
 | Iter | Phase | Scope | LOC est. | Depends on |
