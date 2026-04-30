@@ -14,6 +14,8 @@ pub mod forward_prefill_batched;
 pub mod gpu;
 pub mod header;
 #[allow(dead_code)]
+pub mod kv_persist;
+#[allow(dead_code)]
 pub mod multi_model;
 pub mod parity_quality;
 #[allow(dead_code)]
