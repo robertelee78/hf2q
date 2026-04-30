@@ -1114,12 +1114,18 @@ impl GemmaLoadedModel {
             .metadata_string("tokenizer.chat_template")
             .map(|s| s.to_string())
             .unwrap_or_else(|| {
+                // Phase A0.2b — API path uses minijinja rendering against
+                // `messages` array; the CLI fallback template's literal
+                // `{{PROMPT}}` placeholder is unbound under minijinja and
+                // collapses every prompt to ~14 boilerplate tokens (root
+                // cause of ADR-017 A0.2b flat-TTFT regression). The API
+                // fallback iterates the messages array properly.
                 tracing::warn!(
                     "Engine load: no GGUF `tokenizer.chat_template`; \
-                     using hardcoded Gemma4 fallback. Request rendering will \
-                     only handle single-turn user prompts correctly."
+                     using API-path Gemma4 fallback (iterates messages \
+                     array; supports multi-turn correctly)."
                 );
-                crate::serve::FALLBACK_GEMMA4_CHAT_TEMPLATE.to_string()
+                crate::serve::FALLBACK_GEMMA4_API_CHAT_TEMPLATE.to_string()
             });
 
         // Load GPU ctx + weights. `header::LoadProgress` is happy with a
