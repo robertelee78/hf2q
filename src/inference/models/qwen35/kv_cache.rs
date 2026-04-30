@@ -128,6 +128,108 @@ pub enum LayerSlot {
     Linear(u32), // index into `linear_attn`
 }
 
+/// Deep-copy snapshot of a [`HybridKvCache`] — owns fresh `MlxBuffer`
+/// allocations holding byte-equal contents at snapshot time.
+///
+/// Wedge-3 / ADR-005 iter-216 Phase B.  Used by `HybridPromptCache`
+/// (engine_qwen35.rs Phase C) to save post-prefill cache state for replay
+/// on the next equivalent prompt.  See [`HybridKvCache::snapshot`] for
+/// the deep-copy contract and the DeltaNet ping-pong note.
+pub struct HybridKvCacheSnapshot {
+    /// One per full-attn layer (e.g. 16 for Qwen3.6 27B): K matrix bytes.
+    pub full_attn_k: Vec<MlxBuffer>,
+    /// One per full-attn layer: V matrix bytes.
+    pub full_attn_v: Vec<MlxBuffer>,
+    /// One per full-attn layer: per-seq write cursor at snapshot time.
+    pub full_attn_current_len: Vec<Vec<u32>>,
+    /// MTP slot snapshot (present only when the source cache had one).
+    pub mtp: Option<MtpKvSnapshot>,
+    /// One per linear-attn (DeltaNet) layer: active conv-state bytes.
+    /// Scratch is intentionally NOT snapshotted — see [`HybridKvCache::snapshot`].
+    pub linear_conv: Vec<MlxBuffer>,
+    /// One per linear-attn layer: active recurrent state bytes.
+    pub linear_recurrent: Vec<MlxBuffer>,
+}
+
+/// MTP slot snapshot — same shape as a `FullAttnKvSlot` snapshot but kept
+/// as a dedicated struct so `Option<MtpKvSnapshot>` is explicit rather
+/// than overloading `full_attn_k`/`full_attn_v` with a sentinel.
+pub struct MtpKvSnapshot {
+    pub k: MlxBuffer,
+    pub v: MlxBuffer,
+    pub current_len: Vec<u32>,
+}
+
+impl HybridKvCacheSnapshot {
+    /// Total bytes the snapshot owns across all KV / SSM slots.  Useful
+    /// for memory accounting + tracing the per-prompt cache footprint.
+    pub fn total_bytes(&self) -> usize {
+        let mut n = 0usize;
+        for k in &self.full_attn_k {
+            n += k.byte_len();
+        }
+        for v in &self.full_attn_v {
+            n += v.byte_len();
+        }
+        if let Some(s) = &self.mtp {
+            n += s.k.byte_len() + s.v.byte_len();
+        }
+        for c in &self.linear_conv {
+            n += c.byte_len();
+        }
+        for r in &self.linear_recurrent {
+            n += r.byte_len();
+        }
+        n
+    }
+}
+
+/// Allocate a fresh `MlxBuffer` of the same byte-length / dtype / shape
+/// as `src`, and memcpy the source bytes into it.  Used by the snapshot
+/// path to produce buffers that DON'T alias the source.
+fn deep_copy_buffer(device: &MlxDevice, src: &MlxBuffer) -> Result<MlxBuffer> {
+    let byte_len = src.byte_len();
+    let dtype = src.dtype();
+    let shape = src.shape().to_vec();
+    let mut dst = device
+        .alloc_buffer(byte_len, dtype, shape)
+        .map_err(|e| anyhow!("deep_copy_buffer alloc: {e}"))?;
+    let src_bytes: &[u8] = src
+        .as_slice::<u8>()
+        .map_err(|e| anyhow!("deep_copy_buffer src as_slice: {e}"))?;
+    let dst_bytes: &mut [u8] = dst
+        .as_mut_slice::<u8>()
+        .map_err(|e| anyhow!("deep_copy_buffer dst as_mut_slice: {e}"))?;
+    anyhow::ensure!(
+        src_bytes.len() == dst_bytes.len(),
+        "deep_copy_buffer: byte-length mismatch (src={} dst={})",
+        src_bytes.len(),
+        dst_bytes.len()
+    );
+    dst_bytes.copy_from_slice(src_bytes);
+    Ok(dst)
+}
+
+/// Memcpy bytes from `src` to `dst`.  Both buffers must have equal
+/// `byte_len`; mismatches are caller bugs (different cache shapes) and
+/// surface as Err.
+fn copy_buffer_bytes(src: &MlxBuffer, dst: &mut MlxBuffer) -> Result<()> {
+    anyhow::ensure!(
+        src.byte_len() == dst.byte_len(),
+        "copy_buffer_bytes: byte-length mismatch (src={} dst={})",
+        src.byte_len(),
+        dst.byte_len()
+    );
+    let src_bytes: &[u8] = src
+        .as_slice::<u8>()
+        .map_err(|e| anyhow!("copy_buffer_bytes src as_slice: {e}"))?;
+    let dst_bytes: &mut [u8] = dst
+        .as_mut_slice::<u8>()
+        .map_err(|e| anyhow!("copy_buffer_bytes dst as_mut_slice: {e}"))?;
+    dst_bytes.copy_from_slice(src_bytes);
+    Ok(())
+}
+
 /// DeltaNet 1D conv kernel width — Qwen3.5 uses 4; kept as a constant here so
 /// the conv-state allocation math is explicit. If the config ever varies, the
 /// value is the runtime authority (`cfg.linear_conv_kernel_dim`).
@@ -270,6 +372,151 @@ impl HybridKvCache {
                 }
             }
         }
+    }
+
+    /// Take a deep-copy snapshot of every owned KV / SSM buffer in this
+    /// cache.
+    ///
+    /// Wedge-3 / ADR-005 iter-216 Phase B.  The snapshot owns *fresh*
+    /// `MlxBuffer` allocations whose contents byte-equal the corresponding
+    /// buffers at snapshot time.  Used by `HybridPromptCache` to save
+    /// post-prefill cache state and replay it for the next equivalent
+    /// prompt, mirroring Gemma's `PromptCache` shape but with the hybrid
+    /// (full-attn K/V + DeltaNet conv-state + recurrent state) surface.
+    ///
+    /// # Why deep-copy and NOT Arc::clone
+    ///
+    /// `MlxBuffer`'s underlying allocation is an `Arc<MetalBuffer>` — an
+    /// `Arc::clone` would alias the buffer and a subsequent decode call
+    /// (which writes into the cache through `forward_gpu`) would mutate
+    /// the snapshot in lock-step with the live cache, defeating the
+    /// purpose of caching pre-decode state.  Deep-copy via
+    /// `device.alloc_buffer` + byte-level memcpy detaches the snapshot
+    /// from the live cache so the snapshot is stable across any number of
+    /// subsequent forward passes.
+    ///
+    /// # Ping-pong note (DeltaNet)
+    ///
+    /// `LinearAttnStateSlot::conv_state` and `recurrent` are the *active*
+    /// (read) buffers under the kernel's ping-pong contract.  After each
+    /// decode step the caller swaps them with the corresponding scratch
+    /// buffer.  The snapshot only captures the active buffers — the
+    /// scratch contents at snapshot time are post-write garbage that the
+    /// next forward pass overwrites unconditionally, so they carry no
+    /// semantic state.  On restore, scratch is left untouched (the next
+    /// forward will write into it then swap; the swap exchange is
+    /// purely a pointer operation, no copy).
+    ///
+    /// # Errors
+    ///
+    /// Propagates from any `MlxDevice::alloc_buffer` call (zero-byte
+    /// alloc, OOM) and from `MlxBuffer::as_slice<u8>` / `as_mut_slice<u8>`
+    /// (impossible in correct operation: every snapshot buffer is sized
+    /// to its source's byte length).
+    pub fn snapshot(&self, device: &MlxDevice) -> Result<HybridKvCacheSnapshot> {
+        let mut full_attn_k = Vec::with_capacity(self.full_attn.len());
+        let mut full_attn_v = Vec::with_capacity(self.full_attn.len());
+        let mut full_attn_current_len = Vec::with_capacity(self.full_attn.len());
+        for slot in &self.full_attn {
+            full_attn_k.push(deep_copy_buffer(device, &slot.k).context("snapshot full_attn.k")?);
+            full_attn_v.push(deep_copy_buffer(device, &slot.v).context("snapshot full_attn.v")?);
+            full_attn_current_len.push(slot.current_len.clone());
+        }
+        let mtp = match &self.mtp_slot {
+            Some(slot) => Some(MtpKvSnapshot {
+                k: deep_copy_buffer(device, &slot.k).context("snapshot mtp.k")?,
+                v: deep_copy_buffer(device, &slot.v).context("snapshot mtp.v")?,
+                current_len: slot.current_len.clone(),
+            }),
+            None => None,
+        };
+        let mut linear_conv = Vec::with_capacity(self.linear_attn.len());
+        let mut linear_recurrent = Vec::with_capacity(self.linear_attn.len());
+        for slot in &self.linear_attn {
+            linear_conv.push(
+                deep_copy_buffer(device, &slot.conv_state).context("snapshot conv_state")?,
+            );
+            linear_recurrent.push(
+                deep_copy_buffer(device, &slot.recurrent).context("snapshot recurrent")?,
+            );
+        }
+        Ok(HybridKvCacheSnapshot {
+            full_attn_k,
+            full_attn_v,
+            full_attn_current_len,
+            mtp,
+            linear_conv,
+            linear_recurrent,
+        })
+    }
+
+    /// Memcpy the snapshot's per-slot bytes back into this cache's owned
+    /// buffers and restore per-seq write cursors.
+    ///
+    /// Wedge-3 / ADR-005 iter-216 Phase B.  Pairs with [`Self::snapshot`].
+    /// The cache's existing `MlxBuffer` allocations are reused — only their
+    /// contents are overwritten, so the cache shape (max_seq_len, n_seqs,
+    /// per-layer-slot vectors) MUST match the snapshot's source cache.
+    /// Mismatches surface as length-comparison errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns Err when:
+    /// - the snapshot's slot count doesn't match `self`'s
+    /// - any per-slot byte length disagrees (would mean a different
+    ///   `cfg`-shape cache — caller bug)
+    /// - any `as_slice` / `as_mut_slice` call fails
+    pub fn restore_from(&mut self, snapshot: &HybridKvCacheSnapshot) -> Result<()> {
+        anyhow::ensure!(
+            snapshot.full_attn_k.len() == self.full_attn.len(),
+            "restore_from: full_attn slot count mismatch ({} snapshot vs {} cache)",
+            snapshot.full_attn_k.len(),
+            self.full_attn.len()
+        );
+        anyhow::ensure!(
+            snapshot.linear_conv.len() == self.linear_attn.len(),
+            "restore_from: linear_attn slot count mismatch ({} snapshot vs {} cache)",
+            snapshot.linear_conv.len(),
+            self.linear_attn.len()
+        );
+        for (slot, (k_snap, (v_snap, len_snap))) in self.full_attn.iter_mut().zip(
+            snapshot
+                .full_attn_k
+                .iter()
+                .zip(snapshot.full_attn_v.iter().zip(snapshot.full_attn_current_len.iter())),
+        ) {
+            copy_buffer_bytes(k_snap, &mut slot.k).context("restore full_attn.k")?;
+            copy_buffer_bytes(v_snap, &mut slot.v).context("restore full_attn.v")?;
+            anyhow::ensure!(
+                len_snap.len() == slot.current_len.len(),
+                "restore_from: full_attn current_len shape mismatch"
+            );
+            slot.current_len.copy_from_slice(len_snap);
+        }
+        match (&snapshot.mtp, self.mtp_slot.as_mut()) {
+            (Some(snap), Some(slot)) => {
+                copy_buffer_bytes(&snap.k, &mut slot.k).context("restore mtp.k")?;
+                copy_buffer_bytes(&snap.v, &mut slot.v).context("restore mtp.v")?;
+                anyhow::ensure!(
+                    snap.current_len.len() == slot.current_len.len(),
+                    "restore_from: mtp current_len shape mismatch"
+                );
+                slot.current_len.copy_from_slice(&snap.current_len);
+            }
+            (None, None) => {}
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!("restore_from: mtp_slot presence mismatch between snapshot and cache");
+            }
+        }
+        for (slot, (conv_snap, rec_snap)) in self
+            .linear_attn
+            .iter_mut()
+            .zip(snapshot.linear_conv.iter().zip(snapshot.linear_recurrent.iter()))
+        {
+            copy_buffer_bytes(conv_snap, &mut slot.conv_state).context("restore conv_state")?;
+            copy_buffer_bytes(rec_snap, &mut slot.recurrent).context("restore recurrent")?;
+        }
+        Ok(())
     }
 
     /// Total allocated bytes across all slots (for memory accounting / logs).
@@ -602,6 +849,158 @@ mod tests {
         let linear_expected = 30 * (2 * conv_bytes + 2 * rec_bytes);
         let expected = full_expected + linear_expected;
         assert_eq!(cache.total_bytes(), expected);
+    }
+
+    // -- Wedge-3 / iter-216 Phase B: snapshot + restore ----------------
+
+    /// Wedge-3 / iter-216 Phase B: snapshot captures byte-exact contents
+    /// of every owned KV / SSM buffer, and restore_from puts them back
+    /// after intervening mutation.
+    #[test]
+    fn hybrid_kv_cache_snapshot_round_trip_preserves_bytes() {
+        let cfg = moe_cfg_40layer();
+        let device = MlxDevice::new().expect("device");
+        let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("alloc");
+
+        // Plant non-zero canary values so the snapshot has something
+        // unique to compare against zero / mutated bytes.
+        for (i, slot) in cache.full_attn.iter_mut().enumerate() {
+            let s = slot.k.as_mut_slice::<f32>().expect("k mut");
+            s[0] = (i as f32) + 0.25;
+            s[7] = (i as f32) + 0.5;
+            let s = slot.v.as_mut_slice::<f32>().expect("v mut");
+            s[0] = -(i as f32) - 0.125;
+            slot.current_len[0] = (i as u32) + 1;
+        }
+        for (i, slot) in cache.linear_attn.iter_mut().enumerate() {
+            let s = slot.conv_state.as_mut_slice::<f32>().expect("conv mut");
+            s[0] = (i as f32) * 2.0 + 1.0;
+            let s = slot.recurrent.as_mut_slice::<f32>().expect("rec mut");
+            s[0] = (i as f32) * 0.5 + 0.125;
+        }
+
+        let snap = cache.snapshot(&device).expect("snapshot");
+
+        // Capture canary values pre-mutation for later compare.
+        let mut expect_full_k0: Vec<f32> = Vec::new();
+        let mut expect_full_v0: Vec<f32> = Vec::new();
+        let mut expect_full_lens: Vec<u32> = Vec::new();
+        for slot in &cache.full_attn {
+            expect_full_k0.push(slot.k.as_slice::<f32>().unwrap()[0]);
+            expect_full_v0.push(slot.v.as_slice::<f32>().unwrap()[0]);
+            expect_full_lens.push(slot.current_len[0]);
+        }
+        let mut expect_lin_conv0: Vec<f32> = Vec::new();
+        let mut expect_lin_rec0: Vec<f32> = Vec::new();
+        for slot in &cache.linear_attn {
+            expect_lin_conv0.push(slot.conv_state.as_slice::<f32>().unwrap()[0]);
+            expect_lin_rec0.push(slot.recurrent.as_slice::<f32>().unwrap()[0]);
+        }
+
+        // Mutate the live cache: zero out everything + change cursors.
+        cache.reset();
+        for slot in cache.full_attn.iter_mut() {
+            for v in slot.k.as_mut_slice::<f32>().unwrap().iter_mut() {
+                *v = 999.0;
+            }
+            for v in slot.v.as_mut_slice::<f32>().unwrap().iter_mut() {
+                *v = -999.0;
+            }
+            slot.current_len[0] = 42;
+        }
+
+        // Restore — byte-equality across all canary positions.
+        cache.restore_from(&snap).expect("restore");
+        for (i, slot) in cache.full_attn.iter().enumerate() {
+            assert_eq!(
+                slot.k.as_slice::<f32>().unwrap()[0],
+                expect_full_k0[i],
+                "full_attn[{i}].k[0] not restored"
+            );
+            assert_eq!(
+                slot.v.as_slice::<f32>().unwrap()[0],
+                expect_full_v0[i],
+                "full_attn[{i}].v[0] not restored"
+            );
+            assert_eq!(
+                slot.current_len[0],
+                expect_full_lens[i],
+                "full_attn[{i}].current_len[0] not restored"
+            );
+        }
+        for (i, slot) in cache.linear_attn.iter().enumerate() {
+            assert_eq!(
+                slot.conv_state.as_slice::<f32>().unwrap()[0],
+                expect_lin_conv0[i],
+                "linear_attn[{i}].conv_state[0] not restored"
+            );
+            assert_eq!(
+                slot.recurrent.as_slice::<f32>().unwrap()[0],
+                expect_lin_rec0[i],
+                "linear_attn[{i}].recurrent[0] not restored"
+            );
+        }
+    }
+
+    /// Wedge-3 / iter-216 Phase B: snapshot does NOT alias the source
+    /// — mutating the source post-snapshot leaves snapshot bytes intact.
+    #[test]
+    fn hybrid_kv_cache_snapshot_does_not_alias() {
+        let cfg = moe_cfg_40layer();
+        let device = MlxDevice::new().expect("device");
+        let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("alloc");
+
+        // Plant a canary in slot 0.
+        cache.full_attn[0].k.as_mut_slice::<f32>().unwrap()[0] = 7.5;
+        cache.linear_attn[0].recurrent.as_mut_slice::<f32>().unwrap()[0] = 3.25;
+
+        let snap = cache.snapshot(&device).expect("snapshot");
+        // Canary values inside the snapshot.
+        let snap_full_k0 = snap.full_attn_k[0].as_slice::<f32>().unwrap()[0];
+        let snap_lin_rec0 = snap.linear_recurrent[0].as_slice::<f32>().unwrap()[0];
+        assert_eq!(snap_full_k0, 7.5);
+        assert_eq!(snap_lin_rec0, 3.25);
+
+        // Mutate the live cache — snapshot must NOT see this.
+        cache.full_attn[0].k.as_mut_slice::<f32>().unwrap()[0] = -123.0;
+        cache.linear_attn[0].recurrent.as_mut_slice::<f32>().unwrap()[0] = -456.0;
+
+        // Snapshot still holds the original canaries (deep-copy, not Arc::clone).
+        assert_eq!(
+            snap.full_attn_k[0].as_slice::<f32>().unwrap()[0],
+            7.5,
+            "snapshot aliased live cache (full_attn.k)"
+        );
+        assert_eq!(
+            snap.linear_recurrent[0].as_slice::<f32>().unwrap()[0],
+            3.25,
+            "snapshot aliased live cache (linear recurrent)"
+        );
+    }
+
+    /// Wedge-3 / iter-216 Phase B: total_bytes accounting on the snapshot
+    /// equals the cache it came from (snapshot owns the same shape × counts).
+    #[test]
+    fn hybrid_kv_cache_snapshot_total_bytes_matches_source() {
+        let cfg = moe_cfg_40layer();
+        let device = MlxDevice::new().expect("device");
+        let cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("alloc");
+        let snap = cache.snapshot(&device).expect("snapshot");
+        // Snapshot total_bytes = full_attn (k+v) + linear_attn (conv + recurrent),
+        // i.e. excludes the live cache's scratch/ping-pong buffers (which the
+        // snapshot doesn't own).  So snap.total_bytes <= cache.total_bytes.
+        // Equality holds for the active-only subset.
+        let cache_active_only: usize = cache
+            .full_attn
+            .iter()
+            .map(|s| s.k.element_count() * 4 + s.v.element_count() * 4)
+            .sum::<usize>()
+            + cache
+                .linear_attn
+                .iter()
+                .map(|s| s.conv_state.element_count() * 4 + s.recurrent.element_count() * 4)
+                .sum::<usize>();
+        assert_eq!(snap.total_bytes(), cache_active_only);
     }
 
     /// Sanity smoke for the re-exported CPU reference: it exists and has
