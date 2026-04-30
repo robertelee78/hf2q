@@ -324,6 +324,18 @@ pub struct CellResult {
     pub ran: bool,
     /// Free-form note — populated when a cell is skipped or short-circuited.
     pub note: String,
+    /// Phase A0.2b defect 1: actual prompt_tokens reported by the
+    /// server in the SSE final `usage` block. `None` when the matrix
+    /// cell did not produce a measured stream (skipped / transport
+    /// error / short-circuit). Ship-gate logic compares this against
+    /// the cell's nominal `prefix_len` when deciding whether the cell
+    /// is interpretable for ratio purposes.
+    pub actual_prompt_tokens: Option<u32>,
+    /// Phase A0.2b defect 3: number of transient-transport retries
+    /// the driver issued for this cell's no-cache stream. 0 in the
+    /// default path; increments only when a sub-100 ms transport
+    /// error triggered the retry-with-backoff branch.
+    pub retry_count: u32,
 }
 
 impl CellResult {
@@ -344,6 +356,8 @@ impl CellResult {
             shared_prefix_ratio: 1.0,
             ran: false,
             note: note.to_string(),
+            actual_prompt_tokens: None,
+            retry_count: 0,
         }
     }
 }
@@ -494,12 +508,36 @@ pub mod subprocess_driver {
     use std::time::{Duration, Instant};
 
     /// Per-cell measurement output.
+    ///
+    /// `prompt_tokens` and `retry_count` were added in Phase A0.2b alongside
+    /// the three substrate fixes (token-diverse prompt, SSE-usage parse,
+    /// transient-transport retry). Older callers tolerate `None` for
+    /// `prompt_tokens` — the matrix runner uses it for actual-prefix-length
+    /// gating; older tests don't observe it.
     #[derive(Clone, Debug)]
     pub struct CellMeasurement {
         pub ttft_ms: f64,
         pub decode_tps: f64,
         pub total_tokens: u32,
         pub log_tail: Vec<String>,
+        /// Actual prompt tokens reported by the server in the SSE final
+        /// `usage` block (`stream_options.include_usage=true`). `None`
+        /// when the server does not emit a usage chunk (older builds,
+        /// non-streaming endpoints, or transient stream truncation).
+        ///
+        /// Phase A0.2b defect 1: ship-gate logic must use this rather
+        /// than the cell's nominal `prefix_len` because the harness's
+        /// prompt-construction proxy (a deterministic word stream) is
+        /// BPE-sensitive and the server's tokenizer may produce a
+        /// different token count than the harness assumed.
+        pub prompt_tokens: Option<u32>,
+        /// Number of transient-transport retries the driver issued
+        /// before getting a stream. Phase A0.2b defect 3: short
+        /// prompts can return sub-100 ms transport errors that vanish
+        /// on retry; the driver retries up to 3 times with backoff
+        /// (100ms / 250ms / 500ms) when elapsed < 100 ms before
+        /// surfacing the failure.
+        pub retry_count: u32,
     }
 
     /// Eviction-cycle measurement output (scenarios b/e).
@@ -878,6 +916,57 @@ pub mod subprocess_driver {
         prompt: &str,
         max_tokens: u32,
     ) -> Result<CellMeasurement, DriverError> {
+        // Phase A0.2b defect 3: short prompts (sub-100 ms TTFT) sometimes
+        // return `transport: error sending request` / `transport: request
+        // or response body error` from reqwest's blocking client. The
+        // pattern is reproducible only at sub-100 ms walls; longer
+        // prefills do not trip it. Treat this as a transient transport
+        // condition and retry up to 3 times with backoff (100 / 250 /
+        // 500 ms). Real timeouts on long prefills (≥100 ms elapsed
+        // before failure) are NOT retried — those need to surface so
+        // the operator sees the real error.
+        const RETRY_BACKOFFS_MS: &[u64] = &[100, 250, 500];
+        const TRANSIENT_RETRY_THRESHOLD_MS: u128 = 100;
+        let mut retry_count: u32 = 0;
+        loop {
+            match measure_ttft_subprocess_once(server, model, prompt, max_tokens) {
+                Ok(mut m) => {
+                    m.retry_count = retry_count;
+                    return Ok(m);
+                }
+                Err((err, elapsed_ms)) => {
+                    let is_transient_transport = matches!(err, DriverError::Transport(_))
+                        && elapsed_ms < TRANSIENT_RETRY_THRESHOLD_MS;
+                    if !is_transient_transport
+                        || (retry_count as usize) >= RETRY_BACKOFFS_MS.len()
+                    {
+                        return Err(err);
+                    }
+                    let backoff = RETRY_BACKOFFS_MS[retry_count as usize];
+                    eprintln!(
+                        "measure_ttft_subprocess: transient transport error after {elapsed_ms}ms \
+                         (retry {next}/{total}, backoff {backoff}ms): {err}",
+                        next = retry_count + 1,
+                        total = RETRY_BACKOFFS_MS.len(),
+                    );
+                    thread::sleep(Duration::from_millis(backoff));
+                    retry_count += 1;
+                }
+            }
+        }
+    }
+
+    /// Single-shot inner of measure_ttft_subprocess. Returns the
+    /// `CellMeasurement` (with `retry_count=0` placeholder) on success,
+    /// or `(DriverError, elapsed_ms_before_error)` on failure so the
+    /// retry wrapper can decide whether the failure is sub-100 ms
+    /// (retry) or post-100 ms (surface).
+    fn measure_ttft_subprocess_once(
+        server: &ServerGuard,
+        model: &str,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> Result<CellMeasurement, (DriverError, u128)> {
         let body = serde_json::json!({
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
@@ -895,21 +984,25 @@ pub mod subprocess_driver {
             // Stream-leg can be long for big prefills; budget = 5 min.
             .timeout(Duration::from_secs(300))
             .build()
-            .map_err(|e| DriverError::Transport(e.to_string()))?;
+            .map_err(|e| (DriverError::Transport(e.to_string()), 0))?;
 
         let t0 = Instant::now();
         let resp = client
             .post(&url)
             .json(&body)
             .send()
-            .map_err(|e| DriverError::Transport(e.to_string()))?;
+            .map_err(|e| (DriverError::Transport(e.to_string()), t0.elapsed().as_millis()))?;
         let status = resp.status().as_u16();
         if status != 200 {
+            let elapsed = t0.elapsed().as_millis();
             let txt = resp.text().unwrap_or_else(|_| "<unreadable>".into());
-            return Err(DriverError::Http {
-                status,
-                body: txt,
-            });
+            return Err((
+                DriverError::Http {
+                    status,
+                    body: txt,
+                },
+                elapsed,
+            ));
         }
         let ct = resp
             .headers()
@@ -918,21 +1011,37 @@ pub mod subprocess_driver {
             .unwrap_or("")
             .to_string();
         if !ct.contains("text/event-stream") {
+            let elapsed = t0.elapsed().as_millis();
             let body = resp.text().unwrap_or_else(|_| "<unreadable>".into());
-            return Err(DriverError::Sse(format!(
-                "expected text/event-stream content-type; got {ct:?}; body={body}"
-            )));
+            return Err((
+                DriverError::Sse(format!(
+                    "expected text/event-stream content-type; got {ct:?}; body={body}"
+                )),
+                elapsed,
+            ));
         }
 
         let mut ttft_ms: Option<f64> = None;
         let mut total_tokens: u32 = 0;
+        // Phase A0.2b defect 1: parse the SSE final `usage` block to
+        // record actual `prompt_tokens` (the server's tokenizer count
+        // of our deterministic word-stream proxy). The cell's nominal
+        // `prefix_len` is a target; the actual count drives ship-gate
+        // ratio interpretation.
+        let mut prompt_tokens: Option<u32> = None;
         let mut reader = BufReader::new(resp);
         let mut line = String::new();
         loop {
             line.clear();
-            let n = reader
-                .read_line(&mut line)
-                .map_err(|e| DriverError::Transport(e.to_string()))?;
+            let n = match reader.read_line(&mut line) {
+                Ok(n) => n,
+                Err(e) => {
+                    return Err((
+                        DriverError::Transport(e.to_string()),
+                        t0.elapsed().as_millis(),
+                    ));
+                }
+            };
             if n == 0 {
                 break;
             }
@@ -947,9 +1056,10 @@ pub mod subprocess_driver {
             let v: serde_json::Value = match serde_json::from_str(payload) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Err(DriverError::Sse(format!(
-                        "malformed chunk {payload:?}: {e}"
-                    )));
+                    return Err((
+                        DriverError::Sse(format!("malformed chunk {payload:?}: {e}")),
+                        t0.elapsed().as_millis(),
+                    ));
                 }
             };
             // First content delta — timestamp.
@@ -969,14 +1079,23 @@ pub mod subprocess_driver {
             if let Some(c) = v["usage"]["completion_tokens"].as_u64() {
                 total_tokens = c as u32;
             }
+            if let Some(p) = v["usage"]["prompt_tokens"].as_u64() {
+                prompt_tokens = Some(p as u32);
+            }
         }
         let total_wall = t0.elapsed().as_secs_f64() * 1000.0;
-        let ttft_ms = ttft_ms.ok_or_else(|| {
-            DriverError::Sse(
-                "no non-empty content delta observed; cache_hit measurement invalid"
-                    .to_string(),
-            )
-        })?;
+        let ttft_ms = match ttft_ms {
+            Some(t) => t,
+            None => {
+                return Err((
+                    DriverError::Sse(
+                        "no non-empty content delta observed; cache_hit measurement invalid"
+                            .to_string(),
+                    ),
+                    t0.elapsed().as_millis(),
+                ));
+            }
+        };
         let decode_wall_ms = (total_wall - ttft_ms).max(0.001);
         // Decode tok/s — first token is TTFT, remaining are decode.
         let decode_tps = if total_tokens > 1 {
@@ -989,6 +1108,8 @@ pub mod subprocess_driver {
             decode_tps,
             total_tokens,
             log_tail: server.log_tail(),
+            prompt_tokens,
+            retry_count: 0,
         })
     }
 
@@ -1383,6 +1504,8 @@ pub fn run_cell(cell: MatrixCell) -> CellResult {
                     shared_prefix_ratio: f64::NAN,
                     ran: true,
                     note: format!("subprocess_driver error: {e}"),
+                    actual_prompt_tokens: None,
+                    retry_count: 0,
                 };
             }
         }
@@ -1418,6 +1541,8 @@ pub fn run_cell(cell: MatrixCell) -> CellResult {
         shared_prefix_ratio: f64::NAN,
         ran: true,
         note,
+        actual_prompt_tokens: None,
+        retry_count: 0,
     }
 }
 
@@ -1495,16 +1620,32 @@ fn run_cell_with_subprocess(
     // A0.2a code, which hf2q serve rejects with HTTP 400 model_not_loaded).
     let _ = subprocess_driver::warm_request(&server, &canonical)?;
 
-    // Build a deterministic prompt of length scaled to the cell's
-    // prefix_len; in A0.2a we use a tokenizer-agnostic char-stream
-    // proxy (the prompt characters are produced via repeating a token
-    // pattern; the exact token count isn't load-bearing — the matrix
-    // is run with HF2Q_KV_PERSIST_E2E_MAX_PREFIX caps to keep wall
-    // bounded). Production matrix run on M5 Max overrides via env.
-    let n_chars = (cell.prefix_len.tokens() as usize).max(8);
-    let prompt: String = std::iter::repeat("hello ")
-        .take((n_chars / 6).max(2))
-        .collect::<String>();
+    // Phase A0.2b defect 1: build a token-diverse prompt so the BPE
+    // tokenizer cannot collapse it to <50 tokens. The previous
+    // `"hello ".repeat(N)` pattern produced a single high-frequency
+    // token repeated, which Gemma's BPE merges aggressively — a
+    // 32K-character prompt collapsed to <50 actual prompt_tokens,
+    // making the TTFT-vs-prefix-length sweep meaningless.
+    //
+    // Each `wordN` is a unique ASCII string. Empirically against
+    // Gemma 4 BPE (truncation disabled), `word{i}` tokenizes to
+    // ≈ 3.8 tokens per word once you cross the popular-merge
+    // boundary (the tokenizer has merges for "word" + frequent
+    // 1-2-digit suffixes; the tail is split into "word" + per-digit
+    // tokens). We size `n_words = target_tokens / 4` to land within
+    // ±30 % of the nominal target across L512 / L2K / L8K / L32K.
+    //
+    // The SSE final-usage parse records the actual prompt_tokens —
+    // ship gates evaluate against THAT, not the nominal target;
+    // see assert_ship_gates() defect-1 logic. The construction
+    // sizing here just keeps the cell's TTFT in the load-bearing
+    // regime (large enough to dominate engine first-token cost).
+    let target_tokens = (cell.prefix_len.tokens() as usize).max(8);
+    let n_words = (target_tokens / 4).max(2);
+    let prompt: String = (0..n_words)
+        .map(|i| format!("word{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
 
     let no_cache = subprocess_driver::measure_ttft_subprocess(
         &server,
@@ -1548,6 +1689,59 @@ fn run_cell_with_subprocess(
             std::os::unix::fs::symlink(model_path, &link_path).map_err(|e| {
                 subprocess_driver::DriverError::Eviction(format!("symlink: {e}"))
             })?;
+            // Phase A0.2b defect 2: the swap-back-in pool-key trick
+            // creates a tempdir with a distinct file_stem, but
+            // `find_config` / `find_tokenizer` (src/serve/mod.rs:127-188)
+            // resolve siblings of the GGUF path. Without symlinking the
+            // siblings into the tempdir, `cmd_serve` fails with HTTP 500
+            // "Failed to parse config.json" on the second-turn admit
+            // (observed in iter b74284c run, all SwapBackInSameCtx
+            // cells). We symlink the well-known sibling files plus the
+            // mmproj GGUF (Gemma 4 vision-multimodal); each is best-effort
+            // — missing siblings are non-fatal because the model may
+            // legitimately not ship that file.
+            let model_parent = model_path.parent().ok_or_else(|| {
+                subprocess_driver::DriverError::Eviction(
+                    "model_path has no parent dir for sibling resolution".into(),
+                )
+            })?;
+            for fname in &[
+                "config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "generation_config.json",
+            ] {
+                let src = model_parent.join(fname);
+                if src.exists() {
+                    let dst = tmp_link.path().join(fname);
+                    if let Err(e) = std::os::unix::fs::symlink(&src, &dst) {
+                        return Err(subprocess_driver::DriverError::Eviction(format!(
+                            "symlink sibling {fname}: {e}"
+                        )));
+                    }
+                }
+            }
+            // mmproj GGUF — naming convention is `<stem>-mmproj.gguf`
+            // next to the chat GGUF. Mirror the source name into the
+            // tempdir under the symlink-stem-derived name so the serve
+            // binary's mmproj resolver finds it next to the cloned
+            // GGUF stem (resolver mirrors find_config logic).
+            if let Some(src_stem) = model_path.file_stem().and_then(|s| s.to_str()) {
+                let mmproj_src = model_parent.join(format!("{src_stem}-mmproj.gguf"));
+                if mmproj_src.exists() {
+                    if let Some(link_stem) = link_path.file_stem().and_then(|s| s.to_str())
+                    {
+                        let mmproj_dst =
+                            tmp_link.path().join(format!("{link_stem}-mmproj.gguf"));
+                        if let Err(e) = std::os::unix::fs::symlink(&mmproj_src, &mmproj_dst)
+                        {
+                            return Err(subprocess_driver::DriverError::Eviction(format!(
+                                "symlink mmproj: {e}"
+                            )));
+                        }
+                    }
+                }
+            }
         }
         #[cfg(not(unix))]
         {
@@ -1580,10 +1774,15 @@ fn run_cell_with_subprocess(
         shared_prefix_ratio: f64::NAN,
         ran: true,
         note: format!(
-            "subprocess driven; tokens_total={tt}, log_lines={ll}",
+            "subprocess driven; tokens_total={tt}, log_lines={ll}, \
+             actual_prompt_tokens={pt:?}, retry_count={rc}",
             tt = no_cache.total_tokens,
             ll = no_cache.log_tail.len(),
+            pt = no_cache.prompt_tokens,
+            rc = no_cache.retry_count,
         ),
+        actual_prompt_tokens: no_cache.prompt_tokens,
+        retry_count: no_cache.retry_count,
     })
 }
 
@@ -1874,10 +2073,11 @@ pub fn write_results_md(results: &[CellResult], path: &str) -> std::io::Result<(
     buf.push_str("## Per-cell results\n\n");
     buf.push_str(
         "| Cell label | Ran | no_cache TTFT (ms) | cache_hit TTFT (ms) | \
-         pre_evict (ms) | insert (ms) | load (ms) | kv_sha256 pre/post match | note |\n",
+         pre_evict (ms) | insert (ms) | load (ms) | kv_sha256 pre/post match | \
+         actual_prompt_tokens | retry_count | note |\n",
     );
     buf.push_str(
-        "|---|---|---|---|---|---|---|---|---|\n",
+        "|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
 
     let mut by_status: BTreeMap<&str, u32> = BTreeMap::new();
@@ -1891,8 +2091,12 @@ pub fn write_results_md(results: &[CellResult], path: &str) -> std::io::Result<(
         } else {
             "MISMATCH".to_string()
         };
+        let apt = match r.actual_prompt_tokens {
+            Some(n) => n.to_string(),
+            None => "—".to_string(),
+        };
         buf.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             r.cell.label(),
             ran_str,
             fmt_f64(r.no_cache_ttft_ms),
@@ -1901,6 +2105,8 @@ pub fn write_results_md(results: &[CellResult], path: &str) -> std::io::Result<(
             fmt_f64(r.insert_ms),
             fmt_f64(r.load_ms),
             kv_match,
+            apt,
+            r.retry_count,
             r.note.replace('|', "\\|"),
         ));
     }
@@ -2237,7 +2443,7 @@ fn kv_persist_matrix_e2e() {
             "  cell {:?}/{:?}/{:?}/{:?}/{:?}/{:?}: \
              no_cache_ttft={:.1}ms cache_hit_ttft={:.1}ms \
              ratio={:.3} decode_no_cache={:.1}t/s decode_miss={:.1}t/s \
-             shared_prefix_ratio={:.3} note={:?}",
+             shared_prefix_ratio={:.3} actual_prompt_tokens={:?} retry_count={} note={:?}",
             r.cell.family,
             r.cell.quant,
             r.cell.kv_path,
@@ -2254,6 +2460,8 @@ fn kv_persist_matrix_e2e() {
             r.decode_tok_s_no_cache,
             r.decode_tok_s_cache_enabled_miss,
             r.shared_prefix_ratio,
+            r.actual_prompt_tokens,
+            r.retry_count,
             r.note,
         );
     }
@@ -2459,8 +2667,9 @@ fn measure_ttft_parses_sse_first_content_delta() {
     assert!(m.total_tokens > 0, "must observe at least one content delta");
     assert!(m.decode_tps >= 0.0, "decode_tps cannot be negative");
     eprintln!(
-        "measure_ttft: ttft_ms={:.1}, total_tokens={}, decode_tps={:.2}",
-        m.ttft_ms, m.total_tokens, m.decode_tps
+        "measure_ttft: ttft_ms={:.1}, total_tokens={}, decode_tps={:.2}, \
+         prompt_tokens={:?}, retry_count={}",
+        m.ttft_ms, m.total_tokens, m.decode_tps, m.prompt_tokens, m.retry_count
     );
 }
 
@@ -2784,3 +2993,4 @@ fn driver_error_display_renders_diagnostic_strings() {
         assert!(!d.is_empty(), "Debug must render non-empty string");
     }
 }
+
