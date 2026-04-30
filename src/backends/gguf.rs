@@ -2825,19 +2825,55 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
         MetaValue::String(pre_tokenizer),
     ));
 
-    // Chat template — read from chat_template.jinja or tokenizer_config.json
-    let chat_template_path = input_dir.join("chat_template.jinja");
-    let template_str: Option<String> = if chat_template_path.exists() {
-        std::fs::read_to_string(&chat_template_path).ok()
-    } else {
-        tokenizer_config
+    // Chat template — priority chain (ADR-012 chat-template-auto-inject 2026-04-30):
+    //   1. chat_template.jinja file alongside HF tokenizer
+    //   2. tokenizer_config.json[chat_template]
+    //   3. arch-default from `super::chat_templates::arch_default_chat_template`
+    //   4. graceful skip + WARN (operator-visible)
+    //
+    // Why arch-default exists: 4 of 5 Qwen3.6 GGUFs on disk (all
+    // "abliterated" variants) ship `tokenizer_config.json` WITHOUT a
+    // chat_template field. The runtime fallback at
+    // `serve::render_chat_template` (priority 4) emits Gemma4 control
+    // tokens that Qwen3 was never trained on → degenerate output.
+    // Convert-time auto-inject closes that silent-fail path AND
+    // contaminated ADR-013's sourdough byte-parity gate.
+    let chat_template_jinja = input_dir.join("chat_template.jinja");
+    let (template_str, source_label): (Option<String>, &'static str) =
+        if chat_template_jinja.exists() {
+            (
+                std::fs::read_to_string(&chat_template_jinja).ok(),
+                "chat_template.jinja",
+            )
+        } else if let Some(s) = tokenizer_config
             .as_ref()
             .and_then(|c: &serde_json::Value| c.get("chat_template"))
             .and_then(|v: &serde_json::Value| v.as_str())
             .map(|s| s.to_string())
-    };
+        {
+            (Some(s), "tokenizer_config.json[chat_template]")
+        } else if let Some(default) =
+            crate::backends::chat_templates::arch_default_chat_template(arch)
+        {
+            (Some(default.to_string()), "arch-default (auto-inject)")
+        } else {
+            (None, "")
+        };
     if let Some(tmpl) = template_str {
+        info!(
+            "Chat template: arch={} source={} length={} chars",
+            arch,
+            source_label,
+            tmpl.len()
+        );
         kv.push(("tokenizer.chat_template".into(), MetaValue::String(tmpl)));
+    } else {
+        warn!(
+            "Chat template: no chat_template.jinja, no tokenizer_config.json[chat_template], \
+             and no arch-default for arch={}; skipping emit (runtime will use --chat-template \
+             override or hardcoded fallback)",
+            arch
+        );
     }
 
     info!(
@@ -5881,6 +5917,188 @@ mod tests {
             }
             Provenance::External => panic!("must remain Hf2q-classified"),
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ADR-012 chat-template-auto-inject (2026-04-30)
+    //
+    // Convert-time `tokenizer.chat_template` fallback chain:
+    //   1. chat_template.jinja file        → wins
+    //   2. tokenizer_config.json[chat_template] → wins
+    //   3. arch-default (qwen35/qwen35moe → Qwen3 ChatML) → injected
+    //   4. unknown arch + no source              → graceful skip + WARN
+    //
+    // Each test below constructs a synthetic HF input dir and invokes
+    // `load_tokenizer_metadata(input_dir, arch)` directly, then asserts
+    // the resulting `tokenizer.chat_template` KV (presence, value, length).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Minimal valid `tokenizer.json` body that satisfies
+    /// `load_tokenizer_metadata` (3 vocab entries, 0 merges).
+    fn minimal_tokenizer_json() -> serde_json::Value {
+        serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "<bos>": 0,
+                    "<eos>": 1,
+                    "hello": 2,
+                },
+                "merges": []
+            },
+            "added_tokens": [
+                {"id": 0, "content": "<bos>", "special": true},
+                {"id": 1, "content": "<eos>", "special": true},
+            ]
+        })
+    }
+
+    /// Find a string-valued metadata KV (returns None if absent or
+    /// wrong variant).
+    fn metadata_string<'a>(
+        kv: &'a [(String, MetaValue)],
+        key: &str,
+    ) -> Option<&'a str> {
+        kv.iter().find_map(|(k, v)| {
+            if k == key {
+                if let MetaValue::String(s) = v {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    fn write_minimal_hf_dir(
+        tmp: &tempfile::TempDir,
+        tokenizer_config: serde_json::Value,
+        chat_template_jinja: Option<&str>,
+    ) -> std::path::PathBuf {
+        let dir = tmp.path().to_path_buf();
+        std::fs::write(
+            dir.join("tokenizer.json"),
+            serde_json::to_string(&minimal_tokenizer_json()).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            serde_json::to_string(&tokenizer_config).unwrap(),
+        )
+        .unwrap();
+        if let Some(content) = chat_template_jinja {
+            std::fs::write(dir.join("chat_template.jinja"), content).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn chat_template_inject_qwen35moe_when_source_missing() {
+        // PRIMARY auto-inject path: source HF dir has NO chat_template
+        // (tokenizer_config.json lacks the field, no chat_template.jinja
+        // file). Convert-time should emit Qwen3 ChatML (7764 bytes)
+        // because arch is qwen35moe.
+        let tmp = tempfile::tempdir().unwrap();
+        let tok_cfg = serde_json::json!({
+            "bos_token": "<bos>",
+            "eos_token": "<eos>",
+            // intentionally NO chat_template key
+        });
+        let dir = write_minimal_hf_dir(&tmp, tok_cfg, None);
+
+        let kv = load_tokenizer_metadata(&dir, "qwen35moe")
+            .expect("load_tokenizer_metadata succeeds with valid tokenizer.json");
+
+        let injected = metadata_string(&kv, "tokenizer.chat_template")
+            .expect("arch-default MUST inject tokenizer.chat_template for qwen35moe");
+        assert_eq!(
+            injected.len(),
+            crate::backends::chat_templates::QWEN3_CHATML_LEN,
+            "injected template must be the verbatim 7764-byte Qwen3 ChatML"
+        );
+        assert_eq!(injected, crate::backends::chat_templates::QWEN3_CHATML);
+    }
+
+    #[test]
+    fn chat_template_source_wins_over_arch_default() {
+        // Source-priority guarantee: if tokenizer_config.json has a
+        // chat_template field, it MUST win over the arch-default. This
+        // preserves the vanilla 27B-dwq46 path (which already ships a
+        // chat_template) and never silently swaps it for the
+        // arch-default fixture.
+        let tmp = tempfile::tempdir().unwrap();
+        let custom = "{# bespoke vendor template #}\n{{prompt}}";
+        let tok_cfg = serde_json::json!({
+            "bos_token": "<bos>",
+            "eos_token": "<eos>",
+            "chat_template": custom,
+        });
+        let dir = write_minimal_hf_dir(&tmp, tok_cfg, None);
+
+        let kv = load_tokenizer_metadata(&dir, "qwen35moe")
+            .expect("load_tokenizer_metadata succeeds");
+
+        let emitted = metadata_string(&kv, "tokenizer.chat_template")
+            .expect("source chat_template must be emitted");
+        assert_eq!(emitted, custom, "source MUST win over arch-default");
+        assert_ne!(
+            emitted,
+            crate::backends::chat_templates::QWEN3_CHATML,
+            "arch-default must NOT have replaced the vendor-shipped template"
+        );
+    }
+
+    #[test]
+    fn chat_template_jinja_file_wins_over_tokenizer_config() {
+        // Highest-priority source: a `chat_template.jinja` file in the
+        // HF dir wins over `tokenizer_config.json[chat_template]` AND
+        // over the arch-default. This is the ADR-012 priority order
+        // mirrored from `serve::render_chat_template`.
+        let tmp = tempfile::tempdir().unwrap();
+        let from_jinja = "{# .jinja file content #}\n{{prompt}}_jinja";
+        let from_cfg = "{# from tokenizer_config #}\n{{prompt}}_cfg";
+        let tok_cfg = serde_json::json!({
+            "bos_token": "<bos>",
+            "eos_token": "<eos>",
+            "chat_template": from_cfg,
+        });
+        let dir = write_minimal_hf_dir(&tmp, tok_cfg, Some(from_jinja));
+
+        let kv = load_tokenizer_metadata(&dir, "qwen35moe")
+            .expect("load_tokenizer_metadata succeeds");
+
+        let emitted = metadata_string(&kv, "tokenizer.chat_template")
+            .expect("chat_template.jinja file must be emitted");
+        assert_eq!(
+            emitted, from_jinja,
+            ".jinja file MUST win over tokenizer_config.json[chat_template]"
+        );
+    }
+
+    #[test]
+    fn chat_template_unknown_arch_skips_with_warn() {
+        // Graceful-skip path: source HF dir has no chat_template AND
+        // arch has no vendor-shipped default → no `tokenizer.chat_template`
+        // KV is emitted (and the convert log records a structured WARN
+        // that the operator can grep for).
+        let tmp = tempfile::tempdir().unwrap();
+        let tok_cfg = serde_json::json!({
+            "bos_token": "<bos>",
+            "eos_token": "<eos>",
+        });
+        let dir = write_minimal_hf_dir(&tmp, tok_cfg, None);
+
+        // "phi" has no arch-default at the time of writing — see the
+        // arch-coverage table in `backends::chat_templates`.
+        let kv = load_tokenizer_metadata(&dir, "phi")
+            .expect("load_tokenizer_metadata succeeds even when arch lacks default");
+
+        assert!(
+            metadata_string(&kv, "tokenizer.chat_template").is_none(),
+            "unknown arch with no source MUST NOT emit a synthesized chat_template"
+        );
     }
 
     #[test]

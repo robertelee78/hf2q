@@ -1696,3 +1696,29 @@ Every gotcha from `project_qwen36_architecture.md` is addressed in a specific de
 | #10 Expert weights scale | **Inference-only** — runtime scaling, not persisted in tensor data |
 
 Gotchas #7 and #10 are runtime concerns owned by the inference session; conversion does not transform them.
+
+## Progress log (reverse chronological)
+
+### 2026-04-30 — chat-template auto-inject · CFA dual-mode (claude) — silent-fail path closed; ADR-013 sourdough decontaminated
+
+**(a) Defect.** 4 of 5 Qwen3.6 GGUFs on disk (all "abliterated" variants of `qwen3.6-27b-dwq46`) ship a `tokenizer_config.json` that lacks the `chat_template` field. The convert path at `src/backends/gguf.rs::load_tokenizer_metadata` (the `tokenizer.chat_template` write block) read `chat_template.jinja` first, fell back to `tokenizer_config.json[chat_template]`, and **silently skipped emit when both were absent**. Runtime path `src/serve/mod.rs::render_chat_template` (priority 4) then fell through to `FALLBACK_GEMMA4_CHAT_TEMPLATE`, which Qwen3 was never trained on — the chat session emitted Gemma4 control tokens that Qwen3.6 decoded as nonsense, producing the gibberish that contaminated ADR-013's sourdough byte-parity gate on small prompts.
+
+**(b) Fix.** New module `src/backends/chat_templates.rs` owns vendor-shipped per-arch chat templates. The `qwen3-chatml.jinja` fixture is **the verbatim 7764-byte `chat_template` field** from the canonical `qwen3.6-27b-dwq46/tokenizer_config.json` — copied byte-for-byte; never synthesized. Compile-time fixture length pinned at `QWEN3_CHATML_LEN = 7764` and asserted in `vendor_chat_template_lengths_match_fixtures`. The `gguf.rs` write site now follows a four-step priority chain — `chat_template.jinja` → `tokenizer_config.json[chat_template]` → arch-default → graceful skip + structured WARN. `INFO` log on inject (`arch=… source=… length=…`); `WARN` on the skip path (operator-visible).
+
+**(c) Per-arch coverage table.**
+
+| arch | source ref | status |
+|---|---|---|
+| `qwen35` / `qwen35moe` | `qwen3.6-27b-dwq46/tokenizer_config.json[chat_template]` | EMBEDDED (verbatim, 7764 B) |
+| `qwen2` / `qwen3` | (no vendor reference captured yet) | WARN-only |
+| `gemma3` / `gemma4` | (no vendor reference captured yet) | WARN-only |
+| `llama` / `mistral` / `phi` | (no vendor reference captured yet) | WARN-only |
+
+New arches MUST source from a published vendor `tokenizer_config.json` and be copied verbatim — the runtime `feedback_prove_in_code.md` + `feedback_dont_guess.md` rules apply.
+
+**(d) Tests added (in `backends::gguf::tests`).** `chat_template_inject_qwen35moe_when_source_missing` (PRIMARY auto-inject path emits 7764-byte Qwen3 ChatML); `chat_template_source_wins_over_arch_default` (vendor-shipped `chat_template` in `tokenizer_config.json` MUST NOT be replaced by arch-default); `chat_template_jinja_file_wins_over_tokenizer_config` (`.jinja` file is highest-priority source); `chat_template_unknown_arch_skips_with_warn` (graceful skip on unknown arch, no synthesized template). Plus 3 fixture tests in `backends::chat_templates::tests` (length pin, qwen35→Qwen3 ChatML, unknown→None).
+
+**(e) Verification.** `cargo build --release --bin hf2q` clean; `cargo test --release --bin hf2q backends::gguf` 71/71 PASS (incl. the full iter211 provenance suite — no regression); `cargo test --release --bin hf2q backends::chat_templates` 3/3 PASS. **ADR-013 sourdough chat-template contamination is closed by this commit** — runtime no longer falls through to the Gemma4 fallback for any qwen35/qwen35moe convert that runs through this updated path.
+
+**(f) Constraints honoured.** Pure Rust; no candle/llama.cpp link. Vendor template embedded verbatim (no synthesis). No env-gating, no fallback-of-the-fallback, no TODO stub. Pathspec-only commit per `feedback_git_commit_pathspec_when_parallel.md`.
+
