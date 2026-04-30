@@ -743,6 +743,52 @@ kill -CONT $(pgrep mcp-brain-server)
 
 The matrix runner emits the report into the worktree's `docs/` tree (NOT main hf2q's); operator promotes via dual-mode queen merge. Ship-gate / coherence-gate / decode-regression / overhead-gate assertions evaluate against the per-cell measured fields and fail the test on any kill-criterion (per ADR-017 §10).
 
+### Phase A0.2b LANDED (2026-04-30)
+
+**Status:** Substrate-defect fixes complete on `cfa/adr017-a02b/claude` worktree; pending dual-mode queen merge against the Codex parallel impl. Phase A0.2 closure (the actual measurement run on M5 Max with cold SoC) executed against the patched substrate inside this CFA — see `docs/ADR-017-phase-a0-results.md` for the per-cell numbers + ship-gate verdict.
+
+**Why A0.2b is its own phase:** the iter-`b74284c` live-matrix run surfaced three substrate defects that prevented the matrix from emitting interpretable ship-gate ratios. Per `feedback_substrate_must_not_synthesize_ship_gates`, the right move was to fix the substrate FIRST (not massage the numbers), re-run, then attest the results. A0.2b is the substrate-fix iter; A0.2 closure is the post-fix run that consumes the patched substrate.
+
+**The three defects (each cited at file:line in the commit message):**
+
+1. **TTFT did not scale with prefix length.** Previous prompt construction `"hello ".repeat(N)` collapsed under Gemma BPE to <50 actual `prompt_tokens` at every nominal target — every cell saw the same effective input length, denominator-broken every ship-gate ratio. Fix: token-diverse word stream `(0..n).map(|i| format!("word{i}"))` with `n_words = target_tokens / 4` (empirically Gemma 4 BPE emits ~3.8 tokens per `wordN` once past popular-merge boundary). Companion: parse SSE final `usage` block (`stream_options.include_usage=true` was already requested) to surface `actual_prompt_tokens: Option<u32>` on every CellResult; ship-gate logic now keys off ACTUAL prompt_tokens, not nominal `cell.prefix_len`.
+2. **Symlink eviction-cycle missing config.json.** `SwapBackInSameCtx` returned HTTP 500 "Failed to parse config.json". Root cause (verified by code-reading `src/serve/mod.rs:127-188` per Chesterton's fence): `find_config` resolves config.json next to the GGUF path, but the harness's tempdir contained only the GGUF symlink. Fix: after creating the GGUF symlink, also symlink each well-known sibling (`config.json`, `tokenizer.json`, `tokenizer_config.json`, `generation_config.json`) plus the mmproj GGUF (renamed to match the cloned stem). Best-effort — missing siblings are non-fatal because some models legitimately do not ship that file.
+3. **SSE transport errors on short prompts.** Sub-second responses returned `transport: error sending request` / `transport: request or response body error`. Pattern only reproduced at sub-100 ms walls; longer prefills did not trip it. Fix: retry-with-backoff (100 ms / 250 ms / 500 ms) on `DriverError::Transport` when `elapsed_ms < 100`. Real timeouts on long prefills (≥100 ms elapsed before failure) are NOT retried so operator sees the real error. Surface `retry_count: u32` on CellMeasurement / CellResult so per-cell logs + results.md show retries.
+
+**Tests landed (per spec §Deliverables.4):**
+
+| # | Test | Always-on / Gated | Asserts |
+|---|---|---|---|
+| 1 | `prompt_construction_target_tokens_within_30_percent` | always-on (uses tokenizers crate against on-disk tokenizer.json) | walks targets [512, 2K, 8K, 32K], asserts each lands within ±30 % of nominal post-tokenization (truncation disabled) |
+| 2 | `swap_eviction_cycle_handles_config_files` | env-gated | reproduces tempdir + sibling-symlink set; asserts config.json present in tempdir |
+| 3 | `sse_transient_transport_error_retries_up_to_3_times` | always-on (mock TCP listener accepts + immediately closes) | asserts retry harness reaches the listener ≥4 times (1 initial + 3 retries) |
+| 4 | `measure_ttft_includes_actual_prompt_tokens` | env-gated | asserts `m.prompt_tokens.is_some()` and lands within ±30 % of L512 nominal target |
+
+**Mechanical exit codes:**
+
+| Command | Exit | Output |
+|---|---|---|
+| `cargo build --release --tests --test kv_persist_harness` | **0** | `Finished release profile [optimized] target(s) in 44.47s` |
+| `cargo test --release --test kv_persist_harness -- --test-threads=1` | **0** | **36 passed; 0 failed; 0 ignored** in 1.89 s (32 prior + 4 new) |
+| `grep -rn '// TODO\|todo!()\|unimplemented!()' tests/kv_persist_harness.rs` | **1** | no hits — discipline holds |
+| Matrix run on real GGUF (post-fix) | see results.md | per-cell verdict in `docs/ADR-017-phase-a0-results.md` |
+
+**A0.2b discipline notes:**
+
+- Zero `src/` edits — code-only deliverable; the fix is tests-side per the directive ("PREFER tests-side fixes"). `find_config` / `find_tokenizer` semantics in `src/serve/mod.rs` are correct as-is; the harness was wrong to omit siblings from the symlink tempdir.
+- Zero `// TODO` markers shipped.
+- ADR-015 iter58 fence respected (no `mlx-native/`, `gpu_delta_net.rs`, `forward_gpu.rs`, `gpu_full_attn.rs` edits).
+- ADR-005 Phase 4 fence respected (no `src/serve/multi_model.rs`, `src/serve/api/`, `src/serve/cache.rs`, `src/serve/provenance.rs`, `src/serve/mod.rs` edits).
+- "man-day" used throughout; "person-day" does not appear.
+- Matrix-run safety: spec restricts to dual-mode Claude impl (Codex parallel impl emits patch only, no matrix run, RAM-safety per OOM directive).
+
+**Substrate-defect anti-pattern — explicitly NOT done:**
+
+- Did NOT massage ship-gate numbers to make R-P4/R-P5/R-P6 pass (per `feedback_substrate_must_not_synthesize_ship_gates`).
+- Did NOT skip the post-fix matrix run as a "substrate-only" deliverable. The deliverable is fix + measure; if ratios fail after fixes, the verdict is GREEN/PARTIAL/KILL honestly.
+- Did NOT spawn concurrent `hf2q serve` instances inside cargo test (OOM directive).
+- Did NOT edit `src/serve/*` (the fix path is tests-side; the serve binary's sibling-resolution semantics are production-correct).
+
 ---
 
 ## Open Questions
