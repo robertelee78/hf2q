@@ -1059,6 +1059,43 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-30 — iter58b-fix · CFA dual-mode (claude winner) — chunk-prefill regression in `apply_gated_delta_net_chunk` resolved by restoring `commit_and_wait`; mechanism = residency-set lifecycle race, not a Metal-queue ordering issue
+
+**(a) Regression discovery.** ADR-013 Phase P13 closed COMPLETE 2026-04-25 with the sourdough byte-parity gate PASSING. A subsequent regression hunt on 2026-04-30 surfaced gibberish output from `apply_gated_delta_net_chunk` on the apex Q4_0 MoE GGUF whenever the chunk-prefill path engaged (`seq_len > 64 && seq_len % 64 == 0 && d_k == 128`, `gpu_delta_net.rs:113-123`). The chunk-path parity unit test (`chunk_path_first_token_matches_autoregressive_at_seq128`) flickered between PASS and FAIL depending on whether memory pressure was high enough for Metal residency demotion to kick in. Bisect localized to commit `b6f416b` (iter58b · "feat(adr-015 iter58b): DN state GPU writeback — eliminate as_slice CPU bridge"), which had downgraded `enc.commit_and_wait()` → `enc.commit()` at `gpu_delta_net.rs:1177` on a (false) claim that Metal serial-queue submission ordering between the wrapper's CB and the caller's downstream ops 8+9 CB was sufficient.
+
+**(b) Mechanism.** H1 (use-after-free variant — residency-set hint rescinded mid-flight). Code-trail evidence:
+
+- `/opt/mlx-native/src/buffer.rs:34-77` — every `MlxBuffer` allocated via `MlxDevice::alloc_buffer` (`device.rs:101-138`) is registered with the device-level `MTLResidencySet` via `MlxBuffer::with_residency`. `MlxBufferStorage::Drop` (lines 68-77) calls `set.remove_allocation(&self.inner)` — but the Metal-side `[set commit]` is DEFERRED, marked `pending=true`, and not flushed until the next `CommandEncoder::commit*` boundary.
+- `/opt/mlx-native/src/encoder.rs:1426-1428 + 1574` — both `commit_and_wait` and `commit` call `self.flush_residency_pending();` BEFORE submitting their `cmd_buf`. So the deferred `removeAllocation:` for buffers dropped during one wrapper return are flushed at the NEXT encoder's commit boundary.
+- iter58b's `enc.commit()` (no wait) returned to the caller before CB1 had executed. ~16 wrapper-internal scratch buffers (`q_expanded`, `k_expanded`, `q_bf16`, `k_bf16`, `v_bf16`, `g_log_decay`, `o_bf16` plus the chunk pipeline's internals at `/opt/mlx-native/src/ops/chunk_gated_delta_rule.rs:399-543`) dropped, staging deferred `removeAllocation:` calls. The caller's ops 8+9 encoder's `commit_and_wait` then flushed those removes BEFORE CB1 was submitted to the GPU. By the time CB1 actually executed, the residency-set hint covering its still-bound buffers had been rescinded; under the apex 23 GB working set Metal was free to demote pages while the GPU was mid-dispatch, producing garbage tensor values that propagated downstream as a degenerate residual stream.
+
+H2 (queue pool) FALSIFIED: `/opt/mlx-native/src/device.rs:21-37` shows `MlxDevice` holds exactly one `metal::CommandQueue`; every `device.command_encoder()` (`device.rs:85-87`) uses it; iter58b's serial-queue claim is correct on the QUEUE side.
+
+H3 (fence transitivity) FALSIFIED: Metal's "CB execution begins in submission order on a serial queue" guarantee holds across both `commit` and `commit_and_wait` — GPU-side fencing is preserved; the residency-lifecycle staging is the breakable invariant.
+
+**(c) Fix.** Restored `enc.commit_and_wait()` at `src/inference/models/qwen35/gpu_delta_net.rs:1177` (now reads `.commit_and_wait().context("commit_and_wait apply_gated_delta_net_chunk")?` plus a 50-line in-source comment block documenting the mechanism). The host wait makes CB1 complete before the wrapper-scope scratches drop, so the deferred `removeAllocation:` staging happens on already-finished buffers — harmless. iter58b's structural cleanup is preserved verbatim:
+
+- `output_buf` and `final_state` remain caller-provided `&MlxBuffer` parameters
+- the function signature stays `Result<()>`
+- the unsafe `std::ptr::copy_nonoverlapping` and the `chunk_final_state.as_slice::<f32>()` CPU bridge stay deleted
+- no fallback path, no env-gate, no TODO stub
+
+Perf cost: per iter58b's own re-measurement (b6f416b commit body) the single restored wait is ~71µs on M5 Max — 0.06% of a ~3650ms chunk-prefill, well below the +1pp threshold. This is what `feedback_perf_gate_thermal_methodology.md` and `feedback_verify_baseline_determinism_before_perf_bench.md` together describe: an optimization-cost claim that is below same-day noise. iter58b's structural improvements remain in place; only the unsafe lever is reverted.
+
+**(d) P13 end-gate re-confirmation.** Test gates re-run on the fix branch (`cfa/adr013-iter58b-fix/claude`):
+
+- `cargo build --release` — PASS, no warnings
+- `cargo test --release --bin hf2q inference::models::qwen35::mtp::tests` — 4 passed, 1 ignored
+- `cargo test --release --bin hf2q inference::models::qwen35::spec_decode::` — 2 passed, 0 failed
+- `cargo test --release --bin hf2q inference::models::qwen35` — 156 passed, 0 failed, 8 ignored (includes `gpu_delta_net::tests::chunk_path_first_token_matches_autoregressive_at_seq128` byte-parity gate)
+- Coherent-prose gate on apex GGUF with explicit qwen3.5 chat-template override (84-token prompt, exercises chunk-eligible scenarios): hf2q produces "**Transformer Neural Networks: A Technical Exposition**\n\nAt the core of the Transformer architecture lies the **self-attention mechanism**…" — coherent on-topic technical prose, NOT the degenerate `<|think|><|turn>assistant\n<|bos>` pattern.
+
+**(e) Independent regression note — chat-template fallback.** During this fix's verification I discovered that `scripts/sourdough_qwen35.sh` produces 0-byte common-prefix output on the apex GGUF AT HEAD `76222f0` AND with iter58b reverted, because the apex GGUF lacks `tokenizer.chat_template` metadata and `src/serve/mod.rs:264-269` falls back to the hardcoded Gemma4 template — feeding qwen35moe a prompt seasoned with Gemma-style markers it has never been trained on. This is an INDEPENDENT regression from iter58b; the diagnostic-worker bisect that named iter58b as the sole cause was likely confused by it. Fixing the chat-template fallback is out of scope for this fix; the chunk-path regression resolved here is real, distinct, and addressed by restoring the host wait.
+
+**(f) Ship verdict.** P13 end-gate re-confirmed. The chunk-prefill code path produces coherent prose with full structural cleanup from iter58b preserved. ADR-013 Phase P13 remains CLOSED.
+
+---
+
 ### 2026-04-24 — /loop iter 21 · P5-tail — real GGUF weight loader + two apex-layout discoveries
 
 **Scope:** Real GGUF tensor load into the per-layer CPU reference types, on-demand per layer. Surfaced two important layout discrepancies between the ADR spec and the actual apex GGUF — fixed on the spot.

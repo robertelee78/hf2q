@@ -1151,34 +1151,72 @@ pub fn apply_gated_delta_net_chunk(
 
     drop(_w5b8_encbuild);
     {
-        // iter58b: downgrade `commit_and_wait` to `commit` (no host wait).
-        // The previous wait was forced by the caller's
-        // `chunk_final_state.as_slice::<f32>()` CPU read of `final_state`
-        // to memcpy into `state_out`. Now that `final_state` (and
-        // `output_buf`) are caller-provided buffers the chunk pipeline
-        // writes directly, no caller does a CPU read on the wrapper's
-        // outputs in production. Downstream ops 8+9 (ssm_norm_gate,
-        // out_proj) build their own command encoder on the same Metal
-        // serial queue, which guarantees they cannot execute until this
-        // committed buffer completes — ordering is preserved without a
-        // CPU-side wait.
+        // ADR-013 iter58b-fix (2026-04-30) — restore `commit_and_wait`.
         //
-        // Unit-test note: parity tests in this module that read the
-        // wrapper's outputs via CPU `download_f32` MUST add their own
-        // sync (e.g. an empty `command_encoder().commit_and_wait()`)
-        // between the wrapper call and the download, since the wrapper
-        // no longer drains the queue itself. The `ChunkCommitWait`
-        // section tag is retained (semantic now: "chunk.commit, no
-        // wait") so the existing wave5b8 profiling + W-5b.21 forensic
-        // A/B can still attribute the section.
+        // iter58b downgraded this to `enc.commit()` (no host wait) on the
+        // claim that Metal serial-queue submission ordering between this
+        // CB and the caller's downstream ops 8+9 CB was sufficient. That
+        // claim is correct for *GPU-execution* ordering on the queue but
+        // ignores the *residency-set-lifecycle* coupling: the wrapper-
+        // internal `device.alloc_buffer` scratches (q_expanded,
+        // k_expanded, q_bf16, k_bf16, v_bf16, g_log_decay, o_bf16, plus
+        // the chunk-pipeline's own internal scratches) are registered
+        // with the device-level `MTLResidencySet`, and their `Drop` (via
+        // `MlxBufferStorage::drop` at /opt/mlx-native/src/buffer.rs:68-77)
+        // stages a deferred `removeAllocation:` whose `[set commit]` is
+        // flushed at the *next* `CommandEncoder::commit*` boundary
+        // (encoder.rs:1426 / 1574). With `commit()` (no wait), the
+        // wrapper returns before CB1 has executed, the scratches drop
+        // and stage their removes, and the caller's ops 8+9
+        // `commit_and_wait` flushes those removes BEFORE CB1 has run.
+        // CB1's still-in-flight references to those buffers can then
+        // race the residency-hint rescission — under the apex chunk-
+        // prefill working set Metal is free to demote pages while the
+        // GPU is mid-dispatch, producing garbage tensor values when the
+        // chunk path fires (seq_len > 64 && seq_len % 64 == 0 &&
+        // d_k == 128).
+        //
+        // The host wait restored here makes the wrapper's CB complete
+        // before the wrapper-scope scratches drop, so the deferred
+        // `removeAllocation:` staging happens on already-finished
+        // buffers — harmless. iter58b's structural cleanup is otherwise
+        // intact: caller still supplies `output_buf` + `final_state` as
+        // `&MlxBuffer` parameters, the wrapper still returns
+        // `Result<()>`, the unsafe `copy_nonoverlapping` and the
+        // `as_slice::<f32>()` CPU bridge stay deleted.
+        //
+        // Perf cost: per iter58b's own re-measurement (b6f416b commit
+        // body), this single restored wait is ~71µs on M5 Max — 0.06%
+        // of a ~3650ms chunk-prefill, well below the +1pp gate.
+        //
+        // Unit-test note: parity tests in this module that read wrapper
+        // outputs via CPU `download_f32` previously added their own
+        // empty-encoder `commit_and_wait` drain after the wrapper call.
+        // With this host wait restored those drains are no-ops, but
+        // they remain in place (harmless and forward-compatible if the
+        // wait is moved further out again).
+        //
+        // Independent-regression note (2026-04-30): the small-prompt
+        // sourdough path (seq_len < 64) does NOT take the chunk path
+        // and is not affected by this fix. The repro reported in
+        // `feedback_agent_worktree_cwd_trap.md`-style spec is the
+        // chat-template fallback regression — the apex GGUF lacks
+        // `tokenizer.chat_template` metadata so hf2q falls back to the
+        // hardcoded Gemma4 template (`src/serve/mod.rs:264-269`),
+        // producing `<|think|><|turn>assistant\n<|bos>` Gemma-style
+        // tokens that qwen35moe was never trained on. That regression
+        // is orthogonal to this fix; addressing it requires either
+        // adding `tokenizer.chat_template` to the GGUF or shipping a
+        // qwen35moe-aware fallback in `render_chat_template`.
         let _w5b8_commit = crate::inference::models::qwen35::wave5b8_profile::Section::start(
             crate::inference::models::qwen35::wave5b8_profile::SectionKind::ChunkCommitWait,
         );
-        enc.commit();
+        enc.commit_and_wait()
+            .context("commit_and_wait apply_gated_delta_net_chunk")?;
     }
 
     // iter58b: caller-provided `output_buf` and `final_state` have been
-    // written by the now-committed chunk-pipeline encoder; nothing to return.
+    // written by the now-completed chunk-pipeline encoder; nothing to return.
     Ok(())
 }
 
