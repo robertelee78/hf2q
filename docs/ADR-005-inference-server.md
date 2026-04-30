@@ -1263,25 +1263,46 @@ ADR-017's close gate inherits this rule: it does **NOT** retroactively wait on f
 
 **Cross-link to ADR-017** (already documented at line 1247 below): ADR-017 (Persistent Block Prefix Cache for serve mode) is `Accepted (falsification-gated)` as of 2026-04-30; its Phase A0.1 substrate landed `fc9a7e1` while Phase 4 reopen iter-211/iter-212 were running in parallel worktrees. ADR-017 line 531 (R5 risk-mitigation row) cross-references the family-scope rule symmetrically. ADR-017 Phase C will substitute `NoopKvSpiller` with a real spiller via `HotSwapManager::new_with_spiller(pool, loader, real_spiller)` AND enable the optional Server-Timing response header via `state.kv_spill_counters.set_server_timing_enabled(true)` from `cmd_serve --kv-persist`. **Per R7 risk mitigation, ADR-017 closure does NOT block Phase 4 closure** — Phase 4 closes on iter-214 audit completion (this commit), independent of ADR-017's own Phase D state machine. ADR-017 file: [`docs/ADR-017-persistent-block-prefix-cache.md`](ADR-017-persistent-block-prefix-cache.md). Source dossier: [`docs/research/omlx-2026-04-30.md`](research/omlx-2026-04-30.md).
 
-**Verification commands** (re-runnable from main HEAD post-iter-214 commits):
+**Verification commands + fresh-on-HEAD benchmark sweep** (HEAD `064797e`, measured 2026-04-30 12:44 PDT; M5 Max, 128 GiB unified RAM):
 
 ```bash
-cargo build --release --bin hf2q                           # PASS
-cargo test --bin hf2q --release -- serve::multi_model::    # 48/48
-cargo test --bin hf2q --release -- serve::api::router::    # 39/39 (33 pre-iter-213 + 6 new)
-cargo test --bin hf2q --release -- serve::api::state::     # 6/6
-cargo test --bin hf2q --release -- serve::cache::tests     # 74/74 (69 pre-iter-211 + 5 compute_file_sha256_*)
-cargo test --bin hf2q --release -- serve::provenance::tests  # 10/10
-cargo test --bin hf2q --release -- serve::auto_pipeline::tests  # 23/23
-cargo test --bin hf2q --release -- backends::gguf::tests   # 67/67 (48 pre-iter-211 + 13 iter211_* + 6 iter211b_*)
-cargo test --release --test kv_persist_harness             # 22/22 (ADR-017 A0.1 substrate intact)
-cargo test --release --test auto_pipeline_smoke            # 6/6 (4 pre-iter-211 + 2 e2e_iter211_*)
-cargo test --release --test cache_clear                    # 8/8
-cargo test --release --test coherence_smoke                # PASS (6 passed, 0 failed, 6 skipped — broken-window-gated)
+# Build (incremental)
+cargo build --release --bin hf2q                                    # PASS, 11.03s real
+
+# Phase 4 affected unit-test suites (counts post-iter-211b + Q8 LMHEAD vocab-pad fix +
+# load_engine arch-detect wedge):
+cargo test --bin hf2q --release -- serve::multi_model::tests        # 48/48 PASS in 0.49s real
+cargo test --bin hf2q --release -- serve::api::router::tests        # 39/39 PASS in 0.12s real
+cargo test --bin hf2q --release -- serve::api::state::tests         # 6/6   PASS
+cargo test --bin hf2q --release -- serve::cache::tests              # 74/74 PASS in 1.61s real
+cargo test --bin hf2q --release -- serve::provenance::tests         # 10/10 PASS
+cargo test --bin hf2q --release -- serve::auto_pipeline::tests      # 23/23 PASS
+cargo test --bin hf2q --release -- backends::gguf::tests            # 67/67 PASS in 0.13s real
+cargo test --bin hf2q --release -- serve::tests::load_engine        # 3/3   PASS (wedge-1 arch-detect)
+
+# Full hf2q binary test sweep (the authoritative number):
+cargo test --bin hf2q --release                                     # 2249 passed; 0 failed; 11 ignored (real ~30s)
+
+# ADR-017 A0.1 substrate (Phase A0.2a subprocess driver added 10 tests):
+cargo test --release --test kv_persist_harness                      # 32/32 PASS in 13.14s real
+
+# Phase 4 integration tests:
+cargo test --release --test auto_pipeline_smoke                     # 4/4   PASS  (skip-mode)
+cargo test --release --test cache_clear                             # 8/8   PASS in 0.36s real
+cargo test --release --test coherence_smoke                         # PASS in 72.6s (6 passed, 0 failed, 6 skipped:
+                                                                    #                3 MODEL_MISSING apex + 3
+                                                                    #                QUANT_NOT_SUPPORTED dwq46)
 
 # Live AC 5469 verification (env-gated subprocess test, real hf2q binary):
-HF2Q_AUTO_PIPELINE_E2E=1 cargo test --release --test auto_pipeline_smoke e2e_iter211   # 2/2 PASS
+HF2Q_AUTO_PIPELINE_E2E=1 cargo test --release --test auto_pipeline_smoke e2e_iter211  # 2/2 PASS in 1.19s real
+
+# Live wedge-1 verification (Qwen3.6 SERVE fail-fast diagnostic, no panic):
+target/release/hf2q serve --model /opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf
+# → exits with operator-actionable AnyHow error naming the arch + cmd_generate_qwen35 workaround
+#   (was: silent panic at forward_mlx.rs:976 on attn_q.weight not found)
 ```
+
+**Aggregate benchmark headline:** **2249/2249 hf2q binary tests pass on HEAD `064797e`** with 11 ignored (pre-existing flaky/network-gated). 0 regressions across any Phase-4-affected suite. Full sweep wall-clock dominated by kv_persist_harness's Metal-warmup (13s) + coherence_smoke's subprocess-spawn-and-decode loop (72s); pure unit tests complete in <2s aggregate.
 
 **Live verification depth (mantra-honest, 2026-04-30 iter-214 audit):**
 
