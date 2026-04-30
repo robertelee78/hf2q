@@ -66,6 +66,9 @@ pub enum Command {
     /// Convert a HuggingFace model to a hardware-optimized format
     Convert(ConvertArgs),
 
+    /// Patch an existing GGUF file's metadata without changing tensor bytes
+    GgufPatch(GgufPatchArgs),
+
     /// Inspect model metadata before converting
     Info(InfoArgs),
 
@@ -98,6 +101,31 @@ pub enum Command {
     /// All clear operations atomically rewrite the cache manifest;
     /// concurrent serves observe coherent before/after state.
     Cache(CacheArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct GgufPatchArgs {
+    /// Input GGUF file
+    pub input: PathBuf,
+
+    /// Output GGUF path. Required unless --in-place or --dry-run is set.
+    #[arg(long, conflicts_with = "in_place")]
+    pub output: Option<PathBuf>,
+
+    /// Rewrite the input file atomically in place
+    #[arg(long, conflicts_with = "output", default_value_t = false)]
+    pub in_place: bool,
+
+    /// Add tokenizer.chat_template from the architecture default.
+    ///
+    /// This is currently the default and only patch operation; the flag is
+    /// accepted for explicit operator intent and forward-compatible scripts.
+    #[arg(long, default_value_t = false)]
+    pub add_chat_template_from_arch: bool,
+
+    /// Report the planned action without writing
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
 }
 
 /// Top-level args for `hf2q cache`. The actual surface is split into

@@ -15,6 +15,7 @@ pub mod cli;
 mod debug;
 mod doctor;
 pub mod models;
+pub mod gguf_patch;
 pub mod gpu;
 pub mod inference;
 pub mod input;
@@ -166,6 +167,7 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), AppError> {
     match cli.command {
         Command::Convert(args) => cmd_convert(args),
+        Command::GgufPatch(args) => cmd_gguf_patch(args),
         Command::Info(args) => cmd_info(args).map_err(AppError::Input),
         Command::Validate(args) => cmd_validate(args),
         Command::Doctor => doctor::run_doctor().map_err(AppError::Conversion),
@@ -181,6 +183,23 @@ fn run(cli: Cli) -> Result<(), AppError> {
         // exit-3 is the documented signal.
         Command::Cache(args) => serve::cmd_cache(args).map_err(AppError::Input),
     }
+}
+
+fn cmd_gguf_patch(args: cli::GgufPatchArgs) -> Result<(), AppError> {
+    if !args.dry_run && !args.in_place && args.output.is_none() {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "gguf-patch requires --output <out> or --in-place unless --dry-run is set"
+        )));
+    }
+
+    gguf_patch::patch_chat_template_from_arch(gguf_patch::GgufPatchOptions {
+        input: args.input,
+        output: args.output,
+        in_place: args.in_place,
+        dry_run: args.dry_run,
+    })
+    .map(|_| ())
+    .map_err(AppError::Conversion)
 }
 
 /// Handle the `smoke` subcommand — ADR-012 Decision 16.

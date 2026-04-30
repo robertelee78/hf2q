@@ -2201,3 +2201,19 @@ Per full-attention layer (9 Qwen3.5-specific + 8 MoE FFN):
 | P4–P13 | 1, 2, 8–18 | Pending |
 
 **Next iter target:** SSM_CONV (completes P0), then P1 TRI_SOLVE.
+
+### 2026-04-30 — ADR-012 GGUF patch utility unblocks chat-template-clean sourdough inputs
+
+ADR-012 now ships `hf2q gguf-patch`, a metadata-only GGUF re-emitter for repairing existing artifacts that predate convert-time chat-template injection. It detects `general.architecture`, uses the shared `arch_default_chat_template()` table, and appends `tokenizer.chat_template` only when absent. The command is idempotent, supports `--dry-run`, and preserves tensor names plus raw tensor bytes exactly.
+
+Applied to the local apex artifact:
+
+```bash
+target/release/hf2q --log-level info gguf-patch \
+  /opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf \
+  --output /tmp/cfa-adr012-gguf-chat-template-patch/codex-apex-patched.gguf
+```
+
+Receipt: `arch=qwen35moe`, Qwen3 ChatML template length 7764, 733 tensors. Independent per-tensor SHA-256 verification found zero tensor-name differences and zero tensor-payload diffs between original and patched files. This closes the independent chat-template contamination noted in the 2026-04-30 P13 regression entry; future sourdough runs should use the patched artifact or a GGUF emitted by the post-fix convert path.
+
+Sourdough/bench was not rerun inside the Codex sandbox because no Metal device is available there. That is an environment block only; the patch utility itself is pure GGUF metadata/tensor I/O and needs no Metal.

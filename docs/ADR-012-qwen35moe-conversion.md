@@ -1722,3 +1722,22 @@ New arches MUST source from a published vendor `tokenizer_config.json` and be co
 
 **(f) Constraints honoured.** Pure Rust; no candle/llama.cpp link. Vendor template embedded verbatim (no synthesis). No env-gating, no fallback-of-the-fallback, no TODO stub. Pathspec-only commit per `feedback_git_commit_pathspec_when_parallel.md`.
 
+### 2026-04-30 — GGUF metadata patch utility · CFA dual-mode (codex) — existing artifacts repaired without tensor mutation
+
+**(a) CLI shipped.** Added `hf2q gguf-patch <input> [--output <out> | --in-place] [--add-chat-template-from-arch] [--dry-run]`. The operation opens the input through `mlx_native::gguf::GgufFile`, detects `general.architecture`, looks up `crate::backends::chat_templates::arch_default_chat_template()`, and injects `tokenizer.chat_template` only when the key is absent. Existing `tokenizer.chat_template` is idempotent skip with INFO. Unknown or missing arch is graceful skip with WARN. `--dry-run` reports the planned injection and writes nothing.
+
+**(b) Implementation note.** The patcher re-emits the GGUF header/metadata/tensor-info table and streams every original tensor payload byte to the new data section. It does not route through `GgufBackend::write` because that writer starts from `QuantizedModel` and may rename, synthesize, or repack tensors; this utility's invariant is stricter for already-built GGUFs: all tensor names and raw tensor bytes must be unchanged.
+
+**(c) Tests.** `cargo test --release --bin hf2q gguf_patch` PASS (4/4): qwen35moe synthetic injects the 7764-byte Qwen3 ChatML template; existing chat_template remains byte-unchanged in place; unknown arch skips without writing; dry-run writes nothing. Regression receipts: `cargo test --release --bin hf2q backends::gguf` PASS (71/71) and `cargo test --release --bin hf2q backends::chat_templates` PASS (3/3).
+
+**(d) Apex apply receipt.** Ran:
+
+```bash
+target/release/hf2q --log-level info gguf-patch \
+  /opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf \
+  --output /tmp/cfa-adr012-gguf-chat-template-patch/codex-apex-patched.gguf
+```
+
+Result: `arch=qwen35moe`, `template_len=7764`, `tensors=733`. Independent parser verification: original had no `tokenizer.chat_template`; patched has `tokenizer.chat_template` length 7764; tensor count 733 -> 733; tensor name symmetric difference 0; per-tensor SHA-256 diffs 0; patched size 24,510,951,456 bytes.
+
+**(e) Sourdough/Metal limitation.** The Codex sandbox has no usable Metal device, so ADR-013 sourdough/bench execution remains blocked here by environment, not by the patch utility. The utility itself is pure metadata/tensor-byte I/O and was verified without Metal.
