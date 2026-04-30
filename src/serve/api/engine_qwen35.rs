@@ -1520,6 +1520,76 @@ mod tests {
         );
     }
 
+    /// Wedge-3 / iter-216 Phase E: the Qwen35 chat arm consumes the
+    /// EXISTING `super::registry::QWEN35` registration's reasoning
+    /// markers via `super::registry::split_full_output` — the same
+    /// helper the Gemma non-streaming path uses.  This test pins the
+    /// shared-helper contract (no duplicated splitter code; one source
+    /// of truth in `registry.rs`).
+    #[test]
+    fn splitter_helper_extracts_reasoning_from_qwen35_thinkblocks() {
+        let reg = super::super::registry::QWEN35;
+        let raw =
+            "Sure! <think>Let me solve this step by step.</think>The answer is 42.";
+        let (content, reasoning) = super::super::registry::split_full_output(&reg, raw);
+        assert_eq!(
+            content, "Sure! The answer is 42.",
+            "content must exclude the <think>...</think> span"
+        );
+        assert_eq!(
+            reasoning.as_deref(),
+            Some("Let me solve this step by step."),
+            "reasoning must contain the inner span"
+        );
+    }
+
+    /// Wedge-3 / iter-216 Phase E: the Qwen35 streaming arm consumes
+    /// the EXISTING `super::registry::ToolCallSplitter` for tool-call
+    /// markers (`<tool_call>` / `</tool_call>`).  This test pins the
+    /// open/text/close event sequence so a downstream change to the
+    /// QWEN35 registration's tool-call markers surfaces here.
+    #[test]
+    fn splitter_helper_extracts_tool_calls_from_qwen35_toolblocks() {
+        let reg = super::super::registry::QWEN35;
+        let mut sp = super::super::registry::ToolCallSplitter::from_registration(&reg)
+            .expect("QWEN35 has tool markers");
+        let raw =
+            "Let me search.<tool_call><function=search><parameter=q>weather</parameter></function></tool_call> Done.";
+        let mut events = Vec::new();
+        events.extend(sp.feed(raw));
+        if let Some(tail) = sp.finish() {
+            events.push(tail);
+        }
+        // We expect: Content("Let me search.") → ToolCallOpen →
+        // ToolCallText("<function=search>...</function>") → ToolCallClose
+        // → Content(" Done.").
+        let mut saw_open = false;
+        let mut saw_text = false;
+        let mut saw_close = false;
+        let mut content_runs: Vec<String> = Vec::new();
+        for ev in events {
+            use super::super::registry::ToolCallEvent::*;
+            match ev {
+                Content(t) => content_runs.push(t),
+                ToolCallOpen => saw_open = true,
+                ToolCallText(_) => saw_text = true,
+                ToolCallClose => saw_close = true,
+            }
+        }
+        assert!(saw_open, "must observe ToolCallOpen for QWEN35 marker");
+        assert!(saw_text, "must observe ToolCallText body");
+        assert!(saw_close, "must observe ToolCallClose");
+        let joined: String = content_runs.join("");
+        assert!(
+            joined.contains("Let me search."),
+            "preamble content must round-trip"
+        );
+        assert!(
+            joined.contains(" Done."),
+            "post-close content must round-trip"
+        );
+    }
+
     /// Wedge-3 / iter-216 Phase D contract: a freshly-loaded `Qwen35LoadedModel`
     /// initializes its prompt_cache in the empty state.
     ///
