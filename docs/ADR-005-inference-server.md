@@ -987,7 +987,7 @@ Absorbed from the previous Phase 3 per the 2026-04-23 scope refinement. Vision i
 
 #### Phase 4 reopen — 2026-04-30 (post-iter-210 closure ceremony)
 
-**Status:** Accepted. Three new iters (211, 212, 213) plus a closure-ceremony iter (214). Two new ACs (5471, 5472). One AC unblocked from carry-forward to actually-implementable (5469). No behavior change to existing handlers in any iter except 211's auto-pipeline short-circuit activation, which is byte-equivalent to the iter-204 lookup_and_verify path until a hf2q-emitted GGUF lands in cache.
+**Status:** **CLOSED 2026-04-30** (iter-214 closure ceremony — see closure block below at the end of this subsection). Three new iters (211, 212, 213) plus a closure-ceremony iter (214) all landed on origin/main between commits `2467675..af7ff74` on 2026-04-30. Two new ACs (5471, 5472) closed; one AC (5469) unblocked-from-carry-forward and closed. No behavior change to existing handlers in any iter except 211's auto-pipeline short-circuit activation, which is byte-equivalent to the iter-204 lookup_and_verify path until a hf2q-emitted GGUF lands in cache.
 
 This subsection is engineer-executable. Every iter below names: target file:line, scope, dependencies, mechanical acceptance checkboxes, test cohort, and the Chesterton's-fence audit it must clear before code commits. Per the Engineering Mantra at lines 8-23 (verbatim) — "DO NOT BE LAZY ... No fallback. No stub (todo later) code. Just pure excellence, done the right way the entire time. Also recall Chesterton's fence; always understand current fully before changing it."
 
@@ -1153,7 +1153,7 @@ pub struct HotSwapManager<E> {
   - `hotswap_post_admit_error_does_not_block_admission` — `MockSpiller::post_admit` returns `Error(...)`; assert engine still admitted to pool (admission proceeds; error surfaces to telemetry counter in iter-213).
   - `hotswap_concurrent_load_with_spiller_serializes_under_mutex` — extends iter-210 W-B1 TOCTOU regression test to assert per-thread `pre_evict` + `post_admit` calls counted exactly once each, no double-fire under contention.
 - [ ] No regression: `serve::multi_model::tests` 39/39 → 48/48 (was 39 + 9 new spiller tests); every other suite unchanged.
-- [ ] AC 5471 `[ ]` → `[x]` at line 5869 with citation: `iter-212 W?? commit <hash>; KvSpiller<E> trait + NoopKvSpiller + 2 trigger sites; 9 new unit tests; behavior byte-identical with noop wired.`
+- [x] AC 5471 `[ ]` → `[x]` at line 6101 (real line; plan said 5869, doc had drifted) with citation: `iter-212 commits 7844ccb + 5d41c6e + d018079 + efe061c; merged 8735839; KvSpiller<E> trait + SpillOutcome/RestoreOutcome/SpillErrorKind/RestoreErrorKind enums + NoopKvSpiller default + 3 trigger sites (load_or_get pre_evict per-evictee + post_admit on cold load + evict pre_evict); 9 new unit tests; behavior byte-identical with noop wired (39 pre-iter-212 multi_model tests UNCHANGED).`
 
 **Test cohort target:** ≥9 new in-binary unit tests adjacent to the trait + impl. Mirrors iter-208 W76 test density (14 unit tests for `HotSwapManager`).
 
@@ -1214,14 +1214,60 @@ hf2q_pool_kv_restores_total{repo="meta-llama/...",quant="Q4_0",outcome="success"
 **Target files.** Documentation only — `docs/ADR-005-inference-server.md` updates at the Phase 4 AC checklist (lines 5834-5839 + the new 5471/5472 entries), the Phase 4 audit at line 5630 (note the reopen supersedes its 0/5 framing), and this section's status line.
 
 **Acceptance checkboxes.**
-- [ ] Every Phase 4 AC's `[ ]` / `[x]` matches tree state per `git log` + grep verification (no claims unbacked by code).
-- [ ] Family-scope rule cross-referenced in ADR-017's §Family-scope rule subsection.
-- [ ] ADR-017 status flipped from "Accepted (falsification-gated)" to either "Closed-Shipped" (success) or "Closed-Unmerged" (kill-gate fired) per its own Phase D closure.
-- [ ] Phase 4 reopen status flips Accepted → Closed once iter-211 + 212 + 213 land + 214's audit completes.
+- [x] Every Phase 4 AC's `[ ]` / `[x]` matches tree state per `git log` + grep verification (no claims unbacked by code). **Walk completed iter-214 (2026-04-30) — see iter-214 closure status block below for the per-AC tree-state binding citations.**
+- [x] Family-scope rule cross-referenced in ADR-017's §Family-scope rule subsection. **Verified iter-214 — ADR-017 line 531 (R5 risk-mitigation row) explicitly references the family-scope rule and cross-links back to "ADR-005 Phase 4 reopen subsection". Symmetric cross-reference is now in place.**
+- [ ] ADR-017 status flipped from "Accepted (falsification-gated)" to either "Closed-Shipped" (success) or "Closed-Unmerged" (kill-gate fired) per its own Phase D closure. **OUT-OF-SCOPE for iter-214 per R7 risk mitigation — "ADR-017 closure does not block Phase 4 closure". ADR-017's own Phase D state machine is independent; ADR-017 remains `Accepted (falsification-gated)` at Phase 4 closure (Phase A0.1 substrate landed `fc9a7e1` 2026-04-30; Phases B/C/D pending). This checkbox tracks the future ADR-017 state, not iter-214 work.**
+- [x] Phase 4 reopen status flips Accepted → Closed once iter-211 + 212 + 213 land + 214's audit completes. **Status flipped at line 990 to `**CLOSED 2026-04-30**` 2026-04-30 (iter-214 commit pending below).**
 
 **LOC breakdown.** ~0 src + ~0 test. Documentation only.
 
 **Dependencies.** iter-211 + iter-212 + iter-213 all GREEN.
+
+**iter-214 status (2026-04-30, CLOSED — Phase 4 reopen CLOSURE CEREMONY):** All three reopen iters landed cleanly on origin/main between commits `2467675..af7ff74` on 2026-04-30. Phase 4 reopen status flipped Accepted → CLOSED at line 990. iter-214 is documentation-only; no code changes.
+
+**AC tree-state walk** (every Phase 4 AC verified against actual code via `grep` + `git log` per the Engineering Mantra "Code + test == truth; comments in code or ADR can be starting points, but never trust them over code"):
+
+| AC | Status | Tree-state binding |
+| --- | --- | --- |
+| **5466** Hot-swap < 10s | `[x]` (re-grep `Hot-swap between two cached GGUFs`) | `tests/multi_model_swap.rs::multi_model_swap_two_ggufs_e2e` (LIVE measured 3.108s on M5 Max < 10s budget) — iter-210 W78 commit `e991c96` |
+| **5467** Pool 3 models / LRU / 80% budget | `[x]` (re-grep `Cached pool holds up to 3`) | `src/serve/multi_model.rs::tests::pool_holds_three_models_within_budget` + 4 W-B1 TOCTOU regression tests (`hotswap_chains_multiple_evictions_in_one_load`, `hotswap_oversized_handle_preserves_existing_entries`, `hotswap_load_or_get_promotes_on_cache_hit`, `hotswap_concurrent_load_or_get_serializes_under_mutex`) — iter-210 W78 + Wave 3 W-B1 |
+| **5468** Qwen3/Mistral decode parity ±5% | `[x] (partial)` | Walk-bar correctness PASS at pp4096 (Wave 5b.4 commit `2a67974`); prefill perf-bar measurement remains blocked on ADR-013 hybrid-arch SERVE-side load. **NO change in iter-214** — documented partial-flip carries forward unchanged (R4 mitigation in original Phase 4 audit). |
+| **5469** GGUF provenance path | `[x]` (re-grep `GGUF provenance path: loading`) | `src/backends/gguf.rs::Hf2qProvenance` struct + `GgufBackend::with_provenance(...)` builder + 3 metadata-key writes at quantize time (`hf2q.producer_version` + `hf2q.source_sha256` + optional `hf2q.mmproj_sha256`); reader-half (iter-207 `serve/provenance.rs::detect`) + writer-half (iter-211) round-trip verified by 13 in-binary unit tests under `backends::gguf::tests::iter211_*` + 2 subprocess integration tests under `tests/auto_pipeline_smoke.rs::e2e_iter211_*`; auto-pipeline short-circuit saves 30 GB SHA-256 re-hash on hf2q-stamped cache hits. iter-211 commits `2467675` + `58bd824` + `ffea504`. **Chesterton's-fence finding:** `src/quantize/gguf_writer.rs` does not exist post-ADR-014 P7; writer lives in `src/backends/gguf.rs:347` (the iter-211 plan's reference to `gguf_writer.rs` was speculative). |
+| **5470** Qwen3.5 fast-follow walk-bar | `[x] (partial)` | Same partial state as 5468 (walk-bar correctness PASS, prefill perf-bar inherits ADR-013 blocker). NO change in iter-214. |
+| **5471** Eviction-hook trait surface | `[x]` (re-grep `AC 5471 (added 2026-04-30 reopen)`) | `src/serve/multi_model.rs::KvSpiller<E>` trait + `SpillOutcome`/`RestoreOutcome`/`SpillErrorKind`/`RestoreErrorKind` enums + `NoopKvSpiller` default + 3 trigger sites (`load_or_get` LRU pre_evict per-evictee + post_admit on cold load + `evict()` pre_evict); `HotSwapManager::new(pool, loader)` keeps existing 2-arg back-compat; `new_with_spiller(pool, loader, spiller)` adds 3-arg form; 9 new unit tests (`MockSpiller` fixture mirroring `MockEngine`/`MockLoader` pattern); `serve::multi_model::tests` 39/39 → 48/48 with all 39 pre-existing tests UNCHANGED (proves byte-identical behavior); iter-208 `hotswap_in_flight_arc_survives_eviction` invariant re-verified by `hotswap_pre_evict_fires_before_engine_drop`. iter-212 commits `7844ccb` + `5d41c6e` + `d018079` + `efe061c`; merged `8735839`. |
+| **5472** KV-spill telemetry | `[x]` (re-grep `AC 5472 (added 2026-04-30 reopen)`) | `src/serve/api/state.rs::KvSpillCounters` (`Mutex<HashMap<(repo, quant), [AtomicU64; 4]>>` × 2 maps for spills + restores) + `KV_SPILL_OUTCOMES` `pub const` closed-enum slice (`["success", "codec_err", "io_err", "parity_fail"]`) + `Arc<KvSpillCounters>` field on `AppState` + `set_kv_counters` plumbing on `HotSwapManager` + `record_spill`/`record_restore` outcome→counter wiring at iter-212 trigger sites + `/metrics` emit via new `build_kv_counter_block` helper in `src/serve/api/handlers.rs`; 6 new router-level tests (`iter213_metrics_emits_kv_counters`, `iter213_kv_counter_delta_under_synthetic_spill`, `iter213_kv_counter_outcome_cardinality_registered`, `iter213_server_timing_header_default_off`, `iter213_kv_counter_error_outcomes_increment`, `iter213_skipped_outcome_does_not_increment`); Skipped does NOT increment (closed-enum guard); per-call NOT per-block invariant; Server-Timing default-OFF (ADR-017 Phase C `cmd_serve --kv-persist` enables via `set_server_timing_enabled(true)`). iter-213 commits `20a8b8f` + `150be1c` + `f6ab42c`; merged `af7ff74`. |
+
+**Note on line citations:** This ADR has grown to >7300 lines and AC line numbers drift continuously. Per Engineering Mantra "code is truth, doc may lag", AC bindings above are cited by **content (grep-anchor)** rather than line number; the `re-grep` strings above are stable across doc edits and resolve to the live AC at any HEAD. The iter-211/212/213 plan checkboxes' line citations (5867 / 5869 / 6082) were stale at writing AND drifted further during the closure ceremony itself — the plan's line-number convention does not survive concurrent edits.
+
+**Final AC ratio: 7/7 ACs at terminal state for today's tree** (5/7 fully closed: 5466 + 5467 + 5469 + 5471 + 5472; 2/7 closed-with-partial-qualifier per their documented ADR-013 perf-bar follow-up: 5468 + 5470). **Phase 4 reopen scope (5469 + 5471 + 5472) fully met** — every reopen-scoped AC is `[x]` with a tree-state citation that the next reader can re-verify by `grep` + `cargo test`.
+
+**Family-scope rule (now official close-gate semantics):** Per the family table at lines 1010-1020, "all families we support" means: **every future family complete-in-code MUST land its own `KvCacheSpill` impl as part of its serve-side enablement** (consumes the AC 5471 trait surface). Today's families:
+- **Gemma 4 26B MoE-A4B** — LANDED daily-driver fixture; dense full-attention BF16/F32 K/V at `kv_cache.rs:14-16, 305-337`. Inherits trait surface from Phase 4 closure; ADR-017 Phase C is its primary close-gate target.
+- **Qwen3.5/3.6-MoE hybrid** — BLOCKED on ADR-013 hybrid-arch SERVE-side load (`forward_mlx.rs:803` LMHEAD slice OOB; `:884` missing `attn_q.weight` for delta-net layers). Trait inherits forward; the family-specific spiller impl rides ADR-013 unblock; AC 5468 + 5470 prefill perf-bar halves carry forward unchanged.
+- **BERT-family embeddings** (bge-small-en-v1.5, mxbai-embed-large-v1, nomic-embed-text-v1.5) — LANDED at Phase 2b iter-91; **EXCLUDED by KV semantics** (one-shot pooled forward pass, no KV cache). Phase 4 reopen and ADR-017 do not touch these.
+- **Qwen3 dense, Mistral** — Aspirational per AC 5468; no current serve-side impl. Trait inherits forward; impl rides each family's serve-side enablement.
+
+ADR-017's close gate inherits this rule: it does **NOT** retroactively wait on families that are not yet complete-in-code; the trait surface inherits forward; the parity gate is scoped to today's reality. This sidesteps the failure mode where "all families" reads as "wait for every conceivable future family" (the dual of the carve-out trap rejected in the original Phase 4 reopen synthesis).
+
+**Cross-link to ADR-017** (already documented at line 1247 below): ADR-017 (Persistent Block Prefix Cache for serve mode) is `Accepted (falsification-gated)` as of 2026-04-30; its Phase A0.1 substrate landed `fc9a7e1` while Phase 4 reopen iter-211/iter-212 were running in parallel worktrees. ADR-017 line 531 (R5 risk-mitigation row) cross-references the family-scope rule symmetrically. ADR-017 Phase C will substitute `NoopKvSpiller` with a real spiller via `HotSwapManager::new_with_spiller(pool, loader, real_spiller)` AND enable the optional Server-Timing response header via `state.kv_spill_counters.set_server_timing_enabled(true)` from `cmd_serve --kv-persist`. **Per R7 risk mitigation, ADR-017 closure does NOT block Phase 4 closure** — Phase 4 closes on iter-214 audit completion (this commit), independent of ADR-017's own Phase D state machine. ADR-017 file: [`docs/ADR-017-persistent-block-prefix-cache.md`](ADR-017-persistent-block-prefix-cache.md). Source dossier: [`docs/research/omlx-2026-04-30.md`](research/omlx-2026-04-30.md).
+
+**Verification commands** (re-runnable from main HEAD `af7ff74` post-iter-214 commit):
+
+```bash
+cargo build --release --bin hf2q                           # PASS
+cargo test --bin hf2q --release -- serve::multi_model::    # 48/48
+cargo test --bin hf2q --release -- serve::api::router::    # 39/39 (33 pre-iter-213 + 6 new)
+cargo test --bin hf2q --release -- serve::api::state::     # 6/6
+cargo test --bin hf2q --release -- serve::cache::tests     # 74/74 (69 pre-iter-211 + 5 compute_file_sha256_*)
+cargo test --bin hf2q --release -- serve::provenance::tests  # 10/10
+cargo test --bin hf2q --release -- serve::auto_pipeline::tests  # 23/23
+cargo test --bin hf2q --release -- backends::gguf::tests   # 61/61 (48 pre-iter-211 + 13 iter211_*)
+cargo test --release --test kv_persist_harness             # 22/22 (ADR-017 A0.1 substrate intact)
+cargo test --release --test auto_pipeline_smoke            # 6/6 (4 pre-iter-211 + 2 e2e_iter211_*)
+cargo test --release --test cache_clear                    # 8/8
+```
+
+**Phase 4 reopen final state:** **CLOSED 2026-04-30.** This subsection's `####` header retains the original "Phase 4 reopen — 2026-04-30" date stamp; final state is `CLOSED` per the status flip at line 990. **ADR-005 OVERALL after this closure:** Phase 1 + Phase 1b + Phase 2a + Phase 2b + Phase 2c + Phase 3 + Phase 4 (5/7 ACs full + 2/7 partial-with-perf-bar-blocker inherited from ADR-013) all closed at terminal state for today's tree. The 2/7 partial-flips (AC 5468 + AC 5470) close fully when ADR-013 unblocks the qwen3.6 hybrid-arch SERVE-side load and the prefill perf-bar measurement runs against the unblocked path; that work is ADR-013-territory, not Phase 4-territory.
 
 ##### Test plan (cross-iter)
 
