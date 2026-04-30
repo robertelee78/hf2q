@@ -1134,12 +1134,21 @@ fn dir_total_bytes(dir: &Path) -> u64 {
     total
 }
 
-/// SHA-256 of a file as lowercase hex.  Used by [`QuantEntry`] writers.
-/// Public so iter-203 (integrity check) can reuse it without re-creating
-/// yet another sha256 helper.
-pub fn sha256_file(path: &Path) -> Result<String> {
-    let mut f = File::open(path)
-        .with_context(|| format!("open: {}", path.display()))?;
+/// SHA-256 of a file as lowercase hex (low-level form).
+///
+/// Streams 1 MiB at a time so even 30+ GiB GGUFs hash with a bounded
+/// resident buffer.  Returns `io::Result<String>` so callers can match
+/// on `io::ErrorKind` directly (e.g. distinguish `NotFound` from
+/// `PermissionDenied`).  Parallel naming to
+/// [`compute_source_bundle_sha256`] — the two together form the
+/// "compute" surface the GGUF provenance writer (ADR-005 Phase 4
+/// iter-211) emits at quantize time.
+///
+/// ADR-005 Phase 4 iter-211 — added as the canonical 1-MiB-streaming
+/// hasher; [`sha256_file`] now delegates here so all callers (cache,
+/// auto-pipeline, Phase 3 integrity) share one implementation.
+pub fn compute_file_sha256(path: &Path) -> std::io::Result<String> {
+    let mut f = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1024 * 1024];
     loop {
@@ -1149,8 +1158,20 @@ pub fn sha256_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    let digest = hasher.finalize();
-    Ok(hex::encode(digest))
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// SHA-256 of a file as lowercase hex.  Used by [`QuantEntry`] writers.
+/// Public so iter-203 (integrity check) can reuse it without re-creating
+/// yet another sha256 helper.
+///
+/// Thin `anyhow::Result`-shaped wrapper around
+/// [`compute_file_sha256`] that adds the `open: <path>` context expected
+/// by every existing caller.  Kept for back-compat with iter-203 / iter-205
+/// callsites — new code should prefer [`compute_file_sha256`] when
+/// `io::Result` is sufficient.
+pub fn sha256_file(path: &Path) -> Result<String> {
+    compute_file_sha256(path).with_context(|| format!("open: {}", path.display()))
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1769,6 +1790,92 @@ mod tests {
             sha256_file(&path).unwrap(),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    // ── ADR-005 Phase 4 iter-211 — compute_file_sha256 ────────────────
+    //
+    // Same byte algorithm as `sha256_file`, but `io::Result`-shaped so
+    // GGUF-writer callers can match on `io::ErrorKind` without an
+    // `anyhow::downcast`.  These tests pin the canonical RFC test
+    // vectors and the >1 MiB streaming path so a future "fast" rewrite
+    // can't silently regress.
+
+    #[test]
+    fn compute_file_sha256_known_vector() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hello.bin");
+        fs::write(&path, b"hello").unwrap();
+        assert_eq!(
+            compute_file_sha256(&path).unwrap(),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    #[test]
+    fn compute_file_sha256_empty() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("empty.bin");
+        fs::write(&path, b"").unwrap();
+        assert_eq!(
+            compute_file_sha256(&path).unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn compute_file_sha256_multi_chunk_streams_correctly() {
+        // 3 MiB + 17 bytes — exercises the 1 MiB read loop boundary at
+        // 1, 2, and 3 MiB plus a tail read.  Asserts byte-identical
+        // result against the in-memory hash (equivalence of streaming
+        // and one-shot).
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("multi.bin");
+        let mut buf = Vec::with_capacity(3 * 1024 * 1024 + 17);
+        for i in 0..(3 * 1024 * 1024 + 17) {
+            buf.push((i % 251) as u8); // pseudo-random byte pattern
+        }
+        fs::write(&path, &buf).unwrap();
+
+        let mut hasher = Sha256::new();
+        hasher.update(&buf);
+        let expected = hex::encode(hasher.finalize());
+
+        assert_eq!(compute_file_sha256(&path).unwrap(), expected);
+        assert_eq!(expected.len(), 64);
+        assert!(expected.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn compute_file_sha256_missing_file_yields_io_not_found() {
+        // `io::Result` shape: caller can match on `ErrorKind::NotFound`
+        // without `anyhow::downcast`.  This is the load-bearing reason
+        // we expose `compute_file_sha256` alongside `sha256_file`.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("does-not-exist.bin");
+        let err = compute_file_sha256(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn compute_file_sha256_matches_sha256_file_byte_for_byte() {
+        // Symmetry: `sha256_file` (anyhow shape) and
+        // `compute_file_sha256` (io shape) MUST agree on every input.
+        // If a future refactor drifts the implementations apart,
+        // this test catches it before any cache-vs-writer SHA mismatch.
+        let tmp = TempDir::new().unwrap();
+        for (name, content) in [
+            ("a.bin", &b""[..]),
+            ("b.bin", &b"the quick brown fox jumps over the lazy dog"[..]),
+            ("c.bin", &vec![0xABu8; 2 * 1024 * 1024 + 5][..]),
+        ] {
+            let p = tmp.path().join(name);
+            fs::write(&p, content).unwrap();
+            assert_eq!(
+                compute_file_sha256(&p).unwrap(),
+                sha256_file(&p).unwrap(),
+                "drift between compute_file_sha256 and sha256_file for {name}"
+            );
+        }
     }
 
     // ── ADR-005 Phase 3 iter-203 — schema v1→v2 migration ───────────────
