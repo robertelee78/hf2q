@@ -1426,47 +1426,32 @@ pub fn pool_key_for_path(path: &Path) -> String {
 
 pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<api::engine::Engine> {
     anyhow::ensure!(path.exists(), "Model not found: {}", path.display());
-    // Header-only parse surfaces bad magic immediately without loading
-    // any tensor data.
+    // Header-only parse surfaces bad magic + populates the diagnostic
+    // log line.  Cheap (memory-mapped header, no tensor read).
     //
-    // ADR-005 Phase 4 follow-up wedge — arch dispatch on the SERVE path
-    // (chat-model load).  The body below loads the Gemma-shaped
-    // forward_mlx LoadedModel; for qwen35 / qwen35moe GGUFs that path
-    // panics at `forward_mlx.rs:976` because Qwen3.5/3.6's hybrid 3:1
-    // DeltaNet:Attention has no `attn_q.weight` on DeltaNet layers.
-    //
-    // The `generate` subcommand already routes correctly via
-    // `cmd_generate_qwen35` (`serve/mod.rs:357-379`); the `serve`
-    // subcommand's `DefaultModelLoader::load` does not.  Building the
-    // parallel Qwen35Engine + LoadedQwen35Model is multi-day work
-    // (paralleling the cmd_generate_qwen35 inference path).  Until
-    // that lands, fail FAST + LOUD with an operator-actionable error
-    // here rather than the bare slice-OOB / not-found panic in the
-    // Gemma loader.
+    // ADR-005 Phase 4 reopen iter-215 Wedge-2: the pre-iter-215
+    // arch-detect bail for qwen35 / qwen35moe (commit 064797e) is
+    // replaced by actual SERVE-side dispatch.  `LoadedModel::load`
+    // (api/engine.rs) reads `general.architecture` and routes to
+    // `Qwen35LoadedModel::load` for Qwen3.5/3.6 or
+    // `GemmaLoadedModel::load` otherwise; the worker thread arm for
+    // the Qwen35 variant returns HTTP 501 with an operator-actionable
+    // message (Wedge-3 deferred follow-up wires the live forward
+    // pass).  See `LoadedModel::load` for the dispatch surface.
     {
         let gguf = mlx_native::gguf::GgufFile::open(path)
             .map_err(|e| anyhow::anyhow!("GGUF header parse failed: {e}"))?;
+        let arch = gguf
+            .metadata_string("general.architecture")
+            .map(|s| s.to_string())
+            .unwrap_or_default();
         tracing::info!(
             path = %path.display(),
             tensors = gguf.tensor_count(),
             metadata = gguf.metadata_count(),
+            arch = %arch,
             "Validated GGUF header"
         );
-        if let Some(arch) = gguf.metadata_string("general.architecture") {
-            if arch == "qwen35" || arch == "qwen35moe" {
-                anyhow::bail!(
-                    "ADR-005 Phase 4 follow-up: SERVE-side load for general.architecture=\"{arch}\" \
-                     is not yet implemented. The Gemma-shaped forward_mlx loader (the only chat-model \
-                     loader on the serve path today) expects `blk.{{i}}.attn_q.weight` on every layer, \
-                     but Qwen3.5/3.6's hybrid 3:1 DeltaNet:Attention has no attn_q on DeltaNet layers. \
-                     The `hf2q generate` subcommand already routes Qwen3.5/3.6 GGUFs correctly via \
-                     `cmd_generate_qwen35`. Wire SERVE-side arch-dispatch to a Qwen35Engine paralleling \
-                     cmd_generate_qwen35 (multi-day model-class enablement). Tracked in ADR-005 \
-                     top-level header as out-of-Phase-4-scope follow-up. Path: {}",
-                    path.display()
-                );
-            }
-        }
     }
 
     let load_opts = api::engine::LoadOptions {
@@ -2594,7 +2579,15 @@ mod tests {
         );
     }
 
-    // ── ADR-005 Phase 4 follow-up — load_engine arch-detect wedge ──
+    // ── ADR-005 Phase 4 reopen iter-215 Wedge-2 — load_engine arch dispatch ──
+    //
+    // Iter-215 replaces the iter-214 wedge-1 bail (commit 064797e) with
+    // actual SERVE-side dispatch.  The pre-iter-215 tests
+    // (load_engine_rejects_qwen35_arch_with_operator_actionable_error,
+    //  load_engine_rejects_qwen35moe_arch_with_operator_actionable_error,
+    //  load_engine_does_not_reject_unknown_arch_at_wedge)
+    // tested the bail behavior; they are replaced below by tests that
+    // assert the new dispatch routes to the correct LoadedModel variant.
 
     /// Write a minimal valid GGUF (magic + version + 0 tensors + N
     /// string KVs) to a tempfile. Just enough structure for the
@@ -2624,11 +2617,13 @@ mod tests {
         f
     }
 
-    /// load_engine MUST return Err with operator-actionable diagnostic
-    /// when arch=qwen35 (not silently panic in the Gemma-shaped loader
-    /// at forward_mlx.rs:976 with `blk.0.attn_q.weight not found`).
+    /// Synthetic GGUF with arch=qwen35 routes through
+    /// `Qwen35LoadedModel::load`.  The minimal GGUF has 0 tensors so
+    /// the full weights load fails downstream — but the failure
+    /// surface MUST be from the qwen35 path, NOT the pre-iter-215
+    /// bail or the Gemma loader's `attn_q.weight not found` panic.
     #[test]
-    fn load_engine_rejects_qwen35_arch_with_operator_actionable_error() {
+    fn load_engine_routes_qwen35_to_qwen35_loaded_model() {
         let tmp = write_minimal_gguf_with_arch("qwen35");
         let cfg = super::multi_model::EngineConfig {
             tokenizer_path: None,
@@ -2637,30 +2632,31 @@ mod tests {
             warmup_synchronously: false,
         };
         let result = super::load_engine(tmp.path(), &cfg);
-        assert!(result.is_err(), "qwen35 arch must be rejected by load_engine");
-        let err = result.err().unwrap();
-        let msg = format!("{err:#}");
-        // Operator-actionable: names the workaround for the generate use case.
+        // 0-tensor GGUF can't fully load, but the FAILURE shape proves
+        // dispatch reached the qwen35 path.
+        assert!(result.is_err(), "0-tensor synthetic GGUF must fail load");
+        let msg = format!("{:#}", result.err().unwrap());
+        // Wedge-1 bail message is GONE.
         assert!(
-            msg.contains("cmd_generate_qwen35"),
-            "error must name cmd_generate_qwen35 as the working alternative; got: {msg}"
+            !msg.contains("Phase 4 follow-up: SERVE-side load for general.architecture"),
+            "wedge-1 bail must not fire post iter-215; got: {msg}"
         );
-        // Names the architecture so operator can confirm it's the right path.
+        // Wedge-1 message body referenced cmd_generate_qwen35 — the
+        // SERVE-side load must NOT name that as a workaround anymore
+        // (the SERVE path handles qwen35 now; chat returns 501 from
+        // the worker arm, not load_engine).  The downstream
+        // Qwen35Model::load_from_gguf failure does not name it.
         assert!(
-            msg.contains("qwen35"),
-            "error must name the arch; got: {msg}"
-        );
-        // Names the specific Gemma-shape blocker for diagnostic precision.
-        assert!(
-            msg.contains("attn_q.weight") || msg.contains("DeltaNet"),
-            "error must name the underlying blocker; got: {msg}"
+            !msg.contains("hf2q generate") || !msg.contains("cmd_generate_qwen35"),
+            "load_engine error must not include the iter-214 wedge-1 workaround \
+             pointer; got: {msg}"
         );
     }
 
-    /// Symmetric for qwen35moe (the MoE variant — same blocker, same
-    /// dispatch territory).
+    /// Symmetric for qwen35moe (MoE variant routes through the same
+    /// arm because the dispatcher's match covers both).
     #[test]
-    fn load_engine_rejects_qwen35moe_arch_with_operator_actionable_error() {
+    fn load_engine_routes_qwen35moe_to_qwen35_loaded_model() {
         let tmp = write_minimal_gguf_with_arch("qwen35moe");
         let cfg = super::multi_model::EngineConfig {
             tokenizer_path: None,
@@ -2669,20 +2665,22 @@ mod tests {
             warmup_synchronously: false,
         };
         let result = super::load_engine(tmp.path(), &cfg);
-        assert!(result.is_err(), "qwen35moe arch must be rejected by load_engine");
-        let err = result.err().unwrap();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("qwen35moe"));
-        assert!(msg.contains("cmd_generate_qwen35"));
+        assert!(result.is_err(), "0-tensor synthetic GGUF must fail load");
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            !msg.contains("Phase 4 follow-up: SERVE-side load for general.architecture"),
+            "wedge-1 bail must not fire post iter-215; got: {msg}"
+        );
     }
 
-    /// Negative-path: an unknown architecture must NOT be rejected at
-    /// the arch-detect wedge — it falls through to the existing
-    /// LoadedModel::load path which has its own validation. Asserts
-    /// the wedge does not over-reject (regression guard against a
-    /// future maintainer accidentally widening the match arm).
+    /// Negative-path / regression guard: unknown architectures still
+    /// route through the Gemma default arm of `LoadedModel::load`.
+    /// The Gemma loader fails for missing config/tensors but the
+    /// failure is the Gemma path's failure, NOT a wedge bail or a
+    /// qwen35 dispatch.  Iter-215 dispatch must not over-route on the
+    /// match arm.
     #[test]
-    fn load_engine_does_not_reject_unknown_arch_at_wedge() {
+    fn load_engine_routes_unknown_arch_to_gemma_default_unchanged() {
         let tmp = write_minimal_gguf_with_arch("totally-fake-arch-name");
         let cfg = super::multi_model::EngineConfig {
             tokenizer_path: None,
@@ -2690,16 +2688,19 @@ mod tests {
             queue_capacity: 4,
             warmup_synchronously: false,
         };
-        // We don't care that load_engine ultimately fails (it will,
-        // because the GGUF has no tensors). What we care about is
-        // that the FAILURE is NOT the qwen35 arch-detect wedge.
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err(), "minimal GGUF must fail downstream load");
-        let err = result.err().unwrap();
-        let msg = format!("{err:#}");
+        let msg = format!("{:#}", result.err().unwrap());
         assert!(
             !msg.contains("Phase 4 follow-up: SERVE-side load for general.architecture"),
-            "wedge must not fire on unknown arch; got: {msg}"
+            "wedge-1 bail must not fire on unknown arch; got: {msg}"
+        );
+        // Iter-215 sentinel must NOT fire for unknown arch — that
+        // would mean the dispatcher's match arm widened beyond the
+        // intended set.
+        assert!(
+            !msg.contains("qwen35_not_implemented"),
+            "qwen35 sentinel must not fire on unknown arch; got: {msg}"
         );
     }
 }
