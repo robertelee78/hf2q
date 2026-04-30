@@ -423,6 +423,20 @@ pub struct Engine {
     inner: Arc<EngineInner>,
 }
 
+/// Iter-215 Wedge-2: surface for which `LoadedModel` variant the
+/// engine wraps.  Handlers that bypass the worker round-trip (e.g.
+/// stream-mode chat, where the worker emits Error events into a
+/// separate channel rather than returning a single Result) inspect
+/// this to dispatch the HTTP 501 short-circuit at the handler layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadedArch {
+    /// Gemma 4 (and Gemma-shaped) GGUFs.  Production chat path.
+    Gemma,
+    /// Qwen3.5 / Qwen3.6 (dense + MoE).  Iter-215 MVP returns 501 on
+    /// chat / embed / vision; Wedge-3 wires the live forward pass.
+    Qwen35,
+}
+
 struct EngineInner {
     tx: mpsc::Sender<Request>,
     /// Worker-thread join handle. Held in a `Mutex<Option<...>>` so
@@ -430,6 +444,14 @@ struct EngineInner {
     /// callers can be cheap-clone an `Engine` without contending on the
     /// handle. Outside of shutdown, the slot is read-only.
     worker_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Iter-215 Wedge-2: which `LoadedModel` variant the worker
+    /// thread owns.  Cached at spawn time so handlers can dispatch on
+    /// the architecture without round-tripping a request.  Drives the
+    /// HTTP 501 short-circuit on chat / embed / vision endpoints for
+    /// the `Qwen35` variant; `Gemma` is unconstrained (production
+    /// path).  Wedge-3 (full Qwen3.5/3.6 inference) flips the Qwen35
+    /// arm from 501 to live.
+    arch: LoadedArch,
     /// Metadata exposed to handlers without touching the worker thread.
     /// Immutable for the lifetime of the engine.
     model_id: String,
@@ -1132,6 +1154,10 @@ impl Engine {
         let eos_token_ids = loaded.eos_token_ids().to_vec();
         let tokenizer = Arc::new(loaded.tokenizer().clone());
         let chat_template = Arc::new(loaded.chat_template().to_string());
+        let arch = match &loaded {
+            LoadedModel::Gemma(_) => LoadedArch::Gemma,
+            LoadedModel::Qwen35(_) => LoadedArch::Qwen35,
+        };
         let registration = super::registry::find_for(&model_id);
         if let Some(ref r) = registration {
             tracing::info!(
@@ -1158,6 +1184,7 @@ impl Engine {
             inner: Arc::new(EngineInner {
                 tx,
                 worker_handle: Mutex::new(Some(worker_handle)),
+                arch,
                 model_id,
                 context_length,
                 quant_type,
@@ -1170,6 +1197,14 @@ impl Engine {
                 token_bytes: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// Iter-215 Wedge-2: which `LoadedModel` variant the worker
+    /// thread owns.  Used by handlers (chat, embeddings, vision) to
+    /// short-circuit to HTTP 501 when the variant's inference path
+    /// is not yet implemented (today: `LoadedArch::Qwen35`).
+    pub fn arch(&self) -> LoadedArch {
+        self.inner.arch
     }
 
     /// Lazily build + cache the per-vocab decoded UTF-8 byte table used
@@ -4855,6 +4890,17 @@ assistant:
     where
         F: FnOnce(mpsc::Receiver<Request>) + Send + 'static,
     {
+        make_test_engine_with_worker_and_arch(LoadedArch::Gemma, worker)
+    }
+
+    /// Iter-215 Wedge-2: same as `make_test_engine_with_worker` but
+    /// lets the test specify the `LoadedArch`.  Used by Qwen3.5/3.6
+    /// 501 tests to build a synthetic engine reporting
+    /// `LoadedArch::Qwen35` without a real GGUF on disk.
+    fn make_test_engine_with_worker_and_arch<F>(arch: LoadedArch, worker: F) -> Engine
+    where
+        F: FnOnce(mpsc::Receiver<Request>) + Send + 'static,
+    {
         let (tx, rx) = mpsc::channel::<Request>(8);
         let handle = std::thread::Builder::new()
             .name("hf2q-engine-test".into())
@@ -4865,6 +4911,7 @@ assistant:
             inner: Arc::new(EngineInner {
                 tx,
                 worker_handle: Mutex::new(Some(handle)),
+                arch,
                 model_id: "test-model".into(),
                 context_length: None,
                 quant_type: None,

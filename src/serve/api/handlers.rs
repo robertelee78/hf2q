@@ -290,6 +290,28 @@ pub async fn chat_completions(
     };
     state.metrics.chat_completions_started.fetch_add(1, Ordering::Relaxed);
 
+    // ── ADR-005 Phase 4 reopen iter-215 Wedge-2 — Qwen3.5/3.6 501 ──
+    //
+    // The SERVE-side Qwen3.5/3.6 inference path is Wedge-3 deferred
+    // follow-up.  Today: model loads, /readyz / /v1/models / /metrics
+    // work; chat completion returns HTTP 501 with an operator-actionable
+    // body naming `hf2q generate` (cmd_generate_qwen35) as the working
+    // alternative for chat today.  Short-circuit at the handler layer
+    // so streaming and non-streaming both return 501 cleanly without
+    // the worker thread emitting an Error event into a half-built SSE
+    // stream.
+    if prepared.loaded_engine.engine.arch() == engine::LoadedArch::Qwen35 {
+        tracing::info!(
+            model = %req.model,
+            stream = req.stream.unwrap_or(false),
+            "chat_completion handler: Qwen3.5/3.6 SERVE arm pending Wedge-3 — returning 501"
+        );
+        return ApiError::not_implemented(
+            engine::QWEN35_NOT_IMPLEMENTED_MESSAGE.to_string(),
+        )
+        .into_response();
+    }
+
     // --- Dispatch streaming vs non-streaming ---
     if req.stream.unwrap_or(false) {
         return chat_completions_stream(state.clone(), req, prepared).await;
@@ -337,6 +359,20 @@ pub async fn chat_completions(
             if msg.contains("queue_full") {
                 state.metrics.chat_completions_queue_full.fetch_add(1, Ordering::Relaxed);
                 return queue_full_with_rate_limit_headers(&state);
+            }
+            // ADR-005 Phase 4 reopen iter-215 Wedge-2: Qwen3.5/3.6 SERVE-side
+            // chat completion path returns the sentinel; map to HTTP 501 with
+            // the operator-actionable body (names `hf2q generate` AND
+            // `cmd_generate_qwen35` per the iter-215 contract).
+            if msg.contains(engine::QWEN35_NOT_IMPLEMENTED_SENTINEL) {
+                tracing::info!(
+                    error = %msg,
+                    "chat_completion routed to Qwen3.5/3.6 SERVE arm (Wedge-3 pending) — returning 501"
+                );
+                return ApiError::not_implemented(
+                    engine::QWEN35_NOT_IMPLEMENTED_MESSAGE.to_string(),
+                )
+                .into_response();
             }
             tracing::error!(error = %msg, "chat_completion generation failed");
             return ApiError::generation_error(msg).into_response();
@@ -5669,6 +5705,13 @@ async fn chat_model_embeddings(
                         })),
                     )
                         .into_response();
+                }
+                // Iter-215 Wedge-2: Qwen3.5/3.6 embed sentinel → 501.
+                if msg.contains(engine::QWEN35_NOT_IMPLEMENTED_SENTINEL) {
+                    return ApiError::not_implemented(
+                        engine::QWEN35_NOT_IMPLEMENTED_MESSAGE.to_string(),
+                    )
+                    .into_response();
                 }
                 return ApiError::generation_error(format!("chat-model embedding: {e:#}"))
                     .into_response();

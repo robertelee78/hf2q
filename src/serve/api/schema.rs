@@ -200,6 +200,25 @@ impl ApiError {
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::bare(StatusCode::NOT_FOUND, message, "invalid_request_error", None, None)
     }
+
+    /// Not implemented (HTTP 501) — the request is structurally valid
+    /// but the SERVER cannot fulfil it because the underlying inference
+    /// path is not yet implemented.  ADR-005 Phase 4 reopen iter-215
+    /// Wedge-2: Qwen3.5/3.6 chat completions land here today
+    /// (model loaded, /readyz / /v1/models / /metrics work, but the
+    /// SERVE-side forward pass is Wedge-3 deferred follow-up).  The
+    /// caller's request is well-formed; the SERVER's capability
+    /// surface is the bottleneck — 501 is the correct HTTP class per
+    /// RFC 7231 §6.6.2.
+    pub fn not_implemented(message: impl Into<String>) -> Self {
+        Self::bare(
+            StatusCode::NOT_IMPLEMENTED,
+            message,
+            "server_error",
+            Some("not_implemented"),
+            None,
+        )
+    }
 }
 
 impl IntoResponse for ApiError {
