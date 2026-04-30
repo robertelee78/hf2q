@@ -1251,7 +1251,7 @@ ADR-017's close gate inherits this rule: it does **NOT** retroactively wait on f
 
 **Cross-link to ADR-017** (already documented at line 1247 below): ADR-017 (Persistent Block Prefix Cache for serve mode) is `Accepted (falsification-gated)` as of 2026-04-30; its Phase A0.1 substrate landed `fc9a7e1` while Phase 4 reopen iter-211/iter-212 were running in parallel worktrees. ADR-017 line 531 (R5 risk-mitigation row) cross-references the family-scope rule symmetrically. ADR-017 Phase C will substitute `NoopKvSpiller` with a real spiller via `HotSwapManager::new_with_spiller(pool, loader, real_spiller)` AND enable the optional Server-Timing response header via `state.kv_spill_counters.set_server_timing_enabled(true)` from `cmd_serve --kv-persist`. **Per R7 risk mitigation, ADR-017 closure does NOT block Phase 4 closure** — Phase 4 closes on iter-214 audit completion (this commit), independent of ADR-017's own Phase D state machine. ADR-017 file: [`docs/ADR-017-persistent-block-prefix-cache.md`](ADR-017-persistent-block-prefix-cache.md). Source dossier: [`docs/research/omlx-2026-04-30.md`](research/omlx-2026-04-30.md).
 
-**Verification commands** (re-runnable from main HEAD `af7ff74` post-iter-214 commit):
+**Verification commands** (re-runnable from main HEAD post-iter-214 commits):
 
 ```bash
 cargo build --release --bin hf2q                           # PASS
@@ -1261,11 +1261,23 @@ cargo test --bin hf2q --release -- serve::api::state::     # 6/6
 cargo test --bin hf2q --release -- serve::cache::tests     # 74/74 (69 pre-iter-211 + 5 compute_file_sha256_*)
 cargo test --bin hf2q --release -- serve::provenance::tests  # 10/10
 cargo test --bin hf2q --release -- serve::auto_pipeline::tests  # 23/23
-cargo test --bin hf2q --release -- backends::gguf::tests   # 61/61 (48 pre-iter-211 + 13 iter211_*)
+cargo test --bin hf2q --release -- backends::gguf::tests   # 67/67 (48 pre-iter-211 + 13 iter211_* + 6 iter211b_*)
 cargo test --release --test kv_persist_harness             # 22/22 (ADR-017 A0.1 substrate intact)
 cargo test --release --test auto_pipeline_smoke            # 6/6 (4 pre-iter-211 + 2 e2e_iter211_*)
 cargo test --release --test cache_clear                    # 8/8
+cargo test --release --test coherence_smoke                # PASS (6 passed, 0 failed, 6 skipped — broken-window-gated)
+
+# Live AC 5469 verification (env-gated subprocess test, real hf2q binary):
+HF2Q_AUTO_PIPELINE_E2E=1 cargo test --release --test auto_pipeline_smoke e2e_iter211   # 2/2 PASS
 ```
+
+**Live verification depth (mantra-honest, 2026-04-30 iter-214 audit):**
+
+- **AC 5469 — VERIFIED live at the subprocess/binary level.** `HF2Q_AUTO_PIPELINE_E2E=1 cargo test --release --test auto_pipeline_smoke e2e_iter211` spawns the real `hf2q` binary, builds an hf2q-stamped GGUF in a tempdir cache, and asserts the iter-207 short-circuit log line fires while the W71 SHA-256 re-hash does NOT. The subprocess tests use synthetic GGUFs (no model weights) — `--resolve-only` mode exits before runtime model load. End-to-end against a real 30 GB Qwen3.6 model would additionally exercise the inference forward-pass; that's blocked on a separate Qwen3.6 serve startup bug (`forward_mlx.rs:861` vocab-pad slice OOB on 27b-dwq46; `config.json` parse error on 35b-q4_0-flat) which is outside Phase 4 scope. The provenance-emit + auto-pipeline-short-circuit code paths are fully exercised by the env-gated tests.
+
+- **AC 5472 — VERIFIED live at the production-router level.** `iter213_metrics_emits_kv_counters` builds the actual production `build_router(state)` and asserts the byte-exact `/metrics` scrape body contains: HELP/TYPE preamble for both counters, all 4 outcome rows × 2 counters with correct values (`success=1`, `codec_err=0`, `io_err=0`, `parity_fail=0`), and the iter-210 pool-gauge regression smoke (`hf2q_pool_loaded_models 0`). `iter213_kv_counter_delta_under_synthetic_spill` verifies the counter delta increments correctly under MockSpiller-driven evictions. Subprocess + `curl /metrics` against a running `hf2q serve` would additionally exercise the HTTP transport layer; same Qwen3.6 startup blocker noted above. The /metrics emit code path is fully exercised end-to-end by the router-level tests via `app.oneshot(req).await`.
+
+- **Out-of-scope serve startup follow-up:** the Qwen3.6 27B dwq46 serve path crashes at `src/serve/forward_mlx.rs:861` with a vocab-pad-related slice OOB ("range end index 1269990400 out of range for slice of length 1269985280" — Δ = 5120 = one Qwen3.6 hidden_dim row). The Q8_0 LMHEAD quantization code in forward_mlx.rs is the Gemma-pattern, and Qwen3.6 routes through it for the LMHEAD path despite cmd_generate_qwen35 being its qwen35-native dispatcher elsewhere. This is a SEPARATE model-class follow-up surface (likely ADR-013 territory or a cross-cutting LMHEAD-dispatch fix), NOT Phase 4 scope. Tracked here for the next iter's planning context, not as a Phase 4 closure dependency.
 
 **Phase 4 reopen final state:** **CLOSED 2026-04-30.** This subsection's `####` header retains the original "Phase 4 reopen — 2026-04-30" date stamp; final state is `CLOSED` per the status flip at line 990. **ADR-005 OVERALL after this closure:** Phase 1 + Phase 1b + Phase 2a + Phase 2b + Phase 2c + Phase 3 + Phase 4 (7/7 ACs full-flip) all closed for today's tree. The earlier "5/7 + 2/7 partial inheriting ADR-013" framing was stale doc-copy; ADR-013 closed 2026-04-25 (P14 commit `79140ec`), and AC 5468 + AC 5470 perf-bar measurements have been MET (Wave 5b.4 walk-bar PASS pp4096, Wave 5b.10 ≤5× perf-bar MET, 2026-04-28 decode 0.9796× llama within ±5%). **iter-211 production-stub caveat carries forward** (mmproj_sha256 emits `None` from production cmd_convert with a "future iter that re-orders Phase 4.6/4.8" comment) — schema marks the field optional but per Engineering Mantra "no stub (todo later) code" this MUST close; iter-211b queued.
 
