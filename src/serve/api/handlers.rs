@@ -290,27 +290,17 @@ pub async fn chat_completions(
     };
     state.metrics.chat_completions_started.fetch_add(1, Ordering::Relaxed);
 
-    // ── ADR-005 Phase 4 reopen iter-215 Wedge-2 — Qwen3.5/3.6 501 ──
+    // ── ADR-005 Phase 4 reopen iter-216 Wedge-3 — Qwen3.5/3.6 chat live ──
     //
-    // The SERVE-side Qwen3.5/3.6 inference path is Wedge-3 deferred
-    // follow-up.  Today: model loads, /readyz / /v1/models / /metrics
-    // work; chat completion returns HTTP 501 with an operator-actionable
-    // body naming `hf2q generate` (cmd_generate_qwen35) as the working
-    // alternative for chat today.  Short-circuit at the handler layer
-    // so streaming and non-streaming both return 501 cleanly without
-    // the worker thread emitting an Error event into a half-built SSE
-    // stream.
-    if prepared.loaded_engine.engine.arch() == engine::LoadedArch::Qwen35 {
-        tracing::info!(
-            model = %req.model,
-            stream = req.stream.unwrap_or(false),
-            "chat_completion handler: Qwen3.5/3.6 SERVE arm pending Wedge-3 — returning 501"
-        );
-        return ApiError::not_implemented(
-            engine::QWEN35_NOT_IMPLEMENTED_MESSAGE.to_string(),
-        )
-        .into_response();
-    }
+    // Pre-iter-216 the iter-215 Wedge-2 short-circuit returned HTTP 501
+    // here for `LoadedArch::Qwen35`.  Wedge-3 (iter-216 Phase D) wires
+    // `engine_qwen35::generate_qwen35_once` and
+    // `engine_qwen35::generate_stream_qwen35_once` into `worker_run`, so
+    // the chat handler now flows through to the production
+    // generate / generate_stream path for both Gemma and Qwen35
+    // architectures.  The 501 sentinel constants remain in `engine.rs`
+    // for the still-deferred `Request::GenerateWithSoftTokens` arm
+    // (vision-on-Qwen35 is a Wedge-4 follow-up).
 
     // --- Dispatch streaming vs non-streaming ---
     if req.stream.unwrap_or(false) {

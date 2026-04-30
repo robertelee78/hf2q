@@ -198,6 +198,12 @@ fn dump_hidden_stats(label: &str, buf: &MlxBuffer, seq_len: u32, hidden_size: u3
 enum OutputHeadMode {
     All,
     Last,
+    /// Embeddings-as-chat-model path (Wedge-3 / iter-216 Phase A).
+    /// Apply only the final RMSNorm to the last token's hidden state and
+    /// return the F32 vector of length `hidden_size`.  Skips the
+    /// `lm_head` matmul because no logits are needed; the L2-norm step
+    /// is owned by the caller (`forward_embed_last`).
+    EmbedLast,
 }
 
 /// Pre-allocated decode buffers for `forward_gpu_greedy` (seq_len == 1).
@@ -537,6 +543,72 @@ fn apply_output_head_gpu_last(
         vocab_size,
         eps,
     )
+}
+
+/// Apply ONLY the final RMSNorm to the last token's hidden row, then download
+/// the resulting F32 vector to CPU.
+///
+/// Wedge-3 / ADR-005 iter-216 Phase A.  This is the Qwen3.5/3.6 equivalent of
+/// the chat-as-embedder helper Gemma exposes via
+/// `MlxModelWeights::forward_embed_last` (`src/serve/forward_prefill.rs:1532`).
+/// The semantics are identical: run the layer stack as a normal prefill, take
+/// the last token's residual-stream hidden state, apply the model's final
+/// `output_norm` (RMSNorm with eps=`cfg.rms_norm_eps`), and return the
+/// F32 vector of length `hidden_size`.  L2 normalization is the caller's
+/// responsibility — done in `Qwen35Model::forward_embed_last` so the GPU
+/// path stays a pure RMSNorm dispatch with no extra kernel.
+///
+/// This deliberately reuses the existing `apply_output_head_gpu` RMSNorm
+/// stage rather than introducing a new helper — the Gemma parity bar is
+/// "RMSNormed last hidden state, F32, before lm_head" and that is exactly
+/// what this slice produces.
+fn apply_output_norm_only_last(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden: &MlxBuffer,
+    head: &OutputHeadGpu,
+    seq_len: u32,
+    hidden_size: u32,
+    eps: f32,
+) -> Result<Vec<f32>> {
+    anyhow::ensure!(seq_len > 0, "apply_output_norm_only_last: empty sequence");
+    let byte_offset = ((seq_len as u64 - 1) * hidden_size as u64) * 4;
+    let last_hidden = hidden.slice_view(byte_offset, hidden_size as usize);
+
+    // RMSNorm into a fresh `[1, hidden_size]` F32 buffer, then download.
+    // The pooled allocator's lifetime hook keeps the transient anchored
+    // under MLX_UNRETAINED_REFS=1 (matches the apply_output_head_gpu
+    // pattern at forward_gpu.rs:450-483).
+    let normed = super::decode_pool::pooled_alloc_buffer(
+        device,
+        hidden_size as usize * 4,
+        DType::F32,
+        vec![1usize, hidden_size as usize],
+    )
+    .map_err(|e| anyhow!("alloc embed_normed: {e}"))?;
+    let mut params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
+        .map_err(|e| anyhow!("alloc embed norm params: {e}"))?;
+    {
+        let s = params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
+        s[0] = eps;
+        s[1] = hidden_size as f32;
+    }
+    let mut enc = device.command_encoder().context("enc embed output norm")?;
+    rms_norm::dispatch_rms_norm(
+        &mut enc,
+        registry,
+        device.metal_device(),
+        &last_hidden,
+        &head.norm_w,
+        &normed,
+        &params,
+        1,
+        hidden_size,
+    )
+    .context("dispatch_rms_norm embed output")?;
+    enc.commit_and_wait().context("commit embed output norm")?;
+
+    download_f32(&normed).context("download embed normed")
 }
 
 /// Single source of `&mut DecodeBuffers.logits_buf` from a `&DecodeBuffers`.
@@ -950,6 +1022,67 @@ impl Qwen35Model {
             None,
             OutputHeadMode::Last,
         )
+    }
+
+    /// Chat-as-embedder forward pass — return the L2-normalized last-token
+    /// hidden state instead of logits.
+    ///
+    /// Wedge-3 / ADR-005 iter-216 Phase A.  Mirrors Gemma's
+    /// `MlxModelWeights::forward_embed_last` (`src/serve/forward_prefill.rs:1532`)
+    /// for the Qwen3.5/3.6 SERVE-side `/v1/embeddings` path. The returned
+    /// vector has length `cfg.hidden_size` (e.g. 5120 for Qwen3.6 27B).
+    ///
+    /// Pipeline:
+    ///   1. Run the standard layer stack (`forward_gpu_impl`) over the
+    ///      prompt tokens with `OutputHeadMode::EmbedLast`.  The internal
+    ///      output-head path skips the `lm_head` matmul and instead applies
+    ///      only the final RMSNorm to the last token's residual stream
+    ///      (`apply_output_norm_only_last`).
+    ///   2. L2-normalize the resulting vector on CPU so callers can compute
+    ///      cosine similarity by dot product.  1e-12 floor matches the
+    ///      Gemma + BERT lane normalization (`bert_l2_normalize_gpu` epsilon).
+    ///
+    /// # Errors
+    ///
+    /// Same error surface as `forward_gpu`: empty tokens, positions length
+    /// mismatch, GPU op failures.  Plus an internal `ensure!` if the
+    /// downloaded F32 vector is shorter than `hidden_size` (impossible in
+    /// correct operation; defensive assertion).
+    pub fn forward_embed_last(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+    ) -> Result<Vec<f32>> {
+        if tokens.is_empty() {
+            return Err(anyhow!("forward_embed_last: empty tokens"));
+        }
+        let mut out = self.forward_gpu_impl(
+            tokens,
+            positions_flat,
+            kv_cache,
+            None,
+            None,
+            OutputHeadMode::EmbedLast,
+        )?;
+        let h = self.cfg.hidden_size as usize;
+        anyhow::ensure!(
+            out.len() >= h,
+            "forward_embed_last: returned {} f32 elements, expected at least {}",
+            out.len(),
+            h,
+        );
+        out.truncate(h);
+
+        // L2 normalize so consumers can compute cosine similarity by dot
+        // product.  Same convention as Gemma's forward_embed_last and the
+        // bert_l2_normalize_gpu epsilon.
+        let norm: f32 = out.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let denom = if norm < 1e-12 { 1e-12 } else { norm };
+        for v in out.iter_mut() {
+            *v /= denom;
+        }
+        Ok(out)
     }
 
     /// Forward pass that also returns the final residual-stream hidden buffer
@@ -1863,6 +1996,21 @@ impl Qwen35Model {
                 eps,
             )
             .context("apply_output_head_gpu_last")?,
+            // Wedge-3 / ADR-005 iter-216 Phase A: chat-as-embedder.  Skip
+            // lm_head; return the RMSNormed last-token hidden state in F32.
+            // L2 normalization is applied by `Qwen35Model::forward_embed_last`
+            // (the public wrapper) — keeping it CPU-side avoids a one-off
+            // kernel for the embed path.
+            OutputHeadMode::EmbedLast => apply_output_norm_only_last(
+                &device,
+                &mut registry,
+                &hidden,
+                &output_head,
+                seq_len,
+                h,
+                eps,
+            )
+            .context("apply_output_norm_only_last (forward_embed_last)")?,
         };
         if let Some(t) = t_output_head {
             eprintln!(
@@ -3573,5 +3721,60 @@ mod tests {
              seq={seq}, layers={}, vocab={}",
             cfg.num_hidden_layers, cfg.vocab_size
         );
+    }
+
+    /// Wedge-3 / iter-216 Phase A: `forward_embed_last` returns a Vec<f32>
+    /// of length `cfg.hidden_size`, all entries finite, L2-normalized
+    /// (sum-of-squares ≈ 1.0).
+    ///
+    /// Uses the non-zero deterministic synthetic model so the hidden state
+    /// is not literally zero — that lets us exercise the L2 normalization
+    /// branch (zero hidden + 1e-12 floor would yield a unit-norm vector
+    /// of zeros, which is a degenerate case).
+    #[test]
+    fn forward_embed_last_returns_l2_normalized_hidden_size_vector() {
+        let m = tiny_hybrid_model_nonzero();
+        let cfg = m.cfg.clone();
+        let tokens = vec![3u32, 7, 1];
+        let seq = tokens.len() as u32;
+        let pos_4 = text_positions(seq);
+        let positions = positions_to_flat(&pos_4);
+
+        let device = MlxDevice::new().expect("device");
+        let mut kv = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv");
+
+        let embed = m
+            .forward_embed_last(&tokens, &positions, &mut kv)
+            .expect("forward_embed_last");
+
+        assert_eq!(
+            embed.len(),
+            cfg.hidden_size as usize,
+            "embed length must equal hidden_size"
+        );
+        for (i, v) in embed.iter().enumerate() {
+            assert!(
+                v.is_finite(),
+                "embed[{i}] = {v} is non-finite"
+            );
+        }
+        // L2 norm should be ~1.0 (the only non-unit case is the all-zero
+        // hidden state, where the 1e-12 floor produces a near-zero vector).
+        let l2: f32 = embed.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(
+            (l2 - 1.0).abs() < 1e-3 || l2 < 1e-6,
+            "embed not L2-normalized: ||embed||_2 = {l2}"
+        );
+    }
+
+    /// Wedge-3 / iter-216 Phase A: `forward_embed_last` rejects empty tokens.
+    #[test]
+    fn forward_embed_last_rejects_empty_tokens() {
+        let cfg = tiny_hybrid_cfg();
+        let m = Qwen35Model::empty_from_cfg(cfg.clone());
+        let device = MlxDevice::new().expect("device");
+        let mut kv = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv");
+        let result = m.forward_embed_last(&[], &[], &mut kv);
+        assert!(result.is_err(), "empty tokens should error");
     }
 }

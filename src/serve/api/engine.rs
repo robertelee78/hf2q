@@ -1590,7 +1590,16 @@ fn worker_run(
                     LoadedModel::Gemma(g) => {
                         generate_once(g, &prompt_tokens, &params, registration.as_ref())
                     }
-                    LoadedModel::Qwen35(_) => qwen35_not_implemented_err(),
+                    // Wedge-3 / iter-216 Phase D: real chat completion via
+                    // Qwen35Model::forward_gpu_last_logits + forward_gpu_greedy.
+                    LoadedModel::Qwen35(q) => {
+                        super::engine_qwen35::generate_qwen35_once(
+                            q,
+                            &prompt_tokens,
+                            &params,
+                            registration.as_ref(),
+                        )
+                    }
                 };
                 let _ = reply.send(result);
             }
@@ -1634,15 +1643,20 @@ fn worker_run(
                             cancellation_counter.as_deref(),
                         );
                     }
-                    LoadedModel::Qwen35(_) => {
-                        // Iter-215 MVP: emit a single Error event with the
-                        // 501 sentinel so the SSE encoder can surface the
-                        // operator-actionable message.  The handler-side
-                        // 501 mapping owns the HTTP status; the SSE error
-                        // event carries the message into the stream body.
-                        let _ = events.blocking_send(super::sse::GenerationEvent::Error(
-                            QWEN35_NOT_IMPLEMENTED_MESSAGE.to_string(),
-                        ));
+                    // Wedge-3 / iter-216 Phase D: real streaming chat
+                    // completion via Qwen35Model + per-token splitter
+                    // routing.  Mirrors the Gemma stream arm shape; tool
+                    // calls flow through the close-buffered emitter
+                    // (W-B3 incremental shape is a Wedge-4 follow-up).
+                    LoadedModel::Qwen35(q) => {
+                        super::engine_qwen35::generate_stream_qwen35_once(
+                            q,
+                            &prompt_tokens,
+                            &params,
+                            &events,
+                            registration.as_ref(),
+                            cancellation_counter.as_deref(),
+                        );
                     }
                 }
             }
@@ -1659,7 +1673,9 @@ fn worker_run(
                     LoadedModel::Gemma(g) => {
                         g.weights.forward_embed_last(&prompt_tokens, &mut g.ctx)
                     }
-                    LoadedModel::Qwen35(_) => qwen35_not_implemented_err(),
+                    // Wedge-3 / iter-216 Phase D: real chat-as-embedder via
+                    // Qwen35Model::forward_embed_last (Phase A).
+                    LoadedModel::Qwen35(q) => super::engine_qwen35::embed_qwen35(q, &prompt_tokens),
                 };
                 let _ = reply.send(result);
             }
@@ -3014,7 +3030,13 @@ fn gemma4_kv_to_json(kv: &str) -> Option<String> {
 /// Extracted from the `route_content` closure so audit-driver tests can
 /// exercise this exact code path directly (same extraction pattern as
 /// `finalize_streaming_tool_state` for HIGH-1).
-fn emit_streaming_tool_call_close(
+///
+/// Wedge-3 / iter-216: surfaced as `pub(super)` so the Qwen3.5/3.6
+/// streaming arm in `engine_qwen35::generate_stream_qwen35_once` can
+/// reuse the same close-buffered tool-call dispatch the Gemma path
+/// uses, keeping the body-parse-failure semantics + ToolCallDelta
+/// shape byte-identical across model families.
+pub(super) fn emit_streaming_tool_call_close(
     parsed: Option<super::registry::ParsedToolCall>,
     body_dump: String,
     policy: ToolCallPolicy,
@@ -5491,6 +5513,7 @@ assistant:
             context_length: Some(1024),
             quant_type: Some("Q4_0".to_string()),
             load_duration: Duration::from_millis(7),
+            prompt_cache: super::super::engine_qwen35::HybridPromptCache::new(),
         };
         let qwen = LoadedModel::Qwen35(qwen_loaded);
 
