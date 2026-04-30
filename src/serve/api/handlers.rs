@@ -5718,6 +5718,56 @@ async fn chat_model_embeddings(
 // GET /metrics  (Prometheus text exposition format, Decision #11)
 // ---------------------------------------------------------------------------
 
+/// Build a Prometheus-text counter block for the iter-213 KV-spill /
+/// KV-restore counters (ADR-005 Phase 4 reopen, AC 5472).  Emits the
+/// `# HELP` + `# TYPE` preamble unconditionally, then one line per
+/// observed `(repo, quant, outcome)` triple in 4-outcome cardinality
+/// (`success`, `codec_err`, `io_err`, `parity_fail`).  Closed enum is
+/// enforced by [`crate::serve::api::state::KV_SPILL_OUTCOMES`]; the
+/// snapshot already returned a fixed-size `[u64; 4]` row indexed in
+/// the same order.
+///
+/// Returns a fully-formatted block ending in `\n` so the calling
+/// `format!()` body can interpolate it without trailing-newline
+/// duplication.
+fn build_kv_counter_block(
+    metric_name: &str,
+    help_text: &str,
+    rows: &[((String, String), [u64; 4])],
+) -> String {
+    use crate::serve::api::state::KV_SPILL_OUTCOMES;
+    let mut s = String::new();
+    s.push_str("# HELP ");
+    s.push_str(metric_name);
+    s.push(' ');
+    s.push_str(help_text);
+    s.push('\n');
+    s.push_str("# TYPE ");
+    s.push_str(metric_name);
+    s.push_str(" counter\n");
+    for ((repo, quant), counts) in rows {
+        for (i, outcome_label) in KV_SPILL_OUTCOMES.iter().enumerate() {
+            // Emit every outcome line — Prometheus convention requires
+            // the full cardinality to be present once any
+            // `(repo, quant)` pair has been observed.  Counters that
+            // have never been bumped emit `0`; this prevents the
+            // "absent counter = no histogram, missed alerts" pitfall
+            // documented in AC 5472.
+            s.push_str(metric_name);
+            s.push_str("{repo=\"");
+            s.push_str(repo);
+            s.push_str("\",quant=\"");
+            s.push_str(quant);
+            s.push_str("\",outcome=\"");
+            s.push_str(outcome_label);
+            s.push_str("\"} ");
+            s.push_str(&counts[i].to_string());
+            s.push('\n');
+        }
+    }
+    s
+}
+
 /// Handler for `GET /metrics`. Emits Prometheus text-exposition format
 /// (version 0.0.4) directly — no Prometheus client library dependency; the
 /// output is plain-text key/value with `# HELP` and `# TYPE` annotations.
@@ -5729,6 +5779,10 @@ async fn chat_model_embeddings(
 ///   - `hf2q_pool_loaded_models`          (gauge — count of pooled engines)
 ///   - `hf2q_pool_resident_bytes`         (gauge — sum of GGUF bytes resident)
 ///   - `hf2q_pool_memory_budget_bytes`    (gauge — 80% of unified RAM by default)
+///   - `hf2q_pool_kv_spills_total`        (counter, ADR-005 iter-213 / AC 5472,
+///                                         labels: repo, quant, outcome)
+///   - `hf2q_pool_kv_restores_total`      (counter, ADR-005 iter-213 / AC 5472,
+///                                         labels: repo, quant, outcome)
 ///   - `hf2q_requests_total`              (counter)
 ///   - `hf2q_requests_rejected_total`     (counter)
 ///   - `hf2q_chat_completions_started`    (counter)
@@ -5740,6 +5794,12 @@ async fn chat_model_embeddings(
 pub async fn metrics(State(state): State<AppState>) -> Response {
     use std::sync::atomic::Ordering;
     let m = &state.metrics;
+    // ADR-005 Phase 4 reopen iter-213 (AC 5472): KV-spill / KV-restore
+    // counter snapshots.  Both `snapshot_*` calls take the inner Mutex
+    // briefly; the snapshot is cloned out so the lock is released
+    // before format!()/string-building.
+    let kv_spill_rows = state.kv_spill_counters.snapshot_spills();
+    let kv_restore_rows = state.kv_spill_counters.snapshot_restores();
     let ready = if state.is_ready_for_gen() { 1 } else { 0 };
     // Iter-210 (W78): pool-state gauges sourced from `pool_stats()`
     // (ADR-005 Phase 4, AC 5466 + AC 5467).  Empty / poisoned pool
@@ -5758,6 +5818,28 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
             ),
             None => (0, 0, 0, 0),
         };
+    // ADR-005 Phase 4 reopen iter-213 (AC 5472): build the KV-spill /
+    // KV-restore counter blocks.  Cardinality: four outcome labels per
+    // observed `(repo, quant)` pair (closed enum per
+    // `KV_SPILL_OUTCOMES` in `state.rs`).  HELP/TYPE preamble emits
+    // unconditionally (Prometheus convention — absent counter = no
+    // histogram, missed alerts); per-`(repo, quant, outcome)` lines
+    // emit once at least one observation has occurred against that
+    // pair.  Per AC 5472: `Skipped` outcomes do NOT increment, so the
+    // counters stay at 0 across the noop spiller's default behaviour
+    // even after evictions fire — operators see the cardinality
+    // surface but no spurious counts.
+    let kv_spills_block = build_kv_counter_block(
+        "hf2q_pool_kv_spills_total",
+        "Count of KV-cache spill operations on engine eviction.",
+        &kv_spill_rows,
+    );
+    let kv_restores_block = build_kv_counter_block(
+        "hf2q_pool_kv_restores_total",
+        "Count of KV-cache restore operations on engine admission.",
+        &kv_restore_rows,
+    );
+
     let body = format!(
         "\
 # HELP hf2q_uptime_seconds Process uptime in seconds since bind.\n\
@@ -5778,6 +5860,8 @@ hf2q_pool_resident_bytes {pool_resident}\n\
 # HELP hf2q_pool_memory_budget_bytes Memory budget for HotSwapManager (80% of unified RAM by default).\n\
 # TYPE hf2q_pool_memory_budget_bytes gauge\n\
 hf2q_pool_memory_budget_bytes {pool_budget}\n\
+{kv_spills_block}\
+{kv_restores_block}\
 # HELP hf2q_requests_total Total HTTP requests reaching a handler (post-auth).\n\
 # TYPE hf2q_requests_total counter\n\
 hf2q_requests_total {req_total}\n\
@@ -5809,6 +5893,8 @@ hf2q_prompt_tokens_total {prompt_tok}\n\
         pool_loaded = pool_loaded_models,
         pool_resident = pool_resident_bytes,
         pool_budget = pool_memory_budget_bytes,
+        kv_spills_block = kv_spills_block,
+        kv_restores_block = kv_restores_block,
         req_total = m.requests_total.load(Ordering::Relaxed),
         req_rej = m.requests_rejected_total.load(Ordering::Relaxed),
         chat_start = m.chat_completions_started.load(Ordering::Relaxed),
