@@ -862,6 +862,14 @@ fn pool_key(repo: &str, quant: QuantType) -> String {
 pub struct HotSwapManager<E> {
     pool: LoadedPool,
     loader: Arc<dyn ModelLoader<E>>,
+    /// Eviction-hook surface (ADR-005 Phase 4 reopen iter-212 / AC 5471).
+    /// `Arc<dyn KvSpiller<E>>` parallel to the `ModelLoader<E>` field
+    /// above so ADR-017 can inject a disk-spilling impl without
+    /// `HotSwapManager` taking a direct dependency on the persistence
+    /// stack.  The 2-arg back-compat constructor [`Self::new`] defaults
+    /// this to `Arc::new(NoopKvSpiller)`; production substitutes via
+    /// [`Self::new_with_spiller`].
+    spiller: Arc<dyn KvSpiller<E>>,
     /// Parallel map keyed identically to the pool — holds the actual
     /// engine handles.  Invariant: `engines.contains_key(k) ==
     /// pool.get(k).is_some()` for every `k` after every `load_or_get` /
@@ -874,10 +882,35 @@ impl<E> HotSwapManager<E> {
     /// passes [`LoadedPool::from_hardware`] (or a fixed-budget pool
     /// for tests) and [`DefaultModelLoader`].  The manager starts
     /// empty; the first `load_or_get` admits the first engine.
-    pub fn new(pool: LoadedPool, loader: Arc<dyn ModelLoader<E>>) -> Self {
+    ///
+    /// Defaults the eviction-hook surface to [`NoopKvSpiller`].  Use
+    /// [`Self::new_with_spiller`] when ADR-017's persistence handler
+    /// (or a test fixture) needs to observe eviction + admission.
+    pub fn new(pool: LoadedPool, loader: Arc<dyn ModelLoader<E>>) -> Self
+    where
+        E: 'static,
+    {
+        Self::new_with_spiller(pool, loader, Arc::new(NoopKvSpiller))
+    }
+
+    /// Construct a new manager with an explicit [`KvSpiller`] impl
+    /// (ADR-005 Phase 4 reopen iter-212 / AC 5471).  ADR-017's
+    /// `cmd_serve --kv-persist` substitutes a disk-backed spiller via
+    /// this entry point; tests substitute a `MockSpiller` to assert
+    /// trigger-site invariants.
+    ///
+    /// The manager starts empty; the first `load_or_get` admits the
+    /// first engine and fires `spiller.post_admit(...)` between the
+    /// loader returning a fresh engine and the engines map publication.
+    pub fn new_with_spiller(
+        pool: LoadedPool,
+        loader: Arc<dyn ModelLoader<E>>,
+        spiller: Arc<dyn KvSpiller<E>>,
+    ) -> Self {
         Self {
             pool,
             loader,
+            spiller,
             engines: HashMap::new(),
         }
     }
@@ -928,9 +961,27 @@ impl<E> HotSwapManager<E> {
     /// was not in the pool — idempotent).  In-flight requests holding
     /// their own Arc clones keep the engine alive until they release;
     /// the pool slot becomes available immediately.
+    ///
+    /// **Eviction-hook trigger (iter-212 / AC 5471).**  Fires
+    /// `spiller.pre_evict(handle, &Arc<LoadedEngine<E>>)` BEFORE
+    /// `engines.remove(&k)` drops the manager's Arc.  The Arc is still
+    /// live at call time so the spiller may snapshot KV state without a
+    /// race.  The returned [`SpillOutcome`] is intentionally discarded
+    /// here in iter-212; iter-213 wires it into the
+    /// `hf2q_pool_kv_spills_total{outcome=...}` counter.
     pub fn evict(&mut self, repo: &str, quant: QuantType) -> u64 {
         let k = pool_key(repo, quant);
         let removed = self.pool.remove(&k);
+        // Eviction-hook trigger.  Fire BEFORE the manager's Arc drops
+        // from `engines` so the spiller observes a live Arc.  Lookup
+        // happens before remove() to capture the handle for the call;
+        // we only fire when both the pool AND the engines map agree
+        // the entry exists (the back-compat defensive `engines.remove`
+        // below covers the desync case without firing the hook).
+        if let (Some(handle), Some(arc)) = (removed.as_ref(), self.engines.get(&k).cloned()) {
+            let _outcome = self.spiller.pre_evict(handle, &arc);
+            // outcome surfaces to telemetry counters in iter-213
+        }
         // Drop the engines map entry symmetrically.  If the pool didn't
         // know about the key (already-evicted from a prior call), the
         // engines map shouldn't have it either by the invariant — but
@@ -1016,11 +1067,33 @@ impl<E> HotSwapManager<E> {
         };
 
         for victim in evicted {
+            // Eviction-hook trigger (iter-212 / AC 5471).  Fire
+            // `pre_evict` per evictee BEFORE dropping the manager's Arc
+            // from `engines`, so the spiller observes a live Arc.  The
+            // returned outcome is intentionally discarded in iter-212;
+            // iter-213 wires it into the
+            // `hf2q_pool_kv_spills_total{outcome=...}` counter.  An
+            // `Error(...)` outcome MUST NOT block eviction — the spill
+            // is best-effort.
+            if let Some(arc) = self.engines.get(&victim.repo_id).cloned() {
+                let _outcome = self.spiller.pre_evict(&victim, &arc);
+                // outcome surfaces to telemetry counters in iter-213
+            }
             // Drop the manager's Arc — in-flight requests holding their
             // own clones keep the engine alive until they release; the
             // pool slot is already free.
             self.engines.remove(&victim.repo_id);
         }
+
+        // Admission-hook trigger (iter-212 / AC 5471).  Fire
+        // `post_admit` AFTER `loader.load()` returns and BEFORE the
+        // manager publishes the Arc into `engines`.  At call time the
+        // Arc is held only by the manager's local `loaded_engine`
+        // binding; the spiller may rehydrate KV state into the engine
+        // before any handler can observe it.  An `Error(...)` outcome
+        // MUST NOT block admission — the restore is best-effort.
+        let _outcome = self.spiller.post_admit(repo, quant, &loaded_engine);
+        // outcome surfaces to telemetry counters in iter-213
 
         self.engines.insert(k, Arc::clone(&loaded_engine));
         Ok(loaded_engine)
