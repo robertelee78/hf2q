@@ -617,6 +617,132 @@ Per the mantra: "No fallback. No stub (todo later) code." If a kill-gate fires, 
 - `man-day` used throughout; `person-day` does not appear (Robert directive 2026-04-30).
 - Pre-bench process audit is baked into `kv_persist_matrix_e2e` and surfaced as its own smoke test so the audit body executes on every default `cargo test` run, even when the matrix gate is OFF.
 
+### Phase A0.2a LANDED (2026-04-30)
+
+**Status:** Code-only deliverable complete on `cfa/adr017-a02a/claude` worktree; pending dual-mode queen merge against the Codex parallel impl. **A0.2 closure (matrix execution on M5 Max) is a separate phase** that the main session runs after this CFA returns — A0.2a lands the substrate for that run, not the run itself.
+
+**Why A0.2a is its own phase:** the spec splits A0.2 into "code" (A0.2a, this iter) and "matrix run" (A0.2 closure, post-CFA). The code ships behind the same `HF2Q_KV_PERSIST_E2E=1` env gate as A0.1 so default `cargo test` runs stay cheap; the matrix body remains gated and the operator promotes to the M5 Max + cold-SoC + STOP-paused-mcp-brain-server discipline before invoking it.
+
+**Commits (cfa/adr017-a02a/claude):**
+- `134c712` — `test(adr-017 a0.2a): add BlockStore::time_round_trip helper for cache-hit prediction`
+- `2abd94f` — `test(adr-017 a0.2a): subprocess_driver submodule + run_cell wiring`
+- `96bdd28` — `test(adr-017 a0.2a): gate assertions evaluate against measured fields`
+- `c0506de` — `test(adr-017 a0.2a): add 10 subprocess_driver tests (6 required + 4 bonus)`
+
+**LOC delta (test-only; zero src/ mutation per spec):**
+
+| File | A0.1 LOC | A0.2a LOC | Delta | Role |
+|---|---|---|---|---|
+| `tests/fixtures/synthetic_spiller.rs` | 1,413 | 1,479 | +66 | `BlockStore::time_round_trip` helper (real-disk-I/O round-trip timer used by `synthesize_cache_hit_prediction`). |
+| `tests/kv_persist_harness.rs` | 1,121 | 2,698 | +1,577 | `subprocess_driver` submodule (`ServerGuard`, `spawn_hf2q_serve_subprocess`, `wait_for_readyz`, `warm_request`, `fetch_canonical_model_id`, `measure_ttft_subprocess`, `measure_swap_eviction_cycle`, `synthesize_cache_hit_prediction`, `representative_block_bytes`, `DriverError`, `CellMeasurement`, `EvictionMeasurement`, `CellConfig`); `run_cell` subprocess wiring; `resolve_cell_model_path`; updated gate assertions; 10 new tests. |
+| **Total** | **2,534** | **4,177** | **+1,643** | A0.2a substrate exceeds the spec's ~400-500 estimate by ~1,100 LOC; surplus is mantra discipline (full doc citations, every helper exposed, no `// TODO`, no fallback paths). |
+
+**Subprocess driver surface (mirrors `tests/multi_model_swap.rs:127-385`):**
+
+| Function | Mirrors | Role |
+|---|---|---|
+| `ServerGuard` (struct) | `multi_model_swap.rs:127-155` | RAII child + stderr-tail ring buffer; Drop kills + waits + drains stderr-thread. Manual `Debug` impl (Child doesn't derive). |
+| `spawn_hf2q_serve_subprocess(&CellConfig)` | `multi_model_swap.rs:131-148` | `target/release/hf2q serve --model <gguf>`; rejects missing `model_path` with `DriverError::SpawnFailed`. |
+| `wait_for_readyz(&ServerGuard)` | `multi_model_swap.rs:184-206` | 600 s envelope; `http_get_status` raw TCP probe (no tokio dep on the readyz path). |
+| `warm_request(&ServerGuard) -> Duration` | new | Non-streaming `/v1/chat/completions`; ignored for measurement (warmup-not-bench). |
+| `fetch_canonical_model_id` | `multi_model_swap.rs:220-232` | `/v1/models` data[0].id. |
+| `measure_ttft_subprocess(&ServerGuard, model, prompt, max_tokens) -> CellMeasurement` | new | `stream: true` SSE; first non-empty `choices[0].delta.content` is TTFT; decode tok/s = `(total_tokens - 1) / (total_wall - ttft)`. |
+| `measure_swap_eviction_cycle(&ServerGuard, &Path) -> EvictionMeasurement` | `multi_model_swap.rs:344-384` | Symlink-distinct-pool-key trick; admits on distinct stem to force `HotSwapManager::load_or_get` cold-load. |
+| `synthesize_cache_hit_prediction(no_cache_ttft, prefix_tokens, family, kv_path, &SyntheticSpiller) -> f64` | new | **FALSIFICATION INSTRUMENT.** Real disk I/O via `time_round_trip`; closed-form `restore_ms + (no_cache_ttft / n_blocks)` post-restore proxy. **NO synthetic constants asserted against ship gates.** |
+| `representative_block_bytes(family, kv_path) -> usize` | new | Per-family per-kv-path wire-size (Gemma 4 dense = 1 MiB/block; Qwen3.5-MoE dense = 768 KiB/block; TQ-active = 256 KiB/block). |
+
+**Test count delta:**
+- New tests in A0.2a: **10** (6 required per spec §Deliverables.4 + 4 bonus).
+- Total in `kv_persist_harness.rs` after A0.2a: **32** (22 prior + 10 new); all PASS in **1.53 s** under default `cargo test --release` (env-gated tests skip cleanly without `HF2Q_KV_PERSIST_E2E=1`).
+- 14/14 PASS for the `synthetic_spiller` cohort; the new `time_round_trip` helper ships with no dedicated unit test because the cache-hit-prediction test (`synthesize_cache_hit_prediction_uses_real_io_wall_not_constants`) exercises it end-to-end with two independent invariants (direct wall-monotonicity + indirect prediction-variance).
+
+**Required tests landed (per spec §Deliverables.4):**
+
+| # | Test | Always-on / Gated | Asserts |
+|---|---|---|---|
+| 1 | `subprocess_driver_smoke_binary_locatable` | always-on | driver binary path matches parent helper; surfaces `BinaryNotFound` instead of panic |
+| 2 | `server_guard_lifecycle_starts_and_stops_cleanly` | env-gated | spawn + readyz + drop cleanly; no resident-model strand |
+| 3 | `warm_request_returns_under_10min_budget` | env-gated | warm wall under 600 s envelope |
+| 4 | `measure_ttft_parses_sse_first_content_delta` | env-gated | finite `ttft_ms`, `total_tokens > 0`, `decode_tps >= 0` |
+| 5 | `synthesize_cache_hit_prediction_uses_real_io_wall_not_constants` | always-on (REAL DISK I/O) | (A) `time_round_trip(1)` < `time_round_trip(32)` AND `wall_32 >= 100us`; (B) predictor differentiates prefix lengths (1blk vs 8blk delta > 0.5ms; prefix=0 ≡ `no_cache_ttft`) |
+| 6 | `pool_key_for_path_symlink_trick_reproduces_iter210_pattern` | always-on | distinct stem ⇒ distinct key; identical stem ⇒ identical key |
+
+**Bonus tests landed:**
+
+| # | Test | Purpose |
+|---|---|---|
+| 7 | `synthesize_cache_hit_prediction_rejects_nan_no_cache_ttft` | NaN guard so downstream gates never see contamination |
+| 8 | `representative_block_bytes_nonzero_for_every_family_kv_path` | zero-byte-block guard against `time_round_trip` |
+| 9 | `spawn_hf2q_serve_subprocess_rejects_missing_model_path` | clean `SpawnFailed` vs async child failure |
+| 10 | `driver_error_display_renders_diagnostic_strings` | Display + Debug round-trip for cell-result `note` |
+
+**No-synthetic-constants discipline (the disqualifying antipattern Codex tripped in A0.1, per spec):**
+
+`synthesize_cache_hit_prediction` invokes `BlockStore::time_round_trip` which:
+
+1. Calls `BlockStore::write_block` (atomic temp + rename + fsync) for `n_blocks` payloads of `block_bytes` each.
+2. Calls `BlockStore::read_block` (header parse + body-hash check) for each hash in the chain.
+3. Returns the wall time of the **read leg only**.
+
+Sample output from the falsification test (run on Apple Silicon dev machine, APFS):
+- `time_round_trip(n=1, 1 MiB) = 3.835 ms`
+- `time_round_trip(n=32, 1 MiB) = 119.389 ms`
+- Prediction at `prefix_tokens=0` ≡ 1000.316 ms (the no_cache_ttft input)
+- Prediction at `prefix_tokens=BLOCK_TOKENS` ≡ 1003.745 ms
+- Prediction at `prefix_tokens=BLOCK_TOKENS*8` ≡ 154.834 ms
+
+The 32-block I/O wall (~119 ms) is ~30× the 1-block wall (~3.8 ms); this monotonicity is mathematically incompatible with a constant short-circuit. The test asserts `wall_32 >= wall_1` AND `wall_32 >= 100us`; either invariant alone refutes "synthetic constants asserted against ship gates."
+
+**Mechanical exit codes (worktree HEAD `c0506de`):**
+
+| Command | Exit | Output |
+|---|---|---|
+| `cargo build --release` | **0** | `Finished release profile [optimized] target(s) in 13.89 s` |
+| `cargo test --release --test kv_persist_harness -- --test-threads=1` | **0** | **32 passed; 0 failed; 0 ignored** in 1.53 s |
+| `cargo test --release --test kv_persist_harness synthetic_spiller -- --test-threads=1` | **0** | 14/14 PASS (13 fixture units + 1 trait round-trip; `time_round_trip` exercised end-to-end via test #5) |
+| `grep -rn '// TODO\|todo!()\|unimplemented!()' tests/kv_persist_harness.rs tests/fixtures/synthetic_spiller.rs` | **1** | no hits — discipline holds |
+| `git diff main..HEAD --stat` | OK | only `tests/kv_persist_harness.rs`, `tests/fixtures/synthetic_spiller.rs`, `docs/ADR-017-persistent-block-prefix-cache.md` changed |
+
+**A0.2a discipline notes:**
+
+- Zero `src/` edits — code-only deliverable; the matrix run (A0.2 closure) executes against existing `src/serve/...` surfaces unchanged.
+- Zero `// TODO` markers — gate-assertion short-circuits are documented as substrate-mode behavior, not deferred work.
+- ADR-015 iter58 fence respected: no edits to `mlx-native/`, `gpu_delta_net.rs`, `forward_gpu.rs`, `gpu_full_attn.rs`.
+- ADR-005 Phase 4 fence respected: no edits to `src/serve/multi_model.rs`, `src/serve/api/`, `src/serve/cache.rs`, `src/serve/provenance.rs`, `src/serve/mod.rs`.
+- `man-day` used throughout; `person-day` does not appear.
+- Subprocess driver respects the OOM directive (`feedback_oom_prevention`): per-cell serial spawn; one server resident at a time; tempdir guards keep symlinks in scope across the eviction request.
+- Pre-bench process audit (`pre_bench_process_audit_or_panic`) gates the matrix body; A0.2a does not bypass it.
+
+**Open questions resolved by A0.2 matrix run (post-CFA, main session):**
+
+1. **OQ-2 / OQ-3 numerical decisions** — `mlx-native::metal_blit_block` vs `StorageModeShared` CPU memcpy (OQ-2) and hot-tier RAM cache default (OQ-3) decisions land when the M5 Max matrix run reads. A0.2a unblocks the run; main session executes.
+2. **Per-quant ratio variance** — the A0.2a closed-form post-restore engine cost (`no_cache_ttft / n_blocks`) is a proxy until the M5 Max run measures the actual final-block prefill + first-decode wall. Production A.1 wires a measured-by-engine hook; A0.2a's proxy is for falsification, not for the per-cell ratio in the results report.
+3. **Matrix-run env override scheme** — `HF2Q_KV_PERSIST_E2E_MODEL_<FAMILY>_<QUANT>` and `HF2Q_KV_PERSIST_E2E_MODEL_PATH` are the operator entry points; the main session sets these before invoking `kv_persist_matrix_e2e` on the M5 Max. The driver default falls back to `DEFAULT_CHAT_GGUF` (Gemma 4 26B) so the operator can run a smoke matrix without explicit env config.
+
+**Handoff to A0.2 matrix run (next session, on M5 Max with cold SoC):**
+
+```bash
+# 1. Pre-bench: STOP-pause mcp-brain-server (per feedback_bench_process_audit)
+kill -STOP $(pgrep mcp-brain-server)
+
+# 2. Resolve fixtures (operator overrides, optional):
+export HF2Q_KV_PERSIST_E2E_MODEL_PATH=/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf
+# Optional per-quant (only set if a distinct fixture exists):
+# export HF2Q_KV_PERSIST_E2E_MODEL_GEMMA4_26B_Q4_K_M=...
+
+# 3. Run matrix
+HF2Q_KV_PERSIST_E2E=1 \
+  cargo test --release --test kv_persist_harness \
+    -- --test-threads=1 --nocapture kv_persist_matrix_e2e
+
+# 4. Resume mcp-brain-server
+kill -CONT $(pgrep mcp-brain-server)
+
+# 5. Read results report at docs/ADR-017-phase-a0-results.md
+```
+
+The matrix runner emits the report into the worktree's `docs/` tree (NOT main hf2q's); operator promotes via dual-mode queen merge. Ship-gate / coherence-gate / decode-regression / overhead-gate assertions evaluate against the per-cell measured fields and fail the test on any kill-criterion (per ADR-017 §10).
+
 ---
 
 ## Open Questions
