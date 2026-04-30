@@ -119,12 +119,17 @@ fixture_path() {
 }
 
 # ----- pre-flight FCP / heavyweight gate (FIRST: contamination is fatal) -----
+# iter53 (2026-04-29): added 'logic pro|logicpro' to the contaminator pattern after
+# Logic Pro Creator Studio at 18% sustained CPU + coreaudiod at 6% blocked iter53 H3
+# multi-thermal stability investigation.  Audio-DSP workloads are functionally equivalent
+# to FCP/DaVinci video workloads (sustained P-core compute on shared SoC).  Per
+# feedback_no_broken_windows: fix the gate the moment it surfaces.
 if [[ "$SKIP_FCP_GATE" != "1" ]]; then
-  contaminator="$(ps -ef | egrep -i '(final cut|finalcut|fcp|davinci|handbrake|ffmpeg)' | grep -v grep || true)"
+  contaminator="$(ps -ef | egrep -i '(final cut|finalcut|fcp|davinci|handbrake|ffmpeg|logic pro|logicpro)' | grep -v grep || true)"
   if [[ -n "$contaminator" ]]; then
-    echo "FAIL: heavyweight CPU contaminator detected — abort per iter44 methodology fix:" >&2
+    echo "FAIL: heavyweight CPU contaminator detected — abort per iter44 / iter53 methodology fix:" >&2
     echo "$contaminator" >&2
-    echo "  (set SKIP_FCP_GATE=1 to override; produces noisy hf2q data per iter44 trial-1/5)" >&2
+    echo "  (set SKIP_FCP_GATE=1 to override; produces noisy hf2q data per iter44 trial-1/5 + iter53 PARTIAL/BLOCKED)" >&2
     exit 2
   fi
 fi

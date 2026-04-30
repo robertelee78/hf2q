@@ -139,6 +139,22 @@
       "verdict": "LANDED — primary +3.89pp exceeds Phase 5 ≥1pp gate AND ≥0pp on every other fixture AND coherence_smoke 12/12 + coherence_matrix 0 GIBBERISH"
     }
   },
+  "_iter53_status": {
+    "_status": "PARTIAL — BLOCKED-PRE-FLIGHT",
+    "_captured_at": "2026-04-30T00:22:16Z",
+    "_hf2q_head": "9c228d0",
+    "_mlx_native_head": "9bd1f6f",
+    "_worktree": "agent-a2ca20c8b8d51f7b7",
+    "_mission": "Multi-thermal llama-bench dwq46 stability investigation (H3 from iter52); 5 trials × 3 thermal states = 15 llama-bench runs + paired hf2q runs.",
+    "_outcome": "ABORT — pre-flight contamination event.",
+    "_contamination": "Logic Pro Creator Studio (pid 87605) sustained 17.0–18.4% CPU + coreaudiod (pid 408) sustained 6.2–6.7% CPU = ~24-25% sustained audio-DSP load on M5 Max P-core.  Operator is actively using the audio workstation; this is foreground work, not a runaway daemon.  Same magnitude as the mcp-brain-server contamination class documented in feedback_bench_process_audit (which was 18% and confirmed to shift trial medians by +1.5 t/s).",
+    "_pre_flight_clean": "pmset-therm CLEAN (no thermal/perf warning); vm_stat 35.7 GB free + 1.18M speculative; FCP/davinci/handbrake/ffmpeg/hf2q-convert/p11_re_emit pgrep all empty; mcp-brain-server self-quiesced (S state, 0.0% CPU at sample).",
+    "_methodology_invariant": "iter53 H3 specifically depends on cross-thermal-state spread.  An external uncontrolled 24-25% sustained CPU load voids the Cold-SoC / Sustained-warm / Post-cool-down state distinction (cold isn't cold, warm can't be cleanly attributed, cool-down can't reach idle).  Per feedback_no_shortcuts + feedback_correct_outcomes: refused to run a confounded bench.",
+    "_dwq46_cell_unchanged": "iter51 multi-run snapshot at 0.9503× remains the standing comparator.  Floor stays at 0.94 (= 0.9503 - 0.01 tolerance per current peer state).  No new measurement = no cell update.",
+    "_iter54_recommendation": "Retry iter53 H3 protocol verbatim under either (1) operator quiesces Logic Pro + audio-DSP idle (verified by ps audit + Logic Pro pgrep empty + coreaudiod <2% CPU), or (2) scheduled overnight bench window when workstation is idle.  Existing iter45 harness gate enriched at scripts/iter45-chain-n-curve-bench.sh to abort on Logic Pro / logicpro processes as future-proofing per feedback_no_broken_windows.",
+    "_artefacts": "/tmp/iter53/preflight/{contamination-summary.txt, pmset-therm.txt, vm_stat.txt, ps-audit.txt, top-cpu.txt, uptime.txt, mcp-brain-pids.txt, timestamp.txt}",
+    "_compliance_pins": ["feedback_check_ram_before_inference (PASS, 35.7 GB free)", "feedback_bench_process_audit (full audit archived; contamination IS the deliverable)", "feedback_perf_gate_thermal_methodology (pre-flight thermal clean; abort is on co-process load not thermal-flag)", "feedback_no_shortcuts (no confounded bench)", "feedback_correct_outcomes (honest negative result)", "feedback_evidence_first_no_blind_kernel_rewrites (zero code changes)", "feedback_use_cfa_worktrees (worktree agent-a2ca20c8b8d51f7b7)", "feedback_git_commit_pathspec_when_parallel (pathspec docs+JSON+harness only; src/quantize/mod.rs ADR-014 fence preserved)", "feedback_ground_truth_is_what_we_can_measure_now (deferred is not measured)"]
+  },
   "_iter51_summary": {
     "_artefact": "/tmp/iter51/bench/20260429T230122Z.results.tsv",
     "_n_trials_per_cell": "5 trials × 4 fixtures × 2 sides = 40 trials",

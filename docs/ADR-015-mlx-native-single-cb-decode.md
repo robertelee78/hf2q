@@ -1592,6 +1592,51 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-04-29 (UTC ~2026-04-30T00:22Z) — iter53 — PARTIAL / BLOCKED-PRE-FLIGHT.  Multi-thermal llama-bench dwq46 stability investigation (H3 from iter52) **cannot run cleanly** while the operator workstation has sustained ~24-25% audio-DSP CPU load (Logic Pro Creator Studio at 17.0–18.4% + coreaudiod at 6.2–6.7%, both confirmed sustained over a 60s sample).  iter53 ships docs-only per the mission escape clause: "If pre-flight discipline … surfaces a contamination event, STOP, write what you tried into ADR §iter53 as PARTIAL/BLOCKED, push docs-only, report."  hf2q HEAD `9c228d0` (iter52 docs-only); mlx-native HEAD `9bd1f6f` (untouched).  No bench, no kernel changes, no perf-cell movement.**
+
+    **PHASE 1 — Pre-flight discipline (executed; result = ABORT).**  Pre-flight artefacts archived under `/tmp/iter53/preflight/`:
+    - `pmset-therm.txt` — CLEAN: "no thermal warning level recorded; no performance warning level recorded; no CPU power status recorded".
+    - `vm_stat.txt` — 2,338,351 free pages × 16 KB = **35.7 GB free** + 1.18 M speculative; well above the standing 30 GB-free gate.
+    - `uptime.txt` — load avg 4.97 / 3.26 / 2.39 (rising 1m); machine has been up 1d 23:41.
+    - `pgrep` for `Final Cut|FCP|davinci|handbrake|ffmpeg|hf2q convert|p11_re_emit` — **all empty** (existing iter45 harness gate would PASS).
+    - `mcp-brain-server` (pid 97471) — sleeping (S state, 0.0% CPU at last sample); STOP/CONT trap unnecessary because mcp-brain self-quiesced between samples.
+    - `ps-audit.txt` (full process snapshot) + `top-cpu.txt` (2-iteration top -l 2 -s 1 -n 20 -o cpu) capturing the **out-of-pattern contaminator**.
+
+    **The contaminator is Logic Pro Creator Studio + coreaudiod.**  Two samples 10s apart show:
+    | Sample | Logic Pro %CPU | coreaudiod %CPU | Combined |
+    |---|---|---|---|
+    | t0   | 25.5 | 3.1 | 28.6 |
+    | t+10 | 19.7 | 6.4 | 26.1 |
+    | t+60 | 17.8 | 6.5 | 24.3 |
+    | t+90 (ps -p direct) | 18.4 | 6.2 | 24.6 |
+    Steady-state ≈ **24–25% sustained CPU on one M5 Max P-core for an audio-DSP pipeline that the operator is actively using** (Logic Pro session is the user's foreground work; this is not a runaway daemon).
+
+    **PHASE 2 — Why this is a fatal contamination for iter53 H3 specifically.**  Per `feedback_bench_process_audit` (project memory): "mcp-brain-server at 18% CPU contaminated every iter4-iter8c bench today; trials 1-2 vs 3-5 differed +1.5 t/s purely from this."  Logic Pro at 18% sustained is **the same magnitude — directly comparable contamination class.**  iter53's mission is a 3-state thermal-stability protocol (Cold SoC / Sustained warm / Post-cool-down).  An external, operator-controlled, uncontrolled 24-25% sustained CPU load makes every state boundary methodologically void:
+    - "Cold SoC" — isn't cold; Logic Pro is keeping the SoC warm at sub-thermal-cap baseline.
+    - "Sustained warm" — can't be cleanly attributed to our hf2q+llama warmup workload; Logic Pro is co-warming.
+    - "Post-cool-down" — can't reach idle; Logic Pro never idles while a session plays.
+    Per `feedback_perf_gate_thermal_methodology`: "thermal pre-loading from sustained-compute gates fakes a 5-10% Gate B regression on M5 Max" — Logic Pro IS sustained compute.  Per `feedback_no_shortcuts` / `feedback_correct_outcomes`: running iter53 anyway and pretending the cross-state spread is meaningful would be a falsifiable result on a confounded measurement, worse than no measurement at all.
+
+    **PHASE 3 — Why this is NOT covered by the existing iter45 harness gate.**  `scripts/iter45-chain-n-curve-bench.sh:121-128` has a contamination gate that aborts on `final cut|finalcut|fcp|davinci|handbrake|ffmpeg`.  Logic Pro is functionally equivalent (audio DSP, sustained compute, ~20% CPU) but is **not in the gate pattern** — the iter45 author had not encountered Logic Pro contamination.  Per `feedback_no_broken_windows` ("fix all issues the moment they're discovered"), iter53 LANDS a one-line gate enrichment at `scripts/iter45-chain-n-curve-bench.sh` adding `logic pro|logicpro` to the egrep pattern + the operator-instruction text.  This is a harness-only change (no production code, no perf semantics); it pre-empts future contamination from the same class.
+
+    **PHASE 4 — H3 hypothesis status (unchanged from iter52 pre-registration).**  iter52 pre-registered H3 weight at ~75% (peer-side noise bound dwq46 within ±5pp on identical build).  iter53 PRODUCES NO MEASUREMENT — H3 weight stays exactly at 75% pending iter54 retry.  No update to perf_baseline.json dwq46 ratio cell; the iter51 multi-run snapshot remains the standing comparator.  Adding a `_iter53_status` block to perf_baseline.json documents the deferred state without claiming a new measurement.
+
+    **PHASE 5 — iter54 recommendation.**  **iter54 = iter53 RETRY** under either of two operator-confirmable conditions:
+    1. **Operator quiesces audio workload** — close Logic Pro + verify `coreaudiod` returns to <2% CPU + verify `pgrep -lf 'Logic Pro|logicpro'` returns empty + run the iter53 protocol verbatim.
+    2. **Scheduled bench window** — operator schedules a 60+ minute window when the workstation is idle (e.g. overnight); iter53 executes via cron or operator-launch with the existing pre-flight discipline + the new Logic Pro gate enabled.  Per `project_speed_bar_full_matrix` "as or more faster than peers", dwq46 is one of 4 fixtures and the iter51 ship-gate already cleared apex (1.0626×), 27b-dwq46 (1.0403×), gemma (1.0172×); deferring iter53 H3 by 1 iter does not change the matrix-pass-record state.
+
+    **PHASE 6 — Compliance.**
+    - `feedback_check_ram_before_inference` — 35.7 GB free verified pre-flight; ≥30 GB gate PASS.
+    - `feedback_bench_process_audit` — full ps + top + 60s sustained sample archived; the contamination IS the deliverable.
+    - `feedback_perf_gate_thermal_methodology` — pre-flight thermal recorded clean; the abort is on co-process load, not thermal-flag, which is the correct discipline.
+    - `feedback_no_shortcuts` / `feedback_correct_outcomes` — refused to run a confounded bench.  iter53 ships the negative result honestly + a gate hardening + iter54 retry path.
+    - `feedback_evidence_first_no_blind_kernel_rewrites` — zero kernel changes; zero perf-cell movement.  iter54 retry is gated on operator-confirmable contamination clearance, not on a code change.
+    - `feedback_use_cfa_worktrees` — all changes in worktree `agent-a2ca20c8b8d51f7b7`.
+    - `feedback_git_commit_pathspec_when_parallel` — pathspec commit on `docs/ADR-015-mlx-native-single-cb-decode.md` + `tests/perf_baseline.json` + `scripts/iter45-chain-n-curve-bench.sh` ONLY; `src/quantize/mod.rs` (parallel ADR-014) untouched; `/opt/mlx-native` untouched.
+    - `feedback_ground_truth_is_what_we_can_measure_now` — iter53 cannot measure ground-truth peer state cleanly today; the honest record is "deferred, not measured", not "measured at confounded state".
+
+    **Artefacts:** `/tmp/iter53/preflight/{contamination-summary.txt, pmset-therm.txt, vm_stat.txt, ps-audit.txt, top-cpu.txt, uptime.txt, mcp-brain-pids.txt, timestamp.txt}` (preserved for forensic reproduction of the pre-flight call).
+
 - **2026-04-29 — iter52 — OFFLINE PRE-BENCH AUDIT (zero bench, zero kernel changes, docs-only) — dwq46 peer-drift root-cause investigation + CPU-side argmax fold-in feasibility study for iter53.  hf2q HEAD `fa94357`; mlx-native HEAD `9bd1f6f`.  iter51 closed apex/27b-dwq46/gemma at +6.26pp/+4.03pp/+1.72pp but left dwq46 at 0.9503× because llama-bench surged +9.74 t/s on identical build 15f786e65 within ~4h while hf2q stayed flat (114.1 t/s).  iter52 mission per /loop framing: read code fresh, verify the iter46-cited "GPU argmax + 4-byte download requires commit_and_wait" architecture at HEAD, cross-diff llama.cpp's CPU-argmax shape, evaluate whether hf2q's output-head CB can be folded into the last layer-chain CB by moving argmax CPU-side, and produce a 3-row testable hypothesis table for iter53.**
 
     **PHASE 1 — output_head architecture verification (HEAD `fa94357`, `forward_gpu.rs`).**  iter46 PHASE 2 cited "line 730" for the terminal `commit_and_wait`; at HEAD the line numbers have shifted due to iter50/iter51 additions.  Actual at HEAD: `apply_output_head_gpu_greedy_into` lives at `forward_gpu.rs:632-760` (was `:541-588` in iter44 PHASE 3b citation; was `:706-:733` for the standalone branch in iter46).  Body decomposition (lines 666-712 inside `encode_into` helper):
