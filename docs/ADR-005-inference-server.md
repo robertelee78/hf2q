@@ -1310,9 +1310,59 @@ target/release/hf2q serve --model /opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b
 
 - **AC 5472 — VERIFIED live at the production-router level.** `iter213_metrics_emits_kv_counters` builds the actual production `build_router(state)` and asserts the byte-exact `/metrics` scrape body contains: HELP/TYPE preamble for both counters, all 4 outcome rows × 2 counters with correct values (`success=1`, `codec_err=0`, `io_err=0`, `parity_fail=0`), and the iter-210 pool-gauge regression smoke (`hf2q_pool_loaded_models 0`). `iter213_kv_counter_delta_under_synthetic_spill` verifies the counter delta increments correctly under MockSpiller-driven evictions. Subprocess + `curl /metrics` against a running `hf2q serve` would additionally exercise the HTTP transport layer; same Qwen3.6 startup blocker noted above. The /metrics emit code path is fully exercised end-to-end by the router-level tests via `app.oneshot(req).await`.
 
-- **Out-of-scope serve startup follow-up:** the Qwen3.6 27B dwq46 serve path crashes at `src/serve/forward_mlx.rs:861` with a vocab-pad-related slice OOB ("range end index 1269990400 out of range for slice of length 1269985280" — Δ = 5120 = one Qwen3.6 hidden_dim row). The Q8_0 LMHEAD quantization code in forward_mlx.rs is the Gemma-pattern, and Qwen3.6 routes through it for the LMHEAD path despite cmd_generate_qwen35 being its qwen35-native dispatcher elsewhere. This is a SEPARATE model-class follow-up surface (likely ADR-013 territory or a cross-cutting LMHEAD-dispatch fix), NOT Phase 4 scope. Tracked here for the next iter's planning context, not as a Phase 4 closure dependency.
+- **Out-of-scope serve startup follow-up:** the Qwen3.6 27B dwq46 serve path crashes at `src/serve/forward_mlx.rs:861` with a vocab-pad-related slice OOB ("range end index 1269990400 out of range for slice of length 1269985280" — Δ = 5120 = one Qwen3.6 hidden_dim row). The Q8_0 LMHEAD quantization code in forward_mlx.rs is the Gemma-pattern, and Qwen3.6 routes through it for the LMHEAD path despite cmd_generate_qwen35 being its qwen35-native dispatcher elsewhere. This is a SEPARATE model-class follow-up surface (likely ADR-013 territory or a cross-cutting LMHEAD-dispatch fix), NOT Phase 4 scope. Tracked here for the next iter's planning context, not as a Phase 4 closure dependency. **CLOSED 2026-04-30 by iter-215 Wedge-2** — see iter-215 status entry below.
 
 **Phase 4 reopen final state:** **CLOSED 2026-04-30.** This subsection's `####` header retains the original "Phase 4 reopen — 2026-04-30" date stamp; final state is `CLOSED` per the status flip at line 990. **ADR-005 OVERALL after this closure:** Phase 1 + Phase 1b + Phase 2a + Phase 2b + Phase 2c + Phase 3 + Phase 4 (7/7 ACs full-flip) all closed for today's tree. The earlier "5/7 + 2/7 partial inheriting ADR-013" framing was stale doc-copy; ADR-013 closed 2026-04-25 (P14 commit `79140ec`), and AC 5468 + AC 5470 perf-bar measurements have been MET (Wave 5b.4 walk-bar PASS pp4096, Wave 5b.10 ≤5× perf-bar MET, 2026-04-28 decode 0.9796× llama within ±5%). **iter-211 production-stub caveat carries forward** (mmproj_sha256 emits `None` from production cmd_convert with a "future iter that re-orders Phase 4.6/4.8" comment) — schema marks the field optional but per Engineering Mantra "no stub (todo later) code" this MUST close; iter-211b queued.
+
+###### iter-215 — Wedge-2: Qwen3.5/3.6 SERVE-side arch dispatch MVP (2026-04-30)
+
+**Status: CLOSED 2026-04-30.** Wedge-2 MVP delivers SERVE-side support for `general.architecture ∈ {qwen35, qwen35moe}` GGUFs. The pre-iter-215 wedge-1 bail (commit `064797e`, iter-214 cycle, fail-fast diagnostic + cmd_generate_qwen35 workaround pointer) is replaced by actual arch dispatch: `hf2q serve --model <qwen3.5/3.6 GGUF>` now starts cleanly, `/readyz` returns 200, `/v1/models` lists the model, `/metrics` returns valid Prometheus text including iter-210 pool gauges + iter-213 KV-spill counters, and `/v1/chat/completions` returns HTTP 501 with an operator-actionable body naming both `hf2q generate` AND `cmd_generate_qwen35` literals as the working alternative for chat today. **Phase E (live forward pass via `Qwen35Model::forward_*`) is OUT OF Wedge-2 MVP and tracked as Wedge-3 (deferred follow-up).**
+
+**Phase split (commit-per-phase):**
+
+- **Phase A+B (commit `670a6f8`)** — `LoadedModel` struct → enum lift (`Gemma | Qwen35`). Pre-iter-215 fields move into `GemmaLoadedModel`; new `Qwen35LoadedModel` ships in a new module `src/serve/api/engine_qwen35.rs`. Accessor methods on the enum (model_id, hidden_size, vocab_size, tokenizer, chat_template, eos_token_ids, load_duration, prompt_cache) replace direct field reads in `Engine::spawn`. Inference helpers (`warmup_once`, `generate_once`, `generate_once_with_soft_tokens`, `generate_stream_once`) take `&mut GemmaLoadedModel` directly; `worker_run` dispatches on the enum variant. `LoadedModel::load(opts)` becomes a dispatcher that opens the GGUF header, reads `general.architecture`, and routes to the matching variant constructor. `Qwen35LoadedModel::load` mirrors `cmd_generate_qwen35` (`serve/mod.rs:1037-1110`) for tokenizer + chat-template + EOS resolution (parity with the working CLI chat path); `serve::find_tokenizer` visibility raised to `pub(crate)` so the SERVE-side load reuses the same resolution logic. `QWEN35_NOT_IMPLEMENTED_SENTINEL` + `QWEN35_NOT_IMPLEMENTED_MESSAGE` constants land for the worker → handler error mapping.
+- **Phase C (commit `dc64093`)** — `load_engine` arch dispatch replaces the wedge-1 bail at `serve/mod.rs:1442`. Pre-iter-215 the bail fired for `qwen35`/`qwen35moe` arches with an operator-actionable error pointing at `cmd_generate_qwen35`; iter-215 instead routes through `LoadedModel::load`'s arch dispatcher (Phase A+B). Header parse + arch logging preserved. The three pre-iter-215 wedge-1 tests (`load_engine_rejects_qwen35_arch_*`, `load_engine_rejects_qwen35moe_arch_*`, `load_engine_does_not_reject_unknown_arch_at_wedge`) are replaced by three new tests asserting the new dispatch behavior.
+- **Phase D (commit `561e782`)** — Worker thread Qwen35 arm + handler 501 mapping. `LoadedArch` enum (`Gemma | Qwen35`) cached in `EngineInner` at spawn time; `Engine::arch()` accessor surfaces the variant to handlers. `chat_completions` short-circuits to HTTP 501 with `engine::QWEN35_NOT_IMPLEMENTED_MESSAGE` body when `engine.arch() == LoadedArch::Qwen35` (fires for both stream and non-stream paths so the SSE stream is never half-built). Defence-in-depth: the chat error path AND the embeddings fallback path also detect the worker-side `QWEN35_NOT_IMPLEMENTED_SENTINEL` and map to 501. `ApiError::not_implemented(message)` constructor added to `schema.rs` (HTTP 501 per RFC 7231 §6.6.2; error_type=server_error, code=not_implemented).
+- **Tests (commit `cba1740`)** — Six new tests cover the iter-215 contract: `load_engine_routes_qwen35_to_qwen35_loaded_model` + `load_engine_routes_qwen35moe_to_qwen35_loaded_model` + `load_engine_routes_unknown_arch_to_gemma_default_unchanged` (Phase C, in `serve::tests`); `loaded_model_enum_accessor_methods_dispatch_correctly` + `qwen35_loaded_model_load_synthesizes_eos_default_when_metadata_absent` + `qwen35_not_implemented_message_names_both_workaround_literals` (in `serve::api::engine::tests`); `qwen35_chat_completion_returns_501_with_actionable_message` (in `serve::api::handlers::iter215_qwen35_chat_501_tests`); `qwen35_metrics_endpoint_works_with_qwen35_loaded` (in `serve::api::router::tests`). `HotSwapManager::admit_for_test` `#[cfg(test)]` admission helper added to `serve/multi_model.rs` for the metrics test (inserts a pre-built LoadedEngine into the pool without invoking the loader).
+
+**Live verification (HEAD `cba1740`, 2026-04-30, M5 Max, 128 GiB unified RAM):**
+
+```
+$ target/release/hf2q serve --model /opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf --port 49591 --host 127.0.0.1 &
+$ sleep 5 && curl -sS -w "\nHTTP=%{http_code}\n" -m 2 http://127.0.0.1:49591/readyz
+{"ready":true,"detail":"ready"}
+HTTP=200
+
+$ curl -sS http://127.0.0.1:49591/v1/models
+{"object":"list","data":[{"id":"Qwen3_5ForConditionalGeneration","object":"model","created":1777582186,
+ "owned_by":"hf2q","context_length":262144,"quant_type":"Q4_0","backend":"mlx-native","loaded":true}]}
+
+$ curl -sS http://127.0.0.1:49591/metrics | grep -E "hf2q_(ready|model_loaded|pool_loaded_models|pool_resident_bytes|pool_memory_budget_bytes|pool_kv_(spills|restores)_total)"
+hf2q_ready 1
+hf2q_model_loaded 1
+hf2q_pool_loaded_models 1
+hf2q_pool_resident_bytes 16974085376
+hf2q_pool_memory_budget_bytes 109951162777
+# HELP hf2q_pool_kv_spills_total Count of KV-cache spill operations on engine eviction.
+# TYPE hf2q_pool_kv_spills_total counter
+# HELP hf2q_pool_kv_restores_total Count of KV-cache restore operations on engine admission.
+# TYPE hf2q_pool_kv_restores_total counter
+
+$ curl -sS -w "\nHTTP=%{http_code}\n" -X POST http://127.0.0.1:49591/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"Qwen3_5ForConditionalGeneration","messages":[{"role":"user","content":"hi"}]}'
+{"error":{"message":"Qwen3.5/3.6 chat completion via the SERVE-side path is pending Phase E
+ (Wedge-3). The model is loaded; /readyz, /v1/models, /metrics work. For chat completions today,
+ use `hf2q generate --model <path> --prompt <text>` which routes correctly via cmd_generate_qwen35.",
+ "type":"server_error","param":null,"code":"not_implemented"}}
+HTTP=501
+```
+
+**Test counts:** 2255/2255 hf2q binary tests pass on iter-215 closure (was 2249/2249 at iter-214 closure on `064797e`; +6 tests this iter, no regressions). 312/312 tests in the `iter215|qwen35|loaded_model_enum` filter pass (covers all iter-215 work + the existing qwen35 family-related tests). One pre-existing baseline integration test (`dwq_on_qwen35_surfaces_not_ready_not_fallback`) remains broken — failure independent of iter-215 (verified via `git stash`); ADR-014 P4 tokenizer.json fixture issue, not introduced by Wedge-2.
+
+**Wedge-3 deferred-work surface (next iter's planning context):**
+
+Wedge-3 wires `Qwen35Model::forward_prefill` + `forward_decode` through the SERVE worker thread, replacing the four `qwen35_not_implemented_err()` arms in `worker_run` (Generate / GenerateStream / Embed / GenerateWithSoftTokens) with the real prefill + decode chain. The reference shape is `cmd_generate_qwen35` (`serve/mod.rs:1037-1280`) — the same load logic Wedge-2 mirrors, plus the live decode loop with `HybridKvCache`, `greedy_argmax_last_token`, optional `SpecDecode`, EOS handling, and reasoning-content split via the qwen35 family registration. Open questions for Wedge-3 scoping: (a) Do we wire prompt-cache (currently `LoadedModel::prompt_cache()` returns `None` for the Qwen35 variant)? (b) Do we wire grammar / tool-call splitter the same way the Gemma path does, or does the qwen35 family need a per-variant registration? (c) Does the `forward_embed_last` path need a Qwen35-shaped equivalent or does the chat fallback embed path stay unsupported until a separate Wedge-4? Wedge-3 worker prompt should answer these via Chesterton-walk of `cmd_generate_qwen35` + `serve::api::registry::find_for("qwen35-…")` AND a measurement plan for live wall-clock (the SERVE path will dominate vs the cmd_generate path because it goes through the channel + worker round-trip; benchmark first, optimize second per `feedback_harness_first_before_iter_chasing`).
 
 ##### Test plan (cross-iter)
 

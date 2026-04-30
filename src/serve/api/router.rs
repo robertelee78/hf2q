@@ -1280,4 +1280,72 @@ mod tests {
             "expected default_model name in error: {v}"
         );
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // Iter-215 Wedge-2 — /metrics scrape with Qwen35 engine resident
+    // ────────────────────────────────────────────────────────────────
+
+    /// /metrics surface MUST stay valid Prometheus text when a
+    /// Qwen3.5/3.6 engine is resident in the pool.  Verifies that
+    /// the iter-210 pool gauges (loaded_models / resident_bytes /
+    /// memory_budget_bytes) AND the iter-213 KV-spill counter
+    /// preamble (HELP/TYPE blocks) emit unconditionally with a
+    /// LoadedArch::Qwen35 engine in the pool.
+    #[tokio::test]
+    async fn qwen35_metrics_endpoint_works_with_qwen35_loaded() {
+        use super::super::engine;
+        use crate::serve::quant_select::QuantType;
+        let state = AppState::new(ServerConfig::default());
+        // Inject a synthetic Qwen35-arch engine into the pool.
+        {
+            let mut mgr = state.pool.write().expect("pool rwlock");
+            let engine = engine::make_synthetic_engine_for_test(engine::LoadedArch::Qwen35);
+            mgr.admit_for_test(
+                "iter-215-qwen35-test",
+                QuantType::Q4_K_M,
+                /* bytes_resident */ 1024,
+                engine,
+            )
+            .expect("admit synthetic Qwen35 engine");
+        }
+        let app = build_router(state);
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+
+        // Iter-210 (W78) pool gauges — present.
+        assert!(
+            body.contains("hf2q_pool_loaded_models"),
+            "missing pool gauge: {body}"
+        );
+        assert!(
+            body.contains("hf2q_pool_resident_bytes"),
+            "missing pool gauge: {body}"
+        );
+        assert!(
+            body.contains("hf2q_pool_memory_budget_bytes"),
+            "missing pool gauge: {body}"
+        );
+        // Iter-213 (AC 5472) KV-spill counter HELP/TYPE preamble —
+        // present even with no spills observed (Prometheus convention).
+        assert!(
+            body.contains("hf2q_pool_kv_spills_total"),
+            "missing kv_spills HELP/TYPE: {body}"
+        );
+        assert!(
+            body.contains("hf2q_pool_kv_restores_total"),
+            "missing kv_restores HELP/TYPE: {body}"
+        );
+
+        // Confirm the loaded count reflects the synthetic admission.
+        // The pool gauge line `hf2q_pool_loaded_models 1` MUST appear.
+        assert!(
+            body.lines().any(|l| l.trim() == "hf2q_pool_loaded_models 1"),
+            "expected `hf2q_pool_loaded_models 1` line; got body: {body}"
+        );
+    }
 }
