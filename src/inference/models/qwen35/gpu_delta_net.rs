@@ -792,11 +792,24 @@ pub fn apply_gated_delta_net(
 /// - `n_v_heads % n_k_heads == 0` (GQA constraint, validated downstream).
 /// - `d_k <= 192`, `d_v <= 256` (chunk pipeline threadgroup-memory caps).
 ///
-/// # Returns
+/// # Output buffers (caller-provided, iter58b)
 ///
 /// Same shapes as [`apply_gated_delta_net`]:
-/// - `output_buf`     : `[n_v_heads * seq_len * d_v]` F32.
-/// - `state_out_buf`  : `[d_k * d_v * n_v_heads]` F32.
+/// - `output_buf`  : `[n_v_heads * seq_len * d_v]` F32 — caller-provided
+///   buffer the chunk pipeline writes its F32 attention output into.
+/// - `final_state` : `[d_k * d_v * n_v_heads]` F32 — caller-provided
+///   buffer the chunk pipeline writes the updated recurrent state into.
+///
+/// iter58b refactor: previously this function allocated `output_buf` and
+/// `final_state` internally and returned them as `(MlxBuffer, MlxBuffer)`.
+/// The caller (`build_delta_net_layer` chunk-prefill branch) then read
+/// `final_state.as_slice::<f32>()` and `copy_nonoverlapping`'d it into the
+/// caller's `state_out` ping-pong buffer, forcing a `commit_and_wait` at
+/// the wrapper boundary AND an extra unsafe CPU memcpy. Threading
+/// caller-provided buffers eliminates both: the chunk pipeline writes
+/// directly to the production ping-pong slot, and the wrapper's commit no
+/// longer needs to wait (Metal serial-queue ordering keeps downstream
+/// ops 8+9 correct without a CPU bridge).
 #[allow(clippy::too_many_arguments)]
 pub fn apply_gated_delta_net_chunk(
     device: &MlxDevice,
@@ -807,6 +820,8 @@ pub fn apply_gated_delta_net_chunk(
     g_buf: &MlxBuffer,
     beta_buf: &MlxBuffer,
     state_in: &MlxBuffer,
+    output_buf: &MlxBuffer,
+    final_state: &MlxBuffer,
     seq_len: u32,
     n_k_heads: u32,
     n_v_heads: u32,
@@ -820,7 +835,7 @@ pub fn apply_gated_delta_net_chunk(
     // into the mega-encoder below). Standing parity bar:
     // `mlx-native/tests/test_repeat_tiled.rs::test_repeat_tiled_qwen36_27b_shape_seq128`
     // (and the matching `_pp4106` case) — bit-identical CPU reference.
-) -> Result<(MlxBuffer, MlxBuffer)> {
+) -> Result<()> {
     // Iter 5 contract: callers must already have applied l2-norm + q-scale
     // (matching the autoregressive `apply_gated_delta_net` interface).
     // `use_qk_l2norm=false` therefore signals "skip the chunk-pipeline's
@@ -945,16 +960,34 @@ pub fn apply_gated_delta_net_chunk(
         .map_err(|e| anyhow!("alloc g_log_decay: {e}"))?;
 
     // ---- Allocate output buffers ----
-    // Chunk pipeline writes bf16 output; we'll cast back to f32 at the end.
+    // Chunk pipeline writes bf16 output; we'll cast back to f32 at the end
+    // into the caller-provided `output_buf`. iter58b: the F32 output AND
+    // final_state buffers are now caller-provided (see fn doc-comment); we
+    // only allocate the bf16 scratch the cast reads from.
     let o_bf16 = device
         .alloc_buffer(out_elems_bf16 * 2, DType::BF16, vec![out_elems_bf16])
         .map_err(|e| anyhow!("alloc o_bf16: {e}"))?;
-    let final_state = device
-        .alloc_buffer(state_elems * 4, DType::F32, vec![state_elems])
-        .map_err(|e| anyhow!("alloc final_state: {e}"))?;
-    let output_buf = device
-        .alloc_buffer(out_elems_f32 * 4, DType::F32, vec![out_elems_f32])
-        .map_err(|e| anyhow!("alloc output_f32: {e}"))?;
+    // Defensive size checks on the caller-provided buffers. The shape
+    // contract is documented above; these guards turn a programmer error
+    // into an early `Err` before any GPU dispatch corrupts memory.
+    let final_state_bytes_needed = state_elems * std::mem::size_of::<f32>();
+    if final_state.byte_len() < final_state_bytes_needed {
+        return Err(anyhow!(
+            "apply_gated_delta_net_chunk: final_state byte_len {} < required {} (state_elems={})",
+            final_state.byte_len(),
+            final_state_bytes_needed,
+            state_elems
+        ));
+    }
+    let output_bytes_needed = out_elems_f32 * std::mem::size_of::<f32>();
+    if output_buf.byte_len() < output_bytes_needed {
+        return Err(anyhow!(
+            "apply_gated_delta_net_chunk: output_buf byte_len {} < required {} (out_elems_f32={})",
+            output_buf.byte_len(),
+            output_bytes_needed,
+            out_elems_f32
+        ));
+    }
 
     // Build chunk-pipeline params. scale=1.0 because callers already applied
     // the K^-0.5 scale; use_qk_l2norm=false because callers already l2-normed.
@@ -1096,7 +1129,7 @@ pub fn apply_gated_delta_net_chunk(
         beta_buf,
         state_in,
         &o_bf16,
-        &final_state,
+        final_state,
         p,
     )
     .map_err(|e| anyhow!("dispatch_chunk_gated_delta_rule_fwd: {e}"))?;
@@ -1104,13 +1137,13 @@ pub fn apply_gated_delta_net_chunk(
     // Barrier: o_bf16 is written by chunk pipeline and read by the cast below.
     enc.memory_barrier();
 
-    // Stage D: cast output BF16 → F32 to match the autoregressive return dtype.
+    // Stage D: cast output BF16 → F32 into caller-provided `output_buf`.
     cast(
         &mut enc,
         registry,
         device.metal_device(),
         &o_bf16,
-        &output_buf,
+        output_buf,
         out_elems_bf16,
         CastDirection::BF16ToF32,
     )
@@ -1118,16 +1151,35 @@ pub fn apply_gated_delta_net_chunk(
 
     drop(_w5b8_encbuild);
     {
+        // iter58b: downgrade `commit_and_wait` to `commit` (no host wait).
+        // The previous wait was forced by the caller's
+        // `chunk_final_state.as_slice::<f32>()` CPU read of `final_state`
+        // to memcpy into `state_out`. Now that `final_state` (and
+        // `output_buf`) are caller-provided buffers the chunk pipeline
+        // writes directly, no caller does a CPU read on the wrapper's
+        // outputs in production. Downstream ops 8+9 (ssm_norm_gate,
+        // out_proj) build their own command encoder on the same Metal
+        // serial queue, which guarantees they cannot execute until this
+        // committed buffer completes — ordering is preserved without a
+        // CPU-side wait.
+        //
+        // Unit-test note: parity tests in this module that read the
+        // wrapper's outputs via CPU `download_f32` MUST add their own
+        // sync (e.g. an empty `command_encoder().commit_and_wait()`)
+        // between the wrapper call and the download, since the wrapper
+        // no longer drains the queue itself. The `ChunkCommitWait`
+        // section tag is retained (semantic now: "chunk.commit, no
+        // wait") so the existing wave5b8 profiling + W-5b.21 forensic
+        // A/B can still attribute the section.
         let _w5b8_commit = crate::inference::models::qwen35::wave5b8_profile::Section::start(
             crate::inference::models::qwen35::wave5b8_profile::SectionKind::ChunkCommitWait,
         );
-        enc.commit_and_wait()
-            .context("commit apply_gated_delta_net_chunk")?;
+        enc.commit();
     }
 
-    // Return (output, final_state) — both F32, identical shape contract to
-    // the autoregressive `apply_gated_delta_net` return type.
-    Ok((output_buf, final_state))
+    // iter58b: caller-provided `output_buf` and `final_state` have been
+    // written by the now-committed chunk-pipeline encoder; nothing to return.
+    Ok(())
 }
 
 /// Apply per-head output RMSNorm then element-wise SiLU-gate multiply.
@@ -1602,16 +1654,19 @@ pub fn build_delta_net_layer(
             // split the existing single-encoder ops5-9 prefill into:
             //   E1: ops 5+6 (l2_norm, alpha, beta, q_scale, g_beta) — produces
             //       q_scaled / k_normed / g_buf / beta_buf.
-            //   chunk: apply_gated_delta_net_chunk() — its own encoder; produces
-            //       chunk_attn_out (F32, same shape as the autoregressive
-            //       attn_out_buf) and chunk_final_state (F32, same shape as
-            //       state_out's contract).
+            //   chunk: apply_gated_delta_net_chunk() — its own encoder; writes
+            //       its F32 attention output into the outer-scope `attn_out_buf`
+            //       AND its updated recurrent state directly into `state_out`
+            //       (caller-provided ping-pong slot, iter58b).
             //   E2: ops 8+9 (ssm_norm_gate, out_proj).
             //
-            // After the chunk dispatch we copy `chunk_final_state` into the
-            // caller-provided `state_out` buffer (unified-memory slice copy)
-            // so the ping-pong contract at `forward_gpu.rs:818-823` keeps
-            // working unchanged.
+            // iter58b: previously the wrapper allocated its own output and
+            // final-state buffers internally; the caller then `as_slice`+
+            // memcpy'd the state into `state_out`, which forced the wrapper's
+            // `commit_and_wait` (CPU bridge). Threading caller-provided
+            // buffers eliminates both: the wrapper now `commit`s without
+            // waiting, and Metal serial-queue ordering keeps E2 sequenced
+            // behind the chunk pipeline.
             let k_normed_buf = {
                 let _w5b8 = super::wave5b8_profile::Section::start(
                     super::wave5b8_profile::SectionKind::LayerChunkPrep,
@@ -1652,7 +1707,20 @@ pub fn build_delta_net_layer(
             };
 
             // Stage: chunk-parallel delta-rule pipeline (own encoder).
-            let (chunk_attn_out, chunk_final_state) = {
+            //
+            // iter58b: thread `attn_out_buf` (the outer-scope pooled F32
+            // buffer already used by the autoregressive path at line ~1433)
+            // and `state_out` (the caller-provided ping-pong slot) into the
+            // chunk wrapper as caller-provided output buffers. The wrapper
+            // writes its F32 attention output and final recurrent state
+            // straight into these caller buffers, eliminating:
+            //   - the `chunk_final_state.as_slice::<f32>()` CPU read that
+            //     forced `commit_and_wait` inside the wrapper, and
+            //   - the unsafe `copy_nonoverlapping` memcpy from a
+            //     wrapper-owned allocation into `state_out`.
+            // Metal serial-queue ordering keeps ops 8+9 below correctly
+            // sequenced behind the wrapper's now-non-blocking `commit`.
+            {
                 let _w5b8 = super::wave5b8_profile::Section::start(
                     super::wave5b8_profile::SectionKind::LayerChunkCall,
                 );
@@ -1665,6 +1733,8 @@ pub fn build_delta_net_layer(
                     &g_buf,
                     &beta_buf,
                     state_in,
+                    &attn_out_buf,
+                    state_out,
                     seq_len,
                     n_k_heads,
                     n_v_heads,
@@ -1672,71 +1742,14 @@ pub fn build_delta_net_layer(
                     d_v,
                     /* use_qk_l2norm = */ false,
                 )
-                .context("apply_gated_delta_net_chunk prefill")?
-            };
-
-            // Copy chunk-pipeline `final_state` into the caller-provided
-            // `state_out` ping-pong buffer. Apple unified memory: the
-            // backing pages are CPU-accessible after the chunk wrapper's
-            // commit_and_wait, so this is a plain memcpy on the same
-            // physical address space — no GPU round-trip.
-            //
-            // We write through `contents_ptr()` (raw `*mut c_void`) because
-            // `state_out` is `&MlxBuffer` (shared by the autoregressive
-            // contract that lets dispatch_gated_delta_net write through a
-            // `&` reference via the Metal kernel binding). The autoregressive
-            // path mutates state_out the same way, just on the GPU side.
-            {
-                let src = chunk_final_state.as_slice::<f32>().map_err(|e| {
-                    anyhow!("apply_gated_delta_net_chunk: read final_state: {e}")
-                })?;
-                let n_state = (d_k * d_v * n_v_heads) as usize;
-                if src.len() < n_state {
-                    return Err(anyhow!(
-                        "chunk_final_state len {} < expected n_state {}",
-                        src.len(),
-                        n_state
-                    ));
-                }
-                let bytes_needed = n_state * std::mem::size_of::<f32>();
-                if state_out.byte_len() < bytes_needed {
-                    return Err(anyhow!(
-                        "state_out byte_len {} < required {}",
-                        state_out.byte_len(),
-                        bytes_needed
-                    ));
-                }
-                // SAFETY:
-                // - `state_out.contents_ptr()` is a valid CPU-accessible
-                //   pointer to `state_out.byte_len()` bytes (Apple unified
-                //   memory, MlxBuffer doc-comment §"contents_ptr").
-                // - `chunk_final_state` was just produced by the chunk
-                //   wrapper's `enc.commit_and_wait()` — no concurrent GPU
-                //   writers.
-                // - `state_out` has no concurrent GPU writers in this scope:
-                //   the autoregressive `dispatch_gated_delta_net` is the
-                //   only in-flight writer in this function and it is gated
-                //   behind the `else` branch (chunk path is exclusive).
-                //   Ops 8+9 below do not touch state_out.
-                // - Source and destination cannot alias: `chunk_final_state`
-                //   is a fresh wrapper-owned allocation distinct from the
-                //   caller-provided `state_out`.
-                // - Element type matches: both buffers carry F32 state of
-                //   length `n_state` per the validated shape contracts.
-                // W-5b.17 sub-bucket: chunk-final-state → state_out
-                // ping-pong CPU memcpy. n_state F32 per layer.
-                let _w5b17 = super::wave5b8_profile::Section::start_w5b17(
-                    super::wave5b8_profile::SectionKind::DnStatePingpongMemcpy,
-                );
-                unsafe {
-                    let dst_ptr = state_out.contents_ptr() as *mut f32;
-                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst_ptr, n_state);
-                }
+                .context("apply_gated_delta_net_chunk prefill")?;
             }
 
-            // E2: ops 8+9 (ssm_norm_gate, out_proj). Reads chunk_attn_out
-            // (the F32 attention output from the chunk pipeline) instead of
-            // the autoregressive attn_out_buf.
+            // E2: ops 8+9 (ssm_norm_gate, out_proj). Reads `attn_out_buf`,
+            // which the chunk wrapper just wrote (matches autoregressive
+            // path's contract at line ~1433 where `dispatch_gated_delta_net`
+            // also writes into `attn_out_buf`). state_out has likewise been
+            // written GPU-side by the chunk wrapper.
             let _w5b8_ops89 = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::LayerChunkOps8to9,
             );
@@ -1745,7 +1758,7 @@ pub fn build_delta_net_layer(
                 .context("enc chunk ops8-9 prefill")?;
             dispatch_ssm_norm_gate(
                 &mut enc, registry, device.metal_device(),
-                &chunk_attn_out, &weights.ssm_norm, &z,
+                &attn_out_buf, &weights.ssm_norm, &z,
                 &gated_buf, &op8_params,
                 rows_op8, d_v,
             ).context("dispatch_ssm_norm_gate chunk prefill")?;
@@ -2594,7 +2607,14 @@ mod tests {
 
         // Path B: chunk pipeline (W-5b.20 default: in-encoder GPU
         // repeat_tiled). Test exercises the production NEW path.
-        let (chunk_out, _chunk_state) = apply_gated_delta_net_chunk(
+        // iter58b: caller now owns output_buf + final_state buffers.
+        let chunk_out = device
+            .alloc_buffer(n_out * 4, DType::F32, vec![n_out])
+            .expect("alloc chunk_out");
+        let chunk_state = device
+            .alloc_buffer(n_state * 4, DType::F32, vec![n_state])
+            .expect("alloc chunk_state");
+        apply_gated_delta_net_chunk(
             &device,
             &mut registry,
             &q_chunk,
@@ -2603,6 +2623,8 @@ mod tests {
             &g_chunk,
             &beta_chunk,
             &state_chunk,
+            &chunk_out,
+            &chunk_state,
             seq_len,
             n_k_heads,
             n_v_heads,
@@ -2611,6 +2633,15 @@ mod tests {
             /* use_qk_l2norm = */ false,
         )
         .expect("apply_gated_delta_net_chunk");
+        // iter58b: wrapper now commits without waiting; tests that read via
+        // CPU `download_f32` must drain the queue themselves. An empty
+        // command encoder + commit_and_wait synchronizes with the prior
+        // wrapper commit on the same Metal serial queue.
+        device
+            .command_encoder()
+            .expect("sync enc")
+            .commit_and_wait()
+            .expect("sync wait");
         let chunk_out_cpu = download_f32(&chunk_out).expect("download chunk out");
         assert_eq!(chunk_out_cpu.len(), n_out, "chunk output length");
 
@@ -2752,6 +2783,8 @@ mod tests {
         let dummy_f32 = upload_f32(&[0.0f32; 1], &device).expect("upload dummy");
 
         // seq_len = 65 is > CHUNK_THRESHOLD (64) but not a multiple of BT (64).
+        // iter58b: dummy_f32 doubles as output_buf + final_state (size check
+        // fires AFTER seq_len check, so the dummy never gets read/written).
         let err = apply_gated_delta_net_chunk(
             &device,
             &mut registry,
@@ -2761,6 +2794,8 @@ mod tests {
             &dummy_f32,
             &dummy_f32,
             &dummy_f32,
+            &dummy_f32, // output_buf (unused — seq_len check fires first)
+            &dummy_f32, // final_state (unused — seq_len check fires first)
             /* seq_len = */ 65,
             /* n_k_heads = */ 1,
             /* n_v_heads = */ 1,
@@ -2787,6 +2822,8 @@ mod tests {
         let mut registry = KernelRegistry::new();
         let dummy_f32 = upload_f32(&[0.0f32; 1], &device).expect("upload dummy");
 
+        // iter58b: dummy_f32 doubles as output_buf + final_state (the
+        // use_qk_l2norm check at the top fires before either is read).
         let err = apply_gated_delta_net_chunk(
             &device,
             &mut registry,
@@ -2796,6 +2833,8 @@ mod tests {
             &dummy_f32,
             &dummy_f32,
             &dummy_f32,
+            &dummy_f32, // output_buf (unused — l2norm check fires first)
+            &dummy_f32, // final_state (unused — l2norm check fires first)
             /* seq_len = */ 128,
             /* n_k_heads = */ 1,
             /* n_v_heads = */ 1,
@@ -3001,11 +3040,26 @@ mod tests {
         let g_c = upload_f32(&g_cpu, &device).expect("upload");
         let b_c = upload_f32(&beta_cpu, &device).expect("upload");
         let s_c = upload_f32(&state_zeros, &device).expect("upload");
-        let (chunk_out, _) = apply_gated_delta_net_chunk(
+        // iter58b: caller now owns output_buf + final_state buffers.
+        let chunk_out = device
+            .alloc_buffer(n_out * 4, DType::F32, vec![n_out])
+            .expect("alloc chunk_out");
+        let chunk_state = device
+            .alloc_buffer(n_state * 4, DType::F32, vec![n_state])
+            .expect("alloc chunk_state");
+        apply_gated_delta_net_chunk(
             &device, &mut registry, &q_c, &k_c, &v_c, &g_c, &b_c, &s_c,
+            &chunk_out, &chunk_state,
             seq_len, n_k_heads, n_v_heads, d_k, d_v, false,
         )
         .expect("chunk");
+        let _ = &chunk_state; // keep-alive (wrapper writes via &MlxBuffer)
+        // iter58b: wrapper commits without waiting; sync queue before CPU read.
+        device
+            .command_encoder()
+            .expect("sync enc")
+            .commit_and_wait()
+            .expect("sync wait");
         let chunk_cpu = download_f32(&chunk_out).expect("dl chunk");
 
         // CPU reference (post-decay-err — llama.cpp / FLA fused_recurrent form).
