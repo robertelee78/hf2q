@@ -5491,6 +5491,7 @@ assistant:
             context_length: Some(1024),
             quant_type: Some("Q4_0".to_string()),
             load_duration: Duration::from_millis(7),
+            prompt_cache: super::super::engine_qwen35::HybridPromptCache::new(),
         };
         let qwen = LoadedModel::Qwen35(qwen_loaded);
 

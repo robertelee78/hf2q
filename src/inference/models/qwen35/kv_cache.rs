@@ -128,6 +128,20 @@ pub enum LayerSlot {
     Linear(u32), // index into `linear_attn`
 }
 
+impl std::fmt::Debug for HybridKvCacheSnapshot {
+    /// Surface only counts + total bytes — `MlxBuffer` does not implement
+    /// `Debug` (Metal device handles can't be safely printed) and
+    /// dumping per-element contents would be useless at this scale (GB).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HybridKvCacheSnapshot")
+            .field("full_attn_layers", &self.full_attn_k.len())
+            .field("linear_attn_layers", &self.linear_conv.len())
+            .field("has_mtp", &self.mtp.is_some())
+            .field("total_bytes", &self.total_bytes())
+            .finish()
+    }
+}
+
 /// Deep-copy snapshot of a [`HybridKvCache`] — owns fresh `MlxBuffer`
 /// allocations holding byte-equal contents at snapshot time.
 ///
