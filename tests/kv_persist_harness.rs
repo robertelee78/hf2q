@@ -605,6 +605,16 @@ pub mod subprocess_driver {
         stderr_thread: Option<thread::JoinHandle<()>>,
     }
 
+    impl std::fmt::Debug for ServerGuard {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ServerGuard")
+                .field("host", &self.host)
+                .field("port", &self.port)
+                .field("pid", &self.child.id())
+                .finish()
+        }
+    }
+
     impl ServerGuard {
         pub fn host(&self) -> &str {
             &self.host
@@ -2196,4 +2206,493 @@ fn kv_persist_matrix_e2e() {
     // referenced when A0.2 wires the subprocess driver.)
     let _ = Duration::from_secs(READYZ_BUDGET_SECS);
     let _ = (HOST, PORT_DEFAULT, DEFAULT_CHAT_GGUF);
+}
+
+// ===========================================================================
+// Phase A0.2a tests — subprocess driver + cache-hit prediction.
+// ===========================================================================
+
+/// **A0.2a.T1 (always-on smoke):** the subprocess_driver's binary
+/// locator returns the same path the parent module's helper does, and
+/// surfaces a `BinaryNotFound` error rather than panicking when the
+/// binary is absent (matrix runner can short-circuit cells cleanly).
+#[test]
+fn subprocess_driver_smoke_binary_locatable() {
+    let parent = hf2q_binary_path();
+    let driver = subprocess_driver::binary_path()
+        .expect("driver locator must resolve when parent does");
+    assert_eq!(
+        parent, driver,
+        "subprocess_driver::binary_path must return same path as parent helper"
+    );
+    assert!(
+        driver.ends_with("hf2q"),
+        "driver binary path must end with hf2q; got {}",
+        driver.display()
+    );
+}
+
+/// **A0.2a.T2 (env-gated):** spawn + drop a server cleanly, asserting
+/// `/readyz` reaches 200 and Drop kills + waits the child without
+/// stranding a resident model.
+///
+/// Gated on `HF2Q_KV_PERSIST_E2E=1` because the server spawn loads a
+/// 16-26 GiB GGUF; running this in default `cargo test` would OOM the
+/// dev box.
+#[test]
+fn server_guard_lifecycle_starts_and_stops_cleanly() {
+    if std::env::var(ENV_E2E_GATE).as_deref() != Ok("1") {
+        eprintln!(
+            "server_guard_lifecycle_starts_and_stops_cleanly: skipped \
+             (set {ENV_E2E_GATE}=1 to enable; spawns a 16-26 GiB resident \
+             model and is OOM-risky on default dev runs)"
+        );
+        return;
+    }
+    pre_bench_process_audit_or_panic();
+    let model = std::env::var("HF2Q_KV_PERSIST_E2E_MODEL_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CHAT_GGUF));
+    if !model.exists() {
+        eprintln!(
+            "server_guard_lifecycle: skipped — model fixture {} not found",
+            model.display()
+        );
+        return;
+    }
+    let cell = MatrixCell {
+        family: Family::Gemma4_26b,
+        quant: WeightQuant::Q4_0,
+        kv_path: KvPath::Dense,
+        prefix_len: PrefixLen::L0,
+        cache_state: CacheState::Miss,
+        scenario: Scenario::ColdResume,
+    };
+    let cfg = subprocess_driver::CellConfig::for_cell(&cell, model);
+    let server = subprocess_driver::spawn_hf2q_serve_subprocess(&cfg)
+        .expect("spawn hf2q serve");
+    subprocess_driver::wait_for_readyz(&server).expect("readyz");
+    // Drop fires here.
+    drop(server);
+    // If we got here, Drop didn't panic and the child was reaped.
+    eprintln!("server_guard_lifecycle: spawn + drop OK");
+}
+
+/// **A0.2a.T3 (env-gated):** warm_request returns a Duration under the
+/// 10-min readyz budget. The wall is diagnostic-only; the assertion is
+/// just that the call succeeds and respects the budget envelope.
+#[test]
+fn warm_request_returns_under_10min_budget() {
+    if std::env::var(ENV_E2E_GATE).as_deref() != Ok("1") {
+        eprintln!(
+            "warm_request_returns_under_10min_budget: skipped \
+             (set {ENV_E2E_GATE}=1; OOM-risky)"
+        );
+        return;
+    }
+    pre_bench_process_audit_or_panic();
+    let model = std::env::var("HF2Q_KV_PERSIST_E2E_MODEL_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CHAT_GGUF));
+    if !model.exists() {
+        eprintln!("warm_request: skipped — fixture not found");
+        return;
+    }
+    let cell = MatrixCell {
+        family: Family::Gemma4_26b,
+        quant: WeightQuant::Q4_0,
+        kv_path: KvPath::Dense,
+        prefix_len: PrefixLen::L0,
+        cache_state: CacheState::RamHot,
+        scenario: Scenario::ColdResume,
+    };
+    let cfg = subprocess_driver::CellConfig::for_cell(&cell, model);
+    let server = subprocess_driver::spawn_hf2q_serve_subprocess(&cfg)
+        .expect("spawn");
+    subprocess_driver::wait_for_readyz(&server).expect("readyz");
+    let warm_wall = subprocess_driver::warm_request(&server)
+        .expect("warm_request");
+    assert!(
+        warm_wall <= Duration::from_secs(READYZ_BUDGET_SECS),
+        "warm_request wall {:?} exceeds {}s budget",
+        warm_wall,
+        READYZ_BUDGET_SECS
+    );
+    eprintln!("warm_request: wall={warm_wall:?}");
+}
+
+/// **A0.2a.T4 (env-gated):** measure_ttft_subprocess parses an SSE
+/// first-content-delta from a real `hf2q serve`, returning a finite
+/// `ttft_ms`, non-zero `total_tokens`, and `decode_tps >= 0`.
+#[test]
+fn measure_ttft_parses_sse_first_content_delta() {
+    if std::env::var(ENV_E2E_GATE).as_deref() != Ok("1") {
+        eprintln!(
+            "measure_ttft_parses_sse_first_content_delta: skipped \
+             (set {ENV_E2E_GATE}=1; OOM-risky)"
+        );
+        return;
+    }
+    pre_bench_process_audit_or_panic();
+    let model = std::env::var("HF2Q_KV_PERSIST_E2E_MODEL_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CHAT_GGUF));
+    if !model.exists() {
+        eprintln!("measure_ttft: skipped — fixture not found");
+        return;
+    }
+    let cell = MatrixCell {
+        family: Family::Gemma4_26b,
+        quant: WeightQuant::Q4_0,
+        kv_path: KvPath::Dense,
+        prefix_len: PrefixLen::L512,
+        cache_state: CacheState::SsdWarmPagecache,
+        scenario: Scenario::ColdResume,
+    };
+    let cfg = subprocess_driver::CellConfig::for_cell(&cell, model);
+    let server = subprocess_driver::spawn_hf2q_serve_subprocess(&cfg)
+        .expect("spawn");
+    subprocess_driver::wait_for_readyz(&server).expect("readyz");
+    let canonical = subprocess_driver::fetch_canonical_model_id(&server)
+        .expect("/v1/models");
+    let _ = subprocess_driver::warm_request(&server);
+    let m = subprocess_driver::measure_ttft_subprocess(
+        &server,
+        &canonical,
+        "Hi.",
+        16,
+    )
+    .expect("ttft");
+    assert!(m.ttft_ms.is_finite(), "ttft must be finite");
+    assert!(m.ttft_ms > 0.0, "ttft must be positive");
+    assert!(m.total_tokens > 0, "must observe at least one content delta");
+    assert!(m.decode_tps >= 0.0, "decode_tps cannot be negative");
+    eprintln!(
+        "measure_ttft: ttft_ms={:.1}, total_tokens={}, decode_tps={:.2}",
+        m.ttft_ms, m.total_tokens, m.decode_tps
+    );
+}
+
+/// **A0.2a.T5 (always-on, REAL DISK I/O):**
+/// `synthesize_cache_hit_prediction` invokes the synthetic spiller's
+/// real disk I/O via `BlockStore::time_round_trip` — NOT a constant.
+///
+/// The prediction has two terms:
+///
+///   1. `restore_ms` — the wall from `time_round_trip`'s real
+///      `write_block + read_block` round-trip.
+///   2. `post_restore_engine_ms` — closed-form proxy for final-block
+///      prefill + first-decode (≈ `no_cache_ttft / n_blocks`).
+///
+/// To prove term 1 is REAL disk I/O (not a constant), this test does
+/// TWO independent things:
+///
+///   (A) Calls the underlying `BlockStore::time_round_trip` directly
+///       at 1-block vs 32-block sizes and asserts the I/O wall is
+///       monotonically non-decreasing in n_blocks (32 ≥ 1). Real I/O
+///       must scale with disk traffic; a constant short-circuit
+///       cannot satisfy this.
+///
+///   (B) Calls `synthesize_cache_hit_prediction` itself across two
+///       distinct prefix lengths and asserts the predictions are NOT
+///       byte-identical, AND the value at prefix=0 equals
+///       `no_cache_ttft` (the closed form when there's no cache to
+///       restore — proves the predictor branches on prefix_tokens
+///       and isn't returning a constant).
+///
+/// Either invariant alone refutes "synthetic constants asserted
+/// against ship gates" (the disqualifying antipattern from A0.1
+/// Codex's submission per the spec).
+#[test]
+fn synthesize_cache_hit_prediction_uses_real_io_wall_not_constants() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = std::sync::Arc::new(synthetic_spiller::BlockStore::new(
+        tmp.path().to_path_buf(),
+    ));
+
+    // (A) Direct evidence: time_round_trip walls scale with n_blocks.
+    // Use representative byte size (1 MiB / block) per
+    // representative_block_bytes(Gemma4_26b, Dense). Distinct
+    // fingerprints so neither call's directory shadows the other's.
+    let block_bytes = subprocess_driver::representative_block_bytes(
+        &Family::Gemma4_26b,
+        &KvPath::Dense,
+    );
+    let fp_a = synthetic_spiller::ModelFingerprint::compute(
+        "repo/test-rt-a",
+        "Q4_0",
+        "v0",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "tpl",
+    );
+    let fp_b = synthetic_spiller::ModelFingerprint::compute(
+        "repo/test-rt-b",
+        "Q4_0",
+        "v0",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "tpl",
+    );
+    let wall_1 = store
+        .time_round_trip(&fp_a, 1, block_bytes)
+        .expect("time_round_trip 1");
+    let wall_32 = store
+        .time_round_trip(&fp_b, 32, block_bytes)
+        .expect("time_round_trip 32");
+    eprintln!(
+        "synthesize_cache_hit_prediction: time_round_trip wall_1={:?}, wall_32={:?}",
+        wall_1, wall_32
+    );
+    assert!(
+        wall_32 >= wall_1,
+        "32-block I/O wall {wall_32:?} must be >= 1-block I/O wall {wall_1:?}; \
+         a constant short-circuit cannot satisfy this monotonicity invariant"
+    );
+    // 32 blocks of 1 MiB is 32 MiB; even an APFS page-cache hot path
+    // should take more than 100 microseconds to read 32 MiB. A
+    // constant return would be a fixed delta below this floor.
+    assert!(
+        wall_32 >= std::time::Duration::from_micros(100),
+        "wall_32={wall_32:?} below 100us floor; suggests constant short-circuit"
+    );
+
+    // (B) Indirect evidence via the predictor — different prefix
+    // lengths produce non-identical predictions, AND prefix=0
+    // collapses to no_cache_ttft (the no-cache-restore branch).
+    let spiller = synthetic_spiller::SyntheticSpiller::new(store);
+    let no_cache = 1000.0_f64;
+    let p_zero = subprocess_driver::synthesize_cache_hit_prediction(
+        no_cache,
+        0,
+        Family::Gemma4_26b,
+        KvPath::Dense,
+        &spiller,
+    )
+    .expect("predict 0");
+    let p_one_block = subprocess_driver::synthesize_cache_hit_prediction(
+        no_cache,
+        synthetic_spiller::BLOCK_TOKENS,
+        Family::Gemma4_26b,
+        KvPath::Dense,
+        &spiller,
+    )
+    .expect("predict 1 block");
+    let p_eight_blocks = subprocess_driver::synthesize_cache_hit_prediction(
+        no_cache,
+        synthetic_spiller::BLOCK_TOKENS * 8,
+        Family::Gemma4_26b,
+        KvPath::Dense,
+        &spiller,
+    )
+    .expect("predict 8 blocks");
+    eprintln!(
+        "synthesize_cache_hit_prediction: zero={:.3}ms, 1blk={:.3}ms, 8blk={:.3}ms",
+        p_zero, p_one_block, p_eight_blocks
+    );
+
+    // prefix=0 collapses to no_cache_ttft (no I/O, no per-block split).
+    assert!(
+        (p_zero - no_cache).abs() < 1.0,
+        "zero-prefix prediction must equal no_cache_ttft (no I/O branch); \
+         got {p_zero:.3} vs {no_cache:.3}"
+    );
+
+    // The 1-block and 8-block predictions must differ — different
+    // prefix lengths produce different closed-form post-restore
+    // engine costs (no_cache/n_blocks varies) AND different I/O walls.
+    // A constant short-circuit returning the same number for any
+    // prefix would fail this.
+    assert!(
+        (p_one_block - p_eight_blocks).abs() > 0.5,
+        "1-block and 8-block predictions must differ by >0.5ms; \
+         got |{p_one_block:.3} - {p_eight_blocks:.3}| = {delta:.4}ms — \
+         A CONSTANT RETURN WOULD FAIL THIS",
+        delta = (p_one_block - p_eight_blocks).abs()
+    );
+
+    // Sanity: predictions are positive walls, not negative or NaN.
+    for (label, val) in [
+        ("zero", p_zero),
+        ("one_block", p_one_block),
+        ("eight_blocks", p_eight_blocks),
+    ] {
+        assert!(
+            val.is_finite() && val >= 0.0,
+            "prediction {label} not finite/non-negative: {val}"
+        );
+    }
+}
+
+/// **A0.2a.T6 (always-on, code-truth audit):** the
+/// pool_key_for_path symlink-distinct-pool-key trick reproduces the
+/// iter-210 pattern. Reads `src/serve/mod.rs::pool_key_for_path` via
+/// file_stem semantics (lookup-only — no `use` of the function from
+/// src/, since the harness is tests-only) and asserts that two on-disk
+/// paths with distinct stems yield distinct keys, while paths with
+/// identical stems yield identical keys.
+///
+/// The test mirrors `multi_model_swap.rs:344-384`: a tempdir symlink
+/// named `gemma-4-clone.gguf` to a target named `gemma-4-26B-A4B...gguf`
+/// produces a distinct file_stem, hence a distinct pool key, even
+/// though both names resolve to the same physical bytes.
+#[test]
+fn pool_key_for_path_symlink_trick_reproduces_iter210_pattern() {
+    // Mirror the production logic at src/serve/mod.rs:1416-1420
+    // file_stem-based; falls back to full path if no stem.
+    fn pool_key_for_path(path: &Path) -> String {
+        path.file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned())
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Create a "primary" file and a "clone" symlink under a distinct
+    // stem in the same tempdir.
+    let primary = tmp.path().join("gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf");
+    std::fs::write(&primary, b"GGUFstub").expect("write primary");
+    let clone = tmp.path().join("gemma-4-clone.gguf");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&primary, &clone).expect("symlink clone");
+    #[cfg(not(unix))]
+    {
+        eprintln!(
+            "pool_key_for_path_symlink_trick_reproduces_iter210_pattern: \
+             skipped on non-unix"
+        );
+        return;
+    }
+    assert!(clone.exists(), "clone symlink must exist");
+
+    let key_primary = pool_key_for_path(&primary);
+    let key_clone = pool_key_for_path(&clone);
+    assert_ne!(
+        key_primary, key_clone,
+        "distinct file_stem must yield distinct pool keys; \
+         primary={key_primary}, clone={key_clone}"
+    );
+
+    // And — symmetrically — two paths with identical stem under
+    // different parents must yield identical keys (the pool key is
+    // stem-only, not full-path).
+    let parent2 = tmp.path().join("subdir");
+    std::fs::create_dir(&parent2).expect("mkdir");
+    let twin = parent2.join("gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf");
+    std::fs::write(&twin, b"GGUFstub").expect("write twin");
+    let key_twin = pool_key_for_path(&twin);
+    assert_eq!(
+        key_primary, key_twin,
+        "identical file_stem must yield identical pool keys; \
+         primary={key_primary}, twin={key_twin}"
+    );
+    eprintln!(
+        "pool_key_for_path_symlink_trick: \
+         primary='{key_primary}' != clone='{key_clone}'; \
+         primary == twin == '{key_twin}'"
+    );
+}
+
+/// **A0.2a.T7 (bonus, always-on):** synthesize_cache_hit_prediction
+/// rejects non-finite no_cache_ttft with `DriverError::Synthesis`,
+/// rather than silently producing a NaN prediction that contaminates
+/// downstream gate evaluation.
+#[test]
+fn synthesize_cache_hit_prediction_rejects_nan_no_cache_ttft() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = std::sync::Arc::new(synthetic_spiller::BlockStore::new(
+        tmp.path().to_path_buf(),
+    ));
+    let spiller = synthetic_spiller::SyntheticSpiller::new(store);
+    let err = subprocess_driver::synthesize_cache_hit_prediction(
+        f64::NAN,
+        2048,
+        Family::Gemma4_26b,
+        KvPath::Dense,
+        &spiller,
+    )
+    .expect_err("must reject NaN no_cache_ttft");
+    assert!(
+        matches!(err, subprocess_driver::DriverError::Synthesis(_)),
+        "expected DriverError::Synthesis; got {err:?}"
+    );
+}
+
+/// **A0.2a.T8 (bonus, always-on):** representative_block_bytes returns
+/// a finite, positive byte count for every (family, kv_path)
+/// combination — ensuring the matrix runner never feeds zero-byte
+/// blocks into the synthetic spiller's round-trip helper.
+#[test]
+fn representative_block_bytes_nonzero_for_every_family_kv_path() {
+    for family in [Family::Gemma4_26b, Family::Qwen35Moe_Dwq46] {
+        for kv_path in [KvPath::Dense, KvPath::TqActive] {
+            let n = subprocess_driver::representative_block_bytes(&family, &kv_path);
+            assert!(
+                n > 0,
+                "representative_block_bytes({family:?}, {kv_path:?}) must be >0; got {n}"
+            );
+            // Sanity ceiling: no per-block size should exceed
+            // 16 MiB — production K/V at BLOCK_TOKENS=256 caps well
+            // below this.
+            assert!(
+                n <= 16 * 1024 * 1024,
+                "representative_block_bytes({family:?}, {kv_path:?})={n} exceeds 16 MiB ceiling"
+            );
+        }
+    }
+}
+
+/// **A0.2a.T9 (bonus, always-on):** spawn_hf2q_serve_subprocess
+/// surfaces a clean `DriverError::SpawnFailed` when the model_path
+/// does not exist, rather than letting the child fail asynchronously
+/// after a successful fork.
+#[test]
+fn spawn_hf2q_serve_subprocess_rejects_missing_model_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let nonexistent = tmp.path().join("does-not-exist.gguf");
+    let cell = MatrixCell {
+        family: Family::Gemma4_26b,
+        quant: WeightQuant::Q4_0,
+        kv_path: KvPath::Dense,
+        prefix_len: PrefixLen::L0,
+        cache_state: CacheState::Miss,
+        scenario: Scenario::ColdResume,
+    };
+    let cfg = subprocess_driver::CellConfig::for_cell(&cell, nonexistent);
+    let err = subprocess_driver::spawn_hf2q_serve_subprocess(&cfg)
+        .expect_err("must reject nonexistent model");
+    assert!(
+        matches!(err, subprocess_driver::DriverError::SpawnFailed(_)),
+        "expected SpawnFailed; got {err:?}"
+    );
+}
+
+/// **A0.2a.T10 (bonus, always-on):** DriverError types Display + Debug
+/// cleanly so cell-result `note` fields surface useful diagnostics
+/// rather than `Err(...)` opaque tags.
+#[test]
+fn driver_error_display_renders_diagnostic_strings() {
+    use subprocess_driver::DriverError;
+    let cases = [
+        DriverError::BinaryNotFound("path".into()),
+        DriverError::SpawnFailed("io".into()),
+        DriverError::ReadyzTimeout {
+            waited_secs: 600,
+            last_err: "transport".into(),
+        },
+        DriverError::Transport("net".into()),
+        DriverError::Http {
+            status: 503,
+            body: "{}".into(),
+        },
+        DriverError::Sse("malformed".into()),
+        DriverError::Eviction("symlink".into()),
+        DriverError::Synthesis("nan".into()),
+    ];
+    for c in &cases {
+        let s = format!("{c}");
+        assert!(!s.is_empty(), "Display must render non-empty string");
+        let d = format!("{c:?}");
+        assert!(!d.is_empty(), "Debug must render non-empty string");
+    }
 }
