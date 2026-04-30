@@ -572,6 +572,51 @@ Per the mantra: "No fallback. No stub (todo later) code." If a kill-gate fires, 
 
 **Total: ~4,400 src + ~4,000 test LOC across 16 iters.** Estimated 24–35 man-days at current iter cadence. Sequencing: A0 strictly first; A.1–A.3 sequential; B-dense / B-tq / B-hybrid parallel-where-possible (each rides its own dependency tree); C / D sequential after every B-* GREEN.
 
+### Phase A0.1 LANDED (2026-04-30)
+
+**Status:** Substrate complete on `cfa/adr017-a01/claude` worktree; pending dual-mode queen merge against the Codex parallel impl.
+
+**Commits:**
+- `092ca83` — `test(adr-017 a0.1): synthetic spiller fixture + 13 unit tests`
+- `affb4dd` — `test(adr-017 a0.1): falsification harness substrate + 8 smoke tests`
+
+**LOC shipped (test-only; zero src/ mutation per spec):**
+
+| File | LOC | Role |
+|---|---|---|
+| `tests/fixtures/synthetic_spiller.rs` | 1,413 | `BlockStore` (atomic safetensors writer mirroring `paged_ssd_cache.py:246-297` byte-for-byte), `ModelFingerprint` + `BlockHash` chain-hash per §D4, forward-compat `MockKvSpiller<E>` trait, 13 unit tests. |
+| `tests/kv_persist_harness.rs` | 1,121 | Six-axis matrix generator, `is_runnable_today` filter, `run_cell` runner against the synthetic fixture, ship/coherence/decode/overhead gate assertions, `pre_bench_process_audit_or_panic` (`feedback_bench_process_audit`), markdown results writer, 8 smoke tests + the env-gated `kv_persist_matrix_e2e` body. |
+| **Total** | **2,534** | Substrate exceeds the spec's ~600+~400 estimate by ~1,500 LOC; the surplus is mantra discipline (no `// TODO`, full doc citations, every helper exposed for A0.2 reuse). |
+
+**Test count delta:**
+- New tests: **22** (`cargo test --release --test kv_persist_harness -- --test-threads=1` reports `22 passed; 0 failed; 0 ignored`).
+  - 8 always-on smoke tests (binary locator, matrix cardinality, pre-bench audit body, `run_cell` short/long, results writer, forward-compat trait round-trip, gated `kv_persist_matrix_e2e` body skips cleanly without the env var).
+  - 13 in-binary unit tests under `mod synthetic_spiller` (safetensors envelope byte-compat, atomic rename success + interrupted, header truncation / version-mismatch / body-hash-mismatch quarantine, restart recovery O(1) lookup at 100 blocks, partial-write elision after `kill -9`, advisory-lock contention semantics, LRU eviction at budget boundary, oversized-block refusal, chain-hash determinism across recompute, fingerprint stability across restart).
+  - 1 env-gated matrix body (`HF2Q_KV_PERSIST_E2E=1`) that A0.2 will exercise for real measurements on M5 Max.
+
+**Mechanical exit codes (worktree HEAD):**
+
+| Command | Exit |
+|---|---|
+| `cargo build --release` | **0** (release profile, no new-code warnings after `non_camel_case_types` allow on the on-disk-name-mirroring enums) |
+| `cargo test --release --test kv_persist_harness -- --test-threads=1` | **0** (22/22 PASS in 1.19 s) |
+| `cargo test --release --test kv_persist_harness synthetic_spiller -- --test-threads=1` | **0** (14/14 PASS — the 13 fixture units + the 1 trait round-trip) |
+| `grep -rn '^[[:space:]]*// TODO' tests/kv_persist_harness.rs tests/fixtures/synthetic_spiller.rs` | **1** (no hits — discipline holds) |
+
+**Open questions deferred to A0.2:**
+
+1. **Real subprocess TTFT measurement** — A0.1 substrate populates the `CellResult` perf fields with `f64::NAN` placeholders against the synthetic-fixture path. A0.2 extends `run_cell` to spawn `hf2q serve --model <gguf>` per the iter-210 `multi_model_swap.rs:131-148` `ServerGuard` pattern, drives `/v1/chat/completions` with a known prefix, records TTFT, then forces an LRU evict via the symlink-as-distinct-pool-key trick. Target: A0.2 lands ≤2 man-days after A0.1 close. Answer-by: 2026-05-02.
+2. **OQ-2 / OQ-3 measurements still pending** — `mlx-native::metal_blit_block` vs `StorageModeShared` CPU memcpy decision (OQ-2 in §Open Questions) and hot-tier RAM cache default (OQ-3) are A0.2 deliverables. The harness shape is unchanged; only the cell runner body wires the production K/V tensor extraction. Answer-by: 2026-05-02.
+3. **Qwen3.5-MoE matrix population** — `is_runnable_today()` returns false for every Qwen3.5 cell pending ADR-013 unblock. When ADR-013 lands the qwen35 serve-side load, the filter flips and A0.2/A0.3 populate the hybrid cells without a harness change. Answer-by: tracked against ADR-013 closure date.
+4. **TQ-active matrix population** — `is_runnable_today()` returns false for `KvPath::TqActive` pending ADR-007 codec stable. A0.3 populates these cells once the TQ codec is locked. Answer-by: tracked against ADR-007 codec freeze.
+
+**Discipline notes (A0.1):**
+- Zero `src/` edits — A0.1 is purely tests-only per spec.
+- Zero `// TODO` markers — the forward-compat `MockKvSpiller<E>` trait is documented as a swap-target for ADR-005 Phase 4 iter-212's `KvSpiller<E>`, not a stub.
+- ADR-005 Phase 4 fence respected: no edits to `src/serve/multi_model.rs`, `src/serve/api/`, `src/serve/cache.rs`, `src/serve/provenance.rs`, `src/serve/mod.rs`.
+- `man-day` used throughout; `person-day` does not appear (Robert directive 2026-04-30).
+- Pre-bench process audit is baked into `kv_persist_matrix_e2e` and surfaced as its own smoke test so the audit body executes on every default `cargo test` run, even when the matrix gate is OFF.
+
 ---
 
 ## Open Questions
