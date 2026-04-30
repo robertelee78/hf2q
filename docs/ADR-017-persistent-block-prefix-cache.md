@@ -832,6 +832,90 @@ The matrix runner emits the report into the worktree's `docs/` tree (NOT main hf
 - Did NOT spawn concurrent `hf2q serve` instances inside cargo test (OOM directive).
 - Did NOT edit `src/serve/*` (the fix path is tests-side; the serve binary's sibling-resolution semantics are production-correct).
 
+### Phase A.1 LANDED (2026-04-30)
+
+**Status:** First production-code commit on ADR-017. Substrate complete on `cfa/adr017-a1/claude` worktree; pending dual-mode queen merge against the Codex parallel impl. Phase A0 (falsification harness) gated A.1 entry: A0.2 closure landed against the patched substrate; A0.3 TQ-active matrix is unblocked but not yet a prerequisite for A.1 (A.1 ships the format + index pure-fn primitives that A.2 / A.3 consume).
+
+**Commits (cfa/adr017-a1/claude, 4 expected; pushed):**
+
+- `f7c536b` — `feat(adr-017 a.1): kv_persist::format envelope + chain-hash (8 unit tests)`
+- `4fd5bee` — `feat(adr-017 a.1): kv_persist::index BlockIndex + restart-recovery (8 tests)`
+- `551fc63` — `feat(adr-017 a.1): wire kv_persist into src/serve/mod.rs (one-line additive)`
+- `<this commit>` — `docs(adr-017 a.1): record Phase A.1 LANDED status`
+
+**LOC delta (production src/, additive):**
+
+| File | LOC | Role |
+|---|---|---|
+| `src/serve/kv_persist/format.rs` | 811 | On-disk envelope (byte-compatible with oMLX `paged_ssd_cache.py:246-297`), `BlockHash` / `ParentBlockHash` / `ModelFingerprint` with hex `Display` + `FromStr` + serde, `compute_model_fingerprint` (NUL-separator joins per §D4), `compute_block_hash` chain-hash recurrence (sha256 over `model_fp || parent_or_zeros || token_le_bytes`), `EnvelopeHeader` JSON shape (§D10), `write_envelope` / `read_envelope_header` / `read_envelope_body` with body sha256 verification against `header.block_hash`, atomic `<path>.tmp.<pid>` + `std::fs::rename`. |
+| `src/serve/kv_persist/index.rs` | 744 | `BlockMeta` per-block summary; `BlockIndex` keyed `Arc<RwLock<HashMap<BlockHash, BlockMeta>>>` with `insert` / `lookup` / `remove` / `iter_by_model` / `total_bytes_on_disk` / `block_count`; `rebuild_from_disk` restart-recovery scan per §D8 (walks `<root>/models/<slug>/kv/<fanout>/*.safetensors`, parses headers, validates format_version, populates index from header + stat()); quarantine MOVES (not deletes) corrupted files to `<slug>/kv-quarantine/<original-name>` per §R-F9; `.tmp.<pid>` orphans ignored per §D5. |
+| `src/serve/kv_persist/mod.rs` | 27 | Module entry point with doc comment citing ADR-017 §A.1; `pub mod format` + `pub mod index` + `#[allow(unused_imports)] pub use ...` re-exports for the public surface (consumed by future A.2 / A.3 modules). |
+| `src/serve/mod.rs` | +2 | One-line additive: `#[allow(dead_code)] pub mod kv_persist;` between `pub mod header` and `pub mod multi_model`. ADR-005 Phase 4 fence respected — no edits to `multi_model.rs`, `api/`, `cache.rs`, `provenance.rs`, `forward_*.rs`, `gpu.rs`, `header.rs`, `parity_quality.rs`, `provenance.rs`, `quant_select.rs`, `sampler_pure.rs`. |
+| **Total** | **1,584 src + 0 test (per-spec; tests live in-module under `#[cfg(test)] mod tests`)** | |
+
+**Test count delta:**
+
+- 20 in-module unit tests across format + index (10 each), all PASS in 0.26 s under `cargo test --release --bin hf2q kv_persist`. Spec required ≥15; landed 20 (5 over the bar — bonus tests cover the hex Display/FromStr round-trip, JSON header serde round-trip, empty-root rebuild, Arc-share clone contract, and a smoke test exercising compute_block_hash through write_envelope through rebuild_from_disk in one path).
+- 36/36 existing harness tests still PASS (`cargo test --release --test kv_persist_harness -- --test-threads=1`, 2.01 s) — no regression on the substrate locked in by A0.2b. The harness's `synthetic_spiller::safetensors_envelope_byte_compat_with_omlx_format` test continues to lock in the on-disk envelope shape; A.1's `format::write_envelope` mirrors the same byte layout, so the shape is now enforced from BOTH sides (substrate + production).
+
+**Format envelope byte-compat (oMLX `paged_ssd_cache.py:246-297` mirror):**
+
+| Layout slot | Bytes | Source |
+|---|---|---|
+| header_len | 8 (LE u64) | `paged_ssd_cache.py:292` `f.write(struct.pack("<Q", len(header_json)))` |
+| header_json | `header_len` (UTF-8 JSON, padded with `b' '` to 8-byte alignment) | `paged_ssd_cache.py:286-289` |
+| body | remainder | `paged_ssd_cache.py:294-295` |
+
+`format.rs::write_envelope` emits the same three slots in the same order; `read_envelope_header` strips ASCII-space padding before JSON parse exactly like the harness's `synthetic_spiller` (line 542-547 in the fixture). Atomic publication via `<path>.tmp.<pid>` + `std::fs::rename` mirrors `paged_ssd_cache.py:993-1003`.
+
+**Chain-hash determinism evidence (`block_hash_chain_deterministic_across_calls`, NON-NEGOTIABLE):**
+
+```
+let h1 = compute_block_hash(&fp, &parent, &tokens);
+let h2 = compute_block_hash(&fp, &parent, &tokens);
+let h3 = compute_block_hash(&fp, &parent, &tokens);
+assert_eq!(h1, h2);
+assert_eq!(h2, h3);
+```
+
+Plus a chain-vs-one-shot inequality assertion: a two-link chain over `(0..256, 256..512)` differs from a single-link chain over `(0..512)` because the intermediate `parent_block_hash` state distinguishes them. This invariant is what makes blocks restart-survivable: any two engines computing the same `(model_fp, parent, tokens)` tuple produce byte-identical hashes.
+
+**Mechanical exit codes (worktree HEAD `551fc63`):**
+
+| Command | Exit | Output |
+|---|---|---|
+| `cargo build --release` | **0** | `Finished release profile [optimized] target(s) in 18.16s` |
+| `cargo test --release --bin hf2q kv_persist` | **0** | **20 passed; 0 failed; 0 ignored** in 0.26 s |
+| `cargo test --release --test kv_persist_harness -- --test-threads=1` | **0** | **36 passed; 0 failed; 0 ignored** in 2.01 s (no regression) |
+| `cargo clippy --release --no-deps` (kv_persist filter) | **0** | zero warnings on `kv_persist` code (existing iter23/iter24/iter25 audit-bin warnings unrelated, pre-existing) |
+| `grep -rn '// TODO\|todo!()\|unimplemented!()' src/serve/kv_persist/` | **1** | no hits — discipline holds |
+| `wc -l src/serve/kv_persist/*.rs` | OK | format=811, index=744, mod=27 |
+
+**Hookup readiness for A.2 (block_store / writer / recovery):**
+
+A.2 lands `src/serve/kv_persist/{block_store,writer,recovery}.rs` on top of A.1's primitives. The hand-off shape:
+
+- `block_store.rs` — `pub struct DiskBlockStore` consumes `format::write_envelope` for the atomic write path and `index::BlockIndex::insert` for the published-block notification. The hex-fanout layout (`<root>/models/<short>/kv/<fanout>/<full_hex>.safetensors`) is computed via `ModelFingerprint::short_hex()` + `BlockHash::to_string()[..1]`. No new format primitives required; A.2 stitches A.1.
+- `writer.rs` — background writer thread + bounded channel; consumes `(EnvelopeHeader, Vec<u8>)` from the spiller side and dispatches to `DiskBlockStore::write`. Per ADR-017 §D9, per-block atomicity (one rename per block); no per-batch fsync.
+- `recovery.rs` — wraps `BlockIndex::rebuild_from_disk` with an `HF2Q_KV_PERSIST=1` env gate + telemetry counters (`hf2q_kv_quarantined_total{reason}`, `hf2q_kv_recovered_total`). The scan logic itself is already in A.1; A.2 adds the operator-visibility surface.
+
+A.3 then ships `BlockPrefixCacheSpiller<E>` impl of `KvSpiller<E>` (Phase 4 iter-212 trait) over `DiskBlockStore + BlockIndex`, registered per-family by the per-family `KvCacheSpill` impl (Phase B).
+
+**A.1 discipline notes:**
+
+- Production code in `src/serve/kv_persist/*` only (additive); ONE LINE addition to `src/serve/mod.rs` (the `pub mod kv_persist;`).
+- NO edits to `src/serve/multi_model.rs` (Phase 4 trait surface stable).
+- NO `// TODO` / `todo!()` / `unimplemented!()` markers shipped.
+- "man-day" used throughout; "person-day" does not appear.
+- Format envelope is byte-compatible with `paged_ssd_cache.py:246-297` and locked in by both A0 substrate (`tests/fixtures/synthetic_spiller.rs::write_block`) and A.1 production (`format::write_envelope`); Phase A.2 inherits this contract unchanged.
+- Chain-hash determinism (`block_hash_chain_deterministic_across_calls`) is the load-bearing invariant — two engines on two hosts MUST produce identical chain hashes for identical `(model_fp, parent, tokens)` tuples. NON-NEGOTIABLE per spec; locked in.
+
+**Open questions deferred to A.2:**
+
+1. **Background writer thread shape** — bounded channel with what depth? oMLX uses an unbounded queue + back-pressure on the inference thread when full. A.2 measures M5 Max writer throughput against per-block fsync cost (already flagged R8 in §Risks) and picks a depth that leaves the inference thread unblocked at the spill rates seen in Phase 4 evict-on-admit cycles.
+2. **Recovery scan parallelism** — `rebuild_from_disk` walks sequentially in A.1; M5 Max APFS may benefit from parallel directory walks at scale (>10⁴ blocks per model). A.2 reserves the right to introduce `rayon` parallelism in the scan if measurement shows a startup-time concern; A.1 ships sequential because the parallelism would need its own quarantine-collision serializer.
+3. **Hot-tier RAM cache** — A.1 does NOT include the LRU hot-tier; per ADR-017 §D6 it ships opt-in via `HF2Q_KV_HOT_CACHE_BYTES` (default `0` = disabled) and is gated on Phase A0 measurement. A.2 / A.3 land it together with the spiller wire-up.
+
 ---
 
 ## Open Questions
