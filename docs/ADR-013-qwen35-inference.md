@@ -1059,6 +1059,24 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-05-01 — Q4_K MoE expert-quant unblocked dwq48 GGUF (CFA dual: claude winner)
+
+**Problem.** `qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq48.gguf` failed at load with `load_moe_ffn_quantized layer 0: gate/up expert weights have unsupported quant type Q4_K`. mlx-native lacked Q4_K Metal kernels (Q4_K was registered in `GgmlType` enum + had a host-side `dequantize_q4_k` for one-time F32 dequant, but the MoE expert hot path needs GPU mat-vec-id which was `"unsupported"` in the dispatcher).
+
+**mlx-native (`54bc6b3`).** Two new Metal kernels in the `quantized_matmul_*ggml.metal` shader files:
+- `kernel_mul_mv_id_q4_K_f32` — MoE expert-routed mat-vec, mirrors the existing Q5_K mv_id kernel minus the `qh[QK_K/8]=32` byte high-bit array (Q4_K = Q5_K minus the 5th bit). Same `kmask1=0x3f3f / kmask2=0x0f0f / kmask3=0xc0c0` 6-bit scale-decode machinery, same NSG=2 / sgs=32 / 2-rows-per-tg dispatch geometry as Q5_K and Q6_K.
+- `kernel_mul_mv_q4_K_f32` — dense (non-id) variant for the dense Q4_K path (not exercised by dwq48 but added for completeness).
+- Dispatch wired in `src/ops/quantized_matmul_id_ggml.rs` + `src/ops/quantized_matmul_ggml.rs`. Q4_K excluded from `mm_id` route (mm_id not yet ported; falls through to `mv_id` even at prefill batch > 8). Both kernels registered in `src/kernel_registry.rs` (CRITICAL — Codex CFA partner shipped the `.metal` source but missed the registry insert; their tests failed `KernelNotFound("kernel_mul_mv_q4_K_f32")` while Claude's 12/12 passed).
+- 12 unit tests (`tests/test_q4_k_kernels.rs`): 4 dequant/encoding round-trips + 4 dense mat-vec sizes (2×256, 8×256, 4×512, **64×1024 production shape**) + 4 mat-vec-id top_k variants (1×4 top1, 1×8 top8, 4×8 top2, 8×16 top4). All PASS in main mlx-native (`RUSTC_WRAPPER= cargo test --release --test test_q4_k_kernels` 2026-05-01).
+
+**hf2q (`8bade13`).** Whitelist `Q4_K` in `load_moe_ffn_quantized` at `src/inference/models/qwen35/weight_loader.rs:1047` (4-line edit + error-message strings). Pure gating change — the actual GPU compute is the new mlx-native kernel.
+
+**End-gate.** `./target/release/hf2q generate --model …dwq48.gguf --prompt "How to make bread?" --max-tokens 200` produces fully coherent English: opens with a `<think>` reasoning block, then a structured Basic White Bread Recipe with proper ingredient list. Prefill 31 tok in 3.5s (9 t/s); decode 200 tok in 1.90s (105 t/s); peak 21.1 GB. **Coherence depended on the parallel `70b31d3` tokenizer fix (`fix(adr-013 coherence): API engine_qwen35 — GGUF-driven tokenizer`)** — without that fix the dwq48 model produced a degenerate `"How to make bread?"` echo loop because the HF-fallback tokenizer was emitting OOB-special-tokens. Q4_K kernels alone weren't sufficient; Q4_K kernels + GGUF-driven tokenizer compose to give correct end-to-end inference.
+
+**H4 falsification artifact (`tests/test_q4_k_h4_real_block_parity.rs` on `cfa/adr013-q4k-h4-diagnose`).** While diagnosing the gibberish, wrote a parity test embedding a real 144-byte Q4_K block from `blk.0.ffn_gate_exps.weight` expert 0 of the dwq48 GGUF, decoded it via BOTH the test-file's `cpu_dequant_q4k_block` (Claude's oracle for the 12 unit tests) AND the canonical `dequantize_q4_k` from `src/gguf/mod.rs:582`. Result: 0 indices differ, max_err = 0.0 — the synthetic encoder/decoder pair is bit-exactly canonical-compatible, the unit tests were not decorative. This pre-empted a deep kernel-bug rabbit-hole and surfaced the tokenizer as the actual cause.
+
+**Bench vs llama.cpp.** TBD this date — see follow-up entry.
+
 ### 2026-04-30 — chat-template contamination of sourdough gate closed by ADR-012 auto-inject
 
 **Cross-link.** ADR-012 added a convert-time `tokenizer.chat_template` auto-inject path (see ADR-012 progress-log entry "2026-04-30 — chat-template auto-inject"). Until now the runtime priority chain at `src/serve/mod.rs::render_chat_template` fell through to `FALLBACK_GEMMA4_CHAT_TEMPLATE` whenever the GGUF lacked an embedded `tokenizer.chat_template` — and 4 of 5 Qwen3.6 abliterated GGUFs on disk hit that path because the source HF `tokenizer_config.json` shipped no `chat_template` field. Gemma4 control tokens then flowed into Qwen3.6 → degenerate output → the sourdough byte-parity gate failed on small prompts even though chunk-path correctness (the iter58b-fix focus, this same date) was intact.
