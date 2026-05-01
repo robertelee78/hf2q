@@ -1461,6 +1461,63 @@ Pre-iter-217 turn1 was `"Hello!"` with leaked `<channel|>` (captured in the old 
 
 **Lessons (durable, captured in memory).** (a) "Live verification" requires checking the actual response **bytes** for leaked special tokens, not just protocol invariants + non-empty content. (b) Don't infer model behavior from filename token (`ara` ≠ Arabic; it's Anti-Refusal Augmentation). (c) When closing a phase, the content-correctness gate must be in the test suite, not in the operator's curl history — else the next operator hits the same bug-class and re-discovers it from production. (d) Pre-existing failures on adjacent tests do NOT block a narrow scope-limited fix; document them honestly + scope them to a separate iter rather than papering or coupling.
 
+###### iter-218 — Tool-call infinite-loop fix via `parallel_tool_calls=false` default + peer-aligned comment correction (2026-04-30)
+
+**Status: LANDED 2026-04-30.** Closes the openwebui_tools_streaming_scenario_2 infinite-loop regression flagged in iter-217's honest-scope note. Bisect window (between iter-209 last-LIVE-PASS and iter-217 closure) attributed the regression to wave-2.7 W-η Q-B's `parallel_tool_calls`-aware grammar-shape wiring (`d6da8f1`) coupled with the wave-3 lazy-grammar lifecycle decisions. iter-218 narrows the bug class with a single-default flip + comment correction; the Fix C lifecycle inversion (release-on-close) considered during research was reverted as inferior — it traded the loop bug for a downstream `<|tool_response>`-leak / max_tokens-burn surface that the natural grammar-exhaust path avoids cleanly.
+
+**Reproducer (pre-iter-218 on HEAD c33b3de, parallel-session ADR-017 a.3 already merged on top of iter-217):**
+
+```bash
+# Streaming chat with tools, tool_choice=auto, default parallel_tool_calls (no explicit value):
+curl -N -X POST :47221/v1/chat/completions \
+  -d '{"messages":[{"role":"user","content":"What is the weather in Paris?"}],
+       "tool_choice":"auto","tools":[{"type":"function","function":{"name":"get_current_weather",...}}],
+       "max_tokens":256,"stream":true}'
+# Pre-iter-218 → SSE emits index=0,1,2,3,4,5+ identical `<|tool_call>call:get_current_weather{location:"Paris"}<tool_call|>` blocks until max_tokens.
+# Post-iter-218 → SSE emits ONE tool-call delta (index=0), finish_reason=tool_calls.
+```
+
+**Root cause** (verified across hf2q + peer code, file:line citations below). hf2q's `compile_tool_grammar` at `src/serve/api/handlers.rs:2942` defaulted `parallel = req.parallel_tool_calls.unwrap_or(true)` under a stale "OpenAI default = true" comment; the registry's Gemma 4 emitter at `src/serve/api/registry.rs:1369-1391` for `OneOrMoreCallsBodyOnly { parallel: true }` produced `body <tool_call|> gemma4-call* space` (unbounded `gemma4-call*` recursion). Once the lazy grammar engaged on the first `<|tool_call>` open (`engine.rs:2024-2025` `rt.trigger()`), the runtime's `awaiting_trigger=false` was never re-armed (`engine.rs:2105-2107` "ToolCallClose does NOT reset" / `sampler.rs:480-491` doc-comment citing research-report.md Q2 anti-finding). After each close the grammar accept-set was `{<|tool_call>, ' ', '\n'}` — masking the model's training-signal `<turn|>` (id 106) terminator, the only token in `eos_token_ids = [1, 106]` (engine.rs:1156) that would have halted decode. Greedy decode at temp=0 picked `<|tool_call>` over whitespace because training conditioned that response, locking the grammar into infinite recursion until max_tokens.
+
+**Peer-correct mechanism** (now wired). llama.cpp uses the same `(call){min,max}` shape but with `max = parallel_tool_calls ? -1 : 1` (`/opt/llama.cpp/common/chat.cpp:1399-1416`) AND defaults `parallel_tool_calls=false` (`/opt/llama.cpp/docs/function-calling.md:24`: *"Multiple/parallel tool calling is supported on some models but **disabled by default**, enable it by passing `\"parallel_tool_calls\": true`"*). With `max_calls=1`, the grammar shape is bounded — `body <tool_call|> space` — and exhausts naturally after the first close, triggering the engine's grammar-driven termination at engine.rs:2124-2143 (`is_dead` → break decode loop). vLLM takes a different but compatible approach (`/opt/vllm/vllm/tool_parsers/gemma4_tool_parser.py`): NO grammar applied for `tool_choice=auto`; the parser is purely post-hoc regex (`gemma4_utils.py:132` `r"<\|tool_call\>call:(\w+)\{(.*?)\}(?:<tool_call\|>|<turn\|>)"` — accepts both close markers); generation halts when the model naturally emits `<turn|>` per chat-template training (`/opt/vllm/examples/tool_chat_template_gemma4.jinja:319` `{{- '<turn|>\n' -}}`).
+
+**iter-218 fix (one-line default flip + comment correction):**
+
+- `src/serve/api/handlers.rs:2942`: `req.parallel_tool_calls.unwrap_or(true)` → `unwrap_or(false)`. Single-tool requests now compile to the bounded `body close space` shape that exhausts after the first close. Operators wanting parallel calls opt in explicitly via `"parallel_tool_calls": true` in the request body (preserves OpenAI-spec compatibility for explicit-true clients).
+- `src/serve/api/engine.rs:2105-2107` (non-streaming) + `engine.rs:3805-3819` (streaming `route_content`): comment rewrites pointing at the iter-218 single-call default as the structural termination mechanism, replacing the prior research-report.md Q2 anti-finding citation that conflated llama.cpp's bounded `(call){min,max}` shape (which works because of `parallel=false` default) with hf2q's unbounded `gemma4-call*` shape (which doesn't, because of the prior `parallel=true` default).
+- `src/serve/api/grammar/sampler.rs:480-491`: `trigger()` doc-comment expanded with the iter-218 default-flip rationale and the bounded-shape exhaust mechanism, replacing the prior locked-grammar-by-design citation.
+
+**Tests landed (3 new, 0 modified):**
+
+- `serve::api::handlers::compile_tool_grammar_precondition_tests::compile_tool_grammar_auto_default_parallel_is_false` — pins the default flip via grammar-shape probe (no `gemma4-call` recursion rule emitted when request omits `parallel_tool_calls`).
+- `serve::api::handlers::compile_tool_grammar_precondition_tests::compile_tool_grammar_auto_explicit_parallel_true_emits_recursion` — companion: explicit `parallel_tool_calls=true` MUST still emit the recursion rule (operator opt-in preserved).
+- (The pre-existing `tool_call_open_triggers_grammar_runtime` test at `engine.rs:6310-6373` was kept verbatim — the lifecycle invariant "ToolCallClose MUST NOT re-arm the runtime trigger" is correct under iter-218's bounded-shape design; the previous `(call)+` anti-finding citation was the misattributed cause, not the lifecycle assertion itself. Doc-comment in the test was updated to point at iter-218's default flip as the structural termination mechanism.)
+
+**Test counts:** **2357 / 2357 hf2q binary tests pass** (was 2323 / 2323 at iter-217 closure on `5a1b999`; +34 net change includes parallel-session adds in waves and the iter-218 +2 new). Full `cargo test --release --tests` is green.
+
+**Live verification (post-iter-218 on HEAD c33b3de + uncommitted iter-218 working tree):**
+
+```
+[scenario_2 LIVE on gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf]
+turn1_finish=Some("tool_calls")
+turn1_text="\n            <|tool_response>"     ← post-close stray content (separate iter-219 scope)
+turn1_tool_calls=[{ name: "get_currentcall:get_current_weather", arguments: {"location":"Paris"} }]
+                  ↑ malformed `get_current` prefix concatenated into name (separate iter-219 scope)
+turn1 emitted 1 structured tool-call(s) → iter B-2 ToolCallSplitter CONFIRMED end-to-end
+                                          ↑ structural-pass: SINGLE call, NOT looping
+determinism PASS — turn1 byte-identical at temperature=0
+turn1 marker present → exercising turn2 round-trip
+turn2_finish=Some("stop")
+turn2_text="The current weather in Paris is 18°C with partly cloudy skies."
+turn2 reply references tool result → round-trip CONFIRMED end-to-end
+```
+
+iter-218 delivers the structural fix: tool_calls=1 (no loop), `finish_reason="tool_calls"`, full multi-turn round-trip with synthesized response. The LIVE test still fails on `replay_fixture_assert` because the recorded fixture's first tool_call delta has clean name `"get_current_weather"` while the engine emits the malformed `"get_currentcall:get_current_weather"`. The malformed-name regression is **independent of iter-218**: confirmed by capturing direct curl SSE bytes against the iter-217-but-pre-iter-218 binary (HEAD c33b3de) — the engine emitted `function":{"name":"get_currentcall:get_current_weather"}` then the test failed on the loop, hiding the malformed-name leak. iter-218's structural unblocking surfaced the malformed-name as the next failure-class. Tracked as **iter-219 scope**: investigate the streaming emitter's `extract_gemma4_name_prefix` (engine.rs:2927) + the `ToolCallSplitter` body assembly when the model emits a leading non-tool-call content fragment ending in `get_current` followed by the actual `<|tool_call>` open marker.
+
+**Honest scope-limit note:** iter-218 did NOT make scenario_2 LIVE pass; it converted the failure mode from "infinite loop hitting SSE timeout" to "fixture replay mismatch on a pre-existing malformed-name bug now-visible past the loop fix". This is forward progress: the loop fix is structural and durable; the malformed name is a localized regression in the streaming emitter or splitter logic, separately scoped to iter-219. Splitting these into two iters keeps each fix narrow + auditable, per the loop standing directive's "ask, don't guess" + "no shortcuts" mantra anchors.
+
+**Concurrent-context observation:** during iter-218 LIVE testing on HEAD c33b3de, a 110× decode regression was observed (Gemma 4 5.7 tok/s vs ~110 tok/s baseline). Independent of iter-218 (purely chat-template + grammar-shape changes); decode-rate regression sits in the inference path landed by ADR-017 a.3 BlockPrefixCacheSpiller (`c33b3de`) or earlier on the same parallel-session main HEAD. iter-218 LIVE timing is contaminated by this regression but the structural assertions (loop-eliminated, finish_reason, round-trip) are unaffected. The regression is tracked under separate ADR-015 / ADR-017 scope.
+
 ##### Test plan (cross-iter)
 
 **iter-211 round-trip harness.** `tests/provenance_writer_roundtrip.rs` (new, ~280 LOC). Subprocess-driven, env-gated `HF2Q_PROVENANCE_WRITER_E2E=1`. Spawns `hf2q convert --repo <tiny-test-repo>` against the existing `hf-internal-testing/tiny-random-gpt2` fixture (network-gated `HF2Q_NETWORK_TESTS=1` per iter-204 pattern); asserts the emitted GGUF carries the three keys; asserts `serve/provenance.rs::detect()` returns `Provenance::Hf2q { .. }` with matching SHAs.

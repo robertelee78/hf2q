@@ -483,9 +483,29 @@ impl GrammarRuntime {
     /// normally.
     ///
     /// llama.cpp does NOT reset this flag back to `true` on the close
-    /// marker — multi-tool support comes from the chat-template-rendered
-    /// grammar shape accepting `(call)+` directly (Hermes 2 Pro).  See
-    /// research-report.md Q2 anti-finding + `/opt/llama.cpp/docs/function-calling.md`.
+    /// marker — single-call termination is delivered by the grammar
+    /// SHAPE exhausting after the close (`body close space` for hf2q's
+    /// `OneOrMoreCallsBodyOnly { parallel: false }` emission, mirroring
+    /// llama.cpp's `p.repeat(call, min, max=1)` at
+    /// `/opt/llama.cpp/common/chat.cpp:1399-1416`). Multi-tool support
+    /// comes from the grammar shape accepting `(call)+` directly when
+    /// the operator opts in via `parallel_tool_calls=true`.
+    ///
+    /// **iter-218 default-flip note.** Pre-iter-218 the
+    /// `parallel_tool_calls.unwrap_or(true)` default at handlers.rs
+    /// caused single-tool requests to compile to a `body close
+    /// gemma4-call* space` shape (unbounded recursion). With the
+    /// `awaiting_trigger=false` post-open / no-reset-on-close lifecycle,
+    /// the model could emit another `<|tool_call>` open and re-enter the
+    /// recursion indefinitely, masking the training-signal `<turn|>`
+    /// terminator (id 106) until max_tokens
+    /// (`openwebui_tools_streaming_scenario_2` regression). iter-218
+    /// flips the default to `false` (matches
+    /// `/opt/llama.cpp/docs/function-calling.md:24`'s "disabled by
+    /// default") so the typical request gets the bounded `body close
+    /// space` shape that exhausts naturally after the first close →
+    /// `is_dead` → engine halts via the unconditional grammar-driven
+    /// termination check.
     pub fn trigger(&mut self) {
         self.awaiting_trigger = false;
     }

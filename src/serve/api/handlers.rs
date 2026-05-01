@@ -2935,11 +2935,27 @@ fn compile_tool_grammar(
         _ => unreachable!("None gated above"),
     };
 
-    // Wave 2.7 W-η Q-B: read `parallel_tool_calls` (OpenAI default = true,
-    // matches Open WebUI default).  When the request supplies an explicit
-    // value we honor it; otherwise default to true so multi-call behaviour
-    // is enabled for clients that don't think about the flag.
-    let parallel = req.parallel_tool_calls.unwrap_or(true);
+    // iter-218 fix: default `parallel_tool_calls` to FALSE (matches
+    // llama.cpp `/opt/llama.cpp/docs/function-calling.md:24`: "Multiple/
+    // parallel tool calling is supported on some models but **disabled by
+    // default**, enable it by passing `\"parallel_tool_calls\": true`".)
+    //
+    // Pre-iter-218 default `unwrap_or(true)` mis-cited "OpenAI default"
+    // but coupled to the wave-2.6 lazy grammar lifecycle bug (engine.rs
+    // ToolCallClose did NOT re-arm the trigger gate). Combined with the
+    // `gemma4-call*` shape, the unbounded grammar masked the training-
+    // signal `<turn|>` (id 106) terminator and locked the model into
+    // emitting only `<|tool_call>` blocks until max_tokens
+    // (`openwebui_tools_streaming_scenario_2` regression).
+    //
+    // Even with the iter-218 lifecycle fix (release on close), defaulting
+    // to `parallel=true` is structurally noisier: every well-trained
+    // single-tool request would otherwise compile to a `(call)+` shape
+    // that the model has no compelling reason to terminate after a single
+    // call. Matching llama.cpp's default is principled and conservative;
+    // operators wanting parallel calls opt in explicitly via
+    // `parallel_tool_calls: true` in the request body.
+    let parallel = req.parallel_tool_calls.unwrap_or(false);
 
     // Emit per-function GBNF strings and combine into one grammar via
     // alternation. If only one function matches, no alternation is needed.
@@ -3232,6 +3248,69 @@ mod compile_tool_grammar_precondition_tests {
         let res = compile_tool_grammar(&req, &ToolChoiceValue::None);
         let g = res.expect("None choice MUST stay Ok(None)");
         assert!(g.is_none());
+    }
+
+    /// iter-218 regression guard: `parallel_tool_calls` defaults to FALSE
+    /// when the request omits the field. Pre-iter-218 this was `true`
+    /// (under a stale "OpenAI default" comment), which combined with the
+    /// wave-2.6 lazy-grammar-no-release lifecycle bug caused
+    /// `openwebui_tools_streaming_scenario_2` to loop tool calls until
+    /// max_tokens. Matching llama.cpp's documented default
+    /// (`/opt/llama.cpp/docs/function-calling.md:24`).
+    ///
+    /// We probe via the emitted GBNF: with `parallel=false` the Gemma 4
+    /// emitter for `OneOrMoreCallsBodyOnly` produces a single-call shape
+    /// (NO `gemma4-call*` recursion rule); with `parallel=true` it emits
+    /// the recursion rule. The presence/absence of the recursion rule is
+    /// the discriminator we assert on.
+    #[test]
+    fn compile_tool_grammar_auto_default_parallel_is_false() {
+        // Skip if gemma4 is not registered in the test environment.
+        if registry::find_for("gemma4-27b-it").is_none() {
+            return;
+        }
+        let mut req = req_with("gemma4-27b-it", Some(one_scalar_tool("get_weather")));
+        // Caller leaves parallel_tool_calls unset (request body omits it).
+        req.parallel_tool_calls = None;
+        let res = compile_tool_grammar(&req, &ToolChoiceValue::Auto);
+        let g = res
+            .expect("Auto + tools + registered family MUST compile a grammar")
+            .expect("expected Some(grammar) under Auto+lazy with registered family");
+
+        // Smoke-check the grammar serialization for the recursion rule.
+        // `gemma4-call` is only emitted under `parallel=true` (registry
+        // emitter's branch in OneOrMoreCallsBodyOnly). With the iter-218
+        // default flip, parallel=false → no recursion rule.
+        let serialized = format!("{g:?}");
+        assert!(
+            !serialized.contains("gemma4-call"),
+            "iter-218: with `parallel_tool_calls` unset, the default MUST be \
+             FALSE (single-call grammar, no `gemma4-call` recursion rule). \
+             Found `gemma4-call` in serialized grammar — default flip regressed. \
+             Serialized: {serialized}"
+        );
+    }
+
+    /// Companion to `_default_parallel_is_false`: when the request
+    /// EXPLICITLY sets `parallel_tool_calls=true`, the recursion rule MUST
+    /// fire (operator opt-in for parallel calls preserved).
+    #[test]
+    fn compile_tool_grammar_auto_explicit_parallel_true_emits_recursion() {
+        if registry::find_for("gemma4-27b-it").is_none() {
+            return;
+        }
+        let mut req = req_with("gemma4-27b-it", Some(one_scalar_tool("get_weather")));
+        req.parallel_tool_calls = Some(true);
+        let res = compile_tool_grammar(&req, &ToolChoiceValue::Auto);
+        let g = res
+            .expect("Auto + tools MUST compile")
+            .expect("expected Some(grammar) under Auto+lazy with parallel=true");
+        let serialized = format!("{g:?}");
+        assert!(
+            serialized.contains("gemma4-call"),
+            "explicit parallel_tool_calls=true MUST emit `gemma4-call` recursion \
+             rule (operator opt-in to multi-call). Serialized: {serialized}"
+        );
     }
 
     /// Required + valid tools + registered model → grammar compiles

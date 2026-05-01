@@ -2102,9 +2102,14 @@ fn generate_once_with_soft_tokens(
             // Wave 2.6 W-α5 Q2: feed the splitter; if it emits a
             // ToolCallOpen on this fragment, trigger the grammar runtime
             // so subsequent decode steps enforce the body grammar.
-            // ToolCallClose does NOT reset the trigger — multi-call
-            // grammars handle re-entry via `(call)+` shape (research-
-            // report.md Q2; /opt/llama.cpp/docs/function-calling.md).
+            // ToolCallClose does NOT reset the trigger — single-call
+            // termination is delivered structurally by the grammar shape
+            // exhausting after `body <tool_call|> space` (the iter-218
+            // default `parallel_tool_calls=false` matches llama.cpp's
+            // bounded `(call){min,max=1}` per
+            // `/opt/llama.cpp/docs/function-calling.md:24`); multi-call
+            // mode (`parallel_tool_calls=true` opt-in) carries via the
+            // `gemma4-call*` shape which permits another open marker.
             if let Some(tcs) = tc_splitter_ns.as_mut() {
                 let events = tcs.feed(&fragment);
                 if let Some(rt) = grammar_runtime.as_mut() {
@@ -3778,14 +3783,14 @@ fn generate_stream_once(
                 }
                 super::registry::ToolCallEvent::ToolCallClose => {
                     // Wave 2.6 W-α5 Q2: leaving a tool-call body.  The
-                    // grammar runtime is NOT reset — multi-call support
-                    // relies on the grammar root accepting `(call)+`
-                    // directly (Hermes 2 Pro template; research-report.md
-                    // Q2 anti-finding).  If the model attempts a second
-                    // call against a single-call grammar, the runtime
-                    // will simply die on the next mask step (graceful
-                    // termination via the unconditional is_dead check
-                    // in the decode loop).
+                    // grammar runtime is NOT reset — single-call termination
+                    // is delivered by the grammar shape exhausting (iter-218:
+                    // `parallel_tool_calls=false` default → shape `body close
+                    // space` exhausts after first close → is_dead → halt).
+                    // Multi-call mode (`parallel_tool_calls=true` opt-in)
+                    // relies on the `gemma4-call*` recursion accepting
+                    // subsequent open markers (Hermes 2 Pro template; see
+                    // `/opt/llama.cpp/common/chat.cpp:1399-1416` `p.repeat`).
                     //
                     // Wave 3 W-A3: close-time dispatch delegated to
                     // `emit_streaming_tool_call_close` so the parse-failure
@@ -6361,14 +6366,20 @@ mod test_a1_conditional_grammar_wire {
         );
 
         // Post-open: feeding the close marker through the splitter
-        // does NOT reset the runtime — multi-call grammars handle
-        // re-entry via `(call)+` shape (research-report.md Q2 anti-
-        // finding; /opt/llama.cpp/docs/function-calling.md).
+        // does NOT reset the runtime — single-call termination comes
+        // from the grammar SHAPE exhausting (`body close space` under
+        // iter-218's `parallel_tool_calls=false` default), and multi-call
+        // re-entry is via the `(call)*` recursion when operators opt
+        // into parallel calls (research-report.md Q2; see
+        // `/opt/llama.cpp/docs/function-calling.md:24` and
+        // `/opt/llama.cpp/common/chat.cpp:1399-1416`).
         let _events_close = splitter.feed(close);
         assert!(
             !runtime.is_awaiting_trigger(),
             "ToolCallClose MUST NOT re-arm the runtime trigger \
-             (llama.cpp parity: PR #9639 lazy grammar is one-shot per request)"
+             (llama.cpp parity: PR #9639 lazy grammar is one-shot per request; \
+              iter-218 narrows the bug class via `parallel_tool_calls=false` default \
+              so the bounded shape `body close space` exhausts naturally)"
         );
     }
 }
