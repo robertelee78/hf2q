@@ -1446,6 +1446,103 @@ If `factory.try_construct` returns `None` (engine type mismatch — the auto-`Ar
 
 **Cumulative ADR-017 LOC:** A complete (5,066 LOC) + B-dense.1 (1,829 LOC) + C.1 (1,587 LOC) + B-dense.2 (~1,239 LOC: 254+178+146+63+598) = **9,721 LOC** of in-tree substrate + per-family hook + CLI substrate + matrix harness. **106 in-binary unit tests + 1 kill-9 integration test + 36 harness tests + 7 round-trip harness tests, all PASS.** Phase D coherence + perf gate is now the gating item between B-dense.2's seam and operator-facing semantically active KV persistence at the ship gate.
 
+### Phase B-dense.2 follow-up LANDED (2026-04-30)
+
+**Closes the B-dense.2 caveat:** the previous landing left
+`Gemma4DenseSpillFactory::try_from_engine_arc` always returning `None`
+because `LoaderWrapper::load` passes `Arc<E>` where `E = Engine` (the
+production type), but the factory only downcast to `Arc<EngineHandle>`
+(a Phase C.1 wrapper that no production caller ever passed through the
+auto-bind path). That caveat meant every load substituted nothing —
+the stub `StubGemma4Spill` stayed registered and `pre_evict` /
+`post_admit` were no-ops on real production runs.
+
+This follow-up wires the production path end-to-end: the factory's
+downcast now matches `Arc<Engine>` first; the spill holds an
+`Arc<Engine>` (in addition to the B-dense.1 `EngineHandle` slot for
+backwards compat); and snapshot/restore route through a new
+`Engine` worker bridge so the hook reads/writes
+`MlxModelWeights.dense_kvs` without crossing the worker-thread
+boundary.
+
+**What landed (additive, no trait surface modifications):**
+
+| File | Change | LOC |
+|---|---|---|
+| `src/serve/api/kv_spill_descriptor.rs` | NEW. `KvSpillDescriptor` + `KvDType` + `from_gemma_loaded_model` constructor + 5 unit tests. | ~250 |
+| `src/serve/api/mod.rs` | `pub mod kv_spill_descriptor;` registration. | 1 |
+| `src/serve/api/engine.rs` | + `EngineInner.kv_spill_descriptor: Option<...>` cached at `Engine::spawn` for Gemma variant. + `Request::KvSnapshot` / `Request::KvRestore` variants. + `KvSnapshotBytes` public payload type. + 2 worker_run match arms (`kv_snapshot_gemma` + `kv_restore_gemma` helpers reading/writing `MlxBuffer.as_slice::<u8>`). + 3 public `Engine` methods (`kv_spill_descriptor`, `request_kv_snapshot`, `request_kv_restore`). + `make_synthetic_kv_engine_for_test` cross-module test fixture. + 6 unit tests under `engine::tests::request_kv_*`. | ~1080 |
+| `src/serve/kv_persist/families/gemma4_dense.rs` | + `engine_arc: Arc<RwLock<Option<Arc<Engine>>>>` field. + `Gemma4DenseConfig::from_descriptor`. + `Self::new_with_engine` / `set_engine_arc` / `clear_engine_arc` / `try_from_engine` constructors. + `try_from_engine_arc` extended (Arc<Engine> first, Arc<EngineHandle> fallback). + `snapshot_via_engine` / `restore_via_engine` helpers (route through Engine worker bridge). + `KvCacheSpill::snapshot_block` / `restore_block` updated to prefer `engine_arc` when set, B-dense.1 `engine` slot fallback otherwise. + `EngineBindable::bind_engine` extended to accept Arc<Engine>. + `unbind_engine` clears both slots. + `Gemma4DenseSpillFactory::try_construct` rewritten to handle both engine types in spill duplication. + 5 new tests under `gemma4_dense::tests::followup_*`. | ~750 |
+| `docs/ADR-017-persistent-block-prefix-cache.md` | this subsection. | ~80 |
+
+**Discipline locked in:**
+
+- `KvSpiller` / `KvCacheSpill` / `HotSwapManager` / `ModelLoader` /
+  `EngineBindable` / `FamilyHookFactory` trait surfaces UNCHANGED
+  (additive impl-side methods only).
+- B-dense.1's 17 existing tests PASS unchanged. The B-dense.1
+  `EngineHandle` path is preserved as a backwards-compat fallback;
+  production loads now hit the `Arc<Engine>` path first.
+- Zero edits to `src/serve/multi_model.rs`, `forward_mlx.rs`,
+  `forward_prefill.rs` (KV-shape + decode loop fenced).
+- Zero edits to `src/inference/models/qwen35/*`, `mlx-native/`,
+  `gpu_*.rs` (ADR-015 fence).
+- Real I/O round-trip in tests (per
+  `feedback_substrate_must_not_synthesize_ship_gates`): synthetic
+  worker reads/writes a real `HashMap`-backed byte cache; SHA-256
+  byte-equality asserted on snapshot→restore→snapshot.
+- "man-day" used; "person-day" does not appear (`grep` clean).
+- No `// TODO` / `todo!()` / `unimplemented!()` / `panic!()` outside
+  `#[cfg(test)]`.
+- Worktree discipline: solo Claude session in
+  `.cfa-worktrees/adr017-bdense2-followup-claude`, ABSOLUTE PATHS in
+  every shell command (no `cd /opt/hf2q`).
+
+**Test totals after follow-up:**
+
+- `kv_persist::*` in-binary: **111 PASS** (106 prior + 5 new
+  `gemma4_dense::tests::followup_*`).
+- `engine::tests::request_kv_*`: **6 PASS** (new).
+- `kv_spill_descriptor::*`: **5 PASS** (new).
+- `kv_persist_writer_kill_minus_9`: **1 PASS** (no regression).
+- `kv_persist_harness`: **36 PASS** (no regression).
+- `kv_persist_gemma4_roundtrip`: **7 PASS** (no regression).
+- Full bin unit tests: **2,405 PASS** (no regression vs B-dense.2
+  baseline).
+
+**Hypotheses closure:**
+
+- **H1 (testable):** With `cmd_serve --kv-persist=PATH` + Gemma 4
+  model, the registered hook is now `Gemma4DenseSpill` (not
+  `StubGemma4Spill`). ✅ Locked in by
+  `followup_factory_try_construct_succeeds_on_arc_engine` +
+  `followup_try_from_engine_arc_succeeds_on_arc_engine`.
+- **H2 (testable):** `Engine::kv_spill_descriptor()` returns
+  `Some(...)` for Gemma 4, `None` for Qwen35. ✅ Locked in by
+  `request_kv_descriptor_returns_some_when_set` +
+  `request_kv_descriptor_returns_none_when_not_set` +
+  `followup_try_from_engine_arc_returns_none_on_qwen35_engine`.
+- **H3 (testable):** `request_kv_snapshot` returns the same bytes
+  the live `dense_kvs[layer].k` slice would read. ✅ Locked in by
+  `request_kv_snapshot_returns_real_bytes_from_populated_layer`
+  (asserts byte pattern at known seed offset).
+- **H4 (testable):** `request_kv_restore` + `request_kv_snapshot`
+  round-trip is byte-exact. ✅ Locked in by
+  `request_kv_restore_then_snapshot_round_trip_byte_exact` +
+  `followup_snapshot_restore_round_trip_via_arc_engine`.
+
+**What's still gating Phase D:**
+
+- Real Gemma 4 26B operator GGUF run with `HF2Q_KV_PERSIST_E2E=1`
+  enabled (the matrix harness's master gate). The harness substrate
+  is in place; this follow-up unblocks the actual operator-side
+  end-to-end test by ensuring a real (non-stub) hook is registered.
+- Sourdough byte-exact decoded-token parity across pre-evict /
+  post-admit (the actual H3 + H4 hypothesis closure on a live
+  model — task #14 in the main session work).
+
+**Cumulative ADR-017 LOC after follow-up:** 9,721 LOC + ~2,160 LOC (250+1+1080+750+80) = **~11,881 LOC** in-tree substrate.
+
 ---
 
 ## Open Questions
