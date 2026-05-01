@@ -6,9 +6,10 @@
 //!
 //! ## What's exposed
 //!
-//! Only `serve::kv_persist` (block store + async writer + recovery)
-//! consumed by `tests/kv_persist_writer_kill_minus_9.rs`. Other
-//! modules (cli, inference, quantize, ...) remain bin-private.
+//! Only the A.1 + A.2 leaves of `serve::kv_persist` (block store +
+//! async writer + recovery + format + index) consumed by
+//! `tests/kv_persist_writer_kill_minus_9.rs`. Other modules (cli,
+//! inference, quantize, full `serve::*`, ...) remain bin-private.
 //!
 //! ## Why a lib target at all
 //!
@@ -20,19 +21,38 @@
 //! rename invariant under SIGKILL) reflects production verbatim. A
 //! narrow lib target is the conventional Rust pattern for that.
 //!
-//! ## How the path is wired
+//! ## Why spiller is excluded from the lib facade
 //!
-//! `#[path = "serve/kv_persist/mod.rs"]` shortcuts `src/serve/mod.rs`
-//! and reads only the kv_persist subtree. This works because
-//! kv_persist is self-contained — its source files reference each
-//! other via `crate::serve::kv_persist::*`, and from this lib root
-//! that path resolves correctly.
+//! `spiller.rs` (ADR-017 §A.3) implements the `KvSpiller<E>` trait
+//! defined in `src/serve/multi_model.rs`. Pulling `multi_model` into
+//! the lib transitively requires `intelligence::hardware`,
+//! `serve::api::engine`, and a long tail of bin-private modules —
+//! defeating the "narrow lib" intent. Instead, the lib enumerates
+//! kv_persist's submodules explicitly and OMITS spiller. Spiller is
+//! reachable from the bin's `main.rs` (which loads
+//! `src/serve/kv_persist/mod.rs` with the full submodule list,
+//! including `pub mod spiller;`) and from `--bin hf2q kv_persist`
+//! tests. The integration test in `tests/` only needs A.1 + A.2.
 
 #![allow(clippy::missing_safety_doc)]
 
 pub mod serve {
-    //! Narrow re-export: only `kv_persist`. The full `serve` module
-    //! from `main.rs` stays binary-private.
-    #[path = "../serve/kv_persist/mod.rs"]
-    pub mod kv_persist;
+    //! Narrow re-export: only `kv_persist`'s A.1 + A.2 leaves. The
+    //! full `serve` module from `main.rs` (multi_model, api, etc.)
+    //! stays binary-private. See module docs at the crate root for
+    //! the why.
+    pub mod kv_persist {
+        //! Explicit submodule list — DOES NOT include `spiller`
+        //! (A.3 is bin-private; see `src/lib.rs` module docs).
+        #[path = "../../serve/kv_persist/block_store.rs"]
+        pub mod block_store;
+        #[path = "../../serve/kv_persist/format.rs"]
+        pub mod format;
+        #[path = "../../serve/kv_persist/index.rs"]
+        pub mod index;
+        #[path = "../../serve/kv_persist/recovery.rs"]
+        pub mod recovery;
+        #[path = "../../serve/kv_persist/writer.rs"]
+        pub mod writer;
+    }
 }
