@@ -1059,6 +1059,39 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-05-01 — P17 · Q4_K MoE perf hypothesis matrix — H1+H2 landed, H3+H4 tracked
+
+**Problem.** P16 closed Q4_K coherence + decode parity but left a 30× prefill gap vs llama.cpp (`pp31`=12 t/s vs 671; `pp101`=56 t/s vs 1703). Per `feedback_evidence_first_no_blind_kernel_rewrites` and mantra ("measure 3x, cut once"), did NOT touch tile geometry. Instead: deep-read llama.cpp's `ggml_metal_op_mul_mat_id` (`ggml-metal-ops.cpp:2273`) and `kernel_mul_mm_id` template (`ggml-metal.metal:9719`) side-by-side with our equivalents, ran goalie research, and built a 4-hypothesis matrix.
+
+**Hypotheses (ranked by likely impact, all testable before kernel rewrite):**
+- **H1**: tensor-API variant slower than simdgroup for Q4_K. llama.cpp does NOT have a separate tensor-API path for K-quants — they use `#ifdef GGML_METAL_HAS_TENSOR` to compile the simdgroup OR tensor path into the SAME kernel name. We shipped a separate `kernel_mul_mm_id_q4_K_tensor_f32` and probe-routed to it on M5 Max; suspect our tensor variant is suboptimal.
+- **H2**: `MM_ID_ROUTING_THRESHOLD = 8` is half-baked. llama.cpp's `ne21_mm_id_min = 32` (`ggml-metal-ops.cpp:2312`) — they only use mm_id when `n_tokens >= 32` because below that the tile-reuse setup overhead doesn't amortize.
+- **H3**: shmem hardcode (`MM_SHMEM_BYTES = 8192` in `dispatch_id_mm_for_test`) vs llama.cpp's `pipeline.smem` query (varies per Q-type and tile shape).
+- **H4**: kernel body divergence. Our `hf2q_mul_mm_id_impl` (simdgroup) and `hf2q_mul_mm_id_tensor_impl` are separate templates; llama.cpp has a single `kernel_mul_mm_id` template with conditional code paths and uses `mpp::tensor_ops::matmul2d<...>` for the tensor route — a primitive we don't yet leverage.
+
+**mlx-native `4db99f4`.** Landed H1 + H2 (no kernel changes):
+- `src/ops/quantized_matmul_id_ggml.rs` `probe_tensor_mm_id`: env gate `HF2Q_DISABLE_TENSOR_MM_ID=1` forces simdgroup variant for the A/B comparison without yanking shader source.
+- `MM_ID_ROUTING_THRESHOLD`: `8` → `32` (matches llama.cpp's empirically-derived break-even).
+
+**Bench (M5 Max, dwq48 Qwen3.6-35B-A3B Q4_K, hf2q `--max-tokens 50`).**
+
+| Config | pp31 | pp101 | tg50 |
+|---|---|---|---|
+| P16 baseline (tensor on, threshold 8) | 12 t/s | 38–56 t/s | 106–119 t/s |
+| P17 H1 alone (tensor off, threshold 8) | — | 51 t/s | 122 t/s |
+| **P17 H1+H2 (tensor off, threshold 32)** | **17 t/s** | **53 t/s** | **126 t/s** |
+| llama.cpp `b8680` baseline | 671 t/s | 1703 t/s | 117 t/s |
+| **vs llama (P17/llama)** | 0.025× (39× slower) | 0.031× (32× slower) | **1.08× FASTER** ✓ |
+
+H1 alone gave +34% prefill at pp101 (38 → 51 t/s) and +15% decode (106 → 122). H2 gave +42% at pp31 (12 → 17). Combined gain is real but modest — these explain ~5–10% of the 30× gap. Decode now consistently exceeds llama.cpp same-day at 1.08× faster (was 1.02× post-P16).
+
+**Remaining gap (P18 candidate, kernel-rewrite territory).** Per `feedback_evidence_first_no_blind_kernel_rewrites.md`: do NOT proceed without a matrix harness measuring per-bucket wall-clock. Read of llama.cpp `kernel_mul_mm_id` body (`ggml-metal.metal:9719+`) shows their tensor-API path uses `mpp::tensor_ops::matmul2d<NR1, NR0, NK, ...>` with `execution_simdgroups<4>` — an integrated-into-the-same-kernel design we don't replicate. Our `hf2q_mul_mm_id_tensor_impl` in `src/shaders/quantized_matmul_id_mm_tensor.metal` is a separate template; structural diff vs llama's integrated path is the next concrete investigation.
+
+P18 plan (next iter):
+1. Build matrix harness under `tests/perf/` measuring per-bucket time for {pp32, pp64, pp128, pp256, pp512} × {Q4_0, Q4_K, Q6_K, Q8_0} × {simdgroup, tensor} kernel variants. Get clean signal before changing code.
+2. Side-by-side line-by-line read of llama.cpp's `kernel_mul_mm_id` tensor branch vs our `hf2q_mul_mm_id_tensor_impl`. Identify the divergence (probably MMA descriptor + cooperative tensor handling).
+3. Only then port the missing primitive into our tensor kernel.
+
 ### 2026-05-01 — P16 · Q4_K mat-mat-id (mm_id) Metal kernel — 6× Q4_K prefill speedup, decode parity vs llama.cpp
 
 **Problem.** P15 left Q4_K dispatch stuck on `mv_id` even at prefill batches > 8 tokens (Q4_K was excluded from the `mm_id` route in `src/ops/quantized_matmul_id_ggml.rs` because `kernel_mul_mm_id_q4_K_f32` did not exist). Same-day llama-bench numbers (`b8680-15f786e65`, dwq48 GGUF on M5 Max): hf2q `pp31`=12 t/s vs llama 671 t/s; `pp101`=9 t/s vs llama 1703 t/s; gap of 30–56× and growing with prompt length.
