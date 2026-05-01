@@ -446,6 +446,226 @@ pub enum LoadedArch {
 /// drops every other request kind silently (the test code that builds
 /// these engines either never sends a request, or doesn't await the
 /// reply).
+/// Phase B-dense.2 follow-up — test fixture exposed to sibling
+/// crates/modules so the kv_persist::families::gemma4_dense tests can
+/// build an `Engine` carrying a populated `KvSpillDescriptor` AND a
+/// no-op KV worker that handles `KvSnapshot` / `KvRestore` requests
+/// against an in-memory byte map.
+///
+/// The synthetic engine reports `LoadedArch::Gemma`, hands out the
+/// supplied descriptor, and the worker handles only KV requests +
+/// Shutdown — every other request kind is dropped silently (the
+/// caller never awaits a reply for those).
+///
+/// `seeded_layers` populates the in-memory cache with a deterministic
+/// byte pattern keyed on `(layer, head, slot, byte_index)` so the
+/// caller can assert byte-exactness on round-trips. A layer not in
+/// `seeded_layers` returns zero bytes from snapshot.
+#[cfg(test)]
+pub(crate) fn make_synthetic_kv_engine_for_test(
+    descriptor: super::kv_spill_descriptor::KvSpillDescriptor,
+    seeded_layers: Vec<(usize, u8)>,
+) -> Engine {
+    use std::collections::HashMap;
+
+    let nkv: Vec<usize> = descriptor.nkv_heads.clone();
+    let head_dim: Vec<usize> = descriptor.head_dim.clone();
+    let capacity: Vec<usize> = (0..descriptor.num_layers)
+        .map(|i| match descriptor.layer_types[i] {
+            crate::serve::config::LayerType::Sliding => descriptor.sliding_window,
+            crate::serve::config::LayerType::Full => descriptor.max_decode_tokens.max(64),
+        })
+        .collect();
+    let is_sliding: Vec<bool> = descriptor
+        .layer_types
+        .iter()
+        .map(|lt| *lt == crate::serve::config::LayerType::Sliding)
+        .collect();
+    let descriptor_for_engine = descriptor.clone();
+    let kv_dtype_bytes = descriptor.kv_dtype.elem_bytes();
+
+    let (tx, mut rx) = mpsc::channel::<Request>(8);
+    let nkv_clone = nkv.clone();
+    let head_dim_clone = head_dim.clone();
+    let capacity_clone = capacity.clone();
+    let is_sliding_clone = is_sliding.clone();
+    let handle = std::thread::Builder::new()
+        .name("hf2q-engine-kv-bridge-test".into())
+        .spawn(move || {
+            // (layer, head, slot) -> (k_bytes, v_bytes) — per-token
+            // chunk size is `head_dim * elem_bytes`.
+            let mut cells: HashMap<(usize, usize, usize), (Vec<u8>, Vec<u8>)> = HashMap::new();
+            let mut write_pos: Vec<u32> = vec![0u32; nkv_clone.len()];
+            for (layer, seed) in seeded_layers {
+                let nkv_l = nkv_clone[layer];
+                let cap_l = capacity_clone[layer];
+                let hd_l = head_dim_clone[layer];
+                let chunk = hd_l * kv_dtype_bytes;
+                for h in 0..nkv_l {
+                    for slot in 0..cap_l {
+                        let mut k = vec![0u8; chunk];
+                        let mut v = vec![0u8; chunk];
+                        for (i, b) in k.iter_mut().enumerate() {
+                            *b = seed
+                                ^ (layer as u8)
+                                ^ (h as u8).wrapping_mul(7)
+                                ^ (slot as u8).wrapping_mul(13)
+                                ^ (i as u8).wrapping_mul(3)
+                                ^ 0x5A;
+                        }
+                        for (i, b) in v.iter_mut().enumerate() {
+                            *b = seed
+                                ^ (layer as u8)
+                                ^ (h as u8).wrapping_mul(7)
+                                ^ (slot as u8).wrapping_mul(13)
+                                ^ (i as u8).wrapping_mul(3)
+                                ^ 0xA5;
+                        }
+                        cells.insert((layer, h, slot), (k, v));
+                    }
+                }
+            }
+            while let Some(req) = rx.blocking_recv() {
+                match req {
+                    Request::Shutdown => break,
+                    Request::KvSnapshot {
+                        layer_rank,
+                        range,
+                        reply,
+                    } => {
+                        let result: Result<Option<KvSnapshotBytes>> = if layer_rank
+                            >= nkv_clone.len()
+                        {
+                            Err(anyhow::anyhow!("layer OOB"))
+                        } else {
+                            let nkv_l = nkv_clone[layer_rank];
+                            let cap_l = capacity_clone[layer_rank];
+                            let hd_l = head_dim_clone[layer_rank];
+                            let is_sliding_l = is_sliding_clone[layer_rank];
+                            let chunk = hd_l * kv_dtype_bytes;
+                            // If layer was never seeded AND no
+                            // restore wrote into it, return None
+                            // (mirroring "no prefill yet").
+                            let layer_populated =
+                                cells.iter().any(|((l, _, _), _)| *l == layer_rank);
+                            if !layer_populated {
+                                Ok(None)
+                            } else {
+                                let n_tokens = (range.end - range.start) as usize;
+                                let mut k_out = Vec::with_capacity(nkv_l * n_tokens * chunk);
+                                let mut v_out = Vec::with_capacity(nkv_l * n_tokens * chunk);
+                                for h in 0..nkv_l {
+                                    for tok in range.start..range.end {
+                                        let slot = if is_sliding_l {
+                                            (tok as usize) % cap_l
+                                        } else {
+                                            tok as usize
+                                        };
+                                        match cells.get(&(layer_rank, h, slot)) {
+                                            Some((k, v)) => {
+                                                k_out.extend_from_slice(k);
+                                                v_out.extend_from_slice(v);
+                                            }
+                                            None => {
+                                                k_out.extend_from_slice(&vec![0u8; chunk]);
+                                                v_out.extend_from_slice(&vec![0u8; chunk]);
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(Some(KvSnapshotBytes {
+                                    k: k_out,
+                                    v: v_out,
+                                    nkv_heads: nkv_l as u16,
+                                    head_dim: hd_l as u16,
+                                    capacity: cap_l as u32,
+                                    is_sliding: is_sliding_l,
+                                    write_pos: if is_sliding_l {
+                                        write_pos[layer_rank]
+                                    } else {
+                                        u32::MAX
+                                    },
+                                }))
+                            }
+                        };
+                        let _ = reply.send(result);
+                    }
+                    Request::KvRestore {
+                        layer_rank,
+                        range,
+                        k_payload,
+                        v_payload,
+                        write_pos: wp,
+                        reply,
+                    } => {
+                        let result: Result<()> = if layer_rank >= nkv_clone.len() {
+                            Err(anyhow::anyhow!("layer OOB"))
+                        } else {
+                            let nkv_l = nkv_clone[layer_rank];
+                            let cap_l = capacity_clone[layer_rank];
+                            let hd_l = head_dim_clone[layer_rank];
+                            let is_sliding_l = is_sliding_clone[layer_rank];
+                            let chunk = hd_l * kv_dtype_bytes;
+                            let n_tokens = (range.end - range.start) as usize;
+                            let expected = nkv_l * n_tokens * chunk;
+                            if k_payload.len() != expected || v_payload.len() != expected {
+                                Err(anyhow::anyhow!("payload size mismatch"))
+                            } else {
+                                let mut off = 0usize;
+                                for h in 0..nkv_l {
+                                    for tok in range.start..range.end {
+                                        let slot = if is_sliding_l {
+                                            (tok as usize) % cap_l
+                                        } else {
+                                            tok as usize
+                                        };
+                                        cells.insert(
+                                            (layer_rank, h, slot),
+                                            (
+                                                k_payload[off..off + chunk].to_vec(),
+                                                v_payload[off..off + chunk].to_vec(),
+                                            ),
+                                        );
+                                        off += chunk;
+                                    }
+                                }
+                                if is_sliding_l && wp != u32::MAX {
+                                    write_pos[layer_rank] = wp;
+                                }
+                                Ok(())
+                            }
+                        };
+                        let _ = reply.send(result);
+                    }
+                    _ => {
+                        // Drop other request kinds — caller never
+                        // awaits a reply for them in this fixture.
+                    }
+                }
+            }
+        })
+        .expect("spawn synthetic kv-bridge worker");
+
+    Engine {
+        inner: Arc::new(EngineInner {
+            tx,
+            worker_handle: Mutex::new(Some(handle)),
+            arch: LoadedArch::Gemma,
+            model_id: "synth-kv-bridge-test".into(),
+            context_length: None,
+            quant_type: None,
+            hidden_size: 0,
+            vocab_size: 0,
+            eos_token_ids: vec![],
+            tokenizer: Arc::new(Tokenizer::new(tokenizers::models::bpe::BPE::default())),
+            chat_template: Arc::new(String::new()),
+            registration: None,
+            token_bytes: std::sync::OnceLock::new(),
+            kv_spill_descriptor: Some(descriptor_for_engine),
+        }),
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn make_synthetic_engine_for_test(arch: LoadedArch) -> Engine {
     let (tx, mut rx) = mpsc::channel::<Request>(8);

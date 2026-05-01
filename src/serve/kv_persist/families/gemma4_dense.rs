@@ -112,6 +112,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use mlx_native::{DType, MlxBuffer, MlxDevice};
 
+use crate::serve::api::engine::Engine;
+use crate::serve::api::kv_spill_descriptor::{KvDType, KvSpillDescriptor};
 use crate::serve::config::LayerType;
 use crate::serve::kv_persist::format::BLOCK_TOKENS;
 use crate::serve::kv_persist::spiller::KvCacheSpill;
@@ -245,10 +247,25 @@ impl std::fmt::Debug for EngineHandle {
 /// once per `(repo, quant)` and persists across evictions, but the
 /// underlying `LoadedEngine` instance changes on every re-admit.
 pub struct Gemma4DenseSpill {
-    /// Live engine handle. `None` between evict and admit cycles.
-    /// `RwLock` so concurrent snapshot calls from the spiller's
-    /// trigger sites don't serialize on a `Mutex`.
+    /// Live engine handle (B-dense.1 path). `None` between evict and
+    /// admit cycles. `RwLock` so concurrent snapshot calls from the
+    /// spiller's trigger sites don't serialize on a `Mutex`.
+    ///
+    /// **B-dense.2 follow-up**: the production code path uses
+    /// `engine_arc` (below) instead. This `engine` slot is preserved
+    /// for backwards compatibility with B-dense.1's tests +
+    /// `EngineBindable::bind_engine` callers; when both `engine_arc`
+    /// and `engine` are set, `engine_arc` wins.
     engine: Arc<RwLock<Option<EngineHandle>>>,
+
+    /// Live `Arc<Engine>` slot — Phase B-dense.2 follow-up production
+    /// path. The factory's `try_from_engine_arc` populates this when
+    /// it downcasts to `Arc<Engine>`; `snapshot_block` /
+    /// `restore_block` prefer it over the B-dense.1 `engine` slot
+    /// because the Engine's worker thread owns the live
+    /// `MlxModelWeights.dense_kvs` and is the only path that can
+    /// safely read/write it without crossing the worker boundary.
+    engine_arc: Arc<RwLock<Option<Arc<Engine>>>>,
 
     /// Per-layer attention type. Captured from `Gemma4Config` at
     /// registration. Length == num_layers.
@@ -297,6 +314,27 @@ pub struct Gemma4DenseConfig {
     pub max_decode_tokens: usize,
 }
 
+impl Gemma4DenseConfig {
+    /// Phase B-dense.2 follow-up — convert from a runtime
+    /// [`KvSpillDescriptor`] (snapshot of live `MlxModelWeights`).
+    /// The two structures carry the same fields; this conversion
+    /// translates between the two stable surfaces. Used by
+    /// [`Gemma4DenseSpill::new_with_engine`].
+    pub fn from_descriptor(d: &KvSpillDescriptor) -> Self {
+        Self {
+            layer_types: d.layer_types.clone(),
+            nkv_heads: d.nkv_heads.clone(),
+            head_dim: d.head_dim.clone(),
+            kv_dtype: match d.kv_dtype {
+                KvDType::F32 => DType::F32,
+                KvDType::F16 => DType::F16,
+            },
+            sliding_window: d.sliding_window,
+            max_decode_tokens: d.max_decode_tokens,
+        }
+    }
+}
+
 impl Gemma4DenseSpill {
     /// Build a hook from shape-only config. No live engine state is
     /// captured here — call [`Self::set_engine_handle`] at admission
@@ -316,6 +354,7 @@ impl Gemma4DenseSpill {
         let _tag = DtypeTag::from_dtype(cfg.kv_dtype)?;
         Ok(Self {
             engine: Arc::new(RwLock::new(None)),
+            engine_arc: Arc::new(RwLock::new(None)),
             layer_types: Arc::new(cfg.layer_types),
             nkv_heads: Arc::new(cfg.nkv_heads),
             head_dim: Arc::new(cfg.head_dim),
@@ -324,6 +363,56 @@ impl Gemma4DenseSpill {
             max_decode_tokens: cfg.max_decode_tokens,
             num_layers,
         })
+    }
+
+    /// Phase B-dense.2 follow-up — construct a spill from a
+    /// `KvSpillDescriptor` (read off a live `Engine`) plus the live
+    /// `Arc<Engine>` itself. The descriptor carries the immutable
+    /// shape config; the Arc<Engine> is the worker bridge for
+    /// snapshot/restore byte access.
+    ///
+    /// This is the production constructor used by
+    /// [`Gemma4DenseSpillFactory::try_from_engine_arc`]. The
+    /// B-dense.1 [`Self::new`] + [`Self::set_engine_handle`] path is
+    /// preserved for backwards compat with B-dense.1's tests +
+    /// EngineBindable callers.
+    pub fn new_with_engine(
+        descriptor: KvSpillDescriptor,
+        engine: Arc<Engine>,
+    ) -> Result<Self, SpillErrorKind> {
+        let cfg = Gemma4DenseConfig::from_descriptor(&descriptor);
+        let spill = Self::new(cfg)?;
+        // Set engine_arc directly — the spill is freshly constructed
+        // so no concurrent snapshot calls can be in flight.
+        {
+            let mut g = spill
+                .engine_arc
+                .write()
+                .map_err(|_| SpillErrorKind::CodecErr)?;
+            *g = Some(engine);
+        }
+        Ok(spill)
+    }
+
+    /// Phase B-dense.2 follow-up — set/replace the live `Arc<Engine>`
+    /// slot. Mirrors [`Self::set_engine_handle`] for the production
+    /// path. Subsequent calls overwrite the prior engine.
+    pub fn set_engine_arc(&self, engine: Arc<Engine>) {
+        let mut g = self
+            .engine_arc
+            .write()
+            .expect("Gemma4DenseSpill::engine_arc RwLock poisoned");
+        *g = Some(engine);
+    }
+
+    /// Phase B-dense.2 follow-up — drop the live `Arc<Engine>` slot.
+    /// Mirrors [`Self::clear_engine_handle`].
+    pub fn clear_engine_arc(&self) {
+        let mut g = self
+            .engine_arc
+            .write()
+            .expect("Gemma4DenseSpill::engine_arc RwLock poisoned");
+        *g = None;
     }
 
     /// Wire a live engine handle. Called by Phase C.1's `cmd_serve`
@@ -725,6 +814,130 @@ fn write_bytes_into_kv_range(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Phase B-dense.2 follow-up — Arc<Engine> worker-bridge helpers
+// ---------------------------------------------------------------------------
+
+impl Gemma4DenseSpill {
+    /// Snapshot via the `Arc<Engine>` worker bridge. The Engine's
+    /// worker thread reads `dense_kvs[layer_rank].k.as_slice::<u8>()`
+    /// directly and replies with K+V bytes plus per-layer shape.
+    ///
+    /// Returns `None` (Skipped) when the worker reports
+    /// `Ok(None)` (no prefill yet) OR when any I/O / shape error
+    /// surfaces — matches the existing snapshot_block None-on-error
+    /// contract.
+    fn snapshot_via_engine(
+        &self,
+        engine: Arc<Engine>,
+        layer_rank: usize,
+        range: Range<u32>,
+    ) -> Option<Vec<u8>> {
+        let n_tokens = (range.end - range.start) as usize;
+        let nkv_expected = self.nkv_heads[layer_rank];
+        let hd_expected = self.head_dim[layer_rank];
+        let is_sliding_expected =
+            self.layer_types[layer_rank] == LayerType::Sliding;
+
+        // Send the request. Errors → None (skip).
+        let snap = engine.request_kv_snapshot(layer_rank, range.clone()).ok()??;
+
+        // Validate worker-reported shape against captured config.
+        if snap.nkv_heads as usize != nkv_expected {
+            return None;
+        }
+        if snap.head_dim as usize != hd_expected {
+            return None;
+        }
+        if snap.is_sliding != is_sliding_expected {
+            return None;
+        }
+        let capacity = snap.capacity as usize;
+        if capacity == 0 {
+            return None;
+        }
+        // Worker-side n_tokens vs spiller-side n_tokens.
+        let expected_kv_bytes =
+            nkv_expected * n_tokens * hd_expected * self.kv_dtype.size_of();
+        if snap.k.len() != expected_kv_bytes || snap.v.len() != expected_kv_bytes {
+            return None;
+        }
+
+        // Build the same payload header `gemma4_dense.rs` already
+        // produces in the EngineHandle path so the on-disk envelope
+        // is byte-identical regardless of which path produced it.
+        let dtype_tag = DtypeTag::from_dtype(self.kv_dtype).ok()?;
+        let header = PayloadHeader {
+            dtype: dtype_tag,
+            is_sliding: is_sliding_expected,
+            nkv_heads: snap.nkv_heads,
+            head_dim: snap.head_dim,
+            capacity: snap.capacity,
+            write_pos: if is_sliding_expected {
+                self.pack_write_pos(layer_rank, snap.write_pos as usize)
+            } else {
+                snap.write_pos
+            },
+            range_start: range.start,
+            range_end: range.end,
+            k_byte_len: snap.k.len() as u32,
+            v_byte_len: snap.v.len() as u32,
+        };
+        let mut out = Vec::with_capacity(PAYLOAD_HEADER_BYTES + snap.k.len() + snap.v.len());
+        header.encode_into(&mut out);
+        out.extend_from_slice(&snap.k);
+        out.extend_from_slice(&snap.v);
+        Some(out)
+    }
+
+    /// Restore via the `Arc<Engine>` worker bridge. The header has
+    /// already been parsed + validated by the caller; this method
+    /// splits the payload body into K + V slices and forwards to
+    /// `Engine::request_kv_restore`.
+    fn restore_via_engine(
+        &self,
+        engine: Arc<Engine>,
+        layer_rank: usize,
+        range: Range<u32>,
+        hdr: &PayloadHeader,
+        payload: &[u8],
+    ) -> Result<(), SpillErrorKind> {
+        // Validate range agreement (already partly done by caller's
+        // validate_header but we need n_tokens for the body split).
+        let n_tokens_payload = (hdr.range_end - hdr.range_start) as usize;
+        let n_tokens_spiller = (range.end - range.start) as usize;
+        if n_tokens_payload != n_tokens_spiller {
+            return Err(SpillErrorKind::CodecErr);
+        }
+        // Validate body length.
+        let stride = token_stride_bytes(
+            hdr.nkv_heads as usize,
+            hdr.head_dim as usize,
+            hdr.dtype.to_dtype(),
+        );
+        let expected_kv = n_tokens_payload * stride;
+        if hdr.k_byte_len as usize != expected_kv
+            || hdr.v_byte_len as usize != expected_kv
+        {
+            return Err(SpillErrorKind::CodecErr);
+        }
+        let body_start = PAYLOAD_HEADER_BYTES;
+        let body_total = hdr.k_byte_len as usize + hdr.v_byte_len as usize;
+        if payload.len() != body_start + body_total {
+            return Err(SpillErrorKind::CodecErr);
+        }
+        // Split body into K + V.
+        let body = &payload[body_start..];
+        let k_slice = body[..hdr.k_byte_len as usize].to_vec();
+        let v_slice = body[hdr.k_byte_len as usize..].to_vec();
+
+        // Route to worker.
+        engine
+            .request_kv_restore(layer_rank, range, k_slice, v_slice, hdr.write_pos)
+            .map_err(|_| SpillErrorKind::IoErr)
+    }
+}
+
 impl KvCacheSpill for Gemma4DenseSpill {
     fn block_alignment(&self) -> u32 {
         BLOCK_TOKENS
@@ -739,7 +952,23 @@ impl KvCacheSpill for Gemma4DenseSpill {
             return None;
         }
 
-        // 2. Engine handle present?
+        // 2a. Phase B-dense.2 follow-up: production path — prefer the
+        //     `Arc<Engine>` worker bridge if set. The Engine's worker
+        //     thread is the sole owner of `MlxModelWeights.dense_kvs`
+        //     and the only safe path that does not require crossing
+        //     the worker boundary.
+        if let Some(engine_arc) = self
+            .engine_arc
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+        {
+            return self.snapshot_via_engine(engine_arc, layer_rank, range);
+        }
+
+        // 2b. B-dense.1 fallback — EngineHandle path. Preserved for
+        //     backwards compat with B-dense.1's tests + the
+        //     `EngineBindable::bind_engine` Arc<EngineHandle> contract.
         let engine_guard = self.engine.read().ok()?;
         let engine = engine_guard.as_ref()?;
 
@@ -847,6 +1076,17 @@ impl KvCacheSpill for Gemma4DenseSpill {
 
         // 2. Validate against captured config.
         self.validate_header(layer_rank, &hdr)?;
+
+        // 2a. Phase B-dense.2 follow-up: production path — prefer the
+        //     `Arc<Engine>` worker bridge if set.
+        if let Some(engine_arc) = self
+            .engine_arc
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+        {
+            return self.restore_via_engine(engine_arc, layer_rank, range, &hdr, payload);
+        }
 
         // 3. Validate range agrees with payload header. The spiller
         //    passes `0..n_tokens` derived from `EnvelopeHeader.n_tokens`
@@ -1031,9 +1271,18 @@ fn _assert_send_sync() {
 
 impl crate::serve::kv_persist::EngineBindable for Gemma4DenseSpill {
     fn bind_engine(&self, engine_dyn: Arc<dyn std::any::Any + Send + Sync>) {
-        // Try downcast to Arc<EngineHandle>. On Err, the type-erased
-        // Arc is returned to us; drop it without further action.
-        match engine_dyn.downcast::<EngineHandle>() {
+        // Phase B-dense.2 follow-up: try `Arc<Engine>` first
+        // (production LoaderWrapper path), then `Arc<EngineHandle>`
+        // (B-dense.1 backwards-compat path). Silent no-op on neither
+        // matching, per the EngineBindable contract.
+        let engine_or_other = match engine_dyn.downcast::<Engine>() {
+            Ok(engine_arc) => {
+                self.set_engine_arc(engine_arc);
+                return;
+            }
+            Err(other) => other,
+        };
+        match engine_or_other.downcast::<EngineHandle>() {
             Ok(handle_arc) => {
                 // Cheap-clone the inner EngineHandle (every field is
                 // `Arc`-wrapped). The downcast Arc itself drops at
@@ -1051,6 +1300,7 @@ impl crate::serve::kv_persist::EngineBindable for Gemma4DenseSpill {
 
     fn unbind_engine(&self) {
         self.clear_engine_handle();
+        self.clear_engine_arc();
     }
 }
 
@@ -1116,7 +1366,32 @@ impl Gemma4DenseSpill {
         cfg: Gemma4DenseConfig,
         engine_dyn: Arc<dyn std::any::Any + Send + Sync>,
     ) -> Option<Self> {
-        let handle_arc = match engine_dyn.downcast::<EngineHandle>() {
+        // Phase B-dense.2 follow-up: try `Arc<Engine>` first (the
+        // production LoaderWrapper path delivers `Arc<E>` where
+        // `E = Engine`). Falls back to `Arc<EngineHandle>` for
+        // backwards compat with B-dense.1 callers + tests.
+        let engine_or_other = match engine_dyn.downcast::<Engine>() {
+            Ok(engine_arc) => {
+                // Production path — pull the descriptor from the
+                // Engine itself; the cfg parameter is overridden on
+                // shape-equivalent fields. We trust the Engine's
+                // descriptor (it was captured at spawn from live
+                // weights); the `cfg` argument is only used to seed
+                // `max_decode_tokens` if the descriptor's value is
+                // 0 (defensive).
+                let descriptor = engine_arc.kv_spill_descriptor()?.clone();
+                let mut effective_cfg = Gemma4DenseConfig::from_descriptor(&descriptor);
+                if effective_cfg.max_decode_tokens == 0 {
+                    effective_cfg.max_decode_tokens = cfg.max_decode_tokens;
+                }
+                let spill = Self::new(effective_cfg).ok()?;
+                spill.set_engine_arc(engine_arc);
+                return Some(spill);
+            }
+            Err(other) => other,
+        };
+        // B-dense.1 fallback: try `Arc<EngineHandle>`.
+        let handle_arc = match engine_or_other.downcast::<EngineHandle>() {
             Ok(arc) => arc,
             Err(_other_dyn) => return None,
         };
@@ -1128,6 +1403,18 @@ impl Gemma4DenseSpill {
         // Arc-wrapped). The downcast Arc itself drops at end of scope.
         let handle: EngineHandle = (*handle_arc).clone();
         spill.set_engine_handle(handle);
+        Some(spill)
+    }
+
+    /// Phase B-dense.2 follow-up — direct constructor from
+    /// `Arc<Engine>` (skips the `Arc<dyn Any>` downcast). Used by
+    /// `cmd_serve` post-load wiring where the concrete `Arc<Engine>`
+    /// is already in hand. Reads the `KvSpillDescriptor` from the
+    /// engine; returns `None` if the engine is a Qwen35 variant
+    /// (descriptor will be `None`).
+    pub fn try_from_engine(engine: Arc<Engine>) -> Option<Self> {
+        let descriptor = engine.kv_spill_descriptor()?.clone();
+        let spill = Self::new_with_engine(descriptor, engine).ok()?;
         Some(spill)
     }
 }
@@ -1174,67 +1461,62 @@ impl crate::serve::kv_persist::registry::FamilyHookFactory for Gemma4DenseSpillF
         // 1. Try to materialize a fully-wired spill from the engine.
         //    None on type mismatch ⇒ no substitution.
         let spill = Gemma4DenseSpill::try_from_engine_arc(self.cfg.clone(), engine_dyn)?;
-        // 2. Same Arc<Gemma4DenseSpill> is referenced by both ends of
-        //    the tuple. The kv_hook side wraps in Mutex (per
-        //    KvCacheSpill::restore_block's &mut self contract); the
-        //    bindable side is a direct Arc<dyn EngineBindable>.
-        //
-        //    Note: a Mutex around the spill on the kv side does NOT
-        //    serialize against the registry side — bind_engine /
-        //    unbind_engine on the spill take the inner
-        //    `engine: Arc<RwLock<Option<EngineHandle>>>` lock directly,
-        //    not the outer Mutex. So a long-running restore_block
-        //    holding the outer Mutex doesn't block a bind/unbind.
+
+        // 2. Phase B-dense.2 follow-up: the spill produced in step 1
+        //    holds either an `Arc<Engine>` (production path) OR an
+        //    `EngineHandle` (B-dense.1 backwards-compat path). Build a
+        //    second spill instance for the spiller-side Mutex and
+        //    populate the SAME engine slot that's set on `spill`.
+        //    Both instances share the same engine state because
+        //    `Arc<Engine>` and `EngineHandle` are both Arc-wrapped.
         let spill_arc = Arc::new(spill);
         let bindable: Arc<dyn crate::serve::kv_persist::EngineBindable> = spill_arc.clone();
-        // The Mutex<dyn KvCacheSpill> tuple side wraps a fresh
-        // Gemma4DenseSpill clone — but Gemma4DenseSpill is NOT
-        // `Clone`. The standard pattern (mirrors how cmd_serve C.1
-        // splits the stub: `let stub = Arc::new(StubGemma4Spill); let
-        // stub_for_spiller: Arc<Mutex<dyn KvCacheSpill>> = Arc::new(Mutex::new(StubGemma4Spill));`)
-        // is to construct a *second* spill instance for the spiller
-        // side. The two instances share the same engine state through
-        // their inner `Arc<RwLock<Option<EngineHandle>>>` ONLY IF we
-        // bind both. To keep the two synchronized, we re-run
-        // try_from_engine_arc with a fresh clone of the type-erased
-        // engine — but we no longer have it after the move into the
-        // first call. Instead, we materialize the spiller-side spill
-        // from cfg + handle pulled directly from the bindable side's
-        // engine slot.
-        //
-        // Architecturally simpler approach: build TWO independent
-        // spill instances, each `set_engine_handle`'d from a clone of
-        // the EngineHandle. Both reach the same `dense_kvs:
-        // Arc<RwLock<Option<Vec<DenseKvBuffer>>>>` because EngineHandle
-        // is `Clone` and every field is `Arc`-wrapped.
-        let handle_for_spiller: EngineHandle = {
-            let g = spill_arc
-                .engine
-                .read()
-                .expect("Gemma4DenseSpill::engine RwLock poisoned");
-            // We just constructed + set_engine_handle'd this; it must
-            // be Some at this point.
-            match g.as_ref() {
-                Some(h) => h.clone(),
-                None => {
-                    // Defensive: if for some reason set_engine_handle
-                    // didn't take (lock poisoned, etc.), fall back to
-                    // returning None — the spiller side is unusable
-                    // without a handle.
-                    return None;
-                }
-            }
+
+        // Determine effective config — for the Arc<Engine> path we
+        // can re-derive from the engine's descriptor; for the
+        // EngineHandle path we fall back to self.cfg.
+        let spiller_side = if let Some(engine_for_spiller) = spill_arc
+            .engine_arc
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+        {
+            // Arc<Engine> production path. Both spill instances point
+            // at the same Arc<Engine>; the worker-thread bridge
+            // serializes any concurrent snapshot/restore calls
+            // through the channel anyway.
+            let descriptor = engine_for_spiller.kv_spill_descriptor()?.clone();
+            Gemma4DenseSpill::new_with_engine(descriptor, engine_for_spiller).ok()?
+        } else if let Some(handle_for_spiller) = spill_arc
+            .engine
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+        {
+            // B-dense.1 EngineHandle path.
+            let s = Gemma4DenseSpill::new(self.cfg.clone()).ok()?;
+            s.set_engine_handle(handle_for_spiller);
+            s
+        } else {
+            // Defensive: neither slot populated — spiller side is
+            // unusable without a bound engine.
+            return None;
         };
-        let spiller_side = match Gemma4DenseSpill::new(self.cfg.clone()) {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
-        spiller_side.set_engine_handle(handle_for_spiller);
         let kv_hook: Arc<Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>> =
             Arc::new(Mutex::new(spiller_side));
         Some((kv_hook, bindable))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase B-dense.2 follow-up — `EngineBindable` extension to also accept
+// `Arc<Engine>` in addition to the B-dense.1 `Arc<EngineHandle>` path.
+// ---------------------------------------------------------------------------
+//
+// `EngineBindable::bind_engine` already lives on the type. We extend
+// the impl above to recognize `Arc<Engine>` too — this is implemented
+// as a separate edit to the existing impl block in this file (search
+// for `impl crate::serve::kv_persist::EngineBindable for Gemma4DenseSpill`).
 
 // ---------------------------------------------------------------------------
 // Tests.
@@ -2269,5 +2551,195 @@ mod tests {
         let factory = Gemma4DenseSpillFactory::new(small_cfg(DType::F32));
         let result = factory.try_construct(dyn_view);
         assert!(result.is_none(), "non-EngineHandle ⇒ None");
+    }
+
+    // ========================================================================
+    // Phase B-dense.2 follow-up — Arc<Engine> downcast path tests.
+    //
+    // These verify that the production LoaderWrapper path (which
+    // delivers `Arc<Engine>`) now produces a real (non-stub) hook
+    // wired to the Engine's worker bridge. Falsifier for each test is
+    // documented inline.
+    // ========================================================================
+
+    /// Build a small descriptor matching small_cfg's shape. Keeps the
+    /// new tests aligned with the existing fixtures.
+    fn small_descriptor(kv_dtype: KvDType) -> KvSpillDescriptor {
+        KvSpillDescriptor {
+            sliding_window: 16,
+            max_decode_tokens: 32,
+            num_layers: 4,
+            layer_types: vec![
+                LayerType::Sliding,
+                LayerType::Sliding,
+                LayerType::Full,
+                LayerType::Sliding,
+            ],
+            nkv_heads: vec![2, 2, 1, 2],
+            head_dim: vec![8, 8, 16, 8],
+            kv_dtype,
+        }
+    }
+
+    /// B-dense.2-followup test 1: `try_from_engine_arc` succeeds on
+    /// `Arc<Engine>` (production path). Falsifier: returns None on a
+    /// real Arc<Engine>.
+    #[test]
+    fn followup_try_from_engine_arc_succeeds_on_arc_engine() {
+        let descriptor = small_descriptor(KvDType::F32);
+        let engine = Arc::new(
+            crate::serve::api::engine::make_synthetic_kv_engine_for_test(
+                descriptor.clone(),
+                vec![(0usize, 0x42u8)],
+            ),
+        );
+        let dyn_view: Arc<dyn std::any::Any + Send + Sync> = engine.clone();
+
+        // The cfg parameter is overridden by the engine's descriptor
+        // when the downcast hits Arc<Engine>; we still pass a sentinel
+        // cfg to verify the descriptor wins.
+        let sentinel_cfg = small_cfg(DType::F32);
+        let spill = Gemma4DenseSpill::try_from_engine_arc(sentinel_cfg, dyn_view)
+            .expect("Arc<Engine> downcast ⇒ Some(spill)");
+        // Snapshot returns Some — proves engine_arc is wired.
+        let bytes = spill
+            .snapshot_block(0, 0..4)
+            .expect("snapshot via engine_arc returns Some");
+        // Header parses cleanly.
+        let hdr = PayloadHeader::from_bytes(&bytes).expect("header");
+        assert_eq!(hdr.dtype, DtypeTag::F32);
+        // Layer 0 in small_descriptor is Sliding.
+        assert!(hdr.is_sliding);
+        assert_eq!(hdr.range_start, 0);
+        assert_eq!(hdr.range_end, 4);
+    }
+
+    /// B-dense.2-followup test 2: `try_from_engine_arc` returns None
+    /// on Arc<Engine> for a Qwen35-arch engine (no descriptor).
+    /// Falsifier: returns Some despite descriptor being None.
+    #[test]
+    fn followup_try_from_engine_arc_returns_none_on_qwen35_engine() {
+        // Qwen35 synthetic engine has kv_spill_descriptor == None.
+        let engine = Arc::new(
+            crate::serve::api::engine::make_synthetic_engine_for_test(
+                crate::serve::api::engine::LoadedArch::Qwen35,
+            ),
+        );
+        let dyn_view: Arc<dyn std::any::Any + Send + Sync> = engine;
+        let sentinel_cfg = small_cfg(DType::F32);
+        let result = Gemma4DenseSpill::try_from_engine_arc(sentinel_cfg, dyn_view);
+        assert!(result.is_none(), "Qwen35 engine ⇒ None (no descriptor)");
+    }
+
+    /// B-dense.2-followup test 3: end-to-end snapshot+restore via
+    /// Arc<Engine> path produces byte-exact round trip. Load-bearing
+    /// for H4. Falsifier: any byte mismatch in snapshot→restore→snapshot.
+    #[test]
+    fn followup_snapshot_restore_round_trip_via_arc_engine() {
+        let descriptor = small_descriptor(KvDType::F32);
+        // Producer engine: layer 1 seeded with 0x33.
+        let producer_engine = Arc::new(
+            crate::serve::api::engine::make_synthetic_kv_engine_for_test(
+                descriptor.clone(),
+                vec![(1usize, 0x33u8)],
+            ),
+        );
+        let producer_spill =
+            Gemma4DenseSpill::new_with_engine(descriptor.clone(), producer_engine.clone())
+                .expect("new_with_engine");
+        let payload = producer_spill
+            .snapshot_block(1, 0..8)
+            .expect("snapshot via Arc<Engine>");
+
+        // Consumer engine: empty.
+        let consumer_engine = Arc::new(
+            crate::serve::api::engine::make_synthetic_kv_engine_for_test(
+                descriptor.clone(),
+                vec![],
+            ),
+        );
+        let mut consumer_spill =
+            Gemma4DenseSpill::new_with_engine(descriptor.clone(), consumer_engine.clone())
+                .expect("new_with_engine consumer");
+        consumer_spill
+            .restore_block(1, 0..8, &payload)
+            .expect("restore via Arc<Engine>");
+
+        // Snapshot back from the consumer — bytes must match.
+        let payload2 = consumer_spill
+            .snapshot_block(1, 0..8)
+            .expect("snapshot consumer");
+        assert_eq!(
+            payload, payload2,
+            "snapshot→restore→snapshot is byte-exact"
+        );
+    }
+
+    /// B-dense.2-followup test 4: factory.try_construct via Arc<Engine>
+    /// path returns a real (non-stub) hook tuple. Falsifier: factory
+    /// rejects `Arc<Engine>` and returns None.
+    #[test]
+    fn followup_factory_try_construct_succeeds_on_arc_engine() {
+        use crate::serve::kv_persist::registry::FamilyHookFactory;
+
+        let descriptor = small_descriptor(KvDType::F32);
+        let engine = Arc::new(
+            crate::serve::api::engine::make_synthetic_kv_engine_for_test(
+                descriptor.clone(),
+                vec![(0usize, 0x55u8)],
+            ),
+        );
+        let dyn_view: Arc<dyn std::any::Any + Send + Sync> = engine;
+
+        let factory = Gemma4DenseSpillFactory::new(small_cfg(DType::F32));
+        let (kv_hook, _bindable_hook) = factory
+            .try_construct(dyn_view)
+            .expect("factory accepts Arc<Engine>");
+        let alignment = kv_hook
+            .lock()
+            .expect("kv_hook Mutex")
+            .block_alignment();
+        assert_eq!(alignment, BLOCK_TOKENS, "real Gemma4DenseSpill on kv side");
+        // Snapshot via the kv_hook side proves the Mutex-wrapped
+        // spill is wired to the engine.
+        let bytes = kv_hook.lock().unwrap().snapshot_block(0, 0..4);
+        assert!(
+            bytes.is_some(),
+            "kv_hook side wired via Arc<Engine> path produces snapshot bytes"
+        );
+    }
+
+    /// B-dense.2-followup test 5 (extra): EngineBindable accepts
+    /// `Arc<Engine>` directly. Mirrors the existing
+    /// `engine_bindable_gemma4_dense_round_trip_set_then_clear` for
+    /// the production path. Falsifier: bind_engine drops Arc<Engine>
+    /// silently and snapshot stays disabled.
+    #[test]
+    fn followup_engine_bindable_accepts_arc_engine() {
+        use crate::serve::kv_persist::EngineBindable;
+        let descriptor = small_descriptor(KvDType::F32);
+        let engine = Arc::new(
+            crate::serve::api::engine::make_synthetic_kv_engine_for_test(
+                descriptor.clone(),
+                vec![(0usize, 0x77u8)],
+            ),
+        );
+        let dyn_view: Arc<dyn std::any::Any + Send + Sync> = engine;
+
+        // Build a shape-only spill (no engine wired yet).
+        let hook = Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("new");
+        // Pre-bind: snapshot returns None.
+        assert!(hook.snapshot_block(0, 0..4).is_none());
+        // Bind via EngineBindable trait — accepts Arc<Engine> now.
+        EngineBindable::bind_engine(&hook, dyn_view);
+        // Post-bind: snapshot returns Some via the engine_arc path.
+        let out = hook.snapshot_block(0, 0..4);
+        assert!(
+            out.is_some(),
+            "snapshot active after bind_engine(Arc<Engine>)"
+        );
+        // Unbind clears both engine_arc + engine slots.
+        EngineBindable::unbind_engine(&hook);
+        assert!(hook.snapshot_block(0, 0..4).is_none());
     }
 }
