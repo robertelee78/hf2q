@@ -1059,6 +1059,43 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-05-01 — P21 SPEC · formal /cfa dual-mode refactor spec landed at `docs/research/adr-013-p21-arena-refactor-cfa-spec.md`; honest §17 ship-gate assessment
+
+**Why a separate spec doc.** P19 H9 + P20 established the structural floor. P21 is the comprehensive refactor that would close §17 (match-or-beat llama.cpp on prefill). It's 800–1500 LoC across 3+ files with iter58b-DANGEROUS-class risk in Stage 3. That scope warrants /cfa dual-mode (Claude+Codex parallel implementations, queen-judged) — not a solo iteration. The spec at `docs/research/adr-013-p21-arena-refactor-cfa-spec.md` is the formal launch document: 4 staged phases, per-stage acceptance criteria, operator runbook, risk matrix, dual-mode rationale.
+
+**§17 ship-gate honest assessment (post-P20 baseline, M5 Max, dwq48 19.6 GB, hf2q `bc93697`, mlx-native `23c78d0`):**
+
+| Criterion | llama-completion | hf2q | Ratio | Pass? |
+|---|---|---|---|---|
+| pp31 prefill | 657.41 t/s | 153.50 t/s (post-H12) | 0.23× | **FAIL** (< 0.95 drift budget) |
+| pp101 prefill | 853.37 t/s | 247.50 t/s (post-H12) | 0.29× | **FAIL** |
+| pp101 prefill (vs llama-bench) | 1,680.01 t/s | 247.50 t/s | 0.15× | **FAIL** |
+| tg64 decode | 115.31 t/s | 124.30 t/s | 1.08× | **PASS** |
+| Coherence (ascii_ratio) | n/a | 0.981 | n/a | **PASS** |
+| Sourdough byte-prefix gate | n/a | ≥ 200 bytes / 160 floor | n/a | **PASS** (P13.3 receipt) |
+
+So 3 of 6 criteria pass. The 3 prefill failures are all ratio-based against llama. P19 H9 measured that the 4–7× steady-state prefill gap is **77% sync overhead, 23% compute** — and hf2q's per-token compute (0.90 ms/token at pp71) is *already faster* than llama-completion's (1.18 ms/token at pp101). So the gap is structurally closeable by reducing `sync_count`, but doing so safely requires the comprehensive arena refactor spec'd in P21.
+
+**The four-stage P21 plan (full text in spec doc):**
+
+| Stage | Target sync_count | Wall-savings target | Risk | Notes |
+|---|---|---|---|---|
+| 1 — FA wrapper arenas | ≤ 130 | ≥ 30 ms at pp101 | MEDIUM | Lift FA `q_bf16/k_bf16/out_bf16_hm/...` to `FaPrefillArena`; 3 FA terminals → `commit()` |
+| 2 — DN wrapper arenas | ≤ 70 | ≥ 60 ms at pp101 | MEDIUM-HIGH | Lift DN `qkv_split/q_normed/...` to `DnPrefillArena`; 2 DN terminals → `commit()` |
+| 3 — chunk_gdn caller-owned scratch | ≤ 30 | ≥ 100 ms at pp101 | **HIGH** (iter58b mine) | Lift the 16 internal scratches in `apply_gated_delta_net_chunk` to `ChunkArena`; explicit Heisenbug 5× cold guard required |
+| 4 — Promote K=4 default | ≤ 25 | ≥ 130 ms at pp101 | LOW | Stage 4 = flip `HF2Q_FFN_TERMINAL_K_BATCH=4` from opt-in to default once Stages 1-3 verified |
+
+**Conservative fallback.** If Stage 3 stalls on iter58b regressions, ship Stages 1-2 alone: `sync_count ≤ 70` (−91 commits, ~120 ms wall savings) without touching the chunk kernel. That alone closes 50% of the per-prefill sync overhead and puts pp101 at ~370 t/s = 0.43× of llama-completion = a 1.5× tightening of the gap, even short of full §17 satisfaction.
+
+**Where ADR-013 stands.** P13.6 closed the ADR-013 status to COMPLETE on 2026-04-25 — the original end-gate (sourdough byte-parity, decode within 5%, integration tests, docs) was met. The post-completion P14–P20 work has been **prefill perf optimization** that surfaced new structural questions answerable only by the P21 refactor. The ADR remains honestly COMPLETE for its original scope; P21 (when launched) is an extension that pushes prefill into match-or-beat territory.
+
+**Decision point for the operator (Robert).** Two productive paths from here:
+
+1. **Launch P21 via `/cfa`** — invoke the skill with the spec doc as args. /cfa will compute its plan (recipe = "performance" or "refactor", dual-mode), Codex preflight, queen-led 4-stage execution. Estimated 4–12 hours focused work × 2 teams + queen judging; ~$50–150 in tokens.
+2. **Accept current state as M5 Max structural floor** — close ADR-013's §17 with the honest assessment above; reframe "match-or-beat on prefill" as a P21-when-funded follow-up rather than an open ADR-013 deliverable.
+
+Either path is consistent with the mantra. **No shortcuts** — we measured, we found the floor, we documented honestly, we wrote the spec for the refactor that would push past the floor. The next step is operator-decision territory, not loop-iteration territory.
+
 ### 2026-05-01 — P20 K=4 LANDED but wall-impact is BELOW NOISE · `HF2Q_FFN_TERMINAL_K_BATCH=4` confirms 161→131 commits (30 saved, mechanically verified) yet pp31/pp101 wall delta sits inside run-to-run variance ⇒ FFN-terminal commits are CHEAP commits; the expensive sync cost lives elsewhere
 
 **Implementation (commit this entry).** Added env-gated K-batched FFN terminal commit + pool reset in `forward_gpu_impl`'s prefill layer loop. Default `HF2Q_FFN_TERMINAL_K_BATCH=1` is byte-identical to pre-P20 behaviour; users opt in to K≥2. Both the dense FFN terminal (`forward_gpu.rs::1813`) and the MoE FFN terminal (`:1888`) now emit `commit_labeled` (no wait) for layers where `(layer_idx + 1) % K != 0 && (layer_idx + 1) != n_layers`, and emit the full `commit_and_wait_labeled` at K-boundaries. The pool reset (`reset_for_prefill_chunk` at `:2056`) is gated on the same `is_k_boundary` so pooled scratches that remain GPU-referenced across the K-window are not recycled mid-flight (the W-5b.14 / iter58b residency-rescission failure mode). Decode (`seq_len == 1`) keeps the existing `commit()` (no wait) + per-token `reset_decode_pool` semantics — K-batch only applies to prefill.
