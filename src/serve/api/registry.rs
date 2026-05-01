@@ -618,14 +618,49 @@ pub enum ToolCallEvent {
 /// `Content`-classified fragments then flow into `ToolCallSplitter`. The
 /// same tail-buffer discipline guarantees markers spanning fragment
 /// boundaries are still detected.
+/// Per-family in-call resync markers. When `ToolCallSplitter::feed` sees
+/// any of these literals while `in_tool_call=true`, the current call body
+/// is aborted (synthetic `ToolCallClose` emitted with the partial body)
+/// rather than absorbing the marker bytes into `ToolCallText`. iter-219c
+/// 2026-05-01 — closes the iter-218 LIVE-bug class structurally at the
+/// splitter level instead of relying on downstream defensive scrubbing.
+///
+/// Marker selection mirrors the registered family special-tokens that
+/// MUST NOT appear inside a tool-call body per the chat-template
+/// `tokenizer_config.json`'s regex: for Gemma 4, the call body is
+/// `<\|tool_call>(.*?)<tool_call\|>` — anything else (channel / turn /
+/// tool_response) is OUT-of-call. Seeing one of those mid-call indicates
+/// the model went off-template and the call MUST be aborted defensively.
+fn family_resync_markers(open_marker: &str) -> &'static [&'static str] {
+    match open_marker {
+        "<|tool_call>" => &[
+            // Gemma 4 family.
+            "<|tool_response>", "<tool_response|>",
+            "<|channel>", "<channel|>",
+            "<|turn>", "<turn|>",
+        ],
+        "<tool_call>" => &[
+            // Qwen 3.5/3.6 family.
+            "<think>", "</think>",
+        ],
+        _ => &[],
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolCallSplitter {
     open_marker: &'static str,
     close_marker: &'static str,
+    /// iter-219c (2026-05-01): markers that, when observed inside a
+    /// tool-call body (`in_tool_call=true`), trigger a synthetic
+    /// `ToolCallClose` (abort). Derived from `family_resync_markers` at
+    /// construction.
+    in_call_resync: &'static [&'static str],
     in_tool_call: bool,
     /// Sliding tail of decoded text — long enough to see either marker span
     /// across token boundaries. See `ReasoningSplitter::tail_buf` for the
-    /// identical mechanism.
+    /// identical mechanism. iter-219c: tail_cap now must accommodate the
+    /// LONGEST resync marker too.
     tail_buf: String,
     tail_cap: usize,
 }
@@ -638,10 +673,17 @@ impl ToolCallSplitter {
             (Some(o), Some(c)) if !o.is_empty() && !c.is_empty() => (o, c),
             _ => return None,
         };
-        let cap = open.len().max(close.len()).max(1);
+        let in_call_resync = family_resync_markers(open);
+        // tail_cap must accommodate the longest of: open, close, any resync
+        // marker — so all marker types are detectable across token boundaries.
+        let mut cap = open.len().max(close.len()).max(1);
+        for m in in_call_resync {
+            cap = cap.max(m.len());
+        }
         Some(Self {
             open_marker: open,
             close_marker: close,
+            in_call_resync,
             in_tool_call: false,
             tail_buf: String::with_capacity(cap * 2),
             tail_cap: cap,
@@ -671,14 +713,71 @@ impl ToolCallSplitter {
         let mut out_cursor = 0usize;
 
         loop {
-            let active_marker = if self.in_tool_call {
-                self.close_marker
+            // iter-219c (2026-05-01): in BOTH states, scan for the
+            // active state-flip marker AND any stray family markers
+            // that should be swallowed.
+            //
+            //   in_tool_call=true:
+            //     - close_marker → state-flip (ToolCallClose)
+            //     - resync markers (`<|tool_response>`, `<|channel>`, `<|turn>`)
+            //       → state-flip (synthetic ToolCallClose, call aborted) +
+            //       swallow the marker bytes
+            //   in_tool_call=false:
+            //     - open_marker → state-flip (ToolCallOpen)
+            //     - close_marker (stray) → swallow (no event; just advance)
+            //     - resync markers (stray) → swallow (no event; just advance)
+            //
+            // The "swallow stray" path keeps registered family markers
+            // out of `delta.content` even when they appear in unexpected
+            // positions (e.g. post-abort tail bytes after iter-219c
+            // synthesizes a ToolCallClose). Without this, a `<tool_call|>`
+            // following an aborted call would bleed into Content.
+            #[derive(Clone, Copy)]
+            enum Hit { StateFlip(&'static str), Swallow(&'static str) }
+            let hit: Option<(usize, Hit)> = if self.in_tool_call {
+                let mut best: Option<(usize, Hit)> = scan[scan_cursor..]
+                    .find(self.close_marker)
+                    .map(|r| (r, Hit::StateFlip(self.close_marker)));
+                for &resync in self.in_call_resync {
+                    if let Some(r) = scan[scan_cursor..].find(resync) {
+                        match best {
+                            None => best = Some((r, Hit::StateFlip(resync))),
+                            Some((b, _)) if r < b => best = Some((r, Hit::StateFlip(resync))),
+                            _ => {}
+                        }
+                    }
+                }
+                best
             } else {
-                self.open_marker
+                let mut best: Option<(usize, Hit)> = scan[scan_cursor..]
+                    .find(self.open_marker)
+                    .map(|r| (r, Hit::StateFlip(self.open_marker)));
+                // Stray close_marker outside a call → swallow.
+                if let Some(r) = scan[scan_cursor..].find(self.close_marker) {
+                    match best {
+                        None => best = Some((r, Hit::Swallow(self.close_marker))),
+                        Some((b, _)) if r < b => best = Some((r, Hit::Swallow(self.close_marker))),
+                        _ => {}
+                    }
+                }
+                // Stray in-call markers outside a call → swallow.
+                for &resync in self.in_call_resync {
+                    if let Some(r) = scan[scan_cursor..].find(resync) {
+                        match best {
+                            None => best = Some((r, Hit::Swallow(resync))),
+                            Some((b, _)) if r < b => best = Some((r, Hit::Swallow(resync))),
+                            _ => {}
+                        }
+                    }
+                }
+                best
             };
-            match scan[scan_cursor..].find(active_marker) {
-                Some(rel) => {
+            match hit {
+                Some((rel, kind)) => {
                     let marker_start = scan_cursor + rel;
+                    let marker = match kind {
+                        Hit::StateFlip(m) | Hit::Swallow(m) => m,
+                    };
                     // Emit text [out_cursor..marker_start] as the current slot.
                     if marker_start > out_cursor {
                         let text = scan[out_cursor..marker_start].to_string();
@@ -688,14 +787,21 @@ impl ToolCallSplitter {
                             out.push(ToolCallEvent::Content(text));
                         }
                     }
-                    // Flip state + emit the open/close synthetic event.
-                    if self.in_tool_call {
-                        out.push(ToolCallEvent::ToolCallClose);
-                    } else {
-                        out.push(ToolCallEvent::ToolCallOpen);
+                    match kind {
+                        Hit::StateFlip(_) => {
+                            // Emit the open/close synthetic event + flip state.
+                            if self.in_tool_call {
+                                out.push(ToolCallEvent::ToolCallClose);
+                            } else {
+                                out.push(ToolCallEvent::ToolCallOpen);
+                            }
+                            self.in_tool_call = !self.in_tool_call;
+                        }
+                        Hit::Swallow(_) => {
+                            // Marker swallowed — no event, no state change.
+                        }
                     }
-                    self.in_tool_call = !self.in_tool_call;
-                    scan_cursor = marker_start + active_marker.len();
+                    scan_cursor = marker_start + marker.len();
                     out_cursor = scan_cursor;
                 }
                 None => {
@@ -2324,6 +2430,140 @@ mod tests {
                 ToolCallEvent::Content("after".into()),
             ]
         );
+    }
+
+    /// iter-219c (2026-05-01) — when the model emits a registered in-call
+    /// resync marker (`<|tool_response>`, `<|channel>`, `<|turn>` for
+    /// gemma4) MID-tool-call-body, the splitter MUST abort the call by
+    /// emitting a synthetic ToolCallClose (with the partial body as
+    /// ToolCallText) instead of absorbing the marker bytes verbatim.
+    /// This closes the iter-218 LIVE-bug class structurally at the
+    /// splitter level — the validity-gate + content-fallback-scrub
+    /// downstream layers (iter-219b) catch the SYMPTOM; iter-219c catches
+    /// the CAUSE.
+    ///
+    /// Pre-iter-219c: this test FAILS — splitter emits
+    /// `ToolCallText("call:get_current<|tool_response>call:get_current_weather{...}")`.
+    /// Post-iter-219c: this test PASSES — splitter emits
+    /// `ToolCallText("call:get_current")`, `ToolCallClose` (synthetic),
+    /// then re-enters non-tool-call state for the rest.
+    #[test]
+    fn iter219c_in_call_tool_response_aborts_with_synthetic_close() {
+        let out = tcfeed(
+            &GEMMA4,
+            "<|tool_call>call:get_current<|tool_response>call:get_current_weather{x:1}<tool_call|>",
+        );
+        let joined = tc_coalesce(&out);
+        // The splitter MUST recognize <|tool_response> as a resync marker
+        // and abort the malformed call. The synthetic ToolCallClose fires
+        // when the resync is observed; subsequent text re-enters non-tool-call
+        // routing (Content), where the second `<|tool_call>` reopens a NEW
+        // call cleanly.
+        assert!(
+            matches!(joined.as_slice(),
+                [
+                    ToolCallEvent::ToolCallOpen,
+                    ToolCallEvent::ToolCallText(t1),
+                    ToolCallEvent::ToolCallClose,
+                    // Optional Content between the abort and the next open
+                    // (resync marker bytes are swallowed; whatever followed
+                    // before `<|tool_call>` becomes Content).
+                    ..
+                ] if t1 == "call:get_current"
+            ),
+            "iter-219c: splitter MUST abort on in-call <|tool_response> with \
+             ToolCallText(partial body) + synthetic ToolCallClose. Got: {joined:#?}"
+        );
+        // Stronger: no event in the sequence should contain `<|tool_response>`
+        // as text — the marker bytes MUST be swallowed.
+        for ev in &joined {
+            match ev {
+                ToolCallEvent::ToolCallText(t) | ToolCallEvent::Content(t) => {
+                    assert!(
+                        !t.contains("<|tool_response>") && !t.contains("<tool_response|>"),
+                        "iter-219c: resync marker leaked into text event: {ev:#?}"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// iter-219c sibling — `<|channel>` mid-call (Gemma 4 reasoning
+    /// channel reopened inside a tool body) MUST also abort. NOTE: in
+    /// production the `ReasoningSplitter` runs upstream of
+    /// `ToolCallSplitter` and would have absorbed `<|channel>...<channel|>`
+    /// before reaching here — this test exercises the splitter in
+    /// isolation to verify it recognizes `<|channel>` as a resync marker
+    /// (so the call aborts cleanly even if upstream routing fails). The
+    /// test does NOT assert the `<channel|>` close-marker is scrubbed
+    /// from Content because that's `ReasoningSplitter`'s contract, not
+    /// `ToolCallSplitter`'s.
+    #[test]
+    fn iter219c_in_call_channel_marker_aborts() {
+        let out = tcfeed(
+            &GEMMA4,
+            "<|tool_call>call:f<|channel>thought<channel|>{x:1}<tool_call|>",
+        );
+        let joined = tc_coalesce(&out);
+        // Iterate looking for the abort pattern: ToolCallOpen → ToolCallText
+        // (containing only `call:f`) → ToolCallClose.
+        let saw_clean_partial = joined.windows(3).any(|w| {
+            matches!(w,
+                [
+                    ToolCallEvent::ToolCallOpen,
+                    ToolCallEvent::ToolCallText(t),
+                    ToolCallEvent::ToolCallClose,
+                ] if t == "call:f"
+            )
+        });
+        assert!(
+            saw_clean_partial,
+            "iter-219c: <|channel> mid-call MUST trigger abort; expected \
+             ToolCallText(\"call:f\") + synthetic ToolCallClose; got: {joined:#?}"
+        );
+        // `<|channel>` (open marker, in resync set) MUST be swallowed.
+        // `<channel|>` (close marker, NOT in our resync set; handled by
+        // ReasoningSplitter upstream) may appear in Content here — that's
+        // fine for the unit-isolation test; production never sees it.
+        for ev in &joined {
+            if let ToolCallEvent::ToolCallText(t) = ev {
+                assert!(
+                    !t.contains("<|channel>"),
+                    "iter-219c: <|channel> leaked into ToolCallText: {ev:#?}"
+                );
+            }
+        }
+    }
+
+    /// iter-219c regression-guard — close_marker that comes BEFORE any
+    /// resync marker still wins (existing happy-path behavior unchanged).
+    #[test]
+    fn iter219c_close_before_resync_still_wins() {
+        let out = tcfeed(
+            &GEMMA4,
+            // Clean call, then post-close `<|tool_response>` (legitimate —
+            // host emits tool_response after the call closes; that's
+            // post-close territory, not in-call).
+            "<|tool_call>call:f{x:1}<tool_call|><|tool_response>tool_result<tool_response|>",
+        );
+        let joined = tc_coalesce(&out);
+        // The first 4 events must be the clean happy-path:
+        //   Open, Text("call:f{x:1}"), Close, Content(...)
+        assert!(
+            joined.len() >= 4,
+            "iter-219c happy path: expected ≥4 events; got {joined:#?}"
+        );
+        match (&joined[0], &joined[1], &joined[2]) {
+            (
+                ToolCallEvent::ToolCallOpen,
+                ToolCallEvent::ToolCallText(t),
+                ToolCallEvent::ToolCallClose,
+            ) if t == "call:f{x:1}" => {}
+            _ => panic!(
+                "iter-219c: close_marker MUST win over later resync; got: {joined:#?}"
+            ),
+        }
     }
 
     #[test]
