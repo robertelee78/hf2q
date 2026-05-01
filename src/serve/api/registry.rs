@@ -764,6 +764,29 @@ pub struct ParsedToolCall {
     pub arguments_json: String,
 }
 
+/// Validate an OpenAI-spec function name. Tool names are required to match
+/// `^[a-zA-Z0-9_-]+$` per the OpenAI tool-spec — no special-token bytes,
+/// no whitespace, no nested call/colon syntax.
+///
+/// **iter-219b (2026-05-01)**: this gate exists because the model can emit
+/// known special-token literals (`<|tool_response>`, `<|channel>`, etc.)
+/// MID-tool-call-body; the splitter — which only knows the tool-call
+/// open/close marker pair — concatenates those literals into the body
+/// buffer verbatim. Without name validation, `extract_gemma4_name_prefix`
+/// (engine.rs) and `parse_gemma4_tool_call` / `parse_qwen35_tool_call`
+/// below cheerfully return polluted names like
+/// `get_current<|tool_response>call:get_current_weather` to the SSE
+/// encoder, which proxies them straight to OpenAI clients as
+/// `delta.tool_calls.function.name` — surfaced in iter-218 LIVE testing
+/// as the malformed `get_currentcall:get_current_weather`. Returning
+/// `None`/false from the validity check triggers the existing Auto-policy
+/// content-fallback path, which is the OpenAI-spec-correct behavior for
+/// an unparseable tool-call body.
+pub fn is_valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// Parse a tool-call body emitted between the open/close markers.
 ///
 /// Day-one supports two per-family syntaxes:
@@ -798,7 +821,11 @@ fn parse_gemma4_tool_call(body: &str) -> Option<ParsedToolCall> {
     let rest = body.strip_prefix("call:")?;
     let brace_start = rest.find('{')?;
     let name = rest[..brace_start].trim().to_string();
-    if name.is_empty() {
+    // iter-219b (2026-05-01): reject names that contain special-token
+    // bytes the splitter couldn't trim (e.g. `<|tool_response>` emitted
+    // mid-call). OpenAI spec requires `[a-zA-Z0-9_-]+`. Returning None
+    // triggers the existing content-fallback path.
+    if !is_valid_tool_name(&name) {
         return None;
     }
     // Match braces — body of args ends at the LAST `}` (Gemma can have
@@ -893,7 +920,10 @@ fn parse_qwen35_tool_call(body: &str) -> Option<ParsedToolCall> {
     let after_func = body.strip_prefix("<function=")?;
     let name_end = after_func.find('>')?;
     let name = after_func[..name_end].trim().to_string();
-    if name.is_empty() {
+    // iter-219b (2026-05-01): reject special-token-polluted names. See the
+    // gemma4 sibling for the failure-mode rationale; same OpenAI-spec
+    // identifier contract applies to qwen35's `<function=NAME>` extraction.
+    if !is_valid_tool_name(&name) {
         return None;
     }
     let after_name_close = &after_func[name_end + 1..];

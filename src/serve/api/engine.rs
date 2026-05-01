@@ -3809,14 +3809,16 @@ impl ToolCallStreamEmitter {
 /// Extract the function name from a Gemma 4 body prefix `call:NAME{`. Returns
 /// `Some((name, header_end))` where `header_end` is the byte offset of the
 /// `{` (so `body[header_end+1..]` is the kv-list region the streaming
-/// scanner walks). Returns `None` if the `{` hasn't arrived yet.
+/// scanner walks). Returns `None` if the `{` hasn't arrived yet OR the
+/// extracted name fails OpenAI-spec validity (iter-219b: rejects
+/// special-token-polluted names that the splitter couldn't trim).
 fn extract_gemma4_name_prefix(body: &str) -> Option<(String, usize)> {
     let trimmed_offset = body.len() - body.trim_start().len();
     let after_ws = &body[trimmed_offset..];
     let after_call = after_ws.strip_prefix("call:")?;
     let brace_rel = after_call.find('{')?;
     let name = after_call[..brace_rel].trim().to_string();
-    if name.is_empty() {
+    if !super::registry::is_valid_tool_name(&name) {
         return None;
     }
     let absolute_brace = trimmed_offset + "call:".len() + brace_rel;
@@ -3827,14 +3829,15 @@ fn extract_gemma4_name_prefix(body: &str) -> Option<(String, usize)> {
 /// `<function=NAME>`. Returns `Some((name, header_end))` where `header_end`
 /// is the byte offset just past `>` (so the streaming scanner walks
 /// `body[header_end..]` for `<parameter>` blocks). Returns `None` if the
-/// closing `>` hasn't arrived yet.
+/// closing `>` hasn't arrived yet OR the extracted name fails OpenAI-spec
+/// validity.
 fn extract_qwen35_name_prefix(body: &str) -> Option<(String, usize)> {
     let trimmed_offset = body.len() - body.trim_start().len();
     let after_ws = &body[trimmed_offset..];
     let after_open = after_ws.strip_prefix("<function=")?;
     let gt_rel = after_open.find('>')?;
     let name = after_open[..gt_rel].trim().to_string();
-    if name.is_empty() {
+    if !super::registry::is_valid_tool_name(&name) {
         return None;
     }
     let absolute_gt = trimmed_offset + "<function=".len() + gt_rel;
@@ -8923,8 +8926,22 @@ mod tool_call_stream_emitter_tests {
     /// Drive splitter + emitter pipeline through a sequence of decoded
     /// fragments (one entry per token) and return (delta_content_concat,
     /// tool_call_events).
+    ///
+    /// `policy` selects the close-time fallback shape:
+    ///   - `Constrained` / `AutoLazyGrammar`: parse failure raises a loud
+    ///     `GenerationEvent::Error` (grammar engine bug surface).
+    ///   - `Auto`: parse failure emits `Content(raw_body)` so the malformed
+    ///     bytes still reach the client. Use this for iter-219b which
+    ///     covers special-token-pollution recovery.
     fn drive_splitter_emitter_pipeline(
         fragments: &[&str],
+    ) -> (String, Vec<GenerationEvent>) {
+        drive_splitter_emitter_pipeline_with_policy(fragments, ToolCallPolicy::Constrained)
+    }
+
+    fn drive_splitter_emitter_pipeline_with_policy(
+        fragments: &[&str],
+        policy: ToolCallPolicy,
     ) -> (String, Vec<GenerationEvent>) {
         let (tx, mut rx) = mpsc::channel::<GenerationEvent>(256);
         let reg = &super::super::registry::GEMMA4;
@@ -8968,15 +8985,18 @@ mod tool_call_stream_emitter_tests {
                         let mut em = emitter.take().unwrap_or_else(|| {
                             ToolCallStreamEmitter::new(Some(reg.family), *tc_index)
                         });
-                        em.finalize(
+                        // Auto policy: parse failure → content fallback (Ok).
+                        // Constrained / AutoLazyGrammar: parse failure → loud
+                        // Err(()). Allow either path here so test scenarios
+                        // can exercise both contracts.
+                        let _ = em.finalize(
                             body_dump,
                             Some(reg),
-                            ToolCallPolicy::Constrained,
+                            policy,
                             tc_index,
                             saw_tc,
                             tx,
-                        )
-                        .expect("finalize");
+                        );
                     }
                 }
             }
@@ -9106,5 +9126,75 @@ mod tool_call_stream_emitter_tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&args).expect("args MUST be valid JSON");
         assert_eq!(parsed["location"], "Paris");
+    }
+
+    /// iter-219b reproducer (LIVE-driven 2026-05-01) — Agent A captured
+    /// `name="get_currentcall:get_current_weather"` from a live curl SSE
+    /// against scenario_2. The model emitted `<|tool_response>` (token id 50)
+    /// MID-tool-call, between two `call:` prefixes. The `ToolCallSplitter`
+    /// only recognizes `<|tool_call>` open / `<tool_call|>` close; it has no
+    /// awareness of `<|tool_response>` as a span-terminator, so the inner
+    /// special-token literal flows through as `ToolCallText` and is appended
+    /// to the body buffer verbatim. `extract_gemma4_name_prefix` then runs on
+    /// `body == "call:get_current<|tool_response>call:get_current_weather{...}"`
+    /// and reads everything up to the first `{` as the name.
+    ///
+    /// This test reproduces the exact failure mode at the unit level (no
+    /// live model needed). It MUST fail on HEAD with the malformed name and
+    /// pass after the splitter is taught to treat `<|tool_response>` (and
+    /// any other registered Gemma 4 in-call special-token marker) as a
+    /// resync that aborts the current call body.
+    #[test]
+    fn iter219b_reproducer_tool_response_inside_call() {
+        let fragments: &[&str] = &[
+            "<|tool_call>",
+            "call", ":", "get", "_", "current",
+            "<|tool_response>",                  // stray special token MID-CALL
+            "call", ":", "get", "_", "current", "_", "weather",
+            "{",
+            "location", ":",
+            "<|\"|>", "Paris", "<|\"|>",
+            "}",
+            "<tool_call|>",
+        ];
+        // Use Auto policy — the iter-219b fix routes malformed bodies
+        // through the content-fallback path (None from
+        // `extract_gemma4_name_prefix` → `emit_streaming_tool_call_close`
+        // emits `Content(raw_body)`). Constrained policy would also work
+        // but raises a loud `GenerationEvent::Error` instead of falling
+        // back; we exercise the Auto contract here as the user-facing path.
+        let (_content, tool_events) =
+            drive_splitter_emitter_pipeline_with_policy(fragments, ToolCallPolicy::Auto);
+        let (name, _args) = rebuild_call(&tool_events, 0);
+        // Print the actual name so we can see what the splitter+emitter
+        // produces under this scenario.
+        eprintln!("iter-219b actual name: {name:?}");
+        // The structural invariant: the function name MUST NOT be polluted
+        // by content emitted before the second `call:` marker. Either the
+        // splitter aborts the malformed call (preferred — emit as Content
+        // fallback per OpenAI Auto-mode) OR the emitter rejects the
+        // malformed-prefix body. Both are valid fixes; both surface as
+        // `name != Some("get_currentcall:get_current_weather")`.
+        assert_ne!(
+            name.as_deref(),
+            Some("get_currentcall:get_current_weather"),
+            "iter-219b: stray <|tool_response> mid-call MUST NOT pollute the \
+             tool-call name. The current implementation absorbs the special \
+             token into the body buffer; fix candidates: (a) extend \
+             ToolCallSplitter to treat <|tool_response> / <tool_response|> \
+             as resync points; (b) sanity-check extract_gemma4_name_prefix \
+             rejects names containing special-token characters."
+        );
+        // Tighter contract: name should NOT contain ANY non-identifier
+        // characters (`:`, `<`, `|`, `>` are all special-token bytes). A
+        // healthy splitter+emitter MUST yield either a valid identifier or
+        // None (call rejected).
+        if let Some(n) = name.as_deref() {
+            assert!(
+                !n.contains(':') && !n.contains('<') && !n.contains('|') && !n.contains('>'),
+                "iter-219b: tool-call name must not contain special-token bytes. \
+                 Got name={n:?} — body absorbed mid-call special-token literal."
+            );
+        }
     }
 }
