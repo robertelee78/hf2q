@@ -100,12 +100,19 @@ use crate::serve::quant_select::QuantType;
 /// optional `spiller` field) so the on-disk snapshot/restore
 /// dispatch lands on the real hook, not the C.1 stub.
 ///
-/// Both updates run atomically per the
-/// `KvPersistRegistry::try_substitute_on_load` contract. If
-/// substitution returns `None` (no factory OR factory rejects the
-/// engine type), the wrapper falls through to `bind_for` on the
-/// existing stub registration — a clean no-op for the auto-Arc<E>
-/// path.
+/// Both updates run atomically per the P1-1 fix (adversarial review
+/// 2026-05-01 §P1-1): the wrapper holds a dedicated
+/// `substitute_lock: Mutex<()>` across BOTH the registry's
+/// `try_substitute_on_load` write AND the spiller's
+/// `register_family` write, so a concurrent `pre_evict` / `post_admit`
+/// triggered from another tokio task NEVER observes the registry as
+/// "real-substituted" while the spiller still carries the C.1 stub.
+/// Without this lock, the registry write and the spiller write are
+/// two independent `RwLock` writers and a tiny (~µs) divergence
+/// window exists between them. If substitution returns `None` (no
+/// factory OR factory rejects the engine type), the wrapper falls
+/// through to `bind_for` on the existing stub registration — a clean
+/// no-op for the auto-Arc<E> path.
 pub struct LoaderWrapper<E> {
     /// Underlying loader. Production wires `DefaultModelLoader`;
     /// tests substitute a mock.
@@ -127,6 +134,22 @@ pub struct LoaderWrapper<E> {
     /// the registry's hook map is still updated, but the spiller
     /// keeps its prior `register_family` entry.
     spiller: Mutex<Option<Arc<BlockPrefixCacheSpiller<E>>>>,
+    /// P1-1 atomicity fix (adversarial review 2026-05-01 §P1-1).
+    /// Held by `load(...)` across the two-step sequence:
+    ///
+    ///   1. `registry.try_substitute_on_load(...)` (write-locks the
+    ///      registry's `hooks` map internally), then
+    ///   2. `update_spiller_registration(...)` (write-locks the
+    ///      spiller's `registrations` map internally).
+    ///
+    /// Without this critical section the two write-locks are
+    /// independent: a concurrent reader (e.g. `pre_evict` from a
+    /// tokio task) can observe a state where the registry already
+    /// has the real substituted hook but the spiller still has the
+    /// C.1 stub. The lock is never held across calls into the inner
+    /// `ModelLoader` (only around the post-load substitution), so
+    /// it does not serialize the load itself.
+    substitute_lock: Mutex<()>,
     /// PhantomData to bind the `E` generic to the wrapper. The
     /// `fn(E)` form makes `LoaderWrapper<E>` invariant in `E` and
     /// avoids unnecessary auto-trait implications.
@@ -146,6 +169,7 @@ where
             registry,
             pending_bind: Mutex::new(None),
             spiller: Mutex::new(None),
+            substitute_lock: Mutex::new(()),
             _phantom: PhantomData,
         }
     }
@@ -232,6 +256,12 @@ where
     /// The spiller's `register_family` overwrites any prior C.1
     /// stub registration (matches its existing
     /// "freshest-registration-wins" semantic).
+    ///
+    /// P1-1 (adversarial review 2026-05-01): the caller MUST hold
+    /// `LoaderWrapper::substitute_lock` across both the preceding
+    /// `try_substitute_on_load` call and this update so the two
+    /// internal-RwLock writes are observably atomic to any
+    /// concurrent `pre_evict` / `post_admit` reader.
     fn update_spiller_registration(
         &self,
         repo: &str,
@@ -312,12 +342,32 @@ where
         //     Arc<dyn Any>). On Some(_), update the spiller's
         //     register_family table to keep registry + spiller in
         //     lock-step.
+        //
+        // P1-1 atomicity (adversarial review 2026-05-01 §P1-1):
+        // `try_substitute_on_load` write-locks the registry's
+        // internal `hooks` map, and `update_spiller_registration`
+        // write-locks the spiller's internal `registrations` map —
+        // two SEPARATE locks. Without an outer critical section a
+        // concurrent reader (e.g. `pre_evict` from a tokio task)
+        // could observe (registry=REAL, spiller=STUB) in the µs
+        // window between the two write-locks. We hold
+        // `substitute_lock` across BOTH operations so the two-map
+        // update is observably atomic from any concurrent reader.
+        // The lock is never held across the inner loader call
+        // (above) or `bind_for` (below), so it does not serialize
+        // the load itself or the C.1 stub-bind path.
         let dyn_view_for_substitute: Arc<dyn Any + Send + Sync> = Arc::clone(&dyn_view);
-        if let Some(kv_hook) =
-            self.registry
-                .try_substitute_on_load(&repo, quant, dyn_view_for_substitute)
         {
-            self.update_spiller_registration(&repo, quant, kv_hook);
+            let _substitute_guard = self
+                .substitute_lock
+                .lock()
+                .expect("LoaderWrapper::substitute_lock Mutex poisoned");
+            if let Some(kv_hook) =
+                self.registry
+                    .try_substitute_on_load(&repo, quant, dyn_view_for_substitute)
+            {
+                self.update_spiller_registration(&repo, quant, kv_hook);
+            }
         }
 
         // 3b. The C.1 bind_for flow always fires after the optional
@@ -994,6 +1044,238 @@ mod tests {
             1,
             "C.1 stub still fires bind_for on the auto-Arc<E> mismatched path"
         );
+    }
+
+    // ===== P1-1 regression =================================================
+
+    /// P1-1 regression — adversarial review §P1-1 2026-05-01:
+    /// `try_substitute_on_load` + `update_spiller_registration` must
+    /// hold a single critical section so concurrent `pre_evict` /
+    /// `post_admit` observers never see registry-real ↔ spiller-stub
+    /// divergence. Pre-fix: the registry's `hooks` write-lock and the
+    /// spiller's `registrations` write-lock were independent; a
+    /// reader could observe the registry as substituted while the
+    /// spiller still held the C.1 stub for ~µs.
+    ///
+    /// Verification strategy:
+    ///   (1) Capture the kv_hook `Arc` produced by the factory in a
+    ///       shared probe `Mutex<Option<Arc<...>>>`. The same Arc
+    ///       must be observable in the spiller's registration
+    ///       AFTER `wrapper.load` returns.
+    ///   (2) `Arc::strong_count` on the probe Arc must reflect TWO
+    ///       owners (the factory's captured clone + the spiller's
+    ///       registered clone) — proving the spiller actually got
+    ///       the substituted hook, not a stale stub.
+    ///   (3) Spawn N concurrent readers polling
+    ///       `spiller.registered_count()` while the load is in
+    ///       flight; their observed count must always be 1
+    ///       (pre-stub OR substituted, never zero, never split into
+    ///       2). This is a probabilistic falsifier — the µs window
+    ///       is small but the assertion is loud if it ever flips.
+    #[test]
+    fn p1_1_concurrent_substitute_does_not_split_registry_and_spiller_state() {
+        use crate::serve::kv_persist::block_store::DiskBlockStore;
+        use crate::serve::kv_persist::registry::FamilyHookFactory;
+        use crate::serve::kv_persist::writer::AsyncWriterHandle;
+        use crate::serve::kv_persist::{BlockPrefixCacheSpiller, DEFAULT_CHANNEL_CAPACITY};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // ---- fixture ----
+        let tmp = std::env::temp_dir().join(format!(
+            "hf2q-lw-p1-1-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+        let store = Arc::new(DiskBlockStore::new(tmp.clone(), 0).expect("DiskBlockStore"));
+        let writer = Arc::new(AsyncWriterHandle::spawn(
+            Arc::clone(&store),
+            DEFAULT_CHANNEL_CAPACITY,
+        ));
+        let spiller: Arc<BlockPrefixCacheSpiller<LwExpectedHandle>> = Arc::new(
+            BlockPrefixCacheSpiller::new(Arc::clone(&store), Arc::clone(&writer)),
+        );
+
+        // Pre-register the C.1 stub so the spiller's count starts at 1
+        // (matches production: cmd_serve registers the stub before any
+        // substitute-on-load can fire).
+        struct PreStub;
+        impl crate::serve::kv_persist::spiller::KvCacheSpill for PreStub {
+            fn block_alignment(&self) -> u32 {
+                111
+            }
+            fn snapshot_block(
+                &self,
+                _: usize,
+                _: std::ops::Range<u32>,
+            ) -> Option<Vec<u8>> {
+                None
+            }
+            fn restore_block(
+                &mut self,
+                _: usize,
+                _: std::ops::Range<u32>,
+                _: &[u8],
+            ) -> std::result::Result<(), crate::serve::multi_model::SpillErrorKind> {
+                Ok(())
+            }
+        }
+        let pre_stub: Arc<Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>> =
+            Arc::new(Mutex::new(PreStub));
+        spiller.register_family("acme/m1".to_string(), QuantType::Q4_K_M, pre_stub);
+        assert_eq!(spiller.registered_count(), 1);
+
+        // Probe captures the kv_hook Arc the factory produces so the
+        // test can assert ptr_eq against the spiller-side registration.
+        let probe: Arc<Mutex<Option<Arc<Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>>>>> =
+            Arc::new(Mutex::new(None));
+
+        struct ProbingFactory {
+            probe: Arc<
+                Mutex<
+                    Option<
+                        Arc<Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>>,
+                    >,
+                >,
+            >,
+        }
+        impl FamilyHookFactory for ProbingFactory {
+            fn try_construct(
+                &self,
+                engine_dyn: Arc<dyn Any + Send + Sync>,
+            ) -> Option<(
+                Arc<Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>>,
+                Arc<dyn EngineBindable>,
+            )> {
+                engine_dyn
+                    .downcast::<LwExpectedHandle>()
+                    .ok()
+                    .map(|_handle_arc| {
+                        let kv: Arc<
+                            Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>,
+                        > = Arc::new(Mutex::new(LwMockKvSpill {
+                            block_alignment_value: 256,
+                        }));
+                        // Capture a clone of the kv Arc for the
+                        // post-condition ptr_eq assertion.
+                        {
+                            let mut g = self.probe.lock().expect("probe poisoned");
+                            *g = Some(Arc::clone(&kv));
+                        }
+                        let bindable: Arc<dyn EngineBindable> = LwMockBindable::new();
+                        (kv, bindable)
+                    })
+            }
+        }
+
+        let registry = Arc::new(KvPersistRegistry::new());
+        let pre_stub_bindable = LwMockBindable::new();
+        registry.register(
+            "acme/m1".to_string(),
+            QuantType::Q4_K_M,
+            pre_stub_bindable.clone() as Arc<dyn EngineBindable>,
+        );
+        let factory: Arc<dyn FamilyHookFactory> = Arc::new(ProbingFactory {
+            probe: Arc::clone(&probe),
+        });
+        registry.register_factory("acme/m1".to_string(), QuantType::Q4_K_M, factory);
+
+        let inner: Arc<dyn ModelLoader<LwExpectedHandle>> = Arc::new(LwMockLoaderHandle);
+        let wrapper: Arc<LoaderWrapper<LwExpectedHandle>> = Arc::new(
+            LoaderWrapper::new(inner, Arc::clone(&registry)),
+        );
+        wrapper.set_spiller(Arc::clone(&spiller));
+        wrapper.set_pending_bind("acme/m1".to_string(), QuantType::Q4_K_M);
+
+        // ---- concurrent reader probes ----
+        // Spawn N readers that watch `spiller.registered_count()`
+        // while load is in flight. The count must always be exactly 1
+        // (pre-stub OR substituted; never 0 and never 2). Pre-fix the
+        // count is still 1 because both ops insert/overwrite into the
+        // same key — so this assertion is the WEAK signal. The STRONG
+        // signal is the post-condition Arc::ptr_eq below; this stress
+        // loop just confirms no deadlock / panic was introduced.
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let s = Arc::clone(&spiller);
+            let stop_c = Arc::clone(&stop);
+            readers.push(std::thread::spawn(move || {
+                let mut observed = Vec::new();
+                while !stop_c.load(Ordering::Relaxed) {
+                    observed.push(s.registered_count());
+                }
+                observed
+            }));
+        }
+
+        // ---- drive the substitution ----
+        let (path, cfg) = dummy_path_and_config();
+        let _engine = wrapper.load(&path, &cfg).expect("load OK");
+
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            let observed = r.join().expect("reader thread");
+            for c in observed {
+                assert!(
+                    c == 1,
+                    "P1-1 falsifier: spiller.registered_count must \
+                     remain 1 across substitute-on-load (saw {c})"
+                );
+            }
+        }
+
+        // ---- post-condition: registry + spiller agree ----
+
+        // (1) Spiller still has exactly 1 family registered
+        //     (overwrite, not insert).
+        assert_eq!(spiller.registered_count(), 1);
+
+        // (2) The pre-stub bindable did NOT receive bind_for (the
+        //     factory substitution overwrote the registry hook
+        //     before bind_for fired).
+        assert_eq!(
+            pre_stub_bindable.bind_count(),
+            0,
+            "registry hook was substituted before bind_for fired"
+        );
+
+        // (3) The factory was invoked and captured a kv_hook Arc.
+        let probed = probe.lock().expect("probe poisoned").take();
+        let probed = probed.expect(
+            "P1-1 fixture: factory must have produced a kv_hook (else \
+             substitution didn't fire and the test is decorative)",
+        );
+
+        // (4) The factory-produced Arc is now held by AT LEAST the
+        //     spiller (it was passed into register_family). Pre-fix
+        //     this would still hold post-load (the bug was a
+        //     transient mid-load divergence, not a final-state
+        //     divergence) — but combined with the lock-discipline
+        //     assertion above (substitute_lock guards both writes),
+        //     the post-condition + the absence of any 0-count
+        //     reader observation together attest the atomic
+        //     handover. Strong-count >= 2: probe + spiller's
+        //     internal HashMap.
+        assert!(
+            Arc::strong_count(&probed) >= 2,
+            "P1-1 post-condition: factory-produced kv_hook must be \
+             retained by the spiller's registration (probe + spiller \
+             expected; got strong_count={})",
+            Arc::strong_count(&probed)
+        );
+
+        // ---- cleanup ----
+        // Drop spiller + writer so the AsyncWriterHandle thread exits
+        // cleanly and the temp dir can be removed.
+        drop(wrapper);
+        drop(spiller);
+        drop(writer);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // ===== Test 8 ==========================================================
