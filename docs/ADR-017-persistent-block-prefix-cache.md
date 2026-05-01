@@ -999,6 +999,109 @@ A.3 lands the `BlockPrefixCacheSpiller<E>` impl of the `KvSpiller<E>` trait (ADR
 2. **Per-family payload codec** — A.2's `payload_kind: String` field on `EnvelopeHeader` is opaque. A.3 enumerates the codec values: `kv-dense-bf16` (Gemma 4 dense), `kv-tq-packed` (TQ-active), `kv-hybrid-fa+conv+rec` (Qwen3.5 / Qwen3.6 hybrid). The codec value lives in this header field; the on-disk format is unchanged.
 3. **Pin set wiring** — A.2's `evict_lru_until_under_budget(is_block_pinned)` takes a callback. A.3 wires it to the live KV-cache liveness via `Arc::strong_count()` on the cache slot (or a dedicated `BlockLiveSet` shared between the engine and the spiller).
 
+### Phase A.3 LANDED (2026-04-30)
+
+**Status:** Production wiring complete on `cfa/adr017-a3/claude` worktree; pending dual-mode queen merge against the Codex parallel impl. **Phase A complete** — ADR-017's substrate (format + index + block_store + writer + recovery + spiller) is now in tree, ready for B-dense.1 to substitute the real Gemma 4 hook for the A.3 stub.
+
+**Commits (cfa/adr017-a3/claude, 3 expected; pushed):**
+
+- `177f86b` — `feat(adr-017 a.3): BlockPrefixCacheSpiller<E> + KvCacheSpill trait (14 unit tests)`
+- `c304ea2` — `feat(adr-017 a.3): wire spiller into kv_persist::mod re-exports`
+- `<this commit>` — `docs(adr-017 a.3): record Phase A.3 LANDED + Phase A complete status`
+
+**LOC delta (production src/, additive):**
+
+| File | LOC | Role |
+|---|---|---|
+| `src/serve/kv_persist/spiller.rs` | 1,210 (~534 production + ~670 tests) | `BlockPrefixCacheSpiller<E>` impl of `KvSpiller<E>` (ADR-005 Phase 4 iter-212). Generic over the engine type so it compiles independently of the production `Engine`. Holds `Arc<DiskBlockStore>` (read path) + `Arc<AsyncWriterHandle>` (write path) + `RwLock<HashMap<(String, &'static str), Arc<Mutex<dyn KvCacheSpill>>>>` (per-family registrations keyed on `(repo, quant.as_str())` — &'static str avoids touching `quant_select.rs` to derive `Hash` on `QuantType`). `pre_evict` walks layer × range, asks `snapshot_block` for bytes, builds `EnvelopeHeader` with `block_hash = sha256(body)` (satisfies `format::read_envelope_body`'s sha-256 invariant), advances `parent_block_hash` per-block for chain linkage, enqueues via `writer.enqueue(WriteJob)`. `post_admit` index-looks up by model_fp, sorts by mtime ascending (parent-before-child replay), reads via `store.read_block`, dispatches to `hook.restore_block`. **Per-family `KvCacheSpill` hook trait** (`block_alignment` + `snapshot_block(layer, range) -> Option<Vec<u8>>` + `restore_block(layer, range, payload) -> Result<(), SpillErrorKind>`) decouples lifecycle glue from per-family payload codec — B-dense.1 substitutes Gemma 4 dense BF16 K/V; B-hybrid.1 substitutes Qwen3.5 hybrid; B-tq.1 substitutes TQ-packed. **Stub Gemma 4 hook** (`StubGemma4Spill`) returns `None` for snapshot so the spiller's `Skipped` path fires when only the stub is registered; B-dense.1 swaps the stub for the real impl with no API churn. |
+| `src/serve/kv_persist/mod.rs` | +3 | Adds `pub mod spiller;` and re-exports `BlockPrefixCacheSpiller`, `KvCacheSpill`, `StubGemma4Spill`. |
+| `src/lib.rs` | 58 (rewrite from 38) | Lib facade enumerates kv_persist's submodules explicitly, OMITTING `spiller`. The spiller depends on `crate::serve::multi_model` which transitively pulls `intelligence::hardware`, `serve::api::engine`, and a long tail of bin-private modules — defeating the "narrow lib" intent. Spiller is reachable from the bin's `main.rs` (which loads `src/serve/kv_persist/mod.rs` with the full submodule list, including `pub mod spiller;`) and from `--bin hf2q kv_persist` tests. The integration test in `tests/kv_persist_writer_kill_minus_9.rs` continues to consume only A.1 + A.2. |
+| **Total** | **+1,213 LOC additive over A.2** | — |
+
+**Test count delta:**
+
+- 14 new in-module unit tests in `src/serve/kv_persist/spiller.rs`, all PASS in 1.08 s under `cargo test --release --bin hf2q kv_persist -- --test-threads=1`.
+- Cumulative `kv_persist` unit tests: A.1 had 20 (10 format + 10 index); A.2 added 23 (10 block_store + 6 writer + 7 recovery); A.3 adds 14 → **57 total in-binary unit tests**, all PASS.
+- 1 prior integration test (`tests/kv_persist_writer_kill_minus_9.rs`) continues to PASS — no regression.
+- 36/36 existing harness tests still PASS (`cargo test --release --test kv_persist_harness -- --test-threads=1`, 2.22 s) — no regression.
+
+**The 12+ tests, by ID (per A.3 spec):**
+
+ 1. `new_spiller_has_zero_registrations`
+ 2. `register_then_unregister_family_round_trip`
+ 3. `pre_evict_with_no_registered_family_returns_skipped`
+ 4. `pre_evict_with_mock_hook_enqueues_blocks` (verifies on-disk body bytes byte-exact via `store.read_block` per `feedback_live_verification_must_check_content`)
+ 5. `pre_evict_with_writer_full_returns_error_io_err` (documents the IoErr branch coverage; the spiller propagates `enqueue`'s `Result` from `writer.rs`'s own tests)
+ 6. `pre_evict_chain_hash_links_blocks` (each `pre_evict` cycle starts a fresh chain — genesis parent; per-block `block_hash = sha256(body)` invariant locked in)
+ 7. `post_admit_with_no_registered_family_returns_skipped`
+ 8. `post_admit_with_disk_blocks_calls_restore_for_each` (mock recorded one `restore_block` call with byte-exact body)
+ 9. `post_admit_with_zero_disk_blocks_returns_restored_blocks_zero` (zero blocks → `Skipped` per spec)
+10. `post_admit_with_corrupted_block_returns_error_parity_fail` (mutate body byte → `format::read_envelope_body` rejects → `RestoreOutcome::Error(ParityFail)`)
+11. **`pre_evict_then_post_admit_round_trip_byte_exact` (R-C1)** — load-bearing for B-dense.1: 16,384-byte body produced by `snapshot_block`, written via spiller → drained to disk → `post_admit` reads + delivers byte-exact to `restore_block`. **Stdout evidence:** `[R-C1] PASS — 16384 bytes round-tripped byte-exact via spill→disk→restore`.
+12. `noop_kv_spiller_default_path_byte_identical_to_pre_iter212` (locks in that A.3 surface does NOT change `NoopKvSpiller` behavior)
+13. `post_admit_maps_hook_codec_err_to_restore_codec_err` (extra: error-mapping for hook-side `SpillErrorKind::CodecErr` → `RestoreErrorKind::CodecErr`)
+14. `stub_gemma4_spill_returns_skipped_on_pre_evict` (extra: A.3 stub Gemma 4 hook returns `None` for snapshot → outer `Skipped`)
+
+**Mechanical exit codes (worktree HEAD `<final>`):**
+
+| Command | Exit | Output |
+|---|---|---|
+| `cargo build --release` | **0** | `Finished release profile [optimized] target(s)` |
+| `cargo test --release --bin hf2q kv_persist -- --test-threads=1` | **0** | **57 passed; 0 failed; 0 ignored** in 1.08 s (43 prior + 14 new) |
+| `cargo test --release --test kv_persist_writer_kill_minus_9 -- --test-threads=1` | **0** | **1 passed; 0 failed; 0 ignored** in 0.06 s |
+| `cargo test --release --test kv_persist_harness -- --test-threads=1` | **0** | **36 passed; 0 failed; 0 ignored** in 2.22 s (no regression) |
+| `cargo clippy --release --no-deps` (kv_persist filter) | **0** | zero warnings on `kv_persist/spiller.rs` (`#[allow(clippy::single_range_in_vec_init)]` annotated on the stub's `ranges_for_layer` — documented as intentional because B-dense.1 grows past one element and the `Vec` shape is the stable surface) |
+| `grep -rn '// TODO\|todo!()\|unimplemented!()' src/serve/kv_persist/` | **1** | no hits — discipline holds |
+
+**R-C1 byte-exact evidence (`pre_evict_then_post_admit_round_trip_byte_exact`):**
+
+```
+running 1 test
+test serve::kv_persist::spiller::tests::pre_evict_then_post_admit_round_trip_byte_exact ...
+  [R-C1] PASS — 16384 bytes round-tripped byte-exact via spill→disk→restore
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2347 filtered out; finished in 0.02s
+```
+
+The test asserts: (1) `snapshot_block` returns 16,384 bytes; (2) spiller enqueues `WriteJob` with `block_hash = sha256(body)`; (3) async writer drains to disk under the `<root>/models/<fp>/kv/<hex0>/<hex>.safetensors` layout; (4) `format::read_envelope_body` parses + body-hash-verifies the on-disk envelope; (5) `post_admit` reads the body via `store.read_block` and dispatches to `restore_block`; (6) `restore_block` receives the body BYTE-FOR-BYTE EQUAL to the bytes `snapshot_block` returned.
+
+This is the load-bearing invariant for B-dense.1: the per-family Gemma 4 dense BF16 K/V codec must satisfy the same byte-exact round-trip when it replaces the mock.
+
+**Hookup readiness for B-dense.1:**
+
+B-dense.1 lands the real `KvCacheSpill` impl for Gemma 4 dense BF16 K/V over `mlx_native::ops::kv_cache_copy`. The hand-off shape:
+
+- **Construction**: `cmd_serve` startup builds `Arc<DiskBlockStore>` + `Arc<AsyncWriterHandle>` per A.2's pattern → `Arc::new(BlockPrefixCacheSpiller::new(store, writer))` → `HotSwapManager::new_with_spiller(pool, loader, spiller_arc)`. Per-loaded-model registration: `spiller.register_family(repo.clone(), quant, Arc::new(Mutex::new(Gemma4DenseSpill::new(engine_handle))))`.
+- **B-dense.1 replaces** `StubGemma4Spill` with `Gemma4DenseSpill` whose `snapshot_block(layer, range)` reads dense BF16 K/V from `engine.kv_caches[layer]` over `[range.start..range.end]` tokens via `mlx_native::ops::kv_cache_copy::read_dense_bf16_block` and whose `restore_block(layer, range, payload)` writes the bytes back via `mlx_native::ops::kv_cache_copy::write_dense_bf16_block`. The byte-exact round-trip locked in by R-C1 (test 11) is the ship gate.
+- **No spiller-side changes needed** for B-dense.1 — the trait surface and lifecycle glue are stable per the iter-212 contract.
+
+**Hookup readiness for C.1 (cmd_serve --kv-persist=on wire-up):**
+
+C.1 lands the CLI flag + the construction wiring in `cmd_serve`. The hand-off shape:
+
+- **Flag parse**: `--kv-persist=on|off` (default `off`). When `on`, `cmd_serve` reads `HF2Q_KV_PERSIST_ROOT` (default `~/.cache/hf2q/kv-persist`) and `HF2Q_KV_PERSIST_BUDGET_BYTES` (default `0` = uncapped pilot per §R-F5).
+- **Construction**: `let (index, _report) = recover_from_disk(cache_root)?` → `Arc::new(DiskBlockStore::new_with_index(cache_root, index, budget_bytes)?)` → `Arc::new(AsyncWriterHandle::spawn(store_arc.clone(), DEFAULT_CHANNEL_CAPACITY))` → `Arc::new(BlockPrefixCacheSpiller::new(store_arc, writer_arc))` → `HotSwapManager::new_with_spiller(pool, loader, spiller_arc)`.
+- **Per-model registration** happens at first-load: when `load_or_get(repo, quant, ...)` admits a fresh engine, the model-family resolver (B-dense.1 / B-hybrid.1 / B-tq.1) returns the `Arc<Mutex<dyn KvCacheSpill>>` for that family and `cmd_serve` calls `spiller.register_family(repo.clone(), quant, hook)`.
+
+**A.3 discipline notes:**
+
+- Production code in `src/serve/kv_persist/*` only (additive). Zero edits to `src/serve/multi_model.rs` (Phase 4 trait surface stable per A.3 spec — A.3 IMPLEMENTS the trait; does NOT change the surface).
+- Zero edits to `src/serve/quant_select.rs` (the spiller's registry key is `(String, &'static str)` via `QuantType::as_str` instead of deriving `Hash` on `QuantType`).
+- `src/lib.rs` rewritten (38 → 58 LOC) to enumerate kv_persist's submodules explicitly, OMITTING `spiller`. Documented in the lib's module docstring why: the spiller depends on `multi_model` which transitively pulls heavy bin-private modules, defeating the narrow-lib intent.
+- NO `// TODO` / `todo!()` / `unimplemented!()` markers shipped.
+- "man-day" used; "person-day" does not appear.
+- Real fs::metadata-driven mtime ordering in `post_admit`'s parent-before-child replay (per `feedback_substrate_must_not_synthesize_ship_gates`).
+- Real byte-content verification in tests (per `feedback_live_verification_must_check_content`): R-C1 (test 11) asserts `restored_bytes == body` byte-for-byte; tests 4 + 8 also assert byte-equality on read-back paths.
+- No fallback impls without root-cause (per `feedback_never_ship_fallback_without_rootcause`): the stub `StubGemma4Spill` is documented as "A.3 stub returning Skipped semantics; B-dense.1 replaces" with explicit dated exit condition.
+- Worktree discipline: ABSOLUTE PATHS in shell; no `cd /opt/hf2q` corruption (per `feedback_agent_worktree_cwd_trap`).
+
+**Phase A complete.**
+
+A.1 (format + index, 1,584 LOC) + A.2 (block_store + writer + recovery + lib facade + kill-9 integration test, 2,180 LOC + 89 test LOC) + A.3 (spiller + tests + mod wiring + lib refactor, 1,213 LOC) = **5,066 LOC** of production substrate for ADR-017's persistent block prefix cache. **57 in-binary unit tests + 1 kill-9 integration test + 36 harness tests, all PASS.** R-C1 byte-exact round-trip locked in.
+
+The next ADR-017 milestone is **B-dense.1**: substitute `StubGemma4Spill` with the real Gemma 4 dense BF16 K/V codec. Per Phase A0's measurement-positive ship gates and R-C1's byte-exact contract, B-dense.1 is now unblocked.
+
 ---
 
 ## Open Questions
