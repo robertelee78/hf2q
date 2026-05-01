@@ -1059,6 +1059,45 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-05-01 — P19 H9 follow-up · per-commit audit: 40 of 161 are "refactorable" (per-layer FFN terminal); 120 are entangled with iter58b-class lifetime invariants; full super-CB refactor scoped for P20 (/cfa territory)
+
+**Why this entry.** The H9 measurement (`sync_count = 161` per prefill) is correct, but "reduce 161 → 1" is a slogan, not a plan. Before scoping the refactor, classify every one of the 161 commits by which lifetime invariant requires it. Per `feedback_evidence_first_no_blind_kernel_rewrites`: read each commit site and its caller, tag by safety class, only THEN propose a target.
+
+**Per-layer breakdown (40 layers = 30 DeltaNet + 10 FullAttention):**
+
+| Site (file:line) | Count | Class | Reason for the wait |
+|---|---|---|---|
+| `gpu_full_attn.rs:1550` ops1-4 prefill | 10 | ESSENTIAL | `flash_attn_prefill` bridge reads `q_rope/k_rope/v_flat` written here; serial-queue ordering does not protect against residency-set rescission of the dropped intermediate buffers (iter58b mechanism) |
+| `gpu_full_attn.rs:1158` flash_attn_prefill bridge terminal | 10 | ESSENTIAL | Terminal of the bridge function; the wrapper-internal scratch buffers (q/k/v BF16 staging, `out_bf16_hm`) drop here. Must wait so the staged residency-removeAllocations don't fire mid-CB |
+| `gpu_full_attn.rs:1710` ops6-7 prefill | 10 | ESSENTIAL | `dump_hidden_stats` (in `forward_gpu_impl`) and `dispatch_fused_residual_norm_f32` read the attention output as F32; need GPU-finalized data |
+| `gpu_delta_net.rs:1574` DN ops1-3 prefill | 30 | ESSENTIAL | The chunk path's allocator reads `qkv_split` outputs; same residency-rescission risk |
+| `gpu_delta_net.rs:1214` `apply_gated_delta_net_chunk` | 30 | **DANGEROUS** | iter58b regression (commit `b6f416b`→`2565eab`, 2026-04-30) documents this exact site: removing the wait caused garbage output via mid-flight `removeAllocation:` flush. Cannot be touched without comprehensive arena lifetime refactor |
+| `gpu_delta_net.rs:1808` chunk ops8-9 prefill / `:1862` ops5-9 prefill | 30 | ESSENTIAL | Recurrence wrap-up; `ssm_norm` + sigmoid Z-gate + `ssm_out` dispatch all read prior outputs |
+| `forward_gpu.rs:1888` per-layer FFN terminal `commit_and_wait_labeled("layer.moe_ffn")` (or `:1813` "layer.dense_ffn") | 40 | **REFACTORABLE** | Layer terminal sync. ALL FFN scratches (gate_all, up_all, h_all, y_all, h_s, ids_buf, weights_buf, silu_params, dummy_residual) drop here; the arena reset (`reset_for_prefill_chunk`) currently fires per-layer. Could batch K layers into one CB IF arena reset moves to per-K-layer cadence AND the FFN scratch pool is sized for K layers' simultaneous in-flight work |
+| `forward_gpu.rs:~3180` (output_head terminal) | 1 | ESSENTIAL | Logits flow back to CPU for argmax / sampling; the final wait is unavoidable for the host to read `prefill_logits` |
+
+**Arithmetic sanity check.** 10×3 + 30×3 + 40×1 + 1 = 30 + 90 + 40 + 1 = **161** ✓ matches `SYNC_COUNT` exactly. (Two minor counts are absorbed into "ESSENTIAL" buckets — DN `ssm_conv` at `:557` is the same encoder as DN `ops1-3` in the production batched path, and the FA flash_attn bridge subsumes the standalone sdpa terminal at `:1381`.)
+
+**Refactor envelope.** Of the 161:
+- **40 are REFACTORABLE** with a per-K-layer arena gate (W-5b.15 arena reset already exists; just needs cadence change). Safe quick-win at K=4: 161 → 161-30 = 131 commits ≈ 40 ms savings (~14% wall reduction). Safe target at K=40 (single arena reset at end of prefill): 161 → 121 commits ≈ 53 ms savings (~19%).
+- **120 are ESSENTIAL OR DANGEROUS** under the current buffer-lifetime contract. Removing them requires:
+  - All wrapper-internal scratch (FA bridge: q/k/v BF16; DN chunk: q_expanded, k_expanded, etc.) lifted to caller-owned arena, sized for max-prefill-simultaneous-in-flight, freed only at end-of-prefill
+  - `dump_hidden_stats` / `dump_in_layer` instrumentation paths re-routed through GPU-side reductions or `HF2Q_PROFILE_*=1`-gated post-prefill commits
+  - Comprehensive coherence audit: every CPU `download_f32` / `as_slice` call between layers must either move to a single end-of-prefill download or be eliminated
+- **1 is unavoidable** (output_head terminal — host must read logits)
+
+The 120 → 1 step is the bulk of the win (~157 ms → ~5 ms = 152 ms savings = 55% of pp101 wall) but is also the bulk of the work and risk. **This is /cfa dual-mode territory** — Claude+Codex parallel implementations with cross-review, queen-judged on:
+1. `sync_count` reduction (target ≤ 10, stretch ≤ 5)
+2. `cargo test --release qwen35` 172/172 PASS no regression
+3. Sourdough byte-prefix gate ≥ 160 floor
+4. Coherence ascii_ratio ≥ 0.85 on a fixed prompt
+5. Decode tok/s parity with current (≥ 120 t/s on tg64)
+6. No iter58b-class regression flicker in `chunk_path_first_token_matches_autoregressive_at_seq128`
+
+**P20 spec (one-line for /cfa).** *"Refactor `forward_gpu_impl` + `build_*_layer` + `build_moe_ffn_layer_gpu_q_into` to lift wrapper-internal scratch into a caller-owned per-prefill arena and reduce `mlx_native::sync_count()` per pp101 dwq48 prefill from 161 to ≤ 10 without coherence or decode regression."*
+
+**What this iteration changed.** Documentation only. No code edits, no test changes, no env touched. The quick-win K-batched FFN-terminal refactor is described above but not yet implemented — defer to /cfa or a focused next iteration. Per `feedback_no_broken_windows` and `feedback_no_shortcuts`: do the right thing once, not the easy thing twice.
+
 ### 2026-05-01 — P19 H9 STRUCTURALLY CONFIRMED · empirical sync_count = **161 commit_and_wait per Qwen3.6 prefill** (fixed) ⇒ 213 ms of pure CB-sync overhead dominates the wall at small batch; structural super-CB refactor is the next big lever
 
 **Hypothesis (P19 step 1, commit `342b7d6`).** "Per-layer commit boundary: hf2q closes a command buffer per layer (40 cb/prefill); llama.cpp builds the entire prefill graph as a single ggml graph and the metal-backend submits it as a single super-CB with internal scheduler-emitted barriers. Test: count `commit_and_wait` calls per prefill in `forward_gpu.rs::forward_gpu_impl` and the layer-driver loop. Read llama.cpp's `ggml_metal_graph_compute` to confirm single-CB-per-graph."
