@@ -7,7 +7,7 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
-## ▶ Resume Here — current state of truth (2026-05-01 ~09:00Z, in flight)
+## ▶ Resume Here — current state of truth (2026-05-01 ~10:00Z, bench-blocked on PID-contamination)
 
 **Decode side: SHIPPED + RE-VALIDATED. iter56/57/58b confirmed byte-transparent perf-only changes (iter61c FULL VERDICT: ALL PASS).**
 
@@ -44,13 +44,15 @@ All 12 cells byte-identical. Receipts: `/tmp/cfa-iter61c-20260430/{claude,main}-
 - All 11 mm_tensor parity tests byte-exact; clean build.
 - Branch: `cfa/iter60c-fc-gate-20260430/claude` (mlx-native `4d38baf` + hf2q `5799f98`).
 
-**iter59 next-tier candidates research (READ-ONLY dossier complete):**
-- **#1 multi-token NSG kernel** (1-2 days, zero new kernel code): `gated_delta_net_decode.metal:145` already has `for t in 0..n_tokens`; only Rust gate at `gpu_delta_net.rs:72` restricts to n_tokens=1. Llama.cpp uses identical kernel for decode AND prefill. +0.05-0.2pp on non-chunk-aligned prompts.
-- **#2 RoPE multi-buffer hoist** (1-day, captures 45% of full fusion gain): `build_rope_multi_buffers` per-call alloc costs 208 µs/token; hoist to model-init.
-- **#3 MoE expert sortby/scatter**: mandatory F2 audit of `quantized_matmul_id.metal` ids_buf access pattern FIRST (zero-cost falsification path); +0.1-0.3pp if not falsified.
-- Dossiers: `/tmp/cfa-iter59-research/{rope-qkv-fusion,moe-expert-sortby,multi-token-nsg}-dossier.md` + `index.md`.
+**iter59 next-tier candidates — ALL THREE RESOLVED (1 implemented, 2 falsified by code+test==truth):**
+- **#1 multi-token NSG kernel — IMPLEMENTED, bench pending.** Hypothesis CONFIRMED empirically: kernel inner `for t in 0..n_tokens` loop produces byte-identical output to legacy 128-thread kernel for n_tokens ∈ {1,2,4,8,16,32} (6 new parity tests, 1e-4 vs both GPU legacy + CPU scalar). Rust guard relaxed via `NSG_PREFILL_MAX_TOKENS=32` + `d_k%32==0` check. Routes decode (seq==1) and short-prefill autoregressive (seq_len≤32 non-chunk-eligible). Tests now 266/0/x. Branch: `cfa/iter59-mtnsg-impl-20260501/claude` (mlx-native `a3c7e94` + hf2q `00a7f62`).
+- **#2 RoPE multi-buffer hoist — FALSIFIED, ALREADY DONE.** `dispatch_rope_multi_cached` (mlx-native `a50c224`) already hoisted the per-call alloc; both worktrees use the cached path. Worker landed regression test `imrope_cached_path_is_byte_identical_across_n_calls` (5-call bit-level equality + cache-size invariant) on `cfa/iter59-rope-hoist-20260501/claude`.
+- **#3 MoE expert sortby — FALSIFIED AT ZERO COST.** `kernel_mul_mm_id_map0` already exists at `mlx-native/src/ops/quantized_matmul_id_ggml.rs:950-1000`; fires on prefill for Q4_0/Q8_0/Q6_K with top_k ∈ {1,8} and n_tokens > 8. Production call at `gpu_ffn.rs:2160-2199`. Only residual gap is Q4_K/Q5_K mv_id path → covered by iter62 (parallel `adr013-q4k-moe-kernels` session). Audit at `/tmp/cfa-iter59-moe-sortby-audit/audit-result.md`.
+- Dossiers: `/tmp/cfa-iter59-research/{rope-qkv-fusion,moe-expert-sortby,multi-token-nsg}-dossier.md` + `index.md`. **Standing lesson:** dossiers are starting points — verify hypothesis against current code before dispatching impl. 2 of 3 candidates were already done; only multi-token NSG needed new code (and the Rust guard was the only barrier).
 
-**Bench infrastructure: NOW SOLID (5 broken-window fixes shipped today + capture script + 1 bash-3.2 pipefail bug bypassed).**
+**Bench validation BLOCKED on PID 20090 contamination** (parallel-session `llama-cli -n 200` on 35B-A3B-DWQ48, hung at 96.7% CPU for 81+ min). Bench coordinator `a4b1befe2e655d13e` correctly DEFERRED rather than producing contaminated numbers. All 3 bench-pending branches (iter60c, iter60b, iter59-mtnsg) have pre-built binaries at their respective worktrees; bench script ready at `/tmp/cfa-iter60-bench-validation/bench-iter60-cold.sh`. Operator action needed: `kill 20090`.
+
+**Bench infrastructure: NOW SOLID (5 broken-window fixes shipped today + capture script + 1 bash-3.2 pipefail bug bypassed; iter61c capture method = text-bytes SHA256 over decoded UTF-8, deterministic at temp=0/top-k=1).**
 
 ### What's DONE today (commits, all pushed)
 
@@ -74,20 +76,13 @@ All 12 cells byte-identical. Receipts: `/tmp/cfa-iter61c-20260430/{claude,main}-
 
 ### What's NEXT (in order)
 
-1. **Bench validation for iter60c then iter60b** (perf-only changes already pushed to team branches; need cold-SoC benches against same-day llama.cpp peer on apex q4_0-flat at pp=4096):
-   - Expected: iter60c +0.5-1pp; iter60b +2-5pp; combined cold 0.319× → 0.34-0.40×
-   - Methodology: pre-bench `ps aux | grep -E "mcp|brain|ollama|llama|cargo"` audit, cooldown, 5 cold-process trials median
-2. **Merge order**: iter60c first (smaller, less invasive), then rebase iter60b on iter60c (both touch `quantized_matmul_mm_tensor.metal` — orthogonal diffs but rebase needed)
-3. **iter59-multi-token-NSG** (rank #1 next-tier): remove Rust gate at `gpu_delta_net.rs:72`, extend parity tests to n_tokens > 1; 1-2 days, zero new kernel code
-4. **iter59-RoPE-hoist** (rank #2): hoist `build_rope_multi_buffers` from per-call to model-init; captures 45% of full RoPE+QKV fusion gain at 1-day cost
-5. **iter59-MoE-sortby F2 audit** (rank #3): falsifiable at zero cost; only proceed to impl if audit confirms ids_buf is NOT already accessed in expert-sorted order
-6. **iter62 — Q4_K MoE matmul-id support** (separate broken window): handled by parallel `adr013-q4k-moe-kernels` session
+1. **UNBLOCK BENCH WINDOW**: operator must `kill 20090` (parallel-session llama-cli hung 81+ min). All 3 bench-pending branches will run via prepared script `/tmp/cfa-iter60-bench-validation/bench-iter60-cold.sh` once contamination clears.
+2. **BENCH ORDER**: iter60c → iter60b → iter59-mtnsg → llama.cpp peer baseline (same-day, pp=4096 -ub 512 -r 5) → record verdicts MET/MISSED/REGRESSED.
+3. **MERGE ORDER (contingent on MET verdicts)**: iter60c (smaller/less invasive) → rebase iter60b on iter60c (both touch `quantized_matmul_mm_tensor.metal` — orthogonal diffs) → rebase iter59-mtnsg on top. Push to main, then bench again post-merge to verify combined gain.
+4. **iter62 — Q4_K MoE matmul-id support**: handled by parallel `adr013-q4k-moe-kernels` session; merge inbound separately.
+5. **NEXT LEVER QUEUE (after iter60c+60b+59-mtnsg ship)**: full RoPE+QKV fusion (3-4 days, medium-high risk per dossier; only worth it if cumulative gain after this batch leaves significant prefill gap); multi-token NSG extension to longer prefill windows (current cap NSG_PREFILL_MAX_TOKENS=32); structural matmul tile-size match (llama NRB=128 vs hf2q NR1=32 — 4× tile-area gap, separate iter not yet researched).
 
-**iter61c outcome eliminates the prior "validate before more perf" gate.** Decode-side ship-readiness fully confirmed. All 4 perf-pending fixtures (D4) decode-side ≥1.00×. Prefill side requires the next 5+ levers above.
-
-**iter61a kernel-level work (closed but for reference):**
-- Buffer-pool zero-init in mlx-native `src/buffer_pool.rs` already shipped at `aa5b410`.
-- Serial-dispatch probe env: `HF2Q_FORCE_SERIAL_DISPATCH=1` flips `MTLDispatchType::Concurrent → Serial` (used as bisection tool — not for production).
+**iter61c outcome eliminates the prior "validate before more perf" gate.** Decode-side ship-readiness fully confirmed (all 4 D4 fixtures ≥1.00×). Prefill side requires the bench-validated batch above; current cold baseline 0.319× projects to ~0.345-0.40× post-batch (iter60c +0.5-1pp + iter60b +2-5pp + iter59-mtnsg +0.05-0.2pp), still requires further levers to reach the ≥1.00× exit gate.
 
 **iter61a kernel-level work (closed but for reference):**
 - Buffer-pool zero-init in mlx-native `src/buffer_pool.rs` already shipped at `aa5b410`.
