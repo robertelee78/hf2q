@@ -1059,6 +1059,35 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-05-01 — P17/P16 perf-numbers RETRACTION — bench was single-run noise + contaminated environment
+
+**What's retracted.** All wall-clock t/s figures recorded in the immediately following P17 and P16 entries are unreliable. Re-bench under varied conditions (cold-process × 3, with and without competing ML processes) showed:
+
+1. **llama-bench `pp31`=671 t/s and `pp101`=1703 t/s** (P16 entry) — these were OUTLIERS from a single `llama-bench -p N -n 200 -r 3` invocation. A clean `llama-bench -p 31 -p 101 -p 200 -n 0 -r 3` run on the same hardware/build produced `pp31`=66 ± 5, `pp101`=192 ± 38, `pp200`=271 ± 38 t/s. The "30× prefill gap" claim was wrong by 10×.
+2. **hf2q P17 H1 (+34% from `HF2Q_DISABLE_TENSOR_MM_ID`)** — falsified. 3-run cold-process bench with the env gate ON vs OFF: `pp31`=9/9/9 vs 9/9/9 t/s; `pp101`=22-24 vs 23-24 t/s. No measurable delta.
+3. **hf2q P17 H2 (+42% pp31 from `MM_ID_ROUTING_THRESHOLD` 8 → 32)** — also falsified by the same 3-run methodology. The single-run "17 t/s" was noise above the stable 9 t/s.
+4. **"Decode 1.08× faster than llama"** — most likely also single-run noise, AND the bench environment was contaminated. A subsequent 3-run hf2q decode under load showed 4.2 / 5.0 / 1.0 t/s (huge variance, non-stationary), with concurrent llama-bench `tg200` reading 14.8 ± 3.2 t/s. Both numbers are 10–100× lower than the earlier ~117 t/s baselines and reflect system contention, not true runtime perf.
+
+**Why this happened.** Violated `feedback_verify_baseline_determinism_before_perf_bench.md` and `feedback_bench_process_audit.md`. Single-run benches were treated as authoritative; the system had two parallel sessions running compute at the same time (`hf2q parity check` PID 49630 + `bench_sdpa_tq` PID 24724); 95 GB / 128 GB memory pressure was active during the "contaminated" run. Both H1 and H2 were committed to mlx-native (`4db99f4`) on the basis of one lucky run each.
+
+**Code state.** The mlx-native commit `4db99f4` is *behaviorally* harmless (env gate is off-by-default, threshold bump only changes routing for `n_tokens` ∈ [9, 31] which now goes to mv_id instead of mm_id and shows no perf delta either way). It is left in main as a documentation-only artifact pending a controlled re-bench. The threshold-32 default is closer to llama.cpp's stated `ne21_mm_id_min` and is not wrong on principle — it just doesn't earn the +42% claim.
+
+**Methodology rule (now standing).** Any future perf claim in this ADR (or its companions) must satisfy ALL of:
+- 3+ cold-process invocations (fresh Metal pipeline cache each time).
+- Pre-bench `ps`/`top` / RSS audit per `feedback_bench_process_audit.md`; fail bench if any peer ML process is using ≥1% CPU or ≥10% memory.
+- Median (not mean) reported with min/max range.
+- Same-day llama-bench baseline taken under the same conditions on the same dataset.
+- Output coherence-checked to ensure the kernel under test actually ran (avoid "bench passed because the model loaded but the kernel was bypassed").
+
+**Real perf state of Q4_K dwq48 on M5 Max as of 2026-05-01 (3-run cold-process medians, contention-aware).** TBD — needs a proper controlled bench window; current bench environment contains parallel ADR-015 / ADR-005 work that contaminates measurement. Tracked as a P17b follow-up.
+
+**What we DO know is true (and unaffected by this retraction):**
+- `dwq48` model loads (`load_moe_ffn_quantized` accepts Q4_K) — was failing pre-P15.
+- Output is coherent end-to-end (bread-recipe + transformer-attention prompts; structured English with `<think>` reasoning blocks). This is the SHIP gate per ADR-013 §17 sourdough and it is met for Q4_K MoE.
+- 15/15 mlx-native Q4_K unit tests PASS (mv_id + mm_id routes, including production-shape `32×16×8 top_k=8 k=2048`).
+
+**What we do NOT know:** whether hf2q is actually faster, slower, or at parity with llama.cpp on Q4_K dwq48 prefill or decode. Any future P17b entry must establish this with the methodology rule above.
+
 ### 2026-05-01 — P17 · Q4_K MoE perf hypothesis matrix — H1+H2 landed, H3+H4 tracked
 
 **Problem.** P16 closed Q4_K coherence + decode parity but left a 30× prefill gap vs llama.cpp (`pp31`=12 t/s vs 671; `pp101`=56 t/s vs 1703). Per `feedback_evidence_first_no_blind_kernel_rewrites` and mantra ("measure 3x, cut once"), did NOT touch tile geometry. Instead: deep-read llama.cpp's `ggml_metal_op_mul_mat_id` (`ggml-metal-ops.cpp:2273`) and `kernel_mul_mm_id` template (`ggml-metal.metal:9719`) side-by-side with our equivalents, ran goalie research, and built a 4-hypothesis matrix.
