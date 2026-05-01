@@ -90,6 +90,24 @@ const ENV_PHASE_D_LLAMA_BIN: &str = "HF2Q_KV_PERSIST_PHASE_D_LLAMA_BIN";
 /// `HF2Q_KV_PERSIST_PHASE_D_R_P1=1` directly.
 const ENV_PHASE_D_R_P1: &str = "HF2Q_KV_PERSIST_PHASE_D_R_P1";
 
+/// Phase D R-P1 *concurrent-eviction* polish gate (iter-12). When set
+/// to "1" alongside `HF2Q_KV_PERSIST_PHASE_D=1`, the
+/// `kv_persist_phase_d_r_p1_concurrent_eviction_e2e` test runs the
+/// tighter K2 kill-gate variant: an eviction is fired from a sibling
+/// thread ~100ms into a decode (concurrent with in-flight inference)
+/// rather than between decodes (which the iter-8 test does). This
+/// addresses the iter-8 honest caveat — that the symlink-distinct-pool-key
+/// eviction trick no-ops after iter #0 because the original slot has
+/// already been evicted and never re-loaded — by exercising the async
+/// writer-thread architecture's contract DIRECTLY: if writer activity
+/// leaks onto the inference thread, full-decode wall time would slow
+/// under concurrent eviction. Default: short-circuit so `cargo test`
+/// stays cheap; operator opts in via `scripts/adr017_phase_d.sh` or
+/// by setting `HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT=1` directly.
+/// Distinct from `ENV_PHASE_D_R_P1` so the two K2 measurements can be
+/// run independently.
+const ENV_PHASE_D_R_P1_CONCURRENT: &str = "HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT";
+
 /// Sourdough prompt — byte-identical to `scripts/sourdough_gate.sh`
 /// (DO NOT fix the typo; it is load-bearing for the fixture trajectory).
 const SOURDOUGH_PROMPT: &str =
@@ -2039,6 +2057,277 @@ fn kv_persist_phase_d_r_p1_decode_overhead_e2e() {
     );
 }
 
+/// Phase D R-P1 *concurrent-eviction* K2 polish test (env-gated by
+/// `HF2Q_KV_PERSIST_PHASE_D=1` + `HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT=1`).
+/// Default `cargo test` short-circuits.
+///
+/// Closes the iter-8 K2 honest caveat: the existing
+/// `kv_persist_phase_d_r_p1_decode_overhead_e2e` interleaves
+/// evictions BETWEEN decodes, and the symlink-distinct-pool-key
+/// eviction trick no-ops after iter #0 (the original slot has
+/// already been evicted and is never re-loaded). This tighter
+/// variant fires an eviction from a sibling thread ~100ms INTO a
+/// decode, exercising the async-writer-architecture contract
+/// directly: if pre_evict / post_admit / writer-thread activity
+/// leaks onto the inference thread, full-decode wall time slows
+/// under concurrent-eviction load.
+///
+/// Methodology:
+///   1. Spawn `hf2q serve --kv-persist=DIR` with HF2Q_USE_DENSE=1.
+///   2. Baseline phase: 3 sequential decode requests against the
+///      same prompt + max_tokens=128. The first populates the
+///      cache; we measure the LAST 2 (steady-state cache-hits).
+///      Capture full-stream wall-time (NOT just TTFT) — concurrent
+///      eviction would surface as a stretched stream tail, not
+///      first-token slip.
+///   3. Concurrent-eviction phase: 3 sequential decode requests.
+///      For EACH request: issue the streaming completion + spawn a
+///      sibling thread that sleeps ~100ms then calls
+///      `force_eviction_via_symlink`. Read the SSE stream to
+///      completion, capture full-stream wall-time, join the
+///      sibling thread.
+///   4. Compute overhead = (concurrent_full_avg - baseline_full_avg)
+///      / baseline_full_avg over the LAST 2 samples of each phase.
+///      Assert overhead <= 0.05 (R-P1 ship-gate; K2 falsifier on
+///      >0.05).
+///
+/// Falsifier: full-decode-wall overhead > 0.05 under concurrent
+/// eviction.
+#[test]
+fn kv_persist_phase_d_r_p1_concurrent_eviction_e2e() {
+    let active = std::env::var(ENV_PHASE_D_GATE).as_deref() == Ok("1");
+    if !active {
+        eprintln!(
+            "[Phase D R-P1 concurrent] {ENV_PHASE_D_GATE}=1 not set — short-circuit. \
+             Set {ENV_PHASE_D_GATE}=1 + {ENV_PHASE_D_R_P1_CONCURRENT}=1 + \
+             HF2Q_KV_PERSIST_E2E_MODEL_PATH=PATH to run."
+        );
+        return;
+    }
+    let r_p1c_active =
+        std::env::var(ENV_PHASE_D_R_P1_CONCURRENT).as_deref() == Ok("1");
+    if !r_p1c_active {
+        eprintln!(
+            "[Phase D R-P1 concurrent] {ENV_PHASE_D_R_P1_CONCURRENT}=1 not set — \
+             short-circuit. K2 polish ship-gate is operator-controlled; set \
+             {ENV_PHASE_D_R_P1_CONCURRENT}=1 alongside {ENV_PHASE_D_GATE}=1 \
+             to run the measurement."
+        );
+        return;
+    }
+    let model_path = match resolve_phase_d_model_path() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[Phase D R-P1 concurrent] HF2Q_KV_PERSIST_E2E_MODEL_PATH unset \
+                 or path missing — short-circuit."
+            );
+            return;
+        }
+    };
+
+    let bin = hf2q_binary_path();
+    assert!(
+        bin.exists(),
+        "[Phase D R-P1 concurrent] hf2q binary not found at {} — \
+         did `cargo build --release` run?",
+        bin.display()
+    );
+
+    let cache_dir = std::env::temp_dir().join(format!(
+        "hf2q-kv-persist-phase-d-r-p1-concurrent-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&cache_dir)
+        .expect("mkdir Phase D R-P1 concurrent cache_dir");
+
+    let port = std::env::var("HF2Q_KV_PERSIST_PHASE_D_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(phase_d_driver::PORT_DEFAULT);
+
+    let server = phase_d_driver::spawn_hf2q_serve_with_kv_persist(
+        &bin,
+        &model_path,
+        &cache_dir,
+        phase_d_driver::HOST,
+        port,
+    )
+    .expect("[Phase D R-P1 concurrent] spawn hf2q serve --kv-persist");
+    phase_d_driver::wait_for_readyz(&server).unwrap_or_else(|e| {
+        panic!(
+            "[Phase D R-P1 concurrent] /readyz did not return 200 within budget: {e}\n\
+             --- hf2q serve stderr_tail ({} lines) ---\n{}",
+            server.log_tail().len(),
+            server.log_tail().join("\n"),
+        )
+    });
+    let canonical = phase_d_driver::fetch_canonical_model_id(&server)
+        .expect("[Phase D R-P1 concurrent] fetch canonical model id");
+
+    // Stable, byte-deterministic prompt + slightly larger max_tokens
+    // than the iter-8 R-P1 test so concurrent-eviction overhead has
+    // tail-of-stream surface to manifest on, while keeping the test
+    // under ~90 s wall on M5 Max.
+    let prompt = "List five common breads in alphabetical order.";
+    const N_SAMPLES: usize = 3;
+    const MAX_TOKENS: u32 = 128;
+    /// Delay before sibling-thread fires the eviction trick. ~100 ms
+    /// places the eviction ~mid-stream for steady-state cache-hit
+    /// decodes (TTFT typically <5 ms on cache-hit per R-P4).
+    const EVICTION_DELAY_MS: u64 = 100;
+
+    // -------- Baseline phase: 3 decodes, no induced eviction --------
+    // First decode populates the cache; we measure the LAST 2
+    // (steady-state cache-hits). Full-stream wall-time (NOT just
+    // TTFT) because concurrent eviction would stretch the tail.
+    let mut baseline_durations: Vec<f64> = Vec::with_capacity(N_SAMPLES);
+    for i in 0..N_SAMPLES {
+        let t0 = std::time::Instant::now();
+        let _cap = phase_d_driver::decode_full_text(
+            &server,
+            &canonical,
+            prompt,
+            MAX_TOKENS,
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "[Phase D R-P1 concurrent] baseline decode #{i} failed: {e}\n\
+                 --- hf2q serve stderr_tail ({} lines) ---\n{}",
+                server.log_tail().len(),
+                server.log_tail().join("\n"),
+            )
+        });
+        let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        baseline_durations.push(wall_ms);
+    }
+    // Drop the warm-up sample; measure steady-state.
+    let baseline_steady: Vec<f64> = baseline_durations.iter().skip(1).copied().collect();
+    let baseline_full_avg: f64 =
+        baseline_steady.iter().sum::<f64>() / (baseline_steady.len() as f64);
+    eprintln!(
+        "[Phase D R-P1 concurrent] baseline_full_avg={:.1}ms (durations={:?})",
+        baseline_full_avg, baseline_durations
+    );
+
+    // -------- Concurrent-eviction phase: 3 decodes with eviction --------
+    // For EACH request: spawn a sibling thread that sleeps
+    // EVICTION_DELAY_MS then fires the symlink-distinct-pool-key
+    // eviction trick. The decode runs to completion concurrently;
+    // any leak of writer activity onto the inference thread surfaces
+    // as a measurable wall-time stretch.
+    //
+    // `std::thread::scope` lets the sibling thread borrow `&server`
+    // safely (ServerGuard's stderr_tail is Arc<Mutex<...>>; host/port
+    // are immutable).
+    let mut concurrent_durations: Vec<f64> = Vec::with_capacity(N_SAMPLES);
+    for i in 0..N_SAMPLES {
+        let tmp_link_dir = tempfile::tempdir()
+            .expect("[Phase D R-P1 concurrent] tempdir for symlink-eviction-trick");
+        let tmp_link_path = tmp_link_dir.path().to_path_buf();
+        let model_path_for_thread = model_path.clone();
+
+        let t0 = std::time::Instant::now();
+        let wall_ms = std::thread::scope(|scope| -> f64 {
+            // Sibling thread: sleep ~100ms into the decode, then
+            // fire the eviction-trigger request from a DIFFERENT
+            // thread on the same hf2q serve process.
+            let server_ref = &server;
+            let evict_handle = scope.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    EVICTION_DELAY_MS,
+                ));
+                phase_d_driver::force_eviction_via_symlink(
+                    server_ref,
+                    &model_path_for_thread,
+                    &tmp_link_path,
+                )
+            });
+            // Inference-thread leg: run the decode to completion.
+            let cap_result = phase_d_driver::decode_full_text(
+                &server,
+                &canonical,
+                prompt,
+                MAX_TOKENS,
+            );
+            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            // Always join the sibling thread — even on inference
+            // failure — so the eviction request finishes cleanly
+            // before the next loop iteration tears down tmp_link_dir.
+            let evict_result = evict_handle
+                .join()
+                .expect("[Phase D R-P1 concurrent] eviction thread panicked");
+            if let Err(e) = cap_result {
+                panic!(
+                    "[Phase D R-P1 concurrent] decode #{i} failed: {e}\n\
+                     --- hf2q serve stderr_tail ({} lines) ---\n{}",
+                    server.log_tail().len(),
+                    server.log_tail().join("\n"),
+                );
+            }
+            match evict_result {
+                Ok((_link, evict_wall_ms, _second_ttft_ms)) => {
+                    eprintln!(
+                        "[Phase D R-P1 concurrent] #{i} eviction sibling \
+                         wall={:.1}ms (decode wall={:.1}ms)",
+                        evict_wall_ms, elapsed_ms
+                    );
+                }
+                Err(e) => {
+                    panic!(
+                        "[Phase D R-P1 concurrent] eviction sibling #{i} failed: {e}\n\
+                         --- hf2q serve stderr_tail ({} lines) ---\n{}",
+                        server.log_tail().len(),
+                        server.log_tail().join("\n"),
+                    );
+                }
+            }
+            elapsed_ms
+        });
+        concurrent_durations.push(wall_ms);
+    }
+    // Drop the warm-up sample to mirror the baseline regime.
+    let concurrent_steady: Vec<f64> =
+        concurrent_durations.iter().skip(1).copied().collect();
+    let concurrent_full_avg: f64 =
+        concurrent_steady.iter().sum::<f64>() / (concurrent_steady.len() as f64);
+    eprintln!(
+        "[Phase D R-P1 concurrent] concurrent_full_avg={:.1}ms (durations={:?})",
+        concurrent_full_avg, concurrent_durations
+    );
+
+    let overhead =
+        (concurrent_full_avg - baseline_full_avg) / baseline_full_avg;
+    eprintln!(
+        "[Phase D R-P1 concurrent] overhead={:.3} (gate: <= 0.05)",
+        overhead
+    );
+    let pass = overhead <= 0.05;
+    if pass {
+        eprintln!("[R-P1 concurrent] PASS — overhead within 5% gate");
+    } else {
+        eprintln!(
+            "[R-P1 concurrent] FAIL — overhead exceeds 5% gate \
+             (K2 fires under concurrent-eviction)"
+        );
+    }
+    assert!(
+        pass,
+        "[R-P1 concurrent] ship-gate FAIL (K2 fires under concurrent-eviction): \
+         overhead={:.3} > 0.05 (baseline_full_avg={:.1}ms concurrent_full_avg={:.1}ms \
+         baseline_durations={:?} concurrent_durations={:?})",
+        overhead,
+        baseline_full_avg,
+        concurrent_full_avg,
+        baseline_durations,
+        concurrent_durations,
+    );
+}
+
 // ---------- Phase D always-on shape tests (no env required) ----------
 
 /// Phase D shape test: the new env gates are well-formed and the
@@ -2154,8 +2443,71 @@ fn phase_d_r_p1_env_gate_well_formed() {
     }
 }
 
+/// Phase D shape test: the R-P1 *concurrent-eviction* K2 polish env
+/// gate (iter-12) round-trips cleanly and its short-circuit predicate
+/// gates correctly on both the master Phase D gate and its own gate.
+/// Falsifier: env-var round-trip diverges, or
+/// `kv_persist_phase_d_r_p1_concurrent_eviction_e2e` would attempt to
+/// spawn `hf2q serve` when its env gates are unset.
+#[test]
+fn phase_d_r_p1_concurrent_env_gate_well_formed() {
+    let prior_master = std::env::var(ENV_PHASE_D_GATE).ok();
+    let prior_r_p1c = std::env::var(ENV_PHASE_D_R_P1_CONCURRENT).ok();
+
+    // Round-trip set/get for the new concurrent gate.
+    std::env::remove_var(ENV_PHASE_D_R_P1_CONCURRENT);
+    assert!(
+        std::env::var(ENV_PHASE_D_R_P1_CONCURRENT).is_err(),
+        "{ENV_PHASE_D_R_P1_CONCURRENT} should be unset after remove_var"
+    );
+    std::env::set_var(ENV_PHASE_D_R_P1_CONCURRENT, "1");
+    assert_eq!(
+        std::env::var(ENV_PHASE_D_R_P1_CONCURRENT).as_deref(),
+        Ok("1"),
+        "{ENV_PHASE_D_R_P1_CONCURRENT} round-trip"
+    );
+
+    // The concurrent-eviction K2 test must short-circuit when the
+    // master Phase D gate is unset, even if the concurrent gate is
+    // set. Mirrors the dual-gate discipline of the iter-8 R-P1 test.
+    std::env::remove_var(ENV_PHASE_D_GATE);
+    assert!(
+        std::env::var(ENV_PHASE_D_GATE).is_err(),
+        "{ENV_PHASE_D_GATE} should be unset for short-circuit branch"
+    );
+    let active_master = std::env::var(ENV_PHASE_D_GATE).as_deref() == Ok("1");
+    assert!(
+        !active_master,
+        "K2 concurrent master-gate short-circuit predicate must be false when env unset"
+    );
+
+    // Reverse: master gate set, concurrent gate unset — concurrent
+    // K2 must still short-circuit (concurrent variant is opt-in even
+    // within Phase D, distinct from the iter-8 R-P1 measurement).
+    std::env::set_var(ENV_PHASE_D_GATE, "1");
+    std::env::remove_var(ENV_PHASE_D_R_P1_CONCURRENT);
+    let active_master = std::env::var(ENV_PHASE_D_GATE).as_deref() == Ok("1");
+    let active_r_p1c =
+        std::env::var(ENV_PHASE_D_R_P1_CONCURRENT).as_deref() == Ok("1");
+    assert!(
+        active_master && !active_r_p1c,
+        "K2 concurrent short-circuit predicate must be false when only master is set"
+    );
+
+    // Restore prior env state.
+    std::env::remove_var(ENV_PHASE_D_GATE);
+    std::env::remove_var(ENV_PHASE_D_R_P1_CONCURRENT);
+    if let Some(v) = prior_master {
+        std::env::set_var(ENV_PHASE_D_GATE, v);
+    }
+    if let Some(v) = prior_r_p1c {
+        std::env::set_var(ENV_PHASE_D_R_P1_CONCURRENT, v);
+    }
+}
+
 /// Phase D shape test: the env-gate predicates are well-formed for
-/// each defined gate (master + peer + prefill-length + R-P1 K2).
+/// each defined gate (master + peer + prefill-length + R-P1 K2 +
+/// R-P1 concurrent-eviction K2 polish).
 /// Falsifier: predicate panics or detects "1" when env is unset.
 #[test]
 fn phase_d_env_gates_are_well_formed() {
@@ -2165,6 +2517,7 @@ fn phase_d_env_gates_are_well_formed() {
         ENV_PHASE_D_R_P4_PREFILL_LEN,
         ENV_PHASE_D_LLAMA_BIN,
         ENV_PHASE_D_R_P1,
+        ENV_PHASE_D_R_P1_CONCURRENT,
     ] {
         let prior = std::env::var(gate).ok();
         std::env::remove_var(gate);

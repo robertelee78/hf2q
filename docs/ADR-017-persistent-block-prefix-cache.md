@@ -2874,6 +2874,24 @@ restore TTFT (~13 ms at L=32K per R-P4) is still 50,000× faster
 than the cold-prefill alternative. K2 cannot fire by any
 reasonable interpretation under the current architecture.
 
+* **iter-12 caveat closure (test-polish; gate unchanged).** A
+  follow-up concurrent-eviction test (env-gated) lives at
+  `kv_persist_phase_d_r_p1_concurrent_eviction_e2e` per ADR-017
+  §K2 polish, addressing the eviction-no-op-after-iter-0 dynamic.
+  It fires the eviction trick from a sibling thread ~100 ms INTO
+  a decode (concurrent with in-flight inference) rather than
+  between decodes, exercising the async-writer-architecture
+  contract directly: if writer activity leaks onto the inference
+  thread, full-decode wall-time slows under concurrent eviction.
+  Env: `HF2Q_KV_PERSIST_PHASE_D=1` +
+  `HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT=1` (distinct from
+  `HF2Q_KV_PERSIST_PHASE_D_R_P1` so the two K2 measurements run
+  independently). Always-on shape test
+  `phase_d_r_p1_concurrent_env_gate_well_formed` covers env-gate
+  well-formedness; the env-gated measurement run is
+  operator-controlled per `scripts/adr017_phase_d.sh`. Same 5%
+  overhead ship-gate; falsifier identical to iter-8 K2.
+
 #### All 3 kill-gates FALSIFIED — final status table
 
 | Kill-gate | Threshold | Measured | Verdict | Iter |

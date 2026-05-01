@@ -14,6 +14,14 @@
 #     decode overhead under sustained eviction; <= 5%. OFF by default;
 #     set HF2Q_KV_PERSIST_PHASE_D_R_P1=1 (env or via this script's
 #     wiring below) to opt in.
+#   * kv_persist_phase_d_r_p1_concurrent_eviction_e2e — K2 polish
+#     (iter-12) closing the iter-8 honest caveat. Fires the eviction
+#     trick from a sibling thread ~100ms INTO a decode (concurrent
+#     with in-flight inference) rather than between decodes. Asserts
+#     full-decode-wall-time overhead <= 5%. OFF by default; set
+#     HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT=1 to opt in. Distinct
+#     from HF2Q_KV_PERSIST_PHASE_D_R_P1 so operators can run the two
+#     K2 measurements independently.
 #
 # Pre-conditions (per ADR-017 §Phase D + feedback_bench_process_audit):
 #   - Cold M5 Max (~1-min idle since previous run; pmset -g thermlog clean)
@@ -155,6 +163,7 @@ echo "    HF2Q_KV_PERSIST_E2E_MODEL_PATH=$MODEL_PATH"
 echo "    HF2Q_KV_PERSIST_E2E_PREFILL_LEN=$PREFILL_LEN"
 echo "    HF2Q_KV_PERSIST_PHASE_D_PEER=$([ "$ENABLE_PEER" -eq 1 ] && echo 1 || echo 0)"
 echo "    HF2Q_KV_PERSIST_PHASE_D_R_P1=${HF2Q_KV_PERSIST_PHASE_D_R_P1:-0}  (K2 ship-gate; OFF by default; set =1 in env to opt in)"
+echo "    HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT=${HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT:-0}  (K2 polish; concurrent-eviction-during-decode; OFF by default; set =1 in env to opt in)"
 echo
 
 cd "$REPO_ROOT"
@@ -167,6 +176,7 @@ if HF2Q_KV_PERSIST_E2E=1 \
     HF2Q_KV_PERSIST_E2E_PREFILL_LEN="$PREFILL_LEN" \
     HF2Q_KV_PERSIST_PHASE_D_PEER="$([ "$ENABLE_PEER" -eq 1 ] && echo 1 || echo 0)" \
     HF2Q_KV_PERSIST_PHASE_D_R_P1="${HF2Q_KV_PERSIST_PHASE_D_R_P1:-0}" \
+    HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT="${HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT:-0}" \
     cargo test --release --test kv_persist_gemma4_roundtrip \
       -- --test-threads=1 --nocapture; then
   echo
