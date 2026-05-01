@@ -2923,6 +2923,48 @@ ADR-017's substrate + bench + falsification is COMPLETE. From
 this iter forward, ADR-017 is in maintenance mode against
 upstream ADR work.
 
+### Phase D iter-9 2026-05-01 — maintenance-mode regression watch
+
+ADR-017 is in maintenance mode after iter-8's K2 falsification.
+Iter-9 ran the regression watch. Pre-flight: zero upstream
+movement on origin/main since iter-8 finale `cc28794`. Foreign
+ADR-005 / ADR-013 / ADR-015 sessions either quiesced or are still
+working in their CFA worktrees without pushing.
+
+#### R-C4 internal stability — 3 runs across iter-4, iter-7, iter-9
+
+```
+[Phase D coherence] baseline (3632 bytes / 1000 tokens) == restored (3632 bytes / 1000 tokens) byte-identical
+test result: ok. 1 passed; 0 failed in 16.60s
+```
+
+| Run | Baseline TTFT | Restored TTFT | Cache-hit speedup |
+|---|---|---|---|
+| iter-4 (Phase D GREEN) | 311.8 ms | 0.5 ms | 624× |
+| iter-7 regression check | 311.0 ms | 0.4 ms | 777× |
+| iter-9 regression watch | 308.4 ms | 0.4 ms | 771× |
+
+R-C4 is highly stable across foreign-session activity since
+iter-4 — baseline TTFT within ±2 ms (sub-1% drift; well within
+M5 Max thermal noise floor). Restored TTFT is on the NVMe-restore
++ first-token-decode path; consistently sub-1 ms.
+
+Byte-equality holds — `baseline (3632 bytes) == restored (3632
+bytes)` byte-identical on every run. ADR-017 persistence remains
+correct.
+
+#### Cumulative ADR-017 LOC after iter-9
+
+~20,064 + ~50 (this regression-watch subsection) = **~20,114
+LOC**. No code changes this iter (regression watch only).
+
+ADR-017 maintenance-mode cadence established:
+- /loop wakeup every ~25 min
+- Each iter: pre-flight ps/vm_stat audit + R-C4 regression watch
+- If R-C4 PASSes within ±2 ms baseline drift, no doc update unless
+  upstream ADR-005/013/etc. movement appears
+- If R-C4 FAILs or drifts > 5%, escalate to investigation
+
 ---
 
 ## Open Questions
