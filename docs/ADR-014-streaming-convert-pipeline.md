@@ -45,6 +45,35 @@ Artefacts at `/tmp/p11-re-emit/{27B,35BMOE}-dwq{46,48}/` pending operator promot
 
 ---
 
+## P9 mlx-lm safetensors directory-emit test routing — RESOLVED (iter-221 audit, 2026-05-01)
+
+**Status:** CLOSED 2026-05-01 (commit `0f6be72`). NOT a product defect — a stale test fixture that didn't account for an intentional default-path design change. The writer's DWQ branch is correct in isolation (proven by `dwq_metadata_matches_mlx_lm_schema` unit test); the test needed to opt into the legacy escape hatch to exercise the schema it asserts.
+
+**Surfaced by:** ADR-005 iter-221 cross-ADR drift audit. `cargo test --release --no-fail-fast` ran for the first time since the ADR-014 P4 tokenizer-load gate had been blocking fail-fast since `f8f727e` (2026-04-29). Three failures surfaced — two methodological (tokenizer fixture mirror `5907684`/`4a849de`; env-race in `kv_persist_gemma4_roundtrip` `2e68ff3`) and one apparent product defect in this ADR's territory that on Chesterton's-fence inspection turned out to be a test-routing gap.
+
+**Failing test (pre-fix):** `safetensors_mlx_lm_round_trip::safetensors_directory_emit_dwq46` at `/opt/hf2q/tests/safetensors_mlx_lm_round_trip.rs:228-307`. The test (file header: "ADR-014 P9 iter-1 §S4 — cross-validation harness for the safetensors backend's mlx-lm-style directory layout") panicked at line 291: `"DWQ header must contain `<name>.scales` companion (mlx_lm.utils:154)"`.
+
+**Initial (wrong) hypothesis:** That the weight-space DWQ calibrator on `DwqArch::Other` (LlamaForCausalLM fixture) skipped populating `quant_info.scales`, leaving the writer's emission gate at `safetensors_out.rs:403` (`tensor.quant_info.scales.is_some()`) unfired. Falsified by Worker G's actual investigation.
+
+**Actual root cause (Worker G's investigation):** ADR-014 P11-prereq Iter C (commit `3ce8674`) **deliberately switched the default DWQ byte-emit path** from `MixedBitQuantizer` (Q4_0-family with per-group scalar scales/biases tensors → mlx-lm affine companion schema) to `DwqKQuantizer` (K-quant block bytes with scales packed inline per GGUF spec → opaque U8 blob, no separate `.scales`/`.biases` tensors). `main.rs:1982` forcibly tags the K-quant result `dwq-mixed-4-6` so `is_dwq_method()` returns true while `quant_info.scales` is correctly None — K-quant blocks have no scalar-per-group to expose as a `<name>.scales` companion (`dwq_k_quantizer.rs:50-56`). The legacy path that DOES emit the affine companion schema is preserved behind the explicit `HF2Q_USE_LEGACY_DWQ_Q4_0=1` escape hatch (`main.rs:1820-1850`).
+
+**Why P11 didn't catch this:** P11's "all 4 DWQ artefacts re-emit + load + generate" closure drove **GGUF** output on **qwen35** with the K-quant default path; the four GGUF blobs verifiably load + generate through `llama-cli` (per the iter-92→iter-106 arc and the per-variant metrics table above). The mlx-lm safetensors directory format expects the affine companion schema, which the K-quant default path doesn't produce by design. The cross-validation harness `safetensors_directory_emit_dwq46` (P9 iter-1 §S4) landed before the P11-prereq Iter C path-switch; it asserted the (then-default) Q4_0 path's companions but wasn't updated to opt into `HF2Q_USE_LEGACY_DWQ_Q4_0=1` after the path-switch made K-quant the default. The mismatch stayed hidden because (a) `cargo test` was fail-fast-stuck on the iter-219c→iter-220 D1 ADR-014 P4 tokenizer-fixture chain and (b) the test had also been fixed on a sibling branch `fix/adr005-iter219-baseline-2026-05-01` (commit `63c2d4f`) that's not reachable from `adr017-iter17-2026-05-01`.
+
+**Fix (commit `0f6be72`, ADR-005 iter-221 CFA Worker G):** zero src/ changes — Chesterton's fence on the writer (its DWQ branch is correct, proven by `dwq_metadata_matches_mlx_lm_schema` unit test) and on the K-quant block design. Test routed through `HF2Q_USE_LEGACY_DWQ_Q4_0=1` via a new `run_convert_with_env()` helper; docstring updated to name the default-vs-legacy split. The legacy escape hatch is the supported mechanism for emitting mlx-lm-affine-compatible companions; the default K-quant path remains the production DWQ output.
+
+**Verification (post-fix):**
+- `safetensors_mlx_lm_round_trip` 19/20 → 20/20 PASS (2 `#[ignore]` P10 Python-subprocess gates remain ignored).
+- `safetensors_directory_round_trips_through_safetensors_reader` PASSES (still on default DwqKQuantizer path — assertion `tensor_count >= 9` is path-agnostic).
+- `safetensors_directory_emit_imatrix_q4km` PASSES (K-quant branch unperturbed).
+- `convert_qwen35_real_activation_capture` 2/2 PASS unchanged (qwen35 ActivationCapture path independent).
+- `cargo build --release` clean.
+
+**Documentation hygiene (mantra-aligned, recorded for future readers):** The default-vs-legacy DWQ path-switch landed in `3ce8674` (P11-prereq Iter C) but was not surfaced as a phase-status note here. The Phase status table below should be amended to record (a) the K-quant block path is the production DWQ default since `3ce8674` and (b) the legacy Q4_0 + companion-schema path remains behind `HF2Q_USE_LEGACY_DWQ_Q4_0=1`. Tracked as low-priority follow-up; not closure-blocking.
+
+**Cross-link:** ADR-005 iter-221 audit closure entry (commit `c760386`) catalogued this as D1#3. The honest characterization shifted from "real product defect blocking ADR-005" to "stale test routing; default-path design change documentation gap." Both ADRs cross-link to this entry.
+
+---
+
 ## Phase status
 
 | Phase | Status | Commit | Notes |
