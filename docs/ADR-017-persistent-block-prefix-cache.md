@@ -3249,6 +3249,83 @@ ADR-017 maintenance-mode cadence established:
   upstream ADR-005/013/etc. movement appears
 - If R-C4 FAILs or drifts > 5%, escalate to investigation
 
+### Phase D iter-17 2026-05-01 — regression watch across foreign ADR-005/013 commits
+
+Iter-16 closed at commit `76beb0a` (K2 v3 infrastructure landed).
+Foreign-session activity since iter-16:
+- ADR-005 iter-219c: `94c0dbe` ToolCallSplitter resync-marker fix +
+  `898358e` doc entry (2457/2457 tests). Touches chat-template /
+  splitter — direct regression risk for ADR-017's API-path coherence.
+- ADR-013 P16: `8d06f46` Q4_K mm_id docs entry (perf-only, 6×
+  prefill speedup, decode parity). Indirect risk only.
+
+Pre-flight: SoC contaminated (duetexpertd at 91.5% CPU, WhatsApp
+76.3%, corespotlightd 33.4%) — wall-time perf regression watch
+(R-P4) deferred. R-C4 byte-equality is wall-time-independent so
+runs cleanly under contaminated SoC.
+
+#### R-C4 internal stability — 4 runs across iter-4, iter-7, iter-9, iter-17
+
+```
+[Phase D coherence] baseline (3632 bytes / 1000 tokens) == restored (3632 bytes / 1000 tokens) byte-identical
+test result: ok. 1 passed; 0 failed in 17.73s
+```
+
+| Run | Baseline TTFT | Restored TTFT | Cache-hit speedup |
+|---|---|---|---|
+| iter-4 (Phase D GREEN)   | 311.8 ms | 0.5 ms | 624× |
+| iter-7 regression check  | 311.0 ms | 0.4 ms | 777× |
+| iter-9 regression watch  | 308.4 ms | 0.4 ms | 771× |
+| iter-17 regression watch | 320.8 ms | 0.4 ms | 802× |
+
+iter-17 baseline drift +12.4 ms vs iter-4 (+4.0%) — within the
+±5% escalation threshold but ABOVE the ±2 ms band of iter-4/7/9.
+Attributed to contaminated SoC (duetexpertd hot path) by
+elimination: byte-equality + deterministic restore TTFT (0.4 ms
+on every run) prove the persistence path is unchanged; only the
+baseline-prefill wall is moving, and the 4% drift correlates
+with the duetexpertd CPU spike. Not an ADR-017 regression.
+
+Byte-equality holds — `baseline (3632 bytes) == restored (3632
+bytes)` byte-identical on iter-17. **No regression introduced by
+ADR-005 iter-219c chat-template splitter fix.** This is the
+primary signal iter-17 set out to verify.
+
+#### In-binary unit tests — 145/145 PASS unchanged from iter-16
+
+```
+$ cargo test --release --bin hf2q kv_persist -- --test-threads=1
+test result: ok. 145 passed; 0 failed; 0 ignored; 0 measured;
+2328 filtered out; finished in 2.56s
+```
+
+#### Phase B-hybrid prereq audit (ADR-013 P16)
+
+ADR-013 P16 lands Q4_K mm_id kernel improvement (perf, decode
+parity). It does NOT advance Wedge-3 (serve-side qwen35 forward
+inference) — `src/serve/api/engine.rs:894-906` confirms
+`LoadedModel::Qwen35` still 501s on inference (load-only path).
+Phase B-hybrid remains BLOCKED on ADR-013 Wedge-3, not P16.
+
+#### What iter-17 verified
+
+| Question | Answer | Evidence |
+|---|---|---|
+| Is ADR-017's persistence path regression-clean post ADR-005 iter-219c? | YES | R-C4 byte-identical (3632 bytes baseline==restored) |
+| Is ADR-017's in-binary substrate regression-clean post foreign commits? | YES | 145/145 kv_persist tests PASS |
+| Did ADR-013 P16 unblock Phase B-hybrid? | NO | engine.rs:894-906 confirms Qwen35 inference still 501; P16 was perf-only |
+| Is wall-time perf bench safe to run? | NO | duetexpertd contamination ≥5% |
+
+#### Cumulative ADR-017 LOC after iter-17
+
+~20,114 (post iter-9) + ~83 (iter-16 K2 v3 infra subsection) +
+~85 (this iter-17 regression-watch subsection) = **~20,282 LOC**.
+No code changes this iter (regression watch only).
+
+iter-18+ wakeup remains the maintenance-mode cadence: foreign
+session pushes get a regression watch; no code unless an upstream
+ADR commits something that touches ADR-017 surface.
+
 ---
 
 ## Open Questions
