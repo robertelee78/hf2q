@@ -16,6 +16,8 @@ pub mod header;
 #[allow(dead_code)]
 pub mod kv_persist;
 #[allow(dead_code)]
+pub mod load_info;
+#[allow(dead_code)]
 pub mod multi_model;
 pub mod parity_quality;
 #[allow(dead_code)]

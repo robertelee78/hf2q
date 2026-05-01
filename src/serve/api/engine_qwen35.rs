@@ -211,7 +211,10 @@ impl Qwen35LoadedModel {
         };
 
         // ---- Quant label (matches Gemma path) ----
-        let quant_type = infer_quant_type_from_gguf(&gguf);
+        // Promoted to `crate::serve::load_info::infer_quant_label` per
+        // ADR-018 C1 — the previously-inline body was byte-identical to
+        // the Gemma-path body, both now route through the shared helper.
+        let quant_type = crate::serve::load_info::infer_quant_label(&gguf);
 
         let load_duration = load_start.elapsed();
         tracing::info!(
@@ -238,38 +241,11 @@ impl Qwen35LoadedModel {
     }
 }
 
-/// Dominant non-fp tensor type label.  Mirrors
-/// `engine::infer_quant_type_from_gguf` (kept private to that module);
-/// duplicated here rather than refactored into a shared helper because
-/// the algorithm is 25 LOC and a refactor would touch a load-bearing
-/// file beyond iter-215's scope.
-fn infer_quant_type_from_gguf(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
-    use mlx_native::GgmlType;
-    use std::collections::HashMap;
-
-    let mut histogram: HashMap<&'static str, usize> = HashMap::new();
-    for name in gguf.tensor_names() {
-        let Some(info) = gguf.tensor_info(name) else { continue };
-        if matches!(info.ggml_type, GgmlType::F32 | GgmlType::F16) {
-            continue;
-        }
-        let label = match info.ggml_type {
-            GgmlType::F32 => "F32",
-            GgmlType::F16 => "F16",
-            GgmlType::Q4_0 => "Q4_0",
-            GgmlType::Q8_0 => "Q8_0",
-            GgmlType::Q4_K => "Q4_K",
-            GgmlType::Q5_K => "Q5_K",
-            GgmlType::Q6_K => "Q6_K",
-            GgmlType::I16 => "I16",
-        };
-        *histogram.entry(label).or_insert(0) += 1;
-    }
-    histogram
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(k, _)| k.to_string())
-}
+// `infer_quant_type_from_gguf` (formerly 27 LOC of histogram code,
+// byte-identical to the Gemma-path body in engine.rs) was relocated to
+// `crate::serve::load_info::infer_quant_label` per ADR-018 C1.  The
+// duplication is gone; both `*LoadedModel::load` paths route through
+// the promoted helper.
 
 // ---------------------------------------------------------------------------
 // HybridPromptCache (Wedge-3 / ADR-005 iter-216 Phase C)

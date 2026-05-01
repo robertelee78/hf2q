@@ -1425,10 +1425,11 @@ impl GemmaLoadedModel {
                 .map(|v| v as usize)
         };
 
-        // Quant label: dominant non-fp tensor type. Same histogram algorithm
-        // as the /v1/models handler; computed inline here rather than via a
-        // shared helper so this file stays self-contained.
-        let quant_type = infer_quant_type_from_gguf(&gguf);
+        // Quant label: dominant non-fp tensor type. Promoted to
+        // `crate::serve::load_info::infer_quant_label` per ADR-018 C1
+        // (the prior inline body was byte-identical to the relocated
+        // helper; behaviour is unchanged).
+        let quant_type = crate::serve::load_info::infer_quant_label(&gguf);
 
         // Chat template: GGUF embedded or hardcoded fallback.
         let chat_template = gguf
@@ -3143,35 +3144,12 @@ fn generate_once_with_soft_tokens(
     Ok(result)
 }
 
-/// Infer a quant label from an open GGUF. Shared algorithm with the
-/// `/v1/models` handler (kept inline here for module self-containment).
-fn infer_quant_type_from_gguf(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
-    use mlx_native::GgmlType;
-    use std::collections::HashMap;
-
-    let mut histogram: HashMap<&'static str, usize> = HashMap::new();
-    for name in gguf.tensor_names() {
-        let Some(info) = gguf.tensor_info(name) else { continue };
-        if matches!(info.ggml_type, GgmlType::F32 | GgmlType::F16) {
-            continue;
-        }
-        let label = match info.ggml_type {
-            GgmlType::F32 => "F32",
-            GgmlType::F16 => "F16",
-            GgmlType::Q4_0 => "Q4_0",
-            GgmlType::Q8_0 => "Q8_0",
-            GgmlType::Q4_K => "Q4_K",
-            GgmlType::Q5_K => "Q5_K",
-            GgmlType::Q6_K => "Q6_K",
-            GgmlType::I16 => "I16",
-        };
-        *histogram.entry(label).or_insert(0) += 1;
-    }
-    histogram
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(k, _)| k.to_string())
-}
+// `infer_quant_type_from_gguf` was relocated to
+// `crate::serve::load_info::infer_quant_label` per ADR-018 C1.  The
+// previous 27-LOC body was byte-identical to (and the call site here
+// shared an algorithm with) the equivalent body in
+// `engine_qwen35.rs:246-272`; both call sites now route through the
+// promoted helper.
 
 /// Outcome of `finalize_streaming_tool_state` — tells the streaming
 /// driver whether to proceed to `Done`, abort silently (client gone),
