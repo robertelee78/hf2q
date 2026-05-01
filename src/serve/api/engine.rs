@@ -4719,6 +4719,60 @@ assistant:
     }
 
     #[test]
+    fn fallback_gemma4_api_template_appends_empty_channel_block() {
+        // iter-217 regression guard. The upstream Gemma 4 chat template
+        // (vllm/examples/tool_chat_template_gemma4.jinja:326-330) appends
+        // `<|channel>thought\n<channel|>` after `<|turn>model\n` when
+        // `enable_thinking=false` (the default). Without this empty-block,
+        // the model emits a stray `<channel|>` close marker as its first
+        // decoded token (training expects channel closed before content).
+        // The ReasoningSplitter requires both open + close in OUTPUT to
+        // extract reasoning; a lone close has no open to match and leaks
+        // verbatim into delta.content. This test pins the prompt-side
+        // empty-block so the regression is caught at build time, not by
+        // an operator inspecting curl bytes.
+        use crate::serve::FALLBACK_GEMMA4_API_CHAT_TEMPLATE;
+        assert!(
+            FALLBACK_GEMMA4_API_CHAT_TEMPLATE.ends_with("<|turn>model\n<|channel>thought\n<channel|>"),
+            "FALLBACK_GEMMA4_API_CHAT_TEMPLATE must end with the empty channel block; \
+             got tail: {:?}",
+            &FALLBACK_GEMMA4_API_CHAT_TEMPLATE[FALLBACK_GEMMA4_API_CHAT_TEMPLATE.len().saturating_sub(50)..]
+        );
+    }
+
+    #[test]
+    fn fallback_gemma4_api_template_renders_with_empty_channel_block_terminator() {
+        // End-to-end render of the API fallback template: a single user
+        // message must produce a prompt that ends with the empty channel
+        // block, so the model's first decoded token continues AFTER the
+        // close marker (no leak).
+        use crate::serve::FALLBACK_GEMMA4_API_CHAT_TEMPLATE;
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Text("hi".into())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let out = render_chat_prompt(FALLBACK_GEMMA4_API_CHAT_TEMPLATE, &msgs).unwrap();
+        assert!(
+            out.ends_with("<|channel>thought\n<channel|>"),
+            "rendered Gemma4 fallback prompt must terminate with empty channel block; \
+             got tail: {:?}",
+            &out[out.len().saturating_sub(50)..]
+        );
+        // Sanity: the empty block lives after `<|turn>model\n`, not before.
+        let model_turn_idx = out.find("<|turn>model\n").expect("`<|turn>model` marker present");
+        let channel_open_idx = out.find("<|channel>").expect("`<|channel>` open present");
+        assert!(
+            channel_open_idx > model_turn_idx,
+            "`<|channel>` must come AFTER `<|turn>model\\n` in the rendered prompt; \
+             got channel_open_idx={channel_open_idx} model_turn_idx={model_turn_idx}"
+        );
+    }
+
+    #[test]
     fn render_chat_prompt_does_not_remap_for_non_gemma_template() {
         let tmpl = "{% for m in messages %}{{ m.role }}:{{ m.content }}\n{% endfor %}";
         let msgs = vec![ChatMessage {

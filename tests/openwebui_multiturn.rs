@@ -93,6 +93,51 @@ fn fixture_path() -> PathBuf {
         .join("tests/fixtures/openwebui_multiturn/turn1_chunks.txt")
 }
 
+/// iter-217 content-correctness gate: assert no registered family special-token
+/// markers (reasoning open/close, tool-call open/close) leak verbatim into
+/// rendered chat content.
+///
+/// **Why:** A chat-template / splitter mismatch can result in a special-token
+/// marker reaching `delta.content` instead of being absorbed by the prompt-side
+/// or stripped by the splitter. Pre-iter-217, the Gemma 4 fallback chat
+/// template lacked the `<|channel>thought\n<channel|>` empty-block prime, so
+/// every Gemma chat completion had `<channel|>` (Gemma 4 reasoning_close)
+/// leak as the first decoded token. The protocol-level `assert_streaming_invariants`
+/// + non-empty checks did NOT catch this; only operator inspection of bytes did.
+/// This gate makes the regression class loud at test time.
+///
+/// Markers checked (from `serve::api::registry::BUILTIN_REGISTRATIONS`):
+///   - Gemma 4: `<|channel>`, `<channel|>`, `<|tool_call>`, `<tool_call|>`
+///   - Qwen 3.5/3.6: `<think>`, `</think>`, `<tool_call>`, `</tool_call>`
+/// Plus turn markers that should never leak:
+///   - Gemma 4: `<|turn>`, `<turn|>`
+fn assert_no_leaked_special_tokens(label: &str, text: &str) {
+    const LEAK_MARKERS: &[&str] = &[
+        // Gemma 4 reasoning channel
+        "<|channel>",
+        "<channel|>",
+        // Gemma 4 tool-call
+        "<|tool_call>",
+        "<tool_call|>",
+        // Gemma 4 turn boundaries
+        "<|turn>",
+        "<turn|>",
+        // Qwen 3.5/3.6 reasoning
+        "<think>",
+        "</think>",
+        // Qwen 3.5/3.6 tool-call
+        "<tool_call>",
+        "</tool_call>",
+    ];
+    for &marker in LEAK_MARKERS {
+        assert!(
+            !text.contains(marker),
+            "{label}: special-token marker {marker:?} leaked into rendered content; \
+             text={text:?}"
+        );
+    }
+}
+
 #[test]
 fn openwebui_multiturn_streaming_chat_scenario_1() {
     if std::env::var(ENV_GATE).as_deref() != Ok("1") {
@@ -146,6 +191,7 @@ fn openwebui_multiturn_streaming_chat_scenario_1() {
         "turn1 accumulated content was empty; chunks={:?}",
         turn1_chunks
     );
+    assert_no_leaked_special_tokens("turn1", &turn1_text);
     eprintln!("openwebui_multiturn: turn1_text={turn1_text:?}");
 
     // -----------------------------------------------------------------
@@ -163,6 +209,7 @@ fn openwebui_multiturn_streaming_chat_scenario_1() {
         "turn2 accumulated content was empty; chunks={:?}",
         turn2_chunks
     );
+    assert_no_leaked_special_tokens("turn2", &turn2_text);
     eprintln!("openwebui_multiturn: turn2_text={turn2_text:?}");
 
     // -----------------------------------------------------------------
@@ -188,6 +235,7 @@ fn openwebui_multiturn_streaming_chat_scenario_1() {
         "turn3 accumulated content was empty; chunks={:?}",
         turn3_chunks
     );
+    assert_no_leaked_special_tokens("turn3", &turn3_text);
     eprintln!("openwebui_multiturn: turn3_text={turn3_text:?}");
 
     // -----------------------------------------------------------------

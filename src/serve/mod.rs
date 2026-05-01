@@ -253,12 +253,28 @@ pub(crate) const FALLBACK_GEMMA4_CHAT_TEMPLATE: &str =
 /// `assistant→model` remap (`<|turn>model` is the assistant marker for
 /// Gemma 4); the legacy CLI template embeds a system + `<|think|>`
 /// preamble which is tokenization-equivalent across single-turn rounds.
+///
+/// **iter-217 fix (2026-04-30):** the assistant prefix now appends an
+/// **empty channel block** `<|channel>thought\n<channel|>` after
+/// `<|turn>model\n`, mirroring the upstream Gemma 4 chat template's
+/// behavior when `enable_thinking=false` (the default; see
+/// `vllm/examples/tool_chat_template_gemma4.jinja:326-330`). Without this
+/// empty-block prime, the model emits a stray `<channel|>` close marker
+/// in its first decoded tokens (training expects the channel to be
+/// closed before content begins). The `ReasoningSplitter` requires both
+/// open + close in output to extract reasoning, so a lone close marker
+/// leaked verbatim into `delta.content`. Reproducer pre-fix:
+/// `curl /v1/chat/completions {"messages":[{"role":"user","content":"What is the capital of France? Answer in English."}]}`
+/// → `"content":"<channel|>The capital of France is **Paris**."`.
+/// Post-fix: `"content":"The capital of France is **Paris**."` (close
+/// marker absorbed by the prompt-side empty-block).
 pub(crate) const FALLBACK_GEMMA4_API_CHAT_TEMPLATE: &str = concat!(
     "<bos>",
     "{%- for m in messages -%}",
     "<|turn>{{ m.role }}\n{{ m.content }}<turn|>\n",
     "{%- endfor -%}",
     "<|turn>model\n",
+    "<|channel>thought\n<channel|>",
 );
 
 /// Resolve the chat template per ADR-005 Phase 1 priority order:

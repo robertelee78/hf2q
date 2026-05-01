@@ -1412,6 +1412,55 @@ Headline results: chat completion returns HTTP 200 with 16 generated tokens; SSE
   5. Long-lived `HybridKvCache` on `Qwen35LoadedModel` — Wedge-3 allocates the cache per-request (~1-4 GB Metal alloc); a Wedge-4 follow-up may move the cache to a long-lived field with `reset()` between requests to amortize the alloc.
   6. Optional `SpecDecode` integration on the SERVE path — `cmd_generate_qwen35` already supports it via `HF2Q_SPEC_DECODE=1`; the worker arm doesn't read that env var today (Wedge-3 keeps the simpler greedy/sampling fork; spec-decode through the channel needs a measurement plan first).
 
+###### iter-217 — Gemma 4 chat-template `<channel|>` close-marker leak fix + content-correctness gate (2026-04-30)
+
+**Status: LANDED 2026-04-30.** Audit of "Phase 4 CLOSED" claim (post-iter-216) by Robert caught a content-correctness laziness: the iter-216 closure's "live verification" was protocol-level only, never inspected response bytes, and silently shipped a `<channel|>` close-marker leak that affected EVERY Gemma chat completion through `/v1/chat/completions`. iter-217 fixes the leak, adds a content-correctness gate, and updates the canonical fixture.
+
+**Reproducer (pre-fix on HEAD `09ef8d8`):** `curl -X POST http://127.0.0.1:<port>/v1/chat/completions -d '{"model":"Gemma4ForConditionalGeneration","messages":[{"role":"user","content":"What is the capital of France? Answer in English."}],"max_tokens":48,"temperature":0.0}'` returned `{"choices":[{"message":{"content":"<channel|>The capital of France is **Paris**.","reasoning_content":null}}]}`. The `<channel|>` literal close-marker leaked verbatim into `delta.content` / `message.content` for every request. The in-tree LIVE test `tests/openwebui_multiturn.rs::openwebui_multiturn_streaming_chat_scenario_1` did NOT catch this — its assertions (`assert_streaming_invariants` + non-empty content + determinism + fixture replay) gate protocol-level invariants, not content correctness.
+
+**Root cause (`/opt/vllm/examples/tool_chat_template_gemma4.jinja:326-330`).** The upstream Gemma 4 chat template appends an **empty channel block** `<|channel>thought\n<channel|>` after `<|turn>model\n` when `enable_thinking` is false (the default), telling the model "skip thought, start content directly." Without this prompt-side empty-block, the model's training expects the channel to be closed before content begins — and emits a stray `<channel|>` close-marker as its first decoded token to fulfill that expectation. The hf2q fallback constant `FALLBACK_GEMMA4_API_CHAT_TEMPLATE` (`src/serve/mod.rs:256-262` pre-fix) terminated at `<|turn>model\n`, omitting the empty-block. The `ReasoningSplitter` (`src/serve/api/registry.rs:447`) requires both `<|channel>` open AND `<channel|>` close to appear in OUTPUT to extract reasoning text; with the open implicit-from-prompt and only the close in output, the splitter never enters reasoning mode and the close marker leaks through `finish()` flush into the Content slot. The Gemma 4 GGUF in the daily-driver fixture (`gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf`) ships NO `tokenizer.chat_template` GGUF metadata, so the API-path always falls back to `FALLBACK_GEMMA4_API_CHAT_TEMPLATE`; consequently every operator hitting the fallback path saw the leak.
+
+**The fix (one-line template change).** `src/serve/mod.rs:256-262` — `FALLBACK_GEMMA4_API_CHAT_TEMPLATE` now ends with `<|turn>model\n<|channel>thought\n<channel|>`, mirroring the upstream Gemma 4 jinja's `enable_thinking=false` branch verbatim. With the empty-block in the prompt, the model's first decoded token is now the start of content (or a `<|tool_call>` open marker), and the splitter sees clean output with no leaked markers.
+
+**Content-correctness gate (new + permanent).** `tests/openwebui_multiturn.rs::assert_no_leaked_special_tokens` is invoked on every turn's accumulated content (turn1 / turn2 / turn3) and on the determinism rerun. The gate checks that NONE of the registered family special-token markers (`<|channel>`, `<channel|>`, `<|tool_call>`, `<tool_call|>`, `<|turn>`, `<turn|>` for Gemma 4; `<think>`, `</think>`, `<tool_call>`, `</tool_call>` for Qwen 3.5/3.6) appear verbatim in rendered content. This catches the iter-217 bug-class going forward — any future chat-template / splitter mismatch that leaks special tokens into Content fails loudly at LIVE-test time, not at operator-bytes-inspection time.
+
+**Build-time guard (new).** `src/serve/api/engine.rs::tests::fallback_gemma4_api_template_appends_empty_channel_block` + `fallback_gemma4_api_template_renders_with_empty_channel_block_terminator` pin the fallback template's tail at build time (no live serve required), so a refactor that strips the empty-block fails immediately in CI.
+
+**Live verification (post-fix on HEAD `<iter-217>`):** Three prompts via `/v1/chat/completions`, all clean content with no leaked markers:
+
+```
+Test 1: "What is the capital of France? Answer in English."
+  → content: "The capital of France is **Paris**."  reasoning: None
+
+Test 2: "Write a one-sentence English greeting."
+  → content: "Welcome to our community, and we are delighted to have you with us!"  reasoning: None
+
+Test 3: "Hello, my name is"
+  → content: "...to complete that sentence, I need a little more information! \n\nSince you haven't finished your sentence, here are a few ways we can proceed"
+  → reasoning: None
+```
+
+Note that Test 3 ("Hello, my name is") with the iter-217 template produces coherent ENGLISH (multi-line continuation suggesting helpful elaboration), confirming that the multilingual Arabic/English mix observed pre-iter-217 was NOT a model fine-tune property of "ara-abliterated" (the "ara" is Anti-Refusal Augmentation uncensoring, not Arabic) — it was a downstream-of-leak symptom: the stray `<channel|>` first token threw the model into a confused first-decode state where it sometimes hopped languages. With the fixed template, the model picks coherent same-language continuation.
+
+**LIVE openwebui_multiturn replay (HEAD post-iter-217, `gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf`):**
+
+```
+turn1_text="Greetings."
+turn2_text="Farewell."
+turn3_text="\"Hello\" (or more specifically, \"What did I ask first?\")\n\n"
+determinism PASS — turn1 byte-identical at temperature=0
+non-streaming companion PASS — finish_reason=stop
+replayed fixture at "tests/fixtures/openwebui_multiturn/turn1_chunks.txt" — content-shape match
+```
+
+Pre-iter-217 turn1 was `"Hello!"` with leaked `<channel|>` (captured in the old fixture). Post-iter-217 turn1 is `"Greetings."` (cleaner one-word response with no leak). The fixture at `tests/fixtures/openwebui_multiturn/turn1_chunks.txt` has been re-recorded against the post-fix output; the new fixture pins `delta.content="Greetings."`.
+
+**Test counts:** **2323 / 2323 hf2q binary tests pass** (was 2274 / 2274 at iter-216 closure on `2388f65`; +49 net change across reorganization + 2 new build-time template assertions). +1 new LIVE assertion in `tests/openwebui_multiturn.rs::assert_no_leaked_special_tokens` (called on turn1 / turn2 / turn3 — fires per-turn).
+
+**Honest scope-limit note (must not paper over).** During iter-217 verification, `tests/openwebui_tools.rs::openwebui_tools_streaming_scenario_2` was confirmed FAILING with both the pre-iter-217 template AND the post-iter-217 template — it's a **pre-existing regression** introduced somewhere between iter-209 (last-known LIVE PASS per `Verification (16 gates GREEN)` block above) and iter-216. With tools enabled and `tool_choice=auto`, the model emits a repeating `<|tool_call>call:get_current_weather{location:"Paris"}<tool_call|>` block that never terminates (observed up to `index=5` in 130s curl-stream capture before client timeout); the engine's tool-call streaming pipeline is producing structured `delta.tool_calls` deltas correctly per-call, but the model isn't emitting the expected `<turn|>` end-of-turn marker, so generation runs until `max_tokens`. The companion test `openwebui_tools_streaming_tool_choice_none_companion` PASSES on both pre- and post-iter-217 templates (no tools → no infinite-loop class). The infinite-tool-call regression is **independent of the channel-block leak fix** and is **not a Phase 4 closure blocker** — Phase 4's content-correctness scope was the splitter / chat-template leak, which iter-217 closes. The tool-call infinite-loop is a separate Wedge-4 (or new wedge) territory: investigate the EOS / stop-sequence handling for tool calls (the registry's `tool_close="<tool_call|>"` should arguably trigger generation stop when `tool_choice=auto` is in effect; or the prompt should include a stronger "after one tool call, stop" hint; or the chat-template should pre-prime a different state when tools are provided).
+
+**Lessons (durable, captured in memory).** (a) "Live verification" requires checking the actual response **bytes** for leaked special tokens, not just protocol invariants + non-empty content. (b) Don't infer model behavior from filename token (`ara` ≠ Arabic; it's Anti-Refusal Augmentation). (c) When closing a phase, the content-correctness gate must be in the test suite, not in the operator's curl history — else the next operator hits the same bug-class and re-discovers it from production. (d) Pre-existing failures on adjacent tests do NOT block a narrow scope-limited fix; document them honestly + scope them to a separate iter rather than papering or coupling.
+
 ##### Test plan (cross-iter)
 
 **iter-211 round-trip harness.** `tests/provenance_writer_roundtrip.rs` (new, ~280 LOC). Subprocess-driven, env-gated `HF2Q_PROVENANCE_WRITER_E2E=1`. Spawns `hf2q convert --repo <tiny-test-repo>` against the existing `hf-internal-testing/tiny-random-gpt2` fixture (network-gated `HF2Q_NETWORK_TESTS=1` per iter-204 pattern); asserts the emitted GGUF carries the three keys; asserts `serve/provenance.rs::detect()` returns `Provenance::Hf2q { .. }` with matching SHAs.
