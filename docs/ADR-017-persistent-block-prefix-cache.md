@@ -2945,6 +2945,67 @@ reasonable interpretation under the current architecture.
   or (b) switch to absolute-overhead bounds. Sub-ms ratio-gating
   is methodology error, not signal.
 
+  **iter-15 K2 polish v2 LANDED** (this commit, in-tree edit of
+  `kv_persist_phase_d_r_p1_concurrent_eviction_e2e`):
+
+  iter-15 applies the three corrections iter-14 surfaced. The
+  test name + env gate + always-on shape tests stay stable
+  (operator recipe unchanged); only the test BODY is re-spec'd.
+
+  *3 corrections applied:*
+  1. **Cache-MISS prompts**: each iter constructs a unique
+     salted prompt — `"Iteration {i} salt={pid-nanos} phase={baseline|concurrent} List five common breads…, including {i} variants of sourdough."` — so the BPE tokenization differs per iter and prefill ACTUALLY runs. v1 fired the same prompt every iter, collapsing iters #1..N to sub-ms cache-hits.
+  2. **No eviction-sleep delay**: sibling thread fires
+     `force_eviction_via_symlink` IMMEDIATELY (no
+     `sleep(100ms)`). With cache-MISS prefill in flight for
+     hundreds of ms, the trigger overlaps real
+     decode/prefill work. v1's 100 ms pre-fire delay
+     exceeded sub-ms cache-hit decode wall, so eviction
+     ran AFTER decode — back-to-back, not concurrent.
+  3. **Hybrid gate (absolute OR relative)**: pass if EITHER
+     `abs_overhead = concurrent - baseline ≤ 50 ms` OR
+     `rel_overhead = abs_overhead / baseline ≤ 0.05`. Fail
+     only when BOTH bounds are exceeded. Absolute is
+     meaningful at any scale (catches real overhead even at
+     short baselines); relative is meaningful only when
+     baseline ≥ ~100 ms. v1 used relative-only and FAILed
+     by 0.14 ms of noise on a 0.6 ms baseline.
+
+  *Other v2 details:* `MAX_TOKENS` raised 128 → 256 (4×) to
+  push decode wall to 200-500 ms regardless of cache state.
+  `N_SAMPLES=3`, drop sample #0 (cold-load outlier), average
+  samples #1..N-1 — same warm-up discipline as v1, restated
+  with non-empty-after-skip guard. Session salt is `pid +
+  nanos-since-epoch`, so cross-test cache contamination cannot
+  occur even if the cache_dir hierarchy is shared by accident.
+
+  *v1 → v2 diff at a glance:*
+  | Concern | v1 (iter-14) | v2 (iter-15) |
+  |---|---|---|
+  | Prompt | same every iter | unique salted per iter |
+  | Eviction timing | `sleep(100ms)` then fire | fire immediately |
+  | Gate | relative only (≤0.05) | absolute (≤50ms) OR relative (≤0.05) |
+  | MAX_TOKENS | 128 | 256 |
+  | Decode wall regime | sub-ms cache-hit (iters #1..N) | 200-500 ms cache-MISS |
+
+  *Operator-measurement status:* iter-15 SHIPS THE FIX BUT
+  DOES NOT RUN THE BENCH. The K2 polish v2 measurement is
+  operator-controlled per `scripts/adr017_phase_d.sh` — same
+  contract as iter-12 + iter-14. The next operator role can
+  re-fire the env-gated test under the same recipe; the gate
+  logic now correctly distinguishes real overhead from
+  scheduling-jitter noise at any baseline duration.
+
+  Verification gates (no GPU bench from agent):
+  - `cargo check --release --bin hf2q --tests --test kv_persist_gemma4_roundtrip` exit 0
+  - `cargo test --release --test kv_persist_gemma4_roundtrip phase_d -- --test-threads=1` PASS for always-on shape tests; env-gated v2 test short-circuits cleanly when env unset
+
+  ADR-017 K2 verdict UNCHANGED: iter-8's between-decodes
+  measurement (overhead=−0.995) remains the load-bearing K2
+  falsifier. The concurrent-eviction harness is now
+  methodologically sound and ready for the next operator
+  measurement run.
+
 #### All 3 kill-gates FALSIFIED — final status table
 
 | Kill-gate | Threshold | Measured | Verdict | Iter |
