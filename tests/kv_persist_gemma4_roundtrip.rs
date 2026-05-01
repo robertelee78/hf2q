@@ -963,8 +963,13 @@ pub fn run_cell_e2e(cell: &Cell, model_path: &Path, cache_dir: &Path) -> Result<
         port,
     )
     .map_err(|e| format!("spawn: {e}"))?;
-    phase_d_driver::wait_for_readyz(&server)
-        .map_err(|e| format!("readyz: {e}"))?;
+    phase_d_driver::wait_for_readyz(&server).map_err(|e| {
+        format!(
+            "readyz: {e}\n--- hf2q serve stderr_tail ({} lines) ---\n{}",
+            server.log_tail().len(),
+            server.log_tail().join("\n"),
+        )
+    })?;
     let canonical = phase_d_driver::fetch_canonical_model_id(&server)
         .map_err(|e| format!("fetch model id: {e}"))?;
 
@@ -1419,8 +1424,14 @@ fn kv_persist_phase_d_coherence_e2e() {
         port,
     )
     .expect("[Phase D coherence] spawn hf2q serve --kv-persist");
-    phase_d_driver::wait_for_readyz(&server)
-        .expect("[Phase D coherence] /readyz did not return 200 within budget");
+    phase_d_driver::wait_for_readyz(&server).unwrap_or_else(|e| {
+        panic!(
+            "[Phase D coherence] /readyz did not return 200 within budget: {e}\n\
+             --- hf2q serve stderr_tail ({} lines) ---\n{}",
+            server.log_tail().len(),
+            server.log_tail().join("\n"),
+        )
+    });
     let canonical = phase_d_driver::fetch_canonical_model_id(&server)
         .expect("[Phase D coherence] fetch canonical model id");
 
@@ -1710,8 +1721,14 @@ fn kv_persist_phase_d_r_p4_e2e() {
         port,
     )
     .expect("[Phase D R-P4] spawn hf2q serve --kv-persist");
-    phase_d_driver::wait_for_readyz(&server)
-        .expect("[Phase D R-P4] /readyz did not return 200 within budget");
+    phase_d_driver::wait_for_readyz(&server).unwrap_or_else(|e| {
+        panic!(
+            "[Phase D R-P4] /readyz did not return 200 within budget: {e}\n\
+             --- hf2q serve stderr_tail ({} lines) ---\n{}",
+            server.log_tail().len(),
+            server.log_tail().join("\n"),
+        )
+    });
     let canonical = phase_d_driver::fetch_canonical_model_id(&server)
         .expect("[Phase D R-P4] fetch canonical model id");
 

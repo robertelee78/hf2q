@@ -1755,6 +1755,93 @@ PASS, gemma4_roundtrip 7 always-on prior + 3 new always-on shape =
 The CFA worker's contract is complete: scaffolding LANDED; the
 matrix RUN is the operator-controlled follow-up.
 
+### Phase D measurement attempt 2026-05-01 — BLOCKED on contended SoC + diagnostic improvement LANDED
+
+Solo Claude /loop session 2026-05-01 attempted the Phase D R-C4
+coherence measurement directly via `cargo test
+kv_persist_phase_d_coherence_e2e`. **Substrate-side state
+re-confirmed by code+test:**
+
+| Gate | Result |
+|---|---|
+| `cargo build --release --bin hf2q` | **PASS** (Finished in 0.10s; tree clean) |
+| `cargo test --release --bin hf2q kv_persist -- --test-threads=1` | **PASS** — 111 in-binary tests |
+| `cargo test --release --test kv_persist_writer_kill_minus_9` | **PASS** — 1 test |
+| `cargo test --release --test kv_persist_harness` | **PASS** — 36 tests |
+| `cargo test --release --test kv_persist_gemma4_roundtrip` (always-on) | **PASS** — 12 tests |
+| **Total non-env-gated tests** | **160 PASS / 0 FAIL / 0 ignored** |
+
+**Phase D R-C4 coherence run aborted at /readyz timeout (600s).** The
+test reported `last: "transport: Connection refused (os error 61)"`
+— `hf2q serve --kv-persist=DIR` never bound to port 52339 within the
+budget. **Root cause: contended SoC**, NOT a bug in the kv-persist
+startup path:
+
+- Pre-bench process audit at session start: clean (no
+  `mcp-brain-server` / `llama-server` / `llama-cli` / `ollama`).
+- Mid-bench audit during the failed run: 1123% CPU on `rustc`,
+  66.1% on `llama-cli`, 76.7% on a foreign `target/release/hf2q
+  generate` (PID 66688, child of foreign `coherence_smoke` test
+  PID 53551). Background CFA sessions on ADR-013/015 iter61c
+  bisection + ADR-015 qwen35 tests + iter219 in flight per
+  `[Concurrent sessions in flight]` standing memory.
+- `vm_stat`: free RAM dropped from 67 GiB → 26 GiB during the run as
+  foreign sessions allocated their own model loads.
+- These foreign sessions are NOT mine to kill (per
+  `[Concurrent sessions in flight]` and `feedback_use_cfa_worktrees`).
+
+**No code change to ADR-017 production path.** The startup-path
+itself was never observed to fail on its own merits — the timeout
+was a contention symptom, not a /kv-persist bug.
+
+**Diagnostic improvement landed (additive, tests-only):** the three
+`wait_for_readyz(...)` call sites in
+`tests/kv_persist_gemma4_roundtrip.rs` previously dropped the
+captured `ServerGuard.stderr_tail` on `/readyz` timeout — the
+`.expect("...")` / `.map_err(|e| format!("readyz: {e}"))` paths
+emitted only "Connection refused (os error 61)", with zero insight
+into whether `hf2q serve` was mid-mmap, mid-pre-warm, or had
+panicked. The fix surfaces `server.log_tail()` (up to 256 lines of
+captured stderr) on every timeout, so the next bench attempt's
+failure mode is diagnosable from the cargo-test output alone:
+
+| Call site | Was | Is |
+|---|---|---|
+| `run_cell_e2e` (matrix, line 966) | `.map_err(\|e\| format!("readyz: {e}"))?` | Same + `\n--- hf2q serve stderr_tail (N lines) ---\n{tail}` |
+| `kv_persist_phase_d_coherence_e2e` (line 1422) | `.expect("[Phase D coherence] /readyz did not return 200 within budget")` | `.unwrap_or_else(\|e\| panic!(...))` with stderr_tail in the panic message |
+| `kv_persist_phase_d_r_p4_e2e` (line 1713) | `.expect("[Phase D R-P4] /readyz did not return 200 within budget")` | Same pattern |
+
+Compiles clean. 12/12 always-on tests still PASS post-patch (no
+regression).
+
+**What's still gating Phase D closure:**
+
+- Cold-M5-Max measurement run via `scripts/adr017_phase_d.sh` on
+  the canonical Gemma 4 26B GGUF, with concurrent CFA sessions
+  quiesced or completed.
+- `READYZ_BUDGET_SECS = 600` is generous on a clean SoC for a 14
+  GiB GGUF + Metal pipeline pre-warm; under contention it can be
+  insufficient. The diagnostic improvement makes future failures
+  distinguishable from real defects without raising the budget
+  (which would mask problems per
+  `feedback_substrate_must_not_synthesize_ship_gates`).
+
+**Cumulative ADR-017 LOC after 2026-05-01 diagnostic improvement:**
+~13,391 LOC + ~30 LOC test-side diagnostic = **~13,421 LOC**
+in-tree substrate. Tests-only edit; zero `src/` touches.
+
+**Hypothesis for the operator (testable, recorded for next bench
+attempt):** under a clean-SoC pre-bench audit (no `rustc`/`cargo
+test`/`llama-cli`/foreign `hf2q` processes consuming >10% CPU), the
+R-C4 coherence test starts up within 600s and either (a) PASSes
+byte-exact (confirms H1 from spec §Mantra), or (b) fails with a
+specific stderr_tail signal that names the production-side defect.
+Falsifier: clean-SoC R-C4 also times out at /readyz with no
+informative stderr_tail — would indicate a real cmd_serve
+--kv-persist startup defect that the test-side diagnostic improvement
+does not surface (would require an in-process tracing add
+to `src/serve/mod.rs::cmd_serve`).
+
 ---
 
 ## Open Questions
