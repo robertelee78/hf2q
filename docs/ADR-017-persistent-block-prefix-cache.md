@@ -1102,6 +1102,119 @@ A.1 (format + index, 1,584 LOC) + A.2 (block_store + writer + recovery + lib fac
 
 The next ADR-017 milestone is **B-dense.1**: substitute `StubGemma4Spill` with the real Gemma 4 dense BF16 K/V codec. Per Phase A0's measurement-positive ship gates and R-C1's byte-exact contract, B-dense.1 is now unblocked.
 
+### Phase B-dense.1 LANDED (2026-04-30)
+
+**Status:** `Gemma4DenseSpill` (real Gemma 4 dense F32/F16 K/V codec) shipped on `cfa/adr017-b-dense1/claude` worktree; pending dual-mode CFA queen merge against the Codex parallel impl. **B-dense.1 closes the substrate-↔-engine seam:** the spiller's per-family hook trait now has a real Gemma 4 implementation; Phase C.1 wires the operator-facing flag + `set_engine_handle` plumbing.
+
+**Code-map clarification:** The ADR §B-dense.1 spec named `src/inference/models/<gemma4-eqv>/kv_cache.rs` as the hook target. **That path does not exist.** Gemma 4 inference runs through `src/serve/forward_mlx.rs` (per `src/inference/mod.rs:4` "fit inside `src/serve/forward_mlx.rs` (which is Gemma-4-shaped)"); the dense K/V cache lives at `MlxModelWeights.dense_kvs: Option<Vec<DenseKvBuffers>>` (`forward_mlx.rs:556` + struct decl `:707`), allocated in `forward_prefill.rs:274–285`. B-dense.1 resolved the placeholder by housing the hook at **`src/serve/kv_persist/families/gemma4_dense.rs`** — co-located with the spiller substrate (matches the pattern from §A.3 §"Why Arc<Mutex<dyn KvCacheSpill>>"), independent of the `forward_mlx` engine internals (zero edits to `forward_mlx.rs` / `forward_prefill.rs` per the perf-fence discipline).
+
+**Commits (`cfa/adr017-b-dense1/claude`, 2 commits, pushed to worktree):**
+
+- `11c46b0` — `feat(adr-017 b-dense.1): Gemma4DenseSpill KvCacheSpill impl + 17 unit tests`
+- `b230606` — `feat(adr-017 b-dense.1): wire families module into kv_persist`
+
+**LOC delta (additive over A.3 substrate):**
+
+| File | LOC | Role |
+|---|---|---|
+| `src/serve/kv_persist/families/gemma4_dense.rs` | 1,801 (1,003 production + 798 tests) | `Gemma4DenseSpill` impl of `KvCacheSpill`. Holds `Arc<RwLock<Option<EngineHandle>>>` + per-layer shape config (layer_types, nkv_heads, head_dim, kv_dtype, sliding_window, max_decode_tokens). `EngineHandle` carries `Arc<MlxDevice>` + `Arc<RwLock<Option<Vec<DenseKvBuffer>>>>` + `Arc<RwLock<Vec<usize>>>` (write_positions); designed for Phase C.1's per-admission `set_engine_handle` swap pattern (the hook persists across evictions; the engine instance changes on each re-load). Payload format is a 34-byte self-describing binary header (magic `b"G4D1"`, dtype tag, is_sliding, nkv_heads, head_dim, capacity, write_pos, range_start, range_end, k_byte_len, v_byte_len) followed by K bytes then V bytes, each in token-position order (head-major: `[nkv_heads, n_tokens, head_dim]`). `snapshot_block` reads via `MlxBuffer::as_slice<u8>` on `StorageModeShared` (zero-copy on Apple Silicon unified memory). `restore_block` allocates `dense_kvs` if absent (mirrors `forward_prefill.rs:274–285` exactly: per-layer capacity = `sliding_window` for ring layers, `seq_len + max_decode_tokens` for linear), validates dtype + layer_type + shape against captured config (CodecErr on mismatch; never mutates the cache on rejection), writes payload back into ring/linear slots, restores write_pos for sliding layers. |
+| `src/serve/kv_persist/families/mod.rs` | 27 | Module facade. Exposes `pub mod gemma4_dense;`. Reserves the spot for B-hybrid.1's `qwen35_hybrid` and B-tq.1's `tq_packed` siblings (out of scope for this iter). |
+| `src/serve/kv_persist/mod.rs` | +1 | One-line addition of `pub mod families;`. Trait surface (KvCacheSpill, BlockPrefixCacheSpiller) untouched. |
+| **Total** | **+1,829 LOC additive over A.3** | — |
+
+**Test count delta:**
+
+- 17 new in-module unit tests in `src/serve/kv_persist/families/gemma4_dense.rs`, all PASS in 0.06 s under `cargo test --release --bin hf2q kv_persist::families -- --test-threads=1`.
+- Cumulative `kv_persist` unit tests: A.1+A.2+A.3 had 57; B-dense.1 adds 17 → **74 total in-binary unit tests**, all PASS in 1.17 s.
+- 1 prior integration test (`tests/kv_persist_writer_kill_minus_9.rs`) continues to PASS — no regression.
+- 36/36 existing harness tests still PASS (`cargo test --release --test kv_persist_harness -- --test-threads=1`, 2.00 s) — no regression.
+
+**The 17 tests, by ID:**
+
+ 1. `new_with_zero_layers_returns_zero_alignment_neutral` — invariant: `block_alignment` returns the format constant regardless of `num_layers`; zero-layer hook still rejects every snapshot via the bounds check.
+ 2. `block_alignment_returns_256` — invariant: `KvCacheSpill::block_alignment` returns `BLOCK_TOKENS = 256`.
+ 3. `snapshot_with_no_engine_handle_returns_none` — Skipped path: hook before `set_engine_handle` returns `None`, matches the C.1-pre-load contract.
+ 4. `snapshot_layer_out_of_range_returns_none` — defensive: `layer_rank >= num_layers` returns `None` even with a populated handle.
+ 5. `snapshot_full_layer_returns_dtype_and_bytes` — F32 full-attention layer (nkv=1, head_dim=16) snapshot produces a 34-byte header + 512 K bytes + 512 V bytes; header records `dtype=F32`, `is_sliding=false`, `write_pos=u32::MAX` (linear sentinel).
+ 6. **`snapshot_sliding_layer_handles_ring_wrap`** — sliding layer (capacity=16) snapshot of token range `[12..20)` straddles the ring boundary at slot 16; payload K bytes are reconstructed manually from `populate_handle`'s seed pattern and asserted byte-equal to the snapshot output (proves token-position-order emission stitches the wrap correctly).
+ 7. `snapshot_f16_dtype_payload_round_trips` — F16 dtype tag survives the header round-trip; byte sizes scale correctly (2 bytes per element).
+ 8. `restore_with_dense_kvs_none_allocates_first` — load-bearing for post_admit-before-prefill: starts with `dense_kvs == None`, restore allocates `Vec<DenseKvBuffer>` of `num_layers` mirroring `forward_prefill.rs:274–285`, populates the targeted layer + range.
+ 9. `restore_dtype_mismatch_returns_codec_err` — producer F32 + consumer F16 → restore rejects with `SpillErrorKind::CodecErr` without mutating the cache.
+10. `restore_layer_type_mismatch_returns_codec_err` — producer marks layer 0 as `Sliding`; consumer's config marks it as `Full` → CodecErr.
+11. **`pre_evict_then_post_admit_round_trip_byte_exact` (R-C1)** — load-bearing for B-dense.2: 1-layer full-attn hook produces an 8,192-byte K + 8,192-byte V payload, spiller enqueues + drains via `AsyncWriterHandle` to `DiskBlockStore`, `format::read_envelope_body` parses + body-hash-verifies the on-disk envelope, fresh consumer hook (with `dense_kvs == None`) restores via `post_admit`, every one of the 8,192 K bytes + 8,192 V bytes asserted byte-equal to `populate_handle`'s seed pattern. **Stdout evidence:** `[R-C1] PASS — Gemma4DenseSpill round-trip 8192 K + 8192 V bytes byte-exact via spill→disk→restore`.
+12. **`pre_evict_then_post_admit_round_trip_byte_exact_sliding_with_wrap`** — sliding layer (capacity=8) snapshot of token range `[4..12)` crosses the ring boundary; consumer's restore writes into ring slots `[4,5,6,7,0,1,2,3]`; the per-slot K bytes asserted byte-equal to the producer's pre-evict state; `write_pos` (set to 5 pre-evict) restored byte-equal post-restore. **Stdout evidence:** `[ring-wrap] PASS — sliding layer range [4..12) over capacity=8 round-tripped byte-exact`.
+13. `restore_with_short_payload_returns_codec_err` — defensive parse: 10-byte buffer + header-only buffer both rejected with `CodecErr`.
+14. `restore_with_long_payload_returns_codec_err` — defensive parse: payload extended by 4 trailing junk bytes rejected with `CodecErr` (length must equal `header + k_byte_len + v_byte_len` exactly).
+15. `engine_handle_set_then_clear_disables_snapshot` — `set_engine_handle` ↔ `clear_engine_handle` round-trip: snapshot returns `None` → `Some` → `None` across the calls (matches Phase C.1's expected admit/evict semantics).
+16. `multiple_layers_round_trip_byte_exact` — 4-layer config (3 sliding + 1 full-attn), snapshot every layer's `[0..4)` range, restore on a fresh consumer, assert byte-equal at the touched slot ranges per layer.
+17. `concurrent_snapshot_calls_serialize_via_mutex` — 8 threads concurrently call `snapshot_block(0, 0..4)` through an `Arc<Mutex<dyn KvCacheSpill>>`; all returned payload sizes match (proves the trait-object lock serializes correctly + Send + Sync invariants hold).
+
+**Mechanical exit codes (worktree HEAD `b230606`):**
+
+| Command | Exit | Output |
+|---|---|---|
+| `cargo build --release` | **0** | `Finished release profile [optimized] target(s)` |
+| `cargo test --release --bin hf2q kv_persist -- --test-threads=1` | **0** | **74 passed; 0 failed; 0 ignored** in 1.17 s (57 prior + 17 new) |
+| `cargo test --release --test kv_persist_writer_kill_minus_9 -- --test-threads=1` | **0** | **1 passed; 0 failed; 0 ignored** in 0.05 s |
+| `cargo test --release --test kv_persist_harness -- --test-threads=1` | **0** | **36 passed; 0 failed; 0 ignored** in 2.00 s (no regression) |
+| `cargo clippy --release --no-deps` (kv_persist filter) | **0** | one allowed `clippy::too_many_arguments` warning on internal `read_kv_range_to_bytes` / `write_bytes_into_kv_range` helpers (`(8/7)`); intentional — the helpers carry the full layer shape (nkv, capacity, head_dim, dtype, is_sliding, range, byte buffer) without an intermediate struct because per-call allocation in the snapshot/restore hot path is the wrong direction. |
+| `grep -rn '// TODO\|todo!()\|unimplemented!()\|person-day' src/serve/kv_persist/` | **1** | no hits — discipline holds |
+
+**R-C1 byte-exact evidence (`pre_evict_then_post_admit_round_trip_byte_exact`):**
+
+```
+running 1 test
+test serve::kv_persist::families::gemma4_dense::tests::pre_evict_then_post_admit_round_trip_byte_exact ...
+  [R-C1] PASS — Gemma4DenseSpill round-trip 8192 K + 8192 V bytes byte-exact via spill→disk→restore
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2347 filtered out; finished in 0.06s
+```
+
+The test asserts: (1) `Gemma4DenseSpill::snapshot_block(0, 0..256)` produces a 16,418-byte payload (34-byte header + 8,192 K bytes + 8,192 V bytes); (2) the spiller enqueues a `WriteJob` with `block_hash = sha256(body)`; (3) the async writer drains to disk under the `<root>/models/<fp>/kv/<hex0>/<hex>.safetensors` layout; (4) `format::read_envelope_body` parses + body-hash-verifies the on-disk envelope; (5) `post_admit` reads the body via `store.read_block` and dispatches to a FRESH consumer `Gemma4DenseSpill` whose `dense_kvs == None`; (6) `restore_block` allocates `dense_kvs` (mirroring `forward_prefill.rs:274–285`), then writes K + V bytes into the linear slot range `[0..256)`; (7) every one of the 8,192 K bytes + 8,192 V bytes equals `populate_handle`'s deterministic seed pattern. The post_admit-before-prefill path is exercised end-to-end.
+
+**Ring-wrap evidence (`pre_evict_then_post_admit_round_trip_byte_exact_sliding_with_wrap`):**
+
+```
+running 1 test
+test serve::kv_persist::families::gemma4_dense::tests::pre_evict_then_post_admit_round_trip_byte_exact_sliding_with_wrap ...
+  [ring-wrap] PASS — sliding layer range [4..12) over capacity=8 round-tripped byte-exact
+ok
+```
+
+The test asserts: (a) sliding layer with `capacity=8` snapshots token range `[4..12)` whose slot map wraps through `[4,5,6,7,0,1,2,3]`; (b) payload header records `is_sliding=true`, `capacity=8`, `range=[4,12)`, `write_pos=5` (preserved through the round-trip); (c) consumer's restore writes payload bytes into the same ring slots in token-position order; (d) per-slot K bytes byte-equal between producer and consumer; (e) consumer's `write_positions[0] == 5` post-restore. This is the load-bearing edge case for sliding-layer correctness on long-decode trajectories that wrap the ring.
+
+**Hookup readiness for Phase B-dense.2 (parity matrix):**
+
+B-dense.2 lands the round-trip parity matrix across prefix lengths × quants × scenarios. The hand-off shape:
+
+- **Test fixture**: per-quant Gemma 4 GGUF (Q4_K_M, Q5_K_M, Q6_K, Q8_0, MXFP4) loaded via `cmd_serve` startup; spiller registered with `Gemma4DenseSpill` per A.3 + B-dense.1.
+- **Matrix**: prefix lengths {256, 1K, 4K, 8K, 16K, 32K} × quants × {full-attn dominant, sliding-only, mixed} × {coherence, perf}.
+- **Ship gate**: sourdough byte-exact decode tokens vs the never-evicted baseline at every cell. The R-C1 test 11 + ring-wrap test 12 + multi-layer test 16 in B-dense.1 are the foundation; B-dense.2 turns those unit-level invariants into an end-to-end matrix.
+
+**Hookup readiness for Phase C.1 (cmd_serve --kv-persist=on wire-up):**
+
+C.1 lands the CLI flag + the `set_engine_handle` wiring at engine-load time. The hand-off shape:
+
+- **Flag parse**: `--kv-persist=on|off` (default `off`). When `on`, `cmd_serve` reads `HF2Q_KV_PERSIST_ROOT` (default `~/.cache/hf2q/kv-persist`) and `HF2Q_KV_PERSIST_BUDGET_BYTES` (default `0` = uncapped pilot per §R-F5).
+- **Construction (substrate already shipped in A.1+A.2+A.3)**: `let (index, _report) = recover_from_disk(cache_root)?` → `Arc::new(DiskBlockStore::new_with_index(cache_root, index, budget_bytes)?)` → `Arc::new(AsyncWriterHandle::spawn(store_arc.clone(), DEFAULT_CHANNEL_CAPACITY))` → `Arc::new(BlockPrefixCacheSpiller::new(store_arc, writer_arc))` → `HotSwapManager::new_with_spiller(pool, loader, spiller_arc)`.
+- **Per-model registration with B-dense.1's hook**: when `load_or_get(repo, quant, ...)` admits a fresh Gemma 4 engine, `cmd_serve` builds a `Gemma4DenseConfig` from the loaded `Gemma4Config` (layer_types, nkv_heads / num_global_key_value_heads, head_dim / global_head_dim, kv_dtype = F32/F16 from `INVESTIGATION_ENV.f16_kv`, sliding_window, max_decode_tokens), constructs `Gemma4DenseSpill::new(cfg)?`, calls `spill.set_engine_handle(EngineHandle { device, dense_kvs, write_positions })` with `Arc`-shared references INTO the live `MlxModelWeights`, then `spiller.register_family(repo, quant, Arc::new(Mutex::new(spill)))`.
+- **The seam**: `EngineHandle.dense_kvs` and `EngineHandle.write_positions` are `Arc<RwLock<...>>` so the engine and the hook see the same live state. C.1 must add accessor methods on `MlxModelWeights` to surface those `Arc`s without touching the per-token hot path (the hot-path reads/writes don't take the lock — eviction is the only path that does, and that fires after decode has returned to idle).
+
+**B-dense.1 discipline notes:**
+
+- Production code in `src/serve/kv_persist/families/*` only (additive). Zero edits to `src/serve/multi_model.rs` (KvSpiller trait surface stable per A.3).
+- Zero edits to `src/serve/forward_mlx.rs` or `src/serve/forward_prefill.rs` (perf-sensitive; B-dense.1 reads-only).
+- Zero edits to `src/inference/models/qwen35/*` (parallel ADR-005 Phase 4 fence).
+- Zero edits to `mlx-native/`, `gpu_delta_net.rs`, `forward_gpu.rs`, `gpu_full_attn.rs` (ADR-015 fence).
+- Real I/O round-trip in test 11 (spiller → DiskBlockStore → AsyncWriterHandle → atomic-rename → format::read_envelope_body → restore_block) per `feedback_substrate_must_not_synthesize_ship_gates`.
+- Real byte-content verification in tests (per `feedback_live_verification_must_check_content`): tests 11 + 12 + 16 assert byte-equality on the restored cache contents; tests 5, 6, 7, 9, 10, 13, 14 assert correct codec rejection on mismatched payloads.
+- "man-day" used; "person-day" does not appear.
+- No `// TODO` / `todo!()` / `unimplemented!()` / `panic!()` markers in production code.
+- Worktree discipline: ABSOLUTE PATHS in shell; no `cd /opt/hf2q` corruption (per `feedback_agent_worktree_cwd_trap`).
+
+**Cumulative ADR-017 LOC:** A complete (5,066 LOC) + B-dense.1 (1,829 LOC) = **6,895 LOC** of in-tree substrate + per-family hook. **74 in-binary unit tests + 1 kill-9 integration test + 36 harness tests, all PASS.** Phase B-dense.2 (parity matrix) and Phase C.1 (CLI flag + engine-handle wiring) are now the gating items between this code and operator-facing `cmd_serve --kv-persist=on`.
+
 ---
 
 ## Open Questions
