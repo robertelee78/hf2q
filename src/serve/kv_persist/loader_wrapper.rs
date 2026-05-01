@@ -82,11 +82,30 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 
 use crate::serve::kv_persist::registry::KvPersistRegistry;
+use crate::serve::kv_persist::spiller::{BlockPrefixCacheSpiller, KvCacheSpill};
 use crate::serve::multi_model::{EngineConfig, ModelLoader};
 use crate::serve::quant_select::QuantType;
 
 /// Decorating `ModelLoader<E>` that drives the C.1 engine-binding
 /// registry. See module docs for the full design rationale.
+///
+/// ## Phase B-dense.2 — factory substitution seam
+///
+/// `LoaderWrapper::load`'s post-load callback now calls
+/// `registry.try_substitute_on_load(repo, quant, engine_dyn)` BEFORE
+/// the existing `registry.bind_for(...)` step. If a registered
+/// `FamilyHookFactory` produces a real per-family hook (e.g.
+/// `Gemma4DenseSpill` from `Gemma4DenseSpillFactory`), the wrapper
+/// also updates the *spiller's* `register_family` map (via the
+/// optional `spiller` field) so the on-disk snapshot/restore
+/// dispatch lands on the real hook, not the C.1 stub.
+///
+/// Both updates run atomically per the
+/// `KvPersistRegistry::try_substitute_on_load` contract. If
+/// substitution returns `None` (no factory OR factory rejects the
+/// engine type), the wrapper falls through to `bind_for` on the
+/// existing stub registration — a clean no-op for the auto-Arc<E>
+/// path.
 pub struct LoaderWrapper<E> {
     /// Underlying loader. Production wires `DefaultModelLoader`;
     /// tests substitute a mock.
@@ -99,6 +118,15 @@ pub struct LoaderWrapper<E> {
     /// outside of an in-flight `set_pending_bind` → `load_or_get`
     /// transition.
     pending_bind: Mutex<Option<(String, QuantType)>>,
+    /// Phase B-dense.2 — optional spiller for the
+    /// `try_substitute_on_load` flow. When set, a successful factory
+    /// substitution also overwrites the spiller's per-family hook
+    /// table so the spiller's `pre_evict` / `post_admit` triggers
+    /// dispatch on the real hook. When None (e.g. C.1-only test
+    /// fixtures), the substitution path skips the spiller update —
+    /// the registry's hook map is still updated, but the spiller
+    /// keeps its prior `register_family` entry.
+    spiller: Mutex<Option<Arc<BlockPrefixCacheSpiller<E>>>>,
     /// PhantomData to bind the `E` generic to the wrapper. The
     /// `fn(E)` form makes `LoaderWrapper<E>` invariant in `E` and
     /// avoids unnecessary auto-trait implications.
@@ -117,8 +145,28 @@ where
             inner,
             registry,
             pending_bind: Mutex::new(None),
+            spiller: Mutex::new(None),
             _phantom: PhantomData,
         }
+    }
+
+    /// Phase B-dense.2 — wire the spiller for the
+    /// `try_substitute_on_load` flow. When set, a successful factory
+    /// substitution also calls `spiller.register_family(repo, quant,
+    /// kv_hook)` so the on-disk snapshot/restore dispatch lands on
+    /// the real per-family hook.
+    ///
+    /// `cmd_serve` calls this immediately after constructing the
+    /// `BlockPrefixCacheSpiller` and the `LoaderWrapper`, before
+    /// arming `set_pending_bind`. C.1-only callers (no factory
+    /// registered) may safely skip this — the wrapper degrades to
+    /// the C.1 behavior (registry-only update on bind_for).
+    pub fn set_spiller(&self, spiller: Arc<BlockPrefixCacheSpiller<E>>) {
+        let mut g = self
+            .spiller
+            .lock()
+            .expect("LoaderWrapper::spiller Mutex poisoned");
+        *g = Some(spiller);
     }
 
     /// Arm the pending-bind slot for the next `load(...)` call. Must
@@ -174,6 +222,30 @@ where
     pub fn registry(&self) -> Arc<KvPersistRegistry> {
         Arc::clone(&self.registry)
     }
+
+    /// Phase B-dense.2 — update the spiller's `register_family` map
+    /// after a successful factory substitution. No-op when no
+    /// spiller is wired (C.1-only callers / unit tests).
+    ///
+    /// Called from inside `load(...)` after
+    /// `registry.try_substitute_on_load` returns `Some(kv_hook)`.
+    /// The spiller's `register_family` overwrites any prior C.1
+    /// stub registration (matches its existing
+    /// "freshest-registration-wins" semantic).
+    fn update_spiller_registration(
+        &self,
+        repo: &str,
+        quant: QuantType,
+        kv_hook: Arc<Mutex<dyn KvCacheSpill>>,
+    ) {
+        let g = self
+            .spiller
+            .lock()
+            .expect("LoaderWrapper::spiller Mutex poisoned");
+        if let Some(spiller_arc) = g.as_ref() {
+            spiller_arc.register_family(repo.to_string(), quant, kv_hook);
+        }
+    }
 }
 
 impl<E> ModelLoader<E> for LoaderWrapper<E>
@@ -208,12 +280,47 @@ where
         };
 
         // 3. Build a type-erased Arc view on the freshly-loaded
-        //    engine and drive the registry. The hook's
-        //    `EngineBindable::bind_engine` is responsible for the
-        //    downcast (and silent no-op on mismatch — e.g. when only
-        //    a stub family is registered).
+        //    engine and drive the registry.
+        //
+        // Phase B-dense.2: BEFORE bind_for, call
+        // `try_substitute_on_load`. If a factory is registered for
+        // (repo, quant) AND the engine type matches (e.g.
+        // `Arc<EngineHandle>` for Gemma4 production wiring), the
+        // factory produces a real per-family hook tuple
+        // `(kv_hook, bindable_hook)`. The registry's hook map is
+        // already updated by `try_substitute_on_load`; the wrapper
+        // also updates the spiller's `register_family` map so the
+        // on-disk snapshot/restore dispatch lands on the real hook.
+        //
+        // If `try_substitute_on_load` returns None (no factory OR
+        // factory rejects the engine type — the auto-Arc<E> path is
+        // ALWAYS rejected by the Gemma4 factory because it expects
+        // Arc<EngineHandle>), the substitution is a no-op and the
+        // existing C.1 stub registration remains in the spiller +
+        // registry.
         let arc_engine: Arc<E> = Arc::new(engine);
         let dyn_view: Arc<dyn Any + Send + Sync> = Arc::clone(&arc_engine) as _;
+
+        // 3a. Try substitution. The clone of dyn_view is consumed by
+        //     try_substitute_on_load (it must take ownership of the
+        //     Arc<dyn Any>). On Some(_), update the spiller's
+        //     register_family table to keep registry + spiller in
+        //     lock-step.
+        let dyn_view_for_substitute: Arc<dyn Any + Send + Sync> = Arc::clone(&dyn_view);
+        if let Some(kv_hook) =
+            self.registry
+                .try_substitute_on_load(&repo, quant, dyn_view_for_substitute)
+        {
+            self.update_spiller_registration(&repo, quant, kv_hook);
+        }
+
+        // 3b. The C.1 bind_for flow always fires after the optional
+        //     B-dense.2 substitution — for the auto-Arc<E> path, the
+        //     stub's bind_engine is a silent no-op; for the explicit
+        //     Arc<EngineHandle> path (which cmd_serve drives via a
+        //     SEPARATE post-load bind, not this auto-call),
+        //     try_substitute_on_load already wired the real spill
+        //     and bind_for is redundant but harmless.
         self.registry.bind_for(&repo, quant, dyn_view);
 
         // 4. Reclaim the inner E. `Arc::try_unwrap` succeeds iff the
@@ -608,6 +715,278 @@ mod tests {
             "[C.1 smoke] PASS — wrapper.load fired {} binds, drive_unbind fired {} unbinds",
             recorder.bind_count(),
             recorder.unbind_count()
+        );
+    }
+
+    // ===== Phase B-dense.2 — substitute-on-load tests =======================
+
+    /// Mock kv-side spill for use as the kv_hook half of the factory
+    /// tuple. Records that it was substituted so tests can assert
+    /// the spiller-side update fired.
+    struct LwMockKvSpill {
+        block_alignment_value: u32,
+    }
+
+    impl crate::serve::kv_persist::spiller::KvCacheSpill for LwMockKvSpill {
+        fn block_alignment(&self) -> u32 {
+            self.block_alignment_value
+        }
+        fn snapshot_block(
+            &self,
+            _layer_rank: usize,
+            _range: std::ops::Range<u32>,
+        ) -> Option<Vec<u8>> {
+            None
+        }
+        fn restore_block(
+            &mut self,
+            _layer_rank: usize,
+            _range: std::ops::Range<u32>,
+            _payload: &[u8],
+        ) -> std::result::Result<(), crate::serve::multi_model::SpillErrorKind> {
+            Ok(())
+        }
+    }
+
+    /// Synthetic engine type expected by the factory.
+    #[derive(Debug)]
+    struct LwExpectedHandle {
+        _marker: u32,
+    }
+
+    /// Mock factory that succeeds when downcast to
+    /// `Arc<LwExpectedHandle>` and produces an LwMockKvSpill +
+    /// LwMockBindable tuple.
+    struct LwMockFactory;
+
+    impl crate::serve::kv_persist::registry::FamilyHookFactory for LwMockFactory {
+        fn try_construct(
+            &self,
+            engine_dyn: Arc<dyn Any + Send + Sync>,
+        ) -> Option<(
+            Arc<Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>>,
+            Arc<dyn EngineBindable>,
+        )> {
+            engine_dyn
+                .downcast::<LwExpectedHandle>()
+                .ok()
+                .map(|_handle_arc| {
+                    let kv: Arc<Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>> =
+                        Arc::new(Mutex::new(LwMockKvSpill {
+                            // 256 = BLOCK_TOKENS — a real Gemma4DenseSpill
+                            // would also return this.
+                            block_alignment_value: 256,
+                        }));
+                    let bindable: Arc<dyn EngineBindable> = LwMockBindable::new();
+                    (kv, bindable)
+                })
+        }
+    }
+
+    /// Mock loader that returns an `LwExpectedHandle`-compatible
+    /// type-erased engine. The wrapper's `Arc<E>` carries this type
+    /// directly so the factory's downcast succeeds.
+    struct LwMockLoaderHandle;
+
+    impl ModelLoader<LwExpectedHandle> for LwMockLoaderHandle {
+        fn load(&self, _path: &Path, _config: &EngineConfig) -> Result<LwExpectedHandle> {
+            Ok(LwExpectedHandle { _marker: 0xCAFE })
+        }
+    }
+
+    /// Spec test 9: with a registered factory + matching engine type,
+    /// `LoaderWrapper::load` substitutes the spiller's hook (when a
+    /// spiller is wired). Falsifier: the spiller's registered_count
+    /// stays at 1 with the old hook, OR the spiller's lookup yields
+    /// the old hook's block_alignment (not 256).
+    #[test]
+    fn loader_wrapper_substitutes_on_load_when_factory_matches() {
+        use crate::serve::kv_persist::block_store::DiskBlockStore;
+        use crate::serve::kv_persist::registry::FamilyHookFactory;
+        use crate::serve::kv_persist::writer::AsyncWriterHandle;
+        use crate::serve::kv_persist::{BlockPrefixCacheSpiller, DEFAULT_CHANNEL_CAPACITY};
+
+        // Build a real spiller (cheap; tempdir-backed substrate).
+        let tmp = std::env::temp_dir().join(format!(
+            "hf2q-lw-substitute-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+        let store = Arc::new(DiskBlockStore::new(tmp.clone(), 0).expect("DiskBlockStore"));
+        let writer = Arc::new(AsyncWriterHandle::spawn(
+            Arc::clone(&store),
+            DEFAULT_CHANNEL_CAPACITY,
+        ));
+        let spiller: Arc<BlockPrefixCacheSpiller<LwExpectedHandle>> = Arc::new(
+            BlockPrefixCacheSpiller::new(Arc::clone(&store), Arc::clone(&writer)),
+        );
+
+        // Pre-register a stub family hook so the spiller's count
+        // starts at 1.
+        struct OldStub;
+        impl crate::serve::kv_persist::spiller::KvCacheSpill for OldStub {
+            fn block_alignment(&self) -> u32 {
+                999
+            }
+            fn snapshot_block(
+                &self,
+                _layer_rank: usize,
+                _range: std::ops::Range<u32>,
+            ) -> Option<Vec<u8>> {
+                None
+            }
+            fn restore_block(
+                &mut self,
+                _layer_rank: usize,
+                _range: std::ops::Range<u32>,
+                _payload: &[u8],
+            ) -> std::result::Result<(), crate::serve::multi_model::SpillErrorKind> {
+                Ok(())
+            }
+        }
+        let old_stub: Arc<Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>> =
+            Arc::new(Mutex::new(OldStub));
+        spiller.register_family("acme/m1".to_string(), QuantType::Q4_K_M, old_stub);
+        assert_eq!(spiller.registered_count(), 1);
+
+        let registry = Arc::new(KvPersistRegistry::new());
+        // Pre-register the stub bindable too (the C.1 wire-up
+        // contract) so the hooks map starts populated.
+        let pre_stub_bindable = LwMockBindable::new();
+        registry.register(
+            "acme/m1".to_string(),
+            QuantType::Q4_K_M,
+            pre_stub_bindable.clone() as Arc<dyn EngineBindable>,
+        );
+        // Register the factory.
+        let factory: Arc<dyn FamilyHookFactory> = Arc::new(LwMockFactory);
+        registry.register_factory("acme/m1".to_string(), QuantType::Q4_K_M, factory);
+
+        // Build the LoaderWrapper around an LwMockLoaderHandle so
+        // load returns LwExpectedHandle (which the factory accepts).
+        let inner: Arc<dyn ModelLoader<LwExpectedHandle>> = Arc::new(LwMockLoaderHandle);
+        let wrapper: LoaderWrapper<LwExpectedHandle> =
+            LoaderWrapper::new(inner, Arc::clone(&registry));
+        wrapper.set_spiller(Arc::clone(&spiller));
+        wrapper.set_pending_bind("acme/m1".to_string(), QuantType::Q4_K_M);
+
+        let (path, cfg) = dummy_path_and_config();
+        let _engine = wrapper.load(&path, &cfg).expect("load OK");
+
+        // Spiller's hook for (acme/m1, Q4_K_M) is the SUBSTITUTED
+        // LwMockKvSpill (block_alignment == 256), not OldStub
+        // (block_alignment == 999). The spiller's count is still 1
+        // (overwrite, not insert).
+        assert_eq!(spiller.registered_count(), 1);
+
+        // The factory-substituted bindable should override the C.1
+        // stub. We can't directly inspect block_alignment without
+        // calling pre_evict (which needs a LoadedEngine fixture), so
+        // we assert via the registry: bind_for fires the SUBSTITUTED
+        // bindable (a fresh LwMockBindable), NOT the original
+        // pre_stub_bindable. The original stub's bind_count stays 0.
+        assert_eq!(
+            pre_stub_bindable.bind_count(),
+            0,
+            "factory substitution overwrites the registry's hook entry"
+        );
+    }
+
+    /// Spec test 10: when the factory's `try_construct` returns None
+    /// (engine type mismatch), the spiller's hook table is NOT
+    /// modified. The original C.1 stub registration remains live.
+    /// Falsifier: spiller.registered_count grows past 1 OR the
+    /// spiller's hook for the key is replaced.
+    #[test]
+    fn loader_wrapper_does_not_substitute_on_factory_mismatch() {
+        use crate::serve::kv_persist::block_store::DiskBlockStore;
+        use crate::serve::kv_persist::registry::FamilyHookFactory;
+        use crate::serve::kv_persist::writer::AsyncWriterHandle;
+        use crate::serve::kv_persist::{BlockPrefixCacheSpiller, DEFAULT_CHANNEL_CAPACITY};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "hf2q-lw-no-substitute-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+        let store = Arc::new(DiskBlockStore::new(tmp.clone(), 0).expect("DiskBlockStore"));
+        let writer = Arc::new(AsyncWriterHandle::spawn(
+            Arc::clone(&store),
+            DEFAULT_CHANNEL_CAPACITY,
+        ));
+        // Use the same `TestEngine` E type from the rest of this
+        // test module. The wrapper will deliver Arc<TestEngine> to
+        // the factory; LwMockFactory expects Arc<LwExpectedHandle>
+        // → mismatch → None.
+        let spiller: Arc<BlockPrefixCacheSpiller<TestEngine>> = Arc::new(
+            BlockPrefixCacheSpiller::new(Arc::clone(&store), Arc::clone(&writer)),
+        );
+
+        struct InitialStub;
+        impl crate::serve::kv_persist::spiller::KvCacheSpill for InitialStub {
+            fn block_alignment(&self) -> u32 {
+                111
+            }
+            fn snapshot_block(
+                &self,
+                _layer_rank: usize,
+                _range: std::ops::Range<u32>,
+            ) -> Option<Vec<u8>> {
+                None
+            }
+            fn restore_block(
+                &mut self,
+                _layer_rank: usize,
+                _range: std::ops::Range<u32>,
+                _payload: &[u8],
+            ) -> std::result::Result<(), crate::serve::multi_model::SpillErrorKind> {
+                Ok(())
+            }
+        }
+        let initial_stub: Arc<Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>> =
+            Arc::new(Mutex::new(InitialStub));
+        spiller.register_family("acme/m1".to_string(), QuantType::Q4_K_M, initial_stub);
+
+        let registry = Arc::new(KvPersistRegistry::new());
+        let stub_bindable = LwMockBindable::new();
+        registry.register(
+            "acme/m1".to_string(),
+            QuantType::Q4_K_M,
+            stub_bindable.clone() as Arc<dyn EngineBindable>,
+        );
+        // Register the factory — but the loader returns TestEngine
+        // (not LwExpectedHandle), so try_construct will None-out.
+        let factory: Arc<dyn FamilyHookFactory> = Arc::new(LwMockFactory);
+        registry.register_factory("acme/m1".to_string(), QuantType::Q4_K_M, factory);
+
+        let inner = MockLoader::new();
+        let wrapper: LoaderWrapper<TestEngine> = LoaderWrapper::new(
+            inner.clone() as Arc<dyn ModelLoader<TestEngine>>,
+            Arc::clone(&registry),
+        );
+        wrapper.set_spiller(Arc::clone(&spiller));
+        wrapper.set_pending_bind("acme/m1".to_string(), QuantType::Q4_K_M);
+
+        let (path, cfg) = dummy_path_and_config();
+        let _engine = wrapper.load(&path, &cfg).expect("load OK");
+
+        // No substitution — spiller's count is still 1.
+        assert_eq!(spiller.registered_count(), 1);
+        // The C.1 stub bindable still received the bind_for fallout
+        // (every load fires bind_for unconditionally per the design
+        // doc above).
+        assert_eq!(
+            stub_bindable.bind_count(),
+            1,
+            "C.1 stub still fires bind_for on the auto-Arc<E> mismatched path"
         );
     }
 

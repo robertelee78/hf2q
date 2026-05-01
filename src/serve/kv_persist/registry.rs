@@ -54,8 +54,9 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
+use crate::serve::kv_persist::spiller::KvCacheSpill;
 use crate::serve::kv_persist::EngineBindable;
 use crate::serve::quant_select::QuantType;
 
@@ -66,6 +67,79 @@ use crate::serve::quant_select::QuantType;
 /// same key shape `(repo, quant)` in this registry.
 type FamilyKey = (String, &'static str);
 
+/// Per-`(repo, quant)` factory for "lazy real-hook construction at
+/// first load". Phase B-dense.2 adds this trait so a per-family hook
+/// that needs the live engine to even be CONSTRUCTED (e.g.
+/// [`crate::serve::kv_persist::families::gemma4_dense::Gemma4DenseSpill`]
+/// — its shape config + dtype come from `MlxModelWeights`) can be
+/// registered AS A FACTORY at startup, then materialized on first
+/// load when the engine is finally available.
+///
+/// ## Why a factory not a direct hook
+///
+/// At `cmd_serve` startup the operator's GGUF has not yet been
+/// loaded — `MlxModelWeights` does not exist. The C.1 stub
+/// registration exists precisely so the spiller substrate has *some*
+/// hook to dispatch into; B-dense.2 wires the real hook lazily on
+/// the first load via this factory.
+///
+/// ## Substitution flow (atomic)
+///
+/// On first successful load for a `(repo, quant)` with a registered
+/// factory, [`KvPersistRegistry::try_substitute_on_load`] invokes
+/// `factory.try_construct(engine_dyn)` and atomically:
+///
+///   1. Updates the registry's `hooks` map (overwriting the prior
+///      stub `EngineBindable`).
+///   2. Returns the new `Arc<Mutex<dyn KvCacheSpill>>` so the caller
+///      ([`crate::serve::kv_persist::loader_wrapper::LoaderWrapper`])
+///      can also call `BlockPrefixCacheSpiller::register_family` —
+///      keeping the two registration tables (registry + spiller) in
+///      lock-step.
+///
+/// If `try_construct` returns `None` (engine type mismatch), no
+/// substitution happens and the existing stub registration remains
+/// the active hook for that `(repo, quant)`. The caller falls
+/// through to the existing `bind_for` flow (which also no-ops on the
+/// stub's mismatching downcast — see `StubGemma4Spill`'s
+/// `EngineBindable` impl).
+///
+/// ## Send + Sync
+///
+/// Required because the registry's `factories` map lives behind an
+/// `RwLock` accessed from concurrent load triggers (per the
+/// `KvPersistRegistry` concurrency note in module docs).
+pub trait FamilyHookFactory: Send + Sync {
+    /// Try to construct a real per-family hook from the live engine.
+    /// Returns `Some((kv_hook, bindable_hook))` on success — the
+    /// caller substitutes BOTH simultaneously (spiller registration
+    /// + registry registration). Returns `None` on engine type
+    /// mismatch — the registry leaves the prior stub hook in place
+    /// and the load proceeds with stub-Skipped semantics.
+    ///
+    /// ## Contract: no panic on type mismatch
+    ///
+    /// Implementations MUST use `Arc::downcast` (or equivalent
+    /// non-panicking extraction) and return `None` on mismatch. A
+    /// panic here would propagate up through `LoaderWrapper::load`
+    /// and break the load path.
+    ///
+    /// ## Contract: no Arc retention
+    ///
+    /// Implementations MUST NOT keep a clone of `engine_dyn` itself.
+    /// They may keep clones of the inner `Arc<...>` they downcast
+    /// out of `engine_dyn` (e.g.
+    /// `Arc<crate::serve::kv_persist::families::gemma4_dense::EngineHandle>`),
+    /// but the type-erased outer Arc must drop at end of scope so
+    /// the [`crate::serve::kv_persist::loader_wrapper::LoaderWrapper`]'s
+    /// `Arc::try_unwrap` succeeds (mirrors the
+    /// [`EngineBindable::bind_engine`] retention contract).
+    fn try_construct(
+        &self,
+        engine_dyn: Arc<dyn Any + Send + Sync>,
+    ) -> Option<(Arc<Mutex<dyn KvCacheSpill>>, Arc<dyn EngineBindable>)>;
+}
+
 /// Per-`(repo, quant)` registry of [`EngineBindable`] hooks. See
 /// module docs for the design rationale.
 ///
@@ -74,6 +148,14 @@ pub struct KvPersistRegistry {
     /// Inner map. `RwLock` for concurrent reads (per
     /// concurrency note in module docs).
     hooks: RwLock<HashMap<FamilyKey, Arc<dyn EngineBindable>>>,
+    /// Per-`(repo, quant)` factories (Phase B-dense.2). Populated
+    /// once at `cmd_serve` startup; `try_substitute_on_load`
+    /// consumes a factory entry on first successful load to
+    /// materialize the real hook. Factories are NOT removed after
+    /// use — they remain for any subsequent re-load (HotSwap evict
+    /// → readmit) so the materialization repeats with the fresh
+    /// engine.
+    factories: RwLock<HashMap<FamilyKey, Arc<dyn FamilyHookFactory>>>,
 }
 
 impl Default for KvPersistRegistry {
@@ -88,6 +170,7 @@ impl KvPersistRegistry {
     pub fn new() -> Self {
         Self {
             hooks: RwLock::new(HashMap::new()),
+            factories: RwLock::new(HashMap::new()),
         }
     }
 
@@ -173,6 +256,104 @@ impl KvPersistRegistry {
         if let Some(hook) = g.get(&key) {
             hook.unbind_engine();
         }
+    }
+
+    /// Register a [`FamilyHookFactory`] for `(repo, quant)`. Phase
+    /// B-dense.2's lazy real-hook construction seam.
+    ///
+    /// Re-registering the same key OVERWRITES the prior factory
+    /// (matches `register` semantics — freshest wins). Idempotent.
+    ///
+    /// The factory remains registered after a substitution succeeds:
+    /// a subsequent evict + readmit cycle re-materializes the hook
+    /// against the freshly-loaded engine. This mirrors how
+    /// `register_family` on the spiller is "one entry per
+    /// `(repo, quant)` for the lifetime of the loaded model".
+    pub fn register_factory(
+        &self,
+        repo: String,
+        quant: QuantType,
+        factory: Arc<dyn FamilyHookFactory>,
+    ) {
+        let mut g = self
+            .factories
+            .write()
+            .expect("KvPersistRegistry::factories RwLock poisoned");
+        g.insert((repo, quant.as_str()), factory);
+    }
+
+    /// Number of currently-registered factories. Symmetric to
+    /// [`Self::registered_count`] for hooks. Used by tests to
+    /// verify factory wiring without leaking the `Arc<dyn FamilyHookFactory>`.
+    pub fn factory_count(&self) -> usize {
+        self.factories
+            .read()
+            .expect("KvPersistRegistry::factories RwLock poisoned")
+            .len()
+    }
+
+    /// Test / diagnostic accessor: returns `true` iff a factory is
+    /// registered for `(repo, quant)`.
+    pub fn contains_factory(&self, repo: &str, quant: QuantType) -> bool {
+        let g = self
+            .factories
+            .read()
+            .expect("KvPersistRegistry::factories RwLock poisoned");
+        let key = (repo.to_string(), quant.as_str());
+        g.contains_key(&key)
+    }
+
+    /// Phase B-dense.2 — try to substitute the registered stub hook
+    /// for a real per-family hook by invoking the registered factory
+    /// (if any) with the live `engine_dyn`. Returns the new
+    /// `Arc<Mutex<dyn KvCacheSpill>>` so the caller (the
+    /// `LoaderWrapper`) can also update the spiller's registration
+    /// table — keeping registry + spiller in lock-step.
+    ///
+    /// Returns `None` when:
+    ///   * no factory is registered for `(repo, quant)`, OR
+    ///   * the factory's `try_construct` returned `None` (engine
+    ///     type mismatch — e.g. a non-Gemma 4 family loaded against
+    ///     a Gemma 4 factory).
+    ///
+    /// On `Some(_)`, the registry's `hooks` map is OVERWRITTEN
+    /// atomically with the factory-produced `Arc<dyn EngineBindable>`.
+    /// Subsequent `bind_for` calls hit the new hook directly.
+    ///
+    /// Lock discipline: write-locks `hooks` only when substitution
+    /// succeeds; `factories` is read-only on this path so concurrent
+    /// load triggers don't serialize against each other.
+    pub fn try_substitute_on_load(
+        &self,
+        repo: &str,
+        quant: QuantType,
+        engine_dyn: Arc<dyn Any + Send + Sync>,
+    ) -> Option<Arc<Mutex<dyn KvCacheSpill>>> {
+        let key = (repo.to_string(), quant.as_str());
+        // 1. Look up the factory under a read lock; clone the Arc
+        //    out so we don't hold the lock across `try_construct`
+        //    (which may run for non-trivial time as it inspects the
+        //    type-erased engine).
+        let factory = {
+            let g = self
+                .factories
+                .read()
+                .expect("KvPersistRegistry::factories RwLock poisoned");
+            g.get(&key).cloned()
+        };
+        let factory = factory?;
+        // 2. Invoke the factory. `None` = type mismatch ⇒ leave the
+        //    existing stub registration in place.
+        let (kv_hook, bindable_hook) = factory.try_construct(engine_dyn)?;
+        // 3. Substitute the registry's hook entry atomically.
+        {
+            let mut g = self
+                .hooks
+                .write()
+                .expect("KvPersistRegistry::hooks RwLock poisoned");
+            g.insert(key, bindable_hook);
+        }
+        Some(kv_hook)
     }
 
     /// Test / diagnostic accessor: returns `true` iff a hook is
@@ -421,6 +602,289 @@ mod tests {
         );
         assert_eq!(m1.bind_count(), 0);
         assert_eq!(m2.bind_count(), 1);
+    }
+
+    // ===== Phase B-dense.2 — FamilyHookFactory tests ========================
+
+    /// Mock [`KvCacheSpill`] that just remembers it was constructed.
+    /// Used as the `kv_hook` half of the factory return tuple.
+    struct MockKvSpillForFactory;
+
+    impl crate::serve::kv_persist::spiller::KvCacheSpill for MockKvSpillForFactory {
+        fn block_alignment(&self) -> u32 {
+            crate::serve::kv_persist::format::BLOCK_TOKENS
+        }
+        fn snapshot_block(
+            &self,
+            _layer_rank: usize,
+            _range: std::ops::Range<u32>,
+        ) -> Option<Vec<u8>> {
+            None
+        }
+        fn restore_block(
+            &mut self,
+            _layer_rank: usize,
+            _range: std::ops::Range<u32>,
+            _payload: &[u8],
+        ) -> std::result::Result<(), crate::serve::multi_model::SpillErrorKind> {
+            Ok(())
+        }
+    }
+
+    /// Synthetic concrete engine type used by the factory tests. The
+    /// factory expects to downcast to `ExpectedEngineHandle`; tests
+    /// pass either this (matching) or some unrelated type (mismatch).
+    #[derive(Debug)]
+    struct ExpectedEngineHandle {
+        marker: u32,
+    }
+
+    /// Mock factory — succeeds when the dyn Any downcasts to
+    /// `Arc<ExpectedEngineHandle>`, fails otherwise.
+    struct MockFactoryExpecting;
+
+    impl FamilyHookFactory for MockFactoryExpecting {
+        fn try_construct(
+            &self,
+            engine_dyn: Arc<dyn Any + Send + Sync>,
+        ) -> Option<(Arc<Mutex<dyn KvCacheSpill>>, Arc<dyn EngineBindable>)> {
+            // Use Arc::downcast — returns Result, never panics.
+            match engine_dyn.downcast::<ExpectedEngineHandle>() {
+                Ok(_handle) => {
+                    let kv: Arc<Mutex<dyn KvCacheSpill>> =
+                        Arc::new(Mutex::new(MockKvSpillForFactory));
+                    let bindable: Arc<dyn EngineBindable> = MockBindable::new();
+                    Some((kv, bindable))
+                }
+                Err(_) => None,
+            }
+        }
+    }
+
+    /// Factory that always returns None (simulates a stubbed-out
+    /// non-matching family).
+    struct MockFactoryAlwaysNone;
+
+    impl FamilyHookFactory for MockFactoryAlwaysNone {
+        fn try_construct(
+            &self,
+            _engine_dyn: Arc<dyn Any + Send + Sync>,
+        ) -> Option<(Arc<Mutex<dyn KvCacheSpill>>, Arc<dyn EngineBindable>)> {
+            None
+        }
+    }
+
+    // ===== Test FH-1 =======================================================
+    #[test]
+    fn registry_register_factory_round_trip() {
+        // B-dense.2 spec: register_factory + factory_count grow
+        // alongside the existing hook registration.
+        let reg = KvPersistRegistry::new();
+        assert_eq!(reg.factory_count(), 0);
+        assert!(!reg.contains_factory("acme/m1", QuantType::Q4_K_M));
+
+        reg.register_factory(
+            "acme/m1".to_string(),
+            QuantType::Q4_K_M,
+            Arc::new(MockFactoryExpecting),
+        );
+        assert_eq!(reg.factory_count(), 1);
+        assert!(reg.contains_factory("acme/m1", QuantType::Q4_K_M));
+        // hooks count is independent of factory count.
+        assert_eq!(reg.registered_count(), 0);
+    }
+
+    // ===== Test FH-2 =======================================================
+    #[test]
+    fn registry_try_substitute_on_load_succeeds_on_type_match() {
+        // B-dense.2 Hypothesis 1: factory.try_construct yields
+        // Some(...), registry's hooks map is OVERWRITTEN.
+        let reg = KvPersistRegistry::new();
+        // Pre-existing stub hook.
+        let stub = MockBindable::new();
+        reg.register(
+            "acme/m1".to_string(),
+            QuantType::Q4_K_M,
+            stub.clone() as Arc<dyn EngineBindable>,
+        );
+        assert_eq!(reg.registered_count(), 1);
+
+        reg.register_factory(
+            "acme/m1".to_string(),
+            QuantType::Q4_K_M,
+            Arc::new(MockFactoryExpecting),
+        );
+
+        let payload = Arc::new(ExpectedEngineHandle { marker: 0xBEEF });
+        let payload_dyn: Arc<dyn Any + Send + Sync> = payload;
+        let result = reg.try_substitute_on_load("acme/m1", QuantType::Q4_K_M, payload_dyn);
+        assert!(result.is_some(), "factory yields a kv_hook on type match");
+
+        // Substitution: the registry's hook for (acme/m1, Q4_K_M) is
+        // NOT the original stub anymore. We can't compare Arc
+        // identity through Arc<dyn EngineBindable>, but we verify by
+        // bind_for'ing a payload and observing the original stub's
+        // bind_count remains 0.
+        let next_payload = Arc::new(ExpectedEngineHandle { marker: 0x1234 });
+        reg.bind_for(
+            "acme/m1",
+            QuantType::Q4_K_M,
+            next_payload as Arc<dyn Any + Send + Sync>,
+        );
+        assert_eq!(
+            stub.bind_count(),
+            0,
+            "after substitution, the original stub no longer fires"
+        );
+        // Counts are unchanged: registry replaces the value at the
+        // existing key without growing the table.
+        assert_eq!(reg.registered_count(), 1);
+        assert_eq!(reg.factory_count(), 1);
+    }
+
+    // ===== Test FH-3 =======================================================
+    #[test]
+    fn registry_try_substitute_on_load_returns_none_on_type_mismatch() {
+        // B-dense.2: factory returns None ⇒ substitution does NOT
+        // happen ⇒ the existing stub remains the registered hook.
+        let reg = KvPersistRegistry::new();
+        let stub = MockBindable::new();
+        reg.register(
+            "acme/m1".to_string(),
+            QuantType::Q4_K_M,
+            stub.clone() as Arc<dyn EngineBindable>,
+        );
+        // Factory expects ExpectedEngineHandle; we will give it a
+        // `DummyEnginePayload` ⇒ Arc::downcast fails ⇒ None.
+        reg.register_factory(
+            "acme/m1".to_string(),
+            QuantType::Q4_K_M,
+            Arc::new(MockFactoryExpecting),
+        );
+
+        let wrong_payload = Arc::new(DummyEnginePayload { _marker: 0xFEED });
+        let result = reg.try_substitute_on_load(
+            "acme/m1",
+            QuantType::Q4_K_M,
+            wrong_payload as Arc<dyn Any + Send + Sync>,
+        );
+        assert!(result.is_none(), "type mismatch ⇒ no substitution");
+
+        // Stub still in place.
+        let next_payload = Arc::new(DummyEnginePayload { _marker: 0xBABE });
+        reg.bind_for(
+            "acme/m1",
+            QuantType::Q4_K_M,
+            next_payload as Arc<dyn Any + Send + Sync>,
+        );
+        assert_eq!(
+            stub.bind_count(),
+            1,
+            "stub remains registered after non-matching factory"
+        );
+    }
+
+    // ===== Test FH-4 =======================================================
+    #[test]
+    fn registry_try_substitute_on_load_no_factory_is_noop() {
+        // B-dense.2: no factory registered ⇒ substitution returns None
+        // and the registry state is unchanged.
+        let reg = KvPersistRegistry::new();
+        let stub = MockBindable::new();
+        reg.register(
+            "acme/m1".to_string(),
+            QuantType::Q4_K_M,
+            stub.clone() as Arc<dyn EngineBindable>,
+        );
+
+        let payload = Arc::new(ExpectedEngineHandle { marker: 0xC0DE });
+        let result = reg.try_substitute_on_load(
+            "acme/m1",
+            QuantType::Q4_K_M,
+            payload as Arc<dyn Any + Send + Sync>,
+        );
+        assert!(result.is_none(), "no factory ⇒ no substitution");
+        assert_eq!(reg.factory_count(), 0);
+        // Stub still bind-able.
+        let payload2 = Arc::new(ExpectedEngineHandle { marker: 1 });
+        reg.bind_for(
+            "acme/m1",
+            QuantType::Q4_K_M,
+            payload2 as Arc<dyn Any + Send + Sync>,
+        );
+        assert_eq!(stub.bind_count(), 1);
+    }
+
+    // ===== Test FH-5 =======================================================
+    #[test]
+    fn registry_factory_always_none_does_not_substitute() {
+        // Defensive: factory is registered, but its try_construct is
+        // hard-coded to None (e.g. a stub family for which lazy
+        // construction is intentionally not implemented). Substitute
+        // returns None; the existing hook stays.
+        let reg = KvPersistRegistry::new();
+        let stub = MockBindable::new();
+        reg.register(
+            "acme/m1".to_string(),
+            QuantType::Q4_K_M,
+            stub.clone() as Arc<dyn EngineBindable>,
+        );
+        reg.register_factory(
+            "acme/m1".to_string(),
+            QuantType::Q4_K_M,
+            Arc::new(MockFactoryAlwaysNone),
+        );
+
+        let payload = Arc::new(ExpectedEngineHandle { marker: 5 });
+        let result = reg.try_substitute_on_load(
+            "acme/m1",
+            QuantType::Q4_K_M,
+            payload as Arc<dyn Any + Send + Sync>,
+        );
+        assert!(result.is_none());
+        // The stub is still wired.
+        let payload2 = Arc::new(ExpectedEngineHandle { marker: 6 });
+        reg.bind_for(
+            "acme/m1",
+            QuantType::Q4_K_M,
+            payload2 as Arc<dyn Any + Send + Sync>,
+        );
+        assert_eq!(stub.bind_count(), 1);
+    }
+
+    // ===== Test FH-6 =======================================================
+    #[test]
+    fn registry_factory_re_register_overwrites_prior() {
+        // Symmetric to register_re_register_overwrites_prior_hook but
+        // for factories.
+        let reg = KvPersistRegistry::new();
+        reg.register_factory(
+            "acme/m1".to_string(),
+            QuantType::Q4_K_M,
+            Arc::new(MockFactoryAlwaysNone),
+        );
+        reg.register_factory(
+            "acme/m1".to_string(),
+            QuantType::Q4_K_M,
+            Arc::new(MockFactoryExpecting),
+        );
+        assert_eq!(reg.factory_count(), 1, "no count growth on overwrite");
+
+        // Now substitute — proves the SECOND factory is live (the
+        // first would have returned None unconditionally).
+        let stub = MockBindable::new();
+        reg.register(
+            "acme/m1".to_string(),
+            QuantType::Q4_K_M,
+            stub as Arc<dyn EngineBindable>,
+        );
+        let payload = Arc::new(ExpectedEngineHandle { marker: 7 });
+        let result = reg.try_substitute_on_load(
+            "acme/m1",
+            QuantType::Q4_K_M,
+            payload as Arc<dyn Any + Send + Sync>,
+        );
+        assert!(result.is_some(), "second-registered factory is live");
     }
 
     // ===== Test 8 ==========================================================
