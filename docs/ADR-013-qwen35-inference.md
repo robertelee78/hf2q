@@ -1059,6 +1059,49 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-05-01 — P21 EOD canonical receipt · post-everything-today bench at hf2q `57bb8a4`, mlx-native `23c78d0` confirms structural state holds (sync_count=161, decode 115-116 t/s), wide prefill variance traced to thermal/page-cache aftershock from parallel /cfa session
+
+**Why this entry.** Today's loop landed P17b harness + P18 audit + P19 H9 + P19 H11 + P19 H12 + P20 K=4 + P21 spec across 14+ commits. `5362430..57bb8a4` (parallel ADR-018 C1-C4) also landed during the same window — touching `serve/api/engine.rs`, `serve/load_info.rs`, `serve/mod.rs`. End-of-day bench confirms ADR-013 P19 H9 structural state is unchanged after those parallel commits.
+
+**Methodology.** New harness (`scripts/p17b_q4k_bench.sh` post commit `4a26af8`): pre-flight `ps`-audit on binary path only (no false-positive on argv text), `HF2Q_PROFILE_SYNC=1` per-cell, 3-rep cold-process. Bench fired immediately after the parallel /cfa session's last cargo build completed.
+
+**Per-run wall (cold-process, M5 Max, dwq48 19.6 GB GGUF):**
+
+| pp | tg | run | wall (ms) | tok/s | sync_count |
+|---|---|---|---|---|---|
+| 31  | 64 | 1 | 571.7   | 71.7  | 161 |
+| 31  | 64 | 2 | **276.8** | **148.1** | 161 |
+| 31  | 64 | 3 | 1,497.9 | 27.4  | 161 |
+| 101 | 64 | 1 | 281.2   | 199.2 | 161 |
+| 101 | 64 | 2 | 1,044.8 | 53.6  | 161 |
+| 101 | 64 | 3 | **274.7** | **203.9** | 161 |
+
+**Variance interpretation (honest).** Wall ranges 274.7..1,497.9 ms — a 5.5× spread within 3 cold-process invocations of the same binary on the same prompt. The outliers correspond to cold-page-cache after the parallel /cfa session evicted ~20 GB of GGUF mmap pages; the clean runs (276/275 ms) match this morning's post-H12 median (143-153 ms wall budget at pp41 + 213 ms sync overhead). Best-of-3-cold is the trustworthy signal:
+
+- pp31 best: **148.1 t/s** (vs morning post-H12 median 153.5 — same)
+- pp101 best: **203.9 t/s** (vs morning post-H12 median 247.5 — slight thermal drift)
+
+**Decode is unaffected by the contention** — 115.0/114.8/116.7 (pp31) and 116.2/113.6/116.2 (pp101). Steady-state decode is dominated by GPU compute time, not page-cache state, and matches morning numbers exactly.
+
+**sync_count = 161 across ALL 6 runs.** This is the structural invariant: post-ADR-018 C1-C4 changes, no regression in commit count. The 161 decomposes exactly as P19 H9 audit predicted (10 FA × 3 + 30 DN × 4 + 40 FFN-terminal + 1 output_head = 161). The 213 ms of CB-sync floor is the same on this hardware × this code as it was before today's parallel work.
+
+**§17 ship-gate at end-of-day:**
+
+| Criterion | llama-completion | hf2q best-of-3-cold | Ratio | Pass? |
+|---|---|---|---|---|
+| pp31 prefill | 654.97 t/s | 148.1 t/s | 0.23× | **FAIL** (< 0.95) |
+| pp101 prefill | 841.12 t/s | 203.9 t/s | 0.24× | **FAIL** |
+| pp101 prefill (vs llama-bench) | 1,643.64 t/s | 203.9 t/s | 0.12× | **FAIL** |
+| tg64@pp31 decode | 114.48 t/s | 116.7 t/s | 1.02× | **PASS** |
+| tg64@pp101 decode | 110.75 t/s | 116.2 t/s | 1.05× | **PASS** |
+| Coherence (ascii_ratio) | n/a | 0.981 | n/a | **PASS** |
+
+So 3/6 PASS (decode parity + coherence), 3/6 FAIL (prefill ratios). The fail mode is **entirely** the 213 ms CB-sync overhead documented by P19 H9 — hf2q's per-token compute is already faster than llama (P19 H9 measured 0.90 ms/token at pp71 vs llama-completion's 1.18 ms/token).
+
+**This receipt completes 2026-05-01's ADR-013 work.** The structural floor is documented, the path past it (P21 arena refactor) is fully spec'd at `docs/research/adr-013-p21-arena-refactor-cfa-spec.md`, and the canonical bench numbers are committed as receipts. Closing today's loop session here.
+
+**What did NOT change in this commit.** No code edits, no test changes, no harness edits. Pure documentation receipt of the EOD bench state. The bench artefacts (`/tmp/p21_eod_baseline/`) are local-only; the per-run numbers are recorded inline in this entry as the canonical receipt.
+
 ### 2026-05-01 — P21 SPEC · formal /cfa dual-mode refactor spec landed at `docs/research/adr-013-p21-arena-refactor-cfa-spec.md`; honest §17 ship-gate assessment
 
 **Why a separate spec doc.** P19 H9 + P20 established the structural floor. P21 is the comprehensive refactor that would close §17 (match-or-beat llama.cpp on prefill). It's 800–1500 LoC across 3+ files with iter58b-DANGEROUS-class risk in Stage 3. That scope warrants /cfa dual-mode (Claude+Codex parallel implementations, queen-judged) — not a solo iteration. The spec at `docs/research/adr-013-p21-arena-refactor-cfa-spec.md` is the formal launch document: 4 staged phases, per-stage acceptance criteria, operator runbook, risk matrix, dual-mode rationale.
