@@ -7,7 +7,7 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
-## ▶ Resume Here — current state of truth (2026-05-01 ~14:00Z, perf claims FALSIFIED at empirical bench)
+## ▶ Resume Here — current state of truth (2026-05-01 ~16:00Z, iter60b root cause IDENTIFIED + APPROACH ABANDONED)
 
 **Decode side: SHIPPED + RE-VALIDATED. iter56/57/58b confirmed byte-transparent perf-only changes (iter61c FULL VERDICT: ALL PASS).**
 
@@ -31,12 +31,29 @@ All 12 cells byte-identical. Receipts: `/tmp/cfa-iter61c-20260430/{claude,main}-
 
 **Prefill side: OPEN. Cold-clean baseline 0.319× on apex q4_0-flat (3.13× slower than llama, not 4.47×; prior 0.22× was CPU-contaminated). iter60b + iter60c implemented and pushed to team branches; bench validation pending.**
 
-**iter60b — B-staging elimination — REGRESSED, claim FALSIFIED, DO NOT MERGE:**
+**iter60b — B-staging elimination — REGRESSED, claim FALSIFIED, root cause IDENTIFIED, APPROACH ABANDONED:**
 - Mechanism CONFIRMED at compile time: `tensor<device float, dextents<int32_t, 2>>` declaration accepted by MPP on M5 Max first-attempt; sb threadgroup eliminated; ~1024 fp32→fp16 casts per K-tile gone; -27.2% LOC; 11/11 parity tests byte-exact.
 - **Empirical cold-bench (apex q4_0-flat pp=4096, 5 cold trials each, IQR ≤17ms, today's same-day llama-bench peer):** main median **5769ms** vs iter60b median **6364ms** = **+595ms / +10.3% REGRESSION**. Integrated branch (iter60c+60b+59-mtnsg) = 6339ms = **-9.88pp** vs main.
-- **Hypothesis falsified by empirical effect not captured by per-op cost model**: the eliminated `sb` threadgroup buffer was providing **implicit GPU pipeline-sync** (Metal command-buffer hazard ordering) that the dossier's per-op-cost analysis didn't account for. Removing the apparent "12ms ceiling" of pure overhead instead removed a 600ms inter-op dependency-serialization mechanism. **Code+test==truth**: dossier + parity + static analysis all green; only end-to-end perf bench caught the regression.
-- Branch: `cfa/iter60b-impl-20260430/claude` (mlx-native `136bf98` + hf2q `23f761e`) — kept as evidence; **DO NOT MERGE TO MAIN**.
-- Standing lesson: removing apparent GPU overhead can backfire when the overhead is providing implicit hazard ordering. Mandatory next-iter step: profile with `HF2Q_PROFILE_GPU_TS=1` to identify exactly where the 600ms regression lands; only re-attempt this iter once the implicit-sync mechanism is understood AND can be re-instated explicitly.
+- **Root-cause profile (perf-analyzer, 2026-05-01, 3× main + 3× iter60b on apex pp4096 with `HF2Q_PROFILE_W5B8=1` per-bucket CPU wall-clock):**
+
+  | Rank | Bucket | main median (ms) | iter60b median (ms) | Δ (ms) | Δ (%) |
+  |---|---|---|---|---|---|
+  | 1 | `layer.ops1_3` (QKV/Z proj, 30 DN layers) | 215 | 634 | **+419** | **+195%** |
+  | 2 | `fa.ops1_4 + fa.ops6_7` (QKV+O proj, 10 FA layers) | 170 | 286 | **+115** | **+68%** |
+  | 3 | `layer.autoreg_5_9` (alpha/beta/out_proj, 30 DN layers) | 2752 | 2848 | **+96** | **+3.5%** |
+  | — | `fa.sdpa.kernel` | — | — | -2 | unchanged |
+  | — | `layer.ffn_dispatch` | — | — | -16 | unchanged |
+  | — | `upload_weights` | — | — | +1 | unchanged |
+
+  Sum of top-3 = ~630ms (within 6% of bench-measured 594ms).
+
+- **Implicit-pipeline-sync hypothesis FALSIFIED**: ran iter60b binary with `HF2Q_FORCE_SERIAL_DISPATCH=1` (forces `MTLDispatchType::Serial`, eliminates ALL concurrent-dispatch hazards). ops1_3 = 637ms, statistically identical to concurrent-dispatch 633ms. Cause is NOT a missing memory_barrier or command-buffer ordering issue — adding serialization back wouldn't help.
+- **Revised root cause: DRAM bandwidth saturation in mm_tensor kernel at prefill M=4096.** iter60b replaced `tensor<threadgroup half>` B-tile staging (each [32-row, NK=32] B-tile loaded into 2048-byte on-chip threadgroup SHMEM, then `mm.run` reads from SHMEM at TB/s effective) with `tensor<device float>` device-direct reads (every B-tile load hits DRAM/L2 directly). At pp=4096 the B operand [4096, K] saturates the M5 Max DRAM bus (~800 GB/s); the +195% slowdown in ops1_3 matches the bandwidth ratio between DRAM and on-chip SHMEM. At decode (M=1, B is tiny) device-direct would be fast — but **prefill is exactly where the bandwidth penalty lands hardest**. The threadgroup staging is doing real cache-tier work, not just pipeline-sync.
+- **Verdict: device-direct B for prefill is structurally wrong on M5 Max.** Cannot be salvaged by adding back synchronization. Branch `cfa/iter60b-impl-20260430/claude` (mlx-native `136bf98` + hf2q `23f761e`) kept as evidence; **DO NOT MERGE TO MAIN; DO NOT RETRY without a different strategy** (see iter60d note below).
+- **Methodology gap to record**: dedicated `HF2Q_PROFILE_GPU_TS=1` instrumentation only exists in `forward_prefill_batched.rs` (Gemma4 path). The qwen35 prefill route (`cmd_generate_qwen35` → `forward_gpu_last_logits` for apex q4_0-flat) does not have GPU-timestamp instrumentation; profile was collected via `HF2Q_PROFILE_W5B8=1` (qwen35-specific CPU wall-clock buckets). Future qwen35-prefill iters should add MTLCommandBuffer GPU-timestamp probes to that path.
+- **Standing lesson (sharpened): static analysis + parity tests are necessary but not sufficient.** The dossier's per-op cost model summed `1024 × cast_cycles` and predicted +2-5pp, but ignored the cache-tier lookup ratio between threadgroup and device memory. Per-op-cost models that don't carry per-operand memory-tier are silently assuming "B fits in cache" — for prefill operands, that's wrong by orders of magnitude. Future kernel-level analyses must explicitly carry per-operand memory-tier in predicted runtime.
+
+**iter60d candidate (POSSIBLE same-goal retry):** restore `tensor<threadgroup half>` B-staging (revert the structural part of iter60b) AND vectorize the f32→half stage with `half2` co-loads to halve the staging instruction count. Keeps the on-chip cache benefit while cutting half the cast cost. Expected gain: ~0.5-1pp at apex pp4096 (smaller than iter60b's claimed +2-5pp because we keep the staging, only cut its instruction count). Status: **not yet researched/specced** — queue after NRB tile-size investigation, since NRB has higher expected gain (4× tile-area gap).
 
 **iter60c — function-constant bounds-check gating — NO_REGRESSION, claim MISSED at noise floor:**
 - Mechanism CONFIRMED at compile time: AIR disassembly + metal-opt globalopt shows -19.9% IR instruction count on q4_0 kernel when `FC_mul_mm_bc_inp=false` / `FC_mul_mm_bc_out=false`; partial-tile write-back block 309 entirely eliminated; 11 dead `br i1 undef` stubs killed.
@@ -55,7 +72,7 @@ All 12 cells byte-identical. Receipts: `/tmp/cfa-iter61c-20260430/{claude,main}-
 |---|---|---|---|---|
 | main (`4e12ab0`) | 5769 / 5873 | baseline | — | — |
 | iter60c | 5776 | +7ms (+0.12%) | NO_REGRESSION, claim MISSED | OPTIONAL |
-| iter60b | **6364** | **+595ms (+10.3%)** | **REGRESSED — claim FALSIFIED** | **DO NOT MERGE** |
+| iter60b | **6364** | **+595ms (+10.3%)** | **REGRESSED — root cause = DRAM-bandwidth on B reads; APPROACH ABANDONED** | **DO NOT MERGE / DO NOT RETRY** |
 | iter59-mtnsg | 5897 | -24ms (-0.41%) | NO_REGRESSION, claim untested-on-fixture | OPTIONAL |
 | INTEGRATED (60c+60b+59-mtnsg) | **6339** | **+570ms (-9.88pp)** | **REGRESSED (60b carrier)** | **DO NOT MERGE** |
 
@@ -63,7 +80,7 @@ Decode parity for all 3 branches: BYTE_CLEAN against current main. Bench receipt
 
 **Active worktree branches (pushed, NOT merged to main pending verdict resolution):**
 - `cfa/iter60c-fc-gate-20260430/claude` — bench-noise; merge-optional code-clarity
-- `cfa/iter60b-impl-20260430/claude` — REGRESSED; do not merge until root-cause understood
+- `cfa/iter60b-impl-20260430/claude` — REGRESSED; root cause = DRAM-bandwidth on device-direct B reads (FALSIFIED implicit-pipeline-sync hypothesis); evidence-only, do not merge / do not retry
 - `cfa/iter59-mtnsg-impl-20260501/claude` — bench-fixture-mismatched; merge-optional routing improvement
 - `cfa/iter60-integrated-20260501/claude` — REGRESSED (carrier = iter60b); evidence only
 
@@ -91,16 +108,16 @@ Decode parity for all 3 branches: BYTE_CLEAN against current main. Bench receipt
 
 ### What's NEXT (in order)
 
-1. **iter60b root-cause investigation** — profile with `HF2Q_PROFILE_GPU_TS=1` on the iter60b branch at apex pp4096 to identify exactly where the 595ms regression lands (per-bucket attribution: kernel exec / encoder commit / hazard wait). The bench coordinator's hypothesis is "removed implicit pipeline-sync from threadgroup memory" — must be empirically confirmed before any iter60b retry.
-2. **Decide iter60c + iter59-mtnsg disposition** — both are no-regression but no-measured-win on the apex pp4096 fixture. Options: (a) merge as code-clarity wins (mirror llama.cpp patterns; bring 11 bounds-gate function-constants + 6 multi-token NSG parity tests into main); (b) hold until they show a measured win on a relevant fixture. iter59-mtnsg specifically needs a short-prefill bench fixture (seq_len ≤ 32 autoregressive batched) to validate the +0.05-0.2pp claim.
-3. **Re-research iter60b** if root cause confirms implicit pipeline-sync was the real value: design an explicit-sync version that elides the cast cost while keeping the hazard-ordering guarantee. Possible paths: explicit `threadgroup_barrier(mem_flags::mem_device)` after each B-stride load; or explicit dispatch boundary between K-tile groups.
-4. **NRB tile-size investigation** (separate from iter60b's B-staging) — llama uses NRB=128 vs hf2q NR1=32 (4× tile-area gap per iter59 dossier addendum); independent of iter60b's failed B-staging path.
-5. **iter62 — Q4_K MoE matmul-id support**: handled by parallel `adr013-q4k-moe-kernels` session.
-6. **Next-tier candidates** (queued from iter59 dossier index): full RoPE+QKV fusion (3-4 days, medium-high risk; only worth it if cumulative gain after the above batch leaves significant prefill gap).
+1. **NRB tile-size investigation (highest expected payoff)** — llama uses NRB=128 vs hf2q NR1=32 (4× tile-area gap per iter59 dossier addendum). Independent of iter60b's failed B-staging path. Plan: read llama.cpp `ggml-metal.metal` `kernel_mul_mm_id_*` template and `ggml-metal.m` dispatch shape; identify the M5-tuned tile size; test threadgroup-memory budget before changing kernels (NR1=32 → NR=64 → NR=128). Apex pp4096 ops1_3 at +419ms was on the *device-direct* B path; on the canonical SHMEM-staging path NR=128 vs NR=32 is the lever. Expected: +1-3pp at apex pp4096 (4× tile area = 4× FFMA per SHMEM-load, amortizing cache-tier cost).
+2. **Decide iter60c + iter59-mtnsg disposition (low-risk code-clarity batch)** — both are no-regression but no-measured-win on apex pp4096. Options: (a) merge as code-clarity (mirror llama.cpp patterns; bring 11 bounds-gate function-constants + 6 multi-token NSG parity tests into main); (b) hold until they show a measured win on a relevant fixture. iter59-mtnsg specifically needs a short-prefill autoregressive bench (seq_len ≤ 32 batched chat-completion) to validate the +0.05-0.2pp claim. Recommendation: merge as code-clarity batch (iter60c first, then iter59-mtnsg) — both mirror llama.cpp patterns, both have parity coverage, neither regresses.
+3. **iter60d (POSSIBLE retry)** — restore threadgroup B-staging from main, vectorize f32→half with half2 co-loads. Expected ~0.5-1pp. Lower priority than NRB. Defer until NRB landed.
+4. **Add MTLCommandBuffer GPU-timestamp probes to qwen35 prefill path** (methodology gap from iter60b root-cause). Not a perf iter itself — tooling work that any future qwen35-prefill iter will benefit from. Mirror the `HF2Q_PROFILE_GPU_TS=1` pattern from `forward_prefill_batched.rs` into `cmd_generate_qwen35` / `forward_gpu_last_logits`.
+5. **iter62 — Q4_K MoE matmul-id support**: handled by parallel `adr013-q4k-moe-kernels` session — not this loop's work.
+6. **Next-tier candidates** (queued from iter59 dossier index): full RoPE+QKV fusion (3-4 days, medium-high risk; only worth it if cumulative gain after items 1-3 leaves significant prefill gap).
 
-**Critical methodological lesson from iter60b**: static analysis confirming a mechanism is necessary but not sufficient. The dossier's "+2-5pp from removing 1024 cast instructions per K-tile" was based on per-op cost summed without modeling inter-op dependencies. The cold-bench falsified it by **+595ms in the opposite direction**. Future similar iters must include: (a) per-op cost model, (b) inter-op dependency model, (c) end-to-end cold-bench, before claiming completion. Code+test==truth; dossiers + parity + static analysis + reasoning are starting points only.
+**Critical methodological lesson from iter60b (UPDATED with root cause):** static analysis + parity tests are necessary but not sufficient. The dossier's "+2-5pp from removing 1024 cast instructions per K-tile" summed per-op cost without modeling per-operand memory-tier. Cold-bench falsified by **+595ms in the opposite direction**. Root-cause profile + serial-dispatch diagnostic identified DRAM bandwidth saturation on device-direct B reads — NOT the implicit-pipeline-sync hypothesis the bench coordinator initially proposed. Future similar iters must include: (a) per-op cost model, (b) per-operand memory-tier in cost prediction, (c) end-to-end cold-bench, before claiming completion. Code+test==truth; dossiers + parity + static analysis + first-pass hypotheses are starting points only — including the *initial* root-cause hypothesis when a regression is found.
 
-**iter61c outcome eliminates the prior "validate before more perf" gate.** Decode-side ship-readiness fully confirmed (all 4 D4 fixtures ≥1.00×). Prefill side requires the bench-validated batch above; current cold baseline 0.319× projects to ~0.345-0.40× post-batch (iter60c +0.5-1pp + iter60b +2-5pp + iter59-mtnsg +0.05-0.2pp), still requires further levers to reach the ≥1.00× exit gate.
+**iter61c outcome eliminates the prior "validate before more perf" gate.** Decode-side ship-readiness fully confirmed (all 4 D4 fixtures ≥1.00×). Prefill side: current cold baseline 0.319× on apex q4_0-flat. Projected gains from queued items: iter60c ~+0pp (noise floor) + iter59-mtnsg ~+0pp (chunk-eligible fixture sidesteps the new routing) + NRB tile-size +1-3pp + iter60d (half2 staging) +0.5-1pp = ~+1.5-4pp toward closing the 3.13× gap (would land at ~0.330-0.340×). iter60b's +2-5pp projection has been retracted (hypothesis falsified). Reaching ≥1.00× will require further structural levers from the iter59 paper inventory (RoPE+QKV fusion, MoE expert sortby/scatter — already done — etc.) and likely the same NRB-style tile-size sweep across the FA path.
 
 **iter61a kernel-level work (closed but for reference):**
 - Buffer-pool zero-init in mlx-native `src/buffer_pool.rs` already shipped at `aa5b410`.
