@@ -108,7 +108,7 @@
 //! the cache in the first place.
 
 use std::ops::Range;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use mlx_native::{DType, MlxBuffer, MlxDevice};
 
@@ -258,14 +258,23 @@ pub struct Gemma4DenseSpill {
     /// and `engine` are set, `engine_arc` wins.
     engine: Arc<RwLock<Option<EngineHandle>>>,
 
-    /// Live `Arc<Engine>` slot — Phase B-dense.2 follow-up production
+    /// Live `Weak<Engine>` slot — Phase B-dense.2 follow-up production
     /// path. The factory's `try_from_engine_arc` populates this when
     /// it downcasts to `Arc<Engine>`; `snapshot_block` /
     /// `restore_block` prefer it over the B-dense.1 `engine` slot
     /// because the Engine's worker thread owns the live
     /// `MlxModelWeights.dense_kvs` and is the only path that can
     /// safely read/write it without crossing the worker boundary.
-    engine_arc: Arc<RwLock<Option<Arc<Engine>>>>,
+    ///
+    /// **P0 fix 2026-05-01**: this slot stores `Weak<Engine>`, not
+    /// `Arc<Engine>`. The spill OBSERVES the engine; the engine's
+    /// lifetime is owned by `HotSwapManager`. Storing a strong Arc
+    /// here defeats `LoaderWrapper::load`'s `Arc::try_unwrap` recovery
+    /// of the inner Engine (see `loader_wrapper.rs:333`), which aborts
+    /// pre-warm with the EngineBindable-contract violation. On every
+    /// snapshot/restore the slot is `.upgrade()`-ed; a dropped engine
+    /// (`None`) yields the `Skipped` no-op path, not an error.
+    engine_arc: Arc<RwLock<Option<Weak<Engine>>>>,
 
     /// Per-layer attention type. Captured from `Gemma4Config` at
     /// registration. Length == num_layers.
@@ -384,25 +393,35 @@ impl Gemma4DenseSpill {
         let spill = Self::new(cfg)?;
         // Set engine_arc directly — the spill is freshly constructed
         // so no concurrent snapshot calls can be in flight.
+        // P0 fix 2026-05-01: downgrade to Weak<Engine>; the spill
+        // observes the engine's lifetime, it does not own it.
         {
             let mut g = spill
                 .engine_arc
                 .write()
                 .map_err(|_| SpillErrorKind::CodecErr)?;
-            *g = Some(engine);
+            *g = Some(Arc::downgrade(&engine));
         }
         Ok(spill)
     }
 
-    /// Phase B-dense.2 follow-up — set/replace the live `Arc<Engine>`
-    /// slot. Mirrors [`Self::set_engine_handle`] for the production
-    /// path. Subsequent calls overwrite the prior engine.
+    /// Phase B-dense.2 follow-up — set/replace the live engine
+    /// reference. Mirrors [`Self::set_engine_handle`] for the
+    /// production path. Subsequent calls overwrite the prior engine.
+    ///
+    /// **P0 fix 2026-05-01**: stores `Weak<Engine>` (downgraded from
+    /// the supplied `Arc<Engine>`) so the spill does NOT retain a
+    /// strong reference. This is mandatory for
+    /// `LoaderWrapper::load`'s `Arc::try_unwrap` recovery path; any
+    /// retained strong Arc aborts pre-warm with the EngineBindable
+    /// contract-violation error. Call sites continue to pass
+    /// `Arc<Engine>` (zero ergonomic change).
     pub fn set_engine_arc(&self, engine: Arc<Engine>) {
         let mut g = self
             .engine_arc
             .write()
             .expect("Gemma4DenseSpill::engine_arc RwLock poisoned");
-        *g = Some(engine);
+        *g = Some(Arc::downgrade(&engine));
     }
 
     /// Phase B-dense.2 follow-up — drop the live `Arc<Engine>` slot.
@@ -957,11 +976,17 @@ impl KvCacheSpill for Gemma4DenseSpill {
         //     thread is the sole owner of `MlxModelWeights.dense_kvs`
         //     and the only safe path that does not require crossing
         //     the worker boundary.
+        //
+        //     P0 fix 2026-05-01: the slot now holds `Weak<Engine>`;
+        //     `.upgrade()` to a temporary `Arc<Engine>` for this call.
+        //     If the engine has been dropped (`None`), fall through to
+        //     the EngineHandle path (which itself short-circuits to
+        //     None when unset → Skipped no-op).
         if let Some(engine_arc) = self
             .engine_arc
             .read()
             .ok()
-            .and_then(|g| g.as_ref().cloned())
+            .and_then(|g| g.as_ref().and_then(Weak::upgrade))
         {
             return self.snapshot_via_engine(engine_arc, layer_rank, range);
         }
@@ -1079,11 +1104,16 @@ impl KvCacheSpill for Gemma4DenseSpill {
 
         // 2a. Phase B-dense.2 follow-up: production path — prefer the
         //     `Arc<Engine>` worker bridge if set.
+        //
+        //     P0 fix 2026-05-01: slot is `Weak<Engine>`; upgrade to a
+        //     temporary strong Arc here. Dropped engine ⇒ fall through
+        //     to EngineHandle path; the contract is best-effort
+        //     restore, never an error from a missing engine.
         if let Some(engine_arc) = self
             .engine_arc
             .read()
             .ok()
-            .and_then(|g| g.as_ref().cloned())
+            .and_then(|g| g.as_ref().and_then(Weak::upgrade))
         {
             return self.restore_via_engine(engine_arc, layer_rank, range, &hdr, payload);
         }
@@ -1475,14 +1505,23 @@ impl crate::serve::kv_persist::registry::FamilyHookFactory for Gemma4DenseSpillF
         // Determine effective config — for the Arc<Engine> path we
         // can re-derive from the engine's descriptor; for the
         // EngineHandle path we fall back to self.cfg.
+        //
+        // P0 fix 2026-05-01: the engine_arc slot holds Weak<Engine>;
+        // upgrade just long enough to read the descriptor and seed the
+        // spiller-side spill. The spiller-side spill ALSO stores the
+        // engine as Weak (via new_with_engine → Arc::downgrade), so no
+        // strong ref escapes try_construct. The temporary Arc dropped
+        // at end of `if let` keeps strong_count == 1 across the
+        // function boundary, satisfying LoaderWrapper::load's
+        // try_unwrap contract.
         let spiller_side = if let Some(engine_for_spiller) = spill_arc
             .engine_arc
             .read()
             .ok()
-            .and_then(|g| g.as_ref().cloned())
+            .and_then(|g| g.as_ref().and_then(Weak::upgrade))
         {
             // Arc<Engine> production path. Both spill instances point
-            // at the same Arc<Engine>; the worker-thread bridge
+            // at the same Engine via Weak; the worker-thread bridge
             // serializes any concurrent snapshot/restore calls
             // through the channel anyway.
             let descriptor = engine_for_spiller.kv_spill_descriptor()?.clone();
@@ -2678,18 +2717,25 @@ mod tests {
     /// B-dense.2-followup test 4: factory.try_construct via Arc<Engine>
     /// path returns a real (non-stub) hook tuple. Falsifier: factory
     /// rejects `Arc<Engine>` and returns None.
+    ///
+    /// **P0 fix 2026-05-01**: spill stores `Weak<Engine>`, so this
+    /// test must retain a strong `Arc<Engine>` for the duration of
+    /// the snapshot calls. Production mirror: `HotSwapManager` owns
+    /// the engine's strong ref while the spill is bound.
     #[test]
     fn followup_factory_try_construct_succeeds_on_arc_engine() {
         use crate::serve::kv_persist::registry::FamilyHookFactory;
 
         let descriptor = small_descriptor(KvDType::F32);
-        let engine = Arc::new(
+        // Keep a strong ref alive locally; otherwise the Weak in the
+        // spill cannot upgrade (post-P0-fix semantics).
+        let arc_engine: Arc<Engine> = Arc::new(
             crate::serve::api::engine::make_synthetic_kv_engine_for_test(
                 descriptor.clone(),
                 vec![(0usize, 0x55u8)],
             ),
         );
-        let dyn_view: Arc<dyn std::any::Any + Send + Sync> = engine;
+        let dyn_view: Arc<dyn std::any::Any + Send + Sync> = arc_engine.clone() as _;
 
         let factory = Gemma4DenseSpillFactory::new(small_cfg(DType::F32));
         let (kv_hook, _bindable_hook) = factory
@@ -2701,12 +2747,15 @@ mod tests {
             .block_alignment();
         assert_eq!(alignment, BLOCK_TOKENS, "real Gemma4DenseSpill on kv side");
         // Snapshot via the kv_hook side proves the Mutex-wrapped
-        // spill is wired to the engine.
+        // spill is wired to the engine. arc_engine is still alive,
+        // so the spill's Weak::upgrade succeeds.
         let bytes = kv_hook.lock().unwrap().snapshot_block(0, 0..4);
         assert!(
             bytes.is_some(),
             "kv_hook side wired via Arc<Engine> path produces snapshot bytes"
         );
+        // Keep arc_engine alive until end-of-scope.
+        let _ = arc_engine;
     }
 
     /// B-dense.2-followup test 5 (extra): EngineBindable accepts
@@ -2714,17 +2763,24 @@ mod tests {
     /// `engine_bindable_gemma4_dense_round_trip_set_then_clear` for
     /// the production path. Falsifier: bind_engine drops Arc<Engine>
     /// silently and snapshot stays disabled.
+    ///
+    /// **P0 fix 2026-05-01**: spill stores `Weak<Engine>`, so this
+    /// test must retain a strong `Arc<Engine>` while the bind is
+    /// active. Production mirror: `HotSwapManager` owns the engine's
+    /// strong ref for the spill's lifetime.
     #[test]
     fn followup_engine_bindable_accepts_arc_engine() {
         use crate::serve::kv_persist::EngineBindable;
         let descriptor = small_descriptor(KvDType::F32);
-        let engine = Arc::new(
+        // Keep a strong ref alive locally to keep the spill's Weak
+        // upgrade-able (post-P0-fix semantics).
+        let arc_engine: Arc<Engine> = Arc::new(
             crate::serve::api::engine::make_synthetic_kv_engine_for_test(
                 descriptor.clone(),
                 vec![(0usize, 0x77u8)],
             ),
         );
-        let dyn_view: Arc<dyn std::any::Any + Send + Sync> = engine;
+        let dyn_view: Arc<dyn std::any::Any + Send + Sync> = arc_engine.clone() as _;
 
         // Build a shape-only spill (no engine wired yet).
         let hook = Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("new");
@@ -2732,7 +2788,8 @@ mod tests {
         assert!(hook.snapshot_block(0, 0..4).is_none());
         // Bind via EngineBindable trait — accepts Arc<Engine> now.
         EngineBindable::bind_engine(&hook, dyn_view);
-        // Post-bind: snapshot returns Some via the engine_arc path.
+        // Post-bind: snapshot returns Some via the engine_arc path
+        // (Weak::upgrade succeeds while arc_engine is alive).
         let out = hook.snapshot_block(0, 0..4);
         assert!(
             out.is_some(),
@@ -2741,5 +2798,162 @@ mod tests {
         // Unbind clears both engine_arc + engine slots.
         EngineBindable::unbind_engine(&hook);
         assert!(hook.snapshot_block(0, 0..4).is_none());
+        // Keep arc_engine alive until end-of-scope.
+        let _ = arc_engine;
+    }
+
+    // ========================================================================
+    // P0 regression — bench surfaced 2026-05-01.
+    //
+    // Phase D R-C4 bench (iter-3, /tmp/phase_d_iter3.log) aborted pre-warm
+    // with: "LoaderWrapper: registry hook for (...) retained a clone of
+    // the type-erased engine Arc; this violates the EngineBindable
+    // contract".
+    //
+    // Root cause: `Gemma4DenseSpill.engine_arc` was
+    // `Arc<RwLock<Option<Arc<Engine>>>>`; the B-dense.2-follow-up
+    // `set_engine_arc` retained a STRONG ref. `LoaderWrapper::load:333`
+    // uses `Arc::try_unwrap(arc_engine)` to recover the inner Engine; any
+    // retained strong ref makes try_unwrap fail.
+    //
+    // Fix: the slot is now `Arc<RwLock<Option<Weak<Engine>>>>`. The spill
+    // observes the engine; HotSwapManager owns its lifetime. Snapshot /
+    // restore upgrade on demand and fall through to Skipped when the
+    // engine has been dropped.
+    //
+    // This test pins that contract: after `factory.try_construct`
+    // returns, the strong count of the original `Arc<Engine>` must be
+    // back to its baseline (1 in this fixture). Falsifier: any future
+    // change reintroduces a strong-ref retention path on the production
+    // hook construction, and this test fails immediately at unit-test
+    // tier (ms latency, no GPU required).
+    // ========================================================================
+
+    /// P0 regression — Gemma4DenseSpillFactory::try_construct must NOT
+    /// retain a strong `Arc<Engine>` reference.
+    ///
+    /// Falsifier: Arc::strong_count > baseline after try_construct
+    /// returns. Pre-fix value was 3 (factory's spill_arc held one,
+    /// spiller_side new_with_engine held another); post-fix value is 1
+    /// (only the original test-owned Arc).
+    #[test]
+    fn factory_try_construct_does_not_retain_strong_ref_on_engine() {
+        use crate::serve::kv_persist::registry::FamilyHookFactory;
+
+        // Build a synthetic Gemma4 engine via the test helper. Returns
+        // `Engine` by value; we wrap in `Arc` ourselves so we control
+        // the strong-count baseline.
+        let descriptor = small_descriptor(KvDType::F32);
+        let engine: Engine =
+            crate::serve::api::engine::make_synthetic_kv_engine_for_test(
+                descriptor.clone(),
+                vec![(0usize, 0x42u8)],
+            );
+        let arc_engine: Arc<Engine> = Arc::new(engine);
+
+        let baseline_count = Arc::strong_count(&arc_engine);
+        assert_eq!(
+            baseline_count, 1,
+            "test setup invariant: only one strong ref before factory call"
+        );
+
+        // Factory carries a sentinel cfg; the production try_construct
+        // path overrides it with the engine's KvSpillDescriptor.
+        let factory = Gemma4DenseSpillFactory::new(small_cfg(DType::F32));
+
+        // Mimic LoaderWrapper:301-302 — clone to Arc<dyn Any + Send +
+        // Sync>, then pass to try_construct. dyn_view is consumed by
+        // the call.
+        let dyn_view: Arc<dyn std::any::Any + Send + Sync> =
+            arc_engine.clone() as _;
+        assert_eq!(
+            Arc::strong_count(&arc_engine),
+            2,
+            "after dyn_view clone, strong count goes to 2"
+        );
+
+        // Drive the factory. dyn_view is consumed; the result holds two
+        // freshly-constructed spill instances. Both MUST store
+        // `Weak<Engine>` not `Arc<Engine>` — that is the contract.
+        let result = factory.try_construct(dyn_view);
+        assert!(
+            result.is_some(),
+            "factory accepts a real Arc<Engine> (sanity)"
+        );
+        // Drop the result tuple explicitly so any retained strong refs
+        // inside the spills become observable in the count below.
+        drop(result);
+
+        // CRITICAL ASSERTION: strong count is back to baseline. Any
+        // strong ref retained inside the spill (engine_arc field, or a
+        // descendant container) shows up here as count > 1, which
+        // would break LoaderWrapper::load's Arc::try_unwrap recovery.
+        let post_count = Arc::strong_count(&arc_engine);
+        assert_eq!(
+            post_count, baseline_count,
+            "Gemma4DenseSpillFactory::try_construct must NOT retain a \
+             strong Arc<Engine> reference (use Weak<Engine> in \
+             spill.engine_arc instead). Strong count is {} (baseline \
+             {}). This regresses the LoaderWrapper::load \
+             Arc::try_unwrap pre-warm path — see \
+             /tmp/phase_d_iter3.log 2026-05-01.",
+            post_count, baseline_count
+        );
+    }
+
+    /// P0 regression — `Gemma4DenseSpill::new_with_engine` must NOT
+    /// retain a strong `Arc<Engine>` reference either. This is the
+    /// direct constructor path used by `try_from_engine` (sibling of
+    /// `try_from_engine_arc`); it must be Weak-symmetric.
+    ///
+    /// Falsifier: strong_count > baseline after the spill is dropped
+    /// would still be a different bug, but the load-bearing assertion
+    /// is at the time the spill is *alive* — a strong Arc inside the
+    /// spill defeats LoaderWrapper::load's try_unwrap even before any
+    /// drop happens.
+    #[test]
+    fn new_with_engine_does_not_retain_strong_ref() {
+        let descriptor = small_descriptor(KvDType::F32);
+        let arc_engine: Arc<Engine> = Arc::new(
+            crate::serve::api::engine::make_synthetic_kv_engine_for_test(
+                descriptor.clone(),
+                vec![(0usize, 0x42u8)],
+            ),
+        );
+        assert_eq!(Arc::strong_count(&arc_engine), 1);
+
+        // Construct the spill directly. The engine clone goes into
+        // new_with_engine; the spill must downgrade it.
+        let spill = Gemma4DenseSpill::new_with_engine(
+            descriptor.clone(),
+            arc_engine.clone(),
+        )
+        .expect("new_with_engine");
+
+        // Spill is alive AND strong count is back to 1 — the spill
+        // holds a Weak, not an Arc.
+        let live_count = Arc::strong_count(&arc_engine);
+        assert_eq!(
+            live_count, 1,
+            "Gemma4DenseSpill::new_with_engine must store Weak<Engine>; \
+             live strong count is {} (expected 1)",
+            live_count
+        );
+
+        // Sanity: the spill still works — Weak::upgrade succeeds while
+        // arc_engine is alive, snapshot returns Some.
+        let bytes = spill.snapshot_block(0, 0..4);
+        assert!(
+            bytes.is_some(),
+            "Weak::upgrade succeeds while arc_engine is alive"
+        );
+
+        drop(spill);
+
+        // Sanity 2: dropping the original arc_engine after the spill
+        // would invalidate the Weak; the spill is gone so we can't
+        // observe it directly, but the count check above covers the
+        // load-bearing invariant.
+        assert_eq!(Arc::strong_count(&arc_engine), 1);
     }
 }
