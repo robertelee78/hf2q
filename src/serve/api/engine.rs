@@ -654,6 +654,7 @@ pub(crate) fn make_synthetic_kv_engine_for_test(
         inner: Arc::new(EngineInner {
             tx,
             worker_handle: Mutex::new(Some(handle)),
+            info: synthetic_load_info("synth-kv-bridge-test"),
             arch: LoadedArch::Gemma,
             model_id: "synth-kv-bridge-test".into(),
             context_length: None,
@@ -688,6 +689,7 @@ pub(crate) fn make_synthetic_engine_for_test(arch: LoadedArch) -> Engine {
         inner: Arc::new(EngineInner {
             tx,
             worker_handle: Mutex::new(Some(handle)),
+            info: synthetic_load_info("iter-215-test-model"),
             arch,
             model_id: "iter-215-test-model".into(),
             context_length: None,
@@ -711,6 +713,10 @@ struct EngineInner {
     /// callers can be cheap-clone an `Engine` without contending on the
     /// handle. Outside of shutdown, the slot is read-only.
     worker_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Unified load snapshot built once at model-load completion. Serve
+    /// startup reads this for the ADR-018 banner and tracing without
+    /// touching the worker thread.
+    info: Arc<LoadInfo>,
     /// Iter-215 Wedge-2: which `LoadedModel` variant the worker
     /// thread owns.  Cached at spawn time so handlers can dispatch on
     /// the architecture without round-tripping a request.  Drives the
@@ -762,6 +768,41 @@ struct EngineInner {
     /// real (non-stub) hook from the live shape without round-tripping
     /// through the worker channel.
     kv_spill_descriptor: Option<super::kv_spill_descriptor::KvSpillDescriptor>,
+}
+
+#[cfg(test)]
+fn synthetic_load_info(model_id: &str) -> Arc<LoadInfo> {
+    Arc::new(LoadInfo {
+        model_id: model_id.to_string(),
+        arch_str: "gemma4".to_string(),
+        arch_family: ArchFamily::Gemma4,
+        model_path: PathBuf::from(format!("/tmp/{model_id}.gguf")),
+        on_disk_bytes: 0,
+        backend_chip: "test-gpu".to_string(),
+        backend: "mlx-native",
+        n_layers: 0,
+        hidden_size: 0,
+        vocab_size: 0,
+        n_attention_heads: 0,
+        n_key_value_heads: 0,
+        head_dim: 0,
+        sliding_window: None,
+        full_attention_interval: None,
+        max_context_length: None,
+        moe: None,
+        quant_label: None,
+        quant_bpw: None,
+        tokenizer_source: TokenizerSource::GgufEmbedded,
+        eos_token_ids: Vec::new(),
+        bos_token_id: None,
+        chat_template_source: ChatTemplateSource::None,
+        provenance: crate::serve::provenance::Provenance::External,
+        vision_projector: None,
+        load_wall_clock: Duration::ZERO,
+        resident_weight_bytes: None,
+        kv_cache_budget_bytes: None,
+        kv_spill_active: false,
+    })
 }
 
 /// The request protocol the worker thread drains.
@@ -958,6 +999,12 @@ impl LoadedModel {
         match self {
             LoadedModel::Gemma(g) => g.quant_type.as_deref(),
             LoadedModel::Qwen35(q) => q.quant_type.as_deref(),
+        }
+    }
+    pub fn model_path(&self) -> &Path {
+        match self {
+            LoadedModel::Gemma(g) => &g.model_path,
+            LoadedModel::Qwen35(q) => &q.model_path,
         }
     }
     pub fn hidden_size(&self) -> usize {
@@ -1596,6 +1643,25 @@ impl LoadInfoBuilder for GemmaLoadedModel {
     }
 }
 
+impl LoadInfoBuilder for LoadedModel {
+    fn build_load_info(
+        &self,
+        gguf: &mlx_native::gguf::GgufFile,
+        load_wall_clock: Duration,
+        kv_cache_budget_bytes: Option<u64>,
+        kv_spill_active: bool,
+    ) -> LoadInfo {
+        match self {
+            LoadedModel::Gemma(g) => {
+                g.build_load_info(gguf, load_wall_clock, kv_cache_budget_bytes, kv_spill_active)
+            }
+            LoadedModel::Qwen35(q) => {
+                q.build_load_info(gguf, load_wall_clock, kv_cache_budget_bytes, kv_spill_active)
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Engine::spawn and worker loop
 // ---------------------------------------------------------------------------
@@ -1604,7 +1670,11 @@ impl Engine {
     /// Spawn the worker thread and return a handle. The `queue_capacity` sets
     /// the mpsc channel buffer; when full, handlers receive a `queue_full`
     /// error and map it to 429 + Retry-After (Decision #19).
-    pub fn spawn(loaded: LoadedModel, queue_capacity: usize) -> Self {
+    pub fn spawn(
+        loaded: LoadedModel,
+        queue_capacity: usize,
+        kv_cache_budget_bytes: Option<u64>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel::<Request>(queue_capacity.max(1));
 
         // Iter-215 Wedge-2: accessor methods replace flat-struct field
@@ -1681,6 +1751,15 @@ impl Engine {
                 }
                 LoadedModel::Qwen35(_) => None,
             };
+        let kv_spill_active = kv_spill_descriptor.is_some();
+        let gguf = mlx_native::gguf::GgufFile::open(loaded.model_path())
+            .expect("re-open loaded GGUF for Engine load-info snapshot");
+        let info = Arc::new(loaded.build_load_info(
+            &gguf,
+            loaded.load_duration(),
+            kv_cache_budget_bytes,
+            kv_spill_active,
+        ));
 
         let registration = super::registry::find_for(&model_id);
         if let Some(ref r) = registration {
@@ -1708,6 +1787,7 @@ impl Engine {
             inner: Arc::new(EngineInner {
                 tx,
                 worker_handle: Mutex::new(Some(worker_handle)),
+                info,
                 arch,
                 model_id,
                 context_length,
@@ -1730,6 +1810,11 @@ impl Engine {
     /// is not yet implemented (today: `LoadedArch::Qwen35`).
     pub fn arch(&self) -> LoadedArch {
         self.inner.arch
+    }
+
+    /// Unified load snapshot for this engine.
+    pub fn info(&self) -> &LoadInfo {
+        &self.inner.info
     }
 
     /// Lazily build + cache the per-vocab decoded UTF-8 byte table used
@@ -6070,6 +6155,7 @@ assistant:
             inner: Arc::new(EngineInner {
                 tx,
                 worker_handle: Mutex::new(Some(handle)),
+                info: synthetic_load_info("test-model"),
                 arch,
                 model_id: "test-model".into(),
                 context_length: None,
@@ -6084,6 +6170,24 @@ assistant:
                 kv_spill_descriptor: None,
             }),
         }
+    }
+
+    #[test]
+    fn engine_info_returns_populated_load_info() {
+        let engine = make_test_engine_with_worker(drain_until_shutdown);
+        let info = engine.info();
+        assert_eq!(info.model_id, "test-model");
+        assert_eq!(info.arch_family, ArchFamily::Gemma4);
+        assert_eq!(info.backend, "mlx-native");
+        assert_eq!(info.tokenizer_source, TokenizerSource::GgufEmbedded);
+        assert_eq!(info.chat_template_source, ChatTemplateSource::None);
+        assert_eq!(info.provenance, crate::serve::provenance::Provenance::External);
+        assert_eq!(info.load_wall_clock, Duration::ZERO);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(engine.shutdown()).expect("shutdown");
     }
 
     /// Stub worker: drain until `Shutdown`, then exit cleanly.
@@ -6911,6 +7015,7 @@ assistant:
             inner: Arc::new(EngineInner {
                 tx,
                 worker_handle: Mutex::new(Some(handle)),
+                info: synthetic_load_info("synth-kv"),
                 arch: LoadedArch::Gemma,
                 model_id: "synth-kv".into(),
                 context_length: None,

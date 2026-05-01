@@ -1554,7 +1554,8 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
         config_path: config.config_path.clone(),
     };
     let loaded = api::engine::LoadedModel::load(&load_opts)?;
-    let engine = api::engine::Engine::spawn(loaded, config.queue_capacity);
+    let engine = api::engine::Engine::spawn(loaded, config.queue_capacity, None);
+    load_info::emit_tracing(engine.info());
 
     if config.warmup_synchronously {
         // Warm up the engine SYNCHRONOUSLY here, BEFORE any other Metal
@@ -1626,6 +1627,18 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
 /// trivially unit-testable without spinning up the binary.
 pub(crate) fn should_enable_kv_persist(flag: Option<&str>, env: Option<&str>) -> bool {
     flag.is_some() && env.map(|v| v.trim()).unwrap_or("") != "0"
+}
+
+pub(crate) fn maybe_print_serve_banner<W: std::io::Write>(
+    info: &load_info::LoadInfo,
+    w: &mut W,
+    tty: bool,
+    quiet: bool,
+) -> std::io::Result<()> {
+    if tty && !quiet {
+        load_info::print_banner(info, w, tty)?;
+    }
+    Ok(())
 }
 
 pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
@@ -2018,6 +2031,7 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
     // `repo` key + a synthetic `Q4_K_M` quant (the on-disk quant is
     // baked into the file; the pool key just needs determinism per
     // identical input).
+    let mut startup_engine_for_banner: Option<api::engine::Engine> = None;
     if let Some(model_arg) = default_model_arg.as_ref() {
         let mut cache_guard = state
             .cache
@@ -2072,9 +2086,10 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             .pool
             .write()
             .map_err(|e| anyhow::anyhow!("pool rwlock poisoned at startup: {e}"))?;
-        pool_guard
+        let loaded_engine = pool_guard
             .load_or_get(&pool_repo, pool_quant, &resolved.gguf_path, &engine_config)
             .map_err(|e| anyhow::anyhow!("startup pre-warm: {e}"))?;
+        startup_engine_for_banner = Some(loaded_engine.engine.clone());
         drop(pool_guard);
         tracing::info!(
             repo = %pool_repo,
@@ -2342,6 +2357,9 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         .build()
         .context("building tokio runtime")?;
 
+    let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let quiet = args.quiet;
+
     rt.block_on(async move {
         let bind = format!("{}:{}", config.host, config.port);
         let listener = tokio::net::TcpListener::bind(&bind)
@@ -2352,6 +2370,11 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             addr = %local_addr.map(|a| a.to_string()).unwrap_or_else(|| bind.clone()),
             "hf2q HTTP server listening"
         );
+        if let Some(engine) = startup_engine_for_banner.as_ref() {
+            let mut stdout = std::io::stdout();
+            maybe_print_serve_banner(engine.info(), &mut stdout, stdout_is_tty, quiet)
+                .context("print serve load banner")?;
+        }
         eprintln!("hf2q serving on http://{}", bind);
 
         // Iter-209: warmup ran SYNCHRONOUSLY at pre-warm time (when
@@ -3171,9 +3194,76 @@ fn cmd_parity_capture(
 #[cfg(test)]
 mod tests {
     use super::{
-        render_jinja_template, should_enable_kv_persist, FALLBACK_GEMMA4_API_CHAT_TEMPLATE,
-        FALLBACK_GEMMA4_CHAT_TEMPLATE,
+        maybe_print_serve_banner, render_jinja_template, should_enable_kv_persist,
+        FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
+    use crate::serve::load_info::{
+        ArchFamily, ChatTemplateSource, LoadInfo, TokenizerSource,
+    };
+    use crate::serve::provenance::Provenance;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    fn synthetic_serve_banner_info() -> LoadInfo {
+        LoadInfo {
+            model_id: "serve-test-model".to_string(),
+            arch_str: "gemma4".to_string(),
+            arch_family: ArchFamily::Gemma4,
+            model_path: PathBuf::from("/tmp/serve-test-model.gguf"),
+            on_disk_bytes: 1024,
+            backend_chip: "Apple M5 Max".to_string(),
+            backend: "mlx-native",
+            n_layers: 2,
+            hidden_size: 32,
+            vocab_size: 128,
+            n_attention_heads: 4,
+            n_key_value_heads: 2,
+            head_dim: 8,
+            sliding_window: Some(16),
+            full_attention_interval: None,
+            max_context_length: Some(128),
+            moe: None,
+            quant_label: Some("Q4_K".to_string()),
+            quant_bpw: Some(4.5),
+            tokenizer_source: TokenizerSource::GgufEmbedded,
+            eos_token_ids: vec![1],
+            bos_token_id: Some(2),
+            chat_template_source: ChatTemplateSource::GgufEmbedded,
+            provenance: Provenance::External,
+            vision_projector: None,
+            load_wall_clock: Duration::from_millis(25),
+            resident_weight_bytes: None,
+            kv_cache_budget_bytes: None,
+            kv_spill_active: false,
+        }
+    }
+
+    #[test]
+    fn cmd_serve_banner_emits_on_tty() {
+        let info = synthetic_serve_banner_info();
+        let mut buf = Vec::new();
+        maybe_print_serve_banner(&info, &mut buf, true, false).expect("print serve banner");
+        let got = String::from_utf8(buf).expect("utf8");
+        assert_eq!(got.lines().count(), 13);
+        assert!(got.contains("hf2q load: model = serve-test-model"));
+        assert!(got.contains("\x1b[2m"));
+    }
+
+    #[test]
+    fn cmd_serve_banner_silent_when_non_tty() {
+        let info = synthetic_serve_banner_info();
+        let mut buf = Vec::new();
+        maybe_print_serve_banner(&info, &mut buf, false, false).expect("skip serve banner");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn cmd_serve_banner_silent_when_quiet() {
+        let info = synthetic_serve_banner_info();
+        let mut buf = Vec::new();
+        maybe_print_serve_banner(&info, &mut buf, true, true).expect("skip quiet serve banner");
+        assert!(buf.is_empty());
+    }
 
     // ADR-017 §R-F1 startup-disable override regression guards.
     // Closes operator-runbook §10 gap by pinning the predicate's

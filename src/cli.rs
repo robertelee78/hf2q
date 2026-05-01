@@ -609,6 +609,10 @@ pub struct ServeArgs {
     #[arg(long)]
     pub mmproj: Option<PathBuf>,
 
+    /// Suppress the human-readable serve load banner on stdout.
+    #[arg(long, default_value_t = false)]
+    pub quiet: bool,
+
     /// ADR-005 Phase 3 item 3/4 — skip pre-load cache integrity
     /// verification of the cached GGUF on disk.
     ///
