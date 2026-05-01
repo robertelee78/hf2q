@@ -2263,6 +2263,146 @@ in 4 /loop iterations across 24 hours (iter-1 audit + diagnostic;
 iter-2 worktree harvest; iter-3 P0 fixes + bench-discovery;
 iter-4 GREEN).
 
+### Phase D iter-5 2026-05-01 — operator-readiness P1 batch (3 parallel worktree agents)
+
+Phase D is GREEN (Closed-Shipped); this iter tackles the
+operator-readiness follow-ups in parallel worktree-isolated agents.
+3 surgical fixes landed cleanly on `origin/main` via cherry-pick
+sequence; 128/128 in-binary `kv_persist` tests PASS post-merge.
+
+#### P1-3 LANDED — `HF2Q_KV_PERSIST_BUDGET_BYTES` wired (commit `1ccedea`)
+
+Worktree agent `ad0dfad1618b3cb28` (commit `8ca0872` →
+cherry-picked → `1ccedea`). cargo check 0 in 17.29s; 116 in-binary
+kv_persist tests PASS.
+
+- `cmd_serve --kv-persist=PATH` now reads
+  `HF2Q_KV_PERSIST_BUDGET_BYTES` (u64; 0 = unlimited; warn-on-bad-parse).
+- After `DiskBlockStore::new(...)`, calls `.set_budget_bytes(parsed)`.
+- `tracing::info!` the active budget at startup so operators can
+  verify env-var took effect.
+- 2 new in-binary tests: `set_budget_bytes_zero_means_unlimited`,
+  `set_budget_bytes_nonzero_persists_through_lookup`.
+- **Default**: `0` (unlimited; matches pre-P1-3 behavior — purely
+  additive). The §R7 RAM-derived default (10% of unified RAM)
+  required `mlx_native::sysinfo::physical_ram_bytes()` which does
+  not exist; per directive ("DO NOT add a new mlx-native dep just
+  for this"), defaulted to 0 with §R7 follow-up doc-comment.
+- **API note**: `set_budget_bytes(u64)` (matches `AtomicU64` field),
+  not `usize`. Tests use u64 accordingly.
+- Surface delta: `+78 / -4` across `serve/mod.rs` + `kv_persist/block_store.rs`.
+
+#### P1-1 LANDED — atomic substitute_on_load + spiller registration (commit `2bed72e`)
+
+Worktree agent `a7c16269378ab2d45` (commit `62a1b4c` →
+cherry-picked → `2bed72e`). cargo check 0; 11/11 loader_wrapper +
+115/115 overall kv_persist tests PASS.
+
+- `LoaderWrapper` gains `substitute_lock: Mutex<()>` (init in `new`).
+- `load(...)` wraps `try_substitute_on_load + update_spiller_registration`
+  pair in a critical section. Concurrent `pre_evict` / `post_admit`
+  observers can no longer see registry-real ↔ spiller-stub
+  divergence.
+- Lock NOT held across the inner `ModelLoader::load` (avoids
+  serializing the actual load).
+- New regression test
+  `p1_1_concurrent_substitute_does_not_split_registry_and_spiller_state`
+  uses a probing factory that captures the produced kv_hook Arc;
+  4 concurrent reader threads watch `registered_count()` (must
+  always be 1).
+- Module docstring + dispatch comment updated to cite §P1-1 +
+  spell out atomicity invariant.
+- Surface delta: `+292 / -10` in
+  `kv_persist/loader_wrapper.rs`. Single-file fix; chose
+  Option 1 (Mutex) over Option 2 (registry-API closure) — smaller
+  blast radius, no API contract churn.
+
+**Worktree-cwd-trap recovery**: agent's initial Edit calls landed
+in main repo; caught immediately via `git status`, captured patch
+via `git diff > /tmp/p1_1_loader_wrapper.patch`, reverted main
+with `git checkout --`, re-applied via `git apply` from worktree
+CWD. Main confirmed clean; worktree carries the commit. Pattern
+matches `feedback_agent_worktree_cwd_trap` standing memory.
+
+#### R-F6 LANDED — `hf2q cache --kv-namespace` list/clear/size (commit `7415047`)
+
+Worktree agent `a058b532520498791` (commit `c6893e4` →
+cherry-picked → `7415047`). cargo check 0; 11/11 cache_ops +
+74/74 weights-side regression tests PASS.
+
+Closes operator-runbook §11 #1 gap. Until this commit, KV-side
+cache clear required `rm -rf <kv-persist-path>` on a stopped serve.
+
+- New `--kv-namespace` flag on existing `cache` subcommand (cli.rs
+  +85 LOC).
+- `cache list --kv-namespace`: per-`(repo, quant)` directory listing
+  with bytes-on-disk + block count under
+  `<kv-persist>/models/<fp_short>/`.
+- `cache clear --kv-namespace --model <repo>` (+ optional
+  `--quant <q>`): removes only the targeted directory; preserves
+  sibling repos AND the `locks/` subdir.
+- `cache size --kv-namespace`: total bytes-on-disk under kv subtree.
+- New module `src/serve/kv_persist/cache_ops.rs` (+680 LOC; pure
+  fs ops with tempdir-mocked tests).
+- 11 new tests cover list / size / clear / refusal-when-missing /
+  resolve-kv-root / fp_short-matches-spiller / clear-respects-flock.
+- Path discovery: `--kv-path PATH` → `HF2Q_KV_PERSIST_PATH` env →
+  hard error. NO weights-cache fallback (silent guessing could `rm
+  -rf` an unintended directory; ADR §R-F1 documents kv-persist root
+  as operator-supplied).
+- Refusal-on-active-flock: detects `flock(LOCK_EX | LOCK_NB)` held
+  by a live `cmd_serve --kv-persist=SAME`; returns helpful error;
+  `--force` override available.
+- Surface delta: `+952 / -6` across cli.rs, serve/mod.rs,
+  kv_persist/mod.rs, NEW cache_ops.rs.
+
+**Worktree-cwd-trap recovery**: same trap pattern as P1-1 agent.
+Detected immediately, recovered via `git checkout --` + `rm` of
+unintended files in main; copied changes into worktree. Main HEAD
+confirmed clean of agent's edits. Pattern doubly-confirms
+`feedback_agent_worktree_cwd_trap` — even with the directive,
+agents can land in main if they read absolute paths and don't
+explicitly route writes through their worktree's relative root.
+
+#### Iter-5 verification gates
+
+| Gate | Result |
+|---|---|
+| `cargo check --release --bin hf2q` (post all 3 cherry-picks) | exit 0 in 8.62s |
+| `cargo test --release --bin hf2q kv_persist -- --test-threads=1` | **128 passed; 0 failed** in 1.84s |
+| Each fix's worktree pre-merge cargo check + targeted tests | exit 0; all PASS |
+| Push to origin/main | fast-forward `28d9c3a..7415047` |
+| Phase D R-C4 + R-P4 still GREEN (regression check needed) | next iter |
+
+#### Remaining ADR-017 work after iter-5
+
+- **F4 namespace fingerprint thread-through**: blocked on ADR-005
+  iter-211 GGUF metadata path (producer_version, source_sha256,
+  tokenizer_chat_template). Trait surface inherits forward; impl
+  rides each family's loader. Design-first session needed.
+- **§R-F7 /metrics counters (4 unwired)**:
+  `hf2q_kv_quarantined_total{reason}`, `hf2q_kv_cache_bytes_on_disk`,
+  `hf2q_kv_cache_blocks_total`, `hf2q_kv_cache_evictions_total`.
+  All emit-site additions; surgical.
+- **`HF2Q_KV_PERSIST=0` mid-flight disable** (operator-runbook §10).
+- **Phase D peer arm** (`HF2Q_KV_PERSIST_PHASE_D_PEER=1`) — verify
+  hf2q decode shares ≥ 3094 bytes common prefix with `llama-completion`
+  on same GGUF + sourdough prompt. H2 falsifier from spec §Mantra.
+- **Full matrix sweep** — 36 production-quant cells × 3 scenarios
+  × 4 prefix lengths. Operator-controlled bench under clean SoC.
+- **Phase B-hybrid** (Qwen3.5-MoE) — pending ADR-013 unblock.
+- **K2 dirty-block decode overhead** measurement under
+  sustained-decode load.
+
+#### Cumulative ADR-017 LOC after iter-5
+
+~16,022 + 78 (P1-3) + 292 (P1-1) + 952 (R-F6) + ~250 (this
+subsection) = **~17,594 LOC** in-tree substrate + audit +
+operator docs + landed fixes + bench receipts. Phase D
+operator-readiness 4 of 7 follow-ups closed; remaining 3 are
+either ADR-blocked (F4 → ADR-005, B-hybrid → ADR-013) or
+post-Phase-D-GREEN polish (/metrics, peer arm, matrix sweep).
+
 ---
 
 ## Open Questions
