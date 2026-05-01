@@ -133,10 +133,10 @@ impl Qwen35LoadedModel {
             .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
         let provenance = provenance::detect(&gguf);
 
-        tracing::info!(
-            "Qwen35 SERVE load: model = {}",
-            model_path.display()
-        );
+        // ADR-018 C3: legacy `tracing::info!("Qwen35 SERVE load: model = ...")`
+        // was deleted here. The same fact (`model_path`) is now emitted by
+        // `emit_tracing(&info)` at every CLI/SERVE entry that constructs a
+        // `LoadInfo`. Conditions/warnings stay; load FACTS are unified.
 
         // ---- Resolve tokenizer path ----
         // Reuse the shared `find_tokenizer` helper from serve/mod.rs so
@@ -145,19 +145,43 @@ impl Qwen35LoadedModel {
         // `--tokenizer` (threaded through `LoadOptions::tokenizer_path`).
         let tokenizer_path =
             crate::serve::find_tokenizer(model_path, opts.tokenizer_path.as_deref())?;
-        tracing::info!(
-            "Qwen35 SERVE load: tokenizer = {}",
-            tokenizer_path.display()
-        );
+        // ADR-018 C3: legacy `tracing::info!("Qwen35 SERVE load: tokenizer = ...")`
+        // was deleted here. `emit_tracing(&info)` surfaces the active
+        // tokenizer source; for Qwen3.5/3.6 that's `TokenizerSource::GgufEmbedded`
+        // (the on-disk path is a load-time diagnostic only — see the
+        // `tokenizer_path` shadow below).
 
         // ---- Load weights (full mlx-native pipeline) ----
-        let model = Qwen35Model::load_from_gguf(&gguf).context("Qwen35Model::load_from_gguf")?;
-        let n_layers = model.layers.len();
-        tracing::info!(
-            "Qwen35 SERVE load: weights loaded ({} layers, variant={:?})",
-            n_layers,
-            model.cfg.variant
+        // ADR-018 C3: TTY-aware progress reporter mirroring cmd_generate
+        // (mod.rs:519-531). Under default verbosity on a TTY stderr the
+        // per-layer `\r loading i/n layers` line renders; under tracing
+        // INFO+ (`-v`) or non-TTY stderr (SERVE redirected to systemd /
+        // a log file) the reporter is silent and tracing::debug events
+        // from the per-layer loaders provide per-layer detail.
+        //
+        // Pre-parse just the config (cheap — parses GGUF metadata only,
+        // no tensor reads) so the progress denominator matches
+        // `cmd_generate`'s pattern. `Qwen35Model::load_from_gguf` will
+        // re-parse it internally; the duplicate cost is microsecond-scale
+        // metadata-key reads against an already-mmapped GGUF.
+        let stderr_is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+        let verbosity = if tracing::enabled!(tracing::Level::INFO) {
+            1
+        } else {
+            0
+        };
+        let cfg_preview = Qwen35Model::load_config_only(&gguf)
+            .context("Qwen35Model::load_config_only (progress sizing)")?;
+        let mut progress = crate::serve::header::LoadProgress::new(
+            stderr_is_tty,
+            verbosity,
+            cfg_preview.num_hidden_layers as usize,
         );
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
+            .context("Qwen35Model::load_from_gguf")?;
+        // ADR-018 C3: legacy `tracing::info!("Qwen35 SERVE load: weights loaded ({} layers, variant={:?})", ...)`
+        // was deleted here. `emit_tracing(&info)` surfaces both `n_layers`
+        // and architecture facts as structured fields.
 
         // ---- Resolve EOS ----
         // Qwen3.5/3.6: `tokenizer.ggml.eos_token_id` is typically 151645
@@ -231,13 +255,11 @@ impl Qwen35LoadedModel {
         let quant_type = crate::serve::load_info::infer_quant_label(&gguf);
 
         let load_duration = load_start.elapsed();
-        tracing::info!(
-            "Qwen35 SERVE load: complete in {:.1}s ({} layers, ctx_len={:?}, quant={:?})",
-            load_duration.as_secs_f64(),
-            n_layers,
-            context_length,
-            quant_type
-        );
+        // ADR-018 C3: legacy `tracing::info!("Qwen35 SERVE load: complete in {:.1}s ...", ...)`
+        // was deleted here. `emit_tracing(&info)` (called by every entry
+        // that constructs a `LoadInfo`) emits structured `load_wall_clock`,
+        // `n_layers`, `max_context_length`, `quant_label` fields. The
+        // free-text format here was incompatible with `journalctl -u hf2q | jq`.
 
         Ok(Self {
             model,

@@ -32,7 +32,6 @@ use std::path::Path;
 
 use crate::cli;
 use crate::debug::INVESTIGATION_ENV;
-use config::Gemma4Config;
 
 /// Build a `KernelRegistry` with every shader the embedding forward
 /// path needs registered AND compiled. One warmup forward is run
@@ -460,109 +459,68 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         }
     }
 
-    let tokenizer_path = find_tokenizer(model_path, args.tokenizer.as_deref())?;
-    let config_path = find_config(model_path, args.config.as_deref())?;
-
-    tracing::info!("Model:     {}", model_path.display());
-    tracing::info!("Tokenizer: {}", tokenizer_path.display());
-    tracing::info!("Config:    {}", config_path.display());
-
-    // Parse model config
-    let cfg =
-        Gemma4Config::from_config_json(&config_path).context("Failed to parse config.json")?;
-    tracing::info!(
-        "Gemma4 A4B: {} layers, {} heads, hidden={}, {} experts (top-{})",
-        cfg.num_hidden_layers,
-        cfg.num_attention_heads,
-        cfg.hidden_size,
-        cfg.num_experts,
-        cfg.top_k_experts,
-    );
-
-    // Initialize mlx-native GPU context. Timing starts here; ends once
-    // weights are resident. The elapsed duration feeds Step 5's header
-    // line 2 ("loaded in Xs").
-    let load_start = std::time::Instant::now();
-    tracing::info!("Initializing mlx-native GPU context");
-    let mut ctx =
-        gpu::GpuContext::new().map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
-    let backend_chip = ctx.gpu_name().to_string();
-    tracing::info!("mlx-native backend: {}", backend_chip);
-
-    // Load weights directly from GGUF (ADR-008: no candle)
-    tracing::info!("Loading GGUF model");
-    let gguf = mlx_native::gguf::GgufFile::open(model_path)
-        .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
-    tracing::debug!(
-        "GGUF loaded: {} tensors, {} metadata keys",
-        gguf.tensor_count(),
-        gguf.metadata_count()
-    );
-
-    // Extract human-readable model name from GGUF metadata, with fallback
-    // to the file stem. Consumed by the header printer in Step 5.
-    let model_name = gguf
-        .metadata_string("general.name")
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            model_path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "unknown".to_string())
-        });
-    tracing::debug!(
-        "Model name (GGUF general.name or file stem): {}",
-        model_name
-    );
-
-    tracing::info!("Loading model weights from GGUF into mlx-native buffers");
+    // ADR-018 C3 — unified load path.
+    //
+    // cmd_generate previously did manual GGUF-open + weights-load +
+    // tokenizer-load (~70 LOC of duplicated logic against
+    // `GemmaLoadedModel::load`). Refactor: route through the
+    // `*LoadedModel::load` constructor so CLI and SERVE share one load
+    // surface. Behaviour-equivalent: the constructor opens the GGUF,
+    // parses config, builds GpuContext, resolves tokenizer + chat
+    // template + EOS + provenance, and emits the same TTY-aware
+    // `\r loading i/n layers` progress line via `header::LoadProgress`
+    // (mirrors the previously-inline TTY+verbosity dance at mod.rs:519-531).
+    //
+    // After the load completes we re-open the GGUF (cheap mmap header
+    // parse — microsecond-scale, no tensor reads) for the prompt-time
+    // call sites that still need it: `render_chat_template`, BOS-token
+    // detection, and `build_load_info`.
     let stderr_is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
     let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
-    // Suppress progress line when tracing events at info+ are enabled
-    // (verbosity >= 1) — the tracing debug/info stream already gives
-    // per-layer visibility, and mixing \r overwrites with log lines is
-    // garbled. Equivalent to "show progress only at default verbosity".
-    let verbosity = if tracing::enabled!(tracing::Level::INFO) {
-        1
-    } else {
-        0
+
+    let load_opts = api::engine::LoadOptions {
+        model_path: model_path.clone(),
+        tokenizer_path: args.tokenizer.clone(),
+        config_path: args.config.clone(),
     };
-    let mut load_progress =
-        header::LoadProgress::new(stderr_is_tty, verbosity, cfg.num_hidden_layers);
-    let mut mlx_w =
-        forward_mlx::MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut ctx, &mut load_progress)?;
-    let n_layers = mlx_w.layers.len();
+    let load_start = std::time::Instant::now();
+    let loaded = api::engine::GemmaLoadedModel::load(&load_opts)
+        .context("GemmaLoadedModel::load")?;
     let load_elapsed = load_start.elapsed();
-    tracing::info!(
-        "mlx-native weights loaded ({} layers) in {:.1}s",
-        n_layers,
-        load_elapsed.as_secs_f64()
+
+    // ADR-018 C3: emit the unified 13-line load banner on stdout (dim
+    // on TTY) BEFORE any prompt rendering or prefill begins, preserving
+    // the legacy ordering `print_header_top → render_prompt → prefill →
+    // print_header_prefill → decode`. The banner replaces the old 2-line
+    // `print_header_top` shape; its content is sourced from the
+    // `LoadInfo` snapshot built by `loaded.build_load_info`.
+    //
+    // Re-open the GGUF for `build_load_info` (which needs the metadata
+    // for arch_str + bpw + bos_token_id + chat_template_source) and for
+    // the downstream `render_chat_template` + BOS detection. The GGUF
+    // header parse is mmap-backed and the OS page cache is already warm
+    // from the load above.
+    let gguf = mlx_native::gguf::GgufFile::open(model_path)
+        .map_err(|e| anyhow::anyhow!("GGUF re-open (post-load, banner+prompt): {e}"))?;
+
+    let info = <api::engine::GemmaLoadedModel as load_info::LoadInfoBuilder>::build_load_info(
+        &loaded, &gguf, load_elapsed, None, false,
     );
-
-    // Default-mode header lines 1 and 2 — product output on stdout,
-    // dimmed on TTY. Line 3 (prefill stats) renders after prefill completes.
-    let total_gb = std::fs::metadata(model_path)
-        .map(|m| m.len() as f64 / 1e9)
-        .unwrap_or(0.0);
-    let header_top = header::HeaderInfoTop {
-        chip: header::short_chip_label(&backend_chip),
-        backend: "mlx-native",
-        model: model_name.clone(),
-        load_s: load_elapsed.as_secs_f64(),
-        n_layers,
-        total_gb,
-    };
+    load_info::emit_tracing(&info);
     let mut stdout = std::io::stdout();
-    header::print_header_top(&mut stdout, &header_top, stdout_is_tty)
-        .context("print header top")?;
+    load_info::print_banner(&info, &mut stdout, stdout_is_tty)
+        .context("print load banner")?;
 
-    // Load tokenizer
-    let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
-    tokenizer
-        .with_truncation(None)
-        .map_err(|e| anyhow::anyhow!("Failed to disable tokenizer truncation: {}", e))?;
-    let tokenizer = tokenizer;
+    // Partial-move the loaded artifacts into local mutable bindings so
+    // the rest of cmd_generate (prefill + decode + profiler) keeps the
+    // same `&mut ctx` syntax it had pre-refactor. Rust permits this
+    // because `GemmaLoadedModel` has no manual `Drop` impl: each field
+    // moves independently. After this point `loaded` is no longer
+    // usable as a whole — that's intentional, because none of the
+    // remaining cmd_generate body wants the aggregate.
+    let mut ctx = loaded.ctx;
+    let mut mlx_w = loaded.weights;
+    let tokenizer = loaded.tokenizer;
 
     // Resolve prompt
     let prompt_text_raw = resolve_prompt(&args)?;
@@ -1116,64 +1074,71 @@ fn maybe_run_qwen35_prefill_sweep(
 fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile) -> Result<()> {
     use crate::inference::models::qwen35::io_heads::greedy_argmax_last_token;
     use crate::inference::models::qwen35::kv_cache::HybridKvCache;
-    use crate::inference::models::qwen35::model::Qwen35Model;
+    use crate::serve::api::engine_qwen35::Qwen35LoadedModel;
     use mlx_native::MlxDevice;
     use std::io::Write;
 
     let model_path = &args.model;
-    let tokenizer_path = find_tokenizer(model_path, args.tokenizer.as_deref())?;
 
-    tracing::info!("Qwen3.5 path: {}", model_path.display());
-    tracing::info!("Tokenizer:    {}", tokenizer_path.display());
+    // ADR-018 C3 — unified load path.
+    //
+    // cmd_generate_qwen35 previously did manual GGUF + tokenizer + EOS
+    // resolution (~60 LOC of duplicated logic against
+    // `Qwen35LoadedModel::load`). Refactor: route through the
+    // `*LoadedModel::load` constructor so CLI and SERVE share one load
+    // surface. Behaviour-equivalent: the constructor opens the GGUF
+    // (re-open from the dispatcher's metadata-only handle is fine —
+    // page cache is warm), loads weights via mlx-native, resolves
+    // tokenizer + chat template + EOS + provenance, and emits the same
+    // TTY-aware `\r loading i/n layers` progress line via
+    // `header::LoadProgress`.
+    //
+    // The post-load cmd_generate_qwen35 body still uses the original
+    // `gguf` handle (passed in by `cmd_generate`'s arch detect) for
+    // chat-template render and EOS-from-metadata fallback — those are
+    // mmap reads against the same on-disk file and don't need a second
+    // open. `LoadInfo`'s build path takes its own `&GgufFile`; we pass
+    // the parameter handle.
+    let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
 
-    // ---- Load model ----
+    let load_opts = api::engine::LoadOptions {
+        model_path: model_path.clone(),
+        tokenizer_path: args.tokenizer.clone(),
+        config_path: args.config.clone(),
+    };
     let load_start = std::time::Instant::now();
-    tracing::info!("Loading Qwen3.5 model from GGUF");
-    let model = Qwen35Model::load_from_gguf(&gguf).context("Qwen35Model::load_from_gguf")?;
+    let loaded = Qwen35LoadedModel::load(&load_opts).context("Qwen35LoadedModel::load")?;
     let load_elapsed = load_start.elapsed();
-    tracing::info!(
-        "Qwen3.5 model loaded ({} layers, variant={:?}) in {:.2}s",
-        model.layers.len(),
-        model.cfg.variant,
-        load_elapsed.as_secs_f64()
+
+    // ADR-018 C3: emit the unified 13-line load banner BEFORE prompt
+    // rendering / prefill. Order matches cmd_generate (Gemma) and the
+    // legacy `print_header_top` site.
+    let info = <Qwen35LoadedModel as load_info::LoadInfoBuilder>::build_load_info(
+        &loaded, &gguf, load_elapsed, None, false,
     );
+    load_info::emit_tracing(&info);
+    let mut stdout = std::io::stdout();
+    load_info::print_banner(&info, &mut stdout, stdout_is_tty)
+        .context("print load banner")?;
 
-    // ---- Resolve EOS from GGUF metadata ----
-    // Qwen3.5 / Qwen3.6: tokenizer.ggml.eos_token_id is typically 151645 or 151643.
-    // We prefer the GGUF-declared value (the authoritative source for this GGUF)
-    // over any hard-coded default, per project_qwen36_architecture.md.
-    let eos_token_id: u32 = gguf
-        .metadata_u32("tokenizer.ggml.eos_token_id")
-        .unwrap_or(151645); // HF Qwen3.5 default EOS
-    tracing::info!("Qwen3.5 EOS token id: {}", eos_token_id);
-
-    // ---- Load tokenizer ----
-    //
-    // Qwen3.5/3.6 GGUFs are built from the GGUF's own `tokenizer.ggml.*`
-    // metadata arrays — NOT from the on-disk `tokenizer.json` that ships
-    // alongside the model. The on-disk HF tokenizer.json declares an
-    // `added_tokens` vocabulary (e.g. through 248,319 on the apex GGUF)
-    // that overshoots the GGUF's actual `tokenizer.ggml.tokens` count
-    // (248,044). Loading the HF tokenizer would emit out-of-vocab IDs
-    // (e.g. `<|im_start|>` = 248045) that the embedding loader's
-    // zero-pad fallback (`weight_loader.rs:699-707`) silently maps to
-    // an all-zero embedding — decapitating the residual stream and
-    // producing deterministic prompt-repetition gibberish on chat-
-    // templated prompts ("How to make bread? / How to noob bread?...").
-    //
-    // `crate::inference::models::qwen35::tokenizer::build_tokenizer_from_gguf`
-    // mirrors `llama.cpp`'s vocab path (`llama-vocab.cpp:2197-2253`)
-    // verbatim and produces token streams byte-equivalent to
-    // `llama-tokenize` on the same GGUF. `_tokenizer_path` is kept in
-    // scope only as a load-time diagnostic ("we found one alongside the
-    // GGUF, here's where") — its bytes are NOT consumed.
-    let _tokenizer_path = tokenizer_path;
-    let mut tokenizer =
-        crate::inference::models::qwen35::tokenizer::build_tokenizer_from_gguf(&gguf)
-            .map_err(|e| anyhow::anyhow!("GGUF-driven tokenizer build failed: {e}"))?;
-    tokenizer
-        .with_truncation(None)
-        .map_err(|e| anyhow::anyhow!("Tokenizer truncation: {e}"))?;
+    // Partial-move the loaded artifacts into local mutable bindings so
+    // the rest of cmd_generate_qwen35 (prefill + decode) keeps the same
+    // shape. `Qwen35LoadedModel` has no manual `Drop`; partial moves
+    // are sound.
+    let model = loaded.model;
+    let tokenizer = loaded.tokenizer;
+    // The legacy code path resolved EOS via `gguf.metadata_u32(...)
+    // .unwrap_or(151645)` AND emitted a `tracing::info!("Qwen3.5 EOS
+    // token id: {}", eos_token_id)`. The unified surface stores
+    // `eos_token_ids: Vec<u32>` in the loaded struct (already lifted
+    // from GGUF or defaulted) — read it directly. The trailing
+    // `tracing::info!` is replaced by emit_tracing's `eos_token_ids`
+    // structured field.
+    let eos_token_id: u32 = loaded
+        .eos_token_ids
+        .first()
+        .copied()
+        .unwrap_or(151_645);
 
     if maybe_run_qwen35_prefill_sweep(&model, &tokenizer)? {
         return Ok(());
@@ -1219,40 +1184,15 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         use_spec_decode = false;
     }
 
-    // ---- Build header info ----
-    let backend_chip = {
-        use crate::serve::gpu::GpuContext;
-        GpuContext::new()
-            .ok()
-            .map(|c| c.gpu_name().to_string())
-            .unwrap_or_else(|| "Metal".to_string())
-    };
-    let model_name = gguf
-        .metadata_string("general.name")
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            model_path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "qwen3.5".to_string())
-        });
-    let total_gb = std::fs::metadata(model_path)
-        .map(|m| m.len() as f64 / 1e9)
-        .unwrap_or(0.0);
-    let n_layers = model.layers.len();
-    let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
-
-    let header_top = header::HeaderInfoTop {
-        chip: header::short_chip_label(&backend_chip),
-        backend: "mlx-native",
-        model: model_name,
-        load_s: load_elapsed.as_secs_f64(),
-        n_layers,
-        total_gb,
-    };
-    let mut stdout = std::io::stdout();
-    header::print_header_top(&mut stdout, &header_top, stdout_is_tty)
-        .context("print header top")?;
+    // ADR-018 C3: the legacy 2-line `print_header_top` site that lived
+    // here is gone — the unified 13-line load banner already rendered
+    // at the top of `cmd_generate_qwen35` (the byte-equivalent earlier
+    // call to `load_info::print_banner`). The local variables that
+    // backed the legacy header (`backend_chip`, `model_name`,
+    // `total_gb`, `n_layers`, `header_top`) carried no value past the
+    // print site and were deleted to keep the load-fact surface in one
+    // place. `stdout` and `stdout_is_tty` were the only locals used
+    // downstream — both are bound up top now.
 
     if use_spec_decode {
         use crate::inference::models::qwen35::spec_decode::SpecDecode;

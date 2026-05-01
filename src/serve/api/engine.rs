@@ -1388,9 +1388,14 @@ impl GemmaLoadedModel {
         let tokenizer_path = find_tokenizer(model_path, opts.tokenizer_path.as_deref())?;
         let config_path = find_config(model_path, opts.config_path.as_deref())?;
 
-        tracing::info!("Engine load: model = {}", model_path.display());
-        tracing::info!("Engine load: tokenizer = {}", tokenizer_path.display());
-        tracing::info!("Engine load: config = {}", config_path.display());
+        // ADR-018 C3: legacy `tracing::info!("Engine load: {model,tokenizer,config} = ...")`
+        // triplet was deleted here. The same facts now flow through
+        // `emit_tracing(&info)` at every CLI/SERVE entry that constructs
+        // a `LoadInfo`: structured `model_path`, `tokenizer_source`
+        // (HfTokenizerJson { path }), and the on-disk `config_path` is
+        // load-internal — it produces `Gemma4Config` whose fields
+        // `n_layers`, `hidden_size`, `vocab_size`, etc. emit_tracing
+        // surfaces structurally.
 
         let config = Gemma4Config::from_config_json(&config_path)
             .context("Failed to parse config.json")?;
@@ -1453,14 +1458,38 @@ impl GemmaLoadedModel {
                 crate::serve::FALLBACK_GEMMA4_API_CHAT_TEMPLATE.to_string()
             });
 
-        // Load GPU ctx + weights. `header::LoadProgress` is happy with a
-        // non-TTY parent; we set verbosity to 1 to suppress the progress line
-        // when the server is running (logs replace the progress UX).
+        // Load GPU ctx + weights.
+        //
+        // ADR-018 C3: TTY-aware `LoadProgress::new(stderr_is_tty, verbosity, n_layers)`
+        // replaces the previous hard-coded `LoadProgress::new(false, 1, n_layers)`
+        // silent sentinel. The TTY-aware constructor is the same one
+        // `cmd_generate` uses today (mod.rs:519-531). Behaviour:
+        //
+        //   - CLI default (`hf2q generate`, no -v): stderr is a TTY,
+        //     verbosity=0 (tracing INFO not enabled by main.rs:124),
+        //     progress reporter renders `\r loading i/n layers`.
+        //   - CLI verbose (`hf2q generate -v`): stderr is a TTY,
+        //     tracing::enabled!(INFO) is true → verbosity=1, reporter
+        //     is silent (debug/info events from the loader cover detail).
+        //   - SERVE default (`hf2q serve`): main.rs sets `hf2q=info`
+        //     by default for serve mode (some configs); when stderr IS
+        //     a TTY (interactive launch), tracing INFO is enabled →
+        //     verbosity=1, reporter silent. When stderr ISN'T a TTY
+        //     (systemd, docker), the reporter is silent regardless of
+        //     verbosity. Either way: server output is clean.
+        //   - Test contexts that capture stderr: stderr is rarely a
+        //     TTY → reporter silent.
         let mut ctx = GpuContext::new()
             .map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
 
         let n_layers = config.num_hidden_layers;
-        let mut load_progress = header::LoadProgress::new(false, 1, n_layers);
+        let stderr_is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+        let verbosity = if tracing::enabled!(tracing::Level::INFO) {
+            1
+        } else {
+            0
+        };
+        let mut load_progress = header::LoadProgress::new(stderr_is_tty, verbosity, n_layers);
         let weights = MlxModelWeights::load_from_gguf(
             &gguf,
             &config,
@@ -1481,12 +1510,12 @@ impl GemmaLoadedModel {
         let eos_token_ids: Vec<u32> = vec![1, 106];
 
         let load_duration = load_start.elapsed();
-        tracing::info!(
-            "Engine load: {} layers, ctx_len={:?}, load_time={:.1}s",
-            weights.layers.len(),
-            context_length,
-            load_duration.as_secs_f64()
-        );
+        // ADR-018 C3: legacy `tracing::info!("Engine load: {} layers, ctx_len={:?}, load_time={:.1}s", ...)`
+        // was deleted here. `emit_tracing(&info)` now surfaces the same
+        // facts (`n_layers`, `max_context_length`, `load_wall_clock`) as
+        // structured fields at every CLI/SERVE entry that constructs a
+        // `LoadInfo`. The free-text format was incompatible with
+        // `journalctl -u hf2q | jq` cross-arch filtering.
 
         Ok(Self {
             weights,

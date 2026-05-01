@@ -258,7 +258,26 @@ fn run_hf2q_decode(cell: &Cell) -> Result<String, String> {
         ));
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let raw = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok(strip_banner(&raw))
+}
+
+/// Strip hf2q's stdout banner from a `generate` invocation.
+///
+/// ADR-018 C3: `hf2q generate` writes a 13-line `print_banner`
+/// (`hf2q load: ...` × 13) followed by a 1-line `print_header_prefill`
+/// (`prefill: ... tok in ... ms (... tok/s)`) followed by a blank line
+/// before the decoded text begins. The decoded-only segment is what
+/// the smoke check must inspect — otherwise the literal `"hf2q"`
+/// prefix in every banner line would trip the single-token-repetition
+/// gate (13 × `"hf2q"` from the banner alone). Mirrors the strategy
+/// in `tests/coherence_matrix.rs::strip_hf2q_header`.
+fn strip_banner(stdout: &str) -> String {
+    if let Some(idx) = stdout.find("\n\n") {
+        stdout[idx + 2..].to_string()
+    } else {
+        stdout.to_string()
+    }
 }
 
 fn read_golden(cell: &Cell) -> Result<String, String> {

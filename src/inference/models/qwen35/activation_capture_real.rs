@@ -210,7 +210,11 @@ impl RealActivationCapture {
                 reason: format!("GgufFile::open: {e}"),
             }
         })?;
-        let model = Qwen35Model::load_from_gguf(&gguf).map_err(|e| {
+        // Silent progress: activation capture is a non-CLI test/lab
+        // tool; per-layer `\r` overwrites would mangle the test stderr
+        // output. Mirrors the SERVE-side silent-progress pattern.
+        let mut progress = crate::serve::header::LoadProgress::new(false, 1, 0);
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).map_err(|e| {
             // `{e:#}` displays the anyhow context chain on one line so the
             // inner cause (e.g. specific tensor name + shape) is visible.
             RealActivationCaptureError::Load {

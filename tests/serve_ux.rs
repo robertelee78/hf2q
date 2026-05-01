@@ -101,47 +101,62 @@ fn default_stdout_has_three_header_lines_and_generation() {
     assert!(out.status.success(), "hf2q generate failed: {:?}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    // Stdout isn't a TTY in `Command::output()`, so header is plain.
+    // ADR-018 C3 — banner shape updated.
+    //
+    // Pre-C3 the CLI emitted a 2-line `print_header_top` followed by a
+    // 1-line `print_header_prefill` (3 banner lines total + blank + gen).
+    // Post-C3 the CLI emits the unified 13-line `print_banner` (sourced
+    // from `LoadInfo`) followed by the same 1-line `print_header_prefill`
+    // (14 banner lines total + blank + gen).
+    //
+    // Stdout isn't a TTY in `Command::output()`, so the banner is plain.
     let lines: Vec<&str> = stdout.split_inclusive('\n').collect();
     assert!(
-        lines.len() >= 5,
-        "expected at least 3 header + blank + generation; got {}:\n{stdout}",
+        lines.len() >= 16,
+        "expected at least 13 banner + 1 prefill + blank + generation; got {}:\n{stdout}",
         lines.len()
     );
 
-    let line0 = lines[0].trim_end();
-    let line1 = lines[1].trim_end();
-    let line2 = lines[2].trim_end();
-    let line3 = lines[3].trim_end();
+    // Banner: every load-fact line begins with "hf2q load: ".
+    for (i, line) in lines.iter().take(13).enumerate() {
+        let trimmed = line.trim_end();
+        assert!(
+            trimmed.starts_with("hf2q load: "),
+            "banner line {i} shape: {trimmed:?}"
+        );
+    }
 
-    // Header line 1: "hf2q · <chip> · <backend>"
+    // Spot-check three load facts the new surface owns:
+    let banner: String = lines[..13].concat();
     assert!(
-        line0.starts_with("hf2q · ") && line0.ends_with(" · mlx-native"),
-        "line0 shape: {line0:?}"
+        banner.contains("backend = mlx-native"),
+        "banner missing backend fact:\n{banner}"
+    );
+    assert!(
+        banner.contains("family = gemma4") || banner.contains("family = qwen35"),
+        "banner missing arch family fact:\n{banner}"
+    );
+    assert!(
+        banner.contains("ready in "),
+        "banner missing wall-clock fact:\n{banner}"
     );
 
-    // Header line 2: "<model> · loaded in X.Xs · N layers · X.X GB"
+    // Prefill line (post-banner, byte-for-byte unchanged from pre-C3).
+    let prefill_line = lines[13].trim_end();
     assert!(
-        line1.contains(" · loaded in ")
-            && line1.contains(" layers · ")
-            && line1.ends_with(" GB"),
-        "line1 shape: {line1:?}"
+        prefill_line.starts_with("prefill: ")
+            && prefill_line.contains(" tok in ")
+            && prefill_line.contains("ms (")
+            && prefill_line.ends_with(" tok/s)"),
+        "prefill line shape: {prefill_line:?}"
     );
 
-    // Header line 3: "prefill: N tok in Xms (Y tok/s)"
-    assert!(
-        line2.starts_with("prefill: ")
-            && line2.contains(" tok in ")
-            && line2.contains("ms (")
-            && line2.ends_with(" tok/s)"),
-        "line2 shape: {line2:?}"
-    );
-
-    // Blank line between header and generation.
-    assert!(line3.is_empty(), "line3 should be blank, got {line3:?}");
+    // Blank line between prefill and generation.
+    let blank_line = lines[14].trim_end();
+    assert!(blank_line.is_empty(), "expected blank line at index 14, got {blank_line:?}");
 
     // Generation: remaining bytes are non-empty.
-    let gen: String = lines[4..].concat();
+    let gen: String = lines[15..].concat();
     assert!(!gen.trim().is_empty(), "expected generation text");
 
     // No ANSI escape sequences on piped stdout.
