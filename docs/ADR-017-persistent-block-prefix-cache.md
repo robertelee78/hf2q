@@ -2021,6 +2021,114 @@ Agent assignment: worktree-isolated coder, foreground; ~10 LOC
 edit + 1 unit test. Cherry-pick to `origin/main` after cargo
 check exit 0.
 
+#### P0-3 LANDED — orphan GC at recovery scan (commit `10d419a` on origin/main)
+
+Worktree agent `a3729b799f98efd79` shipped at commit `f4b072a` →
+cherry-picked → `10d419a`. `cargo check --release --bin hf2q` exit
+0 in 20.23s. +102 / -1 LOC in `src/serve/kv_persist/recovery.rs`.
+
+- `ORPHAN_TTL_SECS = 60` constant. Rationale: writes complete in
+  <60s on M5 Max NVMe; longer waits indicate stalled or dead writer.
+- `RecoveryReport.orphan_tmp_files_removed: usize` counter added.
+- `scan_one`'s `.tmp.` arm: increments existing
+  `partial_tmp_files_ignored`, then attempts age-gated GC. Errors
+  swallowed (best-effort — cross-process writer race tolerated).
+- New regression test asserts: 2 orphans (1 recent, 1 backdated 120s
+  via `libc::utimes`) → both counted as ignored, exactly the aged
+  orphan removed.
+
+#### Phase D R-C4 attempt #2 — bench-discovered P0-BENCH ship-blocker
+
+Iter-3 retried Phase D R-C4 from a fresh `/opt/hf2q-bench` worktree
+off `origin/main` after foreign hf2q (27 GiB) freed. **Test FAILED**
+— but the `b0e67ca` diagnostic improvement paid off **immediately**:
+stderr_tail surfaced the real production-side cause:
+
+```
+ERROR hf2q: startup pre-warm: hot-swap loader failed:
+  LoaderWrapper: registry hook for
+  (repo=gemma-4-26B-A4B-it-ara-abliterated-dwq, quant=Q4_K_M)
+  retained a clone of the type-erased engine Arc;
+  this violates the EngineBindable contract
+```
+
+(Pre-warm also emitted "262144 of 262144 logits are NaN" — separate
+ADR-013/014/015 territory issue, likely tied to foreign concurrent
+CFA sessions on ADR-013 qwen35 tokenizer + ADR-014 P11 work or to
+GPU-state corruption from those sessions. NOT ADR-017 fault.)
+
+**Root cause analyzed by reading code (verified against bench stderr):**
+
+`src/serve/kv_persist/families/gemma4_dense.rs:268` declared:
+```rust
+engine_arc: Arc<RwLock<Option<Arc<Engine>>>>,
+```
+
+`Gemma4DenseSpillFactory::try_construct` (B-dense.2 follow-up production
+path, commit `420ef94`) downcast `Arc<dyn Any>` to `Arc<Engine>`, then
+`set_engine_arc(engine_arc)` stored a STRONG `Arc<Engine>` in the
+spill. After substitute_on_load returned, the spill held a strong
+ref. `LoaderWrapper::load:333` called `Arc::try_unwrap(arc_engine)`
+to recover the inner `Engine`; `try_unwrap` failed because the
+strong count was ≥ 2 (the spill's retained clone + the wrapper's
+own). Pre-warm aborted.
+
+The defect was anticipated by `loader_wrapper.rs:328-332`'s contract
+docstring: *"hooks to drop the type-erased Arc before returning"* —
+but B-dense.2 follow-up mutated `EngineHandle`-cheap-clone-of-Arc-fields
+semantics into `Arc<Engine>`-strong-retain semantics without
+updating the contract enforcement.
+
+**Fix LANDED (commit `2b3f62d` on origin/main):**
+
+Worktree agent `a7cd00d736f91bd6e` shipped at `4f3cfbf` →
+cherry-picked → `2b3f62d`. **Migration: `Arc<Engine>` →
+`Weak<Engine>`** in `Gemma4DenseSpill.engine_arc`. The spill now
+OBSERVES the engine; `HotSwapManager` retains the only strong ref.
+Snapshot/restore paths upgrade the Weak on demand; `None` (engine
+dropped post-eviction) yields fall-through to the EngineHandle
+backwards-compat path or `Skipped`, never an error.
+
+| Verification gate | Result |
+|---|---|
+| `cargo check --release --bin hf2q` | exit 0 (clean) |
+| `cargo test --release --bin hf2q kv_persist::families::gemma4_dense -- --test-threads=1` | **31 / 31 PASS** in 0.06s |
+| 2 new regression tests | `factory_try_construct_does_not_retain_strong_ref_on_engine` + `new_with_engine_does_not_retain_strong_ref` — assert `Arc::strong_count` returns to baseline (pre-fix: 3; post-fix: 1) |
+| 2 pre-existing tests updated | `followup_factory_try_construct_succeeds_on_arc_engine`, `followup_engine_bindable_accepts_arc_engine` — retain a local strong `Arc<Engine>` for spill lifetime, mirroring production where `HotSwapManager` owns the strong ref |
+| Single-file edit | +232 / -18 LOC in `gemma4_dense.rs` |
+
+**This is the FIRST real ADR-017 ship-blocker that the bench
+discovered**, validating the bench's value AND the diagnostic
+improvement landed in iter-1. Without `b0e67ca`'s stderr_tail
+surface, the failure would have read identically to the iter-1
+"Connection refused" timeout — 600s of wall time per attempt,
+zero diagnostic signal, ambiguous between SoC contention and real
+defect. The diagnostic investment paid for itself on first contact.
+
+Standing memory candidate (load-bearing pattern):
+> When a subprocess test driver captures stderr, ALWAYS surface the
+> capture on every error path — never just on success. The next
+> failure mode is unknown; the captured stream is the only signal
+> that distinguishes contention from defect.
+
+**Remaining ADR-017 work after iter-3:**
+
+- Re-run Phase D R-C4 against `2b3f62d` HEAD when SoC permits
+  (next /loop iter wakeup picks up).
+- F4 namespace fingerprint thread-through (Agent 1 audit finding —
+  `spiller.rs:242-244` builds with empty strings).
+- P1-1 lock-step atomicity (`loader_wrapper.rs:309-324` — module
+  docs claim atomic, impl is not).
+- P1-3 `budget_bytes` env var wiring + DiskBlockStore::set_budget_bytes invocation.
+- 4 of 6 `/metrics` counters per §R-F7 unwired.
+- Native `cache --kv-namespace` clear command absent.
+- Phase B-hybrid (Qwen3.5-MoE) blocked on ADR-013 unblock.
+
+**Cumulative ADR-017 LOC after iter-3:** ~15,272 + 16
+(P0-1 fsync) + 102 (P0-3 GC) + 232 (P0-bench Weak) + ~150 (this
+ADR subsection) = **~15,772 LOC** in-tree substrate + audit +
+operator docs + landed fixes.
+
 ---
 
 ## Open Questions
