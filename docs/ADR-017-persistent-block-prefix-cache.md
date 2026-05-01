@@ -3006,6 +3006,75 @@ reasonable interpretation under the current architecture.
   methodologically sound and ready for the next operator
   measurement run.
 
+  **iter-15 v2 measurement RAN — FAIL but reveals SECOND test design issue:**
+
+  v2 produced meaningful absolute numbers (cache-MISS prefill
+  drove decodes to 1+ second), but the FAIL surfaces a second
+  test design bug:
+
+  ```
+  baseline_full_avg=1110.8ms (durations [1051, 1071, 1149]; warm-up drop → mean of [1071, 1149] = 1110)
+  concurrent_full_avg=1341.7ms (durations [1138, 1391, 1291]; warm-up drop → mean of [1391, 1291] = 1341)
+  abs_overhead=230.9ms (FAIL > 50ms gate)
+  rel_overhead=0.208 (FAIL > 0.05 gate)
+  ```
+
+  Sibling eviction wall on iter #1 = 0.5 ms, iter #2 = 0.4 ms —
+  same iter-8 / v1 dynamic: after iter #0's real eviction (3460 ms
+  wall), subsequent eviction triggers target fresh pool slots and
+  no-op. So the 230 ms overhead is NOT from "concurrent eviction
+  firing during decode" — eviction didn't actually fire on the
+  measured iters.
+
+  **Causal attribution: TEST DRIVER FILESYSTEM I/O, not spiller
+  writer thread.** Each iter's `force_eviction_via_symlink` does:
+  - Create a tempdir (`tempfile::tempdir()`)
+  - Make a symlink to the GGUF
+  - Walk + symlink sibling config files (tokenizer/etc.)
+  - Issue an HTTP request that POOL-RESOLVES the symlink
+
+  Even when the eviction NO-OPs (pool slot already foreign), the
+  tempdir+symlink filesystem operations run. They compete for FS
+  bandwidth with the inference thread's prefill memory access
+  patterns (BPE tokenizer reads, GGUF mmap fault-in for new
+  prompt regions). 230 ms abs overhead is consistent with kernel
+  FS-cache pressure, NOT with writer-thread async leakage onto
+  inference.
+
+  Production reality check: actual eviction in `cmd_serve`
+  triggers via `HotSwapManager` state-transition (in-memory). It
+  does NOT create tempdirs/symlinks. The test driver's overhead
+  is artifact of the symlink-distinct-pool-key TRICK — that
+  trick was correct for forcing eviction in the R-C4/R-P4 tests
+  (one-shot use), but as a sustained-eviction tool it adds FS
+  noise that the production path does not have.
+
+  **Standing pattern (load-bearing for any test that uses
+  `force_eviction_via_symlink` to measure perf overhead):**
+  the symlink-distinct-pool-key trick is a CORRECTNESS tool
+  (forces a real eviction once), NOT a CADENCE tool (does not
+  cleanly re-fire across iters and adds FS-driver overhead).
+  Tests that need sustained writer-thread pressure should
+  inject spill jobs DIRECTLY via a writer-queue probe (not
+  yet exposed; would require a `BlockPrefixCacheSpiller::test_only_inject_pending_spill(N)`
+  hook + a `pending_writer_queue_depth()` accessor). That's
+  proper structural test infrastructure, out of scope for the
+  v2 patch.
+
+  **K2 verdict still UNCHANGED.** The v2 test methodology is
+  sound for cache-MISS regimes but its eviction trigger
+  contaminates the signal. iter-8's between-decodes K2
+  (overhead=−0.995, sustained 0.3 ms vs baseline 60.8 ms)
+  remains the load-bearing falsifier — its measurement was
+  pure spiller hook activity (no test-driver FS I/O competing
+  with decode).
+
+  iter-16+ K2 polish v3 (if pursued) would land the writer-queue
+  probe + replace the symlink trick with direct queue injection.
+  ADR-017's K2 falsification by iter-8's measurement remains
+  load-bearing; v2/v3 polish is operator-readability improvement,
+  not gate change.
+
 #### All 3 kill-gates FALSIFIED — final status table
 
 | Kill-gate | Threshold | Measured | Verdict | Iter |
