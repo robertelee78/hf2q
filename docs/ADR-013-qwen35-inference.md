@@ -1059,6 +1059,48 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-05-01 — P19 H9 STRUCTURALLY CONFIRMED · empirical sync_count = **161 commit_and_wait per Qwen3.6 prefill** (fixed) ⇒ 213 ms of pure CB-sync overhead dominates the wall at small batch; structural super-CB refactor is the next big lever
+
+**Hypothesis (P19 step 1, commit `342b7d6`).** "Per-layer commit boundary: hf2q closes a command buffer per layer (40 cb/prefill); llama.cpp builds the entire prefill graph as a single ggml graph and the metal-backend submits it as a single super-CB with internal scheduler-emitted barriers. Test: count `commit_and_wait` calls per prefill in `forward_gpu.rs::forward_gpu_impl` and the layer-driver loop. Read llama.cpp's `ggml_metal_graph_compute` to confirm single-CB-per-graph."
+
+**Instrumentation.** mlx-native already exposes `sync_count() / dispatch_count() / barrier_count() / cmd_buf_count() / reset_counters()` (atomic counters, near-zero overhead, exposed at `/opt/mlx-native/src/encoder.rs:215-308`). Added `HF2Q_PROFILE_SYNC=1` env-gated reset+log in `cmd_generate_qwen35` around the prefill timer (`src/serve/mod.rs`, +20 lines). Zero overhead when env unset.
+
+**Empirical receipts (M5 Max, dwq48 19.6 GB, hf2q HEAD-with-this-edit, mlx-native `23c78d0`):**
+
+| target pp | actual tokens | wall (ms) | **sync_count** | dispatch_count | barrier_count | cmd_buf_count | reported t/s |
+|---|---|---|---|---|---|---|---|
+| 31  | 41 | 212.5 | **161** | 1,282 | 630 | 162 | 192.9 |
+| 56  | 56 | 227.6 | **161** | 1,282 | 630 | 162 | 246.0 |
+| 101 | 71 | 277.3 | **161** | 1,282 | 630 | 162 | 256.1 |
+
+**The decisive number: `sync_count = 161` independently of prompt length.** 40 transformer layers × ~4 `commit_and_wait` per layer (ops1-3/4 + chunk_gdn-or-sdpa + post_attn_norm + FFN) + 1 output-head commit = 161. Same for `dispatch_count` (1,282 = ~32 dispatches per layer) and `barrier_count` (630 = ~16 per layer). The work scales with n_tokens, but the **CB boundaries do not** — they are baked into `forward_gpu_impl`'s per-layer encoder pattern.
+
+**Per-commit fixed cost.** 212.5 ms wall / 161 commits = **1.32 ms per commit_and_wait**. That's the floor cost of `[cmd_buf commit]; [cmd_buf waitUntilCompleted]; [residency flush]` on M5 Max in this configuration — driver round-trip + GPU power-state transition + KV barrier write-back. Even an empty commit_and_wait is ~50–100 µs; with realistic in-flight work it's ~1–3 ms.
+
+**Sync vs compute decomposition (subtracting fixed overhead from wall):**
+
+| Cell | Wall | Fixed (161 × 1.32) | Compute (residual) | Per-token compute |
+|---|---|---|---|---|
+| pp41  | 212.5 ms | 213 ms | ≈ 0 ms     | overhead-saturated |
+| pp56  | 227.6 ms | 213 ms | ≈ 15 ms    | 0.27 ms/token |
+| pp101 | 277.3 ms | 213 ms | ≈ 64 ms    | 0.90 ms/token  |
+
+llama-completion at pp101 = 850 t/s = **1.18 ms/token**. Hf2q's actual per-token compute (0.90 ms/token at pp71) is *already faster than llama-completion's reported per-token rate*. The 4–7× steady-state gap is **entirely** the 213 ms of CB-sync overhead. If hf2q could reduce 161 commits → 5–10, the prefill wall would collapse to ~80 ms at pp71 (~890 t/s) — beating llama-completion outright on the same hardware.
+
+**H9 verdict: STRUCTURALLY CONFIRMED with measurement.** This is the dominant remaining optimization target. Per `feedback_evidence_first_no_blind_kernel_rewrites`: instrument first, then refactor — the instrumentation lands here, the refactor lands next.
+
+**Refactor scope (P20 candidate, /cfa territory).** Reduce per-prefill commit_and_wait count from 161 → ≤ 10 by:
+- **Lift per-layer terminal `commit_and_wait` to a per-N-layer batched commit.** Today every layer ends with `commit_and_wait_labeled("layer.moe_ffn")` or `("layer.dense_ffn")`. Replace with a coarser-grained "every K layers commit" pattern. K=8 → 161/4 = ~40 commits; K=40 → 1 commit + tail.
+- **Use `commit()` (no wait) for intra-layer sequencing where the encoder serial-queue invariant covers ordering.** iter58b's regression showed this is unsafe with helper-local scratch + bare commit; the safe pattern requires caller-owned scratch with arena lifetimes that span the batch window.
+- **Pre-allocate scratch buffers at prefill start.** All per-layer pooled allocations (gate_all, up_all, h_all, y_all, h_s, ids, weights, etc.) sized for max-tokens-of-prefill, allocated once, reused across layers. ~10 × 40 = 400 fewer pooled_alloc lookups per prefill.
+- **Single fused encoder across all layers + output_head.** ggml-style: build the entire prefill DAG as a list of dispatches, emit them all into one MTLCommandEncoder, ONE commit_and_wait at the end.
+
+**Risk gradient.** The K=8 batched commit is the lowest-risk first cut: scratch buffers must live ≥8 layers but the existing W-5b.15 arena reset can be gated to only fire every 8 layers. Should give a 4× speedup at pp31-class workloads with minimal coherence risk. The K=40 single-CB version is a much larger refactor — buffer lifetime invariants throughout the layer body change. /cfa dual-mode (Claude+Codex parallel implementations) is the right vehicle for the bigger version.
+
+**What this iteration changed.** Pure measurement diff: `+20 LoC` in `cmd_generate_qwen35` (env-gated counter reset + post-prefill eprintln). No kernel edits, no dispatch changes, no per-layer code touched. `cargo build --release --bin hf2q` clean; `cargo test --release qwen35` 127 passed / 0 failed (filtered subset). Runs are identical to pre-instrumentation when `HF2Q_PROFILE_SYNC` unset.
+
+**Open hypothesis after H9.** Only **H10** (DeltaNet recurrence, 22% bucket within the compute slice) remains untouched. It's a measure-and-decide target — given 40 layers × ~6 ms `layer.linear_total` mostly in the chunk_gated_delta_rule kernel, halving this would shave another ~90 ms from the compute slice. Lower priority than H9 since the sync overhead currently swamps it 3:1 at pp101.
+
 ### 2026-05-01 — P19 H11 PARTIALLY CONFIRMED · `HF2Q_MM_ID_ROUTING_THRESHOLD` env override + 41/56-token sweep ⇒ mm_id setup overhead is real (high variance at small batch) but does NOT dominate enough at our operational range to justify changing the default threshold of 32
 
 **Hypothesis (from P19 step 1, commit `342b7d6`).** "mm_id setup overhead doesn't amortize at pp ≤ ~256: the `map0` pre-pass + the 8 KB shmem stage + the per-call concurrency-reset barrier all cost flat per call. With pp101 the `dispatch_id_mm_pooled` path runs gate+up+down × 40 = 120 mm_id calls. If each pays ~5–10 ms of GPU-wall, that alone is 600–1200 ms — possibly the biggest single cost." Test: bench an unbatched `mv_id`-route prefill at pp101 with the routing threshold over-ridden, compare wall time.

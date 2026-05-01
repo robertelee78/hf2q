@@ -1368,11 +1368,35 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     );
 
     tracing::info!("Qwen3.5 prefill: seq_len={}", prompt_len);
+    // ADR-013 P19 H9 (2026-05-01): empirical CB-sync attribution.  Reset
+    // mlx-native's atomic counters before prefill, read after, and print
+    // when HF2Q_PROFILE_SYNC=1 is set.  This is a measurement-only diff:
+    // SYNC_COUNT counts commit_and_wait calls/prefill, DISPATCH_COUNT
+    // counts kernel dispatches, BARRIER_COUNT counts memory_barriers.
+    // The hypothesis ("hf2q does ~120-160 commit_and_wait/prefill while
+    // llama.cpp does ~1") is TESTABLE by comparing these numbers against
+    // ggml-metal's per-graph submit pattern.  Zero overhead when env
+    // unset (RAII guard does no work).
+    let profile_sync = std::env::var("HF2Q_PROFILE_SYNC").is_ok();
+    if profile_sync {
+        mlx_native::reset_counters();
+    }
     let prefill_start = std::time::Instant::now();
     let prefill_logits = model
         .forward_gpu_last_logits(&prompt_tokens, &prefill_positions, &mut kv_cache)
         .context("Qwen35Model::forward_gpu_last_logits (prefill)")?;
     let prefill_elapsed = prefill_start.elapsed();
+    if profile_sync {
+        eprintln!(
+            "[P19 H9] prefill seq_len={} elapsed_ms={:.1} sync_count={} dispatch_count={} barrier_count={} cmd_buf_count={}",
+            prompt_len,
+            prefill_elapsed.as_secs_f64() * 1000.0,
+            mlx_native::sync_count(),
+            mlx_native::dispatch_count(),
+            mlx_native::barrier_count(),
+            mlx_native::cmd_buf_count(),
+        );
+    }
 
     // Sanity-check logits shape.
     let vocab_size = model.cfg.vocab_size;
