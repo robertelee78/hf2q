@@ -640,12 +640,26 @@ fn extract_tool_calls_from_text(
                                 );
                                 parse_failure = Some(body);
                             } else {
+                                // iter-219b (2026-05-01): scrub registered
+                                // family special-token markers from the
+                                // body before emitting as content. Without
+                                // scrubbing, a body polluted with
+                                // `<|tool_response>` / `<|channel>` etc.
+                                // (e.g. from grammar mask bypass under
+                                // NaN-logits or model-error conditions)
+                                // would leak the literal into the response
+                                // text. Mirrors the streaming path at
+                                // `engine.rs::emit_streaming_tool_call_close`'s
+                                // Auto-fallback branch.
+                                let scrubbed = registry::scrub_special_tokens(&body);
                                 tracing::warn!(
                                     body = %body,
+                                    scrubbed = %scrubbed,
                                     "non-stream tool-call body unparseable; emitting as \
-                                     content (tool_choice=auto with no active grammar)"
+                                     content (tool_choice=auto with no active grammar). \
+                                     Special-token markers scrubbed before emit."
                                 );
-                                content.push_str(&body);
+                                content.push_str(&scrubbed);
                             }
                         }
                     }
@@ -7662,6 +7676,70 @@ mod test_a3_tool_call_extraction {
             result.content.contains(bad_body),
             "Auto (no grammar) MUST re-emit the malformed body as Content; \
              got content: {:?}",
+            result.content
+        );
+    }
+
+    /// iter-219b non-streaming sibling (2026-05-01) — when Auto-policy
+    /// content fallback fires for a malformed body that contains
+    /// registered special-token markers (e.g. `<|tool_response>` from
+    /// model emit under grammar-mask bypass / NaN-logits / parse drift),
+    /// the markers MUST be scrubbed before re-emit so the response text
+    /// stays leak-free. Mirrors the streaming
+    /// `iter219b_content_fallback_does_not_leak_special_tokens` contract.
+    ///
+    /// PRE-FIX HEAD: this test FAILS — `content.push_str(&body)` emits
+    /// the body verbatim including the special-token literal.
+    /// POST-FIX (`registry::scrub_special_tokens(&body)` before push):
+    /// PASSES — markers stripped, body content preserved otherwise.
+    #[test]
+    fn iter219b_nonstream_auto_fallback_scrubs_special_tokens() {
+        let reg = gemma4_reg();
+        let (open, close) = match (reg.tool_open, reg.tool_close) {
+            (Some(o), Some(c)) => (o, c),
+            _ => return,
+        };
+        // Body shape that mirrors the iter-218 LIVE bug: stray
+        // `<|tool_response>` mid-call followed by a second `call:` prefix.
+        // `parse_gemma4_tool_call`'s `is_valid_tool_name` gate rejects this
+        // (the candidate name contains special-token bytes), so the
+        // Auto-policy content-fallback branch fires — that's the path we
+        // want to verify scrubs the body before emit.
+        let bad_body = "call:get_current<|tool_response>call:get_current_weather{location:<|\"|>Paris<|\"|>}";
+        let full_text = format!("{open}{bad_body}{close}");
+
+        let result = extract_tool_calls_from_text(
+            &full_text,
+            Some(&reg),
+            engine::ToolCallPolicy::Auto,
+        );
+
+        assert!(
+            result.tool_calls.is_empty(),
+            "polluted body must not produce a parsed tool call"
+        );
+        // Registered Gemma 4 leak markers MUST NOT appear in content
+        // (mirrors `tests/openwebui_multiturn.rs` LEAK_MARKERS gate).
+        for marker in &[
+            "<|channel>", "<channel|>",
+            "<|tool_call>", "<tool_call|>",
+            "<|tool_response>", "<tool_response|>",
+            "<|turn>", "<turn|>",
+        ] {
+            assert!(
+                !result.content.contains(marker),
+                "iter-219b non-stream content must not contain registered \
+                 special-token marker {marker:?}; got content: {:?}",
+                result.content
+            );
+        }
+        // The scrubbed payload should still carry the structural content
+        // bytes minus the markers (so the operator can see roughly what
+        // the model intended).
+        assert!(
+            result.content.contains("call:get_current_weather"),
+            "scrubbed content should retain the legitimate body bytes; \
+             got: {:?}",
             result.content
         );
     }
