@@ -1641,6 +1641,10 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
     >> = if let Some(cache_dir) = args.kv_persist_path.as_ref() {
         use std::path::PathBuf;
         use std::sync::{Arc, Mutex};
+        use crate::serve::kv_persist::families::gemma4_dense::{
+            Gemma4DenseConfig, Gemma4DenseSpillFactory,
+        };
+        use crate::serve::kv_persist::registry::FamilyHookFactory;
         use crate::serve::kv_persist::{
             recover_from_disk, AsyncWriterHandle, BlockPrefixCacheSpiller, DiskBlockStore,
             KvPersistRegistry, LoaderWrapper, StubGemma4Spill, DEFAULT_CHANNEL_CAPACITY,
@@ -1730,7 +1734,7 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             // Keys: derive a synthetic (repo, quant) the same way
             // the pre-warm path will (so the spiller's lookup hits
             // when load_or_get fires). Phase D's GGUF-derived
-            // (repo, quant) lands when B-dense.2 lands.
+            // (repo, quant) lands later.
             let pool_repo = pool_key_for_path(&PathBuf::from(model_arg));
             let pool_quant = quant_select::QuantType::Q4_K_M;
             spiller.register_family(pool_repo.clone(), pool_quant, stub_for_spiller);
@@ -1739,6 +1743,57 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
                 repo = %pool_repo,
                 quant = %pool_quant.as_str(),
                 "ADR-017 C.1: registered StubGemma4Spill for operator --model"
+            );
+
+            // ADR-017 B-dense.2 — register a Gemma4DenseSpillFactory
+            // alongside the C.1 stub. On the first successful engine
+            // load delivering an `Arc<EngineHandle>` (the production
+            // path drives this from a separate post-load bind in
+            // cmd_serve, not the auto-LoaderWrapper-bind path), the
+            // registry's `try_substitute_on_load` will materialize a
+            // real Gemma4DenseSpill and atomically substitute BOTH
+            // the spiller's family hook AND the registry's bindable
+            // hook. Until that fires, the C.1 stub remains the
+            // active hook (Skipped on every snapshot/restore).
+            //
+            // The shape config wired here is a *placeholder* for
+            // B-dense.2's harness scope: the real GGUF-derived shape
+            // landing extracts from the loaded `MlxModelWeights`
+            // (LayerSpec / DenseKvBuffers / sliding_window) and
+            // requires plumbing through the `cmd_serve` post-load
+            // path. The factory itself is fully shape-parametric;
+            // only the data fed to its constructor is placeholder.
+            //
+            // The matrix harness in `tests/kv_persist_gemma4_roundtrip.rs`
+            // exercises the seam end-to-end via subprocess + real
+            // GGUF.
+            let placeholder_cfg = Gemma4DenseConfig {
+                // Two layers — one Sliding, one Full — minimum that
+                // exercises both layer-type branches in the spill's
+                // capacity_for_layer / alloc_layer paths. The real
+                // Gemma 4 26B has 64 layers (48 sliding + 16
+                // full-attention); this placeholder is *correct
+                // shape* but not *correct length* — the real-shape
+                // wiring is a follow-up plumbing task that pulls
+                // from MlxModelWeights post-load.
+                layer_types: vec![
+                    crate::serve::config::LayerType::Sliding,
+                    crate::serve::config::LayerType::Full,
+                ],
+                nkv_heads: vec![8, 2],
+                head_dim: vec![256, 512],
+                kv_dtype: mlx_native::DType::F32,
+                sliding_window: 4096,
+                max_decode_tokens: 8192,
+            };
+            let factory: Arc<dyn FamilyHookFactory> =
+                Arc::new(Gemma4DenseSpillFactory::new(placeholder_cfg));
+            registry.register_factory(pool_repo.clone(), pool_quant, factory);
+            tracing::info!(
+                repo = %pool_repo,
+                quant = %pool_quant.as_str(),
+                "ADR-017 B-dense.2: registered Gemma4DenseSpillFactory \
+                 (lazy real-hook construction at first engine load)"
             );
         }
 
@@ -1751,6 +1806,14 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             dyn crate::serve::multi_model::ModelLoader<api::engine::Engine>,
         > = Arc::new(DefaultModelLoader);
         let wrapper = Arc::new(LoaderWrapper::new(real_loader, Arc::clone(&registry)));
+        // ADR-017 B-dense.2 — wire the spiller into the wrapper so a
+        // successful factory substitution updates both the registry
+        // (handled inside try_substitute_on_load) AND the spiller's
+        // register_family table (handled in
+        // LoaderWrapper::update_spiller_registration). Order
+        // matters: set_spiller MUST be called before any load_or_get
+        // arms a pending_bind.
+        wrapper.set_spiller(Arc::clone(&spiller));
         let loader_for_manager: Arc<
             dyn crate::serve::multi_model::ModelLoader<api::engine::Engine>,
         > = wrapper.clone();
