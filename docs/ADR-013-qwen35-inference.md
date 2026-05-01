@@ -1059,6 +1059,33 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-05-01 — P16 · Q4_K mat-mat-id (mm_id) Metal kernel — 6× Q4_K prefill speedup, decode parity vs llama.cpp
+
+**Problem.** P15 left Q4_K dispatch stuck on `mv_id` even at prefill batches > 8 tokens (Q4_K was excluded from the `mm_id` route in `src/ops/quantized_matmul_id_ggml.rs` because `kernel_mul_mm_id_q4_K_f32` did not exist). Same-day llama-bench numbers (`b8680-15f786e65`, dwq48 GGUF on M5 Max): hf2q `pp31`=12 t/s vs llama 671 t/s; `pp101`=9 t/s vs llama 1703 t/s; gap of 30–56× and growing with prompt length.
+
+**mlx-native `6794845`.** Ports llama.cpp's `kernel_mul_mm_id_q4_K_f32` template (`ggml-metal.metal:10169`) and `kernel_mul_mm_id_q4_K_tensor_f32` (M3+ tensor-API variant) into the existing `hf2q_mul_mm_id_impl<block_q, nl, dequantize_func>` template machinery. Adds `block_q4_K` typedef + `K_SCALE_SIZE=12` define, the `get_scale_min_k4_just2` helper (port of `:675`), and `dequantize_q4_K` template (port of `:681`). Two template instantiations: `kernel_mul_mm_id_q4_K_f32` and `kernel_mul_mm_id_q4_K_tensor_f32`. Dispatch wired in `src/ops/quantized_matmul_id_ggml.rs` (Q4_K added to `id_mm_kernel_name` + tensor variant; removed from mm_id-route exclusion in `quantized_matmul_id_ggml` and `_pooled`; added to `dispatch_id_mm_for_test`'s accepted-type list). Both kernels registered in `src/kernel_registry.rs`.
+
+**Tests.** Three new Q4_K mm_id parity tests in `tests/test_q4_k_kernels.rs`: `q4k_mmid_16tok_8experts_top8_k512`, `q4k_mmid_64tok_4experts_top1_k1024`, `q4k_mmid_32tok_16experts_top8_k2048` (production shape `hidden_size=2048` × `moe_intermediate_size=512`). Full Q4_K suite: **15/15 PASS** (was 12/12).
+
+**End-gate (M5 Max, dwq48, llama-bench `b8680-15f786e65`, 3 reps).**
+
+| | hf2q P15 | hf2q P16 | llama.cpp | hf2q P16 ratio |
+|---|---|---|---|---|
+| pp31  | 12 t/s | 12 t/s   | 671.4 ± 2.6 t/s   | 0.018× (56× slower) |
+| pp101 |  9 t/s | **56 t/s** | 1702.9 ± 27.1 t/s | 0.033× (30× slower) |
+| tg200 | 105 t/s | 119 t/s | 116.7 ± 0.15 t/s | **1.02× faster** ✓ |
+
+Coherence verified end-to-end (bread recipe + transformer-attention explanation prompts, both produce structured English with `<think>` reasoning blocks). At `pp101` mm_id delivers a **6× prefill speedup** (9 → 56 t/s). At `pp31` the gap is unchanged because n_tokens=31 is below the regime where mm_id's tile-reuse pays for its setup overhead. **Decode (tg200) reaches 1.02× parity with llama.cpp same-day** — P15 + P16 + the parallel `70b31d3` tokenizer fix compose to a coherent, decode-parity Q4_K MoE inference path.
+
+**Methodology correction (`feedback_peer_crosscheck_before_perf_bisect`).** Earlier P15 entry's bench (514 t/s prompt / 174 t/s gen) came from `llama-cli` interactive-mode timing, which mixes setup overhead with kernel timing. Re-measured with `llama-bench -p N -n M -r 3 -o md` (the canonical clean-bench tool — confirmed via goalie research + `llama-bench --help`); numbers above supersede the prior bench.
+
+**Remaining gap (P17 candidate).** Even after P16, llama.cpp prefills Q4_K at 30× hf2q's rate. Hypotheses to test before changing code:
+- H1: llama.cpp's mm tile geometry (NK / NR / threadgroup-shape) for the `b8680` build differs from our `hf2q_mul_mm_id_impl`. Read both side-by-side.
+- H2: llama.cpp's `dispatch_metal_op_mul_mat_id` does additional batching/coalescing across the routed-token list that our `dispatch_id_mm_pooled` doesn't.
+- H3: tensor-API variant only kicks in via `TENSOR_MM_ID_AVAILABLE` probe; if the probe fails on M5 Max for this kernel, we silently fall back to the slower simdgroup path. Verify with explicit log.
+
+Per `feedback_evidence_first_no_blind_kernel_rewrites`: do NOT touch tile geometry without trace proof. Build the matrix harness first.
+
 ### 2026-05-01 — Q4_K MoE expert-quant unblocked dwq48 GGUF (CFA dual: claude winner)
 
 **Problem.** `qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq48.gguf` failed at load with `load_moe_ffn_quantized layer 0: gate/up expert weights have unsupported quant type Q4_K`. mlx-native lacked Q4_K Metal kernels (Q4_K was registered in `GgmlType` enum + had a host-side `dequantize_q4_k` for one-time F32 dequant, but the MoE expert hot path needs GPU mat-vec-id which was `"unsupported"` in the dispatcher).
