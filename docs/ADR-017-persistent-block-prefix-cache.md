@@ -1543,6 +1543,218 @@ boundary.
 
 **Cumulative ADR-017 LOC after follow-up:** 9,721 LOC + ~2,160 LOC (250+1+1080+750+80) = **~11,881 LOC** in-tree substrate.
 
+### Phase D LANDED (scaffolding) (2026-04-30)
+
+Phase D scaffolding ships the harness + operator recipe for the
+coherence + perf validation matrix. The actual MEASUREMENT RUN is
+operator-controlled (cold M5 Max + Gemma4-26B Q4_0 GGUF +
+mcp-brain-server SIGSTOP'd) post-merge; the CFA worker delivered
+scaffolding ONLY per spec §Out-of-scope.
+
+**TESTS-AND-SCRIPTS ONLY — zero `src/` edits.** The scaffolding
+exclusively touches `tests/kv_persist_gemma4_roundtrip.rs`,
+`scripts/adr017_phase_d.sh`, and this ADR document.
+
+**`tests/kv_persist_gemma4_roundtrip.rs::run_cell_e2e` wired** —
+previous B-dense.2 stub (`Err("substrate-only post-merge run")`) is
+replaced with the real subprocess round-trip. Per cell, the runner:
+
+1. spawns `hf2q serve --model PATH --kv-persist=DIR` with
+   `HF2Q_USE_DENSE=1` in env (R-C4 byte-exact requires dense; TQ is
+   lossy by design)
+2. waits for `/readyz`
+3. fetches canonical model id from `/v1/models`
+4. issues a streaming completion against a token-diverse `wordN`
+   prompt sized to the cell's prefix-length; captures `baseline.text`
+5. for `EvictReadmit` / `Restart` scenarios: forces a pool eviction
+   via the symlink-distinct-pool-key trick (sibling `config.json` /
+   `tokenizer*.json` / `generation_config.json` + mmproj GGUF
+   symlinked into the tempdir so `cmd_serve` resolves the cloned
+   path)
+6. issues a second streaming completion against the SAME prompt;
+   captures `restored.text`
+7. asserts `baseline.text == restored.text` byte-for-byte; surfaces
+   first byte-diff offset on FAIL
+
+`ColdLoad` cells exercise step 4 only and assert non-empty decode
+(sanity).
+
+**Self-contained `phase_d_driver` module (~470 LOC)** — mirrors the
+pattern from `kv_persist_harness::subprocess_driver` (RAII
+`ServerGuard`, `/readyz` poll, SSE first-content-delta TTFT capture,
+symlink-pool-key eviction trigger) but adds `--kv-persist=DIR` to the
+spawn args and `HF2Q_USE_DENSE=1` to the child env. Self-contained
+because each `tests/*.rs` is its own integration-test crate; pulling
+the existing driver in via `#[path]`-include would re-import the full
+600-cell matrix substrate redundantly. The Phase D driver also
+returns the FULL captured text (`DecodeCapture.text`) so the R-C4
+byte-equality assertion has a real bytestream to compare, not just a
+TTFT scalar.
+
+**New env-gated test `kv_persist_phase_d_coherence_e2e`** (R-C4):
+
+* Gated on `HF2Q_KV_PERSIST_PHASE_D=1` + non-empty
+  `HF2Q_KV_PERSIST_E2E_MODEL_PATH`. Without the gate, `cargo test`
+  short-circuits cleanly with a diagnostic — no synthesized ship
+  gates per `feedback_substrate_must_not_synthesize_ship_gates`.
+* Drives the canonical sourdough fixture
+  (`scripts/sourdough_gate.sh`'s 22-token user prompt — load-bearing
+  typo "Complrehensive" preserved; `T=0` greedy; `max_tokens=1000`).
+* Captures hf2q never-evicted output A; forces evict-readmit cycle;
+  captures hf2q evicted+restored output B. Asserts A == B
+  byte-identical (R-C4 internal coherence; Hypothesis 2 + 3 falsifier).
+* **Optional peer arm** (env-gated by
+  `HF2Q_KV_PERSIST_PHASE_D_PEER=1`): renders the chat template via
+  `hf2q generate --max-tokens 1` (`HF2Q_DUMP_RENDERED_PROMPT`),
+  BOS-strips the literal `<bos>` prefix, runs `llama-completion`
+  on the rendered prompt at `T=0 --seed 42 --predict 1000`, asserts
+  both A and B share at least 3094 leading bytes with llama's
+  output. Mirrors `scripts/sourdough_gate.sh::MIN_COMMON_PREFIX`.
+* `llama-completion` binary resolved via
+  `HF2Q_KV_PERSIST_PHASE_D_LLAMA_BIN` env override → `which
+  llama-completion` → `/opt/llama.cpp/build/bin/llama-completion`,
+  matching `sourdough_gate.sh`'s precedence.
+
+**New env-gated test `kv_persist_phase_d_r_p4_e2e`** (R-P4):
+
+* Gated on `HF2Q_KV_PERSIST_PHASE_D=1` +
+  `HF2Q_KV_PERSIST_E2E_PREFILL_LEN=N` (spec calls for N=32768 on the
+  cold M5 Max + Gemma4-26B Q4_0 cell).
+* Spawns `hf2q serve --kv-persist=DIR`, prefills N tokens
+  (`wordN` token-diverse construction; ≈3.8 tokens/word under Gemma 4
+  BPE), measures `no_cache_ttft_ms` (cold prefill, primes the on-disk
+  block cache).
+* Forces eviction via symlink-distinct-pool-key (drops the in-RAM
+  KV state).
+* Prefills the SAME prompt; measures `cache_hit_ttft_ms` (the cache
+  is now repopulated from the on-disk persistence layer).
+* Computes `ratio = cache_hit_ttft_ms / no_cache_ttft_ms`; asserts
+  `ratio <= 0.20` (R-P4 ship-gate). Emits diagnostic line
+  `[R-P4] PASS — ratio=X.XXX (no_cache=Yms cache_hit=Zms)`.
+
+**3 new always-on shape tests** (run in default `cargo test`,
+substrate-only — no spawn / no model required):
+
+* `phase_d_driver_rejects_missing_model_cleanly` — `spawn_*` returns
+  `DriverError::SpawnFailed` (not panic) when given a non-existent
+  GGUF path. Falsifier: panic instead of Err.
+* `phase_d_env_gates_are_well_formed` — round-trip set/get
+  consistency for all 4 Phase D env vars
+  (`HF2Q_KV_PERSIST_PHASE_D`, `HF2Q_KV_PERSIST_PHASE_D_PEER`,
+  `HF2Q_KV_PERSIST_E2E_PREFILL_LEN`,
+  `HF2Q_KV_PERSIST_PHASE_D_LLAMA_BIN`).
+* `phase_d_sourdough_constants_match_shell_gate` — drift detector
+  asserting `SOURDOUGH_PROMPT` literal +
+  `SOURDOUGH_MAX_TOKENS=1000` + `SOURDOUGH_MIN_COMMON_PREFIX=3094`
+  match `scripts/sourdough_gate.sh` byte-for-byte. Falsifier: any
+  drift between Phase D test and shell gate.
+
+**Operator recipe `scripts/adr017_phase_d.sh`** (~175 LOC bash):
+
+* Pre-bench process audit (refuses if `mcp-brain-server` /
+  `llama-server` / `llama-cli` / `ollama` running, per
+  `feedback_bench_process_audit`; `--skip-process-audit` bypass for
+  explicit risk acceptance).
+* RAM check via `vm_stat | head -5` (per
+  `feedback_check_ram_before_inference`).
+* Sets `HF2Q_KV_PERSIST_E2E=1` + `HF2Q_KV_PERSIST_PHASE_D=1` +
+  `HF2Q_USE_DENSE=1` + `HF2Q_KV_PERSIST_E2E_MODEL_PATH` +
+  `HF2Q_KV_PERSIST_E2E_PREFILL_LEN` (default 32768) +
+  optional `HF2Q_KV_PERSIST_PHASE_D_PEER=1` (with `--peer` flag).
+* Runs `cargo test --release --test kv_persist_gemma4_roundtrip
+  -- --test-threads=1 --nocapture`.
+* Exit codes: `0` PASS / `1` usage / `2` test-fail / `3`
+  prereq-missing.
+
+`shellcheck` clean. `bash -n` syntax-clean.
+
+**Discipline locked in:**
+
+- TESTS-AND-SCRIPTS ONLY. Zero edits to `src/serve/multi_model.rs`,
+  `forward_mlx.rs`, `forward_prefill.rs`, `src/serve/api/*`,
+  `src/inference/models/qwen35/*`, `mlx-native/`, `gpu_*.rs`.
+  Zero edits to ANY `src/` file. The Phase D wire-up exists entirely
+  in `tests/kv_persist_gemma4_roundtrip.rs` +
+  `scripts/adr017_phase_d.sh`.
+- Phase D tests gate on `HF2Q_KV_PERSIST_PHASE_D=1` and
+  short-circuit cleanly when env unset. Default `cargo test --release
+  --test kv_persist_gemma4_roundtrip` runs only the existing 7
+  always-on tests + the 3 new always-on shape tests = 10 PASS.
+- Real I/O round-trip per
+  `feedback_substrate_must_not_synthesize_ship_gates`: every Phase D
+  test path spawns a real `hf2q serve` subprocess, sends real
+  `/v1/chat/completions` requests over real TCP, parses real SSE
+  streams, captures real `text/event-stream` content bytes. No
+  synthesized constants asserted against ship gates.
+- "man-day" used; "person-day" does not appear (regression-checked).
+- No `// TODO` / `todo!()` / `unimplemented!()` / `panic!()` outside
+  `#[cfg(test)]`. Test-side `panic!`s are diagnostic-only on R-C4
+  byte-diff and R-P4 ratio overshoot.
+- Worktree discipline: solo Claude session in
+  `.cfa-worktrees/adr017-phase-d-claude`, ABSOLUTE PATHS in every
+  shell command (no `cd /opt/hf2q`).
+
+**What the operator does post-merge:**
+
+```bash
+# 1. cold M5 Max — 1+ min idle since previous run
+# 2. SIGSTOP mcp-brain-server (or stop it entirely)
+# 3. cargo build --release
+# 4. ./scripts/adr017_phase_d.sh             # default cell + no peer arm
+#    ./scripts/adr017_phase_d.sh --peer      # +llama-completion peer arm
+```
+
+Expected outcomes (per A0.2b's substrate-mode predictions):
+
+* R-C4 internal: `baseline.text == restored.text` byte-identical.
+* R-C4 peer: both arms share `>= 3094` bytes with llama-completion.
+* R-P4: `cache_hit_ttft / no_cache_ttft <= 0.20` at L=32K
+  (A0.2b prediction = 0.009 → 22× margin).
+
+**Hypotheses (per spec §Mantra):**
+
+* **H1 (testable, R-C4 internal):** With `--kv-persist=PATH` +
+  `HF2Q_USE_DENSE=1`, hf2q's evicted+restored decode output is
+  byte-identical to never-evicted decode for the sourdough prompt
+  (T=0 greedy, 1000 tokens). Falsifier: any byte-diff in the
+  decoded text. Test:
+  `kv_persist_phase_d_coherence_e2e` (asserts byte-equality;
+  test panics with offset+snippets on diff).
+* **H2 (testable, R-C4 peer):** Both never-evicted hf2q and
+  evicted+restored hf2q share `>= 3094` bytes common prefix with
+  llama.cpp on the same GGUF + prompt. Falsifier: common prefix
+  `< 3094` bytes. Test: peer arm of
+  `kv_persist_phase_d_coherence_e2e` (`HF2Q_KV_PERSIST_PHASE_D_PEER=1`).
+* **H3 (testable, R-P4):** At L=32K, `cache_hit_ttft /
+  no_cache_ttft <= 0.20` on Gemma4-26B Q4_0 cold M5 Max.
+  Falsifier: ratio `> 0.20`. Test: `kv_persist_phase_d_r_p4_e2e`.
+
+**Surface delta:**
+
+| File | Δ | What |
+|---|---|---|
+| `tests/kv_persist_gemma4_roundtrip.rs` | +1334 LOC | Phase D env-gate constants, `phase_d_driver` mod (~470 LOC: spawn-with-kv-persist, /readyz poll, canonical-id fetch, full-text SSE capture, symlink eviction, llama-completion peer runner), `run_cell_e2e` wired to subprocess driver, 2 env-gated Phase D tests (`coherence_e2e` + `r_p4_e2e`), 3 always-on shape tests. |
+| `scripts/adr017_phase_d.sh` | NEW 175 LOC | Operator recipe (pre-bench audit + env wire-up + cargo test invocation). |
+| `docs/ADR-017-persistent-block-prefix-cache.md` | this subsection | "Phase D LANDED (scaffolding)" entry. |
+
+**Cumulative ADR-017 LOC after Phase D scaffolding:** ~11,881 LOC +
+~1,510 LOC (1334 test + 175 script) = **~13,391 LOC** in-tree
+substrate. **Test totals:** in-binary `kv_persist::*` 111 PASS (no
+regression), `kv_persist_writer_kill_minus_9` 1 PASS, harness 36
+PASS, gemma4_roundtrip 7 always-on prior + 3 new always-on shape =
+10 PASS by default; Phase D env-gated tests (`coherence_e2e` +
+`r_p4_e2e`) run only under operator-controlled env.
+
+**What's still gating Phase D closure (operator-side):**
+
+- Real cold-M5-Max measurement run via `scripts/adr017_phase_d.sh`
+  on the canonical Gemma 4 26B Q4_0 GGUF.
+- Per-quant follow-up runs (Q4_K_M / Q6_K / Q8_0) once the Q4_0
+  cell PASSes — production matrix sweeps the runnable subset.
+
+The CFA worker's contract is complete: scaffolding LANDED; the
+matrix RUN is the operator-controlled follow-up.
+
 ---
 
 ## Open Questions
