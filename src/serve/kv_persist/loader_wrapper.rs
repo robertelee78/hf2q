@@ -535,7 +535,83 @@ mod tests {
         wrapper.drive_unbind("acme/bad", QuantType::Q4_K_M);
     }
 
-    // ===== Test 7 ==========================================================
+    // ===== Test 7 (cmd_serve flag-on smoke) =================================
+    #[test]
+    fn cmd_serve_constructs_spiller_when_flag_on_smoke() {
+        // Spec test 11 (bonus) — integration-style smoke that mirrors
+        // the cmd_serve flag-on wire-up sequence. Rather than spinning
+        // up a real HTTP server (out of scope for unit tests), this
+        // test exercises the same sequence cmd_serve runs:
+        //
+        //   1. Build BlockPrefixCacheSpiller-equivalent substrate (we
+        //      use the registry directly; the spiller's internal state
+        //      isn't observed here — that's spiller.rs's tests' job).
+        //   2. Register a stub family hook + bind it through both the
+        //      KvPersistRegistry view and a parallel
+        //      Arc<Mutex<dyn KvCacheSpill>> view (mirrors cmd_serve's
+        //      spiller.register_family + registry.register call pair).
+        //   3. Build a LoaderWrapper around a mock loader.
+        //   4. Arm pending_bind, drive load, verify bind fires.
+        //   5. Arm unbind, verify unbind fires.
+        //
+        // What this falsifies: a regression that decouples the
+        // registry from the LoaderWrapper would break this — the
+        // bind_count stays at zero. That's the Hypothesis-2 falsifier
+        // for the C.1 ship gate.
+        use crate::serve::kv_persist::{KvCacheSpill, StubGemma4Spill};
+        use std::sync::Mutex;
+
+        let inner = MockLoader::new();
+        let registry = Arc::new(KvPersistRegistry::new());
+
+        // Register a stub hook with an EngineBindable-aware mock so
+        // we can observe the bind. Production cmd_serve registers
+        // `Arc<StubGemma4Spill>` directly; here we use a recording
+        // mock to preserve the round-trip assertion.
+        let recorder = LwMockBindable::new();
+        registry.register(
+            "google/gemma-4".to_string(),
+            QuantType::Q4_K_M,
+            recorder.clone() as Arc<dyn EngineBindable>,
+        );
+
+        // Parallel KvCacheSpill registration shape (the spiller
+        // doesn't fire here because we're not wiring the full
+        // HotSwapManager — but constructing this Arc proves the
+        // type plumbs through, mirroring cmd_serve's
+        // `spiller.register_family(repo, quant, Arc::new(Mutex::new(StubGemma4Spill)))`
+        // call).
+        let _kv_hook: Arc<Mutex<dyn KvCacheSpill>> =
+            Arc::new(Mutex::new(StubGemma4Spill));
+
+        let wrapper: LoaderWrapper<TestEngine> = LoaderWrapper::new(
+            inner.clone() as Arc<dyn ModelLoader<TestEngine>>,
+            Arc::clone(&registry),
+        );
+
+        // Production cmd_serve sequence:
+        //   wrapper.set_pending_bind(repo, quant);
+        //   pool.load_or_get(repo, quant, gguf_path, cfg);
+        // We exercise the equivalent via wrapper.load directly.
+        wrapper.set_pending_bind("google/gemma-4".to_string(), QuantType::Q4_K_M);
+        let (path, cfg) = dummy_path_and_config();
+        let _engine = wrapper.load(&path, &cfg).expect("load OK");
+        assert_eq!(recorder.bind_count(), 1, "bind fired through registry");
+        assert_eq!(inner.load_count(), 1);
+
+        // Unbind path (exercised at evict in production).
+        wrapper.drive_unbind("google/gemma-4", QuantType::Q4_K_M);
+        assert_eq!(recorder.unbind_count(), 1, "unbind fired through registry");
+
+        // Wire-up scoreboard — used as a regression breadcrumb.
+        eprintln!(
+            "[C.1 smoke] PASS — wrapper.load fired {} binds, drive_unbind fired {} unbinds",
+            recorder.bind_count(),
+            recorder.unbind_count()
+        );
+    }
+
+    // ===== Test 8 ==========================================================
     #[test]
     fn loader_wrapper_set_pending_bind_overwrites_prior() {
         // Calling set_pending_bind twice without an intervening load

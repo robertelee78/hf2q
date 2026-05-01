@@ -1623,6 +1623,163 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         default_model_arg.clone(),
     )?;
 
+    // --- ADR-017 Phase C.1 — optional persistent block-prefix KV cache ---
+    // When `--kv-persist=PATH` is set, replace the AppState's
+    // NoopKvSpiller-backed HotSwapManager with one wired to the
+    // Phase A-substrate (DiskBlockStore + AsyncWriterHandle +
+    // BlockPrefixCacheSpiller) and a per-loaded-family
+    // EngineBindable registry. Off-path (flag absent) is byte-
+    // identical to pre-C.1 — the existing AppState manager stays
+    // wired with NoopKvSpiller.
+    //
+    // The substrate variables outlive the cmd_serve scope via Arc
+    // captures inside the new HotSwapManager. The recovery scan
+    // runs synchronously here so a previously-written cache becomes
+    // available before the optional pre-warm load_or_get fires.
+    let kv_persist_loader_wrapper: Option<std::sync::Arc<
+        crate::serve::kv_persist::LoaderWrapper<api::engine::Engine>,
+    >> = if let Some(cache_dir) = args.kv_persist_path.as_ref() {
+        use std::path::PathBuf;
+        use std::sync::{Arc, Mutex};
+        use crate::serve::kv_persist::{
+            recover_from_disk, AsyncWriterHandle, BlockPrefixCacheSpiller, DiskBlockStore,
+            KvPersistRegistry, LoaderWrapper, StubGemma4Spill, DEFAULT_CHANNEL_CAPACITY,
+        };
+        use crate::serve::multi_model::{DefaultModelLoader, HotSwapManager, LoadedPool};
+
+        // 1. Ensure cache_dir exists.
+        std::fs::create_dir_all(cache_dir).with_context(|| {
+            format!(
+                "ADR-017 C.1: create kv-persist cache dir at {}",
+                cache_dir.display()
+            )
+        })?;
+
+        // 2. Recovery scan — rebuild BlockIndex from on-disk
+        //    envelopes left by a prior run. Returns
+        //    `(BlockIndex, RecoveryReport)` per recovery.rs:110.
+        let (recovered_index, recovery_report) =
+            recover_from_disk(cache_dir).with_context(|| {
+                format!(
+                    "ADR-017 C.1: recover_from_disk({})",
+                    cache_dir.display()
+                )
+            })?;
+        tracing::info!(
+            cache_dir = %cache_dir.display(),
+            blocks_indexed = recovery_report.blocks_indexed,
+            blocks_quarantined = recovery_report.blocks_quarantined,
+            bytes_indexed = recovery_report.bytes_indexed,
+            elapsed_ms = recovery_report.elapsed_ms,
+            "ADR-017 C.1: kv-persist recovery scan complete"
+        );
+
+        // 3. DiskBlockStore — owns the read-path file I/O. The
+        //    `budget_bytes = 0` argument disables the on-disk LRU
+        //    budget (unbounded growth — Phase D wires the budget
+        //    against `HF2Q_KV_PERSIST_BUDGET_BYTES`).
+        let store = Arc::new(
+            DiskBlockStore::new_with_index(cache_dir.clone(), recovered_index, 0)
+                .with_context(|| {
+                    format!(
+                        "ADR-017 C.1: DiskBlockStore::new_with_index({})",
+                        cache_dir.display()
+                    )
+                })?,
+        );
+
+        // 4. AsyncWriterHandle — owns the write-path background
+        //    worker. DEFAULT_CHANNEL_CAPACITY is the iter-212
+        //    contract default; a future Phase D iter exposes it via
+        //    a CLI knob.
+        let writer = Arc::new(AsyncWriterHandle::spawn(
+            Arc::clone(&store),
+            DEFAULT_CHANNEL_CAPACITY,
+        ));
+
+        // 5. BlockPrefixCacheSpiller — owns the lifecycle. Per-
+        //    family hooks register below.
+        let spiller: Arc<BlockPrefixCacheSpiller<api::engine::Engine>> =
+            Arc::new(BlockPrefixCacheSpiller::new(
+                Arc::clone(&store),
+                Arc::clone(&writer),
+            ));
+
+        // 6. KvPersistRegistry — the Phase C.1 EngineBindable
+        //    registry. Populated once per known family below.
+        let registry = Arc::new(KvPersistRegistry::new());
+
+        // 7. Stub-family registration: register `StubGemma4Spill`
+        //    for the operator-supplied --model (if any). The stub
+        //    returns Skipped on every snapshot/restore call (per
+        //    spiller.rs:506-528) and a no-op on bind/unbind (per
+        //    the spiller.rs EngineBindable impl), so the on-path
+        //    is observable but functionally inert.
+        //
+        //    B-dense.2 swaps `StubGemma4Spill` for the real
+        //    `Gemma4DenseSpill` once the GGUF metadata extraction
+        //    + EngineHandle construction lands.
+        if let Some(model_arg) = default_model_arg.as_deref() {
+            let stub = Arc::new(StubGemma4Spill);
+            let stub_for_spiller: Arc<
+                Mutex<dyn crate::serve::kv_persist::KvCacheSpill>,
+            > = Arc::new(Mutex::new(StubGemma4Spill));
+            let stub_for_registry: Arc<
+                dyn crate::serve::kv_persist::EngineBindable,
+            > = stub.clone();
+            // Keys: derive a synthetic (repo, quant) the same way
+            // the pre-warm path will (so the spiller's lookup hits
+            // when load_or_get fires). Phase D's GGUF-derived
+            // (repo, quant) lands when B-dense.2 lands.
+            let pool_repo = pool_key_for_path(&PathBuf::from(model_arg));
+            let pool_quant = quant_select::QuantType::Q4_K_M;
+            spiller.register_family(pool_repo.clone(), pool_quant, stub_for_spiller);
+            registry.register(pool_repo.clone(), pool_quant, stub_for_registry);
+            tracing::info!(
+                repo = %pool_repo,
+                quant = %pool_quant.as_str(),
+                "ADR-017 C.1: registered StubGemma4Spill for operator --model"
+            );
+        }
+
+        // 8. LoaderWrapper — decorates DefaultModelLoader. The
+        //    wrapper's pending_bind slot is armed below, immediately
+        //    before the pre-warm load_or_get call (per the
+        //    synchronous-contract rationale in
+        //    loader_wrapper.rs's module docs).
+        let real_loader: Arc<
+            dyn crate::serve::multi_model::ModelLoader<api::engine::Engine>,
+        > = Arc::new(DefaultModelLoader);
+        let wrapper = Arc::new(LoaderWrapper::new(real_loader, Arc::clone(&registry)));
+        let loader_for_manager: Arc<
+            dyn crate::serve::multi_model::ModelLoader<api::engine::Engine>,
+        > = wrapper.clone();
+
+        // 9. Build a fresh HotSwapManager using new_with_spiller and
+        //    swap state.pool to point at it. Re-derive the pool +
+        //    counters the same way AppState::new_for_serve did so
+        //    behavior diverges from the off-path ONLY in the
+        //    spiller wiring.
+        let pool = LoadedPool::from_hardware(state.hardware.as_ref());
+        let mut manager: HotSwapManager<api::engine::Engine> =
+            HotSwapManager::new_with_spiller(
+                pool,
+                loader_for_manager,
+                spiller as Arc<dyn crate::serve::multi_model::KvSpiller<api::engine::Engine>>,
+            );
+        manager.set_kv_counters(Arc::clone(&state.kv_spill_counters));
+        state.pool = Arc::new(std::sync::RwLock::new(manager));
+
+        tracing::info!(
+            cache_dir = %cache_dir.display(),
+            "ADR-017 C.1: kv-persist spiller substrate wired into HotSwapManager"
+        );
+
+        Some(wrapper)
+    } else {
+        None
+    };
+
     // --- Optional pre-warm (--model supplied) ---
     // ADR-005 Phase 4 iter-208 (W76): the load path flows through the
     // shared `load_engine` callable via `HotSwapManager::load_or_get`,
@@ -1679,6 +1836,13 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             queue_capacity: config.queue_capacity,
             warmup_synchronously: true,
         };
+        // ADR-017 C.1: arm the LoaderWrapper's pending_bind slot for
+        // the about-to-fire load_or_get. Synchronous contract — see
+        // loader_wrapper.rs's module docs.
+        if let Some(wrapper) = kv_persist_loader_wrapper.as_ref() {
+            wrapper.set_pending_bind(pool_repo.clone(), pool_quant);
+        }
+
         let mut pool_guard = state
             .pool
             .write()
