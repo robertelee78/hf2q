@@ -1059,6 +1059,79 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-05-01 — P17b + P18 · clean Q4_K dwq48 bench (3-rep cold-process) + side-by-side kernel audit ⇒ kernel hypotheses H1–H4 falsified, gap lives in MoE FFN wrapper
+
+**Why this entry exists.** P17 was retracted (commit `c5dbc99`) because its perf claims came from single-run bench under concurrent ML-process contention. The retraction documented the *standing rule* — 3+ cold-process invocations, pre-bench `ps`/RSS audit, median + min/max range, same-day llama-bench under same conditions, coherence-check — but left "actual hf2q-vs-llama perf delta on Q4_K dwq48" explicitly UNKNOWN. P17b is the standing-rule-compliant remediation; P18 is the root-cause-direction it points to.
+
+**Harness.** `scripts/p17b_q4k_bench.sh` (new file, ~280 LoC). Pre-flight refuses to bench if any peer ML/build process is active (`ps` audit greps for cargo, rustc, cc/clang, hf2q, llama-cli/llama-bench/llama-completion, mlx_lm, ollama, lmstudio, vllm); warns on `< 30 GB` free+inactive memory. Per-cell loop runs `REPS` cold processes of hf2q + llama-completion + llama-bench against the same GGUF, parses tok/s from each tool's stderr (or CSV for llama-bench), reports median + min/max per cell to a markdown summary. Runs an end-of-bench coherence check on a fixed prompt.
+
+**llama-cli is interactive-only on b8807+.** First wave used `llama-cli -no-cnv` which the new homebrew binary rejects with "please use llama-completion instead", silently fell into interactive mode, and the parent bench script's `read` blocked waiting for the binary to exit. Switched to `llama-completion` (b8680+ canonical non-interactive single-shot binary; emits `common_perf_print: prompt eval time = ...` + `eval time = ...` lines on stderr). Old `llama-cli` retained as fallback for repos that haven't updated. Parser regex matches both `llama_perf_*_print:` (older) and `common_perf_print:` (b8680+) prefixes by anchoring on the unique ` eval time =` substring.
+
+**Bench environment (M5 Max, 128 GB unified):** ps-audit clean, 97.9 GB free+inactive, hf2q `fc0eca9`, mlx-native `4db99f4`, GGUF 19.6 GB. 3 reps cold per cell. `MLX_LOG_TENSOR_PROBE=1` smoke before bench:
+
+```
+[mlx-native] tensor_mm probe: OK (using tensor variant)
+[mlx-native] tensor_mm_id probe: OK (using tensor variant for MoE)
+```
+
+so the M5 Max is in fact dispatching the `mpp::tensor_ops::matmul2d` MoE kernel — falsifies H3 (silent simdgroup fallback).
+
+**Receipts (3 reps cold, median (min..max) tok/s; raw at `/tmp/p17b_q4k/`).**
+
+| pp | tg | hf2q | llama-completion | llama-bench | hf2q/llama-completion | hf2q/llama-bench |
+|---|---|---|---|---|---|---|
+| pp31  | tg64 | **23.80** (23.40..23.80) | **658.19** (653.58..672.17) | **675.77** (667.35..677.31) | 0.036× | 0.035× |
+| pp101 | tg64 | **32.10** (32.10..32.10) | **850.12** (805.69..854.15) | **1680.01** (1673.11..1685.30) | 0.038× | 0.019× |
+
+| pp | tg | hf2q decode | llama-completion decode | llama-bench decode | hf2q/llama-completion | hf2q/llama-bench |
+|---|---|---|---|---|---|---|
+| pp31  | tg64 | **125.60** (124.80..125.80) | 115.31 (114.41..115.76) | 115.34 (115.23..117.69) | **1.089×** | **1.089×** |
+| pp101 | tg64 | **124.30** (124.20..124.40) | 114.66 (97.02..116.69)  | 115.34 (115.23..117.69) | **1.084×** | **1.078×** |
+
+**Coherence.** End-of-bench fixed-prompt run produces fully-coherent English transformer-explanation prose (`ascii_ratio = 0.981`, head: "Okay, I need to explain what a transformer neural network is in exactly three sentences. Let's break it down. First, I should mention that it's a type of neural network architecture. Then, I should highlight its key feature, which is the attention mechanism …"). `<think>` reasoning blocks land correctly. Q4_K dwq48 ship-gate (ADR-013 §17 coherence) holds at this HEAD.
+
+**What survives the retraction.** Decode is *faster* than llama.cpp at 1.08–1.09×. The decoded-prefix sourdough gate (P13.3) holds. Q4_K kernels load + dispatch correctly. Q4_K mm_id route does engage at `n_tokens > 32` and lifts hf2q from 24 → 32 t/s prefill — a real ~35% local lift, just much smaller than llama.cpp's tensor-mm map0+mm pipeline lifts itself at the same threshold (650 → 1680 t/s, ~2.6×).
+
+**The gap.** Prefill: hf2q is **28× slower than llama-completion** at pp31 and **52× slower than llama-bench** at pp101 (the synthetic-batched test that's allowed to push the full ubatch=512 prefill window). The gap *widens* with batch size — exactly the regime where llama.cpp's mm_id tile-reuse should dominate.
+
+#### P18 side-by-side audit — kernel + dispatcher are byte-equivalent to llama.cpp
+
+Per `feedback_evidence_first_no_blind_kernel_rewrites` and `feedback_structural_audit_before_kernel_work`: read the kernel, the dispatcher, and the runtime probe before forming any optimization hypothesis. Static-evidence sources cross-checked side-by-side (2026-05-01):
+
+| Aspect | llama.cpp | hf2q (mlx-native) | Match? |
+|---|---|---|---|
+| Tensor-API kernel template arguments | `kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>` (`ggml-metal.metal:10169`) | `kernel_mul_mm_id_q4_K_tensor_f32` template-instantiated with same `block_q4_K`/`QK_NL`/`dequantize_q4_K`/`half`/`f32` arg-set (`shaders/quantized_matmul_id_mm_tensor.metal:337`) | ✅ |
+| Inner tile geometry | `NR0 = 64`, `NR1 = 32`, `NK = 32` (`ggml-metal.metal:9738-9743`) | `NR0 = 64`, `NR1 = 32`, `NK = 32` (`shaders/quantized_matmul_id_mm_tensor.metal:184-186`) | ✅ |
+| Tensor-MM execution unit | `mpp::tensor_ops::matmul2d<...mode::multiply_accumulate, execution_simdgroups<4>>` (`ggml-metal.metal:9802-9804`) | `matmul2d<...multiply_accumulate, execution_simdgroups<4>>` (`shaders/quantized_matmul_id_mm_tensor.metal:231-234`) | ✅ |
+| `map0` pre-pass kernel | `kernel_mul_mm_id_map0<ne20>` (`ggml-metal.metal:9653-9716`); template instantiated for `ne20 ∈ {1,2,4,5,6,8,10,16,22}` | `kernel_mul_mm_id_map0_ne20_<top_k>`, instantiated for `top_k ∈ {1, 8}` (Qwen3.6moe top_k=8 covered) | ✅ for relevant top_k |
+| `map0` dispatch grid | `(1, 1, 1, ne02, 1, 1)` — one threadgroup, n_experts threads (`ggml-metal-ops.cpp:2358`) | `MTLSize(1,1,1)` × `MTLSize(n_experts,1,1)` (`quantized_matmul_id_ggml.rs:1004-1005`) | ✅ |
+| `mm_id` dispatch grid | `((ne21+31)/32, (ne01+63)/64, ne02, 128, 1, 1)` — 128 threads/tg (`ggml-metal-ops.cpp:2398`) | `((n_tokens+31)/32, (N+63)/64, n_experts)` × 128 threads (`quantized_matmul_id_ggml.rs:1078-1083`) | ✅ |
+| Routing threshold | `ne00 >= 64 && ne21 >= ne21_mm_id_min(=32)` (`ggml-metal-ops.cpp:2311-2313`) | `n_tokens > MM_ID_ROUTING_THRESHOLD(=32) && k >= 32` (`quantized_matmul_id_ggml.rs:265-269,397`) | ✅ matches; hf2q's `k>=32` is a strict subset of llama's `ne00>=64` for Qwen3.6 (moe_intermediate_size=512, hidden_size=2048) |
+| map0→mm hazard barrier | `ggml_metal_op_concurrency_reset(ctx)` (`ggml-metal-ops.cpp:2362`) | `encoder.memory_barrier()` (`quantized_matmul_id_ggml.rs:1025`) | ✅ |
+| Tensor-variant runtime probe | n/a (compile-time `#ifdef GGML_METAL_HAS_TENSOR`) | `TENSOR_MM_ID_AVAILABLE` once-cell (`quantized_matmul_id_ggml.rs:114-136`); reported OK at runtime (above smoke) | ✅ |
+
+Hypothesis verdicts:
+
+- **H1** (different tile geometry / threadgroup-shape): **FALSIFIED** by the table above. NR0/NR1/NK/execution_simdgroups/dispatch grid match.
+- **H2** (extra batching/coalescing across the routed-token list): **FALSIFIED**. Both repos use the same `map0` two-stage dispatch with identical args + identical concurrency-reset barrier. There is no extra batching layer in llama.cpp's path that hf2q lacks.
+- **H3** (tensor probe failing silently → simdgroup fallback): **FALSIFIED**. Runtime `MLX_LOG_TENSOR_PROBE=1` confirms `tensor_mm_id probe: OK (using tensor variant for MoE)` on M5 Max.
+- **H4** (`mpp::tensor_ops::matmul2d` port needed): **FALSIFIED**. Already ported and active (table row 3).
+
+**Conclusion.** The 28–52× prefill gap on Q4_K dwq48 *cannot* live inside the `kernel_mul_mm_id_q4_K_tensor_f32` kernel or the `dispatch_id_mm_pooled` dispatcher — they are structurally identical to llama.cpp's, on the same Metal hardware, on the same code path (verified live by the runtime probe). Per `feedback_evidence_first_no_blind_kernel_rewrites`: **do not touch the kernel.**
+
+**Where it must live (testable hypotheses for P19).** Reading `src/inference/models/qwen35/gpu_ffn.rs::build_moe_ffn_layer_gpu_q_into` (lines 1856–2310) and the W-5b.22/W-5b.23 retrospectives (`project_w5b22_hf2q_exhausted_remaining_in_mul_mm_id`, `project_w5b23_audit_falsifies_w5b22_kernel_attribution`):
+
+- **H5** (encoder/CB barrier fan-out): the wrapper issues 5 explicit `enc.memory_barrier()` calls per MoE FFN-layer (Phase A→B, B→C, C→D, D→E, E→F at `gpu_ffn.rs:2079, 2214, 2253, 2306` + the down dispatch's internal map0→mm barrier inside `dispatch_id_mm_for_test`). For Qwen3.6 35B-A3B that's 5 × 40 layers = **200 explicit barriers per prefill**, plus the 1 internal-to-mm_id barrier × 3 mm_id calls × 40 layers = 120 more. llama.cpp's `qwen35moe.cpp` graph builder lets ggml's own scheduler emit barriers only at real RAW hazards. Test: instrument `enc.memory_barrier()` to count + measure cost (Metal counter sample buffers); compare to llama.cpp's barrier count (read `ggml-metal-ops.cpp` for ggml_metal_op_concurrency_reset call sites along the MoE forward).
+- **H6** (allocator pressure per layer): the wrapper does ≥10 `pooled_alloc_buffer` calls per MoE FFN-layer (gate_all, up_all, h_all, y_all, h_s, ids_buf, weights_buf, out_buf, silu_params, dummy_residual). Even under the W-5b.15 arena-reset, that's 400 lookups per prefill plus the Phase-A `proj_pooled` calls. W-5b.23 attributed 78.6% of the Q4_0 MoE FFN bucket to wrapper-side overhead by direct measurement of `gate+up+down × 48 layers` — same wrapper, similar shape, presumably similar cost on Q4_K.
+- **H7** (CPU-side prep on Phase A): `proj_pooled` for router/sh_logit/sh_gate/sh_up runs as 4 sequential GPU dispatches each with their own scratch + barrier cycle. llama.cpp's qwen35moe.cpp builds `cur` in one residual-norm-fused projection stage. Test: reduce phase-A to a single fused projection dispatch and measure pp101 delta.
+- **H8** (single-encoder-per-layer vs single-encoder-per-prefill): hf2q opens a fresh `enc` for each layer (`forward_gpu_q_into` walks layers, each layer opens/commits independent CBs). llama.cpp's ggml graph builds one CB across the entire prefill graph and dispatches a single super-encoder. Test: read `forward_gpu.rs::forward_prefill` and count `commit_and_wait` calls per prefill; compare against ggml-metal scheduler trace.
+
+All four hypotheses are testable with **wrapper instrumentation** (the existing `wave5b8_profile` framework), no kernel edits, no Metal shader changes.
+
+**Next step (P19).** Run wave5b8_profile across pp101 dwq48 prefill cold-process, capture per-section ms breakdown, identify top-3 sections by ms, target one for an evidence-first optimization — same playbook as W-5b.10 → W-5b.27. Per `feedback_harness_first_before_iter_chasing`: build the matrix harness BEFORE iter-chasing.
+
+**What did NOT change.** mlx-native HEAD, hf2q HEAD, all 15/15 mlx-native Q4_K kernel tests, all 172/172 hf2q qwen35 unit tests, the 200/256 sourdough gate, the coherent-prose ship gate. Only `scripts/p17b_q4k_bench.sh` (new) and this progress entry. P17 (`mlx-native 4db99f4` env-gate + threshold bump) remains in main as documentation-only behaviorally-harmless code per the retraction commit body.
+
 ### 2026-05-01 — P16 · Q4_K mat-mat-id (mm_id) Metal kernel — 6× Q4_K prefill speedup, decode parity vs llama.cpp
 
 **Problem.** P15 left Q4_K dispatch stuck on `mv_id` even at prefill batches > 8 tokens (Q4_K was excluded from the `mm_id` route in `src/ops/quantized_matmul_id_ggml.rs` because `kernel_mul_mm_id_q4_K_f32` did not exist). Same-day llama-bench numbers (`b8680-15f786e65`, dwq48 GGUF on M5 Max): hf2q `pp31`=12 t/s vs llama 671 t/s; `pp101`=9 t/s vs llama 1703 t/s; gap of 30–56× and growing with prompt length.
