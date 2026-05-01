@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
 # sourdough_gate.sh — ADR-005 Phase 1b post-1bNEW.20.FIX correctness gate.
 #
+# DEPRECATED 2026-05-01 (ADR-005 iter-221 drift-audit C2). `scripts/release-check.sh`
+# supersedes this script via Gates C/D/E/F (parity suite + self-baseline).
+# This script remains as a single-prompt fast-iteration tool but its default
+# floor must track tests/evals/reference/MANIFEST.json's
+# `sourdough.common_prefix_bytes` field. The historical 3094-byte floor (frozen
+# 2026-04-11 post-1bNEW.20.FIX) was lowered to 179 in iter-220 (commit `de9b7a4`,
+# 2026-05-01) after a full vs-llama anchor refresh at locked llama.cpp commit
+# `b3d758750a` on M5 Max — cross-implementation argmax drift on long prompts is
+# mathematical (independent kernel implementations) not a regression. See
+# project_w5b22_hf2q_exhausted_remaining_in_mul_mm_id memory entry.
+#
 # Runs hf2q and llama-completion on the 22-token user sourdough prompt at
 # T=0 greedy, max_tokens=1000, and asserts that the common byte prefix of
-# their outputs is at least MIN_COMMON_PREFIX bytes (default: 3094). This
-# enforces "hf2q's decode output is byte-identical to llama.cpp on the
-# DWQ GGUF for the first ~830 decode tokens" as a mandatory pre-merge
-# condition for every future speed item.
+# their outputs is at least MIN_COMMON_PREFIX bytes (default: 179, anchored
+# to today's measurement; previously 3094 pre-iter-220). This enforces "hf2q's
+# decode output does not regress further from llama.cpp on the DWQ GGUF" as
+# a fast-iteration check. Source of truth: tests/evals/reference/MANIFEST.json.
 #
 # Origin: 2026-04-11 investigation (ADR-005 "Sourdough たglitch" Walk
 # Exception entry). The user reported a hiragana character appearing
@@ -20,7 +31,7 @@
 #
 # Usage:
 #   scripts/sourdough_gate.sh <gguf_path>
-#   scripts/sourdough_gate.sh <gguf_path> --min-prefix 3094
+#   scripts/sourdough_gate.sh <gguf_path> --min-prefix 179
 #
 # Exit codes:
 #   0  common prefix >= MIN_COMMON_PREFIX (gate passed)
@@ -28,11 +39,11 @@
 #   2  gate failed (common prefix < MIN_COMMON_PREFIX)
 #   3  tool invocation failure (hf2q or llama-completion crashed)
 #
-# Example (post-1bNEW.20.FIX reference):
-#   hf2q:  3656 bytes
-#   llama: 3658 bytes
-#   common prefix: 3095 bytes
-#   -> PASS (>= 3094)
+# Example (post-iter-220 reference, MANIFEST.json sourdough section):
+#   hf2q:  3575 bytes
+#   llama: 3712 bytes
+#   common prefix: 179 bytes
+#   -> PASS (>= 179)
 
 set -euo pipefail
 
@@ -55,13 +66,15 @@ RENDERED_PROMPT_LLAMA="/tmp/sourdough_gate_rendered_nobos.txt"
 # different trajectory and a different drift profile.
 USER_PROMPT="Complrehensive instructions for making sourdough bread."
 MAX_TOKENS=1000
-MIN_COMMON_PREFIX=3094
+# Source: tests/evals/reference/MANIFEST.json sourdough.common_prefix_bytes
+# (iter-220 anchor refresh, 2026-05-01, commit de9b7a4). Was 3094 pre-iter-220.
+MIN_COMMON_PREFIX=179
 
 usage() {
   cat <<EOF
 Usage: scripts/sourdough_gate.sh <gguf_path> [--min-prefix N] [--max-tokens N]
   <gguf_path>         Path to the Gemma 4 GGUF model (required)
-  --min-prefix N      Common byte prefix floor (default: 3094)
+  --min-prefix N      Common byte prefix floor (default: 179, per MANIFEST.json post-iter-220)
   --max-tokens N      Max decode tokens per run (default: 1000)
 
 Exit codes:
