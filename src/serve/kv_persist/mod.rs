@@ -15,6 +15,7 @@
 //! HotSwapManager.
 
 pub mod block_store;
+pub mod cache_ops;
 pub mod families;
 pub mod format;
 pub mod index;

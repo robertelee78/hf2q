@@ -137,19 +137,72 @@ pub struct CacheArgs {
 }
 
 /// `hf2q cache` subcommands. ADR-005 Phase 3 iter-205 (AC line 5351).
+///
+/// ADR-017 §R-F6 extension: the `--kv-namespace` flag (orthogonal to
+/// the weights-side surface) flips the action's target from the
+/// model-weights cache to the on-disk persistent KV-cache subtree
+/// (`<kv-persist>/models/<fp_short>/`). Path discovery order when
+/// `--kv-namespace` is set:
+///
+/// 1. `--kv-path PATH` (explicit; first to win).
+/// 2. `HF2Q_KV_PERSIST_PATH` env var.
+///
+/// We do NOT silently fall back to the weights-cache root or any
+/// implicit default — see `docs/operating-kv-cache.md` §3 / ADR-017
+/// §R-F1: the kv-persist path is operator-supplied at `cmd_serve`
+/// startup with no default, and guessing here could clear an
+/// unintended directory.
 #[derive(Subcommand, Debug)]
 pub enum CacheAction {
     /// List cached models with their quantizations and on-disk sizes.
-    List,
+    ///
+    /// With `--kv-namespace`: enumerates per-model directories under
+    /// `<kv-persist>/models/<fp_short>/` (one row per `<fp_short>`)
+    /// with bytes-on-disk + block count under that subtree. Closes
+    /// `docs/operating-kv-cache.md` §11 #4 (ADR-017 §R-F6).
+    List {
+        /// Switch this action to the persistent KV-cache subtree
+        /// instead of the model-weights cache. ADR-017 §R-F6.
+        #[arg(long, default_value_t = false)]
+        kv_namespace: bool,
+
+        /// KV-persist root override. Required (or via
+        /// `HF2Q_KV_PERSIST_PATH`) when `--kv-namespace` is set.
+        #[arg(long, value_name = "PATH", requires = "kv_namespace")]
+        kv_path: Option<PathBuf>,
+    },
 
     /// Print the total on-disk size of the cache.
-    Size,
+    ///
+    /// With `--kv-namespace`: total bytes-on-disk under
+    /// `<kv-persist>/models/`.
+    Size {
+        /// Switch this action to the persistent KV-cache subtree.
+        /// ADR-017 §R-F6.
+        #[arg(long, default_value_t = false)]
+        kv_namespace: bool,
+
+        /// KV-persist root override. Required (or via
+        /// `HF2Q_KV_PERSIST_PATH`) when `--kv-namespace` is set.
+        #[arg(long, value_name = "PATH", requires = "kv_namespace")]
+        kv_path: Option<PathBuf>,
+    },
 
     /// Clear cache entries — single (model, quant), all quants for
     /// one model, or the entire cache (`--all --yes`).
+    ///
+    /// With `--kv-namespace --model <repo>`: removes the per-`(repo,
+    /// quant)` directory at `<kv-persist>/models/<fp_short>/kv/`.
+    /// `--model` is REQUIRED for kv-namespace clear (no `--all`
+    /// shortcut — operator runbook §11 #4 specifically calls for
+    /// per-repo scope; whole-cache wipe stays as `rm -rf
+    /// <kv-persist>` on a stopped serve). Does NOT touch
+    /// `<kv-persist>/locks/` (those are session-scoped) or other
+    /// repos' subtrees.
     Clear {
         /// HF repo-id of the model whose cache entry to clear
-        /// (e.g. `google/gemma-4-27b-it`). Required unless `--all`.
+        /// (e.g. `google/gemma-4-27b-it`). Required unless `--all`
+        /// (weights-side) or always-required for `--kv-namespace`.
         #[arg(long)]
         model: Option<String>,
 
@@ -157,18 +210,42 @@ pub enum CacheAction {
         /// `Q4_K_M`, `Q3_K_M`). When omitted with `--model`, every
         /// quant cached for that model is removed (plus the model dir
         /// `source/` and `repo_meta.json`).
+        ///
+        /// For `--kv-namespace` the per-`(repo, quant)` fingerprint
+        /// only varies by `(repo, quant)` at this commit (see
+        /// `docs/operating-kv-cache.md` §3); omitting `--quant`
+        /// removes every quant variant cached for the repo.
         #[arg(long)]
         quant: Option<String>,
 
         /// Clear every cached model. Refuses without `--yes` to
         /// prevent accidental wipes (the entire on-disk cache is
-        /// removed; manifest is reset to empty).
+        /// removed; manifest is reset to empty). Refused under
+        /// `--kv-namespace` — see variant docstring.
         #[arg(long, default_value_t = false)]
         all: bool,
 
         /// Confirm a destructive operation. Required by `--all`.
         #[arg(long, default_value_t = false)]
         yes: bool,
+
+        /// Switch this action to the persistent KV-cache subtree.
+        /// ADR-017 §R-F6.
+        #[arg(long, default_value_t = false)]
+        kv_namespace: bool,
+
+        /// KV-persist root override. Required (or via
+        /// `HF2Q_KV_PERSIST_PATH`) when `--kv-namespace` is set.
+        #[arg(long, value_name = "PATH", requires = "kv_namespace")]
+        kv_path: Option<PathBuf>,
+
+        /// Override the active-serve sentinel-flock guard. Use only
+        /// when you know no `hf2q serve --kv-persist=SAME_PATH` is
+        /// running against this cache root (a stopped serve can
+        /// leave a stale sentinel under abnormal exit; this flag
+        /// re-enables clear in that case).
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 }
 

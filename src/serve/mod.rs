@@ -2362,6 +2362,12 @@ async fn shutdown_signal() {
 /// - `cache size`  — total bytes used by the cache.
 /// - `cache clear` — invalidate entries (single quant, whole repo, or all).
 ///
+/// ADR-017 §R-F6: each action accepts `--kv-namespace` to retarget
+/// from the model-weights cache to the persistent KV cache subtree
+/// (`<kv-persist>/models/<fp_short>/`). Path discovery uses
+/// `--kv-path PATH` then `HF2Q_KV_PERSIST_PATH`; no implicit default.
+/// See `docs/operating-kv-cache.md` §11 #4.
+///
 /// Output is human-readable text on stdout; errors go through stderr
 /// via the standard `Result` plumbing.  Bytes-freed is reported back
 /// to the operator from the on-disk walk performed before removal.
@@ -2371,20 +2377,202 @@ async fn shutdown_signal() {
 /// - Without `--model` and without `--all`, prints the usage and
 ///   exits with `Err` (not a silent no-op — the operator likely
 ///   intended one of the two).
+/// - `--kv-namespace clear` refuses without `--model` and refuses
+///   `--all` entirely (per-repo scope only — see runbook §11 #4).
+/// - `--kv-namespace clear` consults a `<kv_root>/.cache_lock`
+///   sentinel via `flock(LOCK_EX | LOCK_NB)`; pass `--force` to
+///   override.
 pub fn cmd_cache(args: cli::CacheArgs) -> Result<()> {
     use cli::CacheAction;
 
+    // ADR-017 §R-F6: when `--kv-namespace` is set on any action, the
+    // operation targets `<kv-persist>/models/` instead of the
+    // weights-side `cache::ModelCache`. We dispatch BEFORE opening
+    // the weights cache so a kv-namespace op never touches
+    // `~/.cache/hf2q/cache_index.json`.
+    match args.action {
+        CacheAction::List {
+            kv_namespace: true,
+            kv_path,
+        } => {
+            return cmd_cache_kv_list(kv_path.as_deref());
+        }
+        CacheAction::Size {
+            kv_namespace: true,
+            kv_path,
+        } => {
+            return cmd_cache_kv_size(kv_path.as_deref());
+        }
+        CacheAction::Clear {
+            kv_namespace: true,
+            ref model,
+            ref quant,
+            all,
+            yes: _,
+            ref kv_path,
+            force,
+        } => {
+            return cmd_cache_kv_clear(
+                kv_path.as_deref(),
+                model.as_deref(),
+                quant.as_deref(),
+                all,
+                force,
+            );
+        }
+        _ => { /* fall through to weights-side */ }
+    }
+
     let mut cache = cache::ModelCache::open().context("open model cache")?;
     match args.action {
-        CacheAction::List => cmd_cache_list(&cache),
-        CacheAction::Size => cmd_cache_size(&cache),
+        CacheAction::List { .. } => cmd_cache_list(&cache),
+        CacheAction::Size { .. } => cmd_cache_size(&cache),
         CacheAction::Clear {
             model,
             quant,
             all,
             yes,
+            kv_namespace: _,
+            kv_path: _,
+            force: _,
         } => cmd_cache_clear(&mut cache, model, quant, all, yes),
     }
+}
+
+/// `hf2q cache list --kv-namespace [--kv-path PATH]` — ADR-017 §R-F6.
+///
+/// Walks `<kv_root>/models/` and emits one row per `<fp_short>` dir
+/// with `bytes_on_disk` + `block_count`. Tolerates missing
+/// `<kv_root>` / missing `models/` (operator may invoke before the
+/// first `cmd_serve --kv-persist` run).
+fn cmd_cache_kv_list(kv_path: Option<&Path>) -> Result<()> {
+    use crate::serve::kv_persist::cache_ops;
+
+    let kv_root = cache_ops::resolve_kv_root(kv_path)?;
+    let entries = cache_ops::list_namespaces(&kv_root)?;
+    if entries.is_empty() {
+        println!(
+            "(kv-cache empty — root: {})",
+            kv_root.display()
+        );
+        return Ok(());
+    }
+    println!("hf2q kv-cache @ {}", kv_root.display());
+    println!(
+        "{:<20} {:>14} {:>10}",
+        "FP_SHORT", "BYTES_ON_DISK", "BLOCKS"
+    );
+    for e in &entries {
+        println!(
+            "{:<20} {:>14} {:>10}",
+            e.fp_short, e.bytes_on_disk, e.block_count
+        );
+    }
+    Ok(())
+}
+
+/// `hf2q cache size --kv-namespace [--kv-path PATH]` — ADR-017 §R-F6.
+fn cmd_cache_kv_size(kv_path: Option<&Path>) -> Result<()> {
+    use crate::serve::kv_persist::cache_ops;
+
+    let kv_root = cache_ops::resolve_kv_root(kv_path)?;
+    let total = cache_ops::total_bytes(&kv_root);
+    println!(
+        "hf2q kv-cache @ {} — {} bytes ({:.2} GiB)",
+        kv_root.display(),
+        total,
+        total as f64 / (1u64 << 30) as f64,
+    );
+    Ok(())
+}
+
+/// `hf2q cache clear --kv-namespace --model <repo> [--quant <q>]
+///   [--kv-path PATH] [--force]` — ADR-017 §R-F6.
+///
+/// Refuses without `--model` (no whole-cache wipe — operator runbook
+/// §11 #4 deliberately scopes this command to per-repo); refuses
+/// under `--all` (likewise). Without `--force` the active-serve
+/// sentinel-flock guard is consulted; the diagnostic is explicit
+/// about its meaning.
+fn cmd_cache_kv_clear(
+    kv_path: Option<&Path>,
+    model: Option<&str>,
+    quant: Option<&str>,
+    all: bool,
+    force: bool,
+) -> Result<()> {
+    use crate::serve::kv_persist::cache_ops;
+    use crate::serve::quant_select::QuantType;
+
+    if all {
+        return Err(anyhow::anyhow!(
+            "hf2q cache clear --kv-namespace: --all is not supported. \
+             Per-repo scope only (operator runbook §11 #4). To wipe \
+             the entire kv-cache, stop `hf2q serve` and `rm -rf \
+             <kv-persist>/models <kv-persist>/locks` directly."
+        ));
+    }
+    let Some(repo) = model else {
+        return Err(anyhow::anyhow!(
+            "hf2q cache clear --kv-namespace: --model <repo-id> required \
+             (no whole-cache wipe via this command — see operator runbook §11 #4)"
+        ));
+    };
+
+    let kv_root = cache_ops::resolve_kv_root(kv_path)?;
+
+    if let Some(q_str) = quant {
+        let q = QuantType::from_canonical_str(q_str)
+            .map_err(|e| anyhow::anyhow!("--quant: {}", e))?;
+        let outcome = cache_ops::clear_namespace(&kv_root, repo, q, force).map_err(|e| {
+            anyhow::anyhow!(
+                "hf2q cache clear --kv-namespace --model {} --quant {}: {}",
+                repo,
+                q.as_str(),
+                e
+            )
+        })?;
+        if outcome.existed {
+            println!(
+                "hf2q kv-cache: cleared {}@{} (fp_short={}, {} bytes freed)",
+                repo, q.as_str(), outcome.fp_short, outcome.bytes_freed
+            );
+        } else {
+            println!(
+                "hf2q kv-cache: nothing to clear for {}@{} (fp_short={} not present)",
+                repo, q.as_str(), outcome.fp_short
+            );
+        }
+    } else {
+        let outcomes = cache_ops::clear_namespace_all_quants(&kv_root, repo, force)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "hf2q cache clear --kv-namespace --model {} (all quants): {}",
+                    repo, e
+                )
+            })?;
+        let total_bytes: u64 = outcomes.iter().map(|o| o.bytes_freed).sum();
+        let removed: Vec<&str> = outcomes
+            .iter()
+            .filter(|o| o.existed)
+            .map(|o| o.fp_short.as_str())
+            .collect();
+        if removed.is_empty() {
+            println!(
+                "hf2q kv-cache: nothing to clear for {} (no quant variants present)",
+                repo
+            );
+        } else {
+            println!(
+                "hf2q kv-cache: cleared {} (all quants) — {} fp_short dirs, {} bytes freed: [{}]",
+                repo,
+                removed.len(),
+                total_bytes,
+                removed.join(", ")
+            );
+        }
+    }
+    Ok(())
 }
 
 fn cmd_cache_list(cache: &cache::ModelCache) -> Result<()> {
