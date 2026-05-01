@@ -529,6 +529,35 @@ impl KvCacheSpill for StubGemma4Spill {
 }
 
 // ---------------------------------------------------------------------------
+// Phase C.1 — `EngineBindable` impl for `StubGemma4Spill` (no-op).
+//
+// The C.1 `LoaderWrapper` calls `bind_engine` from inside the load path
+// for every registered family. The stub family doesn't need engine
+// state (its snapshot/restore returns None / CodecErr regardless), so
+// both methods drop the type-erased Arc on the floor and return without
+// further state mutation. This satisfies the
+// `EngineBindable::bind_engine` contract:
+//
+//   * Send + Sync: StubGemma4Spill is `#[derive(Default)]` over a unit
+//     struct, trivially Send + Sync.
+//   * Never panic on type mismatch: the impl never inspects the Arc's
+//     concrete type — it just drops the Arc when the function returns.
+//   * No state mutation observable from the spill path: the stub's
+//     `snapshot_block` already returns None deterministically.
+// ---------------------------------------------------------------------------
+
+impl crate::serve::kv_persist::EngineBindable for StubGemma4Spill {
+    fn bind_engine(&self, _engine_dyn: Arc<dyn std::any::Any + Send + Sync>) {
+        // No-op: the stub has no engine-side state. The Arc is
+        // dropped at the end of this scope (the wrapper's
+        // `Arc::try_unwrap` reclaim path therefore succeeds).
+    }
+    fn unbind_engine(&self) {
+        // No-op: nothing to clear.
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
@@ -1179,6 +1208,32 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===== Phase C.1 — EngineBindable no-op for StubGemma4Spill ============
+    #[test]
+    fn engine_bindable_stub_spill_noop_does_not_panic() {
+        // Spec test 8: the stub family's EngineBindable impl is a
+        // no-op. bind_engine must not panic on ANY type-erased Arc;
+        // unbind_engine must not panic on the unbound state.
+        use crate::serve::kv_persist::EngineBindable;
+        let stub = StubGemma4Spill;
+
+        // Pass a unit, a String, and an arbitrary user struct as the
+        // type-erased Arc. None should panic.
+        let unit: Arc<dyn std::any::Any + Send + Sync> = Arc::new(());
+        EngineBindable::bind_engine(&stub, unit);
+        let s: Arc<dyn std::any::Any + Send + Sync> =
+            Arc::new(String::from("hello stub"));
+        EngineBindable::bind_engine(&stub, s);
+
+        struct Bogus(u32);
+        let b: Arc<dyn std::any::Any + Send + Sync> = Arc::new(Bogus(42));
+        EngineBindable::bind_engine(&stub, b);
+
+        // unbind on the unbound stub does not panic.
+        EngineBindable::unbind_engine(&stub);
+        EngineBindable::unbind_engine(&stub);
     }
 
     // ===== Test 14 (extra) — stub Gemma 4 hook returns Skipped =============
