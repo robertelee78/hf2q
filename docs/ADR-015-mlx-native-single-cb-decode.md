@@ -7,7 +7,7 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
-## ▶ Resume Here — current state of truth (2026-05-01 ~10:00Z, bench-blocked on PID-contamination)
+## ▶ Resume Here — current state of truth (2026-05-01 ~14:00Z, perf claims FALSIFIED at empirical bench)
 
 **Decode side: SHIPPED + RE-VALIDATED. iter56/57/58b confirmed byte-transparent perf-only changes (iter61c FULL VERDICT: ALL PASS).**
 
@@ -31,26 +31,41 @@ All 12 cells byte-identical. Receipts: `/tmp/cfa-iter61c-20260430/{claude,main}-
 
 **Prefill side: OPEN. Cold-clean baseline 0.319× on apex q4_0-flat (3.13× slower than llama, not 4.47×; prior 0.22× was CPU-contaminated). iter60b + iter60c implemented and pushed to team branches; bench validation pending.**
 
-**iter60b — B-staging elimination (implementation COMPLETE, bench pending):**
-- ADR's prior phrasing "cast at mpp::tensor_ops::matmul2d call site" was architecturally wrong — that API has no cast parameter. Real win matches llama.cpp's `GGML_METAL_HAS_TENSOR` (ggml-metal.metal:9357-9360): wrap f32 device buffer directly as `tensor<device float, dextents<int32_t, 2>>`, eliminating B-staging entirely.
-- Risk #1 (does MPP accept device-f32 for B operand on M5 Max?) **CLEARED on first attempt**.
-- Eliminates 2048 B threadgroup buffer + ~1024 fp32→fp16 cast instructions per K-tile.
-- All 11 mm_tensor parity tests PASS unchanged tolerances; 264/0/8 qwen35 unchanged.
-- Branch: `cfa/iter60b-impl-20260430/claude` (mlx-native + hf2q).
+**iter60b — B-staging elimination — REGRESSED, claim FALSIFIED, DO NOT MERGE:**
+- Mechanism CONFIRMED at compile time: `tensor<device float, dextents<int32_t, 2>>` declaration accepted by MPP on M5 Max first-attempt; sb threadgroup eliminated; ~1024 fp32→fp16 casts per K-tile gone; -27.2% LOC; 11/11 parity tests byte-exact.
+- **Empirical cold-bench (apex q4_0-flat pp=4096, 5 cold trials each, IQR ≤17ms, today's same-day llama-bench peer):** main median **5769ms** vs iter60b median **6364ms** = **+595ms / +10.3% REGRESSION**. Integrated branch (iter60c+60b+59-mtnsg) = 6339ms = **-9.88pp** vs main.
+- **Hypothesis falsified by empirical effect not captured by per-op cost model**: the eliminated `sb` threadgroup buffer was providing **implicit GPU pipeline-sync** (Metal command-buffer hazard ordering) that the dossier's per-op-cost analysis didn't account for. Removing the apparent "12ms ceiling" of pure overhead instead removed a 600ms inter-op dependency-serialization mechanism. **Code+test==truth**: dossier + parity + static analysis all green; only end-to-end perf bench caught the regression.
+- Branch: `cfa/iter60b-impl-20260430/claude` (mlx-native `136bf98` + hf2q `23f761e`) — kept as evidence; **DO NOT MERGE TO MAIN**.
+- Standing lesson: removing apparent GPU overhead can backfire when the overhead is providing implicit hazard ordering. Mandatory next-iter step: profile with `HF2Q_PROFILE_GPU_TS=1` to identify exactly where the 600ms regression lands; only re-attempt this iter once the implicit-sync mechanism is understood AND can be re-instated explicitly.
 
-**iter60c — function-constant bounds-check gating (implementation COMPLETE, bench pending):**
-- `FC_mul_mm_bc_inp(250)` + `FC_mul_mm_bc_out(251)` mirror llama.cpp:9544-9607.
-- Estimated +0.5-1pp on prod-aligned shapes (K∈{2048,2816,4096}, N∈{2816,4096}, M≥32).
-- All 11 mm_tensor parity tests byte-exact; clean build.
-- Branch: `cfa/iter60c-fc-gate-20260430/claude` (mlx-native `4d38baf` + hf2q `5799f98`).
+**iter60c — function-constant bounds-check gating — NO_REGRESSION, claim MISSED at noise floor:**
+- Mechanism CONFIRMED at compile time: AIR disassembly + metal-opt globalopt shows -19.9% IR instruction count on q4_0 kernel when `FC_mul_mm_bc_inp=false` / `FC_mul_mm_bc_out=false`; partial-tile write-back block 309 entirely eliminated; 11 dead `br i1 undef` stubs killed.
+- **Empirical cold-bench**: main 5769ms vs iter60c 5776ms = **+7ms / +0.12%** (within trial noise floor; IQR ≤17ms). Expected +0.5-1pp not observed.
+- Branch: `cfa/iter60c-fc-gate-20260430/claude` (mlx-native `4d38baf` + hf2q `5799f98`) — **MERGE_OPTIONAL** (no perf cost, no perf benefit, mirrors llama.cpp pattern). Defer until clear merge story or include in a code-clarity batch.
 
-**iter59 next-tier candidates — ALL THREE RESOLVED (1 implemented, 2 falsified by code+test==truth):**
-- **#1 multi-token NSG kernel — IMPLEMENTED, bench pending.** Hypothesis CONFIRMED empirically: kernel inner `for t in 0..n_tokens` loop produces byte-identical output to legacy 128-thread kernel for n_tokens ∈ {1,2,4,8,16,32} (6 new parity tests, 1e-4 vs both GPU legacy + CPU scalar). Rust guard relaxed via `NSG_PREFILL_MAX_TOKENS=32` + `d_k%32==0` check. Routes decode (seq==1) and short-prefill autoregressive (seq_len≤32 non-chunk-eligible). Tests now 266/0/x. Branch: `cfa/iter59-mtnsg-impl-20260501/claude` (mlx-native `a3c7e94` + hf2q `00a7f62`).
-- **#2 RoPE multi-buffer hoist — FALSIFIED, ALREADY DONE.** `dispatch_rope_multi_cached` (mlx-native `a50c224`) already hoisted the per-call alloc; both worktrees use the cached path. Worker landed regression test `imrope_cached_path_is_byte_identical_across_n_calls` (5-call bit-level equality + cache-size invariant) on `cfa/iter59-rope-hoist-20260501/claude`.
-- **#3 MoE expert sortby — FALSIFIED AT ZERO COST.** `kernel_mul_mm_id_map0` already exists at `mlx-native/src/ops/quantized_matmul_id_ggml.rs:950-1000`; fires on prefill for Q4_0/Q8_0/Q6_K with top_k ∈ {1,8} and n_tokens > 8. Production call at `gpu_ffn.rs:2160-2199`. Only residual gap is Q4_K/Q5_K mv_id path → covered by iter62 (parallel `adr013-q4k-moe-kernels` session). Audit at `/tmp/cfa-iter59-moe-sortby-audit/audit-result.md`.
-- Dossiers: `/tmp/cfa-iter59-research/{rope-qkv-fusion,moe-expert-sortby,multi-token-nsg}-dossier.md` + `index.md`. **Standing lesson:** dossiers are starting points — verify hypothesis against current code before dispatching impl. 2 of 3 candidates were already done; only multi-token NSG needed new code (and the Rust guard was the only barrier).
+**iter59 next-tier candidates — ALL THREE RESOLVED:**
+- **#1 multi-token NSG kernel — IMPLEMENTED, NO_REGRESSION, claim untested-on-bench-fixture.** Hypothesis CONFIRMED empirically: kernel inner `for t in 0..n_tokens` loop produces byte-identical output to legacy 128-thread kernel for n_tokens ∈ {1,2,4,8,16,32} (6 new parity tests). Rust guard relaxed via `NSG_PREFILL_MAX_TOKENS=32` + `d_k%32==0` check. Routes decode (seq==1) and short-prefill autoregressive (seq_len≤32 non-chunk-eligible). Tests now 266/0/x. **Cold-bench standalone (apex pp4096):** main 5873ms vs mtnsg 5897ms = -24ms / -0.41% (noise floor). pp4096 is chunk-eligible so the new routing didn't fire; the +0.05-0.2pp claim applies to short-prefill (seq_len ≤ 32) workloads NOT exercised here. Branch: `cfa/iter59-mtnsg-impl-20260501/claude` (mlx-native `a3c7e94` + hf2q `00a7f62`) — **MERGE_OPTIONAL** (no regression on long-prefill, no measured win). To validate the original claim, future bench needs a short-prefill autoregressive fixture (e.g. seq_len=32 batched chat-completion).
+- **#2 RoPE multi-buffer hoist — FALSIFIED, ALREADY DONE.** `dispatch_rope_multi_cached` (mlx-native `a50c224`) already hoisted the per-call alloc. Worker landed regression test `imrope_cached_path_is_byte_identical_across_n_calls` on `cfa/iter59-rope-hoist-20260501/claude`.
+- **#3 MoE expert sortby — FALSIFIED AT ZERO COST.** `kernel_mul_mm_id_map0` already exists at `mlx-native/src/ops/quantized_matmul_id_ggml.rs:950-1000`. Audit at `/tmp/cfa-iter59-moe-sortby-audit/audit-result.md`.
+- Dossiers: `/tmp/cfa-iter59-research/*.md`. **Standing lesson:** dossiers are starting points — verify hypothesis against current code before dispatching impl. 2 of 3 candidates were already done; only multi-token NSG needed new code (and the Rust guard was the only barrier).
 
-**Bench validation BLOCKED on PID 20090 contamination** (parallel-session `llama-cli -n 200` on 35B-A3B-DWQ48, hung at 96.7% CPU for 81+ min). Bench coordinator `a4b1befe2e655d13e` correctly DEFERRED rather than producing contaminated numbers. All 3 bench-pending branches (iter60c, iter60b, iter59-mtnsg) have pre-built binaries at their respective worktrees; bench script ready at `/tmp/cfa-iter60-bench-validation/bench-iter60-cold.sh`. Operator action needed: `kill 20090`.
+**Empirical bench summary table (apex q4_0-flat pp=4096, today's same-day llama-bench peer = 1238ms):**
+
+| Branch | Cold median (ms) | vs main | Verdict | Merge |
+|---|---|---|---|---|
+| main (`4e12ab0`) | 5769 / 5873 | baseline | — | — |
+| iter60c | 5776 | +7ms (+0.12%) | NO_REGRESSION, claim MISSED | OPTIONAL |
+| iter60b | **6364** | **+595ms (+10.3%)** | **REGRESSED — claim FALSIFIED** | **DO NOT MERGE** |
+| iter59-mtnsg | 5897 | -24ms (-0.41%) | NO_REGRESSION, claim untested-on-fixture | OPTIONAL |
+| INTEGRATED (60c+60b+59-mtnsg) | **6339** | **+570ms (-9.88pp)** | **REGRESSED (60b carrier)** | **DO NOT MERGE** |
+
+Decode parity for all 3 branches: BYTE_CLEAN against current main. Bench receipts: `/tmp/cfa-iter60-integrated-bench/results.json` + `/tmp/cfa-iter59-mtnsg-bench/run.log` + per-trial logs at `/tmp/cfa-iter60-integrated-bench/logs/`.
+
+**Active worktree branches (pushed, NOT merged to main pending verdict resolution):**
+- `cfa/iter60c-fc-gate-20260430/claude` — bench-noise; merge-optional code-clarity
+- `cfa/iter60b-impl-20260430/claude` — REGRESSED; do not merge until root-cause understood
+- `cfa/iter59-mtnsg-impl-20260501/claude` — bench-fixture-mismatched; merge-optional routing improvement
+- `cfa/iter60-integrated-20260501/claude` — REGRESSED (carrier = iter60b); evidence only
 
 **Bench infrastructure: NOW SOLID (5 broken-window fixes shipped today + capture script + 1 bash-3.2 pipefail bug bypassed; iter61c capture method = text-bytes SHA256 over decoded UTF-8, deterministic at temp=0/top-k=1).**
 
@@ -76,11 +91,14 @@ All 12 cells byte-identical. Receipts: `/tmp/cfa-iter61c-20260430/{claude,main}-
 
 ### What's NEXT (in order)
 
-1. **UNBLOCK BENCH WINDOW**: operator must `kill 20090` (parallel-session llama-cli hung 81+ min). All 3 bench-pending branches will run via prepared script `/tmp/cfa-iter60-bench-validation/bench-iter60-cold.sh` once contamination clears.
-2. **BENCH ORDER**: iter60c → iter60b → iter59-mtnsg → llama.cpp peer baseline (same-day, pp=4096 -ub 512 -r 5) → record verdicts MET/MISSED/REGRESSED.
-3. **MERGE ORDER (contingent on MET verdicts)**: iter60c (smaller/less invasive) → rebase iter60b on iter60c (both touch `quantized_matmul_mm_tensor.metal` — orthogonal diffs) → rebase iter59-mtnsg on top. Push to main, then bench again post-merge to verify combined gain.
-4. **iter62 — Q4_K MoE matmul-id support**: handled by parallel `adr013-q4k-moe-kernels` session; merge inbound separately.
-5. **NEXT LEVER QUEUE (after iter60c+60b+59-mtnsg ship)**: full RoPE+QKV fusion (3-4 days, medium-high risk per dossier; only worth it if cumulative gain after this batch leaves significant prefill gap); multi-token NSG extension to longer prefill windows (current cap NSG_PREFILL_MAX_TOKENS=32); structural matmul tile-size match (llama NRB=128 vs hf2q NR1=32 — 4× tile-area gap, separate iter not yet researched).
+1. **iter60b root-cause investigation** — profile with `HF2Q_PROFILE_GPU_TS=1` on the iter60b branch at apex pp4096 to identify exactly where the 595ms regression lands (per-bucket attribution: kernel exec / encoder commit / hazard wait). The bench coordinator's hypothesis is "removed implicit pipeline-sync from threadgroup memory" — must be empirically confirmed before any iter60b retry.
+2. **Decide iter60c + iter59-mtnsg disposition** — both are no-regression but no-measured-win on the apex pp4096 fixture. Options: (a) merge as code-clarity wins (mirror llama.cpp patterns; bring 11 bounds-gate function-constants + 6 multi-token NSG parity tests into main); (b) hold until they show a measured win on a relevant fixture. iter59-mtnsg specifically needs a short-prefill bench fixture (seq_len ≤ 32 autoregressive batched) to validate the +0.05-0.2pp claim.
+3. **Re-research iter60b** if root cause confirms implicit pipeline-sync was the real value: design an explicit-sync version that elides the cast cost while keeping the hazard-ordering guarantee. Possible paths: explicit `threadgroup_barrier(mem_flags::mem_device)` after each B-stride load; or explicit dispatch boundary between K-tile groups.
+4. **NRB tile-size investigation** (separate from iter60b's B-staging) — llama uses NRB=128 vs hf2q NR1=32 (4× tile-area gap per iter59 dossier addendum); independent of iter60b's failed B-staging path.
+5. **iter62 — Q4_K MoE matmul-id support**: handled by parallel `adr013-q4k-moe-kernels` session.
+6. **Next-tier candidates** (queued from iter59 dossier index): full RoPE+QKV fusion (3-4 days, medium-high risk; only worth it if cumulative gain after the above batch leaves significant prefill gap).
+
+**Critical methodological lesson from iter60b**: static analysis confirming a mechanism is necessary but not sufficient. The dossier's "+2-5pp from removing 1024 cast instructions per K-tile" was based on per-op cost summed without modeling inter-op dependencies. The cold-bench falsified it by **+595ms in the opposite direction**. Future similar iters must include: (a) per-op cost model, (b) inter-op dependency model, (c) end-to-end cold-bench, before claiming completion. Code+test==truth; dossiers + parity + static analysis + reasoning are starting points only.
 
 **iter61c outcome eliminates the prior "validate before more perf" gate.** Decode-side ship-readiness fully confirmed (all 4 D4 fixtures ≥1.00×). Prefill side requires the bench-validated batch above; current cold baseline 0.319× projects to ~0.345-0.40× post-batch (iter60c +0.5-1pp + iter60b +2-5pp + iter59-mtnsg +0.05-0.2pp), still requires further levers to reach the ≥1.00× exit gate.
 
