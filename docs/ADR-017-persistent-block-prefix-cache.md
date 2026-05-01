@@ -1933,6 +1933,94 @@ specific work.
 in-tree substrate + audit + operator docs. Tests-only edit;
 zero `src/` touches in this session.
 
+### Phase D iter-3 2026-05-01 — P0-1 LANDED + P0-2 FALSIFIED
+
+Loop iter-3 fired ~30 min after iter-2; pre-bench audit found foreign
+SoC contention WORSE than iter-1 (foreign hf2q at 27 GiB resident,
+99% CPU; multiple `rustc` at 98%; ~10 GiB free RAM). Phase D bench
+remains blocked. Productive work: progress on the audit-harvest P0
+fixes via single-agent worktree-isolated edits + main-session
+verification.
+
+#### P0-1 LANDED — `fsync(parent_dir)` after `fs::rename` (commit `0be1754` on origin/main)
+
+`src/serve/kv_persist/format.rs:write_envelope` previously called
+`f.sync_all()` on the temp file then `std::fs::rename(...)` without
+fsync'ing the parent directory afterward. The kill-9 test
+(`tests/kv_persist_writer_kill_minus_9.rs`) covers SIGKILL atomicity
+but NOT power-loss durability — on APFS/ext4/XFS, the rename's
+dir-entry is durable only after the directory inode itself is
+fsync'd.
+
+Fix (worktree agent `ab57fe5e8fa6ab2fc` → cherry-pick →
+`0be1754`): add `File::open(parent)?.sync_all()?` after the rename.
+`cargo check --release --bin hf2q` exit 0 in 19.74s. Existing kill-9
+test continues to PASS unchanged (SIGKILL doesn't power-cycle disk,
+so the test's invariant is unaffected by the addition).
+
+#### P0-2 FALSIFIED — cross-process `flock` exists in hf2q (Agent 1 right; Agent 2 wrong)
+
+The 2026-05-01 worktree audit surfaced a disputed P0-2 finding:
+Agent 2 (adversarial review) claimed `serve/mod.rs:1719-1771` +
+`block_store.rs:100-128` had NO cross-process advisory `flock` on
+`cache_dir`; Agent 1 (oMLX crosscheck) claimed hf2q has finer-grained
+flock per `(model, hash[..2])` AND that hf2q is *stronger* than oMLX
+in this dimension.
+
+Code+test resolution in main session: Agent 1 is correct.
+
+- `src/serve/kv_persist/block_store.rs:27-34` (module docstring):
+  > "Writes acquire an advisory `flock(LOCK_EX)` keyed on
+  > `(model_fingerprint_short, block_hash[..2])` for the duration of
+  > the atomic-rename publication. The lock file lives at
+  > `<cache_root>/locks/<short>__<hash_prefix>.lock`. Pattern mirrors
+  > `serve/cache.rs::CacheLock` (ADR-005). `File` to keep the fd
+  > alive, `flock(LOCK_EX)` on acquire, fd-drop releases.
+  > Per-block-hash-prefix granularity (256 buckets per model) keeps
+  > the contention surface tight without one-lock-per-block fan-out."
+- `src/serve/kv_persist/block_store.rs:399`: real `unsafe { libc::flock(fd, libc::LOCK_EX) }` syscall.
+- `src/serve/kv_persist/block_store.rs:687`:
+  `advisory_lock_serializes_concurrent_writes` test exercises the lock.
+
+The lock granularity is finer than oMLX's whole-cache-root flock —
+hf2q permits concurrent multi-process access to *different* blocks
+while still serializing writes to the *same* block. Agent 2's P0-2
+was a false alarm caused by not finding the implementation; the
+actual concern (in-memory `BlockIndex` view divergence between two
+`cmd_serve --kv-persist=SAME_DIR` instances) is real but is NOT
+corruption — each process's writes go through the per-block flock,
+and stale index entries refresh on the next directory scan.
+
+P0-2 is REMOVED from the bench-blocker concern list.
+
+#### P0-3 in-flight — `*.tmp.<pid>` orphan GC at recovery scan
+
+`src/serve/kv_persist/recovery.rs:167-171`:
+```rust
+if name.contains(".tmp.") {
+    report.partial_tmp_files_ignored += 1;
+    return Ok(());
+}
+```
+
+The recovery scan COUNTS orphans but never deletes them. Combined
+with `budget_bytes = 0` hardcoded at `serve/mod.rs:1764` (P1-3),
+this is a slow-burn monotonic-growth bug for long-running
+deployments that experience frequent kill-9 / power-loss events.
+
+Fix scoped: best-effort GC of `.tmp.<pid>` files older than a TTL
+(60s default) at startup recovery scan. Recovery scan runs
+**before** this process's writer spawns; orphans older than the TTL
+cannot belong to any active writer in this or any other process
+(writes complete in <60s on M5 Max — the TTL gives slack for slow
+NVMe cells). Best-effort `fs::remove_file` ignores errors so a
+racing cross-process writer doesn't crash recovery. Adds
+`orphan_tmp_files_removed: usize` to `RecoveryReport`.
+
+Agent assignment: worktree-isolated coder, foreground; ~10 LOC
+edit + 1 unit test. Cherry-pick to `origin/main` after cargo
+check exit 0.
+
 ---
 
 ## Open Questions
