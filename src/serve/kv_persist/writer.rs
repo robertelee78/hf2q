@@ -75,6 +75,12 @@ impl AsyncWriterHandle {
     /// channel is at capacity, `TrySendError::Disconnected` if the
     /// worker has shut down. Inference threads use this to short-
     /// circuit a stall-prone spill (§R-P1).
+    ///
+    /// The `Err` variant is intentionally large — it carries ownership
+    /// of the failed [`WriteJob`] back to the caller so the body bytes
+    /// can be retried or dropped without re-extracting from the engine.
+    /// Boxing would force a heap alloc on the hot success path.
+    #[allow(clippy::result_large_err)]
     pub fn enqueue(&self, job: WriteJob) -> Result<(), TrySendError<WriteJob>> {
         match self.tx.as_ref() {
             Some(tx) => tx.try_send(job),
@@ -83,7 +89,10 @@ impl AsyncWriterHandle {
     }
 
     /// Blocking enqueue. Used by tests and by callers that explicitly
-    /// want back-pressure to wait rather than short-circuit.
+    /// want back-pressure to wait rather than short-circuit. The `Err`
+    /// variant carries the failed job for the same reason as
+    /// [`Self::enqueue`].
+    #[allow(clippy::result_large_err)]
     pub fn enqueue_blocking(
         &self,
         job: WriteJob,
