@@ -1059,6 +1059,31 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-05-01 — P19 H11 PARTIALLY CONFIRMED · `HF2Q_MM_ID_ROUTING_THRESHOLD` env override + 41/56-token sweep ⇒ mm_id setup overhead is real (high variance at small batch) but does NOT dominate enough at our operational range to justify changing the default threshold of 32
+
+**Hypothesis (from P19 step 1, commit `342b7d6`).** "mm_id setup overhead doesn't amortize at pp ≤ ~256: the `map0` pre-pass + the 8 KB shmem stage + the per-call concurrency-reset barrier all cost flat per call. With pp101 the `dispatch_id_mm_pooled` path runs gate+up+down × 40 = 120 mm_id calls. If each pays ~5–10 ms of GPU-wall, that alone is 600–1200 ms — possibly the biggest single cost." Test: bench an unbatched `mv_id`-route prefill at pp101 with the routing threshold over-ridden, compare wall time.
+
+**Implementation (mlx-native `23c78d0`).** Added `HF2Q_MM_ID_ROUTING_THRESHOLD` env var, read once into a `OnceLock` at first dispatch (`/opt/mlx-native/src/ops/quantized_matmul_id_ggml.rs:399-422`). Defaults to the compile-time `MM_ID_ROUTING_THRESHOLD = 32` const when unset or unparseable. Logged on `MLX_LOG_TENSOR_PROBE=1`. The two existing call sites in `quantized_matmul_id_ggml` and `_pooled` now read `mm_id_routing_threshold()` instead of the const directly. Behaviorally harmless when env unset.
+
+**Bench (3-rep cold P17b harness, M5 Max, dwq48 19.6 GB, hf2q `b5ca3d9`, mlx-native `23c78d0`).** The harness's `gen_prompt(target)` produces ~1.35 chars/token assuming the BASE_PASSAGE — but the integer-division rounding makes pp31/48/64 all collapse to the same 88-char prompt (= 41 actual BPE tokens), and pp80/101 collapse to a 176-char prompt (= 56 actual tokens). So our sweep effectively covered TWO actual-token points, with multiple cold-rep batches per point. Pooling all the data:
+
+| Actual tokens | mm_id route median (range)         | mv_id-only median (range)         | Winner |
+|---|---|---|---|
+| 41            | 153.50–194.10 (146.40..198.30) | 175.80–177.70 (175.40..177.80) | tie/mv_id (tighter variance, comparable median) |
+| 56            | 247.50–248.10 (183.30..248.70) | 215.10–215.40 (153.50..215.80) | **mm_id +15%** |
+
+**Key observations.**
+
+- At 41 actual tokens (the "pp31 cell") mm_id has wild run-to-run variance (~146..198, 35% spread) while mv_id is rock-solid (~175..178, 1.5% spread). Median compute is comparable; SLA is materially better with mv_id.
+- At 56 actual tokens mm_id wins by ~15% on median (248 vs 215). The map0 + 8 KB shmem stage cost amortizes by ~50 tokens.
+- Crossover lives between 41 and 56 actual tokens — a much narrower window than the H11 hypothesis predicted (which had suggested mm_id might lose all the way to pp ~256).
+
+**Verdict.** H11 is **partially confirmed**: the mm_id setup overhead IS real and IS the source of the variance at small-batch prefill, but it does NOT dominate enough to motivate changing the default `MM_ID_ROUTING_THRESHOLD` from 32. The current threshold puts us correctly: mm_id engages at 33+ tokens, where the variance penalty is balanced by the large-batch tile-reuse win. A threshold of 48–50 would gain ~3% predictability at pp31-class workloads without losing the pp101+ amortization, but the gain is marginal — defer until we have a workload that bottlenecks on small-batch tail latency.
+
+What this DOES give us: a runtime knob (`HF2Q_MM_ID_ROUTING_THRESHOLD=99999` to force mv_id-only) for future kernel work, plus the data point that **the mm_id route is NOT the dominant remaining bottleneck** vs llama.cpp's 4–7× steady-state advantage. H11 is closed; H10 (DeltaNet recurrence, 22% bucket) and H9 (per-layer commit boundary, 45% unaccounted bucket) remain open and now move higher in priority.
+
+**No changes to**: hf2q HEAD (no Rust edits in this commit), mlx-native default threshold const (still 32), tests (15/15 mlx-native Q4_K, 172/172 hf2q qwen35), sourdough gate, decode tok/s, total wall time. Mantra holds: **measure, falsify, only then change defaults**. The env-override unblocks future experiments without disturbing the production default.
+
 ### 2026-05-01 — P19 H12 LANDED · hoisted `upload_layer_weights_gpu` out of the prefill timer ⇒ pp31 metric jumps 23.80→153.50 t/s (6.4×), pp101 32.10→247.50 t/s (7.7×); real steady-state gap exposed at **3.4–6.7×** vs llama, not the 28–52× artifact
 
 **Hypothesis (from P19 step 1, commit `342b7d6`).** `cmd_generate_qwen35`'s `prefill_start = Instant::now()` (`src/serve/mod.rs:1348`) fires immediately before `forward_gpu_last_logits`, and `forward_gpu_impl` runs the FIRST-CALL `upload_layer_weights_gpu` (~17 GB Q4 → Metal heap, ~984 ms one-shot) inside that span. llama.cpp's `prompt eval time` excludes model load by construction (the model is loaded into Metal-backend memory before the timer starts in `llama-completion`). So the apparent 28–52× prefill gap was 50–70% accounting bias, not a steady-state compute deficit. Test: lift the cache-init out of `forward_gpu_impl` to a public method and call it from `cmd_generate_qwen35` BEFORE `prefill_start`. Compute unchanged, only the timer-span moves. Predict: pp31 reported `Prefill tok/s` ~5–7× higher; decode unchanged; coherence intact; full unit-test suite green; total wall time unchanged within noise.
