@@ -7,7 +7,8 @@
 - **Phase 2a (HTTP server) + Phase 2b (BERT embeddings) + Phase 2c (vision/mmproj)** — CLOSED
 - **Phase 3 (auto-pipeline + cache management)** — CLOSED iter-205 (5/5 ACs flipped, commits `bda046f` + `a7ce029` + `4604073`)
 - **Phase 4 (multi-model + architectures + reopen)** — CLOSED 2026-04-30 (iter-214 closure ceremony, 7/7 ACs full-flip; reopen iters 211/212/213 + iter-211b mmproj-stub closure landed between commits `2467675..76222f0`). See `#### Phase 4 reopen — 2026-04-30` subsection for the closure block.
-- **iter-219 (baseline)** — LANDED 2026-05-01 (commit `98f92b0`); 3 unit-level reproducers + LEAK_MARKERS coverage for the iter-218 honest-scope tool-call name + stray-content leak. Splitter+emitter unit surface verified correct against real-tokenizer round-trip; LIVE-only follow-up tracked as iter-219b (operator-driven re-capture).
+- **iter-219 (baseline)** — LANDED 2026-05-01 (commit `98f92b0`); 3 unit-level reproducers + LEAK_MARKERS coverage for the iter-218 honest-scope tool-call name + stray-content leak. Splitter+emitter unit surface verified correct against real-tokenizer round-trip.
+- **iter-219b (fix)** — LANDED 2026-05-01 (commit `8d5dbde`); 3-agent swarm characterized the LIVE bug as in-call `<|tool_response>` pollution; `is_valid_tool_name` defensive gate added at all 4 name-extraction sites; `iter219b_reproducer_tool_response_inside_call` test PASSES; 2419/2419 hf2q tests green.
 
 The 2026-04-30 closure ceremony also corrected accumulated stale framing in earlier doc-copy: ADR-013-blocker citations on AC 5468/5470 were stale (ADR-013 closed 2026-04-25 P14 commit `79140ec`; AC 5468 decode parity ±5% IS met at hf2q 0.9796× llama; Wave 5b.10 closed perf wall-clock to 4.34× ≤ 5×); line-citation drift in long-lived ADRs is now policy-noted (use grep-anchors not line numbers); the iter-211 mmproj_sha256 production-stub gap was closed in iter-211b via placeholder + post-write `patch_mmproj_sha256_in_gguf` helper. Defensive Q8_0 LMHEAD vocab-pad fix landed `76222f0` as collateral.
 
@@ -1518,6 +1519,35 @@ iter-218 delivers the structural fix: tool_calls=1 (no loop), `finish_reason="to
 **Honest scope-limit note:** iter-218 did NOT make scenario_2 LIVE pass; it converted the failure mode from "infinite loop hitting SSE timeout" to "fixture replay mismatch on a pre-existing malformed-name bug now-visible past the loop fix". This is forward progress: the loop fix is structural and durable; the malformed name is a localized regression in the streaming emitter or splitter logic, separately scoped to iter-219. Splitting these into two iters keeps each fix narrow + auditable, per the loop standing directive's "ask, don't guess" + "no shortcuts" mantra anchors.
 
 **Concurrent-context observation:** during iter-218 LIVE testing on HEAD c33b3de, a 110× decode regression was observed (Gemma 4 5.7 tok/s vs ~110 tok/s baseline). Independent of iter-218 (purely chat-template + grammar-shape changes); decode-rate regression sits in the inference path landed by ADR-017 a.3 BlockPrefixCacheSpiller (`c33b3de`) or earlier on the same parallel-session main HEAD. iter-218 LIVE timing is contaminated by this regression but the structural assertions (loop-eliminated, finish_reason, round-trip) are unaffected. The regression is tracked under separate ADR-015 / ADR-017 scope.
+
+###### iter-219b — Special-token-polluted name fix + 3-agent swarm characterization (2026-05-01)
+
+**Status: LANDED 2026-05-01 (commit `8d5dbde`).** iter-219 BASELINE pinned the splitter+emitter contract via 3 unit reproducers — all PASSed unprompted, falsifying the iter-218 doc-named splitter/emitter hypothesis. iter-219b spawned 3 worktree-isolated swarm agents to characterize what was actually upstream:
+
+- **Agent D** (peer cross-check `/opt/llama.cpp`): splitter equivalence on canonical streams; flagged grammar-shape divergence on `OneOrMoreCallsBodyOnly{parallel:false}` (hf2q strips leading `<|tool_call>` from grammar; llama.cpp keeps it inline). Saved as `docs/research/iter219b-llama-cpp-cross-check-2026-05-01.md`.
+- **Agent C** (grammar exhaust audit): `space ::= | " " | "\n"{1,2} [ \t]{0,20}` rule's empty alt + `[ \t]{0,20}` (min 0) keeps `is_accepted=true` perpetually; `is_dead` never flips. Engine break gate at `engine.rs:5045-5059` checks `is_accepted && bytes.is_empty()` — `<tool_call|>` decodes to 12 bytes (non-empty) so break is suppressed. iter-218's stated "grammar-exhaust" termination is **structurally broken**. Saved as `docs/research/iter219b-grammar-exhaust-audit-2026-05-01.md`.
+- **Agent A** (LIVE byte capture): spawned hf2q-serve against the daily-driver Gemma 4 GGUF, curled scenario_2 tools-streaming, captured raw SSE. **Pinpointed root cause**: model emits `<|tool_response>` (token id 50) MID-tool-call-body. The `ToolCallSplitter` only watches for `<|tool_call>` open / `<tool_call|>` close — `<|tool_response>` flows through `ToolCallText` verbatim, polluting body. The iter-219 BASELINE unit reproducers didn't cover this in-call special-token-pollution case.
+
+**Fix (defensive validity gate):** `pub fn is_valid_tool_name(&str) -> bool` in `src/serve/api/registry.rs` enforces OpenAI-spec `^[a-zA-Z0-9_-]+$`. Wired into `extract_gemma4_name_prefix`, `extract_qwen35_name_prefix` (engine.rs streaming path) + `parse_gemma4_tool_call`, `parse_qwen35_tool_call` (registry.rs close-buffered path). Polluted names return `None`, triggering Auto-policy `Content(raw_body)` fallback.
+
+**Test:** `iter219b_reproducer_tool_response_inside_call` (engine.rs `tool_call_stream_emitter_tests`) — pre-fix: `name = Some("get_current<|tool_response>call:get_current_weather")` FAILS; post-fix: `name = None` PASSES.
+
+**Run:** `cargo test --release --bin hf2q` → **2419/2419 PASS**.
+
+**Honest scope-limit notes:**
+
+1. Fix is defensive at name-validation layer. Deeper splitter contract (in-call special-token markers should be RESYNC points that abort the malformed body, not silently absorbed) is NOT addressed here. Future iter-219c could extend `ToolCallSplitter::feed` to recognize `<|tool_response>` / `<|channel>` / `<|turn>` as resync events.
+
+2. Agent C's structural finding stands separately: iter-218's "grammar-exhaust" termination IS broken (`is_dead` never flips for `OneOrMoreCallsBodyOnly{parallel:false}`). That's a separate close-gate gap. Decode loop currently relies on max_tokens / EOS / stop-strings to halt past the close marker. Future iter could (a) replace `space` with self-exhausting rule or (b) signal-based stop-on-ToolCallClose.
+
+3. **Concurrent-context observation (NOT iter-219b scope).** Agent A's LIVE capture noted model produces NaN logits (`262144/262144 NaN`) on HEAD `7c6c160` causing 1 t/s decode. Upstream of the tool-call routing bug; likely parallel-session ADR-013/017 collateral. Decode bench at HEAD `7c6c160` measured 96.9 t/s on standalone `hf2q generate` (iter-219 BASELINE companion finding) — so the NaN issue is request-shape-specific or LIVE-serve-specific, not a structural decode regression. Tracked separately.
+
+**Files touched (`8d5dbde`):**
+
+- `src/serve/api/registry.rs` — +24/-1 LOC: `is_valid_tool_name` helper + 2 parse-site validations.
+- `src/serve/api/engine.rs` — +94/-9 LOC: 2 extract-site validations + parameterized `drive_splitter_emitter_pipeline_with_policy` test helper + `iter219b_reproducer_tool_response_inside_call` test.
+- `docs/research/iter219b-llama-cpp-cross-check-2026-05-01.md` — Agent D research note.
+- `docs/research/iter219b-grammar-exhaust-audit-2026-05-01.md` — Agent C research note.
 
 ###### iter-219 — Tool-call name-extract + stray content-leak baseline (2026-05-01)
 
