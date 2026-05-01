@@ -2,11 +2,12 @@
 
 **Status:** Phase 1b Walk **CLOSED with full coverage 2026-04-26 (iter-112b W39)** — `scripts/release-check.sh` PASS on **all eight gates A–H** end-to-end at HEAD `8e5776e` (Gate B median-of-3 = 101.1 tok/s, parity suite 6/6, prefill = 3279.5 tok/s, dispatches/decode_tok = 988.2, syncs = 1, **Gate H cosine_mean=0.999672, p1=0.996080, argmax=0.0080, PPL Δ=0.0014**). Original seven-dense-gate closure landed iter-110 W20 2026-04-25 at HEAD `24b4029`; the TQ-active companion Gate H (ADR-007 §853-866) closed iter-112b W39 after fixing W21's two layered LazyLock-freeze + static-atomic bugs. Original closeout-in-progress declared 2026-04-16 via backend migration (ADR-008 candle divorce) + sharpened closure contract (party-mode disposition, same date). Walk-correctness end gate met 2026-04-11; Walk-speed end gate met within measurement variance (101.7 tok/s median sourdough decode on HEAD `388ad3d` vs 102.01 peer). The 2026-04-16 amendment reclassified the four "open after closeout" items and the historical `[ ]` checklist into a concrete gate set (A–G) enforced mechanically by `scripts/release-check.sh`; Phase 1b is formally closed when release-check.sh PASSes on all seven gates. Residual parity and determinism work that was "tracked downstream" is now surfaced as Phase 1b gates A–G prerequisites. **Phase 2 scope refined 2026-04-23 (party-mode session `adr_005_phase_2`)**: vision absorbed into Phase 2 as sub-phase **2c**; downstream phases renumbered (old Phase 3 → 2c, old Phase 4 → Phase 3, old Phase 5 → Phase 4); 27 design decisions recorded; continuous-batching carved out to a future ADR (see "Concurrent-deployment scaling (deferred)" section).
 
-**ADR-005 OVERALL STATUS — CLOSED 2026-04-30.** Every phase reached terminal state for today's tree:
+**ADR-005 OVERALL STATUS — CLOSED 2026-04-30 (iter-219 baseline regression guards added 2026-05-01).** Every phase reached terminal state for today's tree:
 - **Phase 1 + Phase 1b** — CLOSED 2026-04-26 (iter-112b W39, all 8 gates A–H pass)
 - **Phase 2a (HTTP server) + Phase 2b (BERT embeddings) + Phase 2c (vision/mmproj)** — CLOSED
 - **Phase 3 (auto-pipeline + cache management)** — CLOSED iter-205 (5/5 ACs flipped, commits `bda046f` + `a7ce029` + `4604073`)
 - **Phase 4 (multi-model + architectures + reopen)** — CLOSED 2026-04-30 (iter-214 closure ceremony, 7/7 ACs full-flip; reopen iters 211/212/213 + iter-211b mmproj-stub closure landed between commits `2467675..76222f0`). See `#### Phase 4 reopen — 2026-04-30` subsection for the closure block.
+- **iter-219 (baseline)** — LANDED 2026-05-01 (commit `98f92b0`); 3 unit-level reproducers + LEAK_MARKERS coverage for the iter-218 honest-scope tool-call name + stray-content leak. Splitter+emitter unit surface verified correct against real-tokenizer round-trip; LIVE-only follow-up tracked as iter-219b (operator-driven re-capture).
 
 The 2026-04-30 closure ceremony also corrected accumulated stale framing in earlier doc-copy: ADR-013-blocker citations on AC 5468/5470 were stale (ADR-013 closed 2026-04-25 P14 commit `79140ec`; AC 5468 decode parity ±5% IS met at hf2q 0.9796× llama; Wave 5b.10 closed perf wall-clock to 4.34× ≤ 5×); line-citation drift in long-lived ADRs is now policy-noted (use grep-anchors not line numbers); the iter-211 mmproj_sha256 production-stub gap was closed in iter-211b via placeholder + post-write `patch_mmproj_sha256_in_gguf` helper. Defensive Q8_0 LMHEAD vocab-pad fix landed `76222f0` as collateral.
 
@@ -1517,6 +1518,34 @@ iter-218 delivers the structural fix: tool_calls=1 (no loop), `finish_reason="to
 **Honest scope-limit note:** iter-218 did NOT make scenario_2 LIVE pass; it converted the failure mode from "infinite loop hitting SSE timeout" to "fixture replay mismatch on a pre-existing malformed-name bug now-visible past the loop fix". This is forward progress: the loop fix is structural and durable; the malformed name is a localized regression in the streaming emitter or splitter logic, separately scoped to iter-219. Splitting these into two iters keeps each fix narrow + auditable, per the loop standing directive's "ask, don't guess" + "no shortcuts" mantra anchors.
 
 **Concurrent-context observation:** during iter-218 LIVE testing on HEAD c33b3de, a 110× decode regression was observed (Gemma 4 5.7 tok/s vs ~110 tok/s baseline). Independent of iter-218 (purely chat-template + grammar-shape changes); decode-rate regression sits in the inference path landed by ADR-017 a.3 BlockPrefixCacheSpiller (`c33b3de`) or earlier on the same parallel-session main HEAD. iter-218 LIVE timing is contaminated by this regression but the structural assertions (loop-eliminated, finish_reason, round-trip) are unaffected. The regression is tracked under separate ADR-015 / ADR-017 scope.
+
+###### iter-219 — Tool-call name-extract + stray content-leak baseline (2026-05-01)
+
+**Status: BASELINE LANDED 2026-05-01 (commit `98f92b0`).** iter-218's honest-scope flagged two pre-existing bugs surfaced past the loop fix:
+
+1. **Malformed name** — engine emitted `function":{"name":"get_currentcall:get_current_weather"}` instead of clean `get_current_weather`.
+2. **Stray content** — `\n            <|tool_response>` leaked into `delta.content` after `<tool_call|>` close.
+
+iter-219 lands the **unit-level reproducer + LEAK_MARKERS coverage**, not a code-change fix: the hypothesized splitter→emitter byte-stream paths the iter-218 doc named (`extract_gemma4_name_prefix` + `ToolCallSplitter` body assembly when leading `get_current` content precedes `<|tool_call>`) all PASS unprompted on HEAD. The LIVE bug therefore lives outside the splitter→emitter unit surface; without a live-model capture it cannot be characterized further at the unit level. The regression guards stand as a contract pin; the LIVE fix is a separate iter (iter-219b or operator-driven LIVE re-capture).
+
+**Reproducer scope (`src/serve/api/engine.rs::tool_call_stream_emitter_tests`):**
+
+- `iter219_baseline_single_fragment_yields_clean_name` — whole template-shaped sequence in one fragment yields name=`get_current_weather`. Establishes splitter+emitter is correct when token-boundary issues are absent.
+- `iter219_reproducer_token_boundary_yields_clean_name` — feed the byte stream as 20 individual decoded fragments matching the real Gemma 4 tokenizer encode→decode round-trip (`<|tool_response>`, `get`, `_`, `current`, `<|tool_call>`, `call`, `:`, `get`, `_`, `current`, `_`, `weather`, `{`, `location`, `:`, `<|"|>`, `Paris`, `<|"|>`, `}`, `<tool_call|>` — verified token ids `[50, 828, 236779, 4002, 48, 6639, 236787, ...]` against `models/gemma-4-26B-A4B-it-ara-abliterated-dwq/tokenizer.json` 2026-04-30). Asserts the same clean name.
+- `iter219_reproducer_leading_get_current_content_isolated` — bare `get_current` content fragment before the open marker (the structural shape iter-218's scope note called out). Asserts the leading content stays in `delta.content`, never prepends to body.
+
+**Outcome:** all 3 PASS on HEAD `98f92b0`. The splitter+emitter handles every byte stream consistent with the tokenizer round-trip correctly. Whatever produced the LIVE malformed name is upstream of the splitter (candidates: model-emitted bytes the grammar/mask should have filtered; cache-replay path; or a different LIVE-only sequence the unit harness can't hypothesize). Per the engineering mantra ("Code + test == truth"): the prior text marked iter-219 as a fix-needed item; the unit-level reproducers say the hypothesized splitter/emitter surface is correct. The LIVE bug remains uncharacterized at the unit level — these guards pin the contract, not a fix claim.
+
+**Companion: stray content-leak gate (`tests/openwebui_multiturn.rs`).** `assert_no_leaked_special_tokens` LEAK_MARKERS extended with `<|tool_response>` (token id 50) and `<tool_response|>` (id 51) so the iter-218 stray-content leak class is loud at LIVE-test time. The Gemma 4 model is trained to expect `<|tool_response>...<tool_response|>` from the host post-`<tool_call|>`; absent grammar exhaust, the next decoded token can be that open marker which decodes to its literal text. Registry update is purely additive (10 → 12 markers); existing single-call gemma4 LIVE captures stay unaffected.
+
+**Files touched (`98f92b0`):**
+
+- `src/serve/api/engine.rs` — +207 LOC at `tool_call_stream_emitter_tests` mod (3 new tests + a `drive_splitter_emitter_pipeline` helper that mirrors `route_content` at engine.rs:4598+).
+- `tests/openwebui_multiturn.rs` — +14/-1 LOC in `LEAK_MARKERS` registry + doc-comment.
+
+**Run:** `cargo test --release --bin hf2q tool_call_stream_emitter` → 11/11 PASS (8 pre-existing + 3 new).
+
+**Honest scope-limit note (must not paper over).** iter-219 BASELINE does NOT close the LIVE scenario_2 fixture-replay mismatch. It splits the iter-218 honest-scope into (a) a unit-level pin that the splitter+emitter surface is contract-stable AND (b) a residue of "LIVE-only failure mode whose root cause is upstream of the unit harness." Future iter-219b (LIVE-driven) will need a curl-bytes capture from a fresh hf2q-serve spawn against the gemma-4 GGUF post-iter-218 to hypothesize the actual upstream leak point. **Per Phase 4 closure ceremony (iter-214) line 1317 — Phase 4 status remains CLOSED 2026-04-30; iter-219 is a follow-up regression-guard layer, not a re-open.**
 
 ##### Test plan (cross-iter)
 
