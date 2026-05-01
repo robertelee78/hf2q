@@ -1711,10 +1711,40 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             "ADR-017 C.1: kv-persist recovery scan complete"
         );
 
-        // 3. DiskBlockStore — owns the read-path file I/O. The
-        //    `budget_bytes = 0` argument disables the on-disk LRU
-        //    budget (unbounded growth — Phase D wires the budget
-        //    against `HF2Q_KV_PERSIST_BUDGET_BYTES`).
+        // 3. DiskBlockStore — owns the read-path file I/O.
+        //
+        //    ADR-017 P1-3 (adversarial review fix): wire the on-disk
+        //    LRU budget from `HF2Q_KV_PERSIST_BUDGET_BYTES` (u64,
+        //    bytes). Default `0` = unlimited (matches the pre-P1-3
+        //    behavior so the env var is purely additive). Per
+        //    ADR-017 §R7 the intended future default is "10% of
+        //    unified RAM" (~12.8 GiB on a 128-GiB M5 Max); that
+        //    requires a `mlx_native::sysinfo::physical_ram_bytes()`
+        //    helper which does not yet exist, and per the standing
+        //    directive we do NOT add a new mlx-native dep just for
+        //    this. Operators set the env var explicitly until §R7's
+        //    helper lands.
+        //
+        //    Construct via `new_with_index` (kept at 0 for
+        //    source-compat with existing callers), then override
+        //    through `set_budget_bytes` so the AtomicU64 holds the
+        //    parsed value before any eviction call fires.
+        let kv_persist_budget_bytes: u64 =
+            match std::env::var("HF2Q_KV_PERSIST_BUDGET_BYTES") {
+                Ok(raw) => match raw.trim().parse::<u64>() {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        tracing::warn!(
+                            raw = %raw,
+                            error = %err,
+                            "ADR-017 P1-3: HF2Q_KV_PERSIST_BUDGET_BYTES \
+                             parse failed; defaulting to 0 (unlimited)"
+                        );
+                        0
+                    }
+                },
+                Err(_) => 0,
+            };
         let store = Arc::new(
             DiskBlockStore::new_with_index(cache_dir.clone(), recovered_index, 0)
                 .with_context(|| {
@@ -1723,6 +1753,11 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
                         cache_dir.display()
                     )
                 })?,
+        );
+        store.set_budget_bytes(kv_persist_budget_bytes);
+        tracing::info!(
+            budget_bytes = kv_persist_budget_bytes,
+            "ADR-017 P1-3: HF2Q_KV_PERSIST_BUDGET_BYTES wired (0 = unlimited)"
         );
 
         // 4. AsyncWriterHandle — owns the write-path background

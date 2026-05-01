@@ -881,4 +881,43 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// ADR-017 P1-3: `set_budget_bytes(0)` is the documented "unlimited"
+    /// sentinel. The getter must echo it so the cmd_serve startup
+    /// `tracing::info!(budget_bytes = ...)` reflects the actual stored
+    /// value rather than whatever was passed at construction.
+    #[test]
+    fn set_budget_bytes_zero_means_unlimited() {
+        let dir = temp_dir("budget-zero");
+        // Construct with a non-zero seed so the test exercises the
+        // store→0 transition (catches a hypothetical bug where
+        // set_budget_bytes(0) was a no-op).
+        let store = DiskBlockStore::new(dir.clone(), 1 << 20).expect("new");
+        assert_eq!(store.budget_bytes(), 1 << 20);
+        store.set_budget_bytes(0);
+        assert_eq!(store.budget_bytes(), 0, "0 = unlimited sentinel");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-017 P1-3: a non-zero budget set via the runtime mutator
+    /// must round-trip through the getter. cmd_serve reads
+    /// `HF2Q_KV_PERSIST_BUDGET_BYTES`, parses to u64, and calls
+    /// `set_budget_bytes(parsed)` AFTER `new_with_index(..., 0)`; this
+    /// test pins that contract.
+    #[test]
+    fn set_budget_bytes_nonzero_persists_through_lookup() {
+        let dir = temp_dir("budget-nonzero");
+        let store = DiskBlockStore::new(dir.clone(), 0).expect("new");
+        assert_eq!(store.budget_bytes(), 0);
+        const ONE_GIB: u64 = 1 << 30;
+        store.set_budget_bytes(ONE_GIB);
+        assert_eq!(store.budget_bytes(), ONE_GIB);
+        // Second mutation: prove the AtomicU64 isn't write-once.
+        const FOUR_GIB: u64 = 4u64 << 30;
+        store.set_budget_bytes(FOUR_GIB);
+        assert_eq!(store.budget_bytes(), FOUR_GIB);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
