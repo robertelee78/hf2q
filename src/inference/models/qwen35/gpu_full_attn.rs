@@ -1551,9 +1551,69 @@ pub fn build_gated_attn_layer(
         }
         (x_norm, q_flat, k_flat, v_flat, gate_flat, q_normed, k_normed, q_rope, k_rope)
     };
+    // ADR-015 iter61a-3: dump pre-rope checkpoints BEFORE the drop below.
+    // ops1-4 was committed sync for prefill, so as_slice is safe.
+    super::dump_bisect::dump_in_layer(
+        "fa_x_norm",
+        &x_norm,
+        &[seq_len as usize, hidden_size as usize],
+        device,
+    );
+    super::dump_bisect::dump_in_layer(
+        "fa_q_flat",
+        &q_flat,
+        &[seq_len as usize, q_total as usize],
+        device,
+    );
+    super::dump_bisect::dump_in_layer(
+        "fa_k_flat",
+        &k_flat,
+        &[seq_len as usize, kv_total as usize],
+        device,
+    );
+    super::dump_bisect::dump_in_layer(
+        "fa_q_normed",
+        &q_normed,
+        &[seq_len as usize, n_heads as usize, head_dim as usize],
+        device,
+    );
+    super::dump_bisect::dump_in_layer(
+        "fa_k_normed",
+        &k_normed,
+        &[seq_len as usize, n_kv_heads as usize, head_dim as usize],
+        device,
+    );
     // Suppress unused variable warnings for intermediate buffers that were
     // consumed by downstream ops within the same encoder.
     let _ = (x_norm, q_flat, k_flat, q_normed, k_normed);
+
+    // ---- ADR-015 iter61a-3: within-layer bisection dumps (post ops1-4 commit_and_wait) ----
+    // The ops1-4 encoder above committed (sync for prefill), so q_rope/k_rope/
+    // v_flat/gate_flat/q_normed/k_normed are GPU-finalized and as_slice-safe.
+    super::dump_bisect::dump_in_layer(
+        "fa_q_rope",
+        &q_rope,
+        &[seq_len as usize, n_heads as usize, head_dim as usize],
+        device,
+    );
+    super::dump_bisect::dump_in_layer(
+        "fa_k_rope",
+        &k_rope,
+        &[seq_len as usize, n_kv_heads as usize, head_dim as usize],
+        device,
+    );
+    super::dump_bisect::dump_in_layer(
+        "fa_v_flat",
+        &v_flat,
+        &[seq_len as usize, n_kv_heads as usize, head_dim as usize],
+        device,
+    );
+    super::dump_bisect::dump_in_layer(
+        "fa_gate_flat",
+        &gate_flat,
+        &[seq_len as usize, n_heads as usize, head_dim as usize],
+        device,
+    );
 
     // ---- Op 5: SDPA (causal, GQA) with optional KV-cache threading ----
     // Wave 5b.9: per-FA-layer SDPA op5 wall (gated on HF2Q_PROFILE_W5B8=1).
@@ -1578,6 +1638,15 @@ pub fn build_gated_attn_layer(
         }
     };
     // attn_out is now [seq * n_heads, head_dim] seq-major.
+
+    // ADR-015 iter61a-3: dump SDPA output (the candidate point of divergence
+    // since flash_attn_prefill is the suspected non-determinism site).
+    super::dump_bisect::dump_in_layer(
+        "fa_sdpa_out",
+        &attn_out,
+        &[seq_len as usize, n_heads as usize, head_dim as usize],
+        device,
+    );
 
     // ---- Ops 6–7: sigmoid-gate multiply + output projection ----
     let out = {

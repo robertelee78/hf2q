@@ -509,6 +509,18 @@ fn apply_output_head_gpu(
     if dump_layer_n().is_some() {
         dump_hidden_stats("output_norm", &normed, seq_len, hidden_size);
     }
+    // ADR-015 iter61a-3: per-op bisection dump for output_norm (the last
+    // residual-stream value entering lm_head).  No layer index — always-on.
+    if super::dump_bisect::is_enabled() {
+        super::dump_bisect::dump(
+            super::dump_bisect::current_step().saturating_sub(1),
+            None,
+            "output_norm",
+            &normed,
+            &[seq_len as usize, hidden_size as usize],
+            device,
+        );
+    }
 
     download_f32(&logits_buf).context("download logits")
 }
@@ -677,6 +689,29 @@ fn apply_output_head_gpu_greedy(
         argmax_params,
         logits_buf,
     )?;
+
+    // ADR-015 iter61a-3: per-op bisection dumps for the output-head stage.
+    // The terminal commit_and_wait above guarantees `normed` and `logits_buf`
+    // contain finalized GPU writes, so as_slice reads are safe.
+    if super::dump_bisect::is_enabled() {
+        let step = super::dump_bisect::current_step().saturating_sub(1);
+        super::dump_bisect::dump(
+            step,
+            None,
+            "output_norm",
+            normed,
+            &[1, hidden_size as usize],
+            device,
+        );
+        super::dump_bisect::dump(
+            step,
+            None,
+            "argmax_logits",
+            logits_buf,
+            &[1, vocab_size as usize],
+            device,
+        );
+    }
 
     // Download only 4 bytes (the winning token ID).
     let token_id = out_index
@@ -1286,6 +1321,24 @@ impl Qwen35Model {
             dump_embed_bin(prefix, &hidden, seq_len, h);
         }
 
+        // ADR-015 iter61a-3: per-op bisection dump (HF2Q_DUMP_LAYER env gate).
+        // Whole-buffer dump (not just last-token) so two cold-process runs can
+        // be byte-diffed to find the earliest divergence.  Zero-cost when env
+        // unset.
+        let bisect_step = if super::dump_bisect::is_enabled() {
+            super::dump_bisect::next_step()
+        } else {
+            0
+        };
+        super::dump_bisect::dump(
+            bisect_step,
+            None,
+            "embed",
+            &hidden,
+            &[seq_len as usize, h as usize],
+            &device,
+        );
+
         // ---- Step 2: per-layer forward pass ----
         let decode_profile = std::env::var("HF2Q_DECODE_PROFILE").is_ok();
         let mut total_attn_us = 0u64;
@@ -1296,6 +1349,9 @@ impl Qwen35Model {
         let mut total_full_attn_us = 0u64;
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
             let layer_cpu = &self.layers[layer_idx];
+
+            // ADR-015 iter61a-3: thread-local tag for within-layer dump call sites.
+            super::dump_bisect::set_current_layer(bisect_step, layer_idx);
 
             // Wave 5b.8: per-layer total wall-clock — captures attn +
             // residual+norm + FFN + residual2 for the whole layer body,
@@ -1835,11 +1891,12 @@ impl Qwen35Model {
                 LayerWeightsGpu::FullAttn { .. } => None,
             };
             // Keep a clone for the optional layer dump below; only paid when dump is active.
-            let ffn_out_for_dump = if dump_layer_n().is_some() {
-                Some(ffn_out.clone())
-            } else {
-                None
-            };
+            let ffn_out_for_dump =
+                if dump_layer_n().is_some() || super::dump_bisect::is_enabled() {
+                    Some(ffn_out.clone())
+                } else {
+                    None
+                };
             hidden = match ffn_weights_gpu {
                 FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::Dense(_) | FfnWeightsGpu::DenseQ(_) => {
                     // Residual already folded in build_moe_ffn_layer_gpu_q /
@@ -1884,6 +1941,37 @@ impl Qwen35Model {
                         dump_hidden_stats(&format!("layer{layer_idx}_ffn_out"), fo, seq_len, h);
                     }
                 }
+            }
+
+            // --- ADR-015 iter61a-3: per-op bisection dumps (HF2Q_DUMP_LAYER) ---
+            // Whole-buffer dumps for cold-vs-cold byte-diff bisection.
+            if super::dump_bisect::is_enabled() {
+                super::dump_bisect::dump(
+                    bisect_step,
+                    Some(layer_idx),
+                    "attn_out",
+                    &attn_out,
+                    &[seq_len as usize, h as usize],
+                    &device,
+                );
+                if let Some(ref fo) = ffn_out_for_dump {
+                    super::dump_bisect::dump(
+                        bisect_step,
+                        Some(layer_idx),
+                        "ffn_out",
+                        fo,
+                        &[seq_len as usize, h as usize],
+                        &device,
+                    );
+                }
+                super::dump_bisect::dump(
+                    bisect_step,
+                    Some(layer_idx),
+                    "layer_out",
+                    &hidden,
+                    &[seq_len as usize, h as usize],
+                    &device,
+                );
             }
 
             // --- HF2Q_DUMP_LAYER_ACTIVATIONS binary dump ---
@@ -2266,6 +2354,21 @@ impl Qwen35Model {
             decode_bufs.embed_buf.clone()
         };
 
+        // ADR-015 iter61a-3: per-op bisection dump (HF2Q_DUMP_LAYER env gate).
+        let bisect_step = if super::dump_bisect::is_enabled() {
+            super::dump_bisect::next_step()
+        } else {
+            0
+        };
+        super::dump_bisect::dump(
+            bisect_step,
+            None,
+            "embed",
+            &hidden,
+            &[seq_len as usize, h as usize],
+            &device,
+        );
+
         // ---- ADR-015 P3 Stage 1: HF2Q_LEGACY_PER_LAYER_CB env-gate ----
         //
         // When set to "1", takes the legacy per-helper-commit path
@@ -2394,6 +2497,8 @@ impl Qwen35Model {
         let n_layers = layer_weights_gpu.len();
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
             let layer_cpu = &self.layers[layer_idx];
+            // ADR-015 iter61a-3: thread-local tag for within-layer dump call sites.
+            super::dump_bisect::set_current_layer(bisect_step, layer_idx);
             let post_norm_w = match layer_gpu {
                 LayerWeightsGpu::FullAttn { attn, .. } => &attn.post_attn_norm,
                 LayerWeightsGpu::LinearAttn { attn, .. } => &attn.post_attn_norm,
@@ -3116,6 +3221,37 @@ impl Qwen35Model {
                 _ => residual_add_gpu(ffn_residual_buf_ref, &ffn_out, &device, &mut registry)
                     .with_context(|| format!("residual ffn greedy layer {layer_idx}"))?,
             };
+
+            // ADR-015 iter61a-3: per-op bisection dumps at layer end.
+            // We dump (a) ffn_residual_buf_ref = post-attn-residual (= input
+            // hidden + attn_out, the stable checkpoint between attn and FFN),
+            // and (b) hidden = post-FFN-residual (= layer output).
+            // attn_out / ffn_out are scoped inside the use_single_cb_layer
+            // branch above; the stable checkpoints we capture here narrow
+            // divergence to a single layer (first-pass).  Within-layer
+            // narrowing is a follow-up iter using HF2Q_DUMP_LAYER=<N>.
+            if super::dump_bisect::is_enabled() {
+                // Defensive flush of the post-loop chain encoder happens
+                // below; but per-layer commits in the !partial_chain path
+                // are async (`commit_labeled`), so dump_bisect's own
+                // flush_gpu() ensures the buffer is written before read.
+                super::dump_bisect::dump(
+                    bisect_step,
+                    Some(layer_idx),
+                    "ffn_residual",
+                    ffn_residual_buf_ref,
+                    &[seq_len as usize, h as usize],
+                    &device,
+                );
+                super::dump_bisect::dump(
+                    bisect_step,
+                    Some(layer_idx),
+                    "layer_out",
+                    &hidden,
+                    &[seq_len as usize, h as usize],
+                    &device,
+                );
+            }
         }
 
         if decode_profile {
