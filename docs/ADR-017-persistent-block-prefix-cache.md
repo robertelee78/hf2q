@@ -1360,6 +1360,92 @@ Phase D drives the operator-facing flag-on coherence run on Gemma 4 26B Q4_0 und
 
 **Cumulative ADR-017 LOC:** A complete (5,066 LOC) + B-dense.1 (1,829 LOC) + C.1 (1,587 LOC) = **8,482 LOC** of in-tree substrate + per-family hook + CLI substrate. **94 in-binary unit tests + 1 kill-9 integration test + 36 harness tests, all PASS.** Phase B-dense.2 (real `Gemma4DenseSpill` registration on operator-loaded GGUF + parity matrix) is now the gating item between this code and operator-facing `cmd_serve --kv-persist=PATH` with semantically active KV persistence.
 
+### Phase B-dense.2 LANDED (2026-04-30)
+
+CFA solo Claude (parallel ADR-005 Phase 4 session active; sequential per Robert directive 2026-04-30): adds the **lazy real-hook construction seam** so `cmd_serve --kv-persist=PATH` can register a `Gemma4DenseSpillFactory` at startup before any engine has loaded, then have the registry materialize a real `Gemma4DenseSpill` on the first successful engine load. Phase C.1 already wired the stub at startup; B-dense.2 closes the gap between stub registration and real `KvCacheSpill` semantics for the Gemma 4 family.
+
+**Pattern: `FamilyHookFactory` (lazy real-hook construction at first engine load)**
+
+The `Gemma4DenseSpill`'s shape config (sliding_window, max_decode_tokens, layer_types, kv_dtype, nkv_heads, head_dim, num_layers) ALL come from the live engine's `MlxModelWeights`. At `cmd_serve` startup the operator's GGUF has not yet been loaded — `MlxModelWeights` does not exist. The C.1 stub registration exists precisely so the spiller substrate has *some* hook to dispatch into; B-dense.2 wires the real hook lazily on the first load via this factory.
+
+```rust
+pub trait FamilyHookFactory: Send + Sync {
+    fn try_construct(
+        &self,
+        engine_dyn: Arc<dyn Any + Send + Sync>,
+    ) -> Option<(Arc<Mutex<dyn KvCacheSpill>>, Arc<dyn EngineBindable>)>;
+}
+```
+
+**Substitution call chain (atomic per the registry contract):**
+
+```text
+LoaderWrapper::load(path, config) -> Engine
+  ├─ inner.load(path, config) -> Engine                    (real loader, e.g. DefaultModelLoader)
+  ├─ pending_bind = take((repo, quant))                    (consume operator-armed slot)
+  ├─ arc_engine = Arc::new(engine)
+  ├─ dyn_view = arc_engine as Arc<dyn Any + Send + Sync>
+  ├─ kv_hook_opt = registry.try_substitute_on_load(repo, quant, dyn_view.clone())
+  │    └─ factory = factories[(repo, quant)]               (RwLock read; clone Arc out)
+  │    └─ (kv_hook, bindable_hook) = factory.try_construct(dyn_view)?
+  │    └─ hooks[(repo, quant)] = bindable_hook             (RwLock write; OVERWRITE)
+  │    └─ return Some(kv_hook)
+  ├─ if Some(kv_hook): spiller.register_family(repo, quant, kv_hook)   (in lock-step with hooks)
+  ├─ registry.bind_for(repo, quant, dyn_view)              (no-op on substituted hook; harmless)
+  └─ Arc::try_unwrap(arc_engine) -> engine                 (return to manager)
+```
+
+If `factory.try_construct` returns `None` (engine type mismatch — the auto-`Arc<Engine>` path is ALWAYS rejected by the Gemma 4 factory because it expects `Arc<EngineHandle>`), `try_substitute_on_load` returns `None` and the substitution is a no-op. The existing C.1 stub registration remains in BOTH the spiller's `register_family` map AND the registry's `hooks` map; `bind_for` falls through to the stub's silent-no-op `bind_engine` impl. This is the EXPECTED B-dense.2 wire-up state for the auto-LoaderWrapper path: the `Engine`-typed Arc never matches an `EngineHandle`-expecting factory, so substitution requires a SEPARATE explicit post-load `try_substitute_on_load(repo, quant, Arc::new(engine_handle))` call from `cmd_serve`. That explicit call lands as part of the Phase D coherence + perf integration (task #14); B-dense.2 LANDS the seam, the matrix harness, and the factory itself.
+
+**Why not modify `LoaderWrapper` to deliver `Arc<EngineHandle>` directly:** the wrapper is generic over the engine type `E`; it has no knowledge of family-specific concrete types. Pulling `EngineHandle` (a Gemma-4-specific type defined in `gemma4_dense.rs`) into `loader_wrapper.rs` would break the family-agnostic contract. The factory pattern preserves wrapper genericity while letting per-family hooks declare their own engine-type expectations.
+
+**Surface delta (additive; no trait modifications):**
+
+| File | Δ | What |
+|---|---|---|
+| `src/serve/kv_persist/registry.rs` | +254 LOC | `FamilyHookFactory` trait, factory map, `register_factory` / `factory_count` / `contains_factory` / `try_substitute_on_load`. 6 new unit tests. |
+| `src/serve/kv_persist/families/gemma4_dense.rs` | +178 LOC | `try_from_engine_arc` helper on `Gemma4DenseSpill`, `Gemma4DenseSpillFactory` impl `FamilyHookFactory`. 4 new unit tests (Metal-gated where populated handle is needed). |
+| `src/serve/kv_persist/loader_wrapper.rs` | +146 LOC | Optional `spiller` field + `set_spiller`; `load(...)` calls `try_substitute_on_load` BEFORE `bind_for`; on Some, calls `update_spiller_registration` so registry + spiller stay in lock-step. 2 new unit tests. |
+| `src/serve/mod.rs` cmd_serve --kv-persist block | +63 LOC | Registers `Gemma4DenseSpillFactory` (placeholder shape config) alongside the C.1 stub; calls `wrapper.set_spiller(spiller)` so substitution updates both sides. |
+| `tests/kv_persist_gemma4_roundtrip.rs` | NEW 598 LOC | Env-gated round-trip parity matrix harness. 6 always-on tests (smoke + matrix shape + factory substrate gate test) + 1 env-gated master test. |
+| `docs/ADR-017-persistent-block-prefix-cache.md` | this subsection | "Phase B-dense.2 LANDED" entry. |
+
+**Matrix harness scope (env-gate + cell enumeration):**
+
+* **Master gate:** `HF2Q_KV_PERSIST_E2E=1` (mirrors A0.2b's gate; default OFF).
+* **Per-cell model paths:** `HF2Q_KV_PERSIST_E2E_MODEL_GEMMA4_<QUANT>=PATH` (most-specific) or `HF2Q_KV_PERSIST_E2E_MODEL_PATH=PATH` (single-path fallback).
+* **Cell axes:** 5 quants × 4 prefix lengths × 3 scenarios = 60 cells. Production-quant subset (Q4_K_M / Q6_K / Q8_0) yields 36 runnable cells; Q4_0 / Q5_K_M cells are documented for operator clarity but never runnable today (the production loader's `QuantType::from_canonical_str` rejects them).
+* **Scenarios:** `cold-load` (baseline), `evict-readmit` (symlink-trick eviction + readmit; tests Hypothesis 2 + 3 directly), `restart` (kill server + restart against same cache_dir; tests recovery-scan integration).
+* **Default `cargo test --release --test kv_persist_gemma4_roundtrip`:** runs only the 7 always-on tests (smoke + matrix shape + factory substrate). The matrix master test short-circuits with a diagnostic when the gate is off — no synthesized ship gates per `feedback_substrate_must_not_synthesize_ship_gates`.
+
+**Substrate-only on B-dense.2:** `run_cell_e2e` returns `Err` with a "substrate-only post-merge run" diagnostic for every cell. The matrix gate test distinguishes these from hard failures and only fails on the latter. The actual HTTP/SSE round-trip driver lives in `kv_persist_harness::subprocess_driver` (already shipped as part of A0.2a) and is invoked from the main session post-merge — that's the Phase D coherence + perf integration work.
+
+**Hookup readiness for Phase D coherence/perf validation:**
+
+* Gemma4DenseSpillFactory IS registered on `cmd_serve --kv-persist=PATH` for the operator's --model.
+* The substitution seam IS wired: registry + LoaderWrapper + spiller call chain lands real per-family hooks on first matching load.
+* Real GGUF metadata extraction → `Gemma4DenseConfig` is the gating production task (still placeholder shape today). Phase D's coherence run requires that extraction to land before sourdough byte-exact decoded-token parity can be measured against the real Gemma 4 26B operator GGUF.
+
+**Hypotheses (per spec §Mantra):**
+
+* **H1 (testable, default-on):** `Gemma4DenseSpillFactory::try_construct` returns `Some(_)` on `Arc<EngineHandle>`. Locked in by `factory_construct_from_matching_engine_returns_some_tuple` (Metal-gated) + the structural-only `factory_construct_from_wrong_engine_type_returns_none`. ✅
+* **H2 (testable, env-gated):** Pre-evict snapshot of `dense_kvs[layer].k`/`.v` SHA-256 hashes matches the post-readmit snapshot. Substrate landed; falsifier path lives in `kv_persist_gemma4_roundtrip_matrix_e2e`. Driver wire-up post-merge.
+* **H3 (testable, env-gated):** Decoded tokens after readmit are byte-identical to a never-evicted decode against the same prompt. Substrate landed; driver wire-up post-merge.
+
+**Discipline locked in:**
+
+- Production code in `src/serve/kv_persist/{registry,loader_wrapper,families/gemma4_dense}.rs` (additive only) + `src/serve/mod.rs::cmd_serve` (additive only).
+- Zero edits to `src/serve/multi_model.rs`, `forward_mlx.rs`, `forward_prefill.rs` (KvSpiller / KvCacheSpill / HotSwapManager / ModelLoader trait surfaces stable per A.3).
+- Zero edits to `src/serve/api/*` or `src/inference/models/qwen35/*` (parallel ADR-005 Phase 4 fence).
+- Zero edits to `mlx-native/`, `gpu_delta_net.rs`, `forward_gpu.rs`, `gpu_full_attn.rs` (ADR-015 fence).
+- Real I/O in tests (per `feedback_substrate_must_not_synthesize_ship_gates`) — `BlockPrefixCacheSpiller` constructed against tempdir-backed `DiskBlockStore` + `AsyncWriterHandle` in the loader_wrapper substitution tests.
+- "man-day" used; "person-day" does not appear (regression-checked via `grep -rn 'person-day' src/serve/kv_persist/ tests/kv_persist_gemma4_roundtrip.rs`).
+- No `// TODO` / `todo!()` / `unimplemented!()` / `panic!()` markers in production code.
+- `Arc::downcast` failure in `Gemma4DenseSpillFactory::try_construct` returns `None` (no panic) — locked in by `factory_construct_from_wrong_engine_type_returns_none`.
+- Worktree discipline: ABSOLUTE PATHS in shell; no `cd /opt/hf2q` corruption (per `feedback_agent_worktree_cwd_trap`).
+
+**Cumulative ADR-017 LOC:** A complete (5,066 LOC) + B-dense.1 (1,829 LOC) + C.1 (1,587 LOC) + B-dense.2 (~1,239 LOC: 254+178+146+63+598) = **9,721 LOC** of in-tree substrate + per-family hook + CLI substrate + matrix harness. **106 in-binary unit tests + 1 kill-9 integration test + 36 harness tests + 7 round-trip harness tests, all PASS.** Phase D coherence + perf gate is now the gating item between B-dense.2's seam and operator-facing semantically active KV persistence at the ship gate.
+
 ---
 
 ## Open Questions
