@@ -9,6 +9,11 @@
 #     >=3094 bytes shared with llama-completion
 #   * kv_persist_phase_d_r_p4_e2e — at L=32K, cache_hit_ttft /
 #     no_cache_ttft <= 0.20 ship-gate
+#   * kv_persist_phase_d_r_p1_decode_overhead_e2e — K2 ship-gate
+#     (LAST outstanding ADR-017 kill-gate); 5-baseline + 5-sustained
+#     decode overhead under sustained eviction; <= 5%. OFF by default;
+#     set HF2Q_KV_PERSIST_PHASE_D_R_P1=1 (env or via this script's
+#     wiring below) to opt in.
 #
 # Pre-conditions (per ADR-017 §Phase D + feedback_bench_process_audit):
 #   - Cold M5 Max (~1-min idle since previous run; pmset -g thermlog clean)
@@ -149,6 +154,7 @@ echo "    HF2Q_USE_DENSE=1"
 echo "    HF2Q_KV_PERSIST_E2E_MODEL_PATH=$MODEL_PATH"
 echo "    HF2Q_KV_PERSIST_E2E_PREFILL_LEN=$PREFILL_LEN"
 echo "    HF2Q_KV_PERSIST_PHASE_D_PEER=$([ "$ENABLE_PEER" -eq 1 ] && echo 1 || echo 0)"
+echo "    HF2Q_KV_PERSIST_PHASE_D_R_P1=${HF2Q_KV_PERSIST_PHASE_D_R_P1:-0}  (K2 ship-gate; OFF by default; set =1 in env to opt in)"
 echo
 
 cd "$REPO_ROOT"
@@ -160,6 +166,7 @@ if HF2Q_KV_PERSIST_E2E=1 \
     HF2Q_KV_PERSIST_E2E_MODEL_PATH="$MODEL_PATH" \
     HF2Q_KV_PERSIST_E2E_PREFILL_LEN="$PREFILL_LEN" \
     HF2Q_KV_PERSIST_PHASE_D_PEER="$([ "$ENABLE_PEER" -eq 1 ] && echo 1 || echo 0)" \
+    HF2Q_KV_PERSIST_PHASE_D_R_P1="${HF2Q_KV_PERSIST_PHASE_D_R_P1:-0}" \
     cargo test --release --test kv_persist_gemma4_roundtrip \
       -- --test-threads=1 --nocapture; then
   echo

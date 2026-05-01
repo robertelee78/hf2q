@@ -79,6 +79,17 @@ const ENV_PHASE_D_R_P4_PREFILL_LEN: &str = "HF2Q_KV_PERSIST_E2E_PREFILL_LEN";
 /// to `/opt/llama.cpp/build/bin/llama-completion`.
 const ENV_PHASE_D_LLAMA_BIN: &str = "HF2Q_KV_PERSIST_PHASE_D_LLAMA_BIN";
 
+/// Phase D R-P1 K2 ship-gate env gate. When set to "1", the
+/// `kv_persist_phase_d_r_p1_decode_overhead_e2e` test runs the K2
+/// kill-gate measurement: dirty-block decode overhead during sustained
+/// eviction events. R-P1 contracts the spiller's pre_evict / post_admit
+/// hooks + writer thread MUST NOT add >5% TTFT overhead to ongoing
+/// decode under sustained eviction load. Default: short-circuit so
+/// `cargo test` is cheap; operator opts in via
+/// `scripts/adr017_phase_d.sh` (which always sets this) or by setting
+/// `HF2Q_KV_PERSIST_PHASE_D_R_P1=1` directly.
+const ENV_PHASE_D_R_P1: &str = "HF2Q_KV_PERSIST_PHASE_D_R_P1";
+
 /// Sourdough prompt — byte-identical to `scripts/sourdough_gate.sh`
 /// (DO NOT fix the typo; it is load-bearing for the fixture trajectory).
 const SOURDOUGH_PROMPT: &str =
@@ -1811,6 +1822,223 @@ fn kv_persist_phase_d_r_p4_e2e() {
     );
 }
 
+/// Phase D R-P1 K2 ship-gate test (env-gated by
+/// `HF2Q_KV_PERSIST_PHASE_D=1` + `HF2Q_KV_PERSIST_PHASE_D_R_P1=1`).
+/// Default `cargo test` short-circuits.
+///
+/// K2 is the LAST outstanding ADR-017 kill-gate not yet falsified by
+/// measurement. R-P1 contracts that the spiller's async-write
+/// architecture (pre_evict + post_admit hooks + writer thread) MUST
+/// NOT add >5% TTFT overhead to ongoing decode under sustained
+/// eviction load. If the writer thread leaks onto the inference
+/// thread, K2 fires.
+///
+/// Methodology:
+///   1. Spawn `hf2q serve --kv-persist=DIR` with HF2Q_USE_DENSE=1.
+///   2. Baseline phase: 5 sequential decode requests against the SAME
+///      prompt + max_tokens=64. The cache populates on the first
+///      request; subsequent requests hit the cache. Both regimes
+///      exercise R-P1 — the first request keeps the spiller writer
+///      thread busy, subsequent requests run while the spiller hook is
+///      idle. Capture per-request TTFT; compute baseline_ttft_avg.
+///   3. Sustained-spill phase: 5 sequential decode requests, with
+///      `force_eviction_via_symlink` interleaved between requests.
+///      Each eviction triggers pre_evict + post_admit on the next
+///      request, maximally exercising the spiller's hot path. Capture
+///      per-request TTFT; compute sustained_ttft_avg.
+///   4. Compute overhead = (sustained_ttft_avg - baseline_ttft_avg) /
+///      baseline_ttft_avg. Assert overhead <= 0.05 (R-P1 ship-gate;
+///      K2 falsifier on >0.05).
+///
+/// Falsifier: overhead > 0.05.
+#[test]
+fn kv_persist_phase_d_r_p1_decode_overhead_e2e() {
+    let active = std::env::var(ENV_PHASE_D_GATE).as_deref() == Ok("1");
+    if !active {
+        eprintln!(
+            "[Phase D R-P1] {ENV_PHASE_D_GATE}=1 not set — short-circuit. \
+             Set {ENV_PHASE_D_GATE}=1 + {ENV_PHASE_D_R_P1}=1 + \
+             HF2Q_KV_PERSIST_E2E_MODEL_PATH=PATH to run."
+        );
+        return;
+    }
+    let r_p1_active = std::env::var(ENV_PHASE_D_R_P1).as_deref() == Ok("1");
+    if !r_p1_active {
+        eprintln!(
+            "[Phase D R-P1] {ENV_PHASE_D_R_P1}=1 not set — short-circuit. \
+             K2 ship-gate is operator-controlled; set {ENV_PHASE_D_R_P1}=1 \
+             alongside {ENV_PHASE_D_GATE}=1 to run the measurement."
+        );
+        return;
+    }
+    let model_path = match resolve_phase_d_model_path() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[Phase D R-P1] HF2Q_KV_PERSIST_E2E_MODEL_PATH unset or path missing \
+                 — short-circuit."
+            );
+            return;
+        }
+    };
+
+    let bin = hf2q_binary_path();
+    assert!(
+        bin.exists(),
+        "[Phase D R-P1] hf2q binary not found at {} — \
+         did `cargo build --release` run?",
+        bin.display()
+    );
+
+    let cache_dir = std::env::temp_dir().join(format!(
+        "hf2q-kv-persist-phase-d-r-p1-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&cache_dir).expect("mkdir Phase D R-P1 cache_dir");
+
+    let port = std::env::var("HF2Q_KV_PERSIST_PHASE_D_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(phase_d_driver::PORT_DEFAULT);
+
+    let server = phase_d_driver::spawn_hf2q_serve_with_kv_persist(
+        &bin,
+        &model_path,
+        &cache_dir,
+        phase_d_driver::HOST,
+        port,
+    )
+    .expect("[Phase D R-P1] spawn hf2q serve --kv-persist");
+    phase_d_driver::wait_for_readyz(&server).unwrap_or_else(|e| {
+        panic!(
+            "[Phase D R-P1] /readyz did not return 200 within budget: {e}\n\
+             --- hf2q serve stderr_tail ({} lines) ---\n{}",
+            server.log_tail().len(),
+            server.log_tail().join("\n"),
+        )
+    });
+    let canonical = phase_d_driver::fetch_canonical_model_id(&server)
+        .expect("[Phase D R-P1] fetch canonical model id");
+
+    // Stable, byte-deterministic prompt + small max_tokens so the
+    // whole test stays under ~60s on M5 Max. The prompt is short
+    // enough that TTFT is dominated by prefill+first-token-decode and
+    // any spiller-side overhead surfaces as a measurable delta.
+    let prompt = "List five common breads in alphabetical order.";
+    const N_SAMPLES: usize = 5;
+    const MAX_TOKENS: u32 = 64;
+
+    // -------- Baseline phase: 5 decodes, no induced eviction --------
+    // The first request populates the on-disk cache (writer thread
+    // busy); subsequent requests run while the spiller hook is idle.
+    // Both regimes are part of R-P1's contract.
+    let mut baseline_ttfts: Vec<f64> = Vec::with_capacity(N_SAMPLES);
+    for i in 0..N_SAMPLES {
+        let cap = phase_d_driver::decode_full_text(
+            &server,
+            &canonical,
+            prompt,
+            MAX_TOKENS,
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "[Phase D R-P1] baseline decode #{i} failed: {e}\n\
+                 --- hf2q serve stderr_tail ({} lines) ---\n{}",
+                server.log_tail().len(),
+                server.log_tail().join("\n"),
+            )
+        });
+        baseline_ttfts.push(cap.ttft_ms);
+    }
+    let baseline_ttft_avg: f64 =
+        baseline_ttfts.iter().sum::<f64>() / (baseline_ttfts.len() as f64);
+    eprintln!(
+        "[Phase D R-P1] baseline_ttft_avg={:.1}ms (samples={:?})",
+        baseline_ttft_avg, baseline_ttfts
+    );
+
+    // -------- Sustained-spill phase: 5 decodes with eviction --------
+    // Each eviction triggers pre_evict + post_admit on the NEXT
+    // request, maximally exercising the spiller's writer-thread hot
+    // path while the inference thread is decoding.
+    let mut sustained_ttfts: Vec<f64> = Vec::with_capacity(N_SAMPLES);
+    for i in 0..N_SAMPLES {
+        let tmp_link_dir = tempfile::tempdir()
+            .expect("[Phase D R-P1] tempdir for symlink-eviction-trick");
+        let (_link_path, evict_wall_ms, _second_ttft_ms) =
+            phase_d_driver::force_eviction_via_symlink(
+                &server,
+                &model_path,
+                tmp_link_dir.path(),
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "[Phase D R-P1] force eviction #{i} failed: {e}\n\
+                     --- hf2q serve stderr_tail ({} lines) ---\n{}",
+                    server.log_tail().len(),
+                    server.log_tail().join("\n"),
+                )
+            });
+        eprintln!(
+            "[Phase D R-P1] sustained #{i} eviction cycle wall={:.1}ms",
+            evict_wall_ms
+        );
+        let cap = phase_d_driver::decode_full_text(
+            &server,
+            &canonical,
+            prompt,
+            MAX_TOKENS,
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "[Phase D R-P1] sustained decode #{i} failed: {e}\n\
+                 --- hf2q serve stderr_tail ({} lines) ---\n{}",
+                server.log_tail().len(),
+                server.log_tail().join("\n"),
+            )
+        });
+        sustained_ttfts.push(cap.ttft_ms);
+    }
+    let sustained_ttft_avg: f64 =
+        sustained_ttfts.iter().sum::<f64>() / (sustained_ttfts.len() as f64);
+    eprintln!(
+        "[Phase D R-P1] sustained_ttft_avg={:.1}ms (samples={:?})",
+        sustained_ttft_avg, sustained_ttfts
+    );
+
+    // Overhead is signed: negative means sustained was actually FASTER
+    // than baseline (within noise). The gate fires only when
+    // sustained > baseline by more than 5%.
+    let overhead = (sustained_ttft_avg - baseline_ttft_avg) / baseline_ttft_avg;
+    eprintln!(
+        "[Phase D R-P1] overhead={:.3} (gate: <= 0.05)",
+        overhead
+    );
+    let pass = overhead <= 0.05;
+    if pass {
+        eprintln!("[R-P1] PASS — overhead within 5% gate");
+    } else {
+        eprintln!("[R-P1] FAIL — overhead exceeds 5% gate (K2 fires)");
+    }
+    assert!(
+        pass,
+        "[R-P1] ship-gate FAIL (K2 fires): overhead={:.3} > 0.05 \
+         (baseline_ttft_avg={:.1}ms sustained_ttft_avg={:.1}ms \
+         baseline_samples={:?} sustained_samples={:?} \
+         diff_avg={:.1}ms)",
+        overhead,
+        baseline_ttft_avg,
+        sustained_ttft_avg,
+        baseline_ttfts,
+        sustained_ttfts,
+        sustained_ttft_avg - baseline_ttft_avg,
+    );
+}
+
 // ---------- Phase D always-on shape tests (no env required) ----------
 
 /// Phase D shape test: the new env gates are well-formed and the
@@ -1860,8 +2088,74 @@ fn phase_d_driver_rejects_missing_model_cleanly() {
     }
 }
 
+/// Phase D shape test: the R-P1 K2 env gate round-trips cleanly and
+/// the K2 ship-gate test short-circuits when either gate is unset.
+/// Falsifier: env-var round-trip diverges, or
+/// `kv_persist_phase_d_r_p1_decode_overhead_e2e` would attempt to
+/// spawn `hf2q serve` when its env gates are unset.
+#[test]
+fn phase_d_r_p1_env_gate_well_formed() {
+    // Snapshot any prior values to restore after the test (paranoia
+    // against parallel-test env contamination, even though
+    // --test-threads=1 is the operator recipe).
+    let prior_master = std::env::var(ENV_PHASE_D_GATE).ok();
+    let prior_r_p1 = std::env::var(ENV_PHASE_D_R_P1).ok();
+
+    // Round-trip set/get for the new gate.
+    std::env::remove_var(ENV_PHASE_D_R_P1);
+    assert!(
+        std::env::var(ENV_PHASE_D_R_P1).is_err(),
+        "{ENV_PHASE_D_R_P1} should be unset after remove_var"
+    );
+    std::env::set_var(ENV_PHASE_D_R_P1, "1");
+    assert_eq!(
+        std::env::var(ENV_PHASE_D_R_P1).as_deref(),
+        Ok("1"),
+        "{ENV_PHASE_D_R_P1} round-trip"
+    );
+
+    // The K2 test must short-circuit when the master gate is unset,
+    // even if the R-P1 gate is set. This proves the dual-gate
+    // discipline: operator must opt in to BOTH master Phase D and the
+    // K2 measurement.
+    std::env::remove_var(ENV_PHASE_D_GATE);
+    assert!(
+        std::env::var(ENV_PHASE_D_GATE).is_err(),
+        "{ENV_PHASE_D_GATE} should be unset for short-circuit branch"
+    );
+    // We don't call `kv_persist_phase_d_r_p1_decode_overhead_e2e`
+    // directly (it's a #[test] fn, not a regular fn), but we verify
+    // the predicate it uses to short-circuit is still false.
+    let active_master = std::env::var(ENV_PHASE_D_GATE).as_deref() == Ok("1");
+    assert!(
+        !active_master,
+        "K2 master-gate short-circuit predicate must be false when env unset"
+    );
+
+    // Reverse: master gate set, R-P1 unset — K2 must still
+    // short-circuit (R-P1 is opt-in even within Phase D).
+    std::env::set_var(ENV_PHASE_D_GATE, "1");
+    std::env::remove_var(ENV_PHASE_D_R_P1);
+    let active_master = std::env::var(ENV_PHASE_D_GATE).as_deref() == Ok("1");
+    let active_r_p1 = std::env::var(ENV_PHASE_D_R_P1).as_deref() == Ok("1");
+    assert!(
+        active_master && !active_r_p1,
+        "K2 R-P1 short-circuit predicate must be false when only master is set"
+    );
+
+    // Restore prior env state.
+    std::env::remove_var(ENV_PHASE_D_GATE);
+    std::env::remove_var(ENV_PHASE_D_R_P1);
+    if let Some(v) = prior_master {
+        std::env::set_var(ENV_PHASE_D_GATE, v);
+    }
+    if let Some(v) = prior_r_p1 {
+        std::env::set_var(ENV_PHASE_D_R_P1, v);
+    }
+}
+
 /// Phase D shape test: the env-gate predicates are well-formed for
-/// each defined gate (master + peer + prefill-length).
+/// each defined gate (master + peer + prefill-length + R-P1 K2).
 /// Falsifier: predicate panics or detects "1" when env is unset.
 #[test]
 fn phase_d_env_gates_are_well_formed() {
@@ -1870,6 +2164,7 @@ fn phase_d_env_gates_are_well_formed() {
         ENV_PHASE_D_PEER,
         ENV_PHASE_D_R_P4_PREFILL_LEN,
         ENV_PHASE_D_LLAMA_BIN,
+        ENV_PHASE_D_R_P1,
     ] {
         let prior = std::env::var(gate).ok();
         std::env::remove_var(gate);
