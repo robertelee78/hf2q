@@ -364,6 +364,11 @@ pub fn write_envelope(path: &Path, header: &EnvelopeHeader, body: &[u8]) -> io::
     }
 
     std::fs::rename(&tmp_path, path)?;
+    // P0-1 (ADR-017 adversarial review §P0-1): fsync the parent
+    // directory so the new dir-entry is durable across power loss,
+    // not just process kill. The temp file's f.sync_all() above
+    // covers the file CONTENTS; this covers the rename's dir-entry.
+    File::open(parent)?.sync_all()?;
     let total = 8u64 + header_bytes.len() as u64 + body.len() as u64;
     Ok(total)
 }

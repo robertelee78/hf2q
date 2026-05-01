@@ -293,11 +293,17 @@ where
         // on-disk snapshot/restore dispatch lands on the real hook.
         //
         // If `try_substitute_on_load` returns None (no factory OR
-        // factory rejects the engine type — the auto-Arc<E> path is
-        // ALWAYS rejected by the Gemma4 factory because it expects
-        // Arc<EngineHandle>), the substitution is a no-op and the
-        // existing C.1 stub registration remains in the spiller +
-        // registry.
+        // factory rejects the engine type), the substitution is a
+        // no-op and the existing C.1 stub registration remains in
+        // the spiller + registry. Post-B-dense.2-follow-up
+        // (commit 420ef94, gemma4_dense.rs:1373-1390): the
+        // Gemma4DenseSpillFactory downcasts `Arc<Engine>` FIRST and
+        // reads the cached `KvSpillDescriptor` from
+        // `EngineInner.kv_spill_descriptor` (set in
+        // `Engine::spawn` at engine.rs:1503-1530 for
+        // `LoadedModel::Gemma`), so the auto-Arc<E> path SUCCEEDS
+        // for Gemma 4 production loads. The Arc<EngineHandle>
+        // fallback path is for B-dense.1 backwards-compat tests.
         let arc_engine: Arc<E> = Arc::new(engine);
         let dyn_view: Arc<dyn Any + Send + Sync> = Arc::clone(&arc_engine) as _;
 
