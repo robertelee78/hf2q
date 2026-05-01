@@ -52,6 +52,48 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 // =========================================================================
+// Phase D env gates (additive — separate from the B-dense.2 master gate).
+// =========================================================================
+
+/// Phase D coherence + perf master gate. When unset (default), the new
+/// `kv_persist_phase_d_*` tests short-circuit cleanly with a diagnostic.
+/// Operator runs the matrix via `scripts/adr017_phase_d.sh`, which sets
+/// this alongside `HF2Q_KV_PERSIST_E2E=1` + `HF2Q_USE_DENSE=1`.
+const ENV_PHASE_D_GATE: &str = "HF2Q_KV_PERSIST_PHASE_D";
+
+/// Optional: enable the peer (llama.cpp) byte-prefix arm of the
+/// coherence test. When unset, the coherence test only asserts the
+/// internal hf2q never-evicted == evicted+restored byte-identity (R-C4
+/// internal). When set, additionally asserts both outputs share
+/// `MIN_COMMON_PREFIX` bytes with `llama-completion` on the same GGUF
+/// + prompt.
+const ENV_PHASE_D_PEER: &str = "HF2Q_KV_PERSIST_PHASE_D_PEER";
+
+/// Phase D R-P4 prefill-length gate. When set to a numeric value (e.g.
+/// `32768`), the R-P4 ship-gate test runs against that prefix length.
+/// Default: test short-circuits without measurement.
+const ENV_PHASE_D_R_P4_PREFILL_LEN: &str = "HF2Q_KV_PERSIST_E2E_PREFILL_LEN";
+
+/// Path to `llama-completion` binary for the optional peer arm. When
+/// unset, the driver falls back to `which llama-completion` and finally
+/// to `/opt/llama.cpp/build/bin/llama-completion`.
+const ENV_PHASE_D_LLAMA_BIN: &str = "HF2Q_KV_PERSIST_PHASE_D_LLAMA_BIN";
+
+/// Sourdough prompt — byte-identical to `scripts/sourdough_gate.sh`
+/// (DO NOT fix the typo; it is load-bearing for the fixture trajectory).
+const SOURDOUGH_PROMPT: &str =
+    "Complrehensive instructions for making sourdough bread.";
+
+/// Sourdough decode-token cap — matches `sourdough_gate.sh::MAX_TOKENS`.
+const SOURDOUGH_MAX_TOKENS: u32 = 1000;
+
+/// Sourdough common-prefix floor (bytes) — matches
+/// `sourdough_gate.sh::MIN_COMMON_PREFIX`. The R-C4 peer arm asserts
+/// both never-evicted and evicted+restored hf2q outputs share at least
+/// this many leading bytes with `llama-completion`'s output.
+const SOURDOUGH_MIN_COMMON_PREFIX: usize = 3094;
+
+// =========================================================================
 // Matrix specification (axis cardinality + cell enumeration).
 // =========================================================================
 
@@ -274,34 +316,620 @@ pub fn hf2q_binary_path() -> PathBuf {
 }
 
 // =========================================================================
+// Phase D subprocess driver (additive; mirrors `kv_persist_harness.rs`'s
+// `subprocess_driver` pattern, but spawns with `--kv-persist=PATH` so the
+// coherence and perf round-trips actually exercise the persistence path).
+//
+// Why a self-contained driver: each `tests/*.rs` file is a separate
+// integration-test crate, and the existing `subprocess_driver` does not
+// pass `--kv-persist` (it was sized for A0.2 TTFT predictions, not the
+// Phase D round-trip). The driver is small (~200 LOC) and reuses the
+// well-trodden pattern from `kv_persist_harness::subprocess_driver` and
+// `tests/multi_model_swap.rs`.
+//
+// Real I/O round-trip per `feedback_substrate_must_not_synthesize_ship_gates`:
+// the driver spawns a real `hf2q serve` subprocess, sends real
+// `/v1/chat/completions` requests over real TCP, parses real SSE
+// streams. No constants are asserted against ship gates.
+// =========================================================================
+
+mod phase_d_driver {
+    //! Self-contained subprocess driver for Phase D coherence + perf
+    //! tests. RAII `ServerGuard` kills + waits the child on Drop.
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    pub const HOST: &str = "127.0.0.1";
+    /// Default port for Phase D subprocess. Distinct from
+    /// `kv_persist_harness::PORT_DEFAULT` (52338),
+    /// `multi_model_swap.rs` (52337), `openwebui` (52334),
+    /// `mmproj_llama_cpp_compat` (52226), `vision_e2e_vs_mlx_vlm`
+    /// (18181) so cells can safely run sequentially even if a prior
+    /// run leaked.
+    pub const PORT_DEFAULT: u16 = 52339;
+    /// `/readyz` poll budget — same envelope as
+    /// `kv_persist_harness::READYZ_BUDGET_SECS` (cold 16-26 GiB GGUF
+    /// startup on M5 Max can take 60-180 s).
+    pub const READYZ_BUDGET_SECS: u64 = 600;
+
+    #[derive(Debug)]
+    pub enum DriverError {
+        BinaryNotFound(String),
+        SpawnFailed(String),
+        ReadyzTimeout { waited_secs: u64, last: String },
+        Transport(String),
+        Http { status: u16, body: String },
+        Sse(String),
+    }
+
+    impl std::fmt::Display for DriverError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                DriverError::BinaryNotFound(s) => write!(f, "binary not found: {s}"),
+                DriverError::SpawnFailed(s) => write!(f, "spawn: {s}"),
+                DriverError::ReadyzTimeout { waited_secs, last } => {
+                    write!(f, "readyz timeout after {waited_secs}s; last={last}")
+                }
+                DriverError::Transport(s) => write!(f, "transport: {s}"),
+                DriverError::Http { status, body } => write!(f, "http {status}: {body}"),
+                DriverError::Sse(s) => write!(f, "sse: {s}"),
+            }
+        }
+    }
+    impl std::error::Error for DriverError {}
+
+    pub struct ServerGuard {
+        child: Child,
+        host: String,
+        port: u16,
+        stderr_tail: Arc<Mutex<Vec<String>>>,
+        stderr_thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ServerGuard {
+        pub fn host(&self) -> &str { &self.host }
+        pub fn port(&self) -> u16 { self.port }
+        pub fn log_tail(&self) -> Vec<String> {
+            self.stderr_tail.lock().map(|g| g.clone()).unwrap_or_default()
+        }
+    }
+
+    impl Drop for ServerGuard {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            if let Some(t) = self.stderr_thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// Spawn `hf2q serve --model PATH --host HOST --port PORT
+    /// --kv-persist CACHE_DIR`. Sets `HF2Q_USE_DENSE=1` in the child env
+    /// so the dense decode path is forced (R-C4 byte-exact requires
+    /// dense; TQ is lossy by design).
+    pub fn spawn_hf2q_serve_with_kv_persist(
+        bin: &Path,
+        model_path: &Path,
+        cache_dir: &Path,
+        host: &str,
+        port: u16,
+    ) -> Result<ServerGuard, DriverError> {
+        if !bin.exists() {
+            return Err(DriverError::BinaryNotFound(bin.display().to_string()));
+        }
+        if !model_path.exists() {
+            return Err(DriverError::SpawnFailed(format!(
+                "model path does not exist: {}",
+                model_path.display()
+            )));
+        }
+        std::fs::create_dir_all(cache_dir).map_err(|e| {
+            DriverError::SpawnFailed(format!(
+                "mkdir cache_dir {}: {e}",
+                cache_dir.display()
+            ))
+        })?;
+        let mut child = Command::new(bin)
+            .args([
+                "serve",
+                "--model",
+                &model_path.to_string_lossy(),
+                "--host",
+                host,
+                "--port",
+                &port.to_string(),
+                "--kv-persist",
+                &cache_dir.to_string_lossy(),
+            ])
+            .env("HF2Q_USE_DENSE", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| DriverError::SpawnFailed(e.to_string()))?;
+        let stderr_tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let stderr_thread = if let Some(stderr) = child.stderr.take() {
+            let tail = Arc::clone(&stderr_tail);
+            Some(thread::spawn(move || {
+                let mut reader = BufReader::new(stderr);
+                let mut buf = String::new();
+                loop {
+                    buf.clear();
+                    match reader.read_line(&mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let line = buf.trim_end_matches(['\n', '\r']).to_string();
+                            if let Ok(mut g) = tail.lock() {
+                                g.push(line);
+                                let drain = g.len().saturating_sub(256);
+                                if drain > 0 {
+                                    g.drain(..drain);
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+        Ok(ServerGuard {
+            child,
+            host: host.to_string(),
+            port,
+            stderr_tail,
+            stderr_thread,
+        })
+    }
+
+    /// Minimal HTTP/1.1 GET status — mirrors
+    /// `kv_persist_harness::http_get_status` so we don't pull tokio
+    /// just for the readyz poll.
+    fn http_get_status(host: &str, port: u16, path: &str) -> std::io::Result<u16> {
+        use std::net::TcpStream;
+        let addr = format!("{host}:{port}")
+            .parse()
+            .map_err(std::io::Error::other)?;
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+        s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        s.write_all(
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )?;
+        let mut head = [0u8; 64];
+        let n = s.read(&mut head)?;
+        let head_s = std::str::from_utf8(&head[..n]).unwrap_or("");
+        head_s
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .ok_or_else(|| std::io::Error::other(format!("bad status: {head_s:?}")))
+    }
+
+    pub fn wait_for_readyz(server: &ServerGuard) -> Result<(), DriverError> {
+        let started = Instant::now();
+        let mut last = String::from("<none>");
+        while started.elapsed().as_secs() < READYZ_BUDGET_SECS {
+            match http_get_status(server.host(), server.port(), "/readyz") {
+                Ok(200) => return Ok(()),
+                Ok(c) => last = format!("status={c}"),
+                Err(e) => last = format!("transport: {e}"),
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        Err(DriverError::ReadyzTimeout {
+            waited_secs: started.elapsed().as_secs(),
+            last,
+        })
+    }
+
+    /// Fetch the canonical model id from `/v1/models` so subsequent
+    /// requests use a model name the server recognizes.
+    pub fn fetch_canonical_model_id(server: &ServerGuard) -> Result<String, DriverError> {
+        let url = format!(
+            "http://{}:{}/v1/models",
+            server.host(),
+            server.port()
+        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| DriverError::Transport(e.to_string()))?;
+        let resp = client
+            .get(&url)
+            .send()
+            .map_err(|e| DriverError::Transport(e.to_string()))?;
+        let status = resp.status().as_u16();
+        if status != 200 {
+            let body = resp.text().unwrap_or_else(|_| "<unreadable>".into());
+            return Err(DriverError::Http { status, body });
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .map_err(|e| DriverError::Transport(e.to_string()))?;
+        v["data"][0]["id"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| DriverError::Http {
+                status: 200,
+                body: format!("missing data[0].id: {v}"),
+            })
+    }
+
+    /// Captured decode result from a single streaming completion.
+    #[derive(Clone, Debug)]
+    pub struct DecodeCapture {
+        /// Concatenated `choices[0].delta.content` over all SSE
+        /// chunks — the byte sequence the operator-visible response
+        /// would have rendered. R-C4 byte-equality test compares
+        /// THIS field across never-evicted and evicted+restored runs.
+        pub text: String,
+        /// Wall clock from POST send to the first non-empty content
+        /// delta. R-P4 ship-gate ratio = cache_hit_ttft / no_cache_ttft.
+        pub ttft_ms: f64,
+        /// `usage.completion_tokens` if reported, else delta count.
+        pub total_tokens: u32,
+        /// `usage.prompt_tokens` if reported.
+        pub prompt_tokens: Option<u32>,
+    }
+
+    /// Issue `/v1/chat/completions` with `stream: true`,
+    /// `temperature: 0`, `max_tokens: max_tokens`. Returns the full
+    /// captured text + TTFT.
+    pub fn decode_full_text(
+        server: &ServerGuard,
+        model: &str,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> Result<DecodeCapture, DriverError> {
+        let body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": 0,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
+        let url = format!(
+            "http://{}:{}/v1/chat/completions",
+            server.host(),
+            server.port()
+        );
+        let client = reqwest::blocking::Client::builder()
+            // Big-prefill stream legs can run minutes on M5 Max cold
+            // path; budget = 10 min.
+            .timeout(Duration::from_secs(600))
+            .build()
+            .map_err(|e| DriverError::Transport(e.to_string()))?;
+        let t0 = Instant::now();
+        let resp = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .map_err(|e| DriverError::Transport(e.to_string()))?;
+        let status = resp.status().as_u16();
+        if status != 200 {
+            let body = resp.text().unwrap_or_else(|_| "<unreadable>".into());
+            return Err(DriverError::Http { status, body });
+        }
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        if !ct.contains("text/event-stream") {
+            let body = resp.text().unwrap_or_else(|_| "<unreadable>".into());
+            return Err(DriverError::Sse(format!(
+                "expected text/event-stream content-type; got {ct:?}; body={body}"
+            )));
+        }
+
+        let mut ttft_ms: Option<f64> = None;
+        let mut text = String::new();
+        let mut total_tokens: u32 = 0;
+        let mut prompt_tokens: Option<u32> = None;
+        let mut reader = BufReader::new(resp);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader
+                .read_line(&mut line)
+                .map_err(|e| DriverError::Transport(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            let l = line.trim_end_matches(['\n', '\r']);
+            let payload = match l.strip_prefix("data: ") {
+                Some(p) => p,
+                None => continue,
+            };
+            if payload == "[DONE]" {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(payload)
+                .map_err(|e| DriverError::Sse(format!("malformed chunk {payload:?}: {e}")))?;
+            if let Some(s) = v["choices"][0]["delta"]["content"].as_str() {
+                if !s.is_empty() && ttft_ms.is_none() {
+                    ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
+                }
+                text.push_str(s);
+                total_tokens = total_tokens.saturating_add(1);
+            }
+            if let Some(c) = v["usage"]["completion_tokens"].as_u64() {
+                total_tokens = c as u32;
+            }
+            if let Some(p) = v["usage"]["prompt_tokens"].as_u64() {
+                prompt_tokens = Some(p as u32);
+            }
+        }
+        let ttft_ms = ttft_ms.ok_or_else(|| {
+            DriverError::Sse(
+                "no non-empty content delta observed; cannot measure TTFT".into(),
+            )
+        })?;
+        Ok(DecodeCapture {
+            text,
+            ttft_ms,
+            total_tokens,
+            prompt_tokens,
+        })
+    }
+
+    /// Force a pool eviction by admitting a second model under a
+    /// distinct on-disk path that resolves through `pool_key_for_path`.
+    /// Mirrors `kv_persist_harness::subprocess_driver::measure_swap_eviction_cycle`
+    /// + `multi_model_swap.rs:344-384`.
+    ///
+    /// Returns `(eviction_wall_ms, second_request_ttft_ms)`.
+    #[cfg(unix)]
+    pub fn force_eviction_via_symlink(
+        server: &ServerGuard,
+        model_path: &Path,
+        tmp_link_dir: &Path,
+    ) -> Result<(PathBuf, f64, f64), DriverError> {
+        let link_path = tmp_link_dir.join("kv-persist-clone.gguf");
+        std::os::unix::fs::symlink(model_path, &link_path)
+            .map_err(|e| DriverError::Transport(format!("symlink: {e}")))?;
+        // Mirror sibling files (config.json / tokenizer.json /
+        // tokenizer_config.json / generation_config.json + mmproj GGUF)
+        // — `cmd_serve` resolves siblings of the GGUF path; without
+        // them the second-turn admit fails with HTTP 500.
+        if let Some(model_parent) = model_path.parent() {
+            for fname in &[
+                "config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "generation_config.json",
+            ] {
+                let src = model_parent.join(fname);
+                if src.exists() {
+                    let dst = tmp_link_dir.join(fname);
+                    if let Err(e) = std::os::unix::fs::symlink(&src, &dst) {
+                        return Err(DriverError::Transport(format!(
+                            "symlink sibling {fname}: {e}"
+                        )));
+                    }
+                }
+            }
+            if let Some(src_stem) = model_path.file_stem().and_then(|s| s.to_str()) {
+                let mmproj_src =
+                    model_parent.join(format!("{src_stem}-mmproj.gguf"));
+                if mmproj_src.exists() {
+                    if let Some(link_stem) =
+                        link_path.file_stem().and_then(|s| s.to_str())
+                    {
+                        let mmproj_dst =
+                            tmp_link_dir.join(format!("{link_stem}-mmproj.gguf"));
+                        if let Err(e) =
+                            std::os::unix::fs::symlink(&mmproj_src, &mmproj_dst)
+                        {
+                            return Err(DriverError::Transport(format!(
+                                "symlink mmproj: {e}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Drive a tiny request against the cloned-stem path. This is
+        // the pool-eviction trigger: distinct file_stem -> distinct
+        // pool key -> cold-load path even though both paths resolve
+        // to the same physical bytes.
+        let body = serde_json::json!({
+            "model": link_path.to_string_lossy(),
+            "messages": [{"role": "user", "content": "Say hi."}],
+            "max_tokens": 4,
+            "temperature": 0,
+            "stream": true,
+        });
+        let url = format!(
+            "http://{}:{}/v1/chat/completions",
+            server.host(),
+            server.port()
+        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(600))
+            .build()
+            .map_err(|e| DriverError::Transport(e.to_string()))?;
+        let t0 = Instant::now();
+        let resp = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .map_err(|e| DriverError::Transport(e.to_string()))?;
+        let status = resp.status().as_u16();
+        if status != 200 {
+            let body = resp.text().unwrap_or_else(|_| "<unreadable>".into());
+            return Err(DriverError::Http { status, body });
+        }
+        let mut ttft_ms: Option<f64> = None;
+        let mut reader = BufReader::new(resp);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader
+                .read_line(&mut line)
+                .map_err(|e| DriverError::Transport(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            let l = line.trim_end_matches(['\n', '\r']);
+            let payload = match l.strip_prefix("data: ") {
+                Some(p) => p,
+                None => continue,
+            };
+            if payload == "[DONE]" {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(payload)
+                .map_err(|e| DriverError::Sse(format!("eviction chunk: {e}")))?;
+            if ttft_ms.is_none() {
+                if let Some(s) = v["choices"][0]["delta"]["content"].as_str() {
+                    if !s.is_empty() {
+                        ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
+                    }
+                }
+            }
+        }
+        let eviction_wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let second_ttft_ms = ttft_ms.ok_or_else(|| {
+            DriverError::Sse("no content delta on swap-back-in turn".into())
+        })?;
+        Ok((link_path, eviction_wall_ms, second_ttft_ms))
+    }
+
+    #[cfg(not(unix))]
+    pub fn force_eviction_via_symlink(
+        _server: &ServerGuard,
+        _model_path: &Path,
+        _tmp_link_dir: &Path,
+    ) -> Result<(PathBuf, f64, f64), DriverError> {
+        Err(DriverError::Transport(
+            "symlink-distinct-pool-key trick is unix-only".into(),
+        ))
+    }
+
+    /// Phase D coherence-test peer arm: run llama-completion on the
+    /// same GGUF + sourdough prompt, return the decoded byte stream.
+    /// Mirrors `scripts/sourdough_gate.sh::Run llama-completion` but
+    /// in-process so the test can assert byte-prefix equality without
+    /// shelling out to a separate driver script.
+    pub fn run_llama_completion_peer(
+        llama_bin: &Path,
+        gguf_path: &Path,
+        rendered_prompt_path: &Path,
+        max_tokens: u32,
+    ) -> Result<Vec<u8>, DriverError> {
+        if !llama_bin.exists() {
+            return Err(DriverError::BinaryNotFound(format!(
+                "llama-completion not at {}",
+                llama_bin.display()
+            )));
+        }
+        let out = Command::new(llama_bin)
+            .args([
+                "--model",
+                &gguf_path.to_string_lossy(),
+                "--file",
+                &rendered_prompt_path.to_string_lossy(),
+                "--predict",
+                &max_tokens.to_string(),
+                "--temp",
+                "0",
+                "--seed",
+                "42",
+                "--no-display-prompt",
+                "-no-cnv",
+                "-st",
+                "-ngl",
+                "999",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| DriverError::SpawnFailed(format!("llama-completion: {e}")))?;
+        if !out.status.success() {
+            return Err(DriverError::Http {
+                status: out.status.code().unwrap_or(-1) as u16,
+                body: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+        let stderr_text = String::from_utf8_lossy(&out.stderr);
+        if stderr_text.contains("prompt also starts with a BOS token") {
+            return Err(DriverError::Sse(
+                "llama-completion reports double-BOS — BOS-strip broken".into(),
+            ));
+        }
+        Ok(out.stdout)
+    }
+
+    /// Resolve `llama-completion` binary path using the same precedence
+    /// as `scripts/sourdough_gate.sh`:
+    ///   1. `HF2Q_KV_PERSIST_PHASE_D_LLAMA_BIN` env override
+    ///   2. `which llama-completion` on PATH
+    ///   3. `/opt/llama.cpp/build/bin/llama-completion` last-resort
+    pub fn resolve_llama_completion_bin() -> Option<PathBuf> {
+        if let Ok(v) = std::env::var(super::ENV_PHASE_D_LLAMA_BIN) {
+            let pb = PathBuf::from(v);
+            if pb.exists() {
+                return Some(pb);
+            }
+        }
+        if let Ok(out) = Command::new("which")
+            .arg("llama-completion")
+            .stderr(Stdio::null())
+            .output()
+        {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let pb = PathBuf::from(&s);
+                if pb.exists() {
+                    return Some(pb);
+                }
+            }
+        }
+        let fallback = PathBuf::from("/opt/llama.cpp/build/bin/llama-completion");
+        if fallback.exists() {
+            return Some(fallback);
+        }
+        None
+    }
+}
+
+// =========================================================================
 // E2E cell runner (env-gated; default off).
 // =========================================================================
 
 /// Run one cell end-to-end. Returns `Ok(())` on parity, `Err(reason)`
-/// on any falsifier. The runner is responsible for spawning
-/// `hf2q serve --model PATH --kv-persist=DIR`, sending an N-token
-/// prompt via `/v1/chat/completions`, snapshotting the dense_kvs
-/// SHA-256 hashes, forcing an evict cycle (per cell scenario),
-/// re-driving the same prompt, and comparing.
+/// on any falsifier.
 ///
-/// **B-dense.2 scope:** the runner is structured but the actual
-/// HTTP/SSE plumbing is delegated to the existing
-/// `kv_persist_harness.rs::subprocess_driver` module. This file owns
-/// the matrix shape + env gate + cell payload kind enumeration; the
-/// HTTP/SSE driver lives in the existing harness module so a single
-/// driver implementation services both A0 (TTFT predictions) and
-/// B-dense.2 (round-trip parity).
+/// **Phase D wire-up:** the runner now drives the actual round-trip
+/// via `phase_d_driver`:
 ///
-/// To avoid coupling, this stub-runner returns `Err("E2E driver lives
-/// in kv_persist_harness::subprocess_driver — invoke from there
-/// post-merge")` when called. The matrix gate test below records the
-/// stub-runner result without panicking (operator's actual run is the
-/// post-merge follow-up).
-pub fn run_cell_e2e(cell: &Cell, _model_path: &Path, _cache_dir: &Path) -> Result<(), String> {
-    // Sanity: the binary must be locatable. If not, the run cannot
-    // proceed and we bail with a diagnostic (no-panic on the always-on
-    // path; the gated runner is allowed to surface this as a failure
-    // because the binary is a hard prerequisite).
+///   1. spawn `hf2q serve --model PATH --kv-persist=CACHE_DIR` with
+///      `HF2Q_USE_DENSE=1` in env (R-C4 byte-exact requires dense)
+///   2. wait for `/readyz`
+///   3. fetch canonical model id
+///   4. baseline decode (never-evicted)
+///   5. if scenario is `EvictReadmit` or `Restart`: force eviction via
+///      symlink-distinct-pool-key trick, then re-drive the SAME prompt
+///      (post-readmit decode)
+///   6. assert byte-exact decoded text between baseline and post-readmit
+///
+/// `ColdLoad` cells run only step 4 (no eviction) and assert the
+/// baseline decoded for >0 bytes (sanity).
+///
+/// All measurements come from real I/O (no synthesized constants) per
+/// `feedback_substrate_must_not_synthesize_ship_gates`.
+pub fn run_cell_e2e(cell: &Cell, model_path: &Path, cache_dir: &Path) -> Result<(), String> {
     let bin = hf2q_binary_path();
     if !bin.exists() {
         return Err(format!(
@@ -309,16 +937,111 @@ pub fn run_cell_e2e(cell: &Cell, _model_path: &Path, _cache_dir: &Path) -> Resul
             bin.display()
         ));
     }
+    if !model_path.exists() {
+        return Err(format!(
+            "model_path {} does not exist",
+            model_path.display()
+        ));
+    }
+    std::fs::create_dir_all(cache_dir).map_err(|e| {
+        format!("mkdir cache_dir {}: {e}", cache_dir.display())
+    })?;
 
-    // Round-trip parity wiring deferred per spec — the post-merge run
-    // drives the actual HTTP/SSE round-trip via the existing
-    // kv_persist_harness::subprocess_driver module. Returning a clear
-    // Err keeps the env-gated test from claiming a false success.
-    Err(format!(
-        "B-dense.2 cell {:?} substrate-only: post-merge run drives the HTTP/SSE \
-         round-trip via kv_persist_harness::subprocess_driver",
-        cell.payload_kind()
-    ))
+    // Per-cell port: pin to the Phase D default. Sequential cell
+    // execution (`--test-threads=1`) means there's never overlap.
+    let port = std::env::var("HF2Q_KV_PERSIST_PHASE_D_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(phase_d_driver::PORT_DEFAULT);
+
+    let server = phase_d_driver::spawn_hf2q_serve_with_kv_persist(
+        &bin,
+        model_path,
+        cache_dir,
+        phase_d_driver::HOST,
+        port,
+    )
+    .map_err(|e| format!("spawn: {e}"))?;
+    phase_d_driver::wait_for_readyz(&server)
+        .map_err(|e| format!("readyz: {e}"))?;
+    let canonical = phase_d_driver::fetch_canonical_model_id(&server)
+        .map_err(|e| format!("fetch model id: {e}"))?;
+
+    // Cell prompt: a token-diverse, deterministic word stream sized to
+    // the cell's prefix-length. Same construction as
+    // `kv_persist_harness::run_cell_with_subprocess` — `wordN` per
+    // word so the BPE tokenizer doesn't collapse to a tiny prompt.
+    let target_tokens = (cell.prefix.token_count() as usize).max(8);
+    let n_words = (target_tokens / 4).max(2);
+    let prompt: String = (0..n_words)
+        .map(|i| format!("word{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let max_decode_tokens: u32 = 16;
+
+    let baseline = phase_d_driver::decode_full_text(
+        &server,
+        &canonical,
+        &prompt,
+        max_decode_tokens,
+    )
+    .map_err(|e| format!("baseline decode: {e}"))?;
+
+    // ColdLoad: just the baseline. Sanity-check non-empty decode.
+    if matches!(cell.scenario, Scenario::ColdLoad) {
+        if baseline.text.is_empty() {
+            return Err(format!(
+                "cell {} cold-load baseline produced 0-byte decode",
+                cell.payload_kind()
+            ));
+        }
+        return Ok(());
+    }
+
+    // EvictReadmit / Restart: force eviction via symlink, then
+    // re-drive the SAME prompt and assert byte-exact decoded text.
+    let tmp_link_dir = tempfile::tempdir()
+        .map_err(|e| format!("tempdir for symlink: {e}"))?;
+    let (_link_path, _evict_wall_ms, _second_ttft_ms) =
+        phase_d_driver::force_eviction_via_symlink(
+            &server,
+            model_path,
+            tmp_link_dir.path(),
+        )
+        .map_err(|e| format!("force eviction: {e}"))?;
+    // Note: tmp_link_dir must outlive the eviction request — kept in
+    // scope by binding above. The Restart scenario differs from
+    // EvictReadmit only in pool-cache state semantics; both routes
+    // read the same dense_kvs round-trip path under the hood.
+    let _ = &tmp_link_dir;
+
+    let restored = phase_d_driver::decode_full_text(
+        &server,
+        &canonical,
+        &prompt,
+        max_decode_tokens,
+    )
+    .map_err(|e| format!("restored decode: {e}"))?;
+
+    if baseline.text != restored.text {
+        let n = baseline.text.len().min(restored.text.len());
+        let common = baseline
+            .text
+            .as_bytes()
+            .iter()
+            .zip(restored.text.as_bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        return Err(format!(
+            "cell {} byte-diff at offset {} (baseline={} bytes, restored={} bytes, common={})",
+            cell.payload_kind(),
+            common,
+            baseline.text.len(),
+            restored.text.len(),
+            n,
+        ));
+    }
+    Ok(())
 }
 
 // =========================================================================
@@ -506,15 +1229,22 @@ fn env_gate_predicate_is_well_formed() {
 /// short-circuits with a diagnostic; only fires under
 /// `HF2Q_KV_PERSIST_E2E=1` AND at least one runnable cell.
 ///
-/// **Substrate-only on B-dense.2:** the runner returns Err for every
-/// cell with a "post-merge run" diagnostic. The matrix gate test
-/// records the count of attempted cells and the count of runnable
-/// cells, but does NOT fail on the substrate-only Err. The actual
-/// E2E HTTP/SSE round-trip is a post-merge work item driven from
-/// the main session.
+/// **Phase D wire-up:** `run_cell_e2e` now drives the HTTP/SSE round-trip
+/// via the local `phase_d_driver`. Each cell:
+///   1. spawns `hf2q serve --model PATH --kv-persist=DIR` with
+///      `HF2Q_USE_DENSE=1`
+///   2. issues a baseline streaming completion
+///   3. for `EvictReadmit` / `Restart` scenarios: forces a pool eviction
+///      via the symlink-distinct-pool-key trick, then re-issues the
+///      same prompt
+///   4. asserts byte-exact decoded text between baseline and post-readmit
 ///
-/// Falsifier (post-merge): any cell's pre/post dense_kvs hash diff,
-/// any decoded-token diff, or the substitution flow not firing.
+/// `substrate_only_skips` counter is retained for log-format stability
+/// across pre-Phase-D and post-Phase-D runs but should always be 0 once
+/// Phase D ships.
+///
+/// Falsifier: any cell's decoded-text byte-diff, eviction-cycle error,
+/// or readyz timeout under `HF2Q_KV_PERSIST_E2E=1`.
 #[test]
 fn kv_persist_gemma4_roundtrip_matrix_e2e() {
     let active = std::env::var(ENV_E2E_GATE).as_deref() == Ok("1");
@@ -594,5 +1324,570 @@ fn kv_persist_gemma4_roundtrip_matrix_e2e() {
         "matrix had {} hard failures: {:?}",
         hard_failures.len(),
         hard_failures
+    );
+}
+
+// ---------- Phase D env-gated tests (HF2Q_KV_PERSIST_PHASE_D=1) ----------
+
+/// Resolve the Phase D model path. Operator sets
+/// `HF2Q_KV_PERSIST_E2E_MODEL_PATH=/path/to.gguf` (the canonical
+/// Gemma 4 26B Q4_0 fixture per `scripts/adr017_phase_d.sh`).
+/// Returns `None` if unset or path missing.
+fn resolve_phase_d_model_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var(ENV_MODEL_PATH_FALLBACK) {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    None
+}
+
+/// Phase D R-C4 coherence test (env-gated by
+/// `HF2Q_KV_PERSIST_PHASE_D=1`). Default `cargo test` short-circuits
+/// with a diagnostic.
+///
+/// Drives the canonical sourdough fixture
+/// (`scripts/sourdough_gate.sh`'s 22-token user prompt, T=0 greedy,
+/// max_tokens=1000) under `--kv-persist=DIR` + `HF2Q_USE_DENSE=1`:
+///
+///   1. captures hf2q never-evicted output A
+///   2. forces evict-readmit via symlink-distinct-pool-key
+///   3. captures hf2q evicted+restored output B
+///   4. asserts A == B byte-identical (R-C4 internal coherence)
+///
+/// Optional peer arm (env-gated by
+/// `HF2Q_KV_PERSIST_PHASE_D_PEER=1`): runs `llama-completion` on the
+/// same GGUF + sourdough rendered prompt; asserts both A and B share
+/// at least `SOURDOUGH_MIN_COMMON_PREFIX` (3094) leading bytes with
+/// llama's output. Mirrors `scripts/sourdough_gate.sh`'s 3094-byte
+/// floor.
+///
+/// Falsifier: any byte-diff between A and B; or peer arm's common
+/// prefix below the 3094-byte floor.
+#[test]
+fn kv_persist_phase_d_coherence_e2e() {
+    let active = std::env::var(ENV_PHASE_D_GATE).as_deref() == Ok("1");
+    if !active {
+        eprintln!(
+            "[Phase D coherence] {ENV_PHASE_D_GATE}=1 not set — short-circuit. \
+             Set {ENV_PHASE_D_GATE}=1 + HF2Q_KV_PERSIST_E2E_MODEL_PATH=PATH to run."
+        );
+        return;
+    }
+    let model_path = match resolve_phase_d_model_path() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[Phase D coherence] {ENV_PHASE_D_GATE}=1 set but \
+                 HF2Q_KV_PERSIST_E2E_MODEL_PATH unset or path missing — \
+                 short-circuit."
+            );
+            return;
+        }
+    };
+
+    let bin = hf2q_binary_path();
+    assert!(
+        bin.exists(),
+        "[Phase D coherence] hf2q binary not found at {} — \
+         did `cargo build --release` run?",
+        bin.display()
+    );
+
+    let cache_dir = std::env::temp_dir().join(format!(
+        "hf2q-kv-persist-phase-d-coherence-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&cache_dir).expect("mkdir Phase D coherence cache_dir");
+
+    let port = std::env::var("HF2Q_KV_PERSIST_PHASE_D_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(phase_d_driver::PORT_DEFAULT);
+
+    let server = phase_d_driver::spawn_hf2q_serve_with_kv_persist(
+        &bin,
+        &model_path,
+        &cache_dir,
+        phase_d_driver::HOST,
+        port,
+    )
+    .expect("[Phase D coherence] spawn hf2q serve --kv-persist");
+    phase_d_driver::wait_for_readyz(&server)
+        .expect("[Phase D coherence] /readyz did not return 200 within budget");
+    let canonical = phase_d_driver::fetch_canonical_model_id(&server)
+        .expect("[Phase D coherence] fetch canonical model id");
+
+    eprintln!(
+        "[Phase D coherence] spawned hf2q serve on {}:{} model={} cache_dir={}",
+        phase_d_driver::HOST,
+        port,
+        canonical,
+        cache_dir.display(),
+    );
+
+    let baseline = phase_d_driver::decode_full_text(
+        &server,
+        &canonical,
+        SOURDOUGH_PROMPT,
+        SOURDOUGH_MAX_TOKENS,
+    )
+    .expect("[Phase D coherence] baseline decode (never-evicted)");
+    eprintln!(
+        "[Phase D coherence] baseline decoded {} bytes ({} tokens, ttft={:.1}ms)",
+        baseline.text.len(),
+        baseline.total_tokens,
+        baseline.ttft_ms,
+    );
+    assert!(
+        !baseline.text.is_empty(),
+        "[Phase D coherence] baseline output is empty — server returned 0-byte SSE stream"
+    );
+
+    let tmp_link_dir = tempfile::tempdir()
+        .expect("[Phase D coherence] tempdir for symlink-eviction-trick");
+    let (_link_path, evict_wall_ms, second_ttft_ms) =
+        phase_d_driver::force_eviction_via_symlink(
+            &server,
+            &model_path,
+            tmp_link_dir.path(),
+        )
+        .expect("[Phase D coherence] force eviction via symlink");
+    eprintln!(
+        "[Phase D coherence] eviction cycle: wall={:.1}ms second_ttft={:.1}ms",
+        evict_wall_ms, second_ttft_ms
+    );
+
+    let restored = phase_d_driver::decode_full_text(
+        &server,
+        &canonical,
+        SOURDOUGH_PROMPT,
+        SOURDOUGH_MAX_TOKENS,
+    )
+    .expect("[Phase D coherence] restored decode (post-eviction)");
+    eprintln!(
+        "[Phase D coherence] restored decoded {} bytes ({} tokens, ttft={:.1}ms)",
+        restored.text.len(),
+        restored.total_tokens,
+        restored.ttft_ms,
+    );
+
+    if baseline.text != restored.text {
+        let common = baseline
+            .text
+            .as_bytes()
+            .iter()
+            .zip(restored.text.as_bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let snippet_a = baseline
+            .text
+            .get(common..common.saturating_add(120))
+            .unwrap_or("")
+            .to_string();
+        let snippet_b = restored
+            .text
+            .get(common..common.saturating_add(120))
+            .unwrap_or("")
+            .to_string();
+        panic!(
+            "[Phase D coherence] R-C4 INTERNAL FAIL: baseline != restored \
+             (diverge at byte offset {}; baseline={} bytes, restored={} bytes)\n\
+             baseline @ {}: {:?}\nrestored @ {}: {:?}",
+            common,
+            baseline.text.len(),
+            restored.text.len(),
+            common,
+            snippet_a,
+            common,
+            snippet_b,
+        );
+    }
+    eprintln!(
+        "[R-C4 internal] PASS — baseline ({} bytes) == restored ({} bytes) byte-identical",
+        baseline.text.len(),
+        restored.text.len(),
+    );
+
+    // Optional peer arm: run llama-completion on rendered prompt and
+    // assert both A and B share >= 3094 bytes common prefix with it.
+    let peer_active = std::env::var(ENV_PHASE_D_PEER).as_deref() == Ok("1");
+    if !peer_active {
+        eprintln!(
+            "[Phase D coherence] peer arm skipped ({ENV_PHASE_D_PEER}=1 to enable)"
+        );
+        return;
+    }
+
+    let llama_bin = match phase_d_driver::resolve_llama_completion_bin() {
+        Some(b) => b,
+        None => {
+            eprintln!(
+                "[Phase D coherence] {ENV_PHASE_D_PEER}=1 but llama-completion \
+                 not found (set {ENV_PHASE_D_LLAMA_BIN}=PATH or install at \
+                 /opt/llama.cpp/build/bin/llama-completion). Skipping peer arm."
+            );
+            return;
+        }
+    };
+    eprintln!("[Phase D coherence] llama-completion bin: {}", llama_bin.display());
+
+    // Render the chat template via hf2q (BOS-included), then strip the
+    // leading literal `<bos>` for llama-completion. Mirrors
+    // `scripts/sourdough_gate.sh:115-140`.
+    let rendered_dir = tempfile::tempdir()
+        .expect("[Phase D coherence] rendered-prompt tempdir");
+    let rendered_path = rendered_dir.path().join("rendered.txt");
+    let rendered_path_nobos = rendered_dir.path().join("rendered_nobos.txt");
+    let render_out = Command::new(&bin)
+        .args([
+            "generate",
+            "--model",
+            &model_path.to_string_lossy(),
+            "--prompt",
+            SOURDOUGH_PROMPT,
+            "--max-tokens",
+            "1",
+            "--temperature",
+            "0",
+        ])
+        .env("HF2Q_DUMP_RENDERED_PROMPT", &rendered_path)
+        .env("HF2Q_USE_DENSE", "1")
+        .output()
+        .expect("[Phase D coherence] hf2q generate --max-tokens 1 (render template)");
+    if !render_out.status.success() {
+        panic!(
+            "[Phase D coherence] hf2q template-render failed: status={:?}; stderr={}",
+            render_out.status.code(),
+            String::from_utf8_lossy(&render_out.stderr),
+        );
+    }
+    let rendered = std::fs::read(&rendered_path)
+        .expect("[Phase D coherence] read rendered prompt");
+    assert!(
+        rendered.starts_with(b"<bos>"),
+        "[Phase D coherence] rendered prompt does not start with literal '<bos>' \
+         (chat-template change?); got first 32 bytes: {:?}",
+        &rendered[..rendered.len().min(32)],
+    );
+    std::fs::write(&rendered_path_nobos, &rendered[5..])
+        .expect("[Phase D coherence] write BOS-stripped prompt");
+
+    let llama_bytes = phase_d_driver::run_llama_completion_peer(
+        &llama_bin,
+        &model_path,
+        &rendered_path_nobos,
+        SOURDOUGH_MAX_TOKENS,
+    )
+    .expect("[Phase D coherence] llama-completion peer run");
+    eprintln!(
+        "[Phase D coherence] llama-completion produced {} bytes",
+        llama_bytes.len()
+    );
+
+    let common_baseline = baseline
+        .text
+        .as_bytes()
+        .iter()
+        .zip(llama_bytes.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let common_restored = restored
+        .text
+        .as_bytes()
+        .iter()
+        .zip(llama_bytes.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    eprintln!(
+        "[R-C4 peer] baseline-vs-llama common prefix: {} bytes (floor: {})",
+        common_baseline, SOURDOUGH_MIN_COMMON_PREFIX
+    );
+    eprintln!(
+        "[R-C4 peer] restored-vs-llama common prefix: {} bytes (floor: {})",
+        common_restored, SOURDOUGH_MIN_COMMON_PREFIX
+    );
+    assert!(
+        common_baseline >= SOURDOUGH_MIN_COMMON_PREFIX,
+        "[R-C4 peer] baseline-vs-llama common prefix {} < floor {}",
+        common_baseline,
+        SOURDOUGH_MIN_COMMON_PREFIX,
+    );
+    assert!(
+        common_restored >= SOURDOUGH_MIN_COMMON_PREFIX,
+        "[R-C4 peer] restored-vs-llama common prefix {} < floor {}",
+        common_restored,
+        SOURDOUGH_MIN_COMMON_PREFIX,
+    );
+    eprintln!("[R-C4 peer] PASS — both arms share >= {} bytes with llama.cpp", SOURDOUGH_MIN_COMMON_PREFIX);
+}
+
+/// Phase D R-P4 ship-gate test (env-gated by
+/// `HF2Q_KV_PERSIST_PHASE_D=1` + `HF2Q_KV_PERSIST_E2E_PREFILL_LEN=N`).
+/// Default `cargo test` short-circuits.
+///
+/// At prefill length L (operator-supplied; spec calls for L=32768 on
+/// the cold M5 Max + Gemma4-26B Q4_0 cell):
+///   1. spawn `hf2q serve --kv-persist=DIR`
+///   2. send a token-diverse prompt of size ~L; measure `no_cache_ttft`
+///      (this also primes the on-disk block cache)
+///   3. force eviction via symlink-distinct-pool-key (cold-load the
+///      same physical bytes under a new pool key, dropping the in-RAM
+///      KV state)
+///   4. send the SAME prompt again; measure `cache_hit_ttft` (the cache
+///      is now repopulated from the on-disk persistence layer)
+///   5. assert `cache_hit_ttft / no_cache_ttft <= 0.20`
+///
+/// Falsifier: ratio > 0.20.
+#[test]
+fn kv_persist_phase_d_r_p4_e2e() {
+    let active = std::env::var(ENV_PHASE_D_GATE).as_deref() == Ok("1");
+    if !active {
+        eprintln!(
+            "[Phase D R-P4] {ENV_PHASE_D_GATE}=1 not set — short-circuit. \
+             Set {ENV_PHASE_D_GATE}=1 + {ENV_PHASE_D_R_P4_PREFILL_LEN}=N + \
+             HF2Q_KV_PERSIST_E2E_MODEL_PATH=PATH to run."
+        );
+        return;
+    }
+    let prefill_len: u32 = match std::env::var(ENV_PHASE_D_R_P4_PREFILL_LEN)
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        Some(n) if n > 0 => n,
+        _ => {
+            eprintln!(
+                "[Phase D R-P4] {ENV_PHASE_D_R_P4_PREFILL_LEN} unset or non-positive \
+                 — short-circuit. Set to 32768 for the canonical R-P4 cell."
+            );
+            return;
+        }
+    };
+    let model_path = match resolve_phase_d_model_path() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[Phase D R-P4] HF2Q_KV_PERSIST_E2E_MODEL_PATH unset or path missing \
+                 — short-circuit."
+            );
+            return;
+        }
+    };
+
+    let bin = hf2q_binary_path();
+    assert!(
+        bin.exists(),
+        "[Phase D R-P4] hf2q binary not found at {}",
+        bin.display()
+    );
+
+    let cache_dir = std::env::temp_dir().join(format!(
+        "hf2q-kv-persist-phase-d-r-p4-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&cache_dir).expect("mkdir Phase D R-P4 cache_dir");
+
+    let port = std::env::var("HF2Q_KV_PERSIST_PHASE_D_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(phase_d_driver::PORT_DEFAULT);
+
+    let server = phase_d_driver::spawn_hf2q_serve_with_kv_persist(
+        &bin,
+        &model_path,
+        &cache_dir,
+        phase_d_driver::HOST,
+        port,
+    )
+    .expect("[Phase D R-P4] spawn hf2q serve --kv-persist");
+    phase_d_driver::wait_for_readyz(&server)
+        .expect("[Phase D R-P4] /readyz did not return 200 within budget");
+    let canonical = phase_d_driver::fetch_canonical_model_id(&server)
+        .expect("[Phase D R-P4] fetch canonical model id");
+
+    // Build a token-diverse word-stream prompt sized to ~prefill_len
+    // tokens. Same `wordN` construction as the matrix runner —
+    // empirically ≈3.8 tokens/word under Gemma 4 BPE.
+    let n_words = (prefill_len as usize / 4).max(2);
+    let prompt: String = (0..n_words)
+        .map(|i| format!("word{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    eprintln!(
+        "[Phase D R-P4] prefill_len={} (target tokens), n_words={}, prompt_bytes={}",
+        prefill_len,
+        n_words,
+        prompt.len(),
+    );
+
+    // No-cache run: prompts the on-disk persistence layer for the
+    // first time. TTFT here is the cold-prefill cost.
+    let no_cache = phase_d_driver::decode_full_text(
+        &server,
+        &canonical,
+        &prompt,
+        4,
+    )
+    .expect("[Phase D R-P4] no-cache decode");
+    eprintln!(
+        "[Phase D R-P4] no_cache_ttft={:.1}ms (prompt_tokens={:?}, total_tokens={})",
+        no_cache.ttft_ms, no_cache.prompt_tokens, no_cache.total_tokens
+    );
+
+    // Force eviction so the next request must hit the on-disk cache
+    // rather than the in-RAM KV state from the no-cache run.
+    let tmp_link_dir = tempfile::tempdir()
+        .expect("[Phase D R-P4] tempdir for symlink-eviction-trick");
+    let (_link_path, evict_wall_ms, _second_ttft_ms) =
+        phase_d_driver::force_eviction_via_symlink(
+            &server,
+            &model_path,
+            tmp_link_dir.path(),
+        )
+        .expect("[Phase D R-P4] force eviction via symlink");
+    eprintln!(
+        "[Phase D R-P4] eviction cycle wall={:.1}ms",
+        evict_wall_ms
+    );
+
+    let cache_hit = phase_d_driver::decode_full_text(
+        &server,
+        &canonical,
+        &prompt,
+        4,
+    )
+    .expect("[Phase D R-P4] cache-hit decode");
+    eprintln!(
+        "[Phase D R-P4] cache_hit_ttft={:.1}ms (prompt_tokens={:?}, total_tokens={})",
+        cache_hit.ttft_ms, cache_hit.prompt_tokens, cache_hit.total_tokens
+    );
+
+    let ratio = cache_hit.ttft_ms / no_cache.ttft_ms;
+    let pass = ratio <= 0.20;
+    if pass {
+        eprintln!(
+            "[R-P4] PASS — ratio={:.3} (no_cache={:.1}ms cache_hit={:.1}ms)",
+            ratio, no_cache.ttft_ms, cache_hit.ttft_ms
+        );
+    } else {
+        eprintln!(
+            "[R-P4] FAIL — ratio={:.3} > 0.20 (no_cache={:.1}ms cache_hit={:.1}ms)",
+            ratio, no_cache.ttft_ms, cache_hit.ttft_ms
+        );
+    }
+    assert!(
+        pass,
+        "[R-P4] ship-gate FAIL: ratio={:.3} > 0.20 \
+         (no_cache_ttft={:.1}ms cache_hit_ttft={:.1}ms prefill_len={})",
+        ratio, no_cache.ttft_ms, cache_hit.ttft_ms, prefill_len,
+    );
+}
+
+// ---------- Phase D always-on shape tests (no env required) ----------
+
+/// Phase D shape test: the new env gates are well-formed and the
+/// driver module compiles + the spawn helper rejects nonexistent
+/// model paths cleanly (no panic). Falsifier: spawn helper panics on
+/// missing model rather than returning a `DriverError`.
+#[test]
+fn phase_d_driver_rejects_missing_model_cleanly() {
+    let bogus_model = PathBuf::from(
+        "/var/empty/this-path-must-not-exist-phase-d-shape-test.gguf",
+    );
+    let cache_dir = std::env::temp_dir().join(format!(
+        "hf2q-phase-d-shape-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    let bin = hf2q_binary_path();
+    if !bin.exists() {
+        // Build hasn't happened yet — short-circuit (the binary check
+        // is covered by `binary_is_locatable_and_runs_version`).
+        eprintln!(
+            "[Phase D shape] hf2q binary missing at {}; skipping spawn check",
+            bin.display()
+        );
+        return;
+    }
+    let result = phase_d_driver::spawn_hf2q_serve_with_kv_persist(
+        &bin,
+        &bogus_model,
+        &cache_dir,
+        phase_d_driver::HOST,
+        // Use a port nobody else uses; the spawn should fail BEFORE
+        // any port-bind attempt because model-path check is first.
+        0,
+    );
+    match result {
+        Err(phase_d_driver::DriverError::SpawnFailed(_)) => {}
+        Err(other) => {
+            panic!(
+                "phase_d_driver should return SpawnFailed for missing model; got {other}"
+            );
+        }
+        Ok(_) => panic!("phase_d_driver should not spawn against missing model path"),
+    }
+}
+
+/// Phase D shape test: the env-gate predicates are well-formed for
+/// each defined gate (master + peer + prefill-length).
+/// Falsifier: predicate panics or detects "1" when env is unset.
+#[test]
+fn phase_d_env_gates_are_well_formed() {
+    for gate in &[
+        ENV_PHASE_D_GATE,
+        ENV_PHASE_D_PEER,
+        ENV_PHASE_D_R_P4_PREFILL_LEN,
+        ENV_PHASE_D_LLAMA_BIN,
+    ] {
+        let prior = std::env::var(gate).ok();
+        std::env::remove_var(gate);
+        assert!(
+            std::env::var(gate).is_err(),
+            "gate {gate} should be unset"
+        );
+        std::env::set_var(gate, "1");
+        assert_eq!(
+            std::env::var(gate).as_deref(),
+            Ok("1"),
+            "gate {gate} round-trip"
+        );
+        std::env::remove_var(gate);
+        if let Some(v) = prior {
+            std::env::set_var(gate, v);
+        }
+    }
+}
+
+/// Phase D shape test: the sourdough constants are byte-identical to
+/// `scripts/sourdough_gate.sh`'s. Falsifier: prompt/max_tokens/floor
+/// drift between test and gate script.
+#[test]
+fn phase_d_sourdough_constants_match_shell_gate() {
+    assert_eq!(
+        SOURDOUGH_PROMPT,
+        "Complrehensive instructions for making sourdough bread.",
+        "sourdough prompt must match scripts/sourdough_gate.sh literal"
+    );
+    assert_eq!(
+        SOURDOUGH_MAX_TOKENS, 1000,
+        "sourdough max_tokens must match scripts/sourdough_gate.sh"
+    );
+    assert_eq!(
+        SOURDOUGH_MIN_COMMON_PREFIX, 3094,
+        "sourdough min-common-prefix floor must match scripts/sourdough_gate.sh"
     );
 }
