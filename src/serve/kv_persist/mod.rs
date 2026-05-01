@@ -20,6 +20,7 @@ pub mod families;
 pub mod format;
 pub mod index;
 pub mod loader_wrapper;
+pub mod metrics;
 pub mod recovery;
 pub mod registry;
 pub mod spiller;
@@ -28,10 +29,16 @@ pub mod writer;
 #[allow(unused_imports)]
 pub use block_store::{DiskBlockStore, WriteJob, MAX_BLOCK_BYTES};
 #[allow(unused_imports)]
+pub use metrics::{
+    KvCacheMetricsSink, KvQuarantineReason, KV_EVICTION_TRIGGERS, KV_EVICTION_TRIGGER_COUNT,
+    KV_QUARANTINE_REASONS, KV_QUARANTINE_REASON_COUNT,
+};
+#[allow(unused_imports)]
 pub use loader_wrapper::LoaderWrapper;
 #[allow(unused_imports)]
 pub use recovery::{
-    quarantine_corrupted_block, recover_from_disk, QuarantineReason, RecoveryReport,
+    quarantine_corrupted_block, quarantine_corrupted_block_with_counters, recover_from_disk,
+    recover_from_disk_with_counters, QuarantineReason, RecoveryReport,
 };
 #[allow(unused_imports)]
 pub use registry::KvPersistRegistry;

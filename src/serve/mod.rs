@@ -1703,8 +1703,8 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         };
         use crate::serve::kv_persist::registry::FamilyHookFactory;
         use crate::serve::kv_persist::{
-            recover_from_disk, AsyncWriterHandle, BlockPrefixCacheSpiller, DiskBlockStore,
-            KvPersistRegistry, LoaderWrapper, StubGemma4Spill, DEFAULT_CHANNEL_CAPACITY,
+            AsyncWriterHandle, BlockPrefixCacheSpiller, DiskBlockStore, KvPersistRegistry,
+            LoaderWrapper, StubGemma4Spill, DEFAULT_CHANNEL_CAPACITY,
         };
         use crate::serve::multi_model::{DefaultModelLoader, HotSwapManager, LoadedPool};
 
@@ -1719,8 +1719,24 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         // 2. Recovery scan — rebuild BlockIndex from on-disk
         //    envelopes left by a prior run. Returns
         //    `(BlockIndex, RecoveryReport)` per recovery.rs:110.
+        //
+        //    ADR-017 §R-F7: route through `recover_from_disk_with_counters`
+        //    so the scan-time quarantine moves bump
+        //    `hf2q_kv_quarantined_total{reason=...}` against the same
+        //    AppState-owned counters Arc the /metrics handler reads.
+        //    Upcast `Arc<KvSpillCounters>` → `Arc<dyn KvCacheMetricsSink>`
+        //    here because the substrate's seam is trait-objected (per
+        //    `kv_persist::metrics` module docs — keeps the lib facade
+        //    decoupled from `serve::api`).
+        let metrics_sink: Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink> =
+            Arc::clone(&state.kv_spill_counters)
+                as Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>;
         let (recovered_index, recovery_report) =
-            recover_from_disk(cache_dir).with_context(|| {
+            crate::serve::kv_persist::recover_from_disk_with_counters(
+                cache_dir,
+                Some(&metrics_sink),
+            )
+            .with_context(|| {
                 format!(
                     "ADR-017 C.1: recover_from_disk({})",
                     cache_dir.display()
@@ -1779,6 +1795,15 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
                 })?,
         );
         store.set_budget_bytes(kv_persist_budget_bytes);
+        // ADR-017 §R-F7: wire the DiskBlockStore to the AppState's
+        // kv_spill_counters so eviction bumps
+        // `hf2q_kv_cache_evictions_total{trigger="budget_overflow"}`
+        // against the same Arc the /metrics handler reads. AppState
+        // also gets a clone of the store handle so the gauges
+        // `hf2q_kv_cache_bytes_on_disk` + `hf2q_kv_cache_blocks_total`
+        // resolve at scrape time against the live BlockIndex.
+        store.set_kv_counters(Arc::clone(&metrics_sink));
+        state.kv_disk_store = Some(Arc::clone(&store));
         tracing::info!(
             budget_bytes = kv_persist_budget_bytes,
             "ADR-017 P1-3: HF2Q_KV_PERSIST_BUDGET_BYTES wired (0 = unlimited)"

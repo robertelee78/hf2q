@@ -46,10 +46,11 @@ use std::io::{self, ErrorKind};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::serve::kv_persist::format::{self, BlockHash, EnvelopeHeader, ModelFingerprint};
 use crate::serve::kv_persist::index::{BlockIndex, BlockMeta};
+use crate::serve::kv_persist::metrics::KvCacheMetricsSink;
 
 /// Hard upper bound on a single block's serialized size. Mirrors ADR-017
 /// §R-F11 (oversized-block refusal). Bigger than this is treated as
@@ -95,6 +96,17 @@ pub struct DiskBlockStore {
     /// `0` means "use [`MAX_BLOCK_BYTES`]". Tests set this small so the
     /// rejection path is exercised without a 256-MiB allocation.
     max_block_bytes_override: AtomicU64,
+    /// ADR-017 §R-F7: optional handle to the process-wide telemetry
+    /// sink so `evict_lru_until_under_budget` can bump
+    /// `hf2q_kv_cache_evictions_total{trigger="budget_overflow"}` per
+    /// evicted block. Trait-objected (`Arc<dyn KvCacheMetricsSink>`)
+    /// instead of the concrete `KvSpillCounters` so the narrow
+    /// `kv_persist` lib facade (`src/lib.rs`) compiles without
+    /// pulling `serve::api::state` into the lib build. `None` keeps
+    /// the store metric-silent (the existing test path) — bump is a
+    /// no-op when no sink is attached. Wired by `cmd_serve` via
+    /// [`Self::set_kv_counters`] once `AppState` owns the same Arc.
+    kv_counters: RwLock<Option<Arc<dyn KvCacheMetricsSink>>>,
 }
 
 impl DiskBlockStore {
@@ -124,7 +136,22 @@ impl DiskBlockStore {
             index,
             budget_bytes: AtomicU64::new(budget_bytes),
             max_block_bytes_override: AtomicU64::new(0),
+            kv_counters: RwLock::new(None),
         })
+    }
+
+    /// ADR-017 §R-F7: attach the process-wide telemetry sink so the
+    /// eviction path bumps
+    /// `hf2q_kv_cache_evictions_total{trigger="budget_overflow"}`. Wired
+    /// by `cmd_serve` after `AppState` is constructed; off-path the
+    /// store stays metric-silent (no-op). The concrete sink is
+    /// `serve::api::state::KvSpillCounters` in production; tests that
+    /// want to inspect bumps construct any other type that impls
+    /// [`KvCacheMetricsSink`].
+    pub fn set_kv_counters(&self, counters: Arc<dyn KvCacheMetricsSink>) {
+        if let Ok(mut guard) = self.kv_counters.write() {
+            *guard = Some(counters);
+        }
     }
 
     /// Effective per-block size ceiling (defaults to [`MAX_BLOCK_BYTES`]
@@ -341,6 +368,15 @@ impl DiskBlockStore {
         });
 
         let mut freed = 0u64;
+        // ADR-017 §R-F7: snapshot the counters Arc once outside the
+        // per-block loop so the per-eviction increment doesn't take the
+        // RwLock on every iteration. Cloned Arc is cheap; held by-value
+        // for the loop's lifetime, dropped on return.
+        let counters_snapshot: Option<Arc<dyn KvCacheMetricsSink>> = self
+            .kv_counters
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(Arc::clone));
         for meta in entries {
             if self.index.total_bytes_on_disk() <= budget {
                 break;
@@ -355,6 +391,14 @@ impl DiskBlockStore {
             }
             let bytes = self.remove_block(&meta.hash)?;
             freed = freed.saturating_add(bytes);
+            // ADR-017 §R-F7: per-block (NOT per-call) — bump once for
+            // each block actually removed. Skipped (pinned / racing
+            // remove) blocks do NOT increment, mirroring the
+            // `hf2q_pool_kv_spills_total` per-call invariant where
+            // "no-op" outcomes never bump.
+            if let Some(c) = counters_snapshot.as_ref() {
+                c.record_eviction_budget_overflow();
+            }
         }
         Ok(freed)
     }
@@ -443,6 +487,37 @@ mod tests {
             "deadbeefcafebabe1122334455667788",
             "<|im_start|>...<|im_end|>",
         )
+    }
+
+    /// ADR-017 §R-F7 — minimal in-test [`KvCacheMetricsSink`]. Mirrors
+    /// the storage layout of `serve::api::state::KvSpillCounters` (the
+    /// production sink) so per-trigger / per-reason row indices line
+    /// up with the production assert pattern.
+    #[derive(Debug, Default)]
+    struct TestMetricsSink {
+        quarantines: [AtomicU64; 4],
+        evictions: [AtomicU64; 1],
+    }
+
+    impl TestMetricsSink {
+        fn new() -> Self {
+            Self::default()
+        }
+        fn snapshot_evictions(&self) -> [u64; 1] {
+            [self.evictions[0].load(AtomicOrdering::Relaxed)]
+        }
+    }
+
+    impl crate::serve::kv_persist::metrics::KvCacheMetricsSink for TestMetricsSink {
+        fn record_quarantine(
+            &self,
+            reason: crate::serve::kv_persist::metrics::KvQuarantineReason,
+        ) {
+            self.quarantines[reason.index()].fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        fn record_eviction_budget_overflow(&self) {
+            self.evictions[0].fetch_add(1, AtomicOrdering::Relaxed);
+        }
     }
 
     /// Build (body, header) such that sha256(body) == header.block_hash.
@@ -917,6 +992,184 @@ mod tests {
         const FOUR_GIB: u64 = 4u64 << 30;
         store.set_budget_bytes(FOUR_GIB);
         assert_eq!(store.budget_bytes(), FOUR_GIB);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-017 §R-F7 — cache-side counter wiring tests.
+    //
+    // These tests live inside the kv_persist test module so the
+    // `cargo test ... kv_persist` filter catches them. They exercise
+    // the bump-side / gauge-source contracts ONLY against the
+    // in-process state — the Prometheus emit string-shape is covered
+    // separately by the router's iter213 test suite + the operator
+    // smoke recipe.
+    // -----------------------------------------------------------------
+
+    /// ADR-017 §R-F7 / counter 4: every block actually evicted by
+    /// `evict_lru_until_under_budget` bumps
+    /// `hf2q_kv_cache_evictions_total{trigger="budget_overflow"}` by
+    /// exactly 1. Pinned and racing-removed blocks do NOT bump (mirrors
+    /// the per-call NOT per-block invariant of `record_spill`).
+    #[test]
+    fn cache_evictions_total_bumps_per_evicted_block() {
+        let dir = temp_dir("rf7-evict");
+        let store = DiskBlockStore::new(dir.clone(), 0).expect("new");
+        // Two handles to the same sink — `concrete` for snapshot reads,
+        // `as_trait` upcast to `dyn KvCacheMetricsSink` for the
+        // `set_kv_counters` setter (which takes the trait object so
+        // the lib facade builds without `serve::api::state` access).
+        let concrete = Arc::new(TestMetricsSink::new());
+        let as_trait: Arc<dyn KvCacheMetricsSink> =
+            Arc::clone(&concrete) as Arc<dyn KvCacheMetricsSink>;
+        store.set_kv_counters(as_trait);
+        let fp = fixture_fp("rf7-evict");
+
+        // Write 5 blocks with strictly-increasing mtimes.
+        let mut hashes: Vec<BlockHash> = Vec::new();
+        let mut sizes: Vec<u64> = Vec::new();
+        for s in 0u32..5 {
+            let (body, header) = make_block(fp, ParentBlockHash(None), s);
+            let path = store.write_block_sync(&header, &body).expect("write");
+            hashes.push(header.block_hash);
+            sizes.push(fs::metadata(&path).unwrap().len());
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // Pre-condition: counter at zero.
+        assert_eq!(concrete.snapshot_evictions(), [0u64]);
+
+        // Eviction path: budget fits the 2 newest. 3 oldest evicted.
+        let budget = sizes[3] + sizes[4];
+        store.set_budget_bytes(budget);
+        let _freed = store
+            .evict_lru_until_under_budget(|_| false)
+            .expect("evict");
+        assert_eq!(store.index().block_count(), 2);
+
+        // Counter contract: 3 evicted ⇒ +3 on the budget_overflow row.
+        // Other (non-existent) trigger rows would be tested here if
+        // they existed; `KV_EVICTION_TRIGGERS` is a closed enum of
+        // size 1 today.
+        assert_eq!(
+            concrete.snapshot_evictions(),
+            [3u64],
+            "3 blocks evicted ⇒ +3 on budget_overflow"
+        );
+
+        // Sub-budget eviction with 2 PINNED + budget that requires +1
+        // eviction. Should bump by exactly 1 (only the unpinned block
+        // gets removed).
+        let dir2 = temp_dir("rf7-evict-pin");
+        let store2 = DiskBlockStore::new(dir2.clone(), 0).expect("new2");
+        let concrete2 = Arc::new(TestMetricsSink::new());
+        let as_trait2: Arc<dyn KvCacheMetricsSink> =
+            Arc::clone(&concrete2) as Arc<dyn KvCacheMetricsSink>;
+        store2.set_kv_counters(as_trait2);
+        let fp2 = fixture_fp("rf7-evict-pin");
+        let mut h2: Vec<BlockHash> = Vec::new();
+        let mut s2: Vec<u64> = Vec::new();
+        for s in 0u32..3 {
+            let (body, header) = make_block(fp2, ParentBlockHash(None), s);
+            let path = store2.write_block_sync(&header, &body).expect("w2");
+            h2.push(header.block_hash);
+            s2.push(fs::metadata(&path).unwrap().len());
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Budget fits 1 block. Pin newest 2 → only the oldest (h2[0])
+        // gets removed.
+        let budget2 = s2[2];
+        store2.set_budget_bytes(budget2);
+        let pinned = vec![h2[1], h2[2]];
+        let pinned_clone = pinned.clone();
+        let _ = store2
+            .evict_lru_until_under_budget(move |h| pinned_clone.contains(h))
+            .expect("evict2");
+        assert_eq!(
+            concrete2.snapshot_evictions(),
+            [1u64],
+            "1 block evicted under pin pressure ⇒ +1 on budget_overflow"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
+    /// ADR-017 §R-F7 / counter 2: `hf2q_kv_cache_bytes_on_disk` gauge
+    /// reads `BlockIndex.total_bytes_on_disk()` directly — no separate
+    /// counter, no consistency-window race. Verify by writing N blocks
+    /// of known sizes and asserting the index sum equals the on-disk
+    /// sum from `fs::metadata`.
+    #[test]
+    fn kv_persist_cache_bytes_on_disk_gauge_returns_sum_of_block_sizes() {
+        let dir = temp_dir("rf7-bytes");
+        let store = DiskBlockStore::new(dir.clone(), 0).expect("new");
+        let fp = fixture_fp("rf7-bytes");
+
+        // Empty index: gauge reads 0.
+        assert_eq!(store.index().total_bytes_on_disk(), 0);
+
+        // Write 4 blocks of distinct seeds (so distinct hashes); record
+        // their on-disk file sizes.
+        let mut total_fs_bytes: u64 = 0;
+        for s in 0u32..4 {
+            let (body, header) = make_block(fp, ParentBlockHash(None), s);
+            let path = store.write_block_sync(&header, &body).expect("write");
+            total_fs_bytes += fs::metadata(&path).unwrap().len();
+        }
+
+        // Gauge contract: index-summed == fs-summed.
+        assert_eq!(
+            store.index().total_bytes_on_disk(),
+            total_fs_bytes,
+            "gauge sources from index == fs::metadata reality"
+        );
+
+        // After remove: gauge drops by exactly the removed block's size.
+        let to_remove = store.index().snapshot_all()[0].clone();
+        let removed_bytes = to_remove.bytes_on_disk;
+        let pre = store.index().total_bytes_on_disk();
+        store.remove_block(&to_remove.hash).expect("rm");
+        let post = store.index().total_bytes_on_disk();
+        assert_eq!(
+            pre - post,
+            removed_bytes,
+            "gauge tracks remove() in lockstep"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-017 §R-F7 / counter 3: `hf2q_kv_cache_blocks_total` gauge
+    /// reads `BlockIndex.block_count()` directly. Same lockstep
+    /// invariant as the bytes gauge — no separate counter, no race.
+    #[test]
+    fn kv_persist_cache_blocks_total_gauge_matches_block_index_len() {
+        let dir = temp_dir("rf7-blocks");
+        let store = DiskBlockStore::new(dir.clone(), 0).expect("new");
+        let fp = fixture_fp("rf7-blocks");
+
+        assert_eq!(store.index().block_count(), 0);
+
+        // Insert 7 blocks; gauge increments per insert.
+        let mut hashes: Vec<BlockHash> = Vec::new();
+        for s in 0u32..7 {
+            let (body, header) = make_block(fp, ParentBlockHash(None), s);
+            store.write_block_sync(&header, &body).expect("write");
+            hashes.push(header.block_hash);
+            assert_eq!(
+                store.index().block_count(),
+                hashes.len(),
+                "gauge tracks insert in lockstep"
+            );
+        }
+
+        // Remove 3; gauge decrements per remove.
+        for h in hashes.drain(..3) {
+            store.remove_block(&h).expect("rm");
+        }
+        assert_eq!(store.index().block_count(), 4, "7 - 3 = 4");
 
         let _ = fs::remove_dir_all(&dir);
     }

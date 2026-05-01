@@ -50,6 +50,13 @@ pub mod serve {
         pub mod format;
         #[path = "../../serve/kv_persist/index.rs"]
         pub mod index;
+        // ADR-017 §R-F7: cache-side telemetry seam (trait + label
+        // constants). Kept in the lib facade because `block_store` and
+        // `recovery` reference `KvCacheMetricsSink` at their bump
+        // sites; without this `pub mod metrics;` the lib build can't
+        // resolve `crate::serve::kv_persist::metrics::*`.
+        #[path = "../../serve/kv_persist/metrics.rs"]
+        pub mod metrics;
         #[path = "../../serve/kv_persist/recovery.rs"]
         pub mod recovery;
         #[path = "../../serve/kv_persist/writer.rs"]

@@ -231,6 +231,24 @@ const KV_OUTCOME_COUNT: usize = 4;
 /// work was done" (the noop spiller's default).  Counting Skipped
 /// would conflate the noop fast path with successful spills, which is
 /// the AC 5472 closed-enum guard's whole point.
+///
+/// ADR-017 §R-F7 (adversarial review 2026-05-01): the same telemetry
+/// surface also owns the four cache-side counters that ADR-017
+/// specifies but that Phase 4 left unwired:
+///
+///   * `hf2q_kv_quarantined_total{reason}` — bumped on every move to
+///     `kv-quarantine/`. Reason label = `QuarantineReason::as_str()`
+///     (`trunc` / `verbump` / `bodyhash` / `parity`).
+///   * `hf2q_kv_cache_evictions_total{trigger}` — bumped per evicted
+///     block in `evict_lru_until_under_budget`. Trigger label =
+///     `"budget_overflow"` today; future labels (e.g. `"manual"`) MUST
+///     append, not replace, to preserve scrape-line ordering.
+///   * `hf2q_kv_cache_bytes_on_disk` (gauge) — sourced lazily on
+///     `/metrics` scrape from the live `BlockIndex.total_bytes_on_disk()`
+///     via `AppState.kv_disk_store`. Held outside this struct because
+///     the gauge has no per-event-bump model — it's a pure read.
+///   * `hf2q_kv_cache_blocks_total` (gauge) — same pattern, sourced
+///     from `BlockIndex.block_count()`.
 #[derive(Debug, Default)]
 pub struct KvSpillCounters {
     /// `hf2q_pool_kv_spills_total` storage.  Inner row is indexed by
@@ -243,7 +261,29 @@ pub struct KvSpillCounters {
     /// `cmd_serve --kv-persist` flag flips this to `true` so spill /
     /// restore wall-clock surfaces on auto-swap reload responses.
     server_timing_enabled: AtomicBool,
+    /// ADR-017 §R-F7: `hf2q_kv_quarantined_total{reason}` — one
+    /// AtomicU64 per `QuarantineReason` variant. Index order MUST match
+    /// [`KV_QUARANTINE_REASONS`] so the `/metrics` emit order is stable
+    /// across scrapes.
+    quarantines: [AtomicU64; KV_QUARANTINE_REASON_COUNT],
+    /// ADR-017 §R-F7: `hf2q_kv_cache_evictions_total{trigger}` — one
+    /// AtomicU64 per trigger label. Today only `"budget_overflow"`
+    /// fires; the array is sized for that single trigger and grows on
+    /// future-trigger admission per [`KV_EVICTION_TRIGGERS`].
+    evictions: [AtomicU64; KV_EVICTION_TRIGGER_COUNT],
 }
+
+// ADR-017 §R-F7: re-export the trait + label constant set from the
+// `kv_persist::metrics` seam. The labels live at the seam (not here)
+// so the bump sites in `block_store` / `recovery` and the scrape sites
+// in `api::handlers` can both reach them without `api::state` becoming
+// a dependency of the narrow `kv_persist` lib facade. See the
+// `kv_persist::metrics` module docs for the why.
+pub use crate::serve::kv_persist::metrics::{
+    KvCacheMetricsSink, KvQuarantineReason, KV_EVICTION_TRIGGERS, KV_EVICTION_TRIGGER_COUNT,
+    KV_QUARANTINE_REASONS, KV_QUARANTINE_REASON_COUNT,
+};
+const KV_EVICTION_TRIGGER_BUDGET_OVERFLOW: usize = 0;
 
 impl KvSpillCounters {
     /// Construct an empty counters table with `Server-Timing`
@@ -377,6 +417,49 @@ impl KvSpillCounters {
     pub fn set_server_timing_enabled(&self, enabled: bool) {
         self.server_timing_enabled.store(enabled, Ordering::Release);
     }
+
+    // -----------------------------------------------------------------
+    // ADR-017 §R-F7 — cache-side counters (quarantine / eviction).
+    // -----------------------------------------------------------------
+
+    /// Snapshot the four quarantine-reason rows in
+    /// [`KV_QUARANTINE_REASONS`] order. Used by `/metrics` to emit the
+    /// closed-enum cardinality block (all four lines emit
+    /// unconditionally — Prometheus convention; absent counter ⇒ no
+    /// histogram, missed alerts). The bump method
+    /// [`KvCacheMetricsSink::record_quarantine`] is implemented for
+    /// this struct via the trait impl below.
+    pub fn snapshot_quarantines(&self) -> [u64; KV_QUARANTINE_REASON_COUNT] {
+        let mut out = [0u64; KV_QUARANTINE_REASON_COUNT];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = self.quarantines[i].load(Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// Snapshot the eviction-trigger row(s) in [`KV_EVICTION_TRIGGERS`]
+    /// order. One element per trigger label (today: just
+    /// `"budget_overflow"`). The bump method
+    /// [`KvCacheMetricsSink::record_eviction_budget_overflow`] is
+    /// implemented for this struct via the trait impl below.
+    pub fn snapshot_evictions(&self) -> [u64; KV_EVICTION_TRIGGER_COUNT] {
+        [self.evictions[KV_EVICTION_TRIGGER_BUDGET_OVERFLOW].load(Ordering::Relaxed)]
+    }
+}
+
+/// ADR-017 §R-F7: production [`KvCacheMetricsSink`] impl. The substrate
+/// (`kv_persist::block_store`, `kv_persist::recovery`) holds an
+/// `Arc<dyn KvCacheMetricsSink>` and bumps via this impl; the
+/// `/metrics` handler reads via [`KvSpillCounters::snapshot_quarantines`]
+/// + [`KvSpillCounters::snapshot_evictions`] on the same Arc.
+impl KvCacheMetricsSink for KvSpillCounters {
+    fn record_quarantine(&self, reason: KvQuarantineReason) {
+        self.quarantines[reason.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_eviction_budget_overflow(&self) {
+        self.evictions[KV_EVICTION_TRIGGER_BUDGET_OVERFLOW].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Shared runtime state threaded through axum handlers.
@@ -462,6 +545,20 @@ pub struct AppState {
     /// `AppState` construction so both paths see the same counters
     /// without an extra hop through the pool RwLock.
     pub kv_spill_counters: Arc<KvSpillCounters>,
+    /// ADR-017 §R-F7 (adversarial review 2026-05-01): handle to the live
+    /// on-disk block store, exposed so the `/metrics` handler can source
+    /// the `hf2q_kv_cache_bytes_on_disk` and `hf2q_kv_cache_blocks_total`
+    /// gauges directly from the authoritative `BlockIndex` at scrape
+    /// time — no separate running counter, no consistency-window race
+    /// between insert/remove paths and the gauge read.
+    ///
+    /// `None` when `--kv-persist` is absent (the entire kv-persist
+    /// substrate is opt-in per ADR-017 Phase C.1); both gauges report
+    /// `0` in that mode so the surface stays parseable.
+    ///
+    /// Wired by `cmd_serve` after `DiskBlockStore::new_with_index`
+    /// returns, via [`Self::with_kv_disk_store`].
+    pub kv_disk_store: Option<Arc<crate::serve::kv_persist::DiskBlockStore>>,
 }
 
 /// BERT embedding model, discovered from `--embedding-model <path>` at
@@ -640,6 +737,9 @@ impl AppState {
             mmproj: None,
             metrics: Arc::new(ServerMetrics::default()),
             kv_spill_counters,
+            // ADR-017 §R-F7: gauge source wired post-construction by
+            // `cmd_serve` once `--kv-persist` builds the substrate.
+            kv_disk_store: None,
         })
     }
 
@@ -697,6 +797,10 @@ impl AppState {
             mmproj: None,
             metrics: Arc::new(ServerMetrics::default()),
             kv_spill_counters: kv_spill_counters_test,
+            // ADR-017 §R-F7: tests hand-wire this when they want to
+            // exercise the gauge surface; default `None` keeps router
+            // unit tests independent of the kv-persist substrate.
+            kv_disk_store: None,
         }
     }
 
@@ -704,6 +808,20 @@ impl AppState {
     /// argument).  Returned by-value for builder chaining.
     pub fn with_default_model(mut self, default_model: Option<String>) -> Self {
         self.default_model = default_model;
+        self
+    }
+
+    /// ADR-017 §R-F7: attach the live `DiskBlockStore` so the
+    /// `/metrics` handler can source `hf2q_kv_cache_bytes_on_disk` and
+    /// `hf2q_kv_cache_blocks_total` from the authoritative `BlockIndex`
+    /// at scrape time. Called by `cmd_serve` after the kv-persist
+    /// substrate is constructed; off-path (no `--kv-persist`) leaves
+    /// this `None` and both gauges report `0`.
+    pub fn with_kv_disk_store(
+        mut self,
+        store: Arc<crate::serve::kv_persist::DiskBlockStore>,
+    ) -> Self {
+        self.kv_disk_store = Some(store);
         self
     }
 

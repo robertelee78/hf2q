@@ -25,10 +25,12 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use crate::serve::kv_persist::format::{self, EnvelopeHeader, ModelFingerprint, CURRENT_FORMAT_VERSION};
 use crate::serve::kv_persist::index::{BlockIndex, BlockMeta};
+use crate::serve::kv_persist::metrics::{KvCacheMetricsSink, KvQuarantineReason};
 
 /// TTL for orphan `.tmp.<pid>` files in the recovery GC. Files
 /// younger than this are kept (a crash-mid-write may have left a
@@ -103,6 +105,22 @@ impl QuarantineReason {
     }
 }
 
+/// ADR-017 §R-F7: 1:1 bridge between this module's `QuarantineReason`
+/// and the `KvSpillCounters`-side `KvQuarantineReason` mirror enum.
+/// Exhaustive match — adding a variant to either side without the
+/// other is a compile error here, which is the load-bearing guard
+/// keeping the metric-label set and the on-disk reason set in lockstep.
+impl From<QuarantineReason> for KvQuarantineReason {
+    fn from(r: QuarantineReason) -> KvQuarantineReason {
+        match r {
+            QuarantineReason::TruncatedHeader => KvQuarantineReason::TruncatedHeader,
+            QuarantineReason::VersionMismatch => KvQuarantineReason::VersionMismatch,
+            QuarantineReason::BodyHashMismatch => KvQuarantineReason::BodyHashMismatch,
+            QuarantineReason::ParityFail => KvQuarantineReason::ParityFail,
+        }
+    }
+}
+
 /// Walk the cache root and rebuild a [`BlockIndex`]. Quarantines
 /// header-error and version-mismatch files. Returns the populated
 /// index plus a structured [`RecoveryReport`] suitable for logging
@@ -124,6 +142,17 @@ impl QuarantineReason {
 /// (e.g. permission denied). Per-file failures are routed to
 /// quarantine and accounted in `RecoveryReport`.
 pub fn recover_from_disk(cache_root: &Path) -> io::Result<(BlockIndex, RecoveryReport)> {
+    recover_from_disk_with_counters(cache_root, None)
+}
+
+/// ADR-017 §R-F7 overload: same scan as [`recover_from_disk`] but
+/// bumps `hf2q_kv_quarantined_total{reason=...}` on every block move.
+/// `counters = None` is identical to [`recover_from_disk`] — used by
+/// tests that don't care about the metric surface.
+pub fn recover_from_disk_with_counters(
+    cache_root: &Path,
+    counters: Option<&Arc<dyn KvCacheMetricsSink>>,
+) -> io::Result<(BlockIndex, RecoveryReport)> {
     let start = Instant::now();
     let index = BlockIndex::new();
     let mut report = RecoveryReport::default();
@@ -156,7 +185,7 @@ pub fn recover_from_disk(cache_root: &Path) -> io::Result<(BlockIndex, RecoveryR
                 if !blk_path.is_file() {
                     continue;
                 }
-                scan_one(&slug_path, &blk_path, &index, &mut report)?;
+                scan_one(&slug_path, &blk_path, &index, &mut report, counters)?;
             }
         }
     }
@@ -173,6 +202,7 @@ fn scan_one(
     blk_path: &Path,
     index: &BlockIndex,
     report: &mut RecoveryReport,
+    counters: Option<&Arc<dyn KvCacheMetricsSink>>,
 ) -> io::Result<()> {
     let name = blk_path
         .file_name()
@@ -209,6 +239,10 @@ fn scan_one(
         Ok(h) => h,
         Err(_) => {
             quarantine_with_prefix(slug_path, blk_path, QuarantineReason::TruncatedHeader)?;
+            // ADR-017 §R-F7: bump `hf2q_kv_quarantined_total{reason="trunc"}`.
+            if let Some(c) = counters {
+                c.record_quarantine(QuarantineReason::TruncatedHeader.into());
+            }
             report.blocks_quarantined += 1;
             report.bytes_quarantined = report.bytes_quarantined.saturating_add(file_bytes);
             return Ok(());
@@ -217,6 +251,10 @@ fn scan_one(
 
     if header.format_version != CURRENT_FORMAT_VERSION.0 {
         quarantine_with_prefix(slug_path, blk_path, QuarantineReason::VersionMismatch)?;
+        // ADR-017 §R-F7: bump `hf2q_kv_quarantined_total{reason="verbump"}`.
+        if let Some(c) = counters {
+            c.record_quarantine(QuarantineReason::VersionMismatch.into());
+        }
         report.blocks_quarantined += 1;
         report.bytes_quarantined = report.bytes_quarantined.saturating_add(file_bytes);
         return Ok(());
@@ -272,8 +310,31 @@ pub fn quarantine_corrupted_block(
     original_path: &Path,
     reason: QuarantineReason,
 ) -> io::Result<PathBuf> {
+    quarantine_corrupted_block_with_counters(cache_root, model_fp, original_path, reason, None)
+}
+
+/// ADR-017 §R-F7 overload: same move as [`quarantine_corrupted_block`]
+/// but bumps `hf2q_kv_quarantined_total{reason=...}` on success. Used
+/// by the read path when a body-hash mismatch surfaces. `counters =
+/// None` is the test-only no-op default.
+pub fn quarantine_corrupted_block_with_counters(
+    cache_root: &Path,
+    model_fp: &ModelFingerprint,
+    original_path: &Path,
+    reason: QuarantineReason,
+    counters: Option<&Arc<dyn KvCacheMetricsSink>>,
+) -> io::Result<PathBuf> {
     let slug_path = cache_root.join("models").join(model_fp.short_hex());
-    quarantine_with_prefix(&slug_path, original_path, reason)
+    let dest = quarantine_with_prefix(&slug_path, original_path, reason)?;
+    // ADR-017 §R-F7: increment ONLY after the rename succeeded so the
+    // counter never overcounts a partial move (the move can fail on a
+    // cross-fs edge case before fallback succeeds — but
+    // `quarantine_with_prefix` already handles that internally; if the
+    // returned `dest` is `Ok`, the file is on disk in `kv-quarantine/`).
+    if let Some(c) = counters {
+        c.record_quarantine(reason.into());
+    }
+    Ok(dest)
 }
 
 /// Internal: move `<slug>/kv/<...>/<name>` to
@@ -342,6 +403,43 @@ mod tests {
             "deadbeefcafebabe1122334455667788",
             "<|im_start|>...<|im_end|>",
         )
+    }
+
+    /// ADR-017 §R-F7 — minimal in-test sink. Mirrors the counter-array
+    /// layout of `serve::api::state::KvSpillCounters` (the production
+    /// `KvCacheMetricsSink` impl) so the test assertions read the same
+    /// per-reason / per-trigger row indices as production. Lives in
+    /// the test module so the lib build doesn't see it; the bin tests
+    /// instantiate it directly.
+    #[derive(Debug, Default)]
+    struct TestMetricsSink {
+        quarantines: [std::sync::atomic::AtomicU64; 4],
+        evictions: [std::sync::atomic::AtomicU64; 1],
+    }
+
+    impl TestMetricsSink {
+        fn new() -> Self {
+            Self::default()
+        }
+        fn snapshot_quarantines(&self) -> [u64; 4] {
+            use std::sync::atomic::Ordering;
+            [
+                self.quarantines[0].load(Ordering::Relaxed),
+                self.quarantines[1].load(Ordering::Relaxed),
+                self.quarantines[2].load(Ordering::Relaxed),
+                self.quarantines[3].load(Ordering::Relaxed),
+            ]
+        }
+    }
+
+    impl crate::serve::kv_persist::metrics::KvCacheMetricsSink for TestMetricsSink {
+        fn record_quarantine(&self, reason: KvQuarantineReason) {
+            self.quarantines[reason.index()]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn record_eviction_budget_overflow(&self) {
+            self.evictions[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     fn make_block(
@@ -729,6 +827,141 @@ mod tests {
         );
         assert!(recent.exists(), "recent orphan kept");
         assert!(!aged.exists(), "aged orphan removed");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-017 §R-F7 — quarantine counter wiring tests.
+    // -----------------------------------------------------------------
+
+    /// ADR-017 §R-F7 / counter 1: every move to `kv-quarantine/` via
+    /// `quarantine_corrupted_block_with_counters` bumps
+    /// `hf2q_kv_quarantined_total{reason=...}` by 1, on the row whose
+    /// label matches the [`QuarantineReason`] variant. Order matches
+    /// `KV_QUARANTINE_REASONS` (trunc / verbump / bodyhash / parity).
+    #[test]
+    fn quarantined_total_bumps_on_truncated_header_quarantine() {
+        let dir = temp_dir("rf7-q-trunc");
+        let fp = fixture_fp("rf7-q-trunc");
+        // Two handles to the same sink: `concrete` for assertion reads
+        // (the trait surface is bump-only — the inspect surface lives
+        // on the production sink + this test sink only); `as_trait` is
+        // the same Arc upcast to `dyn KvCacheMetricsSink` for passing
+        // through the substrate API.
+        let concrete = std::sync::Arc::new(TestMetricsSink::new());
+        let as_trait: std::sync::Arc<dyn KvCacheMetricsSink> =
+            std::sync::Arc::clone(&concrete) as std::sync::Arc<dyn KvCacheMetricsSink>;
+
+        // Pre-condition: counters at zero across all 4 reasons.
+        assert_eq!(concrete.snapshot_quarantines(), [0u64, 0, 0, 0]);
+
+        // Write 4 valid blocks; quarantine each with a different reason.
+        let reasons = [
+            QuarantineReason::TruncatedHeader,
+            QuarantineReason::VersionMismatch,
+            QuarantineReason::BodyHashMismatch,
+            QuarantineReason::ParityFail,
+        ];
+        for (i, reason) in reasons.iter().enumerate() {
+            let (body, header) = make_block(fp, ParentBlockHash(None), i as u32);
+            let original = block_path(&dir, &fp, &header.block_hash);
+            write_envelope(&original, &header, &body).expect("write");
+            let _dest = quarantine_corrupted_block_with_counters(
+                &dir,
+                &fp,
+                &original,
+                *reason,
+                Some(&as_trait),
+            )
+            .expect("quarantine");
+        }
+
+        // Each of the 4 closed-enum rows incremented exactly once.
+        // Index order MUST match `KV_QUARANTINE_REASONS`:
+        // [trunc, verbump, bodyhash, parity].
+        assert_eq!(
+            concrete.snapshot_quarantines(),
+            [1u64, 1, 1, 1],
+            "all four QuarantineReason variants bumped their row by 1"
+        );
+
+        // Bumping again with TruncatedHeader only increments the
+        // `trunc` row; the other three rows stay at 1.
+        let (body, header) = make_block(fp, ParentBlockHash(None), 99);
+        let original = block_path(&dir, &fp, &header.block_hash);
+        write_envelope(&original, &header, &body).expect("write");
+        let _ = quarantine_corrupted_block_with_counters(
+            &dir,
+            &fp,
+            &original,
+            QuarantineReason::TruncatedHeader,
+            Some(&as_trait),
+        )
+        .expect("quarantine");
+        assert_eq!(
+            concrete.snapshot_quarantines(),
+            [2u64, 1, 1, 1],
+            "trunc-row +1 only; other three rows unchanged"
+        );
+
+        // Counter-Some-vs-None contract: calling the legacy
+        // `quarantine_corrupted_block` (no counters) does NOT bump.
+        let (body2, header2) = make_block(fp, ParentBlockHash(None), 100);
+        let original2 = block_path(&dir, &fp, &header2.block_hash);
+        write_envelope(&original2, &header2, &body2).expect("write");
+        let _ = quarantine_corrupted_block(
+            &dir,
+            &fp,
+            &original2,
+            QuarantineReason::BodyHashMismatch,
+        )
+        .expect("quarantine");
+        assert_eq!(
+            concrete.snapshot_quarantines(),
+            [2u64, 1, 1, 1],
+            "legacy entry point with no counters MUST NOT bump"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-017 §R-F7: the recovery scan path also bumps the quarantine
+    /// counter — write a corrupted block, run
+    /// `recover_from_disk_with_counters`, assert the trunc row
+    /// incremented.
+    #[test]
+    fn kv_persist_recovery_scan_bumps_quarantined_total_on_truncated_block() {
+        let dir = temp_dir("rf7-rec-scan");
+        let fp = fixture_fp("rf7-rec-scan");
+        let concrete = std::sync::Arc::new(TestMetricsSink::new());
+        let as_trait: std::sync::Arc<dyn KvCacheMetricsSink> =
+            std::sync::Arc::clone(&concrete) as std::sync::Arc<dyn KvCacheMetricsSink>;
+
+        // Write a valid block, then truncate its file so the recovery
+        // scan trips the TruncatedHeader path.
+        let (body, header) = make_block(fp, ParentBlockHash(None), 0);
+        let path = block_path(&dir, &fp, &header.block_hash);
+        write_envelope(&path, &header, &body).expect("write");
+        // Truncate to 4 bytes — header read fails, scan_one quarantines.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("open trunc")
+            .set_len(4)
+            .expect("set_len");
+        std::fs::write(&path, [0u8, 0, 0, 0]).expect("write 4 bytes");
+
+        // Run the scan WITH counters wired; the trunc row must bump.
+        let (_idx, report) =
+            recover_from_disk_with_counters(&dir, Some(&as_trait)).expect("recover");
+        assert_eq!(report.blocks_quarantined, 1, "1 file quarantined");
+        assert_eq!(
+            concrete.snapshot_quarantines(),
+            [1u64, 0, 0, 0],
+            "trunc row bumped; other three rows untouched"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

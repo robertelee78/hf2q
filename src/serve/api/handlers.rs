@@ -5909,6 +5909,18 @@ fn build_kv_counter_block(
 ///                                         labels: repo, quant, outcome)
 ///   - `hf2q_pool_kv_restores_total`      (counter, ADR-005 iter-213 / AC 5472,
 ///                                         labels: repo, quant, outcome)
+///   - `hf2q_kv_quarantined_total`        (counter, ADR-017 §R-F7,
+///                                         label: reason ∈ {trunc, verbump,
+///                                         bodyhash, parity})
+///   - `hf2q_kv_cache_bytes_on_disk`      (gauge, ADR-017 §R-F7 — sum of
+///                                         BlockMeta.bytes_on_disk over the
+///                                         live BlockIndex; 0 when no
+///                                         --kv-persist substrate is wired)
+///   - `hf2q_kv_cache_blocks_total`       (gauge, ADR-017 §R-F7 — live
+///                                         BlockIndex.block_count(); 0
+///                                         when no --kv-persist substrate)
+///   - `hf2q_kv_cache_evictions_total`    (counter, ADR-017 §R-F7,
+///                                         label: trigger ∈ {budget_overflow})
 ///   - `hf2q_requests_total`              (counter)
 ///   - `hf2q_requests_rejected_total`     (counter)
 ///   - `hf2q_chat_completions_started`    (counter)
@@ -5966,6 +5978,57 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         &kv_restore_rows,
     );
 
+    // ADR-017 §R-F7: build the four cache-side metric blocks.  HELP/TYPE
+    // emit unconditionally per Prometheus convention; per-label rows
+    // emit unconditionally too (the closed-enum cardinality is fixed at
+    // module-load time so operators see the full surface from boot,
+    // even before the first quarantine / eviction fires).
+    let kv_quarantine_counts = state.kv_spill_counters.snapshot_quarantines();
+    let kv_quarantined_block = {
+        use crate::serve::api::state::KV_QUARANTINE_REASONS;
+        let mut s = String::with_capacity(256);
+        s.push_str("# HELP hf2q_kv_quarantined_total Count of KV blocks moved to kv-quarantine/, by reason.\n");
+        s.push_str("# TYPE hf2q_kv_quarantined_total counter\n");
+        for (i, label) in KV_QUARANTINE_REASONS.iter().enumerate() {
+            s.push_str("hf2q_kv_quarantined_total{reason=\"");
+            s.push_str(label);
+            s.push_str("\"} ");
+            s.push_str(&kv_quarantine_counts[i].to_string());
+            s.push('\n');
+        }
+        s
+    };
+
+    let kv_eviction_counts = state.kv_spill_counters.snapshot_evictions();
+    let kv_evictions_block = {
+        use crate::serve::api::state::KV_EVICTION_TRIGGERS;
+        let mut s = String::with_capacity(192);
+        s.push_str("# HELP hf2q_kv_cache_evictions_total Count of KV blocks evicted from the on-disk cache, by trigger.\n");
+        s.push_str("# TYPE hf2q_kv_cache_evictions_total counter\n");
+        for (i, label) in KV_EVICTION_TRIGGERS.iter().enumerate() {
+            s.push_str("hf2q_kv_cache_evictions_total{trigger=\"");
+            s.push_str(label);
+            s.push_str("\"} ");
+            s.push_str(&kv_eviction_counts[i].to_string());
+            s.push('\n');
+        }
+        s
+    };
+
+    // Gauges: read live from the BlockIndex via the AppState handle.
+    // No --kv-persist substrate ⇒ both gauges report 0 (the surface
+    // stays parseable; operators querying a non-kv-persist deployment
+    // see a meaningful zero rather than an absent metric).
+    let (kv_cache_bytes_on_disk, kv_cache_blocks_total) =
+        if let Some(store) = state.kv_disk_store.as_ref() {
+            (
+                store.index().total_bytes_on_disk(),
+                store.index().block_count() as u64,
+            )
+        } else {
+            (0u64, 0u64)
+        };
+
     let body = format!(
         "\
 # HELP hf2q_uptime_seconds Process uptime in seconds since bind.\n\
@@ -5988,6 +6051,14 @@ hf2q_pool_resident_bytes {pool_resident}\n\
 hf2q_pool_memory_budget_bytes {pool_budget}\n\
 {kv_spills_block}\
 {kv_restores_block}\
+{kv_quarantined_block}\
+# HELP hf2q_kv_cache_bytes_on_disk Sum of envelope-file bytes currently indexed in the on-disk KV cache.\n\
+# TYPE hf2q_kv_cache_bytes_on_disk gauge\n\
+hf2q_kv_cache_bytes_on_disk {kv_cache_bytes}\n\
+# HELP hf2q_kv_cache_blocks_total Number of KV envelopes currently indexed in the on-disk cache.\n\
+# TYPE hf2q_kv_cache_blocks_total gauge\n\
+hf2q_kv_cache_blocks_total {kv_cache_blocks}\n\
+{kv_evictions_block}\
 # HELP hf2q_requests_total Total HTTP requests reaching a handler (post-auth).\n\
 # TYPE hf2q_requests_total counter\n\
 hf2q_requests_total {req_total}\n\
@@ -6021,6 +6092,10 @@ hf2q_prompt_tokens_total {prompt_tok}\n\
         pool_budget = pool_memory_budget_bytes,
         kv_spills_block = kv_spills_block,
         kv_restores_block = kv_restores_block,
+        kv_quarantined_block = kv_quarantined_block,
+        kv_evictions_block = kv_evictions_block,
+        kv_cache_bytes = kv_cache_bytes_on_disk,
+        kv_cache_blocks = kv_cache_blocks_total,
         req_total = m.requests_total.load(Ordering::Relaxed),
         req_rej = m.requests_rejected_total.load(Ordering::Relaxed),
         chat_start = m.chat_completions_started.load(Ordering::Relaxed),
