@@ -1842,6 +1842,97 @@ informative stderr_tail — would indicate a real cmd_serve
 does not surface (would require an in-process tracing add
 to `src/serve/mod.rs::cmd_serve`).
 
+### Phase D measurement attempt 2026-05-01 (cont.) — parallel worktree audit harvest
+
+Per Robert directive 2026-05-01 ("we have many agents — use work
+trees"), three parallel worktree-isolated agents conducted code-side
+audits while the GPU bench remained blocked on contended SoC. Each
+agent wrote a report committed in its worktree; reports are now
+merged to main at `docs/research/adr017-omlx-crosscheck-2026-05-01.md`
+(782 LOC), `docs/research/adr017-adversarial-review-2026-05-01.md`
+(562 LOC), and `docs/operating-kv-cache.md` (507 LOC, R-O1).
+
+**Key finding triage (validated against production code in main
+session, per `feedback_code_is_truth`):**
+
+#### FALSIFIED — placeholder-shape silent-noop hypothesis
+
+Agent 3 hypothesized (runbook §11 #7) that the placeholder
+`Gemma4DenseConfig` at `src/serve/mod.rs:1770-1788` (2-layer
+[Sliding, Full]) would cause `Gemma4DenseSpillFactory::try_construct`
+to silently no-op against production Gemma 4 26B (64 layers). If
+true, the Phase D R-C4 bench would have measured stub-vs-stub and
+synthesized a misleading PASS.
+
+**Code+test evidence (FALSIFIES the hypothesis):**
+
+- `src/serve/api/engine.rs:1503-1530` — `Engine::spawn` builds a real
+  `KvSpillDescriptor::from_gemma_loaded_model(&g.weights, 512,
+  kv_dtype)` for `LoadedModel::Gemma(g)` and stores it in
+  `EngineInner.kv_spill_descriptor: Some(real_descriptor)`.
+- `src/serve/kv_persist/families/gemma4_dense.rs:1373-1390` —
+  `try_from_engine_arc` downcasts `Arc<dyn Any>` to `Arc<Engine>`
+  FIRST (Phase B-dense.2 follow-up); on success, reads the engine's
+  cached descriptor via `engine_arc.kv_spill_descriptor()?.clone()`,
+  derives `effective_cfg = Gemma4DenseConfig::from_descriptor(&descriptor)`,
+  and constructs the spill with REAL shape — IGNORING the placeholder
+  `cfg` that was registered with the factory.
+- `src/serve/kv_persist/loader_wrapper.rs:262-324` — `LoaderWrapper::load`
+  calls `registry.try_substitute_on_load(&repo, quant, dyn_view)` on
+  every successful load with the engine wrapped as `Arc<Engine>`,
+  which exercises the real-descriptor path.
+
+The placeholder cfg is a SEED used only for the (unused-in-production)
+`Arc<EngineHandle>` fallback path. Production loads exercise the
+`Arc<Engine>` path → real shape. Phase D R-C4 bench WILL exercise the
+real spill when run.
+
+**Outdated stale comment surfaced (cleanup needed):** `loader_wrapper.rs:295-298`
+states "the auto-Arc<E> path is ALWAYS rejected by the Gemma4 factory
+because it expects Arc<EngineHandle>" — this was true at C.1 but is
+NO LONGER TRUE post-B-dense.2-follow-up (commit 420ef94). Per
+`feedback_no_broken_windows`, fix in next iter.
+
+#### REAL findings (P0 candidates from Agent 2 + Agent 1 cross-validation)
+
+| ID | Source | Location | Issue | Bench-blocker? |
+|---|---|---|---|---|
+| **P0-1** | Agent 2 §P0-1 | `format.rs:357-366` | `write_envelope` `fsync`s the file but NOT the parent directory after `fs::rename`. Power loss between rename-syscall return and dir-entry persist loses the file on APFS/ext4/XFS. The kill-9 test covers SIGKILL atomicity, not power-loss durability. | **NO** — Phase D R-C4 bench does not power-cycle. Land before §"Closed-Shipped" status. |
+| **P0-2 (DISPUTED)** | Agent 2 §P0-2 vs Agent 1 §F5 | `serve/mod.rs:1719-1771` + `block_store.rs:100-128` | Agent 2 claims NO cross-process advisory `flock` on `cache_dir`; Agent 1 claims `flock` per-`(model, hash[..2])` exists and is finer-grained-than-oMLX's cache-root flock. Disagreement requires direct verification. | **NO** for first bench (single-process); **YES** for sustained-operator-deployment ship. |
+| **P0-3** | Agent 2 §P0-3 | `recovery.rs:155-172` | `*.tmp.<pid>` orphans counted but never garbage-collected. Combined with `budget_bytes=0` (P1-3), monotonic cache-dir growth. Slow-burn outage on long-running deployments. | **NO** for first bench (clean cache_dir); **YES** for production ship. |
+| **F4** | Agent 1 §F4 | `spiller.rs:242-244` | `family_model_fp` builds with `("", "", "")` for `producer_version`, `source_sha256`, `tokenizer_chat_template` → effective namespace key is `(repo, quant)` only. Re-quanting same repo or chat-template upgrade lands in stale namespace and serves stale blocks. | **NO** for first bench (single GGUF, no re-quant); **YES** before B-dense.1 hardens to operator-touch. |
+| **P1-1** | Agent 2 §P1-1 | `loader_wrapper.rs:309-324` | `try_substitute_on_load` updates registry under write-lock, then `update_spiller_registration` updates spiller in a SEPARATE critical section. Module docs claim atomic; impl is not. Concurrent `pre_evict` from another tokio task can read stub-spiller while registry has real-substituted hook. | **NO** — Phase D bench is sequential. **YES** before multi-tenant ship. |
+| **P1-3** | Agent 2 §P1-3 + Agent 3 §11#4 | `serve/mod.rs:1759-1771` | `budget_bytes = 0` hardcoded; `evict_lru_until_under_budget` short-circuits on 0. Production `--kv-persist` never evicts. `HF2Q_KV_PERSIST_BUDGET_BYTES` env var documented in source comment but not actually read. | **NO** for first bench (cache empty); **YES** for sustained-deployment. |
+
+**Operator runbook gaps surfaced (Agent 3, R-O1 partially landed):**
+8 `[NOT YET IMPLEMENTED — ADR-017 §X]` markers in
+`docs/operating-kv-cache.md`, primarily: native cache-clear
+subcommand absent (`hf2q cache --kv-namespace` per §R-F6 not in
+CLI); 4 of 6 cache-side `/metrics` counters per §R-F7 unwired
+(only the 2 ADR-005 Phase 4 spill/restore counters fire);
+`HF2Q_KV_PERSIST=0` mid-flight disable referenced in code comments
+but never read by `env::var`; `DiskBlockStore::set_budget_bytes`
+plumbed but never wired in cmd_serve.
+
+#### Decision: Phase D bench is NOT BLOCKED by these findings
+
+None of P0-1 / P0-2 / P0-3 / P1-1 / P1-3 perturb the Phase D R-C4
+internal coherence run on a clean cache_dir, single-process,
+sequential operator. The findings are real ship-quality blockers
+for sustained-deployment operator ship; they are NOT bench-gating.
+
+**Bench plan unchanged:** wait for foreign concurrent CFA sessions
+to quiesce, then run `scripts/adr017_phase_d.sh`. If R-C4 PASSes,
+ADR-017 closure proceeds in parallel with the P0/P1/F4 follow-up
+fixes. If R-C4 FAILs, the stderr_tail diagnostic landed at b0e67ca
+will surface the production-side cause; fixes follow as iter-
+specific work.
+
+**Cumulative ADR-017 LOC after parallel-worktree audit harvest:**
+~13,421 LOC + 1,851 LOC (audit reports + runbook) = **~15,272 LOC**
+in-tree substrate + audit + operator docs. Tests-only edit;
+zero `src/` touches in this session.
+
 ---
 
 ## Open Questions
