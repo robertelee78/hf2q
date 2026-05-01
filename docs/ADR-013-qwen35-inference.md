@@ -1059,6 +1059,77 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-05-01 — P19 step 1 · `wave5b8_profile` section breakdown for pp ≈ 56 dwq48 prefill ⇒ apparent prefill gap is ~50% one-shot weight upload bias; real steady-state gap is 7–18×, lives in `layer.linear_total` (DeltaNet) and `layer.ffn_dispatch` (MoE FFN dispatch wall)
+
+**Setup.** hf2q `41e8098`, mlx-native `4db99f4`, M5 Max, 128 GB unified, single cold process, `HF2Q_PROFILE_W5B8=1 HF2Q_PROFILE_W5B22=1`, prompt = 56 tokens (the BPE tokenization of two repetitions of the bench harness's BASE_PASSAGE), `--max-tokens 8`.
+
+**Reported tok/s (this single profiled run):** prefill 31.3 t/s, decode 133.9 t/s. (Consistent with the P17b 3-rep median of 32.10 t/s for pp101.)
+
+**`[W5B8_PROFILE]` sums (ms over the prefill+8-decode wall, n = sample count):**
+
+| Section | n | sum (ms) | mean (ms) | notes |
+|---|---|---|---|---|
+| `upload_weights` | 1 | **983.832** | 983.832 | one-shot first-forward materialization of all per-layer weights onto Metal heap (~17 GB Q4_K) |
+| `layer.linear_total` | 30 | 179.264 | 5.975 | 30 DeltaNet (linear-attn) layers — ssm_conv + recurrence + per-head L2 + chunk dispatch |
+| `layer.ffn_dispatch` | 40 | 128.648 | 3.216 | wall around `build_moe_ffn_layer_gpu_q_into` — includes Phase A→F + barriers + commit boundaries |
+| `dn.outer_choreography_total` | 30 | 102.125 | 3.404 | post-attn-norm + ffn_dispatch + post-ffn-residual for the 30 DN layers (overlaps `layer.ffn_dispatch` for those layers) |
+| `dn.outer_ffn_dispatch` | 30 | 94.853 | 3.161 | DN-layer-only subset of `layer.ffn_dispatch` |
+| `layer.autoreg_ops5_9` | 30 | 54.714 | 1.823 | DeltaNet ops 5–9 (q/k/v split + L2 + recurrence wrap-up) |
+| `layer.full_total` | 10 | 46.553 | 4.655 | 10 full-attention layers (FA prefill SDPA path) |
+| `fa.sdpa_total` | 10 | 4.693 | 0.469 | the SDPA kernel itself within FA layers |
+| `fa.sdpa.kernel` | 10 | 4.549 | 0.454 | kernel-only |
+| `layer.post_attn_fused_norm` | 40 | 7.766 | 0.194 | RMSNorm fused into residual |
+| `layer.qkv_deinterleave` | 30 | 5.486 | 0.182 | DN GPU QKV split |
+| `layer.ops1_3` | 30 | 11.754 | 0.391 | DN ops 1–3 (proj_qkv + conv) |
+| `ffn.alloc_scratch` | 40 | 1.575 | 0.039 | the 10-pooled-buffer alloc burst per FFN layer |
+| `ffn.phase_c_gate_up_shared_down` | 40 | 0.867 | 0.021 | wall of Phase C (gate_up `mm_id` + shared_down) **as observed by CPU** |
+| `ffn.phase_e_down` | 40 | 0.215 | 0.005 | wall of Phase E (`mm_id` down) **as observed by CPU** |
+| `ffn.phase_a_proj` | 40 | 0.272 | 0.006 | router/sh_logit/sh_gate/sh_up projections |
+| `ffn.phase_b_route_silu` | 40 | 0.134 | 0.003 | softmax+top-k + shared silu_mul |
+| `ffn.phase_d_silu` / `ffn.phase_f_reduce` | 40 | < 0.07 | < 0.002 | trivial |
+| `ffn.barrier_*` (5 per layer) | 40 each | ≤ 0.006 | ≤ 0.0002 | **barriers are not the bottleneck** — H5 falsified at the CPU level |
+
+**Methodology finding (the 50% headline number).** The Qwen3.5 prefill timer in `src/serve/mod.rs:1348-1352` starts immediately before `forward_gpu_last_logits` and `forward_gpu_impl` does the FIRST-CALL `upload_layer_weights_gpu` *inside* that span (`forward_gpu.rs:1308-1313`). Every cold-process bench therefore charges the one-shot 984 ms weight materialization to the prefill timer, producing:
+
+| pp | wall (ms) | 984 ms upload | actual prefill (ms) | apparent t/s | **real (steady-state) t/s** | llama-completion t/s | **real gap** |
+|---|---|---|---|---|---|---|---|
+| 31  | 1,302 | 984 | 318   | 23.80 | **97.5** | 658.19 | **6.7×** |
+| 56  | 1,791 | 984 | 807   | 31.3  | **69.4** | (interp ~720) | ~10× |
+| 101 | 3,146 | 984 | 2,162 | 32.10 | **46.7** | 850.12 | **18.2×** |
+
+So the P17b "0.04× = 28× slower" cell-by-cell ratios are the truth-on-the-tin numbers, but ~50% of the apparent gap at pp31 (and ~30% at pp101) is one-shot weight-upload accounting, not a steady-state hf2q-vs-llama compute deficit. llama.cpp's `prompt eval time` excludes model load by construction; hf2q's reported `prefill_tok_s` does not. Decode is unaffected — the `Decode tok/s` 1.08× win is real and steady-state on both sides.
+
+This is *not* an excuse, it is a corrected target: the steady-state prefill gap is **7× at pp31, ~10× at pp56, ~18× at pp101**. The gap *widens with prompt length* — the regime where mm_id should be helping us most is the regime where we lose the most ground.
+
+**Per-token wall (steady-state, upload-excluded):**
+
+| pp | hf2q ms/token | llama-completion ms/token | hf2q decode ms/token (same model) |
+|---|---|---|---|
+| 31 | 10.3 | 1.5 | ~8.0 |
+| 101 | 21.4 | 1.2 | ~8.0 |
+
+hf2q decode is ~8 ms/token. hf2q prefill at pp101 is **2.6× slower than its own decode** — there is no batched-prefill dividend at this scale; each new prefill token actually costs *more* than a fresh decode token. That's the real signature of the wrapper overhead: more tokens in flight does not amortize better.
+
+**Where the steady-state cost goes (sum across the 56-token prefill, ~807 ms total):**
+
+- `layer.linear_total` (30 DN-layer linear-attn op-chain): 179 ms (22%)
+- `layer.ffn_dispatch` (40 layers MoE FFN wall): 129 ms (16%)
+- `layer.autoreg_ops5_9` (30 DN-layer recurrence wrap-up): 55 ms (6.8%)
+- `layer.full_total` (10 FA-layer SDPA path): 47 ms (5.8%)
+- everything else (norm, QKV split, ops1_3, residuals): ≈ 30 ms (3.7%)
+- **unaccounted (commit_and_wait stalls between layers, kernel-launch latency, encoder-rebuild cost):** ≈ 367 ms (45%)
+
+The unaccounted slice is the real frontier. The CPU-observed `ffn.phase_*` walls sum to ~3 ms over 40 layers — orders of magnitude smaller than `layer.ffn_dispatch` = 129 ms — which means **most of the FFN-dispatch cost is GPU work synchronized at a per-layer `commit_and_wait`, not CPU-side wrapper overhead**. H5/H6 (CPU-side barriers, alloc) are falsified. The cost is in actual GPU compute + per-layer command-buffer turnaround.
+
+**Updated hypothesis tree for P19 step 2 (revised, based on profile evidence):**
+
+- **H9** (per-layer commit boundary): hf2q closes a command buffer per layer (40 cb/prefill); llama.cpp builds the entire prefill graph as a single ggml graph and the metal-backend submits it as a single super-CB with internal scheduler-emitted barriers. Test: count `commit_and_wait` calls per prefill in `forward_gpu.rs::forward_gpu_impl` and the layer-driver loop. Read llama.cpp's `ggml_metal_graph_compute` to confirm single-CB-per-graph.
+- **H10** (DeltaNet recurrence is the dominant single bucket): `layer.linear_total` sums to 179 ms = 22% of steady-state prefill. The `chunk_gated_delta_rule` GPU kernel is fired once per DN layer; if that kernel has its own `commit_and_wait` (it does — see `gpu_delta_net.rs:1177` after the iter58b-fix entry below), each of the 30 DN layers stalls the GPU. Test: profile chunk kernel wall vs CPU CB-management wall via Metal counter sample buffers.
+- **H11** (mm_id setup overhead doesn't amortize at pp ≤ ~256): the `map0` pre-pass + the 8 KB shmem stage + the per-call concurrency-reset barrier all cost flat per call. With pp101 the `dispatch_id_mm_pooled` path runs gate+up+down × 40 = 120 mm_id calls. If each pays ~5–10 ms of GPU-wall, that alone is 600–1200 ms — possibly the biggest single cost. Test: bench an unbatched `mv_id`-route prefill at pp101 with `MM_ID_ROUTING_THRESHOLD = 9999` env-override, compare wall time.
+- **H12** (weight-upload methodology fix): if `upload_layer_weights_gpu` runs once at `cmd_generate_qwen35` model-load time instead of inside the first forward pass, hf2q's reported `Prefill tok/s` doubles for short prompts with no compute change. Test: refactor `forward_gpu_impl` to accept pre-uploaded `LayerWeightsGpu`, populate at load time, re-bench. Methodology fix; compute parity.
+
+**Receipts.** Profile log at `/tmp/p19_profile.{stdout,stderr}`; raw P17b receipts in `/tmp/p17b_q4k/` (pushed in commit `41e8098`). All four hypotheses above are testable with **measurement / instrumentation only** — no kernel edits, no shader changes — exactly the discipline `feedback_evidence_first_no_blind_kernel_rewrites` and `feedback_harness_first_before_iter_chasing` require.
+
 ### 2026-05-01 — P17b + P18 · clean Q4_K dwq48 bench (3-rep cold-process) + side-by-side kernel audit ⇒ kernel hypotheses H1–H4 falsified, gap lives in MoE FFN wrapper
 
 **Why this entry exists.** P17 was retracted (commit `c5dbc99`) because its perf claims came from single-run bench under concurrent ML-process contention. The retraction documented the *standing rule* — 3+ cold-process invocations, pre-bench `ps`/RSS audit, median + min/max range, same-day llama-bench under same conditions, coherence-check — but left "actual hf2q-vs-llama perf delta on Q4_K dwq48" explicitly UNKNOWN. P17b is the standing-rule-compliant remediation; P18 is the root-cause-direction it points to.
