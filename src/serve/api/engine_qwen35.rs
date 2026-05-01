@@ -155,8 +155,24 @@ impl Qwen35LoadedModel {
         let eos_token_ids: Vec<u32> = vec![eos_token];
 
         // ---- Load tokenizer ----
-        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+        //
+        // Mirrors `cmd_generate_qwen35`'s tokenizer construction at
+        // `serve/mod.rs::cmd_generate_qwen35` (commit 5ccc54b): builds a
+        // `tokenizers::Tokenizer` programmatically from the GGUF's own
+        // `tokenizer.ggml.*` metadata arrays, NOT from the on-disk HF
+        // `tokenizer.json`. The HF tokenizer overshoots the GGUF's
+        // physical embedding-row count on abliterated/apex GGUFs (e.g.
+        // declares `<|im_start|>`=248045 against a 248,044-row
+        // `token_embd.weight`), and the resulting OOB token IDs hit the
+        // embedding loader's zero-pad fallback — decapitating the
+        // residual stream and producing deterministic prompt-repetition
+        // gibberish on chat-templated requests.
+        //
+        // `tokenizer_path` is kept in scope only as a load-time
+        // diagnostic (logged above); its bytes are NOT consumed.
+        let _tokenizer_path = tokenizer_path;
+        let mut tokenizer = crate::inference::models::qwen35::tokenizer::build_tokenizer_from_gguf(&gguf)
+            .map_err(|e| anyhow::anyhow!("GGUF-driven tokenizer build failed: {e}"))?;
         tokenizer
             .with_truncation(None)
             .map_err(|e| anyhow::anyhow!("Failed to disable tokenizer truncation: {e}"))?;
