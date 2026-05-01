@@ -129,7 +129,20 @@ fn build_safetensors_bytes(
 fn setup(dir: &Path) {
     fs::create_dir_all(dir).unwrap();
     fs::write(dir.join("config.json"), QWEN35_CONFIG).unwrap();
-    fs::write(dir.join("tokenizer.json"), r#"{"version":"1.0"}"#).unwrap();
+    // Minimal-valid `tokenizers::Tokenizer::from_file()`-acceptable JSON.
+    // `{"version":"1.0"}` alone is rejected by the tokenizers crate with
+    // "Model missing." since ADR-014 P4 (commit f8f727e) added a
+    // `Tokenizer::from_file()` gate at src/main.rs:1465 that fires before
+    // the ActivationCapture path. tokenizers 0.22.2 requires `model.type`
+    // plus (for BPE) explicit `vocab` and `merges` fields. Empty values
+    // are accepted. This lets execution reach the intended
+    // ActivationCapture-rejection point so the anchored contract still
+    // trips.
+    fs::write(
+        dir.join("tokenizer.json"),
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]}}"#,
+    )
+    .unwrap();
     fs::write(
         dir.join("tokenizer_config.json"),
         r#"{"model_max_length":131072}"#,
