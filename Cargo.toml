@@ -11,14 +11,6 @@ repository = "https://github.com/robertelee78/hf2q"
 default = []
 # Enable RuVector self-learning
 ruvector = ["dep:ruvector-core"]
-# ADR-018 C3: keep the pre-banner 2-line `print_header_top` golden tests
-# alive when explicitly requested. The tests at
-# `src/serve/header.rs::tests::header_top_*` document the legacy banner
-# shape; under the default feature set they're gated off because the
-# unified `print_banner` (in `src/serve/load_info.rs`) is now the
-# canonical surface. C5 retires `print_header_top` entirely along with
-# this feature.
-legacy-2-line-header = []
 
 [dependencies]
 safetensors = "0.7"

@@ -1,6 +1,6 @@
 # ADR-018: Uniform Model-Load UX Across Families
 
-- **Status:** **Accepted** (C1-C3 implemented 2026-05-01).
+- **Status:** **Accepted, migration complete** (C1-C5 implemented 2026-05-01).
 - **Supersedes:** none.
 - **Related:**
   - **ADR-005** (Phase 1b: SERVE-mode load + iter-215 `LoadedModel` family-split that surfaced the divergence this ADR closes).
@@ -67,7 +67,9 @@ The trait choice (one new trait, narrowly scoped) is per design doc §5.2: per-v
 | C2 — `LoadInfoBuilder` + `print_banner` + `emit_tracing` | **Implemented 2026-05-01** | `<commit-sha-pending>` | Library only, not invoked. Qwen35 provenance field is populated and `LoadedModel::provenance()` reads it. |
 | **C3** — CLI generate switches to `print_banner` | **Implemented 2026-05-01** | `3ba272a` | First user-visible delta. Both `cmd_generate` (Gemma) and `cmd_generate_qwen35` route through `*LoadedModel::load` and emit the unified 13-line banner via `print_banner`. `Qwen35Model::load_from_gguf` grew a `progress: &mut LoadProgress` parameter and all 5 callers (engine_qwen35::load, mod.rs cmd_generate_qwen35 [removed via refactor], activation_capture_real, model.rs:622 test, ppl_driver) updated. Five sets of legacy `tracing::info!` keys deleted (engine.rs:1391-1393 + 1484-1489; engine_qwen35.rs:122-125 + 134-137 + 217-223). Chat-template-fallback `tracing::warn!` (engine.rs:1448-1452) preserved. `header_top_*` tests at header.rs:148-180 feature-gated under `legacy-2-line-header`; default arm asserts the new banner shape via fixture LoadInfo. `tests/serve_ux.rs::default_stdout_has_three_header_lines_and_generation` updated to assert 13-line banner + 1-line prefill + blank + generation. |
 | **C4 [x]** — SERVE-mode banner + `Engine::info()` | **Implemented 2026-05-01** | `<pending-sha>` | `Engine::spawn` builds and stores `Arc<LoadInfo>` before moving `LoadedModel` to the worker; `Engine::info()` exposes it. `cmd_serve` prints the unified banner to stdout before the bind line when stdout is a TTY and `--quiet` is not set. |
-| C5 (optional) — `/v1/models` consumes `LoadInfo` | not started | — | Retires legacy `print_header_top`. |
+| **C5 [x]** — `/v1/models` consumes `LoadInfo`, retire legacy header | **Implemented 2026-05-01** | `e1879b8` | `handlers.rs::list_models` now sources the live-engine `ModelObject` via `model_object_from_load_info(...)` reading `engine.info()`; cache-scanned entries are enriched in place via `enrich_model_object_from_load_info(...)` once the pool snapshot finds a match. `ModelObject` gained 8 optional fields (`arch`, `max_context_length`, `provenance`, `moe_experts`, `moe_experts_per_tok`, `sliding_window`, `kv_spill_active`, `quant_bpw`), each `#[serde(skip_serializing_if = "Option::is_none")]` so the wire shape for non-engine-backed entries (cache-scan / embedding / mmproj) stays byte-identical to pre-C5. `header::print_header_top` + `HeaderInfoTop` + the two `legacy-2-line-header` feature-gated tests at `src/serve/header.rs:148-180` removed entirely (zero production callers after C3). The `legacy-2-line-header` feature flag dropped from `Cargo.toml`. Visible delta: `/v1/models` adds 8 optional keys for live-engine entries; pre-C5 OpenAI-API consumers ignore unknown fields per the SDK forward-compat contract. **Migration complete.** |
+
+**Migration complete: ADR-018 C1–C5 all landed 2026-05-01.**
 
 ## Consequences
 
@@ -105,7 +107,33 @@ cargo clippy --release -- -D warnings
 cargo test --release infer_quant_label_matches_legacy_body
 ```
 
-C2 / C3 / C4 / C5 verification will be added under the same heading in subsequent commits.
+C5 acceptance:
+
+```bash
+# Build still green after schema additions + legacy removal.
+cargo build --release
+
+# Schema serde tests pin both the live-engine wire shape AND the
+# backward-compat skip-if-none guarantee.
+cargo test --release test_model_list_response_serialization
+cargo test --release test_model_object_with_load_info_fields
+
+# Live-engine handler test pins that `engine.info()` flows through to
+# the response.
+cargo test --release list_models_returns
+
+# Header sibling test still asserts the unified banner shape.
+cargo test --release print_banner_default_arm_smoke
+
+# Full release test suite (no regressions on existing /v1/models callers).
+cargo test --release
+
+# Lint (no new warnings, including from removed feature flag).
+cargo clippy --release -- -D warnings
+
+# Sanity: the dropped feature flag is no longer accepted.
+! cargo build --release --features legacy-2-line-header 2>&1 | grep -q "feature `legacy-2-line-header` is not"
+```
 
 ## References
 

@@ -1,9 +1,20 @@
-//! Default-mode header printer and load-progress reporter for `cmd_generate`.
+//! Prefill-stat printer + load-progress reporter for `cmd_generate`.
 //!
-//! The three header lines frame the generation stream. They render on stdout
-//! (not stderr) because they are product output, not logs. At TTY, rendered
-//! dim so the generation stream itself reads at full visual weight. Stripped
-//! of ANSI on non-TTY so piped/redirected stdout captures plain text.
+//! Both surfaces frame the generation stream on stdout (product output,
+//! not logs). At TTY, rendered dim so the generation stream itself reads
+//! at full visual weight. Stripped of ANSI on non-TTY so piped/redirected
+//! stdout captures plain text.
+//!
+//! Pre-ADR-018 this module also owned the 2-line `print_header_top` /
+//! `HeaderInfoTop` surface for backend + model summary lines. ADR-018 C3
+//! superseded that with the unified 13-line `crate::serve::load_info::print_banner`,
+//! and ADR-018 C5 retired the legacy surface entirely (no production
+//! callers remained after C3; the legacy-2-line-header feature flag was
+//! also dropped). The prefill-stat surface (`print_header_prefill`) and
+//! the load-progress reporter (`LoadProgress`) live on; both are called
+//! exclusively from CLI generate paths and are NOT load facts in the
+//! `LoadInfo` sense (they are wall-clock prefill stats / streaming
+//! progress UI, respectively).
 //!
 //! See `docs/generate-ux-cleanup.md` §3 for the full spec.
 
@@ -19,33 +30,8 @@ pub fn short_chip_label(name: &str) -> String {
     name.strip_prefix("Apple ").unwrap_or(name).to_string()
 }
 
-/// Printable info for header lines 1 and 2 (shown after weights load,
-/// before prefill begins).
-///
-/// ADR-018 C3: superseded by `crate::serve::load_info::print_banner`
-/// (the unified 13-line banner). This struct is no longer constructed
-/// in production code paths but is kept under the
-/// `legacy-2-line-header` feature gate so a revert path stays
-/// exercised. Marked `allow(dead_code)` because the default feature
-/// build legitimately doesn't construct it.
-#[allow(dead_code)]
-pub struct HeaderInfoTop {
-    /// Short-form chip label, e.g. "M5 Max". See [`short_chip_label`].
-    pub chip: String,
-    /// Backend identifier. `"mlx-native"` is the sole option today (ADR-008).
-    pub backend: &'static str,
-    /// Human-readable model name (GGUF `general.name` or file-stem fallback).
-    pub model: String,
-    /// Wall-clock seconds from GPU-init start through weights-resident.
-    pub load_s: f64,
-    /// Number of transformer layers actually resident in memory.
-    pub n_layers: usize,
-    /// GGUF file size in GB (authoritative; matches `ls -la` on the model).
-    pub total_gb: f64,
-}
-
-/// Printable info for header line 3 (shown after prefill completes, before
-/// the first generation token renders).
+/// Printable info for the prefill-stats line (shown after prefill
+/// completes, before the first generation token renders).
 pub struct HeaderInfoPrefill {
     /// Number of prompt tokens fed into prefill.
     pub prefill_n: usize,
@@ -55,28 +41,7 @@ pub struct HeaderInfoPrefill {
     pub prefill_tok_s: f64,
 }
 
-/// Write header lines 1 and 2 (backend + model summary).
-/// `tty` controls ANSI dimming. Renders to `w` (typically stdout).
-///
-/// ADR-018 C3: superseded by `crate::serve::load_info::print_banner`.
-/// See `HeaderInfoTop` doc above for the deprecation rationale.
-#[allow(dead_code)]
-pub fn print_header_top<W: Write>(
-    w: &mut W,
-    info: &HeaderInfoTop,
-    tty: bool,
-) -> io::Result<()> {
-    let (d, r) = if tty { (DIM, RESET) } else { ("", "") };
-    writeln!(w, "{d}hf2q · {} · {}{r}", info.chip, info.backend)?;
-    writeln!(
-        w,
-        "{d}{} · loaded in {:.1}s · {} layers · {:.1} GB{r}",
-        info.model, info.load_s, info.n_layers, info.total_gb,
-    )?;
-    w.flush()
-}
-
-/// Write header line 3 (prefill stats) and the blank line that frames the
+/// Write the prefill-stats line and the blank line that frames the
 /// generation stream. Called once prefill finishes, just before the first
 /// decode token prints.
 pub fn print_header_prefill<W: Write>(
@@ -156,58 +121,8 @@ mod tests {
         assert_eq!(short_chip_label(""), "");
     }
 
-    /// ADR-018 C3: legacy 2-line `print_header_top` golden test.
-    ///
-    /// Under the default feature set this test is gated off because the
-    /// unified 13-line `load_info::print_banner` is now the canonical
-    /// load-banner surface (see `tests::print_banner_golden_*` in
-    /// `src/serve/load_info.rs`). The `legacy-2-line-header` feature
-    /// keeps the legacy assertion alive for revert / parity scenarios.
-    #[cfg(feature = "legacy-2-line-header")]
-    #[test]
-    fn header_top_no_tty_has_no_ansi() {
-        let info = HeaderInfoTop {
-            chip: "M5 Max".to_string(),
-            backend: "mlx-native",
-            model: "gemma-4-26B".to_string(),
-            load_s: 2.4,
-            n_layers: 30,
-            total_gb: 16.9,
-        };
-        let mut buf = Vec::new();
-        print_header_top(&mut buf, &info, false).unwrap();
-        let s = String::from_utf8(buf).unwrap();
-        assert!(!s.contains("\x1b["), "no ANSI when not tty");
-        assert_eq!(
-            s,
-            "hf2q · M5 Max · mlx-native\n\
-             gemma-4-26B · loaded in 2.4s · 30 layers · 16.9 GB\n"
-        );
-    }
-
-    /// ADR-018 C3: legacy 2-line `print_header_top` ANSI-dim golden test.
-    /// See `header_top_no_tty_has_no_ansi` above for the feature-gate
-    /// rationale.
-    #[cfg(feature = "legacy-2-line-header")]
-    #[test]
-    fn header_top_tty_has_dim() {
-        let info = HeaderInfoTop {
-            chip: "M5 Max".to_string(),
-            backend: "mlx-native",
-            model: "m".to_string(),
-            load_s: 1.0,
-            n_layers: 1,
-            total_gb: 1.0,
-        };
-        let mut buf = Vec::new();
-        print_header_top(&mut buf, &info, true).unwrap();
-        let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("\x1b[2m"));
-        assert!(s.contains("\x1b[0m"));
-    }
-
-    /// ADR-018 C3: default-feature replacement for the legacy
-    /// `header_top_*` tests above.
+    /// ADR-018 C5: replacement for the legacy 2-line `header_top_*`
+    /// tests retired alongside `print_header_top` / `HeaderInfoTop`.
     ///
     /// Asserts the new banner shape against a fixture LoadInfo. The
     /// banner is line-shape-stable across cold/warm loads and across
@@ -217,8 +132,8 @@ mod tests {
     /// further set of golden tests at `crate::serve::load_info::tests`
     /// (`print_banner_golden_qwen35moe`, `print_banner_handles_absent_optional_fields`)
     /// pins the same shape against the Qwen35 / vision-absent variants;
-    /// this test ensures the legacy header.rs surface stays in sync
-    /// with the unified surface as well.
+    /// this test ensures the header.rs sibling-module path keeps the
+    /// dependency on the unified surface live.
     #[test]
     fn print_banner_default_arm_smoke() {
         use crate::serve::load_info::{
