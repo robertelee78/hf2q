@@ -234,8 +234,32 @@ fn detect_hardware_info() -> (String, u64) {
 /// below). It is NOT compatible with the API path's minijinja rendering
 /// (which iterates a `messages` array). The API path uses
 /// [`FALLBACK_GEMMA4_API_CHAT_TEMPLATE`] instead.
+///
+/// **iter-219b parity-gate fix (2026-05-01):** sibling fix to iter-217's
+/// API-path correction (commit `5a1b999`). The pre-fix version had a
+/// `<|turn>system\n<|think|><turn|>\n` system block that activates
+/// Gemma 4's thinking-mode — the model emits a full `<|channel>thought\n
+/// ...<channel|>` reasoning block before any answer content. That
+/// triggered the parity-gate divergence the iter-219b release-check
+/// caught: llama.cpp reference says `"The answer to 2 + 2 is **4**."`
+/// while hf2q produced `"<|channel>thought\n* Question: \"Hello, what
+/// i..."`. Common-prefix bytes = 0; all 6 parity checks failed (Gates
+/// C/D/E + F).
+///
+/// The fix mirrors `FALLBACK_GEMMA4_API_CHAT_TEMPLATE` (line 271+):
+/// drop the `<|think|>` system marker and append an empty channel block
+/// `<|channel>thought\n<channel|>` after `<|turn>model\n`. The empty
+/// block closes the channel before content begins, so the model emits
+/// the answer directly (matching llama.cpp's behavior with no thinking
+/// hint).
+///
+/// Probe (built binary, daily-driver Gemma 4 GGUF):
+///   pre-fix: hf2q output begins `<|channel>thought\n* Question: ...`
+///            (168 bytes; common-prefix=0 vs llama ref).
+///   post-fix: hf2q output begins `The answer to 2 + 2 is **4**.`
+///            (matches llama ref through 29-byte threshold).
 pub(crate) const FALLBACK_GEMMA4_CHAT_TEMPLATE: &str =
-    "<bos><|turn>system\n<|think|><turn|>\n<|turn>user\n{{PROMPT}}<turn|>\n<|turn>model\n";
+    "<bos><|turn>user\n{{PROMPT}}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>";
 
 /// Hardcoded fallback chat template for the **API path** (consumed by
 /// `src/serve/api/engine.rs::render_chat_prompt_with_tools` via minijinja).
@@ -3076,7 +3100,46 @@ fn cmd_parity_capture(
 
 #[cfg(test)]
 mod tests {
-    use super::render_jinja_template;
+    use super::{render_jinja_template, FALLBACK_GEMMA4_CHAT_TEMPLATE, FALLBACK_GEMMA4_API_CHAT_TEMPLATE};
+
+    /// iter-219b parity-gate fix (2026-05-01) regression guard. The CLI
+    /// fallback chat template MUST NOT activate Gemma 4's thinking-mode
+    /// via `<|think|>` system marker — that diverged from llama.cpp's
+    /// behavior and broke all 6 parity-suite checks (Gates C/D/E + F)
+    /// on HEAD `3cd6ea5`. iter-217 fixed the API path's fallback the
+    /// same way; this test ensures the CLI fallback stays aligned.
+    ///
+    /// The template MUST end with the empty `<|channel>thought\n<channel|>`
+    /// block (closes thinking-mode pre-content) and MUST NOT contain
+    /// `<|think|>` anywhere.
+    #[test]
+    fn iter219b_cli_fallback_chat_template_matches_iter217_contract() {
+        assert!(
+            !FALLBACK_GEMMA4_CHAT_TEMPLATE.contains("<|think|>"),
+            "CLI fallback MUST NOT contain `<|think|>` (activates thinking-mode \
+             that diverges from llama.cpp parity gate). Got: {FALLBACK_GEMMA4_CHAT_TEMPLATE:?}"
+        );
+        assert!(
+            FALLBACK_GEMMA4_CHAT_TEMPLATE.contains("<|channel>thought\n<channel|>"),
+            "CLI fallback MUST end with empty `<|channel>thought\\n<channel|>` block \
+             (closes thinking-mode pre-content; mirrors iter-217 API-path fix). \
+             Got: {FALLBACK_GEMMA4_CHAT_TEMPLATE:?}"
+        );
+        assert!(
+            FALLBACK_GEMMA4_CHAT_TEMPLATE.contains("{{PROMPT}}"),
+            "CLI fallback MUST keep `{{{{PROMPT}}}}` placeholder for `String::replace` \
+             rendering. Got: {FALLBACK_GEMMA4_CHAT_TEMPLATE:?}"
+        );
+        // API fallback must also retain its iter-217 invariant (sibling check).
+        assert!(
+            !FALLBACK_GEMMA4_API_CHAT_TEMPLATE.contains("<|think|>"),
+            "API fallback regression — `<|think|>` reintroduced after iter-217 fix"
+        );
+        assert!(
+            FALLBACK_GEMMA4_API_CHAT_TEMPLATE.contains("<|channel>thought\n<channel|>"),
+            "API fallback regression — empty channel block missing"
+        );
+    }
 
     /// Minimal Gemma-like template: verifies minijinja rendering of a single
     /// user message with `add_generation_prompt`.
