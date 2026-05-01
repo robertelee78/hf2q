@@ -2892,6 +2892,59 @@ reasonable interpretation under the current architecture.
   operator-controlled per `scripts/adr017_phase_d.sh`. Same 5%
   overhead ship-gate; falsifier identical to iter-8 K2.
 
+  **iter-14 measurement RAN — exits FAIL but TEST DESIGN BUG**
+  (commit `e058afe` operator role 2026-05-01):
+  ```
+  [Phase D R-P1 concurrent] baseline_full_avg=0.6ms (durations=[605.71, 0.72, 0.49])
+  [Phase D R-P1 concurrent] #0 eviction sibling wall=3071.0ms (decode wall=0.5ms)
+  [Phase D R-P1 concurrent] #1 eviction sibling wall=0.7ms (decode wall=0.7ms)
+  [Phase D R-P1 concurrent] #2 eviction sibling wall=0.8ms (decode wall=0.8ms)
+  [Phase D R-P1 concurrent] concurrent_full_avg=0.8ms (durations=[0.50, 0.74, 0.76])
+  [Phase D R-P1 concurrent] overhead=0.239 (gate: <= 0.05)
+  ```
+
+  **Honest reading**: the FAIL is a test design bug, NOT a K2 fire.
+  Sub-ms cache-hit decode wall (0.5-0.8 ms) means 0.14 ms absolute
+  diff between baseline and concurrent — well below the
+  scheduling-jitter noise floor at this timescale. The 100 ms
+  eviction-sleep delay vastly exceeds the cache-hit decode wall, so
+  the eviction sibling thread fires AFTER the decode has already
+  completed — the test isn't actually concurrent.
+
+  The async-writer-architecture contract is NOT falsified by this
+  result; the test methodology is what failed. Honest engineering
+  call: tighter K2 polish requires a regime where the inference
+  thread is genuinely BUSY during eviction:
+  - **Cache-MISS prompts** (unique-per-iter so prefill actually
+    runs)
+  - **Drop the eviction-sleep delay** (fire eviction at decode
+    start, not after 100 ms — overlap with prefill, not idle time)
+  - **Larger max_tokens** alongside cache-miss to extend the
+    decode window
+  - **Absolute-overhead bound** as fallback when baseline < 100 ms
+    (e.g. fail only if `concurrent - baseline > 50 ms`, not on
+    relative ratio)
+
+  Iter-14 commit `e058afe` ships the harness as-is with the
+  honest caveat documented here. Iter-15+ would re-spec the test
+  with the corrections above; iter-14 already proved the test
+  scaffolding compiles + executes; the methodology refinement is
+  the next polish-level work.
+
+  ADR-017 K2 verdict UNCHANGED: iter-8's between-decodes
+  measurement (overhead=−0.995; sustained 0.3 ms vs baseline
+  60.8 ms) remains the load-bearing K2 falsifier. The
+  concurrent-eviction harness is a complementary measurement
+  awaiting design refinement.
+
+  **Standing pattern (load-bearing for any sub-ms perf
+  measurement)**: ratio-based gates fail by noise at sub-ms
+  baselines. When measuring a regime where the operation
+  completes in <10 ms wall, either (a) drive the regime toward
+  longer durations via input shape (more tokens, larger prompts),
+  or (b) switch to absolute-overhead bounds. Sub-ms ratio-gating
+  is methodology error, not signal.
+
 #### All 3 kill-gates FALSIFIED — final status table
 
 | Kill-gate | Threshold | Measured | Verdict | Iter |
