@@ -2403,6 +2403,131 @@ operator-readiness 4 of 7 follow-ups closed; remaining 3 are
 either ADR-blocked (F4 → ADR-005, B-hybrid → ADR-013) or
 post-Phase-D-GREEN polish (/metrics, peer arm, matrix sweep).
 
+### Phase D iter-6 2026-05-01 — peer arm triangulates ADR-005 chat-template defect
+
+#### R-C4 peer arm — RAN, FAILED, but in informative way
+
+`HF2Q_KV_PERSIST_PHASE_D_PEER=1 +
+HF2Q_KV_PERSIST_PHASE_D_LLAMA_BIN=/opt/homebrew/bin/llama-completion`
+against `cmd_serve --kv-persist=DIR` against
+`gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf`:
+
+```
+[Phase D coherence] baseline decoded 3632 bytes (1000 tokens, ttft=309.4ms)
+[Phase D coherence] eviction cycle: wall=3168.0ms second_ttft=3168.0ms
+[Phase D coherence] restored decoded 3632 bytes (1000 tokens, ttft=0.4ms)
+[R-C4 internal] PASS — baseline (3632 bytes) == restored (3632 bytes) byte-identical
+[Phase D coherence] llama-completion produced 2054 bytes
+[R-C4 peer] baseline-vs-llama common prefix: 0 bytes (floor: 3094)
+[R-C4 peer] restored-vs-llama common prefix: 0 bytes (floor: 3094)
+panicked at tests/kv_persist_gemma4_roundtrip.rs:1627:5:
+[R-C4 peer] baseline-vs-llama common prefix 0 < floor 3094
+test result: FAILED. 0 passed; 1 failed in 31.26s
+```
+
+**R-C4 INTERNAL: PASS unchanged.** baseline (3632 bytes) ==
+restored (3632 bytes) byte-identical — ADR-017 persistence
+remains byte-perfect. 624× cache-hit TTFT speedup
+(309.4ms → 0.4ms) holds.
+
+**R-C4 PEER: FAIL.** 0 bytes common prefix vs llama on the
+same GGUF + same rendered prompt + T=0 greedy + max_tokens=1000.
+
+#### Triangulation — peer fail is NOT ADR-017's fault
+
+Standalone `/opt/hf2q/scripts/sourdough_gate.sh` runs `hf2q
+generate` (CLI path) against the SAME GGUF + SAME prompt vs the
+SAME llama-completion binary:
+
+```
+=== Sourdough byte-prefix gate (ADR-005 Phase 1b post-1bNEW.20.FIX) ===
+GGUF:           gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf
+hf2q:           target/release/hf2q
+llama-comp:     /opt/homebrew/bin/llama-completion
+git HEAD:       dac3c74...
+prompt:         Complrehensive instructions for making sourdough bread.
+max_tokens:     1000
+min-prefix:     3094 bytes
+
+llama output:  3576 bytes
+hf2q  output:  3575 bytes
+common prefix: 3488 bytes
+min required:  3094 bytes
+PASS: common prefix 3488 >= 3094.
+      (drift is 394 bytes tighter than the floor)
+```
+
+**hf2q generate CLI path: PASS at 3488 bytes (394 byte margin to floor).**
+**hf2q cmd_serve /v1/chat/completions API path: FAIL at 0 bytes.**
+
+The defect is in the API-path chat-template rendering, NOT in
+ADR-017 persistence and NOT in upstream decode coherence.
+
+#### Smoking gun (already in iter-3 stderr)
+
+iter-3's bench captured this stderr line that we glossed over:
+
+```
+WARN hf2q::serve::api::engine: Engine load: no GGUF
+  `tokenizer.chat_template`; using API-path Gemma4 fallback
+  (iterates messages array; supports multi-turn correctly).
+```
+
+The CLI path (`hf2q generate --prompt`) and API path
+(`/v1/chat/completions` with `messages=[{role:"user",content:X}]`)
+take different chat-template rendering routes. The CLI path
+produces a Gemma 4 standard `<bos><start_of_turn>user\n...
+<end_of_turn>\n<start_of_turn>model\n...` template that matches
+llama-completion's expectations; the API-path Gemma 4 fallback
+emits something materially different — different enough that the
+decoded output diverges from the FIRST token.
+
+This is **ADR-005 chat-template rendering territory**, NOT
+ADR-017. ADR-017's bench-discovery role uncovered it — same as
+how iter-3's R-C4 surfaced the P0-bench Arc-retain ship-blocker.
+
+#### Hand-off to ADR-005 owners
+
+A separate ADR-005 work item should:
+1. Audit `src/serve/api/engine.rs` API-path Gemma 4 chat-template
+   fallback (search "API-path Gemma4 fallback" in source).
+2. Compare rendered output side-by-side against the CLI path's
+   `hf2q generate --prompt` template render
+   (`HF2Q_DUMP_RENDERED_PROMPT=path` env captures the rendered
+   bytes).
+3. Make the API path produce byte-identical render to the CLI
+   path; lock in via a regression test that asserts
+   `cli_rendered_bytes == api_rendered_bytes` for the sourdough
+   prompt.
+4. Re-run ADR-017 R-C4 peer arm; expected PASS at ≥3094 bytes
+   common prefix once the rendering converges.
+
+ADR-017 status remains **Closed-Shipped (Phase D GREEN)**. The
+peer arm is a derivative gate that depends on upstream
+chat-template correctness; ADR-017 R-C4 internal byte-equality
+is the load-bearing ADR-017 gate, and it PASSES.
+
+#### Standing pattern (load-bearing for any cross-ADR test)
+
+When a test asserts a property that depends on multiple ADRs'
+correctness, a FAIL at the test's surface should NOT be charged
+to the ADR that owns the test. Triangulate by varying ONE of
+the multiple ADRs at a time:
+- vary the persistence layer (run with --kv-persist=OFF) → ADR-017 isolated
+- vary the rendering path (CLI vs API) → ADR-005 isolated
+- vary the model (different family) → ADR-006/013 isolated
+
+The first triangulation that re-PASSes the gate identifies the
+ADR that owns the regression. Here, varying CLI vs API isolated
+the defect to ADR-005.
+
+#### Cumulative ADR-017 LOC after iter-6 (ADR doc only this turn)
+
+~17,594 + ~120 (this triangulation subsection) = **~17,714 LOC**
+in-tree substrate + audit + operator docs + landed fixes + bench
+receipts + cross-ADR triangulation. /metrics counter wiring
+agent in flight; result lands in iter-6 finale.
+
 ---
 
 ## Open Questions
