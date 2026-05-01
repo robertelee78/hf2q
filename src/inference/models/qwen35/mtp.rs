@@ -36,8 +36,18 @@ pub struct MtpWeights {
     pub(super) hnorm: MlxBuffer,
     pub(super) eh_proj_embed: MlxBuffer,
     pub(super) eh_proj_hidden: MlxBuffer,
+    /// MTP token-embedding table.
+    ///
+    /// `Some(...)` when the GGUF carries a dedicated `blk.{N}.nextn.embed_tokens.weight`
+    /// (Qwen3.5 MTP convention; HF flag `mtp_use_dedicated_embeddings == True`).
+    ///
+    /// `None` when the MTP block shares the main verifier's `token_embd.weight`
+    /// (Qwen3.6 27B + 35B-A3B convention; HF flag `False`). At draft time the
+    /// caller of `forward_draft` already supplies the embedding (`embed_t`); the
+    /// verifier embedding table itself lives on `Qwen35Model::token_embd` and is
+    /// reused via the hot embed_tokens lookup path — no buffer duplication.
     #[allow(dead_code)]
-    pub(super) embed_tokens: MlxBuffer,
+    pub(super) embed_tokens: Option<MlxBuffer>,
     pub(super) shared_head_norm: MlxBuffer,
     pub(super) shared_head_head: MlxBuffer,
     pub(super) attn: MtpFullAttnWeightsGpu,

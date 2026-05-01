@@ -38,6 +38,7 @@ fn tiny_cfg(mtp_layers: u32) -> Qwen35Config {
         vocab_size: 64,
         attn_output_gate: true,
         mtp_num_hidden_layers: mtp_layers,
+        mtp_use_dedicated_embeddings: true,
         intermediate_size: Some(32),
         moe: None,
     }
@@ -158,6 +159,73 @@ fn mtp_loads_gpu_weights_from_synthetic_gguf() {
     assert!(!mtp.is_empty());
     assert!(mtp.has_tensor_suffix("enorm.weight"));
     assert!(mtp.has_tensor_suffix("attn_q.weight"));
+    // ADR-013 P14 follow-up: dedicated path populates the buffer.
+    assert!(
+        mtp.embed_tokens.is_some(),
+        "dedicated_embeddings=true must yield Some(embed_tokens) buffer"
+    );
+    std::fs::remove_file(&tmp).ok();
+}
+
+/// ADR-013 P14 follow-up (2026-04-30): Qwen3.6 27B + 35B-A3B share the main
+/// model's `token_embd.weight`; convert correctly skips emitting
+/// `blk.{N}.nextn.embed_tokens.weight`. The loader must succeed (not bail) when
+/// `mtp_use_dedicated_embeddings=false` AND the dedicated tensor is absent, and
+/// must populate `embed_tokens = None` to signal the shared path.
+#[test]
+fn mtp_loads_with_shared_embeddings_when_flag_false_and_tensor_absent() {
+    let Some(device) = try_device() else { return };
+    // tiny_tensors() includes the dedicated embed_tokens tensor; strip it for
+    // the shared-embeddings scenario.
+    let tensors: Vec<TestTensor> = tiny_tensors()
+        .into_iter()
+        .filter(|t| t.name != "blk.2.nextn.embed_tokens.weight")
+        .collect();
+    let tmp = std::env::temp_dir().join(format!("mtp_shared_{}.gguf", std::process::id()));
+    write_gguf(&tmp, &tensors);
+    let gguf = GgufFile::open(&tmp).expect("open");
+    let mut cfg = tiny_cfg(1);
+    cfg.mtp_use_dedicated_embeddings = false;
+    let mtp = load_mtp_weights_if_present(&gguf, &cfg, &device)
+        .expect("loader must succeed when flag=false and tensor absent")
+        .expect("MtpWeights present (mtp_num_hidden_layers=1)");
+    assert_eq!(mtp.layer_index, 2);
+    assert_eq!(mtp.hidden_size, 32);
+    // Shared-embeddings path: no buffer materialised, main model's token_embd
+    // is reused via Qwen35Model::token_embd at draft time.
+    assert!(
+        mtp.embed_tokens.is_none(),
+        "mtp_use_dedicated_embeddings=false must yield None (shared with main)"
+    );
+    // Other MTP tensors still load correctly.
+    assert!(mtp.has_tensor_suffix("enorm.weight"));
+    assert!(mtp.has_tensor_suffix("attn_q.weight"));
+    // The dedicated-embeddings tensor name is NOT in the discovered names.
+    assert!(
+        !mtp.loaded_tensor_names
+            .iter()
+            .any(|n| n == "blk.2.nextn.embed_tokens.weight"),
+        "dedicated tensor must not appear in loaded_tensor_names"
+    );
+    std::fs::remove_file(&tmp).ok();
+}
+
+/// ADR-013 P14 follow-up: belt-and-suspenders for convert-side inconsistency.
+/// If a GGUF carries both `mtp_use_dedicated_embeddings=False` AND the dedicated
+/// tensor is present, refuse rather than silently dropping the tensor.
+#[test]
+fn mtp_rejects_inconsistent_shared_flag_with_dedicated_tensor_present() {
+    let Some(device) = try_device() else { return };
+    let tmp = std::env::temp_dir().join(format!("mtp_inconsistent_{}.gguf", std::process::id()));
+    write_gguf(&tmp, &tiny_tensors()); // dedicated tensor present
+    let gguf = GgufFile::open(&tmp).expect("open");
+    let mut cfg = tiny_cfg(1);
+    cfg.mtp_use_dedicated_embeddings = false; // inconsistent with tensor presence
+    let result = load_mtp_weights_if_present(&gguf, &cfg, &device);
+    assert!(
+        result.is_err(),
+        "loader must refuse when flag=false but dedicated tensor present"
+    );
     std::fs::remove_file(&tmp).ok();
 }
 

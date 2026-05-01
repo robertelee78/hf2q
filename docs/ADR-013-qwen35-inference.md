@@ -2230,3 +2230,42 @@ The spec_decode mechanism work shipped on the two parallel branches is now ready
 - `origin/fix/adr013-spec-decode-prev-hidden` — spec_decode runtime (prev_hidden plumbing fix)
 
 Bench protocol (next iter): run draft acceptance-rate + e2e tok/s on 27B-dwq46 (DenseQ FullAttn slot, head_dim=256) and apex Q4_0 (MoeQ + DeltaNet hybrid) at max-tokens 64/128/256, paired cold-SoC, mcp-brain-server suspended via `kill -STOP` per `feedback_bench_process_audit`. Pre-fix the bench would have produced run-to-run acceptance-rate variance ≥ ε from the underlying non-determinism; post-fix any variance is purely from spec_decode's own draft/target mismatch, the actual signal we want.
+### 2026-04-30 — P14 follow-up · MTP loader honours `mtp_use_dedicated_embeddings`
+
+**Bug.** ADR-013 P14 (MTP speculative decoding) shipped 2026-04-25 with the loader at `src/inference/models/qwen35/mtp_weights_load.rs:40` UNCONDITIONALLY requiring `blk.{N}.nextn.embed_tokens.weight`. Qwen3.5 MTP-bearing checkpoints (e.g. Qwen3.5-Coder) ship that tensor and the loader works. **Qwen3.6 27B + 35B-A3B**, however, both set HF `config.json` `mtp_use_dedicated_embeddings: false` — the MTP NextN block shares the main verifier's `token_embd.weight`, and convert correctly skips the redundant emit. The unconditional load_tensor_f32 then fails:
+
+```
+Qwen35Model::load_from_gguf: load_mtp_weights_if_present: blk.64.nextn.embed_tokens.weight: load_tensor_f32: tensor 'blk.64.nextn.embed_tokens.weight' not found in GGUF file
+```
+
+This blocked loading any Qwen3.6 model with MTP nextn tensors emitted (i.e. every Qwen3.6 produced by the post-P14 convert pipeline).
+
+**Fix.**
+
+1. `Qwen35Config` gains a new `mtp_use_dedicated_embeddings: bool` field (default `true` to match Qwen3.5 historical baseline).
+2. `Qwen35Config::from_gguf` reads it via the resolution chain: explicit metadata key `{arch}.nextn.use_dedicated_embeddings` (forward-compat) → tensor-presence inference (`gguf.tensor_info("blk.{N}.nextn.embed_tokens.weight").is_some()`) → fallback `true` when MTP absent. llama.cpp itself has no canonical key (`llama-arch.cpp:759` "NextN/MTP tensors are currently ignored"); our key is namespaced under the existing `{arch}.nextn.*` family.
+3. `MtpWeights.embed_tokens` becomes `Option<MlxBuffer>`. Dedicated-embeddings → `Some(buf)` exactly as before. Shared-embeddings → `None` (no buffer duplication; the field is reserved for the rare downstream consumer that needs direct table access — `forward_draft` already takes the per-token embedding `embed_t` as an input, so the verifier's hot path supplies it without round-tripping the table).
+   * **Symmetric fix for `shared_head_head`**: the LM-head projection follows the same shared-vs-dedicated rule as `embed_tokens`. Qwen3.6 27B + 35B-A3B ship neither tensor; the MTP block reuses `output.weight` for the final logit projection. The loader now resolves `blk.{N}.nextn.shared_head_head.weight` if present, else falls back to the main `output.weight` when `mtp_use_dedicated_embeddings=false`. Live-load on the 27B-mtp Q4_0 artefact confirmed both fallbacks fire (INFO logs `sharing main token_embd` + `shared_head_head resolved source=output.weight vocab_size=248044`).
+4. The convert pipeline (`emit_qwen35_metadata` in `src/backends/gguf.rs`) now writes `{arch}.nextn.use_dedicated_embeddings` whenever `nextn_predict_layers > 0`, propagating the HF flag into the GGUF for forward-compat. Existing GGUFs without this key fall back to tensor-presence inference (no breakage).
+5. INFO log line on each load surfaces the chosen path: `qwen35 MTP loader: dedicated embed_tokens` or `qwen35 MTP loader: sharing main token_embd (no dedicated nextn.embed_tokens)`.
+6. Belt-and-suspenders: if a future convert-side regression ever ships a GGUF with `mtp_use_dedicated_embeddings=False` AND a dedicated `nextn.embed_tokens.weight` tensor, the loader bails rather than silently dropping the tensor. This is unit-tested.
+
+**Live MTP-bearing GGUF.** Today's re-emit of vanilla `Qwen/Qwen3.6-27B` to Q4_0 lives at `/opt/hf2q/models/qwen3.6-27b-mtp-q4_0/qwen3.6-27b-mtp-q4_0.gguf`. The convert pipeline emits the four `blk.64.nextn.{eh_proj,enorm,hnorm,shared_head_norm,shared_head_head}.weight` tensors plus the 11 standard transformer tensors at `blk.64` (the MTP layer's attn + FFN), and correctly skips `blk.64.nextn.embed_tokens.weight`. With this loader fix, `target/release/hf2q generate --model …qwen3.6-27b-mtp-q4_0.gguf --prompt "What is 2+2?" --max-tokens 8 --temperature 0` no longer errors on the missing tensor.
+
+**Tests.**
+
+- New `mtp_loads_with_shared_embeddings_when_flag_false_and_tensor_absent` — synthetic GGUF without `nextn.embed_tokens.weight`, `cfg.mtp_use_dedicated_embeddings=false` → loader returns `Some(MtpWeights)` with `embed_tokens.is_none()`.
+- New `mtp_rejects_inconsistent_shared_flag_with_dedicated_tensor_present` — flag=false but tensor present → loader bails.
+- Existing `mtp_loads_gpu_weights_from_synthetic_gguf` augmented to assert `embed_tokens.is_some()` on the dedicated path.
+- All four pre-existing `inference::models::qwen35::mtp` tests (1 ignored) still pass.
+
+**Files touched.**
+
+- `src/inference/models/qwen35/mod.rs` — add field; metadata + tensor-presence resolution.
+- `src/inference/models/qwen35/mtp.rs` — `embed_tokens: Option<MlxBuffer>`.
+- `src/inference/models/qwen35/mtp_weights_load.rs` — honour flag, INFO log, belt-and-suspenders bail.
+- `src/inference/models/qwen35/mtp_tests.rs` — two new tests + augment existing.
+- `src/backends/gguf.rs` — emit `{arch}.nextn.use_dedicated_embeddings` when MTP present.
+- 7 other `inference::models::qwen35` files: thread `mtp_use_dedicated_embeddings: true` through synthetic-config literals (forward_cpu, forward_gpu, full_attn, weight_loader, activation_capture_real, kv_cache, model, spec_decode).
+
+No env-gating, no fallback-of-fallback, no TODO stubs (mantra: "No fallback. No stub.").

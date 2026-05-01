@@ -164,6 +164,18 @@ pub struct Qwen35Config {
     pub vocab_size: u32,
     pub attn_output_gate: bool, // true for Qwen3.5
     pub mtp_num_hidden_layers: u32, // 0 if MTP absent (apex GGUF case)
+    /// Whether the MTP NextN block carries its own dedicated `embed_tokens` table.
+    ///
+    /// Qwen3.5 MTP models (e.g. Qwen3.5-Coder) ship `mtp.embed_tokens.weight`; the
+    /// HF config flag `mtp_use_dedicated_embeddings == True`.  Qwen3.6 27B + 35B-A3B
+    /// instead share the main model's `token_embd.weight` (HF flag `False`); convert
+    /// correctly skips emitting `blk.{N}.nextn.embed_tokens.weight` and the loader
+    /// must reuse the main verifier embedding table.
+    ///
+    /// Default `true` matches the historical Qwen3.5 baseline assumed by ADR-013 P14.
+    /// Read from GGUF metadata key `{arch}.nextn.use_dedicated_embeddings` when
+    /// present, else inferred from tensor-presence at load time.
+    pub mtp_use_dedicated_embeddings: bool,
 
     // --- FFN variant-specific ---
     pub intermediate_size: Option<u32>, // dense: Some(17408); moe: None
@@ -317,6 +329,36 @@ impl Qwen35Config {
             .metadata_u32(&format!("{p}.nextn_predict_layers"))
             .or_else(|| gguf.metadata_u32(&format!("{p}.mtp.num_hidden_layers")))
             .unwrap_or(0);
+        // ADR-013 P14 follow-up (2026-04-30): read mtp_use_dedicated_embeddings.
+        //
+        // Resolution order:
+        //   1) Explicit metadata `{arch}.nextn.use_dedicated_embeddings` (forward-compat;
+        //      our convert pipeline writes this when MTP is present).
+        //   2) Tensor-presence inference: if `blk.{N}.nextn.embed_tokens.weight`
+        //      exists in the GGUF, the MTP block has dedicated embeddings; else it
+        //      shares the main model's `token_embd.weight`.
+        //   3) Fallback (no MTP at all): default `true` to preserve historical Qwen3.5
+        //      semantics; the loader is a no-op when mtp_num_hidden_layers == 0.
+        //
+        // llama.cpp itself has no canonical key for this; it implicitly relies on
+        // tensor presence (llama-arch.cpp:759 "NextN/MTP tensors are currently
+        // ignored"). Our key is namespaced under the existing `{arch}.nextn.*`
+        // family for cleanliness.
+        let mtp_use_dedicated_embeddings = gguf
+            .metadata(&format!("{p}.nextn.use_dedicated_embeddings"))
+            .and_then(|v| match v {
+                MetadataValue::Bool(b) => Some(*b),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                if mtp_num_hidden_layers == 0 {
+                    true
+                } else {
+                    let layer_index = total_block_count.saturating_sub(mtp_num_hidden_layers);
+                    let tname = format!("blk.{layer_index}.nextn.embed_tokens.weight");
+                    gguf.tensor_info(&tname).is_some()
+                }
+            });
         if mtp_num_hidden_layers > total_block_count {
             bail!(
                 "qwen35 config: {p}.nextn_predict_layers ({}) exceeds {p}.block_count ({})",
@@ -451,6 +493,7 @@ impl Qwen35Config {
             vocab_size,
             attn_output_gate,
             mtp_num_hidden_layers,
+            mtp_use_dedicated_embeddings,
             intermediate_size,
             moe,
         })

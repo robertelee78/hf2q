@@ -529,6 +529,7 @@ mod tests {
             linear_conv_kernel_dim: 4,
             moe: None,
             mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: true,
         };
         let num_layers = cfg.num_hidden_layers;
         let hidden_size = cfg.hidden_size;

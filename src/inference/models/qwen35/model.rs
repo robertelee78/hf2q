@@ -472,6 +472,7 @@ mod tests {
             vocab_size: 256,
             attn_output_gate: true,
             mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: true,
             intermediate_size: None,
             moe: Some(Qwen35MoeConfig {
                 moe_intermediate_size: 16,

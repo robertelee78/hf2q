@@ -443,6 +443,7 @@ fn infer_lazy_qwen35_config(lookup: &LazyQwen35Lookup<'_>) -> Result<Qwen35Confi
         vocab_size,
         attn_output_gate: true,
         mtp_num_hidden_layers: 0,
+        mtp_use_dedicated_embeddings: true,
         intermediate_size,
         moe,
     })

@@ -3494,6 +3494,17 @@ fn emit_qwen35_metadata(
                     format!("{}.nextn_predict_layers", arch),
                     MetaValue::Uint32(mtp),
                 ));
+                // ADR-013 P14 follow-up (2026-04-30): forward-compat marker for the
+                // shared-vs-dedicated MTP embedding decision. llama.cpp has no canonical
+                // key (the loader infers from tensor presence at llama-arch.cpp:759) so
+                // we namespace under `{arch}.nextn.*`. Inference loader still falls back
+                // to tensor-presence inference when this key is absent (older GGUFs).
+                if let Some(ded) = meta.mtp_use_dedicated_embeddings {
+                    kv.push((
+                        format!("{}.nextn.use_dedicated_embeddings", arch),
+                        MetaValue::Bool(ded),
+                    ));
+                }
             }
         }
     }
