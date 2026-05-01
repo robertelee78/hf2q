@@ -68,10 +68,22 @@ use mlx_native::ops::elementwise::{cast, scalar_mul_f32, CastDirection};
 use mlx_native::ops::gated_delta_net::{
     build_gated_delta_net_params, dispatch_gated_delta_net, GatedDeltaNetParams,
 };
-// ADR-015 iter56 — decode-only `simd_sum` GDN variant. Drop-in replacement
-// for `dispatch_gated_delta_net` when n_tokens=1; eliminates the 128-thread
-// threadgroup_barrier stalls suffered by the original kernel and fits the
-// state row in registers (NSG=4 for D_k=128 → 16 bytes/thread).
+// ADR-015 iter56/iter59 + ADR-013 P21 stage-4 — `simd_sum` GDN variant.
+// Drop-in replacement for `dispatch_gated_delta_net` for decode (n_tokens=1)
+// AND autoregressive prefill (Stage-4 unconditional when D_k % 32 == 0 &&
+// D_k <= 128). Eliminates the 128-thread threadgroup_barrier stalls and fits
+// the state row in registers (NSG=4 for D_k=128 → 16 bytes/thread).
+//
+// iter59 verified byte-identical output vs legacy kernel for n_tokens
+// ∈ {1..32} in mlx-native/tests/test_gated_delta_net_decode.rs
+// multi_token_nsg_*; Stage-4 measured 2.04x prefill speedup at pp726 with
+// peer-parity coherence preserved through the entire seq_len range.
+//
+// iter66a rebase reconciliation: iter59-mtnsg's original `seq_len <= 32`
+// upper bound was superseded by Stage-4's unconditional dispatch (measured
+// gain holds through long-prefill); the decode-path NSG eligibility check
+// at the build_delta_net_layer decode site (around line ~1547) is iter59's
+// surviving distinct contribution that target Stage-4 did not cover.
 use mlx_native::ops::gated_delta_net_decode::dispatch_gated_delta_net_decode;
 use mlx_native::ops::l2_norm::dispatch_l2_norm;
 use mlx_native::ops::qkv_split::{dispatch_qkv_split_f32, QkvSplitParams};
@@ -1516,12 +1528,26 @@ pub fn build_delta_net_layer(
         ).context("dispatch_compute_g_beta")?;
         enc.memory_barrier();
         // Op 7: GDN — reads state_in, writes state_out (ping-pong buffers).
-        dispatch_gated_delta_net(
-            &mut enc, registry, device.metal_device(),
-            &q_scaled, &k_normed, &v_gpu,
-            &g_buf, &beta_buf, state_in,
-            &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
-        ).context("dispatch_gated_delta_net")?;
+        // ADR-015 iter59: decode path (seq==1 → n_tokens=1) uses the NSG
+        // `simd_sum` kernel when D_k is NSG-compatible (multiple of 32, ≤128)
+        // — byte-identical to legacy kernel, barrier-free. Falls back to the
+        // legacy 128-thread kernel for non-NSG shapes (e.g. test-only D_k=8).
+        let nsg_compatible = d_k % 32 == 0 && d_k / 32 <= mlx_native::ops::gated_delta_net_decode::MAX_NSG;
+        if nsg_compatible {
+            dispatch_gated_delta_net_decode(
+                &mut enc, registry, device.metal_device(),
+                &q_scaled, &k_normed, &v_gpu,
+                &g_buf, &beta_buf, state_in,
+                &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
+            ).context("dispatch_gated_delta_net_decode (build_delta_net_layer decode)")?;
+        } else {
+            dispatch_gated_delta_net(
+                &mut enc, registry, device.metal_device(),
+                &q_scaled, &k_normed, &v_gpu,
+                &g_buf, &beta_buf, state_in,
+                &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
+            ).context("dispatch_gated_delta_net (build_delta_net_layer decode, non-NSG shape)")?;
+        }
         enc.memory_barrier();
         // Op 8: ssm_norm_gate
         dispatch_ssm_norm_gate(
@@ -1843,14 +1869,23 @@ pub fn build_delta_net_layer(
                 seq_len, n_v_heads,
             ).context("dispatch_compute_g_beta prefill")?;
             enc.memory_barrier();
-            // ADR-013 P21 stage-4 (2026-05-01): autoregressive prefill GDN
-            // uses the simd_sum-based decode kernel (mirrors llama.cpp's
+            // ADR-013 P21 stage-4 (2026-05-01) + ADR-015 iter59 / iter66a
+            // rebase reconciliation: autoregressive prefill GDN uses the
+            // simd_sum-based decode kernel (mirrors llama.cpp's
             // kernel_gated_delta_net_f32_<NSG>) when D_k is supported.
             // Per-thread register state shrinks from D_k floats to NSG=D_k/32
             // floats (32x lower at D_k=128) and cross-lane reductions become
             // single-cycle simd_sum vs threadgroup_barrier+shared_memory.
             // Measured at pp726: 2.04x prefill speedup (1010 -> 2061 t/s),
             // ratio vs llama 0.37x -> 0.75-1.18x (at peer parity).
+            //
+            // iter66a note: iter59-mtnsg originally added a `seq_len <=
+            // NSG_PREFILL_MAX_TOKENS` upper bound (32) here; Stage-4 supersedes
+            // that gate — measured advantage holds unconditionally up through
+            // pp726, so we keep Stage-4's unconditional path. The decode-path
+            // NSG eligibility check (above, around line ~1547) survives from
+            // iter59 since target never wrapped that call site.
+            //
             // Fallback to dispatch_gated_delta_net for D_k not a multiple
             // of 32 or > 128 (NSG=4 cap) — preserves synthetic small-shape
             // test coverage and any future architecture with D_k != 128.
