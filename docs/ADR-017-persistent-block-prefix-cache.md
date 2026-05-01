@@ -1217,6 +1217,151 @@ C.1 lands the CLI flag + the `set_engine_handle` wiring at engine-load time. The
 
 ---
 
+### Phase C.1 LANDED (2026-04-30)
+
+Phase C.1 lands the `cmd_serve --kv-persist=PATH` flag plus the per-family `EngineBindable` registry that closes the load-time engine-binding gap A.3 left open. Substrate adds **541 + 570 + 213 + 263 = 1,587 LOC** across two new modules + four additive edits; **20 new unit tests** push the in-binary kv_persist count to **94 PASS** (74 prior + 20 new). The 36-test harness regression and the 1-test kill-9 regression remain GREEN.
+
+**File map:**
+
+| Surface | Status | Lines |
+|---|---|---|
+| `src/serve/kv_persist/registry.rs` (NEW) | C.1 deliverable 1 | 463 LOC (production + 8 tests) |
+| `src/serve/kv_persist/loader_wrapper.rs` (NEW) | C.1 deliverable 2 | 661 LOC (production + 8 tests) |
+| `src/serve/kv_persist/mod.rs` (EDIT) | C.1 deliverable 3 — `EngineBindable` trait + module re-exports | +71 LOC additive |
+| `src/serve/kv_persist/spiller.rs` (EDIT) | C.1 deliverable 4 — `EngineBindable` impl for `StubGemma4Spill` (no-op) + 1 test | +52 LOC additive |
+| `src/serve/kv_persist/families/gemma4_dense.rs` (EDIT) | C.1 deliverable 5 — `EngineBindable` impl for `Gemma4DenseSpill` + 3 tests | +161 LOC additive |
+| `src/cli.rs` (EDIT) | C.1 deliverable 6 — `kv_persist_path: Option<PathBuf>` field on `ServeArgs` | +21 LOC additive |
+| `src/serve/mod.rs::cmd_serve` (EDIT) | C.1 deliverable 7 — substrate wire-up when flag is set | +131 LOC additive |
+| `docs/ADR-017-persistent-block-prefix-cache.md` (this section) | C.1 deliverable 8 | this subsection |
+
+**`EngineBindable` trait surface and rationale:**
+
+```rust
+// In src/serve/kv_persist/mod.rs (additive — no edits to KvSpiller / KvCacheSpill).
+pub trait EngineBindable: Send + Sync {
+    fn bind_engine(&self, engine_dyn: Arc<dyn Any + Send + Sync>);
+    fn unbind_engine(&self);
+}
+```
+
+Two design constraints drive the trait shape:
+
+1. **`KvCacheSpill` stays payload-only.** Adding `bind_engine` directly to `KvCacheSpill` would force every existing impl (including the A.3 `StubGemma4Spill` and any test mocks) to handle a concept they don't need. Splitting the engine-binding seam keeps the per-family payload codec stable.
+2. **`Arc<dyn Any + Send + Sync>` for engine erasure.** The Phase A.3 `BlockPrefixCacheSpiller<E>` is generic over the engine type. The C.1 `LoaderWrapper<E>` is also generic over `E`. Type-erasing through `Arc<dyn Any>` lets the wrapper deliver the freshly-loaded engine to the hook without depending on the hook's concrete state shape — the hook performs the downcast itself (`Arc::downcast`) and silently no-ops on type mismatch (the canonical failure handling per the trait's docs).
+
+`StubGemma4Spill::bind_engine` drops the type-erased Arc (no-op). `Gemma4DenseSpill::bind_engine` downcasts to `Arc<EngineHandle>`; on success cheap-clones the inner `EngineHandle` and stores via the existing B-dense.1 `set_engine_handle`; on Err drops the Arc silently. `unbind_engine` mirrors via `clear_engine_handle`.
+
+**`LoaderWrapper` bind/unbind seam:**
+
+```rust
+// In src/serve/kv_persist/loader_wrapper.rs (additive — no edits to ModelLoader trait).
+pub struct LoaderWrapper<E> {
+    inner: Arc<dyn ModelLoader<E>>,
+    registry: Arc<KvPersistRegistry>,
+    pending_bind: Mutex<Option<(String, QuantType)>>,
+    _phantom: PhantomData<fn(E)>,
+}
+
+impl<E: Send + Sync + 'static> ModelLoader<E> for LoaderWrapper<E> {
+    fn load(&self, path: &Path, config: &EngineConfig) -> Result<E> {
+        let engine = self.inner.load(path, config)?;          // 1. inner load
+        let pending = self.pending_bind.lock()?.take();        // 2. consume pending
+        let Some((repo, quant)) = pending else { return Ok(engine); };
+        let arc_engine: Arc<E> = Arc::new(engine);             // 3. wrap
+        let dyn_view: Arc<dyn Any + Send + Sync> = Arc::clone(&arc_engine) as _;
+        self.registry.bind_for(&repo, quant, dyn_view);        // 4. drive bind
+        Arc::try_unwrap(arc_engine)                            // 5. reclaim E
+            .map_err(|_| anyhow!("EngineBindable contract violation: hook retained Arc"))
+    }
+}
+```
+
+The `pending_bind` slot rationale: production `cmd_serve` startup is single-threaded, so a wrapper-local `Mutex<Option<(String, QuantType)>>` armed synchronously immediately before `pool.load_or_get(...)` is race-free + dependency-graph-local + easy to test. The alternative — a thread-local — would be fragile under tokio's work-stealing scheduler.
+
+**The `Arc::try_unwrap` reclaim is contract-enforced.** A hook that violates `EngineBindable` by retaining a clone of the type-erased Arc surfaces as an operator-actionable error (the message names the offending `(repo, quant)` pair). Production hooks (Stub + Gemma4Dense) only retain content downcast OUT of the Arc (an inner `Arc<EngineHandle>`), never the original `Arc<dyn Any>` itself, so `try_unwrap` succeeds in the live path. The contract-violation regression test (`loader_wrapper_contract_violation_surfaces_error`) locks this in.
+
+**CLI flag semantics:**
+
+```bash
+# Default off — byte-identical to pre-C.1 (NoopKvSpiller).
+target/release/hf2q serve --model <path>
+
+# C.1 flag-on path — wires DiskBlockStore + AsyncWriterHandle + BlockPrefixCacheSpiller
+# + KvPersistRegistry + LoaderWrapper, runs recovery scan at startup, registers
+# StubGemma4Spill for the operator --model.
+target/release/hf2q serve --model <path> --kv-persist=/tmp/hf2q-kv
+```
+
+The off-path is preserved verbatim: `AppState::new_for_serve` builds a `HotSwapManager` with `Arc::new(NoopKvSpiller)` and the existing `kv_spill_counters` thread-up. The C.1 flag-on path replaces `state.pool` with a fresh `HotSwapManager::new_with_spiller`-built manager that re-derives the pool from `state.hardware` and re-installs the same `kv_spill_counters` so the `/metrics` cardinality contract holds across both paths.
+
+**Hookup readiness for B-dense.2 (round-trip parity matrix on real GGUF):**
+
+C.1 ships the WIRING substrate; the actual GGUF-derived `Gemma4DenseConfig` construction + `Arc<EngineHandle>` extraction from `MlxModelWeights.dense_kvs` are B-dense.2's responsibility. The hand-off shape:
+
+- Replace `StubGemma4Spill` registration (line `mod.rs:1668-1683` in cmd_serve) with `Gemma4DenseSpill::new(cfg)` derived from the GGUF metadata pre-load.
+- Construct `Arc<EngineHandle>` post-load from the engine's `MlxModelWeights` and call `registry.bind_for(repo, quant, handle_arc as Arc<dyn Any>)` directly (the `LoaderWrapper`'s automatic bind delivers `Arc<Engine>` which the Gemma4DenseSpill downcast silently rejects — the explicit cmd_serve bind is what threads the `EngineHandle` correctly).
+- Sourdough byte-exact decode-token comparison vs the never-evicted baseline at every prefix length × quant cell.
+
+**Hookup readiness for Phase D (sourdough/coherence validation matrix):**
+
+Phase D drives the operator-facing flag-on coherence run on Gemma 4 26B Q4_0 under `HF2Q_USE_DENSE=1 + --kv-persist=/tmp/kv` against the never-evicted baseline. The mechanical exit gate: byte-exact decode token sequence at every cell. The C.1 substrate is the necessary precondition; B-dense.2's real `Gemma4DenseSpill` registration is the sufficient one.
+
+**Mechanical exit codes (worktree HEAD `b03b664`):**
+
+| Command | Exit | Output |
+|---|---|---|
+| `cargo build --release` | **0** | `Finished release profile [optimized] target(s)` |
+| `cargo test --release --bin hf2q kv_persist -- --test-threads=1` | **0** | **94 passed; 0 failed; 0 ignored** in 1.10 s (74 prior + 20 new) |
+| `cargo test --release --test kv_persist_writer_kill_minus_9 -- --test-threads=1` | **0** | **1 passed; 0 failed; 0 ignored** in 0.05 s |
+| `cargo test --release --test kv_persist_harness -- --test-threads=1` | **0** | **36 passed; 0 failed; 0 ignored** in 2.76 s (no regression) |
+| `grep -rn '// TODO\|todo!()\|unimplemented!()\|person-day' src/serve/kv_persist/ src/serve/mod.rs src/cli.rs` | **1** | no hits — discipline holds |
+
+**C.1 unit-test inventory (20 new tests across registry / loader_wrapper / EngineBindable impls):**
+
+`registry.rs` (8 tests):
+1. `new_registry_has_zero_hooks`
+2. `registry_register_then_bind_round_trip` (spec test 1 — Hypothesis-2 falsifier)
+3. `registry_unbind_clears_engine_handle` (spec test 2)
+4. `registry_bind_for_unknown_repo_quant_is_noop` (spec test 3)
+5. `registry_re_register_overwrites_prior_hook`
+6. `registry_unregister_idempotent`
+7. `registry_distinct_quant_grows_table`
+8. `registry_multi_threaded_bind_for_is_safe`
+
+`loader_wrapper.rs` (8 tests):
+9. `loader_wrapper_passes_through_load_when_no_registry_match` (spec test 4)
+10. `loader_wrapper_calls_bind_after_successful_load` (spec test 5 — Hypothesis-2 falsifier)
+11. `loader_wrapper_does_not_bind_on_load_failure` (spec test 6)
+12. `loader_wrapper_drive_unbind_calls_registry_unbind` (spec test 7)
+13. `loader_wrapper_clear_pending_bind_drops_slot`
+14. `loader_wrapper_contract_violation_surfaces_error`
+15. `cmd_serve_constructs_spiller_when_flag_on_smoke` (spec test 11 — bonus integration smoke)
+16. `loader_wrapper_set_pending_bind_overwrites_prior`
+
+`spiller.rs` + `families/gemma4_dense.rs` (4 tests):
+17. `engine_bindable_stub_spill_noop_does_not_panic` (spec test 8)
+18. `engine_bindable_gemma4_dense_round_trip_set_then_clear` (spec test 9)
+19. `engine_bindable_gemma4_dense_downcast_wrong_type_returns_silently` (spec test 10)
+20. `engine_bindable_gemma4_dense_silently_ignores_non_handle_arc`
+
+**C.1 discipline notes:**
+
+- Production code in `src/serve/kv_persist/{registry,loader_wrapper,mod,spiller,families/gemma4_dense}.rs` (registry + loader_wrapper NEW; mod / spiller / families/gemma4_dense ADDITIVE edits) + `src/cli.rs` (additive field) + `src/serve/mod.rs::cmd_serve` (additive flag-on block).
+- Zero edits to `src/serve/multi_model.rs` (KvSpiller / HotSwapManager / ModelLoader trait surfaces stable per A.3).
+- Zero edits to `src/serve/forward_mlx.rs` or `src/serve/forward_prefill.rs` (perf-sensitive; C.1 reads-only).
+- Zero edits to `src/serve/api/*` (parallel ADR-005 Phase 4 fence).
+- Zero edits to `src/inference/models/qwen35/*` (parallel ADR-005 Phase 4 fence).
+- Zero edits to `mlx-native/`, `gpu_delta_net.rs`, `forward_gpu.rs`, `gpu_full_attn.rs` (ADR-015 fence).
+- Real I/O in `cmd_serve` flag-on path (`recover_from_disk` actually walks the cache_dir and rebuilds the BlockIndex; `DiskBlockStore::new_with_index` actually opens the directory; `AsyncWriterHandle::spawn` actually runs the writer thread).
+- "man-day" used; "person-day" does not appear (regression-checked via `grep -rn 'person-day' src/serve/kv_persist/ src/serve/mod.rs src/cli.rs`).
+- No `// TODO` / `todo!()` / `unimplemented!()` / `panic!()` markers in production code.
+- `Arc::downcast` failure in `Gemma4DenseSpill::bind_engine` returns silently (no panic) — locked in by `engine_bindable_gemma4_dense_downcast_wrong_type_returns_silently`.
+- Worktree discipline: ABSOLUTE PATHS in shell; no `cd /opt/hf2q` corruption (per `feedback_agent_worktree_cwd_trap`).
+
+**Cumulative ADR-017 LOC:** A complete (5,066 LOC) + B-dense.1 (1,829 LOC) + C.1 (1,587 LOC) = **8,482 LOC** of in-tree substrate + per-family hook + CLI substrate. **94 in-binary unit tests + 1 kill-9 integration test + 36 harness tests, all PASS.** Phase B-dense.2 (real `Gemma4DenseSpill` registration on operator-loaded GGUF + parity matrix) is now the gating item between this code and operator-facing `cmd_serve --kv-persist=PATH` with semantically active KV persistence.
+
+---
+
 ## Open Questions
 
 These are NOT stubs (per mantra). Each has a target-iter where the question is resolved by measurement or by code-truth audit:
