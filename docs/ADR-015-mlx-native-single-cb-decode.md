@@ -7,6 +7,83 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
+## ▶ Resume Here — current state of truth (2026-05-01 ~03:00Z, paused)
+
+**Decode side: SHIPPED (D4 ≥1.00× across 4 production fixtures).**
+
+| Fixture | Decode ratio | iter | Commit |
+|---|---|---|---|
+| apex 35B-A3B-MoE Q5_K | 1.085× | iter56 | `5ed7a7c` (hf2q) + `641ab78` (mlx-native) |
+| 27B-Dense Q4_0 (dwq46) | 1.075× | iter56 | same |
+| gemma 26B dwq | 1.017× | iter51 | (older) |
+| 35B-A3B-MoE q4_0-flat | 1.046× | iter56 | same |
+
+**Prefill side: OPEN. Cold-clean baseline 0.319× on apex q4_0-flat (3.13× slower than llama, not 4.47×; prior 0.22× was CPU-contaminated).**
+
+**Bench infrastructure: NOW SOLID (5 broken-window fixes shipped today).**
+
+### What's DONE today (commits, all pushed)
+
+1. **iter56-58 work** (decode fixes + earlier perf attempts): commits `c2d7ac3`, `7b993a5`, `02be0ce`, `b6f416b`, `fd7bc5b`.
+2. **iter58b-fix** (parallel session): residency-set-hint mid-flight regression caught + fixed at commits `2565eab` + `9f8b21c`.
+3. **iter59 paper analysis** (`ef43a7b`): kernel-fusion candidate inventory.
+4. **iter60a research + falsification** (`cfdea4a`, `8a89f97`, `1c7d4f0`): non-tensor matmul vector-store fix landed but doesn't fire on M5 Max (production path is the tensor variant which already has it).
+5. **iter61a defensive zero-init** — closed B-W-1 buffer-init source:
+   - mlx-native `MlxDevice::alloc_buffer` zero-init: `3f21443`
+   - hf2q `HybridKvCache::reset_all_buffers`: `e613722`
+   - Doc: `6bce4e2`
+6. **iter61a-2 kernel-level non-det fix** — single missing `enc.memory_barrier()` between Op 6 (`apply_sigmoid_gate_multiply`) and Op 7 (`apply_linear_projection_f32_pooled`) in PREFILL `build_gated_attn_layer` at `src/inference/models/qwen35/gpu_full_attn.rs:1693`. Same RAW-edge bug class as iter21's decode-side fix (commit `c46207d`) that was missed for the prefill path. Commits: `aa5b410` (mlx-native pool zero-init + serial-dispatch probe), `c8809fc` (hf2q barrier line — merged via parallel session as iter61a-4). Empirical receipts: 27B-dwq46 hash `df65818a4b4cc4ab72eec7ae23c86b72` 10/10 byte-identical; apex q4_0-flat hash `12058ce6bec73ca139c76760a32c9f04` 10/10 byte-identical. **Magnitude argument decisive:** observed max-abs logit delta 5.06 was 4 orders of magnitude above any ULP-noise floor; ruled out all 5 sophisticated hypotheses (Tensor Cores, simdgroup_sum, MoE topk, argmax tie-breaking, template).
+7. **iter61b cant_reproduce** (`e20b269`) — GPU `CommandBufferError` was downstream of B-W-1 garbage reads; iter61a's fixes retroactively closed it. Pp512→pp32768 + concurrent contention all clean.
+
+### Repo HEADs at pause
+
+- hf2q HEAD: `e8427a3` (most recent, includes iter61a-4 barrier fix in history)
+- mlx-native HEAD: `0050329` (Release 0.6.3 with all iter61a/61a-2 fixes)
+- 264/0/8 qwen35:: tests pass
+- Both repos clean (one stash on hf2q: `iter61c-agent-WIP-reverting-iter56-for-parity-test` from killed agent — DROP if not resuming iter61c manual revert path; the parity-test methodology can be re-run cleanly without the stash)
+
+### What's OPEN — concrete resume points
+
+**iter61c — re-validate iter56/57/58b parity claims against deterministic baseline** (task #39, agent killed mid-flight at pause time).
+- Why: iter56/57/58b all claimed "byte-identical smoke passed" against the now-known-non-deterministic baseline. Those PASSes might have been noise. With determinism guaranteed at HEAD `e8427a3`, re-validate.
+- How: at HEAD, capture reference outputs (16 prompts × 32 tok on q4_0-flat + 200-tok sourdough on apex AND 27B). Then for each iter (56/57/58b) reverse-revert that iter's diff (without touching iter61a-2 barrier fix), build, capture, diff. 
+- Pre-iter SHAs: iter56 hf2q `5ed7a7c` + mlx-native `641ab78`; iter57 hf2q `c2d7ac3`; iter58b hf2q `b6f416b` (later partly-reverted by `2565eab` — current effective change is the surviving cleanup).
+- Outcome decides: parity-clean → proceed to iter60b; some_drift → investigate specific kernel; some_broken → ESCALATE (revert).
+- Stash from agent's WIP: `git stash list | grep iter61c-agent-WIP` — drop with `git stash drop` if not resuming the same path.
+- Spec: see iter61c agent prompt in last session for full methodology.
+
+**iter60b — production-path matmul perf lever** (task #36 closed-falsified, this is the real follow-on).
+- Defer the f32→half cast at `/opt/mlx-native/src/shaders/quantized_matmul_mm_tensor.metal:285-287` (production tensor matmul on M5 Max). Stage B as f32; cast to half only at `mpp::tensor_ops::matmul2d<>` call site. Verify tensor cores still engage.
+- Estimated **+2-5pp prefill** at apex q4_0-flat. Combined with iter60c (function-constant bounds-check gating), **+2.5-6pp** total → cold 0.319× → **0.34-0.38×**.
+- Hard parity gates per iter61c lessons: 10/10 byte-identical determinism (now achievable), sourdough on both apex + 27B, decode no-regression on 4 fixtures.
+- File: `/opt/mlx-native/src/shaders/quantized_matmul_mm_tensor.metal:171-350` (kernel body) + `285-287` (cast site).
+
+**iter60c — function-constant bounds-check gating** (smaller).
+- Mirror llama.cpp's `FC_mul_mm_bc_inp` + `FC_mul_mm_bc_out` pattern in mlx-native tensor matmul. Estimated +0.5-1pp.
+- File: `/opt/mlx-native/src/shaders/quantized_matmul_mm.metal:24` ("we always enable bounds-checked" comment) + tensor variant.
+
+**iter62 — Q4_K MoE matmul-id support** (separate broken window, blocks apex-dwq46/dwq48 fixtures).
+- Add `kernel_mul_mm_id_q4_K_f32` (+ tensor variant) to mlx-native shaders mirroring llama.cpp's `kernel_mul_mm_id_q4_K_f32`. Extend hf2q `Qwen35Model::load_from_gguf` MoE-Q loader whitelist (currently rejects Q4_K).
+- Affected fixtures: apex-dwq46, apex-dwq48 (both fail to load currently).
+- Workaround until then: use apex-q4_0-flat for MoE prefill bench (which is the cold-clean 0.319× fixture anyway).
+
+**iter61a kernel-level work (closed but for reference):**
+- Buffer-pool zero-init in mlx-native `src/buffer_pool.rs` already shipped at `aa5b410`.
+- Serial-dispatch probe env: `HF2Q_FORCE_SERIAL_DISPATCH=1` flips `MTLDispatchType::Concurrent → Serial` (used as bisection tool — not for production).
+
+### Loop exit criterion (unchanged)
+
+Prefill D4 ≥1.00× across the same 4-cell standing matrix that decode satisfies. Currently 0.319× cold-clean. Decode side: MET. Prefill side: requires structural matmul work (iter60b/c estimated +2.5-6pp; residual gap to ≥1.00× then needs further levers from iter59 paper analysis: rope+qkv fusion, MoE expert sortby/scatter, multi-token NSG kernel, etc.).
+
+### Resume protocol
+
+1. `cd /opt/hf2q && git pull && git status` — confirm clean
+2. `cd /opt/mlx-native && git pull && git status` — confirm clean  
+3. `cargo test --release --bin hf2q qwen35::` — confirm 264/0/8 (or higher; parallel sessions add tests)
+4. Read this section + the most-recent changelog entries below
+5. Pick next iter: **iter61c** (highest priority — confirms which prior parity claims are real before any further perf iter), then iter60b, then iter60c, then iter62.
+6. If user wants to skip iter61c re-validation and trust prior claims: jump straight to iter60b.
+
 ## Context
 
 ADR-012 closed the qwen35moe **conversion** scope at 0.94× of llama.cpp on
