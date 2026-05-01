@@ -1075,7 +1075,15 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 **H4 falsification artifact (`tests/test_q4_k_h4_real_block_parity.rs` on `cfa/adr013-q4k-h4-diagnose`).** While diagnosing the gibberish, wrote a parity test embedding a real 144-byte Q4_K block from `blk.0.ffn_gate_exps.weight` expert 0 of the dwq48 GGUF, decoded it via BOTH the test-file's `cpu_dequant_q4k_block` (Claude's oracle for the 12 unit tests) AND the canonical `dequantize_q4_k` from `src/gguf/mod.rs:582`. Result: 0 indices differ, max_err = 0.0 — the synthetic encoder/decoder pair is bit-exactly canonical-compatible, the unit tests were not decorative. This pre-empted a deep kernel-bug rabbit-hole and surfaced the tokenizer as the actual cause.
 
-**Bench vs llama.cpp.** TBD this date — see follow-up entry.
+**Bench vs llama.cpp (same M5 Max, same dwq48 GGUF, prompt "How to make bread?", temp=0.0, seed=42, 200 tokens).**
+
+| | hf2q (this work) | llama.cpp `b8680-15f786e65` | hf2q ratio |
+|---|---|---|---|
+| Prefill | 9 t/s (200-tok run) / 14 t/s (50-tok smoke) | 514.3 t/s | **0.02–0.03×** |
+| Decode  | 105 t/s (200-tok) / 118 t/s (50-tok) | 173.6 t/s | **0.60–0.68×** |
+| Peak mem | 21.1 GB | not measured here | n/a |
+
+Coherence is the ship gate and is now MET for Q4_K dwq48. Perf gap — particularly the ~30–50× prefill gap — is real and material to ADR-013 §18 "match-or-beat" but is **out of scope for this Q4_K-extension entry**, which is a kernel-port + load-path unblock, not a perf optimization. Follow-up work (tracked as ADR-013 P16 candidate): root-cause the Q4_K prefill gap. Current dispatch excludes Q4_K from `mm_id` (forces decode-shaped `mv_id` even on prefill batches > 8 tokens — see `src/ops/quantized_matmul_id_ggml.rs` Q4_K-exclusion comments); porting an `mm_id` Q4_K variant should close most of it. Reference: llama.cpp `kernel_mul_mm_id_q4_K_f32` at `ggml-metal.metal:10169`. Per `feedback_verify_baseline_determinism_before_perf_bench.md`: coherence first, perf only on coherent baseline. The decode 0.6× ratio is in the same neighbourhood llama.cpp lives at on this hardware (per `project_decode_parity_achieved.md` for Q4_0); Q4_K prefill is the actionable gap.
 
 ### 2026-04-30 — chat-template contamination of sourdough gate closed by ADR-012 auto-inject
 
