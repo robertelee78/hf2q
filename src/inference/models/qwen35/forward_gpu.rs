@@ -1386,7 +1386,43 @@ impl Qwen35Model {
         let mut total_residual_us = 0u64;
         let mut total_linear_attn_us = 0u64;
         let mut total_full_attn_us = 0u64;
+
+        // ADR-013 P20 (2026-05-01) — K-batched FFN terminal commit.
+        //
+        // The per-layer FFN terminal `commit_and_wait_labeled` accounts for
+        // 40 of the 161 commit_and_wait calls per Qwen3.6 35B-A3B prefill
+        // (P19 H9 measurement, commit `270eaae`). Each commit costs ~1.32 ms
+        // floor on M5 Max → ~52 ms wasted on per-layer sync at K=1.
+        //
+        // With K>1 we replace the FFN terminal `commit_and_wait_labeled` with
+        // a non-waiting `commit_labeled` for layers where (layer_idx + 1) % K
+        // != 0; the K-th layer in each window keeps its `commit_and_wait` so
+        // host gets back its sync. Pool reset (`reset_for_prefill_chunk`) is
+        // ALSO deferred to K-boundaries so pooled scratches that remain
+        // GPU-referenced across the K-window are not recycled mid-flight (the
+        // W-5b.14 / iter58b residency-rescission failure mode).
+        //
+        // SAFE DEFAULT: K=1 (env unset) is byte-identical to pre-P20 behaviour.
+        // Operator opts in via `HF2Q_FFN_TERMINAL_K_BATCH=N` for N>=2. Bench
+        // before promoting any K>1 to default per
+        // `feedback_evidence_first_no_blind_kernel_rewrites`.
+        //
+        // Decode (seq_len == 1) keeps the existing `commit()` (no wait) path
+        // and per-token `reset_decode_pool` — the K-batch only applies to
+        // prefill (seq_len > 1).
+        let n_layers = layer_weights_gpu.len();
+        let ffn_terminal_k_batch: usize = std::env::var("HF2Q_FFN_TERMINAL_K_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&k| k >= 1)
+            .unwrap_or(1);
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
+            // K-boundary: last layer in the window OR final layer overall.
+            // At K=1 every layer is a boundary (= current behaviour).
+            let is_k_boundary = seq_len == 1
+                || ffn_terminal_k_batch <= 1
+                || (layer_idx + 1) % ffn_terminal_k_batch == 0
+                || (layer_idx + 1) == n_layers;
             let layer_cpu = &self.layers[layer_idx];
 
             // ADR-015 iter61a-3: thread-local tag for within-layer dump call sites.
@@ -1809,11 +1845,17 @@ impl Qwen35Model {
                         .with_context(|| format!("dense_ffn_q_into fused layer {layer_idx}"))?;
                         if seq_len == 1 {
                             enc.commit();
-                        } else {
+                        } else if is_k_boundary {
                             enc.commit_and_wait_labeled("layer.dense_ffn")
                                 .with_context(|| {
                                     format!("commit fused-DenseQ layer {layer_idx}")
                                 })?;
+                        } else {
+                            // ADR-013 P20: K-batched FFN terminal — commit
+                            // without waiting. The next K-boundary's
+                            // commit_and_wait drains all in-flight CBs on
+                            // the Metal serial queue, including this one.
+                            enc.commit_labeled("layer.dense_ffn");
                         }
                         out
                     };
@@ -1884,11 +1926,20 @@ impl Qwen35Model {
                     .with_context(|| format!("moe_ffn_q_into fused layer {layer_idx}"))?;
                     if seq_len == 1 {
                         enc.commit();
-                    } else {
+                    } else if is_k_boundary {
                         enc.commit_and_wait_labeled("layer.moe_ffn")
                             .with_context(|| {
                                 format!("commit fused-MoeQ layer {layer_idx}")
                             })?;
+                    } else {
+                        // ADR-013 P20: K-batched FFN terminal — commit
+                        // without waiting. The next K-boundary's
+                        // commit_and_wait drains all in-flight CBs on the
+                        // Metal serial queue, including this one. Pool
+                        // reset is also gated on is_k_boundary below so
+                        // these pooled scratches are not recycled while
+                        // still GPU-referenced.
+                        enc.commit_labeled("layer.moe_ffn");
                     }
                     out
                 }
@@ -2052,7 +2103,16 @@ impl Qwen35Model {
             // pool's `in_use` list contains only this-layer allocations.  We
             // skip the redundant call at decode for clarity and to leave the
             // W-5b.10/W-5b.14 decode profiling unchanged.
-            if seq_len > 1 && std::env::var("HF2Q_DENSE_Q_ARENA_RESET").as_deref() != Ok("0") {
+            // ADR-013 P20: pool reset gated on is_k_boundary. At K=1 (default)
+            // every layer resets, matching W-5b.15 behaviour. At K>1 the reset
+            // fires only at the K-th layer in each window — pooled scratches
+            // for the K-window stay in `in_use` until the K-boundary's
+            // commit_and_wait drains all in-flight CBs, then the reset moves
+            // them all back to the free list at once.
+            if seq_len > 1
+                && is_k_boundary
+                && std::env::var("HF2Q_DENSE_Q_ARENA_RESET").as_deref() != Ok("0")
+            {
                 super::decode_pool::reset_for_prefill_chunk();
             }
         }

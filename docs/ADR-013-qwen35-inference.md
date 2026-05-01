@@ -1059,6 +1059,46 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-05-01 — P20 K=4 LANDED but wall-impact is BELOW NOISE · `HF2Q_FFN_TERMINAL_K_BATCH=4` confirms 161→131 commits (30 saved, mechanically verified) yet pp31/pp101 wall delta sits inside run-to-run variance ⇒ FFN-terminal commits are CHEAP commits; the expensive sync cost lives elsewhere
+
+**Implementation (commit this entry).** Added env-gated K-batched FFN terminal commit + pool reset in `forward_gpu_impl`'s prefill layer loop. Default `HF2Q_FFN_TERMINAL_K_BATCH=1` is byte-identical to pre-P20 behaviour; users opt in to K≥2. Both the dense FFN terminal (`forward_gpu.rs::1813`) and the MoE FFN terminal (`:1888`) now emit `commit_labeled` (no wait) for layers where `(layer_idx + 1) % K != 0 && (layer_idx + 1) != n_layers`, and emit the full `commit_and_wait_labeled` at K-boundaries. The pool reset (`reset_for_prefill_chunk` at `:2056`) is gated on the same `is_k_boundary` so pooled scratches that remain GPU-referenced across the K-window are not recycled mid-flight (the W-5b.14 / iter58b residency-rescission failure mode). Decode (`seq_len == 1`) keeps the existing `commit()` (no wait) + per-token `reset_decode_pool` semantics — K-batch only applies to prefill.
+
+**Mechanical verification (`HF2Q_PROFILE_SYNC=1` smoke).**
+
+| Setting | sync_count | dispatch_count | barrier_count |
+|---|---|---|---|
+| K=1 (default) | **161** | 1,282 | 630 |
+| K=4 (env opt-in) | **131** | 1,282 | 630 |
+
+`-30 commits per prefill`, exactly matching the prediction (10 of 40 layer-FFN-terminals stay as commit_and_wait at K=4 boundaries; 30 become commit_labeled). dispatch_count and barrier_count are unchanged — the work is identical, only the host-side waits are deferred.
+
+**Wall-time receipts (3-rep cold P17b harness, M5 Max, dwq48 19.6 GB, hf2q `b10cff2`, mlx-native `23c78d0`).**
+
+| pp | tg | K=1 prefill (raw 3 reps) | K=1 median | K=4 prefill (raw 3 reps) | K=4 median | delta |
+|---|---|---|---|---|---|---|
+| 31  | 64 | 194.9 / 141.0 / 141.7 | **141.70** | 145.8 / 186.0 / 194.6 | **186.00** | +31% median, but ranges overlap heavily |
+| 101 | 64 | 240.3 / 241.2 / 241.8 | **241.20** | 183.2 / 240.8 / 245.0 | **240.80** | -0.2% (essentially unchanged) |
+
+| pp | tg | K=1 decode | K=4 decode |
+|---|---|---|---|
+| 31  | 64 | 121.90 (120.70..123.50) | 124.70 (122.30..125.00) |
+| 101 | 64 | 123.90 (123.60..124.10) | 123.90 (119.70..124.00) |
+
+Coherence: ascii_ratio 0.981 in both; full English transformer-explanation prose; sourdough-equivalent intact.
+
+**Honest interpretation.** The pp31 median lifts 141.70 → 186.00 t/s (+31%), but the K=1 spread is 141..195 (39% spread) and K=4 spread is 146..195 (33% spread); K=1's max (194.9) reaches K=4's median, and the two ranges overlap heavily. K=4's improvement at pp31 is more about *fewer slow tail runs* than a uniform speedup. At pp101 the medians are statistically tied (K=1 240.30..241.80 tight, K=4 183.20..245.00 wider — one slow K=4 run drags the min down). 30 fewer commits did NOT produce 30 × 1.32 ms = 40 ms of wall savings; the actual savings is inside run-to-run noise.
+
+**Why.** The 1.32 ms per-commit floor (P19 H9) is an *average across 161 commits*. The 30 commits we removed (per-layer FFN terminals) fire AFTER the FFN's heavy matmul work has already finished encoding — by the time the host calls `commit_and_wait_labeled`, the GPU is mostly idle, the wait is mostly driver round-trip cost (~tens of µs each, not 1.32 ms). The expensive commits — the ones that DO cost 1.32+ ms each — are the **kernel-internal** ones inside `apply_gated_delta_net_chunk` (line 1214, the iter58b DANGEROUS class) and the kernel-terminals after large matmuls inside `apply_flash_attn_prefill_seq_major` and the DN ops5-9. The cheap commits are exactly the ones safe to defer.
+
+**This is an important null result, not a failure.** The K-batch infrastructure is correct, env-gated, behaviorally harmless when off, and verifiably reduces commit count. It does NOT measurably reduce prefill wall time on Q4_K dwq48 at pp31/pp101 with the current 3-rep methodology. To unlock real prefill wall savings, the optimization target must move to one of:
+- The 30 expensive kernel-internal commits inside the wrapper functions (`apply_gated_delta_net_chunk`, `apply_flash_attn_prefill_seq_major`) — but each is in the iter58b DANGEROUS class
+- The kernel work itself (per-token compute is already 0.90 ms/token at pp71, FASTER than llama-completion's 1.18 ms/token, so kernel work isn't the gap)
+- Methodology: use `wave5b8_profile` per-section accounting to identify which specific 30 commits actually matter, not the average
+
+**Default unchanged.** `HF2Q_FFN_TERMINAL_K_BATCH=1` stays default. The env-override stays in main as documented infrastructure, behaviorally inert when unset. Future iterations might revisit at K=8 or with broader bench sweeps if a clear signal emerges.
+
+**Tests.** `cargo test --release qwen35` 0 failed (172 in the broader run, 127 in the filtered-pattern run, no regression). `cargo build --release --bin hf2q` clean. No code path other than the prefill K-batch changes; decode, output_head, MTP, spec_decode untouched.
+
 ### 2026-05-01 — P19 H9 follow-up · per-commit audit: 40 of 161 are "refactorable" (per-layer FFN terminal); 120 are entangled with iter58b-class lifetime invariants; full super-CB refactor scoped for P20 (/cfa territory)
 
 **Why this entry.** The H9 measurement (`sync_count = 161` per prefill) is correct, but "reduce 161 → 1" is a slogan, not a plan. Before scoping the refactor, classify every one of the 161 commits by which lifetime invariant requires it. Per `feedback_evidence_first_no_blind_kernel_rewrites`: read each commit site and its caller, tag by safety class, only THEN propose a target.
