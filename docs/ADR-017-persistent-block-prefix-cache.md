@@ -2528,6 +2528,102 @@ in-tree substrate + audit + operator docs + landed fixes + bench
 receipts + cross-ADR triangulation. /metrics counter wiring
 agent in flight; result lands in iter-6 finale.
 
+#### R-F7 LANDED — 4 unwired /metrics counters (commit `ba28b4c` on origin/main)
+
+Worktree agent `a9c4387e047d5b79c` (commit `f1a299a` →
+cherry-picked → `ba28b4c`) — single async background agent
+ran for ~21 minutes. cargo check 0 in 5.10s; **133/133
+in-binary kv_persist tests PASS** (up from 128 pre-iter-6;
++5 new R-F7 tests).
+
+| Counter | Type | Bump site | Label semantics |
+|---|---|---|---|
+| `hf2q_kv_quarantined_total{reason}` | counter | `recovery::scan_one` (TruncatedHeader / VersionMismatch) + `recovery::quarantine_corrupted_block_with_counters` (BodyHashMismatch / ParityFail) | reason ∈ {trunc, verbump, bodyhash, parity} |
+| `hf2q_kv_cache_bytes_on_disk` | gauge | scrape-time read of `BlockIndex.total_bytes_on_disk()` via `AppState.kv_disk_store` | 0 when `--kv-persist` not supplied |
+| `hf2q_kv_cache_blocks_total` | gauge | scrape-time read of `BlockIndex.block_count()` (same source) | 0 when `--kv-persist` not supplied |
+| `hf2q_kv_cache_evictions_total{trigger}` | counter | `DiskBlockStore::evict_lru_until_under_budget` (per evicted block; pinned + racing-removed blocks do NOT bump) | trigger ∈ {budget_overflow} |
+
+**Architecture: `kv_persist::metrics` seam**
+
+New `kv_persist::metrics` module + trait `KvCacheMetricsSink` +
+label constants. Decouples bump sites from `api::state` so the
+narrow lib facade (`src/lib.rs`) compiles without pulling in
+`serve::api` (significant for downstream consumers building
+against the kv_persist crate alone). `KvSpillCounters` impls the
+trait; `cmd_serve` upcasts to
+`Arc<dyn KvCacheMetricsSink>` once at startup.
+
+This pattern (metrics-sink trait at module boundary; concrete
+impl supplied by upper layer at startup) is reusable for any
+future kv_persist consumer who wants Prometheus telemetry without
+the full `serve::api` dependency tree.
+
+**Surface delta**: `+867 / -7` across 8 files:
+- NEW `src/serve/kv_persist/metrics.rs` (~150 LOC: trait + label
+  constants + tests)
+- `src/serve/kv_persist/recovery.rs`: counters bumped at quarantine
+  sites (TruncatedHeader / VersionMismatch path) + new helper
+  `quarantine_corrupted_block_with_counters` for body-hash /
+  parity sites
+- `src/serve/kv_persist/block_store.rs`: counter bump in
+  `evict_lru_until_under_budget` per-evicted-block
+- `src/serve/api/state.rs` + `src/serve/api/handlers.rs`: gauge
+  scrape-time read wiring
+- `src/serve/mod.rs`: `Arc<dyn KvCacheMetricsSink>` upcast at
+  startup (cmd_serve flag-on block)
+- `src/lib.rs`: re-exports for the kv_persist trait
+- `src/serve/kv_persist/mod.rs`: module registration
+
+**Worktree-cwd-trap recovery (3rd consecutive agent)**: agent
+detected mid-session via `git status` showing "nothing to commit"
+while local edits seemed in place. Captured diff to
+`/tmp/adr017_rf7_metrics.patch`, reverted dirty files in
+`/opt/hf2q`, re-applied patch in worktree. All later edits
+verified with absolute worktree paths. Main repo CLEAN at end.
+
+This is the THIRD consecutive worktree-isolated agent to trip the
+trap. Standing memory `feedback_agent_worktree_cwd_trap` is
+under-effective at preventing the trip; agents successfully
+recover post-trip but the cycle wastes ~2-5 min per agent.
+Recommendation: future agent prompts should include a stricter
+write-routing discipline (e.g., "verify worktree path with `pwd`
+before the FIRST write; if the absolute path you're about to
+write to doesn't start with your worktree root, ABORT") OR
+the harness layer could enforce write-paths against the worktree
+boundary.
+
+#### Iter-6 verification gates
+
+| Gate | Result |
+|---|---|
+| `cargo check --release --bin hf2q` (post R-F7 cherry-pick) | exit 0 in 5.10s |
+| `cargo test --release --bin hf2q kv_persist -- --test-threads=1` | **133 passed; 0 failed** in 2.26s (was 128 pre-iter-6; +5 R-F7 tests) |
+| Push to origin/main | fast-forward `c8dc50f..ba28b4c` |
+| Phase D R-C4 internal | PASS (3632 bytes byte-identical, 624× cache-hit) |
+| Phase D R-C4 peer | FAIL — but ownership reassigned to ADR-005 chat-template via triangulation |
+
+#### Cumulative ADR-017 LOC after iter-6 finale
+
+~17,714 + 867 (R-F7) + ~150 (this finale subsection) =
+**~18,731 LOC** in-tree substrate + audit + operator docs +
+landed fixes + bench receipts + cross-ADR triangulation +
+metrics wiring.
+
+#### Remaining ADR-017 work after iter-6
+
+- **F4 namespace fingerprint thread-through** (still ADR-005
+  iter-211 blocked).
+- **`HF2Q_KV_PERSIST=0` mid-flight disable** (operator-runbook §10).
+- **Phase D peer arm vs llama-completion** — bench surfaces real
+  drift; ownership reassigned to ADR-005 chat-template (not
+  ADR-017). Re-bench once ADR-005 closes the API-vs-CLI render
+  divergence.
+- **Full matrix sweep** — 36 production-quant cells × 3 scenarios
+  × 4 prefix lengths. Operator-controlled bench under clean SoC.
+- **Phase B-hybrid** (Qwen3.5-MoE) — pending ADR-013 unblock.
+- **K2 dirty-block decode overhead** measurement under
+  sustained-decode load.
+
 ---
 
 ## Open Questions
