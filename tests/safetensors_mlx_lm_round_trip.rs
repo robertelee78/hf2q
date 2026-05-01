@@ -126,23 +126,37 @@ fn build_synthetic_safetensors_bytes() -> Vec<u8> {
 /// Run `hf2q convert --format safetensors --quant <variant>` and
 /// return the resolved output directory.
 fn run_convert(input_dir: &Path, output_dir: &Path, quant: &str) {
-    Command::cargo_bin("hf2q")
-        .expect("hf2q binary")
-        .args([
-            "convert",
-            "--input",
-            input_dir.to_str().unwrap(),
-            "--format",
-            "safetensors",
-            "--quant",
-            quant,
-            "--output",
-            output_dir.to_str().unwrap(),
-            "--skip-quality",
-            "-vv",
-        ])
-        .assert()
-        .success();
+    run_convert_with_env(input_dir, output_dir, quant, &[]);
+}
+
+/// Like [`run_convert`] but with extra `(KEY, VALUE)` env vars set on
+/// the child process. Used by tests that need to opt into a non-default
+/// emit path (e.g. `HF2Q_USE_LEGACY_DWQ_Q4_0=1` for the mlx-lm DWQ
+/// schema, which only the legacy `MixedBitQuantizer` path produces).
+fn run_convert_with_env(
+    input_dir: &Path,
+    output_dir: &Path,
+    quant: &str,
+    env: &[(&str, &str)],
+) {
+    let mut cmd = Command::cargo_bin("hf2q").expect("hf2q binary");
+    cmd.args([
+        "convert",
+        "--input",
+        input_dir.to_str().unwrap(),
+        "--format",
+        "safetensors",
+        "--quant",
+        quant,
+        "--output",
+        output_dir.to_str().unwrap(),
+        "--skip-quality",
+        "-vv",
+    ]);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.assert().success();
 }
 
 /// Parse a safetensors file's header (size + JSON), returning the
@@ -224,6 +238,14 @@ fn safetensors_directory_emit_f16() {
 ///     block + mirrored `quantization_config`)
 ///   - per-tensor `<name>.weight` + `<name>.scales` + `<name>.biases`
 ///     triples in the safetensors header.
+///
+/// The mlx-lm `<name>.scales`/`.biases` companion schema is produced by
+/// the legacy `MixedBitQuantizer` (Q4_0-family) DWQ byte-emit path. The
+/// default DWQ path switched to `DwqKQuantizer` (K-quant family) in
+/// ADR-014 P11-prereq Iter C, which packs scales inline and emits no
+/// companion tensors. To validate the mlx-lm-compatible safetensors
+/// schema this test asserts, run convert under
+/// `HF2Q_USE_LEGACY_DWQ_Q4_0=1` so the legacy DWQ emit path is taken.
 #[test]
 fn safetensors_directory_emit_dwq46() {
     let tmp = tempfile::tempdir().unwrap();
@@ -231,7 +253,12 @@ fn safetensors_directory_emit_dwq46() {
     let output_dir = tmp.path().join("out_dwq46");
     build_synthetic_gemma4_fixture(&input_dir);
 
-    run_convert(&input_dir, &output_dir, "dwq-4-6");
+    run_convert_with_env(
+        &input_dir,
+        &output_dir,
+        "dwq-4-6",
+        &[("HF2Q_USE_LEGACY_DWQ_Q4_0", "1")],
+    );
 
     // Single-shard `model.safetensors` (fixture is well under 5 GB).
     let st_path = output_dir.join("model.safetensors");
