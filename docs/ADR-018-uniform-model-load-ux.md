@@ -1,6 +1,6 @@
 # ADR-018: Uniform Model-Load UX Across Families
 
-- **Status:** **Accepted** (C1 implemented 2026-05-01).
+- **Status:** **Accepted** (C1-C2 implemented 2026-05-01).
 - **Supersedes:** none.
 - **Related:**
   - **ADR-005** (Phase 1b: SERVE-mode load + iter-215 `LoadedModel` family-split that surfaced the divergence this ADR closes).
@@ -64,7 +64,7 @@ The trait choice (one new trait, narrowly scoped) is per design doc §5.2: per-v
 | Commit | Status | Hash | Notes |
 | --- | --- | --- | --- |
 | **C1** — module + helpers + ADR | **Implemented 2026-05-01** | `<commit-sha-pending>` | Zero behaviour delta. Helpers tested via 6 synthetic-GGUF tests. Both legacy `infer_quant_type_from_gguf` bodies deleted. |
-| C2 — `LoadInfoBuilder` + `print_banner` + `emit_tracing` | not started | — | Library only, not invoked. |
+| C2 — `LoadInfoBuilder` + `print_banner` + `emit_tracing` | **Implemented 2026-05-01** | `<commit-sha-pending>` | Library only, not invoked. Qwen35 provenance field is populated and `LoadedModel::provenance()` reads it. |
 | C3 — CLI generate switches to `print_banner` | not started | — | First user-visible delta. |
 | C4 — SERVE-mode banner + `Engine::info()` | not started | — | TTY-gated; redirected stdout sees only tracing + bind line. |
 | C5 (optional) — `/v1/models` consumes `LoadInfo` | not started | — | Retires legacy `print_header_top`. |

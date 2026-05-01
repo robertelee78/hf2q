@@ -33,6 +33,7 @@
 //!   returns `None` for the Qwen35 variant; that path needs review when
 //!   live inference lands).
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -40,6 +41,11 @@ use tokenizers::Tokenizer;
 
 use crate::inference::models::qwen35::kv_cache::HybridKvCacheSnapshot;
 use crate::inference::models::qwen35::model::Qwen35Model;
+use crate::serve::load_info::{
+    self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, MoeShape,
+    TokenizerSource,
+};
+use crate::serve::provenance::{self, Provenance};
 
 use super::engine::{LoadOptions, SamplingParams};
 
@@ -65,6 +71,8 @@ pub struct Qwen35LoadedModel {
     /// Surfaced via `/v1/models[*].id` and `Engine::model_id()`.
     /// Derived from `general.name` if present, else file stem.
     pub model_id: String,
+    /// Filesystem path to the GGUF opened by this loaded model.
+    pub model_path: PathBuf,
     /// EOS tokens — Qwen3.5/3.6 typically uses 151645 (`<|im_end|>`).
     /// Resolved from `tokenizer.ggml.eos_token_id` metadata; default is
     /// the HF Qwen3.5 default (151645) per `cmd_generate_qwen35`.
@@ -80,6 +88,11 @@ pub struct Qwen35LoadedModel {
     pub quant_type: Option<String>,
     /// Wall-clock from start to finish of `load`.
     pub load_duration: Duration,
+    /// ADR-017 §F4 — GGUF provenance captured at load time via
+    /// `crate::serve::provenance::detect(&gguf)`. Stored for the common
+    /// `LoadedModel::provenance()` surface; Qwen35 KV-spill remains
+    /// descriptor-pending because the cache is hybrid.
+    pub provenance: Provenance,
     /// Single-slot prompt cache (Wedge-3 / iter-216 Phase C / D).  Stores
     /// the post-prefill `HybridKvCacheSnapshot` + the greedy first
     /// decoded token + a generation-affecting params key, so a subsequent
@@ -118,6 +131,7 @@ impl Qwen35LoadedModel {
         // weights load below.
         let gguf = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
+        let provenance = provenance::detect(&gguf);
 
         tracing::info!(
             "Qwen35 SERVE load: model = {}",
@@ -230,14 +244,68 @@ impl Qwen35LoadedModel {
             tokenizer,
             chat_template,
             model_id,
+            model_path: model_path.clone(),
             eos_token_ids,
             hidden_size,
             vocab_size,
             context_length,
             quant_type,
             load_duration,
+            provenance,
             prompt_cache: HybridPromptCache::new(),
         })
+    }
+}
+
+impl LoadInfoBuilder for Qwen35LoadedModel {
+    fn build_load_info(
+        &self,
+        gguf: &mlx_native::gguf::GgufFile,
+        load_wall_clock: Duration,
+        kv_cache_budget_bytes: Option<u64>,
+        kv_spill_active: bool,
+    ) -> LoadInfo {
+        let cfg = &self.model.cfg;
+        LoadInfo {
+            model_id: self.model_id.clone(),
+            arch_str: load_info::arch_str_from_gguf(gguf),
+            arch_family: ArchFamily::Qwen35,
+            model_path: self.model_path.clone(),
+            on_disk_bytes: load_info::on_disk_bytes(&self.model_path),
+            backend_chip: mlx_native::MlxDevice::new()
+                .map(|d| d.name())
+                .unwrap_or_else(|_| "Apple GPU".to_string()),
+            backend: "mlx-native",
+            n_layers: cfg.num_hidden_layers,
+            hidden_size: self.hidden_size as u32,
+            vocab_size: self.vocab_size as u32,
+            n_attention_heads: cfg.num_attention_heads,
+            n_key_value_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            sliding_window: None,
+            full_attention_interval: Some(cfg.full_attention_interval),
+            max_context_length: self.context_length.map(|v| v as u32),
+            moe: cfg.moe.as_ref().map(|m| MoeShape {
+                n_experts: m.num_experts,
+                n_experts_per_tok: m.num_experts_per_tok,
+            }),
+            quant_label: self.quant_type.clone(),
+            quant_bpw: load_info::compute_bpw(gguf),
+            tokenizer_source: TokenizerSource::GgufEmbedded,
+            eos_token_ids: self.eos_token_ids.clone(),
+            bos_token_id: gguf.metadata_u32("tokenizer.ggml.bos_token_id"),
+            chat_template_source: if gguf.metadata_string("tokenizer.chat_template").is_some() {
+                ChatTemplateSource::GgufEmbedded
+            } else {
+                ChatTemplateSource::None
+            },
+            provenance: self.provenance.clone(),
+            vision_projector: None,
+            load_wall_clock,
+            resident_weight_bytes: None,
+            kv_cache_budget_bytes,
+            kv_spill_active,
+        }
     }
 }
 

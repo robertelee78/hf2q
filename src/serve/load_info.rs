@@ -32,10 +32,13 @@
 //! fields, the SERVE-mode banner, and `/v1/models` without leaking model
 //! lifetimes into request handlers.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::serve::provenance::Provenance;
+
+const DIM: &str = "\x1b[2m";
+const RESET: &str = "\x1b[0m";
 
 // ---------------------------------------------------------------------------
 // Origin enums — uniform across arches
@@ -279,6 +282,281 @@ pub struct LoadInfo {
     pub kv_spill_active: bool,
 }
 
+/// Implemented by each loaded-model variant to produce the shared load
+/// snapshot from owned model state plus the still-open GGUF metadata.
+pub trait LoadInfoBuilder {
+    fn build_load_info(
+        &self,
+        gguf: &mlx_native::gguf::GgufFile,
+        load_wall_clock: std::time::Duration,
+        kv_cache_budget_bytes: Option<u64>,
+        kv_spill_active: bool,
+    ) -> LoadInfo;
+}
+
+pub(crate) fn model_id_from_gguf(gguf: &mlx_native::gguf::GgufFile, model_path: &Path) -> String {
+    gguf.metadata_string("general.name")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            model_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unknown".to_string())
+        })
+}
+
+pub(crate) fn arch_str_from_gguf(gguf: &mlx_native::gguf::GgufFile) -> String {
+    gguf.metadata_string("general.architecture")
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+pub(crate) fn on_disk_bytes(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+pub(crate) fn chat_template_source(
+    gguf: &mlx_native::gguf::GgufFile,
+    fallback_name: Option<&'static str>,
+) -> ChatTemplateSource {
+    if gguf.metadata_string("tokenizer.chat_template").is_some() {
+        ChatTemplateSource::GgufEmbedded
+    } else if let Some(name) = fallback_name {
+        ChatTemplateSource::HardcodedFallback { name }
+    } else {
+        ChatTemplateSource::None
+    }
+}
+
+/// Estimate training-time dense KV token capacity for the banner.  This is
+/// only a display hint; callers still pass the authoritative byte budget.
+fn estimate_kv_tokens(info: &LoadInfo) -> Option<u64> {
+    let budget = info.kv_cache_budget_bytes?;
+    let per_token = u64::from(info.n_layers)
+        .checked_mul(u64::from(info.n_key_value_heads))?
+        .checked_mul(u64::from(info.head_dim))?
+        .checked_mul(4)?;
+    if per_token == 0 {
+        return None;
+    }
+    Some(budget / per_token)
+}
+
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / 1024.0 / 1024.0 / 1024.0
+}
+
+fn fmt_gib(bytes: u64) -> String {
+    format!("{:.2} GiB", gib(bytes))
+}
+
+fn fmt_opt_u32(v: Option<u32>) -> String {
+    v.map(|v| v.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn fmt_opt_bytes(v: Option<u64>) -> String {
+    v.map(fmt_gib).unwrap_or_else(|| "none".to_string())
+}
+
+fn fmt_tokenizer_source(source: &TokenizerSource) -> String {
+    match source {
+        TokenizerSource::HfTokenizerJson { path } => {
+            format!("hf-tokenizer-json ({})", path.display())
+        }
+        TokenizerSource::GgufEmbedded => "gguf-embedded (<= mirrors llama-vocab.cpp)".to_string(),
+    }
+}
+
+fn fmt_chat_template_source(source: &ChatTemplateSource) -> String {
+    match source {
+        ChatTemplateSource::GgufEmbedded => "gguf-embedded".to_string(),
+        ChatTemplateSource::CliOverride => "cli-override".to_string(),
+        ChatTemplateSource::HardcodedFallback { name } => format!("hardcoded-fallback ({name})"),
+        ChatTemplateSource::None => "none".to_string(),
+    }
+}
+
+fn fmt_moe(moe: Option<MoeShape>) -> String {
+    moe.map(|m| format!("{} experts/{} active", m.n_experts, m.n_experts_per_tok))
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn fmt_quant(info: &LoadInfo) -> String {
+    let label = info.quant_label.as_deref().unwrap_or("none");
+    let bpw = info
+        .quant_bpw
+        .map(|v| format!("~{v:.2} bpw"))
+        .unwrap_or_else(|| "none".to_string());
+    let resident = fmt_opt_bytes(info.resident_weight_bytes);
+    if label == "none" {
+        format!("none dominant, {bpw}, mlx-native resident {resident}")
+    } else {
+        format!("{label} dominant, {bpw}, mlx-native resident {resident}")
+    }
+}
+
+fn fmt_provenance(provenance: &Provenance) -> String {
+    match provenance {
+        Provenance::External => "external".to_string(),
+        Provenance::Hf2q {
+            producer_version,
+            source_sha256,
+            ..
+        } => {
+            let prefix: String = source_sha256.chars().take(4).collect();
+            format!("hf2q (producer {producer_version}, source_sha {prefix}…)")
+        }
+    }
+}
+
+fn fmt_vision(vision: &Option<VisionProjector>) -> String {
+    match vision {
+        None => "none".to_string(),
+        Some(v) => {
+            let sha = v.mmproj_sha256.as_deref().unwrap_or("none");
+            format!("{} (sha256 {sha})", v.mmproj_path.display())
+        }
+    }
+}
+
+fn fmt_kv_budget(info: &LoadInfo) -> String {
+    match info.kv_cache_budget_bytes {
+        Some(bytes) => match estimate_kv_tokens(info) {
+            Some(tokens) => format!("{} (~{} tokens)", fmt_gib(bytes), tokens),
+            None => fmt_gib(bytes),
+        },
+        None => "none".to_string(),
+    }
+}
+
+/// Print the unified 13-line load banner.
+pub fn print_banner<W: std::io::Write>(
+    info: &LoadInfo,
+    w: &mut W,
+    tty: bool,
+) -> std::io::Result<()> {
+    let (d, r) = if tty { (DIM, RESET) } else { ("", "") };
+    writeln!(
+        w,
+        "{d}hf2q load: backend = {} ({}){r}",
+        info.backend,
+        crate::serve::header::short_chip_label(&info.backend_chip)
+    )?;
+    writeln!(
+        w,
+        "{d}hf2q load: model = {} (arch = {}, family = {}){r}",
+        info.model_id,
+        info.arch_str,
+        info.arch_family.as_str()
+    )?;
+    writeln!(
+        w,
+        "{d}hf2q load: source = {} ({} on disk){r}",
+        info.model_path.display(),
+        fmt_gib(info.on_disk_bytes)
+    )?;
+    writeln!(
+        w,
+        "{d}hf2q load: layout = {} layers, {} heads ({} kv), head_dim={}, hidden={}, vocab={}{r}",
+        info.n_layers,
+        info.n_attention_heads,
+        info.n_key_value_heads,
+        info.head_dim,
+        info.hidden_size,
+        info.vocab_size
+    )?;
+    writeln!(
+        w,
+        "{d}hf2q load: features = sliding_window={}, full_attn_every={}, moe={}{r}",
+        fmt_opt_u32(info.sliding_window),
+        fmt_opt_u32(info.full_attention_interval),
+        fmt_moe(info.moe)
+    )?;
+    writeln!(w, "{d}hf2q load: quant = {}{r}", fmt_quant(info))?;
+    writeln!(
+        w,
+        "{d}hf2q load: max_ctx_train = {}, kv_budget = {}{r}",
+        fmt_opt_u32(info.max_context_length),
+        fmt_kv_budget(info)
+    )?;
+    writeln!(
+        w,
+        "{d}hf2q load: tokenizer = {}{r}",
+        fmt_tokenizer_source(&info.tokenizer_source)
+    )?;
+    writeln!(
+        w,
+        "{d}hf2q load: chat_template = {}{r}",
+        fmt_chat_template_source(&info.chat_template_source)
+    )?;
+    writeln!(
+        w,
+        "{d}hf2q load: provenance = {}{r}",
+        fmt_provenance(&info.provenance)
+    )?;
+    writeln!(
+        w,
+        "{d}hf2q load: vision = {}{r}",
+        fmt_vision(&info.vision_projector)
+    )?;
+    writeln!(
+        w,
+        "{d}hf2q load: kv_spill = {}{r}",
+        if info.kv_spill_active {
+            "active"
+        } else {
+            "inactive"
+        }
+    )?;
+    writeln!(
+        w,
+        "{d}hf2q load: ready in {:.2} s{r}",
+        info.load_wall_clock.as_secs_f64()
+    )?;
+    w.flush()
+}
+
+/// Emit the banner facts as structured tracing events. Field names match
+/// `LoadInfo` exactly so JSON logs remain grep- and diff-friendly.
+pub fn emit_tracing(info: &LoadInfo) {
+    tracing::info!(model_id = %info.model_id);
+    tracing::info!(arch_str = %info.arch_str);
+    tracing::info!(arch_family = %info.arch_family.as_str());
+    tracing::info!(model_path = %info.model_path.display());
+    tracing::info!(on_disk_bytes = info.on_disk_bytes);
+    tracing::info!(backend_chip = %info.backend_chip, backend = info.backend);
+    tracing::info!(
+        n_layers = info.n_layers,
+        hidden_size = info.hidden_size,
+        vocab_size = info.vocab_size,
+        n_attention_heads = info.n_attention_heads,
+        n_key_value_heads = info.n_key_value_heads,
+        head_dim = info.head_dim
+    );
+    tracing::info!(
+        sliding_window = ?info.sliding_window,
+        full_attention_interval = ?info.full_attention_interval,
+        max_context_length = ?info.max_context_length,
+        moe = ?info.moe
+    );
+    tracing::info!(quant_label = ?info.quant_label, quant_bpw = ?info.quant_bpw);
+    tracing::info!(
+        tokenizer_source = ?info.tokenizer_source,
+        eos_token_ids = ?info.eos_token_ids,
+        bos_token_id = ?info.bos_token_id,
+        chat_template_source = ?info.chat_template_source
+    );
+    tracing::info!(provenance = ?info.provenance);
+    tracing::info!(vision_projector = ?info.vision_projector);
+    tracing::info!(
+        load_wall_clock = ?info.load_wall_clock,
+        resident_weight_bytes = ?info.resident_weight_bytes,
+        kv_cache_budget_bytes = ?info.kv_cache_budget_bytes,
+        kv_spill_active = info.kv_spill_active
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Helpers — derivation from an open GGUF
 // ---------------------------------------------------------------------------
@@ -309,7 +587,9 @@ pub fn infer_quant_label(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
 
     let mut histogram: HashMap<&'static str, usize> = HashMap::new();
     for name in gguf.tensor_names() {
-        let Some(info) = gguf.tensor_info(name) else { continue };
+        let Some(info) = gguf.tensor_info(name) else {
+            continue;
+        };
         if matches!(info.ggml_type, GgmlType::F32 | GgmlType::F16) {
             continue;
         }
@@ -373,7 +653,9 @@ pub fn compute_bpw(gguf: &mlx_native::gguf::GgufFile) -> Option<f32> {
     let mut total_bytes: u128 = 0;
 
     for name in gguf.tensor_names() {
-        let Some(info) = gguf.tensor_info(name) else { continue };
+        let Some(info) = gguf.tensor_info(name) else {
+            continue;
+        };
         if matches!(info.ggml_type, GgmlType::F32 | GgmlType::F16) {
             continue;
         }
@@ -458,17 +740,46 @@ mod tests {
         byte_len: usize,
     }
 
+    enum KvSpec {
+        String(&'static str, &'static str),
+        U32(&'static str, u32),
+    }
+
+    fn write_gguf_string(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
     /// Write a minimal GGUF v3 file with zero metadata KV pairs and the
     /// given tensors.  Tensor data is filled with zeros — every helper
     /// under test inspects metadata only, not values.
     fn write_synthetic_gguf(path: &Path, tensors: &[TensorSpec]) {
+        write_synthetic_gguf_with_metadata(path, &[], tensors);
+    }
+
+    fn write_synthetic_gguf_with_metadata(path: &Path, kvs: &[KvSpec], tensors: &[TensorSpec]) {
         let mut buf: Vec<u8> = Vec::new();
 
         // Header: magic, version, n_tensors, n_kv.
         buf.extend_from_slice(b"GGUF");
         buf.extend_from_slice(&3u32.to_le_bytes());
         buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-        buf.extend_from_slice(&0u64.to_le_bytes()); // n_kv = 0
+        buf.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
+
+        for kv in kvs {
+            match kv {
+                KvSpec::String(key, value) => {
+                    write_gguf_string(&mut buf, key);
+                    buf.extend_from_slice(&8u32.to_le_bytes());
+                    write_gguf_string(&mut buf, value);
+                }
+                KvSpec::U32(key, value) => {
+                    write_gguf_string(&mut buf, key);
+                    buf.extend_from_slice(&4u32.to_le_bytes());
+                    buf.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
 
         // Tensor info entries.  Offsets are relative to the tensor-data
         // base; we lay tensors out back-to-back with no inter-tensor
@@ -476,8 +787,7 @@ mod tests {
         // beyond the data-section base).
         let mut data_offset: u64 = 0;
         for t in tensors {
-            buf.extend_from_slice(&(t.name.len() as u64).to_le_bytes());
-            buf.extend_from_slice(t.name.as_bytes());
+            write_gguf_string(&mut buf, t.name);
 
             buf.extend_from_slice(&(t.shape.len() as u32).to_le_bytes());
             for &d in &t.shape {
@@ -612,7 +922,9 @@ mod tests {
 
             let mut histogram: HashMap<&'static str, usize> = HashMap::new();
             for name in gguf.tensor_names() {
-                let Some(info) = gguf.tensor_info(name) else { continue };
+                let Some(info) = gguf.tensor_info(name) else {
+                    continue;
+                };
                 if matches!(info.ggml_type, GgmlType::F32 | GgmlType::F16) {
                     continue;
                 }
@@ -755,8 +1067,8 @@ mod tests {
         let gguf = mlx_native::gguf::GgufFile::open(&path).expect("open synthetic gguf");
         let bpw = compute_bpw(&gguf).expect("non-empty quant set");
         let expected = (178.0 * 8.0) / 288.0; // ≈ 4.94444...
-        // ±5% tolerance per design-doc spec line 754; bpw is exact-by-
-        // construction here so the test would pass at ±0.001 too.
+                                              // ±5% tolerance per design-doc spec line 754; bpw is exact-by-
+                                              // construction here so the test would pass at ±0.001 too.
         assert!(
             (bpw - expected).abs() / expected < 0.05,
             "expected ~{expected:.4} bpw, got {bpw}"
@@ -841,5 +1153,372 @@ mod tests {
         // Debug must not panic.
         let dbg = format!("{cloned:?}");
         assert!(dbg.contains("test-model"));
+    }
+
+    fn golden_qwen35moe_info() -> LoadInfo {
+        LoadInfo {
+            model_id: "<model_id>".to_string(),
+            arch_str: "qwen35moe".to_string(),
+            arch_family: ArchFamily::Qwen35,
+            model_path: PathBuf::from("<on-disk path>"),
+            on_disk_bytes: (29.83_f64 * 1024.0 * 1024.0 * 1024.0).round() as u64,
+            backend_chip: "Apple M5 Max".to_string(),
+            backend: "mlx-native",
+            n_layers: 64,
+            hidden_size: 4096,
+            vocab_size: 151_936,
+            n_attention_heads: 16,
+            n_key_value_heads: 4,
+            head_dim: 128,
+            sliding_window: None,
+            full_attention_interval: Some(4),
+            max_context_length: Some(262_144),
+            moe: Some(MoeShape {
+                n_experts: 128,
+                n_experts_per_tok: 8,
+            }),
+            quant_label: Some("Q4_K".to_string()),
+            quant_bpw: Some(4.55),
+            tokenizer_source: TokenizerSource::GgufEmbedded,
+            eos_token_ids: vec![151_645],
+            bos_token_id: None,
+            chat_template_source: ChatTemplateSource::GgufEmbedded,
+            provenance: Provenance::Hf2q {
+                producer_version: "hf2q 0.1.0".to_string(),
+                source_sha256: "7f3abc".to_string(),
+                mmproj_sha256: None,
+            },
+            vision_projector: None,
+            load_wall_clock: Duration::from_secs_f64(6.84),
+            resident_weight_bytes: Some((16.42_f64 * 1024.0 * 1024.0 * 1024.0).round() as u64),
+            kv_cache_budget_bytes: Some(4 * 1024 * 1024 * 1024),
+            kv_spill_active: false,
+        }
+    }
+
+    #[test]
+    fn print_banner_golden_qwen35moe() {
+        let info = golden_qwen35moe_info();
+        let mut buf = Vec::new();
+        print_banner(&info, &mut buf, false).expect("print banner");
+        let got = String::from_utf8(buf).expect("utf8");
+        assert_eq!(
+            got,
+            "hf2q load: backend = mlx-native (M5 Max)\n\
+             hf2q load: model = <model_id> (arch = qwen35moe, family = qwen35)\n\
+             hf2q load: source = <on-disk path> (29.83 GiB on disk)\n\
+             hf2q load: layout = 64 layers, 16 heads (4 kv), head_dim=128, hidden=4096, vocab=151936\n\
+             hf2q load: features = sliding_window=none, full_attn_every=4, moe=128 experts/8 active\n\
+             hf2q load: quant = Q4_K dominant, ~4.55 bpw, mlx-native resident 16.42 GiB\n\
+             hf2q load: max_ctx_train = 262144, kv_budget = 4.00 GiB (~32768 tokens)\n\
+             hf2q load: tokenizer = gguf-embedded (<= mirrors llama-vocab.cpp)\n\
+             hf2q load: chat_template = gguf-embedded\n\
+             hf2q load: provenance = hf2q (producer hf2q 0.1.0, source_sha 7f3a…)\n\
+             hf2q load: vision = none\n\
+             hf2q load: kv_spill = inactive\n\
+             hf2q load: ready in 6.84 s\n"
+        );
+    }
+
+    #[test]
+    fn print_banner_handles_absent_optional_fields() {
+        let mut info = golden_qwen35moe_info();
+        info.sliding_window = None;
+        info.full_attention_interval = None;
+        info.max_context_length = None;
+        info.moe = None;
+        info.quant_label = None;
+        info.quant_bpw = None;
+        info.resident_weight_bytes = None;
+        info.kv_cache_budget_bytes = None;
+        info.chat_template_source = ChatTemplateSource::None;
+        info.provenance = Provenance::External;
+        let mut buf = Vec::new();
+        print_banner(&info, &mut buf, false).expect("print banner");
+        let got = String::from_utf8(buf).expect("utf8");
+        assert!(got.contains("sliding_window=none, full_attn_every=none, moe=none"));
+        assert!(got.contains("quant = none dominant, none, mlx-native resident none"));
+        assert!(got.contains("max_ctx_train = none, kv_budget = none"));
+        assert!(got.contains("chat_template = none"));
+        assert!(got.contains("provenance = external"));
+        assert!(got.contains("vision = none"));
+    }
+
+    #[test]
+    fn load_info_builder_qwen35_smoke() {
+        use crate::inference::models::qwen35::model::Qwen35Model;
+        use crate::inference::models::qwen35::{
+            default_layer_types, Qwen35Config, Qwen35MoeConfig, Qwen35Variant,
+        };
+        use crate::serve::api::engine_qwen35::{HybridPromptCache, Qwen35LoadedModel};
+
+        let path = tmp_path("qwen35_builder");
+        write_synthetic_gguf_with_metadata(
+            &path,
+            &[
+                KvSpec::String("general.architecture", "qwen35moe"),
+                KvSpec::U32("tokenizer.ggml.bos_token_id", 151_643),
+                KvSpec::String("tokenizer.chat_template", "{{ messages }}"),
+            ],
+            &[TensorSpec {
+                name: "blk.0.ffn_gate_exps.weight",
+                shape: vec![BLOCK_VALUES_Q4_K],
+                ggml_type_id: GGML_TYPE_Q4_K,
+                byte_len: BLOCK_BYTES_Q4_K,
+            }],
+        );
+        let gguf = mlx_native::gguf::GgufFile::open(&path).expect("open synthetic gguf");
+        let cfg = Qwen35Config {
+            variant: Qwen35Variant::Moe,
+            hidden_size: 64,
+            num_hidden_layers: 4,
+            num_attention_heads: 8,
+            num_key_value_heads: 2,
+            head_dim: 16,
+            linear_num_key_heads: 2,
+            linear_num_value_heads: 2,
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            layer_types: default_layer_types(4, 4),
+            partial_rotary_factor: 0.25,
+            rope_theta: 1e7,
+            rotary_dim: 4,
+            mrope_section: [1, 1, 0, 0],
+            mrope_interleaved: true,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 1024,
+            vocab_size: 256,
+            attn_output_gate: true,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: true,
+            intermediate_size: None,
+            moe: Some(Qwen35MoeConfig {
+                moe_intermediate_size: 16,
+                num_experts: 4,
+                num_experts_per_tok: 2,
+                shared_expert_intermediate_size: 16,
+            }),
+        };
+        let loaded = Qwen35LoadedModel {
+            model: Qwen35Model::empty_from_cfg(cfg),
+            tokenizer: tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+            chat_template: "{{ messages }}".to_string(),
+            model_id: "qwen-id".to_string(),
+            model_path: path.clone(),
+            eos_token_ids: vec![151_645],
+            hidden_size: 64,
+            vocab_size: 256,
+            context_length: Some(1024),
+            quant_type: Some("Q4_K".to_string()),
+            load_duration: Duration::from_millis(7),
+            provenance: Provenance::External,
+            prompt_cache: HybridPromptCache::new(),
+        };
+        let info = loaded.build_load_info(
+            &gguf,
+            Duration::from_millis(7),
+            Some(4 * 1024 * 1024),
+            false,
+        );
+        assert_eq!(info.model_id, "qwen-id");
+        assert_eq!(info.arch_str, "qwen35moe");
+        assert_eq!(info.arch_family, ArchFamily::Qwen35);
+        assert_eq!(info.model_path, path);
+        assert!(info.on_disk_bytes > 0);
+        assert_eq!(info.n_layers, 4);
+        assert_eq!(info.hidden_size, 64);
+        assert_eq!(info.vocab_size, 256);
+        assert_eq!(info.n_attention_heads, 8);
+        assert_eq!(info.n_key_value_heads, 2);
+        assert_eq!(info.head_dim, 16);
+        assert_eq!(info.sliding_window, None);
+        assert_eq!(info.full_attention_interval, Some(4));
+        assert_eq!(info.max_context_length, Some(1024));
+        assert_eq!(
+            info.moe,
+            Some(MoeShape {
+                n_experts: 4,
+                n_experts_per_tok: 2
+            })
+        );
+        assert_eq!(info.quant_label, Some("Q4_K".to_string()));
+        assert_eq!(info.quant_bpw, Some(4.5));
+        assert_eq!(info.tokenizer_source, TokenizerSource::GgufEmbedded);
+        assert_eq!(info.eos_token_ids, vec![151_645]);
+        assert_eq!(info.bos_token_id, Some(151_643));
+        assert_eq!(info.chat_template_source, ChatTemplateSource::GgufEmbedded);
+        assert_eq!(info.provenance, Provenance::External);
+        assert_eq!(info.vision_projector, None);
+        assert_eq!(info.load_wall_clock, Duration::from_millis(7));
+        assert_eq!(info.resident_weight_bytes, None);
+        assert_eq!(info.kv_cache_budget_bytes, Some(4 * 1024 * 1024));
+        assert!(!info.kv_spill_active);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_info_builder_gemma_smoke() {
+        let path = tmp_path("gemma_builder");
+        write_synthetic_gguf_with_metadata(
+            &path,
+            &[
+                KvSpec::String("general.architecture", "gemma4"),
+                KvSpec::U32("tokenizer.ggml.bos_token_id", 2),
+            ],
+            &[TensorSpec {
+                name: "blk.0.attn_q.weight",
+                shape: vec![BLOCK_VALUES_Q6_K],
+                ggml_type_id: GGML_TYPE_Q6_K,
+                byte_len: BLOCK_BYTES_Q6_K,
+            }],
+        );
+        let gguf = mlx_native::gguf::GgufFile::open(&path).expect("open synthetic gguf");
+        assert_eq!(arch_str_from_gguf(&gguf), "gemma4");
+        assert_eq!(compute_bpw(&gguf), Some(6.5625));
+        assert_eq!(gguf.metadata_u32("tokenizer.ggml.bos_token_id"), Some(2));
+        let info = LoadInfo {
+            model_id: "gemma-id".to_string(),
+            arch_str: arch_str_from_gguf(&gguf),
+            arch_family: ArchFamily::Gemma4,
+            model_path: PathBuf::from("gemma-id"),
+            on_disk_bytes: 0,
+            backend_chip: "Apple M5 Max".to_string(),
+            backend: "mlx-native",
+            n_layers: 2,
+            hidden_size: 32,
+            vocab_size: 128,
+            n_attention_heads: 4,
+            n_key_value_heads: 2,
+            head_dim: 8,
+            sliding_window: Some(1024),
+            full_attention_interval: None,
+            max_context_length: Some(4096),
+            moe: Some(MoeShape {
+                n_experts: 8,
+                n_experts_per_tok: 2,
+            }),
+            quant_label: infer_quant_label(&gguf),
+            quant_bpw: compute_bpw(&gguf),
+            tokenizer_source: TokenizerSource::HfTokenizerJson {
+                path: PathBuf::from("tokenizer.json"),
+            },
+            eos_token_ids: vec![1, 106],
+            bos_token_id: gguf.metadata_u32("tokenizer.ggml.bos_token_id"),
+            chat_template_source: chat_template_source(
+                &gguf,
+                Some("FALLBACK_GEMMA4_API_CHAT_TEMPLATE"),
+            ),
+            provenance: Provenance::External,
+            vision_projector: None,
+            load_wall_clock: Duration::from_millis(12),
+            resident_weight_bytes: None,
+            kv_cache_budget_bytes: None,
+            kv_spill_active: false,
+        };
+        assert_eq!(info.arch_family, ArchFamily::Gemma4);
+        assert_eq!(info.quant_label, Some("Q6_K".to_string()));
+        assert!(matches!(
+            info.chat_template_source,
+            ChatTemplateSource::HardcodedFallback { name }
+                if name == "FALLBACK_GEMMA4_API_CHAT_TEMPLATE"
+        ));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingLayer {
+        events: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    struct FieldNameVisitor<'a> {
+        names: &'a mut Vec<String>,
+    }
+
+    impl tracing::field::Visit for FieldNameVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {
+            self.names.push(field.name().to_string());
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for RecordingLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut names = Vec::new();
+            event.record(&mut FieldNameVisitor { names: &mut names });
+            self.events.lock().expect("events lock").push(names);
+        }
+    }
+
+    fn capture_emit_tracing(info: &LoadInfo) -> Vec<Vec<String>> {
+        use tracing_subscriber::prelude::*;
+
+        let layer = RecordingLayer::default();
+        let events = layer.events.clone();
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || emit_tracing(info));
+        let captured = events.lock().expect("events lock").clone();
+        captured
+    }
+
+    #[test]
+    fn emit_tracing_emits_at_least_10_events() {
+        let info = golden_qwen35moe_info();
+        let events = capture_emit_tracing(&info);
+        assert!(
+            events.len() >= 10,
+            "expected at least 10 tracing events, got {}",
+            events.len()
+        );
+    }
+
+    #[test]
+    fn emit_tracing_field_names_match_load_info() {
+        let info = golden_qwen35moe_info();
+        let events = capture_emit_tracing(&info);
+        let names: std::collections::BTreeSet<String> = events.into_iter().flatten().collect();
+        let expected = [
+            "model_id",
+            "arch_str",
+            "arch_family",
+            "model_path",
+            "on_disk_bytes",
+            "backend_chip",
+            "backend",
+            "n_layers",
+            "hidden_size",
+            "vocab_size",
+            "n_attention_heads",
+            "n_key_value_heads",
+            "head_dim",
+            "sliding_window",
+            "full_attention_interval",
+            "max_context_length",
+            "moe",
+            "quant_label",
+            "quant_bpw",
+            "tokenizer_source",
+            "eos_token_ids",
+            "bos_token_id",
+            "chat_template_source",
+            "provenance",
+            "vision_projector",
+            "load_wall_clock",
+            "resident_weight_bytes",
+            "kv_cache_budget_bytes",
+            "kv_spill_active",
+        ];
+        for field in expected {
+            assert!(names.contains(field), "missing tracing field {field}");
+        }
     }
 }

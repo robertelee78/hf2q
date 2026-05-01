@@ -45,6 +45,10 @@ use crate::serve::forward_mlx::{MlxModelWeights, ProfileAccumulator};
 use crate::serve::forward_prefill::SoftTokenInjection;
 use crate::serve::gpu::GpuContext;
 use crate::serve::header;
+use crate::serve::load_info::{
+    self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, MoeShape,
+    TokenizerSource,
+};
 use crate::serve::sampler_pure::{
     self, SamplingParams as SamplerParams,
 };
@@ -915,6 +919,8 @@ pub struct GemmaLoadedModel {
     pub ctx: GpuContext,
     pub config: Gemma4Config,
     pub model_id: String,
+    pub model_path: PathBuf,
+    pub tokenizer_path: PathBuf,
     pub context_length: Option<usize>,
     pub quant_type: Option<String>,
     pub tokenizer: Tokenizer,
@@ -979,18 +985,15 @@ impl LoadedModel {
         }
     }
 
-    /// ADR-017 §F4 — GGUF provenance for the loaded model.  The
-    /// `Gemma` variant returns the `Provenance` captured at GGUF-open
-    /// time in [`GemmaLoadedModel::load`]; the `Qwen35` variant
-    /// returns `Provenance::External` because the Qwen35 loader does
-    /// not yet populate a provenance field (Qwen35 inference is
-    /// 501-gated under iter-215; KV-spill never fires for that path).
-    /// When Qwen35 inference lands, this accessor's Qwen35 arm should
-    /// be updated to read `engine_qwen35::Qwen35LoadedModel.provenance`.
+    /// ADR-017 §F4 — GGUF provenance for the loaded model.  Both
+    /// variants capture provenance at GGUF-open time via
+    /// `crate::serve::provenance::detect(&gguf)`.  Gemma consumes it for
+    /// dense KV-spill namespacing today; Qwen35 stores the same fact even
+    /// though its hybrid KV-spill descriptor is a later ADR-017 phase.
     pub fn provenance(&self) -> crate::serve::provenance::Provenance {
         match self {
             LoadedModel::Gemma(g) => g.provenance.clone(),
-            LoadedModel::Qwen35(_) => crate::serve::provenance::Provenance::External,
+            LoadedModel::Qwen35(q) => q.provenance.clone(),
         }
     }
     pub fn eos_token_ids(&self) -> &[u32] {
@@ -1490,6 +1493,8 @@ impl GemmaLoadedModel {
             ctx,
             config,
             model_id,
+            model_path: model_path.clone(),
+            tokenizer_path,
             context_length,
             quant_type,
             tokenizer,
@@ -1499,6 +1504,66 @@ impl GemmaLoadedModel {
             prompt_cache: PromptCache::new(),
             provenance,
         })
+    }
+}
+
+impl LoadInfoBuilder for GemmaLoadedModel {
+    fn build_load_info(
+        &self,
+        gguf: &mlx_native::gguf::GgufFile,
+        load_wall_clock: Duration,
+        kv_cache_budget_bytes: Option<u64>,
+        kv_spill_active: bool,
+    ) -> LoadInfo {
+        let arch_str = load_info::arch_str_from_gguf(gguf);
+        let moe = if self.config.num_experts > 0 && self.config.top_k_experts > 0 {
+            Some(MoeShape {
+                n_experts: self.config.num_experts as u32,
+                n_experts_per_tok: self.config.top_k_experts as u32,
+            })
+        } else {
+            None
+        };
+
+        LoadInfo {
+            model_id: self.model_id.clone(),
+            arch_str,
+            arch_family: ArchFamily::Gemma4,
+            model_path: self.model_path.clone(),
+            on_disk_bytes: load_info::on_disk_bytes(&self.model_path),
+            backend_chip: self.ctx.gpu_name(),
+            backend: "mlx-native",
+            n_layers: self.config.num_hidden_layers as u32,
+            hidden_size: self.config.hidden_size as u32,
+            vocab_size: self.config.vocab_size as u32,
+            n_attention_heads: self.config.num_attention_heads as u32,
+            n_key_value_heads: self.config.num_key_value_heads as u32,
+            head_dim: self.config.head_dim as u32,
+            sliding_window: Some(self.config.sliding_window as u32),
+            full_attention_interval: None,
+            max_context_length: self.context_length.map(|v| v as u32),
+            moe,
+            quant_label: self.quant_type.clone(),
+            quant_bpw: load_info::compute_bpw(gguf),
+            tokenizer_source: TokenizerSource::HfTokenizerJson {
+                path: self.tokenizer_path.clone(),
+            },
+            eos_token_ids: self.eos_token_ids.clone(),
+            bos_token_id: gguf.metadata_u32("tokenizer.ggml.bos_token_id"),
+            chat_template_source: if gguf.metadata_string("tokenizer.chat_template").is_some() {
+                ChatTemplateSource::GgufEmbedded
+            } else {
+                ChatTemplateSource::HardcodedFallback {
+                    name: "FALLBACK_GEMMA4_API_CHAT_TEMPLATE",
+                }
+            },
+            provenance: self.provenance.clone(),
+            vision_projector: None,
+            load_wall_clock,
+            resident_weight_bytes: None,
+            kv_cache_budget_bytes,
+            kv_spill_active,
+        }
     }
 }
 
@@ -6504,12 +6569,14 @@ assistant:
             tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
             chat_template: "qwen-template".to_string(),
             model_id: "qwen-id".to_string(),
+            model_path: PathBuf::from("qwen-id.gguf"),
             eos_token_ids: vec![151645],
             hidden_size: 64,
             vocab_size: 256,
             context_length: Some(1024),
             quant_type: Some("Q4_0".to_string()),
             load_duration: Duration::from_millis(7),
+            provenance: crate::serve::provenance::Provenance::External,
             prompt_cache: super::super::engine_qwen35::HybridPromptCache::new(),
         };
         let qwen = LoadedModel::Qwen35(qwen_loaded);
