@@ -1617,6 +1617,28 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
 ///      read — that happens when the engine loads in iter 3.
 ///   3. Build the axum router and bind the listener.
 ///   4. Serve until SIGINT / SIGTERM (graceful shutdown per Decision #17).
+/// ADR-017 §R-F1 startup-disable predicate: returns `true` iff the
+/// kv-persist substrate should be constructed at startup.
+///
+/// Contract:
+///   * `flag` — `--kv-persist=PATH` argument as a borrowed string slice
+///     (`None` = flag absent).
+///   * `env` — value of the `HF2Q_KV_PERSIST` env var (`None` = unset).
+///
+/// Rules:
+///   * No flag → never enable (matches pre-ADR-017 behavior).
+///   * Flag present + env unset / empty / any value other than `"0"`
+///     (after trim) → enable.
+///   * Flag present + env trims to exactly `"0"` → disable
+///     (operator emergency-override per `docs/operating-kv-cache.md` §10).
+///
+/// Env-driven semantics are process-scoped: operators restart
+/// `cmd_serve` to re-enable. The pure-function form keeps the policy
+/// trivially unit-testable without spinning up the binary.
+pub(crate) fn should_enable_kv_persist(flag: Option<&str>, env: Option<&str>) -> bool {
+    flag.is_some() && env.map(|v| v.trim()).unwrap_or("") != "0"
+}
+
 pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
     use api::schema::OverflowPolicy;
     use api::state::ServerConfig;
@@ -1693,9 +1715,43 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
     // captures inside the new HotSwapManager. The recovery scan
     // runs synchronously here so a previously-written cache becomes
     // available before the optional pre-warm load_or_get fires.
+    //
+    // ADR-017 §R-F1 startup-disable override: `HF2Q_KV_PERSIST=0`
+    // (exact match, after trim) overrides `--kv-persist=PATH` and
+    // leaves the NoopKvSpiller-backed AppState manager wired. This
+    // closes the operator-runbook §10 gap (`docs/operating-kv-cache.md`)
+    // — operators emergency-disable by setting the env var and
+    // restarting (env vars are process-scoped, so true mid-flight
+    // disable is restart-driven; that's the standard operator
+    // pattern for env-driven config). Restart without
+    // `HF2Q_KV_PERSIST=0` to re-enable. The decision predicate is
+    // factored into `should_enable_kv_persist` below for unit
+    // testing.
+    let kv_persist_env = std::env::var("HF2Q_KV_PERSIST").ok();
+    let kv_persist_flag_path = args.kv_persist_path.as_ref();
+    let kv_persist_enabled = should_enable_kv_persist(
+        kv_persist_flag_path.map(|p| p.to_string_lossy()).as_deref(),
+        kv_persist_env.as_deref(),
+    );
+    if !kv_persist_enabled && kv_persist_flag_path.is_some() {
+        // Flag was supplied but env override forced disable — surface
+        // a single warn line so operators see the override took
+        // effect without grepping logs for absent counters.
+        let path_for_log = kv_persist_flag_path
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        tracing::warn!(
+            kv_persist_path = %path_for_log,
+            "ADR-017 R-F1 override: HF2Q_KV_PERSIST=0 — disabling kv-persist \
+             despite --kv-persist={path_for_log}. Operator emergency-disable per \
+             operating-kv-cache.md §10. Restart without HF2Q_KV_PERSIST=0 to \
+             re-enable.",
+            path_for_log = path_for_log,
+        );
+    }
     let kv_persist_loader_wrapper: Option<std::sync::Arc<
         crate::serve::kv_persist::LoaderWrapper<api::engine::Engine>,
-    >> = if let Some(cache_dir) = args.kv_persist_path.as_ref() {
+    >> = if let Some(cache_dir) = args.kv_persist_path.as_ref().filter(|_| kv_persist_enabled) {
         use std::path::PathBuf;
         use std::sync::{Arc, Mutex};
         use crate::serve::kv_persist::families::gemma4_dense::{
@@ -3125,7 +3181,56 @@ fn cmd_parity_capture(
 
 #[cfg(test)]
 mod tests {
-    use super::{render_jinja_template, FALLBACK_GEMMA4_CHAT_TEMPLATE, FALLBACK_GEMMA4_API_CHAT_TEMPLATE};
+    use super::{
+        render_jinja_template, should_enable_kv_persist, FALLBACK_GEMMA4_API_CHAT_TEMPLATE,
+        FALLBACK_GEMMA4_CHAT_TEMPLATE,
+    };
+
+    // ADR-017 §R-F1 startup-disable override regression guards.
+    // Closes operator-runbook §10 gap by pinning the predicate's
+    // truth table. Pure-function tests; no binary / env mutation.
+
+    #[test]
+    fn hf2q_kv_persist_zero_overrides_flag() {
+        assert!(!should_enable_kv_persist(Some("/path"), Some("0")));
+    }
+
+    #[test]
+    fn hf2q_kv_persist_unset_respects_flag_present() {
+        assert!(should_enable_kv_persist(Some("/path"), None));
+    }
+
+    #[test]
+    fn hf2q_kv_persist_one_respects_flag() {
+        assert!(should_enable_kv_persist(Some("/path"), Some("1")));
+    }
+
+    #[test]
+    fn hf2q_kv_persist_no_flag_means_disabled_regardless() {
+        assert!(!should_enable_kv_persist(None, None));
+        assert!(!should_enable_kv_persist(None, Some("0")));
+        assert!(!should_enable_kv_persist(None, Some("1")));
+    }
+
+    #[test]
+    fn hf2q_kv_persist_zero_with_whitespace_still_disables() {
+        // Trim semantics — operators occasionally export with
+        // trailing whitespace from copy-paste; `"  0  "` MUST still
+        // trigger the override.
+        assert!(!should_enable_kv_persist(Some("/path"), Some("  0  ")));
+        assert!(!should_enable_kv_persist(Some("/path"), Some("0\n")));
+    }
+
+    #[test]
+    fn hf2q_kv_persist_empty_or_other_values_respect_flag() {
+        // Empty / `"true"` / `"yes"` / arbitrary strings all
+        // respect the flag (only exact `"0"` after trim disables).
+        assert!(should_enable_kv_persist(Some("/path"), Some("")));
+        assert!(should_enable_kv_persist(Some("/path"), Some("true")));
+        assert!(should_enable_kv_persist(Some("/path"), Some("yes")));
+        assert!(should_enable_kv_persist(Some("/path"), Some("00")));
+    }
+
 
     /// iter-219b parity-gate fix (2026-05-01) regression guard. The CLI
     /// fallback chat template MUST NOT activate Gemma 4's thinking-mode

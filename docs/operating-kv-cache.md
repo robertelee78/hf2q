@@ -447,12 +447,54 @@ panic signal: enqueues return `TrySendError::Disconnected` (mapped to
 
 ## 10. Disabling / removing
 
+### Startup disable via `HF2Q_KV_PERSIST=0` (ADR-017 §R-F1)
+
+Set `HF2Q_KV_PERSIST=0` (exact match, after trim) at process start to
+override `--kv-persist=PATH` and skip kv-persist construction entirely.
+The `NoopKvSpiller`-backed `AppState` manager stays wired (off-path is
+byte-identical to pre-ADR-017). Use this when you need to launch
+`cmd_serve` with the same launch command an orchestrator templated
+(e.g. systemd unit, k8s manifest) but want the persistence layer
+disabled without editing the unit.
+
+```bash
+HF2Q_KV_PERSIST=0 hf2q serve --model <PATH> --kv-persist /var/cache/hf2q/kv
+```
+
+Predicate (`src/serve/mod.rs::should_enable_kv_persist`):
+
+| `--kv-persist` | `HF2Q_KV_PERSIST` | enabled? |
+|----------------|-------------------|----------|
+| absent         | (any)             | no       |
+| present        | unset / empty     | yes      |
+| present        | `"1"` / `"true"`  | yes      |
+| present        | `"0"` (trimmed)   | **no**   |
+
+When the override fires, a single `tracing::warn!` line emits at
+startup citing the flag path and pointing back to this section:
+
+```
+ADR-017 R-F1 override: HF2Q_KV_PERSIST=0 — disabling kv-persist
+despite --kv-persist=<PATH>. Operator emergency-disable per
+operating-kv-cache.md §10. Restart without HF2Q_KV_PERSIST=0 to
+re-enable.
+```
+
+Env vars are process-scoped — the override is **startup-only**. To
+re-enable, stop the process, unset the env var (or set it to anything
+other than `"0"`), and restart. Regression-pinned by
+`hf2q_kv_persist_*` tests in `src/serve/mod.rs::tests`.
+
 ### Mid-flight disable
 
-Not supported. `--kv-persist` is startup-only (wired at
-`src/serve/mod.rs:1719-1922`). To disable: stop `cmd_serve`, drop the
-flag, restart. `HF2Q_KV_PERSIST=0` is `[NOT YET IMPLEMENTED — ADR-017
-§R-F1 / §R-O1]` — the env var appears in source comments only.
+Not supported as a live toggle (env vars are process-scoped). To
+disable an already-running serve: stop `cmd_serve`, either drop
+`--kv-persist=PATH` or relaunch with `HF2Q_KV_PERSIST=0`, restart.
+The runbook used to flag mid-flight disable as
+`[NOT YET IMPLEMENTED — ADR-017 §R-F1 / §R-O1]`; §R-F1 is now
+implemented as the startup-disable override above. True mid-flight
+disable (without restart) remains intentionally out-of-scope per the
+process-scoped env-var contract.
 
 ### Migration off the persistence path
 
@@ -472,8 +514,12 @@ default in `AppState::new_for_serve` is restored on next start
 Each entry cites the ADR section. None are wired in source at commit
 `7c6c160`.
 
-1. **Env-var enable / disable** (§R-F1). `HF2Q_KV_PERSIST=1`/`=0` referenced
-   in doc-comments only; no `env::var` reads. Use `--kv-persist` flag.
+1. **Env-var enable / disable** (§R-F1). **LANDED** — `HF2Q_KV_PERSIST=0`
+   startup-disable override wired via
+   `src/serve/mod.rs::should_enable_kv_persist`; see §10 for the truth
+   table + warn-line semantics. `=1` / unset / any other value defers
+   to `--kv-persist=PATH`. True mid-flight (no-restart) disable remains
+   out-of-scope per the process-scoped env-var contract.
 2. **On-disk byte budget** (§R-F5). cmd_serve hard-codes `budget_bytes = 0`
    at `src/serve/mod.rs:1764`. `DiskBlockStore::set_budget_bytes`
    (`block_store.rs:163-166`) is unwired. No
@@ -503,5 +549,6 @@ Each entry cites the ADR section. None are wired in source at commit
 10. **TQ-active codec family** (Phase B-tq). Not present.
 11. **Quarantine bound** (§R-F9). Quarantine dir grows unbounded; the
     "delete oldest when budget exceeded" rule is not enforced.
-12. **Mid-flight `HF2Q_KV_PERSIST=0`** (§R-O1). No reader; operator must
-    restart `cmd_serve` to disable.
+12. **Mid-flight `HF2Q_KV_PERSIST=0`** (§R-O1). Intentionally
+    out-of-scope — env vars are process-scoped, so the §R-F1 landing
+    is startup-disable + restart, not a live toggle. See §10.
