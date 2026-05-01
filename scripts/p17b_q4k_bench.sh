@@ -194,16 +194,23 @@ stats3() {
 }
 
 # --- hf2q runs ------------------------------------------------------------
-declare -A HF2Q_PP_RUNS HF2Q_TG_RUNS
+# ADR-013 P21 (2026-05-01): the harness now ALWAYS sets HF2Q_PROFILE_SYNC=1
+# inside its hf2q invocations and parses the resulting `[P19 H9] ...
+# sync_count=N dispatch_count=N barrier_count=N` line from stderr. This
+# makes the harness one-stop for both wall-time and CB-sync attribution
+# during P21 stage-by-stage refactor verification (each P21 stage is
+# expected to drop sync_count by a known amount). Cost on a non-P21 run
+# is one extra eprintln per prefill — negligible.
+declare -A HF2Q_PP_RUNS HF2Q_TG_RUNS HF2Q_SYNC_RUNS
 echo "--- hf2q (cold-process, $REPS reps per cell) ---"
 for pp in "${PP_LIST[@]}"; do
   for tg in "${TG_LIST[@]}"; do
     PROMPT="$(gen_prompt "$pp")"
-    PP_VALS="" TG_VALS=""
+    PP_VALS="" TG_VALS="" SYNC_VALS=""
     for ((r=1; r<=REPS; r++)); do
       OUT="$OUT_DIR/hf2q_pp${pp}_tg${tg}_run${r}.txt"
       LOG="$OUT_DIR/hf2q_pp${pp}_tg${tg}_run${r}.log"
-      if ! "$HF2Q_BIN" generate --model "$GGUF_PATH" \
+      if ! HF2Q_PROFILE_SYNC=1 "$HF2Q_BIN" generate --model "$GGUF_PATH" \
             --prompt "$PROMPT" --max-tokens "$tg" --temperature 0 \
             --benchmark > "$OUT" 2> "$LOG"; then
         echo "  hf2q FAIL pp=$pp tg=$tg run=$r — see $LOG" >&2
@@ -211,12 +218,15 @@ for pp in "${PP_LIST[@]}"; do
       fi
       PP_TPS="$(grep -oE 'Prefill tok/s: *[0-9.]+' "$OUT" | head -1 | grep -oE '[0-9.]+' | head -1)"
       TG_TPS="$(grep -oE 'Decode tok/s: *[0-9.]+'  "$OUT" | head -1 | grep -oE '[0-9.]+' | head -1)"
+      SYNC_N="$(grep -oE 'sync_count=[0-9]+' "$LOG" | head -1 | grep -oE '[0-9]+')"
       [[ -n "${PP_TPS:-}" ]] && PP_VALS+="$PP_TPS"$'\n'
       [[ -n "${TG_TPS:-}" ]] && TG_VALS+="$TG_TPS"$'\n'
-      printf "  pp=%-4s tg=%-4s run=%d  pp_tps=%s  tg_tps=%s\n" "$pp" "$tg" "$r" "${PP_TPS:-MISS}" "${TG_TPS:-MISS}"
+      [[ -n "${SYNC_N:-}" ]] && SYNC_VALS+="$SYNC_N"$'\n'
+      printf "  pp=%-4s tg=%-4s run=%d  pp_tps=%s  tg_tps=%s  sync=%s\n" "$pp" "$tg" "$r" "${PP_TPS:-MISS}" "${TG_TPS:-MISS}" "${SYNC_N:-MISS}"
     done
     HF2Q_PP_RUNS["$pp/$tg"]="$(printf '%s' "$PP_VALS" | stats3)"
     HF2Q_TG_RUNS["$pp/$tg"]="$(printf '%s' "$TG_VALS" | stats3)"
+    HF2Q_SYNC_RUNS["$pp/$tg"]="$(printf '%s' "$SYNC_VALS" | stats3)"
   done
 done
 
@@ -343,6 +353,20 @@ SUMMARY="$OUT_DIR/p17b_summary.md"
       RB="-"; [[ "$HM" != "-" && "$BM" != "-" && "$BM" != "0.00" ]] && RB=$(awk -v h="$HM" -v l="$BM" 'BEGIN { if (l+0 == 0) { print "-" } else { printf "%.2fx", h/l } }')
       printf '| %s | %s | %s (%s..%s) | %s (%s..%s) | %s (%s..%s) | %s | %s |\n' \
         "$pp" "$tg" "$HM" "$HL" "$HH" "$CM" "$CL" "$CH" "$BM" "$BL" "$BH" "$RC" "$RB"
+    done
+  done
+  echo
+  echo "## CB-sync (mlx_native::sync_count() per prefill — median \`(min .. max)\`)"
+  echo
+  echo "ADR-013 P19 H9 baseline (post-P20, K=1 default, 2026-05-01) is **161**."
+  echo "P21 stage-1/2/3/4 targets are 130 / 70 / 30 / 25 respectively."
+  echo
+  printf '| pp | tg | hf2q sync_count |\n'
+  printf '|---|---|---|\n'
+  for pp in "${PP_LIST[@]}"; do
+    for tg in "${TG_LIST[@]}"; do
+      IFS=, read -r SM SL SH <<<"${HF2Q_SYNC_RUNS["$pp/$tg"]:-,,}"
+      printf '| %s | %s | %s (%s..%s) |\n' "$pp" "$tg" "$SM" "$SL" "$SH"
     done
   done
   echo
