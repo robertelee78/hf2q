@@ -117,20 +117,27 @@ SELF_PID=$$
 COMPETING="$(ps -axwwo pid=,command= \
   | awk -v self=$SELF_PID '
       $1 != self && $1 != self+1 {
-        line = $0
-        sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", line)
-        # Match anything that looks like a build / inference process.
-        if (line ~ /(^|\/)cargo([[:space:]]|$)/   ||
-            line ~ /\/rustc([[:space:]]|$)/      ||
-            line ~ /(^|\/)cc1?([[:space:]]|$)/   ||
-            line ~ /(^|\/)clang(\+\+)?([[:space:]]|$)/ ||
-            line ~ /(^|\/)hf2q([[:space:]]|$)/   ||
-            line ~ /(^|\/)llama-(bench|cli|server)([[:space:]]|$)/ ||
-            line ~ /(^|\/)mlx_lm/                ||
-            line ~ /(^|\/)ollama([[:space:]]|$)/ ||
-            line ~ /(^|\/)lmstudio/              ||
-            line ~ /(^|\/)vllm/) {
-          print line
+        # Extract only the binary path (first argv token) — argv text
+        # for codex/CFA workers can contain literal newlines + the word
+        # "cargo" inside a prompt, which produces false-positive matches
+        # if we regex against the whole command line.
+        cmd = $0
+        sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", cmd)
+        n = split(cmd, parts, /[[:space:]]/)
+        if (n == 0) next
+        bin = parts[1]
+        # Match the BINARY only against the ML/build process list.
+        if (bin ~ /(^|\/)cargo$/   ||
+            bin ~ /(^|\/)rustc$/   ||
+            bin ~ /(^|\/)cc1?$/    ||
+            bin ~ /(^|\/)clang(\+\+)?$/ ||
+            bin ~ /(^|\/)hf2q$/    ||
+            bin ~ /(^|\/)llama-(bench|cli|completion|server)$/ ||
+            bin ~ /(^|\/)mlx_lm/   ||
+            bin ~ /(^|\/)ollama$/  ||
+            bin ~ /(^|\/)lmstudio/ ||
+            bin ~ /(^|\/)vllm/) {
+          print cmd
         }
       }' || true)"
 
