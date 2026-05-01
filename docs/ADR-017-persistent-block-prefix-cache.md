@@ -3075,6 +3075,89 @@ reasonable interpretation under the current architecture.
   load-bearing; v2/v3 polish is operator-readability improvement,
   not gate change.
 
+##### iter-16 K2 v3 INFRASTRUCTURE LANDED
+
+  **Scope:** ship the structural test infrastructure named at the
+  end of iter-15's caveat-closure (writer-queue depth probe + a
+  `#[cfg(test)]`-gated direct spill-job injection hook). The K2 v3
+  integration test that uses this infra is a follow-up iter; this
+  iter is JUST the infra.
+
+  **Surface landed:**
+
+  | Symbol | Visibility | Gate |
+  |---|---|---|
+  | `AsyncWriterHandle::pending_jobs(&self) -> usize` | `pub` | always (production accessor) |
+  | `BlockPrefixCacheSpiller::pending_writer_queue_depth(&self) -> usize` | `pub` | always (production accessor) |
+  | `BlockPrefixCacheSpiller::test_only_inject_pending_spill(&self, n: usize)` | `pub` (inside `#[cfg(test)] impl` block) | `#[cfg(test)]` ONLY |
+
+  **Mechanism:** the writer's `Arc<AtomicUsize>` pending-depth
+  counter is incremented on every successful `enqueue` /
+  `enqueue_blocking` and decremented inside `process_job` after the
+  job's `write_block_sync` + completion-ack fires. `Ordering::Relaxed`
+  throughout — the counter is a snapshot metric, not a synchronization
+  barrier. Lock-free read is safe from any thread.
+
+  **Production isolation guarantee — VERIFIED:**
+
+  ```
+  $ cargo build --release --bin hf2q
+      Finished `release` profile [optimized] target(s) in 16.04s
+  $ nm -j target/release/hf2q | grep test_only_inject_pending_spill
+  (no output — symbol not present in release binary)
+  ```
+
+  The `#[cfg(test)] impl<E> BlockPrefixCacheSpiller<E>` block in
+  `src/serve/kv_persist/spiller.rs` (search "iter-16 — `#[cfg(test)]`
+  direct spill-job injection hook") gates the inject method behind
+  the test-build conditional. Production builds are byte-identical
+  to pre-iter-16 with respect to the inject path; the only
+  production surface delta is the lock-free `pending_jobs` /
+  `pending_writer_queue_depth` accessors and the writer's internal
+  `Arc<AtomicUsize>` counter (one extra atomic add + one atomic sub
+  per write — sub-nanosecond noise vs. the ~ms-scale write itself,
+  which is what writes-off-the-prefill-path is amortizing).
+
+  **Synthetic-envelope strategy (cfg(test) inject path):**
+  - `payload_kind = "kv-spiller-test-K2"` so injected blocks cannot
+    collide with production `"kv-spiller-l<N>"` block scans;
+  - fixed `_test/K2` model_fingerprint namespace so they all land
+    under a known cleanup-friendly directory on disk;
+  - body sha256 == header.block_hash (envelope contract preserved);
+  - unique block_hash per seed → no `BlockIndex` dedup collision;
+  - parent_block_hash = None (no chain linkage — these are
+    throwaway test jobs).
+
+  **Unit-test count delta:** +3 tests in `spiller.rs::tests`
+  (`pending_writer_queue_depth_starts_at_zero`,
+  `test_only_inject_pending_spill_increases_depth`,
+  `test_only_inject_pending_spill_is_cfg_test_only`) →
+  cumulative 145/145 PASS (was 142/142 at iter-15 close).
+
+  **What this DOES NOT include:** the K2 v3 integration test that
+  swaps the iter-15 `force_eviction_via_symlink` trigger for the
+  new injection hook. That test is a follow-up iter — this iter
+  ships JUST the infra so K2 v3 can be exercised in a clean,
+  separate change without bundling a measurement run with a
+  surface change.
+
+  **K2 verdict still UNCHANGED.** ADR-017's K2 falsification by
+  iter-8's between-decodes measurement (overhead = −0.995) remains
+  the load-bearing falsifier. iter-16 ships the substrate the
+  follow-up K2 v3 integration test will use; the eventual v3
+  measurement (when run) will validate or supersede the v2 caveat,
+  not the iter-8 falsification itself.
+
+  **Verification gates (iter-16):**
+
+  | Gate | Result |
+  |---|---|
+  | `cargo check --release --bin hf2q` | exit 0 |
+  | `cargo test --release --bin hf2q kv_persist -- --test-threads=1` | 145/145 PASS |
+  | `cargo build --release --bin hf2q` (production) | exit 0 |
+  | `nm -j target/release/hf2q \| grep test_only_inject_pending_spill` | no output (symbol absent) |
+  | Main repo cwd-trap check | CLEAN (untracked-only unchanged) |
+
 #### All 3 kill-gates FALSIFIED — final status table
 
 | Kill-gate | Threshold | Measured | Verdict | Iter |

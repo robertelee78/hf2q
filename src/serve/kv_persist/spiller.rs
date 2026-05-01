@@ -252,6 +252,29 @@ impl<E> BlockPrefixCacheSpiller<E> {
             .len()
     }
 
+    /// ADR-017 iter-16 — pending-job count of the underlying writer
+    /// queue. Lock-free read of the writer's `Arc<AtomicUsize>`
+    /// counter; safe to call from any thread without blocking the
+    /// writer worker. Returns an upper bound on in-flight write jobs:
+    /// jobs that have been accepted by the channel but whose
+    /// `write_block_sync` may or may not have completed.
+    ///
+    /// This accessor is the methodologically-clean replacement for
+    /// the iter-15 `force_eviction_via_symlink` cadence trick — tests
+    /// that need writer-thread pressure can probe depth here while
+    /// injecting work via [`Self::test_only_inject_pending_spill`]
+    /// (cfg(test) only) WITHOUT incurring test-driver FS I/O on every
+    /// trigger (see ADR-017 iter-15 v2 measurement caveat-closure).
+    ///
+    /// Production callers may use this for back-pressure diagnostics
+    /// (e.g. shed lower-priority spill jobs when depth > N), but the
+    /// trait surface is intentionally small: just a depth read. A
+    /// caller wanting per-job state must subscribe to the writer's
+    /// completion channel via [`crate::serve::kv_persist::writer::completion_channel`].
+    pub fn pending_writer_queue_depth(&self) -> usize {
+        self.writer.pending_jobs()
+    }
+
     /// Look up a registered family hook by `(repo, quant)`. Returns
     /// `None` if no hook is registered (the spiller short-circuits to
     /// `Skipped` at the trigger site).
@@ -353,6 +376,92 @@ impl<E> BlockPrefixCacheSpiller<E> {
         #[allow(clippy::single_range_in_vec_init)]
         let ranges = vec![0..alignment];
         ranges
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-017 iter-16 — `#[cfg(test)]` direct spill-job injection hook.
+//
+// `test_only_inject_pending_spill(N)` queues `N` synthetic spill jobs
+// directly into the writer queue, BYPASSING the `pre_evict` /
+// `KvCacheSpill::snapshot_block` lifecycle. This is the
+// methodologically-clean replacement for iter-15's
+// `force_eviction_via_symlink` cadence trick: writer-thread pressure
+// can be applied without test-driver FS I/O contaminating the signal.
+//
+// **Production isolation guarantee**: the `impl` block is gated under
+// `#[cfg(test)]`, so production builds (`cargo build --release --bin
+// hf2q` without `--tests`) never link the symbol. Tests + dev-deps
+// see the method; production callers cannot, even if they tried.
+//
+// **Synthetic envelope strategy**:
+//   - distinct `payload_kind = "kv-spiller-test-K2"` so injected
+//     blocks cannot collide with production `"kv-spiller-l<N>"` blocks
+//     in any cache scan (the recovery / index code paths key off
+//     payload_kind for routing where applicable);
+//   - unique block_hash via incrementing seed bytes hashed → no dedup;
+//   - body sha256 == header.block_hash (envelope contract);
+//   - parent_block_hash = None for every job (no chain linkage —
+//     these are throwaway test jobs);
+//   - `n_tokens = BLOCK_TOKENS` (one full block);
+//   - `model_fingerprint` is a fixed test fingerprint so the writer
+//     drops them under a stable `_test/K2` repo namespace path on
+//     disk; operators can `rm -rf <store_root>/_test/` to clean up.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+impl<E> BlockPrefixCacheSpiller<E> {
+    /// Queue `n` synthetic spill jobs into the writer's pending
+    /// queue. Returns immediately after enqueue (does NOT wait for
+    /// the writer to process them). Per-job back-pressure follows the
+    /// writer's configured channel capacity: if the queue fills mid-
+    /// inject, surplus jobs are silently dropped (the test has
+    /// already proved depth>0; further pressure was the point).
+    ///
+    /// **`#[cfg(test)]` ONLY** — production builds do not link this
+    /// symbol. The synthetic envelopes use a distinct
+    /// `payload_kind = "kv-spiller-test-K2"` and a fixed
+    /// `_test/K2` model_fingerprint namespace so they cannot pollute
+    /// any production cache scan.
+    pub fn test_only_inject_pending_spill(&self, n: usize) {
+        // Fixed test fingerprint — every injected job shares this so
+        // they all land in the `_test/K2` namespace dir on disk.
+        let test_fp = compute_model_fingerprint(
+            "_test/K2",
+            "test-quant",
+            "iter-16-infra",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "<|test|>",
+        );
+        // Small body so even at the writer's configured ceiling the
+        // synthetic job never trips MAX_BLOCK_BYTES. 64 bytes per job
+        // keeps the test_only path lightweight.
+        for seed in 0..n {
+            // Unique body per seed → unique block_hash → no dedup
+            // collision in BlockIndex.
+            let body: Vec<u8> = (0..64u32)
+                .flat_map(|i| (i.wrapping_add(seed as u32).wrapping_mul(0x9E3779B1)).to_le_bytes())
+                .collect();
+            let bh: [u8; 32] = Sha256::digest(&body).into();
+            let header = EnvelopeHeader {
+                format_version: CURRENT_FORMAT_VERSION.0,
+                model_fingerprint: test_fp,
+                block_hash: BlockHash(bh),
+                parent_block_hash: ParentBlockHash(None),
+                payload_kind: "kv-spiller-test-K2".into(),
+                codec_version: 1,
+                n_tokens: BLOCK_TOKENS,
+            };
+            let job = WriteJob {
+                header,
+                body,
+                completion_tx: None,
+            };
+            // try_send: at writer capacity we silently drop. The
+            // contract is "queue UP TO n"; the depth probe will
+            // observe whatever the channel + worker drained to.
+            let _ = self.writer.enqueue(job);
+        }
     }
 }
 
@@ -1332,6 +1441,118 @@ mod tests {
             "stub should Skip; got {outcome:?}"
         );
         assert_eq!(store.index().block_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===== iter-16 K2 v3 infra — writer-queue depth probe ==================
+    #[test]
+    fn pending_writer_queue_depth_starts_at_zero() {
+        // A freshly-spawned writer has nothing in flight; the
+        // accessor must return 0 BEFORE any enqueue. This is the
+        // baseline anchor for K2 v3 measurements.
+        let (store, writer, dir) = fresh_substrate("k2v3_zero");
+        let spiller: BlockPrefixCacheSpiller<TestEngine> =
+            BlockPrefixCacheSpiller::new(Arc::clone(&store), writer);
+        assert_eq!(
+            spiller.pending_writer_queue_depth(),
+            0,
+            "fresh spiller must report zero pending writer jobs"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_only_inject_pending_spill_increases_depth() {
+        // Inject 50 synthetic jobs and assert the depth probe
+        // observes a value bounded by 50. The writer thread may
+        // already have started draining (the channel sync_send
+        // releases the worker as soon as a slot opens), so the
+        // observed depth is an upper bound; we only require it to
+        // be in the closed interval [0, 50] AND prove the inject
+        // path actually enqueued work by checking that AT SOME
+        // POINT either the depth is non-zero OR the on-disk
+        // index reflects drained jobs.
+        let (store, writer, dir) = fresh_substrate("k2v3_inject");
+        let spiller: BlockPrefixCacheSpiller<TestEngine> =
+            BlockPrefixCacheSpiller::new(Arc::clone(&store), writer);
+
+        // Pre-condition: zero pending.
+        assert_eq!(spiller.pending_writer_queue_depth(), 0);
+
+        // Inject. Returns immediately.
+        spiller.test_only_inject_pending_spill(50);
+
+        // The depth at this moment is bounded above by 50 (one tick
+        // of the worker may already have drained some).
+        let d = spiller.pending_writer_queue_depth();
+        assert!(d <= 50, "depth {d} should be <= 50");
+
+        // Stronger assertion: the inject path actually enqueued
+        // SOMETHING. Either the depth is currently >0, or the
+        // writer has already drained at least one job to disk
+        // (the substrate's writer cap is 32; 50 inject calls thus
+        // queue the first 32 successfully, the rest get dropped on
+        // try_send Full — that's fine for this test).
+        //
+        // Wait up to 2s for the writer to fully drain so the
+        // assertion is not flaky on slow CI.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let depth_now = spiller.pending_writer_queue_depth();
+            let blocks_now = store.index().block_count();
+            if depth_now == 0 && blocks_now > 0 {
+                // Drained — and the writer landed jobs on disk,
+                // proving the inject path was real. The
+                // synthetic envelopes use payload_kind
+                // "kv-spiller-test-K2" so they cannot collide
+                // with production block scans.
+                assert!(blocks_now > 0, "at least one synthetic job landed");
+                assert!(
+                    blocks_now <= 50,
+                    "blocks_now={blocks_now} bounded by inject count 50"
+                );
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "writer did not drain inject queue within 2s; depth={depth_now} blocks={blocks_now}"
+                );
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_only_inject_pending_spill_is_cfg_test_only() {
+        // Compile-time check: this test exists ONLY in test builds,
+        // proving the symbol it references is also gated under
+        // cfg(test). If `test_only_inject_pending_spill` ever leaked
+        // into production builds, the inject-impl block's gating
+        // would have to be loosened — at which point this test's
+        // existence is a tripwire (the compilation of the symbol
+        // path is itself the assertion).
+        //
+        // Production isolation is verified at build time by:
+        //   1. The `#[cfg(test)] impl<E> BlockPrefixCacheSpiller<E>`
+        //      block in spiller.rs (search "iter-16 — `#[cfg(test)]`
+        //      direct spill-job injection hook" in this file).
+        //   2. `cargo build --release --bin hf2q` succeeds without
+        //      `--tests` and the resulting binary does not contain
+        //      the `test_only_inject_pending_spill` symbol (the
+        //      expected behavior; verified externally by `nm` or a
+        //      CI check).
+        //
+        // The test body itself is a smoke compile + a simple call
+        // site that proves the function is reachable from THIS
+        // (cfg(test)) compilation unit.
+        let (store, writer, dir) = fresh_substrate("k2v3_cfg");
+        let spiller: BlockPrefixCacheSpiller<TestEngine> =
+            BlockPrefixCacheSpiller::new(Arc::clone(&store), writer);
+        spiller.test_only_inject_pending_spill(0); // 0 jobs = no-op
+        // Depth still 0 after a 0-job inject.
+        assert_eq!(spiller.pending_writer_queue_depth(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

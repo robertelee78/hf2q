@@ -35,6 +35,7 @@
 //! lands.
 
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvError, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -50,6 +51,13 @@ use crate::serve::kv_persist::block_store::{DiskBlockStore, WriteJob};
 pub struct AsyncWriterHandle {
     tx: Option<SyncSender<WriteJob>>,
     join_handle: Option<JoinHandle<()>>,
+    /// ADR-017 iter-16 — pending-job depth counter. Incremented on
+    /// every successful enqueue (`try_send` Ok / `send` Ok),
+    /// decremented in `process_job` after the worker dequeues + runs
+    /// the write. Lock-free `Arc<AtomicUsize>` so probes from any
+    /// thread are O(1) and never block the writer. Shared with the
+    /// worker via the `worker_loop` parameter list.
+    pending: Arc<AtomicUsize>,
 }
 
 impl AsyncWriterHandle {
@@ -59,15 +67,18 @@ impl AsyncWriterHandle {
     /// (4-16) so the spiller short-circuits under sustained load.
     pub fn spawn(store: Arc<DiskBlockStore>, channel_capacity: usize) -> Self {
         let (tx, rx) = mpsc::sync_channel::<WriteJob>(channel_capacity);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let pending_for_worker = Arc::clone(&pending);
         let join_handle = thread::Builder::new()
             .name("hf2q-kv-writer".to_string())
             .spawn(move || {
-                worker_loop(store, rx);
+                worker_loop(store, rx, pending_for_worker);
             })
             .expect("spawn hf2q-kv-writer thread");
         Self {
             tx: Some(tx),
             join_handle: Some(join_handle),
+            pending,
         }
     }
 
@@ -83,7 +94,15 @@ impl AsyncWriterHandle {
     #[allow(clippy::result_large_err)]
     pub fn enqueue(&self, job: WriteJob) -> Result<(), TrySendError<WriteJob>> {
         match self.tx.as_ref() {
-            Some(tx) => tx.try_send(job),
+            Some(tx) => match tx.try_send(job) {
+                Ok(()) => {
+                    // Successful enqueue → bump the pending-depth
+                    // counter. The worker decrements after dequeue.
+                    self.pending.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            },
             None => Err(TrySendError::Disconnected(job)),
         }
     }
@@ -98,9 +117,36 @@ impl AsyncWriterHandle {
         job: WriteJob,
     ) -> Result<(), mpsc::SendError<WriteJob>> {
         match self.tx.as_ref() {
-            Some(tx) => tx.send(job),
+            Some(tx) => match tx.send(job) {
+                Ok(()) => {
+                    self.pending.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            },
             None => Err(mpsc::SendError(job)),
         }
+    }
+
+    /// ADR-017 iter-16 — read the pending-job depth without taking
+    /// any lock. The counter is incremented inside [`Self::enqueue`] /
+    /// [`Self::enqueue_blocking`] on successful send, and decremented
+    /// inside `process_job` after the worker has dequeued the job
+    /// (i.e. AFTER the channel slot is freed). The visible value is
+    /// therefore an upper bound on the in-flight write count: at any
+    /// instant there may be up to `pending_jobs()` jobs that have been
+    /// accepted by the channel but whose `write_block_sync` may or may
+    /// not have completed.
+    ///
+    /// Production callers of `BlockPrefixCacheSpiller` may use this as
+    /// a back-pressure signal (e.g. shed lower-priority spill jobs
+    /// when depth > N). Tests use it to verify that the writer's
+    /// enqueue path actually queues work.
+    ///
+    /// `Ordering::Relaxed` is sufficient — the counter is a snapshot
+    /// metric, not a synchronization barrier.
+    pub fn pending_jobs(&self) -> usize {
+        self.pending.load(Ordering::Relaxed)
     }
 
     /// Drop the sender (signaling the worker to drain) and join the
@@ -148,7 +194,11 @@ impl Drop for AsyncWriterHandle {
 /// The worker loop. Drains jobs from `rx`, writes them via `store`,
 /// fires the per-job completion callback. On I/O error: log, fire
 /// the completion callback with `Err`, continue with the next job.
-fn worker_loop(store: Arc<DiskBlockStore>, rx: mpsc::Receiver<WriteJob>) {
+fn worker_loop(
+    store: Arc<DiskBlockStore>,
+    rx: mpsc::Receiver<WriteJob>,
+    pending: Arc<AtomicUsize>,
+) {
     loop {
         let job = match rx.recv() {
             Ok(j) => j,
@@ -159,14 +209,14 @@ fn worker_loop(store: Arc<DiskBlockStore>, rx: mpsc::Receiver<WriteJob>) {
                 break;
             }
         };
-        process_job(&store, job);
+        process_job(&store, job, &pending);
 
         // Opportunistically drain any further jobs without an extra
         // condvar hop. `try_recv` returns immediately; this lets us
         // shave a millisecond or two off batch enqueues.
         loop {
             match rx.try_recv() {
-                Ok(j) => process_job(&store, j),
+                Ok(j) => process_job(&store, j, &pending),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
             }
@@ -176,7 +226,7 @@ fn worker_loop(store: Arc<DiskBlockStore>, rx: mpsc::Receiver<WriteJob>) {
 
 /// Write a single job. Errors are logged + reported via the
 /// completion callback (if any); they NEVER panic the worker.
-fn process_job(store: &DiskBlockStore, job: WriteJob) {
+fn process_job(store: &DiskBlockStore, job: WriteJob, pending: &Arc<AtomicUsize>) {
     let WriteJob {
         header,
         body,
@@ -199,6 +249,14 @@ fn process_job(store: &DiskBlockStore, job: WriteJob) {
         // as "caller didn't care".
         let _ = tx.try_send(result);
     }
+    // ADR-017 iter-16 — pending-depth bookkeeping. Decrement AFTER the
+    // write + completion-ack so a probe taken between dequeue and
+    // ack-fire still observes the job as pending. `saturating_sub`
+    // semantics via `fetch_update` would be cleaner, but
+    // `fetch_sub` cannot underflow as long as every successful
+    // enqueue is paired with exactly one process_job — invariant
+    // held by the worker_loop drain pattern.
+    pending.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Convenience: build a oneshot-style completion channel for a single
