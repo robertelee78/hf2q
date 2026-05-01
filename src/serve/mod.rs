@@ -1122,8 +1122,29 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     tracing::info!("Qwen3.5 EOS token id: {}", eos_token_id);
 
     // ---- Load tokenizer ----
-    let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("Tokenizer load failed: {e}"))?;
+    //
+    // Qwen3.5/3.6 GGUFs are built from the GGUF's own `tokenizer.ggml.*`
+    // metadata arrays — NOT from the on-disk `tokenizer.json` that ships
+    // alongside the model. The on-disk HF tokenizer.json declares an
+    // `added_tokens` vocabulary (e.g. through 248,319 on the apex GGUF)
+    // that overshoots the GGUF's actual `tokenizer.ggml.tokens` count
+    // (248,044). Loading the HF tokenizer would emit out-of-vocab IDs
+    // (e.g. `<|im_start|>` = 248045) that the embedding loader's
+    // zero-pad fallback (`weight_loader.rs:699-707`) silently maps to
+    // an all-zero embedding — decapitating the residual stream and
+    // producing deterministic prompt-repetition gibberish on chat-
+    // templated prompts ("How to make bread? / How to noob bread?...").
+    //
+    // `crate::inference::models::qwen35::tokenizer::build_tokenizer_from_gguf`
+    // mirrors `llama.cpp`'s vocab path (`llama-vocab.cpp:2197-2253`)
+    // verbatim and produces token streams byte-equivalent to
+    // `llama-tokenize` on the same GGUF. `_tokenizer_path` is kept in
+    // scope only as a load-time diagnostic ("we found one alongside the
+    // GGUF, here's where") — its bytes are NOT consumed.
+    let _tokenizer_path = tokenizer_path;
+    let mut tokenizer =
+        crate::inference::models::qwen35::tokenizer::build_tokenizer_from_gguf(&gguf)
+            .map_err(|e| anyhow::anyhow!("GGUF-driven tokenizer build failed: {e}"))?;
     tokenizer
         .with_truncation(None)
         .map_err(|e| anyhow::anyhow!("Tokenizer truncation: {e}"))?;

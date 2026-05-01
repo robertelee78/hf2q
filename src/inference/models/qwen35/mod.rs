@@ -47,6 +47,7 @@ pub mod moe;
 pub mod mtp;
 pub mod mtp_weights_load;
 pub mod spec_decode;
+pub mod tokenizer;
 pub mod wave5b8_profile;
 pub mod weight_loader;
 pub mod weight_pool;
