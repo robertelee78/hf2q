@@ -258,9 +258,32 @@ impl HybridKvCache {
     /// - For each linear-attention layer: conv-state of shape `[K-1, conv_channels, n_seqs]`
     ///   and recurrent state of shape `[D_k, D_v, num_v_heads, n_seqs]`.
     ///
-    /// All buffers are initialized to zero by MlxDevice::alloc_buffer (which
-    /// uses StorageModeShared → the OS zeroes pages on first access; no
-    /// explicit memset needed).
+    /// All buffers are explicitly zero-initialized at the end of `new()`
+    /// via [`Self::reset`].
+    ///
+    /// **ADR-015 iter61a (broken-window fix):** the prior implementation
+    /// relied on `MTLResourceOptions::StorageModeShared` returning zeroed
+    /// pages "on first access" via the OS page-zeroing path.  Empirically
+    /// this is NOT guaranteed on macOS / Apple Silicon — a freshly
+    /// allocated Metal buffer can contain residual bytes from a recently
+    /// freed allocation in the same process / device heap region (the
+    /// Metal allocator coalesces and recycles pages within its private
+    /// pool before the OS sees the free).  In a cold process this even
+    /// surfaces as run-to-run non-determinism: the heap state at the
+    /// moment Metal services `newBufferWithLength` differs across cold
+    /// invocations.
+    ///
+    /// Concretely this caused divergent decoded tokens at temperature=0
+    /// (greedy) on Qwen3.5/3.6: the DeltaNet `ssm_conv` kernel reads
+    /// `conv_state_in` (K-1 history rows) on the very first prefill call
+    /// before any decode step has populated it, and the
+    /// `gated_delta_net` kernel similarly reads `state_in` (the
+    /// recurrent state) on the same first call.  Garbage in those
+    /// buffers contaminates the prefill logits, which are argmax'd to
+    /// produce the first decoded token — different garbage on each cold
+    /// run, different first tokens, different generations.  The
+    /// `feedback_no_broken_windows` standing directive applies: fix at
+    /// the source rather than relying on undefined initialization.
     ///
     /// # Memory footprint
     ///
@@ -331,7 +354,7 @@ impl HybridKvCache {
             None
         };
 
-        Ok(HybridKvCache {
+        let mut cache = HybridKvCache {
             full_attn,
             mtp_slot,
             linear_attn,
@@ -339,7 +362,83 @@ impl HybridKvCache {
             n_seqs,
             conv_channels,
             per_layer_slot,
-        })
+        };
+        // ADR-015 iter61a (broken-window fix): explicitly zero every owned
+        // GPU buffer to defend against StorageModeShared returning recycled,
+        // non-zero memory at allocation time.  See the doc-comment on
+        // `new()` above for the full rationale.  The cost is a one-time
+        // memset over the cache footprint at construction; on the
+        // 27B-dwq46 / 35B-apex configs this is dominated by full-attn
+        // K/V (~10 GB at max_seq=262144) but `cmd_generate_qwen35`
+        // sizes the cache to `prompt_len + max_tokens + 64` so in
+        // practice this is sub-100ms and amortized across the entire
+        // generation request.
+        cache.reset_all_buffers();
+        Ok(cache)
+    }
+
+    /// Internal helper used by `new()` to zero every owned GPU buffer at
+    /// construction time.  Distinct from the public `reset()` which only
+    /// zeros the linear-attention SSM state — full-attention K/V is
+    /// covered here for correctness against any future kernel that reads
+    /// past `current_len` (today's SDPA/flash-attn paths mask, but the
+    /// cost of belt-and-braces zeroing at construction is one memset).
+    fn reset_all_buffers(&mut self) {
+        // Cursor reset (matches `reset()`).
+        for slot in self.full_attn.iter_mut() {
+            for c in slot.current_len.iter_mut() {
+                *c = 0;
+            }
+            // Zero K/V buffers.  Float zero == bit zero, so writing
+            // through `as_mut_slice::<f32>` is well-defined.
+            if let Ok(s) = slot.k.as_mut_slice::<f32>() {
+                for v in s.iter_mut() {
+                    *v = 0.0;
+                }
+            }
+            if let Ok(s) = slot.v.as_mut_slice::<f32>() {
+                for v in s.iter_mut() {
+                    *v = 0.0;
+                }
+            }
+        }
+        if let Some(slot) = self.mtp_slot.as_mut() {
+            for c in slot.current_len.iter_mut() {
+                *c = 0;
+            }
+            if let Ok(s) = slot.k.as_mut_slice::<f32>() {
+                for v in s.iter_mut() {
+                    *v = 0.0;
+                }
+            }
+            if let Ok(s) = slot.v.as_mut_slice::<f32>() {
+                for v in s.iter_mut() {
+                    *v = 0.0;
+                }
+            }
+        }
+        for slot in self.linear_attn.iter_mut() {
+            if let Ok(s) = slot.conv_state.as_mut_slice::<f32>() {
+                for v in s.iter_mut() {
+                    *v = 0.0;
+                }
+            }
+            if let Ok(s) = slot.conv_state_scratch.as_mut_slice::<f32>() {
+                for v in s.iter_mut() {
+                    *v = 0.0;
+                }
+            }
+            if let Ok(s) = slot.recurrent.as_mut_slice::<f32>() {
+                for v in s.iter_mut() {
+                    *v = 0.0;
+                }
+            }
+            if let Ok(s) = slot.recurrent_scratch.as_mut_slice::<f32>() {
+                for v in s.iter_mut() {
+                    *v = 0.0;
+                }
+            }
+        }
     }
 
     /// Translate a model layer index (0..num_hidden_layers) to the matching
@@ -799,6 +898,70 @@ mod tests {
         assert_eq!(s.conv_state.element_count(), 3 * 8192 * 1);
         // recurrent: [D_k=128, D_v=128, num_v_heads=32, n_seqs=1]
         assert_eq!(s.recurrent.element_count(), 128 * 128 * 32 * 1);
+    }
+
+    /// ADR-015 iter61a: `HybridKvCache::new` MUST return cache buffers
+    /// whose contents are bit-identical zero in every owned `MlxBuffer`.
+    /// Relying on `MTLResourceOptions::StorageModeShared` first-touch
+    /// page zeroing was empirically false (cold-process greedy decode
+    /// produced different first tokens each cold run on Qwen3.6 27B
+    /// dwq46 + apex q4_0-flat).  Regression bar: every f32 in every
+    /// owned slot reads as `0.0_f32` (bit pattern `0x0000_0000`).
+    #[test]
+    fn new_returns_zero_initialized_buffers_iter61a() {
+        let cfg = moe_cfg_40layer();
+        let device = MlxDevice::new().expect("device");
+        let cache = HybridKvCache::new(&cfg, &device, 64, 2).expect("alloc");
+
+        // Every full-attn K/V byte must be zero.
+        for (idx, slot) in cache.full_attn.iter().enumerate() {
+            let k = slot.k.as_slice::<f32>().expect("k slice");
+            assert!(
+                k.iter().all(|v| v.to_bits() == 0),
+                "full_attn[{}].k has non-zero bytes after new()",
+                idx
+            );
+            let v = slot.v.as_slice::<f32>().expect("v slice");
+            assert!(
+                v.iter().all(|x| x.to_bits() == 0),
+                "full_attn[{}].v has non-zero bytes after new()",
+                idx
+            );
+            assert!(slot.current_len.iter().all(|&c| c == 0));
+        }
+        // Every linear-attn SSM-state byte must be zero.
+        for (idx, slot) in cache.linear_attn.iter().enumerate() {
+            let conv = slot.conv_state.as_slice::<f32>().expect("conv slice");
+            assert!(
+                conv.iter().all(|v| v.to_bits() == 0),
+                "linear_attn[{}].conv_state has non-zero bytes after new()",
+                idx
+            );
+            let conv_s = slot
+                .conv_state_scratch
+                .as_slice::<f32>()
+                .expect("conv_scratch slice");
+            assert!(
+                conv_s.iter().all(|v| v.to_bits() == 0),
+                "linear_attn[{}].conv_state_scratch has non-zero bytes after new()",
+                idx
+            );
+            let rec = slot.recurrent.as_slice::<f32>().expect("rec slice");
+            assert!(
+                rec.iter().all(|v| v.to_bits() == 0),
+                "linear_attn[{}].recurrent has non-zero bytes after new()",
+                idx
+            );
+            let rec_s = slot
+                .recurrent_scratch
+                .as_slice::<f32>()
+                .expect("rec_scratch slice");
+            assert!(
+                rec_s.iter().all(|v| v.to_bits() == 0),
+                "linear_attn[{}].recurrent_scratch has non-zero bytes after new()",
+                idx
+            );
+        }
     }
 
     #[test]
