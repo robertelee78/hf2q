@@ -2257,3 +2257,66 @@ This blocked loading any Qwen3.6 model with MTP nextn tensors emitted (i.e. ever
 - 7 other `inference::models::qwen35` files: thread `mtp_use_dedicated_embeddings: true` through synthetic-config literals (forward_cpu, forward_gpu, full_attn, weight_loader, activation_capture_real, kv_cache, model, spec_decode).
 
 No env-gating, no fallback-of-fallback, no TODO stubs (mantra: "No fallback. No stub.").
+
+### 2026-04-30 — P14 follow-up · spec_decode runtime: prev_hidden shape + cross-device residency-set
+
+With the loader fix above, `target/release/hf2q generate ... --speculative` (i.e. `HF2Q_SPEC_DECODE=1`) on the live `qwen3.6-27b-mtp-q4_0.gguf` exposed two pre-existing runtime defects in `spec_decode.rs` that had been masked while no on-disk Qwen3.6 GGUF carried MTP nextn tensors. Both are now fixed; live spec-decode produces coherent output on the 27B MTP-bearing model.
+
+**(a) `prev_hidden` shape contract violation.** `Qwen35Model::forward_gpu_with_hidden` returns the FULL residual stream (`element_count() == seq_len * hidden_size`) — same buffer the verifier writes during the layer-stack forward pass. `MtpWeights::forward_draft` requires exactly `[1, hidden_size]` for the `prev_hidden` argument (it RMSNorms a single token and projects it through `eh_proj_hidden`). The prefill path passed the full prompt-length residual straight through:
+
+```
+ERROR ... SpecDecode MTP forward_draft:
+  MTP prev_hidden has 87040 elements, expected 5120
+                     ^ 17 (prompt tokens) * 5120 (hidden_size)
+```
+
+**Fix.** New `last_hidden_row(&MlxBuffer, hidden_size) -> MlxBuffer` helper in `spec_decode.rs` uses `MlxBuffer::slice_view` (zero-copy view + offset-aware `setBuffer:offset:atIndex:`) to project the final row out of the `[seq_len, H]` residual. Mirrors `apply_output_head_gpu_last` at `forward_gpu.rs:530-545`. Applied at both call sites: prefill (where `seq_len = prompt.len()`) and per-step verifier (where `seq_len = 1`, slice is identity-shaped but makes the `[1, H]` contract explicit).
+
+Three new unit tests cover the contract: (i) `last_hidden_row_slices_final_token_from_prefill_shape` — `seq_len=5, H=8` → returns shape `[H]` with `byte_offset = (seq_len-1)*H*sizeof(F32)`; (ii) `last_hidden_row_handles_seq_len_one_identity` — `seq_len=1` → identity slice with `byte_offset=0`; (iii) `last_hidden_row_rejects_misaligned_buffer` — non-multiple-of-H buffer rejected. Validation is on `element_count + byte_offset` (the GPU-visible contract honored by `set_buffer:offset:`), not CPU `as_slice` (which ignores `byte_offset`).
+
+**(b) Cross-device `MlxBufferPool` residency-set mismatch.** With the shape fix in place, the second alloc inside `forward_draft` failed:
+
+```
+ERROR ... SpecDecode MTP forward_draft: alloc out:
+  Invalid argument: MlxBufferPool cannot mix residency-enabled devices
+```
+
+**Mechanism.** Each `MlxDevice::new()` on macOS 15+ creates its own `ResidencySet`; the global `MlxBufferPool` (`/opt/mlx-native/src/buffer_pool.rs:300-310, 376-385`) tracks the residency-set owner the first time any pool-managed buffer is registered, and rejects any subsequent registration from a different owner. `SpecDecode::new` was instantiating its own `MlxDevice` for kv-cache + MTP scratch, while the verifier lazily instantiated a SECOND device inside its thread-local `GPU_CACHE` on the first `forward_gpu*` call. The MTP-scratch pool buffer carried SpecDecode's residency-set, but by the time it was registered, the pool had already adopted the verifier's set — hence "cannot mix".
+
+**Fix.** Two new public methods on `Qwen35Model`:
+
+- `ensure_gpu_cache_primed(&self) -> Result<()>` — eagerly initializes `GPU_CACHE` (one-time weight upload + kernel-registry construction). Idempotent.
+- `with_gpu_cache_mut<R>(&self, f: impl FnOnce(&MlxDevice, &mut KernelRegistry) -> Result<R>) -> Result<R>` — runs a closure with mutable access to the verifier's cached device + registry.
+
+`SpecDecode::new` now calls `ensure_gpu_cache_primed` first, then constructs `HybridKvCache` against the verifier's device via `with_gpu_cache_mut`. The per-step MTP draft (`forward_draft` + `argmax_logits_gpu` + token-embedding upload) runs inside a `with_gpu_cache_mut` closure, so all SpecDecode allocations land on the same residency-set as the verifier's. `embed_token` was refactored into a free function `embed_token_on_device(token_embd, token, hidden_size, device)` to make the closure-capture explicit.
+
+**LIVE receipt (M5 Max, worktree HEAD, `qwen3.6-27b-mtp-q4_0.gguf`):**
+
+```
+$ HF2Q_SPEC_DECODE=1 target/release/hf2q generate \
+    --model /opt/hf2q/models/qwen3.6-27b-mtp-q4_0/qwen3.6-27b-mtp-q4_0.gguf \
+    --prompt "What is 2+2?" --max-tokens 16 --temperature 0 --speculative
+hf2q · M5 Max · mlx-native
+Qwen3_5ForConditionalGeneration · loaded in 8.4s · 64 layers · 17.2 GB
+prefill: 17 tok in 25937ms (1 tok/s)
+
+2+2=4
+2+2=4
+2+2=
+
+--- mlx-native (qwen35 spec): 16 tokens in 99.06s (0.2 tok/s, accept 86.7%) ---
+```
+
+Coherent decode (greedy "4" answer, 86.7% acceptance rate). Numbers were captured under heavy contention: a parallel session was running 35B-A3B inference on the same M5 Max (`PID 41494`, ~1.36 GB resident, started 4 min before this run). Per `feedback_pre_bench_process_audit.md` and `feedback_check_ram_before_inference.md` — RAM dropped from 46 GB free to ~2.5 GB free across the run — these tok/s figures are CONTAMINATED and not the throughput-bench gate result. The acceptance-rate (86.7% on 15 proposals) IS comparable across runs because it is a logits-equality count, not a wall-clock measurement.
+
+**Tests.**
+
+- `cargo test --release --bin hf2q "inference::models::qwen35::spec_decode"` — 5/0/0 (3 new shape-contract tests + 2 existing).
+- `cargo test --release --bin hf2q "inference::models::qwen35::mtp"` — 6/0/1 (existing pass-rate maintained; ignored test is the apex-real-Metal one).
+
+**Files touched (worktree `fix/adr013-spec-decode-prev-hidden`).**
+
+- `src/inference/models/qwen35/spec_decode.rs` — add `last_hidden_row` helper, slice prefill+verify hidden buffers, defer kv-cache alloc, route MTP forward_draft through `with_gpu_cache_mut`, free-function `embed_token_on_device`. +99 / -28 LOC.
+- `src/inference/models/qwen35/forward_gpu.rs` — add `ensure_gpu_cache_primed` + `with_gpu_cache_mut` public accessors; import `anyhow::ensure`. +83 / -1 LOC.
+
+**Throughput-bench gate (P14 deferred end-gate) STATUS:** still partial, but UNBLOCKED. The prev_hidden + residency-set defects no longer block live spec-decode on Qwen3.6-27B-MTP. The bench gate (`scripts/qwen35_bench.sh` baseline vs `HF2Q_SPEC_DECODE=1` baseline) requires a cold-clean SoC per `feedback_perf_gate_thermal_methodology.md` and `feedback_pre_bench_process_audit.md`. Today's worktree run was contaminated by a parallel 35B-A3B inference session; deferring the apples-to-apples bench to a clean SoC is the correct call vs publishing a number the methodology says is noise. Mechanically, the path now works end-to-end and the 86.7% greedy acceptance rate is consistent with literature for shared-architecture MTP draft heads (typical range 70-90% for greedy T=0 in-domain prompts).

@@ -37,7 +37,7 @@
 //! This stacks the per-phase BF16-cast tolerances (≤1e-3 per projection over
 //! ≈8 projections across the 4-layer stack).
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::ops::elementwise::elementwise_add;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 use std::sync::OnceLock;
@@ -1106,6 +1106,96 @@ impl Qwen35Model {
         let hidden = hidden_out
             .ok_or_else(|| anyhow!("forward_gpu_with_hidden: hidden buffer was not captured"))?;
         Ok((logits, hidden))
+    }
+
+    /// Eagerly initialize `GPU_CACHE` if not already primed. SpecDecode
+    /// calls this BEFORE its first `HybridKvCache::new` so the kv_cache
+    /// is allocated against the same `MlxDevice` the verifier uses;
+    /// otherwise mixing two residency-enabled devices triggers
+    /// "MlxBufferPool cannot mix residency-enabled devices".
+    ///
+    /// Idempotent: returns immediately if the cache already belongs to
+    /// this model. Performs the same one-time weight upload that
+    /// `forward_gpu_impl` does on its first call.
+    pub fn ensure_gpu_cache_primed(&self) -> Result<()> {
+        let self_ptr = self as *const _ as *const ();
+        GPU_CACHE.with(|cell| -> Result<()> {
+            let mut cache = cell.borrow_mut();
+            if cache.as_ref().map_or(true, |c| c.model_ptr != self_ptr) {
+                let device = MlxDevice::new().context("ensure_gpu_cache_primed: MlxDevice::new")?;
+                let mut registry = KernelRegistry::new();
+                mlx_native::ops::flash_attn_prefill::register(&mut registry);
+                let layer_weights = self.upload_layer_weights_gpu(&device)?;
+                let lm_head_f32 =
+                    upload_f32_weight(&self.output_weight, &device).context("upload lm_head")?;
+                let n_w = self.output_weight.len();
+                let lm_head_bf16 = {
+                    let bf16_buf = device
+                        .alloc_buffer(n_w * 2, DType::BF16, vec![n_w])
+                        .map_err(|e| anyhow!("alloc lm_head_bf16: {e}"))?;
+                    let mut enc =
+                        device.command_encoder().context("enc lm_head_bf16 cast")?;
+                    mlx_native::ops::elementwise::cast(
+                        &mut enc,
+                        &mut registry,
+                        device.metal_device(),
+                        &lm_head_f32,
+                        &bf16_buf,
+                        n_w,
+                        mlx_native::ops::elementwise::CastDirection::F32ToBF16,
+                    )
+                    .context("cast lm_head F32→BF16 at load")?;
+                    enc.commit_and_wait().context("commit lm_head cast")?;
+                    super::weight_pool::register_weight_buffer(&device, &bf16_buf)
+                        .map_err(|e| anyhow!("register lm_head_bf16: {e}"))?;
+                    bf16_buf
+                };
+                let lm_head_q4 = upload_q4_0_from_f32(&self.output_weight, &device)
+                    .context("upload lm_head_q4")?;
+                let output_head = OutputHeadGpu {
+                    norm_w: upload_f32_weight(&self.output_norm, &device)
+                        .context("upload output_norm")?,
+                    lm_head_bf16,
+                    lm_head_q4,
+                };
+                *cache = Some(ForwardGpuCache {
+                    model_ptr: self_ptr,
+                    device,
+                    registry,
+                    layer_weights,
+                    output_head,
+                    decode_bufs: None,
+                });
+            }
+            Ok(())
+        })
+    }
+
+    /// Run a closure with mutable access to the verifier's cached GPU
+    /// device + kernel registry. SpecDecode uses this so the MTP draft
+    /// block runs on the SAME `MlxDevice` as the verifier — the global
+    /// `MlxBufferPool` rejects mixing residency-enabled devices, so a
+    /// second `MlxDevice::new()` causes "cannot mix residency-enabled
+    /// devices" at the first MTP forward_draft alloc.
+    ///
+    /// Caller must have invoked `ensure_gpu_cache_primed` (or any
+    /// `forward_gpu*` method) at least once on this model first.
+    pub fn with_gpu_cache_mut<R>(
+        &self,
+        f: impl FnOnce(&MlxDevice, &mut KernelRegistry) -> Result<R>,
+    ) -> Result<R> {
+        let self_ptr = self as *const _ as *const ();
+        GPU_CACHE.with(|cell| -> Result<R> {
+            let mut guard = cell.borrow_mut();
+            let cache = guard
+                .as_mut()
+                .ok_or_else(|| anyhow!("with_gpu_cache_mut: GPU_CACHE not initialized; call ensure_gpu_cache_primed first"))?;
+            ensure!(
+                cache.model_ptr == self_ptr,
+                "with_gpu_cache_mut: GPU_CACHE belongs to a different Qwen35Model"
+            );
+            f(&cache.device, &mut cache.registry)
+        })
     }
 
     /// GPU forward + per-layer activation capture for ADR-012 P9b
