@@ -1059,6 +1059,58 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-05-01 — P19 H12 LANDED · hoisted `upload_layer_weights_gpu` out of the prefill timer ⇒ pp31 metric jumps 23.80→153.50 t/s (6.4×), pp101 32.10→247.50 t/s (7.7×); real steady-state gap exposed at **3.4–6.7×** vs llama, not the 28–52× artifact
+
+**Hypothesis (from P19 step 1, commit `342b7d6`).** `cmd_generate_qwen35`'s `prefill_start = Instant::now()` (`src/serve/mod.rs:1348`) fires immediately before `forward_gpu_last_logits`, and `forward_gpu_impl` runs the FIRST-CALL `upload_layer_weights_gpu` (~17 GB Q4 → Metal heap, ~984 ms one-shot) inside that span. llama.cpp's `prompt eval time` excludes model load by construction (the model is loaded into Metal-backend memory before the timer starts in `llama-completion`). So the apparent 28–52× prefill gap was 50–70% accounting bias, not a steady-state compute deficit. Test: lift the cache-init out of `forward_gpu_impl` to a public method and call it from `cmd_generate_qwen35` BEFORE `prefill_start`. Compute unchanged, only the timer-span moves. Predict: pp31 reported `Prefill tok/s` ~5–7× higher; decode unchanged; coherence intact; full unit-test suite green; total wall time unchanged within noise.
+
+**Implementation (this commit).** Reused the pre-existing `Qwen35Model::ensure_gpu_cache_primed` method (introduced for spec-decode device sharing; `forward_gpu.rs:1155-1207`), added the missing `wave5b8_profile::Section::start(SectionKind::UploadWeights)` instrumentation around `upload_layer_weights_gpu` so the upload cost is still tracked when the warmup is invoked from the model-load path. Replaced `forward_gpu_impl`'s 70-line inline cache-init block with `self.ensure_gpu_cache_primed()?` — idempotent, O(1) on second-call. Added `model.ensure_gpu_cache_primed()?` calls in `cmd_generate_qwen35` AFTER `Qwen35Model::load_from_gguf` and BEFORE both `prefill_start` instances (greedy + spec-decode branches). Net diff: −80 lines duplicated cache-init in `forward_gpu_impl`, +18 lines (warmup call + comment), +6 lines (profile instrumentation in the existing primed method). Functionality preserved: same upload, same lm_head BF16/Q4_0 pre-quant, same `flash_attn_prefill` registration, same per-thread `GPU_CACHE` keyed by model `self_ptr`.
+
+**Verification — `cargo test --release --bin hf2q` qwen35 module:** 172 passed / 0 failed / 10 ignored / 2,291 filtered out. No regression.
+
+**Verification — coherence smoke (single cold run, fixed prompt):**
+
+```
+prefill: 39 tok in 361ms (108 tok/s)
+
+Okay, I need to explain what a transformer neural network is in exactly three
+sentences. Let's break it down. First, I should mention that it's a type of
+neural network architecture. Then, I should highlight its key feature, which
+is the attention mechanism. This allows the model to weigh the importance of
+different parts of the input data. …
+```
+
+`ascii_ratio = 0.981`, full English transformer-explanation prose. `<think>` reasoning blocks land correctly.
+
+**Verification — 3-rep cold-process P17b harness re-bench (M5 Max, dwq48 19.6 GB, hf2q `186c1fa` HEAD-with-edits, mlx-native `4db99f4`).**
+
+| pp | tg | hf2q **before H12** | hf2q **after H12** | hf2q delta | llama-completion | llama-bench | hf2q/llama-completion (after) | hf2q/llama-bench (after) |
+|---|---|---|---|---|---|---|---|---|
+| pp31  | tg64 | 23.80 (23.40..23.80)   | **153.50** (150.10..196.20) | **+545%** (×6.45) | 657.41 (620.58..662.22) | 677.64 (677.41..677.86) | 0.23× | 0.23× |
+| pp101 | tg64 | 32.10 (32.10..32.10)   | **247.50** (183.30..248.70) | **+671%** (×7.71) | 853.37 (852.47..853.67) | 1686.63 (1683.63..1691.62) | 0.29× | 0.15× |
+
+| pp | tg | hf2q decode **before H12** | hf2q decode **after H12** | llama-completion | llama-bench |
+|---|---|---|---|---|---|
+| pp31  | tg64 | 125.60 (124.80..125.80) | 124.30 (123.60..125.80) | 118.51 | 116.96 (1.05–1.06× hf2q-favoring still) |
+| pp101 | tg64 | 124.30 (124.20..124.40) | 124.30 (121.10..124.40) | 118.42 | 116.96 |
+
+**Significance.**
+
+- **Apparent gap closed by ~6× across the board.** The 28–52× prefill ratios in the retracted P17 + the freshly-honest P17b were materially driven by metric semantics, not compute. Hf2q's reported `Prefill tok/s` is now apples-to-apples with llama.cpp's `prompt eval time`.
+- **Real steady-state gap is 3.4× (pp31) to 6.7× (pp101 vs llama-bench).** This is the actionable hf2q-vs-llama compute deficit on Q4_K dwq48 prefill — substantial but no longer alarming, and it widens with prompt length (the regime where `mm_id` should help us most). H9/H10/H11 are the open hypothesis tree for closing it.
+- **Decode parity holds.** Hf2q stays 1.05–1.06× faster than both llama-completion and llama-bench at tg64, regardless of pp. The 0.03× regression vs P17b's 1.08× is within run-to-run noise.
+- **Total wall time unchanged within noise.** This is purely a timer-span fix; no compute was eliminated.
+- **Variance widens at the maximum.** pp31 best-of-3 is 196 t/s (probably a partial-warm filesystem cache run), pp101 best-of-3 is 248. Median is the load-bearing number for the gate; min is the conservative cold-cold floor.
+
+**Why pre-existing `ensure_gpu_cache_primed` was missing this caller.** That method was added for spec-decode device-sharing (`Qwen35Model::with_gpu_cache_mut` requires a primed cache so MTP draft-block runs on the same `MlxDevice` as the verifier — `forward_gpu.rs:1218-1234`), but never wired into the regular greedy `cmd_generate_qwen35` path. Mantra applies here: **comments and ADR text are starting points; code is truth.** The doc-mentioned "we cache them in a thread-local on first call" was structurally correct but operationally hostile to the bench metric.
+
+**What did NOT change.** mlx-native HEAD, mlx-native Q4_K kernel tests (15/15), all qwen35 unit tests (172/172), sourdough byte-prefix gate, coherence ship gate, decode tok/s, total wall time per cell, GGUF on-disk format, MTP path, spec-decode behaviour. Pure timer-span fix. P17 retraction stands.
+
+**Next up (P19 step 3 candidates, queued, all measurement-first per `feedback_evidence_first_no_blind_kernel_rewrites`).** The 3.4–6.7× steady-state gap is now well-defined. Order by quickest-to-falsify:
+
+- **H9** (per-layer commit boundary): count `commit_and_wait` calls/prefill in `forward_gpu_impl` vs `ggml_metal_graph_compute`. If hf2q does N×40 commits/prefill where N>1, single-CB-per-graph refactor is a low-risk multiplicative win.
+- **H11** (mm_id setup amortization at pp ≤ 256): run the harness with `MM_ID_ROUTING_THRESHOLD = 9999` env-override (forces `mv_id` even at pp101). If `mv_id`-only is competitive, the mm_id `map0` + 8 KB shmem stage is the dominant per-call cost.
+- **H10** (DeltaNet recurrence, 22% bucket): instrument the `chunk_gated_delta_rule` GPU kernel wall vs CPU CB-management wall via Metal counter sample buffers. Not a refactor target until measured.
+
 ### 2026-05-01 — P19 step 1 · `wave5b8_profile` section breakdown for pp ≈ 56 dwq48 prefill ⇒ apparent prefill gap is ~50% one-shot weight upload bias; real steady-state gap is 7–18×, lives in `layer.linear_total` (DeltaNet) and `layer.ffn_dispatch` (MoE FFN dispatch wall)
 
 **Setup.** hf2q `41e8098`, mlx-native `4db99f4`, M5 Max, 128 GB unified, single cold process, `HF2Q_PROFILE_W5B8=1 HF2Q_PROFILE_W5B22=1`, prompt = 56 tokens (the BPE tokenization of two repetitions of the bench harness's BASE_PASSAGE), `--max-tokens 8`.

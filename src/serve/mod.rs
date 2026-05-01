@@ -1255,6 +1255,12 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     if use_spec_decode {
         use crate::inference::models::qwen35::spec_decode::SpecDecode;
         tracing::info!("Qwen3.5 speculative decode enabled");
+        // ADR-013 P19 H12: warm GPU cache before SpecDecode's internal prefill
+        // timer starts (matches the greedy branch). Idempotent if SpecDecode
+        // already calls `ensure_gpu_cache_primed` internally.
+        model
+            .ensure_gpu_cache_primed()
+            .context("Qwen35Model::ensure_gpu_cache_primed (P19 H12 spec-decode warmup)")?;
         let result = SpecDecode::run_with_eos(
             &model,
             &prompt_tokens,
@@ -1343,6 +1349,23 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         }
         flat
     };
+
+    // ADR-013 P19 H12 (2026-05-01): warm the per-thread GPU cache (one-shot
+    // ~17 GB Q4 weight materialization onto Metal heap + lm_head BF16/Q4_0
+    // pre-quant + flash_attn_prefill kernel registration) BEFORE the prefill
+    // timer starts. Without this, the ~984 ms upload was charged to
+    // `prefill_tok_s`, producing a 28× apparent gap vs llama.cpp's
+    // `prompt eval time` (which excludes model load by construction).
+    // Compute is unchanged; only the timer-span moves. `wave5b8_profile`'s
+    // `UploadWeights` section still tracks the cost — it just lives here now.
+    let warmup_start = std::time::Instant::now();
+    model
+        .ensure_gpu_cache_primed()
+        .context("Qwen35Model::ensure_gpu_cache_primed (P19 H12 warmup)")?;
+    tracing::info!(
+        "Qwen3.5 GPU warmup (P19 H12): {:.2}s",
+        warmup_start.elapsed().as_secs_f64()
+    );
 
     tracing::info!("Qwen3.5 prefill: seq_len={}", prompt_len);
     let prefill_start = std::time::Instant::now();

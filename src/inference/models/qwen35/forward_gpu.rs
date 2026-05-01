@@ -1160,7 +1160,15 @@ impl Qwen35Model {
                 let device = MlxDevice::new().context("ensure_gpu_cache_primed: MlxDevice::new")?;
                 let mut registry = KernelRegistry::new();
                 mlx_native::ops::flash_attn_prefill::register(&mut registry);
-                let layer_weights = self.upload_layer_weights_gpu(&device)?;
+                // Wave 5b.8 profiling — keep `UploadWeights` accounting in the
+                // primed path too, now that ADR-013 P19 H12 has lifted this
+                // to the model-load-time call site.
+                let layer_weights = {
+                    let _t = super::wave5b8_profile::Section::start(
+                        super::wave5b8_profile::SectionKind::UploadWeights,
+                    );
+                    self.upload_layer_weights_gpu(&device)?
+                };
                 let lm_head_f32 =
                     upload_f32_weight(&self.output_weight, &device).context("upload lm_head")?;
                 let n_w = self.output_weight.len();
@@ -1287,82 +1295,23 @@ impl Qwen35Model {
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;
-        let self_ptr = self as *const _ as *const ();
 
         // ---- Acquire GPU device + kernel registry + per-layer weights ----
         //
-        // Weights are expensive to upload (25 GB GGUF).  We cache them in a
-        // thread-local on first call and reuse across all decode tokens.
-        // If the model pointer changes (rare; only on model swap) we rebuild.
-        GPU_CACHE.with(|cell| -> Result<()> {
-            let mut cache = cell.borrow_mut();
-            if cache.as_ref().map_or(true, |c| c.model_ptr != self_ptr) {
-                let device = MlxDevice::new().context("forward_gpu: MlxDevice::new")?;
-                let mut registry = KernelRegistry::new();
-                // Wave 5b.10: register flash_attn_prefill kernel family for
-                // the Qwen3.5 FA prefill path (replaces legacy `sdpa`).
-                // Mirrors `src/serve/gpu.rs:64` (Gemma's GpuContext).
-                mlx_native::ops::flash_attn_prefill::register(&mut registry);
-                // Wave 5b.8: time the one-time `upload_layer_weights_gpu`
-                // first-call cost (~17 GB Q4 materialization onto Metal heap).
-                let layer_weights = {
-                    let _t = super::wave5b8_profile::Section::start(
-                        super::wave5b8_profile::SectionKind::UploadWeights,
-                    );
-                    self.upload_layer_weights_gpu(&device)?
-                };
-                // W-5b.7 iter 2: lm_head F32 / Q4_0 + output_norm join the
-                // weight pool's residency set via the `_weight` / Q4_0
-                // helpers (which auto-register).
-                let lm_head_f32 =
-                    upload_f32_weight(&self.output_weight, &device).context("upload lm_head")?;
-                // Pre-cast lm_head F32 → BF16 once at load time.
-                // apply_linear_projection_f32 detects DType::BF16 and skips
-                // the per-token cast (~2ms saved per decode step).
-                let n_w = self.output_weight.len();
-                let lm_head_bf16 = {
-                    let bf16_buf = device
-                        .alloc_buffer(n_w * 2, DType::BF16, vec![n_w])
-                        .map_err(|e| anyhow!("alloc lm_head_bf16: {e}"))?;
-                    let mut enc = device.command_encoder().context("enc lm_head_bf16 cast")?;
-                    mlx_native::ops::elementwise::cast(
-                        &mut enc,
-                        &mut registry,
-                        device.metal_device(),
-                        &lm_head_f32,
-                        &bf16_buf,
-                        n_w,
-                        mlx_native::ops::elementwise::CastDirection::F32ToBF16,
-                    )
-                    .context("cast lm_head F32→BF16 at load")?;
-                    enc.commit_and_wait().context("commit lm_head cast")?;
-                    // W-5b.7 iter 2: register the BF16 lm_head copy.
-                    super::weight_pool::register_weight_buffer(&device, &bf16_buf)
-                        .map_err(|e| anyhow!("register lm_head_bf16: {e}"))?;
-                    bf16_buf
-                };
-                // Pre-quantize lm_head to Q4_0 for decode (M=1) — 3.57× less
-                // bandwidth vs BF16 (~1.5ms vs ~5.4ms per decode step).
-                // K=hidden_size=7168 is divisible by 32, so Q4_0 is valid.
-                let lm_head_q4 = upload_q4_0_from_f32(&self.output_weight, &device)
-                    .context("upload lm_head_q4")?;
-                let output_head = OutputHeadGpu {
-                    norm_w: upload_f32_weight(&self.output_norm, &device)
-                        .context("upload output_norm")?,
-                    lm_head_bf16,
-                    lm_head_q4,
-                };
-                *cache = Some(ForwardGpuCache {
-                    model_ptr: self_ptr,
-                    device,
-                    registry,
-                    layer_weights,
-                    output_head,
-                    decode_bufs: None, // initialized lazily on first greedy decode
-                });
-            }
-            Ok(())
-        })?;
+        // Weights are expensive to upload (~17 GB Q4 onto Metal heap). The
+        // pre-existing `ensure_gpu_cache_primed` method does the upload +
+        // lm_head BF16/Q4_0 pre-quant + flash_attn_prefill kernel registration
+        // and caches everything in a per-thread `GPU_CACHE` keyed by `self`
+        // pointer. Calling it here is idempotent: first-call from a non-warmed
+        // path still works, repeat calls are O(1).
+        //
+        // ADR-013 P19 H12 (2026-05-01): `cmd_generate_qwen35` now invokes
+        // `ensure_gpu_cache_primed` AFTER `Qwen35Model::load_from_gguf` but
+        // BEFORE `prefill_start = Instant::now()`, so the one-shot ~17 GB
+        // upload no longer pollutes the prefill timer. Compute is unchanged;
+        // only the timer-span moves to expose llama.cpp-comparable
+        // `prompt eval time` semantics. Verified by 3-rep cold bench.
+        self.ensure_gpu_cache_primed()?;
 
         // ---- Upload positions buffer ----
         // Positions change every call (new token index) so they cannot be cached.
