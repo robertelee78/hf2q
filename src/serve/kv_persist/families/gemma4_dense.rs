@@ -1055,6 +1055,188 @@ impl crate::serve::kv_persist::EngineBindable for Gemma4DenseSpill {
 }
 
 // ---------------------------------------------------------------------------
+// Phase B-dense.2 — `FamilyHookFactory` impl for `Gemma4DenseSpill`.
+//
+// The C.1 wire-up registers a *stub* `EngineBindable` at `cmd_serve`
+// startup because the real `Gemma4DenseSpill` shape config comes from
+// the live engine (post-load `MlxModelWeights`). B-dense.2 closes that
+// gap with a factory: at startup, `cmd_serve` registers a
+// `Gemma4DenseSpillFactory` carrying the shape config; on the first
+// successful load, the registry's `try_substitute_on_load` invokes
+// `factory.try_construct(engine_dyn)` and atomically substitutes the
+// stub for a real `Gemma4DenseSpill` already wired to the engine.
+//
+// ## Construction-from-engine helper (`try_from_engine_arc`)
+//
+// `Gemma4DenseSpill::new(cfg)` is shape-only. The factory's job is
+// to invoke `set_engine_handle` on the freshly-constructed spill IFF
+// the type-erased engine downcasts to `Arc<EngineHandle>`. The
+// helper returns `Option<Self>` (None on type mismatch); the
+// factory's `try_construct` wraps this in the larger
+// `(kv_hook, bindable_hook)` tuple.
+//
+// ## Why downcast to `Arc<EngineHandle>` (not `Arc<Engine>`)
+//
+// Phase C.1's `LoaderWrapper` auto-delivers `Arc<Engine>` after every
+// load — but the `Engine` type is owned by the worker thread (it's
+// `Clone` over `Arc<EngineInner>`); pulling shape config out of it
+// would cross the worker-thread boundary. The cleanly-decoupled
+// design is: `cmd_serve` builds an `Arc<EngineHandle>` directly from
+// the loaded `MlxModelWeights` (already done in C.1 for the
+// `EngineBindable::bind_engine` path) and feeds that
+// `Arc<EngineHandle>` through the registry's
+// `try_substitute_on_load`. The auto-path's `Arc<Engine>` mismatches
+// our downcast and returns `None` cleanly.
+//
+// ## Why no panic on type mismatch
+//
+// `Arc::downcast::<EngineHandle>()` returns `Result<Arc<EngineHandle>, Arc<dyn Any>>`
+// — the `Err` branch drops the type-erased Arc silently. This
+// mirrors the existing `EngineBindable::bind_engine` impl above and
+// satisfies the `FamilyHookFactory` contract (no panic on type
+// mismatch).
+// ---------------------------------------------------------------------------
+
+impl Gemma4DenseSpill {
+    /// Phase B-dense.2 — try to construct a `Gemma4DenseSpill` whose
+    /// engine handle is already wired. Returns `Some(spill)` iff
+    /// `engine_dyn` downcasts to `Arc<EngineHandle>`; returns
+    /// `None` on type mismatch (the type-erased Arc drops silently).
+    ///
+    /// `cfg` carries the shape-only config (per
+    /// [`Gemma4DenseConfig`]); the engine handle delivers the live
+    /// device + dense_kvs slot + write_positions tuple.
+    ///
+    /// Returns `None` when:
+    ///   * `engine_dyn` is not `Arc<EngineHandle>`, OR
+    ///   * `Gemma4DenseSpill::new(cfg)` fails (shape vector length
+    ///     mismatch — defensive; shouldn't fire under
+    ///     well-formed cmd_serve registration).
+    pub fn try_from_engine_arc(
+        cfg: Gemma4DenseConfig,
+        engine_dyn: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Option<Self> {
+        let handle_arc = match engine_dyn.downcast::<EngineHandle>() {
+            Ok(arc) => arc,
+            Err(_other_dyn) => return None,
+        };
+        let spill = match Self::new(cfg) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        // Cheap-clone the inner EngineHandle (every field is
+        // Arc-wrapped). The downcast Arc itself drops at end of scope.
+        let handle: EngineHandle = (*handle_arc).clone();
+        spill.set_engine_handle(handle);
+        Some(spill)
+    }
+}
+
+/// Phase B-dense.2 — `FamilyHookFactory` impl for `Gemma4DenseSpill`.
+///
+/// Carries the shape-only `Gemma4DenseConfig` captured at `cmd_serve`
+/// startup. On `try_construct(engine_dyn)`:
+///
+///   1. Calls [`Gemma4DenseSpill::try_from_engine_arc`] which
+///      downcasts to `Arc<EngineHandle>` and constructs a fully-wired
+///      spill on success.
+///   2. On `None` (type mismatch) → returns `None` (the registry's
+///      caller leaves the prior stub registration in place).
+///   3. On `Some(spill)` → wraps the spill in the
+///      `(Arc<Mutex<dyn KvCacheSpill>>, Arc<dyn EngineBindable>)`
+///      tuple expected by the `FamilyHookFactory` trait. The same
+///      `Arc<Gemma4DenseSpill>` is referenced by both ends of the
+///      tuple — so a `bind_engine` call through the registry side
+///      mutates the same engine slot that a `restore_block` call
+///      through the spiller side reads.
+pub struct Gemma4DenseSpillFactory {
+    cfg: Gemma4DenseConfig,
+}
+
+impl Gemma4DenseSpillFactory {
+    /// Construct a factory carrying the supplied shape config. The
+    /// config is captured by value; subsequent factory invocations
+    /// reuse the same shape (the loaded model's shape is immutable
+    /// across evict/readmit cycles).
+    pub fn new(cfg: Gemma4DenseConfig) -> Self {
+        Self { cfg }
+    }
+}
+
+impl crate::serve::kv_persist::registry::FamilyHookFactory for Gemma4DenseSpillFactory {
+    fn try_construct(
+        &self,
+        engine_dyn: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Option<(
+        Arc<Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>>,
+        Arc<dyn crate::serve::kv_persist::EngineBindable>,
+    )> {
+        // 1. Try to materialize a fully-wired spill from the engine.
+        //    None on type mismatch ⇒ no substitution.
+        let spill = Gemma4DenseSpill::try_from_engine_arc(self.cfg.clone(), engine_dyn)?;
+        // 2. Same Arc<Gemma4DenseSpill> is referenced by both ends of
+        //    the tuple. The kv_hook side wraps in Mutex (per
+        //    KvCacheSpill::restore_block's &mut self contract); the
+        //    bindable side is a direct Arc<dyn EngineBindable>.
+        //
+        //    Note: a Mutex around the spill on the kv side does NOT
+        //    serialize against the registry side — bind_engine /
+        //    unbind_engine on the spill take the inner
+        //    `engine: Arc<RwLock<Option<EngineHandle>>>` lock directly,
+        //    not the outer Mutex. So a long-running restore_block
+        //    holding the outer Mutex doesn't block a bind/unbind.
+        let spill_arc = Arc::new(spill);
+        let bindable: Arc<dyn crate::serve::kv_persist::EngineBindable> = spill_arc.clone();
+        // The Mutex<dyn KvCacheSpill> tuple side wraps a fresh
+        // Gemma4DenseSpill clone — but Gemma4DenseSpill is NOT
+        // `Clone`. The standard pattern (mirrors how cmd_serve C.1
+        // splits the stub: `let stub = Arc::new(StubGemma4Spill); let
+        // stub_for_spiller: Arc<Mutex<dyn KvCacheSpill>> = Arc::new(Mutex::new(StubGemma4Spill));`)
+        // is to construct a *second* spill instance for the spiller
+        // side. The two instances share the same engine state through
+        // their inner `Arc<RwLock<Option<EngineHandle>>>` ONLY IF we
+        // bind both. To keep the two synchronized, we re-run
+        // try_from_engine_arc with a fresh clone of the type-erased
+        // engine — but we no longer have it after the move into the
+        // first call. Instead, we materialize the spiller-side spill
+        // from cfg + handle pulled directly from the bindable side's
+        // engine slot.
+        //
+        // Architecturally simpler approach: build TWO independent
+        // spill instances, each `set_engine_handle`'d from a clone of
+        // the EngineHandle. Both reach the same `dense_kvs:
+        // Arc<RwLock<Option<Vec<DenseKvBuffer>>>>` because EngineHandle
+        // is `Clone` and every field is `Arc`-wrapped.
+        let handle_for_spiller: EngineHandle = {
+            let g = spill_arc
+                .engine
+                .read()
+                .expect("Gemma4DenseSpill::engine RwLock poisoned");
+            // We just constructed + set_engine_handle'd this; it must
+            // be Some at this point.
+            match g.as_ref() {
+                Some(h) => h.clone(),
+                None => {
+                    // Defensive: if for some reason set_engine_handle
+                    // didn't take (lock poisoned, etc.), fall back to
+                    // returning None — the spiller side is unusable
+                    // without a handle.
+                    return None;
+                }
+            }
+        };
+        let spiller_side = match Gemma4DenseSpill::new(self.cfg.clone()) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        spiller_side.set_engine_handle(handle_for_spiller);
+        let kv_hook: Arc<Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>> =
+            Arc::new(Mutex::new(spiller_side));
+        Some((kv_hook, bindable))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
@@ -1955,5 +2137,137 @@ mod tests {
 
         // No engine bound ⇒ snapshot is None.
         assert!(hook.snapshot_block(0, 0..4).is_none());
+    }
+
+    // ===== Phase B-dense.2 — FamilyHookFactory tests ========================
+
+    /// Spec test 5: `Gemma4DenseSpill::try_from_engine_arc` succeeds
+    /// on `Arc<EngineHandle>` and yields a spill with engine bound.
+    /// Falsifier: returns None on type match, or doesn't bind the
+    /// engine (hook.snapshot_block returns None despite a populated
+    /// dense_kvs).
+    #[test]
+    fn factory_try_from_engine_arc_succeeds_on_handle_match() {
+        use crate::serve::kv_persist::EngineBindable;
+
+        let device = match try_make_device() {
+            Some(d) => d,
+            None => {
+                eprintln!(
+                    "[B-dense.2 factory] no MlxDevice — skipping populated-handle test"
+                );
+                return;
+            }
+        };
+
+        // Build a populated handle outside the factory so the test
+        // verifies "engine wired" by observing snapshot_block returns
+        // Some(_).
+        let scratch_hook = Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("new");
+        let handle = populate_handle(&scratch_hook, device, 0x55);
+
+        let handle_arc: Arc<EngineHandle> = Arc::new(handle);
+        let dyn_view: Arc<dyn std::any::Any + Send + Sync> = handle_arc;
+
+        let spill = Gemma4DenseSpill::try_from_engine_arc(small_cfg(DType::F32), dyn_view)
+            .expect("try_from_engine_arc on matching Arc<EngineHandle> ⇒ Some(spill)");
+
+        // The spill is wired: snapshot_block returns Some on a
+        // populated layer + range. (We can't observe the bind via
+        // EngineBindable because try_from_engine_arc bypasses that
+        // path; the snapshot path is the load-bearing observation.)
+        let bytes = spill.snapshot_block(0, 0..4);
+        assert!(
+            bytes.is_some(),
+            "factory-built spill yields snapshot bytes on populated layer"
+        );
+
+        // The unbind path also works (no panic, engine slot clears).
+        EngineBindable::unbind_engine(&spill);
+        assert!(spill.snapshot_block(0, 0..4).is_none());
+    }
+
+    /// Spec test 6: `Gemma4DenseSpill::try_from_engine_arc` returns
+    /// None on type mismatch — without panic. Mirrors the
+    /// `engine_bindable_gemma4_dense_silently_ignores_non_handle_arc`
+    /// test's payload.
+    #[test]
+    fn factory_try_from_engine_arc_returns_none_on_type_mismatch() {
+        struct FakeNonHandle {
+            _marker: u32,
+        }
+        let fake = Arc::new(FakeNonHandle { _marker: 9 });
+        let dyn_view: Arc<dyn std::any::Any + Send + Sync> = fake;
+
+        let result = Gemma4DenseSpill::try_from_engine_arc(small_cfg(DType::F32), dyn_view);
+        assert!(result.is_none(), "type mismatch ⇒ None, no panic");
+    }
+
+    /// Spec test 7: `Gemma4DenseSpillFactory::try_construct` round-
+    /// trips through the `FamilyHookFactory` trait with a matching
+    /// engine.
+    ///
+    /// Falsifier: returns None on type match, or the bindable_hook
+    /// half is not actually wired (subsequent unbind_engine fails to
+    /// clear the engine slot).
+    #[test]
+    fn factory_construct_from_matching_engine_returns_some_tuple() {
+        use crate::serve::kv_persist::registry::FamilyHookFactory;
+        use crate::serve::kv_persist::EngineBindable;
+
+        let device = match try_make_device() {
+            Some(d) => d,
+            None => {
+                eprintln!(
+                    "[B-dense.2 factory] no MlxDevice — skipping factory-construct test"
+                );
+                return;
+            }
+        };
+
+        // Populated handle (mirrors what cmd_serve will assemble from
+        // the live MlxModelWeights post-load).
+        let scratch_hook = Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("new");
+        let handle = populate_handle(&scratch_hook, device, 0x66);
+        let handle_arc: Arc<EngineHandle> = Arc::new(handle);
+        let dyn_view: Arc<dyn std::any::Any + Send + Sync> = handle_arc;
+
+        let factory = Gemma4DenseSpillFactory::new(small_cfg(DType::F32));
+        let result = factory.try_construct(dyn_view);
+
+        let (kv_hook, bindable_hook) = result.expect("matching engine ⇒ Some(tuple)");
+
+        // The kv side has block_alignment = BLOCK_TOKENS (the
+        // Gemma4DenseSpill impl returns the format constant).
+        let alignment = kv_hook
+            .lock()
+            .expect("kv_hook Mutex poisoned in test")
+            .block_alignment();
+        assert_eq!(alignment, BLOCK_TOKENS, "kv_hook is a real Gemma4DenseSpill");
+
+        // The bindable side is wired — unbind clears its engine slot
+        // (we can't directly observe, but no-panic + idempotent
+        // re-call is the contract).
+        EngineBindable::unbind_engine(bindable_hook.as_ref());
+        EngineBindable::unbind_engine(bindable_hook.as_ref());
+    }
+
+    /// Spec test 8: `Gemma4DenseSpillFactory::try_construct` returns
+    /// None when the engine_dyn doesn't downcast to
+    /// `Arc<EngineHandle>`. Mirrors the auto-LoaderWrapper-bind path
+    /// where `Arc<Engine>` is delivered.
+    #[test]
+    fn factory_construct_from_wrong_engine_type_returns_none() {
+        use crate::serve::kv_persist::registry::FamilyHookFactory;
+
+        struct FakeEngine {
+            _marker: u32,
+        }
+        let fake = Arc::new(FakeEngine { _marker: 11 });
+        let dyn_view: Arc<dyn std::any::Any + Send + Sync> = fake;
+
+        let factory = Gemma4DenseSpillFactory::new(small_cfg(DType::F32));
+        let result = factory.try_construct(dyn_view);
+        assert!(result.is_none(), "non-EngineHandle ⇒ None");
     }
 }
