@@ -7,9 +7,9 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
-## ▶ Resume Here — current state of truth (2026-05-01 ~03:00Z, paused)
+## ▶ Resume Here — current state of truth (2026-05-01 ~09:00Z, in flight)
 
-**Decode side: SHIPPED (D4 ≥1.00× across 4 production fixtures).**
+**Decode side: SHIPPED + RE-VALIDATED. iter56/57/58b confirmed byte-transparent perf-only changes (iter61c FULL VERDICT: ALL PASS).**
 
 | Fixture | Decode ratio | iter | Commit |
 |---|---|---|---|
@@ -18,9 +18,39 @@
 | gemma 26B dwq | 1.017× | iter51 | (older) |
 | 35B-A3B-MoE q4_0-flat | 1.046× | iter56 | same |
 
-**Prefill side: OPEN. Cold-clean baseline 0.319× on apex q4_0-flat (3.13× slower than llama, not 4.47×; prior 0.22× was CPU-contaminated).**
+**iter61c re-validation table** (each iter reverted in worktree, captured against deterministic HEAD baseline `b7b9599`):
 
-**Bench infrastructure: NOW SOLID (5 broken-window fixes shipped today).**
+| Iter | 27B-dwq46 smoke | 27B-dwq46 sourdough | apex q4_0-flat smoke | apex q4_0-flat sourdough |
+|---|---|---|---|---|
+| HEAD baseline | `e62e6512…` (run1=run2 deterministic) | `aee266b0…` | `b5d42e30…` (run1=run2 deterministic) | `8a7f058b…` |
+| iter56 reverted | `e62e6512…` ✓ | `aee266b0…` ✓ | `b5d42e30…` ✓ | `8a7f058b…` ✓ |
+| iter57 reverted | `e62e6512…` ✓ | `aee266b0…` ✓ | `b5d42e30…` ✓ | `8a7f058b…` ✓ |
+| iter58b reverted | `e62e6512…` ✓ | `aee266b0…` ✓ | `b5d42e30…` ✓ | `8a7f058b…` ✓ |
+
+All 12 cells byte-identical. Receipts: `/tmp/cfa-iter61c-20260430/{claude,main}-iter*-{27B-dwq46,apex}-{smoke,sourdough}.json` (16 prompts × 32 tok smoke; 1 prompt × 200 tok sourdough; SHA256 over UTF-8 bytes of decoded text; seed=0/temperature=0/top-k=1).
+
+**Prefill side: OPEN. Cold-clean baseline 0.319× on apex q4_0-flat (3.13× slower than llama, not 4.47×; prior 0.22× was CPU-contaminated). iter60b + iter60c implemented and pushed to team branches; bench validation pending.**
+
+**iter60b — B-staging elimination (implementation COMPLETE, bench pending):**
+- ADR's prior phrasing "cast at mpp::tensor_ops::matmul2d call site" was architecturally wrong — that API has no cast parameter. Real win matches llama.cpp's `GGML_METAL_HAS_TENSOR` (ggml-metal.metal:9357-9360): wrap f32 device buffer directly as `tensor<device float, dextents<int32_t, 2>>`, eliminating B-staging entirely.
+- Risk #1 (does MPP accept device-f32 for B operand on M5 Max?) **CLEARED on first attempt**.
+- Eliminates 2048 B threadgroup buffer + ~1024 fp32→fp16 cast instructions per K-tile.
+- All 11 mm_tensor parity tests PASS unchanged tolerances; 264/0/8 qwen35 unchanged.
+- Branch: `cfa/iter60b-impl-20260430/claude` (mlx-native + hf2q).
+
+**iter60c — function-constant bounds-check gating (implementation COMPLETE, bench pending):**
+- `FC_mul_mm_bc_inp(250)` + `FC_mul_mm_bc_out(251)` mirror llama.cpp:9544-9607.
+- Estimated +0.5-1pp on prod-aligned shapes (K∈{2048,2816,4096}, N∈{2816,4096}, M≥32).
+- All 11 mm_tensor parity tests byte-exact; clean build.
+- Branch: `cfa/iter60c-fc-gate-20260430/claude` (mlx-native `4d38baf` + hf2q `5799f98`).
+
+**iter59 next-tier candidates research (READ-ONLY dossier complete):**
+- **#1 multi-token NSG kernel** (1-2 days, zero new kernel code): `gated_delta_net_decode.metal:145` already has `for t in 0..n_tokens`; only Rust gate at `gpu_delta_net.rs:72` restricts to n_tokens=1. Llama.cpp uses identical kernel for decode AND prefill. +0.05-0.2pp on non-chunk-aligned prompts.
+- **#2 RoPE multi-buffer hoist** (1-day, captures 45% of full fusion gain): `build_rope_multi_buffers` per-call alloc costs 208 µs/token; hoist to model-init.
+- **#3 MoE expert sortby/scatter**: mandatory F2 audit of `quantized_matmul_id.metal` ids_buf access pattern FIRST (zero-cost falsification path); +0.1-0.3pp if not falsified.
+- Dossiers: `/tmp/cfa-iter59-research/{rope-qkv-fusion,moe-expert-sortby,multi-token-nsg}-dossier.md` + `index.md`.
+
+**Bench infrastructure: NOW SOLID (5 broken-window fixes shipped today + capture script + 1 bash-3.2 pipefail bug bypassed).**
 
 ### What's DONE today (commits, all pushed)
 
@@ -42,30 +72,22 @@
 - 264/0/8 qwen35:: tests pass
 - Both repos clean (one stash on hf2q: `iter61c-agent-WIP-reverting-iter56-for-parity-test` from killed agent — DROP if not resuming iter61c manual revert path; the parity-test methodology can be re-run cleanly without the stash)
 
-### What's OPEN — concrete resume points
+### What's NEXT (in order)
 
-**iter61c — re-validate iter56/57/58b parity claims against deterministic baseline** (task #39, agent killed mid-flight at pause time).
-- Why: iter56/57/58b all claimed "byte-identical smoke passed" against the now-known-non-deterministic baseline. Those PASSes might have been noise. With determinism guaranteed at HEAD `e8427a3`, re-validate.
-- How: at HEAD, capture reference outputs (16 prompts × 32 tok on q4_0-flat + 200-tok sourdough on apex AND 27B). Then for each iter (56/57/58b) reverse-revert that iter's diff (without touching iter61a-2 barrier fix), build, capture, diff. 
-- Pre-iter SHAs: iter56 hf2q `5ed7a7c` + mlx-native `641ab78`; iter57 hf2q `c2d7ac3`; iter58b hf2q `b6f416b` (later partly-reverted by `2565eab` — current effective change is the surviving cleanup).
-- Outcome decides: parity-clean → proceed to iter60b; some_drift → investigate specific kernel; some_broken → ESCALATE (revert).
-- Stash from agent's WIP: `git stash list | grep iter61c-agent-WIP` — drop with `git stash drop` if not resuming the same path.
-- Spec: see iter61c agent prompt in last session for full methodology.
+1. **Bench validation for iter60c then iter60b** (perf-only changes already pushed to team branches; need cold-SoC benches against same-day llama.cpp peer on apex q4_0-flat at pp=4096):
+   - Expected: iter60c +0.5-1pp; iter60b +2-5pp; combined cold 0.319× → 0.34-0.40×
+   - Methodology: pre-bench `ps aux | grep -E "mcp|brain|ollama|llama|cargo"` audit, cooldown, 5 cold-process trials median
+2. **Merge order**: iter60c first (smaller, less invasive), then rebase iter60b on iter60c (both touch `quantized_matmul_mm_tensor.metal` — orthogonal diffs but rebase needed)
+3. **iter59-multi-token-NSG** (rank #1 next-tier): remove Rust gate at `gpu_delta_net.rs:72`, extend parity tests to n_tokens > 1; 1-2 days, zero new kernel code
+4. **iter59-RoPE-hoist** (rank #2): hoist `build_rope_multi_buffers` from per-call to model-init; captures 45% of full RoPE+QKV fusion gain at 1-day cost
+5. **iter59-MoE-sortby F2 audit** (rank #3): falsifiable at zero cost; only proceed to impl if audit confirms ids_buf is NOT already accessed in expert-sorted order
+6. **iter62 — Q4_K MoE matmul-id support** (separate broken window): handled by parallel `adr013-q4k-moe-kernels` session
 
-**iter60b — production-path matmul perf lever** (task #36 closed-falsified, this is the real follow-on).
-- Defer the f32→half cast at `/opt/mlx-native/src/shaders/quantized_matmul_mm_tensor.metal:285-287` (production tensor matmul on M5 Max). Stage B as f32; cast to half only at `mpp::tensor_ops::matmul2d<>` call site. Verify tensor cores still engage.
-- Estimated **+2-5pp prefill** at apex q4_0-flat. Combined with iter60c (function-constant bounds-check gating), **+2.5-6pp** total → cold 0.319× → **0.34-0.38×**.
-- Hard parity gates per iter61c lessons: 10/10 byte-identical determinism (now achievable), sourdough on both apex + 27B, decode no-regression on 4 fixtures.
-- File: `/opt/mlx-native/src/shaders/quantized_matmul_mm_tensor.metal:171-350` (kernel body) + `285-287` (cast site).
+**iter61c outcome eliminates the prior "validate before more perf" gate.** Decode-side ship-readiness fully confirmed. All 4 perf-pending fixtures (D4) decode-side ≥1.00×. Prefill side requires the next 5+ levers above.
 
-**iter60c — function-constant bounds-check gating** (smaller).
-- Mirror llama.cpp's `FC_mul_mm_bc_inp` + `FC_mul_mm_bc_out` pattern in mlx-native tensor matmul. Estimated +0.5-1pp.
-- File: `/opt/mlx-native/src/shaders/quantized_matmul_mm.metal:24` ("we always enable bounds-checked" comment) + tensor variant.
-
-**iter62 — Q4_K MoE matmul-id support** (separate broken window, blocks apex-dwq46/dwq48 fixtures).
-- Add `kernel_mul_mm_id_q4_K_f32` (+ tensor variant) to mlx-native shaders mirroring llama.cpp's `kernel_mul_mm_id_q4_K_f32`. Extend hf2q `Qwen35Model::load_from_gguf` MoE-Q loader whitelist (currently rejects Q4_K).
-- Affected fixtures: apex-dwq46, apex-dwq48 (both fail to load currently).
-- Workaround until then: use apex-q4_0-flat for MoE prefill bench (which is the cold-clean 0.319× fixture anyway).
+**iter61a kernel-level work (closed but for reference):**
+- Buffer-pool zero-init in mlx-native `src/buffer_pool.rs` already shipped at `aa5b410`.
+- Serial-dispatch probe env: `HF2Q_FORCE_SERIAL_DISPATCH=1` flips `MTLDispatchType::Concurrent → Serial` (used as bisection tool — not for production).
 
 **iter61a kernel-level work (closed but for reference):**
 - Buffer-pool zero-init in mlx-native `src/buffer_pool.rs` already shipped at `aa5b410`.
@@ -77,12 +99,15 @@ Prefill D4 ≥1.00× across the same 4-cell standing matrix that decode satisfie
 
 ### Resume protocol
 
-1. `cd /opt/hf2q && git pull && git status` — confirm clean
-2. `cd /opt/mlx-native && git pull && git status` — confirm clean  
+1. `git -C /opt/hf2q pull && git -C /opt/hf2q status` — confirm clean (parallel sessions advance HEAD frequently)
+2. `git -C /opt/mlx-native pull && git -C /opt/mlx-native status` — confirm clean
 3. `cargo test --release --bin hf2q qwen35::` — confirm 264/0/8 (or higher; parallel sessions add tests)
-4. Read this section + the most-recent changelog entries below
-5. Pick next iter: **iter61c** (highest priority — confirms which prior parity claims are real before any further perf iter), then iter60b, then iter60c, then iter62.
-6. If user wants to skip iter61c re-validation and trust prior claims: jump straight to iter60b.
+4. Read this Resume Here block + the most-recent changelog entries below
+5. Pick next item from "What's NEXT" list above. Default sequence: iter60c bench → iter60b bench → iter59-multi-token-NSG impl → iter59-RoPE-hoist impl.
+6. **Active worktree branches** (push to origin, merge into main after green bench):
+   - `cfa/iter60c-fc-gate-20260430/claude` — FC bounds-check gating (mlx-native `4d38baf` + hf2q `5799f98`)
+   - `cfa/iter60b-impl-20260430/claude` — B-staging elimination (both repos)
+   - `cfa/iter61c-20260430/claude` — bisection scaffolding + capture script (read-only reference; do not merge to main; capture script lives in `scripts/iter61c_capture.sh` of that worktree only — local/gitignored)
 
 ## Context
 
