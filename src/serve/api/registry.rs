@@ -1377,8 +1377,26 @@ fn gemma4_tool_call_gbnf(
     //     `body close_marker ( open_marker body close_marker )* space`.
     //     See `GrammarShape::OneOrMoreCallsBodyOnly` doc-comment for the
     //     production-order rationale.
+    // iter-219b grammar-exhaust fix (2026-05-01): drop trailing ` space`
+    // from all root_body shapes. The `space` rule
+    // (`| " " | "\n"{1,2} [ \t]{0,20}`) was inherited from llama.cpp's
+    // SPACE_RULE convention for JSON Schema grammars where it terminates
+    // value rules. For tool-call grammars it served as a trailing-
+    // whitespace allowance after the close marker — but its empty-alt +
+    // `[ \t]{0,20}` (min 0) tail kept `is_dead` from ever flipping
+    // post-close (Agent C audit 2026-05-01,
+    // `docs/research/iter219b-grammar-exhaust-audit-2026-05-01.md`),
+    // breaking iter-218's claimed "natural grammar-exhaust" termination.
+    // Without the trailing `space`, the grammar exhausts cleanly on the
+    // close marker; the engine's `is_dead`-break path at engine.rs:5045-5059
+    // then fires on the next sampled byte. Per chat-template inspection
+    // (regex at tokenizer_config.json: `<|tool_call>...<tool_call|><turn|>?`),
+    // the model is trained to emit `<turn|>` (which is in eos_token_ids)
+    // immediately after `<tool_call|>` with no separating whitespace, so
+    // the trailing-whitespace allowance was never load-bearing for the
+    // happy path.
     let root_body = match shape {
-        GrammarShape::SingleBody => format!("{} space", single_body),
+        GrammarShape::SingleBody => single_body.clone(),
         GrammarShape::OneOrMoreCalls { parallel } => {
             let open_marker = gbnf_literal("<|tool_call>");
             let close_marker = gbnf_literal("<tool_call|>");
@@ -1391,9 +1409,9 @@ fn gemma4_tool_call_gbnf(
             // repeat.  Mirrors llama.cpp `p.repeat(call, 1, parallel?-1:1)`
             // at common/chat.cpp:898-902, 1177-1181.
             if parallel {
-                format!("{} {}* space", g4_call_rule, g4_call_rule)
+                format!("{} {}*", g4_call_rule, g4_call_rule)
             } else {
-                format!("{} space", g4_call_rule)
+                g4_call_rule
             }
         }
         GrammarShape::OneOrMoreCallsBodyOnly { parallel } => {
@@ -1413,17 +1431,15 @@ fn gemma4_tool_call_gbnf(
                     format!("{} {} {}", open_marker, single_body, close_marker),
                 ));
                 format!(
-                    "{} {} {}* space",
+                    "{} {} {}*",
                     single_body, close_marker, g4_call_rule
                 )
             } else {
-                format!("{} {} space", single_body, close_marker)
+                format!("{} {}", single_body, close_marker)
             }
         }
     };
     rules.push(("root".to_string(), root_body));
-
-    rules.push(("space".to_string(), r#"| " " | "\n"{1,2} [ \t]{0,20}"#.to_string()));
 
     let mut out = String::new();
     for (name, body) in &rules {
@@ -1690,8 +1706,11 @@ fn qwen35_tool_call_gbnf(
     //     `body \n close_marker ( \n open_marker \n body \n close_marker )* space`.
     //     See `GrammarShape::OneOrMoreCallsBodyOnly` doc-comment for the
     //     production-order rationale.
+    // iter-219b grammar-exhaust fix (2026-05-01): drop trailing ` space`
+    // from all root_body shapes (sibling to the gemma4 emitter above; see
+    // its block-comment for full rationale + Agent C audit citation).
     let root_body = match shape {
-        GrammarShape::SingleBody => format!("{} space", single_body),
+        GrammarShape::SingleBody => single_body.clone(),
         GrammarShape::OneOrMoreCalls { parallel } => {
             let open_marker = gbnf_literal("<tool_call>");
             let close_marker = gbnf_literal("</tool_call>");
@@ -1712,11 +1731,11 @@ fn qwen35_tool_call_gbnf(
                 // `call ("\n" call)*` — Qwen separates calls 2+ with literal `\n`
                 // (template's loop "else" branch — see citation above).
                 format!(
-                    "{} ( {} {} )* space",
+                    "{} ( {} {} )*",
                     qwen_call_rule, newline_lit, qwen_call_rule
                 )
             } else {
-                format!("{} space", qwen_call_rule)
+                qwen_call_rule
             }
         }
         GrammarShape::OneOrMoreCallsBodyOnly { parallel } => {
@@ -1741,22 +1760,20 @@ fn qwen35_tool_call_gbnf(
                     ),
                 ));
                 format!(
-                    "{} {} {} ( {} {} )* space",
+                    "{} {} {} ( {} {} )*",
                     single_body, newline_lit, close_marker, newline_lit, qwen_call_rule
                 )
             } else {
                 // Single call: body + `\n</tool_call>` (close marker
                 // preceded by `\n` per the template emission pattern).
                 format!(
-                    "{} {} {} space",
+                    "{} {} {}",
                     single_body, newline_lit, close_marker
                 )
             }
         }
     };
     rules.push(("root".to_string(), root_body));
-
-    rules.push(("space".to_string(), r#"| " " | "\n"{1,2} [ \t]{0,20}"#.to_string()));
 
     let mut out = String::new();
     for (name, body) in &rules {
@@ -2571,6 +2588,76 @@ mod tests {
         let input = b"call:noop{}";
         assert!(rt.accept_bytes(input), "empty args form rejected");
         assert!(rt.is_accepted(), "not accepted");
+    }
+
+    /// iter-219b grammar-exhaust regression guard (2026-05-01) — Agent C's
+    /// audit found that `space ::= | " " | "\n"{1,2} [ \t]{0,20}` keeps
+    /// `is_dead` from ever flipping after the close marker is consumed
+    /// (empty alt + `[ \t]{0,20}` min 0 → runtime perpetually accepting
+    /// AND alive). iter-218 claimed "natural grammar-exhaust" termination
+    /// for `OneOrMoreCallsBodyOnly{parallel:false}`, but the engine's
+    /// break gate at `engine.rs:5045-5059` (`is_accepted && bytes.is_empty()`)
+    /// only fires for empty-byte tokens; `<tool_call|>` decodes to 12
+    /// bytes (non-empty) so the loop runs past close marker until
+    /// max_tokens. This test pins the contract:
+    ///
+    ///   After accepting `<body><close_marker>`, the grammar MUST be in
+    ///   a TERMINAL state — any subsequent byte must terminate (kill all
+    ///   stacks; `is_dead == true`). Trailing whitespace allowance was
+    ///   the source of the close-gate gap.
+    ///
+    /// PRE-FIX HEAD: this test FAILS at the `assert!(!alive)` line
+    /// because `space`'s `\n{1,2}` alt accepts the trailing newline.
+    /// POST-FIX (drop trailing `space` from `OneOrMoreCallsBodyOnly{false}`
+    /// + `SingleBody` root_body): this test PASSES.
+    #[test]
+    fn iter219b_grammar_exhaust_after_close_marker_is_terminal() {
+        let schema_json = r#"{"type":"object","properties":{"x":{"type":"integer"}}}"#;
+        let schema_v: serde_json::Value = serde_json::from_str(schema_json).unwrap();
+        let gbnf = GEMMA4
+            .tool_call_gbnf("f", &schema_v, GrammarShape::OneOrMoreCallsBodyOnly { parallel: false })
+            .expect("tool_call_gbnf");
+        let mut rt = grammar_runtime_for_gbnf(&gbnf);
+        // Accept canonical body + close marker per the lazy-gate contract
+        // (open marker has been stripped from the grammar — consumed by the
+        // awaiting_trigger no-op gate before grammar engagement).
+        assert!(
+            rt.accept_bytes(b"call:f{x:1}<tool_call|>"),
+            "canonical body+close rejected"
+        );
+        assert!(
+            rt.is_accepted(),
+            "post-close: rule must be in an accepting state"
+        );
+        // Contract: any further byte must terminate the grammar. iter-218's
+        // claimed grammar-exhaust termination relies on this — without it,
+        // the decode loop runs past close marker because the engine's
+        // `is_accepted && bytes.is_empty()` break gate only fires for
+        // empty-byte tokens and `<tool_call|>` decodes to 12 bytes.
+        let mut clone_lf = rt.clone();
+        let alive_after_lf = clone_lf.accept_bytes(b"\n");
+        assert!(
+            !alive_after_lf,
+            "iter-219b: grammar must terminate on trailing `\\n` after close \
+             marker; HEAD's `space ::= | \" \" | \"\\n\"{{1,2}} [ \\t]{{0,20}}` \
+             allows up to 22 trailing whitespace bytes which prevents \
+             `is_dead` from flipping. Drop the trailing ` space` from \
+             OneOrMoreCallsBodyOnly{{false}} + SingleBody root_body."
+        );
+        assert!(
+            clone_lf.is_dead(),
+            "is_dead must flip to true after rejected continuation post-close"
+        );
+        // Same contract for a non-whitespace byte (start of stray
+        // `<|tool_response>` from the LIVE bug surface).
+        let mut clone_lt = rt.clone();
+        let alive_after_lt = clone_lt.accept_bytes(b"<");
+        assert!(
+            !alive_after_lt,
+            "iter-219b: post-close grammar must reject `<` (start of any \
+             special-token leak like <|tool_response>)"
+        );
+        assert!(clone_lt.is_dead(), "is_dead must flip on rejected `<` after close");
     }
 
     // -----------------------------------------------------------------------
