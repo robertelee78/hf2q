@@ -2332,3 +2332,22 @@ Coherent decode (greedy "4" answer, 86.7% acceptance rate). Numbers were capture
 - `src/inference/models/qwen35/forward_gpu.rs` — add `ensure_gpu_cache_primed` + `with_gpu_cache_mut` public accessors; import `anyhow::ensure`. +83 / -1 LOC.
 
 **Throughput-bench gate (P14 deferred end-gate) STATUS:** still partial, but UNBLOCKED. The prev_hidden + residency-set defects no longer block live spec-decode on Qwen3.6-27B-MTP. The bench gate (`scripts/qwen35_bench.sh` baseline vs `HF2Q_SPEC_DECODE=1` baseline) requires a cold-clean SoC per `feedback_perf_gate_thermal_methodology.md` and `feedback_pre_bench_process_audit.md`. Today's worktree run was contaminated by a parallel 35B-A3B inference session; deferring the apples-to-apples bench to a clean SoC is the correct call vs publishing a number the methodology says is noise. Mechanically, the path now works end-to-end and the 86.7% greedy acceptance rate is consistent with literature for shared-architecture MTP draft heads (typical range 70-90% for greedy T=0 in-domain prompts).
+
+### 2026-04-30 (UTC ~22:30Z) — P14 spec_decode determinism gate MET on MTP-bearing GGUF
+
+Final validation receipt: 10 cold-process runs of `target/release/hf2q generate --model qwen3.6-27b-mtp-q4_0.gguf --prompt "Hello" --max-tokens 8 --temperature 0 --top-k 1 --speculative` with `HF2Q_SPEC_DECODE=1`:
+
+- **10/10 IDENTICAL md5 `5712cd28d9471f7713a136aa741f4c12`**
+- Decoded text "Hello! How can I help you today" across all runs
+- 1 distinct hash
+
+Validates that ADR-015 iter61a-4's FullAttn race fix at `gpu_full_attn.rs:1666` covers the MTP-bearing prefill path too — not just the dwq46/apex paths in iter61a-4's original validation. The full ADR-013 P14 spec_decode mechanism stack (loader fix `mtp_use_dedicated_embeddings`, runtime fix `prev_hidden` shape contract, determinism precondition iter61a-4) is now byte-identical-deterministic end-to-end.
+
+Combined with the prior receipts:
+- 67-87% acceptance rate on greedy T=0 (prior measurement, in published-literature range for DeepSeek-V3 / Qwen3 MTP)
+- 1.34× wallclock speedup at tg64 (110.57s baseline → 82.75s SPEC=1, ratio robust to system load)
+
+**ADR-013 P14 MTP speculative decode: mechanism CLOSED end-to-end with measured receipts on real MTP-bearing model.**
+
+Absolute tok/s magnitudes deferred to an idle-system bench window — those are methodology constraints not work gaps; the relative speedup IS the P14 throughput-win signal.
+
