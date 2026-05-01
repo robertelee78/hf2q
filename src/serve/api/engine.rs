@@ -4018,16 +4018,27 @@ pub(super) fn emit_streaming_tool_call_close(
             }
             // Auto (no grammar) path: preserve the pre-wave-2.5 content
             // fallback. (See function doc above for the rationale.)
+            //
+            // iter-219b (2026-05-01): scrub registered in-call special-token
+            // markers from the body before emitting. Without this scrub,
+            // a polluted body (e.g. with `<|tool_response>` mid-call —
+            // see `iter219b_reproducer_tool_response_inside_call`) would
+            // leak the special-token literal into `delta.content` via this
+            // fallback path, re-introducing the iter-217-class leak that
+            // `assert_no_leaked_special_tokens` is supposed to catch.
+            let scrubbed = super::registry::scrub_special_tokens(&body_dump);
             tracing::warn!(
                 body = %body_dump,
+                scrubbed = %scrubbed,
                 "tool-call body unparseable; emitting as content fallback \
                  (tool_choice=auto with no active grammar — no enforcement \
-                 on body shape; either tools[] empty or unregistered family)"
+                 on body shape; either tools[] empty or unregistered family). \
+                 Special-token markers scrubbed from body before emit."
             );
             if events
                 .blocking_send(GenerationEvent::Delta {
                     kind: DeltaKind::Content,
-                    text: body_dump,
+                    text: scrubbed,
                 })
                 .is_err()
             {
@@ -9194,6 +9205,52 @@ mod tool_call_stream_emitter_tests {
                 !n.contains(':') && !n.contains('<') && !n.contains('|') && !n.contains('>'),
                 "iter-219b: tool-call name must not contain special-token bytes. \
                  Got name={n:?} — body absorbed mid-call special-token literal."
+            );
+        }
+    }
+
+    /// iter-219b second-order test (2026-05-01) — when the validity gate
+    /// rejects a malformed name and Auto-policy falls back to emitting the
+    /// raw body as Content, the body MUST NOT contain special-token byte
+    /// sequences. Otherwise the iter-217-class leak (`<|channel>` /
+    /// `<|tool_response>` etc. reaching `delta.content`) re-surfaces via
+    /// the fallback path. The fix is to scrub registered Gemma 4 / Qwen
+    /// 3.5/3.6 in-call special-token markers from the body before
+    /// emitting the content fallback.
+    ///
+    /// PRE-FIX HEAD: this test FAILS at the `<|tool_response>`
+    /// substring assertion because `emit_streaming_tool_call_close` blindly
+    /// emits `body_dump` verbatim under the Auto branch.
+    /// POST-FIX: scrubbed body emitted; assertions PASS.
+    #[test]
+    fn iter219b_content_fallback_does_not_leak_special_tokens() {
+        let fragments: &[&str] = &[
+            "<|tool_call>",
+            "call", ":", "get", "_", "current",
+            "<|tool_response>",
+            "call", ":", "get", "_", "current", "_", "weather",
+            "{", "location", ":",
+            "<|\"|>", "Paris", "<|\"|>",
+            "}",
+            "<tool_call|>",
+        ];
+        let (content, _tool_events) =
+            drive_splitter_emitter_pipeline_with_policy(fragments, ToolCallPolicy::Auto);
+        eprintln!("iter-219b content fallback: {content:?}");
+        // The body fallback must scrub any registered in-call special-token
+        // markers. Listed against the Gemma 4 BUILTIN_REGISTRATIONS family
+        // (mirrors `tests/openwebui_multiturn.rs::assert_no_leaked_special_tokens`):
+        for marker in &[
+            "<|channel>", "<channel|>",
+            "<|tool_call>", "<tool_call|>",
+            "<|tool_response>", "<tool_response|>",
+            "<|turn>", "<turn|>",
+        ] {
+            assert!(
+                !content.contains(marker),
+                "iter-219b: Auto-policy content-fallback path leaked \
+                 special-token marker {marker:?} into delta.content. \
+                 Content was: {content:?}"
             );
         }
     }

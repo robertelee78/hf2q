@@ -764,6 +764,47 @@ pub struct ParsedToolCall {
     pub arguments_json: String,
 }
 
+/// Every registered in-call special-token marker across all supported
+/// families. Mirrors `BUILTIN_REGISTRATIONS` and the `LEAK_MARKERS` array
+/// in `tests/openwebui_multiturn.rs:115-138`. Used by the Auto-policy
+/// content-fallback scrubber so a malformed-body emit cannot leak any of
+/// these tokens into `delta.content`.
+const ALL_FAMILY_LEAK_MARKERS: &[&str] = &[
+    // Gemma 4 reasoning + tool + turn
+    "<|channel>", "<channel|>",
+    "<|tool_call>", "<tool_call|>",
+    "<|tool_response>", "<tool_response|>",
+    "<|turn>", "<turn|>",
+    // Qwen 3.5 / 3.6 reasoning + tool
+    "<think>", "</think>",
+    "<tool_call>", "</tool_call>",
+];
+
+/// Scrub all registered family special-token markers from `body` so they
+/// cannot leak into `delta.content` via the Auto-policy content-fallback
+/// path (`emit_streaming_tool_call_close` on parse failure). Returns the
+/// body with markers replaced by the empty string.
+///
+/// **iter-219b (2026-05-01)**: when the validity gate (`is_valid_tool_name`)
+/// rejects a polluted tool-call name, `emit_streaming_tool_call_close`
+/// under `ToolCallPolicy::Auto` falls back to emitting the raw body as
+/// `Content`. Without scrubbing, the body's special-token literals
+/// (e.g. `<|tool_response>` decoded from token id 50) reach the OpenAI
+/// client verbatim — re-introducing the iter-217-class leak that the
+/// `tests/openwebui_multiturn.rs::assert_no_leaked_special_tokens` gate is
+/// supposed to make loud at LIVE-test time. Strip every registered
+/// in-call marker so the fallback path stays content-correct regardless
+/// of which family registered the request.
+pub fn scrub_special_tokens(body: &str) -> String {
+    let mut out = body.to_string();
+    for m in ALL_FAMILY_LEAK_MARKERS {
+        if out.contains(m) {
+            out = out.replace(m, "");
+        }
+    }
+    out
+}
+
 /// Validate an OpenAI-spec function name. Tool names are required to match
 /// `^[a-zA-Z0-9_-]+$` per the OpenAI tool-spec — no special-token bytes,
 /// no whitespace, no nested call/colon syntax.
