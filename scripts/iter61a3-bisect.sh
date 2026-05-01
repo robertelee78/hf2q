@@ -6,7 +6,7 @@
 # divergence.  Output: sorted DIFF list to stdout.
 set -euo pipefail
 
-WORKTREE="${WORKTREE:-/opt/hf2q/.cfa-worktrees/adr015-iter61a-3-bisection-scaffold}"
+WORKTREE="${WORKTREE:-/opt/hf2q/.cfa-worktrees/adr015-iter61a-4-fa-race}"
 BIN="${WORKTREE}/target/release/hf2q"
 MODEL="${MODEL:-/opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf}"
 PROMPT="${PROMPT:-Hello}"

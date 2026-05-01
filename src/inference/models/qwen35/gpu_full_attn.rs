@@ -1659,6 +1659,38 @@ pub fn build_gated_attn_layer(
         let gated = apply_sigmoid_gate_multiply(
             &mut enc, registry, device, &attn_out, &gate_flat, n_elem,
         )?;
+        // ADR-015 iter61a-4: memory_barrier between Op 6 (sigmoid_gate_multiply
+        // writes `gated`) and Op 7 (linear_projection reads `gated`).
+        //
+        // The same RAW race that was fixed in `apply_gated_attn_layer_decode_into`
+        // by ADR-015 iter21 (gpu_full_attn.rs:1925) also lives in this prefill
+        // path, but had been latent because per-op bisection only landed in
+        // iter61a-3.  Diagnosis (iter61a-4):
+        //   * 27B-dwq46 'Hello' T=0/top-k=1 max=2 cold-process bisection
+        //     pinned first divergence at (FullAttn layer 3, attn_out) byte
+        //     20992 (token 1 / dim 128 of post-wo_proj output).
+        //   * All within-FA dumps for layer 3 (fa_x_norm, fa_q_flat,
+        //     fa_k_flat, fa_v_flat, fa_q_normed, fa_k_normed, fa_q_rope,
+        //     fa_k_rope, fa_gate_flat, fa_sdpa_out) were byte-identical
+        //     across cold runs — the race lived strictly in this 2-dispatch
+        //     ops6-7 encoder.
+        //   * Even with the encoder's terminal `commit_and_wait` (sync at
+        //     the boundary), Metal's `MTLDispatchTypeConcurrent` is free to
+        //     reorder the two dispatches WITHIN a single command buffer
+        //     unless an explicit `memory_barrier()` enforces the RAW edge.
+        //     The legacy decode encoder containing only these 2 dispatches
+        //     happened to be deterministic by accident (no other parallel
+        //     work to interleave); under the prefill multi-token regime
+        //     (seq=11+ for chat-template-wrapped prompts on 27B/35B) there
+        //     is enough threadgroup pressure to expose the reordering.
+        //
+        // Mechanism is the FullAttn-prefill twin of iter58b's DeltaNet
+        // chunk-prefill residency-set-lifetime fix and iter21's decode-path
+        // ops6→ops7 RAW barrier — same general pattern: when fused-encoder
+        // dispatches share a written buffer, the producer→consumer edge
+        // must be made explicit via `memory_barrier()`, never inferred from
+        // submission order.
+        enc.memory_barrier();
         let out = apply_linear_projection_f32_pooled(
             &mut enc, registry, device, &gated,
             &weights_gpu.wo, seq_len, q_total, hidden_size,

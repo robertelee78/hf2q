@@ -2217,3 +2217,16 @@ target/release/hf2q --log-level info gguf-patch \
 Receipt: `arch=qwen35moe`, Qwen3 ChatML template length 7764, 733 tensors. Independent per-tensor SHA-256 verification found zero tensor-name differences and zero tensor-payload diffs between original and patched files. This closes the independent chat-template contamination noted in the 2026-04-30 P13 regression entry; future sourdough runs should use the patched artifact or a GGUF emitted by the post-fix convert path.
 
 Sourdough/bench was not rerun inside the Codex sandbox because no Metal device is available there. That is an environment block only; the patch utility itself is pure GGUF metadata/tensor I/O and needs no Metal.
+
+### P14 throughput-numeric bench — DETERMINISM PRECONDITION MET (2026-04-30 via ADR-015 iter61a-4)
+
+ADR-013 P14's spec_decode throughput-numeric bench had been blocked on greedy-decode determinism: without byte-identical cold-process output, acceptance-rate measurement is comparing against a moving target and result is noise (per `feedback_verify_baseline_determinism_before_perf_bench`).
+
+ADR-015 iter61a-4 (worktree `fix/adr015-iter61a-4-fa-race`) closed the B-W-1 cold-process non-determinism by adding the missing `enc.memory_barrier()` between Op 6 (sigmoid_gate_multiply) and Op 7 (linear_projection) inside `build_gated_attn_layer`'s prefill ops6-7 encoder at `gpu_full_attn.rs:1666`. **LIVE evidence: 10/10 byte-identical cold-process greedy decodes on 27B-dwq46 (max=8) and apex Q4_0 (max=32).**
+
+The spec_decode mechanism work shipped on the two parallel branches is now ready to bench against this deterministic baseline:
+
+- `origin/fix/adr013-mtp-shared-embed` — MTP weight loader (shared-embedding + tied lm_head fix)
+- `origin/fix/adr013-spec-decode-prev-hidden` — spec_decode runtime (prev_hidden plumbing fix)
+
+Bench protocol (next iter): run draft acceptance-rate + e2e tok/s on 27B-dwq46 (DenseQ FullAttn slot, head_dim=256) and apex Q4_0 (MoeQ + DeltaNet hybrid) at max-tokens 64/128/256, paired cold-SoC, mcp-brain-server suspended via `kill -STOP` per `feedback_bench_process_audit`. Pre-fix the bench would have produced run-to-run acceptance-rate variance ≥ ε from the underlying non-determinism; post-fix any variance is purely from spec_decode's own draft/target mismatch, the actual signal we want.
