@@ -1045,23 +1045,23 @@ pub fn load_moe_ffn_quantized(
     let ggml_type_down = down_info.ggml_type;
 
     let supported = |t: GgmlType| matches!(t,
-        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q5_K | GgmlType::Q6_K
+        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K
     );
 
     // Validate that the types are supported by quantized_matmul_id_ggml.
-    // Q5_K uses the mv_id kernel (mm_id not yet ported); Q4_0/Q8_0/Q6_K
+    // Q4_K/Q5_K use the mv_id kernel (mm_id not yet ported); Q4_0/Q8_0/Q6_K
     // also use mv_id for decode and mm_id for prefill batches > 8 tokens.
     if !supported(ggml_type_gate_up) {
         return Err(anyhow!(
             "layer {layer_idx}: gate/up expert weights have unsupported quant type {:?} \
-             (expected Q4_0, Q8_0, Q5_K, or Q6_K)",
+             (expected Q4_0, Q8_0, Q4_K, Q5_K, or Q6_K)",
             ggml_type_gate_up
         ));
     }
     if !supported(ggml_type_down) {
         return Err(anyhow!(
             "layer {layer_idx}: down expert weights have unsupported quant type {:?} \
-             (expected Q4_0, Q8_0, Q5_K, or Q6_K)",
+             (expected Q4_0, Q8_0, Q4_K, Q5_K, or Q6_K)",
             ggml_type_down
         ));
     }
