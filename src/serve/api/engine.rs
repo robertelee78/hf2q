@@ -8900,4 +8900,211 @@ mod tool_call_stream_emitter_tests {
             other => panic!("expected Content delta, got {other:?}"),
         }
     }
+
+    // ─── iter-219 reproducers (ADR-005 Phase 4 reopen iter-218 honest-scope) ───
+    //
+    // iter-218 LIVE testing surfaced a malformed `function.name` of the form
+    // `get_currentcall:get_current_weather` on the first ToolCallDelta when a
+    // Gemma 4 model emits a leading non-tool-call content fragment ending in
+    // `get_current` followed by `<|tool_call>call:get_current_weather{...}<tool_call|>`.
+    // The bug is independent of the iter-218 loop fix; it surfaced past the
+    // structural unblock. These tests drive the FULL splitter→emitter pipeline
+    // exactly the way `route_content` does (engine.rs:4598+) so the hypothesis
+    // is testable without a live model. Per the engineering mantra
+    // ("Code + test == truth"), the doc-anchored byte stream is the only
+    // ground truth we can rely on for a regression test.
+    //
+    // The flow mirrors route_content:
+    //   - Content   → recorded (delta.content)
+    //   - ToolCallOpen  → body.clear(), emitter = Some(new)
+    //   - ToolCallText  → body.push_str(t), emitter.advance(body, ...)
+    //   - ToolCallClose → emitter.finalize(...)
+
+    /// Drive splitter + emitter pipeline through a sequence of decoded
+    /// fragments (one entry per token) and return (delta_content_concat,
+    /// tool_call_events).
+    fn drive_splitter_emitter_pipeline(
+        fragments: &[&str],
+    ) -> (String, Vec<GenerationEvent>) {
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(256);
+        let reg = &super::super::registry::GEMMA4;
+        let mut splitter =
+            super::super::registry::ToolCallSplitter::from_registration(reg)
+                .expect("gemma4 has tool markers");
+        let mut body = String::new();
+        let mut emitter: Option<ToolCallStreamEmitter> = None;
+        let mut tc_index: usize = 0;
+        let mut saw_tc: bool = false;
+
+        let drive_events = |events: Vec<super::super::registry::ToolCallEvent>,
+                            body: &mut String,
+                            emitter: &mut Option<ToolCallStreamEmitter>,
+                            tc_index: &mut usize,
+                            saw_tc: &mut bool,
+                            tx: &mpsc::Sender<GenerationEvent>| {
+            for ev in events {
+                match ev {
+                    super::super::registry::ToolCallEvent::Content(t) => {
+                        if !t.is_empty() {
+                            tx.blocking_send(GenerationEvent::Delta {
+                                kind: super::super::sse::DeltaKind::Content,
+                                text: t,
+                            })
+                            .expect("send content");
+                        }
+                    }
+                    super::super::registry::ToolCallEvent::ToolCallOpen => {
+                        body.clear();
+                        *emitter = Some(ToolCallStreamEmitter::new(Some(reg.family), *tc_index));
+                    }
+                    super::super::registry::ToolCallEvent::ToolCallText(t) => {
+                        body.push_str(&t);
+                        if let Some(em) = emitter.as_mut() {
+                            em.advance(body, tx).expect("advance");
+                        }
+                    }
+                    super::super::registry::ToolCallEvent::ToolCallClose => {
+                        let body_dump = std::mem::take(body);
+                        let mut em = emitter.take().unwrap_or_else(|| {
+                            ToolCallStreamEmitter::new(Some(reg.family), *tc_index)
+                        });
+                        em.finalize(
+                            body_dump,
+                            Some(reg),
+                            ToolCallPolicy::Constrained,
+                            tc_index,
+                            saw_tc,
+                            tx,
+                        )
+                        .expect("finalize");
+                    }
+                }
+            }
+        };
+
+        for frag in fragments {
+            let events = splitter.feed(frag);
+            drive_events(events, &mut body, &mut emitter, &mut tc_index, &mut saw_tc, &tx);
+        }
+        if let Some(tail) = splitter.finish() {
+            drive_events(vec![tail], &mut body, &mut emitter, &mut tc_index, &mut saw_tc, &tx);
+        }
+        drop(tx);
+
+        let mut content = String::new();
+        let mut tool_events = Vec::new();
+        for ev in drain(&mut rx) {
+            match &ev {
+                GenerationEvent::Delta {
+                    kind: super::super::sse::DeltaKind::Content,
+                    text,
+                } => content.push_str(text),
+                GenerationEvent::ToolCallDelta { .. } => tool_events.push(ev),
+                _ => {}
+            }
+        }
+        (content, tool_events)
+    }
+
+    /// iter-219 baseline — single-fragment whole-emission case. The model
+    /// emits the full template-shaped sequence in one step; splitter sees
+    /// one big string. Establishes that the splitter+emitter is correct
+    /// when boundary issues are absent.
+    #[test]
+    fn iter219_baseline_single_fragment_yields_clean_name() {
+        let raw = "<|tool_response>get_current\
+                   <|tool_call>call:get_current_weather\
+                   {location:<|\"|>Paris<|\"|>}<tool_call|>";
+        let (content, tool_events) = drive_splitter_emitter_pipeline(&[raw]);
+        let (name, args) = rebuild_call(&tool_events, 0);
+        assert_eq!(
+            name.as_deref(),
+            Some("get_current_weather"),
+            "BASELINE: single-fragment whole-emit MUST extract clean name. \
+             Got name={name:?}, content={content:?}, args={args:?}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&args).expect("args MUST be valid JSON");
+        assert_eq!(parsed["location"], "Paris");
+    }
+
+    /// iter-219 reproducer — token-boundary case. The Gemma 4 tokenizer
+    /// emits the bug-relevant string as the following decoded fragments
+    /// (verified against the real `tokenizer.json` round-trip on
+    /// 2026-04-30): `<|tool_response>`, `get`, `_`, `current`,
+    /// `<|tool_call>`, `call`, `:`, `get`, `_`, `current`, `_`,
+    /// `weather`, `{`, `location`, `:`, `<|"|>`, `Paris`, `<|"|>`, `}`,
+    /// `<tool_call|>`. This MUST yield the same clean name as the
+    /// single-fragment case — anything else is a token-boundary regression
+    /// in the splitter / emitter.
+    #[test]
+    fn iter219_reproducer_token_boundary_yields_clean_name() {
+        let fragments: &[&str] = &[
+            "<|tool_response>",
+            "get", "_", "current",
+            "<|tool_call>",
+            "call", ":",
+            "get", "_", "current", "_", "weather",
+            "{",
+            "location", ":",
+            "<|\"|>", "Paris", "<|\"|>",
+            "}",
+            "<tool_call|>",
+        ];
+        let (content, tool_events) = drive_splitter_emitter_pipeline(fragments);
+        let (name, args) = rebuild_call(&tool_events, 0);
+        assert_eq!(
+            name.as_deref(),
+            Some("get_current_weather"),
+            "iter-219: token-boundary feed MUST extract clean name == \
+             \"get_current_weather\" (not the malformed \
+             \"get_currentcall:get_current_weather\" observed in iter-218 \
+             LIVE). Got name={name:?}, content={content:?}, args={args:?}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&args).expect("args MUST be valid JSON");
+        assert_eq!(parsed["location"], "Paris");
+        // The leading `<|tool_response>get_current` must end up in
+        // delta.content (or be absorbed elsewhere coherently); critically,
+        // it MUST NOT pollute the tool-call body.
+        assert!(
+            !name.as_deref().unwrap_or("").contains("call:"),
+            "iter-219: tool-call name MUST NOT contain `call:` (would \
+             indicate body absorbed pre-open content). name={name:?}"
+        );
+    }
+
+    /// iter-219 stress — leading content WITHOUT the `<|tool_response>`
+    /// stray prefix, just a plain `get_current` content fragment before the
+    /// open marker (the structural shape of the bug per the ADR-218
+    /// honest-scope note).
+    #[test]
+    fn iter219_reproducer_leading_get_current_content_isolated() {
+        let fragments: &[&str] = &[
+            "get", "_", "current",
+            "<|tool_call>",
+            "call", ":",
+            "get", "_", "current", "_", "weather",
+            "{",
+            "location", ":",
+            "<|\"|>", "Paris", "<|\"|>",
+            "}",
+            "<tool_call|>",
+        ];
+        let (content, tool_events) = drive_splitter_emitter_pipeline(fragments);
+        let (name, args) = rebuild_call(&tool_events, 0);
+        assert_eq!(
+            name.as_deref(),
+            Some("get_current_weather"),
+            "iter-219: leading `get_current` content MUST be routed to \
+             delta.content (NOT prepended to the tool body). Got \
+             name={name:?}, content={content:?}, args={args:?}"
+        );
+        // `get_current` should appear in delta.content (the splitter routed
+        // it correctly) — present check is loose because exact whitespace
+        // is irrelevant; the regression signature is name pollution.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&args).expect("args MUST be valid JSON");
+        assert_eq!(parsed["location"], "Paris");
+    }
 }

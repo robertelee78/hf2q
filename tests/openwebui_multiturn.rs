@@ -107,10 +107,19 @@ fn fixture_path() -> PathBuf {
 /// This gate makes the regression class loud at test time.
 ///
 /// Markers checked (from `serve::api::registry::BUILTIN_REGISTRATIONS`):
-///   - Gemma 4: `<|channel>`, `<channel|>`, `<|tool_call>`, `<tool_call|>`
+///   - Gemma 4: `<|channel>`, `<channel|>`, `<|tool_call>`, `<tool_call|>`,
+///     `<|tool_response>`, `<tool_response|>`
 ///   - Qwen 3.5/3.6: `<think>`, `</think>`, `<tool_call>`, `</tool_call>`
 /// Plus turn markers that should never leak:
 ///   - Gemma 4: `<|turn>`, `<turn|>`
+///
+/// **iter-219 (2026-04-30 ADR-005 reopen)**: `<|tool_response>` (token id 50
+/// in the Gemma 4 GGUF tokenizer) leaked into `delta.content` during the
+/// iter-218 LIVE run as a post-tool-close stray. The model is trained to
+/// expect a `<|tool_response>...<tool_response|>` block from the host
+/// after `<tool_call|>`; absent grammar exhaust, the next decoded token can
+/// be the open marker which decodes to its literal text. Register it here
+/// so the regression class is loud at LIVE-test time.
 fn assert_no_leaked_special_tokens(label: &str, text: &str) {
     const LEAK_MARKERS: &[&str] = &[
         // Gemma 4 reasoning channel
@@ -119,6 +128,9 @@ fn assert_no_leaked_special_tokens(label: &str, text: &str) {
         // Gemma 4 tool-call
         "<|tool_call>",
         "<tool_call|>",
+        // Gemma 4 tool-response (iter-219: post-close stray content leak)
+        "<|tool_response>",
+        "<tool_response|>",
         // Gemma 4 turn boundaries
         "<|turn>",
         "<turn|>",
