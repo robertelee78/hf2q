@@ -336,6 +336,7 @@ pub fn hf2q_binary_path() -> PathBuf {
 mod phase_d_driver {
     //! Self-contained subprocess driver for Phase D coherence + perf
     //! tests. RAII `ServerGuard` kills + waits the child on Drop.
+    #![allow(dead_code)] // log_tail / stderr_tail held for diagnostic-on-failure surface
     use std::io::{BufRead, BufReader, Read, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
