@@ -30,6 +30,14 @@ use std::time::{Instant, SystemTime};
 use crate::serve::kv_persist::format::{self, EnvelopeHeader, ModelFingerprint, CURRENT_FORMAT_VERSION};
 use crate::serve::kv_persist::index::{BlockIndex, BlockMeta};
 
+/// TTL for orphan `.tmp.<pid>` files in the recovery GC. Files
+/// younger than this are kept (a crash-mid-write may have left a
+/// recently-written tempfile that a concurrent writer in another
+/// process is finalizing). 60s is conservative — writes complete
+/// in <60s on M5 Max NVMe; longer waits indicate a stalled or
+/// dead writer (P0-3, ADR-017 adversarial review §P0-3).
+const ORPHAN_TTL_SECS: u64 = 60;
+
 /// Outcome of a recovery scan. All fields are derived from real
 /// `fs::metadata` calls on the on-disk artifacts — never synthesized
 /// (per `feedback_substrate_must_not_synthesize_ship_gates`).
@@ -48,8 +56,16 @@ pub struct RecoveryReport {
     /// identical so this is the canonical figure).
     pub bytes_quarantined: u64,
     /// `*.tmp.<pid>` files left behind by a prior crashed write
-    /// (§D5 atomic-rename leftovers). Counted but not modified.
+    /// (§D5 atomic-rename leftovers). Counted regardless of whether
+    /// the recovery GC subsequently removed them — see
+    /// [`Self::orphan_tmp_files_removed`].
     pub partial_tmp_files_ignored: usize,
+    /// Subset of [`Self::partial_tmp_files_ignored`] that the recovery
+    /// GC actually unlinked because their mtime was older than
+    /// [`ORPHAN_TTL_SECS`]. Best-effort — a remove failure (e.g. a
+    /// racing cross-process writer holding the inode) is silently
+    /// ignored and not counted (P0-3, ADR-017 adversarial review §P0-3).
+    pub orphan_tmp_files_removed: usize,
     /// Wall-clock duration of the entire scan, milliseconds.
     pub elapsed_ms: u128,
 }
@@ -165,8 +181,20 @@ fn scan_one(
         .to_string();
 
     // Atomic-rename leftovers from a prior crashed write (§D5 + §D8).
+    // P0-3 (ADR-017 adversarial review): GC orphans older than
+    // ORPHAN_TTL_SECS. Best-effort — ignore remove errors so a
+    // racing cross-process writer doesn't crash recovery.
     if name.contains(".tmp.") {
         report.partial_tmp_files_ignored += 1;
+        if let Ok(meta) = fs::metadata(blk_path) {
+            if let Ok(mtime) = meta.modified() {
+                if let Ok(age) = SystemTime::now().duration_since(mtime) {
+                    if age.as_secs() >= ORPHAN_TTL_SECS && fs::remove_file(blk_path).is_ok() {
+                        report.orphan_tmp_files_removed += 1;
+                    }
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -628,6 +656,79 @@ mod tests {
             "scan completed in well under 60s: {} ms",
             report.elapsed_ms
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Backdate `path`'s atime+mtime by `secs` seconds via `libc::utimes`.
+    /// Returns false if the syscall fails (caller skips the test rather
+    /// than emit a confusing assertion failure on a CI sandbox that
+    /// rejects utimes — every dev box this ships against supports it).
+    fn backdate_mtime(path: &Path, secs: u64) -> bool {
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_secs() as i64;
+        let target = now - secs as i64;
+        let tv = [
+            libc::timeval {
+                tv_sec: target as libc::time_t,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: target as libc::time_t,
+                tv_usec: 0,
+            },
+        ];
+        let cstr = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .expect("path -> cstring");
+        let rc = unsafe { libc::utimes(cstr.as_ptr(), tv.as_ptr()) };
+        rc == 0
+    }
+
+    #[test]
+    fn p0_3_orphan_tmp_files_older_than_ttl_are_gc_at_recovery() {
+        // P0-3 (ADR-017 adversarial review §P0-3): orphan `.tmp.<pid>`
+        // files older than ORPHAN_TTL_SECS must be GC'd at recovery
+        // scan. Recent orphans (a possibly-still-active concurrent
+        // writer) must be kept.
+        let dir = temp_dir("rec-p0-3-gc");
+        let fp = fixture_fp("rec-p0-3-gc");
+
+        // Need a fanout dir to drop orphans into. Layout matches the
+        // recover_from_disk walk: <root>/models/<short>/kv/<hex0>/.
+        // Write one valid block first to materialize the fanout dir.
+        let (body, header) = make_block(fp, ParentBlockHash(None), 0);
+        let valid_path = block_path(&dir, &fp, &header.block_hash);
+        write_envelope(&valid_path, &header, &body).expect("write valid");
+        let fanout_dir = valid_path.parent().unwrap().to_path_buf();
+
+        // Recent orphan — must be KEPT (mtime = now).
+        let recent = fanout_dir.join(format!("recent.safetensors.tmp.{}", process::id()));
+        fs::write(&recent, b"recent orphan").expect("write recent");
+
+        // Aged orphan — must be GC'd (mtime backdated 120s).
+        let aged = fanout_dir.join(format!("aged.safetensors.tmp.{}", process::id() + 1));
+        fs::write(&aged, b"aged orphan").expect("write aged");
+        if !backdate_mtime(&aged, 120) {
+            // utimes refused — skip rather than misreport. Every M5
+            // Max / Linux dev box supports utimes; this is a sandbox
+            // bail-out only.
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let (_idx, report) = recover_from_disk(&dir).expect("recover");
+        assert_eq!(
+            report.partial_tmp_files_ignored, 2,
+            "both orphans counted as ignored"
+        );
+        assert_eq!(
+            report.orphan_tmp_files_removed, 1,
+            "exactly the aged orphan was removed"
+        );
+        assert!(recent.exists(), "recent orphan kept");
+        assert!(!aged.exists(), "aged orphan removed");
 
         let _ = fs::remove_dir_all(&dir);
     }
