@@ -166,6 +166,14 @@ impl BlockIndex {
         guard.len()
     }
 
+    /// Return a snapshot of all `BlockMeta` values. Used by the LRU-evict
+    /// path (`block_store::DiskBlockStore::evict_lru_until_under_budget`)
+    /// which needs to sort by `mtime` outside the read lock.
+    pub fn snapshot_all(&self) -> Vec<BlockMeta> {
+        let guard = self.inner.read().expect("BlockIndex inner RwLock poisoned");
+        guard.values().cloned().collect()
+    }
+
     /// Walk `<cache_root>/models/*/kv/*/*.safetensors`, parse each
     /// envelope header, and populate a fresh [`BlockIndex`]. Files that
     /// fail header parse / version check are MOVED to

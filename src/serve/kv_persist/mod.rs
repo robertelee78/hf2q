@@ -14,9 +14,20 @@
 //! that wires `KvSpiller<E>` (ADR-005 Phase 4 iter-212) into the
 //! HotSwapManager.
 
+pub mod block_store;
 pub mod format;
 pub mod index;
+pub mod recovery;
+pub mod writer;
 
+#[allow(unused_imports)]
+pub use block_store::{DiskBlockStore, WriteJob, MAX_BLOCK_BYTES};
+#[allow(unused_imports)]
+pub use recovery::{
+    quarantine_corrupted_block, recover_from_disk, QuarantineReason, RecoveryReport,
+};
+#[allow(unused_imports)]
+pub use writer::{AsyncWriterHandle, DEFAULT_CHANNEL_CAPACITY};
 #[allow(unused_imports)]
 pub use format::{
     compute_block_hash, compute_model_fingerprint, read_envelope_body, read_envelope_header,
