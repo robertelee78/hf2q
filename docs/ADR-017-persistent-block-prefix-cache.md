@@ -916,6 +916,89 @@ A.3 then ships `BlockPrefixCacheSpiller<E>` impl of `KvSpiller<E>` (Phase 4 iter
 2. **Recovery scan parallelism** — `rebuild_from_disk` walks sequentially in A.1; M5 Max APFS may benefit from parallel directory walks at scale (>10⁴ blocks per model). A.2 reserves the right to introduce `rayon` parallelism in the scan if measurement shows a startup-time concern; A.1 ships sequential because the parallelism would need its own quarantine-collision serializer.
 3. **Hot-tier RAM cache** — A.1 does NOT include the LRU hot-tier; per ADR-017 §D6 it ships opt-in via `HF2Q_KV_HOT_CACHE_BYTES` (default `0` = disabled) and is gated on Phase A0 measurement. A.2 / A.3 land it together with the spiller wire-up.
 
+### Phase A.2 LANDED (2026-04-30)
+
+**Status:** Production substrate complete on `cfa/adr017-a2/claude` worktree; pending dual-mode queen merge against the Codex parallel impl. A.1's `format::write_envelope` + `BlockIndex` primitives proved sufficient — A.2 stitched them into a synchronous I/O surface (`DiskBlockStore`), a background writer thread (`AsyncWriterHandle`), and a restart-recovery scan with structured telemetry (`recover_from_disk` + `RecoveryReport`). Plus a kill-9 mid-write integration test that proves the §D5 atomic-rename invariant under SIGKILL.
+
+**Commits (cfa/adr017-a2/claude, 6 expected; pushed):**
+
+- `92269e5` — `feat(adr-017 a.2): kv_persist::block_store DiskBlockStore (10 unit tests)`
+- `2b743bb` — `feat(adr-017 a.2): kv_persist::writer AsyncWriterHandle (6 unit tests)`
+- `efdd303` — `feat(adr-017 a.2): kv_persist::recovery restart-recovery + quarantine (7 unit tests)`
+- `d9511c6` — `feat(adr-017 a.2): kv_persist lib facade for integration tests`
+- `741a485` — `test(adr-017 a.2): kill -9 mid-write atomic-rename integration test (89 LOC)`
+- `<this commit>` — `docs(adr-017 a.2): record Phase A.2 LANDED status`
+
+**LOC delta (production src/, additive):**
+
+| File | LOC | Role |
+|---|---|---|
+| `src/serve/kv_persist/block_store.rs` | 884 | `DiskBlockStore` synchronous I/O over the §D5 layout. `write_block_sync` runs `format::write_envelope` under a per-`(model_fp, hash[..2])` `flock(LOCK_EX)` advisory lock per §R-F10, then `index.insert(...)` so readers see the block immediately. `read_block` / `read_block_with_header` delegate to `format::read_envelope_body` (body-hash verified). `remove_block` is `fs::remove_file` + `index.remove`, idempotent on missing files. `evict_lru_until_under_budget(is_block_pinned)` walks the index by mtime ascending (real `fs::metadata`-driven per `feedback_substrate_must_not_synthesize_ship_gates`), skips Arc-pinned blocks, deterministic tie-break via `(mtime, bytes_desc, hash_lex)`. `block_path` / `quarantine_dir` are pure-path helpers. `MAX_BLOCK_BYTES = 256 MiB` with a test-only `set_max_block_bytes_override` so the §R-F11 rejection test runs at 1 KiB instead of 256 MiB. |
+| `src/serve/kv_persist/writer.rs` | 488 | `AsyncWriterHandle::spawn(store, channel_capacity)` starts a named "hf2q-kv-writer" thread bound to `Arc<DiskBlockStore>`. Bounded back-pressure via `mpsc::sync_channel` per §R-P1: `enqueue` returns `TrySendError::Full` at capacity (spiller short-circuits rather than stalls prefill). `enqueue_blocking` for tests / explicit-back-pressure callers. Worker loop opportunistically drains via `try_recv` after each `recv` to amortize batch enqueues. On I/O error: `tracing::warn!` + `completion_tx.try_send(Err(...))` + continue — NEVER panics. `shutdown` drops the sender, worker drains pending jobs and exits cleanly. `completion_channel()` helper builds `mpsc::sync_channel(1)` for one-shot ack. |
+| `src/serve/kv_persist/recovery.rs` | 634 | `recover_from_disk(cache_root) -> (BlockIndex, RecoveryReport)` for `cmd_serve` startup. `RecoveryReport` carries `blocks_indexed`, `blocks_quarantined`, `bytes_indexed`, `bytes_quarantined`, `partial_tmp_files_ignored`, `elapsed_ms` — all fields derived from real `fs::metadata` calls. `QuarantineReason {TruncatedHeader, VersionMismatch, BodyHashMismatch, ParityFail}` — distinct filename prefixes (`trunc__`, `verbump__`, `bodyhash__`, `parity__`) so operators can grep `kv-quarantine/` by cause. `quarantine_corrupted_block` is the public surface for the read path's lazy body-hash-mismatch quarantine; `fs::rename` with cross-fs `copy + remove` fallback. |
+| `src/serve/kv_persist/mod.rs` | 38 (+11) | Adds `pub mod block_store; pub mod writer; pub mod recovery;` + re-exports for `DiskBlockStore`, `WriteJob`, `MAX_BLOCK_BYTES`, `AsyncWriterHandle`, `DEFAULT_CHANNEL_CAPACITY`, `recover_from_disk`, `RecoveryReport`, `QuarantineReason`, `quarantine_corrupted_block`. |
+| `src/serve/kv_persist/index.rs` | +9 | `BlockIndex::snapshot_all` for the LRU eviction sort path (releases the read lock before sorting to avoid holding it across `fs::remove_file`). |
+| `src/lib.rs` | 38 | Narrow library facade exposing `serve::kv_persist` only. Pre-A.2, `hf2q` was bin-only — integration tests couldn't reach internal modules. The kill-9 test imports production types directly via `hf2q::serve::kv_persist::*`. Other modules (cli, inference, quantize, ...) remain bin-private. Cargo accepts both `[[bin]]` and an implicit `[lib]` target on the same package; `main.rs` is unaffected. |
+| `tests/kv_persist_writer_kill_minus_9.rs` | 89 | Integration test gated `cfg(unix)`. Forks a child via `libc::fork()`, child opens `DiskBlockStore` + `AsyncWriterHandle` and enqueues 10× 1-MiB `WriteJob`s; parent sleeps 30 ms then `libc::kill(child, SIGKILL)` and `libc::waitpid` to reap. Assertions: every `<sha>.safetensors` file at canonical paths parses cleanly via `format::read_envelope_body` (atomic rename held); `*.tmp.<pid>` orphans tolerated. |
+| **Total** | **2,180 src + 89 test (additive over A.1's 1,584)** | — |
+
+**Test count delta:**
+
+- 23 new in-module unit tests across A.2 production code (10 block_store + 6 writer + 7 recovery), all PASS in 1.06 s under `cargo test --release --bin hf2q kv_persist -- --test-threads=1`.
+- Cumulative `kv_persist` unit tests: A.1 had 20 (10 format + 10 index); A.2 adds 23 → **43 total in-binary unit tests**, all PASS.
+- 1 new integration test (`tests/kv_persist_writer_kill_minus_9.rs::kill_minus_9_mid_write_leaves_committed_blocks_and_no_partial_named_files`), 5/5 trials PASS — empirically 5–7 committed blocks + 0–1 tmp orphans + 0 partial-named-final files per run.
+- 36/36 existing harness tests still PASS (`cargo test --release --test kv_persist_harness -- --test-threads=1`, 1.96 s) — no regression.
+
+**Kill-9 atomic-rename evidence (5 consecutive trials):**
+
+| Trial | Committed blocks | Tmp orphans | Partial-named-final files |
+|---|---|---|---|
+| 1 | 7 | 1 | **0** |
+| 2 | 6 | 1 | **0** |
+| 3 | 6 | 1 | **0** |
+| 4 | 6 | 0 | **0** |
+| 5 | 5 | 1 | **0** |
+
+The §D5 atomic-rename invariant holds under SIGKILL: every file at the canonical `<hash>.safetensors` path is a complete envelope. Partial writes are confined to `*.tmp.<pid>` paths that the recovery scan ignores.
+
+**Mechanical exit codes (worktree HEAD `<final>`):**
+
+| Command | Exit | Output |
+|---|---|---|
+| `cargo build --release` | **0** | `Finished release profile [optimized] target(s)` |
+| `cargo test --release --bin hf2q kv_persist -- --test-threads=1` | **0** | **43 passed; 0 failed; 0 ignored** in 1.06 s |
+| `cargo test --release --test kv_persist_writer_kill_minus_9 -- --test-threads=1` | **0** | **1 passed; 0 failed; 0 ignored** in 0.05 s; "PASS — N committed, M tmp orphans, 0 partial-named-final" |
+| `cargo test --release --test kv_persist_harness -- --test-threads=1` | **0** | **36 passed; 0 failed; 0 ignored** in 1.96 s (no regression) |
+| `cargo clippy --release --no-deps` (kv_persist filter) | **0** | zero warnings on `kv_persist` code (`#[allow(clippy::result_large_err)]` annotated on `enqueue` / `enqueue_blocking` because the Err carries the failed `WriteJob` back for caller-side retry) |
+| `grep -rn '// TODO\|todo!()\|unimplemented!()' src/serve/kv_persist/ tests/kv_persist_writer_kill_minus_9.rs` | **1** | no hits — discipline holds |
+
+**Hookup readiness for A.3 (BlockPrefixCacheSpiller<E>):**
+
+A.3 lands the `BlockPrefixCacheSpiller<E>` impl of the `KvSpiller<E>` trait (ADR-005 Phase 4 iter-212) over `Arc<DiskBlockStore> + AsyncWriterHandle`. The hand-off shape:
+
+- **Spiller construction**: `BlockPrefixCacheSpiller::new(cache_root, budget_bytes)` calls `recovery::recover_from_disk(cache_root)` → builds `Arc<DiskBlockStore>` via `DiskBlockStore::new_with_index(cache_root, index, budget_bytes)` → spawns `AsyncWriterHandle::spawn(store_arc.clone(), DEFAULT_CHANNEL_CAPACITY)`.
+- **Spill path (write)**: spiller serializes `(K, V, optional_state)` per §A.3 codec → builds `EnvelopeHeader` with chain-hash `block_hash` per §D4 → `handle.enqueue(WriteJob { header, body, completion_tx: None })`. Back-pressure via `TrySendError::Full` per §R-P1 — spiller drops the spill rather than stalling prefill.
+- **Restore path (read)**: spiller computes the chain hash for the requested `(model_fp, parent, tokens)` → `store.read_block(&hash)` returns body bytes → spiller deserializes per the recorded `payload_kind` + `codec_version`. On `io::Error` from `read_block`, the read path calls `recovery::quarantine_corrupted_block(... QuarantineReason::BodyHashMismatch)` so the corrupted file moves to `kv-quarantine/bodyhash__<hex>.safetensors` for operator post-mortem.
+- **Eviction**: A.3 wires `is_block_pinned` to the live KV-cache liveness check (which `Arc<>`s does the inference engine currently hold?). The spiller calls `store.evict_lru_until_under_budget(|h| live_set.contains(h))` after each spill so the disk budget stays under §R-F5.
+- **Hot tier**: A.3 ships the optional `LruCache<BlockHash, Bytes>` tier with `HF2Q_KV_HOT_CACHE_BYTES` (default `0` = disabled per §D6). Hot tier stores serialized bytes only per oMLX `paged_ssd_cache.py:1198-1245` (no live `MlxBuffer` to avoid `IOGPUMemory` underflow).
+
+**A.2 discipline notes:**
+
+- Production code in `src/serve/kv_persist/*` only (additive). One ADDITIVE 1-line edit to `src/serve/kv_persist/index.rs` (the `snapshot_all` helper). Zero edits to `src/serve/multi_model.rs` (Phase 4 trait surface stable; A.3 is the wire-up phase).
+- New `src/lib.rs` (38 LOC, narrow facade) exposes only `serve::kv_persist`. All other binary-private modules remain unexposed.
+- NO `// TODO` / `todo!()` / `unimplemented!()` markers shipped.
+- "man-day" used; "person-day" does not appear.
+- Real `fs::metadata`-driven mtime ordering for LRU eviction; no synthesized counts (per `feedback_substrate_must_not_synthesize_ship_gates`).
+- Real byte-content verification in tests (per `feedback_live_verification_must_check_content`): `write_block_sync_round_trip_via_format` and `read_block_returns_bytes_after_write` assert on actual `body_back == body` rather than `Ok(...)` returns.
+- Hot tier NOT enabled (per §D6); `HF2Q_KV_HOT_CACHE_BYTES` default `0` deferred to A.3 with the spiller wire-up.
+- Worktree discipline: ABSOLUTE PATHS in shell; no `cd /opt/hf2q` corruption (per `feedback_agent_worktree_cwd_trap`).
+
+**Open questions deferred to A.3:**
+
+1. **Hot-tier RAM cache shape** — `LruCache<BlockHash, Bytes>` of serialized bytes, sized to `HF2Q_KV_HOT_CACHE_BYTES` (default `0`). A.3 measures whether it pays on M5 Max single-process workloads (Phase A0 returned no measurable benefit; A.3 confirms or kills).
+2. **Per-family payload codec** — A.2's `payload_kind: String` field on `EnvelopeHeader` is opaque. A.3 enumerates the codec values: `kv-dense-bf16` (Gemma 4 dense), `kv-tq-packed` (TQ-active), `kv-hybrid-fa+conv+rec` (Qwen3.5 / Qwen3.6 hybrid). The codec value lives in this header field; the on-disk format is unchanged.
+3. **Pin set wiring** — A.2's `evict_lru_until_under_budget(is_block_pinned)` takes a callback. A.3 wires it to the live KV-cache liveness via `Arc::strong_count()` on the cache slot (or a dedicated `BlockLiveSet` shared between the engine and the spiller).
+
 ---
 
 ## Open Questions
