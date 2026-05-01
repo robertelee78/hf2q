@@ -1247,6 +1247,67 @@ impl KvCacheSpill for Gemma4DenseSpill {
 
         Ok(())
     }
+
+    /// ADR-017 §F4 — return the strict
+    /// `(repo, quant, producer_version, source_sha256,
+    /// tokenizer_chat_template_hash)` fingerprint for THIS spill's
+    /// loaded model. Sourced from the engine's
+    /// `KvSpillDescriptor.provenance` (populated at
+    /// [`crate::serve::api::engine::Engine::spawn`] from the GGUF's
+    /// iter-211 metadata + the loaded chat template).
+    ///
+    /// **Returns**:
+    /// - `Some(fp)` for a hf2q-quantized GGUF (provenance was
+    ///   `Provenance::Hf2q`): `fp` differs across re-quants of the
+    ///   same repo (different `source_sha256`), across producer-
+    ///   version upgrades, AND across chat-template rotations.
+    /// - `Some(fp_legacy)` for an External GGUF (foreign quant):
+    ///   `fp_legacy = compute_model_fingerprint(repo, quant.as_str(),
+    ///   "", "", "")` — byte-identical to the spiller's pre-iter-211
+    ///   fallback. This locks in the documented permanent semantic
+    ///   that foreign GGUFs keep the legacy `(repo, quant)` namespace.
+    /// - `None` ONLY when neither the `Arc<Engine>` slot nor the
+    ///   `EngineHandle` slot is populated (the spiller falls back to
+    ///   the legacy fingerprint via the trait default's
+    ///   `family_model_fp` flow). This is unreachable in production
+    ///   because the spiller registers the hook only after the
+    ///   engine is bound.
+    fn model_fingerprint(
+        &self,
+        repo: &str,
+        quant: crate::serve::quant_select::QuantType,
+    ) -> Option<crate::serve::kv_persist::format::ModelFingerprint> {
+        // Production path: read provenance off the live engine's
+        // descriptor. The engine's descriptor was populated at
+        // spawn-time by `Engine::spawn`'s descriptor builder
+        // (engine.rs ~line 1503), so the provenance is the same
+        // for every snapshot/restore cycle for the same loaded
+        // model.
+        let engine_arc = self
+            .engine_arc
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(Weak::upgrade))?;
+        let descriptor = engine_arc.kv_spill_descriptor()?;
+        let prov = &descriptor.provenance;
+
+        // Both Hf2q and External cases route through the same
+        // `compute_model_fingerprint` call. For External GGUFs the
+        // KvSpillProvenance fields are all empty strings, which
+        // collapses to the legacy
+        // `compute_model_fingerprint(repo, quant.as_str(), "", "", "")`
+        // — byte-identical to `BlockPrefixCacheSpiller::family_model_fp`'s
+        // legacy fallback. This preserves pre-iter-211 cache hits.
+        Some(
+            crate::serve::kv_persist::format::compute_model_fingerprint(
+                repo,
+                quant.as_str(),
+                &prov.producer_version,
+                &prov.source_sha256,
+                &prov.tokenizer_chat_template_hash,
+            ),
+        )
+    }
 }
 
 // Send + Sync invariant: every field is Arc-wrapped Send+Sync state.
@@ -2617,6 +2678,7 @@ mod tests {
             nkv_heads: vec![2, 2, 1, 2],
             head_dim: vec![8, 8, 16, 8],
             kv_dtype,
+            provenance: crate::serve::api::kv_spill_descriptor::KvSpillProvenance::default(),
         }
     }
 
@@ -2955,5 +3017,213 @@ mod tests {
         // observe it directly, but the count check above covers the
         // load-bearing invariant.
         assert_eq!(Arc::strong_count(&arc_engine), 1);
+    }
+
+    // ========================================================================
+    // ADR-017 §F4 — provenance-aware namespace key tests
+    // ========================================================================
+    //
+    // These tests are the load-bearing regression suite for the §F4 fix:
+    // they prove that `family_model_fp` consumes ADR-005 iter-211's
+    // `hf2q.producer_version` / `hf2q.source_sha256` metadata + the
+    // GGUF's `tokenizer.chat_template` to build the per-`(repo, quant)`
+    // namespace key, and that the External-GGUF fallback preserves
+    // pre-iter-211 cache hits exactly.
+    //
+    // Falsifier for the first test: the spiller's family_model_fp
+    // ignores provenance and drops back to (repo, quant, "", "", "")
+    // even when the engine carries a populated KvSpillProvenance.
+    //
+    // Falsifier for the second test: the External fallback breaks —
+    // a foreign GGUF with no hf2q.* keys silently shifts namespace
+    // and stops hitting its existing cache blocks.
+    //
+    // Falsifier for the third test: a chat-template upgrade reuses
+    // the pre-upgrade namespace and serves stale blocks against the
+    // new template (the load-bearing F4 hazard).
+
+    /// Build a `Gemma4DenseSpill` whose engine carries the supplied
+    /// provenance. Returns the live `Arc<Engine>` (kept alive by the
+    /// caller so the spill's `Weak<Engine>` upgrades successfully)
+    /// alongside the spill.
+    fn build_spill_with_provenance(
+        provenance: crate::serve::api::kv_spill_descriptor::KvSpillProvenance,
+    ) -> (Arc<Engine>, Gemma4DenseSpill) {
+        let mut descriptor = small_descriptor(KvDType::F32);
+        descriptor.provenance = provenance;
+        let arc_engine: Arc<Engine> = Arc::new(
+            crate::serve::api::engine::make_synthetic_kv_engine_for_test(
+                descriptor.clone(),
+                vec![(0usize, 0x42u8)],
+            ),
+        );
+        let spill = Gemma4DenseSpill::new_with_engine(descriptor, arc_engine.clone())
+            .expect("new_with_engine");
+        (arc_engine, spill)
+    }
+
+    /// Test F4-1 (load-bearing): with a populated `KvSpillProvenance`
+    /// (Hf2q-stamped GGUF), `model_fingerprint` returns the strict
+    /// `(repo, quant, producer_version, source_sha256,
+    /// tokenizer_chat_template_hash)` fingerprint AND that
+    /// fingerprint differs from the legacy `(repo, quant, "", "", "")`
+    /// fallback. Falsifier: the override returns the legacy
+    /// fingerprint, meaning the §F4 fix is dead code.
+    #[test]
+    fn family_model_fp_uses_full_provenance_when_hf2q_keys_present() {
+        use crate::serve::api::kv_spill_descriptor::KvSpillProvenance;
+        use crate::serve::kv_persist::format::compute_model_fingerprint;
+        use crate::serve::kv_persist::spiller::KvCacheSpill;
+        use crate::serve::quant_select::QuantType;
+
+        let template = "<bos><start_of_turn>user\n{{prompt}}<end_of_turn>";
+        let template_hash = KvSpillProvenance::hash_chat_template(template);
+        assert_eq!(
+            template_hash.len(),
+            64,
+            "lowercase-hex SHA-256 is 64 chars"
+        );
+        let prov = KvSpillProvenance {
+            producer_version: "hf2q 0.1.0".to_string(),
+            source_sha256: "a".repeat(64),
+            tokenizer_chat_template_hash: template_hash.clone(),
+        };
+        let (_engine, spill) = build_spill_with_provenance(prov.clone());
+
+        let repo = "google/gemma-4";
+        let quant = QuantType::Q4_K_M;
+
+        let got = spill
+            .model_fingerprint(repo, quant)
+            .expect("Hf2q provenance ⇒ Some(fp)");
+
+        // 1. The fingerprint matches the canonical
+        //    compute_model_fingerprint of the captured tuple.
+        let expected = compute_model_fingerprint(
+            repo,
+            quant.as_str(),
+            &prov.producer_version,
+            &prov.source_sha256,
+            &prov.tokenizer_chat_template_hash,
+        );
+        assert_eq!(
+            got, expected,
+            "F4-1: fingerprint MUST equal the canonical compute_model_fingerprint \
+             over (repo, quant, producer_version, source_sha256, template_hash)"
+        );
+
+        // 2. The fingerprint differs from the legacy fallback —
+        //    proves the override is not a no-op.
+        let legacy = compute_model_fingerprint(repo, quant.as_str(), "", "", "");
+        assert_ne!(
+            got, legacy,
+            "F4-1: Hf2q-provenance fingerprint MUST differ from legacy (repo, quant, '', '', '') \
+             fingerprint; otherwise re-quants serve stale blocks"
+        );
+    }
+
+    /// Test F4-2 (backwards-compat lock-in): with an `External` GGUF
+    /// (foreign loader, no hf2q.provenance.* keys), the spill's
+    /// `model_fingerprint` returns the legacy `(repo, quant, "", "", "")`
+    /// fingerprint exactly. This locks in the documented permanent
+    /// External-fallback semantic from §F4.
+    ///
+    /// Falsifier: the override returns a fingerprint that diverges
+    /// from the pre-iter-211 namespace, silently breaking foreign-GGUF
+    /// cache hits across an upgrade to the iter-211 binary.
+    #[test]
+    fn family_model_fp_falls_back_to_repo_quant_only_when_provenance_external() {
+        use crate::serve::api::kv_spill_descriptor::KvSpillProvenance;
+        use crate::serve::kv_persist::format::compute_model_fingerprint;
+        use crate::serve::kv_persist::spiller::KvCacheSpill;
+        use crate::serve::quant_select::QuantType;
+
+        // External provenance — all-empty (matches the
+        // KvSpillProvenance::default() that Engine::spawn populates
+        // when it sees Provenance::External).
+        let prov = KvSpillProvenance::default();
+        assert!(
+            !prov.is_hf2q(),
+            "default provenance MUST report is_hf2q == false"
+        );
+        let (_engine, spill) = build_spill_with_provenance(prov);
+
+        let repo = "thirdparty/foreign-gguf";
+        let quant = QuantType::Q6_K;
+
+        let got = spill
+            .model_fingerprint(repo, quant)
+            .expect("External provenance ⇒ Some(fp_legacy)");
+
+        let legacy = compute_model_fingerprint(repo, quant.as_str(), "", "", "");
+        assert_eq!(
+            got, legacy,
+            "F4-2: External GGUFs MUST hash to the legacy (repo, quant, '', '', '') fingerprint \
+             so foreign-GGUF cache hits survive the iter-211 upgrade"
+        );
+    }
+
+    /// Test F4-3 (the load-bearing F4 hazard): two spills with
+    /// IDENTICAL `(repo, quant, producer_version, source_sha256)`
+    /// but DIFFERENT chat templates MUST produce DIFFERENT
+    /// fingerprints. This is the chat-template-rotation hazard
+    /// — without the fix, an operator that upgrades the chat
+    /// template (e.g. fixing a tool-calling delimiter) silently
+    /// reuses the pre-upgrade namespace and serves stale blocks.
+    ///
+    /// Falsifier: chat-template-only changes leave the fingerprint
+    /// unchanged → the spiller serves blocks captured under the old
+    /// template against the new template's prefill prefix.
+    #[test]
+    fn family_model_fp_changes_when_chat_template_changes() {
+        use crate::serve::api::kv_spill_descriptor::KvSpillProvenance;
+        use crate::serve::kv_persist::spiller::KvCacheSpill;
+        use crate::serve::quant_select::QuantType;
+
+        let producer = "hf2q 0.1.0".to_string();
+        let source = "c".repeat(64);
+
+        // Two chat templates that differ in a single delimiter byte
+        // — represents a real-world template rotation hazard.
+        let template_a = "<start_of_turn>user\n{{p}}<end_of_turn>";
+        let template_b = "<start_of_turn>user\n{{p}}<end_of_turn>\n";
+
+        let prov_a = KvSpillProvenance {
+            producer_version: producer.clone(),
+            source_sha256: source.clone(),
+            tokenizer_chat_template_hash:
+                KvSpillProvenance::hash_chat_template(template_a),
+        };
+        let prov_b = KvSpillProvenance {
+            producer_version: producer,
+            source_sha256: source,
+            tokenizer_chat_template_hash:
+                KvSpillProvenance::hash_chat_template(template_b),
+        };
+        // Sanity: hashes differ for different templates.
+        assert_ne!(
+            prov_a.tokenizer_chat_template_hash, prov_b.tokenizer_chat_template_hash,
+            "different templates MUST hash to different lowercase-hex SHA-256 strings"
+        );
+
+        let (_engine_a, spill_a) = build_spill_with_provenance(prov_a);
+        let (_engine_b, spill_b) = build_spill_with_provenance(prov_b);
+
+        let repo = "google/gemma-4";
+        let quant = QuantType::Q4_K_M;
+
+        let fp_a = spill_a
+            .model_fingerprint(repo, quant)
+            .expect("Some(fp) for template A");
+        let fp_b = spill_b
+            .model_fingerprint(repo, quant)
+            .expect("Some(fp) for template B");
+
+        assert_ne!(
+            fp_a, fp_b,
+            "F4-3 (load-bearing): chat-template rotation MUST yield distinct namespace \
+             keys; otherwise an operator who upgrades the template silently serves stale \
+             blocks against the new template's prefix"
+        );
     }
 }

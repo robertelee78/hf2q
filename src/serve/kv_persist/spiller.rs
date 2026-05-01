@@ -123,6 +123,39 @@ pub trait KvCacheSpill: Send + Sync {
         range: Range<u32>,
         payload: &[u8],
     ) -> Result<(), SpillErrorKind>;
+
+    /// ADR-017 §F4 — return the per-`(repo, quant)`
+    /// `ModelFingerprint` namespace key for THIS hook instance.
+    ///
+    /// The spiller calls this in `pre_evict` and `post_admit` to
+    /// compute the namespace under which blocks are stored / looked
+    /// up on disk, so re-quanting the same repo or upgrading the
+    /// chat template lands in a fresh namespace and never serves
+    /// stale blocks against new weights.
+    ///
+    /// The default implementation returns `None`, which the spiller
+    /// maps to the legacy `(repo, quant, "", "", "")` fingerprint —
+    /// preserving pre-iter-211 cache hits for hooks that haven't
+    /// yet been migrated (e.g. the A.3 stub `StubGemma4Spill`,
+    /// future hybrid hooks before B-hybrid lands).
+    ///
+    /// `Gemma4DenseSpill` overrides this with the full
+    /// `(repo, quant, producer_version, source_sha256,
+    /// tokenizer_chat_template_hash)` fingerprint sourced from the
+    /// engine's `KvSpillDescriptor.provenance` (ADR-005 iter-211).
+    /// External GGUFs (foreign loaders) yield
+    /// `Provenance::External` → `KvSpillProvenance::default()` →
+    /// the legacy fallback fingerprint. **This External fallback is
+    /// a documented permanent semantic, NOT a stub** — it preserves
+    /// foreign-GGUF cache hits across an upgrade to a hf2q binary
+    /// that knows how to read the iter-211 metadata keys.
+    fn model_fingerprint(
+        &self,
+        _repo: &str,
+        _quant: crate::serve::quant_select::QuantType,
+    ) -> Option<crate::serve::kv_persist::format::ModelFingerprint> {
+        None
+    }
 }
 
 /// Composite key for the per-family registration map. `String` for
@@ -231,15 +264,56 @@ impl<E> BlockPrefixCacheSpiller<E> {
         g.get(&key).cloned()
     }
 
-    /// Compute a stable per-model namespace key from `(repo, quant)`.
-    /// The remaining provenance bits (`producer_version`,
-    /// `source_sha256`, `tokenizer_chat_template`) are stubbed to
-    /// empty strings in A.3 — B-dense.1 wires the real GGUF metadata
-    /// path (ADR-005 iter-211 already lands the metadata). The empty
-    /// placeholders are stable across the spill / restore call sites,
-    /// so the model_fp recomputed in `post_admit` matches the one
-    /// recorded in `pre_evict`.
-    fn family_model_fp(repo: &str, quant: QuantType) -> ModelFingerprint {
+    /// Compute a stable per-model namespace key for `(repo, quant)`.
+    ///
+    /// **ADR-017 §F4 — provenance-aware namespace key (post-iter-211)**.
+    /// When the registered family hook implements
+    /// [`KvCacheSpill::model_fingerprint`] and returns `Some(fp)` for
+    /// the supplied `(repo, quant)` pair, that fingerprint is used
+    /// verbatim. This is the strict path — `Gemma4DenseSpill`
+    /// returns a fingerprint computed from
+    /// `(repo, quant, producer_version, source_sha256,
+    /// tokenizer_chat_template_hash)` so re-quanting the same repo
+    /// or upgrading the chat template lands in a fresh namespace
+    /// and the disk cache never serves stale blocks against new
+    /// weights.
+    ///
+    /// **Fallback (External GGUFs / pre-iter-211 hooks)**. When the
+    /// hook returns `None` (the [`KvCacheSpill::model_fingerprint`]
+    /// default impl, used by [`StubGemma4Spill`] and any future
+    /// not-yet-migrated family hook) OR when no hook is registered
+    /// for `(repo, quant)`, this function falls back to the legacy
+    /// `(repo, quant, "", "", "")` fingerprint. This preserves
+    /// pre-iter-211 cache hits exactly — operators serving foreign
+    /// GGUFs (no hf2q.provenance.* keys) keep the legacy namespace,
+    /// while operators serving hf2q-quantized GGUFs get the strict
+    /// namespace. **The fallback is a documented permanent
+    /// semantic, NOT a stub.**
+    ///
+    /// The chosen fingerprint is stable across the spill / restore
+    /// call sites because both branches read the same hook (or its
+    /// absence) for the same `(repo, quant)`, so the model_fp
+    /// recomputed in `post_admit` matches the one recorded in
+    /// `pre_evict`.
+    fn family_model_fp(
+        &self,
+        repo: &str,
+        quant: QuantType,
+    ) -> ModelFingerprint {
+        if let Some(hook_arc) = self.lookup_hook(repo, quant) {
+            // Take the hook lock briefly to ask for the fingerprint.
+            // Lock-poison is treated as "no fingerprint available"
+            // (defensive — falls back to legacy semantics rather
+            // than aborting the spill / restore lifecycle).
+            if let Ok(g) = hook_arc.lock() {
+                if let Some(fp) = g.model_fingerprint(repo, quant) {
+                    return fp;
+                }
+            }
+        }
+        // Documented permanent fallback for External GGUFs and
+        // not-yet-migrated hooks. Locks in pre-iter-211 cache
+        // hits.
         compute_model_fingerprint(repo, quant.as_str(), "", "", "")
     }
 
@@ -306,7 +380,7 @@ where
             return SpillOutcome::Skipped;
         };
 
-        let model_fp = Self::family_model_fp(&handle.repo_id, quant);
+        let model_fp = self.family_model_fp(&handle.repo_id, quant);
         let alignment = {
             let g = match hook_arc.lock() {
                 Ok(g) => g,
@@ -405,7 +479,7 @@ where
             return RestoreOutcome::Skipped;
         };
 
-        let model_fp = Self::family_model_fp(repo, quant);
+        let model_fp = self.family_model_fp(repo, quant);
         let alignment = {
             let g = match hook_arc.lock() {
                 Ok(g) => g,

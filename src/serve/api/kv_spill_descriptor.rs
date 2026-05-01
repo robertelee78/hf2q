@@ -98,6 +98,97 @@ pub struct KvSpillDescriptor {
     /// Shared dtype across all K/V layers (Gemma 4 uses one dtype for
     /// the whole cache: F32 by default, F16 under `HF2Q_F16_KV=1`).
     pub kv_dtype: KvDType,
+
+    /// ADR-017 §F4 — per-load provenance bits used to derive the
+    /// per-`(repo, quant)` `ModelFingerprint` namespace key. Captured
+    /// at `Engine::spawn` from `serve::provenance::detect(&gguf)` and
+    /// the GGUF-embedded `tokenizer.chat_template`.
+    ///
+    /// The on-disk semantic: an `Hf2q`-stamped GGUF (per ADR-005
+    /// iter-211 metadata keys `hf2q.producer_version` /
+    /// `hf2q.source_sha256` / `hf2q.mmproj_sha256`) yields the strict
+    /// `(repo, quant, producer_version, source_sha256,
+    /// tokenizer_chat_template_hash)` fingerprint; an `External` GGUF
+    /// (foreign quant, no provenance keys) falls back to the legacy
+    /// `(repo, quant, "", "", "")` fingerprint to preserve existing
+    /// cache hits. This fallback is a documented permanent semantic,
+    /// NOT a stub — operators that quantize through hf2q get the
+    /// strict namespace; operators serving foreign GGUFs keep the
+    /// pre-iter-211 behaviour.
+    pub provenance: KvSpillProvenance,
+}
+
+/// ADR-017 §F4 — provenance bits captured at engine spawn time and
+/// threaded through to `family_model_fp`. Stored on
+/// [`KvSpillDescriptor`] (not on a separate engine accessor) so the
+/// per-family hook factories can build a complete `ModelFingerprint`
+/// from a single descriptor read without round-tripping through the
+/// worker channel.
+///
+/// All three fields are empty strings for `External` GGUFs (foreign
+/// quants). For `Hf2q` GGUFs they carry the verbatim
+/// `hf2q.producer_version`, lowercase-hex `hf2q.source_sha256`, and
+/// the lowercase-hex SHA-256 of the GGUF's `tokenizer.chat_template`
+/// string.
+///
+/// The chat-template hash is computed even when `producer_version`
+/// and `source_sha256` are empty (External case), but the fallback
+/// branch in `BlockPrefixCacheSpiller::family_model_fp` ignores it
+/// and uses the legacy three-empty-string fingerprint to preserve
+/// pre-iter-211 cache hits.
+#[derive(Debug, Clone, Default)]
+pub struct KvSpillProvenance {
+    /// Verbatim `hf2q.producer_version` (e.g. `"hf2q 0.1.0"`). Empty
+    /// string for External GGUFs.
+    pub producer_version: String,
+    /// Lowercase-hex `hf2q.source_sha256` of the canonical source-
+    /// shard manifest. Empty string for External GGUFs.
+    pub source_sha256: String,
+    /// Lowercase-hex SHA-256 of the GGUF's `tokenizer.chat_template`
+    /// string. Empty string when no chat template is present (matches
+    /// the existing `Engine.chat_template` behaviour: `Arc<String>`
+    /// initialized to `""` in some test paths). Always populated for
+    /// loaded production GGUFs because the loader either reads the
+    /// metadata key or substitutes a fallback template.
+    pub tokenizer_chat_template_hash: String,
+}
+
+impl KvSpillProvenance {
+    /// Returns `true` iff at least one of the hf2q-origin fields
+    /// (`producer_version` / `source_sha256`) is non-empty. Used by
+    /// `BlockPrefixCacheSpiller::family_model_fp` to decide between
+    /// the strict fingerprint (Hf2q origin) and the legacy fallback
+    /// (External origin).
+    ///
+    /// The chat-template hash is intentionally NOT inspected here —
+    /// External GGUFs may still have a non-empty chat_template string
+    /// (the engine reads `tokenizer.chat_template` regardless of
+    /// origin), but we want External GGUFs to map onto the legacy
+    /// `(repo, quant, "", "", "")` fingerprint for backwards-compat.
+    pub fn is_hf2q(&self) -> bool {
+        !self.producer_version.is_empty() || !self.source_sha256.is_empty()
+    }
+
+    /// Compute a chat-template hash via lowercase-hex SHA-256. Returns
+    /// the empty string for an empty template (matches the existing
+    /// pre-iter-211 fingerprint behaviour where no template lived in
+    /// the namespace key).
+    pub fn hash_chat_template(template: &str) -> String {
+        if template.is_empty() {
+            return String::new();
+        }
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(template.as_bytes());
+        // Lowercase-hex matches `compute_model_fingerprint`'s input
+        // expectations and `serve::provenance::detect`'s SHA-256
+        // normalization for `source_sha256` / `mmproj_sha256`.
+        let mut s = String::with_capacity(64);
+        for b in digest.iter() {
+            use std::fmt::Write;
+            let _ = write!(&mut s, "{b:02x}");
+        }
+        s
+    }
 }
 
 impl KvSpillDescriptor {
@@ -114,10 +205,17 @@ impl KvSpillDescriptor {
     /// descriptor. This matches `forward_prefill.rs:259-260` which
     /// reads the env once into `INVESTIGATION_ENV.f16_kv` at module
     /// init via `LazyLock`.
+    ///
+    /// `provenance` is captured by the caller from
+    /// `serve::provenance::detect(&gguf)` and the GGUF-embedded
+    /// `tokenizer.chat_template`. ADR-017 §F4 — drives the
+    /// `ModelFingerprint` namespace key; see [`KvSpillProvenance`]
+    /// for the External-fallback semantic.
     pub fn from_gemma_loaded_model(
         weights: &crate::serve::forward_mlx::MlxModelWeights,
         max_decode_tokens: usize,
         kv_dtype: KvDType,
+        provenance: KvSpillProvenance,
     ) -> Self {
         let num_layers = weights.layers.len();
         let mut layer_types = Vec::with_capacity(num_layers);
@@ -136,6 +234,7 @@ impl KvSpillDescriptor {
             nkv_heads,
             head_dim,
             kv_dtype,
+            provenance,
         }
     }
 }
@@ -185,6 +284,7 @@ mod kv_spill_descriptor_tests {
             nkv_heads: vec![2, 2, 1, 2],
             head_dim: vec![256, 256, 512, 256],
             kv_dtype: KvDType::F32,
+            provenance: KvSpillProvenance::default(),
         };
         let c = d.clone();
         assert_eq!(c.sliding_window, 1024);
@@ -195,6 +295,7 @@ mod kv_spill_descriptor_tests {
         assert_eq!(c.nkv_heads, vec![2, 2, 1, 2]);
         assert_eq!(c.head_dim, vec![256, 256, 512, 256]);
         assert_eq!(c.kv_dtype, KvDType::F32);
+        assert_eq!(c.provenance.producer_version, "");
     }
 
     /// Test 4: A descriptor with mismatched per-layer vector lengths
@@ -217,6 +318,7 @@ mod kv_spill_descriptor_tests {
             nkv_heads: vec![2, 1, 2],
             head_dim: vec![8, 16, 8],
             kv_dtype: KvDType::F16,
+            provenance: KvSpillProvenance::default(),
         };
         assert_eq!(d.layer_types.len(), d.num_layers);
         assert_eq!(d.nkv_heads.len(), d.num_layers);
@@ -236,6 +338,7 @@ mod kv_spill_descriptor_tests {
             nkv_heads: vec![2],
             head_dim: vec![8],
             kv_dtype: KvDType::F32,
+            provenance: KvSpillProvenance::default(),
         };
         let d_f16 = KvSpillDescriptor {
             kv_dtype: KvDType::F16,

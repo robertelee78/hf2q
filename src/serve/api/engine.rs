@@ -925,6 +925,14 @@ pub struct GemmaLoadedModel {
     /// Owned by the worker thread; lives across requests.  See
     /// `PromptCache` doc for the cache contract.
     pub prompt_cache: PromptCache,
+    /// ADR-017 §F4 — GGUF provenance captured at load time via
+    /// `crate::serve::provenance::detect(&gguf)`. Threaded into the
+    /// `KvSpillDescriptor` at `Engine::spawn` so the per-family hook
+    /// (Phase B-dense.2) can build a strict `ModelFingerprint`
+    /// namespace key for hf2q-quantized GGUFs and fall back to the
+    /// legacy `(repo, quant)` key for foreign GGUFs (`Provenance::External`).
+    /// Read once at spawn; not consulted afterwards.
+    pub provenance: crate::serve::provenance::Provenance,
 }
 
 impl LoadedModel {
@@ -968,6 +976,21 @@ impl LoadedModel {
         match self {
             LoadedModel::Gemma(g) => &g.chat_template,
             LoadedModel::Qwen35(q) => &q.chat_template,
+        }
+    }
+
+    /// ADR-017 §F4 — GGUF provenance for the loaded model.  The
+    /// `Gemma` variant returns the `Provenance` captured at GGUF-open
+    /// time in [`GemmaLoadedModel::load`]; the `Qwen35` variant
+    /// returns `Provenance::External` because the Qwen35 loader does
+    /// not yet populate a provenance field (Qwen35 inference is
+    /// 501-gated under iter-215; KV-spill never fires for that path).
+    /// When Qwen35 inference lands, this accessor's Qwen35 arm should
+    /// be updated to read `engine_qwen35::Qwen35LoadedModel.provenance`.
+    pub fn provenance(&self) -> crate::serve::provenance::Provenance {
+        match self {
+            LoadedModel::Gemma(g) => g.provenance.clone(),
+            LoadedModel::Qwen35(_) => crate::serve::provenance::Provenance::External,
         }
     }
     pub fn eos_token_ids(&self) -> &[u32] {
@@ -1373,6 +1396,15 @@ impl GemmaLoadedModel {
         let gguf = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
 
+        // ADR-017 §F4 + ADR-005 iter-211: detect hf2q-origin provenance
+        // (producer_version + source_sha256 + optional mmproj_sha256) at
+        // GGUF-open time. Threaded into `Engine::spawn`'s
+        // `KvSpillDescriptor` so the per-family spill factory can build
+        // a strict `ModelFingerprint`. External GGUFs (no provenance
+        // keys) yield `Provenance::External` and the spiller falls back
+        // to the legacy `(repo, quant)` namespace.
+        let provenance = crate::serve::provenance::detect(&gguf);
+
         // Extract model id: prefer general.name, fall back to file stem.
         let model_id = gguf
             .metadata_string("general.name")
@@ -1464,6 +1496,7 @@ impl GemmaLoadedModel {
             eos_token_ids,
             load_duration,
             prompt_cache: PromptCache::new(),
+            provenance,
         })
     }
 }
@@ -1520,10 +1553,35 @@ impl Engine {
                     // `forward_prefill.rs:274-285` reallocates to
                     // `seq_len + max_tokens` per request.
                     let max_decode_tokens = 512usize;
+                    // ADR-017 §F4: lift provenance bits from the loader
+                    // (captured at GGUF-open time) and the loaded chat
+                    // template (sha256-hashed) into the descriptor.
+                    // Foreign GGUFs yield Provenance::External →
+                    // KvSpillProvenance::default() (all-empty); the
+                    // spiller's family_model_fp falls back to the
+                    // legacy `(repo, quant, "", "", "")` namespace.
+                    let provenance = match &g.provenance {
+                        crate::serve::provenance::Provenance::Hf2q {
+                            producer_version,
+                            source_sha256,
+                            ..
+                        } => super::kv_spill_descriptor::KvSpillProvenance {
+                            producer_version: producer_version.clone(),
+                            source_sha256: source_sha256.clone(),
+                            tokenizer_chat_template_hash:
+                                super::kv_spill_descriptor::KvSpillProvenance::hash_chat_template(
+                                    &g.chat_template,
+                                ),
+                        },
+                        crate::serve::provenance::Provenance::External => {
+                            super::kv_spill_descriptor::KvSpillProvenance::default()
+                        }
+                    };
                     Some(super::kv_spill_descriptor::KvSpillDescriptor::from_gemma_loaded_model(
                         &g.weights,
                         max_decode_tokens,
                         kv_dtype,
+                        provenance,
                     ))
                 }
                 LoadedModel::Qwen35(_) => None,
@@ -6810,6 +6868,8 @@ assistant:
             nkv_heads: vec![2, 1],
             head_dim: vec![8, 16],
             kv_dtype: KvDType::F32,
+            provenance:
+                super::super::kv_spill_descriptor::KvSpillProvenance::default(),
         };
         let engine = make_synthetic_kv_engine(
             vec![2, 1],
