@@ -30,6 +30,7 @@ pub mod activation_capture_real;
 pub mod decode_pool;
 pub mod delta_net;
 pub mod dense;
+pub mod dump_bisect;
 pub mod ffn;
 pub mod forward_cpu;
 pub mod in_memory_loader;

@@ -855,7 +855,7 @@ Header flipped `Proposed` → `COMPLETE`; this phase plan annotated with commit 
 | Bench within 5% of llama.cpp on M5 Max | ✅ tg64 1.138×, tg256 1.097×, tg1024 1.006× — all > 0.95× at hf2q `23e1128` + mlx-native `25d4c4b` |
 | Integration tests green | ✅ `qwen35moe_apex_generate_smoke` and `qwen35_dense_generate_smoke` — commit `3875bc9` |
 | Docs cover both dense and MoE invocations | ✅ `docs/running-qwen35.md` — commit `d42b8f6` |
-| P14 MTP speculative decode gate | ✅ Merged on `main` at `79140ec` (2026-04-25). Verified on M5 Max: build PASS; `qwen35::mtp` 4 passed/1 ignored (incl. real-Metal `mtp_forward_draft_returns_logits`); `qwen35::spec_decode` 2 passed; sourdough on apex Q4_0 MoE GGUF `222 / 160 floor` PASS. Fall-through smoke (`--speculative` on MTP-stripped apex): WARN-and-fall-through to greedy, decode 116.7 tok/s — no regression vs P13.3 baseline 110.7 tok/s tg64. Live bench with MTP throughput win deferred — all 5 Qwen3.6 GGUFs on disk (27b-dwq46/48, 35b-a3b-apex/dwq46/dwq48) were converted before today's Phase A flip and have `blk.N.nextn.*` tensors stripped (verified via `strings` scan); throughput-improvement measurement requires either re-converting one with the new emit-by-default Phase A path (currently OOM-prone for 35B Q4_0 on this host) or staging a smaller MTP-bearing model. |
+| P14 MTP speculative decode gate | ✅ Merged on `main` at `79140ec` (2026-04-25). Verified on M5 Max: build PASS; `qwen35::mtp` 4 passed/1 ignored (incl. real-Metal `mtp_forward_draft_returns_logits`); `qwen35::spec_decode` 2 passed; sourdough on apex Q4_0 MoE GGUF `222 / 160 floor` PASS. Fall-through smoke (`--speculative` on MTP-stripped apex): WARN-and-fall-through to greedy, decode 116.7 tok/s — no regression vs P13.3 baseline 110.7 tok/s tg64. Live bench with MTP throughput win deferred — all 5 Qwen3.6 GGUFs on disk (27b-dwq46/48, 35b-a3b-apex/dwq46/dwq48) were converted before today's Phase A flip and have `blk.N.nextn.*` tensors stripped (verified via `strings` scan); throughput-improvement measurement requires either re-converting one with the new emit-by-default Phase A path (currently OOM-prone for 35B Q4_0 on this host) or staging a smaller MTP-bearing model. **NOTE 2026-04-30:** P14 throughput-numeric bench remains BLOCKED on B-W-1 (greedy-decode non-determinism). ADR-015 iter61a-3 landed the per-op bisection scaffold + pinned first divergence to FullAttn layer 3 prefill (Heisenbug — race condition, not kernel non-determinism); throughput bench unblocks once iter61a-4 closes the race. |
 
 ### Totals
 
@@ -2217,3 +2217,16 @@ target/release/hf2q --log-level info gguf-patch \
 Receipt: `arch=qwen35moe`, Qwen3 ChatML template length 7764, 733 tensors. Independent per-tensor SHA-256 verification found zero tensor-name differences and zero tensor-payload diffs between original and patched files. This closes the independent chat-template contamination noted in the 2026-04-30 P13 regression entry; future sourdough runs should use the patched artifact or a GGUF emitted by the post-fix convert path.
 
 Sourdough/bench was not rerun inside the Codex sandbox because no Metal device is available there. That is an environment block only; the patch utility itself is pure GGUF metadata/tensor I/O and needs no Metal.
+
+### P14 throughput-numeric bench — DETERMINISM PRECONDITION MET (2026-04-30 via ADR-015 iter61a-4)
+
+ADR-013 P14's spec_decode throughput-numeric bench had been blocked on greedy-decode determinism: without byte-identical cold-process output, acceptance-rate measurement is comparing against a moving target and result is noise (per `feedback_verify_baseline_determinism_before_perf_bench`).
+
+ADR-015 iter61a-4 (worktree `fix/adr015-iter61a-4-fa-race`) closed the B-W-1 cold-process non-determinism by adding the missing `enc.memory_barrier()` between Op 6 (sigmoid_gate_multiply) and Op 7 (linear_projection) inside `build_gated_attn_layer`'s prefill ops6-7 encoder at `gpu_full_attn.rs:1666`. **LIVE evidence: 10/10 byte-identical cold-process greedy decodes on 27B-dwq46 (max=8) and apex Q4_0 (max=32).**
+
+The spec_decode mechanism work shipped on the two parallel branches is now ready to bench against this deterministic baseline:
+
+- `origin/fix/adr013-mtp-shared-embed` — MTP weight loader (shared-embedding + tied lm_head fix)
+- `origin/fix/adr013-spec-decode-prev-hidden` — spec_decode runtime (prev_hidden plumbing fix)
+
+Bench protocol (next iter): run draft acceptance-rate + e2e tok/s on 27B-dwq46 (DenseQ FullAttn slot, head_dim=256) and apex Q4_0 (MoeQ + DeltaNet hybrid) at max-tokens 64/128/256, paired cold-SoC, mcp-brain-server suspended via `kill -STOP` per `feedback_bench_process_audit`. Pre-fix the bench would have produced run-to-run acceptance-rate variance ≥ ε from the underlying non-determinism; post-fix any variance is purely from spec_decode's own draft/target mismatch, the actual signal we want.
