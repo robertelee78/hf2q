@@ -2624,6 +2624,172 @@ metrics wiring.
 - **K2 dirty-block decode overhead** measurement under
   sustained-decode load.
 
+### Phase D iter-7 2026-05-01 — F4 + R-F1 LANDED (2 parallel agents, 0 cwd-trap trips)
+
+ADR-005 iter-211 (commits `58bd824`, `2467675`, `ffea504`,
+`6078f2d`) shipped GGUF `hf2q.provenance.*` keys + `serve::provenance::detect`.
+F4 was unblocked. Iter-7 dispatched both pending operator-readiness
+items in parallel async worktree agents with HARDENED write-routing
+discipline.
+
+**Both agents avoided the cwd-mismatch trap on the first try** —
+the explicit "BEFORE the FIRST Edit/Write call, run pwd; verify
+target path starts with worktree root; abort otherwise" prompt
+discipline solved the problem that the prior 3 consecutive agents
+tripped. Standing memory `feedback_agent_worktree_cwd_trap` is now
+augmented by a write-routing pre-check pattern.
+
+#### F4 LANDED — provenance threaded through namespace fingerprint (commit `134956f`)
+
+Worktree agent `ae88d92d2f2df7d15` (commit `62625fb` →
+cherry-picked → `134956f`). cargo check 0 in 4.54s; **136/136
+in-binary kv_persist tests PASS** (+3 new regression tests).
+
+| Site | Change |
+|---|---|
+| `src/serve/api/engine.rs` (+60/-8) | `GemmaLoadedModel.provenance` field; `LoadedModel::provenance()` accessor; `Engine::spawn` threads provenance into `KvSpillDescriptor` |
+| `src/serve/api/kv_spill_descriptor.rs` (+103/-3) | New `KvSpillProvenance` struct + `hash_chat_template` SHA-256 helper; descriptor extended with `provenance` field |
+| `src/serve/kv_persist/spiller.rs` (+96/-7) | `KvCacheSpill::model_fingerprint` trait method; `family_model_fp` becomes instance method consulting the hook |
+| `src/serve/kv_persist/families/gemma4_dense.rs` (+270/0) | `model_fingerprint` override pulls producer_version + source_sha256 + chat_template_hash from descriptor; 3 regression tests |
+
+**Surface choices:**
+- Extended `KvSpillDescriptor.provenance` (NOT a separate
+  `Engine.provenance()` accessor) — spill factory already reads
+  the descriptor at construction, avoiding a second worker
+  round-trip.
+- Used existing `compute_model_fingerprint(repo, quant,
+  producer_version, source_sha256, tokenizer_chat_template)` 5-arg
+  surface (already provenance-aware per `format.rs:213-234`); prior
+  code was simply not feeding it. Did NOT extend the function
+  signature.
+
+**Backwards-compat semantic** (documented permanent, NOT a stub):
+`Provenance::External` (foreign-loader GGUFs missing the
+`hf2q.provenance.*` keys) → `KvSpillProvenance::default()` (all
+empty) → `compute_model_fingerprint(repo, quant, "", "", "")`
+byte-identical to pre-iter-211 fallback. Operators with
+hf2q-quantized GGUFs get the strict 5-tuple fingerprint;
+operators with foreign GGUFs get the legacy `(repo, quant)` key.
+Cache-poisoning hazard at chat-template / re-quant rotation is
+closed for hf2q-produced GGUFs. The `family_model_fp_falls_back_to_repo_quant_only_when_provenance_external`
+regression test locks in this fallback.
+
+**Load-bearing regression test** —
+`family_model_fp_changes_when_chat_template_changes` — two spills
+with same `(repo, quant, producer_version, source_sha256)` but
+DIFFERENT chat templates produce DIFFERENT `ModelFingerprint`s.
+This is the real F4 fix surface: chat-template upgrade must NOT
+silently serve stale blocks against new weights.
+
+#### R-F1 LANDED — `HF2Q_KV_PERSIST=0` startup-disable (commit `bfbf250`)
+
+Worktree agent `aacf91da8da171a28` (commit `07f820c` →
+cherry-picked → `bfbf250`). cargo check 0; cargo build 0; 6 new
+in-binary tests PASS. Combined with F4: **142/142 kv_persist
+tests PASS** (was 136 after F4 only; +6 new R-F1 predicate tests).
+
+**Pure-function predicate** at `src/serve/mod.rs:1620`:
+```rust
+pub(crate) fn should_enable_kv_persist(
+    flag: Option<&str>,
+    env: Option<&str>,
+) -> bool {
+    flag.is_some() && env.map(|v| v.trim()).unwrap_or("") != "0"
+}
+```
+
+Truth table verified by 6 unit tests:
+| `--kv-persist` flag | `HF2Q_KV_PERSIST` env | Result |
+|---|---|---|
+| `Some("/path")` | `Some("0")` | `false` (override-disable) |
+| `Some("/path")` | `Some("1")` | `true` |
+| `Some("/path")` | `None` | `true` |
+| `None` | `Some("0")` | `false` |
+| `None` | `Some("1")` | `false` |
+| `None` | `None` | `false` |
+
+**Wire-up at `src/serve/mod.rs:1730-1754`**: when
+`--kv-persist=PATH` is supplied AND `HF2Q_KV_PERSIST=0`, cmd_serve
+emits a `tracing::warn!` line:
+
+> "ADR-017 R-F1 override: HF2Q_KV_PERSIST=0 — disabling kv-persist
+>  despite --kv-persist={path}. Operator emergency-disable per
+>  operating-kv-cache.md §10. Restart without HF2Q_KV_PERSIST=0 to
+>  re-enable."
+
+…and skips `BlockPrefixCacheSpiller` / `KvPersistRegistry` /
+`LoaderWrapper` construction. `NoopKvSpiller` stays active —
+matches the pre-flag-on default. Surface delta: `+162 / -10`
+across `serve/mod.rs` (+109/-1) and `docs/operating-kv-cache.md`
+(+53/-9, runbook §10 rewritten with truth table + warn-line text;
+§11 entry 1 marked LANDED).
+
+**Process-scoped semantic clarified**: env vars are read once at
+startup. "Mid-flight disable" in the original runbook §10 was a
+loose framing; the actual contract is an operator emergency-disable
+override at startup that takes precedence over `--kv-persist=PATH`.
+Operators who need true mid-flight disable should restart (the
+standard pattern for env-driven config). Documented this clarification
+in the runbook update.
+
+#### Iter-7 verification gates
+
+| Gate | Result |
+|---|---|
+| `cargo check --release --bin hf2q` (post both cherry-picks) | exit 0 in 4.21s |
+| `cargo test --release --bin hf2q kv_persist -- --test-threads=1` | **142 passed; 0 failed** in 2.18s (was 133 pre-iter-7; +3 F4 + +6 R-F1) |
+| Phase D R-C4 internal (regression check vs HEAD `e4f230e` pre-F4/R-F1) | PASS — 3632 bytes byte-identical, 311.0ms → 0.4ms (777× cache-hit) |
+| Push F4 to origin/main | fast-forward `e4f230e..134956f` |
+| Push R-F1 to origin/main | fast-forward `134956f..bfbf250` |
+| Both agents' main-repo cwd-trap check at end | CLEAN (verbatim `git status --short` matches session-start untracked-only) |
+
+#### Cwd-trap discipline learning
+
+3 prior consecutive agents (P1-1, R-F6, R-F7) all tripped the trap
++ recovered. Iter-7's 2 agents avoided it on first try. The
+difference: iter-7's prompts included an explicit pre-write check:
+
+> "BEFORE the FIRST Edit/Write call, run `pwd` and confirm the path
+>  starts with `/opt/hf2q/.claude/worktrees/`. For EVERY write, the
+>  absolute target path MUST start with your worktree root. If it
+>  starts with `/opt/hf2q/src/...` (NOT in worktree), ABORT, capture
+>  the patch, and re-route through the worktree path. After your
+>  FIRST write, IMMEDIATELY run `git -C /opt/hf2q status --short` —
+>  if you see modified files there, you tripped the trap; recover
+>  before proceeding."
+
+Plus a closing requirement to verify and quote `git -C /opt/hf2q
+status --short` output verbatim at end of work. Both agents did
+this; both reported the session-start untracked-only output
+unchanged. **Standing pattern**: future agent prompts MUST include
+this pre-write check + post-work verification. Pattern shared to
+brain.
+
+#### Cumulative ADR-017 LOC after iter-7
+
+~18,731 + 518 (F4) + 162 (R-F1) + ~200 (this subsection) =
+**~19,611 LOC** in-tree substrate + audit + operator docs +
+landed fixes + bench receipts + cross-ADR triangulation +
+metrics wiring + provenance fingerprint + emergency-disable.
+
+#### Remaining ADR-017 work after iter-7
+
+- **Phase D peer arm vs llama-completion** — bench surfaces real
+  drift; ownership reassigned to ADR-005 chat-template (NOT
+  ADR-017). Re-bench once ADR-005 closes the API-vs-CLI render
+  divergence. Not ADR-017's responsibility.
+- **Full matrix sweep** — 36 production-quant cells × 3 scenarios
+  × 4 prefix lengths. Operator-controlled bench under clean SoC.
+- **Phase B-hybrid** (Qwen3.5-MoE) — pending ADR-013 unblock.
+- **K2 dirty-block decode overhead** measurement under
+  sustained-decode load (steady-state property; needs sustained-bench
+  harness extension).
+
+All operator-readiness P0/P1/F4/R-F1/R-F6/R-F7 items LANDED.
+Remaining items are: (a) bench-only (matrix sweep, K2), or
+(b) ADR-blocked (B-hybrid, peer-arm rebench). Phase D
+operator-readiness round is COMPLETE.
+
 ---
 
 ## Open Questions
