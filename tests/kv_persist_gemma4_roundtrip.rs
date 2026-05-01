@@ -50,6 +50,31 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+
+// =========================================================================
+// Parallel-test env-isolation lock (ADR-005 iter-221 follow-up).
+// =========================================================================
+//
+// Several tests in this binary mutate process-global env vars
+// (`HF2Q_KV_PERSIST_E2E`, `HF2Q_KV_PERSIST_PHASE_D`,
+// `HF2Q_KV_PERSIST_PHASE_D_R_P1`, `HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT`,
+// etc.). Cargo runs tests in parallel by default — without serialization,
+// one test's `set_var`/`remove_var` races against another's `var()` read,
+// producing flaky failures (e.g. `phase_d_r_p1_env_gate_well_formed`
+// observed failing under default `--test-threads`, passing under
+// `--test-threads=1`).
+//
+// We avoid pulling in `serial_test` (no new dev-dep) by gating every
+// env-mutating test on a single file-wide `Mutex` acquired at function
+// entry. The held lock outlives the test body via `_guard` binding;
+// `drop` order is RAII-correct.
+//
+// All env-mutating tests in this file MUST acquire `ENV_LOCK` first.
+// Read-only tests do not need it (their reads see whatever value the
+// concurrently-running mutating test left in place, which is fine for
+// non-env-dependent assertions).
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 // =========================================================================
 // Phase D env gates (additive — separate from the B-dense.2 master gate).
@@ -1113,9 +1138,10 @@ fn binary_is_locatable_and_runs_version() {
 /// detection logic returns true when the env var is unset.
 #[test]
 fn harness_smoke_default_off_when_env_unset() {
+    // Serialize against other env-mutating tests in this binary.
+    let _guard = ENV_LOCK.lock().unwrap();
+
     // Snapshot + clear the env var for the duration of this test.
-    // (Single-threaded test execution — `--test-threads=1` is the
-    // contract; the spec gate applies.)
     let prior = std::env::var(ENV_E2E_GATE).ok();
     std::env::remove_var(ENV_E2E_GATE);
 
@@ -1228,8 +1254,10 @@ fn matrix_runnable_subset_filters_to_production_quants() {
 /// value for explicit env states.
 #[test]
 fn env_gate_predicate_is_well_formed() {
-    // Save + restore env state. Other tests in this binary should
-    // not race because `--test-threads=1` is the spec contract.
+    // Serialize against other env-mutating tests in this binary.
+    let _guard = ENV_LOCK.lock().unwrap();
+
+    // Save + restore env state.
     let prior = std::env::var(ENV_E2E_GATE).ok();
 
     std::env::set_var(ENV_E2E_GATE, "1");
@@ -2443,9 +2471,15 @@ fn phase_d_driver_rejects_missing_model_cleanly() {
 /// spawn `hf2q serve` when its env gates are unset.
 #[test]
 fn phase_d_r_p1_env_gate_well_formed() {
-    // Snapshot any prior values to restore after the test (paranoia
-    // against parallel-test env contamination, even though
-    // --test-threads=1 is the operator recipe).
+    // Serialize against other env-mutating tests in this binary.
+    // Without this lock, `harness_smoke_default_off_when_env_unset`,
+    // `env_gate_predicate_is_well_formed`,
+    // `phase_d_r_p1_concurrent_env_gate_well_formed`, and
+    // `phase_d_env_gates_are_well_formed` race on overlapping env
+    // surfaces under default cargo `--test-threads`.
+    let _guard = ENV_LOCK.lock().unwrap();
+
+    // Snapshot any prior values to restore after the test.
     let prior_master = std::env::var(ENV_PHASE_D_GATE).ok();
     let prior_r_p1 = std::env::var(ENV_PHASE_D_R_P1).ok();
 
@@ -2510,6 +2544,9 @@ fn phase_d_r_p1_env_gate_well_formed() {
 /// spawn `hf2q serve` when its env gates are unset.
 #[test]
 fn phase_d_r_p1_concurrent_env_gate_well_formed() {
+    // Serialize against other env-mutating tests in this binary.
+    let _guard = ENV_LOCK.lock().unwrap();
+
     let prior_master = std::env::var(ENV_PHASE_D_GATE).ok();
     let prior_r_p1c = std::env::var(ENV_PHASE_D_R_P1_CONCURRENT).ok();
 
@@ -2570,6 +2607,9 @@ fn phase_d_r_p1_concurrent_env_gate_well_formed() {
 /// Falsifier: predicate panics or detects "1" when env is unset.
 #[test]
 fn phase_d_env_gates_are_well_formed() {
+    // Serialize against other env-mutating tests in this binary.
+    let _guard = ENV_LOCK.lock().unwrap();
+
     for gate in &[
         ENV_PHASE_D_GATE,
         ENV_PHASE_D_PEER,
