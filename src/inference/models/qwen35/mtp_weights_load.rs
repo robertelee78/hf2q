@@ -37,20 +37,110 @@ pub fn load_mtp_weights_if_present(
     let nextn = format!("{p}.nextn");
     let enorm = load_norm_gpu(gguf, &format!("{nextn}.enorm.weight"), h, device)?;
     let hnorm = load_norm_gpu(gguf, &format!("{nextn}.hnorm.weight"), h, device)?;
-    let embed_tokens = upload_bf16_required(gguf, &format!("{nextn}.embed_tokens.weight"), device)?;
+    // ADR-013 P14 follow-up (2026-04-30): honor mtp_use_dedicated_embeddings.
+    //
+    // - True  → MTP carries its own embed table at `blk.{N}.nextn.embed_tokens.weight`
+    //           (Qwen3.5 MTP convention).
+    // - False → MTP shares the main model's `token_embd.weight` (Qwen3.6 27B + 35B-A3B
+    //           convention; convert correctly skips emitting the redundant tensor).
+    //           We do NOT duplicate the buffer: `forward_draft` is called with the
+    //           per-token embedding already materialised by the verifier's hot path,
+    //           and the field itself is reserved for future direct lookups (use the
+    //           main model's token_embd via Qwen35Model accessors).
+    //
+    // Logged at INFO level so operators can confirm the path.
+    let embed_tokens_tname = format!("{nextn}.embed_tokens.weight");
+    let embed_tokens = if cfg.mtp_use_dedicated_embeddings {
+        let buf = upload_bf16_required(gguf, &embed_tokens_tname, device)
+            .with_context(|| {
+                format!(
+                    "MTP loader expected dedicated `{embed_tokens_tname}` because \
+                     mtp_use_dedicated_embeddings=True (set explicitly via metadata or \
+                     inferred from tensor presence); to share main embeddings, re-emit \
+                     the GGUF without `nextn.embed_tokens.weight` or set the metadata \
+                     key `{p}.nextn.use_dedicated_embeddings = false`"
+                )
+            })?;
+        tracing::info!(
+            mtp_layer = layer_index,
+            mtp_use_dedicated_embeddings = true,
+            tensor = %embed_tokens_tname,
+            "qwen35 MTP loader: dedicated embed_tokens"
+        );
+        Some(buf)
+    } else {
+        // Belt-and-suspenders: if convert-side regression ever re-emits the dedicated
+        // tensor while the flag says shared, refuse to silently ignore one of them.
+        if gguf.tensor_info(&embed_tokens_tname).is_some() {
+            bail!(
+                "qwen35 MTP loader: mtp_use_dedicated_embeddings=False but `{embed_tokens_tname}` \
+                 is present in the GGUF — convert pipeline is inconsistent. Re-emit without \
+                 the dedicated tensor or set the metadata key to true."
+            );
+        }
+        tracing::info!(
+            mtp_layer = layer_index,
+            mtp_use_dedicated_embeddings = false,
+            "qwen35 MTP loader: sharing main token_embd (no dedicated nextn.embed_tokens)"
+        );
+        None
+    };
     let (eh_proj_embed, eh_proj_hidden) =
         load_split_eh_proj(gguf, &format!("{nextn}.eh_proj.weight"), h, device)?;
     let shared_head_norm =
         load_norm_gpu(gguf, &format!("{nextn}.shared_head_norm.weight"), h, device)?;
-    let shared_head_head_f32 =
-        load_f32_tensor(gguf, &format!("{nextn}.shared_head_head.weight"), device)
-            .with_context(|| format!("{nextn}.shared_head_head.weight"))?;
+
+    // ADR-013 P14 follow-up (2026-04-30): the LM-head projection weight (`shared_head.head`)
+    // follows the same shared-vs-dedicated rule as `embed_tokens`.
+    //
+    // Qwen3.6 27B + 35B-A3B (`mtp_use_dedicated_embeddings: False`) ship neither
+    // `mtp.embed_tokens` nor `mtp.shared_head.head`; the MTP block reuses the main
+    // verifier's `token_embd.weight` for the embedding lookup AND `output.weight`
+    // for the final logit projection. Convert correctly skips emitting
+    // `blk.{N}.nextn.shared_head_head.weight` in this configuration.
+    //
+    // Resolution: if the dedicated tensor is present we use it (Qwen3.5 MTP);
+    // otherwise (shared mode) we fall back to the main `output.weight`. The
+    // bf16 GPU buffer is materialised the same way either path; vocab_size
+    // is derived from the row count of whichever tensor we actually loaded.
+    let shared_head_head_tname = format!("{nextn}.shared_head_head.weight");
+    let (shared_head_head_f32, shared_head_head_source) =
+        if gguf.tensor_info(&shared_head_head_tname).is_some() {
+            let data = load_f32_tensor(gguf, &shared_head_head_tname, device)
+                .with_context(|| shared_head_head_tname.clone())?;
+            (data, shared_head_head_tname.clone())
+        } else if !cfg.mtp_use_dedicated_embeddings {
+            // Shared mode: borrow the main LM head.
+            let main_lm = "output.weight";
+            ensure!(
+                gguf.tensor_info(main_lm).is_some(),
+                "qwen35 MTP loader: mtp_use_dedicated_embeddings=False and \
+                 `{shared_head_head_tname}` absent, but main `{main_lm}` is also \
+                 missing — cannot resolve the MTP final projection."
+            );
+            let data = load_f32_tensor(gguf, main_lm, device)
+                .with_context(|| format!("MTP shared_head_head fallback to {main_lm}"))?;
+            (data, main_lm.to_string())
+        } else {
+            bail!(
+                "qwen35 MTP loader: `{shared_head_head_tname}` is missing AND \
+                 mtp_use_dedicated_embeddings=True — cannot resolve the MTP final \
+                 projection. Re-emit the GGUF with the dedicated tensor or set the \
+                 flag to false."
+            );
+        };
     ensure!(
         shared_head_head_f32.len() % h == 0,
-        "{nextn}.shared_head_head.weight has {} floats, not divisible by hidden_size {h}",
+        "{shared_head_head_source} has {} floats, not divisible by hidden_size {h}",
         shared_head_head_f32.len()
     );
     let vocab_size = (shared_head_head_f32.len() / h) as u32;
+    tracing::info!(
+        mtp_layer = layer_index,
+        source = %shared_head_head_source,
+        vocab_size,
+        "qwen35 MTP loader: shared_head_head resolved"
+    );
     let shared_head_head = upload_bf16_from_f32(&shared_head_head_f32, device)
         .context("MTP upload shared_head_head")?;
     let attn = load_mtp_attn(gguf, cfg, layer_index, device)?;

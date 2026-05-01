@@ -3442,6 +3442,7 @@ mod tests {
             vocab_size: 128,
             attn_output_gate: true,
             mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: true,
             intermediate_size: Some(64),
             moe: None,
         }
