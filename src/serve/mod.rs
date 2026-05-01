@@ -1165,6 +1165,18 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     let prompt_len = prompt_tokens.len();
     tracing::info!("Qwen3.5: {} prompt tokens", prompt_len);
 
+    // Gate-time tokenizer parity tooling. When `HF2Q_DEBUG_TOKENIZE_ONLY=1`,
+    // print the encoded token IDs on stdout (one space-separated line
+    // prefixed `TOKENIZE_DEBUG_IDS:`) and exit `Ok(())` before model
+    // load. Used by `scripts/qwen35_tokenizer_parity.sh` to compare
+    // against `llama-tokenize` on the same GGUF — the parity contract
+    // for the GGUF-driven tokenizer per ADR-013 §"Sovereignty".
+    if std::env::var("HF2Q_DEBUG_TOKENIZE_ONLY").as_deref() == Ok("1") {
+        let id_str: Vec<String> = prompt_tokens.iter().map(|i| i.to_string()).collect();
+        println!("TOKENIZE_DEBUG_IDS: {}", id_str.join(" "));
+        return Ok(());
+    }
+
     let max_seq = (prompt_len + args.max_tokens + 64)
         .max(128)
         .min(model.cfg.max_position_embeddings as usize);
