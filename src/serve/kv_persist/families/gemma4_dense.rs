@@ -998,6 +998,63 @@ fn _assert_send_sync() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase C.1 — `EngineBindable` impl for `Gemma4DenseSpill`.
+//
+// The C.1 `LoaderWrapper` delivers a type-erased `Arc<dyn Any + Send + Sync>`
+// at load time. For Gemma 4 the expected concrete is `Arc<EngineHandle>`
+// — the live device + dense_kvs slot + write_positions tuple defined
+// above. The impl downcasts via `Arc::downcast::<EngineHandle>()`:
+//
+//   * On success → clone the inner EngineHandle (cheap-clone via the
+//     existing `EngineHandle::clone` impl above) and store via the
+//     existing `set_engine_handle` method (which acquires the
+//     interior `Arc<RwLock<Option<EngineHandle>>>`'s write lock).
+//   * On mismatch → silently no-op. The downcast returns
+//     `Err(Arc<dyn Any>)` which we drop at end of scope. This
+//     satisfies the contract: hooks NEVER panic on type mismatch.
+//
+// `unbind_engine` clears the engine handle slot via the existing
+// `clear_engine_handle` method. Subsequent `snapshot_block` calls
+// then return `None` (the existing engine-handle-None short-circuit
+// at `gemma4_dense.rs:743-744`).
+//
+// The C.1 cmd_serve wire-up DOES NOT route the loaded `Engine` here
+// directly — instead, cmd_serve builds an `Arc<EngineHandle>` from
+// the engine's MlxModelWeights once load_or_get returns and binds
+// THAT through the registry. The LoaderWrapper's automatic bind path
+// (which would deliver `Arc<Engine>` here) finds the type mismatch
+// and silently no-ops; the explicit `cmd_serve` bind delivers the
+// `Arc<EngineHandle>` and succeeds. This split lets the Engine
+// remain fully owned by the manager (no Arc retention contract
+// violation) while still threading the live KV state to the hook.
+// ---------------------------------------------------------------------------
+
+impl crate::serve::kv_persist::EngineBindable for Gemma4DenseSpill {
+    fn bind_engine(&self, engine_dyn: Arc<dyn std::any::Any + Send + Sync>) {
+        // Try downcast to Arc<EngineHandle>. On Err, the type-erased
+        // Arc is returned to us; drop it without further action.
+        match engine_dyn.downcast::<EngineHandle>() {
+            Ok(handle_arc) => {
+                // Cheap-clone the inner EngineHandle (every field is
+                // `Arc`-wrapped). The downcast Arc itself drops at
+                // end of scope.
+                let handle: EngineHandle = (*handle_arc).clone();
+                self.set_engine_handle(handle);
+            }
+            Err(_other_dyn) => {
+                // Silent no-op on type mismatch (per the
+                // EngineBindable contract). The wrapped Any drops
+                // at end of scope.
+            }
+        }
+    }
+
+    fn unbind_engine(&self) {
+        self.clear_engine_handle();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
@@ -1797,5 +1854,106 @@ mod tests {
         for s in &sizes {
             assert_eq!(*s, first);
         }
+    }
+
+    // ===== Phase C.1 EngineBindable tests ==================================
+
+    /// Spec test 9: round-trip — bind a handle via the EngineBindable
+    /// trait, snapshot succeeds; unbind via the trait, snapshot
+    /// returns None.
+    #[test]
+    fn engine_bindable_gemma4_dense_round_trip_set_then_clear() {
+        use crate::serve::kv_persist::EngineBindable;
+        let Some(device) = try_make_device() else {
+            return;
+        };
+        let hook = Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("new");
+
+        // Build a populated EngineHandle and wrap in Arc.
+        let handle = populate_handle(&hook, device.clone(), 0xC1);
+        let handle_arc: Arc<EngineHandle> = Arc::new(handle);
+        let dyn_view: Arc<dyn std::any::Any + Send + Sync> = handle_arc.clone();
+
+        // Pre-bind: no engine handle ⇒ snapshot returns None.
+        assert!(hook.snapshot_block(0, 0..4).is_none());
+
+        // Bind via EngineBindable trait.
+        EngineBindable::bind_engine(&hook, dyn_view);
+        // Post-bind: snapshot now returns Some.
+        let out = hook.snapshot_block(0, 0..4);
+        assert!(out.is_some(), "snapshot active after bind_engine");
+        assert!(out.unwrap().len() > PAYLOAD_HEADER_BYTES);
+
+        // Unbind via EngineBindable trait.
+        EngineBindable::unbind_engine(&hook);
+        // Post-unbind: snapshot returns None again.
+        assert!(
+            hook.snapshot_block(0, 0..4).is_none(),
+            "snapshot disabled after unbind_engine"
+        );
+
+        // The original Arc<EngineHandle> is still live; the bind
+        // cloned the inner handle but did NOT retain the outer Arc.
+        assert_eq!(
+            Arc::strong_count(&handle_arc),
+            1,
+            "EngineBindable did not retain the outer Arc"
+        );
+    }
+
+    /// Spec test 10: downcast to wrong concrete type silently no-ops.
+    /// The hook's bind_engine never panics on type mismatch.
+    #[test]
+    fn engine_bindable_gemma4_dense_downcast_wrong_type_returns_silently() {
+        use crate::serve::kv_persist::EngineBindable;
+        let hook = Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("new");
+
+        // Pre-bind: no handle.
+        assert!(
+            hook.snapshot_block(0, 0..4).is_none(),
+            "no handle pre-bind"
+        );
+
+        // Pass a String wrapped in Arc<dyn Any>. Downcast to
+        // EngineHandle MUST fail; the impl drops it silently.
+        let bogus: Arc<dyn std::any::Any + Send + Sync> =
+            Arc::new(String::from("not-an-engine-handle"));
+        // This must NOT panic.
+        EngineBindable::bind_engine(&hook, bogus);
+
+        // Post-bind: still no handle (downcast failed silently).
+        assert!(
+            hook.snapshot_block(0, 0..4).is_none(),
+            "snapshot stays disabled after type-mismatch bind"
+        );
+
+        // unbind_engine on an unbound hook is also a no-op (does
+        // not panic).
+        EngineBindable::unbind_engine(&hook);
+    }
+
+    /// Spec test 11 (additional): the C.1 LoaderWrapper builds an
+    /// `Arc<E>` where E is the loaded Engine and passes that to
+    /// `bind_for`. For Gemma4DenseSpill, E is NOT EngineHandle, so the
+    /// downcast fails silently and the engine slot stays None. The
+    /// production cmd_serve path then drives a SEPARATE bind with an
+    /// `Arc<EngineHandle>` constructed from the loaded engine, which
+    /// succeeds.
+    #[test]
+    fn engine_bindable_gemma4_dense_silently_ignores_non_handle_arc() {
+        use crate::serve::kv_persist::EngineBindable;
+        let hook = Gemma4DenseSpill::new(small_cfg(DType::F32)).expect("new");
+
+        // Synthetic "engine" Arc — not an EngineHandle.
+        struct FakeEngine {
+            _marker: u32,
+        }
+        let fake = Arc::new(FakeEngine { _marker: 7 });
+        let dyn_view: Arc<dyn std::any::Any + Send + Sync> = fake;
+
+        EngineBindable::bind_engine(&hook, dyn_view);
+
+        // No engine bound ⇒ snapshot is None.
+        assert!(hook.snapshot_block(0, 0..4).is_none());
     }
 }

@@ -542,6 +542,28 @@ pub struct ServeArgs {
     /// disables that check; corruption silently passes through.
     #[arg(long, default_value_t = false)]
     pub no_integrity: bool,
+
+    /// ADR-017 Phase C.1 — enable persistent block-prefix KV cache to
+    /// disk. The argument is the cache directory (e.g.
+    /// `/tmp/hf2q-kv-persist` or `$HOME/.cache/hf2q/kv-persist`). The
+    /// directory is created if missing; the recovery scan runs at
+    /// startup to rebuild the in-memory `BlockIndex` from any
+    /// previously-written envelopes.
+    ///
+    /// When unset (default), the engine wires `NoopKvSpiller` and
+    /// behaves byte-identical to the pre-ADR-017 path. When set, the
+    /// engine wires `BlockPrefixCacheSpiller` + a per-loaded-family
+    /// `EngineBindable` registration so the spiller's `pre_evict` /
+    /// `post_admit` triggers route through the on-disk lifecycle.
+    ///
+    /// C.1 ships the WIRING substrate. The actual sourdough byte-exact
+    /// coherence run + perf-validation matrix lands in Phase D after
+    /// B-dense.2's round-trip parity matrix on real GGUF; until then,
+    /// the C.1 default registration uses `StubGemma4Spill` (always
+    /// `Skipped` on snapshot/restore) so the on-path is observable
+    /// but functionally inert.
+    #[arg(long = "kv-persist", value_name = "PATH")]
+    pub kv_persist_path: Option<PathBuf>,
 }
 
 /// CLI-facing copy of `serve::api::schema::OverflowPolicy`. Kept local to
