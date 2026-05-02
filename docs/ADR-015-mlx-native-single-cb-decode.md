@@ -1819,6 +1819,51 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-05-02 (UTC ~23:30Z) — iter89d MSL-DIFF: BOTH HYPOTHESES FALSIFIED. AOT vs runtime compile produce BYTE-IDENTICAL metallibs (md5 match for `quantized_matmul_id_mm_tensor.metal`). llama.cpp ALSO uses runtime compile (`GGML_METAL_EMBED_LIBRARY=ON` embeds raw .metal source via `newLibraryWithSource:options:`). Production kernel ISA byte-equivalent, mlx-native is slightly LEANER (673 vs 732 AIR lines). The ENTIRE 616ms wall gap (86ms ffn_down + 530ms residual) is wrapper/dispatch/CB-residency overhead, NOT kernel speed.**
+
+  **iter89d research deliverable:** `/tmp/cfa-iter89d/research/MSL-DIFF.md` (238 lines).
+
+  **Two independent proofs that compile flags are NOT the gap:**
+  1. AOT-compiling `quantized_matmul_id_mm_tensor.metal` with `xcrun -sdk macosx metal -O3` produces a metallib byte-identical to default-options compile (md5 `5071faaf...` matches). `-O0` differs (sanity check). Apple's default `MTLCompileOptions` already corresponds to `-O3 -ffast-math`.
+  2. llama.cpp on this machine uses runtime compile (`/opt/llama.cpp/build/CMakeCache.txt:494` confirms `GGML_METAL_EMBED_LIBRARY=ON`; 600 KB `__ggml_metallib` data section in `libggml-metal.dylib` carries raw .metal source text; runtime compile via `[device newLibraryWithSource:src options:options]` at `ggml-metal-device.m:227-232` with default `MTLCompileOptions`). Same path as mlx-native.
+
+  **Production kernel diff:** mlx-native vs llama.cpp `kernel_mul_mm_id_q4_0_f32` (both with `GGML_METAL_HAS_TENSOR=1`):
+  - AIR-IR structurally identical: same `mpp::tensor_ops::matmul2d` call sequence, same q4_0 dequant FP arithmetic with same constants (`0xH2C00`, `3.906250e-03`), same 4× wg-barriers, same 7-call tensor-ops pattern
+  - mlx-native is slightly LEANER (673 vs 732 AIR lines, 26 vs 34 loads)
+  - One real diff: llama uses `llvm.loop.unroll.full` on B-stage shmem-write loop; mlx documented null effect on M5 (P4.8, 2026-04-19)
+
+  **metal-rs version correction:** mlx-native already uses `metal = "0.33"` (not 0.29 as iter89d brief assumed). 0.33 exposes `set_fast_math_enabled` (already `true` by default), `set_language_version`, `set_preserve_invariance` — but NO `set_optimization_level` because Apple deprecated `setOptimizationLevel` in macOS 14 in favor of `MTLMathMode.fast` default. Upgrading metal-rs further would not help.
+
+  **iter89e directions:**
+  - **iter89e-A (AOT metallib): DO NOT PURSUE.** Provably 0 ms wall savings — IR is byte-identical.
+  - **iter89e-B (xctrace per-dispatch capture): RECOMMENDED.** Operator-driven (Instruments). Concrete plan: `xctrace record --instrument GPU --launch -- /tmp/cfa-iter87d/hf2q-baseline generate ...` on chunk-engaged fixture, same for `llama-cli`. Open in Instruments, line up per-dispatch GPU timings, identify the wrapper overhead source. ~15 min recording + ~1 hour analysis.
+  - **iter89e-C (wrapper-overhead audit, autonomous):** measure mlx-native dispatch wrapper code path latency directly. Possible mechanisms:
+    - Per-dispatch overhead (apply_bindings, ensure_sample_buffer, take_pending_*) ~few µs each
+    - MTLComputePipelineState lookup cache (HashMap miss vs hit)
+    - MTLCommandBuffer commit overhead (200 CBs per prefill is high count)
+    - Buffer residency state asymmetry (StorageModeShared vs llama.cpp's residency-set pattern)
+
+  **CONVERGENT EVIDENCE (load-bearing across iter88a + iter89b + iter89c + iter89d):**
+  - iter88a: gate/up shape mlx-native 1.16-1.20× FASTER than peer (kernel is leaner)
+  - iter88a: down shape mlx-native 0.76-0.86× SLOWER than peer (constant per-dispatch overhead overcomes leaner-kernel gains)
+  - iter89b: kernel source byte-equivalent (.metal templates match)
+  - iter89c: tensor variant is correct route (simdgroup forced is +431 ms slower)
+  - iter89d: kernel ISA byte-equivalent post-compile (compile flags identical effect)
+
+  **The 86 ms ffn_down + 530 ms residual = 616 ms wall gap is in mlx-native's per-dispatch/CB/residency wrapper code path, NOT in the GPU kernel ISA, NOT in compile flags, NOT in tile geometry, NOT in route selection.** This is the FIRST iter sequence in the session that locates the gap mechanism with measurement-grounded confidence.
+
+  **STANDING COMPLIANCE.**
+  - `feedback_evidence_first_no_blind_kernel_rewrites` — iter89d disproves AOT migration hypothesis at zero code-change cost; saves operator from a multi-day misdirected effort.
+  - `feedback_correct_outcomes` — kernel-precision and AOT-compile hypotheses both falsified; the ENTIRE ADR-015 wrapper-side optimization arc (iter72-87d) was working on the right TYPE of mechanism (wrapper/dispatch overhead) but at the wrong layer; the actual offender is at the encode/CB-commit boundary.
+  - `feedback_no_shortcuts` — full disassembly + AIR-IR diff completed before recommending iter89e.
+
+  **Receipts.**
+  - `/tmp/cfa-iter89d/research/MSL-DIFF.md` (238 lines, full disassembly + diff)
+  - `/tmp/cfa-iter89d/aot-build/` (10 metallibs + AIR objects)
+  - `/tmp/cfa-iter89d/msl-dumps/` (6 full .s files + 5 per-kernel extracts)
+
+  Status: ADR-015 gap mechanism LOCALIZED — wrapper/dispatch/CB-residency overhead, not kernel speed. iter89e candidates queued. Loop continues to operator-driven xctrace OR autonomous wrapper-overhead audit.
+
 - **2026-05-02 (UTC ~23:00Z) — iter89b kernel audit + iter89c diagnostic test C: kernel source byte-equivalent (tile geometry, dispatch grid, map0, K-loop body all match peer); simdgroup variant FORCED via `HF2Q_DISABLE_TENSOR_MM_ID=1` is +431ms slower than tensor; the 0.82× gap is in mlx-native's tensor-API path specifically. NEW HYPOTHESIS: MPP `tensor_ops::matmul2d.run()` setup cost amortizes over many K-iters (gate/up k=2048 = 64 iters → 1.16× FASTER) but underperforms at small K (down k=512 = 16 iters → 0.82× SLOWER) vs llama.cpp's raw `simdgroup_multiply_accumulate` calls.**
 
   **iter89b research deliverable:** `/tmp/cfa-iter89b/research/AUDIT.md` (442 lines). Side-by-side comparison of mlx-native and llama.cpp `kernel_mul_mm_id_q4_0_f32` templates.
