@@ -7,7 +7,7 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
-## ▶ Resume Here — current state of truth (2026-05-01 ~22:50Z, iter63 GPU profiling kit LANDED; Apple Silicon AtDispatchBoundary hardware quirk discovered; Part B Xcode capture is the per-dispatch attribution path on M5 Max)
+## ▶ Resume Here — current state of truth (2026-05-01 ~23:05Z, iter64a CONFIRMED: C1 device-direct B reads are iter62's +445ms mechanism — L2/DRAM bandwidth thrash from removed threadgroup-B caching across simdgroups; iter65 hybrid threadgroup<float> B is queued)
 
 **Decode side: SHIPPED + RE-VALIDATED. iter56/57/58b confirmed byte-transparent perf-only changes (iter61c FULL VERDICT: ALL PASS).**
 
@@ -1766,6 +1766,61 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - Memory pins: `feedback_perf_gate_thermal_methodology`, `feedback_shippability_standing_directive`, `feedback_never_ship_fallback_without_rootcause`, `feedback_no_broken_windows`, `project_metal_compiler_auto_optimizes_static_levers`, `project_end_gate_reality_check`, `feedback_ground_truth_is_what_we_can_measure_now`
 
 ## Changelog
+
+- **2026-05-01 (UTC ~23:05Z) — iter64a CONFIRMED: C1 (device-direct B reads) is iter62's +445ms `layer.ops1_3` mechanism. Wall regression +531ms reproduced standalone on main base; mechanism is L2/DRAM bandwidth thrash from removed threadgroup-B caching across simdgroups in a threadgroup. iter60b's structural motivation (eliminate f32→half cast on B) is NOT worth the L2 penalty; iter65 hybrid threadgroup<float> B queued as cast-elimination path WITHOUT L2 thrash.**
+
+  **Method.** iter64 mechanism-bisection research (`/tmp/cfa-iter64/research/BISECTION-DESIGN.md`, 698 lines) refined iter60b's 4 non-tile changes from "4 isolatable elements" to "2 isolatable candidates" via coupling matrix:
+  - **C1 forces C3** — once B becomes `tensor<device float>`, the type-param swap in `get_destination_cooperative_tensor<>` is mandatory; C3 alone on `main` is a no-op since both pre-image types are identical (`tensor<threadgroup half>`).
+  - **C2 must pair with C4** — `transpose_result=true` produces column-major cT, incompatible with `main`'s row-major write-back; conversely.
+  - Three viable bisection candidates: iter64a (C1+C3 on main base, keep transpose=false + partial-tile fast/slow path), iter64b (C2+C4 minimal pair on main base), iter64c (C4-only revert on iter60b base — only if 64a confirms C1).
+
+  **iter64a impl + bench (mlx-native branch `cfa/iter64a-c1-c3-20260501/claude` HEAD `e5d12dc`, hf2q HEAD `2f1e92e`, both pushed; 27 min wall-clock total, ~7 min bench portion):**
+
+  | Metric | iter64a | main baseline | Δ |
+  |---|---:|---:|---:|
+  | Wall prefill (apex q4_0-flat pp4096, 6 alternating cold trials, trimmed median) | **2491 ms** | **1960 ms** | **+531 ms (+27.1%)** |
+  | `layer.ops1_3` (× 30 DN layers) | 208.7 ms | 109.4 ms | +99.3 ms (1.91×) |
+  | `layer.ffn_dispatch` (× 40 layers using same kernel template) | — | — | **+429 ms (largest single bucket)** |
+  | FA path buckets | unchanged | unchanged | 0 (FA path doesn't use mul_mm_tensor) |
+  | IQR (iter64a / main) | 14 ms | 3 ms | well below 50 ms quality threshold |
+  | Token-id parity | id 11 across all trials | id 11 | byte-identical decoded output |
+
+  **Parity test results (the load-bearing correctness gate, addresses iter63c's diagnostic concern from Appendix B Q3):** 11/11 PASS in `test_quantized_matmul_mm` + 9/9 PASS at NR1=32 with M ∈ {16, 33, 40, 64}. **iter63c's "mm.run drops simdgroup-1 contributions when M<NR1" failure mode is NR1-specific** — it fired at NR1=128 because M<128 is common (production chunk-prefill at M=64 < 128); at NR1=32 (unchanged in iter64a), M ≥ 32 is the common case and parity is clean for all tested M values.
+
+  **Mechanism (load-bearing finding).** Pre-image (main): stages B once into 4 KB threadgroup memory (`sb` allocation); 4 simdgroups in a threadgroup all read from threadgroup (~10 TB/s effective bandwidth, M3+ Apple Silicon spec). Post-image (iter60b/iter64a): B becomes `tensor<device float>` over the input device buffer; each `mm.run` re-fetches B tiles from L2/DRAM **with no sharing across simdgroups in a threadgroup**. At pp4096 × 30 DN layers (+ 40 FFN layers using the same `kernel_mul_mm_q4_0_tensor_f32` template), the per-tile B re-read cost compounds to the observed +531 ms wall.
+
+  **Hypothesis space updates:**
+
+  - iter62's "matmul-size-scaled cost signature" → now FULLY EXPLAINED. Larger M = more output tile rows = more B re-reads from DRAM (no threadgroup amortization across simdgroups within a tile). Cost scales linearly with `M × layer count` for layers using this kernel template.
+  - iter60b's structural motivation (eliminate ~1024 fp32→fp16 casts per K-iteration) is FALSIFIED at value: the cast cost is dwarfed by the L2/DRAM bandwidth penalty from removing threadgroup caching. iter60b's net is -27% prefill perf. **iter60b SHOULD NOT SHIP — branch retained as evidence.**
+  - iter64b (C2+C4 minimal pair) becomes OPTIONAL — iter64a alone reproduces the FULL +531 ms regression, so C2+C4 either contributes nothing or partially overlaps with C1. Informational only.
+  - iter64c (revert C4 on iter60b base) NOT NEEDED.
+
+  **iter65 design — cast-elimination WITHOUT L2 thrash (queued, research needed):**
+
+  The desirable property iter60b had — eliminating the f32→half cast on B staging — can be obtained by changing the `sb` element type from `half` to `float` (`tensor<threadgroup float, ...>` instead of `tensor<threadgroup half, ...>`). This:
+  - Keeps the threadgroup-B cache (preserves L2 caching across simdgroups)
+  - Eliminates the per-K-iteration cast (input is f32; staging f32 directly)
+  - Trade-off: 2× threadgroup memory for B (4096 B vs 2048 B); total threadgroup ~8 KB vs current ~6 KB; well within M5 Max's 32 KiB limit
+  - **Open question (CRITICAL pre-impl):** MPP `tensor_ops::matmul2d` may reject mixed-precision operands per the original tensor-variant design comment (`tensor_ops::matmul2d rejects mixed-precision operands (both A and B must be the same Metal type)`). If A stays `tensor<threadgroup half>` (post-dequantize) + B becomes `tensor<threadgroup float>`, MPP may reject. Solutions: (a) promote A to float at dequantization output (memory cost: A becomes 8192 B vs 4096 B); (b) keep B as half but eliminate the cast at staging via a different code path; (c) use a different MPP descriptor pattern that accepts mixed precision. Research required before impl.
+
+  **Standing rule reinforced.** `feedback_evidence_first_no_blind_kernel_rewrites`: even with iter62's per-bucket attribution (matmul-size-scaled cost), the WRONG mechanism could be inferred without single-element bisection. iter62 attribution narrowed to "one of iter60b's 5 changes"; iter63a + iter63c falsified tile-shape; iter64a confirms device-direct B alone is sufficient and individually reproduces the full regression. **Per-mechanism A/B bisection (each <50 LOC) is the right granularity for kernel-level understanding.**
+
+  **STANDING COMPLIANCE.**
+  - `feedback_evidence_first_no_blind_kernel_rewrites` — bisection driven by iter62 attribution + iter63a/c falsifications; 27 min wall to confirmed mechanism.
+  - `feedback_correct_outcomes` — iter64a is a NO-MERGE branch (regression); preserved as evidence; mechanism documented in this Changelog + branch commits.
+  - `feedback_no_shortcuts` — full per-bucket attribution table; cross-trial confirmation; trimmed-median methodology with warmup per binary.
+  - `feedback_use_cfa_worktrees` — both repos in `/tmp/cfa-iter64a/{mlx-native,hf2q}`; isolated build state; rust-analyzer SIGSTOP'd during bench, restored after.
+  - `feedback_git_commit_pathspec_when_parallel` — only `quantized_matmul_mm_tensor.metal` + `quantized_matmul_ggml.rs` modified; hf2q-side change scoped to .cargo/config.toml override + Cargo.lock; ADR-005/013/018 fences honored.
+
+  **Receipts.**
+  - `/tmp/cfa-iter64a/impl-bench/VERDICT.md` (207 lines, full per-bucket table + mechanism explanation)
+  - `/tmp/cfa-iter64a/impl-bench/logs/{warmup-iter64a,warmup-main,A1-A3-iter64a,B1-B3-main}.log` (8 cold-bench logs)
+  - `/tmp/cfa-iter64a/impl-bench/{run-trial.sh,cold-loop.sh}` (bench drivers)
+  - Parity test outputs (11/11 + 9/9 PASS) at iter64a worker logs
+  - Branches: mlx-native `cfa/iter64a-c1-c3-20260501/claude` HEAD `e5d12dc` (pushed), hf2q `cfa/iter64a-c1-c3-20260501/claude` HEAD `2f1e92e` (pushed)
+
+  Status: iter64a CLOSED-CONFIRMED-MECHANISM. iter60b retained as evidence (DO NOT MERGE; net -27% prefill). iter64b informational-only (skipped pending other priorities). iter65 (threadgroup<float> B for cast-elimination without L2 thrash) is the next-iter perf candidate; research required to resolve MPP mixed-precision-operand constraint.
 
 - **2026-05-01 (UTC ~22:50Z) — iter63 GPU profiling kit LANDED on `cfa/iter63-profiling-kit-20260501/claude` (mlx-native HEAD `d0b0128`, 5 commits, ~36 min wall-clock impl); critical Apple Silicon hardware quirk discovered + gracefully handled; Part B (Xcode capture) operational on M5 Max.**
 
