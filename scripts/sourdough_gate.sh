@@ -179,12 +179,20 @@ if ! HF2Q_USE_DENSE=1 "$HF2Q_BIN" generate --model "$GGUF_PATH" --prompt "$USER_
 fi
 
 # 4. Common-byte-prefix diff.
-# hf2q prints a 4-line header on stdout (src/serve/header.rs, commit 172488b):
-#   1: "hf2q · <chip> · <backend>"
-#   2: "<model> · loaded in <s>s · <n> layers · <gb> GB"
-#   3: "prefill: <n> tok in <ms>ms (<tok/s> tok/s)"
-#   4: blank line
-# Strip by skipping the first 4 newline-terminated lines before diffing.
+# hf2q prints a load banner on stdout before the generated text. Two
+# formats coexist:
+#   - Pre-ADR-018 (legacy, src/serve/header.rs commit 172488b):
+#       1: "hf2q · <chip> · <backend>"
+#       2: "<model> · loaded in <s>s · <n> layers · <gb> GB"
+#       3: "prefill: <n> tok in <ms>ms (<tok/s> tok/s)"
+#       4: blank line
+#   - ADR-018 c3 (2026-05-01+, src/serve/load_info.rs::print_banner):
+#       N "hf2q load: <field> = <value>" lines (currently 13)
+#       1 "prefill: <n> tok in <ms>ms (<tok/s> tok/s)" line
+#       1 blank line
+# Both formats end with `prefill: ...\n\n<decoded>` and contain no other
+# blank line in the banner prefix, so finding the first `\n\n` strips both
+# correctly. Mirrors `tests/coherence_matrix.rs::strip_hf2q_header`.
 #
 # Write TSV to a temp file instead of process substitution — the python
 # heredoc contains literal ) which bash's <( ... ) parser miscounts.
@@ -194,16 +202,14 @@ import sys, json
 a = open(sys.argv[1], "rb").read()
 b_raw = open(sys.argv[2], "rb").read()
 out = sys.argv[3]
-if b_raw.startswith(b"hf2q \xc2\xb7 "):
-    pos = 0
-    for _ in range(4):
-        nl = b_raw.find(b"\n", pos)
-        if nl < 0:
-            break
-        pos = nl + 1
-    b = b_raw[pos:]
-else:
-    b = b_raw
+
+def strip_hf2q_header(buf):
+    if not (buf.startswith(b"hf2q \xc2\xb7 ") or buf.startswith(b"hf2q load:")):
+        return buf
+    sep = buf.find(b"\n\n")
+    return buf[sep + 2:] if sep >= 0 else b""
+
+b = strip_hf2q_header(b_raw)
 n = min(len(a), len(b))
 i = 0
 while i < n and a[i] == b[i]:

@@ -1257,13 +1257,20 @@ pub fn generate_stream_qwen35_once(
                     // shape (spec-valid OpenAI streaming tool-call); the
                     // W-B3 incremental shape is a Wedge-4 follow-up if
                     // operators want progressive arg display.
+                    // ADR-005 iter-224 W-A2.2: wrap in a passive EventSink
+                    // so the helper's `&EventSink<'_>` parameter is satisfied
+                    // without altering the qwen35 streaming code path.
+                    // Qwen35 has its own HybridPromptCache and does NOT
+                    // participate in the Gemma fragment-replay capture; a
+                    // passive sink is correct here (forwards 1:1, no mirror).
+                    let sink = super::engine::EventSink::new(events);
                     if super::engine::emit_streaming_tool_call_close(
                         parsed,
                         body_dump,
                         params_tool_call_policy_for_qwen35_stream(),
                         tc_index,
                         saw_tc,
-                        events,
+                        &sink,
                     )
                     .is_err()
                     {
