@@ -2434,22 +2434,21 @@ pub fn compute_vision_embeddings_gpu_dispatch(
                      but arch is ClipClassic — preprocessing/arch mismatch"
                 ));
             }
-            (super::mmproj::ArchProfile::Qwen3VlSiglip, _) => {
-                // iter-224 Wedge-4b: parse path (mmproj header + projector
-                // + DeepStack tensor enumeration) is wired, but the runtime
-                // ViT forward (`compute_vision_embeddings_gpu_qwen3vl`)
-                // lands in Wedge-4c. `ProjectorType::Qwen3VlMerger.is_supported()`
-                // returns false today so a real serve --mmproj startup
-                // rejects this profile before reaching here. The fail-loud
-                // arm below catches the contract regression if a future
-                // change accidentally enables `is_supported()` without
-                // wiring the kernel path.
+            // iter-224 Wedge-4c.1 scaffold: Qwen3-VL preprocessing today
+            // produces a square fixed-resolution `Siglip49(_)` payload
+            // (Risk R4 in Worker W's plan §F: "ship fixed-resolution;
+            // dynamic resolution is Phase 2"). The dispatch step below
+            // partitions Qwen3VlSiglip+Siglip49 inputs and delegates to
+            // `vit_gpu_qwen3vl::compute_vision_embeddings_gpu_qwen3vl`,
+            // which currently returns the 4c.1 scaffold Err. The defense
+            // here mirrors the (ClipClassic, Gemma4v) preprocessing-
+            // mismatch arm above.
+            (super::mmproj::ArchProfile::Qwen3VlSiglip, VisionInput::Siglip49(_)) => {}
+            (super::mmproj::ArchProfile::Qwen3VlSiglip, VisionInput::Gemma4v(_)) => {
                 return Err(anyhow!(
-                    "compute_vision_embeddings_gpu_dispatch: input {idx} arch is \
-                     Qwen3VlSiglip — runtime forward not yet implemented (Wedge-4c). \
-                     ProjectorType::Qwen3VlMerger.is_supported() should be returning \
-                     false at startup; reaching this arm means is_supported() flipped \
-                     without the kernel path landing."
+                    "compute_vision_embeddings_gpu_dispatch: input {idx} is Gemma4v \
+                     but arch is Qwen3VlSiglip — preprocessing/arch mismatch (Qwen3-VL \
+                     uses square-fixed-resolution Siglip49 preprocessing in Phase 1)"
                 ));
             }
             (super::mmproj::ArchProfile::Unknown, _) => unreachable!("guarded above"),
@@ -2476,6 +2475,56 @@ pub fn compute_vision_embeddings_gpu_dispatch(
     }
 
     let mut out: Vec<Option<Vec<f32>>> = (0..inputs.len()).map(|_| None).collect();
+    // iter-224 Wedge-4c.1 scaffold: route Qwen3VlSiglip BEFORE the
+    // generic Siglip49 path so a Qwen3-VL mmproj does not get silently
+    // pushed through `compute_vision_embeddings_gpu` (the SigLIP-49
+    // CLIP-classic forward) — that would produce wrong logits without
+    // any structural error. The new module's stub returns Err so the
+    // mismatch surfaces loudly; subsequent sub-iters (4c.2..5) fill
+    // in the real arithmetic and this branch becomes the success path.
+    //
+    // Note: today this branch is unreachable in production because
+    // `ProjectorType::Qwen3VlMerger.is_supported()` returns false and
+    // `validate_tensor_set` rejects the file at `serve --mmproj`
+    // startup. The wiring exists so 4c.5's gate flip lands without
+    // re-touching the dispatch.
+    if matches!(arch, super::mmproj::ArchProfile::Qwen3VlSiglip) {
+        // Sub-iter 4c.2 will source `num_position_embeddings` from
+        // `mmproj_weights.position_embd_weight()?.shape()[0]`. The 4c.1
+        // stub never reads it, but we must construct the config so the
+        // delegation surface is byte-stable across sub-iters.
+        // Until then we use a sentinel that fails loudly if the stub
+        // ever stops returning Err — sentinel = 1 keeps `from_mmproj`
+        // happy (>0) and any non-stub use will mis-compute and surface.
+        let num_position_embeddings: u32 = 1;
+        let cfg = super::vit_gpu_qwen3vl::Qwen3VlViTConfig::from_mmproj(
+            mmproj_cfg,
+            num_position_embeddings,
+        )?;
+        let r = super::vit_gpu_qwen3vl::compute_vision_embeddings_gpu_qwen3vl(
+            inputs,
+            mmproj_weights,
+            &cfg,
+            mmproj_cfg,
+        )?;
+        // The stub above always errors — we only reach the loop below
+        // once 4c.4 lands real arithmetic. Indices are then preserved
+        // by walking the original input slice in order.
+        for (i, e) in r.into_iter().enumerate() {
+            out[i] = Some(e);
+        }
+        // Skip the gemma/siglip dispatch entirely — Qwen3VlSiglip arch
+        // implies all inputs are Qwen3-VL Siglip49 (validated above).
+        return out
+            .into_iter()
+            .enumerate()
+            .map(|(i, slot)| {
+                slot.ok_or_else(|| {
+                    anyhow!("compute_vision_embeddings_gpu_dispatch: slot {i} unfilled")
+                })
+            })
+            .collect();
+    }
     if !siglip_imgs.is_empty() {
         let r = compute_vision_embeddings_gpu(&siglip_imgs, mmproj_weights, mmproj_cfg, scale)?;
         for (i, e) in siglip_idx.into_iter().zip(r.into_iter()) {
