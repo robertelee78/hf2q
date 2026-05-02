@@ -1793,6 +1793,49 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-05-02 (UTC ~06:15Z) — iter76 NEUTRAL: PostAttnArena bucket impact REAL (-114.6ms `layer.post_attn_fused_norm`) but absorbed into `ffn_dispatch` at +119.1ms = no wall win (Δ +3ms within noise). Critical-path verification REQUIRED for future arena iters; quantile-skew alone is necessary but NOT sufficient.**
+
+  **Verdict.** iter76 wall trimmed median 1491ms (IQR 6) vs iter74 baseline 1488ms (IQR 2) = +3ms (NEUTRAL/slight regression within noise). Pre-registered ≥150ms threshold FALSIFIED. **Branch preserved, NOT merged.**
+
+  **Bucket-level finding (load-bearing methodology refinement):**
+
+  | Bucket | iter74 | iter76 | Δ |
+  |---|---:|---:|---:|
+  | layer.post_attn_fused_norm | 115.5 ms | 0.9 ms | **-114.6 ms** |
+  | layer.ffn_dispatch | 1119.8 ms | 1238.9 ms | **+119.1 ms** |
+
+  **Mechanism: CPU-side alloc overhead was async-overlapped with in-flight GPU work.** iter75 estimate (6.4 GB / 30 GB/s = 213ms theoretical) assumed serial CPU exposure. Actual M5 Max architecture is concurrent: `write_bytes(0)` memsets run while the GPU executes previous-layer FFN kernels. Removing the alloc-cost from `post_attn_fused_norm` bucket simply shifts the wait into `ffn_dispatch` because GPU was the bottleneck (1238ms / 83% of wall). The 114.6ms wasn't on the critical path.
+
+  **Critical-path test (NEW METHODOLOGY refinement banked):**
+  - **Necessary**: quantile-skew (`mean/p50 ≥ 5×`) — bucket has cold-path mechanism
+  - **NOT sufficient**: removing the cold-path may simply cascade into adjacent async-overlapped buckets
+  - **Sufficient test**: when bucket cost X is eliminated, does ANOTHER bucket gain ≈X (= async-overlapped, no wall win) OR does total wall decrease by ≈X (= critical path, real wall win)?
+  - **Pre-impl verification**: trace per-CB GPU timestamps; if bucket sits at encoder commit boundary AND no following dispatch can start during it → critical path. If bucket runs concurrently with GPU dispatch → async-overlapped.
+
+  iter72 + iter74 both passed the implicit critical-path test (their cold paths blocked subsequent dispatches via encoder commit + memset serializing the dispatch queue). iter76 failed because the post-attention buffers' alloc happened concurrently with prior-layer GPU work that was already in flight.
+
+  **iter58b risk verification: PASSED both slots** — `ffn_input_buf` + `ffn_residual_buf` in arena owned by `forward_gpu_impl` for entire prefill; dropped only after final `commit_and_wait_labeled` at output head. Per-layer Arc-clones drop at layer-iter close but arena holds Arc count ≥1. No mid-flight residency rescission possible. (No `commit_and_wait → commit` downgrade introduced.)
+
+  **Tests + parity:** 2549/0/13 full unit suite; 305/0/10 qwen35 module tests; 4/4 D4 fixtures byte-identical iter76 vs iter74. Implementation correct; just no wall benefit.
+
+  **Implication for iter77+:** iter75 secondary candidates (ChunkAllocsArena -100-180ms est, FA-ops1to4 arena -20-40ms est) need critical-path verification BEFORE impl. Apply the new test: examine per-CB GPU timeline OR run a small static analysis on the dispatch order to determine whether the alloc happens during a GPU-idle window (critical path) or during in-flight GPU work (async-overlap). If async-overlap, expect NEUTRAL outcome — don't spend impl budget unless critical-path confirmed.
+
+  **Branch:** `cfa/iter76-post-attn-arena-20260502/claude` (pushed, NOT merged). Preserved as evidence + risk-pattern documentation. iter76 PostAttnArena code is correct + Drop-safe; future iters could revisit if the dispatch pipeline changes (e.g. K-boundary commit_and_wait removed) such that the alloc cost becomes serial.
+
+  **Methodology lesson banked.** Three iters now have demonstrated this pattern at different layers:
+  - iter67-A: 24% per-call savings → 0.0006% wall (per-call work absorbed by Metal CB enqueue floor)
+  - iter69 vs iter70 + iter71: per-call gap NOT in dominant kernel (was diffuse in secondary dispatches; later: was in alloc cold-paths which iter72/74 captured)
+  - **iter76: 7% bucket savings → 0% wall** (alloc cold-path was async-overlapped, not on critical path)
+
+  **Convergent rule:** wall savings = bucket savings ONLY IF bucket sits on the critical path. For Metal serial queue + persistent encoder + K-boundary `commit_and_wait` topology: alloc costs that sit between GPU dispatches are usually critical (iter72/74 case); alloc costs that run alongside in-flight GPU work are usually async-overlapped (iter76 case). Distinguish via per-CB GPU timestamp profile or dispatch-order static analysis.
+
+  **Receipts.**
+  - `/tmp/cfa-iter76/impl-bench/VERDICT.md` (full verdict + bucket-level absorption table)
+  - `/tmp/cfa-iter76/impl-bench/logs/{warmup-iter76,warmup-iter74,A1-A3-iter76,B1-B3-iter74}.log`
+  - `/tmp/cfa-iter76/.IMPL-DONE`
+
+  Status: iter76 CLOSED-NEUTRAL. ratio remains 0.792× (post-iter74). Cumulative session: +33pp (iter72+iter74) + 0pp (iter76) = +33pp from baseline. iter77+ requires critical-path verification before impl.
+
 - **2026-05-02 (UTC ~05:25Z) — iter74 SHIPPED on hf2q main `6b0a067` (FF-merged from `cfa/iter74-dn-arena-20260502/claude` HEAD `5bd15b5`). DnPrefillArena pools DN-side transient scratches → -219ms / -12.86% wall at apex q4_0-flat pp4096; ratio 0.691× → 0.792×; +10pp additional gap closed (cumulative iter72+iter74 = +33pp from 0.460× baseline). Quantile-not-means methodology validated systematically — iter73 audit predicted exactly this win.**
 
   **Mechanism (applies iter72's pattern to DN side).** ~22 transient `pooled_alloc_buffer` calls per DN layer × 30 DN layers, lifted to caller-owned `DnPrefillArena` allocated once at prefill start in `forward_gpu_impl` (alongside FaPrefillArena + MoeFfnArena/DenseFfnArena from prior iters). Per-layer scratch slots reused across all 30 DN layers; cold-path `metal::new_buffer + zero-init + addAllocation + [set commit]` storm collapses from ~22 × 30 = 660 cold allocs to 22 cold allocs total (97% reduction).
