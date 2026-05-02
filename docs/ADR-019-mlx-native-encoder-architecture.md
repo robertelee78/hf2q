@@ -526,6 +526,40 @@ Phased, gated, with parity per increment. Each phase ships behind its own env ga
 
 **Receipts:** `/tmp/cfa-adr019-phase0a1-llamacpp/results.md`, three preserved `.trace` bundles (~75 MB each), `/opt/hf2q/scripts/adr019-phase0a1-llamacpp-capture.sh` (capture script), `/tmp/cfa-adr019-phase0a1-llamacpp/four-bin-results.json`, `/tmp/cfa-adr019-phase0a1-llamacpp/bin-residual.py` (parameterized parser).
 
+**Phase 0a.4 — Metal performance counter attribution (2026-05-02 evening).** Added per the recommended next-step (2) in 0a.1's cross-protocol section. Goal: localize the +340 ms in-process gap into one of three mechanisms — M1 (per-CB GPU dispatch cost), M2 (per-CB occupancy gap), or M3 (per-dispatch GPU overhead independent of CB count). M1/M2 → D3 captures the win; M3 → D3 cannot help and ADR-015 kernel-speed re-opens.
+
+**Counter strategy + load-bearing limitation.** Distinguishing M1 vs M2 vs M3 requires ALU-active / total-cycle ratio (occupancy proxy) and memory-stall counters per shader. **Neither is accessible via xctrace 16.0 CLI on this seat.** Verified via three probes: (a) `xctrace list templates` exposes Metal System Trace, Game Performance, Game Performance Overview — all surface `Counter Set: (null)` per `--toc` of probe runs; (b) explicit `xctrace --instrument "Metal GPU Counters"` returns the warning `"Selected counter profile is not supported on target device"` — no profile-selection CLI; (c) Game Performance template captures exactly ONE counter (`RT Unit Active`, raytracing-specific) by default, useless for ALU/stall/occupancy attribution. **Per-shader ALU/stall/occupancy attribution is therefore deferred to operator-driven Xcode Instruments GUI capture** (Instruments app exposes the Counter Set picker that xctrace CLI lacks); this is the only path to definitively split M1 from M2 from this hardware seat. Per the project mantra (do not fabricate counter values), 0a.4 attempts **partial attribution** using metrics that ARE accessible: hf2q internal `dispatch_count` / `cmd_buf_count` / `sync_count` via `HF2Q_PROFILE_SYNC=1` `[P19 H9]` line, plus xctrace `metal-gpu-execution-points` (per-side comparable) and `metal-application-command-buffer-submissions` schemas.
+
+**Measured 2026-05-02 evening (M5 Max, branch `adr017-iter17-2026-05-01` HEAD `21ddcab`):** xctrace `Metal System Trace` template, 3 cold trials per side, 30 s cooldown; pre-bench process audit clean (≥ 64 GB RAM free; only supervising claude+cmux processes; no rust-analyzer/cargo/brain-server contention). Wall numbers reproduce 0a.1 to ± 6 ms (0.4 % drift); `HF2Q_PROFILE_SYNC=1` adds no material overhead.
+
+**3-trial mean ± σ:**
+
+| Metric | hf2q | llama | Δ (h − l) | Ratio (h / l) |
+|---|---:|---:|---:|---:|
+| Wall (ms) | 1532.0 ± 3.5 | 1192.1 ± 5.9 | +339.9 | 1.29× |
+| xctrace GPU exec-points (paired) | 592 ± 67 | 155 ± 19 | +437 | **3.81×** |
+| xctrace CB submissions | 236 ± 0 | 6 ± 0 | +230 | **39.33×** |
+| hf2q internal dispatch_count | 1292 | n/a | n/a | n/a |
+| hf2q internal cmd_buf_count | 172 | n/a | n/a | n/a |
+| hf2q internal sync_count | 6 | n/a | n/a | n/a |
+
+**Cross-validation:** hf2q wall 1532 ± 3.5 ms (0a.4) vs 1538 ± 6 ms (0a.1) — within noise. llama wall 1192 ± 5.9 ms (0a.4) vs 1186 ± 6.7 ms (0a.1) — within noise. The 64-CB delta between hf2q internal `cmd_buf_count=172` (prefill window only) and xctrace `cb-submissions=236` is consistent across all 3 trials and reflects pre-prefill warmup + post-prefill decode CBs xctrace counts but the internal counter does not.
+
+**H-0a.4-3 verdict — dispatch-vs-CB ratio attribution.** The three hypotheses translated to ratios: M1/M2 (per-CB-dominant) → expect dispatch-ratio ≪ CB-ratio; M3 (per-dispatch-dominant) → expect dispatch-ratio ≈ CB-ratio. Measured: dispatch ratio (xctrace exec-points, apples-to-apples) = **3.81×**; CB ratio = **39.33×**; ratio-of-ratios = **10.3**. **The CB ratio is 10× the dispatch ratio.** hf2q's CBs each schedule far fewer GPU work units than llama.cpp's — exactly the structural shape that makes per-CB GPU-side overhead a load-bearing cost. Sanity-check arithmetic: 340 ms wall delta / (236 − 6) = 230 extra CBs → 1.48 ms / extra CB; plausible if M5 Max CB-boundary cost is ≈ 1–2 ms (kernel launch + scheduler reset + cache flush). **M3 is RULED OUT to leading order**; **M1 and/or M2 is the most likely mechanism.**
+
+**Caveats — load-bearing.** (1) xctrace `metal-gpu-execution-points` are NOT per-shader-dispatch counts — schema column inspection (channel-id, function, gpu-submission-id, slot-id, note) confirms these are GPU-side sub-CB phases, mid-granularity between per-CB and per-dispatch. The 3.81× ratio is "GPU work units scheduled at this granularity"; M3 ruleout is "to leading order," not absolute. (2) The same xctrace schema-visibility asymmetry that 0a.1 documented applies — llama.cpp's outer compute-encoder may pack many inner dispatches xctrace's per-process schemas do not enumerate, so the true dispatch ratio could be closer to 1× than 3.81× (which would make the M1/M2 verdict STRONGER, not weaker). (3) M1 vs M2 cannot be split on this seat without ALU/stall counters; both fit the data.
+
+**Verdict: M1 and/or M2 (per-CB-boundary GPU-side cost) — D3 PROCEEDS with reframed acceptance.** The 39.3× CB asymmetry is the load-bearing cost shape. CB consolidation is the right lever.
+
+**D3 acceptance reframe (replaces existing AC-P1 if 0a.4 verdict accepted):**
+- **AC-P1 reframe:** reduce hf2q's xctrace CB submission count from 236 → ≤ 30 (a 7.9× reduction; matches the ratio-of-ratios headroom). Expected wall reduction at 1.48 ms/CB ≈ 300 ms — sufficient to close most of the 340 ms in-process gap.
+- **AC-P1 ship-gate (replaces ≥ 80 ms wall-reduction target):** hf2q chunk-engaged pp4096 in-process prefill ≤ 1230 ms (within ± 50 ms of llama.cpp 1186 ms).
+- If post-D3 measurement falls short (e.g. only ~100 ms saved going from 236 → 30 CBs), the residual ≈ 240 ms is M2-shaped (per-CB occupancy ramp inherent to GPU pipelining) and ADR-015 kernel work re-opens to harden each consolidated kernel against ramp losses.
+
+**Phase 0b authorization status: AUTHORIZED to proceed under reframed AC-P1.** The hf2q-vs-llama gap mechanism is now narrowed enough that D3 work has a defined ship-gate. **Recommended parallel work — operator-driven Xcode Instruments GUI capture (1 cold trial each side) with Counter Set = Apple GPU Performance** to definitively split M1 from M2; this informs whether kernel-level work is needed alongside CB consolidation, but does NOT block Phase 0b.
+
+**Receipts:** `/tmp/cfa-adr019-phase0a4/results.md`, six preserved `.trace` bundles (3 hf2q + 3 llama, ~50–75 MB each), `/opt/hf2q/scripts/adr019-phase0a4-perf-counters.sh` (capture script), `/tmp/cfa-adr019-phase0a4/analyze.py` (parser/analyzer), per-trial `*.exec-points.xml` and `*.cb-submissions.xml` exports, `/tmp/cfa-adr019-phase0a4/results-table.md` (analyzer output).
+
 ### Phase 0b — EncoderSession abstraction (PREREQUISITE)
 
 **Scope:** Lift the existing `CommandEncoder` to a `CommandEncoder + EncoderSession` pair. `EncoderSession` owns:
