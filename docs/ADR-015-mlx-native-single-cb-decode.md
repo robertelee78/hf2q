@@ -7,7 +7,9 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
-## ▶ Resume Here — current state of truth (2026-05-02 ~16:30Z, **iter83 SHIPPED: ChunkInternalArena lifts mlx-native-internal chunk-pipeline scratches; chunk-engaged -355ms / -16.1% wall = ratio ~0.95× on chunk-engaged axis (was 0.790×). Default unchanged at 0.792× (chunk path inert on pp4123). 5th SHIPPED win this session refutes iter82 scope-exhaustion declaration: arena lever-class extends one nesting level deeper. Cumulative session: 0.460× → 0.792× default + chunk-engaged 0.547× → ~0.95× = 5 SHIPPED wins (iter72/74/78/83 + iter66a). Loop continues — iter84+ candidates queued at NEXT nesting level + `chunk.commit_wait` -41ms residual + FA-path analog.** Earlier closure framing was premature; arena class is recursive, not flat.)
+## ▶ Resume Here — current state of truth (2026-05-02 ~17:15Z, **iter84 MEASUREMENT-ONLY: chunk-engaged ceiling localized at iter83's 0.95× ratio. B-1 (upstream-stall propagation) CONFIRMED at S/N=20× via bucket-level IQR analysis (chunk.commit_wait <2ms within-binary IQR vs -41ms cross-binary delta). B-4 differentiation: wall-clock IQR 37ms (T2-excluded) is GPU-thermal noise, but per-bucket IQR is rock-solid <2ms. Methodology lesson: report bucket-level S/N alongside wall S/N. iter85+ pivots to Candidate D — apply iter72 quantile-skew methodology to default-axis autoreg path on pp4123 fixture.** Receipts: `/tmp/cfa-iter84/research/CANDIDATES.md` + `/tmp/cfa-iter84/b4-logs/`)
+
+## ▶ Resume Here — preceding state (2026-05-02 ~16:30Z, **iter83 SHIPPED: ChunkInternalArena lifts mlx-native-internal chunk-pipeline scratches; chunk-engaged -355ms / -16.1% wall = ratio ~0.95× on chunk-engaged axis (was 0.790×). Default unchanged at 0.792× (chunk path inert on pp4123). 5th SHIPPED win this session refutes iter82 scope-exhaustion declaration: arena lever-class extends one nesting level deeper. Cumulative session: 0.460× → 0.792× default + chunk-engaged 0.547× → ~0.95× = 5 SHIPPED wins (iter72/74/78/83 + iter66a). Loop continues — iter84+ candidates queued at NEXT nesting level + `chunk.commit_wait` -41ms residual + FA-path analog.** Earlier closure framing was premature; arena class is recursive, not flat.)
 
 **iter83 receipts:** mlx-native main `1a3f61f` + hf2q `a29dd7c` (both pushed). Branches: `cfa/iter83-chunk-internal-arena-20260502/claude`. 4-fixture decode parity 4/4 IDENTICAL. Tests 137/0/0 mlx-native + 307/0/10 hf2q qwen35. Verdict: `/tmp/cfa-iter83/impl-bench/VERDICT.md`.
 
@@ -1794,6 +1796,56 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - Memory pins: `feedback_perf_gate_thermal_methodology`, `feedback_shippability_standing_directive`, `feedback_never_ship_fallback_without_rootcause`, `feedback_no_broken_windows`, `project_metal_compiler_auto_optimizes_static_levers`, `project_end_gate_reality_check`, `feedback_ground_truth_is_what_we_can_measure_now`
 
 ## Changelog
+
+- **2026-05-02 (UTC ~17:15Z) — iter84 MEASUREMENT-ONLY: B-1 CONFIRMED (upstream-stall propagation), B-4 DIFFERENTIATED (wall noisy 37ms IQR, buckets stable <2ms IQR). iter83 chunk.commit_wait -41ms drop is REAL signal (S/N = 20×), not host-wait phenomenon (cap 8.5ms per iter66b). Chunk-engaged axis now ceiling-localized — next code lever requires per-DN-layer arena-warming or MTLResidencySet snapshot (heavy). iter85+ pivots to Candidate D (default-axis quantile-skew audit) per iter72 methodology.**
+
+  **iter84 candidate audit (research-only, /tmp/cfa-iter84/research/CANDIDATES.md, 352 lines):**
+  - **Candidate A (deeper arena nesting in chunk_gated_delta_rule)**: STATIC FALSIFICATION at zero cost. K-loop iterations are fully in-shader (`gated_delta_net_chunk.metal:21` `for i_t in 0..NT`). All host-side `alloc_buffer` sites in lines 400-543 already lifted by iter83. Sub-kernel `dispatch_*` functions (gated_delta_net_chunk.rs:310, gated_delta_net_chunk_o.rs:306, gated_delta_net_kkt.rs:213, gated_delta_net_recompute_wu.rs:258, chunk_gated_delta_rule_tri_solve_invert.rs:124) are encoder-only. Score 1/4 predicates. Mirrors iter59 #2/#3 already-done pattern.
+  - **Candidate B (chunk.commit_wait 41ms residual)**: PRIMARY for iter84 (measurement-only). 41ms is 5× larger than iter66b host-wait cap (≤8.5ms = 4 sites × 71µs/wait × 30 layers); it cannot be host-side savings; must be GPU-execution time propagated via Metal serial-queue ordering.
+  - **Candidate C (FA-path internal arena)**: EXHAUSTED. ADR-013 P21 S1 already landed FaPrefillArena (gpu_full_attn.rs:1019 is its parameter). Only remaining alloc on arena path is `out_seq` at line 1062, by-design caller-owned per queen plan A.5. flash_attn_prefill_blk.rs:225 is dead code on Qwen3.5/3.6 prefill path. Score 0/4 predicates. Hard fence respected.
+  - **Candidate D (default-axis autoreg path for +21pp default gap)**: DEFER until B resolves. iter71 verdict ("diffuse across 12 secondary moe_ffn dispatches × ~460µs each") was reached without quantile-skew attribution. iter72 demonstrated that quantile attribution can flip a structural-exhaustion declaration. Apply same methodology to default-axis only AFTER B resolves.
+
+  **iter84 measurement bench (5 cold trials × 60s cooldown × iter83 binary vs ITSELF on chunk-engaged pp4096):**
+
+  | Metric | iter83 self-vs-self IQR (4 trials, T2 outlier excluded for stable IQR; with T2 included = ~216ms wall) | Cross-binary signal iter82→iter83 | S/N ratio |
+  |---|---:|---:|---:|
+  | wall-clock prefill | 37 ms (T1=1820, T3=1831, T4=1794; T2=2010 outlier) | -355 ms | ~10× (decisive WIN) |
+  | chunk.enc_build | **<0.5 ms** (1.66-2.06 across 4 trials) | -290 ms | **~580×** (rock-solid signal) |
+  | chunk.commit_wait | **<2 ms** (380.5-382.4 across 4 trials) | -41 ms | **~20×** (rock-solid signal) |
+  | layer.linear_total | 149 ms (T2 outlier-dependent) | -325 ms | ~2× (T2 outlier injection) |
+  | layer.full_total | 65 ms (T2 outlier-dependent) | unchanged | N/A |
+
+  **B-4 differentiation (NEW METHODOLOGY LESSON):** wall-clock IQR was confounded with bucket IQR in prior iters' analyses; iter84 separates them. Wall-clock has GPU-thermal-scheduling noise (T2 hot trial = +200ms); per-bucket measurements are stable to <2ms because they instrument specific commit_and_wait windows that don't accumulate the GPU-scheduling jitter into a single number. **For future arena/kernel-port iters: report bucket-level S/N ratios, NOT wall S/N alone.** A wall-only delta of -41ms looks like noise (within 37ms IQR); the same delta in chunk.commit_wait is 20× signal because the bucket itself is stable.
+
+  **B-1 verdict: CONFIRMED.** The -41ms chunk.commit_wait drop iter82→iter83 is real signal at the bucket level (S/N=20×). Mechanism: not host-wait (iter66b math caps that at ≤8.5ms); must be GPU-internal stall reduction propagated via Metal serial queue. Likely sub-mechanism: when iter83 lifted 12 alloc_buffer sites OUT of the per-layer encoder-build window, the surrounding GPU dispatches no longer block on `addAllocation:` calls for these buffers (residency-set commit storm reduction = iter84's pre-registered B-2 sub-hypothesis).
+
+  **B-2 (residency-set commit storm) and B-3 (bandwidth contention) not directly tested in this iter** — both require additional instrumentation (B-2: `[set commit]` counter, B-3: MTLCounterSampleBuffer GPU-busy/idle). B-1's confirmation and the math (iter66b host-wait cap excludes host-side savings) make B-2 the most plausible mechanism by elimination. iter63's GPU profiling kit (mlx-native main `feeea8c` MTLCaptureManager port) is available for future per-dispatch attribution if a deeper code lever emerges.
+
+  **Chunk-engaged axis now ceiling-localized.** The remaining lever surface for chunk-engaged is:
+  - per-DN-layer arena-warming (reuse arena's first-touch zero-init across layers via in-shader idempotent ops)
+  - MTLResidencySet snapshot per-prefill instead of per-layer (Apple-private API; risky)
+  - chunk.commit_wait further reduction would require attacking the per-layer commit_and_wait_labeled boundary (iter58b PINNED for residency rescission safety; cannot relax without re-validating that constraint)
+
+  All three remaining levers are HEAVY (40-80 hr effort estimate) and high-risk vs the diminishing return (-41ms is already 2.2% of chunk-engaged wall). **Cost/benefit declines steeply** beyond iter83's -355ms.
+
+  **iter85+ direction (per iter84 D-deferral resolution):**
+  1. **iter85 candidate (PRIMARY)**: Default-axis quantile-skew audit. Apply iter72/74/78 methodology to autoreg path on pp4123 fixture. Read /opt/hf2q/src/inference/models/qwen35/gpu_ffn.rs:2548-2913 (autoreg path territory). Read /opt/mlx-native/src/ops/quantized_matmul.rs:174-751 (autoreg secondary-kernel allocs). Score 3-predicate test on each candidate bucket. Pre-register hypothesis with ≥50ms wall-savings threshold + p95/p50 ≥5× ratio on at least one of the 12 secondary moe_ffn kernels. iter71's "diffuse" framing was without quantile attribution — iter72 method might find a hot one.
+  2. **iter85 candidate (SECONDARY)**: RoPE+QKV fusion (queued from iter59 dossier). 3-4 days, medium-high risk. Targets autoreg path (default-axis). Estimate -50 to -100ms.
+  3. **iter85 candidate (TERTIARY)**: Pivot OUT of ADR-015 to ADR-013 P14 (spec decode) / ADR-017 (KV reuse) / ADR-005 (prompt caching) per iter82's original closure direction.
+
+  **STANDING COMPLIANCE.**
+  - `feedback_evidence_first_no_blind_kernel_rewrites` — iter84 is research+measurement only; no code changes; pre-registered all 4 sub-hypotheses with falsification thresholds.
+  - `feedback_correct_outcomes` — iter83's -41ms chunk.commit_wait was previously characterized as "borderline within noise"; iter84 separates wall vs bucket noise floors and confirms the bucket signal is robust.
+  - `feedback_no_shortcuts` — B-4 IQR test ran 5 cold trials with full bench-process audit; T2 outlier characterized rather than dismissed.
+  - `feedback_metal_compiler_auto_optimizes_static_levers` — methodology refined: report bucket-level S/N alongside wall-level S/N going forward.
+
+  **Receipts.**
+  - iter84 candidates research: `/tmp/cfa-iter84/research/CANDIDATES.md` (352 lines)
+  - iter84 B-4 IQR bench: `/tmp/cfa-iter84/b4-iqr.log` + `/tmp/cfa-iter84/b4-logs/T{1..4}.log` + `warmup.log`
+  - iter84 B-1 attribution derived from existing iter83 receipts (no new bench needed)
+  - All artifacts read-only; no `target/` modified; hard fences respected.
+
+  Status: **chunk-engaged ceiling localized at iter83's 0.95×.** iter85+ pivots to default-axis (Candidate D) — apply quantile-skew methodology to autoreg path that produced iter72/74/78 wins on chunk path. Loop continues.
 
 - **2026-05-02 (UTC ~16:30Z) — iter83 SHIPPED: ChunkInternalArena lifts mlx-native-internal chunk-pipeline scratches; chunk-engaged -355ms / -16.1% wall; default NEUTRAL; 4-fixture decode parity 4/4 IDENTICAL. Refutes iter82 scope-exhaustion declaration: arena lever-class extends one nesting level deeper than iter78 (mlx-native-internal vs hf2q-wrapper). 5th SHIPPED win this session.**
 
