@@ -2395,7 +2395,24 @@ fn worker_run(
                         &params,
                         registration.as_ref(),
                     ),
-                    LoadedModel::Qwen35(_) => qwen35_not_implemented_err(),
+                    // ADR-005 Phase 4 Wedge-4a (2026-05-01): closes the
+                    // last `qwen35_not_implemented_err()` call site —
+                    // vision-aware generate now routes through
+                    // `Qwen35Model::forward_gpu_last_logits_with_soft_tokens`
+                    // via `engine_qwen35::generate_qwen35_once_with_soft_tokens`.
+                    // Wedge-4a opens the soft-token API for Qwen3.5/3.6
+                    // GGUFs without adding a vision encoder; Wedge-4b
+                    // lands the qwen3vl ViT + qwen3vl_merger projector
+                    // + DeepStack taps next.
+                    LoadedModel::Qwen35(q) => {
+                        super::engine_qwen35::generate_qwen35_once_with_soft_tokens(
+                            q,
+                            &prompt_tokens,
+                            &injections,
+                            &params,
+                            registration.as_ref(),
+                        )
+                    }
                 };
                 let _ = reply.send(result);
             }

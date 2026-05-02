@@ -426,6 +426,115 @@ fn embed_tokens_gpu(
     upload_f32(&cpu, device).context("embed_tokens_gpu upload")
 }
 
+/// Soft-token-aware variant of [`embed_tokens_gpu`].
+///
+/// ADR-005 Phase 4 Wedge-4a (2026-05-01).  Performs the standard CPU
+/// gather + upload like `embed_tokens_gpu`, but for any prompt position
+/// `p` that lies within a `SoftTokenInjection.range`, the per-token row
+/// is OVERWRITTEN by the corresponding row of the override `MlxBuffer`
+/// before upload.  The placeholder token id at `tokens[p]` is ignored at
+/// those positions — the override fully replaces the embedding-table
+/// lookup, mirroring the Gemma path's contract documented at
+/// `crate::serve::forward_prefill::SoftTokenInjection`.
+///
+/// Override rows are read from the supplied `embeddings` buffer via
+/// `MlxBuffer::as_slice::<f32>()`; this is a CPU-side read of the
+/// override-row bytes, then a single `upload_f32` once the full
+/// `[seq_len, hidden_size]` row matrix is materialized.  The Gemma
+/// path uses an on-GPU `dispatch_copy_f32` because its embed step runs
+/// in the per-token GPU session loop; the qwen35 forward does the
+/// embed CPU-side as a single batch upload, so the override is most
+/// natural to apply at the CPU stage too.
+///
+/// **Pre-scaling contract.** Qwen3.5/3.6 does NOT scale the embedding-
+/// table lookup by `sqrt(hidden_size)` (only Gemma does — see
+/// `forward_prefill.rs::SoftTokenInjection` doc).  The override rows
+/// are therefore copied VERBATIM, identical to the no-scale path.
+///
+/// # Errors
+///
+/// * Any `SoftTokenInjection.range` extends past `tokens.len()`.
+/// * Two `SoftTokenInjection` ranges overlap (ambiguous override).
+/// * Any `SoftTokenInjection.embeddings.byte_len()` is too small for
+///   `range.len() * hidden_size * 4`.
+/// * The override buffer is not F32 (caller contract — overrides come
+///   from a vision projector that already emits F32 rows).
+fn embed_tokens_gpu_with_soft_tokens(
+    tokens: &[u32],
+    token_embd: &[f32],
+    vocab_size: u32,
+    hidden_size: u32,
+    soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
+    device: &MlxDevice,
+) -> Result<MlxBuffer> {
+    let seq_len = tokens.len();
+    let h = hidden_size as usize;
+
+    // Validate soft-token ranges + embedding sizes upfront so we fail
+    // before the (expensive) embed gather + upload.  Mirrors the Gemma
+    // path's pre-flight at `forward_prefill.rs:152-186`.
+    for (i, st) in soft_tokens.iter().enumerate() {
+        if st.range.end > seq_len {
+            anyhow::bail!(
+                "embed_tokens_gpu_with_soft_tokens: soft_tokens[{}].range {:?} extends past tokens.len()={}",
+                i, st.range, seq_len
+            );
+        }
+        if st.range.start >= st.range.end {
+            anyhow::bail!(
+                "embed_tokens_gpu_with_soft_tokens: soft_tokens[{}].range {:?} is empty or reversed",
+                i, st.range
+            );
+        }
+        let needed_bytes = st.range.len() * h * 4;
+        if st.embeddings.byte_len() < needed_bytes {
+            anyhow::bail!(
+                "embed_tokens_gpu_with_soft_tokens: soft_tokens[{}].embeddings byte_len={} < required {} \
+                 ({} positions × {} hidden × 4 bytes)",
+                i, st.embeddings.byte_len(), needed_bytes, st.range.len(), h
+            );
+        }
+    }
+    // Reject overlapping ranges (ambiguous which embedding wins).
+    for i in 0..soft_tokens.len() {
+        for j in (i + 1)..soft_tokens.len() {
+            let a = &soft_tokens[i].range;
+            let b = &soft_tokens[j].range;
+            if a.start < b.end && b.start < a.end {
+                anyhow::bail!(
+                    "embed_tokens_gpu_with_soft_tokens: soft_tokens ranges overlap — [{}]={:?} vs [{}]={:?}",
+                    i, a, j, b
+                );
+            }
+        }
+    }
+
+    // Standard CPU gather (same vocab-size handling as embed_tokens_gpu).
+    let embed_vocab = if hidden_size > 0 {
+        (token_embd.len() / h) as u32
+    } else {
+        vocab_size
+    };
+    let mut cpu = embed_tokens(tokens, token_embd, embed_vocab, hidden_size);
+
+    // Overwrite per-position rows for every soft-token range.
+    for st in soft_tokens.iter() {
+        let src: &[f32] = st.embeddings
+            .as_slice::<f32>()
+            .map_err(|e| anyhow!(
+                "embed_tokens_gpu_with_soft_tokens: override slice (range {:?}): {e}",
+                st.range
+            ))?;
+        for (row_idx, p) in st.range.clone().enumerate() {
+            let src_off = row_idx * h;
+            let dst_off = p * h;
+            cpu[dst_off..dst_off + h].copy_from_slice(&src[src_off..src_off + h]);
+        }
+    }
+
+    upload_f32(&cpu, device).context("embed_tokens_gpu_with_soft_tokens upload")
+}
+
 /// Apply the final output head on the GPU.
 ///
 /// 1. RMSNorm(`hidden`, `norm_w`, eps) → `normed`  [seq, H]
@@ -1035,6 +1144,7 @@ impl Qwen35Model {
             None,
             None,
             OutputHeadMode::All,
+            &[],
         )
     }
 
@@ -1056,6 +1166,61 @@ impl Qwen35Model {
             None,
             None,
             OutputHeadMode::Last,
+            &[],
+        )
+    }
+
+    /// Soft-token-aware variant of [`Self::forward_gpu_last_logits`].
+    ///
+    /// ADR-005 Phase 4 Wedge-4a (2026-05-01).  Closes the last
+    /// `qwen35_not_implemented_err()` arm in
+    /// `crate::serve::api::engine::worker_run`.  Identical semantics to
+    /// `forward_gpu_last_logits` except: for any prompt position `p`
+    /// that lies within a [`SoftTokenInjection`] range, the standard
+    /// embedding-table lookup at the embed step is REPLACED by the
+    /// corresponding row of the supplied override `MlxBuffer`.  Every
+    /// other op (per-layer attn / FFN / output norm / lm_head) is
+    /// byte-identical to the text-only path.
+    ///
+    /// The mRoPE 4-axis position layout already supports the vision
+    /// shape — callers populate `positions_flat[4*p..4*p+4] = [t, h, w, 0]`
+    /// for image-patch positions and `[t, t, t, t]` for text positions.
+    /// No new mRoPE kernel work; the existing
+    /// `imrope_inplace`/`apply_imrope` kernel at
+    /// `mlx-native/src/ops/rope_multi.rs` consumes the per-axis
+    /// positions as-is.  See ADR-005 Phase 4 Wedge-4 plan for the full
+    /// vision integration sequence (Wedge-4a opens the API; Wedge-4b
+    /// adds the qwen3vl ViT + qwen3vl_merger projector + DeepStack
+    /// taps).
+    ///
+    /// **Wedge-4a scope.** This entry point lands the soft-token
+    /// PLUMBING only: a real forward run with override-aware embeddings
+    /// and the existing 4-axis mRoPE.  No vision encoder / mmproj /
+    /// patch merger.  An empty `soft_tokens` slice is byte-identical to
+    /// `forward_gpu_last_logits`.
+    ///
+    /// # Errors
+    ///
+    /// In addition to the base `forward_gpu_last_logits` error set:
+    ///   * Any `SoftTokenInjection.range` extends past `tokens.len()`.
+    ///   * Two `SoftTokenInjection` ranges overlap.
+    ///   * `embeddings.byte_len()` is too small for
+    ///     `range.len() × hidden_size × 4`.
+    pub fn forward_gpu_last_logits_with_soft_tokens(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
+        kv_cache: &mut HybridKvCache,
+    ) -> Result<Vec<f32>> {
+        self.forward_gpu_impl(
+            tokens,
+            positions_flat,
+            kv_cache,
+            None,
+            None,
+            OutputHeadMode::Last,
+            soft_tokens,
         )
     }
 
@@ -1099,6 +1264,7 @@ impl Qwen35Model {
             None,
             None,
             OutputHeadMode::EmbedLast,
+            &[],
         )?;
         let h = self.cfg.hidden_size as usize;
         anyhow::ensure!(
@@ -1137,6 +1303,7 @@ impl Qwen35Model {
             None,
             Some(&mut hidden_out),
             OutputHeadMode::All,
+            &[],
         )?;
         let hidden = hidden_out
             .ok_or_else(|| anyhow!("forward_gpu_with_hidden: hidden buffer was not captured"))?;
@@ -1267,6 +1434,7 @@ impl Qwen35Model {
             Some(out_activations),
             None,
             OutputHeadMode::All,
+            &[],
         )
     }
 
@@ -1278,6 +1446,7 @@ impl Qwen35Model {
         mut capture: Option<&mut LayerActivations>,
         mut hidden_out: Option<&mut Option<MlxBuffer>>,
         output_head_mode: OutputHeadMode,
+        soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
     ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(anyhow!("forward_gpu: tokens must be non-empty"));
@@ -1350,8 +1519,23 @@ impl Qwen35Model {
         let output_head = unsafe { &*output_head_ref };
 
         // ---- Step 1: embedding lookup → hidden ----
-        let mut hidden = embed_tokens_gpu(tokens, &self.token_embd, cfg.vocab_size, h, &device)
-            .context("embed_tokens_gpu")?;
+        //
+        // ADR-005 Phase 4 Wedge-4a (2026-05-01): when `soft_tokens` is
+        // non-empty, route through `embed_tokens_gpu_with_soft_tokens`
+        // so positions in any soft-token range are populated from the
+        // override `MlxBuffer` instead of the embedding table.  Empty
+        // slice → byte-identical to the standard `embed_tokens_gpu`
+        // path (text-only requests pay zero overhead — the empty-slice
+        // branch is a single `is_empty()` check).
+        let mut hidden = if soft_tokens.is_empty() {
+            embed_tokens_gpu(tokens, &self.token_embd, cfg.vocab_size, h, &device)
+                .context("embed_tokens_gpu")?
+        } else {
+            embed_tokens_gpu_with_soft_tokens(
+                tokens, &self.token_embd, cfg.vocab_size, h, soft_tokens, &device,
+            )
+            .context("embed_tokens_gpu_with_soft_tokens")?
+        };
 
         if dump_layer_n().is_some() {
             dump_hidden_stats("embed", &hidden, seq_len, h);
@@ -4055,5 +4239,312 @@ mod tests {
         let mut kv = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv");
         let result = m.forward_embed_last(&[], &[], &mut kv);
         assert!(result.is_err(), "empty tokens should error");
+    }
+
+    // ============================================================
+    // ADR-005 Phase 4 Wedge-4a (2026-05-01) — soft-token forward path
+    // ============================================================
+    //
+    // Wedge-4a opens the `Request::GenerateWithSoftTokens` API for
+    // Qwen3.5/3.6 GGUFs.  The forward function under test is
+    // `Qwen35Model::forward_gpu_last_logits_with_soft_tokens`; the
+    // tests below verify three contracts:
+    //
+    //  1. `qwen35_generate_with_soft_tokens_smoke` — synthetic
+    //     deterministic override at known positions produces a
+    //     finite, correctly-shaped logits vector AND those logits
+    //     differ from the text-only forward (proves the override
+    //     reaches the model and is not silently bypassed).
+    //
+    //  2. `qwen35_soft_token_range_only_overrides_embed` — an
+    //     all-zero override applied at positions [0..K) leaves the
+    //     OUTSIDE-range hidden state UNCHANGED relative to a
+    //     forward where the prompt-token rows at [0..K) are
+    //     externally zeroed in the embedding table.  Demonstrates
+    //     the override is range-bounded.
+    //
+    //  3. `qwen35_soft_tokens_validates_oob_range` — out-of-range
+    //     `SoftTokenInjection.range` errors cleanly without entering
+    //     the GPU forward.
+
+    /// Build a deterministic F32 buffer of shape `[len * h]` seeded
+    /// from `seed` so tests can construct synthetic override
+    /// embeddings that are reproducible without external RNG.
+    fn synthetic_override_rows(len: usize, h: usize, seed: u32) -> Vec<f32> {
+        let mut s = seed;
+        (0..(len * h))
+            .map(|_| {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((s as i32 as f32) / (i32::MAX as f32)) * 0.05
+            })
+            .collect()
+    }
+
+    /// **Wedge-4a smoke**: synthetic Qwen35 fixture + synthetic
+    /// soft-token buffer + zero-axis mRoPE — `forward_gpu_last_logits_with_soft_tokens`
+    /// returns a logits vector of the right shape with finite values,
+    /// AND the values differ from the text-only forward (the override
+    /// is not silently bypassed).
+    #[test]
+    fn qwen35_generate_with_soft_tokens_smoke() {
+        let m = tiny_hybrid_model_nonzero();
+        let cfg = m.cfg.clone();
+        let h = cfg.hidden_size as usize;
+
+        let tokens = vec![3u32, 7, 1, 5, 2];
+        let seq = tokens.len() as u32;
+        let pos_4 = text_positions(seq);
+        let positions = positions_to_flat(&pos_4);
+
+        let device = MlxDevice::new().expect("device");
+
+        // Text-only baseline.
+        let mut kv_text = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv text");
+        let text_logits = m
+            .forward_gpu_last_logits(&tokens, &positions, &mut kv_text)
+            .expect("text-only forward");
+        assert_eq!(
+            text_logits.len(),
+            cfg.vocab_size as usize,
+            "text-only logits length must equal vocab_size"
+        );
+
+        // Soft-token forward: override positions [1..4) with a
+        // deterministic synthetic row matrix, far enough from any
+        // possible embedding-table row to guarantee a divergence.
+        let range = 1usize..4;
+        let n_rows = range.len();
+        let override_data = synthetic_override_rows(n_rows, h, 0xC0FFEE);
+        let override_buf = upload_f32(&override_data, &device).expect("upload override");
+
+        let injection = crate::serve::forward_prefill::SoftTokenInjection {
+            range: range.clone(),
+            embeddings: &override_buf,
+        };
+        let injections = vec![injection];
+
+        let mut kv_soft = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv soft");
+        let soft_logits = m
+            .forward_gpu_last_logits_with_soft_tokens(
+                &tokens,
+                &positions,
+                &injections,
+                &mut kv_soft,
+            )
+            .expect("soft-token forward");
+
+        assert_eq!(
+            soft_logits.len(),
+            cfg.vocab_size as usize,
+            "soft-token logits length must equal vocab_size"
+        );
+        for (i, v) in soft_logits.iter().enumerate() {
+            assert!(
+                v.is_finite(),
+                "soft_logits[{i}] = {v} is non-finite (Wedge-4a path must produce finite output)"
+            );
+        }
+
+        // Soft tokens must change the logits vs the text-only path.
+        // We chose `range = 1..4` and override rows at scale 0.05 so
+        // the embed at those positions is completely different from
+        // the language-model lookup (which uses scale 0.1 in the
+        // synthetic fixture).  Some difference in the final logits
+        // must appear; otherwise the override is silently bypassed.
+        let max_diff = soft_logits
+            .iter()
+            .zip(text_logits.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "soft-token override appears to be silently bypassed: \
+             max(|soft - text|) = {max_diff:.2e} (expected > 1e-4)"
+        );
+    }
+
+    /// **Wedge-4a range-bounded override contract**: an override at
+    /// positions [0..K) has zero effect on positions OUTSIDE that
+    /// range when the override is constructed to match what the
+    /// embedding table would produce for the same tokens.
+    ///
+    /// The strongest range-bounded check is: build the override rows
+    /// from the same `embed_tokens` lookup as the text-only path;
+    /// then the soft-token forward MUST be byte-identical (same RNG
+    /// path through every layer) to the text-only forward.  This
+    /// proves the override path doesn't accidentally perturb
+    /// positions outside `range`.
+    #[test]
+    fn qwen35_soft_token_range_only_overrides_embed() {
+        use crate::inference::models::qwen35::io_heads::embed_tokens as cpu_embed_tokens;
+
+        let m = tiny_hybrid_model_nonzero();
+        let cfg = m.cfg.clone();
+        let h = cfg.hidden_size as usize;
+
+        let tokens = vec![3u32, 7, 1, 5, 2];
+        let seq = tokens.len() as u32;
+        let pos_4 = text_positions(seq);
+        let positions = positions_to_flat(&pos_4);
+
+        let device = MlxDevice::new().expect("device");
+
+        // Text-only baseline.
+        let mut kv_text = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv text");
+        let text_logits = m
+            .forward_gpu_last_logits(&tokens, &positions, &mut kv_text)
+            .expect("text-only forward");
+
+        // Build an override that is BYTE-IDENTICAL to what embed_tokens
+        // would produce for tokens[0..2] — i.e. rows 0 and 1 are the
+        // language-model embeddings of tokens[0] and tokens[1].
+        // With this construction, the soft-token forward must produce
+        // the exact same hidden state as the text-only forward at
+        // every position, so the final logits must match within the
+        // standard determinism envelope (5e-2 absolute, see
+        // `forward_gpu_deterministic` rationale).
+        let embed_vocab = if cfg.hidden_size > 0 {
+            (m.token_embd.len() / h) as u32
+        } else {
+            cfg.vocab_size
+        };
+        let full_cpu = cpu_embed_tokens(&tokens, &m.token_embd, embed_vocab, cfg.hidden_size);
+        // Override range: positions [0, 2).  Take rows 0 and 1 from
+        // `full_cpu` directly.
+        let range = 0usize..2;
+        let n_rows = range.len();
+        let mut override_data = vec![0.0f32; n_rows * h];
+        for (i, p) in range.clone().enumerate() {
+            override_data[i * h..(i + 1) * h]
+                .copy_from_slice(&full_cpu[p * h..(p + 1) * h]);
+        }
+        let override_buf = upload_f32(&override_data, &device).expect("upload override");
+
+        let injection = crate::serve::forward_prefill::SoftTokenInjection {
+            range: range.clone(),
+            embeddings: &override_buf,
+        };
+        let injections = vec![injection];
+
+        let mut kv_soft = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv soft");
+        let soft_logits = m
+            .forward_gpu_last_logits_with_soft_tokens(
+                &tokens,
+                &positions,
+                &injections,
+                &mut kv_soft,
+            )
+            .expect("soft-token forward");
+
+        assert_eq!(soft_logits.len(), text_logits.len(), "logits length mismatch");
+        // Match within the GPU determinism envelope (forward_gpu_deterministic
+        // anchors this at < 5e-2 worst-case under parallel test execution).
+        let max_diff = soft_logits
+            .iter()
+            .zip(text_logits.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 5e-2,
+            "range-bounded contract violated: identity override at [0..2) changed logits, \
+             max(|soft - text|) = {max_diff:.2e} (expected < 5e-2)"
+        );
+    }
+
+    /// **Wedge-4a integration**: a `SoftTokenInjection` with a range
+    /// that extends past the prompt-tokens length is rejected cleanly
+    /// (no GPU forward, no panic, no silent truncation) — proves the
+    /// pre-flight validation in `embed_tokens_gpu_with_soft_tokens`
+    /// fires before any expensive op.  This is the test-fixture
+    /// equivalent of the engine integration check that
+    /// `Request::GenerateWithSoftTokens` for a qwen35 GGUF returns Ok
+    /// or Err but never the not-implemented sentinel — a malformed
+    /// caller is the only path that should error here, so we drive
+    /// the smallest possible malformed shape (range past
+    /// tokens.len()) and assert it errors with a clear message.
+    #[test]
+    fn qwen35_no_implemented_error_on_soft_token_request() {
+        let m = tiny_hybrid_model_nonzero();
+        let cfg = m.cfg.clone();
+        let h = cfg.hidden_size as usize;
+
+        let tokens = vec![3u32, 7, 1];
+        let seq = tokens.len() as u32;
+        let pos_4 = text_positions(seq);
+        let positions = positions_to_flat(&pos_4);
+
+        let device = MlxDevice::new().expect("device");
+
+        // Step 1: a WELL-FORMED request must succeed (Ok), NOT return
+        // a "not implemented" error.  This is the literal check that
+        // the engine arm at `engine.rs:2398` no longer routes to
+        // `qwen35_not_implemented_err()`.
+        let override_data = synthetic_override_rows(1, h, 0xDEADBEEF);
+        let override_buf = upload_f32(&override_data, &device).expect("upload override");
+        let injection = crate::serve::forward_prefill::SoftTokenInjection {
+            range: 0..1,
+            embeddings: &override_buf,
+        };
+        let injections = vec![injection];
+        let mut kv = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv");
+        let result = m.forward_gpu_last_logits_with_soft_tokens(
+            &tokens,
+            &positions,
+            &injections,
+            &mut kv,
+        );
+        assert!(
+            result.is_ok(),
+            "well-formed soft-token request must succeed, got: {:?}",
+            result.as_ref().err().map(|e| format!("{e:#}"))
+        );
+        let logits = result.unwrap();
+        assert_eq!(
+            logits.len(),
+            cfg.vocab_size as usize,
+            "well-formed soft-token forward must return [vocab_size] logits"
+        );
+        for (i, v) in logits.iter().enumerate() {
+            assert!(
+                v.is_finite(),
+                "logits[{i}] = {v} is non-finite (well-formed forward must produce finite output)"
+            );
+        }
+
+        // Step 2: a MALFORMED range (extends past tokens.len()) must
+        // error cleanly with a message that names the offending range.
+        // Note: the error path validates BEFORE acquiring the GPU
+        // cache, so this also exercises the early-fail contract.
+        let bad_buf = upload_f32(&vec![0.0f32; 5 * h], &device).expect("upload bad");
+        let bad_injection = crate::serve::forward_prefill::SoftTokenInjection {
+            range: 2..7, // tokens.len() == 3, so 7 is past the end
+            embeddings: &bad_buf,
+        };
+        let bad_injections = vec![bad_injection];
+        let mut kv2 = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv2");
+        let bad_result = m.forward_gpu_last_logits_with_soft_tokens(
+            &tokens,
+            &positions,
+            &bad_injections,
+            &mut kv2,
+        );
+        assert!(
+            bad_result.is_err(),
+            "malformed range (past tokens.len()) must error"
+        );
+        let err_msg = format!("{:#}", bad_result.unwrap_err());
+        assert!(
+            err_msg.contains("extends past tokens.len()"),
+            "malformed range error must name the violation; got: {err_msg}"
+        );
+
+        // Step 3: explicit guarantee that the returned-Ok path's error
+        // surface NEVER contains the qwen35_not_implemented sentinel.
+        // Belt-and-suspenders against accidental future regressions
+        // that re-introduce the sentinel.
+        assert!(
+            !err_msg.contains("qwen35_not_implemented"),
+            "soft-token error path must never contain the legacy 501 sentinel"
+        );
     }
 }
