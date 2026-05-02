@@ -308,20 +308,39 @@ pub(crate) const FALLBACK_GEMMA4_API_CHAT_TEMPLATE: &str = concat!(
 ///   2. CLI `--chat-template-file FILE`
 ///   3. GGUF `tokenizer.chat_template` metadata
 ///   4. Hardcoded fallback string (last resort)
+/// Resolve the `enable_thinking` value to pass to the chat-template Jinja
+/// context from the CLI's mutually-exclusive `--enable-thinking` /
+/// `--no-thinking` flags. Default (neither flag set) is `Some(false)`.
+///
+/// **Why default = `Some(false)`** (2026-05-02 user-regression follow-up):
+/// the initial commit `8c110f5` defaulted to `None`, but user retest showed
+/// the regression "stops after thinking prior to full response" was still
+/// firing on the default cmdline. With `None` the qwen3-chatml.jinja `else`
+/// branch fires, the prompt ends with `<think>\n`, non-thinking checkpoints
+/// improvise a `<|end|>` close marker (Phi-3-style) the substring stop
+/// catches, and the user sees thinking content + no answer. `Some(false)`
+/// makes the jinja emit a pre-closed `<think>\n\n</think>\n\n` block that
+/// cues ANY checkpoint — thinking-capable or not — directly into the
+/// answer. Users who want a Qwen3-thinking checkpoint's reasoning trace
+/// opt in via `--enable-thinking`.
+///
+/// Clap enforces mutual exclusion via `conflicts_with`, so the
+/// (true, true) input is unreachable in practice; we still cover it
+/// defensively to keep the function total.
+fn resolve_enable_thinking(args: &cli::GenerateArgs) -> Option<bool> {
+    if args.enable_thinking {
+        Some(true)
+    } else {
+        Some(false)
+    }
+}
+
 fn render_chat_template(
     gguf: &mlx_native::gguf::GgufFile,
     args: &cli::GenerateArgs,
     user_prompt: &str,
 ) -> Result<String> {
-    // Resolve `enable_thinking`: `--enable-thinking` → Some(true),
-    // `--no-thinking` → Some(false), neither → None (Jinja sees the
-    // variable as undefined; most templates' `else` branch fires).
-    // Mutual exclusion is enforced by clap (`conflicts_with` on `no_thinking`).
-    let enable_thinking = match (args.enable_thinking, args.no_thinking) {
-        (true, _) => Some(true),
-        (_, true) => Some(false),
-        _ => None,
-    };
+    let enable_thinking = resolve_enable_thinking(args);
 
     // Priority 1: CLI --chat-template string
     if let Some(tmpl) = args.chat_template.as_deref() {
@@ -3434,10 +3453,11 @@ fn cmd_parity_capture(
 mod tests {
     use super::{
         detect_greedy_repetition_loop, find_special_token_stop, maybe_print_serve_banner,
-        render_jinja_template, should_enable_kv_persist, FALLBACK_GEMMA4_API_CHAT_TEMPLATE,
-        FALLBACK_GEMMA4_CHAT_TEMPLATE,
+        render_jinja_template, resolve_enable_thinking, should_enable_kv_persist,
+        FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
     use crate::backends::chat_templates::QWEN3_CHATML;
+    use crate::cli;
     use crate::serve::load_info::{
         ArchFamily, ChatTemplateSource, LoadInfo, TokenizerSource,
     };
@@ -4000,11 +4020,18 @@ mod tests {
 
     #[test]
     fn render_jinja_qwen3_chatml_enable_thinking_none_treats_as_undefined_else_branch() {
-        // Legacy behavior preservation: when neither --enable-thinking nor
-        // --no-thinking is passed, the resolved value is None. Jinja sees the
-        // variable as undefined; `enable_thinking is defined and ... is false`
-        // evaluates false; the `else` branch fires. This test pins that
-        // None ≡ Some(true) for the qwen3-chatml template (both fire `else`).
+        // Property pin: when callers pass None to render_jinja_template
+        // directly (e.g. an internal API path that hasn't been updated to
+        // resolve the default), Jinja sees the variable as undefined. The
+        // `enable_thinking is defined and ... is false` guard fails; the
+        // `else` branch fires; output matches Some(true).
+        //
+        // NOTE: `render_chat_template` no longer EVER passes None — the
+        // 2026-05-02 user-regression follow-up changed the default
+        // resolution to Some(false). This test pins the LOWER-LEVEL helper
+        // semantics (None == undefined Jinja var) so future callers know
+        // what the contract is, even though the upper-level CLI path
+        // doesn't exercise None anymore.
         let rendered_none = render_jinja_template(QWEN3_CHATML, "make me candy", None)
             .expect("qwen3-chatml render with None must succeed");
         let rendered_true = render_jinja_template(QWEN3_CHATML, "make me candy", Some(true))
@@ -4014,7 +4041,90 @@ mod tests {
             "with the qwen3-chatml template, None must render byte-identically \
              to Some(true) — the `is defined and is false` guard fails for both. \
              A divergence here means minijinja serialized None as a non-undefined \
-             value, breaking the legacy default behavior."
+             value, which would break the lower-level helper contract."
+        );
+    }
+
+    /// Build a default `GenerateArgs` for testing the resolution helper.
+    /// The `Default` derive isn't on the struct (clap derives don't include
+    /// Default), so we construct one manually here.
+    fn test_args_default() -> cli::GenerateArgs {
+        cli::GenerateArgs {
+            model: std::path::PathBuf::from("/dev/null"),
+            prompt: None,
+            prompt_file: None,
+            tokenizer: None,
+            config: None,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            max_tokens: 1,
+            chat_template: None,
+            chat_template_file: None,
+            benchmark: false,
+            speculative: false,
+            enable_thinking: false,
+            no_thinking: false,
+        }
+    }
+
+    #[test]
+    fn resolve_enable_thinking_default_is_some_false_post_regression_followup() {
+        // 2026-05-02 user re-tested after commit 8c110f5 (plumb-only) and
+        // the "stops after thinking prior to full response" regression was
+        // still firing on the default cmdline. This test pins the FIX:
+        // default resolution must be Some(false) so the jinja emits a
+        // pre-closed `<think>\n\n</think>\n\n` block, cuing the model
+        // (thinking-capable or not) directly into the answer.
+        let args = test_args_default();
+        assert_eq!(resolve_enable_thinking(&args), Some(false));
+    }
+
+    #[test]
+    fn resolve_enable_thinking_explicit_enable_returns_some_true() {
+        let mut args = test_args_default();
+        args.enable_thinking = true;
+        assert_eq!(resolve_enable_thinking(&args), Some(true));
+    }
+
+    #[test]
+    fn resolve_enable_thinking_explicit_no_thinking_returns_some_false() {
+        // `--no-thinking` is currently equivalent to the default; this
+        // test pins the contract so a future change that splits the two
+        // (e.g. None vs Some(false) divergence) fails loud.
+        let mut args = test_args_default();
+        args.no_thinking = true;
+        assert_eq!(resolve_enable_thinking(&args), Some(false));
+    }
+
+    #[test]
+    fn user_candy_regression_default_renders_pre_closed_think_block_e2e() {
+        // The smoking-gun end-to-end test for the 2026-05-02 user-reported
+        // "stops after thinking prior to full response" regression. With
+        // default args (no flag), the rendered prompt MUST end with
+        // `<|im_start|>assistant\n<think>\n\n</think>\n\n` so that:
+        //   (a) thinking-capable Qwen3-thinking checkpoints see the think
+        //       block as already-closed and skip directly to the answer,
+        //   (b) non-thinking Qwen-arch checkpoints (the user's case) don't
+        //       have to improvise a close marker — there's nothing to close.
+        //
+        // FALSIFICATION: if a future change reverts to `None` default or
+        // `Some(true)` default, the rendered tail will become `<think>\n`
+        // and the user's bug class re-opens. This test fails IMMEDIATELY
+        // at PR time instead of at the operator's terminal.
+        let args = test_args_default();
+        let resolved = resolve_enable_thinking(&args);
+        let rendered = render_jinja_template(QWEN3_CHATML, "make me candy", resolved)
+            .expect("default render must succeed");
+        assert!(
+            rendered.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "default-cmdline render MUST end with pre-closed think block. \
+             Actual tail: `{}`. \
+             If you intentionally changed the default, also update \
+             `resolve_enable_thinking_default_is_some_false_post_regression_followup` \
+             with a pointer to the new design rationale.",
+            &rendered[rendered.len().saturating_sub(80)..]
         );
     }
 

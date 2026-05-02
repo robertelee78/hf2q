@@ -530,24 +530,29 @@ pub struct GenerateArgs {
     /// template's Jinja context. For Qwen3-thinking checkpoints, this opens an
     /// unfilled `<think>\n` block at the end of the rendered prompt and the
     /// model is expected to emit reasoning content + `</think>` before the
-    /// answer. Default behavior (neither flag set) leaves `enable_thinking`
-    /// undefined, which most templates treat as "thinking enabled" via their
-    /// `else` branch — see `qwen3-chatml.jinja:147-153`. Pass `--no-thinking`
-    /// to explicitly disable thinking mode for non-thinking checkpoints
-    /// (the template emits a closed `<think>\n\n</think>\n\n` block, cuing
-    /// the model to skip directly to the answer). Mutually exclusive.
+    /// answer.
     ///
-    /// 2026-05-02: added after the H2 audit
-    /// (`docs/research/decode-test-gap-2026-05-02.md`) found that
-    /// `render_jinja_template` was passing zero per-request flags into the
-    /// Jinja context — the upstream cause of the candy-prompt
-    /// hallucinated-`<|end|>` regression on a non-thinking checkpoint.
+    /// **Default behavior (NEITHER flag set) is `enable_thinking=false`** —
+    /// the jinja template emits a pre-closed `<think>\n\n</think>\n\n` block,
+    /// cuing ANY checkpoint (thinking-capable or not) directly into the
+    /// answer. This is the safe default after the 2026-05-02 regression where
+    /// non-thinking Qwen-arch GGUFs given an unclosed `<think>\n` prompt
+    /// improvised Phi-3-style `<|end|>` close markers and produced no answer.
+    /// Pass this flag explicitly to opt into a true Qwen3-thinking checkpoint's
+    /// `<think>...reasoning...</think>` reasoning trace. `--no-thinking` is
+    /// equivalent to the default and exists for explicitness/scripting.
+    /// Mutually exclusive with `--no-thinking`.
+    ///
+    /// 2026-05-02: added (commit `8c110f5`, plumb-only) and re-defaulted to
+    /// false (user-reported regression follow-up). H2 audit:
+    /// `docs/research/decode-test-gap-2026-05-02.md`.
     #[arg(long)]
     pub enable_thinking: bool,
 
-    /// Disable thinking-mode rendering: pass `enable_thinking=false` to the
-    /// chat template's Jinja context. See `--enable-thinking` for the full
-    /// rationale. Mutually exclusive with `--enable-thinking`.
+    /// Disable thinking-mode rendering. Equivalent to the default behavior
+    /// (no flag); exists for explicitness in shell scripts. See
+    /// `--enable-thinking` for the full rationale. Mutually exclusive with
+    /// `--enable-thinking`.
     #[arg(long, conflicts_with = "enable_thinking")]
     pub no_thinking: bool,
 
