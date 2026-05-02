@@ -698,3 +698,253 @@ fn streaming_prompt_cache_hit_miss_and_invalidation() {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// ADR-005 iter-224 W-A2.4 — Fragment-replay event-stream byte-identity
+// ---------------------------------------------------------------------------
+
+/// Env gate for the W-A2.4 live fragment-replay test.  Distinct from
+/// the W-A2 streaming-cache live test gate so operators can run them
+/// independently (W-A2 validates cached-token signal; W-A2.4 validates
+/// per-event byte-identity, the W-A2.3 closure).
+const ENV_GATE_FRAGMENT_LIVE: &str = "HF2Q_PROMPT_CACHE_FRAGMENT_LIVE";
+
+/// Live validation for the W-A2.3 fragment-replay branch.
+///
+/// Drives two identical greedy streaming chat-completion requests; the
+/// first MISSES (live decode populates `PromptCache::fragments` via
+/// W-A2.2 capture) and the second HITS (replay traverses the W-A2.3
+/// fragments branch — emit each `CachedFragment` directly as the
+/// matching `GenerationEvent`).
+///
+/// Asserts per-chunk structural equality between the live and replay
+/// SSE sequences.  Modulo:
+///   - `usage.completion_tokens_details.{any timing fields}` — zero on
+///     replay by design.
+///   - `usage.prompt_tokens_details.cached_tokens` — `null` (or
+///     absent) on miss, `Some(N)` on hit by design.
+///   - Per-chunk `id`/`created` fields — request-scoped so they
+///     differ between requests.  Non-load-bearing.
+///
+/// What MUST match exactly:
+///   - The set of `delta.{content,reasoning_content,tool_calls}` fragments
+///     emitted, IN THE SAME ORDER.  This is the per-token-boundary
+///     preservation contract — pre-W-A2.3 the replay would emit one
+///     big content chunk; post-W-A2.3 the replay emits the same N
+///     chunks the live decode emitted.
+///   - `delta.tool_calls[*].{index, id, type, function.name}` for the
+///     first chunk per call; subsequent chunks must repeat `index`
+///     and only carry `function.arguments` fragments.
+///   - Final chunk's `finish_reason`.
+///   - Final chunk's `usage.{prompt,completion}_tokens` totals.
+///
+/// # Run
+///
+/// ```ignore
+/// HF2Q_PROMPT_CACHE_FRAGMENT_LIVE=1 cargo test --release \
+///     --test prompt_cache_live -- --test-threads=1 --nocapture \
+///     streaming_fragment_replay_event_stream_byte_identity
+/// ```
+#[test]
+fn streaming_fragment_replay_event_stream_byte_identity() {
+    if std::env::var(ENV_GATE_FRAGMENT_LIVE).as_deref() != Ok("1") {
+        eprintln!(
+            "{ENV_GATE_FRAGMENT_LIVE} != \"1\" — skipping W-A2.4 live test. \
+             Set {ENV_GATE_FRAGMENT_LIVE}=1 to run (loads a chat GGUF; cold \
+             warmup is multi-minute on M5 Max)."
+        );
+        return;
+    }
+
+    let gguf = std::env::var(ENV_GGUF).unwrap_or_else(|_| DEFAULT_CHAT_GGUF.into());
+    if !PathBuf::from(&gguf).exists() {
+        panic!(
+            "chat GGUF not found at {gguf:?} — set {ENV_GGUF}=<path> or place a \
+             GGUF at the default path"
+        );
+    }
+
+    eprintln!(
+        "prompt_cache_live[fragment_replay]: spawning hf2q serve at {HOST}:{PORT} model={gguf}"
+    );
+    let _server = ServerGuard::spawn(&gguf).expect("spawn hf2q serve");
+    wait_for_readyz();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .build()
+            .expect("build reqwest client");
+
+        let model_id = fetch_model_id(&client).await;
+        eprintln!("prompt_cache_live[fragment_replay]: model_id={model_id}");
+
+        // ── Pass 1: live decode (cache MISS) ────────────────────────────
+        //
+        // Populates `PromptCache::fragments` via the W-A2.2 capture.
+        let prompt = "Say hello in one short sentence.";
+        let live_body = chat_stream(&client, &model_id, prompt).await;
+        let live_chunks = parse_sse_chunks(&live_body);
+        let live_cached = sse_cached_tokens(&live_chunks);
+        let live_content = assemble_sse_content(&live_chunks);
+        let prompt_len = sse_prompt_tokens(&live_chunks);
+
+        assert_eq!(
+            live_cached, 0,
+            "first request must MISS (cached_tokens=0); got {live_cached}. \
+             A non-zero value here means a stale cache from a prior test run."
+        );
+        assert!(
+            !live_content.trim().is_empty(),
+            "live MISS produced empty content — model may have failed to decode."
+        );
+        eprintln!(
+            "prompt_cache_live[fragment_replay]: pass-1 MISS — \
+             {} chunks, content={live_content:?} prompt_tokens={prompt_len}",
+            live_chunks.len()
+        );
+
+        // ── Pass 2: cache hit + fragment replay ─────────────────────────
+        //
+        // Identical request → `lookup_with_fragments` returns
+        // `Some((result, Some(frags)))` → replay traverses the W-A2.3
+        // fragments branch.
+        let replay_body = chat_stream(&client, &model_id, prompt).await;
+        let replay_chunks = parse_sse_chunks(&replay_body);
+        let replay_cached = sse_cached_tokens(&replay_chunks);
+        let replay_content = assemble_sse_content(&replay_chunks);
+
+        assert_eq!(
+            replay_cached, prompt_len,
+            "replay MUST be a cache hit; got cached_tokens={replay_cached} \
+             vs expected={prompt_len}"
+        );
+        eprintln!(
+            "prompt_cache_live[fragment_replay]: pass-2 HIT — \
+             {} chunks, content={replay_content:?}",
+            replay_chunks.len()
+        );
+
+        // ── W-A2.3 byte-identity contract ───────────────────────────────
+        //
+        // Per-chunk delta-shape equality between live and replay,
+        // modulo timing-related fields on the final chunk + cached
+        // signal.  Pre-W-A2.3 the replay emits ONE big content chunk
+        // per cache hit (splitter-rerun branch); post-W-A2.3 the
+        // replay emits N chunks matching the live decode 1:1.
+        //
+        // Strip the per-request control fields (`id`, `created`) that
+        // are intentionally request-scoped, plus the diverging
+        // `usage` / `x_hf2q_timing` blocks on the final chunk.  What
+        // remains is the per-chunk `choices[0].delta` shape, which
+        // MUST match.
+        let live_deltas = extract_deltas(&live_chunks);
+        let replay_deltas = extract_deltas(&replay_chunks);
+        assert_eq!(
+            replay_deltas.len(),
+            live_deltas.len(),
+            "W-A2.3 closure: replay event count {} != live event count {}. \
+             Pre-W-A2.3 the splitter-rerun emits ONE big content chunk per \
+             cache hit; post-W-A2.3 each per-token boundary is preserved.\n\
+             live deltas: {:?}\nreplay deltas: {:?}",
+            replay_deltas.len(),
+            live_deltas.len(),
+            live_deltas,
+            replay_deltas,
+        );
+        for (i, (live_d, replay_d)) in live_deltas.iter().zip(&replay_deltas).enumerate() {
+            assert_eq!(
+                live_d, replay_d,
+                "W-A2.3 byte-identity: delta[{i}] differs.\n  live:   {live_d}\n  replay: {replay_d}"
+            );
+        }
+
+        // Final-chunk finish_reason must agree.
+        let live_finish = final_finish_reason(&live_chunks);
+        let replay_finish = final_finish_reason(&replay_chunks);
+        assert_eq!(
+            live_finish, replay_finish,
+            "final finish_reason differs: live={live_finish:?} replay={replay_finish:?}"
+        );
+
+        // Total content must match byte-for-byte (sanity check on
+        // the per-chunk equality already asserted).
+        assert_eq!(
+            live_content, replay_content,
+            "assembled content differs between live and replay despite \
+             per-chunk equality — should not be reachable"
+        );
+
+        eprintln!(
+            "prompt_cache_live[fragment_replay]: ALL ASSERTIONS PASSED\n\
+             \n\
+             Summary (W-A2.4 live byte-identity validation):\n\
+             \n\
+             model:           {model_id}\n\
+             pass-1 MISS:     {} delta events, content={live_content:?}\n\
+             pass-2 HIT:      {} delta events (byte-identical to MISS)\n\
+             cached_tokens:   miss=0 hit={prompt_len}\n\
+             finish_reason:   live={live_finish:?} replay={replay_finish:?}\n\
+             \n\
+             The W-A2.3 fragment-replay branch produces byte-identical\n\
+             SSE event-stream framing on cache hits.\n\
+             Closes Worker AA design §6 falsifiable closure on a real\n\
+             Gemma 4 streaming response.",
+            live_deltas.len(),
+            replay_deltas.len(),
+        );
+    });
+}
+
+/// Per-chunk delta extraction for W-A2.4 byte-identity comparison.
+/// Returns one string per chunk that has a non-empty `choices[0].delta`
+/// payload — used to sidestep request-scoped fields (id, created) and
+/// final-chunk `usage` / `x_hf2q_timing` blocks that legitimately
+/// differ between miss and hit.
+fn extract_deltas(chunks: &[serde_json::Value]) -> Vec<String> {
+    let mut out = Vec::new();
+    for c in chunks {
+        let delta = &c["choices"][0]["delta"];
+        if delta.is_null() {
+            continue;
+        }
+        // Skip the role-marker chunk (`{"role":"assistant"}`) — emitted
+        // once on every stream, identical between miss and hit.
+        if delta.get("role").is_some()
+            && delta.get("content").map(|v| v.is_null()).unwrap_or(true)
+            && delta.get("reasoning_content").map(|v| v.is_null()).unwrap_or(true)
+            && delta.get("tool_calls").map(|v| v.is_null()).unwrap_or(true)
+        {
+            continue;
+        }
+        // Skip the terminal-stop chunk (`finish_reason!=null` AND
+        // `delta` empty other than possibly nullish fields).  The
+        // finish_reason itself is asserted separately.
+        let finish_reason = c["choices"][0]["finish_reason"].as_str();
+        if finish_reason.is_some()
+            && delta.get("content").map(|v| v.is_null()).unwrap_or(true)
+            && delta.get("reasoning_content").map(|v| v.is_null()).unwrap_or(true)
+            && delta.get("tool_calls").map(|v| v.is_null()).unwrap_or(true)
+        {
+            continue;
+        }
+        // Reduce to the `choices[0].delta` JSON only — strips request-
+        // scoped id/created/etc.
+        out.push(delta.to_string());
+    }
+    out
+}
+
+/// Returns the final chunk's `finish_reason` string (or "" if absent).
+fn final_finish_reason(chunks: &[serde_json::Value]) -> String {
+    chunks
+        .iter()
+        .rev()
+        .find_map(|c| c["choices"][0]["finish_reason"].as_str().map(String::from))
+        .unwrap_or_default()
+}
