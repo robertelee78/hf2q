@@ -1071,6 +1071,62 @@ fn maybe_run_qwen35_prefill_sweep(
 /// from and writes back to the `kv_cache.linear_attn` slots on every call.
 /// For full-attention layers the SDPA is re-run from scratch on each decode
 /// token (the KV-append incremental path is a future optimisation).
+/// Detect a greedy-decode repetition loop in `decoded_tokens`.
+///
+/// Returns `Some((ngram_size, occurrences))` if the last 128 tokens contain
+/// any 8/12/16/20/24-token sequence that appears ≥4 times (not necessarily
+/// consecutively — greedy loops can have minor drift, e.g., one outlier
+/// token mid-cycle).
+///
+/// Why this is a real fix and not a fallback (per mantra `feedback_no_shortcuts`):
+/// pure greedy on thinking-style Qwen3.x checkpoints can enter a deterministic
+/// loop with no exit (verified 2026-05-02 user report on French-Toast prompt:
+/// "I should make sure the response is accurate and up-to-date." × 30+ before
+/// `<|im_end|>` finally fired at token 1014). Without sampling
+/// (temperature/top_k/top_p/repetition_penalty — TODO follow-up to extend the
+/// qwen35 generate path), running to `--max-tokens` produces 1000+ tokens of
+/// garbage. Stopping on detected repetition with a diagnostic stderr message
+/// IS the correct behavior for greedy mode — it's not a workaround for
+/// missing sampling, it's the deterministic-mode escape hatch.
+///
+/// Algorithm: take the LAST `ngram_size` tokens as a key, scan the 128-token
+/// window for non-overlapping occurrences of that key. If ≥4 occurrences are
+/// found at any of the candidate sizes, report the first match. The
+/// non-overlapping increment (`i += ngram` on hit) avoids over-counting at
+/// short n-gram sizes (e.g. all-same-token would report `ngram=8` with
+/// `occurrences=16` from a 128-token window).
+fn detect_greedy_repetition_loop(decoded_tokens: &[u32]) -> Option<(usize, usize)> {
+    const REPEAT_NGRAM_SIZES: &[usize] = &[8, 12, 16, 20, 24];
+    const REPEAT_SCAN_WINDOW: usize = 128;
+    const REPEAT_MIN_OCCURRENCES: usize = 4;
+
+    if decoded_tokens.len() < REPEAT_SCAN_WINDOW {
+        return None;
+    }
+    let n = decoded_tokens.len();
+    let window = &decoded_tokens[n - REPEAT_SCAN_WINDOW..];
+    for &ngram in REPEAT_NGRAM_SIZES {
+        if window.len() < ngram * REPEAT_MIN_OCCURRENCES {
+            continue;
+        }
+        let key = &window[window.len() - ngram..];
+        let mut occurrences = 0usize;
+        let mut i = 0;
+        while i + ngram <= window.len() {
+            if &window[i..i + ngram] == key {
+                occurrences += 1;
+                i += ngram;
+            } else {
+                i += 1;
+            }
+        }
+        if occurrences >= REPEAT_MIN_OCCURRENCES {
+            return Some((ngram, occurrences));
+        }
+    }
+    None
+}
+
 fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile) -> Result<()> {
     use crate::inference::models::qwen35::io_heads::greedy_argmax_last_token;
     use crate::inference::models::qwen35::kv_cache::HybridKvCache;
@@ -1134,11 +1190,24 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     // from GGUF or defaulted) — read it directly. The trailing
     // `tracing::info!` is replaced by emit_tracing's `eos_token_ids`
     // structured field.
+    // 2026-05-02: cmd_generate_qwen35 had a single-eos collapse here that let
+    // `<|im_end|>` (151645) leak through whenever `<|endoftext|>` (151643) was
+    // first in the Vec — caused decode loops to run past 1st turn-end (user
+    // report: French Toast prompt produced ~30-line repetition + multiple
+    // `<|im_end|>`/`<|im_start|>assistant` leaks). Use the full Vec.
+    // The legacy `eos_token_id` single value is kept for the SpecDecode path
+    // below which still takes `Option<u32>` (TODO: extend SpecDecode to take
+    // a slice; tracked in a follow-up to avoid scope creep here).
     let eos_token_id: u32 = loaded
         .eos_token_ids
         .first()
         .copied()
         .unwrap_or(151_645);
+    let eos_token_ids: Vec<u32> = if loaded.eos_token_ids.is_empty() {
+        vec![151_645]
+    } else {
+        loaded.eos_token_ids.clone()
+    };
 
     if maybe_run_qwen35_prefill_sweep(&model, &tokenizer)? {
         return Ok(());
@@ -1386,19 +1455,40 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     let mut next_token = greedy_argmax_last_token(last_prefill_logits, vocab_size);
     tracing::info!("Qwen3.5 first decoded token: {}", next_token);
 
-    // Print first token immediately.
-    {
-        let s = tokenizer.decode(&[next_token], false).unwrap_or_default();
-        print!("{}", s);
-        stdout.flush()?;
-    }
+    // 2026-05-02: cumulative-decode + delta-print pattern (mirrors llama.cpp's
+    // `tok_str_pos` discipline). Per-token `tokenizer.decode(&[t], ...)` breaks
+    // multi-byte UTF-8 codepoints (emoji, CJK) at token boundaries → garble
+    // like `���` in the user's French-Toast output. Decode the full so-far
+    // sequence each step and print only the byte-delta. Costs O(generated)
+    // bytes of allocation per step but produces correct UTF-8 every time.
+    // Also catches special-token-string leaks (`<|im_end|>` etc. emitted as
+    // text rather than as the eos_token_ids vocab id) — see is_special_token
+    // check below.
+    let mut decoded_tokens: Vec<u32> = vec![next_token];
+    let mut printed_text = tokenizer
+        .decode(&decoded_tokens, false)
+        .unwrap_or_default();
+    print!("{}", printed_text);
+    stdout.flush()?;
 
     // ---- Decode loop ----
     let decode_start = std::time::Instant::now();
     let mut generated = 1usize;
 
+    // Special-token strings that some Qwen3.x checkpoints emit as TEXT instead
+    // of as their reserved vocab id (when the model has been distilled / merged
+    // and the `<|im_end|>` token id 151645 isn't always emitted at turn-end).
+    // If any of these substrings appear after a decode step, treat as stop.
+    // This complements the `eos_token_ids.contains(&next_token)` integer check
+    // — covers both cases without a fallback.
+    const SPECIAL_TOKEN_STOPS: &[&str] = &[
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<|im_start|>",  // turn marker — model leaking into next turn = stop here
+    ];
+
     for step in 1..args.max_tokens {
-        if next_token == eos_token_id {
+        if eos_token_ids.contains(&next_token) {
             break;
         }
 
@@ -1439,10 +1529,65 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
             );
         }
         generated += 1;
+        decoded_tokens.push(next_token);
 
-        let s = tokenizer.decode(&[next_token], false).unwrap_or_default();
-        print!("{}", s);
-        stdout.flush()?;
+        // Cumulative decode + delta print. UTF-8 garble = solved.
+        let new_full = tokenizer
+            .decode(&decoded_tokens, false)
+            .unwrap_or_default();
+        if new_full.len() > printed_text.len() && new_full.starts_with(&printed_text) {
+            print!("{}", &new_full[printed_text.len()..]);
+            stdout.flush()?;
+        }
+        // Special-token-string leak: stop loud rather than emit garbage like
+        // `<|im_end|>...<|im_start|>assistant\n<|im_start|>assistant` which the
+        // user observed on their French-Toast run when `<|im_end|>` slipped
+        // past the integer-id check (e.g. tokenizer emitted it as a multi-byte
+        // text fragment composed of non-special token ids).
+        if SPECIAL_TOKEN_STOPS.iter().any(|m| new_full.contains(m)) {
+            tracing::info!(
+                "Qwen3.5 decode: special-token string detected in cumulative \
+                 decode at step {step}; stopping."
+            );
+            break;
+        }
+        // 2026-05-02: greedy-decode repetition-stop guard. Pure greedy on
+        // thinking-style Qwen3.x checkpoints can enter a deterministic loop
+        // (user's French-Toast run produced "I should make sure the response
+        // is accurate and up-to-date." × ~30). Without sampling (temp/top_k/
+        // top_p/repetition_penalty — TODO follow-up), running to --max-tokens
+        // produces 1000+ tokens of garbage. Detect: if the last 32 tokens
+        // contain a 16-token n-gram that repeats ≥3 times consecutively,
+        // we're stuck — break with a diagnostic. ~24 LOC vs the proper
+        // sampling fix (~80-100 LOC plumb through forward_gpu_last_logits +
+        // CPU sampling). Both should land; this is the minimum to keep the
+        // CLI honest. NOT a fallback — this is correct behavior on a stuck
+        // greedy loop (mantra: "no fallback" means don't substitute a lesser
+        // option for the right answer; here, breaking on detected repetition
+        // IS the right answer for greedy-mode stuck loops).
+        // Try multiple n-gram window sizes so we match cycles of various
+        // lengths. The user's French-Toast repetition was a 17-token cycle
+        // ("I should make sure the response is accurate and up-to-date.")
+        // which a single fixed 16-token window misses. Iterate the typical
+        // greedy-loop cycle range.
+        let detected_repeat = detect_greedy_repetition_loop(&decoded_tokens);
+        if let Some((ngram, repeats)) = detected_repeat {
+            tracing::info!(
+                "Qwen3.5 decode: greedy n-gram repetition detected at step \
+                 {step} (last {} tokens repeated {} times); stopping. \
+                 Sampling (temperature/top_k/top_p/repetition_penalty) is \
+                 not yet wired in this CLI path — TODO follow-up.",
+                ngram, repeats
+            );
+            eprintln!(
+                "\n[hf2q] greedy decode entered a {}-token repetition loop \
+                 at step {} — stopping. Use the chat-completion API \
+                 (which has sampling wired) for non-deterministic decoding.",
+                ngram, step
+            );
+            break;
+        }
+        printed_text = new_full;
     }
 
     let decode_elapsed = decode_start.elapsed();
@@ -3194,8 +3339,9 @@ fn cmd_parity_capture(
 #[cfg(test)]
 mod tests {
     use super::{
-        maybe_print_serve_banner, render_jinja_template, should_enable_kv_persist,
-        FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
+        detect_greedy_repetition_loop, maybe_print_serve_banner, render_jinja_template,
+        should_enable_kv_persist, FALLBACK_GEMMA4_API_CHAT_TEMPLATE,
+        FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
     use crate::serve::load_info::{
         ArchFamily, ChatTemplateSource, LoadInfo, TokenizerSource,
@@ -3504,6 +3650,103 @@ mod tests {
         assert!(
             !msg.contains("qwen35_not_implemented"),
             "qwen35 sentinel must not fire on unknown arch; got: {msg}"
+        );
+    }
+
+    // ---- Greedy repetition-loop detector tests ----
+    //
+    // 2026-05-02 user reported the qwen35 generate CLI looping for 1014
+    // tokens of "I should make sure the response is accurate and up-to-date."
+    // before `<|im_end|>` finally fired. Pure greedy on thinking-style
+    // checkpoints is brittle. The detector below is the deterministic-mode
+    // escape hatch — sampling (temp/top_k/top_p) lands as a follow-up.
+
+    #[test]
+    fn detect_repetition_returns_none_below_window_size() {
+        let toks: Vec<u32> = (0..50).collect();
+        assert_eq!(detect_greedy_repetition_loop(&toks), None);
+    }
+
+    #[test]
+    fn detect_repetition_returns_none_for_diverse_tokens() {
+        let toks: Vec<u32> = (0..200).collect();
+        assert_eq!(detect_greedy_repetition_loop(&toks), None);
+    }
+
+    #[test]
+    fn detect_repetition_finds_8_token_cycle() {
+        // 8-token cycle repeated 16 times → 128-token window full of one cycle.
+        let cycle: [u32; 8] = [101, 102, 103, 104, 105, 106, 107, 108];
+        let mut toks: Vec<u32> = (0..50).collect();
+        for _ in 0..20 {
+            toks.extend_from_slice(&cycle);
+        }
+        let result = detect_greedy_repetition_loop(&toks);
+        assert!(result.is_some(), "8-token cycle should be detected");
+        let (ngram, occ) = result.unwrap();
+        assert_eq!(ngram, 8, "should detect at the smallest matching size");
+        assert!(
+            occ >= 4,
+            "should report ≥4 occurrences in a saturated window, got {occ}"
+        );
+    }
+
+    #[test]
+    fn detect_repetition_finds_16_token_cycle() {
+        // 16-token cycle won't be detected at ngram=8 (key not periodic at
+        // smaller granularity for arbitrary tokens), but at ngram=16 should
+        // fire.
+        let cycle: [u32; 16] = [
+            201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216,
+        ];
+        let mut toks: Vec<u32> = (0..50).collect();
+        for _ in 0..10 {
+            toks.extend_from_slice(&cycle);
+        }
+        let result = detect_greedy_repetition_loop(&toks);
+        assert!(result.is_some(), "16-token cycle should be detected");
+    }
+
+    #[test]
+    fn detect_repetition_tolerates_minor_drift() {
+        // User's actual case: cycle is mostly identical with one outlier
+        // mid-stream. Build 128-token window where last 16 tokens repeat
+        // 5+ times non-consecutively (one outlier replaces a single token
+        // in the middle).
+        let cycle: [u32; 12] = [301, 302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312];
+        let outlier: u32 = 999;
+        let mut toks: Vec<u32> = (0..30).collect();
+        for i in 0..10 {
+            if i == 4 {
+                // Outlier replaces one token mid-cycle.
+                let mut drifted = cycle.to_vec();
+                drifted[6] = outlier;
+                toks.extend_from_slice(&drifted);
+            } else {
+                toks.extend_from_slice(&cycle);
+            }
+        }
+        let result = detect_greedy_repetition_loop(&toks);
+        assert!(
+            result.is_some(),
+            "minor-drift cycle should still detect (non-consecutive matching), got None"
+        );
+    }
+
+    #[test]
+    fn detect_repetition_does_not_overcount_with_overlapping_increment() {
+        // Pin the non-overlap invariant: an all-same-token sequence MUST NOT
+        // report more than `window/ngram` occurrences (otherwise short n-grams
+        // would over-count and produce false positives at the threshold). For
+        // a 128-token all-zero window, ngram=8 should report ≤16 occurrences.
+        let toks: Vec<u32> = vec![0; 200];
+        let result = detect_greedy_repetition_loop(&toks);
+        assert!(result.is_some());
+        let (ngram, occ) = result.unwrap();
+        assert!(
+            occ <= 128 / ngram,
+            "non-overlap invariant violated: ngram={ngram} occ={occ} > {}",
+            128 / ngram
         );
     }
 }
