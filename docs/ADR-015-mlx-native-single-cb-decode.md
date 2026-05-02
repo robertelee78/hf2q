@@ -7,7 +7,9 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
-## ▶ Resume Here — current state of truth (2026-05-02 ~19:45Z, **iter87 FALSIFIED at zero cost: HALF_MMA_OPT in quantized_matmul_id_ggml::dispatch_id_mm is ALREADY SHIPPED on M5 Max — production tensor variant already uses (half, half, float) homogeneous MMA matching llama.cpp peer. Convergent with iter62-65's "main IS OPTIMAL" finding now reached via 2 independent kernels. Genuine new lever found: iter87b flash_attn_prefill tensor port (~16% of prefill compute; inner matmul still on M1-era simdgroup_multiply_accumulate; iter56 precedent). Estimated 30-100 ms wall savings on default-axis. iter87b research+impl queued.** Receipts: `/tmp/cfa-iter87/research/SCOPE.md` (245 lines).
+## ▶ Resume Here — current state of truth (2026-05-02 ~20:30Z, **iter87b FALSIFIED at zero impl cost: flash_attn_prefill tensor matmul2d port blocked by (1) llama.cpp peer doesn't ship it either — they use simdgroup_multiply_accumulate exclusively in flash_attn (so tensor cores aren't the peer gap mechanism), (2) matmul2d M/N≥16 constraint blocks 8x8x8 fragment decomposition, (3) iter56 precedent doesn't apply to fragment-decomposed kernel. Adjacent lever surfaced: iter87d — (half, half, float) simdgroup-MMA operand precision matching llama.cpp's exact ALU-precision pattern. ~50 LOC, distinct from iter62-65 falsifications. Queued for impl.** Receipts: `/tmp/cfa-iter87b/research/DESIGN.md` + `/tmp/cfa-iter87b/impl-bench/VERDICT.md`.
+
+## ▶ Resume Here — preceding state (2026-05-02 ~19:45Z, **iter87 FALSIFIED at zero cost: HALF_MMA_OPT in quantized_matmul_id_ggml::dispatch_id_mm is ALREADY SHIPPED on M5 Max — production tensor variant already uses (half, half, float) homogeneous MMA matching llama.cpp peer. Convergent with iter62-65's "main IS OPTIMAL" finding now reached via 2 independent kernels. Genuine new lever found: iter87b flash_attn_prefill tensor port (~16% of prefill compute; inner matmul still on M1-era simdgroup_multiply_accumulate; iter56 precedent). Estimated 30-100 ms wall savings on default-axis. iter87b research+impl queued.** Receipts: `/tmp/cfa-iter87/research/SCOPE.md` (245 lines).
 
 ## ▶ Resume Here — preceding state (2026-05-02 ~19:00Z, **iter86 NEUTRAL closes the wrapper-arena class on default-axis (5 NEUTRAL outcomes total). FaProjectionsArena impl is correct + parity-clean + 4/4 fixtures IDENTICAL but wall delta -7ms (slower) because alloc cost was async-overlapped with prior-layer GPU. iter85 predicate #2 prediction CONFIRMED. ADR-015 hf2q-side wrapper optimization scope is DEFINITIVELY EXHAUSTED — 5 SHIPPED + 5 NEUTRAL across iter72-86 with banked methodology. Real ratios from same-day llama-bench: chunk-engaged 0.667× / default 0.842×. iter87+ requires either mlx-native kernel work (Q-2: HALF_MMA_OPT in `quantized_matmul_id_ggml::dispatch_id_mm`) OR pivot to different ADRs (Q-3: ADR-013 P14 / ADR-017 / ADR-005).** Receipts: `/tmp/cfa-iter86/impl-bench/VERDICT.md` + branch `cfa/iter86-fa-projections-arena-20260502/claude` HEAD `4c7b7bc` (DO NOT MERGE; preserved as evidence).)
 
@@ -1812,6 +1814,46 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - Memory pins: `feedback_perf_gate_thermal_methodology`, `feedback_shippability_standing_directive`, `feedback_never_ship_fallback_without_rootcause`, `feedback_no_broken_windows`, `project_metal_compiler_auto_optimizes_static_levers`, `project_end_gate_reality_check`, `feedback_ground_truth_is_what_we_can_measure_now`
 
 ## Changelog
+
+- **2026-05-02 (UTC ~20:30Z) — iter87b FALSIFIED at zero impl cost: tensor matmul2d port of flash_attn_prefill blocked by 3 convergent findings (peer doesn't ship it; matmul2d M/N≥16 multiple constraint blocks 8x8x8 fragment decomposition; iter56 whole-tile precedent doesn't apply to fragment-decomposed kernel). Adjacent lever surfaced — iter87d: simdgroup-MMA operand precision (half, half, float) matching llama.cpp peer's exact pattern. ~50 LOC effort.**
+
+  **iter87b research-only verdict (`/tmp/cfa-iter87b/impl-bench/VERDICT.md`, falsified at design stage):**
+
+  **Finding 1 — Peer reference doesn't ship the proposed optimization.**
+  - `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:5801, 6056-6160` `kernel_flash_attn_ext_impl` uses `simdgroup_multiply_accumulate` exclusively (12+ call sites)
+  - `mpp::tensor_ops::matmul2d` only used in `kernel_mul_mm` and `kernel_mul_mm_id` (lines 9309, 9363, 9802, 9986)
+  - **The peer we trail 18-50% does NOT implement a flash_attn tensor variant** → hardware tensor cores cannot explain the gap
+
+  **Finding 2 — matmul2d constraint blocks fragment-level port.**
+  - `MPPTensorOpsMatMul2dImpl.h:3763-3765` requires "at least one of M or N must be a multiple of 16"
+  - flash_attn_prefill uses 8x8x8 fragment decomposition (`tile_matmad` at flash_attn_prefill.metal:998-1015) — can't map directly
+  - Whole-tile redesign multi-week (online softmax + mask + causal + per-row reduction must all be rewritten against cooperative_tensor's per-thread layout)
+
+  **Finding 3 — iter56 precedent doesn't apply.**
+  - iter56 ported `kernel_mul_mm_q4_0` which was already a whole-tile matmul
+  - flash_attn_prefill is fragment-decomposed because online softmax operates on per-row data via `MMAFrag_t::row_reduce`
+
+  **Adjacent lever (iter87d, distinct from iter87b):**
+  - llama.cpp's `FA_TYPES` macro (ggml-metal.metal:6469-6475) uses `(half, half, float)` `simdgroup_multiply_accumulate` (q8x8_t = `simdgroup_half8x8`)
+  - mlx-native uses `(float, float, float)` because `MMATile<AccumType=float, ...>` makes Q/K fragments `simdgroup_float8x8`
+  - Switching mlx-native to half operand fragments matches peer's ALU-precision pattern
+  - **Distinct hypothesis from iter62-65** (those were tensor matmul2d, not simdgroup-MMA-with-half operands)
+  - ~50 LOC effort. Threshold ≥30 ms wall + 4-fixture decode parity.
+
+  **Hard-fence-aware reroute options:**
+  - **iter87d (RECOMMENDED)**: (half, half, float) simdgroup-MMA operand precision change. ~50 LOC.
+  - iter87a: ADR-015 measurement infra (MTLCounterSampleBuffer + xctrace, partial via iter63 already)
+  - iter87c: ADR-015 P3c.3 multi-iter NAX port (mirrors MLX `steel_attention_nax` b41b349) — multi-week
+  - Pivot OUT to ADR-013 P14 / ADR-017 / ADR-005
+
+  **STANDING COMPLIANCE.**
+  - `feedback_evidence_first_no_blind_kernel_rewrites` — iter87b read source BEFORE coding; falsified at design stage; saved 90-180 min impl + bench.
+  - `feedback_correct_outcomes` — adjacent lever (iter87d) surfaced explicitly rather than silently re-scoping.
+  - `feedback_no_shortcuts` — full peer cross-check completed (12+ call sites in llama.cpp's flash_attn_ext_impl) before recommending NO_IMPL.
+
+  **Receipts.** `/tmp/cfa-iter87b/research/DESIGN.md` + `/tmp/cfa-iter87b/impl-bench/VERDICT.md`.
+
+  Status: flash_attn_prefill tensor matmul2d port FALSIFIED at design stage. iter87d simdgroup-MMA half-operand precision queued as next genuine lever (matches llama.cpp's exact pattern).
 
 - **2026-05-02 (UTC ~19:45Z) — iter87 FALSIFIED at zero cost: HALF_MMA_OPT in `quantized_matmul_id_ggml::dispatch_id_mm` is ALREADY SHIPPED on M5 Max. Pre-registered hypothesis "mlx-native id_mm uses slow mixed-precision MMA" REFUTED by code reads. Genuine new lever found: iter87b — flash_attn_prefill tensor port (~16% of prefill compute, M1-era simdgroup_multiply_accumulate inner matmul). Queued for impl.**
 
