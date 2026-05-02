@@ -442,6 +442,32 @@ Phased, gated, with parity per increment. Each phase ships behind its own env ga
 
 **Acceptance Phase 0a.1:** if any single class accounts for ≥ 70% of the 530 ms residual, that class is the primary D3 lever. If the residual is uniformly distributed, D4 watermark may be a better fit and Phase 0a.2 microprototype becomes load-bearing.
 
+**Measured 2026-05-02 (M5 Max, branch `adr017-iter17-2026-05-01` HEAD `aa9e94f`):** xctrace `Metal System Trace` template, 3 cold trials, 30s cooldown; pre-bench process audit + mid-run snapshots; xctrace-on wall = 1538 ± 6 ms (vs no-xctrace baseline 1534 ± 13 ms; capture overhead within noise). Per-trial CB count = 235 (vs ADR's "~96" estimate; 235 reflects current chunk-engaged production shape).
+
+**Four-bin attribution (3-trial mean ± σ):**
+| Bin | mean ± σ (ms) | % of wall |
+|---|---:|---:|
+| GPU active (CB submission → CB completion union) | **1540.9 ± 7.4** | **99.6%** |
+| GPU pipeline-bubble (window − GPU active) | **6.2 ± 1.5** | **0.4%** |
+| CPU encoder-build (per-CB Encoding interval, *concurrent* with GPU) | 172.9 ± 3.5 | 11.2% conc |
+| Driver commit (sub-duration − encoder-time, *concurrent* with GPU) | 40.0 ± 3.4 | 2.6% conc |
+| Residency-set add+remove (in prefill window) | 0.0 | 0.0% |
+
+**Cross-check vs Phase 0a.3 H3 floor:** PASS. H3 predicted ~13.3 µs/CB pure driver-commit floor; 0a.1 measured per-CB driver-side wall = ~157–190 µs (12× H3 floor; the bin includes ObjC encoder-end + queue-add beyond the pure commit roundtrip). Both numbers internally consistent — H3 is a lower bound, 0a.1 is the full per-CB CPU-side cost.
+
+**Verdict: REQUIRES OPERATOR REVIEW (mixed signal).** Phase 0a.1 measures **the GPU is 99.6% active during the prefill window on current HEAD**; the `wall − GPU` residual is **6 ms (0.4%), not 530 ms**. The CPU encoder-build (173 ms) and driver-commit (40 ms) DO exist but run *concurrently* with GPU exec — collapsing them via D3/D4 cannot reduce wall because the GPU is the long pole and is already saturated.
+
+**Discrepancy with ADR baseline (load-bearing):** ADR-019's "1849 ms hf2q chunk-engaged baseline" was a `llama-bench` total measurement; the 0a.1 measurement is hf2q's in-process `prefill:` window (1538 ms median). The 311 ms difference may be (a) `llama-bench` warmup/multi-iter wrap, (b) measurement-protocol mismatch between in-process `prefill:` and llama-bench end-to-end, or (c) post-iter88a perf landings. Until that gap is reconciled, the 530 ms residual cannot be presumed to live in the prefill forward path.
+
+**Phase 0b authorization status: HOLD.** Recommended next-step (operator):
+1. Re-measure hf2q chunk-engaged pp4096 via the same `llama-bench` protocol that produced the 1849 ms baseline; confirm gap to peer is still ~616 ms.
+2. If the gap persists at ~530 ms encoder/orchestration, expand Phase 0a.1 capture window to cover the FULL hf2q invocation (model-load + warmup + decode), not just `prefill:`. The 530 ms residual likely lives outside the forward-pass window.
+3. If the gap has closed (post-iter88a perf landings already absorbed it), ADR-019 may be obsolete; stand down Phase 0b.
+
+**Independent of step 1-3:** the 530 ms residual **cannot be CPU-encoder-build dominated** (≤ 173 ms total in window) and **cannot be driver-commit dominated** (≤ 40 ms total in window). If it exists at all, it is either outside the prefill window or pure GPU pipeline-bubble (host CPU NOT busy and GPU NOT executing — only realisable via blocking syncs that have no work to do, which is not the case at 99.6% GPU utilization).
+
+**Receipts:** `/tmp/cfa-adr019-phase0a1/results.md`, three preserved `.trace` bundles (~80 MB each), `/opt/hf2q/scripts/adr019-phase0a1-capture-and-bin.sh` (reusable capture script), `four-bin-results.json` (machine-parseable per-trial bins). Capture cmd: `xctrace record --template "Metal System Trace" --target-stdout <log> --launch -- hf2q generate ...`.
+
 **Phase 0a.2 — D4 microprototype falsification gate.** 1-week branch-local prototype implementing MLX PR #1864-style watermark on the FA-path slice (10 FA layers only, not the whole forward). Compare wall-time + per-CB profile against current per-component shape and against D3-projected shape (calculated, not yet built).
 
 **Acceptance Phase 0a.2:** D4 microprototype must show wall reduction ≥ 60 ms above D3-projected on the FA-path slice (= 75% of AC-P1's 80 ms target × FA-path's ~16% of total wall = 9.6 ms minimum; using 60 ms as conservative ceiling) AND no parity regressions on FA-path canary fixture. If D4 fails this gate, D3 ships as planned. If D4 passes, D3 is dropped and D4 becomes new PRIMARY.
@@ -464,6 +490,8 @@ Phased, gated, with parity per increment. Each phase ships behind its own env ga
 **Phase 0a is the gate that authorizes Phase 0b.** If Phase 0a falsifies D3 in favor of D4, the Migration Plan below is rewritten before any structural code lands.
 
 **Sequencing update (post-Phase 0a.2 + 0a.3 research, 2026-05-02):** 0a.3 (microbench) and 0a.2 (design research) both LANDED; both converge on the same finding — the 530 ms `wall − GPU` residual is **NOT driver-commit dominated** (driver floor 13.3 µs/CB × 96 CBs = 1.3 ms = 0.25% of residual). The residual must be encoder-build, residency-flush, or inter-CB pipeline-bubble. **Phase 0a.1 (xctrace operator capture) is now critical-path** — it is the only remaining measurement that can bin the residual to one of those classes and authorize either D3-proceed or D4-revisit. Until 0a.1 lands, Phase 0a.2 microprototype implementation is HELD; Phase 0b EncoderSession is NOT authorized.
+
+**Sequencing update (post-Phase 0a.1 capture, 2026-05-02 evening):** 0a.1 LANDED. Three cold trials on M5 Max apex Q4_0-flat pp4096 chunk-engaged measure **GPU active = 99.6% of prefill window (1541 / 1547 ms); pipeline-bubble = 0.4% (6 ms); CPU encoder-build = 173 ms concurrent; driver-commit = 40 ms concurrent; residency churn = 0 ms**. The four-bin acceptance gate ("any class ≥ 70% of 530 ms residual") is **structurally not satisfiable**: the residual measured is 6 ms, not 530 ms. The 530 ms ADR baseline measured via `llama-bench` differs from the in-process `prefill:` measurement by 311 ms; this gap likely lives **outside** the prefill forward-pass window (model-load, warmup, llama-bench multi-iter wrap, or post-iter88a perf landings). **Phase 0b EncoderSession authorization: HOLD pending operator reconciliation of the 1849 ms vs 1538 ms baseline** — see §Phase 0a.1 Recommended next step (1)–(3). If reconciliation shows the residual lives outside the forward path, ADR-019's scope must be reframed; if it has already closed, ADR-019 may be obsolete.
 
 ### Phase 0b — EncoderSession abstraction (PREREQUISITE)
 
