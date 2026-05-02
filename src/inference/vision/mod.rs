@@ -47,6 +47,7 @@ pub mod preprocess;
 pub mod vit;
 pub mod vit_dump;
 pub mod vit_gpu;
+pub mod vit_gpu_qwen3vl;
 
 #[allow(unused_imports)]
 pub use preprocess::{preprocess_rgb_chw, PreprocessConfig, GEMMA4_VISION_CONFIG};
