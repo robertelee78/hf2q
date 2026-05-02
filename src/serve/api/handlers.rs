@@ -2245,6 +2245,29 @@ fn process_multimodal_content(
                     source_label,
                 }));
             }
+            ArchProfile::Qwen3VlSiglip => {
+                // iter-224 Wedge-4b: parse-time mmproj header + projector +
+                // DeepStack tensor enumeration are wired here, but the
+                // runtime ViT forward + Qwen3-VL-specific preprocessor
+                // (patch_size=16 + spatial_merge_size=2 native-resolution
+                // tiling) land in Wedge-4c. `ProjectorType::Qwen3VlMerger.is_supported()`
+                // returns false today so `serve --mmproj` rejects this
+                // profile at startup before any chat-completion enters
+                // here. Fail-loud if the contract regresses.
+                return Err(ApiError::invalid_request(
+                    format!(
+                        "messages[{}].content[{}].image_url: loaded mmproj is Qwen3-VL \
+                         (ArchProfile::Qwen3VlSiglip) — runtime path not yet implemented \
+                         (iter-224 Wedge-4b parse-only; Wedge-4c will land the ViT). \
+                         ProjectorType::Qwen3VlMerger.is_supported() should be returning \
+                         false at startup; if you reached here, is_supported() was \
+                         flipped without the kernel path landing.",
+                        mi, pi
+                    ),
+                    Some(format!("messages[{}].content[{}]", mi, pi)),
+                )
+                .into_response());
+            }
             ArchProfile::Unknown => {
                 // Guarded above; preserved so the match is exhaustive.
                 unreachable!(
@@ -7028,6 +7051,11 @@ mod multimodal_tests {
             projector: ProjectorType::Mlp,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            // iter-224 Wedge-4b: Qwen3-VL-only fields default to None on
+            // non-Qwen3-VL synthetic fixtures.
+            spatial_merge_size: None,
+            projection_dim: None,
+            deepstack_indexes: None,
         };
         let device = mlx_native::MlxDevice::new().expect("create device");
         let weights = crate::inference::vision::mmproj_weights::LoadedMmprojWeights::empty(device);
@@ -7167,6 +7195,11 @@ mod multimodal_tests {
             projector: ProjectorType::Mlp,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            // iter-224 Wedge-4b: Qwen3-VL-only fields default to None on
+            // non-Qwen3-VL synthetic fixtures (this is a Gemma4v fixture).
+            spatial_merge_size: None,
+            projection_dim: None,
+            deepstack_indexes: None,
         };
         let device = mlx_native::MlxDevice::new().expect("create device");
         let weights = crate::inference::vision::mmproj_weights::LoadedMmprojWeights::empty(device);
