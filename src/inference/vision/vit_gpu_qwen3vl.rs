@@ -26,7 +26,8 @@
 //! |          |   /opt/mlx-native main `d0e6c42`)                                        |
 //! | 4c.4     | Per-flagged-layer DeepStack heads (`v.deepstack.{N}.{norm,fc1,fc2}`),    |
 //! |          |   spatial 2×2 merge reshape, main projector (`mm.0/mm.2`), final         |
-//! |          |   feature-dim concat producing `[hidden*(1+N_deepstack), n_image_tokens]`|
+//! |          |   feature-dim concat producing `[n_image_tokens, lm_hidden*(1+N_dst)]`   |
+//! |          |   (Rust row-major; ggml-side `ne[0]=lm_hidden*(1+N_dst), ne[1]=tokens`)  |
 //! | 4c.5     | LM-side hooks in `Qwen35Model::forward_gpu_*_with_soft_tokens` to split  |
 //! |          |   the augmented embedding and inject chunk `(il+1)` at LM layer `il <    |
 //! |          |   N_deepstack` (post-FFN-residual `cur += ds`); flips                    |
@@ -38,9 +39,14 @@
 //! `/opt/hf2q/docs/research/wedge4c-deepstack-r1-audit-2026-05-01.md`,
 //! Qwen3-VL DeepStack is **per-layer LM injection via concatenated-feature
 //! transport**, NOT concat-along-sequence. The ViT-side outputs an
-//! augmented embedding of shape `[hidden*(1+N_deepstack), n_image_tokens]`
-//! which the LM splits at runtime and adds chunk `(il+1)` to the
-//! post-FFN-residual at LM layer `il < N_deepstack`. See:
+//! augmented embedding of Rust row-major shape
+//! `[n_image_tokens, lm_hidden*(1+N_deepstack)]` (equivalently in ggml
+//! convention `ne[0]=lm_hidden*(1+N_deepstack), ne[1]=n_image_tokens` —
+//! ggml uses fastest-varying-axis-first; the underlying byte layout is
+//! identical). The LM splits at runtime via `ggml_view_2d` (offset
+//! `(il+1)*lm_hidden*sizeof(float)`, `nb[1]=lm_hidden*(1+N_deepstack)
+//! *sizeof(float)`) and adds chunk `(il+1)` to the post-FFN-residual at
+//! LM layer `il < N_deepstack`. See:
 //!
 //! - `/opt/llama.cpp/tools/mtmd/models/qwen3vl.cpp:1-193` (ViT graph)
 //! - `/opt/llama.cpp/src/models/qwen3vl.cpp:96-100` (LM split-and-add)
@@ -4952,6 +4958,52 @@ mod tests {
              violating qwen3vl.cpp:150's `if (layer.has_deepstack())` gate"
         );
     }
+
+    // PHASE-2C RESPONSE TO CODEX REVIEW OF cf754d6 (finding #1, medium):
+    // Codex correctly flagged that the structural-only test above pins
+    // length but not payload-source. A payload-differential test was
+    // attempted (run flag=[2] vs flag=[0], assert deepstack chunks
+    // differ) but the synthetic fixture's UNIFORM weights cause two
+    // collapses that make the differential vacuous:
+    //
+    //   1. LayerNorm normalizes `(x - mean(x))/sqrt(var(x)+ε)`. With
+    //      uniform-per-channel input (which the all-equal weights
+    //      always produce), var(x) = 0 and LN outputs ~0 + ln_bias —
+    //      erasing per-block divergence.
+    //   2. GELU saturates above ~6: with proj_w = 0.05, fc1 output
+    //      reaches ~6.4 per channel, GELU clamps both passes to the
+    //      same saturated value.
+    //
+    // Closing this gap rigorously needs either (a) per-channel-asymmetric
+    // pos-embed/ln_bias in the fixture builder, or (b) an end-to-end
+    // GGUF-fixture parity test against a real Qwen3-VL checkpoint. Both
+    // are out-of-scope for 4c.4 Phase-2c.
+    //
+    // Tap-source correctness is INSTEAD pinned by code-reading +
+    // structural invariant at vit_gpu_qwen3vl.rs:2279-2323:
+    //
+    //   for block_idx in 0..(cfg.n_layer as usize) {
+    //       let block_out = apply_qwen3vl_block_forward_gpu(...);
+    //       if deepstack_set.contains(&(block_idx as u32)) {
+    //           let head_out = apply_qwen3vl_deepstack_head_gpu(
+    //               ..., block_idx as u32, &block_out, ...);
+    //           deepstack_outputs.push(head_out);
+    //       }
+    //       hidden_states = block_out;
+    //   }
+    //
+    // The SAME `block_idx` variable is used to (i) gate the if, (ii)
+    // index the head's `v.deepstack.{N}.*` weight lookup, AND (iii)
+    // reference the just-produced `block_out`. There is no shadowing
+    // or earlier saved buffer that could be mis-used as `head_input`.
+    // A wrong-block-tap sabotage would require an explicit different
+    // variable, which does not exist in the code path.
+    //
+    // Wedge-4c.5's LM-side hooks will additionally cross-check tap-
+    // source correctness: if a hf2q-side sabotage tapped block 0 when
+    // the LM expected block 2's output, the LM's per-layer residual
+    // add would produce numerical divergence vs the llama.cpp reference
+    // in the parity tests Wedge-4c.5 will land.
 
     /// Test 4c.4-E — `qwen3vl_augmented_embed_shape_matches_lm_split_contract`.
     ///
