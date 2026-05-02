@@ -1016,7 +1016,9 @@ pub fn apply_flash_attn_prefill_seq_major(
     n_heads: u32,
     n_kv_heads: u32,
     head_dim: u32,
+    fa_arena: Option<&mut crate::inference::models::qwen35::FaPrefillArena>,
 ) -> Result<MlxBuffer> {
+    let _ = fa_arena;  // TODO(P21-Worker-B): wire into scratch allocations + commit_labeled
     if head_dim != 256 {
         return Err(anyhow!(
             "apply_flash_attn_prefill_seq_major: head_dim must be 256 \
@@ -1200,7 +1202,9 @@ pub fn apply_sdpa_with_kv_cache(
     n_kv_heads: u32,
     head_dim: u32,
     max_seq_len: u32,
+    fa_arena: Option<&mut crate::inference::models::qwen35::FaPrefillArena>,
 ) -> Result<MlxBuffer> {
+    let _ = fa_arena;  // TODO(P21-Worker-B): wire into scratch allocations + commit_labeled
     let seq = seq_len as usize;
     let nh = n_heads as usize;
     let nkv = n_kv_heads as usize;
@@ -1340,6 +1344,7 @@ pub fn apply_sdpa_with_kv_cache(
                 device, registry,
                 q_seq_major, k_seq_major, v_seq_major,
                 seq_len, n_heads, n_kv_heads, head_dim,
+                None,
             )?;
             // --- Update current_len cursor (prefill path) ---
             let new_len = kv_seq_len;
@@ -1462,7 +1467,9 @@ pub fn build_gated_attn_layer(
     freq_base: f32,
     mrope_section: [u32; 4],
     rms_norm_eps: f32,
+    fa_arena: Option<&mut crate::inference::models::qwen35::FaPrefillArena>,
 ) -> Result<MlxBuffer> {
+    let _ = fa_arena;  // TODO(P21-Worker-B): wire into scratch allocations + commit_labeled
     let q_total = n_heads * head_dim;
     let kv_total = n_kv_heads * head_dim;
 
@@ -1626,6 +1633,7 @@ pub fn build_gated_attn_layer(
                 device, registry,
                 &q_rope, &k_rope, &v_flat,
                 slot, seq_len, n_heads, n_kv_heads, head_dim, max_seq_len,
+                None,
             )?,
             None => {
                 let mut enc = device.command_encoder().context("enc op5")?;
@@ -2592,6 +2600,7 @@ mod tests {
             shape.rope_theta,
             shape.mrope_section,
             shape.rms_norm_eps,
+            None,
         )
         .expect("build_gated_attn_layer");
 

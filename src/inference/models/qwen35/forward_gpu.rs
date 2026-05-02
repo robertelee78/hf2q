@@ -1492,6 +1492,7 @@ impl Qwen35Model {
                         shape.rope_theta,
                         shape.mrope_section,
                         shape.rms_norm_eps,
+                        None,
                     )
                     .with_context(|| format!("full_attn layer {layer_idx}"))?
                 }
@@ -3029,6 +3030,7 @@ impl Qwen35Model {
                             shape.rope_theta,
                             shape.mrope_section,
                             shape.rms_norm_eps,
+                            None,
                         )
                         .with_context(|| format!("full_attn legacy greedy layer {layer_idx}"))?
                     }

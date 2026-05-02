@@ -309,6 +309,7 @@ impl MtpWeights {
             cfg.num_key_value_heads,
             cfg.head_dim,
             kv_cache.max_seq_len,
+            None,
         )
         .context("MTP SDPA")?;
 
