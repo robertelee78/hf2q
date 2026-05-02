@@ -7,7 +7,9 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
-## ▶ Resume Here — current state of truth (2026-05-02 ~19:00Z, **iter86 NEUTRAL closes the wrapper-arena class on default-axis (5 NEUTRAL outcomes total). FaProjectionsArena impl is correct + parity-clean + 4/4 fixtures IDENTICAL but wall delta -7ms (slower) because alloc cost was async-overlapped with prior-layer GPU. iter85 predicate #2 prediction CONFIRMED. ADR-015 hf2q-side wrapper optimization scope is DEFINITIVELY EXHAUSTED — 5 SHIPPED + 5 NEUTRAL across iter72-86 with banked methodology. Real ratios from same-day llama-bench: chunk-engaged 0.667× / default 0.842×. iter87+ requires either mlx-native kernel work (Q-2: HALF_MMA_OPT in `quantized_matmul_id_ggml::dispatch_id_mm`) OR pivot to different ADRs (Q-3: ADR-013 P14 / ADR-017 / ADR-005).** Receipts: `/tmp/cfa-iter86/impl-bench/VERDICT.md` + branch `cfa/iter86-fa-projections-arena-20260502/claude` HEAD `4c7b7bc` (DO NOT MERGE; preserved as evidence).)
+## ▶ Resume Here — current state of truth (2026-05-02 ~19:45Z, **iter87 FALSIFIED at zero cost: HALF_MMA_OPT in quantized_matmul_id_ggml::dispatch_id_mm is ALREADY SHIPPED on M5 Max — production tensor variant already uses (half, half, float) homogeneous MMA matching llama.cpp peer. Convergent with iter62-65's "main IS OPTIMAL" finding now reached via 2 independent kernels. Genuine new lever found: iter87b flash_attn_prefill tensor port (~16% of prefill compute; inner matmul still on M1-era simdgroup_multiply_accumulate; iter56 precedent). Estimated 30-100 ms wall savings on default-axis. iter87b research+impl queued.** Receipts: `/tmp/cfa-iter87/research/SCOPE.md` (245 lines).
+
+## ▶ Resume Here — preceding state (2026-05-02 ~19:00Z, **iter86 NEUTRAL closes the wrapper-arena class on default-axis (5 NEUTRAL outcomes total). FaProjectionsArena impl is correct + parity-clean + 4/4 fixtures IDENTICAL but wall delta -7ms (slower) because alloc cost was async-overlapped with prior-layer GPU. iter85 predicate #2 prediction CONFIRMED. ADR-015 hf2q-side wrapper optimization scope is DEFINITIVELY EXHAUSTED — 5 SHIPPED + 5 NEUTRAL across iter72-86 with banked methodology. Real ratios from same-day llama-bench: chunk-engaged 0.667× / default 0.842×. iter87+ requires either mlx-native kernel work (Q-2: HALF_MMA_OPT in `quantized_matmul_id_ggml::dispatch_id_mm`) OR pivot to different ADRs (Q-3: ADR-013 P14 / ADR-017 / ADR-005).** Receipts: `/tmp/cfa-iter86/impl-bench/VERDICT.md` + branch `cfa/iter86-fa-projections-arena-20260502/claude` HEAD `4c7b7bc` (DO NOT MERGE; preserved as evidence).)
 
 ## ▶ Resume Here — preceding state (2026-05-02 ~18:30Z, **PEER CROSS-CHECK CORRECTION: same-day same-hardware llama-bench measures peer at 3322 t/s (pp4096) / 3249 t/s (pp4127) = 1233 ms / 1271 ms. Real ratios are chunk-engaged 0.667× (+50% gap, NOT 0.95×) and default 0.842× (+18.8% gap, NOT 0.792×). Prior session's chunk-engaged 0.95× claim was based on a math estimate using a stale peer baseline (1741 ms inferred from "iter82 was 0.790×"). Default-axis is ACTUALLY CLOSER to peer than chunk-engaged. iter72-83 wrapper-side arena wins are still real wall-time savings (-651 ms cumulative chunk-engaged) but the cumulative ratio numbers in earlier ADR entries were calculated against an inflated baseline.**
 
@@ -1810,6 +1812,40 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - Memory pins: `feedback_perf_gate_thermal_methodology`, `feedback_shippability_standing_directive`, `feedback_never_ship_fallback_without_rootcause`, `feedback_no_broken_windows`, `project_metal_compiler_auto_optimizes_static_levers`, `project_end_gate_reality_check`, `feedback_ground_truth_is_what_we_can_measure_now`
 
 ## Changelog
+
+- **2026-05-02 (UTC ~19:45Z) — iter87 FALSIFIED at zero cost: HALF_MMA_OPT in `quantized_matmul_id_ggml::dispatch_id_mm` is ALREADY SHIPPED on M5 Max. Pre-registered hypothesis "mlx-native id_mm uses slow mixed-precision MMA" REFUTED by code reads. Genuine new lever found: iter87b — flash_attn_prefill tensor port (~16% of prefill compute, M1-era simdgroup_multiply_accumulate inner matmul). Queued for impl.**
+
+  **iter87 research (research-only, /tmp/cfa-iter87/research/SCOPE.md, 245 lines):**
+
+  **Code-read evidence:**
+  - `/opt/mlx-native/src/shaders/quantized_matmul_id_mm_tensor.metal:228-229, 236` — production tensor variant uses `tensor<threadgroup half, ...>` for BOTH A and B operands with float accumulator → **(half, half, float) homogeneous MMA = M3+ hardware tensor cores path** (already optimal)
+  - `/opt/mlx-native/src/ops/quantized_matmul_id_ggml.rs:1058-1063` — dispatcher routes to tensor variant when probe succeeds (M5 Max); simdgroup variant is pre-M3 fallback only
+  - `/opt/hf2q/docs/ADR-013-qwen35-inference.md:1422-1423` — runtime smoke confirms `tensor_mm_id probe: OK (using tensor variant for MoE)` on M5 Max
+  - `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:10161` — peer Q4_0 template uses identical homogeneous half MMA (`simdgroup_half8x8` for both A and B)
+  - Commit `4d2ec0b` (2026-05-02): "tensor variant ≡ llama half-MMA, residual gap is GPU scheduling"
+
+  **Convergent falsification (load-bearing).** ADR-015 iter62/63a/63c/64a/65 — 4 independent kernel modifications all regressed when they broke homogeneous (half, half, float). The earlier finding "main IS OPTIMAL for `kernel_mul_mm_q4_0_tensor_f32` on M5 Max. The B staging design space is CLOSED" is now reached via two independent kernels (mul_mm and mul_mm_id), making it load-bearing.
+
+  **Pre-M3 fallback (Definition B):** `/opt/mlx-native/src/shaders/quantized_matmul_id_mm.metal:397-398` does declare `mb[2]` as `simdgroup_float8x8` (mixed precision) — a real HALF_MMA_OPT opportunity in the simdgroup fallback. But this branch never fires on M5 Max (tensor probe succeeds). Would benefit M1/M2 hardware only. **Out of ADR-015 scope** for this session's hardware target.
+
+  **iter87 effort × impact summary:**
+
+  | Definition | LOC | Impact M5 Max | Verdict |
+  |---|---:|---:|---|
+  | A (tensor uses homogeneous half) | 0 — already done | 0% | NO-OP |
+  | B (simdgroup fallback half-MMA) | ~10 | 0% (path inert on M5 Max); +5-10% on M1/M2 | DECLINE |
+  | C (further-optimize tensor variant) | unknown | 0% — design space CLOSED per iter62-65 | DECLINE |
+
+  **iter87b queued (genuine new lever):** flash_attn_prefill inner matmul still uses M1-era `simdgroup_multiply_accumulate` (per ADR-015:5935). FA path is ~16% of prefill compute (default-axis: ~242 ms / 1510 ms wall; chunk-engaged: ~290 ms / 1849 ms wall). Tensor cooperative-tensor port precedent: iter56 mul_mm_q4_0 ship. Estimated impact: 30-100 ms wall on default-axis (assume 30-50% kernel speedup on FA inner matmul × 16% prefill share). Threshold ≥30 ms WIN. Effort: medium (1-3 days; precedent established).
+
+  **STANDING COMPLIANCE.**
+  - `feedback_evidence_first_no_blind_kernel_rewrites` — iter87 research read source code BEFORE recommending impl; falsified at zero cost.
+  - `feedback_correct_outcomes` — pre-registered hypothesis was wrong; finding is reported honestly.
+  - `feedback_no_shortcuts` — full code reads on mlx-native + llama.cpp peer cross-check + commit-history cross-check (4d2ec0b) before verdict.
+
+  **Receipts.** `/tmp/cfa-iter87/research/SCOPE.md` (245 lines, full code-read citations).
+
+  Status: ADR-015 mlx-native HALF_MMA_OPT scope FALSIFIED (already shipped). iter87b flash_attn_prefill tensor port queued as genuine new lever. Loop continues to iter87b impl.
 
 - **2026-05-02 (UTC ~19:00Z) — iter86 NEUTRAL: FaProjectionsArena impl correct + 4/4 decode parity + bucket lift CONFIRMED (`fa.ops1_4` -99.5% / -100ms across 10 FA layers) but wall delta -7ms / iter86 SLOWER → DO NOT SHIP. Mechanism: alloc cost was async-overlapped with prior-layer GPU compute on Metal serial queue (iter85 predicate #2 prediction CORRECT). 5th NEUTRAL in wrapper-arena class on default-axis; wrapper-class definitively EXHAUSTED on default-axis. Branch `cfa/iter86-fa-projections-arena-20260502/claude` HEAD `4c7b7bc` preserved as evidence.**
 
