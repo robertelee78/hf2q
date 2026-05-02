@@ -1229,6 +1229,106 @@ pub enum CachedFragment {
     },
 }
 
+/// W-A2.2 streaming-emit sink with optional fragment capture.
+///
+/// Wraps the `tokio::sync::mpsc::Sender<GenerationEvent>` that streaming
+/// helpers (`generate_stream_once`, `route_content`, `emit_fragment`,
+/// `finalize_streaming_tool_state`, `ToolCallStreamEmitter::*`,
+/// `emit_streaming_tool_call_close`, `replay_cached_streaming_response`)
+/// previously took as `&mpsc::Sender<...>`.
+///
+/// **Why a wrapper:** the W-A2.2 capture must mirror EVERY emitted
+/// `GenerationEvent::Delta` / `::ToolCallDelta` into a parallel
+/// `Vec<CachedFragment>` accumulator without missing a callsite.  Threading
+/// `Option<&RefCell<Vec<CachedFragment>>>` as a separate parameter through
+/// every helper (the alternative considered) costs the same number of
+/// signature changes AND adds a manual `if let Some(cap) = ...` block at
+/// every send site.  Centralising both forwarding and capture inside
+/// `EventSink::blocking_send` makes "every emit gets captured" structural
+/// rather than convention-bound.
+///
+/// **Capture ordering:** the capture push happens BEFORE the channel send
+/// so a client-disconnect mid-decode (channel send returns `Err`) does NOT
+/// drop the fragment — the cache write at end-of-stream still records the
+/// full prefix the cache will later replay.  This matches the
+/// `accumulated_text.push_str` ordering at engine.rs:5161,5260 (text is
+/// pushed before `emit_fragment`).
+///
+/// **`call_type` normalisation:** none — the field is preserved verbatim
+/// (`Option<String>`).  Converting back to `GenerationEvent` is lossless.
+///
+/// **`Done` / `Error` / `Logprobs` are NOT captured:** they are
+/// terminal-shape control events whose state is reconstructed from
+/// `cached.{finish_reason, prompt_tokens, completion_tokens, ...}` at
+/// replay time.  Capturing them would double-emit on hit.
+pub(super) struct EventSink<'a> {
+    sender: &'a tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
+    /// `Some(_)` — populated capture; mirror every Delta/ToolCallDelta.
+    /// `None` — passive forwarder; events flow through unchanged.
+    capture: Option<&'a std::cell::RefCell<Vec<CachedFragment>>>,
+}
+
+impl<'a> EventSink<'a> {
+    /// Passive sink — no capture.  Used by `replay_cached_streaming_response`
+    /// (replay does not capture; it re-emits already-captured fragments) and
+    /// by tests / qwen35 callsites that don't participate in the Gemma
+    /// streaming-origin store path.
+    pub(super) fn new(
+        sender: &'a tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
+    ) -> Self {
+        Self { sender, capture: None }
+    }
+
+    /// Capture sink — every `Delta` / `ToolCallDelta` is mirrored into
+    /// `capture` before forwarding to `sender`.  Used by
+    /// `generate_stream_once` for the streaming-origin store path.
+    pub(super) fn with_capture(
+        sender: &'a tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
+        capture: &'a std::cell::RefCell<Vec<CachedFragment>>,
+    ) -> Self {
+        Self { sender, capture: Some(capture) }
+    }
+
+    /// Forward an event to the underlying channel, mirroring into the
+    /// capture vec first if active.  Same signature shape as
+    /// `tokio::sync::mpsc::Sender::blocking_send` so helper bodies that
+    /// previously called `events.blocking_send(...)` need NO body edit.
+    pub(super) fn blocking_send(
+        &self,
+        ev: super::sse::GenerationEvent,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<super::sse::GenerationEvent>> {
+        // Mirror BEFORE forwarding — see struct doc for ordering rationale.
+        if let Some(cap) = self.capture {
+            match &ev {
+                super::sse::GenerationEvent::Delta {
+                    kind: super::sse::DeltaKind::Content,
+                    text,
+                } => cap.borrow_mut().push(CachedFragment::Content(text.clone())),
+                super::sse::GenerationEvent::Delta {
+                    kind: super::sse::DeltaKind::Reasoning,
+                    text,
+                } => cap.borrow_mut().push(CachedFragment::Reasoning(text.clone())),
+                super::sse::GenerationEvent::ToolCallDelta {
+                    index,
+                    id,
+                    call_type,
+                    name,
+                    arguments,
+                } => cap.borrow_mut().push(CachedFragment::ToolCallDelta {
+                    index: *index,
+                    id: id.clone(),
+                    call_type: call_type.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                }),
+                // Done / Error / Logprobs: NOT captured.  See struct doc.
+                _ => {}
+            }
+        }
+        self.sender.blocking_send(ev)
+    }
+}
+
 /// Single-slot prompt cache (Phase 2a Task #7, iter-96).
 ///
 /// **Iter-96 scope: full-equality + temperature=0 cache.**  When the
@@ -3513,7 +3613,7 @@ fn finalize_streaming_tool_state(
     registration: Option<&super::registry::ModelRegistration>,
     completion_tokens: usize,
     accumulated_text_len: usize,
-    events: &mpsc::Sender<super::sse::GenerationEvent>,
+    events: &EventSink<'_>,
 ) -> FinalizeStreamingAction {
     use super::sse::{DeltaKind, GenerationEvent};
 
@@ -3742,7 +3842,7 @@ impl ToolCallStreamEmitter {
     fn advance(
         &mut self,
         body: &str,
-        events: &tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
+        events: &EventSink<'_>,
     ) -> Result<(), ()> {
         use super::sse::GenerationEvent;
 
@@ -3808,7 +3908,7 @@ impl ToolCallStreamEmitter {
     fn scan_emit_gemma4_kvs(
         &mut self,
         body: &str,
-        events: &tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
+        events: &EventSink<'_>,
     ) -> Result<(), ()> {
         use super::sse::GenerationEvent;
         // Walk from scan_cursor, tracking `<|"|>` string state. On a top-level
@@ -3872,7 +3972,7 @@ impl ToolCallStreamEmitter {
     fn scan_emit_qwen35_kvs(
         &mut self,
         body: &str,
-        events: &tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
+        events: &EventSink<'_>,
     ) -> Result<(), ()> {
         use super::sse::GenerationEvent;
         loop {
@@ -3962,7 +4062,7 @@ impl ToolCallStreamEmitter {
         policy: ToolCallPolicy,
         tc_index: &mut usize,
         saw_tc: &mut bool,
-        events: &tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
+        events: &EventSink<'_>,
     ) -> Result<(), ()> {
         use super::sse::GenerationEvent;
 
@@ -4267,7 +4367,7 @@ pub(super) fn emit_streaming_tool_call_close(
     policy: ToolCallPolicy,
     tc_index: &mut usize,
     saw_tc: &mut bool,
-    events: &tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
+    events: &EventSink<'_>,
 ) -> Result<(), ()> {
     use super::sse::{DeltaKind, GenerationEvent};
 
@@ -4469,7 +4569,7 @@ fn replay_cached_streaming_response(
     cached: &GenerationResult,
     registration: Option<&super::registry::ModelRegistration>,
     tool_call_policy: ToolCallPolicy,
-    events: &mpsc::Sender<super::sse::GenerationEvent>,
+    events: &EventSink<'_>,
 ) -> Result<(), ()> {
     use super::sse::{DeltaKind, GenerationEvent, StreamStats};
 
@@ -4526,7 +4626,7 @@ fn replay_cached_streaming_response(
          body: &mut String,
          tc_index: &mut usize,
          saw_tc: &mut bool,
-         events: &mpsc::Sender<GenerationEvent>,
+         events: &EventSink<'_>,
          text: &str|
          -> Result<(), ()> {
             if text.is_empty() {
@@ -4776,11 +4876,25 @@ fn generate_stream_once(
     prompt_tokens: &[u32],
     soft_tokens: &[SoftTokenInjection<'_>],
     params: &SamplingParams,
-    events: &mpsc::Sender<super::sse::GenerationEvent>,
+    events: &tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
     registration: Option<&super::registry::ModelRegistration>,
     cancellation_counter: Option<&std::sync::atomic::AtomicU64>,
 ) {
     use super::sse::{DeltaKind, GenerationEvent, StreamStats};
+
+    // W-A2.2: streaming origin captures the per-emit sequence into a
+    // sibling `Vec<CachedFragment>`.  The capture is wrapped in a `RefCell`
+    // so the `EventSink` (which all helpers borrow shared) can borrow_mut
+    // through `EventSink::blocking_send` without conflicting with the
+    // closures that capture `&events`.  The vec is consumed at end-of-
+    // stream and passed to `prompt_cache.store_with_fragments` —
+    // see store callsite below the decode loop.
+    let captured_fragments: std::cell::RefCell<Vec<CachedFragment>> =
+        std::cell::RefCell::new(Vec::new());
+    let sink = EventSink::with_capture(events, &captured_fragments);
+    // Helpers + closures borrow `events` as `&EventSink<'_>`; alias for
+    // body uniformity (the original `events` ident shadowed below).
+    let events = &sink;
 
     // Helper: send an event; if the receiver is gone, bump the
     // cancellation counter (→ hf2q_sse_cancellations in /metrics) and bail.
@@ -4946,7 +5060,7 @@ fn generate_stream_once(
                          saw_tc: &mut bool,
                          emitter: &mut Option<ToolCallStreamEmitter>,
                          grammar_runtime: &mut Option<super::grammar::GrammarRuntime>,
-                         events: &mpsc::Sender<GenerationEvent>,
+                         events: &EventSink<'_>,
                          text: &str,
                          reg: Option<&super::registry::ModelRegistration>|
      -> Result<(), ()> {
@@ -5060,7 +5174,7 @@ fn generate_stream_once(
                          saw_tc: &mut bool,
                          emitter: &mut Option<ToolCallStreamEmitter>,
                          grammar_runtime: &mut Option<super::grammar::GrammarRuntime>,
-                         events: &mpsc::Sender<GenerationEvent>,
+                         events: &EventSink<'_>,
                          fragment: &str,
                          reg: Option<&super::registry::ModelRegistration>|
      -> Result<(), ()> {
@@ -5554,7 +5668,35 @@ fn generate_stream_once(
         decode_duration,
         cached_tokens: 0,
     };
-    loaded.prompt_cache.store(prompt_tokens, params, &cache_result);
+
+    // ADR-005 iter-224 W-A2.2: streaming-origin fragment capture.
+    //
+    // `captured_fragments` was populated by `EventSink::with_capture`
+    // mirroring every `GenerationEvent::Delta` / `::ToolCallDelta`
+    // forwarded to the SSE channel during the decode loop above (see
+    // `let sink = EventSink::with_capture(...)` at function entry).
+    // Pass it to `store_with_fragments` so a future cache hit on the
+    // same prompt+params replays via the W-A2.3 fragments branch
+    // (byte-identical event-stream framing).  `Some(...)` here is what
+    // distinguishes streaming-origin entries from the non-streaming
+    // origin path (`generate_once_with_soft_tokens` calls plain
+    // `store(...)` which sets fragments=None — see Worker AA design
+    // §3b option (a)).
+    //
+    // Drop the `&sink` borrow before `store_with_fragments`, which
+    // mutates `loaded.prompt_cache` (siblings of `events` field-wise);
+    // `sink` borrows `events` (the channel sender) only, so dropping
+    // it does not affect `loaded`.  The captured vec is moved into the
+    // cache via `RefCell::into_inner`.
+    drop(events);
+    drop(sink);
+    let fragments = captured_fragments.into_inner();
+    loaded.prompt_cache.store_with_fragments(
+        prompt_tokens,
+        params,
+        &cache_result,
+        Some(fragments),
+    );
 }
 
 fn hit_stop_string(text: &str, stops: &[String]) -> bool {
@@ -6933,6 +7075,173 @@ assistant:
     }
 
     // ────────────────────────────────────────────────────────────────
+    // ADR-005 iter-224 W-A2.2 — streaming-origin capture mechanics
+    // ────────────────────────────────────────────────────────────────
+
+    /// Drives `EventSink::with_capture` through a synthetic event stream
+    /// and asserts the captured Vec parallels the events forwarded into
+    /// the channel — fragment-by-fragment, in order.  This is the
+    /// W-A2.2 mechanical regression gate: any future edit that breaks
+    /// the "every emit gets captured" invariant fails this test.
+    ///
+    /// Worker AA design report §3b: streaming origin captures each
+    /// emitted `Delta` / `ToolCallDelta` in a sibling `Vec<CachedFragment>`
+    /// accumulator.  Live `generate_stream_once` is hard to drive in a
+    /// unit test (needs a real `GemmaLoadedModel`); the synthetic test
+    /// pins the wrapper's mirror logic at the channel boundary, which
+    /// is the same boundary the live decode emits through.
+    #[test]
+    fn streaming_origin_capture_vec_parallels_emitted_events() {
+        use super::super::sse::{DeltaKind, GenerationEvent};
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<GenerationEvent>(64);
+        let capture: std::cell::RefCell<Vec<CachedFragment>> =
+            std::cell::RefCell::new(Vec::new());
+        let sink = EventSink::with_capture(&tx, &capture);
+
+        // Drive a representative sequence: Reasoning + Content + ToolCall
+        // first-chunk + ToolCall args + Content postscript + Done + Error.
+        // Capture MUST mirror Reasoning / Content / ToolCallDelta.
+        // Capture MUST NOT mirror Done / Error / Logprobs.
+        sink.blocking_send(GenerationEvent::Delta {
+            kind: DeltaKind::Reasoning,
+            text: "let me think".to_string(),
+        })
+        .expect("send 0");
+        sink.blocking_send(GenerationEvent::Delta {
+            kind: DeltaKind::Content,
+            text: "Sure! ".to_string(),
+        })
+        .expect("send 1");
+        sink.blocking_send(GenerationEvent::ToolCallDelta {
+            index: 0,
+            id: Some("call_hf2q_aaaa".to_string()),
+            call_type: Some("function".to_string()),
+            name: Some("get_weather".to_string()),
+            arguments: None,
+        })
+        .expect("send 2");
+        sink.blocking_send(GenerationEvent::ToolCallDelta {
+            index: 0,
+            id: None,
+            call_type: None,
+            name: None,
+            arguments: Some("{\"loc\":\"SF\"}".to_string()),
+        })
+        .expect("send 3");
+        sink.blocking_send(GenerationEvent::Delta {
+            kind: DeltaKind::Content,
+            text: " Done.".to_string(),
+        })
+        .expect("send 4");
+        // Done + Error are control events — captured? No, by design.
+        sink.blocking_send(GenerationEvent::Done {
+            finish_reason: "tool_calls",
+            prompt_tokens: 7,
+            completion_tokens: 5,
+            stats: super::super::sse::StreamStats::default(),
+        })
+        .expect("send 5");
+
+        drop(sink);
+        drop(tx);
+
+        // Drain channel + collect captured.
+        let mut emitted: Vec<GenerationEvent> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            emitted.push(ev);
+        }
+        let captured = capture.into_inner();
+
+        // Channel saw all 6 events.
+        assert_eq!(
+            emitted.len(),
+            6,
+            "channel must forward all 6 sent events; got {}",
+            emitted.len()
+        );
+
+        // Capture saw 5 mirror-eligible events (Done is not captured).
+        assert_eq!(
+            captured.len(),
+            5,
+            "capture mirrors Delta + ToolCallDelta only — 5 of 6; got {}",
+            captured.len()
+        );
+
+        // Per-fragment structural check.
+        match &captured[0] {
+            CachedFragment::Reasoning(t) => assert_eq!(t, "let me think"),
+            other => panic!("frag[0]: expected Reasoning; got {other:?}"),
+        }
+        match &captured[1] {
+            CachedFragment::Content(t) => assert_eq!(t, "Sure! "),
+            other => panic!("frag[1]: expected Content; got {other:?}"),
+        }
+        match &captured[2] {
+            CachedFragment::ToolCallDelta {
+                index,
+                id,
+                call_type,
+                name,
+                arguments,
+            } => {
+                assert_eq!(*index, 0);
+                assert_eq!(id.as_deref(), Some("call_hf2q_aaaa"));
+                assert_eq!(call_type.as_deref(), Some("function"));
+                assert_eq!(name.as_deref(), Some("get_weather"));
+                assert!(arguments.is_none());
+            }
+            other => panic!("frag[2]: expected ToolCallDelta first-chunk; got {other:?}"),
+        }
+        match &captured[3] {
+            CachedFragment::ToolCallDelta {
+                index,
+                id,
+                call_type,
+                name,
+                arguments,
+            } => {
+                assert_eq!(*index, 0);
+                assert!(id.is_none());
+                assert!(call_type.is_none());
+                assert!(name.is_none());
+                assert_eq!(arguments.as_deref(), Some("{\"loc\":\"SF\"}"));
+            }
+            other => panic!("frag[3]: expected ToolCallDelta args-chunk; got {other:?}"),
+        }
+        match &captured[4] {
+            CachedFragment::Content(t) => assert_eq!(t, " Done."),
+            other => panic!("frag[4]: expected Content; got {other:?}"),
+        }
+    }
+
+    /// Pin: `EventSink::new(...)` (passive sink) does NOT mirror anything.
+    /// This is the property that lets `replay_cached_streaming_response`
+    /// and `engine_qwen35::route_content_qwen35` reuse helpers that take
+    /// `&EventSink<'_>` without participating in fragment capture.
+    #[test]
+    fn passive_event_sink_does_not_capture() {
+        use super::super::sse::{DeltaKind, GenerationEvent};
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<GenerationEvent>(8);
+        let sink = EventSink::new(&tx);
+        sink.blocking_send(GenerationEvent::Delta {
+            kind: DeltaKind::Content,
+            text: "hello".to_string(),
+        })
+        .expect("send");
+        drop(sink);
+        drop(tx);
+
+        // Channel saw the event.
+        assert!(rx.try_recv().is_ok(), "passive sink must still forward");
+        // Passive sink has no capture surface — that's the contract.
+        // (No assertion needed: there's nothing to inspect because
+        // `capture: None`; the contract is structurally enforced.)
+    }
+
+    // ────────────────────────────────────────────────────────────────
     // Iter-215 Wedge-2 — LoadedModel enum accessor dispatch
     // ────────────────────────────────────────────────────────────────
 
@@ -7542,7 +7851,7 @@ mod streaming_prompt_cache_replay_tests {
             &cached,
             None, // no registration ⇒ everything routes as Content
             ToolCallPolicy::Auto,
-            &tx,
+            &EventSink::new(&tx),
         );
         assert!(res.is_ok(), "replay must succeed when no client disconnect");
 
@@ -7588,7 +7897,7 @@ mod streaming_prompt_cache_replay_tests {
             &cached,
             None,
             ToolCallPolicy::Auto,
-            &tx,
+            &EventSink::new(&tx),
         );
         assert!(res.is_ok());
         drop(tx);
@@ -7664,7 +7973,7 @@ mod streaming_prompt_cache_replay_tests {
             &cached,
             Some(&reg),
             ToolCallPolicy::Auto,
-            &tx,
+            &EventSink::new(&tx),
         );
         assert!(res.is_ok(), "replay must succeed");
         drop(tx);
@@ -7759,7 +8068,7 @@ mod streaming_prompt_cache_replay_tests {
             &cached,
             None,
             ToolCallPolicy::Auto,
-            &tx,
+            &EventSink::new(&tx),
         );
         assert!(
             res.is_err(),
@@ -7824,7 +8133,7 @@ mod streaming_prompt_cache_replay_tests {
             &cached,
             Some(&reg), // <-- KEY: registration enables splitter (the bug only fires when splitter is built)
             ToolCallPolicy::Auto,
-            &tx,
+            &EventSink::new(&tx),
         );
         assert!(res.is_ok(), "replay must succeed");
         drop(tx);
@@ -7912,7 +8221,7 @@ mod streaming_prompt_cache_replay_tests {
             &cached,
             Some(&reg),
             ToolCallPolicy::Auto,
-            &tx,
+            &EventSink::new(&tx),
         );
         assert!(res.is_ok(), "replay must succeed");
         drop(tx);
@@ -8095,7 +8404,7 @@ mod streaming_prompt_cache_replay_tests {
             &cached,
             Some(&reg),
             ToolCallPolicy::Auto,
-            &tx,
+            &EventSink::new(&tx),
         );
         assert!(res.is_ok(), "replay must succeed");
         drop(tx);
@@ -8196,7 +8505,7 @@ mod streaming_prompt_cache_replay_tests {
             &cached,
             Some(&reg),
             ToolCallPolicy::Auto,
-            &tx,
+            &EventSink::new(&tx),
         );
         assert!(res.is_ok());
         drop(tx);
@@ -8285,7 +8594,7 @@ mod streaming_prompt_cache_replay_tests {
             &cached,
             Some(&reg),
             ToolCallPolicy::Auto,
-            &tx,
+            &EventSink::new(&tx),
         );
         assert!(res.is_ok());
         drop(tx);
@@ -8412,7 +8721,7 @@ mod streaming_prompt_cache_replay_tests {
             &cached,
             Some(&reg),
             ToolCallPolicy::Auto,
-            &tx,
+            &EventSink::new(&tx),
         );
         assert!(res.is_ok());
         drop(tx);
@@ -8478,7 +8787,7 @@ mod streaming_prompt_cache_replay_tests {
             &cached,
             Some(&reg),
             ToolCallPolicy::Auto,
-            &tx,
+            &EventSink::new(&tx),
         );
         assert!(res.is_ok(), "replay must succeed");
         drop(tx);
@@ -8722,7 +9031,7 @@ mod finalize_streaming_tool_state_tests {
             Some(&reg),
             /* completion_tokens */ 7,
             /* accumulated_text_len */ 18,
-            &tx,
+            &EventSink::new(&tx),
         );
 
         assert_eq!(
@@ -8782,7 +9091,7 @@ mod finalize_streaming_tool_state_tests {
             Some(&reg),
             /* completion_tokens */ 64,
             /* accumulated_text_len */ 0,
-            &tx,
+            &EventSink::new(&tx),
         );
 
         assert_eq!(
@@ -8828,7 +9137,7 @@ mod finalize_streaming_tool_state_tests {
             Some(&reg),
             /* completion_tokens */ 7,
             /* accumulated_text_len */ 18,
-            &tx,
+            &EventSink::new(&tx),
         );
         assert_eq!(
             action,
@@ -8870,7 +9179,7 @@ mod finalize_streaming_tool_state_tests {
             Some(&reg),
             64,
             0,
-            &tx,
+            &EventSink::new(&tx),
         );
         assert_eq!(action, FinalizeStreamingAction::Continue);
         drop(tx);
@@ -8915,7 +9224,7 @@ mod finalize_streaming_tool_state_tests {
             Some(&reg),
             /* completion_tokens */ 7,
             /* accumulated_text_len */ 18,
-            &tx,
+            &EventSink::new(&tx),
         );
 
         assert_eq!(
@@ -8985,7 +9294,7 @@ mod finalize_streaming_tool_state_tests {
             Some(&reg),
             64,
             0,
-            &tx,
+            &EventSink::new(&tx),
         );
         assert_eq!(
             action,
@@ -9030,7 +9339,7 @@ mod finalize_streaming_tool_state_tests {
             Some(&reg),
             12,
             18,
-            &tx,
+            &EventSink::new(&tx),
         );
         assert_eq!(action, FinalizeStreamingAction::Continue);
         drop(tx);
@@ -9110,7 +9419,7 @@ mod emit_streaming_tool_call_close_tests {
             ToolCallPolicy::Constrained,
             &mut tc_index,
             &mut saw_tc,
-            &tx,
+            &EventSink::new(&tx),
         );
 
         assert!(
@@ -9187,7 +9496,7 @@ mod emit_streaming_tool_call_close_tests {
             ToolCallPolicy::AutoLazyGrammar,
             &mut tc_index,
             &mut saw_tc,
-            &tx,
+            &EventSink::new(&tx),
         );
 
         assert!(
@@ -9262,7 +9571,7 @@ mod emit_streaming_tool_call_close_tests {
             ToolCallPolicy::Auto,
             &mut tc_index,
             &mut saw_tc,
-            &tx,
+            &EventSink::new(&tx),
         );
 
         assert!(
@@ -9376,7 +9685,7 @@ mod tool_call_stream_emitter_tests {
         // a started kv. The first `advance` call MUST emit chunk 1
         // (id+type+name) and chunk 2 (the args opening `{`).
         let body = "call:get_weather{location:<|\"|>San Fra".to_string();
-        emitter.advance(&body, &tx).expect("advance ok");
+        emitter.advance(&body, &EventSink::new(&tx)).expect("advance ok");
         drop(tx);
         let events = drain(&mut rx);
         // Chunk 1: name+id+type, no args.
@@ -9429,13 +9738,13 @@ mod tool_call_stream_emitter_tests {
         let mut body = String::new();
         // Fragment 1: header + first kv started, no closer.
         body.push_str("call:get_weather{location:<|\"|>");
-        emitter.advance(&body, &tx).expect("frag1");
+        emitter.advance(&body, &EventSink::new(&tx)).expect("frag1");
         // Fragment 2: close first kv with `,` and start second kv.
         body.push_str("San Francisco<|\"|>,");
-        emitter.advance(&body, &tx).expect("frag2");
+        emitter.advance(&body, &EventSink::new(&tx)).expect("frag2");
         // Fragment 3: second kv complete + closer.
         body.push_str("units:<|\"|>celsius<|\"|>}");
-        emitter.advance(&body, &tx).expect("frag3");
+        emitter.advance(&body, &EventSink::new(&tx)).expect("frag3");
         // Close finalizes the last kv + `}`.
         let mut tc_index: usize = 0;
         let mut saw_tc: bool = false;
@@ -9446,7 +9755,7 @@ mod tool_call_stream_emitter_tests {
                 ToolCallPolicy::Constrained,
                 &mut tc_index,
                 &mut saw_tc,
-                &tx,
+                &EventSink::new(&tx),
             )
             .expect("finalize");
         drop(tx);
@@ -9496,7 +9805,7 @@ mod tool_call_stream_emitter_tests {
         ];
         for c in &chunks {
             body.push_str(c);
-            emitter.advance(&body, &tx).expect("advance");
+            emitter.advance(&body, &EventSink::new(&tx)).expect("advance");
         }
         let mut tc_index: usize = 0;
         let mut saw_tc: bool = false;
@@ -9507,7 +9816,7 @@ mod tool_call_stream_emitter_tests {
                 ToolCallPolicy::Constrained,
                 &mut tc_index,
                 &mut saw_tc,
-                &tx,
+                &EventSink::new(&tx),
             )
             .expect("finalize");
         drop(tx);
@@ -9542,7 +9851,7 @@ mod tool_call_stream_emitter_tests {
         let (tx, mut rx) = mpsc::channel::<GenerationEvent>(16);
         let mut emitter = ToolCallStreamEmitter::new(Some("gemma4"), 0);
         let body = "call:f{x:1}".to_string();
-        emitter.advance(&body, &tx).expect("advance");
+        emitter.advance(&body, &EventSink::new(&tx)).expect("advance");
         let mut tc_index: usize = 0;
         let mut saw_tc: bool = false;
         emitter
@@ -9552,7 +9861,7 @@ mod tool_call_stream_emitter_tests {
                 ToolCallPolicy::Constrained,
                 &mut tc_index,
                 &mut saw_tc,
-                &tx,
+                &EventSink::new(&tx),
             )
             .expect("finalize");
         drop(tx);
@@ -9597,14 +9906,14 @@ mod tool_call_stream_emitter_tests {
         // Call 0.
         let mut em0 = ToolCallStreamEmitter::new(Some("gemma4"), tc_index);
         let body0 = "call:f0{a:1}".to_string();
-        em0.advance(&body0, &tx).expect("advance0");
+        em0.advance(&body0, &EventSink::new(&tx)).expect("advance0");
         em0.finalize(
             body0,
             Some(&super::super::registry::GEMMA4),
             ToolCallPolicy::Constrained,
             &mut tc_index,
             &mut saw_tc,
-            &tx,
+            &EventSink::new(&tx),
         )
         .expect("finalize0");
         assert_eq!(tc_index, 1, "tc_index advances after call 0");
@@ -9612,14 +9921,14 @@ mod tool_call_stream_emitter_tests {
         // Call 1.
         let mut em1 = ToolCallStreamEmitter::new(Some("gemma4"), tc_index);
         let body1 = "call:f1{b:2}".to_string();
-        em1.advance(&body1, &tx).expect("advance1");
+        em1.advance(&body1, &EventSink::new(&tx)).expect("advance1");
         em1.finalize(
             body1,
             Some(&super::super::registry::GEMMA4),
             ToolCallPolicy::Constrained,
             &mut tc_index,
             &mut saw_tc,
-            &tx,
+            &EventSink::new(&tx),
         )
         .expect("finalize1");
         assert_eq!(tc_index, 2, "tc_index advances after call 1");
@@ -9698,7 +10007,7 @@ mod tool_call_stream_emitter_tests {
         //   chunk 2: arguments=`{`
         // Then finalize emits the residual tail.
         let body = "call:f{x:1}".to_string();
-        emitter.advance(&body, &tx).expect("advance");
+        emitter.advance(&body, &EventSink::new(&tx)).expect("advance");
         let mut tc_index: usize = 0;
         let mut saw_tc: bool = false;
         emitter
@@ -9708,7 +10017,7 @@ mod tool_call_stream_emitter_tests {
                 ToolCallPolicy::Constrained,
                 &mut tc_index,
                 &mut saw_tc,
-                &tx,
+                &EventSink::new(&tx),
             )
             .expect("finalize");
         drop(tx);
@@ -9794,11 +10103,11 @@ mod tool_call_stream_emitter_tests {
         let mut emitter = ToolCallStreamEmitter::new(Some("qwen35"), 0);
         let mut body = String::new();
         body.push_str("<function=lookup>");
-        emitter.advance(&body, &tx).expect("frag1");
+        emitter.advance(&body, &EventSink::new(&tx)).expect("frag1");
         body.push_str("\n<parameter=q>\n\"hello\"\n</parameter>");
-        emitter.advance(&body, &tx).expect("frag2");
+        emitter.advance(&body, &EventSink::new(&tx)).expect("frag2");
         body.push_str("\n<parameter=k>\n5\n</parameter>\n</function>");
-        emitter.advance(&body, &tx).expect("frag3");
+        emitter.advance(&body, &EventSink::new(&tx)).expect("frag3");
         let mut tc_index: usize = 0;
         let mut saw_tc: bool = false;
         emitter
@@ -9808,7 +10117,7 @@ mod tool_call_stream_emitter_tests {
                 ToolCallPolicy::Constrained,
                 &mut tc_index,
                 &mut saw_tc,
-                &tx,
+                &EventSink::new(&tx),
             )
             .expect("finalize");
         drop(tx);
@@ -9839,7 +10148,7 @@ mod tool_call_stream_emitter_tests {
         let (tx, mut rx) = mpsc::channel::<GenerationEvent>(8);
         let mut emitter = ToolCallStreamEmitter::new(None, 0);
         emitter
-            .advance("anything goes here", &tx)
+            .advance("anything goes here", &EventSink::new(&tx))
             .expect("advance no-op");
         // No emissions yet — unknown family declined the streaming path.
         let mid_events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
@@ -9857,7 +10166,7 @@ mod tool_call_stream_emitter_tests {
             ToolCallPolicy::Auto,
             &mut tc_index,
             &mut saw_tc,
-            &tx,
+            &EventSink::new(&tx),
         );
         assert!(result.is_ok(), "Auto + unparseable MUST be Ok (content fallback)");
         drop(tx);
@@ -9928,12 +10237,12 @@ mod tool_call_stream_emitter_tests {
                             emitter: &mut Option<ToolCallStreamEmitter>,
                             tc_index: &mut usize,
                             saw_tc: &mut bool,
-                            tx: &mpsc::Sender<GenerationEvent>| {
+                            sink: &EventSink<'_>| {
             for ev in events {
                 match ev {
                     super::super::registry::ToolCallEvent::Content(t) => {
                         if !t.is_empty() {
-                            tx.blocking_send(GenerationEvent::Delta {
+                            sink.blocking_send(GenerationEvent::Delta {
                                 kind: super::super::sse::DeltaKind::Content,
                                 text: t,
                             })
@@ -9947,7 +10256,7 @@ mod tool_call_stream_emitter_tests {
                     super::super::registry::ToolCallEvent::ToolCallText(t) => {
                         body.push_str(&t);
                         if let Some(em) = emitter.as_mut() {
-                            em.advance(body, tx).expect("advance");
+                            em.advance(body, sink).expect("advance");
                         }
                     }
                     super::super::registry::ToolCallEvent::ToolCallClose => {
@@ -9965,20 +10274,22 @@ mod tool_call_stream_emitter_tests {
                             policy,
                             tc_index,
                             saw_tc,
-                            tx,
+                            sink,
                         );
                     }
                 }
             }
         };
 
+        let sink = EventSink::new(&tx);
         for frag in fragments {
             let events = splitter.feed(frag);
-            drive_events(events, &mut body, &mut emitter, &mut tc_index, &mut saw_tc, &tx);
+            drive_events(events, &mut body, &mut emitter, &mut tc_index, &mut saw_tc, &sink);
         }
         if let Some(tail) = splitter.finish() {
-            drive_events(vec![tail], &mut body, &mut emitter, &mut tc_index, &mut saw_tc, &tx);
+            drive_events(vec![tail], &mut body, &mut emitter, &mut tc_index, &mut saw_tc, &sink);
         }
+        drop(sink);
         drop(tx);
 
         let mut content = String::new();
