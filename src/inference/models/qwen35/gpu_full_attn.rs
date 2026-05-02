@@ -1581,10 +1581,20 @@ pub fn build_gated_attn_layer(
     fa_arena: Option<&mut crate::inference::models::qwen35::FaPrefillArena>,
 ) -> Result<MlxBuffer> {
     // Capture arena presence before moving fa_arena into the SDPA call below.
-    // Used to decide the commit vs commit_labeled path for ops1-4 and ops6-7:
-    // when arena=Some && seq_len > 1, scratch buffers are arena-owned and
-    // outlive this CB, so commit_labeled (no host wait) is safe per A.5.
-    let use_arena = fa_arena.is_some() && seq_len > 1;
+    // Used to decide the commit vs commit_labeled path for ops1-4 and ops6-7.
+    //
+    // The ops1-4 commit can be downgraded to commit_labeled ONLY when
+    // apply_sdpa_with_kv_cache will take the new_path_eligible branch
+    // (head_dim == 256 && cur_len == 0), because that branch does NOT call
+    // download_f32 on k_rope/v_flat. The legacy SDPA fallback branch DOES
+    // call download_f32 and requires a CPU barrier (commit_and_wait).
+    //
+    // Condition: arena=Some && seq_len > 1 && head_dim == 256.
+    // head_dim == 256 is the production Qwen3.5/3.6 value and matches the
+    // new_path_eligible check in apply_sdpa_with_kv_cache. cur_len == 0 is
+    // guaranteed by prefill-from-zero (the arena is only allocated in
+    // forward_gpu_impl when seq_len > 1, and fresh-slot cur_len is always 0).
+    let use_arena = fa_arena.is_some() && seq_len > 1 && head_dim == 256;
     let q_total = n_heads * head_dim;
     let kv_total = n_kv_heads * head_dim;
 

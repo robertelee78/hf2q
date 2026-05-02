@@ -1378,6 +1378,36 @@ impl Qwen35Model {
             &device,
         );
 
+        // ---- ADR-013 P21 S1: FaPrefillArena allocation ----
+        //
+        // Allocated ONCE per prefill (seq_len > 1), sized for the actual prompt
+        // length and the FA shape (n_heads, n_kv_heads, head_dim). Reused across
+        // all FullAttn layers in the loop below.
+        //
+        // Lifetime: dropped at end of forward_gpu_impl, AFTER the final
+        // output-head commit_and_wait_labeled — which guarantees all arena
+        // buffers are still alive when any CB that references them executes.
+        //
+        // Skip when seq_len == 1 (decode): decode never enters the FA prefill
+        // bridge or the prefill branches of ops1-4 / ops6-7 commits. All decode
+        // paths already use commit_labeled (no wait).
+        //
+        // Skip when the model has no FullAttn layers: defensive — avoids a zero-
+        // useful arena allocation when running DN-only models.
+        let mut fa_arena: Option<super::FaPrefillArena> = if seq_len > 1
+            && layer_weights_gpu.iter().any(|l| matches!(l, LayerWeightsGpu::FullAttn { .. }))
+        {
+            let shape = FullAttnShape::from_config(cfg);
+            Some(
+                super::FaPrefillArena::new(
+                    &device, seq_len, shape.n_head, shape.n_kv, shape.head_dim,
+                )
+                .context("alloc FaPrefillArena")?,
+            )
+        } else {
+            None
+        };
+
         // ---- Step 2: per-layer forward pass ----
         let decode_profile = std::env::var("HF2Q_DECODE_PROFILE").is_ok();
         let mut total_attn_us = 0u64;
@@ -1492,7 +1522,7 @@ impl Qwen35Model {
                         shape.rope_theta,
                         shape.mrope_section,
                         shape.rms_norm_eps,
-                        None,
+                        fa_arena.as_mut(),
                     )
                     .with_context(|| format!("full_attn layer {layer_idx}"))?
                 }
