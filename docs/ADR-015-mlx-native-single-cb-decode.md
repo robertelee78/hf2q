@@ -1819,6 +1819,28 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-05-02 (UTC ~22:30Z) — iter89a FALSIFIED at zero risk: forcing mv_id route via `HF2Q_MM_ID_ROUTING_THRESHOLD=99999` produces +1852 ms wall regression (1.93× slower). mm_id IS the correct route at (m=2048, k=512, top_k=1). The 0.82× peer ratio for ffn_down is at the kernel-implementation level, NOT route selection. iter89b kernel audit is the next target.**
+
+  **iter89a method:** env override forces mv_id route for ALL n_tokens (default threshold 32 → 99999). 4 paired cold trials (warmup + T1-T3) on chunk-engaged pp4096.
+
+  | Trial | Baseline | mvid forced | Delta |
+  |---|---:|---:|---:|
+  | warmup | 2000 ms | 3841 ms | +1841 ms |
+  | T1 | 1988 ms | 3818 ms | +1830 ms |
+  | T2 | 1984 ms | 3842 ms | +1858 ms |
+  | T3 | 2006 ms | 3840 ms | +1834 ms |
+  | **median** | **1988** | **3840** | **+1852 ms (1.93×)** |
+
+  Per-CB attribution: baseline `layer.moe_ffn` = 16.2 ms/layer (648 ms total, 44%); mvid forced = **61.8 ms/layer (2471 ms total, 75%)** — 3.8× slower per layer. mv_id is much worse at large total_rows.
+
+  **Implication:** the iter88a COMPARISON.md hypothesis "mv_id route might be faster for top_k=1" is REFUTED. mlx-native's auto-selection of mm_id at n_tokens > 32 is correct. The kernel-level gap (mlx-native 0.82× peer at the (m=2048, k=512) shape) lives INSIDE `kernel_mul_mm_id_q4_0_f32`, not in route selection.
+
+  **iter89b queued (next primary):** kernel audit of `/opt/mlx-native/src/shaders/quantized_matmul_id_mm_tensor.metal` at (m=2048, k=512, top_k=1) vs `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:10161` `kernel_mul_mm_id_q4_0_f32`. Audit areas: shmem tile size for the small K=512 (compared to typical mm tile NK=32 with k_iter=16 = 512 — exactly one K-tile, possibly underutilizing the kernel), expert-stride access pattern for top_k=1 (each row reads ONE expert), output write coalescing across 32768 rows.
+
+  **Receipts.** `/tmp/cfa-iter89a/logs/{warmup,T1..T3}-{baseline,mvid}.log` + `test.log` (4 paired trials with full per-CB profile dumps).
+
+  Status: iter89a kernel-route hypothesis FALSIFIED. Loop continues to iter89b kernel-implementation audit.
+
 - **2026-05-02 (UTC ~22:00Z) — iter88a HARNESS LANDED, "exhausted" framing FALSIFIED. Per-kernel peer comparison reveals: mlx-native MoE FFN gate/up is 1.16-1.20× FASTER than llama.cpp at production batch sizes; MoE FFN down lags 0.76-0.86× (86 ms gap = 14% of 616 ms wall gap); the OTHER 530 ms gap lives in encoder/orchestration/CB residency NOT kernel speed. Iter72-87d's "ADR-015 in-scope levers exhausted" was wrong because we never compared against peer at the kernel level; we were guessing at wrappers and optimization classes without grounded attribution.**
 
   **User directive that triggered this iter (load-bearing):**
