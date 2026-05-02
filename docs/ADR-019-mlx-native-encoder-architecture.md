@@ -61,7 +61,7 @@ iter88a (`/tmp/cfa-iter88a/COMPARISON.md`) ran a per-kernel peer comparison harn
 - **Only MoE FFN-down lags 0.76-0.86× of peer = 86 ms gap** (14% of the 616 ms wall gap).
 - **The OTHER 530 ms (86%) is in encoder/orchestration/CB residency, NOT kernel speed.**
 
-Subsequent iters falsified four candidate mechanisms for the 530 ms residual:
+Subsequent iters falsified five candidate mechanisms for the 530 ms residual:
 | iter | Hypothesis | Verdict |
 |---|---|---|
 | iter89a | mm_id routing threshold | mm_id route is correct |
@@ -69,6 +69,9 @@ Subsequent iters falsified four candidate mechanisms for the 530 ms residual:
 | iter89c | dense-q microbench mirror | confirms kernel parity |
 | iter89d | xctrace 577 ms residual | byte-identical metallib + byte-equivalent ISA |
 | iter89e | GDN microbench | kernel speed is **not** the mechanism |
+| **iter89d-B** | raw-simdgroup variant of `kernel_mul_mm_id_q4_0_f32` (faithful llama.cpp `(half, half, float)` MMA mirror, no MPP) | **FALSIFIED at +525 ms WORSE on mm_id prefill bucket; raw-simd is 0.71× peer; MPP tensor IS the FAST path on M5 Max.** Triple-convergent kernel close (89b/c/d-B). Receipt: `/tmp/cfa-adr015-iter89db/results.md`; mlx-native `adr015-iter89db-raw-simdgroup-mul-mm-id` HEAD `84f4bbc`. |
+
+**Bonus finding from iter89d-B (2026-05-02 ~24:00Z):** session-internal cell A measurement of the production MPP tensor variant at FFN-down shape (m=2048, k=512) reads **0.97× peer = within parity**. This raises the question of whether the iter88a-cited 86 ms / 0.76-0.86× FFN-down deficit was shape-conditional or session-noise-bound. **Conservative interpretation (load-bearing):** the kernel-level fence is now CLOSED for FFN-down — no further mlx-native kernel work will recover the cited 86 ms because (a) three independent falsifications converge on "MPP IS optimal," and (b) within-parity sessions exist. Whether the 86 ms is real or measurement-bound, ADR-019's encoder/orchestration consolidation captures the optimization surface either way; if the 86 ms turns out to be session-conditional, the ADR-019 cumulative ship-gate at AC-P1 (≥ 80 ms) targets THE ENTIRE remaining gap.
 
 **Convergent finding (load-bearing):** the +50% chunk-engaged peer gap is COMMAND BUFFER COUNT ASYMMETRY. mlx-native uses 100+ CBs per chunk-engaged prefill via per-layer `commit_labeled` / `commit_and_wait_labeled` sites; llama.cpp uses `dispatch_apply(n_cb, encode_async)` to encode the entire graph into n_cb+1 ∈ {2, 3, 5, 9} CBs. Each MTLCommandBuffer creation+commit has measurable CPU + driver-round-trip overhead; 100× more CBs = order-of-magnitude more orchestration cost, plus GPU pipeline stalls at every `commit_and_wait_labeled` boundary.
 
