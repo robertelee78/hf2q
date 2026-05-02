@@ -1466,6 +1466,33 @@ impl PromptCache {
     /// `min_p`, `tool_call_policy`, `logprobs`, `top_logprobs`,
     /// `parallel_tool_calls`.  See `PromptCacheKey` doc for rationale.
     pub fn lookup(&self, prompt_tokens: &[u32], params: &SamplingParams) -> Option<GenerationResult> {
+        self.lookup_with_fragments(prompt_tokens, params)
+            .map(|(result, _frags)| result)
+    }
+
+    /// Streaming-aware cache check: returns the cached `GenerationResult`
+    /// AND a borrow of the captured fragment vec (if any) so the caller
+    /// can branch its replay strategy on origin (W-A2.3).
+    ///
+    /// Same eligibility gate as `lookup`.  Streaming-origin entries
+    /// (stored via `store_with_fragments(.., Some(_))`) yield
+    /// `Some((result, Some(frags)))` — replay emits each
+    /// `CachedFragment` directly as the matching `GenerationEvent`,
+    /// byte-identical to the live event stream (W-A2.3 fragments
+    /// branch).  Non-streaming origin entries (stored via plain
+    /// `store(...)`) yield `Some((result, None))` — replay falls
+    /// through to the splitter-rerun branch, preserving the Wave-3.5
+    /// HIGH-2 splitter `tail_buf` drain (engine.rs:4332).
+    ///
+    /// The fragment vec is borrowed (`&Vec<CachedFragment>`) rather
+    /// than cloned to keep the cache-hit fast path zero-copy.  Replay
+    /// streams each fragment as a fresh `GenerationEvent` whose String
+    /// payloads are cloned at emit time only.
+    pub fn lookup_with_fragments(
+        &self,
+        prompt_tokens: &[u32],
+        params: &SamplingParams,
+    ) -> Option<(GenerationResult, Option<&Vec<CachedFragment>>)> {
         // Bypass for any non-greedy mode.  These all introduce per-call
         // variance that a cached replay would silently erase.
         if params.temperature > 0.0
@@ -1484,7 +1511,7 @@ impl PromptCache {
         if self.key != request_key {
             return None;
         }
-        Some(GenerationResult {
+        let result = GenerationResult {
             text: self.text.clone(),
             reasoning_text: self.reasoning_text.clone(),
             prompt_tokens: prompt_tokens.len(),
@@ -1497,7 +1524,8 @@ impl PromptCache {
             prefill_duration: Duration::ZERO,
             decode_duration: Duration::ZERO,
             cached_tokens: prompt_tokens.len(),
-        })
+        };
+        Some((result, self.fragments.as_ref()))
     }
 
     /// Cache write: store this request's result so the next
@@ -4571,7 +4599,157 @@ fn replay_cached_streaming_response(
     tool_call_policy: ToolCallPolicy,
     events: &EventSink<'_>,
 ) -> Result<(), ()> {
+    // W-A2.3 default callers (tests, helpers without fragment access) get
+    // the splitter-rerun replay path — fragments=None preserves the Wave-3.5
+    // HIGH-2 tail_buf drain.  Streaming origin (`generate_stream_once` cache
+    // hit) drives `replay_cached_streaming_response_with_fragments` directly
+    // with `Some(frags)` to bypass the splitter pipeline entirely and emit
+    // byte-identical event-stream framing.
+    replay_cached_streaming_response_with_fragments(
+        cached,
+        registration,
+        tool_call_policy,
+        events,
+        None,
+    )
+}
+
+/// W-A2.3 fragments-aware streaming-cache replay.
+///
+/// Branches on `cached_fragments`:
+///
+/// - `Some(frags)` — **fragments-replay branch**.  Emit each
+///   `CachedFragment` directly as the matching `GenerationEvent`, then
+///   emit the terminal `Done`.  Skips the ReasoningSplitter +
+///   ToolCallSplitter pipeline, the splitter feeds, AND the
+///   end-of-stream `tail_buf` drain (Wave-3.5 HIGH-2 fix at
+///   engine.rs:4332).  The drain is unnecessary on this branch
+///   because the splitters never run — there is no held-back tail to
+///   drop.  Captured at streaming origin, so per-token boundaries are
+///   preserved byte-for-byte (the W-A2 closure UX win).
+///
+/// - `None` — **legacy splitter-rerun branch** (preserves the
+///   Wave-3.5 HIGH-2 splitter drain).  Builds fresh
+///   ReasoningSplitter + ToolCallSplitter from the registration,
+///   feeds `cached.text` through them, and drains both at end of
+///   stream.  This path is for non-streaming-origin entries (no
+///   per-token trace exists) and for any test/legacy caller of
+///   `replay_cached_streaming_response`.
+///
+/// The fragments branch is the byte-identical-event-stream contract
+/// — Worker AA design §6 falsifiable closure.
+fn replay_cached_streaming_response_with_fragments(
+    cached: &GenerationResult,
+    registration: Option<&super::registry::ModelRegistration>,
+    tool_call_policy: ToolCallPolicy,
+    events: &EventSink<'_>,
+    cached_fragments: Option<&Vec<CachedFragment>>,
+) -> Result<(), ()> {
     use super::sse::{DeltaKind, GenerationEvent, StreamStats};
+
+    // ── 0. Fragments-replay branch (W-A2.3) ─────────────────────────────
+    //
+    // Streaming-origin entry: emit each captured fragment directly as the
+    // matching GenerationEvent.  No splitter pipeline, no tail_buf drain —
+    // the W-A2.2 capture mirrors EVERY emitted Delta / ToolCallDelta into
+    // the vec, so the splitter run that originally produced these emits
+    // does not need to be re-run.
+    //
+    // Critical Chesterton-fence note: this branch MUST emit the SAME
+    // terminal `Done` event the splitter-rerun branch emits below
+    // (cached_prompt_tokens populated, timings zeroed).  If the Done
+    // shape diverges, the byte-identity contract from Worker AA §6
+    // breaks.  The Done emit is shared across both branches by falling
+    // through after the fragments emit.
+    if let Some(frags) = cached_fragments {
+        // saw_tool_call: a streaming-origin capture that produced any
+        // ToolCallDelta means the live decode reached at least one
+        // ToolCallClose, which is the same trigger
+        // `generate_stream_once`'s `saw_tool_call` flag uses.  Mirror
+        // the live `Done.finish_reason = "tool_calls"` override here so
+        // the cache replay's terminal chunk matches the original
+        // request's terminal chunk.
+        let mut saw_tool_call = false;
+        for frag in frags {
+            match frag {
+                CachedFragment::Content(text) => {
+                    if !text.is_empty()
+                        && events
+                            .blocking_send(GenerationEvent::Delta {
+                                kind: DeltaKind::Content,
+                                text: text.clone(),
+                            })
+                            .is_err()
+                    {
+                        return Err(());
+                    }
+                }
+                CachedFragment::Reasoning(text) => {
+                    if !text.is_empty()
+                        && events
+                            .blocking_send(GenerationEvent::Delta {
+                                kind: DeltaKind::Reasoning,
+                                text: text.clone(),
+                            })
+                            .is_err()
+                    {
+                        return Err(());
+                    }
+                }
+                CachedFragment::ToolCallDelta {
+                    index,
+                    id,
+                    call_type,
+                    name,
+                    arguments,
+                } => {
+                    saw_tool_call = true;
+                    if events
+                        .blocking_send(GenerationEvent::ToolCallDelta {
+                            index: *index,
+                            id: id.clone(),
+                            call_type: call_type.clone(),
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                        })
+                        .is_err()
+                    {
+                        return Err(());
+                    }
+                }
+            }
+        }
+        // Emit Done — same shape as the splitter-rerun branch below.
+        // Tool-call replay overrides finish_reason per OpenAI spec.
+        let stats = StreamStats {
+            prefill_time_secs: Some(0.0),
+            decode_time_secs: Some(0.0),
+            total_time_secs: Some(0.0),
+            time_to_first_token_ms: Some(0.0),
+            prefill_tokens_per_sec: None,
+            decode_tokens_per_sec: None,
+            gpu_sync_count: None,
+            gpu_dispatch_count: None,
+            cached_prompt_tokens: Some(cached.cached_tokens),
+            reasoning_tokens: cached.reasoning_tokens,
+        };
+        if events
+            .blocking_send(GenerationEvent::Done {
+                finish_reason: if saw_tool_call {
+                    "tool_calls"
+                } else {
+                    cached.finish_reason
+                },
+                prompt_tokens: cached.prompt_tokens,
+                completion_tokens: cached.completion_tokens,
+                stats,
+            })
+            .is_err()
+        {
+            return Err(());
+        }
+        return Ok(());
+    }
 
     // ── 1. Reasoning replay ─────────────────────────────────────────────
     //
@@ -4937,23 +5115,37 @@ fn generate_stream_once(
     // logprobs/top_logprobs, parallel_tool_calls).  See PromptCacheKey
     // doc at engine.rs:489-535 for the full inventory.
     //
-    // On hit, `replay_cached_streaming_response` re-routes the cached
-    // text through the same Reasoning + ToolCall splitter pipeline the
-    // live decode uses, so the SSE shape (Content / Reasoning /
-    // ToolCallDelta) matches what the original request produced.  See
-    // that helper's doc for the cache-shape decision (text-only ⇒ single
-    // splitter pass, NOT per-token replay; per-token replay would require
-    // extending PromptCache to store the Delta sequence).
-    if let Some(cached) = loaded.prompt_cache.lookup(prompt_tokens, params) {
+    // On hit, the replay path emits the cached event sequence:
+    //
+    //   - **Streaming-origin entry** (W-A2.2 captured fragments): emit
+    //     each `CachedFragment` directly as the matching
+    //     `GenerationEvent`, byte-identical to the live event stream.
+    //     This is the W-A2.3 fragments-replay branch — preserves
+    //     per-token boundaries (perceived TTFT/streaming-rate UX).
+    //
+    //   - **Non-streaming-origin entry** (no captured fragments):
+    //     re-route the cached text through fresh ReasoningSplitter +
+    //     ToolCallSplitter, drain both at end-of-stream (Wave-3.5
+    //     HIGH-2 fix at engine.rs:4332).  Preserves structural shape
+    //     (Content / Reasoning / ToolCallDelta) but loses per-token
+    //     boundaries.  This branch fires when the cache entry came
+    //     from `generate_once_with_soft_tokens` (no per-token trace
+    //     exists at non-streaming origin).
+    if let Some((cached, cached_frags)) =
+        loaded.prompt_cache.lookup_with_fragments(prompt_tokens, params)
+    {
         tracing::debug!(
-            "prompt_cache: STREAMING HIT — {} tokens served from cache, prefill+decode skipped",
-            cached.prompt_tokens
+            "prompt_cache: STREAMING HIT — {} tokens served from cache, \
+             prefill+decode skipped, fragments_branch={}",
+            cached.prompt_tokens,
+            cached_frags.is_some(),
         );
-        if replay_cached_streaming_response(
+        if replay_cached_streaming_response_with_fragments(
             &cached,
             registration,
             params.tool_call_policy,
             events,
+            cached_frags,
         )
         .is_err()
         {
@@ -8807,6 +8999,256 @@ mod streaming_prompt_cache_replay_tests {
              regression that drops EITHER drain would lose the bytes \
              because both splitters' tail_buf can swallow 2 bytes \
              entirely.\nevents: {events:?}"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // ADR-005 iter-224 W-A2.3 — fragments-replay branch byte-identity
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Falsifiable closure (Worker AA design §6, unit-test variant):
+    /// build a known `Vec<CachedFragment>`, store via
+    /// `PromptCache::store_with_fragments`, drive the streaming-cache
+    /// hit path, capture the replayed event stream, assert
+    /// fragment-by-fragment byte-identity.
+    ///
+    /// **Fail-first**: this test would fail at the start of W-A2.3 (no
+    /// fragments branch yet → falls through to splitter-rerun → emits
+    /// one big Content delta of `cached.text` instead of the per-token
+    /// boundaries the captured Vec preserves).  PASSES post-W-A2.3.
+    ///
+    /// Covers: Content + Reasoning + ToolCallDelta first-chunk +
+    /// ToolCallDelta args-chunk + tool-call finish_reason override
+    /// (`saw_tool_call → "tool_calls"`).
+    #[test]
+    fn streaming_fragment_replay_byte_identical_event_stream() {
+        let frags: Vec<CachedFragment> = vec![
+            CachedFragment::Reasoning("plan: ".to_string()),
+            CachedFragment::Reasoning("call get_weather".to_string()),
+            CachedFragment::Content("OK ".to_string()),
+            CachedFragment::ToolCallDelta {
+                index: 0,
+                id: Some("call_hf2q_aabb".to_string()),
+                call_type: Some("function".to_string()),
+                name: Some("get_weather".to_string()),
+                arguments: None,
+            },
+            CachedFragment::ToolCallDelta {
+                index: 0,
+                id: None,
+                call_type: None,
+                name: None,
+                arguments: Some("{".to_string()),
+            },
+            CachedFragment::ToolCallDelta {
+                index: 0,
+                id: None,
+                call_type: None,
+                name: None,
+                arguments: Some("\"loc\":\"SF\"}".to_string()),
+            },
+            CachedFragment::Content(" Done.".to_string()),
+        ];
+
+        // Cache populated as if streaming origin completed (text is
+        // accumulated_text-style; reasoning_text=None because the live
+        // splitter routed reasoning into Reasoning deltas as decoded).
+        let mut cache = PromptCache::new();
+        let tokens: Vec<u32> = vec![100, 200, 300];
+        let params = SamplingParams::default();
+        let result = GenerationResult {
+            text: "<think>plan: call get_weather</think>OK <|tool_call>call:get_weather{loc:<|\"|>SF<|\"|>}<tool_call|> Done.".to_string(),
+            reasoning_text: None,
+            prompt_tokens: tokens.len(),
+            completion_tokens: 10,
+            reasoning_tokens: Some(2),
+            // Pre-store finish_reason — the replay overrides to
+            // "tool_calls" because the captured Vec contains a
+            // ToolCallDelta.  This mirrors the live `saw_tool_call`
+            // override in `generate_stream_once`.
+            finish_reason: "stop",
+            prefill_duration: Duration::ZERO,
+            decode_duration: Duration::ZERO,
+            cached_tokens: 0,
+        };
+        cache.store_with_fragments(&tokens, &params, &result, Some(frags.clone()));
+
+        // Drive lookup_with_fragments + replay.
+        let (cached, cached_frags) = cache
+            .lookup_with_fragments(&tokens, &params)
+            .expect("greedy hit");
+        assert!(
+            cached_frags.is_some(),
+            "lookup must return Some(fragments) for streaming-origin entry"
+        );
+
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(64);
+        let res = replay_cached_streaming_response_with_fragments(
+            &cached,
+            None, // registration irrelevant on fragments branch (no splitter run)
+            ToolCallPolicy::Auto,
+            &EventSink::new(&tx),
+            cached_frags,
+        );
+        assert!(res.is_ok(), "fragments replay must succeed");
+        drop(tx);
+
+        let mut emitted: Vec<GenerationEvent> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            emitted.push(ev);
+        }
+
+        // Expected event stream = frags.len() Delta/ToolCallDelta + 1 Done.
+        assert_eq!(
+            emitted.len(),
+            frags.len() + 1,
+            "fragments branch emits N fragments + 1 Done; got {} events",
+            emitted.len()
+        );
+
+        // Per-event byte-identity — Reasoning, Content, ToolCallDelta.
+        for (i, frag) in frags.iter().enumerate() {
+            match (frag, &emitted[i]) {
+                (CachedFragment::Reasoning(t), GenerationEvent::Delta { kind, text }) => {
+                    assert_eq!(*kind, DeltaKind::Reasoning);
+                    assert_eq!(text, t);
+                }
+                (CachedFragment::Content(t), GenerationEvent::Delta { kind, text }) => {
+                    assert_eq!(*kind, DeltaKind::Content);
+                    assert_eq!(text, t);
+                }
+                (
+                    CachedFragment::ToolCallDelta {
+                        index: fi,
+                        id: fid,
+                        call_type: fct,
+                        name: fn_,
+                        arguments: fargs,
+                    },
+                    GenerationEvent::ToolCallDelta {
+                        index,
+                        id,
+                        call_type,
+                        name,
+                        arguments,
+                    },
+                ) => {
+                    assert_eq!(*fi, *index);
+                    assert_eq!(fid, id);
+                    assert_eq!(fct, call_type);
+                    assert_eq!(fn_, name);
+                    assert_eq!(fargs, arguments);
+                }
+                (frag, ev) => panic!("frag[{i}] {frag:?} did not match emitted event {ev:?}"),
+            }
+        }
+
+        // Terminal Done — finish_reason="tool_calls" (override) +
+        // cache-hit signal populated.
+        match emitted.last() {
+            Some(GenerationEvent::Done {
+                finish_reason,
+                prompt_tokens,
+                completion_tokens,
+                stats,
+            }) => {
+                assert_eq!(
+                    *finish_reason, "tool_calls",
+                    "fragments-branch saw_tool_call MUST override stored finish_reason"
+                );
+                assert_eq!(*prompt_tokens, 3);
+                assert_eq!(*completion_tokens, 10);
+                assert_eq!(stats.cached_prompt_tokens, Some(3));
+                assert_eq!(stats.prefill_time_secs, Some(0.0));
+                assert_eq!(stats.decode_time_secs, Some(0.0));
+                assert_eq!(stats.reasoning_tokens, Some(2));
+            }
+            other => panic!("last event must be Done; got {other:?}"),
+        }
+    }
+
+    /// Regression-pin (Chesterton's fence): with `fragments=None`, the
+    /// replay path MUST run the splitter pipeline AND drain `tail_buf`
+    /// — Wave-3.5 HIGH-2 fix at engine.rs:4332.  Pre-Wave-3.5 the
+    /// replay fed `cached.text` once and emitted Done, never calling
+    /// `finish()` on either splitter, so held-back tail bytes were
+    /// silently dropped.
+    ///
+    /// W-A2.3 must NOT regress this: a tail-bytes drop on the
+    /// non-fragment path would silently truncate cache hits whose
+    /// origin was non-streaming (or whose fragments slot is otherwise
+    /// `None`).  The existing
+    /// `streaming_prompt_cache_replay_tests::replay_drains_*` tests
+    /// pin this; this test re-pins specifically the fragments=None
+    /// branch with a fresh assertion that the Wave-3.5 drain still
+    /// fires.
+    #[test]
+    fn fragments_none_replay_preserves_splitter_drain() {
+        // Build a cached entry with no fragments — should hit
+        // splitter-rerun branch.  Use registration so splitters are
+        // active (otherwise drain is a no-op).
+        let mut cache = PromptCache::new();
+        let tokens: Vec<u32> = vec![1, 2, 3];
+        let params = SamplingParams::default();
+
+        // Text whose tail is shorter than the splitter's `tail_cap` —
+        // pre-Wave-3.5 this would be silently dropped.
+        let result = GenerationResult {
+            text: "ok".to_string(),
+            reasoning_text: None,
+            prompt_tokens: tokens.len(),
+            completion_tokens: 1,
+            reasoning_tokens: None,
+            finish_reason: "stop",
+            prefill_duration: Duration::ZERO,
+            decode_duration: Duration::ZERO,
+            cached_tokens: 0,
+        };
+        cache.store(&tokens, &params, &result);
+        // Confirm fragments=None (legacy single-arg store).
+        assert!(cache.fragments.is_none());
+
+        let (cached, cached_frags) = cache
+            .lookup_with_fragments(&tokens, &params)
+            .expect("greedy hit");
+        assert!(
+            cached_frags.is_none(),
+            "non-streaming-origin must yield fragments=None"
+        );
+
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(32);
+        let res = replay_cached_streaming_response_with_fragments(
+            &cached,
+            Some(&super::super::registry::GEMMA4),
+            ToolCallPolicy::Auto,
+            &EventSink::new(&tx),
+            cached_frags,
+        );
+        assert!(res.is_ok());
+        drop(tx);
+
+        let mut emitted: Vec<GenerationEvent> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            emitted.push(ev);
+        }
+        // Expected: splitter pipeline produces a Content delta (2-byte
+        // tail flushed via finish() drain) + Done.  If the drain
+        // regressed, "ok" would not appear in any Content delta.
+        let content_concat: String = emitted
+            .iter()
+            .filter_map(|ev| match ev {
+                GenerationEvent::Delta {
+                    kind: DeltaKind::Content,
+                    text,
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            content_concat, "ok",
+            "fragments=None branch MUST exercise splitter drain — \
+             a regression here re-introduces the Wave-3.5 HIGH-2 \
+             tail-drop bug. emitted={emitted:?}"
         );
     }
 }
