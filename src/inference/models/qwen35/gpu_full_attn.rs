@@ -1580,7 +1580,11 @@ pub fn build_gated_attn_layer(
     rms_norm_eps: f32,
     fa_arena: Option<&mut crate::inference::models::qwen35::FaPrefillArena>,
 ) -> Result<MlxBuffer> {
-    let _ = fa_arena;  // TODO(P21-Worker-B): wire into scratch allocations + commit_labeled
+    // Capture arena presence before moving fa_arena into the SDPA call below.
+    // Used to decide the commit vs commit_labeled path for ops1-4 and ops6-7:
+    // when arena=Some && seq_len > 1, scratch buffers are arena-owned and
+    // outlive this CB, so commit_labeled (no host wait) is safe per A.5.
+    let use_arena = fa_arena.is_some() && seq_len > 1;
     let q_total = n_heads * head_dim;
     let kv_total = n_kv_heads * head_dim;
 
@@ -1658,11 +1662,23 @@ pub fn build_gated_attn_layer(
         // The SDPA encode path (apply_sdpa_with_kv_cache seq=1 branch) never
         // calls download_f32 so no CPU buffer access races.
         //
-        // Prefill path (seq>1) or non-standard head_dim: commit_and_wait()
+        // Prefill path (seq>1) without arena: commit_and_wait()
         // because apply_sdpa_with_kv_cache's prefill branch calls download_f32
         // (CPU read) on k_rope/v_flat before submitting any GPU work, so the
         // GPU must have finished writing those buffers before we return.
+        //
+        // Prefill path (seq>1) with arena (use_arena=true): the new_path_eligible
+        // branch of apply_sdpa_with_kv_cache calls apply_flash_attn_prefill_seq_major
+        // which does NOT call download_f32 — it works entirely on GPU. So the
+        // arena-path commit_and_wait is redundant and can be downgraded to
+        // commit_labeled. The Metal serial queue ensures ops1-4 completes before
+        // the FA bridge encoder starts (iter58b safety: ops1-4 buffers are NOT
+        // arena-owned — they are per-layer allocations from the pooled helper —
+        // but they are consumed only by the FA bridge via GPU-ordering, not by
+        // any CPU download_f32. Downgrade is safe by A.1 / queen plan).
         if seq_len == 1 && head_dim % 32 == 0 {
+            enc.commit_labeled("layer.full_attn.ops1-4");
+        } else if use_arena {
             enc.commit_labeled("layer.full_attn.ops1-4");
         } else {
             enc.commit_and_wait().context("commit ops1-4 prefill")?;
@@ -1744,7 +1760,7 @@ pub fn build_gated_attn_layer(
                 device, registry,
                 &q_rope, &k_rope, &v_flat,
                 slot, seq_len, n_heads, n_kv_heads, head_dim, max_seq_len,
-                None,
+                fa_arena,
             )?,
             None => {
                 let mut enc = device.command_encoder().context("enc op5")?;
@@ -1819,11 +1835,20 @@ pub fn build_gated_attn_layer(
         // via a new encoder on the same Metal serial queue, so the GPU will
         // execute ops6-7 before fused_residual_norm without a CPU sync.
         //
-        // Prefill (seq>1): pooled helper falls back to unpooled internally;
-        // commit_and_wait() because dump_hidden_stats in forward_gpu may do a
-        // CPU read of the returned buffer, and because prefill throughput is
-        // not the hot path.
+        // Prefill (seq>1) without arena: commit_and_wait() because
+        // dump_hidden_stats in forward_gpu may do a CPU read of the returned
+        // buffer (HF2Q_DECODE_PROFILE-gated), and because prefill throughput
+        // was not the hot path pre-P21.
+        //
+        // Prefill (seq>1) with arena (use_arena=true): the returned `out` is
+        // consumed by dispatch_fused_residual_norm_f32 on the same Metal serial
+        // queue. That dispatch is GPU-ordered behind this CB, so no CPU sync
+        // is needed. dump_hidden_stats is HF2Q_DECODE_PROFILE-gated (env-only
+        // diagnostic, not on the production path). Downgrade to commit_labeled
+        // is safe per queen plan A.1 ops6-7 analysis.
         if seq_len == 1 {
+            enc.commit_labeled("layer.full_attn.ops6-7");
+        } else if use_arena {
             enc.commit_labeled("layer.full_attn.ops6-7");
         } else {
             enc.commit_and_wait().context("commit ops6-7")?;
