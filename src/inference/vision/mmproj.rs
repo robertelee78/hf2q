@@ -583,6 +583,92 @@ impl ArchProfile {
             ArchProfile::Gemma4Siglip | ArchProfile::ClipClassic | ArchProfile::Qwen3VlSiglip
         )
     }
+
+    /// Map the parsed `ArchProfile` to the chat-handler-side
+    /// [`VisionFamily`] used for placeholder syntax + token-id lookup.
+    ///
+    /// Wedge-4d (iter-224 row 4): the chat handler's
+    /// `rewrite_messages_for_vision_placeholders` and
+    /// `expand_image_placeholders` need a single value to switch on so
+    /// the right special-token marker is embedded in the rendered
+    /// prompt. `ArchProfile` carries that information already (it
+    /// reflects the loaded mmproj's projector); this convenience
+    /// projection avoids spreading `match arch { ... }` over the
+    /// handler.
+    pub fn vision_family(&self) -> VisionFamily {
+        match self {
+            ArchProfile::Gemma4Siglip | ArchProfile::ClipClassic => VisionFamily::Gemma,
+            ArchProfile::Qwen3VlSiglip => VisionFamily::Qwen3Vl,
+            ArchProfile::Unknown => VisionFamily::Unknown,
+        }
+    }
+}
+
+/// Multimodal chat-handler vision family.
+///
+/// Distinct from `ArchProfile` because that enum is mmproj-tensor-shape
+/// oriented (drives `compute_vision_embeddings_gpu_dispatch`), while
+/// `VisionFamily` is chat-template / placeholder-marker oriented
+/// (drives `rewrite_messages_for_vision_placeholders` +
+/// `expand_image_placeholders`).
+///
+/// Mapping (per `ArchProfile::vision_family`):
+/// - `Gemma4Siglip` / `ClipClassic` → `VisionFamily::Gemma` (placeholder
+///   `<|image|>`, single special-token id resolved via
+///   `Tokenizer::token_to_id("<|image|>")`).
+/// - `Qwen3VlSiglip` → `VisionFamily::Qwen3Vl` (placeholder marker
+///   `<|vision_start|><|image_pad|><|vision_end|>` rendered into the
+///   user message; the inner `<|image_pad|>` is the per-token expansion
+///   target, with id resolved via
+///   `Tokenizer::token_to_id("<|image_pad|>")` — id 151655 in canonical
+///   Qwen3-VL tokenizers but resolved at runtime so the loader is the
+///   single source of truth).
+/// - `Unknown` → `VisionFamily::Unknown` (handler returns 400).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionFamily {
+    /// Gemma 4 / generic CLIP (single `<|image|>` placeholder per image).
+    Gemma,
+    /// Qwen3-VL (`<|vision_start|><|image_pad|><|vision_end|>` triplet
+    /// per image; only the inner `<|image_pad|>` is expanded to
+    /// `n_image_tokens` copies — the start/end markers count as a single
+    /// token each in the tokenized prompt, exactly like peer mtmd
+    /// emits at `tools/mtmd/mtmd.cpp:317-319`).
+    Qwen3Vl,
+    /// Unsupported / unknown profile — handler short-circuits to 400.
+    Unknown,
+}
+
+impl VisionFamily {
+    /// Token literal that appears as a single tokenized id in the
+    /// rendered prompt and must be expanded to `n_image_tokens` copies
+    /// at the soft-token-injection step. Returned as a `&'static str`
+    /// because the value is a compile-time constant per family.
+    ///
+    /// For `Gemma`: `<|image|>` (expanded by
+    /// `expand_image_placeholders` to N copies).
+    /// For `Qwen3Vl`: `<|image_pad|>` (the inner placeholder of the
+    /// `<|vision_start|>...<|vision_end|>` triplet; the start/end
+    /// markers are NOT expanded — they remain as single tokens).
+    pub fn placeholder_token_literal(&self) -> Option<&'static str> {
+        match self {
+            VisionFamily::Gemma => Some("<|image|>"),
+            VisionFamily::Qwen3Vl => Some("<|image_pad|>"),
+            VisionFamily::Unknown => None,
+        }
+    }
+
+    /// Marker triplet (open + close) that wraps the per-image
+    /// placeholder in the rewritten user message. `Gemma` returns
+    /// `("", "")` because its chat template handles the wrapping itself;
+    /// `Qwen3Vl` returns `("<|vision_start|>", "<|vision_end|>")`
+    /// matching peer at `tools/mtmd/mtmd.cpp:317-319`.
+    pub fn marker_pair(&self) -> (&'static str, &'static str) {
+        match self {
+            VisionFamily::Gemma => ("", ""),
+            VisionFamily::Qwen3Vl => ("<|vision_start|>", "<|vision_end|>"),
+            VisionFamily::Unknown => ("", ""),
+        }
+    }
 }
 
 /// Detect the mmproj's tensor-naming profile from a tensor-name list.

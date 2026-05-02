@@ -359,6 +359,8 @@ pub async fn chat_completions(
         vit_forward_ms,
         vit_images,
         vit_soft_tokens_total,
+        deepstack_data,
+        positions_flat,
     } = prepared;
     let engine: &Engine = &loaded_engine.engine;
     // Wave-2.5 A4: save policy before params is moved into the engine call.
@@ -370,14 +372,27 @@ pub async fn chat_completions(
     let pre_dispatches = mlx_native::dispatch_count();
     let pre_syncs = mlx_native::sync_count();
     let gen_started = std::time::Instant::now();
-    // Vision dispatch fork (Phase 2c Task #17 / iter-99): when the
-    // multimodal preflight produced soft-token overrides, route through
-    // `Engine::generate_with_soft_tokens` so the worker plugs the
-    // projected ViT embeddings into the prefill at every placeholder
-    // position.  Empty `soft_tokens` ⇒ pure-text path (unchanged
-    // `Engine::generate`).
+    // Vision dispatch fork (Phase 2c Task #17 / iter-99 + Wedge-4d):
+    // when the multimodal preflight produced soft-token overrides,
+    // route through `Engine::generate_with_soft_tokens` (Gemma) or
+    // `Engine::generate_with_soft_tokens_and_deepstack` (Qwen3-VL) so
+    // the worker plugs the projected ViT embeddings into the prefill
+    // at every placeholder position. Empty `soft_tokens` ⇒ pure-text
+    // path (unchanged `Engine::generate`).
     let gen_outcome = if soft_tokens.is_empty() {
         engine.generate(prompt_tokens, params).await
+    } else if deepstack_data.is_some() || positions_flat.is_some() {
+        // Wedge-4d: Qwen3-VL with augmented embed split + 3D-mRoPE
+        // positions threaded through to the LM forward.
+        engine
+            .generate_with_soft_tokens_and_deepstack(
+                prompt_tokens,
+                soft_tokens,
+                params,
+                deepstack_data,
+                positions_flat,
+            )
+            .await
     } else {
         engine
             .generate_with_soft_tokens(prompt_tokens, soft_tokens, params)
@@ -826,6 +841,18 @@ struct PreparedChatContext {
     /// for triaging the iter-101 acceptance harness when hf2q vs
     /// mlx-vlm token counts diverge.  `None` for text-only.
     vit_soft_tokens_total: Option<usize>,
+    /// **Wedge-4d (iter-224 row 4)**: DeepStack injection chunks for
+    /// the Qwen3-VL path. Built at the handler engine seam by
+    /// splitting `compute_vision_embeddings_gpu_qwen3vl`'s augmented
+    /// `[n_image_tokens, hidden * (1 + N_deepstack)]` buffer into one
+    /// `[n_image_tokens, hidden]` chunk per LM layer that consumes a
+    /// DeepStack tap. `None` for Gemma / non-Qwen3-VL paths.
+    deepstack_data: Option<engine::DeepstackData>,
+    /// **Wedge-4d**: 3D-mRoPE flat position buffer (`[4 * prompt_len]`
+    /// axis-major i32) built by `build_qwen3vl_positions`. `None` for
+    /// Gemma / non-Qwen3-VL paths (the worker arm synthesizes
+    /// text-style positions when None).
+    positions_flat: Option<Vec<i32>>,
 }
 
 /// Run every validation + rendering + tokenization step common to the
@@ -919,65 +946,109 @@ where
             Ok(imgs) => imgs,
             Err(resp) => return Err(resp),
         };
-    let (messages_for_render, vision_embeddings, vit_forward_ms_v, vit_images_v) =
-        if preprocessed_inputs.is_empty() {
-            (req.messages.clone(), Vec::new(), None, None)
-        } else {
-            let n_images = preprocessed_inputs.len();
-            let mmproj = state
-                .mmproj
-                .as_ref()
-                .expect("mmproj checked in process_multimodal_content");
-            let head_dim_f =
-                (mmproj.config.hidden_size / mmproj.config.num_attention_heads) as f32;
-            let scale = 1.0f32 / head_dim_f.sqrt();
-            let t0 = std::time::Instant::now();
-            // ADR-005 Phase 2c iter-116a: arch-profile dispatch routes
-            // through `compute_vision_embeddings_gpu_dispatch` (W25) which
-            // partitions the heterogeneous input slice into homogeneous
-            // batches per `ArchProfile` and runs the matching forward.
-            // For `ClipClassic` mmprojs the dispatch is a thin wrapper
-            // around `compute_vision_embeddings_gpu`; for `Gemma4Siglip`
-            // it routes to `compute_vision_embeddings_gpu_gemma4v`.
-            let embeddings =
-                match crate::inference::vision::vit_gpu::compute_vision_embeddings_gpu_dispatch(
-                    &preprocessed_inputs,
-                    mmproj.arch,
-                    &mmproj.weights,
-                    &mmproj.config,
-                    scale,
-                ) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        return Err(ApiError::generation_error(format!(
-                            "ViT forward failed: {e}"
-                        ))
-                        .into_response());
-                    }
-                };
-            let elapsed_ms = t0.elapsed().as_millis() as u64;
-            tracing::info!(
-                n_images,
-                embed_dim = embeddings.first().map(|e| e.len()).unwrap_or(0),
-                forward_ms = elapsed_ms,
-                "Vision embeddings computed via GPU ViT forward"
-            );
-            // Validate every embedding's element count is a positive
-            // multiple of the chat-model hidden size so the soft-token
-            // expansion has a unique answer for `N_image_tokens`.
-            let hidden = engine.hidden_size();
-            for (i, e) in embeddings.iter().enumerate() {
-                if hidden == 0 || e.is_empty() || e.len() % hidden != 0 {
+    let (
+        messages_for_render,
+        vision_embeddings,
+        vit_forward_ms_v,
+        vit_images_v,
+        vision_family,
+        per_row_floats,
+    ) = if preprocessed_inputs.is_empty() {
+        (
+            req.messages.clone(),
+            Vec::new(),
+            None,
+            None,
+            crate::inference::vision::mmproj::VisionFamily::Gemma,
+            engine.hidden_size(),
+        )
+    } else {
+        let n_images = preprocessed_inputs.len();
+        let mmproj = state
+            .mmproj
+            .as_ref()
+            .expect("mmproj checked in process_multimodal_content");
+        let head_dim_f =
+            (mmproj.config.hidden_size / mmproj.config.num_attention_heads) as f32;
+        let scale = 1.0f32 / head_dim_f.sqrt();
+        let t0 = std::time::Instant::now();
+        // ADR-005 Phase 2c iter-116a: arch-profile dispatch routes
+        // through `compute_vision_embeddings_gpu_dispatch` (W25) which
+        // partitions the heterogeneous input slice into homogeneous
+        // batches per `ArchProfile` and runs the matching forward.
+        // For `ClipClassic` mmprojs the dispatch is a thin wrapper
+        // around `compute_vision_embeddings_gpu`; for `Gemma4Siglip`
+        // it routes to `compute_vision_embeddings_gpu_gemma4v`; for
+        // `Qwen3VlSiglip` (Wedge-4d) it routes to
+        // `compute_vision_embeddings_gpu_qwen3vl` and returns the
+        // augmented `[n_image_tokens, hidden * (1 + N_deepstack)]`
+        // buffer.
+        let embeddings =
+            match crate::inference::vision::vit_gpu::compute_vision_embeddings_gpu_dispatch(
+                &preprocessed_inputs,
+                mmproj.arch,
+                &mmproj.weights,
+                &mmproj.config,
+                scale,
+            ) {
+                Ok(e) => e,
+                Err(e) => {
                     return Err(ApiError::generation_error(format!(
-                        "vision embedding [{i}] length {} is not a positive multiple of hidden_size {hidden}",
-                        e.len()
+                        "ViT forward failed: {e}"
                     ))
                     .into_response());
                 }
+            };
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
+        tracing::info!(
+            n_images,
+            embed_dim = embeddings.first().map(|e| e.len()).unwrap_or(0),
+            forward_ms = elapsed_ms,
+            arch = mmproj.arch.as_str(),
+            "Vision embeddings computed via GPU ViT forward"
+        );
+        // Per-row stride depends on family — Qwen3-VL emits an augmented
+        // embed `hidden * (1 + N_deepstack)` floats per image token,
+        // while Gemma emits exactly `hidden` floats per image token.
+        let family = mmproj.arch.vision_family();
+        let n_deepstack = mmproj
+            .config
+            .deepstack_indexes
+            .as_ref()
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let hidden = engine.hidden_size();
+        let per_row_floats = match family {
+            crate::inference::vision::mmproj::VisionFamily::Gemma => hidden,
+            crate::inference::vision::mmproj::VisionFamily::Qwen3Vl => {
+                hidden.saturating_mul(1 + n_deepstack)
             }
-            let rewritten = rewrite_messages_for_vision_placeholders(&req.messages);
-            (rewritten, embeddings, Some(elapsed_ms), Some(n_images))
+            crate::inference::vision::mmproj::VisionFamily::Unknown => hidden,
         };
+        // Validate every embedding's element count is a positive multiple
+        // of `per_row_floats` so the soft-token expansion has a unique
+        // answer for `N_image_tokens`.
+        for (i, e) in embeddings.iter().enumerate() {
+            if per_row_floats == 0 || e.is_empty() || e.len() % per_row_floats != 0 {
+                return Err(ApiError::generation_error(format!(
+                    "vision embedding [{i}] length {} is not a positive multiple \
+                     of per_row_floats {per_row_floats} (family={family:?}, \
+                     hidden={hidden}, n_deepstack={n_deepstack})",
+                    e.len()
+                ))
+                .into_response());
+            }
+        }
+        let rewritten = rewrite_messages_for_vision_placeholders_family(&req.messages, family);
+        (
+            rewritten,
+            embeddings,
+            Some(elapsed_ms),
+            Some(n_images),
+            family,
+            per_row_floats,
+        )
+    };
 
     // Compile the response_format grammar (Decision #6).  Iter-95 wires
     // the parsed grammar into `SamplingParams.grammar` so the decode loop
@@ -1200,11 +1271,21 @@ where
     //
     // Empty `vision_embeddings` ⇒ pure-text path: skip everything,
     // return `Vec::new()` for `soft_tokens`.
-    let (final_prompt_tokens, soft_tokens) = if vision_embeddings.is_empty() {
-        (prompt_tokens, Vec::<engine::SoftTokenData>::new())
+    let (final_prompt_tokens, soft_tokens, image_token_positions_per_image): (
+        Vec<u32>,
+        Vec<engine::SoftTokenData>,
+        Vec<Vec<u32>>,
+    ) = if vision_embeddings.is_empty() {
+        (prompt_tokens, Vec::<engine::SoftTokenData>::new(), Vec::new())
     } else {
-        match expand_image_placeholders(engine, &prompt_tokens, &vision_embeddings) {
-            Ok(pair) => pair,
+        match expand_image_placeholders_family(
+            engine,
+            &prompt_tokens,
+            &vision_embeddings,
+            vision_family,
+            per_row_floats,
+        ) {
+            Ok(triple) => triple,
             Err(resp) => return Err(resp),
         }
     };
@@ -1229,6 +1310,33 @@ where
     } else {
         Some(soft_tokens.iter().map(|s| s.range.len()).sum())
     };
+
+    // Wedge-4d engine seam (Qwen3-VL only):
+    //   1. Split each image's augmented `[n_image_tokens, hidden * (1 +
+    //      N_deepstack)]` buffer into N_deepstack `[total_n_image_tokens,
+    //      hidden]` chunks, concatenating per-image chunks along the
+    //      row axis in natural left-to-right order.
+    //   2. Build the 3D-mRoPE `positions_flat` buffer covering the
+    //      full expanded prompt.
+    let (deepstack_data, positions_flat) = if matches!(
+        vision_family,
+        crate::inference::vision::mmproj::VisionFamily::Qwen3Vl,
+    ) && !vision_embeddings.is_empty()
+    {
+        match dispatch_qwen3vl_seam_split(
+            engine,
+            state.mmproj.as_ref().expect("mmproj checked above"),
+            &vision_embeddings,
+            &image_token_positions_per_image,
+            &final_prompt_tokens,
+        ) {
+            Ok((ds, pos)) => (Some(ds), Some(pos)),
+            Err(resp) => return Err(resp),
+        }
+    } else {
+        (None, None)
+    };
+
     Ok(PreparedChatContext {
         loaded_engine,
         prompt_tokens: final_prompt_tokens,
@@ -1239,7 +1347,234 @@ where
         vit_forward_ms: vit_forward_ms_v,
         vit_images: vit_images_v,
         vit_soft_tokens_total,
+        deepstack_data,
+        positions_flat,
     })
+}
+
+/// Wedge-4d engine seam (ADR-005 iter-224 row 4): split the Qwen3-VL
+/// augmented embed `[n_image_tokens, hidden * (1 + N_deepstack)]` into
+/// the base chunk (already inside `soft_tokens[i].embeddings` via
+/// `expand_image_placeholders_family`) plus `N_deepstack`
+/// `[total_n_image_tokens, hidden]` GPU buffers, and build the 3D-mRoPE
+/// flat-position buffer covering the full expanded prompt.
+///
+/// **Round-trip identity invariant**: per peer
+/// `/opt/llama.cpp/src/models/qwen3vl.cpp:96-100`, the augmented embed
+/// row `r` for image `img` packs `[base_chunk; ds_0_chunk; ...;
+/// ds_{N-1}_chunk]` along the feature axis. The split we do here must
+/// produce chunks that, when concatenated row-by-row in column-order,
+/// reconstruct the original augmented row. The `expand_image_placeholders_family`
+/// call already split out the base chunk into the `soft_tokens` slot;
+/// here we slice out the `N_deepstack` deepstack chunks at byte offsets
+/// `(j+1) * hidden * 4 .. (j+2) * hidden * 4` per row.
+fn dispatch_qwen3vl_seam_split(
+    engine: &engine::Engine,
+    mmproj: &super::state::LoadedMmproj,
+    vision_embeddings: &[Vec<f32>],
+    image_token_positions_per_image: &[Vec<u32>],
+    final_prompt_tokens: &[u32],
+) -> std::result::Result<(engine::DeepstackData, Vec<i32>), Response> {
+    use crate::serve::forward_prefill::{build_qwen3vl_positions, Qwen3VlImageGrid};
+
+    let hidden = engine.hidden_size();
+    let n_deepstack = mmproj
+        .config
+        .deepstack_indexes
+        .as_ref()
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let per_row_floats = hidden.saturating_mul(1 + n_deepstack);
+    if hidden == 0 || per_row_floats == 0 {
+        return Err(ApiError::generation_error(format!(
+            "dispatch_qwen3vl_seam_split: degenerate hidden ({}) or \
+             n_deepstack ({})",
+            hidden, n_deepstack
+        ))
+        .into_response());
+    }
+    if vision_embeddings.len() != image_token_positions_per_image.len() {
+        return Err(ApiError::generation_error(format!(
+            "dispatch_qwen3vl_seam_split: vision_embeddings.len()={} != \
+             image_token_positions_per_image.len()={}",
+            vision_embeddings.len(),
+            image_token_positions_per_image.len()
+        ))
+        .into_response());
+    }
+
+    // Compute the per-image post-merge token grid. **Phase-1 ViT
+    // limitation** (see `Qwen3VlPreprocessed` doc): every image
+    // produces a SQUARE `(image_size / (patch * sm))²` token grid;
+    // truly variable per-image grids will lift in a Phase-2 ViT
+    // relaxation iter.
+    let stride = mmproj
+        .config
+        .patch_size
+        .saturating_mul(mmproj.config.spatial_merge_size.unwrap_or(1));
+    if stride == 0 {
+        return Err(ApiError::generation_error(format!(
+            "dispatch_qwen3vl_seam_split: patch_size ({}) * \
+             spatial_merge_size ({:?}) = 0",
+            mmproj.config.patch_size, mmproj.config.spatial_merge_size
+        ))
+        .into_response());
+    }
+    let image_size = mmproj.config.image_size;
+    if image_size == 0 || image_size % stride != 0 {
+        return Err(ApiError::generation_error(format!(
+            "dispatch_qwen3vl_seam_split: image_size ({}) is not a \
+             positive multiple of stride ({})",
+            image_size, stride
+        ))
+        .into_response());
+    }
+    let n_x_token = image_size / stride;
+    let n_y_token = image_size / stride;
+    let per_image_n_image_tokens = (n_x_token as usize) * (n_y_token as usize);
+
+    // Validate per-image n_image_tokens consistency.
+    for (i, e) in vision_embeddings.iter().enumerate() {
+        if e.len() % per_row_floats != 0 {
+            return Err(ApiError::generation_error(format!(
+                "dispatch_qwen3vl_seam_split: vision_embeddings[{i}].len()={} \
+                 not divisible by per_row_floats={per_row_floats}",
+                e.len()
+            ))
+            .into_response());
+        }
+        let observed = e.len() / per_row_floats;
+        if observed != per_image_n_image_tokens {
+            return Err(ApiError::generation_error(format!(
+                "dispatch_qwen3vl_seam_split: vision_embeddings[{i}] has \
+                 {observed} image tokens but Phase-1 ViT contract says \
+                 {per_image_n_image_tokens}"
+            ))
+            .into_response());
+        }
+        if image_token_positions_per_image[i].len() != per_image_n_image_tokens {
+            return Err(ApiError::generation_error(format!(
+                "dispatch_qwen3vl_seam_split: image_token_positions_per_image[{i}].len()={} \
+                 != per_image_n_image_tokens={per_image_n_image_tokens}",
+                image_token_positions_per_image[i].len()
+            ))
+            .into_response());
+        }
+    }
+
+    let total_n_image_tokens: usize =
+        per_image_n_image_tokens.saturating_mul(vision_embeddings.len());
+    if total_n_image_tokens == 0 || n_deepstack == 0 {
+        // No deepstack chunks to split. Still return an empty
+        // DeepstackData and a positions_flat (text-only positions for
+        // the expanded prompt — image regions get the standard
+        // `[t,t,t,t]` text broadcast since no Wedge-4d hooks consume
+        // them at decode time anyway).
+        let flat = build_qwen3vl_positions(final_prompt_tokens.len(), &[])
+            .map_err(|e| {
+                ApiError::generation_error(format!(
+                    "build_qwen3vl_positions (no images): {e}"
+                ))
+                .into_response()
+            })?;
+        return Ok((
+            engine::DeepstackData {
+                image_token_positions: Vec::new(),
+                chunks: Vec::new(),
+            },
+            flat,
+        ));
+    }
+
+    // Allocate one `[total_n_image_tokens, hidden]` MlxBuffer per
+    // deepstack chunk slot.
+    let mlx_dev = mlx_native::MlxDevice::new().map_err(|e| {
+        ApiError::generation_error(format!(
+            "dispatch_qwen3vl_seam_split: MlxDevice::new: {e}"
+        ))
+        .into_response()
+    })?;
+    let chunk_byte_len = total_n_image_tokens * hidden * std::mem::size_of::<f32>();
+    let mut chunks: Vec<mlx_native::MlxBuffer> = Vec::with_capacity(n_deepstack);
+    for j in 0..n_deepstack {
+        let buf = mlx_dev
+            .alloc_buffer(
+                chunk_byte_len,
+                mlx_native::DType::F32,
+                vec![total_n_image_tokens, hidden],
+            )
+            .map_err(|e| {
+                ApiError::generation_error(format!(
+                    "dispatch_qwen3vl_seam_split: alloc deepstack chunk {j}: {e}"
+                ))
+                .into_response()
+            })?;
+        chunks.push(buf);
+    }
+
+    // CPU memcpy: scatter per-image augmented rows' deepstack slots
+    // into the per-deepstack-chunk buffers, concatenating across
+    // images in input order.
+    for j in 0..n_deepstack {
+        let dst = chunks[j].as_mut_slice::<f32>().map_err(|e| {
+            ApiError::generation_error(format!(
+                "dispatch_qwen3vl_seam_split: as_mut_slice chunk {j}: {e}"
+            ))
+            .into_response()
+        })?;
+        let mut row_offset: usize = 0;
+        for src in vision_embeddings.iter() {
+            for r in 0..per_image_n_image_tokens {
+                let src_base = r * per_row_floats + (j + 1) * hidden;
+                let dst_base = (row_offset + r) * hidden;
+                dst[dst_base..dst_base + hidden]
+                    .copy_from_slice(&src[src_base..src_base + hidden]);
+            }
+            row_offset += per_image_n_image_tokens;
+        }
+    }
+
+    // Concatenate per-image image_token_positions in natural order.
+    let mut all_positions: Vec<u32> = Vec::with_capacity(total_n_image_tokens);
+    for img in image_token_positions_per_image.iter() {
+        all_positions.extend_from_slice(img);
+    }
+    debug_assert_eq!(all_positions.len(), total_n_image_tokens);
+
+    // Build `image_grids` for `build_qwen3vl_positions`: each image
+    // contributes one (Qwen3VlImageGrid { n_x_token, n_y_token },
+    // sequence_start = first position). All images share the same
+    // square grid in Phase-1.
+    let mut image_grids: Vec<(Qwen3VlImageGrid, u32)> =
+        Vec::with_capacity(image_token_positions_per_image.len());
+    for img_positions in image_token_positions_per_image.iter() {
+        if img_positions.is_empty() {
+            continue; // defensive; expand_image_placeholders_family enforces non-empty
+        }
+        let seq_start = img_positions[0];
+        image_grids.push((
+            Qwen3VlImageGrid {
+                n_x: n_x_token,
+                n_y: n_y_token,
+            },
+            seq_start,
+        ));
+    }
+    let positions_flat =
+        build_qwen3vl_positions(final_prompt_tokens.len(), &image_grids).map_err(|e| {
+            ApiError::generation_error(format!(
+                "dispatch_qwen3vl_seam_split: build_qwen3vl_positions: {e}"
+            ))
+            .into_response()
+        })?;
+
+    Ok((
+        engine::DeepstackData {
+            image_token_positions: all_positions,
+            chunks,
+        },
+        positions_flat,
+    ))
 }
 
 /// Streaming chat-completion path. Opens an `mpsc::channel(64)`, hands the
@@ -1275,6 +1610,24 @@ async fn chat_completions_stream(
     // response headers below.
     let summarized_messages = prepared.summarized_messages;
     let summary_tokens = prepared.summary_tokens;
+
+    // Wedge-4d streaming gap: the streaming worker
+    // (`Request::GenerateStream`) doesn't yet thread `DeepstackData` /
+    // `positions_flat` through to the LM forward. For the Qwen3-VL
+    // path this is a follow-up wedge (Wedge-4e); fall back to a 501
+    // here so the user sees an actionable message rather than a
+    // soft-token-only stream that drops the DeepStack injection.
+    if prepared.deepstack_data.is_some() || prepared.positions_flat.is_some() {
+        return ApiError::not_implemented(
+            "streaming chat with Qwen3-VL DeepStack injection is not yet \
+             supported (Wedge-4d closes the non-streaming path; \
+             streaming requires the Qwen35 stream worker arm to thread \
+             DeepstackData + 3D-mRoPE positions — Wedge-4e). Set \
+             `\"stream\": false` and retry."
+                .to_string(),
+        )
+        .into_response();
+    }
 
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
     // Worker bumps this counter if it aborts because the SSE receiver was
@@ -2288,46 +2641,63 @@ fn process_multimodal_content(
                 }));
             }
             ArchProfile::Qwen3VlSiglip => {
-                // iter-224 Wedge-4c.5 LANDED: server-side load is now
-                // accepted (the validator+ViT+LM-side hooks all ship
-                // together), so text-only chat against a Qwen3-VL GGUF
-                // works. The image-bearing chat path still requires:
-                //   (a) a Qwen3-VL preprocessor (variable-resolution
-                //       patch grid, spatial_merge_size=2 native tiling),
-                //   (b) chat-template handling of the
-                //       `<|vision_start|><|image_pad|><|vision_end|>`
-                //       triplet (different from Gemma's `<|image|>`),
-                //   (c) 3D-mRoPE position synthesis (per
-                //       /opt/llama.cpp/tools/mtmd/clip-impl.h:78 and
-                //       qwen3vl.cpp's `rope_multi`),
-                //   (d) the engine-seam handler that splits
-                //       `compute_vision_embeddings_gpu_qwen3vl`'s
-                //       augmented `[n_image_tokens, lm_hidden*(1+N_dst)]`
-                //       buffer into the base SoftTokenInjection +
-                //       N_deepstack DeepstackInjection chunks expected
-                //       by `Qwen35Model::forward_gpu_last_logits_with_soft_tokens_and_deepstack`.
-                // All four are Wedge-4d's scope; this fail-loud guard
-                // returns 400 with the explicit handoff so the user
-                // sees an actionable message instead of a confused
-                // crash deep in the gemma4v preprocess path.
-                return Err(ApiError::invalid_request(
-                    format!(
-                        "messages[{}].content[{}].image_url: loaded mmproj is Qwen3-VL \
-                         (ArchProfile::Qwen3VlSiglip) — TEXT-ONLY chat works, but \
-                         IMAGE-BEARING chat requires Wedge-4d. Missing pieces: \
-                         (1) variable-resolution preprocessor with spatial_merge_size=2 \
-                         native tiling, (2) `<|vision_start|><|image_pad|><|vision_end|>` \
-                         placeholder expansion, (3) 3D-mRoPE position synthesis, \
-                         (4) augmented-embed split → SoftTokenInjection + \
-                         DeepstackInjection at the engine seam. The LM-side hooks \
-                         (forward_gpu_last_logits_with_soft_tokens_and_deepstack) \
-                         and the ViT forward (compute_vision_embeddings_gpu_qwen3vl) \
-                         are READY — only the chat-handler glue remains.",
-                        mi, pi
-                    ),
-                    Some(format!("messages[{}].content[{}]", mi, pi)),
-                )
-                .into_response());
+                // iter-224 Wedge-4d LANDED: variable-resolution
+                // preprocessor + `<|vision_start|><|image_pad|><|vision_end|>`
+                // placeholder expansion + 3D-mRoPE position synthesis
+                // + augmented-embed split at engine seam are now wired.
+                //
+                // Phase-1 ViT compatibility note (see
+                // `Qwen3VlPreprocessed` doc): the smart-resize result
+                // is center-padded to `image_size × image_size` so the
+                // Phase-1 ViT (DO-NOT-TOUCH for Wedge-4d) sees a square
+                // input. This preserves aspect ratio while reporting a
+                // FIXED token grid; truly variable n_image_tokens is a
+                // Phase-2 ViT-relaxation iter.
+                let qcfg =
+                    crate::inference::vision::preprocess::Qwen3VlPreprocessConfig::from_mmproj(
+                        &mmproj.config,
+                    )
+                    .map_err(|e| {
+                        ApiError::generation_error(format!(
+                            "messages[{}].content[{}].image_url qwen3vl preprocess \
+                             config: {e}",
+                            mi, pi
+                        ))
+                        .into_response()
+                    })?;
+                let preprocessed =
+                    crate::inference::vision::preprocess::preprocess_qwen3vl(
+                        &bytes,
+                        &qcfg,
+                        mmproj.config.image_size,
+                    )
+                    .map_err(|e| {
+                        ApiError::invalid_request(
+                            format!(
+                                "messages[{}].content[{}].image_url qwen3vl preprocess \
+                                 failed: {e}",
+                                mi, pi
+                            ),
+                            Some(format!("messages[{}].content[{}]", mi, pi)),
+                        )
+                        .into_response()
+                    })?;
+                // Route through the existing Phase-1 ViT entry point as
+                // a square `Siglip49(PreprocessedImage)` payload — the
+                // ViT validates `pixel_values.len() == 3 * image_size²`
+                // at vit_gpu_qwen3vl.rs:2070-2078, which the
+                // smart-resize-then-pad output satisfies. The variable
+                // (n_x_token, n_y_token) is captured for 3D-mRoPE
+                // position synthesis downstream; Phase-1 ViT outputs a
+                // FIXED (image_size/(patch*sm))² token grid that
+                // matches what the preprocessor reports.
+                out.push(VisionInput::Siglip49(
+                    crate::inference::vision::PreprocessedImage {
+                        pixel_values: preprocessed.pixel_values,
+                        target_size: preprocessed.target_size,
+                        source_label,
+                    },
+                ));
             }
             ArchProfile::Unknown => {
                 // Guarded above; preserved so the match is exhaustive.
@@ -2405,7 +2775,45 @@ fn apply_vit_transparency_headers(
 ///
 /// Phase 2c Task #17 / iter-99.
 fn rewrite_messages_for_vision_placeholders(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    rewrite_messages_for_vision_placeholders_family(
+        messages,
+        crate::inference::vision::mmproj::VisionFamily::Gemma,
+    )
+}
+
+/// Family-aware variant of [`rewrite_messages_for_vision_placeholders`]
+/// (ADR-005 iter-224 Wedge-4d).
+///
+/// Per-family placeholder rendering:
+///   - `VisionFamily::Gemma` → `<|image|>` (one literal per image; the
+///     existing Gemma path).
+///   - `VisionFamily::Qwen3Vl` →
+///     `<|vision_start|><|image_pad|><|vision_end|>` triplet (matches
+///     peer at `/opt/llama.cpp/tools/mtmd/mtmd.cpp:317-321` for
+///     `PROJECTOR_TYPE_QWEN3VL`).  The inner `<|image_pad|>` is the
+///     soft-token expansion target (one tokenized id → N copies);
+///     `<|vision_start|>` and `<|vision_end|>` remain as single tokens.
+///   - `VisionFamily::Unknown` → no rewrite (the `process_multimodal_content`
+///     gate rejects this case before tokenization, so we never actually
+///     reach this branch in production).
+fn rewrite_messages_for_vision_placeholders_family(
+    messages: &[ChatMessage],
+    family: crate::inference::vision::mmproj::VisionFamily,
+) -> Vec<ChatMessage> {
     use super::schema::ContentPart;
+    use crate::inference::vision::mmproj::VisionFamily;
+
+    let placeholder_marker: String = match family {
+        VisionFamily::Gemma => "<|image|>".to_string(),
+        VisionFamily::Qwen3Vl => {
+            "<|vision_start|><|image_pad|><|vision_end|>".to_string()
+        }
+        // Unknown shouldn't reach here (gate at `process_multimodal_content`),
+        // but produce a deterministic empty marker so the caller's
+        // tokenization is well-defined; the request is already rejected.
+        VisionFamily::Unknown => "".to_string(),
+    };
+
     messages
         .iter()
         .map(|msg| {
@@ -2422,7 +2830,7 @@ fn rewrite_messages_for_vision_placeholders(messages: &[ChatMessage]) -> Vec<Cha
                         for part in parts {
                             match part {
                                 ContentPart::Text { text } => buf.push_str(text),
-                                ContentPart::ImageUrl { .. } => buf.push_str("<|image|>"),
+                                ContentPart::ImageUrl { .. } => buf.push_str(&placeholder_marker),
                             }
                         }
                         MessageContent::Text(buf)
@@ -2530,16 +2938,78 @@ fn expand_image_placeholders(
     prompt_tokens: &[u32],
     embeddings: &[Vec<f32>],
 ) -> std::result::Result<(Vec<u32>, Vec<engine::SoftTokenData>), Response> {
+    expand_image_placeholders_family(
+        engine,
+        prompt_tokens,
+        embeddings,
+        crate::inference::vision::mmproj::VisionFamily::Gemma,
+        /*per_row_floats=*/ engine.hidden_size(),
+    )
+    .map(|(toks, soft, _positions)| (toks, soft))
+}
+
+/// Family-aware variant of [`expand_image_placeholders`] (ADR-005
+/// iter-224 Wedge-4d).
+///
+/// In addition to the legacy Gemma behaviour, this entry point:
+///
+///   1. Picks the family-specific placeholder token literal via
+///      `VisionFamily::placeholder_token_literal()` (Gemma:
+///      `<|image|>`; Qwen3-VL: `<|image_pad|>`). The token id is
+///      resolved from the LM tokenizer at runtime — NOT hardcoded.
+///   2. Computes `N_image_tokens` per image as
+///      `embeddings[i].len() / per_row_floats` where `per_row_floats`
+///      depends on family (Gemma: `hidden`; Qwen3-VL: `hidden * (1 +
+///      N_deepstack)` because the augmented embed concatenates base +
+///      deepstack chunks along the feature axis).
+///   3. Returns the per-image `image_token_positions` slice
+///      (post-expansion absolute positions) so the engine seam can
+///      build `DeepstackInjection` for the LM-side hooks.
+///
+/// The base soft-token slot (`SoftTokenData.embeddings`) holds ONLY the
+/// first `hidden` floats of each row — the deepstack chunks are split
+/// out by the engine seam (see `engine_qwen35.rs` /
+/// `engine.rs::dispatch_qwen3vl_seam_split`).
+fn expand_image_placeholders_family(
+    engine: &engine::Engine,
+    prompt_tokens: &[u32],
+    embeddings: &[Vec<f32>],
+    family: crate::inference::vision::mmproj::VisionFamily,
+    per_row_floats: usize,
+) -> std::result::Result<
+    (Vec<u32>, Vec<engine::SoftTokenData>, Vec<Vec<u32>>),
+    Response,
+> {
     let n_images = embeddings.len();
     let hidden = engine.hidden_size();
-    let img_token_id: u32 = match engine.tokenizer().token_to_id("<|image|>") {
+    if hidden == 0 || per_row_floats == 0 {
+        return Err(ApiError::generation_error(format!(
+            "expand_image_placeholders_family: degenerate hidden ({}) or \
+             per_row_floats ({})",
+            hidden, per_row_floats
+        ))
+        .into_response());
+    }
+    let placeholder_literal = match family.placeholder_token_literal() {
+        Some(s) => s,
+        None => {
+            return Err(ApiError::generation_error(format!(
+                "expand_image_placeholders_family: VisionFamily::{:?} has no \
+                 placeholder token literal — handler should have rejected \
+                 this profile upstream",
+                family
+            ))
+            .into_response());
+        }
+    };
+    let img_token_id: u32 = match engine.tokenizer().token_to_id(placeholder_literal) {
         Some(id) => id,
         None => {
-            return Err(ApiError::generation_error(
-                "tokenizer has no `<|image|>` special-token id; the loaded chat \
-                 model does not support vision input through hf2q's soft-token \
-                 path",
-            )
+            return Err(ApiError::generation_error(format!(
+                "tokenizer has no `{placeholder_literal}` special-token id; \
+                 the loaded chat model does not support vision input through \
+                 hf2q's soft-token path"
+            ))
             .into_response());
         }
     };
@@ -2550,14 +3020,26 @@ fn expand_image_placeholders(
         .collect();
     if placeholder_positions.len() != n_images {
         return Err(ApiError::generation_error(format!(
-            "rendered prompt has {} `<|image|>` placeholder(s) but request \
-             carries {} image(s); the chat template likely dropped or \
-             duplicated image markers — check `tokenizer_config.json` and \
-             the GGUF chat template",
+            "rendered prompt has {} `{placeholder_literal}` placeholder(s) \
+             but request carries {} image(s); the chat template likely \
+             dropped or duplicated image markers — check \
+             `tokenizer_config.json` and the GGUF chat template",
             placeholder_positions.len(),
             n_images
         ))
         .into_response());
+    }
+    // Validate per-image embedding length matches per_row_floats × N.
+    for (i, e) in embeddings.iter().enumerate() {
+        if e.len() % per_row_floats != 0 || e.is_empty() {
+            return Err(ApiError::generation_error(format!(
+                "vision embedding [{i}] length {} is not a positive multiple \
+                 of per_row_floats {per_row_floats} (family={family:?}, \
+                 hidden={hidden})",
+                e.len()
+            ))
+            .into_response());
+        }
     }
     // Apple Silicon: MlxDevice::new() returns the singleton Metal
     // device.  Buffers it allocates are usable by any other GpuContext
@@ -2574,20 +3056,33 @@ fn expand_image_placeholders(
     };
     let total_extra: usize = embeddings
         .iter()
-        .map(|e| e.len() / hidden)
+        .map(|e| e.len() / per_row_floats)
         .sum::<usize>()
         .saturating_sub(n_images); // each placeholder already counts once
     let mut prompt_expanded: Vec<u32> = Vec::with_capacity(prompt_tokens.len() + total_extra);
     let mut soft_tokens: Vec<engine::SoftTokenData> = Vec::with_capacity(n_images);
+    // Per-image expanded-prompt absolute positions (the contiguous run
+    // each `<|image_pad|>` placeholder expands into). Wedge-4d uses
+    // these to populate `DeepstackInjection.image_token_positions` at
+    // the engine seam. For Gemma the slot is unused (Gemma doesn't have
+    // DeepStack heads); we still emit it for shape symmetry.
+    let mut image_token_positions: Vec<Vec<u32>> = Vec::with_capacity(n_images);
     let mut last_pos = 0usize;
     for (i, &pos) in placeholder_positions.iter().enumerate() {
         prompt_expanded.extend_from_slice(&prompt_tokens[last_pos..pos]);
-        let n_image_tokens = embeddings[i].len() / hidden;
+        let n_image_tokens = embeddings[i].len() / per_row_floats;
         let start = prompt_expanded.len();
         for _ in 0..n_image_tokens {
             prompt_expanded.push(img_token_id);
         }
         let end = prompt_expanded.len();
+        // Soft-token slot stores ONLY the BASE chunk (first `hidden`
+        // floats per row). For Gemma family `per_row_floats == hidden`
+        // → the entire embedding is the base chunk. For Qwen3-VL family
+        // `per_row_floats == hidden * (1 + N_deepstack)` → we slice out
+        // the first column-chunk via per-row stride. The full augmented
+        // embedding is preserved on the AppState side for the engine
+        // seam to split (see `dispatch_qwen3vl_seam_split`).
         let byte_len = n_image_tokens * hidden * std::mem::size_of::<f32>();
         let mut buf = match mlx_dev.alloc_buffer(
             byte_len,
@@ -2604,8 +3099,22 @@ fn expand_image_placeholders(
         };
         match buf.as_mut_slice::<f32>() {
             Ok(dst) => {
-                debug_assert_eq!(dst.len(), embeddings[i].len());
-                dst.copy_from_slice(&embeddings[i]);
+                debug_assert_eq!(dst.len(), n_image_tokens * hidden);
+                if per_row_floats == hidden {
+                    // Gemma-style: contiguous copy.
+                    dst.copy_from_slice(&embeddings[i]);
+                } else {
+                    // Qwen3-VL-style: per-row strided copy of the first
+                    // `hidden`-float chunk (the base chunk). Subsequent
+                    // chunks are split out by the engine seam.
+                    for row in 0..n_image_tokens {
+                        let src_base = row * per_row_floats;
+                        let dst_base = row * hidden;
+                        dst[dst_base..dst_base + hidden].copy_from_slice(
+                            &embeddings[i][src_base..src_base + hidden],
+                        );
+                    }
+                }
             }
             Err(e) => {
                 return Err(ApiError::generation_error(format!(
@@ -2618,10 +3127,13 @@ fn expand_image_placeholders(
             range: start..end,
             embeddings: buf,
         });
+        // Record per-image expanded-prompt positions for downstream
+        // DeepstackInjection construction at the engine seam.
+        image_token_positions.push((start..end).map(|p| p as u32).collect());
         last_pos = pos + 1;
     }
     prompt_expanded.extend_from_slice(&prompt_tokens[last_pos..]);
-    Ok((prompt_expanded, soft_tokens))
+    Ok((prompt_expanded, soft_tokens, image_token_positions))
 }
 
 /// Pre-compile the request's `response_format` to a parsed GBNF grammar.
@@ -7607,6 +8119,237 @@ mod multimodal_tests {
         match out[1].content.as_ref().expect("content") {
             MessageContent::Text(t) => assert_eq!(t, "<|image|>"),
             other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-005 iter-224 Wedge-4d: family-aware placeholder rewrite tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn rewrite_messages_family_qwen3vl_emits_vision_start_image_pad_vision_end() {
+        use crate::inference::vision::mmproj::VisionFamily;
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(vec![
+                ContentPart::Text { text: "describe:".into() },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,XXX".into(),
+                        detail: None,
+                    },
+                },
+            ])),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let out = rewrite_messages_for_vision_placeholders_family(&msgs, VisionFamily::Qwen3Vl);
+        match out[0].content.as_ref().expect("content") {
+            MessageContent::Text(t) => {
+                assert!(
+                    t.contains("<|vision_start|><|image_pad|><|vision_end|>"),
+                    "expected qwen3vl triplet, got: {t}"
+                );
+                assert!(t.starts_with("describe:"));
+                // Sanity: only ONE inner <|image_pad|> per image.
+                assert_eq!(t.matches("<|image_pad|>").count(), 1);
+            }
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rewrite_messages_family_qwen3vl_two_images_two_triplets() {
+        use crate::inference::vision::mmproj::VisionFamily;
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(vec![
+                ContentPart::Text { text: "a".into() },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,A".into(),
+                        detail: None,
+                    },
+                },
+                ContentPart::Text { text: "b".into() },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,B".into(),
+                        detail: None,
+                    },
+                },
+            ])),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let out = rewrite_messages_for_vision_placeholders_family(&msgs, VisionFamily::Qwen3Vl);
+        match out[0].content.as_ref().expect("content") {
+            MessageContent::Text(t) => {
+                assert_eq!(t.matches("<|image_pad|>").count(), 2);
+                assert_eq!(t.matches("<|vision_start|>").count(), 2);
+                assert_eq!(t.matches("<|vision_end|>").count(), 2);
+            }
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rewrite_messages_family_gemma_byte_identical_to_legacy() {
+        use crate::inference::vision::mmproj::VisionFamily;
+        // Regression pin: the legacy `rewrite_messages_for_vision_placeholders`
+        // is now a thin wrapper over the family-aware variant with
+        // VisionFamily::Gemma. They must produce byte-identical output.
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(vec![
+                ContentPart::Text { text: "x".into() },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,A".into(),
+                        detail: None,
+                    },
+                },
+                ContentPart::Text { text: "y".into() },
+            ])),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let legacy = rewrite_messages_for_vision_placeholders(&msgs);
+        let family = rewrite_messages_for_vision_placeholders_family(&msgs, VisionFamily::Gemma);
+        assert_eq!(legacy.len(), family.len());
+        assert_eq!(legacy[0].content, family[0].content);
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-005 iter-224 Wedge-4d: seam-split round-trip identity
+    // -----------------------------------------------------------------
+
+    /// Pure-CPU mirror of the byte-shuffle that
+    /// `dispatch_qwen3vl_seam_split` performs (without the GPU-buffer
+    /// allocation). Returns the per-deepstack-chunk Vec<f32> array
+    /// keyed `[total_n_image_tokens, hidden]` row-major. Used by the
+    /// round-trip test to prove split + concat == identity.
+    fn cpu_split_qwen3vl_augmented(
+        vision_embeddings: &[Vec<f32>],
+        per_image_n_image_tokens: usize,
+        hidden: usize,
+        n_deepstack: usize,
+    ) -> Vec<Vec<f32>> {
+        let per_row_floats = hidden * (1 + n_deepstack);
+        let total = per_image_n_image_tokens * vision_embeddings.len();
+        let mut chunks: Vec<Vec<f32>> = (0..n_deepstack).map(|_| vec![0f32; total * hidden]).collect();
+        for j in 0..n_deepstack {
+            let mut row_offset = 0usize;
+            for src in vision_embeddings {
+                for r in 0..per_image_n_image_tokens {
+                    let src_base = r * per_row_floats + (j + 1) * hidden;
+                    let dst_base = (row_offset + r) * hidden;
+                    chunks[j][dst_base..dst_base + hidden]
+                        .copy_from_slice(&src[src_base..src_base + hidden]);
+                }
+                row_offset += per_image_n_image_tokens;
+            }
+        }
+        chunks
+    }
+
+    #[test]
+    fn qwen3vl_seam_split_round_trip_identity() {
+        // Construct an augmented embed with deterministic byte pattern,
+        // CPU-split it, then re-concatenate row-by-row and verify
+        // byte-identity vs the original. This pins the split semantics
+        // independently of any GPU-side allocation.
+        let hidden = 4;
+        let n_deepstack = 3;
+        let n_image_tokens = 6;
+        let per_row_floats = hidden * (1 + n_deepstack);
+        // Build augmented buffer for ONE image, with row r and slot j
+        // value = `r * 1000 + j`.
+        let mut augmented = vec![0f32; n_image_tokens * per_row_floats];
+        for r in 0..n_image_tokens {
+            for j in 0..(1 + n_deepstack) {
+                for h in 0..hidden {
+                    augmented[r * per_row_floats + j * hidden + h] =
+                        ((r * 1000 + j * 100 + h) as f32);
+                }
+            }
+        }
+
+        let vision_embeddings = vec![augmented.clone()];
+        let chunks = cpu_split_qwen3vl_augmented(
+            &vision_embeddings,
+            n_image_tokens,
+            hidden,
+            n_deepstack,
+        );
+        assert_eq!(chunks.len(), n_deepstack);
+
+        // Now reconstruct: for each row, concat the BASE chunk (per-row
+        // first hidden floats from the original) + chunks[0..N] for
+        // that row, and compare against the original row.
+        for r in 0..n_image_tokens {
+            let mut reconstructed = Vec::with_capacity(per_row_floats);
+            // Base chunk = first `hidden` floats of original row.
+            reconstructed.extend_from_slice(
+                &augmented[r * per_row_floats..r * per_row_floats + hidden],
+            );
+            // Deepstack chunks j=1..=N.
+            for j in 0..n_deepstack {
+                reconstructed.extend_from_slice(
+                    &chunks[j][r * hidden..(r + 1) * hidden],
+                );
+            }
+            let original_row =
+                &augmented[r * per_row_floats..(r + 1) * per_row_floats];
+            assert_eq!(
+                reconstructed, original_row,
+                "row {r} round-trip mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen3vl_seam_split_concatenates_multi_image_in_order() {
+        // Two images: image 0 has rows with value `r`, image 1 has
+        // rows with value `100 + r`. After split + concat, chunks[0]
+        // should hold rows 0..n then 100..(100+n) for slot j=1.
+        let hidden = 2;
+        let n_deepstack = 1;
+        let n_image_tokens = 3;
+        let per_row_floats = hidden * (1 + n_deepstack);
+
+        let mut img0 = vec![0f32; n_image_tokens * per_row_floats];
+        let mut img1 = vec![0f32; n_image_tokens * per_row_floats];
+        for r in 0..n_image_tokens {
+            // For each row, slot j=1 (deepstack index 0) has value:
+            //   img0[r] = r
+            //   img1[r] = 100 + r
+            for h in 0..hidden {
+                img0[r * per_row_floats + 1 * hidden + h] = r as f32;
+                img1[r * per_row_floats + 1 * hidden + h] = (100 + r) as f32;
+            }
+        }
+        let vision_embeddings = vec![img0, img1];
+        let chunks = cpu_split_qwen3vl_augmented(
+            &vision_embeddings,
+            n_image_tokens,
+            hidden,
+            n_deepstack,
+        );
+        // chunks[0] is concatenated [img0_rows; img1_rows].
+        // Row 0 of chunks[0] = img0 row 0's slot 1 = 0.
+        // Row 3 of chunks[0] = img1 row 0's slot 1 = 100.
+        for h in 0..hidden {
+            assert_eq!(chunks[0][0 * hidden + h], 0.0);
+            assert_eq!(chunks[0][3 * hidden + h], 100.0);
+            assert_eq!(chunks[0][4 * hidden + h], 101.0);
+            assert_eq!(chunks[0][5 * hidden + h], 102.0);
         }
     }
 }
