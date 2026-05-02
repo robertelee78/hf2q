@@ -1441,11 +1441,21 @@ impl Qwen35Model {
         // and per-token `reset_decode_pool` — the K-batch only applies to
         // prefill (seq_len > 1).
         let n_layers = layer_weights_gpu.len();
+        // ADR-013 P21 stage-3b (2026-05-01): K=4 promoted to default after
+        // Stage 3a downgraded the 30 per-DN-layer commit_and_wait sites to
+        // commit_labeled. P20's prior null-wall measurement was conditional
+        // on the now-removed sync gauntlet (every DN layer host-blocked at
+        // ops1-3, qkv_split, ops5-9 — so the FFN terminal commit hit a CPU
+        // already idle, no wall savings from removing it). With Stage 3a
+        // in place, the FFN terminal commit IS on the critical path and
+        // K-batching saves measurable wall (3-cold-run pp80: 199 t/s K=1
+        // pre-Stage-3a → 460 t/s K=4 post-Stage-3a, 2.31x).
+        // SAFE DEFAULT: K=4. Operator can opt back to K=1 via env=1.
         let ffn_terminal_k_batch: usize = std::env::var("HF2Q_FFN_TERMINAL_K_BATCH")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&k| k >= 1)
-            .unwrap_or(1);
+            .unwrap_or(4);
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
             // K-boundary: last layer in the window OR final layer overall.
             // At K=1 every layer is a boundary (= current behaviour).
