@@ -2475,19 +2475,14 @@ pub fn compute_vision_embeddings_gpu_dispatch(
     }
 
     let mut out: Vec<Option<Vec<f32>>> = (0..inputs.len()).map(|_| None).collect();
-    // iter-224 Wedge-4c.1 scaffold: route Qwen3VlSiglip BEFORE the
-    // generic Siglip49 path so a Qwen3-VL mmproj does not get silently
-    // pushed through `compute_vision_embeddings_gpu` (the SigLIP-49
-    // CLIP-classic forward) — that would produce wrong logits without
-    // any structural error. The new module's stub returns Err so the
-    // mismatch surfaces loudly; subsequent sub-iters (4c.2..5) fill
-    // in the real arithmetic and this branch becomes the success path.
-    //
-    // Note: today this branch is unreachable in production because
-    // `ProjectorType::Qwen3VlMerger.is_supported()` returns false and
-    // `validate_tensor_set` rejects the file at `serve --mmproj`
-    // startup. The wiring exists so 4c.5's gate flip lands without
-    // re-touching the dispatch.
+    // iter-224 Wedge-4c.5 LANDED: Qwen3VlSiglip routes through
+    // `compute_vision_embeddings_gpu_qwen3vl` for the full ViT
+    // forward (CPU prelude + per-block transformer + DeepStack heads
+    // + main projector + augmented embed concat). The validator
+    // accepts the file at `serve --mmproj` startup; this branch is
+    // the production path for any image-bearing chat that survives
+    // the Wedge-4d preprocess gate at handlers.rs (text-only chat
+    // doesn't enter dispatch at all).
     if matches!(arch, super::mmproj::ArchProfile::Qwen3VlSiglip) {
         // Sub-iter 4c.2 closure: `num_position_embeddings` is sourced
         // from the loaded `v.position_embd.weight` tensor's outer
@@ -2518,9 +2513,9 @@ pub fn compute_vision_embeddings_gpu_dispatch(
             &cfg,
             mmproj_cfg,
         )?;
-        // The stub above always errors — we only reach the loop below
-        // once 4c.4 lands real arithmetic. Indices are then preserved
-        // by walking the original input slice in order.
+        // 4c.4 landed the real arithmetic; indices are preserved by
+        // walking the returned-vec in input order (Wedge-4c.4 Phase-1
+        // accepts only single-image inputs, so r.len() == 1).
         for (i, e) in r.into_iter().enumerate() {
             out[i] = Some(e);
         }
