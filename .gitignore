@@ -23,6 +23,10 @@ CLAUDE.md
 # this `.worktrees/` dir is for long-lived branch worktrees (adr-013, etc.).
 .worktrees/
 .cfa-worktrees/
+.cfa-archive/
+
+# Agentic-QE local SQLite memory (accidentally committed in 9602b06; reverted)
+.agentic-qe/
 
 # Logs and examples
 logs/
