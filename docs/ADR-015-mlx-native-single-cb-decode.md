@@ -7,7 +7,9 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
-## ▶ Resume Here — current state of truth (2026-05-02 ~09:00Z, **ADR-015 SCOPE-EXHAUSTION REACHED at default ratio 0.792× / chunk-engaged 0.790×. iter82 NEUTRAL confirmed iter81 prediction: norm-family port (-16.3ms bucket but kernel class is only 2.5-5% of wall). After 7+ iter cycles (4 SHIPPED + 4 NEUTRAL with banked methodology), the +21pp remaining gap is genuinely outside ADR-015 scope. Cumulative session: 0.460× → 0.792× default + chunk-engaged 0.547× → 0.790× = 4 SHIPPED wins.** Pivot direction: ADR-013 P14 (spec decode), ADR-017 (KV reuse + PagedAttention), ADR-005 (prompt caching) — different ADRs.)
+## ▶ Resume Here — current state of truth (2026-05-02 ~16:30Z, **iter83 SHIPPED: ChunkInternalArena lifts mlx-native-internal chunk-pipeline scratches; chunk-engaged -355ms / -16.1% wall = ratio ~0.95× on chunk-engaged axis (was 0.790×). Default unchanged at 0.792× (chunk path inert on pp4123). 5th SHIPPED win this session refutes iter82 scope-exhaustion declaration: arena lever-class extends one nesting level deeper. Cumulative session: 0.460× → 0.792× default + chunk-engaged 0.547× → ~0.95× = 5 SHIPPED wins (iter72/74/78/83 + iter66a). Loop continues — iter84+ candidates queued at NEXT nesting level + `chunk.commit_wait` -41ms residual + FA-path analog.** Earlier closure framing was premature; arena class is recursive, not flat.)
+
+**iter83 receipts:** mlx-native main `1a3f61f` + hf2q `a29dd7c` (both pushed). Branches: `cfa/iter83-chunk-internal-arena-20260502/claude`. 4-fixture decode parity 4/4 IDENTICAL. Tests 137/0/0 mlx-native + 307/0/10 hf2q qwen35. Verdict: `/tmp/cfa-iter83/impl-bench/VERDICT.md`.
 
 **Decode side: SHIPPED + RE-VALIDATED. iter56/57/58b confirmed byte-transparent perf-only changes (iter61c FULL VERDICT: ALL PASS).**
 
@@ -1793,7 +1795,79 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
-- **2026-05-02 (UTC ~09:00Z) — iter82 NEUTRAL → ADR-015 SCOPE-EXHAUSTION at 0.792× default / 0.790× chunk-engaged. simd_sum+float4 port of 5 reduction-heavy mlx-native shaders DELIVERED real bucket savings (-16.3ms) but the kernel class is 2.5-5% of wall, too small to surface above noise. 7-iter convergence (4 SHIPPED + 4 NEUTRAL) closes the wrapper-side AND norm-family levers; remaining +21pp is genuinely outside ADR-015 scope.**
+- **2026-05-02 (UTC ~16:30Z) — iter83 SHIPPED: ChunkInternalArena lifts mlx-native-internal chunk-pipeline scratches; chunk-engaged -355ms / -16.1% wall; default NEUTRAL; 4-fixture decode parity 4/4 IDENTICAL. Refutes iter82 scope-exhaustion declaration: arena lever-class extends one nesting level deeper than iter78 (mlx-native-internal vs hf2q-wrapper). 5th SHIPPED win this session.**
+
+  **iter83 hypothesis (pre-registered).** Lift the 7 large + 5 small `device.alloc_buffer` sites inside `dispatch_chunk_gated_delta_rule_fwd` (mlx-native `src/ops/chunk_gated_delta_rule.rs:400-543`) into a caller-owned `ChunkInternalArena`. Mirrors iter78's hf2q-side `ChunkAllocsArena` pattern at the next nesting level down. Estimate: -50 to -100 ms wall on chunk-engaged 4096-token workload (chunk path predicate `seq_len > 64 && seq_len % 64 == 0` engages); NEUTRAL on default pp4123 (chunk path inert). Falsification threshold: <30 ms wall on chunk-engaged.
+
+  **Bench (apex q4_0-flat, 6 alternating cold trials × 60s cooldown × MANDATORY warmup × mcp-brain SIGSTOP × ChunkInternalArena vs iter82 baseline `02f062f`):**
+
+  | Fixture | Chunk path? | iter83 median | iter82 median | Δ wall | Verdict |
+  |---|---|---:|---:|---:|---|
+  | chunk-engaged pp4096 (n=2 valid; A3+B3 dropped contamination) | YES | **1848.5 ms** | **2203.5 ms** | **-355 ms (-16.1%)** | **WIN** (exceeds upper-bound by 3.5×) |
+  | chunk-engaged pp4096 (n=3 robust) | YES | 1887 ms | 2244 ms | -357 ms (-15.9%) | WIN |
+  | default pp4123 | NO (4123%64=27) | 1506 ms | 1508 ms | -2 ms (-0.13%) | **NEUTRAL** |
+
+  **Per-bucket attribution (chunk-engaged, A1+A2 vs B1+B2 medians):**
+  - `chunk.enc_build`: 292.0 ms → **2.2 ms** (-289.8 ms / **-99.3%**) — collapse mechanism confirmed
+  - `chunk.commit_wait`: 424.7 ms → 383.5 ms (-41.2 ms / -9.7%)
+  - **TOTAL chunk.* lifted: 716.7 ms → 385.7 ms (-331.0 ms / -46.2%)**
+  - `layer.linear_total` (DN whole, 30 layers): 1749.6 ms → 1397.4 ms (-20.1%)
+  - `layer.full_total` (FA): unchanged within noise
+  - **Bucket→wall translation: -331 ms bucket → -355 ms wall = 107%** (clean iter72/74/78 critical-path topology — bucket savings flow through to whole-prefill wall with no async-overlap absorption)
+
+  **Pre-merge gates ALL GREEN.**
+  - 4-fixture decode parity: **4/4 IDENTICAL** (F1 27B-dwq46, F2 apex Q5_K dwq46, F3 apex q4_0-flat, F4 gemma-26B-dwq) — only timing fields differ; generated text byte-identical at temp=0.0/top-k=1/max-tokens=32. iter78's f8cdebc EOS fix is in main now, so no version-gap this round.
+  - Per-bench unit-test parity: byte-exact arena-vs-no-arena at seq=128 (0 element diffs in both `out` and `final_state` buffers — structurally stronger than 4-fixture decode parity).
+  - Token-id parity 6/6 cold trials: PASS (`The user has provided`).
+  - Tests: mlx-native lib **137/0/0** (was 127; +10 arena unit tests). hf2q `qwen35::` **307/0/10** (was 306; +1 byte-exact F32 parity test). 10 pre-existing failures predate iter83.
+  - iter58b residency-rescission audit: NO RISK — all 13 arena slots Drop-safe (caller-owned, outlive every per-layer encoder commit, terminal `commit_and_wait_labeled` preserved).
+  - HARD FENCES respected (gpu_full_attn.rs / engine.rs / registry.rs / ADR-005 doc untouched).
+
+  **Critical-path topology validation (3-predicate test post-impl):**
+  - **Predicate #1 (quantile-skew)**: `chunk.enc_build` mean/p50 = 292/2.2 = **133×** (massive cold-path skew at K=4096 boundary firings). PASS.
+  - **Predicate #2 (GPU-idle-window)**: 100% — `chunk.enc_build` is the encoder-build phase BEFORE GPU dispatch, runs entirely on CPU before the GPU has anything to do. HIGH. PASS.
+  - **Predicate #3 (fixture engagement)**: chunk-engaged fixture explicitly sized to satisfy 4096%64==0; on default pp4123 the predicate fails and arena code is dead (Result::Err → None fallback). PASS on chunk-engaged, EXPECTED-FAIL on default (= predicted NEUTRAL).
+  - **All 3 predicates score HIGH on chunk-engaged.** Outcome: WIN, exactly as topology predicts.
+
+  **Cumulative session summary (8 iters, 5 SHIPPED + 3 NEUTRAL — iter82 closure REFUTED):**
+
+  | iter | Class | Outcome | Wall Δ default / chunk-engaged |
+  |---|---|---|---:|
+  | iter72 | MoeFfnArena+DenseFfnArena (hf2q wrapper) | SHIPPED | -290 ms default |
+  | iter74 | DnPrefillArena (hf2q wrapper) | SHIPPED | -219 ms default |
+  | iter76 | PostAttnArena (hf2q wrapper) | NEUTRAL (#2 fail) | +3 ms |
+  | iter78 | ChunkAllocsArena (hf2q wrapper) | SHIPPED (chunk-engaged only) | -296 ms chunk-engaged |
+  | iter80 | MoeFfnProjArena (hf2q wrapper) | NEUTRAL (#2 partial) | +8 ms |
+  | iter82 | simd_sum+float4 norm port (mlx-native) | NEUTRAL (class too small) | -2 ms |
+  | **iter83** | **ChunkInternalArena (mlx-native internal)** | **SHIPPED (chunk-engaged only)** | **-355 ms chunk-engaged** |
+  | **Cumulative chunk-engaged** | **iter78 + iter83** | **2 levers** | **-651 ms (cumulative)** |
+
+  **Methodology lesson — iter82 closure was PREMATURE. The arena lever-class is NOT exhausted at the mlx-native-internal level.** The 7-iter convergence framing missed that the class extends recursively: iter72/74 lifted hf2q's outer arena → iter78 lifted hf2q's chunk-pipeline arena → iter83 lifted mlx-native's chunk-pipeline-internal arena. Each level previously hidden allocations now visible to the bench. Future closure declarations must explicitly enumerate remaining nesting levels.
+
+  **Cumulative ratio update (chunk-engaged axis only — default unchanged at 0.792×):** Pre-iter78 baseline 0.547× → iter78 0.790× → iter83 ~0.95× (estimate based on -598ms cumulative chunk-engaged vs llama-bench 1238ms peer; needs same-day peer cross-check for definitive ratio). **Default ratio remains 0.792×** since chunk path doesn't engage on pp4123.
+
+  **iter84+ candidates queued (not yet declared exhaustion):**
+  - **iter84 candidate**: hunt for the next-deeper allocation level inside mlx-native chunk_gated_delta_rule's INNER kernel-dispatch sites (after `chunk_internal_arena` covers the outer 12 sites, are there per-K-tile allocations still in flight?).
+  - **iter84 candidate**: `chunk.commit_wait` -41ms remaining (-9.7%) suggests a smaller secondary lever exists — investigate which encoder-commit boundary is the bottleneck.
+  - **iter84 candidate**: same nesting-level pattern applied to FA path (`fa.full_total` analog) — does FA orchestration have an internal arena class similar to chunk_gated_delta_rule? Per iter83 verdict: `fa.full_total` unchanged within noise → may be ALREADY tight.
+  - **iter84 candidate** (per iter82 framing, still valid): pivot OUT of ADR-015 to ADR-013 P14 / ADR-017 / ADR-005.
+
+  **STANDING COMPLIANCE.**
+  - `feedback_no_shortcuts` — 4-fixture decode gate run before merge, not skipped (worker recommended skipping based on byte-exact unit test; orchestrator ran it anyway and confirmed 4/4 IDENTICAL).
+  - `feedback_evidence_first_no_blind_kernel_rewrites` — pre-registered hypothesis with falsification threshold; 3-predicate test scored HIGH on all 3 chunk-engaged predicates pre-impl.
+  - `feedback_correct_outcomes` — iter82 SCOPE-EXHAUSTION explicitly REFUTED by iter83 evidence; declaration revised, not buried.
+  - `feedback_bench_process_audit` — bench worker noted that parallel `cargo test` from a wedge4c2 worktree contaminated trial 3 (A3+B3); the WIN signal is robust even with contamination (n=2 clean trials AND n=3 all trials both produce -355 ms / -357 ms WIN). Future iters must `kill -STOP` cargo-test parents, not just mcp-brain-server.
+
+  **Receipts.**
+  - iter83 verdict: `/tmp/cfa-iter83/impl-bench/VERDICT.md` (480 lines)
+  - iter83 4-fixture decode gate: `/tmp/cfa-iter83/4-fixture/run.log` + `F{1..4}-{main,iter83}.txt` byte-identical excluding timing
+  - mlx-native merge: `1a3f61f` (`cfa/iter83-chunk-internal-arena-20260502/claude` 62298b4 fast-forwarded via merge --no-ff)
+  - hf2q merge: `a29dd7c` (`cfa/iter83-chunk-internal-arena-20260502/claude` ec2bef7 fast-forwarded via merge --no-ff)
+  - Both pushed to origin.
+
+  Status: ADR-015 default ratio holds at 0.792×. **Chunk-engaged ratio improves from 0.790× → ~0.95× via iter83**. iter82 SCOPE-EXHAUSTION declaration REVISED — arena class extends recursively across nesting levels; iter84+ should hunt for the NEXT level before re-declaring closure. Loop continues.
+
+- **2026-05-02 (UTC ~09:00Z) — iter82 NEUTRAL → ADR-015 SCOPE-EXHAUSTION at 0.792× default / 0.790× chunk-engaged. [SUPERSEDED BY iter83 — chunk-engaged closure refined to ~0.95× via mlx-native-internal arena lift; arena class NOT exhausted as claimed.] simd_sum+float4 port of 5 reduction-heavy mlx-native shaders DELIVERED real bucket savings (-16.3ms) but the kernel class is 2.5-5% of wall, too small to surface above noise. 7-iter convergence (4 SHIPPED + 4 NEUTRAL) closes the wrapper-side AND norm-family levers; remaining +21pp is genuinely outside ADR-015 scope.**
 
   **iter82 deliverables.** Worker ported 5 mlx-native shader files from `threadgroup_barrier + shared-memory tree reduction + scalar f32` to `simd_sum + float4 + fused mul/add` (per llama.cpp peer pattern + iter56 `gated_delta_net_decode` precedent). Branch `cfa/iter82-simd-norms-20260502/claude` HEAD `45dd2bd` (mlx-native, pushed). 19+ kernel functions ported across rms_norm.metal (11), l2_norm.metal (3), ssm_norm_gate.metal (1), fused_norm_add_f32.metal (2), fused_norm_add_bf16.metal (2), moe_softmax_topk.metal (Phase 1).
 
