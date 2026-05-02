@@ -51,9 +51,10 @@ use super::gpu_delta_net::{
 };
 use super::gpu_ffn::{
     build_dense_ffn_layer_gpu, build_dense_ffn_layer_gpu_q_into,
-    build_dense_ffn_layer_gpu_q_split_profile, build_moe_ffn_layer_gpu,
-    build_moe_ffn_layer_gpu_q_into, DenseFfnWeightsGpu, DenseFfnWeightsGpuQ, MoeFfnWeightsGpu,
-    MoeFfnWeightsGpuQ,
+    build_dense_ffn_layer_gpu_q_into_with_arena, build_dense_ffn_layer_gpu_q_split_profile,
+    build_moe_ffn_layer_gpu, build_moe_ffn_layer_gpu_q_into,
+    build_moe_ffn_layer_gpu_q_into_with_arena, DenseFfnWeightsGpu, DenseFfnWeightsGpuQ,
+    MoeFfnWeightsGpu, MoeFfnWeightsGpuQ,
 };
 use super::gpu_full_attn::{
     apply_gated_attn_layer_decode_into, apply_linear_projection_f32,
@@ -1592,6 +1593,72 @@ impl Qwen35Model {
             None
         };
 
+        // ---- ADR-015 iter72: DenseFfnArena allocation ----
+        //
+        // Allocated ONCE per prefill (seq_len > 1), sized for the actual prompt
+        // length and dense FFN shape (hidden_size, intermediate_size). Reused
+        // across all dense layers in the loop below.
+        //
+        // Lifetime: dropped at end of forward_gpu_impl, AFTER the final
+        // output-head commit_and_wait_labeled — which guarantees all arena
+        // buffers are still alive when any CB that references them executes.
+        //
+        // Skip when seq_len == 1 (decode): existing thread-local
+        // `decode_pool::pooled_alloc_buffer` path is already optimal at
+        // single-token granularity.
+        //
+        // Skip when the model has no dense FFN intermediate_size (pure-MoE
+        // configs): no work for this arena.
+        //
+        // Memory footprint at 27B q4_0-flat pp4096 (h=5120, m=17408):
+        //   3 × (4096 × 17408 × 4 bytes) ≈ 855 MB + 4 bytes silu_params.
+        // Allocated once, lives for the entire prefill duration; on M5 Max
+        // 128 GB unified memory this is well within budget.
+        let mut dense_ffn_arena: Option<super::DenseFfnArena> = if seq_len > 1 {
+            if let Some(m) = cfg.intermediate_size {
+                Some(
+                    super::DenseFfnArena::new(&device, seq_len, h, m)
+                        .context("alloc DenseFfnArena")?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // ---- ADR-015 iter72: MoeFfnArena allocation ----
+        //
+        // Allocated ONCE per prefill (seq_len > 1), sized for the actual
+        // prompt length and MoE FFN shape. Reused across all MoE layers in
+        // the loop below. Same lifetime contract + iter58b residency-
+        // rescission protection as DenseFfnArena above.
+        //
+        // Skip when no MoE config present (pure-dense models).
+        //
+        // Memory footprint at 35B-A3B q4_0-flat pp4096 (h=5120, topk=8,
+        // m_moe=512, m_sh=512): ~870 MB. Allocated once for the prefill;
+        // M5 Max 128 GB unified memory keeps this well within budget.
+        let mut moe_ffn_arena: Option<super::MoeFfnArena> = if seq_len > 1 {
+            if let Some(moe) = cfg.moe.as_ref() {
+                Some(
+                    super::MoeFfnArena::new(
+                        &device,
+                        seq_len,
+                        h,
+                        moe.num_experts_per_tok,
+                        moe.moe_intermediate_size,
+                        moe.shared_expert_intermediate_size,
+                    )
+                    .context("alloc MoeFfnArena")?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // ---- Step 2: per-layer forward pass ----
         let decode_profile = std::env::var("HF2Q_DECODE_PROFILE").is_ok();
         let mut total_attn_us = 0u64;
@@ -2060,15 +2127,39 @@ impl Qwen35Model {
                             format!("dense_ffn_q_split_profile fused layer {layer_idx}")
                         })?
                     } else {
-                        let out = build_dense_ffn_layer_gpu_q_into(
-                            &mut enc,
-                            &device,
-                            &mut registry,
-                            &ffn_input,
-                            w,
-                            Some(&ffn_residual),
-                        )
-                        .with_context(|| format!("dense_ffn_q_into fused layer {layer_idx}"))?;
+                        // ADR-015 iter72: route through DenseFfnArena at prefill
+                        // (seq_len > 1) to eliminate per-layer pooled scratch
+                        // allocations.  Arena is owned by `forward_gpu_impl` and
+                        // outlives every per-layer encoder commit, preventing the
+                        // iter58b residency-rescission failure mode.  Decode path
+                        // (seq_len == 1) keeps the existing pooled variant
+                        // (single-token thread-local pool is already optimal).
+                        let out = if let Some(arena) = dense_ffn_arena.as_mut() {
+                            build_dense_ffn_layer_gpu_q_into_with_arena(
+                                &mut enc,
+                                &device,
+                                &mut registry,
+                                &ffn_input,
+                                w,
+                                Some(&ffn_residual),
+                                arena,
+                            )
+                            .with_context(|| {
+                                format!("dense_ffn_q_into_with_arena fused layer {layer_idx}")
+                            })?
+                        } else {
+                            build_dense_ffn_layer_gpu_q_into(
+                                &mut enc,
+                                &device,
+                                &mut registry,
+                                &ffn_input,
+                                w,
+                                Some(&ffn_residual),
+                            )
+                            .with_context(|| {
+                                format!("dense_ffn_q_into fused layer {layer_idx}")
+                            })?
+                        };
                         if seq_len == 1 {
                             enc.commit();
                         } else if is_k_boundary {
@@ -2140,16 +2231,42 @@ impl Qwen35Model {
                     // buffer is `device.alloc_buffer` (gpu_ffn.rs line 1989,
                     // iter40 fix), so it survives the per-layer pool reset
                     // and can safely become the next layer's residual stream.
-                    let out = build_moe_ffn_layer_gpu_q_into(
-                        &mut enc,
-                        &device,
-                        &mut registry,
-                        &ffn_input,
-                        w_gpu,
-                        shape,
-                        Some(&ffn_residual),
-                    )
-                    .with_context(|| format!("moe_ffn_q_into fused layer {layer_idx}"))?;
+                    // ADR-015 iter72: route through MoeFfnArena at prefill
+                    // (seq_len > 1) to eliminate per-layer pooled scratch
+                    // allocations.  Arena is owned by `forward_gpu_impl` and
+                    // outlives every per-layer encoder commit, preventing the
+                    // iter58b residency-rescission failure mode.  Decode path
+                    // (seq_len == 1) keeps the existing pooled variant (the
+                    // single-token thread-local pool is already optimal at
+                    // decode granularity).
+                    let out = if let Some(arena) = moe_ffn_arena.as_mut() {
+                        build_moe_ffn_layer_gpu_q_into_with_arena(
+                            &mut enc,
+                            &device,
+                            &mut registry,
+                            &ffn_input,
+                            w_gpu,
+                            shape,
+                            Some(&ffn_residual),
+                            arena,
+                        )
+                        .with_context(|| {
+                            format!("moe_ffn_q_into_with_arena fused layer {layer_idx}")
+                        })?
+                    } else {
+                        build_moe_ffn_layer_gpu_q_into(
+                            &mut enc,
+                            &device,
+                            &mut registry,
+                            &ffn_input,
+                            w_gpu,
+                            shape,
+                            Some(&ffn_residual),
+                        )
+                        .with_context(|| {
+                            format!("moe_ffn_q_into fused layer {layer_idx}")
+                        })?
+                    };
                     if seq_len == 1 {
                         enc.commit();
                     } else if is_k_boundary {

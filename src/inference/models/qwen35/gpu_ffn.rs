@@ -1119,6 +1119,210 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
     Ok(result)
 }
 
+/// ADR-015 iter72: `_into_arena` variant of `build_dense_ffn_layer_gpu_q_into`.
+///
+/// Prefill-only variant that reuses the four transient scratches
+/// (gate, up, hidden, silu_params) from a caller-owned
+/// [`super::DenseFfnArena`]. Allocation happens ONCE per prefill (in
+/// `forward_gpu_impl`); this function performs zero `device.alloc_buffer`
+/// calls for scratches, eliminating the W-5b.8 `ffn.alloc_scratch` bucket
+/// (~365 ms / ~14 % of prefill wall on 27B q4_0-flat pp4096).
+///
+/// # Arguments
+///
+/// * `arena` — caller-owned scratch arena. MUST be sized for the actual
+///   prefill `(seq_len, hidden_size, intermediate_size)`. The function
+///   asserts this via `validate_fits` and returns `Err` on mismatch.
+///
+/// # Lifetime contract
+///
+/// Same as the pooled variant for the FINAL output buffer (`down_out` /
+/// `sum_buf`): device-allocated at prefill so it survives the per-layer
+/// pool reset and crosses into the next layer's `hidden`. The four
+/// transient scratches now live in the arena (caller scope), eliminating
+/// the per-layer `pooled_alloc_buffer` calls entirely.
+#[allow(clippy::too_many_arguments)]
+pub fn build_dense_ffn_layer_gpu_q_into_with_arena(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    weights: &DenseFfnWeightsGpuQ,
+    add_residual: Option<&MlxBuffer>,
+    arena: &mut super::DenseFfnArena,
+) -> Result<MlxBuffer> {
+    let h = weights.hidden_size;
+    let m = weights.intermediate_size;
+    let seq_len = (x.element_count() / h as usize) as u32;
+    let n_h = (seq_len * m) as u32;
+    let n_out = (seq_len * h) as usize;
+
+    // Validate the arena's capacity matches our shape — guards against a
+    // future model that mixes dense layers of different intermediate sizes
+    // or against accidental shape drift.
+    arena
+        .validate_fits(seq_len, h, m)
+        .context("DenseFfnArena shape mismatch")?;
+
+    // ADR-015 iter72: zero per-layer scratch allocations.  The four
+    // transient buffers (gate, up, hidden, silu_params) live in the
+    // caller-owned arena across all dense layers in this prefill.  The
+    // arena is allocated once at the top of `forward_gpu_impl` (after
+    // `ensure_gpu_cache_primed`, before the per-layer loop) when seq_len > 1
+    // AND the model has at least one Dense FFN layer.
+    //
+    // We still record the (now near-zero) `FfnAllocScratch` bucket so the
+    // W-5b.8 profile can confirm the savings on the same metric the prior
+    // closure attempts inspected.
+    let _w5b_ffn_alloc = super::wave5b8_profile::Section::start(
+        super::wave5b8_profile::SectionKind::FfnAllocScratch,
+    );
+
+    // FINAL OUTPUT (down_out) at prefill MUST be `device.alloc_buffer`'d so it
+    // survives the per-layer arena reset and can become the next layer's
+    // `hidden`.  Same lifetime constraint as the pooled variant — see
+    // `build_dense_ffn_layer_gpu_q_into_pooled` lines 958-978 for the
+    // canonical doc-comment.
+    let mut down_out = device
+        .alloc_buffer(n_out * 4, DType::F32, vec![seq_len as usize, h as usize])
+        .map_err(|e| anyhow!("alloc dense_q down_out (device, prefill arena): {e}"))?;
+
+    // Write the silu_mul element count to the arena's silu_params buffer.
+    arena
+        .silu_params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("DenseFfnArena silu_params as_mut_slice: {e}"))?[0] = n_h;
+    drop(_w5b_ffn_alloc);
+
+    let gate_up_params = GgmlQuantizedMatmulParams {
+        m: seq_len,
+        n: m,
+        k: h,
+        ggml_type: weights.ggml_type_gate_up,
+    };
+    let down_params = GgmlQuantizedMatmulParams {
+        m: seq_len,
+        n: h,
+        k: m,
+        ggml_type: weights.ggml_type_down,
+    };
+
+    // Ops 1+2: gate and up projections via quantized_matmul_ggml (both read x, concurrent).
+    {
+        let _w5b = super::wave5b8_profile::Section::start(
+            super::wave5b8_profile::SectionKind::FfnPhaseAProj,
+        );
+        quantized_matmul_ggml(
+            enc,
+            registry,
+            device,
+            x,
+            &weights.gate_q,
+            &mut arena.gate_buf,
+            &gate_up_params,
+        )
+        .context("dense_q gate proj (arena)")?;
+        quantized_matmul_ggml(
+            enc,
+            registry,
+            device,
+            x,
+            &weights.up_q,
+            &mut arena.up_buf,
+            &gate_up_params,
+        )
+        .context("dense_q up proj (arena)")?;
+    }
+
+    // Barrier: silu_mul reads gate_buf/up_buf written above.
+    {
+        let _w5b = super::wave5b8_profile::Section::start(
+            super::wave5b8_profile::SectionKind::FfnBarrierAB,
+        );
+        enc.memory_barrier();
+    }
+
+    // Op 3: silu(gate) * up → hidden.
+    {
+        let _w5b = super::wave5b8_profile::Section::start(
+            super::wave5b8_profile::SectionKind::FfnPhaseDSilu,
+        );
+        dispatch_silu_mul(
+            enc,
+            registry,
+            device.metal_device(),
+            &arena.gate_buf,
+            &arena.up_buf,
+            &arena.hidden_buf,
+            &arena.silu_params_buf,
+            n_h,
+        )
+        .context("dense_q silu_mul (arena)")?;
+    }
+
+    // Barrier: down proj reads hidden.
+    {
+        let _w5b = super::wave5b8_profile::Section::start(
+            super::wave5b8_profile::SectionKind::FfnBarrierDE,
+        );
+        enc.memory_barrier();
+    }
+
+    // Op 4: out = down_proj(hidden).
+    {
+        let _w5b = super::wave5b8_profile::Section::start(
+            super::wave5b8_profile::SectionKind::FfnPhaseEDown,
+        );
+        quantized_matmul_ggml(
+            enc,
+            registry,
+            device,
+            &arena.hidden_buf,
+            &weights.down_q,
+            &mut down_out,
+            &down_params,
+        )
+        .context("dense_q down proj (arena)")?;
+    }
+
+    // Op 5 (optional): out += residual — folded to save 1 commit per dense layer.
+    let result = if let Some(res) = add_residual {
+        // Same lifetime constraint as down_out at prefill — must be
+        // `device.alloc_buffer` to survive per-layer reset.
+        let sum_buf = device
+            .alloc_buffer(n_out * 4, DType::F32, vec![n_out])
+            .map_err(|e| anyhow!("alloc dense_q residual sum (device, prefill arena): {e}"))?;
+        // Barrier: elementwise_add reads down_out written by Op 4.
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnBarrierEF,
+            );
+            enc.memory_barrier();
+        }
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnPhaseFReduce,
+            );
+            elementwise_add(
+                enc,
+                registry,
+                device.metal_device(),
+                &down_out,
+                res,
+                &sum_buf,
+                n_out,
+                DType::F32,
+            )
+            .context("dense_q residual add (arena)")?;
+        }
+        sum_buf
+    } else {
+        down_out
+    };
+
+    Ok(result)
+}
+
 /// Prefill-safe variant of [`build_dense_ffn_layer_gpu_q_into`]: uses
 /// `device.alloc_buffer` for scratches to avoid the per-decode-token arena
 /// pool's residency-set exhaustion at full prefill working set.  Same
@@ -2336,6 +2540,373 @@ pub fn build_moe_ffn_layer_gpu_q_into(
         // NOTE: this `_into` variant does NOT commit.  The caller is
         // responsible for committing the encoder, allowing fusion with
         // upstream dispatches (e.g. `dispatch_fused_residual_norm_f32`).
+    }
+
+    Ok(out_buf)
+}
+
+/// ADR-015 iter72: `_with_arena` variant of `build_moe_ffn_layer_gpu_q_into`.
+///
+/// Prefill-only variant that reuses the eight transient scratches
+/// (ids, weights, gate_all, up_all, h_all, y_all, h_s, silu_params,
+/// silu_sh_params, dummy_residual) from a caller-owned [`super::MoeFfnArena`].
+/// Allocation happens ONCE per prefill (in `forward_gpu_impl`); this
+/// function performs ZERO `pooled_alloc_buffer` calls for the transient
+/// scratches, eliminating the W-5b.8 `ffn.alloc_scratch` bucket.
+///
+/// **NOT included** in the arena (still allocated per-layer, lifetime
+/// crosses the layer boundary):
+/// - `out_buf` — function return value, becomes next layer's `hidden`.
+///   Same `device.alloc_buffer` path the existing `_into` variant uses
+///   at prefill (gpu_ffn.rs ~2189 in iter40-fix doc-comment).
+///
+/// # Lifetime contract
+///
+/// The arena outlives every per-layer encoder commit; identical to
+/// FaPrefillArena's structural-fix-for-iter58b doc.
+#[allow(clippy::too_many_arguments)]
+pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    weights: &MoeFfnWeightsGpuQ,
+    shape: MoeFfnShape,
+    add_residual: Option<&MlxBuffer>,
+    arena: &mut super::MoeFfnArena,
+) -> Result<MlxBuffer> {
+    let h = shape.hidden_size as usize;
+    let _ne = shape.num_experts as usize;
+    let topk = shape.num_experts_per_tok as usize;
+    let m_moe = shape.moe_intermediate_size as usize;
+    let seq_len = (x.element_count() / h) as u32;
+    let seq = seq_len as usize;
+
+    let h32 = shape.hidden_size;
+    let ne32 = shape.num_experts;
+    let m_moe32 = shape.moe_intermediate_size;
+    let m_sh32 = shape.shared_intermediate_size;
+
+    // Validate the arena's capacity matches our shape.
+    arena
+        .validate_fits(
+            seq_len,
+            h32,
+            shape.num_experts_per_tok,
+            m_moe32,
+            m_sh32,
+        )
+        .context("MoeFfnArena shape mismatch")?;
+
+    let total_rows = seq * topk;
+    let _w5b_ffn_alloc = super::wave5b8_profile::Section::start(
+        super::wave5b8_profile::SectionKind::FfnAllocScratch,
+    );
+
+    // Per-layer FINAL OUTPUT must be device-allocated at prefill so it
+    // survives the per-layer pool reset and crosses into the next layer's
+    // `hidden`.  See gpu_ffn.rs:2165-2196 (iter40 fix) for the canonical
+    // doc-comment on this lifetime contract.
+    let out_bytes = seq * h * 4;
+    let mut out_buf = device
+        .alloc_buffer(out_bytes, DType::F32, vec![seq, h])
+        .map_err(|e| anyhow!("alloc moe output (device, prefill arena): {e}"))?;
+
+    // silu params writes — done once per layer, but they share with the
+    // arena's pre-allocated buffer.  Same `n_h_all` value every layer at
+    // a given seq_len.
+    let n_h_all = (total_rows * m_moe) as u32;
+    let m_sh = m_sh32 as usize;
+    let n_h_s = (seq * m_sh) as u32;
+    arena
+        .silu_params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("MoeFfnArena silu_params as_mut_slice: {e}"))?[0] = n_h_all;
+    arena
+        .silu_sh_params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("MoeFfnArena silu_sh_params as_mut_slice: {e}"))?[0] = n_h_s;
+
+    // Resolve residual buffer reference: arena.dummy_residual_buf when
+    // add_residual=None, otherwise the caller-provided buffer.
+    let residual_ref: &MlxBuffer = match add_residual {
+        Some(buf) => buf,
+        None => &arena.dummy_residual_buf,
+    };
+    drop(_w5b_ffn_alloc);
+
+    {
+        // ---- Phase A: router + shared expert projections (concurrent) ----
+        let (logits_buf, sh_logit_buf, a_s_buf, b_s_buf) = {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnPhaseAProj,
+            );
+            // proj_pooled allocates from the thread-local decode pool —
+            // these projection outputs flow into Phase B/C/F kernels and
+            // never cross a layer boundary, so the existing pool path is
+            // safe and we leave it untouched (the W-5b.8
+            // `ffn.alloc_scratch` bucket measures the iter72-targeted
+            // scratches above; proj_pooled is measured in
+            // `ffn.phase_a_proj`).
+            let logits_buf = proj_pooled(
+                enc,
+                registry,
+                device,
+                x,
+                &weights.router,
+                seq_len,
+                h32,
+                ne32,
+            )?;
+            let sh_logit_buf = proj_pooled(
+                enc,
+                registry,
+                device,
+                x,
+                &weights.shared_gate_inp,
+                seq_len,
+                h32,
+                1,
+            )?;
+            let a_s_buf = proj_pooled(
+                enc,
+                registry,
+                device,
+                x,
+                &weights.shared_gate,
+                seq_len,
+                h32,
+                m_sh32,
+            )?;
+            let b_s_buf = proj_pooled(
+                enc,
+                registry,
+                device,
+                x,
+                &weights.shared_up,
+                seq_len,
+                h32,
+                m_sh32,
+            )?;
+            (logits_buf, sh_logit_buf, a_s_buf, b_s_buf)
+        };
+
+        // Barrier A→B.
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnBarrierAB,
+            );
+            enc.memory_barrier();
+        }
+
+        // ---- Phase B: GPU softmax+topk + shared silu_mul (concurrent) ----
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnPhaseBRouteSilu,
+            );
+            dispatch_moe_softmax_topk(
+                enc,
+                registry,
+                device,
+                &logits_buf,
+                &arena.ids_buf,
+                &arena.weights_buf,
+                seq_len,
+                ne32,
+                shape.num_experts_per_tok,
+            )
+            .map_err(|e| anyhow!("moe_softmax_topk: {e}"))?;
+            dispatch_silu_mul(
+                enc,
+                registry,
+                device.metal_device(),
+                &a_s_buf,
+                &b_s_buf,
+                &arena.h_s_buf,
+                &arena.silu_sh_params_buf,
+                n_h_s,
+            )
+            .map_err(|e| anyhow!("silu_mul sh: {e}"))?;
+        }
+
+        // Barrier B→C.
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnBarrierBC,
+            );
+            enc.memory_barrier();
+        }
+
+        // ---- Phase C: expert gate+up matmuls + shared down proj ----
+        let gate_params = GgmlQuantizedMatmulIdParams {
+            n_tokens: seq_len,
+            top_k: shape.num_experts_per_tok,
+            n: m_moe32,
+            k: h32,
+            n_experts: ne32,
+            expert_stride: weights.expert_gate_stride,
+            ggml_type: weights.ggml_type_gate_up,
+        };
+        let up_params = GgmlQuantizedMatmulIdParams {
+            expert_stride: weights.expert_up_stride,
+            ..gate_params
+        };
+        let y_s_buf = {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnPhaseCGateUpSharedDown,
+            );
+            super::decode_pool::with_id_mm_scratch(
+                super::decode_pool::MmIdSlot::Gate,
+                device,
+                ne32,
+                seq_len * shape.num_experts_per_tok,
+                |scratch| {
+                    quantized_matmul_id_ggml_pooled(
+                        enc,
+                        registry,
+                        device,
+                        x,
+                        &weights.expert_gate_q,
+                        &arena.ids_buf,
+                        &mut arena.gate_all_buf,
+                        scratch,
+                        &gate_params,
+                    )
+                },
+            )
+            .map_err(|e| anyhow!("gate_all qmatmul_id_pooled: {e}"))?;
+            super::decode_pool::with_id_mm_scratch(
+                super::decode_pool::MmIdSlot::Up,
+                device,
+                ne32,
+                seq_len * shape.num_experts_per_tok,
+                |scratch| {
+                    quantized_matmul_id_ggml_pooled(
+                        enc,
+                        registry,
+                        device,
+                        x,
+                        &weights.expert_up_q,
+                        &arena.ids_buf,
+                        &mut arena.up_all_buf,
+                        scratch,
+                        &up_params,
+                    )
+                },
+            )
+            .map_err(|e| anyhow!("up_all qmatmul_id_pooled: {e}"))?;
+            proj_pooled(
+                enc,
+                registry,
+                device,
+                &arena.h_s_buf,
+                &weights.shared_down,
+                seq_len,
+                m_sh32,
+                h32,
+            )?
+        };
+
+        // Barrier C→D.
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnBarrierCD,
+            );
+            enc.memory_barrier();
+        }
+
+        // ---- Phase D: h_all = silu(gate_all) * up_all ----
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnPhaseDSilu,
+            );
+            dispatch_silu_mul(
+                enc,
+                registry,
+                device.metal_device(),
+                &arena.gate_all_buf,
+                &arena.up_all_buf,
+                &arena.h_all_buf,
+                &arena.silu_params_buf,
+                n_h_all,
+            )
+            .map_err(|e| anyhow!("silu_mul dispatch: {e}"))?;
+        }
+
+        // Barrier D→E.
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnBarrierDE,
+            );
+            enc.memory_barrier();
+        }
+
+        // ---- Phase E: y_all = expert_down(h_all) ----
+        let down_params = GgmlQuantizedMatmulIdParams {
+            n_tokens: total_rows as u32,
+            top_k: 1,
+            n: h32,
+            k: m_moe32,
+            n_experts: ne32,
+            expert_stride: weights.expert_down_stride,
+            ggml_type: weights.ggml_type_down,
+        };
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnPhaseEDown,
+            );
+            super::decode_pool::with_id_mm_scratch(
+                super::decode_pool::MmIdSlot::Down,
+                device,
+                ne32,
+                total_rows as u32,
+                |scratch| {
+                    quantized_matmul_id_ggml_pooled(
+                        enc,
+                        registry,
+                        device,
+                        &arena.h_all_buf,
+                        &weights.expert_down_q,
+                        &arena.ids_buf,
+                        &mut arena.y_all_buf,
+                        scratch,
+                        &down_params,
+                    )
+                },
+            )
+            .map_err(|e| anyhow!("y_all qmatmul_id_pooled: {e}"))?;
+        }
+
+        // Barrier E→F.
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnBarrierEF,
+            );
+            enc.memory_barrier();
+        }
+
+        // ---- Phase F: weighted reduce + residual ----
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnPhaseFReduce,
+            );
+            dispatch_moe_weighted_reduce(
+                enc,
+                registry,
+                device,
+                &arena.weights_buf,
+                &arena.y_all_buf,
+                &sh_logit_buf,
+                &y_s_buf,
+                residual_ref,
+                &mut out_buf,
+                seq_len,
+                shape.num_experts_per_tok,
+                h32,
+                add_residual.is_some(),
+            )
+            .map_err(|e| anyhow!("moe_weighted_reduce: {e}"))?;
+        }
     }
 
     Ok(out_buf)
