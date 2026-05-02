@@ -1377,36 +1377,47 @@ pub fn apply_sdpa_with_kv_cache(
         // SDPA kernel call (gated on HF2Q_PROFILE_W5B8=1, no-op otherwise).
         // The buckets together account for `FaSdpaTotal` measured by
         // `build_gated_attn_layer`.
-        let (k_cpu_new, v_cpu_new) = {
+        // ADR-013 P21 stage-2 (2026-05-01): GPU-side KV cache write.
+        //
+        // Replaces the legacy `download_f32(k_seq_major) + download_f32(v_seq_major)
+        // + CPU triple-loop write into slot.k/slot.v` with a single GPU dispatch
+        // (`kv_cache_copy_seq_f32_kv_dual`) — the same kernel the decode path
+        // already uses (line 1349). This eliminates:
+        //   - The CPU bridge that violated as_slice "no GPU writer in flight"
+        //     (Codex Phase-2b finding from Stage 1)
+        //   - The need for `commit_and_wait_labeled` on ops1-4 in arena prefill
+        //     (the wait was solely to give as_slice access to k_seq_major /
+        //     v_seq_major). With this change, ops1-4 can downgrade to
+        //     commit_labeled (next encoder will have GPU-ordering after ops1-4
+        //     via Metal serial queue).
+        //   - 86 ms host-wall on fa.ops1_4 at pp80 (HF2Q_PROFILE_W5B8 measurement
+        //     after Stage 3a; the wait drained all in-flight async DN work).
+        //
+        // The kernel writes the same bytes as the CPU loop did:
+        //   src layout: [seq * n_kv_heads, head_dim] = seq-major
+        //   dst layout: slot.k/v = [n_kv_heads, max_seq_len, head_dim] = head-major
+        //   slot = (cur_len + t) for full-attn (capacity == max_seq_len, no wrap)
+        if kv_write_tokens > 0 {
             let _w5b9_kv_dl_copy = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FaSdpaKvDownloadCopy,
             );
-            let k_cpu_new = download_f32(k_seq_major)?;
-            let v_cpu_new = download_f32(v_seq_major)?;
-
-            let k_cache_cpu = slot.k.as_mut_slice::<f32>()
-                .map_err(|e| anyhow!("kv_cache k as_mut_slice: {e}"))?;
-            let v_cache_cpu = slot.v.as_mut_slice::<f32>()
-                .map_err(|e| anyhow!("kv_cache v as_mut_slice: {e}"))?;
-
-            for t in 0..kv_write_tokens {
-                let abs_pos = cur_len + t;
-                for h in 0..nkv {
-                    let src_base = (t * nkv + h) * d;
-                    let dst_base = h * max_sl * d + abs_pos * d;
-                    k_cache_cpu[dst_base..dst_base + d].copy_from_slice(&k_cpu_new[src_base..src_base + d]);
-                    v_cache_cpu[dst_base..dst_base + d].copy_from_slice(&v_cpu_new[src_base..src_base + d]);
-                }
-            }
-            (k_cpu_new, v_cpu_new)
-        };
-        // Suppress unused-variable warnings: k_cpu_new/v_cpu_new are kept alive
-        // only to ensure the bucket boundary above closes before the SDPA call.
-        let _ = (k_cpu_new, v_cpu_new);
-        // k_cache_cpu / v_cache_cpu are &mut [f32] borrowed from slot.k / slot.v;
-        // NLL releases them at their last use (the loop above), so the immutable
-        // re-borrow at sdpa(&slot.k, &slot.v, ...) below is sound without an
-        // explicit drop. (drop() on a reference is a no-op anyway.)
+            let mut enc = device.command_encoder()
+                .context("enc kv_cache_copy_seq_dual prefill")?;
+            mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual(
+                &mut enc, registry, device.metal_device(),
+                k_seq_major, v_seq_major,
+                &slot.k, &slot.v,
+                n_kv_heads, head_dim, max_seq_len,
+                cur_len as u32, kv_write_tokens as u32, 0,
+            ).context("kv_cache_copy_seq_f32_dual prefill")?;
+            // commit_labeled (no host wait) — out_buf for the FA dispatch below
+            // is a separate buffer; the new_path_eligible branch reads
+            // k_seq_major/v_seq_major directly (not slot.k/slot.v) so this
+            // commit's completion is not on the critical path of the FA bridge
+            // — the legacy SDPA fallback will commit_and_wait at line 1497
+            // and pick up the slot.k/slot.v writes via Metal queue ordering.
+            enc.commit_labeled("layer.full_attn.kv_cache_write");
+        }
 
         // ── Production path: flash_attn_prefill_bf16_d256 ──
         //
@@ -1682,11 +1693,17 @@ pub fn build_gated_attn_layer(
         // calls download_f32(k_seq_major) / download_f32(v_seq_major) to write
         // the persistent KV cache (slot.k/slot.v) BEFORE the new_path_eligible
         // branch dispatches FA. download_f32 → MlxBuffer::as_slice violates the
-        // "no GPU writer in flight" safety contract unless we commit_and_wait
-        // here first. Stage 1 cannot drop this wait without also moving the
-        // KV-cache write onto GPU (deferred to Stage 1.5 / Stage 2 per Codex
-        // Phase-2b finding `missing_RAW` and queen Option A).
-        if seq_len == 1 && head_dim % 32 == 0 {
+        // ADR-013 P21 Stage 2 (2026-05-01): KV-cache write is now a GPU
+        // dispatch (kv_cache_copy_seq_f32_dual at apply_sdpa_with_kv_cache:1380),
+        // eliminating the download_f32(k_seq_major)/download_f32(v_seq_major)
+        // calls that previously required commit_and_wait here for the
+        // as_slice "no GPU writer in flight" contract. With use_arena=true
+        // (Stage 1 FaPrefillArena keeps scratches alive past commit), we can
+        // safely commit_labeled in prefill too — the FA bridge dispatch runs
+        // on the same Metal serial queue and orders after ops1-4 by GPU
+        // queue ordering. iter58b residency-rescission is prevented by the
+        // FaPrefillArena lifetime (scratches don't drop until end of prefill).
+        if (seq_len == 1 && head_dim % 32 == 0) || use_arena {
             enc.commit_labeled("layer.full_attn.ops1-4");
         } else {
             enc.commit_and_wait_labeled("layer.full_attn.ops1-4").context("commit ops1-4 prefill")?;
