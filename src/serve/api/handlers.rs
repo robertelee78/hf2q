@@ -41,6 +41,48 @@ use crate::serve::auto_pipeline;
 use crate::serve::multi_model::{EngineConfig, HotSwapError, LoadedEngine, PoolError};
 use crate::serve::quant_select::QuantType;
 
+/// Probe-order list of BOS-token text fragments used by the `/v1/embeddings`
+/// handler when a GGUF doesn't surface `tokenizer.ggml.bos_token_id` through
+/// `Engine`. First match (via `tokenizer().token_to_id`) wins.
+///
+/// **Order matters** — Gemma's `<bos>` is checked before `<s>` because both
+/// can appear in the same vocab on dual-format checkpoints (e.g. SentencePiece-
+/// based Gemma adapters), and the embedding wire format must match
+/// `llama-embedding`'s byte-for-byte. Adding a new fragment without a peer
+/// cite will fail the family-matrix tests in `bos_probe_tests` below.
+///
+/// 2026-05-02 — extracted from a 275-LOC inline `embeddings` async fn body
+/// per the H1 audit (`docs/research/decode-test-gap-2026-05-02.md`). Inline
+/// fn-body `const &[&str]` declarations are fn-local-scope and unreachable
+/// from `mod tests`; same regression class as the
+/// `SPECIAL_TOKEN_STOPS` 3-commit thrash on the same day. The
+/// `tokenizer.ggml.bos_token_id` GGUF key would be the authoritative source;
+/// surfacing it through `Engine` (rather than probing the HF tokenizer) is
+/// iter-94+ work tracked in the original embeddings comment.
+///
+/// # Family coverage
+/// | Fragment | Families |
+/// |---|---|
+/// | `<bos>` | Gemma 1 / 2 / 3 / 4 |
+/// | `<\|begin_of_text\|>` | Llama 3 / 3.1 / 3.2 |
+/// | `<s>` | Llama 1 / 2, Mistral |
+/// | `<\|im_start\|>` | Qwen 2 / 2.5 / 3 (start-of-turn used as BOS by `llama-embedding`) |
+pub(crate) const BOS_PROBE_FRAGMENTS: &[&str] = &[
+    "<bos>",
+    "<|begin_of_text|>",
+    "<s>",
+    "<|im_start|>",
+];
+
+/// Probe `tokenizer` for the first `BOS_PROBE_FRAGMENTS` entry it recognizes.
+/// Returns the corresponding token id, or `None` if no fragment matches
+/// (in which case the embedding handler skips the BOS prepend silently).
+pub(crate) fn probe_bos_token_id(tokenizer: &tokenizers::Tokenizer) -> Option<u32> {
+    BOS_PROBE_FRAGMENTS
+        .iter()
+        .find_map(|t| tokenizer.token_to_id(t))
+}
+
 // ---------------------------------------------------------------------------
 // Pool-routing helper (ADR-005 Phase 4 iter-209 — Decision #26 auto-swap)
 // ---------------------------------------------------------------------------
@@ -5747,22 +5789,12 @@ async fn chat_model_embeddings(
     // post-processor leaves bos handling to the chat-template render
     // layer.  Probe the tokenizer's special-token map for the BOS
     // string used by the major chat-model families and prepend its id
-    // manually.
-    //
-    // Probe order — first match wins:
-    //   "<bos>"             — Gemma 1/2/3/4
-    //   "<|begin_of_text|>" — Llama 3 / 3.1 / 3.2
-    //   "<s>"               — Llama 1/2, Mistral
-    //   "<|im_start|>"      — Qwen 2/2.5 (used as start-of-turn, treated
-    //                         as bos by llama-embedding)
-    //
-    // Models without a recognised BOS token skip the prepend silently.
-    // The `tokenizer.ggml.bos_token_id` GGUF key would be the
-    // authoritative source; surfacing it through Engine (rather than
-    // probing the HF tokenizer) is iter-94+ work.
-    let bos_id: Option<u32> = ["<bos>", "<|begin_of_text|>", "<s>", "<|im_start|>"]
-        .iter()
-        .find_map(|t| engine.tokenizer().token_to_id(t));
+    // manually. Probe order + family coverage docs live on
+    // `BOS_PROBE_FRAGMENTS` at the top of this file (extracted from this
+    // inline site 2026-05-02 per the H1 audit
+    // `docs/research/decode-test-gap-2026-05-02.md` — fn-body-local
+    // `const &[&str]` declarations are unreachable from `mod tests`).
+    let bos_id: Option<u32> = probe_bos_token_id(engine.tokenizer());
 
     for (i, input) in inputs.into_iter().enumerate() {
         // Tokenize without auto-special-tokens — we manually prepend BOS
@@ -8452,5 +8484,138 @@ mod test_a4_tool_call_policy {
             result.tool_calls.is_empty(),
             "Constrained mode parse failure must produce no tool calls"
         );
+    }
+}
+
+
+// ============================================================================
+// BOS-probe family matrix tests (2026-05-02)
+// ============================================================================
+//
+// Pin the policy data in `BOS_PROBE_FRAGMENTS` + behavior of
+// `probe_bos_token_id` against a representative tokenizer per supported
+// family. Closes the H1-twin regression class identified in the
+// 2026-05-02 decode-test-gap audit (`docs/research/decode-test-gap-2026-05-02.md`)
+// — the previous inline `["<bos>", "<|begin_of_text|>", "<s>", "<|im_start|>"]`
+// const lived inside a 275-LOC async fn body and was unreachable from
+// `mod tests`. A future careless reorder would now fail
+// `bos_probe_tests::probe_first_match_wins_when_multiple_present`.
+
+#[cfg(test)]
+mod bos_probe_tests {
+    use super::{probe_bos_token_id, BOS_PROBE_FRAGMENTS};
+    use tokenizers::{models::bpe::BPE, AddedToken, Tokenizer};
+
+    /// Build a minimal `tokenizers::Tokenizer` with each provided fragment
+    /// registered as a special token. This is the cheapest path to a
+    /// tokenizer that returns `Some(id)` from `token_to_id(fragment)` for
+    /// the listed fragments and `None` otherwise — exactly the surface
+    /// `probe_bos_token_id` queries.
+    fn tokenizer_with_specials(fragments: &[&str]) -> Tokenizer {
+        let mut tok = Tokenizer::new(BPE::default());
+        let added: Vec<AddedToken> = fragments
+            .iter()
+            .map(|f| AddedToken::from((*f).to_string(), true))
+            .collect();
+        tok.add_special_tokens(&added);
+        tok
+    }
+
+    // ---- per-family probes ------------------------------------------------
+
+    #[test]
+    fn probe_returns_bos_for_gemma_family_tokenizer() {
+        // Gemma 1/2/3/4 vocabularies register `<bos>` as the BOS marker.
+        let tok = tokenizer_with_specials(&["<bos>"]);
+        let expected_id = tok.token_to_id("<bos>");
+        assert!(expected_id.is_some(), "fixture invariant: <bos> must register");
+        assert_eq!(probe_bos_token_id(&tok), expected_id);
+    }
+
+    #[test]
+    fn probe_returns_begin_of_text_for_llama3_family_tokenizer() {
+        // Llama 3 / 3.1 / 3.2 vocabularies register `<|begin_of_text|>`.
+        let tok = tokenizer_with_specials(&["<|begin_of_text|>"]);
+        let expected_id = tok.token_to_id("<|begin_of_text|>");
+        assert!(expected_id.is_some(), "fixture invariant: <|begin_of_text|> must register");
+        assert_eq!(probe_bos_token_id(&tok), expected_id);
+    }
+
+    #[test]
+    fn probe_returns_s_for_llama2_mistral_family_tokenizer() {
+        // Llama 1/2, Mistral SentencePiece vocabularies register `<s>`.
+        let tok = tokenizer_with_specials(&["<s>"]);
+        let expected_id = tok.token_to_id("<s>");
+        assert!(expected_id.is_some(), "fixture invariant: <s> must register");
+        assert_eq!(probe_bos_token_id(&tok), expected_id);
+    }
+
+    #[test]
+    fn probe_returns_im_start_for_qwen_family_tokenizer() {
+        // Qwen 2/2.5/3 vocabularies use `<|im_start|>` as start-of-turn,
+        // treated as BOS by `llama-embedding`'s wire format.
+        let tok = tokenizer_with_specials(&["<|im_start|>"]);
+        let expected_id = tok.token_to_id("<|im_start|>");
+        assert!(expected_id.is_some(), "fixture invariant: <|im_start|> must register");
+        assert_eq!(probe_bos_token_id(&tok), expected_id);
+    }
+
+    // ---- negative + tie-break cases --------------------------------------
+
+    #[test]
+    fn probe_returns_none_when_no_fragment_matches() {
+        // A tokenizer with NO recognized BOS fragment — the embeddings
+        // handler's `if let Some(b) = bos_id` arm must skip the prepend
+        // silently. Pinned: `probe_bos_token_id` must NOT panic and must
+        // return `None`.
+        let tok = tokenizer_with_specials(&["<unk>", "<pad>"]);
+        assert_eq!(probe_bos_token_id(&tok), None);
+    }
+
+    #[test]
+    fn probe_first_match_wins_when_multiple_present() {
+        // Dual-format checkpoints (e.g. some Gemma SentencePiece adapters)
+        // can have BOTH `<bos>` and `<s>` registered. The probe must return
+        // the FIRST array-order hit. `<bos>` is index 0 in BOS_PROBE_FRAGMENTS,
+        // `<s>` is index 2. So the result must equal the `<bos>` id.
+        //
+        // This test FAILS if a future careless reorder pushes `<s>` ahead
+        // of `<bos>` in the array — the H1-prevention property.
+        let tok = tokenizer_with_specials(&["<s>", "<bos>"]);
+        let bos_id = tok.token_to_id("<bos>");
+        let s_id = tok.token_to_id("<s>");
+        assert!(bos_id.is_some() && s_id.is_some());
+        assert_ne!(bos_id, s_id, "fixture invariant: distinct ids");
+        assert_eq!(
+            probe_bos_token_id(&tok),
+            bos_id,
+            "<bos> must win over <s> per BOS_PROBE_FRAGMENTS array order"
+        );
+    }
+
+    #[test]
+    fn probe_fragments_array_documented_order_invariant() {
+        // Pin the array order itself so a reorder that would silently break
+        // the dual-format-checkpoint case (caught by the test above) is
+        // ALSO caught here at the data layer with a clearer failure message.
+        assert_eq!(BOS_PROBE_FRAGMENTS.len(), 4);
+        assert_eq!(BOS_PROBE_FRAGMENTS[0], "<bos>",            "Gemma slot");
+        assert_eq!(BOS_PROBE_FRAGMENTS[1], "<|begin_of_text|>", "Llama 3 slot");
+        assert_eq!(BOS_PROBE_FRAGMENTS[2], "<s>",              "Llama 1/2 + Mistral slot");
+        assert_eq!(BOS_PROBE_FRAGMENTS[3], "<|im_start|>",     "Qwen slot");
+    }
+
+    #[test]
+    fn probe_fragments_array_contains_no_duplicates() {
+        // Sanity: each fragment must be unique. A duplicate would mask
+        // intent ("which family did we mean?") and confuse the reorder
+        // catch above.
+        let mut seen = std::collections::HashSet::new();
+        for f in BOS_PROBE_FRAGMENTS {
+            assert!(
+                seen.insert(*f),
+                "duplicate fragment in BOS_PROBE_FRAGMENTS: {f}"
+            );
+        }
     }
 }
