@@ -47,7 +47,8 @@ use super::delta_net::DeltaNetLayerShape;
 use super::ffn::{DenseFfnShape, MoeFfnShape};
 use super::full_attn::FullAttnShape;
 use super::gpu_delta_net::{
-    build_delta_net_layer, build_delta_net_layer_decode_into, DeltaNetWeightsGpu,
+    build_delta_net_layer, build_delta_net_layer_decode_into,
+    build_delta_net_layer_with_arena, DeltaNetWeightsGpu,
 };
 use super::gpu_ffn::{
     build_dense_ffn_layer_gpu, build_dense_ffn_layer_gpu_q_into,
@@ -1659,6 +1660,46 @@ impl Qwen35Model {
             None
         };
 
+        // ---- ADR-015 iter74: DnPrefillArena allocation ----
+        //
+        // Allocated ONCE per prefill (seq_len > 1), sized for the actual
+        // prompt length and DN shape (hidden_size, n_k_heads, n_v_heads,
+        // d_k, d_v). Reused across all DN (LinearAttn) layers in the loop
+        // below. Same lifetime contract + iter58b residency-rescission
+        // protection as DenseFfnArena / MoeFfnArena above.
+        //
+        // Skip when seq_len == 1 (decode): existing thread-local
+        // `decode_pool::pooled_alloc_buffer` path is already optimal at
+        // single-token granularity, and `build_delta_net_layer_decode_into`
+        // (single-CB greedy) is a different code path that this arena does
+        // not target.
+        //
+        // Skip when the model has no LinearAttn (DN) layers: defensive.
+        //
+        // Memory footprint at apex 35B-A3B q4_0-flat pp4096 with the
+        // typical DN shape (h, n_k_heads, n_v_heads, d_k, d_v) drawn from
+        // the GGUF config — sums to a few hundred MB across the 23 slots,
+        // well within M5 Max 128 GB unified memory.
+        let mut dn_prefill_arena: Option<super::DnPrefillArena> = if seq_len > 1
+            && layer_weights_gpu.iter().any(|l| matches!(l, LayerWeightsGpu::LinearAttn { .. }))
+        {
+            let dn_shape = DeltaNetLayerShape::from_config(cfg);
+            Some(
+                super::DnPrefillArena::new(
+                    &device,
+                    seq_len,
+                    dn_shape.hidden_size,
+                    dn_shape.n_k_heads,
+                    dn_shape.n_v_heads,
+                    dn_shape.d_k,
+                    dn_shape.d_v,
+                )
+                .context("alloc DnPrefillArena")?,
+            )
+        } else {
+            None
+        };
+
         // ---- Step 2: per-layer forward pass ----
         let decode_profile = std::env::var("HF2Q_DECODE_PROFILE").is_ok();
         let mut total_attn_us = 0u64;
@@ -1846,25 +1887,58 @@ impl Qwen35Model {
                             &zero_rec_buf_out,
                         )
                     };
-                    let out = build_delta_net_layer(
-                        &device,
-                        &mut registry,
-                        &hidden,
-                        attn,
-                        conv_in_ref,
-                        conv_out_ref,
-                        state_in_ref,
-                        state_out_ref,
-                        seq_len,
-                        shape.hidden_size,
-                        shape.n_k_heads,
-                        shape.n_v_heads,
-                        shape.d_k,
-                        shape.d_v,
-                        shape.conv_kernel,
-                        shape.rms_norm_eps,
-                    )
-                    .with_context(|| format!("delta_net layer {layer_idx}"))?;
+                    // ADR-015 iter74: route through DnPrefillArena at prefill
+                    // (seq_len > 1) to eliminate per-layer pooled scratch
+                    // allocations (~22/layer × 30 DN layers/prefill). Arena is
+                    // owned by `forward_gpu_impl` and outlives every per-layer
+                    // encoder commit, preventing the iter58b residency-
+                    // rescission failure mode. Decode path (seq_len == 1)
+                    // keeps the existing pooled variant (single-token
+                    // thread-local pool is already optimal).
+                    let out = if let Some(arena) = dn_prefill_arena.as_mut() {
+                        build_delta_net_layer_with_arena(
+                            &device,
+                            &mut registry,
+                            &hidden,
+                            attn,
+                            conv_in_ref,
+                            conv_out_ref,
+                            state_in_ref,
+                            state_out_ref,
+                            arena,
+                            seq_len,
+                            shape.hidden_size,
+                            shape.n_k_heads,
+                            shape.n_v_heads,
+                            shape.d_k,
+                            shape.d_v,
+                            shape.conv_kernel,
+                            shape.rms_norm_eps,
+                        )
+                        .with_context(|| {
+                            format!("delta_net_with_arena layer {layer_idx}")
+                        })?
+                    } else {
+                        build_delta_net_layer(
+                            &device,
+                            &mut registry,
+                            &hidden,
+                            attn,
+                            conv_in_ref,
+                            conv_out_ref,
+                            state_in_ref,
+                            state_out_ref,
+                            seq_len,
+                            shape.hidden_size,
+                            shape.n_k_heads,
+                            shape.n_v_heads,
+                            shape.d_k,
+                            shape.d_v,
+                            shape.conv_kernel,
+                            shape.rms_norm_eps,
+                        )
+                        .with_context(|| format!("delta_net layer {layer_idx}"))?
+                    };
 
                     // --- Swap conv + recurrent ping-pong (O(1) pointer swap, zero copy) ---
                     if linear_slot_idx != usize::MAX {
