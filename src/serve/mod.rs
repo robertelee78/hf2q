@@ -1160,6 +1160,42 @@ fn detect_greedy_repetition_loop(decoded_tokens: &[u32]) -> Option<(usize, usize
     None
 }
 
+/// Special-token text fragments that, if present in the cumulative decode of
+/// **generated** tokens, indicate the model has either:
+///
+/// * emitted an end-of-turn marker as text rather than as the configured
+///   integer EOS id (Qwen3.x distill / merge variants), OR
+/// * leaked into a new `<|im_start|>` turn (single-turn `generate` must
+///   stop), OR
+/// * ended a Phi-3-style turn via the `<|end|>` text fragment (observed
+///   2026-05-02 on a Qwen3.x-arch GGUF whose model emitted Phi-3-style
+///   markers as multi-token text).
+///
+/// Order in this array determines tie-breaks when more than one fragment is
+/// present in the input (`Iterator::find` returns the first hit). The
+/// surrounding decode loop in `cmd_generate_qwen35` does not depend on which
+/// fragment matched — it just stops on Some.
+const SPECIAL_TOKEN_STOPS: &[&str] = &[
+    "<|im_end|>",
+    "<|endoftext|>",
+    "<|im_start|>",
+    "<|end|>",
+];
+
+/// Returns the first [`SPECIAL_TOKEN_STOPS`] fragment present in `generated_text`,
+/// or `None` if generation should continue.
+///
+/// The input MUST be the cumulative decode of **assistant-generated** tokens
+/// only (NOT the prompt). The prompt typically contains `<|im_start|>` /
+/// `<|im_end|>` chat-template markers; scanning those would short-circuit
+/// generation immediately on every model.
+fn find_special_token_stop(generated_text: &str) -> Option<&'static str> {
+    SPECIAL_TOKEN_STOPS
+        .iter()
+        .copied()
+        .find(|m| generated_text.contains(m))
+}
+
 fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile) -> Result<()> {
     use crate::inference::models::qwen35::io_heads::greedy_argmax_last_token;
     use crate::inference::models::qwen35::kv_cache::HybridKvCache;
@@ -1508,24 +1544,9 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     let decode_start = std::time::Instant::now();
     let mut generated = 1usize;
 
-    // Special-token strings that some Qwen3.x checkpoints emit as TEXT instead
-    // of as their reserved vocab id (when the model has been distilled / merged
-    // and the `<|im_end|>` token id 151645 isn't always emitted at turn-end).
-    // If any of these substrings appear after a decode step, treat as stop.
-    // This complements the `eos_token_ids.contains(&next_token)` integer check
-    // — covers both cases without a fallback.
-    // 2026-05-02 (follow-up): `<|im_start|>` REMOVED from this list. Qwen3
-    // thinking-style checkpoints emit a literal `<|im_start|>` text fragment
-    // mid-turn during the thinking → answer transition (right after the
-    // `<|end|>` end-of-thinking marker), and stopping there cuts the response
-    // before any actual answer is produced. The original French-Toast leak
-    // sequence (`<|im_end|>...<|im_start|>assistant`) is still caught by the
-    // `<|im_end|>` substring entry below — `<|im_start|>` was redundant
-    // defense for that case and is hostile to thinking-mode output.
-    const SPECIAL_TOKEN_STOPS: &[&str] = &[
-        "<|im_end|>",
-        "<|endoftext|>",
-    ];
+    // Special-token-substring stop policy moved to module-scope
+    // `SPECIAL_TOKEN_STOPS` + `find_special_token_stop` so it's unit-testable.
+    // See those for the full policy rationale.
 
     for step in 1..args.max_tokens {
         if eos_token_ids.contains(&next_token) {
@@ -1580,14 +1601,15 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
             stdout.flush()?;
         }
         // Special-token-string leak: stop loud rather than emit garbage like
-        // `<|im_end|>...<|im_start|>assistant\n<|im_start|>assistant` which the
-        // user observed on their French-Toast run when `<|im_end|>` slipped
-        // past the integer-id check (e.g. tokenizer emitted it as a multi-byte
-        // text fragment composed of non-special token ids).
-        if SPECIAL_TOKEN_STOPS.iter().any(|m| new_full.contains(m)) {
+        // `<|im_end|>...<|im_start|>assistant\n<|im_start|>assistant` (original
+        // 2026-05-02 French-Toast leak) or `<|end|>\n\n<|im_start|>user\n
+        // [echoed prompt]<|im_start|>...<|im_start|>` (2026-05-02 follow-up
+        // candy-thinking degeneracy). Helper is unit-tested so the substring
+        // set can't drift silently.
+        if let Some(marker) = find_special_token_stop(&new_full) {
             tracing::info!(
-                "Qwen3.5 decode: special-token string detected in cumulative \
-                 decode at step {step}; stopping."
+                "Qwen3.5 decode: special-token string `{marker}` detected in \
+                 cumulative decode at step {step}; stopping."
             );
             break;
         }
@@ -3379,8 +3401,8 @@ fn cmd_parity_capture(
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_greedy_repetition_loop, maybe_print_serve_banner, render_jinja_template,
-        should_enable_kv_persist, FALLBACK_GEMMA4_API_CHAT_TEMPLATE,
+        detect_greedy_repetition_loop, find_special_token_stop, maybe_print_serve_banner,
+        render_jinja_template, should_enable_kv_persist, FALLBACK_GEMMA4_API_CHAT_TEMPLATE,
         FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
     use crate::serve::load_info::{
@@ -3788,5 +3810,118 @@ mod tests {
             "non-overlap invariant violated: ngram={ngram} occ={occ} > {}",
             128 / ngram
         );
+    }
+
+    // ---- find_special_token_stop matrix --------------------------------
+    //
+    // 2026-05-02 — pin the substring stop policy with a falsifiable test
+    // matrix so it can't drift silently the way the inline `const` did
+    // (three commits, opposite directions, all uncovered). Each test case
+    // names a real model-output pattern observed in user reports OR a
+    // hypothetical we want to NOT trip on.
+
+    #[test]
+    fn special_token_stop_empty_input() {
+        assert_eq!(find_special_token_stop(""), None);
+    }
+
+    #[test]
+    fn special_token_stop_plain_thinking_text_does_not_stop() {
+        // Bare thinking-style content with no markers — must continue.
+        let s = "I should make sure the answer is comprehensive and avoids \
+                 jargon. The user is asking about candy.";
+        assert_eq!(find_special_token_stop(s), None);
+    }
+
+    #[test]
+    fn special_token_stop_think_html_tag_does_not_stop() {
+        // `</think>` end-of-thinking tag is NOT in the stop set — it's a
+        // legitimate thinking-mode transition; the model continues to the
+        // actual answer afterwards.
+        let s = "<think>reasoning content</think>\n\nactual answer";
+        assert_eq!(find_special_token_stop(s), None);
+    }
+
+    #[test]
+    fn special_token_stop_im_end_text_fragment_stops() {
+        // Distill / merge variant emits `<|im_end|>` as a multi-token text
+        // fragment instead of as integer id 151645, slipping past the
+        // integer-id eos check.
+        let s = "answer text<|im_end|>";
+        assert_eq!(find_special_token_stop(s), Some("<|im_end|>"));
+    }
+
+    #[test]
+    fn special_token_stop_endoftext_fragment_stops() {
+        let s = "answer text<|endoftext|>";
+        assert_eq!(find_special_token_stop(s), Some("<|endoftext|>"));
+    }
+
+    #[test]
+    fn special_token_stop_im_start_leak_after_end_marker_stops() {
+        // 2026-05-02 candy-thinking degeneracy: post-`<|end|>` model
+        // hallucinates a new `<|im_start|>user` turn and echoes the prompt.
+        // Must stop at the first matching marker.
+        let s = "thinking content<|end|>\n\n<|im_start|>user\necho";
+        // Iterator order: <|im_end|> miss → <|endoftext|> miss → <|im_start|>
+        // hit. So the returned marker is `<|im_start|>` (NOT `<|end|>`,
+        // which comes later in the array even though earlier in the string).
+        assert_eq!(find_special_token_stop(s), Some("<|im_start|>"));
+    }
+
+    #[test]
+    fn special_token_stop_french_toast_im_end_then_im_start_caught_by_im_end() {
+        // 2026-05-02 original French-Toast leak:
+        // `<|im_end|>...<|im_start|>assistant\n<|im_start|>assistant`.
+        // First-in-array `<|im_end|>` wins.
+        let s = "answer<|im_end|>\n<|im_start|>assistant\nleak";
+        assert_eq!(find_special_token_stop(s), Some("<|im_end|>"));
+    }
+
+    #[test]
+    fn special_token_stop_phi3_end_marker_stops() {
+        // Phi-3-style end-of-turn marker emitted as multi-token text on a
+        // Qwen3.x-architecture GGUF (observed 2026-05-02 candy prompt).
+        let s = "answer<|end|>";
+        assert_eq!(find_special_token_stop(s), Some("<|end|>"));
+    }
+
+    #[test]
+    fn special_token_stop_end_substring_does_not_falsely_match_endoftext() {
+        // Sanity: `<|end|>` (7 chars: `<|end|>`) is NOT a substring of
+        // `<|endoftext|>` (after `<|end` we have `oftext|>`, not `|>`).
+        // When only `<|endoftext|>` is present, the returned marker must be
+        // `<|endoftext|>`.
+        let s = "answer<|endoftext|>";
+        assert_eq!(find_special_token_stop(s), Some("<|endoftext|>"));
+    }
+
+    #[test]
+    fn special_token_stop_degenerate_im_start_only_stops() {
+        // 2026-05-02 follow-up: with `<|im_start|>` removed from stops, the
+        // model emitted bare `<|im_start|>` repeatedly until n-gram
+        // repetition fired at step 520. Pin: bare-`<|im_start|>` sequence
+        // STOPS immediately on the first occurrence.
+        let s = "<|im_start|>\n\n<|im_start|>";
+        assert_eq!(find_special_token_stop(s), Some("<|im_start|>"));
+    }
+
+    #[test]
+    fn special_token_stop_qwen3_thinking_clean_answer_does_not_stop_mid_text() {
+        // Negative case: realistic Qwen3-thinking output without any
+        // turn-leak markers must NOT stop mid-text.
+        let s = "<think>The user wants candy.</think>\n\n\
+                 To make candy you need sugar, water, and flavoring. \
+                 Heat to soft-ball stage at 235°F.";
+        assert_eq!(find_special_token_stop(s), None);
+    }
+
+    #[test]
+    fn special_token_stop_iterator_order_is_array_order() {
+        // Pin the tie-break: when multiple stops are present, array order
+        // determines which marker is returned. `<|im_end|>` is index 0, so
+        // it wins even when `<|end|>` appears earlier in the string.
+        let s = "x<|end|>y<|im_end|>z";
+        assert_eq!(find_special_token_stop(s), Some("<|im_end|>"));
     }
 }
