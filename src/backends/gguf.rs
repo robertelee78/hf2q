@@ -2601,13 +2601,59 @@ enum MetaValue {
 // Tokenizer metadata
 // ---------------------------------------------------------------------------
 
-// Token type constants matching llama.cpp's TokenType enum
+// Token type constants matching llama.cpp's TokenType enum at
+// `/opt/llama.cpp/gguf-py/gguf/constants.py:3969-3975`.
 const TOKEN_TYPE_NORMAL: i32 = 1;
 // TOKEN_TYPE_UNKNOWN = 2 — not used; <unk> is in added_tokens with special=true,
 // so it gets TOKEN_TYPE_CONTROL like in llama.cpp's LlamaHfVocab.get_token_type().
 const TOKEN_TYPE_CONTROL: i32 = 3;
 const TOKEN_TYPE_USER_DEFINED: i32 = 4;
+const TOKEN_TYPE_UNUSED: i32 = 5;
 const TOKEN_TYPE_BYTE: i32 = 6;
+
+/// Mirror llama.cpp's `Model.does_token_look_special` at
+/// `/opt/llama.cpp/convert_hf_to_gguf.py` (the heuristic used by
+/// `get_vocab_base` to upgrade an `added_token` from USER_DEFINED to
+/// CONTROL even when its `tokenizer.json` `special` flag is false).
+///
+/// A token "looks special" if it's either:
+/// * `<|...|>` form (Qwen / GPT-OSS markers)
+/// * `<...>` form with len > 2 and not `<unk>` (Mistral / Gemma markers)
+fn does_token_look_special(token: &str) -> bool {
+    if token.starts_with("<|") && token.ends_with("|>") {
+        return true;
+    }
+    if token.starts_with('<') && token.ends_with('>') && token.len() > 2 && token != "<unk>" {
+        return true;
+    }
+    false
+}
+
+/// Read the full model `vocab_size` from `config.json`, handling both the
+/// top-level `vocab_size` key (Llama / Mistral / Qwen3 plain) and the
+/// nested `text_config.vocab_size` key (Qwen3-VL / Qwen3.6 with vision —
+/// the user's actual case where the model is conditional-generation with
+/// a separate `text_config` substruct). Returns `None` if neither is
+/// present (caller falls back to max-observed-id + 1, the legacy
+/// behavior).
+///
+/// 2026-05-02 — added per the user-reported regression where the
+/// converter was building vocab from `tokenizer.json["model"]["vocab"]`
+/// only (the base BPE = 248044 entries for Qwen3.6-27B), missing the
+/// added-tokens range 248044..248069 that includes `<|im_end|>`,
+/// `<|endoftext|>`, `<think>`, `</think>`. Source HF
+/// `text_config.vocab_size = 248320`. Mirrors llama.cpp's pattern at
+/// `convert_hf_to_gguf.py:1231` (`hparams.get("vocab_size", ...)`).
+fn read_full_vocab_size_from_config(input_dir: &Path) -> Option<u64> {
+    let config_path = input_dir.join("config.json");
+    let config: serde_json::Value = std::fs::read_to_string(&config_path).ok()
+        .and_then(|s| serde_json::from_str(&s).ok())?;
+    config
+        .get("text_config")
+        .and_then(|tc| tc.get("vocab_size"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| config.get("vocab_size").and_then(|v| v.as_u64()))
+}
 
 /// Load tokenizer metadata from the model input directory and return GGUF
 /// metadata key-value pairs for embedding into the GGUF file.
@@ -2656,52 +2702,142 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
     let tokenizer_model_name = determine_tokenizer_model_name(model_section, arch);
     info!("Tokenizer model type: {}", tokenizer_model_name);
 
-    // Extract vocab: HashMap<String, u32> -> sorted Vec<String> by ID
+    // -----------------------------------------------------------------
+    // 2026-05-02 — Vocab build refactored to mirror llama.cpp's canonical
+    // `get_vocab_base` at `/opt/llama.cpp/convert_hf_to_gguf.py:1225-1267`.
+    //
+    // Prior bug (REGRESSION OF EVERY QWEN3-VL/3.5/3.6 GGUF WE PRODUCED):
+    // we built `vocab_entries` from `tokenizer.json["model"]["vocab"]`
+    // ONLY — the base BPE table — and used `vocab_obj.len()` as the
+    // total vocab size. This silently truncated all `added_tokens` whose
+    // ids landed above the base vocab range. For Qwen3.6-27B the base
+    // BPE has 248044 entries while `config.json[text_config][vocab_size]`
+    // declares 248320 with `<|endoftext|>`, `<|im_start|>`, `<|im_end|>`,
+    // `<think>`, `</think>` etc. at ids 248044-248069. The truncated GGUF
+    // had no embedding rows for those special tokens, so the model
+    // couldn't emit them; `tokenizer.ggml.eos_token_id` lookup failed
+    // (the eos_token string was not in the truncated vocab), so we
+    // wrote no eos metadata; runtime fell back to a wrong default and
+    // the user observed turns that never properly terminated.
+    //
+    // Fix: merge base BPE + `added_tokens` into one map, read
+    // `vocab_size` from `config.json` (priority: `text_config.vocab_size`
+    // then top-level `vocab_size`) — falling back to max-observed-id+1
+    // only if neither is present — then iterate `range(vocab_size)` and
+    // gap-fill missing ids with `[PAD{i}]` / UNUSED. This matches what
+    // llama.cpp ships, what HF AutoTokenizer.vocab returns at runtime,
+    // and what the embedding matrix expects.
+
+    // 1. Base BPE vocab from `tokenizer.json[model][vocab]`.
     let vocab_obj = model_section.get("vocab")?.as_object()?;
-    let vocab_size = vocab_obj.len();
-    let mut vocab_entries: Vec<(String, u32)> = vocab_obj
-        .iter()
-        .filter_map(|(k, v)| v.as_u64().map(|id| (k.clone(), id as u32)))
-        .collect();
-    vocab_entries.sort_by_key(|(_, id)| *id);
-
-    // Build ordered token string list
-    // Fill gaps with empty strings (shouldn't happen for well-formed vocabs)
-    let max_id = vocab_entries
-        .last()
-        .map(|(_, id)| *id as usize)
-        .unwrap_or(0);
-    let total_tokens = max_id + 1;
-    let mut tokens: Vec<String> = vec![String::new(); total_tokens];
-    for (token, id) in &vocab_entries {
-        tokens[*id as usize] = token.clone();
+    let base_vocab_size = vocab_obj.len();
+    let mut id_to_token: std::collections::HashMap<u32, String> =
+        std::collections::HashMap::with_capacity(base_vocab_size + 64);
+    for (k, v) in vocab_obj.iter() {
+        if let Some(id) = v.as_u64() {
+            id_to_token.insert(id as u32, k.clone());
+        }
     }
-    info!("Loaded {} vocab tokens (max ID: {})", vocab_size, max_id);
 
-    // Extract merges: may be Vec<Vec<String>> (new format) or Vec<String> (old format)
-    let merges = extract_merges(model_section);
-    info!("Loaded {} merges", merges.len());
-
-    // Build set of added token IDs and special token IDs
+    // 2. Added tokens — these may lie ABOVE the base BPE range
+    //    (Qwen3.6: ids 248044-248069 with base size 248044). Track
+    //    per-id metadata so we can classify token types correctly.
     let added_tokens_arr = tokenizer_json
         .get("added_tokens")
         .and_then(|v| v.as_array());
-    let mut special_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut added_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut added_special_flag: std::collections::HashSet<u32> =
+        std::collections::HashSet::new();
     if let Some(added) = added_tokens_arr {
         for entry in added {
+            let id_opt = entry.get("id").and_then(|v| v.as_u64()).map(|x| x as u32);
+            let content_opt = entry.get("content").and_then(|v| v.as_str());
             let is_special = entry
                 .get("special")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            if is_special {
-                if let Some(id) = entry.get("id").and_then(|v| v.as_u64()) {
-                    special_ids.insert(id as u32);
+            if let (Some(id), Some(content)) = (id_opt, content_opt) {
+                id_to_token.insert(id, content.to_string());
+                added_ids.insert(id);
+                if is_special {
+                    added_special_flag.insert(id);
                 }
             }
         }
     }
 
-    // Gemma4 set_vocab marks certain tokens as USER_DEFINED for chat parser visibility
+    // 3. Resolve target vocab size: config.json's `vocab_size`
+    //    (priority: text_config.vocab_size then top-level) is the
+    //    authoritative source — it matches the model's `embed_tokens`
+    //    matrix row count. Fall back to max observed id + 1 only as a
+    //    last resort (legacy compat for malformed configs).
+    let max_observed_id = id_to_token.keys().max().copied().unwrap_or(0) as usize;
+    let target_vocab_size: usize = match read_full_vocab_size_from_config(input_dir) {
+        Some(v) => {
+            let v = v as usize;
+            if v < max_observed_id + 1 {
+                warn!(
+                    "config.json vocab_size ({}) is smaller than max observed token id+1 ({}); \
+                     using max observed instead. This may indicate a corrupted config.",
+                    v,
+                    max_observed_id + 1
+                );
+                max_observed_id + 1
+            } else {
+                v
+            }
+        }
+        None => {
+            warn!(
+                "No vocab_size in config.json; falling back to max observed token id+1 = {}. \
+                 If your model has added_tokens with ids beyond the base BPE range, the \
+                 resulting GGUF may be missing embedding rows.",
+                max_observed_id + 1
+            );
+            max_observed_id + 1
+        }
+    };
+    let total_tokens = target_vocab_size;
+
+    // 4. Build the ordered tokens array, gap-filling with [PAD{i}].
+    let mut tokens: Vec<String> = (0..total_tokens).map(|i| format!("[PAD{i}]")).collect();
+    let mut filled_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for (id, token) in &id_to_token {
+        if (*id as usize) < total_tokens {
+            tokens[*id as usize] = token.clone();
+            filled_ids.insert(*id);
+        }
+    }
+    let unfilled = total_tokens - filled_ids.len();
+    info!(
+        "Loaded {} vocab tokens (base BPE: {}, added: {}, gap-filled UNUSED: {}, target: {})",
+        filled_ids.len(),
+        base_vocab_size,
+        added_ids.len(),
+        unfilled,
+        total_tokens
+    );
+
+    // 5. Build vocab_entries (merged) for special-token-id resolution.
+    //    Sorted-by-id for determinism.
+    let mut vocab_entries: Vec<(String, u32)> = id_to_token
+        .iter()
+        .map(|(id, t)| (t.clone(), *id))
+        .collect();
+    vocab_entries.sort_by_key(|(_, id)| *id);
+
+    // 6. Merges — same as before, from `model[merges]`.
+    let merges = extract_merges(model_section);
+    info!("Loaded {} merges", merges.len());
+
+    // 7. Token-type classification, per llama.cpp's `get_vocab_base`:
+    //    * gap (no entry in id_to_token) → UNUSED (the bug-fix)
+    //    * byte fallback `<0x..>` → BYTE
+    //    * gemma4 visible chat-parser markers → USER_DEFINED
+    //    * added_token whose `special` flag is true OR which "looks
+    //      special" by the `<|...|>` / `<...>` heuristic → CONTROL
+    //    * other added_tokens → USER_DEFINED
+    //    * everything else → NORMAL
     let visible_tokens: std::collections::HashSet<&str> = [
         "<|channel>",
         "<channel|>",
@@ -2715,8 +2851,7 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
     .copied()
     .collect();
 
-    // Compute scores and token types for each token
-    // LlamaHfVocab.get_token_score() returns -1000.0 for all tokens
+    // LlamaHfVocab.get_token_score() returns -1000.0 for all tokens.
     let scores: Vec<f32> = vec![-1000.0; total_tokens];
 
     let token_types: Vec<i32> = tokens
@@ -2724,23 +2859,29 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
         .enumerate()
         .map(|(id, token)| {
             let id_u32 = id as u32;
-            // Gemma4 overrides: certain visible tokens → USER_DEFINED
+            if !filled_ids.contains(&id_u32) {
+                return TOKEN_TYPE_UNUSED;
+            }
             if arch == "gemma4" && visible_tokens.contains(token.as_str()) {
                 return TOKEN_TYPE_USER_DEFINED;
             }
-            // Byte fallback tokens like <0x00>, <0xAB>
             if is_byte_token(token) {
                 return TOKEN_TYPE_BYTE;
             }
-            // Special/control tokens
-            if special_ids.contains(&id_u32) {
-                return TOKEN_TYPE_CONTROL;
+            if added_ids.contains(&id_u32) {
+                if added_special_flag.contains(&id_u32) || does_token_look_special(token) {
+                    return TOKEN_TYPE_CONTROL;
+                }
+                return TOKEN_TYPE_USER_DEFINED;
             }
             TOKEN_TYPE_NORMAL
         })
         .collect();
 
-    // Look up special token IDs from tokenizer_config.json
+    // 8. Special-token id lookup against the MERGED vocab — this is
+    //    where the user's `<|im_end|>` resolution previously failed
+    //    (it's at id 248046, in `added_tokens`, so the prior base-only
+    //    `vocab_entries` didn't contain it).
     let bos_id = resolve_special_token_id("bos_token", &tokenizer_config, &vocab_entries);
     let eos_id = resolve_special_token_id("eos_token", &tokenizer_config, &vocab_entries);
     let unk_id = resolve_special_token_id("unk_token", &tokenizer_config, &vocab_entries);
@@ -6143,5 +6284,330 @@ mod tests {
             }
             Provenance::External => panic!("must classify Hf2q"),
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // 2026-05-02: vocab merge / EOS metadata regression tests for the
+    // user-reported broken-GGUF class — Qwen3.6-27B with `text_config.
+    // vocab_size = 248320` and special tokens (`<|im_end|>` at 248046,
+    // `<|endoftext|>` at 248044, `<think>` at 248068, `</think>` at
+    // 248069) declared in `added_tokens` BEYOND the base BPE range
+    // (which is 248044 entries). The pre-fix converter built vocab from
+    // `tokenizer.json[model][vocab]` only, lost all special tokens, and
+    // wrote no `tokenizer.ggml.eos_token_id` because the EOS string
+    // wasn't present in the truncated vocab.
+    //
+    // Fixture matrix asserts:
+    //   * `tokenizer.ggml.tokens` is sized to `text_config.vocab_size`
+    //     (not `len(model.vocab)`).
+    //   * Out-of-range added_tokens land at their declared ids in the
+    //     tokens array.
+    //   * Gap ids are `[PAD{i}]` with token-type UNUSED (5).
+    //   * Special-flagged added_tokens get token-type CONTROL (3).
+    //   * Added_tokens that LOOK special (`<...>` heuristic) get CONTROL
+    //     even when their `special` flag is false.
+    //   * `tokenizer.ggml.eos_token_id` resolves to the added_token id
+    //     even when the eos_token string is OUT of the base BPE range.
+
+    fn metadata_uint32(
+        kv: &[(String, MetaValue)],
+        key: &str,
+    ) -> Option<u32> {
+        kv.iter().find_map(|(k, v)| {
+            if k == key {
+                if let MetaValue::Uint32(x) = v {
+                    Some(*x)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    fn metadata_array_string<'a>(
+        kv: &'a [(String, MetaValue)],
+        key: &str,
+    ) -> Option<&'a [String]> {
+        kv.iter().find_map(|(k, v)| {
+            if k == key {
+                if let MetaValue::ArrayString(a) = v {
+                    Some(a.as_slice())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    fn metadata_array_int32<'a>(
+        kv: &'a [(String, MetaValue)],
+        key: &str,
+    ) -> Option<&'a [i32]> {
+        kv.iter().find_map(|(k, v)| {
+            if k == key {
+                if let MetaValue::ArrayInt32(a) = v {
+                    Some(a.as_slice())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Synthetic Qwen3.6-shaped HF dir: base BPE 100 entries (ids 0..99) +
+    /// added_tokens at ids 100, 101, 102, 103, 104 (the high-id added
+    /// tokens scenario), with `text_config.vocab_size = 110` (so ids
+    /// 105..109 must be gap-filled).
+    fn write_qwen36_shaped_hf_dir(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        let dir = tmp.path().to_path_buf();
+        let mut vocab_obj = serde_json::Map::new();
+        for i in 0..100u32 {
+            vocab_obj.insert(format!("tok{i}"), serde_json::json!(i));
+        }
+        let tokenizer_json = serde_json::json!({
+            "model": { "type": "BPE", "vocab": vocab_obj, "merges": [] },
+            "added_tokens": [
+                {"id": 100, "content": "<|endoftext|>", "special": true},
+                {"id": 101, "content": "<|im_start|>",  "special": true},
+                {"id": 102, "content": "<|im_end|>",    "special": true},
+                {"id": 103, "content": "<think>",       "special": false},
+                {"id": 104, "content": "</think>",      "special": false},
+            ]
+        });
+        std::fs::write(
+            dir.join("tokenizer.json"),
+            serde_json::to_string(&tokenizer_json).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            serde_json::to_string(&serde_json::json!({
+                "bos_token": "<|endoftext|>",
+                "eos_token": "<|im_end|>",
+                "chat_template": "{{ messages }}"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // Mirrors Qwen3.6's actual config.json — `text_config.vocab_size`
+        // (NOT top-level vocab_size) is the canonical signal.
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_string(&serde_json::json!({
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "model_type": "qwen3_5",
+                "text_config": { "vocab_size": 110 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn vocab_merge_token_array_sized_to_text_config_vocab_size() {
+        // The smoking-gun pin for the user's regression: with
+        // base BPE = 100 entries + added_tokens at ids 100-104 +
+        // text_config.vocab_size = 110, the GGUF MUST emit a 110-entry
+        // tokens array (NOT 100 like the pre-fix code did).
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_qwen36_shaped_hf_dir(&tmp);
+        let kv = load_tokenizer_metadata(&dir, "qwen35moe")
+            .expect("load_tokenizer_metadata must succeed");
+        let tokens = metadata_array_string(&kv, "tokenizer.ggml.tokens")
+            .expect("tokens array must be present");
+        assert_eq!(
+            tokens.len(),
+            110,
+            "vocab MUST be sized to text_config.vocab_size=110, not base BPE len. \
+             Pre-fix bug produced 100; that's the regression."
+        );
+    }
+
+    #[test]
+    fn vocab_merge_added_tokens_land_at_declared_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_qwen36_shaped_hf_dir(&tmp);
+        let kv = load_tokenizer_metadata(&dir, "qwen35moe")
+            .expect("load");
+        let tokens = metadata_array_string(&kv, "tokenizer.ggml.tokens")
+            .expect("tokens");
+        assert_eq!(tokens[100], "<|endoftext|>");
+        assert_eq!(tokens[101], "<|im_start|>");
+        assert_eq!(tokens[102], "<|im_end|>");
+        assert_eq!(tokens[103], "<think>");
+        assert_eq!(tokens[104], "</think>");
+    }
+
+    #[test]
+    fn vocab_merge_gap_filled_with_pad_unused() {
+        // Ids 105..109 are gap (no entry). Pre-fix code wouldn't have
+        // produced these slots at all. Post-fix MUST produce [PAD{i}]
+        // with TOKEN_TYPE_UNUSED.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_qwen36_shaped_hf_dir(&tmp);
+        let kv = load_tokenizer_metadata(&dir, "qwen35moe")
+            .expect("load");
+        let tokens = metadata_array_string(&kv, "tokenizer.ggml.tokens")
+            .expect("tokens");
+        let types = metadata_array_int32(&kv, "tokenizer.ggml.token_type")
+            .expect("types");
+        for i in 105..110usize {
+            assert_eq!(
+                tokens[i],
+                format!("[PAD{i}]"),
+                "id {i} must gap-fill with [PAD{i}]"
+            );
+            assert_eq!(
+                types[i], 5,
+                "id {i} token_type must be UNUSED (5), got {}",
+                types[i]
+            );
+        }
+    }
+
+    #[test]
+    fn vocab_merge_eos_metadata_resolves_for_out_of_range_added_token() {
+        // THE smoking gun for the user's actual regression. Pre-fix
+        // resolve_special_token_id looked up `<|im_end|>` in vocab_entries
+        // built from base BPE only (100 entries) → not found → no EOS
+        // metadata written. Runtime then fell back to a hardcoded id
+        // that didn't match the vocab. Post-fix MUST resolve to id 102.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_qwen36_shaped_hf_dir(&tmp);
+        let kv = load_tokenizer_metadata(&dir, "qwen35moe")
+            .expect("load");
+        assert_eq!(
+            metadata_uint32(&kv, "tokenizer.ggml.eos_token_id"),
+            Some(102),
+            "eos_token_id MUST resolve to <|im_end|> at id 102 (added_token, beyond base BPE)"
+        );
+        assert_eq!(
+            metadata_uint32(&kv, "tokenizer.ggml.bos_token_id"),
+            Some(100),
+            "bos_token_id MUST resolve to <|endoftext|> at id 100"
+        );
+    }
+
+    #[test]
+    fn vocab_merge_added_special_tokens_get_control_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_qwen36_shaped_hf_dir(&tmp);
+        let kv = load_tokenizer_metadata(&dir, "qwen35moe")
+            .expect("load");
+        let types = metadata_array_int32(&kv, "tokenizer.ggml.token_type")
+            .expect("types");
+        // ids 100, 101, 102 are added with special=true → CONTROL (3)
+        assert_eq!(types[100], 3, "<|endoftext|> (special=true) must be CONTROL");
+        assert_eq!(types[101], 3, "<|im_start|> (special=true) must be CONTROL");
+        assert_eq!(types[102], 3, "<|im_end|> (special=true) must be CONTROL");
+    }
+
+    #[test]
+    fn vocab_merge_added_lookalike_specials_get_control_via_heuristic() {
+        // ids 103 (`<think>`) and 104 (`</think>`) have special=false in
+        // tokenizer.json BUT match `does_token_look_special` (`<...>`
+        // form, len > 2). Per llama.cpp's get_vocab_base, they MUST be
+        // upgraded to CONTROL.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_qwen36_shaped_hf_dir(&tmp);
+        let kv = load_tokenizer_metadata(&dir, "qwen35moe")
+            .expect("load");
+        let types = metadata_array_int32(&kv, "tokenizer.ggml.token_type")
+            .expect("types");
+        assert_eq!(
+            types[103], 3,
+            "<think> (looks special via heuristic) must be CONTROL even when special=false"
+        );
+        assert_eq!(
+            types[104], 3,
+            "</think> (looks special via heuristic) must be CONTROL even when special=false"
+        );
+    }
+
+    #[test]
+    fn does_token_look_special_heuristic_matches_llama_cpp() {
+        // Pin the heuristic: mirrors Model.does_token_look_special at
+        // /opt/llama.cpp/convert_hf_to_gguf.py.
+        for s in &[
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<|tool_call>",
+            "<think>",
+            "</think>",
+            "<bos>",
+            "<eos>",
+        ] {
+            assert!(
+                does_token_look_special(s),
+                "expected `{s}` to look special"
+            );
+        }
+        for s in &[
+            "<unk>",  // explicit exception per llama.cpp heuristic
+            "hello",
+            "<",
+            ">",
+            "<>",
+            "world",
+            "tok42",
+        ] {
+            assert!(
+                !does_token_look_special(s),
+                "expected `{s}` to NOT look special"
+            );
+        }
+    }
+
+    #[test]
+    fn read_full_vocab_size_prefers_text_config_over_top_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.json"),
+            serde_json::to_string(&serde_json::json!({
+                "vocab_size": 999,
+                "text_config": { "vocab_size": 248320 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_full_vocab_size_from_config(tmp.path()),
+            Some(248320),
+            "text_config.vocab_size must take priority for nested-config models (Qwen3-VL)"
+        );
+    }
+
+    #[test]
+    fn read_full_vocab_size_falls_back_to_top_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.json"),
+            serde_json::to_string(&serde_json::json!({ "vocab_size": 32000 }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_full_vocab_size_from_config(tmp.path()),
+            Some(32000),
+            "plain top-level vocab_size MUST be used when text_config absent"
+        );
+    }
+
+    #[test]
+    fn read_full_vocab_size_returns_none_when_config_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No config.json written.
+        assert_eq!(
+            read_full_vocab_size_from_config(tmp.path()),
+            None,
+            "missing config.json must return None (caller handles fallback)"
+        );
     }
 }
