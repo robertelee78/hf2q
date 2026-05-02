@@ -41,6 +41,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub mod image_token_residual_add;
 pub mod mmproj;
 pub mod mmproj_weights;
 pub mod preprocess;

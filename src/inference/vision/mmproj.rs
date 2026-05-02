@@ -167,23 +167,28 @@ impl ProjectorType {
     /// projector head `Gemma4ClippableLinear` is in
     /// `vit_gpu.rs::gemma4v_apply_full_forward_gpu` (Stage 8).
     ///
-    /// `Qwen3VlMerger` — **NOT YET** (iter-224 Wedge-4b parse-only
-    /// stage). Returning `false` keeps `validate_tensor_set` rejecting
-    /// the file at `serve --mmproj` startup so the server never
-    /// advertises a forward path it can't back, while still letting
-    /// `MmprojConfig::from_gguf` parse the file for `/v1/models`-style
-    /// listing. Wedge-4c (queued, blocked by 4b) flips this to
-    /// `true` once `compute_vision_embeddings_gpu_qwen3vl` ships at
-    /// `vit_gpu.rs:2412`.
+    /// `Qwen3VlMerger` — **YES** (iter-224 Wedge-4c.5 LANDED). The full
+    /// Qwen3-VL ViT forward (`compute_vision_embeddings_gpu_qwen3vl` at
+    /// `vit_gpu_qwen3vl.rs`), the LM-side split-and-add hooks
+    /// (`Qwen35Model::forward_gpu_*_with_soft_tokens`), the
+    /// `image_token_residual_add` GPU dispatch, and the mmproj loader's
+    /// fused-`attn_qkv` slice-view extension all ship together. The
+    /// `is_supported()` flip is the gate that lets `validate_tensor_set`
+    /// accept Qwen3-VL mmproj files at `serve --mmproj` startup.
     ///
     /// `Resampler` / `Other(_)` — no (no kernel path).
     pub fn is_supported(&self) -> bool {
-        // iter-224 Wedge-4b: `Qwen3VlMerger` deliberately NOT in this
-        // matches!() arm — the regression-guard test
-        // `qwen3vl_merger_is_supported_returns_false_until_wedge_4c`
-        // in tests/mmproj_qwen3vl.rs hard-asserts that flipping this
-        // bit happens in lockstep with the ViT forward landing.
-        matches!(self, ProjectorType::Mlp | ProjectorType::Gemma4v)
+        // iter-224 Wedge-4c.5: `Qwen3VlMerger` LANDED — every leg of
+        // the Qwen3-VL forward path (ViT forward in vit_gpu_qwen3vl.rs,
+        // LM-side hooks at forward_gpu.rs, image_token_residual_add
+        // GPU dispatch, fused-attn_qkv loader) is wired before this
+        // gate flipped. The matching assertion at
+        // `projector_supported_for_qwen3vl_merger_after_wedge_4c5`
+        // (tests below) regression-guards the flip.
+        matches!(
+            self,
+            ProjectorType::Mlp | ProjectorType::Gemma4v | ProjectorType::Qwen3VlMerger
+        )
     }
 }
 
@@ -561,12 +566,22 @@ impl ArchProfile {
     }
     /// Whether hf2q has a runtime forward path for this arch.
     ///
-    /// **iter-224 Wedge-4b**: `Qwen3VlSiglip` returns `false` —
-    /// listing-without-serving works (`MmprojConfig::from_gguf` parses
-    /// the file) but the validator rejects at `serve --mmproj`
-    /// startup. Wedge-4c flips this when the runtime ViT lands.
+    /// **iter-224 Wedge-4c.5**: `Qwen3VlSiglip` returns `true` —
+    /// `compute_vision_embeddings_gpu_qwen3vl` (vit_gpu_qwen3vl.rs)
+    /// supplies the ViT forward; the LM-side split-and-add hooks at
+    /// `Qwen35Model::forward_gpu_*_with_soft_tokens` consume the
+    /// augmented embed; mmproj loader handles fused `attn_qkv`. Note
+    /// that the chat-handler-side preprocess routing for Qwen3-VL
+    /// (variable-resolution patch grid + 3D-mRoPE positions +
+    /// `<|vision_start|><|image_pad|><|vision_end|>` placeholder
+    /// expansion) is Wedge-4d territory — when an image-bearing
+    /// chat request lands, `process_multimodal_content` fails loud
+    /// with a Wedge-4d-pointing message until that lands.
     pub fn is_supported(&self) -> bool {
-        matches!(self, ArchProfile::Gemma4Siglip | ArchProfile::ClipClassic)
+        matches!(
+            self,
+            ArchProfile::Gemma4Siglip | ArchProfile::ClipClassic | ArchProfile::Qwen3VlSiglip
+        )
     }
 }
 
@@ -684,17 +699,24 @@ pub fn detect_arch_profile_with_projector(
 /// diagnostic when the writer dropped a universal tensor — more
 /// actionable than a bare "projector type not supported" message
 /// that hides the producer bug. The projector-supported gate runs
-/// LAST, so a tensor-complete Qwen3-VL mmproj surfaces the
-/// "not yet supported" verdict; a tensor-incomplete one surfaces
-/// the missing-tensor list (including the deepstack arm). Wedge-4c's
-/// flip of `Qwen3VlMerger.is_supported()` from false to true requires
-/// no further validator change.
+/// LAST.
+///
+/// **iter-224 Wedge-4c.5**: per-block QKV check now accepts EITHER
+/// the fused `v.blk.{N}.attn_qkv.weight` (Qwen3-VL HF-source canonical,
+/// emitted by /opt/llama.cpp/convert_hf_to_gguf.py:4853-4972) OR the
+/// classic split `attn_q/k/v.weight` trio. Mixing is rejected loud
+/// (producer bug). `Qwen3VlMerger.is_supported()` returns true after
+/// this iter, so a tensor-complete Qwen3-VL mmproj passes the gate
+/// rather than surfacing the old "not yet supported" reject.
 pub fn validate_tensor_set(cfg: &MmprojConfig, actual_names: &[&str]) -> Result<()> {
     let actual_set: std::collections::HashSet<&str> = actual_names.iter().copied().collect();
     let mut missing: Vec<String> = Vec::new();
 
-    // Universal tensors (arch-agnostic).
-    let mut required: Vec<String> = vec![
+    // Universal tensors (arch-agnostic). After Wedge-4c.5 the per-block
+    // QKV + attn_out checks moved into the layer loop below, so this
+    // list now carries only the patch-embed + position-embed pair —
+    // no longer needs to grow inside the loop.
+    let required: Vec<String> = vec![
         TENSOR_PATCH_EMBD.to_string(),
         TENSOR_POS_EMBD.to_string(),
     ];
@@ -703,9 +725,65 @@ pub fn validate_tensor_set(cfg: &MmprojConfig, actual_names: &[&str]) -> Result<
     // per `TN_ATTN_OUTPUT = "%s.blk.%d.attn_out.%s"`
     // (`/opt/llama.cpp/tools/mtmd/clip-impl.h:82`); this is distinct
     // from the text-decoder `attn_output.weight` long-form.
+    //
+    // **Wedge-4c.5**: Qwen3-VL converters (HF source) emit a FUSED
+    // `attn_qkv.{weight,bias}` per block (clip-impl.h:78
+    // `TN_ATTN_QKV = "%s.blk.%d.attn_qkv.%s"`,
+    // /opt/llama.cpp/tools/mtmd/clip.cpp:1669) instead of split
+    // `attn_q/k/v`. Both forms back the same logical Q/K/V projection;
+    // the runtime mmproj loader (`LoadedMmprojWeights::load`) installs
+    // canonical-name slice views so the consumer code (`block_tensor`)
+    // remains unchanged. The validator accepts EITHER convention
+    // per-block but rejects MIXED (some blocks fused, others split) —
+    // mixing means a producer bug worth surfacing loud.
     for layer_idx in 0..cfg.num_hidden_layers as usize {
-        for suffix in ["attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_out.weight"] {
-            required.push(vit_layer_tensor(layer_idx, suffix));
+        // attn_out is universal — neither convention fuses it.
+        let attn_out_name = vit_layer_tensor(layer_idx, "attn_out.weight");
+        if !actual_set.contains(attn_out_name.as_str()) {
+            missing.push(attn_out_name);
+        }
+
+        // QKV: accept fused `attn_qkv.weight` OR the split
+        // `attn_q.weight + attn_k.weight + attn_v.weight` trio.
+        let qkv_fused_w = vit_layer_tensor(layer_idx, "attn_qkv.weight");
+        let q_w = vit_layer_tensor(layer_idx, "attn_q.weight");
+        let k_w = vit_layer_tensor(layer_idx, "attn_k.weight");
+        let v_w = vit_layer_tensor(layer_idx, "attn_v.weight");
+        let has_fused = actual_set.contains(qkv_fused_w.as_str());
+        let split_present = [&q_w, &k_w, &v_w]
+            .iter()
+            .filter(|n| actual_set.contains(n.as_str()))
+            .count();
+        let has_full_split = split_present == 3;
+        match (has_fused, has_full_split, split_present) {
+            (true, false, 0) => { /* fused-only — accepted */ }
+            (false, true, _) => { /* split-only — accepted */ }
+            (true, true, _) => {
+                missing.push(format!(
+                    "block {layer_idx}: BOTH fused '{qkv_fused_w}' AND split \
+                     attn_q/k/v are present — producer must emit one form, not both"
+                ));
+            }
+            (true, false, _) => {
+                missing.push(format!(
+                    "block {layer_idx}: fused '{qkv_fused_w}' is present but \
+                     PARTIAL split tensors leaked through (only {split_present}/3 \
+                     of attn_q/k/v.weight present) — refusing to mix conventions"
+                ));
+            }
+            (false, false, _) => {
+                if split_present == 0 {
+                    missing.push(format!(
+                        "block {layer_idx}: missing QKV — neither fused '{qkv_fused_w}' \
+                         nor split attn_q/k/v.weight trio is present"
+                    ));
+                } else {
+                    // partial split, no fused — list each missing leg
+                    if !actual_set.contains(q_w.as_str()) { missing.push(q_w); }
+                    if !actual_set.contains(k_w.as_str()) { missing.push(k_w); }
+                    if !actual_set.contains(v_w.as_str()) { missing.push(v_w); }
+                }
+            }
         }
     }
     for name in &required {
@@ -836,16 +914,17 @@ mod tests {
 
     #[test]
     fn projector_supported_for_mlp_and_gemma4v() {
-        // Both projector heads have a runtime forward path:
-        //   - Mlp     → compute_vision_embeddings_gpu (SigLIP-49)
-        //   - Gemma4v → gemma4v_apply_full_forward_gpu via dispatch
+        // All three projector heads have a runtime forward path:
+        //   - Mlp            → compute_vision_embeddings_gpu (SigLIP-49)
+        //   - Gemma4v        → gemma4v_apply_full_forward_gpu via dispatch
+        //   - Qwen3VlMerger  → compute_vision_embeddings_gpu_qwen3vl via
+        //                      dispatch (Wedge-4c.5 LANDED)
         assert!(ProjectorType::Mlp.is_supported());
         assert!(ProjectorType::Gemma4v.is_supported());
-        // iter-224 Wedge-4b standing invariant: Qwen3VlMerger is NOT
-        // yet supported — flipping this bit is Wedge-4c's job
-        // (in lockstep with the runtime ViT landing). The
-        // tests/mmproj_qwen3vl.rs companion test enforces the same.
-        assert!(!ProjectorType::Qwen3VlMerger.is_supported());
+        // iter-224 Wedge-4c.5 LANDED: Qwen3VlMerger is now supported —
+        // the runtime ViT forward + LM-side hooks + fused-attn_qkv
+        // loader all shipped in the same iter that flipped this bit.
+        assert!(ProjectorType::Qwen3VlMerger.is_supported());
         assert!(!ProjectorType::Resampler.is_supported());
         assert!(!ProjectorType::Other("x".into()).is_supported());
     }
@@ -1056,15 +1135,24 @@ mod tests {
 
     #[test]
     fn validate_tensor_set_flags_missing_whole_block() {
-        // 2-layer cfg, only block 0's tensors present.
+        // 2-layer cfg, only block 0's tensors present. Wedge-4c.5 changes
+        // the missing-tensor surface for QKV: instead of listing each of
+        // attn_q/k/v.weight individually, the validator emits a single
+        // "block N: missing QKV — neither fused 'v.blk.N.attn_qkv.weight'
+        // nor split attn_q/k/v.weight trio is present" message naming
+        // both alternatives. attn_out.weight stays as its own line. Total
+        // missing = 2 (1 QKV diagnostic + 1 attn_out).
         let cfg = mlp_cfg(2);
         let names = minimum_tensor_names(1); // only 1 layer's tensors
         let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         let err = validate_tensor_set(&cfg, &actual).expect_err("should fail");
         let msg = format!("{err}");
-        // 4 missing: v.blk.1.{attn_q, attn_k, attn_v, attn_out}.weight
-        assert!(msg.contains("missing 4 required tensor"), "got: {msg}");
-        assert!(msg.contains("v.blk.1.attn_q.weight"), "got: {msg}");
+        assert!(msg.contains("missing 2 required tensor"), "got: {msg}");
+        assert!(msg.contains("v.blk.1.attn_out.weight"), "got: {msg}");
+        assert!(
+            msg.contains("block 1: missing QKV") && msg.contains("attn_qkv"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -1138,14 +1226,18 @@ mod tests {
 
     #[test]
     fn arch_profile_is_supported_only_for_runtime_paths() {
-        // iter-224 Wedge-4b: `is_supported()` semantics tightened from
-        // "not Unknown" to "has a runtime forward path." Gemma4Siglip
-        // and ClipClassic do; Qwen3VlSiglip does not yet (queued under
-        // Wedge-4c — see `compute_vision_embeddings_gpu_qwen3vl` at
-        // `vit_gpu.rs:2412` once it lands); Unknown never does.
+        // iter-224 Wedge-4c.5: all three arch profiles with a runtime
+        // ViT forward report supported — Gemma4Siglip, ClipClassic, and
+        // Qwen3VlSiglip (the latter via compute_vision_embeddings_gpu_qwen3vl).
+        // Unknown never does. NOTE: image-bearing chat requests for
+        // Qwen3-VL still fail loud at preprocess routing in
+        // `process_multimodal_content` (handlers.rs) until Wedge-4d
+        // lands the variable-resolution patch + 3D-mRoPE preprocess
+        // pipeline; this test asserts the LOAD-TIME validator gate flip
+        // only.
         assert!(ArchProfile::Gemma4Siglip.is_supported());
         assert!(ArchProfile::ClipClassic.is_supported());
-        assert!(!ArchProfile::Qwen3VlSiglip.is_supported());
+        assert!(ArchProfile::Qwen3VlSiglip.is_supported());
         assert!(!ArchProfile::Unknown.is_supported());
     }
 
@@ -1303,23 +1395,20 @@ mod tests {
     }
 
     #[test]
-    fn validate_qwen3vl_complete_set_falls_through_to_unsupported_projector() {
-        // iter-224 Wedge-4b: a tensor-complete Qwen3-VL mmproj must
-        // PASS the universal/projector/deepstack checks and reach the
-        // final projector-supported gate (which fails because
-        // Qwen3VlMerger.is_supported() = false until Wedge-4c). When
-        // 4c adds Qwen3VlMerger to is_supported()'s matches!() arm,
-        // this test will start failing with "should not have errored"
-        // — a green-flip signal that's easy to spot in the diff.
+    fn validate_qwen3vl_complete_set_passes_after_wedge_4c5() {
+        // iter-224 Wedge-4c.5 LANDED: a tensor-complete Qwen3-VL mmproj
+        // must PASS the universal/projector/deepstack checks AND the
+        // final projector-supported gate (now true for Qwen3VlMerger).
+        // This is the green-flip signal — pre-Wedge-4c.5 this test
+        // asserted the gate REJECTED with "not yet supported"; flipping
+        // the test polarity here is the regression-guard counterpart
+        // to flipping `is_supported()`'s matches!() arm.
         let cfg = qwen3vl_cfg(24, vec![5, 11, 17]);
         let names = qwen3vl_minimum_tensor_names(24, &[5, 11, 17]);
         let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-        let err = validate_tensor_set(&cfg, &actual)
-            .expect_err("Wedge-4b: tensor-complete Qwen3-VL must surface unsupported-projector error");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("'qwen3vl_merger' is not yet supported"),
-            "Wedge-4b: expected unsupported-projector message, got: {msg}"
+        validate_tensor_set(&cfg, &actual).expect(
+            "Wedge-4c.5: tensor-complete Qwen3-VL with split attn_q/k/v must validate cleanly \
+             now that ProjectorType::Qwen3VlMerger.is_supported() returns true",
         );
     }
 
@@ -1385,5 +1474,112 @@ mod tests {
         let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         validate_tensor_set(&cfg, &actual)
             .expect("empty deepstack_indexes with complete universal set must pass");
+    }
+
+    // -----------------------------------------------------------------------
+    // Wedge-4c.5: validator accepts fused `attn_qkv` per-block.
+    //
+    // /opt/llama.cpp/convert_hf_to_gguf.py:4853-4972's Qwen3VLVisionModel
+    // emits the fused name (`V_ENC_ATTN_QKV` mapped to
+    // `v.blk.{bid}.attn_qkv` at gguf-py/gguf/constants.py:1205);
+    // /opt/llama.cpp/tools/mtmd/clip.cpp:1669 loads it as a single
+    // optional tensor. Both shapes back the same logical Q/K/V projection.
+    // -----------------------------------------------------------------------
+
+    /// Build a Qwen3-VL minimum tensor set with FUSED `attn_qkv`
+    /// instead of split `attn_q/k/v`. Used by the Wedge-4c.5 validator
+    /// tests below.
+    fn qwen3vl_fused_qkv_tensor_names(num_layers: u32, flagged: &[u32]) -> Vec<String> {
+        let mut names = vec![
+            TENSOR_PATCH_EMBD.to_string(),
+            TENSOR_POS_EMBD.to_string(),
+            TENSOR_MM_0_WEIGHT.to_string(),
+        ];
+        for layer_idx in 0..num_layers as usize {
+            // Fused QKV (one tensor) instead of three.
+            names.push(vit_layer_tensor(layer_idx, "attn_qkv.weight"));
+            names.push(vit_layer_tensor(layer_idx, "attn_out.weight"));
+        }
+        for &idx in flagged {
+            for suffix in DEEPSTACK_REQUIRED_SUFFIXES {
+                names.push(vit_deepstack_tensor(idx as usize, suffix));
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn validate_qwen3vl_fused_attn_qkv_accepted() {
+        // Wedge-4c.5: a Qwen3-VL mmproj with fused `attn_qkv.weight`
+        // (canonical from llama.cpp's HF converter) must validate
+        // cleanly. This is the green-flip companion to the loader's
+        // slice-view extension.
+        let cfg = qwen3vl_cfg(24, vec![5, 11, 17]);
+        let names = qwen3vl_fused_qkv_tensor_names(24, &[5, 11, 17]);
+        let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        validate_tensor_set(&cfg, &actual).expect(
+            "Wedge-4c.5: tensor-complete Qwen3-VL with FUSED attn_qkv must validate cleanly",
+        );
+    }
+
+    #[test]
+    fn validate_qwen3vl_split_attn_qkv_still_accepted() {
+        // Wedge-4c.5: the split form (legacy, hf2q-converted) must
+        // remain accepted — both loader paths are equivalent. This is
+        // a regression-guard against accidentally requiring fused.
+        let cfg = qwen3vl_cfg(24, vec![5, 11, 17]);
+        let names = qwen3vl_minimum_tensor_names(24, &[5, 11, 17]);
+        let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        validate_tensor_set(&cfg, &actual)
+            .expect("split attn_q/k/v.weight trio must remain a valid Qwen3-VL form");
+    }
+
+    #[test]
+    fn validate_qwen3vl_mixed_qkv_form_rejected() {
+        // Wedge-4c.5: a producer that emits BOTH fused AND split for
+        // the same block is a bug — the loader can't deterministically
+        // pick which to use. Validator must surface this loud.
+        let cfg = qwen3vl_cfg(4, vec![]);
+        let mut names = qwen3vl_minimum_tensor_names(4, &[]);
+        // Add the fused tensor at block 0 — now block 0 has BOTH split
+        // attn_q/k/v.weight AND fused attn_qkv.weight.
+        names.push(vit_layer_tensor(0, "attn_qkv.weight"));
+        let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let err = validate_tensor_set(&cfg, &actual)
+            .expect_err("BOTH fused AND split present at the same block must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("BOTH fused") && msg.contains("attn_qkv"),
+            "error must call out the both-forms case at block 0; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_qwen3vl_missing_qkv_names_fused_alternative() {
+        // Wedge-4c.5: when QKV is entirely missing (neither fused nor
+        // split), the error message must NAME the fused alternative
+        // so a producer reading the diagnostic knows both forms are
+        // accepted (avoids whack-a-mole adding split tensors when the
+        // fused tensor would have been simpler).
+        let cfg = qwen3vl_cfg(2, vec![]);
+        // Only ship the universals + attn_out + projector head (no
+        // QKV in any form).
+        let mut names = vec![
+            TENSOR_PATCH_EMBD.to_string(),
+            TENSOR_POS_EMBD.to_string(),
+            TENSOR_MM_0_WEIGHT.to_string(),
+        ];
+        for layer_idx in 0..2usize {
+            names.push(vit_layer_tensor(layer_idx, "attn_out.weight"));
+        }
+        let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let err = validate_tensor_set(&cfg, &actual)
+            .expect_err("missing QKV in any form must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("attn_qkv") && msg.contains("attn_q/k/v"),
+            "error must name BOTH the fused alternative ('attn_qkv') AND \
+             the split form ('attn_q/k/v') so the producer can pick; got: {msg}"
+        );
     }
 }

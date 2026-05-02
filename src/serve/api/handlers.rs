@@ -2288,22 +2288,41 @@ fn process_multimodal_content(
                 }));
             }
             ArchProfile::Qwen3VlSiglip => {
-                // iter-224 Wedge-4b: parse-time mmproj header + projector +
-                // DeepStack tensor enumeration are wired here, but the
-                // runtime ViT forward + Qwen3-VL-specific preprocessor
-                // (patch_size=16 + spatial_merge_size=2 native-resolution
-                // tiling) land in Wedge-4c. `ProjectorType::Qwen3VlMerger.is_supported()`
-                // returns false today so `serve --mmproj` rejects this
-                // profile at startup before any chat-completion enters
-                // here. Fail-loud if the contract regresses.
+                // iter-224 Wedge-4c.5 LANDED: server-side load is now
+                // accepted (the validator+ViT+LM-side hooks all ship
+                // together), so text-only chat against a Qwen3-VL GGUF
+                // works. The image-bearing chat path still requires:
+                //   (a) a Qwen3-VL preprocessor (variable-resolution
+                //       patch grid, spatial_merge_size=2 native tiling),
+                //   (b) chat-template handling of the
+                //       `<|vision_start|><|image_pad|><|vision_end|>`
+                //       triplet (different from Gemma's `<|image|>`),
+                //   (c) 3D-mRoPE position synthesis (per
+                //       /opt/llama.cpp/tools/mtmd/clip-impl.h:78 and
+                //       qwen3vl.cpp's `rope_multi`),
+                //   (d) the engine-seam handler that splits
+                //       `compute_vision_embeddings_gpu_qwen3vl`'s
+                //       augmented `[n_image_tokens, lm_hidden*(1+N_dst)]`
+                //       buffer into the base SoftTokenInjection +
+                //       N_deepstack DeepstackInjection chunks expected
+                //       by `Qwen35Model::forward_gpu_last_logits_with_soft_tokens_and_deepstack`.
+                // All four are Wedge-4d's scope; this fail-loud guard
+                // returns 400 with the explicit handoff so the user
+                // sees an actionable message instead of a confused
+                // crash deep in the gemma4v preprocess path.
                 return Err(ApiError::invalid_request(
                     format!(
                         "messages[{}].content[{}].image_url: loaded mmproj is Qwen3-VL \
-                         (ArchProfile::Qwen3VlSiglip) — runtime path not yet implemented \
-                         (iter-224 Wedge-4b parse-only; Wedge-4c will land the ViT). \
-                         ProjectorType::Qwen3VlMerger.is_supported() should be returning \
-                         false at startup; if you reached here, is_supported() was \
-                         flipped without the kernel path landing.",
+                         (ArchProfile::Qwen3VlSiglip) — TEXT-ONLY chat works, but \
+                         IMAGE-BEARING chat requires Wedge-4d. Missing pieces: \
+                         (1) variable-resolution preprocessor with spatial_merge_size=2 \
+                         native tiling, (2) `<|vision_start|><|image_pad|><|vision_end|>` \
+                         placeholder expansion, (3) 3D-mRoPE position synthesis, \
+                         (4) augmented-embed split → SoftTokenInjection + \
+                         DeepstackInjection at the engine seam. The LM-side hooks \
+                         (forward_gpu_last_logits_with_soft_tokens_and_deepstack) \
+                         and the ViT forward (compute_vision_embeddings_gpu_qwen3vl) \
+                         are READY — only the chat-handler glue remains.",
                         mi, pi
                     ),
                     Some(format!("messages[{}].content[{}]", mi, pi)),

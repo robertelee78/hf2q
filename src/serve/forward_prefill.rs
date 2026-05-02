@@ -69,6 +69,59 @@ pub struct SoftTokenInjection<'a> {
     /// on mismatch.
     pub embeddings: &'a MlxBuffer,
 }
+
+/// Per-LM-layer DeepStack residual injection metadata (ADR-005 iter-224
+/// Wedge-4c.5).
+///
+/// Mirrors /opt/llama.cpp/src/models/qwen3vl.cpp:96-100's per-layer
+/// `cur += ds` add: at LM layer `il < n_deepstack` (where
+/// `n_deepstack = chunks.len()`), the post-FFN-residual `cur` is
+/// updated in-place at the image-token positions with chunk `il`'s
+/// rows.
+///
+/// The `chunks` vec is **sorted by ascending LM-layer-of-injection**,
+/// so chunks[0] is added at LM layer 0, chunks[1] at LM layer 1, etc.
+/// This matches Qwen3-VL's `deepstack_indexes` convention where the
+/// i-th flagged ViT block's tap output (after passing through its
+/// DeepStack head + main projector) becomes chunk i+1 in the
+/// augmented embed and is consumed at LM layer i.
+///
+/// `image_token_positions` lists the prompt positions (post-`<|image_pad|>`
+/// expansion) where the image tokens reside; same length as the
+/// `n_image_tokens` row count of every chunk.
+///
+/// **Wedge-4c.5 status**: this struct is the engine seam between the
+/// ViT side (vit_gpu_qwen3vl.rs's augmented embed) and the LM side
+/// (forward_gpu.rs's image_token_residual_add hook). The handler-side
+/// path that constructs it from `compute_vision_embeddings_gpu_qwen3vl`'s
+/// output is Wedge-4d territory — until that lands, only the
+/// LM-side test fixtures construct DeepstackInjection directly.
+pub struct DeepstackInjection<'a> {
+    /// Image-token positions in the prompt (post-`<|image_pad|>`
+    /// expansion). Each position must be `< prompt_tokens.len()`.
+    /// Order is the natural left-to-right scan; chunk row k applies
+    /// at position `image_token_positions[k]`.
+    pub image_token_positions: Vec<u32>,
+    /// One GPU buffer per ds layer, each shape `[n_image_tokens,
+    /// hidden_size]` F32 row-major. `chunks.len()` = n_deepstack;
+    /// chunks[i] is added at LM layer i (i in 0..n_deepstack). Buffers
+    /// outlive this `DeepstackInjection` (lifetime `'a`).
+    pub chunks: Vec<&'a MlxBuffer>,
+}
+
+impl<'a> DeepstackInjection<'a> {
+    /// `n_deepstack` — number of LM layers receiving deepstack
+    /// injection. Equal to `chunks.len()`.
+    pub fn n_deepstack(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// `n_image_tokens` — equal to `image_token_positions.len()`. By
+    /// contract every `chunks[i]` carries `n_image_tokens` rows.
+    pub fn n_image_tokens(&self) -> usize {
+        self.image_token_positions.len()
+    }
+}
 use super::forward_mlx::{
     MlxModelWeights, DenseKvBuffers, HbKvBuffers, dispatch_qmatmul,
     dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs,

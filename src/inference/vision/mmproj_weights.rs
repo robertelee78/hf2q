@@ -108,7 +108,7 @@ impl LoadedMmprojWeights {
     /// lazy-load remaining blocks on first request).
     pub fn load(
         gguf: &GgufFile,
-        _cfg: &MmprojConfig,
+        cfg: &MmprojConfig,
         device: MlxDevice,
     ) -> Result<Self> {
         let names = gguf.tensor_names();
@@ -142,10 +142,144 @@ impl LoadedMmprojWeights {
             };
             tensors.insert((*name).to_string(), buf);
         }
+
+        // -------------------------------------------------------------------
+        // Wedge-4c.5: fused `attn_qkv` → split `attn_q/k/v` slice views.
+        //
+        // /opt/llama.cpp/convert_hf_to_gguf.py:4853-4972 emits Qwen3-VL's
+        // ViT QKV as a single fused tensor named `v.blk.{N}.attn_qkv.weight`
+        // (and optional `.bias`) per /opt/llama.cpp/tools/mtmd/clip-impl.h:78.
+        // The runtime forward consumer at vit_gpu_qwen3vl.rs requests split
+        // tensors by name (`attn_q.weight`, `attn_k.weight`, `attn_v.weight`)
+        // — so when we detect a fused tensor, we install three slice-view
+        // buffers under those split names. The slice views share the
+        // fused tensor's underlying Metal buffer; no extra copy is paid.
+        //
+        // Layout (per /opt/llama.cpp/tools/mtmd/clip.cpp:339-352):
+        //   fused weight `[3*hidden, hidden]` row-major (output dim first
+        //   per hf2q's vit_linear_gpu convention) — Q rows are
+        //   `[0..hidden][0..hidden]`, K rows `[hidden..2*hidden][0..hidden]`,
+        //   V rows `[2*hidden..3*hidden][0..hidden]`. Each slice is
+        //   exactly `hidden * hidden` contiguous floats.
+        //
+        //   fused bias `[3*hidden]` 1-D — split into three contiguous
+        //   `[hidden]` slices at offsets 0 / hidden / 2*hidden.
+        //
+        // We reject MIXED state (a block has BOTH fused AND split tensors)
+        // because the validator's mixed-state check would have already
+        // rejected at startup; this is a defensive guard against a future
+        // caller that bypasses the validator.
+        Self::install_fused_attn_qkv_slice_views(&mut tensors, cfg)?;
+
         Ok(Self {
             tensors,
             _device: device,
         })
+    }
+
+    /// Detect fused `v.blk.{N}.attn_qkv.{weight,bias}` per block and
+    /// install three split-name slice views (`attn_q/k/v.{weight,bias}`)
+    /// pointing at the fused tensor's underlying Metal storage. Idempotent
+    /// for split-only mmprojs (no fused tensors to slice).
+    ///
+    /// See `LoadedMmprojWeights::load` for the layout reasoning. Reject
+    /// MIXED state loud — a single block with both fused and split is
+    /// ambiguous.
+    fn install_fused_attn_qkv_slice_views(
+        tensors: &mut HashMap<String, mlx_native::MlxBuffer>,
+        cfg: &MmprojConfig,
+    ) -> Result<()> {
+        let hidden = cfg.hidden_size as usize;
+        if hidden == 0 {
+            // No vision tower → nothing to slice. Defensive: a zero hidden
+            // size would also break every downstream consumer; the parser
+            // already rejects this via from_gguf, but we don't re-check here.
+            return Ok(());
+        }
+        for layer_idx in 0..cfg.num_hidden_layers as usize {
+            let fused_w = vit_layer_tensor(layer_idx, "attn_qkv.weight");
+            let fused_b = vit_layer_tensor(layer_idx, "attn_qkv.bias");
+            let split_q_w = vit_layer_tensor(layer_idx, "attn_q.weight");
+            let split_k_w = vit_layer_tensor(layer_idx, "attn_k.weight");
+            let split_v_w = vit_layer_tensor(layer_idx, "attn_v.weight");
+
+            let has_fused_w = tensors.contains_key(&fused_w);
+            let has_split_w = tensors.contains_key(&split_q_w)
+                || tensors.contains_key(&split_k_w)
+                || tensors.contains_key(&split_v_w);
+
+            if has_fused_w && has_split_w {
+                return Err(anyhow!(
+                    "mmproj loader: block {layer_idx} has BOTH fused '{}' AND \
+                     split attn_q/k/v.weight tensors — refusing to mix conventions \
+                     (validator should have caught this at startup; bypassing \
+                     validator is unsupported)",
+                    fused_w
+                ));
+            }
+            if !has_fused_w {
+                continue; // split-only block (or no QKV at all — that's a
+                          // validator job). Nothing to slice.
+            }
+
+            // The fused-only path. Slice the weight.
+            let fused_buf = tensors.get(&fused_w).expect(
+                "has_fused_w=true contract violated by tensors.get",
+            );
+            let elem_size = fused_buf.dtype().size_of();
+            let chunk_elems = hidden * hidden;
+            let chunk_bytes = chunk_elems * elem_size;
+            // Validate the fused tensor's storage is exactly 3 * chunk_bytes.
+            // Anything else means the converter wrote an off-spec shape; we
+            // refuse rather than silently slice the wrong region.
+            let expected_bytes = 3 * chunk_bytes;
+            if fused_buf.byte_len() < expected_bytes {
+                return Err(anyhow!(
+                    "mmproj loader: fused '{fused_w}' byte_len {} < expected 3*hidden*hidden*{}={} \
+                     (hidden={hidden}, dtype={:?}); converter likely wrote a wrong shape",
+                    fused_buf.byte_len(),
+                    elem_size,
+                    expected_bytes,
+                    fused_buf.dtype(),
+                ));
+            }
+            let q_w = fused_buf.slice_view(0u64, chunk_elems);
+            let k_w = fused_buf.slice_view(chunk_bytes as u64, chunk_elems);
+            let v_w = fused_buf.slice_view((2 * chunk_bytes) as u64, chunk_elems);
+            tensors.insert(split_q_w, q_w);
+            tensors.insert(split_k_w, k_w);
+            tensors.insert(split_v_w, v_w);
+
+            // Slice the optional bias if present. Bias is 1-D `[3*hidden]`.
+            if tensors.contains_key(&fused_b) {
+                let split_q_b = vit_layer_tensor(layer_idx, "attn_q.bias");
+                let split_k_b = vit_layer_tensor(layer_idx, "attn_k.bias");
+                let split_v_b = vit_layer_tensor(layer_idx, "attn_v.bias");
+                let fused_bias_buf = tensors.get(&fused_b).expect(
+                    "tensors.contains_key(&fused_b) contract violated by tensors.get",
+                );
+                let bias_elem = fused_bias_buf.dtype().size_of();
+                let bias_chunk_bytes = hidden * bias_elem;
+                let bias_expected = 3 * bias_chunk_bytes;
+                if fused_bias_buf.byte_len() < bias_expected {
+                    return Err(anyhow!(
+                        "mmproj loader: fused '{fused_b}' byte_len {} < expected 3*hidden*{}={} \
+                         (hidden={hidden}, dtype={:?})",
+                        fused_bias_buf.byte_len(),
+                        bias_elem,
+                        bias_expected,
+                        fused_bias_buf.dtype(),
+                    ));
+                }
+                let q_b = fused_bias_buf.slice_view(0u64, hidden);
+                let k_b = fused_bias_buf.slice_view(bias_chunk_bytes as u64, hidden);
+                let v_b = fused_bias_buf.slice_view((2 * bias_chunk_bytes) as u64, hidden);
+                tensors.insert(split_q_b, q_b);
+                tensors.insert(split_k_b, k_b);
+                tensors.insert(split_v_b, v_b);
+            }
+        }
+        Ok(())
     }
 
     /// Load from a GGUF file path. Opens the file, creates a default
@@ -815,5 +949,262 @@ mod tests {
         assert_eq!(weights.mm_0_output_max(), None);
         let bounds = weights.mm_0_bounds();
         assert!(!bounds.any());
+    }
+
+    // -----------------------------------------------------------------------
+    // Wedge-4c.5: install_fused_attn_qkv_slice_views.
+    // -----------------------------------------------------------------------
+
+    /// Build a small synthetic Qwen3-VL-style MmprojConfig that
+    /// `install_fused_attn_qkv_slice_views` consumes for hidden_size +
+    /// num_hidden_layers. Other fields don't affect the slice-view path.
+    fn synth_qwen3vl_loader_cfg(hidden: u32, num_layers: u32) -> MmprojConfig {
+        MmprojConfig {
+            image_size: 32,
+            patch_size: 16,
+            num_patches_side: 2,
+            hidden_size: hidden,
+            intermediate_size: hidden * 4,
+            num_attention_heads: 4,
+            num_hidden_layers: num_layers,
+            layer_norm_eps: 1e-6,
+            projector: super::super::mmproj::ProjectorType::Qwen3VlMerger,
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [0.5, 0.5, 0.5],
+            spatial_merge_size: Some(2),
+            projection_dim: Some(hidden),
+            deepstack_indexes: Some(vec![]),
+        }
+    }
+
+    /// Allocate an MlxBuffer of `n_elements` F32 values, populated by
+    /// `f(i) -> f32` for i in 0..n_elements.
+    fn alloc_f32_with<F: FnMut(usize) -> f32>(
+        device: &MlxDevice,
+        n_elements: usize,
+        shape: Vec<usize>,
+        mut f: F,
+    ) -> MlxBuffer {
+        use mlx_native::DType;
+        let mut buf = device
+            .alloc_buffer(n_elements * 4, DType::F32, shape)
+            .expect("alloc f32 buffer");
+        {
+            let dst: &mut [f32] = buf.as_mut_slice::<f32>().expect("as_mut_slice f32");
+            for (i, slot) in dst.iter_mut().enumerate().take(n_elements) {
+                *slot = f(i);
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn install_fused_attn_qkv_splits_weight_into_three_slice_views() {
+        // Single block, hidden=4 → fused weight is 3*4*4 = 48 floats.
+        // Q chunk = floats [0..16] @ byte_offset 0,
+        // K = [16..32] @ byte_offset 64 (16 floats × 4 bytes),
+        // V = [32..48] @ byte_offset 128 (32 floats × 4 bytes).
+        //
+        // We verify the slice views by inspecting (byte_offset, shape,
+        // dtype, element_count). Direct CPU readback via `as_slice`
+        // does NOT honor `byte_offset` — `MlxBuffer::contents_ptr()`
+        // returns the start of the whole storage — so we read the
+        // backing storage manually using `contents_ptr` + the recorded
+        // `byte_offset` to verify the kernel-dispatch contract.
+        // This pattern matches what the encoder does at
+        // /opt/mlx-native/src/encoder.rs:218-220
+        // (`set_buffer(index, metal_buffer(), buf.byte_offset())`).
+        let device = MlxDevice::new().expect("device");
+        let cfg = synth_qwen3vl_loader_cfg(4, 1);
+        let mut tensors: HashMap<String, MlxBuffer> = HashMap::new();
+        let fused_buf = alloc_f32_with(&device, 48, vec![12, 4], |i| i as f32);
+        tensors.insert("v.blk.0.attn_qkv.weight".to_string(), fused_buf);
+        LoadedMmprojWeights::install_fused_attn_qkv_slice_views(&mut tensors, &cfg)
+            .expect("install on fused-only tensor map must succeed");
+        let q = tensors.get("v.blk.0.attn_q.weight").expect("Q view");
+        let k = tensors.get("v.blk.0.attn_k.weight").expect("K view");
+        let v = tensors.get("v.blk.0.attn_v.weight").expect("V view");
+        // byte_offset matches the per-chunk offset.
+        assert_eq!(q.byte_offset(), 0);
+        assert_eq!(k.byte_offset(), 64); // 16 floats × 4 bytes.
+        assert_eq!(v.byte_offset(), 128); // 32 floats × 4 bytes.
+        // shape was flattened to a 1-D view of n_elements = hidden*hidden.
+        assert_eq!(q.element_count(), 16);
+        assert_eq!(k.element_count(), 16);
+        assert_eq!(v.element_count(), 16);
+        // Verify the underlying bytes are the right region by reading
+        // contents_ptr + byte_offset directly. This is what the encoder
+        // does on dispatch.
+        let read_slice = |buf: &MlxBuffer, n: usize| -> Vec<f32> {
+            let ptr = buf.contents_ptr() as *const u8;
+            let off = buf.byte_offset() as usize;
+            // SAFETY: synthetic test buffer alloc'd above; we hold a
+            // shared ref via `tensors.get` and no GPU work is in flight.
+            unsafe {
+                std::slice::from_raw_parts(
+                    (ptr.add(off)) as *const f32,
+                    n,
+                )
+                .to_vec()
+            }
+        };
+        let q_s = read_slice(q, 16);
+        let k_s = read_slice(k, 16);
+        let v_s = read_slice(v, 16);
+        for i in 0..16 {
+            assert_eq!(q_s[i], i as f32, "Q[{i}] must equal fused[{i}]");
+            assert_eq!(k_s[i], (16 + i) as f32, "K[{i}] must equal fused[{}]", 16 + i);
+            assert_eq!(v_s[i], (32 + i) as f32, "V[{i}] must equal fused[{}]", 32 + i);
+        }
+    }
+
+    #[test]
+    fn install_fused_attn_qkv_handles_optional_bias() {
+        // hidden=8, single block. Fused bias is 3*8 = 24 f32 values.
+        // Q bias = [0..8] @ off 0; K bias = [8..16] @ off 32;
+        // V bias = [16..24] @ off 64.
+        let device = MlxDevice::new().expect("device");
+        let cfg = synth_qwen3vl_loader_cfg(8, 1);
+        let mut tensors: HashMap<String, MlxBuffer> = HashMap::new();
+        let weight_buf = alloc_f32_with(&device, 3 * 8 * 8, vec![24, 8], |i| i as f32);
+        let bias_buf = alloc_f32_with(&device, 24, vec![24], |i| -(i as f32));
+        tensors.insert("v.blk.0.attn_qkv.weight".to_string(), weight_buf);
+        tensors.insert("v.blk.0.attn_qkv.bias".to_string(), bias_buf);
+        LoadedMmprojWeights::install_fused_attn_qkv_slice_views(&mut tensors, &cfg)
+            .expect("install with optional bias must succeed");
+        let q_b = tensors.get("v.blk.0.attn_q.bias").expect("Q bias view");
+        let k_b = tensors.get("v.blk.0.attn_k.bias").expect("K bias view");
+        let v_b = tensors.get("v.blk.0.attn_v.bias").expect("V bias view");
+        assert_eq!(q_b.byte_offset(), 0);
+        assert_eq!(k_b.byte_offset(), 32); // 8 f32 = 32 bytes.
+        assert_eq!(v_b.byte_offset(), 64);
+        assert_eq!(q_b.element_count(), 8);
+        assert_eq!(k_b.element_count(), 8);
+        assert_eq!(v_b.element_count(), 8);
+        // Read the underlying region via contents_ptr + byte_offset.
+        let read_slice = |buf: &MlxBuffer, n: usize| -> Vec<f32> {
+            let ptr = buf.contents_ptr() as *const u8;
+            let off = buf.byte_offset() as usize;
+            unsafe {
+                std::slice::from_raw_parts(ptr.add(off) as *const f32, n).to_vec()
+            }
+        };
+        for (label, view, n_off) in [
+            ("Q", q_b, 0usize),
+            ("K", k_b, 8),
+            ("V", v_b, 16),
+        ] {
+            let s = read_slice(view, 8);
+            for i in 0..8 {
+                assert_eq!(
+                    s[i],
+                    -((n_off + i) as f32),
+                    "{label} bias [{i}] mismatch"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn install_fused_attn_qkv_split_only_is_a_noop() {
+        // Pre-existing split tensors must pass through untouched —
+        // the helper is a no-op on split-only inputs.
+        let device = MlxDevice::new().expect("device");
+        let cfg = synth_qwen3vl_loader_cfg(4, 1);
+        let mut tensors: HashMap<String, MlxBuffer> = HashMap::new();
+        for suffix in ["attn_q.weight", "attn_k.weight", "attn_v.weight"] {
+            let key = format!("v.blk.0.{suffix}");
+            let buf = alloc_f32_with(&device, 16, vec![4, 4], |i| i as f32);
+            tensors.insert(key, buf);
+        }
+        let n_before = tensors.len();
+        LoadedMmprojWeights::install_fused_attn_qkv_slice_views(&mut tensors, &cfg)
+            .expect("split-only must be a no-op");
+        assert_eq!(tensors.len(), n_before, "split-only tensor map must be unchanged");
+    }
+
+    #[test]
+    fn install_fused_attn_qkv_rejects_mixed_block() {
+        // A block with BOTH fused and split is a producer bug — the
+        // validator catches it normally; this test guards the
+        // defense-in-depth check inside the loader.
+        let device = MlxDevice::new().expect("device");
+        let cfg = synth_qwen3vl_loader_cfg(4, 1);
+        let mut tensors: HashMap<String, MlxBuffer> = HashMap::new();
+        tensors.insert(
+            "v.blk.0.attn_qkv.weight".to_string(),
+            alloc_f32_with(&device, 48, vec![12, 4], |i| i as f32),
+        );
+        // Add a stray split tensor as well — this should trigger the
+        // mixed-state error path.
+        tensors.insert(
+            "v.blk.0.attn_q.weight".to_string(),
+            alloc_f32_with(&device, 16, vec![4, 4], |_| 0.0),
+        );
+        let err = LoadedMmprojWeights::install_fused_attn_qkv_slice_views(&mut tensors, &cfg)
+            .expect_err("mixed fused+split per block must fail loud");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("BOTH fused") && msg.contains("attn_qkv"),
+            "loader error must call out the mixed-state case; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn install_fused_attn_qkv_rejects_undersized_fused_weight() {
+        // Fused weight that's smaller than 3*hidden*hidden floats is a
+        // converter bug — slicing would silently return wrong data.
+        // Reject loud.
+        let device = MlxDevice::new().expect("device");
+        let cfg = synth_qwen3vl_loader_cfg(4, 1);
+        let mut tensors: HashMap<String, MlxBuffer> = HashMap::new();
+        // Allocate only 2*4*4 = 32 floats instead of 48.
+        let undersized = alloc_f32_with(&device, 32, vec![8, 4], |i| i as f32);
+        tensors.insert("v.blk.0.attn_qkv.weight".to_string(), undersized);
+        let err = LoadedMmprojWeights::install_fused_attn_qkv_slice_views(&mut tensors, &cfg)
+            .expect_err("undersized fused weight must fail loud");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("byte_len") && msg.contains("expected"),
+            "loader error must name byte_len + expected size; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn install_fused_attn_qkv_multi_block_batches_correctly() {
+        // Multi-block: every block independently slices its fused
+        // tensor. Block N's Q view points at block N's storage at
+        // byte_offset 0 — distinct backing storage from block M (M≠N).
+        let device = MlxDevice::new().expect("device");
+        let cfg = synth_qwen3vl_loader_cfg(4, 3);
+        let mut tensors: HashMap<String, MlxBuffer> = HashMap::new();
+        for layer_idx in 0..3 {
+            let fused = alloc_f32_with(&device, 48, vec![12, 4], |i| {
+                (layer_idx * 100 + i) as f32
+            });
+            tensors.insert(format!("v.blk.{layer_idx}.attn_qkv.weight"), fused);
+        }
+        LoadedMmprojWeights::install_fused_attn_qkv_slice_views(&mut tensors, &cfg)
+            .expect("multi-block install must succeed");
+        let read_slice = |buf: &MlxBuffer, n: usize| -> Vec<f32> {
+            let ptr = buf.contents_ptr() as *const u8;
+            let off = buf.byte_offset() as usize;
+            unsafe {
+                std::slice::from_raw_parts(ptr.add(off) as *const f32, n).to_vec()
+            }
+        };
+        for layer_idx in 0..3 {
+            let q = tensors.get(&format!("v.blk.{layer_idx}.attn_q.weight"))
+                .unwrap_or_else(|| panic!("Q for block {layer_idx}"));
+            assert_eq!(q.byte_offset(), 0, "Q view always at fused-tensor start");
+            let q_s = read_slice(q, 16);
+            for i in 0..16 {
+                assert_eq!(
+                    q_s[i],
+                    (layer_idx * 100 + i) as f32,
+                    "block {layer_idx} Q[{i}] mismatch"
+                );
+            }
+        }
     }
 }

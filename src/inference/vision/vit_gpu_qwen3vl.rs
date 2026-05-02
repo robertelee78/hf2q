@@ -1,20 +1,26 @@
 //! Qwen3-VL ViT forward (ADR-005 iter-224 row 3 — Wedge-4c).
 //!
-//! **Status (sub-iter 4c.4)**: full ViT forward end-to-end, producing
-//! the augmented `[n_image_tokens, lm_hidden * (1 + N_deepstack)]`
-//! embedding that the LM-side hooks (4c.5) consume. 4c.4 layered the
-//! per-flagged-layer DeepStack heads + main `mm.0/mm.2` 2-layer GELU
-//! projector + final feature-dim concat on top of the 4c.3 per-block
-//! transformer forward. `is_supported()` STAYS `false` — flipping
-//! that gate happens in 4c.5 alongside the LM-side image-token
-//! residual-add hook.
+//! **Status (sub-iter 4c.5 LANDED)**: full ViT forward end-to-end,
+//! producing the augmented `[n_image_tokens, lm_hidden * (1 + N_deepstack)]`
+//! embedding consumed by the LM-side hooks. 4c.5 finalized the wedge
+//! by (1) wiring the LM-side `image_token_residual_add` GPU dispatch
+//! at `Qwen35Model::forward_gpu_last_logits_with_soft_tokens_and_deepstack`,
+//! (2) extending the mmproj loader to accept fused `attn_qkv` tensors
+//! (canonical llama.cpp HF-converter output) via slice-view installation,
+//! and (3) flipping `ProjectorType::Qwen3VlMerger.is_supported()` /
+//! `ArchProfile::Qwen3VlSiglip.is_supported()` to TRUE so
+//! `serve --mmproj <qwen3vl>` accepts the file at startup. The
+//! handler-side preprocess for image-bearing requests still fails loud
+//! (Wedge-4d territory: variable-resolution preprocessor +
+//! `<|vision_start|><|image_pad|><|vision_end|>` placeholder expansion +
+//! 3D-mRoPE position synthesis + augmented-embed split at engine seam).
 //!
 //! # Sub-iter roadmap (sequential, all blocked on this 4c.1 scaffold)
 //!
 //! | Sub-iter | Scope                                                                    |
 //! |----------|--------------------------------------------------------------------------|
 //! | 4c.1     | LANDED — `Qwen3VlViTConfig` + `compute_vision_embeddings_gpu_qwen3vl`    |
-//! |          |   stub, dispatch-arm wired, `is_supported()` stays `false`               |
+//! |          |   stub, dispatch-arm wired                                               |
 //! | 4c.2     | **THIS** — input validation, dispatch-site `num_position_embeddings`     |
 //! |          |   real-shape extraction, CPU helpers for dual-conv patch embedding +     |
 //! |          |   bilinear position-embedding resize + 2×2 block-merge reshape (the      |
@@ -28,10 +34,15 @@
 //! |          |   spatial 2×2 merge reshape, main projector (`mm.0/mm.2`), final         |
 //! |          |   feature-dim concat producing `[n_image_tokens, lm_hidden*(1+N_dst)]`   |
 //! |          |   (Rust row-major; ggml-side `ne[0]=lm_hidden*(1+N_dst), ne[1]=tokens`)  |
-//! | 4c.5     | LM-side hooks in `Qwen35Model::forward_gpu_*_with_soft_tokens` to split  |
-//! |          |   the augmented embedding and inject chunk `(il+1)` at LM layer `il <    |
-//! |          |   N_deepstack` (post-FFN-residual `cur += ds`); flips                    |
-//! |          |   `ProjectorType::Qwen3VlMerger.is_supported()` to `true`                |
+//! | 4c.5     | LANDED — LM-side hooks via                                              |
+//! |          |   `Qwen35Model::forward_gpu_last_logits_with_soft_tokens_and_deepstack`  |
+//! |          |   thread `DeepstackInjection { image_token_positions, chunks }`          |
+//! |          |   through the layer loop and dispatch                                    |
+//! |          |   `image_token_residual_add_gpu` at il < n_deepstack. mmproj loader       |
+//! |          |   accepts fused `attn_qkv` via `install_fused_attn_qkv_slice_views`.     |
+//! |          |   Flipped `ProjectorType::Qwen3VlMerger.is_supported()` AND              |
+//! |          |   `ArchProfile::Qwen3VlSiglip.is_supported()` to `true`. Wedge-4d        |
+//! |          |   (handler-side preprocess) is the remaining gap.                        |
 //!
 //! # Architecture reference (production-correct, source-side audited)
 //!
@@ -53,14 +64,12 @@
 //! - `/opt/llama.cpp/tools/mtmd/clip.cpp:3808-3809`
 //!   (`embed_dim_per_image_token = mm_1_b->ne[0] * (1 + n_deepstack_layers)`)
 //!
-//! # Why a stub returns `Err` instead of `unimplemented!()`
+//! # Error handling philosophy
 //!
-//! `unimplemented!()` would panic and abort the serve process if a
-//! future code path inadvertently called it. An `Err` propagates up
-//! through `compute_vision_embeddings_gpu_dispatch` to the chat handler
-//! which converts it to a 500-class JSON error — the user gets a
-//! diagnostic instead of an unrecoverable abort. This matches Wedge-4b's
-//! existing fail-loud arm semantics in `vit_gpu.rs::dispatch`.
+//! Every shape mismatch / tensor-not-found returns `Err` rather than
+//! panicking, so a corrupt mmproj or unexpected pixel input surfaces
+//! as a 500-class JSON error to the user instead of aborting the
+//! serve process. Matches the `vit_gpu.rs::dispatch` convention.
 
 use anyhow::{anyhow, Context, Result};
 
@@ -1149,26 +1158,19 @@ fn apply_qwen3vl_block_forward_gpu(
     // Stage 2: Q/K/V projection + bias add (qwen3vl.cpp:88-104).
     // -----------------------------------------------------------------
     // qwen3vl.cpp:88 uses a single fused `attn_qkv` weight + bias; our
-    // mmproj validator at src/inference/vision/mmproj.rs:701-708 requires
-    // split `attn_q/k/v.{weight,bias}`. The 4c.3 path consumes the split
-    // form; the math is identical (3 individual `[n_pos, hidden]` matmuls
-    // produce the same Q/K/V rows as one fused `[n_pos, 3*hidden]` view).
-    //
-    // ⚠ 4c.5-BLOCKER (per Codex Phase-2b review of fb3d16c, 2026-05-02):
-    // llama.cpp's converter at /opt/llama.cpp/convert_hf_to_gguf.py:5478-5501
-    // FUSES q/k/v into the single ATTN_QKV tensor named `v.blk.%d.attn_qkv.%s`
-    // (per /opt/llama.cpp/tools/mtmd/clip-impl.h:78). When 4c.5 lifts
-    // `is_supported()`, real llama.cpp-produced GGUF fixtures will fail
-    // mmproj.rs validator (it requires split names that won't be present).
-    // Resolution must land in 4c.5's loader-contract work — either:
-    //   (a) extend mmproj.rs validator + block_tensor() to accept fused
-    //       `attn_qkv.{weight,bias}` and produce the split slice views at
-    //       lookup time, OR
-    //   (b) split fused QKV at convert-time so hf2q-produced GGUFs always
-    //       carry split tensors (means every Wedge-4f convert path also
-    //       needs to know about this fork).
-    // (a) is preferred — keeps hf2q runtime compatible with llama.cpp's
-    // canonical converter output. Tracking as a 4c.5 prerequisite.
+    // mmproj validator at src/inference/vision/mmproj.rs accepts EITHER
+    // the fused `attn_qkv.{weight,bias}` (canonical llama.cpp HF
+    // converter output per /opt/llama.cpp/convert_hf_to_gguf.py:4853-4972
+    // → V_ENC_ATTN_QKV per gguf-py/gguf/constants.py:1205) OR the split
+    // `attn_q/k/v.{weight,bias}` (legacy hf2q convert-side form). The
+    // 4c.3 consumer path below requests SPLIT names via `block_tensor`
+    // — the loader at `LoadedMmprojWeights::install_fused_attn_qkv_slice_views`
+    // installs canonical-name slice views over the fused tensor's
+    // backing storage at load time, so this consumer doesn't need to
+    // care which form the producer emitted. The math is identical: 3
+    // individual `[n_pos, hidden]` matmuls produce the same Q/K/V rows
+    // as one fused `[n_pos, 3*hidden]` view sliced into 3 thirds.
+    // (Wedge-4c.5 LANDED 2026-05-02.)
     let q = vit_linear_gpu(
         encoder,
         registry,
@@ -1967,11 +1969,16 @@ fn qwen3vl_concat_augmented_embed_cpu(
 /// layer `cfg.deepstack_indexes[i]` (sorted ascending; i-th LM
 /// injection layer consumes chunk `i+1`).
 ///
-/// `is_supported()` on `ProjectorType::Qwen3VlMerger` STAYS `false`
-/// after 4c.4 — the LM-side post-FFN image_token_residual_add hook
-/// is still missing (4c.5 territory), and flipping the gate now
-/// would route augmented embeddings into an LM that doesn't know
-/// to split them. 4c.5 wires the hook + flips the gate atomically.
+/// `is_supported()` on `ProjectorType::Qwen3VlMerger` is `true` as of
+/// Wedge-4c.5 — the LM-side `image_token_residual_add` GPU dispatch
+/// at `Qwen35Model::forward_gpu_last_logits_with_soft_tokens_and_deepstack`
+/// consumes the augmented embed via the `DeepstackInjection` engine
+/// seam. The handler-side preprocess routing for image-bearing
+/// requests is still Wedge-4d territory (variable-resolution patch
+/// preprocessor + `<|vision_start|><|image_pad|><|vision_end|>` chat
+/// template handling + 3D-mRoPE position synthesis + augmented-embed
+/// split into base-chunk SoftTokenInjection + per-layer
+/// DeepstackInjection chunks).
 ///
 /// # Inputs
 ///
@@ -4255,8 +4262,8 @@ mod tests {
     /// spatial_merge_size))²`.
     ///
     /// Pins:
-    ///   - shape contract for 4c.5 LM-side split
-    ///   - is_supported() STAYS false (4c.5 gate)
+    ///   - shape contract for the LM-side DeepstackInjection split
+    ///   - is_supported() returns true (4c.5 LANDED)
     ///   - every element finite (no kernel NaN/Inf)
     #[test]
     fn qwen3vl_compute_returns_ok_augmented_for_2_block_synthetic() {
@@ -4324,14 +4331,17 @@ mod tests {
         for (i, &v) in out.iter().enumerate() {
             assert!(v.is_finite(), "augmented[{i}] = {v} not finite");
         }
-        // Regression pin: 4c.5 gate `is_supported()` must STAY false
-        // until the LM-side hooks land. 4c.4 builds the augmented
-        // embed; the projector still rejects at validate_tensor_set
-        // until 4c.5 flips this in lockstep with the LM hook.
+        // Regression pin: 4c.5 LANDED gate `is_supported()` returns
+        // true. The LM-side `forward_gpu_last_logits_with_soft_tokens_and_deepstack`
+        // hook + the mmproj loader's fused-attn_qkv slice-view
+        // installer + the validator's fused-or-split acceptance arm
+        // all ship together; flipping this bit is the green-flip
+        // counterpart.
         assert!(
-            !ProjectorType::Qwen3VlMerger.is_supported(),
-            "4c.4 must NOT flip ProjectorType::Qwen3VlMerger.is_supported() — \
-             that's 4c.5 territory (LM-side hooks + projector head)"
+            ProjectorType::Qwen3VlMerger.is_supported(),
+            "4c.5 LANDED: ProjectorType::Qwen3VlMerger.is_supported() must \
+             return true now that the LM-side hook + loader extension + \
+             validator extension are wired"
         );
     }
 
@@ -5178,5 +5188,115 @@ mod tests {
         let bad = vec![vec![1.0f32; 8], vec![1.0f32; 7]];
         let err = qwen3vl_concat_augmented_embed_cpu(&bad, 2, 4).unwrap_err();
         assert!(format!("{err}").contains("length"));
+    }
+
+    // -----------------------------------------------------------------
+    // Wedge-4c.5 — `is_supported()` flip + dispatch routing pins.
+    //
+    // Spec scope item 4 asks for 2+ tests:
+    //   1. `Qwen3VlMerger.is_supported() == true`
+    //   2. dispatch path reaches `compute_vision_embeddings_gpu_qwen3vl`
+    //      when the GGUF declares Qwen3-VL.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn qwen3vl_merger_is_supported_after_wedge_4c5() {
+        // Plain assertion mirroring the regression-guard at
+        // mmproj.rs::tests::projector_supported_for_mlp_and_gemma4v
+        // (which used to assert !is_supported()) now flipped post-Wedge-4c.5.
+        // Pinning here too gives the qwen3vl-specific test file a local
+        // green-flip signal independent of the shared validator test
+        // module.
+        assert!(
+            ProjectorType::Qwen3VlMerger.is_supported(),
+            "Wedge-4c.5 LANDED: ProjectorType::Qwen3VlMerger.is_supported() must return true"
+        );
+        assert!(
+            super::super::mmproj::ArchProfile::Qwen3VlSiglip.is_supported(),
+            "Wedge-4c.5 LANDED: ArchProfile::Qwen3VlSiglip.is_supported() must return true \
+             so the validator + handler-side mmproj.arch.is_supported() check accepts \
+             text-only chat against Qwen3-VL GGUFs"
+        );
+    }
+
+    #[test]
+    fn qwen3vl_dispatch_routes_to_compute_vision_embeddings_gpu_qwen3vl() {
+        // Drive `compute_vision_embeddings_gpu_dispatch` with a
+        // Qwen3VlSiglip arch + a synthetic Qwen3VlSiglip-marked
+        // mmproj_weights tensor map and confirm the call reaches
+        // `compute_vision_embeddings_gpu_qwen3vl` (rather than the
+        // Gemma/SigLIP path). The dispatch entry-point re-derives
+        // `Qwen3VlViTConfig` from `mmproj_cfg` (so the vit_cfg returned
+        // by `synth_qwen3vl_block_cfg` is informational only — what
+        // matters is `mmproj_cfg.deepstack_indexes`). We use the empty
+        // deepstack default because the synthetic weights builder
+        // expects it to match (the dispatch path otherwise complains
+        // about missing v.deepstack.* tensors).
+        use crate::inference::vision::vit_gpu::{
+            compute_vision_embeddings_gpu_dispatch, VisionInput,
+        };
+        let device = mlx_native::MlxDevice::new().expect("MlxDevice");
+        let (vit_cfg, mmproj_cfg) = synth_qwen3vl_block_cfg(2);
+        // Empty deepstack_indexes (default in synth_qwen3vl_block_cfg)
+        // — keeps the synthetic-weights builder consistent with the
+        // dispatch's tensor-set expectations.
+        let weights = build_synth_qwen3vl_weights_with_deepstack(
+            device,
+            vit_cfg.n_layer,
+            vit_cfg.n_embd,
+            vit_cfg.intermediate_size,
+            (vit_cfg.num_position_embeddings as f64).sqrt() as u32,
+            1.0,
+            0.0,
+            0.1,
+            0.1,
+            vit_cfg.patch_size,
+            &vit_cfg.deepstack_indexes,
+            vit_cfg.out_hidden_size,
+        );
+        let _ = VisionInput::Siglip49; // make `VisionInput` import non-dead
+        let inputs = synth_zero_pixel_inputs(mmproj_cfg.image_size);
+
+        let result = compute_vision_embeddings_gpu_dispatch(
+            &inputs,
+            super::super::mmproj::ArchProfile::Qwen3VlSiglip,
+            &weights,
+            &mmproj_cfg,
+            1.0, // scale — Qwen3-VL forward ignores this; pre-set for the
+                 // arch arms that consume it (Gemma4v passes its own scale).
+        );
+        match result {
+            Ok(out) => {
+                // Routed correctly: returned the augmented embed.
+                assert_eq!(out.len(), 1, "single image → single output");
+                let n_pos_merged = (mmproj_cfg.image_size as usize
+                    / mmproj_cfg.patch_size as usize)
+                    .pow(2);
+                let merge_factor = (vit_cfg.spatial_merge_size as usize).pow(2);
+                let n_image_tokens = n_pos_merged / merge_factor;
+                // augmented_embed_dim with empty deepstack = out_hidden_size.
+                let expected_len = n_image_tokens * (vit_cfg.out_hidden_size as usize);
+                assert_eq!(
+                    out[0].len(),
+                    expected_len,
+                    "dispatch routing must produce the augmented [n_image_tokens, \
+                     augmented_embed_dim] shape per the Qwen3-VL contract \
+                     (synthetic empty-deepstack fixture, so augmented_embed_dim = \
+                     out_hidden_size)"
+                );
+            }
+            Err(e) => {
+                // If the synthetic fixture happens to fail an internal
+                // shape check, the error message must come from the
+                // qwen3vl module, NOT the gemma/siglip path. This
+                // proves dispatch routed correctly.
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("qwen3vl") || msg.contains("Qwen3VlSiglip"),
+                    "dispatch must route Qwen3VlSiglip to the qwen3vl module; \
+                     got error from a non-qwen3vl path: {msg}"
+                );
+            }
+        }
     }
 }
