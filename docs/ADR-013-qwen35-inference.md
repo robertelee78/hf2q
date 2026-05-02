@@ -3075,3 +3075,39 @@ The hf2q caller used the prefill kernel for prefill paths. **The decode-named ke
 **Receipts**: commits c3f35d4, 1ecfa7b, 2ee0ffc, 9cfca06, 0847f56. Bench logs `/tmp/{s4,long2,sw}-*.{out,log}`. Profile receipts `/tmp/s4-prof.log`, `/tmp/post-s2c-gpu.log`. ADR-013 progress entries from this session at "2026-05-01 (deep-night)" and "2026-05-01 (deeper-night)".
 
 **Next (open):** close the pp80 prefill gap (0.52× → 1.0×). Bottleneck: `layer.moe_ffn` Q4_K mm_id MoE matmul at 1862µs avg × 40 layers = 74.5ms / 73.9% of GPU work. ADR-015 territory — likely needs faster Q4_K mm_id kernel implementation or wrapper-overhead reduction (per W-5b.22/23 audit findings).
+
+### 2026-05-02 (early-morning) — P21 canonical p17b receipt — prefill 0.49–0.63×, decode 1.05–1.07×
+
+**Canonical 3-cold-process matrix at hf2q `04aea0e`, mlx-native `ac4628b`:**
+
+| pp | tg | hf2q (t/s) | llama-cli (t/s) | llama-bench (t/s) | hf2q/llama-cli | hf2q/llama-bench | sync |
+|---|---|---|---|---|---|---|---|
+| 31  | 64  | 318.30 | 653.34 | 674.85 | 0.49× | 0.47× | 6 |
+| 31  | 200 | 346.80 | 651.21 | 674.85 | 0.53× | 0.51× | 6 |
+| 101 | 64  | 465.30 | 846.83 | 1605.83 | 0.55× | 0.29× | 6 |
+| 101 | 200 | 468.60 | 847.23 | 1605.83 | 0.55× | 0.29× | 6 |
+| 512 | 64  | 1029.90 | 1623.43 | 2340.99 | 0.63× | 0.44× | 6 |
+| 512 | 200 | 828.70  | 1621.43 | 2340.99 | 0.51× | 0.35× | 6 |
+
+**Decode (tg) — at peer parity ✓:**
+
+| pp | tg | hf2q | llama-cli | hf2q/llama-cli |
+|---|---|---|---|---|
+| 31 | 64 | 124.00 | 115.77 | **1.07×** |
+| 101 | 64 | 123.00 | 116.75 | **1.05×** |
+| 512 | 64 | 123.00 | 115.89 | **1.06×** |
+
+**Coherence ascii_ratio: 1.000** across all cells.
+
+**Cumulative ADR-013 P21 trajectory (single session):**
+- pre-P21 baseline (pp101, K=1): 199 t/s prefill, 105 t/s decode, 161 syncs
+- post-Stage-4 canonical (pp101, K=8): **465 t/s prefill (2.34× speedup), 123 t/s decode (1.17×), 6 syncs (96% reduction)**
+- vs llama-completion peer parity:
+  - prefill ratio (pp101): 0.18× → **0.55×** (3.0× closer to parity)
+  - decode parity: 1.05–1.07× **CONFIRMED at canonical bench**
+- vs llama-bench (synthetic prefill, no kv warmup):
+  - 0.29× at pp101 — llama-bench's pre-tile-warmup advantage on synthetic shapes is real
+
+**Remaining gap is in `layer.moe_ffn` Q4_K mm_id MoE matmul kernel** — at pp80 the MoE FFN is 73-76% of GPU work post-Stage-4 (1135-1862µs/call × 40 calls). hf2q ports llama's `kernel_mul_mm_id_q4_K_f32` template + adds an M3+ tensor variant that's measurably faster (638 vs 520 t/s default-A/B). Per-CB GPU time deltas vs llama at the kernel level are still 1.5-2× — open ADR-015 work for the kernel-level audit.
+
+**Receipts**: `/tmp/p17b_q4k_bench/p17b_summary.md`, also archived at `docs/research/p17b-final-2026-05-02.md`. Bench logs `/tmp/p17b_q4k_bench/`.

@@ -1,0 +1,22 @@
+# ADR-005 Phase 2b — pinned Python deps for the MTEB sanity harness.
+#
+# Update protocol:
+#   1. Bump the version below.
+#   2. Re-run the live harness against the new mteb release.
+#   3. If task primary-metric keys shifted, update
+#      `tests/fixtures/mteb/runner.py::_PRIMARY_METRIC_KEYS` and
+#      `_extract_primary_from_scores_blob` together.
+#   4. Re-pin `tests/fixtures/mteb/expected_scores.json` from the
+#      MTEB leaderboard rendered against this version of mteb.
+#
+# Range rationale: 1.12+ introduced the TaskResult/.scores shape the
+# runner targets first; we cap at <2.0 so a future major bump doesn't
+# silently break the parser. The runner also handles the older 1.x
+# dict-of-dicts shape as a fallback so an operator running an older
+# mteb still gets a useful result instead of an opaque crash.
+mteb>=1.12.0,<2.0.0
+
+# numpy + requests are explicit (mteb declares them transitively, but
+# pinning the floor keeps the harness reproducible).
+numpy>=1.24
+requests>=2.28

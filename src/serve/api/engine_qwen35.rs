@@ -872,6 +872,204 @@ pub fn generate_qwen35_once(
     })
 }
 
+/// ADR-005 Phase 4 Wedge-4a (2026-05-01): vision-aware non-streaming
+/// chat generation against a loaded Qwen3.5/3.6 model.  Replaces the
+/// `worker_run` 501 arm for `Request::GenerateWithSoftTokens` (the last
+/// `qwen35_not_implemented_err()` call site at
+/// `crate::serve::api::engine::worker_run`).
+///
+/// Identical to `generate_qwen35_once` except:
+///   * Prefill goes through `Qwen35Model::forward_gpu_last_logits_with_soft_tokens`
+///     so per-position embedding overrides apply (image-token positions
+///     consume the supplied projector outputs instead of the language-
+///     model embedding table).
+///   * The prompt-cache fast-path is BYPASSED.  The cache is keyed on
+///     `prompt_tokens` only; a vision-augmented request with the same
+///     placeholder ids but different image content would falsely hit a
+///     cached text-only result.  Wedge-4 follow-up may extend the cache
+///     key to include a hash of the soft-token bytes; for the Wedge-4a
+///     opener we take the safe path and skip cache entirely when
+///     `soft_tokens` is non-empty.
+///   * Decode steps after the prefill use the standard text path
+///     (`forward_gpu_greedy` / `forward_gpu_last_logits`) — soft-token
+///     overrides only apply during prefill.  Decode positions are
+///     post-prompt by construction so they cannot lie within a
+///     soft-token range.
+///
+/// **Wedge-4a scope.** Wires the API for vision-on-Qwen3.5/3.6 without
+/// adding a vision encoder.  Wedge-4b lands the qwen3vl ViT +
+/// qwen3vl_merger projector + DeepStack taps so end-to-end multimodal
+/// chat works against `Qwen/Qwen3-VL-8B-Instruct-GGUF`.
+///
+/// When `soft_tokens` is empty, behaviour is byte-identical to
+/// `generate_qwen35_once`.
+pub fn generate_qwen35_once_with_soft_tokens(
+    qwen: &mut Qwen35LoadedModel,
+    prompt_tokens: &[u32],
+    soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
+    params: &SamplingParams,
+    registration: Option<&ModelRegistration>,
+) -> Result<GenerationResult> {
+    // Empty slice → identity over `generate_qwen35_once`.  This keeps
+    // text-only fallback paths from paying any soft-token overhead
+    // when (e.g.) a future caller threads an empty vec through the
+    // engine `Request::GenerateWithSoftTokens` arm.
+    if soft_tokens.is_empty() {
+        return generate_qwen35_once(qwen, prompt_tokens, params, registration);
+    }
+
+    anyhow::ensure!(
+        !prompt_tokens.is_empty(),
+        "generate_qwen35_once_with_soft_tokens: empty prompt_tokens"
+    );
+    let prompt_len = prompt_tokens.len();
+    let max_tokens = params.max_tokens.max(1);
+    let is_greedy = is_greedy_eligible(params);
+
+    let device = MlxDevice::new()
+        .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 generate w/ soft tokens): {e}"))?;
+    let mut kv_cache = alloc_kv_cache_for_request(qwen, &device, prompt_len, max_tokens)?;
+
+    // Prompt-cache is intentionally NOT consulted on the vision path
+    // (see docstring above for the cache-key safety rationale).
+    let prefill_start = Instant::now();
+    let positions = prefill_positions_for(prompt_len);
+    let prefill_logits = qwen
+        .model
+        .forward_gpu_last_logits_with_soft_tokens(
+            prompt_tokens,
+            &positions,
+            soft_tokens,
+            &mut kv_cache,
+        )
+        .context("Qwen35Model::forward_gpu_last_logits_with_soft_tokens (prefill)")?;
+    anyhow::ensure!(
+        prefill_logits.len() == qwen.vocab_size,
+        "qwen35 prefill (soft tokens) logits len {} != vocab_size {}",
+        prefill_logits.len(),
+        qwen.vocab_size
+    );
+    let mut next_token: u32 = if is_greedy {
+        greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32)
+    } else {
+        let mut logits = prefill_logits.clone();
+        sample_logits_qwen35(&mut logits, params, &[])
+    };
+    let prefill_duration = prefill_start.elapsed();
+
+    // Decode loop — identical to `generate_qwen35_once`.  Decode
+    // positions are post-prompt by construction (>= prompt_len) and so
+    // cannot lie within any soft-token range, so the decode path
+    // deliberately uses the soft-token-FREE forward methods.
+    let decode_start = Instant::now();
+    let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
+    generated_tokens.push(next_token);
+
+    let first_fragment = qwen
+        .tokenizer
+        .decode(&[next_token], false)
+        .unwrap_or_default();
+    let mut decoded_text = first_fragment.clone();
+
+    let mut finish_reason: &'static str = "length";
+
+    if qwen.eos_token_ids.contains(&next_token) {
+        finish_reason = "stop";
+    } else if qwen35_hit_stop_string(&decoded_text, &params.stop_strings) {
+        finish_reason = "stop";
+        qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+    } else {
+        for step in 1..max_tokens {
+            let pos = (prompt_len + step - 1) as i32;
+            if pos as u32 >= kv_cache.max_seq_len {
+                tracing::warn!(
+                    pos,
+                    max_seq = kv_cache.max_seq_len,
+                    "qwen35 decode (soft tokens): hit kv-cache bound; stopping with finish=length",
+                );
+                break;
+            }
+            let decode_positions = vec![pos; 4];
+
+            next_token = if is_greedy {
+                qwen.model
+                    .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache)
+                    .with_context(|| {
+                        format!("forward_gpu_greedy decode step {step} (soft tokens)")
+                    })?
+            } else {
+                let logits_full = qwen
+                    .model
+                    .forward_gpu_last_logits(&[next_token], &decode_positions, &mut kv_cache)
+                    .with_context(|| {
+                        format!("forward_gpu_last_logits decode step {step} (soft tokens)")
+                    })?;
+                let mut logits = logits_full;
+                sample_logits_qwen35(&mut logits, params, &generated_tokens)
+            };
+
+            if qwen.eos_token_ids.contains(&next_token) {
+                finish_reason = "stop";
+                break;
+            }
+            generated_tokens.push(next_token);
+            let fragment = qwen
+                .tokenizer
+                .decode(&[next_token], false)
+                .unwrap_or_default();
+            decoded_text.push_str(&fragment);
+            if qwen35_hit_stop_string(&decoded_text, &params.stop_strings) {
+                finish_reason = "stop";
+                qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+                break;
+            }
+        }
+    }
+    let decode_duration = decode_start.elapsed();
+
+    // Reasoning split — same registry helper as generate_qwen35_once.
+    let (content, reasoning_text) = match registration {
+        Some(reg) if reg.has_reasoning() => super::registry::split_full_output(reg, &decoded_text),
+        _ => (decoded_text, None),
+    };
+
+    let reasoning_token_count = match registration {
+        Some(reg) if reg.has_reasoning() => {
+            let mut sp = ReasoningSplitter::from_registration(reg);
+            let mut count = 0usize;
+            for &tok in &generated_tokens {
+                let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
+                if let Some(splitter) = sp.as_mut() {
+                    let _ = splitter.feed(&frag);
+                    if splitter.in_reasoning() {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        }
+        _ => 0,
+    };
+
+    Ok(GenerationResult {
+        text: content,
+        reasoning_text,
+        prompt_tokens: prompt_len,
+        completion_tokens: generated_tokens.len(),
+        reasoning_tokens: if reasoning_token_count > 0 {
+            Some(reasoning_token_count)
+        } else {
+            None
+        },
+        finish_reason,
+        prefill_duration,
+        decode_duration,
+        // No prompt-cache fast-path on the soft-tokens path; cached
+        // tokens count is always 0 for vision-augmented requests.
+        cached_tokens: 0,
+    })
+}
+
 /// Wedge-3 / Phase D: streaming chat generation against a loaded
 /// Qwen3.5/3.6 model.  Replaces the `worker_run` 501 arm for
 /// `Request::GenerateStream`.

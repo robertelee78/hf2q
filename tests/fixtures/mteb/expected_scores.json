@@ -1,0 +1,33 @@
+{
+  "_source": "MTEB leaderboard snapshot 2026-05-01 (Worker Z design report values for bge-small-en-v1.5; nomic + mxbai pending re-pin)",
+  "_re_pin_policy": "Drift = re-pin via PR. Per-cell floor: |measured - expected| <= 1.0 (AC line 3979). Numbers MUST come from the published HuggingFace MTEB leaderboard at https://huggingface.co/spaces/mteb/leaderboard for the exact (model, task) pair; do NOT compute them locally.",
+  "_metric_per_task": {
+    "BIOSSES": "Spearman cosine correlation x100 (STS)",
+    "Banking77Classification": "Accuracy x100 (Classification)",
+    "NFCorpus": "nDCG@10 x100 (Retrieval, BEIR)",
+    "TwentyNewsgroupsClustering": "V-measure x100 (Clustering)",
+    "SciDocsRR": "MAP x100 (Reranking)"
+  },
+  "_todo_pin_nomic_and_mxbai": "Worker AB (2026-05-01) left nomic-ai/nomic-embed-text-v1.5 and mixedbread-ai/mxbai-embed-large-v1 cells as null because the design report only quoted bge values; a follow-up PR must source the leaderboard values for both models on the same 5 tasks before the live matrix can close. Until then the harness skips those cells with WARN(no-baseline) and only PASSES on a fully-pinned bge row.",
+  "BAAI/bge-small-en-v1.5": {
+    "BIOSSES": 87.4,
+    "Banking77Classification": 84.4,
+    "NFCorpus": 31.0,
+    "TwentyNewsgroupsClustering": 47.6,
+    "SciDocsRR": 81.0
+  },
+  "nomic-ai/nomic-embed-text-v1.5": {
+    "BIOSSES": null,
+    "Banking77Classification": null,
+    "NFCorpus": null,
+    "TwentyNewsgroupsClustering": null,
+    "SciDocsRR": null
+  },
+  "mixedbread-ai/mxbai-embed-large-v1": {
+    "BIOSSES": null,
+    "Banking77Classification": null,
+    "NFCorpus": null,
+    "TwentyNewsgroupsClustering": null,
+    "SciDocsRR": null
+  }
+}
