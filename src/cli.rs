@@ -532,27 +532,31 @@ pub struct GenerateArgs {
     /// the end of the rendered prompt — the model emits reasoning content
     /// + `</think>` + the answer (the "both" outcome).
     ///
-    /// **Default behavior (NEITHER flag set) is auto-detect** from the
-    /// GGUF's `general.name` metadata:
+    /// **Default behavior (NEITHER flag set) is auto-detect via the
+    /// canonical render-and-diff signal**: hf2q renders the resolved chat
+    /// template TWICE — once with `enable_thinking=true`, once with
+    /// `=false` — and checks if the bytes differ. If they do, the
+    /// template branches on the variable → the model class supports
+    /// thinking-mode → default-on (model produces BOTH reasoning trace
+    /// AND answer). If the bytes are identical (or no template can be
+    /// resolved), default is `false` (safe fallback).
     ///
-    ///   * Names containing `thinking` / `qwq` / `reasoning` / `-o1-`
-    ///     (case-insensitive) → `enable_thinking=true` (model gets BOTH
-    ///     reasoning + answer rendered)
-    ///   * All other names → `enable_thinking=false` (model is cued
-    ///     directly into the answer via a pre-closed `<think>\n\n</think>\n\n`
-    ///     block; the regression-safe default for non-thinking Qwen-arch
-    ///     checkpoints that improvise Phi-3-style `<|end|>` close markers)
+    /// Mirrors llama.cpp's `--reasoning auto` decision logic at
+    /// `/opt/llama.cpp/common/chat-diff-analyzer.cpp:319-401` (the
+    /// `compare_thinking_enabled` function) and the user-facing decision
+    /// at `/opt/llama.cpp/tools/server/server-context.cpp:1050`.
     ///
     /// Pass `--enable-thinking` to override auto-detect ON (e.g. a custom
-    /// thinking-capable checkpoint whose name doesn't match the heuristic).
-    /// Pass `--no-thinking` to override auto-detect OFF (e.g. a hybrid
-    /// model that LOOKS thinking-capable by name but actually breaks).
-    /// Mutually exclusive.
+    /// template that doesn't probe as thinking-capable but you know the
+    /// model supports it). Pass `--no-thinking` to override auto-detect
+    /// OFF (e.g. a template that probes as thinking-capable but the
+    /// model's actual checkpoint doesn't know how to close `</think>`,
+    /// improvising `<|end|>` instead). Mutually exclusive.
     ///
     /// 2026-05-02: added (commit `8c110f5`, plumb-only) → re-defaulted to
-    /// false (regression-fix iter 2) → upgraded to name-based auto-detect
-    /// (regression-fix iter 3, "we want both"). Substring heuristic mirrors
-    /// llama.cpp's `--reasoning auto` precedent. H2 audit:
+    /// false (regression-fix iter 2) → name-substring heuristic (REJECTED
+    /// by user) → render-and-diff canonical signal (peer audit:
+    /// `/tmp/cfa-thinking-detect/peer-detection-report.md`). H2 audit:
     /// `docs/research/decode-test-gap-2026-05-02.md`.
     #[arg(long)]
     pub enable_thinking: bool,

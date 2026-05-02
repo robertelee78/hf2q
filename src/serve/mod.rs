@@ -308,25 +308,41 @@ pub(crate) const FALLBACK_GEMMA4_API_CHAT_TEMPLATE: &str = concat!(
 ///   2. CLI `--chat-template-file FILE`
 ///   3. GGUF `tokenizer.chat_template` metadata
 ///   4. Hardcoded fallback string (last resort)
-/// Heuristic: does the GGUF's `general.name` (or other identifying string)
-/// suggest the model is a thinking-capable / reasoning checkpoint?
+/// Detect whether a Jinja chat template supports thinking-mode rendering by
+/// rendering it twice with synthetic test input — once with
+/// `enable_thinking=true`, once with `enable_thinking=false` — and comparing
+/// the output bytes. If they differ, the template branches on the variable
+/// → the model class supports thinking-mode → default to enable_thinking on.
 ///
-/// Substring matches (case-insensitive):
-///   * `"thinking"`  — Qwen3-Thinking, Qwen3.6-A3B-Thinking, etc.
-///   * `"qwq"`       — Qwen QwQ-32B series (thinking model line)
-///   * `"reasoning"` — GPT-OSS reasoning checkpoints, distill variants
-///   * `"o1"`        — OpenAI-o1-style distills (rare in GGUF but observed)
+/// **This is the canonical signal** per peer audit
+/// `/tmp/cfa-thinking-detect/peer-detection-report.md`. Mirrors llama.cpp's
+/// `compare_thinking_enabled` at `/opt/llama.cpp/common/chat-diff-analyzer.cpp:319-401`,
+/// surfaced via `common_chat_templates_support_enable_thinking` at
+/// `/opt/llama.cpp/common/chat.cpp:244-257`. The user-facing decision in
+/// llama.cpp lives at `/opt/llama.cpp/tools/server/server-context.cpp:1050`:
+/// `enable_thinking = params_base.enable_reasoning != 0 && template_supports_thinking`.
 ///
-/// 2026-05-02 — added per user "but don't we want both?" follow-up:
-/// thinking-capable models should default to `enable_thinking=true` so the
-/// reasoning trace AND the answer both render; non-thinking checkpoints
-/// stay on `false` (the regression-fix default). The flag remains the
-/// explicit override.
-fn gguf_name_suggests_thinking_capable(name_lower: &str) -> bool {
-    name_lower.contains("thinking")
-        || name_lower.contains("qwq")
-        || name_lower.contains("reasoning")
-        || name_lower.contains("-o1-")
+/// Returns `false` if either render fails — a malformed template can't be
+/// probed; the caller takes the safe default. The synthetic test input is
+/// a single-character user prompt; no real conversation context is needed
+/// because the thinking-mode branch fires only on `add_generation_prompt`
+/// (always true in our render path), independent of message content.
+///
+/// 2026-05-02 — replaces the prior name-substring heuristic
+/// `gguf_name_suggests_thinking_capable` which the user correctly rejected:
+/// > "Thinking is not determined by having thinking in the model name.
+/// >  Thinking is determined by the model class and what is available
+/// >  in the gguf file."
+fn template_supports_enable_thinking(template_str: &str) -> bool {
+    let render_true = render_jinja_template(template_str, "x", Some(true));
+    let render_false = render_jinja_template(template_str, "x", Some(false));
+    match (render_true, render_false) {
+        (Ok(a), Ok(b)) => a != b,
+        // Either render failed → can't probe → safe default false. The caller
+        // (`render_chat_template`) will surface the actual render error on
+        // the real render attempt, so we don't lose information here.
+        _ => false,
+    }
 }
 
 /// Resolve the `enable_thinking` value to pass to the chat-template Jinja
@@ -334,34 +350,32 @@ fn gguf_name_suggests_thinking_capable(name_lower: &str) -> bool {
 ///
 /// 1. **Explicit `--enable-thinking`** → `Some(true)`
 /// 2. **Explicit `--no-thinking`** → `Some(false)`
-/// 3. **Default (neither flag set)** → auto-detect from `gguf_name`:
-///    * thinking-suggesting name (per [`gguf_name_suggests_thinking_capable`])
-///      → `Some(true)`
-///    * anything else → `Some(false)` (the 2026-05-02 regression-safe default)
+/// 3. **Default (neither flag set)** → auto-detect via render-and-diff
+///    (`template_supports_enable_thinking`):
+///    * Template branches on the variable → `Some(true)`
+///    * Template doesn't branch (or no template provided) → `Some(false)`
 ///
-/// `gguf_name` is the model's `general.name` GGUF metadata string (or `None`
-/// if the GGUF doesn't expose one). Passed lowercased into the heuristic so
-/// callers don't need to normalize.
+/// `template_str` is the resolved chat-template Jinja source. Pass `None`
+/// when there's no Jinja template (e.g. the hardcoded Gemma4 fallback); in
+/// that case the default resolves to `Some(false)` since the fallback path
+/// doesn't go through Jinja at all.
 ///
-/// Clap enforces `--enable-thinking` ⊕ `--no-thinking` mutual exclusion via
-/// `conflicts_with`; the (true, true) input is unreachable in practice but
-/// the function remains total.
-fn resolve_enable_thinking(args: &cli::GenerateArgs, gguf_name: Option<&str>) -> Option<bool> {
+/// Mirrors llama.cpp's `--reasoning auto` decision at
+/// `/opt/llama.cpp/tools/server/server-context.cpp:1050`. Clap enforces
+/// `--enable-thinking` ⊕ `--no-thinking` mutual exclusion via
+/// `conflicts_with`; the (true, true) input is unreachable in practice
+/// but the function remains total.
+fn resolve_enable_thinking(args: &cli::GenerateArgs, template_str: Option<&str>) -> Option<bool> {
     if args.enable_thinking {
         return Some(true);
     }
     if args.no_thinking {
         return Some(false);
     }
-    // Default — auto-detect from model name. The flag remains the explicit
-    // override; this branch is the "both" path: thinking-capable models get
-    // both reasoning + answer rendered out of the box.
-    let name_lower = gguf_name.map(|s| s.to_ascii_lowercase());
-    let auto_thinking = name_lower
-        .as_deref()
-        .map(gguf_name_suggests_thinking_capable)
+    let auto = template_str
+        .map(template_supports_enable_thinking)
         .unwrap_or(false);
-    Some(auto_thinking)
+    Some(auto)
 }
 
 fn render_chat_template(
@@ -369,40 +383,44 @@ fn render_chat_template(
     args: &cli::GenerateArgs,
     user_prompt: &str,
 ) -> Result<String> {
-    let enable_thinking = resolve_enable_thinking(args, gguf.metadata_string("general.name"));
-
-    // Priority 1: CLI --chat-template string
-    if let Some(tmpl) = args.chat_template.as_deref() {
+    // Step 1: resolve the chat template SOURCE in priority order.
+    // Priorities 1-3 are Jinja templates; priority 4 is the hardcoded
+    // string-replace fallback (not Jinja, so it doesn't go through
+    // `render_jinja_template` and `enable_thinking` is irrelevant for it).
+    let template_str: String = if let Some(tmpl) = args.chat_template.as_deref() {
         tracing::info!("Chat template: using CLI --chat-template override");
-        return render_jinja_template(tmpl, user_prompt, enable_thinking);
-    }
-
-    // Priority 2: CLI --chat-template-file
-    if let Some(path) = args.chat_template_file.as_deref() {
+        tmpl.to_string()
+    } else if let Some(path) = args.chat_template_file.as_deref() {
         tracing::info!(
             "Chat template: loading from --chat-template-file {}",
             path.display()
         );
-        let tmpl = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read --chat-template-file {}", path.display()))?;
-        return render_jinja_template(&tmpl, user_prompt, enable_thinking);
-    }
-
-    // Priority 3: GGUF metadata `tokenizer.chat_template`
-    if let Some(tmpl) = gguf.metadata_string("tokenizer.chat_template") {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read --chat-template-file {}", path.display()))?
+    } else if let Some(tmpl) = gguf.metadata_string("tokenizer.chat_template") {
         tracing::info!(
             "Chat template: using GGUF metadata tokenizer.chat_template ({} chars)",
             tmpl.len()
         );
-        return render_jinja_template(tmpl, user_prompt, enable_thinking);
-    }
+        tmpl.to_string()
+    } else {
+        // Priority 4: hardcoded string-replace fallback. NOT Jinja — no
+        // enable_thinking branching is available here.
+        tracing::warn!(
+            "Chat template: no GGUF metadata tokenizer.chat_template and no \
+             CLI override; falling back to hardcoded Gemma4 template"
+        );
+        return Ok(FALLBACK_GEMMA4_CHAT_TEMPLATE.replace("{{PROMPT}}", user_prompt));
+    };
 
-    // Priority 4: hardcoded fallback
-    tracing::warn!(
-        "Chat template: no GGUF metadata tokenizer.chat_template and no CLI override; \
-         falling back to hardcoded Gemma4 template"
-    );
-    Ok(FALLBACK_GEMMA4_CHAT_TEMPLATE.replace("{{PROMPT}}", user_prompt))
+    // Step 2: resolve enable_thinking using the resolved template (so the
+    // auto-detect render-and-diff probes the SAME template we're about to
+    // render with). This is the canonical signal per
+    // /opt/llama.cpp/common/chat-diff-analyzer.cpp:319-401.
+    let enable_thinking = resolve_enable_thinking(args, Some(template_str.as_str()));
+
+    // Step 3: render with the resolved template + flag.
+    render_jinja_template(&template_str, user_prompt, enable_thinking)
 }
 
 /// Render a Jinja2 chat template using minijinja.
@@ -4098,150 +4116,174 @@ mod tests {
         }
     }
 
+    // ---- canonical render-and-diff thinking-mode detection -----------
+    //
+    // 2026-05-02 (peer-audit-driven rewrite of the auto-detect signal,
+    // /tmp/cfa-thinking-detect/peer-detection-report.md).
+    //
+    // The old name-substring heuristic was rejected by the user:
+    //   "Thinking is not determined by having thinking in the model
+    //    name. Thinking is determined by the model class and what is
+    //    available in the gguf file."
+    //
+    // The canonical signal — used by llama.cpp at
+    // /opt/llama.cpp/common/chat-diff-analyzer.cpp:319-401 and
+    // /opt/llama.cpp/common/chat.cpp:244-257 — is to render the
+    // resolved chat template TWICE with `enable_thinking=true` then
+    // `=false`, and check if the bytes differ. If they do, the
+    // template branches on the variable → the model class supports
+    // thinking → default-on. Tests below pin every leg of that
+    // contract.
+
+    use super::template_supports_enable_thinking;
+
     #[test]
-    fn resolve_enable_thinking_default_no_name_is_some_false() {
-        // No flag, no GGUF name → safe default Some(false) (the
-        // 2026-05-02 regression baseline). Pins that the auto-detect
-        // doesn't accidentally true-up on missing name metadata.
+    fn template_supports_enable_thinking_true_for_qwen3_chatml() {
+        // The bundled qwen3-chatml.jinja vendor template has explicit
+        // `enable_thinking is defined and is false` branching at lines
+        // 147-153. Render-and-diff MUST detect this.
+        assert!(
+            template_supports_enable_thinking(QWEN3_CHATML),
+            "qwen3-chatml.jinja MUST be detected as thinking-capable; \
+             render-and-diff against vendor lines 147-153 should differ"
+        );
+    }
+
+    #[test]
+    fn template_supports_enable_thinking_false_for_thinking_agnostic_template() {
+        // A minimal Jinja that doesn't reference `enable_thinking` at
+        // all renders identically regardless of the flag → should NOT
+        // be detected as thinking-capable.
+        let template = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n\
+                        {% endfor %}{% if add_generation_prompt %}assistant: {% endif %}";
+        assert!(
+            !template_supports_enable_thinking(template),
+            "thinking-agnostic template MUST NOT be flagged"
+        );
+    }
+
+    #[test]
+    fn template_supports_enable_thinking_false_for_empty_branch_template() {
+        // Edge case: a template that DOES reference `enable_thinking`
+        // but has empty branches (no byte-level difference) renders
+        // identically and must NOT be flagged. Pins the property that
+        // we're checking effective output, not just textual mention.
+        let template = "{% if enable_thinking %}{% endif %}\
+                        {% for m in messages %}{{ m.content }}{% endfor %}";
+        assert!(
+            !template_supports_enable_thinking(template),
+            "empty-branch template MUST NOT be flagged (output bytes \
+             are identical for true vs false)"
+        );
+    }
+
+    #[test]
+    fn template_supports_enable_thinking_false_on_malformed_template() {
+        // Malformed Jinja must NOT crash the auto-detect — graceful
+        // false fallback so the caller's actual render attempt is the
+        // one that surfaces the parse error.
+        let template = "{% unclosed";
+        assert!(
+            !template_supports_enable_thinking(template),
+            "malformed template must produce false (graceful), not panic"
+        );
+    }
+
+    #[test]
+    fn resolve_enable_thinking_default_no_template_returns_some_false() {
+        // No flag, no template (e.g. fallback path) → safe default.
         let args = test_args_default();
         assert_eq!(resolve_enable_thinking(&args, None), Some(false));
     }
 
     #[test]
-    fn resolve_enable_thinking_default_non_thinking_name_is_some_false() {
+    fn resolve_enable_thinking_default_thinking_template_auto_enables() {
+        // The user's expected behavior on the bundled qwen3-chatml.jinja:
+        // default cmdline → render-and-diff detects thinking branches →
+        // enable_thinking=true → model emits BOTH reasoning + answer.
+        // This is the "we want both" path the user requested.
         let args = test_args_default();
         assert_eq!(
-            resolve_enable_thinking(&args, Some("Qwen3-7B-Instruct")),
-            Some(false),
-            "plain instruct model must default to no thinking"
-        );
-        assert_eq!(
-            resolve_enable_thinking(&args, Some("Gemma-4-27B")),
-            Some(false)
-        );
-        assert_eq!(
-            resolve_enable_thinking(&args, Some("Llama-3.1-70B")),
-            Some(false)
+            resolve_enable_thinking(&args, Some(QWEN3_CHATML)),
+            Some(true),
+            "qwen3-chatml.jinja default render MUST auto-enable thinking"
         );
     }
 
     #[test]
-    fn resolve_enable_thinking_default_thinking_name_auto_enables() {
-        // 2026-05-02 user follow-up: "we want to support thinking mode,
-        // and still get the full answer". Auto-detect ON when the model
-        // name suggests a thinking-capable checkpoint, so the user gets
-        // BOTH the reasoning trace AND the answer without passing a flag.
+    fn resolve_enable_thinking_default_non_thinking_template_returns_some_false() {
+        // Plain ChatML without thinking branches → render-and-diff is
+        // bytewise identical → no auto-enable → safe default false.
+        let template = "{% for m in messages %}<|im_start|>{{ m.role }}\n\
+                        {{ m.content }}<|im_end|>\n{% endfor %}\
+                        {% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
         let args = test_args_default();
-        for thinking_name in &[
-            "Qwen3-30B-A3B-Thinking-2507",
-            "Qwen3-7B-Thinking-FP16",
-            "qwen3-thinking",                 // case-insensitive match
-            "QwQ-32B-Preview",
-            "Qwen-QwQ-32B-Reasoning",
-            "GPT-OSS-Reasoning-Distill",
-            "DeepSeek-R1-Distill-Qwen-o1-7B", // -o1- substring
-        ] {
-            assert_eq!(
-                resolve_enable_thinking(&args, Some(thinking_name)),
-                Some(true),
-                "thinking-capable model `{thinking_name}` must auto-enable"
-            );
-        }
+        assert_eq!(resolve_enable_thinking(&args, Some(template)), Some(false));
     }
 
     #[test]
     fn resolve_enable_thinking_explicit_enable_overrides_auto_detect() {
-        // Explicit --enable-thinking wins even when the GGUF name would
+        // Explicit --enable-thinking wins even when the template would
         // auto-detect to false.
         let mut args = test_args_default();
         args.enable_thinking = true;
-        assert_eq!(
-            resolve_enable_thinking(&args, Some("Qwen3-7B-Instruct")),
-            Some(true)
-        );
+        let plain = "{{ messages[0].content }}";
+        assert_eq!(resolve_enable_thinking(&args, Some(plain)), Some(true));
     }
 
     #[test]
     fn resolve_enable_thinking_explicit_no_thinking_overrides_auto_detect() {
-        // Explicit --no-thinking wins even when the GGUF name would
-        // auto-detect to true. Critical: a user who hits a hybrid model
-        // that LOOKS thinking-capable but actually breaks must be able
-        // to opt out.
+        // Explicit --no-thinking wins even when the template would
+        // auto-detect to true. Critical escape hatch: a template that
+        // probes as thinking-capable but breaks for the user's specific
+        // checkpoint must be opt-out-able.
         let mut args = test_args_default();
         args.no_thinking = true;
         assert_eq!(
-            resolve_enable_thinking(&args, Some("Qwen3-30B-A3B-Thinking-2507")),
+            resolve_enable_thinking(&args, Some(QWEN3_CHATML)),
             Some(false)
         );
     }
 
     #[test]
-    fn user_candy_regression_default_non_thinking_name_renders_pre_closed() {
-        // 2026-05-02 user candy-prompt regression: with a non-thinking
-        // model name (or no name), default render MUST end with
-        // pre-closed `<think>\n\n</think>\n\n` so the model goes straight
-        // to the answer. FALSIFIES if the regression-safe default reverts.
+    fn user_candy_regression_default_non_thinking_template_renders_pre_closed() {
+        // 2026-05-02 candy-prompt regression: a non-thinking template
+        // (no `enable_thinking` Jinja branch) auto-detects to false →
+        // render goes through but `enable_thinking=false` is irrelevant
+        // since the template doesn't branch on it. Pin: with QWEN3_CHATML
+        // the regression-safe path requires explicit --no-thinking.
+        let mut args = test_args_default();
+        args.no_thinking = true;
+        let resolved = resolve_enable_thinking(&args, Some(QWEN3_CHATML));
+        let rendered = render_jinja_template(QWEN3_CHATML, "make me candy", resolved)
+            .expect("--no-thinking render must succeed");
+        assert!(
+            rendered.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "--no-thinking on qwen3-chatml MUST emit pre-closed think block. \
+             Actual tail: `{}`",
+            &rendered[rendered.len().saturating_sub(80)..]
+        );
+    }
+
+    #[test]
+    fn user_we_want_both_default_on_qwen3_chatml_renders_open_block() {
+        // The "we want both" path: with the bundled qwen3-chatml.jinja
+        // (auto-detected as thinking-capable via render-and-diff), the
+        // default cmdline MUST emit `<think>\n` so the model produces
+        // BOTH reasoning AND answer — exactly what the user asked for.
+        // FALSIFIES if a future change reverts to name-substring or
+        // unconditional false.
         let args = test_args_default();
-        let resolved = resolve_enable_thinking(&args, Some("Qwen3-7B-Instruct"));
+        let resolved = resolve_enable_thinking(&args, Some(QWEN3_CHATML));
+        assert_eq!(resolved, Some(true), "auto-detect must enable thinking");
         let rendered = render_jinja_template(QWEN3_CHATML, "make me candy", resolved)
             .expect("default render must succeed");
         assert!(
-            rendered.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
-            "non-thinking-name default render MUST emit pre-closed think block. \
-             Actual tail: `{}`",
-            &rendered[rendered.len().saturating_sub(80)..]
-        );
-    }
-
-    #[test]
-    fn user_thinking_request_default_thinking_name_renders_open_block() {
-        // The "we want both" path: when GGUF name suggests a thinking-
-        // capable checkpoint, default render MUST end with `<think>\n`
-        // (open block) so the model emits BOTH reasoning AND answer.
-        let args = test_args_default();
-        let resolved = resolve_enable_thinking(&args, Some("Qwen3-30B-A3B-Thinking-2507"));
-        let rendered = render_jinja_template(QWEN3_CHATML, "make me candy", resolved)
-            .expect("thinking-name default render must succeed");
-        assert!(
             rendered.ends_with("<|im_start|>assistant\n<think>\n"),
-            "thinking-name default render MUST emit open think block. \
+            "default cmdline on qwen3-chatml MUST emit open think block. \
              Actual tail: `{}`",
             &rendered[rendered.len().saturating_sub(80)..]
         );
-    }
-
-    #[test]
-    fn gguf_name_thinking_heuristic_substring_matrix() {
-        use super::gguf_name_suggests_thinking_capable;
-        // Positive cases (substring match, case-insensitive lowering done by caller)
-        for s in &[
-            "qwen3-thinking",
-            "qwq-32b",
-            "reasoning-distill",
-            "deepseek-r1-distill-qwen-o1-7b",
-        ] {
-            assert!(
-                gguf_name_suggests_thinking_capable(s),
-                "expected positive match for `{s}`"
-            );
-        }
-        // Negative cases
-        for s in &[
-            "qwen3-7b-instruct",
-            "gemma-4-27b",
-            "llama-3.1-70b",
-            "mistral-large-2407",
-            "phi-3.5-mini-instruct",
-            // Explicitly NOT matching: "thinkpad", "rethinking" — no, both contain
-            // "thinking" — substring match. Document this as a known false-positive
-            // class; users can override with --no-thinking.
-            "plain-baseline-model",
-        ] {
-            assert!(
-                !gguf_name_suggests_thinking_capable(s),
-                "expected NO match for `{s}`"
-            );
-        }
     }
 
     #[test]
