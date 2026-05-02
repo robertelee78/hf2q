@@ -1514,10 +1514,17 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     // If any of these substrings appear after a decode step, treat as stop.
     // This complements the `eos_token_ids.contains(&next_token)` integer check
     // — covers both cases without a fallback.
+    // 2026-05-02 (follow-up): `<|im_start|>` REMOVED from this list. Qwen3
+    // thinking-style checkpoints emit a literal `<|im_start|>` text fragment
+    // mid-turn during the thinking → answer transition (right after the
+    // `<|end|>` end-of-thinking marker), and stopping there cuts the response
+    // before any actual answer is produced. The original French-Toast leak
+    // sequence (`<|im_end|>...<|im_start|>assistant`) is still caught by the
+    // `<|im_end|>` substring entry below — `<|im_start|>` was redundant
+    // defense for that case and is hostile to thinking-mode output.
     const SPECIAL_TOKEN_STOPS: &[&str] = &[
         "<|im_end|>",
         "<|endoftext|>",
-        "<|im_start|>",  // turn marker — model leaking into next turn = stop here
     ];
 
     for step in 1..args.max_tokens {
