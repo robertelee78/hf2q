@@ -7,7 +7,9 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
-## ▶ Resume Here — current state of truth (2026-05-02 ~17:15Z, **iter84 MEASUREMENT-ONLY: chunk-engaged ceiling localized at iter83's 0.95× ratio. B-1 (upstream-stall propagation) CONFIRMED at S/N=20× via bucket-level IQR analysis (chunk.commit_wait <2ms within-binary IQR vs -41ms cross-binary delta). B-4 differentiation: wall-clock IQR 37ms (T2-excluded) is GPU-thermal noise, but per-bucket IQR is rock-solid <2ms. Methodology lesson: report bucket-level S/N alongside wall S/N. iter85+ pivots to Candidate D — apply iter72 quantile-skew methodology to default-axis autoreg path on pp4123 fixture.** Receipts: `/tmp/cfa-iter84/research/CANDIDATES.md` + `/tmp/cfa-iter84/b4-logs/`)
+## ▶ Resume Here — current state of truth (2026-05-02 ~17:45Z, **iter85 NULL HYPOTHESIS on default-axis. Wrapper-side arena class structurally exhausted on autoreg path under the iter72 methodology — `layer.ffn_dispatch` 125.4× skew is the 4:1 DN:FA layer-mix structural delta, not a single hot kernel. iter71 "diffuse" verdict CONFIRMED with refinement. Q-1 (FaProjectionsArena) UNBLOCKED for iter86 because ADR-013 P21 Stage 2 fence verified LIFTED at `2ee0ffc`. Bench was cleanest of session: 5ms wall IQR / 0.33% noise floor. Default ratio holds at 0.792×; chunk-engaged ratio 0.95×. iter86+ candidates: Q-1 FaProjectionsArena (15-50ms est, fence lifted) / Q-2 mlx-native HALF_MMA_OPT / Q-3 pivot OUT to ADR-013 P14 / ADR-017.** Receipts: `/tmp/cfa-iter85/research/CANDIDATES.md` + `/tmp/cfa-iter85/profile-bench/`)
+
+## ▶ Resume Here — preceding state (2026-05-02 ~17:15Z, **iter84 MEASUREMENT-ONLY: chunk-engaged ceiling localized at iter83's 0.95× ratio. B-1 (upstream-stall propagation) CONFIRMED at S/N=20× via bucket-level IQR analysis (chunk.commit_wait <2ms within-binary IQR vs -41ms cross-binary delta). B-4 differentiation: wall-clock IQR 37ms (T2-excluded) is GPU-thermal noise, but per-bucket IQR is rock-solid <2ms. Methodology lesson: report bucket-level S/N alongside wall S/N. iter85+ pivots to Candidate D — apply iter72 quantile-skew methodology to default-axis autoreg path on pp4123 fixture.** Receipts: `/tmp/cfa-iter84/research/CANDIDATES.md` + `/tmp/cfa-iter84/b4-logs/`)
 
 ## ▶ Resume Here — preceding state (2026-05-02 ~16:30Z, **iter83 SHIPPED: ChunkInternalArena lifts mlx-native-internal chunk-pipeline scratches; chunk-engaged -355ms / -16.1% wall = ratio ~0.95× on chunk-engaged axis (was 0.790×). Default unchanged at 0.792× (chunk path inert on pp4123). 5th SHIPPED win this session refutes iter82 scope-exhaustion declaration: arena lever-class extends one nesting level deeper. Cumulative session: 0.460× → 0.792× default + chunk-engaged 0.547× → ~0.95× = 5 SHIPPED wins (iter72/74/78/83 + iter66a). Loop continues — iter84+ candidates queued at NEXT nesting level + `chunk.commit_wait` -41ms residual + FA-path analog.** Earlier closure framing was premature; arena class is recursive, not flat.)
 
@@ -1796,6 +1798,40 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - Memory pins: `feedback_perf_gate_thermal_methodology`, `feedback_shippability_standing_directive`, `feedback_never_ship_fallback_without_rootcause`, `feedback_no_broken_windows`, `project_metal_compiler_auto_optimizes_static_levers`, `project_end_gate_reality_check`, `feedback_ground_truth_is_what_we_can_measure_now`
 
 ## Changelog
+
+- **2026-05-02 (UTC ~17:45Z) — iter85 NULL HYPOTHESIS on default-axis quantile-skew audit. Wrapper-side arena class confirmed structurally exhausted on default pp4127 autoreg path. Q-1 (FaProjectionsArena) queued for iter86: ADR-013 P21 Stage 2 fence verified LIFTED at commit `2ee0ffc`; Chesterton's fence on prefill projections is decode-pool-specific (bucket-rounded byte_len) not arena-general. Q-2 (mlx-native HALF_MMA_OPT) and Q-3 (pivot out to ADR-013 P14 / ADR-017) banked.**
+
+  **iter85 bench (apex q4_0-flat × pp4127 autoreg-engaged × 5 cold trials × 60s cooldown × pgrep-audited):** wall **1511, 1511, 1507, 1512, 1509 ms — IQR 5 ms = 0.33% noise floor**. Per-bucket cross-trial noise 1.0–2.2%. Profile-bench cleanest measurement of session.
+
+  **Top quantile-skew finding (FALSIFIED as actionable lever):** `layer.ffn_dispatch` p95/p50 = **125.4× skew** — but skew is **structural to the 4:1 DN:FA layer-mix**, not a single hot kernel. DN-FFN runs 3.3 ms/layer (already arena'd by iter72/74); FA-FFN runs 105 ms/layer using the same `build_moe_ffn_layer_gpu_q_into_with_arena` arena code. The 32× per-layer delta lives in **upstream FA-attn 3-commit_labeled chain saturating the Metal serial queue**, not in allocation churn. iter71's "diffuse" framing CONFIRMED with refinement.
+
+  **NULL hypothesis grounding (3-predicate test on each candidate):**
+  | Candidate | #1 quantile-skew | #2 GPU-idle window | #3 fixture engagement | #4 class-size | Verdict |
+  |---|---|---|---|---|---|
+  | gpu_ffn.rs autoreg path | already arena'd by iter72 (verified line 2548-2913) | N/A | PASS | N/A | **EXHAUSTED** |
+  | gpu_delta_net.rs autoreg variant | already arena'd by iter74 DnPrefillArena (verified line 2369-2453) | N/A | PASS | N/A | **EXHAUSTED** |
+  | mlx-native quantized_matmul_id_ggml dispatch_id_mv/dispatch_id_mm_for_test | encoder-only, zero-alloc (verified line 280-755) | N/A | PASS | N/A | **FALSIFIED** (pre-supposed allocs DON'T EXIST) |
+  | layer.ffn_dispatch (highest skew) | 125.4× passes | N/A — upstream-limited | PASS | 70% of wall passes | **STRUCTURAL** (skew is 4:1 mix, not arena-class) |
+
+  No candidate meets all 4 predicates simultaneously. **Methodology lesson: quantile-skew finds OUR allocation tail; it does not find UPSTREAM GPU compute. Class-size threshold #4 is conjunctive with skew threshold #1 — when only one passes, the lever is structural not arena-class.**
+
+  **Queued candidates (NOT in iter85 scope):**
+  1. **Q-1 — FaProjectionsArena** (mirror iter72-pattern lift to `apply_linear_projection_f32` device.alloc_buffer churn at `gpu_full_attn.rs:606` — 4 large + 5 small projections × 10 FA layers, ~800 MiB/prefill). Estimated 30 ms savings (range 15-50 ms). **FENCE STATUS: LIFTED.** ADR-013 P21 Stage 2 committed at `2ee0ffc`; tree clean. Chesterton's fence at gpu_full_attn.rs:756-775 is specific to `decode_pool` bucket-rounding (`byte_len()` inflation breaks `download_f32`), NOT to arena-general — exact-sized FaPrefillArena slots avoid this. **iter86 PRIMARY candidate.**
+  2. **Q-2 — mlx-native HALF_MMA_OPT in `quantized_matmul_id_ggml::dispatch_id_mm`.** The +21pp default gap is mm_id kernel speed per W-5b.22 closure + ADR-013 P21 Stage 4 receipts. Out of hf2q wrapper scope; would require mlx-native kernel work. Estimated +5-10pp closure if successful.
+  3. **Q-3 — pivot OUT of ADR-015** to ADR-013 P14 (speculative decoding) / ADR-017 (KV reuse + PagedAttention) / ADR-005 (prompt caching). Per iter82's original closure direction.
+
+  **STANDING COMPLIANCE.**
+  - `feedback_evidence_first_no_blind_kernel_rewrites` — pre-registered ≥50ms wall + p95/p50 ≥5× + class ≥10% + GPU-idle ≥50% before opening source files; all candidates falsified by code-read evidence + bench evidence.
+  - `feedback_correct_outcomes` — wrapper-side arena exhaustion declared ON DEFAULT-AXIS specifically, not globally; chunk-engaged axis still has iter83's 0.95× and Q-1 is unblocked for iter86.
+  - `feedback_no_shortcuts` — iter85 ran the full 5-trial cold bench despite worker recommending NO_IMPL; bench evidence is the load-bearing finding, not the worker's deferral.
+  - `feedback_metal_compiler_auto_optimizes_static_levers` — quantile-skew methodology refined: skew is necessary but NOT sufficient; class-size threshold #4 is conjunctive.
+
+  **Receipts.**
+  - iter85 candidates: `/tmp/cfa-iter85/research/CANDIDATES.md` (412 lines)
+  - iter85 bench: `/tmp/cfa-iter85/profile-bench/{warmup,T1..T5}.log` + `SUMMARY.txt`
+  - Peer cross-check (orchestrator): llama.cpp `build_moe_ffn` at `/opt/llama.cpp/src/llama-graph.cpp:1517` shows merged `gate_up_exps` path is 1 mul_mat_id; current Qwen3.6 GGUFs store gate + up SEPARATELY (verified via `dump_gguf_types`); BOTH peers do 2 dispatches on these GGUFs — NOT a current peer gap. Defer to ADR-014 (quant/conversion) if pursued.
+
+  Status: ADR-015 default-axis wrapper-side arena class **EXHAUSTED at 0.792× under 3-predicate methodology**. iter86 PRIMARY = Q-1 FaProjectionsArena (fence lifted; threshold lowered to ≥20 ms given default-axis difficulty). Loop continues.
 
 - **2026-05-02 (UTC ~17:15Z) — iter84 MEASUREMENT-ONLY: B-1 CONFIRMED (upstream-stall propagation), B-4 DIFFERENTIATED (wall noisy 37ms IQR, buckets stable <2ms IQR). iter83 chunk.commit_wait -41ms drop is REAL signal (S/N = 20×), not host-wait phenomenon (cap 8.5ms per iter66b). Chunk-engaged axis now ceiling-localized — next code lever requires per-DN-layer arena-warming or MTLResidencySet snapshot (heavy). iter85+ pivots to Candidate D (default-axis quantile-skew audit) per iter72 methodology.**
 
