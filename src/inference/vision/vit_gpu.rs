@@ -2434,6 +2434,24 @@ pub fn compute_vision_embeddings_gpu_dispatch(
                      but arch is ClipClassic — preprocessing/arch mismatch"
                 ));
             }
+            (super::mmproj::ArchProfile::Qwen3VlSiglip, _) => {
+                // iter-224 Wedge-4b: parse path (mmproj header + projector
+                // + DeepStack tensor enumeration) is wired, but the runtime
+                // ViT forward (`compute_vision_embeddings_gpu_qwen3vl`)
+                // lands in Wedge-4c. `ProjectorType::Qwen3VlMerger.is_supported()`
+                // returns false today so a real serve --mmproj startup
+                // rejects this profile before reaching here. The fail-loud
+                // arm below catches the contract regression if a future
+                // change accidentally enables `is_supported()` without
+                // wiring the kernel path.
+                return Err(anyhow!(
+                    "compute_vision_embeddings_gpu_dispatch: input {idx} arch is \
+                     Qwen3VlSiglip — runtime forward not yet implemented (Wedge-4c). \
+                     ProjectorType::Qwen3VlMerger.is_supported() should be returning \
+                     false at startup; reaching this arm means is_supported() flipped \
+                     without the kernel path landing."
+                ));
+            }
             (super::mmproj::ArchProfile::Unknown, _) => unreachable!("guarded above"),
         }
     }
@@ -7226,6 +7244,11 @@ mod tests {
             projector: crate::inference::vision::mmproj::ProjectorType::Mlp,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            // iter-224 Wedge-4b: Qwen3-VL-only fields default to None on
+            // non-Qwen3-VL fixtures (this is a Gemma4v synthetic fixture).
+            spatial_merge_size: None,
+            projection_dim: None,
+            deepstack_indexes: None,
         };
         (weights, cfg, patches, pos_x, pos_y)
     }
