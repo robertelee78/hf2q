@@ -1316,7 +1316,6 @@ pub fn apply_sdpa_with_kv_cache(
     max_seq_len: u32,
     fa_arena: Option<&mut crate::inference::models::qwen35::FaPrefillArena>,
 ) -> Result<MlxBuffer> {
-    let _ = fa_arena;  // TODO(P21-Worker-B): wire into scratch allocations + commit_labeled
     let seq = seq_len as usize;
     let nh = n_heads as usize;
     let nkv = n_kv_heads as usize;
@@ -1456,7 +1455,7 @@ pub fn apply_sdpa_with_kv_cache(
                 device, registry,
                 q_seq_major, k_seq_major, v_seq_major,
                 seq_len, n_heads, n_kv_heads, head_dim,
-                None,
+                fa_arena,
             )?;
             // --- Update current_len cursor (prefill path) ---
             let new_len = kv_seq_len;
