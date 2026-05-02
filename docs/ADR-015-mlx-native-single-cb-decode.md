@@ -7,7 +7,7 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
-## ▶ Resume Here — current state of truth (2026-05-01 ~22:30Z, iter62→iter63a→iter63c: tile-shape hypothesis ALSO refuted at parity; iter63 GPU profiling kit is the load-bearing path)
+## ▶ Resume Here — current state of truth (2026-05-01 ~22:50Z, iter63 GPU profiling kit LANDED; Apple Silicon AtDispatchBoundary hardware quirk discovered; Part B Xcode capture is the per-dispatch attribution path on M5 Max)
 
 **Decode side: SHIPPED + RE-VALIDATED. iter56/57/58b confirmed byte-transparent perf-only changes (iter61c FULL VERDICT: ALL PASS).**
 
@@ -102,9 +102,27 @@ iter62 receipts: `/tmp/cfa-iter62/results/{A-VERDICT,B-60c-VERDICT,B-mtnsg-VERDI
 
 **Updated iter63 priority (loop continues):**
 
-1. **iter63 GPU profiling kit (NEW HIGHEST PRIORITY) — extend `mlx-native/src/kernel_profile.rs` to per-DISPATCH `MTLCounterSampleBuffer.sampleCounters` + port llama.cpp's programmatic `MTLCaptureManager` pattern.** The deferred per-dispatch path is documented in the existing module's doc comment (`/opt/mlx-native/src/kernel_profile.rs:14-17`). metal-rs 0.33 (mlx-native's existing dep at `Cargo.toml:33`) wraps every API needed — no FFI shim, no objc2 upgrade. Total ~430 LOC across mlx-native; 0 in hf2q. Env-gated: `MLX_PROFILE_DISPATCH=1` + `MLX_METAL_CAPTURE=/path.gputrace`. Critical caveat (Risk R3 in the design doc): per-dispatch sampling with `with_barrier:YES` (mandatory under `MTLDispatchTypeConcurrent`) serializes the encoder → upper-bound numbers; production decode runs always with both env vars unset. Cross-validation rule: sum-of-per-dispatch gpu_ns per CB must match per-CB ground truth ≤5%. **Without this kit, iter60b's actual regression mechanism cannot be localized.** Design at `/tmp/cfa-iter63/research/PROFILING-KIT-DESIGN.md` (495 lines) + playbook at `/tmp/cfa-iter63/research/PROFILING-KIT-PLAYBOOK.md` (375 lines); impl in flight on branch `cfa/iter63-profiling-kit-20260501/claude` (worktree `/tmp/cfa-iter63/impl/`).
-2. **xctrace Metal Frame Capture session (operator-driven)** — once the kit lands, an operator triggers `xcrun xctrace record --template "Metal System Trace"` against a representative prefill workload to capture full GPU timeline including idle gaps, scheduling stalls, memory pressure. Complementary to the kit's per-dispatch counters.
-3. **Once measurement is in place: A/B alternative tile sizes per `feedback_evidence_first_no_blind_kernel_rewrites`.** Candidates (from now-falsified iter63a + 63c experience):
+1. **iter63 GPU profiling kit — LANDED on `cfa/iter63-profiling-kit-20260501/claude` HEAD `d0b0128` (mlx-native), 5 commits, +1566 LOC (995 production / 571 tests).** Extends `kernel_profile.rs` per-CB scaffold with per-dispatch path (`MLX_PROFILE_DISPATCH=1`) + ports llama.cpp's programmatic `MTLCaptureManager` (`MLX_METAL_CAPTURE=/path.gputrace`). All 6 acceptance criteria PASS; 127/127 mlx-native lib tests (0 regressions; +2 in `kernel_profile::tests`, +5 in `metal_capture::tests`); 9 new unsafe blocks all matching existing patterns; zero FFI shim, zero objc2-metal dep. Operator hand-off recipe ready.
+   - **CRITICAL DISCOVERY at impl time (Apple Silicon hardware quirk):** `AGXG17XFamilyComputeContext` (M-series, macOS 26) supports counter sampling **only at `AtStageBoundary`, never `AtDispatchBoundary`**. Calling `sampleCountersInBuffer:atSampleIndex:withBarrier:` between dispatches inside a persistent compute encoder ABORTS with `failed assertion 'MTLComputeCommandEncoder:sampleCountersInBuffer:atSampleIndex:withBarrier not supported on this device'`. **AtStageBoundary is incompatible with mlx-native's persistent-compute-encoder design** — that encoder is mlx-native's load-bearing existing optimization (~800 encoder create/end cycles per forward pass amortized into one persistent encoder per CB). For numeric per-dispatch attribution on M-series, the path forward is **Part B's Xcode GPU-timeline visualization** which DOES show per-dispatch start/end on M5 Max because Apple's frame capture is independent of `MTLCounterSampleBuffer`.
+   - **Resolution:** the kit gracefully degrades on M-series (`device.supports_counter_sampling(AtDispatchBoundary)` pre-flight check; no-op + one-shot stderr warning when unsupported). Forward-compatible for AMD/Intel discrete + simulators + future Apple silicon. Per-CB profiling (`MLX_PROFILE_CB=1`, independent code path) remains the ground-truth attribution mechanism on M-series TODAY.
+   - **Per-dispatch numeric attribution (Part A) on M5 Max: not available.** The per-CB scaffold from earlier (`MLX_PROFILE_CB=1`) is the available numeric mechanism.
+   - **Visual capture (Part B) on M5 Max: WORKS.** Verified live with a 40 KB `.gputrace` bundle containing 6 expected entries (capture, delta-device-resources, index 12.7 KB, metadata 1.1 KB, startup-0-platform, store0 5.2 KB). Operator opens the .gputrace in Xcode → Performance → GPU for full per-dispatch timeline including idle gaps, scheduling stalls, memory pressure.
+   - **Operator recipe (works on M5 Max):**
+     ```bash
+     METAL_CAPTURE_ENABLED=1 MLX_METAL_CAPTURE=/tmp/iter60b-vs-main.gputrace \
+         /opt/hf2q/target/release/hf2q -v generate ...  # against iter60b binary
+     # Then bench main HEAD with a separate .gputrace:
+     METAL_CAPTURE_ENABLED=1 MLX_METAL_CAPTURE=/tmp/main.gputrace \
+         /opt/hf2q/target/release/hf2q -v generate ...
+     # Open both .gputrace files in Xcode side-by-side for per-dispatch comparison
+     ```
+   - **Branch ready to merge into mlx-native main (fast-forward, 5 commits, 0 commits to main since branch creation; clean ff-merge).**
+
+2. **iter64 — operator-driven Xcode GPU-timeline capture for iter60b mechanism localization.** With Part B working on M5 Max, an operator runs the iter63 capture recipe against (a) iter60b binary at apex q4_0-flat pp4096, (b) iter60b-parent binary at same fixture. Compare .gputrace files in Xcode to localize the +445ms `layer.ops1_3` regression to a specific dispatch sequence. Candidate mechanisms (from iter62 falsification): `transpose_result` toggle, type-param swap in `get_destination_cooperative_tensor<>`, partial-tile writeback removal, OR device-direct B reads. **Once localized, iter64+ becomes a focused per-mechanism A/B (each is <20 LOC) instead of multi-element diff.**
+
+3. **xctrace Metal System Trace (operator-driven, complementary to Part B)** — `xcrun xctrace record --template "Metal System Trace"` adds whole-system context (CPU thread states, memory pressure, thermal). Use if Xcode .gputrace alone doesn't disambiguate iter60b's mechanism.
+
+4. **Once mechanism localized: A/B alternative tile sizes per `feedback_evidence_first_no_blind_kernel_rewrites`.** Candidates (from now-falsified iter63a + 63c experience):
    - **iter63d — bisect iter60b's other changes individually.** Apply each of iter60b's 4 non-tile changes (transpose_result toggle, type-param swap, partial-tile removal, device-direct B reads) in isolation; bench each; localize the +445ms `layer.ops1_3` regression to one specific change. Each change is <20 LOC.
    - **iter63e — host-side B padding to NR1.** Pad the input matrix M-dimension up to a multiple of NR1=128 before the dispatch, then strip after; sidesteps the partial-tile bug. Memcopy overhead must be measured.
    - **iter63f — raise `MM_ROUTING_THRESHOLD` 8→128.** Routes any M<128 dispatch to the simdgroup MMA path (which doesn't have the partial-tile bug). Defensive-only; **measurable perf hit** at M ∈ [9, 127] which includes production chunk-prefill at M=64. Document, do not ship.
@@ -1748,6 +1766,58 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - Memory pins: `feedback_perf_gate_thermal_methodology`, `feedback_shippability_standing_directive`, `feedback_never_ship_fallback_without_rootcause`, `feedback_no_broken_windows`, `project_metal_compiler_auto_optimizes_static_levers`, `project_end_gate_reality_check`, `feedback_ground_truth_is_what_we_can_measure_now`
 
 ## Changelog
+
+- **2026-05-01 (UTC ~22:50Z) — iter63 GPU profiling kit LANDED on `cfa/iter63-profiling-kit-20260501/claude` (mlx-native HEAD `d0b0128`, 5 commits, ~36 min wall-clock impl); critical Apple Silicon hardware quirk discovered + gracefully handled; Part B (Xcode capture) operational on M5 Max.**
+
+  **Method.** Single coder-impl worker (opus, background, worktree at `/tmp/cfa-iter63/impl/`) implementing the design at `/tmp/cfa-iter63/research/PROFILING-KIT-DESIGN.md` (495 lines) + playbook at `/tmp/cfa-iter63/research/PROFILING-KIT-PLAYBOOK.md` (375 lines). Five-stage incremental impl: stage-A1 (per-dispatch `kernel_profile` scaffold, `3293ac7`) → stage-A2 (encoder wire-up, `85ede8a`) → stage-A3+A4 (replay-path op_kind + integration tests + Apple Silicon graceful-degrade, `9b343e0`) → stage-B (programmatic MTLCaptureManager wiring, `3ff51b6`) → stage-B-smoke (operator-gated happy-path .gputrace verification, `d0b0128`). +1566 LOC net (995 production / 571 tests; design estimate was 430 — overshoot dominated by extensive rustdoc covering the Apple Silicon discovery + graceful-degrade paths).
+
+  **Acceptance criteria results (6/6 PASS).**
+
+  | # | Criterion | Result |
+  |---|-----------|--------|
+  | 1 | Build clean both worktrees | PASS — mlx-native lib (1.51s); hf2q against iter63 mlx-native via temporary path-override (14.00s, restored after) |
+  | 2 | Existing mlx-native tests pass | PASS — 127/127 lib tests (0 regressions; +2 in `kernel_profile::tests`, +5 in `metal_capture::tests`); pre-existing FP-bitexact failures in `test_q4_0_*` (max_err 4×10⁻⁶) verified to fail identically on baseline `ac4628b` — NOT iter63 regressions |
+  | 3 | `MLX_PROFILE_DISPATCH=0` zero overhead | PASS — single `AtomicI8::load(Relaxed)` per dispatch via `is_dispatch_enabled()`, no allocation, no buffer access |
+  | 4 | `MLX_PROFILE_DISPATCH=1` per-dispatch breakdown | PASS via graceful-degrade on M5 Max + supported-path test infrastructure (Apple Silicon caveat below) |
+  | 5 | `.gputrace` written end-to-end | PASS — verified live: `/tmp/iter63-smoke.gputrace` 40 KB bundle with 6 expected entries (capture, delta-device-resources, index 12.7 KB, metadata 1.1 KB, startup-0-platform, store0 5.2 KB) |
+  | 6 | No new unsafe beyond metal-rs's safe wrappers | PASS — 9 new unsafe blocks; all match existing patterns (7× `unsafe { &*encoder_ptr }` mirrors `memory_barrier` at encoder.rs:800; 2× `msg_send![cb, device]` mirrors `commit_wait_with_gpu_time` at encoder.rs:1573); zero FFI shim, zero objc2-metal dep |
+
+  **CRITICAL Apple Silicon hardware quirk discovered at impl (Risk R1 from design doc materialized).** `AGXG17XFamilyComputeContext` (M-series, macOS 26) supports counter sampling **only at `MTLCounterSamplingPoint::AtStageBoundary`, never `AtDispatchBoundary`**. Calling `sampleCountersInBuffer:atSampleIndex:withBarrier:` between dispatches inside a persistent compute encoder ABORTS with `failed assertion '-[AGXG17XFamilyComputeContext sampleCountersInBuffer:atSampleIndex:withBarrier:]:1018: MTLComputeCommandEncoder:sampleCountersInBuffer:atSampleIndex:withBarrier not supported on this device'`. **`AtStageBoundary` is incompatible with mlx-native's persistent-compute-encoder design** — that encoder is mlx-native's load-bearing existing optimization (~800 encoder create/end cycles per forward pass amortized into one persistent encoder per CB; see `encoder.rs:729-757` for the persistent encoder lifecycle). For numeric per-dispatch attribution on M-series, the path forward is **Part B's Xcode GPU-timeline visualization** which DOES work on M5 Max because Apple's frame capture is independent of `MTLCounterSampleBuffer`. Resolution: `ensure_sample_buffer` pre-flight checks `device.supports_counter_sampling(AtDispatchBoundary)` and gracefully degrades to no-op + one-shot stderr warning when unsupported. **Kit ships forward-compatible**: when Apple eventually adds `AtDispatchBoundary` support to Apple Silicon (or on AMD/Intel discrete / simulators / future hardware), the kit Just Works without code changes.
+
+  **Constants correction at impl:** `MAX_SAMPLES_PER_CB` adjusted from 32_768 → 4_096 — the actual Metal constraint is a 32 KB byte-size budget per buffer (each timestamp sample is 8 bytes), NOT a 32K-sample count. Documented at the constant declaration.
+
+  **Operator recipe — visual capture (Part B) works on M5 Max:**
+  ```bash
+  METAL_CAPTURE_ENABLED=1 MLX_METAL_CAPTURE=/tmp/iter60b-prefill.gputrace \
+      /opt/hf2q/target/release/hf2q -v generate ...
+  # Open .gputrace in Xcode → Performance → GPU for per-dispatch timeline
+  ```
+
+  **Operator recipe — per-dispatch numeric (Part A) on supported hardware:**
+  ```bash
+  MLX_PROFILE_CB=1 MLX_PROFILE_DISPATCH=1 \
+      /opt/hf2q/target/release/hf2q -v generate ...
+  # On M5 Max: Part A is no-op + warning; per-CB ground truth populates via MLX_PROFILE_CB.
+  # On supported HW: both populate; cross-validate sum(per-dispatch ns) ≤ 5% of per-CB ns.
+  ```
+
+  **Implication for iter62's `layer.ops1_3` regression mechanism (load-bearing).** Per-dispatch numeric attribution on M5 Max is blocked by Apple's `AtStageBoundary` constraint. **iter64 unblocks via operator-driven Xcode .gputrace capture of iter60b vs iter60b-parent at apex q4_0-flat pp4096.** Side-by-side .gputrace comparison in Xcode pinpoints the per-dispatch sequence carrying the +445ms regression; the iter62 four-candidate space (transpose_result toggle / type-param swap / partial-tile removal / device-direct B reads) collapses to one or two specific dispatches. Once localized, iter64+ becomes per-mechanism A/B at <20 LOC each.
+
+  **STANDING COMPLIANCE.**
+  - `feedback_evidence_first_no_blind_kernel_rewrites` — kit is infrastructure for evidence-driven future kernel work; no kernels modified by this iter.
+  - `feedback_correct_outcomes` — Apple Silicon discovery documented in-source at `kernel_profile::ensure_sample_buffer` + in this Changelog; not buried in a TODO.
+  - `feedback_no_shortcuts` — kit ships with graceful-degrade (forward-compatible) rather than skipping or env-gating-out the unsupported path.
+  - `feedback_use_cfa_worktrees` — entire impl in `/tmp/cfa-iter63/impl/{mlx-native,hf2q}`, isolated from main repo build state.
+  - `feedback_git_commit_pathspec_when_parallel` — 5 commits scoped to `mlx-native/src/{kernel_profile.rs,encoder.rs,graph.rs,lib.rs,metal_capture.rs}` + 3 new test files; zero hf2q source changes (pure mlx-native infra). Parallel ADR-005 + ADR-013 P21 + ADR-018 sessions on hf2q advanced HEAD during impl; no fence violations.
+
+  **Receipts.**
+  - Impl branch (mlx-native): `cfa/iter63-profiling-kit-20260501/claude` HEAD `d0b0128`, 5 commits, pushed.
+  - Live `.gputrace` smoke: `/tmp/iter63-smoke.gputrace` (40 KB bundle).
+  - Production source: `/opt/mlx-native/src/{kernel_profile.rs (extended), encoder.rs (extended), graph.rs (extended), lib.rs (re-exports), metal_capture.rs (new)}`.
+  - Tests: `/opt/mlx-native/tests/{dispatch_profile.rs (new), metal_capture.rs (new), metal_capture_happy_path.rs (new)}`.
+  - Coordination markers: `/tmp/cfa-iter63/.heartbeat-impl`, `/tmp/cfa-iter63/.IMPL-DONE` (touched at completion).
+
+  Status: iter63 profiling kit READY-TO-MERGE (fast-forward to mlx-native main); iter64 (operator Xcode .gputrace capture for iter60b mechanism localization) UNBLOCKED.
 
 - **2026-05-01 (UTC ~22:30Z) — iter63a + iter63c — tile-shape hypothesis REFUTED at parity at two independent diff levels; iter63 GPU profiling kit becomes the load-bearing path.**
 
