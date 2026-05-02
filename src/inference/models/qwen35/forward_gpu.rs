@@ -1744,6 +1744,56 @@ impl Qwen35Model {
             None
         };
 
+        // ---- ADR-015 iter83: ChunkInternalArena allocation ----
+        //
+        // Caller-owned arena for the 7 large + 5 small mlx-native-internal
+        // chunk-pipeline scratches (g_cumsum, A_strict, A_inv, w, u, h,
+        // v_new + 5 param buffers). Allocated ONCE per prefill, sized for
+        // the actual chunk-pipeline shape (b=1, t=seq_len, hg=h=n_v_heads,
+        // k=d_k, v=d_v, bt=64), reused across all DN (LinearAttn) layers.
+        //
+        // Workload-conditional WIN by design (mirrors iter78 ChunkAllocsArena):
+        // - NEUTRAL on default pp4123 (chunk path predicate fails: pp4123 % 64 != 0).
+        // - Expected -50 to -100 ms wall improvement on chunk-engaged
+        //   4096-token prefill, additive to iter78's ChunkAllocsArena win.
+        //
+        // Only allocated when (1) the iter78 chunk_allocs_arena is allocated
+        // AND (2) the apex chunk-pipeline shape constraints fit
+        // (K==MAX_K=128, BT==FIXED_BT=64, t%bt==0). The ChunkInternalArena::new
+        // constructor enforces these; if any constraint fails (e.g. on a
+        // model with K!=128 or seq_len%64!=0), we fall back to None and the
+        // chunk dispatch uses its existing per-call alloc path.
+        //
+        // Memory footprint at apex pp4096 with Qwen3.6 35B-A3B shape:
+        // ~235 MB total. Allocated on top of iter78's ~270 MB ChunkAllocsArena.
+        let mut chunk_internal_arena: Option<
+            mlx_native::ops::chunk_gated_delta_rule::ChunkInternalArena,
+        > = if chunk_allocs_arena.is_some() {
+            let dn_shape = DeltaNetLayerShape::from_config(cfg);
+            // ChunkInternalArena::new returns Err on shape constraint
+            // violations (K!=128, BT!=64, t%bt!=0, H%Hg!=0). For chunk-
+            // engaged prefill (seq_len % 64 == 0 enforced by the runtime
+            // chunk_path_eligible predicate elsewhere) on Qwen3.6 35B-A3B
+            // (K=V=128, n_k_heads%n_v_heads==0), all constraints hold and
+            // we expect Ok. For models that don't fit, we silently skip
+            // the internal arena (chunk dispatch falls back to per-call
+            // alloc) — the iter78 arena still eliminates the wrapper
+            // scratches.
+            mlx_native::ops::chunk_gated_delta_rule::ChunkInternalArena::new(
+                &device,
+                /* b  */ 1,
+                /* t  */ seq_len,
+                /* hg */ dn_shape.n_v_heads,
+                /* h  */ dn_shape.n_v_heads,
+                /* k  */ dn_shape.d_k,
+                /* v  */ dn_shape.d_v,
+                /* bt */ 64,
+            )
+            .ok()
+        } else {
+            None
+        };
+
         // ---- Step 2: per-layer forward pass ----
         let decode_profile = std::env::var("HF2Q_DECODE_PROFILE").is_ok();
         let mut total_attn_us = 0u64;
@@ -1951,6 +2001,9 @@ impl Qwen35Model {
                             state_out_ref,
                             arena,
                             chunk_allocs_arena.as_mut(),
+                            // ADR-015 iter83: thread the ChunkInternalArena
+                            // (lift mlx-native chunk-pipeline scratches).
+                            chunk_internal_arena.as_mut(),
                             seq_len,
                             shape.hidden_size,
                             shape.n_k_heads,
