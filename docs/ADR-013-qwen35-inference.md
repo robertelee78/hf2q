@@ -2826,3 +2826,43 @@ Combined with the prior receipts:
 
 Absolute tok/s magnitudes deferred to an idle-system bench window — those are methodology constraints not work gaps; the relative speedup IS the P14 throughput-win signal.
 
+
+### 2026-05-01 (late) — P21 STAGE 1 LANDED · `FaPrefillArena` infrastructure + sync_count 161 → 141 via /cfa review-only mode
+
+**Why this entry.** P21 spec doc (committed `de9b7a4`) launched the four-stage arena refactor. Stage 1 — caller-owned per-prefill arena for the FA bridge — landed today via `/cfa` review-only mode (codex GPU sandbox limitation forced single-team mode; codex served as Phase-2b independent reviewer instead of parallel implementer). Worktree branch `cfa/adr013-p21-s1/claude`, 7 commits (`49e2e4d` → `63ba2ec`).
+
+**What landed.**
+
+- **NEW `src/inference/models/qwen35/fa_prefill_arena.rs`** (426 LOC): `FaPrefillArena` struct owns 7 BF16 buffer fields (q_norm, k_norm, q_rope, k_rope, k_seq_major, v_seq_major, out_seq) + 4 capacity bookkeeping fields. `new(device, seq_capacity, n_heads, n_kv_heads, head_dim) -> Result<Self>` with zero-dim and GQA divisibility guards. `validate_fits(seq, n_heads, n_kv_heads, head_dim)` returning Err on capacity/shape mismatch. 8 unit tests cover: zero-dim rejection, GQA divisibility rejection, qwen35 pp101/pp4096 sizes, validate_fits exact match / seq overrun / shape mismatch, buffers zero-initialized.
+
+- **`src/inference/models/qwen35/gpu_full_attn.rs`** refactored: `apply_flash_attn_prefill_seq_major`, `apply_sdpa_with_kv_cache`, `build_gated_attn_layer` all take `fa_arena: Option<&mut FaPrefillArena>`. When arena present + `head_dim == 256` (matches `new_path_eligible` condition), use arena's 7 scratches and replace 1 `commit_and_wait` with `commit_labeled` at the FA-bridge terminal commit. The originally proposed second downgrade (ops1-4 commit) was reverted in c6 after Codex Phase-2b found a real RAW race: `download_f32(k_seq_major)/download_f32(v_seq_major)` in `apply_sdpa_with_kv_cache:1384-1385` violates the as_slice "no GPU writer in flight" contract when ops1-4 doesn't host-wait first. See c6 commit body for full mechanics.
+
+- **`src/inference/models/qwen35/forward_gpu.rs`** allocation site: `forward_gpu_impl` allocates `FaPrefillArena` once per prefill call (`seq_len > 1` and at least one FullAttn layer present) and threads `fa_arena.as_mut()` into each per-layer call. Per-prefill lifetime confirmed by Codex review.
+
+- **Wiring**: `mod.rs` adds `pub mod fa_prefill_arena`. `mtp.rs` adds the `None` arg to a single call site (legacy decode-only path, no arena).
+
+**Verification.**
+
+| Criterion | Result | Evidence |
+|---|---|---|
+| sync_count drop (target ≤141 post-fix; structural) | **141** deterministic, 3 cold pp101 runs | `/tmp/heisen-{1,2,3}.log` |
+| Unit tests | **2544/2544 PASS** (+8 new arena tests) | `cargo test --release --lib --bins` |
+| Heisenbug 5/5 (worker C verified) | **PASS** prior to c6 + 3/3 PASS post-c6 | `/tmp/cfa-adr013-p21-s1/heisenbug.log` |
+| Decode parity (tg64 ≥ 120 t/s) | 122.7 t/s median per worker C bench | `/tmp/cfa-adr013-p21-s1/bench-out/p17b_summary.md` |
+| Coherence (ascii_ratio ≥ 0.85) | **1.000** | bench.log |
+| Memory budget (≤ 30 GB) | 29.601 GB (+10.5 MB vs baseline) | `/tmp/cfa-adr013-p21-s1/mem.log` |
+| Build cleanliness (0 new warnings) | -2 net (375 → 373) | `/tmp/cfa-adr013-p21-s1/clippy.log` |
+| Wall improvement (target +13% pp101) | **231 t/s** (matches P20 null-wall finding) | `/tmp/cfa-adr013-p21-s1/bench-out` |
+| Sourdough byte-parity | (pre-existing fail — ADR-018 c3 banner regex broke `strip_hf2q_header`; tracked separately, not introduced by Stage 1) | sourdough.log |
+
+**Codex Phase-2b adjudication.** Verdict: `request_changes`. Critical finding: **missing_RAW** — Stage 1 c1-c4 downgraded ops1-4 from `commit_and_wait` to `commit_labeled` whenever `use_arena=true`, but `apply_sdpa_with_kv_cache:1384-1385` unconditionally calls `download_f32(k_seq_major)/download_f32(v_seq_major)` BEFORE the new_path_eligible branch dispatches FA. That host read previously relied on the ops1-4 sync. Codex traced the same iter58b-class signature on a different surface; coherence=1.000 + 5/5 Heisenbug do NOT refute it because Apple Silicon unified memory often masks small-window races. iter58b risk: SAFE for the FA bridge itself (arena owns scratches correctly). Arena sizing: CORRECT. Lifetime: per_prefill (correct). Scope: in_scope.
+
+**Queen Phase-3 judgment.** Decision: **REQUEST-FIX (Option A)**. Adopted: keep `commit_and_wait` for ops1-4 ALWAYS in prefill seq>1, regardless of `use_arena`. Stage 1's measured savings come from the FA-bridge terminal commit alone (10 FA layers × 2 commits-saved each = 20 dropped). sync_count: 161 → 141 (not 131 — that was a math error in the pre-Codex spec). FaPrefillArena infrastructure preserved for Stages 2/3.
+
+**What's needed for sync_count=131 → 70 → 25.** Stage 2 must move the prefill KV-cache K/V write fully onto GPU via a `kv_cache_copy_seq_major_to_head_major` Metal kernel + dispatch + parity test (~150 LOC). That eliminates the `download_f32(k_seq_major)/download_f32(v_seq_major)` calls entirely, which is the prerequisite for safely downgrading ops1-4 in arena prefill. Stage 3 lifts DeltaNet wrapper scratch (much higher iter58b risk). Stage 4 collapses chunk-DN commit boundaries.
+
+**Stage 1 status.** Branch `cfa/adr013-p21-s1/claude` HEAD `63ba2ec` ready for merge into mainline. Held briefly because parallel ADR-005 iter-222 work is dirty in `src/serve/forward_mlx.rs` / `forward_prefill.rs` on the active branch — merging would race against that session. Merge will be performed once parallel work commits or operator stashes.
+
+**Wall-savings honest assessment.** P20 already established (and Stage 1 confirms) that the FA-bridge terminal commits live in the cheap-commit class — they fire when GPU is idle, so removing them does not move wall time. The +13% pp101 target was aspirational and is rejected by measurement. Stage 1's value is **structural infrastructure** (the arena type + allocation site + threading + lifetime + iter58b safety pattern), not wall-time. Stage 2's KV-cache GPU-side write is the actual prefill-tps unlock.
+
+**Receipts**: `/tmp/cfa-adr013-p21-s1/{queen-judgment.md,queen-judgment.json,test-report.md,codex-review-last.txt,bench-out/p17b_summary.md}`.
