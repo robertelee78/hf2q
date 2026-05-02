@@ -447,6 +447,13 @@ Phased, gated, with parity per increment. Each phase ships behind its own env ga
 
 **Acceptance Phase 0a.3:** all three microbench numbers documented with ± noise floor; AC-P4 sync_count target validated against measured event cost.
 
+**Measured 2026-05-02 (M5 Max, mlx-native branch `adr019-phase0a3-mtl-event-microbench`):**
+- **H1 = 1.25 µs ± 0.25 µs** per MTLSharedEvent signal+wait CB-pair (= ~620 ns per single signal-or-wait encode at the Metal driver surface). iter89b's 100-500 ns estimate was the encode-call CPU cost in isolation; the cross-CB GPU sync the event enforces costs an additional ~500 ns. Combined per-encode is at the upper end of the iter89b range (revised upward by ~6×), still negligible vs. driver-commit floor.
+- **H2 = 2.79 µs ± 0.4 µs** per residency add+remove cycle (= ~1.4 µs / staged-flush). PASS by ~36× vs. the < 100 µs prediction. iter8e defer-and-flush design (one `[set commit]` per CB instead of per-allocation) is doing exactly the work it was designed to do.
+- **H3 = 13.3 µs ± 0.1 µs** per single empty CB with synchronous wait; ~8 µs per CB when two CBs pipeline behind one `wait_until_completed`. PASS by ~38× vs. the < 500 µs prediction.
+- **AC-P4 validation: PASS.** At 1.25 µs / CB-pair, D3's projected ~80 intra-stage MTLEvent fences cost ~100 µs total — negligible against the 530 ms residual AC-P1 targets (80 ms). Per-component `commit_and_wait` → chunk-internal MTLEvent fence saves ~6.5 µs per converted boundary at the M5 Max driver level. Event cost cannot block AC-P4. The 530 ms residual is pipeline-bubble + encoder-build dominated, NOT driver-commit, so D3's per-stage-fence consolidation must address those (Phase 0a.1 xctrace bins), confirming the existing migration plan.
+- Methodology: criterion 0.5, 5-trial protocol (3 contaminated by rust-analyzer at 96.8% CPU; 4 + 5 canonical, ≤ 1.5% drift). Full report: `/tmp/cfa-adr019-phase0a3/results.md`.
+
 **ETA Phase 0a:** 5-10 man-days operator + 3-5 man-days dev for microprototype = ~2 calendar weeks.
 
 **Phase 0a is the gate that authorizes Phase 0b.** If Phase 0a falsifies D3 in favor of D4, the Migration Plan below is rewritten before any structural code lands.
