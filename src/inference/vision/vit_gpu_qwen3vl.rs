@@ -83,13 +83,23 @@ use super::vit_gpu::VisionInput;
 /// llama.cpp does NOT write `num_position_embeddings` as a metadata
 /// key (verified via `grep -rn "num_position_embeddings" clip.cpp
 /// clip-impl.h` — only the position embedding *tensor* itself
-/// (`v.position_embd.weight`) carries the dimension as `ne[0]` per
-/// `clip.cpp:3849`). Source-side that's a tensor-shape derivation,
-/// not a config field. To keep `Qwen3VlViTConfig` honest about its
-/// data flow, the dispatch site reads
-/// `mmproj_weights.position_embd_weight()?.shape()[0]` and passes it
-/// in explicitly — pretending to extract it from `MmprojConfig`
-/// (which doesn't carry it) would be a Chesterton's-fence violation.
+/// (`v.position_embd.weight`) carries the dimension. Per
+/// `clip.cpp:272-289` (`clip_graph::resize_position_embeddings`),
+/// the position-table count is `pos_embd->ne[1]` and the per-side
+/// trained edge is `sqrt(pos_embd->ne[1])` (the table is square
+/// 2D, e.g. 48×48 for Qwen3-VL-2B at 768×768 / 16×16 → ne[1]=2304).
+/// Source-side that's a tensor-shape derivation, not a config field.
+/// To keep `Qwen3VlViTConfig` honest about its data flow, the
+/// dispatch site reads `mmproj_weights.position_embd_weight()?
+/// .shape()[1]` and passes it in explicitly — pretending to extract
+/// it from `MmprojConfig` (which doesn't carry it) would be a
+/// Chesterton's-fence violation.
+///
+/// (Citation correction 2026-05-02: an earlier scaffold revision
+/// cited `clip.cpp:3849` and `ne[0]` — that line is actually
+/// `PROJECTOR_TYPE_LFM2A` returning the projection-dim of an
+/// unrelated audio model. Codex Phase-2b review caught it; the
+/// correct reference is `clip.cpp:272-289` with `ne[1]`.)
 #[derive(Debug, Clone, PartialEq)]
 pub struct Qwen3VlViTConfig {
     /// ViT encoder layer count (e.g. 24 for Qwen3-VL-2B). Sourced
@@ -117,11 +127,14 @@ pub struct Qwen3VlViTConfig {
     /// MUST be `Some(_)` — `from_mmproj` rejects loudly if `None`.
     pub out_hidden_size: u32,
     /// Trained-resolution position-table length (e.g. 2304 for
-    /// Qwen3-VL-2B at 768×768 / 16×16 = 48² + spec slack). Sourced
-    /// from the LOADED `v.position_embd.weight` tensor's first dim
-    /// (per `clip.cpp:3849`), not from a metadata key. Passed in
-    /// explicitly to `from_mmproj` so the call-site is unambiguous
-    /// about where the value came from.
+    /// Qwen3-VL-2B at 768×768 / 16×16 = 48² = 2304). Sourced from
+    /// the LOADED `v.position_embd.weight` tensor's `ne[1]` axis
+    /// (per `clip.cpp:272-289` — the table is shaped `(n_embd, count)`
+    /// and `count = ne[1]`; 4c.2 will derive this from
+    /// `mmproj_weights.position_embd_weight()?.shape()[1]`). Not
+    /// from a metadata key. Passed in explicitly to `from_mmproj`
+    /// so the call-site is unambiguous about where the value came
+    /// from.
     pub num_position_embeddings: u32,
     /// Sorted ascending list of layer indexes flagged in
     /// `clip.vision.is_deepstack_layers` (e.g. `[5, 11, 17]` for
