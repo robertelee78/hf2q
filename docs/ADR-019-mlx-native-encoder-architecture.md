@@ -470,10 +470,11 @@ Phased, gated, with parity per increment. Each phase ships behind its own env ga
 **Scope:** Lift the existing `CommandEncoder` to a `CommandEncoder + EncoderSession` pair. `EncoderSession` owns:
 - The current MTLCommandBuffer (or pool, for D1 future).
 - An open MTLComputeCommandEncoder (the current persistent compute encoder).
-- An optional MTLEvent for stage-fence semantics.
+- An optional MTLEvent for stage-fence semantics (uses metal-rs 0.33 native surface — `Device::new_shared_event` / `CommandBufferRef::encode_signal_event` / `encode_wait_for_event` per Phase 0a.3 verified at `device.rs:2059-2065`, `commandbuffer.rs:194-210`; NO raw `msg_send!` ObjC wrappers needed).
 - The residency-set membership (delegated to MlxDevice's existing single-set).
-- The K-batch state (already partially in P21).
 - The labeled phase context (for xctrace).
+
+**Phase 0b design doc (deep-researcher, 2026-05-02):** `/tmp/cfa-adr019-phase0b-design/encoder_session_api.md` — full API surface, lifecycle state machine, F1-F12 fence mapping, migration plan, test plan. **Implementation gap discovered:** `CommandEncoder` does not currently hold a queue reference; `reset_for_next_stage()` after a non-blocking `commit_stage()` needs to open a fresh CB from the same queue. Adding a `queue: CommandQueue` field (~3 LoC, `CommandQueue` is `Send + Sync` per metal-rs 0.33 — preserves the existing unsafe `Send` impl on `CommandEncoder`) is the load-bearing structural change. **Doc correction:** K-batch state lives in hf2q `forward_gpu.rs:1884-1895` (NOT mlx-native); `EncoderSession` does NOT carry a K-batch field. Phase 4 will use `commit_stage()` vs `commit_and_wait()` to express K-window-interior vs K-boundary semantics; the K-batch predicate stays in hf2q.
 
 **LoC:** ~200 in `/opt/mlx-native/src/encoder.rs` + new `/opt/mlx-native/src/encoder_session.rs`. No behavior change. Feature-flagged behind `HF2Q_ENCODER_SESSION=1`.
 
