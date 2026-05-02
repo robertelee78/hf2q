@@ -1686,9 +1686,7 @@ pub fn build_gated_attn_layer(
         // arena-owned — they are per-layer allocations from the pooled helper —
         // but they are consumed only by the FA bridge via GPU-ordering, not by
         // any CPU download_f32. Downgrade is safe by A.1 / queen plan).
-        if seq_len == 1 && head_dim % 32 == 0 {
-            enc.commit_labeled("layer.full_attn.ops1-4");
-        } else if use_arena {
+        if (seq_len == 1 && head_dim % 32 == 0) || use_arena {
             enc.commit_labeled("layer.full_attn.ops1-4");
         } else {
             enc.commit_and_wait().context("commit ops1-4 prefill")?;
@@ -1856,9 +1854,7 @@ pub fn build_gated_attn_layer(
         // is needed. dump_hidden_stats is HF2Q_DECODE_PROFILE-gated (env-only
         // diagnostic, not on the production path). Downgrade to commit_labeled
         // is safe per queen plan A.1 ops6-7 analysis.
-        if seq_len == 1 {
-            enc.commit_labeled("layer.full_attn.ops6-7");
-        } else if use_arena {
+        if seq_len == 1 || use_arena {
             enc.commit_labeled("layer.full_attn.ops6-7");
         } else {
             enc.commit_and_wait().context("commit ops6-7")?;
