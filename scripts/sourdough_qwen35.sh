@@ -211,16 +211,37 @@ b_raw = open(sys.argv[2], "rb").read()
 out = sys.argv[3]
 
 def strip_hf2q_header(buf):
-    """hf2q prints 4 leader lines before the generated text."""
-    if not buf.startswith(b"hf2q \xc2\xb7 "):
+    """Strip hf2q's load banner + perf line before the generated text.
+
+    Two formats supported:
+      - Pre-ADR-018: 4 lines starting with `hf2q · ` (UTF-8 middle dot).
+      - ADR-018 c3 (2026-05-01+): N lines starting with `hf2q load: `,
+        followed by one `prefill: <n> tok in <m>ms (<r> tok/s)` line,
+        followed by a blank line, then generated text.
+
+    Strategy: skip lines until we hit one that is NOT a banner line.
+    A line is a banner iff it starts with `hf2q ` (covers both formats)
+    OR `prefill:` (post-load timing line) OR is empty.
+    """
+    if not (buf.startswith(b"hf2q \xc2\xb7 ") or buf.startswith(b"hf2q load:")):
         return buf
     pos = 0
-    for _ in range(4):
+    while pos < len(buf):
         nl = buf.find(b"\n", pos)
+        line_end = nl if nl >= 0 else len(buf)
+        line = buf[pos:line_end]
+        is_banner = (
+            line.startswith(b"hf2q ")
+            or line.startswith(b"prefill:")
+            or line.startswith(b"decode:")
+            or line == b""
+        )
+        if not is_banner:
+            return buf[pos:]
         if nl < 0:
-            return buf
+            return b""
         pos = nl + 1
-    return buf[pos:]
+    return b""
 
 def strip_llama_banner(buf):
     """llama-cli emits: progress spinner + ASCII logo + build/model/
