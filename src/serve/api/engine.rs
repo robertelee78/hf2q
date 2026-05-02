@@ -1179,6 +1179,56 @@ impl PromptCacheKey {
     }
 }
 
+/// One captured streaming-emit event, for fragment-replay (W-A2.1).
+///
+/// The `replay_cached_streaming_response` helper today re-runs the
+/// ReasoningSplitter + ToolCallSplitter pipeline over `PromptCache::text`
+/// to reconstruct the SSE event sequence on a cache hit.  That preserves
+/// **structural shape** (Content / Reasoning / ToolCallDelta) but loses
+/// **per-token boundaries**: a 100-token live decode emits ~100 deltas;
+/// the replay emits one big splitter pass.
+///
+/// Fragment-replay (W-A2.1–W-A2.4) closes that gap by capturing each
+/// `GenerationEvent::Delta` / `::ToolCallDelta` actually emitted during the
+/// streaming decode into a `Vec<CachedFragment>` stored alongside `text`.
+/// On a hit, the replay emits each `CachedFragment` directly as the matching
+/// `GenerationEvent`, byte-identical to the live event stream.
+///
+/// # Why not `Vec<(DeltaKind, String)>`?
+///
+/// `DeltaKind` is `Content | Reasoning` only (sse.rs:50).  Tool-call deltas
+/// carry richer structural fields (`index`, `id`, `call_type`, `name`,
+/// `arguments`) that the deferral note's `(DeltaKind, String)` shape cannot
+/// represent.  This enum is a 1:1 mirror of the `GenerationEvent` variants
+/// the streaming path emits — lossless capture + lossless replay.
+///
+/// # Why no `ToolCallClose`?
+///
+/// The live path does not emit a "close" event — `tc_index += 1` and
+/// `saw_tool_call = true` are bookkeeping that flips the terminal `Done`
+/// event's `finish_reason` to `"tool_calls"`.  The cached `finish_reason`
+/// already lives in `PromptCache::finish_reason` and is replayed on the
+/// `Done` chunk, so no separate Close fragment is needed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CachedFragment {
+    /// `GenerationEvent::Delta { kind: DeltaKind::Content, text }`.
+    Content(String),
+    /// `GenerationEvent::Delta { kind: DeltaKind::Reasoning, text }`.
+    Reasoning(String),
+    /// `GenerationEvent::ToolCallDelta { index, id, call_type, name, arguments }`.
+    /// All five fields preserved verbatim — first-chunk shape (id+name+
+    /// call_type, arguments=None) and subsequent args-chunk shape
+    /// (everything None except arguments=Some(fragment)) both round-trip
+    /// without loss.
+    ToolCallDelta {
+        index: usize,
+        id: Option<String>,
+        call_type: Option<String>,
+        name: Option<String>,
+        arguments: Option<String>,
+    },
+}
+
 /// Single-slot prompt cache (Phase 2a Task #7, iter-96).
 ///
 /// **Iter-96 scope: full-equality + temperature=0 cache.**  When the
@@ -1254,6 +1304,19 @@ pub struct PromptCache {
     pub reasoning_tokens: Option<usize>,
     /// `"stop"` | `"length"` from the previous result.
     pub finish_reason: &'static str,
+    /// Captured per-emit `GenerationEvent` sequence from the previous
+    /// streaming decode, for fragment-replay (W-A2.1–W-A2.4).
+    ///
+    /// `None` for a fresh cache, OR for any entry whose origin was
+    /// non-streaming (`generate_once_with_soft_tokens`) — non-streaming
+    /// has no per-token trace, so the splitter-rerun replay path is the
+    /// honest minimum (Worker AA design §3b option (a)).
+    ///
+    /// `Some(frags)` for streaming-origin entries — the replay path
+    /// emits each `CachedFragment` directly, byte-identical to the live
+    /// event stream.  Single-slot cache ⇒ ~5–10 KB worst-case footprint
+    /// (Worker AA design §3e).
+    pub fragments: Option<Vec<CachedFragment>>,
 }
 
 impl Default for PromptCache {
@@ -1286,6 +1349,7 @@ impl PromptCache {
             completion_tokens: 0,
             reasoning_tokens: None,
             finish_reason: "length",
+            fragments: None,
         }
     }
 
@@ -1342,11 +1406,45 @@ impl PromptCache {
     /// Same eligibility gate as `lookup` — sampling-mode requests are
     /// not cached (storing them would mean a future greedy request
     /// could replay a sampling outcome, violating determinism).
+    ///
+    /// **Fragment-replay (W-A2.1)**: this entry-point sets
+    /// `fragments = None`, which is the correct behaviour for
+    /// non-streaming origin (`generate_once_with_soft_tokens`) — no
+    /// per-token trace exists.  The streaming origin uses
+    /// `store_with_fragments` to capture the per-emit
+    /// `CachedFragment` sequence.
     pub fn store(
         &mut self,
         prompt_tokens: &[u32],
         params: &SamplingParams,
         result: &GenerationResult,
+    ) {
+        self.store_with_fragments(prompt_tokens, params, result, None);
+    }
+
+    /// Cache write with optional captured fragment sequence (W-A2.1).
+    ///
+    /// `fragments == Some(frags)` records the per-emit `GenerationEvent`
+    /// trace for fragment-replay (W-A2.3) — the replay path emits each
+    /// `CachedFragment` directly as the matching `GenerationEvent`,
+    /// byte-identical to the live event stream.
+    ///
+    /// `fragments == None` records the legacy text-only entry whose
+    /// replay re-runs the splitter pipeline over `text` (preserves
+    /// structural shape, loses token boundaries).  This is the honest
+    /// minimum for non-streaming origin, where no per-token trace exists
+    /// (Worker AA design §3b option (a)).
+    ///
+    /// Same eligibility gate as `lookup` and `store` — sampling-mode
+    /// requests are NOT cached, including those carrying captured
+    /// fragments (storing them would mean a future greedy request could
+    /// replay a sampling outcome, violating determinism).
+    pub fn store_with_fragments(
+        &mut self,
+        prompt_tokens: &[u32],
+        params: &SamplingParams,
+        result: &GenerationResult,
+        fragments: Option<Vec<CachedFragment>>,
     ) {
         if params.temperature > 0.0
             || params.top_k > 0
@@ -1363,6 +1461,7 @@ impl PromptCache {
         self.completion_tokens = result.completion_tokens;
         self.reasoning_tokens = result.reasoning_tokens;
         self.finish_reason = result.finish_reason;
+        self.fragments = fragments;
     }
 }
 
@@ -6661,6 +6760,176 @@ assistant:
             "identical full-inventory params must hit cache"
         );
         assert_eq!(hit.unwrap().text, "full-inventory-hit");
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // ADR-005 iter-224 W-A2.1 — PromptCache fragment-replay scaffolding
+    // ────────────────────────────────────────────────────────────────
+    //
+    // These tests pin the type addition (CachedFragment enum +
+    // `fragments: Option<Vec<...>>` field on PromptCache + the new
+    // `store_with_fragments` method) without exercising the streaming
+    // capture path (W-A2.2) or the replay branch (W-A2.3) yet.
+    //
+    // Worker AA design report: /tmp/cfa-cfa-audit/prompt-cache-fragment-replay-design.md.
+
+    /// Round-trip: `store(...)` (the legacy single-arg API) must persist
+    /// `fragments = None`, matching the non-streaming-origin honest-
+    /// minimum behaviour (Worker AA design §3b option (a)).
+    #[test]
+    fn prompt_cache_store_with_none_fragments_round_trip() {
+        let tokens: Vec<u32> = vec![1, 2, 3];
+        let params = SamplingParams::default();
+        let result = GenerationResult {
+            text: "hello world".to_string(),
+            reasoning_text: None,
+            prompt_tokens: tokens.len(),
+            completion_tokens: 7,
+            reasoning_tokens: None,
+            finish_reason: "stop",
+            prefill_duration: Duration::ZERO,
+            decode_duration: Duration::ZERO,
+            cached_tokens: 0,
+        };
+
+        let mut cache = PromptCache::new();
+        // Pre-store the fragments slot is None.
+        assert!(
+            cache.fragments.is_none(),
+            "fresh PromptCache must initialise fragments=None"
+        );
+        cache.store(&tokens, &params, &result);
+
+        assert_eq!(cache.tokens, tokens);
+        assert_eq!(cache.text, "hello world");
+        assert_eq!(cache.completion_tokens, 7);
+        assert_eq!(cache.finish_reason, "stop");
+        // Critical: legacy single-arg `store` MUST leave fragments=None
+        // so the replay path falls through to the splitter-rerun branch
+        // (Wave-3.5 HIGH-2 tail_buf drain preserved).
+        assert!(
+            cache.fragments.is_none(),
+            "store() (legacy single-arg API) must default fragments=None; \
+             non-streaming origin has no per-token trace and must use \
+             the splitter-rerun replay path (Worker AA design §3b)"
+        );
+
+        // Lookup hit shape: fragments are NOT surfaced in GenerationResult
+        // — they live alongside text on PromptCache and are consumed by
+        // `replay_cached_streaming_response` directly.
+        let hit = cache.lookup(&tokens, &params).expect("greedy hit");
+        assert_eq!(hit.text, "hello world");
+        assert_eq!(hit.cached_tokens, tokens.len());
+    }
+
+    /// Round-trip: `store_with_fragments(..., Some(frags))` persists the
+    /// captured `Vec<CachedFragment>` byte-for-byte, including all three
+    /// variants (Content, Reasoning, ToolCallDelta with both first-chunk
+    /// and args-chunk shapes).  This is the W-A2.3 replay-branch input.
+    #[test]
+    fn prompt_cache_store_with_some_fragments_round_trip() {
+        let tokens: Vec<u32> = vec![10, 20, 30, 40];
+        let params = SamplingParams::default();
+        let result = GenerationResult {
+            text: "<thought>plan</thought>call:foo{x:<|\"|>1<|\"|>}".to_string(),
+            reasoning_text: None,
+            prompt_tokens: tokens.len(),
+            completion_tokens: 12,
+            reasoning_tokens: Some(2),
+            finish_reason: "tool_calls",
+            prefill_duration: Duration::ZERO,
+            decode_duration: Duration::ZERO,
+            cached_tokens: 0,
+        };
+
+        // Build a fragment vec exercising all three variants and both
+        // ToolCallDelta shapes.
+        let frags = vec![
+            CachedFragment::Reasoning("plan".to_string()),
+            CachedFragment::Content("Here is a result: ".to_string()),
+            // First-chunk shape: id+call_type+name set, arguments None.
+            CachedFragment::ToolCallDelta {
+                index: 0,
+                id: Some("call_hf2q_0123456789abcdef".to_string()),
+                call_type: Some("function".to_string()),
+                name: Some("foo".to_string()),
+                arguments: None,
+            },
+            // Args-chunk shape: only `arguments` populated.
+            CachedFragment::ToolCallDelta {
+                index: 0,
+                id: None,
+                call_type: None,
+                name: None,
+                arguments: Some("{".to_string()),
+            },
+            CachedFragment::ToolCallDelta {
+                index: 0,
+                id: None,
+                call_type: None,
+                name: None,
+                arguments: Some("\"x\":1}".to_string()),
+            },
+        ];
+
+        let mut cache = PromptCache::new();
+        cache.store_with_fragments(&tokens, &params, &result, Some(frags.clone()));
+
+        assert_eq!(cache.tokens, tokens);
+        assert_eq!(cache.text, result.text);
+        assert_eq!(cache.completion_tokens, 12);
+        assert_eq!(cache.reasoning_tokens, Some(2));
+        assert_eq!(cache.finish_reason, "tool_calls");
+        let stored = cache
+            .fragments
+            .as_ref()
+            .expect("Some(fragments) must persist verbatim");
+        assert_eq!(
+            stored, &frags,
+            "stored fragment vec must equal the input vec byte-for-byte; \
+             any divergence breaks the W-A2.3 byte-identity contract"
+        );
+
+        // Sampling-mode bypass: storing with sampling params (temperature
+        // > 0) MUST NOT persist anything — this matches the legacy `store`
+        // semantics and prevents a future greedy request from replaying a
+        // sampling outcome.
+        let mut sampling_params = SamplingParams::default();
+        sampling_params.temperature = 0.7;
+        let mut cache2 = PromptCache::new();
+        cache2.store_with_fragments(&tokens, &sampling_params, &result, Some(frags));
+        assert!(
+            cache2.tokens.is_empty(),
+            "sampling-mode (temperature>0) store_with_fragments must bypass write"
+        );
+        assert!(
+            cache2.fragments.is_none(),
+            "sampling-mode bypass leaves fragments at default (None)"
+        );
+    }
+
+    /// H3 hypothesis pin (Worker AA design §3e): `CachedFragment`
+    /// memory footprint is bounded.  Asserts the enum's `size_of` is
+    /// reasonable; single-slot cache means total worst-case ~15–20 KB
+    /// at 150 fragments — negligible vs. the model itself.
+    ///
+    /// Rust enum size is determined by the largest variant.  The
+    /// `ToolCallDelta` variant carries 4 `Option<String>` (each 24 bytes
+    /// with non-null-pointer niche optimisation) + 1 `usize` + tag.
+    /// That fixes the union at ~104 bytes today.  The 128-byte budget
+    /// includes a small slack for layout-padding shifts.  If a future
+    /// edit pushes the enum past this budget, surface the regression
+    /// instead of hiding it.
+    #[test]
+    fn cached_fragment_size_of_is_bounded() {
+        let size = std::mem::size_of::<CachedFragment>();
+        assert!(
+            size <= 128,
+            "CachedFragment size_of={} bytes; design budget is ≤128 bytes \
+             (Worker AA §3e: single-slot ⇒ ~15–20 KB worst case at 150 frags). \
+             A regression past this means the variant layout grew unexpectedly.",
+            size
+        );
     }
 
     // ────────────────────────────────────────────────────────────────
