@@ -1160,7 +1160,15 @@ impl Qwen35Model {
                 let device = MlxDevice::new().context("ensure_gpu_cache_primed: MlxDevice::new")?;
                 let mut registry = KernelRegistry::new();
                 mlx_native::ops::flash_attn_prefill::register(&mut registry);
-                let layer_weights = self.upload_layer_weights_gpu(&device)?;
+                // Wave 5b.8 profiling — keep `UploadWeights` accounting in the
+                // primed path too, now that ADR-013 P19 H12 has lifted this
+                // to the model-load-time call site.
+                let layer_weights = {
+                    let _t = super::wave5b8_profile::Section::start(
+                        super::wave5b8_profile::SectionKind::UploadWeights,
+                    );
+                    self.upload_layer_weights_gpu(&device)?
+                };
                 let lm_head_f32 =
                     upload_f32_weight(&self.output_weight, &device).context("upload lm_head")?;
                 let n_w = self.output_weight.len();
@@ -1287,82 +1295,23 @@ impl Qwen35Model {
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;
-        let self_ptr = self as *const _ as *const ();
 
         // ---- Acquire GPU device + kernel registry + per-layer weights ----
         //
-        // Weights are expensive to upload (25 GB GGUF).  We cache them in a
-        // thread-local on first call and reuse across all decode tokens.
-        // If the model pointer changes (rare; only on model swap) we rebuild.
-        GPU_CACHE.with(|cell| -> Result<()> {
-            let mut cache = cell.borrow_mut();
-            if cache.as_ref().map_or(true, |c| c.model_ptr != self_ptr) {
-                let device = MlxDevice::new().context("forward_gpu: MlxDevice::new")?;
-                let mut registry = KernelRegistry::new();
-                // Wave 5b.10: register flash_attn_prefill kernel family for
-                // the Qwen3.5 FA prefill path (replaces legacy `sdpa`).
-                // Mirrors `src/serve/gpu.rs:64` (Gemma's GpuContext).
-                mlx_native::ops::flash_attn_prefill::register(&mut registry);
-                // Wave 5b.8: time the one-time `upload_layer_weights_gpu`
-                // first-call cost (~17 GB Q4 materialization onto Metal heap).
-                let layer_weights = {
-                    let _t = super::wave5b8_profile::Section::start(
-                        super::wave5b8_profile::SectionKind::UploadWeights,
-                    );
-                    self.upload_layer_weights_gpu(&device)?
-                };
-                // W-5b.7 iter 2: lm_head F32 / Q4_0 + output_norm join the
-                // weight pool's residency set via the `_weight` / Q4_0
-                // helpers (which auto-register).
-                let lm_head_f32 =
-                    upload_f32_weight(&self.output_weight, &device).context("upload lm_head")?;
-                // Pre-cast lm_head F32 → BF16 once at load time.
-                // apply_linear_projection_f32 detects DType::BF16 and skips
-                // the per-token cast (~2ms saved per decode step).
-                let n_w = self.output_weight.len();
-                let lm_head_bf16 = {
-                    let bf16_buf = device
-                        .alloc_buffer(n_w * 2, DType::BF16, vec![n_w])
-                        .map_err(|e| anyhow!("alloc lm_head_bf16: {e}"))?;
-                    let mut enc = device.command_encoder().context("enc lm_head_bf16 cast")?;
-                    mlx_native::ops::elementwise::cast(
-                        &mut enc,
-                        &mut registry,
-                        device.metal_device(),
-                        &lm_head_f32,
-                        &bf16_buf,
-                        n_w,
-                        mlx_native::ops::elementwise::CastDirection::F32ToBF16,
-                    )
-                    .context("cast lm_head F32→BF16 at load")?;
-                    enc.commit_and_wait().context("commit lm_head cast")?;
-                    // W-5b.7 iter 2: register the BF16 lm_head copy.
-                    super::weight_pool::register_weight_buffer(&device, &bf16_buf)
-                        .map_err(|e| anyhow!("register lm_head_bf16: {e}"))?;
-                    bf16_buf
-                };
-                // Pre-quantize lm_head to Q4_0 for decode (M=1) — 3.57× less
-                // bandwidth vs BF16 (~1.5ms vs ~5.4ms per decode step).
-                // K=hidden_size=7168 is divisible by 32, so Q4_0 is valid.
-                let lm_head_q4 = upload_q4_0_from_f32(&self.output_weight, &device)
-                    .context("upload lm_head_q4")?;
-                let output_head = OutputHeadGpu {
-                    norm_w: upload_f32_weight(&self.output_norm, &device)
-                        .context("upload output_norm")?,
-                    lm_head_bf16,
-                    lm_head_q4,
-                };
-                *cache = Some(ForwardGpuCache {
-                    model_ptr: self_ptr,
-                    device,
-                    registry,
-                    layer_weights,
-                    output_head,
-                    decode_bufs: None, // initialized lazily on first greedy decode
-                });
-            }
-            Ok(())
-        })?;
+        // Weights are expensive to upload (~17 GB Q4 onto Metal heap). The
+        // pre-existing `ensure_gpu_cache_primed` method does the upload +
+        // lm_head BF16/Q4_0 pre-quant + flash_attn_prefill kernel registration
+        // and caches everything in a per-thread `GPU_CACHE` keyed by `self`
+        // pointer. Calling it here is idempotent: first-call from a non-warmed
+        // path still works, repeat calls are O(1).
+        //
+        // ADR-013 P19 H12 (2026-05-01): `cmd_generate_qwen35` now invokes
+        // `ensure_gpu_cache_primed` AFTER `Qwen35Model::load_from_gguf` but
+        // BEFORE `prefill_start = Instant::now()`, so the one-shot ~17 GB
+        // upload no longer pollutes the prefill timer. Compute is unchanged;
+        // only the timer-span moves to expose llama.cpp-comparable
+        // `prompt eval time` semantics. Verified by 3-rep cold bench.
+        self.ensure_gpu_cache_primed()?;
 
         // ---- Upload positions buffer ----
         // Positions change every call (new token index) so they cannot be cached.
@@ -1429,6 +1378,36 @@ impl Qwen35Model {
             &device,
         );
 
+        // ---- ADR-013 P21 S1: FaPrefillArena allocation ----
+        //
+        // Allocated ONCE per prefill (seq_len > 1), sized for the actual prompt
+        // length and the FA shape (n_heads, n_kv_heads, head_dim). Reused across
+        // all FullAttn layers in the loop below.
+        //
+        // Lifetime: dropped at end of forward_gpu_impl, AFTER the final
+        // output-head commit_and_wait_labeled — which guarantees all arena
+        // buffers are still alive when any CB that references them executes.
+        //
+        // Skip when seq_len == 1 (decode): decode never enters the FA prefill
+        // bridge or the prefill branches of ops1-4 / ops6-7 commits. All decode
+        // paths already use commit_labeled (no wait).
+        //
+        // Skip when the model has no FullAttn layers: defensive — avoids a zero-
+        // useful arena allocation when running DN-only models.
+        let mut fa_arena: Option<super::FaPrefillArena> = if seq_len > 1
+            && layer_weights_gpu.iter().any(|l| matches!(l, LayerWeightsGpu::FullAttn { .. }))
+        {
+            let shape = FullAttnShape::from_config(cfg);
+            Some(
+                super::FaPrefillArena::new(
+                    &device, seq_len, shape.n_head, shape.n_kv, shape.head_dim,
+                )
+                .context("alloc FaPrefillArena")?,
+            )
+        } else {
+            None
+        };
+
         // ---- Step 2: per-layer forward pass ----
         let decode_profile = std::env::var("HF2Q_DECODE_PROFILE").is_ok();
         let mut total_attn_us = 0u64;
@@ -1437,7 +1416,54 @@ impl Qwen35Model {
         let mut total_residual_us = 0u64;
         let mut total_linear_attn_us = 0u64;
         let mut total_full_attn_us = 0u64;
+
+        // ADR-013 P20 (2026-05-01) — K-batched FFN terminal commit.
+        //
+        // The per-layer FFN terminal `commit_and_wait_labeled` accounts for
+        // 40 of the 161 commit_and_wait calls per Qwen3.6 35B-A3B prefill
+        // (P19 H9 measurement, commit `270eaae`). Each commit costs ~1.32 ms
+        // floor on M5 Max → ~52 ms wasted on per-layer sync at K=1.
+        //
+        // With K>1 we replace the FFN terminal `commit_and_wait_labeled` with
+        // a non-waiting `commit_labeled` for layers where (layer_idx + 1) % K
+        // != 0; the K-th layer in each window keeps its `commit_and_wait` so
+        // host gets back its sync. Pool reset (`reset_for_prefill_chunk`) is
+        // ALSO deferred to K-boundaries so pooled scratches that remain
+        // GPU-referenced across the K-window are not recycled mid-flight (the
+        // W-5b.14 / iter58b residency-rescission failure mode).
+        //
+        // SAFE DEFAULT: K=1 (env unset) is byte-identical to pre-P20 behaviour.
+        // Operator opts in via `HF2Q_FFN_TERMINAL_K_BATCH=N` for N>=2. Bench
+        // before promoting any K>1 to default per
+        // `feedback_evidence_first_no_blind_kernel_rewrites`.
+        //
+        // Decode (seq_len == 1) keeps the existing `commit()` (no wait) path
+        // and per-token `reset_decode_pool` — the K-batch only applies to
+        // prefill (seq_len > 1).
+        let n_layers = layer_weights_gpu.len();
+        // ADR-013 P21 stage-2c (2026-05-01): K=8 promoted to default after
+        // Stage 2 (GPU-side KV cache write) eliminated the FA fa.ops1_4
+        // host wait. K-batch ladder bench at pp80 + tg32 (5-cold-run median):
+        //   K=1 (pre-Stage-3a baseline): 199 t/s prefill, sync_count=161
+        //   K=4 (Stage 3b post-Stage-3a): 439 t/s, sync_count=21
+        //   K=8 (this commit, post-Stage-2): 582 t/s, sync_count=6
+        //   K=20: 599 t/s, sync_count=3 (3% over K=8, diminishing returns)
+        //   K=40: 598 t/s, sync_count=2 (no further gain — structural floor)
+        // K=8 is the sweet spot: 5x sync_count drop vs K=1 with 3% headroom
+        // remaining at K=20+. Operator can override via env for memory-
+        // constrained settings (smaller K = smaller pool peak).
+        let ffn_terminal_k_batch: usize = std::env::var("HF2Q_FFN_TERMINAL_K_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&k| k >= 1)
+            .unwrap_or(8);
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
+            // K-boundary: last layer in the window OR final layer overall.
+            // At K=1 every layer is a boundary (= current behaviour).
+            let is_k_boundary = seq_len == 1
+                || ffn_terminal_k_batch <= 1
+                || (layer_idx + 1) % ffn_terminal_k_batch == 0
+                || (layer_idx + 1) == n_layers;
             let layer_cpu = &self.layers[layer_idx];
 
             // ADR-015 iter61a-3: thread-local tag for within-layer dump call sites.
@@ -1507,6 +1533,7 @@ impl Qwen35Model {
                         shape.rope_theta,
                         shape.mrope_section,
                         shape.rms_norm_eps,
+                        fa_arena.as_mut(),
                     )
                     .with_context(|| format!("full_attn layer {layer_idx}"))?
                 }
@@ -1860,11 +1887,17 @@ impl Qwen35Model {
                         .with_context(|| format!("dense_ffn_q_into fused layer {layer_idx}"))?;
                         if seq_len == 1 {
                             enc.commit();
-                        } else {
+                        } else if is_k_boundary {
                             enc.commit_and_wait_labeled("layer.dense_ffn")
                                 .with_context(|| {
                                     format!("commit fused-DenseQ layer {layer_idx}")
                                 })?;
+                        } else {
+                            // ADR-013 P20: K-batched FFN terminal — commit
+                            // without waiting. The next K-boundary's
+                            // commit_and_wait drains all in-flight CBs on
+                            // the Metal serial queue, including this one.
+                            enc.commit_labeled("layer.dense_ffn");
                         }
                         out
                     };
@@ -1935,11 +1968,20 @@ impl Qwen35Model {
                     .with_context(|| format!("moe_ffn_q_into fused layer {layer_idx}"))?;
                     if seq_len == 1 {
                         enc.commit();
-                    } else {
+                    } else if is_k_boundary {
                         enc.commit_and_wait_labeled("layer.moe_ffn")
                             .with_context(|| {
                                 format!("commit fused-MoeQ layer {layer_idx}")
                             })?;
+                    } else {
+                        // ADR-013 P20: K-batched FFN terminal — commit
+                        // without waiting. The next K-boundary's
+                        // commit_and_wait drains all in-flight CBs on the
+                        // Metal serial queue, including this one. Pool
+                        // reset is also gated on is_k_boundary below so
+                        // these pooled scratches are not recycled while
+                        // still GPU-referenced.
+                        enc.commit_labeled("layer.moe_ffn");
                     }
                     out
                 }
@@ -2103,7 +2145,16 @@ impl Qwen35Model {
             // pool's `in_use` list contains only this-layer allocations.  We
             // skip the redundant call at decode for clarity and to leave the
             // W-5b.10/W-5b.14 decode profiling unchanged.
-            if seq_len > 1 && std::env::var("HF2Q_DENSE_Q_ARENA_RESET").as_deref() != Ok("0") {
+            // ADR-013 P20: pool reset gated on is_k_boundary. At K=1 (default)
+            // every layer resets, matching W-5b.15 behaviour. At K>1 the reset
+            // fires only at the K-th layer in each window — pooled scratches
+            // for the K-window stay in `in_use` until the K-boundary's
+            // commit_and_wait drains all in-flight CBs, then the reset moves
+            // them all back to the free list at once.
+            if seq_len > 1
+                && is_k_boundary
+                && std::env::var("HF2Q_DENSE_Q_ARENA_RESET").as_deref() != Ok("0")
+            {
                 super::decode_pool::reset_for_prefill_chunk();
             }
         }
@@ -3020,6 +3071,7 @@ impl Qwen35Model {
                             shape.rope_theta,
                             shape.mrope_section,
                             shape.rms_norm_eps,
+                            None,
                         )
                         .with_context(|| format!("full_attn legacy greedy layer {layer_idx}"))?
                     }

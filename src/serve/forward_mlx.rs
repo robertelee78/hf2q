@@ -52,55 +52,25 @@ fn profiling_enabled() -> bool {
     INVESTIGATION_ENV.mlx_profile
 }
 
-/// iter-34 (ADR-015 §iter34, 2026-04-29): dense-SDPA-on-TQ-KV is the **default**
-/// for the gemma `forward_mlx` decode path.
-///
-/// Locks in iter33's measured Defect B closure: gemma-26B-dwq cn=1 ratio
-/// 0.8356× → 0.9553× (+11.97pp absolute, +14.32% relative; 5 cold-SoC trials,
-/// median 87.9 → 100.5 t/s, llama same-day median 105.20 t/s — see
-/// `/tmp/iter33-bench/perf/results.txt` and ADR-015 §iter33). Output is
-/// byte-identical across the 5 trials (md5 `dce9cb3b…` text-only) and produces
-/// coherent English semantically aligned with the legacy TQ SDPA path.
-///
-/// Semantics:
-/// * **Default (env unset)** → `true`: K/V are TQ-encoded as before, but
-///   simultaneously dequantized into the F32 shadow cache (`leg_f_kvs`)
-///   and the dense `flash_attn_vec` kernel dispatches on the shadow.
-/// * `HF2Q_LEGACY_TQ_SDPA=1` → `false`: opt-out — restores the pre-iter34
-///   `flash_attn_vec_tq` inner-loop path bit-for-bit.
-/// * `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=0` → `false`: back-compat alias for
-///   the same opt-out (legacy ablation flag, kept so existing scripts
-///   that explicitly turned the gate off continue to do so).
-/// * `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=1` → `true`: back-compat alias for
-///   the new default (no-op; pre-iter34 ablation flag).
-///
-/// Resolved exactly once per process via `OnceLock` (cheap hot-path read).
-/// Affects the gemma `forward_mlx` path only — the qwen35 `forward_gpu`
-/// path is structurally distinct and unchanged by this flip.
-pub(crate) fn dense_sdpa_on_tq_kv_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let legacy_opt_out =
-            std::env::var("HF2Q_LEGACY_TQ_SDPA").ok().as_deref() == Some("1");
-        let force_dense_explicit = std::env::var("HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV").ok();
-        let force_dense_off = force_dense_explicit.as_deref() == Some("0");
-        let enabled = !(legacy_opt_out || force_dense_off);
-        if !enabled {
-            eprintln!(
-                "[HF2Q_LEGACY_TQ_SDPA] iter34: legacy TQ SDPA inner-loop \
-                 restored (opt-out via {})",
-                if legacy_opt_out { "HF2Q_LEGACY_TQ_SDPA=1" }
-                else { "HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=0" }
-            );
-        } else if force_dense_explicit.as_deref() == Some("1") {
-            eprintln!(
-                "[HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV] iter34: explicit =1 alias \
-                 (no-op; matches new default)"
-            );
-        }
-        enabled
-    })
-}
+// iter-222 (ADR-005 closure, 2026-05-01): the iter-34 `dense_sdpa_on_tq_kv_enabled`
+// helper + `HF2Q_LEGACY_TQ_SDPA` / `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV` env vars +
+// the dense-on-shadow Leg F decode branch + the `leg_f_kvs` shadow cache field
+// were deleted entirely. Iter34 routed TQ-regime SDPA through the dense
+// `flash_attn_vec` kernel on a TQ→F32 shadow cache to lock in iter33's
+// +11.97pp single-regime perf gain, but iter-222's bisect proved that path
+// breaks Gate H (TQ-active two-regime decode quality envelope, ADR-007
+// §853-866) — the encode→F32-shadow→decode round-trip introduced
+// quantization noise the inline-fused `flash_attn_vec_tq` / `flash_attn_vec_tq_hb`
+// kernels do not have. Worker R's TurboQuant peer-impl research (TheTom
+// llama.cpp Phase 4b, animehacker CUDA, ollama mverrilli, sharpner-MLX V2,
+// vivekvar-dl turbokv) found every shipping production engine uses inline-fused
+// dequant as the default; the dequant-then-dense path is universally treated
+// as an ablation. Per the user's mantra ("Fallback is basically a swear word
+// to me — it's giving up"; "claiming we do TQ but falling back to not TQ ==
+// bullshit") the iter-34 path was a fallback in the mantra's sense and is
+// removed. The inline-fused TQ-native kernels (`flash_attn_vec_tq` for
+// `HF2Q_TQ_CODEBOOK_BITS=4`, `flash_attn_vec_tq_hb` for the default 5/6/8-bit
+// HB path) are now the SOLE TQ production path.
 
 /// Accumulated per-kernel-type timing for one token.
 #[derive(Default, Clone)]
@@ -556,31 +526,21 @@ pub struct MlxModelWeights {
     pub dense_kvs: Option<Vec<DenseKvBuffers>>,
     /// Tmp buffer for flash_attn_vec when using dense decode.
     pub dense_sdpa_tmp: Option<MlxBuffer>,
-    /// iter-20 Leg F → iter-34 default: F32 KV shadow cache filled from TQ
-    /// dequant each step.
+    // iter-20 Leg F `leg_f_kvs` + `leg_f_sdpa_tmp` shadow-cache fields deleted
+    // iter-222 (2026-05-01) along with the iter-34 dense-on-shadow Leg F decode
+    // branch and `dense_sdpa_on_tq_kv_enabled()` helper. See the file-level
+    // iter-222 closure note above the deleted helper site for the rationale
+    // (Gate H regression + peer-impl research + "no fallback" mantra). The
+    // inline-fused TQ-native kernels (`flash_attn_vec_tq` / `flash_attn_vec_tq_hb`)
+    // read directly from the TQ-packed `kv_caches[layer].{k,v}_packed` and
+    // `leg_hb_encoded` buffers respectively — no F32 shadow cache required.
+
+    /// iter-21 Track B: byte-packed higher-bit (5/6/8-bit) KV encoded cache.
     ///
-    /// **Default (since ADR-015 §iter34, 2026-04-29):** populated and used.
-    /// K/V are still TQ-encoded but simultaneously dequantized into these F32
-    /// buffers; the dense `flash_attn_vec` kernel then operates on the
-    /// dequantized K/V, isolating SDPA math from TQ representation noise.
-    /// Locks in iter33's measured +11.97pp gemma closure
-    /// (cn=1 ratio 0.8356× → 0.9553× vs llama; see `dense_sdpa_on_tq_kv_enabled`).
-    ///
-    /// **Opt-out (`HF2Q_LEGACY_TQ_SDPA=1` or back-compat
-    /// `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=0`):** the shadow cache is not
-    /// allocated and the legacy `flash_attn_vec_tq` inner-loop runs
-    /// bit-for-bit identical to the pre-iter34 path.
-    ///
-    /// Same layout as `dense_kvs`: `[nkv_heads, capacity, head_dim]` F32,
-    /// ring-buffer for sliding layers, linear for global layers.
-    pub leg_f_kvs: Option<Vec<DenseKvBuffers>>,
-    /// Tmp buffer for flash_attn_vec in Leg F path.
-    pub leg_f_sdpa_tmp: Option<MlxBuffer>,
-    /// iter-21 Track B: byte-packed higher-bit (5/6-bit) KV encoded cache.
-    ///
-    /// When `HF2Q_TQ_CODEBOOK_BITS=5|6`, K/V are encoded to byte-packed
-    /// 5/6-bit Lloyd-Max indices via `hadamard_quantize_kv_hb`, stored here,
-    /// then dequantized into `leg_f_kvs` (F32 shadow) for dense SDPA.
+    /// When `HF2Q_TQ_CODEBOOK_BITS=5|6|8` (default 8), K/V are encoded to
+    /// byte-packed 5/6/8-bit Lloyd-Max indices via `hadamard_quantize_kv_hb`,
+    /// stored here, and consumed inline by the `flash_attn_vec_tq_hb` kernel
+    /// (no shadow-cache dequant round-trip).
     ///
     /// Layout: `[nkv_heads, capacity, head_dim]` U8 (1 byte per element).
     /// Norms: same layout as 4-bit caches (D=256: 1 norm/pos, D=512: 2/pos).
@@ -1204,8 +1164,8 @@ impl MlxModelWeights {
             intermediate_size: cfg.intermediate_size,
             dense_kvs: None,
             dense_sdpa_tmp: None,
-            leg_f_kvs: None,
-            leg_f_sdpa_tmp: None,
+            // iter-222 (2026-05-01): leg_f_kvs / leg_f_sdpa_tmp shadow-cache
+            // fields deleted along with iter-34 dense-on-shadow Leg F branch.
             leg_hb_encoded: None,
             // ADR-007 Gate H release-check counter — increments per
             // forward_decode call, used by the `[HF2Q_NLL]` / `[HF2Q_DECODE_EMIT]`
@@ -1495,8 +1455,8 @@ impl MlxModelWeights {
             kv_info.push((is_sliding, write_pos, capacity, seq_len));
         }
 
-        // iter-21 Track B: lazy allocation of leg_hb_encoded and leg_f_kvs on first decode.
-        // forward_prefill may have already allocated these; if not, do it here.
+        // iter-21 Track B: lazy allocation of leg_hb_encoded on first decode.
+        // forward_prefill may have already allocated this; if not, do it here.
         // We read from the INVESTIGATION_ENV LazyLock (parsed once at process start).
         {
             // ADR-007 post-close correction 2026-04-24: TQ-8-bit is the default when
@@ -1510,7 +1470,6 @@ impl MlxModelWeights {
             if cb_bits >= 5 && self.leg_hb_encoded.is_none() {
                 let (exec, _reg) = gpu.split();
                 let dev = exec.device();
-                let sw = self.sliding_window;
                 // Use kv_caches[0] write_pos - 1 to infer linear capacity. In practice
                 // we use the same capacity as kv_caches per layer (the KV cache was sized
                 // for the full sequence at init time).
@@ -1539,39 +1498,14 @@ impl MlxModelWeights {
                         k_packed, k_norms, v_packed, v_norms,
                         capacity: cap, is_sliding: is_ring, norms_per_pos,
                     });
-                    let _ = sw; // sw only needed for leg_f_kvs sizing which mirrors kv_caches
                 }
                 eprintln!("[iter-21 Track B] Allocated leg_hb_encoded ({} layers, {}-bit)", num_layers, cb_bits);
                 self.leg_hb_encoded = Some(leg_hb_vec);
             }
-            // Ensure leg_f_kvs shadow cache is also allocated for Track B SDPA.
-            if cb_bits >= 5 && self.leg_f_kvs.is_none() {
-                let (exec, _reg) = gpu.split();
-                let dev = exec.device();
-                let max_nh = self.num_attention_heads;
-                let max_hd = self.layers.iter().map(|l| l.head_dim).max().unwrap_or(512);
-                let mut leg_f_vec: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
-                for layer_idx in 0..num_layers {
-                    let nkv = self.layers[layer_idx].num_kv_heads;
-                    let hd = self.layers[layer_idx].head_dim;
-                    let is_ring = self.kv_caches[layer_idx].is_sliding;
-                    let cap = self.kv_caches[layer_idx].capacity;
-                    let n = nkv * cap * hd;
-                    let k = dev.alloc_buffer(n * 4, mlx_native::DType::F32, vec![nkv, cap, hd])
-                        .map_err(|e| anyhow::anyhow!("leg_f K lazy L{layer_idx}: {e}"))?;
-                    let v = dev.alloc_buffer(n * 4, mlx_native::DType::F32, vec![nkv, cap, hd])
-                        .map_err(|e| anyhow::anyhow!("leg_f V lazy L{layer_idx}: {e}"))?;
-                    leg_f_vec.push(DenseKvBuffers { k, v, capacity: cap, is_sliding: is_ring });
-                }
-                let tmp_bytes = mlx_native::ops::flash_attn_vec::tmp_buffer_bytes(
-                    max_nh as u32, max_hd as u32);
-                let leg_f_tmp = dev.alloc_buffer(tmp_bytes, mlx_native::DType::F32,
-                    vec![tmp_bytes / 4])
-                    .map_err(|e| anyhow::anyhow!("leg_f_sdpa_tmp lazy: {e}"))?;
-                eprintln!("[iter-21 Track B] Allocated leg_f_kvs shadow cache ({} layers)", num_layers);
-                self.leg_f_kvs = Some(leg_f_vec);
-                self.leg_f_sdpa_tmp = Some(leg_f_tmp);
-            }
+            // iter-222 (2026-05-01): the lazy-allocate of `leg_f_kvs` shadow
+            // cache that lived here was deleted along with the iter-34
+            // dense-on-shadow Leg F decode branch — `flash_attn_vec_tq_hb`
+            // consumes `leg_hb_encoded` directly with no F32 round-trip.
         }
 
         // =====================================================================
@@ -1609,18 +1543,13 @@ impl MlxModelWeights {
             })
         };
 
-        // iter-34 (ADR-015 §iter34, 2026-04-29): dense SDPA on TQ-dequantized K/V
-        // is now the DEFAULT for the gemma forward_mlx path. K/V are TQ-encoded
-        // normally, then dequantized into leg_f_kvs (F32 shadow cache) and the
-        // dense `flash_attn_vec` kernel dispatches on those values instead of
-        // `flash_attn_vec_tq`. Locks in iter33's measured +11.97pp closure
-        // (0.8356× → 0.9553× cn=1 ratio vs llama, 5 cold-SoC trials × NGEN=256,
-        // byte-identical determinism — see `/tmp/iter33-bench/perf/results.txt`
-        // and ADR-015 §iter33).  Opt-out: `HF2Q_LEGACY_TQ_SDPA=1` (or back-compat
-        // `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=0`) restores the pre-iter34 TQ SDPA
-        // inner-loop bit-for-bit.  See `dense_sdpa_on_tq_kv_enabled` (forward_mlx.rs)
-        // for the full env-var contract and parity rationale.
-        let force_dense_sdpa_on_tq_kv: bool = dense_sdpa_on_tq_kv_enabled();
+        // iter-222 (ADR-005 closure, 2026-05-01): the iter-34 `force_dense_sdpa_on_tq_kv`
+        // gate that lived here was deleted — see file-level iter-222 closure
+        // note above the (now-deleted) `dense_sdpa_on_tq_kv_enabled()` site for
+        // rationale. TQ-regime SDPA now flows through the inline-fused
+        // `flash_attn_vec_tq` (cb_bits=4) / `flash_attn_vec_tq_hb` (cb_bits>=5)
+        // kernels unconditionally — peer-correct production paths that read
+        // TQ-packed K/V directly with no F32 shadow-cache round-trip.
 
         // iter-21 Track B + 2026-04-24 post-close default correction.
         // HF2Q_TQ_CODEBOOK_BITS selects the KV codebook width.
@@ -1659,9 +1588,9 @@ impl MlxModelWeights {
                 }
             })
         };
-        // iter-24: native HB SDPA replaces force-dense-SDPA for all higher-bit paths.
-        // force_dense_sdpa_on_tq_kv_hb is now FALSE — we use flash_attn_vec_tq_hb directly.
-        let _force_dense_sdpa_on_tq_kv_hb = false;
+        // iter-24: native HB SDPA via `flash_attn_vec_tq_hb` for cb_bits >= 5
+        // (default 8). Reads TQ-packed K/V directly from `leg_hb_encoded` —
+        // no F32 shadow-cache round-trip.
         let use_native_hb_sdpa = tq_codebook_bits >= 5;
 
         let session_start = Instant::now();
@@ -1973,10 +1902,12 @@ impl MlxModelWeights {
 
                 // iter-24: higher-bit (5/6/8-bit) KV encode into leg_hb_encoded.
                 // When HF2Q_TQ_CODEBOOK_BITS=5|6|8, encode K/V to byte-packed HB format
-                // for native HB SDPA dispatch.
-                // iter-49 H1: skip HB-encode under iter34's dense-SDPA default — Leg F path
-                // (Branch B at ~L2496) reads leg_f_kvs, not leg_hb_encoded (Branch C reader at ~L2675).
-                if use_native_hb_sdpa && !INVESTIGATION_ENV.skip_tq_encode && !force_dense_sdpa_on_tq_kv {
+                // for native HB SDPA dispatch via `flash_attn_vec_tq_hb` (which reads
+                // `leg_hb_encoded` directly — no F32 shadow-cache round-trip).
+                // iter-222 (2026-05-01): the `&& !force_dense_sdpa_on_tq_kv` gate
+                // that suppressed this block under iter-34's dense-on-shadow
+                // default was deleted along with the iter-34 Leg F branch.
+                if use_native_hb_sdpa && !INVESTIGATION_ENV.skip_tq_encode {
                     if let Some(ref leg_hb_enc) = self.leg_hb_encoded {
                         let cache_pos_val = if kv_is_sliding {
                             (kv_write_pos % kv_capacity) as u32
@@ -2315,6 +2246,11 @@ impl MlxModelWeights {
                 // calling std::env::var per-token per-layer. Behavior is bit-identical:
                 // `use_dense` mirrors `== Ok("1")`; `layer_policy.as_deref()` mirrors
                 // `as_deref()` on the Result, with None mapping to the former Err(_) arm.
+                // iter-222 (ADR-005 closure, 2026-05-01): the iter-50
+                // `None if force_dense_sdpa_on_tq_kv => true` arms that routed
+                // iter-34's default to Branch A (dense_kvs) were deleted — see
+                // file-level iter-222 closure note. Default now flows through
+                // the inline-fused TQ-native path below as in pre-iter-34.
                 let use_dense_sdpa = if self.dense_kvs.is_none() {
                     false
                 } else if self.gate_h_inactive {
@@ -2324,12 +2260,6 @@ impl MlxModelWeights {
                     } else {
                         match INVESTIGATION_ENV.layer_policy.as_deref() {
                             Some("dense_all") => true,
-                            // iter50: route iter34 default (force_dense_sdpa_on_tq_kv=true,
-                            // unset env) to Branch A — Leg F dispatches 8/layer (2 dequant +
-                            // 2 cache_copy + 2 FWHT + 2 flash_attn_vec) while Branch A
-                            // dispatches 4/layer (2 cache_copy + 2 flash_attn_vec) on the
-                            // already-allocated dense_kvs. Preserves explicit env opt-ins.
-                            None if force_dense_sdpa_on_tq_kv => true,
                             Some("tq_all") | None => false,
                             Some("tq_slide_dense_global") => !kv_is_sliding,
                             Some("dense_slide_tq_global") => kv_is_sliding,
@@ -2352,8 +2282,6 @@ impl MlxModelWeights {
                             } else {
                                 match INVESTIGATION_ENV.layer_policy.as_deref() {
                                     Some("dense_all") => true,
-                                    // iter50: see gate_h_inactive arm above.
-                                    None if force_dense_sdpa_on_tq_kv => true,
                                     Some("tq_all") | None => false,
                                     Some("tq_slide_dense_global") => !kv_is_sliding,
                                     Some("dense_slide_tq_global") => kv_is_sliding,
@@ -2537,179 +2465,14 @@ impl MlxModelWeights {
                         &p,
                     ).map_err(|e| anyhow::anyhow!("dense flash_attn_vec L{layer_idx}: {e}"))?;
                     total_dispatches += 2; // main + reduce
-                } else if !INVESTIGATION_ENV.skip_tq_sdpa && force_dense_sdpa_on_tq_kv {
-                    // -- Leg F: dense SDPA on TQ-dequantized K/V (iter-20 ablation) --
-                    //
-                    // K/V have already been TQ-encoded into k_packed/k_norms above.
-                    // Here we: (a) dequantize the full TQ KV cache into a F32 shadow cache
-                    // (leg_f_kvs), then (b) dispatch flash_attn_vec (dense) on those values.
-                    //
-                    // The dequantize kernel writes into the shadow cache at `kv_write_pos`.
-                    // Q remains unrotated (no FWHT pre-mult) because flash_attn_vec
-                    // operates in the original (non-rotated) domain. The dequantize
-                    // kernel writes the FWHT-rotated values, then IFWHT undoes them
-                    // to recover the original domain — but since the encoder encodes
-                    // sign*K via FWHT → quantize, and dequant → IFWHT would give sign*K_approx,
-                    // the Q · K dot product is (Q) · (sign*K_approx) / sqrt(d).
-                    //
-                    // IMPORTANT: The dequant output is in the FWHT-rotated domain.
-                    // For correct dot products with unrotated Q we need to inverse-FWHT
-                    // the dequantized K and V before storing. However, this adds complexity.
-                    // For the ablation purpose: we use pre-rotated Q (same as TQ SDPA)
-                    // + dequantized K/V (also rotated), then IFWHT the output — exactly
-                    // matching the TQ SDPA domain. This way the comparison is fair.
-                    //
-                    // Decision: pre-rotate Q via FWHT sign-premult (same as TQ path),
-                    // dequantize K/V at current position into leg_f_kvs shadow cache,
-                    // dispatch flash_attn_vec on the shadow cache, then IFWHT output.
-                    if let Some(ref leg_f_kvs) = self.leg_f_kvs {
-                        let leg_f_cap = leg_f_kvs[layer_idx].capacity;
-                        let leg_f_is_ring = leg_f_kvs[layer_idx].is_sliding;
-                        let write_slot = if leg_f_is_ring {
-                            (seq_pos % leg_f_cap) as u32
-                        } else {
-                            seq_pos as u32
-                        };
-
-                        // (a) Dequantize current position's K and V into shadow cache.
-                        // The dequant kernel reads from k_packed/k_norms at kv_write_pos
-                        // and writes [nkv, hd] f32 to a flat buffer. We then copy that
-                        // into the shadow cache at write_slot via kv_cache_copy_batch_f32.
-                        //
-                        // We reuse attn_k_normed as scratch for the single-position dequant
-                        // output (attn_k_normed is [nkv*hd] f32, which is exactly [nkv, hd]).
-                        // attn_k_normed is not used again after this point in the layer.
-                        let cache_write_pos = kv_write_pos as u32;
-                        // Wrap the physical write pos for ring buffers.
-                        let read_pos_phys = if kv_is_sliding {
-                            (kv_write_pos % kv_capacity) as u32
-                        } else {
-                            kv_write_pos as u32
-                        };
-
-                        s.barrier_between(
-                            &[&self.kv_caches[layer_idx].k_packed,
-                              &self.kv_caches[layer_idx].k_norms],
-                            &[&self.activations.attn_k_normed],
-                        );
-                        mlx_native::ops::tq_dequantize_kv::dispatch_tq_dequantize_kv(
-                            s.encoder_mut(), reg, metal_dev,
-                            &self.kv_caches[layer_idx].k_packed,
-                            &self.kv_caches[layer_idx].k_norms,
-                            &self.activations.attn_k_normed,
-                            nkv as u32, hd as u32, kv_capacity as u32,
-                            read_pos_phys, tq_scale_factor_d512,
-                        ).map_err(|e| anyhow::anyhow!("tq_dequantize_k L{layer_idx}: {e}"))?;
-                        total_dispatches += 1;
-
-                        // Copy dequantized K into shadow cache at write_slot.
-                        s.barrier_between(
-                            &[&self.activations.attn_k_normed],
-                            &[&leg_f_kvs[layer_idx].k],
-                        );
-                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
-                            s.encoder_mut(), reg, metal_dev,
-                            &self.activations.attn_k_normed,
-                            &leg_f_kvs[layer_idx].k,
-                            nkv as u32, hd as u32, leg_f_cap as u32, write_slot,
-                        ).map_err(|e| anyhow::anyhow!("leg_f K cache copy L{layer_idx}: {e}"))?;
-                        total_dispatches += 1;
-
-                        // Dequantize V: reuse attn_k_normed again (after K copy is done).
-                        let v_src_for_dq = {
-                            // v_src is attn_k_normed or attn_v — both are [nkv,hd] f32.
-                            // We need a separate read for V norms/packed.
-                            // Use activations.attn_k_normed as scratch again (K copy is committed).
-                            &self.activations.attn_k_normed
-                        };
-                        let _ = cache_write_pos; // suppress unused warning
-                        s.barrier_between(
-                            &[&self.kv_caches[layer_idx].v_packed,
-                              &self.kv_caches[layer_idx].v_norms],
-                            &[v_src_for_dq],
-                        );
-                        mlx_native::ops::tq_dequantize_kv::dispatch_tq_dequantize_kv(
-                            s.encoder_mut(), reg, metal_dev,
-                            &self.kv_caches[layer_idx].v_packed,
-                            &self.kv_caches[layer_idx].v_norms,
-                            v_src_for_dq,
-                            nkv as u32, hd as u32, kv_capacity as u32,
-                            read_pos_phys, tq_scale_factor_d512,
-                        ).map_err(|e| anyhow::anyhow!("tq_dequantize_v L{layer_idx}: {e}"))?;
-                        total_dispatches += 1;
-
-                        s.barrier_between(
-                            &[v_src_for_dq],
-                            &[&leg_f_kvs[layer_idx].v],
-                        );
-                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
-                            s.encoder_mut(), reg, metal_dev,
-                            v_src_for_dq,
-                            &leg_f_kvs[layer_idx].v,
-                            nkv as u32, hd as u32, leg_f_cap as u32, write_slot,
-                        ).map_err(|e| anyhow::anyhow!("leg_f V cache copy L{layer_idx}: {e}"))?;
-                        total_dispatches += 1;
-
-                        // (b) Pre-rotate Q for flash_attn_vec on the rotated-domain K/V.
-                        // Dequantized K/V are in FWHT-rotated domain; pre-rotate Q to match.
-                        s.barrier_between(
-                            &[&self.activations.attn_q_normed],
-                            &[&self.activations.attn_q_normed],
-                        );
-                        mlx_native::ops::fwht_standalone::dispatch_fwht_sign_premult_f32(
-                            s.encoder_mut(), reg, metal_dev,
-                            &self.activations.attn_q_normed,
-                            nh as u32, hd as u32,
-                        ).map_err(|e| anyhow::anyhow!("Leg F FWHT Q sign-premult L{layer_idx}: {e}"))?;
-                        total_dispatches += 1;
-
-                        // (c) Dense flash_attn_vec on shadow cache.
-                        let leg_f_sdpa_tmp = self.leg_f_sdpa_tmp.as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("leg_f_sdpa_tmp not allocated"))?;
-                        let leg_f_kv_seq_len = if leg_f_is_ring {
-                            ((seq_pos + 1).min(leg_f_cap)) as u32
-                        } else {
-                            (seq_pos + 1) as u32
-                        };
-                        let p = mlx_native::ops::flash_attn_vec::FlashAttnVecParams {
-                            num_heads: nh as u32,
-                            num_kv_heads: nkv as u32,
-                            head_dim: hd as u32,
-                            kv_seq_len: leg_f_kv_seq_len,
-                            kv_capacity: leg_f_cap as u32,
-                            scale: 1.0,
-                            mask_type: 1, // causal; ring handles the sliding constraint
-                            sliding_window: 0,
-                            softcap: 0.0,
-                        };
-                        s.barrier_between(
-                            &[&self.activations.attn_q_normed,
-                              &leg_f_kvs[layer_idx].k, &leg_f_kvs[layer_idx].v],
-                            &[&self.activations.sdpa_out],
-                        );
-                        mlx_native::ops::flash_attn_vec::flash_attn_vec(
-                            s.encoder_mut(), reg, dev,
-                            &self.activations.attn_q_normed,
-                            &leg_f_kvs[layer_idx].k,
-                            &leg_f_kvs[layer_idx].v,
-                            &self.activations.sdpa_out,
-                            leg_f_sdpa_tmp,
-                            &p,
-                        ).map_err(|e| anyhow::anyhow!("Leg F flash_attn_vec L{layer_idx}: {e}"))?;
-                        total_dispatches += 2; // main + reduce
-
-                        // (d) Inverse-rotate SDPA output (matches TQ path sign-undo).
-                        s.barrier_between(
-                            &[&self.activations.sdpa_out],
-                            &[&self.activations.sdpa_out],
-                        );
-                        mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
-                            s.encoder_mut(), reg, metal_dev,
-                            &self.activations.sdpa_out,
-                            nh as u32, hd as u32,
-                        ).map_err(|e| anyhow::anyhow!("Leg F FWHT sign-undo L{layer_idx}: {e}"))?;
-                        total_dispatches += 1;
-                    }
+                // iter-222 (ADR-005 closure, 2026-05-01): the iter-20 Leg F /
+                // iter-34 dense-on-shadow decode branch was deleted entirely
+                // here (~170 LOC) — see file-level iter-222 closure note above
+                // the (now-deleted) `dense_sdpa_on_tq_kv_enabled()` site for
+                // rationale (Gate H regression + peer-impl research +
+                // "no fallback" mantra). TQ-regime SDPA now flows through the
+                // inline-fused `flash_attn_vec_tq_hb` (cb_bits>=5, default 8)
+                // or `flash_attn_vec_tq` (cb_bits=4 legacy) branches below.
                 } else if !INVESTIGATION_ENV.skip_tq_sdpa && use_native_hb_sdpa {
                     // -- iter-24: native HB SDPA (5/6/8-bit byte-packed K/V) --
                     //

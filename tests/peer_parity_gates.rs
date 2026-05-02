@@ -103,6 +103,26 @@ mod quality {
     pub use super::perplexity;
 }
 
+mod serve {
+    //! ADR-018 C3 stub: see `tests/ppl_driver.rs::serve::header` for
+    //! the rationale. Mirrors the public surface of
+    //! `src/serve/header.rs::LoadProgress` so the `#[path]`-included
+    //! `ppl_driver.rs` and the stubbed `Qwen35Model::load_from_gguf`
+    //! both type-check.
+    pub mod header {
+        pub struct LoadProgress;
+        impl LoadProgress {
+            pub fn new(_stderr_is_tty: bool, _verbosity: u8, _n_layers: usize) -> Self {
+                Self
+            }
+            #[allow(dead_code)]
+            pub fn on_layer(&mut self, _i: usize) {}
+            #[allow(dead_code)]
+            pub fn finish(&mut self) {}
+        }
+    }
+}
+
 mod inference {
     pub mod models {
         pub mod qwen35 {
@@ -151,7 +171,12 @@ mod inference {
                 }
 
                 impl Qwen35Model {
-                    pub fn load_from_gguf(_gguf: &GgufFile) -> Result<Self> {
+                    /// ADR-018 C3: signature mirrors the production
+                    /// `Qwen35Model::load_from_gguf(gguf, progress)`.
+                    pub fn load_from_gguf(
+                        _gguf: &GgufFile,
+                        _progress: &mut crate::serve::header::LoadProgress,
+                    ) -> Result<Self> {
                         Err(anyhow!(
                             "tests/peer_parity_gates.rs: stubbed Qwen35Model::load_from_gguf \
                              — production driver lives at src/quality/ppl_driver.rs and \

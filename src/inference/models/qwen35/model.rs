@@ -169,7 +169,18 @@ impl Qwen35Model {
     ///
     /// For Dense models the behaviour is unchanged: weights are dequantized
     /// to f32 via [`weight_loader::load_layer`].
-    pub fn load_from_gguf(gguf: &GgufFile) -> Result<Self> {
+    ///
+    /// `progress` drives the default-mode in-place `\r`-overwrite progress
+    /// line on stderr (mirrors the Gemma path at [`crate::serve::forward_mlx::MlxModelWeights::load_from_gguf`]).
+    /// It is a no-op when stderr isn't a TTY or verbosity > 0 (tracing
+    /// debug events then cover per-layer detail). Pass a silent progress
+    /// (`LoadProgress::new(false, 1, n_layers)`) from non-CLI call sites
+    /// — `RealActivationCapture::new`, `ppl_driver`, the integration test
+    /// at `model.rs:622` — to suppress output cleanly.
+    pub fn load_from_gguf(
+        gguf: &GgufFile,
+        progress: &mut crate::serve::header::LoadProgress,
+    ) -> Result<Self> {
         let mut cfg = Self::load_config_only(gguf)?;
 
         let device = MlxDevice::new()
@@ -278,6 +289,13 @@ impl Qwen35Model {
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers as usize);
         for i in 0..cfg.num_hidden_layers {
+            // Default-mode CLI progress line: `\r loading {i}/{n} layers`.
+            // No-op for SERVE / tests / non-TTY callers (the `progress`
+            // they pass is a `LoadProgress::new(false, 1, _)` silent
+            // sentinel). The `i+1` form matches the Gemma path
+            // (`forward_mlx::MlxModelWeights::load_from_gguf` which calls
+            // `progress.on_layer(i + 1)` per layer).
+            progress.on_layer(i as usize + 1);
             let layer = match cfg.variant {
                 Qwen35Variant::Moe => {
                     let kind = cfg
@@ -312,6 +330,11 @@ impl Qwen35Model {
             };
             layers.push(layer);
         }
+
+        // Clear the progress line so any subsequent stderr output
+        // (e.g. tracing log lines, banner emission) starts on a clean
+        // row. Mirrors the Gemma path's terminal-side hygiene.
+        progress.finish();
 
         Ok(Self {
             cfg,
@@ -619,7 +642,9 @@ mod tests {
                 return;
             }
         };
-        let m = Qwen35Model::load_from_gguf(&gguf).expect("load");
+        // Silent progress: heavyweight test runs without TTY hooks.
+        let mut progress = crate::serve::header::LoadProgress::new(false, 1, 0);
+        let m = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load");
         assert_eq!(m.cfg.variant, Qwen35Variant::Moe);
         assert_eq!(m.layers.len(), 40);
         assert_eq!(m.num_full_attn_layers(), 10);

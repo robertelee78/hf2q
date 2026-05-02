@@ -2307,6 +2307,78 @@ mod tests {
         assert_eq!(reasoning, None);
     }
 
+    /// ADR-005 Phase 4 iter C closure (2026-05-01): non-streaming
+    /// surface contract. The handler calls `split_full_output` to
+    /// extract `reasoning_text` from the raw decoded stream, THEN
+    /// `extract_tool_calls_from_text` runs over the remaining
+    /// post-reasoning content to extract tool calls. This test locks
+    /// in that `split_full_output` correctly partitions a stream that
+    /// contains BOTH reasoning markers AND tool-call markers — the
+    /// reasoning span is the only thing extracted; tool-call markers
+    /// remain in `content` for downstream tool-call splitter to
+    /// consume. Companion to the engine.rs streaming-side
+    /// `replay_routes_reasoning_then_tool_call_in_correct_order`
+    /// test. Without this, a regression that incorrectly interleaved
+    /// the two splitters in `split_full_output` would silently
+    /// surface only at LIVE-test time.
+    #[test]
+    fn split_full_output_preserves_tool_call_markers_in_content() {
+        // Qwen 3.5/3.6 reasoning span + tool-call span. The reasoning
+        // splitter only knows about reasoning markers; tool-call
+        // markers must pass through untouched into the `content`
+        // return slot.
+        let raw_stream =
+            "<think>I should call get_weather</think>OK, calling now: \
+             <tool_call>\n<function=get_weather><parameter=city>Paris</parameter></function>\n</tool_call>";
+        let (content, reasoning) = split_full_output(&QWEN35, raw_stream);
+        assert_eq!(
+            reasoning.as_deref(),
+            Some("I should call get_weather"),
+            "iter C non-streaming contract: reasoning span must be \
+             extracted verbatim, markers swallowed"
+        );
+        assert!(
+            !content.contains("<think>") && !content.contains("</think>"),
+            "iter C non-streaming contract: reasoning markers must NOT \
+             leak into content slot; got content: {content:?}"
+        );
+        assert!(
+            content.contains("<tool_call>") && content.contains("</tool_call>"),
+            "iter C+B-2 composition: tool-call markers MUST be preserved \
+             in the content slot for the downstream ToolCallSplitter to \
+             consume; ReasoningSplitter must not touch them. got content: {content:?}"
+        );
+        assert!(
+            content.contains("OK, calling now:"),
+            "iter C non-streaming contract: post-reasoning natural-language \
+             preamble must be preserved verbatim; got content: {content:?}"
+        );
+    }
+
+    /// ADR-005 Phase 4 iter C closure: non-streaming surface symmetric
+    /// contract — pure reasoning followed by EOS (no post-reasoning
+    /// content). The handler must produce `message.reasoning_content`
+    /// populated, `message.content` empty (which serializes to `""`
+    /// per OpenAI compat — the assistant gave a non-empty turn that's
+    /// just thinking). This locks in the symmetric streaming-side
+    /// `replay_streaming_origin_pure_reasoning_no_content` test at
+    /// the helper level.
+    #[test]
+    fn split_full_output_pure_reasoning_returns_empty_content() {
+        let (content, reasoning) =
+            split_full_output(&QWEN35, "<think>only thinking, no answer</think>");
+        assert_eq!(
+            reasoning.as_deref(),
+            Some("only thinking, no answer"),
+            "pure-reasoning input must produce a populated reasoning slot"
+        );
+        assert_eq!(
+            content, "",
+            "pure-reasoning input (no content after </think>) must produce \
+             empty content slot; got: {content:?}"
+        );
+    }
+
     #[test]
     fn list_families_includes_builtins() {
         let fams = list_families();

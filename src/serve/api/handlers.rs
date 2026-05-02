@@ -6225,6 +6225,15 @@ pub async fn list_models(State(state): State<AppState>) -> Response {
     // strict subset (one entry, max).  The OpenAI `loaded` boolean
     // extension reflects pool residency: any model present in
     // `pool.snapshot_engines()` reports `loaded: true`.
+    //
+    // ADR-018 C5: the live-engine path now sources the unified `LoadInfo`
+    // snapshot via `engine.info()` and surfaces the new optional fields
+    // (`arch`, `max_context_length`, `provenance`, `moe_*`,
+    // `sliding_window`, `kv_spill_active`, `quant_bpw`) through
+    // `model_object_from_load_info`. When an existing cache-scanned entry
+    // matches the loaded model_id, we *also* enrich it in place — the
+    // operator's `/v1/models` view is consistent regardless of cache-scan
+    // vs hot-pool ordering.
     let pool_snapshot: Vec<_> = state
         .pool
         .read()
@@ -6233,28 +6242,25 @@ pub async fn list_models(State(state): State<AppState>) -> Response {
         .unwrap_or_default();
     for le in pool_snapshot.iter() {
         let loaded_id = le.engine.model_id().to_string();
+        let info = le.engine.info();
         match models.iter_mut().find(|m| m.id == loaded_id) {
-            Some(m) => m.loaded = true,
+            Some(m) => {
+                m.loaded = true;
+                enrich_model_object_from_load_info(m, info);
+            }
             None => {
-                models.insert(
-                    0,
-                    ModelObject {
-                        id: loaded_id,
-                        object: "model",
-                        created: chrono_seconds(),
-                        owned_by: "hf2q",
-                        context_length: le.engine.context_length(),
-                        quant_type: le.engine.quant_type().map(|s| s.to_string()),
-                        backend: Some("mlx-native"),
-                        loaded: true,
-                    },
-                );
+                models.insert(0, model_object_from_load_info(loaded_id, info, true));
             }
         }
     }
     // Prepend the embedding model if one was supplied via --embedding-model.
     // Listed with `loaded: true` since the config is resident in memory even
     // if the forward-pass path isn't wired yet.
+    //
+    // ADR-018 C5: the embedding model has no `LoadInfo` snapshot today
+    // (it's wired through `EmbeddingModel`, not `Engine`), so the new
+    // optional fields stay `None` here — backward-compatible with pre-C5
+    // consumers.
     if let Some(em) = state.embedding_config.as_ref() {
         if !models.iter().any(|m| m.id == em.model_id) {
             models.insert(
@@ -6272,6 +6278,14 @@ pub async fn list_models(State(state): State<AppState>) -> Response {
                     quant_type: None,
                     backend: Some("mlx-native"),
                     loaded: true,
+                    arch: None,
+                    max_context_length: None,
+                    provenance: None,
+                    moe_experts: None,
+                    moe_experts_per_tok: None,
+                    sliding_window: None,
+                    kv_spill_active: None,
+                    quant_bpw: None,
                 },
             );
         }
@@ -6282,6 +6296,9 @@ pub async fn list_models(State(state): State<AppState>) -> Response {
     // their chat model. Listed with `loaded: true` — header+config are
     // resident in memory, weight loading happens on first multimodal
     // request in a later iter.
+    //
+    // ADR-018 C5: the mmproj is not engine-backed either; new optional
+    // fields stay `None`.
     if let Some(m) = state.mmproj.as_ref() {
         if !models.iter().any(|existing| existing.id == m.model_id) {
             models.insert(
@@ -6295,6 +6312,14 @@ pub async fn list_models(State(state): State<AppState>) -> Response {
                     quant_type: None,
                     backend: Some("mlx-native"),
                     loaded: true,
+                    arch: None,
+                    max_context_length: None,
+                    provenance: None,
+                    moe_experts: None,
+                    moe_experts_per_tok: None,
+                    sliding_window: None,
+                    kv_spill_active: None,
+                    quant_bpw: None,
                 },
             );
         }
@@ -6418,7 +6443,116 @@ fn inspect_gguf(path: &Path) -> Option<ModelObject> {
         // iter 2: no model is loaded at runtime. Future iter flips this to
         // `true` for the currently-loaded model entry.
         loaded: false,
+        // ADR-018 C5: cache-scanned entries have no `LoadInfo` snapshot —
+        // these fields are populated only by the live-engine path
+        // (`list_models`'s pool-snapshot enrichment). Leaving them `None`
+        // keeps the cache-scan wire shape byte-identical to pre-C5.
+        arch: None,
+        max_context_length: None,
+        provenance: None,
+        moe_experts: None,
+        moe_experts_per_tok: None,
+        sliding_window: None,
+        kv_spill_active: None,
+        quant_bpw: None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// ADR-018 C5: ModelObject ↔ LoadInfo bridge
+// ---------------------------------------------------------------------------
+
+/// Build a fresh `ModelObject` for a live-engine entry from its unified
+/// [`LoadInfo`] snapshot.
+///
+/// Used by `list_models` when the loaded model's id is not present in the
+/// cache scan (e.g. the GGUF lives outside the configured `cache_dir`).
+/// The returned entry carries `loaded: <loaded>` plus every C5 field
+/// derivable from `info`.
+///
+/// Field derivation:
+/// * `quant_type`         ← `info.quant_label` (cloned)
+/// * `quant_bpw`          ← `info.quant_bpw`
+/// * `context_length`     ← `info.max_context_length` (downcast to usize)
+/// * `arch`               ← `info.arch_str` (cloned)
+/// * `max_context_length` ← `info.max_context_length` (widened to u64)
+/// * `provenance`         ← [`provenance_label`]
+/// * `moe_experts`        ← `info.moe.map(|m| m.n_experts)`
+/// * `moe_experts_per_tok`← `info.moe.map(|m| m.n_experts_per_tok)`
+/// * `sliding_window`     ← `info.sliding_window`
+/// * `kv_spill_active`    ← `Some(info.kv_spill_active)`
+fn model_object_from_load_info(
+    id: String,
+    info: &crate::serve::load_info::LoadInfo,
+    loaded: bool,
+) -> ModelObject {
+    ModelObject {
+        id,
+        object: "model",
+        created: chrono_seconds(),
+        owned_by: "hf2q",
+        context_length: info.max_context_length.map(|v| v as usize),
+        quant_type: info.quant_label.clone(),
+        backend: Some("mlx-native"),
+        loaded,
+        arch: Some(info.arch_str.clone()),
+        max_context_length: info.max_context_length.map(u64::from),
+        provenance: Some(provenance_label(&info.provenance)),
+        moe_experts: info.moe.map(|m| m.n_experts),
+        moe_experts_per_tok: info.moe.map(|m| m.n_experts_per_tok),
+        sliding_window: info.sliding_window,
+        kv_spill_active: Some(info.kv_spill_active),
+        quant_bpw: info.quant_bpw,
+    }
+}
+
+/// Enrich an existing (cache-scanned) `ModelObject` in place with every
+/// `LoadInfo`-sourced C5 field.
+///
+/// Used by `list_models` when the cache scan already produced an entry
+/// for this model_id and the loaded engine adds the live snapshot.
+/// `id`, `object`, `created`, `owned_by`, `context_length`, `quant_type`,
+/// `backend`, `loaded` are left untouched (the cache scan picked them up
+/// and the caller has already flipped `loaded=true`); only the new C5
+/// optional fields are populated. This keeps cache-scan-derived
+/// timestamps stable (operators relying on `created` for pinning aren't
+/// surprised when the model is hot-loaded).
+fn enrich_model_object_from_load_info(
+    m: &mut ModelObject,
+    info: &crate::serve::load_info::LoadInfo,
+) {
+    m.arch = Some(info.arch_str.clone());
+    m.max_context_length = info.max_context_length.map(u64::from);
+    m.provenance = Some(provenance_label(&info.provenance));
+    m.moe_experts = info.moe.map(|moe| moe.n_experts);
+    m.moe_experts_per_tok = info.moe.map(|moe| moe.n_experts_per_tok);
+    m.sliding_window = info.sliding_window;
+    m.kv_spill_active = Some(info.kv_spill_active);
+    m.quant_bpw = info.quant_bpw;
+    // Fold in the LoadInfo's quant label too, only if the cache scan didn't
+    // already pick one up. Live `LoadInfo::quant_label` is sourced from the
+    // same histogram algorithm as the cache scan's `infer_quant_type`, so
+    // they agree byte-for-byte; this defensive fallback covers the edge
+    // case where the cache scan saw a malformed file but the engine still
+    // came up.
+    if m.quant_type.is_none() {
+        m.quant_type = info.quant_label.clone();
+    }
+}
+
+/// Coarse on-the-wire string label for a [`Provenance`] enum value.
+///
+/// Returns `&'static str` (matches `ModelObject::provenance` field type)
+/// so callers don't pay an allocation. Two stable values today: `"hf2q"`
+/// and `"external"`. Adding a third variant to `Provenance` requires
+/// updating the match arm here AND the doc string on
+/// `ModelObject::provenance`.
+fn provenance_label(p: &crate::serve::provenance::Provenance) -> &'static str {
+    use crate::serve::provenance::Provenance;
+    match p {
+        Provenance::Hf2q { .. } => "hf2q",
+        Provenance::External => "external",
+    }
 }
 
 /// Read `{arch}.context_length` from GGUF metadata. The architecture key
@@ -6567,6 +6701,277 @@ mod tests {
         let p = std::env::temp_dir().join(format!("{tag}-{pid}-{nanos}"));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    // ── ADR-018 C5 — `LoadInfo` → `ModelObject` bridge ─────────────────
+
+    /// Build a populated `LoadInfo` fixture matching a Qwen3.6-MoE shape
+    /// (the case that exercises every new optional field — `arch`,
+    /// `max_context_length`, `provenance`, both `moe_*` slots,
+    /// `kv_spill_active`, `quant_bpw`). `sliding_window` is intentionally
+    /// `None` here so the corresponding `ModelObject` field also stays
+    /// `None`; the Gemma fixture below covers the `Some` arm.
+    fn populated_qwen35_load_info() -> crate::serve::load_info::LoadInfo {
+        use crate::serve::load_info::{
+            ArchFamily, ChatTemplateSource, LoadInfo, MoeShape, TokenizerSource,
+        };
+        use crate::serve::provenance::Provenance;
+        use std::path::PathBuf;
+        use std::time::Duration;
+
+        LoadInfo {
+            model_id: "Qwen3.6-27B-A3B-DWQ46-MoE".to_string(),
+            arch_str: "qwen35moe".to_string(),
+            arch_family: ArchFamily::Qwen35,
+            model_path: PathBuf::from("/cache/qwen35-27b-moe.gguf"),
+            on_disk_bytes: 16_000_000_000,
+            backend_chip: "Apple M5 Max".to_string(),
+            backend: "mlx-native",
+            n_layers: 64,
+            hidden_size: 4096,
+            vocab_size: 151_936,
+            n_attention_heads: 16,
+            n_key_value_heads: 4,
+            head_dim: 128,
+            sliding_window: None,
+            full_attention_interval: Some(4),
+            max_context_length: Some(262_144),
+            moe: Some(MoeShape {
+                n_experts: 128,
+                n_experts_per_tok: 8,
+            }),
+            quant_label: Some("Q4_K".to_string()),
+            quant_bpw: Some(4.55),
+            tokenizer_source: TokenizerSource::GgufEmbedded,
+            eos_token_ids: vec![151_645],
+            bos_token_id: Some(151_643),
+            chat_template_source: ChatTemplateSource::GgufEmbedded,
+            provenance: Provenance::Hf2q {
+                producer_version: "hf2q 0.1.0".to_string(),
+                source_sha256: "abcd".repeat(16),
+                mmproj_sha256: None,
+            },
+            vision_projector: None,
+            load_wall_clock: Duration::from_secs_f64(6.84),
+            resident_weight_bytes: Some(14_000_000_000),
+            kv_cache_budget_bytes: Some(4 * 1024 * 1024 * 1024),
+            kv_spill_active: false,
+        }
+    }
+
+    /// Build a populated `LoadInfo` fixture matching a Gemma4-dense shape
+    /// (sliding_window=Some, provenance=External, no moe). Pairs with the
+    /// Qwen35 fixture above to cover both `Some(_)` and `None` arms of
+    /// every C5 field.
+    fn populated_gemma4_load_info() -> crate::serve::load_info::LoadInfo {
+        use crate::serve::load_info::{
+            ArchFamily, ChatTemplateSource, LoadInfo, TokenizerSource,
+        };
+        use crate::serve::provenance::Provenance;
+        use std::path::PathBuf;
+        use std::time::Duration;
+
+        LoadInfo {
+            model_id: "gemma-4-27b-it-Q4_K_M".to_string(),
+            arch_str: "gemma4".to_string(),
+            arch_family: ArchFamily::Gemma4,
+            model_path: PathBuf::from("/cache/gemma-4-27b-it-Q4_K_M.gguf"),
+            on_disk_bytes: 18_000_000_000,
+            backend_chip: "Apple M5 Max".to_string(),
+            backend: "mlx-native",
+            n_layers: 62,
+            hidden_size: 5376,
+            vocab_size: 262_144,
+            n_attention_heads: 32,
+            n_key_value_heads: 16,
+            head_dim: 128,
+            sliding_window: Some(4096),
+            full_attention_interval: None,
+            max_context_length: Some(131_072),
+            moe: None,
+            quant_label: Some("Q4_K".to_string()),
+            quant_bpw: Some(4.83),
+            tokenizer_source: TokenizerSource::HfTokenizerJson {
+                path: PathBuf::from("/cache/tokenizer.json"),
+            },
+            eos_token_ids: vec![1, 106],
+            bos_token_id: Some(2),
+            chat_template_source: ChatTemplateSource::GgufEmbedded,
+            provenance: Provenance::External,
+            vision_projector: None,
+            load_wall_clock: Duration::from_secs_f64(2.41),
+            resident_weight_bytes: Some(17_000_000_000),
+            kv_cache_budget_bytes: None,
+            kv_spill_active: true,
+        }
+    }
+
+    #[test]
+    fn provenance_label_maps_external_and_hf2q() {
+        use crate::serve::provenance::Provenance;
+        assert_eq!(provenance_label(&Provenance::External), "external");
+        assert_eq!(
+            provenance_label(&Provenance::Hf2q {
+                producer_version: "hf2q 0.1.0".into(),
+                source_sha256: "0".repeat(64),
+                mmproj_sha256: None,
+            }),
+            "hf2q"
+        );
+    }
+
+    #[test]
+    fn model_object_from_load_info_populates_qwen35_moe_fields() {
+        let info = populated_qwen35_load_info();
+        let m = model_object_from_load_info("Qwen3.6-27B-A3B-DWQ46-MoE".into(), &info, true);
+
+        // Identity + legacy-shape carry-over.
+        assert_eq!(m.id, "Qwen3.6-27B-A3B-DWQ46-MoE");
+        assert_eq!(m.object, "model");
+        assert_eq!(m.owned_by, "hf2q");
+        assert_eq!(m.backend, Some("mlx-native"));
+        assert!(m.loaded);
+        // Pre-C5 `context_length` mirrored to the legacy field too — keeps
+        // pre-C5 consumers' reads stable.
+        assert_eq!(m.context_length, Some(262_144));
+        assert_eq!(m.quant_type.as_deref(), Some("Q4_K"));
+
+        // C5 fields.
+        assert_eq!(m.arch.as_deref(), Some("qwen35moe"));
+        assert_eq!(m.max_context_length, Some(262_144));
+        assert_eq!(m.provenance, Some("hf2q"));
+        assert_eq!(m.moe_experts, Some(128));
+        assert_eq!(m.moe_experts_per_tok, Some(8));
+        assert_eq!(m.sliding_window, None);
+        assert_eq!(m.kv_spill_active, Some(false));
+        assert!(
+            m.quant_bpw.map(|v| (v - 4.55).abs() < 1e-3).unwrap_or(false),
+            "expected quant_bpw ≈ 4.55, got {:?}",
+            m.quant_bpw
+        );
+    }
+
+    #[test]
+    fn model_object_from_load_info_populates_gemma4_dense_fields() {
+        let info = populated_gemma4_load_info();
+        let m = model_object_from_load_info("gemma-4-27b-it-Q4_K_M".into(), &info, true);
+
+        assert_eq!(m.id, "gemma-4-27b-it-Q4_K_M");
+        assert_eq!(m.arch.as_deref(), Some("gemma4"));
+        // External provenance label.
+        assert_eq!(m.provenance, Some("external"));
+        // Dense → both `moe_*` fields stay None.
+        assert_eq!(m.moe_experts, None);
+        assert_eq!(m.moe_experts_per_tok, None);
+        // Sliding window populated for Gemma4.
+        assert_eq!(m.sliding_window, Some(4096));
+        // KV-spill active flag rides through.
+        assert_eq!(m.kv_spill_active, Some(true));
+        // BPW present.
+        assert!(
+            m.quant_bpw.map(|v| (v - 4.83).abs() < 1e-3).unwrap_or(false),
+            "expected quant_bpw ≈ 4.83, got {:?}",
+            m.quant_bpw
+        );
+    }
+
+    #[test]
+    fn enrich_model_object_from_load_info_overlays_new_fields_only() {
+        // Pre-C5 cache-scanned shape: legacy fields populated, all C5
+        // fields None. The enrichment overlay must populate the new
+        // fields without overwriting `id`, `object`, `created`,
+        // `owned_by`, or `loaded` (the cache-scan picked them up,
+        // `loaded` was just flipped by the caller).
+        let preexisting_created = 1_700_000_000_i64;
+        let mut m = ModelObject {
+            id: "Qwen3.6-27B-A3B-DWQ46-MoE".into(),
+            object: "model",
+            created: preexisting_created,
+            owned_by: "hf2q",
+            context_length: Some(131_072),
+            quant_type: Some("Q4_K".into()),
+            backend: Some("mlx-native"),
+            loaded: true,
+            arch: None,
+            max_context_length: None,
+            provenance: None,
+            moe_experts: None,
+            moe_experts_per_tok: None,
+            sliding_window: None,
+            kv_spill_active: None,
+            quant_bpw: None,
+        };
+        let info = populated_qwen35_load_info();
+        enrich_model_object_from_load_info(&mut m, &info);
+
+        // Identity / legacy fields untouched (created stays cache-scan
+        // value, NOT overwritten with `chrono_seconds()`).
+        assert_eq!(m.id, "Qwen3.6-27B-A3B-DWQ46-MoE");
+        assert_eq!(m.created, preexisting_created);
+        assert_eq!(m.context_length, Some(131_072));
+        assert!(m.loaded);
+        assert_eq!(m.quant_type.as_deref(), Some("Q4_K"));
+
+        // C5 fields now populated from LoadInfo.
+        assert_eq!(m.arch.as_deref(), Some("qwen35moe"));
+        assert_eq!(m.max_context_length, Some(262_144));
+        assert_eq!(m.provenance, Some("hf2q"));
+        assert_eq!(m.moe_experts, Some(128));
+        assert_eq!(m.moe_experts_per_tok, Some(8));
+        assert_eq!(m.sliding_window, None);
+        assert_eq!(m.kv_spill_active, Some(false));
+    }
+
+    #[test]
+    fn enrich_model_object_fills_quant_type_when_cache_scan_missed_it() {
+        // Defensive fallback: a malformed cache-scanned entry (somehow
+        // missing quant_type) should pick up the live LoadInfo's label.
+        let mut m = ModelObject {
+            id: "weird-model".into(),
+            object: "model",
+            created: 0,
+            owned_by: "hf2q",
+            context_length: None,
+            quant_type: None, // ← cache scan missed this
+            backend: Some("mlx-native"),
+            loaded: true,
+            arch: None,
+            max_context_length: None,
+            provenance: None,
+            moe_experts: None,
+            moe_experts_per_tok: None,
+            sliding_window: None,
+            kv_spill_active: None,
+            quant_bpw: None,
+        };
+        let info = populated_qwen35_load_info();
+        enrich_model_object_from_load_info(&mut m, &info);
+        assert_eq!(m.quant_type.as_deref(), Some("Q4_K"));
+    }
+
+    #[test]
+    fn model_object_from_load_info_serializes_with_new_fields() {
+        // End-to-end pin: build the wire shape and assert the new keys
+        // are present. Ensures the schema-side
+        // `#[serde(skip_serializing_if = "Option::is_none")]` + the
+        // helper's `Some(_)` propagation actually compose at the
+        // serializer level.
+        let info = populated_gemma4_load_info();
+        let m = model_object_from_load_info("gemma-4-27b-it-Q4_K_M".into(), &info, true);
+        let v = serde_json::to_value(&m).expect("serialize ModelObject");
+        assert_eq!(v["id"], "gemma-4-27b-it-Q4_K_M");
+        assert_eq!(v["arch"], "gemma4");
+        assert_eq!(v["max_context_length"], 131_072);
+        assert_eq!(v["provenance"], "external");
+        assert!(v.get("moe_experts").is_none(), "dense → moe_experts skipped");
+        assert!(
+            v.get("moe_experts_per_tok").is_none(),
+            "dense → moe_experts_per_tok skipped"
+        );
+        assert_eq!(v["sliding_window"], 4096);
+        assert_eq!(v["kv_spill_active"], true);
+        let bpw = v["quant_bpw"].as_f64().expect("quant_bpw f64");
+        assert!((bpw - 4.83_f64).abs() < 1e-3);
     }
 }
 

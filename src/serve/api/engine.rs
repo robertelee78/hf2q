@@ -45,6 +45,10 @@ use crate::serve::forward_mlx::{MlxModelWeights, ProfileAccumulator};
 use crate::serve::forward_prefill::SoftTokenInjection;
 use crate::serve::gpu::GpuContext;
 use crate::serve::header;
+use crate::serve::load_info::{
+    self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, MoeShape,
+    TokenizerSource,
+};
 use crate::serve::sampler_pure::{
     self, SamplingParams as SamplerParams,
 };
@@ -650,6 +654,7 @@ pub(crate) fn make_synthetic_kv_engine_for_test(
         inner: Arc::new(EngineInner {
             tx,
             worker_handle: Mutex::new(Some(handle)),
+            info: synthetic_load_info("synth-kv-bridge-test"),
             arch: LoadedArch::Gemma,
             model_id: "synth-kv-bridge-test".into(),
             context_length: None,
@@ -684,6 +689,7 @@ pub(crate) fn make_synthetic_engine_for_test(arch: LoadedArch) -> Engine {
         inner: Arc::new(EngineInner {
             tx,
             worker_handle: Mutex::new(Some(handle)),
+            info: synthetic_load_info("iter-215-test-model"),
             arch,
             model_id: "iter-215-test-model".into(),
             context_length: None,
@@ -707,6 +713,10 @@ struct EngineInner {
     /// callers can be cheap-clone an `Engine` without contending on the
     /// handle. Outside of shutdown, the slot is read-only.
     worker_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Unified load snapshot built once at model-load completion. Serve
+    /// startup reads this for the ADR-018 banner and tracing without
+    /// touching the worker thread.
+    info: Arc<LoadInfo>,
     /// Iter-215 Wedge-2: which `LoadedModel` variant the worker
     /// thread owns.  Cached at spawn time so handlers can dispatch on
     /// the architecture without round-tripping a request.  Drives the
@@ -758,6 +768,41 @@ struct EngineInner {
     /// real (non-stub) hook from the live shape without round-tripping
     /// through the worker channel.
     kv_spill_descriptor: Option<super::kv_spill_descriptor::KvSpillDescriptor>,
+}
+
+#[cfg(test)]
+fn synthetic_load_info(model_id: &str) -> Arc<LoadInfo> {
+    Arc::new(LoadInfo {
+        model_id: model_id.to_string(),
+        arch_str: "gemma4".to_string(),
+        arch_family: ArchFamily::Gemma4,
+        model_path: PathBuf::from(format!("/tmp/{model_id}.gguf")),
+        on_disk_bytes: 0,
+        backend_chip: "test-gpu".to_string(),
+        backend: "mlx-native",
+        n_layers: 0,
+        hidden_size: 0,
+        vocab_size: 0,
+        n_attention_heads: 0,
+        n_key_value_heads: 0,
+        head_dim: 0,
+        sliding_window: None,
+        full_attention_interval: None,
+        max_context_length: None,
+        moe: None,
+        quant_label: None,
+        quant_bpw: None,
+        tokenizer_source: TokenizerSource::GgufEmbedded,
+        eos_token_ids: Vec::new(),
+        bos_token_id: None,
+        chat_template_source: ChatTemplateSource::None,
+        provenance: crate::serve::provenance::Provenance::External,
+        vision_projector: None,
+        load_wall_clock: Duration::ZERO,
+        resident_weight_bytes: None,
+        kv_cache_budget_bytes: None,
+        kv_spill_active: false,
+    })
 }
 
 /// The request protocol the worker thread drains.
@@ -915,6 +960,8 @@ pub struct GemmaLoadedModel {
     pub ctx: GpuContext,
     pub config: Gemma4Config,
     pub model_id: String,
+    pub model_path: PathBuf,
+    pub tokenizer_path: PathBuf,
     pub context_length: Option<usize>,
     pub quant_type: Option<String>,
     pub tokenizer: Tokenizer,
@@ -954,6 +1001,12 @@ impl LoadedModel {
             LoadedModel::Qwen35(q) => q.quant_type.as_deref(),
         }
     }
+    pub fn model_path(&self) -> &Path {
+        match self {
+            LoadedModel::Gemma(g) => &g.model_path,
+            LoadedModel::Qwen35(q) => &q.model_path,
+        }
+    }
     pub fn hidden_size(&self) -> usize {
         match self {
             LoadedModel::Gemma(g) => g.weights.hidden_size,
@@ -979,18 +1032,15 @@ impl LoadedModel {
         }
     }
 
-    /// ADR-017 §F4 — GGUF provenance for the loaded model.  The
-    /// `Gemma` variant returns the `Provenance` captured at GGUF-open
-    /// time in [`GemmaLoadedModel::load`]; the `Qwen35` variant
-    /// returns `Provenance::External` because the Qwen35 loader does
-    /// not yet populate a provenance field (Qwen35 inference is
-    /// 501-gated under iter-215; KV-spill never fires for that path).
-    /// When Qwen35 inference lands, this accessor's Qwen35 arm should
-    /// be updated to read `engine_qwen35::Qwen35LoadedModel.provenance`.
+    /// ADR-017 §F4 — GGUF provenance for the loaded model.  Both
+    /// variants capture provenance at GGUF-open time via
+    /// `crate::serve::provenance::detect(&gguf)`.  Gemma consumes it for
+    /// dense KV-spill namespacing today; Qwen35 stores the same fact even
+    /// though its hybrid KV-spill descriptor is a later ADR-017 phase.
     pub fn provenance(&self) -> crate::serve::provenance::Provenance {
         match self {
             LoadedModel::Gemma(g) => g.provenance.clone(),
-            LoadedModel::Qwen35(_) => crate::serve::provenance::Provenance::External,
+            LoadedModel::Qwen35(q) => q.provenance.clone(),
         }
     }
     pub fn eos_token_ids(&self) -> &[u32] {
@@ -1385,9 +1435,14 @@ impl GemmaLoadedModel {
         let tokenizer_path = find_tokenizer(model_path, opts.tokenizer_path.as_deref())?;
         let config_path = find_config(model_path, opts.config_path.as_deref())?;
 
-        tracing::info!("Engine load: model = {}", model_path.display());
-        tracing::info!("Engine load: tokenizer = {}", tokenizer_path.display());
-        tracing::info!("Engine load: config = {}", config_path.display());
+        // ADR-018 C3: legacy `tracing::info!("Engine load: {model,tokenizer,config} = ...")`
+        // triplet was deleted here. The same facts now flow through
+        // `emit_tracing(&info)` at every CLI/SERVE entry that constructs
+        // a `LoadInfo`: structured `model_path`, `tokenizer_source`
+        // (HfTokenizerJson { path }), and the on-disk `config_path` is
+        // load-internal — it produces `Gemma4Config` whose fields
+        // `n_layers`, `hidden_size`, `vocab_size`, etc. emit_tracing
+        // surfaces structurally.
 
         let config = Gemma4Config::from_config_json(&config_path)
             .context("Failed to parse config.json")?;
@@ -1425,10 +1480,11 @@ impl GemmaLoadedModel {
                 .map(|v| v as usize)
         };
 
-        // Quant label: dominant non-fp tensor type. Same histogram algorithm
-        // as the /v1/models handler; computed inline here rather than via a
-        // shared helper so this file stays self-contained.
-        let quant_type = infer_quant_type_from_gguf(&gguf);
+        // Quant label: dominant non-fp tensor type. Promoted to
+        // `crate::serve::load_info::infer_quant_label` per ADR-018 C1
+        // (the prior inline body was byte-identical to the relocated
+        // helper; behaviour is unchanged).
+        let quant_type = crate::serve::load_info::infer_quant_label(&gguf);
 
         // Chat template: GGUF embedded or hardcoded fallback.
         let chat_template = gguf
@@ -1449,14 +1505,38 @@ impl GemmaLoadedModel {
                 crate::serve::FALLBACK_GEMMA4_API_CHAT_TEMPLATE.to_string()
             });
 
-        // Load GPU ctx + weights. `header::LoadProgress` is happy with a
-        // non-TTY parent; we set verbosity to 1 to suppress the progress line
-        // when the server is running (logs replace the progress UX).
+        // Load GPU ctx + weights.
+        //
+        // ADR-018 C3: TTY-aware `LoadProgress::new(stderr_is_tty, verbosity, n_layers)`
+        // replaces the previous hard-coded `LoadProgress::new(false, 1, n_layers)`
+        // silent sentinel. The TTY-aware constructor is the same one
+        // `cmd_generate` uses today (mod.rs:519-531). Behaviour:
+        //
+        //   - CLI default (`hf2q generate`, no -v): stderr is a TTY,
+        //     verbosity=0 (tracing INFO not enabled by main.rs:124),
+        //     progress reporter renders `\r loading i/n layers`.
+        //   - CLI verbose (`hf2q generate -v`): stderr is a TTY,
+        //     tracing::enabled!(INFO) is true → verbosity=1, reporter
+        //     is silent (debug/info events from the loader cover detail).
+        //   - SERVE default (`hf2q serve`): main.rs sets `hf2q=info`
+        //     by default for serve mode (some configs); when stderr IS
+        //     a TTY (interactive launch), tracing INFO is enabled →
+        //     verbosity=1, reporter silent. When stderr ISN'T a TTY
+        //     (systemd, docker), the reporter is silent regardless of
+        //     verbosity. Either way: server output is clean.
+        //   - Test contexts that capture stderr: stderr is rarely a
+        //     TTY → reporter silent.
         let mut ctx = GpuContext::new()
             .map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
 
         let n_layers = config.num_hidden_layers;
-        let mut load_progress = header::LoadProgress::new(false, 1, n_layers);
+        let stderr_is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+        let verbosity = if tracing::enabled!(tracing::Level::INFO) {
+            1
+        } else {
+            0
+        };
+        let mut load_progress = header::LoadProgress::new(stderr_is_tty, verbosity, n_layers);
         let weights = MlxModelWeights::load_from_gguf(
             &gguf,
             &config,
@@ -1477,18 +1557,20 @@ impl GemmaLoadedModel {
         let eos_token_ids: Vec<u32> = vec![1, 106];
 
         let load_duration = load_start.elapsed();
-        tracing::info!(
-            "Engine load: {} layers, ctx_len={:?}, load_time={:.1}s",
-            weights.layers.len(),
-            context_length,
-            load_duration.as_secs_f64()
-        );
+        // ADR-018 C3: legacy `tracing::info!("Engine load: {} layers, ctx_len={:?}, load_time={:.1}s", ...)`
+        // was deleted here. `emit_tracing(&info)` now surfaces the same
+        // facts (`n_layers`, `max_context_length`, `load_wall_clock`) as
+        // structured fields at every CLI/SERVE entry that constructs a
+        // `LoadInfo`. The free-text format was incompatible with
+        // `journalctl -u hf2q | jq` cross-arch filtering.
 
         Ok(Self {
             weights,
             ctx,
             config,
             model_id,
+            model_path: model_path.clone(),
+            tokenizer_path,
             context_length,
             quant_type,
             tokenizer,
@@ -1501,6 +1583,85 @@ impl GemmaLoadedModel {
     }
 }
 
+impl LoadInfoBuilder for GemmaLoadedModel {
+    fn build_load_info(
+        &self,
+        gguf: &mlx_native::gguf::GgufFile,
+        load_wall_clock: Duration,
+        kv_cache_budget_bytes: Option<u64>,
+        kv_spill_active: bool,
+    ) -> LoadInfo {
+        let arch_str = load_info::arch_str_from_gguf(gguf);
+        let moe = if self.config.num_experts > 0 && self.config.top_k_experts > 0 {
+            Some(MoeShape {
+                n_experts: self.config.num_experts as u32,
+                n_experts_per_tok: self.config.top_k_experts as u32,
+            })
+        } else {
+            None
+        };
+
+        LoadInfo {
+            model_id: self.model_id.clone(),
+            arch_str,
+            arch_family: ArchFamily::Gemma4,
+            model_path: self.model_path.clone(),
+            on_disk_bytes: load_info::on_disk_bytes(&self.model_path),
+            backend_chip: self.ctx.gpu_name(),
+            backend: "mlx-native",
+            n_layers: self.config.num_hidden_layers as u32,
+            hidden_size: self.config.hidden_size as u32,
+            vocab_size: self.config.vocab_size as u32,
+            n_attention_heads: self.config.num_attention_heads as u32,
+            n_key_value_heads: self.config.num_key_value_heads as u32,
+            head_dim: self.config.head_dim as u32,
+            sliding_window: Some(self.config.sliding_window as u32),
+            full_attention_interval: None,
+            max_context_length: self.context_length.map(|v| v as u32),
+            moe,
+            quant_label: self.quant_type.clone(),
+            quant_bpw: load_info::compute_bpw(gguf),
+            tokenizer_source: TokenizerSource::HfTokenizerJson {
+                path: self.tokenizer_path.clone(),
+            },
+            eos_token_ids: self.eos_token_ids.clone(),
+            bos_token_id: gguf.metadata_u32("tokenizer.ggml.bos_token_id"),
+            chat_template_source: if gguf.metadata_string("tokenizer.chat_template").is_some() {
+                ChatTemplateSource::GgufEmbedded
+            } else {
+                ChatTemplateSource::HardcodedFallback {
+                    name: "FALLBACK_GEMMA4_API_CHAT_TEMPLATE",
+                }
+            },
+            provenance: self.provenance.clone(),
+            vision_projector: None,
+            load_wall_clock,
+            resident_weight_bytes: None,
+            kv_cache_budget_bytes,
+            kv_spill_active,
+        }
+    }
+}
+
+impl LoadInfoBuilder for LoadedModel {
+    fn build_load_info(
+        &self,
+        gguf: &mlx_native::gguf::GgufFile,
+        load_wall_clock: Duration,
+        kv_cache_budget_bytes: Option<u64>,
+        kv_spill_active: bool,
+    ) -> LoadInfo {
+        match self {
+            LoadedModel::Gemma(g) => {
+                g.build_load_info(gguf, load_wall_clock, kv_cache_budget_bytes, kv_spill_active)
+            }
+            LoadedModel::Qwen35(q) => {
+                q.build_load_info(gguf, load_wall_clock, kv_cache_budget_bytes, kv_spill_active)
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Engine::spawn and worker loop
 // ---------------------------------------------------------------------------
@@ -1509,7 +1670,11 @@ impl Engine {
     /// Spawn the worker thread and return a handle. The `queue_capacity` sets
     /// the mpsc channel buffer; when full, handlers receive a `queue_full`
     /// error and map it to 429 + Retry-After (Decision #19).
-    pub fn spawn(loaded: LoadedModel, queue_capacity: usize) -> Self {
+    pub fn spawn(
+        loaded: LoadedModel,
+        queue_capacity: usize,
+        kv_cache_budget_bytes: Option<u64>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel::<Request>(queue_capacity.max(1));
 
         // Iter-215 Wedge-2: accessor methods replace flat-struct field
@@ -1586,6 +1751,15 @@ impl Engine {
                 }
                 LoadedModel::Qwen35(_) => None,
             };
+        let kv_spill_active = kv_spill_descriptor.is_some();
+        let gguf = mlx_native::gguf::GgufFile::open(loaded.model_path())
+            .expect("re-open loaded GGUF for Engine load-info snapshot");
+        let info = Arc::new(loaded.build_load_info(
+            &gguf,
+            loaded.load_duration(),
+            kv_cache_budget_bytes,
+            kv_spill_active,
+        ));
 
         let registration = super::registry::find_for(&model_id);
         if let Some(ref r) = registration {
@@ -1613,6 +1787,7 @@ impl Engine {
             inner: Arc::new(EngineInner {
                 tx,
                 worker_handle: Mutex::new(Some(worker_handle)),
+                info,
                 arch,
                 model_id,
                 context_length,
@@ -1635,6 +1810,11 @@ impl Engine {
     /// is not yet implemented (today: `LoadedArch::Qwen35`).
     pub fn arch(&self) -> LoadedArch {
         self.inner.arch
+    }
+
+    /// Unified load snapshot for this engine.
+    pub fn info(&self) -> &LoadInfo {
+        &self.inner.info
     }
 
     /// Lazily build + cache the per-vocab decoded UTF-8 byte table used
@@ -3143,35 +3323,12 @@ fn generate_once_with_soft_tokens(
     Ok(result)
 }
 
-/// Infer a quant label from an open GGUF. Shared algorithm with the
-/// `/v1/models` handler (kept inline here for module self-containment).
-fn infer_quant_type_from_gguf(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
-    use mlx_native::GgmlType;
-    use std::collections::HashMap;
-
-    let mut histogram: HashMap<&'static str, usize> = HashMap::new();
-    for name in gguf.tensor_names() {
-        let Some(info) = gguf.tensor_info(name) else { continue };
-        if matches!(info.ggml_type, GgmlType::F32 | GgmlType::F16) {
-            continue;
-        }
-        let label = match info.ggml_type {
-            GgmlType::F32 => "F32",
-            GgmlType::F16 => "F16",
-            GgmlType::Q4_0 => "Q4_0",
-            GgmlType::Q8_0 => "Q8_0",
-            GgmlType::Q4_K => "Q4_K",
-            GgmlType::Q5_K => "Q5_K",
-            GgmlType::Q6_K => "Q6_K",
-            GgmlType::I16 => "I16",
-        };
-        *histogram.entry(label).or_insert(0) += 1;
-    }
-    histogram
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(k, _)| k.to_string())
-}
+// `infer_quant_type_from_gguf` was relocated to
+// `crate::serve::load_info::infer_quant_label` per ADR-018 C1.  The
+// previous 27-LOC body was byte-identical to (and the call site here
+// shared an algorithm with) the equivalent body in
+// `engine_qwen35.rs:246-272`; both call sites now route through the
+// promoted helper.
 
 /// Outcome of `finalize_streaming_tool_state` — tells the streaming
 /// driver whether to proceed to `Done`, abort silently (client gone),
@@ -5998,6 +6155,7 @@ assistant:
             inner: Arc::new(EngineInner {
                 tx,
                 worker_handle: Mutex::new(Some(handle)),
+                info: synthetic_load_info("test-model"),
                 arch,
                 model_id: "test-model".into(),
                 context_length: None,
@@ -6012,6 +6170,24 @@ assistant:
                 kv_spill_descriptor: None,
             }),
         }
+    }
+
+    #[test]
+    fn engine_info_returns_populated_load_info() {
+        let engine = make_test_engine_with_worker(drain_until_shutdown);
+        let info = engine.info();
+        assert_eq!(info.model_id, "test-model");
+        assert_eq!(info.arch_family, ArchFamily::Gemma4);
+        assert_eq!(info.backend, "mlx-native");
+        assert_eq!(info.tokenizer_source, TokenizerSource::GgufEmbedded);
+        assert_eq!(info.chat_template_source, ChatTemplateSource::None);
+        assert_eq!(info.provenance, crate::serve::provenance::Provenance::External);
+        assert_eq!(info.load_wall_clock, Duration::ZERO);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(engine.shutdown()).expect("shutdown");
     }
 
     /// Stub worker: drain until `Shutdown`, then exit cleanly.
@@ -6526,12 +6702,14 @@ assistant:
             tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
             chat_template: "qwen-template".to_string(),
             model_id: "qwen-id".to_string(),
+            model_path: PathBuf::from("qwen-id.gguf"),
             eos_token_ids: vec![151645],
             hidden_size: 64,
             vocab_size: 256,
             context_length: Some(1024),
             quant_type: Some("Q4_0".to_string()),
             load_duration: Duration::from_millis(7),
+            provenance: crate::serve::provenance::Provenance::External,
             prompt_cache: super::super::engine_qwen35::HybridPromptCache::new(),
         };
         let qwen = LoadedModel::Qwen35(qwen_loaded);
@@ -6837,6 +7015,7 @@ assistant:
             inner: Arc::new(EngineInner {
                 tx,
                 worker_handle: Mutex::new(Some(handle)),
+                info: synthetic_load_info("synth-kv"),
                 arch: LoadedArch::Gemma,
                 model_id: "synth-kv".into(),
                 context_length: None,
@@ -7549,6 +7728,440 @@ mod streaming_prompt_cache_replay_tests {
             matches!(events.last(), Some(GenerationEvent::Done { .. })),
             "Done must be the last event"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-005 Phase 4 iter C — `delta.reasoning_content` extractor
+    // unit-level closure tests (2026-05-01).
+    //
+    // The iter B-2 ToolCallSplitter LANDED in iter-219c (commit
+    // `94c0dbe`); the parallel iter C reasoning-content extractor was
+    // wired alongside it (W66/W67 path: ReasoningSplitter integrated
+    // into `generate_stream_once` + `replay_cached_streaming_response`,
+    // schema `ChunkDelta.reasoning_content` + `ChatMessage
+    // .reasoning_content` populated, SSE encoder routes on
+    // `DeltaKind::Reasoning` per Decision #21). The pre-existing
+    // `replay_emits_reasoning_then_content_when_reasoning_text_set`
+    // test exercises the **non-streaming-origin** cache entry shape
+    // (text post-split + `reasoning_text=Some(...)`); these tests
+    // close the **streaming-origin** branch (text contains embedded
+    // reasoning markers + `reasoning_text=None`) plus the
+    // reasoning + tool-call interleaving contract — both currently
+    // only exercised via the env-gated live test
+    // `tests/openwebui_reasoning.rs::openwebui_reasoning_streaming_scenario_3`,
+    // which is not part of the default `cargo test` baseline.
+    //
+    // Mantra alignment: no env-gating, no model-load, deterministic,
+    // sub-millisecond. Locks the iter C contract at every cargo test
+    // invocation so a regression in either splitter wiring or the
+    // mutual-exclusion of reasoning vs tool_calls (per OpenAI spec)
+    // surfaces loud at unit-test time, not at LIVE-test time.
+    // -----------------------------------------------------------------
+
+    /// Iter C streaming-origin shape: cache entry's `text` field carries
+    /// the **raw pre-split decoded stream** (markers and all) with
+    /// `reasoning_text=None`. The replay helper must run the cached text
+    /// through a fresh `ReasoningSplitter` and route the marker-bounded
+    /// span as `DeltaKind::Reasoning`, the rest as `DeltaKind::Content`.
+    ///
+    /// Marker pair: Qwen 3.5/3.6 `<think>` / `</think>` (registered
+    /// reasoning markers per `registry::QWEN35`).
+    #[test]
+    fn replay_routes_streaming_origin_reasoning_markers_to_reasoning_deltas() {
+        // Resolve a model-id that maps to QWEN35 registration so the
+        // splitter has reasoning markers + tool markers both registered.
+        let reg = match super::super::registry::find_for("qwen3.6-27b-dwq46") {
+            Some(r) => r,
+            None => {
+                eprintln!("qwen35 registration absent; skipping iter C streaming-origin test");
+                return;
+            }
+        };
+        // Sanity: the registration must have reasoning markers, else
+        // the test is degenerate.
+        assert!(
+            reg.has_reasoning(),
+            "iter C contract: qwen35 family MUST have reasoning markers \
+             registered; got open={:?} close={:?}",
+            reg.reasoning_open,
+            reg.reasoning_close,
+        );
+
+        // Streaming-origin cache shape: `text` carries the pre-split
+        // stream verbatim; `reasoning_text=None` because the LIVE
+        // splitter routed reasoning fragments into Reasoning deltas at
+        // decode time (no separately-tracked string to replay).
+        let cached_text = "<think>let me compute 2+2</think>The answer is 4.";
+        let cached = GenerationResult {
+            text: cached_text.into(),
+            reasoning_text: None,
+            prompt_tokens: 5,
+            completion_tokens: 12,
+            reasoning_tokens: None,
+            finish_reason: "stop",
+            prefill_duration: Duration::ZERO,
+            decode_duration: Duration::ZERO,
+            cached_tokens: 5,
+        };
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let res = replay_cached_streaming_response(
+            &cached,
+            Some(&reg),
+            ToolCallPolicy::Auto,
+            &tx,
+        );
+        assert!(res.is_ok(), "replay must succeed");
+        drop(tx);
+        let events = drain(&mut rx);
+
+        // Concat the deltas by kind. The splitter may emit each kind
+        // in one or more chunks (tail buffering across the marker
+        // boundary); contract is on the concatenated text + ordering.
+        let mut reasoning_concat = String::new();
+        let mut content_concat = String::new();
+        let mut first_reasoning_idx: Option<usize> = None;
+        let mut first_content_idx: Option<usize> = None;
+        for (i, ev) in events.iter().enumerate() {
+            match ev {
+                GenerationEvent::Delta { kind: DeltaKind::Reasoning, text } => {
+                    if first_reasoning_idx.is_none() {
+                        first_reasoning_idx = Some(i);
+                    }
+                    reasoning_concat.push_str(text);
+                }
+                GenerationEvent::Delta { kind: DeltaKind::Content, text } => {
+                    if first_content_idx.is_none() {
+                        first_content_idx = Some(i);
+                    }
+                    content_concat.push_str(text);
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            reasoning_concat, "let me compute 2+2",
+            "reasoning slot must capture body between <think>...</think> markers \
+             (markers themselves swallowed); got events: {events:?}"
+        );
+        assert_eq!(
+            content_concat, "The answer is 4.",
+            "content slot must capture post-marker text only; got events: {events:?}"
+        );
+        // Decision #21 ordering: reasoning streams BEFORE content for
+        // Open WebUI's panel UX.
+        assert!(
+            first_reasoning_idx < first_content_idx,
+            "iter C ordering contract violated: reasoning must precede content \
+             in event stream; reasoning_idx={first_reasoning_idx:?}, \
+             content_idx={first_content_idx:?}, events={events:?}"
+        );
+        // No raw markers leak.
+        for marker in &["<think>", "</think>"] {
+            assert!(
+                !reasoning_concat.contains(marker),
+                "splitter regression: reasoning slot contains raw marker {marker:?}"
+            );
+            assert!(
+                !content_concat.contains(marker),
+                "splitter regression: content slot contains raw marker {marker:?}"
+            );
+        }
+        // Last event is Done.
+        assert!(
+            matches!(events.last(), Some(GenerationEvent::Done { .. })),
+            "Done must be terminal event; got events: {events:?}"
+        );
+    }
+
+    /// Iter C edge case: only reasoning, no post-reasoning content.
+    /// Some thinking-mode prompts result in `<think>...</think>` followed
+    /// by EOS — the answer is implicit in the reasoning. The replay must
+    /// emit reasoning, no content delta, then Done.
+    #[test]
+    fn replay_streaming_origin_pure_reasoning_no_content() {
+        let reg = match super::super::registry::find_for("qwen3.6-27b-dwq46") {
+            Some(r) => r,
+            None => {
+                eprintln!("qwen35 registration absent; skipping iter C pure-reasoning test");
+                return;
+            }
+        };
+        if !reg.has_reasoning() {
+            return;
+        }
+
+        let cached_text = "<think>only thinking</think>";
+        let cached = GenerationResult {
+            text: cached_text.into(),
+            reasoning_text: None,
+            prompt_tokens: 3,
+            completion_tokens: 4,
+            reasoning_tokens: None,
+            finish_reason: "stop",
+            prefill_duration: Duration::ZERO,
+            decode_duration: Duration::ZERO,
+            cached_tokens: 3,
+        };
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let res = replay_cached_streaming_response(
+            &cached,
+            Some(&reg),
+            ToolCallPolicy::Auto,
+            &tx,
+        );
+        assert!(res.is_ok());
+        drop(tx);
+        let events = drain(&mut rx);
+
+        let reasoning_concat: String = events
+            .iter()
+            .filter_map(|e| match e {
+                GenerationEvent::Delta { kind: DeltaKind::Reasoning, text } => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let content_concat: String = events
+            .iter()
+            .filter_map(|e| match e {
+                GenerationEvent::Delta { kind: DeltaKind::Content, text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(reasoning_concat, "only thinking");
+        assert_eq!(
+            content_concat, "",
+            "pure-reasoning input must NOT emit any content delta; got events: {events:?}"
+        );
+        assert!(matches!(events.last(), Some(GenerationEvent::Done { .. })));
+    }
+
+    /// Iter C + iter B-2 interleaving: a reasoning span FOLLOWED BY a
+    /// tool-call span must route into `Reasoning` deltas, then `Content`
+    /// deltas (preamble post-reasoning), then `ToolCallDelta` events for
+    /// the tool-call span — the OpenAI spec mandates `reasoning_content`
+    /// and `tool_calls` are mutually exclusive on the same delta chunk.
+    /// This locks in the composition contract: ReasoningSplitter runs
+    /// FIRST, the Content-classified output then flows through
+    /// ToolCallSplitter.
+    ///
+    /// Uses Qwen 3.5/3.6 markers so both reasoning + tool-call markers
+    /// are present in the registration: reasoning `<think>`/`</think>`,
+    /// tool-call `<tool_call>`/`</tool_call>`.
+    #[test]
+    fn replay_routes_reasoning_then_tool_call_in_correct_order() {
+        let reg = match super::super::registry::find_for("qwen3.6-27b-dwq46") {
+            Some(r) => r,
+            None => {
+                eprintln!("qwen35 registration absent; skipping iter C+B-2 interleave test");
+                return;
+            }
+        };
+        if !reg.has_reasoning() {
+            return;
+        }
+        let (open, close) = match (reg.tool_open, reg.tool_close) {
+            (Some(o), Some(c)) => (o, c),
+            _ => {
+                eprintln!("qwen35 has no tool markers; skipping interleave test");
+                return;
+            }
+        };
+
+        // Streaming-origin shape: full pre-split stream including BOTH
+        // reasoning markers AND tool-call markers. Body shape doesn't
+        // need to parse as a real tool call — the assertion is on
+        // event-class ordering (Reasoning → Content → ToolCallDelta-or-
+        // Content-fallback → Done), not on parser outcome.
+        let cached_text = format!(
+            "<think>I should call the weather tool</think>Let me check. \
+             {open}<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>{close}"
+        );
+        let cached = GenerationResult {
+            text: cached_text,
+            reasoning_text: None,
+            prompt_tokens: 6,
+            completion_tokens: 20,
+            reasoning_tokens: None,
+            finish_reason: "stop",
+            prefill_duration: Duration::ZERO,
+            decode_duration: Duration::ZERO,
+            cached_tokens: 6,
+        };
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let res = replay_cached_streaming_response(
+            &cached,
+            Some(&reg),
+            ToolCallPolicy::Auto,
+            &tx,
+        );
+        assert!(res.is_ok());
+        drop(tx);
+        let events = drain(&mut rx);
+
+        // Find the index of the FIRST event of each kind.
+        let first_reasoning_idx = events.iter().position(|e| matches!(
+            e,
+            GenerationEvent::Delta { kind: DeltaKind::Reasoning, .. }
+        ));
+        let first_content_idx = events.iter().position(|e| matches!(
+            e,
+            GenerationEvent::Delta { kind: DeltaKind::Content, .. }
+        ));
+        let first_tool_call_idx = events.iter().position(|e| matches!(
+            e,
+            GenerationEvent::ToolCallDelta { .. }
+        ));
+
+        // Reasoning MUST appear; it's unconditional in this fixture.
+        let r_idx = first_reasoning_idx.unwrap_or_else(|| {
+            panic!(
+                "iter C interleave contract: reasoning delta MUST be emitted \
+                 for input containing <think>...</think>; got events: {events:?}"
+            )
+        });
+        // Content MUST appear (the "Let me check. " preamble between
+        // </think> and the tool-call open marker).
+        let c_idx = first_content_idx.unwrap_or_else(|| {
+            panic!(
+                "iter C interleave contract: content delta MUST be emitted for \
+                 the post-reasoning preamble; got events: {events:?}"
+            )
+        });
+
+        // Decision #21 ordering: reasoning before content.
+        assert!(
+            r_idx < c_idx,
+            "iter C ordering: reasoning ({r_idx}) MUST precede content ({c_idx}); \
+             events: {events:?}"
+        );
+
+        // If a ToolCallDelta fired (the body parsed under Auto), it MUST
+        // come AFTER the reasoning AND after the first content delta —
+        // it cannot interleave inside the reasoning span (otherwise the
+        // ReasoningSplitter→ToolCallSplitter composition is broken).
+        if let Some(t_idx) = first_tool_call_idx {
+            assert!(
+                r_idx < t_idx,
+                "iter C+B-2 composition: reasoning ({r_idx}) MUST precede \
+                 tool-call delta ({t_idx}); the ReasoningSplitter runs FIRST \
+                 in the engine pipeline. events: {events:?}"
+            );
+            assert!(
+                c_idx < t_idx,
+                "iter C+B-2 composition: post-reasoning content ({c_idx}) MUST \
+                 precede tool-call delta ({t_idx}); events: {events:?}"
+            );
+        }
+
+        // OpenAI spec: NO single delta event may carry BOTH
+        // reasoning_content AND tool_calls. The Rust enum makes this
+        // structurally impossible at the GenerationEvent level — Reasoning
+        // deltas are `GenerationEvent::Delta { kind: Reasoning, ... }`,
+        // tool deltas are `GenerationEvent::ToolCallDelta { ... }` —
+        // distinct variants, both encode through `sse.rs:166-247` into
+        // separate JSON chunks. Lock in by asserting NO ToolCallDelta
+        // appears at an index ≤ the last Reasoning delta index.
+        let last_reasoning_idx = events
+            .iter()
+            .rposition(|e| matches!(e, GenerationEvent::Delta { kind: DeltaKind::Reasoning, .. }));
+        if let (Some(lr), Some(t)) = (last_reasoning_idx, first_tool_call_idx) {
+            assert!(
+                lr < t,
+                "OpenAI spec: tool-call delta MUST NOT precede or interleave \
+                 with the reasoning span; last_reasoning={lr}, first_tool_call={t}, \
+                 events: {events:?}"
+            );
+        }
+
+        // Last event is Done.
+        assert!(
+            matches!(events.last(), Some(GenerationEvent::Done { .. })),
+            "Done must terminate stream; events: {events:?}"
+        );
+    }
+
+    /// Iter C non-streaming-origin replay: when the cache entry was
+    /// stored from a non-streaming completion (`reasoning_text=Some(...)`,
+    /// `text` post-split), the replay must FIRST emit the explicit
+    /// reasoning_text as a Reasoning delta, then route `text` (which
+    /// contains NO reasoning markers because they were stripped at
+    /// store time) through the splitter as Content. Companion to the
+    /// existing `replay_emits_reasoning_then_content_when_reasoning_text_set`
+    /// test, but locks in that the **registered model's** ReasoningSplitter
+    /// does NOT mistakenly re-classify post-split `text` as containing
+    /// reasoning (would cause double-emit).
+    #[test]
+    fn replay_nonstreaming_origin_does_not_double_emit_reasoning() {
+        let reg = match super::super::registry::find_for("qwen3.6-27b-dwq46") {
+            Some(r) => r,
+            None => {
+                eprintln!("qwen35 registration absent; skipping iter C double-emit test");
+                return;
+            }
+        };
+        if !reg.has_reasoning() {
+            return;
+        }
+
+        // Non-streaming-origin shape: post-split text + explicit
+        // reasoning_text. Critically, `text` does NOT contain reasoning
+        // markers (they were stripped by `split_full_output` at store
+        // time). If the splitter mistakenly re-runs and finds nothing,
+        // text routes cleanly as Content; if a regression caused it to
+        // partially match, we'd see double-emit.
+        let cached = cached_non_streaming(
+            "The final answer is 42.",
+            Some("step 1: parse problem; step 2: compute"),
+        );
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let res = replay_cached_streaming_response(
+            &cached,
+            Some(&reg),
+            ToolCallPolicy::Auto,
+            &tx,
+        );
+        assert!(res.is_ok());
+        drop(tx);
+        let events = drain(&mut rx);
+
+        // Concat by kind.
+        let reasoning_concat: String = events
+            .iter()
+            .filter_map(|e| match e {
+                GenerationEvent::Delta { kind: DeltaKind::Reasoning, text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        let content_concat: String = events
+            .iter()
+            .filter_map(|e| match e {
+                GenerationEvent::Delta { kind: DeltaKind::Content, text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // Reasoning emitted EXACTLY ONCE — single emission of the
+        // stored reasoning_text, not duplicated by a stray splitter
+        // match on post-split text.
+        assert_eq!(
+            reasoning_concat, "step 1: parse problem; step 2: compute",
+            "non-streaming-origin: reasoning_text must be emitted verbatim, \
+             ONCE. events: {events:?}"
+        );
+        assert_eq!(
+            content_concat, "The final answer is 42.",
+            "non-streaming-origin: post-split text must route cleanly as Content. \
+             events: {events:?}"
+        );
+        assert!(matches!(events.last(), Some(GenerationEvent::Done { .. })));
     }
 
     /// Wave 3.5 HIGH-2 — drain the ReasoningSplitter tail too.

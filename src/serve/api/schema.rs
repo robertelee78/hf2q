@@ -283,6 +283,13 @@ pub struct ReadyzResponse {
 /// Extended with hf2q-specific fields: `quant_type`, `context_length`,
 /// `backend`, `loaded`. These survive round-tripping through OpenAI SDKs
 /// because SDKs preserve unknown fields in the deserialized object.
+///
+/// ADR-018 C5: extended again with the unified `LoadInfo` snapshot fields
+/// (`arch`, `max_context_length`, `provenance`, `moe_*`, `sliding_window`,
+/// `kv_spill_active`, `quant_bpw`). Each new field is `Option<_>` and
+/// serde-skip-if-none, so externally-produced cache-scanned entries that
+/// have no live engine still serialize to a strict subset of the pre-C5
+/// shape — downstream OpenAI-API-compatible clients keep working.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelObject {
     pub id: String,
@@ -301,6 +308,50 @@ pub struct ModelObject {
     /// Whether this model is the currently-loaded one. Phase 4 hot-swap will
     /// allow multiple `loaded: true` entries; Phase 2 is exactly one.
     pub loaded: bool,
+
+    // ── ADR-018 C5 — `LoadInfo`-sourced fields (live-engine path only) ──
+    //
+    // Each field below is populated by the live-engine path
+    // (`handlers.rs::list_models` reading `engine.info()`) and left `None`
+    // by the cache-scan / embedding / mmproj paths that have no LoadInfo
+    // snapshot. `serde(skip_serializing_if = "Option::is_none")` keeps the
+    // wire format byte-identical to the pre-C5 shape for those callers.
+    /// Raw GGUF `general.architecture` string, e.g. `"gemma4"`,
+    /// `"qwen35"`, `"qwen35moe"`. Mirrors `LoadInfo::arch_str`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    /// Maximum context length declared by the GGUF
+    /// (`{arch}.context_length`). Distinct from `context_length` (which
+    /// historically reflects the cache-scanner-derived value); this field
+    /// is the live-engine LoadInfo source of truth and is `Some` only on
+    /// engine-backed entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_context_length: Option<u64>,
+    /// Provenance label — `"hf2q"` for hf2q-emitted GGUFs, `"external"`
+    /// otherwise. Derived from the `Provenance` enum on `LoadInfo`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<&'static str>,
+    /// Total expert count for MoE models; `None` for dense and for
+    /// non-engine-backed entries. Mirrors `LoadInfo.moe.n_experts`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moe_experts: Option<u32>,
+    /// Routed experts per token; `None` for dense and for non-engine-
+    /// backed entries. Mirrors `LoadInfo.moe.n_experts_per_tok`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moe_experts_per_tok: Option<u32>,
+    /// Sliding-window size in tokens, when applicable. Gemma4 sets this;
+    /// Qwen35 leaves it `None`. Mirrors `LoadInfo::sliding_window`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sliding_window: Option<u32>,
+    /// `true` iff the engine has a KV-spill hook bound for this load.
+    /// Mirrors `LoadInfo::kv_spill_active`. `None` for non-engine-backed
+    /// entries (cache-scanner has no engine to ask).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_spill_active: Option<bool>,
+    /// Parameter-weighted bits-per-weight, averaged across non-fp tensors.
+    /// Mirrors `LoadInfo::quant_bpw`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quant_bpw: Option<f32>,
 }
 
 /// Response for `GET /v1/models`.
@@ -1039,6 +1090,10 @@ mod tests {
 
     #[test]
     fn test_model_list_response_serialization() {
+        // ADR-018 C5: every new `LoadInfo`-sourced field is `None` here so
+        // the serialized shape mirrors the pre-C5 cache-scanned entry shape
+        // exactly (the eight new keys are skipped via
+        // `#[serde(skip_serializing_if = "Option::is_none")]`).
         let resp = ModelListResponse {
             object: "list",
             data: vec![ModelObject {
@@ -1050,6 +1105,14 @@ mod tests {
                 quant_type: Some("Q4_K_M".into()),
                 backend: Some("mlx-native"),
                 loaded: true,
+                arch: None,
+                max_context_length: None,
+                provenance: None,
+                moe_experts: None,
+                moe_experts_per_tok: None,
+                sliding_window: None,
+                kv_spill_active: None,
+                quant_bpw: None,
             }],
         };
         let json = serde_json::to_value(&resp).unwrap();
@@ -1062,6 +1125,74 @@ mod tests {
         assert_eq!(json["data"][0]["quant_type"], "Q4_K_M");
         assert_eq!(json["data"][0]["backend"], "mlx-native");
         assert_eq!(json["data"][0]["loaded"], true);
+
+        // Backward-compat pin: with every C5 field `None`, the serialized
+        // wire shape MUST NOT include any of the new keys.
+        let entry = &json["data"][0];
+        assert!(entry.get("arch").is_none(), "arch must be skipped");
+        assert!(
+            entry.get("max_context_length").is_none(),
+            "max_context_length must be skipped"
+        );
+        assert!(entry.get("provenance").is_none(), "provenance must be skipped");
+        assert!(
+            entry.get("moe_experts").is_none(),
+            "moe_experts must be skipped"
+        );
+        assert!(
+            entry.get("moe_experts_per_tok").is_none(),
+            "moe_experts_per_tok must be skipped"
+        );
+        assert!(
+            entry.get("sliding_window").is_none(),
+            "sliding_window must be skipped"
+        );
+        assert!(
+            entry.get("kv_spill_active").is_none(),
+            "kv_spill_active must be skipped"
+        );
+        assert!(entry.get("quant_bpw").is_none(), "quant_bpw must be skipped");
+    }
+
+    #[test]
+    fn test_model_object_with_load_info_fields() {
+        // ADR-018 C5: when the live-engine path populates the new fields,
+        // they appear in the wire format alongside the legacy fields.
+        let obj = ModelObject {
+            id: "Qwen3.6-27B-A3B-DWQ46-MoE".into(),
+            object: "model",
+            created: 1700000000,
+            owned_by: "hf2q",
+            context_length: Some(262_144),
+            quant_type: Some("Q4_K".into()),
+            backend: Some("mlx-native"),
+            loaded: true,
+            arch: Some("qwen35moe".into()),
+            max_context_length: Some(262_144),
+            provenance: Some("hf2q"),
+            moe_experts: Some(128),
+            moe_experts_per_tok: Some(8),
+            sliding_window: None,
+            kv_spill_active: Some(false),
+            quant_bpw: Some(4.55),
+        };
+        let json = serde_json::to_value(&obj).unwrap();
+        assert_eq!(json["arch"], "qwen35moe");
+        assert_eq!(json["max_context_length"], 262_144);
+        assert_eq!(json["provenance"], "hf2q");
+        assert_eq!(json["moe_experts"], 128);
+        assert_eq!(json["moe_experts_per_tok"], 8);
+        assert!(
+            json.get("sliding_window").is_none(),
+            "sliding_window=None must be skipped"
+        );
+        assert_eq!(json["kv_spill_active"], false);
+        // Float comparison via approximate equality on the JSON number's f64.
+        let bpw = json["quant_bpw"].as_f64().expect("quant_bpw f64");
+        assert!(
+            (bpw - 4.55_f64).abs() < 1e-3,
+            "quant_bpw expected ≈4.55, got {bpw}"
+        );
     }
 
     #[test]

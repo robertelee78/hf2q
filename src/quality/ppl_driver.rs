@@ -251,7 +251,11 @@ pub fn measure_ppl_qwen35(
     // iter-2c after the Chesterton's-fence audit confirmed it was a
     // forward-looking guard, not a correctness invariant — see the
     // module-level doc.
-    let qwen = Qwen35Model::load_from_gguf(&gguf)
+    // Silent progress: ppl_driver is a quality-eval batch tool; the
+    // `\r`-overwrite progress line would interleave with the per-chunk
+    // perplexity log. Mirrors the SERVE-side silent-progress pattern.
+    let mut progress = crate::serve::header::LoadProgress::new(false, 1, 0);
+    let qwen = Qwen35Model::load_from_gguf(&gguf, &mut progress)
         .map_err(|e| PplDriverError::Load(format!("{e:#}")))?;
 
     let vocab_size = qwen.cfg.vocab_size as usize;

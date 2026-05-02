@@ -55,6 +55,29 @@ mod quality {
     pub use super::perplexity;
 }
 
+mod serve {
+    //! ADR-018 C3 stub: `Qwen35Model::load_from_gguf(progress: &mut
+    //! crate::serve::header::LoadProgress)` resolves through this
+    //! tree from the `#[path]`-included `ppl_driver.rs`. The shim
+    //! `LoadProgress` mirrors the public surface of the production
+    //! type at `src/serve/header.rs:92-129`. Tests never actually
+    //! invoke `on_layer` / `finish` on the stub because the smoke
+    //! tests bail at input-validation or `GgufFile::open` long
+    //! before the stubbed `Qwen35Model::load_from_gguf` is reached.
+    pub mod header {
+        pub struct LoadProgress;
+        impl LoadProgress {
+            pub fn new(_stderr_is_tty: bool, _verbosity: u8, _n_layers: usize) -> Self {
+                Self
+            }
+            #[allow(dead_code)]
+            pub fn on_layer(&mut self, _i: usize) {}
+            #[allow(dead_code)]
+            pub fn finish(&mut self) {}
+        }
+    }
+}
+
 mod inference {
     //! Type-stubs for `crate::inference::models::qwen35::*`. Never
     //! invoked at runtime by the smoke tests below — every test
@@ -101,7 +124,16 @@ mod inference {
                 }
 
                 impl Qwen35Model {
-                    pub fn load_from_gguf(_gguf: &GgufFile) -> Result<Self> {
+                    /// ADR-018 C3: stubbed signature mirrors the
+                    /// production `Qwen35Model::load_from_gguf(gguf,
+                    /// progress)`. The smoke tests never reach this
+                    /// method, but the test crate must compile against
+                    /// the real signature so a future drift between
+                    /// stub and production trips at compile time.
+                    pub fn load_from_gguf(
+                        _gguf: &GgufFile,
+                        _progress: &mut crate::serve::header::LoadProgress,
+                    ) -> Result<Self> {
                         Err(anyhow!(
                             "tests/ppl_driver.rs: stubbed Qwen35Model::load_from_gguf \
                              — the production driver lives at \

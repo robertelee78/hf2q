@@ -33,6 +33,7 @@
 //!   returns `None` for the Qwen35 variant; that path needs review when
 //!   live inference lands).
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -40,6 +41,11 @@ use tokenizers::Tokenizer;
 
 use crate::inference::models::qwen35::kv_cache::HybridKvCacheSnapshot;
 use crate::inference::models::qwen35::model::Qwen35Model;
+use crate::serve::load_info::{
+    self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, MoeShape,
+    TokenizerSource,
+};
+use crate::serve::provenance::{self, Provenance};
 
 use super::engine::{LoadOptions, SamplingParams};
 
@@ -65,6 +71,8 @@ pub struct Qwen35LoadedModel {
     /// Surfaced via `/v1/models[*].id` and `Engine::model_id()`.
     /// Derived from `general.name` if present, else file stem.
     pub model_id: String,
+    /// Filesystem path to the GGUF opened by this loaded model.
+    pub model_path: PathBuf,
     /// EOS tokens — Qwen3.5/3.6 typically uses 151645 (`<|im_end|>`).
     /// Resolved from `tokenizer.ggml.eos_token_id` metadata; default is
     /// the HF Qwen3.5 default (151645) per `cmd_generate_qwen35`.
@@ -80,6 +88,11 @@ pub struct Qwen35LoadedModel {
     pub quant_type: Option<String>,
     /// Wall-clock from start to finish of `load`.
     pub load_duration: Duration,
+    /// ADR-017 §F4 — GGUF provenance captured at load time via
+    /// `crate::serve::provenance::detect(&gguf)`. Stored for the common
+    /// `LoadedModel::provenance()` surface; Qwen35 KV-spill remains
+    /// descriptor-pending because the cache is hybrid.
+    pub provenance: Provenance,
     /// Single-slot prompt cache (Wedge-3 / iter-216 Phase C / D).  Stores
     /// the post-prefill `HybridKvCacheSnapshot` + the greedy first
     /// decoded token + a generation-affecting params key, so a subsequent
@@ -118,11 +131,12 @@ impl Qwen35LoadedModel {
         // weights load below.
         let gguf = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
+        let provenance = provenance::detect(&gguf);
 
-        tracing::info!(
-            "Qwen35 SERVE load: model = {}",
-            model_path.display()
-        );
+        // ADR-018 C3: legacy `tracing::info!("Qwen35 SERVE load: model = ...")`
+        // was deleted here. The same fact (`model_path`) is now emitted by
+        // `emit_tracing(&info)` at every CLI/SERVE entry that constructs a
+        // `LoadInfo`. Conditions/warnings stay; load FACTS are unified.
 
         // ---- Resolve tokenizer path ----
         // Reuse the shared `find_tokenizer` helper from serve/mod.rs so
@@ -131,19 +145,43 @@ impl Qwen35LoadedModel {
         // `--tokenizer` (threaded through `LoadOptions::tokenizer_path`).
         let tokenizer_path =
             crate::serve::find_tokenizer(model_path, opts.tokenizer_path.as_deref())?;
-        tracing::info!(
-            "Qwen35 SERVE load: tokenizer = {}",
-            tokenizer_path.display()
-        );
+        // ADR-018 C3: legacy `tracing::info!("Qwen35 SERVE load: tokenizer = ...")`
+        // was deleted here. `emit_tracing(&info)` surfaces the active
+        // tokenizer source; for Qwen3.5/3.6 that's `TokenizerSource::GgufEmbedded`
+        // (the on-disk path is a load-time diagnostic only — see the
+        // `tokenizer_path` shadow below).
 
         // ---- Load weights (full mlx-native pipeline) ----
-        let model = Qwen35Model::load_from_gguf(&gguf).context("Qwen35Model::load_from_gguf")?;
-        let n_layers = model.layers.len();
-        tracing::info!(
-            "Qwen35 SERVE load: weights loaded ({} layers, variant={:?})",
-            n_layers,
-            model.cfg.variant
+        // ADR-018 C3: TTY-aware progress reporter mirroring cmd_generate
+        // (mod.rs:519-531). Under default verbosity on a TTY stderr the
+        // per-layer `\r loading i/n layers` line renders; under tracing
+        // INFO+ (`-v`) or non-TTY stderr (SERVE redirected to systemd /
+        // a log file) the reporter is silent and tracing::debug events
+        // from the per-layer loaders provide per-layer detail.
+        //
+        // Pre-parse just the config (cheap — parses GGUF metadata only,
+        // no tensor reads) so the progress denominator matches
+        // `cmd_generate`'s pattern. `Qwen35Model::load_from_gguf` will
+        // re-parse it internally; the duplicate cost is microsecond-scale
+        // metadata-key reads against an already-mmapped GGUF.
+        let stderr_is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+        let verbosity = if tracing::enabled!(tracing::Level::INFO) {
+            1
+        } else {
+            0
+        };
+        let cfg_preview = Qwen35Model::load_config_only(&gguf)
+            .context("Qwen35Model::load_config_only (progress sizing)")?;
+        let mut progress = crate::serve::header::LoadProgress::new(
+            stderr_is_tty,
+            verbosity,
+            cfg_preview.num_hidden_layers as usize,
         );
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
+            .context("Qwen35Model::load_from_gguf")?;
+        // ADR-018 C3: legacy `tracing::info!("Qwen35 SERVE load: weights loaded ({} layers, variant={:?})", ...)`
+        // was deleted here. `emit_tracing(&info)` surfaces both `n_layers`
+        // and architecture facts as structured fields.
 
         // ---- Resolve EOS ----
         // Qwen3.5/3.6: `tokenizer.ggml.eos_token_id` is typically 151645
@@ -211,65 +249,93 @@ impl Qwen35LoadedModel {
         };
 
         // ---- Quant label (matches Gemma path) ----
-        let quant_type = infer_quant_type_from_gguf(&gguf);
+        // Promoted to `crate::serve::load_info::infer_quant_label` per
+        // ADR-018 C1 — the previously-inline body was byte-identical to
+        // the Gemma-path body, both now route through the shared helper.
+        let quant_type = crate::serve::load_info::infer_quant_label(&gguf);
 
         let load_duration = load_start.elapsed();
-        tracing::info!(
-            "Qwen35 SERVE load: complete in {:.1}s ({} layers, ctx_len={:?}, quant={:?})",
-            load_duration.as_secs_f64(),
-            n_layers,
-            context_length,
-            quant_type
-        );
+        // ADR-018 C3: legacy `tracing::info!("Qwen35 SERVE load: complete in {:.1}s ...", ...)`
+        // was deleted here. `emit_tracing(&info)` (called by every entry
+        // that constructs a `LoadInfo`) emits structured `load_wall_clock`,
+        // `n_layers`, `max_context_length`, `quant_label` fields. The
+        // free-text format here was incompatible with `journalctl -u hf2q | jq`.
 
         Ok(Self {
             model,
             tokenizer,
             chat_template,
             model_id,
+            model_path: model_path.clone(),
             eos_token_ids,
             hidden_size,
             vocab_size,
             context_length,
             quant_type,
             load_duration,
+            provenance,
             prompt_cache: HybridPromptCache::new(),
         })
     }
 }
 
-/// Dominant non-fp tensor type label.  Mirrors
-/// `engine::infer_quant_type_from_gguf` (kept private to that module);
-/// duplicated here rather than refactored into a shared helper because
-/// the algorithm is 25 LOC and a refactor would touch a load-bearing
-/// file beyond iter-215's scope.
-fn infer_quant_type_from_gguf(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
-    use mlx_native::GgmlType;
-    use std::collections::HashMap;
-
-    let mut histogram: HashMap<&'static str, usize> = HashMap::new();
-    for name in gguf.tensor_names() {
-        let Some(info) = gguf.tensor_info(name) else { continue };
-        if matches!(info.ggml_type, GgmlType::F32 | GgmlType::F16) {
-            continue;
+impl LoadInfoBuilder for Qwen35LoadedModel {
+    fn build_load_info(
+        &self,
+        gguf: &mlx_native::gguf::GgufFile,
+        load_wall_clock: Duration,
+        kv_cache_budget_bytes: Option<u64>,
+        kv_spill_active: bool,
+    ) -> LoadInfo {
+        let cfg = &self.model.cfg;
+        LoadInfo {
+            model_id: self.model_id.clone(),
+            arch_str: load_info::arch_str_from_gguf(gguf),
+            arch_family: ArchFamily::Qwen35,
+            model_path: self.model_path.clone(),
+            on_disk_bytes: load_info::on_disk_bytes(&self.model_path),
+            backend_chip: mlx_native::MlxDevice::new()
+                .map(|d| d.name())
+                .unwrap_or_else(|_| "Apple GPU".to_string()),
+            backend: "mlx-native",
+            n_layers: cfg.num_hidden_layers,
+            hidden_size: self.hidden_size as u32,
+            vocab_size: self.vocab_size as u32,
+            n_attention_heads: cfg.num_attention_heads,
+            n_key_value_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            sliding_window: None,
+            full_attention_interval: Some(cfg.full_attention_interval),
+            max_context_length: self.context_length.map(|v| v as u32),
+            moe: cfg.moe.as_ref().map(|m| MoeShape {
+                n_experts: m.num_experts,
+                n_experts_per_tok: m.num_experts_per_tok,
+            }),
+            quant_label: self.quant_type.clone(),
+            quant_bpw: load_info::compute_bpw(gguf),
+            tokenizer_source: TokenizerSource::GgufEmbedded,
+            eos_token_ids: self.eos_token_ids.clone(),
+            bos_token_id: gguf.metadata_u32("tokenizer.ggml.bos_token_id"),
+            chat_template_source: if gguf.metadata_string("tokenizer.chat_template").is_some() {
+                ChatTemplateSource::GgufEmbedded
+            } else {
+                ChatTemplateSource::None
+            },
+            provenance: self.provenance.clone(),
+            vision_projector: None,
+            load_wall_clock,
+            resident_weight_bytes: None,
+            kv_cache_budget_bytes,
+            kv_spill_active,
         }
-        let label = match info.ggml_type {
-            GgmlType::F32 => "F32",
-            GgmlType::F16 => "F16",
-            GgmlType::Q4_0 => "Q4_0",
-            GgmlType::Q8_0 => "Q8_0",
-            GgmlType::Q4_K => "Q4_K",
-            GgmlType::Q5_K => "Q5_K",
-            GgmlType::Q6_K => "Q6_K",
-            GgmlType::I16 => "I16",
-        };
-        *histogram.entry(label).or_insert(0) += 1;
     }
-    histogram
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(k, _)| k.to_string())
 }
+
+// `infer_quant_type_from_gguf` (formerly 27 LOC of histogram code,
+// byte-identical to the Gemma-path body in engine.rs) was relocated to
+// `crate::serve::load_info::infer_quant_label` per ADR-018 C1.  The
+// duplication is gone; both `*LoadedModel::load` paths route through
+// the promoted helper.
 
 // ---------------------------------------------------------------------------
 // HybridPromptCache (Wedge-3 / ADR-005 iter-216 Phase C)

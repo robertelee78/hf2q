@@ -16,16 +16,14 @@
 //!   * `HF2Q_VISION_E2E_GGUF`   — path to the chat-model GGUF (Gemma 4).
 //!   * `HF2Q_VISION_E2E_MMPROJ` — path to the mmproj GGUF.
 //!   * `HF2Q_VISION_E2E_MLX_REPO` — model id passed to `mlx_vlm.generate`.
-//!     **REQUIRED — there is no usable default.**  The harness's historical
-//!     placeholder `mlx-community/gemma-4-vision-26b-A4B-it-bf16` does
-//!     **not exist** on HuggingFace and any peer leg run against it 404s.
-//!     Set this to a real, accessible HF repo id (or a local path that
-//!     `mlx_vlm.generate --model` can resolve) before running the matrix.
-//!     If left unset, the harness still uses the placeholder string but
-//!     the per-pair peer call will fail fast with a clear "set
-//!     HF2Q_VISION_E2E_MLX_REPO" error captured in the report's
-//!     `mlx_vlm_stderr_tail_4kb` field rather than producing a vacuous
-//!     all-zero match matrix (iter-104 fix for the vacuous-25/25 bug).
+//!     **Default: `mlx-community/gemma-4-26b-a4b-it-bf16`** (HTTP 200, ungated,
+//!     356 `vision_tower.*` tensors, full `vision_config` +
+//!     `vision_soft_tokens_per_image=280`, matches hf2q `gemma4_vision` config
+//!     exactly). Re-anchored 2026-05-01 (iter-224 row 7 / Worker Y) from the
+//!     iter-101 placeholder `mlx-community/gemma-4-vision-26b-A4B-it-bf16`,
+//!     which returns HTTP 401 (does not exist on HF) and was a stale guess.
+//!     Override only to point at a different real repo or local path that
+//!     `mlx_vlm.generate --model` can resolve.
 //!
 //! When unset, the GGUF + mmproj defaults point at
 //! `/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/` which holds
@@ -42,11 +40,12 @@
 //!     `GET /v1/models` once after `/readyz` flips and reusing
 //!     `data[0].id` as the model id for every per-pair POST — the
 //!     server is the source of truth for the loaded model id.
-//!   * **Bug 2 — placeholder `HF2Q_VISION_E2E_MLX_REPO`.**  The default
-//!     repo id does not exist; the harness now logs a concrete
-//!     "set HF2Q_VISION_E2E_MLX_REPO" pointer when the peer call's
+//!   * **Bug 2 — placeholder `HF2Q_VISION_E2E_MLX_REPO`.**  iter-104 added
+//!     a concrete "set HF2Q_VISION_E2E_MLX_REPO" pointer when the peer call's
 //!     stderr contains a 404 / "not found" / "does not exist" / "no such
-//!     file or directory" marker.
+//!     file or directory" marker.  iter-224 row 7 (2026-05-01) re-anchored
+//!     the default itself to `mlx-community/gemma-4-26b-a4b-it-bf16` so the
+//!     out-of-the-box run no longer hits a phantom repo.
 //!
 //! What the harness does end-to-end (only when the env-gate fires):
 //!   1. Materialize 5 synthetic fixture PNGs in `tests/fixtures/vision/` if missing.
@@ -399,7 +398,7 @@ fn run_e2e_matrix() -> std::io::Result<MatrixReport> {
             .into_owned()
     });
     let mlx_repo = std::env::var("HF2Q_VISION_E2E_MLX_REPO")
-        .unwrap_or_else(|_| "mlx-community/gemma-4-vision-26b-A4B-it-bf16".to_string());
+        .unwrap_or_else(|_| "mlx-community/gemma-4-26b-a4b-it-bf16".to_string());
 
     if !PathBuf::from(&gguf).exists() {
         return Err(std::io::Error::new(
@@ -598,10 +597,11 @@ fn run_e2e_matrix() -> std::io::Result<MatrixReport> {
             format!(
                 "[hf2q vision-e2e harness] mlx-vlm peer call for '{}' looks like a \
                  repo-not-found / 404 failure. The default \
-                 HF2Q_VISION_E2E_MLX_REPO value \
-                 'mlx-community/gemma-4-vision-26b-A4B-it-bf16' does NOT exist on \
-                 HuggingFace; set HF2Q_VISION_E2E_MLX_REPO to a real, accessible \
-                 HF repo id (or local path) before re-running.\n\
+                 HF2Q_VISION_E2E_MLX_REPO value re-anchored 2026-05-01 to \
+                 'mlx-community/gemma-4-26b-a4b-it-bf16' (verified HTTP 200); \
+                 if running against a different repo, ensure it exists on \
+                 HuggingFace or set HF2Q_VISION_E2E_MLX_REPO to a real, \
+                 accessible HF repo id (or local path) before re-running.\n\
                  ----- mlx_vlm stderr tail -----\n{}",
                 mlx_repo, stderr_tail,
             )
