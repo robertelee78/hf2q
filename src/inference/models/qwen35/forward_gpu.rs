@@ -1594,6 +1594,49 @@ impl Qwen35Model {
             None
         };
 
+        // ---- ADR-015 iter86: FaProjectionsArena allocation ----
+        //
+        // Allocated ONCE per prefill (seq_len > 1) when the model has at least
+        // one FullAttn layer, sized for the actual prompt length and FA shape
+        // (hidden_size, n_head, n_kv, head_dim, rms_norm_eps). Reused across
+        // all FullAttn layers in the loop below.
+        //
+        // Memory footprint at apex 35B-A3B q4_0-flat pp4127 (h=2048, n_head=16,
+        // n_kv=2, head_dim=256): ~405 MB. Lives for the entire prefill duration;
+        // M5 Max 128 GB unified memory keeps this well within budget.
+        //
+        // Lifetime: dropped at end of forward_gpu_impl, AFTER the final
+        // output-head commit_and_wait_labeled — which guarantees all arena
+        // buffers are still alive when any CB that references them executes.
+        // Same iter58b residency-rescission protection contract as
+        // FaPrefillArena / DenseFfnArena / MoeFfnArena / DnPrefillArena /
+        // ChunkAllocsArena.
+        //
+        // Skip when seq_len == 1 (decode): decode never enters the FA prefill
+        // bridge or the prefill branches of ops1-4 / ops6-7 commits.
+        //
+        // Skip when the model has no FullAttn layers: defensive — avoids a
+        // zero-useful arena allocation when running DN-only models.
+        let mut fa_proj_arena: Option<super::FaProjectionsArena> = if seq_len > 1
+            && layer_weights_gpu.iter().any(|l| matches!(l, LayerWeightsGpu::FullAttn { .. }))
+        {
+            let shape = FullAttnShape::from_config(cfg);
+            Some(
+                super::FaProjectionsArena::new(
+                    &device,
+                    seq_len,
+                    shape.hidden_size,
+                    shape.n_head,
+                    shape.n_kv,
+                    shape.head_dim,
+                    shape.rms_norm_eps,
+                )
+                .context("alloc FaProjectionsArena")?,
+            )
+        } else {
+            None
+        };
+
         // ---- ADR-015 iter72: DenseFfnArena allocation ----
         //
         // Allocated ONCE per prefill (seq_len > 1), sized for the actual prompt
@@ -1920,6 +1963,7 @@ impl Qwen35Model {
                         shape.mrope_section,
                         shape.rms_norm_eps,
                         fa_arena.as_mut(),
+                        fa_proj_arena.as_mut(),
                     )
                     .with_context(|| format!("full_attn layer {layer_idx}"))?
                 }
@@ -3544,6 +3588,7 @@ impl Qwen35Model {
                             shape.rope_theta,
                             shape.mrope_section,
                             shape.rms_norm_eps,
+                            None,
                             None,
                         )
                         .with_context(|| format!("full_attn legacy greedy layer {layer_idx}"))?

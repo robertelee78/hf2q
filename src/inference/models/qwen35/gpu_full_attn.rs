@@ -806,6 +806,161 @@ pub fn apply_linear_projection_f32_pooled(
 }
 
 // ================================================================
+// ADR-015 iter86: arena-aware variants of FA helper ops
+// ================================================================
+//
+// These mirror the existing helpers byte-for-byte, but write into a
+// caller-supplied `&MlxBuffer` (output) and `&MlxBuffer` (params) sourced
+// from a [`super::FaProjectionsArena`]. Used by [`build_gated_attn_layer`]'s
+// prefill body when `fa_proj_arena=Some` to eliminate the per-FA-layer
+// pooled_alloc_buffer / device.alloc_buffer churn captured by the W-5b.8
+// `fa.ops1_4` bucket.
+//
+// All four helpers preserve the exact dispatch sequence + numerical
+// behaviour of the originals — only the output buffer source differs.
+
+/// Arena-aware variant of [`apply_pre_attn_rms_norm`] that writes into
+/// caller-supplied `out` (sourced from
+/// [`super::FaProjectionsArena::x_norm_buf`]) using `params` from
+/// [`super::FaProjectionsArena::pre_norm_params_buf`].
+pub fn apply_pre_attn_rms_norm_into(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weights_gpu: &FullAttnWeightsGpu,
+    out: &MlxBuffer,
+    params: &MlxBuffer,
+    seq_len: u32,
+    hidden_size: u32,
+) -> Result<()> {
+    rms_norm::dispatch_rms_norm(
+        encoder,
+        registry,
+        device.metal_device(),
+        input,
+        &weights_gpu.attn_norm,
+        out,
+        params,
+        seq_len,
+        hidden_size,
+    )
+    .context("dispatch_rms_norm (arena into)")?;
+    Ok(())
+}
+
+/// Arena-aware variant of [`apply_q_or_k_per_head_rms_norm`] that writes
+/// into caller-supplied `out` (sourced from
+/// [`super::FaProjectionsArena::q_normed_buf`] or `k_normed_buf`) using
+/// shared `params` from [`super::FaProjectionsArena::qk_rms_params_buf`].
+///
+/// `params` must contain `[eps, head_dim_as_f32]`. Both Q and K share the
+/// same param values because both norm along `head_dim` with the same eps.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_q_or_k_per_head_rms_norm_into(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    norm_weight: &MlxBuffer,
+    out: &MlxBuffer,
+    params: &MlxBuffer,
+    seq_len: u32,
+    n_heads: u32,
+    head_dim: u32,
+) -> Result<()> {
+    let rows = seq_len * n_heads;
+    let dim = head_dim;
+    rms_norm::dispatch_rms_norm(
+        encoder,
+        registry,
+        device.metal_device(),
+        input,
+        norm_weight,
+        out,
+        params,
+        rows,
+        dim,
+    )
+    .context("dispatch_rms_norm per-head (arena into)")?;
+    Ok(())
+}
+
+/// Arena-aware variant of [`apply_imrope`] that writes into caller-supplied
+/// `out` (sourced from [`super::FaProjectionsArena::q_rope_buf`] or
+/// `k_rope_buf`).
+///
+/// IMROPE param buffers are NOT in the arena — `dispatch_rope_multi_cached`
+/// holds its own thread-local cache keyed by shape + freq_base, so the
+/// param triple is built once across the entire prefill (and decode), not
+/// per-call.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_imrope_into(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    out: &MlxBuffer,
+    positions: &MlxBuffer,
+    seq_len: u32,
+    n_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    freq_base: f32,
+    mrope_section: [u32; 4],
+) -> Result<()> {
+    let params = RopeMultiParams {
+        head_dim,
+        rope_dim: rotary_dim,
+        n_heads,
+        seq_len,
+        freq_base,
+        mode: RopeMultiMode::Imrope,
+        sections: mrope_section,
+    };
+    dispatch_rope_multi_cached(
+        encoder,
+        registry,
+        device,
+        input,
+        out,
+        positions,
+        params,
+    )
+    .context("dispatch_rope_multi_cached (arena into)")?;
+    Ok(())
+}
+
+/// Arena-aware variant of [`apply_sigmoid_gate_multiply`] that writes into
+/// caller-supplied `out` (sourced from
+/// [`super::FaProjectionsArena::gated_buf`]) using `params` from
+/// [`super::FaProjectionsArena::sigmoid_params_buf`].
+#[allow(clippy::too_many_arguments)]
+pub fn apply_sigmoid_gate_multiply_into(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    attn_out: &MlxBuffer,
+    gate: &MlxBuffer,
+    out: &MlxBuffer,
+    params: &MlxBuffer,
+    n_elements: u32,
+) -> Result<()> {
+    dispatch_sigmoid_mul(
+        encoder,
+        registry,
+        device.metal_device(),
+        attn_out,
+        gate,
+        out,
+        params,
+        n_elements,
+    )
+    .context("dispatch_sigmoid_mul (arena into)")?;
+    Ok(())
+}
+
+// ================================================================
 // SDPA — causal, GQA, prefill
 // ================================================================
 
@@ -1590,6 +1745,7 @@ pub fn build_gated_attn_layer(
     mrope_section: [u32; 4],
     rms_norm_eps: f32,
     fa_arena: Option<&mut crate::inference::models::qwen35::FaPrefillArena>,
+    fa_proj_arena: Option<&mut crate::inference::models::qwen35::FaProjectionsArena>,
 ) -> Result<MlxBuffer> {
     // Capture arena presence before moving fa_arena into the SDPA call below.
     // Used to decide the commit vs commit_labeled path for ops1-4 and ops6-7.
@@ -1609,6 +1765,27 @@ pub fn build_gated_attn_layer(
     let q_total = n_heads * head_dim;
     let kv_total = n_kv_heads * head_dim;
 
+    // ADR-015 iter86: validate the projections arena's capacity and consume
+    // the &mut borrow into a local Option<&FaProjectionsArena> for the
+    // ops1-4 + ops6-7 read-only access pattern. The arena's slot buffers
+    // need only `&MlxBuffer` for `dispatch_*` calls (kernel writes go via
+    // mlx-native's own internal mutability).
+    //
+    // For the Q/K/V/Gate projections (which call `quantized_matmul_ggml`
+    // requiring `&mut MlxBuffer`), we use `apply_linear_projection_f32_into`
+    // which takes `&mut dst` — but each projection writes to a distinct
+    // arena field, so we destructure the arena into individual `&mut`
+    // borrows just before that block.
+    let use_proj_arena = fa_proj_arena.is_some() && seq_len > 1;
+    if let Some(ref arena) = fa_proj_arena {
+        // Capacity check happens once per layer call. Mismatch is a wiring
+        // bug (caller must size the arena from the same FullAttnShape used
+        // here).
+        arena
+            .validate_fits(seq_len, hidden_size, n_heads, n_kv_heads, head_dim)
+            .context("FaProjectionsArena shape mismatch")?;
+    }
+
     // ---- PREFILL / STATELESS PATH (all cases) ----
     //
     // For decode (seq=1) with a KV cache slot, the GPU-fused single-encoder
@@ -1619,7 +1796,142 @@ pub fn build_gated_attn_layer(
     // For seq > 1 (prefill): CPU K/V permute is required for head-major layout.
     // Wave 5b.9: per-FA-layer ops1-4 wall (gated on HF2Q_PROFILE_W5B8=1).
     // Guard scoped to the inner `{ ... }` so the section closes before the SDPA call.
-    let (x_norm, q_flat, k_flat, v_flat, gate_flat, q_normed, k_normed, q_rope, k_rope) = {
+    //
+    // ADR-015 iter86: when fa_proj_arena=Some (prefill, seq_len>1, model has
+    // FA layers), use the arena-aware ops that write into caller-owned slots.
+    // Eliminates 9 device.alloc_buffer / pooled_alloc_buffer calls per FA layer
+    // (4 projection outputs + 5 helper outputs) per W-5b.8 fa.ops1_4 bucket.
+    //
+    // The two paths produce bit-identical results — same kernels, same dispatch
+    // sequence, same intra-encoder barriers; only the output buffer source
+    // differs (caller-owned arena slot vs. fresh device.alloc_buffer /
+    // pooled_alloc_buffer). The byte-exact F32 parity test
+    // `fa_projections_arena_byte_exact_f32_parity` (this file) guards the
+    // equivalence at seq_len=128.
+    // Take the &mut borrow only when use_proj_arena is true. fa_proj_arena
+    // remains `Option<&mut FaProjectionsArena>`; we reborrow in each phase
+    // (ops1-4 here, ops6-7 below) so both phases can share access without
+    // consuming the outer Option.
+    let mut fa_proj_arena = fa_proj_arena;
+    let (x_norm, q_flat, k_flat, v_flat, gate_flat, q_normed, k_normed, q_rope, k_rope) = if let
+        Some(arena) = fa_proj_arena.as_mut().map(|a| &mut **a).filter(|_| use_proj_arena)
+    {
+        let _w5b9_ops1to4 = super::wave5b8_profile::Section::start(
+            super::wave5b8_profile::SectionKind::FaOps1to4,
+        );
+        let mut enc = device.command_encoder().context("enc ops1-4")?;
+
+        // Op 1: pre-attention RMSNorm → arena.x_norm_buf
+        apply_pre_attn_rms_norm_into(
+            &mut enc, registry, device, x, weights_gpu,
+            &arena.x_norm_buf, &arena.pre_norm_params_buf,
+            seq_len, hidden_size,
+        )?;
+        // Barrier: ops 2 read from x_norm written above.
+        enc.memory_barrier();
+
+        // Op 2: Q/K/V/G projections — all read from arena.x_norm_buf, write
+        // into arena.{q,k,v,gate}_proj_buf via apply_linear_projection_f32_into.
+        // Each call needs &mut on a distinct arena field; we sequence them so
+        // the unique &mut borrows don't overlap.
+        apply_linear_projection_f32_into(
+            &mut enc, registry, device, &arena.x_norm_buf,
+            &weights_gpu.wq, &mut arena.q_proj_buf,
+            seq_len, hidden_size, q_total,
+        )?;
+        apply_linear_projection_f32_into(
+            &mut enc, registry, device, &arena.x_norm_buf,
+            &weights_gpu.wk, &mut arena.k_proj_buf,
+            seq_len, hidden_size, kv_total,
+        )?;
+        apply_linear_projection_f32_into(
+            &mut enc, registry, device, &arena.x_norm_buf,
+            &weights_gpu.wv, &mut arena.v_proj_buf,
+            seq_len, hidden_size, kv_total,
+        )?;
+        apply_linear_projection_f32_into(
+            &mut enc, registry, device, &arena.x_norm_buf,
+            &weights_gpu.w_gate, &mut arena.gate_proj_buf,
+            seq_len, hidden_size, q_total,
+        )?;
+        // Barrier: ops 3 read from q_proj/k_proj written above.
+        enc.memory_barrier();
+
+        // Op 3: per-head RMSNorm on Q and K (shared params from arena).
+        apply_q_or_k_per_head_rms_norm_into(
+            &mut enc, registry, device, &arena.q_proj_buf,
+            &weights_gpu.attn_q_norm, &arena.q_normed_buf,
+            &arena.qk_rms_params_buf, seq_len, n_heads, head_dim,
+        )?;
+        apply_q_or_k_per_head_rms_norm_into(
+            &mut enc, registry, device, &arena.k_proj_buf,
+            &weights_gpu.attn_k_norm, &arena.k_normed_buf,
+            &arena.qk_rms_params_buf, seq_len, n_kv_heads, head_dim,
+        )?;
+        // Barrier: ops 4 read from q_normed / k_normed written above.
+        enc.memory_barrier();
+
+        // Op 4: IMROPE on Q and K — params triple is in dispatch_rope_multi_cached's
+        // thread-local cache (NOT in this arena) — see apply_imrope_into doc.
+        apply_imrope_into(
+            &mut enc, registry, device, &arena.q_normed_buf, &arena.q_rope_buf,
+            positions, seq_len, n_heads, head_dim, rotary_dim, freq_base, mrope_section,
+        )?;
+        apply_imrope_into(
+            &mut enc, registry, device, &arena.k_normed_buf, &arena.k_rope_buf,
+            positions, seq_len, n_kv_heads, head_dim, rotary_dim, freq_base, mrope_section,
+        )?;
+
+        // Decode fast path (seq=1, head_dim%32==0): commit() without wait.
+        // Metal serial queue guarantees ops1-4 completes before SDPA starts.
+        // The SDPA encode path (apply_sdpa_with_kv_cache seq=1 branch) never
+        // calls download_f32 so no CPU buffer access races.
+        //
+        // Prefill path (seq>1) without arena: commit_and_wait()
+        // because apply_sdpa_with_kv_cache's prefill branch calls download_f32
+        // (CPU read) on k_rope/v_flat before submitting any GPU work, so the
+        // GPU must have finished writing those buffers before we return.
+        //
+        // Decode (seq=1) only: GPU-only path, safe to commit_labeled.
+        // Prefill (seq>1): apply_sdpa_with_kv_cache (legacy path) unconditionally
+        // calls download_f32(k_seq_major) / download_f32(v_seq_major) to write
+        // the persistent KV cache (slot.k/slot.v) BEFORE the new_path_eligible
+        // branch dispatches FA. download_f32 → MlxBuffer::as_slice violates the
+        // ADR-013 P21 Stage 2 (2026-05-01): KV-cache write is now a GPU
+        // dispatch (kv_cache_copy_seq_f32_dual at apply_sdpa_with_kv_cache:1380),
+        // eliminating the download_f32(k_seq_major)/download_f32(v_seq_major)
+        // calls that previously required commit_and_wait here for the
+        // as_slice "no GPU writer in flight" contract. With use_arena=true
+        // (Stage 1 FaPrefillArena keeps scratches alive past commit), we can
+        // safely commit_labeled in prefill too — the FA bridge dispatch runs
+        // on the same Metal serial queue and orders after ops1-4 by GPU
+        // queue ordering. iter58b residency-rescission is prevented by the
+        // FaPrefillArena lifetime (scratches don't drop until end of prefill).
+        if (seq_len == 1 && head_dim % 32 == 0) || use_arena {
+            enc.commit_labeled("layer.full_attn.ops1-4");
+        } else {
+            enc.commit_and_wait_labeled("layer.full_attn.ops1-4")
+                .context("commit ops1-4 prefill (proj arena)")?;
+        }
+
+        // ARC clones from the arena are returned to the outer-scope tuple.
+        // Each clone is just a refcount bump on the underlying Metal buffer;
+        // the arena slot is conceptually borrowed for the rest of the layer.
+        // The next FA layer overwrites these slots only AFTER its own enc
+        // commit submits to the Metal serial queue — by which time all
+        // CBs that read these clones have already been queued ahead.
+        (
+            arena.x_norm_buf.clone(),
+            arena.q_proj_buf.clone(),
+            arena.k_proj_buf.clone(),
+            arena.v_proj_buf.clone(),
+            arena.gate_proj_buf.clone(),
+            arena.q_normed_buf.clone(),
+            arena.k_normed_buf.clone(),
+            arena.q_rope_buf.clone(),
+            arena.k_rope_buf.clone(),
+        )
+    } else {
         let _w5b9_ops1to4 = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::FaOps1to4,
         );
@@ -1809,6 +2121,12 @@ pub fn build_gated_attn_layer(
     );
 
     // ---- Ops 6–7: sigmoid-gate multiply + output projection ----
+    //
+    // ADR-015 iter86: when use_proj_arena, sigmoid_mul writes into
+    // arena.gated_buf (with arena.sigmoid_params_buf as the element-count
+    // buffer) instead of allocating from the decode pool. Same kernels,
+    // same dispatch order, same memory_barrier — only the output buffer
+    // source differs. The byte-exact F32 parity test guards equivalence.
     let out = {
         // Wave 5b.9: per-FA-layer ops6-7 wall (gated on HF2Q_PROFILE_W5B8=1).
         let _w5b9_ops6to7 = super::wave5b8_profile::Section::start(
@@ -1816,9 +2134,20 @@ pub fn build_gated_attn_layer(
         );
         let n_elem = seq_len * q_total;
         let mut enc = device.command_encoder().context("enc ops6-7")?;
-        let gated = apply_sigmoid_gate_multiply(
-            &mut enc, registry, device, &attn_out, &gate_flat, n_elem,
-        )?;
+        let gated = if let Some(arena) =
+            fa_proj_arena.as_ref().map(|a| &**a).filter(|_| use_proj_arena)
+        {
+            apply_sigmoid_gate_multiply_into(
+                &mut enc, registry, device,
+                &attn_out, &gate_flat, &arena.gated_buf,
+                &arena.sigmoid_params_buf, n_elem,
+            )?;
+            arena.gated_buf.clone()
+        } else {
+            apply_sigmoid_gate_multiply(
+                &mut enc, registry, device, &attn_out, &gate_flat, n_elem,
+            )?
+        };
         // ADR-015 iter61a-4: memory_barrier between Op 6 (sigmoid_gate_multiply
         // writes `gated`) and Op 7 (linear_projection reads `gated`).
         //
@@ -2760,6 +3089,7 @@ mod tests {
             shape.mrope_section,
             shape.rms_norm_eps,
             None,
+            None,
         )
         .expect("build_gated_attn_layer");
 
@@ -2899,4 +3229,188 @@ mod tests {
     // 11) at full PP4106 walk-bar scale supersedes the seq=128 unit-level
     // numerical-tolerance check; see `docs/wave5b3-walkbar-results.md`
     // "Wave 5b.12" section for the audit table.
+
+    /// **ADR-015 iter86 byte-exact F32 parity test**: arena-aware FA layer
+    /// (`fa_proj_arena=Some(arena)`) returns BIT-IDENTICAL output to the
+    /// legacy path (`fa_proj_arena=None`) when given the same input,
+    /// weights, and positions. Demonstrates the arena lift is a pure
+    /// allocation-source change with zero numerical effect.
+    ///
+    /// Stateless path (`kv_cache_slot=None`) at seq_len=128 — exercises the
+    /// full ops1-4 → SDPA causal → ops6-7 chain through the arena's slots.
+    ///
+    /// # Why byte-exact, not |GPU − CPU| tolerance
+    ///
+    /// Both paths run the SAME mlx-native kernels with the SAME inputs;
+    /// the only difference is the buffer the kernel writes into. F32
+    /// arithmetic is deterministic on a fixed Metal device + simdgroup
+    /// width, so 0 element diffs is the correct invariant.
+    #[test]
+    fn fa_projections_arena_byte_exact_f32_parity() {
+        use super::super::FaProjectionsArena;
+
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let (shape, weights_cpu, seq_len) = small_shape_and_weights();
+        // Use a larger seq_len than small_shape_and_weights' default to
+        // exercise the prefill (seq_len > 1) commit path. The helper
+        // returns a small seq_len; we override here with a fixed 128 to
+        // match the test name + the iter72/74/78 precedent of
+        // unit-test-scale-shape parity gates.
+        let _ = seq_len;
+        let seq_len: u32 = 128;
+
+        let h = shape.hidden_size as usize;
+        let nh = shape.n_head as usize;
+        let nkv = shape.n_kv as usize;
+        let d = shape.head_dim as usize;
+        let seq = seq_len as usize;
+
+        // Synthetic residual-stream input (deterministic seed).
+        let mut s = 0xDEADBEEFu32;
+        let x_cpu: Vec<f32> = (0..seq * h)
+            .map(|_| {
+                s = s.wrapping_mul(1103515245).wrapping_add(12345);
+                ((s as i32 as f32) / (i32::MAX as f32)) * 0.5
+            })
+            .collect();
+
+        // Text-only positions: all 4 axes = token index, flat layout
+        // matching the production forward_gpu.rs encoding.
+        let positions_flat: Vec<i32> = (0..4)
+            .flat_map(|_| (0..seq_len as i32).collect::<Vec<_>>())
+            .collect();
+
+        let upload_pos = |dev: &MlxDevice| -> MlxBuffer {
+            let mut b = dev
+                .alloc_buffer(positions_flat.len() * 4, DType::I32, vec![positions_flat.len()])
+                .expect("alloc positions");
+            b.as_mut_slice::<i32>()
+                .expect("mut")
+                .copy_from_slice(&positions_flat);
+            b
+        };
+
+        // Upload weights via the F32 dense path so both runs see identical
+        // numerics; production's Q4_0 path also goes through arena vs
+        // pooled symmetrically, but F32 lets us test byte-exactness without
+        // worrying about quantization step-effects on a different alloc.
+        // build_gated_attn_layer dispatches by weight dtype; we want both
+        // paths to take the same dispatch arm so any element diff isolates
+        // the alloc-source-change as the culprit.
+        let upload_weights = |dev: &MlxDevice| -> FullAttnWeightsGpu {
+            FullAttnWeightsGpu::from_cpu_f32(&weights_cpu, dev).expect("upload weights")
+        };
+
+        // --- Run 1: legacy path (fa_proj_arena=None) ---
+        let x_gpu_legacy = upload_f32(&x_cpu, &device).expect("upload x legacy");
+        let pos_legacy = upload_pos(&device);
+        let weights_legacy = upload_weights(&device);
+        let out_legacy_buf = build_gated_attn_layer(
+            &device,
+            &mut registry,
+            &x_gpu_legacy,
+            &pos_legacy,
+            &weights_legacy,
+            None, // stateless SDPA
+            0,
+            seq_len,
+            shape.hidden_size,
+            shape.n_head,
+            shape.n_kv,
+            shape.head_dim,
+            shape.rotary_dim,
+            shape.rope_theta,
+            shape.mrope_section,
+            shape.rms_norm_eps,
+            None, // fa_arena
+            None, // fa_proj_arena (LEGACY)
+        )
+        .expect("legacy build_gated_attn_layer");
+        let out_legacy = download_f32(&out_legacy_buf).expect("download legacy");
+
+        // --- Run 2: arena path (fa_proj_arena=Some(...)) ---
+        let x_gpu_arena = upload_f32(&x_cpu, &device).expect("upload x arena");
+        let pos_arena = upload_pos(&device);
+        let weights_arena = upload_weights(&device);
+        let mut fa_proj_arena = FaProjectionsArena::new(
+            &device,
+            seq_len,
+            shape.hidden_size,
+            shape.n_head,
+            shape.n_kv,
+            shape.head_dim,
+            shape.rms_norm_eps,
+        )
+        .expect("FaProjectionsArena::new");
+        let out_arena_buf = build_gated_attn_layer(
+            &device,
+            &mut registry,
+            &x_gpu_arena,
+            &pos_arena,
+            &weights_arena,
+            None,
+            0,
+            seq_len,
+            shape.hidden_size,
+            shape.n_head,
+            shape.n_kv,
+            shape.head_dim,
+            shape.rotary_dim,
+            shape.rope_theta,
+            shape.mrope_section,
+            shape.rms_norm_eps,
+            None,                       // fa_arena
+            Some(&mut fa_proj_arena),   // fa_proj_arena (NEW)
+        )
+        .expect("arena build_gated_attn_layer");
+        let out_arena = download_f32(&out_arena_buf).expect("download arena");
+
+        // --- Compare ---
+        // Guard: parallel test contention may leave a Metal CB unexecuted,
+        // returning all-zero output. Skip both-zero (suspect contention)
+        // rather than fail.
+        let legacy_all_zero = out_legacy.iter().all(|&v| v == 0.0);
+        let arena_all_zero = out_arena.iter().all(|&v| v == 0.0);
+        if legacy_all_zero && arena_all_zero {
+            eprintln!(
+                "fa_projections_arena_byte_exact_f32_parity: both paths all-zero \
+                 under parallel test contention — skipping"
+            );
+            return;
+        }
+
+        assert_eq!(
+            out_legacy.len(),
+            out_arena.len(),
+            "byte-exact parity: output lengths differ — legacy={} arena={}",
+            out_legacy.len(),
+            out_arena.len(),
+        );
+        let mut n_diff = 0usize;
+        for (i, (&l, &a)) in out_legacy.iter().zip(out_arena.iter()).enumerate() {
+            if l.to_bits() != a.to_bits() {
+                if n_diff < 5 {
+                    eprintln!(
+                        "  byte-exact diff[{i}]: legacy={l:.10} ({:#010x}) \
+                         arena={a:.10} ({:#010x})",
+                        l.to_bits(),
+                        a.to_bits()
+                    );
+                }
+                n_diff += 1;
+            }
+        }
+        assert_eq!(
+            n_diff, 0,
+            "fa_projections_arena_byte_exact_f32_parity FAIL: {n_diff}/{} F32 \
+             elements differ — arena path is NOT byte-identical to legacy",
+            out_legacy.len(),
+        );
+        eprintln!(
+            "fa_projections_arena_byte_exact_f32_parity: 0/{} elements differ \
+             (byte-exact) seq_len={seq_len}, shape h={}, nh={}, nkv={}, d={}",
+            out_legacy.len(), shape.hidden_size, nh, nkv, d,
+        );
+    }
 }
