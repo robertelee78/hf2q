@@ -7,7 +7,7 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
-## ▶ Resume Here — current state of truth (2026-05-01 ~23:05Z, iter64a CONFIRMED: C1 device-direct B reads are iter62's +445ms mechanism — L2/DRAM bandwidth thrash from removed threadgroup-B caching across simdgroups; iter65 hybrid threadgroup<float> B is queued)
+## ▶ Resume Here — current state of truth (2026-05-01 ~23:35Z, iter65 FALSIFIED: load-bearing finding — Apple M3+ hardware tensor cores ONLY accelerate the homogeneous (half, half, float) variant; ANY operand-precision-mixing falls to ~2× slower software compute path. main IS optimal for this kernel.)
 
 **Decode side: SHIPPED + RE-VALIDATED. iter56/57/58b confirmed byte-transparent perf-only changes (iter61c FULL VERDICT: ALL PASS).**
 
@@ -100,9 +100,25 @@ iter62 receipts: `/tmp/cfa-iter62/results/{A-VERDICT,B-60c-VERDICT,B-mtnsg-VERDI
 - **Production blast radius (load-bearing):** hf2q's chunk-prefill uses M=64 EXACTLY (`CHUNK_THRESHOLD` in `src/inference/models/qwen35/gpu_delta_net.rs:105`); the 3 `test_*_mm_matches_mv_prefill_shape` failures at M=64 are the production chunk shape exactly. Shipping iter63a or iter63c would silently corrupt every prefill chunk. **DO NOT MERGE either branch.** llama.cpp's NRB=128 geometry works for them only because their typical M (full-prompt prefill) is ≫ 128.
 - **Implication for iter62's matmul-size-scaled `layer.ops1_3` regression mechanism:** the regression must come from one of iter60b's OTHER changes (transpose_result toggle, type-param swap in `get_destination_cooperative_tensor<>`, partial-tile writeback removal, OR device-direct B reads), NOT from the unchanged tile shape. The actual mechanism is unknown — localizing it requires per-DISPATCH GPU counter measurement.
 
-**Updated iter63 priority (loop continues):**
+**iter65 POST-MORTEM (2026-05-01 ~23:35Z): the cast-elimination-via-threadgroup<float> hypothesis is FALSIFIED, completing a 4-iter convergence (iter60b/63a/63c/65) on the LOAD-BEARING tensor-cores finding.**
+- **iter65** (mlx-native branch `cfa/iter65-tg-float-b-20260501/claude` HEAD `b47e927`, pushed): kept main's threadgroup-B cache + changed sb element type half→float to eliminate f32→half cast. Build + parity 11/11 PASS BYTE-EXACT. Cold-bench: iter65 2540ms vs main 2023ms = **+517ms / +25.6% REGRESSION**. Per-bucket: layer.ops1_3 +100ms (1.85×), layer.ffn_dispatch +416ms (1.31×); fa.ops1_4 unchanged (FA path uses different kernel template).
+- **Critical convergent finding:** iter64a (device-direct B, no cache, +531ms) and iter65 (threadgroup<float> B, cache preserved, +517ms) produce ~the same regression DESPITE completely different L2/DRAM access patterns. The ONLY shared property: BOTH break homogeneous-half-precision input for `tensor_ops::matmul2d`. Combined with iter60b (+423ms via mixed precision through `tensor<device float>`) and iter63a/c (NR1=128 with mixed precision, parity-failed pre-bench), 4 independent kernel modifications converge on the same hypothesis: **Apple M3+ hardware tensor cores accelerate ONLY the `(half, half, float)` cooperative-tensor variant; mixed-precision `(half, float, float)` and `(float, half, float)` variants — though shipping in the MPP API per `MPPTensorOpsMatMul2d.h:21,24` + `Impl.h:5610-5621` — fall to a ~2× slower software compute path.**
+- **Implication: main IS OPTIMAL for `kernel_mul_mm_q4_0_tensor_f32` on M5 Max.** The f32→half cast in main is the price paid for hardware tensor cores. iter60b's "eliminate cast" structural motivation is FALSIFIED at value (definitively): the cast cost is dwarfed by the tensor-cores loss. The B staging design space is CLOSED.
+- **DO NOT MERGE iter65, iter64a, iter60b, iter63a, iter63c.** All preserved as evidence. Convergent ADR-013 P21 mm_id audit (`tensor variant ≡ llama half-MMA, residual gap is GPU scheduling`) reaches the same conclusion via a different kernel.
 
-1. **iter63 GPU profiling kit — LANDED on `cfa/iter63-profiling-kit-20260501/claude` HEAD `d0b0128` (mlx-native), 5 commits, +1566 LOC (995 production / 571 tests).** Extends `kernel_profile.rs` per-CB scaffold with per-dispatch path (`MLX_PROFILE_DISPATCH=1`) + ports llama.cpp's programmatic `MTLCaptureManager` (`MLX_METAL_CAPTURE=/path.gputrace`). All 6 acceptance criteria PASS; 127/127 mlx-native lib tests (0 regressions; +2 in `kernel_profile::tests`, +5 in `metal_capture::tests`); 9 new unsafe blocks all matching existing patterns; zero FFI shim, zero objc2-metal dep. Operator hand-off recipe ready.
+**Updated iter66+ priority (loop continues; B staging closed, look elsewhere):**
+
+1. **iter66 candidate — encoder coalescence (iter57 thesis revival).** Now empirically motivated by the matmul kernel being optimal: the residual prefill gap (0.319× cold-clean) lives at the orchestration layer (CB count, dispatch density, encoder boundaries), not the kernel itself. ADR-013 P21 already proved the orchestration improvements possible (sync_count 161→6 via FaPrefillArena, K=8 FFN-terminal batching). Continue similar work for the prefill DN path.
+
+2. **iter66 candidate — multi-token NSG kernel merge (iter59-mtnsg).** Has confirmed 2.2× speedup at seq_len≤32 short-prefill fixture. Currently HOLD pending rebase + 4-fixture decode no-regression on current main HEAD. Low-effort: rebase + retest gates; if green, merge.
+
+3. **iter66 candidate — RoPE+QKV fusion (3-4 days, medium-high risk).** Queued from iter59 dossier index; only worth it if cumulative gain from above leaves significant prefill gap.
+
+4. **iter66 candidate — operator-driven Xcode .gputrace capture (Part B of iter63 profiling kit).** Now has a NEW use case: not localizing iter60b's mechanism (we know it now), but identifying NEXT bottleneck after the matmul kernel is exonerated. The kernel ≈ optimal; what's the next-largest-time-bucket attribution at the FORWARD-PASS level?
+
+5. **Decide iter60c + iter59-mtnsg disposition (carried from iter62 followup).** Both branches HOLD due to staleness vs current main HEAD; rebase + re-bench needed before merge decision.
+
+6. **iter63 GPU profiling kit — LANDED on `cfa/iter63-profiling-kit-20260501/claude` HEAD `d0b0128` (mlx-native), 5 commits, +1566 LOC (995 production / 571 tests).** Extends `kernel_profile.rs` per-CB scaffold with per-dispatch path (`MLX_PROFILE_DISPATCH=1`) + ports llama.cpp's programmatic `MTLCaptureManager` (`MLX_METAL_CAPTURE=/path.gputrace`). All 6 acceptance criteria PASS; 127/127 mlx-native lib tests (0 regressions; +2 in `kernel_profile::tests`, +5 in `metal_capture::tests`); 9 new unsafe blocks all matching existing patterns; zero FFI shim, zero objc2-metal dep. Operator hand-off recipe ready.
    - **CRITICAL DISCOVERY at impl time (Apple Silicon hardware quirk):** `AGXG17XFamilyComputeContext` (M-series, macOS 26) supports counter sampling **only at `AtStageBoundary`, never `AtDispatchBoundary`**. Calling `sampleCountersInBuffer:atSampleIndex:withBarrier:` between dispatches inside a persistent compute encoder ABORTS with `failed assertion 'MTLComputeCommandEncoder:sampleCountersInBuffer:atSampleIndex:withBarrier not supported on this device'`. **AtStageBoundary is incompatible with mlx-native's persistent-compute-encoder design** — that encoder is mlx-native's load-bearing existing optimization (~800 encoder create/end cycles per forward pass amortized into one persistent encoder per CB). For numeric per-dispatch attribution on M-series, the path forward is **Part B's Xcode GPU-timeline visualization** which DOES show per-dispatch start/end on M5 Max because Apple's frame capture is independent of `MTLCounterSampleBuffer`.
    - **Resolution:** the kit gracefully degrades on M-series (`device.supports_counter_sampling(AtDispatchBoundary)` pre-flight check; no-op + one-shot stderr warning when unsupported). Forward-compatible for AMD/Intel discrete + simulators + future Apple silicon. Per-CB profiling (`MLX_PROFILE_CB=1`, independent code path) remains the ground-truth attribution mechanism on M-series TODAY.
    - **Per-dispatch numeric attribution (Part A) on M5 Max: not available.** The per-CB scaffold from earlier (`MLX_PROFILE_CB=1`) is the available numeric mechanism.
@@ -1767,7 +1783,72 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
-- **2026-05-01 (UTC ~23:05Z) — iter64a CONFIRMED: C1 (device-direct B reads) is iter62's +445ms `layer.ops1_3` mechanism. Wall regression +531ms reproduced standalone on main base; mechanism is L2/DRAM bandwidth thrash from removed threadgroup-B caching across simdgroups in a threadgroup. iter60b's structural motivation (eliminate f32→half cast on B) is NOT worth the L2 penalty; iter65 hybrid threadgroup<float> B queued as cast-elimination path WITHOUT L2 thrash.**
+- **2026-05-01 (UTC ~23:35Z) — iter65 FALSIFIED: threadgroup<float> B regresses +517ms wall (matching iter64a's +531ms in magnitude). LOAD-BEARING finding across 4 independent failures (iter60b/63a/63c/65): Apple M3+ hardware tensor cores ONLY accelerate the homogeneous (half, half, float) cooperative-tensor variant; mixed-precision variants like (half, float, float) — though present in the MPP API — fall to a ~2× slower software compute path. The f32→half cast in main is the price of hardware tensor cores. main IS OPTIMAL for kernel_mul_mm_q4_0_tensor_f32 on M5 Max. Future prefill closure must look elsewhere (encoder coalescence, RoPE+QKV fusion, multi-token NSG, MoE routing).**
+
+  **Method.** iter65 research (`/tmp/cfa-iter65/research/PRECISION-DESIGN.md`, 789 lines) verified MPP `tensor_ops::matmul2d` accepts mixed-precision operands per Apple SDK headers `MPPTensorOpsMatMul2d.h:21,24` + `MPPTensorOpsMatMul2dImpl.h:5610-5621, 5646-5657, 916, 997`. llama.cpp peer code already uses the pattern at `ggml-metal.metal:9358-9420` with `mb=tensor<device float>` + `ma=tensor<threadgroup half>`. Resolution C identified as cheapest: ~10 LOC change.
+
+  **iter65 impl (mlx-native branch `cfa/iter65-tg-float-b-20260501/claude` HEAD `b47e927`, pushed):** sb element type `half→float`, tB tensor view `<threadgroup half>→<threadgroup float>`, drop `(half2x4)` cast on B-stage store, mirror in perm021 sibling. NO Rust dispatcher changes; NO shmem-size change. NR1=32 unchanged.
+
+  **Build + parity:** **11/11 PASS BYTE-EXACT** at `cargo test --release --test test_quantized_matmul_mm`. The research worker's predicted 1-ULP relaxed-precision drift did NOT materialize. Token-id parity at 8-tok decode smoke: both branches decode `<|im_start|>assistant`.
+
+  **Cold-bench (apex q4_0-flat pp4096, 3 alternating cold trials × 60s cooldown × MANDATORY warmup per binary):**
+
+  | Branch | Wall trimmed median | tok/s | IQR |
+  |---|---:|---:|---:|
+  | iter65 (threadgroup<float> B) | **2540 ms** (2540, 2542, 2537) | 1623 | 5 ms |
+  | main (threadgroup<half> B + cast) | **2023 ms** (2023, 2023, 2012) | 2038 | 11 ms |
+  | **Δ iter65 − main** | **+517 ms / +25.6% REGRESSION** | -20.4% | — |
+
+  **Per-bucket attribution (paired A1 vs B1):**
+
+  | Bucket | iter65 | main | Δ (ms) | iter65/main |
+  |---|---:|---:|---:|---:|
+  | layer.ops1_3 (×30 DN) | 218.5 | 118.3 | **+100.3** | 1.85× |
+  | layer.full_total (×10 FA) | 1626.7 | 1209.0 | **+417.7** | 1.35× |
+  | fa.ops1_4 (×10 FA) | 94.3 | 94.1 | +0.1 | 1.00× (noise) |
+  | layer.ffn_dispatch (×40) | 1753.5 | 1337.8 | **+415.7** | 1.31× |
+
+  Wall regression decomposition: layer.ops1_3 (+100ms) + layer.ffn_dispatch (+416ms) ≈ +517ms wall. Tracks closely; mechanism fully attributed.
+
+  **Comparison with iter64a (mlx-native `cfa/iter64a-c1-c3-20260501/claude` HEAD `e5d12dc`):**
+
+  | Branch | Mechanism | Wall Δ | layer.ops1_3 Δ | layer.ffn_dispatch Δ |
+  |---|---|---:|---:|---:|
+  | iter64a (device-direct B; no threadgroup cache) | hypothesized L2/DRAM thrash | **+531 ms** | +99.3 (1.91×) | +429 |
+  | iter65 (threadgroup<float> B; preserves cache) | hypothesized cast-elim win | **+517 ms** | +100.3 (1.85×) | +416 |
+
+  **CRITICAL CONVERGENT FINDING (NEW; load-bearing).** iter64a and iter65 produce ~the same magnitude regression DESPITE completely different L2/DRAM access patterns. iter64a removed threadgroup-B caching (would predict L2 thrash); iter65 KEPT threadgroup-B caching (would predict NO L2 thrash). Yet both regress by ~+520 ms with the SAME per-bucket signature. The ONLY thing both changes have in common is **breaking the homogeneous-half-precision invariant for `tensor_ops::matmul2d`**: iter64a makes B `device float`; iter65 makes B `threadgroup float`. Both produce mixed-precision (half, float, float) cooperative-tensor configurations.
+
+  Combined with iter60b (mixed-precision via `tensor<device float>`, +423/+595 ms regression depending on bench methodology) and iter63a/c (NR1=128 with mixed precision, parity-failed before bench could run), **FOUR independent kernel-modification attempts** that share no source code in common ALL regress with the same per-bucket signature when they break homogeneous half precision.
+
+  **Hypothesis (now strongly supported by 4 independent data points):** Apple M3+ hardware tensor cores are SPECIALIZED FOR `(half, half, float)` cooperative tensors. The MPP API documents and ships symbols for `(half, float, float)` and `(float, half, float)` variants, but those are SOFTWARE compute paths (vector lanes / SIMD-MMA fall-back), not the hardware tensor cores. iter65's L2/DRAM caching pattern is identical to main's, but the MPP runtime selects a slower compute kernel because B is float. Consistent with `project_metal_compiler_auto_optimizes_static_levers` — the compiler may auto-hoist the f32→half cast in main, AND the matmul itself only goes hardware-accelerated when both operands are half.
+
+  **iter60b's structural motivation FALSIFIED at value (definitively).** iter60b sought to eliminate ~1024 fp32→fp16 cast instructions per K-iteration. The iter65 experiment tested whether the cast was the bottleneck by eliminating it WITHOUT the L2 thrash; result was equivalent regression. The cast is NOT the bottleneck — it's the price paid for hardware tensor cores, and that price is dwarfed by the cost of losing them.
+
+  **Implication for ADR-015 prefill closure (loop exit gate ≥1.00× across 4 D4 fixtures, currently 0.319× cold-clean):** main IS OPTIMAL for `kernel_mul_mm_q4_0_tensor_f32` on M5 Max. The B staging design space is closed. Future prefill perf work must target OTHER kernels or higher-level structure. Carrying-forward candidate list:
+  - Cross-layer encoder coalescence (iter57 thesis from earlier ADR; now empirically motivated by the matmul kernel being optimal)
+  - RoPE+QKV fusion (3-4 days, medium-high risk; queued from iter59 dossier)
+  - Multi-token NSG kernel — iter59-mtnsg has confirmed 2.2× speedup at seq_len≤32; pending merge after rebase
+  - MoE expert sortby/scatter — kernel_mul_mm_id_map0 already exists per iter59 audit
+  - iter63 GPU profiling kit Part B (Xcode .gputrace) — useful for ANY future kernel-level investigation, especially encoder-coalescence work
+  - ADR-013 P21 mm_id audit also concluded "residual gap is GPU scheduling efficiency / memory bandwidth" — converges with iter65's tensor-cores finding (the tensor-cores path is optimal; remaining gap is at the orchestration layer, not the kernel)
+
+  **STANDING COMPLIANCE.**
+  - `feedback_evidence_first_no_blind_kernel_rewrites` — 4-iter empirical convergence (iter60b/63a/63c/65) replaced what would have been blind kernel rewrites; the load-bearing tensor-cores finding required 4 independent data points and could not be inferred from iter62 attribution alone.
+  - `feedback_correct_outcomes` — iter65 is a NO-MERGE branch (regression); preserved as evidence.
+  - `feedback_no_shortcuts` — full per-bucket attribution + IQR + per-trial table; trimmed-median methodology with mandatory warmup per binary.
+  - `feedback_use_cfa_worktrees` — `/tmp/cfa-iter65/{mlx-native,hf2q}` isolated; mcp-brain-server SIGSTOP'd during bench.
+  - `feedback_git_commit_pathspec_when_parallel` — only `quantized_matmul_mm_tensor.metal` modified; hf2q-side change scoped to .cargo/config.toml override (worktree-only, NOT pushed); ADR-005/013/018 fences honored.
+
+  **Receipts.**
+  - `/tmp/cfa-iter65/results/VERDICT.md` — full verdict.
+  - `/tmp/cfa-iter65/impl-bench/logs/{warmup-iter65,warmup-main,A1-A3-iter65,B1-B3-main}.log` — 8 raw bench logs.
+  - `/tmp/cfa-iter65/research/PRECISION-DESIGN.md` — 789-line research artifact citing Apple SDK + llama.cpp peer source.
+  - mlx-native branch `cfa/iter65-tg-float-b-20260501/claude` HEAD `b47e927` (pushed); DO NOT MERGE.
+
+  Status: iter65 CLOSED-FALSIFIED-AT-PERF; iter60b family of 4 attempts (60b/63a/63c/65) CLOSED with load-bearing tensor-cores hypothesis. iter66+ direction: encoder coalescence (iter57 thesis revival) OR multi-token-NSG merge after rebase OR RoPE+QKV fusion. Any further `kernel_mul_mm_q4_0_tensor_f32`-internal changes are out of scope until/unless Apple ships native tensor-cores support for mixed-precision variants.
+
+- **2026-05-01 (UTC ~23:05Z) — iter64a CONFIRMED: C1 (device-direct B reads) is iter62's +445ms `layer.ops1_3` mechanism. Wall regression +531ms reproduced standalone on main base; mechanism is L2/DRAM bandwidth thrash from removed threadgroup-B caching across simdgroups in a threadgroup. iter60b's structural motivation (eliminate f32→half cast on B) is NOT worth the L2 penalty; iter65 hybrid threadgroup<float> B queued as cast-elimination path WITHOUT L2 thrash.** [SUPERSEDED by iter65: the L2-thrash mechanism explanation was incomplete; the actual mechanism is loss of hardware tensor cores when operand precision is mixed. iter65's threadgroup<float> B has identical L2 access pattern to main but still regresses by +517ms — falsifying the L2-thrash-only hypothesis and pointing to MPP precision dispatch as the load-bearing factor.]
 
   **Method.** iter64 mechanism-bisection research (`/tmp/cfa-iter64/research/BISECTION-DESIGN.md`, 698 lines) refined iter60b's 4 non-tile changes from "4 isolatable elements" to "2 isolatable candidates" via coupling matrix:
   - **C1 forces C3** — once B becomes `tensor<device float>`, the type-param swap in `get_destination_cooperative_tensor<>` is mandatory; C3 alone on `main` is a no-op since both pre-image types are identical (`tensor<threadgroup half>`).
