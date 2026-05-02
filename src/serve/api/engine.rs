@@ -5875,12 +5875,13 @@ fn generate_stream_once(
     // `store(...)` which sets fragments=None — see Worker AA design
     // §3b option (a)).
     //
-    // Drop the `&sink` borrow before `store_with_fragments`, which
-    // mutates `loaded.prompt_cache` (siblings of `events` field-wise);
-    // `sink` borrows `events` (the channel sender) only, so dropping
-    // it does not affect `loaded`.  The captured vec is moved into the
-    // cache via `RefCell::into_inner`.
-    drop(events);
+    // Drop the `sink` (and the `events` alias which borrows `sink`)
+    // before `store_with_fragments`, which mutates
+    // `loaded.prompt_cache` (siblings of the channel borrow); `sink`
+    // borrows the channel sender only, so dropping it does not affect
+    // `loaded`.  The captured vec is moved into the cache via
+    // `RefCell::into_inner`.
+    let _ = events; // release the `&sink` alias (was a reference; clippy: `drop` of reference)
     drop(sink);
     let fragments = captured_fragments.into_inner();
     loaded.prompt_cache.store_with_fragments(
