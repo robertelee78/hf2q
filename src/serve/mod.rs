@@ -660,14 +660,24 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     .context("print header prefill")?;
 
     // Decode
+    //
+    // 2026-05-02: mirror cmd_generate_qwen35 cumulative-decode pattern so
+    // multi-byte UTF-8 codepoints (emoji, CJK) don't get split at token
+    // boundaries → garble like `���`. Also reuse the n-gram repetition
+    // guard so Gemma's greedy decode can't run to --max-tokens on a stuck
+    // loop. Special-token-string check skipped here — Gemma's marker set
+    // (`<end_of_turn>`, `<start_of_turn>`, `<eos>`, `<bos>`) differs from
+    // Qwen's; integer-id stop via eos_token_ids.contains() catches `<end_of_turn>`
+    // (token id 106) which is the dominant turn-end marker.
     let mut all_tokens = prompt_tokens.to_vec();
     let mut next_token = last_token;
     all_tokens.push(next_token);
-    {
-        let token_str = tokenizer.decode(&[next_token], false).unwrap_or_default();
-        print!("{}", token_str);
-        std::io::stdout().flush()?;
-    }
+    let mut decoded_tokens: Vec<u32> = vec![next_token];
+    let mut printed_text = tokenizer
+        .decode(&decoded_tokens, false)
+        .unwrap_or_default();
+    print!("{}", printed_text);
+    std::io::stdout().flush()?;
 
     let decode_start = std::time::Instant::now();
     let mut generated = 1usize;
@@ -680,31 +690,54 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         }
         let pos = all_tokens.len() - 1;
 
-        if kernel_profile_mode {
+        let kernel_profile_break = if kernel_profile_mode {
             let (tok, kp) = mlx_w.forward_decode_kernel_profile(next_token, pos, &mut ctx)?;
             next_token = tok;
             if generated > kernel_profile_warmup {
                 kernel_profiles.push(kp);
             }
-            if kernel_profiles.len() >= kernel_profile_measure {
-                all_tokens.push(next_token);
-                generated += 1;
-                let token_str = tokenizer.decode(&[next_token], false).unwrap_or_default();
-                print!("{}", token_str);
-                std::io::stdout().flush()?;
-                break;
-            }
+            kernel_profiles.len() >= kernel_profile_measure
         } else {
             let mut p = profiler.start_token();
             next_token = mlx_w.forward_decode(next_token, pos, &mut ctx, &mut p)?;
             profiler.finish_token(p);
-        }
+            false
+        };
         all_tokens.push(next_token);
         generated += 1;
-        {
-            let token_str = tokenizer.decode(&[next_token], false).unwrap_or_default();
-            print!("{}", token_str);
+        decoded_tokens.push(next_token);
+
+        // Cumulative decode + delta print (llama.cpp tok_str_pos pattern).
+        let new_full = tokenizer
+            .decode(&decoded_tokens, false)
+            .unwrap_or_default();
+        if new_full.len() > printed_text.len() && new_full.starts_with(&printed_text) {
+            print!("{}", &new_full[printed_text.len()..]);
             std::io::stdout().flush()?;
+        }
+        printed_text = new_full;
+
+        if kernel_profile_break {
+            break;
+        }
+
+        // N-gram repetition guard — same shared detector as the qwen35 path.
+        if let Some((ngram, repeats)) = detect_greedy_repetition_loop(&decoded_tokens) {
+            tracing::info!(
+                "Gemma decode: greedy n-gram repetition detected (last {} tokens \
+                 repeated {} times); stopping. Sampling \
+                 (temperature/top_k/top_p/repetition_penalty) is wired in \
+                 forward_decode but the CLI does not pass them through; \
+                 use the chat-completion API for non-deterministic decoding.",
+                ngram, repeats
+            );
+            eprintln!(
+                "\n[hf2q] Gemma greedy decode entered a {}-token repetition loop \
+                 — stopping. Use the chat-completion API for non-deterministic \
+                 decoding.",
+                ngram
+            );
+            break;
         }
     }
     let decode_elapsed = decode_start.elapsed();
