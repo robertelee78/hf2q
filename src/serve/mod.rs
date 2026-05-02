@@ -1290,6 +1290,212 @@ fn find_special_token_stop(generated_text: &str) -> Option<&'static str> {
         .find(|m| generated_text.contains(m))
 }
 
+// ============================================================================
+// Decode-loop testable helper (H3 Layer A unlock, item (c) of dossier plan)
+// ============================================================================
+//
+// 2026-05-02 — extracts the qwen3.5 greedy-decode loop body from
+// `cmd_generate_qwen35` into a pure helper that injects the model call as a
+// closure. Lets unit tests feed synthetic token streams through the entire
+// loop (including stop-condition + cumulative-decode + repetition-guard
+// composition) without needing a Metal GPU. Closes the H3 finding from
+// `docs/research/decode-test-gap-2026-05-02.md`: today's 12+4 helper tests
+// pin individual pure functions in isolation but not the loop body that
+// composes them.
+
+/// Reason the decode loop stopped emitting tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DecodeStopReason {
+    /// `next_token` matched one of `eos_token_ids` (integer-id stop).
+    /// The matched id is included for diagnostics.
+    EosTokenId(u32),
+    /// Cumulative decode contained a [`SPECIAL_TOKEN_STOPS`] substring
+    /// (text-fragment stop — covers tokenizers that emit special tokens
+    /// as multi-token text instead of as the reserved id).
+    SpecialTokenLeak(&'static str),
+    /// `detect_greedy_repetition_loop` fired — greedy decode entered a
+    /// stuck cycle.
+    RepetitionLoop { ngram: usize, repeats: usize },
+    /// KV cache would overrun on the next step.
+    MaxSeq,
+    /// `max_tokens` step budget exhausted without any of the above firing.
+    MaxTokensReached,
+}
+
+/// Outcome of [`run_decode_loop`].
+#[derive(Debug)]
+pub(crate) struct DecodeLoopOutcome {
+    /// Total number of tokens generated (including the seed token from
+    /// prefill argmax).
+    pub generated: usize,
+    /// Why the loop stopped.
+    pub stop_reason: DecodeStopReason,
+}
+
+/// One per-step event emitted to the `on_event` callback.
+///
+/// `step`, `token`, `cumulative_text` are exposed for unit-test
+/// observation — production callers (cmd_generate_qwen35) only consume
+/// `delta` for the streaming print, but tests assert on all four fields
+/// to verify the loop state matches expectations.
+#[allow(dead_code)]
+pub(crate) struct DecodeStepEvent<'a> {
+    /// Step index (0 is the seed token from prefill argmax; subsequent
+    /// steps are 1..max_tokens, matching the production loop bounds).
+    pub step: usize,
+    /// The token just sampled by the model (or the seed token at step 0).
+    pub token: u32,
+    /// Cumulative-decoded text (covers all tokens generated so far,
+    /// including the seed token).
+    pub cumulative_text: &'a str,
+    /// New byte-delta to emit since the previous step (the part of
+    /// `cumulative_text` that wasn't in the previous step's emit).
+    /// Empty if the new tokens didn't extend the cumulative text
+    /// (e.g. a tokenizer rewrite changed an earlier prefix; we
+    /// silently skip such cases for streaming correctness).
+    pub delta: &'a str,
+}
+
+/// Run the qwen3.5 greedy-decode loop with injected forward + decode
+/// closures.
+///
+/// The helper owns the per-step bookkeeping (cumulative-decode tracking,
+/// stop checks, repetition guard, position arithmetic) and calls the
+/// caller's `step_model` closure for each forward pass. This lets unit
+/// tests feed a synthetic `step_model` that returns a pre-arranged token
+/// stream, completely bypassing the GPU.
+///
+/// # Parameters
+///
+/// * `initial_token` — the token sampled from prefill argmax (becomes
+///   step 0 of the cumulative decode).
+/// * `prompt_len` — number of tokens in the (already-prefilled) prompt;
+///   used to compute absolute positions.
+/// * `max_seq` — KV-cache capacity. The loop stops with
+///   [`DecodeStopReason::MaxSeq`] when the next position would equal or
+///   exceed this value.
+/// * `max_tokens` — step budget. `step=1..max_tokens` means at most
+///   `max_tokens - 1` forward calls (matches the production loop bounds).
+/// * `eos_token_ids` — integer EOS ids; matched against `next_token` at
+///   the TOP of each iteration (mirrors production loop semantics).
+/// * `step_model(prev_token, pos) -> Result<u32>` — produces the next
+///   token. In production, this calls `model.forward_gpu_greedy(...)`.
+///   In tests, it can return canned tokens.
+/// * `decode_text(&[u32]) -> String` — decodes the cumulative token
+///   list. In production, this is `tokenizer.decode(_, false)`.
+/// * `on_event(DecodeStepEvent)` — invoked once per step AFTER the
+///   forward call completes, with the cumulative text + delta.
+///   Production binding prints the delta to stdout.
+///
+/// # Returns
+///
+/// [`DecodeLoopOutcome`] with the total tokens generated + stop reason.
+///
+/// # Errors
+///
+/// Propagates the first error from `step_model`. Does NOT propagate
+/// errors from `decode_text` — a tokenizer decode failure is treated
+/// as an empty string for that step (matches production behavior:
+/// `unwrap_or_default()` at the call site).
+pub(crate) fn run_decode_loop<F, P, E>(
+    initial_token: u32,
+    prompt_len: usize,
+    max_seq: usize,
+    max_tokens: usize,
+    eos_token_ids: &[u32],
+    mut step_model: F,
+    mut decode_text: P,
+    mut on_event: E,
+) -> Result<DecodeLoopOutcome>
+where
+    F: FnMut(u32, i32) -> Result<u32>,
+    P: FnMut(&[u32]) -> String,
+    E: FnMut(DecodeStepEvent<'_>),
+{
+    let mut decoded_tokens: Vec<u32> = vec![initial_token];
+    let mut printed_text: String = decode_text(&decoded_tokens);
+    let mut next_token = initial_token;
+    let mut generated = 1usize;
+
+    // Emit step 0 event (the seed token from prefill).
+    on_event(DecodeStepEvent {
+        step: 0,
+        token: initial_token,
+        cumulative_text: &printed_text,
+        delta: &printed_text,
+    });
+
+    for step in 1..max_tokens {
+        // Top-of-iteration integer-EOS check (mirrors production: line
+        // 1646). Note: this catches the seed token if it's already EOS,
+        // which preserves the production loop's `for step in 1..` shape.
+        if eos_token_ids.contains(&next_token) {
+            return Ok(DecodeLoopOutcome {
+                generated,
+                stop_reason: DecodeStopReason::EosTokenId(next_token),
+            });
+        }
+
+        // Position arithmetic: step=1 maps to pos=prompt_len (the next
+        // slot after prefill); step=N maps to pos=prompt_len + (N - 1).
+        let pos = (prompt_len + step - 1) as i32;
+        if (pos as usize) >= max_seq {
+            return Ok(DecodeLoopOutcome {
+                generated,
+                stop_reason: DecodeStopReason::MaxSeq,
+            });
+        }
+
+        // Forward pass.
+        next_token = step_model(next_token, pos)?;
+        generated += 1;
+        decoded_tokens.push(next_token);
+
+        // Cumulative decode + delta computation.
+        let new_full = decode_text(&decoded_tokens);
+        let delta = if new_full.len() > printed_text.len()
+            && new_full.starts_with(&printed_text)
+        {
+            &new_full[printed_text.len()..]
+        } else {
+            // Tokenizer rewrote an earlier prefix (rare; happens with some
+            // BPE merges) — emit nothing this step. Production code path
+            // does the same (the `if` guard at line 1693).
+            ""
+        };
+
+        on_event(DecodeStepEvent {
+            step,
+            token: next_token,
+            cumulative_text: &new_full,
+            delta,
+        });
+
+        // Special-token-string leak check.
+        if let Some(marker) = find_special_token_stop(&new_full) {
+            return Ok(DecodeLoopOutcome {
+                generated,
+                stop_reason: DecodeStopReason::SpecialTokenLeak(marker),
+            });
+        }
+
+        // N-gram repetition guard.
+        if let Some((ngram, repeats)) = detect_greedy_repetition_loop(&decoded_tokens) {
+            return Ok(DecodeLoopOutcome {
+                generated,
+                stop_reason: DecodeStopReason::RepetitionLoop { ngram, repeats },
+            });
+        }
+
+        printed_text = new_full;
+    }
+
+    Ok(DecodeLoopOutcome {
+        generated,
+        stop_reason: DecodeStopReason::MaxTokensReached,
+    })
+}
+
 fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile) -> Result<()> {
     use crate::inference::models::qwen35::io_heads::greedy_argmax_last_token;
     use crate::inference::models::qwen35::kv_cache::HybridKvCache;
@@ -1615,7 +1821,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
 
     // Sample the first token from prefill logits (last token's row).
     let last_prefill_logits = &prefill_logits;
-    let mut next_token = greedy_argmax_last_token(last_prefill_logits, vocab_size);
+    let next_token = greedy_argmax_last_token(last_prefill_logits, vocab_size);
     tracing::info!("Qwen3.5 first decoded token: {}", next_token);
 
     // 2026-05-02: cumulative-decode + delta-print pattern (mirrors llama.cpp's
@@ -1627,125 +1833,83 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     // Also catches special-token-string leaks (`<|im_end|>` etc. emitted as
     // text rather than as the eos_token_ids vocab id) — see is_special_token
     // check below.
-    let mut decoded_tokens: Vec<u32> = vec![next_token];
-    let mut printed_text = tokenizer
-        .decode(&decoded_tokens, false)
-        .unwrap_or_default();
-    print!("{}", printed_text);
-    stdout.flush()?;
+    // Initial seed-token print is now handled inside the loop helper's
+    // step=0 event (the helper takes care of the entire cumulative-decode
+    // bookkeeping). We just bind the closures and fire it.
 
     // ---- Decode loop ----
     let decode_start = std::time::Instant::now();
-    let mut generated = 1usize;
+    let step_profile_enabled = std::env::var("HF2Q_STEP_PROFILE").is_ok();
 
-    // Special-token-substring stop policy moved to module-scope
-    // `SPECIAL_TOKEN_STOPS` + `find_special_token_stop` so it's unit-testable.
-    // See those for the full policy rationale.
+    let outcome = run_decode_loop(
+        next_token,
+        prompt_len,
+        max_seq,
+        args.max_tokens,
+        &eos_token_ids,
+        |prev_token, pos| -> Result<u32> {
+            // Build single-token positions buffer: flat [4 * 1] all set to `pos`.
+            let decode_positions = vec![pos; 4];
+            let _t_step = step_profile_enabled.then(std::time::Instant::now);
+            // forward_gpu_greedy: GPU argmax → 4-byte download (vs 600KB full logits).
+            // Eliminates ~5ms/token vocabulary download for greedy decode.
+            let next = model
+                .forward_gpu_greedy(&[prev_token], &decode_positions, &mut kv_cache)
+                .with_context(|| format!("forward_gpu_greedy decode at pos {pos}"))?;
+            if let Some(t) = _t_step {
+                eprintln!(
+                    "[STEP_PROFILE] pos={pos} total={:.2}ms",
+                    t.elapsed().as_micros() as f64 / 1000.0
+                );
+            }
+            Ok(next)
+        },
+        |toks| tokenizer.decode(toks, false).unwrap_or_default(),
+        |event| {
+            if !event.delta.is_empty() {
+                print!("{}", event.delta);
+                let _ = stdout.flush();
+            }
+        },
+    )?;
 
-    for step in 1..args.max_tokens {
-        if eos_token_ids.contains(&next_token) {
-            break;
-        }
-
-        // Absolute position of the decode token: prompt_len + (step - 1) since
-        // step=1 is the second decode token, positioned at prompt_len.
-        // (step=0 was the first decode token sampled from prefill; it already
-        // "consumed" position prompt_len implicitly because we ran prefill at
-        // positions 0..prompt_len-1, so the next position is prompt_len.)
-        let pos = (prompt_len + step - 1) as i32;
-
-        // Check we haven't overrun the KV cache.
-        if pos as usize >= max_seq {
+    // Loop-side stop reasons get a one-line tracing emit + (for repetition)
+    // a stderr diagnostic, matching the production behavior the loop
+    // previously emitted inline. EosTokenId / MaxTokensReached are the
+    // expected exits; MaxSeq is informational; the rest are loud.
+    match &outcome.stop_reason {
+        DecodeStopReason::EosTokenId(_) | DecodeStopReason::MaxTokensReached => {}
+        DecodeStopReason::MaxSeq => {
             tracing::warn!(
-                "Qwen3.5 decode: reached max_seq {} at step {}; stopping",
-                max_seq,
-                step
-            );
-            break;
-        }
-
-        // Build single-token positions buffer: flat [4 * 1] all set to `pos`.
-        let decode_positions = vec![pos; 4];
-
-        // forward_gpu_greedy: GPU argmax → 4-byte download (vs 600KB full logits).
-        // Eliminates ~5ms/token vocabulary download for greedy decode.
-        let _t_step = if std::env::var("HF2Q_STEP_PROFILE").is_ok() {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        next_token = model
-            .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache)
-            .with_context(|| format!("forward_gpu_greedy decode step {step}"))?;
-        if let Some(t) = _t_step {
-            eprintln!(
-                "[STEP_PROFILE] step={step} total={:.2}ms",
-                t.elapsed().as_micros() as f64 / 1000.0
+                "Qwen3.5 decode: reached max_seq {} after {} tokens; stopping",
+                max_seq, outcome.generated
             );
         }
-        generated += 1;
-        decoded_tokens.push(next_token);
-
-        // Cumulative decode + delta print. UTF-8 garble = solved.
-        let new_full = tokenizer
-            .decode(&decoded_tokens, false)
-            .unwrap_or_default();
-        if new_full.len() > printed_text.len() && new_full.starts_with(&printed_text) {
-            print!("{}", &new_full[printed_text.len()..]);
-            stdout.flush()?;
-        }
-        // Special-token-string leak: stop loud rather than emit garbage like
-        // `<|im_end|>...<|im_start|>assistant\n<|im_start|>assistant` (original
-        // 2026-05-02 French-Toast leak) or `<|end|>\n\n<|im_start|>user\n
-        // [echoed prompt]<|im_start|>...<|im_start|>` (2026-05-02 follow-up
-        // candy-thinking degeneracy). Helper is unit-tested so the substring
-        // set can't drift silently.
-        if let Some(marker) = find_special_token_stop(&new_full) {
+        DecodeStopReason::SpecialTokenLeak(marker) => {
             tracing::info!(
                 "Qwen3.5 decode: special-token string `{marker}` detected in \
-                 cumulative decode at step {step}; stopping."
+                 cumulative decode after {} tokens; stopping.",
+                outcome.generated
             );
-            break;
         }
-        // 2026-05-02: greedy-decode repetition-stop guard. Pure greedy on
-        // thinking-style Qwen3.x checkpoints can enter a deterministic loop
-        // (user's French-Toast run produced "I should make sure the response
-        // is accurate and up-to-date." × ~30). Without sampling (temp/top_k/
-        // top_p/repetition_penalty — TODO follow-up), running to --max-tokens
-        // produces 1000+ tokens of garbage. Detect: if the last 32 tokens
-        // contain a 16-token n-gram that repeats ≥3 times consecutively,
-        // we're stuck — break with a diagnostic. ~24 LOC vs the proper
-        // sampling fix (~80-100 LOC plumb through forward_gpu_last_logits +
-        // CPU sampling). Both should land; this is the minimum to keep the
-        // CLI honest. NOT a fallback — this is correct behavior on a stuck
-        // greedy loop (mantra: "no fallback" means don't substitute a lesser
-        // option for the right answer; here, breaking on detected repetition
-        // IS the right answer for greedy-mode stuck loops).
-        // Try multiple n-gram window sizes so we match cycles of various
-        // lengths. The user's French-Toast repetition was a 17-token cycle
-        // ("I should make sure the response is accurate and up-to-date.")
-        // which a single fixed 16-token window misses. Iterate the typical
-        // greedy-loop cycle range.
-        let detected_repeat = detect_greedy_repetition_loop(&decoded_tokens);
-        if let Some((ngram, repeats)) = detected_repeat {
+        DecodeStopReason::RepetitionLoop { ngram, repeats } => {
             tracing::info!(
-                "Qwen3.5 decode: greedy n-gram repetition detected at step \
-                 {step} (last {} tokens repeated {} times); stopping. \
+                "Qwen3.5 decode: greedy n-gram repetition detected after {} \
+                 tokens (last {} tokens repeated {} times); stopping. \
                  Sampling (temperature/top_k/top_p/repetition_penalty) is \
                  not yet wired in this CLI path — TODO follow-up.",
-                ngram, repeats
+                outcome.generated, ngram, repeats
             );
             eprintln!(
                 "\n[hf2q] greedy decode entered a {}-token repetition loop \
-                 at step {} — stopping. Use the chat-completion API \
+                 after {} tokens — stopping. Use the chat-completion API \
                  (which has sampling wired) for non-deterministic decoding.",
-                ngram, step
+                ngram, outcome.generated
             );
-            break;
         }
-        printed_text = new_full;
     }
 
+    let generated = outcome.generated;
     let decode_elapsed = decode_start.elapsed();
     let tok_per_sec = generated as f64 / decode_elapsed.as_secs_f64();
 
@@ -3500,8 +3664,9 @@ fn cmd_parity_capture(
 mod tests {
     use super::{
         detect_greedy_repetition_loop, find_special_token_stop, maybe_print_serve_banner,
-        render_jinja_template, resolve_enable_thinking, should_enable_kv_persist,
-        FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
+        render_jinja_template, resolve_enable_thinking, run_decode_loop,
+        should_enable_kv_persist, DecodeStopReason, FALLBACK_GEMMA4_API_CHAT_TEMPLATE,
+        FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
     use crate::backends::chat_templates::QWEN3_CHATML;
     use crate::cli;
@@ -4304,5 +4469,302 @@ mod tests {
                  enable_thinking={et:?}"
             );
         }
+    }
+
+    // ---- run_decode_loop matrix tests --------------------------------
+    //
+    // 2026-05-02 — H3 Layer A unlock per item (c) of the dossier plan
+    // (docs/research/decode-test-gap-2026-05-02.md). The decode-loop
+    // body was previously inline in cmd_generate_qwen35; today's 12+
+    // helper tests pinned individual pure functions in isolation but
+    // not the loop body that composes them. These tests feed synthetic
+    // token streams through `run_decode_loop` and assert on the
+    // `DecodeLoopOutcome` + emitted-event sequence — the entire loop
+    // is now testable without a Metal GPU.
+
+    /// Build a closure factory that returns canned tokens in order.
+    /// `tokens[0]` is returned on the first step_model call, `tokens[1]`
+    /// on the second, etc. Panics if the loop calls past the supplied
+    /// stream — that's a test-author bug.
+    fn canned_step_model(tokens: Vec<u32>) -> impl FnMut(u32, i32) -> super::Result<u32> {
+        let mut iter = tokens.into_iter();
+        move |_prev, _pos| {
+            let t = iter.next().expect("test bug: canned stream exhausted");
+            Ok(t)
+        }
+    }
+
+    /// Decode tokens to text by trivial mapping: each id maps to the
+    /// digit/letter that visually identifies it. Avoids needing a real
+    /// tokenizer in unit tests.
+    fn ascii_decode(toks: &[u32]) -> String {
+        toks.iter().map(|&t| char::from(t as u8)).collect()
+    }
+
+    #[test]
+    fn run_decode_loop_max_tokens_reached() {
+        // No EOS, no leak, no repetition — loop runs to budget.
+        let outcome = run_decode_loop(
+            b'A' as u32,
+            10,
+            1024,
+            5,
+            &[999],
+            canned_step_model(vec![b'B' as u32, b'C' as u32, b'D' as u32, b'E' as u32]),
+            ascii_decode,
+            |_event| {},
+        )
+        .expect("step_model never errors here");
+        assert_eq!(outcome.stop_reason, DecodeStopReason::MaxTokensReached);
+        // 1 (seed) + 4 (step 1..5) = 5 generated.
+        assert_eq!(outcome.generated, 5);
+    }
+
+    #[test]
+    fn run_decode_loop_stops_on_integer_eos() {
+        // Stream produces a token id that's in eos_token_ids.
+        let outcome = run_decode_loop(
+            b'A' as u32,
+            10,
+            1024,
+            10,
+            &[42],
+            canned_step_model(vec![b'B' as u32, 42, b'D' as u32]),
+            ascii_decode,
+            |_event| {},
+        )
+        .expect("ok");
+        assert_eq!(outcome.stop_reason, DecodeStopReason::EosTokenId(42));
+        // Seed (A) + step 1 (B) + step 2 (42, EOS-detected at TOP of step 3) = 3.
+        assert_eq!(outcome.generated, 3);
+    }
+
+    #[test]
+    fn run_decode_loop_stops_on_special_token_leak() {
+        // Stream produces a sequence whose decoded text contains
+        // `<|im_end|>` (one of SPECIAL_TOKEN_STOPS). Use a custom
+        // decode_text that injects the leak after step 2.
+        let mut step = 0;
+        let outcome = run_decode_loop(
+            b'A' as u32,
+            10,
+            1024,
+            10,
+            &[999],
+            canned_step_model(vec![b'B' as u32, b'C' as u32, b'D' as u32]),
+            move |toks| {
+                step += 1;
+                let mut s: String = toks.iter().map(|&t| char::from(t as u8)).collect();
+                if step >= 3 {
+                    s.push_str("<|im_end|>");
+                }
+                s
+            },
+            |_event| {},
+        )
+        .expect("ok");
+        assert_eq!(
+            outcome.stop_reason,
+            DecodeStopReason::SpecialTokenLeak("<|im_end|>"),
+        );
+    }
+
+    #[test]
+    fn run_decode_loop_stops_on_repetition() {
+        // Build a stream that's identical 8-token cycles repeated.
+        let cycle: Vec<u32> = (b'A'..=b'H').map(|c| c as u32).collect();
+        let mut stream: Vec<u32> = Vec::new();
+        for _ in 0..40 {
+            stream.extend(cycle.iter().copied());
+        }
+        let outcome = run_decode_loop(
+            b'Z' as u32,
+            10,
+            1024,
+            500,
+            &[999],
+            canned_step_model(stream),
+            ascii_decode,
+            |_event| {},
+        )
+        .expect("ok");
+        match outcome.stop_reason {
+            DecodeStopReason::RepetitionLoop { ngram, repeats } => {
+                assert!(ngram >= 8, "expected ngram >= 8, got {ngram}");
+                assert!(repeats >= 4, "expected repeats >= 4, got {repeats}");
+            }
+            other => panic!("expected RepetitionLoop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_decode_loop_stops_on_max_seq_overrun() {
+        // prompt_len + step - 1 == max_seq triggers MaxSeq stop. With
+        // prompt_len=8, max_seq=10, step=1 puts pos=8, step=2 puts
+        // pos=9, step=3 puts pos=10 → overrun.
+        let outcome = run_decode_loop(
+            b'A' as u32,
+            8,
+            10,
+            10,
+            &[999],
+            canned_step_model(vec![b'B' as u32, b'C' as u32, b'D' as u32]),
+            ascii_decode,
+            |_event| {},
+        )
+        .expect("ok");
+        assert_eq!(outcome.stop_reason, DecodeStopReason::MaxSeq);
+        // Seed (A) + step 1 (B) + step 2 (C) = 3; step 3 hits the
+        // pos-check at top and returns MaxSeq before another forward call.
+        assert_eq!(outcome.generated, 3);
+    }
+
+    #[test]
+    fn run_decode_loop_emits_step_zero_seed_event() {
+        // Pin: the seed token from prefill argmax MUST be emitted as
+        // step=0 with delta == cumulative_text. This is what makes the
+        // FIRST printed bytes appear in the production CLI without
+        // requiring a special-case before the loop.
+        let mut events: Vec<(usize, u32, String, String)> = Vec::new();
+        let _ = run_decode_loop(
+            b'A' as u32,
+            10,
+            1024,
+            2,
+            &[999],
+            canned_step_model(vec![b'B' as u32]),
+            ascii_decode,
+            |event| {
+                events.push((
+                    event.step,
+                    event.token,
+                    event.cumulative_text.to_string(),
+                    event.delta.to_string(),
+                ));
+            },
+        )
+        .expect("ok");
+        assert_eq!(events.len(), 2, "expected 2 events (step 0 + step 1)");
+        assert_eq!(events[0].0, 0);
+        assert_eq!(events[0].1, b'A' as u32);
+        assert_eq!(events[0].2, "A");
+        assert_eq!(events[0].3, "A", "step 0 delta MUST equal cumulative");
+    }
+
+    #[test]
+    fn run_decode_loop_delta_is_cumulative_minus_previous() {
+        // Pin: per-step delta == cumulative_text - previous cumulative.
+        // For UTF-8 streaming correctness this is THE invariant.
+        let mut deltas: Vec<String> = Vec::new();
+        let _ = run_decode_loop(
+            b'X' as u32,
+            10,
+            1024,
+            4,
+            &[999],
+            canned_step_model(vec![b'Y' as u32, b'Z' as u32, b'!' as u32]),
+            ascii_decode,
+            |event| deltas.push(event.delta.to_string()),
+        )
+        .expect("ok");
+        // step 0 emits "X" (full seed); step 1 emits "Y"; step 2 "Z"; step 3 "!".
+        assert_eq!(deltas, vec!["X", "Y", "Z", "!"]);
+    }
+
+    #[test]
+    fn run_decode_loop_propagates_step_model_error() {
+        // A failing forward pass MUST surface the error through `Result`.
+        let outcome = run_decode_loop(
+            b'A' as u32,
+            10,
+            1024,
+            5,
+            &[999],
+            |_prev, pos| -> super::Result<u32> {
+                Err(anyhow::anyhow!("synthetic forward failure at pos {pos}"))
+            },
+            ascii_decode,
+            |_event| {},
+        );
+        assert!(outcome.is_err());
+        let msg = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            msg.contains("synthetic forward failure"),
+            "expected error to propagate, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_decode_loop_zero_max_tokens_emits_seed_only() {
+        // max_tokens=1 means the for-loop range is 1..1 (empty); only the
+        // seed event fires, and we exit with MaxTokensReached + 1 generated.
+        let mut events_count = 0usize;
+        let outcome = run_decode_loop(
+            b'A' as u32,
+            10,
+            1024,
+            1,
+            &[999],
+            canned_step_model(vec![]), // empty — never called
+            ascii_decode,
+            |_event| events_count += 1,
+        )
+        .expect("ok");
+        assert_eq!(events_count, 1, "only the seed event must fire");
+        assert_eq!(outcome.generated, 1);
+        assert_eq!(outcome.stop_reason, DecodeStopReason::MaxTokensReached);
+    }
+
+    #[test]
+    fn run_decode_loop_initial_token_is_eos_stops_at_top_of_step_one() {
+        // Edge case: prefill argmax returns an EOS-class token. The loop
+        // emits the seed event at step 0, then enters step 1, sees
+        // next_token in eos_token_ids, and stops. This matches production
+        // semantics (`for step in 1..` with the eos check at the top).
+        let mut events_count = 0usize;
+        let outcome = run_decode_loop(
+            42,
+            10,
+            1024,
+            5,
+            &[42],
+            canned_step_model(vec![]),
+            ascii_decode,
+            |_event| events_count += 1,
+        )
+        .expect("ok");
+        assert_eq!(events_count, 1);
+        assert_eq!(outcome.generated, 1);
+        assert_eq!(outcome.stop_reason, DecodeStopReason::EosTokenId(42));
+    }
+
+    #[test]
+    fn run_decode_loop_phi3_end_marker_caught_via_special_token_leak() {
+        // 2026-05-02 user-reported regression class: the model emits
+        // `<|end|>` as a multi-token text fragment after thinking content.
+        // run_decode_loop must catch this via SpecialTokenLeak ("<|end|>").
+        let mut step = 0;
+        let outcome = run_decode_loop(
+            b'A' as u32,
+            10,
+            1024,
+            10,
+            &[999],
+            canned_step_model(vec![b'B' as u32, b'C' as u32, b'D' as u32]),
+            move |toks| {
+                step += 1;
+                let mut s: String = toks.iter().map(|&t| char::from(t as u8)).collect();
+                if step >= 4 {
+                    s.push_str("<|end|>");
+                }
+                s
+            },
+            |_event| {},
+        )
+        .expect("ok");
+        assert_eq!(
+            outcome.stop_reason,
+            DecodeStopReason::SpecialTokenLeak("<|end|>")
+        );
     }
 }
