@@ -7,7 +7,7 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
-## ▶ Resume Here — current state of truth (2026-05-01 ~23:35Z, iter65 FALSIFIED: load-bearing finding — Apple M3+ hardware tensor cores ONLY accelerate the homogeneous (half, half, float) variant; ANY operand-precision-mixing falls to ~2× slower software compute path. main IS optimal for this kernel.)
+## ▶ Resume Here — current state of truth (2026-05-02 ~00:25Z, hf2q-side EXHAUSTED at two layers: matmul kernel optimal (4-iter convergence) + encoder coalescence DN path ≤0.30pp ceiling (iter66b audit); 93.2% of remaining prefill GPU time is in OTHER mlx-native kernels — gdn.ops5-9 (54.9%) + moe_ffn (38.3%); iter67+ direction shifts to those kernels)
 
 **Decode side: SHIPPED + RE-VALIDATED. iter56/57/58b confirmed byte-transparent perf-only changes (iter61c FULL VERDICT: ALL PASS).**
 
@@ -100,23 +100,33 @@ iter62 receipts: `/tmp/cfa-iter62/results/{A-VERDICT,B-60c-VERDICT,B-mtnsg-VERDI
 - **Production blast radius (load-bearing):** hf2q's chunk-prefill uses M=64 EXACTLY (`CHUNK_THRESHOLD` in `src/inference/models/qwen35/gpu_delta_net.rs:105`); the 3 `test_*_mm_matches_mv_prefill_shape` failures at M=64 are the production chunk shape exactly. Shipping iter63a or iter63c would silently corrupt every prefill chunk. **DO NOT MERGE either branch.** llama.cpp's NRB=128 geometry works for them only because their typical M (full-prompt prefill) is ≫ 128.
 - **Implication for iter62's matmul-size-scaled `layer.ops1_3` regression mechanism:** the regression must come from one of iter60b's OTHER changes (transpose_result toggle, type-param swap in `get_destination_cooperative_tensor<>`, partial-tile writeback removal, OR device-direct B reads), NOT from the unchanged tile shape. The actual mechanism is unknown — localizing it requires per-DISPATCH GPU counter measurement.
 
+**iter66b ENCODER-COALESCENCE AUDIT (2026-05-02 ~00:25Z): hf2q-orchestration-layer prefill perf is EXHAUSTED. iter67+ direction shifts to mlx-native kernels gdn.ops5-9 + moe_ffn (93.2% of remaining prefill GPU time per ADR-013 P21 4c10de3 per-CB profile).**
+
+iter66b research worker (`/tmp/cfa-iter66b/research/ENCODER-COALESCENCE-DESIGN.md`, 812 lines) inventoried all 9 `commit_*` sites in the DN prefill code path and audited each against Chesterton's fence + per-call cost (71µs/wait per ADR-005 iter58c calibration). Of 9 sites: 3 are test-only (irrelevant); 4 are already `commit_labeled` (ADR-013 P21 Stage-3a downgrades + iter58b decode arm); 1 is iter58b-PINNED (chunk-attn residency rescission guard, MUST stay `commit_and_wait`); only 2 are UNAUDITED Stage-3a misses (line 1742 chunk-prep, line 1811 chunk ops8-9). Total candidate set = 4 candidates (C1-C4), individually 0.06-0.18 pp; combined wall savings ≤0.30 pp at apex pp=4096. Gap to ≥1.00× exit gate is **+68 pp**. **Encoder coalescence contributes 0.4% of the needed work** — falsified as a viable iter66+ direction.
+
+iter66b's load-bearing reference: ADR-013 P21 commit `4c10de3` per-CB profile shows **93.2% of prefill GPU time is kernel-bound** (gdn.ops5-9 54.9% + moe_ffn 38.3%). This converges with iter62-65's matmul-kernel-optimal finding: BOTH the mul_mm tensor kernel AND the hf2q orchestration layer are exhausted at peer parity. **The +68 pp gap to ≥1.00× lives entirely in OTHER mlx-native kernels (gdn.ops5-9 + moe_ffn), out of mul_mm tensor scope.**
+
 **iter65 POST-MORTEM (2026-05-01 ~23:35Z): the cast-elimination-via-threadgroup<float> hypothesis is FALSIFIED, completing a 4-iter convergence (iter60b/63a/63c/65) on the LOAD-BEARING tensor-cores finding.**
 - **iter65** (mlx-native branch `cfa/iter65-tg-float-b-20260501/claude` HEAD `b47e927`, pushed): kept main's threadgroup-B cache + changed sb element type half→float to eliminate f32→half cast. Build + parity 11/11 PASS BYTE-EXACT. Cold-bench: iter65 2540ms vs main 2023ms = **+517ms / +25.6% REGRESSION**. Per-bucket: layer.ops1_3 +100ms (1.85×), layer.ffn_dispatch +416ms (1.31×); fa.ops1_4 unchanged (FA path uses different kernel template).
 - **Critical convergent finding:** iter64a (device-direct B, no cache, +531ms) and iter65 (threadgroup<float> B, cache preserved, +517ms) produce ~the same regression DESPITE completely different L2/DRAM access patterns. The ONLY shared property: BOTH break homogeneous-half-precision input for `tensor_ops::matmul2d`. Combined with iter60b (+423ms via mixed precision through `tensor<device float>`) and iter63a/c (NR1=128 with mixed precision, parity-failed pre-bench), 4 independent kernel modifications converge on the same hypothesis: **Apple M3+ hardware tensor cores accelerate ONLY the `(half, half, float)` cooperative-tensor variant; mixed-precision `(half, float, float)` and `(float, half, float)` variants — though shipping in the MPP API per `MPPTensorOpsMatMul2d.h:21,24` + `Impl.h:5610-5621` — fall to a ~2× slower software compute path.**
 - **Implication: main IS OPTIMAL for `kernel_mul_mm_q4_0_tensor_f32` on M5 Max.** The f32→half cast in main is the price paid for hardware tensor cores. iter60b's "eliminate cast" structural motivation is FALSIFIED at value (definitively): the cast cost is dwarfed by the tensor-cores loss. The B staging design space is CLOSED.
 - **DO NOT MERGE iter65, iter64a, iter60b, iter63a, iter63c.** All preserved as evidence. Convergent ADR-013 P21 mm_id audit (`tensor variant ≡ llama half-MMA, residual gap is GPU scheduling`) reaches the same conclusion via a different kernel.
 
-**Updated iter66+ priority (loop continues; B staging closed, look elsewhere):**
+**Updated iter67+ priority (B staging + DN encoder coalescence BOTH closed; remaining gap is in OTHER mlx-native kernels):**
 
-1. **iter66 candidate — encoder coalescence (iter57 thesis revival).** Now empirically motivated by the matmul kernel being optimal: the residual prefill gap (0.319× cold-clean) lives at the orchestration layer (CB count, dispatch density, encoder boundaries), not the kernel itself. ADR-013 P21 already proved the orchestration improvements possible (sync_count 161→6 via FaPrefillArena, K=8 FFN-terminal batching). Continue similar work for the prefill DN path.
+1. **iter66a — iter59-mtnsg merge after rebase (in flight).** Confirmed 2.2× speedup at seq_len≤32 short-prefill autoregressive batched (per iter62 followup `/tmp/cfa-iter62-followup/4-fixture-VERDICT.md`). Branch was HOLD due to staleness vs current main; rebase + 4-fixture decode no-regression worker spawned. If gates pass, merge.
 
-2. **iter66 candidate — multi-token NSG kernel merge (iter59-mtnsg).** Has confirmed 2.2× speedup at seq_len≤32 short-prefill fixture. Currently HOLD pending rebase + 4-fixture decode no-regression on current main HEAD. Low-effort: rebase + retest gates; if green, merge.
+2. **iter67 candidate (NEW PRIMARY) — gdn.ops5-9 mlx-native kernel optimization.** Per ADR-013 P21 4c10de3 per-CB profile, this bucket carries **54.9% of prefill GPU time**. This is DeltaNet's chunked operations 5-9 (the kernel composition for the gated_delta_net forward pass). mlx-native scope; out of mul_mm tensor territory. Research needed: identify the dominant kernel inside gdn.ops5-9, peer cross-check with FLA / RecurrentGemma reference impls, evidence-based optimization candidate.
 
-3. **iter66 candidate — RoPE+QKV fusion (3-4 days, medium-high risk).** Queued from iter59 dossier index; only worth it if cumulative gain from above leaves significant prefill gap.
+3. **iter67 candidate — moe_ffn mlx-native kernel optimization.** 38.3% of prefill GPU time per same profile. mlx-native MoE FFN dispatch (the routing + expert matmul orchestration). Research candidates: kernel_mul_mm_id (Q4_K MoE handled by parallel adr013-q4k-moe-kernels session), expert sortby/scatter (kernel_mul_mm_id_map0 already exists per iter59 audit), router fusion.
 
-4. **iter66 candidate — operator-driven Xcode .gputrace capture (Part B of iter63 profiling kit).** Now has a NEW use case: not localizing iter60b's mechanism (we know it now), but identifying NEXT bottleneck after the matmul kernel is exonerated. The kernel ≈ optimal; what's the next-largest-time-bucket attribution at the FORWARD-PASS level?
+4. **iter67 candidate — RoPE+QKV fusion (3-4 days, medium-high risk).** Queued from iter59 dossier; lower priority than (2) and (3) since gdn+moe is 93.2% of remaining time vs RoPE+QKV at unknown smaller fraction.
 
-5. **Decide iter60c + iter59-mtnsg disposition (carried from iter62 followup).** Both branches HOLD due to staleness vs current main HEAD; rebase + re-bench needed before merge decision.
+5. **iter67 candidate — operator-driven Xcode .gputrace capture (Part B of iter63 profiling kit).** Useful diagnostic for identifying next bottleneck inside gdn.ops5-9 and moe_ffn at per-dispatch granularity. Per-CB attribution above already gives the bucket; per-dispatch zooms in.
+
+6. **iter60c rebase + 4-fixture decode** — carried from iter62 followup. Lower priority since iter60c is no-regression / no-measured-win at noise floor; merge value is just code-clarity (mirrors llama.cpp `FC_*` pattern).
+
+**ABANDONED iter66 candidate — encoder coalescence (iter57 thesis revival).** iter66b research audit: ≤0.30 pp ceiling vs +68 pp gap. **DO NOT pursue.** ADR-013 P21 already captured the wins via FaPrefillArena (sync_count 161→6) + K=8 FFN-terminal batching + Stage-3a downgrades. iter66b research artifact preserved at `/tmp/cfa-iter66b/research/ENCODER-COALESCENCE-DESIGN.md`.
 
 6. **iter63 GPU profiling kit — LANDED on `cfa/iter63-profiling-kit-20260501/claude` HEAD `d0b0128` (mlx-native), 5 commits, +1566 LOC (995 production / 571 tests).** Extends `kernel_profile.rs` per-CB scaffold with per-dispatch path (`MLX_PROFILE_DISPATCH=1`) + ports llama.cpp's programmatic `MTLCaptureManager` (`MLX_METAL_CAPTURE=/path.gputrace`). All 6 acceptance criteria PASS; 127/127 mlx-native lib tests (0 regressions; +2 in `kernel_profile::tests`, +5 in `metal_capture::tests`); 9 new unsafe blocks all matching existing patterns; zero FFI shim, zero objc2-metal dep. Operator hand-off recipe ready.
    - **CRITICAL DISCOVERY at impl time (Apple Silicon hardware quirk):** `AGXG17XFamilyComputeContext` (M-series, macOS 26) supports counter sampling **only at `AtStageBoundary`, never `AtDispatchBoundary`**. Calling `sampleCountersInBuffer:atSampleIndex:withBarrier:` between dispatches inside a persistent compute encoder ABORTS with `failed assertion 'MTLComputeCommandEncoder:sampleCountersInBuffer:atSampleIndex:withBarrier not supported on this device'`. **AtStageBoundary is incompatible with mlx-native's persistent-compute-encoder design** — that encoder is mlx-native's load-bearing existing optimization (~800 encoder create/end cycles per forward pass amortized into one persistent encoder per CB). For numeric per-dispatch attribution on M-series, the path forward is **Part B's Xcode GPU-timeline visualization** which DOES show per-dispatch start/end on M5 Max because Apple's frame capture is independent of `MTLCounterSampleBuffer`.
@@ -1782,6 +1792,55 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - Memory pins: `feedback_perf_gate_thermal_methodology`, `feedback_shippability_standing_directive`, `feedback_never_ship_fallback_without_rootcause`, `feedback_no_broken_windows`, `project_metal_compiler_auto_optimizes_static_levers`, `project_end_gate_reality_check`, `feedback_ground_truth_is_what_we_can_measure_now`
 
 ## Changelog
+
+- **2026-05-02 (UTC ~00:25Z) — iter66b encoder-coalescence audit: hf2q-orchestration prefill perf is EXHAUSTED. ≤0.30 pp ceiling vs +68 pp gap to ≥1.00× exit. iter67+ direction shifts to mlx-native gdn.ops5-9 + moe_ffn kernels (93.2% of remaining prefill GPU time per ADR-013 P21 4c10de3 per-CB profile).**
+
+  **Method.** iter66b research worker (`/tmp/cfa-iter66b/research/ENCODER-COALESCENCE-DESIGN.md`, 812 lines) inventoried every `commit_*` site in `/opt/hf2q/src/inference/models/qwen35/gpu_delta_net.rs` on the production DN prefill code path; cross-referenced ADR-013 P21 stage-2 profile commit `4c10de3`, ADR-013 P21 stage-3a commit `c3f35d4`, ADR-013 P21 stage-3b commit `1ecfa7b`, ADR-013 P21 stage-2c commit `9cfca06`, ADR-013 P21 stage-2 commit `2ee0ffc`. Each site audited against Chesterton's fence (original motivation, invariant preserved) + per-call host-wait cost (71µs/wait per ADR-005 iter58c calibration).
+
+  **Inventory of 9 commit sites:**
+  | Sites | Status | Action |
+  |---|---|---|
+  | 3 (lines 557, 733, 2474+) | TEST-ONLY | Irrelevant to production |
+  | 4 (lines 1542, 1577, 1649, 1887) | Already `commit_labeled` | Captured by ADR-013 P21 Stage-3a + iter58b decode arm |
+  | 1 (line 1214 chunk-attn) | iter58b-PINNED | MUST stay `commit_and_wait` (residency rescission guard) |
+  | 2 (line 1742 chunk-prep, line 1811 chunk ops8-9) | UNAUDITED Stage-3a misses | Candidate set |
+
+  **Candidate set (4 candidates C1-C4): combined wall savings ≤0.30 pp at apex pp=4096.**
+  - C1: chunk-prep encoder downgrade (line 1742) — 0.06 pp
+  - C2: chunk ops8-9 encoder downgrade (line 1811) — 0.18 pp
+  - C3: Stage-3a-class symmetry follow-up (~30-min impl) — 0.04 pp
+  - C4: Stage-1-class `DnChunkArena` refactor (analogous to FaPrefillArena) — 0.02 pp; C1 depends on C4
+
+  **Comparison with the gap:** Loop exit gate is prefill ≥1.00× across 4 D4 fixtures; current cold-clean is 0.319× (-3.13× peer); gap is **+68 pp**. Encoder coalescence delivers **0.30 pp = 0.4% of needed work**.
+
+  **Load-bearing reference (ADR-013 P21 4c10de3 per-CB profile):** at apex prefill, GPU-time attribution is **gdn.ops5-9 = 54.9%, moe_ffn = 38.3%, total = 93.2% kernel-bound**. The remaining 6.8% covers (a) encoder commit overhead (now ≤0.30pp recoverable; iter66b candidate set), (b) MTL device-init / weight upload first-time costs (one-shot, amortizable but not recoverable per-prefill), (c) wrapper / dispatch infrastructure (largely captured by ADR-013 P21 work).
+
+  **Convergence with prior iter62-65 finding.** iter62-65's 4-iter convergence proved `kernel_mul_mm_q4_0_tensor_f32` is OPTIMAL on M5 Max (any operand-precision-mixing falls to ~2× slower software path). iter66b's audit proves the hf2q ORCHESTRATION layer is OPTIMAL post-ADR-013 P21. **Both layers exhausted; remaining gap is entirely in OTHER mlx-native kernels — gdn.ops5-9 (DeltaNet chunked ops 5-9) + moe_ffn (MoE FFN dispatch).**
+
+  **Recommendation:** **DO NOT IMPLEMENT iter66+ as encoder coalescence.** Pursue:
+  1. iter66a — iter59-mtnsg merge after rebase (in flight; confirmed 2.2× speedup at seq_len≤32; small-but-real win)
+  2. iter67 — gdn.ops5-9 mlx-native kernel optimization (54.9% of prefill GPU time; PRIMARY remaining lever)
+  3. iter67 — moe_ffn mlx-native kernel optimization (38.3% of prefill GPU time; SECONDARY remaining lever)
+  4. iter67 — operator-driven Xcode .gputrace via iter63 Part B for per-dispatch zoom into gdn / moe buckets
+
+  **Methodology lessons banked.** iter62-65 + iter66b together establish a 5-iter empirical pattern:
+  - Per-bucket GPU attribution (HF2Q_PROFILE_GPU_TS=1 + HF2Q_PROFILE_W5B8=1) is the load-bearing measurement methodology.
+  - 6 alternating cold trials × 60s cooldown × MANDATORY warmup-per-binary; trimmed-median drops shader-cache outliers.
+  - mcp-brain-server SIGSTOP'd during bench; rust-analyzer SIGSTOP'd if active.
+  - Hypothesis-first: pre-register falsifiable threshold BEFORE impl; STOP at parity fail; accept FALSIFIED outcome as data.
+  - Convergent verdicts across multiple independent attempts (4 in iter62-65; 2 layers in iter66b) are stronger than any single iter's bench number.
+
+  **STANDING COMPLIANCE.**
+  - `feedback_evidence_first_no_blind_kernel_rewrites` — read-only audit; no source changes.
+  - `feedback_correct_outcomes` — research delivers a NO-IMPL recommendation; not buried.
+  - `feedback_no_shortcuts` — full per-site Chesterton's-fence walkthrough; cited line numbers + commit hashes.
+  - `feedback_use_cfa_worktrees` — research worker isolated; no main repo impact.
+
+  **Receipts.**
+  - `/tmp/cfa-iter66b/research/ENCODER-COALESCENCE-DESIGN.md` (812 lines, 9-site inventory + 4-candidate audit + ranking)
+  - `/tmp/cfa-iter66b/.RESEARCH-DONE` flag
+
+  Status: iter66b CLOSED-NO-IMPL-RECOMMENDED. Encoder coalescence on DN prefill path closed as a viable iter66+ direction. iter67+ pivots to mlx-native gdn.ops5-9 + moe_ffn kernel work.
 
 - **2026-05-01 (UTC ~23:35Z) — iter65 FALSIFIED: threadgroup<float> B regresses +517ms wall (matching iter64a's +531ms in magnitude). LOAD-BEARING finding across 4 independent failures (iter60b/63a/63c/65): Apple M3+ hardware tensor cores ONLY accelerate the homogeneous (half, half, float) cooperative-tensor variant; mixed-precision variants like (half, float, float) — though present in the MPP API — fall to a ~2× slower software compute path. The f32→half cast in main is the price of hardware tensor cores. main IS OPTIMAL for kernel_mul_mm_q4_0_tensor_f32 on M5 Max. Future prefill closure must look elsewhere (encoder coalescence, RoPE+QKV fusion, multi-token NSG, MoE routing).**
 
