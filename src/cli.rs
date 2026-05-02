@@ -526,6 +526,31 @@ pub struct GenerateArgs {
     #[arg(long, conflicts_with = "chat_template")]
     pub chat_template_file: Option<PathBuf>,
 
+    /// Enable thinking-mode rendering: pass `enable_thinking=true` to the chat
+    /// template's Jinja context. For Qwen3-thinking checkpoints, this opens an
+    /// unfilled `<think>\n` block at the end of the rendered prompt and the
+    /// model is expected to emit reasoning content + `</think>` before the
+    /// answer. Default behavior (neither flag set) leaves `enable_thinking`
+    /// undefined, which most templates treat as "thinking enabled" via their
+    /// `else` branch — see `qwen3-chatml.jinja:147-153`. Pass `--no-thinking`
+    /// to explicitly disable thinking mode for non-thinking checkpoints
+    /// (the template emits a closed `<think>\n\n</think>\n\n` block, cuing
+    /// the model to skip directly to the answer). Mutually exclusive.
+    ///
+    /// 2026-05-02: added after the H2 audit
+    /// (`docs/research/decode-test-gap-2026-05-02.md`) found that
+    /// `render_jinja_template` was passing zero per-request flags into the
+    /// Jinja context — the upstream cause of the candy-prompt
+    /// hallucinated-`<|end|>` regression on a non-thinking checkpoint.
+    #[arg(long)]
+    pub enable_thinking: bool,
+
+    /// Disable thinking-mode rendering: pass `enable_thinking=false` to the
+    /// chat template's Jinja context. See `--enable-thinking` for the full
+    /// rationale. Mutually exclusive with `--enable-thinking`.
+    #[arg(long, conflicts_with = "enable_thinking")]
+    pub no_thinking: bool,
+
     // ADR-008: candle-era kernel mode flags removed.
     // The mlx-native backend handles all dispatch internally.
 }

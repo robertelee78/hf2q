@@ -313,10 +313,20 @@ fn render_chat_template(
     args: &cli::GenerateArgs,
     user_prompt: &str,
 ) -> Result<String> {
+    // Resolve `enable_thinking`: `--enable-thinking` → Some(true),
+    // `--no-thinking` → Some(false), neither → None (Jinja sees the
+    // variable as undefined; most templates' `else` branch fires).
+    // Mutual exclusion is enforced by clap (`conflicts_with` on `no_thinking`).
+    let enable_thinking = match (args.enable_thinking, args.no_thinking) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    };
+
     // Priority 1: CLI --chat-template string
     if let Some(tmpl) = args.chat_template.as_deref() {
         tracing::info!("Chat template: using CLI --chat-template override");
-        return render_jinja_template(tmpl, user_prompt);
+        return render_jinja_template(tmpl, user_prompt, enable_thinking);
     }
 
     // Priority 2: CLI --chat-template-file
@@ -327,7 +337,7 @@ fn render_chat_template(
         );
         let tmpl = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read --chat-template-file {}", path.display()))?;
-        return render_jinja_template(&tmpl, user_prompt);
+        return render_jinja_template(&tmpl, user_prompt, enable_thinking);
     }
 
     // Priority 3: GGUF metadata `tokenizer.chat_template`
@@ -336,7 +346,7 @@ fn render_chat_template(
             "Chat template: using GGUF metadata tokenizer.chat_template ({} chars)",
             tmpl.len()
         );
-        return render_jinja_template(tmpl, user_prompt);
+        return render_jinja_template(tmpl, user_prompt, enable_thinking);
     }
 
     // Priority 4: hardcoded fallback
@@ -358,7 +368,11 @@ fn render_chat_template(
 /// - `raise_exception(msg)` function — Qwen3.6 guard for missing user query
 ///   (we always supply a user message, so this code path is unreachable; we
 ///   log a warning and continue rather than aborting template rendering).
-fn render_jinja_template(template_str: &str, user_prompt: &str) -> Result<String> {
+fn render_jinja_template(
+    template_str: &str,
+    user_prompt: &str,
+    enable_thinking: Option<bool>,
+) -> Result<String> {
     let mut env = minijinja::Environment::new();
 
     // `tojson` filter — converts any value to its JSON representation.
@@ -401,6 +415,19 @@ fn render_jinja_template(template_str: &str, user_prompt: &str) -> Result<String
     let tmpl = env
         .get_template("chat")
         .context("Failed to load parsed chat template")?;
+    // 2026-05-02 (per H2 audit, docs/research/decode-test-gap-2026-05-02.md):
+    // include `enable_thinking` in the Jinja context. Templates like
+    // qwen3-chatml.jinja:147-153 branch on this variable to either open an
+    // unfilled `<think>\n` block (default: thinking-mode-on) or emit a
+    // pre-closed `<think>\n\n</think>\n\n` (thinking-mode-off, cuing the
+    // model to skip directly to the answer). Before this fix the variable
+    // was never passed and templates always fired the `else` branch — broken
+    // for non-thinking checkpoints loaded under the qwen3-arch dispatch.
+    //
+    // `Option<bool>` ↦ Jinja: None leaves the variable undefined (legacy
+    // behavior preserved); Some(b) sets it to that bool value. minijinja's
+    // `context!` macro accepts `Option<bool>` and serializes None as
+    // undefined, which is exactly what we want for jinja `is defined` guards.
     let rendered = tmpl
         .render(minijinja::context! {
             messages => vec![
@@ -409,6 +436,7 @@ fn render_jinja_template(template_str: &str, user_prompt: &str) -> Result<String
             add_generation_prompt => true,
             bos_token => "<bos>",
             eos_token => "<eos>",
+            enable_thinking => enable_thinking,
         })
         .context("Failed to render chat template")?;
     Ok(rendered)
@@ -3181,6 +3209,8 @@ fn cmd_parity_check(
             chat_template_file: None,
             benchmark: false,
             speculative: false,
+            enable_thinking: false,
+            no_thinking: false,
         },
         &prompt_text,
     )?;
@@ -3362,6 +3392,8 @@ fn cmd_parity_capture(
                 chat_template_file: None,
                 benchmark: false,
                 speculative: false,
+                enable_thinking: false,
+                no_thinking: false,
             },
             &prompt_text,
         )?;
@@ -3405,6 +3437,7 @@ mod tests {
         render_jinja_template, should_enable_kv_persist, FALLBACK_GEMMA4_API_CHAT_TEMPLATE,
         FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
+    use crate::backends::chat_templates::QWEN3_CHATML;
     use crate::serve::load_info::{
         ArchFamily, ChatTemplateSource, LoadInfo, TokenizerSource,
     };
@@ -3563,7 +3596,7 @@ mod tests {
     #[test]
     fn jinja_template_renders_single_user_turn() {
         let tmpl = "{{ bos_token }}{% for m in messages %}<|turn|>{{ m.role }}\n{{ m.content }}<|end|>\n{% endfor %}{% if add_generation_prompt %}<|turn|>model\n{% endif %}";
-        let out = render_jinja_template(tmpl, "hello").expect("render ok");
+        let out = render_jinja_template(tmpl, "hello", None).expect("render ok");
         assert!(
             out.starts_with("<bos>"),
             "output should start with bos_token: {out}"
@@ -3582,7 +3615,7 @@ mod tests {
     #[test]
     fn jinja_template_parse_error_is_reported() {
         let tmpl = "{% unclosed"; // invalid
-        let err = render_jinja_template(tmpl, "x").unwrap_err();
+        let err = render_jinja_template(tmpl, "x", None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("parse") || msg.contains("Jinja") || msg.contains("template"),
@@ -3923,5 +3956,85 @@ mod tests {
         // it wins even when `<|end|>` appears earlier in the string.
         let s = "x<|end|>y<|im_end|>z";
         assert_eq!(find_special_token_stop(s), Some("<|im_end|>"));
+    }
+
+    // ---- enable_thinking plumbing into chat-template render ----------
+    //
+    // 2026-05-02 — pin the H2-audit fix (docs/research/decode-test-gap-2026-05-02.md).
+    // `render_jinja_template` was not passing `enable_thinking` into the
+    // Jinja context; the qwen3-chatml.jinja `else` branch at line 152 always
+    // fired, opening an unfilled `<think>\n` block. On non-thinking
+    // checkpoints the model improvised a close marker (Phi-3's `<|end|>` in
+    // the user's candy-prompt repro 2026-05-02). These tests pin the three
+    // resolved states (Some(true), Some(false), None) against the bundled
+    // qwen3-chatml.jinja vendor fixture so a future regression on the plumb
+    // surface fails at PR time, not at the operator's terminal.
+
+    #[test]
+    fn render_jinja_qwen3_chatml_enable_thinking_true_opens_unfilled_think_block() {
+        let rendered = render_jinja_template(QWEN3_CHATML, "make me candy", Some(true))
+            .expect("qwen3-chatml render with enable_thinking=true must succeed");
+        assert!(
+            rendered.ends_with("<|im_start|>assistant\n<think>\n"),
+            "with enable_thinking=true the qwen3-chatml `else` branch (line 152) \
+             must fire, ending the prompt with `<|im_start|>assistant\\n<think>\\n` \
+             so the model emits reasoning content next. Actual tail: \
+             `{}`",
+            &rendered[rendered.len().saturating_sub(60)..]
+        );
+    }
+
+    #[test]
+    fn render_jinja_qwen3_chatml_enable_thinking_false_emits_pre_closed_think_block() {
+        let rendered = render_jinja_template(QWEN3_CHATML, "make me candy", Some(false))
+            .expect("qwen3-chatml render with enable_thinking=false must succeed");
+        assert!(
+            rendered.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "with enable_thinking=false the qwen3-chatml `if` branch (line 150) \
+             must fire, emitting a pre-closed `<think>\\n\\n</think>\\n\\n` block \
+             so the model skips reasoning and emits the answer directly. Actual \
+             tail: `{}`",
+            &rendered[rendered.len().saturating_sub(60)..]
+        );
+    }
+
+    #[test]
+    fn render_jinja_qwen3_chatml_enable_thinking_none_treats_as_undefined_else_branch() {
+        // Legacy behavior preservation: when neither --enable-thinking nor
+        // --no-thinking is passed, the resolved value is None. Jinja sees the
+        // variable as undefined; `enable_thinking is defined and ... is false`
+        // evaluates false; the `else` branch fires. This test pins that
+        // None ≡ Some(true) for the qwen3-chatml template (both fire `else`).
+        let rendered_none = render_jinja_template(QWEN3_CHATML, "make me candy", None)
+            .expect("qwen3-chatml render with None must succeed");
+        let rendered_true = render_jinja_template(QWEN3_CHATML, "make me candy", Some(true))
+            .expect("qwen3-chatml render with Some(true) must succeed");
+        assert_eq!(
+            rendered_none, rendered_true,
+            "with the qwen3-chatml template, None must render byte-identically \
+             to Some(true) — the `is defined and is false` guard fails for both. \
+             A divergence here means minijinja serialized None as a non-undefined \
+             value, breaking the legacy default behavior."
+        );
+    }
+
+    #[test]
+    fn render_jinja_qwen3_chatml_enable_thinking_does_not_affect_user_message() {
+        // Sanity: the user message body itself must be present regardless of
+        // the thinking flag. Pin against accidental message stripping.
+        for et in [None, Some(true), Some(false)] {
+            let rendered = render_jinja_template(QWEN3_CHATML, "MARKER_USER_BODY_42", et)
+                .expect("render must succeed");
+            assert!(
+                rendered.contains("MARKER_USER_BODY_42"),
+                "user message body missing from rendered prompt with \
+                 enable_thinking={et:?}"
+            );
+            assert!(
+                rendered.contains("<|im_start|>user\n"),
+                "user-turn opener missing from rendered prompt with \
+                 enable_thinking={et:?}"
+            );
+        }
     }
 }
