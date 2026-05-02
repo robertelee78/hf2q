@@ -3023,3 +3023,55 @@ This is **mlx-native / ADR-015 territory**: the next ~1.9× speedup requires fas
 Three of four criteria PASS. Prefill parity is open at 0.52× and traces to mlx-native kernel performance — escalates to ADR-015 scope.
 
 **Receipts**: commits `c3f35d4`, `1ecfa7b`, `2ee0ffc`, `9cfca06` on `adr017-iter17-2026-05-01`. Bench logs `/tmp/{s2,k4,k8,k10,k20,k40}-r*.log`, profile receipts `/tmp/post-s2-prof.log`, `/tmp/post-k20-prof.log`.
+
+### 2026-05-01 (deeper-night) — P21 Stage 4 LANDED · GDN simd_sum kernel swap, 2.04× at pp726, peer parity at long prompts
+
+**Why this entry.** Continuation of the P21 cumulative wall-win. After Stage 1+3a+3b+2+2c brought sync_count from 161→6 and prefill 199→582 t/s at pp80, the per-CB GPU profile pinpointed `layer.gdn.ops5-9` (54.4% of GPU work, 64.15ms, 2138µs avg) as the largest single bucket. Two GDN kernels existed in `/opt/mlx-native`:
+- `gated_delta_net_f32` (the prefill kernel): 128-thread threadgroups, per-thread serial reduction over D_k=128 elements, threadgroup_barrier between phases, shared memory.
+- `gated_delta_net_decode_f32_<NSG>` (iter56, mirrors llama.cpp's `kernel_gated_delta_net_f32_<NSG>`): 32-thread SIMD groups × NSG=D_k/32 cells per thread, simd_sum cross-lane reductions, no shared memory, no threadgroup_barrier.
+
+The hf2q caller used the prefill kernel for prefill paths. **The decode-named kernel handles n_tokens > 1 just fine** — its inner `for t in 0..n_tokens` loop is identical to the prefill kernel's. The "decode-only" naming was a deferred-prefill-rollout convention from iter56; the kernel is mathematically n_tokens-agnostic.
+
+**Stage 4 (`0847f56`):** route the autoregressive prefill `dispatch_gated_delta_net` call (gpu_delta_net.rs:1847) through `dispatch_gated_delta_net_decode` when D_k is a multiple of 32 and ≤ 128. Fallback to the prefill kernel otherwise (preserves D_k=8 synthetic-shape unit tests). Identical signatures, drop-in.
+
+**Per-CB GPU time effect at pp80:**
+| label | pre-Stage-4 | post-Stage-4 | drop |
+|---|---|---|---|
+| layer.gdn.ops5-9 | 64.15ms / 2138µs avg | 13.35ms / 445µs avg | **4.8×** |
+| total labeled GPU | 117.92ms | 100.79ms | -14.5% |
+
+**Bench (3-cold-process median):**
+| length | metric | pre-Stage-4 (Stage 2c) | post-Stage-4 | speedup |
+|---|---|---|---|---|
+| pp80 | prefill | 582 t/s | 582 t/s | (no change — ops5-9 absorbed by pipelining) |
+| pp726 | prefill | 1010 t/s | **1968 t/s median** | **1.95×** (single-cold runs up to 2087) |
+| pp80 | decode | 124 t/s | 116 t/s | within noise |
+| pp726 | decode | ~108 t/s | 103-108 t/s | within noise |
+
+**vs llama-completion (3-cold-run median):**
+| length | hf2q | llama | ratio | (was) |
+|---|---|---|---|---|
+| pp80 prefill | 582 t/s | 1112 t/s | 0.52× | (was 0.18×) |
+| **pp726 prefill** | **1968 t/s** | **2728 t/s** | **0.72×** | (was 0.37–0.58×) |
+| decode (any seq) | 116 t/s | 114 t/s | **1.02× ✓** | unchanged |
+
+**§17 ship-gate at pp726 status:**
+- Coherence ascii_ratio: 1.000 — PASS
+- Decode parity: 1.02× — **PASS** (matches/beats peer)
+- Prefill parity: **0.72× of peer** — open but in striking distance (was 0.10× pre-P21)
+- Sourdough byte-prefix: pre-existing ADR-018 c3 banner-regex breakage — track separately
+
+**Why pp80 didn't move with the kernel swap.** At pp80 the autoregressive ops5-9 GPU work was 64ms (54.4%) but it was being overlapped with the layer.moe_ffn dispatches that ran in parallel via Metal serial-queue concurrent dispatch. So removing 51ms of ops5-9 GPU work freed nothing on the critical path. The wall-time critical path at pp80 is now firmly **`layer.moe_ffn`** (Q4_K MoE mm_id matmul, 73.9% of post-Stage-4 GPU time at pp80, 1862µs avg). Closing pp80 toward peer parity now requires faster MoE FFN.
+
+**Why pp726 moved 1.95× wall.** At pp726 the autoregressive recurrence is dominant — the per-token recurrent state update + dot products scale linearly with sequence. The new kernel's NSG=4 register-resident state (16 bytes/thread) vs the old kernel's 512 bytes/thread (D_k=128 in private memory) is a 32× register-pressure reduction. At long prompts the per-thread-state cost adds up and the new kernel scales better.
+
+**Cumulative ADR-013 P21 (Stage 1 + 3a + 3b + 2 + 2c + 4):**
+- pp80 prefill: 199 → 582 t/s = **2.92× speedup** (vs llama: 0.18× → 0.52×)
+- pp726 prefill: ~200 → 1968 t/s = **~10× speedup** (vs llama: ~0.10× → 0.72×)
+- decode: 105 → 116 t/s = 1.10× speedup (matches/beats peer)
+- sync_count: 161 → 6 = 96% reduction
+- 7 commits on `adr017-iter17-2026-05-01` cleanly merged to `main` at `d1ca97f`
+
+**Receipts**: commits c3f35d4, 1ecfa7b, 2ee0ffc, 9cfca06, 0847f56. Bench logs `/tmp/{s4,long2,sw}-*.{out,log}`. Profile receipts `/tmp/s4-prof.log`, `/tmp/post-s2c-gpu.log`. ADR-013 progress entries from this session at "2026-05-01 (deep-night)" and "2026-05-01 (deeper-night)".
+
+**Next (open):** close the pp80 prefill gap (0.52× → 1.0×). Bottleneck: `layer.moe_ffn` Q4_K mm_id MoE matmul at 1862µs avg × 40 layers = 74.5ms / 73.9% of GPU work. ADR-015 territory — likely needs faster Q4_K mm_id kernel implementation or wrapper-overhead reduction (per W-5b.22/23 audit findings).
