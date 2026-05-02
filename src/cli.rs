@@ -526,33 +526,42 @@ pub struct GenerateArgs {
     #[arg(long, conflicts_with = "chat_template")]
     pub chat_template_file: Option<PathBuf>,
 
-    /// Enable thinking-mode rendering: pass `enable_thinking=true` to the chat
-    /// template's Jinja context. For Qwen3-thinking checkpoints, this opens an
-    /// unfilled `<think>\n` block at the end of the rendered prompt and the
-    /// model is expected to emit reasoning content + `</think>` before the
-    /// answer.
+    /// Force thinking-mode rendering on: pass `enable_thinking=true` to the
+    /// chat template's Jinja context. For Qwen3-thinking / QwQ / GPT-OSS-
+    /// reasoning checkpoints, this opens an unfilled `<think>\n` block at
+    /// the end of the rendered prompt — the model emits reasoning content
+    /// + `</think>` + the answer (the "both" outcome).
     ///
-    /// **Default behavior (NEITHER flag set) is `enable_thinking=false`** —
-    /// the jinja template emits a pre-closed `<think>\n\n</think>\n\n` block,
-    /// cuing ANY checkpoint (thinking-capable or not) directly into the
-    /// answer. This is the safe default after the 2026-05-02 regression where
-    /// non-thinking Qwen-arch GGUFs given an unclosed `<think>\n` prompt
-    /// improvised Phi-3-style `<|end|>` close markers and produced no answer.
-    /// Pass this flag explicitly to opt into a true Qwen3-thinking checkpoint's
-    /// `<think>...reasoning...</think>` reasoning trace. `--no-thinking` is
-    /// equivalent to the default and exists for explicitness/scripting.
-    /// Mutually exclusive with `--no-thinking`.
+    /// **Default behavior (NEITHER flag set) is auto-detect** from the
+    /// GGUF's `general.name` metadata:
     ///
-    /// 2026-05-02: added (commit `8c110f5`, plumb-only) and re-defaulted to
-    /// false (user-reported regression follow-up). H2 audit:
+    ///   * Names containing `thinking` / `qwq` / `reasoning` / `-o1-`
+    ///     (case-insensitive) → `enable_thinking=true` (model gets BOTH
+    ///     reasoning + answer rendered)
+    ///   * All other names → `enable_thinking=false` (model is cued
+    ///     directly into the answer via a pre-closed `<think>\n\n</think>\n\n`
+    ///     block; the regression-safe default for non-thinking Qwen-arch
+    ///     checkpoints that improvise Phi-3-style `<|end|>` close markers)
+    ///
+    /// Pass `--enable-thinking` to override auto-detect ON (e.g. a custom
+    /// thinking-capable checkpoint whose name doesn't match the heuristic).
+    /// Pass `--no-thinking` to override auto-detect OFF (e.g. a hybrid
+    /// model that LOOKS thinking-capable by name but actually breaks).
+    /// Mutually exclusive.
+    ///
+    /// 2026-05-02: added (commit `8c110f5`, plumb-only) → re-defaulted to
+    /// false (regression-fix iter 2) → upgraded to name-based auto-detect
+    /// (regression-fix iter 3, "we want both"). Substring heuristic mirrors
+    /// llama.cpp's `--reasoning auto` precedent. H2 audit:
     /// `docs/research/decode-test-gap-2026-05-02.md`.
     #[arg(long)]
     pub enable_thinking: bool,
 
-    /// Disable thinking-mode rendering. Equivalent to the default behavior
-    /// (no flag); exists for explicitness in shell scripts. See
-    /// `--enable-thinking` for the full rationale. Mutually exclusive with
-    /// `--enable-thinking`.
+    /// Force thinking-mode rendering off. See `--enable-thinking` for the
+    /// full rationale (auto-detect default + override semantics). Use this
+    /// when a model whose name LOOKS thinking-capable (e.g. `qwen-thinking-
+    /// distill`) actually breaks with the open-`<think>` prompt cue.
+    /// Mutually exclusive with `--enable-thinking`.
     #[arg(long, conflicts_with = "enable_thinking")]
     pub no_thinking: bool,
 

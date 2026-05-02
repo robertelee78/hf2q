@@ -308,31 +308,60 @@ pub(crate) const FALLBACK_GEMMA4_API_CHAT_TEMPLATE: &str = concat!(
 ///   2. CLI `--chat-template-file FILE`
 ///   3. GGUF `tokenizer.chat_template` metadata
 ///   4. Hardcoded fallback string (last resort)
+/// Heuristic: does the GGUF's `general.name` (or other identifying string)
+/// suggest the model is a thinking-capable / reasoning checkpoint?
+///
+/// Substring matches (case-insensitive):
+///   * `"thinking"`  — Qwen3-Thinking, Qwen3.6-A3B-Thinking, etc.
+///   * `"qwq"`       — Qwen QwQ-32B series (thinking model line)
+///   * `"reasoning"` — GPT-OSS reasoning checkpoints, distill variants
+///   * `"o1"`        — OpenAI-o1-style distills (rare in GGUF but observed)
+///
+/// 2026-05-02 — added per user "but don't we want both?" follow-up:
+/// thinking-capable models should default to `enable_thinking=true` so the
+/// reasoning trace AND the answer both render; non-thinking checkpoints
+/// stay on `false` (the regression-fix default). The flag remains the
+/// explicit override.
+fn gguf_name_suggests_thinking_capable(name_lower: &str) -> bool {
+    name_lower.contains("thinking")
+        || name_lower.contains("qwq")
+        || name_lower.contains("reasoning")
+        || name_lower.contains("-o1-")
+}
+
 /// Resolve the `enable_thinking` value to pass to the chat-template Jinja
-/// context from the CLI's mutually-exclusive `--enable-thinking` /
-/// `--no-thinking` flags. Default (neither flag set) is `Some(false)`.
+/// context. Three-state precedence:
 ///
-/// **Why default = `Some(false)`** (2026-05-02 user-regression follow-up):
-/// the initial commit `8c110f5` defaulted to `None`, but user retest showed
-/// the regression "stops after thinking prior to full response" was still
-/// firing on the default cmdline. With `None` the qwen3-chatml.jinja `else`
-/// branch fires, the prompt ends with `<think>\n`, non-thinking checkpoints
-/// improvise a `<|end|>` close marker (Phi-3-style) the substring stop
-/// catches, and the user sees thinking content + no answer. `Some(false)`
-/// makes the jinja emit a pre-closed `<think>\n\n</think>\n\n` block that
-/// cues ANY checkpoint — thinking-capable or not — directly into the
-/// answer. Users who want a Qwen3-thinking checkpoint's reasoning trace
-/// opt in via `--enable-thinking`.
+/// 1. **Explicit `--enable-thinking`** → `Some(true)`
+/// 2. **Explicit `--no-thinking`** → `Some(false)`
+/// 3. **Default (neither flag set)** → auto-detect from `gguf_name`:
+///    * thinking-suggesting name (per [`gguf_name_suggests_thinking_capable`])
+///      → `Some(true)`
+///    * anything else → `Some(false)` (the 2026-05-02 regression-safe default)
 ///
-/// Clap enforces mutual exclusion via `conflicts_with`, so the
-/// (true, true) input is unreachable in practice; we still cover it
-/// defensively to keep the function total.
-fn resolve_enable_thinking(args: &cli::GenerateArgs) -> Option<bool> {
+/// `gguf_name` is the model's `general.name` GGUF metadata string (or `None`
+/// if the GGUF doesn't expose one). Passed lowercased into the heuristic so
+/// callers don't need to normalize.
+///
+/// Clap enforces `--enable-thinking` ⊕ `--no-thinking` mutual exclusion via
+/// `conflicts_with`; the (true, true) input is unreachable in practice but
+/// the function remains total.
+fn resolve_enable_thinking(args: &cli::GenerateArgs, gguf_name: Option<&str>) -> Option<bool> {
     if args.enable_thinking {
-        Some(true)
-    } else {
-        Some(false)
+        return Some(true);
     }
+    if args.no_thinking {
+        return Some(false);
+    }
+    // Default — auto-detect from model name. The flag remains the explicit
+    // override; this branch is the "both" path: thinking-capable models get
+    // both reasoning + answer rendered out of the box.
+    let name_lower = gguf_name.map(|s| s.to_ascii_lowercase());
+    let auto_thinking = name_lower
+        .as_deref()
+        .map(gguf_name_suggests_thinking_capable)
+        .unwrap_or(false);
+    Some(auto_thinking)
 }
 
 fn render_chat_template(
@@ -340,7 +369,7 @@ fn render_chat_template(
     args: &cli::GenerateArgs,
     user_prompt: &str,
 ) -> Result<String> {
-    let enable_thinking = resolve_enable_thinking(args);
+    let enable_thinking = resolve_enable_thinking(args, gguf.metadata_string("general.name"));
 
     // Priority 1: CLI --chat-template string
     if let Some(tmpl) = args.chat_template.as_deref() {
@@ -4070,62 +4099,149 @@ mod tests {
     }
 
     #[test]
-    fn resolve_enable_thinking_default_is_some_false_post_regression_followup() {
-        // 2026-05-02 user re-tested after commit 8c110f5 (plumb-only) and
-        // the "stops after thinking prior to full response" regression was
-        // still firing on the default cmdline. This test pins the FIX:
-        // default resolution must be Some(false) so the jinja emits a
-        // pre-closed `<think>\n\n</think>\n\n` block, cuing the model
-        // (thinking-capable or not) directly into the answer.
+    fn resolve_enable_thinking_default_no_name_is_some_false() {
+        // No flag, no GGUF name → safe default Some(false) (the
+        // 2026-05-02 regression baseline). Pins that the auto-detect
+        // doesn't accidentally true-up on missing name metadata.
         let args = test_args_default();
-        assert_eq!(resolve_enable_thinking(&args), Some(false));
+        assert_eq!(resolve_enable_thinking(&args, None), Some(false));
     }
 
     #[test]
-    fn resolve_enable_thinking_explicit_enable_returns_some_true() {
+    fn resolve_enable_thinking_default_non_thinking_name_is_some_false() {
+        let args = test_args_default();
+        assert_eq!(
+            resolve_enable_thinking(&args, Some("Qwen3-7B-Instruct")),
+            Some(false),
+            "plain instruct model must default to no thinking"
+        );
+        assert_eq!(
+            resolve_enable_thinking(&args, Some("Gemma-4-27B")),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_enable_thinking(&args, Some("Llama-3.1-70B")),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn resolve_enable_thinking_default_thinking_name_auto_enables() {
+        // 2026-05-02 user follow-up: "we want to support thinking mode,
+        // and still get the full answer". Auto-detect ON when the model
+        // name suggests a thinking-capable checkpoint, so the user gets
+        // BOTH the reasoning trace AND the answer without passing a flag.
+        let args = test_args_default();
+        for thinking_name in &[
+            "Qwen3-30B-A3B-Thinking-2507",
+            "Qwen3-7B-Thinking-FP16",
+            "qwen3-thinking",                 // case-insensitive match
+            "QwQ-32B-Preview",
+            "Qwen-QwQ-32B-Reasoning",
+            "GPT-OSS-Reasoning-Distill",
+            "DeepSeek-R1-Distill-Qwen-o1-7B", // -o1- substring
+        ] {
+            assert_eq!(
+                resolve_enable_thinking(&args, Some(thinking_name)),
+                Some(true),
+                "thinking-capable model `{thinking_name}` must auto-enable"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_enable_thinking_explicit_enable_overrides_auto_detect() {
+        // Explicit --enable-thinking wins even when the GGUF name would
+        // auto-detect to false.
         let mut args = test_args_default();
         args.enable_thinking = true;
-        assert_eq!(resolve_enable_thinking(&args), Some(true));
+        assert_eq!(
+            resolve_enable_thinking(&args, Some("Qwen3-7B-Instruct")),
+            Some(true)
+        );
     }
 
     #[test]
-    fn resolve_enable_thinking_explicit_no_thinking_returns_some_false() {
-        // `--no-thinking` is currently equivalent to the default; this
-        // test pins the contract so a future change that splits the two
-        // (e.g. None vs Some(false) divergence) fails loud.
+    fn resolve_enable_thinking_explicit_no_thinking_overrides_auto_detect() {
+        // Explicit --no-thinking wins even when the GGUF name would
+        // auto-detect to true. Critical: a user who hits a hybrid model
+        // that LOOKS thinking-capable but actually breaks must be able
+        // to opt out.
         let mut args = test_args_default();
         args.no_thinking = true;
-        assert_eq!(resolve_enable_thinking(&args), Some(false));
+        assert_eq!(
+            resolve_enable_thinking(&args, Some("Qwen3-30B-A3B-Thinking-2507")),
+            Some(false)
+        );
     }
 
     #[test]
-    fn user_candy_regression_default_renders_pre_closed_think_block_e2e() {
-        // The smoking-gun end-to-end test for the 2026-05-02 user-reported
-        // "stops after thinking prior to full response" regression. With
-        // default args (no flag), the rendered prompt MUST end with
-        // `<|im_start|>assistant\n<think>\n\n</think>\n\n` so that:
-        //   (a) thinking-capable Qwen3-thinking checkpoints see the think
-        //       block as already-closed and skip directly to the answer,
-        //   (b) non-thinking Qwen-arch checkpoints (the user's case) don't
-        //       have to improvise a close marker — there's nothing to close.
-        //
-        // FALSIFICATION: if a future change reverts to `None` default or
-        // `Some(true)` default, the rendered tail will become `<think>\n`
-        // and the user's bug class re-opens. This test fails IMMEDIATELY
-        // at PR time instead of at the operator's terminal.
+    fn user_candy_regression_default_non_thinking_name_renders_pre_closed() {
+        // 2026-05-02 user candy-prompt regression: with a non-thinking
+        // model name (or no name), default render MUST end with
+        // pre-closed `<think>\n\n</think>\n\n` so the model goes straight
+        // to the answer. FALSIFIES if the regression-safe default reverts.
         let args = test_args_default();
-        let resolved = resolve_enable_thinking(&args);
+        let resolved = resolve_enable_thinking(&args, Some("Qwen3-7B-Instruct"));
         let rendered = render_jinja_template(QWEN3_CHATML, "make me candy", resolved)
             .expect("default render must succeed");
         assert!(
             rendered.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
-            "default-cmdline render MUST end with pre-closed think block. \
-             Actual tail: `{}`. \
-             If you intentionally changed the default, also update \
-             `resolve_enable_thinking_default_is_some_false_post_regression_followup` \
-             with a pointer to the new design rationale.",
+            "non-thinking-name default render MUST emit pre-closed think block. \
+             Actual tail: `{}`",
             &rendered[rendered.len().saturating_sub(80)..]
         );
+    }
+
+    #[test]
+    fn user_thinking_request_default_thinking_name_renders_open_block() {
+        // The "we want both" path: when GGUF name suggests a thinking-
+        // capable checkpoint, default render MUST end with `<think>\n`
+        // (open block) so the model emits BOTH reasoning AND answer.
+        let args = test_args_default();
+        let resolved = resolve_enable_thinking(&args, Some("Qwen3-30B-A3B-Thinking-2507"));
+        let rendered = render_jinja_template(QWEN3_CHATML, "make me candy", resolved)
+            .expect("thinking-name default render must succeed");
+        assert!(
+            rendered.ends_with("<|im_start|>assistant\n<think>\n"),
+            "thinking-name default render MUST emit open think block. \
+             Actual tail: `{}`",
+            &rendered[rendered.len().saturating_sub(80)..]
+        );
+    }
+
+    #[test]
+    fn gguf_name_thinking_heuristic_substring_matrix() {
+        use super::gguf_name_suggests_thinking_capable;
+        // Positive cases (substring match, case-insensitive lowering done by caller)
+        for s in &[
+            "qwen3-thinking",
+            "qwq-32b",
+            "reasoning-distill",
+            "deepseek-r1-distill-qwen-o1-7b",
+        ] {
+            assert!(
+                gguf_name_suggests_thinking_capable(s),
+                "expected positive match for `{s}`"
+            );
+        }
+        // Negative cases
+        for s in &[
+            "qwen3-7b-instruct",
+            "gemma-4-27b",
+            "llama-3.1-70b",
+            "mistral-large-2407",
+            "phi-3.5-mini-instruct",
+            // Explicitly NOT matching: "thinkpad", "rethinking" — no, both contain
+            // "thinking" — substring match. Document this as a known false-positive
+            // class; users can override with --no-thinking.
+            "plain-baseline-model",
+        ] {
+            assert!(
+                !gguf_name_suggests_thinking_capable(s),
+                "expected NO match for `{s}`"
+            );
+        }
     }
 
     #[test]
