@@ -1793,6 +1793,33 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-05-02 (UTC ~01:25Z) — iter67-A CONFIRMED+NEUTRAL: parallel top-K replaces single-threaded sort with correct GPU pattern (6/6 parity tests, byte-identical decode), per-call p50 1.7µs→1.3µs (-24% real algorithmic speedup), but bucket-level wall below measurement floor at apex pp4096. 10th confirmed M5 Max static-evidence kernel hypothesis falsified at wall level. Branch HOLD pending iter67-B bundle decision.**
+
+  **Method.** iter67-A worker (impl + bench in worktree `/tmp/cfa-iter67a/`) replaced the single-threaded insertion sort in `moe_softmax_topk.metal:102-194` (`if (tiitg == 0) { ... }` with 127 idle threads waiting upstream) with K iterative parallel argmax reductions (tree-reduction + smaller-idx tiebreak preserving original encounter-order semantics). 1 shader file changed; 6 new dedicated parity tests in `tests/test_moe_softmax_topk.rs` (previously zero). Production shape covered: ne=256, top_k=8, n_tokens=80 (Qwen3.6 35B-A3B Abliterix EGA).
+
+  **Tests.** 6/6 new PASS · 16 MoE tests across 4 files PASS · 276/0/10 hf2q qwen35:: tests PASS · token-id parity = first decoded id 11 across all 8 prefill invocations · 760-byte byte-identical decode on 35B-A3B MoE + 760-byte byte-identical decode on 27B-dense.
+
+  **Bench (apex q4_0-flat pp4096, 6 alternating cold trials × 60s cooldown × MANDATORY warmup, mcp-brain SIGSTOP'd):**
+  - Trimmed median prefill: main **2540ms** vs iter67a **2536ms** (Δ -4ms / -0.16%) — pre-registered ≥0.5% threshold NOT met
+  - Phase B route+silu bucket: 0.154 → 0.162ms median (sub-noise)
+  - **Per-call p50 of phase_b_route_silu: 1.7µs → 1.3µs (-24% — the real Phase 2 speedup; absolute wall is too small to surface at bucket level)**
+
+  **Mechanism finding (load-bearing).** Per-call kernel cost ~1.7µs is dominated by Metal command-buffer enqueue + pipeline cache lookup, NOT the Phase 2 sort itself. Phase 2 went from N×K=2048 ops serial to ~K×log(N)=64 ops parallel — the per-call p50 reflected this (-24%) but bucket-level wall (40 calls × 0.4µs ≈ 16µs total saved per prefill) is below measurement floor against a 2540ms prefill.
+
+  **Algorithm is correct AND GPU-idiomatic.** The original "127 idle threads waiting" pattern was a real GPU-correctness anti-pattern (per worker: "the cleanest unambiguous 'obviously wrong' GPU pattern in the moe_ffn pipeline"). The new parallel top-K reduction respects the homogeneous-warp execution model. Even at zero measured wall improvement, **iter67-A is a code-quality + GPU-correctness fix.**
+
+  **Convergence with `project_metal_compiler_auto_optimizes_static_levers`.** This is the **10th** confirmed M5 Max static-evidence kernel hypothesis falsified at the wall level. The pattern: per-op cost summed across all calls predicts wall improvement, but the Metal compiler / runtime overhead floor swallows sub-microsecond per-call savings before they surface. Reinforces the load-bearing finding from iter62-65 + iter66b: M5 Max kernel-level optimization on already-optimized hot paths converges to noise floor.
+
+  **Merge decision: HOLD pending iter67-B bundle.** Per worker recommendation. Bundle with iter67-B or merge as kernel-cleanliness only at orchestrator's discretion. If iter67-B also lands NEUTRAL, evaluate whether bundled cumulative effect surfaces above noise floor; if not, ship as code-quality cleanup.
+
+  **Branches pushed.**
+  - mlx-native: `cfa/iter67a-parallel-topk-20260502/claude` (2 commits 836ec1c + 9220479) on top of main `feeea8c`
+  - hf2q: `cfa/iter67a-parallel-topk-20260502/claude` (no commits; working-tree-only Cargo.toml path-pin override that must be reverted on merge)
+
+  **Receipts.** `/tmp/cfa-iter67a/impl-bench/VERDICT.md` (full verdict); `/tmp/cfa-iter67a/impl-bench/logs/{T1,T2,T3}-{main,iter}.log` + warmups; `/tmp/cfa-iter67a/impl-bench/decode-smoke{,-moe}/{main,iter}.log`; `/tmp/cfa-iter67a/.IMPL-DONE`.
+
+  Status: iter67-A CLOSED-NEUTRAL-AT-WALL, ALGORITHM-CONFIRMED. iter67-B (moe mm_id indirect-dispatch occupancy, 3% ceiling) queued as next bench-and-decide step.
+
 - **2026-05-02 (UTC ~01:00Z) — iter67 research re-frames the prefill optimization landscape: post-Stage-4 moe_ffn = 73-76% (not 38.3%); ALL kernel-opt candidates total ≤5% wall ceiling — does NOT close the +68 pp gap to ≥1.00× exit. Structural closure requires either hardware-ceiling acknowledgement OR cross-context optimization outside kernel scope.**
 
   **Critical correction (load-bearing).** The cited ADR-013 P21 commit `4c10de3` per-CB profile (gdn.ops5-9 = 54.9%, moe_ffn = 38.3%) was captured **BEFORE** ADR-013 P21 Stage 4 (`0847f56`). **Stage 4 swapped autoregressive prefill GDN to the simd_sum decode kernel and dropped gdn.ops5-9 from 64.15 ms → 13.35 ms (4.8×).** Post-Stage-4 reality (per ADR-013 doc lines 2966-3050):
