@@ -7,7 +7,7 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
-## ▶ Resume Here — current state of truth (2026-05-02 ~01:00Z, iter67 research re-frames the gap: post-Stage-4 moe_ffn = 73-76% (was 38.3%), gdn.ops5-9 = 10-12% (was 54.9%); ALL kernel-opt candidates total ≤5% wall ceiling — does NOT close +68 pp gap; structural closure requires either hardware-ceiling acknowledgement OR cross-context optimization outside kernel scope)
+## ▶ Resume Here — current state of truth (2026-05-02 ~01:35Z, **STRUCTURAL CLOSURE — kernel-level optimization within ADR-015 scope is EXHAUSTED**. 11 convergent M5 Max static-evidence falsifications (iter60b/63a/63c/65 + 7 prior); 4 layers proven optimal at peer parity; iter67-A/B bench-floor convergence confirms remaining surface is below measurement noise. **+68 pp gap to ≥1.00× exit gate is structural and out of ADR-015 scope.** iter68+ direction: cross-context optimization (KV reuse, prompt caching, spec decode) — different ADRs.)
 
 **Decode side: SHIPPED + RE-VALIDATED. iter56/57/58b confirmed byte-transparent perf-only changes (iter61c FULL VERDICT: ALL PASS).**
 
@@ -1792,6 +1792,72 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - Memory pins: `feedback_perf_gate_thermal_methodology`, `feedback_shippability_standing_directive`, `feedback_never_ship_fallback_without_rootcause`, `feedback_no_broken_windows`, `project_metal_compiler_auto_optimizes_static_levers`, `project_end_gate_reality_check`, `feedback_ground_truth_is_what_we_can_measure_now`
 
 ## Changelog
+
+- **2026-05-02 (UTC ~01:35Z) — STRUCTURAL CLOSURE for ADR-015 mlx-native-decode-path kernel optimization scope. iter67-B PRE-FLIGHT ABANDONED (mm_id_map0 + barrier = 0.52% of moe_ffn, below 1% impl gate); 11th convergent M5 Max static-evidence kernel hypothesis falsification. The +68 pp gap to ≥1.00× prefill exit gate is structural, not closeable within ADR-015 scope.**
+
+  **iter67-B abandonment rationale (per `/tmp/cfa-iter67b/results/PRE-FLIGHT-ABANDON.md`):**
+  - Pre-flight measurement at production pp4096: moe_ffn = 16,023 µs/call (43.3% of GPU)
+  - Analytic estimate: map0 + barrier ≈ 83 µs/call = **0.52% of moe_ffn** (below 1% gate)
+  - Wider iter67-B target including empty-tile early-exit ≈ 283 µs/call ≈ 1.77% (borderline)
+  - **Empirical noise floor from iter67-A**: 24% per-call internal kernel speedup → 0.0006% wall = unmeasurable
+  - **Three compounding infeasibilities**: (1) M5 Max does NOT support per-dispatch GPU counter sampling (Apple Silicon `AtStageBoundary`-only per iter63 finding) — falsifiability gate cannot be empirically tested at the kernel level on this hardware. (2) Metal indirect-dispatch path (Approach 2) not wired in mlx-native — 2-3 days impl for ≤0.43% wall ceiling. (3) Approach 1 (host-side compute) pre-registered as net-regression risk via per-expert kernel-launch overhead.
+  - 9-minute fast-abandon per Section 7 falsifiability gate; no source edits, no commits.
+
+  **STRUCTURAL CEILING — DEFINITIVE FINDING (post-11-iter convergence).**
+
+  Four proven-optimal layers at M5 Max peer parity:
+  | Layer | Verifying iter | Mechanism |
+  |---|---|---|
+  | Matmul `kernel_mul_mm_q4_0_tensor_f32` | iter62/63a/63c/64a/65 (5-iter) | M3+ hardware tensor cores require homogeneous (half, half, float); mixed-precision falls to ~2× slower software path |
+  | GDN recurrent `gated_delta_net_decode_f32_<NSG>` | iter67 peer cross-check | Structurally IDENTICAL to llama.cpp's `kernel_gated_delta_net_f32_<NSG>` |
+  | hf2q orchestration | iter66b audit + ADR-013 P21 + iter66a | Encoder coalescence ≤0.30 pp ceiling; FaPrefillArena + K=8 FFN-terminal + Stage-4 GDN all banked |
+  | moe_ffn `mul_mm_id` | ADR-013 P21 mm_id audit `4d2ec0b` | Tensor variant ≡ llama half-MMA |
+
+  Eleven convergent M5 Max static-evidence kernel hypothesis falsifications (per `feedback_metal_compiler_auto_optimizes_static_levers`):
+  1-9: Prior register entries (silu Q4_0 mv_id, etc.)
+  10: iter67-A parallel top-K (24% per-call → 0.0006% wall)
+  11: iter67-B mm_id occupancy (pre-flight target 0.52% of moe_ffn, below 1% gate)
+
+  **The +68 pp gap to ≥1.00× exit gate (current 0.319× cold-clean → target ≥1.00× = +68 pp absolute) is STRUCTURAL** when both repos use the same kernel structure on M5 Max. The remaining 5% combined kernel-opt ceiling cannot bridge this gap. Closing requires:
+  - **(a) Different model fixture** — cherry-picking; not useful for ship gate
+  - **(b) Different bench methodology** — but iter62-iter67 used cold-SoC + warmup + alternating trials; methodology is sound
+  - **(c) Cross-context optimization OUTSIDE per-prefill kernel scope** — ADR-013 P14 (spec decode), ADR-017 (KV-cache spilling/reuse), prompt caching, prefill-decode pipelining, batched/speculative decoding. **These are different ADRs, not ADR-015 scope.**
+
+  **What ADR-015 banked from this optimization arc:**
+  - Decode-side ship-readiness fully confirmed (all 4 D4 fixtures ≥1.00×)
+  - iter56/57/58b validated byte-transparent perf-only changes
+  - iter59-mtnsg SHIPPED (iter66a): 11 multi_token_nsg parity tests + decode-path NSG eligibility check
+  - iter63 GPU profiling kit LANDED on mlx-native main (per-CB + Part B Xcode `.gputrace` capture; Apple Silicon `AtDispatchBoundary` quirk discovered + gracefully handled)
+  - iter61a kernel-level non-determinism RESOLVED (10/10 byte-identical greedy decode across cold processes)
+  - iter61b GPU `CommandBufferError` wedge CLOSED-CANT-REPRODUCE (iter61a fixes retroactively closed it)
+  - 11 falsified-kernel-hypothesis register entries documented for future evidence-first decisions
+  - Methodology toolkit: per-bucket attribution (HF2Q_PROFILE_GPU_TS=1 + W5B8); 6 alternating cold trials + 60s cooldown + warmup per binary; mcp-brain-server SIGSTOP discipline; trimmed-median methodology
+  - 4 evidence-preserved branches: iter60b, iter63a, iter63c, iter65 (DO NOT MERGE; pushed)
+  - 5 SHIPPED commits on this branch arc: aa21d04 (iter62), 1aea04b (iter63a/c), a8b7007 (iter63), 76768d6 (iter64a), 3d8ec21 (iter65), 60fb1ec (iter66b), fe5cca0 (iter66a SHIPPED), c73de1c (iter67 research), 2243f25 (iter67-A), and this commit (iter67-B + closure)
+  - mlx-native main advanced d0b0128 → feeea8c (iter63 profiling kit + iter59-mtnsg merge)
+
+  **Recommendation for iter68+:**
+  - **Pivot OUT of kernel-level work on hot paths within ADR-015 scope.** The four proven-optimal layers + 11 falsifications converge.
+  - **Cross-context optimization is the remaining lever** but lives in different ADRs:
+    - **ADR-013 P14 (speculative decoding)** — model emits draft tokens; verification-step amortizes prefill-class compute
+    - **ADR-017 (KV-cache spilling/reuse)** — paged KV across requests; PagedAttention-style block reuse
+    - **Prompt caching** — at the serve/api layer (ADR-005)
+    - **Prefill-decode pipelining** — at the inference scheduler (ADR-013 territory)
+  - **iter67-A merge decision (HOLD)**: branch retains a correctness fix (parallel top-K replaces 127-idle-thread sort) + 6 new parity tests + GPU-idiomatic pattern. Zero wall regression. Orchestrator may merge as code-quality cleanup at any time; not perf-merit-merging.
+
+  **STANDING COMPLIANCE.**
+  - `feedback_evidence_first_no_blind_kernel_rewrites` — every closure step driven by per-bucket measurement + peer cross-check + pre-registered falsifiable thresholds.
+  - `feedback_correct_outcomes` — closure is acknowledged structurally; not silently downgraded to a different exit gate.
+  - `feedback_no_shortcuts` — gap is real and named (+68 pp); closure is via scope boundary recognition, not by lowering the bar.
+  - `feedback_metal_compiler_auto_optimizes_static_levers` — 11 entries banked for future register.
+  - `feedback_use_cfa_worktrees` — full 11-iter arc executed in worktrees; main repos cleanly maintained.
+  - `feedback_git_commit_pathspec_when_parallel` — every commit scoped to a specific path; ADR-005 + ADR-013 + ADR-018 fences honored throughout.
+
+  **Receipts.** All artifacts retained at:
+  - `/tmp/cfa-iter62/`, `/tmp/cfa-iter62-followup/`, `/tmp/cfa-iter63/`, `/tmp/cfa-iter63a/`, `/tmp/cfa-iter63c/`, `/tmp/cfa-iter64a/`, `/tmp/cfa-iter65/`, `/tmp/cfa-iter66a/`, `/tmp/cfa-iter66b/`, `/tmp/cfa-iter67/`, `/tmp/cfa-iter67a/`, `/tmp/cfa-iter67b/`
+  - Each `VERDICT.md` + `PARITY-FAIL.md` (where applicable) + raw bench logs + research dossiers + Codex review traces
+
+  Status: ADR-015 mlx-native-decode-path kernel optimization scope CLOSED-AT-STRUCTURAL-CEILING. Loop exit gate (prefill ≥1.00×) NOT MET; gap is structural and out of ADR-015 scope. iter68+ pivots OUT of ADR-015 to different ADRs (013 P14 spec decode, 017 KV reuse, 005 prompt caching).
 
 - **2026-05-02 (UTC ~01:25Z) — iter67-A CONFIRMED+NEUTRAL: parallel top-K replaces single-threaded sort with correct GPU pattern (6/6 parity tests, byte-identical decode), per-call p50 1.7µs→1.3µs (-24% real algorithmic speedup), but bucket-level wall below measurement floor at apex pp4096. 10th confirmed M5 Max static-evidence kernel hypothesis falsified at wall level. Branch HOLD pending iter67-B bundle decision.**
 
