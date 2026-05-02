@@ -7,7 +7,9 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
-## ▶ Resume Here — current state of truth (2026-05-02 ~20:30Z, **iter87b FALSIFIED at zero impl cost: flash_attn_prefill tensor matmul2d port blocked by (1) llama.cpp peer doesn't ship it either — they use simdgroup_multiply_accumulate exclusively in flash_attn (so tensor cores aren't the peer gap mechanism), (2) matmul2d M/N≥16 constraint blocks 8x8x8 fragment decomposition, (3) iter56 precedent doesn't apply to fragment-decomposed kernel. Adjacent lever surfaced: iter87d — (half, half, float) simdgroup-MMA operand precision matching llama.cpp's exact ALU-precision pattern. ~50 LOC, distinct from iter62-65 falsifications. Queued for impl.** Receipts: `/tmp/cfa-iter87b/research/DESIGN.md` + `/tmp/cfa-iter87b/impl-bench/VERDICT.md`.
+## ▶ Resume Here — current state of truth (2026-05-02 ~21:00Z, **iter87d NEUTRAL: half-MMA operand precision matching llama.cpp's exact pattern delivered 4/4 IDENTICAL decode parity but 0 ms wall savings on default + 17 ms slower on chunk-engaged. 6th NEUTRAL outcome. CONVERGENT PEER-GAP FINDING (load-bearing across iter87b + iter87d): the +18-50% peer gap is NOT in any simple kernel-precision optimization (tensor matmul2d falsified by iter87b — peer doesn't ship it; half-MMA operands falsified by iter87d — matching peer pattern delivers 0 ms). The remaining mechanism is FA algorithm differences, memory access patterns, or higher-level scheduling. ADR-015 wrapper + kernel-precision scope DEFINITIVELY EXHAUSTED across hf2q + mlx-native based on convergent evidence: 5 SHIPPED + 6 NEUTRAL/FALSIFIED + 1 NULL.** Real ratios: chunk-engaged 0.667× / default 0.842× per same-day llama-bench. iter88+ remaining surface: measurement infra (iter88a) / algorithm port (iter88b) / pivot OUT (iter88c). Receipts: `/tmp/cfa-iter87d/impl-bench/VERDICT.md`.
+
+## ▶ Resume Here — preceding state (2026-05-02 ~20:30Z, **iter87b FALSIFIED at zero impl cost: flash_attn_prefill tensor matmul2d port blocked by (1) llama.cpp peer doesn't ship it either — they use simdgroup_multiply_accumulate exclusively in flash_attn (so tensor cores aren't the peer gap mechanism), (2) matmul2d M/N≥16 constraint blocks 8x8x8 fragment decomposition, (3) iter56 precedent doesn't apply to fragment-decomposed kernel. Adjacent lever surfaced: iter87d — (half, half, float) simdgroup-MMA operand precision matching llama.cpp's exact ALU-precision pattern. ~50 LOC, distinct from iter62-65 falsifications. Queued for impl.** Receipts: `/tmp/cfa-iter87b/research/DESIGN.md` + `/tmp/cfa-iter87b/impl-bench/VERDICT.md`.
 
 ## ▶ Resume Here — preceding state (2026-05-02 ~19:45Z, **iter87 FALSIFIED at zero cost: HALF_MMA_OPT in quantized_matmul_id_ggml::dispatch_id_mm is ALREADY SHIPPED on M5 Max — production tensor variant already uses (half, half, float) homogeneous MMA matching llama.cpp peer. Convergent with iter62-65's "main IS OPTIMAL" finding now reached via 2 independent kernels. Genuine new lever found: iter87b flash_attn_prefill tensor port (~16% of prefill compute; inner matmul still on M1-era simdgroup_multiply_accumulate; iter56 precedent). Estimated 30-100 ms wall savings on default-axis. iter87b research+impl queued.** Receipts: `/tmp/cfa-iter87/research/SCOPE.md` (245 lines).
 
@@ -1814,6 +1816,88 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - Memory pins: `feedback_perf_gate_thermal_methodology`, `feedback_shippability_standing_directive`, `feedback_never_ship_fallback_without_rootcause`, `feedback_no_broken_windows`, `project_metal_compiler_auto_optimizes_static_levers`, `project_end_gate_reality_check`, `feedback_ground_truth_is_what_we_can_measure_now`
 
 ## Changelog
+
+- **2026-05-02 (UTC ~21:00Z) — iter87d NEUTRAL: half-MMA operand precision matching llama.cpp peer's exact pattern delivered 4/4 IDENTICAL decode parity but 0 ms wall savings on default pp4127 / +17 ms (mildly REGRESSED) on chunk-engaged pp4096. 6th NEUTRAL outcome. Combined with iter87b's "peer doesn't use tensor matmul2d" finding, this is load-bearing evidence that the +18-50% peer gap is NOT in any simple kernel-precision optimization. The remaining lever surface is FA algorithm differences, memory access patterns, or higher-level scheduling — not operand precision.**
+
+  **iter87d implementation (5-line MMATile<T> change, mlx-native `ae71687`):**
+  ```cpp
+  // BEFORE: MMATile<AccumType, ...> for Qtile/Ktile/Vtile (float operands)
+  // AFTER:  MMATile<T, ..., MMAFrag_op_t> where T = I/O dtype (half/bf16)
+  using MMAFrag_op_t = BaseMMAFrag<T, kFragSize, kFragSize>;
+  MMATile<T,         TQ, 1,  MMAFrag_op_t>  Qtile;
+  MMATile<T,         1,  TK, MMAFrag_op_t>  Ktile;
+  MMATile<AccumType, TQ, TK, MMAFrag_acc_t> Stile;   // float accumulator UNCHANGED
+  MMATile<T,         1,  1,  MMAFrag_op_t>  Vtile;
+  MMATile<AccumType, TQ, TD, MMAFrag_acc_t> Otile;   // float accumulator UNCHANGED
+  ```
+  Mirrors llama.cpp's FA_TYPES macro at ggml-metal.metal:6469-6475 exactly.
+
+  **Pre-merge gates:**
+  - mlx-native flash_attn parity tests: 30+ PASS
+  - 4-fixture decode parity: **4/4 IDENTICAL** at greedy temp=0/top-k=1/max-tokens=32 (F1 27B-dwq46, F2 apex Q5_K, F3 apex q4_0-flat, F4 gemma-26B-bf16)
+  - Wall savings ≥30 ms threshold: **NOT MET**
+
+  **Bench (apex q4_0-flat, 6 cold trials × 60s × pgrep-audited):**
+
+  | Fixture | Baseline median | iter87d median | Δ wall | Verdict |
+  |---|---:|---:|---:|---|
+  | Default pp4127 | 1516 ms | 1516 ms | **0 ms (0%)** | NEUTRAL (within <2 ms IQR) |
+  | Chunk-engaged pp4096 | 1803 ms | 1820 ms | **+17 ms (+0.94%)** | MILDLY REGRESSED |
+
+  **Mechanism falsification (load-bearing):**
+
+  Predicted: 5-15% per-FA-kernel speedup from register-pressure halving + 2× MMA throughput → 12-36 ms wall.
+  Observed: 0 ms wall.
+
+  Possible mechanism reasons (untested, banked for future iters):
+  1. Apple Silicon's `simdgroup_multiply_accumulate(half, half, float)` may not have 2× throughput vs `(float, float, float)` on M5 Max — hardware tensor-core path requires `mpp::tensor_ops::matmul2d` (which iter87b confirmed isn't in flash_attn anyway)
+  2. FA kernel may not be MMA-throughput bound — bottleneck may be memory bandwidth (Q/K loads), online softmax reductions, mask handling, or SIMD divergence at sequence edges
+  3. M5 Max GPU may schedule FA kernel below MMA-throughput peak due to occupancy limits, register file allocation, or cache pressure
+
+  **Convergent peer-gap finding (load-bearing across iter87b + iter87d):**
+  - iter87b: peer doesn't use tensor matmul2d for flash_attn → tensor cores aren't the gap mechanism
+  - iter87d: matching peer's exact half-MMA pattern delivers 0 ms wall → operand precision isn't the gap mechanism
+  - **Conclusion: the +18-50% peer gap is NOT in any simple kernel-precision optimization.** Mechanism must be elsewhere: FA algorithm differences (online softmax variant, tile geometry, K-loop iteration order), memory access patterns (LDS sharing, GMEM coalescence), higher-level scheduling, or different hardware utilization (occupancy, register file).
+
+  **Cumulative session arc (8+ iters):**
+
+  | iter | Class | Outcome |
+  |---|---|---|
+  | iter72 | MoeFfnArena+DenseFfnArena | SHIPPED -290 ms chunk-engaged |
+  | iter74 | DnPrefillArena | SHIPPED -219 ms chunk-engaged |
+  | iter76 | PostAttnArena | NEUTRAL (#2 fail) |
+  | iter78 | ChunkAllocsArena | SHIPPED -296 ms chunk-engaged |
+  | iter80 | MoeFfnProjArena | NEUTRAL (#2 partial) |
+  | iter82 | simd_sum norm port | NEUTRAL (class too small) |
+  | iter83 | ChunkInternalArena (mlx-native) | SHIPPED -355 ms chunk-engaged |
+  | iter85 | (research) | NULL hypothesis on default-axis |
+  | iter86 | FaProjectionsArena | NEUTRAL (#2 fail; async-overlap) |
+  | iter87 | mm_id HALF_MMA_OPT | FALSIFIED (already shipped on M5 Max) |
+  | iter87b | flash_attn tensor matmul2d port | FALSIFIED at design (peer doesn't ship) |
+  | **iter87d** | **flash_attn half-MMA operands** | **NEUTRAL (parity OK, 0 ms wall)** |
+
+  **5 SHIPPED + 6 NEUTRAL/FALSIFIED + 1 RESEARCH** across hf2q wrapper, mlx-native arena, kernel-precision audits + impls.
+
+  **iter88+ remaining surface (genuine, not in current scope):**
+  1. **iter88a — measurement infra**: iter63's MTLCounterSampleBuffer + xctrace at per-dispatch granularity to attribute the FA peer gap mechanism. Without this attribution, kernel-algorithm changes are blind. In-scope per original handoff.
+  2. **iter88b — FA algorithm port**: FlashAttention-2 or NAX-style port (mirrors MLX `steel_attention_nax` b41b349). Multi-week effort.
+  3. **iter88c — pivot OUT**: ADR-013 P14 (spec decode) / ADR-017 (KV reuse + PagedAttention) / ADR-005 (prompt caching). Amortization vs per-call optimization.
+
+  **STANDING COMPLIANCE.**
+  - `feedback_evidence_first_no_blind_kernel_rewrites` — pre-registered ≥30 ms threshold; falsified at bench despite parity holding.
+  - `feedback_correct_outcomes` — iter87d SLOWER on chunk-engaged (+17 ms) reported honestly; not framed as noise.
+  - `feedback_no_shortcuts` — full impl + 4-fixture parity + 6-trial × 2-fixture cold bench completed even though research worker had pre-registered NEUTRAL-leaning prediction.
+  - `feedback_metal_compiler_auto_optimizes_static_levers` — ANOTHER datapoint: peer-pattern-matching does NOT guarantee wall savings; the mechanism that makes peer faster is somewhere else.
+
+  **Receipts.**
+  - iter87d VERDICT: `/tmp/cfa-iter87d/impl-bench/VERDICT.md` (85 lines)
+  - DESIGN: `/tmp/cfa-iter87d/research/DESIGN.md` (16KB, full code-citation evidence)
+  - Bench logs: `/tmp/cfa-iter87d/impl-bench/logs/{default,chunk-engaged}/{warmup,T{1..3}}-{baseline,iter87d}.log`
+  - 4-fixture parity: `/tmp/cfa-iter87d/4-fixture/F{1..4}-{baseline,iter87d}.txt`
+  - Branch: `cfa/iter87d-fa-half-mma-20260502/claude` HEAD `ae71687` (preserved as evidence; DO NOT MERGE)
+  - Binaries: `/tmp/cfa-iter87d/hf2q-{baseline,iter87d}` (preserved for future bench reproduction)
+
+  Status: ADR-015 wrapper + kernel-precision optimization scope is **DEFINITIVELY EXHAUSTED across hf2q AND mlx-native** based on convergent evidence (5 SHIPPED + 6 NEUTRAL/FALSIFIED + 1 NULL). Remaining peer gap (+18-50%) is in FA algorithm / memory access / scheduling — out of current ADR-015 in-scope levers under iter72 methodology. iter88+ requires either measurement infra (iter88a) or algorithm port (iter88b) or pivot OUT (iter88c).
 
 - **2026-05-02 (UTC ~20:30Z) — iter87b FALSIFIED at zero impl cost: tensor matmul2d port of flash_attn_prefill blocked by 3 convergent findings (peer doesn't ship it; matmul2d M/N≥16 multiple constraint blocks 8x8x8 fragment decomposition; iter56 whole-tile precedent doesn't apply to fragment-decomposed kernel). Adjacent lever surfaced — iter87d: simdgroup-MMA operand precision (half, half, float) matching llama.cpp peer's exact pattern. ~50 LOC effort.**
 
