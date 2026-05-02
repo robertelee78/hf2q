@@ -633,12 +633,13 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
 
     // Phase 0: Read model metadata for preflight
     //
-    // `metadata` is `mut` so Phase 1.8 (vocab-pad de-pad, ADR-012) can
-    // overwrite `metadata.vocab_size` with the de-padded count derived from
-    // tokenizer.json — keeps the downstream metadata emission consistent
-    // with the truncated embedding tensors.
+    // 2026-05-02: `metadata` previously needed `mut` for Phase 1.8
+    // (vocab-pad de-pad, ADR-012) which overwrote `metadata.vocab_size`
+    // post-depad. Now that depad is removed (commit 505b5b8 + this one),
+    // metadata.vocab_size stays at config.json's authoritative value
+    // throughout — no mutation required.
     let config_path = config.input_dir.join("config.json");
-    let mut metadata = if config_path.exists() {
+    let metadata = if config_path.exists() {
         input::config_parser::parse_config(&config_path)
             .context("Failed to parse model config")
             .map_err(AppError::Input)?
@@ -1141,106 +1142,46 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     .context("qwen35 linear-attention transforms (lazy) failed")
     .map_err(AppError::Conversion)?;
 
-    // Phase 1.8: ADR-012 vocab-pad de-pad — surfaced 2026-04-25 by
-    // `hf2q smoke --arch qwen35 --quant q4_0 --local-dir <hf-cache-snap>`.
+    // Phase 1.8 (vocab-pad de-pad) — REMOVED 2026-05-02.
     //
-    // HF safetensors pads `model.embed_tokens.weight` and `lm_head.weight` to
-    // an aligned vocab dimension (Qwen3.6-27B emits 248320 rows even though
-    // the tokenizer owns 248044 unique ids).  llama.cpp's loader compares the
-    // tensor shape against the emitted `tokenizer.ggml.tokens` array length
-    // and rejects a mismatch with
-    //   tensor 'token_embd.weight' has wrong shape; expected H, T, got H, P
-    // where T is de-padded and P is padded.
+    // The depad was added 2026-04-25 as a workaround for a converter bug
+    // in `gguf.rs::load_tokenizer_metadata`: at the time the emit code
+    // built the GGUF tokens array from `tokenizer.json[model][vocab]`
+    // ONLY (the base BPE = 248044 entries for Qwen3.6-27B), missing
+    // `added_tokens` whose ids land beyond the base range. The HF
+    // embedding matrix has 248320 rows (per `text_config.vocab_size`),
+    // and llama.cpp's loader compares tokens.length to embed.rows and
+    // rejects a mismatch. The 2026-04-25 depad "fixed" the loader
+    // rejection by truncating the embedding from 248320 → 248044,
+    // matching the (broken) emit.
     //
-    // This phase truncates both embedding tensors to the de-padded count
-    // computed from `tokenizer.json` (the same ground truth that drives
-    // tokenizer.ggml.tokens emission downstream).  No-op when the model has
-    // no `tokenizer.json`, when no padding is present, or when the embed
-    // tensor doesn't match the original metadata.vocab_size.  Updates
-    // `metadata.vocab_size` to the de-padded value so downstream metadata
-    // emission is consistent.
+    // The cost of this workaround was the user's currently-broken
+    // GGUF: rows 248044..248069 (the 26 TRAINED special-token rows
+    // including `<|im_end|>`, `<|endoftext|>`, `<think>`, `</think>`)
+    // got dropped along with the 250 reserved/PAD rows. The model
+    // could no longer emit any of those special tokens as atomic ids,
+    // turn-end never fired cleanly, the user observed "stops after
+    // thinking with no answer".
     //
-    // ADR-014 P1: lifted onto LazyTensorMap. Truncation is shape-changing
-    // (rows decrease) — embed tensors materialise, slice the byte buffer,
-    // re-insert as LazyTensor::from_bytes with updated shape. Embed
-    // tensors are ~1 GB at apex MoE scale (248k × 2048 × 2 bytes); the
-    // materialise here is bounded to the 1-2 embed tensors only.
-    if let Some(true_vocab) = input::detect_padded_vocab(&config.input_dir, &metadata)
-        .context("vocab-pad detection failed")
-        .map_err(AppError::Conversion)?
-    {
-        let mut truncated = 0usize;
-        for key in ["model.embed_tokens.weight", "lm_head.weight"] {
-            let Some(old_lazy) = lazy_map.remove(key) else {
-                continue;
-            };
-            // Validate metadata before forcing materialise — same 2-D
-            // shape contract as the eager `truncate_padded_vocab`.
-            if old_lazy.shape().len() != 2 {
-                lazy_map.insert(old_lazy);
-                continue;
-            }
-            let original_rows = old_lazy.shape()[0];
-            let cols = old_lazy.shape()[1];
-            let new_rows = true_vocab as usize;
-            if new_rows >= original_rows {
-                lazy_map.insert(old_lazy);
-                continue;
-            }
-            let elem_size = match old_lazy.dtype() {
-                ir::DType::F32 => 4,
-                ir::DType::F16 | ir::DType::BF16 => 2,
-                ir::DType::U8 => 1,
-                _ => {
-                    lazy_map.insert(old_lazy);
-                    continue;
-                }
-            };
-            let new_byte_len = new_rows * cols * elem_size;
-            // Materialise + truncate + re-insert.
-            let dtype = old_lazy.dtype();
-            let materialised = old_lazy
-                .materialize()
-                .context("vocab-pad de-pad materialise failed")
-                .map_err(AppError::Conversion)?;
-            // ADR-014 P13 step 2 (iter-81): rebuild via slice-to-Vec
-            // instead of in-place .truncate() so the same code works
-            // whether `materialised.data` is `Vec<u8>` (today) or
-            // `Arc<[u8]>` (post-iter-82+ P13 type swap).
-            if new_byte_len > materialised.data.len() {
-                // Defensive: shouldn't happen if shape matches.
-                let new_meta = ir::lazy::LazyMeta::new(
-                    materialised.name,
-                    vec![original_rows, cols],
-                    dtype,
-                );
-                let truncate_len = original_rows * cols * elem_size;
-                let data: Vec<u8> = materialised.data[..truncate_len].to_vec();
-                lazy_map.insert(ir::lazy::LazyTensor::from_bytes(new_meta, data));
-                continue;
-            }
-            let new_meta = ir::lazy::LazyMeta::new(key.to_string(), vec![new_rows, cols], dtype);
-            let data: Vec<u8> = materialised.data[..new_byte_len].to_vec();
-            lazy_map.insert(ir::lazy::LazyTensor::from_bytes(new_meta, data));
-            truncated += 1;
-            tracing::info!(
-                tensor = key,
-                from_rows = original_rows,
-                to_rows = new_rows,
-                "ADR-014 Phase 1.8 (lazy): truncated embedding to de-padded vocab"
-            );
-        }
-        // Update metadata regardless — same semantics as eager (callers
-        // expect post-call invariant `metadata.vocab_size == true_vocab`).
-        metadata.vocab_size = true_vocab;
-        if truncated > 0 {
-            tracing::info!(
-                truncated_tensors = truncated,
-                de_padded_vocab = true_vocab,
-                "ADR-012 Phase 1.8 (lazy): vocab-pad fix applied"
-            );
-        }
-    }
+    // The 2026-04-25 author DOCUMENTED at `input/mod.rs:127-133` that
+    // this was wrong:
+    //   "extending the GGUF emit to also include added_tokens (and
+    //    bumping the embedding to match, 248070 rows) is the strictly-
+    //    correct end state — it would preserve the trained embeddings
+    //    for the 26 chat special tokens (currently those rows in
+    //    safetensors are dropped during truncation). Tracked separately."
+    //
+    // 2026-05-02 commit `505b5b8` fixed the converter to mirror
+    // llama.cpp's `get_vocab_base`: emits the full `text_config.vocab_size`
+    // (= 248320) as the tokens array length, gap-fills [PAD{i}] / UNUSED
+    // for reserved slots. With that fix the depad is a NET-NEGATIVE
+    // workaround — it strips trained data from a now-correct pipeline.
+    // Removing here.
+    //
+    // The `input::detect_padded_vocab` and `input::truncate_padded_vocab`
+    // helpers remain for future use against genuinely malformed sources
+    // (HF embedding rows different from config.json's vocab_size); the
+    // CALL is removed here because well-formed HF sources don't need it.
 
     // ADR-014 P7 iter-60 (2026-04-28): move backend creation BEFORE
     // the materialize_all() bridge.  Backend selection is just a
