@@ -798,12 +798,15 @@ fn upload_i32_to_gpu(
 ///   * positions[2*n_pos .. 3*n_pos)  → axis 2 (ignored in vision mode)
 ///   * positions[3*n_pos .. 4*n_pos)  → axis 3 (ignored in vision mode)
 ///
-/// llama.cpp's `clip.cpp:3280-3309` callback for the qwen3vl_merger
-/// projector writes `[t, h, w, 0]` PER TOKEN in a different layout
-/// (per-token interleaved). The shader expects the section-contiguous
-/// layout instead — so this helper writes y into the first section
-/// (=axis 0) and x into the second (=axis 1) regardless of whether the
-/// upstream "t/h/w" mnemonic suggests otherwise.
+/// llama.cpp's `clip.cpp:3286-3302` callback for the qwen3vl_merger
+/// projector writes the SAME section-contiguous y/x/y/x layout this
+/// helper emits — per Codex Phase-2b review correction: the original
+/// header comment claimed "per-token interleaved [t,h,w,0]" was the
+/// llama.cpp shape and that we differ from it; that's wrong. llama.cpp
+/// allocates `n_pos*4` and writes section 0 = y, section 1 = x, then
+/// duplicates y/x into sections 2/3. Both implementations are
+/// section-contiguous; both rely on mlx-native vision mode reading
+/// only sections 0/1 per `/opt/mlx-native/src/shaders/rope_multi.metal:60-67`.
 ///
 /// `n_x` = patch grid width AFTER the 2x2 prelude block-merge — i.e.
 /// `n_patches_x / 2` (we operate on 2x2-merged tokens). Same for
@@ -1140,13 +1143,27 @@ fn apply_qwen3vl_block_forward_gpu(
     // -----------------------------------------------------------------
     // Stage 2: Q/K/V projection + bias add (qwen3vl.cpp:88-104).
     // -----------------------------------------------------------------
-    // qwen3vl.cpp uses a single fused `attn_qkv` weight + bias; our
-    // mmproj layer/validator expects split `attn_q/k/v.{weight,bias}`
-    // (see /opt/hf2q/.cfa-worktrees/.../src/inference/vision/mmproj.rs:707).
-    // The 4c.3 path consumes the split form; converter alignment for
-    // real-fixture loads is Wedge-4b/4c.5 territory. The math is
-    // identical: 3 individual `[n_pos, hidden]` matmuls produce the
-    // same Q/K/V rows as one fused `[n_pos, 3*hidden]` view.
+    // qwen3vl.cpp:88 uses a single fused `attn_qkv` weight + bias; our
+    // mmproj validator at src/inference/vision/mmproj.rs:701-708 requires
+    // split `attn_q/k/v.{weight,bias}`. The 4c.3 path consumes the split
+    // form; the math is identical (3 individual `[n_pos, hidden]` matmuls
+    // produce the same Q/K/V rows as one fused `[n_pos, 3*hidden]` view).
+    //
+    // ⚠ 4c.5-BLOCKER (per Codex Phase-2b review of fb3d16c, 2026-05-02):
+    // llama.cpp's converter at /opt/llama.cpp/convert_hf_to_gguf.py:5478-5501
+    // FUSES q/k/v into the single ATTN_QKV tensor named `v.blk.%d.attn_qkv.%s`
+    // (per /opt/llama.cpp/tools/mtmd/clip-impl.h:78). When 4c.5 lifts
+    // `is_supported()`, real llama.cpp-produced GGUF fixtures will fail
+    // mmproj.rs validator (it requires split names that won't be present).
+    // Resolution must land in 4c.5's loader-contract work — either:
+    //   (a) extend mmproj.rs validator + block_tensor() to accept fused
+    //       `attn_qkv.{weight,bias}` and produce the split slice views at
+    //       lookup time, OR
+    //   (b) split fused QKV at convert-time so hf2q-produced GGUFs always
+    //       carry split tensors (means every Wedge-4f convert path also
+    //       needs to know about this fork).
+    // (a) is preferred — keeps hf2q runtime compatible with llama.cpp's
+    // canonical converter output. Tracking as a 4c.5 prerequisite.
     let q = vit_linear_gpu(
         encoder,
         registry,
