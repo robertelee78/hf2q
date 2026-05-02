@@ -1677,16 +1677,16 @@ pub fn build_gated_attn_layer(
         // (CPU read) on k_rope/v_flat before submitting any GPU work, so the
         // GPU must have finished writing those buffers before we return.
         //
-        // Prefill path (seq>1) with arena (use_arena=true): the new_path_eligible
-        // branch of apply_sdpa_with_kv_cache calls apply_flash_attn_prefill_seq_major
-        // which does NOT call download_f32 — it works entirely on GPU. So the
-        // arena-path commit_and_wait is redundant and can be downgraded to
-        // commit_labeled. The Metal serial queue ensures ops1-4 completes before
-        // the FA bridge encoder starts (iter58b safety: ops1-4 buffers are NOT
-        // arena-owned — they are per-layer allocations from the pooled helper —
-        // but they are consumed only by the FA bridge via GPU-ordering, not by
-        // any CPU download_f32. Downgrade is safe by A.1 / queen plan).
-        if (seq_len == 1 && head_dim % 32 == 0) || use_arena {
+        // Decode (seq=1) only: GPU-only path, safe to commit_labeled.
+        // Prefill (seq>1): apply_sdpa_with_kv_cache (legacy path) unconditionally
+        // calls download_f32(k_seq_major) / download_f32(v_seq_major) to write
+        // the persistent KV cache (slot.k/slot.v) BEFORE the new_path_eligible
+        // branch dispatches FA. download_f32 → MlxBuffer::as_slice violates the
+        // "no GPU writer in flight" safety contract unless we commit_and_wait
+        // here first. Stage 1 cannot drop this wait without also moving the
+        // KV-cache write onto GPU (deferred to Stage 1.5 / Stage 2 per Codex
+        // Phase-2b finding `missing_RAW` and queen Option A).
+        if seq_len == 1 && head_dim % 32 == 0 {
             enc.commit_labeled("layer.full_attn.ops1-4");
         } else {
             enc.commit_and_wait().context("commit ops1-4 prefill")?;
