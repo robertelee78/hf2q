@@ -7,7 +7,7 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
-## ▶ Resume Here — current state of truth (2026-05-02 ~04:40Z, **iter72 SHIPPED: MoeFfnArena + DenseFfnArena pool MoE/dense FFN scratches → -290ms / -14.6% wall, ratio 0.460× → 0.690×, +23pp gap closed in a SINGLE iter. 8 prior closure declarations were wrong — the lever existed all along in `ffn.alloc_scratch`. Current gap: hf2q 1700ms vs llama 1174ms = 1.45× slower; remaining +31pp is the next horizon.** Merged at hf2q main `5e49d9f`. iter73+ direction: re-measure peer at fresh same-day; investigate next-largest unattributed bucket; possibly more arena candidates.)
+## ▶ Resume Here — current state of truth (2026-05-02 ~05:25Z, **iter74 SHIPPED: DnPrefillArena -219ms / -12.86% wall, ratio 0.691× → 0.792×, +10pp gap closed. Cumulative 2-iter session: 0.460× → 0.792× = +33pp in iter72+iter74. Quantile-not-means lens validated as systematic methodology. Current gap: hf2q 1484ms vs llama 1176ms = 1.26× slower; remaining +21pp.** Merged at hf2q main `6b0a067`. iter75+ direction: continue quantile audit on post-iter74 baseline; iter73 already proposed iter75 PostAttnArena (-40 to -80ms additive); broader bucket scan likely finds more.)
 
 **Decode side: SHIPPED + RE-VALIDATED. iter56/57/58b confirmed byte-transparent perf-only changes (iter61c FULL VERDICT: ALL PASS).**
 
@@ -1792,6 +1792,78 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - Memory pins: `feedback_perf_gate_thermal_methodology`, `feedback_shippability_standing_directive`, `feedback_never_ship_fallback_without_rootcause`, `feedback_no_broken_windows`, `project_metal_compiler_auto_optimizes_static_levers`, `project_end_gate_reality_check`, `feedback_ground_truth_is_what_we_can_measure_now`
 
 ## Changelog
+
+- **2026-05-02 (UTC ~05:25Z) — iter74 SHIPPED on hf2q main `6b0a067` (FF-merged from `cfa/iter74-dn-arena-20260502/claude` HEAD `5bd15b5`). DnPrefillArena pools DN-side transient scratches → -219ms / -12.86% wall at apex q4_0-flat pp4096; ratio 0.691× → 0.792×; +10pp additional gap closed (cumulative iter72+iter74 = +33pp from 0.460× baseline). Quantile-not-means methodology validated systematically — iter73 audit predicted exactly this win.**
+
+  **Mechanism (applies iter72's pattern to DN side).** ~22 transient `pooled_alloc_buffer` calls per DN layer × 30 DN layers, lifted to caller-owned `DnPrefillArena` allocated once at prefill start in `forward_gpu_impl` (alongside FaPrefillArena + MoeFfnArena/DenseFfnArena from prior iters). Per-layer scratch slots reused across all 30 DN layers; cold-path `metal::new_buffer + zero-init + addAllocation + [set commit]` storm collapses from ~22 × 30 = 660 cold allocs to 22 cold allocs total (97% reduction).
+
+  **Bench (apex q4_0-flat pp4096, 6 alternating cold trials × 60s cooldown × MANDATORY warmup × mcp-brain SIGSTOP):**
+
+  | Trial | iter74 prefill (ms) | iter72 baseline prefill (ms) |
+  |---:|---:|---:|
+  | Warmup | 1482 | 1708 |
+  | 1 | 1484 | 1703 |
+  | 2 | 1482 | 1703 |
+  | 3 | 1490 | 1710 |
+  | **median** | **1484** | **1703** |
+  | **IQR** | 8 | 7 |
+
+  Wall improvement: **-219ms (-12.86%)**. Ratio vs llama (1176 ms iter73-fresh peer): 0.691× → **0.792×**.
+
+  **Per-bucket attribution (matches iter73 quantile prediction exactly):**
+
+  | Bucket | iter72 baseline | iter74 | Δ | Reduction |
+  |---|---:|---:|---:|---:|
+  | layer.ops1_3 (DN, n=30) | 108.7 ms | 7.5 ms | -101.2 ms | 14× |
+  | layer.qkv_deinterleave (DN, n=30) | 61.1 ms | 0.6 ms | -60.5 ms | **100×** |
+  | layer.autoreg_ops5_9 (DN, n=30) | 46.7 ms | 17.3 ms | -29.4 ms | 2.7× |
+  | **Combined skew buckets** | **216.5 ms** | **25.4 ms** | **-191 ms** | **-88%** |
+
+  **Token-id parity: 3/3 cold trials byte-identical** to iter72 baseline.
+
+  **4-fixture decode no-regression (mandatory pre-merge gate per ADR-015 §iter60 fix plan):**
+
+  | Fixture | Result |
+  |---|---|
+  | apex Q5_K dwq46 (MoE, MoeFfnArena) | **IDENTICAL** |
+  | 27B Dense Q4_0 dwq46 (Dense, DenseFfnArena) | **IDENTICAL** |
+  | apex q4_0-flat (MoE) | **IDENTICAL** |
+  | gemma 26B dwq | **IDENTICAL** |
+
+  **Source change scope:** +1,547 LOC (691 new `dn_prefill_arena.rs` module + 760 `_with_arena` variants in `gpu_delta_net.rs` + 114 in `forward_gpu.rs` + 2 in mod.rs). Memory: ~165 MB DnPrefillArena allocated once per prefill (well within budget).
+
+  **Cumulative session progress (3 SHIPPED levers across iter66a → iter72 → iter74):**
+
+  | Iter | Win | Wall | Ratio Δ |
+  |---|---|---:|---:|
+  | iter66a iter59-mtnsg | merged (small short-prefill win) | n/a | n/a |
+  | iter72 MoeFfnArena+DenseFfnArena | -290 ms (-14.6%) | 0.460× → 0.690× | +23 pp |
+  | **iter74 DnPrefillArena** | **-219 ms (-12.86%)** | **0.691× → 0.792×** | **+10 pp** |
+  | **Cumulative** | **-509 ms** | **0.460× → 0.792×** | **+33 pp** |
+
+  Remaining gap to ≥1.00× exit: **+21 pp**. The structural-ceiling closure declared 8 times across iter65→iter71 was wrong — there were levers all along, hidden in quantile-skewed buckets.
+
+  **Methodology systematic now (banked from iter72 + iter74):** for any per-bucket profile, compute `mean/p50` and `max/p50` ratios. Buckets where `mean/p50 ≥ 5×` are cold-path-dominated and candidates for arena-pool elimination. iter73 audit found 3 such DN-side buckets at 170×/189×/85× ratios; iter74 confirmed all three collapse cleanly under DnPrefillArena. Apply same lens to iter74 baseline to find iter75+ candidates.
+
+  **iter75+ direction (already partially scoped):**
+  - **iter75 PostAttnArena** (iter73 secondary recommendation): `device.alloc_buffer × 2` at `forward_gpu.rs:1979/1986` (ffn_input_buf, ffn_residual_buf). 80 large allocs/prefill, FLAT distribution (mean ≈ p50, no quantile skew). Different mechanism — uniform amortization, not cold-path elimination. Estimated -40 to -80 ms additive.
+  - **Quantile audit re-run on post-iter74 baseline** — apply `mean/p50 ≥ 5×` threshold to NEW profile; new candidates likely to surface as the iter72/iter74 wins shift the bucket distributions.
+  - **mlx-native side audit** — iter72/iter74 were entirely hf2q wrapper changes. mlx-native may have its own cold-path-allocation patterns (residency-set commit storms inside MLX-native helpers). iter63 GPU profiling kit's per-CB infrastructure can drive this.
+
+  **STANDING COMPLIANCE.**
+  - `feedback_evidence_first_no_blind_kernel_rewrites` — pre-registered hypothesis from iter73 audit; 6-trial cold bench + 4-fixture parity gate.
+  - `feedback_correct_outcomes` — clean win documented; cumulative gap accounting transparent.
+  - `feedback_no_shortcuts` — 4-fixture parity gate (full set, including DenseFfnArena code path which DN-arena isn't expected to touch but verified independent).
+  - `feedback_use_cfa_worktrees` — entire iter74 workflow in `/tmp/cfa-iter74/hf2q/` worktree; isolated from main repo until merge.
+
+  **Receipts.**
+  - Branch: `cfa/iter74-dn-arena-20260502/claude` HEAD `5bd15b5` (pushed)
+  - Merged: hf2q main `6b0a067` (FF-merged 2026-05-02 ~05:25Z)
+  - Verdict: `/tmp/cfa-iter74/impl-bench/VERDICT.md`
+  - Bench logs: `/tmp/cfa-iter74/impl-bench/logs/`
+  - 4-fixture parity logs: `/tmp/cfa-iter74/impl-bench/four-fixture-decode.sh` + heartbeat trace
+
+  Status: iter74 SHIPPED. ADR-015 prefill optimization continues; the "quantile-not-means" methodology has produced 2 consecutive merge-worthy wins. iter75+ continues with post-iter74 baseline + new bucket scan.
 
 - **2026-05-02 (UTC ~04:40Z) — iter72 SHIPPED on hf2q main `5e49d9f` (FF-merged from `cfa/iter72-moeffn-arena-20260502/claude` HEAD `4261b2a`). MoeFfnArena + DenseFfnArena pool transient FFN scratches → -290ms / -14.6% wall at apex q4_0-flat pp4096; ratio 0.460× → 0.690×; **+23 pp gap closed in a single iter**. 8 prior closure declarations across iter62-71 were WRONG — the structural-ceiling assertion missed `ffn.alloc_scratch` (365ms / 14% of wall) which pools cleanly via the FaPrefillArena pattern. The user's persistence through 14 iters and 8 closure attempts paid off.**
 
