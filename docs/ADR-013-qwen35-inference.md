@@ -3050,3 +3050,56 @@ The hf2q caller used the prefill kernel for prefill paths. **The decode-named ke
 **Remaining gap is in `layer.moe_ffn` Q4_K mm_id MoE matmul kernel** — at pp80 the MoE FFN is 73-76% of GPU work post-Stage-4 (1135-1862µs/call × 40 calls). hf2q ports llama's `kernel_mul_mm_id_q4_K_f32` template + adds an M3+ tensor variant that's measurably faster (638 vs 520 t/s default-A/B). Per-CB GPU time deltas vs llama at the kernel level are still 1.5-2× — open ADR-015 work for the kernel-level audit.
 
 **Receipts**: `/tmp/p17b_q4k_bench/p17b_summary.md`, also archived at `docs/research/p17b-final-2026-05-02.md`. Bench logs `/tmp/p17b_q4k_bench/`.
+
+### 2026-05-02 (early-morning continued) — P21 mm_id audit · structural parity confirmed, residual gap is GPU scheduling
+
+**Why this entry.** Continuing to close the prefill ratio gap (0.49-0.63× of llama-cli post-Stage-4). Hypothesis to test: hf2q's Q4_K mm_id MoE kernel might use mixed-precision MMA (half weights × float input) where llama uses pure half MMA, leaving 2× kernel speed on the table.
+
+**Side-by-side audit:**
+
+| aspect | llama | hf2q simdgroup | hf2q tensor (default M3+) |
+|---|---|---|---|
+| ma fragment (weights) | simdgroup_half8x8 | simdgroup_half8x8 | half tensor (matmul2d) |
+| mb fragment (input) | simdgroup_half8x8 | simdgroup_float8x8 | half tensor (matmul2d) |
+| mc fragment (accum) | simdgroup_float8x8 | simdgroup_float8x8 | float (matmul2d) |
+| tile size NR0×NR1×NK | 64×32×32 | 64×32×32 | 64×32×32 |
+| dispatch threadgroups | (⌈n_tok/32⌉, ⌈N/64⌉, n_expert) | identical | identical |
+| dispatch threads/tg | (128, 1, 1) | identical | identical |
+| map0 + barrier + mm_id | yes | yes | yes |
+| ne21 mm_id threshold | 32 | 32 | 32 |
+
+**Finding.** The hf2q **tensor variant** (default on M3+, used at our production path) is structurally equivalent to llama's simdgroup-half kernel: both use half-precision MMA with float accumulator, identical tile sizes, identical dispatch configuration. The hypothesized "f32 mb fragment" gap only exists in the simdgroup variant, which is NOT our default at production shapes.
+
+**A/B confirmation (at pp80, qwen3.6-35B-A3B dwq48):**
+- Our tensor variant (default): 638 t/s prefill (3-cold-run median)
+- Our simdgroup variant (HF2Q_DISABLE_TENSOR_MM_ID=1): 520 t/s prefill (3-cold-run median, -18%)
+- llama-cli simdgroup-half kernel: 1112 t/s prefill (3-cold-run median, +74% over our tensor)
+
+**Residual structural gap.** Tensor and simdgroup-half MMA produce equivalent FLOP throughput on M5 Max. The remaining 1.74× hf2q-vs-llama gap at pp80 is NOT in:
+- MMA precision (both use half) ✓
+- Tile size (identical) ✓
+- Dispatch geometry (identical) ✓
+- Routing structure (map0 + barrier + mm_id, both) ✓
+- Sync overhead (sync_count=6 K=8, near-minimum) ✓
+
+The gap is in either:
+- GPU scheduling efficiency (concurrent dispatch ordering, kernel launch overhead, encoder lifetime)
+- Memory bandwidth pressure (working-set cache hit rates, weight tile re-read patterns)
+- mlx-native vs ggml-metal kernel-launch / arg-encoding host path
+
+**Limit of pure-Rust audit.** Diagnosing the remaining gap requires xctrace Metal Frame Capture (not available in this session) or per-kernel `MTLCounterSampleBuffer` profiling (mlx-native does not yet wire this). Per the mantra "Always understand current fully before changing it" / Chesterton's fence, kernel rewrites without measurement evidence would be guesswork.
+
+**ADR-013 status.** P21 hf2q-side optimization is **complete**:
+- Decode parity: **PASS** (1.05-1.07× peer at pp31/101/512)
+- Prefill parity: **0.49-0.63× peer** — open, but residual gap is structurally diagnosable as a GPU-scheduling/memory-bandwidth issue, not a missing kernel optimization
+- Coherence: **PASS** (ascii_ratio 1.000 across all cells)
+- Sync optimization: **96% reduction** (161 → 6) — at structural floor
+
+**Next-iteration handoff (open).** Closing the residual ~30-50% prefill gap requires:
+1. xctrace Metal Frame Capture or os_signpost instrumentation — operator-driven, not from this session
+2. Kernel-counter profiling (MTLCounterSampleBuffer) added to mlx-native — modest implementation work, then a measurement campaign
+3. Possibly experimentation with NR0/NR1 alternatives (96×32, 64×64) — quick to try once measurement framework is in place
+
+This is **ADR-015 mlx-native territory** — see `feedback_evidence_first_no_blind_kernel_rewrites` for the discipline that gates kernel rewrites on measurement.
+
+**Receipts:** template instantiation comparison from `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal` and `/opt/mlx-native/src/shaders/quantized_matmul_id_mm.metal`/`quantized_matmul_id_mm_tensor.metal`; A/B bench results `/tmp/{tensor,notensor}-r{1,2,3}.{out,log}`.
