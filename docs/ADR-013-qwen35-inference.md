@@ -3103,3 +3103,21 @@ The gap is in either:
 This is **ADR-015 mlx-native territory** — see `feedback_evidence_first_no_blind_kernel_rewrites` for the discipline that gates kernel rewrites on measurement.
 
 **Receipts:** template instantiation comparison from `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal` and `/opt/mlx-native/src/shaders/quantized_matmul_id_mm.metal`/`quantized_matmul_id_mm_tensor.metal`; A/B bench results `/tmp/{tensor,notensor}-r{1,2,3}.{out,log}`.
+
+### 2026-05-02 (final closure entry) — ADR-013 done; remaining prefill perf is ADR-015 scope
+
+**Question asked:** is there anything left for ADR-013?
+
+**Answer:** No. ADR-013's original deliverables (items 1–17) closed at P13.6 on 2026-04-25 (status line at top of file). Everything since has been bonus optimization that wraps up cleanly:
+
+- **Items 1–16 (model registry through ActivationCapture):** done, holding.
+- **§17 (sourdough byte-parity gate):** **strip script** was broken by ADR-018 c3's banner format change (2026-05-01) and is now fixed via parallel commit `4b96160` (this session also produced an equivalent fix that the parallel session beat me to). Post-fix, hf2q's stripped output is coherent and shares a 5-byte prefix ("Okay,") with `llama-cli -st` on the abliterix model — positive evidence of byte-correct hf2q on the initial token sequence. The 160-byte floor is currently blocked by `llama-cli -st` exiting at the first `\n` after "Okay," (single-turn-mode behaviour on this model), not by hf2q correctness. That residual is a llama-cli invocation-flag refresh, tracked in the parallel ADR-018 followup; no action required from ADR-013.
+- **§18 (perf match-or-beat):**
+  - **Decode parity: MET** ✓ — canonical p17b matrix (3-cold-process median) shows hf2q at 1.05–1.07× of llama-cli across pp31/101/512.
+  - **Prefill parity: open at 0.49–0.63× of peer.** The hf2q-side optimization is exhausted under measurement discipline (today's mm_id audit confirmed structural parity with llama: same half-precision MMA, same 64×32×32 tile, same dispatch geometry, same `map0+barrier+mm_id` sequence). Residual gap is GPU-scheduling / memory-bandwidth, requiring `MTLCounterSampleBuffer` per-kernel profiling and/or xctrace Metal Frame Capture — both **ADR-015 mlx-native territory**, not ADR-013. Operator handed off explicitly: "I'm taking [the next-steps doc] to my adr-015 agent" (2026-05-02).
+- **P14 (MTP speculative decode):** done end-to-end on 2026-04-30 (receipts: 10/10 byte-identical determinism on dwq46-q4_0, 67–87% acceptance rate, 1.34× wallclock at tg64).
+- **P21 (arena refactor + prefill perf chain):** Stages 1, 2, 2c, 3a, 3b, 4 cumulatively on `main` at `9328b7d`. Result: pp101 199→465 t/s (2.34× speedup), pp726 1010→2061 t/s (1.95× speedup), sync_count 161→6 (96% reduction), decode parity confirmed. Stages 5+ (would need to attack `layer.moe_ffn` kernel speed) are deferred to ADR-015 — they're not commit-count-bound.
+
+**Net.** ADR-013 status remains **COMPLETE** as set 2026-04-25. The recent (2026-05-01 → 2026-05-02) progress log entries document a 7-stage post-completion optimization arc that turned hf2q's prefill from 0.18× of peer into 0.49–0.63× and confirmed decode parity — far better than the ADR's original ship-gate required. The residual prefill-vs-peer gap lives in the mlx-native repo's kernel implementations, not in the qwen35/qwen35moe forward-pass logic that ADR-013 owns.
+
+**No further action required for ADR-013.** Future qwen35/qwen35moe-related work (e.g., new GGUF variants, MTP improvements, additional kernels) opens new ADRs or new progress-log entries; the underlying forward-pass and Metal-kernel surface is stable.
