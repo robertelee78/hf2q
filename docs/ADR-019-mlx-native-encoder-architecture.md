@@ -357,7 +357,7 @@ See §"Counter-Evidence Against Naïve Parallel-Encode" above. Five convergent s
 
 ### D4 (DEFERRED — pending Phase 0 microprototype) — Streaming Watermark
 
-**Shape:** continuous encoding into a "currently-active" CB. Commit + start-new-CB when the active CB hits a threshold (N dispatches encoded, M MB of buffer references retained, T µs since open). MLX framework's actual production scheduler shape (per PR #1864).
+**Shape:** continuous encoding into a "currently-active" CB. Commit + start-new-CB when the active CB hits a threshold (N dispatches encoded OR M MB of buffer references retained). MLX framework's actual production scheduler shape (per PR #1864 — verified at `mlx/backend/metal/device.cpp:445-522`; M-series Max uses N=50 ops / M=50 MB). **Doc correction (Phase 0a.2 research, 2026-05-03):** earlier ADR-019 drafts cited a third "T µs since open" time threshold; that trigger is NOT present in the merged MLX diff. Real MLX uses 2-param (op-count OR byte-budget) only. Receipt: `/tmp/cfa-adr019-phase0a2-research/design.md`.
 
 **Status revised post-Codex review (2026-05-03):** Codex Phase-2b cross-review flagged D4's outright rejection as "too categorical relative to the Apple/MLX evidence" (the apple-mlx-metal-2026 dossier identifies PR #1864's 50-op/50-MB scheduler as the closest Apple-blessed M-series reference). **D4 is NOT rejected — it is DEFERRED pending a Phase 0 microprototype that benchmarks D4-shape against D3-shape on the FA-path slice.**
 
@@ -443,6 +443,8 @@ Phased, gated, with parity per increment. Each phase ships behind its own env ga
 
 **Acceptance Phase 0a.2:** D4 microprototype must show wall reduction ≥ 60 ms above D3-projected on the FA-path slice (= 75% of AC-P1's 80 ms target × FA-path's ~16% of total wall = 9.6 ms minimum; using 60 ms as conservative ceiling) AND no parity regressions on FA-path canary fixture. If D4 fails this gate, D3 ships as planned. If D4 passes, D3 is dropped and D4 becomes new PRIMARY.
 
+**Phase 0a.2 design research COMPLETE 2026-05-02 (deep-researcher, hf2q):** No fatal counter-evidence against D4 — none of the five D2-rejection streams applies at high severity. MLX PR #1864 verified at source. **Critical finding: the 60 ms FA-slice-only acceptance threshold is structurally UNREACHABLE from CB overhead alone.** FA path has 40 non-blocking commits (`commit_labeled`, none `commit_and_wait`) costing 40 × 1.6 µs ≈ 0.064 ms in CB overhead; D4 would reduce FA path to ~3 CBs, saving ~0.059 ms — three orders of magnitude below the 60 ms threshold. Plausible 60 ms saving on FA-path requires `flush_residency_pending()` churn (encoder.rs:1842, 2004) to be material, which is currently unmeasured. **D3-projected FA-path savings range: 0.06–78 ms (gated on Phase 0a.1).** Recommended action: Phase 0a.2 microprototype DEFERRED until Phase 0a.1 xctrace lands; threshold to be recalibrated from actual residual attribution. If 0a.1 confirms ≥70% of the 530 ms residual is CB-overhead/residency, microprototype proceeds at 2 man-days (not 5-7); if residual is dominated by DN chunk-attn blocking syncs (90 × 1.32 ms ≈ 119 ms baseline), microprototype must expand to full chunk-engaged forward, not FA-slice-only. Receipt: `/tmp/cfa-adr019-phase0a2-research/design.md`.
+
 **Phase 0a.3 — MTLEvent cost calibration.** Microbench MTLEvent.signal/wait roundtrip on M5 Max. iter89b audit cited 100-500 ns / commit; iter63 inter-CB GPU pipeline-bubble cost is unmeasured. Need: per-CB MTLEvent cost, per-CB residency add/remove, per-CB driver commit overhead.
 
 **Acceptance Phase 0a.3:** all three microbench numbers documented with ± noise floor; AC-P4 sync_count target validated against measured event cost.
@@ -457,6 +459,8 @@ Phased, gated, with parity per increment. Each phase ships behind its own env ga
 **ETA Phase 0a:** 5-10 man-days operator + 3-5 man-days dev for microprototype = ~2 calendar weeks.
 
 **Phase 0a is the gate that authorizes Phase 0b.** If Phase 0a falsifies D3 in favor of D4, the Migration Plan below is rewritten before any structural code lands.
+
+**Sequencing update (post-Phase 0a.2 + 0a.3 research, 2026-05-02):** 0a.3 (microbench) and 0a.2 (design research) both LANDED; both converge on the same finding — the 530 ms `wall − GPU` residual is **NOT driver-commit dominated** (driver floor 13.3 µs/CB × 96 CBs = 1.3 ms = 0.25% of residual). The residual must be encoder-build, residency-flush, or inter-CB pipeline-bubble. **Phase 0a.1 (xctrace operator capture) is now critical-path** — it is the only remaining measurement that can bin the residual to one of those classes and authorize either D3-proceed or D4-revisit. Until 0a.1 lands, Phase 0a.2 microprototype implementation is HELD; Phase 0b EncoderSession is NOT authorized.
 
 ### Phase 0b — EncoderSession abstraction (PREREQUISITE)
 
