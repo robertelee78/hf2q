@@ -1571,7 +1571,10 @@ pub fn build_delta_net_layer(
                 &qkv_raw, &weights.ssm_conv1d, conv_state_in, conv_state_out,
                 &qkv_conv, &ssm_params_buf, ssm_conv_params,
             ).context("dispatch_ssm_conv ops3 prefill")?;
-            enc.commit_and_wait_labeled("layer.gdn.ops1-3").context("commit ops1-3 prefill")?;
+            // P21 Stage 3 hypothesis test: pooled scratches (qkv_raw/qkv_conv from
+            // pooled_alloc_buffer), no CPU read between this and ops5-9. Downgrade
+            // commit_and_wait → commit_labeled. If iter58b reproduces, revert.
+            enc.commit_labeled("layer.gdn.ops1-3");
             (x_norm, qkv_conv, z)
         };
         // conv_state_out now holds the updated conv state (caller swaps ping-pong).
@@ -1642,8 +1645,8 @@ pub fn build_delta_net_layer(
                 &params,
             )
             .map_err(|e| anyhow!("dispatch_qkv_split_f32 (W-5b.18): {e}"))?;
-            enc.commit_and_wait_labeled("layer.gdn.qkv_split")
-                .context("commit qkv_split (W-5b.18) prefill")?;
+            // P21 Stage 3 hypothesis test: pooled q/k/v scratches, no CPU read.
+            enc.commit_labeled("layer.gdn.qkv_split");
             (q_gpu, k_gpu, v_gpu)
         };
 
@@ -1859,7 +1862,9 @@ pub fn build_delta_net_layer(
                 &mut enc, registry, device, &gated_buf,
                 &weights.ssm_out, seq_len, z_channels, hidden_size,
             )?;
-            enc.commit_and_wait_labeled("layer.gdn.ops5-9").context("commit ops5-9 prefill")?;
+            // P21 Stage 3 hypothesis test: pooled scratches throughout ops5-9, no CPU read.
+            // Output is fed into next encoder (FFN) on same Metal serial queue.
+            enc.commit_labeled("layer.gdn.ops5-9");
             output
         };
         // state_out/conv_state_out now hold updated states (caller swaps ping-pong).
