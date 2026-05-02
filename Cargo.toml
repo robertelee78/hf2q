@@ -127,6 +127,17 @@ criterion = "0.5"
 regex = "1"
 tower = { version = "0.4", features = ["util"] }
 
+# 2026-05-02 — H1 structural-audit integration test, item (b) of the
+# decode-test-gap dossier (docs/research/decode-test-gap-2026-05-02.md).
+# Parses src/serve/**/*.rs and fails on any new fn-body-local
+# `const X: &[&str]` declaration — those are unreachable from `mod tests`
+# (Rust fn-body const is fn-local-scope) and were the load-bearing variable
+# in the same-day SPECIAL_TOKEN_STOPS 3-commit thrash. Features: `full`
+# enables Item::Const + Stmt::Item parsing; `visit` enables the AST walker
+# trait (gated separately in syn 2.x); `extra-traits` is for Debug/Eq
+# derivations on AST nodes used in error messages.
+syn = { version = "2", features = ["full", "extra-traits", "visit"] }
+
 # ADR-005 Phase 2a iter-133 (Iter A): Open WebUI multi-turn streaming chat E2E test.
 # The test spawns `hf2q serve` as a subprocess and drives `/v1/chat/completions`
 # with `stream: true`, so it needs a real HTTP client capable of consuming a
