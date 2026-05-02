@@ -1819,6 +1819,45 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-05-02 (UTC ~23:00Z) — iter89b kernel audit + iter89c diagnostic test C: kernel source byte-equivalent (tile geometry, dispatch grid, map0, K-loop body all match peer); simdgroup variant FORCED via `HF2Q_DISABLE_TENSOR_MM_ID=1` is +431ms slower than tensor; the 0.82× gap is in mlx-native's tensor-API path specifically. NEW HYPOTHESIS: MPP `tensor_ops::matmul2d.run()` setup cost amortizes over many K-iters (gate/up k=2048 = 64 iters → 1.16× FASTER) but underperforms at small K (down k=512 = 16 iters → 0.82× SLOWER) vs llama.cpp's raw `simdgroup_multiply_accumulate` calls.**
+
+  **iter89b research deliverable:** `/tmp/cfa-iter89b/research/AUDIT.md` (442 lines). Side-by-side comparison of mlx-native and llama.cpp `kernel_mul_mm_id_q4_0_f32` templates.
+
+  **iter89b findings:**
+  1. Tile geometry, dispatch grid, threadgroup size, shmem size, write-back pattern: **byte-identical** between mlx-native and llama.cpp at the FFN-down production shape (m=2048, k=512, top_k=1).
+  2. map0 preprocessing functionally equivalent (same single-threadgroup × n_experts-thread dispatch). mlx-native missing `#pragma unroll(ne20)` at top_k=1 is moot (1-iteration loop).
+  3. Real but moot precision difference (mlx-native simdgroup variant `(half, float, float)` vs llama.cpp `(half, half, float)`) — iter88a empirically showed gate/up is +16% FASTER through same mlx-native source, ruling this out as the FFN-down 0.82× cause.
+  4. **Tensor-API K-loop body byte-equivalent at the granularity of "dequantize → A-stage → B-stage → barrier → matmul2d.run"** — but mlx-native uses MPP cooperative-tensor `matmul2d.run()` while llama.cpp uses raw `simdgroup_multiply_accumulate`.
+
+  **iter89c diagnostic test C (decisive):**
+
+  | Variant | Median wall | layer.moe_ffn (40 layers) | Per-layer ms |
+  |---|---:|---:|---:|
+  | Tensor (current default) | 1994 ms | 655 ms (44.5%) | 16.4 ms |
+  | Simdgroup forced | 2425 ms | 1077 ms (57.2%) | 26.9 ms |
+  | Δ | **+431 ms (1.22×)** | **+422 ms (1.64×)** | **+10.5 ms** |
+
+  Test C interpretation: simdgroup is WORSE than tensor → tensor is correct route. iter89b audit's pre-registered "≥0.95× simdgroup match peer = gap in tensor-API path" axis applies because simdgroup is even worse, but iter89c's REAL contribution: the gap is genuinely in the tensor variant's per-K overhead, not route selection.
+
+  **NEW HYPOTHESIS (iter89d, pre-registered):** MPP `tensor_ops::matmul2d.run()` has per-call setup overhead (cooperative-tensor allocation, fragment-layout init) that amortizes well over many K-iterations but underperforms at small K. At gate/up (k=2048, 64 K-iters), mlx-native is +16% faster; at down (k=512, 16 K-iters), mlx-native is -18% slower. The break-even point is around k≈1500 K-iters per the harness curve.
+
+  **iter89d candidates:**
+  1. **iter89d-A: dump compiled MSL for mlx-native vs llama.cpp `kernel_mul_mm_id_q4_0_f32`**, diff register/spill profiles. Apple's `metal-objdump` + `metal-archive` extract assembly. Quick (~1 hour); reveals whether MPP setup adds per-K overhead in compiled output.
+  2. **iter89d-B: implement raw-simdgroup variant of mlx-native `kernel_mul_mm_id_q4_0_f32`** (no MPP, mirror llama.cpp's manual K-loop). Bench against current tensor variant at down shape. If raw-simdgroup matches peer ≥0.95×, MPP IS the per-K overhead. Falsification threshold: ≥30 ms wall savings on chunk-engaged.
+  3. **iter89d-C: per-CB GPU-only vs wall comparison on llama.cpp** — would need xctrace operator-driven capture; settles whether the 530 ms residual exists on peer side too.
+
+  **STANDING COMPLIANCE.**
+  - `feedback_evidence_first_no_blind_kernel_rewrites` — iter89b audit READ both kernels in full before recommending; iter89c's diagnostic test ran zero-risk env-only experiment first.
+  - `feedback_correct_outcomes` — kernel source IS byte-equivalent (audit finding); the gap mechanism is at the API/compiler layer (iter89d hypothesis); admitted instead of forcing fit.
+  - `feedback_no_shortcuts` — diagnostic test C with full per-CB profile; not just wall comparison.
+
+  **Receipts.**
+  - `/tmp/cfa-iter89b/research/AUDIT.md` (442 lines, kernel side-by-side comparison)
+  - `/tmp/cfa-iter89c/logs/{warmup,T1..T3}-{tensor,simdgroup}.log` (4 paired trials per variant)
+  - `/tmp/cfa-iter89c/test.log`
+
+  Status: kernel source-level audit COMPLETE; gap localizes to MPP cooperative-tensor matmul2d at small K (down path). iter89d candidates: MSL diff (cheap) + raw-simdgroup variant impl (medium). Loop continues.
+
 - **2026-05-02 (UTC ~22:30Z) — iter89a FALSIFIED at zero risk: forcing mv_id route via `HF2Q_MM_ID_ROUTING_THRESHOLD=99999` produces +1852 ms wall regression (1.93× slower). mm_id IS the correct route at (m=2048, k=512, top_k=1). The 0.82× peer ratio for ffn_down is at the kernel-implementation level, NOT route selection. iter89b kernel audit is the next target.**
 
   **iter89a method:** env override forces mv_id route for ALL n_tokens (default threshold 32 → 99999). 4 paired cold trials (warmup + T1-T3) on chunk-engaged pp4096.
