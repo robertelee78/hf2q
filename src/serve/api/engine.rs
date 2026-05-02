@@ -7730,6 +7730,440 @@ mod streaming_prompt_cache_replay_tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // ADR-005 Phase 4 iter C — `delta.reasoning_content` extractor
+    // unit-level closure tests (2026-05-01).
+    //
+    // The iter B-2 ToolCallSplitter LANDED in iter-219c (commit
+    // `94c0dbe`); the parallel iter C reasoning-content extractor was
+    // wired alongside it (W66/W67 path: ReasoningSplitter integrated
+    // into `generate_stream_once` + `replay_cached_streaming_response`,
+    // schema `ChunkDelta.reasoning_content` + `ChatMessage
+    // .reasoning_content` populated, SSE encoder routes on
+    // `DeltaKind::Reasoning` per Decision #21). The pre-existing
+    // `replay_emits_reasoning_then_content_when_reasoning_text_set`
+    // test exercises the **non-streaming-origin** cache entry shape
+    // (text post-split + `reasoning_text=Some(...)`); these tests
+    // close the **streaming-origin** branch (text contains embedded
+    // reasoning markers + `reasoning_text=None`) plus the
+    // reasoning + tool-call interleaving contract — both currently
+    // only exercised via the env-gated live test
+    // `tests/openwebui_reasoning.rs::openwebui_reasoning_streaming_scenario_3`,
+    // which is not part of the default `cargo test` baseline.
+    //
+    // Mantra alignment: no env-gating, no model-load, deterministic,
+    // sub-millisecond. Locks the iter C contract at every cargo test
+    // invocation so a regression in either splitter wiring or the
+    // mutual-exclusion of reasoning vs tool_calls (per OpenAI spec)
+    // surfaces loud at unit-test time, not at LIVE-test time.
+    // -----------------------------------------------------------------
+
+    /// Iter C streaming-origin shape: cache entry's `text` field carries
+    /// the **raw pre-split decoded stream** (markers and all) with
+    /// `reasoning_text=None`. The replay helper must run the cached text
+    /// through a fresh `ReasoningSplitter` and route the marker-bounded
+    /// span as `DeltaKind::Reasoning`, the rest as `DeltaKind::Content`.
+    ///
+    /// Marker pair: Qwen 3.5/3.6 `<think>` / `</think>` (registered
+    /// reasoning markers per `registry::QWEN35`).
+    #[test]
+    fn replay_routes_streaming_origin_reasoning_markers_to_reasoning_deltas() {
+        // Resolve a model-id that maps to QWEN35 registration so the
+        // splitter has reasoning markers + tool markers both registered.
+        let reg = match super::super::registry::find_for("qwen3.6-27b-dwq46") {
+            Some(r) => r,
+            None => {
+                eprintln!("qwen35 registration absent; skipping iter C streaming-origin test");
+                return;
+            }
+        };
+        // Sanity: the registration must have reasoning markers, else
+        // the test is degenerate.
+        assert!(
+            reg.has_reasoning(),
+            "iter C contract: qwen35 family MUST have reasoning markers \
+             registered; got open={:?} close={:?}",
+            reg.reasoning_open,
+            reg.reasoning_close,
+        );
+
+        // Streaming-origin cache shape: `text` carries the pre-split
+        // stream verbatim; `reasoning_text=None` because the LIVE
+        // splitter routed reasoning fragments into Reasoning deltas at
+        // decode time (no separately-tracked string to replay).
+        let cached_text = "<think>let me compute 2+2</think>The answer is 4.";
+        let cached = GenerationResult {
+            text: cached_text.into(),
+            reasoning_text: None,
+            prompt_tokens: 5,
+            completion_tokens: 12,
+            reasoning_tokens: None,
+            finish_reason: "stop",
+            prefill_duration: Duration::ZERO,
+            decode_duration: Duration::ZERO,
+            cached_tokens: 5,
+        };
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let res = replay_cached_streaming_response(
+            &cached,
+            Some(&reg),
+            ToolCallPolicy::Auto,
+            &tx,
+        );
+        assert!(res.is_ok(), "replay must succeed");
+        drop(tx);
+        let events = drain(&mut rx);
+
+        // Concat the deltas by kind. The splitter may emit each kind
+        // in one or more chunks (tail buffering across the marker
+        // boundary); contract is on the concatenated text + ordering.
+        let mut reasoning_concat = String::new();
+        let mut content_concat = String::new();
+        let mut first_reasoning_idx: Option<usize> = None;
+        let mut first_content_idx: Option<usize> = None;
+        for (i, ev) in events.iter().enumerate() {
+            match ev {
+                GenerationEvent::Delta { kind: DeltaKind::Reasoning, text } => {
+                    if first_reasoning_idx.is_none() {
+                        first_reasoning_idx = Some(i);
+                    }
+                    reasoning_concat.push_str(text);
+                }
+                GenerationEvent::Delta { kind: DeltaKind::Content, text } => {
+                    if first_content_idx.is_none() {
+                        first_content_idx = Some(i);
+                    }
+                    content_concat.push_str(text);
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            reasoning_concat, "let me compute 2+2",
+            "reasoning slot must capture body between <think>...</think> markers \
+             (markers themselves swallowed); got events: {events:?}"
+        );
+        assert_eq!(
+            content_concat, "The answer is 4.",
+            "content slot must capture post-marker text only; got events: {events:?}"
+        );
+        // Decision #21 ordering: reasoning streams BEFORE content for
+        // Open WebUI's panel UX.
+        assert!(
+            first_reasoning_idx < first_content_idx,
+            "iter C ordering contract violated: reasoning must precede content \
+             in event stream; reasoning_idx={first_reasoning_idx:?}, \
+             content_idx={first_content_idx:?}, events={events:?}"
+        );
+        // No raw markers leak.
+        for marker in &["<think>", "</think>"] {
+            assert!(
+                !reasoning_concat.contains(marker),
+                "splitter regression: reasoning slot contains raw marker {marker:?}"
+            );
+            assert!(
+                !content_concat.contains(marker),
+                "splitter regression: content slot contains raw marker {marker:?}"
+            );
+        }
+        // Last event is Done.
+        assert!(
+            matches!(events.last(), Some(GenerationEvent::Done { .. })),
+            "Done must be terminal event; got events: {events:?}"
+        );
+    }
+
+    /// Iter C edge case: only reasoning, no post-reasoning content.
+    /// Some thinking-mode prompts result in `<think>...</think>` followed
+    /// by EOS — the answer is implicit in the reasoning. The replay must
+    /// emit reasoning, no content delta, then Done.
+    #[test]
+    fn replay_streaming_origin_pure_reasoning_no_content() {
+        let reg = match super::super::registry::find_for("qwen3.6-27b-dwq46") {
+            Some(r) => r,
+            None => {
+                eprintln!("qwen35 registration absent; skipping iter C pure-reasoning test");
+                return;
+            }
+        };
+        if !reg.has_reasoning() {
+            return;
+        }
+
+        let cached_text = "<think>only thinking</think>";
+        let cached = GenerationResult {
+            text: cached_text.into(),
+            reasoning_text: None,
+            prompt_tokens: 3,
+            completion_tokens: 4,
+            reasoning_tokens: None,
+            finish_reason: "stop",
+            prefill_duration: Duration::ZERO,
+            decode_duration: Duration::ZERO,
+            cached_tokens: 3,
+        };
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let res = replay_cached_streaming_response(
+            &cached,
+            Some(&reg),
+            ToolCallPolicy::Auto,
+            &tx,
+        );
+        assert!(res.is_ok());
+        drop(tx);
+        let events = drain(&mut rx);
+
+        let reasoning_concat: String = events
+            .iter()
+            .filter_map(|e| match e {
+                GenerationEvent::Delta { kind: DeltaKind::Reasoning, text } => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let content_concat: String = events
+            .iter()
+            .filter_map(|e| match e {
+                GenerationEvent::Delta { kind: DeltaKind::Content, text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(reasoning_concat, "only thinking");
+        assert_eq!(
+            content_concat, "",
+            "pure-reasoning input must NOT emit any content delta; got events: {events:?}"
+        );
+        assert!(matches!(events.last(), Some(GenerationEvent::Done { .. })));
+    }
+
+    /// Iter C + iter B-2 interleaving: a reasoning span FOLLOWED BY a
+    /// tool-call span must route into `Reasoning` deltas, then `Content`
+    /// deltas (preamble post-reasoning), then `ToolCallDelta` events for
+    /// the tool-call span — the OpenAI spec mandates `reasoning_content`
+    /// and `tool_calls` are mutually exclusive on the same delta chunk.
+    /// This locks in the composition contract: ReasoningSplitter runs
+    /// FIRST, the Content-classified output then flows through
+    /// ToolCallSplitter.
+    ///
+    /// Uses Qwen 3.5/3.6 markers so both reasoning + tool-call markers
+    /// are present in the registration: reasoning `<think>`/`</think>`,
+    /// tool-call `<tool_call>`/`</tool_call>`.
+    #[test]
+    fn replay_routes_reasoning_then_tool_call_in_correct_order() {
+        let reg = match super::super::registry::find_for("qwen3.6-27b-dwq46") {
+            Some(r) => r,
+            None => {
+                eprintln!("qwen35 registration absent; skipping iter C+B-2 interleave test");
+                return;
+            }
+        };
+        if !reg.has_reasoning() {
+            return;
+        }
+        let (open, close) = match (reg.tool_open, reg.tool_close) {
+            (Some(o), Some(c)) => (o, c),
+            _ => {
+                eprintln!("qwen35 has no tool markers; skipping interleave test");
+                return;
+            }
+        };
+
+        // Streaming-origin shape: full pre-split stream including BOTH
+        // reasoning markers AND tool-call markers. Body shape doesn't
+        // need to parse as a real tool call — the assertion is on
+        // event-class ordering (Reasoning → Content → ToolCallDelta-or-
+        // Content-fallback → Done), not on parser outcome.
+        let cached_text = format!(
+            "<think>I should call the weather tool</think>Let me check. \
+             {open}<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>{close}"
+        );
+        let cached = GenerationResult {
+            text: cached_text,
+            reasoning_text: None,
+            prompt_tokens: 6,
+            completion_tokens: 20,
+            reasoning_tokens: None,
+            finish_reason: "stop",
+            prefill_duration: Duration::ZERO,
+            decode_duration: Duration::ZERO,
+            cached_tokens: 6,
+        };
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let res = replay_cached_streaming_response(
+            &cached,
+            Some(&reg),
+            ToolCallPolicy::Auto,
+            &tx,
+        );
+        assert!(res.is_ok());
+        drop(tx);
+        let events = drain(&mut rx);
+
+        // Find the index of the FIRST event of each kind.
+        let first_reasoning_idx = events.iter().position(|e| matches!(
+            e,
+            GenerationEvent::Delta { kind: DeltaKind::Reasoning, .. }
+        ));
+        let first_content_idx = events.iter().position(|e| matches!(
+            e,
+            GenerationEvent::Delta { kind: DeltaKind::Content, .. }
+        ));
+        let first_tool_call_idx = events.iter().position(|e| matches!(
+            e,
+            GenerationEvent::ToolCallDelta { .. }
+        ));
+
+        // Reasoning MUST appear; it's unconditional in this fixture.
+        let r_idx = first_reasoning_idx.unwrap_or_else(|| {
+            panic!(
+                "iter C interleave contract: reasoning delta MUST be emitted \
+                 for input containing <think>...</think>; got events: {events:?}"
+            )
+        });
+        // Content MUST appear (the "Let me check. " preamble between
+        // </think> and the tool-call open marker).
+        let c_idx = first_content_idx.unwrap_or_else(|| {
+            panic!(
+                "iter C interleave contract: content delta MUST be emitted for \
+                 the post-reasoning preamble; got events: {events:?}"
+            )
+        });
+
+        // Decision #21 ordering: reasoning before content.
+        assert!(
+            r_idx < c_idx,
+            "iter C ordering: reasoning ({r_idx}) MUST precede content ({c_idx}); \
+             events: {events:?}"
+        );
+
+        // If a ToolCallDelta fired (the body parsed under Auto), it MUST
+        // come AFTER the reasoning AND after the first content delta —
+        // it cannot interleave inside the reasoning span (otherwise the
+        // ReasoningSplitter→ToolCallSplitter composition is broken).
+        if let Some(t_idx) = first_tool_call_idx {
+            assert!(
+                r_idx < t_idx,
+                "iter C+B-2 composition: reasoning ({r_idx}) MUST precede \
+                 tool-call delta ({t_idx}); the ReasoningSplitter runs FIRST \
+                 in the engine pipeline. events: {events:?}"
+            );
+            assert!(
+                c_idx < t_idx,
+                "iter C+B-2 composition: post-reasoning content ({c_idx}) MUST \
+                 precede tool-call delta ({t_idx}); events: {events:?}"
+            );
+        }
+
+        // OpenAI spec: NO single delta event may carry BOTH
+        // reasoning_content AND tool_calls. The Rust enum makes this
+        // structurally impossible at the GenerationEvent level — Reasoning
+        // deltas are `GenerationEvent::Delta { kind: Reasoning, ... }`,
+        // tool deltas are `GenerationEvent::ToolCallDelta { ... }` —
+        // distinct variants, both encode through `sse.rs:166-247` into
+        // separate JSON chunks. Lock in by asserting NO ToolCallDelta
+        // appears at an index ≤ the last Reasoning delta index.
+        let last_reasoning_idx = events
+            .iter()
+            .rposition(|e| matches!(e, GenerationEvent::Delta { kind: DeltaKind::Reasoning, .. }));
+        if let (Some(lr), Some(t)) = (last_reasoning_idx, first_tool_call_idx) {
+            assert!(
+                lr < t,
+                "OpenAI spec: tool-call delta MUST NOT precede or interleave \
+                 with the reasoning span; last_reasoning={lr}, first_tool_call={t}, \
+                 events: {events:?}"
+            );
+        }
+
+        // Last event is Done.
+        assert!(
+            matches!(events.last(), Some(GenerationEvent::Done { .. })),
+            "Done must terminate stream; events: {events:?}"
+        );
+    }
+
+    /// Iter C non-streaming-origin replay: when the cache entry was
+    /// stored from a non-streaming completion (`reasoning_text=Some(...)`,
+    /// `text` post-split), the replay must FIRST emit the explicit
+    /// reasoning_text as a Reasoning delta, then route `text` (which
+    /// contains NO reasoning markers because they were stripped at
+    /// store time) through the splitter as Content. Companion to the
+    /// existing `replay_emits_reasoning_then_content_when_reasoning_text_set`
+    /// test, but locks in that the **registered model's** ReasoningSplitter
+    /// does NOT mistakenly re-classify post-split `text` as containing
+    /// reasoning (would cause double-emit).
+    #[test]
+    fn replay_nonstreaming_origin_does_not_double_emit_reasoning() {
+        let reg = match super::super::registry::find_for("qwen3.6-27b-dwq46") {
+            Some(r) => r,
+            None => {
+                eprintln!("qwen35 registration absent; skipping iter C double-emit test");
+                return;
+            }
+        };
+        if !reg.has_reasoning() {
+            return;
+        }
+
+        // Non-streaming-origin shape: post-split text + explicit
+        // reasoning_text. Critically, `text` does NOT contain reasoning
+        // markers (they were stripped by `split_full_output` at store
+        // time). If the splitter mistakenly re-runs and finds nothing,
+        // text routes cleanly as Content; if a regression caused it to
+        // partially match, we'd see double-emit.
+        let cached = cached_non_streaming(
+            "The final answer is 42.",
+            Some("step 1: parse problem; step 2: compute"),
+        );
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let res = replay_cached_streaming_response(
+            &cached,
+            Some(&reg),
+            ToolCallPolicy::Auto,
+            &tx,
+        );
+        assert!(res.is_ok());
+        drop(tx);
+        let events = drain(&mut rx);
+
+        // Concat by kind.
+        let reasoning_concat: String = events
+            .iter()
+            .filter_map(|e| match e {
+                GenerationEvent::Delta { kind: DeltaKind::Reasoning, text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        let content_concat: String = events
+            .iter()
+            .filter_map(|e| match e {
+                GenerationEvent::Delta { kind: DeltaKind::Content, text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // Reasoning emitted EXACTLY ONCE — single emission of the
+        // stored reasoning_text, not duplicated by a stray splitter
+        // match on post-split text.
+        assert_eq!(
+            reasoning_concat, "step 1: parse problem; step 2: compute",
+            "non-streaming-origin: reasoning_text must be emitted verbatim, \
+             ONCE. events: {events:?}"
+        );
+        assert_eq!(
+            content_concat, "The final answer is 42.",
+            "non-streaming-origin: post-split text must route cleanly as Content. \
+             events: {events:?}"
+        );
+        assert!(matches!(events.last(), Some(GenerationEvent::Done { .. })));
+    }
+
     /// Wave 3.5 HIGH-2 — drain the ReasoningSplitter tail too.
     ///
     /// Cached text contains reasoning markers + a short tail of
