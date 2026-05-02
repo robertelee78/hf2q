@@ -1700,6 +1700,50 @@ impl Qwen35Model {
             None
         };
 
+        // ---- ADR-015 iter78: ChunkAllocsArena allocation ----
+        //
+        // Allocated ONCE per prefill, sized for the actual prompt length
+        // and DN chunk shape (n_v_heads, d_k, d_v). Reused across all DN
+        // (LinearAttn) layers in the loop below — every per-layer
+        // `apply_gated_delta_net_chunk_with_arena` call substitutes the 7
+        // chunk-internal scratches (q_expanded, k_expanded, q_bf16,
+        // k_bf16, v_bf16, g_log_decay, o_bf16) for caller-owned arena
+        // slots. Same lifetime contract + iter58b residency-rescission
+        // protection as DnPrefillArena above.
+        //
+        // Skip when seq_len == 1 (decode): the chunk path is never
+        // engaged for single-token decode (`chunk_path_eligible` requires
+        // `seq_len > 64 && seq_len % 64 == 0`).
+        //
+        // Skip when the model has no LinearAttn (DN) layers, OR when the
+        // chunk path predicate fails for this prefill. The arena allocation
+        // is cheap (~270 MB at apex pp4096) and the chunk_path_eligible
+        // predicate is checked dynamically per-layer inside
+        // `build_delta_net_layer_with_arena`, so we conditionally allocate
+        // only when at least one DN layer is present.
+        //
+        // Memory footprint at apex 35B-A3B q4_0-flat pp4096 with the
+        // typical DN shape (n_v_heads, d_k, d_v) drawn from the GGUF
+        // config — sums to ~270 MB across the 7 slots, well within M5
+        // Max 128 GB unified memory.
+        let mut chunk_allocs_arena: Option<super::ChunkAllocsArena> = if seq_len > 1
+            && layer_weights_gpu.iter().any(|l| matches!(l, LayerWeightsGpu::LinearAttn { .. }))
+        {
+            let dn_shape = DeltaNetLayerShape::from_config(cfg);
+            Some(
+                super::ChunkAllocsArena::new(
+                    &device,
+                    seq_len,
+                    dn_shape.n_v_heads,
+                    dn_shape.d_k,
+                    dn_shape.d_v,
+                )
+                .context("alloc ChunkAllocsArena")?,
+            )
+        } else {
+            None
+        };
+
         // ---- Step 2: per-layer forward pass ----
         let decode_profile = std::env::var("HF2Q_DECODE_PROFILE").is_ok();
         let mut total_attn_us = 0u64;
@@ -1906,6 +1950,7 @@ impl Qwen35Model {
                             state_in_ref,
                             state_out_ref,
                             arena,
+                            chunk_allocs_arena.as_mut(),
                             seq_len,
                             shape.hidden_size,
                             shape.n_k_heads,
