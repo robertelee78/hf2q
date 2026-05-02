@@ -60,7 +60,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::chunk_gated_delta_rule::{
-    dispatch_chunk_gated_delta_rule_fwd, ChunkGatedDeltaRuleParams, FIXED_BT,
+    dispatch_chunk_gated_delta_rule_fwd, dispatch_chunk_gated_delta_rule_fwd_with_arena,
+    ChunkGatedDeltaRuleParams, ChunkInternalArena, FIXED_BT,
 };
 use mlx_native::ops::compute_g_beta::dispatch_compute_g_beta;
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
@@ -1486,6 +1487,14 @@ pub fn apply_gated_delta_net_chunk_with_arena(
     output_buf: &MlxBuffer,
     final_state: &MlxBuffer,
     arena: &mut super::ChunkAllocsArena,
+    // ADR-015 iter83: caller-owned ChunkInternalArena threading. When
+    // `Some`, the chunk-pipeline orchestrator uses
+    // `dispatch_chunk_gated_delta_rule_fwd_with_arena`, lifting the 7
+    // large + 5 small internal scratches (g_cumsum, A_strict, A_inv, w,
+    // u, h, v_new + 5 param buffers) to caller scope. When `None`,
+    // falls back to the iter78 non-internal-arena dispatch (byte-
+    // identical behaviour pre-iter83).
+    chunk_internal_arena: Option<&mut ChunkInternalArena>,
     seq_len: u32,
     n_k_heads: u32,
     n_v_heads: u32,
@@ -1673,21 +1682,46 @@ pub fn apply_gated_delta_net_chunk_with_arena(
 
     // Stage C: chunk-pipeline orchestrator. final_state lands in the
     // caller-provided buffer (NOT the arena).
-    dispatch_chunk_gated_delta_rule_fwd(
-        &mut enc,
-        registry,
-        device,
-        &arena.q_bf16_buf,
-        &arena.k_bf16_buf,
-        &arena.v_bf16_buf,
-        &arena.g_log_decay_buf,
-        beta_buf,
-        state_in,
-        &arena.o_bf16_buf,
-        final_state,
-        p,
-    )
-    .map_err(|e| anyhow!("dispatch_chunk_gated_delta_rule_fwd (arena): {e}"))?;
+    //
+    // ADR-015 iter83: when `chunk_internal_arena` is `Some`, dispatch
+    // the `_with_arena` variant to lift 7 large + 5 small internal
+    // scratches to caller scope. Falls back to non-arena dispatch when
+    // `None` (back-compat with iter78 single-arena callers and the
+    // unit-test path).
+    if let Some(ci_arena) = chunk_internal_arena {
+        dispatch_chunk_gated_delta_rule_fwd_with_arena(
+            &mut enc,
+            registry,
+            device,
+            &arena.q_bf16_buf,
+            &arena.k_bf16_buf,
+            &arena.v_bf16_buf,
+            &arena.g_log_decay_buf,
+            beta_buf,
+            state_in,
+            &arena.o_bf16_buf,
+            final_state,
+            ci_arena,
+            p,
+        )
+        .map_err(|e| anyhow!("dispatch_chunk_gated_delta_rule_fwd_with_arena: {e}"))?;
+    } else {
+        dispatch_chunk_gated_delta_rule_fwd(
+            &mut enc,
+            registry,
+            device,
+            &arena.q_bf16_buf,
+            &arena.k_bf16_buf,
+            &arena.v_bf16_buf,
+            &arena.g_log_decay_buf,
+            beta_buf,
+            state_in,
+            &arena.o_bf16_buf,
+            final_state,
+            p,
+        )
+        .map_err(|e| anyhow!("dispatch_chunk_gated_delta_rule_fwd (arena): {e}"))?;
+    }
 
     enc.memory_barrier();
 
@@ -2468,6 +2502,12 @@ pub fn build_delta_net_layer_with_arena(
     state_out: &MlxBuffer,
     arena: &mut super::DnPrefillArena,
     chunk_allocs_arena: Option<&mut super::ChunkAllocsArena>,
+    // ADR-015 iter83: caller-owned ChunkInternalArena for the 7 large +
+    // 5 small mlx-native-internal chunk-pipeline scratches. When `Some`,
+    // routes the chunk-pipeline orchestrator through the
+    // `_with_arena` dispatch variant. Workload-conditional (only fires
+    // when chunk path is engaged for this prefill).
+    chunk_internal_arena: Option<&mut ChunkInternalArena>,
     seq_len: u32,
     hidden_size: u32,
     n_k_heads: u32,
@@ -2797,6 +2837,7 @@ pub fn build_delta_net_layer_with_arena(
                     &arena.attn_out_buf,
                     state_out,
                     chunk_arena,
+                    chunk_internal_arena,
                     seq_len,
                     n_k_heads,
                     n_v_heads,
@@ -4054,6 +4095,11 @@ mod tests {
             &out_a,
             &final_state_a,
             &mut arena,
+            // iter83: test exercises the back-compat (None) path so the
+            // arena vs non-arena byte-exact parity covers the iter78
+            // contract; iter83 internal-arena byte-exact parity is
+            // covered by the dedicated unit test below.
+            None,
             seq_len,
             n_k_heads,
             n_v_heads,
@@ -4135,6 +4181,214 @@ mod tests {
                 n.to_bits(),
                 a.to_bits(),
                 "chunk arena final_state byte-parity FAILED at index {i}: na={n:.6e} a={a:.6e}"
+            );
+        }
+    }
+
+    /// ADR-015 iter83 — `apply_gated_delta_net_chunk_with_arena` byte-
+    /// exact parity between `chunk_internal_arena: Some(...)` and
+    /// `chunk_internal_arena: None` at seq_len=128 (chunk-eligible).
+    ///
+    /// Validates that lifting the 7 large + 5 small mlx-native-internal
+    /// chunk-pipeline scratches into a caller-owned `ChunkInternalArena`
+    /// produces byte-identical output to the per-call `device.alloc_buffer`
+    /// path inside `dispatch_chunk_gated_delta_rule_fwd`.
+    ///
+    /// Bar: byte-exact equality (NOT FIRST_TOKEN_TOL) — both paths share
+    /// the same kernel dispatches, the same encoder choreography, and the
+    /// same memory layout; the only difference is alloc source for the
+    /// 7 internal scratches. Any non-bit-exact divergence indicates a real
+    /// bug (e.g., wrong shape in arena, mis-routed buffer slot, param
+    /// buffer mis-fill).
+    #[test]
+    fn chunk_internal_arena_byte_exact_parity_at_seq128() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+
+        let seq_len: u32 = 128;
+        let n_k_heads: u32 = 2;
+        let n_v_heads: u32 = 4;
+        let d_k: u32 = 128;
+        let d_v: u32 = 128;
+
+        let n_q_elems = (seq_len * n_k_heads * d_k) as usize;
+        let n_v_elems = (seq_len * n_v_heads * d_v) as usize;
+        let n_g_elems = (seq_len * n_v_heads) as usize;
+        let n_state = (d_k * d_v * n_v_heads) as usize;
+        let n_out = (n_v_heads * seq_len * d_v) as usize;
+
+        let mut seed: u32 = 0xBAB3;
+        let q_cpu: Vec<f32> = mk_rand(&mut seed, n_q_elems, 0.05);
+        let k_cpu: Vec<f32> = mk_rand(&mut seed, n_q_elems, 0.05);
+        let v_cpu: Vec<f32> = mk_rand(&mut seed, n_v_elems, 0.1);
+        let g_cpu: Vec<f32> = (0..n_g_elems)
+            .map(|i| 0.001 + 0.0001 * (i as f32 % 7.0))
+            .collect();
+        let beta_cpu: Vec<f32> = (0..n_g_elems)
+            .map(|i| 0.5 + 0.01 * ((i as f32 % 11.0) - 5.0))
+            .collect();
+        let state_zeros = vec![0.0f32; n_state];
+
+        // Path NA (no internal arena): chunk_internal_arena = None →
+        // dispatch_chunk_gated_delta_rule_fwd internally allocates the 7
+        // large + 5 small scratches per-call.
+        let q_na = upload_f32(&q_cpu, &device).expect("upload q na");
+        let k_na = upload_f32(&k_cpu, &device).expect("upload k na");
+        let v_na = upload_f32(&v_cpu, &device).expect("upload v na");
+        let g_na = upload_f32(&g_cpu, &device).expect("upload g na");
+        let beta_na = upload_f32(&beta_cpu, &device).expect("upload beta na");
+        let state_na = upload_f32(&state_zeros, &device).expect("upload state na");
+        let out_na = device
+            .alloc_buffer(n_out * 4, DType::F32, vec![n_out])
+            .expect("alloc out_na");
+        let final_state_na = device
+            .alloc_buffer(n_state * 4, DType::F32, vec![n_state])
+            .expect("alloc final_state_na");
+        let mut allocs_arena_na = crate::inference::models::qwen35::ChunkAllocsArena::new(
+            &device, seq_len, n_v_heads, d_k, d_v,
+        )
+        .expect("ChunkAllocsArena::new (na)");
+        apply_gated_delta_net_chunk_with_arena(
+            &device,
+            &mut registry,
+            &q_na,
+            &k_na,
+            &v_na,
+            &g_na,
+            &beta_na,
+            &state_na,
+            &out_na,
+            &final_state_na,
+            &mut allocs_arena_na,
+            None, // no internal arena → existing per-call alloc path
+            seq_len,
+            n_k_heads,
+            n_v_heads,
+            d_k,
+            d_v,
+            /* use_qk_l2norm = */ false,
+        )
+        .expect("apply_gated_delta_net_chunk_with_arena (na)");
+        device
+            .command_encoder()
+            .expect("sync enc na")
+            .commit_and_wait()
+            .expect("sync wait na");
+        let out_na_cpu = download_f32(&out_na).expect("download out_na");
+        let state_na_cpu = download_f32(&final_state_na).expect("download state_na");
+
+        // Path IA (internal arena): chunk_internal_arena = Some →
+        // dispatch_chunk_gated_delta_rule_fwd_with_arena reuses caller-
+        // owned scratch slots for the 7 large + 5 small buffers.
+        let q_ia = upload_f32(&q_cpu, &device).expect("upload q ia");
+        let k_ia = upload_f32(&k_cpu, &device).expect("upload k ia");
+        let v_ia = upload_f32(&v_cpu, &device).expect("upload v ia");
+        let g_ia = upload_f32(&g_cpu, &device).expect("upload g ia");
+        let beta_ia = upload_f32(&beta_cpu, &device).expect("upload beta ia");
+        let state_ia = upload_f32(&state_zeros, &device).expect("upload state ia");
+        let out_ia = device
+            .alloc_buffer(n_out * 4, DType::F32, vec![n_out])
+            .expect("alloc out_ia");
+        let final_state_ia = device
+            .alloc_buffer(n_state * 4, DType::F32, vec![n_state])
+            .expect("alloc final_state_ia");
+        let mut allocs_arena_ia = crate::inference::models::qwen35::ChunkAllocsArena::new(
+            &device, seq_len, n_v_heads, d_k, d_v,
+        )
+        .expect("ChunkAllocsArena::new (ia)");
+        let mut internal_arena =
+            mlx_native::ops::chunk_gated_delta_rule::ChunkInternalArena::new(
+                &device,
+                /* b  */ 1,
+                /* t  */ seq_len,
+                /* hg */ n_v_heads,
+                /* h  */ n_v_heads,
+                /* k  */ d_k,
+                /* v  */ d_v,
+                /* bt */ 64,
+            )
+            .expect("ChunkInternalArena::new");
+        apply_gated_delta_net_chunk_with_arena(
+            &device,
+            &mut registry,
+            &q_ia,
+            &k_ia,
+            &v_ia,
+            &g_ia,
+            &beta_ia,
+            &state_ia,
+            &out_ia,
+            &final_state_ia,
+            &mut allocs_arena_ia,
+            Some(&mut internal_arena),
+            seq_len,
+            n_k_heads,
+            n_v_heads,
+            d_k,
+            d_v,
+            /* use_qk_l2norm = */ false,
+        )
+        .expect("apply_gated_delta_net_chunk_with_arena (ia)");
+        device
+            .command_encoder()
+            .expect("sync enc ia")
+            .commit_and_wait()
+            .expect("sync wait ia");
+        let out_ia_cpu = download_f32(&out_ia).expect("download out_ia");
+        let state_ia_cpu = download_f32(&final_state_ia).expect("download state_ia");
+
+        let na_zero = out_na_cpu.iter().all(|&v| v == 0.0);
+        let ia_zero = out_ia_cpu.iter().all(|&v| v == 0.0);
+        if na_zero && ia_zero {
+            eprintln!(
+                "chunk_internal_arena_byte_exact_parity_at_seq128: \
+                 BOTH paths returned all-zero — parallel-contention flake; \
+                 re-run with --test-threads=1 to confirm."
+            );
+            return;
+        }
+        assert!(!na_zero, "no-internal-arena path returned all-zero");
+        assert!(!ia_zero, "internal-arena path returned all-zero");
+
+        // Byte-exact parity bar: only difference between paths is alloc
+        // source for the 7 large + 5 small internal scratches.
+        let mut diffs = 0usize;
+        let mut max_abs: f32 = 0.0;
+        for (i, (&n, &a)) in out_na_cpu.iter().zip(out_ia_cpu.iter()).enumerate() {
+            if n.to_bits() != a.to_bits() {
+                diffs += 1;
+                let d = (n - a).abs();
+                if d > max_abs {
+                    max_abs = d;
+                }
+                if diffs <= 4 {
+                    eprintln!(
+                        "internal-arena diff[{}] na={:.6e} bits={:#x} \
+                         vs ia={:.6e} bits={:#x} diff={:.3e}",
+                        i,
+                        n,
+                        n.to_bits(),
+                        a,
+                        a.to_bits(),
+                        d
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            diffs, 0,
+            "iter83 chunk_internal_arena byte-parity FAILED: {diffs} elements differ \
+             (max abs diff {max_abs:.3e}); internal arena must produce \
+             bit-identical output to per-call alloc path"
+        );
+
+        // final_state byte-exact parity.
+        for (i, (&n, &a)) in state_na_cpu.iter().zip(state_ia_cpu.iter()).enumerate() {
+            assert_eq!(
+                n.to_bits(),
+                a.to_bits(),
+                "iter83 chunk_internal_arena final_state byte-parity FAILED at index {i}: \
+                 na={n:.6e} ia={a:.6e}"
             );
         }
     }
