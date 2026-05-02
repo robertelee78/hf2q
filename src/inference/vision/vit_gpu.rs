@@ -2489,14 +2489,25 @@ pub fn compute_vision_embeddings_gpu_dispatch(
     // startup. The wiring exists so 4c.5's gate flip lands without
     // re-touching the dispatch.
     if matches!(arch, super::mmproj::ArchProfile::Qwen3VlSiglip) {
-        // Sub-iter 4c.2 will source `num_position_embeddings` from
-        // `mmproj_weights.position_embd_weight()?.shape()[0]`. The 4c.1
-        // stub never reads it, but we must construct the config so the
-        // delegation surface is byte-stable across sub-iters.
-        // Until then we use a sentinel that fails loudly if the stub
-        // ever stops returning Err — sentinel = 1 keeps `from_mmproj`
-        // happy (>0) and any non-stub use will mis-compute and surface.
-        let num_position_embeddings: u32 = 1;
+        // Sub-iter 4c.2 closure: `num_position_embeddings` is sourced
+        // from the loaded `v.position_embd.weight` tensor's outer
+        // (count) axis. ggml stores the table as
+        // `(n_embd, count)` column-major (`pos_embd->ne[1] = count`,
+        // per `clip.cpp:272-289` `clip_graph::resize_position_embeddings`);
+        // hf2q's `mlx_native::gguf::GgufFile` parser at
+        // `mod.rs:861` reverses the dim order so the row-major view is
+        // `[count, n_embd]` → `shape()[0] = count`. The 4c.1 sentinel
+        // `num_position_embeddings = 1` is replaced here per Codex
+        // Phase-2b drift-trap closure.
+        let num_position_embeddings: u32 = mmproj_weights
+            .position_embd_weight()
+            .map_err(|e| {
+                anyhow!(
+                    "compute_vision_embeddings_gpu_dispatch (Qwen3VlSiglip): \
+                     v.position_embd.weight required for shape extraction: {e}"
+                )
+            })?
+            .shape()[0] as u32;
         let cfg = super::vit_gpu_qwen3vl::Qwen3VlViTConfig::from_mmproj(
             mmproj_cfg,
             num_position_embeddings,
