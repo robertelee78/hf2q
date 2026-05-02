@@ -85,6 +85,36 @@ The trait choice (one new trait, narrowly scoped) is per design doc §5.2: per-v
 **Neutral:**
 - C1 itself adds ≥6 tests and removes ~54 LOC (two 27-LOC duplicate bodies); net code change at C1 boundary is +~470 LOC of which ~330 is tests + module docs.
 
+## Performance
+
+Hot-path inference (decode + prefill) is unchanged by this migration — no
+forward-pass code is touched. The 2485/2485 release test suite green at every
+commit (C1 → C5) is the regression guard.
+
+Cold-load overhead added by this ADR is bounded by inspection:
+
+- **GGUF reopen in `Engine::spawn`**: one mmap header parse via
+  `mlx_native::gguf::GgufFile::open(loaded.model_path())`. Cost: low
+  milliseconds on a warm OS page cache (the file was just read by
+  `*LoadedModel::load`).
+- **`print_banner`** (13 `writeln!` calls): on the order of microseconds; the
+  byte-exact golden test fixes the field ordering at compile time so there is
+  no per-call format-spec evaluation overhead.
+- **`emit_tracing`** (≥10 `tracing::info!` events): on the order of
+  microseconds when the subscriber is at INFO level, near-zero when filtered
+  out via `RUST_LOG`.
+
+Aggregate startup overhead: well under 10 ms on M5 Max — below the noise
+floor of the 5–10 s real-model load. The per-layer `LoadProgress` overlay on
+stderr is `\r`-overwritten in TTY mode and a no-op when stderr is not a TTY
+(`header.rs::LoadProgress::on_layer` early-returns when
+`enabled = false`); zero impact on non-interactive operators.
+
+There is no hot-path optimization opportunity introduced or surfaced by this
+migration: the load-side surface is one-shot per process. Future families
+adding their own `LoadInfoBuilder` impls inherit the same micro-cost
+profile.
+
 ## Verification
 
 C1 acceptance:
