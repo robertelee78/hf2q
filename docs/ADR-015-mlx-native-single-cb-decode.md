@@ -7,7 +7,7 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
-## ▶ Resume Here — current state of truth (2026-05-02 ~00:25Z, hf2q-side EXHAUSTED at two layers: matmul kernel optimal (4-iter convergence) + encoder coalescence DN path ≤0.30pp ceiling (iter66b audit); 93.2% of remaining prefill GPU time is in OTHER mlx-native kernels — gdn.ops5-9 (54.9%) + moe_ffn (38.3%); iter67+ direction shifts to those kernels)
+## ▶ Resume Here — current state of truth (2026-05-02 ~00:50Z, iter66a iter59-mtnsg SHIPPED to mlx-native main feeea8c + hf2q 0c91d1c; iter67+ direction is mlx-native gdn.ops5-9 (54.9%) + moe_ffn (38.3%) kernels per ADR-013 P21 4c10de3 per-CB profile)
 
 **Decode side: SHIPPED + RE-VALIDATED. iter56/57/58b confirmed byte-transparent perf-only changes (iter61c FULL VERDICT: ALL PASS).**
 
@@ -1792,6 +1792,29 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - Memory pins: `feedback_perf_gate_thermal_methodology`, `feedback_shippability_standing_directive`, `feedback_never_ship_fallback_without_rootcause`, `feedback_no_broken_windows`, `project_metal_compiler_auto_optimizes_static_levers`, `project_end_gate_reality_check`, `feedback_ground_truth_is_what_we_can_measure_now`
 
 ## Changelog
+
+- **2026-05-02 (UTC ~00:50Z) — iter66a SHIPPED: iter59-mtnsg merged onto mlx-native main `feeea8c` + hf2q `0c91d1c`. Decode-path NSG eligibility check + 11 multi-token NSG parity tests (n_tokens ∈ {1..32}) live in production. 4/4 D4 fixtures byte-identical decoded text + 3/4 peer-ratio PASS (gemma 0.890 inherent to current main, not iter59-mtnsg).**
+
+  **Path:** iter66a worker rebased iter59-mtnsg branches (mlx-native `a3c7e94` → `fd0cf32`, hf2q `00a7f62` → `ecefaae`) onto current main HEADs. 3 conflicts in `gpu_delta_net.rs` resolved against ADR-013 P21 Stage-4 (`0847f56`, the unconditional autoregressive prefill NSG dispatch already on main, measured 2.04× at pp726). **Stage-4 supersedes iter59-mtnsg's `seq_len ≤ 32` upper bound** — the now-dead `NSG_PREFILL_MAX_TOKENS` constant was removed; iter59-mtnsg's surviving distinct contribution is the **decode-path NSG eligibility check** in `build_delta_net_layer:1547` which Stage-4 did not cover (wraps the previous unconditional `dispatch_gated_delta_net` with a `nsg_compatible = d_k % 32 == 0 && d_k / 32 <= MAX_NSG` check, falling back to legacy kernel for non-NSG decode shapes).
+
+  **Build + test:** mlx-native 127/0 lib (serial) + 11/11 multi_token_nsg parity (n_tokens ∈ {1, 2, 4, 8, 16, 32}); hf2q 276/0/10 qwen35::.
+
+  **4-fixture decode no-regression vs main HEAD (`3d8ec21`):**
+
+  | Fixture | iter66a tok/s | main tok/s | Δ | byte-identity | peer ratio |
+  |---|---:|---:|---:|---:|---:|
+  | 27B-dwq46 | 32.0 | 32.3 | -0.9% | IDENTICAL | 1.135 (PASS ≥1.05) |
+  | apex Q5_K | 122.9 | 123.3 | -0.3% | IDENTICAL | 1.195 (PASS ≥1.07) |
+  | q4_0-flat | 131.8 | 131.9 | -0.1% | IDENTICAL | 1.141 (PASS ≥1.04) |
+  | gemma 26B | 92.0 | 91.8 | +0.2% | IDENTICAL | 0.890 (inherent to main; same on baseline 0.888) |
+
+  **Resolves the iter62-followup q4_flat byte-divergence** — Stage-4 already on main produces the same kernel selection that iter59-mtnsg's pre-rebase stale-main path-flip was triggering. Now byte-identical.
+
+  **Methodology lesson banked.** "Branch staleness during peer-perf optimization": when a CFA worktree carries a hf2q-side fix that overlaps with what main subsequently lands independently, rebase with conflict-take-HEAD on the overlap and preserve only the subset that main did not cover. Always diff the worktree's hf2q-side change against the target advance BEFORE manual conflict resolution to identify the supersession boundary.
+
+  **Receipts.** `/tmp/cfa-iter66a/merge-instructions.md`; `/tmp/cfa-iter66a/results/VERDICT.md`; `/tmp/cfa-iter66a/.IMPL-DONE`. Merge commits: mlx-native `feeea8c` (`merge(adr-015 iter66a): MTNSG mlx-native fd0cf32 — multi-token NSG parity tests for n_tokens in {1..32}`), hf2q `0c91d1c` (`merge(adr-015 iter66a): hf2q MTNSG ecefaae — decode-path NSG eligibility check`).
+
+  Status: iter66a CLOSED-SHIPPED. iter67+ direction (per iter66b audit + ADR-013 P21 4c10de3 profile): mlx-native gdn.ops5-9 + moe_ffn kernel optimization (93.2% of remaining prefill GPU time).
 
 - **2026-05-02 (UTC ~00:25Z) — iter66b encoder-coalescence audit: hf2q-orchestration prefill perf is EXHAUSTED. ≤0.30 pp ceiling vs +68 pp gap to ≥1.00× exit. iter67+ direction shifts to mlx-native gdn.ops5-9 + moe_ffn kernels (93.2% of remaining prefill GPU time per ADR-013 P21 4c10de3 per-CB profile).**
 
