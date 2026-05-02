@@ -2699,8 +2699,21 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("mmproj GGUF tensor-set validation: {e}"))?;
         // Detect the arch profile so forward-pass dispatch knows
         // which per-block-norm shape to expect (Gemma 4 SigLIP vs
-        // classic CLIP vs Unknown).
-        let arch = crate::inference::vision::mmproj::detect_arch_profile(&actual_names);
+        // classic CLIP vs Qwen3-VL SigLIP vs Unknown).
+        //
+        // 2026-05-02 Wedge-4c.5 Phase-2c (Codex review of 2eb1e36):
+        // call the projector-aware detector here, NOT the tensor-only
+        // `detect_arch_profile`. Real Qwen3-VL GGUFs may flag DeepStack
+        // at indices > 0 (e.g. [3, 7, 15, 23] for a 24-layer ViT),
+        // which would leave `v.deepstack.0.fc1.weight` absent and the
+        // tensor-only detector would emit `Unknown`, blocking even
+        // text-only chat against a perfectly valid Qwen3-VL projector.
+        // The parsed `MmprojConfig.projector` is the upstream-most
+        // signal (`clip.cpp:865-867` gates the qwen3vl builder on it).
+        let arch = crate::inference::vision::mmproj::detect_arch_profile_with_projector(
+            &mmp_config.projector,
+            &actual_names,
+        );
         if !arch.is_supported() {
             anyhow::bail!(
                 "mmproj arch profile is Unknown — neither Gemma 4 \

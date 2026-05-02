@@ -1225,6 +1225,52 @@ mod tests {
     }
 
     #[test]
+    fn detect_arch_profile_with_projector_qwen3vl_no_layer0_deepstack() {
+        // Phase-2c regression for Wedge-4c.5 Codex review of 2eb1e36
+        // (high-severity finding at src/serve/mod.rs:2703): when a real
+        // Qwen3-VL GGUF flags DeepStack only at layer indices > 0
+        // (e.g. [3, 7, 15, 23] for a 24-layer ViT), the tensor-only
+        // detect_arch_profile would return Unknown because
+        // v.deepstack.0.fc1.weight is absent — leaving serve startup
+        // to bail with "mmproj arch profile is Unknown" and blocking
+        // even text-only chat against a perfectly valid file.
+        //
+        // The projector-aware variant must short-circuit on the
+        // parsed projector_type string regardless of which deepstack
+        // layer indices are present (the projector_type is the
+        // upstream-most signal — clip.cpp:865-867 gates the qwen3vl
+        // builder on it). Mirrors what the serve-startup path now does
+        // (src/serve/mod.rs Phase-2c fix).
+        let names: Vec<&str> = vec![
+            "v.patch_embd.weight",
+            "v.blk.0.ln1.weight",
+            "v.blk.0.attn_q.weight",
+            // No v.deepstack.0.* — DeepStack flagged at layers >0.
+            "v.deepstack.3.fc1.weight",
+            "v.deepstack.7.fc1.weight",
+        ];
+        // Tensor-only detector returns Unknown here (the buggy path
+        // that the Phase-2c fix avoids).
+        assert_eq!(
+            detect_arch_profile(&names),
+            ArchProfile::Unknown,
+            "tensor-only detector should NOT identify Qwen3-VL when \
+             v.deepstack.0 marker is absent — this is the precise gap \
+             the projector-aware variant covers"
+        );
+        // Projector-aware detector identifies Qwen3-VL via the parsed
+        // ProjectorType, which is sourced from the GGUF metadata's
+        // `clip.projector_type` string (independent of layer indices).
+        assert_eq!(
+            detect_arch_profile_with_projector(&ProjectorType::Qwen3VlMerger, &names),
+            ArchProfile::Qwen3VlSiglip,
+            "projector-aware detector must return Qwen3VlSiglip when \
+             projector_type is Qwen3VlMerger, regardless of which \
+             deepstack layer indices the file flagged"
+        );
+    }
+
+    #[test]
     fn arch_profile_is_supported_only_for_runtime_paths() {
         // iter-224 Wedge-4c.5: all three arch profiles with a runtime
         // ViT forward report supported — Gemma4Siglip, ClipClassic, and
