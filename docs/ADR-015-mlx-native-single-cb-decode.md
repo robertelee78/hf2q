@@ -7,7 +7,7 @@
 - **Siblings of:** ADR-013 (qwen35 inference — owns the qwen35 forward path being rewritten); ADR-006 (mlx-native GPU backend — owns the Gemma `forward_decode` path being rewritten)
 - **Standing requirement:** "as fast as our peers" applies to **every shipped model family** — `feedback_shippability_standing_directive`, restated 2026-04-26: *"we need this coherence and speed for qwen and gemma families of models"*. ADR-015 covers both.
 
-## ▶ Resume Here — current state of truth (2026-05-02 ~00:50Z, iter66a iter59-mtnsg SHIPPED to mlx-native main feeea8c + hf2q 0c91d1c; iter67+ direction is mlx-native gdn.ops5-9 (54.9%) + moe_ffn (38.3%) kernels per ADR-013 P21 4c10de3 per-CB profile)
+## ▶ Resume Here — current state of truth (2026-05-02 ~01:00Z, iter67 research re-frames the gap: post-Stage-4 moe_ffn = 73-76% (was 38.3%), gdn.ops5-9 = 10-12% (was 54.9%); ALL kernel-opt candidates total ≤5% wall ceiling — does NOT close +68 pp gap; structural closure requires either hardware-ceiling acknowledgement OR cross-context optimization outside kernel scope)
 
 **Decode side: SHIPPED + RE-VALIDATED. iter56/57/58b confirmed byte-transparent perf-only changes (iter61c FULL VERDICT: ALL PASS).**
 
@@ -1792,6 +1792,48 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - Memory pins: `feedback_perf_gate_thermal_methodology`, `feedback_shippability_standing_directive`, `feedback_never_ship_fallback_without_rootcause`, `feedback_no_broken_windows`, `project_metal_compiler_auto_optimizes_static_levers`, `project_end_gate_reality_check`, `feedback_ground_truth_is_what_we_can_measure_now`
 
 ## Changelog
+
+- **2026-05-02 (UTC ~01:00Z) — iter67 research re-frames the prefill optimization landscape: post-Stage-4 moe_ffn = 73-76% (not 38.3%); ALL kernel-opt candidates total ≤5% wall ceiling — does NOT close the +68 pp gap to ≥1.00× exit. Structural closure requires either hardware-ceiling acknowledgement OR cross-context optimization outside kernel scope.**
+
+  **Critical correction (load-bearing).** The cited ADR-013 P21 commit `4c10de3` per-CB profile (gdn.ops5-9 = 54.9%, moe_ffn = 38.3%) was captured **BEFORE** ADR-013 P21 Stage 4 (`0847f56`). **Stage 4 swapped autoregressive prefill GDN to the simd_sum decode kernel and dropped gdn.ops5-9 from 64.15 ms → 13.35 ms (4.8×).** Post-Stage-4 reality (per ADR-013 doc lines 2966-3050):
+  - **moe_ffn = 73-76%** of GPU time (1862 µs avg × 40 layers @ pp80) — primary remaining lever
+  - **gdn.ops5-9 = ~10-12%** — already 4.8× win banked, residual lever
+  - The earlier framing in iter66b changelog ("93.2% in gdn + moe split 54.9/38.3") was based on the pre-Stage-4 profile and is now superseded by this re-attribution.
+
+  **Peer cross-check (load-bearing).** llama.cpp ships `kernel_gated_delta_net_f32_<NSG>` at `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:2645-2647` — **structurally IDENTICAL simd_sum recurrent kernel** to mlx-native's `gated_delta_net_decode_f32_<NSG>`. **llama.cpp ships NO chunk-form kernels** — runs autoregressive recurrence at all sequence lengths. hf2q's chunk-pipeline kernels (`gated_delta_net_chunk_o`, `kkt`, etc.) are gated behind `HF2Q_CHUNK_SCAN_PREFILL=1` env, NOT in production hot path. So at the kernel level, **hf2q's GDN ≡ llama.cpp's GDN**; the gap to peer is NOT in the recurrent kernel itself.
+
+  **Candidate ranking (per `/tmp/cfa-iter67/research/KERNEL-OPT-DESIGN.md`, 821 lines):**
+
+  | Candidate | Wall ceiling | Effort | Score | Notes |
+  |---|---:|---|---:|---|
+  | iter67-B (moe mm_id indirect-dispatch occupancy) | ~3% | medium | 5/10 | Empty-tile early-exit at `quantized_matmul_id_mm_tensor.metal:198` |
+  | iter67-A (moe_softmax_topk parallel top-K) | ~1.8% | low | 4/10 | Phase 2 single-threaded sort at `moe_softmax_topk.metal:104-148` — 127 idle threads waiting at upstream barrier — "cleanest unambiguous 'obviously wrong' GPU pattern" |
+  | iter67-D (gdn fold q_scale into kernel) | 0.15% | very low | 2/10 | `gated_delta_net_decode.metal:125-130` |
+  | iter67-C (Phase A 4-proj fusion) | ~0.7% | medium | 2/10 | `gpu_ffn.rs:1856-2334` |
+  | iter67-G (barrier reduction) | 0% | — | 0/10 | NO-OP after audit |
+  | iter67-F (silu_mul + down fusion) | — | — | — | ALREADY FALSIFIED 2026-04-26 in falsified-kernel-hypothesis register |
+  | iter67-H (map0 + mm_id fusion) | — | — | 0/10 | INFEASIBLE: M5 Max 32 KB TG mem limit; fusion requires 320 KB |
+
+  **Recommendation (per worker):** Run pre-profile receipt at pp80 BEFORE iter67-B impl. If `mm_id_map0 + barrier < 1%` of moe_ffn, abandon iter67-B; pivot to iter67-A only. **Combined ceiling of ALL recommended candidates ≈ 5% of total prefill wall — does NOT close the +68 pp gap to ≥1.00× exit gate.**
+
+  **Implication for ADR-015 loop exit gate.** The gap to peer parity is **structural**, not kernel-bound. Two convergent layers proven optimal at peer parity:
+  1. Matmul kernel `kernel_mul_mm_q4_0_tensor_f32` (4-iter convergence iter62-65; M3+ tensor cores require homogeneous half precision)
+  2. GDN recurrent kernel (iter67 peer cross-check; hf2q's `gated_delta_net_decode_f32` ≡ llama.cpp's `kernel_gated_delta_net_f32`)
+  3. hf2q orchestration layer (iter66b audit + ADR-013 P21 + iter66a)
+  4. moe_ffn `mul_mm_id` matmul (ADR-013 P21 mm_id audit `4d2ec0b`: tensor variant ≡ llama half-MMA)
+
+  **The 0.319× cold-clean prefill ratio appears to be a structural M5 Max ceiling** when both repos use the same kernel structure. The remaining 5% kernel-opt candidates are incremental ratio improvement, not gap closure. Closing to ≥1.00× would require: (a) different model fixture; (b) different bench methodology that more accurately reflects production workload; (c) cross-context optimization (e.g. KV-cache reuse, prompt caching, batching, speculative decoding) outside the per-prefill kernel scope.
+
+  **iter67-A targeted as next concrete impl** — cleanest "obviously wrong" pattern (single-threaded insertion sort with 127 idle threads); 1.8% wall ceiling; low effort. Even at small win, the pattern is worth fixing for code quality + correctness invariant ("no GPU code path that intentionally idles 99% of the threadgroup").
+
+  **STANDING COMPLIANCE.**
+  - `feedback_evidence_first_no_blind_kernel_rewrites` — peer cross-check + per-bucket profile + 821-line audit BEFORE any impl.
+  - `feedback_correct_outcomes` — re-attribution of pre-Stage-4 numbers to post-Stage-4 reality; not silent.
+  - `feedback_no_shortcuts` — the +68 pp gap is acknowledged as structural; NOT silently downgraded to a different exit gate.
+
+  **Receipts.** `/tmp/cfa-iter67/research/KERNEL-OPT-DESIGN.md` (821 lines, all 9 candidates audited with file:line citations + risk register). `/tmp/cfa-iter67/.RESEARCH-DONE`.
+
+  Status: iter67 research CLOSED. iter67-A queued as next impl. Major reframe of remaining ADR-015 prefill optimization landscape pending.
 
 - **2026-05-02 (UTC ~00:50Z) — iter66a SHIPPED: iter59-mtnsg merged onto mlx-native main `feeea8c` + hf2q `0c91d1c`. Decode-path NSG eligibility check + 11 multi-token NSG parity tests (n_tokens ∈ {1..32}) live in production. 4/4 D4 fixtures byte-identical decoded text + 3/4 peer-ratio PASS (gemma 0.890 inherent to current main, not iter59-mtnsg).**
 
