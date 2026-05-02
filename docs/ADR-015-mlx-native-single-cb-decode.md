@@ -1793,6 +1793,42 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 ## Changelog
 
+- **2026-05-02 (UTC ~07:55Z) — iter80 NEUTRAL: MoeFfnProjArena bucket impact -38.9ms but absorbed (parent `layer.ffn_dispatch` unchanged); +8ms wall within IQR. Refines methodology: predicate #2 (GPU-idle-window) must be HIGH-confidence, not PARTIAL. Wrapper-side arena lever-class now EXHAUSTED across 5 iters (3 wins + 2 NEUTRAL); iter81+ pivots to mlx-native side.**
+
+  iter80 prototyped extending iter72's `MoeFfnArena` to also pool the 5 `proj_pooled` projection-output buffers (router + shared_gate_inp + shared_gate + shared_up + shared_down) currently allocated via thread-local `decode_pool`. Per iter79 audit: 3-predicate test scored #1 PASS (skew 253× / 159×), #2 PARTIAL PASS (~10-12 of 40 layers in GPU-idle window), #3 PASS (no fixture predicate gate).
+
+  **Bench result (apex q4_0-flat pp4123 default workload):** Δ +8ms (within IQR), below -50ms falsification threshold. Mechanism worked at bucket level (`ffn.phase_a_proj` skew 253× → 1.67×, -99.3% / -30.2ms; `ffn.phase_c_gate_up_shared_down` skew 159× → 105×, -34.2% / -8.7ms; total -38.9ms bucket savings). But parent `layer.ffn_dispatch` -0.1ms — savings absorbed by non-K-boundary layers running with prior `commit_labeled` async-overlap (iter76 pattern).
+
+  **Methodology refinement banked: predicate #2 must score HIGH, not PARTIAL.** Threshold inferred from iter80 (PARTIAL ~25% K-boundary coverage → NEUTRAL): for arena savings to surface above non-K-boundary absorption, **≥50% of layers must be in the GPU-idle window** at the alloc site. iter72/74/78 all had ~95-100% layers in GPU-idle window (full chunk-prefill or post-`commit_and_wait` topology); iter80's K-boundary-only coverage was insufficient.
+
+  **5-iter arena lever-class summary:**
+
+  | iter | Predicate #1 | Predicate #2 | Predicate #3 | Outcome |
+  |---|---|---|---|---|
+  | iter72 (MoeFfnArena+DenseFfnArena) | PASS | HIGH | PASS | **SHIPPED** -290ms |
+  | iter74 (DnPrefillArena) | PASS | HIGH | PASS | **SHIPPED** -219ms |
+  | iter76 (PostAttnArena) | PASS | **FAIL** | PASS | NEUTRAL |
+  | iter78 (ChunkAllocsArena) | PASS | HIGH | **CONDITIONAL** | SHIPPED (chunk-engaged only) |
+  | **iter80 (MoeFfnProjArena)** | PASS | **PARTIAL** | PASS | **NEUTRAL** |
+
+  **Conclusion: Wrapper-side arena lever-class is now EXHAUSTED.** Pattern is well-characterized; 3-predicate test reliably distinguishes WIN from NEUTRAL outcomes pre-impl. Future arena-pattern candidates require ≥50% of layers in GPU-idle window AND fixture engagement.
+
+  **iter58b residency-rescission risk:** YES audit per slot — all 5 new MoeFfnArena slots safe; live for entire `forward_gpu_impl` body; no `commit_and_wait → commit` downgrade introduced.
+
+  **Tests:** 308/0/10 hf2q qwen35:: (was 306/0/10; +2 new tests including `moe_arena_byte_exact_parity_at_seq128` — byte-exact F32, 0/N elements differ).
+
+  **iter81+ pivot direction (per iter79 audit secondary recommendation):**
+  - **mlx-native kernel work** — per ADR-013 P21 `4c10de3` per-CB profile, 54.9% `gdn.ops5-9` + 38.3% `moe_ffn` = 93.2% of remaining prefill GPU time in mlx-native kernels
+  - High-risk territory: iter62-65 4-iter convergence on matmul kernel territory was falsified (M3+ tensor cores at peer parity)
+  - But iter71's "diffuse across 12 secondary dispatches" framing was about ALLOC overheads (which iter72/74/78 successfully captured); residual mlx-native kernel-internal opportunities may still exist for `gdn.ops5-9` + `moe_ffn` orchestration
+  - Alternative: ONE more wrapper-side audit pass specifically searching for HIGH-#2 candidates we may have skipped (low probability per the 5-iter exhaustion data)
+
+  **Branch:** `cfa/iter80-moe-proj-arena-20260502/claude` HEAD `2827122` (pushed, NOT merged). Preserved as evidence + methodology data.
+
+  **Receipts.** `/tmp/cfa-iter80/impl-bench/VERDICT.md` + `/tmp/cfa-iter80/impl-bench/logs/`. iter79 audit at `/tmp/cfa-iter79/research/POST-ITER78-AUDIT.md` (predicted PARTIAL #2 → NEUTRAL outcome correctly).
+
+  **Cumulative session unchanged from iter78 (0.792× ratio on default; chunk-engaged 0.547×→0.790×).** Remaining gap to ≥1.00×: +21pp on default. The path forward likely requires mlx-native side work or accepting the current ratio as the wrapper-side optimization ceiling.
+
 - **2026-05-02 (UTC ~07:05Z) — iter78 SHIPPED on hf2q main `5a4d879` (FF-merged from `cfa/iter78-chunk-arena-20260502/claude` HEAD `fb55ee6`). ChunkAllocsArena pools 7 chunk-prefill scratches → SPLIT verdict: NEUTRAL on default pp4123 (chunk path NOT engaged at 4123%64≠0), but **WIN -296ms / -12.1% on chunk-eligible 4096-token workloads**. 3-predicate critical-path methodology now established and validated.**
 
   **Method.** iter77 critical-path audit confirmed ChunkAllocsArena is structurally identical to iter72/74 winners (sits IMMEDIATELY after `enc.commit_and_wait()` at `gpu_delta_net.rs:1972/2476`; GPU-idle window guaranteed; no async-overlap absorption mechanically possible — predecessors guarantee idle). iter78 worker prototyped `ChunkAllocsArena` mirroring iter74's `DnPrefillArena` pattern: 7 caller-owned scratch buffers (`q_expanded`, `k_expanded`, `q_bf16`, `k_bf16`, `v_bf16`, `g_log_decay`, `o_bf16`) lifted into arena allocated once at prefill start in `forward_gpu_impl`.
