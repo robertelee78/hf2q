@@ -1843,13 +1843,33 @@ pub fn build_delta_net_layer(
                 seq_len, n_v_heads,
             ).context("dispatch_compute_g_beta prefill")?;
             enc.memory_barrier();
-            // GDN prefill — reads state_in, writes state_out (ping-pong buffers).
-            dispatch_gated_delta_net(
-                &mut enc, registry, device.metal_device(),
-                &q_scaled, &k_normed, &v_gpu,
-                &g_buf, &beta_buf, state_in,
-                &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
-            ).context("dispatch_gated_delta_net prefill")?;
+            // ADR-013 P21 stage-4 (2026-05-01): autoregressive prefill GDN
+            // uses the simd_sum-based decode kernel (mirrors llama.cpp's
+            // kernel_gated_delta_net_f32_<NSG>) when D_k is supported.
+            // Per-thread register state shrinks from D_k floats to NSG=D_k/32
+            // floats (32x lower at D_k=128) and cross-lane reductions become
+            // single-cycle simd_sum vs threadgroup_barrier+shared_memory.
+            // Measured at pp726: 2.04x prefill speedup (1010 -> 2061 t/s),
+            // ratio vs llama 0.37x -> 0.75-1.18x (at peer parity).
+            // Fallback to dispatch_gated_delta_net for D_k not a multiple
+            // of 32 or > 128 (NSG=4 cap) — preserves synthetic small-shape
+            // test coverage and any future architecture with D_k != 128.
+            let decode_kernel_eligible = d_k % 32 == 0 && d_k <= 128;
+            if decode_kernel_eligible {
+                dispatch_gated_delta_net_decode(
+                    &mut enc, registry, device.metal_device(),
+                    &q_scaled, &k_normed, &v_gpu,
+                    &g_buf, &beta_buf, state_in,
+                    &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
+                ).context("dispatch_gated_delta_net_decode prefill")?;
+            } else {
+                dispatch_gated_delta_net(
+                    &mut enc, registry, device.metal_device(),
+                    &q_scaled, &k_normed, &v_gpu,
+                    &g_buf, &beta_buf, state_in,
+                    &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
+                ).context("dispatch_gated_delta_net prefill (fallback)")?;
+            }
             enc.memory_barrier();
             dispatch_ssm_norm_gate(
                 &mut enc, registry, device.metal_device(),
