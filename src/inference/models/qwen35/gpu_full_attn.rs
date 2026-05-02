@@ -1494,7 +1494,7 @@ pub fn apply_sdpa_with_kv_cache(
             let mut enc = device.command_encoder().context("enc sdpa kv-cache prefill")?;
             sdpa(&mut enc, registry, device, &q_gpu, &slot.k, &slot.v, &out_buf, &params, 1)
                 .context("sdpa with kv cache prefill")?;
-            enc.commit_and_wait().context("commit sdpa kv-cache prefill")?;
+            enc.commit_and_wait_labeled("layer.full_attn.sdpa_legacy_prefill").context("commit sdpa kv-cache prefill")?;
         }
 
         // Permute output from head-major [n_heads, seq, head_dim] → seq-major
@@ -1689,7 +1689,7 @@ pub fn build_gated_attn_layer(
         if seq_len == 1 && head_dim % 32 == 0 {
             enc.commit_labeled("layer.full_attn.ops1-4");
         } else {
-            enc.commit_and_wait().context("commit ops1-4 prefill")?;
+            enc.commit_and_wait_labeled("layer.full_attn.ops1-4").context("commit ops1-4 prefill")?;
         }
         (x_norm, q_flat, k_flat, v_flat, gate_flat, q_normed, k_normed, q_rope, k_rope)
     };
@@ -1857,7 +1857,7 @@ pub fn build_gated_attn_layer(
         if seq_len == 1 || use_arena {
             enc.commit_labeled("layer.full_attn.ops6-7");
         } else {
-            enc.commit_and_wait().context("commit ops6-7")?;
+            enc.commit_and_wait_labeled("layer.full_attn.ops6-7").context("commit ops6-7")?;
         }
         out
     };

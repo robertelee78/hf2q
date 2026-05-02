@@ -2866,3 +2866,37 @@ Absolute tok/s magnitudes deferred to an idle-system bench window — those are 
 **Wall-savings honest assessment.** P20 already established (and Stage 1 confirms) that the FA-bridge terminal commits live in the cheap-commit class — they fire when GPU is idle, so removing them does not move wall time. The +13% pp101 target was aspirational and is rejected by measurement. Stage 1's value is **structural infrastructure** (the arena type + allocation site + threading + lifetime + iter58b safety pattern), not wall-time. Stage 2's KV-cache GPU-side write is the actual prefill-tps unlock.
 
 **Receipts**: `/tmp/cfa-adr013-p21-s1/{queen-judgment.md,queen-judgment.json,test-report.md,codex-review-last.txt,bench-out/p17b_summary.md}`.
+
+### 2026-05-01 (post-merge) — P21 STAGE 2 PROFILING · per-CB GPU time labels added; finding pivots Stage 2-4 target
+
+**Why this entry.** Stage 1 merged at `14b9cc3` confirmed P20's null-wall finding (sync_count drop did not move pp101 wall). Per the standing rule "Never guess. Create hypotheses that are testable before changing code", before launching Stage 2 (planned: ops1-4 KV-cache GPU-side write to enable safe `commit_labeled`), I added per-label `commit_and_wait_labeled` instrumentation to the chunk-DN + FA prefill commits in `gpu_delta_net.rs` (4 sites: ops1-3, qkv_split, chunk ops8-9, autoregressive ops5-9) and `gpu_full_attn.rs` (3 sites: sdpa_legacy_prefill, ops1-4, ops6-7). The existing `MLX_PROFILE_CB=1` accumulator (`mlx_native::kernel_profile`) then attributes per-CB GPU wall-clock time to each label.
+
+**Test setup.** `target/release/hf2q generate --model qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq48.gguf --prompt <101-token-fixture> --max-tokens 1 --temperature 0 --benchmark` with `MLX_PROFILE_CB=1 HF2Q_PROFILE_SYNC=1`. Tokenizer produces seq_len=80 (101 words → 80 tokens after BPE), so chunk-DN takes the AUTOREGRESSIVE branch (chunked path needs `seq % 64 == 0`); chunk_attn/ops8-9 don't fire.
+
+**Result — per-CB GPU time at pp101 (top of profile):**
+
+| Label | Calls | Total | Avg/call | Min | Max | % |
+|---|---|---|---|---|---|---|
+| `layer.gdn.ops5-9` | 30 | **71.13ms** | **2371µs** | 1833µs | 8550µs | **54.9%** |
+| `layer.moe_ffn` | 40 | 49.64ms | 1241µs | 928µs | 3195µs | 38.3% |
+| `layer.gdn.ops1-3` | 30 | 5.72ms | 191µs | 143µs | 751µs | 4.4% |
+| `layer.full_attn.ops1-4` | 10 | 1.51ms | 151µs | 124µs | 220µs | 1.2% |
+| `layer.full_attn.ops6-7` | 10 | 0.92ms | 92µs | 80µs | 141µs | 0.7% |
+| `fa.prefill_bridge` | 10 | 0.52ms | 52µs | 44µs | 75µs | 0.4% |
+| `layer.gdn.qkv_split` | 30 | 0.18ms | 6µs | 5µs | 18µs | 0.1% |
+
+Total labeled GPU time: **129.61ms across 160 commits** (sync_count=161 per `HF2Q_PROFILE_SYNC=1`; the missing commit is `output_head.argmax` at end of prefill). Prefill wall ~470ms (101 tokens / 215 tps); the remaining ~340ms is host overhead between commits OR cheap async commits not captured in the labeled accumulator.
+
+**Implication for P21 Stages 2-4.**
+
+- **Stage 2 target** (`layer.full_attn.ops1-4` GPU-side KV-cache write to enable `commit_labeled`): saves at most **1.51ms / 1.2% of labeled GPU time**. Wall-time impact on pp101: **bounded above by 1.51ms = ~3% of prefill wall**. Even total elimination would not close the 0.12-0.29× ratio gap to llama-completion.
+- **Stage 3 target** (DeltaNet wrapper scratch lift, `gdn.ops1-3` + `gdn.ops5-9`): conceptually the right bucket (combined 76.85ms / 59.3% of labeled GPU time), BUT the cost is in **kernel execution time**, not commit-count overhead. Lifting wrapper scratches into a caller arena reduces residency-rescission risk and frees the iter58b `commit_and_wait` requirement, but does NOT speed the kernel itself. Wall savings would come from the small (~71µs measured per iter58b receipt) per-layer drained-residency cost across 30 layers ≈ 2ms — same magnitude as Stage 2.
+- **Stage 4 target** (chunk-DN consolidation): doesn't apply at seq=80 (chunked path inactive). At seq>=128 (chunk path active), `layer.gdn.chunk_attn` would replace `gdn.ops5-9` and the call-count would change but per-call kernel cost would not.
+
+**Where the §17 prefill ratio gap actually lives.** The two dominant buckets — `layer.gdn.ops5-9` (2.4ms/call × 30 layers) and `layer.moe_ffn` (1.2ms/call × 40 layers) — are **kernel-execution-bound**, not commit-count-bound. llama.cpp's faster prefill at pp101 (665-1644 t/s vs hf2q 199-274 t/s) reflects faster per-kernel execution (its `chunk_attn` SWA kernel + Q4_K mm_id MoE matmul are tighter Metal kernels than our equivalents). This is **mlx-native / ADR-015 territory**, not ADR-013 territory.
+
+**Decision.** Mark ADR-013 P21 Stages 2-4 as **DEFERRED — low-yield**. The §17 ship-gate "match-or-beat llama on prefill" cannot be achieved by completing P21 (best-case ~3% wall savings). Closing the gap requires faster `layer.gdn.ops5-9` and `layer.moe_ffn` kernels, which is open ADR-015 work (W-5b.22 / W-5b.23 already established `mul_mm_id` is hf2q wrapper overhead at production shapes; a similar audit of `layer.gdn.ops5-9` is the natural next step in ADR-015's scope, not ADR-013's).
+
+ADR-013's original closure (P13.6, 2026-04-25) was correct: the original deliverable (sourdough byte-parity, decode within 5%, integration tests, docs) is met. P14-P20 was prefill optimization that proved the structural floor lives in kernel speed. P21 Stage 1 lands as **infrastructure** (FaPrefillArena type, lifetime contract, validate_fits guards) usable for any future stage, with no wall regression. P21 Stages 2-4 are **deferred indefinitely**.
+
+**Receipts**: `/tmp/p21-stage2-cbprof3.log` (final 7-label table), `/tmp/p21-stage2-cbprof2.log` (intermediate 6-label after first labeling pass), `/tmp/p21-stage2-cbprof.out` (initial 3-label, pre-instrumentation).

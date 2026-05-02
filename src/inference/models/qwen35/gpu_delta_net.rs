@@ -1211,7 +1211,7 @@ pub fn apply_gated_delta_net_chunk(
         let _w5b8_commit = crate::inference::models::qwen35::wave5b8_profile::Section::start(
             crate::inference::models::qwen35::wave5b8_profile::SectionKind::ChunkCommitWait,
         );
-        enc.commit_and_wait()
+        enc.commit_and_wait_labeled("layer.gdn.chunk_attn")
             .context("commit_and_wait apply_gated_delta_net_chunk")?;
     }
 
@@ -1571,7 +1571,7 @@ pub fn build_delta_net_layer(
                 &qkv_raw, &weights.ssm_conv1d, conv_state_in, conv_state_out,
                 &qkv_conv, &ssm_params_buf, ssm_conv_params,
             ).context("dispatch_ssm_conv ops3 prefill")?;
-            enc.commit_and_wait().context("commit ops1-3 prefill")?;
+            enc.commit_and_wait_labeled("layer.gdn.ops1-3").context("commit ops1-3 prefill")?;
             (x_norm, qkv_conv, z)
         };
         // conv_state_out now holds the updated conv state (caller swaps ping-pong).
@@ -1642,7 +1642,7 @@ pub fn build_delta_net_layer(
                 &params,
             )
             .map_err(|e| anyhow!("dispatch_qkv_split_f32 (W-5b.18): {e}"))?;
-            enc.commit_and_wait()
+            enc.commit_and_wait_labeled("layer.gdn.qkv_split")
                 .context("commit qkv_split (W-5b.18) prefill")?;
             (q_gpu, k_gpu, v_gpu)
         };
@@ -1805,7 +1805,7 @@ pub fn build_delta_net_layer(
                 &mut enc, registry, device, &gated_buf,
                 &weights.ssm_out, seq_len, z_channels, hidden_size,
             )?;
-            enc.commit_and_wait().context("commit chunk ops8-9 prefill")?;
+            enc.commit_and_wait_labeled("layer.gdn.ops8-9").context("commit chunk ops8-9 prefill")?;
             output
         } else {
             // ---- AUTOREGRESSIVE PREFILL (iter-4 unchanged path) ----
@@ -1859,7 +1859,7 @@ pub fn build_delta_net_layer(
                 &mut enc, registry, device, &gated_buf,
                 &weights.ssm_out, seq_len, z_channels, hidden_size,
             )?;
-            enc.commit_and_wait().context("commit ops5-9 prefill")?;
+            enc.commit_and_wait_labeled("layer.gdn.ops5-9").context("commit ops5-9 prefill")?;
             output
         };
         // state_out/conv_state_out now hold updated states (caller swaps ping-pong).
