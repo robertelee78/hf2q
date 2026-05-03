@@ -1603,6 +1603,29 @@ impl Qwen35Model {
         if tokens.is_empty() {
             return Err(anyhow!("forward_gpu: tokens must be non-empty"));
         }
+        // 2026-05-03 — top-of-call pool reset. Mirrors `forward_gpu_greedy`'s
+        // line-3150 call (which only fires on the greedy temp=0 fast-path).
+        // Without this, every `forward_gpu_last_logits` call (sampling-mode
+        // decode + the soft-token / deepstack variants + the prefill-with-
+        // capture variants) grows the thread-local `DECODE_POOL`'s `in_use`
+        // list monotonically. Each fresh-allocation branch in
+        // `MlxBufferPool::alloc_inner` calls `register_residency_allocation`
+        // → Apple's `-[IOGPUMetalResidencySet addAllocation:]`. After ~960k
+        // un-recycled allocations Apple aborts (SIGABRT exit 134, six macOS
+        // DiagnosticReports captured 2026-05-02 22:30 → 2026-05-03 07:15;
+        // HF2Q_PROFILE_RESIDENCY_ABORT instrumentation in mlx-native at
+        // commit-of-this-diff confirms the leak: 962591 fresh allocs with
+        // dup=false on every line, no host-pointer reuse).
+        //
+        // Resetting here is safe for prefill: the prefill path also calls
+        // `reset_for_prefill_chunk` at end of each K-batch layer iteration
+        // (forward_gpu.rs:3008) which is bytewise-identical to this reset
+        // (decode_pool.rs:137-139). Calling reset twice is a no-op the
+        // second time. Resetting here is safe for decode: every per-token
+        // pool-allocated `MlxBuffer` is locally bound inside this function's
+        // call tree and out-of-scope by the time we return, so the next
+        // call's reset moves them all to the free list as expected.
+        super::decode_pool::reset_decode_pool();
         let seq_len = tokens.len() as u32;
         let expected_pos_len = 4 * seq_len as usize;
         if positions_flat.len() != expected_pos_len {

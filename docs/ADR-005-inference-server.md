@@ -7807,3 +7807,59 @@ phase-1/2/3a (e.g. `gpu_delta_net::apply_proj` is older than ADR-019).
 **Next iteration.** Land instrumentation in mlx-native, run one supervised
 reproducer, fix the dedup key. This entry stands as the static-evidence
 trail; the fix entry will follow.
+
+### 2026-05-03 (afternoon, fix landed) — SIGABRT fixed: forward_gpu_impl pool-reset gap
+
+**Falsified prior hypothesis.** The dedup-by-host-pointer hypothesis from the
+2026-05-03 (afternoon) entry was WRONG. Built `HF2Q_PROFILE_RESIDENCY_ABORT=1`
+instrumentation in mlx-native (commit `9676cc8` on `main`), captured 962,591
+log lines from a single supervised reproducer. Every line: `dup=false`. No
+host-pointer reuse anywhere in the run.
+
+**Actual root cause.** Hf2q's `Qwen35Model::forward_gpu_impl` (the shared
+helper called by `forward_gpu_last_logits`, the sampling-mode decode path
++ all soft-token / DeepStack / capture variants) DID NOT call
+`decode_pool::reset_decode_pool` at the top of each invocation, while the
+sibling `forward_gpu_greedy` (temp=0 fast path, line 3150) DOES. Default
+sampling (`--temperature 0.8`, the user's reproducer) routes through
+`forward_gpu_last_logits`, so every decode step's pooled scratch
+allocations accumulated in `MlxBufferPool::in_use` indefinitely. The
+free-list never grew; every subsequent alloc took the fresh-allocation
+branch, called `MlxBufferPool::register_residency_allocation` →
+Apple's `-[IOGPUMetalResidencySet addAllocation:]`. After ~960k
+unrecycled fresh allocations the IOGPU set aborted.
+
+**Fix.** Add a `decode_pool::reset_decode_pool()` call at the top of
+`forward_gpu_impl` (`src/inference/models/qwen35/forward_gpu.rs`).
+Bytewise-identical to the call already in `forward_gpu_greedy`.
+Documented commentary above the call cites the ADR-005 entry, the
+SIGABRT crash-report trail, and the `HF2Q_PROFILE_RESIDENCY_ABORT=1`
+empirical evidence that confirmed the leak.
+
+**Verification (single supervised reproducer, post-fix).**
+
+```
+$ HF2Q_PROFILE_RESIDENCY_ABORT=1 hf2q generate --max-tokens 5000 \
+    --model qwen3.6-35B-A3B-dwq48 --prompt "<wedding-cake>"
+exit=0
+[RESIDENCY] count: 1438         (was: 962,591, then SIGABRT)
+max N: 1437                     (steady-state working set)
+mlx-native (qwen35): 342 tokens in 4.76s (71.8 tok/s)
+```
+
+Coherent generation, no abort. Residency-set N saturates at the natural
+working-set size after warm-up — pool reuse is now functioning.
+
+**Why prior commits (982594f, 3e4df05, 8fd66ec) didn't surface this.** The
+chat-template + tokenizer parity work falsified the user's
+strong-suspect hypothesis (those byte-identical to llama.cpp). The
+SIGABRT root-cause entry got the abort site right (Apple residency-set)
+but the dedup-collision sub-hypothesis wrong; only the
+`HF2Q_PROFILE_RESIDENCY_ABORT` instrumentation revealed `dup=false` on
+every line and pointed at the missing reset.
+
+**Open follow-up.** `forward_gpu_greedy`'s reset call (line 3150) is now
+redundant — `forward_gpu_impl` (which it presumably calls in some
+variants) resets first. Audit + dedup the reset call sites in a
+follow-up to avoid double-reset confusion. Non-blocking; no correctness
+or perf risk.
