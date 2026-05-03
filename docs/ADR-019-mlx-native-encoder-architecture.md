@@ -280,7 +280,7 @@ ADR-013 P21 dropped sync_count from 161 → 6 via FFN-terminal batching. That **
 
 ### 5. D2 introduces material OOM risk on apex MoE
 
-Per researcher-deep §5.5: parallel CBs hold more buffers in flight simultaneously. The Qwen3.6-35B-A3B working set is ~24 GB on M5 Max (5.2 GB context + 23.9 GB model). Current 1-CB-at-a-time keeps the in-flight working set bounded. n_cb=4 (D2) inflates this 4× — peak memory may overrun on apex MoE under long context. **D2 is the only candidate of the four with material OOM risk.**
+Per researcher-deep §5.5: parallel CBs hold more **transient buffers** in flight simultaneously — model weights are NOT duplicated per CB (residency surface is single-set). The risk vector is narrower than the original framing: (a) per-CB live transient/scratch buffers held concurrently across worker threads; (b) `ResidencySet::pending` windows held open longer because flushes are not synchronized across workers; (c) arena lifetime overlap when multiple worker threads' commits stage `MlxBufferStorage::drop`s into a shared residency-remove queue. The Qwen3.6-35B-A3B static working set is ~24 GB on M5 Max (5.2 GB context + 23.9 GB model); the per-prefill transient working set on top of that is the load-bearing OOM surface. n_cb=4 inflates the **transient** portion ~4× — peak memory may overrun on apex MoE under long context, but the original "n_cb=4 inflates this 4×" framing was too broad (it implied weights duplicate, which they do not). **D2 is the only candidate of the four with material OOM risk** (the other three are single-threaded and amortize transient state across a single in-flight queue).
 
 ### Additional D2-specific weaknesses (research synthesis §4 D2)
 
@@ -296,7 +296,7 @@ Citing five convergent streams: Apple BPG verbatim + Apple ML team's choice + ll
 
 ## Decision
 
-ADR-019 ships **D3 (per-stage-fence) as the primary architectural target**, with **D1 (single-CB-everywhere) as the second-stage convergence target** after the chunk-prefill arena lifetime work clears the iter58b residency-rescission fence in its long-window form. **D2 (n_cb-pool / parallel-encode) and D4 (streaming watermark) are explicitly rejected** for the reasons enumerated above and below.
+ADR-019 ships **D3 (per-stage-fence) as the primary architectural target**, with **D1 (single-CB-everywhere) as the second-stage convergence target** after the chunk-prefill arena lifetime work clears the iter58b residency-rescission fence in its long-window form. **D2 (n_cb-pool / parallel-encode) is explicitly rejected** for the five convergent counter-evidence streams enumerated above. **D4 (streaming watermark) is DEFERRED, not rejected** — see §"D4 (DEFERRED)" below for the Phase 0 microprototype gate; per Phase 0a.2 design research (`/tmp/cfa-adr019-phase0a2-research/design.md`, 2026-05-02) and Phase 0a.4 verdict, D4 is no longer on the active blocking path and is queued as the documented fallback architecture if D3 Phase 3b stalls or hf2q starts shipping non-transformer workloads.
 
 ### Design space summary table
 
@@ -312,9 +312,9 @@ ADR-019 ships **D3 (per-stage-fence) as the primary architectural target**, with
 | Unblocks `MLX_UNRETAINED_REFS` | Yes | No | Partially | Partially |
 | Apple-precedent | gemma (already ships) | llama.cpp (n_cb=1) | none (novel) | MLX framework |
 | OOM risk on apex MoE | none | **yes** | none | bounded |
-| **Verdict** | **second-stage** | **REJECTED** | **PRIMARY (subject to Phase 0 D4-falsification gate)** | **DEFERRED (Phase 0 microprototype)** |
+| **Verdict** | **second-stage** | **REJECTED** | **PRIMARY (Phase 0a.4 verdict; AC-P1 reframed)** | **DEFERRED (documented fallback; not blocking)** |
 
-**Codex-review note (2026-05-03):** AC-P1's 80 ms wall reduction gate is **contingent on Phase 3a + 3b combined**. Phase 3a alone (per-stage fence, 4 CBs) projects ~30-60 ms savings; the residual ~20-50 ms requires Phase 3b chunk-prefill arena lifetime work (deferred from ADR-013 P21 Stage 3). If D3 Phase 3b stalls, D4 microprototype is the documented fallback.
+**Codex-review-2 note (2026-05-02):** original AC-P1's 80 ms wall reduction gate has been **superseded by the post-0a.4 reframe**: AC-P1 = in-process prefill ≤ 1230 ms (within ±50ms of llama.cpp 1186 ms) and AC-P6 = xctrace CB submissions ≤ 30 (down from 236). Phase 3a alone projects ~30 CBs saved (10 FA + 10 mid-DN-cluster); Phase 3b adds another ~60 (chunk-internal MTLEvent); Phase 4 closes another ~35 (FFN K-window consolidation). If Phase 3b stalls on the chunk-prefill arena work (Risk Register F2), D4 microprototype is the documented fallback (no longer a blocking falsification gate per the recalibration in §"D4 (DEFERRED)" below).
 
 ### D3 (PRIMARY) — Per-Stage-Fence
 
@@ -330,7 +330,23 @@ ADR-019 ships **D3 (per-stage-fence) as the primary architectural target**, with
 
 **CB-count reconciliation (post-Codex):** the ADR's earlier "4-6 CB target" was the IDEAL (collapsed FFN K-boundaries), not the achievable figure for ADR-013 P21's K=8 batching invariant. AC-P6 is set to `cmd_buf_count ≤ 8` to match this revised accounting. The 4-6 ideal is reachable in Phase 3b once the K-boundary fence (ADR-013 P21 Stage 3 chunk-prefill arena) clears; Phase 3a-only ships at 8-9 CBs.
 
-**Boundary primitive:** MTLEvent fences between stages (intra-stage hazards still use `MTLDispatchTypeConcurrent` + `enc.memory_barrier()` + `MemRanges`). Single host-side `commit_and_wait` at stage 4 (output head). Total: 4-6 CBs / chunk-engaged prefill, 1 host wait.
+**Boundary primitive:** MTLSharedEvent fences between stages (intra-stage hazards still use `MTLDispatchTypeConcurrent` + `enc.memory_barrier()` + `MemRanges`). Single host-side `commit_and_wait` at stage 4 (output head).
+
+**MTLEvent rationale clarification:** same-queue CB-to-CB ordering on a single `MTLCommandQueue` already preserves cross-CB GPU correctness for free (Metal's command buffer ordering invariant — CBs execute in submission order on a single queue). MTLSharedEvent is NOT load-bearing for cross-CB correctness; its role is (a) explicit stage-fence semantics for the `EncoderSession` state machine (Empty → Open → Encoding → Fenced → Committed → Drained — clarifies "which CB completed which stage" for the lifecycle latch and the F2 residency-rescission Drop guard); (b) profiling/labeling clarity in xctrace MST so operator-driven captures show `signal/wait` events tagged with stage labels; (c) future-proofing for any cross-queue extension (e.g. dedicated decode queue). Phase 0a.3 measured MTLSharedEvent `signal+wait` cost at 1.25 µs/pair on M5 Max — negligible against the 340 ms target.
+
+**Per-phase CB count target (canonical, post-Codex-review-2 reconciliation):**
+| Phase | xctrace CB submissions | Mechanism |
+|---|---:|---|
+| Current HEAD | **236** | per-component `commit_labeled`/`commit_and_wait_labeled` per layer |
+| Phase 1 (output-head fusion, LANDED) | 235 (-1) | last-layer FFN-terminal + output-head share one CB |
+| Phase 2 (FA-path D3) | ~205 (-30) | 10 FA layers × ~3 CBs collapsed to 1 each |
+| Phase 3a (DN conservative) | ~175 (-30) | 30 DN layers × ops1-3 + qkv_split consolidated |
+| Phase 3b (DN aggressive) | ~115 (-60) | 30 DN layers × additional chunk-internal MTLEvent |
+| Phase 4 (FFN tower) | ~80 (-35) | K=8 batching consolidated to 5 stage-CBs |
+| Phase 5 (close) | **≤ 30** | end-to-end target = AC-P6 |
+| Phase 6 (D1 future) | 1 | single-CB-everywhere |
+
+Targets are projections from the per-CB-cost arithmetic (340 ms / 230 extra CBs ≈ 1.48 ms/CB; recovering 200+ CBs ≈ 300 ms wall reduction). Each phase's actual delta is measured and the table is updated as evidence accumulates.
 
 **Migration scope (research synthesis §6.3):** ~300-600 LoC. Lift the 4 stage boundaries in `forward_gpu.rs`; replace 4-5 of the K-boundary `commit_and_wait_labeled` calls with `commit_labeled` + MTLEvent.signal; the next stage opens its CB with MTLEvent.wait. Single host-side `commit_and_wait` at the very end (output head). Keeps decode hot path on its current shape until phase 5.
 
@@ -369,15 +385,16 @@ See §"Counter-Evidence Against Naïve Parallel-Encode" above. Five convergent s
 - **Workload-tunable knob.** D4 introduces an `N` parameter (20-50) that affects perf and behaves differently per chip generation. D3's per-stage boundaries are intrinsic to transformer structure.
 - **Conditional advantage.** D4's wins likely shine for non-transformer workloads where stage boundaries are unclear; hf2q's transformer forward has crisp 4-stage structure. Phase 0 microprototype falsifies-or-confirms.
 
-**Phase 0 D4 microprototype gate (NEW per Codex-review):**
+**Phase 0 D4 microprototype gate — RECALIBRATED (Codex-review-2, 2026-05-02):**
 
-If a 1-week branch-local D4 prototype on the FA-path slice (~10 layers, 10% of the workload) shows:
-- Wall reduction ≥ 60 ms above D3-projected savings (AC-P1 / 80 ms target × 75% to account for FA-only scope), AND
-- No new parity violations introduced (4-fixture decode no-regression on FA-only canary),
+The original "1-week branch-local D4 prototype on the FA-path slice with ≥ 60 ms wall reduction" gate was **structurally unreachable** (Phase 0a.2 research showed FA-path CB overhead totals ~0.064 ms; D4 collapsing to ~3 CBs saves ~0.059 ms — three orders of magnitude below the 60 ms threshold). Phase 0a.4 then ruled out M3 (per-dispatch overhead) and confirmed D3's CB-consolidation thesis is well-grounded; D4 vs D3 is no longer a falsification race.
 
-then D4 BECOMES the primary path and D3 is dropped. Otherwise, D4 stays deferred and D3 ships as planned. **This Phase 0 evidence-based gate replaces the original "rejected with prejudice" framing.**
+**D4 status is now: documented fallback, not blocking gate.** D4 is queued as the architectural alternative if any of the following triggers fire post-D3 ship:
+- D3 Phase 3b stalls on the chunk-prefill arena lifetime work (per ADR-019 Risk Register F2 mitigation plan)
+- AC-P1 (in-process prefill ≤ 1230 ms) is missed by ≥ 100 ms after Phase 4 lands; the residual would suggest CB consolidation alone doesn't close the gap and a different scheduling primitive is needed
+- hf2q starts shipping non-transformer workloads (encoder-decoder, vision-language, agentic tool-use scheduling) where the watermark heuristic's "no fixed stage boundaries" property earns its keep
 
-**Revisit triggers post-D3 ship:** if hf2q starts shipping non-transformer workloads (encoder-decoder, vision-language, agentic tool-use scheduling) where the watermark heuristic earns its keep, OR if D3 Phase 3b stalls on the chunk-prefill arena work, D4 is the queued fallback architecture.
+**Microprototype is NOT a Phase 0 deliverable.** Phase 0 closes with the four-subphase chain (0a.1 / 0a.2 design / 0a.3 / 0a.4) all landed; D4 microprototype implementation is queued for follow-up CFA cycle iff a trigger above fires.
 
 ---
 
@@ -389,12 +406,13 @@ Concrete, testable, with thresholds. Pre-registered before implementation begins
 
 | ID | Metric | Threshold | Source |
 |---|---|---|---|
-| **AC-P1** | Wall-time, pp4096 chunk-engaged | hf2q ≤ 1769 ms (vs current 1849 ms; ≥ 80 ms reduction = 16% of 530 ms encoder/orchestration residual) | iter88a fixture, 5-trial trimmed median, cold start |
+| **AC-P1** | Wall-time, in-process prefill, chunk-engaged pp4096 | hf2q ≤ **1230 ms** (vs current 1538 ms; within ±50 ms of llama.cpp 1186 ms; canonical post-0a.4 reframe — see §Phase 0a.4 line 554) | apex Q4_0-flat fixture, 5-trial trimmed median, cold start, in-process `prefill:` window |
+| **AC-P1-legacy** | Wall-time, llama-bench protocol, pp4096 chunk-engaged | hf2q ≤ 1769 ms (vs original 1849 ms baseline) | llama-bench harness — secondary metric; the 311 ms gap to AC-P1 is llama-bench wrap (model-load + warmup + multi-iter) per 0a.1 cross-protocol finding |
 | **AC-P2** | Wall-time, pp4127 default-axis | hf2q ≤ 1480 ms (vs current 1510 ms; no regression + ≥ 30 ms reduction) | same harness |
 | **AC-P3** | Wall-time, decode (4 fixtures) | All 4 ≥ 1.00× peer (no regression from current 1.07× decode parity) | iter61c re-validation harness |
-| **AC-P4** | Sync count, chunk-engaged pp4096 | `sync_count ≤ 12` (down from current ~96 estimated via §"Production blocking site enumeration") | `mlx_native::sync_count()` runtime telemetry |
-| **AC-P5** | Sync count, pp80 non-chunk | `sync_count == 6` (unchanged from P21 K=8 floor) | same |
-| **AC-P6** | CB count, chunk-engaged pp4096 | `cmd_buf_count ≤ 8` (down from current ~100) | `mlx_native::cmd_buf_count()` |
+| **AC-P4** | Sync count, chunk-engaged pp4096 | `sync_count` stays at K=8 floor (~6); does NOT decrease — Phase 2/3a use `commit_labeled` (non-blocking) so they don't move sync_count. Canonical CB-count gate is AC-P6. | `mlx_native::sync_count()` runtime telemetry |
+| **AC-P5** | Sync count, pp80 non-chunk | `sync_count == 6` (unchanged from P21 K=8 floor; pp80 fixture for Phase 1 fusion check) | same; Phase 1 LANDED at 6→5 on Qwen, 9→8 on 27B-dwq46 |
+| **AC-P6** | xctrace CB submissions, chunk-engaged pp4096 | **≤ 30** (down from 236 measured in 0a.4; 7.9× reduction) — canonical post-0a.4 reframe; mlx-native internal `cmd_buf_count` is the prefill-window-only secondary metric | `xctrace export --xpath` per `scripts/adr019-phase0a1-capture-and-bin.sh` |
 | **AC-P7** | iter88a microbench, gate/up MoE FFN | ≥ 1.0× peer (no regression from current 1.16-1.20×) | iter88a per-kernel comparison harness |
 
 ### Parity gates
@@ -433,6 +451,20 @@ Phased, gated, with parity per increment. Each phase ships behind its own env ga
 ### Phase 0a — Pre-implementation measurement gates (NEW post-Codex review)
 
 **Promoted from OQ-1 / OQ-2 per Codex Phase-2b review (2026-05-03)** — these measurements run BEFORE Phase 0b (EncoderSession) abstraction work to validate the assumptions D3 rests on.
+
+**Phase 0a RESOLVED 2026-05-02 (canonical summary; full evidence log in subsections below):**
+
+| Sub-phase | Status | Headline finding |
+|---|---|---|
+| 0a.1 hf2q xctrace | ✅ landed `42dd6c6` | hf2q in-process prefill 1538 ms; 99.6% GPU-active; pipeline-bubble 6 ms (0.4%); residency churn 0 |
+| 0a.1 cross-protocol llama.cpp | ✅ landed `21ddcab` | llama.cpp in-process prefill 1186 ms; **352 ms in-process gap is GPU-side** (NOT llama-bench-wrap as initially considered) |
+| 0a.2 D4 design research | ✅ landed `aafedb6` | D4 streamline-watermark structurally viable; FA-only acceptance threshold UNREACHABLE (60ms vs 0.06ms achievable); microprototype DEFERRED, not blocking |
+| 0a.3 MTLEvent microbench | ✅ landed `4c39fd3` | H1=1.25 µs/pair, H2=2.79 µs/cycle, H3=13.3 µs/CB — all negligible vs 340 ms target |
+| 0a.4 Metal perf counter attribution | ✅ landed `ad887a8` | M3 (per-dispatch cost) RULED OUT; verdict M1 and/or M2 (per-CB GPU-side cost); 39.33× CB asymmetry (236 vs 6) at ~1.48 ms/CB recovers ~340 ms |
+
+**Architectural verdict:** D3 PROCEEDS; CB consolidation is the lever. **Phase 0b AUTHORIZED 2026-05-02** under reframed AC-P1 (in-process prefill ≤ 1230 ms) + AC-P6 (xctrace CB submissions ≤ 30). D4 stays deferred as fallback only (no longer blocking gate). Operator-driven Xcode GUI Counter Set capture queued as nice-to-have for M1-vs-M2 split (does NOT block Phase 0b/1/2/3/4).
+
+**Evidence log** — the per-subphase narrative below preserves the historical "HOLD/AUTHORIZED" decision flips for audit purposes; readers acting on the ADR should consult the resolved-summary table above for current status, not the historical narrative.
 
 **Phase 0a.1 — xctrace residual attribution.** Operator-driven Xcode Instruments capture of one chunk-engaged generate run on apex q4_0-flat pp4096. Bin the 530 ms `wall - GPU` residual by:
 - CPU encoder-build time (per-CB)
