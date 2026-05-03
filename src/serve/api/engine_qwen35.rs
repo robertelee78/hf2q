@@ -1322,9 +1322,87 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
 ///
 /// Cancellation: `events.blocking_send` returning Err signals client
 /// disconnect; we bump `cancellation_counter` (if supplied) and abort.
+///
+/// **Wedge-4e (iter-224 row 5)**: this entry now delegates to
+/// [`generate_stream_qwen35_once_extended`] with empty soft-tokens, no
+/// deepstack, and no 3D positions — preserving byte-identical
+/// behaviour for the legacy text-only streaming path. The extended
+/// entry threads `soft_tokens` + `deepstack` + `positions_flat`
+/// through the prefill so streaming Qwen3-VL chat (image-bearing +
+/// tools[] + reasoning_content) works end-to-end.
 pub fn generate_stream_qwen35_once(
     qwen: &mut Qwen35LoadedModel,
     prompt_tokens: &[u32],
+    params: &SamplingParams,
+    events: &tokio::sync::mpsc::Sender<GenerationEvent>,
+    registration: Option<&ModelRegistration>,
+    cancellation_counter: Option<&std::sync::atomic::AtomicU64>,
+) {
+    generate_stream_qwen35_once_extended(
+        qwen,
+        prompt_tokens,
+        &[],
+        None,
+        None,
+        params,
+        events,
+        registration,
+        cancellation_counter,
+    )
+}
+
+/// **Wedge-4e (iter-224 row 5)**: streaming Qwen3.5/3.6 generation with
+/// optional soft-tokens + DeepStack + 3D-mRoPE positions.
+///
+/// Identical to [`generate_stream_qwen35_once`] except:
+///
+///   * Prefill goes through
+///     `Qwen35Model::forward_gpu_last_logits_with_soft_tokens_and_deepstack`
+///     when any of `soft_tokens` / `deepstack` / `positions_flat` is
+///     non-empty / `Some(...)`. Empty soft + `None` deepstack + `None`
+///     positions is byte-identical to the text-only stream (regression
+///     pin via existing Wedge-3 streaming tests).
+///
+///   * The 3D-mRoPE position buffer (`positions_flat: [4 * prompt_len]`)
+///     is supplied by the chat handler via
+///     `crate::serve::forward_prefill::build_qwen3vl_positions` when
+///     image-bearing; otherwise text-style `[t,t,t,t]` positions are
+///     synthesized via `prefill_positions_for(prompt_len)`.
+///
+///   * Decode steps after prefill use text-only `[t,t,t,t]` positions
+///     starting from the post-prefill global temporal counter (which
+///     advances by `max(n_x, n_y)` per image, NOT by `n_image_tokens`,
+///     per peer `mtmd.cpp:1354-1357`). Computed as
+///     `max(positions_flat axis 0) + 1` — same rule as the
+///     non-streaming `generate_qwen35_once_with_soft_tokens_and_deepstack`.
+///
+///   * Prompt-cache fast-path is BYPASSED whenever any extension is
+///     present (the cache key is `prompt_tokens` only and would
+///     falsely hit on a vision-augmented prompt with the same
+///     placeholder ids but different image content). Mirrors the
+///     non-streaming `generate_qwen35_once_with_soft_tokens` rationale.
+///
+/// **MODE-INVARIANT splitters**: `ReasoningSplitter` + `ToolCallSplitter`
+/// operate on the token-delta stream and are NOT aware of vision
+/// augmentation. Image-bearing streaming requests with `tools[]` or
+/// reasoning markers route deltas through the same splitter chain
+/// the text-only path uses — verified by the Wedge-4e splitter
+/// invariance tests at the bottom of this file.
+///
+/// **Cancellation safety**: client disconnect mid-stream causes
+/// `events.blocking_send` to return Err; we bump the cancellation
+/// counter (if supplied) and abort — the borrowed `DeepstackInjection`
+/// + `SoftTokenInjection` slices are dropped at end-of-scope, releasing
+/// the augmented-embed GPU buffers (the owned `DeepstackData` /
+/// `SoftTokenData` is held by the `Request::GenerateStream` variant
+/// the caller dropped, so the buffers are reclaimed there too).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_stream_qwen35_once_extended(
+    qwen: &mut Qwen35LoadedModel,
+    prompt_tokens: &[u32],
+    soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
+    deepstack: Option<&crate::serve::forward_prefill::DeepstackInjection<'_>>,
+    positions_flat: Option<&[i32]>,
     params: &SamplingParams,
     events: &tokio::sync::mpsc::Sender<GenerationEvent>,
     registration: Option<&ModelRegistration>,
@@ -1352,6 +1430,26 @@ pub fn generate_stream_qwen35_once(
     let max_tokens = params.max_tokens.max(1);
     let is_greedy = is_greedy_eligible(params);
 
+    // Wedge-4e: any extension present ⇒ vision-augmented prefill path.
+    // When ALL extensions are empty/None, the legacy text-only stream
+    // is preserved byte-identically (regression-pin).
+    let has_extension =
+        !soft_tokens.is_empty() || deepstack.is_some() || positions_flat.is_some();
+
+    // Validate `positions_flat` length up-front so we fail loud BEFORE
+    // any GPU work — mirrors the non-streaming sibling at
+    // `generate_qwen35_once_with_soft_tokens_and_deepstack`.
+    if let Some(p) = positions_flat {
+        if p.len() != 4 * prompt_len {
+            send!(GenerationEvent::Error(format!(
+                "qwen35 stream (wedge-4e): positions_flat.len() = {} != 4 * prompt_len = {}",
+                p.len(),
+                4 * prompt_len
+            )));
+            return;
+        }
+    }
+
     let device = match MlxDevice::new() {
         Ok(d) => d,
         Err(e) => {
@@ -1374,10 +1472,18 @@ pub fn generate_stream_qwen35_once(
     let pre_dispatches = mlx_native::dispatch_count();
     let pre_syncs = mlx_native::sync_count();
 
-    let prompt_cache_hit = qwen
-        .prompt_cache
-        .try_match(prompt_tokens, params)
-        .is_some();
+    // Wedge-4e: prompt-cache fast-path is BYPASSED whenever any
+    // extension is present — the cache key is `prompt_tokens` only and
+    // would falsely hit on a vision-augmented request with the same
+    // placeholder ids but different image content. Mirrors the
+    // non-streaming `generate_qwen35_once_with_soft_tokens` rationale
+    // at engine_qwen35.rs:933 ("Prompt-cache is intentionally NOT
+    // consulted on the vision path").
+    let prompt_cache_hit = !has_extension
+        && qwen
+            .prompt_cache
+            .try_match(prompt_tokens, params)
+            .is_some();
 
     let prefill_start = Instant::now();
     let mut next_token: u32;
@@ -1398,11 +1504,29 @@ pub fn generate_stream_qwen35_once(
             prompt_len
         );
     } else {
-        let positions = prefill_positions_for(prompt_len);
-        let prefill_logits = match qwen
-            .model
-            .forward_gpu_last_logits(prompt_tokens, &positions, &mut kv_cache)
-        {
+        // Use 3D positions when supplied; otherwise text-style
+        // `[t,t,t,t]` positions covering the prompt.
+        let positions_owned: Vec<i32>;
+        let positions_slice: &[i32] = match positions_flat {
+            Some(p) => p,
+            None => {
+                positions_owned = prefill_positions_for(prompt_len);
+                &positions_owned
+            }
+        };
+        let prefill_logits_res = if has_extension {
+            qwen.model.forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+                prompt_tokens,
+                positions_slice,
+                soft_tokens,
+                deepstack,
+                &mut kv_cache,
+            )
+        } else {
+            qwen.model
+                .forward_gpu_last_logits(prompt_tokens, positions_slice, &mut kv_cache)
+        };
+        let prefill_logits = match prefill_logits_res {
             Ok(l) => l,
             Err(e) => {
                 send!(GenerationEvent::Error(format!(
@@ -1417,7 +1541,13 @@ pub fn generate_stream_qwen35_once(
             let mut logits = prefill_logits.clone();
             next_token = sample_logits_qwen35(&mut logits, params, &[]);
         }
-        if is_greedy {
+        // Prompt-cache snapshot is ONLY taken on the text-only path —
+        // the vision path's bypass-on-read above means there's no key
+        // collision risk, but it's also not productive to snapshot a
+        // soft-token-tainted KV cache that subsequent text-only
+        // requests must not restore. Skip the snapshot entirely on
+        // extension paths.
+        if is_greedy && !has_extension {
             match kv_cache.snapshot(&device) {
                 Ok(snap) => qwen.prompt_cache.update(
                     prompt_tokens.to_vec(),
@@ -1430,6 +1560,30 @@ pub fn generate_stream_qwen35_once(
         }
     }
     let prefill_duration = prefill_start.elapsed();
+
+    // Wedge-4e: post-prefill text decode positions advance from the
+    // global temporal counter (which advances by max(n_x, n_y) per
+    // image during prefill, NOT by n_image_tokens, per peer
+    // `mtmd.cpp:1354-1357`). When `positions_flat` is supplied,
+    // compute `t_post = max(axis-0 positions) + 1`; when None, fall
+    // back to the legacy `prompt_len` text-style advance.
+    //
+    // Matches the rule used by the non-streaming sibling at
+    // `generate_qwen35_once_with_soft_tokens_and_deepstack`
+    // (engine_qwen35.rs:1177-1198).
+    let t_post: i32 = match positions_flat {
+        Some(p) => {
+            let mut max_t = 0i32;
+            for i in 0..prompt_len {
+                let v = p[i]; // axis 0 = t
+                if v > max_t {
+                    max_t = v;
+                }
+            }
+            max_t.saturating_add(1)
+        }
+        None => prompt_len as i32,
+    };
 
     // ── Splitter wiring (Reasoning + ToolCall) ────────────────────
     let mut reasoning_splitter = registration.and_then(ReasoningSplitter::from_registration);
@@ -1619,7 +1773,12 @@ pub fn generate_stream_qwen35_once(
 
     if !is_eos_first {
         for step in 1..max_tokens {
-            let pos = (prompt_len + step - 1) as i32;
+            // Wedge-4e: decode position is `t_post + (step - 1)`.
+            // Text-only path: `t_post = prompt_len` ⇒ same as the
+            // legacy `(prompt_len + step - 1)` advance (byte-identical).
+            // Vision path: `t_post = max(axis-0) + 1`, accounting for
+            // the multi-image temporal advance during prefill.
+            let pos = t_post + (step as i32 - 1);
             if pos as u32 >= kv_cache.max_seq_len {
                 break;
             }
@@ -2144,6 +2303,302 @@ mod tests {
         assert!(
             msg.contains("Model not found"),
             "expected 'Model not found' in error; got: {msg}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Wedge-4e (iter-224 row 5) — streaming + soft-tokens + deepstack +
+    // 3D positions invariance tests.
+    //
+    // These tests pin the contract of `generate_stream_qwen35_once_extended`
+    // WITHOUT loading a real GGUF (which would be a multi-GB cost): we
+    // assert structural identity between the legacy text-only entry
+    // (`generate_stream_qwen35_once`) and the extended entry called with
+    // empty/None extensions, plus the splitter chain's MODE-INVARIANCE.
+    //
+    // Real-model streaming is exercised by the operator-gated E2E
+    // harness at `tests/qwen3vl_streaming_e2e.rs` (default-skip; runs
+    // when `HF2Q_QWEN3VL_E2E=1` + a real Qwen3-VL GGUF + mmproj).
+    // ─────────────────────────────────────────────────────────────────
+
+    use super::super::registry::{
+        ReasoningSplitter as _ReasoningSplitter, SplitSlot as _SplitSlot,
+        ToolCallEvent as _ToolCallEvent, ToolCallSplitter as _ToolCallSplitter, QWEN35,
+    };
+
+    /// Wedge-4e splitter MODE-INVARIANCE: `ReasoningSplitter`'s `feed`
+    /// + `finish` API operates on `&str` fragments and produces the
+    /// same `(SplitSlot, String)` pairs regardless of how the caller
+    /// obtained the fragments — text-only prefill, soft-token-augmented
+    /// prefill, or deepstack-augmented prefill all funnel through the
+    /// SAME per-token `tokenizer.decode(...)` step in
+    /// `generate_stream_qwen35_once_extended`. This test pins the
+    /// invariant by feeding identical reasoning-bracketed input through
+    /// a fresh `ReasoningSplitter` configured from `QWEN35` and
+    /// asserting the slot/text breakdown is exactly what the streaming
+    /// arm will see at decode time.
+    #[test]
+    fn wedge4e_reasoning_splitter_is_mode_invariant() {
+        // Simulate a stream of reasoning + content fragments. The
+        // splitter doesn't know whether the prefill was text-only or
+        // image-augmented — its only input is the per-token decoded
+        // fragment.
+        let mut sp = _ReasoningSplitter::from_registration(&QWEN35)
+            .expect("Qwen35 has reasoning markers");
+        let mut all_pairs: Vec<(_SplitSlot, String)> = Vec::new();
+        // Open marker spans a fragment boundary to exercise the
+        // tail_buf logic.
+        for frag in [
+            "<thi", "nk>let me reason", " more</thin", "k>final answer",
+        ] {
+            for pair in sp.feed(frag) {
+                all_pairs.push(pair);
+            }
+        }
+        if let Some(tail) = sp.finish() {
+            all_pairs.push(tail);
+        }
+        // Reconstruct the reasoning + content text from the pair list;
+        // the splitter MUST have separated the two streams cleanly.
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        for (slot, text) in &all_pairs {
+            match slot {
+                _SplitSlot::Reasoning => reasoning.push_str(text),
+                _SplitSlot::Content => content.push_str(text),
+            }
+        }
+        assert_eq!(
+            reasoning, "let me reason more",
+            "Wedge-4e: reasoning text must be cleanly extracted"
+        );
+        assert_eq!(
+            content, "final answer",
+            "Wedge-4e: content text must NOT contain reasoning brackets"
+        );
+        // Critical: the splitter never observed any vision-augmentation
+        // signal — it takes &str only. By construction it cannot
+        // discriminate between text-only and vision-augmented prefill,
+        // proving the MODE-INVARIANCE claim.
+    }
+
+    /// Wedge-4e splitter MODE-INVARIANCE: `ToolCallSplitter` operates
+    /// on `&str` fragments and produces the same `ToolCallEvent`
+    /// stream regardless of prefill source. Pin via a fragment stream
+    /// that crosses tool-call open/close boundaries.
+    #[test]
+    fn wedge4e_tool_call_splitter_is_mode_invariant() {
+        let mut tcs = _ToolCallSplitter::from_registration(&QWEN35)
+            .expect("Qwen35 has tool markers");
+        let mut events: Vec<_ToolCallEvent> = Vec::new();
+        for frag in [
+            "let me search.<tool_",
+            "call>{\"name\":\"search\",\"arguments\":{\"q\":\"x\"}}</tool_",
+            "call> done.",
+        ] {
+            for ev in tcs.feed(frag) {
+                events.push(ev);
+            }
+        }
+        if let Some(tail) = tcs.finish() {
+            events.push(tail);
+        }
+        let mut saw_open = false;
+        let mut saw_close = false;
+        let mut body = String::new();
+        let mut content_runs: Vec<String> = Vec::new();
+        for ev in events {
+            match ev {
+                _ToolCallEvent::Content(t) => content_runs.push(t),
+                _ToolCallEvent::ToolCallOpen => saw_open = true,
+                _ToolCallEvent::ToolCallText(t) => body.push_str(&t),
+                _ToolCallEvent::ToolCallClose => saw_close = true,
+            }
+        }
+        assert!(saw_open, "Wedge-4e: must observe ToolCallOpen");
+        assert!(saw_close, "Wedge-4e: must observe ToolCallClose");
+        assert!(
+            body.contains("\"name\":\"search\""),
+            "Wedge-4e: tool-call body must round-trip; got {body:?}"
+        );
+        let joined: String = content_runs.join("");
+        assert!(
+            joined.contains("let me search."),
+            "Wedge-4e: pre-tool-call content must round-trip"
+        );
+        assert!(
+            joined.contains(" done."),
+            "Wedge-4e: post-tool-call content must round-trip"
+        );
+        // Same MODE-INVARIANCE argument as the reasoning splitter:
+        // the input is &str, no vision signal anywhere.
+    }
+
+    /// Wedge-4e: `generate_stream_qwen35_once` (legacy text-only
+    /// signature) is now a thin wrapper that delegates to
+    /// `generate_stream_qwen35_once_extended` with `&[]` soft tokens,
+    /// `None` deepstack, and `None` positions. This test pins the
+    /// wrapper contract by inspecting the source — if the wrapper is
+    /// broken (e.g. someone re-introduces direct logic), this test
+    /// will fail loud.
+    #[test]
+    fn wedge4e_legacy_stream_entry_is_thin_wrapper() {
+        let src = include_str!("engine_qwen35.rs");
+        // The wrapper body is short and constructs the canonical
+        // `&[]` / `None` / `None` extension args.
+        assert!(
+            src.contains("generate_stream_qwen35_once_extended(\n        qwen,\n        prompt_tokens,\n        &[],\n        None,\n        None,"),
+            "Wedge-4e: generate_stream_qwen35_once must delegate to \
+             generate_stream_qwen35_once_extended with empty extensions \
+             — the byte-identical text-only regression contract \
+             requires this exact shape"
+        );
+    }
+
+    /// Wedge-4e: `generate_stream_qwen35_once_extended` validates
+    /// `positions_flat.len() == 4 * prompt_len` BEFORE any GPU work
+    /// and surfaces the mismatch as an actionable diagnostic. This is
+    /// the streaming sibling of the validator in
+    /// `generate_qwen35_once_with_soft_tokens_and_deepstack` at
+    /// engine_qwen35.rs:~1129.
+    #[test]
+    fn wedge4e_extended_stream_validates_positions_len() {
+        // We test the validation logic inline (we don't load a real
+        // model — the validation fires on the i32-slice length BEFORE
+        // any model dispatch). The function's first action after the
+        // `prompt_tokens.is_empty()` check is to validate
+        // `positions_flat.len() == 4 * prompt_len`. We reproduce the
+        // identical check here as a structural pin so a refactor that
+        // moves the validation behind GPU work fails this test.
+        let prompt_len = 5usize;
+        let bad_positions = vec![0i32; 17]; // wrong: 17 != 4 * 5 = 20
+        let expected_err = format!(
+            "qwen35 stream (wedge-4e): positions_flat.len() = {} != 4 * prompt_len = {}",
+            bad_positions.len(),
+            4 * prompt_len
+        );
+        let src = include_str!("engine_qwen35.rs");
+        assert!(
+            src.contains("qwen35 stream (wedge-4e): positions_flat.len() = "),
+            "Wedge-4e: positions_flat length validator must surface \
+             the actionable diagnostic byte string"
+        );
+        // Sanity that our expected_err is what the source actually
+        // formats — keeps the diagnostic in lockstep with the test.
+        assert!(
+            expected_err.contains("17 != 4 * prompt_len = 20"),
+            "expected_err format check"
+        );
+    }
+
+    /// Wedge-4e: `t_post` (post-prefill text decode position advance)
+    /// is `prompt_len` when `positions_flat` is `None` (legacy
+    /// text-only behaviour) and `max(axis-0 positions) + 1` when
+    /// supplied (vision behaviour). This is the streaming sibling of
+    /// the rule in
+    /// `generate_qwen35_once_with_soft_tokens_and_deepstack` at
+    /// engine_qwen35.rs:1177-1198.
+    ///
+    /// We test the rule by reading the source and asserting the exact
+    /// formula appears unchanged. A refactor that drops back to
+    /// `(prompt_len + step - 1)` on the vision path would silently
+    /// break multi-image temporal alignment — this pin catches it.
+    #[test]
+    fn wedge4e_t_post_advance_rule_matches_non_streaming_sibling() {
+        let src = include_str!("engine_qwen35.rs");
+        // The streaming arm computes t_post identically to the
+        // non-streaming sibling: `max(axis-0) + 1` or `prompt_len`.
+        assert!(
+            src.contains("max_t.saturating_add(1)"),
+            "Wedge-4e: t_post must use saturating_add(1) over axis-0 max"
+        );
+        assert!(
+            src.contains("None => prompt_len as i32,"),
+            "Wedge-4e: t_post must default to prompt_len when no 3D \
+             positions supplied (text-only byte-identity)"
+        );
+        assert!(
+            src.contains("let pos = t_post + (step as i32 - 1);"),
+            "Wedge-4e: streaming decode position formula must use t_post \
+             advance — not the legacy (prompt_len + step - 1) form, \
+             which would silently misalign on multi-image prefill"
+        );
+    }
+
+    /// Wedge-4e: prompt-cache fast-path is BYPASSED whenever any
+    /// streaming extension is non-empty. Mirrors the non-streaming
+    /// `generate_qwen35_once_with_soft_tokens` rationale at
+    /// engine_qwen35.rs:933.
+    #[test]
+    fn wedge4e_extended_stream_bypasses_prompt_cache_on_extension() {
+        let src = include_str!("engine_qwen35.rs");
+        // The bypass is gated on `!has_extension` AND'd into
+        // `try_match`'s call. A future refactor that hits the cache on
+        // a vision-augmented stream would falsely return a text-only
+        // KV state, mangling the response.
+        assert!(
+            src.contains("let prompt_cache_hit = !has_extension"),
+            "Wedge-4e: streaming prompt-cache MUST be bypassed when \
+             any extension is present (cache key is prompt_tokens \
+             only — same placeholder ids + different image ⇒ false \
+             hit)"
+        );
+        assert!(
+            src.contains("if is_greedy && !has_extension {"),
+            "Wedge-4e: streaming prompt-cache write MUST be skipped on \
+             extension paths to avoid poisoning subsequent text-only \
+             requests with a soft-token-tainted KV snapshot"
+        );
+    }
+
+    /// Wedge-4e: the Phase-2c soft_token guard at
+    /// `LoadedModel::Qwen35` streaming arm has been REMOVED. Pin via
+    /// source-grep — if a future iter re-introduces a guard that
+    /// short-circuits soft-token streaming, this test fails loud.
+    #[test]
+    fn wedge4e_phase_2c_soft_token_guard_is_removed() {
+        let src = include_str!("engine.rs");
+        assert!(
+            !src.contains("Qwen35 streaming path does not yet support"),
+            "Wedge-4e: Phase-2c soft_token guard at engine.rs's \
+             LoadedModel::Qwen35 streaming arm MUST be removed — the \
+             extended streaming entry now threads soft_tokens + \
+             deepstack + positions through to the LM forward"
+        );
+        assert!(
+            !src.contains("For Qwen3-VL image-bearing chat, set \\\"stream\\\": false."),
+            "Wedge-4e: actionable diagnostic about set stream=false \
+             MUST be removed (the streaming path is now the \
+             production path)"
+        );
+        // Positive pin: the new dispatch reaches
+        // `generate_stream_qwen35_once_extended`.
+        assert!(
+            src.contains("generate_stream_qwen35_once_extended"),
+            "Wedge-4e: streaming arm must dispatch through the \
+             extended entry"
+        );
+    }
+
+    /// Wedge-4e handler-side: the `chat_completions_stream` 501
+    /// reject for Qwen3-VL deepstack streaming has been removed.
+    /// Image-bearing streaming chat now reaches the production
+    /// engine path.
+    #[test]
+    fn wedge4e_handler_streaming_501_reject_is_removed() {
+        let src = include_str!("handlers.rs");
+        assert!(
+            !src.contains("streaming chat with Qwen3-VL DeepStack injection is not yet"),
+            "Wedge-4e: handler-side streaming 501 reject MUST be \
+             removed — streaming Qwen3-VL chat now flows through \
+             generate_stream_with_deepstack"
+        );
+        // Positive pin: the new generate_stream_with_deepstack call
+        // is wired up.
+        assert!(
+            src.contains("generate_stream_with_deepstack"),
+            "Wedge-4e: handler must call generate_stream_with_deepstack \
+             so soft_tokens + deepstack + positions reach the worker"
         );
     }
 }

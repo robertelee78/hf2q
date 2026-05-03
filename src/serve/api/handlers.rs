@@ -1611,23 +1611,21 @@ async fn chat_completions_stream(
     let summarized_messages = prepared.summarized_messages;
     let summary_tokens = prepared.summary_tokens;
 
-    // Wedge-4d streaming gap: the streaming worker
-    // (`Request::GenerateStream`) doesn't yet thread `DeepstackData` /
-    // `positions_flat` through to the LM forward. For the Qwen3-VL
-    // path this is a follow-up wedge (Wedge-4e); fall back to a 501
-    // here so the user sees an actionable message rather than a
-    // soft-token-only stream that drops the DeepStack injection.
-    if prepared.deepstack_data.is_some() || prepared.positions_flat.is_some() {
-        return ApiError::not_implemented(
-            "streaming chat with Qwen3-VL DeepStack injection is not yet \
-             supported (Wedge-4d closes the non-streaming path; \
-             streaming requires the Qwen35 stream worker arm to thread \
-             DeepstackData + 3D-mRoPE positions — Wedge-4e). Set \
-             `\"stream\": false` and retry."
-                .to_string(),
-        )
-        .into_response();
-    }
+    // **Wedge-4e (iter-224 row 5)**: streaming Qwen3-VL chat is now
+    // supported end-to-end. The Qwen35 streaming worker arm threads
+    // `soft_tokens` + `DeepstackData` + 3D-mRoPE `positions_flat`
+    // through `forward_gpu_last_logits_with_soft_tokens_and_deepstack`
+    // for prefill, then runs the standard text-only decode loop.
+    //
+    // The MODE-INVARIANT `ReasoningSplitter` + `ToolCallSplitter` chain
+    // (Wedge-3 Phase E) operates on token deltas regardless of prefill
+    // source, so reasoning_content + tool_calls work end-to-end on
+    // image-bearing streaming requests with `tools[]`.
+    //
+    // The Wedge-4d streaming-501 placeholder previously sat here; it
+    // has been REMOVED. The non-streaming chat path delegates the same
+    // engine seam at `prepare_chat_generation`'s
+    // `dispatch_qwen3vl_seam_split` call (handlers.rs:1326).
 
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
     // Worker bumps this counter if it aborts because the SSE receiver was
@@ -1636,12 +1634,14 @@ async fn chat_completions_stream(
     let cancellation_counter =
         Some(state.metrics.sse_cancellations_counter_arc());
     if let Err(e) = engine
-        .generate_stream(
+        .generate_stream_with_deepstack(
             prepared.prompt_tokens,
             prepared.params,
             events_tx,
             cancellation_counter,
             prepared.soft_tokens,
+            prepared.deepstack_data,
+            prepared.positions_flat,
         )
         .await
     {

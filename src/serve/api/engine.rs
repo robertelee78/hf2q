@@ -875,6 +875,28 @@ enum Request {
         /// using the same forward-prefill API the non-streaming
         /// `Request::GenerateWithSoftTokens` arm already uses.
         soft_tokens: Vec<SoftTokenData>,
+        /// **Wedge-4e (iter-224 row 5)**: DeepStack injection chunks
+        /// split out from the augmented `[n_image_tokens, hidden *
+        /// (1 + N_deepstack)]` ViT output. `None` for Gemma /
+        /// non-Qwen3-VL paths and for the legacy text-only / pure
+        /// soft-token streaming requests; the Qwen35 streaming arm
+        /// rebuilds borrowed `DeepstackInjection<'_>` slices from this
+        /// owned `DeepstackData` for the per-token forward pass.
+        ///
+        /// Mirrors the `Request::GenerateWithSoftTokens.deepstack`
+        /// field added in Wedge-4d so the streaming and non-streaming
+        /// paths consume the same engine-seam shape.
+        deepstack: Option<DeepstackData>,
+        /// **Wedge-4e (iter-224 row 5)**: 3D-mRoPE position buffer
+        /// (`[4 * prompt_len]` axis-major i32) built by
+        /// `build_qwen3vl_positions`. `None` for Gemma / non-Qwen3-VL
+        /// streaming paths (the Qwen35 stream worker arm synthesizes
+        /// `prefill_positions_for(prompt_len)` text-style positions
+        /// when this is None).
+        ///
+        /// Mirrors the `Request::GenerateWithSoftTokens.positions_flat`
+        /// field added in Wedge-4d.
+        positions_flat: Option<Vec<i32>>,
     },
     /// Pooled-embedding request (ADR-005 Phase 2a Task #8 / iter-92).
     ///
@@ -2352,12 +2374,55 @@ impl Engine {
         cancellation_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
         soft_tokens: Vec<SoftTokenData>,
     ) -> Result<()> {
+        self.generate_stream_with_deepstack(
+            prompt_tokens,
+            params,
+            events_tx,
+            cancellation_counter,
+            soft_tokens,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// **Wedge-4e (iter-224 row 5)**: streaming-with-soft-tokens entry
+    /// extended with optional `deepstack: Option<DeepstackData>` and
+    /// `positions_flat: Option<Vec<i32>>` for the Qwen3-VL streaming
+    /// path. When both are `None`, behaviour is byte-identical to the
+    /// legacy `generate_stream` (which still exists as a thin wrapper
+    /// passing `None` for both).
+    ///
+    /// This is the single seam through which the chat handler routes
+    /// streaming Qwen3-VL chat (image-bearing + tools[] + reasoning)
+    /// — the worker thread rebuilds borrowed `DeepstackInjection<'_>`
+    /// slices and dispatches through the
+    /// `forward_gpu_last_logits_with_soft_tokens_and_deepstack` LM
+    /// forward, mirroring the non-streaming
+    /// `generate_with_soft_tokens_and_deepstack` shape.
+    ///
+    /// The MODE-INVARIANT `ReasoningSplitter` and `ToolCallSplitter`
+    /// chain (Wedge-3 Phase E) sees the per-token decoded fragments
+    /// regardless of prefill source, so reasoning_content + tool_calls
+    /// surface end-to-end on multimodal streaming requests.
+    pub async fn generate_stream_with_deepstack(
+        &self,
+        prompt_tokens: Vec<u32>,
+        params: SamplingParams,
+        events_tx: mpsc::Sender<super::sse::GenerationEvent>,
+        cancellation_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+        soft_tokens: Vec<SoftTokenData>,
+        deepstack: Option<DeepstackData>,
+        positions_flat: Option<Vec<i32>>,
+    ) -> Result<()> {
         let req = Request::GenerateStream {
             prompt_tokens,
             params,
             events: events_tx,
             cancellation_counter,
             soft_tokens,
+            deepstack,
+            positions_flat,
         };
         match self.inner.tx.try_send(req) {
             Ok(()) => Ok(()),
@@ -2603,6 +2668,8 @@ fn worker_run(
                 events,
                 cancellation_counter,
                 soft_tokens,
+                deepstack,
+                positions_flat,
             } => {
                 // The streaming path sends every event (Delta / Done / Error)
                 // via `events`. Errors stay inside the function — the
@@ -2618,6 +2685,17 @@ fn worker_run(
                 // prefill path (the prefill function is already a thin wrapper
                 // around `forward_prefill_with_soft_tokens` with an empty
                 // slice — see `src/serve/forward_prefill.rs:111-118`).
+                //
+                // **Wedge-4e (iter-224 row 5)**: extended with borrowed
+                // `DeepstackInjection<'_>` constructed from the owned
+                // `DeepstackData` (mirrors the non-streaming
+                // `Request::GenerateWithSoftTokens` arm). When both
+                // `deepstack` and `positions_flat` are `None`, behaviour is
+                // byte-identical to the pre-Wedge-4e text-only / pure
+                // soft-token streaming path. The Phase-2c soft_token guard
+                // that previously sat here has been REMOVED — the Qwen35
+                // streaming arm now threads soft_tokens + deepstack +
+                // positions through `generate_stream_qwen35_once_extended`.
                 let injections: Vec<SoftTokenInjection<'_>> = soft_tokens
                     .iter()
                     .map(|d| SoftTokenInjection {
@@ -2625,8 +2703,19 @@ fn worker_run(
                         embeddings: &d.embeddings,
                     })
                     .collect();
+                let ds_borrow_stream: Option<crate::serve::forward_prefill::DeepstackInjection<'_>> =
+                    deepstack.as_ref().map(|d| {
+                        crate::serve::forward_prefill::DeepstackInjection {
+                            image_token_positions: d.image_token_positions.clone(),
+                            chunks: d.chunks.iter().collect(),
+                        }
+                    });
                 match &mut loaded {
                     LoadedModel::Gemma(g) => {
+                        // Gemma streaming does not consume `deepstack` or
+                        // 3D `positions_flat` (those are Qwen3-VL-only);
+                        // the existing entry point ignores both.
+                        let _ = (&ds_borrow_stream, &positions_flat);
                         generate_stream_once(
                             g,
                             &prompt_tokens,
@@ -2642,36 +2731,21 @@ fn worker_run(
                     // routing.  Mirrors the Gemma stream arm shape; tool
                     // calls flow through the close-buffered emitter
                     // (W-B3 incremental shape is a Wedge-4 follow-up).
+                    //
+                    // **Wedge-4e (iter-224 row 5)**: routes through the
+                    // soft-token + deepstack + 3D-positions extended
+                    // entry point. When all extensions are empty/None,
+                    // behaviour is byte-identical to the pre-Wedge-4e
+                    // text-only streaming path (the splitter chain is
+                    // MODE-INVARIANT — it operates on token deltas
+                    // regardless of prefill source).
                     LoadedModel::Qwen35(q) => {
-                        // Wedge-4d Codex Phase-2c (2026-05-02): the Qwen35
-                        // streaming worker does NOT yet thread soft-tokens
-                        // OR the Wedge-4c.5 DeepstackInjection / Wedge-4d
-                        // 3D positions through `generate_stream_qwen35_once`
-                        // — that's Wedge-4e's scope. The PUBLIC chat
-                        // handler at handlers.rs already returns HTTP 501
-                        // before image-bearing Qwen3-VL streaming reaches
-                        // this dispatch (see `dispatch_qwen3vl_seam_split`
-                        // and the streaming reject in `process_multimodal_content`),
-                        // BUT the lower-level engine API is reachable
-                        // directly (programmatic callers) and would
-                        // silently drop the soft_tokens injection without
-                        // this guard. Fail loud here with an actionable
-                        // diagnostic rather than producing text-only
-                        // output for what was a soft-token request.
-                        if !soft_tokens.is_empty() {
-                            let _ = events.send(super::sse::GenerationEvent::Error(
-                                "Qwen35 streaming path does not yet support \
-                                 soft-token injections (Wedge-4c.5 DeepStack \
-                                 + Wedge-4d 3D positions). For Qwen3-VL \
-                                 image-bearing chat, set \"stream\": false. \
-                                 Tracking: ADR-005 Wedge-4e."
-                                    .to_string(),
-                            ));
-                            continue;
-                        }
-                        super::engine_qwen35::generate_stream_qwen35_once(
+                        super::engine_qwen35::generate_stream_qwen35_once_extended(
                             q,
                             &prompt_tokens,
+                            &injections,
+                            ds_borrow_stream.as_ref(),
+                            positions_flat.as_deref(),
                             &params,
                             &events,
                             registration.as_ref(),
