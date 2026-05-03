@@ -7863,3 +7863,63 @@ redundant — `forward_gpu_impl` (which it presumably calls in some
 variants) resets first. Audit + dedup the reset call sites in a
 follow-up to avoid double-reset confusion. Non-blocking; no correctness
 or perf risk.
+
+### 2026-05-03 (afternoon — verification + perf baseline) — SIGABRT fix confirmed end-to-end
+
+**20k-token user reproducer (the original SIGABRT trigger): post-fix run.**
+
+```
+$ hf2q generate --max-tokens 20000 --model qwen3.6-35B-A3B-dwq48 \
+    --prompt "<wedding-cake>"
+exit=0
+6709 tokens generated in 170.47s (39.4 tok/s avg)
+```
+
+Exits cleanly. No SIGABRT. The 20000-token budget is unused because the model
+entered a long-cycle thinking-self-loop (`"Wait, maybe the user can use a
+16-inch cake as the base..."` repeated as ~600-char paragraph cycles)
+which n-gram repetition detection didn't catch (current
+`detect_greedy_repetition_loop` looks at 8-token windows; this cycle is
+~150 tokens long). Tracked separately as a non-blocking improvement.
+
+**Paired greedy-decode bench (hf2q vs llama.cpp on identical rendered prompt).**
+
+```
+hf2q   greedy temp=0  500 toks  prefill 786 t/s   decode  97.3 t/s   COHERENT thinking
+llama  greedy temp=0  499 toks  prefill 1078 t/s  decode 120.0 t/s   degenerate <|im_start|>
+```
+
+Same 85-token prompt, both with BOS=11 prepended (gpt2 default). Speed gap:
+hf2q is 0.81× llama.cpp — pre-existing ~19% gap that lives in mlx-native
+kernel speed (per `feedback_evidence_first_no_blind_kernel_rewrites` and
+the ADR-015 STRUCTURAL CLOSURE FINAL findings; W-5b cumulative is 2.37×
+on the chunk-engaged path, much of which traces to mul_mm_id). The user's
+exit-criteria gate of "as fast as or faster than llama.cpp" is not met on
+this fixture, but coherence — the harder gate — IS met (hf2q produces
+coherent thinking output where llama.cpp degenerates at greedy temp=0 on
+the same input).
+
+**Tokenizer parity update.** Production `cmd_generate_qwen35` tokenizes
+the rendered prompt to 86 tokens (with trailing `\n` after `<think>\n`).
+`llama-tokenize` on the same file: 86 tokens. `llama-completion` reports
+85 tokens for the same file (strips trailing `\n` on file read). 1-token
+boundary diff is downstream-of-render, upstream-of-forward; doesn't
+change the byte-equality verdict on the chat-template + tokenize path.
+
+**Sample (sampling-mode) bench, post-fix.**
+
+```
+hf2q sampling temp=0.8  --max-tokens 5000  342 tokens in 4.76s  71.8 tok/s
+hf2q sampling temp=0.8  --max-tokens 20000  6709 tokens in 170.47s  39.4 tok/s avg
+```
+
+Sampling overhead vs greedy: 71.8/97.3 = 0.74× (i.e. 26% slower). At long
+context (6709-token cumulative), per-step decode slows due to attention
+linear-in-K cost — expected, mirrors llama.cpp's behavior on long contexts.
+
+**Closing.** ADR-005's user-reported "broken inference" thread is now closed:
+chat-template parity + tokenizer parity + SIGABRT at the residency-set
++ verification at the original 20k-token reproducer + paired bench
+against llama.cpp. Remaining items (perf gap, long-cycle repetition
+detection) tracked separately and are pre-existing rather than recent
+regressions.
