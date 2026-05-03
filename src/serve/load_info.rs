@@ -141,6 +141,11 @@ pub enum ArchFamily {
     /// Qwen3.5 / Qwen3.6 (DeltaNet linear-attn + periodic full-attn,
     /// dense or MoE).
     Qwen35,
+    /// Qwen3-VL **text** LM (plain dense GQA + per-head Q/K RMSNorm +
+    /// 3D-mRoPE + DeepStack-residual injection). The vision side is a
+    /// separate ViT (Wedge-4c) that produces image-token embeddings the
+    /// text LM consumes. ADR-005 Wedge-4 / iter-228a.
+    Qwen3VlText,
     /// Reserved — Llama4 (placeholder; the dispatcher errors at the
     /// `LoadedModel::load` arch peek today).
     Llama4Reserved,
@@ -153,6 +158,7 @@ impl ArchFamily {
         match self {
             ArchFamily::Gemma4 => "gemma4",
             ArchFamily::Qwen35 => "qwen35",
+            ArchFamily::Qwen3VlText => "qwen3vl-text",
             ArchFamily::Llama4Reserved => "llama4",
         }
     }

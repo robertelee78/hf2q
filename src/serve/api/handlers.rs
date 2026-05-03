@@ -421,6 +421,25 @@ pub async fn chat_completions(
                 )
                 .into_response();
             }
+            // iter-228a (ADR-005 Wedge-4): Qwen3-VL text-LM SERVE arm
+            // returns the forward-pending sentinel until iter-228b
+            // wires the dense transformer forward. Mirror the Qwen35
+            // 501 mapping so operators see a clean
+            // `qwen3vl_text_forward_pending` 501 with the
+            // operator-actionable body rather than a generic 500.
+            if msg.contains(
+                crate::inference::models::qwen3vl_text::forward::QWEN3VL_TEXT_FORWARD_PENDING_SENTINEL,
+            ) {
+                tracing::info!(
+                    error = %msg,
+                    "chat_completion routed to Qwen3-VL text SERVE arm (iter-228b pending) — returning 501"
+                );
+                return ApiError::not_implemented(
+                    crate::inference::models::qwen3vl_text::forward::QWEN3VL_TEXT_FORWARD_PENDING_MESSAGE
+                        .to_string(),
+                )
+                .into_response();
+            }
             tracing::error!(error = %msg, "chat_completion generation failed");
             return ApiError::generation_error(msg).into_response();
         }
@@ -6489,6 +6508,17 @@ async fn chat_model_embeddings(
                 if msg.contains(engine::QWEN35_NOT_IMPLEMENTED_SENTINEL) {
                     return ApiError::not_implemented(
                         engine::QWEN35_NOT_IMPLEMENTED_MESSAGE.to_string(),
+                    )
+                    .into_response();
+                }
+                // iter-228a (ADR-005 Wedge-4): Qwen3-VL text-LM embed
+                // sentinel → 501. Mirrors the chat-completion 501 mapping.
+                if msg.contains(
+                    crate::inference::models::qwen3vl_text::forward::QWEN3VL_TEXT_FORWARD_PENDING_SENTINEL,
+                ) {
+                    return ApiError::not_implemented(
+                        crate::inference::models::qwen3vl_text::forward::QWEN3VL_TEXT_FORWARD_PENDING_MESSAGE
+                            .to_string(),
                     )
                     .into_response();
                 }

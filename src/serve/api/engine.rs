@@ -471,6 +471,11 @@ pub enum LoadedArch {
     /// Qwen3.5 / Qwen3.6 (dense + MoE).  Iter-215 MVP returns 501 on
     /// chat / embed / vision; Wedge-3 wires the live forward pass.
     Qwen35,
+    /// Qwen3-VL text-LM (ADR-005 Wedge-4 / iter-228a). MVP returns 501 on
+    /// chat / embed / vision via the
+    /// [`crate::inference::models::qwen3vl_text::forward::QWEN3VL_TEXT_FORWARD_PENDING_SENTINEL`]
+    /// sentinel; iter-228b wires the live dense transformer forward.
+    Qwen3VlText,
 }
 
 /// Iter-215 Wedge-2 test fixture — build a synthetic `Engine` with a
@@ -1021,6 +1026,16 @@ pub enum LoadedModel {
     /// `Qwen35Model::load_from_gguf`.  Inference path returns 501 in
     /// iter-215 MVP; Wedge-3 wires forward_gpu through the worker.
     Qwen35(super::engine_qwen35::Qwen35LoadedModel),
+    /// Qwen3-VL text-LM GGUFs (ADR-005 Wedge-4 / iter-228a). Loaded via
+    /// [`crate::inference::models::qwen3vl_text::Qwen3VlTextModel::load_from_gguf`].
+    /// Inference path returns 501 in iter-228a MVP via the
+    /// [`crate::inference::models::qwen3vl_text::forward::QWEN3VL_TEXT_FORWARD_PENDING_SENTINEL`]
+    /// sentinel; iter-228b wires the dense transformer forward.
+    ///
+    /// Replaces iter-227's actionable-error bail at the dispatch site
+    /// (the GGUF now opens cleanly and the model loads, but the chat
+    /// arm short-circuits to 501 the same way Qwen35 did at iter-215).
+    Qwen3VlText(super::engine_qwen3vl::Qwen3VlTextLoadedModel),
 }
 
 /// Gemma 4 (and Gemma-shaped) artifacts.  Pre-iter-215 these were the
@@ -1059,48 +1074,56 @@ impl LoadedModel {
         match self {
             LoadedModel::Gemma(g) => &g.model_id,
             LoadedModel::Qwen35(q) => &q.model_id,
+            LoadedModel::Qwen3VlText(v) => &v.model_id,
         }
     }
     pub fn context_length(&self) -> Option<usize> {
         match self {
             LoadedModel::Gemma(g) => g.context_length,
             LoadedModel::Qwen35(q) => q.context_length,
+            LoadedModel::Qwen3VlText(v) => v.context_length,
         }
     }
     pub fn quant_type(&self) -> Option<&str> {
         match self {
             LoadedModel::Gemma(g) => g.quant_type.as_deref(),
             LoadedModel::Qwen35(q) => q.quant_type.as_deref(),
+            LoadedModel::Qwen3VlText(v) => v.quant_type.as_deref(),
         }
     }
     pub fn model_path(&self) -> &Path {
         match self {
             LoadedModel::Gemma(g) => &g.model_path,
             LoadedModel::Qwen35(q) => &q.model_path,
+            LoadedModel::Qwen3VlText(v) => &v.model_path,
         }
     }
     pub fn hidden_size(&self) -> usize {
         match self {
             LoadedModel::Gemma(g) => g.weights.hidden_size,
             LoadedModel::Qwen35(q) => q.hidden_size,
+            LoadedModel::Qwen3VlText(v) => v.hidden_size,
         }
     }
     pub fn vocab_size(&self) -> usize {
         match self {
             LoadedModel::Gemma(g) => g.weights.vocab_size,
             LoadedModel::Qwen35(q) => q.vocab_size,
+            LoadedModel::Qwen3VlText(v) => v.vocab_size,
         }
     }
     pub fn tokenizer(&self) -> &Tokenizer {
         match self {
             LoadedModel::Gemma(g) => &g.tokenizer,
             LoadedModel::Qwen35(q) => &q.tokenizer,
+            LoadedModel::Qwen3VlText(v) => &v.tokenizer,
         }
     }
     pub fn chat_template(&self) -> &str {
         match self {
             LoadedModel::Gemma(g) => &g.chat_template,
             LoadedModel::Qwen35(q) => &q.chat_template,
+            LoadedModel::Qwen3VlText(v) => &v.chat_template,
         }
     }
 
@@ -1113,28 +1136,34 @@ impl LoadedModel {
         match self {
             LoadedModel::Gemma(g) => g.provenance.clone(),
             LoadedModel::Qwen35(q) => q.provenance.clone(),
+            LoadedModel::Qwen3VlText(v) => v.provenance.clone(),
         }
     }
     pub fn eos_token_ids(&self) -> &[u32] {
         match self {
             LoadedModel::Gemma(g) => &g.eos_token_ids,
             LoadedModel::Qwen35(q) => &q.eos_token_ids,
+            LoadedModel::Qwen3VlText(v) => &v.eos_token_ids,
         }
     }
     pub fn load_duration(&self) -> Duration {
         match self {
             LoadedModel::Gemma(g) => g.load_duration,
             LoadedModel::Qwen35(q) => q.load_duration,
+            LoadedModel::Qwen3VlText(v) => v.load_duration,
         }
     }
     /// Prompt cache is Gemma-only in iter-215 MVP.  The Qwen35 worker
     /// arm returns 501 before any prompt-cache logic runs, so the
     /// `None` returned here is unreachable on the Qwen35 path.  Wedge-3
     /// (full Qwen3.5/3.6 inference) will revisit caching scope.
+    /// iter-228a Qwen3VlText: same shape — sentinel-route returns 501
+    /// before prompt cache could fire.
     pub fn prompt_cache(&self) -> Option<&PromptCache> {
         match self {
             LoadedModel::Gemma(g) => Some(&g.prompt_cache),
             LoadedModel::Qwen35(_) => None,
+            LoadedModel::Qwen3VlText(_) => None,
         }
     }
 }
@@ -1698,38 +1727,35 @@ impl LoadedModel {
             .metadata_string("general.architecture")
             .map(|s| s.to_string())
             .unwrap_or_default();
-        // Wedge-4 / iter-227 (2026-05-02): close the runtime gap that
-        // surfaced when running `scripts/wedge4_qwen3vl.sh` against a
-        // real Qwen3-VL-2B GGUF — the SERVE-side loader fell through
-        // to the Gemma 4 forward path and bailed inside the per-layer
-        // MoE expert loader with `missing blk.0.ffn_gate_up_exps.weight`.
+        // Wedge-4 / iter-227 (2026-05-02): originally a runtime
+        // actionable-error dispatch shim that bailed on Qwen3-VL
+        // arches because the LM forward path wasn't wired yet.
         //
-        // Qwen3-VL text is structurally a plain dense transformer with
-        // `attn_{q,k,v,o}` + `ffn_{gate,up,down}` tensors; it does NOT
-        // match the Qwen3.5 hybrid (DeltaNet + gated full-attn) shape,
-        // so it cannot be routed through `Qwen35Model::load_from_gguf`
-        // (which requires SSM metadata keys absent from Qwen3-VL
-        // GGUFs). The full Qwen3-VL LM forward path is iter-228+
-        // scope; this iter closes only the dispatch gap with an
-        // operator-actionable error. Mirrors the cmd_generate
-        // dispatch arm in `src/serve/mod.rs`.
+        // **iter-228a (2026-05-02)** replaces the bail with a real
+        // dispatch arm: dense Qwen3-VL GGUFs now route through
+        // `Qwen3VlTextLoadedModel::load` (load surface lands; chat
+        // arm continues to short-circuit to 501 via the
+        // `QWEN3VL_TEXT_FORWARD_PENDING_SENTINEL` until iter-228b
+        // wires the actual transformer forward).
+        //
+        // MoE Qwen3-VL still bails at this site (no convert pipeline
+        // emits it; the dense-only loader cannot consume an MoE GGUF
+        // structurally), with the same operator-actionable message.
         use crate::inference::models::qwen35::{is_qwen3_vl_arch, is_qwen3_vl_moe_arch};
         if is_qwen3_vl_arch(arch.as_str()) {
-            let variant_label = if is_qwen3_vl_moe_arch(arch.as_str()) {
-                "MoE"
-            } else {
-                "dense"
-            };
-            anyhow::bail!(
-                "Qwen3-VL ({variant_label}, general.architecture = {arch:?}) GGUFs are recognized \
-                 but the LM forward path is not yet wired into `hf2q serve` (iter-227 closes \
-                 only the dispatch gap; the full Qwen3-VL LM forward path is iter-228+ scope). \
-                 Qwen3-VL text is a plain dense transformer and cannot be routed through the \
-                 Qwen3.5 hybrid path (which requires SSM metadata keys absent from Qwen3-VL \
-                 GGUFs). For now: use a Qwen3.5 / Qwen3.6 GGUF, or wait for the iter-228 \
-                 Qwen3-VL LM forward path to land. Model: {}",
-                model_path.display(),
-            );
+            if is_qwen3_vl_moe_arch(arch.as_str()) {
+                anyhow::bail!(
+                    "Qwen3-VL (MoE, general.architecture = {arch:?}) GGUFs are recognized \
+                     but no convert pipeline currently emits this variant; the dense Qwen3-VL \
+                     LM loader is iter-228a scope and cannot consume an MoE GGUF structurally. \
+                     For dense Qwen3-VL today, use a `qwen3_vl` / `qwen3vl` GGUF (e.g. \
+                     `Qwen/Qwen3-VL-2B-Instruct`). Model: {}",
+                    model_path.display(),
+                );
+            }
+            // Dense Qwen3-VL — route through iter-228a's load path.
+            let v = super::engine_qwen3vl::Qwen3VlTextLoadedModel::load(opts)?;
+            return Ok(LoadedModel::Qwen3VlText(v));
         }
         match arch.as_str() {
             "qwen35" | "qwen35moe" => {
@@ -1990,6 +2016,9 @@ impl LoadInfoBuilder for LoadedModel {
             LoadedModel::Qwen35(q) => {
                 q.build_load_info(gguf, load_wall_clock, kv_cache_budget_bytes, kv_spill_active)
             }
+            LoadedModel::Qwen3VlText(v) => {
+                v.build_load_info(gguf, load_wall_clock, kv_cache_budget_bytes, kv_spill_active)
+            }
         }
     }
 }
@@ -2024,6 +2053,7 @@ impl Engine {
         let arch = match &loaded {
             LoadedModel::Gemma(_) => LoadedArch::Gemma,
             LoadedModel::Qwen35(_) => LoadedArch::Qwen35,
+            LoadedModel::Qwen3VlText(_) => LoadedArch::Qwen3VlText,
         };
 
         // Phase B-dense.2 follow-up: snapshot the KV-spill shape
@@ -2082,6 +2112,12 @@ impl Engine {
                     ))
                 }
                 LoadedModel::Qwen35(_) => None,
+                // iter-228a: Qwen3-VL text LM doesn't yet wire a
+                // KV-spill descriptor; the chat arm short-circuits to
+                // 501 before any KV-spill code path runs. iter-228b's
+                // forward wiring will revisit (mirror the gemma branch
+                // shape against the dense Qwen3-VL KV cache).
+                LoadedModel::Qwen3VlText(_) => None,
             };
         let kv_spill_active = kv_spill_descriptor.is_some();
         let gguf = mlx_native::gguf::GgufFile::open(loaded.model_path())
@@ -2670,6 +2706,10 @@ fn worker_run(
                     // contract — "model is loaded; chat is 501" — surfaces
                     // cleanly rather than a startup failure.
                     LoadedModel::Qwen35(_) => Ok(()),
+                    // iter-228a Qwen3-VL text MVP: same shape — chat arm
+                    // returns 501; warmup is a no-op so /readyz surfaces
+                    // "model is loaded".
+                    LoadedModel::Qwen3VlText(_) => Ok(()),
                 };
                 let _ = reply.send(result);
             }
@@ -2691,6 +2731,13 @@ fn worker_run(
                             &params,
                             registration.as_ref(),
                         )
+                    }
+                    // iter-228a Qwen3-VL text MVP: short-circuit to the
+                    // forward-pending sentinel. iter-228b replaces this
+                    // with the live dense transformer forward (mirrors
+                    // the iter-215 → Wedge-3 split for Qwen3.5/3.6).
+                    LoadedModel::Qwen3VlText(_) => {
+                        crate::inference::models::qwen3vl_text::forward::qwen3vl_text_forward_pending_err()
                     }
                 };
                 let _ = reply.send(result);
@@ -2785,6 +2832,22 @@ fn worker_run(
                             cancellation_counter.as_deref(),
                         );
                     }
+                    // iter-228a Qwen3-VL text MVP: emit a single Error
+                    // event onto the stream channel carrying the
+                    // forward-pending sentinel, so the SSE handler maps
+                    // it to a clean stream termination with a 501-style
+                    // error body. iter-228b wires the live streaming
+                    // forward.
+                    LoadedModel::Qwen3VlText(_) => {
+                        let _ = (&ds_borrow_stream, &positions_flat);
+                        let pending: Result<()> =
+                            crate::inference::models::qwen3vl_text::forward::qwen3vl_text_forward_pending_err();
+                        if let Err(e) = pending {
+                            let _ = events.blocking_send(
+                                super::sse::GenerationEvent::Error(format!("{e:#}")),
+                            );
+                        }
+                    }
                 }
             }
             Request::Embed {
@@ -2803,6 +2866,13 @@ fn worker_run(
                     // Wedge-3 / iter-216 Phase D: real chat-as-embedder via
                     // Qwen35Model::forward_embed_last (Phase A).
                     LoadedModel::Qwen35(q) => super::engine_qwen35::embed_qwen35(q, &prompt_tokens),
+                    // iter-228a Qwen3-VL text MVP: embed surface joins
+                    // chat in returning the forward-pending sentinel.
+                    // iter-228b lands a real `forward_embed_last`
+                    // (mirroring engine_qwen35::embed_qwen35).
+                    LoadedModel::Qwen3VlText(_) => {
+                        crate::inference::models::qwen3vl_text::forward::qwen3vl_text_forward_pending_err()
+                    }
                 };
                 let _ = reply.send(result);
             }
@@ -2878,6 +2948,17 @@ fn worker_run(
                             )
                         }
                     }
+                    // iter-228a Qwen3-VL text MVP: vision-aware generate
+                    // (with DeepStack chunks + 3D-mRoPE positions
+                    // already built by Wedge-4d/4e on the handler side)
+                    // returns the forward-pending sentinel until
+                    // iter-228b wires the real LM forward. The
+                    // ds_borrow + positions_flat bindings are retained
+                    // so the borrow lifetime check still runs.
+                    LoadedModel::Qwen3VlText(_) => {
+                        let _ = (&ds_borrow, &positions_flat);
+                        crate::inference::models::qwen3vl_text::forward::qwen3vl_text_forward_pending_err()
+                    }
                 };
                 let _ = reply.send(result);
             }
@@ -2903,6 +2984,12 @@ fn worker_run(
                     // Qwen35 has no dense_kvs surface; KV-persist for
                     // hybrid models lands under B-hybrid.1.
                     LoadedModel::Qwen35(_) => Ok(None),
+                    // iter-228a Qwen3-VL text MVP: no dense_kvs surface
+                    // until iter-228b allocates the KV cache. Match the
+                    // Qwen35 shape (return Ok(None)) so the KV-spill
+                    // hook treats it as "no snapshot available" rather
+                    // than an error.
+                    LoadedModel::Qwen3VlText(_) => Ok(None),
                 };
                 let _ = reply.send(result);
             }
@@ -2926,6 +3013,12 @@ fn worker_run(
                     LoadedModel::Qwen35(_) => Err(anyhow::anyhow!(
                         "kv_restore: not supported on Qwen35 variant (hybrid \
                          KV state — see B-hybrid.1)"
+                    )),
+                    // iter-228a Qwen3-VL text MVP: same shape — no KV
+                    // restore until iter-228b allocates the cache.
+                    LoadedModel::Qwen3VlText(_) => Err(anyhow::anyhow!(
+                        "kv_restore: not yet supported on Qwen3-VL text variant \
+                         (iter-228a is load-only; KV cache allocation lands in iter-228b)"
                     )),
                 };
                 let _ = reply.send(result);

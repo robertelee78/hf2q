@@ -531,20 +531,24 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                 is_qwen36_gguf, is_qwen3_vl_arch, is_qwen3_vl_moe_arch, ARCH_QWEN35,
                 ARCH_QWEN35MOE,
             };
-            // Wedge-4 / iter-227 (2026-05-02): close the runtime gap that
-            // surfaced when running `scripts/wedge4_qwen3vl.sh` against
-            // a real Qwen3-VL-2B GGUF — the loader fell through to the
-            // Gemma 4 forward path and bailed inside the per-layer MoE
-            // expert loader with `missing blk.0.ffn_gate_up_exps.weight`.
+            // Wedge-4 / iter-227 (2026-05-02): originally a runtime
+            // actionable-error dispatch shim that bailed on Qwen3-VL
+            // arches because the LM forward path wasn't wired yet.
             //
-            // Qwen3-VL text is structurally a plain dense transformer
-            // with `attn_{q,k,v,o}` + `ffn_{gate,up,down}` tensors; it
-            // does NOT match the Qwen3.5 hybrid (DeltaNet + gated full-
-            // attn) shape, so it cannot be routed through
-            // `Qwen35Model::load_from_gguf` (which requires SSM keys
-            // that Qwen3-VL GGUFs do not carry). The full Qwen3-VL LM
-            // forward path is iter-228+ scope; this iter closes only
-            // the dispatch gap with an operator-actionable error.
+            // **iter-228a (2026-05-02)**: the SERVE-side load path
+            // (`LoadedModel::load`) now routes dense Qwen3-VL through
+            // `Qwen3VlTextLoadedModel::load` and short-circuits chat
+            // completion to a `qwen3vl_text_forward_pending` 501 (the
+            // iter-215 → Wedge-3 split for Qwen3.5/3.6 in miniature).
+            //
+            // The CLI `hf2q generate` path stays bailed at this site:
+            // CLI generate has no chat-completion 501 fallback (it
+            // would have to actually decode tokens), so its blocker is
+            // iter-228b's LM forward, not iter-228a's load surface.
+            // Operators who want to validate the iter-228a load
+            // surface should run `hf2q serve --model <Qwen3-VL.gguf>`
+            // and confirm `/readyz=200` / `/v1/models` reports the
+            // model.
             if is_qwen3_vl_arch(arch) {
                 let variant_label = if is_qwen3_vl_moe_arch(arch) {
                     "MoE"
@@ -553,13 +557,13 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                 };
                 anyhow::bail!(
                     "Qwen3-VL ({variant_label}, general.architecture = {arch:?}) GGUFs are recognized \
-                     but the LM forward path is not yet wired into `hf2q generate` (iter-227 \
-                     closes only the dispatch gap; the full Qwen3-VL LM forward path is \
-                     iter-228+ scope). Qwen3-VL text is a plain dense transformer and cannot \
-                     be routed through the Qwen3.5 hybrid path (which requires SSM metadata \
-                     keys absent from Qwen3-VL GGUFs). For now: use a Qwen3.5 / Qwen3.6 \
-                     GGUF, or wait for the iter-228 Qwen3-VL LM forward path to land. \
-                     Model: {}",
+                     but the CLI `hf2q generate` path requires a working LM forward (iter-228b \
+                     scope). iter-228a (this commit) lands the SERVE-side load path: \
+                     `hf2q serve --model <gguf>` will load this GGUF and surface it on \
+                     `/v1/models`, but chat completion still returns HTTP 501 with the \
+                     `qwen3vl_text_forward_pending` sentinel until iter-228b wires the \
+                     dense transformer forward. For text-only chat today, use a \
+                     Qwen3.5 / Qwen3.6 GGUF (full chat path). Model: {}",
                     model_path.display(),
                 );
             }
@@ -4006,11 +4010,17 @@ mod tests {
     // `missing blk.0.ffn_gate_up_exps.weight` panic.
 
     /// Synthetic GGUF with arch=qwen3_vl (hf2q's underscored convention,
-    /// emitted by Wedge-4f convert) routes through the new iter-227
-    /// dispatch arm and surfaces an operator-actionable error rather
-    /// than falling through to the Gemma 4 loader.
+    /// emitted by Wedge-4f convert) used to surface the iter-227
+    /// dispatch bail. As of **iter-228a** (2026-05-02) the dense
+    /// Qwen3-VL arm no longer bails at the dispatch site — it routes
+    /// through `Qwen3VlTextLoadedModel::load`, which then fails
+    /// downstream when the synthetic 0-tensor GGUF has no
+    /// `qwen3_vl.block_count` etc. metadata to parse a config from.
+    /// This test pins the new failure shape: dispatch reaches the
+    /// iter-228a config parser, NOT the Gemma loader (the regression
+    /// guard the iter-227 test was originally for is preserved).
     #[test]
-    fn iter227_load_engine_rejects_qwen3_vl_underscored_with_actionable_error() {
+    fn iter228a_load_engine_routes_qwen3_vl_to_qwen3vl_text_loader() {
         let tmp = write_minimal_gguf_with_arch("qwen3_vl");
         let cfg = super::multi_model::EngineConfig {
             tokenizer_path: None,
@@ -4021,34 +4031,34 @@ mod tests {
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(
             result.is_err(),
-            "qwen3_vl synthetic GGUF must surface the iter-227 dispatch error"
+            "0-tensor synthetic qwen3_vl GGUF must fail load (no metadata)"
         );
         let msg = format!("{:#}", result.err().unwrap());
+        // Must reach the Qwen3VlTextConfig parser (not Gemma).
         assert!(
-            msg.contains("Qwen3-VL"),
-            "iter-227 error must name 'Qwen3-VL' so operators can grep; got: {msg}"
+            msg.contains("Qwen3VlTextConfig::from_gguf")
+                || msg.contains("missing core architecture facts"),
+            "iter-228a must route dense Qwen3-VL through Qwen3VlTextConfig parser; got: {msg}"
         );
-        assert!(
-            msg.contains("dense"),
-            "iter-227 dense-variant error must say 'dense' (vs 'MoE'); got: {msg}"
-        );
-        assert!(
-            msg.contains("iter-228"),
-            "iter-227 error must point at iter-228+ as the unblocking work; got: {msg}"
-        );
-        // Regression guard — must NOT fall through to the Gemma loader's
-        // pre-iter-227 panic surface.
+        // Regression guards from the iter-227 tests:
+        // (1) MUST NOT fall through to the Gemma loader's panic surface.
         assert!(
             !msg.contains("missing blk.0.ffn_gate_up_exps.weight"),
-            "iter-227 must intercept BEFORE the Gemma MoE expert load; got: {msg}"
+            "iter-228a must intercept BEFORE the Gemma MoE expert load; got: {msg}"
+        );
+        // (2) MUST NOT regress to the iter-227 actionable-error bail
+        // for dense Qwen3-VL (that bail is now lifted; only MoE bails).
+        assert!(
+            !msg.contains("iter-227 closes only the dispatch gap"),
+            "iter-228a lifted the iter-227 dispatch bail for dense Qwen3-VL; got: {msg}"
         );
     }
 
     /// Symmetric for the upstream llama.cpp arch-string convention
-    /// (no underscore — `qwen3vl`). Forward-compat for a future
-    /// convert-pipeline alignment.
+    /// (no underscore — `qwen3vl`). Both arch spellings route through
+    /// the iter-228a load path.
     #[test]
-    fn iter227_load_engine_rejects_qwen3vl_no_underscore_with_actionable_error() {
+    fn iter228a_load_engine_routes_qwen3vl_upstream_to_qwen3vl_text_loader() {
         let tmp = write_minimal_gguf_with_arch("qwen3vl");
         let cfg = super::multi_model::EngineConfig {
             tokenizer_path: None,
@@ -4060,8 +4070,9 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{:#}", result.err().unwrap());
         assert!(
-            msg.contains("Qwen3-VL") && msg.contains("dense"),
-            "iter-227 must surface dense-variant Qwen3-VL message for upstream arch string; got: {msg}"
+            msg.contains("Qwen3VlTextConfig::from_gguf")
+                || msg.contains("missing core architecture facts"),
+            "iter-228a must route upstream-arch dense Qwen3-VL through Qwen3VlTextConfig parser; got: {msg}"
         );
     }
 
