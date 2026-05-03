@@ -2461,7 +2461,29 @@ pub fn build_gated_attn_layer(
             super::wave5b8_profile::SectionKind::FaOps6to7,
         );
         let n_elem = seq_len * q_total;
-        let mut enc = device.command_encoder().context("enc ops6-7")?;
+        // ADR-019 Phase 2 iter89e2-G: when fused_stage_a_enc is Some, the
+        // Stage-A encoder (carrying ops1-4 + kv_cache_write + fa.prefill_bridge
+        // dispatches encoded but not yet committed) was moved here from the
+        // ops1-4 fused branch above. We continue encoding ops6-7 into the
+        // SAME encoder and issue ONE terminal commit_labeled covering all 4
+        // FA-layer ops. Otherwise (decode, dump_bisect, head_dim != 256,
+        // cur_len != 0, missing arenas), open a fresh encoder as before.
+        let (mut enc, fused_into_stage_a) = match fused_stage_a_enc.take() {
+            Some(e) => (e, true),
+            None => (device.command_encoder().context("enc ops6-7")?, false),
+        };
+        // ADR-019 Phase 2 iter89e2-G: RAW barrier between fa.prefill_bridge's
+        // final dispatch (permute_021_bf16_to_f32 → out_seq) and ops6
+        // (sigmoid_gate_multiply reads attn_out == out_seq). The legacy
+        // 4-CB layout had this RAW edge enforced by the CB boundary between
+        // fa.prefill_bridge and ops6-7; the fused path replaces that
+        // boundary with this intra-CB memory_barrier(). Mirrors the existing
+        // RAW barriers at the ops1-4→kv_cache_write and kv_cache_write→
+        // fa.prefill_bridge boundaries from iter89e2-F. AC-PA2 Heisenbug 5×
+        // is the empirical guard.
+        if fused_into_stage_a {
+            enc.memory_barrier();
+        }
         let gated = if let Some(arena) =
             fa_proj_arena.as_ref().map(|a| &**a).filter(|_| use_proj_arena)
         {
@@ -2528,7 +2550,20 @@ pub fn build_gated_attn_layer(
         // is needed. dump_hidden_stats is HF2Q_DECODE_PROFILE-gated (env-only
         // diagnostic, not on the production path). Downgrade to commit_labeled
         // is safe per queen plan A.1 ops6-7 analysis.
-        if seq_len == 1 || use_arena {
+        // ADR-019 Phase 2 iter89e2-G: when fused_into_stage_a, this single
+        // terminal commit covers all 4 FA-layer ops (ops1-4 + kv_cache_write
+        // + fa.prefill_bridge + ops6-7), labeled "layer.full_attn.stage_a"
+        // for xctrace MST attribution. Replaces 4 separate commit_labeled
+        // calls per FA layer with ONE. The non-fused branches (decode path,
+        // dump bisect, head_dim != 256, cur_len != 0, missing arenas) keep
+        // the legacy "layer.full_attn.ops6-7" label and commit choice.
+        //
+        // commit_labeled is non-blocking; out (linear_proj output) is on the
+        // Rust stack until consumed by dispatch_fused_residual_norm_f32 in
+        // forward_gpu's next encoder on the same Metal serial queue.
+        if fused_into_stage_a {
+            enc.commit_labeled("layer.full_attn.stage_a");
+        } else if seq_len == 1 || use_arena {
             enc.commit_labeled("layer.full_attn.ops6-7");
         } else {
             enc.commit_and_wait_labeled("layer.full_attn.ops6-7").context("commit ops6-7")?;
