@@ -1502,6 +1502,11 @@ impl Qwen35Model {
                 let device = MlxDevice::new().context("ensure_gpu_cache_primed: MlxDevice::new")?;
                 let mut registry = KernelRegistry::new();
                 mlx_native::ops::flash_attn_prefill::register(&mut registry);
+                // 2026-05-03 — register flash_attn_vec for decode-path SDPA.
+                // Closes long-context decode parity gap vs llama.cpp (tg1000:
+                // 105 → ~117 t/s expected). Was previously dispatching
+                // sdpa_decode (single-threadgroup serial) for FA layers.
+                mlx_native::ops::flash_attn_vec::register(&mut registry);
                 // Wedge-4c.5: register the LM-side image-token residual
                 // add shader. Idempotent: safe to call on every primed
                 // path; non-Qwen3-VL chats simply never dispatch the
@@ -3226,6 +3231,10 @@ impl Qwen35Model {
                 // Wave 5b.10: register flash_attn_prefill kernel family for
                 // the Qwen3.5 FA prefill path (replaces legacy `sdpa`).
                 mlx_native::ops::flash_attn_prefill::register(&mut registry);
+                // 2026-05-03 — register flash_attn_vec for decode-path SDPA.
+                // See forward_gpu.rs:1504 sister registration; closes
+                // long-context decode parity gap vs llama.cpp.
+                mlx_native::ops::flash_attn_vec::register(&mut registry);
                 // Wedge-4c.5: register the LM-side image-token residual
                 // add shader (idempotent; gated by deepstack=Some).
                 crate::inference::vision::image_token_residual_add

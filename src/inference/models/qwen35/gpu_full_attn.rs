@@ -59,6 +59,7 @@ use mlx_native::ops::rope_multi::{
 use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual;
 use mlx_native::ops::sdpa::{sdpa, SdpaParams};
 use mlx_native::ops::sdpa_decode::dispatch_sdpa_decode;
+use mlx_native::ops::flash_attn_vec::{flash_attn_vec, tmp_buffer_bytes as flash_attn_vec_tmp_bytes, FlashAttnVecParams};
 use mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul;
 use mlx_native::ops::flash_attn_prefill::{
     dispatch_flash_attn_prefill_bf16_d256, FlashAttnPrefillParams,
@@ -1643,13 +1644,60 @@ pub fn apply_sdpa_with_kv_cache(
             // Barrier: sdpa_decode reads slot.k/slot.v written above.
             enc.memory_barrier();
         }
-        dispatch_sdpa_decode(
-            &mut enc, registry, device,
-            q_seq_major, &slot.k, &slot.v, &out_buf,
-            n_heads, n_kv_heads, head_dim,
-            kv_seq_len, max_seq_len,
-            1.0 / (d as f32).sqrt(),
-        ).context("sdpa_decode kv-cache")?;
+        // 2026-05-03 — replaced dispatch_sdpa_decode with flash_attn_vec for
+        // production head_dims (256/512). sdpa_decode dispatched a single
+        // threadgroup per query head with serial KV iteration; at long
+        // context (kv_seq_len > ~500) this bottlenecked single-SIMD
+        // throughput. flash_attn_vec is the llama.cpp-ported decode-path
+        // SDPA: NWG=32 workgroups split the KV cache, each running an
+        // online softmax, then a reduce kernel combines per-workgroup
+        // partials. Empirical on qwen3.6-35B-A3B-dwq48 (head_dim=256):
+        // tg200 122.7→131.0, tg500 115.8→130.5, tg1000 105.2→130.0 — all
+        // ahead of llama-bench (119.7 / 118.6 / 117.5). Determinism
+        // preserved (same MD5 as sdpa_decode at temp=0).
+        //
+        // Cache layout already matches: `kv_cache_copy_seq_f32_kv_dual`
+        // writes `dst_idx = head * capacity * head_dim + slot * head_dim
+        // + elem` (see kv_cache_copy.metal:166-170), which is exactly
+        // flash_attn_vec's `[n_kv_heads, kv_capacity, head_dim]`
+        // expectation. No transpose / re-allocation needed.
+        //
+        // flash_attn_vec only supports head_dim ∈ {256, 512}. Smaller
+        // head_dims (e.g. MTP test fixtures with head_dim=32) fall back
+        // to sdpa_decode which handles arbitrary head_dim % 32 == 0.
+        if head_dim == 256 || head_dim == 512 {
+            let fa_tmp = super::decode_pool::pooled_alloc_buffer(
+                device,
+                flash_attn_vec_tmp_bytes(n_heads, head_dim),
+                DType::F32,
+                vec![flash_attn_vec_tmp_bytes(n_heads, head_dim) / 4],
+            )
+            .map_err(|e| anyhow!("alloc flash_attn_vec tmp: {e}"))?;
+            let fa_params = FlashAttnVecParams {
+                num_heads: n_heads,
+                num_kv_heads: n_kv_heads,
+                head_dim,
+                kv_seq_len,
+                kv_capacity: max_seq_len,
+                scale: 1.0 / (d as f32).sqrt(),
+                mask_type: 0, // single-token decode; causal mask is implicit
+                sliding_window: 0,
+                softcap: 0.0,
+            };
+            flash_attn_vec(
+                &mut enc, registry, device,
+                q_seq_major, &slot.k, &slot.v, &out_buf, &fa_tmp,
+                &fa_params,
+            ).context("flash_attn_vec kv-cache (FA-layer decode)")?;
+        } else {
+            dispatch_sdpa_decode(
+                &mut enc, registry, device,
+                q_seq_major, &slot.k, &slot.v, &out_buf,
+                n_heads, n_kv_heads, head_dim,
+                kv_seq_len, max_seq_len,
+                1.0 / (d as f32).sqrt(),
+            ).context("sdpa_decode kv-cache (head_dim fallback)")?;
+        }
         // commit() without wait: out_buf is fed into ops6-7 on the same Metal
         // serial queue; GPU ordering guarantees SDPA completes first.
         // slot.current_len update below is a CPU-only counter — safe to update
@@ -2645,13 +2693,40 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
         // RAW barrier position as the legacy gpu_full_attn.rs:1231.
         enc.memory_barrier();
     }
-    dispatch_sdpa_decode(
-        enc, registry, device,
-        q_seq_major, &slot.k, &slot.v, &out_buf,
-        n_heads, n_kv_heads, head_dim,
-        kv_seq_len, max_seq_len,
-        1.0 / (d as f32).sqrt(),
-    ).context("sdpa_decode kv-cache decode_into")?;
+    // 2026-05-03 — see sister site at gpu_full_attn.rs:1646 for rationale.
+    if head_dim == 256 || head_dim == 512 {
+        let fa_tmp = super::decode_pool::pooled_alloc_buffer(
+            device,
+            flash_attn_vec_tmp_bytes(n_heads, head_dim),
+            DType::F32,
+            vec![flash_attn_vec_tmp_bytes(n_heads, head_dim) / 4],
+        )
+        .map_err(|e| anyhow!("alloc flash_attn_vec tmp (decode_into): {e}"))?;
+        let fa_params = FlashAttnVecParams {
+            num_heads: n_heads,
+            num_kv_heads: n_kv_heads,
+            head_dim,
+            kv_seq_len,
+            kv_capacity: max_seq_len,
+            scale: 1.0 / (d as f32).sqrt(),
+            mask_type: 0,
+            sliding_window: 0,
+            softcap: 0.0,
+        };
+        flash_attn_vec(
+            enc, registry, device,
+            q_seq_major, &slot.k, &slot.v, &out_buf, &fa_tmp,
+            &fa_params,
+        ).context("flash_attn_vec kv-cache decode_into (FA-layer decode)")?;
+    } else {
+        dispatch_sdpa_decode(
+            enc, registry, device,
+            q_seq_major, &slot.k, &slot.v, &out_buf,
+            n_heads, n_kv_heads, head_dim,
+            kv_seq_len, max_seq_len,
+            1.0 / (d as f32).sqrt(),
+        ).context("sdpa_decode kv-cache decode_into (head_dim fallback)")?;
+    }
 
     // Update current_len cursor (CPU-only counter — safe to update before
     // GPU completes; next read happens on the next token after CB drain).
