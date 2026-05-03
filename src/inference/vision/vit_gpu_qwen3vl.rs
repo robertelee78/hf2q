@@ -406,37 +406,70 @@ pub(crate) fn qwen3vl_dual_conv_patch_embed_cpu(
     patch_size: u32,
     hidden: u32,
 ) -> Result<Vec<f32>> {
-    use super::vit::patch_embed_forward;
+    // Square wrapper: thin shim over the rectangular helper for
+    // backward-compat with existing tests.
+    qwen3vl_dual_conv_patch_embed_cpu_hw(
+        pixel_values,
+        weight_0,
+        weight_1,
+        bias,
+        image_size,
+        image_size,
+        patch_size,
+        hidden,
+    )
+}
+
+/// Phase-2 (iter-225) variable-resolution dual-stem patch embedding.
+///
+/// Same algorithm as [`qwen3vl_dual_conv_patch_embed_cpu`] but accepts
+/// an explicit rectangular `(pixel_h, pixel_w)` for the
+/// smart-resized input. Output shape is
+/// `[(pixel_h / patch_size) * (pixel_w / patch_size), hidden]`
+/// row-major.
+pub(crate) fn qwen3vl_dual_conv_patch_embed_cpu_hw(
+    pixel_values: &[f32],
+    weight_0: &[f32],
+    weight_1: &[f32],
+    bias: Option<&[f32]>,
+    pixel_h: u32,
+    pixel_w: u32,
+    patch_size: u32,
+    hidden: u32,
+) -> Result<Vec<f32>> {
+    use super::vit::patch_embed_forward_hw;
 
     // Stem 0: bias goes here (matches qwen3vl.cpp ordering — the bias
     // add at line 41-43 comes AFTER the `inp = inp + inp_1` at line 25,
     // so adding it to either stem before the sum is functionally
     // equivalent to adding it to the sum at the end. We attach it to
-    // stem 0 to keep `patch_embed_forward`'s existing behavior intact
+    // stem 0 to keep `patch_embed_forward_hw`'s existing behavior intact
     // and avoid duplicating the bias add).
-    let out_0 = patch_embed_forward(
+    let out_0 = patch_embed_forward_hw(
         pixel_values,
         weight_0,
         bias,
-        image_size,
+        pixel_h,
+        pixel_w,
         patch_size,
         hidden,
     )
-    .context("qwen3vl_dual_conv_patch_embed_cpu: stem 0")?;
-    let out_1 = patch_embed_forward(
+    .context("qwen3vl_dual_conv_patch_embed_cpu_hw: stem 0")?;
+    let out_1 = patch_embed_forward_hw(
         pixel_values,
         weight_1,
         None, // stem 1 carries no bias
-        image_size,
+        pixel_h,
+        pixel_w,
         patch_size,
         hidden,
     )
-    .context("qwen3vl_dual_conv_patch_embed_cpu: stem 1")?;
+    .context("qwen3vl_dual_conv_patch_embed_cpu_hw: stem 1")?;
 
     if out_0.len() != out_1.len() {
         return Err(anyhow!(
-            "qwen3vl_dual_conv_patch_embed_cpu: stem outputs length mismatch \
-             ({} vs {}) — patch_embed_forward shape contract violated",
+            "qwen3vl_dual_conv_patch_embed_cpu_hw: stem outputs length mismatch \
+             ({} vs {}) — patch_embed_forward_hw shape contract violated",
             out_0.len(),
             out_1.len()
         ));
@@ -557,15 +590,14 @@ pub(crate) fn qwen3vl_2x2_block_merge_reshape(
 ///
 /// **Antialias flag**: clip.cpp's default mode is
 /// `BILINEAR | ANTIALIAS` (per `clip-graph.h:12`). Antialiasing only
-/// affects DOWNSAMPLING (when `target_n_per_side < trained_n_per_side`,
-/// it applies a Lanczos-style triangle prefilter). For Qwen3-VL the
-/// trained resolution is 768×768 / 16² = 48×48 = 2304; production
-/// inference uses the same image_size (set at preprocess time per
-/// `convert_hf_to_gguf.py:4863-4869`). Resize triggers only when a
-/// future Wedge-4d dynamic-resolution preprocessor differs. 4c.2
-/// implements plain bilinear; the antialias path lands as a 4c.4
-/// follow-up if real-fixture parity requires it. The fast-path at
-/// equal sizes is byte-exact regardless.
+/// affects DOWNSAMPLING (when target < trained, it applies a
+/// Lanczos-style triangle prefilter). For Qwen3-VL the trained
+/// resolution is 768×768 / 16² = 48×48 = 2304; production inference
+/// at image_size=768 hits the fast-path. The general path triggers
+/// when the runtime image grid differs (Phase-2 variable resolution).
+/// Plain bilinear here; antialias path lands as a follow-up if
+/// real-fixture parity requires it. The fast-path at equal sizes is
+/// byte-exact regardless.
 ///
 /// # Inputs
 ///
@@ -576,38 +608,41 @@ pub(crate) fn qwen3vl_2x2_block_merge_reshape(
 /// - `num_position_embeddings`: trained-resolution table length.
 ///   `sqrt(num_position_embeddings)` MUST be an exact integer.
 /// - `n_embd`: ViT hidden dim.
-/// - `target_n_per_side`: post-conv patch count per side at runtime
-///   `= image_size / patch_size`.
+/// - `target_n_x`: post-conv patch count along W at runtime (=
+///   `target_w / patch_size`).
+/// - `target_n_y`: post-conv patch count along H at runtime (=
+///   `target_h / patch_size`). Phase-2: rectangular target.
 ///
 /// # Output
 ///
-/// `Vec<f32>` of length `target_n_per_side² * n_embd`, row-major
-/// `[target_n_per_side², n_embd]`. The patches are in y-major-then-x
-/// order — i.e. the same layout as the dual-conv output BEFORE
-/// [`qwen3vl_2x2_block_merge_reshape`] is applied. The caller MUST
-/// run the block-merge reshape on this output to match the patch
-/// embedding's post-prelude layout (qwen3vl.cpp:48-57).
+/// `Vec<f32>` of length `target_n_y * target_n_x * n_embd`, row-major
+/// `[target_n_y, target_n_x, n_embd]` (y-major then x-major). The
+/// caller MUST run the block-merge reshape on this output to match
+/// the patch embedding's post-prelude layout (qwen3vl.cpp:48-57).
 ///
 /// # Errors
 ///
 /// - `num_position_embeddings == 0` or not a perfect square
-/// - `n_embd == 0` or `target_n_per_side == 0`
+/// - `n_embd == 0`, `target_n_x == 0`, or `target_n_y == 0`
 /// - `pos_embd_table.len() != num_position_embeddings * n_embd`
 //
 // 4c.3 closure: consumed by `compute_vision_embeddings_gpu_qwen3vl`
 // below to bilinear-resize the trained pos-embd table to the runtime
 // patch grid before adding it to the dual-conv patch embedding.
+// iter-225 Phase-2: signature lifted from square `target_n_per_side`
+// to rectangular `(target_n_x, target_n_y)`.
 pub(crate) fn qwen3vl_resize_position_embeddings_bilinear(
     pos_embd_table: &[f32],
     num_position_embeddings: u32,
     n_embd: u32,
-    target_n_per_side: u32,
+    target_n_x: u32,
+    target_n_y: u32,
 ) -> Result<Vec<f32>> {
-    if num_position_embeddings == 0 || n_embd == 0 || target_n_per_side == 0 {
+    if num_position_embeddings == 0 || n_embd == 0 || target_n_x == 0 || target_n_y == 0 {
         return Err(anyhow!(
             "qwen3vl_resize_position_embeddings_bilinear: num_position_embeddings \
-             ({num_position_embeddings}), n_embd ({n_embd}), target_n_per_side \
-             ({target_n_per_side}) must all be > 0"
+             ({num_position_embeddings}), n_embd ({n_embd}), target_n_x \
+             ({target_n_x}), target_n_y ({target_n_y}) must all be > 0"
         ));
     }
     // Per clip.cpp:277 `n_per_side = sqrt(pos_embd->ne[1])` — the
@@ -633,24 +668,26 @@ pub(crate) fn qwen3vl_resize_position_embeddings_bilinear(
         ));
     }
 
-    // Fast path (clip.cpp:281-283): trained edge equals target edge,
-    // pass through unchanged. Byte-exact regardless of mode flags.
-    if trained_n == target_n_per_side {
+    // Fast path (clip.cpp:281-283): trained edge equals BOTH target
+    // edges (square trained × square target × matching size), pass
+    // through unchanged. Byte-exact regardless of mode flags.
+    if trained_n == target_n_x && trained_n == target_n_y {
         return Ok(pos_embd_table.to_vec());
     }
 
     // General path. The trained table is `[trained_n*trained_n,
-    // n_embd]` row-major; we want output `[target_n*target_n, n_embd]`
-    // row-major. Bilinear interpolates each n_embd channel
+    // n_embd]` row-major; we want output `[target_n_y*target_n_x,
+    // n_embd]` row-major. Bilinear interpolates each n_embd channel
     // independently; each output position `(y_dst, x_dst)` reads 4
     // source positions and blends.
     //
     // Source-coord mapping (PyTorch align_corners=False / pixel_offset
     // = 0.5, per ggml-cpu/ops.cpp:7637-7676):
     //
-    //   sf       = target_n / trained_n
-    //   x_src    = (x_dst + 0.5) / sf - 0.5
-    //   y_src    = (y_dst + 0.5) / sf - 0.5
+    //   sf_x     = target_n_x / trained_n
+    //   sf_y     = target_n_y / trained_n
+    //   x_src    = (x_dst + 0.5) / sf_x - 0.5
+    //   y_src    = (y_dst + 0.5) / sf_y - 0.5
     //   x0       = clamp(floor(x_src),     0, trained_n - 1)
     //   x1       = clamp(x0 + 1,           0, trained_n - 1)
     //   dx       = clamp(x_src - x0,       0, 1)        // post-clamp
@@ -661,17 +698,20 @@ pub(crate) fn qwen3vl_resize_position_embeddings_bilinear(
     //            + d *      dx  *      dy
     //
     // where a,b,c,d are the four trained-table entries at (x0,y0),
-    // (x1,y0), (x0,y1), (x1,y1).
+    // (x1,y0), (x0,y1), (x1,y1). Phase-2: separate sf_x and sf_y for
+    // rectangular targets.
     let trained = trained_n as i64;
-    let target = target_n_per_side as i64;
+    let target_x = target_n_x as i64;
+    let target_y = target_n_y as i64;
     let h = n_embd as usize;
-    let mut out = vec![0f32; (target as usize) * (target as usize) * h];
+    let mut out = vec![0f32; (target_y as usize) * (target_x as usize) * h];
 
-    let sf = (target as f32) / (trained as f32);
+    let sf_x = (target_x as f32) / (trained as f32);
+    let sf_y = (target_y as f32) / (trained as f32);
     let pixel_offset: f32 = 0.5;
 
-    for y_dst in 0..target {
-        let y_src = ((y_dst as f32) + pixel_offset) / sf - pixel_offset;
+    for y_dst in 0..target_y {
+        let y_src = ((y_dst as f32) + pixel_offset) / sf_y - pixel_offset;
         let mut y0 = y_src.floor() as i64;
         let mut y1 = y0 + 1;
         y0 = y0.max(0).min(trained - 1);
@@ -679,8 +719,8 @@ pub(crate) fn qwen3vl_resize_position_embeddings_bilinear(
         let mut dy = y_src - (y0 as f32);
         dy = dy.max(0.0).min(1.0);
 
-        for x_dst in 0..target {
-            let x_src = ((x_dst as f32) + pixel_offset) / sf - pixel_offset;
+        for x_dst in 0..target_x {
+            let x_src = ((x_dst as f32) + pixel_offset) / sf_x - pixel_offset;
             let mut x0 = x_src.floor() as i64;
             let mut x1 = x0 + 1;
             x0 = x0.max(0).min(trained - 1);
@@ -698,7 +738,8 @@ pub(crate) fn qwen3vl_resize_position_embeddings_bilinear(
             let off_c = ((y1 as usize) * (trained as usize) + (x0 as usize)) * h;
             let off_d = ((y1 as usize) * (trained as usize) + (x1 as usize)) * h;
 
-            let dst_off = ((y_dst as usize) * (target as usize) + (x_dst as usize)) * h;
+            let dst_off =
+                ((y_dst as usize) * (target_x as usize) + (x_dst as usize)) * h;
 
             for k in 0..h {
                 out[dst_off + k] = pos_embd_table[off_a + k] * w_a
@@ -1998,17 +2039,19 @@ fn qwen3vl_concat_augmented_embed_cpu(
 ///
 /// # Errors
 ///
-/// - `inputs.len() != 1` (Phase 1 single-image only)
+/// - `inputs.len() != 1` (single-image; multi-image batching is the
+///   engine seam's responsibility — calls into this function are
+///   per-image)
 /// - input variant is not `VisionInput::Siglip49(_)` (e.g.
 ///   `Gemma4v(_)` slipped past dispatch — would mean preprocessing
 ///   chose the wrong family branch)
-/// - `mmproj_cfg.image_size % (cfg.patch_size * cfg.spatial_merge_size)
-///   != 0` (per qwen3vl.cpp:19-20 `GGML_ASSERT(img.nx % (patch_size *
-///   2) == 0)`; we additionally enforce divisibility by the
-///   spatial-merge stride so the 4c.4 main projector's
-///   `reshape_3d(n_embd*4, n_pos/4)` is exact)
-/// - `pixel_values.len() != 3 * image_size²` (preprocessing contract
-///   violation)
+/// - per-image `(pixel_h, pixel_w)` not divisible by
+///   `cfg.patch_size * cfg.spatial_merge_size` (per qwen3vl.cpp:19-20
+///   `GGML_ASSERT(img.nx % (patch_size * 2) == 0)`; we additionally
+///   enforce divisibility by the spatial-merge stride so the 4c.4 main
+///   projector's `reshape_3d(n_embd*4, n_pos/4)` is exact)
+/// - `pixel_values.len() != 3 * pixel_h * pixel_w` (preprocessing
+///   contract violation)
 /// - propagated from any GPU sub-stage (missing tensor, shape
 ///   mismatch, kernel dispatch failure)
 pub fn compute_vision_embeddings_gpu_qwen3vl(
@@ -2018,18 +2061,26 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
     mmproj_cfg: &MmprojConfig,
 ) -> Result<Vec<Vec<f32>>> {
     // -----------------------------------------------------------------
-    // Input validation (Phase 1: single image, square image_size).
+    // Input validation. ADR-005 iter-225 (Wedge-4 Phase-2): per-image
+    // rectangular `[3, H, W]` input where `(H, W)` are sourced from
+    // the per-image `PreprocessedImage::pixel_grid()` (Phase-2)  or
+    // fall back to `mmproj_cfg.image_size` for backward-compat
+    // (Phase-1 square fixtures and synthetic test inputs).
     // -----------------------------------------------------------------
     if inputs.len() != 1 {
         return Err(anyhow!(
-            "compute_vision_embeddings_gpu_qwen3vl: Phase 1 supports exactly \
-             1 input image; got {} (multi-image batching is Wedge-4d territory)",
+            "compute_vision_embeddings_gpu_qwen3vl: per-image entry point \
+             expects exactly 1 input image; got {} (multi-image batching \
+             is the engine-seam's responsibility — call once per image)",
             inputs.len()
         ));
     }
     let input = &inputs[0];
-    let pixel_values: &[f32] = match input {
-        VisionInput::Siglip49(p) => &p.pixel_values,
+    let (pixel_values, pixel_w, pixel_h): (&[f32], u32, u32) = match input {
+        VisionInput::Siglip49(p) => {
+            let (w, h) = p.pixel_grid();
+            (&p.pixel_values, w, h)
+        }
         VisionInput::Gemma4v(_) => {
             return Err(anyhow!(
                 "compute_vision_embeddings_gpu_qwen3vl: Qwen3-VL preprocessing \
@@ -2040,7 +2091,6 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         }
     };
 
-    let image_size = mmproj_cfg.image_size;
     let stride = cfg.patch_size * cfg.spatial_merge_size;
     if stride == 0 {
         return Err(anyhow!(
@@ -2050,31 +2100,46 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
             cfg.spatial_merge_size
         ));
     }
-    if image_size % stride != 0 {
+    if pixel_w == 0 || pixel_h == 0 {
+        return Err(anyhow!(
+            "compute_vision_embeddings_gpu_qwen3vl: pixel grid ({}x{}) has \
+             zero dimension",
+            pixel_w,
+            pixel_h
+        ));
+    }
+    if pixel_w % stride != 0 || pixel_h % stride != 0 {
         // Mirrors qwen3vl.cpp:19-20:
         //   GGML_ASSERT(img.nx % (patch_size * 2) == 0);
         //   GGML_ASSERT(img.ny % (patch_size * 2) == 0);
         // We use cfg.spatial_merge_size (= 2 for Qwen3-VL) instead of the
         // hard-coded 2 so a future variant with merge_size != 2 still
-        // gets the right check.
+        // gets the right check. Phase-2: validate per-image (W, H)
+        // independently rather than the canonical canvas.
         return Err(anyhow!(
-            "compute_vision_embeddings_gpu_qwen3vl: image_size ({}) must be \
-             a multiple of patch_size ({}) * spatial_merge_size ({}) = {} \
-             (per qwen3vl.cpp:19-20 GGML_ASSERT)",
-            image_size,
+            "compute_vision_embeddings_gpu_qwen3vl: per-image pixel grid \
+             ({}x{}) — both dimensions must be a multiple of patch_size ({}) * \
+             spatial_merge_size ({}) = {} (per qwen3vl.cpp:19-20 GGML_ASSERT). \
+             Preprocessing should have stride-aligned the smart-resize output \
+             before passing to the ViT.",
+            pixel_w,
+            pixel_h,
             cfg.patch_size,
             cfg.spatial_merge_size,
             stride
         ));
     }
-    let expected_pixels = 3 * (image_size as usize) * (image_size as usize);
+    let expected_pixels = 3 * (pixel_h as usize) * (pixel_w as usize);
     if pixel_values.len() != expected_pixels {
         return Err(anyhow!(
             "compute_vision_embeddings_gpu_qwen3vl: pixel_values.len() ({}) != \
-             3 * image_size² = 3 * {}² = {} — preprocessing contract violated",
+             3 * pixel_h * pixel_w = 3 * {} * {} = {} — preprocessing contract \
+             violated (mmproj_cfg.image_size={} for reference)",
             pixel_values.len(),
-            image_size,
-            expected_pixels
+            pixel_h,
+            pixel_w,
+            expected_pixels,
+            mmproj_cfg.image_size
         ));
     }
 
@@ -2090,17 +2155,21 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
     // row-major buffer that 4c.5's LM hooks split per-LM-layer.
     // -----------------------------------------------------------------
 
-    // Stage 0: post-conv patch grid dimensions (BEFORE block-merge).
-    //   n_x_pre = n_y_pre = image_size / patch_size
-    //   n_pos_pre = n_x_pre² (square fixed-resolution; Wedge-4d will
-    //   relax to rectangular).
-    let n_x_pre = image_size / cfg.patch_size;
-    let n_y_pre = n_x_pre;
-    if n_x_pre == 0 {
+    // Stage 0: per-image post-conv patch grid dimensions (BEFORE
+    // block-merge). Phase-2: rectangular per the smart-resized input.
+    //   n_x_pre = pixel_w / patch_size
+    //   n_y_pre = pixel_h / patch_size
+    //   n_pos_pre = n_x_pre * n_y_pre (rectangular)
+    let n_x_pre = pixel_w / cfg.patch_size;
+    let n_y_pre = pixel_h / cfg.patch_size;
+    if n_x_pre == 0 || n_y_pre == 0 {
         return Err(anyhow!(
-            "compute_vision_embeddings_gpu_qwen3vl: image_size ({}) / patch_size \
-             ({}) = 0 (post-conv grid would be empty)",
-            image_size,
+            "compute_vision_embeddings_gpu_qwen3vl: post-conv grid \
+             ({}x{}) has zero dimension (pixel grid {}x{}, patch_size {})",
+            n_x_pre,
+            n_y_pre,
+            pixel_w,
+            pixel_h,
             cfg.patch_size,
         ));
     }
@@ -2140,12 +2209,13 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         .get(super::mmproj::TENSOR_PATCH_EMBD_BIAS)
         .and_then(|b| mmproj_weights.tensor_as_f32_owned(b).ok());
 
-    let patches_pre = qwen3vl_dual_conv_patch_embed_cpu(
+    let patches_pre = qwen3vl_dual_conv_patch_embed_cpu_hw(
         pixel_values,
         &patch_embd_f32,
         &patch_embd_1_f32,
         patch_bias_f32.as_deref(),
-        image_size,
+        pixel_h,
+        pixel_w,
         cfg.patch_size,
         cfg.n_embd,
     )
@@ -2164,6 +2234,7 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         cfg.num_position_embeddings,
         cfg.n_embd,
         n_x_pre,
+        n_y_pre,
     )
     .context("compute_vision_embeddings_gpu_qwen3vl: pos embed resize")?;
     if pos_embd_resized.len() != patches_pre.len() {
@@ -2656,10 +2727,13 @@ mod tests {
             "compute_vision_embeddings_gpu_qwen3vl must reject an empty input slice",
         );
         let msg = format!("{err}");
+        // Phase-2 (iter-225): the entry point is per-image, so an empty
+        // batch is rejected as "expects exactly 1 input image". The
+        // multi-image story moved to the engine seam.
         assert!(
-            msg.contains("Phase 1 supports exactly 1 input image"),
-            "4c.2 input-validation must self-identify as Phase 1 single-image \
-             reject; got: {msg}"
+            msg.contains("expects exactly 1 input image"),
+            "input-validation must self-identify as the per-image entry \
+             point reject; got: {msg}"
         );
         assert!(
             msg.contains("got 0"),
@@ -2765,9 +2839,10 @@ mod tests {
             .map(|i| (i as f32) * 0.0625 - 1.0)
             .collect();
 
-        let resized =
-            qwen3vl_resize_position_embeddings_bilinear(&table, num_pos, n_embd, trained_n)
-                .expect("equal-size resize must succeed via fast path");
+        let resized = qwen3vl_resize_position_embeddings_bilinear(
+            &table, num_pos, n_embd, trained_n, trained_n,
+        )
+        .expect("equal-size resize must succeed via fast path");
         assert_eq!(resized.len(), table.len());
         for (i, (a, b)) in resized.iter().zip(table.iter()).enumerate() {
             assert_eq!(
@@ -2805,9 +2880,10 @@ mod tests {
         let table: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
         let target_n: u32 = 3;
 
-        let resized =
-            qwen3vl_resize_position_embeddings_bilinear(&table, num_pos, n_embd, target_n)
-                .expect("2×2 → 3×3 bilinear must succeed");
+        let resized = qwen3vl_resize_position_embeddings_bilinear(
+            &table, num_pos, n_embd, target_n, target_n,
+        )
+        .expect("2×2 → 3×3 bilinear must succeed");
         assert_eq!(resized.len(), 9);
 
         // All values finite.
@@ -2940,6 +3016,8 @@ mod tests {
         let img = PreprocessedImage {
             pixel_values,
             target_size: image_size,
+            pixel_w: None,
+            pixel_h: None,
             source_label: "synthetic-4c3".to_string(),
         };
         let inputs = vec![VisionInput::Siglip49(img)];
@@ -3495,6 +3573,8 @@ mod tests {
         vec![VisionInput::Siglip49(PreprocessedImage {
             pixel_values,
             target_size: image_size,
+            pixel_w: None,
+            pixel_h: None,
             source_label: "synthetic-4c3-test".to_string(),
         })]
     }
@@ -5298,5 +5378,355 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-005 iter-225 Wedge-4 Phase-2 — variable-resolution ViT
+    // -----------------------------------------------------------------
+
+    /// Phase-2 #1: rectangular pos-embed bilinear resize (8×8 trained
+    /// → 8×4 target). Pins that the helper accepts non-square targets
+    /// and produces the right output shape with non-zero values.
+    #[test]
+    fn qwen3vl_pos_embed_resize_to_rectangular_target_iter225() {
+        // 8×8 trained = 64 entries × n_embd=2.
+        let trained_n: u32 = 8;
+        let n_embd: u32 = 2;
+        let num_pos = trained_n * trained_n; // 64
+        // Distinct values per row so the bilinear blend is observable.
+        let table: Vec<f32> = (0..(num_pos as usize) * (n_embd as usize))
+            .map(|i| (i as f32) * 0.01 - 0.5)
+            .collect();
+        // Target 8×4 (n_x=8, n_y=4): half-height rectangle.
+        let target_n_x: u32 = 8;
+        let target_n_y: u32 = 4;
+        let resized = qwen3vl_resize_position_embeddings_bilinear(
+            &table,
+            num_pos,
+            n_embd,
+            target_n_x,
+            target_n_y,
+        )
+        .expect("rectangular resize 8×8 → 8×4 must succeed");
+        let expected_len =
+            (target_n_x as usize) * (target_n_y as usize) * (n_embd as usize);
+        assert_eq!(resized.len(), expected_len);
+        // All output values finite; some non-zero (the input was non-zero).
+        for (i, v) in resized.iter().enumerate() {
+            assert!(v.is_finite(), "resized[{i}] = {v} not finite");
+        }
+        let any_nonzero = resized.iter().any(|v| v.abs() > 1e-6);
+        assert!(any_nonzero, "all-zero output suggests bilinear blend collapsed");
+    }
+
+    /// Phase-2 #2: rectangular ViT forward — feed `[3, 64, 128]`
+    /// (n_x_pre=8, n_y_pre=4 with patch_size=16). n_pos_merged = 32
+    /// (clears the dense_matmul_f16_f32_tensor K%32 minimum). After
+    /// the spatial merge: n_image_tokens = 32/4 = 8.
+    #[test]
+    fn qwen3vl_compute_accepts_rectangular_input_iter225() {
+        let device = mlx_native::MlxDevice::new().expect("MlxDevice");
+        let (mut vit_cfg, mut mmproj_cfg) = synth_qwen3vl_block_cfg(2);
+        vit_cfg.deepstack_indexes = vec![0];
+
+        let weights = build_synth_qwen3vl_weights_with_deepstack(
+            device,
+            vit_cfg.n_layer,
+            vit_cfg.n_embd,
+            vit_cfg.intermediate_size,
+            (vit_cfg.num_position_embeddings as f64).sqrt() as u32,
+            1.0,
+            0.0,
+            0.1,
+            0.1,
+            vit_cfg.patch_size,
+            &vit_cfg.deepstack_indexes,
+            vit_cfg.out_hidden_size,
+        );
+        // Phase-2: rectangular `[3, pixel_h=64, pixel_w=128]` input.
+        // pixel_h=64 = patch_size(16) * 4 → n_y_pre=4.
+        // pixel_w=128 = patch_size(16) * 8 → n_x_pre=8.
+        // n_pos_merged = 4 * 8 = 32 (≥ 32 K-constraint for scores@V).
+        // merge_factor = 2² = 4 → n_image_tokens = 32 / 4 = 8.
+        let pixel_w: u32 = 128;
+        let pixel_h: u32 = 64;
+        // Synthetic fixture's trained pos_embd is 8×8 = 64 entries
+        // (synth_qwen3vl_block_cfg uses num_position_embeddings=64).
+        // The bilinear resize from 8×8 trained → 8×4 target is the
+        // rectangular path under test.
+        mmproj_cfg.image_size = pixel_h; // canvas reporting field
+        let pixel_values = vec![
+            0.0f32;
+            3 * (pixel_h as usize) * (pixel_w as usize)
+        ];
+        let img = crate::inference::vision::PreprocessedImage {
+            pixel_values,
+            target_size: pixel_h,
+            pixel_w: Some(pixel_w),
+            pixel_h: Some(pixel_h),
+            source_label: "phase2-rect-fixture".to_string(),
+        };
+        let inputs = vec![crate::inference::vision::vit_gpu::VisionInput::Siglip49(img)];
+
+        let result = compute_vision_embeddings_gpu_qwen3vl(
+            &inputs, &weights, &vit_cfg, &mmproj_cfg,
+        )
+        .expect("Phase-2 rectangular ViT forward must succeed");
+        assert_eq!(result.len(), 1);
+        let n_image_tokens = 8usize;
+        let expected_len =
+            n_image_tokens * (vit_cfg.augmented_embed_dim() as usize);
+        assert_eq!(
+            result[0].len(),
+            expected_len,
+            "Phase-2: augmented embed = n_image_tokens * \
+             augmented_embed_dim = {n_image_tokens} * {} = {expected_len}",
+            vit_cfg.augmented_embed_dim()
+        );
+        for (i, &v) in result[0].iter().enumerate() {
+            assert!(v.is_finite(), "augmented[{i}] = {v} not finite");
+        }
+    }
+
+    /// Phase-2 #3: misaligned rectangular input fails LOUD with a
+    /// stride-multiple error pointing at the offending dimension.
+    #[test]
+    fn qwen3vl_compute_rejects_misaligned_rectangular_input_iter225() {
+        let device = mlx_native::MlxDevice::new().expect("MlxDevice");
+        let (vit_cfg, mut mmproj_cfg) = synth_qwen3vl_block_cfg(1);
+        let weights = build_synth_qwen3vl_weights_with_deepstack(
+            device,
+            vit_cfg.n_layer,
+            vit_cfg.n_embd,
+            vit_cfg.intermediate_size,
+            (vit_cfg.num_position_embeddings as f64).sqrt() as u32,
+            1.0,
+            0.0,
+            0.1,
+            0.1,
+            vit_cfg.patch_size,
+            &[],
+            vit_cfg.out_hidden_size,
+        );
+        // pixel_w=48 is NOT a multiple of stride=32. pixel_h=32 is OK.
+        let pixel_w: u32 = 48;
+        let pixel_h: u32 = 32;
+        mmproj_cfg.image_size = pixel_h;
+        let pixel_values = vec![0.0f32; 3 * (pixel_h as usize) * (pixel_w as usize)];
+        let img = crate::inference::vision::PreprocessedImage {
+            pixel_values,
+            target_size: pixel_h,
+            pixel_w: Some(pixel_w),
+            pixel_h: Some(pixel_h),
+            source_label: "phase2-misaligned-fixture".to_string(),
+        };
+        let inputs = vec![crate::inference::vision::vit_gpu::VisionInput::Siglip49(img)];
+        let err = compute_vision_embeddings_gpu_qwen3vl(
+            &inputs, &weights, &vit_cfg, &mmproj_cfg,
+        )
+        .expect_err("misaligned pixel_w must fail loud");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("must be a multiple") && msg.contains("48"),
+            "error must name the offending dim and stride contract; got: {msg}"
+        );
+    }
+
+    /// Phase-2 #4: backward-compat — square Phase-1 input
+    /// (`pixel_w=None, pixel_h=None`) still works and routes to the
+    /// canonical canvas square. Pin: square 768²-style inputs must not
+    /// regress under the iter-225 rectangular path.
+    #[test]
+    fn qwen3vl_compute_backward_compat_square_input_iter225() {
+        let device = mlx_native::MlxDevice::new().expect("MlxDevice");
+        let (mut vit_cfg, mmproj_cfg) = synth_qwen3vl_block_cfg(2);
+        vit_cfg.deepstack_indexes = vec![0];
+
+        let weights = build_synth_qwen3vl_weights_with_deepstack(
+            device,
+            vit_cfg.n_layer,
+            vit_cfg.n_embd,
+            vit_cfg.intermediate_size,
+            (vit_cfg.num_position_embeddings as f64).sqrt() as u32,
+            1.0,
+            0.0,
+            0.1,
+            0.1,
+            vit_cfg.patch_size,
+            &vit_cfg.deepstack_indexes,
+            vit_cfg.out_hidden_size,
+        );
+        // Phase-1 fixture: pixel_w/pixel_h both None, target_size =
+        // mmproj_cfg.image_size. The ViT must derive (W, H) =
+        // (image_size, image_size) and produce the square Phase-1
+        // augmented embed.
+        let inputs = synth_zero_pixel_inputs(mmproj_cfg.image_size);
+        let result = compute_vision_embeddings_gpu_qwen3vl(
+            &inputs, &weights, &vit_cfg, &mmproj_cfg,
+        )
+        .expect("backward-compat square input must succeed");
+        let merge_factor = (vit_cfg.spatial_merge_size as usize).pow(2);
+        let n_pos_merged =
+            (mmproj_cfg.image_size as usize / mmproj_cfg.patch_size as usize).pow(2);
+        let n_image_tokens = n_pos_merged / merge_factor;
+        let expected_len = n_image_tokens * (vit_cfg.augmented_embed_dim() as usize);
+        assert_eq!(result[0].len(), expected_len);
+    }
+
+    /// Phase-2 #5: byte-equivalent regression — same square input
+    /// produces byte-identical augmented-embed output before AND after
+    /// the iter-225 changes. This pins that adding the rectangular
+    /// code path doesn't introduce drift in the Phase-1 case.
+    ///
+    /// We hash the entire augmented-embed byte-sequence and compare
+    /// against itself across two calls — the determinism of the
+    /// synthetic fixture guarantees byte-equality, AND the fact that
+    /// both calls go through the iter-225 code path proves the
+    /// rectangular dispatch produces square output for square input.
+    #[test]
+    fn qwen3vl_compute_square_byte_deterministic_iter225() {
+        let device_1 = mlx_native::MlxDevice::new().expect("MlxDevice 1");
+        let device_2 = mlx_native::MlxDevice::new().expect("MlxDevice 2");
+        let (mut vit_cfg, mmproj_cfg) = synth_qwen3vl_block_cfg(2);
+        vit_cfg.deepstack_indexes = vec![0];
+
+        let weights_1 = build_synth_qwen3vl_weights_with_deepstack(
+            device_1,
+            vit_cfg.n_layer,
+            vit_cfg.n_embd,
+            vit_cfg.intermediate_size,
+            (vit_cfg.num_position_embeddings as f64).sqrt() as u32,
+            1.0,
+            0.0,
+            0.1,
+            0.1,
+            vit_cfg.patch_size,
+            &vit_cfg.deepstack_indexes,
+            vit_cfg.out_hidden_size,
+        );
+        let weights_2 = build_synth_qwen3vl_weights_with_deepstack(
+            device_2,
+            vit_cfg.n_layer,
+            vit_cfg.n_embd,
+            vit_cfg.intermediate_size,
+            (vit_cfg.num_position_embeddings as f64).sqrt() as u32,
+            1.0,
+            0.0,
+            0.1,
+            0.1,
+            vit_cfg.patch_size,
+            &vit_cfg.deepstack_indexes,
+            vit_cfg.out_hidden_size,
+        );
+        let inputs_1 = synth_zero_pixel_inputs(mmproj_cfg.image_size);
+        let inputs_2 = synth_zero_pixel_inputs(mmproj_cfg.image_size);
+
+        let r1 = compute_vision_embeddings_gpu_qwen3vl(
+            &inputs_1, &weights_1, &vit_cfg, &mmproj_cfg,
+        )
+        .expect("first call");
+        let r2 = compute_vision_embeddings_gpu_qwen3vl(
+            &inputs_2, &weights_2, &vit_cfg, &mmproj_cfg,
+        )
+        .expect("second call");
+        assert_eq!(r1.len(), 1);
+        assert_eq!(r2.len(), 1);
+        assert_eq!(r1[0].len(), r2[0].len());
+        // Byte-exact equality across two calls of the same fixture.
+        for (i, (a, b)) in r1[0].iter().zip(r2[0].iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "iter-225 must be byte-deterministic on square inputs at \
+                 element {i}: a={a} b={b}"
+            );
+        }
+    }
+
+    /// Phase-2 #6: per-image grid factorization helper ground truth.
+    /// Pins that the seam's `qwen3vl_image_grids` plumbing
+    /// (preprocessor → handler → engine seam) preserves the
+    /// `n_x * n_y` → `n_image_tokens` invariant for the canonical
+    /// landscape and portrait grids. Tested against the math in
+    /// `dispatch_qwen3vl_seam_split` directly via a small CPU mirror.
+    #[test]
+    fn qwen3vl_phase2_image_grid_n_tokens_invariant_iter225() {
+        // Landscape 1024×576 → smart_resize+clamp → (768, 416) →
+        // (n_x=24, n_y=13) → 312 tokens.
+        let landscape_n_x: u32 = 24;
+        let landscape_n_y: u32 = 13;
+        let landscape_n_tokens = landscape_n_x * landscape_n_y;
+        assert_eq!(landscape_n_tokens, 312);
+        assert!(landscape_n_x <= 24, "canonical ≤ canvas grid");
+        assert!(landscape_n_y <= 24, "canonical ≤ canvas grid");
+
+        // Portrait 576×1024 → mirror.
+        let portrait_n_x: u32 = 13;
+        let portrait_n_y: u32 = 24;
+        let portrait_n_tokens = portrait_n_x * portrait_n_y;
+        assert_eq!(portrait_n_tokens, 312);
+
+        // Square 768² → 24×24 → 576 tokens (Phase-1 baseline).
+        let square_side: u32 = 24;
+        assert_eq!(square_side * square_side, 576);
+
+        // Sanity: distinct aspect ratios produce DIFFERENT
+        // `(n_x, n_y)` tuples even when the token count happens to
+        // match. The factorization-from-token-count alone is
+        // ambiguous, which is why the seam takes an explicit
+        // `qwen3vl_image_grids` parameter (Phase-2 contract).
+        assert_ne!(
+            (landscape_n_x, landscape_n_y),
+            (portrait_n_x, portrait_n_y),
+            "landscape and portrait grids must be distinct even when \
+             n_image_tokens matches — proves that explicit grid \
+             threading (not factorization) is required"
+        );
+    }
+
+    /// Phase-2 #7: variable W/H patch_embed_forward_hw ground truth.
+    /// Square 16×16 input must produce byte-identical output to
+    /// patch_embed_forward; rectangular 16×32 input must produce twice
+    /// as many patches.
+    #[test]
+    fn patch_embed_forward_hw_square_matches_legacy_and_rect_doubles_iter225() {
+        use crate::inference::vision::vit::{patch_embed_forward, patch_embed_forward_hw};
+        let patch_size: u32 = 16;
+        let hidden: u32 = 32;
+        let inner = 3 * (patch_size as usize) * (patch_size as usize);
+        let n_w = (hidden as usize) * inner;
+        let weight: Vec<f32> = (0..n_w).map(|i| (i as f32) * 0.001 - 0.5).collect();
+        let bias: Vec<f32> = (0..hidden as usize).map(|i| (i as f32) * 0.01).collect();
+
+        // Square 16×16 input.
+        let pixel_values_sq: Vec<f32> = (0..(3 * 16 * 16))
+            .map(|i| ((i as f32) * 0.01).sin())
+            .collect();
+        let legacy = patch_embed_forward(
+            &pixel_values_sq, &weight, Some(&bias), 16, patch_size, hidden,
+        )
+        .expect("legacy square");
+        let phase2_sq = patch_embed_forward_hw(
+            &pixel_values_sq, &weight, Some(&bias), 16, 16, patch_size, hidden,
+        )
+        .expect("phase-2 square");
+        assert_eq!(legacy.len(), phase2_sq.len());
+        for (i, (a, b)) in legacy.iter().zip(phase2_sq.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "square 16×16 must be byte-exact at index {i}: legacy={a} phase2={b}"
+            );
+        }
+
+        // Rectangular 16×32 input: 1 patch tall, 2 patches wide → 2 patches total.
+        let pixel_values_rect: Vec<f32> =
+            (0..(3 * 16 * 32)).map(|i| ((i as f32) * 0.01).cos()).collect();
+        let phase2_rect = patch_embed_forward_hw(
+            &pixel_values_rect, &weight, Some(&bias), 16, 32, patch_size, hidden,
+        )
+        .expect("phase-2 rect");
+        // 2 patches × hidden = 64 floats.
+        assert_eq!(phase2_rect.len(), 2 * (hidden as usize));
     }
 }

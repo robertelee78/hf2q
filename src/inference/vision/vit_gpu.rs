@@ -5956,6 +5956,8 @@ mod tests {
             PreprocessedImage {
                 pixel_values: pixels,
                 target_size: cfg.image_size,
+                pixel_w: None,
+                pixel_h: None,
                 source_label: format!("synthetic-{seed}"),
             }
         };

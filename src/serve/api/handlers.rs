@@ -953,6 +953,7 @@ where
         vit_images_v,
         vision_family,
         per_row_floats,
+        qwen3vl_image_grids,
     ) = if preprocessed_inputs.is_empty() {
         (
             req.messages.clone(),
@@ -961,6 +962,7 @@ where
             None,
             crate::inference::vision::mmproj::VisionFamily::Gemma,
             engine.hidden_size(),
+            Vec::<(u32, u32)>::new(),
         )
     } else {
         let n_images = preprocessed_inputs.len();
@@ -1039,6 +1041,45 @@ where
                 .into_response());
             }
         }
+        // ADR-005 iter-225 (Wedge-4 Phase-2): collect per-image
+        // post-merge token grids `(n_x_token, n_y_token)` from the
+        // preprocessed inputs. For Qwen3-VL the per-image grid is
+        // derived from the smart-resized pixel grid via
+        // `(pixel_w / stride, pixel_h / stride)` where stride =
+        // patch_size * spatial_merge_size. This is the AUTHORITATIVE
+        // grid threaded into `dispatch_qwen3vl_seam_split` so the
+        // 3D-mRoPE position synthesis sees per-image rectangular
+        // (n_x, n_y) instead of inferring it via post-hoc
+        // factorization.
+        //
+        // For non-Qwen3VL families this Vec stays empty (the seam
+        // dispatch is skipped at the caller).
+        let qwen3vl_image_grids: Vec<(u32, u32)> = if matches!(
+            family,
+            crate::inference::vision::mmproj::VisionFamily::Qwen3Vl
+        ) {
+            let stride = mmproj
+                .config
+                .patch_size
+                .saturating_mul(mmproj.config.spatial_merge_size.unwrap_or(1));
+            preprocessed_inputs
+                .iter()
+                .map(|input| {
+                    use crate::inference::vision::vit_gpu::VisionInput;
+                    match input {
+                        VisionInput::Siglip49(p) => {
+                            let (pw, ph) = p.pixel_grid();
+                            let nx = if stride > 0 { pw / stride } else { 0 };
+                            let ny = if stride > 0 { ph / stride } else { 0 };
+                            (nx, ny)
+                        }
+                        VisionInput::Gemma4v(_) => (0, 0),
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let rewritten = rewrite_messages_for_vision_placeholders_family(&req.messages, family);
         (
             rewritten,
@@ -1047,6 +1088,7 @@ where
             Some(n_images),
             family,
             per_row_floats,
+            qwen3vl_image_grids,
         )
     };
 
@@ -1328,6 +1370,7 @@ where
             state.mmproj.as_ref().expect("mmproj checked above"),
             &vision_embeddings,
             &image_token_positions_per_image,
+            &qwen3vl_image_grids,
             &final_prompt_tokens,
         ) {
             Ok((ds, pos)) => (Some(ds), Some(pos)),
@@ -1373,6 +1416,7 @@ fn dispatch_qwen3vl_seam_split(
     mmproj: &super::state::LoadedMmproj,
     vision_embeddings: &[Vec<f32>],
     image_token_positions_per_image: &[Vec<u32>],
+    qwen3vl_image_grids: &[(u32, u32)],
     final_prompt_tokens: &[u32],
 ) -> std::result::Result<(engine::DeepstackData, Vec<i32>), Response> {
     use crate::serve::forward_prefill::{build_qwen3vl_positions, Qwen3VlImageGrid};
@@ -1403,11 +1447,10 @@ fn dispatch_qwen3vl_seam_split(
         .into_response());
     }
 
-    // Compute the per-image post-merge token grid. **Phase-1 ViT
-    // limitation** (see `Qwen3VlPreprocessed` doc): every image
-    // produces a SQUARE `(image_size / (patch * sm))²` token grid;
-    // truly variable per-image grids will lift in a Phase-2 ViT
-    // relaxation iter.
+    // ADR-005 iter-225 (Wedge-4 Phase-2): per-image grids are
+    // RECTANGULAR and derived from the augmented-embed length /
+    // per-row floats. Each image's `n_image_tokens` may differ from
+    // every other image's (e.g. 1024×576 → 16×9=144 vs 768²=24×24=576).
     let stride = mmproj
         .config
         .patch_size
@@ -1429,11 +1472,11 @@ fn dispatch_qwen3vl_seam_split(
         ))
         .into_response());
     }
-    let n_x_token = image_size / stride;
-    let n_y_token = image_size / stride;
-    let per_image_n_image_tokens = (n_x_token as usize) * (n_y_token as usize);
 
-    // Validate per-image n_image_tokens consistency.
+    // Per-image n_image_tokens derived from augmented-embed length.
+    // Phase-2: per-image counts may differ; we collect them into a Vec.
+    let mut per_image_n_image_tokens: Vec<usize> =
+        Vec::with_capacity(vision_embeddings.len());
     for (i, e) in vision_embeddings.iter().enumerate() {
         if e.len() % per_row_floats != 0 {
             return Err(ApiError::generation_error(format!(
@@ -1444,26 +1487,26 @@ fn dispatch_qwen3vl_seam_split(
             .into_response());
         }
         let observed = e.len() / per_row_floats;
-        if observed != per_image_n_image_tokens {
+        if observed == 0 {
             return Err(ApiError::generation_error(format!(
-                "dispatch_qwen3vl_seam_split: vision_embeddings[{i}] has \
-                 {observed} image tokens but Phase-1 ViT contract says \
-                 {per_image_n_image_tokens}"
+                "dispatch_qwen3vl_seam_split: vision_embeddings[{i}] has 0 \
+                 image tokens (augmented-embed empty)"
             ))
             .into_response());
         }
-        if image_token_positions_per_image[i].len() != per_image_n_image_tokens {
+        if image_token_positions_per_image[i].len() != observed {
             return Err(ApiError::generation_error(format!(
                 "dispatch_qwen3vl_seam_split: image_token_positions_per_image[{i}].len()={} \
-                 != per_image_n_image_tokens={per_image_n_image_tokens}",
+                 != observed n_image_tokens={observed} (must match the \
+                 augmented-embed row count after per_row_floats={per_row_floats} split)",
                 image_token_positions_per_image[i].len()
             ))
             .into_response());
         }
+        per_image_n_image_tokens.push(observed);
     }
 
-    let total_n_image_tokens: usize =
-        per_image_n_image_tokens.saturating_mul(vision_embeddings.len());
+    let total_n_image_tokens: usize = per_image_n_image_tokens.iter().sum();
     if total_n_image_tokens == 0 || n_deepstack == 0 {
         // No deepstack chunks to split. Still return an empty
         // DeepstackData and a positions_flat (text-only positions for
@@ -1487,7 +1530,8 @@ fn dispatch_qwen3vl_seam_split(
     }
 
     // Allocate one `[total_n_image_tokens, hidden]` MlxBuffer per
-    // deepstack chunk slot.
+    // deepstack chunk slot. Phase-2: total_n_image_tokens is the SUM
+    // of per-image counts (differing across images).
     let mlx_dev = mlx_native::MlxDevice::new().map_err(|e| {
         ApiError::generation_error(format!(
             "dispatch_qwen3vl_seam_split: MlxDevice::new: {e}"
@@ -1514,7 +1558,7 @@ fn dispatch_qwen3vl_seam_split(
 
     // CPU memcpy: scatter per-image augmented rows' deepstack slots
     // into the per-deepstack-chunk buffers, concatenating across
-    // images in input order.
+    // images in input order. Phase-2: per-image row count varies.
     for j in 0..n_deepstack {
         let dst = chunks[j].as_mut_slice::<f32>().map_err(|e| {
             ApiError::generation_error(format!(
@@ -1523,14 +1567,15 @@ fn dispatch_qwen3vl_seam_split(
             .into_response()
         })?;
         let mut row_offset: usize = 0;
-        for src in vision_embeddings.iter() {
-            for r in 0..per_image_n_image_tokens {
+        for (i, src) in vision_embeddings.iter().enumerate() {
+            let n_img_i = per_image_n_image_tokens[i];
+            for r in 0..n_img_i {
                 let src_base = r * per_row_floats + (j + 1) * hidden;
                 let dst_base = (row_offset + r) * hidden;
                 dst[dst_base..dst_base + hidden]
                     .copy_from_slice(&src[src_base..src_base + hidden]);
             }
-            row_offset += per_image_n_image_tokens;
+            row_offset += n_img_i;
         }
     }
 
@@ -1542,23 +1587,87 @@ fn dispatch_qwen3vl_seam_split(
     debug_assert_eq!(all_positions.len(), total_n_image_tokens);
 
     // Build `image_grids` for `build_qwen3vl_positions`: each image
-    // contributes one (Qwen3VlImageGrid { n_x_token, n_y_token },
-    // sequence_start = first position). All images share the same
-    // square grid in Phase-1.
+    // contributes one (Qwen3VlImageGrid { n_x, n_y }, sequence_start
+    // = first position). Phase-2: per-image (n_x, n_y) is the
+    // AUTHORITATIVE grid threaded from the preprocessor via
+    // `qwen3vl_image_grids` (one entry per image, in the same order
+    // as `vision_embeddings`). We validate the supplied grid
+    // `n_x * n_y` matches the augmented-embed row count
+    // `per_image_n_image_tokens[i]` so a producer/consumer mismatch
+    // fails LOUD here rather than silently mis-routing positions.
+    if !qwen3vl_image_grids.is_empty()
+        && qwen3vl_image_grids.len() != vision_embeddings.len()
+    {
+        return Err(ApiError::generation_error(format!(
+            "dispatch_qwen3vl_seam_split: qwen3vl_image_grids.len()={} != \
+             vision_embeddings.len()={} — one (n_x, n_y) entry required \
+             per image",
+            qwen3vl_image_grids.len(),
+            vision_embeddings.len(),
+        ))
+        .into_response());
+    }
+    let canonical_per_side = image_size / stride;
     let mut image_grids: Vec<(Qwen3VlImageGrid, u32)> =
         Vec::with_capacity(image_token_positions_per_image.len());
-    for img_positions in image_token_positions_per_image.iter() {
+    for (i, img_positions) in image_token_positions_per_image.iter().enumerate() {
         if img_positions.is_empty() {
             continue; // defensive; expand_image_placeholders_family enforces non-empty
         }
         let seq_start = img_positions[0];
-        image_grids.push((
-            Qwen3VlImageGrid {
-                n_x: n_x_token,
-                n_y: n_y_token,
-            },
-            seq_start,
-        ));
+        let n_tokens = per_image_n_image_tokens[i] as u32;
+        let (n_x, n_y) = if !qwen3vl_image_grids.is_empty() {
+            let (gx, gy) = qwen3vl_image_grids[i];
+            // Both axes > 0, both ≤ canonical canvas grid, and the
+            // product matches the observed n_image_tokens — these
+            // pin the producer/consumer agreement.
+            if gx == 0 || gy == 0 {
+                return Err(ApiError::generation_error(format!(
+                    "dispatch_qwen3vl_seam_split: image[{i}] grid \
+                     ({gx},{gy}) has zero axis (preprocessor must report \
+                     positive (n_x, n_y))"
+                ))
+                .into_response());
+            }
+            if gx > canonical_per_side || gy > canonical_per_side {
+                return Err(ApiError::generation_error(format!(
+                    "dispatch_qwen3vl_seam_split: image[{i}] grid \
+                     ({gx},{gy}) exceeds canonical canvas grid \
+                     ({canonical_per_side},{canonical_per_side}) — \
+                     preprocessor canvas clamp violated"
+                ))
+                .into_response());
+            }
+            if gx.saturating_mul(gy) != n_tokens {
+                return Err(ApiError::generation_error(format!(
+                    "dispatch_qwen3vl_seam_split: image[{i}] grid \
+                     ({gx},{gy}) product {} != observed n_image_tokens \
+                     {n_tokens} — producer/consumer mismatch between \
+                     preprocess_qwen3vl and compute_vision_embeddings_gpu_qwen3vl",
+                    gx.saturating_mul(gy)
+                ))
+                .into_response());
+            }
+            (gx, gy)
+        } else {
+            // Backward-compat path: no explicit grids supplied.
+            // Honor the Phase-1 square assumption that holds when
+            // `n_tokens == canonical_per_side²`. This is the only
+            // factorization that is unambiguously safe; any other
+            // count would require the preprocessor's grid handle.
+            let side = (n_tokens as f64).sqrt() as u32;
+            if side == 0 || side > canonical_per_side || side * side != n_tokens {
+                return Err(ApiError::generation_error(format!(
+                    "dispatch_qwen3vl_seam_split: image[{i}] n_image_tokens={n_tokens} \
+                     is not a square ≤ canonical_per_side² ({canonical_per_side}²) \
+                     and no explicit per-image grid was supplied — caller must \
+                     thread `qwen3vl_image_grids` for non-square Phase-2 inputs"
+                ))
+                .into_response());
+            }
+            (side, side)
+        };
+        image_grids.push((Qwen3VlImageGrid { n_x, n_y }, seq_start));
     }
     let positions_flat =
         build_qwen3vl_positions(final_prompt_tokens.len(), &image_grids).map_err(|e| {
@@ -2612,6 +2721,8 @@ fn process_multimodal_content(
                     crate::inference::vision::PreprocessedImage {
                         pixel_values,
                         target_size: preprocess_cfg.target_size,
+                        pixel_w: None,
+                        pixel_h: None,
                         source_label,
                     },
                 ));
@@ -2641,18 +2752,14 @@ fn process_multimodal_content(
                 }));
             }
             ArchProfile::Qwen3VlSiglip => {
-                // iter-224 Wedge-4d LANDED: variable-resolution
-                // preprocessor + `<|vision_start|><|image_pad|><|vision_end|>`
-                // placeholder expansion + 3D-mRoPE position synthesis
-                // + augmented-embed split at engine seam are now wired.
-                //
-                // Phase-1 ViT compatibility note (see
-                // `Qwen3VlPreprocessed` doc): the smart-resize result
-                // is center-padded to `image_size × image_size` so the
-                // Phase-1 ViT (DO-NOT-TOUCH for Wedge-4d) sees a square
-                // input. This preserves aspect ratio while reporting a
-                // FIXED token grid; truly variable n_image_tokens is a
-                // Phase-2 ViT-relaxation iter.
+                // iter-225 Wedge-4 Phase-2 LANDED: ViT now accepts
+                // rectangular `[3, H, W]` input with per-image
+                // `(n_x_token, n_y_token)` derived from smart-resize.
+                // The Phase-1 center-pad path is GONE — the ViT
+                // `compute_vision_embeddings_gpu_qwen3vl` consumes
+                // `pixel_w * pixel_h * 3` floats and computes the per-
+                // image post-merge token grid from the actual content
+                // dimensions, not the trained canvas.
                 let qcfg =
                     crate::inference::vision::preprocess::Qwen3VlPreprocessConfig::from_mmproj(
                         &mmproj.config,
@@ -2682,19 +2789,22 @@ fn process_multimodal_content(
                         )
                         .into_response()
                     })?;
-                // Route through the existing Phase-1 ViT entry point as
-                // a square `Siglip49(PreprocessedImage)` payload — the
-                // ViT validates `pixel_values.len() == 3 * image_size²`
-                // at vit_gpu_qwen3vl.rs:2070-2078, which the
-                // smart-resize-then-pad output satisfies. The variable
-                // (n_x_token, n_y_token) is captured for 3D-mRoPE
-                // position synthesis downstream; Phase-1 ViT outputs a
-                // FIXED (image_size/(patch*sm))² token grid that
-                // matches what the preprocessor reports.
+                // Phase-2: per-image rectangular pixel grid is carried
+                // through `pixel_w` / `pixel_h`; downstream
+                // `compute_vision_embeddings_gpu_qwen3vl` derives
+                // `n_x_pre = pixel_w / patch_size` and
+                // `n_y_pre = pixel_h / patch_size` from these instead
+                // of from `mmproj.image_size`.  The 3D-mRoPE position
+                // synthesis at the engine seam reads the per-image
+                // `(n_x_token, n_y_token)` from the augmented-embed
+                // length and per-image token positions.
+                let (target_w, target_h) = preprocessed.target_pixel_grid();
                 out.push(VisionInput::Siglip49(
                     crate::inference::vision::PreprocessedImage {
                         pixel_values: preprocessed.pixel_values,
                         target_size: preprocessed.target_size,
+                        pixel_w: Some(target_w),
+                        pixel_h: Some(target_h),
                         source_label,
                     },
                 ));
@@ -8311,6 +8421,79 @@ mod multimodal_tests {
                 reconstructed, original_row,
                 "row {r} round-trip mismatch"
             );
+        }
+    }
+
+    /// ADR-005 iter-225 (Wedge-4 Phase-2): per-image rectangular grids
+    /// flow through the seam-split CPU memcpy with VARIABLE per-image
+    /// row counts (different aspect ratios → different
+    /// `n_image_tokens`). This pins that the row-offset bookkeeping
+    /// handles per-image counts correctly, scattering each image's
+    /// deepstack rows into the right slot of the concatenated chunk
+    /// buffer.
+    #[test]
+    fn qwen3vl_seam_split_handles_per_image_variable_n_image_tokens_iter225() {
+        // Two images with DIFFERENT post-merge token counts:
+        //   image 0 (landscape 24×9 = 216 tokens) — would be a wide
+        //     aspect under canonical 768 canvas
+        //   image 1 (portrait 9×24 = 216 tokens) — same TOTAL but
+        //     different aspect (Phase-2 distinguishing case)
+        // We use simpler shapes here for byte-determinism: 4 rows for
+        // image 0, 3 rows for image 1. Concatenated total = 7 rows.
+        let hidden = 2;
+        let n_deepstack = 1;
+        let per_row_floats = hidden * (1 + n_deepstack);
+        let n_img0 = 4usize;
+        let n_img1 = 3usize;
+
+        // Image 0 augmented embed: deepstack slot j=1 row r → r*10.
+        let mut img0 = vec![0f32; n_img0 * per_row_floats];
+        for r in 0..n_img0 {
+            for h in 0..hidden {
+                img0[r * per_row_floats + 1 * hidden + h] = (r * 10) as f32;
+            }
+        }
+        // Image 1 augmented embed: deepstack slot j=1 row r → 100 + r.
+        let mut img1 = vec![0f32; n_img1 * per_row_floats];
+        for r in 0..n_img1 {
+            for h in 0..hidden {
+                img1[r * per_row_floats + 1 * hidden + h] = (100 + r) as f32;
+            }
+        }
+
+        // CPU mirror of the iter-225 per-image-variable scatter (the
+        // actual production path lives in dispatch_qwen3vl_seam_split,
+        // which depends on a full Engine + LoadedMmproj fixture; this
+        // CPU mirror exercises the byte-shuffle math directly).
+        let total_n = n_img0 + n_img1;
+        let per_image_n_image_tokens = vec![n_img0, n_img1];
+        let vision_embeddings = vec![img0, img1];
+        let mut chunks: Vec<Vec<f32>> =
+            (0..n_deepstack).map(|_| vec![0f32; total_n * hidden]).collect();
+        for j in 0..n_deepstack {
+            let mut row_offset = 0usize;
+            for (i, src) in vision_embeddings.iter().enumerate() {
+                let n_img_i = per_image_n_image_tokens[i];
+                for r in 0..n_img_i {
+                    let src_base = r * per_row_floats + (j + 1) * hidden;
+                    let dst_base = (row_offset + r) * hidden;
+                    chunks[j][dst_base..dst_base + hidden]
+                        .copy_from_slice(&src[src_base..src_base + hidden]);
+                }
+                row_offset += n_img_i;
+            }
+        }
+
+        // Image 0 contributes rows 0..4 of chunks[0]: values 0, 10, 20, 30.
+        // Image 1 contributes rows 4..7 of chunks[0]: values 100, 101, 102.
+        for h in 0..hidden {
+            assert_eq!(chunks[0][0 * hidden + h], 0.0);
+            assert_eq!(chunks[0][1 * hidden + h], 10.0);
+            assert_eq!(chunks[0][2 * hidden + h], 20.0);
+            assert_eq!(chunks[0][3 * hidden + h], 30.0);
+            assert_eq!(chunks[0][4 * hidden + h], 100.0);
+            assert_eq!(chunks[0][5 * hidden + h], 101.0);
+            assert_eq!(chunks[0][6 * hidden + h], 102.0);
         }
     }
 
