@@ -105,13 +105,33 @@ pub fn sample_token(
     if indexed.is_empty() {
         return sample_greedy(logits);
     }
-    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // ------------------------------------------------------------------
     // Top-k truncation on raw logits (llama-sampler.cpp:317).
+    //
+    // 2026-05-03 — perf: previously this section did a full O(V log V)
+    // descending sort of all ~248K vocab entries before truncating to
+    // top_k=40. With Qwen3.6's 248044-entry vocab that's ~4.5M f32
+    // comparisons and was the dominant per-step cost on the sampling
+    // path (default --temperature=0.8 → ~74 tok/s vs greedy 122 tok/s
+    // on qwen3.6-35B-A3B-dwq48). When `top_k > 0 && top_k < V`, use
+    // `select_nth_unstable_by` (O(V) average partition) followed by an
+    // O(K log K) sort of the small top-k subset. Mirrors llama.cpp
+    // `llama_sampler_top_k_impl` which uses `std::nth_element` for the
+    // same reason. The full-sort fallback only fires when top_k is
+    // disabled or covers the whole vocab — in which case the downstream
+    // top_p loop genuinely needs all logits sorted.
     // ------------------------------------------------------------------
+    let cmp_desc = |a: &(usize, f32), b: &(usize, f32)| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    };
     if params.top_k > 0 && params.top_k < indexed.len() {
-        indexed.truncate(params.top_k);
+        let top_k = params.top_k;
+        indexed.select_nth_unstable_by(top_k - 1, cmp_desc);
+        indexed.truncate(top_k);
+        indexed.sort_by(cmp_desc);
+    } else {
+        indexed.sort_by(cmp_desc);
     }
 
     // ------------------------------------------------------------------
