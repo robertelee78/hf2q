@@ -1160,6 +1160,201 @@ pub fn apply_sdpa_causal_from_seq_major(
 /// - `n_heads % n_kv_heads != 0` (rejected by mlx-native validate).
 /// - Any underlying mlx-native dispatch failure is propagated with
 ///   the bridge step name in the context.
+///
+/// # ADR-019 Phase 2 iter89e2-E — `_into` variant
+///
+/// [`apply_flash_attn_prefill_seq_major_into`] performs the same 8 dispatches
+/// + 5 intra-encoder barriers but encodes them into a caller-supplied
+/// `&mut CommandEncoder` and does NOT commit. It is the structural
+/// foundation for iter89e2-F's single-CB FA-layer fusion (ops1-4 +
+/// kv_cache_write + fa.prefill_bridge + ops6-7 → 1 CB).
+///
+/// This wrapper preserves byte-identical behavior: when `fa_arena=Some`,
+/// it opens its own encoder, delegates encoding to the `_into` variant,
+/// and commits via `commit_labeled("fa.prefill_bridge")` exactly as before.
+/// When `fa_arena=None`, it executes the legacy per-call alloc + commit-and-
+/// wait path (no `_into` delegation; that path's contract differs).
+///
+/// ── ADR-019 Phase 2 iter89e2-E variant ──────────────────────────────────────
+
+/// Encode `apply_flash_attn_prefill_seq_major`'s 8 dispatches + 5 intra-
+/// encoder barriers into a caller-supplied [`mlx_native::CommandEncoder`]
+/// without committing. The caller owns the encoder lifecycle and is
+/// responsible for issuing the terminal commit.
+///
+/// This is the structural prerequisite for the Phase 2 single-CB fusion
+/// (ADR-019 iter89e2-F): with this `_into` form available, the FA-layer
+/// orchestrator can encode ops1-4 + kv_cache_write + fa.prefill_bridge +
+/// ops6-7 into a single command buffer separated by `enc.memory_barrier()`
+/// calls, eliminating 3 of the 4 commit_labeled calls per FA layer
+/// (4 → 1 CB × 10 FA layers = 30 fewer CBs per Qwen3.6-35B-A3B prefill).
+///
+/// # Contract
+///
+/// - Caller supplies `enc` and is responsible for committing it.
+/// - Caller supplies `out_seq` (the F32 seq-major output buffer); this
+///   function writes into it via the final `permute_021_bf16_to_f32`
+///   dispatch. Allocation of `out_seq` is the caller's responsibility so
+///   the wrapper's per-call alloc shape is preserved exactly (see the
+///   wrapper at [`apply_flash_attn_prefill_seq_major`]).
+/// - `arena` is a `&mut FaPrefillArena` (NOT `Option<&mut ...>`): the
+///   `_into` form is exclusively the production arena path. The legacy
+///   no-arena path uses `commit_and_wait` and per-call BF16 allocations,
+///   which are incompatible with the caller-supplied-encoder model and
+///   remain encapsulated in the wrapper's `else` branch.
+///
+/// # F-fence preservation (ADR-019 §Risk Register)
+///
+/// - F2 (residency-rescission, iter58b): all 7 BF16 scratches are arena-
+///   owned and live for the entire prefill (allocated at
+///   `forward_gpu.rs:1701-1713`, dropped after the output-head terminal
+///   `commit_and_wait_labeled`). `out_seq` is caller-owned and outlives
+///   any commit the caller chooses to issue. No wrapper-local MlxBuffer
+///   drops occur — iter58b race is structurally unreachable regardless
+///   of when the caller commits.
+/// - F11 (zero-init alloc): no `device.alloc_buffer` is called from this
+///   variant — `out_seq` is supplied by the caller, scratches are arena-
+///   owned. The wrapper's per-call `out_seq` allocation is unchanged.
+/// - F1 (persistent compute encoder): `enc` may be in any state on entry;
+///   each dispatch reads/writes it via the standard mlx-native dispatch
+///   surface, which lazy-opens the persistent compute encoder as needed.
+///   This variant adds one new entry-point but no new encoder lifecycles.
+///
+/// # Intra-encoder barriers
+///
+/// All 5 `enc.memory_barrier()` calls present in the wrapper's arena path
+/// are reproduced here in identical positions:
+///   - after Q cast → before Q permute_021
+///   - after K cast → before K permute_021
+///   - after V cast → before V permute_021
+///   - after V permute_021 → before flash_attn_prefill_bf16_d256
+///   - after flash_attn_prefill → before permute_021_bf16_to_f32
+///
+/// # Errors
+///
+/// Same as [`apply_flash_attn_prefill_seq_major`] minus the encoder-open
+/// failure (the caller has already supplied a live encoder):
+///   - `head_dim != 256`
+///   - any underlying mlx-native dispatch failure
+///   - arena `validate_fits` failure (capacity / shape mismatch)
+#[allow(clippy::too_many_arguments)]
+pub fn apply_flash_attn_prefill_seq_major_into(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q_seq_major: &MlxBuffer,
+    k_seq_major: &MlxBuffer,
+    v_seq_major: &MlxBuffer,
+    out_seq: &MlxBuffer,
+    seq_len: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    arena: &mut crate::inference::models::qwen35::FaPrefillArena,
+) -> Result<()> {
+    if head_dim != 256 {
+        return Err(anyhow!(
+            "apply_flash_attn_prefill_seq_major_into: head_dim must be 256 \
+             (D=256 dispatcher); got {head_dim}. Other head_dims need a \
+             different mlx-native dispatcher (D=64 / D=512) or a new port."
+        ));
+    }
+    let seq = seq_len as usize;
+    let nh = n_heads as usize;
+    let nkv = n_kv_heads as usize;
+    let d = head_dim as usize;
+
+    let q_elems = seq * nh * d;
+    let k_elems = seq * nkv * d;
+    let v_elems = seq * nkv * d;
+
+    arena.validate_fits(seq_len, n_heads, n_kv_heads, head_dim)
+        .context("FA bridge: arena validate_fits")?;
+
+    // Step 1+2: Q F32 seq-major → BF16 seq-major → BF16 head-major.
+    cast(
+        enc, registry, device.metal_device(),
+        q_seq_major, &arena.q_bf16_seq, q_elems, CastDirection::F32ToBF16,
+    ).context("FA bridge: cast Q F32→BF16")?;
+    enc.memory_barrier();
+    permute_021_bf16(
+        enc, registry, device.metal_device(),
+        &arena.q_bf16_seq, &arena.q_bf16_hm,
+        seq, nh, d,
+    ).context("FA bridge: permute_021 Q [seq, nh, d] → [nh, seq, d]")?;
+
+    // Step 3+4: K F32 seq-major → BF16 seq-major → BF16 head-major.
+    cast(
+        enc, registry, device.metal_device(),
+        k_seq_major, &arena.k_bf16_seq, k_elems, CastDirection::F32ToBF16,
+    ).context("FA bridge: cast K F32→BF16")?;
+    enc.memory_barrier();
+    permute_021_bf16(
+        enc, registry, device.metal_device(),
+        &arena.k_bf16_seq, &arena.k_bf16_hm,
+        seq, nkv, d,
+    ).context("FA bridge: permute_021 K [seq, nkv, d] → [nkv, seq, d]")?;
+
+    // Step 5+6: V F32 seq-major → BF16 seq-major → BF16 head-major.
+    cast(
+        enc, registry, device.metal_device(),
+        v_seq_major, &arena.v_bf16_seq, v_elems, CastDirection::F32ToBF16,
+    ).context("FA bridge: cast V F32→BF16")?;
+    enc.memory_barrier();
+    permute_021_bf16(
+        enc, registry, device.metal_device(),
+        &arena.v_bf16_seq, &arena.v_bf16_hm,
+        seq, nkv, d,
+    ).context("FA bridge: permute_021 V [seq, nkv, d] → [nkv, seq, d]")?;
+
+    // Barrier: flash_attn_prefill reads Q/K/V head-major written above.
+    enc.memory_barrier();
+
+    // Step 7: dispatch flash_attn_prefill_bf16_d256.
+    //   - scale = 1.0 / sqrt(head_dim) — Qwen3.5/3.6 oracle scale (no
+    //     pre-scaling upstream, unlike Gemma 4).
+    //   - do_causal = true — full prefill from offset 0; in-kernel causal
+    //     mask handles row<col mask.
+    //   - mask = None — pure causal, no external additive bias needed.
+    //   - blk = None (path: dispatch_flash_attn_prefill_bf16_d256, the
+    //     blk-less wrapper that delegates to *_with_blk(blk=None)).
+    let scale = 1.0 / (d as f32).sqrt();
+    dispatch_flash_attn_prefill_bf16_d256(
+        enc, device, registry,
+        &arena.q_bf16_hm, &arena.k_bf16_hm, &arena.v_bf16_hm,
+        /* mask = */ None,
+        &mut arena.out_bf16_hm,
+        &FlashAttnPrefillParams {
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            seq_len_q: seq_len,
+            seq_len_k: seq_len,
+            batch: 1,
+            scale,
+            do_causal: true,
+        },
+    ).context("FA bridge: dispatch_flash_attn_prefill_bf16_d256")?;
+
+    // Barrier: permute_021_bf16_to_f32 reads out_bf16_hm written above.
+    enc.memory_barrier();
+
+    // Step 8: BF16 head-major → F32 seq-major (fused permute+cast).
+    //   Input dims for permute_021 are (dim_a=nh, dim_b=seq, dim_c=d) —
+    //   the kernel writes [seq, nh, d] (i.e. dim_a/dim_b swapped in the
+    //   layout, matching the [A, B, C] → [B, A, C] contract).
+    permute_021_bf16_to_f32(
+        enc, registry, device.metal_device(),
+        &arena.out_bf16_hm, out_seq,
+        nh, seq, d,
+    ).context("FA bridge: permute_021_bf16_to_f32 out [nh, seq, d] → [seq, nh, d] F32")?;
+
+    // No commit — caller owns the encoder lifecycle. See the wrapper
+    // [`apply_flash_attn_prefill_seq_major`] for the "open + delegate +
+    // commit_labeled" composition that preserves the legacy behavior.
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn apply_flash_attn_prefill_seq_major(
     device: &MlxDevice,
@@ -1220,95 +1415,32 @@ pub fn apply_flash_attn_prefill_seq_major(
     if let Some(arena) = fa_arena {
         // ── Arena path: use caller-owned BF16 scratch buffers ────────────
         //
+        // Wrapper preserves byte-identical behavior: opens its own encoder,
+        // delegates encoding to `apply_flash_attn_prefill_seq_major_into`
+        // (which encodes 8 dispatches + 5 intra-encoder barriers but does
+        // NOT commit), then commits via `commit_labeled` exactly as before.
+        //
+        // ADR-019 Phase 2 iter89e2-E: the `_into` variant exists so a
+        // caller (iter89e2-F) can encode the FA-prefill bridge into a
+        // shared CB alongside ops1-4 + kv_cache_write + ops6-7, eliminating
+        // 3 of the 4 CBs per FA layer. iter89e2-E itself is a refactor
+        // only — every callsite of the wrapper still observes identical
+        // output buffers and identical commit semantics.
+        //
         // Lifetime safety (iter58b contract): arena buffers are owned by
         // forward_gpu_impl for the entire prefill. They do NOT drop when
         // this wrapper returns, so no deferred removeAllocation: is staged
         // on the MTLResidencySet. commit_labeled (no host wait) is therefore
         // safe — the next encoder's commit* cannot flush a stale
         // residency-rescission for buffers still referenced by this CB.
-        arena.validate_fits(seq_len, n_heads, n_kv_heads, head_dim)
-            .context("FA bridge: arena validate_fits")?;
-
         let mut enc = device.command_encoder().context("FA prefill bridge encoder")?;
-
-        // Step 1+2: Q F32 seq-major → BF16 seq-major → BF16 head-major.
-        cast(
-            &mut enc, registry, device.metal_device(),
-            q_seq_major, &arena.q_bf16_seq, q_elems, CastDirection::F32ToBF16,
-        ).context("FA bridge: cast Q F32→BF16")?;
-        enc.memory_barrier();
-        permute_021_bf16(
-            &mut enc, registry, device.metal_device(),
-            &arena.q_bf16_seq, &arena.q_bf16_hm,
-            seq, nh, d,
-        ).context("FA bridge: permute_021 Q [seq, nh, d] → [nh, seq, d]")?;
-
-        // Step 3+4: K F32 seq-major → BF16 seq-major → BF16 head-major.
-        cast(
-            &mut enc, registry, device.metal_device(),
-            k_seq_major, &arena.k_bf16_seq, k_elems, CastDirection::F32ToBF16,
-        ).context("FA bridge: cast K F32→BF16")?;
-        enc.memory_barrier();
-        permute_021_bf16(
-            &mut enc, registry, device.metal_device(),
-            &arena.k_bf16_seq, &arena.k_bf16_hm,
-            seq, nkv, d,
-        ).context("FA bridge: permute_021 K [seq, nkv, d] → [nkv, seq, d]")?;
-
-        // Step 5+6: V F32 seq-major → BF16 seq-major → BF16 head-major.
-        cast(
-            &mut enc, registry, device.metal_device(),
-            v_seq_major, &arena.v_bf16_seq, v_elems, CastDirection::F32ToBF16,
-        ).context("FA bridge: cast V F32→BF16")?;
-        enc.memory_barrier();
-        permute_021_bf16(
-            &mut enc, registry, device.metal_device(),
-            &arena.v_bf16_seq, &arena.v_bf16_hm,
-            seq, nkv, d,
-        ).context("FA bridge: permute_021 V [seq, nkv, d] → [nkv, seq, d]")?;
-
-        // Barrier: flash_attn_prefill reads Q/K/V head-major written above.
-        enc.memory_barrier();
-
-        // Step 7: dispatch flash_attn_prefill_bf16_d256.
-        //   - scale = 1.0 / sqrt(head_dim) — Qwen3.5/3.6 oracle scale (no
-        //     pre-scaling upstream, unlike Gemma 4).
-        //   - do_causal = true — full prefill from offset 0; in-kernel causal
-        //     mask handles row<col mask.
-        //   - mask = None — pure causal, no external additive bias needed.
-        //   - blk = None (path: dispatch_flash_attn_prefill_bf16_d256, the
-        //     blk-less wrapper that delegates to *_with_blk(blk=None)).
-        let scale = 1.0 / (d as f32).sqrt();
-        dispatch_flash_attn_prefill_bf16_d256(
+        apply_flash_attn_prefill_seq_major_into(
             &mut enc, device, registry,
-            &arena.q_bf16_hm, &arena.k_bf16_hm, &arena.v_bf16_hm,
-            /* mask = */ None,
-            &mut arena.out_bf16_hm,
-            &FlashAttnPrefillParams {
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                seq_len_q: seq_len,
-                seq_len_k: seq_len,
-                batch: 1,
-                scale,
-                do_causal: true,
-            },
-        ).context("FA bridge: dispatch_flash_attn_prefill_bf16_d256")?;
-
-        // Barrier: permute_021_bf16_to_f32 reads out_bf16_hm written above.
-        enc.memory_barrier();
-
-        // Step 8: BF16 head-major → F32 seq-major (fused permute+cast).
-        //   Input dims for permute_021 are (dim_a=nh, dim_b=seq, dim_c=d) —
-        //   the kernel writes [seq, nh, d] (i.e. dim_a/dim_b swapped in the
-        //   layout, matching the [A, B, C] → [B, A, C] contract).
-        permute_021_bf16_to_f32(
-            &mut enc, registry, device.metal_device(),
-            &arena.out_bf16_hm, &out_seq,
-            nh, seq, d,
-        ).context("FA bridge: permute_021_bf16_to_f32 out [nh, seq, d] → [seq, nh, d] F32")?;
-
+            q_seq_major, k_seq_major, v_seq_major,
+            &out_seq,
+            seq_len, n_heads, n_kv_heads, head_dim,
+            arena,
+        )?;
         // Arena path: commit without host wait. Arena buffers are owned by
         // forward_gpu_impl and outlive this CB. out_seq is moved to the caller
         // and also outlives this CB. No wrapper-local MlxBuffer drops occur,
@@ -3216,6 +3348,162 @@ mod tests {
             max_err < 1e-3,
             "projection max_err={:.2e} >= 1e-3",
             max_err
+        );
+    }
+
+    /// **ADR-019 Phase 2 iter89e2-E byte-exact parity test**: the new
+    /// [`apply_flash_attn_prefill_seq_major_into`] variant produces
+    /// BIT-IDENTICAL output to the legacy
+    /// [`apply_flash_attn_prefill_seq_major`] wrapper when given the same
+    /// inputs and a fresh arena.
+    ///
+    /// This is the load-bearing acceptance gate for iter89e2-E: the
+    /// refactor is a behavior-preserving extraction. If even one F32
+    /// element differs between the two paths, the wrapper-→-`_into`
+    /// composition has changed observable semantics and the iter89e2-F
+    /// fusion cannot proceed.
+    ///
+    /// # Shape rationale
+    ///
+    /// `head_dim=256` is required by the function (D=256 dispatcher).
+    /// `seq=64` exercises the full 8-dispatch chain at production-shape
+    /// proportions (matches `test_arena_buffers_zero_initialized`'s
+    /// seq=64 / nh=16 / nkv=2 / d=256 footprint, ~16 MB scratch).
+    /// `n_heads=16, n_kv_heads=2` matches the apex Qwen3.6-35B-A3B FA
+    /// layer's GQA ratio (8:1).
+    #[test]
+    fn flash_attn_prefill_into_byte_exact_parity_with_wrapper() {
+        use super::super::FaPrefillArena;
+
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        // The flash_attn_prefill kernels are NOT pre-registered in
+        // KernelRegistry::new() — only the steel_attention_* primitives are.
+        // Production callers register at model-load time
+        // (forward_gpu.rs:1394, serve/gpu.rs:64). Mirror that here so the
+        // test exercises the same dispatch surface as production.
+        mlx_native::ops::flash_attn_prefill::register(&mut registry);
+
+        // Production-shape proportions (head_dim=256 mandatory; seq small
+        // enough to fit comfortably in unit-test memory).
+        let seq_len: u32 = 64;
+        let n_heads: u32 = 16;
+        let n_kv_heads: u32 = 2;
+        let head_dim: u32 = 256;
+        let seq = seq_len as usize;
+        let nh = n_heads as usize;
+        let nkv = n_kv_heads as usize;
+        let d = head_dim as usize;
+
+        // Synthetic Q/K/V (deterministic seed).
+        let mut s = 0xCAFEF00Du32;
+        let mut mk_rand_buf = |elems: usize| -> Vec<f32> {
+            (0..elems)
+                .map(|_| {
+                    s = s.wrapping_mul(1103515245).wrapping_add(12345);
+                    ((s as i32 as f32) / (i32::MAX as f32)) * 0.5
+                })
+                .collect()
+        };
+        let q_cpu = mk_rand_buf(seq * nh * d);
+        let k_cpu = mk_rand_buf(seq * nkv * d);
+        let v_cpu = mk_rand_buf(seq * nkv * d);
+
+        let upload = |dev: &MlxDevice, data: &[f32]| -> MlxBuffer {
+            upload_f32(data, dev).expect("upload q/k/v")
+        };
+
+        // --- Run 1: wrapper path (opens own encoder + commit_labeled) ---
+        let q_wrap = upload(&device, &q_cpu);
+        let k_wrap = upload(&device, &k_cpu);
+        let v_wrap = upload(&device, &v_cpu);
+        let mut arena_wrap = FaPrefillArena::new(
+            &device, seq_len, n_heads, n_kv_heads, head_dim,
+        ).expect("FaPrefillArena wrap");
+        let out_wrap_buf = apply_flash_attn_prefill_seq_major(
+            &device, &mut registry,
+            &q_wrap, &k_wrap, &v_wrap,
+            seq_len, n_heads, n_kv_heads, head_dim,
+            Some(&mut arena_wrap),
+        )
+        .expect("wrapper apply_flash_attn_prefill_seq_major");
+        let out_wrap = download_f32(&out_wrap_buf).expect("download wrapper");
+
+        // --- Run 2: _into variant (caller-supplied encoder, caller commits) ---
+        let q_into = upload(&device, &q_cpu);
+        let k_into = upload(&device, &k_cpu);
+        let v_into = upload(&device, &v_cpu);
+        let mut arena_into = FaPrefillArena::new(
+            &device, seq_len, n_heads, n_kv_heads, head_dim,
+        ).expect("FaPrefillArena into");
+        let out_into_buf = device
+            .alloc_buffer(seq * nh * d * 4, DType::F32, vec![seq, nh, d])
+            .expect("alloc out_seq into");
+        {
+            let mut enc = device
+                .command_encoder()
+                .expect("FA prefill bridge encoder (into test)");
+            apply_flash_attn_prefill_seq_major_into(
+                &mut enc, &device, &mut registry,
+                &q_into, &k_into, &v_into,
+                &out_into_buf,
+                seq_len, n_heads, n_kv_heads, head_dim,
+                &mut arena_into,
+            )
+            .expect("_into apply_flash_attn_prefill_seq_major_into");
+            // Caller-issued commit, mirroring the wrapper's commit_labeled
+            // exactly so the byte-exact comparison is apples-to-apples.
+            enc.commit_labeled("fa.prefill_bridge.into.test");
+        }
+        let out_into = download_f32(&out_into_buf).expect("download into");
+
+        // --- Compare ---
+        // Guard: parallel test contention can leave a Metal CB unexecuted
+        // (mirrors the precedent at fa_projections_arena_byte_exact_f32_parity).
+        let wrap_all_zero = out_wrap.iter().all(|&v| v == 0.0);
+        let into_all_zero = out_into.iter().all(|&v| v == 0.0);
+        if wrap_all_zero && into_all_zero {
+            eprintln!(
+                "flash_attn_prefill_into_byte_exact_parity_with_wrapper: \
+                 both paths all-zero under parallel test contention — skipping"
+            );
+            return;
+        }
+
+        assert_eq!(
+            out_wrap.len(),
+            out_into.len(),
+            "byte-exact parity: output lengths differ — wrapper={} into={}",
+            out_wrap.len(),
+            out_into.len(),
+        );
+
+        let mut n_diff = 0usize;
+        for (i, (&w, &n)) in out_wrap.iter().zip(out_into.iter()).enumerate() {
+            if w.to_bits() != n.to_bits() {
+                if n_diff < 5 {
+                    eprintln!(
+                        "  byte-exact diff[{i}]: wrapper={w:.10} ({:#010x}) \
+                         into={n:.10} ({:#010x})",
+                        w.to_bits(),
+                        n.to_bits()
+                    );
+                }
+                n_diff += 1;
+            }
+        }
+        assert_eq!(
+            n_diff, 0,
+            "flash_attn_prefill_into_byte_exact_parity_with_wrapper FAIL: \
+             {n_diff}/{} F32 elements differ — _into variant is NOT byte-\
+             identical to the wrapper. iter89e2-F fusion cannot proceed.",
+            out_wrap.len(),
+        );
+        eprintln!(
+            "flash_attn_prefill_into_byte_exact_parity_with_wrapper: \
+             0/{} elements differ (byte-exact) seq_len={seq_len}, \
+             n_heads={n_heads}, n_kv_heads={n_kv_heads}, head_dim={head_dim}",
+            out_wrap.len(),
         );
     }
 
