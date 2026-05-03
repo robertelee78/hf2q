@@ -1751,6 +1751,10 @@ pub fn apply_gated_delta_net_chunk_with_arena(
         // for the same iter58b reason — they drop when this encoder's
         // CB completes. Keeping `commit_and_wait_labeled` is the safe
         // structural contract iter78 inherits unchanged.
+        //
+        // ADR-019 Phase 3a iter89e2-I: PRESERVED. This is THE iter58b F2 fence
+        // for the chunk-pipeline. Phase 3a does NOT touch this — relaxing it
+        // requires the ChunkInternalArena lifetime audit deferred to Phase 3b.
         let _w5b8_commit = crate::inference::models::qwen35::wave5b8_profile::Section::start(
             crate::inference::models::qwen35::wave5b8_profile::SectionKind::ChunkCommitWait,
         );
@@ -2605,14 +2609,62 @@ pub fn build_delta_net_layer_with_arena(
         k_width,
     };
 
-    // ---- ops 1-3 prefill encoder ----
+    // ---- Stage-A: ops1 + ops2a/2b + op3 + qkv_split (ADR-019 Phase 3a iter89e2-I) ----
+    //
+    // ADR-019 Phase 3a iter89e2-I (chunk-engaged path, mirrored on autoreg too
+    // since both regimes share these pre-branch ops): collapses the legacy
+    // separate ops1-3 CB + qkv_split CB into ONE Stage-A CB. Two
+    // `commit_labeled` per DN layer → one. At 30 DN layers on chunk-engaged
+    // 27B-dwq46: -30 CBs.
+    //
+    // F1 (persistent compute encoder): ADOPTED — one persistent encoder per
+    // Stage-A CB now covers pre_norm + proj_qkv + proj_z + ssm_conv +
+    // qkv_split (5 dispatches, previously split across 2 CBs).
+    //
+    // F2 (iter58b residency-rescission): PRESERVED. All Stage-A scratches
+    // (`x_norm_buf`, `qkv_raw_buf`, `z_buf`, `qkv_conv_buf`, `q_split_buf`,
+    // `k_split_buf`, `v_split_buf`, plus the small param buffers) are owned
+    // by the caller-provided `DnPrefillArena`. The arena is allocated once
+    // in `forward_gpu_impl` (`forward_gpu.rs:~1849-1862`) and dropped only
+    // after the output-head terminal `commit_and_wait_labeled`. No
+    // wrapper-local `MlxBuffer` drops occur within Stage-A — the
+    // iter58b residency-rescission race is structurally unreachable.
+    // Stage-A is non-blocking (`commit_labeled`); the chunk-prep
+    // `commit_and_wait()` immediately following (line ~2808) plus the
+    // chunk-attn `commit_and_wait_labeled("layer.gdn.chunk_attn")` (the
+    // load-bearing iter58b F2 fence at `gpu_delta_net.rs:1757`) and the
+    // ops8-9 `commit_and_wait_labeled` (line ~2904) are PRESERVED EXACTLY
+    // — Phase 3a does NOT widen the F2 window.
+    //
+    // F11 (zero-init alloc): PRESERVED — Stage-A adds zero new
+    // `device.alloc_buffer` calls. The legacy F32 weight-bf16 cast scratch
+    // inside `apply_proj_into` (line ~737) is per-call pooled, unchanged
+    // by this consolidation, and unused on Qwen3.6 dwq46 (Q4_0 weights
+    // take the U8 path).
+    //
+    // RAW edges enforced by `enc.memory_barrier()` calls within the single
+    // CB (replacing the implicit fence the legacy CB boundary provided):
+    //   1. pre_norm → proj_qkv/proj_z (existing — preserved at write-of-
+    //      x_norm_buf → read-of-x_norm_buf).
+    //   2. proj_qkv/proj_z → ssm_conv (existing — preserved at write-of-
+    //      qkv_raw_buf → read-of-qkv_raw_buf; proj_qkv & proj_z dispatch
+    //      concurrently with no barrier between them, matching legacy).
+    //   3. ssm_conv → qkv_split (NEW — replaces the legacy CB-boundary
+    //      ordering between qkv_conv_buf write (op3) and qkv_conv_buf
+    //      read (qkv_split). This is the load-bearing new barrier called
+    //      out in §4.F5 of the Phase 3a design doc; the byte-exact unit
+    //      test below is the empirical guard against forgetting it).
+    let v_sp = nv * dv;
     {
         let _w5b8 = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::LayerOps1to3,
         );
+        let _w5b17 = super::wave5b8_profile::Section::start_w5b17(
+            super::wave5b8_profile::SectionKind::DnQkvGpuSplit,
+        );
         let mut enc = device
             .command_encoder()
-            .context("enc ops1-3 prefill (arena)")?;
+            .context("enc gdn stage_a prefill (arena)")?;
         apply_pre_norm_into(
             &mut enc,
             registry,
@@ -2662,27 +2714,17 @@ pub fn build_delta_net_layer_with_arena(
             ssm_conv_params,
         )
         .context("dispatch_ssm_conv ops3 (arena)")?;
-        enc.commit_labeled("layer.gdn.ops1-3");
-    }
-
-    // ---- qkv_split (de-interleave qkv_conv into Q / K / V slots) ----
-    let v_sp = nv * dv;
-    {
-        let _w5b8 = super::wave5b8_profile::Section::start(
-            super::wave5b8_profile::SectionKind::LayerQkvDeinterleave,
-        );
-        let _w5b17 = super::wave5b8_profile::Section::start_w5b17(
-            super::wave5b8_profile::SectionKind::DnQkvGpuSplit,
-        );
-        let params = QkvSplitParams {
+        // ADR-019 Phase 3a iter89e2-I: NEW intra-CB RAW barrier between
+        // ssm_conv's write to qkv_conv_buf and qkv_split's read of it.
+        // Replaces the legacy CB-boundary ordering when ops1-3 and
+        // qkv_split lived in separate CBs.
+        enc.memory_barrier();
+        let qkv_split_params = QkvSplitParams {
             seq: seq_len,
             q_sp: q_sp as u32,
             k_sp: k_sp as u32,
             v_sp: v_sp as u32,
         };
-        let mut enc = device
-            .command_encoder()
-            .context("enc qkv_split prefill (arena)")?;
         dispatch_qkv_split_f32(
             &mut enc,
             registry,
@@ -2691,10 +2733,13 @@ pub fn build_delta_net_layer_with_arena(
             &arena.q_split_buf,
             &arena.k_split_buf,
             &arena.v_split_buf,
-            &params,
+            &qkv_split_params,
         )
         .map_err(|e| anyhow!("dispatch_qkv_split_f32 (arena): {e}"))?;
-        enc.commit_labeled("layer.gdn.qkv_split");
+        // Stage-A terminal commit (non-blocking). Replaces the two former
+        // `commit_labeled("layer.gdn.ops1-3")` and
+        // `commit_labeled("layer.gdn.qkv_split")` calls with one.
+        enc.commit_labeled("layer.gdn.stage_a");
     }
     let _ = (k_sp, q_sp, v_sp); // shape sanity; locals used above
 
@@ -2805,6 +2850,16 @@ pub fn build_delta_net_layer_with_arena(
                 n_v_heads,
             )
             .context("dispatch_compute_g_beta chunk prefill (arena)")?;
+            // ADR-019 Phase 3a iter89e2-I: PRESERVED. chunk-prep terminal
+            // `commit_and_wait()` (unlabeled — note: ADR-019 §Phase 3 text
+            // mistakenly described this as `commit_labeled`; the actual code
+            // here at gpu_delta_net.rs has always been `commit_and_wait`).
+            // This blocking fence is the F2-protective barrier ahead of the
+            // chunk pipeline, which then issues its own
+            // `commit_and_wait_labeled("layer.gdn.chunk_attn")` (the iter58b
+            // F2 fence at line ~1757). DO NOT consolidate this — it bounds
+            // the iter58b residency-rescission window for the chunk-internal
+            // arena work that Phase 3b (deferred) is the proper home for.
             enc.commit_and_wait()
                 .context("commit chunk-prep prefill (arena)")?;
         }
@@ -2901,6 +2956,12 @@ pub fn build_delta_net_layer_with_arena(
             z_channels,
             hidden_size,
         )?;
+        // ADR-019 Phase 3a iter89e2-I: PRESERVED. chunk ops8-9 terminal
+        // `commit_and_wait_labeled` is the load-bearing F2 / residual-handoff
+        // fence that closes the chunk-engaged DN layer. DO NOT consolidate —
+        // the residual handoff into the FFN tower's first encoder relies on
+        // this blocking commit; relaxing it is Phase 3b territory along with
+        // the chunk-internal arena audit.
         enc.commit_and_wait_labeled("layer.gdn.ops8-9")
             .context("commit chunk ops8-9 prefill (arena)")?;
         output
@@ -4777,5 +4838,381 @@ mod tests {
         for &n in &[128u32, 256, 512, 1024, 2048] {
             run_seqlen_with_heads(n, 2, 2);
         }
+    }
+
+    /// **ADR-019 Phase 3a iter89e2-I byte-exact parity test**: the
+    /// consolidated Stage-A CB (ops1 + ops2a/2b + op3 + qkv_split fused into
+    /// one `commit_labeled("layer.gdn.stage_a")`) produces F32-byte-identical
+    /// output to a parallel reference path that opens the legacy two
+    /// encoders inline (mirroring pre-iter89e2-I structure: separate
+    /// `commit_labeled("layer.gdn.ops1-3")` then a fresh encoder for
+    /// `commit_labeled("layer.gdn.qkv_split")`).
+    ///
+    /// This is the load-bearing acceptance gate for iter89e2-I: collapsing
+    /// two CBs with an explicit intra-CB `enc.memory_barrier()` between
+    /// op3 (writes `qkv_conv_buf`) and qkv_split (reads `qkv_conv_buf`)
+    /// must preserve observable output bit-for-bit. If even one F32
+    /// element differs, the missing/wrong barrier hypothesis is alive
+    /// and Phase 3a's wider iter58b risk surface (per design doc §4 F5)
+    /// requires HOLD before push.
+    ///
+    /// Pattern reference: iter89e2-E's
+    /// `flash_attn_prefill_into_byte_exact_parity_with_wrapper` at
+    /// `gpu_full_attn.rs:3571`.
+    ///
+    /// Exercises the AUTOREGRESSIVE branch of `build_delta_net_layer_with_arena`
+    /// (chunk_path_eligible == false because `HF2Q_CHUNK_SCAN_PREFILL` is
+    /// not set in unit tests). The Stage-A consolidation runs identically
+    /// in both branches — both regimes share these pre-branch ops — so
+    /// autoreg is the cleanest path for unit-test reproduction. The
+    /// chunk-engaged branch is byte-validated separately by AC-PA1's
+    /// 4-fixture decode parity at production weights.
+    #[test]
+    fn dn_stage_a_byte_exact_parity_with_pre_phase3a() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+
+        // Small shape: keeps unit-test memory <1 MB and runtime <100 ms.
+        // d_k=32 satisfies the autoregressive decode-kernel-eligible gate
+        // (d_k % 32 == 0 && d_k <= 128); d_k != MAX_K so chunk_path_eligible
+        // returns false (autoreg path taken).
+        let shape = DeltaNetLayerShape {
+            hidden_size: 64,
+            n_k_heads: 2,
+            n_v_heads: 4,
+            d_k: 32,
+            d_v: 32,
+            conv_kernel: 4,
+            rms_norm_eps: 1e-6,
+        };
+        let seq_len: u32 = 16;
+        let _h = shape.hidden_size as usize;
+        let qkv_channels = shape.qkv_channels();
+        let nv = shape.n_v_heads as usize;
+        let dv = shape.d_v as usize;
+        let state_size = nv * shape.d_k as usize * dv;
+        let km1 = (shape.conv_kernel - 1) as usize;
+
+        let weights_cpu = synthetic_weights(shape, 0xDEADBEEF);
+        let gpu_weights = DeltaNetWeightsGpu::from_cpu_f32(
+            &weights_cpu,
+            &device,
+            shape.conv_kernel as usize,
+            qkv_channels as usize,
+        )
+        .expect("from_cpu_f32");
+
+        // Deterministic input.
+        let x_cpu: Vec<f32> = (0..seq_len as usize * shape.hidden_size as usize)
+            .map(|i| 0.01 * (i as f32) - 0.5)
+            .collect();
+        let state_in = vec![0.0f32; state_size];
+        let conv_state = vec![0.0f32; km1 * qkv_channels as usize];
+
+        // ---- Run 1: PRODUCTION consolidated Stage-A path (post-iter89e2-I) ----
+        let x_prod = upload_f32(&x_cpu, &device).expect("upload x prod");
+        let state_in_prod = upload_f32(&state_in, &device).expect("upload state_in prod");
+        let state_out_prod = upload_f32(&state_in, &device).expect("upload state_out prod");
+        let conv_in_prod = upload_f32(&conv_state, &device).expect("upload conv_in prod");
+        let conv_out_prod = upload_f32(&conv_state, &device).expect("upload conv_out prod");
+        let mut arena_prod = super::super::DnPrefillArena::new(
+            &device,
+            seq_len,
+            shape.hidden_size,
+            shape.n_k_heads,
+            shape.n_v_heads,
+            shape.d_k,
+            shape.d_v,
+        )
+        .expect("DnPrefillArena prod");
+        let prod_out_buf = build_delta_net_layer_with_arena(
+            &device,
+            &mut registry,
+            &x_prod,
+            &gpu_weights,
+            &conv_in_prod,
+            &conv_out_prod,
+            &state_in_prod,
+            &state_out_prod,
+            &mut arena_prod,
+            None, // chunk_allocs_arena: autoreg branch ignores
+            None, // chunk_internal_arena: autoreg branch ignores
+            seq_len,
+            shape.hidden_size,
+            shape.n_k_heads,
+            shape.n_v_heads,
+            shape.d_k,
+            shape.d_v,
+            shape.conv_kernel,
+            shape.rms_norm_eps,
+        )
+        .expect("production consolidated Stage-A path");
+        // Flush before download (mirrors pattern at gpu_state_propagation_*).
+        {
+            let mut flush_enc = device.command_encoder().expect("flush prod");
+            flush_enc.commit_and_wait().expect("flush commit_and_wait prod");
+        }
+        let prod_out = download_f32(&prod_out_buf).expect("download prod");
+
+        // ---- Run 2: LEGACY 2-CB reference path (pre-iter89e2-I structure) ----
+        // Replicates the exact dispatch sequence of the production path EXCEPT
+        // the two pre-branch encoders are opened separately as in pre-Phase-3a
+        // (closes `ops1-3` CB before opening a fresh `qkv_split` CB). All
+        // post-Stage-A code (autoreg ops5-9) is reproduced inline using the
+        // same kernels. If output differs from production, the new intra-CB
+        // memory_barrier between op3 and qkv_split is wrong/missing.
+        let x_ref = upload_f32(&x_cpu, &device).expect("upload x ref");
+        let state_in_ref = upload_f32(&state_in, &device).expect("upload state_in ref");
+        let state_out_ref = upload_f32(&state_in, &device).expect("upload state_out ref");
+        let conv_in_ref = upload_f32(&conv_state, &device).expect("upload conv_in ref");
+        let conv_out_ref = upload_f32(&conv_state, &device).expect("upload conv_out ref");
+        let mut arena_ref = super::super::DnPrefillArena::new(
+            &device,
+            seq_len,
+            shape.hidden_size,
+            shape.n_k_heads,
+            shape.n_v_heads,
+            shape.d_k,
+            shape.d_v,
+        )
+        .expect("DnPrefillArena ref");
+
+        // Replicate per-layer constants exactly as build_delta_net_layer_with_arena does.
+        let n_q_elems = (seq_len * shape.n_k_heads * shape.d_k) as usize;
+        let q_scale_val = 1.0_f32 / (shape.d_k as f32).sqrt();
+        let rows_op8 = seq_len * shape.n_v_heads;
+        let z_channels = shape.n_v_heads * shape.d_v;
+        let q_sp = (shape.n_k_heads * shape.d_k) as usize;
+        let k_sp = (shape.n_k_heads * shape.d_k) as usize;
+        let v_sp = nv * dv;
+
+        // Populate small param buffers (verbatim).
+        {
+            let s = arena_ref.ssm_params_buf.as_mut_slice::<u32>().expect("ssm_params");
+            s[0] = qkv_channels;
+            s[1] = seq_len;
+            s[2] = 1;
+            s[3] = shape.conv_kernel;
+        }
+        {
+            let s = arena_ref.g_params_buf.as_mut_slice::<u32>().expect("g_params");
+            s[0] = shape.n_v_heads;
+            s[1] = seq_len;
+        }
+        {
+            let s = arena_ref.op8_params_buf.as_mut_slice::<f32>().expect("op8_params");
+            s[0] = shape.rms_norm_eps;
+            s[1] = shape.d_v as f32;
+        }
+        let gdn_params = GatedDeltaNetParams {
+            d_k: shape.d_k,
+            d_v: shape.d_v,
+            n_k_heads: shape.n_k_heads,
+            n_v_heads: shape.n_v_heads,
+            n_tokens: seq_len,
+            n_seqs: 1,
+        };
+        {
+            let s = arena_ref.gdn_params_buf.as_mut_slice::<u32>().expect("gdn_params");
+            s[0] = gdn_params.d_k;
+            s[1] = gdn_params.d_v;
+            s[2] = gdn_params.n_k_heads;
+            s[3] = gdn_params.n_v_heads;
+            s[4] = gdn_params.n_tokens;
+            s[5] = gdn_params.n_seqs;
+            s[6] = 0;
+            s[7] = 0;
+        }
+        let ssm_conv_params = SsmConvParams {
+            channels: qkv_channels,
+            n_tokens: seq_len,
+            n_seqs: 1,
+            k_width: shape.conv_kernel,
+        };
+
+        // ---- pre-iter89e2-I: separate ops1-3 CB ----
+        {
+            let mut enc = device
+                .command_encoder()
+                .expect("ref enc ops1-3");
+            apply_pre_norm_into(
+                &mut enc, &mut registry, &device,
+                &x_ref, &gpu_weights.attn_norm,
+                &arena_ref.x_norm_buf, &mut arena_ref.pre_norm_params_buf,
+                seq_len, shape.hidden_size, shape.rms_norm_eps,
+            ).expect("ref pre_norm");
+            enc.memory_barrier();
+            apply_proj_into(
+                &mut enc, &mut registry, &device,
+                &arena_ref.x_norm_buf, &gpu_weights.attn_qkv,
+                &mut arena_ref.qkv_raw_buf,
+                seq_len, shape.hidden_size, qkv_channels,
+            ).expect("ref proj_qkv");
+            apply_proj_into(
+                &mut enc, &mut registry, &device,
+                &arena_ref.x_norm_buf, &gpu_weights.attn_gate,
+                &mut arena_ref.z_buf,
+                seq_len, shape.hidden_size, z_channels,
+            ).expect("ref proj_z");
+            enc.memory_barrier();
+            dispatch_ssm_conv(
+                &mut enc, &mut registry, device.metal_device(),
+                &arena_ref.qkv_raw_buf, &gpu_weights.ssm_conv1d,
+                &conv_in_ref, &conv_out_ref,
+                &arena_ref.qkv_conv_buf,
+                &arena_ref.ssm_params_buf, ssm_conv_params,
+            ).expect("ref ssm_conv");
+            enc.commit_labeled("ref.layer.gdn.ops1-3");
+        }
+
+        // ---- pre-iter89e2-I: separate qkv_split CB ----
+        {
+            let params = QkvSplitParams {
+                seq: seq_len,
+                q_sp: q_sp as u32,
+                k_sp: k_sp as u32,
+                v_sp: v_sp as u32,
+            };
+            let mut enc = device
+                .command_encoder()
+                .expect("ref enc qkv_split");
+            dispatch_qkv_split_f32(
+                &mut enc, &mut registry, device.metal_device(),
+                &arena_ref.qkv_conv_buf,
+                &arena_ref.q_split_buf,
+                &arena_ref.k_split_buf,
+                &arena_ref.v_split_buf,
+                &params,
+            ).expect("ref qkv_split");
+            enc.commit_labeled("ref.layer.gdn.qkv_split");
+        }
+
+        // ---- autoreg ops5-9: same as production (verbatim) ----
+        let ref_out_buf = {
+            let mut enc = device
+                .command_encoder()
+                .expect("ref enc ops5-9");
+            apply_l2_norm_per_head_into(
+                &mut enc, &mut registry, &device,
+                &arena_ref.q_split_buf, &arena_ref.q_l2_buf,
+                &mut arena_ref.l2_params_q_buf,
+                seq_len, shape.n_k_heads, shape.d_k, shape.rms_norm_eps,
+            ).expect("ref l2_q");
+            apply_l2_norm_per_head_into(
+                &mut enc, &mut registry, &device,
+                &arena_ref.k_split_buf, &arena_ref.k_normed_buf,
+                &mut arena_ref.l2_params_k_buf,
+                seq_len, shape.n_k_heads, shape.d_k, shape.rms_norm_eps,
+            ).expect("ref l2_k");
+            apply_proj_into(
+                &mut enc, &mut registry, &device,
+                &arena_ref.x_norm_buf, &gpu_weights.ssm_alpha,
+                &mut arena_ref.alpha_logit_buf,
+                seq_len, shape.hidden_size, shape.n_v_heads,
+            ).expect("ref alpha");
+            apply_proj_into(
+                &mut enc, &mut registry, &device,
+                &arena_ref.x_norm_buf, &gpu_weights.ssm_beta,
+                &mut arena_ref.beta_logit_buf,
+                seq_len, shape.hidden_size, shape.n_v_heads,
+            ).expect("ref beta");
+            enc.memory_barrier();
+            scalar_mul_f32(
+                &mut enc, &mut registry, device.metal_device(),
+                &arena_ref.q_l2_buf, &arena_ref.q_scaled_buf,
+                n_q_elems, q_scale_val,
+            ).expect("ref scalar_mul");
+            dispatch_compute_g_beta(
+                &mut enc, &mut registry, device.metal_device(),
+                &arena_ref.alpha_logit_buf, &arena_ref.beta_logit_buf,
+                &gpu_weights.ssm_dt_bias, &gpu_weights.ssm_a,
+                &arena_ref.g_buf, &arena_ref.beta_buf,
+                &arena_ref.g_params_buf, seq_len, shape.n_v_heads,
+            ).expect("ref compute_g_beta");
+            enc.memory_barrier();
+            // d_k=32 satisfies decode-kernel-eligible gate.
+            dispatch_gated_delta_net_decode(
+                &mut enc, &mut registry, device.metal_device(),
+                &arena_ref.q_scaled_buf, &arena_ref.k_normed_buf,
+                &arena_ref.v_split_buf, &arena_ref.g_buf, &arena_ref.beta_buf,
+                &state_in_ref, &arena_ref.attn_out_buf, &state_out_ref,
+                &arena_ref.gdn_params_buf, gdn_params,
+            ).expect("ref gdn_decode");
+            enc.memory_barrier();
+            dispatch_ssm_norm_gate(
+                &mut enc, &mut registry, device.metal_device(),
+                &arena_ref.attn_out_buf, &gpu_weights.ssm_norm,
+                &arena_ref.z_buf, &arena_ref.gated_buf,
+                &arena_ref.op8_params_buf, rows_op8, shape.d_v,
+            ).expect("ref ssm_norm_gate");
+            enc.memory_barrier();
+            let out = apply_proj(
+                &mut enc, &mut registry, &device,
+                &arena_ref.gated_buf, &gpu_weights.ssm_out,
+                seq_len, z_channels, shape.hidden_size,
+            ).expect("ref out_proj");
+            enc.commit_labeled("ref.layer.gdn.ops5-9");
+            out
+        };
+        {
+            let mut flush_enc = device.command_encoder().expect("flush ref");
+            flush_enc.commit_and_wait().expect("flush commit_and_wait ref");
+        }
+        let ref_out = download_f32(&ref_out_buf).expect("download ref");
+
+        let _ = (k_sp, q_sp, v_sp);
+
+        // ---- Compare ----
+        // Guard: parallel test contention can leave a Metal CB unexecuted
+        // (mirrors the precedent at flash_attn_prefill_into_byte_exact_parity_*).
+        let prod_all_zero = prod_out.iter().all(|&v| v == 0.0);
+        let ref_all_zero = ref_out.iter().all(|&v| v == 0.0);
+        if prod_all_zero && ref_all_zero {
+            eprintln!(
+                "dn_stage_a_byte_exact_parity_with_pre_phase3a: \
+                 both paths all-zero under parallel test contention — skipping"
+            );
+            return;
+        }
+
+        assert_eq!(
+            prod_out.len(),
+            ref_out.len(),
+            "byte-exact parity: output lengths differ — prod={} ref={}",
+            prod_out.len(),
+            ref_out.len(),
+        );
+
+        let mut n_diff = 0usize;
+        for (i, (&p, &r)) in prod_out.iter().zip(ref_out.iter()).enumerate() {
+            if p.to_bits() != r.to_bits() {
+                if n_diff < 5 {
+                    eprintln!(
+                        "  byte-exact diff[{i}]: prod={p:.10} ({:#010x}) \
+                         ref={r:.10} ({:#010x})",
+                        p.to_bits(),
+                        r.to_bits()
+                    );
+                }
+                n_diff += 1;
+            }
+        }
+        assert_eq!(
+            n_diff, 0,
+            "dn_stage_a_byte_exact_parity_with_pre_phase3a FAIL: \
+             {n_diff}/{} F32 elements differ — Stage-A consolidation is NOT \
+             byte-identical to the legacy 2-CB structure. The new intra-CB \
+             memory_barrier between op3 (writes qkv_conv_buf) and qkv_split \
+             (reads qkv_conv_buf) is wrong or missing. iter89e2-I HOLD.",
+            prod_out.len(),
+        );
+        eprintln!(
+            "dn_stage_a_byte_exact_parity_with_pre_phase3a: \
+             0/{} elements differ (byte-exact) seq_len={seq_len}, \
+             hidden={}, n_k={}, n_v={}, d_k={}, d_v={}",
+            prod_out.len(),
+            shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
+            shape.d_k, shape.d_v,
+        );
     }
 }
