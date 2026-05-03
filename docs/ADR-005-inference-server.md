@@ -7730,3 +7730,80 @@ this prompt, not an hf2q regression.
    Possible perf regression vs prior 120 t/s baseline.
 
 **No production-code change in this entry.** Findings + harness only.
+
+### 2026-05-03 (afternoon) — SIGABRT root-caused to mlx-native residency-set, not hf2q
+
+**Crash report evidence.** macOS DiagnosticReports captured 6 SIGABRT crashes
+on `hf2q` over a 9-hour window (2026-05-02 22:30:33 → 2026-05-03 07:15:15).
+All six have the **identical** faulting-thread stack:
+
+```
+abort
+↓ -[IOGPUMetalResidencySet addAllocation:]    (Apple Metal driver)
+↓ mlx_native::residency::ResidencySet::add_allocation
+↓ MlxBufferPool::register_residency_allocation     (mlx-native/src/buffer_pool.rs:398)
+↓ MlxBufferPool::alloc_inner                       (buffer_pool.rs:136)
+↓ MlxBufferPool::alloc                             (buffer_pool.rs:97)
+↓ {hf2q qwen35 forward-pass alloc site}
+↓ Qwen35Model::forward_gpu_impl
+↓ hf2q::serve::run_decode_loop
+↓ hf2q::serve::cmd_generate_qwen35
+```
+
+The hf2q-side leaf alternates across reports:
+* `gpu_ffn::build_moe_ffn_layer_gpu_q_into` (3×)
+* `gpu_delta_net::build_delta_net_layer` (2×)
+* `gpu_delta_net::apply_proj` (1×)
+* `gpu_ffn::proj_pooled` (1×)
+
+— i.e. ANY per-token alloc site that goes through the pool can trip it. The
+common-cause is below the alloc-site, in `MlxBufferPool::register_residency_allocation`'s
+unconditional `device_set.add_allocation(buffer)` call followed by Apple's
+`-[IOGPUMetalResidencySet addAllocation:]` aborting.
+
+**Reproducer.** `hf2q generate --max-tokens 20000 --model <qwen3.6-35B-A3B-dwq48>`
+on a long-form prompt. Crash fires at ~2 k decoded tokens (~18-20 s of
+generation). Exit code 134 (SIGABRT), no Rust panic message — the abort
+comes from below the FFI boundary inside Metal's residency-set machinery.
+
+**Hypothesis (NOT yet falsified, requires model load to confirm).**
+`MlxBufferPool::register_residency_allocation` (buffer_pool.rs:398-427)
+deduplicates by `buffer.contents() as usize` (host pointer of
+`StorageModeShared`). When Apple's allocator recycles a host page, two
+distinct `MTLBuffer` ARCs can share the same `contents()` pointer; the
+pool's local `resident_buffers` HashMap then returns the wrong dedup
+verdict (either skipping a needed `add_allocation` or accepting a duplicate
+add for a different MTLBuffer at the same host address). Apple's
+residency-set treats these as duplicate-add and aborts.
+
+**Falsification plan (one careful model load, supervised — RAM peak ~25 GiB
+on 128 GiB M5 Max — within budget).**
+
+  1. Add an `eprintln` instrumentation gate
+     (`HF2Q_PROFILE_RESIDENCY_ABORT=1`) inside
+     `register_residency_allocation` that logs:
+       * `resident_buffers.len()` before each add
+       * `buffer_key` collisions (existing-vs-new MTLBuffer ARCs)
+     Run the wedding-cake reproducer until SIGABRT, capture last 20 lines.
+
+  2. If host-pointer collision reproduces in instrumentation logs:
+     redesign the dedup key to use `MTLBuffer` object identity (`Retained<MTLBuffer>`
+     ARC ptr eq) rather than `contents()` host pointer.
+
+  3. If collision does NOT reproduce: investigate the descriptor's
+     `setInitialCapacity:256` (residency.rs:106) — is there a hard cap
+     beyond which `addAllocation:` aborts? Apple's docs say the set grows
+     but may have an internal upper bound.
+
+**Why this is mlx-native territory, not hf2q.** The bug lives entirely
+within `mlx-native::buffer_pool` / `mlx-native::residency`. hf2q's
+qwen35 forward-pass code is the *trigger frequency* (per-token alloc
+load) but not the cause. Phase-1/2/3a (ADR-019 trunk-landings on 2026-05-02
+20:44/20:48/20:49) widened in-flight CB windows but did NOT introduce this
+abort — earliest crash report is 2026-05-02 22:30:33, < 2 hours after
+those commits, BUT the same crash mode also affects callers that pre-date
+phase-1/2/3a (e.g. `gpu_delta_net::apply_proj` is older than ADR-019).
+
+**Next iteration.** Land instrumentation in mlx-native, run one supervised
+reproducer, fix the dedup key. This entry stands as the static-evidence
+trail; the fix entry will follow.
