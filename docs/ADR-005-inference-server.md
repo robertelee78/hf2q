@@ -8179,3 +8179,64 @@ passes 2784/2784 (`cargo test --release --bin hf2q -- --test-threads=1`).
 ADR-013/015/017/019 territories (Qwen35 inference, mlx-native single-CB,
 persistent block prefix cache, encoder architecture) all green.
 
+
+---
+
+### Session entry — 2026-05-03 (afternoon, fourth iter): sampling lm_head
+### BF16 → Q4 closes most of the remaining sampling-vs-greedy gap
+
+User feedback this iter: "yeah, still stupid slow." 93 tok/s sampling on
+the moonwalk prompt was the floor; user explicitly cited the 93 vs 123
+gap as the gate.
+
+**Per-step profile (`HF2Q_STEP_PROFILE`).** The diagnostic was extended
+to split `fwd=` (forward+lm_head) and `smp=` (host sampler) so the
+remaining gap could be attributed directly:
+
+  Sampling pre-fix: total=9.5–10.0 ms  fwd=9.2–9.5 ms  smp=0.36 ms
+  Greedy:           total=7.8–8.0 ms                    (single bucket)
+
+The host sampler is **negligible** (0.36 ms) after iters 1-3's
+optimizations. The entire remaining sampling-vs-greedy gap was on
+the GPU forward path.
+
+**Root cause.** `apply_output_head_gpu_into` (the sampling path) used
+`head.lm_head_bf16`. `apply_output_head_gpu_greedy_into` (the greedy
+path) uses `head.lm_head_q4`. BF16 matmul on Apple Silicon is
+~1.4 ms/step slower than Q4 on this fixture (35B params, 248K vocab).
+Q4 was already proven correct in greedy mode — and produces
+byte-identical output to BF16 at temp=0 (determinism MD5 unchanged
+across the switch).
+
+**Fix.** Single-line edit at `forward_gpu.rs:692`:
+`&head.lm_head_bf16` → `&head.lm_head_q4`. All callers of
+`apply_output_head_gpu_into` move to Q4 in lockstep (full prefill,
+last-row prefill, sampling decode).
+
+**Empirical** (qwen3.6-35B-A3B-dwq48, recipe / 200 tok / sampling
+defaults, 3 rounds):
+
+  Pre-fix:    101.5–101.9 tok/s
+  Post-fix:   115.4–115.9 tok/s   (+14 tok/s, +14%)
+
+  Greedy temp=0 unchanged: 123.0 tok/s.
+  Determinism (5x cold runs) unchanged: MD5 0dfd0ae2…
+  Full test suite (singleton): 2784/2784 PASS.
+
+**Cumulative sampling-mode improvement this session:**
+
+  Pre-iter-1:  74.2 tok/s   (full O(V log V) sort + BF16 lm_head)
+  Iter-1:     100.7         (O(V)→O(K) partial select)
+  Iter-2:     101.7         (thread-local scratch)
+  Iter-3:     115.7         (BF16→Q4 lm_head)         ← THIS ENTRY
+  Total:      +41.5 tok/s   (+56%)
+
+**Remaining 3.5 tok/s gap to llama-bench tg200 (119.4 tok/s).** Per the
+profile, sampling is at 8.3 ms/step vs greedy 7.85 ms/step. Delta
+~0.45 ms is mostly the 1 MB host download (`download_f32` of full vocab
+F32 logits). Closing requires GPU top-k: invoke
+`mlx_native::ops::top_k::dispatch_top_k_f32` after the lm_head matmul,
+download only K * 8 bytes (indices + values), and feed them to a new
+`sample_token_from_topk` host helper. mlx-native already ships the
+kernel (max K=128 — default top_k=40 fits). Tracked for next iter.
+
