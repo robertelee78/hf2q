@@ -325,6 +325,86 @@ if ! grep -q '^data: \[DONE\]' "$STREAM_LOG"; then
 fi
 echo "    streaming OK: $(grep -c '^data:' "$STREAM_LOG") SSE events + [DONE] sentinel"
 
+# ---- Step 8: Streaming-with-tools[] variant (Wedge-4e tools[] coverage) ----
+# Phase-2c followup closing Codex Wedge-4f review finding #4 (low):
+# the prior recipe didn't actually exercise tools[]. This step sends a
+# streaming chat with image + tools[] + tool_choice=auto and asserts the
+# request path produces a valid SSE stream (whether or not the model
+# emits a tool_call — that's content-dependent on the prompt and the
+# model's actual tool-use behavior). The default-running unit tests
+# pin the splitter MODE-INVARIANCE; this live exercise pins the
+# request-path plumbing under tools[]: handler accepts tools[],
+# engine threads it, sampler grammar compiles (Auto path), SSE
+# streams without 5xx.
+echo "==> Step 8: Streaming-with-tools[] variant"
+TOOLS_LOG="/tmp/wedge4_qwen3vl_tools.log"
+curl -s -N -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n \
+        --arg img "data:image/png;base64,$TEST_IMAGE_B64" \
+        '{
+            model: "qwen3-vl-2b",
+            messages: [{
+                role: "user",
+                content: [
+                    {type: "text", text: "If asked, classify the image color via the classify_color tool."},
+                    {type: "image_url", image_url: {url: $img}}
+                ]
+            }],
+            tools: [{
+                type: "function",
+                function: {
+                    name: "classify_color",
+                    description: "Classify the dominant color of an image",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            color: {
+                                type: "string",
+                                description: "The dominant color name"
+                            }
+                        },
+                        required: ["color"]
+                    }
+                }
+            }],
+            tool_choice: "auto",
+            max_tokens: 64,
+            temperature: 0,
+            stream: true
+        }')" \
+    > "$TOOLS_LOG" || {
+    echo "ERROR: streaming-with-tools curl failed; server log tail:" >&2
+    tail -20 "$SERVE_LOG" >&2
+    exit 4
+}
+
+# Required: SSE shape valid (data: lines + [DONE] sentinel) regardless
+# of whether a tool_call was actually emitted. A real tool_call delta
+# emission is content-dependent (model may produce text instead); per
+# the matrix's ⚠ caveat, this step asserts the REQUEST PATH only.
+if ! grep -q '^data:' "$TOOLS_LOG"; then
+    echo "ERROR: tools[] streaming response had no SSE 'data:' lines" >&2
+    cat "$TOOLS_LOG" >&2
+    exit 4
+fi
+if ! grep -q '^data: \[DONE\]' "$TOOLS_LOG"; then
+    echo "ERROR: tools[] streaming response missing '[DONE]' sentinel" >&2
+    tail -10 "$TOOLS_LOG" >&2
+    exit 4
+fi
+TOOL_DELTAS=$(grep -c '"tool_calls"' "$TOOLS_LOG" || true)
+TEXT_DELTAS=$(grep -c '"content"' "$TOOLS_LOG" || true)
+echo "    tools[] streaming OK: $(grep -c '^data:' "$TOOLS_LOG") SSE events + [DONE] sentinel"
+echo "    tool_call deltas:   $TOOL_DELTAS"
+echo "    text content deltas: $TEXT_DELTAS"
+if [ "$TOOL_DELTAS" -eq 0 ]; then
+    echo "    NOTE: no tool_call deltas emitted — the model produced text"
+    echo "    instead of invoking the tool. This is content-dependent and"
+    echo "    NOT a failure mode (per Wedge-4 closure ⚠ caveat); the"
+    echo "    request path is verified by the SSE shape + [DONE] sentinel."
+fi
+
 # ---- Cleanup ----
 echo "==> Cleanup: stopping serve"
 kill -TERM $SERVE_PID 2>/dev/null || true
@@ -344,6 +424,7 @@ echo "Logs:"
 echo "  Serve log:        $SERVE_LOG"
 echo "  Non-stream resp:  $RESPONSE_LOG"
 echo "  Stream resp:      $STREAM_LOG"
+echo "  Stream+tools[]:   $TOOLS_LOG"
 echo
 echo "To run the synthetic round-trip parity test (no large download):"
 echo "  cargo test --bin hf2q --tests --test qwen3vl_round_trip_e2e"

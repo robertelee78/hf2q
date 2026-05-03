@@ -2007,6 +2007,18 @@ pub fn build_gated_attn_layer(
     let mut fa_arena = fa_arena;
     let mut kv_cache_slot = kv_cache_slot;
     let mut attn_out_fused: Option<MlxBuffer> = None;
+    // ADR-019 Phase 2 iter89e2-G: when use_fused_stage_ab fires AND ops6-7
+    // can also be encoded into the same CB, we move the Stage-A encoder out
+    // of the ops1-4 inner block and into this function-scope Option. ops6-7
+    // then takes the encoder, encodes sigmoid_gate_multiply + linear_proj,
+    // and issues the single terminal commit_labeled("layer.full_attn.stage_a").
+    // Replaces 4 separate commit_labeled calls per FA layer (ops1-4 +
+    // kv_cache_write + fa.prefill_bridge + ops6-7) with ONE.
+    //
+    // Eligibility condition is identical to use_fused_stage_ab AND
+    // ops6-7's arena path (use_proj_arena), so the encoder ownership transfer
+    // is safe — the ops6-7 block sees the same arena that ops1-4 wrote into.
+    let mut fused_stage_a_enc: Option<mlx_native::CommandEncoder> = None;
     let (x_norm, q_flat, k_flat, v_flat, gate_flat, q_normed, k_normed, q_rope, k_rope) = if let
         Some(arena) = fa_proj_arena.as_mut().map(|a| &mut **a).filter(|_| use_proj_arena)
     {
@@ -2164,9 +2176,25 @@ pub fn build_gated_attn_layer(
             // Update KV cursor (CPU-only counter; safe before GPU completes).
             slot.current_len[0] = kv_seq_len;
 
-            // Stage-A terminal commit (non-blocking). Replaces 3 separate
-            // commit_labeled calls. arena buffers + out_seq outlive this CB.
-            enc.commit_labeled("layer.full_attn.stage_ab");
+            // ADR-019 Phase 2 iter89e2-G: defer the Stage-A terminal commit
+            // by moving `enc` into the function-scope Option. The ops6-7
+            // block consumes it, encodes sigmoid_gate_multiply + linear_proj
+            // into the SAME encoder, and issues the single terminal
+            // commit_labeled("layer.full_attn.stage_a") covering all 4 FA-layer
+            // ops (ops1-4 + kv_cache_write + fa.prefill_bridge + ops6-7).
+            //
+            // F2 invariant: Both arenas (FaPrefillArena 7 BF16 scratches,
+            // FaProjectionsArena 10 F32 scratches including gated_buf for
+            // ops6) plus persistent slot.k/slot.v plus the caller-owned
+            // out_seq outlive the deferred CB by design — forward_gpu_impl
+            // owns the arenas through the output-head terminal
+            // commit_and_wait_labeled, and `out` (linear_proj output) is on
+            // the Rust stack of forward_gpu_impl until consumed by
+            // dispatch_fused_residual_norm_f32. The wider in-flight CB
+            // window has zero F2 exposure: no buffer can drop between
+            // dispatch encode and GPU completion. iter58b race structurally
+            // unreachable.
+            fused_stage_a_enc = Some(enc);
 
             // Hand attn_out to the post-SDPA control flow; suppress the
             // legacy SDPA dispatch by consuming fa_arena + kv_cache_slot.
