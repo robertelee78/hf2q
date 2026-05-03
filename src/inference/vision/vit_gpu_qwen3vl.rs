@@ -710,42 +710,71 @@ pub(crate) fn qwen3vl_resize_position_embeddings_bilinear(
     let sf_y = (target_y as f32) / (trained as f32);
     let pixel_offset: f32 = 0.5;
 
+    // iter-225 Codex Phase-2c (HIGH finding at vit_gpu_qwen3vl.rs:591):
+    // llama.cpp's `resize_position_embeddings` calls `ggml_interpolate`
+    // with `DEFAULT_INTERPOLATION_MODE = GGML_SCALE_MODE_BILINEAR |
+    // GGML_SCALE_FLAG_ANTIALIAS` (clip-graph.h:12). For Phase-2 variable-
+    // aspect inputs that downsample on at least one axis (e.g. trained
+    // 48×48 → target 36×64 for portrait 576×1024 input), the antialias
+    // branch is semantically active per ggml-cpu/ops.cpp:7578-7637.
+    //
+    // The antialias path uses a triangle filter with support = max(1,
+    // 1/sf) and sums weighted contributions from ALL trained-table
+    // entries within the support window. For sf >= 1 (upsampling),
+    // support degenerates to 1 and the result is similar to plain
+    // bilinear (but NOT byte-identical due to the weight-renormalization
+    // step). For sf < 1 (downsampling), support > 1 and the
+    // contributing window expands to cover multiple source pixels per
+    // target pixel — the load-bearing semantic difference.
+    //
+    // Direct Rust port of the C++ at /opt/llama.cpp/ggml/src/ggml-cpu/
+    // ops.cpp:7578-7637, axis-independent for rectangular targets.
+    let triangle_filter = |x: f32| -> f32 { (1.0 - x.abs()).max(0.0) };
+    let support_x = (1.0 / sf_x).max(1.0);
+    let invscale_x = 1.0 / support_x;
+    let support_y = (1.0 / sf_y).max(1.0);
+    let invscale_y = 1.0 / support_y;
+
     for y_dst in 0..target_y {
-        let y_src = ((y_dst as f32) + pixel_offset) / sf_y - pixel_offset;
-        let mut y0 = y_src.floor() as i64;
-        let mut y1 = y0 + 1;
-        y0 = y0.max(0).min(trained - 1);
-        y1 = y1.max(0).min(trained - 1);
-        let mut dy = y_src - (y0 as f32);
-        dy = dy.max(0.0).min(1.0);
+        let y = ((y_dst as f32) + pixel_offset) / sf_y;
+        let y_min = ((y - support_y + pixel_offset).max(0.0)) as i64;
+        let y_max = ((y + support_y + pixel_offset).min(trained as f32)) as i64;
 
         for x_dst in 0..target_x {
-            let x_src = ((x_dst as f32) + pixel_offset) / sf_x - pixel_offset;
-            let mut x0 = x_src.floor() as i64;
-            let mut x1 = x0 + 1;
-            x0 = x0.max(0).min(trained - 1);
-            x1 = x1.max(0).min(trained - 1);
-            let mut dx = x_src - (x0 as f32);
-            dx = dx.max(0.0).min(1.0);
-
-            let w_a = (1.0 - dx) * (1.0 - dy);
-            let w_b = dx * (1.0 - dy);
-            let w_c = (1.0 - dx) * dy;
-            let w_d = dx * dy;
-
-            let off_a = ((y0 as usize) * (trained as usize) + (x0 as usize)) * h;
-            let off_b = ((y0 as usize) * (trained as usize) + (x1 as usize)) * h;
-            let off_c = ((y1 as usize) * (trained as usize) + (x0 as usize)) * h;
-            let off_d = ((y1 as usize) * (trained as usize) + (x1 as usize)) * h;
+            let x = ((x_dst as f32) + pixel_offset) / sf_x;
+            let x_min = ((x - support_x + pixel_offset).max(0.0)) as i64;
+            let x_max = ((x + support_x + pixel_offset).min(trained as f32)) as i64;
 
             let dst_off =
                 ((y_dst as usize) * (target_x as usize) + (x_dst as usize)) * h;
 
-            for k in 0..h {
-                out[dst_off + k] = pos_embd_table[off_a + k] * w_a
-                    + pos_embd_table[off_b + k] * w_b
-                    + pos_embd_table[off_c + k] * w_c
-                    + pos_embd_table[off_d + k] * w_d;
+            // Accumulate weighted source contributions per channel.
+            // We initialize an all-zeros window then divide by total
+            // weight at the end (peer's same renormalization step).
+            let mut total_weight = 0.0f32;
+            // Reuse out as the accumulator for each (y_dst, x_dst) row;
+            // it's already zero-initialized.
+            for sy in y_min..y_max {
+                let weight_y = triangle_filter(((sy as f32) - y + pixel_offset) * invscale_y);
+                for sx in x_min..x_max {
+                    let weight_x =
+                        triangle_filter(((sx as f32) - x + pixel_offset) * invscale_x);
+                    let weight = weight_x * weight_y;
+                    if weight <= 0.0 {
+                        continue;
+                    }
+                    let src_off = ((sy as usize) * (trained as usize) + (sx as usize)) * h;
+                    for k in 0..h {
+                        out[dst_off + k] += pos_embd_table[src_off + k] * weight;
+                    }
+                    total_weight += weight;
+                }
+            }
+            if total_weight > 0.0 {
+                let inv = 1.0 / total_weight;
+                for k in 0..h {
+                    out[dst_off + k] *= inv;
+                }
             }
         }
     }
@@ -2918,6 +2947,94 @@ mod tests {
             (resized[idx(1, 2)] - 3.0).abs() < eps,
             "dst(1,2) expected 3.0, got {}",
             resized[idx(1, 2)]
+        );
+    }
+
+    /// Test #3b (Codex iter-225 Phase-2c HIGH finding closure) —
+    /// Antialias bilinear semantics on a downsample case where plain
+    /// bilinear and antialias diverge measurably.
+    ///
+    /// Setup: 4×4 source with hand-picked values → 2×2 target. This is
+    /// a 2× downsample on both axes, so:
+    ///   - sf = 0.5 < 1 → support = max(1, 1/0.5) = 2.0 (antialias active)
+    ///   - plain bilinear samples 4 corner pixels with weights
+    ///   - antialias bilinear sums all 16 source pixels with triangle
+    ///     filter weights, producing a SMOOTHED average not present in
+    ///     plain bilinear
+    ///
+    /// Hand-trace for the antialias path on dst(0,0):
+    ///   - x = y = (0+0.5)/0.5 = 1.0
+    ///   - x_min = max(0, (1.0 - 2.0 + 0.5)) = max(0, -0.5) = 0; cast → 0
+    ///   - x_max = min(4, (1.0 + 2.0 + 0.5)) = min(4, 3.5) = 3.5; cast → 3
+    ///   - source range x: [0, 3) = {0, 1, 2}; same for y
+    ///   - invscale = 1/2 = 0.5
+    ///   - weight_y for sy=0: triangle((0 - 1.0 + 0.5)*0.5) = triangle(-0.25) = 0.75
+    ///   - weight_y for sy=1: triangle((1 - 1.0 + 0.5)*0.5) = triangle(0.25) = 0.75
+    ///   - weight_y for sy=2: triangle((2 - 1.0 + 0.5)*0.5) = triangle(0.75) = 0.25
+    ///   - same pattern for x
+    ///
+    /// With source values being the "x+10*y" pattern (so source[(0,0)]=0,
+    /// source[(1,0)]=1, source[(0,1)]=10, etc.), the antialias-weighted
+    /// average is non-trivial. We pin one analytically-computable case +
+    /// a sabotage check: the plain-bilinear path would sample only the
+    /// 4 corner sources (sy in {0, 1}, sx in {0, 1}) — a value of about
+    /// (0+1+10+11)/4 = 5.5. The antialias path INCLUDES sy=2 / sx=2
+    /// contributions and the result MUST differ from 5.5.
+    #[test]
+    fn qwen3vl_position_embedding_antialias_downsample_diverges_from_plain_bilinear() {
+        let trained_n: u32 = 4;
+        let n_embd: u32 = 1;
+        let num_pos = trained_n * trained_n; // 16
+        // Source pattern: value(y, x) = y * 10 + x.
+        // Row-major (n_pos, n_embd) layout → table[(y*4+x)*1] = 10*y+x.
+        let mut table: Vec<f32> = Vec::with_capacity(num_pos as usize);
+        for y in 0..trained_n {
+            for x in 0..trained_n {
+                table.push((y as f32) * 10.0 + (x as f32));
+            }
+        }
+        let target_n: u32 = 2;
+        let resized = qwen3vl_resize_position_embeddings_bilinear(
+            &table, num_pos, n_embd, target_n, target_n,
+        )
+        .expect("4×4 → 2×2 downsample must succeed");
+        assert_eq!(resized.len(), 4);
+        for v in &resized {
+            assert!(v.is_finite(), "antialias result {v} must be finite");
+        }
+
+        // Plain-bilinear (PRE Codex iter-225 Phase-2c) would compute
+        // dst(0,0) via 4 corner samples at (sx,sy)∈{0,1}². The four
+        // values are 0, 1, 10, 11 with equal 0.25 weights → 5.5.
+        // Antialias bilinear adds sx=2 / sy=2 contributions → strictly
+        // diverges from 5.5. This test would FAIL under plain bilinear
+        // (which the pre-Phase-2c implementation used).
+        let dst_00 = resized[0];
+        assert!(
+            (dst_00 - 5.5).abs() > 0.05,
+            "Codex Phase-2c sabotage check: plain bilinear dst(0,0) ≈ 5.5; \
+             antialias bilinear MUST diverge measurably (>= 0.05) on this \
+             downsample fixture. Got dst(0,0) = {dst_00}; if this is ~5.5, \
+             the antialias semantic was reverted to plain bilinear. \
+             Reference: /opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp:7578-7637 \
+             (BILINEAR | ANTIALIAS triangle-filter accumulation)."
+        );
+
+        // Symmetry pin: the source pattern is symmetric under
+        // (x → 3-x, y → 3-y) translated by the global offset, so dst
+        // values should reflect that symmetry within FP slop.
+        let dst_11 = resized[3];
+        // dst(0,0) and dst(1,1) are NOT mirror images because the
+        // pattern is value=10y+x (not centered), but dst(0,1) and
+        // dst(1,0) flip the x/y rows. Pin the diagonal sum:
+        //   dst(0,0) samples lower-left quadrant (lower y, lower x)
+        //   dst(1,1) samples upper-right quadrant (higher y, higher x)
+        // The pattern's value(y,x) = 10y+x means dst(1,1) > dst(0,0)
+        // monotonically.
+        assert!(
+            dst_11 > dst_00,
+            "antialias dst(1,1) ({dst_11}) must be > dst(0,0) ({dst_00}) \
+             on this monotone source pattern (sanity)"
         );
     }
 
