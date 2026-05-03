@@ -233,6 +233,43 @@ fn validate_shape(name: &str, buf: &MlxBuffer, expected: &[usize]) -> Result<()>
     Ok(())
 }
 
+/// iter-228a Phase-2c (Codex review of 3811f5d, finding #2 medium):
+/// validate that the GGUF on-disk tensor type matches what the
+/// downstream forward path expects. Without this, a same-shape tensor
+/// of unexpected type (e.g. F16 in place of Q4_0) would load past the
+/// shape check and produce garbage when iter-228b's forward dispatches
+/// the tensor through the wrong qmatmul kernel.
+///
+/// Accepted ggml_types per tensor class on the canonical Qwen3-VL-2B
+/// q4_0 GGUF (verified: 196 Q4_0, 113 F32, 1 F16, 0 attn biases):
+///   - Quantized projections (attn_q/k/v/output, ffn_gate/up/down):
+///     Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0 — any quantized type the
+///     mlx-native qmatmul kernel registry accepts.
+///   - Norms (attn_norm, ffn_norm, attn_q_norm, attn_k_norm,
+///     output_norm): F32 (already enforced by load_tensor_f32 — kept
+///     as a fact-of-life pin for future reorgs).
+///   - Embedding (token_embd, output): F16 OR Q4_0 OR another quantized
+///     type — operator may convert via different quants. Anything
+///     gguf::load_tensor accepts is fine.
+fn validate_quantized_proj_type(
+    gguf: &mlx_native::gguf::GgufFile,
+    name: &str,
+) -> Result<()> {
+    use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+    let info = gguf.tensor_info(name).ok_or_else(|| {
+        anyhow!("{name}: tensor info missing (loader can't validate ggml_type)")
+    })?;
+    match info.ggml_type {
+        GgmlType::Q4_0 | GgmlType::Q4_K
+        | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_0 => Ok(()),
+        other => Err(anyhow!(
+            "{name}: ggml_type {other:?} is not a quantized projection \
+             type (expected Q4_0/Q4_K/Q5_K/Q6_K/Q8_0). Loading would \
+             route through the wrong qmatmul kernel and produce garbage."
+        )),
+    }
+}
+
 fn load_layer(
     gguf: &GgufFile,
     device: &MlxDevice,
@@ -247,19 +284,25 @@ fn load_layer(
         .map_err(|e| anyhow!("blk.{il}.attn_norm.weight: {e}"))?;
     validate_shape("attn_norm", &attn_norm, &[hidden])?;
 
+    let attn_q_name = format!("blk.{il}.attn_q.weight");
+    validate_quantized_proj_type(gguf, &attn_q_name)?;
     let attn_q = gguf
-        .load_tensor(&format!("blk.{il}.attn_q.weight"), device)
-        .map_err(|e| anyhow!("blk.{il}.attn_q.weight: {e}"))?;
+        .load_tensor(&attn_q_name, device)
+        .map_err(|e| anyhow!("{attn_q_name}: {e}"))?;
     validate_shape("attn_q", &attn_q, &[hidden, hidden])?;
 
+    let attn_k_name = format!("blk.{il}.attn_k.weight");
+    validate_quantized_proj_type(gguf, &attn_k_name)?;
     let attn_k = gguf
-        .load_tensor(&format!("blk.{il}.attn_k.weight"), device)
-        .map_err(|e| anyhow!("blk.{il}.attn_k.weight: {e}"))?;
+        .load_tensor(&attn_k_name, device)
+        .map_err(|e| anyhow!("{attn_k_name}: {e}"))?;
     validate_shape("attn_k", &attn_k, &[kv_dim, hidden])?;
 
+    let attn_v_name = format!("blk.{il}.attn_v.weight");
+    validate_quantized_proj_type(gguf, &attn_v_name)?;
     let attn_v = gguf
-        .load_tensor(&format!("blk.{il}.attn_v.weight"), device)
-        .map_err(|e| anyhow!("blk.{il}.attn_v.weight: {e}"))?;
+        .load_tensor(&attn_v_name, device)
+        .map_err(|e| anyhow!("{attn_v_name}: {e}"))?;
     validate_shape("attn_v", &attn_v, &[kv_dim, hidden])?;
 
     let attn_q_norm = gguf
@@ -272,9 +315,11 @@ fn load_layer(
         .map_err(|e| anyhow!("blk.{il}.attn_k_norm.weight: {e}"))?;
     validate_shape("attn_k_norm", &attn_k_norm, &[head_dim])?;
 
+    let attn_output_name = format!("blk.{il}.attn_output.weight");
+    validate_quantized_proj_type(gguf, &attn_output_name)?;
     let attn_output = gguf
-        .load_tensor(&format!("blk.{il}.attn_output.weight"), device)
-        .map_err(|e| anyhow!("blk.{il}.attn_output.weight: {e}"))?;
+        .load_tensor(&attn_output_name, device)
+        .map_err(|e| anyhow!("{attn_output_name}: {e}"))?;
     validate_shape("attn_output", &attn_output, &[hidden, hidden])?;
 
     let ffn_norm = gguf
@@ -282,19 +327,25 @@ fn load_layer(
         .map_err(|e| anyhow!("blk.{il}.ffn_norm.weight: {e}"))?;
     validate_shape("ffn_norm", &ffn_norm, &[hidden])?;
 
+    let ffn_gate_name = format!("blk.{il}.ffn_gate.weight");
+    validate_quantized_proj_type(gguf, &ffn_gate_name)?;
     let ffn_gate = gguf
-        .load_tensor(&format!("blk.{il}.ffn_gate.weight"), device)
-        .map_err(|e| anyhow!("blk.{il}.ffn_gate.weight: {e}"))?;
+        .load_tensor(&ffn_gate_name, device)
+        .map_err(|e| anyhow!("{ffn_gate_name}: {e}"))?;
     validate_shape("ffn_gate", &ffn_gate, &[intermediate, hidden])?;
 
+    let ffn_up_name = format!("blk.{il}.ffn_up.weight");
+    validate_quantized_proj_type(gguf, &ffn_up_name)?;
     let ffn_up = gguf
-        .load_tensor(&format!("blk.{il}.ffn_up.weight"), device)
-        .map_err(|e| anyhow!("blk.{il}.ffn_up.weight: {e}"))?;
+        .load_tensor(&ffn_up_name, device)
+        .map_err(|e| anyhow!("{ffn_up_name}: {e}"))?;
     validate_shape("ffn_up", &ffn_up, &[intermediate, hidden])?;
 
+    let ffn_down_name = format!("blk.{il}.ffn_down.weight");
+    validate_quantized_proj_type(gguf, &ffn_down_name)?;
     let ffn_down = gguf
-        .load_tensor(&format!("blk.{il}.ffn_down.weight"), device)
-        .map_err(|e| anyhow!("blk.{il}.ffn_down.weight: {e}"))?;
+        .load_tensor(&ffn_down_name, device)
+        .map_err(|e| anyhow!("{ffn_down_name}: {e}"))?;
     validate_shape("ffn_down", &ffn_down, &[hidden, intermediate])?;
 
     Ok(Qwen3VlTextLayerWeights {

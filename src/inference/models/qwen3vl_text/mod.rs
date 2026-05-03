@@ -305,23 +305,52 @@ impl Qwen3VlTextConfig {
             .metadata_u32(&format!("{prefix}.context_length"))
             .unwrap_or(0);
 
+        // iter-228a Phase-2c (Codex review of 3811f5d, finding #1 medium):
+        // explicit invariants on parsed dimensions BEFORE deriving
+        // head_dim — guards against malformed GGUFs whose tensor
+        // shapes happen to match Qwen3-VL but whose metadata is
+        // internally inconsistent (would silently route to iter-228b
+        // forward with a wrong attention layout).
+        if num_attention_heads == 0 {
+            return Err(anyhow!(
+                "Qwen3VlTextConfig: num_attention_heads is zero — invalid"
+            ));
+        }
+        if num_key_value_heads == 0 {
+            return Err(anyhow!(
+                "Qwen3VlTextConfig: num_key_value_heads is zero — invalid \
+                 (also avoids modulo-by-zero in the GQA divisibility check)"
+            ));
+        }
+        if hidden_size % num_attention_heads != 0 {
+            return Err(anyhow!(
+                "Qwen3VlTextConfig: hidden_size ({hidden_size}) must be \
+                 divisible by num_attention_heads ({num_attention_heads}) \
+                 for the derived head_dim to be exact"
+            ));
+        }
+
         // head_dim: prefer explicit `attention.key_length` (some
         // converters emit it); else derive from hidden / heads. For the
         // real-model GGUF the explicit key is absent → derived value
         // is 2048 / 16 = 128 ✓.
         let head_dim = gguf
             .metadata_u32(&format!("{prefix}.attention.key_length"))
-            .unwrap_or_else(|| {
-                if num_attention_heads == 0 {
-                    0
-                } else {
-                    hidden_size / num_attention_heads
-                }
-            });
+            .unwrap_or(hidden_size / num_attention_heads);
         if head_dim == 0 {
             return Err(anyhow!(
                 "Qwen3VlTextConfig: derived head_dim is zero (hidden={hidden_size}, \
                  heads={num_attention_heads}); refusing to load"
+            ));
+        }
+        // Phase-2c invariant: when explicit key_length is supplied,
+        // it MUST be consistent with hidden_size / num_attention_heads.
+        // Catches a config where heads + head_dim disagree with hidden.
+        if hidden_size != num_attention_heads * head_dim {
+            return Err(anyhow!(
+                "Qwen3VlTextConfig: hidden_size ({hidden_size}) != \
+                 num_attention_heads ({num_attention_heads}) * head_dim \
+                 ({head_dim}) — config is internally inconsistent"
             ));
         }
         if num_attention_heads % num_key_value_heads != 0 {
