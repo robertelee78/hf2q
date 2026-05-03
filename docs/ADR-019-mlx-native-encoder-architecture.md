@@ -1293,3 +1293,84 @@ Revisions applied per Codex review:
 ---
 
 **End of ADR-019.**
+
+---
+
+## 2026-05-03 — Phase 1 missing-barrier finding (post-merge regression closed at hf2q@f591a66)
+
+**Symptom.** A 5× cold-process forward-pass logit dump on the
+qwen3.6-35B-A3B-dwq48 wedding-cake prompt at greedy temp=0 produced
+five DIFFERENT first-token logit tuples (argmax flipped 1/5 runs;
+logit magnitudes spread 18→33). Forward pass non-deterministic on a
+fixed input.
+
+**Root cause.** ADR-019 Phase 1 (commit hf2q@8012e63) refactored
+`apply_output_head_gpu_into` to accept a caller-supplied
+`CommandEncoder` so the LAST decoder layer's MoeQ/DenseQ FFN-terminal
+encoder could be HELD open and folded into the same command buffer
+as `output_norm` + `lm_head`. The hand-off was missing one barrier:
+when `caller_enc.is_some()`, the encoder ALREADY contains the prior
+layer's `dispatch_fused_residual_norm_f32` (which writes `hidden`),
+and the very next dispatch in this function — `dispatch_rms_norm` —
+READS `hidden`. Without an `enc.memory_barrier()` between hand-off
+and rms_norm, Apple's `MTLDispatchTypeConcurrent` reorders the two
+dispatches within the encoder, and rms_norm sees stale or
+partially-updated `hidden` bytes.
+
+**Why AC-PA2 5× Heisenbug check missed it.** The phase-1 commit's
+gate suite included AC-PA2 = "5/5 cold-run byte-identical decode
+parity". AC-PA2's fixture (27B-dwq46 / 35B-A3B q4_0-flat on a
+different prompt) happened to produce the same argmax through the
+unordered `hidden` read — i.e. the unbarriered race was latent
+under that fixture but TRIGGERED on the wedding-cake prompt's
+specific top-2 logit gap (small enough to flip argmax).
+
+**Surgical fix at hf2q@f591a66.** ONE line — `if fused {
+enc.memory_barrier(); }` inserted between encoder hand-off and the
+first rms_norm dispatch in `apply_output_head_gpu_into`. The
+standalone path (caller_enc = None) is unaffected; only the fused
+path needed the explicit RAW barrier.
+
+**Phase 2 and Phase 3a audit — clean.** Identical pattern check on
+the other ADR-019 fusion sites (gpu_full_attn.rs `use_fused_stage_ab`
+ops6-7 hand-off; gpu_delta_net.rs Stage-A consolidation):
+
+| Site | Producer | Consumer | Barrier between? |
+|------|----------|----------|------------------|
+| Phase-1 hand-off → rms_norm | last-layer FFN (hidden) | dispatch_rms_norm | **MISSING (now added)** |
+| Phase-2 hand-off → ops6 | fa.prefill_bridge (out_seq) | sigmoid_gate_multiply | present (line 2487) |
+| Phase-2 ops6 → ops7 | sigmoid_gate_multiply (gated) | apply_linear_projection_f32_pooled | present (line 2540) |
+| Phase-3a ops1 → ops2a/2b | pre_norm (x_norm_buf) | proj_qkv + proj_z | present (line 2680) |
+| Phase-3a ops2a/2b → op3 | proj_qkv (qkv_raw_buf) | dispatch_ssm_conv | present (line 2702) |
+| Phase-3a op3 → qkv_split | dispatch_ssm_conv (qkv_conv_buf) | dispatch_qkv_split_f32 | present (line 2722) |
+
+Only Phase-1's hand-off → rms_norm edge was missing the explicit barrier.
+
+**Regression harness landed at hf2q@c35fa78.**
+`scripts/coherence-harness/determinism_check.sh` runs hf2q 5× on a
+fixed prompt at greedy temp=0 and asserts byte-identical first-token
+logit tuples. Smoke-tested on the wedding-cake fixture AND a quantum-
+computing fixture (different prompt + token shape) AND both
+thinking/no-thinking modes — all 4 PASS post-fix; pre-fix the
+wedding-cake-thinking case fails. This harness will be added to the
+ADR-019 ship-gate suite for any future encoder-fusion landing.
+
+**Action items for ADR-019 ship-gate suite (going forward).**
+1. AC-PA2 should be widened or replaced with byte-equality on
+   first-token LOGIT TUPLE (not just argmax) — the wedding-cake
+   bug only manifested as argmax flip on 1/5 runs because the
+   top-2 gap was small; logits actually wobbled by ~13 units across
+   runs, which a logit-tuple check catches immediately.
+2. The widened gate should run on AT LEAST 3 prompts × 2 modes
+   (thinking / no-thinking) — single-fixture coverage missed a
+   real bug.
+3. Determinism gate is mandatory for ANY fusion landing that holds
+   an encoder across function boundaries OR widens an existing
+   in-flight CB window. The fence-check happens at code review;
+   determinism_check.sh is the empirical guard.
+
+**Status.** Phase 1, Phase 2, Phase 3a fusion all now byte-deterministic
+on the dwq48 wedding-cake fixture. Decode-greedy parity restored to
+"works as designed". Speed unchanged (~100 tok/s greedy at HEAD;
+0.81× peer per ADR-005's paired bench).
+
