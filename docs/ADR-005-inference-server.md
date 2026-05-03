@@ -109,15 +109,21 @@
 
      **Cumulative LOC delta vs Phase 4 start**: ~10,915 LOC across 28+ files (production + tests + scripts + docs). **Test count**: at Wedge-4f LANDED, `cargo test --bin hf2q --tests` reports **3271/3271 PASS, 0 fail, 48 ignored** across 66 test runners; bin lib alone is **2728/2728 PASS** (+20 new at Wedge-4f over Wedge-4e baseline of 2708). Build clean. Cargo.lock unchanged.
 
-     **Capability matrix — all green at Wedge-4 close**:
+     **Capability matrix at Wedge-4 close** — legend: ✅ = production routing path operational with default-running unit/integration coverage; ⚠ = path operational with operator-gated end-to-end coverage but not a forced live assertion; n/a = not applicable for variant.
 
      | Variant | Text-only | Image+text | Streaming | Reasoning content | tools[] |
      |---------|-----------|------------|-----------|-------------------|---------|
      | Qwen3.5/3.6 dense (LM)  | ✅ since iter-50s | n/a | ✅ since W-A2 | ✅ since 4e | ✅ since 4e |
      | Qwen3.5/3.6 MoE (LM)    | ✅ since iter-150s | n/a | ✅ since W-A2 | ✅ since 4e | ✅ since 4e |
-     | Qwen3-VL non-streaming  | ✅ via 4d         | ✅ via 4d  | ⟶ 4e         | ✅ via 4e         | ✅ via 4e |
-     | Qwen3-VL streaming      | ✅ via 4e         | ✅ via 4e  | ✅           | ✅                | ✅       |
-     | Qwen3-VL HF→GGUF→hf2q   | ✅ via 4f         | ✅ via 4f  | ✅           | ✅                | ✅       |
+     | Qwen3-VL non-streaming  | ✅ via 4d         | ✅ via 4d  | ⟶ 4e         | ✅ via 4e         | ⚠ via 4e |
+     | Qwen3-VL streaming      | ✅ via 4e         | ✅ via 4e  | ✅           | ✅                | ⚠ via 4e |
+     | Qwen3-VL HF→GGUF→hf2q   | ✅ via 4f         | ✅ via 4f  | ✅           | ✅                | ⚠ via 4f |
+
+     **`tools[]` ⚠ caveat (Codex Phase-2b Wedge-4f review finding #4, low; closed at the docs level here)**: the `tools[]` request path on Qwen3-VL is operational end-to-end (handler → engine → splitters → SSE), but live coverage is THIS strong, not stronger:
+     - Default-running tests pin the `ToolCallSplitter` MODE-INVARIANCE on crafted fragment streams crossing marker boundaries (Wedge-4e fresh tests `wedge4e_tool_call_splitter_is_mode_invariant`); the splitter itself is unchanged from the Wedge-3 Phase E shape and operates on `&str` fragments regardless of vision augmentation.
+     - The operator-gated `qwen3vl_streaming_e2e_real_with_tools` test (`HF2Q_QWEN3VL_E2E=1`) sends `tools[]` + `tool_choice=auto` over an image-bearing streaming request and asserts `tool_calls.arguments` parses as JSON IF a tool call is emitted — but treats no emitted tool call as success (a real Qwen3-VL model may decline to emit a tool call on an arbitrary fixture prompt).
+     - The operator script `scripts/wedge4_qwen3vl.sh` Step 8 exercises the full request path with image + tools[] + tool_choice=auto, asserting SSE shape (data: lines + [DONE] sentinel) regardless of whether the model emits a tool_call delta — surfacing tool_call vs text-content delta counts in operator output. This pins the REQUEST PATH plumbing live (handler → engine → grammar compile → SSE).
+     - A FORCED-tool-call live assertion (e.g. via grammar-constrained sampling that the model cannot decline, or a tool whose parameters perfectly match a fixed prompt) is a documented future-iter carry-over. Not Wedge-4 close-blocking because the splitter is `MODE-INVARIANT`, but it means the matrix's tools[] cells are ⚠ not ✅.
 
      **Operator runbook**: `scripts/wedge4_qwen3vl.sh` walks the operator from `git lfs clone Qwen/Qwen3-VL-2B-Instruct` → `cargo build --release` → `hf2q convert --emit-vision-tower` → `hf2q serve --model --mmproj` → curl chat-completions request with image (non-streaming + streaming). Disk: ~7 GB scratch. RAM: ~10 GB convert peak / ~3 GB serve. Time: ~8 minutes total on M5 Max.
 
