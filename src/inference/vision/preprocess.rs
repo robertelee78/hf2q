@@ -890,13 +890,74 @@ pub fn preprocess_qwen3vl(
     }
 
     // Step 2: smart_resize → (target_w, target_h) aligned to `stride`.
-    let (target_w, target_h) = qwen3vl_calc_size_preserved_ratio(
+    //
+    // Phase-1 Codex Phase-2c (2026-05-02): clamp `image_max_pixels` to
+    // image_size² when feeding the calc so the resized output cannot
+    // exceed the fixed Phase-1 canvas. The canonical canvas is
+    // image_size × image_size pixels (e.g. 768² = 589,824); the
+    // canonical Qwen3-VL `image_max_pixels` config is 4,194,304 — so
+    // an ordinary 1080p / 2K input would smart-resize to a target
+    // larger than the canvas and then get heavily center-cropped at
+    // the composite step below, silently losing image content. This
+    // is a divergence from llama.cpp variable-resolution behavior AND
+    // from the stated smart-resize-then-center-pad intent.
+    //
+    // The fix: cap `effective_max_pixels` at `min(image_max_pixels,
+    // image_size²)`. This keeps smart-resize aspect-ratio-preserving
+    // (the resize math is unchanged: it only changes the upper area
+    // bound), and guarantees the resized output ≤ canvas in BOTH
+    // dimensions so the composite step is pure pad (no crop) for
+    // every Phase-1 input.
+    //
+    // Operator note: when Phase-2 lifts the fixed-canvas constraint
+    // (true variable-resolution ViT), drop this cap and pass
+    // `cfg.image_max_pixels` through unmodified.
+    let canvas_pixels = (image_size as u64) * (image_size as u64);
+    let effective_max_pixels = cfg.image_max_pixels.min(canvas_pixels);
+    if cfg.image_min_pixels > effective_max_pixels {
+        return Err(anyhow!(
+            "qwen3vl preprocess Phase-1: image_min_pixels ({}) exceeds the \
+             effective max ({} = min(image_max_pixels={}, image_size²={})). \
+             Either lower image_min_pixels, increase image_size, or wait for \
+             the Phase-2 variable-resolution ViT iter.",
+            cfg.image_min_pixels,
+            effective_max_pixels,
+            cfg.image_max_pixels,
+            canvas_pixels
+        ));
+    }
+    let (smart_w, smart_h) = qwen3vl_calc_size_preserved_ratio(
         orig_w,
         orig_h,
         stride,
         cfg.image_min_pixels,
-        cfg.image_max_pixels,
+        effective_max_pixels,
     )?;
+
+    // Phase-1 Codex Phase-2c per-axis clamp: the area cap above is
+    // NECESSARY but NOT SUFFICIENT. For very-wide or very-tall aspects,
+    // an area-bounded aspect-preserving rectangle can still have one
+    // dimension > image_size (e.g. 16:9 input with area = 768² gives
+    // 1024 × 576 — width 1024 > canvas 768). When that happens, scale
+    // BOTH axes proportionally so the larger side equals image_size,
+    // then re-snap to stride. This preserves aspect ratio (the whole
+    // point of smart_resize) while guaranteeing both axes ≤ canvas →
+    // composite step is pure pad with no crop.
+    let (target_w, target_h) = if smart_w > image_size || smart_h > image_size {
+        let max_dim = smart_w.max(smart_h) as f64;
+        let scale = (image_size as f64) / max_dim;
+        // Snap to stride (rounding DOWN preserves the ≤ image_size
+        // invariant; the smaller axis can only shrink, so its
+        // post-snap value is also ≤ image_size).
+        let scaled_w = ((smart_w as f64 * scale) as u32 / stride) * stride;
+        let scaled_h = ((smart_h as f64 * scale) as u32 / stride) * stride;
+        // Ensure at least one stride along each axis (can't be 0).
+        let final_w = scaled_w.max(stride);
+        let final_h = scaled_h.max(stride);
+        (final_w, final_h)
+    } else {
+        (smart_w, smart_h)
+    };
 
     // Step 3: bilinear resize. Use the byte-faithful llama.cpp resize
     // (corner-aligned, truncation cast) so the smart-resized pixels
@@ -911,10 +972,16 @@ pub fn preprocess_qwen3vl(
     let off_x = (pad_w / 2) as i64;
     let off_y = (pad_h / 2) as i64;
 
-    // If smart_resize produced pixels LARGER than the trained square
-    // (rare; only when min_pixels > image_size² which a sane mmproj
-    // doesn't configure), center-crop to fit. The canvas is ALWAYS
-    // (image_size × image_size).
+    // Phase-1 Codex Phase-2c invariant: with `effective_max_pixels`
+    // capped at `image_size²` above, BOTH `target_w ≤ image_size` AND
+    // `target_h ≤ image_size`, so the composite step below is pure
+    // pad (off_x ≥ 0, off_y ≥ 0, every (x, y) in [0, target) maps
+    // inside the canvas). The clipping branches in the inner loop
+    // remain as defense-in-depth (compiler folds them to no-op when
+    // the invariant holds), but should never observably crop a
+    // Phase-1 input. The full center-crop path is reserved for
+    // hypothetical inputs that bypass the cap (operator-overridden
+    // config, future Phase-2 path).
     let canvas: RgbImage = if target_w == image_size && target_h == image_size {
         resized
     } else {
@@ -1575,6 +1642,85 @@ mod tests {
                 "({tw}x{th}) area={area} not in [{}, {}]",
                 cfg.image_min_pixels,
                 cfg.image_max_pixels
+            );
+        }
+    }
+
+    #[test]
+    fn qwen3vl_preprocess_phase1_no_crop_for_canonical_oversized_input() {
+        // Phase-2c regression for Codex Phase-2b finding #1 of Wedge-4d
+        // 5dac5ed (medium severity at preprocess.rs:892):
+        //   "Qwen3-VL smart-resize can produce target dimensions larger
+        //    than the fixed Phase-1 ViT canvas, then the code center-
+        //    crops to image_size. With canonical bounds, max_pixels is
+        //    4,194,304 while image_size=768 gives only 589,824 pixels,
+        //    so ordinary 1080p/2K images can be resized above 768 and
+        //    then heavily cropped instead of padded."
+        //
+        // Pin: with the canonical config (image_max_pixels = 4_194_304)
+        // and image_size = 768, an oversized input MUST smart-resize to
+        // dimensions ≤ image_size in BOTH axes (so the composite step
+        // is pure pad, no crop). This is the invariant the Phase-2c
+        // `effective_max_pixels = min(image_max_pixels, image_size²)`
+        // cap establishes. A future regression that drops the cap would
+        // produce target_w or target_h > 768 and silently lose image
+        // content via center-crop — failing this test.
+        let cfg = qwen3vl_test_cfg();
+        let image_size = 768u32;
+        let canvas_pixels = (image_size as u64) * (image_size as u64);
+        let effective_max = cfg.image_max_pixels.min(canvas_pixels);
+        let stride: u32 = cfg.patch_size * cfg.spatial_merge_size;
+
+        // Canonical oversized inputs that, without the cap + per-axis
+        // clamp, would land with at least one dimension > image_size.
+        // The full Phase-2c pipeline applies the area cap (in
+        // `qwen3vl_calc_size_preserved_ratio`) AND a post-smart-resize
+        // per-axis clamp inside `preprocess_qwen3vl` (because for very
+        // wide/tall aspects the area cap alone leaves one dim > canvas:
+        // 16:9 with area = 768² = 589824 → 1024×576, width 1024 > 768).
+        // This test mirrors that two-step constraint exactly.
+        for &(orig_w, orig_h, label) in &[
+            (1920u32, 1080u32, "1080p landscape"),
+            (1080, 1920, "1080p portrait"),
+            (2560, 1440, "2K landscape"),
+            (3840, 2160, "4K landscape"),
+            (4096, 4096, "4K square (matches max_pixels exactly)"),
+            (8000, 4000, "extreme landscape"),
+        ] {
+            let (smart_w, smart_h) = qwen3vl_calc_size_preserved_ratio(
+                orig_w,
+                orig_h,
+                stride,
+                cfg.image_min_pixels,
+                effective_max,
+            )
+            .unwrap_or_else(|e| panic!("smart_resize ok for {label}: {e}"));
+            // Mirror the per-axis clamp the pipeline applies.
+            let (tw, th) = if smart_w > image_size || smart_h > image_size {
+                let max_dim = smart_w.max(smart_h) as f64;
+                let scale = (image_size as f64) / max_dim;
+                let scaled_w = ((smart_w as f64 * scale) as u32 / stride) * stride;
+                let scaled_h = ((smart_h as f64 * scale) as u32 / stride) * stride;
+                (scaled_w.max(stride), scaled_h.max(stride))
+            } else {
+                (smart_w, smart_h)
+            };
+            assert!(
+                tw <= image_size && th <= image_size,
+                "{label} ({orig_w}x{orig_h}) post-clamp ({tw}x{th}) exceeds \
+                 canvas={image_size} — Phase-1 composite would center-crop, \
+                 losing image content. Phase-2c per-axis clamp must keep \
+                 the resized output within the canvas."
+            );
+            let area = tw as u64 * th as u64;
+            assert!(
+                area <= canvas_pixels,
+                "{label} post-clamp area {area} exceeds canvas {canvas_pixels}"
+            );
+            // Stride alignment must be preserved by the clamp.
+            assert!(
+                tw % stride == 0 && th % stride == 0,
+                "{label} post-clamp ({tw}x{th}) not aligned to stride={stride}"
             );
         }
     }

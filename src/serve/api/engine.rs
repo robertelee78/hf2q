@@ -2643,6 +2643,32 @@ fn worker_run(
                     // calls flow through the close-buffered emitter
                     // (W-B3 incremental shape is a Wedge-4 follow-up).
                     LoadedModel::Qwen35(q) => {
+                        // Wedge-4d Codex Phase-2c (2026-05-02): the Qwen35
+                        // streaming worker does NOT yet thread soft-tokens
+                        // OR the Wedge-4c.5 DeepstackInjection / Wedge-4d
+                        // 3D positions through `generate_stream_qwen35_once`
+                        // — that's Wedge-4e's scope. The PUBLIC chat
+                        // handler at handlers.rs already returns HTTP 501
+                        // before image-bearing Qwen3-VL streaming reaches
+                        // this dispatch (see `dispatch_qwen3vl_seam_split`
+                        // and the streaming reject in `process_multimodal_content`),
+                        // BUT the lower-level engine API is reachable
+                        // directly (programmatic callers) and would
+                        // silently drop the soft_tokens injection without
+                        // this guard. Fail loud here with an actionable
+                        // diagnostic rather than producing text-only
+                        // output for what was a soft-token request.
+                        if !soft_tokens.is_empty() {
+                            let _ = events.send(super::sse::GenerationEvent::Error(
+                                "Qwen35 streaming path does not yet support \
+                                 soft-token injections (Wedge-4c.5 DeepStack \
+                                 + Wedge-4d 3D positions). For Qwen3-VL \
+                                 image-bearing chat, set \"stream\": false. \
+                                 Tracking: ADR-005 Wedge-4e."
+                                    .to_string(),
+                            ));
+                            continue;
+                        }
                         super::engine_qwen35::generate_stream_qwen35_once(
                             q,
                             &prompt_tokens,
