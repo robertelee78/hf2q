@@ -248,7 +248,16 @@ impl VisionConfig {
                         }
                         indexes.push(idx);
                     }
-                    indexes.sort_unstable();
+                    // Wedge-4f Phase-2c (Codex review of 9e9e262, finding #2,
+                    // medium): preserve HF config order. Peer implementations
+                    // (llama.cpp, vLLM, Candle) all enumerate
+                    // `deepstack_visual_indexes` in HF order to attach
+                    // DeepStack heads at the correct absolute layers.
+                    // Sorting silently breaks `visual.deepstack_merger_list.{rel_idx}`
+                    // → absolute-layer remap for any unsorted producer
+                    // configuration. Current Qwen3-VL-2B [5, 11, 17] is
+                    // already sorted so the bug was latent, but config
+                    // schema imposes no ordering invariant.
                     Some(indexes)
                 }
             },
@@ -259,6 +268,72 @@ impl VisionConfig {
         let temporal_patch_size: Option<u32> =
             vc.get("temporal_patch_size").and_then(|v| v.as_u64()).map(|n| n as u32);
 
+        // Wedge-4f Phase-2c (Codex review of 9e9e262, finding #1, BLOCKER):
+        // Real Qwen3-VL HF configs do NOT carry vision_config.projector_type
+        // (verified against Qwen/Qwen3-VL-2B-Instruct/config.json 2026-04
+        // snapshot — uses model_type="qwen3_vl" + deepstack_visual_indexes
+        // and out_hidden_size, but no projector_type field). The previous
+        // landing defaulted to "mlp" + never derived projection_dim, so
+        // hf2q would emit clip.projector_type="mlp" and miss
+        // clip.vision.projection_dim — preventing downstream Qwen3-VL
+        // dispatch and causing Qwen3VlViTConfig::from_mmproj to reject.
+        //
+        // Detect Qwen3-VL family via TWO independent upstream signals
+        // mirroring llama.cpp's Qwen3VLVisionModel gate:
+        //   (a) vision_config.model_type == "qwen3_vl" (canonical HF
+        //       Qwen3-VL), or
+        //   (b) deepstack_visual_indexes presence (the unique-to-Qwen3-VL
+        //       config key — same fallback used by `is_qwen3vl()`).
+        // When either fires, force projector_type to "qwen3vl_merger"
+        // (the canonical GGUF projector_type string per
+        // /opt/llama.cpp/tools/mtmd/clip.cpp:865-867) regardless of
+        // whether the HF config carries a (different) projector_type
+        // string.
+        let model_type = vc
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let raw_projector_type = str_def("projector_type", "mlp");
+        let is_qwen3vl_via_model_type = model_type
+            .as_deref()
+            .map(|s| s == "qwen3_vl")
+            .unwrap_or(false);
+        let is_qwen3vl_via_deepstack = deepstack_visual_indexes.is_some();
+        let projector_type = if is_qwen3vl_via_model_type || is_qwen3vl_via_deepstack {
+            "qwen3vl_merger".to_string()
+        } else {
+            raw_projector_type
+        };
+
+        // projection_dim resolution order matches what llama.cpp's
+        // MmprojModel.set_gguf_parameters does — read from the FIRST
+        // available source: vision_config.projection_dim → vision_config
+        // .out_hidden_size (Qwen3-VL canonical, e.g. 2048 for Qwen3-VL-2B)
+        // → text_config.hidden_size at the root config level (the LM
+        // hidden size — projection MUST match LM input embedding dim).
+        // Without this, the converter omits clip.vision.projection_dim
+        // and the Qwen3VlViTConfig::from_mmproj loader rejects.
+        let projection_dim = vc
+            .get("projection_dim")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32)
+            .or_else(|| {
+                vc.get("out_hidden_size")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32)
+            })
+            .or_else(|| {
+                root.get("text_config")
+                    .and_then(|tc| tc.get("hidden_size"))
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32)
+            })
+            .or_else(|| {
+                root.get("hidden_size")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32)
+            });
+
         Ok(VisionConfig {
             hidden_size,
             num_hidden_layers,
@@ -267,8 +342,8 @@ impl VisionConfig {
             image_size,
             intermediate_size,
             layer_norm_eps: f32_def("layer_norm_eps", 1e-6),
-            projector_type: str_def("projector_type", "mlp"),
-            projection_dim: vc.get("projection_dim").and_then(|v| v.as_u64()).map(|n| n as u32),
+            projector_type,
+            projection_dim,
             image_mean: read_triple("image_mean", [0.5, 0.5, 0.5]),
             image_std: read_triple("image_std", [0.5, 0.5, 0.5]),
             spatial_merge_size,
@@ -488,12 +563,16 @@ mod tests {
     }
 
     #[test]
-    fn deepstack_indexes_sorted_ascending_when_unsorted_input() {
-        // Sovereignty: even if HF source ships indexes out of order
-        // (e.g. `[17, 5, 11]`), we sort them so downstream code can
-        // rely on `deepstack_visual_indexes[0]` being the earliest
-        // flagged layer. Mirrors the loader's `read_deepstack_indexes`
-        // which iterates the GGUF Bool[] array in ascending order.
+    fn deepstack_indexes_preserve_hf_order_unsorted_input() {
+        // RENAMED + SEMANTICS FLIPPED for Wedge-4f Phase-2c (Codex Phase-2b
+        // finding #2, medium): peer implementations (llama.cpp converter,
+        // vLLM, Candle) all preserve HF config order when remapping
+        // `visual.deepstack_merger_list.{rel_idx}` → absolute layer
+        // indexes. Sorting silently breaks the remap for any unsorted
+        // producer config. The pre-Phase-2c `sort_unstable()` was
+        // landing-time wrong (latent because Qwen3-VL-2B [5, 11, 17]
+        // happens to be sorted, but nothing in HF config schema
+        // requires it). This test now pins the corrected behavior.
         let root = serde_json::json!({
             "vision_config": {
                 "hidden_size": 64,
@@ -506,7 +585,13 @@ mod tests {
             }
         });
         let vc = VisionConfig::from_hf_config(&root).unwrap();
-        assert_eq!(vc.deepstack_visual_indexes, Some(vec![5, 11, 17]));
+        assert_eq!(
+            vc.deepstack_visual_indexes,
+            Some(vec![17, 5, 11]),
+            "HF order MUST be preserved (peer impls index by enumerate() / \
+             by .index() — sorting silently breaks the rel_idx → \
+             absolute-layer remap for unsorted producer configs)"
+        );
     }
 
     #[test]
@@ -621,5 +706,120 @@ mod tests {
         });
         let vc = VisionConfig::from_hf_config(&root).unwrap();
         assert!(vc.is_qwen3vl());
+    }
+
+    #[test]
+    fn from_hf_config_canonical_qwen3vl_no_projector_type_with_out_hidden_size() {
+        // Phase-2c regression for Codex Phase-2b finding #1 BLOCKER on
+        // Wedge-4f 9e9e262: real Qwen3-VL HF configs (verified against
+        // Qwen/Qwen3-VL-2B-Instruct/config.json 2026-04 snapshot) carry
+        // model_type="qwen3_vl" + deepstack_visual_indexes + out_hidden_size,
+        // but NO projector_type field. Pre-Phase-2c the converter
+        // defaulted projector_type to "mlp" and never derived
+        // projection_dim — silently emitting a wrong mmproj.
+        //
+        // This test pins both halves of the fix:
+        //   (a) projector_type forced to "qwen3vl_merger" via model_type
+        //       OR via deepstack_visual_indexes presence;
+        //   (b) projection_dim populated from out_hidden_size when
+        //       projection_dim is absent.
+        let root = serde_json::json!({
+            "text_config": {"hidden_size": 1024},  // present but not consulted because vc has out_hidden_size
+            "vision_config": {
+                "model_type": "qwen3_vl",
+                "hidden_size": 64,
+                "num_hidden_layers": 24,
+                "num_attention_heads": 8,
+                "patch_size": 16,
+                "image_size": 768,
+                "intermediate_size": 256,
+                "spatial_merge_size": 2,
+                "temporal_patch_size": 2,
+                "deepstack_visual_indexes": [5, 11, 17],
+                "out_hidden_size": 2048
+                // NOTE: NO projector_type, NO projection_dim
+            }
+        });
+        let vc = VisionConfig::from_hf_config(&root).unwrap();
+        // Pin (a): projector_type forced to canonical Qwen3-VL string.
+        assert_eq!(
+            vc.projector_type, "qwen3vl_merger",
+            "Real HF Qwen3-VL configs lack projector_type — Phase-2c \
+             must force it to qwen3vl_merger via model_type='qwen3_vl' \
+             OR deepstack_visual_indexes presence. Got '{}'",
+            vc.projector_type
+        );
+        assert!(vc.is_qwen3vl());
+        // Pin (b): projection_dim derived from out_hidden_size (NOT
+        // text_config.hidden_size — out_hidden_size has higher priority).
+        assert_eq!(
+            vc.projection_dim,
+            Some(2048),
+            "projection_dim must derive from vision_config.out_hidden_size \
+             (= 2048) when explicit projection_dim is absent. Got {:?}",
+            vc.projection_dim
+        );
+    }
+
+    #[test]
+    fn from_hf_config_qwen3vl_falls_back_to_text_config_hidden_size_when_no_out_hidden_size() {
+        // Edge case: vision_config has NEITHER projection_dim NOR
+        // out_hidden_size; converter must fall back to
+        // text_config.hidden_size (the LM input embedding dim — the
+        // projection MUST match it for the augmented embed contract
+        // to land at the right shape per Wedge-4c.5 contract).
+        let root = serde_json::json!({
+            "text_config": {"hidden_size": 1536},
+            "vision_config": {
+                "model_type": "qwen3_vl",
+                "hidden_size": 64,
+                "num_hidden_layers": 8,
+                "num_attention_heads": 8,
+                "patch_size": 16,
+                "image_size": 224,
+                "intermediate_size": 256,
+                "deepstack_visual_indexes": [3, 5]
+                // NO out_hidden_size, NO projection_dim
+            }
+        });
+        let vc = VisionConfig::from_hf_config(&root).unwrap();
+        assert_eq!(vc.projector_type, "qwen3vl_merger");
+        assert_eq!(
+            vc.projection_dim,
+            Some(1536),
+            "Fallback: text_config.hidden_size when both \
+             projection_dim and out_hidden_size are absent"
+        );
+    }
+
+    #[test]
+    fn from_hf_config_preserves_deepstack_index_hf_order() {
+        // Phase-2c regression for Codex Phase-2b finding #2 (medium):
+        // deepstack_visual_indexes was being sort_unstable()'d which
+        // would silently mis-attach DeepStack heads for any unsorted
+        // producer config (peer impls preserve HF order).
+        let root = serde_json::json!({
+            "vision_config": {
+                "model_type": "qwen3_vl",
+                "hidden_size": 64,
+                "num_hidden_layers": 24,
+                "num_attention_heads": 8,
+                "patch_size": 16,
+                "image_size": 224,
+                "intermediate_size": 256,
+                // Deliberately UNSORTED — sort_unstable() would have
+                // turned this into [3, 7, 11] and silently broken the
+                // merger_list.{rel_idx} → absolute remap.
+                "deepstack_visual_indexes": [11, 3, 7]
+            }
+        });
+        let vc = VisionConfig::from_hf_config(&root).unwrap();
+        assert_eq!(
+            vc.deepstack_visual_indexes,
+            Some(vec![11, 3, 7]),
+            "Phase-2c: HF order must be preserved (peer impls index by \
+             enumerate() / by .index() — sorting silently breaks the \
+             relative-to-absolute remap for unsorted producers)"
+        );
     }
 }
