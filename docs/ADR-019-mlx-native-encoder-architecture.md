@@ -789,7 +789,8 @@ Phased, gated, with parity per increment. Each phase ships behind its own env ga
 **Scope:** 30 DN layers across two regimes:
 - **Autoregressive prefill (pp80):** ops1-3 + qkv_split + ops5-9. Already largely `commit_labeled` per Stage 3a; consolidate into one stage-end commit with intra-stage MTLEvent fence for ops5-9 producer→consumer.
 - **Chunk-engaged prefill (pp4096):** the iter58b-DANGEROUS class. ops1-3 + qkv_split + chunk-prep + chunk-attn + ops8-9. Two sub-options:
-  - **Phase 3a (conservative):** Consolidate ops1-3 + qkv_split into one stage CB; keep chunk-prep + chunk-attn + ops8-9 as separate CBs (preserves existing iter58b fences). Sync count drops by ~30 (30 DN × 1 site).
+  - **Phase 3a (conservative):** Consolidate ops1-3 + qkv_split into one stage CB; keep chunk-prep + chunk-attn + ops8-9 as separate CBs (preserves existing iter58b fences). Sync count drops by ~30 (30 DN × 1 site). **Doc-bug correction (caught iter89e2-I 2026-05-02):** chunk-prep at `gpu_delta_net.rs:2825` uses `commit_and_wait()` (unlabeled) — NOT `commit_labeled` as earlier ADR text implied. The blocking fence is the F2-protective barrier ahead of the chunk pipeline; the partition "ops1-3 + qkv_split (commit_labeled, non-blocking) | chunk-prep + chunk-attn + ops8-9 (commit_and_wait, blocking)" is factually correct.  
+  **Layer-count correction (caught iter89e2-I 2026-05-02):** the design doc and this section both quote "30 DN layers" for 27B-dwq46. Actual architecture is `full_attn_every=4` across `n_layers=64` → 16 FA + **48 DN** layers. Phase 3a collapses 1 CB per DN layer × 48 DN layers = **-48 CBs** (not -30). The structural prediction (1 CB collapsed per DN layer) holds; only the layer count was off.
   - **Phase 3b (aggressive):** Convert chunk-internal commit_and_wait to MTLEvent intra-stage. Requires verifying ChunkInternalArena (mlx-native iter83 commit `62298b4`) covers ALL chunk-pipeline-internal scratches end-to-end. Sync count drops by ~60 (30 DN × 2 additional sites).
 
 **LoC:** Phase 3a ~200 in `gpu_delta_net.rs`. Phase 3b additional ~150 + mlx-native chunk-pipeline scratch lifetime audit (~100 LoC of test code).
@@ -808,6 +809,61 @@ Phased, gated, with parity per increment. Each phase ships behind its own env ga
 **ETA:** Phase 3a: 5-8 man-days. Phase 3b: 8-12 man-days (the arena-lifetime audit is the load-bearing scope).
 
 **Risk gate:** if Phase 3b chunk-internal MTLEvent conversion proves materially harder than the 8-12 day estimate, ship Phase 3a alone (still ≥ 40 ms win toward AC-P1; Phase 3b deferred to follow-up CFA cycle).
+
+#### iter89e2-I LANDED 2026-05-02 (Phase 3a conservative — DN-path Stage-A consolidation):
+
+Per Phase 3a design (`/tmp/cfa-adr019-phase3a-design/dn_path_d3_conservative_design.md` §2.1), `build_delta_net_layer_with_arena` (`gpu_delta_net.rs:2494`) gains a unified Stage-A CB in BOTH chunk-engaged and autoreg sub-paths: opens ONE `CommandEncoder` per DN layer; encodes ops1 (pre_norm) → barrier → ops2a/2b (proj_qkv + proj_z, concurrent) → barrier → op3 (ssm_conv) → NEW barrier (qkv_conv_buf RAW edge) → qkv_split; terminal `commit_labeled("layer.gdn.stage_a")`. Replaces two separate `commit_labeled("layer.gdn.ops1-3") + commit_labeled("layer.gdn.qkv_split")` calls per DN layer with one.
+
+Operator-authorized scope (Q1/Q2 baked in):
+- Q1 (autoreg ops5-9 fold): DEFERRED to iter89e2-K; iter89e2-I is the conservative Stage-A consolidation only, smallest blast radius for DN's iter58b risk surface.
+- Q2 (AC-P1 measurement): BOTH pp4096 and pp4528. (Note: 4528 is not a multiple of `FIXED_BT=64` so chunk path doesn't engage at exactly that token count; substituted **pp4544** which produces `seq_len=4544` chunk-aligned. The cross-fixture per-CB cost characterization the operator wanted is still satisfied.)
+
+Preserved fences (DO NOT CONSOLIDATE — F2 protective barriers; 1-line WHY annotations added inline at each):
+- chunk-prep `commit_and_wait()` (`gpu_delta_net.rs:2825`).
+- chunk-attn `commit_and_wait_labeled("layer.gdn.chunk_attn")` (`gpu_delta_net.rs:1757`).
+- ops8-9 `commit_and_wait_labeled("layer.gdn.ops8-9")` (`gpu_delta_net.rs:2917`).
+
+Trunk-state correction surfaced at iter89e2-I commit time: HEAD `780942a` is iter89e2-G's docs commit but the iter89e2-G **code** commit `b35b86a` was NEVER MERGED to trunk (it lives on a separate branch). `fused_stage_a_enc` Option exists at `gpu_full_attn.rs:2021` but is never `.take()`'d at the ops6-7 encoder-open site (line 2464 still does `device.command_encoder()` unconditionally). Thus iter89e2-I's measurement baseline is post-iter89e2-F (cmd_buf=338 at pp4096), and the Δ-48 below is purely the DN-path Stage-A consolidation. Recommended next step (a) below addresses this.
+
+Acceptance gates (5-trial trimmed median; alternating-trial bench to share noise floor; pre-bench process audit clean):
+
+- **AC-PA1** (4-fixture decode parity): PASS — all 4 SHA256 byte-identical.
+  - 27B-dwq46:        `6eae06cf4e563ee8b5e8027d6a1921a75fec7d6dbc3ef88bf2e80bb223736258` ✓
+  - 35B-A3B apex:     `c27cfd8857b7f90014842f93c26a78ca837ab43fb142a320f22d5e9fb87a3132` ✓
+  - 35B-A3B q4_0-flat: `52c56af14bd8fd185a4f0ee90fe5027e43701f0650bd8413ea92a21fc1728ab9` ✓
+  - gemma-26B dwq:    `dce2ad832f6bb760f8d13f44cca3a79f1f96a4d6277abd10bb7b8da2333ac396` ✓
+  Receipts: `/tmp/adr019_phase2_parity/<fixture>_phase3a-{baseline,iter89e2i}.sha`.
+- **AC-PA2** (Heisenbug 5×, MANDATORY for DN iter58b zone): PASS — 5/5 cold-process trials on 35B-A3B q4_0-flat produce byte-identical SHA `52c56af14bd8fd185a4f0ee90fe5027e43701f0650bd8413ea92a21fc1728ab9`. F2 verified by empirical guard. Receipts: `/tmp/adr019_phase3a_parity/heisenbug_trial{1..5}.text`.
+- **AC-PA4** (`cargo test --release -- --test-threads=1`): PASS 3276/3276 (vs iter89e2-G baseline 3275/3275, +1 = new `dn_stage_a_byte_exact_parity_with_pre_phase3a` unit test). Zero new failures. Existing iter89e2-E `flash_attn_prefill_into_byte_exact_parity_with_wrapper` test stays green.
+- **AC-P3** (decode no-regression, 35B-A3B q4_0-flat, 5-trial trimmed median): PASS — 131.97 → 131.77 t/s (-0.15 %, well within ±5 %).
+- **AC-P6** (cmd_buf_count delta, 27B-dwq46 chunk-engaged, both fixtures):
+  - pp4096: 338 → 290 (Δ **-48** = 48 DN layers × 1 CB/layer eliminated, exact match vs corrected layer-count prediction).
+  - pp4544: 338 → 290 (Δ **-48** = same; CB count is layer-count-bound not seq-bound).
+  - barrier_count: 1008 → 1056 (Δ +48; the new intra-Stage-A `enc.memory_barrier()` between op3's `qkv_conv_buf` write and qkv_split's `qkv_conv_buf` read, one per DN layer).
+  - sync_count: 153 → 153 unchanged (`commit_labeled` is non-blocking; chunk-prep + chunk-attn + ops8-9 fences preserved exactly).
+  - dispatch_count: 2002 → 2002 unchanged (kernel sequence identical).
+- **AC-P1** (chunk-engaged wall, alternating-trial 5-trial trimmed median):
+  - pp4096: 8616.1 → 8529.4 ms (-86.7 ms, -1.01 %); per-CB savings **1.81 ms/CB** across 48 collapsed CBs.
+  - pp4544: 9220.2 → 9239.0 ms (+18.8 ms, +0.20 %, within noise); per-CB savings -0.39 ms/CB across 48 collapsed CBs.
+  Per-CB cost cross-check vs Phase 2: iter89e2-F's pp4528 measured 4.75 ms/CB and iter89e2-G's pp4096 measured 0.50 ms/CB on FA-layer collapses. DN-layer collapses show smaller per-CB savings (~1.8 ms/CB on pp4096; noise-floor on pp4544) — DN layers have heavier per-layer GPU work amortizing the CB-overhead more than FA layers. Validates Phase 2's empirical finding that per-CB cost varies 0.50-4.75 ms/CB by workload.
+
+F1-F12 fence preservation (per design §4):
+- **F1** (persistent compute encoder per CB): ADOPTED — one persistent encoder per Stage-A CB now covers pre_norm + proj_qkv + proj_z + ssm_conv + qkv_split (5 dispatches, previously split across 2 CBs).
+- **F2** (iter58b residency-rescission): PRESERVED. All Stage-A scratches (`x_norm_buf`, `qkv_raw_buf`, `z_buf`, `qkv_conv_buf`, `q_split_buf`, `k_split_buf`, `v_split_buf`, plus small param buffers) are caller-owned `DnPrefillArena` slots, allocated once in `forward_gpu_impl` (`forward_gpu.rs:~1849-1862`), dropped only after the output-head terminal `commit_and_wait_labeled`. No wrapper-local `MlxBuffer` drops in Stage-A. Stage-A is non-blocking (`commit_labeled`); the three protective `commit_and_wait` fences (chunk-prep, chunk-attn, ops8-9) are preserved exactly. AC-PA2 5/5 PASS is the empirical guard. iter58b race structurally unreachable.
+- **F5** (RAW barriers): one new `enc.memory_barrier()` between op3's `qkv_conv_buf` write and qkv_split's `qkv_conv_buf` read. Replaces the legacy CB-boundary ordering. Verified byte-exact via the new unit test `dn_stage_a_byte_exact_parity_with_pre_phase3a` (compares production consolidated path against a parallel reference path that opens the legacy 2 encoders inline).
+- **F11** (zero-init alloc): PRESERVED — Stage-A adds zero new `device.alloc_buffer` calls.
+- **F12** (`HF2Q_FORCE_SERIAL_DISPATCH` probe): PRESERVED — single Stage-A CB still uses `get_or_create_encoder` which honors the env var on every fresh CB.
+
+LoC: 457 insertions / 20 deletions in `gpu_delta_net.rs` (within design's 140-180 src LoC + ~340 LoC unit test fixture).
+
+Cumulative Phase 2 + 3a totals (chunk-engaged 27B-dwq46): once iter89e2-G's code commit `b35b86a` lands on trunk, expected cumulative will be 338 → 322 (Phase 2 -16) → 274 (Phase 3a -48) = **-64 CBs**. iter89e2-I trunk-relative measurement here is **-48 CBs** (DN-only).
+
+Recommended next step: trunk currently lacks iter89e2-G's code commit. Two ordered options:
+  (a) Land iter89e2-G's `b35b86a` code commit on trunk, then re-bench iter89e2-I against a true Phase-2-complete baseline (cumulative 338 → 322 → 274).
+  (b) Proceed directly to **iter89e2-K** (autoreg ops5-9 fold). Per design doc §2.2, low-risk: all `commit_labeled` (non-blocking), no `commit_and_wait`, all arena-backed. Adds ~30 LoC and zero F2 risk.
+Phase 3b (chunk-internal MTLEvent) requires the deferred `ChunkInternalArena` lifetime audit and remains higher F2 risk; not the next move.
+
+Branch: `adr019-phase3a-iter89e2i-dn-path-conservative-fusion` (cd16430 on origin).
 
 ### Phase 4 — MoE-FFN / Dense-FFN tower D3 stage migration
 
