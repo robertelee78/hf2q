@@ -7923,3 +7923,86 @@ chat-template parity + tokenizer parity + SIGABRT at the residency-set
 against llama.cpp. Remaining items (perf gap, long-cycle repetition
 detection) tracked separately and are pre-existing rather than recent
 regressions.
+
+### 2026-05-03 (afternoon — true root-cause found and fixed) — Phase-1 fusion missing intra-CB RAW barrier
+
+**Pivot from earlier sub-hypotheses.** Today's earlier ADR-005 entries
+chased: chat-template render parity (byte-identical, ruled out),
+tokenization parity (byte-identical, ruled out), SIGABRT
+(real, fixed at fa104a7), buffer-pool host-pointer collision
+(falsified by HF2Q_PROFILE_RESIDENCY_ABORT instrumentation showing
+dup=false on every alloc), and an env-gate hack
+(b1e1383, then reverted at 71bb107 on user directive
+"no quick fixes — true fixes of true root cause only").
+
+**Empirical signal.** A 5× cold-process logit-dump test on the
+qwen3.6-35B-A3B-dwq48 wedding-cake prompt at greedy temp=0 produced
+five DIFFERENT first-token logit tuples — argmax flipped 1/5 runs,
+logit magnitudes spread 18→33. Forward pass non-deterministic.
+With `HF2Q_DUMP_LAYER=999` set (which gates off Phase-1 + Phase-2
+fusion AND adds a sync at embed/output_norm), 5/5 runs produced
+byte-identical (31248, 18.851507) top-3. With JUST Phase-2 disabled
+(env-gate hack), argmax stabilized but logits still wobbled — meaning
+TWO sources of non-determinism stacked. Phase-2 was one; the other
+had to be in either Phase-1 fusion or somewhere else gated by
+dump_bisect.
+
+**Code-review localization.** `apply_output_head_gpu_into`
+(`src/inference/models/qwen35/forward_gpu.rs:570+`) is the function
+Phase-1 (commit 8012e63) introduced for the output-head/last-layer
+fusion. It accepts `caller_enc: Option<CommandEncoder>`. When
+`fused = true`, the caller-supplied encoder ALREADY HAS the
+last-layer's MoeQ/DenseQ FFN-terminal `dispatch_fused_residual_norm_f32`
+encoded into it — that dispatch wrote the very `hidden` buffer this
+function then reads via `dispatch_rms_norm`. **No `enc.memory_barrier()`
+between the hand-off and the rms_norm dispatch.** Apple's
+MTLDispatchTypeConcurrent reorders dispatches within a single
+encoder unless an explicit RAW barrier is present; `dispatch_rms_norm`
+overlaps with (or precedes) the upstream FFN write, reading stale
+or partially-updated `hidden`.
+
+**Surgical fix at f591a66.** ONE line — `if fused { enc.memory_barrier(); }`
+inserted after the encoder hand-off and before the first rms_norm
+dispatch. The standalone path (caller_enc = None) is unaffected: the
+previous FFN encoder commits BEFORE this function's fresh encoder
+opens, so `hidden` is GPU-visible by Metal command-queue ordering.
+
+**Verification (post-fix).**
+
+```
+$ scripts/coherence-harness/determinism_check.sh \
+    qwen3.6-35B-A3B-dwq48.gguf "<wedding-cake>" thinking
+  run 1: top-3: [(31248, 18.851507), (1206, 17.665968), (90700, 16.616976)]
+  run 2: top-3: [(31248, 18.851507), (1206, 17.665968), (90700, 16.616976)]
+  run 3: top-3: [(31248, 18.851507), (1206, 17.665968), (90700, 16.616976)]
+  run 4: top-3: [(31248, 18.851507), (1206, 17.665968), (90700, 16.616976)]
+  run 5: top-3: [(31248, 18.851507), (1206, 17.665968), (90700, 16.616976)]
+DETERMINISM: PASS — 5/5 cold runs produced byte-identical top-3
+```
+
+Full-generation verification: 3 cold runs of greedy temp=0 --enable-thinking
+--max-tokens 300 produce byte-identical 300-token outputs at ~100 tok/s.
+Default-sampling --max-tokens 5000 generates 5000 coherent thinking
+tokens with no infinite loop fired (the user's earlier 1189-then-loop
+report was a downstream symptom of forward-pass non-determinism — when
+the argmax flipped on a critical token, the model fell into a degenerate
+attractor; with the forward pass deterministic, that no longer happens).
+
+**Why phase-1's AC-PA2 5× Heisenbug check missed this.** The AC-PA2
+fixture in commit 8012e63 was 27B-dwq46 / 35B-A3B on a different
+prompt where the unbarriered race happened to produce the same argmax.
+The wedding-cake prompt's specific hidden-state pattern produced a
+top-2 logit gap small enough that the unordered `hidden` read flipped
+argmax on 1/5 runs. New harness `scripts/coherence-harness/determinism_check.sh`
+asserts byte-identical first-token logit-tuples across 5 cold runs —
+will catch this Heisenbug class going forward.
+
+**`--no-thinking` failure on this dwq48 file remains model-level.**
+Verified at byte level: same rendered no-thinking prompt fed to
+llama-completion at greedy temp=0 produces token 27 (`<`) as first
+generated token, identical to hf2q. The empty
+`<think>\n\n</think>\n\n` suppressor in this dwq48 quant is an
+attractor for chat-template special tokens — neither hf2q nor llama.cpp
+escapes it. Operators get useful output by relying on the default
+auto-thinking path (`--enable-thinking` if the GGUF's chat-template
+supports it, which Qwen3.x's does).
