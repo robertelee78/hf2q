@@ -1388,57 +1388,59 @@ fn maybe_run_qwen35_prefill_sweep(
 /// from and writes back to the `kv_cache.linear_attn` slots on every call.
 /// For full-attention layers the SDPA is re-run from scratch on each decode
 /// token (the KV-append incremental path is a future optimisation).
-/// Detect a greedy-decode repetition loop in `decoded_tokens`.
+/// Detect a true consecutive-repetition loop in `decoded_tokens`.
 ///
-/// Returns `Some((ngram_size, occurrences))` if the last 128 tokens contain
-/// any 8/12/16/20/24-token sequence that appears ≥4 times (not necessarily
-/// consecutively — greedy loops can have minor drift, e.g., one outlier
-/// token mid-cycle).
+/// Returns `Some((ngram_size, occurrences))` if the LAST `N × ngram_size`
+/// tokens are exactly `N` consecutive copies of the same `ngram_size`-token
+/// sequence, for any `ngram_size ∈ {8, 12, 16, 20, 24}` and `N ≥ 4`.
 ///
-/// Why this is a real fix and not a fallback (per mantra `feedback_no_shortcuts`):
-/// pure greedy on thinking-style Qwen3.x checkpoints can enter a deterministic
-/// loop with no exit (verified 2026-05-02 user report on French-Toast prompt:
-/// "I should make sure the response is accurate and up-to-date." × 30+ before
-/// `<|im_end|>` finally fired at token 1014). Without sampling
-/// (temperature/top_k/top_p/repetition_penalty — TODO follow-up to extend the
-/// qwen35 generate path), running to `--max-tokens` produces 1000+ tokens of
-/// garbage. Stopping on detected repetition with a diagnostic stderr message
-/// IS the correct behavior for greedy mode — it's not a workaround for
-/// missing sampling, it's the deterministic-mode escape hatch.
+/// Why "true consecutive" not "non-overlapping in a 128-token window":
+/// the prior heuristic (4 non-overlapping occurrences of the last-N-token
+/// key anywhere in the last 128 tokens) was overly aggressive on legitimate
+/// enumeration patterns. 2026-05-03 user report: a wedding-cake recipe
+/// shopping list with bullets like
+///   `*   **Buy:** 5 lbs SMBC ...`
+///   `*   **Buy:** 3 cans condensed milk ...`
+///   `*   **Buy:** 1 box of Greenery ...`
+///   `*   **Buy:** 1 Cake Drum ...`
+///   `*   **Buy:** 1`  ← stop fired here
+/// triggered the old detector at 666 useful tokens because the 8-token
+/// `*   **Buy:** 1` prefix happened to appear ≥4 times non-consecutively
+/// in the window — even though every bullet's CONTENT was different and
+/// the model was making real progress.
 ///
-/// Algorithm: take the LAST `ngram_size` tokens as a key, scan the 128-token
-/// window for non-overlapping occurrences of that key. If ≥4 occurrences are
-/// found at any of the candidate sizes, report the first match. The
-/// non-overlapping increment (`i += ngram` on hit) avoids over-counting at
-/// short n-gram sizes (e.g. all-same-token would report `ngram=8` with
-/// `occurrences=16` from a 128-token window).
+/// True loops (the 2026-05-02 French-Toast `"I should make sure the
+/// response is accurate and up-to-date."` × 30+ case) are CONSECUTIVE
+/// — the model emits the SAME sequence end-to-end with no intervening
+/// content. The consecutive-only check fires on those and ignores
+/// structured enumeration.
+///
+/// Algorithm: take the LAST `ngram_size` tokens as the key, then check
+/// whether the immediately preceding `ngram_size` tokens equal the key,
+/// and the ones before that, and so on for `REPEAT_MIN_OCCURRENCES` total
+/// copies. If all match, report a true loop.
 fn detect_greedy_repetition_loop(decoded_tokens: &[u32]) -> Option<(usize, usize)> {
     const REPEAT_NGRAM_SIZES: &[usize] = &[8, 12, 16, 20, 24];
-    const REPEAT_SCAN_WINDOW: usize = 128;
     const REPEAT_MIN_OCCURRENCES: usize = 4;
 
-    if decoded_tokens.len() < REPEAT_SCAN_WINDOW {
-        return None;
-    }
     let n = decoded_tokens.len();
-    let window = &decoded_tokens[n - REPEAT_SCAN_WINDOW..];
     for &ngram in REPEAT_NGRAM_SIZES {
-        if window.len() < ngram * REPEAT_MIN_OCCURRENCES {
+        let need = ngram * REPEAT_MIN_OCCURRENCES;
+        if n < need {
             continue;
         }
-        let key = &window[window.len() - ngram..];
-        let mut occurrences = 0usize;
-        let mut i = 0;
-        while i + ngram <= window.len() {
-            if &window[i..i + ngram] == key {
-                occurrences += 1;
-                i += ngram;
-            } else {
-                i += 1;
+        let tail = &decoded_tokens[n - need..];
+        let key = &tail[need - ngram..];
+        let mut all_match = true;
+        for i in 0..REPEAT_MIN_OCCURRENCES {
+            let start = i * ngram;
+            if &tail[start..start + ngram] != key {
+                all_match = false;
+                break;
             }
         }
-        if occurrences >= REPEAT_MIN_OCCURRENCES {
-            return Some((ngram, occurrences));
+        if all_match {
+            return Some((ngram, REPEAT_MIN_OCCURRENCES));
         }
     }
     None
@@ -2244,15 +2246,16 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         }
         DecodeStopReason::RepetitionLoop { ngram, repeats } => {
             tracing::info!(
-                "Qwen3.5 decode: greedy n-gram repetition detected after {} \
-                 tokens (last {} tokens repeated {} times); stopping.",
+                "Qwen3.5 decode: consecutive n-gram repetition detected after {} \
+                 tokens (last {} tokens repeated {} times consecutively); stopping.",
                 outcome.generated, ngram, repeats
             );
             eprintln!(
-                "\n[hf2q] greedy decode entered a {}-token repetition loop \
-                 after {} tokens — stopping. Use non-zero temperature / top-p \
-                 / top-k sampling for non-deterministic decoding.",
-                ngram, outcome.generated
+                "\n[hf2q] decode entered a {}-token consecutive-repetition loop \
+                 after {} tokens — stopping. The model emitted the same \
+                 {}-token sequence {} times in a row; raise --repetition-penalty \
+                 or use a higher --temperature / lower --min-p to escape.",
+                ngram, outcome.generated, ngram, repeats
             );
         }
     }
@@ -4589,6 +4592,66 @@ mod tests {
             occ <= 128 / ngram,
             "non-overlap invariant violated: ngram={ngram} occ={occ} > {}",
             128 / ngram
+        );
+    }
+
+    #[test]
+    fn detect_repetition_does_not_fire_on_bullet_list() {
+        // 2026-05-03 — regression pin for the wedding-cake false-positive.
+        // A shopping list with 6 bulleted items shares the prefix
+        //   `*   **Buy:**` (~8 tokens)
+        // followed by completely different content per bullet. The OLD
+        // window-scan detector (any 4 non-overlapping matches of the
+        // last-N-token key in the last 128 tokens) fired here because
+        // the prefix tokens incidentally appeared 4× in the window —
+        // even though the model was making real progress. Confirm the
+        // consecutive-only detector ignores this.
+        let bullet_prefix: [u32; 8] = [42, 32, 32, 32, 1234, 5678, 9012, 3456];
+        // synthetic non-prefix bytes per bullet, growing each time
+        let mut toks: Vec<u32> = (0..50).collect();
+        for content_seed in 0..6u32 {
+            toks.extend_from_slice(&bullet_prefix);
+            // 12-20 tokens of unique content per bullet
+            for j in 0..(12 + content_seed as usize) {
+                toks.push(50000 + content_seed * 100 + j as u32);
+            }
+        }
+        // The last 8 tokens are NOT all the prefix — the trailing content
+        // is unique. detect_greedy_repetition_loop should NOT fire.
+        assert_eq!(
+            detect_greedy_repetition_loop(&toks),
+            None,
+            "false positive on legitimate bullet-list enumeration"
+        );
+    }
+
+    #[test]
+    fn detect_repetition_fires_on_true_consecutive_loop() {
+        // 2026-05-03 — pin the true-loop detection as the inverse of the
+        // bullet-list test. The 2026-05-02 French-Toast user report had
+        // the model emitting `"I should make sure the response is
+        // accurate and up-to-date."` × 30+ in a row. That sequence,
+        // tokenized, is roughly 16 tokens; consecutive emission for 30
+        // cycles trivially satisfies "last 4 × 16 tokens are 4 copies
+        // of the last 16 tokens". Verify the new detector still fires.
+        let cycle: [u32; 16] = [
+            701, 702, 703, 704, 705, 706, 707, 708, 709, 710, 711, 712, 713, 714, 715, 716,
+        ];
+        let mut toks: Vec<u32> = (0..50).collect();
+        for _ in 0..30 {
+            toks.extend_from_slice(&cycle);
+        }
+        let result = detect_greedy_repetition_loop(&toks);
+        assert!(
+            result.is_some(),
+            "true consecutive loop must still trigger the detector"
+        );
+        let (ngram, _occ) = result.unwrap();
+        assert_eq!(
+            ngram, 16,
+            "16-token cycle's halves are NOT individually periodic at 8, so \
+             ngram=8 doesn't fire; the smallest matching consecutive period \
+             is 16"
         );
     }
 
