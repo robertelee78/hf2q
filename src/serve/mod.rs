@@ -527,7 +527,42 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         let gguf_peek = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open (arch peek): {e}"))?;
         if let Some(arch) = gguf_peek.metadata_string("general.architecture") {
-            use crate::inference::models::qwen35::{is_qwen36_gguf, ARCH_QWEN35, ARCH_QWEN35MOE};
+            use crate::inference::models::qwen35::{
+                is_qwen36_gguf, is_qwen3_vl_arch, is_qwen3_vl_moe_arch, ARCH_QWEN35,
+                ARCH_QWEN35MOE,
+            };
+            // Wedge-4 / iter-227 (2026-05-02): close the runtime gap that
+            // surfaced when running `scripts/wedge4_qwen3vl.sh` against
+            // a real Qwen3-VL-2B GGUF — the loader fell through to the
+            // Gemma 4 forward path and bailed inside the per-layer MoE
+            // expert loader with `missing blk.0.ffn_gate_up_exps.weight`.
+            //
+            // Qwen3-VL text is structurally a plain dense transformer
+            // with `attn_{q,k,v,o}` + `ffn_{gate,up,down}` tensors; it
+            // does NOT match the Qwen3.5 hybrid (DeltaNet + gated full-
+            // attn) shape, so it cannot be routed through
+            // `Qwen35Model::load_from_gguf` (which requires SSM keys
+            // that Qwen3-VL GGUFs do not carry). The full Qwen3-VL LM
+            // forward path is iter-228+ scope; this iter closes only
+            // the dispatch gap with an operator-actionable error.
+            if is_qwen3_vl_arch(arch) {
+                let variant_label = if is_qwen3_vl_moe_arch(arch) {
+                    "MoE"
+                } else {
+                    "dense"
+                };
+                anyhow::bail!(
+                    "Qwen3-VL ({variant_label}, general.architecture = {arch:?}) GGUFs are recognized \
+                     but the LM forward path is not yet wired into `hf2q generate` (iter-227 \
+                     closes only the dispatch gap; the full Qwen3-VL LM forward path is \
+                     iter-228+ scope). Qwen3-VL text is a plain dense transformer and cannot \
+                     be routed through the Qwen3.5 hybrid path (which requires SSM metadata \
+                     keys absent from Qwen3-VL GGUFs). For now: use a Qwen3.5 / Qwen3.6 \
+                     GGUF, or wait for the iter-228 Qwen3-VL LM forward path to land. \
+                     Model: {}",
+                    model_path.display(),
+                );
+            }
             if arch == ARCH_QWEN35 || arch == ARCH_QWEN35MOE {
                 // Wave 5a (ADR-005 Phase 4 ACs 5468/5470 partial): the
                 // Qwen3.5 forward path is autoregressive-only (per-token
@@ -3962,6 +3997,95 @@ mod tests {
         );
     }
 
+    // ── Wedge-4 / iter-227 — Qwen3-VL arch dispatch tests ──
+    //
+    // Pin the new dispatch arm in `LoadedModel::load` (api/engine.rs)
+    // and `cmd_generate` (this file's runtime arch peek) so the
+    // operator-actionable error message reaches the caller instead of
+    // the pre-iter-227 silent fall-through into the Gemma 4 loader's
+    // `missing blk.0.ffn_gate_up_exps.weight` panic.
+
+    /// Synthetic GGUF with arch=qwen3_vl (hf2q's underscored convention,
+    /// emitted by Wedge-4f convert) routes through the new iter-227
+    /// dispatch arm and surfaces an operator-actionable error rather
+    /// than falling through to the Gemma 4 loader.
+    #[test]
+    fn iter227_load_engine_rejects_qwen3_vl_underscored_with_actionable_error() {
+        let tmp = write_minimal_gguf_with_arch("qwen3_vl");
+        let cfg = super::multi_model::EngineConfig {
+            tokenizer_path: None,
+            config_path: None,
+            queue_capacity: 4,
+            warmup_synchronously: false,
+        };
+        let result = super::load_engine(tmp.path(), &cfg);
+        assert!(
+            result.is_err(),
+            "qwen3_vl synthetic GGUF must surface the iter-227 dispatch error"
+        );
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            msg.contains("Qwen3-VL"),
+            "iter-227 error must name 'Qwen3-VL' so operators can grep; got: {msg}"
+        );
+        assert!(
+            msg.contains("dense"),
+            "iter-227 dense-variant error must say 'dense' (vs 'MoE'); got: {msg}"
+        );
+        assert!(
+            msg.contains("iter-228"),
+            "iter-227 error must point at iter-228+ as the unblocking work; got: {msg}"
+        );
+        // Regression guard — must NOT fall through to the Gemma loader's
+        // pre-iter-227 panic surface.
+        assert!(
+            !msg.contains("missing blk.0.ffn_gate_up_exps.weight"),
+            "iter-227 must intercept BEFORE the Gemma MoE expert load; got: {msg}"
+        );
+    }
+
+    /// Symmetric for the upstream llama.cpp arch-string convention
+    /// (no underscore — `qwen3vl`). Forward-compat for a future
+    /// convert-pipeline alignment.
+    #[test]
+    fn iter227_load_engine_rejects_qwen3vl_no_underscore_with_actionable_error() {
+        let tmp = write_minimal_gguf_with_arch("qwen3vl");
+        let cfg = super::multi_model::EngineConfig {
+            tokenizer_path: None,
+            config_path: None,
+            queue_capacity: 4,
+            warmup_synchronously: false,
+        };
+        let result = super::load_engine(tmp.path(), &cfg);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            msg.contains("Qwen3-VL") && msg.contains("dense"),
+            "iter-227 must surface dense-variant Qwen3-VL message for upstream arch string; got: {msg}"
+        );
+    }
+
+    /// MoE Qwen3-VL variant (Qwen3-VL-30B-A3B etc., upstream
+    /// `qwen3vlmoe` arch). The error must distinguish MoE from dense
+    /// so the operator knows which variant we recognized.
+    #[test]
+    fn iter227_load_engine_rejects_qwen3vlmoe_with_moe_specific_error() {
+        let tmp = write_minimal_gguf_with_arch("qwen3vlmoe");
+        let cfg = super::multi_model::EngineConfig {
+            tokenizer_path: None,
+            config_path: None,
+            queue_capacity: 4,
+            warmup_synchronously: false,
+        };
+        let result = super::load_engine(tmp.path(), &cfg);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            msg.contains("Qwen3-VL") && msg.contains("MoE"),
+            "iter-227 MoE-variant error must include 'MoE' to distinguish from dense; got: {msg}"
+        );
+    }
+
     /// Negative-path / regression guard: unknown architectures still
     /// route through the Gemma default arm of `LoadedModel::load`.
     /// The Gemma loader fails for missing config/tensors but the
@@ -3991,6 +4115,43 @@ mod tests {
             !msg.contains("qwen35_not_implemented"),
             "qwen35 sentinel must not fire on unknown arch; got: {msg}"
         );
+        // Iter-227 sentinel must NOT fire for unknown arch — that
+        // would mean the Qwen3-VL match arm widened beyond the
+        // intended `qwen3_vl` / `qwen3vl` / `qwen3vlmoe` set.
+        assert!(
+            !msg.contains("Qwen3-VL"),
+            "iter-227 Qwen3-VL dispatch must not fire on unknown arch; got: {msg}"
+        );
+    }
+
+    /// Iter-227 regression guard for the existing qwen35 / qwen35moe
+    /// dispatch arms — they MUST still route to `Qwen35LoadedModel::load`,
+    /// NOT into the new iter-227 Qwen3-VL bail. The new is_qwen3_vl_arch
+    /// predicate is narrow and additive.
+    #[test]
+    fn iter227_does_not_regress_qwen35_dispatch() {
+        for arch in &["qwen35", "qwen35moe"] {
+            let tmp = write_minimal_gguf_with_arch(arch);
+            let cfg = super::multi_model::EngineConfig {
+                tokenizer_path: None,
+                config_path: None,
+                queue_capacity: 4,
+                warmup_synchronously: false,
+            };
+            let result = super::load_engine(tmp.path(), &cfg);
+            assert!(
+                result.is_err(),
+                "0-tensor synthetic GGUF for {arch} must fail load (routed to qwen35 path)"
+            );
+            let msg = format!("{:#}", result.err().unwrap());
+            // The Qwen3-VL bail message must NOT fire on real qwen35
+            // arch strings — that would mean iter-227's predicate
+            // widened past its intended scope.
+            assert!(
+                !msg.contains("Qwen3-VL"),
+                "iter-227 Qwen3-VL dispatch must NOT fire on arch={arch}; got: {msg}"
+            );
+        }
     }
 
     // ---- Greedy repetition-loop detector tests ----

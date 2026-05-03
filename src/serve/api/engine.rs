@@ -1698,6 +1698,39 @@ impl LoadedModel {
             .metadata_string("general.architecture")
             .map(|s| s.to_string())
             .unwrap_or_default();
+        // Wedge-4 / iter-227 (2026-05-02): close the runtime gap that
+        // surfaced when running `scripts/wedge4_qwen3vl.sh` against a
+        // real Qwen3-VL-2B GGUF — the SERVE-side loader fell through
+        // to the Gemma 4 forward path and bailed inside the per-layer
+        // MoE expert loader with `missing blk.0.ffn_gate_up_exps.weight`.
+        //
+        // Qwen3-VL text is structurally a plain dense transformer with
+        // `attn_{q,k,v,o}` + `ffn_{gate,up,down}` tensors; it does NOT
+        // match the Qwen3.5 hybrid (DeltaNet + gated full-attn) shape,
+        // so it cannot be routed through `Qwen35Model::load_from_gguf`
+        // (which requires SSM metadata keys absent from Qwen3-VL
+        // GGUFs). The full Qwen3-VL LM forward path is iter-228+
+        // scope; this iter closes only the dispatch gap with an
+        // operator-actionable error. Mirrors the cmd_generate
+        // dispatch arm in `src/serve/mod.rs`.
+        use crate::inference::models::qwen35::{is_qwen3_vl_arch, is_qwen3_vl_moe_arch};
+        if is_qwen3_vl_arch(arch.as_str()) {
+            let variant_label = if is_qwen3_vl_moe_arch(arch.as_str()) {
+                "MoE"
+            } else {
+                "dense"
+            };
+            anyhow::bail!(
+                "Qwen3-VL ({variant_label}, general.architecture = {arch:?}) GGUFs are recognized \
+                 but the LM forward path is not yet wired into `hf2q serve` (iter-227 closes \
+                 only the dispatch gap; the full Qwen3-VL LM forward path is iter-228+ scope). \
+                 Qwen3-VL text is a plain dense transformer and cannot be routed through the \
+                 Qwen3.5 hybrid path (which requires SSM metadata keys absent from Qwen3-VL \
+                 GGUFs). For now: use a Qwen3.5 / Qwen3.6 GGUF, or wait for the iter-228 \
+                 Qwen3-VL LM forward path to land. Model: {}",
+                model_path.display(),
+            );
+        }
         match arch.as_str() {
             "qwen35" | "qwen35moe" => {
                 let q = super::engine_qwen35::Qwen35LoadedModel::load(opts)?;
