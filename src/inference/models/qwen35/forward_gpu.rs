@@ -392,10 +392,17 @@ fn default_chain_n(cfg: &Qwen35Config, layer_weights_gpu: &[LayerWeightsGpu]) ->
 
 struct OutputHeadGpu {
     norm_w: MlxBuffer,
-    /// BF16 pre-cast of lm_head — used for prefill (M > 1) where MM kernel is optimal.
-    lm_head_bf16: MlxBuffer,
-    /// Q4_0 quantized lm_head — used for single-token decode (M=1) for 3.57×
-    /// lower bandwidth vs BF16 (~1.5ms vs ~5.4ms per decode token).
+    /// Q4_0 quantized lm_head — used for ALL prefill + decode lm_head matmul
+    /// dispatches (`apply_output_head_gpu_into` and
+    /// `apply_output_head_gpu_greedy_into`).
+    ///
+    /// Pre-2026-05-03 there was also a BF16 pre-cast (`lm_head_bf16`) used by
+    /// the prefill / sampling-decode path on the assumption that MM kernels
+    /// preferred BF16 for M > 1. Empirically Q4_0 matmul on Apple Silicon
+    /// is faster than BF16 at BOTH M=1 (decode, ~1.4 ms saved per step → +14
+    /// tok/s on sampling) AND M>1 (prefill speed unchanged at ~350 tok/s).
+    /// The BF16 buffer was wasting ~1 GB of GPU memory + ~1 s of load-time
+    /// per session for nothing — removed at this iter.
     lm_head_q4: MlxBuffer,
 }
 
@@ -1522,36 +1529,11 @@ impl Qwen35Model {
                     );
                     self.upload_layer_weights_gpu(&device)?
                 };
-                let lm_head_f32 =
-                    upload_f32_weight(&self.output_weight, &device).context("upload lm_head")?;
-                let n_w = self.output_weight.len();
-                let lm_head_bf16 = {
-                    let bf16_buf = device
-                        .alloc_buffer(n_w * 2, DType::BF16, vec![n_w])
-                        .map_err(|e| anyhow!("alloc lm_head_bf16: {e}"))?;
-                    let mut enc =
-                        device.command_encoder().context("enc lm_head_bf16 cast")?;
-                    mlx_native::ops::elementwise::cast(
-                        &mut enc,
-                        &mut registry,
-                        device.metal_device(),
-                        &lm_head_f32,
-                        &bf16_buf,
-                        n_w,
-                        mlx_native::ops::elementwise::CastDirection::F32ToBF16,
-                    )
-                    .context("cast lm_head F32→BF16 at load")?;
-                    enc.commit_and_wait().context("commit lm_head cast")?;
-                    super::weight_pool::register_weight_buffer(&device, &bf16_buf)
-                        .map_err(|e| anyhow!("register lm_head_bf16: {e}"))?;
-                    bf16_buf
-                };
                 let lm_head_q4 = upload_q4_0_from_f32(&self.output_weight, &device)
                     .context("upload lm_head_q4")?;
                 let output_head = OutputHeadGpu {
                     norm_w: upload_f32_weight(&self.output_norm, &device)
                         .context("upload output_norm")?,
-                    lm_head_bf16,
                     lm_head_q4,
                 };
                 *cache = Some(ForwardGpuCache {
@@ -3241,35 +3223,11 @@ impl Qwen35Model {
                     ::register_image_token_residual_add_shader(&mut registry);
                 let layer_weights = self.upload_layer_weights_gpu(&device)?;
                 // W-5b.7 iter 2: residency-aware uploads for lm_head and norm.
-                let lm_head_f32 =
-                    upload_f32_weight(&self.output_weight, &device).context("upload lm_head")?;
-                let n_w = self.output_weight.len();
-                let lm_head_bf16 = {
-                    let bf16_buf = device
-                        .alloc_buffer(n_w * 2, DType::BF16, vec![n_w])
-                        .map_err(|e| anyhow!("alloc lm_head_bf16: {e}"))?;
-                    let mut enc = device.command_encoder().context("enc lm_head_bf16 cast")?;
-                    mlx_native::ops::elementwise::cast(
-                        &mut enc,
-                        &mut registry,
-                        device.metal_device(),
-                        &lm_head_f32,
-                        &bf16_buf,
-                        n_w,
-                        mlx_native::ops::elementwise::CastDirection::F32ToBF16,
-                    )
-                    .context("cast lm_head F32→BF16 at load")?;
-                    enc.commit_and_wait().context("commit lm_head cast")?;
-                    super::weight_pool::register_weight_buffer(&device, &bf16_buf)
-                        .map_err(|e| anyhow!("register lm_head_bf16 greedy: {e}"))?;
-                    bf16_buf
-                };
                 let lm_head_q4 = upload_q4_0_from_f32(&self.output_weight, &device)
                     .context("upload lm_head_q4 greedy")?;
                 let output_head = OutputHeadGpu {
                     norm_w: upload_f32_weight(&self.output_norm, &device)
                         .context("upload output_norm")?,
-                    lm_head_bf16,
                     lm_head_q4,
                 };
                 *cache = Some(ForwardGpuCache {
