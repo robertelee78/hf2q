@@ -8085,3 +8085,48 @@ temp=0) and outputs coherent (recipe text matches the format/quality of
 4adf689 and llama.cpp), the user's exit criteria — "as coherent as
 llama.cpp AND as fast as (or faster than) llama.cpp AND deterministic" —
 is met for greedy decode on this fixture.
+
+---
+
+### Session entry — 2026-05-03 (afternoon, second iter): chat-template byte
+### parity vs llama.cpp confirmed; iter89e2-F failure is test parallelism
+
+User suspicion this iter: "something is broken in how we do the chat
+template vs how llama.cpp does it." Tested directly with the existing
+`HF2Q_DEBUG_TOKENIZE_ONLY` + `HF2Q_DUMP_RENDERED_PROMPT` harness:
+
+| Engine               | First few token IDs                                |
+| -------------------- | -------------------------------------------------- |
+| hf2q HEAD (588ccb6+) | `11 27 91 316 4747 91 29 846 198 ...`              |
+| hf2q 4adf689         |    `27 91 316 4747 91 29 846 198 ...`              |
+| llama-tokenize       | `11 27 91 316 4747 91 29 846 198 ...`              |
+| llama-tokenize --no-bos |  `27 91 316 4747 91 29 846 198 ...`              |
+
+**HEAD is byte-identical to `llama-tokenize` default.** 4adf689 was
+byte-identical to `llama-tokenize --no-bos`. The 1-token diff was the
+`tokenizer.ggml.add_bos_token=true` flag (set in this GGUF) being
+honored at HEAD via the c18eccf chat-template fix.
+
+The ROOT cause is a **broken GGUF metadata** convention: this dwq48
+file declares `BOS = EOS = 11 (',')` (verified via
+`/opt/homebrew/bin/llama-tokenize -m … --stdin` which prints
+`print_info: BOS token = 11 ','`). llama.cpp loads this metadata as-is,
+prepends the comma BOS, and the model produces coherent output anyway.
+hf2q at HEAD now matches that exact behavior; 4adf689 silently dropped
+the prepend.
+
+This is parity-correct, NOT a regression. Documented for future
+sessions: when llama.cpp shows `print_info: BOS token = 11 ','` (or any
+other "wrong-looking" BOS), the metadata is the truth and hf2q should
+preserve it byte-for-byte. The downstream model behavior is determined
+by the model's own training-time prompt convention.
+
+**iter89e2-F parity test** (`flash_attn_prefill_into_byte_exact_parity_with_wrapper`)
+fails when the full test suite runs in parallel (45048/262144 F32 differ)
+but PASSES with `--test-threads=1`. The test itself has a guard for this
+class of failure ("Metal CB unexecuted under parallel contention") — but
+that guard only catches the all-zero subcase. The 45048-mismatch case is
+a different parallel-Metal-contention manifestation (probably another
+test's encoder racing with this test's commit). NOT a coherence regression
+in the production code path. Tracked but not blocking the mission.
+
