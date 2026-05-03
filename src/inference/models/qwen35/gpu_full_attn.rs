@@ -1897,6 +1897,60 @@ pub fn build_gated_attn_layer(
     let q_total = n_heads * head_dim;
     let kv_total = n_kv_heads * head_dim;
 
+    // ---- ADR-019 Phase 2 iter89e2-F: Stage-A unified-CB fast path ----
+    //
+    // When all preconditions hold, encode ops1-4 + kv_cache_write +
+    // fa.prefill_bridge into a SINGLE CommandBuffer (intra-stage
+    // memory_barrier between the three sub-stages) with one terminal
+    // commit_labeled. ops6-7 remains a separate CB in this iter to limit
+    // blast radius for parity debugging (per design doc §6 iter89e2-F;
+    // iter89e2-G extends fusion to ops6-7).
+    //
+    // Net per-FA-layer CB reduction: 4 -> 2 (ops1-4 + kv_cache_write +
+    // fa.prefill_bridge merged; ops6-7 still its own CB). Across 10 FA
+    // layers per Qwen3.6-35B-A3B prefill: 20 fewer CBs per chunk-engaged
+    // prefill.
+    //
+    // Preconditions (all required):
+    //  - `use_arena`        : fa_arena=Some && seq_len>1 && head_dim==256
+    //                         (gates the FA-bridge `_into` variant)
+    //  - `use_proj_arena`   : fa_proj_arena=Some && seq_len>1
+    //                         (gates the projection-arena ops1-4 path)
+    //  - `kv_cache_slot`    : Some (slot for the kv_cache_write dispatch)
+    //  - `cur_len == 0`     : prefill-from-zero (matches the
+    //                         `new_path_eligible` predicate in
+    //                         apply_sdpa_with_kv_cache; production-only)
+    //  - `!dump_bisect::is_enabled()` : R6 design-doc mitigation. The
+    //                         within-layer dump_in_layer call sites at
+    //                         lines below `as_slice` arena buffers; with
+    //                         the unified CB, those buffers' producer
+    //                         encoder is not yet committed when the dumps
+    //                         run. Falling through to the legacy 4-CB
+    //                         path keeps dump_bisect bisection viable.
+    //
+    // F-fence preservation:
+    //  - F1 (persistent encoder): one persistent compute encoder per
+    //    Stage-A CB, lazy-opened by the first dispatch. ops1-4 + kv_write
+    //    + bridge dispatches all share that encoder via memory_barrier
+    //    inserts.
+    //  - F2 (iter58b residency-rescission): SAFE. All FA-layer scratch
+    //    buffers (FaPrefillArena 7 BF16, FaProjectionsArena 10 F32) are
+    //    allocated at forward_gpu.rs:1701/1738 and dropped only at end
+    //    of forward_gpu_impl after the output-head terminal
+    //    commit_and_wait_labeled. They outlive every Stage-A CB. No
+    //    wrapper-local alloc_buffer drop occurs between dispatch and
+    //    GPU completion. iter58b race is structurally unreachable.
+    //  - F11 (zero-init alloc): one new per-call alloc (`out_seq`),
+    //    matching the wrapper at gpu_full_attn.rs:1411-1413 byte-for-byte.
+    //    No new ad-hoc allocations introduced.
+    let use_fused_stage_ab = use_arena
+        && fa_proj_arena.is_some()
+        && kv_cache_slot
+            .as_deref()
+            .map(|s| s.current_len[0] == 0)
+            .unwrap_or(false)
+        && !super::dump_bisect::is_enabled();
+
     // ADR-015 iter86: validate the projections arena's capacity and consume
     // the &mut borrow into a local Option<&FaProjectionsArena> for the
     // ops1-4 + ops6-7 read-only access pattern. The arena's slot buffers
@@ -1945,6 +1999,14 @@ pub fn build_gated_attn_layer(
     // (ops1-4 here, ops6-7 below) so both phases can share access without
     // consuming the outer Option.
     let mut fa_proj_arena = fa_proj_arena;
+    // ADR-019 Phase 2 iter89e2-F: when use_fused_stage_ab, consume fa_arena
+    // and kv_cache_slot in this branch (encoded into the same Stage-A CB
+    // as ops1-4). Outer bindings rebound to None so the downstream op5
+    // dispatch path is reached only by non-fused branches (decode, dump
+    // bisect, head_dim != 256, cur_len != 0, missing arenas).
+    let mut fa_arena = fa_arena;
+    let mut kv_cache_slot = kv_cache_slot;
+    let mut attn_out_fused: Option<MlxBuffer> = None;
     let (x_norm, q_flat, k_flat, v_flat, gate_flat, q_normed, k_normed, q_rope, k_rope) = if let
         Some(arena) = fa_proj_arena.as_mut().map(|a| &mut **a).filter(|_| use_proj_arena)
     {
@@ -2014,36 +2076,135 @@ pub fn build_gated_attn_layer(
             positions, seq_len, n_kv_heads, head_dim, rotary_dim, freq_base, mrope_section,
         )?;
 
-        // Decode fast path (seq=1, head_dim%32==0): commit() without wait.
-        // Metal serial queue guarantees ops1-4 completes before SDPA starts.
-        // The SDPA encode path (apply_sdpa_with_kv_cache seq=1 branch) never
-        // calls download_f32 so no CPU buffer access races.
+        // ── ADR-019 Phase 2 iter89e2-F: Stage-A unified-CB fusion ──────────
         //
-        // Prefill path (seq>1) without arena: commit_and_wait()
-        // because apply_sdpa_with_kv_cache's prefill branch calls download_f32
-        // (CPU read) on k_rope/v_flat before submitting any GPU work, so the
-        // GPU must have finished writing those buffers before we return.
+        // When use_fused_stage_ab is true, encode kv_cache_write +
+        // fa.prefill_bridge into the SAME `enc` and issue ONE terminal
+        // commit_labeled at end of bridge. Replaces 3 separate commits:
+        //   - layer.full_attn.ops1-4      (this block)
+        //   - layer.full_attn.kv_cache_write (apply_sdpa_with_kv_cache:1706)
+        //   - fa.prefill_bridge           (apply_flash_attn_prefill_seq_major:1449)
         //
-        // Decode (seq=1) only: GPU-only path, safe to commit_labeled.
-        // Prefill (seq>1): apply_sdpa_with_kv_cache (legacy path) unconditionally
-        // calls download_f32(k_seq_major) / download_f32(v_seq_major) to write
-        // the persistent KV cache (slot.k/slot.v) BEFORE the new_path_eligible
-        // branch dispatches FA. download_f32 → MlxBuffer::as_slice violates the
-        // ADR-013 P21 Stage 2 (2026-05-01): KV-cache write is now a GPU
-        // dispatch (kv_cache_copy_seq_f32_dual at apply_sdpa_with_kv_cache:1380),
-        // eliminating the download_f32(k_seq_major)/download_f32(v_seq_major)
-        // calls that previously required commit_and_wait here for the
-        // as_slice "no GPU writer in flight" contract. With use_arena=true
-        // (Stage 1 FaPrefillArena keeps scratches alive past commit), we can
-        // safely commit_labeled in prefill too — the FA bridge dispatch runs
-        // on the same Metal serial queue and orders after ops1-4 by GPU
-        // queue ordering. iter58b residency-rescission is prevented by the
-        // FaPrefillArena lifetime (scratches don't drop until end of prefill).
-        if (seq_len == 1 && head_dim % 32 == 0) || use_arena {
-            enc.commit_labeled("layer.full_attn.ops1-4");
+        // 4 -> 2 CBs per FA layer (ops6-7 still its own CB; iter89e2-G
+        // extends fusion to ops6-7).
+        //
+        // F2 invariant: arena buffers (FaPrefillArena 7 BF16, FaProjectionsArena
+        // 10 F32, persistent slot.k/slot.v) all outlive this CB by design —
+        // forward_gpu_impl owns them through the output-head terminal commit.
+        // The wider in-flight window has no F2 exposure because no buffer
+        // can drop between dispatch encode and GPU completion.
+        if use_fused_stage_ab {
+            // Take the &mut on slot + arena ONCE for the duration of this
+            // fused-stage block. Both bindings are rebound to None at the
+            // end so the SDPA-call branch (line ~2227) sees no slot/arena
+            // and does not double-dispatch (we set attn_out_fused below).
+            let slot = kv_cache_slot.as_mut().expect(
+                "use_fused_stage_ab implies kv_cache_slot.is_some()"
+            );
+            let fa_pre = fa_arena.as_mut().expect(
+                "use_fused_stage_ab implies fa_arena.is_some()"
+            );
+
+            let cur_len_u32 = slot.current_len[0]; // == 0 by predicate
+            let max_sl = max_seq_len as usize;
+            let kv_write_tokens =
+                (seq_len as usize).min(max_sl.saturating_sub(cur_len_u32 as usize));
+            let kv_seq_len = (cur_len_u32 as usize + kv_write_tokens).min(max_sl) as u32;
+
+            // RAW barrier: kv_cache_write reads arena.k_rope_buf / arena.v_proj_buf
+            // written by ops4 (k_rope) / op2 (v_proj) above.
+            enc.memory_barrier();
+            if kv_write_tokens > 0 {
+                let _w5b9_kv = super::wave5b8_profile::Section::start(
+                    super::wave5b8_profile::SectionKind::FaSdpaKvDownloadCopy,
+                );
+                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual(
+                    &mut enc, registry, device.metal_device(),
+                    &arena.k_rope_buf, &arena.v_proj_buf,
+                    &slot.k, &slot.v,
+                    n_kv_heads, head_dim, max_seq_len,
+                    cur_len_u32, kv_write_tokens as u32, 0,
+                ).context("kv_cache_copy_seq_f32_dual prefill (fused stage_ab)")?;
+            }
+
+            // RAW barrier: fa.prefill_bridge reads arena.q_rope_buf /
+            // arena.k_rope_buf / arena.v_proj_buf. Independent of
+            // kv_cache_write's writes (slot.k/slot.v are not read by the
+            // bridge), but Metal MTLDispatchTypeConcurrent reorders within
+            // a CB without an explicit barrier — required for ordering
+            // correctness and profiling attribution.
+            enc.memory_barrier();
+
+            // Allocate `out_seq` (the FA bridge's F32 seq-major output).
+            // Same per-call alloc shape as the wrapper at line 1411-1413
+            // — caller-owned, moved into attn_out_fused below.
+            let seq = seq_len as usize;
+            let nh = n_heads as usize;
+            let d = head_dim as usize;
+            let out_elems = seq * nh * d;
+            let out_seq = device
+                .alloc_buffer(out_elems * 4, DType::F32, vec![seq, nh, d])
+                .map_err(|e| anyhow!("alloc out_seq (fused stage_ab): {e}"))?;
+
+            // Encode the FA bridge body (8 dispatches + 5 intra-encoder
+            // barriers) into the SAME `enc`. iter89e2-E's `_into` variant.
+            {
+                let _w5b10_kernel = super::wave5b8_profile::Section::start(
+                    super::wave5b8_profile::SectionKind::FaSdpaKernel,
+                );
+                apply_flash_attn_prefill_seq_major_into(
+                    &mut enc, device, registry,
+                    &arena.q_rope_buf, &arena.k_rope_buf, &arena.v_proj_buf,
+                    &out_seq,
+                    seq_len, n_heads, n_kv_heads, head_dim,
+                    fa_pre,
+                )?;
+            }
+
+            // Update KV cursor (CPU-only counter; safe before GPU completes).
+            slot.current_len[0] = kv_seq_len;
+
+            // Stage-A terminal commit (non-blocking). Replaces 3 separate
+            // commit_labeled calls. arena buffers + out_seq outlive this CB.
+            enc.commit_labeled("layer.full_attn.stage_ab");
+
+            // Hand attn_out to the post-SDPA control flow; suppress the
+            // legacy SDPA dispatch by consuming fa_arena + kv_cache_slot.
+            attn_out_fused = Some(out_seq);
+            fa_arena = None;
+            kv_cache_slot = None;
         } else {
-            enc.commit_and_wait_labeled("layer.full_attn.ops1-4")
-                .context("commit ops1-4 prefill (proj arena)")?;
+            // Decode fast path (seq=1, head_dim%32==0): commit() without wait.
+            // Metal serial queue guarantees ops1-4 completes before SDPA starts.
+            // The SDPA encode path (apply_sdpa_with_kv_cache seq=1 branch) never
+            // calls download_f32 so no CPU buffer access races.
+            //
+            // Prefill path (seq>1) without arena: commit_and_wait()
+            // because apply_sdpa_with_kv_cache's prefill branch calls download_f32
+            // (CPU read) on k_rope/v_flat before submitting any GPU work, so the
+            // GPU must have finished writing those buffers before we return.
+            //
+            // Decode (seq=1) only: GPU-only path, safe to commit_labeled.
+            // Prefill (seq>1): apply_sdpa_with_kv_cache (legacy path) unconditionally
+            // calls download_f32(k_seq_major) / download_f32(v_seq_major) to write
+            // the persistent KV cache (slot.k/slot.v) BEFORE the new_path_eligible
+            // branch dispatches FA. download_f32 → MlxBuffer::as_slice violates the
+            // ADR-013 P21 Stage 2 (2026-05-01): KV-cache write is now a GPU
+            // dispatch (kv_cache_copy_seq_f32_dual at apply_sdpa_with_kv_cache:1380),
+            // eliminating the download_f32(k_seq_major)/download_f32(v_seq_major)
+            // calls that previously required commit_and_wait here for the
+            // as_slice "no GPU writer in flight" contract. With use_arena=true
+            // (Stage 1 FaPrefillArena keeps scratches alive past commit), we can
+            // safely commit_labeled in prefill too — the FA bridge dispatch runs
+            // on the same Metal serial queue and orders after ops1-4 by GPU
+            // queue ordering. iter58b residency-rescission is prevented by the
+            // FaPrefillArena lifetime (scratches don't drop until end of prefill).
+            if (seq_len == 1 && head_dim % 32 == 0) || use_arena {
+                enc.commit_labeled("layer.full_attn.ops1-4");
+            } else {
+                enc.commit_and_wait_labeled("layer.full_attn.ops1-4")
+                    .context("commit ops1-4 prefill (proj arena)")?;
+            }
         }
 
         // ARC clones from the arena are returned to the outer-scope tuple.
@@ -2220,7 +2381,14 @@ pub fn build_gated_attn_layer(
 
     // ---- Op 5: SDPA (causal, GQA) with optional KV-cache threading ----
     // Wave 5b.9: per-FA-layer SDPA op5 wall (gated on HF2Q_PROFILE_W5B8=1).
-    let attn_out = {
+    //
+    // ADR-019 Phase 2 iter89e2-F: when use_fused_stage_ab fired, attn_out
+    // was produced inline as part of the Stage-A unified CB (ops1-4 +
+    // kv_cache_write + fa.prefill_bridge merged); we skip the legacy
+    // dispatch entirely.
+    let attn_out = if let Some(out_fused) = attn_out_fused.take() {
+        out_fused
+    } else {
         let _w5b9_sdpa_total = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::FaSdpaTotal,
         );
