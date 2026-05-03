@@ -380,6 +380,38 @@ pub struct SoftTokenData {
     pub embeddings: mlx_native::MlxBuffer,
 }
 
+/// Owned, channel-friendly mirror of
+/// [`crate::serve::forward_prefill::DeepstackInjection`] (ADR-005
+/// iter-224 Wedge-4d).  Built at the chat-handler engine seam from
+/// [`compute_vision_embeddings_gpu_qwen3vl`]'s augmented embed (one
+/// chunk per Qwen3-VL DeepStack head). The worker thread rebuilds
+/// borrowed `DeepstackInjection<'_>` slices from a `DeepstackData` for
+/// the LM-side `forward_gpu_last_logits_with_soft_tokens_and_deepstack`
+/// call.
+#[derive(Debug, Clone)]
+pub struct DeepstackData {
+    /// Image-token positions in the post-`<|image_pad|>`-expansion
+    /// prompt (concatenated across all images in the request, in
+    /// natural left-to-right order).  Same length as the row count of
+    /// every chunk.
+    pub image_token_positions: Vec<u32>,
+    /// One GPU buffer per ds layer, each shape `[n_image_tokens,
+    /// hidden_size]` F32 row-major.  `chunks.len()` = n_deepstack;
+    /// `chunks[i]` is added at LM layer `i`.
+    pub chunks: Vec<mlx_native::MlxBuffer>,
+}
+
+impl DeepstackData {
+    /// Number of deepstack layers (= chunks.len()).
+    pub fn n_deepstack(&self) -> usize {
+        self.chunks.len()
+    }
+    /// Number of image tokens (= image_token_positions.len()).
+    pub fn n_image_tokens(&self) -> usize {
+        self.image_token_positions.len()
+    }
+}
+
 /// Result of a non-streaming chat generation.
 #[derive(Debug, Clone)]
 pub struct GenerationResult {
@@ -858,10 +890,28 @@ enum Request {
     },
     /// Vision-aware chat generation (Phase 2c Task #17 / iter-98).
     /// See `Engine::generate_with_soft_tokens` doc.
+    ///
+    /// **iter-224 Wedge-4d**: extended with an optional
+    /// `deepstack: Option<DeepstackData>` and an optional
+    /// `positions_flat: Option<Vec<i32>>` for the Qwen3-VL path.
+    /// Gemma + ClipClassic paths leave both `None` (Gemma's text-mode
+    /// IMROPE positions are synthesized inside the worker; Gemma has
+    /// no deepstack heads).
     GenerateWithSoftTokens {
         prompt_tokens: Vec<u32>,
         soft_tokens: Vec<SoftTokenData>,
         params: SamplingParams,
+        /// Wedge-4d: DeepStack injection chunks split out from the
+        /// augmented `[n_image_tokens, hidden * (1 + N_deepstack)]`
+        /// ViT output. `None` for Gemma / non-Qwen3-VL paths.
+        deepstack: Option<DeepstackData>,
+        /// Wedge-4d: 3D-mRoPE position buffer
+        /// (`[4 * prompt_len]` axis-major i32) built by
+        /// `build_qwen3vl_positions`. `None` for Gemma / non-Qwen3-VL
+        /// paths (the Qwen35 worker arm synthesizes
+        /// `prefill_positions_for(prompt_len)` text-style positions
+        /// when this is None).
+        positions_flat: Option<Vec<i32>>,
         reply: oneshot::Sender<Result<GenerationResult>>,
     },
     /// Phase B-dense.2 follow-up: read a slice of `dense_kvs[layer_rank]`
@@ -2355,11 +2405,38 @@ impl Engine {
         soft_tokens: Vec<SoftTokenData>,
         params: SamplingParams,
     ) -> Result<GenerationResult> {
+        self.generate_with_soft_tokens_and_deepstack(
+            prompt_tokens,
+            soft_tokens,
+            params,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Wedge-4d entry point for Qwen3-VL chat: same as
+    /// `generate_with_soft_tokens` but threads a `DeepstackData` (one
+    /// chunk per ViT-flagged-layer head) and a 3D-mRoPE
+    /// `positions_flat` buffer through to the worker. Both
+    /// `deepstack` and `positions_flat` are `None` for Gemma /
+    /// non-Qwen3-VL paths, in which case behaviour is byte-identical
+    /// to the legacy `generate_with_soft_tokens` entry point.
+    pub async fn generate_with_soft_tokens_and_deepstack(
+        &self,
+        prompt_tokens: Vec<u32>,
+        soft_tokens: Vec<SoftTokenData>,
+        params: SamplingParams,
+        deepstack: Option<DeepstackData>,
+        positions_flat: Option<Vec<i32>>,
+    ) -> Result<GenerationResult> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let req = Request::GenerateWithSoftTokens {
             prompt_tokens,
             soft_tokens,
             params,
+            deepstack,
+            positions_flat,
             reply: reply_tx,
         };
         match self.inner.tx.try_send(req) {
@@ -2566,6 +2643,32 @@ fn worker_run(
                     // calls flow through the close-buffered emitter
                     // (W-B3 incremental shape is a Wedge-4 follow-up).
                     LoadedModel::Qwen35(q) => {
+                        // Wedge-4d Codex Phase-2c (2026-05-02): the Qwen35
+                        // streaming worker does NOT yet thread soft-tokens
+                        // OR the Wedge-4c.5 DeepstackInjection / Wedge-4d
+                        // 3D positions through `generate_stream_qwen35_once`
+                        // — that's Wedge-4e's scope. The PUBLIC chat
+                        // handler at handlers.rs already returns HTTP 501
+                        // before image-bearing Qwen3-VL streaming reaches
+                        // this dispatch (see `dispatch_qwen3vl_seam_split`
+                        // and the streaming reject in `process_multimodal_content`),
+                        // BUT the lower-level engine API is reachable
+                        // directly (programmatic callers) and would
+                        // silently drop the soft_tokens injection without
+                        // this guard. Fail loud here with an actionable
+                        // diagnostic rather than producing text-only
+                        // output for what was a soft-token request.
+                        if !soft_tokens.is_empty() {
+                            let _ = events.send(super::sse::GenerationEvent::Error(
+                                "Qwen35 streaming path does not yet support \
+                                 soft-token injections (Wedge-4c.5 DeepStack \
+                                 + Wedge-4d 3D positions). For Qwen3-VL \
+                                 image-bearing chat, set \"stream\": false. \
+                                 Tracking: ADR-005 Wedge-4e."
+                                    .to_string(),
+                            ));
+                            continue;
+                        }
                         super::engine_qwen35::generate_stream_qwen35_once(
                             q,
                             &prompt_tokens,
@@ -2600,13 +2703,16 @@ fn worker_run(
                 prompt_tokens,
                 soft_tokens,
                 params,
+                deepstack,
+                positions_flat,
                 reply,
             } => {
-                // Vision-aware generate (Phase 2c Task #17 / iter-98).
-                // Build borrowed `SoftTokenInjection<'_>` slices from the
-                // owned `SoftTokenData` we received over the channel; the
-                // borrow lifetime is bounded by this match arm so it
-                // can't outlive the underlying buffers.
+                // Vision-aware generate (Phase 2c Task #17 / iter-98 +
+                // Wedge-4d). Build borrowed `SoftTokenInjection<'_>` /
+                // `DeepstackInjection<'_>` slices from the owned data we
+                // received over the channel; the borrow lifetime is
+                // bounded by this match arm so it can't outlive the
+                // underlying buffers.
                 let injections: Vec<SoftTokenInjection<'_>> = soft_tokens
                     .iter()
                     .map(|d| SoftTokenInjection {
@@ -2614,31 +2720,56 @@ fn worker_run(
                         embeddings: &d.embeddings,
                     })
                     .collect();
+                let ds_borrow: Option<crate::serve::forward_prefill::DeepstackInjection<'_>> =
+                    deepstack.as_ref().map(|d| {
+                        crate::serve::forward_prefill::DeepstackInjection {
+                            image_token_positions: d.image_token_positions.clone(),
+                            chunks: d.chunks.iter().collect(),
+                        }
+                    });
                 let result = match &mut loaded {
-                    LoadedModel::Gemma(g) => generate_once_with_soft_tokens(
-                        g,
-                        &prompt_tokens,
-                        &injections,
-                        &params,
-                        registration.as_ref(),
-                    ),
-                    // ADR-005 Phase 4 Wedge-4a (2026-05-01): closes the
-                    // last `qwen35_not_implemented_err()` call site —
-                    // vision-aware generate now routes through
-                    // `Qwen35Model::forward_gpu_last_logits_with_soft_tokens`
-                    // via `engine_qwen35::generate_qwen35_once_with_soft_tokens`.
-                    // Wedge-4a opens the soft-token API for Qwen3.5/3.6
-                    // GGUFs without adding a vision encoder; Wedge-4b
-                    // lands the qwen3vl ViT + qwen3vl_merger projector
-                    // + DeepStack taps next.
-                    LoadedModel::Qwen35(q) => {
-                        super::engine_qwen35::generate_qwen35_once_with_soft_tokens(
-                            q,
+                    LoadedModel::Gemma(g) => {
+                        // Gemma path doesn't consume deepstack / 3D
+                        // positions (those are Qwen3-VL specific). Fall
+                        // back to the legacy soft-token-only entry.
+                        generate_once_with_soft_tokens(
+                            g,
                             &prompt_tokens,
                             &injections,
                             &params,
                             registration.as_ref(),
                         )
+                    }
+                    // ADR-005 Phase 4 Wedge-4a (2026-05-01): closes the
+                    // last `qwen35_not_implemented_err()` call site —
+                    // vision-aware generate now routes through
+                    // `Qwen35Model::forward_gpu_last_logits_with_soft_tokens`
+                    // via `engine_qwen35::generate_qwen35_once_with_soft_tokens`.
+                    // **Wedge-4d (this iter)**: when `deepstack` is `Some`,
+                    // route through
+                    // `engine_qwen35::generate_qwen35_once_with_soft_tokens_and_deepstack`
+                    // which threads the per-LM-layer DeepStack chunks
+                    // and the 3D-mRoPE positions through the LM forward.
+                    LoadedModel::Qwen35(q) => {
+                        if ds_borrow.is_some() || positions_flat.is_some() {
+                            super::engine_qwen35::generate_qwen35_once_with_soft_tokens_and_deepstack(
+                                q,
+                                &prompt_tokens,
+                                &injections,
+                                ds_borrow.as_ref(),
+                                positions_flat.as_deref(),
+                                &params,
+                                registration.as_ref(),
+                            )
+                        } else {
+                            super::engine_qwen35::generate_qwen35_once_with_soft_tokens(
+                                q,
+                                &prompt_tokens,
+                                &injections,
+                                &params,
+                                registration.as_ref(),
+                            )
+                        }
                     }
                 };
                 let _ = reply.send(result);

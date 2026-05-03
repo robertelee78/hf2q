@@ -1070,6 +1070,241 @@ pub fn generate_qwen35_once_with_soft_tokens(
     })
 }
 
+/// Wedge-4d (ADR-005 iter-224 row 4) — vision-aware non-streaming chat
+/// generation for Qwen3-VL with the full DeepStack injection pipeline.
+///
+/// Identical to `generate_qwen35_once_with_soft_tokens` except:
+///   * Prefill goes through
+///     `Qwen35Model::forward_gpu_last_logits_with_soft_tokens_and_deepstack`
+///     so the per-LM-layer DeepStack chunks are added to the residual
+///     stream at the image-token positions during prefill (per peer
+///     `qwen3vl.cpp:96-100`).
+///   * The 3D-mRoPE position buffer (`positions_flat: [4 * prompt_len]`)
+///     is supplied by the chat handler via
+///     `crate::serve::forward_prefill::build_qwen3vl_positions`, NOT
+///     synthesized via `prefill_positions_for`. This carries the
+///     `[t, y, x, 0]` axis assignment that the IMROPE kernel consumes
+///     for image-patch tokens.
+///   * Decode steps after prefill use text-only `[t,t,t,t]` positions
+///     starting from the post-prefill global temporal counter (which
+///     advances by `max(n_x, n_y)` per image, NOT by `n_image_tokens`,
+///     per peer `mtmd.cpp:1354-1357`).
+///
+/// When both `deepstack` and `positions_flat` are `None`, behaviour is
+/// identical to `generate_qwen35_once_with_soft_tokens`.
+pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
+    qwen: &mut Qwen35LoadedModel,
+    prompt_tokens: &[u32],
+    soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
+    deepstack: Option<&crate::serve::forward_prefill::DeepstackInjection<'_>>,
+    positions_flat: Option<&[i32]>,
+    params: &SamplingParams,
+    registration: Option<&ModelRegistration>,
+) -> Result<GenerationResult> {
+    // Empty soft + no deepstack + no positions → identity over text-only.
+    if soft_tokens.is_empty() && deepstack.is_none() && positions_flat.is_none() {
+        return generate_qwen35_once(qwen, prompt_tokens, params, registration);
+    }
+
+    anyhow::ensure!(
+        !prompt_tokens.is_empty(),
+        "generate_qwen35_once_with_soft_tokens_and_deepstack: empty prompt_tokens"
+    );
+    let prompt_len = prompt_tokens.len();
+    let max_tokens = params.max_tokens.max(1);
+    let is_greedy = is_greedy_eligible(params);
+
+    let device = MlxDevice::new()
+        .map_err(|e| {
+            anyhow::anyhow!("MlxDevice::new (qwen35 wedge-4d generate): {e}")
+        })?;
+    let mut kv_cache = alloc_kv_cache_for_request(qwen, &device, prompt_len, max_tokens)?;
+
+    let prefill_start = Instant::now();
+    // Use supplied 3D positions if provided; otherwise fall back to
+    // text-style `[t,t,t,t]` positions.
+    let positions_owned: Vec<i32>;
+    let positions: &[i32] = match positions_flat {
+        Some(p) => {
+            anyhow::ensure!(
+                p.len() == 4 * prompt_len,
+                "generate_qwen35_once_with_soft_tokens_and_deepstack: \
+                 positions_flat.len() = {} != 4 * prompt_len = {}",
+                p.len(),
+                4 * prompt_len
+            );
+            p
+        }
+        None => {
+            positions_owned = prefill_positions_for(prompt_len);
+            &positions_owned
+        }
+    };
+
+    let prefill_logits = qwen
+        .model
+        .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+            prompt_tokens,
+            positions,
+            soft_tokens,
+            deepstack,
+            &mut kv_cache,
+        )
+        .context(
+            "Qwen35Model::forward_gpu_last_logits_with_soft_tokens_and_deepstack \
+             (prefill)",
+        )?;
+    anyhow::ensure!(
+        prefill_logits.len() == qwen.vocab_size,
+        "qwen35 prefill (wedge-4d) logits len {} != vocab_size {}",
+        prefill_logits.len(),
+        qwen.vocab_size
+    );
+    let mut next_token: u32 = if is_greedy {
+        greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32)
+    } else {
+        let mut logits = prefill_logits.clone();
+        sample_logits_qwen35(&mut logits, params, &[])
+    };
+    let prefill_duration = prefill_start.elapsed();
+
+    // Decode loop — for the post-prefill text steps, the global
+    // temporal position has advanced by image-aware amounts. Compute
+    // the post-prefill temporal `t_post` from the LAST text token's
+    // axis-0 position +1, OR (when the prompt ends with image tokens)
+    // from `axis-0[last] + temporal_advance`. Easiest: take
+    // `max(positions axis 0) + 1` as the next text temporal position.
+    let t_post: i32 = match positions_flat {
+        Some(p) => {
+            // axis 0 of positions_flat covers indices 0..prompt_len.
+            let mut max_t = 0i32;
+            for i in 0..prompt_len {
+                let v = p[i]; // axis 0 = t
+                if v > max_t {
+                    max_t = v;
+                }
+            }
+            // Image-tail special case: if last prompt token is an
+            // image-patch token (its t=t_img is constant across the
+            // image), the next text step's t = t_img + temporal_advance.
+            // We can't recover `temporal_advance` cheaply here; the
+            // simplest correct rule is `max_t + 1` for purely-text-end
+            // prompts (the conservative case). For Qwen3-VL chat the
+            // prompt always ends with the assistant turn marker (text),
+            // so max_t+1 is correct.
+            max_t.saturating_add(1)
+        }
+        None => prompt_len as i32,
+    };
+
+    let decode_start = Instant::now();
+    let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
+    generated_tokens.push(next_token);
+
+    let first_fragment = qwen
+        .tokenizer
+        .decode(&[next_token], false)
+        .unwrap_or_default();
+    let mut decoded_text = first_fragment.clone();
+
+    let mut finish_reason: &'static str = "length";
+
+    if qwen.eos_token_ids.contains(&next_token) {
+        finish_reason = "stop";
+    } else if qwen35_hit_stop_string(&decoded_text, &params.stop_strings) {
+        finish_reason = "stop";
+        qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+    } else {
+        for step in 1..max_tokens {
+            // Decode position is `t_post + (step - 1)`, broadcast across
+            // all 4 axes (text-style).
+            let pos = t_post + (step as i32 - 1);
+            if pos as u32 >= kv_cache.max_seq_len {
+                tracing::warn!(
+                    pos,
+                    max_seq = kv_cache.max_seq_len,
+                    "qwen35 decode (wedge-4d): hit kv-cache bound; stopping with finish=length",
+                );
+                break;
+            }
+            let decode_positions = vec![pos; 4];
+
+            next_token = if is_greedy {
+                qwen.model
+                    .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache)
+                    .with_context(|| {
+                        format!("forward_gpu_greedy decode step {step} (wedge-4d)")
+                    })?
+            } else {
+                let logits_full = qwen
+                    .model
+                    .forward_gpu_last_logits(&[next_token], &decode_positions, &mut kv_cache)
+                    .with_context(|| {
+                        format!("forward_gpu_last_logits decode step {step} (wedge-4d)")
+                    })?;
+                let mut logits = logits_full;
+                sample_logits_qwen35(&mut logits, params, &generated_tokens)
+            };
+
+            if qwen.eos_token_ids.contains(&next_token) {
+                finish_reason = "stop";
+                break;
+            }
+            generated_tokens.push(next_token);
+            let fragment = qwen
+                .tokenizer
+                .decode(&[next_token], false)
+                .unwrap_or_default();
+            decoded_text.push_str(&fragment);
+            if qwen35_hit_stop_string(&decoded_text, &params.stop_strings) {
+                finish_reason = "stop";
+                qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+                break;
+            }
+        }
+    }
+    let decode_duration = decode_start.elapsed();
+
+    let (content, reasoning_text) = match registration {
+        Some(reg) if reg.has_reasoning() => super::registry::split_full_output(reg, &decoded_text),
+        _ => (decoded_text, None),
+    };
+
+    let reasoning_token_count = match registration {
+        Some(reg) if reg.has_reasoning() => {
+            let mut sp = ReasoningSplitter::from_registration(reg);
+            let mut count = 0usize;
+            for &tok in &generated_tokens {
+                let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
+                if let Some(splitter) = sp.as_mut() {
+                    let _ = splitter.feed(&frag);
+                    if splitter.in_reasoning() {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        }
+        _ => 0,
+    };
+
+    Ok(GenerationResult {
+        text: content,
+        reasoning_text,
+        prompt_tokens: prompt_len,
+        completion_tokens: generated_tokens.len(),
+        reasoning_tokens: if reasoning_token_count > 0 {
+            Some(reasoning_token_count)
+        } else {
+            None
+        },
+        finish_reason,
+        prefill_duration,
+        decode_duration,
+        cached_tokens: 0,
+    })
+}
+
 /// Wedge-3 / Phase D: streaming chat generation against a loaded
 /// Qwen3.5/3.6 model.  Replaces the `worker_run` 501 arm for
 /// `Request::GenerateStream`.

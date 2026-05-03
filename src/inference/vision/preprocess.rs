@@ -666,6 +666,434 @@ fn resize_bilinear_pad_llama_cpp(
 }
 
 // ---------------------------------------------------------------------------
+// Qwen3-VL variable-resolution preprocessing (ADR-005 iter-224 Wedge-4d)
+// ---------------------------------------------------------------------------
+
+/// Knobs for the Qwen3-VL "smart_resize" preprocessor, sourced from
+/// peer's projector init at `/opt/llama.cpp/tools/mtmd/clip.cpp:1352-1369`
+/// and the helper at `/opt/llama.cpp/tools/mtmd/clip-model.h:112-118`
+/// (`set_limit_image_tokens`).
+///
+/// For Qwen3-VL the per-token budget defaults to `[8, 4096]`. The
+/// pixel-area bounds are derived as
+/// `image_min_pixels = 8 * patch_size² * spatial_merge_size²`,
+/// `image_max_pixels = 4096 * patch_size² * spatial_merge_size²`. With
+/// `patch_size=16` and `spatial_merge_size=2` (Qwen3-VL canonical):
+///   - `image_min_pixels = 8 * 1024 = 8192`
+///   - `image_max_pixels = 4096 * 1024 = 4_194_304`
+///
+/// `align_size = patch_size * spatial_merge_size` (= 32 for canonical
+/// Qwen3-VL). Both output axes are multiples of `align_size`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Qwen3VlPreprocessConfig {
+    /// ViT patch edge length (Qwen3-VL: 16). Sourced from
+    /// `MmprojConfig.patch_size`.
+    pub patch_size: u32,
+    /// Spatial-merge degree (Qwen3-VL: 2 → 2×2 merge, 4× token
+    /// reduction). Sourced from
+    /// `MmprojConfig.spatial_merge_size.expect("Qwen3-VL")`.
+    pub spatial_merge_size: u32,
+    /// Per-channel mean (Qwen3-VL canonical: `[0.48145466, 0.4578275,
+    /// 0.40821073]` — OpenAI CLIP defaults; verify per-mmproj). Sourced
+    /// from `MmprojConfig.image_mean`.
+    pub image_mean: [f32; 3],
+    /// Per-channel std (Qwen3-VL canonical: `[0.26862954, 0.26130258,
+    /// 0.27577711]`). Sourced from `MmprojConfig.image_std`.
+    pub image_std: [f32; 3],
+    /// Pixel-area lower bound (per peer `set_limit_image_tokens`). When
+    /// the rounded-up size falls below this floor, the smart-resize
+    /// upscales to meet it.
+    pub image_min_pixels: u64,
+    /// Pixel-area upper bound. When the rounded-up size exceeds this
+    /// ceiling, the smart-resize downscales to fit.
+    pub image_max_pixels: u64,
+}
+
+impl Qwen3VlPreprocessConfig {
+    /// Build from a parsed `MmprojConfig`. Falls back to peer's
+    /// `set_limit_image_tokens(8, 4096)` defaults for the pixel bounds —
+    /// these are NOT serialized in the GGUF metadata for canonical
+    /// Qwen3-VL files (peer's `KEY_IMAGE_MIN_PIXELS` /
+    /// `KEY_IMAGE_MAX_PIXELS` reads at clip.cpp:1294 are scoped to
+    /// `DOTS_OCR` and `KIMIK25` only, NOT the QWEN*VL projectors —
+    /// those use the hard-coded 8/4096 token limits at clip.cpp:1361).
+    ///
+    /// # Errors
+    /// - `MmprojConfig.spatial_merge_size` is `None` (caller must supply
+    ///   a Qwen3-VL mmproj; the dispatch site already enforces this).
+    /// - `patch_size` or `spatial_merge_size` is 0.
+    pub fn from_mmproj(cfg: &super::mmproj::MmprojConfig) -> anyhow::Result<Self> {
+        let sm = cfg.spatial_merge_size.ok_or_else(|| {
+            anyhow!(
+                "Qwen3VlPreprocessConfig::from_mmproj: MmprojConfig.spatial_merge_size is None \
+                 — Qwen3-VL mmproj must carry `clip.vision.spatial_merge_size`"
+            )
+        })?;
+        if cfg.patch_size == 0 || sm == 0 {
+            return Err(anyhow!(
+                "Qwen3VlPreprocessConfig::from_mmproj: patch_size ({}) and \
+                 spatial_merge_size ({}) must be > 0",
+                cfg.patch_size,
+                sm
+            ));
+        }
+        // Peer defaults from clip.cpp:1361 `set_limit_image_tokens(8, 4096)`.
+        // Patch-area = patch² * sm² (clip-model.h:114).
+        let patch_area: u64 = (cfg.patch_size as u64).pow(2) * (sm as u64).pow(2);
+        let image_min_pixels: u64 = 8 * patch_area;
+        let image_max_pixels: u64 = 4096 * patch_area;
+        Ok(Self {
+            patch_size: cfg.patch_size,
+            spatial_merge_size: sm,
+            image_mean: cfg.image_mean,
+            image_std: cfg.image_std,
+            image_min_pixels,
+            image_max_pixels,
+        })
+    }
+}
+
+/// Output of `preprocess_qwen3vl` — variable-resolution pixel tensor in
+/// CHW layout plus the post-resize patch grid the placeholder expansion
+/// + 3D-mRoPE position synthesis consume.
+///
+/// **Phase 1 ViT compatibility note** (Wedge-4d limitation): the current
+/// `compute_vision_embeddings_gpu_qwen3vl` insists on square fixed-
+/// resolution `image_size × image_size` input (Wedge-4c.4 enforced this
+/// at `vit_gpu_qwen3vl.rs:2070-2078`). To honor the
+/// `vit_gpu_qwen3vl.rs` DO-NOT-TOUCH constraint and ship Wedge-4d, this
+/// preprocessor produces square pixels at `mmproj.image_size`, derived
+/// from a **smart-resize-then-pad** chain that preserves aspect ratio
+/// while filling the trained input dimensions:
+///
+///   1. Smart-resize per peer `calc_size_preserved_ratio` → variable
+///      `(target_w, target_h)` aligned to `(patch_size *
+///      spatial_merge_size)`.
+///   2. Bilinear-resize the source image to that variable target.
+///   3. Center-pad to `(image_size, image_size)` with zero pixels.
+///
+/// The reported `n_x_token, n_y_token, n_image_tokens` are the FIXED
+/// post-pad token grid (`image_size / (patch * sm)` square), matching
+/// what the Phase-1 ViT outputs. **A future iter that relaxes the ViT
+/// to truly variable [3, H, W] input will let this preprocessor report
+/// the genuine smart-resize grid.** Until then, the smart-resize step
+/// is a content-quality improvement (variable input → aspect-preserving
+/// content within the fixed trained input box) but doesn't yet flow
+/// through to variable token counts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Qwen3VlPreprocessed {
+    /// Flat `[3, image_size, image_size]` row-major (CHW) tensor.
+    /// Caller passes this through as `VisionInput::Siglip49(...)`'s
+    /// `pixel_values` for the Phase-1 ViT.
+    pub pixel_values: Vec<f32>,
+    /// Square ViT input edge in pixels (= `mmproj.image_size`).
+    pub target_size: u32,
+    /// Token grid dimension along the W axis (= `image_size / (patch *
+    /// sm)`). Used by 3D-mRoPE position synthesis: image-patch token at
+    /// post-merge index `i` has position `[t, i/n_x_token, i%n_x_token,
+    /// 0]` (per peer `tools/mtmd/mtmd.cpp:1295-1304`
+    /// `mtmd_image_tokens_get_decoder_pos` with `MTMD_POS_TYPE_MROPE`).
+    pub n_x_token: u32,
+    /// Token grid dimension along the H axis (= `image_size / (patch *
+    /// sm)`).
+    pub n_y_token: u32,
+    /// Total post-merge image token count = `n_x_token * n_y_token`.
+    /// This is what `expand_image_placeholders` uses to expand the
+    /// `<|image_pad|>` placeholder into a contiguous run of repeats.
+    pub n_image_tokens: u32,
+}
+
+/// Variable-resolution preprocessor for Qwen3-VL images.
+///
+/// Implements peer's `mtmd_image_preprocessor_dyn_size::preprocess`
+/// flow at `/opt/llama.cpp/tools/mtmd/mtmd-image.cpp:859-877` adapted
+/// for the Phase-1-ViT square-input constraint (see
+/// `Qwen3VlPreprocessed` doc):
+///
+///   1. Decode image bytes (PNG/JPEG; `image::guess_format` rejects
+///      anything else).
+///   2. Compute `(target_w, target_h)` via
+///      `calc_size_preserved_ratio(orig_size, align_size=patch*sm,
+///      min_pixels, max_pixels)`. This is "smart_resize" from the HF
+///      transformers code — aspect ratio preserved, both axes aligned
+///      to `align_size`, area clamped to `[min_pixels, max_pixels]`.
+///   3. Bilinear resize the source RGB to `(target_w, target_h)` via
+///      the byte-faithful `resize_bilinear_llama_cpp` (corner-aligned,
+///      truncation-cast — same as the gemma4v path).
+///   4. Center-pad to `(image_size, image_size)` with zero pixels.
+///   5. Pixel-normalize: `(pix/255 - mean[c]) / std[c]` per channel,
+///      written CHW row-major into `pixel_values`.
+///
+/// Step 4 is the Phase-1 ViT accommodation — the smart-resized pixels
+/// are placed at the center of an `image_size × image_size` zero-padded
+/// canvas. The ViT-side patch-conv sees garbage pixels in the pad
+/// region; the ViT block forward + LM-side attention see all post-merge
+/// tokens regardless of which originate from real content vs pad. This
+/// is the single semantic deviation from peer for Phase-1; truly
+/// variable resolution lifts it.
+///
+/// # Errors
+/// - Image format not PNG/JPEG.
+/// - `image::load_from_memory` decode failure (truncated / corrupt).
+/// - Original image has zero dimension.
+/// - `cfg.patch_size * cfg.spatial_merge_size == 0`.
+/// - `cfg.image_min_pixels > cfg.image_max_pixels`.
+/// - `image_size` is not a positive multiple of `patch_size *
+///   spatial_merge_size` (would otherwise produce a degenerate token
+///   grid).
+pub fn preprocess_qwen3vl(
+    bytes: &[u8],
+    cfg: &Qwen3VlPreprocessConfig,
+    image_size: u32,
+) -> Result<Qwen3VlPreprocessed> {
+    if cfg.patch_size == 0 || cfg.spatial_merge_size == 0 {
+        return Err(anyhow!(
+            "qwen3vl preprocess: patch_size ({}) and spatial_merge_size ({}) \
+             must both be > 0",
+            cfg.patch_size,
+            cfg.spatial_merge_size
+        ));
+    }
+    let stride = cfg.patch_size * cfg.spatial_merge_size;
+    if image_size == 0 || image_size % stride != 0 {
+        return Err(anyhow!(
+            "qwen3vl preprocess: image_size ({}) must be a positive multiple \
+             of patch_size ({}) * spatial_merge_size ({}) = {}",
+            image_size,
+            cfg.patch_size,
+            cfg.spatial_merge_size,
+            stride
+        ));
+    }
+    if cfg.image_min_pixels > cfg.image_max_pixels {
+        return Err(anyhow!(
+            "qwen3vl preprocess: image_min_pixels ({}) > image_max_pixels ({})",
+            cfg.image_min_pixels,
+            cfg.image_max_pixels
+        ));
+    }
+
+    let fmt = image::guess_format(bytes).map_err(|e| anyhow!("guess_format: {e}"))?;
+    match fmt {
+        ImageFormat::Png | ImageFormat::Jpeg => {}
+        other => {
+            return Err(anyhow!(
+                "image format {:?} is not supported by qwen3vl preprocess (only PNG + JPEG)",
+                other
+            ));
+        }
+    }
+    let img = image::load_from_memory(bytes).map_err(|e| anyhow!("decode image: {e}"))?;
+    let (orig_w, orig_h) = img.dimensions();
+    if orig_w == 0 || orig_h == 0 {
+        return Err(anyhow!("qwen3vl preprocess: image has zero dimension"));
+    }
+
+    // Step 2: smart_resize → (target_w, target_h) aligned to `stride`.
+    //
+    // Phase-1 Codex Phase-2c (2026-05-02): clamp `image_max_pixels` to
+    // image_size² when feeding the calc so the resized output cannot
+    // exceed the fixed Phase-1 canvas. The canonical canvas is
+    // image_size × image_size pixels (e.g. 768² = 589,824); the
+    // canonical Qwen3-VL `image_max_pixels` config is 4,194,304 — so
+    // an ordinary 1080p / 2K input would smart-resize to a target
+    // larger than the canvas and then get heavily center-cropped at
+    // the composite step below, silently losing image content. This
+    // is a divergence from llama.cpp variable-resolution behavior AND
+    // from the stated smart-resize-then-center-pad intent.
+    //
+    // The fix: cap `effective_max_pixels` at `min(image_max_pixels,
+    // image_size²)`. This keeps smart-resize aspect-ratio-preserving
+    // (the resize math is unchanged: it only changes the upper area
+    // bound), and guarantees the resized output ≤ canvas in BOTH
+    // dimensions so the composite step is pure pad (no crop) for
+    // every Phase-1 input.
+    //
+    // Operator note: when Phase-2 lifts the fixed-canvas constraint
+    // (true variable-resolution ViT), drop this cap and pass
+    // `cfg.image_max_pixels` through unmodified.
+    let canvas_pixels = (image_size as u64) * (image_size as u64);
+    let effective_max_pixels = cfg.image_max_pixels.min(canvas_pixels);
+    if cfg.image_min_pixels > effective_max_pixels {
+        return Err(anyhow!(
+            "qwen3vl preprocess Phase-1: image_min_pixels ({}) exceeds the \
+             effective max ({} = min(image_max_pixels={}, image_size²={})). \
+             Either lower image_min_pixels, increase image_size, or wait for \
+             the Phase-2 variable-resolution ViT iter.",
+            cfg.image_min_pixels,
+            effective_max_pixels,
+            cfg.image_max_pixels,
+            canvas_pixels
+        ));
+    }
+    let (smart_w, smart_h) = qwen3vl_calc_size_preserved_ratio(
+        orig_w,
+        orig_h,
+        stride,
+        cfg.image_min_pixels,
+        effective_max_pixels,
+    )?;
+
+    // Phase-1 Codex Phase-2c per-axis clamp: the area cap above is
+    // NECESSARY but NOT SUFFICIENT. For very-wide or very-tall aspects,
+    // an area-bounded aspect-preserving rectangle can still have one
+    // dimension > image_size (e.g. 16:9 input with area = 768² gives
+    // 1024 × 576 — width 1024 > canvas 768). When that happens, scale
+    // BOTH axes proportionally so the larger side equals image_size,
+    // then re-snap to stride. This preserves aspect ratio (the whole
+    // point of smart_resize) while guaranteeing both axes ≤ canvas →
+    // composite step is pure pad with no crop.
+    let (target_w, target_h) = if smart_w > image_size || smart_h > image_size {
+        let max_dim = smart_w.max(smart_h) as f64;
+        let scale = (image_size as f64) / max_dim;
+        // Snap to stride (rounding DOWN preserves the ≤ image_size
+        // invariant; the smaller axis can only shrink, so its
+        // post-snap value is also ≤ image_size).
+        let scaled_w = ((smart_w as f64 * scale) as u32 / stride) * stride;
+        let scaled_h = ((smart_h as f64 * scale) as u32 / stride) * stride;
+        // Ensure at least one stride along each axis (can't be 0).
+        let final_w = scaled_w.max(stride);
+        let final_h = scaled_h.max(stride);
+        (final_w, final_h)
+    } else {
+        (smart_w, smart_h)
+    };
+
+    // Step 3: bilinear resize. Use the byte-faithful llama.cpp resize
+    // (corner-aligned, truncation cast) so the smart-resized pixels
+    // match peer at the bit level for any future variable-ViT iter.
+    let src_rgb = img.to_rgb8();
+    let resized = resize_bilinear_llama_cpp(&src_rgb, target_w, target_h);
+
+    // Step 4: center-pad to (image_size, image_size).
+    let canvas_size = image_size as usize;
+    let pad_w = (image_size as i64 - target_w as i64).max(0) as u32;
+    let pad_h = (image_size as i64 - target_h as i64).max(0) as u32;
+    let off_x = (pad_w / 2) as i64;
+    let off_y = (pad_h / 2) as i64;
+
+    // Phase-1 Codex Phase-2c invariant: with `effective_max_pixels`
+    // capped at `image_size²` above, BOTH `target_w ≤ image_size` AND
+    // `target_h ≤ image_size`, so the composite step below is pure
+    // pad (off_x ≥ 0, off_y ≥ 0, every (x, y) in [0, target) maps
+    // inside the canvas). The clipping branches in the inner loop
+    // remain as defense-in-depth (compiler folds them to no-op when
+    // the invariant holds), but should never observably crop a
+    // Phase-1 input. The full center-crop path is reserved for
+    // hypothetical inputs that bypass the cap (operator-overridden
+    // config, future Phase-2 path).
+    let canvas: RgbImage = if target_w == image_size && target_h == image_size {
+        resized
+    } else {
+        let mut canvas: RgbImage = ImageBuffer::from_pixel(image_size, image_size, Rgb([0, 0, 0]));
+        // Composite, clipping to canvas bounds.
+        for y in 0..target_h {
+            for x in 0..target_w {
+                let dx = (x as i64) + off_x;
+                let dy = (y as i64) + off_y;
+                if dx < 0 || dy < 0 || dx >= image_size as i64 || dy >= image_size as i64 {
+                    continue;
+                }
+                canvas.put_pixel(dx as u32, dy as u32, *resized.get_pixel(x, y));
+            }
+        }
+        canvas
+    };
+
+    // Step 5: HWC → CHW + per-channel normalize.
+    let hw = canvas_size * canvas_size;
+    let mut pixel_values = vec![0f32; 3 * hw];
+    for (y, row) in canvas.rows().enumerate() {
+        for (x, pix) in row.enumerate() {
+            let idx = y * canvas_size + x;
+            for c in 0..3 {
+                let v = (pix[c] as f32 / 255.0 - cfg.image_mean[c]) / cfg.image_std[c];
+                pixel_values[c * hw + idx] = v;
+            }
+        }
+    }
+
+    // Phase-1 token-grid contract: square fixed-resolution → fixed
+    // n_image_tokens. Variable-token-count is Phase-2 ViT relaxation.
+    let n_x_token = image_size / stride;
+    let n_y_token = image_size / stride;
+    let n_image_tokens = n_x_token * n_y_token;
+
+    Ok(Qwen3VlPreprocessed {
+        pixel_values,
+        target_size: image_size,
+        n_x_token,
+        n_y_token,
+        n_image_tokens,
+    })
+}
+
+/// Smart-resize byte-faithful with peer
+/// `img_tool::calc_size_preserved_ratio(inp, align_size, min_pixels,
+/// max_pixels)` (`/opt/llama.cpp/tools/mtmd/mtmd-image.cpp:144-168`).
+/// Algorithm:
+///   - `align_size` MUST be > 0.
+///   - Always align up first: `h_bar = max(align, round_by(h))`,
+///     `w_bar = max(align, round_by(w))` where
+///     `round_by(x) = round(x/align)*align`.
+///   - If `h_bar*w_bar > max_pixels`:
+///     `beta = sqrt(h*w / max_pixels)`,
+///     `h_bar = max(align, floor_by(h/beta))`,
+///     `w_bar = max(align, floor_by(w/beta))`.
+///   - Else if `h_bar*w_bar < min_pixels`:
+///     `beta = sqrt(min_pixels / (h*w))`,
+///     `h_bar = ceil_by(h*beta)`, `w_bar = ceil_by(w*beta)`.
+///
+/// Returns `(target_w, target_h)`.
+fn qwen3vl_calc_size_preserved_ratio(
+    orig_w: u32,
+    orig_h: u32,
+    align_size: u32,
+    min_pixels: u64,
+    max_pixels: u64,
+) -> Result<(u32, u32)> {
+    let align: u64 = align_size as u64;
+    if align == 0 {
+        return Err(anyhow!(
+            "qwen3vl smart_resize: align_size must be > 0"
+        ));
+    }
+    let width = orig_w as u64;
+    let height = orig_h as u64;
+
+    let round_by = |x: f64| -> u64 {
+        ((x / align as f64).round() as i64).max(0) as u64 * align
+    };
+    let ceil_by = |x: f64| -> u64 {
+        ((x / align as f64).ceil() as i64).max(0) as u64 * align
+    };
+    let floor_by = |x: f64| -> u64 {
+        ((x / align as f64).floor() as i64).max(0) as u64 * align
+    };
+
+    let mut h_bar: u64 = align.max(round_by(height as f64));
+    let mut w_bar: u64 = align.max(round_by(width as f64));
+
+    if h_bar * w_bar > max_pixels {
+        let beta = ((height * width) as f64 / max_pixels as f64).sqrt();
+        h_bar = align.max(floor_by(height as f64 / beta));
+        w_bar = align.max(floor_by(width as f64 / beta));
+    } else if h_bar * w_bar < min_pixels {
+        let beta = (min_pixels as f64 / (height * width) as f64).sqrt();
+        h_bar = ceil_by(height as f64 * beta);
+        w_bar = ceil_by(width as f64 * beta);
+    }
+
+    if h_bar == 0 || w_bar == 0 || h_bar > u32::MAX as u64 || w_bar > u32::MAX as u64 {
+        return Err(anyhow!(
+            "qwen3vl smart_resize: degenerate output ({} x {}) for input ({} x {})",
+            w_bar, h_bar, orig_w, orig_h
+        ));
+    }
+    Ok((w_bar as u32, h_bar as u32))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1146,5 +1574,277 @@ mod tests {
         };
         let err = preprocess_gemma4v(&png, &cfg).unwrap_err();
         assert!(format!("{err}").contains("token_min"));
+    }
+
+    // -----------------------------------------------------------------
+    // Qwen3-VL preprocessor tests (ADR-005 iter-224 Wedge-4d)
+    // -----------------------------------------------------------------
+
+    /// Canonical Qwen3-VL preprocessor config for tests: patch_size=16,
+    /// spatial_merge_size=2, OpenAI-CLIP normalization defaults, peer's
+    /// `set_limit_image_tokens(8, 4096)` pixel bounds.
+    fn qwen3vl_test_cfg() -> Qwen3VlPreprocessConfig {
+        Qwen3VlPreprocessConfig {
+            patch_size: 16,
+            spatial_merge_size: 2,
+            image_mean: [0.48145466, 0.4578275, 0.40821073],
+            image_std: [0.26862954, 0.26130258, 0.27577711],
+            image_min_pixels: 8 * 16 * 16 * 2 * 2,    // 8192
+            image_max_pixels: 4096 * 16 * 16 * 2 * 2, // 4_194_304
+        }
+    }
+
+    #[test]
+    fn qwen3vl_preprocess_pixel_shape_matches_image_size_squared() {
+        let png = encode_solid_png(256, 256, [127, 127, 127]);
+        let cfg = qwen3vl_test_cfg();
+        let image_size = 768; // canonical Qwen3-VL trained input
+        let out = preprocess_qwen3vl(&png, &cfg, image_size).unwrap();
+        assert_eq!(out.pixel_values.len(), 3 * (image_size as usize).pow(2));
+        assert_eq!(out.target_size, image_size);
+        // n_x_token = n_y_token = 768 / (16 * 2) = 24
+        assert_eq!(out.n_x_token, 24);
+        assert_eq!(out.n_y_token, 24);
+        assert_eq!(out.n_image_tokens, 24 * 24);
+    }
+
+    #[test]
+    fn qwen3vl_preprocess_smart_resize_aligned_to_stride() {
+        // Input shape that doesn't align — verify smart_resize produces a
+        // (target_w, target_h) that is a multiple of stride = patch * sm.
+        let stride: u32 = 16 * 2;
+        let cfg = qwen3vl_test_cfg();
+
+        // Test the calc helper directly across a range of input sizes.
+        for &(orig_w, orig_h) in &[
+            (100, 100),
+            (200, 50),
+            (50, 200),
+            (1, 1),       // tiny — should upscale to min_pixels
+            (8000, 4000), // huge — should downscale to max_pixels
+            (1024, 768),  // landscape standard
+        ] {
+            let (tw, th) = qwen3vl_calc_size_preserved_ratio(
+                orig_w,
+                orig_h,
+                stride,
+                cfg.image_min_pixels,
+                cfg.image_max_pixels,
+            )
+            .expect("smart_resize ok");
+            assert!(
+                tw % stride == 0 && th % stride == 0,
+                "({orig_w}x{orig_h}) → ({tw}x{th}) not aligned to stride={stride}"
+            );
+            let area = tw as u64 * th as u64;
+            assert!(
+                area >= cfg.image_min_pixels && area <= cfg.image_max_pixels,
+                "({tw}x{th}) area={area} not in [{}, {}]",
+                cfg.image_min_pixels,
+                cfg.image_max_pixels
+            );
+        }
+    }
+
+    #[test]
+    fn qwen3vl_preprocess_phase1_no_crop_for_canonical_oversized_input() {
+        // Phase-2c regression for Codex Phase-2b finding #1 of Wedge-4d
+        // 5dac5ed (medium severity at preprocess.rs:892):
+        //   "Qwen3-VL smart-resize can produce target dimensions larger
+        //    than the fixed Phase-1 ViT canvas, then the code center-
+        //    crops to image_size. With canonical bounds, max_pixels is
+        //    4,194,304 while image_size=768 gives only 589,824 pixels,
+        //    so ordinary 1080p/2K images can be resized above 768 and
+        //    then heavily cropped instead of padded."
+        //
+        // Pin: with the canonical config (image_max_pixels = 4_194_304)
+        // and image_size = 768, an oversized input MUST smart-resize to
+        // dimensions ≤ image_size in BOTH axes (so the composite step
+        // is pure pad, no crop). This is the invariant the Phase-2c
+        // `effective_max_pixels = min(image_max_pixels, image_size²)`
+        // cap establishes. A future regression that drops the cap would
+        // produce target_w or target_h > 768 and silently lose image
+        // content via center-crop — failing this test.
+        let cfg = qwen3vl_test_cfg();
+        let image_size = 768u32;
+        let canvas_pixels = (image_size as u64) * (image_size as u64);
+        let effective_max = cfg.image_max_pixels.min(canvas_pixels);
+        let stride: u32 = cfg.patch_size * cfg.spatial_merge_size;
+
+        // Canonical oversized inputs that, without the cap + per-axis
+        // clamp, would land with at least one dimension > image_size.
+        // The full Phase-2c pipeline applies the area cap (in
+        // `qwen3vl_calc_size_preserved_ratio`) AND a post-smart-resize
+        // per-axis clamp inside `preprocess_qwen3vl` (because for very
+        // wide/tall aspects the area cap alone leaves one dim > canvas:
+        // 16:9 with area = 768² = 589824 → 1024×576, width 1024 > 768).
+        // This test mirrors that two-step constraint exactly.
+        for &(orig_w, orig_h, label) in &[
+            (1920u32, 1080u32, "1080p landscape"),
+            (1080, 1920, "1080p portrait"),
+            (2560, 1440, "2K landscape"),
+            (3840, 2160, "4K landscape"),
+            (4096, 4096, "4K square (matches max_pixels exactly)"),
+            (8000, 4000, "extreme landscape"),
+        ] {
+            let (smart_w, smart_h) = qwen3vl_calc_size_preserved_ratio(
+                orig_w,
+                orig_h,
+                stride,
+                cfg.image_min_pixels,
+                effective_max,
+            )
+            .unwrap_or_else(|e| panic!("smart_resize ok for {label}: {e}"));
+            // Mirror the per-axis clamp the pipeline applies.
+            let (tw, th) = if smart_w > image_size || smart_h > image_size {
+                let max_dim = smart_w.max(smart_h) as f64;
+                let scale = (image_size as f64) / max_dim;
+                let scaled_w = ((smart_w as f64 * scale) as u32 / stride) * stride;
+                let scaled_h = ((smart_h as f64 * scale) as u32 / stride) * stride;
+                (scaled_w.max(stride), scaled_h.max(stride))
+            } else {
+                (smart_w, smart_h)
+            };
+            assert!(
+                tw <= image_size && th <= image_size,
+                "{label} ({orig_w}x{orig_h}) post-clamp ({tw}x{th}) exceeds \
+                 canvas={image_size} — Phase-1 composite would center-crop, \
+                 losing image content. Phase-2c per-axis clamp must keep \
+                 the resized output within the canvas."
+            );
+            let area = tw as u64 * th as u64;
+            assert!(
+                area <= canvas_pixels,
+                "{label} post-clamp area {area} exceeds canvas {canvas_pixels}"
+            );
+            // Stride alignment must be preserved by the clamp.
+            assert!(
+                tw % stride == 0 && th % stride == 0,
+                "{label} post-clamp ({tw}x{th}) not aligned to stride={stride}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen3vl_preprocess_aspect_ratio_preserved_in_smart_resize() {
+        // 200x50 (4:1) — smart_resize should keep that ratio approximately.
+        let stride: u32 = 32;
+        let cfg = qwen3vl_test_cfg();
+        let (tw, th) = qwen3vl_calc_size_preserved_ratio(
+            200,
+            50,
+            stride,
+            cfg.image_min_pixels,
+            cfg.image_max_pixels,
+        )
+        .unwrap();
+        // Ratio drift should be small (within stride alignment tolerance).
+        let orig_ratio = 200.0_f64 / 50.0;
+        let new_ratio = tw as f64 / th as f64;
+        assert!(
+            (orig_ratio - new_ratio).abs() / orig_ratio < 0.5,
+            "smart_resize aspect drift: orig={orig_ratio}, new={new_ratio} ({tw}x{th})"
+        );
+    }
+
+    #[test]
+    fn qwen3vl_preprocess_rejects_misaligned_image_size() {
+        let png = encode_solid_png(100, 100, [0, 0, 0]);
+        let cfg = qwen3vl_test_cfg();
+        // 100 is not a multiple of stride=32.
+        let err = preprocess_qwen3vl(&png, &cfg, 100).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("must be a positive multiple"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn qwen3vl_preprocess_normalization_mean_std_applied() {
+        // Constant 128/255 image, mean=0.5, std=0.5: per-channel value
+        // before norm = 128/255 ≈ 0.502, after = (0.502-0.5)/0.5 ≈ 0.004.
+        let png = encode_solid_png(64, 64, [128, 128, 128]);
+        let cfg = Qwen3VlPreprocessConfig {
+            patch_size: 16,
+            spatial_merge_size: 2,
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: 64 * 64,         // 4096 (≤ canvas area)
+            image_max_pixels: 768u64.pow(2),   // 589824
+        };
+        let out = preprocess_qwen3vl(&png, &cfg, 768).unwrap();
+        // The PADDED region is zero pixels which become (0/255 - 0.5)/0.5 = -1.0.
+        // Sample the center (where the resized content lives).
+        let center_idx = 768 * 384 + 384; // (y=384, x=384), c=0 plane
+        let v = out.pixel_values[center_idx];
+        // Center should be near +0.004 (resized content), NOT -1.0 (pad).
+        assert!(
+            v.abs() < 0.05,
+            "center pixel of normalized 128-gray image should be ~0, got {v}"
+        );
+        // Corner of canvas should be in pad region (zero pixel → -1 after norm).
+        let corner_v = out.pixel_values[0];
+        assert!(
+            (corner_v + 1.0).abs() < 0.05,
+            "canvas corner (pad region) should normalize to ~-1.0, got {corner_v}"
+        );
+    }
+
+    #[test]
+    fn qwen3vl_preprocess_from_mmproj_picks_up_canonical_pixel_bounds() {
+        let mmcfg = super::super::mmproj::MmprojConfig {
+            image_size: 768,
+            patch_size: 16,
+            num_patches_side: 48,
+            hidden_size: 1024,
+            intermediate_size: 4096,
+            num_attention_heads: 16,
+            num_hidden_layers: 24,
+            layer_norm_eps: 1e-6,
+            projector: super::super::mmproj::ProjectorType::Qwen3VlMerger,
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [0.5, 0.5, 0.5],
+            spatial_merge_size: Some(2),
+            projection_dim: Some(2048),
+            deepstack_indexes: Some(vec![5, 11, 17]),
+        };
+        let cfg = Qwen3VlPreprocessConfig::from_mmproj(&mmcfg).unwrap();
+        // Defaults: image_min_pixels = 8 * 16² * 2² = 8192,
+        //           image_max_pixels = 4096 * 16² * 2² = 4_194_304.
+        assert_eq!(cfg.image_min_pixels, 8192);
+        assert_eq!(cfg.image_max_pixels, 4_194_304);
+        assert_eq!(cfg.patch_size, 16);
+        assert_eq!(cfg.spatial_merge_size, 2);
+    }
+
+    #[test]
+    fn qwen3vl_preprocess_from_mmproj_rejects_missing_spatial_merge() {
+        let mmcfg = super::super::mmproj::MmprojConfig {
+            image_size: 768,
+            patch_size: 16,
+            num_patches_side: 48,
+            hidden_size: 1024,
+            intermediate_size: 4096,
+            num_attention_heads: 16,
+            num_hidden_layers: 24,
+            layer_norm_eps: 1e-6,
+            projector: super::super::mmproj::ProjectorType::Qwen3VlMerger,
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [0.5, 0.5, 0.5],
+            spatial_merge_size: None, // missing
+            projection_dim: Some(2048),
+            deepstack_indexes: Some(vec![5, 11, 17]),
+        };
+        let err = Qwen3VlPreprocessConfig::from_mmproj(&mmcfg).unwrap_err();
+        assert!(format!("{err}").contains("spatial_merge_size"));
+    }
+
+    #[test]
+    fn qwen3vl_preprocess_rejects_non_image_bytes() {
+        let cfg = qwen3vl_test_cfg();
+        let err = preprocess_qwen3vl(&[1, 2, 3, 4, 5], &cfg, 768).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("guess_format") || msg.contains("not supported"), "got: {msg}");
     }
 }
