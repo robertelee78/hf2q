@@ -109,6 +109,19 @@ pub fn hf_vit_name_to_gguf(hf_name: &str) -> Option<String> {
         return mapped;
     }
     // Qwen3.6 globals: patch_embed, pos_embed, merger.
+    //
+    // Wedge-4f (iter-224 row 6): the `merger.norm.{weight,bias}` mapping
+    // moved from `mm.input_norm.{weight,bias}` to
+    // `v.post_ln.{weight,bias}` because llama.cpp's
+    // `Qwen3VLVisionModel.modify_tensors` at
+    // `/opt/llama.cpp/convert_hf_to_gguf.py:4948-4949` routes
+    // `visual.merger.norm.*` through `MODEL_TENSOR.V_POST_NORM` —
+    // see `/opt/llama.cpp/gguf-py/gguf/constants.py:1224`
+    // (`V_POST_NORM: "v.post_ln"`). The previous `mm.input_norm.*`
+    // mapping was the YOUTUVL projector convention (clip.cpp:1859-1866),
+    // not Qwen3-VL — emitting it produced an mmproj that Wedge-4c.5's
+    // `compute_vision_embeddings_gpu_qwen3vl` could not load (no
+    // `v.post_ln.*` to feed the post-block LayerNorm).
     static QWEN36_GLOBAL_MAP: &[(&str, &str)] = &[
         // patch_embed: 5-D [out, in, T=2, H, W] needs caller-side split
         // along T. We return the canonical first-slice name; pipeline
@@ -121,9 +134,11 @@ pub fn hf_vit_name_to_gguf(hf_name: &str) -> Option<String> {
         ("model.visual.merger.linear_fc1.bias",   "mm.0.bias"),
         ("model.visual.merger.linear_fc2.weight", "mm.2.weight"),
         ("model.visual.merger.linear_fc2.bias",   "mm.2.bias"),
-        // Qwen3.6 ViT pre-merger norm — maps to TN_MM_INP_NORM family.
-        ("model.visual.merger.norm.weight", "mm.input_norm.weight"),
-        ("model.visual.merger.norm.bias",   "mm.input_norm.bias"),
+        // Wedge-4f: merger.norm goes to V_POST_NORM = `v.post_ln.*`,
+        // matching convert_hf_to_gguf.py:4948-4949 via
+        // MODEL_TENSOR.V_POST_NORM.
+        ("model.visual.merger.norm.weight", "v.post_ln.weight"),
+        ("model.visual.merger.norm.bias",   "v.post_ln.bias"),
     ];
     for (hf, gguf) in QWEN36_GLOBAL_MAP {
         if hf_name == *hf {
@@ -210,23 +225,128 @@ fn ensure_f16_bytes(tensor: &TensorRef) -> Result<Vec<u8>, VitConvertError> {
     }
 }
 
+/// Map Qwen3-VL's `visual.deepstack_merger_list.{rel_idx}.{component}.{suffix}`
+/// HF tensor name to its absolute-indexed GGUF equivalent.
+///
+/// Qwen3-VL ships per-DeepStack-layer head tensors using a RELATIVE
+/// 0-based index into `vision_config.deepstack_visual_indexes` — e.g.
+/// `visual.deepstack_merger_list.0.norm.weight` is the FIRST DeepStack
+/// head, which on Qwen3-VL-2B-Instruct attaches to ABSOLUTE layer 5
+/// (the first entry of `[5, 11, 17]`). The runtime mmproj loader
+/// expects the absolute index encoded in the tensor name as
+/// `v.deepstack.5.norm.weight` (per the canonical
+/// `TN_DEEPSTACK_NORM = "v.deepstack.%d.norm.%s"` format string at
+/// `/opt/llama.cpp/tools/mtmd/clip-impl.h:117`).
+///
+/// Sub-keys per `convert_hf_to_gguf.py:4918-4928`:
+///   - `norm.{weight,bias}`        → `V_DS_NORM`  / `v.deepstack.{idx}.norm.{w,b}`
+///   - `linear_fc1.{weight,bias}`  → `V_DS_FC1`   / `v.deepstack.{idx}.fc1.{w,b}`
+///   - `linear_fc2.{weight,bias}`  → `V_DS_FC2`   / `v.deepstack.{idx}.fc2.{w,b}`
+///
+/// Returns `None` when:
+///   - The HF name does not match `visual.deepstack_merger_list.*`.
+///   - The relative index is out of range vs `deepstack_indexes.len()`
+///     (writer-bug: producer emitted more deepstack heads than
+///     `deepstack_visual_indexes` declared).
+///   - The component is unrecognized (writer-bug: caller emitted a
+///     deepstack tensor whose suffix is none of `norm`/`linear_fc1`/`linear_fc2`).
+fn hf_qwen3vl_deepstack_to_gguf(
+    hf_name: &str,
+    deepstack_indexes: &[u32],
+) -> Option<String> {
+    // Strip optional `model.` prefix to match convert_hf_to_gguf.py:4908-4909.
+    let canon = hf_name
+        .strip_prefix("model.")
+        .unwrap_or(hf_name);
+    let rest = canon.strip_prefix("visual.deepstack_merger_list.")?;
+
+    // Layout: "{rel_idx}.{component}.{suffix}" where component ∈
+    //   {"norm", "linear_fc1", "linear_fc2"}.
+    let mut parts = rest.splitn(3, '.');
+    let rel_idx_str = parts.next()?;
+    let component = parts.next()?;
+    let suffix = parts.next()?;
+
+    let rel_idx: usize = rel_idx_str.parse().ok()?;
+    if rel_idx >= deepstack_indexes.len() {
+        // Writer bug: more relative heads than declared. Fail loud at
+        // the convert layer rather than silently dropping the tensor.
+        return None;
+    }
+    let abs_idx = deepstack_indexes[rel_idx];
+
+    let target = match component {
+        "norm" => "norm",
+        "linear_fc1" => "fc1",
+        "linear_fc2" => "fc2",
+        _ => return None,
+    };
+
+    // Verify suffix is `weight` or `bias` — anything else is a writer
+    // bug. We don't enforce-reject here (return None) because forward
+    // compatibility might later admit other suffixes; the consumer-side
+    // `MmprojConfig::validate_tensor_set` is the authoritative check.
+    Some(format!("v.deepstack.{}.{}.{}", abs_idx, target, suffix))
+}
+
 /// Load + map + cast the vision tensors from an HF repo directory.
 pub fn load_vision_tensors(
     hf_repo_dir: &Path,
-    _vision_config: &VisionConfig,
+    vision_config: &VisionConfig,
 ) -> Result<HashMap<String, VitTensor>, VitConvertError> {
     let progress = ProgressReporter::new();
     let tensor_map = safetensors::read_tensors(hf_repo_dir, &progress)
         .map_err(|e| VitConvertError::Safetensors(e.to_string()))?;
 
+    // Wedge-4f: cache the deepstack absolute indexes for the per-tensor
+    // name remap. Empty slice when the model is non-Qwen3-VL or has no
+    // DeepStack heads.
+    let deepstack_indexes: Vec<u32> = vision_config
+        .deepstack_visual_indexes
+        .clone()
+        .unwrap_or_default();
+
     let mut out: HashMap<String, VitTensor> = HashMap::new();
     for (name, tensor) in tensor_map.iter() {
+        // Wedge-4f: Qwen3-VL DeepStack head tensors —
+        // `visual.deepstack_merger_list.{rel_idx}.*`. Remap the
+        // relative index to absolute via the model's
+        // `deepstack_visual_indexes` table. Hits BEFORE the static
+        // map (which doesn't pattern-match this prefix) and BEFORE
+        // the per-block ViT encoder match (which strips
+        // `model.vision_tower.encoder.layer.` — different prefix).
+        if let Some(gguf_name) = hf_qwen3vl_deepstack_to_gguf(name, &deepstack_indexes) {
+            let data = ensure_f16_bytes(tensor)?;
+            out.insert(
+                gguf_name.clone(),
+                VitTensor {
+                    gguf_name,
+                    shape: tensor.shape.clone(),
+                    dtype: DType::F16,
+                    data,
+                },
+            );
+            continue;
+        }
+
         // Special case: Qwen3.6 patch_embed.proj.weight is 5-D
         // [out, in, T=2, H, W]. llama.cpp's qwen3vl clip graph
         // expects two separate 4-D conv weights (one per temporal
         // frame), named `v.patch_embd.weight` and
         // `v.patch_embd.weight.1`. Split here.
-        if name == "model.visual.patch_embed.proj.weight" && tensor.shape.len() == 5 {
+        //
+        // Wedge-4f also handles the `model.`-stripped form
+        // (`visual.patch_embed.proj.weight`) since real Qwen3-VL HF
+        // safetensors omit the `model.` prefix on the visual tower
+        // (see `/opt/llama.cpp/convert_hf_to_gguf.py:4908-4909` —
+        // canonical writer also strips). The static map at
+        // `hf_vit_name_to_gguf::QWEN36_GLOBAL_MAP` keeps the
+        // `model.visual.*` form for backward-compat with synthetic
+        // fixtures that embed the prefix.
+        let is_qwen3vl_patch_5d = (name == "model.visual.patch_embed.proj.weight"
+            || name == "visual.patch_embed.proj.weight")
+            && tensor.shape.len() == 5;
+        if is_qwen3vl_patch_5d {
             let (slice0, slice1) = split_qwen3vl_patch_embed_temporal(tensor)?;
             out.insert(
                 "v.patch_embd.weight".to_string(),
@@ -249,7 +369,25 @@ pub fn load_vision_tensors(
             continue;
         }
 
-        if let Some(gguf_name) = hf_vit_name_to_gguf(name) {
+        // Wedge-4f: try both prefixed (`model.visual.*`) and bare
+        // (`visual.*`) forms — real Qwen3-VL HF strips the `model.`
+        // prefix from the visual tower (mirrors line-4908-4909 in
+        // convert_hf_to_gguf.py); synthetic fixtures keep it.
+        let mapped = hf_vit_name_to_gguf(name).or_else(|| {
+            if let Some(stripped) = name.strip_prefix("model.") {
+                // Re-add the `model.` prefix when calling into
+                // `hf_vit_name_to_gguf` so we don't accidentally
+                // double-strip; instead probe by building back the
+                // full-form variant from a stripped input. The bare
+                // strip path lets `visual.*` sources hit the static
+                // map by re-adding `model.`.
+                hf_vit_name_to_gguf(stripped)
+            } else {
+                hf_vit_name_to_gguf(&format!("model.{}", name))
+            }
+        });
+
+        if let Some(gguf_name) = mapped {
             let data = ensure_f16_bytes(tensor)?;
             out.insert(
                 gguf_name.clone(),
@@ -519,6 +657,162 @@ mod tests {
         };
         let out = ensure_f16_bytes(&tensor).unwrap();
         assert_eq!(out, vec![0x00, 0x3c, 0x00, 0x40]);
+    }
+
+    // ----- Wedge-4f (iter-224 row 6) — Qwen3-VL-specific mapping -----
+
+    /// **LAYER C ANCHOR** — Qwen3-VL `merger.norm` maps to
+    /// `v.post_ln.{weight,bias}`, NOT `mm.input_norm`. This is the
+    /// canonical mapping per `convert_hf_to_gguf.py:4948-4949` via
+    /// `MODEL_TENSOR.V_POST_NORM` / `gguf-py/gguf/constants.py:1224`.
+    /// Pre-Wedge-4f mapping was `mm.input_norm.*` (YOUTUVL projector
+    /// convention) which made the emitted mmproj unloadable by
+    /// Wedge-4c.5's qwen3vl ViT forward.
+    #[test]
+    fn wedge4f_qwen3vl_merger_norm_maps_to_v_post_ln() {
+        let w = hf_vit_name_to_gguf("model.visual.merger.norm.weight").unwrap();
+        let b = hf_vit_name_to_gguf("model.visual.merger.norm.bias").unwrap();
+        assert_eq!(w, "v.post_ln.weight");
+        assert_eq!(b, "v.post_ln.bias");
+    }
+
+    /// Qwen3-VL `merger.linear_fc1`/`linear_fc2` map to `mm.0`/`mm.2`
+    /// per clip.cpp:1844-1850 (PROJECTOR_TYPE_QWEN3VL section).
+    #[test]
+    fn wedge4f_qwen3vl_merger_fc_maps_to_mm_0_and_mm_2() {
+        assert_eq!(
+            hf_vit_name_to_gguf("model.visual.merger.linear_fc1.weight"),
+            Some("mm.0.weight".to_string())
+        );
+        assert_eq!(
+            hf_vit_name_to_gguf("model.visual.merger.linear_fc2.weight"),
+            Some("mm.2.weight".to_string())
+        );
+    }
+
+    /// Per-block Qwen3-VL fused QKV: `model.visual.blocks.{N}.attn.qkv.{w,b}`
+    /// → `v.blk.{N}.attn_qkv.{w,b}` (TN_ATTN_QKV at clip-impl.h:78).
+    /// Wedge-4c.5's mmproj loader installs canonical-name slice views
+    /// over the fused tensor, so the converter's job is just to keep
+    /// the on-disk name fused.
+    #[test]
+    fn wedge4f_qwen3vl_per_block_fused_qkv_name_preserved() {
+        assert_eq!(
+            hf_vit_name_to_gguf("model.visual.blocks.5.attn.qkv.weight"),
+            Some("v.blk.5.attn_qkv.weight".to_string())
+        );
+        assert_eq!(
+            hf_vit_name_to_gguf("model.visual.blocks.5.attn.qkv.bias"),
+            Some("v.blk.5.attn_qkv.bias".to_string())
+        );
+        assert_eq!(
+            hf_vit_name_to_gguf("model.visual.blocks.5.attn.proj.weight"),
+            Some("v.blk.5.attn_out.weight".to_string())
+        );
+    }
+
+    /// **LAYER C ANCHOR** — DeepStack tensor remap converts the HF
+    /// RELATIVE index (0..N where N = `len(deepstack_visual_indexes)`)
+    /// to the absolute layer index encoded in
+    /// `deepstack_visual_indexes[rel_idx]`. This is THE error-prone
+    /// part of the Qwen3-VL converter: silently emitting the relative
+    /// index would put DeepStack heads at the wrong layer in the
+    /// mmproj, causing the LM-side hooks to inject the augmentation
+    /// at the wrong block and produce garbled output.
+    ///
+    /// Spec: `convert_hf_to_gguf.py:4914`
+    ///   `idx = self.hparams_vision.get("deepstack_visual_indexes", [])[int(prefix)]`
+    #[test]
+    fn wedge4f_qwen3vl_deepstack_relative_to_absolute_index_remap() {
+        let indexes = vec![5, 11, 17];
+        // rel_idx=0 → abs 5
+        assert_eq!(
+            hf_qwen3vl_deepstack_to_gguf(
+                "visual.deepstack_merger_list.0.norm.weight",
+                &indexes,
+            ),
+            Some("v.deepstack.5.norm.weight".to_string())
+        );
+        // rel_idx=1 → abs 11
+        assert_eq!(
+            hf_qwen3vl_deepstack_to_gguf(
+                "visual.deepstack_merger_list.1.linear_fc1.weight",
+                &indexes,
+            ),
+            Some("v.deepstack.11.fc1.weight".to_string())
+        );
+        // rel_idx=2 → abs 17
+        assert_eq!(
+            hf_qwen3vl_deepstack_to_gguf(
+                "visual.deepstack_merger_list.2.linear_fc2.bias",
+                &indexes,
+            ),
+            Some("v.deepstack.17.fc2.bias".to_string())
+        );
+    }
+
+    /// `model.`-prefixed form of the deepstack tensor name (synthetic
+    /// fixtures may include the prefix; real Qwen3-VL strips it). Both
+    /// must work.
+    #[test]
+    fn wedge4f_qwen3vl_deepstack_with_model_prefix_supported() {
+        let indexes = vec![5];
+        assert_eq!(
+            hf_qwen3vl_deepstack_to_gguf(
+                "model.visual.deepstack_merger_list.0.norm.weight",
+                &indexes,
+            ),
+            Some("v.deepstack.5.norm.weight".to_string())
+        );
+    }
+
+    /// Out-of-range relative index returns None (writer-bug guard:
+    /// caller fed more relative heads than declared).
+    #[test]
+    fn wedge4f_qwen3vl_deepstack_out_of_range_relative_returns_none() {
+        let indexes = vec![5, 11];
+        // rel_idx=2 is out of range when only 2 indexes declared.
+        assert!(hf_qwen3vl_deepstack_to_gguf(
+            "visual.deepstack_merger_list.2.norm.weight",
+            &indexes,
+        )
+        .is_none());
+    }
+
+    /// Unknown component returns None (no `linear_fc3` etc).
+    #[test]
+    fn wedge4f_qwen3vl_deepstack_unknown_component_returns_none() {
+        let indexes = vec![5];
+        assert!(hf_qwen3vl_deepstack_to_gguf(
+            "visual.deepstack_merger_list.0.linear_fc3.weight",
+            &indexes,
+        )
+        .is_none());
+    }
+
+    /// Non-deepstack tensor names return None — the helper must not
+    /// match anything outside the `visual.deepstack_merger_list.*`
+    /// prefix.
+    #[test]
+    fn wedge4f_qwen3vl_deepstack_non_deepstack_returns_none() {
+        let indexes = vec![5, 11, 17];
+        assert!(hf_qwen3vl_deepstack_to_gguf(
+            "visual.merger.linear_fc1.weight",
+            &indexes,
+        )
+        .is_none());
+        assert!(hf_qwen3vl_deepstack_to_gguf(
+            "visual.blocks.0.norm1.weight",
+            &indexes,
+        )
+        .is_none());
+        // CLIP-classic per-block tensor must not match the deepstack
+        // helper (different prefix).
+        assert!(hf_qwen3vl_deepstack_to_gguf(
+            "model.vision_tower.encoder.layer.5.layer_norm1.weight",
+            &indexes,
+        )
+        .is_none());
     }
 
     #[test]
