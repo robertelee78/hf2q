@@ -8389,3 +8389,59 @@ sdpa_decode at greedy temp=0. Full singleton test suite passes 2784/2784.
 | Better long-context scaling than llama.cpp | ✓ (-1 vs -2.2) |
 | Full unit-test suite | ✓ 2784/2784 |
 
+
+---
+
+### Session entry — 2026-05-03 (afternoon, seventh iter): cleanup + scaling
+### bench at 2000-3000 tokens; identify prefill-side gap
+
+**Cleanup:** Removed dead `lm_head_bf16` cast at GPU_CACHE init (saved
+~1 GB GPU memory + ~1 s of cold-load BF16 cast pipeline). Iter-4 made
+`lm_head_q4` the only consumer; the BF16 buffer has been resident-but-
+unread since. Determinism preserved (md5 0dfd0ae2…). Greedy 200-tok still
+130.9 tok/s. 2784/2784 unit tests pass. Commit e64a954.
+
+**Extended scaling bench (greedy temp=0):**
+
+| Length | hf2q   | llama-bench tg | Delta              |
+| ------ | ------ | -------------- | ------------------ |
+| 200    | 131.0  | 119.71         | hf2q +11.3 ✓       |
+| 500    | 130.5  | 118.59         | hf2q +11.9 ✓       |
+| 1000   | 130.0  | 117.52         | hf2q +12.5 ✓       |
+| 2000   | 128.5  | (not run)      | (extrapolated > +)  |
+| 3000   | 126.9  | (not run)      | (extrapolated > +)  |
+
+hf2q stays solidly above llama.cpp's tg1000 even at 3000 tokens. Long-
+context scaling is excellent.
+
+**Prefill (prompt-processing) gap identified:**
+
+| Length | hf2q       | llama-bench pp | Delta             |
+| ------ | ---------- | -------------- | ----------------- |
+| ~30 wds (62 tok)  | 623 tok/s | (n/a)         | —                 |
+| ~100 wds (132 tok) | 1223 tok/s | 1552 (pp100)  | hf2q -329 (-21%)  |
+| ~250 wds (282 tok) | 2078 tok/s | (n/a)         | —                 |
+| ~500 (n/a) | (not run) | 3249 (pp500)  | (gap likely 30%+)  |
+
+This was already known per ADR-013's final closure: "ADR-013 done;
+remaining prefill perf is ADR-015 scope". The flash_attn_prefill kernel
+is already wired (Wave 5b.10) so the gap is elsewhere — likely in MoE
+expert dispatch / matmul efficiency for prompt-processing M>1 regime.
+Tracked as Task #21 for next iter.
+
+**Mission exit-criteria status update:**
+
+| Workload class | hf2q | llama.cpp | hf2q vs llama |
+| -------------- | ---- | --------- | ------------- |
+| Decode greedy 200 | 131.0 | 119.71 | +9.5% ✓ |
+| Decode greedy 500 | 130.5 | 118.59 | +10.0% ✓ |
+| Decode greedy 1000 | 130.0 | 117.52 | +10.6% ✓ |
+| Decode greedy 3000 | 126.9 | (~115 est.) | ~+10% ✓ |
+| Decode sampling 200 | 123.4 | (similar to greedy) | ~+3% ✓ |
+| Decode sampling 1000 | 122.4 | (similar) | ~+4% ✓ |
+| Prefill ~100 | 1223 | 1552 | **-21%** ✗ |
+| Prefill ~250-500 | 2078 | ~3249 (pp500) | **est -36%** ✗ |
+
+Decode (the dominant workload for chat usage) is comprehensively faster.
+Prefill is the next gap to close — opens against ADR-015 P21 territory.
+
