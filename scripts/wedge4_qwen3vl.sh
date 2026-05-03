@@ -191,8 +191,40 @@ echo "    text GGUF:   $TEXT_GGUF ($(du -h "$TEXT_GGUF" | cut -f1))"
 echo "    mmproj GGUF: $MMPROJ_GGUF ($(du -h "$MMPROJ_GGUF" | cut -f1))"
 
 # ---- Step 4: Verify the GGUF structure (read-only) ----
+#
+# iter-227 fix (2026-05-02): the previous incarnation called
+# `hf2q info --gguf "$MMPROJ_GGUF"` but `hf2q info` does not accept a
+# `--gguf` flag (its arg surface is `--input <safetensors_dir>` /
+# `--repo <hf-repo-id>`; see `src/cli.rs::InfoArgs`). The malformed
+# call was masked by the trailing `|| true` so Step 4 silently no-op'd
+# in every prior run.
+#
+# Replace with a lightweight metadata + tensor-count probe via the
+# Python GGUF parser already shipped in the test env. Falls back to a
+# bytewise magic-string assertion so Step 4 still produces a useful
+# signal even on systems without python3 / `gguf` installed.
 echo "==> Step 4: Verifying mmproj GGUF structure"
-"$HF2Q_BIN" info --gguf "$MMPROJ_GGUF" 2>&1 | head -30 || true
+if command -v python3 >/dev/null 2>&1; then
+    python3 - "$MMPROJ_GGUF" <<'PY' || echo "    (python3 GGUF parse failed — non-fatal)"
+import struct, sys
+path = sys.argv[1]
+with open(path, "rb") as f:
+    magic = f.read(4)
+    if magic != b"GGUF":
+        print(f"    ERROR: bad magic {magic!r} in {path}", file=sys.stderr)
+        sys.exit(1)
+    version = struct.unpack("<I", f.read(4))[0]
+    n_tensors = struct.unpack("<Q", f.read(8))[0]
+    n_kv = struct.unpack("<Q", f.read(8))[0]
+print(f"    GGUF v{version} — {n_tensors} tensors, {n_kv} metadata kvs")
+print(f"    file: {path}")
+PY
+else
+    # Magic-bytes fallback: assert the file is at least a GGUF.
+    head -c 4 "$MMPROJ_GGUF" | grep -q "GGUF" \
+        && echo "    GGUF magic verified (python3 unavailable for full parse)" \
+        || { echo "    ERROR: $MMPROJ_GGUF is not a GGUF file"; exit 4; }
+fi
 
 # ---- Step 5: Live serve smoke test ----
 if [[ $DO_SERVE -eq 0 ]]; then

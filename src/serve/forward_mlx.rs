@@ -317,6 +317,26 @@ pub struct MlxMlpWeights {
     pub down_proj: MlxQWeight,
 }
 
+/// 1-element placeholder allocator helper.
+///
+/// Wedge-4 / iter-227: produces a tiny MlxBuffer that dense-FFN layers can
+/// stash into the `MlxMoeWeights` slot without paying for the GBs of MoE
+/// expert tensors that do not exist on disk. Dtype + shape are arbitrary
+/// (the dense forward path never reads them); F32 with shape `[1]` is the
+/// cheapest valid combination.
+fn alloc_one_f32_placeholder(
+    mlx_device: &mlx_native::MlxDevice,
+    label: &'static str,
+) -> Result<MlxBuffer> {
+    mlx_device
+        .alloc_buffer(
+            std::mem::size_of::<f32>(),
+            mlx_native::DType::F32,
+            vec![1],
+        )
+        .map_err(|e| anyhow::anyhow!("dense MoE placeholder alloc ({label}): {e}"))
+}
+
 /// Per-expert MoE weights for one layer (quantized, GGML block format).
 pub struct MlxMoeWeights {
     /// Stacked gate_up weights: all experts concatenated into `[n_experts, N, packed_K]`.
@@ -346,6 +366,53 @@ pub struct MlxMoeWeights {
     ///   `output = unit_norm(residual) * router_combined_weight`
     /// This replaces the 3-step CPU sequence: unit_norm → scale → mul.
     pub router_combined_weight: MlxBuffer,
+}
+
+impl MlxMoeWeights {
+    /// Construct a placeholder MoE bundle for **dense** layers.
+    ///
+    /// Wedge-4 / iter-227 (2026-05-02): dense GGUFs (e.g.
+    /// `qwen3-vl-2b-q4_0.gguf` from Wedge-4f convert) carry zero MoE
+    /// expert tensors. To keep the per-layer struct (`MlxDecoderLayerWeights`)
+    /// uniform across dense + MoE layers without rippling
+    /// `Vec<Option<MlxMoeWeights>>` through the forward path, we expose
+    /// this constructor: it returns a bundle with `stacked_gate_up: None`
+    /// and `stacked_down: None` plus 1-element placeholder buffers for
+    /// every required field. The dense forward dispatch
+    /// (`MlxModelWeights::forward_decode` / `forward_prefill`) consumes
+    /// `MlxMlpWeights`, never the MoE bundle, so these placeholders are
+    /// inert. The fused-id MoE dispatch already gates on
+    /// `stacked_gate_up.is_some() && stacked_down.is_some()` (see
+    /// `forward_decode` lines ~2863 / ~3922), so a misrouted MoE call
+    /// against a dense-placeholder layer would falsify the `is_some()`
+    /// gate at runtime rather than silently consuming garbage.
+    ///
+    /// Allocation cost is ~16 bytes per layer (vs. GBs of real expert
+    /// tensors), and `top_k` / `moe_intermediate_size` are zeroed so
+    /// any accidental read of them is also visibly wrong.
+    pub fn dense_placeholder(mlx_device: &mlx_native::MlxDevice) -> Result<Self> {
+        let router_proj_buf = alloc_one_f32_placeholder(mlx_device, "router_proj_buf")?;
+        Ok(MlxMoeWeights {
+            stacked_gate_up: None,
+            stacked_down: None,
+            gate_up_expert_stride: 0,
+            down_expert_stride: 0,
+            router_proj: MlxQWeight {
+                buffer: router_proj_buf,
+                info: QuantWeightInfo {
+                    ggml_dtype: mlx_native::GgmlType::F32,
+                    rows: 1,
+                    cols: 1,
+                },
+            },
+            per_expert_scale: alloc_one_f32_placeholder(mlx_device, "per_expert_scale")?,
+            gate_up_ggml_dtype: mlx_native::GgmlType::F32,
+            down_ggml_dtype: mlx_native::GgmlType::F32,
+            top_k: 0,
+            moe_intermediate_size: 0,
+            router_combined_weight: alloc_one_f32_placeholder(mlx_device, "router_combined_weight")?,
+        })
+    }
 }
 
 /// Per-layer norm weights (7 RmsNorm per layer).
@@ -971,71 +1038,131 @@ impl MlxModelWeights {
             };
 
             // -- MoE expert weights (3D tensors, already stacked in GGUF) --
+            //
+            // Wedge-4 / iter-227 (2026-05-02): make the MoE expert load
+            // conditional on tensor presence. Pre-iter-227 the loader
+            // unconditionally required `blk.{i}.ffn_gate_up_exps.weight`
+            // and bailed with `missing blk.0.ffn_gate_up_exps.weight`
+            // when handed a dense GGUF (e.g. the real Qwen3-VL-2B-Instruct
+            // GGUF emitted by `scripts/wedge4_qwen3vl.sh` Step 3, which
+            // is structurally dense — `general.architecture = "qwen3_vl"`
+            // with `ffn_{gate,up,down}.weight` per layer and no expert
+            // tensors).
+            //
+            // Detection rule (deterministic, GGUF-metadata-only — never
+            // filename-based per the iter-227 correctness pin): a layer
+            // is MoE iff BOTH `ffn_gate_up_exps.weight` AND
+            // `ffn_down_exps.weight` tensors are present in the GGUF.
+            // When either is absent we treat the layer as dense and
+            // populate `MlxMoeWeights` with `stacked_{gate_up,down}: None`
+            // plus 1-element placeholder buffers for the `router_*` /
+            // `per_expert_scale` / `router_combined_weight` fields. The
+            // forward dispatch (`forward_decode` lines 2863 / 3922)
+            // already gates fused-id MoE on `stacked_gate_up.is_some()
+            // && stacked_down.is_some()`; the dense MLP path consumes
+            // `MlxMlpWeights` (loaded above unconditionally at lines
+            // 962-971) and never reads the placeholder MoE fields.
+            // Layer mixing (some layers MoE, some dense) is supported
+            // structurally, mirroring llama.cpp's
+            // `LLM_ARCH_QWEN3VLMOE` per-block decision.
             let gu_name = format!("blk.{i}.ffn_gate_up_exps.weight");
-            let gu_info = gguf.tensor_info(&gu_name)
-                .ok_or_else(|| anyhow::anyhow!("missing {gu_name}"))?;
-            let stacked_gate_up_buf = gguf.load_tensor(&gu_name, mlx_device)
-                .map_err(|e| anyhow::anyhow!("load {gu_name}: {e}"))?;
-            let gate_up_expert_stride = stacked_gate_up_buf.byte_len() / cfg.num_experts;
-            let gate_up_ggml_dtype = gu_info.ggml_type;
-
             let dn_name = format!("blk.{i}.ffn_down_exps.weight");
-            let dn_info = gguf.tensor_info(&dn_name)
-                .ok_or_else(|| anyhow::anyhow!("missing {dn_name}"))?;
-            let stacked_down_buf = gguf.load_tensor(&dn_name, mlx_device)
-                .map_err(|e| anyhow::anyhow!("load {dn_name}: {e}"))?;
-            let down_expert_stride = stacked_down_buf.byte_len() / cfg.num_experts;
-            let down_ggml_dtype = dn_info.ggml_type;
+            let gu_info_opt = gguf.tensor_info(&gu_name);
+            let dn_info_opt = gguf.tensor_info(&dn_name);
+            let layer_has_moe_experts = gu_info_opt.is_some() && dn_info_opt.is_some();
 
-            if (i + 1) % 5 == 0 || i == 0 {
-                tracing::debug!("GGUF layer {}/{}: MoE experts loaded (stacked, {:.1} MB + {:.1} MB)",
-                    i + 1, num_layers,
-                    stacked_gate_up_buf.byte_len() as f64 / 1e6,
-                    stacked_down_buf.byte_len() as f64 / 1e6);
-            }
+            let moe = if layer_has_moe_experts {
+                // MoE layer — preserve pre-iter-227 load behavior byte-
+                // identically. The two-clone of `gguf.tensor_info` is
+                // safe; we already established both are Some above.
+                let gu_info = gu_info_opt.unwrap();
+                let stacked_gate_up_buf = gguf.load_tensor(&gu_name, mlx_device)
+                    .map_err(|e| anyhow::anyhow!("load {gu_name}: {e}"))?;
+                let gate_up_expert_stride = stacked_gate_up_buf.byte_len() / cfg.num_experts;
+                let gate_up_ggml_dtype = gu_info.ggml_type;
 
-            // -- Router and scales (F32) --
-            let router_proj = load_gguf_qweight(
-                gguf, &format!("blk.{i}.ffn_gate_inp.weight"), mlx_device,
-            )?;
-            let router_scale = gguf.load_tensor_f32(
-                &format!("blk.{i}.ffn_gate_inp.scale"), mlx_device,
-            ).map_err(|e| anyhow::anyhow!("layer {i} router_scale: {e}"))?;
-            let per_expert_scale = gguf.load_tensor_f32(
-                &format!("blk.{i}.ffn_down_exps.scale"), mlx_device,
-            ).map_err(|e| anyhow::anyhow!("layer {i} per_expert_scale: {e}"))?;
+                let dn_info = dn_info_opt.unwrap();
+                let stacked_down_buf = gguf.load_tensor(&dn_name, mlx_device)
+                    .map_err(|e| anyhow::anyhow!("load {dn_name}: {e}"))?;
+                let down_expert_stride = stacked_down_buf.byte_len() / cfg.num_experts;
+                let down_ggml_dtype = dn_info.ggml_type;
 
-            // Pre-compute router combined weight:
-            //   router_combined_weight[j] = router_scale[j] * (hidden_size ^ -0.5)
-            let router_combined_weight = {
-                let scale_factor = (cfg.hidden_size as f32).powf(-0.5);
-                let rs: &[f32] = router_scale.as_slice()
-                    .map_err(|e| anyhow::anyhow!("router_scale read for combined weight: {e}"))?;
-                let mut combined = mlx_device.alloc_buffer(
-                    cfg.hidden_size * std::mem::size_of::<f32>(),
-                    mlx_native::DType::F32,
-                    vec![cfg.hidden_size],
-                ).map_err(|e| anyhow::anyhow!("router_combined_weight alloc: {e}"))?;
-                let dst: &mut [f32] = combined.as_mut_slice()
-                    .map_err(|e| anyhow::anyhow!("router_combined_weight write: {e}"))?;
-                for j in 0..cfg.hidden_size {
-                    dst[j] = rs[j] * scale_factor;
+                if (i + 1) % 5 == 0 || i == 0 {
+                    tracing::debug!("GGUF layer {}/{}: MoE experts loaded (stacked, {:.1} MB + {:.1} MB)",
+                        i + 1, num_layers,
+                        stacked_gate_up_buf.byte_len() as f64 / 1e6,
+                        stacked_down_buf.byte_len() as f64 / 1e6);
                 }
-                combined
-            };
 
-            let moe = MlxMoeWeights {
-                stacked_gate_up: Some(stacked_gate_up_buf),
-                stacked_down: Some(stacked_down_buf),
-                gate_up_expert_stride: gate_up_expert_stride as u64,
-                down_expert_stride: down_expert_stride as u64,
-                router_proj,
-                per_expert_scale,
-                gate_up_ggml_dtype,
-                down_ggml_dtype,
-                top_k: cfg.top_k_experts,
-                moe_intermediate_size: cfg.moe_intermediate_size,
-                router_combined_weight,
+                // -- Router and scales (F32) --
+                let router_proj = load_gguf_qweight(
+                    gguf, &format!("blk.{i}.ffn_gate_inp.weight"), mlx_device,
+                )?;
+                let router_scale = gguf.load_tensor_f32(
+                    &format!("blk.{i}.ffn_gate_inp.scale"), mlx_device,
+                ).map_err(|e| anyhow::anyhow!("layer {i} router_scale: {e}"))?;
+                let per_expert_scale = gguf.load_tensor_f32(
+                    &format!("blk.{i}.ffn_down_exps.scale"), mlx_device,
+                ).map_err(|e| anyhow::anyhow!("layer {i} per_expert_scale: {e}"))?;
+
+                // Pre-compute router combined weight:
+                //   router_combined_weight[j] = router_scale[j] * (hidden_size ^ -0.5)
+                let router_combined_weight = {
+                    let scale_factor = (cfg.hidden_size as f32).powf(-0.5);
+                    let rs: &[f32] = router_scale.as_slice()
+                        .map_err(|e| anyhow::anyhow!("router_scale read for combined weight: {e}"))?;
+                    let mut combined = mlx_device.alloc_buffer(
+                        cfg.hidden_size * std::mem::size_of::<f32>(),
+                        mlx_native::DType::F32,
+                        vec![cfg.hidden_size],
+                    ).map_err(|e| anyhow::anyhow!("router_combined_weight alloc: {e}"))?;
+                    let dst: &mut [f32] = combined.as_mut_slice()
+                        .map_err(|e| anyhow::anyhow!("router_combined_weight write: {e}"))?;
+                    for j in 0..cfg.hidden_size {
+                        dst[j] = rs[j] * scale_factor;
+                    }
+                    combined
+                };
+
+                MlxMoeWeights {
+                    stacked_gate_up: Some(stacked_gate_up_buf),
+                    stacked_down: Some(stacked_down_buf),
+                    gate_up_expert_stride: gate_up_expert_stride as u64,
+                    down_expert_stride: down_expert_stride as u64,
+                    router_proj,
+                    per_expert_scale,
+                    gate_up_ggml_dtype,
+                    down_ggml_dtype,
+                    top_k: cfg.top_k_experts,
+                    moe_intermediate_size: cfg.moe_intermediate_size,
+                    router_combined_weight,
+                }
+            } else {
+                // Dense layer — produce a placeholder MoE bundle so the
+                // existing per-layer struct (`MlxDecoderLayerWeights`)
+                // stays uniform without a Vec<Option<MoeWeights>>
+                // ripple change. The dense forward path uses
+                // `MlxMlpWeights` (loaded at lines 962-971) and never
+                // reads these placeholder buffers; the fused-id MoE
+                // dispatch already gates on `stacked_gate_up.is_some()
+                // && stacked_down.is_some()` (forward_decode lines
+                // 2863 / 3922) so the placeholders are consulted only
+                // by metadata fields like `top_k` (read but unused on
+                // the dense path). Buffer sizes are 1 element to
+                // minimize wasted allocation; on a 28-layer Qwen3-VL-2B
+                // dense load this adds 28 × ~16 bytes = ~448 bytes
+                // overhead vs. the pre-iter-227 unconditional path
+                // (which would have OOM-allocated GBs of expert
+                // tensors that don't exist on disk).
+                if i == 0 {
+                    tracing::debug!(
+                        "GGUF layer {}/{}: dense FFN detected (no {gu_name} / {dn_name}); \
+                         skipping MoE expert load — using placeholder MoE bundle",
+                        i + 1, num_layers,
+                    );
+                }
+                MlxMoeWeights::dense_placeholder(mlx_device)
+                    .map_err(|e| anyhow::anyhow!("layer {i} MoE placeholder alloc: {e}"))?
             };
 
             // -- Norm weights (all F32) --
@@ -4479,6 +4606,112 @@ mod cosine_tests {
         let py_nb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
         let py = (py_dot / (py_na * py_nb)) as f32;
         assert!((s - py).abs() < 1e-6, "rust cosine={s} vs python-equiv={py}");
+    }
+}
+
+/// Wedge-4 / iter-227 — `MlxMoeWeights::dense_placeholder` invariants.
+///
+/// These tests pin the placeholder constructor's contract at the Rust
+/// type-system level so a future refactor cannot silently re-introduce
+/// the iter-227 dispatch crash. They do NOT exercise GPU kernels — the
+/// constructor is pure CPU + tiny MlxBuffer allocations.
+///
+/// Live-load coverage of the conditional MoE-expert load itself
+/// (skipping `blk.0.ffn_gate_up_exps.weight` when the dense GGUF lacks
+/// it) is covered by the `iter227_*` arch-dispatch tests in
+/// `serve::tests` plus the operator-gated regression test referenced by
+/// `scripts/wedge4_qwen3vl.sh` (the real Qwen3-VL-2B GGUF ships with
+/// dense FFN tensors and surfaces the iter-227 actionable error from
+/// `LoadedModel::load`, not from the per-layer MoE expert loader).
+#[cfg(test)]
+mod dense_placeholder_tests {
+    use super::*;
+
+    /// The dense placeholder bundle MUST report `stacked_gate_up: None`
+    /// AND `stacked_down: None` so the fused-id MoE dispatch's
+    /// `is_some() && is_some()` gate falsifies cleanly. If a future
+    /// refactor accidentally allocates Some(empty_buffer) here, the
+    /// MoE dispatch would walk into 1-element buffers and produce
+    /// garbage logits without panicking — far worse than today's
+    /// "missing tensor" load-time bail.
+    #[test]
+    fn iter227_dense_placeholder_has_no_stacked_expert_buffers() {
+        let device = match mlx_native::MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => {
+                // No Metal device available (e.g. CI without GPU);
+                // skip — the live load path on M5 Max exercises this.
+                eprintln!("skipping iter227_dense_placeholder_has_no_stacked_expert_buffers: no MlxDevice");
+                return;
+            }
+        };
+        let moe = MlxMoeWeights::dense_placeholder(&device)
+            .expect("dense_placeholder allocation must succeed on Metal device");
+        assert!(
+            moe.stacked_gate_up.is_none(),
+            "dense placeholder MUST have stacked_gate_up = None to falsify fused-id MoE gate"
+        );
+        assert!(
+            moe.stacked_down.is_none(),
+            "dense placeholder MUST have stacked_down = None to falsify fused-id MoE gate"
+        );
+    }
+
+    /// Sentinel scalars (`top_k = 0`, `moe_intermediate_size = 0`,
+    /// strides = 0) make any accidental read of the placeholder fields
+    /// visibly wrong instead of producing plausible-looking garbage.
+    #[test]
+    fn iter227_dense_placeholder_zeros_scalar_metadata() {
+        let device = match mlx_native::MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping iter227_dense_placeholder_zeros_scalar_metadata: no MlxDevice");
+                return;
+            }
+        };
+        let moe = MlxMoeWeights::dense_placeholder(&device)
+            .expect("dense_placeholder allocation must succeed on Metal device");
+        assert_eq!(moe.top_k, 0, "dense placeholder must zero top_k");
+        assert_eq!(
+            moe.moe_intermediate_size, 0,
+            "dense placeholder must zero moe_intermediate_size"
+        );
+        assert_eq!(moe.gate_up_expert_stride, 0);
+        assert_eq!(moe.down_expert_stride, 0);
+    }
+
+    /// Allocation cost regression guard: the placeholder bundle must
+    /// stay tiny so a 28-layer Qwen3-VL-2B dense load adds <1 KB total
+    /// MoE-bookkeeping overhead vs. the previous unconditional path
+    /// (which would have OOM-allocated GBs of expert tensors that
+    /// don't exist on disk).
+    #[test]
+    fn iter227_dense_placeholder_buffers_are_one_element_each() {
+        let device = match mlx_native::MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping iter227_dense_placeholder_buffers_are_one_element_each: no MlxDevice");
+                return;
+            }
+        };
+        let moe = MlxMoeWeights::dense_placeholder(&device)
+            .expect("dense_placeholder allocation must succeed on Metal device");
+        // Each placeholder buffer is 1 F32 element = 4 bytes.
+        assert_eq!(
+            moe.per_expert_scale.byte_len(),
+            std::mem::size_of::<f32>(),
+            "per_expert_scale placeholder must be 1 F32 element"
+        );
+        assert_eq!(
+            moe.router_combined_weight.byte_len(),
+            std::mem::size_of::<f32>(),
+            "router_combined_weight placeholder must be 1 F32 element"
+        );
+        assert_eq!(
+            moe.router_proj.buffer.byte_len(),
+            std::mem::size_of::<f32>(),
+            "router_proj placeholder buffer must be 1 F32 element"
+        );
     }
 }
 
