@@ -569,6 +569,123 @@ pub fn patch_embed_forward(
     Ok(out)
 }
 
+/// Variable-resolution patch embedding: rectangular `[3, H, W]` →
+/// `[(H/p) * (W/p), hidden]` row-major.
+///
+/// Sibling to [`patch_embed_forward`] which assumes square
+/// `image_size`. ADR-005 iter-225 (Wedge-4 Phase-2) introduces
+/// variable-resolution Qwen3-VL ViT input where each image's `H` and
+/// `W` are independently aligned to `patch_size * spatial_merge_size`
+/// after smart-resize. The kernel per output element is identical to
+/// the square version — the only difference is the outer iteration
+/// over `(py, px)` ranges over `(H/p, W/p)` separately.
+///
+/// # Output shape
+///
+/// `Vec<f32>` of length `(H/p) * (W/p) * hidden`, row-major
+/// `[(H/p) * (W/p), hidden]` with patches in y-major-then-x order.
+///
+/// # Errors
+///
+/// - `pixel_h % patch_size != 0` or `pixel_w % patch_size != 0`
+/// - `pixel_values.len() != 3 * pixel_h * pixel_w`
+/// - `patch_embd_weight.len() != hidden * 3 * patch_size²`
+/// - `patch_embd_bias.is_some_and(|b| b.len() != hidden)`
+///
+/// Backward-compat note: when `pixel_h == pixel_w == image_size` this
+/// function is byte-exact equivalent to `patch_embed_forward` (same
+/// inner kernel, same float-summation order).
+pub fn patch_embed_forward_hw(
+    pixel_values: &[f32],
+    patch_embd_weight: &[f32],
+    patch_embd_bias: Option<&[f32]>,
+    pixel_h: u32,
+    pixel_w: u32,
+    patch_size: u32,
+    hidden: u32,
+) -> Result<Vec<f32>> {
+    if patch_size == 0 {
+        return Err(anyhow!("patch_size must be > 0"));
+    }
+    if pixel_h % patch_size != 0 {
+        return Err(anyhow!(
+            "pixel_h ({pixel_h}) must be divisible by patch_size ({patch_size})"
+        ));
+    }
+    if pixel_w % patch_size != 0 {
+        return Err(anyhow!(
+            "pixel_w ({pixel_w}) must be divisible by patch_size ({patch_size})"
+        ));
+    }
+    let p = patch_size as usize;
+    let h_dim = hidden as usize;
+    let hw = (pixel_h as usize) * (pixel_w as usize);
+    let expected_pixels = 3 * hw;
+    if pixel_values.len() != expected_pixels {
+        return Err(anyhow!(
+            "pixel_values len {} != expected 3*{pixel_h}*{pixel_w} = {expected_pixels}",
+            pixel_values.len()
+        ));
+    }
+    let expected_w = h_dim * 3 * p * p;
+    if patch_embd_weight.len() != expected_w {
+        return Err(anyhow!(
+            "patch_embd_weight len {} != expected {hidden}*3*{patch_size}*{patch_size} = {expected_w}",
+            patch_embd_weight.len()
+        ));
+    }
+    if let Some(b) = patch_embd_bias {
+        if b.len() != h_dim {
+            return Err(anyhow!(
+                "patch_embd_bias len {} != hidden {hidden}",
+                b.len()
+            ));
+        }
+    }
+
+    let nps_y = (pixel_h / patch_size) as usize;
+    let nps_x = (pixel_w / patch_size) as usize;
+    let num_patches = nps_y * nps_x;
+    let mut out = vec![0f32; num_patches * h_dim];
+
+    let ws_oc = 3 * p * p;
+    let ws_ic = p * p;
+    let ws_y = p;
+
+    let ps_c = hw; // stride between channels (= H * W)
+    let ps_y = pixel_w as usize; // stride between rows within one channel
+
+    for py in 0..nps_y {
+        let y0 = py * p;
+        for px in 0..nps_x {
+            let x0 = px * p;
+            let patch_idx = py * nps_x + px;
+            let out_base = patch_idx * h_dim;
+            for oc in 0..h_dim {
+                let mut acc: f32 = match patch_embd_bias {
+                    Some(b) => b[oc],
+                    None => 0.0,
+                };
+                let w_base = oc * ws_oc;
+                for ic in 0..3usize {
+                    let w_ic_base = w_base + ic * ws_ic;
+                    let p_ic_base = ic * ps_c;
+                    for dy in 0..p {
+                        let w_row_base = w_ic_base + dy * ws_y;
+                        let p_row_base = p_ic_base + (y0 + dy) * ps_y + x0;
+                        for dx in 0..p {
+                            acc += pixel_values[p_row_base + dx]
+                                * patch_embd_weight[w_row_base + dx];
+                        }
+                    }
+                }
+                out[out_base + oc] = acc;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Dense linear layer forward: `y = x @ W.T` (+ optional bias).
 ///
 /// This is the workhorse primitive for every projection in the ViT
