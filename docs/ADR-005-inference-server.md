@@ -8006,3 +8006,65 @@ attractor for chat-template special tokens — neither hf2q nor llama.cpp
 escapes it. Operators get useful output by relying on the default
 auto-thinking path (`--enable-thinking` if the GGUF's chat-template
 supports it, which Qwen3.x's does).
+
+
+---
+
+### Session entry — 2026-05-03 (afternoon): close 19 t/s greedy regression
+### at temp=0, restoring llama.cpp parity
+
+**Mission segment:** /loop autonomous mission "as fast as llama.cpp AND
+deterministic." Context: morning session closed coherence (decode_pool
+reset + intra-CB barrier + repetition-detector tightening + decode_stream
+O(N²)→O(N)). Steady-state on dwq48 was 104 tok/s; 4adf689 (yesterday's
+known-good) ran the same fixture at 122–123 tok/s. The 19 tok/s gap was
+the remaining mission blocker.
+
+**Bisect outcome.** The cause was *two* compounding fixes, neither of
+which was the prefix-strip / decode_stream that the previous session
+suspected:
+
+1. `qwen35_generate_uses_sampling` (mod.rs:1549) checked top_p/top_k/min_p
+   independently of temperature. With CLI defaults (top_p=0.95, top_k=40,
+   min_p=0.05), `--temperature 0` still flipped the gate true and routed
+   through `forward_gpu_last_logits` (~600 KB host download per step) +
+   `sample_qwen35_logits_for_generate`, instead of `forward_gpu_greedy`
+   (4 bytes per step after a GPU argmax kernel). llama.cpp's `--temp 0`
+   semantics are: argmax supersedes top_k/top_p/min_p truncation. Fix
+   reduces the gate to `temp > SAMPLING_EPS || rep_penalty != 1.0`.
+
+2. `cmd_generate_qwen35` had a per-step `if sample_logits { ... } else
+   { ... }` branch *inside* the step_model closure body. `sample_logits`
+   is loop-invariant. Even so, the indirection layer (closure → if/else
+   → method call) and the larger captured-state struct (the closure
+   captured both `args`, `sample_logits`, AND model+kv_cache) measurably
+   regressed the greedy path. Empirically (control test that hit 122 tok/s
+   when the `if sample_logits` was the only thing removed): the cost was
+   ~19 tok/s by itself. Fix monomorphizes the dispatch by pulling the
+   branch outside `run_decode_loop` — there are now two distinct
+   `run_decode_loop` call-sites, one per arm.
+
+Either fix alone recovered ~19 tok/s; both together compose cleanly.
+With both shipped, dwq48 greedy temp=0 hits **123.0–123.4 tok/s vs
+4adf689's 122.8–123.4** across 3 alternating cool-down rounds — at
+parity within measurement noise.
+
+**Determinism.** 5× cold-run check at greedy temp=0 produces
+byte-identical 100-token output (md5 `99692c8abaff1a26e573284611d6efca`,
+400 bytes). Combined with the morning session's intra-CB barrier (commit
+f591a66), the wedding-cake-class forward-pass Heisenbug is closed and
+greedy is byte-deterministic across cold processes.
+
+**`--temperature` defaults remain sampling.** CLI default is `--temperature
+0.8` (matches llama-cli's --temp default). Operators who want
+deterministic output need to pass `--temperature 0` explicitly. Documented
+on `qwen35_generate_uses_sampling`.
+
+**Pre-existing parity test failure (separate item).** `cargo test
+flash_attn_prefill_into_byte_exact_parity_with_wrapper` fails at HEAD
+(45048/262144 F32 elements differ) but PASSES at 4adf689. Suspect
+cause: the f591a66 barrier in `apply_output_head_gpu_into` may have
+shifted timing such that the `_into` variant's encoder reorders against
+the wrapper's discrete commit. Tracked separately; not on the greedy
+decode path. Will land alongside the next ADR-019 phase iter.
+
