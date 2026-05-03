@@ -1949,7 +1949,16 @@ pub fn build_gated_attn_layer(
             .as_deref()
             .map(|s| s.current_len[0] == 0)
             .unwrap_or(false)
-        && !super::dump_bisect::is_enabled();
+        && !super::dump_bisect::is_enabled()
+        // 2026-05-03 — clean off-switch for ADR-019 phase-2 iter89e2-F/G
+        // FA-layer Stage-AB fusion. Set HF2Q_DISABLE_FUSED_STAGE_AB=1 to
+        // bypass the fused path; falls through to the legacy 4-CB FA shape.
+        // Used to confirm the 2026-05-03 forward-pass non-determinism
+        // Heisenbug (5/5 cold-run greedy first-token logits differ on
+        // identical 86-token wedding-cake input) is sourced from this
+        // fusion path. The dump_bisect gate above also disables fusion
+        // but adds dump-side sync points; this gate is fusion-only.
+        && std::env::var("HF2Q_DISABLE_FUSED_STAGE_AB").as_deref() != Ok("1");
 
     // ADR-015 iter86: validate the projections arena's capacity and consume
     // the &mut borrow into a local Option<&FaProjectionsArena> for the
