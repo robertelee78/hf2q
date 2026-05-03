@@ -10,3 +10,4 @@
 pub mod bert;
 pub mod nomic_bert;
 pub mod qwen35;
+pub mod qwen3vl_text;

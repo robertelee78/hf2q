@@ -28,6 +28,7 @@ pub mod state;
 pub mod middleware;
 pub mod engine;
 pub mod engine_qwen35;
+pub mod engine_qwen3vl;
 pub mod grammar;
 pub mod kv_spill_descriptor;
 pub mod registry;
