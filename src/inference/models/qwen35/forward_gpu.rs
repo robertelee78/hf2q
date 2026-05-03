@@ -543,6 +543,11 @@ fn embed_tokens_gpu_with_soft_tokens(
 /// 2. `normed` @ `lm_head^T` → logits             [seq, vocab]
 ///
 /// Returns logits as `Vec<f32>` (downloaded from GPU).
+///
+/// Standalone (non-fused) wrapper — opens its own encoder and issues a
+/// terminal `commit_and_wait`. ADR-019 Phase 1 callers that want to fold
+/// the prior layer's FFN-terminal CB into the same command buffer call
+/// [`apply_output_head_gpu_into`] directly with `caller_enc = Some(...)`.
 fn apply_output_head_gpu(
     device: &MlxDevice,
     registry: &mut KernelRegistry,
@@ -553,56 +558,113 @@ fn apply_output_head_gpu(
     vocab_size: u32,
     eps: f32,
 ) -> Result<Vec<f32>> {
-    // ---- Final RMSNorm ----
-    // ADR-015 iter14: scratch-lift for unretained-refs gate.  Per the
-    // iter13 docstring at `mlx-native/src/encoder.rs:419-444`, every
-    // helper-allocated transient that is dispatched-into and then
-    // dropped before the eventual `commit_and_wait` must be anchored
-    // by the per-decode-token `MlxBufferPool`'s `in_use` ARC clones
-    // when `MLX_UNRETAINED_REFS=1`.  Switching to `pooled_alloc_buffer`
-    // is a no-op under retained refs (the pool's bucket-rounded
-    // allocations are released by `reset_decode_pool` at the next
-    // forward call) but provides the lifecycle anchor needed under
-    // unretained refs.
-    let normed = {
-        let out = super::decode_pool::pooled_alloc_buffer(
-                device,
-                (seq_len * hidden_size) as usize * 4,
-                DType::F32,
-                vec![seq_len as usize, hidden_size as usize],
-            )
-            .map_err(|e| anyhow!("alloc normed: {e}"))?;
-        let mut params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
-            .map_err(|e| anyhow!("alloc norm params: {e}"))?;
-        {
-            let s = params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
-            s[0] = eps;
-            s[1] = hidden_size as f32;
-        }
-        let mut enc = device.command_encoder().context("enc output norm")?;
-        rms_norm::dispatch_rms_norm(
-            &mut enc,
-            registry,
-            device.metal_device(),
-            hidden,
-            &head.norm_w,
-            &out,
-            &params,
-            seq_len,
-            hidden_size,
-        )
-        .context("dispatch_rms_norm output")?;
-        // commit() without wait: lm_head encoder reads `out` immediately after
-        // on the same Metal serial queue; GPU ordering guarantees output_norm
-        // completes before lm_head executes.
-        enc.commit();
-        out
+    apply_output_head_gpu_into(
+        None,
+        device,
+        registry,
+        hidden,
+        head,
+        seq_len,
+        hidden_size,
+        vocab_size,
+        eps,
+    )
+}
+
+/// Caller-driven single-CB output head (RMSNorm + lm_head projection).
+///
+/// ADR-019 Phase 1 — output-head + last-layer fusion (lowest-risk first).
+///
+/// When `caller_enc = Some(enc)`, output_norm and the lm_head projection
+/// are encoded into the caller's command buffer with an intra-CB
+/// `memory_barrier` between them (RAW: lm_head reads `normed`).  The
+/// terminal `commit_and_wait_labeled("output_head.fused_norm_lm_head")`
+/// drains BOTH the output-head dispatches AND any prior dispatches the
+/// caller had encoded into `enc` (the last-layer FFN K-boundary, in the
+/// Phase 1 fusion).  This drops one `commit_and_wait` per prefill
+/// (AC-P5: pp80 sync_count 6 → 5).
+///
+/// When `caller_enc = None`, this opens its own encoder and matches the
+/// pre-Phase-1 2-encoder shape (output_norm `commit()` + lm_head
+/// `commit_and_wait()`) — used by `OutputHeadMode::All` (full-logits
+/// prefill, which currently has no holdable upstream encoder) and by
+/// the diagnostic-fallback path when `forward_gpu_impl` cannot satisfy
+/// the fusion eligibility predicate.
+///
+/// F-fence preservation (per ADR-019 §"Risk Register"):
+/// - F1 (persistent compute encoder per CB): preserved — fusion only
+///   widens the existing CB, the encoder remains persistent within it.
+/// - F2 (iter58b residency-rescission): preserved — `normed` is a
+///   pooled scratch whose Drop runs after the function returns, i.e.
+///   AFTER `commit_and_wait` has drained Metal; pool reset for the
+///   final layer is skipped by the caller when fusion is engaged.
+/// - F6 (output-head argmax CPU read): preserved — terminal
+///   `commit_and_wait` precedes the `download_f32` host read.
+fn apply_output_head_gpu_into(
+    caller_enc: Option<mlx_native::CommandEncoder>,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden: &MlxBuffer,
+    head: &OutputHeadGpu,
+    seq_len: u32,
+    hidden_size: u32,
+    vocab_size: u32,
+    eps: f32,
+) -> Result<Vec<f32>> {
+    // ---- Allocate normed + norm-params (pooled per ADR-015 iter14) ----
+    //
+    // Pooled allocation provides the iter58b lifecycle anchor under
+    // `MLX_UNRETAINED_REFS=1`: the pool's `in_use` ARC keeps these
+    // buffers resident through the eventual `commit_and_wait`.  Both
+    // are released by the next `reset_decode_pool` / `reset_for_prefill_chunk`,
+    // which the caller defers past this function for the fused path.
+    let normed = super::decode_pool::pooled_alloc_buffer(
+        device,
+        (seq_len * hidden_size) as usize * 4,
+        DType::F32,
+        vec![seq_len as usize, hidden_size as usize],
+    )
+    .map_err(|e| anyhow!("alloc normed: {e}"))?;
+    let mut params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
+        .map_err(|e| anyhow!("alloc norm params: {e}"))?;
+    {
+        let s = params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
+        s[0] = eps;
+        s[1] = hidden_size as f32;
+    }
+
+    // ---- Acquire encoder: caller-supplied (fused) or fresh (standalone) ----
+    let fused = caller_enc.is_some();
+    let mut enc = match caller_enc {
+        Some(e) => e,
+        None => device
+            .command_encoder()
+            .context("enc output_head.fused_norm_lm_head")?,
     };
 
-    // ---- LM head projection ----
-    // Use the pre-cast BF16 weight to skip the per-token F32→BF16 cast.
-    // apply_linear_projection_f32 detects DType::BF16 and skips the cast.
-    let mut enc = device.command_encoder().context("enc lm_head")?;
+    // Stage 1: output_norm → normed.
+    rms_norm::dispatch_rms_norm(
+        &mut enc,
+        registry,
+        device.metal_device(),
+        hidden,
+        &head.norm_w,
+        &normed,
+        &params,
+        seq_len,
+        hidden_size,
+    )
+    .context("dispatch_rms_norm output")?;
+    // RAW barrier: lm_head reads `normed` written above. Replaces the
+    // legacy CB boundary (output_norm `enc.commit()` + new lm_head
+    // encoder).  Identical pattern to the decode-greedy single-CB path
+    // at `apply_output_head_gpu_greedy_into` lines 884-916.
+    enc.memory_barrier();
+
+    // Stage 2: lm_head projection → logits_buf (device-allocated, NOT
+    // pooled — see `apply_linear_projection_f32` doc-comment for the
+    // bucket-rounding rationale).  The returned buffer is owned and
+    // outlives the encoder commit below.
     let logits_buf = apply_linear_projection_f32(
         &mut enc,
         registry,
@@ -614,7 +676,17 @@ fn apply_output_head_gpu(
         vocab_size,
     )
     .context("lm_head projection")?;
-    enc.commit_and_wait().context("commit lm_head")?;
+
+    // Terminal commit_and_wait — drains output_head dispatches AND, in
+    // the Phase 1 fusion, the caller's last-layer FFN dispatches.  F6
+    // (output-head host read) preserved — `download_f32` runs after.
+    let label = if fused {
+        "output_head.fused_norm_lm_head_with_layer_ffn"
+    } else {
+        "output_head.fused_norm_lm_head"
+    };
+    enc.commit_and_wait_labeled(label)
+        .context("commit output_head fused norm+lm_head")?;
 
     // Optional: dump output-norm stats to stderr.
     if dump_layer_n().is_some() {
@@ -643,7 +715,13 @@ fn apply_output_head_gpu(
 /// and Qwen3.6's 248k vocab that full buffer is ~4 GB.  This path takes a
 /// zero-copy Metal slice view of the final hidden row and reuses the same
 /// output-head implementation with `seq_len=1`, returning `[vocab]` logits.
+///
+/// ADR-019 Phase 1: when `caller_enc = Some(enc)`, the output-head
+/// dispatches are folded into the caller's still-open command buffer
+/// (the last-layer FFN-terminal CB), saving one `commit_and_wait` per
+/// prefill (AC-P5: pp80 sync_count 6 → 5).
 fn apply_output_head_gpu_last(
+    caller_enc: Option<mlx_native::CommandEncoder>,
     device: &MlxDevice,
     registry: &mut KernelRegistry,
     hidden: &MlxBuffer,
@@ -656,7 +734,8 @@ fn apply_output_head_gpu_last(
     anyhow::ensure!(seq_len > 0, "apply_output_head_gpu_last: empty sequence");
     let byte_offset = ((seq_len as u64 - 1) * hidden_size as u64) * 4;
     let last_hidden = hidden.slice_view(byte_offset, hidden_size as usize);
-    apply_output_head_gpu(
+    apply_output_head_gpu_into(
+        caller_enc,
         device,
         registry,
         &last_hidden,
@@ -2004,6 +2083,48 @@ impl Qwen35Model {
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&k| k >= 1)
             .unwrap_or(8);
+
+        // ADR-019 Phase 1 — output-head + last-layer fusion eligibility.
+        //
+        // When eligible, the LAST layer's MoeQ/DenseQ FFN-terminal CB is
+        // NOT committed at the K-boundary; instead the still-open encoder
+        // is held in `last_layer_held_enc` and threaded into
+        // `apply_output_head_gpu_last` after the layer loop.  The output
+        // head encodes output_norm + lm_head into the same CB and issues
+        // the terminal `commit_and_wait_labeled`, draining both the
+        // last-layer FFN dispatches and the output-head dispatches in a
+        // single GPU sync.  Drops 1 commit_and_wait per prefill (AC-P5:
+        // pp80 sync_count 6 → 5).
+        //
+        // Eligibility criteria (Chesterton's fence preservation):
+        // - prefill (seq_len > 1) — decode goes through `forward_gpu_greedy`.
+        // - `OutputHeadMode::Last` only — `All` returns full per-token
+        //   logits and currently has no last-row hand-off; `EmbedLast`
+        //   skips lm_head entirely (separate Phase 1 follow-up).
+        // - No diagnostic env active: `HF2Q_DUMP_LAYER_N` /
+        //   `HF2Q_DUMP_LAYER_ACTIVATIONS` / `dump_bisect` would read
+        //   `as_slice` mid-flight on the held encoder.  ADR-012 P9b
+        //   `capture` and `hidden_out` likewise download `hidden` AFTER
+        //   the FFN commit — fusion holds them OPEN, so we fall back.
+        // - Deepstack: only injects on layers `il < n_deepstack`; the
+        //   last layer is past `n_deepstack` for every Qwen3-VL config
+        //   shipped to date, but we still gate per-call to be safe.
+        //
+        // FFN-arm gate (only MoeQ/DenseQ keep the encoder live; F32-MoE
+        // and F32-Dense build their own encoder + commit internally) is
+        // enforced inline at the K-boundary commit sites below.
+        let phase1_fusion_env_eligible = seq_len > 1
+            && matches!(output_head_mode, OutputHeadMode::Last)
+            && capture.is_none()
+            && hidden_out.is_none()
+            && dump_layer_n().is_none()
+            && dump_layer_activations_prefix().is_none()
+            && !super::dump_bisect::is_enabled()
+            && deepstack
+                .map(|ds| n_layers > ds.chunks.len())
+                .unwrap_or(true);
+        let mut last_layer_held_enc: Option<mlx_native::CommandEncoder> = None;
+
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
             // K-boundary: last layer in the window OR final layer overall.
             // At K=1 every layer is a boundary (= current behaviour).
@@ -2497,10 +2618,23 @@ impl Qwen35Model {
                         if seq_len == 1 {
                             enc.commit();
                         } else if is_k_boundary {
-                            enc.commit_and_wait_labeled("layer.dense_ffn")
-                                .with_context(|| {
-                                    format!("commit fused-DenseQ layer {layer_idx}")
-                                })?;
+                            // ADR-019 Phase 1: hold the LAST layer's
+                            // FFN-terminal encoder open (skip commit_and_wait)
+                            // so the output head can fold its dispatches into
+                            // the same CB.  Fusion eligibility checked once
+                            // before the loop; FFN-arm guard (MoeQ/DenseQ)
+                            // satisfied here trivially.  Pool reset for the
+                            // last layer is also skipped below.
+                            if phase1_fusion_env_eligible
+                                && (layer_idx + 1) == n_layers
+                            {
+                                last_layer_held_enc = Some(enc);
+                            } else {
+                                enc.commit_and_wait_labeled("layer.dense_ffn")
+                                    .with_context(|| {
+                                        format!("commit fused-DenseQ layer {layer_idx}")
+                                    })?;
+                            }
                         } else {
                             // ADR-013 P20: K-batched FFN terminal — commit
                             // without waiting. The next K-boundary's
@@ -2604,10 +2738,17 @@ impl Qwen35Model {
                     if seq_len == 1 {
                         enc.commit();
                     } else if is_k_boundary {
-                        enc.commit_and_wait_labeled("layer.moe_ffn")
-                            .with_context(|| {
-                                format!("commit fused-MoeQ layer {layer_idx}")
-                            })?;
+                        // ADR-019 Phase 1: see DenseQ fusion comment above.
+                        if phase1_fusion_env_eligible
+                            && (layer_idx + 1) == n_layers
+                        {
+                            last_layer_held_enc = Some(enc);
+                        } else {
+                            enc.commit_and_wait_labeled("layer.moe_ffn")
+                                .with_context(|| {
+                                    format!("commit fused-MoeQ layer {layer_idx}")
+                                })?;
+                        }
                     } else {
                         // ADR-013 P20: K-batched FFN terminal — commit
                         // without waiting. The next K-boundary's
@@ -2848,8 +2989,20 @@ impl Qwen35Model {
             // for the K-window stay in `in_use` until the K-boundary's
             // commit_and_wait drains all in-flight CBs, then the reset moves
             // them all back to the free list at once.
+            //
+            // ADR-019 Phase 1: when this layer's encoder is being HELD for
+            // fusion with the output head (last layer + eligibility), the
+            // K-boundary commit_and_wait has NOT happened yet — pool reset
+            // would move still-GPU-referenced scratches to the free list and
+            // re-trip the iter58b residency-rescission failure mode (F2/F7).
+            // The output head's terminal commit_and_wait drains them; the
+            // next forward call's `reset_decode_pool` (decode) or
+            // `reset_for_prefill_chunk` (next prefill chunk) reclaims the
+            // pool — one prefill of held scratches is below the W-5b.14
+            // 33 GB residency-quota ceiling for production fixtures.
             if seq_len > 1
                 && is_k_boundary
+                && last_layer_held_enc.is_none()
                 && std::env::var("HF2Q_DENSE_Q_ARENA_RESET").as_deref() != Ok("0")
             {
                 super::decode_pool::reset_for_prefill_chunk();
@@ -2899,6 +3052,24 @@ impl Qwen35Model {
         } else {
             None
         };
+        // ADR-019 Phase 1 defense: eligibility above gates on
+        // `OutputHeadMode::Last`, so the held encoder can only ever be
+        // Some when we are about to run the Last arm.  If a future
+        // refactor relaxes the eligibility predicate without updating
+        // every output-head arm to consume the held encoder, drain it
+        // here rather than dropping uncommitted (which would leak a
+        // CB and silently re-trip F2 if any pooled scratch is reused).
+        debug_assert!(
+            last_layer_held_enc.is_none()
+                || matches!(output_head_mode, OutputHeadMode::Last),
+            "ADR-019 Phase 1: held encoder requires OutputHeadMode::Last"
+        );
+        if !matches!(output_head_mode, OutputHeadMode::Last) {
+            if let Some(mut enc) = last_layer_held_enc.take() {
+                enc.commit_and_wait_labeled("layer.last.fusion_fallback")
+                    .context("commit fallback for held last-layer encoder")?;
+            }
+        }
         let logits = match output_head_mode {
             OutputHeadMode::All => apply_output_head_gpu(
                 &device,
@@ -2912,6 +3083,7 @@ impl Qwen35Model {
             )
             .context("apply_output_head_gpu")?,
             OutputHeadMode::Last => apply_output_head_gpu_last(
+                last_layer_held_enc.take(),
                 &device,
                 &mut registry,
                 &hidden,
