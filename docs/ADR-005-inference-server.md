@@ -8130,3 +8130,52 @@ a different parallel-Metal-contention manifestation (probably another
 test's encoder racing with this test's commit). NOT a coherence regression
 in the production code path. Tracked but not blocking the mission.
 
+
+---
+
+### Session entry — 2026-05-03 (afternoon, third iter): sampling-mode perf
+### gap closed from 74 → 101.7 tok/s (+37%)
+
+Default `--temperature 0.8` (sampling) was 74 tok/s vs greedy 122 tok/s
+on the same fixture. Two surgical fixes on `serve/sampler_pure.rs`:
+
+1. **`O(V log V)` full sort → `O(V)` partial select.** Pre-fix
+   `sample_token` did a full descending sort of all 248044 vocab
+   entries before truncating to top_k=40 — that's 4.5M f32 comparisons
+   per step. Replaced with `select_nth_unstable_by` (O(V) average) +
+   small O(K log K) sort of the top-k subset. Mirrors llama.cpp's
+   `llama_sampler_top_k_impl` which uses `std::nth_element` for the
+   same reason.
+
+2. **Thread-local scratch Vec + drop is_finite filter.**
+   `Vec<(usize, f32)>` of 248K entries (~3 MB) was allocated fresh
+   per step. Replaced with `thread_local! SAMPLE_INDEXED_SCRATCH`
+   that grows to the high-water vocab and stays resident.
+   `is_finite` filter dropped — NaNs are rare and the downstream
+   `partial_cmp().unwrap_or(Equal)` already handles them.
+
+Empirical chain (qwen3.6-35B-A3B-dwq48 / recipe / 200 tok / temp=0.8):
+
+| State                                      | Mean tok/s   |
+| ------------------------------------------ | ------------ |
+| Pre-fix (1602511 / before this iter)       | **74.2**     |
+| After O(V) partial select                  | 100.7-100.9  |
+| After thread-local scratch + filter drop   | **101.5-101.9** |
+
+Greedy temp=0 unchanged at 123.5 tok/s. Determinism unaffected (greedy
+path is unchanged; only sampling-chain ordering touched). All 6 sampler
+unit tests pass.
+
+**Remaining sampling-vs-greedy gap (~21 tok/s):** the GPU-side delta is
+dominant — `forward_gpu_last_logits` downloads ~1 MB of full vocab
+F32 logits per step (`apply_output_head_gpu_into` returns a Vec<f32>
+of size `vocab_size`). Greedy uses `forward_gpu_greedy` which fuses
+GPU argmax + 4-byte download. Closing this requires a GPU top-k
+kernel (returns top-K indices+values instead of full vocab). Out of
+scope for this iter.
+
+**Other ADR work verified non-regressed.** Full singleton test suite
+passes 2784/2784 (`cargo test --release --bin hf2q -- --test-threads=1`).
+ADR-013/015/017/019 territories (Qwen35 inference, mlx-native single-CB,
+persistent block prefix cache, encoder architecture) all green.
+
