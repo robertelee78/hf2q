@@ -7669,3 +7669,64 @@ Synthetic-test passing (tolerance-based assertion: `BF16_GPU_ATOL=5e-3`, `BF16_G
 1. **Audit other i32-multiplication patterns in mlx-native shaders.**  Phase A §5.1 recommended a broader sweep via `grep -nE "(int|long).*\*.*[A-Za-z_]+_stride" src/shaders/flash_attn_prefill*.metal`.  This Phase B fix addresses the two flagged sites; future waves may want to widen all `int * stride` patterns to `int64_t` defensively, since shaders that currently fit can become bug-prone if any future model uses larger seq_len.
 2. **Eventual E2E pp65536 capstone run.**  When idle GPU time is available and there is no concurrent ADR-014/ADR-015 work, run `serve` + `HF2Q_BATCHED_PREFILL=1` + 65536-token prompt against Gemma-4 26B DWQ, capture `first_decode_token`, and update `project_long_prefill_parity_inverts.md` with the post-fix observation.  Expected: `first_decode_token = 30852` (matching the smaller-shape baseline) and a substantial wall-clock improvement at pp65536.
 3. **Update `project_long_prefill_parity_inverts.md`.**  Once #2 lands, the brain memory should record the post-fix parity numbers and CLOSE the `first_decode_token = 0 (potential silent corruption)` note.
+
+### 2026-05-03 — chat-template / tokenize parity verified; user-reported "broken inference" localized
+
+**Trigger.** User report: `./hf2q generate ... wedding-cake prompt --no-thinking`
+produced `<|im_start|<|im_start|...` repetition, then `--max-tokens 20000`
+produced coherent thinking and hard-aborted with `zsh: abort`. User strong-suspect:
+"something is broken in how we do the chat template vs how llama.cpp does it".
+
+**Test harnesses landed** in `scripts/coherence-harness/` (commit `982594f`):
+* `render_parity.sh` — hf2q render vs llama.cpp jinja render, byte-compare.
+* `extract_template.py` — pure-Python GGUF KV walker for the chat-template.
+* `logits_parity.sh` — first-token logit dump from both stacks.
+* `coherence_bench.sh` — side-by-side decode + tok/s on the same rendered prompt.
+
+**Hypothesis 1 — chat template render diverges. FALSIFIED.** `render_parity.sh`
+on 3 prompts × 2 modes (thinking/no-thinking) against
+`qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq48`:
+
+```
+hf2q     bytes=77   sha256=d910a692…
+llama.cpp bytes=77  sha256=d910a692…
+RENDER PARITY: PASS
+```
+
+Same for the 319-byte (`enable_thinking`) and 330-byte (`no-thinking`) wedding-cake renders.
+
+**Hypothesis 2 — tokenization diverges. FALSIFIED.** Initial run of
+`scripts/qwen35_tokenizer_parity.sh` reported FAIL on all 3 fixtures, but
+inspection showed the script was strict-comparing
+`hf2q_tokens` vs `llama_tokens_with_BOS_stripped`. Premise stale: ADR-015
+iter42 (`0122100`, 2026-04-29) added `add_bos_token` honour to Gemma; the
+qwen35 path's `tokenize_rendered_prompt_llama_style`
+(`src/serve/mod.rs:627`) explicitly prepends BOS via
+`resolve_token_id(...)` falling back to
+`llama_cpp_special_token_id_for_model("gpt2", ...)` → 11 (mirrors
+`llama-vocab.cpp:1838-1839` GPT-2 default `special_bos_id = 11`). The GGUF
+in question carries no `tokenizer.ggml.bos_token_id` metadata, so both
+sides hit the GPT-2 default. Script fixed to compare both with-BOS
+streams; PARITY PASS now reports byte-identical IDs across all 3 fixtures.
+
+**Hypothesis 3 — `--no-thinking` is hf2q-broken. FALSIFIED.** Running
+`llama-completion` (build `b9010-d05fe1d7d`) on the *exact* hf2q-rendered
+no-thinking prompt for the wedding-cake input produces the same
+`<|im_start|>assistant`-loop garbage as hf2q. The empty-`<think>\n\n</think>\n\n`
+suppressor block is a model-level failure mode for this dwq48 fixture on
+this prompt, not an hf2q regression.
+
+**Residual real bugs (open).**
+1. **SIGABRT inside mlx-native** at `--max-tokens 20000` — exit 134 with
+   no Rust panic message in stderr, abort comes from below the FFI
+   boundary. Reproducer: wedding-cake prompt, default sampling, run for
+   ~2k tokens of generation.
+2. **Run-to-run flakiness** with default sampling on the wedding-cake
+   prompt — 3-run test produced coherent / degenerate-`<|im_start|>` /
+   coherent. Sampler chain is correct (per c18eccf unit tests); the
+   degenerate runs are model + sampling-seed paths the model genuinely
+   can't escape.
+3. **Variable tok/s** — same prompt yields 65–130 t/s across runs.
+   Possible perf regression vs prior 120 t/s baseline.
+
+**No production-code change in this entry.** Findings + harness only.
