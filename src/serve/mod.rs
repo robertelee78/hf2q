@@ -2303,14 +2303,20 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
             |prev_token, pos, generated_tokens| -> Result<u32> {
                 let decode_positions = vec![pos; 4];
                 let _t_step = step_profile_enabled.then(std::time::Instant::now);
+                let _t_fwd = step_profile_enabled.then(std::time::Instant::now);
                 let mut logits = model
                     .forward_gpu_last_logits(&[prev_token], &decode_positions, &mut kv_cache)
                     .with_context(|| format!("forward_gpu_last_logits decode at pos {pos}"))?;
+                let fwd_us = _t_fwd.map(|t| t.elapsed().as_micros());
+                let _t_smp = step_profile_enabled.then(std::time::Instant::now);
                 let next = sample_qwen35_logits_for_generate(&mut logits, &args, generated_tokens);
+                let smp_us = _t_smp.map(|t| t.elapsed().as_micros());
                 if let Some(t) = _t_step {
                     eprintln!(
-                        "[STEP_PROFILE] pos={pos} total={:.2}ms",
-                        t.elapsed().as_micros() as f64 / 1000.0
+                        "[STEP_PROFILE] pos={pos} total={:.2}ms fwd={:.2}ms smp={:.2}ms",
+                        t.elapsed().as_micros() as f64 / 1000.0,
+                        fwd_us.unwrap_or(0) as f64 / 1000.0,
+                        smp_us.unwrap_or(0) as f64 / 1000.0,
                     );
                 }
                 Ok(next)
