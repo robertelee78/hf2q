@@ -582,3 +582,228 @@ fn qwen3vl_streaming_e2e_real_with_tools() {
         panic!("Wedge-4e tools[] check failed: {reason}");
     }
 }
+
+/// FORCED-tool-call live assertion (Wedge-4f Codex finding #4 follow-up,
+/// closes the ⚠ caveat to ✅): same operator-gated harness as
+/// `qwen3vl_streaming_e2e_real_with_tools` BUT uses the OpenAI
+/// `tool_choice: {type: "function", function: {name: "..."}}`
+/// FORCED-function semantic that the model cannot decline. Per
+/// `/opt/hf2q/src/serve/api/handlers.rs:1112-1115`, this physically
+/// constrains the sampler-side grammar to only emit a tool_call for
+/// the named function — text-content fallback is grammatically
+/// impossible. We assert that a tool_call WAS emitted (not just
+/// well-formed-if-emitted), and that its `function.name` matches the
+/// forced name + its `function.arguments` parse as JSON object with
+/// the required parameter present.
+#[test]
+#[ignore = "operator-gated; run with HF2Q_QWEN3VL_E2E=1 and a real Qwen3-VL GGUF + mmproj"]
+fn qwen3vl_streaming_e2e_real_with_tools_forced_function() {
+    if std::env::var(ENV_GATE).ok().as_deref() != Some("1") {
+        return;
+    }
+    let gguf_path = std::env::var(ENV_GGUF)
+        .unwrap_or_else(|_| panic!("{ENV_GGUF} must be set when {ENV_GATE}=1"));
+    let mmproj_path = std::env::var(ENV_MMPROJ)
+        .unwrap_or_else(|_| panic!("{ENV_MMPROJ} must be set when {ENV_GATE}=1"));
+
+    let fixture = fixture_path();
+    materialize_fixture_image(&fixture).expect("materialize fixture image");
+
+    let bin = env!("CARGO_BIN_EXE_hf2q");
+    // Distinct port from the auto-tools test so they can run in parallel.
+    let port: u16 = 18763;
+    let mut child = std::process::Command::new(bin)
+        .args([
+            "serve",
+            "--model",
+            &gguf_path,
+            "--mmproj",
+            &mmproj_path,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ])
+        .spawn()
+        .expect("spawn hf2q serve");
+
+    let server_url = format!("http://127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("reqwest client");
+    loop {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("hf2q serve /readyz did not flip to 200 within 180s");
+        }
+        match client.get(format!("{server_url}/readyz")).send() {
+            Ok(r) if r.status().is_success() => break,
+            _ => std::thread::sleep(Duration::from_millis(500)),
+        }
+    }
+
+    let model_id = {
+        let r = client
+            .get(format!("{server_url}/v1/models"))
+            .send()
+            .expect("GET /v1/models");
+        let body: serde_json::Value = r.json().expect("parse models response");
+        body["data"][0]["id"]
+            .as_str()
+            .expect("models[0].id is a string")
+            .to_string()
+    };
+
+    let img_bytes = std::fs::read(&fixture).expect("read fixture image");
+    let img_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        &img_bytes,
+    );
+    let data_uri = format!("data:image/png;base64,{img_b64}");
+
+    const FORCED_NAME: &str = "describe_image_region";
+
+    let req_body = serde_json::json!({
+        "model": model_id,
+        "temperature": 0.0,
+        "max_tokens": 120,
+        "stream": true,
+        // OpenAI FORCED-function tool_choice: server-side grammar
+        // physically constrains output to a tool_call for THIS name.
+        // Text-content fallback is grammatically impossible per
+        // handlers.rs:1112-1115's grammar-compile gate.
+        "tool_choice": {"type": "function", "function": {"name": FORCED_NAME}},
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": FORCED_NAME,
+                "description": "Describe a sub-region of the most recently shown image.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "region": {
+                            "type": "string",
+                            "description": "Which part of the image to describe (e.g., 'top-left')."
+                        }
+                    },
+                    "required": ["region"]
+                }
+            }
+        }],
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe the top-left of this image."},
+                {"type": "image_url", "image_url": {"url": data_uri}}
+            ]
+        }]
+    });
+
+    let resp = client
+        .post(format!("{server_url}/v1/chat/completions"))
+        .header("Content-Type", "application/json")
+        .json(&req_body)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .expect("POST chat-completions stream=true tool_choice=forced");
+    let status = resp.status();
+    let body_text = resp.text().expect("read SSE body");
+
+    let mut assert_and_kill = |cond: bool, msg: String| {
+        if !cond {
+            let _ = child.kill();
+            panic!("{msg}\nresponse body: {body_text}");
+        }
+    };
+    assert_and_kill(
+        status.is_success(),
+        format!("expected 2xx, got {status}"),
+    );
+
+    // Collect tool_call deltas — we EXPECT one (the model cannot
+    // decline under forced function tool_choice).
+    let mut tool_args_concat = String::new();
+    let mut tool_name_seen: Option<String> = None;
+    let mut saw_done = false;
+    for line in body_text.lines() {
+        if let Some(rest) = line.strip_prefix("data: ") {
+            if rest == "[DONE]" {
+                saw_done = true;
+                continue;
+            }
+            let v: serde_json::Value = match serde_json::from_str(rest) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let Some(tcs) = v["choices"][0]["delta"]["tool_calls"].as_array() {
+                for tc in tcs {
+                    if let Some(name) = tc["function"]["name"].as_str() {
+                        if !name.is_empty() {
+                            tool_name_seen = Some(name.to_string());
+                        }
+                    }
+                    if let Some(args) = tc["function"]["arguments"].as_str() {
+                        tool_args_concat.push_str(args);
+                    }
+                }
+            }
+        }
+    }
+    assert_and_kill(
+        saw_done,
+        "SSE stream did not terminate with `data: [DONE]`".to_string(),
+    );
+
+    // FORCED-function pin: a tool_call MUST have been emitted (the
+    // grammar-constrained sampler cannot produce text content).
+    let tool_check_result: Result<(), String> = (|| {
+        let name = tool_name_seen
+            .as_deref()
+            .ok_or_else(|| {
+                "FORCED-function tool_choice produced NO tool_call delta — \
+                 the grammar gate at handlers.rs:1112-1115 should have \
+                 physically prevented text-content fallback. Either the \
+                 grammar compile failed silently OR the server didn't \
+                 honor the forced name.".to_string()
+            })?;
+        if name != FORCED_NAME {
+            return Err(format!(
+                "FORCED-function tool_choice asked for {FORCED_NAME:?} but \
+                 server emitted tool_call for {name:?}"
+            ));
+        }
+        if tool_args_concat.is_empty() {
+            return Err(
+                "FORCED-function emitted tool_call but arguments were empty"
+                    .to_string(),
+            );
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&tool_args_concat)
+            .map_err(|e| {
+                format!(
+                    "FORCED-function tool_call arguments did not parse \
+                     as JSON: {e}\nargs: {tool_args_concat:?}"
+                )
+            })?;
+        let obj = parsed.as_object().ok_or_else(|| {
+            format!("FORCED-function arguments parsed but not an object: {parsed}")
+        })?;
+        if !obj.contains_key("region") {
+            return Err(format!(
+                "FORCED-function arguments missing required `region` key: {parsed}"
+            ));
+        }
+        eprintln!(
+            "Wedge-4f finding-#4 closure: FORCED-function tool_call OK \
+             name={name} args={tool_args_concat}"
+        );
+        Ok(())
+    })();
+
+    let _ = child.kill();
+    if let Err(reason) = tool_check_result {
+        panic!("FORCED-tool-call check failed: {reason}");
+    }
+}
