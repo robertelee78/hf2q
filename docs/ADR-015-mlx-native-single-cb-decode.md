@@ -6444,3 +6444,47 @@ gap.
 - `tests/coherence_smoke.rs`, `tests/coherence_matrix.rs` — harness impl.
 - `scripts/coherence_and_speed_regression.sh` — combined gate driver.
 - `tests/perf_baseline.json` — per-cell ratio floors (re-capture pending iter40).
+
+---
+
+## 2026-05-03 — R1 (missing barrier = silent corruption) MANIFESTED in ADR-019 Phase 1; closed at hf2q@f591a66
+
+The Open Risk **R1** ("Barrier correctness: single-CB requires every
+cross-stage dependency expressed as `enc.memory_barrier()`. A missed
+barrier = silent corruption.") manifested as a real bug in ADR-019
+Phase 1 (output-head + last-layer FFN fusion at hf2q@8012e63):
+`apply_output_head_gpu_into`'s caller_enc hand-off was missing the
+intra-CB RAW barrier between the prior layer's
+`dispatch_fused_residual_norm_f32` (writes `hidden`) and this
+function's first `dispatch_rms_norm` (reads `hidden`). On the
+qwen3.6-35B-A3B-dwq48 wedding-cake prompt the unbarriered race
+flipped argmax 1/5 cold runs and produced 13-unit logit spread
+across runs.
+
+R1's stated mitigation was "P4 bit-exact parity gate is mandatory
+[plus] spot-check with `mlx_native::ops::memory_barrier` debug
+logging during P3." The P4 gate was AC-PA2 5×-cold byte-identical
+decode parity (run on 27B-dwq46 / 35B-A3B q4_0-flat with a
+DIFFERENT prompt). It missed this site because the alternative
+fixture happened to produce the same argmax through the unordered
+race, so byte-identical-decoded-tokens still passed. The gap
+between R1's stated mitigation and the actual harness was a
+single-fixture coverage hole.
+
+Fix at hf2q@f591a66: ONE line `if fused { enc.memory_barrier(); }`
+inserted between encoder hand-off and the first rms_norm dispatch
+in `apply_output_head_gpu_into`.
+
+Empirical guard — `scripts/coherence-harness/determinism_check.sh`
+(committed at hf2q@c35fa78) runs hf2q 5× cold-process and asserts
+byte-identical first-token logit-tuple. PASSES post-fix on
+qwen3.6-35B-A3B-dwq48 across two prompts × two thinking modes;
+FAILS pre-fix on the wedding-cake-thinking case. This harness is
+the canonical R1 detector going forward.
+
+ADR-019 has the full root-cause + fence audit + AC-PA2 follow-up
+recommendations; cross-reference there.
+
+The standing coherence_smoke gate (`cargo test --test coherence_smoke
+--release`) PASSES at HEAD post-fix (2/2 tests, 86s budget).
+
