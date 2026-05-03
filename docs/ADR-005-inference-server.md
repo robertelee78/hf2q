@@ -8068,3 +8068,20 @@ shifted timing such that the `_into` variant's encoder reorders against
 the wrapper's discrete commit. Tracked separately; not on the greedy
 decode path. Will land alongside the next ADR-019 phase iter.
 
+
+**Cross-check vs llama.cpp (mission exit-criteria gate).**
+
+Same fixture (qwen3.6-35B-A3B-dwq48, M5 Max, Metal):
+
+| Engine          | Workload      | Mean t/s      |
+| --------------- | ------------- | ------------- |
+| llama.cpp `tg200` (llama-bench, ngl=999) | 200-tok greedy generation | **119.41 ± 0.43** |
+| hf2q greedy temp=0 (recipe prompt, 200 tok) | 200-tok greedy generation | **123.0–123.4** |
+| hf2q greedy temp=0 (moonwalk prompt, 80 tok) | 80-tok greedy generation | **125.6–125.9** |
+
+hf2q is **~3–6 t/s faster** than llama-bench's Metal tg200 number on the
+same model + hardware. With determinism preserved (5/5 byte-identical at
+temp=0) and outputs coherent (recipe text matches the format/quality of
+4adf689 and llama.cpp), the user's exit criteria — "as coherent as
+llama.cpp AND as fast as (or faster than) llama.cpp AND deterministic" —
+is met for greedy decode on this fixture.
