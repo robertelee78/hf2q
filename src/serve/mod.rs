@@ -1472,6 +1472,7 @@ const SPECIAL_TOKEN_STOPS: &[&str] = &[
 /// only (NOT the prompt). The prompt typically contains `<|im_start|>` /
 /// `<|im_end|>` chat-template markers; scanning those would short-circuit
 /// generation immediately on every model.
+#[allow(dead_code)] // production callers route via qwen35_visible_generated_prefix → special_token_safe_prefix; helper retained for unit tests.
 fn find_special_token_stop(generated_text: &str) -> Option<&'static str> {
     find_special_token_stop_pos(generated_text).map(|(_, marker)| marker)
 }
@@ -1529,6 +1530,34 @@ fn trim_generated_assistant_role_prefix(mut text: &str) -> &str {
 fn qwen35_visible_generated_prefix(generated_text: &str) -> (String, Option<&'static str>) {
     let (safe_raw, stop_marker) = special_token_safe_prefix(generated_text);
 
+    // 2026-05-03 — hot-path fast-paths.
+    //
+    // Without these short-circuits, the per-decode-step body in
+    // `run_decode_loop` runs ~5 O(N) scans (`rfind`, two `.find()` calls,
+    // `.replace()`, plus `trim_generated_assistant_role_prefix`) and 2
+    // String allocations on a cumulative text that grows with every token.
+    // Empirical bench (qwen3.6-35B-A3B-dwq48 greedy 200 tok, recipe
+    // prompt) showed ~25 t/s regression vs commit 4adf689 (which used the
+    // cheaper `find_special_token_stop` per step). The strip is only
+    // load-bearing when the cumulative text contains a `<|im_start|>`
+    // marker — which only happens at the chat-template boundary or if the
+    // model emits a literal special-token bytestream as a hallucination.
+    //
+    // The fast paths preserve byte-equivalent output:
+    //   • no '<' anywhere   → no special token possible; return safe_raw.
+    //   • '<' but no `<|im_start|>` literal → only the leading role-prefix
+    //     trim is meaningful (trim_generated_assistant_role_prefix is a
+    //     small constant-bounded loop). The two `.find()` markers and
+    //     `.replace("<|im_start|>", "")` are no-ops in this case.
+    if safe_raw.find('<').is_none() {
+        return (safe_raw.to_string(), stop_marker);
+    }
+    if !safe_raw.contains("<|im_start|>") {
+        let trimmed = trim_generated_assistant_role_prefix(safe_raw);
+        return (trimmed.to_string(), stop_marker);
+    }
+
+    // SLOW PATH: contains `<|im_start|>`. Run the full strip pipeline.
     let mut visible = if let Some(pos) = safe_raw.rfind("<|im_start|>assistant") {
         let rest = &safe_raw[pos + "<|im_start|>assistant".len()..];
         trim_generated_assistant_role_prefix(rest).to_string()
@@ -1546,11 +1575,26 @@ fn qwen35_visible_generated_prefix(generated_text: &str) -> (String, Option<&'st
     (visible, stop_marker)
 }
 
+/// Decide whether the qwen3.5 generate-CLI loop needs the sampler-path
+/// (forward_gpu_last_logits + sample_qwen35_logits_for_generate) or can take
+/// the GPU-argmax fast-path (forward_gpu_greedy).
+///
+/// Mirrors llama.cpp's `--temp 0` semantics: when temperature is at or below
+/// the deterministic floor, the argmax of the unwarped logits is the output —
+/// top_k / top_p / min_p truncation is a no-op against an argmax-of-1. The
+/// sampler-path is only needed when temperature scales the distribution OR
+/// when repetition_penalty re-weights it (rep_penalty modifies logits before
+/// argmax, so it cannot ride the GPU argmax fast-path).
+///
+/// Pre-2026-05-03 this returned `true` whenever any of top_k/top_p/min_p were
+/// at their non-disabled defaults (40 / 0.95 / 0.05) regardless of temperature.
+/// That meant `--temperature 0` still routed through the slower sampler path
+/// (forward_gpu_last_logits downloads ~600KB of vocab logits to host;
+/// forward_gpu_greedy returns 4 bytes after a GPU argmax kernel). On
+/// qwen3.6-35B-A3B-dwq48 that cost ~19 tok/s vs the truly-greedy path at
+/// 122 tok/s — the regression that matched 4adf689's pre-CLI-sampling perf.
 fn qwen35_generate_uses_sampling(args: &cli::GenerateArgs) -> bool {
     args.temperature > crate::serve::sampler_pure::SAMPLING_EPS
-        || args.top_k > 0
-        || args.top_p < 1.0
-        || args.min_p > 0.0
         || args.repetition_penalty != 1.0
 }
 
@@ -2186,82 +2230,122 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     let decode_start = std::time::Instant::now();
     let step_profile_enabled = std::env::var("HF2Q_STEP_PROFILE").is_ok();
 
-    // 2026-05-03 — replace the O(N²) cumulative-decode pattern (every step
-    // re-decoded the full token list, costing ~1ms / 1k tokens / step → 3.3M
-    // token-decodes for a 1832-token run) with a stateful HuggingFace
-    // `decode_stream` that yields O(1) bytes per token while preserving
-    // UTF-8 boundary handling (the original motivation for cumulative
-    // decode in c18eccf). Empirical: 1832-token sampling generation
-    // dropped to 60.4 tok/s today vs llama.cpp's 116.7 tok/s on the same
-    // workload (1.93x gap). This refactor closes the largest CPU-side
-    // contribution; remaining gap (visible-prefix-strip + GPU attention)
-    // is tracked separately. Stream + scalar `prev_token_count` together
-    // give the same `cumulative_text` semantics the closure used to
-    // produce, but the closure now appends one token per call instead
-    // of re-decoding everything.
-    let mut decode_stream = tokenizer.decode_stream(false);
-    let mut cumulative_text = String::new();
-    let mut last_decoded_count = 1usize; // seed token already in `decoded_tokens` at run_decode_loop start
-    {
-        // Seed the stream with the prefill-argmax token so the first delta
-        // emitted by run_decode_loop matches the legacy behaviour.
+    // 2026-05-03 — split run_decode_loop dispatch into greedy and sampling
+    // ARMS rather than branching `if sample_logits` per step inside the
+    // step_model closure. The branched closure captured `sample_logits`,
+    // `args`, AND `model` (sampling needed forward_gpu_last_logits +
+    // sample_qwen35_logits_for_generate; greedy needed forward_gpu_greedy);
+    // even though the branch was loop-invariant, the captured-state struct
+    // size + the layered indirection (closure → if/else → method call)
+    // measurably regressed greedy decode by ~19 tok/s (104 vs 122) on
+    // qwen3.6-35B-A3B-dwq48 200-token greedy bench (HEAD@588ccb6 vs
+    // 4adf689). Bisecting empirically: removing only the branch from the
+    // closure body restored 122 tok/s exactly; reverting decode_stream or
+    // qwen35_visible_generated_prefix did NOT recover the gap. Two-arm
+    // dispatch monomorphizes each path independently, eliminating the
+    // per-step branch + indirection.
+    //
+    // Cumulative-decode strategy: both arms use a stateful HuggingFace
+    // `decode_stream` (O(1) per token). The non-stream alternative —
+    // `tokenizer.decode(toks, false)` — re-tokenizes O(N) per call and
+    // sum-O(N²) per generation; that pattern showed 60 tok/s on a
+    // 1832-token sampling run (vs 116 tok/s peer). decode_stream + the
+    // `cumulative_text.push_str` accumulator reproduces the same
+    // `&str` value run_decode_loop expects without the quadratic blowup.
+    let outcome = if sample_logits {
+        let mut decode_stream = tokenizer.decode_stream(false);
+        let mut cumulative_text = String::new();
+        let mut last_decoded_count = 1usize;
         if let Ok(Some(s)) = decode_stream.step(next_token) {
             cumulative_text.push_str(&s);
         }
-    }
 
-    let outcome = run_decode_loop(
-        next_token,
-        prompt_len,
-        max_seq,
-        args.max_tokens,
-        &eos_token_ids,
-        |prev_token, pos, generated_tokens| -> Result<u32> {
-            // Build single-token positions buffer: flat [4 * 1] all set to `pos`.
-            let decode_positions = vec![pos; 4];
-            let _t_step = step_profile_enabled.then(std::time::Instant::now);
-            let next = if sample_logits {
+        run_decode_loop(
+            next_token,
+            prompt_len,
+            max_seq,
+            args.max_tokens,
+            &eos_token_ids,
+            |prev_token, pos, generated_tokens| -> Result<u32> {
+                let decode_positions = vec![pos; 4];
+                let _t_step = step_profile_enabled.then(std::time::Instant::now);
                 let mut logits = model
                     .forward_gpu_last_logits(&[prev_token], &decode_positions, &mut kv_cache)
                     .with_context(|| format!("forward_gpu_last_logits decode at pos {pos}"))?;
-                sample_qwen35_logits_for_generate(&mut logits, &args, generated_tokens)
-            } else {
-                // forward_gpu_greedy: GPU argmax → 4-byte download (vs 600KB full logits).
-                // Keeps deterministic temperature=0 decode on the fast path.
-                model
-                    .forward_gpu_greedy(&[prev_token], &decode_positions, &mut kv_cache)
-                    .with_context(|| format!("forward_gpu_greedy decode at pos {pos}"))?
-            };
-            if let Some(t) = _t_step {
-                eprintln!(
-                    "[STEP_PROFILE] pos={pos} total={:.2}ms",
-                    t.elapsed().as_micros() as f64 / 1000.0
-                );
-            }
-            Ok(next)
-        },
-        |toks| {
-            // Stateful streaming decode: handle the (possibly several) new
-            // tokens since the last call by advancing the stream. The seed
-            // token is already in cumulative_text from the pre-loop
-            // initialization; each step adds exactly one token for the
-            // standard production path.
-            while last_decoded_count < toks.len() {
-                let tok = toks[last_decoded_count];
-                if let Ok(Some(s)) = decode_stream.step(tok) {
-                    cumulative_text.push_str(&s);
+                let next = sample_qwen35_logits_for_generate(&mut logits, &args, generated_tokens);
+                if let Some(t) = _t_step {
+                    eprintln!(
+                        "[STEP_PROFILE] pos={pos} total={:.2}ms",
+                        t.elapsed().as_micros() as f64 / 1000.0
+                    );
                 }
-                last_decoded_count += 1;
-            }
-            cumulative_text.clone()
-        },
-        |event| {
-            if !event.delta.is_empty() {
-                print!("{}", event.delta);
-                let _ = stdout.flush();
-            }
-        },
-    )?;
+                Ok(next)
+            },
+            |toks| {
+                while last_decoded_count < toks.len() {
+                    let tok = toks[last_decoded_count];
+                    if let Ok(Some(s)) = decode_stream.step(tok) {
+                        cumulative_text.push_str(&s);
+                    }
+                    last_decoded_count += 1;
+                }
+                cumulative_text.clone()
+            },
+            |event| {
+                if !event.delta.is_empty() {
+                    print!("{}", event.delta);
+                    let _ = stdout.flush();
+                }
+            },
+        )?
+    } else {
+        let mut decode_stream = tokenizer.decode_stream(false);
+        let mut cumulative_text = String::new();
+        let mut last_decoded_count = 1usize;
+        if let Ok(Some(s)) = decode_stream.step(next_token) {
+            cumulative_text.push_str(&s);
+        }
+
+        run_decode_loop(
+            next_token,
+            prompt_len,
+            max_seq,
+            args.max_tokens,
+            &eos_token_ids,
+            |prev_token, pos, _generated_tokens| -> Result<u32> {
+                let decode_positions = vec![pos; 4];
+                let _t_step = step_profile_enabled.then(std::time::Instant::now);
+                // forward_gpu_greedy: GPU argmax → 4-byte download (vs 600KB full logits).
+                // Eliminates ~5ms/token vocabulary download for greedy decode.
+                let next = model
+                    .forward_gpu_greedy(&[prev_token], &decode_positions, &mut kv_cache)
+                    .with_context(|| format!("forward_gpu_greedy decode at pos {pos}"))?;
+                if let Some(t) = _t_step {
+                    eprintln!(
+                        "[STEP_PROFILE] pos={pos} total={:.2}ms",
+                        t.elapsed().as_micros() as f64 / 1000.0
+                    );
+                }
+                Ok(next)
+            },
+            |toks| {
+                while last_decoded_count < toks.len() {
+                    let tok = toks[last_decoded_count];
+                    if let Ok(Some(s)) = decode_stream.step(tok) {
+                        cumulative_text.push_str(&s);
+                    }
+                    last_decoded_count += 1;
+                }
+                cumulative_text.clone()
+            },
+            |event| {
+                if !event.delta.is_empty() {
+                    print!("{}", event.delta);
+                    let _ = stdout.flush();
+                }
+            },
+        )?
+    };
 
     // Loop-side stop reasons get a one-line tracing emit + (for repetition)
     // a stderr diagnostic, matching the production behavior the loop
