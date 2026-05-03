@@ -717,6 +717,21 @@ Phased, gated, with parity per increment. Each phase ships behind its own env ga
 
 **ETA:** 5-8 man-days.
 
+**iter89e2-E LANDED 2026-05-02:**
+- **Branch:** `adr019-phase2-iter89e2e-fa-prefill-into-variant`
+- **Commit:** `8305bf9` (single commit; +369/-81 = +288 net, of which ~80 LoC is the new `_into` function body + ~70 LoC of doc comments + ~150 LoC of unit test + ~30 LoC wrapper doc + ~40 LoC delegating wrapper body replacing inline encoding)
+- **What landed:** Extracted `apply_flash_attn_prefill_seq_major_into(enc: &mut CommandEncoder, …, arena: &mut FaPrefillArena)` from the wrapper's arena branch. The new variant encodes the same 8 dispatches (Q/K/V cast→permute_021_bf16 ×3 + flash_attn_prefill_bf16_d256 + permute_021_bf16_to_f32) with the same 5 intra-encoder `memory_barrier()` calls and DOES NOT commit. The original `apply_flash_attn_prefill_seq_major` wrapper preserves byte-identical behavior: when `fa_arena=Some` it opens its own encoder, delegates to `_into`, and commits via `commit_labeled("fa.prefill_bridge")` exactly as before; when `fa_arena=None` it executes the legacy per-call alloc + commit_and_wait path unchanged.
+- **What did NOT land:** the actual fusion (replacing wrapper-call with caller-supplied-encoder + memory_barrier across ops1-4 + kv_cache_write + fa.prefill_bridge + ops6-7) — that is iter89e2-F. Production behavior is byte-exact unchanged.
+- **Tests:** 2707 → 2708 (+1 new `flash_attn_prefill_into_byte_exact_parity_with_wrapper` at production shape seq=64/n_heads=16/n_kv_heads=2/head_dim=256 asserting 0/1048576 F32 elements differ between the wrapper and `_into` at the buffer level). All 13 `gpu_full_attn` module tests PASS, all 230 `qwen35` family tests PASS, full hf2q suite PASS with zero regressions.
+- **AC-PA1 (4-fixture decode parity):** GUARANTEED by transitivity. The wrapper's production callsite at `gpu_full_attn.rs:1752` is unchanged; the wrapper produces byte-identical buffer output bits (proven by the new unit test at production shape). End-to-end SHA256 receipts cannot diverge.
+- **AC-P3 (decode no-regression):** Deferred to next clean-SoC measurement. Pre-bench process audit detected a parallel CFA worker on a sibling worktree (`.cfa-worktrees/wedge4f-convert-claude`) contaminating wall-time. Refactor is byte-exact and inlinable in `--release`; regression risk is structurally near-zero (the wrapper's compiled instructions are equivalent modulo inlining).
+- **F1-F12 fence preservation:**
+  - F1 (persistent compute encoder): `_into` adds one new entry-point but zero new encoder lifecycles. The caller's encoder lazily opens its persistent compute encoder via the standard mlx-native dispatch surface.
+  - F2 (residency-rescission, iter58b): PRESERVED. All 7 BF16 scratches remain arena-owned; arena lifetime spans the entire prefill (allocated `forward_gpu.rs:1701-1713`, dropped after the output-head terminal `commit_and_wait_labeled`). `out_seq` is caller-owned and outlives any commit. No wrapper-local `MlxBuffer` drops occur — iter58b race structurally unreachable regardless of when the caller commits.
+  - F11 (zero-init alloc): PRESERVED. `_into` adds NO `device.alloc_buffer` calls — `out_seq` is caller-supplied, scratches are arena-owned. The wrapper's per-call `out_seq` allocation is unchanged.
+- **Recommended next step:** iter89e2-F (the actual single-CB fusion of ops1-4 + kv_cache_write + fa.prefill_bridge via `apply_flash_attn_prefill_seq_major_into` + ops6-7 in `build_gated_attn_layer`). Per design doc §6, that step deletes 3 of the 4 commit_labeled calls per FA layer × 10 FA layers = 30 fewer CBs per Qwen3.6-35B-A3B prefill. The `_into` extraction is a pure refactor — iter89e2-F's blast radius is now the only remaining structural change for Phase 2 single-stage.
+- **Notes:** Design doc cited the function at `gpu_full_attn.rs:1164`, which is correct on `ca4a03c`. The function moves to `gpu_full_attn.rs:1359` after this commit (the `_into` variant + its docs are inserted before the wrapper). All other line citations in the design doc remain accurate.
+
 ### Phase 3 — DN-path D3 stage migration (chunk-engaged + autoreg variants)
 
 **Scope:** 30 DN layers across two regimes:
