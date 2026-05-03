@@ -2186,6 +2186,30 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     let decode_start = std::time::Instant::now();
     let step_profile_enabled = std::env::var("HF2Q_STEP_PROFILE").is_ok();
 
+    // 2026-05-03 — replace the O(N²) cumulative-decode pattern (every step
+    // re-decoded the full token list, costing ~1ms / 1k tokens / step → 3.3M
+    // token-decodes for a 1832-token run) with a stateful HuggingFace
+    // `decode_stream` that yields O(1) bytes per token while preserving
+    // UTF-8 boundary handling (the original motivation for cumulative
+    // decode in c18eccf). Empirical: 1832-token sampling generation
+    // dropped to 60.4 tok/s today vs llama.cpp's 116.7 tok/s on the same
+    // workload (1.93x gap). This refactor closes the largest CPU-side
+    // contribution; remaining gap (visible-prefix-strip + GPU attention)
+    // is tracked separately. Stream + scalar `prev_token_count` together
+    // give the same `cumulative_text` semantics the closure used to
+    // produce, but the closure now appends one token per call instead
+    // of re-decoding everything.
+    let mut decode_stream = tokenizer.decode_stream(false);
+    let mut cumulative_text = String::new();
+    let mut last_decoded_count = 1usize; // seed token already in `decoded_tokens` at run_decode_loop start
+    {
+        // Seed the stream with the prefill-argmax token so the first delta
+        // emitted by run_decode_loop matches the legacy behaviour.
+        if let Ok(Some(s)) = decode_stream.step(next_token) {
+            cumulative_text.push_str(&s);
+        }
+    }
+
     let outcome = run_decode_loop(
         next_token,
         prompt_len,
@@ -2216,7 +2240,21 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
             }
             Ok(next)
         },
-        |toks| tokenizer.decode(toks, false).unwrap_or_default(),
+        |toks| {
+            // Stateful streaming decode: handle the (possibly several) new
+            // tokens since the last call by advancing the stream. The seed
+            // token is already in cumulative_text from the pre-loop
+            // initialization; each step adds exactly one token for the
+            // standard production path.
+            while last_decoded_count < toks.len() {
+                let tok = toks[last_decoded_count];
+                if let Ok(Some(s)) = decode_stream.step(tok) {
+                    cumulative_text.push_str(&s);
+                }
+                last_decoded_count += 1;
+            }
+            cumulative_text.clone()
+        },
         |event| {
             if !event.delta.is_empty() {
                 print!("{}", event.delta);
