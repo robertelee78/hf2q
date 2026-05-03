@@ -1552,9 +1552,23 @@ fn qwen35_visible_generated_prefix(generated_text: &str) -> (String, Option<&'st
     if safe_raw.find('<').is_none() {
         return (safe_raw.to_string(), stop_marker);
     }
+    // The model emits `<|im_start|>` as a BPE-decomposed byte-sequence
+    // (tokens 27 91 316 4747 91 29 in this Qwen tokenizer) rather than
+    // the special-token id 151644 — so it survives the SPECIAL_TOKEN_STOPS
+    // gate (which holds only `<|im_end|>`, `<|endoftext|>`, `<|end|>`)
+    // and ends up rendered as raw text. We strip both the full literal
+    // `<|im_start|>` and any trailing PREFIX of it (including the all-too-
+    // common 10-byte `<|im_start` that decode_stream emits one token before
+    // the closing `|>`). The trailing-prefix walk runs longest-first so
+    // a complete-form match takes precedence.
     if !safe_raw.contains("<|im_start|>") {
         let trimmed = trim_generated_assistant_role_prefix(safe_raw);
-        return (trimmed.to_string(), stop_marker);
+        let mut owned = trimmed.to_string();
+        if owned.contains("<|im_start|") {
+            owned = owned.replace("<|im_start|", "");
+        }
+        strip_trailing_im_start_prefix(&mut owned);
+        return (owned, stop_marker);
     }
 
     // SLOW PATH: contains `<|im_start|>`. Run the full strip pipeline.
@@ -1572,7 +1586,27 @@ fn qwen35_visible_generated_prefix(generated_text: &str) -> (String, Option<&'st
     }
 
     visible = visible.replace("<|im_start|>", "");
+    if visible.contains("<|im_start|") {
+        visible = visible.replace("<|im_start|", "");
+    }
+    strip_trailing_im_start_prefix(&mut visible);
     (visible, stop_marker)
+}
+
+/// Trim any trailing PREFIX of `<|im_start|>` from `text`, longest first.
+/// `<|im_start|>` is 12 bytes; checks lengths 11..=1.
+fn strip_trailing_im_start_prefix(text: &mut String) {
+    const IM_START: &str = "<|im_start|>";
+    // longest first so that a fully-matched `<|im_start|>` was already
+    // stripped by .replace above and we only see partial tails here.
+    for len in (1..IM_START.len()).rev() {
+        let candidate = &IM_START[..len];
+        if text.ends_with(candidate) {
+            let new_len = text.len() - len;
+            text.truncate(new_len);
+            return;
+        }
+    }
 }
 
 /// Decide whether the qwen3.5 generate-CLI loop needs the sampler-path
