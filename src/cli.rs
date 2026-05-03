@@ -494,8 +494,16 @@ pub struct GenerateArgs {
     #[arg(long, default_value = "256")]
     pub max_tokens: usize,
 
-    /// Sampling temperature (0.0 = greedy)
-    #[arg(long, default_value = "0.8")]
+    /// Sampling temperature (0.0 = greedy, deterministic).
+    ///
+    /// Default `0.0` mirrors `--temp 0` in llama-cli's deterministic mode and
+    /// gives the user predictable, complete, byte-reproducible output on every
+    /// run.  Pass any positive value (e.g. `--temperature 0.8`) to opt into
+    /// stochastic sampling — useful for creative-writing prompts where output
+    /// diversity matters more than reproducibility, but the cost is occasional
+    /// early-`<|im_end|>` stops on prompts where the model's distribution
+    /// has non-trivial mass on EOS at any step.
+    #[arg(long, default_value = "0.0")]
     pub temperature: f64,
 
     /// Top-p nucleus sampling
