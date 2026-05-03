@@ -602,6 +602,50 @@ Phased, gated, with parity per increment. Each phase ships behind its own env ga
 
 **ETA:** 1-2 man-days.
 
+**Phase 1 LANDED 2026-05-02 (M5 Max):**
+
+- hf2q branch: `adr019-phase1-output-head-fusion`
+- hf2q commit: `96b163c` (`feat(adr-019 phase 1): fuse output-head + last-layer FFN-terminal CB`)
+- LoC: +230 / -58 in `src/inference/models/qwen35/forward_gpu.rs` (net code ≈ 50 LoC; remainder is F1-F12 fence preservation rationale and eligibility documentation, per ADR-019:597 spec).  No new abstraction; no new mlx-native code.
+
+**Verified line numbers vs ADR-019:595 claim:**
+- Output head reference site: ADR cited `forward_gpu.rs:974`. Actual file is `src/inference/models/qwen35/forward_gpu.rs`.  Line 974 is the DECODE greedy `output_head.fused_norm_lm_argmax` terminal `commit_and_wait_labeled`.  However the PREFILL path used by `OutputHeadMode::Last` (the seq_len > 1 path that AC-P5 measures via `HF2Q_PROFILE_SYNC=1`) goes through `apply_output_head_gpu` at line 546 (was 2-encoder shape: `output_norm.commit()` + `lm_head.commit_and_wait()`), which is the actual fusion target.  The ADR's "fused_norm_lm_argmax" naming is decode-side; AC-P5 (pp80 sync_count) tracks prefill, so Phase 1 implements the prefill-side fusion (decode greedy already lives in a single CB via `apply_output_head_gpu_greedy_into`, so no decode change was needed).
+- Last-layer FFN K-boundary: ADR cited `forward_gpu.rs:2382 / 2489`. Actual sites in the post-Wedge-4 / post-iter-89e2 file are line 2622 (DenseQ K-boundary `commit_and_wait_labeled("layer.dense_ffn")`) and line 2742 (MoeQ K-boundary `commit_and_wait_labeled("layer.moe_ffn")`). Both are wired into the fusion at the LAST layer K-boundary only.
+
+**Acceptance results (operator-driven cold-process bench, M5 Max, 128 GB):**
+
+| Gate | Result | Detail |
+|---|---|---|
+| AC-PA1 (4-fixture decode parity) | **PASS** | 4/4 SHA256 byte-identical (max-tokens 32, temp=0; full text-stream byte-identical at decode-bench --benchmark mode for 35B-A3B q4_0-flat over 64 decoded tokens) |
+| AC-PA4 (cargo test --release) | **PASS** | 3234 / 3234 (0 new failures, 45 ignored) |
+| AC-P5 (pp80 sync_count) | **PASS** | 27B-dwq46: 9 → 8 (Δ = -1); 35B-A3B-apex Q5_K: 6 → 5 (Δ = -1); 35B-A3B-apex q4_0-flat: 6 → 5 (Δ = -1).  cmd_buf_count drops by 2 (output_norm + lm_head encoders folded into the held FFN encoder); barrier_count +1 (new intra-CB memory_barrier between output_norm and lm_head). |
+| AC-P3 (decode no-regression) | **PASS** | 35B-A3B q4_0-flat --benchmark mode: decode 124.7 → 126.0 t/s (+1.0%, well within ±5%; Phase 1 doesn't touch `forward_gpu_greedy`). Prefill 777 → 811 t/s (+4.4%, the expected wall-time win from one fewer commit_and_wait per prefill). |
+
+**SHA256 receipts (Phase 1 == baseline byte-for-byte across all 4):**
+
+| Fixture | SHA256 (first 24 chars) |
+|---|---|
+| qwen3.6-27b-dwq46 | `588934069354073ed5701cde` |
+| qwen3.6-35b-A3B-apex Q5_K | `967efb516ac626e0fa0f86d2` |
+| qwen3.6-35b-A3B-apex q4_0-flat | `0df6e05fd04705a91da83359` |
+| gemma-4-26B-A4B-it-ara-dwq | `94590cd5b86ee68582b30fb9` |
+
+**F1-F12 fence preservation:**
+- F1 (persistent compute encoder per CB): PRESERVED — fusion only widens the existing CB.
+- F2 (iter58b residency-rescission, THE BIG FENCE): PRESERVED — pooled `normed` Drop runs after `commit_and_wait` returns; pool reset for the held last layer is gated on `last_layer_held_enc.is_none()`; intermediate K-boundaries unchanged.
+- F6 (output-head argmax CPU read): PRESERVED — terminal `commit_and_wait` precedes `download_f32`.
+- F7 (K-boundary scratch lifetime contract): PRESERVED — scratches stay GPU-referenced through the held encoder's eventual commit_and_wait at output-head terminal.
+- F11 (zero-init alloc_buffer): PRESERVED — no new buffer allocations.
+
+**Eligibility predicate (Chesterton's fence):**
+- prefill (seq_len > 1) AND `OutputHeadMode::Last`
+- `capture.is_none()` AND `hidden_out.is_none()` (ADR-012 P9b downloads `hidden` after FFN commit; fusion holds open)
+- `HF2Q_DUMP_LAYER_N` unset AND `HF2Q_DUMP_LAYER_ACTIVATIONS` unset AND `dump_bisect::is_enabled() == false` (diagnostic paths read `as_slice` mid-flight)
+- deepstack inactive for the last layer (n_layers > n_deepstack — true for every Qwen3-VL config to date)
+- FFN arm is MoeQ or DenseQ (F32-MoE / F32-Dense build their own encoder + commit internally; not on the held-encoder path)
+
+**Recommended next step:** Phase 0b-B (residency + MTLEvent fence on the EncoderSession scaffold from iter89e2-A) is the gating prerequisite for Phase 2's intra-stage MTLEvent fences. Phase 2 (FA-path D3) is the next high-impact phase — 10 FA layers × 1 sync collapse = ≥10 sync_count drop on chunk-engaged pp4096 (vs Phase 1's per-prefill -1 sync drop). Phase 1's path-finding role is satisfied: the AC-P5 measurement infrastructure works, the fusion is byte-parity-safe under iter58b's F2 fence, and the F-fence preservation pattern is now established for Phase 2-4.
+
 ### Phase 2 — FA-path D3 stage migration (smallest hazard graph; lowest risk)
 
 **Scope:** 10 FA layers; ops1-4 + kv_cache_write + fa.prefill_bridge + ops6-7 form a clear stage. Replace per-component `commit_labeled` with stage-end `commit_labeled` + intra-stage `enc.memory_barrier()`. The four ops already use `FaPrefillArena` (Stage 1) and `FaProjectionsArena` (iter86) — F2 lifetime is structurally clean.
