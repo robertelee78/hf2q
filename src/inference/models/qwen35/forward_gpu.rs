@@ -642,6 +642,25 @@ fn apply_output_head_gpu_into(
             .context("enc output_head.fused_norm_lm_head")?,
     };
 
+    // 2026-05-03 — RAW barrier: rms_norm reads `hidden`, which in the FUSED
+    // path was JUST written by the LAST layer's MoeQ/DenseQ FFN-terminal
+    // dispatch into the SAME caller-supplied encoder. ADR-019 Phase 1
+    // (commit 8012e63) shipped the encoder hand-off WITHOUT this barrier;
+    // Apple's MTLDispatchTypeConcurrent then reorders rms_norm ahead of (or
+    // overlapping with) the FFN write, so rms_norm sees stale or partially-
+    // updated `hidden` bytes. Empirically (5x cold-process logit dump on
+    // qwen3.6-35B-A3B-dwq48 wedding-cake greedy temp=0): pre-fix produced
+    // {31248, 31248, 1206, 31248, 31248} with logits 32.4 / 31.7 / 18.2 /
+    // 22.3 / 33.8 — argmax flip + wide logit spread = the residual
+    // non-determinism after Phase-2 (use_fused_stage_ab) is also disabled.
+    //
+    // The standalone (caller_enc=None) path doesn't need this barrier:
+    // the previous FFN commit closed its CB before this function's fresh
+    // encoder opens, so `hidden` is GPU-visible by Metal-queue ordering.
+    if fused {
+        enc.memory_barrier();
+    }
+
     // Stage 1: output_norm → normed.
     rms_norm::dispatch_rms_norm(
         &mut enc,
