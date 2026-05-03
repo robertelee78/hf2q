@@ -8341,3 +8341,51 @@ Tracked as Task #20 for next iter — significant kernel work
 (~150-300 LOC across two repos), expected to close 12+ tok/s on
 long-context workloads.
 
+
+---
+
+### Session entry — 2026-05-03 (afternoon, sixth iter — flash_attn_vec swap):
+### hf2q now 11-12 t/s FASTER than llama.cpp at ALL decode lengths
+
+**Closes the long-context gap identified in 9ba041d (same iter).**
+
+The cache-layout investigation initially looked complex, but reading the
+actual kernel source (not just doc comments) showed `kv_cache_copy_seq_f32_kv_dual`
+already writes K/V in `[n_kv_heads, capacity, head_dim]` layout — exactly
+what `flash_attn_vec` expects. The Qwen35 HybridKvCache doc string
+(`[head_dim, n_kv, max_seq_len, n_seqs]`) is in Fortran/innermost-first
+order, not the row-major C-order I initially read it as. **Code + test ==
+truth, doc comments are not.**
+
+**Drop-in swap implemented at the two `dispatch_sdpa_decode` call sites in
+`gpu_full_attn.rs` (lines 1646, 2648).** Production head_dims (256, 512)
+go through flash_attn_vec; smaller head_dims (MTP test fixtures with
+head_dim=32) keep sdpa_decode as fallback.
+
+**Empirical (qwen3.6-35B-A3B-dwq48, M5 Max Metal, recipe / greedy / temp=0):**
+
+| Length | Pre-fix    | Post-fix    | llama-bench  | Delta vs llama.cpp |
+| ------ | ---------- | ----------- | ------------ | ------------------ |
+| 200    | 122.7      | **131.0**   | 119.71 ± 0.22 | **hf2q +11.3** ✓   |
+| 500    | 115.8      | **130.5**   | 118.59 ± 0.25 | **hf2q +11.9** ✓   |
+| 1000   | 105.2      | **130.0**   | 117.52 ± 0.16 | **hf2q +12.5** ✓   |
+
+hf2q is now **+11 to +12 tok/s faster than llama.cpp at every decode length
+tested**. Long-context scaling is also better than llama.cpp (-1 t/s across
+5x context vs llama.cpp's -2.2 t/s).
+
+**Coherence preserved:** determinism harness produces the SAME MD5 hash
+(`0dfd0ae2…`) as before the swap — flash_attn_vec is byte-identical to
+sdpa_decode at greedy temp=0. Full singleton test suite passes 2784/2784.
+
+**Mission exit-criteria for greedy temp=0 — FULL parity gate:**
+
+| Axis | Status |
+| --- | --- |
+| Coherent vs llama.cpp (chat-template byte-identical) | ✓ (per iter-2 finding) |
+| Faster than llama.cpp (tg200, tg500, tg1000) | ✓ +11-12 t/s |
+| Deterministic (5/5 cold byte-identical) | ✓ md5 0dfd0ae2… |
+| Long-context coherence (1791-tok recipe) | ✓ |
+| Better long-context scaling than llama.cpp | ✓ (-1 vs -2.2) |
+| Full unit-test suite | ✓ 2784/2784 |
+
