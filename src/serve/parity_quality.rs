@@ -465,6 +465,7 @@ fn run_two_regime_decode(
             temperature: 0.0,
             top_p: 1.0,
             top_k: 0,
+            min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: tokens,
             chat_template: None,
@@ -474,6 +475,7 @@ fn run_two_regime_decode(
             enable_thinking: false,
             no_thinking: false,
         },
+        Some(&tokenizer),
         prompt_text,
     )?;
     let encoding = tokenizer
@@ -908,4 +910,3 @@ fn iso8601_utc_now() -> String {
         year, mo, d, h, m, s
     )
 }
-

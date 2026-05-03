@@ -310,9 +310,13 @@ pub(crate) const FALLBACK_GEMMA4_API_CHAT_TEMPLATE: &str = concat!(
 ///   4. Hardcoded fallback string (last resort)
 /// Detect whether a Jinja chat template supports thinking-mode rendering by
 /// rendering it twice with synthetic test input — once with
-/// `enable_thinking=true`, once with `enable_thinking=false` — and comparing
-/// the output bytes. If they differ, the template branches on the variable
-/// → the model class supports thinking-mode → default to enable_thinking on.
+/// `enable_thinking=true`, once with `enable_thinking=false` — and checking
+/// that the enabled render actually opens a reasoning block. A plain byte
+/// difference is insufficient: llama.cpp's template matrix includes Qwen3
+/// templates where `enable_thinking=false` appends an empty `<think></think>`
+/// suppressor, while `enable_thinking=true` leaves the assistant prompt bare.
+/// Those templates branch on the variable but should still default to
+/// thinking off.
 ///
 /// **This is the canonical signal** per peer audit
 /// `/tmp/cfa-thinking-detect/peer-detection-report.md`. Mirrors llama.cpp's
@@ -337,12 +341,27 @@ fn template_supports_enable_thinking(template_str: &str) -> bool {
     let render_true = render_jinja_template(template_str, "x", Some(true));
     let render_false = render_jinja_template(template_str, "x", Some(false));
     match (render_true, render_false) {
-        (Ok(a), Ok(b)) => a != b,
+        (Ok(enabled), Ok(disabled)) => rendered_prompt_opens_thinking(&enabled, &disabled),
         // Either render failed → can't probe → safe default false. The caller
         // (`render_chat_template`) will surface the actual render error on
         // the real render attempt, so we don't lose information here.
         _ => false,
     }
+}
+
+fn rendered_prompt_opens_thinking(enabled: &str, disabled: &str) -> bool {
+    let enabled_tail = enabled.trim_end();
+    let disabled_tail = disabled.trim_end();
+
+    if !enabled_tail.ends_with("<think>") {
+        return false;
+    }
+
+    if disabled_tail == enabled_tail {
+        return false;
+    }
+
+    disabled_tail.contains("</think>") || !disabled_tail.ends_with("<think>")
 }
 
 /// Resolve the `enable_thinking` value to pass to the chat-template Jinja
@@ -381,6 +400,7 @@ fn resolve_enable_thinking(args: &cli::GenerateArgs, template_str: Option<&str>)
 fn render_chat_template(
     gguf: &mlx_native::gguf::GgufFile,
     args: &cli::GenerateArgs,
+    tokenizer: Option<&tokenizers::Tokenizer>,
     user_prompt: &str,
 ) -> Result<String> {
     // Step 1: resolve the chat template SOURCE in priority order.
@@ -419,8 +439,31 @@ fn render_chat_template(
     // /opt/llama.cpp/common/chat-diff-analyzer.cpp:319-401.
     let enable_thinking = resolve_enable_thinking(args, Some(template_str.as_str()));
 
-    // Step 3: render with the resolved template + flag.
-    render_jinja_template(&template_str, user_prompt, enable_thinking)
+    // Step 3: render with the resolved template + flag. Do not post-edit the
+    // rendered chat prompt here: llama.cpp's chat-template path treats the
+    // template output as authoritative, and Qwen equivalence depends on the
+    // same contract. Decode behavior differences belong in the sampler/stop
+    // pipeline, not in prompt surgery.
+    let bos_token = resolve_token_text(
+        gguf,
+        tokenizer,
+        "tokenizer.ggml.bos_token_id",
+        "<bos>",
+    );
+    let eos_token = resolve_token_text(
+        gguf,
+        tokenizer,
+        "tokenizer.ggml.eos_token_id",
+        "<eos>",
+    );
+
+    render_jinja_template_with_specials(
+        &template_str,
+        user_prompt,
+        enable_thinking,
+        &bos_token,
+        &eos_token,
+    )
 }
 
 /// Render a Jinja2 chat template using minijinja.
@@ -438,6 +481,16 @@ fn render_jinja_template(
     template_str: &str,
     user_prompt: &str,
     enable_thinking: Option<bool>,
+) -> Result<String> {
+    render_jinja_template_with_specials(template_str, user_prompt, enable_thinking, "<bos>", "<eos>")
+}
+
+fn render_jinja_template_with_specials(
+    template_str: &str,
+    user_prompt: &str,
+    enable_thinking: Option<bool>,
+    bos_token: &str,
+    eos_token: &str,
 ) -> Result<String> {
     let mut env = minijinja::Environment::new();
 
@@ -500,12 +553,112 @@ fn render_jinja_template(
                 minijinja::context! { role => "user", content => user_prompt }
             ],
             add_generation_prompt => true,
-            bos_token => "<bos>",
-            eos_token => "<eos>",
+            bos_token => bos_token,
+            eos_token => eos_token,
             enable_thinking => enable_thinking,
         })
         .context("Failed to render chat template")?;
     Ok(rendered)
+}
+
+fn gguf_bool(gguf: &mlx_native::gguf::GgufFile, key: &str) -> bool {
+    matches!(
+        gguf.metadata(key),
+        Some(mlx_native::gguf::MetadataValue::Bool(true))
+    )
+}
+
+fn resolve_token_id(
+    gguf: &mlx_native::gguf::GgufFile,
+    tokenizer: &tokenizers::Tokenizer,
+    metadata_key: &str,
+) -> Option<u32> {
+    llama_cpp_special_token_id(gguf, metadata_key)
+        .and_then(|id| tokenizer.id_to_token(id).map(|_| id))
+}
+
+fn llama_cpp_special_token_id(
+    gguf: &mlx_native::gguf::GgufFile,
+    metadata_key: &str,
+) -> Option<u32> {
+    if let Some(id) = gguf.metadata_u32(metadata_key) {
+        return Some(id);
+    }
+
+    let tokenizer_model = gguf.metadata_string("tokenizer.ggml.model")?;
+    llama_cpp_special_token_id_for_model(tokenizer_model, metadata_key)
+}
+
+fn llama_cpp_special_token_id_for_model(
+    tokenizer_model: &str,
+    metadata_key: &str,
+) -> Option<u32> {
+    match (tokenizer_model, metadata_key) {
+        // Mirrors `/opt/llama.cpp/src/llama-vocab.cpp`: for tokenizer model
+        // `gpt2`, llama.cpp initializes both BOS and EOS to token id 11 before
+        // applying GGUF metadata overrides.
+        ("gpt2", "tokenizer.ggml.bos_token_id")
+        | ("gpt2", "tokenizer.ggml.eos_token_id") => Some(11),
+        _ => None,
+    }
+}
+
+fn resolve_token_text(
+    gguf: &mlx_native::gguf::GgufFile,
+    tokenizer: Option<&tokenizers::Tokenizer>,
+    metadata_key: &str,
+    template_literal_when_unavailable: &str,
+) -> String {
+    let Some(tokenizer) = tokenizer else {
+        return template_literal_when_unavailable.to_string();
+    };
+    resolve_token_id(gguf, tokenizer, metadata_key)
+        .and_then(|id| tokenizer.id_to_token(id))
+        .unwrap_or_else(|| template_literal_when_unavailable.to_string())
+}
+
+/// Tokenize a rendered prompt with llama.cpp `common_tokenize(...,
+/// add_special=true, parse_special=true)` semantics.
+///
+/// The Rust tokenizer call below intentionally keeps `add_special_tokens=false`
+/// because the GGUF-driven tokenizer is assembled from llama.cpp metadata, not
+/// HF `tokenizer.json`; we then apply GGUF add_bos/add_eos explicitly with the
+/// same token IDs llama.cpp would prepend/append.
+fn tokenize_rendered_prompt_llama_style(
+    gguf: &mlx_native::gguf::GgufFile,
+    tokenizer: &tokenizers::Tokenizer,
+    prompt_text: &str,
+) -> Result<Vec<u32>> {
+    let encoding = tokenizer
+        .encode(prompt_text, false)
+        .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
+    let mut prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+
+    if gguf_bool(gguf, "tokenizer.ggml.add_bos_token") {
+        if let Some(bos) = resolve_token_id(
+            gguf,
+            tokenizer,
+            "tokenizer.ggml.bos_token_id",
+        ) {
+            if prompt_tokens.first() != Some(&bos) {
+                prompt_tokens.insert(0, bos);
+            }
+        }
+    }
+
+    if gguf_bool(gguf, "tokenizer.ggml.add_eos_token") {
+        if let Some(eos) = resolve_token_id(
+            gguf,
+            tokenizer,
+            "tokenizer.ggml.eos_token_id",
+        ) {
+            if prompt_tokens.last() != Some(&eos) {
+                prompt_tokens.push(eos);
+            }
+        }
+    }
+
+    Ok(prompt_tokens)
 }
 
 /// Run the `generate` subcommand.
@@ -657,7 +810,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
 
     // Resolve prompt
     let prompt_text_raw = resolve_prompt(&args)?;
-    let prompt_text = render_chat_template(&gguf, &args, &prompt_text_raw)?;
+    let prompt_text = render_chat_template(&gguf, &args, Some(&tokenizer), &prompt_text_raw)?;
 
     // ADR-005 1bNEW.0c: dump rendered prompt and exit if requested
     if let Some(dump_path) = INVESTIGATION_ENV.dump_rendered_prompt.as_deref() {
@@ -671,10 +824,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         return Ok(());
     }
 
-    let encoding = tokenizer
-        .encode(prompt_text.as_str(), false)
-        .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
-    let mut prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+    let mut prompt_tokens = tokenize_rendered_prompt_llama_style(&gguf, &tokenizer, &prompt_text)?;
 
     // ADR-015 iter42 — Gemma forward_mlx prefill coherence fix.
     //
@@ -743,6 +893,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         temperature: args.temperature,
         top_p: args.top_p,
         top_k: args.top_k,
+        min_p: args.min_p,
         repetition_penalty: args.repetition_penalty,
         max_tokens: args.max_tokens,
     };
@@ -1298,8 +1449,6 @@ fn detect_greedy_repetition_loop(decoded_tokens: &[u32]) -> Option<(usize, usize
 ///
 /// * emitted an end-of-turn marker as text rather than as the configured
 ///   integer EOS id (Qwen3.x distill / merge variants), OR
-/// * leaked into a new `<|im_start|>` turn (single-turn `generate` must
-///   stop), OR
 /// * ended a Phi-3-style turn via the `<|end|>` text fragment (observed
 ///   2026-05-02 on a Qwen3.x-arch GGUF whose model emitted Phi-3-style
 ///   markers as multi-token text).
@@ -1311,7 +1460,6 @@ fn detect_greedy_repetition_loop(decoded_tokens: &[u32]) -> Option<(usize, usize
 const SPECIAL_TOKEN_STOPS: &[&str] = &[
     "<|im_end|>",
     "<|endoftext|>",
-    "<|im_start|>",
     "<|end|>",
 ];
 
@@ -1323,10 +1471,101 @@ const SPECIAL_TOKEN_STOPS: &[&str] = &[
 /// `<|im_end|>` chat-template markers; scanning those would short-circuit
 /// generation immediately on every model.
 fn find_special_token_stop(generated_text: &str) -> Option<&'static str> {
+    find_special_token_stop_pos(generated_text).map(|(_, marker)| marker)
+}
+
+fn find_special_token_stop_pos(generated_text: &str) -> Option<(usize, &'static str)> {
     SPECIAL_TOKEN_STOPS
         .iter()
         .copied()
-        .find(|m| generated_text.contains(m))
+        .filter_map(|m| generated_text.find(m).map(|pos| (pos, m)))
+        .min_by_key(|(pos, _)| *pos)
+}
+
+fn trailing_special_token_prefix_len(generated_text: &str) -> usize {
+    SPECIAL_TOKEN_STOPS
+        .iter()
+        .flat_map(|marker| {
+            (1..marker.len()).filter_map(|len| {
+                let prefix = &marker[..len];
+                generated_text.ends_with(prefix).then_some(len)
+            })
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn special_token_safe_prefix(generated_text: &str) -> (&str, Option<&'static str>) {
+    if let Some((pos, marker)) = find_special_token_stop_pos(generated_text) {
+        return (&generated_text[..pos], Some(marker));
+    }
+
+    let hold_len = trailing_special_token_prefix_len(generated_text);
+    (&generated_text[..generated_text.len() - hold_len], None)
+}
+
+fn trim_generated_assistant_role_prefix(mut text: &str) -> &str {
+    loop {
+        let trimmed = text.trim_start_matches(['\r', '\n', ' ', '\t']);
+        text = trimmed;
+        if let Some(rest) = text.strip_prefix("<|im_start|>") {
+            text = rest;
+            continue;
+        }
+        if let Some(rest) = text.strip_prefix("assistant\r\n") {
+            text = rest;
+            continue;
+        }
+        if let Some(rest) = text.strip_prefix("assistant\n") {
+            text = rest;
+            continue;
+        }
+        return text;
+    }
+}
+
+fn qwen35_visible_generated_prefix(generated_text: &str) -> (String, Option<&'static str>) {
+    let (safe_raw, stop_marker) = special_token_safe_prefix(generated_text);
+
+    let mut visible = if let Some(pos) = safe_raw.rfind("<|im_start|>assistant") {
+        let rest = &safe_raw[pos + "<|im_start|>assistant".len()..];
+        trim_generated_assistant_role_prefix(rest).to_string()
+    } else {
+        trim_generated_assistant_role_prefix(safe_raw).to_string()
+    };
+
+    for marker in ["<|im_start|>user", "<|im_start|>system"] {
+        if let Some(pos) = visible.find(marker) {
+            visible.truncate(pos);
+        }
+    }
+
+    visible = visible.replace("<|im_start|>", "");
+    (visible, stop_marker)
+}
+
+fn qwen35_generate_uses_sampling(args: &cli::GenerateArgs) -> bool {
+    args.temperature > crate::serve::sampler_pure::SAMPLING_EPS
+        || args.top_k > 0
+        || args.top_p < 1.0
+        || args.min_p > 0.0
+        || args.repetition_penalty != 1.0
+}
+
+fn sample_qwen35_logits_for_generate(
+    logits: &mut [f32],
+    args: &cli::GenerateArgs,
+    previous_tokens: &[u32],
+) -> u32 {
+    let params = crate::serve::sampler_pure::SamplingParams {
+        temperature: args.temperature,
+        top_p: args.top_p,
+        top_k: args.top_k,
+        min_p: args.min_p,
+        repetition_penalty: args.repetition_penalty,
+        max_tokens: args.max_tokens,
+    };
+    crate::serve::sampler_pure::sample_token(logits, &params, previous_tokens)
 }
 
 // ============================================================================
@@ -1447,22 +1686,31 @@ pub(crate) fn run_decode_loop<F, P, E>(
     mut on_event: E,
 ) -> Result<DecodeLoopOutcome>
 where
-    F: FnMut(u32, i32) -> Result<u32>,
+    F: FnMut(u32, i32, &[u32]) -> Result<u32>,
     P: FnMut(&[u32]) -> String,
     E: FnMut(DecodeStepEvent<'_>),
 {
     let mut decoded_tokens: Vec<u32> = vec![initial_token];
-    let mut printed_text: String = decode_text(&decoded_tokens);
+    let mut emitted_text: String = String::new();
     let mut next_token = initial_token;
     let mut generated = 1usize;
 
     // Emit step 0 event (the seed token from prefill).
+    let seed_full = decode_text(&decoded_tokens);
+    let (seed_visible, seed_stop_marker) = qwen35_visible_generated_prefix(&seed_full);
     on_event(DecodeStepEvent {
         step: 0,
         token: initial_token,
-        cumulative_text: &printed_text,
-        delta: &printed_text,
+        cumulative_text: &seed_full,
+        delta: &seed_visible,
     });
+    emitted_text.push_str(&seed_visible);
+    if let Some(marker) = seed_stop_marker {
+        return Ok(DecodeLoopOutcome {
+            generated,
+            stop_reason: DecodeStopReason::SpecialTokenLeak(marker),
+        });
+    }
 
     for step in 1..max_tokens {
         // Top-of-iteration integer-EOS check (mirrors production: line
@@ -1486,16 +1734,17 @@ where
         }
 
         // Forward pass.
-        next_token = step_model(next_token, pos)?;
+        next_token = step_model(next_token, pos, &decoded_tokens)?;
         generated += 1;
         decoded_tokens.push(next_token);
 
         // Cumulative decode + delta computation.
         let new_full = decode_text(&decoded_tokens);
-        let delta = if new_full.len() > printed_text.len()
-            && new_full.starts_with(&printed_text)
+        let (visible_full, stop_marker) = qwen35_visible_generated_prefix(&new_full);
+        let delta = if visible_full.len() > emitted_text.len()
+            && visible_full.starts_with(&emitted_text)
         {
-            &new_full[printed_text.len()..]
+            &visible_full[emitted_text.len()..]
         } else {
             // Tokenizer rewrote an earlier prefix (rare; happens with some
             // BPE merges) — emit nothing this step. Production code path
@@ -1511,7 +1760,7 @@ where
         });
 
         // Special-token-string leak check.
-        if let Some(marker) = find_special_token_stop(&new_full) {
+        if let Some(marker) = stop_marker {
             return Ok(DecodeLoopOutcome {
                 generated,
                 stop_reason: DecodeStopReason::SpecialTokenLeak(marker),
@@ -1526,7 +1775,7 @@ where
             });
         }
 
-        printed_text = new_full;
+        emitted_text = visible_full;
     }
 
     Ok(DecodeLoopOutcome {
@@ -1564,6 +1813,35 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     // open. `LoadInfo`'s build path takes its own `&GgufFile`; we pass
     // the parameter handle.
     let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+
+    if INVESTIGATION_ENV.dump_rendered_prompt.is_some()
+        || std::env::var("HF2Q_DEBUG_TOKENIZE_ONLY").as_deref() == Ok("1")
+    {
+        let tokenizer =
+            crate::inference::models::qwen35::tokenizer::build_tokenizer_from_gguf(&gguf)
+                .context("Qwen35 tokenizer build for prompt diagnostics")?;
+        let prompt_text_raw = resolve_prompt(&args)?;
+        let prompt_text = render_chat_template(&gguf, &args, Some(&tokenizer), &prompt_text_raw)?;
+
+        if let Some(dump_path) = INVESTIGATION_ENV.dump_rendered_prompt.as_deref() {
+            std::fs::write(dump_path, prompt_text.as_bytes())
+                .with_context(|| format!("HF2Q_DUMP_RENDERED_PROMPT: failed to write {dump_path}"))?;
+            eprintln!(
+                "HF2Q_DUMP_RENDERED_PROMPT: wrote {} bytes to {}",
+                prompt_text.len(),
+                dump_path
+            );
+        }
+
+        if std::env::var("HF2Q_DEBUG_TOKENIZE_ONLY").as_deref() == Ok("1") {
+            let prompt_tokens =
+                tokenize_rendered_prompt_llama_style(&gguf, &tokenizer, &prompt_text)?;
+            let id_str: Vec<String> = prompt_tokens.iter().map(|i| i.to_string()).collect();
+            println!("TOKENIZE_DEBUG_IDS: {}", id_str.join(" "));
+        }
+
+        return Ok(());
+    }
 
     let load_opts = api::engine::LoadOptions {
         model_path: model_path.clone(),
@@ -1623,13 +1901,24 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
 
     // ---- Resolve + render prompt ----
     let prompt_text_raw = resolve_prompt(&args)?;
-    let prompt_text = render_chat_template(&gguf, &args, &prompt_text_raw)?;
+    let prompt_text = render_chat_template(&gguf, &args, Some(&tokenizer), &prompt_text_raw)?;
+
+    // Keep the Qwen path inspectable with the same investigation knob as the
+    // Gemma path. This must happen before tokenization/decode so prompt bugs
+    // can be isolated without a successful generation.
+    if let Some(dump_path) = INVESTIGATION_ENV.dump_rendered_prompt.as_deref() {
+        std::fs::write(dump_path, prompt_text.as_bytes())
+            .with_context(|| format!("HF2Q_DUMP_RENDERED_PROMPT: failed to write {dump_path}"))?;
+        eprintln!(
+            "HF2Q_DUMP_RENDERED_PROMPT: wrote {} bytes to {}",
+            prompt_text.len(),
+            dump_path
+        );
+        return Ok(());
+    }
 
     // ---- Tokenize ----
-    let encoding = tokenizer
-        .encode(prompt_text.as_str(), false)
-        .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
-    let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+    let prompt_tokens = tokenize_rendered_prompt_llama_style(&gguf, &tokenizer, &prompt_text)?;
     let prompt_len = prompt_tokens.len();
     tracing::info!("Qwen3.5: {} prompt tokens", prompt_len);
 
@@ -1648,12 +1937,19 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     let max_seq = (prompt_len + args.max_tokens + 64)
         .max(128)
         .min(model.cfg.max_position_embeddings as usize);
+    let sample_logits = qwen35_generate_uses_sampling(&args);
+
     let spec_env = std::env::var("HF2Q_SPEC_DECODE").ok();
     let mut use_spec_decode = match spec_env.as_deref() {
         Some("0") => false,
         Some("1") => true,
-        _ => args.speculative || model.mtp.is_some(),
+        _ => !sample_logits && (args.speculative || model.mtp.is_some()),
     };
+    if sample_logits && args.speculative {
+        tracing::warn!(
+            "Speculative decoding requested with sampling parameters; using sampler path"
+        );
+    }
     if use_spec_decode && model.mtp.is_none() {
         tracing::warn!(
             "Speculative decoding requested but this GGUF has no MTP weights; using greedy decode"
@@ -1858,9 +2154,17 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         return Ok(());
     }
 
-    // Sample the first token from prefill logits (last token's row).
+    // Sample the first token from prefill logits (last token's row). This
+    // mirrors llama.cpp's common_sampler contract: the CLI default sampling
+    // parameters affect token 0, instead of silently downcasting generation to
+    // greedy argmax.
     let last_prefill_logits = &prefill_logits;
-    let next_token = greedy_argmax_last_token(last_prefill_logits, vocab_size);
+    let next_token = if sample_logits {
+        let mut logits = last_prefill_logits.to_vec();
+        sample_qwen35_logits_for_generate(&mut logits, &args, &[])
+    } else {
+        greedy_argmax_last_token(last_prefill_logits, vocab_size)
+    };
     tracing::info!("Qwen3.5 first decoded token: {}", next_token);
 
     // 2026-05-02: cumulative-decode + delta-print pattern (mirrors llama.cpp's
@@ -1886,15 +2190,22 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         max_seq,
         args.max_tokens,
         &eos_token_ids,
-        |prev_token, pos| -> Result<u32> {
+        |prev_token, pos, generated_tokens| -> Result<u32> {
             // Build single-token positions buffer: flat [4 * 1] all set to `pos`.
             let decode_positions = vec![pos; 4];
             let _t_step = step_profile_enabled.then(std::time::Instant::now);
-            // forward_gpu_greedy: GPU argmax → 4-byte download (vs 600KB full logits).
-            // Eliminates ~5ms/token vocabulary download for greedy decode.
-            let next = model
-                .forward_gpu_greedy(&[prev_token], &decode_positions, &mut kv_cache)
-                .with_context(|| format!("forward_gpu_greedy decode at pos {pos}"))?;
+            let next = if sample_logits {
+                let mut logits = model
+                    .forward_gpu_last_logits(&[prev_token], &decode_positions, &mut kv_cache)
+                    .with_context(|| format!("forward_gpu_last_logits decode at pos {pos}"))?;
+                sample_qwen35_logits_for_generate(&mut logits, &args, generated_tokens)
+            } else {
+                // forward_gpu_greedy: GPU argmax → 4-byte download (vs 600KB full logits).
+                // Keeps deterministic temperature=0 decode on the fast path.
+                model
+                    .forward_gpu_greedy(&[prev_token], &decode_positions, &mut kv_cache)
+                    .with_context(|| format!("forward_gpu_greedy decode at pos {pos}"))?
+            };
             if let Some(t) = _t_step {
                 eprintln!(
                     "[STEP_PROFILE] pos={pos} total={:.2}ms",
@@ -1934,15 +2245,13 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         DecodeStopReason::RepetitionLoop { ngram, repeats } => {
             tracing::info!(
                 "Qwen3.5 decode: greedy n-gram repetition detected after {} \
-                 tokens (last {} tokens repeated {} times); stopping. \
-                 Sampling (temperature/top_k/top_p/repetition_penalty) is \
-                 not yet wired in this CLI path — TODO follow-up.",
+                 tokens (last {} tokens repeated {} times); stopping.",
                 outcome.generated, ngram, repeats
             );
             eprintln!(
                 "\n[hf2q] greedy decode entered a {}-token repetition loop \
-                 after {} tokens — stopping. Use the chat-completion API \
-                 (which has sampling wired) for non-deterministic decoding.",
+                 after {} tokens — stopping. Use non-zero temperature / top-p \
+                 / top-k sampling for non-deterministic decoding.",
                 ngram, outcome.generated
             );
         }
@@ -3485,6 +3794,7 @@ fn cmd_parity_check(
             temperature: 0.0,
             top_p: 1.0,
             top_k: 0,
+            min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: tokens,
             chat_template: None,
@@ -3494,6 +3804,7 @@ fn cmd_parity_check(
             enable_thinking: false,
             no_thinking: false,
         },
+        Some(&tokenizer),
         &prompt_text,
     )?;
 
@@ -3668,6 +3979,7 @@ fn cmd_parity_capture(
                 temperature: 0.0,
                 top_p: 1.0,
                 top_k: 0,
+                min_p: 0.0,
                 repetition_penalty: 1.0,
                 max_tokens: tokens,
                 chat_template: None,
@@ -3677,6 +3989,7 @@ fn cmd_parity_capture(
                 enable_thinking: false,
                 no_thinking: false,
             },
+            Some(&tokenizer),
             &prompt_text,
         )?;
 
@@ -3716,9 +4029,10 @@ fn cmd_parity_capture(
 mod tests {
     use super::{
         detect_greedy_repetition_loop, find_special_token_stop, maybe_print_serve_banner,
-        render_jinja_template, resolve_enable_thinking, run_decode_loop,
-        should_enable_kv_persist, DecodeStopReason, FALLBACK_GEMMA4_API_CHAT_TEMPLATE,
-        FALLBACK_GEMMA4_CHAT_TEMPLATE,
+        llama_cpp_special_token_id_for_model, render_jinja_template,
+        resolve_enable_thinking, run_decode_loop,
+        should_enable_kv_persist, special_token_safe_prefix, DecodeStopReason,
+        FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
     use crate::backends::chat_templates::QWEN3_CHATML;
     use crate::cli;
@@ -3728,6 +4042,22 @@ mod tests {
     use crate::serve::provenance::Provenance;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn llama_cpp_gpt2_special_token_defaults_match_vocab_cpp() {
+        assert_eq!(
+            llama_cpp_special_token_id_for_model("gpt2", "tokenizer.ggml.bos_token_id"),
+            Some(11)
+        );
+        assert_eq!(
+            llama_cpp_special_token_id_for_model("gpt2", "tokenizer.ggml.eos_token_id"),
+            Some(11)
+        );
+        assert_eq!(
+            llama_cpp_special_token_id_for_model("gpt2", "tokenizer.ggml.padding_token_id"),
+            None
+        );
+    }
 
     fn synthetic_serve_banner_info() -> LoadInfo {
         LoadInfo {
@@ -4308,15 +4638,13 @@ mod tests {
     }
 
     #[test]
-    fn special_token_stop_im_start_leak_after_end_marker_stops() {
+    fn special_token_stop_end_marker_before_im_start_stops_at_end() {
         // 2026-05-02 candy-thinking degeneracy: post-`<|end|>` model
         // hallucinates a new `<|im_start|>user` turn and echoes the prompt.
-        // Must stop at the first matching marker.
+        // `<|im_start|>` is not a llama.cpp-style stop by itself, but the
+        // preceding end marker is.
         let s = "thinking content<|end|>\n\n<|im_start|>user\necho";
-        // Iterator order: <|im_end|> miss → <|endoftext|> miss → <|im_start|>
-        // hit. So the returned marker is `<|im_start|>` (NOT `<|end|>`,
-        // which comes later in the array even though earlier in the string).
-        assert_eq!(find_special_token_stop(s), Some("<|im_start|>"));
+        assert_eq!(find_special_token_stop(s), Some("<|end|>"));
     }
 
     #[test]
@@ -4347,13 +4675,13 @@ mod tests {
     }
 
     #[test]
-    fn special_token_stop_degenerate_im_start_only_stops() {
-        // 2026-05-02 follow-up: with `<|im_start|>` removed from stops, the
-        // model emitted bare `<|im_start|>` repeatedly until n-gram
-        // repetition fired at step 520. Pin: bare-`<|im_start|>` sequence
-        // STOPS immediately on the first occurrence.
+    fn special_token_stop_degenerate_im_start_only_does_not_stop() {
+        // llama.cpp does not treat `<|im_start|>` as an implicit reverse
+        // prompt in the normal completion sampler. Stopping here causes the
+        // Qwen no-thinking path to terminate before the model can continue
+        // after a generated ChatML opener.
         let s = "<|im_start|>\n\n<|im_start|>";
-        assert_eq!(find_special_token_stop(s), Some("<|im_start|>"));
+        assert_eq!(find_special_token_stop(s), None);
     }
 
     #[test]
@@ -4367,12 +4695,43 @@ mod tests {
     }
 
     #[test]
-    fn special_token_stop_iterator_order_is_array_order() {
-        // Pin the tie-break: when multiple stops are present, array order
-        // determines which marker is returned. `<|im_end|>` is index 0, so
-        // it wins even when `<|end|>` appears earlier in the string.
+    fn special_token_stop_earliest_marker_wins() {
+        // Pin the tie-break: when multiple stops are present, stop at the
+        // earliest byte position. This matches streaming behavior: once a
+        // complete stop marker appears, later text is not part of the answer.
         let s = "x<|end|>y<|im_end|>z";
-        assert_eq!(find_special_token_stop(s), Some("<|im_end|>"));
+        assert_eq!(find_special_token_stop(s), Some("<|end|>"));
+    }
+
+    #[test]
+    fn special_token_safe_prefix_holds_partial_marker_suffix() {
+        let (safe, marker) = special_token_safe_prefix("answer<|im_en");
+        assert_eq!(safe, "answer");
+        assert_eq!(marker, None);
+    }
+
+    #[test]
+    fn special_token_safe_prefix_clips_complete_marker() {
+        let (safe, marker) = special_token_safe_prefix("answer<|im_end|>user");
+        assert_eq!(safe, "answer");
+        assert_eq!(marker, Some("<|im_end|>"));
+    }
+
+    #[test]
+    fn qwen35_visible_generated_prefix_hides_generated_assistant_opener() {
+        let (visible, marker) =
+            super::qwen35_visible_generated_prefix("<|im_start|>assistant\nanswer");
+        assert_eq!(visible, "answer");
+        assert_eq!(marker, None);
+    }
+
+    #[test]
+    fn qwen35_visible_generated_prefix_takes_latest_assistant_turn() {
+        let raw = "<|im_start|>user\nWhat is 2+2?<|im_end||\n\n\
+                   <|im_start|>assistant\n4";
+        let (visible, marker) = super::qwen35_visible_generated_prefix(raw);
+        assert_eq!(visible, "4");
+        assert_eq!(marker, None);
     }
 
     // ---- enable_thinking plumbing into chat-template render ----------
@@ -4455,6 +4814,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             top_k: 0,
+            min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: 1,
             chat_template: None,
@@ -4480,10 +4840,11 @@ mod tests {
     // /opt/llama.cpp/common/chat-diff-analyzer.cpp:319-401 and
     // /opt/llama.cpp/common/chat.cpp:244-257 — is to render the
     // resolved chat template TWICE with `enable_thinking=true` then
-    // `=false`, and check if the bytes differ. If they do, the
-    // template branches on the variable → the model class supports
-    // thinking → default-on. Tests below pin every leg of that
-    // contract.
+    // `=false`, then recover whether the enabled render actually opens a
+    // reasoning block. Plain byte inequality is too broad for Qwen3:
+    // llama.cpp's own test_template.py expects Qwen-Qwen3-0.6B auto to end
+    // at `<|im_start|>assistant\n`, even though `reasoning=off` appends an
+    // empty `<think></think>` suppressor.
 
     use super::template_supports_enable_thinking;
 
@@ -4509,6 +4870,28 @@ mod tests {
         assert!(
             !template_supports_enable_thinking(template),
             "thinking-agnostic template MUST NOT be flagged"
+        );
+    }
+
+    #[test]
+    fn template_supports_enable_thinking_false_for_plain_qwen3_suppressor_template() {
+        // Mirrors llama.cpp tools/server/tests/unit/test_template.py:
+        // Qwen-Qwen3-0.6B with reasoning=auto ends at the bare assistant
+        // generation prompt, while reasoning=off appends an empty
+        // `<think></think>` suppressor. This is a real byte difference, but
+        // it is NOT evidence that auto should open thinking.
+        let template = "{%- for m in messages -%}\
+                        <|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n\
+                        {%- endfor -%}\
+                        {%- if add_generation_prompt -%}\
+                        <|im_start|>assistant\n\
+                        {%- if enable_thinking is defined and enable_thinking is false -%}\
+                        <think>\n\n</think>\n\n\
+                        {%- endif -%}\
+                        {%- endif -%}";
+        assert!(
+            !template_supports_enable_thinking(template),
+            "a disabled-only empty think suppressor must not auto-enable thinking"
         );
     }
 
@@ -4671,9 +5054,9 @@ mod tests {
     /// `tokens[0]` is returned on the first step_model call, `tokens[1]`
     /// on the second, etc. Panics if the loop calls past the supplied
     /// stream — that's a test-author bug.
-    fn canned_step_model(tokens: Vec<u32>) -> impl FnMut(u32, i32) -> super::Result<u32> {
+    fn canned_step_model(tokens: Vec<u32>) -> impl FnMut(u32, i32, &[u32]) -> super::Result<u32> {
         let mut iter = tokens.into_iter();
-        move |_prev, _pos| {
+        move |_prev, _pos, _generated| {
             let t = iter.next().expect("test bug: canned stream exhausted");
             Ok(t)
         }
@@ -4751,6 +5134,33 @@ mod tests {
         assert_eq!(
             outcome.stop_reason,
             DecodeStopReason::SpecialTokenLeak("<|im_end|>"),
+        );
+    }
+
+    #[test]
+    fn run_decode_loop_does_not_emit_partial_special_token_prefix() {
+        // Generated `<|im_end|>` can arrive over multiple decode steps. The
+        // loop must buffer possible stop prefixes and emit no part of the
+        // marker before the final `>` makes the stop detectable.
+        let mut deltas: Vec<String> = Vec::new();
+        let outcome = run_decode_loop(
+            b'<' as u32,
+            10,
+            1024,
+            16,
+            &[999],
+            canned_step_model("<|im_end|>".bytes().skip(1).map(|b| b as u32).collect()),
+            ascii_decode,
+            |event| deltas.push(event.delta.to_string()),
+        )
+        .expect("ok");
+        assert_eq!(
+            outcome.stop_reason,
+            DecodeStopReason::SpecialTokenLeak("<|im_end|>")
+        );
+        assert!(
+            deltas.iter().all(|d| d.is_empty()),
+            "partial stop marker leaked through deltas: {deltas:?}"
         );
     }
 
@@ -4865,7 +5275,7 @@ mod tests {
             1024,
             5,
             &[999],
-            |_prev, pos| -> super::Result<u32> {
+            |_prev, pos, _generated| -> super::Result<u32> {
                 Err(anyhow::anyhow!("synthetic forward failure at pos {pos}"))
             },
             ascii_decode,

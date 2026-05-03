@@ -3538,6 +3538,7 @@ fn generate_once_with_soft_tokens(
             temperature: params.temperature as f64,
             top_p: params.top_p as f64,
             top_k: params.top_k,
+            min_p: 0.0,
             repetition_penalty: params.repetition_penalty as f64,
             max_tokens: params.max_tokens,
         })
@@ -5769,6 +5770,7 @@ fn generate_stream_once(
             temperature: params.temperature as f64,
             top_p: params.top_p as f64,
             top_k: params.top_k,
+            min_p: 0.0,
             repetition_penalty: params.repetition_penalty as f64,
             max_tokens: params.max_tokens,
         })

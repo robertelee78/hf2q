@@ -495,16 +495,20 @@ pub struct GenerateArgs {
     pub max_tokens: usize,
 
     /// Sampling temperature (0.0 = greedy)
-    #[arg(long, default_value = "0.7")]
+    #[arg(long, default_value = "0.8")]
     pub temperature: f64,
 
     /// Top-p nucleus sampling
-    #[arg(long, default_value = "0.9")]
+    #[arg(long, default_value = "0.95")]
     pub top_p: f64,
 
     /// Top-k sampling (0 = disabled)
-    #[arg(long, default_value = "50")]
+    #[arg(long, default_value = "40")]
     pub top_k: usize,
+
+    /// Min-p sampling (0.0 = disabled)
+    #[arg(long, default_value = "0.05")]
+    pub min_p: f64,
 
     /// Repetition penalty (1.0 = disabled)
     #[arg(long, default_value = "1.0")]
