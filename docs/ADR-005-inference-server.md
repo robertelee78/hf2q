@@ -8293,3 +8293,51 @@ Help-text on the `--temperature` flag tightened to mirror llama-cli's
 `--temp 0` semantics and call out the EOS-early-stop trade-off for
 stochastic mode. Full singleton test suite passes 2784/2784.
 
+
+---
+
+### Session entry — 2026-05-03 (afternoon, sixth iter): long-context attention
+### gap identified — hf2q sdpa_decode scales worse than llama.cpp's flash_attn
+
+**Direct comparison at varied decode lengths** (qwen3.6-35B-A3B-dwq48,
+M5 Max Metal):
+
+| Decode length | llama-bench tg | hf2q greedy   | Delta          |
+| ------------- | -------------- | ------------- | -------------- |
+| 200           | 119.77 ± 0.12  | 122.7         | hf2q +2.9 (faster) |
+| 500           | 118.74 ± 0.31  | 115.8         | hf2q -2.9 (slower) |
+| 1000          | 117.39 ± 0.11  | 105.2         | hf2q -12.2 (slower)|
+
+llama.cpp barely loses speed across 5x context (-2.4 t/s). hf2q loses
+17.5 t/s. Mission exit-criteria gap: at decode lengths > ~500 hf2q is
+slower than llama.cpp.
+
+**Root cause.** hf2q's Qwen35 decode-time attention dispatches
+`dispatch_sdpa_decode` (`mlx-native/src/ops/sdpa_decode.rs`) at the two
+call sites in `gpu_full_attn.rs` (line 1646: `apply_sdpa_with_kv_cache`,
+line 2648: `apply_sdpa_with_kv_cache_decode_into`). mlx-native ALSO
+ships `flash_attn_vec` (`mlx-native/src/ops/flash_attn_vec.rs`) which
+is the SIMD-vectorized decode-path SDPA ported from llama.cpp's
+`flash_attn_ext_vec`. The Gemma path in `forward_mlx.rs` already uses
+`flash_attn_vec`/`flash_attn_vec_tq`. Qwen35 was never wired to it.
+
+**Why this scales differently.** sdpa_decode uses a single threadgroup
+per query head with serial KV iteration (n_sg simdgroups). flash_attn_vec
+splits the KV cache across NWG=32 workgroups with an online-softmax
+reduce — bandwidth-parallel across more SIMDs at long context.
+
+**Why the swap is non-trivial.** Cache-layout mismatch: our `slot.k` /
+`slot.v` (Qwen35 `HybridKvCache`) are stored
+`[n_seqs, max_seq_len, n_kv_heads, head_dim]` row-major (per
+`kv_cache_copy_seq_f32_dual`). flash_attn_vec's metal shader documents
+`[n_kv_heads, kv_capacity, head_dim]` — head-major instead of
+position-major. The Gemma `dense_kvs` is allocated in the head-major
+layout via `kv_cache_copy_batch_f32`. Wiring flash_attn_vec into the
+Qwen35 decode path requires either (a) re-allocating slot.k/slot.v in
+the head-major layout (also needs a new kv_cache_copy variant), or
+(b) a transpose pass between sdpa step and flash_attn step.
+
+Tracked as Task #20 for next iter — significant kernel work
+(~150-300 LOC across two repos), expected to close 12+ tok/s on
+long-context workloads.
+
