@@ -8742,3 +8742,69 @@ deleted; 15 hf2q + 28 mlx-native local branches deleted; 10 remote
 branches deleted from hf2q origin and 5 from mlx-native origin.
 Both repos minimal: hf2q has only `main` + `adr017-iter17-2026-05-01`;
 mlx-native has only `main`.
+
+---
+
+## 2026-05-03 — iter-17b: kernel context-dependence empirically pinned
+
+Following on iter-17 finding (mlx-native pipeline correct in isolation;
+production produces 32 NaN at exact dim=10), this iter ran four
+context-elimination experiments in production hf2q with the
+HF2Q_DUMP_FA_BF16 instrumentation in place:
+
+| Env | Layer-3 out_bf16_hm NaN | Diagnosis |
+|---|---|---|
+| (default) | 32 (all at dim=10) | baseline reproduction |
+| HF2Q_NO_RESIDENCY=1 | 32 (all at dim=10) | not residency set |
+| HF2Q_LEGACY_PER_LAYER_CB=1 | 32 (all at dim=10) | not per-layer CB ordering |
+| HF2Q_FA_FORCE_SYNC=1 (added) | 32 (all at dim=10) | not memory_barrier insufficient |
+| HF2Q_NO_RESIDENCY + HF2Q_LEGACY_PER_LAYER_CB | 32 (all at dim=10) | combination doesn't help either |
+
+**Confirmed:** the kernel's behaviour DOES depend on production
+context, but it's NOT residency-set state, NOT CB-level ordering,
+NOT in-CB memory_barrier, NOT pipeline cache (same align_Q=false
+align_K=false function constants in both binaries).
+
+**Remaining un-eliminated context candidates:**
+
+1. Apple-Silicon-specific hardware state (cache, SIMD register file,
+   DRAM bank scheduling) under sustained memory pressure from the
+   ~25 GB resident model weights.
+2. Per-process MSL pipeline compilation producing different machine
+   code (compiler nondeterminism / function-constant code paths).
+3. Some other piece of GPU global state we haven't yet eliminated.
+
+**Pragmatic workaround paths (not yet implemented):**
+
+* **Fall back to legacy SDPA for short prefill (qL\<32)** — the
+  legacy 3-pass tiled `sdpa` kernel was the production path before
+  ADR-011 Phase 1a; reactivate it via a runtime predicate on
+  `seq_len < 32` (or similar threshold).  Trade-off: slower for
+  short prefill but bit-correct.
+* **Pad Q to BQ=32 with zero rows + mask the padding** — change the
+  dispatcher to always feed a multiple-of-BQ qL so the kernel takes
+  the aligned-Q path (which has no NaN).  Trade-off: ~16x more FLOPs
+  for the smallest prompts; cheap in absolute terms (a 2-token
+  prefill becomes a 32-token prefill that still completes in
+  millions of clocks).
+* **Add HF2Q_NO_FA short-circuit** — there's already an
+  `HF2Q_NO_FA=1` env flag at `serve/forward_prefill_batched.rs:237`;
+  understand whether wiring it through the qwen35 prefill path is
+  feasible.
+
+**Tests pinned by this iter:**
+* `mlx-native@91d3337` — `test_repro_production_bf16_bytes_direct`
+  (loads hf2q's exact bf16 input dumps and runs the kernel; gets
+   0 NaN; proves kernel is non-deterministic vs production context)
+* `hf2q@6731db2` — `HF2Q_DUMP_FA_BF16=1` instrumentation (dumps
+  arena.q/k/v/out_bf16_hm immediately post-kernel)
+
+**Next iter options:**
+1. Implement workaround #1 or #2 (1-2 hour change), validate, ship
+   the coherence fix.  Performance cost is small for the tiny prompts
+   that hit this bug.
+2. Continue digging into the kernel's machine-code to find the
+   specific instruction that produces NaN at dim=10 — could take
+   days; productive only if we want to fix the kernel itself.
+
+User to direct.
