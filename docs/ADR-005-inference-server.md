@@ -9070,3 +9070,42 @@ follow-up.
   per-layer-loop instrumentation in a future session.
 * The remaining 15-20 % long-prefill gap is in mlx-native's MoE
   matmul kernel (mul_mm_id), tracked under task #21 / ADR-015.
+
+---
+
+## 2026-05-04 — iter-19: K-boundary periodic sync did NOT fix FRESH
+
+Implemented option 2 from iter-17e: insert `commit_and_wait` at every
+K-boundary in the layer loop (when no encoder is held into Phase-1
+fusion), gated on `seq_len < 32` so long-prefill perf is preserved.
+
+For Qwen3.6 with default `HF2Q_FFN_TERMINAL_K_BATCH=1`, this fires
+at every layer (40 sync points across the prefill).
+
+Result on FRESH dwq48 + "Hi": **STILL all-NaN, still `!!!`**.
+
+So neither:
+* iter-18 option 1 (commit between RMSNorm and lm_head)
+* iter-19 option 2 (commit at every K-boundary in layer loop)
+
+…fixes FRESH while only `HF2Q_DUMP_LAYER=ALL` does.  The masking is
+something MORE than per-layer commit_and_wait — likely the multiple
+`flush_gpu` calls at every dump_in_layer point (per FA layer there
+are ~10 dump points: x_norm, q_flat, q_normed, q_rope, k_*, v_*,
+gate_flat, sdpa_out — each calling flush_gpu).
+
+This is a 4 to 10x denser sync grid than per-layer alone.  Reverted
+iter-19 cleanly; OLD GGUF unchanged.
+
+**Final conclusion:** the FRESH dwq48 GGUF runtime quirk requires
+either:
+(a) a much denser sync injection across kernel ops (pessimistic — would
+    halve perf on FRESH GGUF prefill but provably masks the bug), OR
+(b) finding the specific kernel write/read race and fixing the
+    barrier locally (could be days of mlx-native instrumentation), OR
+(c) a different kernel implementation for FRESH-specific tensor
+    layouts.
+
+**Mission disposition (final):** OLD dwq48 GGUF meets all criteria
+end-to-end.  Production should consume that GGUF.  FRESH is deferred
+pending future deep-dive instrumentation.
