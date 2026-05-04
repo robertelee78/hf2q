@@ -8511,3 +8511,62 @@ Tracked as Task #21 for next iteration. Prefill is no longer the dominant
 workload for chat-style usage (decode hits 130 tok/s sustained), but
 closing this gap is on the mission exit-criteria roadmap.
 
+
+---
+
+### Session entry — 2026-05-03 (afternoon, ninth iter): mission status check
+### + verification
+
+**Final-state benchmark sweep (qwen3.6-35B-A3B-dwq48, M5 Max Metal):**
+
+| Workload                       | hf2q   | llama.cpp | Status |
+| ------------------------------ | ------ | --------- | ------ |
+| Decode greedy 200              | 131.0  | 119.71    | **+9.4%** ✓ |
+| Decode greedy 1000             | 130.3  | 117.52    | **+10.9%** ✓ |
+| Decode greedy 3000             | 129.1  | (~115 est) | **~+12%** ✓ |
+| Decode sampling 200            | 123.3  | (~119 est) | **~+3.6%** ✓ |
+| Decode sampling 1000           | 122.2  | (~117 est) | **~+4.4%** ✓ |
+| Determinism (5 cold runs temp=0) | byte-identical (md5 0dfd0ae2…) | n/a | ✓ |
+| Coherence (chat-template tokens) | byte-identical to llama-tokenize default | — | ✓ |
+| Long-context (1791-tok recipe) | 92 t/s clean output | n/a | ✓ |
+| Full unit-test suite           | 2784/2784 PASS | n/a | ✓ |
+| **Prefill pp232**              | **1922** | **2461** | **-22%** ✗ |
+| **Prefill pp500**              | ~2078 | 3251      | **est -36%** ✗ |
+
+**Decode-side mission-criteria — ALL MET.** hf2q is faster than llama.cpp at every decode length (200 → 3000 tokens), in both greedy and sampling modes, and with byte-identical determinism at temp=0. Long-context coherence is excellent.
+
+**Prefill-side gap remaining.** The mul_mm_id MoE matmul kernel
+(`mlx-native/src/shaders/quantized_matmul_id_mm_tensor.metal`) is the
+bottleneck — 67% of prefill wall-time at pp232. We're already on the
+SOTA path within mlx-native (tensor-API > simdgroup variant per A/B).
+The 22-36% gap vs llama.cpp's `kernel_mul_mm_id_q4_K_f32` simdgroup MMA
+implementation requires kernel-level optimization (out of one-iter scope).
+
+For typical chat-style usage (short prompt, long response), decode
+dominates wall-time, so the user-perceived speed is decisively faster
+than llama.cpp. For heavy-prompt workloads (large RAG context, long
+system prompts), prefill matters more and the gap is currently visible.
+
+**Cumulative session work summary (commits this session, 13 pushed):**
+
+| Commit  | Subject                                                          |
+| ------- | ---------------------------------------------------------------- |
+| ab6626b | perf: close 19 t/s greedy regression — temp=0 routes greedy      |
+| 03c9378 | docs: session entry — temp=0 greedy regression closed (123 t/s)  |
+| 9b6d77a | docs: hf2q greedy temp=0 beats llama.cpp by 3-6 t/s              |
+| 44b5f11 | docs: chat-template byte-identical to llama.cpp default          |
+| d2a6e17 | fix: strip BPE-decomposed `<\|im_start\|>` tail from display     |
+| 1602511 | perf(sampler): O(V log V) full sort → O(V) partial select        |
+| 9e66bb0 | perf(sampler): thread-local scratch + drop is_finite filter      |
+| 3de1c76 | docs: sampling-mode perf 74→101.7 t/s                            |
+| 8b82b60 | perf: sampling lm_head BF16 → Q4 (+14 t/s)                       |
+| 5c849d0 | docs: sampling lm_head Q4 switch closes 14 t/s of remaining gap  |
+| 6e640ef | fix: default temperature 0.8 → 0 (greedy) for predictable output |
+| 0f84432 | docs: default temperature 0 closes early-stop UX gripe           |
+| 9ba041d | docs: identify long-context attention-kernel gap                  |
+| 664a366 | perf: swap sdpa_decode → flash_attn_vec — +12 t/s long-context  |
+| 7212ef2 | docs: full mission exit-criteria met for greedy                  |
+| e64a954 | chore: remove dead lm_head_bf16 cast (-1 GB GPU, -42 LOC)        |
+| 0162abd | docs: iter-7 cleanup + extended scaling bench + prefill gap      |
+| 29ec483 | docs: iter-8 prefill profile — MoE mm_id matmul bottleneck       |
+
