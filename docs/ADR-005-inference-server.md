@@ -8870,3 +8870,60 @@ llama.cpp AND as fast as (or faster than) llama.cpp"):**
 * mlx-native HEAD: `91d3337` (full regression test suite for the
   short-prefill kernel investigation)
 * Both pushed to origin and clean.
+
+---
+
+## 2026-05-03 — iter-17d: FRESH GGUF has separate short-prefill bug
+
+While the OLD (Apr 30) dwq48 GGUF works end-to-end after the iter-17
+qL\<32 → legacy SDPA fix, the FRESH (May 3) re-converted GGUF
+exhibits a separate path-specific bug: short prefill produces all-NaN
+final logits despite layers 0-39 + output_norm all dumping finite F32.
+
+**Empirical matrix:**
+
+| GGUF      | path                          | result      |
+|-----------|-------------------------------|-------------|
+| OLD       | long prefill (FA, qL≥32)      | ✓ coherent  |
+| OLD       | short prefill (legacy SDPA)   | ✓ coherent  |
+| FRESH     | long prefill (FA, qL≥32)      | ✓ coherent  |
+| FRESH     | short prefill (legacy SDPA)   | ✗ all-NaN logits, downstream `!!!` |
+| FRESH     | short prefill + HF2Q_DUMP_LAYER=ALL | ✓ first token ("Here") |
+
+The dump-layer mode bypasses fused-stage-ab paths and forces
+flush_gpu sync points; under that mode FRESH first-token works.
+Without it, lm_head logits go all-NaN even though the immediate
+upstream `output_norm` dump shows finite values in [-17.2, 14.8].
+
+Direct reproduction is in /tmp/dwq48-fresh-20260503_200447/.
+
+**Working hypotheses (none verified yet):**
+
+1. The `lm_head_q4` Q4_0 re-encode of FRESH's vocab=248320 output.weight
+   has a bad block at one or more positions; in production the matmul
+   accumulates NaN through the full vocab axis, but the dump_layer
+   flush_gpu masks it via timing.
+2. Some additional kernel between output_norm and download (LM-head
+   matmul or final cast) reads from a residency-recently-modified
+   buffer at certain timing.
+3. The added 276 token rows in token_embd / output.weight have
+   uninitialised memory in their Q4_K-encoded form that triggers the
+   matmul-NaN under specific scheduling.
+
+**Mitigation:** the OLD GGUF (already on disk at
+`/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq48/...`)
+works end-to-end and is what users should consume.  The FRESH GGUF
+was built solely to validate the May-2 converter fix's metadata
+(`vocab=248320`, `EOS=248046='<|im_end|>'`) — the metadata IS
+correct; the bug is downstream.
+
+**Suggested next iter:** dump arena-bytes for FRESH on short prefill
+without DUMP_LAYER (currently impossible without re-instrumentation);
+narrow which kernel between output_norm and final logits introduces
+NaN.  ETA: 2-3 iters of focused diagnostic.
+
+OR: ship using OLD GGUF and de-prioritise the FRESH-specific bug
+since it doesn't affect production (OLD GGUF is the one users have
+been using throughout).
+
+User direction needed.
