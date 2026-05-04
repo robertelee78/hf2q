@@ -1448,6 +1448,49 @@ pub fn apply_flash_attn_prefill_seq_major(
         // so no deferred removeAllocation: is staged — iter58b race is
         // structurally unreachable (queen plan A.5 / ADR-013 P21 S1).
         enc.commit_labeled("fa.prefill_bridge");
+
+        // ── ITER-17 DIAGNOSTIC (HF2Q_DUMP_FA_BF16=1) ────────────────────
+        // Dim=10 NaN bug investigation: dump arena.out_bf16_hm bytes
+        // immediately after kernel commit (synchronized via fresh empty
+        // encoder commit_and_wait) so we can compare bf16 buffer state
+        // directly to mlx-native test's expected bf16 output.  Cost: one
+        // commit_and_wait + raw byte memcpy when env is set; zero when
+        // unset.  Output: /tmp/hf2q_fa_bf16_layerNNN_step0.bin (bf16
+        // little-endian, [nh, seq, d] head-major layout).
+        if std::env::var("HF2Q_DUMP_FA_BF16").as_deref() == Ok("1") {
+            // Sync: wait for the just-committed CB (and therefore the
+            // kernel write to out_bf16_hm) to actually land.
+            let mut sync_enc = device.command_encoder()
+                .context("FA bridge: dump sync encoder")?;
+            sync_enc.commit_and_wait()
+                .context("FA bridge: dump sync commit_and_wait")?;
+
+            // Read raw bytes from arena buffers (StorageModeShared → memcpy).
+            let layer_idx = super::dump_bisect::current_layer_idx();
+            let step_idx = super::dump_bisect::current_step_idx();
+
+            for (label, buf) in [
+                ("q_bf16_hm",   &arena.q_bf16_hm),
+                ("k_bf16_hm",   &arena.k_bf16_hm),
+                ("v_bf16_hm",   &arena.v_bf16_hm),
+                ("out_bf16_hm", &arena.out_bf16_hm),
+            ] {
+                let bytes = buf.as_slice::<u8>()
+                    .map_err(|e| anyhow!("FA bridge: dump as_slice {label}: {e}"))?;
+                let path = format!(
+                    "/tmp/hf2q_fa_bf16_step{:04}_layer{:03}_{}.bin",
+                    step_idx,
+                    layer_idx.unwrap_or(999),
+                    label,
+                );
+                std::fs::write(&path, bytes)
+                    .with_context(|| format!("FA bridge: dump write {}", path))?;
+            }
+            tracing::info!(
+                "iter-17 dump: wrote 4× arena bf16 buffers for layer {:?} step {}",
+                layer_idx, step_idx,
+            );
+        }
     } else {
         // ── Fallback path (fa_arena=None): per-call alloc + commit_and_wait ──
         //

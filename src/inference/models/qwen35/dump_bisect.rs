@@ -171,6 +171,17 @@ thread_local! {
     static CURRENT_STEP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// Read the current per-thread (step, layer_idx) for use by ad-hoc
+/// diagnostic dumps that share the dump_bisect manifest's run id but
+/// don't go through `dump_in_layer`.
+pub fn current_layer_idx() -> Option<usize> {
+    CURRENT_LAYER.with(|c| c.get())
+}
+
+pub fn current_step_idx() -> u64 {
+    CURRENT_STEP.with(|c| c.get())
+}
+
 /// Set the current (step, layer) tag used by within-layer dump call sites.
 /// Call this from `forward_gpu_*` at the top of each layer's iteration.
 pub fn set_current_layer(step: u64, layer_idx: usize) {
