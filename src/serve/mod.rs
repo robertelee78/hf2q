@@ -1459,8 +1459,34 @@ fn detect_greedy_repetition_loop(decoded_tokens: &[u32]) -> Option<(usize, usize
 /// present in the input (`Iterator::find` returns the first hit). The
 /// surrounding decode loop in `cmd_generate_qwen35` does not depend on which
 /// fragment matched — it just stops on Some.
+// Text-fragment stop-strings for finetunes that emit special tokens as
+// BPE-decomposed bytes instead of as proper integer ids. Matches the
+// stop-string contract of llama.cpp's CLI (`-r` / `--reverse-prompt`).
+//
+// 2026-05-03 — switched the leading marker from `<|im_end|>` to
+// `<|im_start|>user`. On thinking-capable Qwen3 finetunes (notably the
+// abliterix-EGA-abliterated dwq48 file in this repo's models/), the
+// model emits `<|im_end|>` as a SEGMENT separator BETWEEN the thinking
+// trace and the actual answer:
+//
+//   [thinking]<|im_end|>\n<|im_start|>assistant\n[ANSWER]<|im_end|>\n<|im_start|>user\n[hallucinations]
+//                       ^                                            ^
+//                       segment break, NOT turn-end                   model's "I've finished my
+//                                                                    assistant turn" signal
+//
+// Stopping on the first `<|im_end|>` (the previous default — matches a
+// properly-trained Qwen3 checkpoint, which uses `<|im_end|>` ONLY at
+// turn-end) cut generation off before the answer was emitted. The
+// turn-end signal on this finetune is the NEXT-turn opener
+// `<|im_start|>user` (the model is hallucinating the next user input).
+// Stopping there preserves the full assistant response (thinking +
+// segment markers + answer + closing `<|im_end|>`).
+//
+// `<|endoftext|>` and `<|end|>` cover other end-of-generation markers
+// (some Phi-3 / GPT-2 era models emit these as bytes).
 const SPECIAL_TOKEN_STOPS: &[&str] = &[
-    "<|im_end|>",
+    "<|im_start|>user",
+    "<|im_start|>system",
     "<|endoftext|>",
     "<|end|>",
 ];
@@ -4779,12 +4805,25 @@ mod tests {
     }
 
     #[test]
-    fn special_token_stop_im_end_text_fragment_stops() {
-        // Distill / merge variant emits `<|im_end|>` as a multi-token text
-        // fragment instead of as integer id 151645, slipping past the
-        // integer-id eos check.
+    fn special_token_stop_im_end_alone_is_not_a_stop() {
+        // 2026-05-03 — `<|im_end|>` was REMOVED from SPECIAL_TOKEN_STOPS.
+        // On thinking-capable Qwen3 finetunes (e.g. abliterix-EGA-
+        // abliterated dwq48) the model emits `<|im_end|>` as a SEGMENT
+        // separator BETWEEN thinking and the actual answer, NOT as a
+        // turn-end marker. Stopping there cut generation off before the
+        // answer was emitted. The turn-end signal on this finetune is the
+        // NEXT-turn opener `<|im_start|>user` — see
+        // `special_token_stop_im_start_user_signals_turn_end` below.
         let s = "answer text<|im_end|>";
-        assert_eq!(find_special_token_stop(s), Some("<|im_end|>"));
+        assert_eq!(find_special_token_stop(s), None);
+    }
+
+    #[test]
+    fn special_token_stop_im_start_user_signals_turn_end() {
+        // The model hallucinating the next user turn = it has finished
+        // its assistant turn. Stop here.
+        let s = "[thinking]<|im_end|>\n<|im_start|>assistant\n[answer]<|im_end|>\n<|im_start|>user\nnext";
+        assert_eq!(find_special_token_stop(s), Some("<|im_start|>user"));
     }
 
     #[test]
@@ -4804,12 +4843,16 @@ mod tests {
     }
 
     #[test]
-    fn special_token_stop_french_toast_im_end_then_im_start_caught_by_im_end() {
-        // 2026-05-02 original French-Toast leak:
-        // `<|im_end|>...<|im_start|>assistant\n<|im_start|>assistant`.
-        // First-in-array `<|im_end|>` wins.
+    fn special_token_stop_im_end_then_assistant_role_no_user_does_not_stop() {
+        // 2026-05-03 — the original French-Toast leak fixture
+        // (`<|im_end|>` followed by `<|im_start|>assistant`) is NOT a
+        // turn boundary on the finetunes that emit `<|im_end|>` as a
+        // segment separator. Without a `<|im_start|>user` follow-up,
+        // generation continues. (For models that emit id 151645
+        // properly, integer-EOS catches first; this list is the
+        // text-fragment fallback only.)
         let s = "answer<|im_end|>\n<|im_start|>assistant\nleak";
-        assert_eq!(find_special_token_stop(s), Some("<|im_end|>"));
+        assert_eq!(find_special_token_stop(s), None);
     }
 
     #[test]
@@ -5242,8 +5285,9 @@ mod tests {
     #[test]
     fn run_decode_loop_stops_on_special_token_leak() {
         // Stream produces a sequence whose decoded text contains
-        // `<|im_end|>` (one of SPECIAL_TOKEN_STOPS). Use a custom
-        // decode_text that injects the leak after step 2.
+        // `<|im_start|>user` (one of SPECIAL_TOKEN_STOPS — the model
+        // hallucinating the next user turn = its assistant turn is over).
+        // Use a custom decode_text that injects the leak after step 2.
         let mut step = 0;
         let outcome = run_decode_loop(
             b'A' as u32,
@@ -5256,7 +5300,7 @@ mod tests {
                 step += 1;
                 let mut s: String = toks.iter().map(|&t| char::from(t as u8)).collect();
                 if step >= 3 {
-                    s.push_str("<|im_end|>");
+                    s.push_str("<|im_start|>user");
                 }
                 s
             },
@@ -5265,14 +5309,14 @@ mod tests {
         .expect("ok");
         assert_eq!(
             outcome.stop_reason,
-            DecodeStopReason::SpecialTokenLeak("<|im_end|>"),
+            DecodeStopReason::SpecialTokenLeak("<|im_start|>user"),
         );
     }
 
     #[test]
     fn run_decode_loop_streams_raw_deltas_then_stops_on_full_marker() {
         // 2026-05-03 — the inference layer now emits RAW decoded text. As
-        // `<|im_end|>` arrives byte-by-byte, each partial prefix is
+        // `<|im_start|>user` arrives byte-by-byte, each partial prefix is
         // streamed to the caller AS-IS. Once the full marker assembles in
         // the cumulative text, the SpecialTokenLeak stop fires.
         //
@@ -5285,26 +5329,27 @@ mod tests {
         // llama.cpp's libllama doesn't do that surgery either; the CLI /
         // application layer is responsible for any user-facing formatting.
         let mut deltas: Vec<String> = Vec::new();
+        const TARGET: &str = "<|im_start|>user";
         let outcome = run_decode_loop(
             b'<' as u32,
             10,
             1024,
-            16,
+            32,
             &[999],
-            canned_step_model("<|im_end|>".bytes().skip(1).map(|b| b as u32).collect()),
+            canned_step_model(TARGET.bytes().skip(1).map(|b| b as u32).collect()),
             ascii_decode,
             |event| deltas.push(event.delta.to_string()),
         )
         .expect("ok");
         assert_eq!(
             outcome.stop_reason,
-            DecodeStopReason::SpecialTokenLeak("<|im_end|>")
+            DecodeStopReason::SpecialTokenLeak("<|im_start|>user")
         );
-        // Deltas concatenate to the FULL `<|im_end|>` text — partial
-        // prefixes ARE streamed (raw inference layer; caller decides
-        // whether to display them).
+        // Deltas concatenate to the FULL marker text — partial prefixes
+        // ARE streamed (raw inference layer; caller decides whether to
+        // display them).
         let joined: String = deltas.concat();
-        assert_eq!(joined, "<|im_end|>");
+        assert_eq!(joined, TARGET);
     }
 
     #[test]
