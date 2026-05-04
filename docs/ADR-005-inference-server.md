@@ -9158,3 +9158,60 @@ all measured lengths.
 ADR-005 inference-server work for this session is **COMPLETE**.
 qL<16 gap and FRESH GGUF deeper hardware-context bug deferred to
 future deep-dive sessions.
+
+---
+
+## 2026-05-04 — iter-21: padded short-prefill attempt didn't work
+
+Attempted to close the qL<16 gap by padding Q/K/V to qL=16 with
+zero rows and routing through the FA path (which is known coherent
+at qL>=16).  Implementation inlined a new `short_pad_eligible` branch
+in `apply_sdpa_with_kv_cache` that:
+
+1. Allocated padded F32 Q/K/V buffers of size [16, h, d] (zeroed).
+2. CPU memcpy first seq_len rows from q/k/v_seq_major.
+3. Dispatched apply_flash_attn_prefill_seq_major at qL=16.
+4. Sliced output back to seq_len rows.
+
+**Result:** still all-NaN.  Even with `HF2Q_DUMP_LAYER=ALL` the
+output was empty (model produced 0 useful tokens).  Likely the CPU
+memcpy across the StorageModeShared boundary into the buffer that
+the next encoder reads doesn't get the explicit fence that Apple
+needs in this code path; or the FA kernel still produces NaN for
+the padded inputs because the bug is hardware-context-dependent
+on something other than the kL_rem partial-tile mask.
+
+Reverted cleanly.  Production state on OLD GGUF unchanged.
+
+**Final disposition for this session:**
+
+The qL<16 gap requires either:
+* A more sophisticated padding scheme that uses the existing
+  arena's BF16 buffers and dispatches the cast/permute through the
+  GPU instead of CPU memcpy (eliminates any CPU/GPU coherence
+  concerns).  Estimated 100-150 LOC change.
+* OR a kernel-level fix at the partial-K-tile mask boundary in
+  `flash_attn_prefill.metal` (deeper investigation; the dim=10
+  pattern suggests one specific lane in the MMA frag).
+
+Both deferred to future sessions.
+
+**Final session deliverables (all committed + pushed):**
+* hf2q `1ecbe0a` — qL>=16 FA gate fix; ADR-005 iter-17 to iter-20
+  documentation chain
+* mlx-native `91d3337` — three regression tests pinning kernel
+  correctness on real production input bytes
+* 30+ branches + worktrees cleaned across both repos
+
+**Mission criteria evaluation (production OLD dwq48 GGUF):**
+* coherence parity with llama.cpp on greedy temp=0 — ✅
+* decode +11% faster than llama.cpp — ✅
+* mid-prefill (pp235) +21% faster — ✅
+* short-prefill qL=16-31 — ✅ (newly opened by iter-20)
+* short-prefill qL=2-15 — ⚠ deferred (workaround: pad prompt or
+  use chat-template which always tokenizes >=16)
+* long-prefill (pp512+) — ⚠ -15-20% (mlx-native kernel territory,
+  task #21 / ADR-015)
+
+ADR-005 inference-server work for this session: COMPLETE on
+production target.
