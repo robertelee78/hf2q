@@ -7328,3 +7328,109 @@ iter94 evidence files:
 - `/opt/hf2q/.cfa-archive/iter94/worker_report.md`
 - `/opt/hf2q/.cfa-archive/iter94/final-report.md` (LANDED verdict)
 
+## iter95 — K-batch silent drift CLOSED via per-layer `hidden` hold-vec
+
+**Verdict:** LANDED — AC-4 strict parity at `MLX_UNRETAINED_REFS=1`
+PASSES across all available production fixtures (3/4 PASS-IDENTICAL
++ 1 SKIP-MISSING `apex` model not present on disk). iter94 Task #5's
+defensive K=1 forced gate is REMOVED in this commit (no longer
+required as a safety net).
+
+### First-divergent layer (forensic dump_bisect, env=1+UNRETAINED+K=2)
+
+iter95 ran the iter94 Task #3 session-aware `dump_bisect` tool with a
+single-iter forensic-only env override (`HF2Q_DEBUG_BYPASS_TASK5=1`,
+removed in this same commit) to actively exercise K=2 under the
+triple combo and locate the divergence:
+
+| Layer | Op | env=0 SHA | env=1+UNRETAINED+K=2 SHA | Notes |
+|---|---|---|---|---|
+| 0 | attn_out | (correct) | **dump fails: `flush_gpu session.commit_and_wait` errors** | first dump call triggers session error |
+| 0 | ffn_out | `32248b8b` | `7d43a6d0` (= all-zero hash) | post-error reads return pre-write zeros |
+| 1+ | all | (varying) | `7d43a6d0` / `30e14955` | session is poisoned for the rest of run |
+
+Stderr captured a single line: `[DUMP_BISECT] flush_gpu failed:
+flush_gpu session.commit_and_wait`. Only ONE flush_gpu fail per
+prefill — which firing on the FIRST dump (layer 0) means the
+underlying session race manifests as soon as the K-window begins.
+
+### Root cause
+
+Per-layer iteration variable `hidden` is overwritten at each layer's
+tail (`hidden = ffn_out`, `forward_gpu.rs` ~line 3556). The
+reassignment drops the OLD `hidden`'s `MlxBuffer` Arc — at layer 0
+that Arc holds the only reference to the embed allocation outside
+the still-open session CB. Under `MLX_UNRETAINED_REFS=1` the Metal
+CB's `bind_buffer_*` calls do NOT ARC-retain the bound resource. So
+when `MlxBufferStorage::Drop` fires (`/opt/mlx-native/src/buffer.rs:68-77`),
+the deferred `removeAllocation:` is staged on the residency set —
+flushed at the next `CommandEncoder::commit*` boundary.
+
+That next boundary is the K-batch K-boundary `commit_and_wait_labeled`.
+By then the `removeAllocation:` for the embed has been staged WHILE
+the embed is STILL bound into the open session CB's encoded
+`dispatch_fused_residual_norm_f32` (which reads `hidden` as its
+residual operand at layer 0). The CB submission triggers the residency
+flush, which rescinds the embed allocation mid-flight → GPU CB
+error → silent deterministic-but-wrong output.
+
+This is the same race class as iter90b/iter92 (the `attn_out_holds`
+Vec was iter92's mitigation for the FA bridge's per-call `out_seq`),
+but for a NEW load-bearing buffer the audit had missed: the per-layer
+iteration `hidden` itself.
+
+### Fix
+
+`forward_gpu.rs` `forward_gpu_impl` — added `hidden_holds: Vec<MlxBuffer>`
+mirror of `attn_out_holds`:
+
+1. Declared just below `attn_out_holds` (~line 2671).
+2. `hidden_holds.push(hidden.clone())` at the TOP of each layer
+   iteration (~line 2768) — Arc clone before the layer body uses
+   `hidden`, so the original Arc survives the tail `hidden = ffn_out`
+   reassignment.
+3. `hidden_holds.clear()` at K-boundary (~line 3856) alongside
+   `attn_out_holds.clear()` — same gate (`seq_len > 1 && is_k_boundary
+   && last_layer_held_enc.is_none()`).
+4. Final `drop(hidden_holds)` after the output-head terminal commit
+   (~line 4030).
+5. Removed iter94 Task #5 K=1 forced gate at the K-batch decision site
+   (~line 2553–2584): the underlying race is now closed; the safety
+   net is unnecessary. Also removed the `HF2Q_DEBUG_BYPASS_TASK5`
+   forensic-only env that the dump_bisect runs needed.
+
+### LOC delta
+
+| File | Net LOC | Purpose |
+|---|---|---|
+| `forward_gpu.rs` | +99 / −27 | iter95 fix + iter94 Task #5 removal + doc |
+| `docs/ADR-015...md` (this entry) | +90 | Doc |
+| **Total** | **~190** | well within iter95 spec budget |
+
+### AC scorecard
+
+| AC | Predicate | Outcome | Evidence |
+|---|---|---|---|
+| AC-1 | env=0 hf2q tests ≥ iter94 baseline 3339/0/49 | **PASS** — 3339/0/49 (no regression) | `/opt/hf2q/.cfa-archive/iter95/ac1_env0.txt` |
+| AC-build | release build clean | **PASS** | `/opt/hf2q/.cfa-archive/iter95/build.txt` |
+| AC-4 | env=1+UNRETAINED 3/4 PASS-IDENTICAL + 1 SKIP-MISSING (apex absent) + 0 MISMATCH | **PASS** — 27b-dwq46 `63cf53ce`, 35b-q4_0-flat `7006dce6`, gemma-4-26b-dwq `dce2ad83` all match env=0 baseline byte-for-byte | `/opt/hf2q/.cfa-archive/iter95/parity_unretained_run.txt` + `parity_baseline_run.txt` |
+| AC-5 | env=1+UNRETAINED 5/5 cold-runs byte-identical top-3 | **PASS** | `/opt/hf2q/.cfa-archive/iter95/ac5_determinism.txt` |
+| AC-K-ladder | env=1+UNRETAINED K=1/2/4/8 all match baseline | **PASS** | `/opt/hf2q/.cfa-archive/iter95/postfix_27b_env1u_k{1,2,4,8}.out` |
+| AC-UNRETAINED-only | UNRETAINED-only no longer crashes at layer 7 | **PASS** | `/opt/hf2q/.cfa-archive/iter95/postfix_27b_unretained_only.out` |
+| AC-no-divergence | per-layer dump-bisect 0 divergent entries between env=0 and env=1u+K=2 | **PASS** | (re-dump after fix; 0 / 192 dump points diverged) |
+
+### iter95 evidence files
+
+- `/opt/hf2q/.cfa-archive/iter95/build.txt`
+- `/opt/hf2q/.cfa-archive/iter95/ac1_env0.txt` (3339/0/49)
+- `/opt/hf2q/.cfa-archive/iter95/parity_unretained_run.txt` (AC-4)
+- `/opt/hf2q/.cfa-archive/iter95/parity_baseline_run.txt` (env=0 reference)
+- `/opt/hf2q/.cfa-archive/iter95/ac5_determinism.txt` (5/5 byte-identical)
+- `/opt/hf2q/.cfa-archive/iter95/forensic_dump_env1u_k2.err` (the `flush_gpu failed` line)
+- `/opt/hf2q/.cfa-archive/iter95/postfix_27b_env1u_k{1,2,4,8}.out`
+- `/opt/hf2q/.cfa-archive/iter95/postfix_27b_unretained_only.out`
+- `/opt/hf2q/.cfa-archive/iter95/postfix_35b_env0.out`
+- `/opt/hf2q/.cfa-archive/iter95/postfix_35b_env1u_k8.out`
+- `/opt/hf2q/.cfa-archive/iter95/worker_report.md`
+- `/opt/hf2q/.cfa-archive/iter95/final-report.md`
+

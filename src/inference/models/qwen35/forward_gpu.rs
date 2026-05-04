@@ -2551,36 +2551,21 @@ impl Qwen35Model {
         // remaining at K=20+. Operator can override via env for memory-
         // constrained settings (smaller K = smaller pool peak).
         let ffn_terminal_k_batch: usize = {
-            // ADR-015 iter94 Task #5 — defensive runtime gate forcing K=1
-            // under the triple combo `HF2Q_ENCODER_SESSION=1` AND
-            // `MLX_UNRETAINED_REFS=1`.  iter93's K-batch ladder
-            // (.cfa-archive/iter93/27b_env1u_k{1,2,4,8}.text) showed K=1
-            // is byte-identical to baseline at this triple combo while
-            // K>=2 silently drifts (sha `e511ec27` for all K=2/4/8 on
-            // 27b-dwq46).  iter95 will close the underlying race in the
-            // intra-K ARC contract; until then, force K=1 here so
-            // production users hitting both env vars do NOT get silently
-            // wrong tokens.  See `/opt/hf2q/.cfa-archive/iter93/final-report.md`
-            // §"K-batch ladder under env=1+UNRETAINED" + §"iter94 scope".
-            // Cost: gives up K-batch perf wins on this opt-in-opt-in
-            // path — acceptable interim safety net.
-            let forced_k1 = std::env::var("HF2Q_ENCODER_SESSION").as_deref() == Ok("1")
-                && std::env::var("MLX_UNRETAINED_REFS").as_deref() == Ok("1");
-            let user_k = std::env::var("HF2Q_FFN_TERMINAL_K_BATCH")
+            // ADR-015 iter95 — the iter94 Task #5 K=1 forced gate under the
+            // triple combo HF2Q_ENCODER_SESSION=1 + MLX_UNRETAINED_REFS=1 was
+            // REMOVED here: the underlying race (per-layer `hidden` Arc dropped
+            // mid-flight under unretained-refs) is now structurally closed by
+            // the iter95 `hidden_holds` K-batch hold-vec (~line 2671 below).
+            // AC-4 strict parity now PASSES at env=1+UNRETAINED across all
+            // available production fixtures (27b-dwq46, 35b-q4_0-flat,
+            // gemma-4-26b-dwq) at K=1/2/4/8 — verified at
+            // `/opt/hf2q/.cfa-archive/iter95/parity_unretained_run.txt`.
+            // The K=1 safety net is no longer required.
+            std::env::var("HF2Q_FFN_TERMINAL_K_BATCH")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|&k| k >= 1)
-                .unwrap_or(8);
-            if forced_k1 && user_k > 1 {
-                eprintln!(
-                    "[ADR-015 iter94 Task#5] forcing K=1 (was {user_k}) under \
-                     HF2Q_ENCODER_SESSION=1 + MLX_UNRETAINED_REFS=1 triple combo \
-                     to avoid iter93 silent drift; see iter93 final-report.md"
-                );
-                1
-            } else {
-                user_k
-            }
+                .unwrap_or(8)
         };
 
         // ADR-019 Phase 1 — output-head + last-layer fusion eligibility.
@@ -2665,6 +2650,63 @@ impl Qwen35Model {
             ffn_terminal_k_batch.max(1) as usize,
         );
 
+        // ADR-015 iter95 — K-batch hold-vec for the per-layer `hidden`
+        // ARC clone.
+        //
+        // # Bug fixed
+        //
+        // iter93 final-report §"K-batch ladder under env=1+UNRETAINED"
+        // localized a silent drift to the triple combo
+        // `HF2Q_ENCODER_SESSION=1` + `MLX_UNRETAINED_REFS=1` + K>1.
+        // iter95 forensic dump_bisect (`/opt/hf2q/.cfa-archive/iter95/`)
+        // ran per-layer dumps under env=1+UNRETAINED+K=2 and observed
+        // that `dump_bisect::flush_gpu`'s `sess.commit_and_wait()` FAILS
+        // with a `MTLCommandBufferStatus::Error` at the FIRST dump
+        // (layer 0 attn_out), which made every subsequent dump read
+        // pre-write all-zeros (sha `7d43a6d0`).
+        //
+        // Root cause: at the per-layer-loop tail, `hidden = ffn_out`
+        // REPLACES the old `hidden` Arc (= the embed buffer at layer 0
+        // OR the prior layer's ring-slot clone at layer N>0).  Under
+        // `MLX_UNRETAINED_REFS=1` the OPEN session CB does NOT
+        // ARC-retain the bound `hidden` buffer for
+        // `dispatch_fused_residual_norm_f32` (forward_gpu.rs ~3094 —
+        // reads `hidden` as the residual operand) — the embed
+        // allocation's last clone is the per-layer iteration `hidden`
+        // local, and replacing it on the next iteration drops the Arc.
+        // `MlxBufferStorage::Drop` queues `removeAllocation:` on the
+        // residency set (deferred per `buffer.rs:68-77` doc comment;
+        // flushed at the next `CommandEncoder::commit*`).  At env=1
+        // K>1, the next commit IS the K-boundary `commit_and_wait` —
+        // by which point the residency-set rescission has staged for
+        // the embed allocation while it is STILL bound into the open
+        // CB's encoded fused_residual_norm dispatch.  Result: GPU CB
+        // error → silent drift (env=1 path absorbs error into
+        // deterministic-but-wrong output).
+        //
+        // # Fix mechanism
+        //
+        // Mirror iter92's `attn_out_holds` shape: ARC-clone EVERY
+        // per-layer `hidden` value into this Vec at the TOP of each
+        // iteration (before the `hidden = ffn_out` reassignment that
+        // would otherwise drop it).  The Vec is cleared at K-boundary
+        // alongside `attn_out_holds` (line ~3776 below).  Memory cost
+        // mirrors `attn_out_holds`: at 27B-dwq46 K=8, 8×(seq×h×4) =
+        // 8×(4096×5120×4) = 640 MB worst case; fits comfortably in
+        // 128 GB unified memory.  Skipped at decode (seq_len == 1)
+        // because decode is single-token DROP_SITE per iter90b spec.
+        //
+        // # Scope contract
+        //
+        // ONLY closes the iter93 K>1 + env=1 + UNRETAINED silent drift.
+        // Does NOT change env=0 / env=1+retained-refs / decode behaviour
+        // — the Arc clone is sub-µs and the Vec drop on the env=0 path
+        // happens at K-boundary like attn_out_holds.  Env=0 was already
+        // byte-identical to baseline at all K values per iter93 K-ladder.
+        let mut hidden_holds: Vec<MlxBuffer> = Vec::with_capacity(
+            ffn_terminal_k_batch.max(1) as usize,
+        );
+
         // ADR-015 iter94 Task #3 — install layer_session as the
         // dump_bisect drainer so `flush_gpu` (called by every dump call
         // site below) routes through `session.commit_and_wait +
@@ -2689,6 +2731,22 @@ impl Qwen35Model {
                 || (layer_idx + 1) % ffn_terminal_k_batch == 0
                 || (layer_idx + 1) == n_layers;
             let layer_cpu = &self.layers[layer_idx];
+
+            // ADR-015 iter95 — push the per-layer `hidden` ARC clone into
+            // the K-batch hold-vec BEFORE the layer body uses it.  This
+            // ensures the buffer's residency-set membership stays alive
+            // across the full K-window even when the layer-tail
+            // `hidden = ffn_out` reassignment drops the per-iteration
+            // local Arc.  See `hidden_holds` decl above (~line 2671) for
+            // the full root-cause analysis (iter95 forensic dump_bisect
+            // pinned this to the FIRST dump under env=1+UNRETAINED+K=2).
+            //
+            // Skip at decode (seq_len == 1) — single-token DROP_SITE,
+            // no K-window race surface.  Cleared at K-boundary alongside
+            // attn_out_holds (line ~3776 below).
+            if seq_len > 1 {
+                hidden_holds.push(hidden.clone());
+            }
 
             // ADR-015 iter61a-3: thread-local tag for within-layer dump call sites.
             super::dump_bisect::set_current_layer(bisect_step, layer_idx);
@@ -3771,6 +3829,15 @@ impl Qwen35Model {
             // completes (drained below the for-loop).
             if seq_len > 1 && is_k_boundary && last_layer_held_enc.is_none() {
                 attn_out_holds.clear();
+                // ADR-015 iter95 — clear the per-layer `hidden` hold-vec at the
+                // same K-boundary.  Mirrors `attn_out_holds` exactly: the K-
+                // boundary `commit_and_wait_labeled` has drained the GPU, so
+                // every CB in this K-window is complete and the held `hidden`
+                // ARC clones are safe to drop.  See `hidden_holds` decl
+                // (~line 2671) for full root-cause.  Held-encoder fusion
+                // path skips this drain (same gate as attn_out_holds) so
+                // the output-head's terminal commit drains both Vecs.
+                hidden_holds.clear();
             }
         }
 
@@ -3934,6 +4001,11 @@ impl Qwen35Model {
         // the implicit drop at end-of-scope would do the same a few
         // statements later).
         drop(attn_out_holds);
+        // ADR-015 iter95 — symmetric final drain of `hidden_holds`.
+        // Same reasoning as `attn_out_holds`: the output-head's
+        // terminal commit drained the GPU, so all bound `hidden`
+        // buffers in the held vec are safe to release.
+        drop(hidden_holds);
 
         // ---- ADR-019 Phase 2 iter91 Worker B (H2 production CB-count probe) ----
         // Emit the post/delta line right before returning. The session has been
