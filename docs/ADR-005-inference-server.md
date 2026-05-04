@@ -8570,3 +8570,63 @@ system prompts), prefill matters more and the gap is currently visible.
 | 0162abd | docs: iter-7 cleanup + extended scaling bench + prefill gap      |
 | 29ec483 | docs: iter-8 prefill profile — MoE mm_id matmul bottleneck       |
 
+
+---
+
+### Session entry — 2026-05-03 (afternoon, tenth iter): wedding-cake at
+### `--no-thinking` is a MODEL-LEVEL bug (both engines), not hf2q
+
+**User-reported regression.** `hf2q generate --prompt "wedding cake..."
+--max-tokens 20000 --no-thinking` looped at 32 tokens. Per user directive
+"no guessing, real harness, ground up testing."
+
+**Ground-up test sequence:**
+
+1. Render the prompt via `HF2Q_DUMP_RENDERED_PROMPT`. Tokenize via
+   `llama-tokenize`. Bytes + token IDs are byte-identical to llama.cpp
+   default (already proven iter-2 / 44b5f11 — chat-template parity).
+2. Run llama-cli on the SAME rendered prompt at greedy. **llama.cpp
+   produces the same degenerate `\n\n`-only output** that hf2q produces
+   (verified via `> > > >`-only output).
+3. Run hf2q at default (no --no-thinking, no --enable-thinking).
+   Auto-detect routes to thinking-on. Output: "Okay, the user wants
+   a wedding cake recipe…" at 130.8 tok/s.
+4. Run hf2q at --enable-thinking explicit. Same coherent output.
+5. Run dwq46 sibling (Qwen3.6-27B dense) on same prompt at --no-thinking.
+   Produces a different degenerate pattern (regurgitates the prompt back
+   as "user\n[prompt]…").
+
+**Conclusion.** Both hf2q and llama.cpp fail the same way on this prompt
+with `--no-thinking`. The chat template's `enable_thinking=False` branch
+injects an empty `<think>\n\n</think>\n\n` suppressor before the
+assistant turn; thinking-capable Qwen checkpoints are trained to ALWAYS
+emit reasoning, and an empty pre-filled block is sufficiently OOD to
+drive the greedy argmax into a token-271 (`\n\n`) attractor on certain
+prompts. **Default (auto-detected thinking-on) works correctly.**
+
+**Shipped this iter:**
+
+1. **Improved diagnostic** in `cmd_generate_qwen35`'s repetition-stop
+   handler (`src/serve/mod.rs:2409-2434`): when --no-thinking is the
+   active mode AND the loop fired in <200 tokens, the user-visible
+   message now names the root cause and recommends dropping
+   `--no-thinking` rather than vaguely suggesting more sampling.
+
+2. **Sanity harness** (`scripts/coherence-harness/thinking_mode_sanity.sh`):
+   matrix of {wedding-cake, moonwalk, recipe, quantum} × {default,
+   --no-thinking, --enable-thinking}. Catches wedding-cake/--no-thinking
+   as DEGENERATE (32 tokens, 0 body chars) while passing default +
+   --enable-thinking (120 tokens, 371 body chars). Run via:
+
+       scripts/coherence-harness/thinking_mode_sanity.sh <gguf>
+
+   Future regressions in default or enable-thinking modes fail the
+   harness; --no-thinking outcomes are reported but do not gate
+   (per the model-level finding above).
+
+**ADR-005 status note.** This finding is a follow-up to morning session
+entry "`--no-thinking` failure on this dwq48 file remains model-level."
+The morning session correctly identified this as model-level but did not
+ship the operator-facing diagnostic improvement or a regression harness;
+this iter fills both gaps.
+
