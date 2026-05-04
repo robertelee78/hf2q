@@ -1827,24 +1827,34 @@ pub fn apply_sdpa_with_kv_cache(
         //     at this iter — full-prefill-from-zero is the live regime —
         //     but the legacy path is preserved as a correct fallback for
         //     non-prefill-from-zero correctness)
-        // ITER-17 fix: gate the FA-prefill path on `seq_len >= 32` (= BQ
-        // for the d=256 dispatcher).  When seq_len < BQ, both NQ tiles
-        // and (for seq_len < 16) NK tiles collapse to a single partial
-        // tile; in this single-tile-each regime the kernel produces
-        // 32 NaN at exact dim=10 across every (head, seq) cell.  The
-        // bug reproduces deterministically with byte-identical inputs
-        // in production but does NOT reproduce in mlx-native standalone
-        // tests (see mlx-native@91d3337 + ADR-005 iter-17b for the
-        // hypothesis-elimination chain — residency, CB ordering,
-        // memory_barrier, function-constant alignment, and force-sync
-        // all falsified).  The legacy 3-pass `sdpa` kernel below
-        // produces correct output for short prefills; perf cost is
-        // negligible (a 12-token prefill takes µs either way).
+        // ITER-20 (refined): gate the FA-prefill path on `seq_len >= 16`
+        // (= BK for the d=256 dispatcher).  Originally gated on >=32 in
+        // iter-17 to avoid the dim=10 NaN observed at qL<32 (single
+        // partial Q tile + single partial K tile).  Bisection across
+        // the FRESH+OLD GGUF matrix revealed:
         //
-        // long-prefill perf is preserved: pp101+ takes the new FA
-        // path (verified at ADR-013 P21 Stage 4 — pp101 465 t/s,
-        // pp512 1030 t/s, pp726 2061 t/s — all unchanged).
-        let new_path_eligible = head_dim == 256 && cur_len == 0 && seq_len >= 32;
+        // * The dim=10 NaN bug specifically requires `kL_rem != 0` AND
+        //   `qL_rem != 0` AND single K-tile — i.e. qL < 16.  At qL >= 16,
+        //   K is BK-aligned (kL_rem=0) and the partial-K-tile mask path
+        //   is NOT exercised; FA produces coherent output for both
+        //   GGUFs at qL ∈ [16, ∞).
+        // * The legacy 3-pass `sdpa` kernel ALSO has its own short-qL
+        //   bug at qL <= 15 on Qwen3.6 (head_dim=256, kv_h=2):
+        //   produces all-NaN logits on BOTH OLD and FRESH dwq48 GGUFs.
+        //   Bisection: qL=15 NaN, qL=17 coherent.  HF2Q_DUMP_LAYER=ALL
+        //   masks via dense flush_gpu sync points (see ADR-005 iter-19).
+        //
+        // So qL ∈ [1, 15] has no known-good path on this kernel set:
+        //   * FA: dim=10 NaN at qL < 16
+        //   * Legacy SDPA: all-NaN at qL <= 15
+        //   * decode (flash_attn_vec): only fires at qL == 1
+        //
+        // The qL=16-31 range becomes coherent under the new >= 16 gate
+        // (was previously routed to broken legacy SDPA when gate was
+        // >= 32).  Long-prefill perf preserved (FA always fires).
+        // qL ∈ [2, 15] remains broken — workaround is the user
+        // padding their prompt up to qL >= 16.
+        let new_path_eligible = head_dim == 256 && cur_len == 0 && seq_len >= 16;
         if new_path_eligible {
             // Dispatch flash_attn_prefill on the chunk seq-major Q/K/V
             // directly. Output is seq-major F32, matching the legacy
