@@ -570,6 +570,74 @@ fn proj_pooled(
     Ok(dst)
 }
 
+/// ADR-019 Phase 2 iter90b H5b — arena-anchored variant of [`proj_pooled`].
+///
+/// Writes the projection into a CALLER-PROVIDED `dst: &mut MlxBuffer`
+/// instead of allocating from the thread-local decode pool.  The caller
+/// is expected to pass an arena-anchored buffer (e.g.
+/// `MoeFfnArena::logits_buf`) that outlives the entire prefill.  This
+/// eliminates the helper-local `MlxBuffer` lifetime that Codex finding
+/// #2 flagged on iter90.
+///
+/// # Production-only — BF16 weight required
+///
+/// Unlike [`proj_pooled`], this helper does NOT include the BF16 cast
+/// branch.  The apex production path pre-casts MoE projection weights
+/// to BF16 at model load (see `MoeFfnWeightsGpuQ::from_cpu`
+/// `gpu_ffn.rs:309-327` — `upload_bf16_from_f32`), so the cast branch
+/// in `proj_pooled` is decorative for production.  Test fixtures that
+/// require F32 weights should keep using `proj_pooled`.  The bf16
+/// requirement is asserted in debug; release just propagates the
+/// downstream `dense_matmul_bf16_f32_tensor` error if the weight dtype
+/// is wrong.
+///
+/// # Caller contract
+///
+/// `dst` must be:
+///   - DType `F32`
+///   - byte_len ≥ `seq_len * out_features * 4`
+///   - shape compatible with `[seq_len, out_features]`
+/// The arena allocation is the canonical source for these constraints.
+#[allow(clippy::too_many_arguments)]
+fn proj_into(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    dst: &mut MlxBuffer,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<()> {
+    debug_assert_eq!(
+        weight.dtype(),
+        DType::BF16,
+        "proj_into: production weight must be BF16 (preacast at MoE load); \
+         got {:?}",
+        weight.dtype()
+    );
+
+    let params = DenseMmBf16F32Params {
+        m: seq_len,
+        n: out_features,
+        k: in_features,
+        src0_batch: 1,
+        src1_batch: 1,
+    };
+
+    if seq_len == 1 {
+        dense_gemv_bf16_f32(encoder, registry, device, weight, input, dst, &params)
+            .context("dense_gemv_bf16_f32 proj_into M=1")?;
+    } else {
+        dense_matmul_bf16_f32_tensor(
+            encoder, registry, device, weight, input, dst, &params,
+        )
+        .context("dense_matmul_bf16_f32_tensor proj_into")?;
+    }
+    Ok(())
+}
+
 // ================================================================
 // CPU SiLU helper for legacy parity-only paths
 // ================================================================
@@ -2595,6 +2663,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             shape.num_experts_per_tok,
             m_moe32,
             m_sh32,
+            ne32,
         )
         .context("MoeFfnArena shape mismatch")?;
 
@@ -2637,59 +2706,63 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
 
     {
         // ---- Phase A: router + shared expert projections (concurrent) ----
-        let (logits_buf, sh_logit_buf, a_s_buf, b_s_buf) = {
+        //
+        // ADR-019 Phase 2 iter90b H5b — projections write directly into the
+        // arena-owned `logits_buf` / `sh_logit_buf` / `a_s_buf` / `b_s_buf`
+        // (lifted from helper-local pool allocs to close Codex finding #2).
+        // Each call takes `&mut arena.<field>` exclusively for its own
+        // dispatch; the borrows are sequential so the borrow checker is
+        // happy.  Downstream Phase B/C/F dispatches then read `&arena.<field>`
+        // — a fresh shared reborrow of the same arena.
+        {
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnPhaseAProj,
             );
-            // proj_pooled allocates from the thread-local decode pool —
-            // these projection outputs flow into Phase B/C/F kernels and
-            // never cross a layer boundary, so the existing pool path is
-            // safe and we leave it untouched (the W-5b.8
-            // `ffn.alloc_scratch` bucket measures the iter72-targeted
-            // scratches above; proj_pooled is measured in
-            // `ffn.phase_a_proj`).
-            let logits_buf = proj_pooled(
+            proj_into(
                 enc,
                 registry,
                 device,
                 x,
                 &weights.router,
+                &mut arena.logits_buf,
                 seq_len,
                 h32,
                 ne32,
             )?;
-            let sh_logit_buf = proj_pooled(
+            proj_into(
                 enc,
                 registry,
                 device,
                 x,
                 &weights.shared_gate_inp,
+                &mut arena.sh_logit_buf,
                 seq_len,
                 h32,
                 1,
             )?;
-            let a_s_buf = proj_pooled(
+            proj_into(
                 enc,
                 registry,
                 device,
                 x,
                 &weights.shared_gate,
+                &mut arena.a_s_buf,
                 seq_len,
                 h32,
                 m_sh32,
             )?;
-            let b_s_buf = proj_pooled(
+            proj_into(
                 enc,
                 registry,
                 device,
                 x,
                 &weights.shared_up,
+                &mut arena.b_s_buf,
                 seq_len,
                 h32,
                 m_sh32,
             )?;
-            (logits_buf, sh_logit_buf, a_s_buf, b_s_buf)
-        };
+        }
 
         // Barrier A→B.
         {
@@ -2708,7 +2781,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                 enc,
                 registry,
                 device,
-                &logits_buf,
+                &arena.logits_buf,
                 &arena.ids_buf,
                 &arena.weights_buf,
                 seq_len,
@@ -2720,8 +2793,8 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                 enc,
                 registry,
                 device.metal_device(),
-                &a_s_buf,
-                &b_s_buf,
+                &arena.a_s_buf,
+                &arena.b_s_buf,
                 &arena.h_s_buf,
                 &arena.silu_sh_params_buf,
                 n_h_s,
@@ -2896,7 +2969,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                 device,
                 &arena.weights_buf,
                 &arena.y_all_buf,
-                &sh_logit_buf,
+                &arena.sh_logit_buf,
                 &y_s_buf,
                 residual_ref,
                 &mut out_buf,

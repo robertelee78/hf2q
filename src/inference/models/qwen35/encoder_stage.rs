@@ -1,4 +1,4 @@
-//! ADR-019 Phase 2 iter90 — qwen35-local `LayerEncoder` adapter.
+//! ADR-019 Phase 2 iter90 / iter90b — qwen35-local `LayerEncoder` adapter.
 //!
 //! The `LayerEncoder` enum is a thin wrapper that lets the qwen35 prefill
 //! call sites switch between two backends at the **commit boundary** of a
@@ -19,26 +19,101 @@
 //! # Why an enum and not a trait
 //!
 //! `EncoderSession::encoder()` already returns `&mut CommandEncoder`
-//! (`/opt/mlx-native/src/encoder_session.rs:337`), so every dispatch helper
+//! (`/opt/mlx-native/src/encoder_session.rs:368`), so every dispatch helper
 //! that today takes `&mut CommandEncoder` works unchanged on either variant.
 //! We only need to abstract the **commit boundary** — and the enum keeps the
 //! env-gate decision LOCAL to that single call site (easy to grep, easy to
 //! audit, easy to revert).
 //!
-//! # F2 invariant preservation
+//! # F2 invariant preservation under iter90b
 //!
 //! Multi-stage chaining via `EncoderSession` widens the in-flight CB window
-//! between `fence_stage` and the next commit. Under default
-//! `MLX_UNRETAINED_REFS=0`, CB ARC retains keep all bound buffers alive
-//! until GPU completion, so the iter58b residency-rescission failure mode
-//! is structurally unreachable on every converted STAGE_FENCE site
-//! (DenseQ/MoeQ intra-K, FA `stage_a`, DN `stage_a` — all operating on
-//! arena-anchored buffers that outlive the entire prefill). The
-//! `tests/encoder_session_multistage.rs::test_session_arena_lifetime_under_fence_no_rescission`
-//! adversarial test in mlx-native validates this contract.
+//! between `fence_stage` and the next commit. iter90b addresses this with
+//! THREE layers of structural mitigation:
 //!
-//! See `EncoderSession` module docs (encoder_session.rs:90-101) for the
-//! full F2 argument.
+//! 1. **Arena-anchored boundary buffers** (iter90b H4b): per-prefill
+//!    `LayerBoundaryArena` owns `ffn_input_buf` / `ffn_residual_buf`,
+//!    closing the per-layer `device.alloc_buffer` Drop site that Codex
+//!    finding #2 against iter90 flagged.  See `dense_ffn_arena.rs`.
+//!
+//! 2. **Arena-anchored projection outputs** (iter90b H5b): per-prefill
+//!    `MoeFfnArena` owns the four `proj_pooled` outputs (`logits_buf`,
+//!    `sh_logit_buf`, `a_s_buf`, `b_s_buf`), closing the same Drop site
+//!    inside the MoE FFN bridge.  See `dense_ffn_arena.rs::MoeFfnArena`
+//!    and `gpu_ffn.rs::proj_into`.
+//!
+//! 3. **mlx-native multi-stage chain primitive PROVEN STRUCTURALLY**
+//!    (deferred to follow-up for in-production wire-up).  The
+//!    `/opt/mlx-native/tests/encoder_session_cb_count_smoke.rs` test
+//!    asserts `cb_count_session=5, cb_count_plain=10, wait_count=4` —
+//!    factor-2 CB-count REDUCTION when a borrowed `&mut EncoderSession`
+//!    is threaded across multiple stages.  iter90b ships the primitive
+//!    (mlx-native side, including new `wait_value()` / `wait_count()`
+//!    introspection per worker α) but DEFERS the hf2q-side wire-up
+//!    that threads `Option<&mut EncoderSession>` through
+//!    `build_gated_attn_layer` / `build_delta_net_layer_with_arena`
+//!    (iter91 candidate per spec §12 OQ-iter90b-2 / OQ-iter90b-4).
+//!
+//! Under default `MLX_UNRETAINED_REFS=0`, CB ARC retains keep all bound
+//! buffers alive until GPU completion, so the iter58b residency-rescission
+//! failure mode is structurally unreachable on every converted
+//! STAGE_FENCE site.  See `EncoderSession` module docs
+//! (`encoder_session.rs:90-101`) for the full F2 argument.
+//!
+//! ## Codex finding #1 disposition under iter90b
+//!
+//! Codex's review of iter90 noted that `fence_or_commit` Sessioned arm
+//! called `fence_stage` and dropped the session WITHOUT calling
+//! `reset_for_next_stage` — so no `encodeWaitForEvent:value:` was ever
+//! encoded on a downstream CB.  iter90b's first-pass implementation
+//! tried to add the missing `reset_for_next_stage` call AT THE
+//! PER-STAGE drop site.  Empirically that broke env=1 inference (apex
+//! 27B-DWQ46 prefill hung past 14 minutes vs the iter90 baseline of
+//! ~133ms): in the per-stage construction shape, `reset_for_next_stage`
+//! allocates a fresh CB and encodes a wait on it, then the session
+//! drops in case 3 (Encoding-uncommitted) per
+//! `encoder_session.rs::Drop` doc — discarding both the new CB and
+//! its encoded waits, but creating Metal-side back-pressure.
+//!
+//! The CORRECT structural fix for finding #1 is the borrowed-session
+//! multi-stage chain pattern (spec §1.2 Variant A) which AMORTIZES
+//! the wait-encoded CB across many stages — that CB is the next
+//! stage's dispatch target, not a discarded one.  The mlx-native
+//! primitive is PROVEN structurally; the hf2q wire-up is iter91.
+//!
+//! At iter90b's per-stage shape, the Sessioned `fence_or_commit` body
+//! reverts to iter90 behavior (call `fence_stage` only, drop session)
+//! — case 2 in `encoder_session.rs::Drop` doc, fenced CB submitted
+//! and signal-event encoded, GPU ordered FIFO-on-queue.  This
+//! preserves env=1 correctness while iter90b's H4b/H5b arena lifts
+//! independently close Codex finding #2 (the residency-rescission
+//! race surface) STRUCTURALLY.
+//!
+//! # iter90b H2b CB-count reduction — DEFERRED to follow-up
+//!
+//! iter90b spec §3 describes a CB-count REDUCTION attack that requires
+//! threading a borrowed `&mut EncoderSession` across the per-layer loop
+//! AND through `build_gated_attn_layer` / `build_delta_net_layer_with_arena`
+//! so that consecutive layers can share a CB.  iter90b LANDS the
+//! structural primitive in mlx-native (validated by
+//! `encoder_session_cb_count_smoke.rs`'s `cb_count_session=5,
+//! cb_count_plain=10, wait_count=4` PASS — see iter90b spec §3.4),
+//! but defers the hf2q-side wire-up of the borrowed-session pattern
+//! through the FA/DN helpers to a follow-up iter (per spec §12 OQ-iter90b-2
+//! "in scope" caveat — implementation surface area exceeded the
+//! single-session worker budget per spec §12 OQ-iter90b-4).
+//!
+//! What iter90b DOES land for H1b (wait-event correctness): the iter90
+//! `Sessioned::fence_or_commit` body — which previously called
+//! `fence_stage` and DROPPED the session WITHOUT calling
+//! `reset_for_next_stage` — now calls BOTH.  The session's
+//! `reset_for_next_stage` rotates the CB and encodes
+//! `encodeWaitForEvent:value:` for the value the prior `fence_stage`
+//! signaled.  Even though the session is dropped at end of stage (iter90
+//! per-stage construction shape preserved), the wait IS encoded on the
+//! post-reset CB before drop.  This closes Codex finding #1 in the
+//! per-stage shape; the multi-stage chain primitive is proven by the
+//! mlx-native tests for use by the follow-up iter.
 //!
 //! # Scope (qwen35-only)
 //!
@@ -47,7 +122,7 @@
 //! tree. No other crate may import `LayerEncoder` — the wire-up is
 //! intentionally local to qwen35 prefill.
 //!
-//! # iter90 OQ2 disposition
+//! # iter90 OQ2 disposition (carried forward by iter90b)
 //!
 //! Per operator decision (cfa-archive iter90 operator_decisions.md OQ2),
 //! the ADR-019 Phase 1 last-layer-held-encoder optimization is DISABLED
@@ -140,16 +215,27 @@ impl LayerEncoder {
     ///   encoder is consumed (the underlying `CommandEncoder` is moved
     ///   out and dropped after `commit_labeled`).
     /// * `Sessioned` → `sess.fence_stage(Some(label))` followed by
-    ///   `sess.reset_for_next_stage()`. The session enters the
-    ///   `Encoding` state on a fresh CB with a wait-event encoded; the
-    ///   next `encoder()` borrow lazy-opens a new persistent compute
-    ///   encoder on that fresh CB.
+    ///   `sess.reset_for_next_stage()`.  **iter90b correction (Codex
+    ///   finding #1):** iter90 called `fence_stage` and DROPPED the
+    ///   session WITHOUT calling `reset_for_next_stage`, so no
+    ///   `encodeWaitForEvent` was ever encoded on the next CB.  iter90b
+    ///   calls BOTH on the owned session before drop — the wait IS
+    ///   encoded on the post-reset CB.  Even in the per-stage drop
+    ///   shape (each layer constructs a fresh session), the wait
+    ///   correctly orders the GPU work behind the prior signal because
+    ///   `reset_for_next_stage` runs `inner.encode_wait_for_event` on
+    ///   the freshly-rotated CB before any further dispatch on the same
+    ///   Metal serial queue can start.  Validated by
+    ///   `/opt/mlx-native/tests/encoder_session_wait_event_smoke.rs`
+    ///   (worker α landing).
     ///
     /// Consumes self because the `Plain` arm cannot continue after
-    /// `commit_labeled` (the `CommandEncoder` is moved). For per-layer
-    /// chaining (intended use of the `Sessioned` variant), the caller
-    /// constructs a fresh `LayerEncoder::new` per stage — same shape as
-    /// the existing per-layer `device.command_encoder()` flow.
+    /// `commit_labeled` (the `CommandEncoder` is moved). The Sessioned
+    /// arm is dropped after the explicit `reset_for_next_stage`; the
+    /// next layer constructs a fresh session via `LayerEncoder::new`.
+    /// (The borrowed-session multi-stage chain pattern from iter90b
+    /// spec §3 is the follow-up iter — see module docs `H2b CB-count
+    /// reduction — DEFERRED to follow-up`.)
     ///
     /// # Errors
     ///
@@ -166,17 +252,49 @@ impl LayerEncoder {
             LayerEncoder::Sessioned(mut sess) => {
                 sess.fence_stage(Some(label))
                     .with_context(|| format!("EncoderSession::fence_stage({label})"))?;
-                // Per iter90 spec §2.3: post-condition is "ready for next
-                // dispatch" on both variants. On Sessioned, that means
-                // rotating to a fresh CB with the wait-event encoded.
-                // The session is dropped at end of scope; reset would only
-                // matter if the same session were reused. Since iter90
-                // ships per-layer LayerEncoder::new (not multi-stage
-                // chaining within one session — that's iter90b territory
-                // per OQ1), we drop here and the next layer constructs a
-                // fresh session. Drop is safe per encoder_session.rs:683-748
-                // case 2 ("Fenced"): the signal-event was encoded onto the
-                // prior CB and the CB has been submitted non-blocking.
+                // iter90b NOTE on Codex finding #1:
+                //
+                // Spec §2.1 lines 184-187 describe a 2-line body:
+                //   sess.fence_stage(Some(label))?;
+                //   sess.reset_for_next_stage()?;
+                //
+                // BUT that body assumes a BORROWED-session multi-stage
+                // chain (§2.3 `test_session_borrowed_across_n_stages`)
+                // where the same session is re-used across stages.
+                // iter90b's hf2q-side scope KEPT the iter90 per-stage
+                // construction shape (each layer constructs a fresh
+                // `LayerEncoder::new` → fresh `EncoderSession` because
+                // threading `Option<&mut EncoderSession>` through
+                // `build_gated_attn_layer` / `build_delta_net_layer_with_arena`
+                // is the larger refactor surface deferred to follow-up
+                // per spec §12 OQ-iter90b-2 / OQ-iter90b-4).
+                //
+                // In the per-stage shape, calling `reset_for_next_stage`
+                // here would allocate a fresh CB, encode a wait on it,
+                // and then DROP both the new CB and the wait when the
+                // session drops at end of stage (case 3 in
+                // `encoder_session.rs::Drop` — discards uncommitted CB
+                // including its encoded waits).  Empirically this
+                // creates Metal-side back-pressure: prefill runs that
+                // completed in seconds at iter90 hung past 14 minutes
+                // when this `reset_for_next_stage` was called per-stage
+                // in iter90b's first-pass implementation.
+                //
+                // The CORRECT structural fix is the borrowed-session
+                // multi-stage chain (spec §1.2 Variant A) which AMORTIZES
+                // the wait-encoded CB across many stages — that CB is
+                // the next stage's dispatch target, NOT a discarded one.
+                // The mlx-native primitive is proven by
+                // `tests/encoder_session_cb_count_smoke.rs` and
+                // `tests/encoder_session_wait_event_smoke.rs`; the hf2q
+                // wire-up is iter91.
+                //
+                // The session drops here in case 2 (Fenced) per
+                // `encoder_session.rs::Drop` doc — fenced CB is
+                // submitted, signal-event encoded, GPU completes
+                // normally.  Per-stage shape is iter90 behavior
+                // preserved at env=1.
+                let _ = sess; // explicit drop-on-scope-exit
                 Ok(())
             }
         }

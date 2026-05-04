@@ -46,7 +46,7 @@ pub mod gpu_delta_net;
 pub mod gpu_ffn;
 pub mod gpu_full_attn;
 pub use chunk_allocs_arena::ChunkAllocsArena;
-pub use dense_ffn_arena::{DenseFfnArena, MoeFfnArena};
+pub use dense_ffn_arena::{DenseFfnArena, LayerBoundaryArena, MoeFfnArena};
 pub use dn_prefill_arena::DnPrefillArena;
 pub use fa_prefill_arena::FaPrefillArena;
 pub use fa_projections_arena::FaProjectionsArena;

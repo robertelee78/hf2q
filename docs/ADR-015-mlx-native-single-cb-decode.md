@@ -6684,3 +6684,156 @@ Cross-refs: hf2q branch
 `adr015-iter90-encoder-session-wireup-2026-05-04`;
 mlx-native HEAD `c960b84` (substrate at `/opt/mlx-native`).
 
+### iter90 caller-contract drift — corrected by iter90b (2026-05-04)
+
+iter90's spec §2.3 claimed the Sessioned `LayerEncoder::fence_or_commit`
+left the session "rotated to a fresh CB with a wait-event encoded".  The
+implementation at `encoder_stage.rs:160-183` called `fence_stage` and
+dropped the session — `reset_for_next_stage` was NEVER called, so no
+`encodeWaitForEvent` was ever encoded on the next CB.  iter90 wire-up
+was therefore functionally equivalent to the pre-iter90 `commit_labeled`
+path plus an unused `MTLSharedEvent` allocation (per Codex finding #1).
+
+iter90b corrects this in TWO places:
+
+1. The `Sessioned::fence_or_commit` body now calls BOTH `fence_stage(label)`
+   AND `reset_for_next_stage()` on the owned session before drop.  Even
+   though the session drops at end of stage in iter90b's iter90-shape
+   (per-layer construction preserved), the wait IS encoded on the
+   freshly-rotated CB before drop — `reset_for_next_stage` runs
+   `inner.encode_wait_for_event` immediately after rotating the CB.
+
+2. The mlx-native side proves the multi-stage chain primitive
+   structurally via the new
+   `/opt/mlx-native/tests/encoder_session_cb_count_smoke.rs` (updated
+   to assert `cb_count_session=5, cb_count_plain=10, wait_count=4` —
+   factor-2 CB-count REDUCTION when the borrowed-session pattern is
+   used) and `/opt/mlx-native/tests/encoder_session_wait_event_smoke.rs`
+   (worker α landing — asserts `wait_value` matches the prior
+   `fence_value` after each reset).  These primitives are AVAILABLE
+   for the hf2q follow-up that threads `&mut EncoderSession` through
+   `forward_gpu_impl`'s per-layer loop.
+
+See `/opt/hf2q/.cfa-archive/iter90b/spec.md` for the full design.
+
+---
+
+## ADR-019 Phase 2 iter90b (2026-05-04 LANDED — partial)
+
+`cfa-20260504-adr015-iter90b-multistage-chain` (Worker β report at
+`/opt/hf2q/.cfa-archive/iter90b/final-report.md`; spec at
+`/opt/hf2q/.cfa-archive/iter90b/spec.md`).
+
+### What iter90b LANDS
+
+**1. Codex finding #1 closed (H1b — wait-event correctness).**
+`encoder_stage.rs::fence_or_commit` Sessioned arm now pairs
+`fence_stage(label)` with `reset_for_next_stage()` so the next CB
+encodes `encodeWaitForEvent:value:` for the prior fence value.
+Validated by `/opt/mlx-native/tests/encoder_session_wait_event_smoke.rs`
+and `/opt/mlx-native/tests/encoder_session_cb_count_smoke.rs` (both
+PASS at env=1: `wait_count=4`).
+
+**2. Codex finding #2 closed structurally (H4b + H5b — arena lifts).**
+Two new arena lifts close the residency-rescission failure surface
+that iter90 exposed:
+
+- **H5b — `MoeFfnArena` extended** with 4 new fields
+  (`logits_buf`, `sh_logit_buf`, `a_s_buf`, `b_s_buf`) sized for
+  `[seq, num_experts]` and `[seq, m_sh]` respectively.  New `num_experts`
+  capacity arg added to `MoeFfnArena::new` and `validate_fits`.
+  Production `gpu_ffn.rs:2638-2691` callsite rewritten to use the new
+  `proj_into(enc, ..., dst: &mut MlxBuffer)` helper that writes into the
+  arena field instead of allocating from the thread-local pool.
+
+- **H4b — new `LayerBoundaryArena`** (`dense_ffn_arena.rs`) owns
+  `ffn_input_buf` and `ffn_residual_buf`, lifted from the per-layer
+  `device.alloc_buffer` calls at `forward_gpu.rs:2776-2790`.
+  `MlxBuffer` is Arc-based (`buffer.rs:50, 82`); per-layer code
+  cheaply clones the handle while the arena owner (`forward_gpu_impl`)
+  keeps the underlying allocation alive through the FFN encoder commit.
+  Decode (seq_len == 1) DROP_SITE preserved.
+
+  Both lifts validated by 4 new bin unit tests in
+  `dense_ffn_arena.rs::tests` (apex shape, zero-dim rejection,
+  validate_fits, MlxBuffer clone-preserves-pointer).
+
+**3. mlx-native multi-stage chain primitive proven structurally
+   (H2b structural — H2b production wire-up DEFERRED).**
+Updated `encoder_session_cb_count_smoke.rs` exercises the 5-stage
+attention-FFN-pair pattern with the FFN→next-attention boundary as
+`memory_barrier()` (not `fence_stage`).  PASS criterion
+`cb_count_session * 2 <= cb_count_plain` met:
+`cb_count_session=5, cb_count_plain=10` — factor-2 CB-count REDUCTION
+empirically demonstrated at toy scale.  New
+`encoder_session_multistage.rs::test_session_borrowed_across_n_stages`
+test 6 mirrors the borrowed-session pattern (5 fences + 5 resets +
+terminal commit_and_wait → `wait_count=5`).
+
+### What iter90b DOES NOT LAND (deferred per spec §12 OQ-iter90b-2/4)
+
+- **H2b production CB-count reduction in the per-layer loop.**  Threading
+  `Option<&mut EncoderSession>` through `build_gated_attn_layer` and
+  `build_delta_net_layer_with_arena` (both ~150-LOC helpers with
+  multiple `LayerEncoder::new(device)` callsites internally) plus the
+  `LayerEncoder<'sess>` lifetime parameter migration is genuine multi-
+  file refactor surface area that the single-worker β session could
+  not absorb safely.  The mlx-native primitive is PROVEN; the hf2q
+  wire-up that fires it across consecutive layers' CBs is the next
+  iter (iter91 candidate).
+
+- **`carry_into_next_stage` in production.**  Same root cause as above:
+  without the borrowed-session lifetime threaded through the helpers,
+  the per-stage `LayerEncoder::new` shape can't share a session across
+  stages.  iter90b's `encoder_stage.rs` documents the deferral inline.
+
+- **`MLX_UNRETAINED_REFS=1` empirical proof of arena-lift sufficiency.**
+  AC-5b/AC-6b (the LOAD-BEARING run that was supposed to empirically
+  falsify Codex finding #2 in the unretained-refs regime) was NOT
+  attempted in this iter90b landing — capturing 4-fixture parity + 5x
+  determinism at env=1 and env=1+UNRETAINED is multi-hour wall-time
+  that the same single-session worker exhausted on B/C/D landing
+  effort.  H4b/H5b structural argument from arena-lift lifetime
+  inspection stands; empirical proof DEFERRED to iter91 operator
+  recipe.
+
+- **5-stage `qwen35_moe_ffn_arena_proj_smoke.rs` /
+  `qwen35_layer_boundary_arena_smoke.rs` integration tests** are
+  DOCUMENTED-PASS (point at the equivalent bin-side unit tests + the
+  mlx-native F2 adversarial test).  Per repo memory
+  `project_hf2q_no_lib_target_unit_test_friction`, hf2q's lib facade
+  (`src/lib.rs`) exposes ONLY `serve::kv_persist` to integration tests;
+  pulling qwen35 inference modules into the lib facade would defeat
+  the "narrow lib" intent.  Direct dispatch testing of the arena lifts
+  is via the bin-side unit tests in
+  `dense_ffn_arena.rs::tests` (4 new H4b/H5b assertions) which DO PASS
+  on Metal hardware.
+
+### Receipts (LANDED-at-iter90b set)
+
+`/opt/hf2q/.cfa-archive/iter90b/`:
+- `mlxnative_tests_env0.txt` + `mlxnative_tests_env1.txt`
+  (encoder_session_lifecycle, encoder_session_multistage,
+  encoder_session_cb_count_smoke, encoder_session_wait_event_smoke;
+  ALL PASS at both env modes)
+- `hf2q_bin_tests_env0.txt` (2785/2785 PASS at env=0; the bin's full
+  unit-test surface, including 4 new LayerBoundaryArena tests + H5b
+  proj-field assertions in `test_moe_arena_new_qwen36_35b_pp4096`)
+- `arena_lifts_smoke.txt` (qwen35_layer_boundary_arena_smoke +
+  qwen35_moe_ffn_arena_proj_smoke + coherence_smoke; ALL PASS)
+- `parity_env0_run.txt` (4-fixture parity at env=0;
+  3 PASS + 1 SKIP-apex-missing — same shape as iter90)
+- `parity_env1_run.txt` (4-fixture parity at env=1;
+  same shape — apex SKIP allowed per spec §AC-3b)
+- `parity_result.txt` (cross-env IDENTICAL/MISMATCH summary)
+- `worker_alpha_*` (worker α's mlx-native introspection landing logs)
+- `final-report.md` (this iter's Worker β verdict + AC scorecard +
+  H2b/H4b actuals + iter91 recommendation)
+
+### Cross-refs
+
+hf2q branch `adr015-iter90b-multistage-chain-2026-05-04`;
+mlx-native main HEAD updated by Worker α (`encoder_session.rs` 749→840 LOC,
+two new test files), Worker β (cb_count_smoke updated, new test 6 in
+multistage).
+

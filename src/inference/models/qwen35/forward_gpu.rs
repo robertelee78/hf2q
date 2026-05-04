@@ -2223,6 +2223,7 @@ impl Qwen35Model {
                         moe.num_experts_per_tok,
                         moe.moe_intermediate_size,
                         moe.shared_expert_intermediate_size,
+                        moe.num_experts,
                     )
                     .context("alloc MoeFfnArena")?,
                 )
@@ -2268,6 +2269,32 @@ impl Qwen35Model {
                     dn_shape.d_v,
                 )
                 .context("alloc DnPrefillArena")?,
+            )
+        } else {
+            None
+        };
+
+        // ---- ADR-019 Phase 2 iter90b H4b: LayerBoundaryArena allocation ----
+        //
+        // Lifts the per-layer `device.alloc_buffer` calls for `ffn_input_buf`
+        // and `ffn_residual_buf` (formerly at the start of each layer's FFN
+        // block) to a per-prefill arena.  Closes Codex finding #2 against
+        // iter90: those two `MlxBuffer`s are bound into the FFN encoder and
+        // their per-layer drop CAN trigger the iter58b residency-rescission
+        // failure mode under `MLX_UNRETAINED_REFS=1`.
+        //
+        // Allocated ONCE per prefill (`seq_len > 1`); reused across all N
+        // layers (content overwritten each layer by
+        // `dispatch_fused_residual_norm_f32`).  Decode (seq_len == 1) keeps
+        // the per-call alloc shape (DROP_SITE per iter90b spec §1.1, §5.2).
+        //
+        // Memory cost: 2 × seq_len × hidden_size × 4 bytes = 167 MB at
+        // pp4096 × h=5120 (Qwen3.6 27B/35B). Negligible vs the existing
+        // ~870 MB MoeFfnArena footprint on apex.
+        let layer_boundary_arena: Option<super::LayerBoundaryArena> = if seq_len > 1 {
+            Some(
+                super::LayerBoundaryArena::new(&device, seq_len, h)
+                    .context("alloc LayerBoundaryArena")?,
             )
         } else {
             None
@@ -2773,21 +2800,42 @@ impl Qwen35Model {
             let moeq_fused_eligible = matches!(ffn_weights_gpu_peek, FfnWeightsGpu::MoeQ(_));
             let any_fused_eligible = denseq_fused_eligible || moeq_fused_eligible;
 
-            // Allocate the two outputs up-front (live past the encoder).
-            let ffn_input_buf = device
-                .alloc_buffer(
-                    (seq_len * h) as usize * 4,
-                    DType::F32,
-                    vec![seq_len as usize, h as usize],
-                )
-                .map_err(|e| anyhow!("alloc ffn_input layer {layer_idx}: {e}"))?;
-            let ffn_residual_buf = device
-                .alloc_buffer(
-                    (seq_len * h) as usize * 4,
-                    DType::F32,
-                    vec![seq_len as usize, h as usize],
-                )
-                .map_err(|e| anyhow!("alloc ffn_residual layer {layer_idx}: {e}"))?;
+            // ADR-019 Phase 2 iter90b H4b: lift `ffn_input_buf` and
+            // `ffn_residual_buf` to a per-prefill arena (closes Codex
+            // finding #2 — these MlxBuffers are bound into the FFN encoder
+            // and per-layer drop is the iter58b residency-rescission risk
+            // surface).  `MlxBuffer` is Arc-based (`buffer.rs:82` `impl
+            // Clone`), so `.clone()` is cheap and the cloned handle keeps
+            // the underlying allocation alive through the FFN encoder
+            // commit.  At seq_len > 1 the arena is `Some`; at decode
+            // (seq_len == 1) we fall through to the legacy per-call
+            // `device.alloc_buffer` path (DROP_SITE per iter90b spec §1.1
+            // / §5.2).
+            let (ffn_input_buf, ffn_residual_buf) =
+                if let Some(arena) = layer_boundary_arena.as_ref() {
+                    arena
+                        .validate_fits(seq_len, h)
+                        .with_context(|| {
+                            format!("LayerBoundaryArena shape mismatch layer {layer_idx}")
+                        })?;
+                    (arena.ffn_input_buf.clone(), arena.ffn_residual_buf.clone())
+                } else {
+                    let ffn_input_buf = device
+                        .alloc_buffer(
+                            (seq_len * h) as usize * 4,
+                            DType::F32,
+                            vec![seq_len as usize, h as usize],
+                        )
+                        .map_err(|e| anyhow!("alloc ffn_input layer {layer_idx}: {e}"))?;
+                    let ffn_residual_buf = device
+                        .alloc_buffer(
+                            (seq_len * h) as usize * 4,
+                            DType::F32,
+                            vec![seq_len as usize, h as usize],
+                        )
+                        .map_err(|e| anyhow!("alloc ffn_residual layer {layer_idx}: {e}"))?;
+                    (ffn_input_buf, ffn_residual_buf)
+                };
 
             // ADR-019 Phase 2 iter90: `fused_enc` is now `LayerEncoder` (env=0
             // → Plain(CommandEncoder); env=1 → Sessioned(EncoderSession)). The
