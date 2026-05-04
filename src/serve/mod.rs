@@ -1647,6 +1647,30 @@ fn strip_trailing_im_start_prefix(text: &mut String) {
             return;
         }
     }
+    // Also strip a trailing `<think>` / `<|endthink|>` prefix. The
+    // second-`<think>`-block stop (special_token_safe_prefix) cuts safe_raw
+    // at the position of the SECOND `<think>` opening, but the streaming
+    // display has already flushed any partial `<` `t` `h` `i` `n` `k`
+    // tokens that the model emitted byte-by-byte before the full
+    // `<think>` was assembled. Trim any such trailing prefix so the user
+    // sees a clean answer ending instead of "...clean cuts.\n\n<think".
+    for marker in ["<think>", "<|endthink|>"] {
+        for len in (1..marker.len()).rev() {
+            let candidate = &marker[..len];
+            if text.ends_with(candidate) {
+                let new_len = text.len() - len;
+                text.truncate(new_len);
+                return;
+            }
+        }
+    }
+    // Trim trailing whitespace runs (newlines + spaces) that survive the
+    // `<think>`-prefix strip — the user-visible answer reads cleaner
+    // without a dangling "\n\n" tail.
+    let trimmed_len = text.trim_end_matches([' ', '\t', '\r', '\n']).len();
+    if trimmed_len < text.len() {
+        text.truncate(trimmed_len);
+    }
 }
 
 /// Decide whether the qwen3.5 generate-CLI loop needs the sampler-path
