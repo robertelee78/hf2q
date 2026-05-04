@@ -8927,3 +8927,59 @@ since it doesn't affect production (OLD GGUF is the one users have
 been using throughout).
 
 User direction needed.
+
+---
+
+## 2026-05-03 — iter-17e: FRESH GGUF deeper bug — Phase-1 fusion gate insufficient
+
+Followup to iter-17d.  Confirmed with code trace + empirical:
+
+* `HF2Q_DUMP_LAYER=ALL` makes `dump_bisect::is_enabled() = true`
+* That env disables `phase1_fusion_env_eligible` AND adds many
+  `flush_gpu()` (commit_and_wait empty encoder) sync points
+  scattered through the layer loop and the output-head dump call
+  at `forward_gpu.rs:735`.
+
+Tried gating `phase1_fusion_env_eligible` on `seq_len >= 32` directly
+(without the env): coherence DOES NOT recover on FRESH GGUF.  So the
+fusion-disable is NOT what's masking the bug — the additional sync
+points are.
+
+This means the bug is hardware-context-dependent on Apple Silicon
+when many CBs are queued asynchronously without intermediate
+`commit_and_wait` (the queue depth or some scheduling state).  The
+existing `enc.memory_barrier()` at `forward_gpu.rs:688` between
+RMSNorm and lm_head is structurally insufficient.
+
+**Pragmatic options for ADR-005 iter-18 (next session):**
+
+1. Add an unconditional `commit_and_wait` between RMSNorm and the
+   lm_head matmul in `apply_output_head_gpu_into`.  Cost: 1 sync
+   per prefill chunk (negligible at any reasonable prefill length).
+   Coverage: should fix every model, every prompt length.
+2. Add periodic `commit_and_wait` checkpoints in the per-layer
+   loop (e.g. every 8 layers) to drain the CB queue.  Cost: 4-5
+   syncs per prefill (~100 µs each on M5 Max).  Higher impact.
+3. Investigate whether the model's Q4_K dequant of FRESH-specific
+   data has subnormal/denormal values that trip the matmul kernel
+   under specific scheduling.
+
+**Mitigation in the meantime:** users running short-prefill
+production should use the OLD dwq48 GGUF
+(`/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq48/`)
+or set `HF2Q_DUMP_LAYER=ALL` (slow but coherent) for the FRESH GGUF.
+
+**End of session 2026-05-03 final state:**
+* hf2q HEAD `e11bd07` ships the iter-17 qL<32 → legacy SDPA fix
+  that ELIMINATES the dim=10 NaN bug for OLD GGUF (which is the
+  production model).
+* hf2q HEAD `f048ee4` documents the iter-17c validation: coherence
+  + speed parity vs llama.cpp on OLD GGUF.
+* hf2q HEAD `d9973ed` documents the FRESH GGUF residual bug.
+* hf2q HEAD (current `d9973ed`) is the same as `e11bd07` for
+  binary behaviour — the ADR additions don't touch src/.
+* mlx-native HEAD `91d3337` ships the regression test suite.
+
+ADR-005 work for this session is COMPLETE on the OLD-GGUF
+production target.  FRESH-GGUF deeper investigation deferred to
+next session.
