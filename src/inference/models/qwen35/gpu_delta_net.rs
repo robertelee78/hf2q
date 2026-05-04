@@ -2521,6 +2521,16 @@ pub fn build_delta_net_layer_with_arena(
     d_v: u32,
     k_width: u32,
     rms_norm_eps: f32,
+    // ADR-019 Phase 2 iter91: borrowed `&mut EncoderSession` for the
+    // multi-stage chain.  `None` at env=0 (per-stage Plain CommandEncoder
+    // shape, byte-identical to pre-iter91).  `Some(sess)` at env=1 — the
+    // session is allocated once in `forward_gpu_impl` and threaded through
+    // every helper that constructs a `LayerEncoder`.  The single internal
+    // `LayerEncoder::from_session_or_plain` site (DN stage_a at line ~2673)
+    // consumes the borrow via `as_deref_mut()`; the terminal
+    // `fence_or_commit("layer.gdn.stage_a")` releases the borrow back to
+    // the caller's `Option`.
+    layer_session: Option<&mut mlx_native::EncoderSession>,
 ) -> Result<MlxBuffer> {
     debug_assert!(
         seq_len > 1,
@@ -2670,7 +2680,18 @@ pub fn build_delta_net_layer_with_arena(
         // of this block routes through `LayerEncoder::fence_or_commit` which
         // emits `commit_labeled` on Plain (byte-identical to pre-iter90) and
         // `fence_stage + reset_for_next_stage` on Sessioned.
-        let mut enc = LayerEncoder::new(device)
+        // iter91: thread the optional session borrow into the LayerEncoder
+        // constructor.  Under env=0 this is byte-identical to pre-iter91
+        // (Plain CommandEncoder via device.command_encoder()).  Under env=1
+        // the borrow is consumed for this stage and released at the
+        // terminal `fence_or_commit("layer.gdn.stage_a")` below.
+        //
+        // Note: build_delta_net_layer_with_arena binds `layer_session` by
+        // value at the function signature and shadows it here via a single
+        // `Option::take`-like consumption — there's only one
+        // LayerEncoder::from_session_or_plain site in this function, so we
+        // can move the Option directly without `as_deref_mut`.
+        let mut enc = LayerEncoder::from_session_or_plain(device, layer_session)
             .context("enc gdn stage_a prefill (arena)")?;
         apply_pre_norm_into(
             enc.encoder(),
@@ -4958,6 +4979,9 @@ mod tests {
             shape.d_v,
             shape.conv_kernel,
             shape.rms_norm_eps,
+            // iter91: synthetic test exercises the per-stage Plain
+            // CommandEncoder shape (env=0 equivalent) — pass None.
+            None,
         )
         .expect("production consolidated Stage-A path");
         // Flush before download (mirrors pattern at gpu_state_propagation_*).

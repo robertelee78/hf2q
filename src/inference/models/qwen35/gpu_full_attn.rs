@@ -1407,9 +1407,11 @@ pub fn apply_flash_attn_prefill_seq_major(
     let v_elems = seq * nkv * d;
     let out_elems = seq * nh * d;
 
-    // out_seq is always a per-call allocation: it is the function's return
-    // value and the caller takes ownership. Arena-owning it would require
-    // a per-layer index, which adds aliasing risk (A.5).
+    // out_seq is a per-call allocation: it is the function's return value
+    // and the caller takes ownership.  ADR-019 Phase 2 iter92: caller is
+    // expected to ARC-clone it into the K-batch hold-vec at forward_gpu
+    // level before the next FA layer's same-slot reuse can race the
+    // residency-rescission mid-flight CB.
     let out_seq = device
         .alloc_buffer(out_elems * 4, DType::F32, vec![seq, nh, d])
         .map_err(|e| anyhow!("alloc out_seq: {e}"))?;
@@ -1997,6 +1999,26 @@ pub fn build_gated_attn_layer(
     rms_norm_eps: f32,
     fa_arena: Option<&mut crate::inference::models::qwen35::FaPrefillArena>,
     fa_proj_arena: Option<&mut crate::inference::models::qwen35::FaProjectionsArena>,
+    // ADR-019 Phase 2 iter92 — K-batch ARC hold for the FA bridge's
+    // F32 seq-major output (`out_seq`).  When `Some`, the helper pushes
+    // an Arc-clone of `out_seq` into the vec before the function-local
+    // binding falls out of scope at function return, ensuring the
+    // underlying allocation outlives the in-flight FA-stage CB through
+    // the K-boundary commit_and_wait at forward_gpu level.  When
+    // `None` (decode, tests), per-call drop happens normally; decode
+    // commits-and-waits per token so no in-flight CB ever spans the
+    // function-return boundary.
+    mut out_seq_hold: Option<&mut Vec<MlxBuffer>>,
+    // ADR-019 Phase 2 iter91: borrowed `&mut EncoderSession` for the
+    // multi-stage chain.  `None` at env=0 (per-stage Plain CommandEncoder
+    // shape, byte-identical to pre-iter91).  `Some(sess)` at env=1 — the
+    // session is allocated once in `forward_gpu_impl` between the arena
+    // setup and the per-layer loop and threaded through every helper that
+    // constructs a `LayerEncoder`.  Both internal `LayerEncoder` sites
+    // (ops1-4 at line ~2152 and ops6-7 fallback at line ~2610) consume
+    // the borrow via `as_deref_mut()` so the session can be re-borrowed
+    // for the next stage / next layer.
+    mut layer_session: Option<&mut mlx_native::EncoderSession>,
 ) -> Result<MlxBuffer> {
     // Capture arena presence before moving fa_arena into the SDPA call below.
     // Used to decide the commit vs commit_labeled path for ops1-4 and ops6-7.
@@ -2142,14 +2164,24 @@ pub fn build_gated_attn_layer(
     // The encoder is constructed at "enc ops1-4" below and threaded through
     // the use_fused_stage_ab block to the ops6-7 site (line ~2589) where it
     // emits the single terminal `layer.full_attn.stage_a` fence/commit.
-    let mut fused_stage_a_enc: Option<LayerEncoder> = None;
+    // ADR-019 Phase 2 iter91: `fused_stage_a_enc` carries the borrowed
+    // session lifetime `'sess` through the use_fused_stage_ab block to the
+    // ops6-7 site below.  Under env=0 the borrow is `'static`-equivalent
+    // (Plain variant carries no lifetime).
+    let mut fused_stage_a_enc: Option<LayerEncoder<'_>> = None;
     let (x_norm, q_flat, k_flat, v_flat, gate_flat, q_normed, k_normed, q_rope, k_rope) = if let
         Some(arena) = fa_proj_arena.as_mut().map(|a| &mut **a).filter(|_| use_proj_arena)
     {
         let _w5b9_ops1to4 = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::FaOps1to4,
         );
-        let mut enc = LayerEncoder::new(device).context("enc ops1-4")?;
+        // iter91: thread the optional session borrow into the LayerEncoder
+        // constructor.  `as_deref_mut` re-borrows the inner `&mut EncoderSession`
+        // each time so the session can be passed to the ops6-7 fallback below
+        // (which only fires when fused_stage_a_enc is None — i.e. ops1-4 did
+        // NOT take the use_fused_stage_ab branch).
+        let mut enc = LayerEncoder::from_session_or_plain(device, layer_session.as_deref_mut())
+            .context("enc ops1-4")?;
 
         // Op 1: pre-attention RMSNorm → arena.x_norm_buf
         apply_pre_attn_rms_norm_into(
@@ -2281,6 +2313,10 @@ pub fn build_gated_attn_layer(
             let out_seq = device
                 .alloc_buffer(out_elems * 4, DType::F32, vec![seq, nh, d])
                 .map_err(|e| anyhow!("alloc out_seq (fused stage_ab): {e}"))?;
+            // ADR-019 Phase 2 iter92 — push Arc-clone into K-batch hold-vec.
+            if let Some(hold) = out_seq_hold.as_deref_mut() {
+                hold.push(out_seq.clone());
+            }
 
             // Encode the FA bridge body (8 dispatches + 5 intra-encoder
             // barriers) into the SAME `enc`. iter89e2-E's `_into` variant.
@@ -2552,7 +2588,7 @@ pub fn build_gated_attn_layer(
         let _w5b9_sdpa_total = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::FaSdpaTotal,
         );
-        match kv_cache_slot {
+        let sdpa_out = match kv_cache_slot {
             Some(slot) => apply_sdpa_with_kv_cache(
                 device, registry,
                 &q_rope, &k_rope, &v_flat,
@@ -2567,7 +2603,14 @@ pub fn build_gated_attn_layer(
                     seq_len, n_heads, n_kv_heads, head_dim,
                 )?
             }
+        };
+        // ADR-019 Phase 2 iter92 — push Arc-clone into K-batch hold-vec for
+        // the legacy SDPA path's per-call output too.  See the modern
+        // fused-stage-ab path above for the same pattern.
+        if let Some(hold) = out_seq_hold.as_deref_mut() {
+            hold.push(sdpa_out.clone());
         }
+        sdpa_out
     };
     // attn_out is now [seq * n_heads, head_dim] seq-major.
 
@@ -2607,7 +2650,18 @@ pub fn build_gated_attn_layer(
         // and reach it via `enc.encoder()`.
         let (mut enc, fused_into_stage_a) = match fused_stage_a_enc.take() {
             Some(e) => (e, true),
-            None => (LayerEncoder::new(device).context("enc ops6-7")?, false),
+            None => (
+                // iter91: when ops1-4 didn't fuse (decode / dump_bisect /
+                // head_dim != 256 / cur_len != 0 / missing arenas), the
+                // ops1-4 enc was already committed via fence_or_commit
+                // above — releasing the session borrow back to
+                // layer_session.  Re-borrow here for the ops6-7 stage's
+                // fresh CB.  Under env=0 (Plain), each branch opens its
+                // own CommandEncoder unchanged from pre-iter91.
+                LayerEncoder::from_session_or_plain(device, layer_session.as_deref_mut())
+                    .context("enc ops6-7")?,
+                false,
+            ),
         };
         // ADR-019 Phase 2 iter89e2-G: RAW barrier between fa.prefill_bridge's
         // final dispatch (permute_021_bf16_to_f32 → out_seq) and ops6
@@ -3630,6 +3684,10 @@ mod tests {
             shape.rms_norm_eps,
             None,
             None,
+            // iter92: synthetic test, no K-batch hold-vec needed.
+            None,
+            // iter91: synthetic parity test — Plain CommandEncoder shape.
+            None,
         )
         .expect("build_gated_attn_layer");
 
@@ -4021,6 +4079,8 @@ mod tests {
             shape.rms_norm_eps,
             None, // fa_arena
             None, // fa_proj_arena (LEGACY)
+            None, // iter92: K-batch hold-vec — synthetic test
+            None, // iter91: layer_session — synthetic parity test, Plain shape.
         )
         .expect("legacy build_gated_attn_layer");
         let out_legacy = download_f32(&out_legacy_buf).expect("download legacy");
@@ -4058,6 +4118,8 @@ mod tests {
             shape.rms_norm_eps,
             None,                       // fa_arena
             Some(&mut fa_proj_arena),   // fa_proj_arena (NEW)
+            None,                       // iter92: K-batch hold-vec — synthetic test
+            None,                       // iter91: layer_session — Plain shape.
         )
         .expect("arena build_gated_attn_layer");
         let out_arena = download_f32(&out_arena_buf).expect("download arena");

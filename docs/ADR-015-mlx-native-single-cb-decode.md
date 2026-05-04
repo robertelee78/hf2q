@@ -6837,3 +6837,343 @@ mlx-native main HEAD updated by Worker α (`encoder_session.rs` 749→840 LOC,
 two new test files), Worker β (cb_count_smoke updated, new test 6 in
 multistage).
 
+---
+
+## iter91 — production wire-up LANDED, H4 race FALSIFIED at MLX_UNRETAINED_REFS=1 (2026-05-04)
+
+**Verdict: PARTIAL.** iter91 closes the iter90b H1+H2+H3 deferrals
+(production wire-up of the borrowed-`&mut EncoderSession` multi-stage
+chain across the per-layer loop, with measurable 30.68% CB-count
+reduction and zero wall-time regression). iter91 also runs the
+load-bearing H4 empirical race-falsification at `MLX_UNRETAINED_REFS=1`
+that iter90b deferred. **H4 FALSIFIED** — the borrowed-session retain
+mechanism is INSUFFICIENT to close the layer-7 dense_ffn / layer-15
+moe_ffn race surface predicted by Codex finding #2. iter91 ships
+H1/H2/H3 production-wire-up; iter92 owns H4 (DenseFfnOutputRingBuffer +
+MoeFfnOutputRingBuffer per spec §11 OQ-iter91-2).
+
+### iter91 worker chain
+- **Worker A** (lifetime refactor) — LANDED; `LayerEncoder<'sess>`
+  enum + `from_session_or_plain(device, session: Option<&'sess mut
+  EncoderSession>)` + `carry_into_next_stage(self, label)` method;
+  session allocated once per `forward_gpu_impl` (gated on `seq_len > 1
+  && LayerEncoder::env_enabled()`); threaded `as_deref_mut()` through
+  `build_gated_attn_layer` (FA helper) and
+  `build_delta_net_layer_with_arena` (DN helper); intra-K FFN
+  `enc.fence_or_commit(...)` swapped to `enc.carry_into_next_stage(...)`
+  at 2 sites (`forward_gpu.rs:3104` DenseQ + `:3245` MoeQ).
+- **Worker B** (CB-count + wall instrumentation + AC-2 evidence) — PARTIAL
+  (script harness exited before completing wall AC-3; launcher
+  hand-measured AC-3 directly). AC-2 PASS (30.68% CB reduction).
+- **Worker C** (H4 falsification + ADR + commit) — H4 FAIL → PARTIAL,
+  no commit/push per spec §S3 (leave branch for iter92 to consume).
+
+### iter91 LOC delta (actual vs spec §1.3 estimate ~520 LOC)
+
+| File | spec est | actual |
+|---|---|---|
+| `src/inference/models/qwen35/encoder_stage.rs` | ~140 | +236/-191 = +45 net (rewritten 462 LOC body+doc) |
+| `src/inference/models/qwen35/forward_gpu.rs` | ~50 | +112/-9 = +103 net |
+| `src/inference/models/qwen35/gpu_full_attn.rs` | ~25 | +37/-4 = +33 net |
+| `src/inference/models/qwen35/gpu_delta_net.rs` | ~15 | +25/-1 = +24 net |
+| `scripts/iter91-cb-count-probe.sh` (NEW) | ~50 | ~50 |
+| `scripts/iter91-pp4096-wall.sh` (NEW) | ~50 | ~50 |
+| **Total wire-up + harness** | **~330** | **~310 net** |
+
+Within spec estimate; well under the 1000 LOC scope-split trigger and
+the 2000 LOC operator threshold.
+
+### Worker A spec deviation (signature change beyond §1.2 #6)
+
+Spec §1.2 #6 says `commit_and_wait_labeled` Sessioned arm should be
+`sess.begin_stage(label); sess.commit_and_wait()` (no drop). Worker A
+shipped `sess.begin_stage(label); sess.commit_and_wait()?;
+sess.reset_for_next_stage()?;` (extra `reset_for_next_stage` call after
+commit_and_wait). **Required because** `CommandEncoder::commit_and_wait`
+at `/opt/mlx-native/src/encoder.rs:1852-1879` does NOT call
+`reset_command_buffer()` internally. After it returns, `self.cmd_buf`
+still references the now-committed CB; the next layer's `enc.encoder()`
+call would Metal-assert at `setCurrentCommandEncoder:` line 323.
+`reset_for_next_stage` is structurally safe here per its own docstring
+at `/opt/mlx-native/src/encoder_session.rs:553-559` — `Drained →
+Encoding (new CB, no wait)` transition. Costs +1 CB per K-boundary
+commit_and_wait (cheap; H2 reduction comes from intra-K
+`carry_into_next_stage`, not K-boundary CB count).
+
+### Phase 1 Queen finding (carry-forward to iter92)
+
+> "The race fix IS the borrowed-session retain mechanism itself — no
+> additional arena lift in iter91 because the FFN sum_buf/down_out
+> lifetime contract (cross-layer hidden ownership) makes 4th arena
+> unsafe per dense_ffn_arena.rs:55-63 doc."
+
+This Phase 1 prediction is now **EMPIRICALLY FALSIFIED**. The
+borrowed-session pattern keeps the session-CB chain alive across
+stages, but the per-layer `down_out`/`sum_buf` allocations in
+`build_dense_ffn_layer_gpu_q_into_with_arena` (gpu_ffn.rs:1254-1256
+and 1360-1362) and the equivalent MoE `out_buf` allocation in
+`build_moe_ffn_layer_gpu_q_into_with_arena` (gpu_ffn.rs:2680-2682) STILL
+drop ARC underneath an in-flight pipelined CB at
+`MLX_UNRETAINED_REFS=1`, even with the borrowed session intact. The
+session's CB chain provides retain on buffers bound INTO ITS OWN
+PERSISTENT ENCODER, but the FFN cross-layer hidden chain crosses
+allocations whose ARC drop is gated by next-layer assignment, not by
+session-CB-chain anchoring.
+
+iter92 must add `DenseFfnOutputRingBuffer` (2-slot ring per spec
+§3.3 alternative) AND `MoeFfnOutputRingBuffer` to anchor the
+cross-layer output buffers. The aliasing concern documented at
+`dense_ffn_arena.rs:55-63` is closeable with a 2-slot ring (current +
+prev) — at 2 slots there's no aliasing because layer-N writes to slot
+N%2 while layer-N-1's read still sees slot (N-1)%2, then layer-N+1
+overwrites slot (N+1)%2 = (N-1)%2 only AFTER layer-N's CB has
+completed and dropped its last reference.
+
+### AC scorecard
+
+| AC | hypothesis | result | evidence |
+|---|---|---|---|
+| AC-1 | H1 — env=0 zero-behavior-change | **PASS** | `worker_a_ac1_env0.txt` — 2785/0/13 (matches iter90b baseline byte-exact) |
+| AC-2 | H2 — production CB-count ≥30% reduction | **PASS** | `cb_count_ratio.txt` — env0=176, env1=122, ratio=0.6932, **30.68% reduction** |
+| AC-3 | H3 — wall-time within 2x of env=0 | **PASS** | `pp4096_wall_ratio.txt` — env0=19663ms, env1=19568ms, ratio=0.9952 (env=1 marginally faster, within bench noise — borrowed-session does NOT reproduce iter90b worker β's 14-min back-pressure antipattern) |
+| AC-4 | H4 — race CLOSED at UNRETAINED=1 (parity) | **FAIL** | `parity_unretained_result.txt` — 1 PASS (gemma) + 3 SKIP (qwen35 fixtures crashed before producing decoded text). Same layer-7 dense_ffn site as iter90b for 27B-DWQ46; layer-15 moe_ffn site for 35B-q4_0-flat (validates spec §11 OQ-iter91-2 prediction); apex genuinely missing |
+| AC-5 | H4 — race CLOSED at UNRETAINED=1 (5x cold determinism) | **FAIL** | `determinism_unretained_env1.txt` — 5/5 cold runs FAIL with `Qwen35Model::forward_gpu_last_logits (prefill): commit fused-DenseQ layer 7: EncoderSession::commit_and_wait(layer.dense_ffn): Command buffer error: GPU command buffer completed with error status` |
+| AC-6 | regression — iter90b parity preserved at env=1 | **DEFERRED** (H4 FAIL → S2 skipped per spec §S3) | — |
+| AC-7 | mlx-native existing tests preserved | not run by Worker C (Worker A noted no mlx-native edits in iter91; primitive unchanged from iter90b) | — |
+| AC-8 | ADR doc updated with real numbers | **PASS** | this entry |
+| AC-9 | branches pushed to remote | **NOT EXECUTED** (per task §S3 directive: do NOT push if H4 FAIL — leave branch for iter92 to consume) | — |
+
+**Net verdict:** PARTIAL. AC-1+AC-2+AC-3+AC-8 PASS (production wire-up
+H1+H2+H3 + ADR doc). AC-4+AC-5 FAIL (H4 race not closed). AC-6+AC-7
+deferred per H4-FAIL skip rule. AC-9 not executed (PARTIAL hold).
+Codex finding #2 race-class concern remains OPEN.
+
+### Specific empirical FAIL evidence (the load-bearing iter91 result)
+
+3 qwen35 fixtures crashed at the SAME SITES iter90b documented:
+```
+qwen3.6-27b-dwq46:
+  ERROR hf2q: Qwen35Model::forward_gpu_last_logits (prefill):
+  commit fused-DenseQ layer 7: EncoderSession::commit_and_wait(layer.dense_ffn):
+  Command buffer error: GPU command buffer completed with error status
+
+qwen3.6-35b-a3b-q4_0-flat:
+  ERROR hf2q: Qwen35Model::forward_gpu_last_logits (prefill):
+  commit fused-MoeQ layer 15: EncoderSession::commit_and_wait(layer.moe_ffn):
+  Command buffer error: GPU command buffer completed with error status
+
+qwen3.6-35b-a3b-apex:
+  ERROR hf2q: Model not found: ... (genuinely missing on bench host —
+  pre-existing per iter90b OQ-iter91-3)
+```
+
+Gemma path PASSED IDENTICAL to env=0 baseline (gemma path does NOT use
+the qwen35 encoder_stage.rs / borrowed-session shape; H4 FAIL is
+qwen35-scoped per design).
+
+5/5 cold determinism runs (35b-dwq46, "Hello" prompt) all FAIL at the
+identical layer-7 dense_ffn site — fully deterministic race at
+MLX_UNRETAINED_REFS=1.
+
+### env=1 default-on (MLX_UNRETAINED_REFS=0) status
+
+iter91's borrowed-session production wire-up DOES land safely at env=1
+default-on (default ARC retain). AC-1 (env=0) is byte-identical to
+iter90b's 2785/0/13 baseline, confirming Plain-arm path preserved.
+Worker A's three smoke runs (29/37/327 prefill at env=1) all returned
+coherent output in <1 second — borrowed-session shape works under
+default ARC retain. The CB-count reduction (30.68%) and wall-time
+neutrality (0.9952 ratio) are PROVEN on the env=1 default-on path.
+
+**The race opens ONLY at `MLX_UNRETAINED_REFS=1`** — the Codex
+finding #2 surface that the operator MUST gate behind a flag until
+iter92's ring-buffer arena lifts close it. iter91 leaves this gating
+EXPLICIT — `HF2Q_ENCODER_SESSION=1` (default behavior at env=1) is
+SAFE for production at default `MLX_UNRETAINED_REFS=0`; combining with
+`MLX_UNRETAINED_REFS=1` is UNSAFE pending iter92.
+
+### iter92 scope recommendation
+
+Per spec §3.3 alternative + §11 OQ-iter91-2:
+
+1. Author `DenseFfnOutputRingBuffer` (2-slot ring of `MlxBuffer` for
+   `down_out`/`sum_buf` outputs) at `dense_ffn_arena.rs`. Anchor the
+   ring on the layer-loop scope (lifetime ≥ all in-flight pipelined
+   CBs that reference the prev layer's hidden). Slot rotation
+   N%2 vs (N-1)%2 sidesteps the aliasing hazard documented at
+   dense_ffn_arena.rs:55-63 because read/write windows are
+   1-layer-apart.
+2. Author `MoeFfnOutputRingBuffer` analogously for
+   `build_moe_ffn_layer_gpu_q_into_with_arena`'s `out_buf` at
+   gpu_ffn.rs:2680-2682.
+3. Re-run iter91's AC-4 + AC-5 at `MLX_UNRETAINED_REFS=1` after
+   ring-buffer lift. PASS = layer-7 + layer-15 sites no longer fail.
+4. Re-run iter91's AC-2 + AC-3 to confirm ring-buffer lift does NOT
+   regress CB count or wall time.
+5. Operator-controlled cold-SoC pp4096 wall-time bench (H5/H3b per
+   iter91 spec out-of-scope items) AFTER iter92 closes H4.
+
+iter92 inherits iter91's branch
+`adr015-iter91-prod-wireup-race-closure-2026-05-04` (NOT yet pushed
+per H4-FAIL gate).
+
+### Receipts (iter91 set)
+
+`/opt/hf2q/.cfa-archive/iter91/`:
+- `worker_a_build.txt` (RUSTC_WRAPPER="" cargo build --release: 30s cold, no iter91 warnings)
+- `worker_a_ac1_env0.txt` (2785/0/13 — AC-1 PASS, byte-identical to iter90b)
+- `worker_a_smoke_env0.txt`, `worker_a_smoke_env1.txt`, `worker_a_smoke_env1_long.txt` (3 prefill-length smokes at env=0/env=1: all coherent, <1s)
+- `cb_count_ratio.txt` (env0=176, env1=122, ratio=0.6932 — AC-2 PASS, 30.68% CB reduction)
+- `pp4096_wall_ratio.txt` (env0=19663ms, env1=19568ms, ratio=0.9952 — AC-3 PASS, no back-pressure)
+- `parity_unretained_run.txt` + `parity_unretained_result.txt` (AC-4 evidence — 1 PASS gemma + 3 SKIP qwen35 crashed)
+- `determinism_unretained_env1.txt` (AC-5 evidence — 5/5 cold FAIL at layer-7 dense_ffn)
+- `worker_a_report.md` (Worker A lifetime refactor full report with diff stats + signature deviation rationale)
+- `worker_c_report.md` (Worker C race-falsification report with H4 FAIL diagnosis)
+- `final-report.md` (Worker C deliverable; verdict + AC scorecard + iter92 recommendation)
+
+### Cross-refs (iter91)
+
+hf2q branch `adr015-iter91-prod-wireup-race-closure-2026-05-04` (off
+iter90b tip `fb8ba9b`); mlx-native main HEAD UNCHANGED (iter91 made
+no mlx-native edits per spec §11 OQ-iter91-5; primitives proven in
+iter90b stand). Branch NOT pushed (H4 FAIL gate per task §S3); iter92
+to consume in-tree.
+
+## ADR-019 Phase 2 iter92 — RACE CRASH CLOSURE (PARTIAL)
+
+### Verdict: PARTIAL
+
+iter91 PARTIAL becomes iter91+iter92 PARTIAL. iter92 closed the
+**GPU-error crash class** at `MLX_UNRETAINED_REFS=1` (5/5 cold runs
+now produce DETERMINISTIC output instead of `MTLCommandBufferStatus::
+Error`), but the produced output is NOT byte-identical to the env=0
+baseline. iter92 H4 verdict: **CRASH CLOSED, PARITY OPEN.**
+
+### What landed
+
+Three structural lifts to close the spec §3 race surface:
+
+1. **DenseFfnOutputRingBuffer + MoeFfnOutputRingBuffer** (new types in
+   `dense_ffn_arena.rs`).  Two-slot rings rotated by `layer_idx % 2`
+   hold the per-layer FFN final output (`down_out` / `sum_buf` for
+   Dense, `out_buf` for MoE).  Pre-allocated `[seq_capacity,
+   hidden_size]` F32 each slot, lifetime = whole prefill.  Closes the
+   `hidden = ffn_out` reassignment race at
+   `forward_gpu.rs:3382`/3449 (the spec §3.2 dense_ffn_arena.rs
+   doc-comment "FINAL OUTPUT … intentionally NOT included in the
+   arena" is now retroactively WRONG — iter92 INCLUDES it via the
+   ring's slot rotation, which the doc-comment warned would alias
+   with adjacent slots; the rotation invariant prevents that
+   aliasing).
+
+2. **DenseFfnArena.down_out_buf** field added — when residual is
+   folded, the dense-Q down projection writes into this arena
+   scratch; the elementwise_add then writes the FINAL output into
+   the ring slot.  Removes the per-layer `device.alloc_buffer` for
+   `down_out` at `gpu_ffn.rs:1254` and `sum_buf` at :1360.
+
+3. **K-batch ARC hold-vec for FA `out_seq`** in `forward_gpu_impl`,
+   threaded into `build_gated_attn_layer` via a new
+   `out_seq_hold: Option<&mut Vec<MlxBuffer>>` parameter.  The FA
+   bridge's per-call F32 seq-major output buffer
+   (`gpu_full_attn.rs:1413` and :2303) is Arc-cloned into the vec
+   BEFORE the function-local binding falls out of scope at
+   `build_gated_attn_layer` return.  Cleared at K-boundary after
+   `commit_and_wait_labeled` drains the GPU.  Closes the FA-side
+   sister of the dense_ffn race: previous-layer `attn_out` dropping
+   between FA-stage commit and K-boundary commit_and_wait.
+
+### Receipts
+
+`/opt/hf2q/.cfa-archive/iter92/`:
+- `build.txt` (release build, 13s, 2 stale warnings only)
+- `ac1_env0.txt` (test result: 2792 passed; 0 failed; 13 ignored —
+  AC-1 PASS, +7 new ring-buffer tests vs iter91 baseline 2785)
+- `cb_count.txt` (cb_count_env0=176, cb_count_env1=122, ratio=0.6932,
+  reduction_pct=30.68 — AC-2 PASS, BYTE-IDENTICAL to iter91 result)
+- `parity_default_env1.txt` (3 PASS IDENTICAL + 1 SKIP-missing-apex —
+  AC-3b PASS)
+- `parity_env0_run.txt` (iter92 env=0 baseline; 3/3 fixtures match
+  iter90b's env=0 baseline byte-identically — proves iter92's
+  ring-buffer + arena changes are content-equivalent under default
+  ARC retention)
+- `parity_unretained_run.txt` + `parity_unretained_result.txt`
+  (env=1+UNRETAINED=1: 3 fixtures ran successfully, 1 SKIP-missing-
+  apex — but 2/3 ran fixtures produced DETERMINISTIC-DIFFERENT output
+  vs env=0 baseline; gemma matches.  Race is CLOSED — no GPU error —
+  but parity is OPEN)
+- `determinism_unretained_env1.txt` (5/5 cold runs produced
+  byte-identical top-3 — `DETERMINISM: PASS`.  Race verifiably
+  closed by independent measurement)
+
+### AC scorecard (iter92)
+
+| AC | Predicate | Outcome |
+|----|-----------|---------|
+| AC-1 | env=0 test suite ≥ iter91 baseline (2785/0/13) | **PASS** (2792/0/13 — +7 new ring-buffer + arena tests) |
+| AC-2 | env=1 cb_count ratio ≤ 0.70 vs env=0 | **PASS** (0.6932 = 30.68% reduction; byte-identical to iter91) |
+| AC-3b | env=1 default-retained 3/4 IDENTICAL + 1 SKIP-missing | **PASS** |
+| AC-4 | env=1+UNRETAINED=1 ≥3 PASS-IDENTICAL + 0 MISMATCH | **FAIL** (3 ran successfully — race closed — but 2/3 produced deterministic-different output vs env=0 baseline; gemma matches) |
+| AC-5 | env=1+UNRETAINED=1 5/5 cold runs byte-identical | **PASS** (`DETERMINISM: PASS`) |
+
+### Race-class delta vs iter91
+
+| Mode | iter91 | iter92 |
+|------|--------|--------|
+| env=0 | PASS (baseline) | PASS (byte-identical) |
+| env=1 (default) | PASS (matches env=0) | PASS (matches env=0) |
+| env=1+UNRETAINED=1 (4-fixture parity) | 3/4 CRASH at K-boundary (`MTLCommandBufferStatus::Error`) | 3/4 RUN to completion deterministically; outputs differ from env=0 baseline |
+| env=1+UNRETAINED=1 (determinism 5x) | `DETERMINISM: FAIL — 5/5 cold runs DID NOT produce byte-identical top-3` (all 5 crashed at the same site) | `DETERMINISM: PASS — 5/5 cold runs produced byte-identical top-3` |
+
+iter92 closes the **CRASH CLASS** that iter91 left open.  The race
+that fired `MlxError::CommandBufferError` is now structurally
+unreachable on the closed code paths.
+
+### What's still open (iter93 scope)
+
+The deterministic-but-different output at `MLX_UNRETAINED_REFS=1`
+suggests one of:
+
+1. There's a fourth race-class buffer not yet covered — a
+   `device.alloc_buffer` call in some helper that is bound into a
+   deferred-commit CB and dropped before the CB completes.  Under
+   `MLX_UNRETAINED_REFS=1` the kernel still **reads** the bytes (AS
+   unified memory), but the residency-rescission may cause the kernel
+   to read GARBAGE (e.g. contents of the next allocation that
+   recycled the page).  Different-but-deterministic = same garbage
+   re-read every cold run.
+2. A subtle ordering bug exposed only when ARC retain doesn't extend
+   buffer lifetimes (i.e., the sourdough behavior depended on
+   incidental ARC retention).
+3. The `attn_out_holds.clear()` at K-boundary fires AFTER
+   `commit_and_wait_labeled` drains the K-batch but the FFN
+   intra-K commits already flushed residency — possibly leaving a
+   window where layer N+1's FA write into a recycled physical page
+   sees stale residency hint.
+
+iter93 should run with `HF2Q_PROFILE_RESIDENCY_ABORT=1` (if it
+exists; otherwise add similar instrumentation) plus per-layer dump
+bisection at the FIRST divergent token to localize the race.
+
+### Receipts cross-refs (iter91+iter92 combined)
+
+iter91:
+- `/opt/hf2q/.cfa-archive/iter91/worker_a_*` (build + AC-1 + smokes)
+- `/opt/hf2q/.cfa-archive/iter91/cb_count_ratio.txt`
+- `/opt/hf2q/.cfa-archive/iter91/pp4096_wall_ratio.txt`
+- `/opt/hf2q/.cfa-archive/iter91/parity_unretained_run.txt` (CRASH evidence)
+- `/opt/hf2q/.cfa-archive/iter91/determinism_unretained_env1.txt` (CRASH evidence)
+- `/opt/hf2q/.cfa-archive/iter91/worker_c_report.md`
+- `/opt/hf2q/.cfa-archive/iter91/final-report.md` (PARTIAL verdict)
+
+iter92:
+- `/opt/hf2q/.cfa-archive/iter92/build.txt`
+- `/opt/hf2q/.cfa-archive/iter92/ac1_env0.txt`
+- `/opt/hf2q/.cfa-archive/iter92/cb_count.txt`
+- `/opt/hf2q/.cfa-archive/iter92/parity_default_env1*`
+- `/opt/hf2q/.cfa-archive/iter92/parity_env0_run.txt`
+- `/opt/hf2q/.cfa-archive/iter92/parity_unretained_run.txt` + `_result.txt`
+- `/opt/hf2q/.cfa-archive/iter92/determinism_unretained_env1.txt` (PASS)
+- `/opt/hf2q/.cfa-archive/iter92/worker_report.md`
+- `/opt/hf2q/.cfa-archive/iter92/final-report.md`
+

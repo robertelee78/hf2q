@@ -1937,6 +1937,24 @@ impl Qwen35Model {
         // call's reset moves them all to the free list as expected.
         super::decode_pool::reset_decode_pool();
         let seq_len = tokens.len() as u32;
+        // ---- ADR-019 Phase 2 iter91 Worker B (H2 production CB-count probe) ----
+        //
+        // When `HF2Q_DUMP_CB_COUNT=1` is set, capture the process-global
+        // `mlx_native::cmd_buf_count()` atomic at the top of this prefill (after
+        // the decode-pool reset to exclude any pre-prefill housekeeping CBs)
+        // and emit a single `hf2q::cb_count: forward_gpu_impl pre=N post=M
+        // delta=D` line to stderr immediately before `Ok(logits)` returns.
+        //
+        // Gated to a no-op at default (env var unset) — zero behavior change.
+        // The DELTA is the AC-2 H2 signal: env=0 baseline vs env=1 sessioned
+        // chain. PASS criterion (spec §7 AC-2): delta_env1 / delta_env0 ≤ 0.70
+        // (≥30% reduction in CB allocations for the same fixture).
+        let dump_cb_count = std::env::var("HF2Q_DUMP_CB_COUNT").ok().as_deref() == Some("1");
+        let cb_count_pre = if dump_cb_count {
+            mlx_native::cmd_buf_count()
+        } else {
+            0
+        };
         let expected_pos_len = 4 * seq_len as usize;
         if positions_flat.len() != expected_pos_len {
             return Err(anyhow!(
@@ -2274,6 +2292,50 @@ impl Qwen35Model {
             None
         };
 
+        // ---- ADR-019 Phase 2 iter92: FFN-output ring buffers (race closure) ----
+        //
+        // Two-slot rings rotate by `layer_idx % 2` to hold the per-layer
+        // FFN final output (`down_out` / `sum_buf` for Dense; `out_buf`
+        // for MoE).  iter91 falsified the borrowed-session retain
+        // hypothesis: at `MLX_UNRETAINED_REFS=1` the per-layer
+        // `device.alloc_buffer` for these outputs dropped on
+        // `hidden = ffn_out` reassignment (forward_gpu.rs:3382) while the
+        // PRIOR layer's CB was still in flight; the residency-set
+        // `removeAllocation:` fired and the GPU completed that CB with
+        // `MTLCommandBufferStatus::Error`.
+        //
+        // The ring's persistent ARC retain across the whole prefill
+        // structurally prevents the drop.  Both rings are sized
+        // [seq_capacity, hidden_size] F32 × 2 slots = 167 MB at apex
+        // pp4096 × h=5120; both rings active simultaneously costs ~334 MB
+        // — negligible vs the existing ~870 MB MoeFfnArena footprint on
+        // apex.  See `dense_ffn_arena.rs::DenseFfnOutputRingBuffer` doc
+        // for the rationale and AC-4 / AC-5 closure details.
+        //
+        // Decode (`seq_len == 1`) keeps the existing per-call
+        // `device.alloc_buffer` shape (decode never engages the
+        // multi-layer race surface — each token is its own GPU sync).
+        let mut dense_ffn_output_ring: Option<super::DenseFfnOutputRingBuffer> = if seq_len > 1
+            && cfg.intermediate_size.is_some()
+        {
+            Some(
+                super::DenseFfnOutputRingBuffer::new(&device, seq_len, h)
+                    .context("alloc DenseFfnOutputRingBuffer")?,
+            )
+        } else {
+            None
+        };
+        let mut moe_ffn_output_ring: Option<super::MoeFfnOutputRingBuffer> = if seq_len > 1
+            && cfg.moe.is_some()
+        {
+            Some(
+                super::MoeFfnOutputRingBuffer::new(&device, seq_len, h)
+                    .context("alloc MoeFfnOutputRingBuffer")?,
+            )
+        } else {
+            None
+        };
+
         // ---- ADR-019 Phase 2 iter90b H4b: LayerBoundaryArena allocation ----
         //
         // Lifts the per-layer `device.alloc_buffer` calls for `ffn_input_buf`
@@ -2295,6 +2357,56 @@ impl Qwen35Model {
             Some(
                 super::LayerBoundaryArena::new(&device, seq_len, h)
                     .context("alloc LayerBoundaryArena")?,
+            )
+        } else {
+            None
+        };
+
+        // ---- ADR-019 Phase 2 iter91: borrowed-`&mut EncoderSession`
+        //      multi-stage chain (the H2 CB-count reduction primitive,
+        //      proven by /opt/mlx-native/tests/encoder_session_cb_count_smoke.rs
+        //      at factor-2x reduction).
+        //
+        // Construct the session ONCE per `forward_gpu_impl` call (one
+        // allocation, one drop), gated on `seq_len > 1` (decode goes
+        // through the per-token `forward_gpu_greedy` which never engages
+        // the multi-layer chain) AND `LayerEncoder::env_enabled()`
+        // (HF2Q_ENCODER_SESSION=1).  The borrow is threaded through the
+        // per-layer loop below via `layer_session.as_mut()` /
+        // `as_deref_mut()` to:
+        //   1. The inline FFN encoder construction (the `enc fused_res_norm`
+        //      site below) where `LayerEncoder::from_session_or_plain`
+        //      consumes the borrow and releases it at the FFN's terminal
+        //      `commit_and_wait_labeled` (K-boundary) or
+        //      `carry_into_next_stage` (intra-K).
+        //   2. `build_gated_attn_layer`'s `layer_session` parameter (the
+        //      ops1-4 + ops6-7 helper).
+        //   3. `build_delta_net_layer_with_arena`'s `layer_session`
+        //      parameter (the DN stage_a helper).
+        //
+        // The session is dropped at end of `forward_gpu_impl` AFTER the
+        // output-head terminal `commit_and_wait_labeled` drains the GPU
+        // and clears `fence_pending` (`encoder_session.rs::Drop` Case 1
+        // — clean release).  Dropping a Fenced session BEFORE the
+        // matching wait-event lands is the iter90b "14-minute Metal
+        // back-pressure hang" antipattern that this iter91 borrowed-
+        // session shape structurally avoids.
+        //
+        // env=0 (default): None.  Each per-layer LayerEncoder constructor
+        // opens its own owned `CommandEncoder` (Plain variant) — byte-
+        // identical to pre-iter91 behavior.  AC-1 regression test PASS
+        // is the empirical guard.
+        let mut layer_session: Option<mlx_native::EncoderSession> = if seq_len > 1
+            && super::encoder_stage::LayerEncoder::env_enabled()
+        {
+            Some(
+                device
+                    .encoder_session()
+                    .context("alloc layer_session for borrowed-session multi-stage chain")?
+                    .expect(
+                        "LayerEncoder::env_enabled() == true ⇒ \
+                         MlxDevice::encoder_session() returns Some(_)",
+                    ),
             )
         } else {
             None
@@ -2495,6 +2607,37 @@ impl Qwen35Model {
                 .unwrap_or(true);
         let mut last_layer_held_enc: Option<mlx_native::CommandEncoder> = None;
 
+        // ADR-019 Phase 2 iter92 — K-batch ARC hold for cross-layer
+        // device-allocated buffers.
+        //
+        // The FA bridge (`apply_flash_attn_prefill_seq_major`) returns its
+        // F32 output (`out_seq` at gpu_full_attn.rs:1413) as a per-call
+        // `device.alloc_buffer` MlxBuffer.  That buffer becomes `attn_out`
+        // in this loop and is bound into `dispatch_fused_residual_norm_f32`
+        // via `&attn_out` (see line ~3036 below).  At end of the layer
+        // iteration, `attn_out` falls out of scope and its `MlxBuffer::Drop`
+        // fires `removeAllocation:` on the residency set (deferred —
+        // flushed at the next CommandEncoder::commit*).  Under
+        // `MLX_UNRETAINED_REFS=1` the in-flight FFN CB (intra-K, non-
+        // blocking commit) loses access to its bound `attn_out` and the
+        // K-boundary `commit_and_wait` reports `MTLCommandBufferStatus::
+        // Error` — the iter91 H4 race.
+        //
+        // Fix: stash an `Arc`-clone of every `attn_out` into this Vec so
+        // the underlying allocation outlives the in-flight CB.  Vec is
+        // cleared at the K-boundary (after the K-boundary's
+        // `commit_and_wait_labeled` drains the GPU, line ~3650 below).
+        // Memory cost at apex 27B-DWQ46 (16 FA layers, K=8, attn_out =
+        // seq×nh×d×4 = 4096×16×256×4 = 67 MB): worst-case 8×67MB = 536 MB
+        // held during one K-batch.  Fits comfortably in 128 GB unified
+        // memory.  DN's `attn_out` is pool-allocated (no residency-set
+        // membership in the storage Arc) so pushing it into this Vec is
+        // harmless but unnecessary — for code uniformity, both layer
+        // kinds push.
+        let mut attn_out_holds: Vec<MlxBuffer> = Vec::with_capacity(
+            ffn_terminal_k_batch.max(1) as usize,
+        );
+
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
             // K-boundary: last layer in the window OR final layer overall.
             // At K=1 every layer is a boundary (= current behaviour).
@@ -2573,6 +2716,19 @@ impl Qwen35Model {
                         shape.rms_norm_eps,
                         fa_arena.as_mut(),
                         fa_proj_arena.as_mut(),
+                        // ADR-019 Phase 2 iter92 — pass the K-batch
+                        // hold-vec so the FA helper pushes its per-call
+                        // `out_seq` Arc-clone into it before the
+                        // function-local binding falls out of scope.
+                        // See attn_out_holds doc above (~line 2640).
+                        if seq_len > 1 { Some(&mut attn_out_holds) } else { None },
+                        // iter91: thread the borrowed session into the
+                        // FA helper.  `as_mut()` re-borrows the
+                        // `Option<EncoderSession>` for this call's
+                        // lifetime; the helper releases the borrow at
+                        // its terminal `fence_or_commit` so the next
+                        // helper / FFN inline encoder can re-borrow.
+                        layer_session.as_mut(),
                     )
                     .with_context(|| format!("full_attn layer {layer_idx}"))?
                 }
@@ -2665,6 +2821,13 @@ impl Qwen35Model {
                             shape.d_v,
                             shape.conv_kernel,
                             shape.rms_norm_eps,
+                            // iter91: thread the borrowed session into the
+                            // DN helper.  The DN helper has only one
+                            // LayerEncoder site (stage_a) so it can
+                            // consume the borrow by value via the helper
+                            // signature; we pass `as_mut()` here for
+                            // symmetry with the FA call site above.
+                            layer_session.as_mut(),
                         )
                         .with_context(|| {
                             format!("delta_net_with_arena layer {layer_idx}")
@@ -2710,6 +2873,16 @@ impl Qwen35Model {
                     LayerWeightsGpu::FullAttn { .. } => total_full_attn_us += us,
                 }
             }
+
+            // ADR-019 Phase 2 iter92 — note: the K-batch hold-vec
+            // `attn_out_holds` is populated INSIDE
+            // `build_gated_attn_layer` via the `out_seq_hold` parameter
+            // we threaded above, capturing the FA bridge's per-call
+            // device.alloc'd output (`out_seq`) BEFORE it falls out of
+            // helper-scope.  The DN path's `attn_out` is pool-allocated
+            // (no residency-set membership in the storage Arc, see
+            // buffer.rs:122-130 / buffer_pool.rs:202) and does NOT
+            // require a hold-vec push.
 
             // --- Fused residual + post-attention RMSNorm (1 encoder, 1 commit) ---
             // Replaces: residual_add_gpu (1 commit) + dispatch_rms_norm (1 commit)
@@ -2846,8 +3019,19 @@ impl Qwen35Model {
             // `commit_and_wait_labeled` (K-boundary TERMINAL), or
             // `commit_unlabeled` (decode `seq_len == 1` DROP_SITE).
             let (ffn_residual, ffn_input, mut fused_enc) = {
-                let mut enc = LayerEncoder::new(&device)
-                    .with_context(|| format!("enc fused_res_norm layer {layer_idx}"))?;
+                // iter91: thread the borrowed session into the FFN inline
+                // encoder.  At env=0 (Plain) this is byte-identical to
+                // pre-iter91 `LayerEncoder::new(&device)`.  At env=1 the
+                // borrow is consumed for this stage and released at one
+                // of the FFN-arm terminal commits below
+                // (carry_into_next_stage / commit_and_wait_labeled /
+                // commit_unlabeled), allowing the next layer's FA helper
+                // to re-borrow `layer_session.as_mut()`.
+                let mut enc = LayerEncoder::from_session_or_plain(
+                    &device,
+                    layer_session.as_mut(),
+                )
+                .with_context(|| format!("enc fused_res_norm layer {layer_idx}"))?;
                 dispatch_fused_residual_norm_f32(
                     enc.encoder(),
                     &mut registry,
@@ -3008,21 +3192,37 @@ impl Qwen35Model {
                         // iter58b residency-rescission failure mode.  Decode path
                         // (seq_len == 1) keeps the existing pooled variant
                         // (single-token thread-local pool is already optimal).
-                        let out = if let Some(arena) = dense_ffn_arena.as_mut() {
-                            build_dense_ffn_layer_gpu_q_into_with_arena(
-                                enc.encoder(),
-                                &device,
-                                &mut registry,
-                                &ffn_input,
-                                w,
-                                Some(&ffn_residual),
-                                arena,
-                            )
-                            .with_context(|| {
-                                format!("dense_ffn_q_into_with_arena fused layer {layer_idx}")
-                            })?
-                        } else {
-                            build_dense_ffn_layer_gpu_q_into(
+                        // ADR-019 Phase 2 iter92: route through ring-buffered
+                        // `out_slot` at prefill so the FINAL FFN output is
+                        // arena-anchored (caller-owned, prefill-lifetime).
+                        // Closes the iter91 race at `MLX_UNRETAINED_REFS=1`
+                        // by preventing `removeAllocation:` from firing on the
+                        // residency set at next-layer `hidden = ffn_out`
+                        // reassignment while the prior layer's CB is still
+                        // in flight.  Both `dense_ffn_arena` and
+                        // `dense_ffn_output_ring` are Some at prefill
+                        // (`seq_len > 1`); both None at decode.
+                        let out = match (
+                            dense_ffn_arena.as_mut(),
+                            dense_ffn_output_ring.as_mut(),
+                        ) {
+                            (Some(arena), Some(ring)) => {
+                                let out_slot = ring.slot_mut(layer_idx as u32);
+                                build_dense_ffn_layer_gpu_q_into_with_arena(
+                                    enc.encoder(),
+                                    &device,
+                                    &mut registry,
+                                    &ffn_input,
+                                    w,
+                                    Some(&ffn_residual),
+                                    arena,
+                                    out_slot,
+                                )
+                                .with_context(|| {
+                                    format!("dense_ffn_q_into_with_arena fused layer {layer_idx}")
+                                })?
+                            }
+                            _ => build_dense_ffn_layer_gpu_q_into(
                                 enc.encoder(),
                                 &device,
                                 &mut registry,
@@ -3032,7 +3232,7 @@ impl Qwen35Model {
                             )
                             .with_context(|| {
                                 format!("dense_ffn_q_into fused layer {layer_idx}")
-                            })?
+                            })?,
                         };
                         if seq_len == 1 {
                             // Decode path (DROP_SITE per spec §1.1).
@@ -3081,14 +3281,21 @@ impl Qwen35Model {
                             // commit_and_wait drains all in-flight CBs on the
                             // Metal serial queue, including this one.
                             //
-                            // ADR-019 Phase 2 iter90 STAGE_FENCE site:
+                            // ADR-019 Phase 2 iter91 H2 CB-count reduction site:
                             // env=0 → CommandEncoder::commit_labeled (byte-
-                            //   identical to pre-iter90 shape);
-                            // env=1 → EncoderSession::fence_stage + reset_for_next_stage
-                            //   so the NEXT layer's first dispatch waits on the
-                            //   MTLSharedEvent rather than the queue's FIFO drain.
-                            enc.fence_or_commit("layer.dense_ffn").with_context(|| {
-                                format!("fence/commit DenseQ intra-K layer {layer_idx}")
+                            //   identical to pre-iter91 shape — Plain arm of
+                            //   carry_into_next_stage delegates to
+                            //   commit_labeled).
+                            // env=1 → EncoderSession::encoder().memory_barrier()
+                            //   ONLY — keeps the CB OPEN so the NEXT layer's
+                            //   first dispatch (its FA / DN helper's stage_a
+                            //   LayerEncoder) encodes into the SAME persistent
+                            //   compute encoder.  This is the iter91 H2 primitive
+                            //   that achieves factor-2x CB-count reduction
+                            //   (proven structurally by
+                            //   /opt/mlx-native/tests/encoder_session_cb_count_smoke.rs).
+                            enc.carry_into_next_stage("layer.dense_ffn").with_context(|| {
+                                format!("carry DenseQ intra-K layer {layer_idx}")
                             })?;
                         }
                         out
@@ -3156,22 +3363,29 @@ impl Qwen35Model {
                     // (seq_len == 1) keeps the existing pooled variant (the
                     // single-token thread-local pool is already optimal at
                     // decode granularity).
-                    let out = if let Some(arena) = moe_ffn_arena.as_mut() {
-                        build_moe_ffn_layer_gpu_q_into_with_arena(
-                            enc.encoder(),
-                            &device,
-                            &mut registry,
-                            &ffn_input,
-                            w_gpu,
-                            shape,
-                            Some(&ffn_residual),
-                            arena,
-                        )
-                        .with_context(|| {
-                            format!("moe_ffn_q_into_with_arena fused layer {layer_idx}")
-                        })?
-                    } else {
-                        build_moe_ffn_layer_gpu_q_into(
+                    // ADR-019 Phase 2 iter92: route through ring-buffered
+                    // `out_slot` (sister of the DenseQ arm above).  Closes
+                    // the iter91 race for the MoE path that fired at
+                    // q4_0-flat layer-15 in the iter91 H4 run.
+                    let out = match (moe_ffn_arena.as_mut(), moe_ffn_output_ring.as_mut()) {
+                        (Some(arena), Some(ring)) => {
+                            let out_slot = ring.slot_mut(layer_idx as u32);
+                            build_moe_ffn_layer_gpu_q_into_with_arena(
+                                enc.encoder(),
+                                &device,
+                                &mut registry,
+                                &ffn_input,
+                                w_gpu,
+                                shape,
+                                Some(&ffn_residual),
+                                arena,
+                                out_slot,
+                            )
+                            .with_context(|| {
+                                format!("moe_ffn_q_into_with_arena fused layer {layer_idx}")
+                            })?
+                        }
+                        _ => build_moe_ffn_layer_gpu_q_into(
                             enc.encoder(),
                             &device,
                             &mut registry,
@@ -3182,7 +3396,7 @@ impl Qwen35Model {
                         )
                         .with_context(|| {
                             format!("moe_ffn_q_into fused layer {layer_idx}")
-                        })?
+                        })?,
                     };
                     if seq_len == 1 {
                         // Decode path (DROP_SITE per spec §1.1).
@@ -3221,11 +3435,16 @@ impl Qwen35Model {
                         // pooled scratches are not recycled while still
                         // GPU-referenced.
                         //
-                        // ADR-019 Phase 2 iter90 STAGE_FENCE site (sister of
-                        // DenseQ above): env=0 → CommandEncoder::commit_labeled;
-                        // env=1 → EncoderSession fence_stage + reset_for_next_stage.
-                        enc.fence_or_commit("layer.moe_ffn").with_context(|| {
-                            format!("fence/commit MoeQ intra-K layer {layer_idx}")
+                        // ADR-019 Phase 2 iter91 H2 CB-count reduction site
+                        // (sister of DenseQ above): env=0 →
+                        // CommandEncoder::commit_labeled (Plain arm of
+                        // carry_into_next_stage); env=1 →
+                        // EncoderSession::encoder().memory_barrier() ONLY,
+                        // keeping the CB open for the next layer's FA / DN
+                        // helper to encode into the same persistent compute
+                        // encoder.
+                        enc.carry_into_next_stage("layer.moe_ffn").with_context(|| {
+                            format!("carry MoeQ intra-K layer {layer_idx}")
                         })?;
                     }
                     out
@@ -3476,6 +3695,24 @@ impl Qwen35Model {
             {
                 super::decode_pool::reset_for_prefill_chunk();
             }
+
+            // ADR-019 Phase 2 iter92 — drain attn_out hold-vec at K-boundary.
+            //
+            // After the K-boundary's `commit_and_wait_labeled` (DenseQ
+            // line ~3231 / MoeQ line ~3375 above) drains the GPU, all CBs
+            // from this K-batch are complete and the held `attn_out`
+            // ARC-clones are no longer needed for in-flight CB safety.
+            // Clear the Vec — the underlying device.alloc'd buffers now
+            // drop their final ARC and `removeAllocation:` fires, but
+            // there are NO in-flight CBs that reference them, so the
+            // race cannot manifest.  Skip the drain when the held-encoder
+            // path is engaged (last layer, output-head fusion): the
+            // commit_and_wait hasn't happened yet at this point and the
+            // Vec must be held until the output-head's terminal commit
+            // completes (drained below the for-loop).
+            if seq_len > 1 && is_k_boundary && last_layer_held_enc.is_none() {
+                attn_out_holds.clear();
+            }
         }
 
         if decode_profile {
@@ -3618,6 +3855,34 @@ impl Qwen35Model {
             eprintln!(
                 "[DECODE_PROFILE] output_head={:.1}ms",
                 t.elapsed().as_micros() as f64 / 1000.0
+            );
+        }
+        // ADR-019 Phase 2 iter92 — final drain of attn_out hold-vec.
+        //
+        // The output-head's terminal `commit_and_wait_labeled` (above)
+        // drains every CB submitted for this prefill, so the held
+        // `attn_out` ARC-clones are now safe to drop.  Explicit drop
+        // documents the lifetime contract and ensures the deferred
+        // `removeAllocation:` calls fire before the function returns
+        // (good hygiene; not strictly required for correctness because
+        // the implicit drop at end-of-scope would do the same a few
+        // statements later).
+        drop(attn_out_holds);
+
+        // ---- ADR-019 Phase 2 iter91 Worker B (H2 production CB-count probe) ----
+        // Emit the post/delta line right before returning. The session has been
+        // dropped already (drained at the output-head terminal commit_and_wait
+        // above), so the delta covers the full prefill from the top-of-call
+        // capture through the output-head commit. See top-of-fn block for
+        // `dump_cb_count` / `cb_count_pre` definitions.
+        if dump_cb_count {
+            let cb_count_post = mlx_native::cmd_buf_count();
+            eprintln!(
+                "hf2q::cb_count: forward_gpu_impl pre={} post={} delta={} seq_len={}",
+                cb_count_pre,
+                cb_count_post,
+                cb_count_post.saturating_sub(cb_count_pre),
+                seq_len,
             );
         }
         Ok(logits)
@@ -4429,6 +4694,16 @@ impl Qwen35Model {
                             shape.mrope_section,
                             shape.rms_norm_eps,
                             None,
+                            None,
+                            // iter92: decode path doesn't need K-batch
+                            // hold-vec (per-token GPU sync; no in-flight CB
+                            // spans the function-return boundary).
+                            None,
+                            // iter91: forward_gpu_greedy is the decode path
+                            // (seq_len == 1) and never engages the multi-layer
+                            // borrowed-session chain.  Pass None to take the
+                            // Plain CommandEncoder shape — byte-identical to
+                            // pre-iter91 behavior.
                             None,
                         )
                         .with_context(|| format!("full_attn legacy greedy layer {layer_idx}"))?
