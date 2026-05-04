@@ -2412,13 +2412,39 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
                  tokens (last {} tokens repeated {} times consecutively); stopping.",
                 outcome.generated, ngram, repeats
             );
-            eprintln!(
-                "\n[hf2q] decode entered a {}-token consecutive-repetition loop \
-                 after {} tokens — stopping. The model emitted the same \
-                 {}-token sequence {} times in a row; raise --repetition-penalty \
-                 or use a higher --temperature / lower --min-p to escape.",
-                ngram, outcome.generated, ngram, repeats
-            );
+            // 2026-05-03 — when the user passed `--no-thinking` AND the loop
+            // fired EARLY (within 32-200 tokens), the most likely cause is
+            // the empty-`<think>\n\n</think>\n\n` suppressor in the chat
+            // template confusing the model into a degenerate attractor on
+            // this specific prompt. Both hf2q and llama.cpp exhibit this
+            // failure mode with `--no-thinking` on Qwen3.5/3.6 thinking-
+            // capable checkpoints (verified ADR-005 morning session). The
+            // canonical fix is to drop `--no-thinking` and let the
+            // auto-detected default (thinking-on) handle it; the model
+            // will emit an internal reasoning trace then the answer.
+            if args.no_thinking && outcome.generated < 200 {
+                eprintln!(
+                    "\n[hf2q] decode entered a {}-token consecutive-repetition loop \
+                     after only {} tokens with `--no-thinking`. On this Qwen3.5/3.6 \
+                     thinking-capable checkpoint, the empty `<think></think>` \
+                     suppressor is a known degenerate attractor for some prompts \
+                     (both hf2q AND llama.cpp produce the same loop). \
+                     Recommended fix: drop `--no-thinking` and let the auto-\
+                     detected thinking-mode handle it (the model will emit a \
+                     reasoning trace, then the answer). \
+                     Alternative escape: raise `--repetition-penalty` or use \
+                     `--temperature` >0.",
+                    ngram, outcome.generated
+                );
+            } else {
+                eprintln!(
+                    "\n[hf2q] decode entered a {}-token consecutive-repetition loop \
+                     after {} tokens — stopping. The model emitted the same \
+                     {}-token sequence {} times in a row; raise --repetition-penalty \
+                     or use a higher --temperature / lower --min-p to escape.",
+                    ngram, outcome.generated, ngram, repeats
+                );
+            }
         }
     }
 
