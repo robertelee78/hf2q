@@ -137,6 +137,127 @@ pub fn sample_token(
     sample_greedy(logits)
 }
 
+/// Sample a single token from a pre-extracted top-K (indices, values) pair.
+///
+/// ADR-005 iter-25. Same llama.cpp-shape sampling chain as
+/// [`sample_token`] (top_p truncate → min_p truncate → temperature
+/// scale → softmax → multinomial sample), but starts from a small
+/// top-K subset rather than rebuilding `Vec<(usize, f32)>` over the
+/// full vocab. Skips the dominant CPU-side `select_nth_unstable_by`
+/// over Qwen3.6's 248K vocab — the bottleneck behind sampling decode
+/// 117 t/s vs greedy 130 t/s on qwen3.6-35B-A3B-dwq48.
+///
+/// # Caller contract
+///
+/// * `top_indices` / `top_values` must be parallel slices of equal
+///   length. Length 0 returns `0`.
+/// * `top_values` are LOGITS in their original logit space (NOT
+///   softmaxed) — the sampling chain reads them as logits throughout,
+///   matching `sample_token`.
+/// * Output order is NOT required to be sorted; this function sorts
+///   the (≤128-entry) top-K subset descending before running the
+///   chain.
+/// * `params.repetition_penalty` is NOT honoured here — the GPU top-K
+///   was extracted before any repetition penalty could be applied.
+///   Callers MUST gate routing on `repetition_penalty == 1.0` and
+///   stay on the full-vocab `sample_token` path otherwise. In debug
+///   builds we panic on `repetition_penalty != 1.0`; in release we
+///   fall back to greedy on the supplied top-K (the safest available
+///   answer with the data on hand).
+/// * Greedy fast-path: when `params.temperature < SAMPLING_EPS`
+///   returns `top_indices[i]` where `top_values[i]` is max (NaN
+///   never wins, matching `sample_greedy`).
+pub fn sample_token_from_topk(
+    top_indices: &[u32],
+    top_values: &[f32],
+    params: &SamplingParams,
+) -> u32 {
+    debug_assert_eq!(
+        top_indices.len(),
+        top_values.len(),
+        "sample_token_from_topk: top_indices.len()={} != top_values.len()={}",
+        top_indices.len(),
+        top_values.len(),
+    );
+    if top_indices.is_empty() {
+        return 0;
+    }
+    // Repetition penalty cannot be honoured on a pre-extracted top-K (the
+    // penalty mutates the FULL logit vector and may demote a hot token off
+    // the top-K subset). Caller is responsible for not routing here when
+    // rep_penalty is engaged; debug-assert ensures regressions are loud.
+    debug_assert!(
+        (params.repetition_penalty - 1.0).abs() < 1e-9,
+        "sample_token_from_topk: repetition_penalty={} != 1.0 — caller must \
+         route through the full-vocab sample_token path when rep_penalty is \
+         engaged",
+        params.repetition_penalty
+    );
+    if (params.repetition_penalty - 1.0).abs() >= 1e-9 {
+        // Release-mode safety: the safest answer with what we have on hand
+        // is the greedy pick over the supplied top-K (caller's chain is
+        // misconfigured, but we must not return out-of-distribution noise).
+        let mut best_i = 0usize;
+        let mut best_v = top_values[0];
+        for (i, &v) in top_values.iter().enumerate().skip(1) {
+            if v > best_v {
+                best_v = v;
+                best_i = i;
+            }
+        }
+        return top_indices[best_i];
+    }
+
+    // Greedy fast-path: temp at or below the deterministic floor.
+    if params.temperature < SAMPLING_EPS {
+        let mut best_i = 0usize;
+        let mut best_v = top_values[0];
+        for (i, &v) in top_values.iter().enumerate().skip(1) {
+            if v > best_v {
+                best_v = v;
+                best_i = i;
+            }
+        }
+        return top_indices[best_i];
+    }
+
+    // Build (idx, logit) pairs from the top-K subset. K <= 128, so this
+    // alloc is trivial — no thread-local scratch needed.
+    //
+    // `sample_token_indexed` runs the full llama.cpp sampling chain on
+    // the supplied pairs:
+    //   1. If `params.top_k > 0 && params.top_k < indexed.len()`:
+    //      `select_nth_unstable_by` partition + sort the top_k subset.
+    //      Otherwise: full sort (cheap at K <= 128).
+    //   2. top_p truncate → min_p truncate → temperature scale → softmax
+    //      → multinomial sample.
+    // Either branch yields a descending-sorted top slice before the
+    // top_p prefix-sum, so passing the kernel's unsorted output is fine.
+    let mut indexed: Vec<(usize, f32)> = top_indices
+        .iter()
+        .zip(top_values.iter())
+        .map(|(&i, &l)| (i as usize, l))
+        .collect();
+
+    match sample_token_indexed(&mut indexed, params) {
+        Some(tok) => tok,
+        None => {
+            // Fallback to top-1 of the GPU subset (the indexed Vec may
+            // have been emptied by a degenerate chain). top_values may
+            // be unsorted, so re-scan.
+            let mut best_i = 0usize;
+            let mut best_v = top_values[0];
+            for (i, &v) in top_values.iter().enumerate().skip(1) {
+                if v > best_v {
+                    best_v = v;
+                    best_i = i;
+                }
+            }
+            top_indices[best_i]
+        }
+    }
+}
+
 fn sample_token_indexed(
     indexed: &mut Vec<(usize, f32)>,
     params: &SamplingParams,
@@ -566,5 +687,158 @@ mod tests {
             max_tokens: 1,
         };
         assert_eq!(sample_token(&mut logits, &params, &[]), 1);
+    }
+
+    // ----------------------------------------------------------------
+    // ADR-005 iter-25: sample_token_from_topk tests
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn topk_with_k1_returns_single_index_regardless_of_temperature() {
+        let top_indices = vec![42u32];
+        let top_values = vec![3.7_f32];
+        for &temp in &[0.0_f64, 0.5, 0.8, 1.5, 5.0] {
+            for &top_p in &[0.0_f64, 0.5, 0.95, 1.0] {
+                let params = SamplingParams {
+                    temperature: temp,
+                    top_p,
+                    top_k: 0,
+                    min_p: 0.0,
+                    repetition_penalty: 1.0,
+                    max_tokens: 1,
+                };
+                assert_eq!(
+                    sample_token_from_topk(&top_indices, &top_values, &params),
+                    42,
+                    "K=1 must always return the single index (temp={}, top_p={})",
+                    temp, top_p,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn topk_empty_returns_zero() {
+        let params = SamplingParams::default();
+        assert_eq!(sample_token_from_topk(&[], &[], &params), 0);
+    }
+
+    #[test]
+    fn topk_temp_zero_returns_max_value_index() {
+        // Unsorted top-K (matches kernel output convention).
+        let top_indices = vec![100u32, 200, 300, 400];
+        let top_values = vec![1.0_f32, 5.0, 3.0, 2.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            max_tokens: 1,
+        };
+        // Max value 5.0 is at index 1 in the top_values array → top_indices[1] = 200.
+        assert_eq!(
+            sample_token_from_topk(&top_indices, &top_values, &params),
+            200,
+        );
+    }
+
+    #[test]
+    fn topk_matches_full_v_path_within_sampling_noise() {
+        // Construct a synthetic vocab where the top 8 logits are
+        // dominant and the rest are far below. Compare empirical
+        // distributions of `sample_token` (full V) vs
+        // `sample_token_from_topk` (pre-extracted top-K) at temp=0.5,
+        // top_k=8. Frequencies must match within ±5 % per index.
+        let v: usize = 1000;
+        let mut full_logits = vec![-10.0_f32; v];
+        // 8 dominant logits at known positions with descending values.
+        let top_pos = [3usize, 17, 42, 99, 250, 500, 700, 999];
+        let top_vals = [5.0_f32, 4.5, 4.0, 3.5, 3.0, 2.5, 2.0, 1.5];
+        for (&pos, &val) in top_pos.iter().zip(top_vals.iter()) {
+            full_logits[pos] = val;
+        }
+
+        let params = SamplingParams {
+            temperature: 0.5,
+            top_p: 1.0,
+            top_k: 8,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            max_tokens: 1,
+        };
+
+        let n = 4_000usize;
+
+        // Full-V path frequencies.
+        let mut full_counts = vec![0usize; v];
+        for _ in 0..n {
+            let mut buf = full_logits.clone();
+            let tok = sample_token(&mut buf, &params, &[]);
+            full_counts[tok as usize] += 1;
+        }
+
+        // Top-K-only path frequencies. Indices/values must be parallel
+        // and may be unsorted (matches kernel output).
+        let topk_indices: Vec<u32> = top_pos.iter().map(|&p| p as u32).collect();
+        let topk_values: Vec<f32> = top_vals.to_vec();
+        let mut topk_counts = vec![0usize; v];
+        for _ in 0..n {
+            let tok = sample_token_from_topk(&topk_indices, &topk_values, &params);
+            topk_counts[tok as usize] += 1;
+        }
+
+        // Verify the top 8 frequencies match within sampling tolerance.
+        for &pos in &top_pos {
+            let f_full = full_counts[pos] as f64 / n as f64;
+            let f_topk = topk_counts[pos] as f64 / n as f64;
+            assert!(
+                (f_full - f_topk).abs() < 0.05,
+                "top-K path diverges from full-V path at idx {}: \
+                 full={:.4} topk={:.4} diff={:.4}",
+                pos, f_full, f_topk, (f_full - f_topk).abs(),
+            );
+        }
+        // Tail (everything outside the top 8) must be ~0 in both paths.
+        for i in 0..v {
+            if !top_pos.contains(&i) {
+                assert_eq!(
+                    full_counts[i], 0,
+                    "full-V path leaked to tail idx {} ({} hits)",
+                    i, full_counts[i]
+                );
+                assert_eq!(
+                    topk_counts[i], 0,
+                    "top-K path leaked to tail idx {} ({} hits)",
+                    i, topk_counts[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn topk_unsorted_input_preserves_distribution() {
+        // The kernel returns top-K unsorted. Verify that scrambling the
+        // (idx, val) pair order does not change the sampling outcome at
+        // temp=0 (greedy) — picks the max-value index regardless of
+        // input ordering.
+        let top_indices_a = vec![10u32, 20, 30, 40];
+        let top_values_a = vec![1.0_f32, 5.0, 3.0, 2.0];
+        // Same data, scrambled: (20, 5.0) was at index 1 → now at index 2.
+        let top_indices_b = vec![10u32, 30, 20, 40];
+        let top_values_b = vec![1.0_f32, 3.0, 5.0, 2.0];
+
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            max_tokens: 1,
+        };
+        let a = sample_token_from_topk(&top_indices_a, &top_values_a, &params);
+        let b = sample_token_from_topk(&top_indices_b, &top_values_b, &params);
+        assert_eq!(a, 20, "expected max-value idx 20, got {}", a);
+        assert_eq!(b, 20, "scrambled order changed greedy result: {}", b);
     }
 }
