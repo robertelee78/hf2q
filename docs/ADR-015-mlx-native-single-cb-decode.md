@@ -7177,3 +7177,154 @@ iter92:
 - `/opt/hf2q/.cfa-archive/iter92/worker_report.md`
 - `/opt/hf2q/.cfa-archive/iter92/final-report.md`
 
+## iter94 — defensive plays + tooling improvements LANDED (2026-05-04)
+
+iter93 final-report localized iter92's residual silent drift to the
+TRIPLE combo `HF2Q_ENCODER_SESSION=1` + `MLX_UNRETAINED_REFS=1` +
+`HF2Q_FFN_TERMINAL_K_BATCH > 1` (sha `e511ec27` on 27b-dwq46 K∈{2,4,8};
+sha `8f75eaaf` (= baseline) at K=1).  iter94 ships 4 small defensive
+tasks + tooling improvements before iter95 attempts the actual K-batch
+ARC-contract bug fix.  Total LOC: ~140 (within iter94 spec budget).
+
+### iter94 Tasks shipped
+
+#### Task #2 — mlx-native fail-loud `EncoderSession::commit_and_wait`
+
+**File:** `/opt/mlx-native/src/encoder_session.rs:429-461` (commit body)
++ `/opt/mlx-native/tests/encoder_session_lifecycle.rs:435+` (new test).
+
+Reshapes `commit_and_wait` from tail-only `self.inner.commit_and_wait()`
+expression to explicit `let result = ...; result?; Ok(())` chain.
+Functionally equivalent (the tail-only form already propagated via
+return type) but documents intent and is unit-tested by
+`test_commit_and_wait_propagates_inner_cb_error`.
+
+The test (Test 6 in lifecycle) does three things:
+1. Compile-time signature check — `Result<()>` return type pinned.
+2. Runtime success path — `commit_and_wait` returns `Ok(())` after a
+   real `elementwise_add` dispatch (env-gated to skip when
+   `HF2Q_ENCODER_SESSION` unset).
+3. Source-code structural regression guard — reads
+   `encoder_session.rs` and asserts it contains the iter94 doc anchor
+   AND the explicit `result?; Ok(())` propagation pattern AND no
+   `let _ = self.inner.commit_and_wait*(` swallows.  Real GPU-error
+   injection from a unit test is impractical (Metal exposes no
+   force-fail-CB hook); the structural assertion plus iter93's
+   production-side CRASH evidence at
+   `/opt/hf2q/.cfa-archive/iter93/27b_unretained_only.text` (layer-7
+   `MlxError::CommandBufferError`) form the unit-level analog.
+
+#### Task #3 — Session-aware `dump_bisect`
+
+**File:** `/opt/hf2q/.cfa-worktrees/iter91-claude/src/inference/models/qwen35/dump_bisect.rs`
+(new thread-local `ACTIVE_SESSION` + `set_active_session` /
+`clear_active_session` API + `flush_gpu` session-aware drain branch).
+**Caller:** `forward_gpu.rs` ~line 2680 (install before layer loop) +
+~line 3782 (clear after loop), gated on `dump_bisect::is_enabled()`.
+
+When the active EncoderSession pointer is installed, `flush_gpu`
+routes its drain through `session.commit_and_wait +
+reset_for_next_stage` instead of opening a fresh `device.command_encoder`.
+This unblocks per-layer bisection of the env=1 path: the previous
+fresh-encoder drain did NOT join the session's persistent CB chain, so
+download-side `as_slice` reads preceded session-internal writes
+(iter93 Phase C: all-zero ffn_out reads from session-only env=1).
+
+Empirically verified: under `HF2Q_ENCODER_SESSION=1 HF2Q_DUMP_LAYER=0`
+on 27b-dwq46, the dump now writes 148480/148480 non-zero floats to
+`step0000_layer000_ffn_out.f32` (vs iter93 Phase C all-zero).
+Evidence: `/opt/hf2q/.cfa-archive/iter94/task3_session_dump.{out,err}`
++ `/tmp/hf2q-dump/iter94-task3-test/`.
+
+Safety: thread-local raw pointer is set/cleared bracketed around the
+layer loop on the inference thread; `dump_bisect` is invoked only
+from layer-body code on the same thread.  No cross-thread aliasing
+possible (`thread_local!` cell).  `&mut` reborrow inside `flush_gpu`
+does not alias because the layer-body code that calls `dump_in_layer`
+released its `layer_session.as_mut()` borrow at the prior
+`fence_or_commit` per the iter91 wire-up contract.
+
+#### Task #4 — Defensive ARC-clone `attn_out` into K-batch hold-vec
+
+**File:** `forward_gpu.rs` ~line 2885 (immediately after the `attn_out =
+match { ... }` binding).  3-LOC `if seq_len > 1 { attn_out_holds.push(
+attn_out.clone()); }` push.
+
+iter92's `attn_out_holds` Vec already holds the FA bridge's per-call
+`out_seq` MlxBuffer (pushed inside `build_gated_attn_layer` via
+`out_seq_hold`).  This task adds a defensive push of the OUTPUT of
+`apply_linear_projection_f32_pooled` (which becomes `attn_out` in the
+forward_gpu scope) — a SEPARATE allocation from `out_seq`.  The clone
+is sub-µs (Arc bump on `MlxBuffer::storage`), held until the K-boundary
+clears the Vec at line ~3773.
+
+Not yet evidence-confirmed to fix iter93's silent drift (Phase B did
+NOT prove this is the missing buffer); pure defensive add per iter93
+final-report §"iter94 scope" item 4.
+
+#### Task #5 — Defensive runtime gate forcing K=1 under triple combo
+
+**File:** `forward_gpu.rs:2553-2587` (K-batch decision site).
+
+When `HF2Q_ENCODER_SESSION=1 AND MLX_UNRETAINED_REFS=1` are both set
+in the process env, force `ffn_terminal_k_batch = 1` regardless of
+the user's `HF2Q_FFN_TERMINAL_K_BATCH` value.  Logs the override to
+stderr.  Lossy: gives up K-batch perf wins on the triple-combo opt-in
+path — acceptable interim safety net until iter95 closes the
+underlying ARC-contract race.
+
+Empirically verified:
+- `HF2Q_ENCODER_SESSION=1 MLX_UNRETAINED_REFS=1
+  HF2Q_FFN_TERMINAL_K_BATCH=8` → stderr emits
+  `[ADR-015 iter94 Task#5] forcing K=1 (was 8) ...`, generation
+  succeeds, output coherent.  Evidence:
+  `/opt/hf2q/.cfa-archive/iter94/task5_triple_combo.{out,err}`.
+- `HF2Q_ENCODER_SESSION=1 HF2Q_FFN_TERMINAL_K_BATCH=8` (UNRETAINED
+  unset) → NO override message; baseline K=8 preserved.  Evidence:
+  `/opt/hf2q/.cfa-archive/iter94/task5_session_only.{out,err}`.
+
+### iter94 Acceptance evidence
+
+| Bar | Predicate | Result | Evidence |
+|---|---|---|---|
+| Build | release-mode build clean both repos | PASS | `/opt/hf2q/.cfa-archive/iter94/build.txt` (warnings only, all pre-existing) |
+| mlx-native tests | full suite ≥ baseline | PASS — 615 passed / 3 failed; the 3 failures (`test_q4_0_*` in `test_quantized_matmul_id_ggml`) are pre-existing (verified by stash + re-run on baseline at `994a6a9`); new `test_commit_and_wait_propagates_inner_cb_error` PASSES at both env=0 and env=1 | `/opt/hf2q/.cfa-archive/iter94/mlxnative_tests.txt` |
+| hf2q tests | env=0 ≥ iter91 baseline 2792/0/13 | **PASS — 3339 passed / 0 failed / 49 ignored** (above baseline) | `/opt/hf2q/.cfa-archive/iter94/hf2q_tests.txt` |
+| Task #5 fires under triple combo | log emits + K=1 takes effect | PASS | `/opt/hf2q/.cfa-archive/iter94/task5_triple_combo.{out,err}` |
+| Task #5 dormant under session-only | no log; K=8 preserved | PASS | `/opt/hf2q/.cfa-archive/iter94/task5_session_only.{out,err}` |
+| Task #3 session-aware dump non-zero | `ffn_out` dump under session has data, not all-zero | PASS — 148480/148480 non-zero | `/opt/hf2q/.cfa-archive/iter94/task3_session_dump.{out,err}` + `/tmp/hf2q-dump/iter94-task3-test/` |
+
+### iter94 LOC delta
+
+| File | LOC added | Purpose |
+|---|---|---|
+| `/opt/mlx-native/src/encoder_session.rs` | ~25 | Task #2 fail-loud reshape + doc |
+| `/opt/mlx-native/tests/encoder_session_lifecycle.rs` | ~125 | Task #2 unit test (3 sub-checks) |
+| `forward_gpu.rs` (K-batch site, attn_out push, dump install/clear) | ~50 | Tasks #4 + #5 + #3-caller |
+| `dump_bisect.rs` (thread-local + flush_gpu reroute) | ~80 | Task #3 session-aware drainer |
+| `docs/ADR-015...md` (this entry) | ~120 | Doc |
+| **Total** | **~400 (incl. doc + test + comments)** | within iter94 spec budget |
+
+### iter95 scope (recommended)
+
+iter94 did NOT close AC-4 strict parity at MLX_UNRETAINED_REFS=1.  The
+underlying K-batch ARC-contract race is iter95's target per iter93
+final-report Task #1: audit `device.alloc_buffer` + `decode_pool::
+pooled_alloc_buffer` call sites reached by `apply_flash_attn_prefill_
+seq_major`, `apply_linear_projection_f32_pooled`,
+`build_dense_ffn_layer_gpu_q_into_with_arena`, `build_gated_attn_layer`
+internals, and `apply_proj` in DeltaNet path.  iter94's session-aware
+`dump_bisect` (Task #3) unblocks the per-layer bisection iter95 needs
+to find which buffer crosses the intra-K layer boundary while bound to
+the prior layer's still-uncommitted dispatch.
+
+iter94 evidence files:
+- `/opt/hf2q/.cfa-archive/iter94/build.txt`
+- `/opt/hf2q/.cfa-archive/iter94/mlxnative_tests.txt` (615/3 prior fail)
+- `/opt/hf2q/.cfa-archive/iter94/hf2q_tests.txt` (3339/0/49)
+- `/opt/hf2q/.cfa-archive/iter94/task5_triple_combo.{out,err}`
+- `/opt/hf2q/.cfa-archive/iter94/task5_session_only.{out,err}`
+- `/opt/hf2q/.cfa-archive/iter94/task3_session_dump.{out,err}`
+- `/opt/hf2q/.cfa-archive/iter94/worker_report.md`
+- `/opt/hf2q/.cfa-archive/iter94/final-report.md` (LANDED verdict)
+

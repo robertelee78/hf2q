@@ -2550,11 +2550,38 @@ impl Qwen35Model {
         // K=8 is the sweet spot: 5x sync_count drop vs K=1 with 3% headroom
         // remaining at K=20+. Operator can override via env for memory-
         // constrained settings (smaller K = smaller pool peak).
-        let ffn_terminal_k_batch: usize = std::env::var("HF2Q_FFN_TERMINAL_K_BATCH")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&k| k >= 1)
-            .unwrap_or(8);
+        let ffn_terminal_k_batch: usize = {
+            // ADR-015 iter94 Task #5 — defensive runtime gate forcing K=1
+            // under the triple combo `HF2Q_ENCODER_SESSION=1` AND
+            // `MLX_UNRETAINED_REFS=1`.  iter93's K-batch ladder
+            // (.cfa-archive/iter93/27b_env1u_k{1,2,4,8}.text) showed K=1
+            // is byte-identical to baseline at this triple combo while
+            // K>=2 silently drifts (sha `e511ec27` for all K=2/4/8 on
+            // 27b-dwq46).  iter95 will close the underlying race in the
+            // intra-K ARC contract; until then, force K=1 here so
+            // production users hitting both env vars do NOT get silently
+            // wrong tokens.  See `/opt/hf2q/.cfa-archive/iter93/final-report.md`
+            // §"K-batch ladder under env=1+UNRETAINED" + §"iter94 scope".
+            // Cost: gives up K-batch perf wins on this opt-in-opt-in
+            // path — acceptable interim safety net.
+            let forced_k1 = std::env::var("HF2Q_ENCODER_SESSION").as_deref() == Ok("1")
+                && std::env::var("MLX_UNRETAINED_REFS").as_deref() == Ok("1");
+            let user_k = std::env::var("HF2Q_FFN_TERMINAL_K_BATCH")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&k| k >= 1)
+                .unwrap_or(8);
+            if forced_k1 && user_k > 1 {
+                eprintln!(
+                    "[ADR-015 iter94 Task#5] forcing K=1 (was {user_k}) under \
+                     HF2Q_ENCODER_SESSION=1 + MLX_UNRETAINED_REFS=1 triple combo \
+                     to avoid iter93 silent drift; see iter93 final-report.md"
+                );
+                1
+            } else {
+                user_k
+            }
+        };
 
         // ADR-019 Phase 1 — output-head + last-layer fusion eligibility.
         //
@@ -2637,6 +2664,22 @@ impl Qwen35Model {
         let mut attn_out_holds: Vec<MlxBuffer> = Vec::with_capacity(
             ffn_terminal_k_batch.max(1) as usize,
         );
+
+        // ADR-015 iter94 Task #3 — install layer_session as the
+        // dump_bisect drainer so `flush_gpu` (called by every dump call
+        // site below) routes through `session.commit_and_wait +
+        // reset_for_next_stage` instead of opening a fresh CB.  Without
+        // this, env=1 (HF2Q_ENCODER_SESSION=1) bisection sees stale
+        // pre-write reads (iter93 Phase C found all-zero ffn_out for
+        // session-only env=1).  Cleared after the layer loop below;
+        // gated on `dump_bisect::is_enabled()` so the production hot
+        // path (env unset) skips the install entirely.
+        let dump_bisect_active = super::dump_bisect::is_enabled();
+        if dump_bisect_active {
+            if let Some(sess) = layer_session.as_mut() {
+                super::dump_bisect::set_active_session(sess);
+            }
+        }
 
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
             // K-boundary: last layer in the window OR final layer overall.
@@ -2883,6 +2926,22 @@ impl Qwen35Model {
             // (no residency-set membership in the storage Arc, see
             // buffer.rs:122-130 / buffer_pool.rs:202) and does NOT
             // require a hold-vec push.
+            //
+            // ADR-015 iter94 Task #4 — defensive ARC-clone of `attn_out`
+            // itself into the hold-vec.  iter93 final-report §"iter94
+            // scope" item 4: the FA helper's linear-proj output (which
+            // BECOMES `attn_out` after `apply_linear_projection_f32_pooled`
+            // at gpu_full_attn.rs:2724) is a SEPARATE allocation from
+            // the FA bridge's `out_seq` already held by `out_seq_hold`.
+            // Pushing `attn_out.clone()` adds a sub-µs Arc clone and
+            // ensures the linear-proj result outlives any in-flight
+            // K-batched FFN CB that binds it.  Not yet evidence-confirmed
+            // to fix iter93's drift (Phase B did NOT prove this is the
+            // missing buffer) — pure defensive add.  Cleared at K-boundary
+            // alongside the FA-helper-pushed entries (line ~3713 below).
+            if seq_len > 1 {
+                attn_out_holds.push(attn_out.clone());
+            }
 
             // --- Fused residual + post-attention RMSNorm (1 encoder, 1 commit) ---
             // Replaces: residual_add_gpu (1 commit) + dispatch_rms_norm (1 commit)
@@ -3713,6 +3772,13 @@ impl Qwen35Model {
             if seq_len > 1 && is_k_boundary && last_layer_held_enc.is_none() {
                 attn_out_holds.clear();
             }
+        }
+
+        // ADR-015 iter94 Task #3 — clear the dump_bisect drainer pointer
+        // before `layer_session` may be dropped or moved below.  Idempotent
+        // when never installed.
+        if dump_bisect_active {
+            super::dump_bisect::clear_active_session();
         }
 
         if decode_profile {
