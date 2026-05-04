@@ -8665,3 +8665,80 @@ and stops at the second `<think>`. Returns synthetic stop marker
 thinking-block prompts unaffected); determinism preserved (md5
 0dfd0ae2… × 3); 2784/2784 unit tests pass.
 
+
+---
+
+## 2026-05-03 — iter-17: short-prefill NaN pinned to hf2q context (NOT kernel)
+
+**Symptom (root finding):** On Qwen3.6-35B-A3B with chat-template
+prefill of "Hi" (qL=2 visible tokens), `fa_sdpa_out` at the FIRST
+full-attention layer (layer 3) contains exactly 32 NaN values, all
+at `dim=10` across every (seq, head) — a structurally suspicious
+pattern. NaN propagates through ops 6-7 → all subsequent layers →
+final logits are all-NaN → sampling argmax produces `!!!` repetition.
+Reproduces deterministically with two distinct GGUFs (OLD April-30
+and FRESH May-3 with different DWQ banding + different vocab — so
+not a converter bug).
+
+**Hypotheses falsified this iter (with code-cited evidence):**
+
+| Hypothesis | Disproof |
+|---|---|
+| Chat-template render diverges vs llama.cpp | hf2q `TOKENIZE_DEBUG_IDS` byte-identical to `llama-tokenize` on the rendered prompt |
+| GGUF converter wrote bad tensor data | OLD/NEW GGUFs both reproduce; tensor-data SHA differs ⇒ failure is code, not data |
+| FA Stage-A fusion (iter89e2-F) | `HF2Q_DUMP_LAYER=ALL` disables fused path; NaN persists |
+| High-id token embedding lookup | Bare 2-token prompt (no high-id chat-template tokens) still NaN |
+| `lm_head_bf16` removal (commit `e64a954`) | Agent verified all reads now use `lm_head_q4`; field genuinely dead |
+| `flash_attn_prefill` kernel edge-case at qL\<BQ + kL\<BK | Synthetic test (random data, same dims) — 0 NaN |
+| Kernel coverage gap at dim=10 | NaN-prefilled output + real production Q/K/V — kernel writes ALL 8192 positions |
+| Anywhere in mlx-native pipeline (cast→permute→FA→permute_back) | Full GPU pipeline test in single CommandEncoder with NaN-prefilled scratch — 0 NaN AND 8160/8192 bit-exact match with production dump |
+
+**Decisive new evidence:** Two regression tests committed (mlx-native
+@`242a545` + `e033fdb`) that load the actual production Q/K/V f32
+dumps from `/tmp/hf2q-dump/30654/` and run the kernel pipeline.
+Both produce 0 NaN. Comparing each output against the production
+`fa_sdpa_out` dump shows **bit-exact match at 8160 of 8192 positions**
+(`mine.to_bits() == prod.to_bits()`). The 32 mismatches are exactly
+the 32 NaN positions in production at `(s ∈ {0,1}) × (h ∈ {0..15}) ×
+dim=10`. Standalone produces `-1.2265625` at every dim=10; production
+has NaN.
+
+**Conclusion:** The flash_attn_prefill kernel and the surrounding
+mlx-native cast/permute infrastructure are correct. The NaN is
+introduced by something specific to hf2q's full inference pipeline:
+
+  1. Encoder/arena lifecycle across DN layers 0-2 (which run before
+     the first FA layer) — out_bf16_hm or some shared Metal storage
+     is touched in a way that leaves NaN at exact stride-of-256+10
+     offsets per head before the FA kernel runs.
+  2. Buffer pool aliasing — `decode_pool::pooled_alloc_buffer` may
+     return memory whose underlying Metal storage was just used by
+     a DN-layer kernel that wrote NaN at dim=10-equivalent offsets.
+  3. KV-cache slot.k/slot.v writes overlapping the arena's
+     out_bf16_hm region (Metal serial queue does NOT prevent
+     allocator reuse of the same storage).
+  4. `download_f32` reading the F32 dump buffer at a moment when the
+     write hasn't fully landed (Metal queue serialization should
+     prevent this, but worth verifying with explicit fence).
+
+**Next iter:** Add a focused diagnostic to dump
+`arena.out_bf16_hm` immediately after the kernel returns and
+before `permute_021_bf16_to_f32`. The dump compared bit-for-bit
+against my standalone test's bf16 output will localize whether the
+NaN is in the bf16 buffer or introduced post-permute.
+
+**Tests pinned by this iter:**
+* `mlx-native@242a545` — `test_repro_qwen35_layer3_seq2_real_qkv_dim10_nan`
+* `mlx-native@e033fdb` — `test_repro_full_pipeline_qwen35_layer3_seq2`
+
+Both ignored by default; run with
+`cargo test --release --test test_flash_attn_prefill -- --ignored`.
+Production dumps must be present at `/tmp/hf2q-dump/30654/` (or
+override via `HF2Q_DUMP_DIR`).
+
+**Cleanup completed in same session:** all CFA worktrees and
+branches removed in both repos; 14 hf2q + 16 mlx-native worktrees
+deleted; 15 hf2q + 28 mlx-native local branches deleted; 10 remote
+branches deleted from hf2q origin and 5 from mlx-native origin.
+Both repos minimal: hf2q has only `main` + `adr017-iter17-2026-05-01`;
+mlx-native has only `main`.
