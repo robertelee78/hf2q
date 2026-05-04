@@ -31,6 +31,7 @@ pub mod decode_pool;
 pub mod delta_net;
 pub mod dense;
 pub mod dump_bisect;
+pub(super) mod encoder_stage;
 pub mod chunk_allocs_arena;
 pub mod dense_ffn_arena;
 pub mod dn_prefill_arena;

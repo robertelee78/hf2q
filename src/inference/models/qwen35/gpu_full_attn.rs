@@ -67,6 +67,7 @@ use mlx_native::ops::flash_attn_prefill::{
 use mlx_native::ops::transpose::{permute_021_bf16, permute_021_bf16_to_f32};
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
+use super::encoder_stage::LayerEncoder;
 use super::full_attn::FullAttnLayerWeights;
 use super::kv_cache::FullAttnKvSlot;
 
@@ -2136,73 +2137,78 @@ pub fn build_gated_attn_layer(
     // Eligibility condition is identical to use_fused_stage_ab AND
     // ops6-7's arena path (use_proj_arena), so the encoder ownership transfer
     // is safe — the ops6-7 block sees the same arena that ops1-4 wrote into.
-    let mut fused_stage_a_enc: Option<mlx_native::CommandEncoder> = None;
+    // ADR-019 Phase 2 iter90: `fused_stage_a_enc` is now `LayerEncoder`
+    // (env=0 → Plain(CommandEncoder); env=1 → Sessioned(EncoderSession)).
+    // The encoder is constructed at "enc ops1-4" below and threaded through
+    // the use_fused_stage_ab block to the ops6-7 site (line ~2589) where it
+    // emits the single terminal `layer.full_attn.stage_a` fence/commit.
+    let mut fused_stage_a_enc: Option<LayerEncoder> = None;
     let (x_norm, q_flat, k_flat, v_flat, gate_flat, q_normed, k_normed, q_rope, k_rope) = if let
         Some(arena) = fa_proj_arena.as_mut().map(|a| &mut **a).filter(|_| use_proj_arena)
     {
         let _w5b9_ops1to4 = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::FaOps1to4,
         );
-        let mut enc = device.command_encoder().context("enc ops1-4")?;
+        let mut enc = LayerEncoder::new(device).context("enc ops1-4")?;
 
         // Op 1: pre-attention RMSNorm → arena.x_norm_buf
         apply_pre_attn_rms_norm_into(
-            &mut enc, registry, device, x, weights_gpu,
+            enc.encoder(), registry, device, x, weights_gpu,
             &arena.x_norm_buf, &arena.pre_norm_params_buf,
             seq_len, hidden_size,
         )?;
         // Barrier: ops 2 read from x_norm written above.
-        enc.memory_barrier();
+        enc.encoder().memory_barrier();
 
         // Op 2: Q/K/V/G projections — all read from arena.x_norm_buf, write
         // into arena.{q,k,v,gate}_proj_buf via apply_linear_projection_f32_into.
         // Each call needs &mut on a distinct arena field; we sequence them so
         // the unique &mut borrows don't overlap.
         apply_linear_projection_f32_into(
-            &mut enc, registry, device, &arena.x_norm_buf,
+            enc.encoder(), registry, device, &arena.x_norm_buf,
             &weights_gpu.wq, &mut arena.q_proj_buf,
             seq_len, hidden_size, q_total,
         )?;
         apply_linear_projection_f32_into(
-            &mut enc, registry, device, &arena.x_norm_buf,
+            enc.encoder(), registry, device, &arena.x_norm_buf,
             &weights_gpu.wk, &mut arena.k_proj_buf,
             seq_len, hidden_size, kv_total,
         )?;
         apply_linear_projection_f32_into(
-            &mut enc, registry, device, &arena.x_norm_buf,
+            enc.encoder(), registry, device, &arena.x_norm_buf,
             &weights_gpu.wv, &mut arena.v_proj_buf,
             seq_len, hidden_size, kv_total,
         )?;
         apply_linear_projection_f32_into(
-            &mut enc, registry, device, &arena.x_norm_buf,
+            enc.encoder(), registry, device, &arena.x_norm_buf,
             &weights_gpu.w_gate, &mut arena.gate_proj_buf,
             seq_len, hidden_size, q_total,
         )?;
         // Barrier: ops 3 read from q_proj/k_proj written above.
-        enc.memory_barrier();
+        enc.encoder().memory_barrier();
 
         // Op 3: per-head RMSNorm on Q and K (shared params from arena).
         apply_q_or_k_per_head_rms_norm_into(
-            &mut enc, registry, device, &arena.q_proj_buf,
+            enc.encoder(), registry, device, &arena.q_proj_buf,
             &weights_gpu.attn_q_norm, &arena.q_normed_buf,
             &arena.qk_rms_params_buf, seq_len, n_heads, head_dim,
         )?;
         apply_q_or_k_per_head_rms_norm_into(
-            &mut enc, registry, device, &arena.k_proj_buf,
+            enc.encoder(), registry, device, &arena.k_proj_buf,
             &weights_gpu.attn_k_norm, &arena.k_normed_buf,
             &arena.qk_rms_params_buf, seq_len, n_kv_heads, head_dim,
         )?;
         // Barrier: ops 4 read from q_normed / k_normed written above.
-        enc.memory_barrier();
+        enc.encoder().memory_barrier();
 
         // Op 4: IMROPE on Q and K — params triple is in dispatch_rope_multi_cached's
         // thread-local cache (NOT in this arena) — see apply_imrope_into doc.
         apply_imrope_into(
-            &mut enc, registry, device, &arena.q_normed_buf, &arena.q_rope_buf,
+            enc.encoder(), registry, device, &arena.q_normed_buf, &arena.q_rope_buf,
             positions, seq_len, n_heads, head_dim, rotary_dim, freq_base, mrope_section,
         )?;
         apply_imrope_into(
-            &mut enc, registry, device, &arena.k_normed_buf, &arena.k_rope_buf,
+            enc.encoder(), registry, device, &arena.k_normed_buf, &arena.k_rope_buf,
             positions, seq_len, n_kv_heads, head_dim, rotary_dim, freq_base, mrope_section,
         )?;
 
@@ -2243,13 +2249,13 @@ pub fn build_gated_attn_layer(
 
             // RAW barrier: kv_cache_write reads arena.k_rope_buf / arena.v_proj_buf
             // written by ops4 (k_rope) / op2 (v_proj) above.
-            enc.memory_barrier();
+            enc.encoder().memory_barrier();
             if kv_write_tokens > 0 {
                 let _w5b9_kv = super::wave5b8_profile::Section::start(
                     super::wave5b8_profile::SectionKind::FaSdpaKvDownloadCopy,
                 );
                 mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual(
-                    &mut enc, registry, device.metal_device(),
+                    enc.encoder(), registry, device.metal_device(),
                     &arena.k_rope_buf, &arena.v_proj_buf,
                     &slot.k, &slot.v,
                     n_kv_heads, head_dim, max_seq_len,
@@ -2263,7 +2269,7 @@ pub fn build_gated_attn_layer(
             // bridge), but Metal MTLDispatchTypeConcurrent reorders within
             // a CB without an explicit barrier — required for ordering
             // correctness and profiling attribution.
-            enc.memory_barrier();
+            enc.encoder().memory_barrier();
 
             // Allocate `out_seq` (the FA bridge's F32 seq-major output).
             // Same per-call alloc shape as the wrapper at line 1411-1413
@@ -2283,7 +2289,7 @@ pub fn build_gated_attn_layer(
                     super::wave5b8_profile::SectionKind::FaSdpaKernel,
                 );
                 apply_flash_attn_prefill_seq_major_into(
-                    &mut enc, device, registry,
+                    enc.encoder(), device, registry,
                     &arena.q_rope_buf, &arena.k_rope_buf, &arena.v_proj_buf,
                     &out_seq,
                     seq_len, n_heads, n_kv_heads, head_dim,
@@ -2345,8 +2351,16 @@ pub fn build_gated_attn_layer(
             // on the same Metal serial queue and orders after ops1-4 by GPU
             // queue ordering. iter58b residency-rescission is prevented by the
             // FaPrefillArena lifetime (scratches don't drop until end of prefill).
+            // ADR-019 Phase 2 iter90: SUBSET site (spec §1.6) — only fires
+            // when use_fused_stage_ab is FALSE (fusion-OFF fallback). NOT
+            // wired through fence_or_commit in iter90 default scope; left
+            // as a STAGE_FENCE candidate for §1.6 follow-on. The Plain
+            // arm of LayerEncoder calls inner.commit_labeled exactly as
+            // pre-iter90; on the Sessioned arm we still get the equivalent
+            // structural behavior (commit boundary, no fence).
             if (seq_len == 1 && head_dim % 32 == 0) || use_arena {
-                enc.commit_labeled("layer.full_attn.ops1-4");
+                enc.fence_or_commit("layer.full_attn.ops1-4")
+                    .context("fence/commit ops1-4 (use_arena/decode)")?;
             } else {
                 enc.commit_and_wait_labeled("layer.full_attn.ops1-4")
                     .context("commit ops1-4 prefill (proj arena)")?;
@@ -2586,9 +2600,14 @@ pub fn build_gated_attn_layer(
         // SAME encoder and issue ONE terminal commit_labeled covering all 4
         // FA-layer ops. Otherwise (decode, dump_bisect, head_dim != 256,
         // cur_len != 0, missing arenas), open a fresh encoder as before.
+        // ADR-019 Phase 2 iter90: `enc` is now `LayerEncoder` (the
+        // function-scope `fused_stage_a_enc` is `Option<LayerEncoder>`; the
+        // None branch constructs a fresh LayerEncoder with the same env-gate
+        // semantics). All dispatch helpers below take `&mut CommandEncoder`
+        // and reach it via `enc.encoder()`.
         let (mut enc, fused_into_stage_a) = match fused_stage_a_enc.take() {
             Some(e) => (e, true),
-            None => (device.command_encoder().context("enc ops6-7")?, false),
+            None => (LayerEncoder::new(device).context("enc ops6-7")?, false),
         };
         // ADR-019 Phase 2 iter89e2-G: RAW barrier between fa.prefill_bridge's
         // final dispatch (permute_021_bf16_to_f32 → out_seq) and ops6
@@ -2600,20 +2619,20 @@ pub fn build_gated_attn_layer(
         // fa.prefill_bridge boundaries from iter89e2-F. AC-PA2 Heisenbug 5×
         // is the empirical guard.
         if fused_into_stage_a {
-            enc.memory_barrier();
+            enc.encoder().memory_barrier();
         }
         let gated = if let Some(arena) =
             fa_proj_arena.as_ref().map(|a| &**a).filter(|_| use_proj_arena)
         {
             apply_sigmoid_gate_multiply_into(
-                &mut enc, registry, device,
+                enc.encoder(), registry, device,
                 &attn_out, &gate_flat, &arena.gated_buf,
                 &arena.sigmoid_params_buf, n_elem,
             )?;
             arena.gated_buf.clone()
         } else {
             apply_sigmoid_gate_multiply(
-                &mut enc, registry, device, &attn_out, &gate_flat, n_elem,
+                enc.encoder(), registry, device, &attn_out, &gate_flat, n_elem,
             )?
         };
         // ADR-015 iter61a-4: memory_barrier between Op 6 (sigmoid_gate_multiply
@@ -2647,9 +2666,9 @@ pub fn build_gated_attn_layer(
         // dispatches share a written buffer, the producer→consumer edge
         // must be made explicit via `memory_barrier()`, never inferred from
         // submission order.
-        enc.memory_barrier();
+        enc.encoder().memory_barrier();
         let out = apply_linear_projection_f32_pooled(
-            &mut enc, registry, device, &gated,
+            enc.encoder(), registry, device, &gated,
             &weights_gpu.wo, seq_len, q_total, hidden_size,
         )?;
         // Decode fast path (seq=1): commit() without wait, and `out` is pooled.
@@ -2679,10 +2698,23 @@ pub fn build_gated_attn_layer(
         // commit_labeled is non-blocking; out (linear_proj output) is on the
         // Rust stack until consumed by dispatch_fused_residual_norm_f32 in
         // forward_gpu's next encoder on the same Metal serial queue.
+        // ADR-019 Phase 2 iter90 STAGE_FENCE site (`layer.full_attn.stage_a`):
+        // env=0 → CommandEncoder::commit_labeled (byte-identical to
+        //   pre-iter90 iter89e2-G shape);
+        // env=1 → EncoderSession::fence_stage + reset_for_next_stage so the
+        //   NEXT layer's first dispatch waits on the MTLSharedEvent rather
+        //   than the queue's FIFO drain. This is THE primary
+        //   STAGE_FENCE site on the Qwen3.6 35B-A3B FA-dominated path
+        //   (≈16 FA layers per chunk-engaged pp4096 prefill).
         if fused_into_stage_a {
-            enc.commit_labeled("layer.full_attn.stage_a");
+            enc.fence_or_commit("layer.full_attn.stage_a")
+                .context("fence/commit FA stage_a")?;
         } else if seq_len == 1 || use_arena {
-            enc.commit_labeled("layer.full_attn.ops6-7");
+            // Non-fused fallback (decode, missing arenas) — SUBSET site per
+            // spec §1.6. Wired through fence_or_commit for type uniformity;
+            // env=0 path is byte-identical to pre-iter90 commit_labeled.
+            enc.fence_or_commit("layer.full_attn.ops6-7")
+                .context("fence/commit FA ops6-7 (non-fused fallback)")?;
         } else {
             enc.commit_and_wait_labeled("layer.full_attn.ops6-7").context("commit ops6-7")?;
         }

@@ -44,6 +44,7 @@ use std::sync::OnceLock;
 
 use super::activation_capture::LayerActivations;
 use super::delta_net::DeltaNetLayerShape;
+use super::encoder_stage::LayerEncoder;
 use super::ffn::{DenseFfnShape, MoeFfnShape};
 use super::full_attn::FullAttnShape;
 use super::gpu_delta_net::{
@@ -2445,7 +2446,17 @@ impl Qwen35Model {
         // FFN-arm gate (only MoeQ/DenseQ keep the encoder live; F32-MoE
         // and F32-Dense build their own encoder + commit internally) is
         // enforced inline at the K-boundary commit sites below.
+        // ADR-019 Phase 2 iter90 OQ2 disposition: when HF2Q_ENCODER_SESSION=1,
+        // disable the last-layer-held encoder optimization. Threading an
+        // `EncoderSession`-backed encoder into `apply_output_head_gpu_into`'s
+        // `caller_enc: Option<CommandEncoder>` parameter would force a
+        // synchronous boundary at output-head (drain-via-commit_and_wait
+        // before re-opening), which contradicts the wire-up's "non-blocking
+        // fences" direction. Better to leave a small per-prefill perf nick
+        // on the env=1 path than entangle iter90's scope. See
+        // `/opt/hf2q/.cfa-archive/iter90/operator_decisions.md` OQ2.
         let phase1_fusion_env_eligible = seq_len > 1
+            && !LayerEncoder::env_enabled()
             && matches!(output_head_mode, OutputHeadMode::Last)
             && capture.is_none()
             && hidden_out.is_none()
@@ -2778,12 +2789,19 @@ impl Qwen35Model {
                 )
                 .map_err(|e| anyhow!("alloc ffn_residual layer {layer_idx}: {e}"))?;
 
+            // ADR-019 Phase 2 iter90: `fused_enc` is now `LayerEncoder` (env=0
+            // → Plain(CommandEncoder); env=1 → Sessioned(EncoderSession)). The
+            // dispatch helpers below take `&mut CommandEncoder` and reach it
+            // via `enc.encoder()` on the LayerEncoder. The terminal commit
+            // sites at the FFN-arm ends below route through
+            // `LayerEncoder::fence_or_commit` (intra-K STAGE_FENCE),
+            // `commit_and_wait_labeled` (K-boundary TERMINAL), or
+            // `commit_unlabeled` (decode `seq_len == 1` DROP_SITE).
             let (ffn_residual, ffn_input, mut fused_enc) = {
-                let mut enc = device
-                    .command_encoder()
+                let mut enc = LayerEncoder::new(&device)
                     .with_context(|| format!("enc fused_res_norm layer {layer_idx}"))?;
                 dispatch_fused_residual_norm_f32(
-                    &mut enc,
+                    enc.encoder(),
                     &mut registry,
                     device.metal_device(),
                     &hidden,                 // residual
@@ -2807,14 +2825,20 @@ impl Qwen35Model {
                     // ffn_input + ffn_residual via the same encoder; the
                     // memory_barrier below enforces the RAW dependency
                     // (fused_residual_norm writes → MoeQ FFN reads).
-                    enc.memory_barrier();
+                    enc.encoder().memory_barrier();
                     (ffn_residual_buf, ffn_input_buf, Some(enc))
                 } else {
                     // Legacy 2-encoder path for Dense (F32) / Moe (F32-MoE).
                     // commit() without wait — Metal serial queue guarantees
                     // ordering; the FFN commit_and_wait() provides the
-                    // eventual sync.
-                    enc.commit();
+                    // eventual sync. Decode-path classification per spec
+                    // §1.1 is DROP_SITE; commit_unlabeled preserves the
+                    // pre-iter90 `enc.commit()` shape on the Plain variant
+                    // and routes through `EncoderSession::commit_stage` on
+                    // the Sessioned variant (which delegates to the same
+                    // inner.commit() when no label is set).
+                    enc.commit_unlabeled()
+                        .with_context(|| format!("commit fused_res_norm (Dense/F32-MoE 2-encoder path) layer {layer_idx}"))?;
                     (ffn_residual_buf, ffn_input_buf, None)
                 }
             };
@@ -2901,8 +2925,23 @@ impl Qwen35Model {
                     let out = if seq_len > 1
                         && std::env::var("HF2Q_PROFILE_DENSE_Q_SPLIT_COMMITS").as_deref() == Ok("1")
                     {
+                        // Diagnostic split-profile path takes CommandEncoder by
+                        // value (gpu_ffn.rs:1466). Under HF2Q_ENCODER_SESSION=1
+                        // the LayerEncoder is Sessioned and cannot be downgraded
+                        // without breaking the session state machine — and
+                        // mixing two diagnostic env gates is out of scope for
+                        // iter90. Gate this path to env=0 explicitly; if both
+                        // envs are set together, surface a clear error rather
+                        // than silently switching paths.
+                        let plain_enc = enc.try_into_inner_command_encoder().map_err(|_| {
+                            anyhow!(
+                                "HF2Q_PROFILE_DENSE_Q_SPLIT_COMMITS=1 is incompatible \
+                                 with HF2Q_ENCODER_SESSION=1 (iter90 scope: profile path \
+                                 takes CommandEncoder by value, layer {layer_idx})"
+                            )
+                        })?;
                         build_dense_ffn_layer_gpu_q_split_profile(
-                            enc,
+                            plain_enc,
                             &device,
                             &mut registry,
                             &ffn_input,
@@ -2923,7 +2962,7 @@ impl Qwen35Model {
                         // (single-token thread-local pool is already optimal).
                         let out = if let Some(arena) = dense_ffn_arena.as_mut() {
                             build_dense_ffn_layer_gpu_q_into_with_arena(
-                                &mut enc,
+                                enc.encoder(),
                                 &device,
                                 &mut registry,
                                 &ffn_input,
@@ -2936,7 +2975,7 @@ impl Qwen35Model {
                             })?
                         } else {
                             build_dense_ffn_layer_gpu_q_into(
-                                &mut enc,
+                                enc.encoder(),
                                 &device,
                                 &mut registry,
                                 &ffn_input,
@@ -2948,7 +2987,13 @@ impl Qwen35Model {
                             })?
                         };
                         if seq_len == 1 {
-                            enc.commit();
+                            // Decode path (DROP_SITE per spec §1.1).
+                            // commit_unlabeled preserves pre-iter90 enc.commit()
+                            // shape on Plain; routes through commit_stage on
+                            // Sessioned.
+                            enc.commit_unlabeled().with_context(|| {
+                                format!("commit fused-DenseQ decode layer {layer_idx}")
+                            })?;
                         } else if is_k_boundary {
                             // ADR-019 Phase 1: hold the LAST layer's
                             // FFN-terminal encoder open (skip commit_and_wait)
@@ -2957,22 +3002,46 @@ impl Qwen35Model {
                             // before the loop; FFN-arm guard (MoeQ/DenseQ)
                             // satisfied here trivially.  Pool reset for the
                             // last layer is also skipped below.
+                            //
+                            // ADR-019 Phase 2 iter90 OQ2: phase1_fusion_env_eligible
+                            // is already gated on !LayerEncoder::env_enabled(),
+                            // so under env=1 the held branch is structurally
+                            // unreachable. The assert keeps the invariant
+                            // visible to future readers.
                             if phase1_fusion_env_eligible
                                 && (layer_idx + 1) == n_layers
                             {
-                                last_layer_held_enc = Some(enc);
+                                debug_assert!(
+                                    !LayerEncoder::env_enabled(),
+                                    "phase1_fusion_env_eligible must be false under env=1 (iter90 OQ2)"
+                                );
+                                let plain_enc = enc.try_into_inner_command_encoder()
+                                    .unwrap_or_else(|_| unreachable!(
+                                        "phase1_fusion_env_eligible ⇒ env=0 ⇒ LayerEncoder::Plain"
+                                    ));
+                                last_layer_held_enc = Some(plain_enc);
                             } else {
+                                // K-boundary TERMINAL — drain the GPU.
                                 enc.commit_and_wait_labeled("layer.dense_ffn")
                                     .with_context(|| {
                                         format!("commit fused-DenseQ layer {layer_idx}")
                                     })?;
                             }
                         } else {
-                            // ADR-013 P20: K-batched FFN terminal — commit
-                            // without waiting. The next K-boundary's
-                            // commit_and_wait drains all in-flight CBs on
-                            // the Metal serial queue, including this one.
-                            enc.commit_labeled("layer.dense_ffn");
+                            // ADR-013 P20: K-batched FFN intra-K terminal —
+                            // commit without waiting. The next K-boundary's
+                            // commit_and_wait drains all in-flight CBs on the
+                            // Metal serial queue, including this one.
+                            //
+                            // ADR-019 Phase 2 iter90 STAGE_FENCE site:
+                            // env=0 → CommandEncoder::commit_labeled (byte-
+                            //   identical to pre-iter90 shape);
+                            // env=1 → EncoderSession::fence_stage + reset_for_next_stage
+                            //   so the NEXT layer's first dispatch waits on the
+                            //   MTLSharedEvent rather than the queue's FIFO drain.
+                            enc.fence_or_commit("layer.dense_ffn").with_context(|| {
+                                format!("fence/commit DenseQ intra-K layer {layer_idx}")
+                            })?;
                         }
                         out
                     };
@@ -3041,7 +3110,7 @@ impl Qwen35Model {
                     // decode granularity).
                     let out = if let Some(arena) = moe_ffn_arena.as_mut() {
                         build_moe_ffn_layer_gpu_q_into_with_arena(
-                            &mut enc,
+                            enc.encoder(),
                             &device,
                             &mut registry,
                             &ffn_input,
@@ -3055,7 +3124,7 @@ impl Qwen35Model {
                         })?
                     } else {
                         build_moe_ffn_layer_gpu_q_into(
-                            &mut enc,
+                            enc.encoder(),
                             &device,
                             &mut registry,
                             &ffn_input,
@@ -3068,13 +3137,27 @@ impl Qwen35Model {
                         })?
                     };
                     if seq_len == 1 {
-                        enc.commit();
+                        // Decode path (DROP_SITE per spec §1.1).
+                        enc.commit_unlabeled().with_context(|| {
+                            format!("commit fused-MoeQ decode layer {layer_idx}")
+                        })?;
                     } else if is_k_boundary {
                         // ADR-019 Phase 1: see DenseQ fusion comment above.
+                        // ADR-019 Phase 2 iter90 OQ2: phase1_fusion_env_eligible
+                        // is gated on !LayerEncoder::env_enabled(); held branch
+                        // is structurally unreachable under env=1.
                         if phase1_fusion_env_eligible
                             && (layer_idx + 1) == n_layers
                         {
-                            last_layer_held_enc = Some(enc);
+                            debug_assert!(
+                                !LayerEncoder::env_enabled(),
+                                "phase1_fusion_env_eligible must be false under env=1 (iter90 OQ2)"
+                            );
+                            let plain_enc = enc.try_into_inner_command_encoder()
+                                .unwrap_or_else(|_| unreachable!(
+                                    "phase1_fusion_env_eligible ⇒ env=0 ⇒ LayerEncoder::Plain"
+                                ));
+                            last_layer_held_enc = Some(plain_enc);
                         } else {
                             enc.commit_and_wait_labeled("layer.moe_ffn")
                                 .with_context(|| {
@@ -3082,14 +3165,20 @@ impl Qwen35Model {
                                 })?;
                         }
                     } else {
-                        // ADR-013 P20: K-batched FFN terminal — commit
+                        // ADR-013 P20: K-batched FFN intra-K terminal — commit
                         // without waiting. The next K-boundary's
                         // commit_and_wait drains all in-flight CBs on the
-                        // Metal serial queue, including this one. Pool
-                        // reset is also gated on is_k_boundary below so
-                        // these pooled scratches are not recycled while
-                        // still GPU-referenced.
-                        enc.commit_labeled("layer.moe_ffn");
+                        // Metal serial queue, including this one. Pool reset
+                        // is also gated on is_k_boundary below so these
+                        // pooled scratches are not recycled while still
+                        // GPU-referenced.
+                        //
+                        // ADR-019 Phase 2 iter90 STAGE_FENCE site (sister of
+                        // DenseQ above): env=0 → CommandEncoder::commit_labeled;
+                        // env=1 → EncoderSession fence_stage + reset_for_next_stage.
+                        enc.fence_or_commit("layer.moe_ffn").with_context(|| {
+                            format!("fence/commit MoeQ intra-K layer {layer_idx}")
+                        })?;
                     }
                     out
                 }

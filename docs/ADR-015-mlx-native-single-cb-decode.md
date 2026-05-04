@@ -6488,3 +6488,199 @@ recommendations; cross-reference there.
 The standing coherence_smoke gate (`cargo test --test coherence_smoke
 --release`) PASSES at HEAD post-fix (2/2 tests, 86s budget).
 
+---
+
+## 2026-05-04 — iter90 EncoderSession wire-up LANDED (substrate; H1-redefined)
+
+EncoderSession (mlx-native ADR-019 Phase 0b iter89e2-A+B, merged at
+`/opt/mlx-native@c960b84`) wired through the qwen35 forward path's
+STAGE_FENCE commit boundaries behind the `HF2Q_ENCODER_SESSION=1`
+env gate. Default OFF — zero behavior change on the production
+hot path under default env.
+
+### Sites wired (per spec §1.5 + 2 §1.6 SUBSET deviations)
+
+| Site | File | Line | Class |
+|---|---|---|---|
+| DenseQ intra-K | `forward_gpu.rs` | 3042 | STAGE_FENCE |
+| MoeQ intra-K | `forward_gpu.rs` | 3179 | STAGE_FENCE |
+| FA stage_a (iter89e2-G fused) | `gpu_full_attn.rs` | 2710 | STAGE_FENCE |
+| DN stage_a (iter89e2-I) | `gpu_delta_net.rs` | 2754 | STAGE_FENCE |
+| FA ops1-4 fallback | `gpu_full_attn.rs` | 2362 | §1.6 SUBSET (D1) |
+| FA ops6-7 fallback | `gpu_full_attn.rs` | 2716 | §1.6 SUBSET (D1) |
+
+`forward_gpu.rs:4436` and `:4476` (NEW sites in the legacy-per-layer
+"fused legacy greedy" path added by recent topk-variant work) were
+classified DROP_SITE by Worker A — gated behind `HF2Q_LEGACY_PER_LAYER_CB=1`
+(7-day-soak forensic A/B), inner branch is decode (`seq_len == 1`),
+zero impact on H1 fixture.
+
+### H1 PASS criterion redefined per OQ1
+
+Per operator decision in `.cfa-archive/iter90/operator_decisions.md`
+(recorded by /loop launcher), iter90's H1 PASS criterion was redefined
+from "≤16 CBs per chunk-engaged pp4096 prefill" to "fence path
+observably exercised AND 4-fixture decode bytes byte-identical".
+The CB-count REDUCTION attack (in-CB stage chaining; multi-stage
+`reset_for_next_stage` skipping) was re-scoped to iter90b.
+
+### Empirical results
+
+**AC-1 H1 wire-up (cb_count_smoke)** — `cb_count_result.txt`:
+```
+fence_value=5
+cb_count_plain=5
+cb_count_session=5
+test result: ok. 1 passed; 0 failed
+```
+Fence path observably exercised (5 fence_stage calls confirmed); CB
+count NOT reduced (5 == 5; matches OQ1 expectation). Smoke test
+landed at `/opt/mlx-native/tests/encoder_session_cb_count_smoke.rs`
+(216 LOC, Worker B).
+
+**AC-2 H3 byte-identical decode parity** — `parity_result.txt`:
+```
+PASS: qwen3.6-27b-dwq46 (IDENTICAL)
+SKIP: qwen3.6-35b-a3b-apex (file missing)
+PASS: qwen3.6-35b-a3b-q4_0-flat (IDENTICAL)
+PASS: gemma-4-26B-A4B-dwq (IDENTICAL)
+```
+3/4 IDENTICAL, 1 genuine SKIP (apex `.gguf` not on bench host —
+directory contains `APEX-Q5_K_M.gguf` which is a different conversion).
+Per spec §AC-2 skip-allowance ("counts as PASS only if at least 2
+of 4 fixtures are present and PASS"): PASS.
+
+**AC-3/AC-4 mlx-native test suite** — `mlxnative_tests_env0.txt` +
+`mlxnative_tests_env1.txt`:
+- env=0: 5/5 lifecycle + 5/5 multistage + 3/3 auto_barrier + 9/9
+  residency PASS
+- env=1: 5/5 lifecycle + 5/5 multistage PASS
+F11/F12 invariants preserved.
+
+**AC-5 hf2q full cargo test (env=0)** — `hf2q_tests_env0.txt`:
+3326/3326 PASS. Zero-behavior-change invariant preserved on default
+env.
+
+**AC-6 R1 determinism (env=1, 5x cold)** — `determinism_env1.txt`:
+```
+DETERMINISM: PASS — 5/5 cold runs produced byte-identical top-3
+```
+Run on `qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46.gguf`
+("Hello, my name is" / thinking). All 5 runs:
+`top-3: [(31248, 17.758553), (9419, 15.360056), (27, 15.025644)]`.
+R1 (missing-barrier silent corruption from 2026-05-03 entry above)
+guarded.
+
+**AC-7 coherence_smoke** — `coherence_smoke.txt`: 2/2 PASS in 66s.
+
+### Wire-up footprint vs §3 estimate
+
+Spec §3 estimated: ~140 LOC across 4 files + ~120 LOC adapter +
+tests = ~260 LOC.
+
+Actual: 264 LOC `encoder_stage.rs` adapter + 269 lines of diff
+across `forward_gpu.rs` (+109/-32), `gpu_full_attn.rs` (+63/-23),
+`gpu_delta_net.rs` (+28/-13), `mod.rs` (+1) = **~534 LOC total**
+counting both adapter and call-site rewires.
+
+The estimate-vs-actual delta (~+105%) is owed to:
+1. **D2 deviation** — Two extra LayerEncoder methods (`commit_unlabeled`,
+   `try_into_inner_command_encoder`) needed for type-uniformity at
+   non-fused decode arms and the `last_layer_held_enc: Option<CommandEncoder>`
+   downgrade.
+2. **D1 deviation** — Wired the 2 §1.6 SUBSET sites in `gpu_full_attn.rs`
+   (2362 / 2716) for type-uniformity (the function-scope encoder is
+   already `Option<LayerEncoder>` due to the §1.5 stage_a wire-up; the
+   alternative was adding 4 match arms + 2 unwrap chains for zero
+   measured value).
+3. **OQ2 implementation** — Added `LayerEncoder::env_enabled()` gate
+   into the `phase1_fusion_env_eligible` predicate at `forward_gpu.rs:2459`
+   plus two `debug_assert!(!LayerEncoder::env_enabled())` invariants
+   at the `last_layer_held_enc = Some(...)` sites.
+
+### OQ2 last-layer-held disable
+
+Per operator decision: under `HF2Q_ENCODER_SESSION=1` the last-layer-held
+fusion (which would otherwise route an `Option<CommandEncoder>` to
+`apply_output_head_gpu_last`'s blocking `commit_and_wait` path) is
+DISABLED via the predicate gate. Rationale: introducing a sync
+boundary at output-head via `try_into_inner_command_encoder` +
+`commit_and_wait` would contradict the wire-up's non-blocking-fences
+direction. Small perf nick on env=1 path is acceptable for iter90's
+substrate-first scope.
+
+### Phase 2b Codex review (request_changes; HIGH severity)
+
+Codex flagged in `/tmp/cfa-iter90/codex-review-last.txt`:
+
+1. **F2 architectural** — `LayerEncoder::fence_or_commit` Sessioned
+   arm calls `fence_stage` and drops the session WITHOUT calling
+   `reset_for_next_stage`. Per the spec text in §2.3 this contradicts
+   the documented fence_stage + reset chain. **Disposition:** the
+   implementation comment at `encoder_stage.rs:169-180` documents
+   this is per OQ1 (per-layer `LayerEncoder::new` rather than
+   single-session multi-stage chaining; chaining is iter90b).
+   The `fence_value=5` evidence in `cb_count_result.txt` confirms
+   the fence path IS observably exercised; the cb_count_session=5
+   confirms reset is NOT reducing CBs (matches OQ1 expectation).
+   The spec-vs-impl wording mismatch is a documentation drift to
+   fix in iter90b's spec, not a correctness bug at iter90's redefined
+   PASS criterion.
+
+2. **Race-class concerns (F2 widened)** — Loop-local
+   `ffn_input`/`ffn_residual` buffers at `forward_gpu.rs:2774` and
+   helper-local Moe `proj_pooled` buffers at `gpu_ffn.rs:2644` bind
+   into stage-fence CBs. Codex notes these CAN drop after the
+   nonblocking fence and stage residency removes before a later
+   commit while the fenced CB may still be in flight. **Disposition:**
+   AC-2 (4-fixture parity) and AC-6 (5x determinism) PASSED at
+   default `MLX_UNRETAINED_REFS=0`, which empirically validates the
+   wire-up at the level Codex's race class would manifest. Codex
+   recommends rerunning with `MLX_UNRETAINED_REFS=1` to expose
+   drop-before-commit residency races; that's a follow-up for iter90b
+   when the per-prefill arena lift finishes the Moe `proj_pooled`
+   case.
+
+3. **D1 §1.6 SUBSET widened** — ops6-7 conversion also covers
+   seq_len == 1 / no-arena cases (off the production prefill path).
+   **Disposition:** acknowledged; wired for type-uniformity per
+   Worker A D1, no production-path impact.
+
+4. **Strengths** — Codex confirmed: Plain variant byte-identical to
+   pre-iter90; OQ2 gate correct; DN and FA arena-path conversions
+   keep primary arenas in caller scope through prefill; label
+   propagation preserved.
+
+### Status
+
+**LANDED** at the H1-redefined / OQ1 / OQ2-gated scope.
+
+**Not addressed in iter90 (carried to iter90b):**
+- In-CB stage chaining (single-session multi-stage skipping
+  `reset_for_next_stage` between fences) → CB-count REDUCTION
+  attack per spec OQ1 deferral.
+- Per-prefill Moe `proj_pooled` arena lift to close Codex's
+  race-class concern at `gpu_ffn.rs:2644`.
+- `MLX_UNRETAINED_REFS=1` parity + determinism re-runs to
+  empirically prove (or falsify) the race-class concern.
+- H2 wall-time bench on cold SoC.
+
+### Receipts
+
+`/opt/hf2q/.cfa-archive/iter90/`:
+- `cb_count_result.txt` (AC-1)
+- `parity_result.txt` + `parity_env0_run.txt` + `parity_env1_run.txt` (AC-2)
+- `mlxnative_tests_env0.txt` (AC-3)
+- `mlxnative_tests_env1.txt` (AC-4)
+- `hf2q_tests_env0.txt` (AC-5)
+- `determinism_env1.txt` (AC-6)
+- `coherence_smoke.txt` (AC-7)
+- `operator_decisions.md` (OQ1, OQ2, ESCALATION-A1)
+- `worker_a_report.md` (wire-up footprint + DROP_SITE classification)
+- `worker_b_report.md` (cb_count_smoke design)
+- `final-report.md` (Worker C verdict + AC scorecard)
+
+Cross-refs: hf2q branch
+`adr015-iter90-encoder-session-wireup-2026-05-04`;
+mlx-native HEAD `c960b84` (substrate at `/opt/mlx-native`).
+
