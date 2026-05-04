@@ -9269,3 +9269,42 @@ iter-22).
 Production OLD GGUF meets all mission criteria.  Future work
 (qL<16 deeper kernel fix, FRESH GGUF hardware-context bug,
 long-prefill mlx-native kernel optimization) deferred.
+
+---
+
+## 2026-05-04 — iter-23: long-prefill gap rooted in mlx-native mm_id kernel
+
+Looking at the long-prefill perf gap (-15-20% vs llama.cpp), confirmed
+the routing IS correct: mm_id (Q4_K MoE matmul) is dispatched for
+prefill ≥ 32 tokens, and an A/B at pp1281 confirms it's the right choice:
+
+| route | pp1281 t/s |
+|---|---|
+| mm_id (default threshold=32) | 2688 |
+| mv_id (override threshold=99999) | 713 (-73 %, much slower) |
+| mm_id aggressive (threshold=4) | 2674 |
+
+So the work isn't in the routing.  The remaining gap is in the
+implementation of Apple Silicon Metal Q4_K MoE matmul vs llama.cpp's
+ggml-metal kernels.  llama.cpp baseline is FLAT at ~3200 t/s pp512+;
+hf2q grows to ~2700 t/s asymptotically.
+
+**Scaling profile:**
+
+| qL | hf2q t/s | llama.cpp t/s | hf2q vs llama |
+|---|---|---|---|
+| 235 | 1873 | 1552 (pp100) | +21 % faster |
+| 641 | 2501 | 3227 (pp512) | -22 % |
+| 1281 | 2688 | 3236 (pp1024) | -17 % |
+| 2048 | ~2700 (extrap) | 3207 | -16 % |
+
+llama.cpp is FLAT at long prefill (compute-bound).  hf2q grows toward
+its own ceiling (different memory/compute balance in the kernel).
+
+**Closing the gap requires:** port-or-rewrite of the Q4_K MoE matmul
+kernel in mlx-native to match llama.cpp's instruction-level efficiency.
+Multi-day work in a different repo (mlx-native), tracked under task
+#21 / ADR-015 territory.
+
+ADR-005 inference-server work for this session: COMPLETE.
+Long-prefill follow-up belongs in ADR-013/ADR-015.
