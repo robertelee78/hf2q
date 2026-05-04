@@ -1502,49 +1502,9 @@ fn special_token_safe_prefix(generated_text: &str) -> (&str, Option<&'static str
     if let Some((pos, marker)) = find_special_token_stop_pos(generated_text) {
         return (&generated_text[..pos], Some(marker));
     }
-    // 2026-05-03 — second-`<think>`-block stop. The Qwen3.5/3.6 thinking-
-    // capable abliterix-EGA-abliterated checkpoint sometimes emits a full
-    // answer, then RESTARTS reasoning with a fresh `<think>` block instead
-    // of emitting `<|im_end|>` to close its turn (verified end-to-end on
-    // the wedding-cake prompt 2026-05-03: 1718-token output where
-    // tokens 0-1000 are a clean answer and 1000-1718 are a redundant
-    // re-thinking + re-answer that degenerates into a `(14" (14" (14"`
-    // loop). The repetition guard catches the loop eventually but only
-    // after wasted tokens. A cleaner stop: when the cumulative text
-    // contains a closing reasoning tag (`</think>` or the model's
-    // nonstandard `<|endthink|>`) followed by a fresh opening `<think>`
-    // tag, the answer is complete and we should stop.
-    if let Some(close_pos) = find_first_reasoning_close(generated_text) {
-        // Look for a NEW `<think>` opening AFTER the close.
-        let after_close = &generated_text[close_pos..];
-        if let Some(rel_pos) = after_close.find("<think>") {
-            let abs_pos = close_pos + rel_pos;
-            return (&generated_text[..abs_pos], Some("<think>-restart"));
-        }
-    }
 
     let hold_len = trailing_special_token_prefix_len(generated_text);
     (&generated_text[..generated_text.len() - hold_len], None)
-}
-
-/// Find the byte position immediately AFTER the first reasoning-close marker
-/// in `generated_text`, or `None` if no close marker has appeared yet.
-///
-/// Recognises both the standard Qwen `</think>` and the abliterix-EGA-
-/// abliterated checkpoint's nonstandard `<|endthink|>` (which BPE-decomposes
-/// into 8 regular tokens rather than emitting as a single special-token id).
-fn find_first_reasoning_close(generated_text: &str) -> Option<usize> {
-    let mut earliest: Option<usize> = None;
-    for marker in ["</think>", "<|endthink|>"] {
-        if let Some(pos) = generated_text.find(marker) {
-            let end = pos + marker.len();
-            earliest = Some(match earliest {
-                None => end,
-                Some(prev) => prev.min(end),
-            });
-        }
-    }
-    earliest
 }
 
 fn trim_generated_assistant_role_prefix(mut text: &str) -> &str {
@@ -1646,30 +1606,6 @@ fn strip_trailing_im_start_prefix(text: &mut String) {
             text.truncate(new_len);
             return;
         }
-    }
-    // Also strip a trailing `<think>` / `<|endthink|>` prefix. The
-    // second-`<think>`-block stop (special_token_safe_prefix) cuts safe_raw
-    // at the position of the SECOND `<think>` opening, but the streaming
-    // display has already flushed any partial `<` `t` `h` `i` `n` `k`
-    // tokens that the model emitted byte-by-byte before the full
-    // `<think>` was assembled. Trim any such trailing prefix so the user
-    // sees a clean answer ending instead of "...clean cuts.\n\n<think".
-    for marker in ["<think>", "<|endthink|>"] {
-        for len in (1..marker.len()).rev() {
-            let candidate = &marker[..len];
-            if text.ends_with(candidate) {
-                let new_len = text.len() - len;
-                text.truncate(new_len);
-                return;
-            }
-        }
-    }
-    // Trim trailing whitespace runs (newlines + spaces) that survive the
-    // `<think>`-prefix strip — the user-visible answer reads cleaner
-    // without a dangling "\n\n" tail.
-    let trimmed_len = text.trim_end_matches([' ', '\t', '\r', '\n']).len();
-    if trimmed_len < text.len() {
-        text.truncate(trimmed_len);
     }
 }
 

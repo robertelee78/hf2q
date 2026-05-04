@@ -32,7 +32,7 @@ fi
 cp /tmp/hf2q_logits_t0.bin "$WORKDIR/hf2q.bin"
 
 # 2. llama.cpp first-token logits via llama-eval-callback.
-"$LLAMA_EVAL" -m "$MODEL" -p "$PROMPT_TEXT" -n 0 --no-warmup \
+"$LLAMA_EVAL" -m "$MODEL" -p "$PROMPT_TEXT" -n 0 \
   >"$WORKDIR/llama.stdout" 2>"$WORKDIR/llama.stderr" || true
 
 # 3. Compare. (For now top-1 argmax; full L2 distance requires a llama.cpp
