@@ -618,6 +618,50 @@ fn apply_output_head_gpu_into(
     vocab_size: u32,
     eps: f32,
 ) -> Result<Vec<f32>> {
+    let logits_buf = apply_output_head_gpu_into_buf(
+        caller_enc,
+        device,
+        registry,
+        hidden,
+        head,
+        seq_len,
+        hidden_size,
+        vocab_size,
+        eps,
+    )?;
+    download_f32(&logits_buf).context("download logits")
+}
+
+/// Same as [`apply_output_head_gpu_into`] but returns the post-commit GPU
+/// logits `MlxBuffer` instead of a downloaded `Vec<f32>`.
+///
+/// ADR-005 iter-25: split out so the GPU top-K sampling path can read the
+/// same buffer with a downstream kernel (`mlx_native::ops::top_k`) without
+/// paying the ~600 KB / ~250 µs vocab download. The original
+/// `apply_output_head_gpu_into` becomes a thin wrapper that downloads the
+/// buffer for callers that still want full F32 logits on host (full-logits
+/// prefill, sampling-mode decode without GPU top-K, embed paths, etc.).
+///
+/// All invariants of the original function are preserved here:
+///   - Pooled `normed` / `params` allocation (iter58b residency anchor).
+///   - Encoder hand-off with intra-CB `memory_barrier` between RMSNorm
+///     and lm_head (replaces legacy CB boundaries).
+///   - Phase-1 fusion barrier when `caller_enc = Some(_)` (RAW barrier
+///     against the prior layer's FFN-terminal write to `hidden`).
+///   - Q4 lm_head matmul (matches the greedy-decode head path).
+///   - Optional dump_layer_n / dump_bisect dumps run AFTER the terminal
+///     `commit_and_wait` (the dump path requires a settled `normed`).
+fn apply_output_head_gpu_into_buf(
+    caller_enc: Option<mlx_native::CommandEncoder>,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden: &MlxBuffer,
+    head: &OutputHeadGpu,
+    seq_len: u32,
+    hidden_size: u32,
+    vocab_size: u32,
+    eps: f32,
+) -> Result<MlxBuffer> {
     // ---- Allocate normed + norm-params (pooled per ADR-015 iter14) ----
     //
     // Pooled allocation provides the iter58b lifecycle anchor under
@@ -743,7 +787,7 @@ fn apply_output_head_gpu_into(
         );
     }
 
-    download_f32(&logits_buf).context("download logits")
+    Ok(logits_buf)
 }
 
 /// Apply the final output head only to the last prefill row.
