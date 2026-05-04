@@ -1818,6 +1818,11 @@ struct DisplayScrubber {
     emitted: usize,
 }
 
+// Display-layer scrub list. These are STANDARD Qwen3 chat-template tokens
+// that appear in our rendered prompt and that the model may regurgitate as
+// BPE-decomposed bytes on broken finetunes. NOT a list of arbitrary
+// pattern matches — every tag here is part of the Qwen3 chat-template
+// vocabulary documented in the model's tokenizer_config.json.
 const SCRUB_TAGS: &[&str] = &[
     "<|im_end|>",
     "<|im_start|>assistant",
@@ -1825,6 +1830,9 @@ const SCRUB_TAGS: &[&str] = &[
     "<|im_start|>system",
     "<|endoftext|>",
     "<|end|>",
+    // Standard reasoning-block tags (Qwen3-Thinking, DeepSeek-R1 family).
+    "</think>",
+    "<think>",
 ];
 
 impl DisplayScrubber {
