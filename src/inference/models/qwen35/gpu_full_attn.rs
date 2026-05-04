@@ -1827,7 +1827,24 @@ pub fn apply_sdpa_with_kv_cache(
         //     at this iter — full-prefill-from-zero is the live regime —
         //     but the legacy path is preserved as a correct fallback for
         //     non-prefill-from-zero correctness)
-        let new_path_eligible = head_dim == 256 && cur_len == 0;
+        // ITER-17 fix: gate the FA-prefill path on `seq_len >= 32` (= BQ
+        // for the d=256 dispatcher).  When seq_len < BQ, both NQ tiles
+        // and (for seq_len < 16) NK tiles collapse to a single partial
+        // tile; in this single-tile-each regime the kernel produces
+        // 32 NaN at exact dim=10 across every (head, seq) cell.  The
+        // bug reproduces deterministically with byte-identical inputs
+        // in production but does NOT reproduce in mlx-native standalone
+        // tests (see mlx-native@91d3337 + ADR-005 iter-17b for the
+        // hypothesis-elimination chain — residency, CB ordering,
+        // memory_barrier, function-constant alignment, and force-sync
+        // all falsified).  The legacy 3-pass `sdpa` kernel below
+        // produces correct output for short prefills; perf cost is
+        // negligible (a 12-token prefill takes µs either way).
+        //
+        // long-prefill perf is preserved: pp101+ takes the new FA
+        // path (verified at ADR-013 P21 Stage 4 — pp101 465 t/s,
+        // pp512 1030 t/s, pp726 2061 t/s — all unchanged).
+        let new_path_eligible = head_dim == 256 && cur_len == 0 && seq_len >= 32;
         if new_path_eligible {
             // Dispatch flash_attn_prefill on the chunk seq-major Q/K/V
             // directly. Output is seq-major F32, matching the legacy
