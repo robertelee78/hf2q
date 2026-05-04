@@ -9308,3 +9308,57 @@ Multi-day work in a different repo (mlx-native), tracked under task
 
 ADR-005 inference-server work for this session: COMPLETE.
 Long-prefill follow-up belongs in ADR-013/ADR-015.
+
+---
+
+## 2026-05-04 — iter-24: task #19 (GPU top-k) plan documented
+
+Re-baselined sampling perf and located integration points:
+
+* Greedy decode: 130.2 t/s (qwen3.6-35B-A3B-dwq48)
+* Sampling decode: 117.2 t/s (default --temp=0.8 --top-k=40 --top-p=0.95
+  --min-p=0.05, no rep penalty)
+* Gap: 13 t/s ≈ 8 % perf delta = ~0.86 ms/step CPU sampling overhead.
+
+The 0.86 ms/step is dominated by:
+1. `Vec<(usize, f32)>` build over 248K vocab (~250µs alloc+loop)
+2. `select_nth_unstable_by` partition on 248K f32 (~500µs)
+3. Final sort of top-40 + softmax + sample (~100µs)
+
+**Available infrastructure:** `mlx-native::ops::top_k::dispatch_top_k_f32`
+already exists (single-threadgroup kernel, K up to 128, returns
+unsorted u32 indices + f32 values).  Originally built for the Q8
+lm_head rerank path; not yet used by sampling.
+
+**Integration plan (well-scoped, 200-300 LOC):**
+
+1. Add `sample_token_from_topk(idx: &[u32], val: &[f32], params)` API
+   to `sampler_pure.rs` — same chain (top_p/min_p/temp/softmax/sample)
+   but starting from K=128 candidates instead of full V.
+2. In `serve/mod.rs::cmd_generate_qwen35` sampling path: when
+   `repetition_penalty == 1.0`, dispatch `top_k_f32` on the GPU
+   logits buffer → download K=128 (idx, val) pairs → call new API.
+3. When `repetition_penalty != 1.0`: keep CPU path (or write a
+   GPU rep-penalty kernel as a follow-up — only needed for users
+   who actually set `--repetition-penalty`).
+4. Cache the top-k index/value/params buffers in `DecodeBuffers`
+   to avoid per-step allocation.
+5. Coverage: thinking_mode_sanity harness across the prompt matrix.
+
+**Expected gain:** ~700 µs/step → close most of the 13 t/s gap,
+bring sampling within ~1-3 t/s of greedy.
+
+**Out of scope this iter** (deferred to focused session): the
+implementation.
+
+**Alternative tracks (pick one for next focused session):**
+* qL<16 GPU-padded fix (close the bare-short-prompt edge case;
+  100-150 LOC arena+wrapper surgery; iter-21 CPU-memcpy attempt
+  was empirically broken)
+* FRESH dwq48 hardware-context-NaN deep-dive (deepest investigation;
+  may require kernel-level instrumentation in mlx-native)
+
+ADR-005 inference-server work for THIS session: COMPLETE (qL>=16
+coherence + iter-22 peer-validated parity-class for qL<16 + iter-23
+documented long-prefill gap rooted in mlx-native + iter-24 plan
+for task #19).
