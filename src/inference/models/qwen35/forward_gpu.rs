@@ -678,6 +678,95 @@ fn apply_output_head_gpu_into_buf(
     vocab_size: u32,
     eps: f32,
 ) -> Result<MlxBuffer> {
+    // Encode the output head (RMSNorm + lm_head) into the encoder, but
+    // do NOT commit. We commit-and-wait below before the optional dumps.
+    let (mut enc, normed, logits_buf) = encode_output_head_into_encoder(
+        caller_enc,
+        device,
+        registry,
+        hidden,
+        head,
+        seq_len,
+        hidden_size,
+        vocab_size,
+        eps,
+    )?;
+
+    // Terminal commit_and_wait — drains output_head dispatches AND, in
+    // the Phase 1 fusion, the caller's last-layer FFN dispatches.  F6
+    // (output-head host read) preserved — `download_f32` runs after.
+    let fused_label = enc.is_carried_from_fused_caller();
+    let label = if fused_label {
+        "output_head.fused_norm_lm_head_with_layer_ffn"
+    } else {
+        "output_head.fused_norm_lm_head"
+    };
+    enc.commit_and_wait_labeled(label)
+        .context("commit output_head fused norm+lm_head")?;
+
+    // Optional: dump output-norm stats to stderr.
+    if dump_layer_n().is_some() {
+        dump_hidden_stats("output_norm", &normed, seq_len, hidden_size);
+    }
+    // ADR-015 iter61a-3: per-op bisection dump for output_norm (the last
+    // residual-stream value entering lm_head).  No layer index — always-on.
+    if super::dump_bisect::is_enabled() {
+        super::dump_bisect::dump(
+            super::dump_bisect::current_step().saturating_sub(1),
+            None,
+            "output_norm",
+            &normed,
+            &[seq_len as usize, hidden_size as usize],
+            device,
+        );
+    }
+
+    Ok(logits_buf)
+}
+
+/// Wrap the borrowed encoder with a tag indicating whether it was
+/// supplied by the Phase-1 fused caller (changes the commit label only).
+struct OutputHeadEncoder {
+    enc: mlx_native::CommandEncoder,
+    fused: bool,
+}
+
+impl OutputHeadEncoder {
+    fn is_carried_from_fused_caller(&self) -> bool {
+        self.fused
+    }
+    fn commit_and_wait_labeled(&mut self, label: &str) -> Result<()> {
+        self.enc
+            .commit_and_wait_labeled(label)
+            .map_err(|e| anyhow!("commit {}: {}", label, e))
+    }
+}
+
+/// Encode the output-head pipeline (output_norm RMSNorm + Q4 lm_head
+/// matmul) into a single encoder WITHOUT committing.
+///
+/// Returns the encoder (still open), the pooled `normed` buffer (kept so
+/// the caller can run optional dump paths after the eventual commit),
+/// and the device-allocated `logits_buf`.
+///
+/// ADR-005 iter-25 split: `apply_output_head_gpu_into_buf` calls this
+/// then commits + dumps; `apply_output_head_gpu_into_topk` calls this,
+/// extends the encoder with a `top_k_f32` dispatch, and commits ONCE
+/// (collapsing what was previously two commit_and_waits into one — each
+/// commit_and_wait costs a few-hundred-µs RTT on Apple Silicon, which
+/// was undoing the entire ~700 µs saving from skipping the CPU partial
+/// sort if naively cascaded).
+fn encode_output_head_into_encoder(
+    caller_enc: Option<mlx_native::CommandEncoder>,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden: &MlxBuffer,
+    head: &OutputHeadGpu,
+    seq_len: u32,
+    hidden_size: u32,
+    vocab_size: u32,
+    eps: f32,
+) -> Result<(OutputHeadEncoder, MlxBuffer, MlxBuffer)> {
     // ---- Allocate normed + norm-params (pooled per ADR-015 iter14) ----
     //
     // Pooled allocation provides the iter58b lifecycle anchor under
@@ -775,35 +864,7 @@ fn apply_output_head_gpu_into_buf(
     )
     .context("lm_head projection")?;
 
-    // Terminal commit_and_wait — drains output_head dispatches AND, in
-    // the Phase 1 fusion, the caller's last-layer FFN dispatches.  F6
-    // (output-head host read) preserved — `download_f32` runs after.
-    let label = if fused {
-        "output_head.fused_norm_lm_head_with_layer_ffn"
-    } else {
-        "output_head.fused_norm_lm_head"
-    };
-    enc.commit_and_wait_labeled(label)
-        .context("commit output_head fused norm+lm_head")?;
-
-    // Optional: dump output-norm stats to stderr.
-    if dump_layer_n().is_some() {
-        dump_hidden_stats("output_norm", &normed, seq_len, hidden_size);
-    }
-    // ADR-015 iter61a-3: per-op bisection dump for output_norm (the last
-    // residual-stream value entering lm_head).  No layer index — always-on.
-    if super::dump_bisect::is_enabled() {
-        super::dump_bisect::dump(
-            super::dump_bisect::current_step().saturating_sub(1),
-            None,
-            "output_norm",
-            &normed,
-            &[seq_len as usize, hidden_size as usize],
-            device,
-        );
-    }
-
-    Ok(logits_buf)
+    Ok((OutputHeadEncoder { enc, fused }, normed, logits_buf))
 }
 
 /// Apply the final output head only to the last prefill row.
@@ -890,11 +951,15 @@ fn apply_output_head_gpu_into_topk(
         ));
     }
 
-    // Stage A: produce the full logits buffer on GPU (post-commit; the
-    // terminal commit_and_wait inside the buf helper drains the
-    // RMSNorm + lm_head dispatches and any prior Phase-1-fused last-layer
-    // FFN work that was encoded into the caller-supplied encoder).
-    let logits_buf = apply_output_head_gpu_into_buf(
+    // Stage A: encode RMSNorm + lm_head into an encoder (open, NOT
+    // committed). This is the exact same pipeline as
+    // `apply_output_head_gpu_into_buf`'s prefix; the split lets us
+    // append the top_k_f32 dispatch in the SAME command buffer so the
+    // whole output-head + top-K runs on one commit_and_wait. Cascading
+    // two commit_and_waits would re-introduce the per-step CPU/GPU
+    // round-trip (~50–100 µs each on Apple Silicon) the entire iter-25
+    // optimization is supposed to skip.
+    let (mut head_enc, _normed, logits_buf) = encode_output_head_into_encoder(
         caller_enc,
         device,
         registry,
@@ -906,30 +971,37 @@ fn apply_output_head_gpu_into_topk(
         eps,
     )?;
 
-    // Stage B: allocate the top-K outputs and params buffer.
-    //
-    // We use `device.alloc_buffer` rather than the decode pool here:
-    //   * Sizes are tiny (top_k * 4 bytes each, and 8 bytes for params).
-    //   * The `Vec` reads below force a CPU-side sync and copy out of
-    //     the buffer immediately after `commit_and_wait`, so there is
-    //     no lifetime concern for the next pool reset.
-    let out_indices = device
-        .alloc_buffer(
-            (top_k as usize) * 4,
-            DType::U32,
-            vec![top_k as usize],
-        )
-        .map_err(|e| anyhow!("alloc top_k out_indices: {e}"))?;
-    let out_values = device
-        .alloc_buffer(
-            (top_k as usize) * 4,
-            DType::F32,
-            vec![top_k as usize],
-        )
-        .map_err(|e| anyhow!("alloc top_k out_values: {e}"))?;
-    let mut params_buf = device
-        .alloc_buffer(8, DType::U32, vec![2usize])
-        .map_err(|e| anyhow!("alloc top_k params: {e}"))?;
+    // Stage B: allocate the top-K outputs and params buffer via the
+    // decode pool. Direct `device.alloc_buffer` per step incurs a Metal
+    // `newBuffer` syscall + `MTLResidencySet::addAllocation:` on every
+    // decode step. The decode pool's bucket-rounding amortizes these
+    // across all decode steps after the first (next call's
+    // `pool.alloc_inner` finds a same-size, same-dtype buffer on the
+    // free list and reuses it; ARC keeps it resident through the
+    // eventual commit_and_wait via the pool's `in_use` list, and
+    // `reset_decode_pool()` at the top of `forward_gpu_impl` cycles
+    // them back to the free list each step).
+    let out_indices = super::decode_pool::pooled_alloc_buffer(
+        device,
+        (top_k as usize) * 4,
+        DType::U32,
+        vec![top_k as usize],
+    )
+    .map_err(|e| anyhow!("alloc top_k out_indices: {e}"))?;
+    let out_values = super::decode_pool::pooled_alloc_buffer(
+        device,
+        (top_k as usize) * 4,
+        DType::F32,
+        vec![top_k as usize],
+    )
+    .map_err(|e| anyhow!("alloc top_k out_values: {e}"))?;
+    let mut params_buf = super::decode_pool::pooled_alloc_buffer(
+        device,
+        8,
+        DType::U32,
+        vec![2usize],
+    )
+    .map_err(|e| anyhow!("alloc top_k params: {e}"))?;
     {
         let s = params_buf
             .as_mut_slice::<u32>()
@@ -938,17 +1010,11 @@ fn apply_output_head_gpu_into_topk(
         s[1] = top_k;
     }
 
-    // Stage C: dispatch top_k_f32 in a fresh encoder and wait.
-    //
-    // A fresh encoder is correct here even though `apply_output_head_gpu_into_buf`
-    // already committed: that commit drained the lm_head matmul write to
-    // `logits_buf`, so the new encoder sees a fully-settled buffer. No
-    // intra-CB barrier needed (the CB boundary IS the barrier).
-    let mut enc = device
-        .command_encoder()
-        .context("enc output_head.top_k")?;
+    // Stage C: append top_k_f32 to the SAME encoder. RAW barrier:
+    // top_k_f32 reads `logits_buf` written by lm_head two stages above.
+    head_enc.enc.memory_barrier();
     mlx_native::ops::top_k::dispatch_top_k_f32(
-        &mut enc,
+        &mut head_enc.enc,
         registry,
         device.metal_device(),
         &logits_buf,
@@ -959,10 +1025,17 @@ fn apply_output_head_gpu_into_topk(
         top_k,
     )
     .context("dispatch_top_k_f32")?;
-    enc.commit_and_wait_labeled("output_head.top_k")
-        .context("commit output_head.top_k")?;
 
-    // Stage D: read the K-element outputs out to host. ~K*8 bytes total.
+    // Stage D: terminal commit_and_wait — drains output_head + top_k
+    // AND, in the Phase-1 fusion, the caller's last-layer FFN dispatches.
+    let label = if head_enc.is_carried_from_fused_caller() {
+        "output_head.fused_norm_lm_head_topk_with_layer_ffn"
+    } else {
+        "output_head.fused_norm_lm_head_topk"
+    };
+    head_enc.commit_and_wait_labeled(label)?;
+
+    // Stage E: read the K-element outputs out to host. ~K*8 bytes total.
     let top_indices = out_indices
         .as_slice::<u32>()
         .map_err(|e| anyhow!("read top_k out_indices: {e}"))?
