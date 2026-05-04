@@ -8983,3 +8983,38 @@ or set `HF2Q_DUMP_LAYER=ALL` (slow but coherent) for the FRESH GGUF.
 ADR-005 work for this session is COMPLETE on the OLD-GGUF
 production target.  FRESH-GGUF deeper investigation deferred to
 next session.
+
+---
+
+## 2026-05-03 — iter-18: option 1 tested, did NOT fix FRESH
+
+Implemented iter-17e's option 1: split `apply_output_head_gpu_into`
+so that RMSNorm and the lm_head Q4_0 matmul are in SEPARATE
+command buffers (commit between them, fresh encoder for lm_head,
+commit_and_wait_labeled at end).
+
+Result on FRESH GGUF + "Hi": **still all-NaN logits, still `!!!`**.
+
+So the bug is NOT in the RMSNorm → lm_head matmul segment.  It enters
+EARLIER in the forward pass.  Reverted the change.
+
+Perf check: pp101 = 929 t/s (this is the actual baseline; the earlier
+1197 t/s was pp146, longer prefill).  No regression from the
+(reverted) attempt.
+
+**Next session options:**
+
+* Option 2: insert periodic `commit_and_wait` checkpoints in the
+  per-layer loop (e.g. every 8 layers or every K-boundary).  This is
+  what `HF2Q_DUMP_LAYER=ALL` effectively does via dump_in_layer.
+  Cost: 4-5 syncs per prefill chunk.
+* Option 3: instrument an earlier dump point (between layers 20 and
+  30, say) without the full DUMP_LAYER bypass to localize where the
+  NaN actually enters the pipeline.
+
+**End of session:** OLD GGUF = production-ready (coherence + speed
+parity with llama.cpp).  FRESH GGUF deferred — converter metadata
+is correct (vocab=248320, EOS=248046) which validates ADR-005's
+May-2 commit `505b5b8` (`fix(gguf converter): merge added_tokens`).
+The FRESH-specific runtime NaN is a separate context-dependent
+hardware quirk that requires deeper investigation.
