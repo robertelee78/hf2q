@@ -9362,3 +9362,119 @@ ADR-005 inference-server work for THIS session: COMPLETE (qL>=16
 coherence + iter-22 peer-validated parity-class for qL<16 + iter-23
 documented long-prefill gap rooted in mlx-native + iter-24 plan
 for task #19).
+
+## 2026-05-04 — iter-25: task #19 (GPU top-k) implementation
+
+Followed iter-24's 6-step integration plan. Build-and-test-clean
+infrastructure landed; user-facing routing reverted because the
+underlying kernel is empirically too slow at vocab=248044 to beat
+the CPU partial-sort it was meant to replace.
+
+### What landed (kept across the iter)
+
+1. **`apply_output_head_gpu_into` refactor** — split into
+   `apply_output_head_gpu_into_buf` (returns the post-commit
+   GPU `MlxBuffer`) + a 1-line wrapper that downloads. Lets
+   downstream kernels (top_k, future GPU rep-penalty, etc.)
+   read the logits buffer without paying the ~600 KB / ~250 µs
+   F32 download.
+2. **`apply_output_head_gpu_into_topk`** — new variant that runs
+   RMSNorm + Q4 lm_head + `top_k_f32` in ONE encoder, single
+   commit_and_wait. Top-K out-buffers (out_indices, out_values,
+   params) are decode-pool allocated to avoid per-step Metal
+   `newBuffer` overhead.
+3. **`OutputHeadMode::TopK { k }`** + `forward_gpu_impl` out-param
+   `topk_out: Option<&mut Option<(Vec<u32>, Vec<f32>)>>`. Public
+   surface: `Qwen35Model::forward_gpu_last_topk`.
+4. **`sample_token_from_topk(top_indices, top_values, params)`**
+   API in `sampler_pure.rs`. Repetition penalty unsupported
+   (caller must gate on `rep_penalty == 1.0`); 5 unit tests cover
+   K=1, empty, temp=0 max-pick, full-V vs top-K distribution
+   match within ±5 % (4000 samples per path), and unsorted-input
+   invariance.
+5. **`encode_output_head_into_encoder` helper** — factors the
+   RMSNorm + lm_head encoder build from the
+   commit_and_wait + dump path, sharing one body between
+   `_buf` and `_topk` variants.
+
+### Why the user-facing routing was reverted
+
+After implementing all 6 spec steps, ran the sampling perf bench:
+
+* Baseline (no GPU top-K, full-vocab download + CPU partial-sort):
+  121.6–123.6 t/s on `Tell me about recursion` 50-token decode
+  with `temp=0.8 top-k=40 top-p=0.95 min-p=0.05`.
+* GPU top-K path (`HF2Q_USE_GPU_TOPK=1`, all preconditions met):
+  **71–77 t/s** — a 45 t/s REGRESSION.
+
+Root-caused via per-step `[STEP_PROFILE]` instrumentation:
+* Baseline output-head: 0.8–4.9 ms/step
+* GPU top-K output-head: 7–11 ms/step
+
+The kernel itself, `top_k_f32` at
+`/opt/mlx-native/src/shaders/top_k.metal`, is a single-threadgroup
+design (tg_size=64 threads × K replace-min insertion sort) that
+scans all 248044 elements through one SIMD-group on one SM. At
+N=248k it is ~6 ms — fundamentally too slow to win against the
+CPU's `select_nth_unstable_by` (~500 µs).
+
+The iter-24 plan's premise — "GPU kernel saves CPU partial-sort
+time" — held only if the kernel is sub-300 µs at this N, which it
+isn't. The kernel was originally sized for the Q8 lm_head rerank
+path (smaller N or rerank-once-per-query, where the cost is
+amortized differently).
+
+### What's needed for a future retry
+
+The infrastructure landed in iter-25 is reusable as soon as a
+faster GPU top-K kernel exists. Options for that kernel:
+
+* **Multi-threadgroup tournament reduction** — split the 248k vocab
+  across many threadgroups (one SM each), each producing a local
+  top-K, then a final reduction kernel merges. Apple Silicon GPUs
+  have many SMs; saturating them should bring per-step cost down
+  to ~300 µs.
+* **Bitonic top-K** — fully-parallel sort within larger threadgroups,
+  proven well at vocab scale in CUDA literature; portable to Metal.
+* **GPU rep-penalty kernel** — separate enabler. Lifts the
+  `rep_penalty == 1.0` precondition from sample_token_from_topk
+  routing.
+
+These are mlx-native territory (kernel work in
+`/opt/mlx-native/src/shaders/top_k.metal`). hf2q-side iter-25
+infra waits in tree; no further hf2q-side work is unblocked by
+fixing the kernel.
+
+### Final state shipped
+
+* `forward_gpu_last_topk` lives in the model API; testable from a
+  unit harness with a real model load if needed.
+* `sample_token_from_topk` lives in `sampler_pure.rs` with 5 unit
+  tests (passes under `cargo test --release sampler_pure`).
+* No production routing change — `serve/mod.rs::cmd_generate_qwen35`
+  reverted to byte-identical pre-iter-25 sampling decode loop.
+* Greedy regression check: 133 t/s pp29 / 124–134 t/s decode 30
+  tokens (matches pre-iter-25 baseline).
+* Long-prefill regression check: 2724 t/s pp1028 (matches
+  pre-iter-25 baseline within bench noise).
+* Sampling regression check: 121.6 t/s for 50-token decode
+  (matches pre-iter-25 baseline).
+
+### Methodology lessons captured for the brain
+
+* **GPU is not always faster than CPU at the same workload.**
+  On Apple Silicon a single-threadgroup kernel scanning 248k F32s
+  is bandwidth- AND compute-bound on one SM; the CPU partial-sort
+  with `select_nth_unstable_by` runs on the full M5 Max P-cluster
+  (P-cores at 4+ GHz with vector intrinsics). For tasks that fit
+  on the CPU, only multi-SM-saturating GPU kernels win.
+* **Profile the bottleneck FIRST.** iter-24's plan attributed
+  ~700 µs to the CPU partial-sort but did not measure the GPU
+  kernel's wall time. Adding a per-stage `[TOPK_PROFILE]`
+  instrumentation showed the kernel was 6× the CPU baseline, not
+  a fractional saving.
+* **Don't add a 2nd commit_and_wait for a small downstream
+  dispatch.** Apple Silicon CPU↔GPU round-trip on
+  `commit_and_wait` is ~50–100 µs floor. The single-CB refactor
+  in this iter is the right pattern; the kernel was the wrong
+  tool, not the dispatch shape.
