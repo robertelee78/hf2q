@@ -8630,3 +8630,38 @@ The morning session correctly identified this as model-level but did not
 ship the operator-facing diagnostic improvement or a regression harness;
 this iter fills both gaps.
 
+
+---
+
+### Session entry — 2026-05-03 (iter 11): second `<think>` block stop —
+### saves 644 wasted tokens on wedding-cake DEFAULT invocation
+
+**User-reported follow-up.** With iter-10's diagnostic shipped, user
+re-tested wedding-cake at default mode (no `--no-thinking`). Got
+1718 tokens of mostly-coherent output but with a redundant
+re-thinking + re-answer round at the end that degenerated into a
+`(14" (14" (14"` loop, caught by the repetition guard.
+
+**Root cause.** The Qwen3.5/3.6 thinking-capable abliterix-EGA-
+abliterated checkpoint sometimes emits a full answer, then RESTARTS
+reasoning with a fresh `<think>` block instead of emitting
+`<|im_end|>` to close its turn. Checkpoint-level chat-format bug.
+
+The model also uses a NONSTANDARD `<|endthink|>` close marker
+(BPE-decomposed) instead of the standard `</think>`. Both forms now
+detected.
+
+**This iter ships:** new stop pattern in `special_token_safe_prefix`
+that matches `<|endthink|>` (or `</think>`) followed by `<think>`
+and stops at the second `<think>`. Returns synthetic stop marker
+`<think>-restart` for diagnostics.
+
+**Empirical (wedding-cake, default mode):**
+
+  Pre-fix:   1718 tokens, 644 wasted on second-think + degenerate loop
+  Post-fix:  1074 tokens, clean stop after first answer (128.5 tok/s)
+
+**Verification:** thinking_mode_sanity harness still PASSes (single-
+thinking-block prompts unaffected); determinism preserved (md5
+0dfd0ae2… × 3); 2784/2784 unit tests pass.
+
