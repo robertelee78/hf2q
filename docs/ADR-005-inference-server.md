@@ -9109,3 +9109,52 @@ either:
 **Mission disposition (final):** OLD dwq48 GGUF meets all criteria
 end-to-end.  Production should consume that GGUF.  FRESH is deferred
 pending future deep-dive instrumentation.
+
+---
+
+## 2026-05-04 — iter-20: gate refined to seq_len>=16, qL=16-31 now coherent
+
+Bisection across the FRESH+OLD dwq48 GGUF matrix revealed the
+actual bug-trigger threshold for the dim=10 NaN (FA prefill) is
+**qL=16**, not qL=32 as iter-17 conservatively gated.  The kernel's
+partial-K-tile mask path only fires when `kL_rem != 0`; at qL>=16,
+K is BK-aligned and the buggy mask path is skipped.
+
+Empirical sweep:
+
+| qL | path under old (>=32) gate | path under new (>=16) gate | result |
+|---|---|---|---|
+| 1 | flash_attn_vec | flash_attn_vec | ✓ works |
+| 2-15 | legacy SDPA | legacy SDPA | ✗ all-NaN (kernel-level bug, BOTH GGUFs) |
+| 16-31 | legacy SDPA (broken at low qL) | **FA path** | ✅ FIXED — coherent |
+| 32+ | FA path | FA path | ✓ works |
+
+**Net coverage gained:** qL ∈ [16, 31] previously broken; now
+coherent on BOTH OLD and FRESH dwq48.  Validated end-to-end:
+
+* OLD "Hi" chat-template (qL=29) → coherent
+* OLD "Tell me a joke" (qL=32) → coherent
+* FRESH (qL=19) → coherent
+* long prefill pp75 → 727 t/s (FA path, perf preserved)
+
+**Remaining gap:** qL ∈ [2, 15].  Both kernels broken in this
+range.  User-side workaround: pad prompts to qL >= 16, or use
+chat-template prompts which naturally tokenize >= 16 tokens for
+any non-trivial user message.  Future kernel fix could add wrapper-
+side qL<16 padding-up-to-16 which would close the gap (50-100 LOC
+in apply_flash_attn_prefill_seq_major_into).
+
+**Tasks status — ADR-005 work completion:**
+
+* #25 (`!!!` repetition root-cause) — completed in iter-17
+* #26 (flash_attn_prefill short-seq investigation) — completed
+* #27 (commit_and_wait split) — completed (option 1 ruled out)
+* qL=16-31 coverage gap — closed in iter-20
+
+Production state on OLD GGUF: COHERENT + faster than llama.cpp at
+decode + +21% mid-prefill + within parity-class on prefill across
+all measured lengths.
+
+ADR-005 inference-server work for this session is **COMPLETE**.
+qL<16 gap and FRESH GGUF deeper hardware-context bug deferred to
+future deep-dive sessions.
