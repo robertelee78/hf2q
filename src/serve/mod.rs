@@ -1550,54 +1550,6 @@ fn sample_qwen35_logits_for_generate(
     crate::serve::sampler_pure::sample_token(logits, &params, previous_tokens)
 }
 
-/// ADR-005 iter-25: predicate for routing the sampling decode loop
-/// through the GPU top-K path (`forward_gpu_last_topk` +
-/// `sample_token_from_topk`) instead of the full-vocab download
-/// (`forward_gpu_last_logits` + `sample_token`).
-///
-/// Eligibility:
-///   * `args.repetition_penalty == 1.0` — rep-penalty mutates the FULL
-///     logit vector and may demote a hot token off the GPU top-K subset
-///     before sampling sees it. Cannot be honoured on a pre-extracted K.
-///   * `args.top_k` in `[1, 128]` — kernel `MAX_K = 128`; top_k=0 means
-///     "use full vocab" which defeats the purpose.
-///   * `args.temperature > SAMPLING_EPS` — at temp=0 the caller takes
-///     the greedy fast-path (`forward_gpu_greedy`) before reaching this
-///     decision; here we keep the gate explicit for defence in depth.
-///
-/// Default: gated behind `HF2Q_USE_GPU_TOPK=1` env var. The follow-up
-/// iter flips the gate to default-on once production has burned-in
-/// against this implementation.
-fn qwen35_use_gpu_topk_sampling(args: &cli::GenerateArgs) -> bool {
-    if std::env::var("HF2Q_USE_GPU_TOPK").ok().as_deref() != Some("1") {
-        return false;
-    }
-    args.repetition_penalty == 1.0
-        && args.top_k > 0
-        && args.top_k <= 128
-        && args.temperature > crate::serve::sampler_pure::SAMPLING_EPS
-}
-
-/// Companion to `sample_qwen35_logits_for_generate` for the GPU top-K
-/// path. Same `SamplingParams` shape, but consumes `(top_indices,
-/// top_values)` from `Qwen35Model::forward_gpu_last_topk` instead of a
-/// full F32 logit slice.
-fn sample_qwen35_topk_for_generate(
-    top_indices: &[u32],
-    top_values: &[f32],
-    args: &cli::GenerateArgs,
-) -> u32 {
-    let params = crate::serve::sampler_pure::SamplingParams {
-        temperature: args.temperature,
-        top_p: args.top_p,
-        top_k: args.top_k,
-        min_p: args.min_p,
-        repetition_penalty: args.repetition_penalty,
-        max_tokens: args.max_tokens,
-    };
-    crate::serve::sampler_pure::sample_token_from_topk(top_indices, top_values, &params)
-}
-
 // ============================================================================
 // Decode-loop testable helper (H3 Layer A unlock, item (c) of dossier plan)
 // ============================================================================
@@ -2382,16 +2334,6 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         if let Ok(Some(s)) = decode_stream.step(next_token) {
             cumulative_text.push_str(&s);
         }
-        // ADR-005 iter-25: per-call eligibility for GPU top-K sampling
-        // path. Args are immutable across the decode loop so we evaluate
-        // once here rather than per step.
-        let use_gpu_topk = qwen35_use_gpu_topk_sampling(&args);
-        let topk_k: u32 = if use_gpu_topk {
-            // top_k is already validated in [1, 128] by the predicate.
-            args.top_k as u32
-        } else {
-            0
-        };
 
         run_decode_loop(
             next_token,
@@ -2403,67 +2345,21 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
                 let decode_positions = vec![pos; 4];
                 let _t_step = step_profile_enabled.then(std::time::Instant::now);
                 let _t_fwd = step_profile_enabled.then(std::time::Instant::now);
-                let next = if use_gpu_topk {
-                    // GPU top-K path: ~K * 8 bytes back to host instead of
-                    // ~600 KB. Skips the dominant CPU-side
-                    // `select_nth_unstable_by` over Qwen3.6's 248K vocab.
-                    let (top_indices, top_values) = model
-                        .forward_gpu_last_topk(
-                            &[prev_token],
-                            &decode_positions,
-                            &mut kv_cache,
-                            topk_k,
-                        )
-                        .with_context(|| {
-                            format!("forward_gpu_last_topk decode at pos {pos}")
-                        })?;
-                    let _fwd_us = _t_fwd.map(|t| t.elapsed().as_micros());
-                    let _t_smp = step_profile_enabled.then(std::time::Instant::now);
-                    // Top-K path doesn't honour repetition_penalty (gated
-                    // out in `qwen35_use_gpu_topk_sampling` above);
-                    // `generated_tokens` is intentionally unused here.
-                    let _ = generated_tokens;
-                    let next = sample_qwen35_topk_for_generate(
-                        &top_indices,
-                        &top_values,
-                        &args,
+                let mut logits = model
+                    .forward_gpu_last_logits(&[prev_token], &decode_positions, &mut kv_cache)
+                    .with_context(|| format!("forward_gpu_last_logits decode at pos {pos}"))?;
+                let fwd_us = _t_fwd.map(|t| t.elapsed().as_micros());
+                let _t_smp = step_profile_enabled.then(std::time::Instant::now);
+                let next = sample_qwen35_logits_for_generate(&mut logits, &args, generated_tokens);
+                let smp_us = _t_smp.map(|t| t.elapsed().as_micros());
+                if let Some(t) = _t_step {
+                    eprintln!(
+                        "[STEP_PROFILE] pos={pos} total={:.2}ms fwd={:.2}ms smp={:.2}ms",
+                        t.elapsed().as_micros() as f64 / 1000.0,
+                        fwd_us.unwrap_or(0) as f64 / 1000.0,
+                        smp_us.unwrap_or(0) as f64 / 1000.0,
                     );
-                    let _smp_us = _t_smp.map(|t| t.elapsed().as_micros());
-                    if let Some(t) = _t_step {
-                        eprintln!(
-                            "[STEP_PROFILE] pos={pos} total={:.2}ms fwd={:.2}ms smp={:.2}ms (topk)",
-                            t.elapsed().as_micros() as f64 / 1000.0,
-                            _fwd_us.unwrap_or(0) as f64 / 1000.0,
-                            _smp_us.unwrap_or(0) as f64 / 1000.0,
-                        );
-                    }
-                    next
-                } else {
-                    // Full-V CPU sampling path (rep-penalty engaged or
-                    // top_k out of GPU range).
-                    let mut logits = model
-                        .forward_gpu_last_logits(&[prev_token], &decode_positions, &mut kv_cache)
-                        .with_context(|| {
-                            format!("forward_gpu_last_logits decode at pos {pos}")
-                        })?;
-                    let fwd_us = _t_fwd.map(|t| t.elapsed().as_micros());
-                    let _t_smp = step_profile_enabled.then(std::time::Instant::now);
-                    let next = sample_qwen35_logits_for_generate(
-                        &mut logits,
-                        &args,
-                        generated_tokens,
-                    );
-                    let smp_us = _t_smp.map(|t| t.elapsed().as_micros());
-                    if let Some(t) = _t_step {
-                        eprintln!(
-                            "[STEP_PROFILE] pos={pos} total={:.2}ms fwd={:.2}ms smp={:.2}ms",
-                            t.elapsed().as_micros() as f64 / 1000.0,
-                            fwd_us.unwrap_or(0) as f64 / 1000.0,
-                            smp_us.unwrap_or(0) as f64 / 1000.0,
-                        );
-                    }
-                    next
-                };
+                }
                 Ok(next)
             },
             |toks| {
