@@ -43,7 +43,8 @@
 //!   long-decode).
 
 use anyhow::{Context, Result};
-use mlx_native::{MlxBuffer, MlxDevice};
+use mlx_native::{EncoderSession, MlxBuffer, MlxDevice};
+use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -51,6 +52,67 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use super::gpu_full_attn::download_f32;
+
+thread_local! {
+    /// ADR-015 iter94 Task #3 — thread-local session drainer pointer.
+    ///
+    /// When set (via [`set_active_session`]), [`flush_gpu`] routes its
+    /// drain through `EncoderSession::commit_and_wait +
+    /// reset_for_next_stage` on the pointed session INSTEAD of opening a
+    /// fresh `device.command_encoder()` and committing it.  This is
+    /// required for env=1 (HF2Q_ENCODER_SESSION=1) bisection: the
+    /// session's persistent CB carries the in-flight intra-K dispatches,
+    /// and a fresh-encoder `commit_and_wait` does NOT join that session,
+    /// so download-side reads see pre-write state (iter93 Phase C found
+    /// all-zero ffn_out reads from the session-only env=1 path).
+    ///
+    /// # Lifetime contract
+    ///
+    /// The pointer is set ONLY by `forward_gpu_*` immediately before the
+    /// per-layer dispatch loop and CLEARED immediately after.  Within
+    /// that window, the pointed `EncoderSession` is on the same thread's
+    /// stack and cannot be moved (the layer loop holds it via
+    /// `&mut Option<EncoderSession>`).  `flush_gpu` reads this Cell
+    /// from the SAME thread at dump time.  No cross-thread aliasing is
+    /// possible because the Cell is thread-local and dump_bisect is
+    /// only invoked on the inference thread.
+    ///
+    /// `dump_bisect` is a diagnostic-only path gated by `HF2Q_DUMP_LAYER`;
+    /// the raw-pointer dance is acceptable in that scope.  Production
+    /// runs (env unset) bypass [`is_enabled`] before `flush_gpu` is ever
+    /// called, so this thread-local is dormant on the hot path.
+    static ACTIVE_SESSION: Cell<Option<*mut EncoderSession>> = const { Cell::new(None) };
+}
+
+/// Install a session pointer for [`flush_gpu`] to drain through.
+///
+/// Caller must call [`clear_active_session`] before the session is
+/// dropped or moved.  Recommended pattern:
+///
+/// ```ignore
+/// if let Some(sess) = layer_session.as_mut() {
+///     dump_bisect::set_active_session(sess);
+/// }
+/// // ... layer loop ...
+/// dump_bisect::clear_active_session();
+/// ```
+///
+/// # Safety
+///
+/// The caller must ensure that the pointed session outlives any
+/// subsequent `flush_gpu` calls (i.e. the session's stack-frame must
+/// not exit until [`clear_active_session`] runs).  Stamped here as a
+/// SAFE function because the `*mut EncoderSession` is treated opaquely
+/// by this module — no read/write happens until [`flush_gpu`]
+/// dereferences it inside its own `unsafe` block.
+pub fn set_active_session(sess: &mut EncoderSession) {
+    ACTIVE_SESSION.with(|c| c.set(Some(sess as *mut EncoderSession)));
+}
+
+/// Clear the session-drainer pointer.  Idempotent.
+pub fn clear_active_session() {
+    ACTIVE_SESSION.with(|c| c.set(None));
+}
 
 /// Cached env-gate state.  Computed once per process.
 struct DumpConfig {
@@ -245,7 +307,37 @@ pub fn dump(
 /// Open + commit-and-wait an empty encoder on the device so any
 /// previously-submitted async command buffers are guaranteed to finish
 /// before the caller reads buffer contents via `as_slice`.
+///
+/// ADR-015 iter94 Task #3 — when an active EncoderSession has been
+/// installed via [`set_active_session`], drain THROUGH that session's
+/// persistent CB instead of opening a fresh encoder.  Required for
+/// HF2Q_ENCODER_SESSION=1 bisection: a fresh `device.command_encoder()`
+/// allocates a NEW MTLCommandBuffer that does NOT join the session's
+/// in-flight chain; without the session-aware drain, the dump's
+/// `as_slice` reads can precede the session-internal writes (iter93
+/// Phase C: all-zero ffn_out reads from session-only env=1).
 fn flush_gpu(device: &MlxDevice) -> Result<()> {
+    let active = ACTIVE_SESSION.with(|c| c.get());
+    if let Some(sess_ptr) = active {
+        // SAFETY: the pointer is set only by forward_gpu_* immediately
+        // before the per-layer loop and cleared immediately after.  The
+        // pointed `EncoderSession` lives on the inference thread's stack
+        // for the full duration of that loop.  `flush_gpu` runs on the
+        // same thread (dump_bisect is invoked from layer-body call
+        // sites in forward_gpu).  No cross-thread aliasing is possible
+        // because `ACTIVE_SESSION` is thread-local.  The `&mut` reborrow
+        // here does not alias any other live `&mut` because no other
+        // path holds a `&mut EncoderSession` while a dump call is in
+        // progress (the layer-body code that calls `dump_in_layer`
+        // released its `layer_session.as_mut()` borrow at the prior
+        // `fence_or_commit` per the iter91 wire-up contract).
+        let sess: &mut EncoderSession = unsafe { &mut *sess_ptr };
+        sess.commit_and_wait()
+            .context("flush_gpu session.commit_and_wait")?;
+        sess.reset_for_next_stage()
+            .context("flush_gpu session.reset_for_next_stage")?;
+        return Ok(());
+    }
     let mut enc = device.command_encoder().context("flush_gpu enc")?;
     enc.commit_and_wait().context("flush_gpu commit_and_wait")?;
     Ok(())

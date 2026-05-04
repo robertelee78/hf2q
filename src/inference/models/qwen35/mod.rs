@@ -31,6 +31,7 @@ pub mod decode_pool;
 pub mod delta_net;
 pub mod dense;
 pub mod dump_bisect;
+pub(super) mod encoder_stage;
 pub mod chunk_allocs_arena;
 pub mod dense_ffn_arena;
 pub mod dn_prefill_arena;
@@ -45,7 +46,10 @@ pub mod gpu_delta_net;
 pub mod gpu_ffn;
 pub mod gpu_full_attn;
 pub use chunk_allocs_arena::ChunkAllocsArena;
-pub use dense_ffn_arena::{DenseFfnArena, MoeFfnArena};
+pub use dense_ffn_arena::{
+    DenseFfnArena, DenseFfnOutputRingBuffer, LayerBoundaryArena, MoeFfnArena,
+    MoeFfnOutputRingBuffer,
+};
 pub use dn_prefill_arena::DnPrefillArena;
 pub use fa_prefill_arena::FaPrefillArena;
 pub use fa_projections_arena::FaProjectionsArena;

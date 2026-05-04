@@ -94,6 +94,16 @@ pub struct DenseFfnArena {
     pub hidden_buf: MlxBuffer,
     /// `[1]` U32 — silu_mul element count parameter buffer.
     pub silu_params_buf: MlxBuffer,
+    /// `[seq_len, hidden_size]` F32 — intermediate down-projection output
+    /// when residual is folded.  Written by `quantized_matmul_ggml` (down
+    /// proj) then read by `elementwise_add` to produce the FINAL output
+    /// (which lands in the [`DenseFfnOutputRingBuffer`] slot).
+    ///
+    /// **iter92:** lifted from per-layer `device.alloc_buffer` to close
+    /// Codex finding #2 race — under `MLX_UNRETAINED_REFS=1` the per-layer
+    /// drop fired `removeAllocation:` between fence and next-layer commit
+    /// while the layer's CB was still in flight.
+    pub down_out_buf: MlxBuffer,
 
     // ── Capacity bookkeeping ─────────────────────────────────────────────
     /// The `seq_capacity` value the arena was allocated for.
@@ -130,8 +140,10 @@ impl DenseFfnArena {
         }
 
         let seq = seq_capacity as usize;
+        let h = hidden_size as usize;
         let m = intermediate_size as usize;
         let n_h_bytes = seq * m * 4;
+        let n_out_bytes = seq * h * 4;
 
         let gate_buf = device
             .alloc_buffer(n_h_bytes, DType::F32, vec![seq, m])
@@ -145,12 +157,16 @@ impl DenseFfnArena {
         let silu_params_buf = device
             .alloc_buffer(4, DType::U32, vec![1])
             .map_err(|e| anyhow!("DenseFfnArena alloc silu_params_buf: {e}"))?;
+        let down_out_buf = device
+            .alloc_buffer(n_out_bytes, DType::F32, vec![seq, h])
+            .map_err(|e| anyhow!("DenseFfnArena alloc down_out_buf: {e}"))?;
 
         Ok(Self {
             gate_buf,
             up_buf,
             hidden_buf,
             silu_params_buf,
+            down_out_buf,
             seq_capacity,
             hidden_size,
             intermediate_size,
@@ -243,6 +259,37 @@ pub struct MoeFfnArena {
     /// valid buffer reference even when the add_residual flag is 0).
     pub dummy_residual_buf: MlxBuffer,
 
+    // ── ADR-019 Phase 2 iter90b H5b — Phase A projection outputs ────────
+    //
+    // The four `proj_pooled` outputs at `gpu_ffn.rs:2651-2691` (router
+    // + shared gate + shared up projections) bind helper-local
+    // `MlxBuffer`s into the FFN encoder.  Codex finding #2 flagged these
+    // as crossing the non-blocking commit boundary under
+    // `MLX_UNRETAINED_REFS=1`.  Lifting them to arena-anchored buffers
+    // (which outlive the entire prefill) is the structural mitigation.
+    //
+    // All four shapes are `seq * out_features * 4` bytes — same shape
+    // category as the existing arena fields above.  Memory cost on apex
+    // 35B-A3B (h=5120, ne=128, m_sh=512, pp4096):
+    //   logits_buf:   4096 × 128 × 4 = 2.0 MB
+    //   sh_logit_buf: 4096 × 1   × 4 = 16 KB
+    //   a_s_buf:      4096 × 512 × 4 = 8.0 MB
+    //   b_s_buf:      4096 × 512 × 4 = 8.0 MB
+    // Total: ~18 MB — negligible vs the existing ~870 MB MoeFfnArena.
+
+    /// `[seq, num_experts]` F32 — router logits.  Replaces the
+    /// helper-local `proj_pooled` allocation at `gpu_ffn.rs:2651`.
+    pub logits_buf: MlxBuffer,
+    /// `[seq, 1]` F32 — shared expert gate input logit.  Replaces
+    /// `gpu_ffn.rs:2661`.
+    pub sh_logit_buf: MlxBuffer,
+    /// `[seq, m_sh]` F32 — shared expert gate output.  Replaces
+    /// `gpu_ffn.rs:2671`.
+    pub a_s_buf: MlxBuffer,
+    /// `[seq, m_sh]` F32 — shared expert up output.  Replaces
+    /// `gpu_ffn.rs:2681`.
+    pub b_s_buf: MlxBuffer,
+
     // ── Capacity bookkeeping ─────────────────────────────────────────────
     /// The `seq_capacity` value the arena was allocated for.
     pub seq_capacity: u32,
@@ -254,6 +301,9 @@ pub struct MoeFfnArena {
     pub moe_intermediate_size: u32,
     /// The `shared_intermediate_size` the arena was allocated for.
     pub shared_intermediate_size: u32,
+    /// The `num_experts` (router output dim) the arena was allocated for.
+    /// Iter90b H5b — sizes `logits_buf`.
+    pub num_experts: u32,
 }
 
 impl MoeFfnArena {
@@ -271,22 +321,26 @@ impl MoeFfnArena {
         num_experts_per_tok: u32,
         moe_intermediate_size: u32,
         shared_intermediate_size: u32,
+        num_experts: u32,
     ) -> Result<Self> {
         if seq_capacity == 0
             || hidden_size == 0
             || num_experts_per_tok == 0
             || moe_intermediate_size == 0
             || shared_intermediate_size == 0
+            || num_experts == 0
         {
             return Err(anyhow!(
                 "MoeFfnArena::new: zero dim \
                  seq_capacity={} hidden_size={} num_experts_per_tok={} \
-                 moe_intermediate_size={} shared_intermediate_size={}",
+                 moe_intermediate_size={} shared_intermediate_size={} \
+                 num_experts={}",
                 seq_capacity,
                 hidden_size,
                 num_experts_per_tok,
                 moe_intermediate_size,
                 shared_intermediate_size,
+                num_experts,
             ));
         }
 
@@ -295,6 +349,7 @@ impl MoeFfnArena {
         let topk = num_experts_per_tok as usize;
         let m_moe = moe_intermediate_size as usize;
         let m_sh = shared_intermediate_size as usize;
+        let ne = num_experts as usize;
         let total_rows = seq * topk;
 
         let ids_buf = device
@@ -331,6 +386,23 @@ impl MoeFfnArena {
             .alloc_buffer(4, DType::F32, vec![1])
             .map_err(|e| anyhow!("MoeFfnArena alloc dummy_residual_buf: {e}"))?;
 
+        // ── ADR-019 Phase 2 iter90b H5b — Phase A projection arena slots ──
+        let logits_bytes = seq * ne * 4;
+        let logits_buf = device
+            .alloc_buffer(logits_bytes, DType::F32, vec![seq, ne])
+            .map_err(|e| anyhow!("MoeFfnArena alloc logits_buf: {e}"))?;
+        let sh_logit_bytes = seq * 4;
+        let sh_logit_buf = device
+            .alloc_buffer(sh_logit_bytes, DType::F32, vec![seq, 1])
+            .map_err(|e| anyhow!("MoeFfnArena alloc sh_logit_buf: {e}"))?;
+        let a_s_bytes = seq * m_sh * 4;
+        let a_s_buf = device
+            .alloc_buffer(a_s_bytes, DType::F32, vec![seq, m_sh])
+            .map_err(|e| anyhow!("MoeFfnArena alloc a_s_buf: {e}"))?;
+        let b_s_buf = device
+            .alloc_buffer(a_s_bytes, DType::F32, vec![seq, m_sh])
+            .map_err(|e| anyhow!("MoeFfnArena alloc b_s_buf: {e}"))?;
+
         Ok(Self {
             ids_buf,
             weights_buf,
@@ -342,11 +414,16 @@ impl MoeFfnArena {
             silu_params_buf,
             silu_sh_params_buf,
             dummy_residual_buf,
+            logits_buf,
+            sh_logit_buf,
+            a_s_buf,
+            b_s_buf,
             seq_capacity,
             hidden_size,
             num_experts_per_tok,
             moe_intermediate_size,
             shared_intermediate_size,
+            num_experts,
         })
     }
 
@@ -365,6 +442,7 @@ impl MoeFfnArena {
         num_experts_per_tok: u32,
         moe_intermediate_size: u32,
         shared_intermediate_size: u32,
+        num_experts: u32,
     ) -> Result<()> {
         if seq_len > self.seq_capacity {
             return Err(anyhow!(
@@ -377,22 +455,410 @@ impl MoeFfnArena {
             || num_experts_per_tok != self.num_experts_per_tok
             || moe_intermediate_size != self.moe_intermediate_size
             || shared_intermediate_size != self.shared_intermediate_size
+            || num_experts != self.num_experts
         {
             return Err(anyhow!(
                 "MoeFfnArena::validate_fits: shape mismatch — \
-                 arena (h={}, topk={}, m_moe={}, m_sh={}) vs \
-                 call (h={}, topk={}, m_moe={}, m_sh={})",
+                 arena (h={}, topk={}, m_moe={}, m_sh={}, ne={}) vs \
+                 call (h={}, topk={}, m_moe={}, m_sh={}, ne={})",
                 self.hidden_size,
                 self.num_experts_per_tok,
                 self.moe_intermediate_size,
                 self.shared_intermediate_size,
+                self.num_experts,
                 hidden_size,
                 num_experts_per_tok,
                 moe_intermediate_size,
                 shared_intermediate_size,
+                num_experts,
             ));
         }
         Ok(())
+    }
+}
+
+/// ADR-019 Phase 2 iter90b H4b — caller-owned arena for the FFN-boundary
+/// `ffn_input` and `ffn_residual` buffers, lifted from the per-layer
+/// `device.alloc_buffer` calls at `forward_gpu.rs:2776-2790`.
+///
+/// # Why
+///
+/// Codex finding #2 against iter90 flagged `ffn_input_buf` and
+/// `ffn_residual_buf` as helper-local `MlxBuffer`s bound into the FFN
+/// encoder.  Under `MLX_UNRETAINED_REFS=1` (where CB ARC retains are
+/// SKIPPED), these buffers can drop after the non-blocking
+/// `fence_or_commit` on the FFN CB while the GPU is still pipelining.
+/// That is the iter58b residency-rescission failure mode.
+///
+/// Hoisting both buffers to a per-prefill arena owned by `forward_gpu_impl`
+/// — same lifetime pattern as `MoeFfnArena` / `DenseFfnArena` /
+/// `DnPrefillArena` — eliminates the failure mode structurally: the
+/// arena outlives every per-layer encoder commit, so no `MlxBuffer` drop
+/// stages a deferred residency-removal during the in-flight CB window.
+///
+/// # Lifetime contract
+///
+/// Allocated ONCE per prefill (`seq_len > 1`) just before the per-layer
+/// loop in `forward_gpu_impl`.  The two buffers are reused across all N
+/// layers — content is overwritten by each layer's
+/// `dispatch_fused_residual_norm_f32` call (which writes both
+/// `ffn_input` = rms_norm(hidden + attn_out) and
+/// `ffn_residual` = hidden + attn_out).  The arena is dropped at the
+/// end of `forward_gpu_impl` AFTER the output-head terminal
+/// `commit_and_wait_labeled`, which drains the GPU and frees the
+/// buffers safely.
+///
+/// **Decode (seq_len == 1) policy:** decode is DROP_SITE per iter90b
+/// spec §1.1 / §5.2.  The decode arm continues to use per-call
+/// `device.alloc_buffer` (one alloc per call, dropped at end of
+/// `forward_gpu_greedy`).  This arena is `Option<>` and gated on
+/// `seq_len > 1`.
+///
+/// # Memory cost
+///
+/// Two `[seq_capacity, hidden_size]` F32 buffers.  At pp4096 × h=5120:
+///   2 × 4096 × 5120 × 4 = 167 MB.  Negligible vs the existing ~870 MB
+/// MoeFfnArena footprint on apex.
+///
+/// # Risk register
+///
+/// F2 invariant preservation: the lift mirrors `MoeFfnArena` /
+/// `DenseFfnArena` exactly (caller-owned, prefill-lifetime, F32 layout).
+/// No new fence-class risk; the iter58b argument applies verbatim.
+pub struct LayerBoundaryArena {
+    /// `[seq_capacity, hidden_size]` F32 — FFN input
+    /// (= `rms_norm(hidden + attn_out)`).  Reused across all N layers.
+    pub ffn_input_buf: MlxBuffer,
+    /// `[seq_capacity, hidden_size]` F32 — pre-FFN residual
+    /// (= `hidden + attn_out`).  Reused across all N layers.
+    pub ffn_residual_buf: MlxBuffer,
+
+    // ── Capacity bookkeeping ─────────────────────────────────────────────
+    pub seq_capacity: u32,
+    pub hidden_size: u32,
+}
+
+impl LayerBoundaryArena {
+    /// Allocate both F32 boundary buffers for a single prefill.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if any dimension is zero or any underlying
+    /// `device.alloc_buffer` fails.
+    pub fn new(device: &MlxDevice, seq_capacity: u32, hidden_size: u32) -> Result<Self> {
+        if seq_capacity == 0 || hidden_size == 0 {
+            return Err(anyhow!(
+                "LayerBoundaryArena::new: zero dim seq_capacity={} hidden_size={}",
+                seq_capacity,
+                hidden_size,
+            ));
+        }
+        let bytes = (seq_capacity as usize) * (hidden_size as usize) * 4;
+        let shape = vec![seq_capacity as usize, hidden_size as usize];
+        let ffn_input_buf = device
+            .alloc_buffer(bytes, DType::F32, shape.clone())
+            .map_err(|e| anyhow!("LayerBoundaryArena alloc ffn_input_buf: {e}"))?;
+        let ffn_residual_buf = device
+            .alloc_buffer(bytes, DType::F32, shape)
+            .map_err(|e| anyhow!("LayerBoundaryArena alloc ffn_residual_buf: {e}"))?;
+        Ok(Self {
+            ffn_input_buf,
+            ffn_residual_buf,
+            seq_capacity,
+            hidden_size,
+        })
+    }
+
+    /// Validate that a per-layer call's shape fits inside the arena's capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `seq_len > self.seq_capacity` or
+    /// `hidden_size != self.hidden_size`.
+    pub fn validate_fits(&self, seq_len: u32, hidden_size: u32) -> Result<()> {
+        if seq_len > self.seq_capacity {
+            return Err(anyhow!(
+                "LayerBoundaryArena::validate_fits: seq_len {} exceeds capacity {}",
+                seq_len,
+                self.seq_capacity
+            ));
+        }
+        if hidden_size != self.hidden_size {
+            return Err(anyhow!(
+                "LayerBoundaryArena::validate_fits: hidden_size {} != arena {}",
+                hidden_size,
+                self.hidden_size
+            ));
+        }
+        Ok(())
+    }
+}
+
+// ── ADR-019 Phase 2 iter92 — FFN-output ring buffers (race closure) ──────────
+//
+// **Why two ring-buffer types instead of one combined or in a new file?**
+//
+// Decision: SEPARATE per-FFN-type structs (Dense / Moe), kept in this file
+// alongside the existing `DenseFfnArena` / `MoeFfnArena`.  Mirrors the
+// existing per-FFN-type arena pattern: every other arena split (Dense vs Moe
+// vs LayerBoundary) lives in `dense_ffn_arena.rs`.  Rationale:
+//   - Different shape parameters (Dense uses `intermediate_size`, MoE uses
+//     `num_experts_per_tok` × `moe_intermediate_size`); a combined struct
+//     would either over-allocate or carry awkward optionals.
+//   - Per-layer dispatch matches arena type: a DenseQ layer never touches
+//     the MoE ring slot and vice-versa, so an aliased single-ring would
+//     lose this safety invariant statically.
+//   - Co-located with their arena counterparts so future readers find both
+//     halves of the lifetime contract together.
+//
+// **Why ring-buffer not single-buffer?**
+//
+// A single shared output buffer would alias the read-side (current `hidden`
+// = previous layer's output) and the write-side (current layer's FFN
+// output) within the SAME memory.  The FFN encoder reads `hidden` (= the
+// shared slot) into projections then writes results back to the SAME slot,
+// corrupting the residual stream.  The ring's two-slot rotation gives us
+// (a) read-from = slot[(layer_idx-1) % 2]  and  (b) write-into =
+// slot[layer_idx % 2] — disjoint memory windows for the in-flight encoder.
+//
+// **Why 2 slots specifically?**
+//
+// Cross-layer dependency depth is 1: layer N reads layer N-1's output as
+// its `hidden`.  Ring slot at index (N-1)%2 must be alive (ARC-retained by
+// the ring AND by the `hidden` clone) while layer N is encoding.  Layer
+// N+1 then writes to slot[(N+1)%2] which is the same physical slot that
+// held layer N-1's output — but layer N+1 is the GPU-write-side and the
+// in-flight CB pipeline (within the same `EncoderSession` chain when
+// `HF2Q_ENCODER_SESSION=1`) serializes writes via memory_barrier and the
+// session's MTLSharedEvent chain.  So the buffer's PHYSICAL memory is
+// re-used for layer N+1's output AFTER the GPU has finished reading it
+// for layer N.  The Rust-side ARC retain by the ring prevents
+// `removeAllocation:` from firing on the residency set during this
+// transfer — that was the iter90b/iter91 race closure failure.
+//
+// **K+1 slots considered and rejected.**  K=8 K-batch boundary, on first
+// glance suggests ring_size=K+1=9.  Reading the actual encoder ordering:
+// every K-boundary layer issues `commit_and_wait_labeled` which DRAINS
+// the GPU.  Any in-flight CB that wrote a previous slot is fully complete
+// before the next K-batch starts.  So the only intra-K race surface is
+// 2-deep (read N-1, write N), satisfied by 2 slots.  Empirical
+// confirmation lives in the AC-4 + AC-5 tests below.
+//
+// **Lifetime contract** (mirrors `MoeFfnArena` / `DenseFfnArena` /
+// `LayerBoundaryArena` exactly):
+//   1. Allocated ONCE per prefill (`seq_len > 1`) just before the per-layer
+//      loop in `forward_gpu_impl`.
+//   2. Reused across all N layers — content overwritten in-place by each
+//      layer's `quantized_matmul_ggml` (Dense down proj) /
+//      `dispatch_moe_weighted_reduce` (MoE) call.
+//   3. Dropped at end of `forward_gpu_impl` AFTER the output-head terminal
+//      `commit_and_wait_labeled` drains the GPU and frees the buffers
+//      safely.
+//
+// **Memory footprint at apex pp4096 × h=5120:**
+//   Dense ring: 2 × 4096 × 5120 × 4 = 167 MB.
+//   MoE   ring: 2 × 4096 × 5120 × 4 = 167 MB.
+//   Both rings active on a model that mixes Dense + MoE layers: 334 MB.
+// Negligible vs the existing ~870 MB MoeFfnArena footprint on apex; M5 Max
+// 128 GB unified memory keeps this well within budget.
+//
+// **Decode policy:** decode (`seq_len == 1`) is DROP_SITE — keeps the
+// existing per-call `device.alloc_buffer` shape (decode never engages the
+// multi-layer race because each token is its own GPU sync).  The ring is
+// `Option<>` and gated on `seq_len > 1`, identical to the iter72 arena
+// gating.
+
+/// Ring buffer for the dense-Q FFN final-output buffer (`down_out` /
+/// `sum_buf`) across all dense layers in a single prefill.  Two slots
+/// rotated by `layer_idx % 2`; writes are in-place into the slot's
+/// pre-allocated `MlxBuffer`.
+///
+/// See module-level doc above for the ring-buffer rationale and lifetime
+/// contract.
+pub struct DenseFfnOutputRingBuffer {
+    /// Slot 0 — `[seq_capacity, hidden_size]` F32.  Holds the FFN output
+    /// for layers where `layer_idx % 2 == 0`.
+    slot0: MlxBuffer,
+    /// Slot 1 — `[seq_capacity, hidden_size]` F32.  Holds the FFN output
+    /// for layers where `layer_idx % 2 == 1`.
+    slot1: MlxBuffer,
+    /// The `seq_capacity` value the ring was allocated for.
+    pub seq_capacity: u32,
+    /// The `hidden_size` the ring was allocated for.
+    pub hidden_size: u32,
+}
+
+impl DenseFfnOutputRingBuffer {
+    /// Allocate both `[seq_capacity, hidden_size]` F32 slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if any dim is zero or any underlying
+    /// `device.alloc_buffer` fails.
+    pub fn new(device: &MlxDevice, seq_capacity: u32, hidden_size: u32) -> Result<Self> {
+        if seq_capacity == 0 || hidden_size == 0 {
+            return Err(anyhow!(
+                "DenseFfnOutputRingBuffer::new: zero dim seq_capacity={} hidden_size={}",
+                seq_capacity,
+                hidden_size,
+            ));
+        }
+        let bytes = (seq_capacity as usize) * (hidden_size as usize) * 4;
+        let shape = vec![seq_capacity as usize, hidden_size as usize];
+        let slot0 = device
+            .alloc_buffer(bytes, DType::F32, shape.clone())
+            .map_err(|e| anyhow!("DenseFfnOutputRingBuffer alloc slot0: {e}"))?;
+        let slot1 = device
+            .alloc_buffer(bytes, DType::F32, shape)
+            .map_err(|e| anyhow!("DenseFfnOutputRingBuffer alloc slot1: {e}"))?;
+        Ok(Self {
+            slot0,
+            slot1,
+            seq_capacity,
+            hidden_size,
+        })
+    }
+
+    /// Validate that a per-layer call's shape fits inside the ring's
+    /// capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `seq_len > self.seq_capacity` or
+    /// `hidden_size != self.hidden_size`.
+    pub fn validate_fits(&self, seq_len: u32, hidden_size: u32) -> Result<()> {
+        if seq_len > self.seq_capacity {
+            return Err(anyhow!(
+                "DenseFfnOutputRingBuffer::validate_fits: seq_len {} exceeds capacity {}",
+                seq_len,
+                self.seq_capacity,
+            ));
+        }
+        if hidden_size != self.hidden_size {
+            return Err(anyhow!(
+                "DenseFfnOutputRingBuffer::validate_fits: hidden_size {} != ring {}",
+                hidden_size,
+                self.hidden_size,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Mutable handle to the slot for `layer_idx`.  Pass to
+    /// `quantized_matmul_ggml` / `elementwise_add` as the destination.
+    pub fn slot_mut(&mut self, layer_idx: u32) -> &mut MlxBuffer {
+        if layer_idx % 2 == 0 {
+            &mut self.slot0
+        } else {
+            &mut self.slot1
+        }
+    }
+
+    /// `Arc`-cloned handle to the slot for `layer_idx`.  Returned by the
+    /// FFN function as `ffn_out`; becomes the next layer's `hidden`.  The
+    /// ring still retains the underlying allocation, so the next layer's
+    /// `hidden = ffn_out` reassignment dropping the previous `hidden` does
+    /// NOT trigger `removeAllocation:` — the iter91 race closure path.
+    pub fn slot_clone(&self, layer_idx: u32) -> MlxBuffer {
+        if layer_idx % 2 == 0 {
+            self.slot0.clone()
+        } else {
+            self.slot1.clone()
+        }
+    }
+}
+
+/// Ring buffer for the MoE-Q FFN final-output buffer (`out_buf`) across all
+/// MoE layers in a single prefill.  Two slots rotated by `layer_idx % 2`;
+/// writes are in-place into the slot's pre-allocated `MlxBuffer`.
+///
+/// See [`DenseFfnOutputRingBuffer`] above and the module-level doc for the
+/// ring-buffer rationale and lifetime contract.
+pub struct MoeFfnOutputRingBuffer {
+    /// Slot 0 — `[seq_capacity, hidden_size]` F32.
+    slot0: MlxBuffer,
+    /// Slot 1 — `[seq_capacity, hidden_size]` F32.
+    slot1: MlxBuffer,
+    /// The `seq_capacity` value the ring was allocated for.
+    pub seq_capacity: u32,
+    /// The `hidden_size` the ring was allocated for.
+    pub hidden_size: u32,
+}
+
+impl MoeFfnOutputRingBuffer {
+    /// Allocate both `[seq_capacity, hidden_size]` F32 slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if any dim is zero or any underlying
+    /// `device.alloc_buffer` fails.
+    pub fn new(device: &MlxDevice, seq_capacity: u32, hidden_size: u32) -> Result<Self> {
+        if seq_capacity == 0 || hidden_size == 0 {
+            return Err(anyhow!(
+                "MoeFfnOutputRingBuffer::new: zero dim seq_capacity={} hidden_size={}",
+                seq_capacity,
+                hidden_size,
+            ));
+        }
+        let bytes = (seq_capacity as usize) * (hidden_size as usize) * 4;
+        let shape = vec![seq_capacity as usize, hidden_size as usize];
+        let slot0 = device
+            .alloc_buffer(bytes, DType::F32, shape.clone())
+            .map_err(|e| anyhow!("MoeFfnOutputRingBuffer alloc slot0: {e}"))?;
+        let slot1 = device
+            .alloc_buffer(bytes, DType::F32, shape)
+            .map_err(|e| anyhow!("MoeFfnOutputRingBuffer alloc slot1: {e}"))?;
+        Ok(Self {
+            slot0,
+            slot1,
+            seq_capacity,
+            hidden_size,
+        })
+    }
+
+    /// Validate that a per-layer call's shape fits inside the ring's
+    /// capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `seq_len > self.seq_capacity` or
+    /// `hidden_size != self.hidden_size`.
+    pub fn validate_fits(&self, seq_len: u32, hidden_size: u32) -> Result<()> {
+        if seq_len > self.seq_capacity {
+            return Err(anyhow!(
+                "MoeFfnOutputRingBuffer::validate_fits: seq_len {} exceeds capacity {}",
+                seq_len,
+                self.seq_capacity,
+            ));
+        }
+        if hidden_size != self.hidden_size {
+            return Err(anyhow!(
+                "MoeFfnOutputRingBuffer::validate_fits: hidden_size {} != ring {}",
+                hidden_size,
+                self.hidden_size,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Mutable handle to the slot for `layer_idx`.  Pass to
+    /// `dispatch_moe_weighted_reduce` as the `out_buf` destination.
+    pub fn slot_mut(&mut self, layer_idx: u32) -> &mut MlxBuffer {
+        if layer_idx % 2 == 0 {
+            &mut self.slot0
+        } else {
+            &mut self.slot1
+        }
+    }
+
+    /// `Arc`-cloned handle to the slot for `layer_idx`.  Same usage as
+    /// [`DenseFfnOutputRingBuffer::slot_clone`].
+    pub fn slot_clone(&self, layer_idx: u32) -> MlxBuffer {
+        if layer_idx % 2 == 0 {
+            self.slot0.clone()
+        } else {
+            self.slot1.clone()
+        }
     }
 }
 
@@ -424,10 +890,15 @@ mod tests {
         assert_eq!(arena.intermediate_size, m);
 
         let n_h_bytes = (seq as usize) * (m as usize) * 4;
+        let n_out_bytes = (seq as usize) * (h as usize) * 4;
         assert_eq!(arena.gate_buf.byte_len(), n_h_bytes, "gate_buf byte_len");
         assert_eq!(arena.up_buf.byte_len(), n_h_bytes, "up_buf byte_len");
         assert_eq!(arena.hidden_buf.byte_len(), n_h_bytes, "hidden_buf byte_len");
         assert_eq!(arena.silu_params_buf.byte_len(), 4, "silu_params byte_len");
+        // iter92: down_out_buf scratch (final-output sister; ring slot is the
+        // FINAL final-output, but down_out_buf is intermediate when residual
+        // is folded).
+        assert_eq!(arena.down_out_buf.byte_len(), n_out_bytes, "down_out_buf byte_len");
     }
 
     /// Smaller shape sanity-check.
@@ -557,14 +1028,15 @@ mod tests {
                 return;
             }
         };
-        let (seq, h, topk, m_moe, m_sh) = (4096u32, 5120u32, 8u32, 512u32, 512u32);
-        let arena = MoeFfnArena::new(&device, seq, h, topk, m_moe, m_sh).expect("moe arena new");
+        let (seq, h, topk, m_moe, m_sh, ne) = (4096u32, 5120u32, 8u32, 512u32, 512u32, 128u32);
+        let arena = MoeFfnArena::new(&device, seq, h, topk, m_moe, m_sh, ne).expect("moe arena new");
 
         assert_eq!(arena.seq_capacity, seq);
         assert_eq!(arena.hidden_size, h);
         assert_eq!(arena.num_experts_per_tok, topk);
         assert_eq!(arena.moe_intermediate_size, m_moe);
         assert_eq!(arena.shared_intermediate_size, m_sh);
+        assert_eq!(arena.num_experts, ne);
 
         let total_rows = (seq as usize) * (topk as usize);
         let gate_all_bytes = total_rows * (m_moe as usize) * 4;
@@ -575,6 +1047,15 @@ mod tests {
         assert_eq!(arena.h_all_buf.byte_len(), gate_all_bytes, "h_all_buf");
         assert_eq!(arena.y_all_buf.byte_len(), y_all_bytes, "y_all_buf");
         assert_eq!(arena.h_s_buf.byte_len(), h_s_bytes, "h_s_buf");
+
+        // ── iter90b H5b — Phase A projection arena slot sizes ──
+        let logits_bytes = (seq as usize) * (ne as usize) * 4;
+        let sh_logit_bytes = (seq as usize) * 4;
+        let a_s_bytes = (seq as usize) * (m_sh as usize) * 4;
+        assert_eq!(arena.logits_buf.byte_len(), logits_bytes, "logits_buf");
+        assert_eq!(arena.sh_logit_buf.byte_len(), sh_logit_bytes, "sh_logit_buf");
+        assert_eq!(arena.a_s_buf.byte_len(), a_s_bytes, "a_s_buf");
+        assert_eq!(arena.b_s_buf.byte_len(), a_s_bytes, "b_s_buf");
     }
 
     /// Smaller MoE shape sanity-check.
@@ -587,8 +1068,9 @@ mod tests {
                 return;
             }
         };
-        let arena = MoeFfnArena::new(&device, 64, 128, 4, 256, 128).expect("moe arena new");
+        let arena = MoeFfnArena::new(&device, 64, 128, 4, 256, 128, 8).expect("moe arena new");
         assert_eq!(arena.seq_capacity, 64);
+        assert_eq!(arena.num_experts, 8);
     }
 
     /// MoE zero-dim rejection.
@@ -601,11 +1083,12 @@ mod tests {
                 return;
             }
         };
-        assert!(MoeFfnArena::new(&device, 0, 128, 4, 256, 128).is_err());
-        assert!(MoeFfnArena::new(&device, 64, 0, 4, 256, 128).is_err());
-        assert!(MoeFfnArena::new(&device, 64, 128, 0, 256, 128).is_err());
-        assert!(MoeFfnArena::new(&device, 64, 128, 4, 0, 128).is_err());
-        assert!(MoeFfnArena::new(&device, 64, 128, 4, 256, 0).is_err());
+        assert!(MoeFfnArena::new(&device, 0, 128, 4, 256, 128, 8).is_err());
+        assert!(MoeFfnArena::new(&device, 64, 0, 4, 256, 128, 8).is_err());
+        assert!(MoeFfnArena::new(&device, 64, 128, 0, 256, 128, 8).is_err());
+        assert!(MoeFfnArena::new(&device, 64, 128, 4, 0, 128, 8).is_err());
+        assert!(MoeFfnArena::new(&device, 64, 128, 4, 256, 0, 8).is_err());
+        assert!(MoeFfnArena::new(&device, 64, 128, 4, 256, 128, 0).is_err());
     }
 
     /// MoE validate_fits exact match returns Ok.
@@ -618,9 +1101,9 @@ mod tests {
                 return;
             }
         };
-        let arena = MoeFfnArena::new(&device, 128, 256, 4, 512, 256).expect("moe arena new");
-        assert!(arena.validate_fits(128, 256, 4, 512, 256).is_ok());
-        assert!(arena.validate_fits(64, 256, 4, 512, 256).is_ok());
+        let arena = MoeFfnArena::new(&device, 128, 256, 4, 512, 256, 16).expect("moe arena new");
+        assert!(arena.validate_fits(128, 256, 4, 512, 256, 16).is_ok());
+        assert!(arena.validate_fits(64, 256, 4, 512, 256, 16).is_ok());
     }
 
     /// MoE validate_fits seq overrun returns Err.
@@ -633,8 +1116,8 @@ mod tests {
                 return;
             }
         };
-        let arena = MoeFfnArena::new(&device, 128, 256, 4, 512, 256).expect("moe arena new");
-        assert!(arena.validate_fits(256, 256, 4, 512, 256).is_err());
+        let arena = MoeFfnArena::new(&device, 128, 256, 4, 512, 256, 16).expect("moe arena new");
+        assert!(arena.validate_fits(256, 256, 4, 512, 256, 16).is_err());
     }
 
     /// MoE validate_fits shape mismatch returns Err.
@@ -647,10 +1130,262 @@ mod tests {
                 return;
             }
         };
-        let arena = MoeFfnArena::new(&device, 128, 256, 4, 512, 256).expect("moe arena new");
-        assert!(arena.validate_fits(128, 128, 4, 512, 256).is_err());
-        assert!(arena.validate_fits(128, 256, 8, 512, 256).is_err());
-        assert!(arena.validate_fits(128, 256, 4, 256, 256).is_err());
-        assert!(arena.validate_fits(128, 256, 4, 512, 128).is_err());
+        let arena = MoeFfnArena::new(&device, 128, 256, 4, 512, 256, 16).expect("moe arena new");
+        assert!(arena.validate_fits(128, 128, 4, 512, 256, 16).is_err());
+        assert!(arena.validate_fits(128, 256, 8, 512, 256, 16).is_err());
+        assert!(arena.validate_fits(128, 256, 4, 256, 256, 16).is_err());
+        assert!(arena.validate_fits(128, 256, 4, 512, 128, 16).is_err());
+        assert!(arena.validate_fits(128, 256, 4, 512, 256, 32).is_err());
+    }
+
+    // ── ADR-019 Phase 2 iter90b H4b — LayerBoundaryArena tests ──
+
+    /// Apex shape: pp4096 × h=5120 (Qwen3.6 27B/35B prefill).
+    #[test]
+    fn test_layer_boundary_arena_new_apex_shape() {
+        let device = match device_or_skip() {
+            Some(d) => d,
+            None => {
+                eprintln!(
+                    "test_layer_boundary_arena_new_apex_shape: skipping — no Metal device"
+                );
+                return;
+            }
+        };
+        let (seq, h) = (4096u32, 5120u32);
+        let arena = LayerBoundaryArena::new(&device, seq, h).expect("new");
+        assert_eq!(arena.seq_capacity, seq);
+        assert_eq!(arena.hidden_size, h);
+        let bytes = (seq as usize) * (h as usize) * 4;
+        assert_eq!(arena.ffn_input_buf.byte_len(), bytes, "ffn_input_buf");
+        assert_eq!(arena.ffn_residual_buf.byte_len(), bytes, "ffn_residual_buf");
+    }
+
+    /// Zero-dim rejection.
+    #[test]
+    fn test_layer_boundary_arena_zero_dim_rejected() {
+        let device = match device_or_skip() {
+            Some(d) => d,
+            None => {
+                eprintln!(
+                    "test_layer_boundary_arena_zero_dim_rejected: skipping — no Metal device"
+                );
+                return;
+            }
+        };
+        assert!(LayerBoundaryArena::new(&device, 0, 128).is_err());
+        assert!(LayerBoundaryArena::new(&device, 128, 0).is_err());
+    }
+
+    /// validate_fits exact-match returns Ok; smaller seq_len OK; overrun Err;
+    /// hidden_size mismatch Err.
+    #[test]
+    fn test_layer_boundary_arena_validate_fits() {
+        let device = match device_or_skip() {
+            Some(d) => d,
+            None => {
+                eprintln!(
+                    "test_layer_boundary_arena_validate_fits: skipping — no Metal device"
+                );
+                return;
+            }
+        };
+        let arena = LayerBoundaryArena::new(&device, 128, 256).expect("new");
+        assert!(arena.validate_fits(128, 256).is_ok());
+        assert!(arena.validate_fits(64, 256).is_ok());
+        assert!(arena.validate_fits(256, 256).is_err()); // overrun
+        assert!(arena.validate_fits(128, 128).is_err()); // shape mismatch
+    }
+
+    /// `MlxBuffer::clone()` preserves the underlying allocation
+    /// (`contents_ptr` is identical) — the per-prefill arena lift
+    /// relies on cheap Arc-clones of the owned buffers being bound
+    /// into per-layer dispatches.  This is the structural property
+    /// iter90b H4b depends on.
+    #[test]
+    fn test_layer_boundary_arena_clone_preserves_pointer() {
+        let device = match device_or_skip() {
+            Some(d) => d,
+            None => {
+                eprintln!(
+                    "test_layer_boundary_arena_clone_preserves_pointer: skipping — no Metal device"
+                );
+                return;
+            }
+        };
+        let arena = LayerBoundaryArena::new(&device, 64, 128).expect("new");
+        let original_ptr = arena.ffn_input_buf.contents_ptr();
+        let cloned = arena.ffn_input_buf.clone();
+        assert_eq!(
+            cloned.contents_ptr(),
+            original_ptr,
+            "MlxBuffer::clone must preserve the underlying Metal allocation pointer \
+             (Arc-based)"
+        );
+        // Drop the clone; arena still holds the original.
+        drop(cloned);
+        assert_eq!(
+            arena.ffn_input_buf.contents_ptr(),
+            original_ptr,
+            "arena buffer pointer unchanged after clone drop"
+        );
+    }
+
+    // ── ADR-019 Phase 2 iter92 — FFN-output ring-buffer tests ──
+
+    /// Apex shape: pp4096 × h=5120.  Verifies both slots allocate to the
+    /// expected byte length and capacity is recorded.
+    #[test]
+    fn test_dense_ring_new_apex_shape() {
+        let device = match device_or_skip() {
+            Some(d) => d,
+            None => {
+                eprintln!("test_dense_ring_new_apex_shape: skipping — no Metal device");
+                return;
+            }
+        };
+        let (seq, h) = (4096u32, 5120u32);
+        let ring = DenseFfnOutputRingBuffer::new(&device, seq, h).expect("new");
+        assert_eq!(ring.seq_capacity, seq);
+        assert_eq!(ring.hidden_size, h);
+        let bytes = (seq as usize) * (h as usize) * 4;
+        assert_eq!(ring.slot0.byte_len(), bytes, "slot0 byte_len");
+        assert_eq!(ring.slot1.byte_len(), bytes, "slot1 byte_len");
+    }
+
+    /// Same for MoE ring.
+    #[test]
+    fn test_moe_ring_new_apex_shape() {
+        let device = match device_or_skip() {
+            Some(d) => d,
+            None => {
+                eprintln!("test_moe_ring_new_apex_shape: skipping — no Metal device");
+                return;
+            }
+        };
+        let (seq, h) = (4096u32, 5120u32);
+        let ring = MoeFfnOutputRingBuffer::new(&device, seq, h).expect("new");
+        assert_eq!(ring.seq_capacity, seq);
+        assert_eq!(ring.hidden_size, h);
+        let bytes = (seq as usize) * (h as usize) * 4;
+        assert_eq!(ring.slot0.byte_len(), bytes, "slot0 byte_len");
+        assert_eq!(ring.slot1.byte_len(), bytes, "slot1 byte_len");
+    }
+
+    /// Zero-dim rejection (both ring types).
+    #[test]
+    fn test_ring_new_zero_dim_rejected() {
+        let device = match device_or_skip() {
+            Some(d) => d,
+            None => {
+                eprintln!("test_ring_new_zero_dim_rejected: skipping — no Metal device");
+                return;
+            }
+        };
+        assert!(DenseFfnOutputRingBuffer::new(&device, 0, 128).is_err());
+        assert!(DenseFfnOutputRingBuffer::new(&device, 128, 0).is_err());
+        assert!(MoeFfnOutputRingBuffer::new(&device, 0, 128).is_err());
+        assert!(MoeFfnOutputRingBuffer::new(&device, 128, 0).is_err());
+    }
+
+    /// validate_fits: exact match Ok; smaller seq Ok; overrun Err; shape
+    /// mismatch Err.
+    #[test]
+    fn test_ring_validate_fits() {
+        let device = match device_or_skip() {
+            Some(d) => d,
+            None => {
+                eprintln!("test_ring_validate_fits: skipping — no Metal device");
+                return;
+            }
+        };
+        let dense = DenseFfnOutputRingBuffer::new(&device, 128, 256).expect("new");
+        assert!(dense.validate_fits(128, 256).is_ok());
+        assert!(dense.validate_fits(64, 256).is_ok());
+        assert!(dense.validate_fits(256, 256).is_err()); // overrun
+        assert!(dense.validate_fits(128, 128).is_err()); // shape mismatch
+
+        let moe = MoeFfnOutputRingBuffer::new(&device, 128, 256).expect("new");
+        assert!(moe.validate_fits(128, 256).is_ok());
+        assert!(moe.validate_fits(256, 256).is_err());
+        assert!(moe.validate_fits(128, 128).is_err());
+    }
+
+    /// `slot_mut` and `slot_clone` rotate by `layer_idx % 2`.  Verifies
+    /// even layers route to slot0 and odd to slot1, AND that
+    /// `slot_clone(N+2)` lands on the SAME underlying allocation as
+    /// `slot_clone(N)` — the structural rotation invariant the iter92 fix
+    /// depends on.
+    #[test]
+    fn test_dense_ring_slot_rotation() {
+        let device = match device_or_skip() {
+            Some(d) => d,
+            None => {
+                eprintln!("test_dense_ring_slot_rotation: skipping — no Metal device");
+                return;
+            }
+        };
+        let mut ring = DenseFfnOutputRingBuffer::new(&device, 64, 128).expect("new");
+        let slot0_ptr = ring.slot_mut(0).contents_ptr();
+        let slot1_ptr = ring.slot_mut(1).contents_ptr();
+        assert_ne!(slot0_ptr, slot1_ptr, "slots must be physically distinct");
+
+        // Layer 2 wraps back to slot0; layer 3 to slot1; etc.
+        assert_eq!(ring.slot_mut(2).contents_ptr(), slot0_ptr, "even rotation");
+        assert_eq!(ring.slot_mut(3).contents_ptr(), slot1_ptr, "odd rotation");
+        assert_eq!(ring.slot_mut(64).contents_ptr(), slot0_ptr, "high layer wrap");
+        assert_eq!(ring.slot_mut(65).contents_ptr(), slot1_ptr, "high layer wrap");
+
+        // slot_clone preserves the same underlying allocation (Arc clone).
+        let clone0 = ring.slot_clone(0);
+        assert_eq!(clone0.contents_ptr(), slot0_ptr, "clone preserves ptr");
+        let clone2 = ring.slot_clone(2);
+        assert_eq!(clone2.contents_ptr(), slot0_ptr, "rotation+clone");
+    }
+
+    /// MoE ring slot rotation — sister test to the Dense one above.
+    #[test]
+    fn test_moe_ring_slot_rotation() {
+        let device = match device_or_skip() {
+            Some(d) => d,
+            None => {
+                eprintln!("test_moe_ring_slot_rotation: skipping — no Metal device");
+                return;
+            }
+        };
+        let mut ring = MoeFfnOutputRingBuffer::new(&device, 64, 128).expect("new");
+        let slot0_ptr = ring.slot_mut(0).contents_ptr();
+        let slot1_ptr = ring.slot_mut(1).contents_ptr();
+        assert_ne!(slot0_ptr, slot1_ptr);
+        assert_eq!(ring.slot_mut(2).contents_ptr(), slot0_ptr);
+        assert_eq!(ring.slot_mut(15).contents_ptr(), slot1_ptr);
+        let clone15 = ring.slot_clone(15);
+        assert_eq!(clone15.contents_ptr(), slot1_ptr);
+    }
+
+    /// `slot_clone` returns an Arc-cloned `MlxBuffer`; dropping the clone
+    /// does NOT invalidate the ring's slot.  This is the lifetime contract
+    /// the iter92 race closure relies on: the ring outlives every per-layer
+    /// hidden hand-off.
+    #[test]
+    fn test_dense_ring_clone_outlives_drop() {
+        let device = match device_or_skip() {
+            Some(d) => d,
+            None => {
+                eprintln!("test_dense_ring_clone_outlives_drop: skipping — no Metal device");
+                return;
+            }
+        };
+        let ring = DenseFfnOutputRingBuffer::new(&device, 64, 128).expect("new");
+        let original_ptr = ring.slot0.contents_ptr();
+        let clone = ring.slot_clone(0);
+        assert_eq!(clone.contents_ptr(), original_ptr);
+        drop(clone);
+        // Ring still holds the original allocation.
+        assert_eq!(
+            ring.slot0.contents_ptr(),
+            original_ptr,
+            "ring slot0 unchanged after clone drop"
+        );
     }
 }

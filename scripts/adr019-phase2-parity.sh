@@ -16,7 +16,7 @@ OUTDIR=/tmp/adr019_phase2_parity
 mkdir -p "$OUTDIR"
 
 PROMPT="Explain transformer neural networks in one short paragraph."
-HF2Q=/opt/hf2q/target/release/hf2q
+HF2Q="${HF2Q:-/opt/hf2q/target/release/hf2q}"
 
 declare -a FIXTURES=(
   "qwen3.6-27b-dwq46:/opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf"

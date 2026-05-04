@@ -100,6 +100,7 @@ use mlx_native::ops::ssm_norm_gate::dispatch_ssm_norm_gate;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::delta_net::DeltaNetLayerWeights;
+use super::encoder_stage::LayerEncoder;
 use super::gpu_full_attn::{download_f32, upload_f32, upload_f32_weight, upload_q4_0_from_f32};
 use crate::debug::INVESTIGATION_ENV;
 
@@ -2520,6 +2521,16 @@ pub fn build_delta_net_layer_with_arena(
     d_v: u32,
     k_width: u32,
     rms_norm_eps: f32,
+    // ADR-019 Phase 2 iter91: borrowed `&mut EncoderSession` for the
+    // multi-stage chain.  `None` at env=0 (per-stage Plain CommandEncoder
+    // shape, byte-identical to pre-iter91).  `Some(sess)` at env=1 — the
+    // session is allocated once in `forward_gpu_impl` and threaded through
+    // every helper that constructs a `LayerEncoder`.  The single internal
+    // `LayerEncoder::from_session_or_plain` site (DN stage_a at line ~2673)
+    // consumes the borrow via `as_deref_mut()`; the terminal
+    // `fence_or_commit("layer.gdn.stage_a")` releases the borrow back to
+    // the caller's `Option`.
+    layer_session: Option<&mut mlx_native::EncoderSession>,
 ) -> Result<MlxBuffer> {
     debug_assert!(
         seq_len > 1,
@@ -2662,11 +2673,28 @@ pub fn build_delta_net_layer_with_arena(
         let _w5b17 = super::wave5b8_profile::Section::start_w5b17(
             super::wave5b8_profile::SectionKind::DnQkvGpuSplit,
         );
-        let mut enc = device
-            .command_encoder()
+        // ADR-019 Phase 2 iter90: the per-stage encoder is now a `LayerEncoder`
+        // (env=0 → Plain(CommandEncoder); env=1 → Sessioned(EncoderSession)).
+        // Dispatch helpers below take `&mut CommandEncoder` and reach it via
+        // `enc.encoder()`. The terminal `layer.gdn.stage_a` commit at the end
+        // of this block routes through `LayerEncoder::fence_or_commit` which
+        // emits `commit_labeled` on Plain (byte-identical to pre-iter90) and
+        // `fence_stage + reset_for_next_stage` on Sessioned.
+        // iter91: thread the optional session borrow into the LayerEncoder
+        // constructor.  Under env=0 this is byte-identical to pre-iter91
+        // (Plain CommandEncoder via device.command_encoder()).  Under env=1
+        // the borrow is consumed for this stage and released at the
+        // terminal `fence_or_commit("layer.gdn.stage_a")` below.
+        //
+        // Note: build_delta_net_layer_with_arena binds `layer_session` by
+        // value at the function signature and shadows it here via a single
+        // `Option::take`-like consumption — there's only one
+        // LayerEncoder::from_session_or_plain site in this function, so we
+        // can move the Option directly without `as_deref_mut`.
+        let mut enc = LayerEncoder::from_session_or_plain(device, layer_session)
             .context("enc gdn stage_a prefill (arena)")?;
         apply_pre_norm_into(
-            &mut enc,
+            enc.encoder(),
             registry,
             device,
             x,
@@ -2677,9 +2705,9 @@ pub fn build_delta_net_layer_with_arena(
             hidden_size,
             rms_norm_eps,
         )?;
-        enc.memory_barrier();
+        enc.encoder().memory_barrier();
         apply_proj_into(
-            &mut enc,
+            enc.encoder(),
             registry,
             device,
             &arena.x_norm_buf,
@@ -2690,7 +2718,7 @@ pub fn build_delta_net_layer_with_arena(
             qkv_channels,
         )?;
         apply_proj_into(
-            &mut enc,
+            enc.encoder(),
             registry,
             device,
             &arena.x_norm_buf,
@@ -2700,9 +2728,9 @@ pub fn build_delta_net_layer_with_arena(
             hidden_size,
             z_channels,
         )?;
-        enc.memory_barrier();
+        enc.encoder().memory_barrier();
         dispatch_ssm_conv(
-            &mut enc,
+            enc.encoder(),
             registry,
             device.metal_device(),
             &arena.qkv_raw_buf,
@@ -2718,7 +2746,7 @@ pub fn build_delta_net_layer_with_arena(
         // ssm_conv's write to qkv_conv_buf and qkv_split's read of it.
         // Replaces the legacy CB-boundary ordering when ops1-3 and
         // qkv_split lived in separate CBs.
-        enc.memory_barrier();
+        enc.encoder().memory_barrier();
         let qkv_split_params = QkvSplitParams {
             seq: seq_len,
             q_sp: q_sp as u32,
@@ -2726,7 +2754,7 @@ pub fn build_delta_net_layer_with_arena(
             v_sp: v_sp as u32,
         };
         dispatch_qkv_split_f32(
-            &mut enc,
+            enc.encoder(),
             registry,
             device.metal_device(),
             &arena.qkv_conv_buf,
@@ -2736,10 +2764,16 @@ pub fn build_delta_net_layer_with_arena(
             &qkv_split_params,
         )
         .map_err(|e| anyhow!("dispatch_qkv_split_f32 (arena): {e}"))?;
-        // Stage-A terminal commit (non-blocking). Replaces the two former
-        // `commit_labeled("layer.gdn.ops1-3")` and
-        // `commit_labeled("layer.gdn.qkv_split")` calls with one.
-        enc.commit_labeled("layer.gdn.stage_a");
+        // ADR-019 Phase 2 iter90 STAGE_FENCE site (`layer.gdn.stage_a`):
+        // env=0 → CommandEncoder::commit_labeled (byte-identical to
+        //   pre-iter90 iter89e2-I shape);
+        // env=1 → EncoderSession::fence_stage + reset_for_next_stage so the
+        //   next stage waits on the MTLSharedEvent rather than the queue's
+        //   FIFO drain. THE primary STAGE_FENCE site on the Qwen3.6 27B-DWQ46
+        //   DN-dominated path (≈30 DN layers per chunk-engaged pp4096
+        //   prefill).
+        enc.fence_or_commit("layer.gdn.stage_a")
+            .context("fence/commit DN stage_a (arena)")?;
     }
     let _ = (k_sp, q_sp, v_sp); // shape sanity; locals used above
 
@@ -4945,6 +4979,9 @@ mod tests {
             shape.d_v,
             shape.conv_kernel,
             shape.rms_norm_eps,
+            // iter91: synthetic test exercises the per-stage Plain
+            // CommandEncoder shape (env=0 equivalent) — pass None.
+            None,
         )
         .expect("production consolidated Stage-A path");
         // Flush before download (mirrors pattern at gpu_state_propagation_*).

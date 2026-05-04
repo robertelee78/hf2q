@@ -570,6 +570,74 @@ fn proj_pooled(
     Ok(dst)
 }
 
+/// ADR-019 Phase 2 iter90b H5b — arena-anchored variant of [`proj_pooled`].
+///
+/// Writes the projection into a CALLER-PROVIDED `dst: &mut MlxBuffer`
+/// instead of allocating from the thread-local decode pool.  The caller
+/// is expected to pass an arena-anchored buffer (e.g.
+/// `MoeFfnArena::logits_buf`) that outlives the entire prefill.  This
+/// eliminates the helper-local `MlxBuffer` lifetime that Codex finding
+/// #2 flagged on iter90.
+///
+/// # Production-only — BF16 weight required
+///
+/// Unlike [`proj_pooled`], this helper does NOT include the BF16 cast
+/// branch.  The apex production path pre-casts MoE projection weights
+/// to BF16 at model load (see `MoeFfnWeightsGpuQ::from_cpu`
+/// `gpu_ffn.rs:309-327` — `upload_bf16_from_f32`), so the cast branch
+/// in `proj_pooled` is decorative for production.  Test fixtures that
+/// require F32 weights should keep using `proj_pooled`.  The bf16
+/// requirement is asserted in debug; release just propagates the
+/// downstream `dense_matmul_bf16_f32_tensor` error if the weight dtype
+/// is wrong.
+///
+/// # Caller contract
+///
+/// `dst` must be:
+///   - DType `F32`
+///   - byte_len ≥ `seq_len * out_features * 4`
+///   - shape compatible with `[seq_len, out_features]`
+/// The arena allocation is the canonical source for these constraints.
+#[allow(clippy::too_many_arguments)]
+fn proj_into(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    dst: &mut MlxBuffer,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<()> {
+    debug_assert_eq!(
+        weight.dtype(),
+        DType::BF16,
+        "proj_into: production weight must be BF16 (preacast at MoE load); \
+         got {:?}",
+        weight.dtype()
+    );
+
+    let params = DenseMmBf16F32Params {
+        m: seq_len,
+        n: out_features,
+        k: in_features,
+        src0_batch: 1,
+        src1_batch: 1,
+    };
+
+    if seq_len == 1 {
+        dense_gemv_bf16_f32(encoder, registry, device, weight, input, dst, &params)
+            .context("dense_gemv_bf16_f32 proj_into M=1")?;
+    } else {
+        dense_matmul_bf16_f32_tensor(
+            encoder, registry, device, weight, input, dst, &params,
+        )
+        .context("dense_matmul_bf16_f32_tensor proj_into")?;
+    }
+    Ok(())
+}
+
 // ================================================================
 // CPU SiLU helper for legacy parity-only paths
 // ================================================================
@@ -1133,14 +1201,23 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
 /// * `arena` — caller-owned scratch arena. MUST be sized for the actual
 ///   prefill `(seq_len, hidden_size, intermediate_size)`. The function
 ///   asserts this via `validate_fits` and returns `Err` on mismatch.
+/// * `out_slot` — caller-owned [`super::DenseFfnOutputRingBuffer`] slot
+///   for THIS layer (selected by `layer_idx % 2`).  The function dispatches
+///   the FINAL output (down_out when no residual; sum after residual fold
+///   when present) directly INTO this slot.  Returns `out_slot.clone()`
+///   (Arc-cloned MlxBuffer) so the caller can assign it to
+///   `hidden = ffn_out` while the ring retains the underlying allocation.
+///   See [`super::DenseFfnOutputRingBuffer`] for the lifetime contract.
 ///
-/// # Lifetime contract
+/// # Lifetime contract (iter92 update)
 ///
-/// Same as the pooled variant for the FINAL output buffer (`down_out` /
-/// `sum_buf`): device-allocated at prefill so it survives the per-layer
-/// pool reset and crosses into the next layer's `hidden`. The four
-/// transient scratches now live in the arena (caller scope), eliminating
-/// the per-layer `pooled_alloc_buffer` calls entirely.
+/// The FINAL output now lives in the ring buffer (caller-owned, prefill
+/// lifetime) instead of being `device.alloc_buffer`'d per-layer.  This
+/// closes the iter91 `MLX_UNRETAINED_REFS=1` race: a per-layer
+/// `device.alloc_buffer` would drop on `hidden = ffn_out` reassignment
+/// at the next layer's iteration, firing `removeAllocation:` while the
+/// PREVIOUS layer's CB was still in flight; the ring's persistent ARC
+/// retain prevents the drop.
 #[allow(clippy::too_many_arguments)]
 pub fn build_dense_ffn_layer_gpu_q_into_with_arena(
     enc: &mut mlx_native::CommandEncoder,
@@ -1150,6 +1227,7 @@ pub fn build_dense_ffn_layer_gpu_q_into_with_arena(
     weights: &DenseFfnWeightsGpuQ,
     add_residual: Option<&MlxBuffer>,
     arena: &mut super::DenseFfnArena,
+    out_slot: &mut MlxBuffer,
 ) -> Result<MlxBuffer> {
     let h = weights.hidden_size;
     let m = weights.intermediate_size;
@@ -1171,21 +1249,20 @@ pub fn build_dense_ffn_layer_gpu_q_into_with_arena(
     // `ensure_gpu_cache_primed`, before the per-layer loop) when seq_len > 1
     // AND the model has at least one Dense FFN layer.
     //
-    // We still record the (now near-zero) `FfnAllocScratch` bucket so the
+    // ADR-019 Phase 2 iter92: FINAL output (down_out / sum) is now also
+    // arena-anchored, in the caller-owned `out_slot` (a slot of
+    // [`super::DenseFfnOutputRingBuffer`]).  The down_out_buf intermediate
+    // (when residual is folded) lives in `arena.down_out_buf` (same
+    // arena).  Zero `device.alloc_buffer` calls remain in the per-layer
+    // hot path — closing the Codex finding #2 race surface for the dense
+    // path.
+    //
+    // We still record the (now zero) `FfnAllocScratch` bucket so the
     // W-5b.8 profile can confirm the savings on the same metric the prior
     // closure attempts inspected.
     let _w5b_ffn_alloc = super::wave5b8_profile::Section::start(
         super::wave5b8_profile::SectionKind::FfnAllocScratch,
     );
-
-    // FINAL OUTPUT (down_out) at prefill MUST be `device.alloc_buffer`'d so it
-    // survives the per-layer arena reset and can become the next layer's
-    // `hidden`.  Same lifetime constraint as the pooled variant — see
-    // `build_dense_ffn_layer_gpu_q_into_pooled` lines 958-978 for the
-    // canonical doc-comment.
-    let mut down_out = device
-        .alloc_buffer(n_out * 4, DType::F32, vec![seq_len as usize, h as usize])
-        .map_err(|e| anyhow!("alloc dense_q down_out (device, prefill arena): {e}"))?;
 
     // Write the silu_mul element count to the arena's silu_params buffer.
     arena
@@ -1193,6 +1270,8 @@ pub fn build_dense_ffn_layer_gpu_q_into_with_arena(
         .as_mut_slice::<u32>()
         .map_err(|e| anyhow!("DenseFfnArena silu_params as_mut_slice: {e}"))?[0] = n_h;
     drop(_w5b_ffn_alloc);
+    let _ = n_out; // n_out is now derived from out_slot; preserved for
+                   // stat-noisy logging in case future probes want it.
 
     let gate_up_params = GgmlQuantizedMatmulParams {
         m: seq_len,
@@ -1269,30 +1348,37 @@ pub fn build_dense_ffn_layer_gpu_q_into_with_arena(
     }
 
     // Op 4: out = down_proj(hidden).
+    //
+    // iter92: when residual is folded, write `down_out` into the arena's
+    // dedicated `down_out_buf` scratch (an intermediate that gets fed into
+    // the elementwise_add below).  When NO residual, write directly into
+    // the caller-owned ring slot `out_slot` — that buffer becomes the next
+    // layer's `hidden`.
     {
         let _w5b = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::FfnPhaseEDown,
         );
+        let down_dst: &mut MlxBuffer = if add_residual.is_some() {
+            &mut arena.down_out_buf
+        } else {
+            out_slot
+        };
         quantized_matmul_ggml(
             enc,
             registry,
             device,
             &arena.hidden_buf,
             &weights.down_q,
-            &mut down_out,
+            down_dst,
             &down_params,
         )
         .context("dense_q down proj (arena)")?;
     }
 
-    // Op 5 (optional): out += residual — folded to save 1 commit per dense layer.
-    let result = if let Some(res) = add_residual {
-        // Same lifetime constraint as down_out at prefill — must be
-        // `device.alloc_buffer` to survive per-layer reset.
-        let sum_buf = device
-            .alloc_buffer(n_out * 4, DType::F32, vec![n_out])
-            .map_err(|e| anyhow!("alloc dense_q residual sum (device, prefill arena): {e}"))?;
-        // Barrier: elementwise_add reads down_out written by Op 4.
+    // Op 5 (optional): out_slot = down_out_buf + residual — folded to save
+    // 1 commit per dense layer.
+    if let Some(res) = add_residual {
+        // Barrier: elementwise_add reads down_out_buf written by Op 4.
         {
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnBarrierEF,
@@ -1307,20 +1393,17 @@ pub fn build_dense_ffn_layer_gpu_q_into_with_arena(
                 enc,
                 registry,
                 device.metal_device(),
-                &down_out,
+                &arena.down_out_buf,
                 res,
-                &sum_buf,
+                out_slot,
                 n_out,
                 DType::F32,
             )
             .context("dense_q residual add (arena)")?;
         }
-        sum_buf
-    } else {
-        down_out
-    };
+    }
 
-    Ok(result)
+    Ok(out_slot.clone())
 }
 
 /// Prefill-safe variant of [`build_dense_ffn_layer_gpu_q_into`]: uses
@@ -2574,6 +2657,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
     shape: MoeFfnShape,
     add_residual: Option<&MlxBuffer>,
     arena: &mut super::MoeFfnArena,
+    out_slot: &mut MlxBuffer,
 ) -> Result<MlxBuffer> {
     let h = shape.hidden_size as usize;
     let _ne = shape.num_experts as usize;
@@ -2595,6 +2679,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             shape.num_experts_per_tok,
             m_moe32,
             m_sh32,
+            ne32,
         )
         .context("MoeFfnArena shape mismatch")?;
 
@@ -2603,14 +2688,15 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
         super::wave5b8_profile::SectionKind::FfnAllocScratch,
     );
 
-    // Per-layer FINAL OUTPUT must be device-allocated at prefill so it
-    // survives the per-layer pool reset and crosses into the next layer's
-    // `hidden`.  See gpu_ffn.rs:2165-2196 (iter40 fix) for the canonical
-    // doc-comment on this lifetime contract.
-    let out_bytes = seq * h * 4;
-    let mut out_buf = device
-        .alloc_buffer(out_bytes, DType::F32, vec![seq, h])
-        .map_err(|e| anyhow!("alloc moe output (device, prefill arena): {e}"))?;
+    // ADR-019 Phase 2 iter92: FINAL output now lives in the caller-owned
+    // ring slot (`out_slot`).  The previous device.alloc_buffer per-layer
+    // pattern triggered the iter91 `MLX_UNRETAINED_REFS=1` race when the
+    // next-layer `hidden = ffn_out` reassignment dropped the prior layer's
+    // output buffer ARC while its CB was still in flight.  The ring's
+    // persistent ARC retain prevents the drop.  See
+    // [`super::MoeFfnOutputRingBuffer`] for the lifetime contract.
+    let _ = h;
+    let _ = topk;
 
     // silu params writes — done once per layer, but they share with the
     // arena's pre-allocated buffer.  Same `n_h_all` value every layer at
@@ -2637,59 +2723,63 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
 
     {
         // ---- Phase A: router + shared expert projections (concurrent) ----
-        let (logits_buf, sh_logit_buf, a_s_buf, b_s_buf) = {
+        //
+        // ADR-019 Phase 2 iter90b H5b — projections write directly into the
+        // arena-owned `logits_buf` / `sh_logit_buf` / `a_s_buf` / `b_s_buf`
+        // (lifted from helper-local pool allocs to close Codex finding #2).
+        // Each call takes `&mut arena.<field>` exclusively for its own
+        // dispatch; the borrows are sequential so the borrow checker is
+        // happy.  Downstream Phase B/C/F dispatches then read `&arena.<field>`
+        // — a fresh shared reborrow of the same arena.
+        {
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnPhaseAProj,
             );
-            // proj_pooled allocates from the thread-local decode pool —
-            // these projection outputs flow into Phase B/C/F kernels and
-            // never cross a layer boundary, so the existing pool path is
-            // safe and we leave it untouched (the W-5b.8
-            // `ffn.alloc_scratch` bucket measures the iter72-targeted
-            // scratches above; proj_pooled is measured in
-            // `ffn.phase_a_proj`).
-            let logits_buf = proj_pooled(
+            proj_into(
                 enc,
                 registry,
                 device,
                 x,
                 &weights.router,
+                &mut arena.logits_buf,
                 seq_len,
                 h32,
                 ne32,
             )?;
-            let sh_logit_buf = proj_pooled(
+            proj_into(
                 enc,
                 registry,
                 device,
                 x,
                 &weights.shared_gate_inp,
+                &mut arena.sh_logit_buf,
                 seq_len,
                 h32,
                 1,
             )?;
-            let a_s_buf = proj_pooled(
+            proj_into(
                 enc,
                 registry,
                 device,
                 x,
                 &weights.shared_gate,
+                &mut arena.a_s_buf,
                 seq_len,
                 h32,
                 m_sh32,
             )?;
-            let b_s_buf = proj_pooled(
+            proj_into(
                 enc,
                 registry,
                 device,
                 x,
                 &weights.shared_up,
+                &mut arena.b_s_buf,
                 seq_len,
                 h32,
                 m_sh32,
             )?;
-            (logits_buf, sh_logit_buf, a_s_buf, b_s_buf)
-        };
+        }
 
         // Barrier A→B.
         {
@@ -2708,7 +2798,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                 enc,
                 registry,
                 device,
-                &logits_buf,
+                &arena.logits_buf,
                 &arena.ids_buf,
                 &arena.weights_buf,
                 seq_len,
@@ -2720,8 +2810,8 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                 enc,
                 registry,
                 device.metal_device(),
-                &a_s_buf,
-                &b_s_buf,
+                &arena.a_s_buf,
+                &arena.b_s_buf,
                 &arena.h_s_buf,
                 &arena.silu_sh_params_buf,
                 n_h_s,
@@ -2896,10 +2986,10 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                 device,
                 &arena.weights_buf,
                 &arena.y_all_buf,
-                &sh_logit_buf,
+                &arena.sh_logit_buf,
                 &y_s_buf,
                 residual_ref,
-                &mut out_buf,
+                out_slot,
                 seq_len,
                 shape.num_experts_per_tok,
                 h32,
@@ -2909,7 +2999,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
         }
     }
 
-    Ok(out_buf)
+    Ok(out_slot.clone())
 }
 
 // ================================================================
