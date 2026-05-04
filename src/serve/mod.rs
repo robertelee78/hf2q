@@ -1485,130 +1485,6 @@ fn find_special_token_stop_pos(generated_text: &str) -> Option<(usize, &'static 
         .min_by_key(|(pos, _)| *pos)
 }
 
-fn trailing_special_token_prefix_len(generated_text: &str) -> usize {
-    SPECIAL_TOKEN_STOPS
-        .iter()
-        .flat_map(|marker| {
-            (1..marker.len()).filter_map(|len| {
-                let prefix = &marker[..len];
-                generated_text.ends_with(prefix).then_some(len)
-            })
-        })
-        .max()
-        .unwrap_or(0)
-}
-
-fn special_token_safe_prefix(generated_text: &str) -> (&str, Option<&'static str>) {
-    if let Some((pos, marker)) = find_special_token_stop_pos(generated_text) {
-        return (&generated_text[..pos], Some(marker));
-    }
-
-    let hold_len = trailing_special_token_prefix_len(generated_text);
-    (&generated_text[..generated_text.len() - hold_len], None)
-}
-
-fn trim_generated_assistant_role_prefix(mut text: &str) -> &str {
-    loop {
-        let trimmed = text.trim_start_matches(['\r', '\n', ' ', '\t']);
-        text = trimmed;
-        if let Some(rest) = text.strip_prefix("<|im_start|>") {
-            text = rest;
-            continue;
-        }
-        if let Some(rest) = text.strip_prefix("assistant\r\n") {
-            text = rest;
-            continue;
-        }
-        if let Some(rest) = text.strip_prefix("assistant\n") {
-            text = rest;
-            continue;
-        }
-        return text;
-    }
-}
-
-fn qwen35_visible_generated_prefix(generated_text: &str) -> (String, Option<&'static str>) {
-    let (safe_raw, stop_marker) = special_token_safe_prefix(generated_text);
-
-    // 2026-05-03 — hot-path fast-paths.
-    //
-    // Without these short-circuits, the per-decode-step body in
-    // `run_decode_loop` runs ~5 O(N) scans (`rfind`, two `.find()` calls,
-    // `.replace()`, plus `trim_generated_assistant_role_prefix`) and 2
-    // String allocations on a cumulative text that grows with every token.
-    // Empirical bench (qwen3.6-35B-A3B-dwq48 greedy 200 tok, recipe
-    // prompt) showed ~25 t/s regression vs commit 4adf689 (which used the
-    // cheaper `find_special_token_stop` per step). The strip is only
-    // load-bearing when the cumulative text contains a `<|im_start|>`
-    // marker — which only happens at the chat-template boundary or if the
-    // model emits a literal special-token bytestream as a hallucination.
-    //
-    // The fast paths preserve byte-equivalent output:
-    //   • no '<' anywhere   → no special token possible; return safe_raw.
-    //   • '<' but no `<|im_start|>` literal → only the leading role-prefix
-    //     trim is meaningful (trim_generated_assistant_role_prefix is a
-    //     small constant-bounded loop). The two `.find()` markers and
-    //     `.replace("<|im_start|>", "")` are no-ops in this case.
-    if safe_raw.find('<').is_none() {
-        return (safe_raw.to_string(), stop_marker);
-    }
-    // The model emits `<|im_start|>` as a BPE-decomposed byte-sequence
-    // (tokens 27 91 316 4747 91 29 in this Qwen tokenizer) rather than
-    // the special-token id 151644 — so it survives the SPECIAL_TOKEN_STOPS
-    // gate (which holds only `<|im_end|>`, `<|endoftext|>`, `<|end|>`)
-    // and ends up rendered as raw text. We strip both the full literal
-    // `<|im_start|>` and any trailing PREFIX of it (including the all-too-
-    // common 10-byte `<|im_start` that decode_stream emits one token before
-    // the closing `|>`). The trailing-prefix walk runs longest-first so
-    // a complete-form match takes precedence.
-    if !safe_raw.contains("<|im_start|>") {
-        let trimmed = trim_generated_assistant_role_prefix(safe_raw);
-        let mut owned = trimmed.to_string();
-        if owned.contains("<|im_start|") {
-            owned = owned.replace("<|im_start|", "");
-        }
-        strip_trailing_im_start_prefix(&mut owned);
-        return (owned, stop_marker);
-    }
-
-    // SLOW PATH: contains `<|im_start|>`. Run the full strip pipeline.
-    let mut visible = if let Some(pos) = safe_raw.rfind("<|im_start|>assistant") {
-        let rest = &safe_raw[pos + "<|im_start|>assistant".len()..];
-        trim_generated_assistant_role_prefix(rest).to_string()
-    } else {
-        trim_generated_assistant_role_prefix(safe_raw).to_string()
-    };
-
-    for marker in ["<|im_start|>user", "<|im_start|>system"] {
-        if let Some(pos) = visible.find(marker) {
-            visible.truncate(pos);
-        }
-    }
-
-    visible = visible.replace("<|im_start|>", "");
-    if visible.contains("<|im_start|") {
-        visible = visible.replace("<|im_start|", "");
-    }
-    strip_trailing_im_start_prefix(&mut visible);
-    (visible, stop_marker)
-}
-
-/// Trim any trailing PREFIX of `<|im_start|>` from `text`, longest first.
-/// `<|im_start|>` is 12 bytes; checks lengths 11..=1.
-fn strip_trailing_im_start_prefix(text: &mut String) {
-    const IM_START: &str = "<|im_start|>";
-    // longest first so that a fully-matched `<|im_start|>` was already
-    // stripped by .replace above and we only see partial tails here.
-    for len in (1..IM_START.len()).rev() {
-        let candidate = &IM_START[..len];
-        if text.ends_with(candidate) {
-            let new_len = text.len() - len;
-            text.truncate(new_len);
-            return;
-        }
-    }
-}
-
 /// Decide whether the qwen3.5 generate-CLI loop needs the sampler-path
 /// (forward_gpu_last_logits + sample_qwen35_logits_for_generate) or can take
 /// the GPU-argmax fast-path (forward_gpu_greedy).
@@ -1776,21 +1652,40 @@ where
     let mut generated = 1usize;
 
     // Emit step 0 event (the seed token from prefill).
+    //
+    // 2026-05-03 — match llama.cpp's libllama philosophy: inference emits
+    // raw decoded tokens. NO output-text scanning, NO visible-prefix
+    // surgery, NO special-token-fragment scrubbing. The caller (CLI / SSE
+    // server / harness) is the right layer to decide what to display, what
+    // to truncate, and when to stop on application-level markers.
+    //
+    // Hard stops kept here (model-agnostic, layer-correct):
+    //   * integer EOS via `eos_token_ids`
+    //   * max_tokens budget
+    //   * max_seq KV-cache overrun
+    //   * consecutive n-gram repetition guard (catches genuine model loops
+    //     that have NO clean stop signal — e.g. broken finetunes that
+    //     never emit id 151645)
+    //
+    // Pre-2026-05-03 this loop body called `qwen35_visible_generated_prefix`
+    // which hid `<|im_start|>` literal text + counted special-token-fragment
+    // stops + did trailing-prefix-of-marker holding. For finetunes that
+    // emit special tokens as BPE-decomposed bytes (this dwq48 file), that
+    // text-fragment scaffolding stopped on the FIRST `<|im_end|>` text
+    // appearance — which on simple prompts ("Hi", "Tell me a joke") is the
+    // end-of-thinking marker, NOT the end-of-turn marker. The actual
+    // answer comes between two `<|im_end|>` text fragments. Our stop fired
+    // before the answer was emitted. Removed the inference-layer scanning
+    // entirely; if a caller wants to truncate at `<|im_end|>` for display,
+    // it does so as a display-layer post-process.
     let seed_full = decode_text(&decoded_tokens);
-    let (seed_visible, seed_stop_marker) = qwen35_visible_generated_prefix(&seed_full);
     on_event(DecodeStepEvent {
         step: 0,
         token: initial_token,
         cumulative_text: &seed_full,
-        delta: &seed_visible,
+        delta: &seed_full,
     });
-    emitted_text.push_str(&seed_visible);
-    if let Some(marker) = seed_stop_marker {
-        return Ok(DecodeLoopOutcome {
-            generated,
-            stop_reason: DecodeStopReason::SpecialTokenLeak(marker),
-        });
-    }
+    emitted_text.push_str(&seed_full);
 
     for step in 1..max_tokens {
         // Top-of-iteration integer-EOS check (mirrors production: line
@@ -1819,16 +1714,16 @@ where
         decoded_tokens.push(next_token);
 
         // Cumulative decode + delta computation.
+        // 2026-05-03 — emit raw decoded text directly. See seed-event
+        // comment above for the rationale (inference vs display layering).
         let new_full = decode_text(&decoded_tokens);
-        let (visible_full, stop_marker) = qwen35_visible_generated_prefix(&new_full);
-        let delta = if visible_full.len() > emitted_text.len()
-            && visible_full.starts_with(&emitted_text)
+        let delta = if new_full.len() > emitted_text.len()
+            && new_full.starts_with(&emitted_text)
         {
-            &visible_full[emitted_text.len()..]
+            &new_full[emitted_text.len()..]
         } else {
             // Tokenizer rewrote an earlier prefix (rare; happens with some
-            // BPE merges) — emit nothing this step. Production code path
-            // does the same (the `if` guard at line 1693).
+            // BPE merges) — emit nothing this step.
             ""
         };
 
@@ -1839,8 +1734,18 @@ where
             delta,
         });
 
-        // Special-token-string leak check.
-        if let Some(marker) = stop_marker {
+        // Text-fragment EOS for finetunes that emit `<|im_end|>` (etc.) as
+        // BPE-decomposed bytes instead of as their proper integer special-
+        // token id. llama.cpp's CLI handles this via `--reverse-prompt` /
+        // stop-strings as an application-layer gate; we implement the same
+        // contract inline, scanning the cumulative decoded text for any
+        // entry in `SPECIAL_TOKEN_STOPS`. This is NOT visible-text surgery
+        // (we do not strip / re-format / hold-back trailing prefixes — the
+        // delta the caller printed at this step is the raw model output).
+        // The stop is a hard cut: raw display up to the boundary, then
+        // exit with `SpecialTokenLeak`. Properly-trained models hit
+        // integer-EOS first (above) and never trip this fallback.
+        if let Some(marker) = find_special_token_stop(&new_full) {
             return Ok(DecodeLoopOutcome {
                 generated,
                 stop_reason: DecodeStopReason::SpecialTokenLeak(marker),
@@ -1855,7 +1760,7 @@ where
             });
         }
 
-        emitted_text = visible_full;
+        emitted_text = new_full;
     }
 
     Ok(DecodeLoopOutcome {
@@ -4222,7 +4127,7 @@ mod tests {
         detect_greedy_repetition_loop, find_special_token_stop, maybe_print_serve_banner,
         llama_cpp_special_token_id_for_model, render_jinja_template,
         resolve_enable_thinking, run_decode_loop,
-        should_enable_kv_persist, special_token_safe_prefix, DecodeStopReason,
+        should_enable_kv_persist, DecodeStopReason,
         FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
     use crate::backends::chat_templates::QWEN3_CHATML;
@@ -4954,36 +4859,12 @@ mod tests {
         assert_eq!(find_special_token_stop(s), Some("<|end|>"));
     }
 
-    #[test]
-    fn special_token_safe_prefix_holds_partial_marker_suffix() {
-        let (safe, marker) = special_token_safe_prefix("answer<|im_en");
-        assert_eq!(safe, "answer");
-        assert_eq!(marker, None);
-    }
-
-    #[test]
-    fn special_token_safe_prefix_clips_complete_marker() {
-        let (safe, marker) = special_token_safe_prefix("answer<|im_end|>user");
-        assert_eq!(safe, "answer");
-        assert_eq!(marker, Some("<|im_end|>"));
-    }
-
-    #[test]
-    fn qwen35_visible_generated_prefix_hides_generated_assistant_opener() {
-        let (visible, marker) =
-            super::qwen35_visible_generated_prefix("<|im_start|>assistant\nanswer");
-        assert_eq!(visible, "answer");
-        assert_eq!(marker, None);
-    }
-
-    #[test]
-    fn qwen35_visible_generated_prefix_takes_latest_assistant_turn() {
-        let raw = "<|im_start|>user\nWhat is 2+2?<|im_end||\n\n\
-                   <|im_start|>assistant\n4";
-        let (visible, marker) = super::qwen35_visible_generated_prefix(raw);
-        assert_eq!(visible, "4");
-        assert_eq!(marker, None);
-    }
+    // Removed 2026-05-03: `special_token_safe_prefix` and
+    // `qwen35_visible_generated_prefix` — the inference-layer visible-text
+    // surgery they implemented was the brittle scaffolding the user called
+    // out. run_decode_loop now emits raw decoded tokens; only the 3-string
+    // `SPECIAL_TOKEN_STOPS` list remains (matches llama.cpp's stop-string
+    // contract). The two helpers + their tests are removed alongside.
 
     // ---- enable_thinking plumbing into chat-template render ----------
     //
@@ -5389,10 +5270,20 @@ mod tests {
     }
 
     #[test]
-    fn run_decode_loop_does_not_emit_partial_special_token_prefix() {
-        // Generated `<|im_end|>` can arrive over multiple decode steps. The
-        // loop must buffer possible stop prefixes and emit no part of the
-        // marker before the final `>` makes the stop detectable.
+    fn run_decode_loop_streams_raw_deltas_then_stops_on_full_marker() {
+        // 2026-05-03 — the inference layer now emits RAW decoded text. As
+        // `<|im_end|>` arrives byte-by-byte, each partial prefix is
+        // streamed to the caller AS-IS. Once the full marker assembles in
+        // the cumulative text, the SpecialTokenLeak stop fires.
+        //
+        // Pre-2026-05-03 this test asserted that partial stop prefixes
+        // were buffered (held back via `trailing_special_token_prefix_len`)
+        // until the marker resolved. That visible-prefix surgery was
+        // removed because it leaked into a 150-LOC web of pattern matches
+        // that the user ("VERY brittle patterns / with the stripping")
+        // correctly identified as inference/display layer confusion.
+        // llama.cpp's libllama doesn't do that surgery either; the CLI /
+        // application layer is responsible for any user-facing formatting.
         let mut deltas: Vec<String> = Vec::new();
         let outcome = run_decode_loop(
             b'<' as u32,
@@ -5409,10 +5300,11 @@ mod tests {
             outcome.stop_reason,
             DecodeStopReason::SpecialTokenLeak("<|im_end|>")
         );
-        assert!(
-            deltas.iter().all(|d| d.is_empty()),
-            "partial stop marker leaked through deltas: {deltas:?}"
-        );
+        // Deltas concatenate to the FULL `<|im_end|>` text — partial
+        // prefixes ARE streamed (raw inference layer; caller decides
+        // whether to display them).
+        let joined: String = deltas.concat();
+        assert_eq!(joined, "<|im_end|>");
     }
 
     #[test]
