@@ -8445,3 +8445,69 @@ Tracked as Task #21 for next iter.
 Decode (the dominant workload for chat usage) is comprehensively faster.
 Prefill is the next gap to close — opens against ADR-015 P21 territory.
 
+
+---
+
+### Session entry — 2026-05-03 (afternoon, eighth iter): prefill gap profile —
+### MoE mm_id matmul is the bottleneck (mlx-native kernel scope)
+
+**Apples-to-apples prefill benchmark (qwen3.6-35B-A3B-dwq48, M5 Max Metal):**
+
+| Length | hf2q   | llama-bench pp | Delta            |
+| ------ | ------ | -------------- | ---------------- |
+| 100    | 1223   | 1554.06        | hf2q -331 (-21%) |
+| 232    | 1922   | 2461.12        | hf2q -539 (-22%) |
+| 500    | ~2078  | 3251.24        | hf2q est -1173 (-36%) |
+| 1000   | (n/a)  | 3206.82        | (likely similar gap) |
+
+**W5B8 profile breakdown at pp232:**
+
+| Section                  | n   | sum_ms  | mean_ms |
+| ------------------------ | --- | ------- | ------- |
+| layer.ffn_dispatch       | 40  | **84.7** | 2.116  |
+| layer.full_total         | 10  | 76.0    | 7.601   |
+| layer.linear_total       | 30  | 25.2    | 0.841   |
+| layer.post_attn_fused_norm | 40 | 6.9    | 0.173   |
+| (other)                  | —   | ~7      | —       |
+| **prefill total**        | —   | **127** | —       |
+
+FFN dispatch is **67% of prefill wall-time** (84.7 / 127 ms). Within FFN
+the per-phase tracked breakdown only accounts for ~15 ms; the remaining
+~70 ms is the MoE matmul (mul_mm_id) GPU kernel cost itself.
+
+**Already on the SOTA path within mlx-native.**
+
+Tested via `HF2Q_DISABLE_TENSOR_MM_ID=1` A/B:
+
+  Tensor variant (default):     1922 t/s pp232
+  Simdgroup variant (env-off):  1332 t/s pp232  (-31%)
+
+So `kernel_mul_mm_id_q4_K_tensor_f32` (M3+ tensor-API mm_id port) is
+already the fastest variant in mlx-native, and we're using it. The
+remaining 22% gap vs llama.cpp is in the kernel implementation itself
+— llama.cpp's simdgroup MMA mm_id for K-quants is faster than our
+tensor-API mm_id.
+
+**Future optimization candidates (mlx-native scope, out of one-iter scope):**
+
+1. **mm_id MMA tile/cycle tuning.** Profile the `kernel_mul_mm_id_q4_K_tensor_f32`
+   shader against llama.cpp's `kernel_mul_mm_id_q4_K_f32` simdgroup MMA
+   path; figure out why tensor-API is suboptimal for K-quants here.
+
+2. **Fused gate+up matmul.** The MoE FFN path currently issues two
+   separate `quantized_matmul_id_ggml_pooled` calls per layer (gate, up).
+   `mlx-native/src/shaders/moe_dispatch.metal` already ships a
+   `moe_swiglu_fused` kernel that operates on a stacked [gate, up]
+   buffer. Refactoring the FFN dispatch to use a single fused matmul
+   would halve the mm_id call count (3 → 2 per layer) and use the
+   existing fused SwiGLU kernel.
+
+3. **Concatenated weight tensors at load.** Stack the per-expert gate
+   and up weight tensors at GGUF-load time so the fused gate_up matmul
+   just sees one wider weight matrix. Saves runtime alloc/copy of the
+   stacked buffer.
+
+Tracked as Task #21 for next iteration. Prefill is no longer the dominant
+workload for chat-style usage (decode hits 130 tok/s sustained), but
+closing this gap is on the mission exit-criteria roadmap.
+
