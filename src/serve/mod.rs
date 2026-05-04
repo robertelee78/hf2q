@@ -1795,6 +1795,102 @@ where
     })
 }
 
+/// Streaming display-layer chat-template tag scrubber for the qwen3.5/3.6
+/// CLI generate path.
+///
+/// Inference (`run_decode_loop`) emits raw decoded tokens — including
+/// any literal `<|im_end|>` / `<|im_start|>{role}` chat-template tags
+/// that the model produces as BPE-decomposed bytes (notably on the
+/// abliterix-EGA-abliterated dwq48 finetune which doesn't emit these
+/// as their proper integer special-token ids).  This struct sits at
+/// the **display** layer between `run_decode_loop`'s on_event and
+/// the user's terminal, suppressing those tags from the streamed
+/// print without otherwise transforming the model's output.
+///
+/// Implementation: each delta is appended to a small rolling buffer.
+/// We print the prefix of the buffer that CANNOT be the start of any
+/// known tag (i.e. holds back the trailing N bytes if they could be
+/// a prefix of `<|im_start|>system` etc.).  When the held-back bytes
+/// resolve into a complete tag, we drop them; otherwise (the model
+/// just emitted a `<` mid-text) we eventually print them out.
+struct DisplayScrubber {
+    buf: String,
+    emitted: usize,
+}
+
+const SCRUB_TAGS: &[&str] = &[
+    "<|im_end|>",
+    "<|im_start|>assistant",
+    "<|im_start|>user",
+    "<|im_start|>system",
+    "<|endoftext|>",
+    "<|end|>",
+];
+
+impl DisplayScrubber {
+    fn new() -> Self {
+        Self { buf: String::new(), emitted: 0 }
+    }
+
+    /// Append `delta`, return the bytes safe to print right now (with
+    /// known tags scrubbed). Called once per decode step.
+    fn push(&mut self, delta: &str) -> String {
+        if delta.is_empty() {
+            return String::new();
+        }
+        self.buf.push_str(delta);
+        // Determine the largest position N <= buf.len() such that
+        // buf[N..] is NOT a non-trivial prefix of any tag in SCRUB_TAGS.
+        // Bytes [emitted..N] are safe to print (after scrubbing complete
+        // tags); bytes [N..] are held back.
+        let trail_hold = max_trailing_tag_prefix_len(&self.buf);
+        let safe_to = self.buf.len().saturating_sub(trail_hold);
+        if safe_to <= self.emitted {
+            return String::new();
+        }
+        let raw_segment = &self.buf[self.emitted..safe_to];
+        // Strip any complete tags that fall ENTIRELY within this segment.
+        let mut out = raw_segment.to_string();
+        for tag in SCRUB_TAGS {
+            if out.contains(tag) {
+                out = out.replace(tag, "");
+            }
+        }
+        self.emitted = safe_to;
+        out
+    }
+
+    /// Return any final bytes after the last on_event call (held-back
+    /// trailing tag-prefixes that didn't resolve into a complete tag).
+    fn flush(&self) -> String {
+        if self.emitted >= self.buf.len() {
+            return String::new();
+        }
+        let mut out = self.buf[self.emitted..].to_string();
+        for tag in SCRUB_TAGS {
+            if out.contains(tag) {
+                out = out.replace(tag, "");
+            }
+        }
+        out
+    }
+}
+
+/// Length of the longest trailing slice of `text` that is a non-empty
+/// proper prefix of any tag in [`SCRUB_TAGS`]. 0 if none.
+fn max_trailing_tag_prefix_len(text: &str) -> usize {
+    let mut max = 0;
+    for tag in SCRUB_TAGS {
+        for len in 1..tag.len() {
+            let prefix = &tag[..len];
+            if text.ends_with(prefix) && len > max {
+                max = len;
+            }
+        }
+    }
+    max
+}
+
 fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile) -> Result<()> {
     use crate::inference::models::qwen35::io_heads::greedy_argmax_last_token;
     use crate::inference::models::qwen35::kv_cache::HybridKvCache;
@@ -2217,6 +2313,12 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     // 1832-token sampling run (vs 116 tok/s peer). decode_stream + the
     // `cumulative_text.push_str` accumulator reproduces the same
     // `&str` value run_decode_loop expects without the quadratic blowup.
+    // Display-layer chat-template tag scrubber. Inference emits raw
+    // bytes; this filter sits on the streaming-print path and suppresses
+    // literal `<|im_end|>` / `<|im_start|>{role}` tags from the user's
+    // terminal without touching the inference layer.
+    let mut display = DisplayScrubber::new();
+
     let outcome = if sample_logits {
         let mut decode_stream = tokenizer.decode_stream(false);
         let mut cumulative_text = String::new();
@@ -2263,8 +2365,9 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
                 cumulative_text.clone()
             },
             |event| {
-                if !event.delta.is_empty() {
-                    print!("{}", event.delta);
+                let cleaned = display.push(event.delta);
+                if !cleaned.is_empty() {
+                    print!("{}", cleaned);
                     let _ = stdout.flush();
                 }
             },
@@ -2310,13 +2413,24 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
                 cumulative_text.clone()
             },
             |event| {
-                if !event.delta.is_empty() {
-                    print!("{}", event.delta);
+                let cleaned = display.push(event.delta);
+                if !cleaned.is_empty() {
+                    print!("{}", cleaned);
                     let _ = stdout.flush();
                 }
             },
         )?
     };
+
+    // Flush any held-back trailing bytes from the display scrubber. These
+    // are bytes that COULD have been the start of a chat-template tag at
+    // the time on_event was called but never resolved into one before the
+    // loop ended.
+    let trailing = display.flush();
+    if !trailing.is_empty() {
+        print!("{}", trailing);
+        let _ = stdout.flush();
+    }
 
     // Loop-side stop reasons get a one-line tracing emit + (for repetition)
     // a stderr diagnostic, matching the production behavior the loop
