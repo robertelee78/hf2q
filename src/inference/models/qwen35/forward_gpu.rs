@@ -206,6 +206,22 @@ enum OutputHeadMode {
     /// `lm_head` matmul because no logits are needed; the L2-norm step
     /// is owned by the caller (`forward_embed_last`).
     EmbedLast,
+    /// Top-K logits over the last prefill row only (ADR-005 iter-25).
+    ///
+    /// Same upstream pipeline as [`OutputHeadMode::Last`] but the
+    /// output-head step replaces the `download_f32` of the full vocab
+    /// with a GPU `top_k_f32` dispatch, returning only the top-K
+    /// (index, value) pairs (~K*8 bytes vs ~600 KB for the full vocab
+    /// on Qwen3.6's 248K-entry vocab).  Skips the dominant CPU partial
+    /// sort (`select_nth_unstable_by`) in `sampler_pure::sample_token`,
+    /// the bottleneck behind sampling decode 117 t/s vs greedy 130 t/s.
+    ///
+    /// `k` must be in `[1, 128]` (kernel `MAX_K`).  The host-side
+    /// `Vec<f32>` returned by `forward_gpu_impl` is empty for this mode;
+    /// the actual (indices, values) pair is stashed via the
+    /// `topk_out: Option<&mut Option<(Vec<u32>, Vec<f32>)>>` out
+    /// parameter that the caller threads in.
+    TopK { k: u32 },
 }
 
 /// Pre-allocated decode buffers for `forward_gpu_greedy` (seq_len == 1).
@@ -1472,6 +1488,7 @@ impl Qwen35Model {
             OutputHeadMode::All,
             &[],
             None,
+            None,
         )
     }
 
@@ -1495,7 +1512,68 @@ impl Qwen35Model {
             OutputHeadMode::Last,
             &[],
             None,
+            None,
         )
+    }
+
+    /// Top-K variant of [`Self::forward_gpu_last_logits`].
+    ///
+    /// ADR-005 iter-25 — GPU top-K sampling. Same forward pass as
+    /// `forward_gpu_last_logits` (final RMSNorm + Q4 lm_head matmul), but
+    /// the output-head step replaces the host download of all
+    /// `vocab_size` F32 logits (~600 KB / ~250 µs on Qwen3.6's 248K
+    /// vocab) with an in-GPU `top_k_f32` dispatch, returning only the
+    /// top-K (index, value) pairs (~K * 8 bytes).
+    ///
+    /// Used by the sampling decode loop in [`crate::serve::sampler_pure`]
+    /// when the caller's sampling chain is "simple" enough that only the
+    /// top-K logits are needed (no repetition penalty, top_k explicitly
+    /// in `[1, 128]`, temperature > 0). Skips the ~700 µs/step CPU
+    /// `select_nth_unstable_by` partial-sort over the full vocab —
+    /// closes the 13 t/s gap between sampling 117 t/s and greedy
+    /// 130 t/s on qwen3.6-35B-A3B-dwq48.
+    ///
+    /// # Returns
+    ///
+    /// `(top_indices, top_values)`: two parallel `Vec`s of length
+    /// exactly `top_k`. Output order is NOT guaranteed (kernel returns
+    /// unsorted); the sampling caller sorts on the K-element subset.
+    ///
+    /// # Errors
+    ///
+    /// In addition to all errors from `forward_gpu_last_logits`:
+    ///   * `top_k == 0` or `top_k > 128` (kernel `MAX_K`).
+    pub fn forward_gpu_last_topk(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        top_k: u32,
+    ) -> Result<(Vec<u32>, Vec<f32>)> {
+        if top_k == 0 || top_k > 128 {
+            return Err(anyhow!(
+                "forward_gpu_last_topk: top_k={} must be in [1, 128]",
+                top_k
+            ));
+        }
+        let mut topk_slot: Option<(Vec<u32>, Vec<f32>)> = None;
+        let _empty = self.forward_gpu_impl(
+            tokens,
+            positions_flat,
+            kv_cache,
+            None,
+            None,
+            OutputHeadMode::TopK { k: top_k },
+            &[],
+            None,
+            Some(&mut topk_slot),
+        )?;
+        topk_slot.ok_or_else(|| {
+            anyhow!(
+                "forward_gpu_last_topk: top-K out-parameter not populated by \
+                 forward_gpu_impl (internal invariant violation)"
+            )
+        })
     }
 
     /// Soft-token-aware variant of [`Self::forward_gpu_last_logits`].
@@ -1549,6 +1627,7 @@ impl Qwen35Model {
             None,
             OutputHeadMode::Last,
             soft_tokens,
+            None,
             None,
         )
     }
@@ -1608,6 +1687,7 @@ impl Qwen35Model {
             OutputHeadMode::Last,
             soft_tokens,
             deepstack,
+            None,
         )
     }
 
@@ -1653,6 +1733,7 @@ impl Qwen35Model {
             OutputHeadMode::EmbedLast,
             &[],
             None,
+            None,
         )?;
         let h = self.cfg.hidden_size as usize;
         anyhow::ensure!(
@@ -1692,6 +1773,7 @@ impl Qwen35Model {
             Some(&mut hidden_out),
             OutputHeadMode::All,
             &[],
+            None,
             None,
         )?;
         let hidden = hidden_out
@@ -1811,6 +1893,7 @@ impl Qwen35Model {
             OutputHeadMode::All,
             &[],
             None,
+            None,
         )
     }
 
@@ -1824,6 +1907,7 @@ impl Qwen35Model {
         output_head_mode: OutputHeadMode,
         soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
         deepstack: Option<&crate::serve::forward_prefill::DeepstackInjection<'_>>,
+        topk_out: Option<&mut Option<(Vec<u32>, Vec<f32>)>>,
     ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(anyhow!("forward_gpu: tokens must be non-empty"));
@@ -3307,6 +3391,11 @@ impl Qwen35Model {
         // every output-head arm to consume the held encoder, drain it
         // here rather than dropping uncommitted (which would leak a
         // CB and silently re-trip F2 if any pooled scratch is reused).
+        //
+        // ADR-005 iter-25: `TopK` mode is decode-only (seq_len == 1) and
+        // `phase1_fusion_env_eligible` already gates on `seq_len > 1`, so
+        // the held encoder is always None for TopK. The defense below
+        // does not list TopK as an "encoder consumer" for that reason.
         debug_assert!(
             last_layer_held_enc.is_none()
                 || matches!(output_head_mode, OutputHeadMode::Last),
@@ -3357,6 +3446,36 @@ impl Qwen35Model {
                 eps,
             )
             .context("apply_output_norm_only_last (forward_embed_last)")?,
+            // ADR-005 iter-25: GPU top-K sampling path.  Same RMSNorm + Q4
+            // lm_head pipeline as `Last`, but the post-commit logits buffer
+            // is fed into `dispatch_top_k_f32` for an in-GPU partial sort
+            // and only top-K (index, value) pairs come back to host. The
+            // caller must thread a non-`None` `topk_out` to receive the
+            // result; if `topk_out` is `None`, we error rather than
+            // silently dropping the top-K result.
+            OutputHeadMode::TopK { k } => {
+                let pair = apply_output_head_gpu_last_topk(
+                    None, // TopK is seq_len==1; never holds the fused encoder.
+                    &device,
+                    &mut registry,
+                    &hidden,
+                    &output_head,
+                    seq_len,
+                    h,
+                    cfg.vocab_size,
+                    eps,
+                    k,
+                )
+                .context("apply_output_head_gpu_last_topk")?;
+                let slot = topk_out.ok_or_else(|| {
+                    anyhow!(
+                        "forward_gpu_impl: OutputHeadMode::TopK requires a non-None \
+                         topk_out out-parameter to receive (indices, values)"
+                    )
+                })?;
+                *slot = Some(pair);
+                Vec::new()
+            }
         };
         if let Some(t) = t_output_head {
             eprintln!(
