@@ -829,6 +829,169 @@ fn apply_output_head_gpu_last(
     )
 }
 
+/// GPU output-head + top-K — return the top-K (index, value) pairs unsorted.
+///
+/// ADR-005 iter-25 Step 2.  Same RMSNorm + Q4 lm_head pipeline as
+/// [`apply_output_head_gpu_into`], but instead of downloading the full
+/// F32 logits vector (~600 KB / ~250 µs on Qwen3.6's 248K vocab), this
+/// dispatches `mlx_native::ops::top_k::dispatch_top_k_f32` against the
+/// post-commit logits buffer and returns only `top_k * 8` bytes
+/// (`Vec<u32>` indices + `Vec<f32>` values).
+///
+/// The GPU top-K kernel collapses the dominant CPU-side
+/// `select_nth_unstable_by` cost in `sampler_pure::sample_token` (the
+/// O(V) partial-sort over 248K entries that bridges the 13 t/s gap
+/// between greedy 130 t/s and sampling 117 t/s on the OLD dwq48 GGUF).
+///
+/// # Returns
+///
+/// A pair of `(top_indices, top_values)` `Vec`s of length exactly
+/// `top_k`. Output order is NOT guaranteed (the kernel returns unsorted
+/// pairs); callers that need sorted-descending order must sort
+/// themselves on the K-element subset.
+///
+/// # Errors
+///
+/// In addition to all errors from [`apply_output_head_gpu_into_buf`]:
+///   - `top_k == 0` or `top_k > 128` (kernel limit, see
+///     `/opt/mlx-native/src/shaders/top_k.metal`'s `MAX_K`).
+fn apply_output_head_gpu_into_topk(
+    caller_enc: Option<mlx_native::CommandEncoder>,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden: &MlxBuffer,
+    head: &OutputHeadGpu,
+    seq_len: u32,
+    hidden_size: u32,
+    vocab_size: u32,
+    eps: f32,
+    top_k: u32,
+) -> Result<(Vec<u32>, Vec<f32>)> {
+    if top_k == 0 || top_k > 128 {
+        return Err(anyhow!(
+            "apply_output_head_gpu_into_topk: top_k={} must be in [1, 128]",
+            top_k
+        ));
+    }
+
+    // Stage A: produce the full logits buffer on GPU (post-commit; the
+    // terminal commit_and_wait inside the buf helper drains the
+    // RMSNorm + lm_head dispatches and any prior Phase-1-fused last-layer
+    // FFN work that was encoded into the caller-supplied encoder).
+    let logits_buf = apply_output_head_gpu_into_buf(
+        caller_enc,
+        device,
+        registry,
+        hidden,
+        head,
+        seq_len,
+        hidden_size,
+        vocab_size,
+        eps,
+    )?;
+
+    // Stage B: allocate the top-K outputs and params buffer.
+    //
+    // We use `device.alloc_buffer` rather than the decode pool here:
+    //   * Sizes are tiny (top_k * 4 bytes each, and 8 bytes for params).
+    //   * The `Vec` reads below force a CPU-side sync and copy out of
+    //     the buffer immediately after `commit_and_wait`, so there is
+    //     no lifetime concern for the next pool reset.
+    let out_indices = device
+        .alloc_buffer(
+            (top_k as usize) * 4,
+            DType::U32,
+            vec![top_k as usize],
+        )
+        .map_err(|e| anyhow!("alloc top_k out_indices: {e}"))?;
+    let out_values = device
+        .alloc_buffer(
+            (top_k as usize) * 4,
+            DType::F32,
+            vec![top_k as usize],
+        )
+        .map_err(|e| anyhow!("alloc top_k out_values: {e}"))?;
+    let mut params_buf = device
+        .alloc_buffer(8, DType::U32, vec![2usize])
+        .map_err(|e| anyhow!("alloc top_k params: {e}"))?;
+    {
+        let s = params_buf
+            .as_mut_slice::<u32>()
+            .map_err(|e| anyhow!("{e}"))?;
+        s[0] = vocab_size;
+        s[1] = top_k;
+    }
+
+    // Stage C: dispatch top_k_f32 in a fresh encoder and wait.
+    //
+    // A fresh encoder is correct here even though `apply_output_head_gpu_into_buf`
+    // already committed: that commit drained the lm_head matmul write to
+    // `logits_buf`, so the new encoder sees a fully-settled buffer. No
+    // intra-CB barrier needed (the CB boundary IS the barrier).
+    let mut enc = device
+        .command_encoder()
+        .context("enc output_head.top_k")?;
+    mlx_native::ops::top_k::dispatch_top_k_f32(
+        &mut enc,
+        registry,
+        device.metal_device(),
+        &logits_buf,
+        &out_indices,
+        &out_values,
+        &params_buf,
+        vocab_size,
+        top_k,
+    )
+    .context("dispatch_top_k_f32")?;
+    enc.commit_and_wait_labeled("output_head.top_k")
+        .context("commit output_head.top_k")?;
+
+    // Stage D: read the K-element outputs out to host. ~K*8 bytes total.
+    let top_indices = out_indices
+        .as_slice::<u32>()
+        .map_err(|e| anyhow!("read top_k out_indices: {e}"))?
+        .to_vec();
+    let top_values = out_values
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("read top_k out_values: {e}"))?
+        .to_vec();
+    Ok((top_indices, top_values))
+}
+
+/// Top-K equivalent of [`apply_output_head_gpu_last`] — returns the
+/// top-K (index, value) pairs for the LAST prefill row's logits.
+fn apply_output_head_gpu_last_topk(
+    caller_enc: Option<mlx_native::CommandEncoder>,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden: &MlxBuffer,
+    head: &OutputHeadGpu,
+    seq_len: u32,
+    hidden_size: u32,
+    vocab_size: u32,
+    eps: f32,
+    top_k: u32,
+) -> Result<(Vec<u32>, Vec<f32>)> {
+    anyhow::ensure!(
+        seq_len > 0,
+        "apply_output_head_gpu_last_topk: empty sequence"
+    );
+    let byte_offset = ((seq_len as u64 - 1) * hidden_size as u64) * 4;
+    let last_hidden = hidden.slice_view(byte_offset, hidden_size as usize);
+    apply_output_head_gpu_into_topk(
+        caller_enc,
+        device,
+        registry,
+        &last_hidden,
+        head,
+        1,
+        hidden_size,
+        vocab_size,
+        eps,
+        top_k,
+    )
+}
+
 /// Apply ONLY the final RMSNorm to the last token's hidden row, then download
 /// the resulting F32 vector to CPU.
 ///
