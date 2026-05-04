@@ -297,6 +297,38 @@ pub fn generation_events_stream(
                 }
                 GenerationEvent::Error(msg) => {
                     tracing::error!(error = %msg, "Generation error during streaming");
+                    // iter-228a Phase-2c (Codex review of 3811f5d, finding #3
+                    // medium): emit the error message as a content delta
+                    // BEFORE the finish_reason chunk. Pre-Phase-2c the
+                    // streaming path discarded the diagnostic — clients
+                    // only saw a chunk with finish_reason='error' followed
+                    // by [DONE], with no actionable message (e.g. the
+                    // qwen3vl_text_forward_pending sentinel from iter-228a's
+                    // engine seam was effectively invisible). Emitting the
+                    // message as content matches what real OpenAI clients
+                    // surface to users (Continue, OpenWebUI, etc. render
+                    // delta.content even when finish_reason='error').
+                    let message_chunk = ChatCompletionChunk {
+                        id: request_id.clone(),
+                        object: "chat.completion.chunk",
+                        created,
+                        model: model_name.clone(),
+                        system_fingerprint: sfp.clone(),
+                        choices: vec![ChunkChoice {
+                            index: 0,
+                            delta: ChunkDelta {
+                                role: None,
+                                content: Some(msg.clone()),
+                                reasoning_content: None,
+                                tool_calls: None,
+                            },
+                            finish_reason: None,
+                            logprobs: None,
+                        }],
+                        usage: None,
+                    };
+                    yield Ok(Event::default()
+                        .data(serde_json::to_string(&message_chunk).unwrap_or_default()));
                     let error_chunk = ChatCompletionChunk {
                         id: request_id.clone(),
                         object: "chat.completion.chunk",
@@ -552,7 +584,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn error_event_emits_error_finish_reason_then_done() {
+    async fn error_event_emits_error_message_then_finish_reason_then_done() {
         let (tx, rx) = mpsc::channel(4);
         let events = vec![
             GenerationEvent::Delta {
@@ -564,9 +596,25 @@ mod tests {
         let sse = make_sse(rx, SseStreamOptions::default());
         tokio::spawn(spawn_feeder(tx, events));
         let payloads = drain_sse(sse).await;
-        // role, content, error-final, [DONE]
-        assert_eq!(payloads.len(), 4);
-        let err: serde_json::Value = serde_json::from_str(&payloads[2]).unwrap();
+        // iter-228a Phase-2c (Codex finding #3): emission shape is now
+        // role, content, ERROR-MESSAGE-AS-CONTENT, error-final-with-
+        // finish_reason, [DONE] = 5 payloads (was 4 pre-Phase-2c).
+        // Carrying the error message as a content delta lets streaming
+        // clients surface the diagnostic to users instead of dropping
+        // it on the floor.
+        assert_eq!(payloads.len(), 5);
+        let msg_chunk: serde_json::Value = serde_json::from_str(&payloads[2]).unwrap();
+        assert_eq!(
+            msg_chunk["choices"][0]["delta"]["content"], "metal panic",
+            "Phase-2c: error message MUST be emitted as a content delta \
+             before the finish_reason chunk so streaming clients see \
+             the diagnostic"
+        );
+        assert!(
+            msg_chunk["choices"][0]["finish_reason"].is_null(),
+            "message chunk must NOT carry finish_reason (the next chunk does)"
+        );
+        let err: serde_json::Value = serde_json::from_str(&payloads[3]).unwrap();
         assert_eq!(err["choices"][0]["finish_reason"], "error");
         assert_eq!(payloads.last().unwrap(), "[DONE]");
     }

@@ -308,43 +308,162 @@ pub(crate) const FALLBACK_GEMMA4_API_CHAT_TEMPLATE: &str = concat!(
 ///   2. CLI `--chat-template-file FILE`
 ///   3. GGUF `tokenizer.chat_template` metadata
 ///   4. Hardcoded fallback string (last resort)
+/// Detect whether a Jinja chat template supports thinking-mode rendering by
+/// rendering it twice with synthetic test input — once with
+/// `enable_thinking=true`, once with `enable_thinking=false` — and checking
+/// that the enabled render actually opens a reasoning block. A plain byte
+/// difference is insufficient: llama.cpp's template matrix includes Qwen3
+/// templates where `enable_thinking=false` appends an empty `<think></think>`
+/// suppressor, while `enable_thinking=true` leaves the assistant prompt bare.
+/// Those templates branch on the variable but should still default to
+/// thinking off.
+///
+/// **This is the canonical signal** per peer audit
+/// `/tmp/cfa-thinking-detect/peer-detection-report.md`. Mirrors llama.cpp's
+/// `compare_thinking_enabled` at `/opt/llama.cpp/common/chat-diff-analyzer.cpp:319-401`,
+/// surfaced via `common_chat_templates_support_enable_thinking` at
+/// `/opt/llama.cpp/common/chat.cpp:244-257`. The user-facing decision in
+/// llama.cpp lives at `/opt/llama.cpp/tools/server/server-context.cpp:1050`:
+/// `enable_thinking = params_base.enable_reasoning != 0 && template_supports_thinking`.
+///
+/// Returns `false` if either render fails — a malformed template can't be
+/// probed; the caller takes the safe default. The synthetic test input is
+/// a single-character user prompt; no real conversation context is needed
+/// because the thinking-mode branch fires only on `add_generation_prompt`
+/// (always true in our render path), independent of message content.
+///
+/// 2026-05-02 — replaces the prior name-substring heuristic
+/// `gguf_name_suggests_thinking_capable` which the user correctly rejected:
+/// > "Thinking is not determined by having thinking in the model name.
+/// >  Thinking is determined by the model class and what is available
+/// >  in the gguf file."
+fn template_supports_enable_thinking(template_str: &str) -> bool {
+    let render_true = render_jinja_template(template_str, "x", Some(true));
+    let render_false = render_jinja_template(template_str, "x", Some(false));
+    match (render_true, render_false) {
+        (Ok(enabled), Ok(disabled)) => rendered_prompt_opens_thinking(&enabled, &disabled),
+        // Either render failed → can't probe → safe default false. The caller
+        // (`render_chat_template`) will surface the actual render error on
+        // the real render attempt, so we don't lose information here.
+        _ => false,
+    }
+}
+
+fn rendered_prompt_opens_thinking(enabled: &str, disabled: &str) -> bool {
+    let enabled_tail = enabled.trim_end();
+    let disabled_tail = disabled.trim_end();
+
+    if !enabled_tail.ends_with("<think>") {
+        return false;
+    }
+
+    if disabled_tail == enabled_tail {
+        return false;
+    }
+
+    disabled_tail.contains("</think>") || !disabled_tail.ends_with("<think>")
+}
+
+/// Resolve the `enable_thinking` value to pass to the chat-template Jinja
+/// context. Three-state precedence:
+///
+/// 1. **Explicit `--enable-thinking`** → `Some(true)`
+/// 2. **Explicit `--no-thinking`** → `Some(false)`
+/// 3. **Default (neither flag set)** → auto-detect via render-and-diff
+///    (`template_supports_enable_thinking`):
+///    * Template branches on the variable → `Some(true)`
+///    * Template doesn't branch (or no template provided) → `Some(false)`
+///
+/// `template_str` is the resolved chat-template Jinja source. Pass `None`
+/// when there's no Jinja template (e.g. the hardcoded Gemma4 fallback); in
+/// that case the default resolves to `Some(false)` since the fallback path
+/// doesn't go through Jinja at all.
+///
+/// Mirrors llama.cpp's `--reasoning auto` decision at
+/// `/opt/llama.cpp/tools/server/server-context.cpp:1050`. Clap enforces
+/// `--enable-thinking` ⊕ `--no-thinking` mutual exclusion via
+/// `conflicts_with`; the (true, true) input is unreachable in practice
+/// but the function remains total.
+fn resolve_enable_thinking(args: &cli::GenerateArgs, template_str: Option<&str>) -> Option<bool> {
+    if args.enable_thinking {
+        return Some(true);
+    }
+    if args.no_thinking {
+        return Some(false);
+    }
+    let auto = template_str
+        .map(template_supports_enable_thinking)
+        .unwrap_or(false);
+    Some(auto)
+}
+
 fn render_chat_template(
     gguf: &mlx_native::gguf::GgufFile,
     args: &cli::GenerateArgs,
+    tokenizer: Option<&tokenizers::Tokenizer>,
     user_prompt: &str,
 ) -> Result<String> {
-    // Priority 1: CLI --chat-template string
-    if let Some(tmpl) = args.chat_template.as_deref() {
+    // Step 1: resolve the chat template SOURCE in priority order.
+    // Priorities 1-3 are Jinja templates; priority 4 is the hardcoded
+    // string-replace fallback (not Jinja, so it doesn't go through
+    // `render_jinja_template` and `enable_thinking` is irrelevant for it).
+    let template_str: String = if let Some(tmpl) = args.chat_template.as_deref() {
         tracing::info!("Chat template: using CLI --chat-template override");
-        return render_jinja_template(tmpl, user_prompt);
-    }
-
-    // Priority 2: CLI --chat-template-file
-    if let Some(path) = args.chat_template_file.as_deref() {
+        tmpl.to_string()
+    } else if let Some(path) = args.chat_template_file.as_deref() {
         tracing::info!(
             "Chat template: loading from --chat-template-file {}",
             path.display()
         );
-        let tmpl = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read --chat-template-file {}", path.display()))?;
-        return render_jinja_template(&tmpl, user_prompt);
-    }
-
-    // Priority 3: GGUF metadata `tokenizer.chat_template`
-    if let Some(tmpl) = gguf.metadata_string("tokenizer.chat_template") {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read --chat-template-file {}", path.display()))?
+    } else if let Some(tmpl) = gguf.metadata_string("tokenizer.chat_template") {
         tracing::info!(
             "Chat template: using GGUF metadata tokenizer.chat_template ({} chars)",
             tmpl.len()
         );
-        return render_jinja_template(tmpl, user_prompt);
-    }
+        tmpl.to_string()
+    } else {
+        // Priority 4: hardcoded string-replace fallback. NOT Jinja — no
+        // enable_thinking branching is available here.
+        tracing::warn!(
+            "Chat template: no GGUF metadata tokenizer.chat_template and no \
+             CLI override; falling back to hardcoded Gemma4 template"
+        );
+        return Ok(FALLBACK_GEMMA4_CHAT_TEMPLATE.replace("{{PROMPT}}", user_prompt));
+    };
 
-    // Priority 4: hardcoded fallback
-    tracing::warn!(
-        "Chat template: no GGUF metadata tokenizer.chat_template and no CLI override; \
-         falling back to hardcoded Gemma4 template"
+    // Step 2: resolve enable_thinking using the resolved template (so the
+    // auto-detect render-and-diff probes the SAME template we're about to
+    // render with). This is the canonical signal per
+    // /opt/llama.cpp/common/chat-diff-analyzer.cpp:319-401.
+    let enable_thinking = resolve_enable_thinking(args, Some(template_str.as_str()));
+
+    // Step 3: render with the resolved template + flag. Do not post-edit the
+    // rendered chat prompt here: llama.cpp's chat-template path treats the
+    // template output as authoritative, and Qwen equivalence depends on the
+    // same contract. Decode behavior differences belong in the sampler/stop
+    // pipeline, not in prompt surgery.
+    let bos_token = resolve_token_text(
+        gguf,
+        tokenizer,
+        "tokenizer.ggml.bos_token_id",
+        "<bos>",
     );
-    Ok(FALLBACK_GEMMA4_CHAT_TEMPLATE.replace("{{PROMPT}}", user_prompt))
+    let eos_token = resolve_token_text(
+        gguf,
+        tokenizer,
+        "tokenizer.ggml.eos_token_id",
+        "<eos>",
+    );
+
+    render_jinja_template_with_specials(
+        &template_str,
+        user_prompt,
+        enable_thinking,
+        &bos_token,
+        &eos_token,
+    )
 }
 
 /// Render a Jinja2 chat template using minijinja.
@@ -358,7 +477,21 @@ fn render_chat_template(
 /// - `raise_exception(msg)` function — Qwen3.6 guard for missing user query
 ///   (we always supply a user message, so this code path is unreachable; we
 ///   log a warning and continue rather than aborting template rendering).
-fn render_jinja_template(template_str: &str, user_prompt: &str) -> Result<String> {
+fn render_jinja_template(
+    template_str: &str,
+    user_prompt: &str,
+    enable_thinking: Option<bool>,
+) -> Result<String> {
+    render_jinja_template_with_specials(template_str, user_prompt, enable_thinking, "<bos>", "<eos>")
+}
+
+fn render_jinja_template_with_specials(
+    template_str: &str,
+    user_prompt: &str,
+    enable_thinking: Option<bool>,
+    bos_token: &str,
+    eos_token: &str,
+) -> Result<String> {
     let mut env = minijinja::Environment::new();
 
     // `tojson` filter — converts any value to its JSON representation.
@@ -401,17 +534,131 @@ fn render_jinja_template(template_str: &str, user_prompt: &str) -> Result<String
     let tmpl = env
         .get_template("chat")
         .context("Failed to load parsed chat template")?;
+    // 2026-05-02 (per H2 audit, docs/research/decode-test-gap-2026-05-02.md):
+    // include `enable_thinking` in the Jinja context. Templates like
+    // qwen3-chatml.jinja:147-153 branch on this variable to either open an
+    // unfilled `<think>\n` block (default: thinking-mode-on) or emit a
+    // pre-closed `<think>\n\n</think>\n\n` (thinking-mode-off, cuing the
+    // model to skip directly to the answer). Before this fix the variable
+    // was never passed and templates always fired the `else` branch — broken
+    // for non-thinking checkpoints loaded under the qwen3-arch dispatch.
+    //
+    // `Option<bool>` ↦ Jinja: None leaves the variable undefined (legacy
+    // behavior preserved); Some(b) sets it to that bool value. minijinja's
+    // `context!` macro accepts `Option<bool>` and serializes None as
+    // undefined, which is exactly what we want for jinja `is defined` guards.
     let rendered = tmpl
         .render(minijinja::context! {
             messages => vec![
                 minijinja::context! { role => "user", content => user_prompt }
             ],
             add_generation_prompt => true,
-            bos_token => "<bos>",
-            eos_token => "<eos>",
+            bos_token => bos_token,
+            eos_token => eos_token,
+            enable_thinking => enable_thinking,
         })
         .context("Failed to render chat template")?;
     Ok(rendered)
+}
+
+fn gguf_bool(gguf: &mlx_native::gguf::GgufFile, key: &str) -> bool {
+    matches!(
+        gguf.metadata(key),
+        Some(mlx_native::gguf::MetadataValue::Bool(true))
+    )
+}
+
+fn resolve_token_id(
+    gguf: &mlx_native::gguf::GgufFile,
+    tokenizer: &tokenizers::Tokenizer,
+    metadata_key: &str,
+) -> Option<u32> {
+    llama_cpp_special_token_id(gguf, metadata_key)
+        .and_then(|id| tokenizer.id_to_token(id).map(|_| id))
+}
+
+fn llama_cpp_special_token_id(
+    gguf: &mlx_native::gguf::GgufFile,
+    metadata_key: &str,
+) -> Option<u32> {
+    if let Some(id) = gguf.metadata_u32(metadata_key) {
+        return Some(id);
+    }
+
+    let tokenizer_model = gguf.metadata_string("tokenizer.ggml.model")?;
+    llama_cpp_special_token_id_for_model(tokenizer_model, metadata_key)
+}
+
+fn llama_cpp_special_token_id_for_model(
+    tokenizer_model: &str,
+    metadata_key: &str,
+) -> Option<u32> {
+    match (tokenizer_model, metadata_key) {
+        // Mirrors `/opt/llama.cpp/src/llama-vocab.cpp`: for tokenizer model
+        // `gpt2`, llama.cpp initializes both BOS and EOS to token id 11 before
+        // applying GGUF metadata overrides.
+        ("gpt2", "tokenizer.ggml.bos_token_id")
+        | ("gpt2", "tokenizer.ggml.eos_token_id") => Some(11),
+        _ => None,
+    }
+}
+
+fn resolve_token_text(
+    gguf: &mlx_native::gguf::GgufFile,
+    tokenizer: Option<&tokenizers::Tokenizer>,
+    metadata_key: &str,
+    template_literal_when_unavailable: &str,
+) -> String {
+    let Some(tokenizer) = tokenizer else {
+        return template_literal_when_unavailable.to_string();
+    };
+    resolve_token_id(gguf, tokenizer, metadata_key)
+        .and_then(|id| tokenizer.id_to_token(id))
+        .unwrap_or_else(|| template_literal_when_unavailable.to_string())
+}
+
+/// Tokenize a rendered prompt with llama.cpp `common_tokenize(...,
+/// add_special=true, parse_special=true)` semantics.
+///
+/// The Rust tokenizer call below intentionally keeps `add_special_tokens=false`
+/// because the GGUF-driven tokenizer is assembled from llama.cpp metadata, not
+/// HF `tokenizer.json`; we then apply GGUF add_bos/add_eos explicitly with the
+/// same token IDs llama.cpp would prepend/append.
+fn tokenize_rendered_prompt_llama_style(
+    gguf: &mlx_native::gguf::GgufFile,
+    tokenizer: &tokenizers::Tokenizer,
+    prompt_text: &str,
+) -> Result<Vec<u32>> {
+    let encoding = tokenizer
+        .encode(prompt_text, false)
+        .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
+    let mut prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+
+    if gguf_bool(gguf, "tokenizer.ggml.add_bos_token") {
+        if let Some(bos) = resolve_token_id(
+            gguf,
+            tokenizer,
+            "tokenizer.ggml.bos_token_id",
+        ) {
+            if prompt_tokens.first() != Some(&bos) {
+                prompt_tokens.insert(0, bos);
+            }
+        }
+    }
+
+    if gguf_bool(gguf, "tokenizer.ggml.add_eos_token") {
+        if let Some(eos) = resolve_token_id(
+            gguf,
+            tokenizer,
+            "tokenizer.ggml.eos_token_id",
+        ) {
+            if prompt_tokens.last() != Some(&eos) {
+                prompt_tokens.push(eos);
+            }
+        }
+    }
+
+    Ok(prompt_tokens)
 }
 
 /// Run the `generate` subcommand.
@@ -433,7 +680,46 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         let gguf_peek = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open (arch peek): {e}"))?;
         if let Some(arch) = gguf_peek.metadata_string("general.architecture") {
-            use crate::inference::models::qwen35::{is_qwen36_gguf, ARCH_QWEN35, ARCH_QWEN35MOE};
+            use crate::inference::models::qwen35::{
+                is_qwen36_gguf, is_qwen3_vl_arch, is_qwen3_vl_moe_arch, ARCH_QWEN35,
+                ARCH_QWEN35MOE,
+            };
+            // Wedge-4 / iter-227 (2026-05-02): originally a runtime
+            // actionable-error dispatch shim that bailed on Qwen3-VL
+            // arches because the LM forward path wasn't wired yet.
+            //
+            // **iter-228a (2026-05-02)**: the SERVE-side load path
+            // (`LoadedModel::load`) now routes dense Qwen3-VL through
+            // `Qwen3VlTextLoadedModel::load` and short-circuits chat
+            // completion to a `qwen3vl_text_forward_pending` 501 (the
+            // iter-215 → Wedge-3 split for Qwen3.5/3.6 in miniature).
+            //
+            // The CLI `hf2q generate` path stays bailed at this site:
+            // CLI generate has no chat-completion 501 fallback (it
+            // would have to actually decode tokens), so its blocker is
+            // iter-228b's LM forward, not iter-228a's load surface.
+            // Operators who want to validate the iter-228a load
+            // surface should run `hf2q serve --model <Qwen3-VL.gguf>`
+            // and confirm `/readyz=200` / `/v1/models` reports the
+            // model.
+            if is_qwen3_vl_arch(arch) {
+                let variant_label = if is_qwen3_vl_moe_arch(arch) {
+                    "MoE"
+                } else {
+                    "dense"
+                };
+                anyhow::bail!(
+                    "Qwen3-VL ({variant_label}, general.architecture = {arch:?}) GGUFs are recognized \
+                     but the CLI `hf2q generate` path requires a working LM forward (iter-228b \
+                     scope). iter-228a (this commit) lands the SERVE-side load path: \
+                     `hf2q serve --model <gguf>` will load this GGUF and surface it on \
+                     `/v1/models`, but chat completion still returns HTTP 501 with the \
+                     `qwen3vl_text_forward_pending` sentinel until iter-228b wires the \
+                     dense transformer forward. For text-only chat today, use a \
+                     Qwen3.5 / Qwen3.6 GGUF (full chat path). Model: {}",
+                    model_path.display(),
+                );
+            }
             if arch == ARCH_QWEN35 || arch == ARCH_QWEN35MOE {
                 // Wave 5a (ADR-005 Phase 4 ACs 5468/5470 partial): the
                 // Qwen3.5 forward path is autoregressive-only (per-token
@@ -524,7 +810,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
 
     // Resolve prompt
     let prompt_text_raw = resolve_prompt(&args)?;
-    let prompt_text = render_chat_template(&gguf, &args, &prompt_text_raw)?;
+    let prompt_text = render_chat_template(&gguf, &args, Some(&tokenizer), &prompt_text_raw)?;
 
     // ADR-005 1bNEW.0c: dump rendered prompt and exit if requested
     if let Some(dump_path) = INVESTIGATION_ENV.dump_rendered_prompt.as_deref() {
@@ -538,10 +824,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         return Ok(());
     }
 
-    let encoding = tokenizer
-        .encode(prompt_text.as_str(), false)
-        .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
-    let mut prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+    let mut prompt_tokens = tokenize_rendered_prompt_llama_style(&gguf, &tokenizer, &prompt_text)?;
 
     // ADR-015 iter42 — Gemma forward_mlx prefill coherence fix.
     //
@@ -610,6 +893,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         temperature: args.temperature,
         top_p: args.top_p,
         top_k: args.top_k,
+        min_p: args.min_p,
         repetition_penalty: args.repetition_penalty,
         max_tokens: args.max_tokens,
     };
@@ -660,14 +944,24 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     .context("print header prefill")?;
 
     // Decode
+    //
+    // 2026-05-02: mirror cmd_generate_qwen35 cumulative-decode pattern so
+    // multi-byte UTF-8 codepoints (emoji, CJK) don't get split at token
+    // boundaries → garble like `���`. Also reuse the n-gram repetition
+    // guard so Gemma's greedy decode can't run to --max-tokens on a stuck
+    // loop. Special-token-string check skipped here — Gemma's marker set
+    // (`<end_of_turn>`, `<start_of_turn>`, `<eos>`, `<bos>`) differs from
+    // Qwen's; integer-id stop via eos_token_ids.contains() catches `<end_of_turn>`
+    // (token id 106) which is the dominant turn-end marker.
     let mut all_tokens = prompt_tokens.to_vec();
     let mut next_token = last_token;
     all_tokens.push(next_token);
-    {
-        let token_str = tokenizer.decode(&[next_token], false).unwrap_or_default();
-        print!("{}", token_str);
-        std::io::stdout().flush()?;
-    }
+    let mut decoded_tokens: Vec<u32> = vec![next_token];
+    let mut printed_text = tokenizer
+        .decode(&decoded_tokens, false)
+        .unwrap_or_default();
+    print!("{}", printed_text);
+    std::io::stdout().flush()?;
 
     let decode_start = std::time::Instant::now();
     let mut generated = 1usize;
@@ -680,31 +974,54 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         }
         let pos = all_tokens.len() - 1;
 
-        if kernel_profile_mode {
+        let kernel_profile_break = if kernel_profile_mode {
             let (tok, kp) = mlx_w.forward_decode_kernel_profile(next_token, pos, &mut ctx)?;
             next_token = tok;
             if generated > kernel_profile_warmup {
                 kernel_profiles.push(kp);
             }
-            if kernel_profiles.len() >= kernel_profile_measure {
-                all_tokens.push(next_token);
-                generated += 1;
-                let token_str = tokenizer.decode(&[next_token], false).unwrap_or_default();
-                print!("{}", token_str);
-                std::io::stdout().flush()?;
-                break;
-            }
+            kernel_profiles.len() >= kernel_profile_measure
         } else {
             let mut p = profiler.start_token();
             next_token = mlx_w.forward_decode(next_token, pos, &mut ctx, &mut p)?;
             profiler.finish_token(p);
-        }
+            false
+        };
         all_tokens.push(next_token);
         generated += 1;
-        {
-            let token_str = tokenizer.decode(&[next_token], false).unwrap_or_default();
-            print!("{}", token_str);
+        decoded_tokens.push(next_token);
+
+        // Cumulative decode + delta print (llama.cpp tok_str_pos pattern).
+        let new_full = tokenizer
+            .decode(&decoded_tokens, false)
+            .unwrap_or_default();
+        if new_full.len() > printed_text.len() && new_full.starts_with(&printed_text) {
+            print!("{}", &new_full[printed_text.len()..]);
             std::io::stdout().flush()?;
+        }
+        printed_text = new_full;
+
+        if kernel_profile_break {
+            break;
+        }
+
+        // N-gram repetition guard — same shared detector as the qwen35 path.
+        if let Some((ngram, repeats)) = detect_greedy_repetition_loop(&decoded_tokens) {
+            tracing::info!(
+                "Gemma decode: greedy n-gram repetition detected (last {} tokens \
+                 repeated {} times); stopping. Sampling \
+                 (temperature/top_k/top_p/repetition_penalty) is wired in \
+                 forward_decode but the CLI does not pass them through; \
+                 use the chat-completion API for non-deterministic decoding.",
+                ngram, repeats
+            );
+            eprintln!(
+                "\n[hf2q] Gemma greedy decode entered a {}-token repetition loop \
+                 — stopping. Use the chat-completion API for non-deterministic \
+                 decoding.",
+                ngram
+            );
+            break;
         }
     }
     let decode_elapsed = decode_start.elapsed();
@@ -1071,6 +1388,517 @@ fn maybe_run_qwen35_prefill_sweep(
 /// from and writes back to the `kv_cache.linear_attn` slots on every call.
 /// For full-attention layers the SDPA is re-run from scratch on each decode
 /// token (the KV-append incremental path is a future optimisation).
+/// Detect a true consecutive-repetition loop in `decoded_tokens`.
+///
+/// Returns `Some((ngram_size, occurrences))` if the LAST `N × ngram_size`
+/// tokens are exactly `N` consecutive copies of the same `ngram_size`-token
+/// sequence, for any `ngram_size ∈ {8, 12, 16, 20, 24}` and `N ≥ 4`.
+///
+/// Why "true consecutive" not "non-overlapping in a 128-token window":
+/// the prior heuristic (4 non-overlapping occurrences of the last-N-token
+/// key anywhere in the last 128 tokens) was overly aggressive on legitimate
+/// enumeration patterns. 2026-05-03 user report: a wedding-cake recipe
+/// shopping list with bullets like
+///   `*   **Buy:** 5 lbs SMBC ...`
+///   `*   **Buy:** 3 cans condensed milk ...`
+///   `*   **Buy:** 1 box of Greenery ...`
+///   `*   **Buy:** 1 Cake Drum ...`
+///   `*   **Buy:** 1`  ← stop fired here
+/// triggered the old detector at 666 useful tokens because the 8-token
+/// `*   **Buy:** 1` prefix happened to appear ≥4 times non-consecutively
+/// in the window — even though every bullet's CONTENT was different and
+/// the model was making real progress.
+///
+/// True loops (the 2026-05-02 French-Toast `"I should make sure the
+/// response is accurate and up-to-date."` × 30+ case) are CONSECUTIVE
+/// — the model emits the SAME sequence end-to-end with no intervening
+/// content. The consecutive-only check fires on those and ignores
+/// structured enumeration.
+///
+/// Algorithm: take the LAST `ngram_size` tokens as the key, then check
+/// whether the immediately preceding `ngram_size` tokens equal the key,
+/// and the ones before that, and so on for `REPEAT_MIN_OCCURRENCES` total
+/// copies. If all match, report a true loop.
+fn detect_greedy_repetition_loop(decoded_tokens: &[u32]) -> Option<(usize, usize)> {
+    const REPEAT_NGRAM_SIZES: &[usize] = &[8, 12, 16, 20, 24];
+    const REPEAT_MIN_OCCURRENCES: usize = 4;
+
+    let n = decoded_tokens.len();
+    for &ngram in REPEAT_NGRAM_SIZES {
+        let need = ngram * REPEAT_MIN_OCCURRENCES;
+        if n < need {
+            continue;
+        }
+        let tail = &decoded_tokens[n - need..];
+        let key = &tail[need - ngram..];
+        let mut all_match = true;
+        for i in 0..REPEAT_MIN_OCCURRENCES {
+            let start = i * ngram;
+            if &tail[start..start + ngram] != key {
+                all_match = false;
+                break;
+            }
+        }
+        if all_match {
+            return Some((ngram, REPEAT_MIN_OCCURRENCES));
+        }
+    }
+    None
+}
+
+/// Special-token text fragments that, if present in the cumulative decode of
+/// **generated** tokens, indicate the model has either:
+///
+/// * emitted an end-of-turn marker as text rather than as the configured
+///   integer EOS id (Qwen3.x distill / merge variants), OR
+/// * ended a Phi-3-style turn via the `<|end|>` text fragment (observed
+///   2026-05-02 on a Qwen3.x-arch GGUF whose model emitted Phi-3-style
+///   markers as multi-token text).
+///
+/// Order in this array determines tie-breaks when more than one fragment is
+/// present in the input (`Iterator::find` returns the first hit). The
+/// surrounding decode loop in `cmd_generate_qwen35` does not depend on which
+/// fragment matched — it just stops on Some.
+// Text-fragment stop-strings for finetunes that emit special tokens as
+// BPE-decomposed bytes instead of as proper integer ids. Matches the
+// stop-string contract of llama.cpp's CLI (`-r` / `--reverse-prompt`).
+//
+// 2026-05-03 — switched the leading marker from `<|im_end|>` to
+// `<|im_start|>user`. On thinking-capable Qwen3 finetunes (notably the
+// abliterix-EGA-abliterated dwq48 file in this repo's models/), the
+// model emits `<|im_end|>` as a SEGMENT separator BETWEEN the thinking
+// trace and the actual answer:
+//
+//   [thinking]<|im_end|>\n<|im_start|>assistant\n[ANSWER]<|im_end|>\n<|im_start|>user\n[hallucinations]
+//                       ^                                            ^
+//                       segment break, NOT turn-end                   model's "I've finished my
+//                                                                    assistant turn" signal
+//
+// Stopping on the first `<|im_end|>` (the previous default — matches a
+// properly-trained Qwen3 checkpoint, which uses `<|im_end|>` ONLY at
+// turn-end) cut generation off before the answer was emitted. The
+// turn-end signal on this finetune is the NEXT-turn opener
+// `<|im_start|>user` (the model is hallucinating the next user input).
+// Stopping there preserves the full assistant response (thinking +
+// segment markers + answer + closing `<|im_end|>`).
+//
+// `<|endoftext|>` and `<|end|>` cover other end-of-generation markers
+// (some Phi-3 / GPT-2 era models emit these as bytes).
+const SPECIAL_TOKEN_STOPS: &[&str] = &[
+    "<|im_start|>user",
+    "<|im_start|>system",
+    "<|endoftext|>",
+    "<|end|>",
+];
+
+/// Returns the first [`SPECIAL_TOKEN_STOPS`] fragment present in `generated_text`,
+/// or `None` if generation should continue.
+///
+/// The input MUST be the cumulative decode of **assistant-generated** tokens
+/// only (NOT the prompt). The prompt typically contains `<|im_start|>` /
+/// `<|im_end|>` chat-template markers; scanning those would short-circuit
+/// generation immediately on every model.
+#[allow(dead_code)] // production callers route via qwen35_visible_generated_prefix → special_token_safe_prefix; helper retained for unit tests.
+fn find_special_token_stop(generated_text: &str) -> Option<&'static str> {
+    find_special_token_stop_pos(generated_text).map(|(_, marker)| marker)
+}
+
+fn find_special_token_stop_pos(generated_text: &str) -> Option<(usize, &'static str)> {
+    SPECIAL_TOKEN_STOPS
+        .iter()
+        .copied()
+        .filter_map(|m| generated_text.find(m).map(|pos| (pos, m)))
+        .min_by_key(|(pos, _)| *pos)
+}
+
+/// Decide whether the qwen3.5 generate-CLI loop needs the sampler-path
+/// (forward_gpu_last_logits + sample_qwen35_logits_for_generate) or can take
+/// the GPU-argmax fast-path (forward_gpu_greedy).
+///
+/// Mirrors llama.cpp's `--temp 0` semantics: when temperature is at or below
+/// the deterministic floor, the argmax of the unwarped logits is the output —
+/// top_k / top_p / min_p truncation is a no-op against an argmax-of-1. The
+/// sampler-path is only needed when temperature scales the distribution OR
+/// when repetition_penalty re-weights it (rep_penalty modifies logits before
+/// argmax, so it cannot ride the GPU argmax fast-path).
+///
+/// Pre-2026-05-03 this returned `true` whenever any of top_k/top_p/min_p were
+/// at their non-disabled defaults (40 / 0.95 / 0.05) regardless of temperature.
+/// That meant `--temperature 0` still routed through the slower sampler path
+/// (forward_gpu_last_logits downloads ~600KB of vocab logits to host;
+/// forward_gpu_greedy returns 4 bytes after a GPU argmax kernel). On
+/// qwen3.6-35B-A3B-dwq48 that cost ~19 tok/s vs the truly-greedy path at
+/// 122 tok/s — the regression that matched 4adf689's pre-CLI-sampling perf.
+fn qwen35_generate_uses_sampling(args: &cli::GenerateArgs) -> bool {
+    args.temperature > crate::serve::sampler_pure::SAMPLING_EPS
+        || args.repetition_penalty != 1.0
+}
+
+fn sample_qwen35_logits_for_generate(
+    logits: &mut [f32],
+    args: &cli::GenerateArgs,
+    previous_tokens: &[u32],
+) -> u32 {
+    let params = crate::serve::sampler_pure::SamplingParams {
+        temperature: args.temperature,
+        top_p: args.top_p,
+        top_k: args.top_k,
+        min_p: args.min_p,
+        repetition_penalty: args.repetition_penalty,
+        max_tokens: args.max_tokens,
+    };
+    crate::serve::sampler_pure::sample_token(logits, &params, previous_tokens)
+}
+
+// ============================================================================
+// Decode-loop testable helper (H3 Layer A unlock, item (c) of dossier plan)
+// ============================================================================
+//
+// 2026-05-02 — extracts the qwen3.5 greedy-decode loop body from
+// `cmd_generate_qwen35` into a pure helper that injects the model call as a
+// closure. Lets unit tests feed synthetic token streams through the entire
+// loop (including stop-condition + cumulative-decode + repetition-guard
+// composition) without needing a Metal GPU. Closes the H3 finding from
+// `docs/research/decode-test-gap-2026-05-02.md`: today's 12+4 helper tests
+// pin individual pure functions in isolation but not the loop body that
+// composes them.
+
+/// Reason the decode loop stopped emitting tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DecodeStopReason {
+    /// `next_token` matched one of `eos_token_ids` (integer-id stop).
+    /// The matched id is included for diagnostics.
+    EosTokenId(u32),
+    /// Cumulative decode contained a [`SPECIAL_TOKEN_STOPS`] substring
+    /// (text-fragment stop — covers tokenizers that emit special tokens
+    /// as multi-token text instead of as the reserved id).
+    SpecialTokenLeak(&'static str),
+    /// `detect_greedy_repetition_loop` fired — greedy decode entered a
+    /// stuck cycle.
+    RepetitionLoop { ngram: usize, repeats: usize },
+    /// KV cache would overrun on the next step.
+    MaxSeq,
+    /// `max_tokens` step budget exhausted without any of the above firing.
+    MaxTokensReached,
+}
+
+/// Outcome of [`run_decode_loop`].
+#[derive(Debug)]
+pub(crate) struct DecodeLoopOutcome {
+    /// Total number of tokens generated (including the seed token from
+    /// prefill argmax).
+    pub generated: usize,
+    /// Why the loop stopped.
+    pub stop_reason: DecodeStopReason,
+}
+
+/// One per-step event emitted to the `on_event` callback.
+///
+/// `step`, `token`, `cumulative_text` are exposed for unit-test
+/// observation — production callers (cmd_generate_qwen35) only consume
+/// `delta` for the streaming print, but tests assert on all four fields
+/// to verify the loop state matches expectations.
+#[allow(dead_code)]
+pub(crate) struct DecodeStepEvent<'a> {
+    /// Step index (0 is the seed token from prefill argmax; subsequent
+    /// steps are 1..max_tokens, matching the production loop bounds).
+    pub step: usize,
+    /// The token just sampled by the model (or the seed token at step 0).
+    pub token: u32,
+    /// Cumulative-decoded text (covers all tokens generated so far,
+    /// including the seed token).
+    pub cumulative_text: &'a str,
+    /// New byte-delta to emit since the previous step (the part of
+    /// `cumulative_text` that wasn't in the previous step's emit).
+    /// Empty if the new tokens didn't extend the cumulative text
+    /// (e.g. a tokenizer rewrite changed an earlier prefix; we
+    /// silently skip such cases for streaming correctness).
+    pub delta: &'a str,
+}
+
+/// Run the qwen3.5 greedy-decode loop with injected forward + decode
+/// closures.
+///
+/// The helper owns the per-step bookkeeping (cumulative-decode tracking,
+/// stop checks, repetition guard, position arithmetic) and calls the
+/// caller's `step_model` closure for each forward pass. This lets unit
+/// tests feed a synthetic `step_model` that returns a pre-arranged token
+/// stream, completely bypassing the GPU.
+///
+/// # Parameters
+///
+/// * `initial_token` — the token sampled from prefill argmax (becomes
+///   step 0 of the cumulative decode).
+/// * `prompt_len` — number of tokens in the (already-prefilled) prompt;
+///   used to compute absolute positions.
+/// * `max_seq` — KV-cache capacity. The loop stops with
+///   [`DecodeStopReason::MaxSeq`] when the next position would equal or
+///   exceed this value.
+/// * `max_tokens` — step budget. `step=1..max_tokens` means at most
+///   `max_tokens - 1` forward calls (matches the production loop bounds).
+/// * `eos_token_ids` — integer EOS ids; matched against `next_token` at
+///   the TOP of each iteration (mirrors production loop semantics).
+/// * `step_model(prev_token, pos) -> Result<u32>` — produces the next
+///   token. In production, this calls `model.forward_gpu_greedy(...)`.
+///   In tests, it can return canned tokens.
+/// * `decode_text(&[u32]) -> String` — decodes the cumulative token
+///   list. In production, this is `tokenizer.decode(_, false)`.
+/// * `on_event(DecodeStepEvent)` — invoked once per step AFTER the
+///   forward call completes, with the cumulative text + delta.
+///   Production binding prints the delta to stdout.
+///
+/// # Returns
+///
+/// [`DecodeLoopOutcome`] with the total tokens generated + stop reason.
+///
+/// # Errors
+///
+/// Propagates the first error from `step_model`. Does NOT propagate
+/// errors from `decode_text` — a tokenizer decode failure is treated
+/// as an empty string for that step (matches production behavior:
+/// `unwrap_or_default()` at the call site).
+pub(crate) fn run_decode_loop<F, P, E>(
+    initial_token: u32,
+    prompt_len: usize,
+    max_seq: usize,
+    max_tokens: usize,
+    eos_token_ids: &[u32],
+    mut step_model: F,
+    mut decode_text: P,
+    mut on_event: E,
+) -> Result<DecodeLoopOutcome>
+where
+    F: FnMut(u32, i32, &[u32]) -> Result<u32>,
+    P: FnMut(&[u32]) -> String,
+    E: FnMut(DecodeStepEvent<'_>),
+{
+    let mut decoded_tokens: Vec<u32> = vec![initial_token];
+    let mut emitted_text: String = String::new();
+    let mut next_token = initial_token;
+    let mut generated = 1usize;
+
+    // Emit step 0 event (the seed token from prefill).
+    //
+    // 2026-05-03 — match llama.cpp's libllama philosophy: inference emits
+    // raw decoded tokens. NO output-text scanning, NO visible-prefix
+    // surgery, NO special-token-fragment scrubbing. The caller (CLI / SSE
+    // server / harness) is the right layer to decide what to display, what
+    // to truncate, and when to stop on application-level markers.
+    //
+    // Hard stops kept here (model-agnostic, layer-correct):
+    //   * integer EOS via `eos_token_ids`
+    //   * max_tokens budget
+    //   * max_seq KV-cache overrun
+    //   * consecutive n-gram repetition guard (catches genuine model loops
+    //     that have NO clean stop signal — e.g. broken finetunes that
+    //     never emit id 151645)
+    //
+    // Pre-2026-05-03 this loop body called `qwen35_visible_generated_prefix`
+    // which hid `<|im_start|>` literal text + counted special-token-fragment
+    // stops + did trailing-prefix-of-marker holding. For finetunes that
+    // emit special tokens as BPE-decomposed bytes (this dwq48 file), that
+    // text-fragment scaffolding stopped on the FIRST `<|im_end|>` text
+    // appearance — which on simple prompts ("Hi", "Tell me a joke") is the
+    // end-of-thinking marker, NOT the end-of-turn marker. The actual
+    // answer comes between two `<|im_end|>` text fragments. Our stop fired
+    // before the answer was emitted. Removed the inference-layer scanning
+    // entirely; if a caller wants to truncate at `<|im_end|>` for display,
+    // it does so as a display-layer post-process.
+    let seed_full = decode_text(&decoded_tokens);
+    on_event(DecodeStepEvent {
+        step: 0,
+        token: initial_token,
+        cumulative_text: &seed_full,
+        delta: &seed_full,
+    });
+    emitted_text.push_str(&seed_full);
+
+    for step in 1..max_tokens {
+        // Top-of-iteration integer-EOS check (mirrors production: line
+        // 1646). Note: this catches the seed token if it's already EOS,
+        // which preserves the production loop's `for step in 1..` shape.
+        if eos_token_ids.contains(&next_token) {
+            return Ok(DecodeLoopOutcome {
+                generated,
+                stop_reason: DecodeStopReason::EosTokenId(next_token),
+            });
+        }
+
+        // Position arithmetic: step=1 maps to pos=prompt_len (the next
+        // slot after prefill); step=N maps to pos=prompt_len + (N - 1).
+        let pos = (prompt_len + step - 1) as i32;
+        if (pos as usize) >= max_seq {
+            return Ok(DecodeLoopOutcome {
+                generated,
+                stop_reason: DecodeStopReason::MaxSeq,
+            });
+        }
+
+        // Forward pass.
+        next_token = step_model(next_token, pos, &decoded_tokens)?;
+        generated += 1;
+        decoded_tokens.push(next_token);
+
+        // Cumulative decode + delta computation.
+        // 2026-05-03 — emit raw decoded text directly. See seed-event
+        // comment above for the rationale (inference vs display layering).
+        let new_full = decode_text(&decoded_tokens);
+        let delta = if new_full.len() > emitted_text.len()
+            && new_full.starts_with(&emitted_text)
+        {
+            &new_full[emitted_text.len()..]
+        } else {
+            // Tokenizer rewrote an earlier prefix (rare; happens with some
+            // BPE merges) — emit nothing this step.
+            ""
+        };
+
+        on_event(DecodeStepEvent {
+            step,
+            token: next_token,
+            cumulative_text: &new_full,
+            delta,
+        });
+
+        // Text-fragment EOS for finetunes that emit `<|im_end|>` (etc.) as
+        // BPE-decomposed bytes instead of as their proper integer special-
+        // token id. llama.cpp's CLI handles this via `--reverse-prompt` /
+        // stop-strings as an application-layer gate; we implement the same
+        // contract inline, scanning the cumulative decoded text for any
+        // entry in `SPECIAL_TOKEN_STOPS`. This is NOT visible-text surgery
+        // (we do not strip / re-format / hold-back trailing prefixes — the
+        // delta the caller printed at this step is the raw model output).
+        // The stop is a hard cut: raw display up to the boundary, then
+        // exit with `SpecialTokenLeak`. Properly-trained models hit
+        // integer-EOS first (above) and never trip this fallback.
+        if let Some(marker) = find_special_token_stop(&new_full) {
+            return Ok(DecodeLoopOutcome {
+                generated,
+                stop_reason: DecodeStopReason::SpecialTokenLeak(marker),
+            });
+        }
+
+        // N-gram repetition guard.
+        if let Some((ngram, repeats)) = detect_greedy_repetition_loop(&decoded_tokens) {
+            return Ok(DecodeLoopOutcome {
+                generated,
+                stop_reason: DecodeStopReason::RepetitionLoop { ngram, repeats },
+            });
+        }
+
+        emitted_text = new_full;
+    }
+
+    Ok(DecodeLoopOutcome {
+        generated,
+        stop_reason: DecodeStopReason::MaxTokensReached,
+    })
+}
+
+/// Streaming display-layer chat-template tag scrubber for the qwen3.5/3.6
+/// CLI generate path.
+///
+/// Inference (`run_decode_loop`) emits raw decoded tokens — including
+/// any literal `<|im_end|>` / `<|im_start|>{role}` chat-template tags
+/// that the model produces as BPE-decomposed bytes (notably on the
+/// abliterix-EGA-abliterated dwq48 finetune which doesn't emit these
+/// as their proper integer special-token ids).  This struct sits at
+/// the **display** layer between `run_decode_loop`'s on_event and
+/// the user's terminal, suppressing those tags from the streamed
+/// print without otherwise transforming the model's output.
+///
+/// Implementation: each delta is appended to a small rolling buffer.
+/// We print the prefix of the buffer that CANNOT be the start of any
+/// known tag (i.e. holds back the trailing N bytes if they could be
+/// a prefix of `<|im_start|>system` etc.).  When the held-back bytes
+/// resolve into a complete tag, we drop them; otherwise (the model
+/// just emitted a `<` mid-text) we eventually print them out.
+struct DisplayScrubber {
+    buf: String,
+    emitted: usize,
+}
+
+// Display-layer scrub list. These are STANDARD Qwen3 chat-template tokens
+// that appear in our rendered prompt and that the model may regurgitate as
+// BPE-decomposed bytes on broken finetunes. NOT a list of arbitrary
+// pattern matches — every tag here is part of the Qwen3 chat-template
+// vocabulary documented in the model's tokenizer_config.json.
+const SCRUB_TAGS: &[&str] = &[
+    "<|im_end|>",
+    "<|im_start|>assistant",
+    "<|im_start|>user",
+    "<|im_start|>system",
+    "<|endoftext|>",
+    "<|end|>",
+    // Standard reasoning-block tags (Qwen3-Thinking, DeepSeek-R1 family).
+    "</think>",
+    "<think>",
+];
+
+impl DisplayScrubber {
+    fn new() -> Self {
+        Self { buf: String::new(), emitted: 0 }
+    }
+
+    /// Append `delta`, return the bytes safe to print right now (with
+    /// known tags scrubbed). Called once per decode step.
+    fn push(&mut self, delta: &str) -> String {
+        if delta.is_empty() {
+            return String::new();
+        }
+        self.buf.push_str(delta);
+        // Determine the largest position N <= buf.len() such that
+        // buf[N..] is NOT a non-trivial prefix of any tag in SCRUB_TAGS.
+        // Bytes [emitted..N] are safe to print (after scrubbing complete
+        // tags); bytes [N..] are held back.
+        let trail_hold = max_trailing_tag_prefix_len(&self.buf);
+        let safe_to = self.buf.len().saturating_sub(trail_hold);
+        if safe_to <= self.emitted {
+            return String::new();
+        }
+        let raw_segment = &self.buf[self.emitted..safe_to];
+        // Strip any complete tags that fall ENTIRELY within this segment.
+        let mut out = raw_segment.to_string();
+        for tag in SCRUB_TAGS {
+            if out.contains(tag) {
+                out = out.replace(tag, "");
+            }
+        }
+        self.emitted = safe_to;
+        out
+    }
+
+    /// Return any final bytes after the last on_event call (held-back
+    /// trailing tag-prefixes that didn't resolve into a complete tag).
+    fn flush(&self) -> String {
+        if self.emitted >= self.buf.len() {
+            return String::new();
+        }
+        let mut out = self.buf[self.emitted..].to_string();
+        for tag in SCRUB_TAGS {
+            if out.contains(tag) {
+                out = out.replace(tag, "");
+            }
+        }
+        out
+    }
+}
+
+/// Length of the longest trailing slice of `text` that is a non-empty
+/// proper prefix of any tag in [`SCRUB_TAGS`]. 0 if none.
+fn max_trailing_tag_prefix_len(text: &str) -> usize {
+    let mut max = 0;
+    for tag in SCRUB_TAGS {
+        for len in 1..tag.len() {
+            let prefix = &tag[..len];
+            if text.ends_with(prefix) && len > max {
+                max = len;
+            }
+        }
+    }
+    max
+}
+
 fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile) -> Result<()> {
     use crate::inference::models::qwen35::io_heads::greedy_argmax_last_token;
     use crate::inference::models::qwen35::kv_cache::HybridKvCache;
@@ -1100,6 +1928,35 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     // open. `LoadInfo`'s build path takes its own `&GgufFile`; we pass
     // the parameter handle.
     let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+
+    if INVESTIGATION_ENV.dump_rendered_prompt.is_some()
+        || std::env::var("HF2Q_DEBUG_TOKENIZE_ONLY").as_deref() == Ok("1")
+    {
+        let tokenizer =
+            crate::inference::models::qwen35::tokenizer::build_tokenizer_from_gguf(&gguf)
+                .context("Qwen35 tokenizer build for prompt diagnostics")?;
+        let prompt_text_raw = resolve_prompt(&args)?;
+        let prompt_text = render_chat_template(&gguf, &args, Some(&tokenizer), &prompt_text_raw)?;
+
+        if let Some(dump_path) = INVESTIGATION_ENV.dump_rendered_prompt.as_deref() {
+            std::fs::write(dump_path, prompt_text.as_bytes())
+                .with_context(|| format!("HF2Q_DUMP_RENDERED_PROMPT: failed to write {dump_path}"))?;
+            eprintln!(
+                "HF2Q_DUMP_RENDERED_PROMPT: wrote {} bytes to {}",
+                prompt_text.len(),
+                dump_path
+            );
+        }
+
+        if std::env::var("HF2Q_DEBUG_TOKENIZE_ONLY").as_deref() == Ok("1") {
+            let prompt_tokens =
+                tokenize_rendered_prompt_llama_style(&gguf, &tokenizer, &prompt_text)?;
+            let id_str: Vec<String> = prompt_tokens.iter().map(|i| i.to_string()).collect();
+            println!("TOKENIZE_DEBUG_IDS: {}", id_str.join(" "));
+        }
+
+        return Ok(());
+    }
 
     let load_opts = api::engine::LoadOptions {
         model_path: model_path.clone(),
@@ -1134,11 +1991,24 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     // from GGUF or defaulted) — read it directly. The trailing
     // `tracing::info!` is replaced by emit_tracing's `eos_token_ids`
     // structured field.
+    // 2026-05-02: cmd_generate_qwen35 had a single-eos collapse here that let
+    // `<|im_end|>` (151645) leak through whenever `<|endoftext|>` (151643) was
+    // first in the Vec — caused decode loops to run past 1st turn-end (user
+    // report: French Toast prompt produced ~30-line repetition + multiple
+    // `<|im_end|>`/`<|im_start|>assistant` leaks). Use the full Vec.
+    // The legacy `eos_token_id` single value is kept for the SpecDecode path
+    // below which still takes `Option<u32>` (TODO: extend SpecDecode to take
+    // a slice; tracked in a follow-up to avoid scope creep here).
     let eos_token_id: u32 = loaded
         .eos_token_ids
         .first()
         .copied()
         .unwrap_or(151_645);
+    let eos_token_ids: Vec<u32> = if loaded.eos_token_ids.is_empty() {
+        vec![151_645]
+    } else {
+        loaded.eos_token_ids.clone()
+    };
 
     if maybe_run_qwen35_prefill_sweep(&model, &tokenizer)? {
         return Ok(());
@@ -1146,13 +2016,24 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
 
     // ---- Resolve + render prompt ----
     let prompt_text_raw = resolve_prompt(&args)?;
-    let prompt_text = render_chat_template(&gguf, &args, &prompt_text_raw)?;
+    let prompt_text = render_chat_template(&gguf, &args, Some(&tokenizer), &prompt_text_raw)?;
+
+    // Keep the Qwen path inspectable with the same investigation knob as the
+    // Gemma path. This must happen before tokenization/decode so prompt bugs
+    // can be isolated without a successful generation.
+    if let Some(dump_path) = INVESTIGATION_ENV.dump_rendered_prompt.as_deref() {
+        std::fs::write(dump_path, prompt_text.as_bytes())
+            .with_context(|| format!("HF2Q_DUMP_RENDERED_PROMPT: failed to write {dump_path}"))?;
+        eprintln!(
+            "HF2Q_DUMP_RENDERED_PROMPT: wrote {} bytes to {}",
+            prompt_text.len(),
+            dump_path
+        );
+        return Ok(());
+    }
 
     // ---- Tokenize ----
-    let encoding = tokenizer
-        .encode(prompt_text.as_str(), false)
-        .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
-    let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+    let prompt_tokens = tokenize_rendered_prompt_llama_style(&gguf, &tokenizer, &prompt_text)?;
     let prompt_len = prompt_tokens.len();
     tracing::info!("Qwen3.5: {} prompt tokens", prompt_len);
 
@@ -1171,12 +2052,19 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     let max_seq = (prompt_len + args.max_tokens + 64)
         .max(128)
         .min(model.cfg.max_position_embeddings as usize);
+    let sample_logits = qwen35_generate_uses_sampling(&args);
+
     let spec_env = std::env::var("HF2Q_SPEC_DECODE").ok();
     let mut use_spec_decode = match spec_env.as_deref() {
         Some("0") => false,
         Some("1") => true,
-        _ => args.speculative || model.mtp.is_some(),
+        _ => !sample_logits && (args.speculative || model.mtp.is_some()),
     };
+    if sample_logits && args.speculative {
+        tracing::warn!(
+            "Speculative decoding requested with sampling parameters; using sampler path"
+        );
+    }
     if use_spec_decode && model.mtp.is_none() {
         tracing::warn!(
             "Speculative decoding requested but this GGUF has no MTP weights; using greedy decode"
@@ -1381,70 +2269,239 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         return Ok(());
     }
 
-    // Sample the first token from prefill logits (last token's row).
+    // Sample the first token from prefill logits (last token's row). This
+    // mirrors llama.cpp's common_sampler contract: the CLI default sampling
+    // parameters affect token 0, instead of silently downcasting generation to
+    // greedy argmax.
     let last_prefill_logits = &prefill_logits;
-    let mut next_token = greedy_argmax_last_token(last_prefill_logits, vocab_size);
+    let next_token = if sample_logits {
+        let mut logits = last_prefill_logits.to_vec();
+        sample_qwen35_logits_for_generate(&mut logits, &args, &[])
+    } else {
+        greedy_argmax_last_token(last_prefill_logits, vocab_size)
+    };
     tracing::info!("Qwen3.5 first decoded token: {}", next_token);
 
-    // Print first token immediately.
-    {
-        let s = tokenizer.decode(&[next_token], false).unwrap_or_default();
-        print!("{}", s);
-        stdout.flush()?;
-    }
+    // 2026-05-02: cumulative-decode + delta-print pattern (mirrors llama.cpp's
+    // `tok_str_pos` discipline). Per-token `tokenizer.decode(&[t], ...)` breaks
+    // multi-byte UTF-8 codepoints (emoji, CJK) at token boundaries → garble
+    // like `���` in the user's French-Toast output. Decode the full so-far
+    // sequence each step and print only the byte-delta. Costs O(generated)
+    // bytes of allocation per step but produces correct UTF-8 every time.
+    // Also catches special-token-string leaks (`<|im_end|>` etc. emitted as
+    // text rather than as the eos_token_ids vocab id) — see is_special_token
+    // check below.
+    // Initial seed-token print is now handled inside the loop helper's
+    // step=0 event (the helper takes care of the entire cumulative-decode
+    // bookkeeping). We just bind the closures and fire it.
 
     // ---- Decode loop ----
     let decode_start = std::time::Instant::now();
-    let mut generated = 1usize;
+    let step_profile_enabled = std::env::var("HF2Q_STEP_PROFILE").is_ok();
 
-    for step in 1..args.max_tokens {
-        if next_token == eos_token_id {
-            break;
+    // 2026-05-03 — split run_decode_loop dispatch into greedy and sampling
+    // ARMS rather than branching `if sample_logits` per step inside the
+    // step_model closure. The branched closure captured `sample_logits`,
+    // `args`, AND `model` (sampling needed forward_gpu_last_logits +
+    // sample_qwen35_logits_for_generate; greedy needed forward_gpu_greedy);
+    // even though the branch was loop-invariant, the captured-state struct
+    // size + the layered indirection (closure → if/else → method call)
+    // measurably regressed greedy decode by ~19 tok/s (104 vs 122) on
+    // qwen3.6-35B-A3B-dwq48 200-token greedy bench (HEAD@588ccb6 vs
+    // 4adf689). Bisecting empirically: removing only the branch from the
+    // closure body restored 122 tok/s exactly; reverting decode_stream or
+    // qwen35_visible_generated_prefix did NOT recover the gap. Two-arm
+    // dispatch monomorphizes each path independently, eliminating the
+    // per-step branch + indirection.
+    //
+    // Cumulative-decode strategy: both arms use a stateful HuggingFace
+    // `decode_stream` (O(1) per token). The non-stream alternative —
+    // `tokenizer.decode(toks, false)` — re-tokenizes O(N) per call and
+    // sum-O(N²) per generation; that pattern showed 60 tok/s on a
+    // 1832-token sampling run (vs 116 tok/s peer). decode_stream + the
+    // `cumulative_text.push_str` accumulator reproduces the same
+    // `&str` value run_decode_loop expects without the quadratic blowup.
+    // Display-layer chat-template tag scrubber. Inference emits raw
+    // bytes; this filter sits on the streaming-print path and suppresses
+    // literal `<|im_end|>` / `<|im_start|>{role}` tags from the user's
+    // terminal without touching the inference layer.
+    let mut display = DisplayScrubber::new();
+
+    let outcome = if sample_logits {
+        let mut decode_stream = tokenizer.decode_stream(false);
+        let mut cumulative_text = String::new();
+        let mut last_decoded_count = 1usize;
+        if let Ok(Some(s)) = decode_stream.step(next_token) {
+            cumulative_text.push_str(&s);
         }
 
-        // Absolute position of the decode token: prompt_len + (step - 1) since
-        // step=1 is the second decode token, positioned at prompt_len.
-        // (step=0 was the first decode token sampled from prefill; it already
-        // "consumed" position prompt_len implicitly because we ran prefill at
-        // positions 0..prompt_len-1, so the next position is prompt_len.)
-        let pos = (prompt_len + step - 1) as i32;
-
-        // Check we haven't overrun the KV cache.
-        if pos as usize >= max_seq {
-            tracing::warn!(
-                "Qwen3.5 decode: reached max_seq {} at step {}; stopping",
-                max_seq,
-                step
-            );
-            break;
+        run_decode_loop(
+            next_token,
+            prompt_len,
+            max_seq,
+            args.max_tokens,
+            &eos_token_ids,
+            |prev_token, pos, generated_tokens| -> Result<u32> {
+                let decode_positions = vec![pos; 4];
+                let _t_step = step_profile_enabled.then(std::time::Instant::now);
+                let _t_fwd = step_profile_enabled.then(std::time::Instant::now);
+                let mut logits = model
+                    .forward_gpu_last_logits(&[prev_token], &decode_positions, &mut kv_cache)
+                    .with_context(|| format!("forward_gpu_last_logits decode at pos {pos}"))?;
+                let fwd_us = _t_fwd.map(|t| t.elapsed().as_micros());
+                let _t_smp = step_profile_enabled.then(std::time::Instant::now);
+                let next = sample_qwen35_logits_for_generate(&mut logits, &args, generated_tokens);
+                let smp_us = _t_smp.map(|t| t.elapsed().as_micros());
+                if let Some(t) = _t_step {
+                    eprintln!(
+                        "[STEP_PROFILE] pos={pos} total={:.2}ms fwd={:.2}ms smp={:.2}ms",
+                        t.elapsed().as_micros() as f64 / 1000.0,
+                        fwd_us.unwrap_or(0) as f64 / 1000.0,
+                        smp_us.unwrap_or(0) as f64 / 1000.0,
+                    );
+                }
+                Ok(next)
+            },
+            |toks| {
+                while last_decoded_count < toks.len() {
+                    let tok = toks[last_decoded_count];
+                    if let Ok(Some(s)) = decode_stream.step(tok) {
+                        cumulative_text.push_str(&s);
+                    }
+                    last_decoded_count += 1;
+                }
+                cumulative_text.clone()
+            },
+            |event| {
+                let cleaned = display.push(event.delta);
+                if !cleaned.is_empty() {
+                    print!("{}", cleaned);
+                    let _ = stdout.flush();
+                }
+            },
+        )?
+    } else {
+        let mut decode_stream = tokenizer.decode_stream(false);
+        let mut cumulative_text = String::new();
+        let mut last_decoded_count = 1usize;
+        if let Ok(Some(s)) = decode_stream.step(next_token) {
+            cumulative_text.push_str(&s);
         }
 
-        // Build single-token positions buffer: flat [4 * 1] all set to `pos`.
-        let decode_positions = vec![pos; 4];
+        run_decode_loop(
+            next_token,
+            prompt_len,
+            max_seq,
+            args.max_tokens,
+            &eos_token_ids,
+            |prev_token, pos, _generated_tokens| -> Result<u32> {
+                let decode_positions = vec![pos; 4];
+                let _t_step = step_profile_enabled.then(std::time::Instant::now);
+                // forward_gpu_greedy: GPU argmax → 4-byte download (vs 600KB full logits).
+                // Eliminates ~5ms/token vocabulary download for greedy decode.
+                let next = model
+                    .forward_gpu_greedy(&[prev_token], &decode_positions, &mut kv_cache)
+                    .with_context(|| format!("forward_gpu_greedy decode at pos {pos}"))?;
+                if let Some(t) = _t_step {
+                    eprintln!(
+                        "[STEP_PROFILE] pos={pos} total={:.2}ms",
+                        t.elapsed().as_micros() as f64 / 1000.0
+                    );
+                }
+                Ok(next)
+            },
+            |toks| {
+                while last_decoded_count < toks.len() {
+                    let tok = toks[last_decoded_count];
+                    if let Ok(Some(s)) = decode_stream.step(tok) {
+                        cumulative_text.push_str(&s);
+                    }
+                    last_decoded_count += 1;
+                }
+                cumulative_text.clone()
+            },
+            |event| {
+                let cleaned = display.push(event.delta);
+                if !cleaned.is_empty() {
+                    print!("{}", cleaned);
+                    let _ = stdout.flush();
+                }
+            },
+        )?
+    };
 
-        // forward_gpu_greedy: GPU argmax → 4-byte download (vs 600KB full logits).
-        // Eliminates ~5ms/token vocabulary download for greedy decode.
-        let _t_step = if std::env::var("HF2Q_STEP_PROFILE").is_ok() {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        next_token = model
-            .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache)
-            .with_context(|| format!("forward_gpu_greedy decode step {step}"))?;
-        if let Some(t) = _t_step {
-            eprintln!(
-                "[STEP_PROFILE] step={step} total={:.2}ms",
-                t.elapsed().as_micros() as f64 / 1000.0
-            );
-        }
-        generated += 1;
-
-        let s = tokenizer.decode(&[next_token], false).unwrap_or_default();
-        print!("{}", s);
-        stdout.flush()?;
+    // Flush any held-back trailing bytes from the display scrubber. These
+    // are bytes that COULD have been the start of a chat-template tag at
+    // the time on_event was called but never resolved into one before the
+    // loop ended.
+    let trailing = display.flush();
+    if !trailing.is_empty() {
+        print!("{}", trailing);
+        let _ = stdout.flush();
     }
 
+    // Loop-side stop reasons get a one-line tracing emit + (for repetition)
+    // a stderr diagnostic, matching the production behavior the loop
+    // previously emitted inline. EosTokenId / MaxTokensReached are the
+    // expected exits; MaxSeq is informational; the rest are loud.
+    match &outcome.stop_reason {
+        DecodeStopReason::EosTokenId(_) | DecodeStopReason::MaxTokensReached => {}
+        DecodeStopReason::MaxSeq => {
+            tracing::warn!(
+                "Qwen3.5 decode: reached max_seq {} after {} tokens; stopping",
+                max_seq, outcome.generated
+            );
+        }
+        DecodeStopReason::SpecialTokenLeak(marker) => {
+            tracing::info!(
+                "Qwen3.5 decode: special-token string `{marker}` detected in \
+                 cumulative decode after {} tokens; stopping.",
+                outcome.generated
+            );
+        }
+        DecodeStopReason::RepetitionLoop { ngram, repeats } => {
+            tracing::info!(
+                "Qwen3.5 decode: consecutive n-gram repetition detected after {} \
+                 tokens (last {} tokens repeated {} times consecutively); stopping.",
+                outcome.generated, ngram, repeats
+            );
+            // 2026-05-03 — when the user passed `--no-thinking` AND the loop
+            // fired EARLY (within 32-200 tokens), the most likely cause is
+            // the empty-`<think>\n\n</think>\n\n` suppressor in the chat
+            // template confusing the model into a degenerate attractor on
+            // this specific prompt. Both hf2q and llama.cpp exhibit this
+            // failure mode with `--no-thinking` on Qwen3.5/3.6 thinking-
+            // capable checkpoints (verified ADR-005 morning session). The
+            // canonical fix is to drop `--no-thinking` and let the
+            // auto-detected default (thinking-on) handle it; the model
+            // will emit an internal reasoning trace then the answer.
+            if args.no_thinking && outcome.generated < 200 {
+                eprintln!(
+                    "\n[hf2q] decode entered a {}-token consecutive-repetition loop \
+                     after only {} tokens with `--no-thinking`. On this Qwen3.5/3.6 \
+                     thinking-capable checkpoint, the empty `<think></think>` \
+                     suppressor is a known degenerate attractor for some prompts \
+                     (both hf2q AND llama.cpp produce the same loop). \
+                     Recommended fix: drop `--no-thinking` and let the auto-\
+                     detected thinking-mode handle it (the model will emit a \
+                     reasoning trace, then the answer). \
+                     Alternative escape: raise `--repetition-penalty` or use \
+                     `--temperature` >0.",
+                    ngram, outcome.generated
+                );
+            } else {
+                eprintln!(
+                    "\n[hf2q] decode entered a {}-token consecutive-repetition loop \
+                     after {} tokens — stopping. The model emitted the same \
+                     {}-token sequence {} times in a row; raise --repetition-penalty \
+                     or use a higher --temperature / lower --min-p to escape.",
+                    ngram, outcome.generated, ngram, repeats
+                );
+            }
+        }
+    }
+
+    let generated = outcome.generated;
     let decode_elapsed = decode_start.elapsed();
     let tok_per_sec = generated as f64 / decode_elapsed.as_secs_f64();
 
@@ -2234,8 +3291,21 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("mmproj GGUF tensor-set validation: {e}"))?;
         // Detect the arch profile so forward-pass dispatch knows
         // which per-block-norm shape to expect (Gemma 4 SigLIP vs
-        // classic CLIP vs Unknown).
-        let arch = crate::inference::vision::mmproj::detect_arch_profile(&actual_names);
+        // classic CLIP vs Qwen3-VL SigLIP vs Unknown).
+        //
+        // 2026-05-02 Wedge-4c.5 Phase-2c (Codex review of 2eb1e36):
+        // call the projector-aware detector here, NOT the tensor-only
+        // `detect_arch_profile`. Real Qwen3-VL GGUFs may flag DeepStack
+        // at indices > 0 (e.g. [3, 7, 15, 23] for a 24-layer ViT),
+        // which would leave `v.deepstack.0.fc1.weight` absent and the
+        // tensor-only detector would emit `Unknown`, blocking even
+        // text-only chat against a perfectly valid Qwen3-VL projector.
+        // The parsed `MmprojConfig.projector` is the upstream-most
+        // signal (`clip.cpp:865-867` gates the qwen3vl builder on it).
+        let arch = crate::inference::vision::mmproj::detect_arch_profile_with_projector(
+            &mmp_config.projector,
+            &actual_names,
+        );
         if !arch.is_supported() {
             anyhow::bail!(
                 "mmproj arch profile is Unknown — neither Gemma 4 \
@@ -2968,13 +4038,17 @@ fn cmd_parity_check(
             temperature: 0.0,
             top_p: 1.0,
             top_k: 0,
+            min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: tokens,
             chat_template: None,
             chat_template_file: None,
             benchmark: false,
             speculative: false,
+            enable_thinking: false,
+            no_thinking: false,
         },
+        Some(&tokenizer),
         &prompt_text,
     )?;
 
@@ -3149,13 +4223,17 @@ fn cmd_parity_capture(
                 temperature: 0.0,
                 top_p: 1.0,
                 top_k: 0,
+                min_p: 0.0,
                 repetition_penalty: 1.0,
                 max_tokens: tokens,
                 chat_template: None,
                 chat_template_file: None,
                 benchmark: false,
                 speculative: false,
+                enable_thinking: false,
+                no_thinking: false,
             },
+            Some(&tokenizer),
             &prompt_text,
         )?;
 
@@ -3194,15 +4272,36 @@ fn cmd_parity_capture(
 #[cfg(test)]
 mod tests {
     use super::{
-        maybe_print_serve_banner, render_jinja_template, should_enable_kv_persist,
+        detect_greedy_repetition_loop, find_special_token_stop, maybe_print_serve_banner,
+        llama_cpp_special_token_id_for_model, render_jinja_template,
+        resolve_enable_thinking, run_decode_loop,
+        should_enable_kv_persist, DecodeStopReason,
         FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
+    use crate::backends::chat_templates::QWEN3_CHATML;
+    use crate::cli;
     use crate::serve::load_info::{
         ArchFamily, ChatTemplateSource, LoadInfo, TokenizerSource,
     };
     use crate::serve::provenance::Provenance;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn llama_cpp_gpt2_special_token_defaults_match_vocab_cpp() {
+        assert_eq!(
+            llama_cpp_special_token_id_for_model("gpt2", "tokenizer.ggml.bos_token_id"),
+            Some(11)
+        );
+        assert_eq!(
+            llama_cpp_special_token_id_for_model("gpt2", "tokenizer.ggml.eos_token_id"),
+            Some(11)
+        );
+        assert_eq!(
+            llama_cpp_special_token_id_for_model("gpt2", "tokenizer.ggml.padding_token_id"),
+            None
+        );
+    }
 
     fn synthetic_serve_banner_info() -> LoadInfo {
         LoadInfo {
@@ -3355,7 +4454,7 @@ mod tests {
     #[test]
     fn jinja_template_renders_single_user_turn() {
         let tmpl = "{{ bos_token }}{% for m in messages %}<|turn|>{{ m.role }}\n{{ m.content }}<|end|>\n{% endfor %}{% if add_generation_prompt %}<|turn|>model\n{% endif %}";
-        let out = render_jinja_template(tmpl, "hello").expect("render ok");
+        let out = render_jinja_template(tmpl, "hello", None).expect("render ok");
         assert!(
             out.starts_with("<bos>"),
             "output should start with bos_token: {out}"
@@ -3374,7 +4473,7 @@ mod tests {
     #[test]
     fn jinja_template_parse_error_is_reported() {
         let tmpl = "{% unclosed"; // invalid
-        let err = render_jinja_template(tmpl, "x").unwrap_err();
+        let err = render_jinja_template(tmpl, "x", None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("parse") || msg.contains("Jinja") || msg.contains("template"),
@@ -3476,6 +4575,102 @@ mod tests {
         );
     }
 
+    // ── Wedge-4 / iter-227 — Qwen3-VL arch dispatch tests ──
+    //
+    // Pin the new dispatch arm in `LoadedModel::load` (api/engine.rs)
+    // and `cmd_generate` (this file's runtime arch peek) so the
+    // operator-actionable error message reaches the caller instead of
+    // the pre-iter-227 silent fall-through into the Gemma 4 loader's
+    // `missing blk.0.ffn_gate_up_exps.weight` panic.
+
+    /// Synthetic GGUF with arch=qwen3_vl (hf2q's underscored convention,
+    /// emitted by Wedge-4f convert) used to surface the iter-227
+    /// dispatch bail. As of **iter-228a** (2026-05-02) the dense
+    /// Qwen3-VL arm no longer bails at the dispatch site — it routes
+    /// through `Qwen3VlTextLoadedModel::load`, which then fails
+    /// downstream when the synthetic 0-tensor GGUF has no
+    /// `qwen3_vl.block_count` etc. metadata to parse a config from.
+    /// This test pins the new failure shape: dispatch reaches the
+    /// iter-228a config parser, NOT the Gemma loader (the regression
+    /// guard the iter-227 test was originally for is preserved).
+    #[test]
+    fn iter228a_load_engine_routes_qwen3_vl_to_qwen3vl_text_loader() {
+        let tmp = write_minimal_gguf_with_arch("qwen3_vl");
+        let cfg = super::multi_model::EngineConfig {
+            tokenizer_path: None,
+            config_path: None,
+            queue_capacity: 4,
+            warmup_synchronously: false,
+        };
+        let result = super::load_engine(tmp.path(), &cfg);
+        assert!(
+            result.is_err(),
+            "0-tensor synthetic qwen3_vl GGUF must fail load (no metadata)"
+        );
+        let msg = format!("{:#}", result.err().unwrap());
+        // Must reach the Qwen3VlTextConfig parser (not Gemma).
+        assert!(
+            msg.contains("Qwen3VlTextConfig::from_gguf")
+                || msg.contains("missing core architecture facts"),
+            "iter-228a must route dense Qwen3-VL through Qwen3VlTextConfig parser; got: {msg}"
+        );
+        // Regression guards from the iter-227 tests:
+        // (1) MUST NOT fall through to the Gemma loader's panic surface.
+        assert!(
+            !msg.contains("missing blk.0.ffn_gate_up_exps.weight"),
+            "iter-228a must intercept BEFORE the Gemma MoE expert load; got: {msg}"
+        );
+        // (2) MUST NOT regress to the iter-227 actionable-error bail
+        // for dense Qwen3-VL (that bail is now lifted; only MoE bails).
+        assert!(
+            !msg.contains("iter-227 closes only the dispatch gap"),
+            "iter-228a lifted the iter-227 dispatch bail for dense Qwen3-VL; got: {msg}"
+        );
+    }
+
+    /// Symmetric for the upstream llama.cpp arch-string convention
+    /// (no underscore — `qwen3vl`). Both arch spellings route through
+    /// the iter-228a load path.
+    #[test]
+    fn iter228a_load_engine_routes_qwen3vl_upstream_to_qwen3vl_text_loader() {
+        let tmp = write_minimal_gguf_with_arch("qwen3vl");
+        let cfg = super::multi_model::EngineConfig {
+            tokenizer_path: None,
+            config_path: None,
+            queue_capacity: 4,
+            warmup_synchronously: false,
+        };
+        let result = super::load_engine(tmp.path(), &cfg);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            msg.contains("Qwen3VlTextConfig::from_gguf")
+                || msg.contains("missing core architecture facts"),
+            "iter-228a must route upstream-arch dense Qwen3-VL through Qwen3VlTextConfig parser; got: {msg}"
+        );
+    }
+
+    /// MoE Qwen3-VL variant (Qwen3-VL-30B-A3B etc., upstream
+    /// `qwen3vlmoe` arch). The error must distinguish MoE from dense
+    /// so the operator knows which variant we recognized.
+    #[test]
+    fn iter227_load_engine_rejects_qwen3vlmoe_with_moe_specific_error() {
+        let tmp = write_minimal_gguf_with_arch("qwen3vlmoe");
+        let cfg = super::multi_model::EngineConfig {
+            tokenizer_path: None,
+            config_path: None,
+            queue_capacity: 4,
+            warmup_synchronously: false,
+        };
+        let result = super::load_engine(tmp.path(), &cfg);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            msg.contains("Qwen3-VL") && msg.contains("MoE"),
+            "iter-227 MoE-variant error must include 'MoE' to distinguish from dense; got: {msg}"
+        );
+    }
+
     /// Negative-path / regression guard: unknown architectures still
     /// route through the Gemma default arm of `LoadedModel::load`.
     /// The Gemma loader fails for missing config/tensors but the
@@ -3504,6 +4699,977 @@ mod tests {
         assert!(
             !msg.contains("qwen35_not_implemented"),
             "qwen35 sentinel must not fire on unknown arch; got: {msg}"
+        );
+        // Iter-227 sentinel must NOT fire for unknown arch — that
+        // would mean the Qwen3-VL match arm widened beyond the
+        // intended `qwen3_vl` / `qwen3vl` / `qwen3vlmoe` set.
+        assert!(
+            !msg.contains("Qwen3-VL"),
+            "iter-227 Qwen3-VL dispatch must not fire on unknown arch; got: {msg}"
+        );
+    }
+
+    /// Iter-227 regression guard for the existing qwen35 / qwen35moe
+    /// dispatch arms — they MUST still route to `Qwen35LoadedModel::load`,
+    /// NOT into the new iter-227 Qwen3-VL bail. The new is_qwen3_vl_arch
+    /// predicate is narrow and additive.
+    #[test]
+    fn iter227_does_not_regress_qwen35_dispatch() {
+        for arch in &["qwen35", "qwen35moe"] {
+            let tmp = write_minimal_gguf_with_arch(arch);
+            let cfg = super::multi_model::EngineConfig {
+                tokenizer_path: None,
+                config_path: None,
+                queue_capacity: 4,
+                warmup_synchronously: false,
+            };
+            let result = super::load_engine(tmp.path(), &cfg);
+            assert!(
+                result.is_err(),
+                "0-tensor synthetic GGUF for {arch} must fail load (routed to qwen35 path)"
+            );
+            let msg = format!("{:#}", result.err().unwrap());
+            // The Qwen3-VL bail message must NOT fire on real qwen35
+            // arch strings — that would mean iter-227's predicate
+            // widened past its intended scope.
+            assert!(
+                !msg.contains("Qwen3-VL"),
+                "iter-227 Qwen3-VL dispatch must NOT fire on arch={arch}; got: {msg}"
+            );
+        }
+    }
+
+    // ---- Greedy repetition-loop detector tests ----
+    //
+    // 2026-05-02 user reported the qwen35 generate CLI looping for 1014
+    // tokens of "I should make sure the response is accurate and up-to-date."
+    // before `<|im_end|>` finally fired. Pure greedy on thinking-style
+    // checkpoints is brittle. The detector below is the deterministic-mode
+    // escape hatch — sampling (temp/top_k/top_p) lands as a follow-up.
+
+    #[test]
+    fn detect_repetition_returns_none_below_window_size() {
+        let toks: Vec<u32> = (0..50).collect();
+        assert_eq!(detect_greedy_repetition_loop(&toks), None);
+    }
+
+    #[test]
+    fn detect_repetition_returns_none_for_diverse_tokens() {
+        let toks: Vec<u32> = (0..200).collect();
+        assert_eq!(detect_greedy_repetition_loop(&toks), None);
+    }
+
+    #[test]
+    fn detect_repetition_finds_8_token_cycle() {
+        // 8-token cycle repeated 16 times → 128-token window full of one cycle.
+        let cycle: [u32; 8] = [101, 102, 103, 104, 105, 106, 107, 108];
+        let mut toks: Vec<u32> = (0..50).collect();
+        for _ in 0..20 {
+            toks.extend_from_slice(&cycle);
+        }
+        let result = detect_greedy_repetition_loop(&toks);
+        assert!(result.is_some(), "8-token cycle should be detected");
+        let (ngram, occ) = result.unwrap();
+        assert_eq!(ngram, 8, "should detect at the smallest matching size");
+        assert!(
+            occ >= 4,
+            "should report ≥4 occurrences in a saturated window, got {occ}"
+        );
+    }
+
+    #[test]
+    fn detect_repetition_finds_16_token_cycle() {
+        // 16-token cycle won't be detected at ngram=8 (key not periodic at
+        // smaller granularity for arbitrary tokens), but at ngram=16 should
+        // fire.
+        let cycle: [u32; 16] = [
+            201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216,
+        ];
+        let mut toks: Vec<u32> = (0..50).collect();
+        for _ in 0..10 {
+            toks.extend_from_slice(&cycle);
+        }
+        let result = detect_greedy_repetition_loop(&toks);
+        assert!(result.is_some(), "16-token cycle should be detected");
+    }
+
+    #[test]
+    fn detect_repetition_tolerates_minor_drift() {
+        // User's actual case: cycle is mostly identical with one outlier
+        // mid-stream. Build 128-token window where last 16 tokens repeat
+        // 5+ times non-consecutively (one outlier replaces a single token
+        // in the middle).
+        let cycle: [u32; 12] = [301, 302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312];
+        let outlier: u32 = 999;
+        let mut toks: Vec<u32> = (0..30).collect();
+        for i in 0..10 {
+            if i == 4 {
+                // Outlier replaces one token mid-cycle.
+                let mut drifted = cycle.to_vec();
+                drifted[6] = outlier;
+                toks.extend_from_slice(&drifted);
+            } else {
+                toks.extend_from_slice(&cycle);
+            }
+        }
+        let result = detect_greedy_repetition_loop(&toks);
+        assert!(
+            result.is_some(),
+            "minor-drift cycle should still detect (non-consecutive matching), got None"
+        );
+    }
+
+    #[test]
+    fn detect_repetition_does_not_overcount_with_overlapping_increment() {
+        // Pin the non-overlap invariant: an all-same-token sequence MUST NOT
+        // report more than `window/ngram` occurrences (otherwise short n-grams
+        // would over-count and produce false positives at the threshold). For
+        // a 128-token all-zero window, ngram=8 should report ≤16 occurrences.
+        let toks: Vec<u32> = vec![0; 200];
+        let result = detect_greedy_repetition_loop(&toks);
+        assert!(result.is_some());
+        let (ngram, occ) = result.unwrap();
+        assert!(
+            occ <= 128 / ngram,
+            "non-overlap invariant violated: ngram={ngram} occ={occ} > {}",
+            128 / ngram
+        );
+    }
+
+    #[test]
+    fn detect_repetition_does_not_fire_on_bullet_list() {
+        // 2026-05-03 — regression pin for the wedding-cake false-positive.
+        // A shopping list with 6 bulleted items shares the prefix
+        //   `*   **Buy:**` (~8 tokens)
+        // followed by completely different content per bullet. The OLD
+        // window-scan detector (any 4 non-overlapping matches of the
+        // last-N-token key in the last 128 tokens) fired here because
+        // the prefix tokens incidentally appeared 4× in the window —
+        // even though the model was making real progress. Confirm the
+        // consecutive-only detector ignores this.
+        let bullet_prefix: [u32; 8] = [42, 32, 32, 32, 1234, 5678, 9012, 3456];
+        // synthetic non-prefix bytes per bullet, growing each time
+        let mut toks: Vec<u32> = (0..50).collect();
+        for content_seed in 0..6u32 {
+            toks.extend_from_slice(&bullet_prefix);
+            // 12-20 tokens of unique content per bullet
+            for j in 0..(12 + content_seed as usize) {
+                toks.push(50000 + content_seed * 100 + j as u32);
+            }
+        }
+        // The last 8 tokens are NOT all the prefix — the trailing content
+        // is unique. detect_greedy_repetition_loop should NOT fire.
+        assert_eq!(
+            detect_greedy_repetition_loop(&toks),
+            None,
+            "false positive on legitimate bullet-list enumeration"
+        );
+    }
+
+    #[test]
+    fn detect_repetition_fires_on_true_consecutive_loop() {
+        // 2026-05-03 — pin the true-loop detection as the inverse of the
+        // bullet-list test. The 2026-05-02 French-Toast user report had
+        // the model emitting `"I should make sure the response is
+        // accurate and up-to-date."` × 30+ in a row. That sequence,
+        // tokenized, is roughly 16 tokens; consecutive emission for 30
+        // cycles trivially satisfies "last 4 × 16 tokens are 4 copies
+        // of the last 16 tokens". Verify the new detector still fires.
+        let cycle: [u32; 16] = [
+            701, 702, 703, 704, 705, 706, 707, 708, 709, 710, 711, 712, 713, 714, 715, 716,
+        ];
+        let mut toks: Vec<u32> = (0..50).collect();
+        for _ in 0..30 {
+            toks.extend_from_slice(&cycle);
+        }
+        let result = detect_greedy_repetition_loop(&toks);
+        assert!(
+            result.is_some(),
+            "true consecutive loop must still trigger the detector"
+        );
+        let (ngram, _occ) = result.unwrap();
+        assert_eq!(
+            ngram, 16,
+            "16-token cycle's halves are NOT individually periodic at 8, so \
+             ngram=8 doesn't fire; the smallest matching consecutive period \
+             is 16"
+        );
+    }
+
+    // ---- find_special_token_stop matrix --------------------------------
+    //
+    // 2026-05-02 — pin the substring stop policy with a falsifiable test
+    // matrix so it can't drift silently the way the inline `const` did
+    // (three commits, opposite directions, all uncovered). Each test case
+    // names a real model-output pattern observed in user reports OR a
+    // hypothetical we want to NOT trip on.
+
+    #[test]
+    fn special_token_stop_empty_input() {
+        assert_eq!(find_special_token_stop(""), None);
+    }
+
+    #[test]
+    fn special_token_stop_plain_thinking_text_does_not_stop() {
+        // Bare thinking-style content with no markers — must continue.
+        let s = "I should make sure the answer is comprehensive and avoids \
+                 jargon. The user is asking about candy.";
+        assert_eq!(find_special_token_stop(s), None);
+    }
+
+    #[test]
+    fn special_token_stop_think_html_tag_does_not_stop() {
+        // `</think>` end-of-thinking tag is NOT in the stop set — it's a
+        // legitimate thinking-mode transition; the model continues to the
+        // actual answer afterwards.
+        let s = "<think>reasoning content</think>\n\nactual answer";
+        assert_eq!(find_special_token_stop(s), None);
+    }
+
+    #[test]
+    fn special_token_stop_im_end_alone_is_not_a_stop() {
+        // 2026-05-03 — `<|im_end|>` was REMOVED from SPECIAL_TOKEN_STOPS.
+        // On thinking-capable Qwen3 finetunes (e.g. abliterix-EGA-
+        // abliterated dwq48) the model emits `<|im_end|>` as a SEGMENT
+        // separator BETWEEN thinking and the actual answer, NOT as a
+        // turn-end marker. Stopping there cut generation off before the
+        // answer was emitted. The turn-end signal on this finetune is the
+        // NEXT-turn opener `<|im_start|>user` — see
+        // `special_token_stop_im_start_user_signals_turn_end` below.
+        let s = "answer text<|im_end|>";
+        assert_eq!(find_special_token_stop(s), None);
+    }
+
+    #[test]
+    fn special_token_stop_im_start_user_signals_turn_end() {
+        // The model hallucinating the next user turn = it has finished
+        // its assistant turn. Stop here.
+        let s = "[thinking]<|im_end|>\n<|im_start|>assistant\n[answer]<|im_end|>\n<|im_start|>user\nnext";
+        assert_eq!(find_special_token_stop(s), Some("<|im_start|>user"));
+    }
+
+    #[test]
+    fn special_token_stop_endoftext_fragment_stops() {
+        let s = "answer text<|endoftext|>";
+        assert_eq!(find_special_token_stop(s), Some("<|endoftext|>"));
+    }
+
+    #[test]
+    fn special_token_stop_end_marker_before_im_start_stops_at_end() {
+        // 2026-05-02 candy-thinking degeneracy: post-`<|end|>` model
+        // hallucinates a new `<|im_start|>user` turn and echoes the prompt.
+        // `<|im_start|>` is not a llama.cpp-style stop by itself, but the
+        // preceding end marker is.
+        let s = "thinking content<|end|>\n\n<|im_start|>user\necho";
+        assert_eq!(find_special_token_stop(s), Some("<|end|>"));
+    }
+
+    #[test]
+    fn special_token_stop_im_end_then_assistant_role_no_user_does_not_stop() {
+        // 2026-05-03 — the original French-Toast leak fixture
+        // (`<|im_end|>` followed by `<|im_start|>assistant`) is NOT a
+        // turn boundary on the finetunes that emit `<|im_end|>` as a
+        // segment separator. Without a `<|im_start|>user` follow-up,
+        // generation continues. (For models that emit id 151645
+        // properly, integer-EOS catches first; this list is the
+        // text-fragment fallback only.)
+        let s = "answer<|im_end|>\n<|im_start|>assistant\nleak";
+        assert_eq!(find_special_token_stop(s), None);
+    }
+
+    #[test]
+    fn special_token_stop_phi3_end_marker_stops() {
+        // Phi-3-style end-of-turn marker emitted as multi-token text on a
+        // Qwen3.x-architecture GGUF (observed 2026-05-02 candy prompt).
+        let s = "answer<|end|>";
+        assert_eq!(find_special_token_stop(s), Some("<|end|>"));
+    }
+
+    #[test]
+    fn special_token_stop_end_substring_does_not_falsely_match_endoftext() {
+        // Sanity: `<|end|>` (7 chars: `<|end|>`) is NOT a substring of
+        // `<|endoftext|>` (after `<|end` we have `oftext|>`, not `|>`).
+        // When only `<|endoftext|>` is present, the returned marker must be
+        // `<|endoftext|>`.
+        let s = "answer<|endoftext|>";
+        assert_eq!(find_special_token_stop(s), Some("<|endoftext|>"));
+    }
+
+    #[test]
+    fn special_token_stop_degenerate_im_start_only_does_not_stop() {
+        // llama.cpp does not treat `<|im_start|>` as an implicit reverse
+        // prompt in the normal completion sampler. Stopping here causes the
+        // Qwen no-thinking path to terminate before the model can continue
+        // after a generated ChatML opener.
+        let s = "<|im_start|>\n\n<|im_start|>";
+        assert_eq!(find_special_token_stop(s), None);
+    }
+
+    #[test]
+    fn special_token_stop_qwen3_thinking_clean_answer_does_not_stop_mid_text() {
+        // Negative case: realistic Qwen3-thinking output without any
+        // turn-leak markers must NOT stop mid-text.
+        let s = "<think>The user wants candy.</think>\n\n\
+                 To make candy you need sugar, water, and flavoring. \
+                 Heat to soft-ball stage at 235°F.";
+        assert_eq!(find_special_token_stop(s), None);
+    }
+
+    #[test]
+    fn special_token_stop_earliest_marker_wins() {
+        // Pin the tie-break: when multiple stops are present, stop at the
+        // earliest byte position. This matches streaming behavior: once a
+        // complete stop marker appears, later text is not part of the answer.
+        let s = "x<|end|>y<|im_end|>z";
+        assert_eq!(find_special_token_stop(s), Some("<|end|>"));
+    }
+
+    // Removed 2026-05-03: `special_token_safe_prefix` and
+    // `qwen35_visible_generated_prefix` — the inference-layer visible-text
+    // surgery they implemented was the brittle scaffolding the user called
+    // out. run_decode_loop now emits raw decoded tokens; only the 3-string
+    // `SPECIAL_TOKEN_STOPS` list remains (matches llama.cpp's stop-string
+    // contract). The two helpers + their tests are removed alongside.
+
+    // ---- enable_thinking plumbing into chat-template render ----------
+    //
+    // 2026-05-02 — pin the H2-audit fix (docs/research/decode-test-gap-2026-05-02.md).
+    // `render_jinja_template` was not passing `enable_thinking` into the
+    // Jinja context; the qwen3-chatml.jinja `else` branch at line 152 always
+    // fired, opening an unfilled `<think>\n` block. On non-thinking
+    // checkpoints the model improvised a close marker (Phi-3's `<|end|>` in
+    // the user's candy-prompt repro 2026-05-02). These tests pin the three
+    // resolved states (Some(true), Some(false), None) against the bundled
+    // qwen3-chatml.jinja vendor fixture so a future regression on the plumb
+    // surface fails at PR time, not at the operator's terminal.
+
+    #[test]
+    fn render_jinja_qwen3_chatml_enable_thinking_true_opens_unfilled_think_block() {
+        let rendered = render_jinja_template(QWEN3_CHATML, "make me candy", Some(true))
+            .expect("qwen3-chatml render with enable_thinking=true must succeed");
+        assert!(
+            rendered.ends_with("<|im_start|>assistant\n<think>\n"),
+            "with enable_thinking=true the qwen3-chatml `else` branch (line 152) \
+             must fire, ending the prompt with `<|im_start|>assistant\\n<think>\\n` \
+             so the model emits reasoning content next. Actual tail: \
+             `{}`",
+            &rendered[rendered.len().saturating_sub(60)..]
+        );
+    }
+
+    #[test]
+    fn render_jinja_qwen3_chatml_enable_thinking_false_emits_pre_closed_think_block() {
+        let rendered = render_jinja_template(QWEN3_CHATML, "make me candy", Some(false))
+            .expect("qwen3-chatml render with enable_thinking=false must succeed");
+        assert!(
+            rendered.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "with enable_thinking=false the qwen3-chatml `if` branch (line 150) \
+             must fire, emitting a pre-closed `<think>\\n\\n</think>\\n\\n` block \
+             so the model skips reasoning and emits the answer directly. Actual \
+             tail: `{}`",
+            &rendered[rendered.len().saturating_sub(60)..]
+        );
+    }
+
+    #[test]
+    fn render_jinja_qwen3_chatml_enable_thinking_none_treats_as_undefined_else_branch() {
+        // Property pin: when callers pass None to render_jinja_template
+        // directly (e.g. an internal API path that hasn't been updated to
+        // resolve the default), Jinja sees the variable as undefined. The
+        // `enable_thinking is defined and ... is false` guard fails; the
+        // `else` branch fires; output matches Some(true).
+        //
+        // NOTE: `render_chat_template` no longer EVER passes None — the
+        // 2026-05-02 user-regression follow-up changed the default
+        // resolution to Some(false). This test pins the LOWER-LEVEL helper
+        // semantics (None == undefined Jinja var) so future callers know
+        // what the contract is, even though the upper-level CLI path
+        // doesn't exercise None anymore.
+        let rendered_none = render_jinja_template(QWEN3_CHATML, "make me candy", None)
+            .expect("qwen3-chatml render with None must succeed");
+        let rendered_true = render_jinja_template(QWEN3_CHATML, "make me candy", Some(true))
+            .expect("qwen3-chatml render with Some(true) must succeed");
+        assert_eq!(
+            rendered_none, rendered_true,
+            "with the qwen3-chatml template, None must render byte-identically \
+             to Some(true) — the `is defined and is false` guard fails for both. \
+             A divergence here means minijinja serialized None as a non-undefined \
+             value, which would break the lower-level helper contract."
+        );
+    }
+
+    /// Build a default `GenerateArgs` for testing the resolution helper.
+    /// The `Default` derive isn't on the struct (clap derives don't include
+    /// Default), so we construct one manually here.
+    fn test_args_default() -> cli::GenerateArgs {
+        cli::GenerateArgs {
+            model: std::path::PathBuf::from("/dev/null"),
+            prompt: None,
+            prompt_file: None,
+            tokenizer: None,
+            config: None,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            max_tokens: 1,
+            chat_template: None,
+            chat_template_file: None,
+            benchmark: false,
+            speculative: false,
+            enable_thinking: false,
+            no_thinking: false,
+        }
+    }
+
+    // ---- canonical render-and-diff thinking-mode detection -----------
+    //
+    // 2026-05-02 (peer-audit-driven rewrite of the auto-detect signal,
+    // /tmp/cfa-thinking-detect/peer-detection-report.md).
+    //
+    // The old name-substring heuristic was rejected by the user:
+    //   "Thinking is not determined by having thinking in the model
+    //    name. Thinking is determined by the model class and what is
+    //    available in the gguf file."
+    //
+    // The canonical signal — used by llama.cpp at
+    // /opt/llama.cpp/common/chat-diff-analyzer.cpp:319-401 and
+    // /opt/llama.cpp/common/chat.cpp:244-257 — is to render the
+    // resolved chat template TWICE with `enable_thinking=true` then
+    // `=false`, then recover whether the enabled render actually opens a
+    // reasoning block. Plain byte inequality is too broad for Qwen3:
+    // llama.cpp's own test_template.py expects Qwen-Qwen3-0.6B auto to end
+    // at `<|im_start|>assistant\n`, even though `reasoning=off` appends an
+    // empty `<think></think>` suppressor.
+
+    use super::template_supports_enable_thinking;
+
+    #[test]
+    fn template_supports_enable_thinking_true_for_qwen3_chatml() {
+        // The bundled qwen3-chatml.jinja vendor template has explicit
+        // `enable_thinking is defined and is false` branching at lines
+        // 147-153. Render-and-diff MUST detect this.
+        assert!(
+            template_supports_enable_thinking(QWEN3_CHATML),
+            "qwen3-chatml.jinja MUST be detected as thinking-capable; \
+             render-and-diff against vendor lines 147-153 should differ"
+        );
+    }
+
+    #[test]
+    fn template_supports_enable_thinking_false_for_thinking_agnostic_template() {
+        // A minimal Jinja that doesn't reference `enable_thinking` at
+        // all renders identically regardless of the flag → should NOT
+        // be detected as thinking-capable.
+        let template = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n\
+                        {% endfor %}{% if add_generation_prompt %}assistant: {% endif %}";
+        assert!(
+            !template_supports_enable_thinking(template),
+            "thinking-agnostic template MUST NOT be flagged"
+        );
+    }
+
+    #[test]
+    fn template_supports_enable_thinking_false_for_plain_qwen3_suppressor_template() {
+        // Mirrors llama.cpp tools/server/tests/unit/test_template.py:
+        // Qwen-Qwen3-0.6B with reasoning=auto ends at the bare assistant
+        // generation prompt, while reasoning=off appends an empty
+        // `<think></think>` suppressor. This is a real byte difference, but
+        // it is NOT evidence that auto should open thinking.
+        let template = "{%- for m in messages -%}\
+                        <|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n\
+                        {%- endfor -%}\
+                        {%- if add_generation_prompt -%}\
+                        <|im_start|>assistant\n\
+                        {%- if enable_thinking is defined and enable_thinking is false -%}\
+                        <think>\n\n</think>\n\n\
+                        {%- endif -%}\
+                        {%- endif -%}";
+        assert!(
+            !template_supports_enable_thinking(template),
+            "a disabled-only empty think suppressor must not auto-enable thinking"
+        );
+    }
+
+    #[test]
+    fn template_supports_enable_thinking_false_for_empty_branch_template() {
+        // Edge case: a template that DOES reference `enable_thinking`
+        // but has empty branches (no byte-level difference) renders
+        // identically and must NOT be flagged. Pins the property that
+        // we're checking effective output, not just textual mention.
+        let template = "{% if enable_thinking %}{% endif %}\
+                        {% for m in messages %}{{ m.content }}{% endfor %}";
+        assert!(
+            !template_supports_enable_thinking(template),
+            "empty-branch template MUST NOT be flagged (output bytes \
+             are identical for true vs false)"
+        );
+    }
+
+    #[test]
+    fn template_supports_enable_thinking_false_on_malformed_template() {
+        // Malformed Jinja must NOT crash the auto-detect — graceful
+        // false fallback so the caller's actual render attempt is the
+        // one that surfaces the parse error.
+        let template = "{% unclosed";
+        assert!(
+            !template_supports_enable_thinking(template),
+            "malformed template must produce false (graceful), not panic"
+        );
+    }
+
+    #[test]
+    fn resolve_enable_thinking_default_no_template_returns_some_false() {
+        // No flag, no template (e.g. fallback path) → safe default.
+        let args = test_args_default();
+        assert_eq!(resolve_enable_thinking(&args, None), Some(false));
+    }
+
+    #[test]
+    fn resolve_enable_thinking_default_thinking_template_auto_enables() {
+        // The user's expected behavior on the bundled qwen3-chatml.jinja:
+        // default cmdline → render-and-diff detects thinking branches →
+        // enable_thinking=true → model emits BOTH reasoning + answer.
+        // This is the "we want both" path the user requested.
+        let args = test_args_default();
+        assert_eq!(
+            resolve_enable_thinking(&args, Some(QWEN3_CHATML)),
+            Some(true),
+            "qwen3-chatml.jinja default render MUST auto-enable thinking"
+        );
+    }
+
+    #[test]
+    fn resolve_enable_thinking_default_non_thinking_template_returns_some_false() {
+        // Plain ChatML without thinking branches → render-and-diff is
+        // bytewise identical → no auto-enable → safe default false.
+        let template = "{% for m in messages %}<|im_start|>{{ m.role }}\n\
+                        {{ m.content }}<|im_end|>\n{% endfor %}\
+                        {% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+        let args = test_args_default();
+        assert_eq!(resolve_enable_thinking(&args, Some(template)), Some(false));
+    }
+
+    #[test]
+    fn resolve_enable_thinking_explicit_enable_overrides_auto_detect() {
+        // Explicit --enable-thinking wins even when the template would
+        // auto-detect to false.
+        let mut args = test_args_default();
+        args.enable_thinking = true;
+        let plain = "{{ messages[0].content }}";
+        assert_eq!(resolve_enable_thinking(&args, Some(plain)), Some(true));
+    }
+
+    #[test]
+    fn resolve_enable_thinking_explicit_no_thinking_overrides_auto_detect() {
+        // Explicit --no-thinking wins even when the template would
+        // auto-detect to true. Critical escape hatch: a template that
+        // probes as thinking-capable but breaks for the user's specific
+        // checkpoint must be opt-out-able.
+        let mut args = test_args_default();
+        args.no_thinking = true;
+        assert_eq!(
+            resolve_enable_thinking(&args, Some(QWEN3_CHATML)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn user_candy_regression_default_non_thinking_template_renders_pre_closed() {
+        // 2026-05-02 candy-prompt regression: a non-thinking template
+        // (no `enable_thinking` Jinja branch) auto-detects to false →
+        // render goes through but `enable_thinking=false` is irrelevant
+        // since the template doesn't branch on it. Pin: with QWEN3_CHATML
+        // the regression-safe path requires explicit --no-thinking.
+        let mut args = test_args_default();
+        args.no_thinking = true;
+        let resolved = resolve_enable_thinking(&args, Some(QWEN3_CHATML));
+        let rendered = render_jinja_template(QWEN3_CHATML, "make me candy", resolved)
+            .expect("--no-thinking render must succeed");
+        assert!(
+            rendered.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "--no-thinking on qwen3-chatml MUST emit pre-closed think block. \
+             Actual tail: `{}`",
+            &rendered[rendered.len().saturating_sub(80)..]
+        );
+    }
+
+    #[test]
+    fn user_we_want_both_default_on_qwen3_chatml_renders_open_block() {
+        // The "we want both" path: with the bundled qwen3-chatml.jinja
+        // (auto-detected as thinking-capable via render-and-diff), the
+        // default cmdline MUST emit `<think>\n` so the model produces
+        // BOTH reasoning AND answer — exactly what the user asked for.
+        // FALSIFIES if a future change reverts to name-substring or
+        // unconditional false.
+        let args = test_args_default();
+        let resolved = resolve_enable_thinking(&args, Some(QWEN3_CHATML));
+        assert_eq!(resolved, Some(true), "auto-detect must enable thinking");
+        let rendered = render_jinja_template(QWEN3_CHATML, "make me candy", resolved)
+            .expect("default render must succeed");
+        assert!(
+            rendered.ends_with("<|im_start|>assistant\n<think>\n"),
+            "default cmdline on qwen3-chatml MUST emit open think block. \
+             Actual tail: `{}`",
+            &rendered[rendered.len().saturating_sub(80)..]
+        );
+    }
+
+    #[test]
+    fn render_jinja_qwen3_chatml_enable_thinking_does_not_affect_user_message() {
+        // Sanity: the user message body itself must be present regardless of
+        // the thinking flag. Pin against accidental message stripping.
+        for et in [None, Some(true), Some(false)] {
+            let rendered = render_jinja_template(QWEN3_CHATML, "MARKER_USER_BODY_42", et)
+                .expect("render must succeed");
+            assert!(
+                rendered.contains("MARKER_USER_BODY_42"),
+                "user message body missing from rendered prompt with \
+                 enable_thinking={et:?}"
+            );
+            assert!(
+                rendered.contains("<|im_start|>user\n"),
+                "user-turn opener missing from rendered prompt with \
+                 enable_thinking={et:?}"
+            );
+        }
+    }
+
+    // ---- run_decode_loop matrix tests --------------------------------
+    //
+    // 2026-05-02 — H3 Layer A unlock per item (c) of the dossier plan
+    // (docs/research/decode-test-gap-2026-05-02.md). The decode-loop
+    // body was previously inline in cmd_generate_qwen35; today's 12+
+    // helper tests pinned individual pure functions in isolation but
+    // not the loop body that composes them. These tests feed synthetic
+    // token streams through `run_decode_loop` and assert on the
+    // `DecodeLoopOutcome` + emitted-event sequence — the entire loop
+    // is now testable without a Metal GPU.
+
+    /// Build a closure factory that returns canned tokens in order.
+    /// `tokens[0]` is returned on the first step_model call, `tokens[1]`
+    /// on the second, etc. Panics if the loop calls past the supplied
+    /// stream — that's a test-author bug.
+    fn canned_step_model(tokens: Vec<u32>) -> impl FnMut(u32, i32, &[u32]) -> super::Result<u32> {
+        let mut iter = tokens.into_iter();
+        move |_prev, _pos, _generated| {
+            let t = iter.next().expect("test bug: canned stream exhausted");
+            Ok(t)
+        }
+    }
+
+    /// Decode tokens to text by trivial mapping: each id maps to the
+    /// digit/letter that visually identifies it. Avoids needing a real
+    /// tokenizer in unit tests.
+    fn ascii_decode(toks: &[u32]) -> String {
+        toks.iter().map(|&t| char::from(t as u8)).collect()
+    }
+
+    #[test]
+    fn run_decode_loop_max_tokens_reached() {
+        // No EOS, no leak, no repetition — loop runs to budget.
+        let outcome = run_decode_loop(
+            b'A' as u32,
+            10,
+            1024,
+            5,
+            &[999],
+            canned_step_model(vec![b'B' as u32, b'C' as u32, b'D' as u32, b'E' as u32]),
+            ascii_decode,
+            |_event| {},
+        )
+        .expect("step_model never errors here");
+        assert_eq!(outcome.stop_reason, DecodeStopReason::MaxTokensReached);
+        // 1 (seed) + 4 (step 1..5) = 5 generated.
+        assert_eq!(outcome.generated, 5);
+    }
+
+    #[test]
+    fn run_decode_loop_stops_on_integer_eos() {
+        // Stream produces a token id that's in eos_token_ids.
+        let outcome = run_decode_loop(
+            b'A' as u32,
+            10,
+            1024,
+            10,
+            &[42],
+            canned_step_model(vec![b'B' as u32, 42, b'D' as u32]),
+            ascii_decode,
+            |_event| {},
+        )
+        .expect("ok");
+        assert_eq!(outcome.stop_reason, DecodeStopReason::EosTokenId(42));
+        // Seed (A) + step 1 (B) + step 2 (42, EOS-detected at TOP of step 3) = 3.
+        assert_eq!(outcome.generated, 3);
+    }
+
+    #[test]
+    fn run_decode_loop_stops_on_special_token_leak() {
+        // Stream produces a sequence whose decoded text contains
+        // `<|im_start|>user` (one of SPECIAL_TOKEN_STOPS — the model
+        // hallucinating the next user turn = its assistant turn is over).
+        // Use a custom decode_text that injects the leak after step 2.
+        let mut step = 0;
+        let outcome = run_decode_loop(
+            b'A' as u32,
+            10,
+            1024,
+            10,
+            &[999],
+            canned_step_model(vec![b'B' as u32, b'C' as u32, b'D' as u32]),
+            move |toks| {
+                step += 1;
+                let mut s: String = toks.iter().map(|&t| char::from(t as u8)).collect();
+                if step >= 3 {
+                    s.push_str("<|im_start|>user");
+                }
+                s
+            },
+            |_event| {},
+        )
+        .expect("ok");
+        assert_eq!(
+            outcome.stop_reason,
+            DecodeStopReason::SpecialTokenLeak("<|im_start|>user"),
+        );
+    }
+
+    #[test]
+    fn run_decode_loop_streams_raw_deltas_then_stops_on_full_marker() {
+        // 2026-05-03 — the inference layer now emits RAW decoded text. As
+        // `<|im_start|>user` arrives byte-by-byte, each partial prefix is
+        // streamed to the caller AS-IS. Once the full marker assembles in
+        // the cumulative text, the SpecialTokenLeak stop fires.
+        //
+        // Pre-2026-05-03 this test asserted that partial stop prefixes
+        // were buffered (held back via `trailing_special_token_prefix_len`)
+        // until the marker resolved. That visible-prefix surgery was
+        // removed because it leaked into a 150-LOC web of pattern matches
+        // that the user ("VERY brittle patterns / with the stripping")
+        // correctly identified as inference/display layer confusion.
+        // llama.cpp's libllama doesn't do that surgery either; the CLI /
+        // application layer is responsible for any user-facing formatting.
+        let mut deltas: Vec<String> = Vec::new();
+        const TARGET: &str = "<|im_start|>user";
+        let outcome = run_decode_loop(
+            b'<' as u32,
+            10,
+            1024,
+            32,
+            &[999],
+            canned_step_model(TARGET.bytes().skip(1).map(|b| b as u32).collect()),
+            ascii_decode,
+            |event| deltas.push(event.delta.to_string()),
+        )
+        .expect("ok");
+        assert_eq!(
+            outcome.stop_reason,
+            DecodeStopReason::SpecialTokenLeak("<|im_start|>user")
+        );
+        // Deltas concatenate to the FULL marker text — partial prefixes
+        // ARE streamed (raw inference layer; caller decides whether to
+        // display them).
+        let joined: String = deltas.concat();
+        assert_eq!(joined, TARGET);
+    }
+
+    #[test]
+    fn run_decode_loop_stops_on_repetition() {
+        // Build a stream that's identical 8-token cycles repeated.
+        let cycle: Vec<u32> = (b'A'..=b'H').map(|c| c as u32).collect();
+        let mut stream: Vec<u32> = Vec::new();
+        for _ in 0..40 {
+            stream.extend(cycle.iter().copied());
+        }
+        let outcome = run_decode_loop(
+            b'Z' as u32,
+            10,
+            1024,
+            500,
+            &[999],
+            canned_step_model(stream),
+            ascii_decode,
+            |_event| {},
+        )
+        .expect("ok");
+        match outcome.stop_reason {
+            DecodeStopReason::RepetitionLoop { ngram, repeats } => {
+                assert!(ngram >= 8, "expected ngram >= 8, got {ngram}");
+                assert!(repeats >= 4, "expected repeats >= 4, got {repeats}");
+            }
+            other => panic!("expected RepetitionLoop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_decode_loop_stops_on_max_seq_overrun() {
+        // prompt_len + step - 1 == max_seq triggers MaxSeq stop. With
+        // prompt_len=8, max_seq=10, step=1 puts pos=8, step=2 puts
+        // pos=9, step=3 puts pos=10 → overrun.
+        let outcome = run_decode_loop(
+            b'A' as u32,
+            8,
+            10,
+            10,
+            &[999],
+            canned_step_model(vec![b'B' as u32, b'C' as u32, b'D' as u32]),
+            ascii_decode,
+            |_event| {},
+        )
+        .expect("ok");
+        assert_eq!(outcome.stop_reason, DecodeStopReason::MaxSeq);
+        // Seed (A) + step 1 (B) + step 2 (C) = 3; step 3 hits the
+        // pos-check at top and returns MaxSeq before another forward call.
+        assert_eq!(outcome.generated, 3);
+    }
+
+    #[test]
+    fn run_decode_loop_emits_step_zero_seed_event() {
+        // Pin: the seed token from prefill argmax MUST be emitted as
+        // step=0 with delta == cumulative_text. This is what makes the
+        // FIRST printed bytes appear in the production CLI without
+        // requiring a special-case before the loop.
+        let mut events: Vec<(usize, u32, String, String)> = Vec::new();
+        let _ = run_decode_loop(
+            b'A' as u32,
+            10,
+            1024,
+            2,
+            &[999],
+            canned_step_model(vec![b'B' as u32]),
+            ascii_decode,
+            |event| {
+                events.push((
+                    event.step,
+                    event.token,
+                    event.cumulative_text.to_string(),
+                    event.delta.to_string(),
+                ));
+            },
+        )
+        .expect("ok");
+        assert_eq!(events.len(), 2, "expected 2 events (step 0 + step 1)");
+        assert_eq!(events[0].0, 0);
+        assert_eq!(events[0].1, b'A' as u32);
+        assert_eq!(events[0].2, "A");
+        assert_eq!(events[0].3, "A", "step 0 delta MUST equal cumulative");
+    }
+
+    #[test]
+    fn run_decode_loop_delta_is_cumulative_minus_previous() {
+        // Pin: per-step delta == cumulative_text - previous cumulative.
+        // For UTF-8 streaming correctness this is THE invariant.
+        let mut deltas: Vec<String> = Vec::new();
+        let _ = run_decode_loop(
+            b'X' as u32,
+            10,
+            1024,
+            4,
+            &[999],
+            canned_step_model(vec![b'Y' as u32, b'Z' as u32, b'!' as u32]),
+            ascii_decode,
+            |event| deltas.push(event.delta.to_string()),
+        )
+        .expect("ok");
+        // step 0 emits "X" (full seed); step 1 emits "Y"; step 2 "Z"; step 3 "!".
+        assert_eq!(deltas, vec!["X", "Y", "Z", "!"]);
+    }
+
+    #[test]
+    fn run_decode_loop_propagates_step_model_error() {
+        // A failing forward pass MUST surface the error through `Result`.
+        let outcome = run_decode_loop(
+            b'A' as u32,
+            10,
+            1024,
+            5,
+            &[999],
+            |_prev, pos, _generated| -> super::Result<u32> {
+                Err(anyhow::anyhow!("synthetic forward failure at pos {pos}"))
+            },
+            ascii_decode,
+            |_event| {},
+        );
+        assert!(outcome.is_err());
+        let msg = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            msg.contains("synthetic forward failure"),
+            "expected error to propagate, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_decode_loop_zero_max_tokens_emits_seed_only() {
+        // max_tokens=1 means the for-loop range is 1..1 (empty); only the
+        // seed event fires, and we exit with MaxTokensReached + 1 generated.
+        let mut events_count = 0usize;
+        let outcome = run_decode_loop(
+            b'A' as u32,
+            10,
+            1024,
+            1,
+            &[999],
+            canned_step_model(vec![]), // empty — never called
+            ascii_decode,
+            |_event| events_count += 1,
+        )
+        .expect("ok");
+        assert_eq!(events_count, 1, "only the seed event must fire");
+        assert_eq!(outcome.generated, 1);
+        assert_eq!(outcome.stop_reason, DecodeStopReason::MaxTokensReached);
+    }
+
+    #[test]
+    fn run_decode_loop_initial_token_is_eos_stops_at_top_of_step_one() {
+        // Edge case: prefill argmax returns an EOS-class token. The loop
+        // emits the seed event at step 0, then enters step 1, sees
+        // next_token in eos_token_ids, and stops. This matches production
+        // semantics (`for step in 1..` with the eos check at the top).
+        let mut events_count = 0usize;
+        let outcome = run_decode_loop(
+            42,
+            10,
+            1024,
+            5,
+            &[42],
+            canned_step_model(vec![]),
+            ascii_decode,
+            |_event| events_count += 1,
+        )
+        .expect("ok");
+        assert_eq!(events_count, 1);
+        assert_eq!(outcome.generated, 1);
+        assert_eq!(outcome.stop_reason, DecodeStopReason::EosTokenId(42));
+    }
+
+    #[test]
+    fn run_decode_loop_phi3_end_marker_caught_via_special_token_leak() {
+        // 2026-05-02 user-reported regression class: the model emits
+        // `<|end|>` as a multi-token text fragment after thinking content.
+        // run_decode_loop must catch this via SpecialTokenLeak ("<|end|>").
+        let mut step = 0;
+        let outcome = run_decode_loop(
+            b'A' as u32,
+            10,
+            1024,
+            10,
+            &[999],
+            canned_step_model(vec![b'B' as u32, b'C' as u32, b'D' as u32]),
+            move |toks| {
+                step += 1;
+                let mut s: String = toks.iter().map(|&t| char::from(t as u8)).collect();
+                if step >= 4 {
+                    s.push_str("<|end|>");
+                }
+                s
+            },
+            |_event| {},
+        )
+        .expect("ok");
+        assert_eq!(
+            outcome.stop_reason,
+            DecodeStopReason::SpecialTokenLeak("<|end|>")
         );
     }
 }

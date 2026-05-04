@@ -1469,6 +1469,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "syn",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.18",
@@ -2197,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "mlx-native"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "bytemuck",
  "half",

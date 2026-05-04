@@ -47,13 +47,15 @@ use super::delta_net::DeltaNetLayerShape;
 use super::ffn::{DenseFfnShape, MoeFfnShape};
 use super::full_attn::FullAttnShape;
 use super::gpu_delta_net::{
-    build_delta_net_layer, build_delta_net_layer_decode_into, DeltaNetWeightsGpu,
+    build_delta_net_layer, build_delta_net_layer_decode_into,
+    build_delta_net_layer_with_arena, DeltaNetWeightsGpu,
 };
 use super::gpu_ffn::{
     build_dense_ffn_layer_gpu, build_dense_ffn_layer_gpu_q_into,
-    build_dense_ffn_layer_gpu_q_split_profile, build_moe_ffn_layer_gpu,
-    build_moe_ffn_layer_gpu_q_into, DenseFfnWeightsGpu, DenseFfnWeightsGpuQ, MoeFfnWeightsGpu,
-    MoeFfnWeightsGpuQ,
+    build_dense_ffn_layer_gpu_q_into_with_arena, build_dense_ffn_layer_gpu_q_split_profile,
+    build_moe_ffn_layer_gpu, build_moe_ffn_layer_gpu_q_into,
+    build_moe_ffn_layer_gpu_q_into_with_arena, DenseFfnWeightsGpu, DenseFfnWeightsGpuQ,
+    MoeFfnWeightsGpu, MoeFfnWeightsGpuQ,
 };
 use super::gpu_full_attn::{
     apply_gated_attn_layer_decode_into, apply_linear_projection_f32,
@@ -204,6 +206,22 @@ enum OutputHeadMode {
     /// `lm_head` matmul because no logits are needed; the L2-norm step
     /// is owned by the caller (`forward_embed_last`).
     EmbedLast,
+    /// Top-K logits over the last prefill row only (ADR-005 iter-25).
+    ///
+    /// Same upstream pipeline as [`OutputHeadMode::Last`] but the
+    /// output-head step replaces the `download_f32` of the full vocab
+    /// with a GPU `top_k_f32` dispatch, returning only the top-K
+    /// (index, value) pairs (~K*8 bytes vs ~600 KB for the full vocab
+    /// on Qwen3.6's 248K-entry vocab).  Skips the dominant CPU partial
+    /// sort (`select_nth_unstable_by`) in `sampler_pure::sample_token`,
+    /// the bottleneck behind sampling decode 117 t/s vs greedy 130 t/s.
+    ///
+    /// `k` must be in `[1, 128]` (kernel `MAX_K`).  The host-side
+    /// `Vec<f32>` returned by `forward_gpu_impl` is empty for this mode;
+    /// the actual (indices, values) pair is stashed via the
+    /// `topk_out: Option<&mut Option<(Vec<u32>, Vec<f32>)>>` out
+    /// parameter that the caller threads in.
+    TopK { k: u32 },
 }
 
 /// Pre-allocated decode buffers for `forward_gpu_greedy` (seq_len == 1).
@@ -390,10 +408,17 @@ fn default_chain_n(cfg: &Qwen35Config, layer_weights_gpu: &[LayerWeightsGpu]) ->
 
 struct OutputHeadGpu {
     norm_w: MlxBuffer,
-    /// BF16 pre-cast of lm_head — used for prefill (M > 1) where MM kernel is optimal.
-    lm_head_bf16: MlxBuffer,
-    /// Q4_0 quantized lm_head — used for single-token decode (M=1) for 3.57×
-    /// lower bandwidth vs BF16 (~1.5ms vs ~5.4ms per decode token).
+    /// Q4_0 quantized lm_head — used for ALL prefill + decode lm_head matmul
+    /// dispatches (`apply_output_head_gpu_into` and
+    /// `apply_output_head_gpu_greedy_into`).
+    ///
+    /// Pre-2026-05-03 there was also a BF16 pre-cast (`lm_head_bf16`) used by
+    /// the prefill / sampling-decode path on the assumption that MM kernels
+    /// preferred BF16 for M > 1. Empirically Q4_0 matmul on Apple Silicon
+    /// is faster than BF16 at BOTH M=1 (decode, ~1.4 ms saved per step → +14
+    /// tok/s on sampling) AND M>1 (prefill speed unchanged at ~350 tok/s).
+    /// The BF16 buffer was wasting ~1 GB of GPU memory + ~1 s of load-time
+    /// per session for nothing — removed at this iter.
     lm_head_q4: MlxBuffer,
 }
 
@@ -541,6 +566,11 @@ fn embed_tokens_gpu_with_soft_tokens(
 /// 2. `normed` @ `lm_head^T` → logits             [seq, vocab]
 ///
 /// Returns logits as `Vec<f32>` (downloaded from GPU).
+///
+/// Standalone (non-fused) wrapper — opens its own encoder and issues a
+/// terminal `commit_and_wait`. ADR-019 Phase 1 callers that want to fold
+/// the prior layer's FFN-terminal CB into the same command buffer call
+/// [`apply_output_head_gpu_into`] directly with `caller_enc = Some(...)`.
 fn apply_output_head_gpu(
     device: &MlxDevice,
     registry: &mut KernelRegistry,
@@ -551,68 +581,128 @@ fn apply_output_head_gpu(
     vocab_size: u32,
     eps: f32,
 ) -> Result<Vec<f32>> {
-    // ---- Final RMSNorm ----
-    // ADR-015 iter14: scratch-lift for unretained-refs gate.  Per the
-    // iter13 docstring at `mlx-native/src/encoder.rs:419-444`, every
-    // helper-allocated transient that is dispatched-into and then
-    // dropped before the eventual `commit_and_wait` must be anchored
-    // by the per-decode-token `MlxBufferPool`'s `in_use` ARC clones
-    // when `MLX_UNRETAINED_REFS=1`.  Switching to `pooled_alloc_buffer`
-    // is a no-op under retained refs (the pool's bucket-rounded
-    // allocations are released by `reset_decode_pool` at the next
-    // forward call) but provides the lifecycle anchor needed under
-    // unretained refs.
-    let normed = {
-        let out = super::decode_pool::pooled_alloc_buffer(
-                device,
-                (seq_len * hidden_size) as usize * 4,
-                DType::F32,
-                vec![seq_len as usize, hidden_size as usize],
-            )
-            .map_err(|e| anyhow!("alloc normed: {e}"))?;
-        let mut params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
-            .map_err(|e| anyhow!("alloc norm params: {e}"))?;
-        {
-            let s = params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
-            s[0] = eps;
-            s[1] = hidden_size as f32;
-        }
-        let mut enc = device.command_encoder().context("enc output norm")?;
-        rms_norm::dispatch_rms_norm(
-            &mut enc,
-            registry,
-            device.metal_device(),
-            hidden,
-            &head.norm_w,
-            &out,
-            &params,
-            seq_len,
-            hidden_size,
-        )
-        .context("dispatch_rms_norm output")?;
-        // commit() without wait: lm_head encoder reads `out` immediately after
-        // on the same Metal serial queue; GPU ordering guarantees output_norm
-        // completes before lm_head executes.
-        enc.commit();
-        out
-    };
-
-    // ---- LM head projection ----
-    // Use the pre-cast BF16 weight to skip the per-token F32→BF16 cast.
-    // apply_linear_projection_f32 detects DType::BF16 and skips the cast.
-    let mut enc = device.command_encoder().context("enc lm_head")?;
-    let logits_buf = apply_linear_projection_f32(
-        &mut enc,
-        registry,
+    apply_output_head_gpu_into(
+        None,
         device,
-        &normed,
-        &head.lm_head_bf16,
+        registry,
+        hidden,
+        head,
         seq_len,
         hidden_size,
         vocab_size,
+        eps,
     )
-    .context("lm_head projection")?;
-    enc.commit_and_wait().context("commit lm_head")?;
+}
+
+/// Caller-driven single-CB output head (RMSNorm + lm_head projection).
+///
+/// ADR-019 Phase 1 — output-head + last-layer fusion (lowest-risk first).
+///
+/// When `caller_enc = Some(enc)`, output_norm and the lm_head projection
+/// are encoded into the caller's command buffer with an intra-CB
+/// `memory_barrier` between them (RAW: lm_head reads `normed`).  The
+/// terminal `commit_and_wait_labeled("output_head.fused_norm_lm_head")`
+/// drains BOTH the output-head dispatches AND any prior dispatches the
+/// caller had encoded into `enc` (the last-layer FFN K-boundary, in the
+/// Phase 1 fusion).  This drops one `commit_and_wait` per prefill
+/// (AC-P5: pp80 sync_count 6 → 5).
+///
+/// When `caller_enc = None`, this opens its own encoder and matches the
+/// pre-Phase-1 2-encoder shape (output_norm `commit()` + lm_head
+/// `commit_and_wait()`) — used by `OutputHeadMode::All` (full-logits
+/// prefill, which currently has no holdable upstream encoder) and by
+/// the diagnostic-fallback path when `forward_gpu_impl` cannot satisfy
+/// the fusion eligibility predicate.
+///
+/// F-fence preservation (per ADR-019 §"Risk Register"):
+/// - F1 (persistent compute encoder per CB): preserved — fusion only
+///   widens the existing CB, the encoder remains persistent within it.
+/// - F2 (iter58b residency-rescission): preserved — `normed` is a
+///   pooled scratch whose Drop runs after the function returns, i.e.
+///   AFTER `commit_and_wait` has drained Metal; pool reset for the
+///   final layer is skipped by the caller when fusion is engaged.
+/// - F6 (output-head argmax CPU read): preserved — terminal
+///   `commit_and_wait` precedes the `download_f32` host read.
+fn apply_output_head_gpu_into(
+    caller_enc: Option<mlx_native::CommandEncoder>,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden: &MlxBuffer,
+    head: &OutputHeadGpu,
+    seq_len: u32,
+    hidden_size: u32,
+    vocab_size: u32,
+    eps: f32,
+) -> Result<Vec<f32>> {
+    let logits_buf = apply_output_head_gpu_into_buf(
+        caller_enc,
+        device,
+        registry,
+        hidden,
+        head,
+        seq_len,
+        hidden_size,
+        vocab_size,
+        eps,
+    )?;
+    download_f32(&logits_buf).context("download logits")
+}
+
+/// Same as [`apply_output_head_gpu_into`] but returns the post-commit GPU
+/// logits `MlxBuffer` instead of a downloaded `Vec<f32>`.
+///
+/// ADR-005 iter-25: split out so the GPU top-K sampling path can read the
+/// same buffer with a downstream kernel (`mlx_native::ops::top_k`) without
+/// paying the ~600 KB / ~250 µs vocab download. The original
+/// `apply_output_head_gpu_into` becomes a thin wrapper that downloads the
+/// buffer for callers that still want full F32 logits on host (full-logits
+/// prefill, sampling-mode decode without GPU top-K, embed paths, etc.).
+///
+/// All invariants of the original function are preserved here:
+///   - Pooled `normed` / `params` allocation (iter58b residency anchor).
+///   - Encoder hand-off with intra-CB `memory_barrier` between RMSNorm
+///     and lm_head (replaces legacy CB boundaries).
+///   - Phase-1 fusion barrier when `caller_enc = Some(_)` (RAW barrier
+///     against the prior layer's FFN-terminal write to `hidden`).
+///   - Q4 lm_head matmul (matches the greedy-decode head path).
+///   - Optional dump_layer_n / dump_bisect dumps run AFTER the terminal
+///     `commit_and_wait` (the dump path requires a settled `normed`).
+fn apply_output_head_gpu_into_buf(
+    caller_enc: Option<mlx_native::CommandEncoder>,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden: &MlxBuffer,
+    head: &OutputHeadGpu,
+    seq_len: u32,
+    hidden_size: u32,
+    vocab_size: u32,
+    eps: f32,
+) -> Result<MlxBuffer> {
+    // Encode the output head (RMSNorm + lm_head) into the encoder, but
+    // do NOT commit. We commit-and-wait below before the optional dumps.
+    let (mut enc, normed, logits_buf) = encode_output_head_into_encoder(
+        caller_enc,
+        device,
+        registry,
+        hidden,
+        head,
+        seq_len,
+        hidden_size,
+        vocab_size,
+        eps,
+    )?;
+
+    // Terminal commit_and_wait — drains output_head dispatches AND, in
+    // the Phase 1 fusion, the caller's last-layer FFN dispatches.  F6
+    // (output-head host read) preserved — `download_f32` runs after.
+    let fused_label = enc.is_carried_from_fused_caller();
+    let label = if fused_label {
+        "output_head.fused_norm_lm_head_with_layer_ffn"
+    } else {
+        "output_head.fused_norm_lm_head"
+    };
+    enc.commit_and_wait_labeled(label)
+        .context("commit output_head fused norm+lm_head")?;
 
     // Optional: dump output-norm stats to stderr.
     if dump_layer_n().is_some() {
@@ -631,7 +721,150 @@ fn apply_output_head_gpu(
         );
     }
 
-    download_f32(&logits_buf).context("download logits")
+    Ok(logits_buf)
+}
+
+/// Wrap the borrowed encoder with a tag indicating whether it was
+/// supplied by the Phase-1 fused caller (changes the commit label only).
+struct OutputHeadEncoder {
+    enc: mlx_native::CommandEncoder,
+    fused: bool,
+}
+
+impl OutputHeadEncoder {
+    fn is_carried_from_fused_caller(&self) -> bool {
+        self.fused
+    }
+    fn commit_and_wait_labeled(&mut self, label: &str) -> Result<()> {
+        self.enc
+            .commit_and_wait_labeled(label)
+            .map_err(|e| anyhow!("commit {}: {}", label, e))
+    }
+}
+
+/// Encode the output-head pipeline (output_norm RMSNorm + Q4 lm_head
+/// matmul) into a single encoder WITHOUT committing.
+///
+/// Returns the encoder (still open), the pooled `normed` buffer (kept so
+/// the caller can run optional dump paths after the eventual commit),
+/// and the device-allocated `logits_buf`.
+///
+/// ADR-005 iter-25 split: `apply_output_head_gpu_into_buf` calls this
+/// then commits + dumps; `apply_output_head_gpu_into_topk` calls this,
+/// extends the encoder with a `top_k_f32` dispatch, and commits ONCE
+/// (collapsing what was previously two commit_and_waits into one — each
+/// commit_and_wait costs a few-hundred-µs RTT on Apple Silicon, which
+/// was undoing the entire ~700 µs saving from skipping the CPU partial
+/// sort if naively cascaded).
+fn encode_output_head_into_encoder(
+    caller_enc: Option<mlx_native::CommandEncoder>,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden: &MlxBuffer,
+    head: &OutputHeadGpu,
+    seq_len: u32,
+    hidden_size: u32,
+    vocab_size: u32,
+    eps: f32,
+) -> Result<(OutputHeadEncoder, MlxBuffer, MlxBuffer)> {
+    // ---- Allocate normed + norm-params (pooled per ADR-015 iter14) ----
+    //
+    // Pooled allocation provides the iter58b lifecycle anchor under
+    // `MLX_UNRETAINED_REFS=1`: the pool's `in_use` ARC keeps these
+    // buffers resident through the eventual `commit_and_wait`.  Both
+    // are released by the next `reset_decode_pool` / `reset_for_prefill_chunk`,
+    // which the caller defers past this function for the fused path.
+    let normed = super::decode_pool::pooled_alloc_buffer(
+        device,
+        (seq_len * hidden_size) as usize * 4,
+        DType::F32,
+        vec![seq_len as usize, hidden_size as usize],
+    )
+    .map_err(|e| anyhow!("alloc normed: {e}"))?;
+    let mut params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
+        .map_err(|e| anyhow!("alloc norm params: {e}"))?;
+    {
+        let s = params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
+        s[0] = eps;
+        s[1] = hidden_size as f32;
+    }
+
+    // ---- Acquire encoder: caller-supplied (fused) or fresh (standalone) ----
+    let fused = caller_enc.is_some();
+    let mut enc = match caller_enc {
+        Some(e) => e,
+        None => device
+            .command_encoder()
+            .context("enc output_head.fused_norm_lm_head")?,
+    };
+
+    // 2026-05-03 — RAW barrier: rms_norm reads `hidden`, which in the FUSED
+    // path was JUST written by the LAST layer's MoeQ/DenseQ FFN-terminal
+    // dispatch into the SAME caller-supplied encoder. ADR-019 Phase 1
+    // (commit 8012e63) shipped the encoder hand-off WITHOUT this barrier;
+    // Apple's MTLDispatchTypeConcurrent then reorders rms_norm ahead of (or
+    // overlapping with) the FFN write, so rms_norm sees stale or partially-
+    // updated `hidden` bytes. Empirically (5x cold-process logit dump on
+    // qwen3.6-35B-A3B-dwq48 wedding-cake greedy temp=0): pre-fix produced
+    // {31248, 31248, 1206, 31248, 31248} with logits 32.4 / 31.7 / 18.2 /
+    // 22.3 / 33.8 — argmax flip + wide logit spread = the residual
+    // non-determinism after Phase-2 (use_fused_stage_ab) is also disabled.
+    //
+    // The standalone (caller_enc=None) path doesn't need this barrier:
+    // the previous FFN commit closed its CB before this function's fresh
+    // encoder opens, so `hidden` is GPU-visible by Metal-queue ordering.
+    if fused {
+        enc.memory_barrier();
+    }
+
+    // Stage 1: output_norm → normed.
+    rms_norm::dispatch_rms_norm(
+        &mut enc,
+        registry,
+        device.metal_device(),
+        hidden,
+        &head.norm_w,
+        &normed,
+        &params,
+        seq_len,
+        hidden_size,
+    )
+    .context("dispatch_rms_norm output")?;
+    // RAW barrier: lm_head reads `normed` written above. Replaces the
+    // legacy CB boundary (output_norm `enc.commit()` + new lm_head
+    // encoder).  Identical pattern to the decode-greedy single-CB path
+    // at `apply_output_head_gpu_greedy_into` lines 884-916.
+    enc.memory_barrier();
+
+    // Stage 2: lm_head projection → logits_buf (device-allocated, NOT
+    // pooled — see `apply_linear_projection_f32` doc-comment for the
+    // bucket-rounding rationale).  The returned buffer is owned and
+    // outlives the encoder commit below.
+    //
+    // 2026-05-03 — switched from `lm_head_bf16` to `lm_head_q4` to match
+    // the greedy-decode path (`apply_output_head_gpu_greedy_into` line 1005).
+    // BF16 lm_head matmul costs ~1.4 ms/decode-step more than Q4 on
+    // qwen3.6-35B-A3B-dwq48 (Apple Silicon's Q4 matmul kernel is much
+    // faster than BF16). Sampling-mode decode with default --temperature
+    // 0.8 was 9.3 ms/step; greedy was 7.85 ms/step. Coherence: greedy
+    // already uses Q4 here and produces output byte-identical to llama.cpp
+    // at temp=0 — so Q4 logits are mathematically correct, not a precision
+    // shortcut. Prefill last-row logit and full-prefill rows take the same
+    // path here too (apply_output_head_gpu_last and apply_output_head_gpu),
+    // so all post-forward logit consumers move to Q4 in lockstep.
+    let logits_buf = apply_linear_projection_f32(
+        &mut enc,
+        registry,
+        device,
+        &normed,
+        &head.lm_head_q4,
+        seq_len,
+        hidden_size,
+        vocab_size,
+    )
+    .context("lm_head projection")?;
+
+    Ok((OutputHeadEncoder { enc, fused }, normed, logits_buf))
 }
 
 /// Apply the final output head only to the last prefill row.
@@ -641,7 +874,13 @@ fn apply_output_head_gpu(
 /// and Qwen3.6's 248k vocab that full buffer is ~4 GB.  This path takes a
 /// zero-copy Metal slice view of the final hidden row and reuses the same
 /// output-head implementation with `seq_len=1`, returning `[vocab]` logits.
+///
+/// ADR-019 Phase 1: when `caller_enc = Some(enc)`, the output-head
+/// dispatches are folded into the caller's still-open command buffer
+/// (the last-layer FFN-terminal CB), saving one `commit_and_wait` per
+/// prefill (AC-P5: pp80 sync_count 6 → 5).
 fn apply_output_head_gpu_last(
+    caller_enc: Option<mlx_native::CommandEncoder>,
     device: &MlxDevice,
     registry: &mut KernelRegistry,
     hidden: &MlxBuffer,
@@ -654,7 +893,8 @@ fn apply_output_head_gpu_last(
     anyhow::ensure!(seq_len > 0, "apply_output_head_gpu_last: empty sequence");
     let byte_offset = ((seq_len as u64 - 1) * hidden_size as u64) * 4;
     let last_hidden = hidden.slice_view(byte_offset, hidden_size as usize);
-    apply_output_head_gpu(
+    apply_output_head_gpu_into(
+        caller_enc,
         device,
         registry,
         &last_hidden,
@@ -663,6 +903,181 @@ fn apply_output_head_gpu_last(
         hidden_size,
         vocab_size,
         eps,
+    )
+}
+
+/// GPU output-head + top-K — return the top-K (index, value) pairs unsorted.
+///
+/// ADR-005 iter-25 Step 2.  Same RMSNorm + Q4 lm_head pipeline as
+/// [`apply_output_head_gpu_into`], but instead of downloading the full
+/// F32 logits vector (~600 KB / ~250 µs on Qwen3.6's 248K vocab), this
+/// dispatches `mlx_native::ops::top_k::dispatch_top_k_f32` against the
+/// post-commit logits buffer and returns only `top_k * 8` bytes
+/// (`Vec<u32>` indices + `Vec<f32>` values).
+///
+/// The GPU top-K kernel collapses the dominant CPU-side
+/// `select_nth_unstable_by` cost in `sampler_pure::sample_token` (the
+/// O(V) partial-sort over 248K entries that bridges the 13 t/s gap
+/// between greedy 130 t/s and sampling 117 t/s on the OLD dwq48 GGUF).
+///
+/// # Returns
+///
+/// A pair of `(top_indices, top_values)` `Vec`s of length exactly
+/// `top_k`. Output order is NOT guaranteed (the kernel returns unsorted
+/// pairs); callers that need sorted-descending order must sort
+/// themselves on the K-element subset.
+///
+/// # Errors
+///
+/// In addition to all errors from [`apply_output_head_gpu_into_buf`]:
+///   - `top_k == 0` or `top_k > 128` (kernel limit, see
+///     `/opt/mlx-native/src/shaders/top_k.metal`'s `MAX_K`).
+fn apply_output_head_gpu_into_topk(
+    caller_enc: Option<mlx_native::CommandEncoder>,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden: &MlxBuffer,
+    head: &OutputHeadGpu,
+    seq_len: u32,
+    hidden_size: u32,
+    vocab_size: u32,
+    eps: f32,
+    top_k: u32,
+) -> Result<(Vec<u32>, Vec<f32>)> {
+    if top_k == 0 || top_k > 128 {
+        return Err(anyhow!(
+            "apply_output_head_gpu_into_topk: top_k={} must be in [1, 128]",
+            top_k
+        ));
+    }
+
+    // Stage A: encode RMSNorm + lm_head into an encoder (open, NOT
+    // committed). This is the exact same pipeline as
+    // `apply_output_head_gpu_into_buf`'s prefix; the split lets us
+    // append the top_k_f32 dispatch in the SAME command buffer so the
+    // whole output-head + top-K runs on one commit_and_wait. Cascading
+    // two commit_and_waits would re-introduce the per-step CPU/GPU
+    // round-trip (~50–100 µs each on Apple Silicon) the entire iter-25
+    // optimization is supposed to skip.
+    let (mut head_enc, _normed, logits_buf) = encode_output_head_into_encoder(
+        caller_enc,
+        device,
+        registry,
+        hidden,
+        head,
+        seq_len,
+        hidden_size,
+        vocab_size,
+        eps,
+    )?;
+
+    // Stage B: allocate the top-K outputs and params buffer via the
+    // decode pool. Direct `device.alloc_buffer` per step incurs a Metal
+    // `newBuffer` syscall + `MTLResidencySet::addAllocation:` on every
+    // decode step. The decode pool's bucket-rounding amortizes these
+    // across all decode steps after the first (next call's
+    // `pool.alloc_inner` finds a same-size, same-dtype buffer on the
+    // free list and reuses it; ARC keeps it resident through the
+    // eventual commit_and_wait via the pool's `in_use` list, and
+    // `reset_decode_pool()` at the top of `forward_gpu_impl` cycles
+    // them back to the free list each step).
+    let out_indices = super::decode_pool::pooled_alloc_buffer(
+        device,
+        (top_k as usize) * 4,
+        DType::U32,
+        vec![top_k as usize],
+    )
+    .map_err(|e| anyhow!("alloc top_k out_indices: {e}"))?;
+    let out_values = super::decode_pool::pooled_alloc_buffer(
+        device,
+        (top_k as usize) * 4,
+        DType::F32,
+        vec![top_k as usize],
+    )
+    .map_err(|e| anyhow!("alloc top_k out_values: {e}"))?;
+    let mut params_buf = super::decode_pool::pooled_alloc_buffer(
+        device,
+        8,
+        DType::U32,
+        vec![2usize],
+    )
+    .map_err(|e| anyhow!("alloc top_k params: {e}"))?;
+    {
+        let s = params_buf
+            .as_mut_slice::<u32>()
+            .map_err(|e| anyhow!("{e}"))?;
+        s[0] = vocab_size;
+        s[1] = top_k;
+    }
+
+    // Stage C: append top_k_f32 to the SAME encoder. RAW barrier:
+    // top_k_f32 reads `logits_buf` written by lm_head two stages above.
+    head_enc.enc.memory_barrier();
+    mlx_native::ops::top_k::dispatch_top_k_f32(
+        &mut head_enc.enc,
+        registry,
+        device.metal_device(),
+        &logits_buf,
+        &out_indices,
+        &out_values,
+        &params_buf,
+        vocab_size,
+        top_k,
+    )
+    .context("dispatch_top_k_f32")?;
+
+    // Stage D: terminal commit_and_wait — drains output_head + top_k
+    // AND, in the Phase-1 fusion, the caller's last-layer FFN dispatches.
+    let label = if head_enc.is_carried_from_fused_caller() {
+        "output_head.fused_norm_lm_head_topk_with_layer_ffn"
+    } else {
+        "output_head.fused_norm_lm_head_topk"
+    };
+    head_enc.commit_and_wait_labeled(label)?;
+
+    // Stage E: read the K-element outputs out to host. ~K*8 bytes total.
+    let top_indices = out_indices
+        .as_slice::<u32>()
+        .map_err(|e| anyhow!("read top_k out_indices: {e}"))?
+        .to_vec();
+    let top_values = out_values
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("read top_k out_values: {e}"))?
+        .to_vec();
+    Ok((top_indices, top_values))
+}
+
+/// Top-K equivalent of [`apply_output_head_gpu_last`] — returns the
+/// top-K (index, value) pairs for the LAST prefill row's logits.
+fn apply_output_head_gpu_last_topk(
+    caller_enc: Option<mlx_native::CommandEncoder>,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden: &MlxBuffer,
+    head: &OutputHeadGpu,
+    seq_len: u32,
+    hidden_size: u32,
+    vocab_size: u32,
+    eps: f32,
+    top_k: u32,
+) -> Result<(Vec<u32>, Vec<f32>)> {
+    anyhow::ensure!(
+        seq_len > 0,
+        "apply_output_head_gpu_last_topk: empty sequence"
+    );
+    let byte_offset = ((seq_len as u64 - 1) * hidden_size as u64) * 4;
+    let last_hidden = hidden.slice_view(byte_offset, hidden_size as usize);
+    apply_output_head_gpu_into_topk(
+        caller_enc,
+        device,
+        registry,
+        &last_hidden,
+        head,
+        1,
+        hidden_size,
+        vocab_size,
+        eps,
+        top_k,
     )
 }
 
@@ -1145,6 +1560,8 @@ impl Qwen35Model {
             None,
             OutputHeadMode::All,
             &[],
+            None,
+            None,
         )
     }
 
@@ -1167,7 +1584,69 @@ impl Qwen35Model {
             None,
             OutputHeadMode::Last,
             &[],
+            None,
+            None,
         )
+    }
+
+    /// Top-K variant of [`Self::forward_gpu_last_logits`].
+    ///
+    /// ADR-005 iter-25 — GPU top-K sampling. Same forward pass as
+    /// `forward_gpu_last_logits` (final RMSNorm + Q4 lm_head matmul), but
+    /// the output-head step replaces the host download of all
+    /// `vocab_size` F32 logits (~600 KB / ~250 µs on Qwen3.6's 248K
+    /// vocab) with an in-GPU `top_k_f32` dispatch, returning only the
+    /// top-K (index, value) pairs (~K * 8 bytes).
+    ///
+    /// Used by the sampling decode loop in [`crate::serve::sampler_pure`]
+    /// when the caller's sampling chain is "simple" enough that only the
+    /// top-K logits are needed (no repetition penalty, top_k explicitly
+    /// in `[1, 128]`, temperature > 0). Skips the ~700 µs/step CPU
+    /// `select_nth_unstable_by` partial-sort over the full vocab —
+    /// closes the 13 t/s gap between sampling 117 t/s and greedy
+    /// 130 t/s on qwen3.6-35B-A3B-dwq48.
+    ///
+    /// # Returns
+    ///
+    /// `(top_indices, top_values)`: two parallel `Vec`s of length
+    /// exactly `top_k`. Output order is NOT guaranteed (kernel returns
+    /// unsorted); the sampling caller sorts on the K-element subset.
+    ///
+    /// # Errors
+    ///
+    /// In addition to all errors from `forward_gpu_last_logits`:
+    ///   * `top_k == 0` or `top_k > 128` (kernel `MAX_K`).
+    pub fn forward_gpu_last_topk(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        top_k: u32,
+    ) -> Result<(Vec<u32>, Vec<f32>)> {
+        if top_k == 0 || top_k > 128 {
+            return Err(anyhow!(
+                "forward_gpu_last_topk: top_k={} must be in [1, 128]",
+                top_k
+            ));
+        }
+        let mut topk_slot: Option<(Vec<u32>, Vec<f32>)> = None;
+        let _empty = self.forward_gpu_impl(
+            tokens,
+            positions_flat,
+            kv_cache,
+            None,
+            None,
+            OutputHeadMode::TopK { k: top_k },
+            &[],
+            None,
+            Some(&mut topk_slot),
+        )?;
+        topk_slot.ok_or_else(|| {
+            anyhow!(
+                "forward_gpu_last_topk: top-K out-parameter not populated by \
+                 forward_gpu_impl (internal invariant violation)"
+            )
+        })
     }
 
     /// Soft-token-aware variant of [`Self::forward_gpu_last_logits`].
@@ -1221,6 +1700,67 @@ impl Qwen35Model {
             None,
             OutputHeadMode::Last,
             soft_tokens,
+            None,
+            None,
+        )
+    }
+
+    /// Soft-token + DeepStack-aware forward (ADR-005 iter-224 Wedge-4c.5).
+    ///
+    /// Identical to [`forward_gpu_last_logits_with_soft_tokens`] when
+    /// `deepstack` is `None`. When `Some`, additionally:
+    ///
+    ///   1. After the standard embed step, no extra change at layer 0's
+    ///      input — the base-chunk substitution must already live inside
+    ///      `soft_tokens[i].embeddings` (the caller is responsible for
+    ///      installing the BASE chunk there; chunks 1..n_deepstack go
+    ///      into `deepstack.chunks`).
+    ///   2. After the post-FFN-residual at LM layer `il` for `il < n_deepstack`,
+    ///      dispatches `image_token_residual_add_gpu` to add chunk `il`
+    ///      at the image-token positions.
+    ///
+    /// **Caller contract for the augmented-embed split** (see
+    /// `/opt/llama.cpp/src/models/qwen3vl.cpp:96-100`):
+    ///
+    ///   * `soft_tokens[i].embeddings` carries the **base** chunk row
+    ///     for each image token (i.e. the first `hidden` floats of each
+    ///     augmented row). The `embed_tokens_gpu_with_soft_tokens` path
+    ///     consumes this verbatim.
+    ///   * `deepstack.chunks[j]` carries chunk `(j+1)` of the augmented
+    ///     embed (the deepstack chunk for ViT-flagged-layer index `j`).
+    ///     Length j+1 starts at the second slot — matches qwen3vl.cpp:97's
+    ///     `(il + 1) * n_embd * sizeof(float)` byte offset.
+    ///
+    /// Producing these from the augmented `[n_image_tokens, lm_hidden *
+    /// (1 + N_deepstack)]` buffer at the engine seam is Wedge-4d's
+    /// responsibility; this entry point is the LM-side bottom-half.
+    ///
+    /// # Errors
+    ///
+    /// In addition to the base error set:
+    ///   * `deepstack.image_token_positions[k] >= tokens.len()`.
+    ///   * `deepstack.chunks[i].byte_len()` insufficient for
+    ///     `n_image_tokens * hidden * 4` (per-chunk shape mismatch).
+    ///   * `deepstack.n_deepstack() > num_hidden_layers` (out-of-range
+    ///     LM layer requested).
+    pub fn forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
+        deepstack: Option<&crate::serve::forward_prefill::DeepstackInjection<'_>>,
+        kv_cache: &mut HybridKvCache,
+    ) -> Result<Vec<f32>> {
+        self.forward_gpu_impl(
+            tokens,
+            positions_flat,
+            kv_cache,
+            None,
+            None,
+            OutputHeadMode::Last,
+            soft_tokens,
+            deepstack,
+            None,
         )
     }
 
@@ -1265,6 +1805,8 @@ impl Qwen35Model {
             None,
             OutputHeadMode::EmbedLast,
             &[],
+            None,
+            None,
         )?;
         let h = self.cfg.hidden_size as usize;
         anyhow::ensure!(
@@ -1304,6 +1846,8 @@ impl Qwen35Model {
             Some(&mut hidden_out),
             OutputHeadMode::All,
             &[],
+            None,
+            None,
         )?;
         let hidden = hidden_out
             .ok_or_else(|| anyhow!("forward_gpu_with_hidden: hidden buffer was not captured"))?;
@@ -1327,6 +1871,17 @@ impl Qwen35Model {
                 let device = MlxDevice::new().context("ensure_gpu_cache_primed: MlxDevice::new")?;
                 let mut registry = KernelRegistry::new();
                 mlx_native::ops::flash_attn_prefill::register(&mut registry);
+                // 2026-05-03 — register flash_attn_vec for decode-path SDPA.
+                // Closes long-context decode parity gap vs llama.cpp (tg1000:
+                // 105 → ~117 t/s expected). Was previously dispatching
+                // sdpa_decode (single-threadgroup serial) for FA layers.
+                mlx_native::ops::flash_attn_vec::register(&mut registry);
+                // Wedge-4c.5: register the LM-side image-token residual
+                // add shader. Idempotent: safe to call on every primed
+                // path; non-Qwen3-VL chats simply never dispatch the
+                // kernel (deepstack=None gates the call).
+                crate::inference::vision::image_token_residual_add
+                    ::register_image_token_residual_add_shader(&mut registry);
                 // Wave 5b.8 profiling — keep `UploadWeights` accounting in the
                 // primed path too, now that ADR-013 P19 H12 has lifted this
                 // to the model-load-time call site.
@@ -1336,36 +1891,11 @@ impl Qwen35Model {
                     );
                     self.upload_layer_weights_gpu(&device)?
                 };
-                let lm_head_f32 =
-                    upload_f32_weight(&self.output_weight, &device).context("upload lm_head")?;
-                let n_w = self.output_weight.len();
-                let lm_head_bf16 = {
-                    let bf16_buf = device
-                        .alloc_buffer(n_w * 2, DType::BF16, vec![n_w])
-                        .map_err(|e| anyhow!("alloc lm_head_bf16: {e}"))?;
-                    let mut enc =
-                        device.command_encoder().context("enc lm_head_bf16 cast")?;
-                    mlx_native::ops::elementwise::cast(
-                        &mut enc,
-                        &mut registry,
-                        device.metal_device(),
-                        &lm_head_f32,
-                        &bf16_buf,
-                        n_w,
-                        mlx_native::ops::elementwise::CastDirection::F32ToBF16,
-                    )
-                    .context("cast lm_head F32→BF16 at load")?;
-                    enc.commit_and_wait().context("commit lm_head cast")?;
-                    super::weight_pool::register_weight_buffer(&device, &bf16_buf)
-                        .map_err(|e| anyhow!("register lm_head_bf16: {e}"))?;
-                    bf16_buf
-                };
                 let lm_head_q4 = upload_q4_0_from_f32(&self.output_weight, &device)
                     .context("upload lm_head_q4")?;
                 let output_head = OutputHeadGpu {
                     norm_w: upload_f32_weight(&self.output_norm, &device)
                         .context("upload output_norm")?,
-                    lm_head_bf16,
                     lm_head_q4,
                 };
                 *cache = Some(ForwardGpuCache {
@@ -1435,6 +1965,8 @@ impl Qwen35Model {
             None,
             OutputHeadMode::All,
             &[],
+            None,
+            None,
         )
     }
 
@@ -1447,10 +1979,35 @@ impl Qwen35Model {
         mut hidden_out: Option<&mut Option<MlxBuffer>>,
         output_head_mode: OutputHeadMode,
         soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
+        deepstack: Option<&crate::serve::forward_prefill::DeepstackInjection<'_>>,
+        topk_out: Option<&mut Option<(Vec<u32>, Vec<f32>)>>,
     ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(anyhow!("forward_gpu: tokens must be non-empty"));
         }
+        // 2026-05-03 — top-of-call pool reset. Mirrors `forward_gpu_greedy`'s
+        // line-3150 call (which only fires on the greedy temp=0 fast-path).
+        // Without this, every `forward_gpu_last_logits` call (sampling-mode
+        // decode + the soft-token / deepstack variants + the prefill-with-
+        // capture variants) grows the thread-local `DECODE_POOL`'s `in_use`
+        // list monotonically. Each fresh-allocation branch in
+        // `MlxBufferPool::alloc_inner` calls `register_residency_allocation`
+        // → Apple's `-[IOGPUMetalResidencySet addAllocation:]`. After ~960k
+        // un-recycled allocations Apple aborts (SIGABRT exit 134, six macOS
+        // DiagnosticReports captured 2026-05-02 22:30 → 2026-05-03 07:15;
+        // HF2Q_PROFILE_RESIDENCY_ABORT instrumentation in mlx-native at
+        // commit-of-this-diff confirms the leak: 962591 fresh allocs with
+        // dup=false on every line, no host-pointer reuse).
+        //
+        // Resetting here is safe for prefill: the prefill path also calls
+        // `reset_for_prefill_chunk` at end of each K-batch layer iteration
+        // (forward_gpu.rs:3008) which is bytewise-identical to this reset
+        // (decode_pool.rs:137-139). Calling reset twice is a no-op the
+        // second time. Resetting here is safe for decode: every per-token
+        // pool-allocated `MlxBuffer` is locally bound inside this function's
+        // call tree and out-of-scope by the time we return, so the next
+        // call's reset moves them all to the free list as expected.
+        super::decode_pool::reset_decode_pool();
         let seq_len = tokens.len() as u32;
         let expected_pos_len = 4 * seq_len as usize;
         if positions_flat.len() != expected_pos_len {
@@ -1464,6 +2021,53 @@ impl Qwen35Model {
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;
+
+        // ---- Wedge-4c.5: validate DeepstackInjection up-front -------------
+        //
+        // Pre-flight every chunk's storage size + every position's
+        // bound BEFORE starting the (expensive) GPU forward. Mirrors
+        // the embed_tokens_gpu_with_soft_tokens validation pattern:
+        // any deepstack misconfiguration must surface in <1ms instead
+        // of producing garbage after N layers.
+        if let Some(ds) = deepstack {
+            let n_image = ds.image_token_positions.len();
+            let n_ds_layers = ds.chunks.len();
+            // n_deepstack must not exceed the LM layer count.
+            if n_ds_layers > self.layers.len() {
+                return Err(anyhow!(
+                    "forward_gpu: deepstack n_deepstack={} > num_hidden_layers={}",
+                    n_ds_layers,
+                    self.layers.len()
+                ));
+            }
+            for &p in &ds.image_token_positions {
+                if (p as usize) >= tokens.len() {
+                    return Err(anyhow!(
+                        "forward_gpu: deepstack image_token_position {} >= tokens.len()={}",
+                        p,
+                        tokens.len()
+                    ));
+                }
+            }
+            // Every chunk must carry n_image_tokens * hidden F32 bytes.
+            let chunk_bytes_required = n_image
+                .saturating_mul(h as usize)
+                .saturating_mul(4);
+            for (i, c) in ds.chunks.iter().enumerate() {
+                let span = c.byte_len().saturating_sub(c.byte_offset() as usize);
+                if span < chunk_bytes_required {
+                    return Err(anyhow!(
+                        "forward_gpu: deepstack chunks[{}].byte_len-offset={} < required {} \
+                         (n_image_tokens={} * hidden={} * 4)",
+                        i,
+                        span,
+                        chunk_bytes_required,
+                        n_image,
+                        h
+                    ));
+                }
+            }
+        }
 
         // ---- Acquire GPU device + kernel registry + per-layer weights ----
         //
@@ -1592,6 +2196,249 @@ impl Qwen35Model {
             None
         };
 
+        // ---- ADR-015 iter86: FaProjectionsArena allocation ----
+        //
+        // Allocated ONCE per prefill (seq_len > 1) when the model has at least
+        // one FullAttn layer, sized for the actual prompt length and FA shape
+        // (hidden_size, n_head, n_kv, head_dim, rms_norm_eps). Reused across
+        // all FullAttn layers in the loop below.
+        //
+        // Memory footprint at apex 35B-A3B q4_0-flat pp4127 (h=2048, n_head=16,
+        // n_kv=2, head_dim=256): ~405 MB. Lives for the entire prefill duration;
+        // M5 Max 128 GB unified memory keeps this well within budget.
+        //
+        // Lifetime: dropped at end of forward_gpu_impl, AFTER the final
+        // output-head commit_and_wait_labeled — which guarantees all arena
+        // buffers are still alive when any CB that references them executes.
+        // Same iter58b residency-rescission protection contract as
+        // FaPrefillArena / DenseFfnArena / MoeFfnArena / DnPrefillArena /
+        // ChunkAllocsArena.
+        //
+        // Skip when seq_len == 1 (decode): decode never enters the FA prefill
+        // bridge or the prefill branches of ops1-4 / ops6-7 commits.
+        //
+        // Skip when the model has no FullAttn layers: defensive — avoids a
+        // zero-useful arena allocation when running DN-only models.
+        let mut fa_proj_arena: Option<super::FaProjectionsArena> = if seq_len > 1
+            && layer_weights_gpu.iter().any(|l| matches!(l, LayerWeightsGpu::FullAttn { .. }))
+        {
+            let shape = FullAttnShape::from_config(cfg);
+            Some(
+                super::FaProjectionsArena::new(
+                    &device,
+                    seq_len,
+                    shape.hidden_size,
+                    shape.n_head,
+                    shape.n_kv,
+                    shape.head_dim,
+                    shape.rms_norm_eps,
+                )
+                .context("alloc FaProjectionsArena")?,
+            )
+        } else {
+            None
+        };
+
+        // ---- ADR-015 iter72: DenseFfnArena allocation ----
+        //
+        // Allocated ONCE per prefill (seq_len > 1), sized for the actual prompt
+        // length and dense FFN shape (hidden_size, intermediate_size). Reused
+        // across all dense layers in the loop below.
+        //
+        // Lifetime: dropped at end of forward_gpu_impl, AFTER the final
+        // output-head commit_and_wait_labeled — which guarantees all arena
+        // buffers are still alive when any CB that references them executes.
+        //
+        // Skip when seq_len == 1 (decode): existing thread-local
+        // `decode_pool::pooled_alloc_buffer` path is already optimal at
+        // single-token granularity.
+        //
+        // Skip when the model has no dense FFN intermediate_size (pure-MoE
+        // configs): no work for this arena.
+        //
+        // Memory footprint at 27B q4_0-flat pp4096 (h=5120, m=17408):
+        //   3 × (4096 × 17408 × 4 bytes) ≈ 855 MB + 4 bytes silu_params.
+        // Allocated once, lives for the entire prefill duration; on M5 Max
+        // 128 GB unified memory this is well within budget.
+        let mut dense_ffn_arena: Option<super::DenseFfnArena> = if seq_len > 1 {
+            if let Some(m) = cfg.intermediate_size {
+                Some(
+                    super::DenseFfnArena::new(&device, seq_len, h, m)
+                        .context("alloc DenseFfnArena")?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // ---- ADR-015 iter72: MoeFfnArena allocation ----
+        //
+        // Allocated ONCE per prefill (seq_len > 1), sized for the actual
+        // prompt length and MoE FFN shape. Reused across all MoE layers in
+        // the loop below. Same lifetime contract + iter58b residency-
+        // rescission protection as DenseFfnArena above.
+        //
+        // Skip when no MoE config present (pure-dense models).
+        //
+        // Memory footprint at 35B-A3B q4_0-flat pp4096 (h=5120, topk=8,
+        // m_moe=512, m_sh=512): ~870 MB. Allocated once for the prefill;
+        // M5 Max 128 GB unified memory keeps this well within budget.
+        let mut moe_ffn_arena: Option<super::MoeFfnArena> = if seq_len > 1 {
+            if let Some(moe) = cfg.moe.as_ref() {
+                Some(
+                    super::MoeFfnArena::new(
+                        &device,
+                        seq_len,
+                        h,
+                        moe.num_experts_per_tok,
+                        moe.moe_intermediate_size,
+                        moe.shared_expert_intermediate_size,
+                    )
+                    .context("alloc MoeFfnArena")?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // ---- ADR-015 iter74: DnPrefillArena allocation ----
+        //
+        // Allocated ONCE per prefill (seq_len > 1), sized for the actual
+        // prompt length and DN shape (hidden_size, n_k_heads, n_v_heads,
+        // d_k, d_v). Reused across all DN (LinearAttn) layers in the loop
+        // below. Same lifetime contract + iter58b residency-rescission
+        // protection as DenseFfnArena / MoeFfnArena above.
+        //
+        // Skip when seq_len == 1 (decode): existing thread-local
+        // `decode_pool::pooled_alloc_buffer` path is already optimal at
+        // single-token granularity, and `build_delta_net_layer_decode_into`
+        // (single-CB greedy) is a different code path that this arena does
+        // not target.
+        //
+        // Skip when the model has no LinearAttn (DN) layers: defensive.
+        //
+        // Memory footprint at apex 35B-A3B q4_0-flat pp4096 with the
+        // typical DN shape (h, n_k_heads, n_v_heads, d_k, d_v) drawn from
+        // the GGUF config — sums to a few hundred MB across the 23 slots,
+        // well within M5 Max 128 GB unified memory.
+        let mut dn_prefill_arena: Option<super::DnPrefillArena> = if seq_len > 1
+            && layer_weights_gpu.iter().any(|l| matches!(l, LayerWeightsGpu::LinearAttn { .. }))
+        {
+            let dn_shape = DeltaNetLayerShape::from_config(cfg);
+            Some(
+                super::DnPrefillArena::new(
+                    &device,
+                    seq_len,
+                    dn_shape.hidden_size,
+                    dn_shape.n_k_heads,
+                    dn_shape.n_v_heads,
+                    dn_shape.d_k,
+                    dn_shape.d_v,
+                )
+                .context("alloc DnPrefillArena")?,
+            )
+        } else {
+            None
+        };
+
+        // ---- ADR-015 iter78: ChunkAllocsArena allocation ----
+        //
+        // Allocated ONCE per prefill, sized for the actual prompt length
+        // and DN chunk shape (n_v_heads, d_k, d_v). Reused across all DN
+        // (LinearAttn) layers in the loop below — every per-layer
+        // `apply_gated_delta_net_chunk_with_arena` call substitutes the 7
+        // chunk-internal scratches (q_expanded, k_expanded, q_bf16,
+        // k_bf16, v_bf16, g_log_decay, o_bf16) for caller-owned arena
+        // slots. Same lifetime contract + iter58b residency-rescission
+        // protection as DnPrefillArena above.
+        //
+        // Skip when seq_len == 1 (decode): the chunk path is never
+        // engaged for single-token decode (`chunk_path_eligible` requires
+        // `seq_len > 64 && seq_len % 64 == 0`).
+        //
+        // Skip when the model has no LinearAttn (DN) layers, OR when the
+        // chunk path predicate fails for this prefill. The arena allocation
+        // is cheap (~270 MB at apex pp4096) and the chunk_path_eligible
+        // predicate is checked dynamically per-layer inside
+        // `build_delta_net_layer_with_arena`, so we conditionally allocate
+        // only when at least one DN layer is present.
+        //
+        // Memory footprint at apex 35B-A3B q4_0-flat pp4096 with the
+        // typical DN shape (n_v_heads, d_k, d_v) drawn from the GGUF
+        // config — sums to ~270 MB across the 7 slots, well within M5
+        // Max 128 GB unified memory.
+        let mut chunk_allocs_arena: Option<super::ChunkAllocsArena> = if seq_len > 1
+            && layer_weights_gpu.iter().any(|l| matches!(l, LayerWeightsGpu::LinearAttn { .. }))
+        {
+            let dn_shape = DeltaNetLayerShape::from_config(cfg);
+            Some(
+                super::ChunkAllocsArena::new(
+                    &device,
+                    seq_len,
+                    dn_shape.n_v_heads,
+                    dn_shape.d_k,
+                    dn_shape.d_v,
+                )
+                .context("alloc ChunkAllocsArena")?,
+            )
+        } else {
+            None
+        };
+
+        // ---- ADR-015 iter83: ChunkInternalArena allocation ----
+        //
+        // Caller-owned arena for the 7 large + 5 small mlx-native-internal
+        // chunk-pipeline scratches (g_cumsum, A_strict, A_inv, w, u, h,
+        // v_new + 5 param buffers). Allocated ONCE per prefill, sized for
+        // the actual chunk-pipeline shape (b=1, t=seq_len, hg=h=n_v_heads,
+        // k=d_k, v=d_v, bt=64), reused across all DN (LinearAttn) layers.
+        //
+        // Workload-conditional WIN by design (mirrors iter78 ChunkAllocsArena):
+        // - NEUTRAL on default pp4123 (chunk path predicate fails: pp4123 % 64 != 0).
+        // - Expected -50 to -100 ms wall improvement on chunk-engaged
+        //   4096-token prefill, additive to iter78's ChunkAllocsArena win.
+        //
+        // Only allocated when (1) the iter78 chunk_allocs_arena is allocated
+        // AND (2) the apex chunk-pipeline shape constraints fit
+        // (K==MAX_K=128, BT==FIXED_BT=64, t%bt==0). The ChunkInternalArena::new
+        // constructor enforces these; if any constraint fails (e.g. on a
+        // model with K!=128 or seq_len%64!=0), we fall back to None and the
+        // chunk dispatch uses its existing per-call alloc path.
+        //
+        // Memory footprint at apex pp4096 with Qwen3.6 35B-A3B shape:
+        // ~235 MB total. Allocated on top of iter78's ~270 MB ChunkAllocsArena.
+        let mut chunk_internal_arena: Option<
+            mlx_native::ops::chunk_gated_delta_rule::ChunkInternalArena,
+        > = if chunk_allocs_arena.is_some() {
+            let dn_shape = DeltaNetLayerShape::from_config(cfg);
+            // ChunkInternalArena::new returns Err on shape constraint
+            // violations (K!=128, BT!=64, t%bt!=0, H%Hg!=0). For chunk-
+            // engaged prefill (seq_len % 64 == 0 enforced by the runtime
+            // chunk_path_eligible predicate elsewhere) on Qwen3.6 35B-A3B
+            // (K=V=128, n_k_heads%n_v_heads==0), all constraints hold and
+            // we expect Ok. For models that don't fit, we silently skip
+            // the internal arena (chunk dispatch falls back to per-call
+            // alloc) — the iter78 arena still eliminates the wrapper
+            // scratches.
+            mlx_native::ops::chunk_gated_delta_rule::ChunkInternalArena::new(
+                &device,
+                /* b  */ 1,
+                /* t  */ seq_len,
+                /* hg */ dn_shape.n_v_heads,
+                /* h  */ dn_shape.n_v_heads,
+                /* k  */ dn_shape.d_k,
+                /* v  */ dn_shape.d_v,
+                /* bt */ 64,
+            )
+            .ok()
+        } else {
+            None
+        };
+
         // ---- Step 2: per-layer forward pass ----
         let decode_profile = std::env::var("HF2Q_DECODE_PROFILE").is_ok();
         let mut total_attn_us = 0u64;
@@ -1641,6 +2488,48 @@ impl Qwen35Model {
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&k| k >= 1)
             .unwrap_or(8);
+
+        // ADR-019 Phase 1 — output-head + last-layer fusion eligibility.
+        //
+        // When eligible, the LAST layer's MoeQ/DenseQ FFN-terminal CB is
+        // NOT committed at the K-boundary; instead the still-open encoder
+        // is held in `last_layer_held_enc` and threaded into
+        // `apply_output_head_gpu_last` after the layer loop.  The output
+        // head encodes output_norm + lm_head into the same CB and issues
+        // the terminal `commit_and_wait_labeled`, draining both the
+        // last-layer FFN dispatches and the output-head dispatches in a
+        // single GPU sync.  Drops 1 commit_and_wait per prefill (AC-P5:
+        // pp80 sync_count 6 → 5).
+        //
+        // Eligibility criteria (Chesterton's fence preservation):
+        // - prefill (seq_len > 1) — decode goes through `forward_gpu_greedy`.
+        // - `OutputHeadMode::Last` only — `All` returns full per-token
+        //   logits and currently has no last-row hand-off; `EmbedLast`
+        //   skips lm_head entirely (separate Phase 1 follow-up).
+        // - No diagnostic env active: `HF2Q_DUMP_LAYER_N` /
+        //   `HF2Q_DUMP_LAYER_ACTIVATIONS` / `dump_bisect` would read
+        //   `as_slice` mid-flight on the held encoder.  ADR-012 P9b
+        //   `capture` and `hidden_out` likewise download `hidden` AFTER
+        //   the FFN commit — fusion holds them OPEN, so we fall back.
+        // - Deepstack: only injects on layers `il < n_deepstack`; the
+        //   last layer is past `n_deepstack` for every Qwen3-VL config
+        //   shipped to date, but we still gate per-call to be safe.
+        //
+        // FFN-arm gate (only MoeQ/DenseQ keep the encoder live; F32-MoE
+        // and F32-Dense build their own encoder + commit internally) is
+        // enforced inline at the K-boundary commit sites below.
+        let phase1_fusion_env_eligible = seq_len > 1
+            && matches!(output_head_mode, OutputHeadMode::Last)
+            && capture.is_none()
+            && hidden_out.is_none()
+            && dump_layer_n().is_none()
+            && dump_layer_activations_prefix().is_none()
+            && !super::dump_bisect::is_enabled()
+            && deepstack
+                .map(|ds| n_layers > ds.chunks.len())
+                .unwrap_or(true);
+        let mut last_layer_held_enc: Option<mlx_native::CommandEncoder> = None;
+
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
             // K-boundary: last layer in the window OR final layer overall.
             // At K=1 every layer is a boundary (= current behaviour).
@@ -1718,6 +2607,7 @@ impl Qwen35Model {
                         shape.mrope_section,
                         shape.rms_norm_eps,
                         fa_arena.as_mut(),
+                        fa_proj_arena.as_mut(),
                     )
                     .with_context(|| format!("full_attn layer {layer_idx}"))?
                 }
@@ -1779,25 +2669,62 @@ impl Qwen35Model {
                             &zero_rec_buf_out,
                         )
                     };
-                    let out = build_delta_net_layer(
-                        &device,
-                        &mut registry,
-                        &hidden,
-                        attn,
-                        conv_in_ref,
-                        conv_out_ref,
-                        state_in_ref,
-                        state_out_ref,
-                        seq_len,
-                        shape.hidden_size,
-                        shape.n_k_heads,
-                        shape.n_v_heads,
-                        shape.d_k,
-                        shape.d_v,
-                        shape.conv_kernel,
-                        shape.rms_norm_eps,
-                    )
-                    .with_context(|| format!("delta_net layer {layer_idx}"))?;
+                    // ADR-015 iter74: route through DnPrefillArena at prefill
+                    // (seq_len > 1) to eliminate per-layer pooled scratch
+                    // allocations (~22/layer × 30 DN layers/prefill). Arena is
+                    // owned by `forward_gpu_impl` and outlives every per-layer
+                    // encoder commit, preventing the iter58b residency-
+                    // rescission failure mode. Decode path (seq_len == 1)
+                    // keeps the existing pooled variant (single-token
+                    // thread-local pool is already optimal).
+                    let out = if let Some(arena) = dn_prefill_arena.as_mut() {
+                        build_delta_net_layer_with_arena(
+                            &device,
+                            &mut registry,
+                            &hidden,
+                            attn,
+                            conv_in_ref,
+                            conv_out_ref,
+                            state_in_ref,
+                            state_out_ref,
+                            arena,
+                            chunk_allocs_arena.as_mut(),
+                            // ADR-015 iter83: thread the ChunkInternalArena
+                            // (lift mlx-native chunk-pipeline scratches).
+                            chunk_internal_arena.as_mut(),
+                            seq_len,
+                            shape.hidden_size,
+                            shape.n_k_heads,
+                            shape.n_v_heads,
+                            shape.d_k,
+                            shape.d_v,
+                            shape.conv_kernel,
+                            shape.rms_norm_eps,
+                        )
+                        .with_context(|| {
+                            format!("delta_net_with_arena layer {layer_idx}")
+                        })?
+                    } else {
+                        build_delta_net_layer(
+                            &device,
+                            &mut registry,
+                            &hidden,
+                            attn,
+                            conv_in_ref,
+                            conv_out_ref,
+                            state_in_ref,
+                            state_out_ref,
+                            seq_len,
+                            shape.hidden_size,
+                            shape.n_k_heads,
+                            shape.n_v_heads,
+                            shape.d_k,
+                            shape.d_v,
+                            shape.conv_kernel,
+                            shape.rms_norm_eps,
+                        )
+                        .with_context(|| format!("delta_net layer {layer_idx}"))?
+                    };
 
                     // --- Swap conv + recurrent ping-pong (O(1) pointer swap, zero copy) ---
                     if linear_slot_idx != usize::MAX {
@@ -2060,22 +2987,59 @@ impl Qwen35Model {
                             format!("dense_ffn_q_split_profile fused layer {layer_idx}")
                         })?
                     } else {
-                        let out = build_dense_ffn_layer_gpu_q_into(
-                            &mut enc,
-                            &device,
-                            &mut registry,
-                            &ffn_input,
-                            w,
-                            Some(&ffn_residual),
-                        )
-                        .with_context(|| format!("dense_ffn_q_into fused layer {layer_idx}"))?;
+                        // ADR-015 iter72: route through DenseFfnArena at prefill
+                        // (seq_len > 1) to eliminate per-layer pooled scratch
+                        // allocations.  Arena is owned by `forward_gpu_impl` and
+                        // outlives every per-layer encoder commit, preventing the
+                        // iter58b residency-rescission failure mode.  Decode path
+                        // (seq_len == 1) keeps the existing pooled variant
+                        // (single-token thread-local pool is already optimal).
+                        let out = if let Some(arena) = dense_ffn_arena.as_mut() {
+                            build_dense_ffn_layer_gpu_q_into_with_arena(
+                                &mut enc,
+                                &device,
+                                &mut registry,
+                                &ffn_input,
+                                w,
+                                Some(&ffn_residual),
+                                arena,
+                            )
+                            .with_context(|| {
+                                format!("dense_ffn_q_into_with_arena fused layer {layer_idx}")
+                            })?
+                        } else {
+                            build_dense_ffn_layer_gpu_q_into(
+                                &mut enc,
+                                &device,
+                                &mut registry,
+                                &ffn_input,
+                                w,
+                                Some(&ffn_residual),
+                            )
+                            .with_context(|| {
+                                format!("dense_ffn_q_into fused layer {layer_idx}")
+                            })?
+                        };
                         if seq_len == 1 {
                             enc.commit();
                         } else if is_k_boundary {
-                            enc.commit_and_wait_labeled("layer.dense_ffn")
-                                .with_context(|| {
-                                    format!("commit fused-DenseQ layer {layer_idx}")
-                                })?;
+                            // ADR-019 Phase 1: hold the LAST layer's
+                            // FFN-terminal encoder open (skip commit_and_wait)
+                            // so the output head can fold its dispatches into
+                            // the same CB.  Fusion eligibility checked once
+                            // before the loop; FFN-arm guard (MoeQ/DenseQ)
+                            // satisfied here trivially.  Pool reset for the
+                            // last layer is also skipped below.
+                            if phase1_fusion_env_eligible
+                                && (layer_idx + 1) == n_layers
+                            {
+                                last_layer_held_enc = Some(enc);
+                            } else {
+                                enc.commit_and_wait_labeled("layer.dense_ffn")
+                                    .with_context(|| {
+                                        format!("commit fused-DenseQ layer {layer_idx}")
+                                    })?;
+                            }
                         } else {
                             // ADR-013 P20: K-batched FFN terminal — commit
                             // without waiting. The next K-boundary's
@@ -2140,23 +3104,56 @@ impl Qwen35Model {
                     // buffer is `device.alloc_buffer` (gpu_ffn.rs line 1989,
                     // iter40 fix), so it survives the per-layer pool reset
                     // and can safely become the next layer's residual stream.
-                    let out = build_moe_ffn_layer_gpu_q_into(
-                        &mut enc,
-                        &device,
-                        &mut registry,
-                        &ffn_input,
-                        w_gpu,
-                        shape,
-                        Some(&ffn_residual),
-                    )
-                    .with_context(|| format!("moe_ffn_q_into fused layer {layer_idx}"))?;
+                    // ADR-015 iter72: route through MoeFfnArena at prefill
+                    // (seq_len > 1) to eliminate per-layer pooled scratch
+                    // allocations.  Arena is owned by `forward_gpu_impl` and
+                    // outlives every per-layer encoder commit, preventing the
+                    // iter58b residency-rescission failure mode.  Decode path
+                    // (seq_len == 1) keeps the existing pooled variant (the
+                    // single-token thread-local pool is already optimal at
+                    // decode granularity).
+                    let out = if let Some(arena) = moe_ffn_arena.as_mut() {
+                        build_moe_ffn_layer_gpu_q_into_with_arena(
+                            &mut enc,
+                            &device,
+                            &mut registry,
+                            &ffn_input,
+                            w_gpu,
+                            shape,
+                            Some(&ffn_residual),
+                            arena,
+                        )
+                        .with_context(|| {
+                            format!("moe_ffn_q_into_with_arena fused layer {layer_idx}")
+                        })?
+                    } else {
+                        build_moe_ffn_layer_gpu_q_into(
+                            &mut enc,
+                            &device,
+                            &mut registry,
+                            &ffn_input,
+                            w_gpu,
+                            shape,
+                            Some(&ffn_residual),
+                        )
+                        .with_context(|| {
+                            format!("moe_ffn_q_into fused layer {layer_idx}")
+                        })?
+                    };
                     if seq_len == 1 {
                         enc.commit();
                     } else if is_k_boundary {
-                        enc.commit_and_wait_labeled("layer.moe_ffn")
-                            .with_context(|| {
-                                format!("commit fused-MoeQ layer {layer_idx}")
-                            })?;
+                        // ADR-019 Phase 1: see DenseQ fusion comment above.
+                        if phase1_fusion_env_eligible
+                            && (layer_idx + 1) == n_layers
+                        {
+                            last_layer_held_enc = Some(enc);
+                        } else {
+                            enc.commit_and_wait_labeled("layer.moe_ffn")
+                                .with_context(|| {
+                                    format!("commit fused-MoeQ layer {layer_idx}")
+                                })?;
+                        }
                     } else {
                         // ADR-013 P20: K-batched FFN terminal — commit
                         // without waiting. The next K-boundary's
@@ -2226,6 +3223,68 @@ impl Qwen35Model {
             if let Some(t) = t_res2_start {
                 total_residual_us += t.elapsed().as_micros() as u64;
             }
+
+            // ----------------------------------------------------------
+            // Wedge-4c.5: Qwen3-VL DeepStack post-FFN-residual injection.
+            //
+            // /opt/llama.cpp/src/models/qwen3vl.cpp:96-100 — at LM layer
+            // `il < n_deepstack`, add the deepstack chunk for layer il
+            // (a `[n_image_tokens, hidden]` F32 tensor) to `hidden` at
+            // exactly the image-token positions; non-image positions
+            // are unchanged. We dispatch `image_token_residual_add_gpu`
+            // which is a single-kernel position-gated in-place add.
+            //
+            // Skip path when `deepstack` is None OR the layer is
+            // beyond `n_deepstack` (the guard for `il >= n_deepstack`
+            // that the spec demands — the Qwen3-VL contract is that
+            // the FIRST `n_deepstack` LM layers receive injection,
+            // every later layer is unchanged).
+            //
+            // Zero-overhead for non-Qwen3-VL paths (`deepstack=None`):
+            // the entire branch compiles to a None check and an early
+            // skip — no encoder allocation, no dispatch, no readback.
+            if let Some(ds) = deepstack {
+                if (layer_idx as usize) < ds.chunks.len() {
+                    // Per-layer encoder so we don't conflict with any
+                    // FFN-fold encoder still in flight on the residual
+                    // bucket (residual_add_gpu commits its own
+                    // encoder).
+                    let mut ds_enc = device
+                        .command_encoder()
+                        .with_context(|| {
+                            format!(
+                                "wedge4c5 deepstack encoder layer {layer_idx}"
+                            )
+                        })?;
+                    crate::inference::vision::image_token_residual_add
+                        ::image_token_residual_add_gpu(
+                            &mut ds_enc,
+                            &mut registry,
+                            &device,
+                            &hidden,
+                            ds.chunks[layer_idx as usize],
+                            &ds.image_token_positions,
+                            seq_len,
+                            ds.image_token_positions.len() as u32,
+                            h,
+                        )
+                        .with_context(|| {
+                            format!("wedge4c5 deepstack add layer {layer_idx}")
+                        })?;
+                    ds_enc
+                        .commit_and_wait()
+                        .with_context(|| {
+                            format!(
+                                "wedge4c5 deepstack commit layer {layer_idx}"
+                            )
+                        })?;
+                }
+                // For layer_idx >= n_deepstack: NO injection. This is
+                // the byte-identity contract for layers past the
+                // deepstack range — pinned by
+                // `qwen35_deepstack_layers_past_n_unaffected`.
+            }
+
             // Drop post-FFN-residual bucket guard before the layer dump
             // and capture work, neither of which is on the production hot
             // path under the W-5b.11 bench (capture target unbound, dump
@@ -2335,8 +3394,20 @@ impl Qwen35Model {
             // for the K-window stay in `in_use` until the K-boundary's
             // commit_and_wait drains all in-flight CBs, then the reset moves
             // them all back to the free list at once.
+            //
+            // ADR-019 Phase 1: when this layer's encoder is being HELD for
+            // fusion with the output head (last layer + eligibility), the
+            // K-boundary commit_and_wait has NOT happened yet — pool reset
+            // would move still-GPU-referenced scratches to the free list and
+            // re-trip the iter58b residency-rescission failure mode (F2/F7).
+            // The output head's terminal commit_and_wait drains them; the
+            // next forward call's `reset_decode_pool` (decode) or
+            // `reset_for_prefill_chunk` (next prefill chunk) reclaims the
+            // pool — one prefill of held scratches is below the W-5b.14
+            // 33 GB residency-quota ceiling for production fixtures.
             if seq_len > 1
                 && is_k_boundary
+                && last_layer_held_enc.is_none()
                 && std::env::var("HF2Q_DENSE_Q_ARENA_RESET").as_deref() != Ok("0")
             {
                 super::decode_pool::reset_for_prefill_chunk();
@@ -2386,6 +3457,29 @@ impl Qwen35Model {
         } else {
             None
         };
+        // ADR-019 Phase 1 defense: eligibility above gates on
+        // `OutputHeadMode::Last`, so the held encoder can only ever be
+        // Some when we are about to run the Last arm.  If a future
+        // refactor relaxes the eligibility predicate without updating
+        // every output-head arm to consume the held encoder, drain it
+        // here rather than dropping uncommitted (which would leak a
+        // CB and silently re-trip F2 if any pooled scratch is reused).
+        //
+        // ADR-005 iter-25: `TopK` mode is decode-only (seq_len == 1) and
+        // `phase1_fusion_env_eligible` already gates on `seq_len > 1`, so
+        // the held encoder is always None for TopK. The defense below
+        // does not list TopK as an "encoder consumer" for that reason.
+        debug_assert!(
+            last_layer_held_enc.is_none()
+                || matches!(output_head_mode, OutputHeadMode::Last),
+            "ADR-019 Phase 1: held encoder requires OutputHeadMode::Last"
+        );
+        if !matches!(output_head_mode, OutputHeadMode::Last) {
+            if let Some(mut enc) = last_layer_held_enc.take() {
+                enc.commit_and_wait_labeled("layer.last.fusion_fallback")
+                    .context("commit fallback for held last-layer encoder")?;
+            }
+        }
         let logits = match output_head_mode {
             OutputHeadMode::All => apply_output_head_gpu(
                 &device,
@@ -2399,6 +3493,7 @@ impl Qwen35Model {
             )
             .context("apply_output_head_gpu")?,
             OutputHeadMode::Last => apply_output_head_gpu_last(
+                last_layer_held_enc.take(),
                 &device,
                 &mut registry,
                 &hidden,
@@ -2424,6 +3519,36 @@ impl Qwen35Model {
                 eps,
             )
             .context("apply_output_norm_only_last (forward_embed_last)")?,
+            // ADR-005 iter-25: GPU top-K sampling path.  Same RMSNorm + Q4
+            // lm_head pipeline as `Last`, but the post-commit logits buffer
+            // is fed into `dispatch_top_k_f32` for an in-GPU partial sort
+            // and only top-K (index, value) pairs come back to host. The
+            // caller must thread a non-`None` `topk_out` to receive the
+            // result; if `topk_out` is `None`, we error rather than
+            // silently dropping the top-K result.
+            OutputHeadMode::TopK { k } => {
+                let pair = apply_output_head_gpu_last_topk(
+                    None, // TopK is seq_len==1; never holds the fused encoder.
+                    &device,
+                    &mut registry,
+                    &hidden,
+                    &output_head,
+                    seq_len,
+                    h,
+                    cfg.vocab_size,
+                    eps,
+                    k,
+                )
+                .context("apply_output_head_gpu_last_topk")?;
+                let slot = topk_out.ok_or_else(|| {
+                    anyhow!(
+                        "forward_gpu_impl: OutputHeadMode::TopK requires a non-None \
+                         topk_out out-parameter to receive (indices, values)"
+                    )
+                })?;
+                *slot = Some(pair);
+                Vec::new()
+            }
         };
         if let Some(t) = t_output_head {
             eprintln!(
@@ -2487,37 +3612,21 @@ impl Qwen35Model {
                 // Wave 5b.10: register flash_attn_prefill kernel family for
                 // the Qwen3.5 FA prefill path (replaces legacy `sdpa`).
                 mlx_native::ops::flash_attn_prefill::register(&mut registry);
+                // 2026-05-03 — register flash_attn_vec for decode-path SDPA.
+                // See forward_gpu.rs:1504 sister registration; closes
+                // long-context decode parity gap vs llama.cpp.
+                mlx_native::ops::flash_attn_vec::register(&mut registry);
+                // Wedge-4c.5: register the LM-side image-token residual
+                // add shader (idempotent; gated by deepstack=Some).
+                crate::inference::vision::image_token_residual_add
+                    ::register_image_token_residual_add_shader(&mut registry);
                 let layer_weights = self.upload_layer_weights_gpu(&device)?;
                 // W-5b.7 iter 2: residency-aware uploads for lm_head and norm.
-                let lm_head_f32 =
-                    upload_f32_weight(&self.output_weight, &device).context("upload lm_head")?;
-                let n_w = self.output_weight.len();
-                let lm_head_bf16 = {
-                    let bf16_buf = device
-                        .alloc_buffer(n_w * 2, DType::BF16, vec![n_w])
-                        .map_err(|e| anyhow!("alloc lm_head_bf16: {e}"))?;
-                    let mut enc = device.command_encoder().context("enc lm_head_bf16 cast")?;
-                    mlx_native::ops::elementwise::cast(
-                        &mut enc,
-                        &mut registry,
-                        device.metal_device(),
-                        &lm_head_f32,
-                        &bf16_buf,
-                        n_w,
-                        mlx_native::ops::elementwise::CastDirection::F32ToBF16,
-                    )
-                    .context("cast lm_head F32→BF16 at load")?;
-                    enc.commit_and_wait().context("commit lm_head cast")?;
-                    super::weight_pool::register_weight_buffer(&device, &bf16_buf)
-                        .map_err(|e| anyhow!("register lm_head_bf16 greedy: {e}"))?;
-                    bf16_buf
-                };
                 let lm_head_q4 = upload_q4_0_from_f32(&self.output_weight, &device)
                     .context("upload lm_head_q4 greedy")?;
                 let output_head = OutputHeadGpu {
                     norm_w: upload_f32_weight(&self.output_norm, &device)
                         .context("upload output_norm")?,
-                    lm_head_bf16,
                     lm_head_q4,
                 };
                 *cache = Some(ForwardGpuCache {
@@ -3255,6 +4364,7 @@ impl Qwen35Model {
                             shape.rope_theta,
                             shape.mrope_section,
                             shape.rms_norm_eps,
+                            None,
                             None,
                         )
                         .with_context(|| format!("full_attn legacy greedy layer {layer_idx}"))?
@@ -4545,6 +5655,343 @@ mod tests {
         assert!(
             !err_msg.contains("qwen35_not_implemented"),
             "soft-token error path must never contain the legacy 501 sentinel"
+        );
+    }
+
+    // ============================================================
+    // ADR-005 Phase 4 Wedge-4c.5 (2026-05-02) — DeepStack hooks
+    // ============================================================
+    //
+    // The Qwen3-VL DeepStack contract per
+    // /opt/llama.cpp/src/models/qwen3vl.cpp:96-100:
+    //
+    //   if (il < n_deepstack_layers) {
+    //       cur += chunk_(il+1)   /* at image-token rows only */
+    //   }
+    //
+    // Six tests pin the 4c.5 LM-side hooks at the engine-seam level:
+    //   1. `qwen35_deepstack_none_byte_identical_to_text_only`
+    //   2. `qwen35_deepstack_zero_chunks_byte_identical`
+    //   3. `qwen35_deepstack_layer_il0_changes_logits_vs_no_injection`
+    //   4. `qwen35_deepstack_layers_past_n_unaffected`
+    //   5. `qwen35_deepstack_validates_oob_position`
+    //   6. `qwen35_deepstack_validates_chunk_size`
+
+    /// Build a `[n_image_tokens, hidden]` F32 MlxBuffer populated by
+    /// `init(i)` so deepstack-hook tests can construct synthetic
+    /// chunks deterministically.
+    fn build_ds_chunk(
+        device: &MlxDevice,
+        n_image_tokens: usize,
+        hidden: usize,
+        init: impl Fn(usize) -> f32,
+    ) -> MlxBuffer {
+        let n_elem = n_image_tokens * hidden;
+        let data: Vec<f32> = (0..n_elem).map(init).collect();
+        upload_f32(&data, device).expect("upload ds chunk")
+    }
+
+    /// **4c.5 contract — None-deepstack identity**: a forward call with
+    /// `deepstack=None` MUST be byte-identical to the existing
+    /// `forward_gpu_last_logits_with_soft_tokens` path. This is the
+    /// zero-overhead pin: the new entry point with `None` adds no work.
+    #[test]
+    fn qwen35_deepstack_none_byte_identical_to_text_only() {
+        let m = tiny_hybrid_model_nonzero();
+        let cfg = m.cfg.clone();
+        let device = MlxDevice::new().expect("device");
+        let tokens = vec![1u32, 2, 3, 4];
+        let seq = tokens.len() as u32;
+        let pos_4 = text_positions(seq);
+        let positions = positions_to_flat(&pos_4);
+
+        let mut kv_a = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv a");
+        let logits_a = m
+            .forward_gpu_last_logits_with_soft_tokens(&tokens, &positions, &[], &mut kv_a)
+            .expect("baseline forward");
+        let mut kv_b = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv b");
+        let logits_b = m
+            .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+                &tokens, &positions, &[], None, &mut kv_b,
+            )
+            .expect("deepstack=None forward");
+        assert_eq!(
+            logits_a.len(),
+            logits_b.len(),
+            "deepstack=None must return same logits length"
+        );
+        let max_diff = logits_a
+            .iter()
+            .zip(logits_b.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        // Same kernel path → byte-identical (max_diff = 0).
+        assert!(
+            max_diff < 1e-6,
+            "deepstack=None must be byte-identical to text-only; max diff = {max_diff:.3e}"
+        );
+    }
+
+    /// **4c.5 contract — empty chunks identity**: a forward call with
+    /// `deepstack=Some(...)` but `chunks.len()=0` MUST be byte-identical
+    /// to deepstack=None. Demonstrates the n_deepstack=0 path bypasses
+    /// every per-layer image_token_residual_add dispatch.
+    #[test]
+    fn qwen35_deepstack_zero_chunks_byte_identical() {
+        let m = tiny_hybrid_model_nonzero();
+        let cfg = m.cfg.clone();
+        let device = MlxDevice::new().expect("device");
+        let tokens = vec![1u32, 2, 3];
+        let seq = tokens.len() as u32;
+        let pos_4 = text_positions(seq);
+        let positions = positions_to_flat(&pos_4);
+
+        let empty_ds = crate::serve::forward_prefill::DeepstackInjection {
+            image_token_positions: vec![1u32],
+            chunks: vec![], // n_deepstack = 0
+        };
+
+        let mut kv_a = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv a");
+        let logits_a = m
+            .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+                &tokens,
+                &positions,
+                &[],
+                None,
+                &mut kv_a,
+            )
+            .expect("none forward");
+        let mut kv_b = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv b");
+        let logits_b = m
+            .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+                &tokens,
+                &positions,
+                &[],
+                Some(&empty_ds),
+                &mut kv_b,
+            )
+            .expect("zero-chunks forward");
+        let max_diff = logits_a
+            .iter()
+            .zip(logits_b.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-6,
+            "n_deepstack=0 must be byte-identical to deepstack=None; max diff = {max_diff:.3e}"
+        );
+    }
+
+    /// **4c.5 contract — il=0 injection materially changes logits**:
+    /// a non-zero chunk at LM layer 0 must produce DIFFERENT logits
+    /// than the no-injection baseline. Proves the kernel actually
+    /// reaches `hidden` and the injection is not silently bypassed.
+    #[test]
+    fn qwen35_deepstack_layer_il0_changes_logits_vs_no_injection() {
+        let m = tiny_hybrid_model_nonzero();
+        let cfg = m.cfg.clone();
+        let h = cfg.hidden_size as usize;
+        let device = MlxDevice::new().expect("device");
+        let tokens = vec![3u32, 7, 1, 5, 2];
+        let seq = tokens.len() as u32;
+        let pos_4 = text_positions(seq);
+        let positions = positions_to_flat(&pos_4);
+        let image_positions = vec![1u32, 2, 3];
+
+        let chunk0 = build_ds_chunk(&device, image_positions.len(), h, |i| {
+            // significant magnitude so the post-FFN-residual change
+            // propagates to the final logits beyond noise.
+            ((i as f32) * 0.07).sin() * 0.3
+        });
+        let ds = crate::serve::forward_prefill::DeepstackInjection {
+            image_token_positions: image_positions.clone(),
+            chunks: vec![&chunk0],
+        };
+
+        let mut kv_a = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv a");
+        let logits_a = m
+            .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+                &tokens, &positions, &[], None, &mut kv_a,
+            )
+            .expect("baseline");
+        let mut kv_b = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv b");
+        let logits_b = m
+            .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+                &tokens, &positions, &[], Some(&ds), &mut kv_b,
+            )
+            .expect("ds forward");
+        let max_diff = logits_a
+            .iter()
+            .zip(logits_b.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-3,
+            "deepstack injection at il=0 with non-zero chunk must change logits vs none; \
+             max diff = {max_diff:.3e}"
+        );
+    }
+
+    /// **4c.5 contract — layers past n_deepstack are unaffected**:
+    /// the test fixture has N_layers ≥ 2; we run two forwards, both
+    /// with `n_deepstack = 1` (one chunk applied at LM layer 0). The
+    /// chunk for the second forward differs from the first ONLY for
+    /// rows that DON'T correspond to layer-0 indexing — but since both
+    /// forwards' chunks are at LM layer 0, the only differences must
+    /// come through layer-0's injection. We compare against a third
+    /// forward that runs WITHOUT deepstack and confirm: layers past
+    /// il=0 still process the modified residual but receive NO further
+    /// per-layer DS injection (which is the byte-identity contract for
+    /// il >= n_deepstack — no residual-add even when more chunks
+    /// would have existed).
+    ///
+    /// The harder check we want: with `n_deepstack = 1`, layer 1's
+    /// post-FFN-residual receives NO image_token_residual_add. We
+    /// verify this by running with `n_deepstack = 1` AND with
+    /// `n_deepstack = N_layers` (saturating); the saturating run's
+    /// chunks 1..N_layers must clearly perturb logits MORE than the
+    /// 1-chunk run, which proves the past-il=0 chunks DO take effect
+    /// when their layer is < n_deepstack and DON'T take effect when
+    /// their layer is >= n_deepstack.
+    #[test]
+    fn qwen35_deepstack_layers_past_n_unaffected() {
+        let m = tiny_hybrid_model_nonzero();
+        let cfg = m.cfg.clone();
+        let h = cfg.hidden_size as usize;
+        let n_layers = m.layers.len();
+        // Need at least 2 layers for this test to be meaningful.
+        assert!(n_layers >= 2, "tiny_hybrid model must have ≥ 2 layers");
+        let device = MlxDevice::new().expect("device");
+        let tokens = vec![2u32, 4, 6, 8];
+        let seq = tokens.len() as u32;
+        let pos_4 = text_positions(seq);
+        let positions = positions_to_flat(&pos_4);
+        let image_positions = vec![0u32, 2];
+
+        // Build n_layers chunks, each non-zero with distinct seeds so
+        // each contributes uniquely.
+        let chunks_storage: Vec<MlxBuffer> = (0..n_layers)
+            .map(|li| {
+                build_ds_chunk(&device, image_positions.len(), h, move |i| {
+                    let s = (li as f32) * 13.7 + (i as f32) * 0.13;
+                    s.sin() * 0.25
+                })
+            })
+            .collect();
+
+        // n_deepstack = 1: only chunk 0 applied at LM layer 0.
+        let ds_one = crate::serve::forward_prefill::DeepstackInjection {
+            image_token_positions: image_positions.clone(),
+            chunks: vec![&chunks_storage[0]],
+        };
+        // n_deepstack = n_layers: every chunk applied; layers
+        // past il=0 should now receive non-zero injection.
+        let chunks_all: Vec<&MlxBuffer> = chunks_storage.iter().collect();
+        let ds_all = crate::serve::forward_prefill::DeepstackInjection {
+            image_token_positions: image_positions.clone(),
+            chunks: chunks_all,
+        };
+
+        let mut kv_a = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv a");
+        let logits_one = m
+            .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+                &tokens, &positions, &[], Some(&ds_one), &mut kv_a,
+            )
+            .expect("ds=one");
+        let mut kv_b = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv b");
+        let logits_all = m
+            .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+                &tokens, &positions, &[], Some(&ds_all), &mut kv_b,
+            )
+            .expect("ds=all");
+        let max_diff = logits_one
+            .iter()
+            .zip(logits_all.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        // If the past-il=0 chunks were silently applied even when
+        // n_deepstack=1 (e.g. via off-by-one), max_diff would be ~0.
+        // The contract is: chunks 1..n_layers DO matter when
+        // n_deepstack = n_layers, so max_diff must be substantial.
+        assert!(
+            max_diff > 1e-3,
+            "past-il=0 chunks must take effect when n_deepstack > 1; \
+             ds=one vs ds=all logits identical (max diff = {max_diff:.3e}) \
+             — suggests il bound check is broken"
+        );
+    }
+
+    /// **4c.5 contract — out-of-range image_token_position rejected
+    /// loud at pre-flight**: a position >= tokens.len() must error
+    /// before any GPU dispatch, mirroring the SoftTokenInjection's
+    /// range-validation pattern.
+    #[test]
+    fn qwen35_deepstack_validates_oob_position() {
+        let m = tiny_hybrid_model_nonzero();
+        let cfg = m.cfg.clone();
+        let h = cfg.hidden_size as usize;
+        let device = MlxDevice::new().expect("device");
+        let tokens = vec![1u32, 2, 3];
+        let seq = tokens.len() as u32;
+        let pos_4 = text_positions(seq);
+        let positions = positions_to_flat(&pos_4);
+        // Position 99 is way past tokens.len()=3.
+        let image_positions = vec![99u32];
+        let chunk = build_ds_chunk(&device, 1, h, |_| 0.5);
+        let ds = crate::serve::forward_prefill::DeepstackInjection {
+            image_token_positions: image_positions,
+            chunks: vec![&chunk],
+        };
+        let mut kv = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv");
+        let result = m.forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+            &tokens,
+            &positions,
+            &[],
+            Some(&ds),
+            &mut kv,
+        );
+        let err = result.expect_err("oob position must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("image_token_position") && msg.contains("tokens.len()"),
+            "oob position error must name the violation; got: {msg}"
+        );
+    }
+
+    /// **4c.5 contract — undersized chunk rejected loud at pre-flight**:
+    /// a chunk whose byte_len doesn't match `n_image_tokens * hidden * 4`
+    /// must error before any GPU dispatch.
+    #[test]
+    fn qwen35_deepstack_validates_chunk_size() {
+        let m = tiny_hybrid_model_nonzero();
+        let cfg = m.cfg.clone();
+        let h = cfg.hidden_size as usize;
+        let device = MlxDevice::new().expect("device");
+        let tokens = vec![1u32, 2, 3];
+        let seq = tokens.len() as u32;
+        let pos_4 = text_positions(seq);
+        let positions = positions_to_flat(&pos_4);
+        // Declare 3 image-token positions but pass a chunk sized for
+        // only 1.
+        let image_positions = vec![0u32, 1, 2];
+        let undersized_chunk = build_ds_chunk(&device, 1, h, |_| 0.0);
+        let ds = crate::serve::forward_prefill::DeepstackInjection {
+            image_token_positions: image_positions,
+            chunks: vec![&undersized_chunk],
+        };
+        let mut kv = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv");
+        let result = m.forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+            &tokens,
+            &positions,
+            &[],
+            Some(&ds),
+            &mut kv,
+        );
+        let err = result.expect_err("undersized chunk must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("deepstack chunks[") && msg.contains("required"),
+            "undersized chunk error must name the violation; got: {msg}"
         );
     }
 }

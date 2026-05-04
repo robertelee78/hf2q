@@ -69,6 +69,227 @@ pub struct SoftTokenInjection<'a> {
     /// on mismatch.
     pub embeddings: &'a MlxBuffer,
 }
+
+/// Per-LM-layer DeepStack residual injection metadata (ADR-005 iter-224
+/// Wedge-4c.5).
+///
+/// Mirrors /opt/llama.cpp/src/models/qwen3vl.cpp:96-100's per-layer
+/// `cur += ds` add: at LM layer `il < n_deepstack` (where
+/// `n_deepstack = chunks.len()`), the post-FFN-residual `cur` is
+/// updated in-place at the image-token positions with chunk `il`'s
+/// rows.
+///
+/// The `chunks` vec is **sorted by ascending LM-layer-of-injection**,
+/// so chunks[0] is added at LM layer 0, chunks[1] at LM layer 1, etc.
+/// This matches Qwen3-VL's `deepstack_indexes` convention where the
+/// i-th flagged ViT block's tap output (after passing through its
+/// DeepStack head + main projector) becomes chunk i+1 in the
+/// augmented embed and is consumed at LM layer i.
+///
+/// `image_token_positions` lists the prompt positions (post-`<|image_pad|>`
+/// expansion) where the image tokens reside; same length as the
+/// `n_image_tokens` row count of every chunk.
+///
+/// **Wedge-4c.5 status**: this struct is the engine seam between the
+/// ViT side (vit_gpu_qwen3vl.rs's augmented embed) and the LM side
+/// (forward_gpu.rs's image_token_residual_add hook). The handler-side
+/// path that constructs it from `compute_vision_embeddings_gpu_qwen3vl`'s
+/// output is Wedge-4d territory — until that lands, only the
+/// LM-side test fixtures construct DeepstackInjection directly.
+pub struct DeepstackInjection<'a> {
+    /// Image-token positions in the prompt (post-`<|image_pad|>`
+    /// expansion). Each position must be `< prompt_tokens.len()`.
+    /// Order is the natural left-to-right scan; chunk row k applies
+    /// at position `image_token_positions[k]`.
+    pub image_token_positions: Vec<u32>,
+    /// One GPU buffer per ds layer, each shape `[n_image_tokens,
+    /// hidden_size]` F32 row-major. `chunks.len()` = n_deepstack;
+    /// chunks[i] is added at LM layer i (i in 0..n_deepstack). Buffers
+    /// outlive this `DeepstackInjection` (lifetime `'a`).
+    pub chunks: Vec<&'a MlxBuffer>,
+}
+
+impl<'a> DeepstackInjection<'a> {
+    /// `n_deepstack` — number of LM layers receiving deepstack
+    /// injection. Equal to `chunks.len()`.
+    pub fn n_deepstack(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// `n_image_tokens` — equal to `image_token_positions.len()`. By
+    /// contract every `chunks[i]` carries `n_image_tokens` rows.
+    pub fn n_image_tokens(&self) -> usize {
+        self.image_token_positions.len()
+    }
+}
+
+/// Per-image post-merge token grid for 3D-mRoPE position synthesis
+/// (ADR-005 iter-224 Wedge-4d).
+///
+/// Carries the post-spatial-merge `(n_x, n_y)` grid that the placeholder
+/// expansion + ViT both produce for one image. Total token count is
+/// `n_x * n_y` and matches `n_image_tokens` flowing through the
+/// `expand_image_placeholders` per-image expansion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen3VlImageGrid {
+    /// Post-merge token-grid width (X axis). For canonical Qwen3-VL
+    /// preprocessor at `image_size=768, patch_size=16,
+    /// spatial_merge_size=2`: `n_x = 24`.
+    pub n_x: u32,
+    /// Post-merge token-grid height (Y axis).
+    pub n_y: u32,
+}
+
+impl Qwen3VlImageGrid {
+    /// `n_image_tokens` = `n_x * n_y`.
+    pub fn n_image_tokens(&self) -> u32 {
+        self.n_x.saturating_mul(self.n_y)
+    }
+
+    /// Per peer `mtmd_image_tokens_get_n_pos` at
+    /// `/opt/llama.cpp/tools/mtmd/mtmd.cpp:1354-1357` —
+    /// `MTMD_POS_TYPE_MROPE` returns `max(nx, ny)` for the temporal-axis
+    /// advance after an image chunk. For Qwen3-VL the LM's "global"
+    /// time index advances by `max(n_x, n_y)`, NOT by the full
+    /// `n_image_tokens` — i.e. the LM treats an image as a SINGLE
+    /// temporal step covering `max(n_x, n_y)` positions along axis 0,
+    /// while axes 1 (y) and 2 (x) carry the per-patch grid coordinates.
+    pub fn temporal_advance(&self) -> u32 {
+        self.n_x.max(self.n_y)
+    }
+}
+
+/// Build the 3D-mRoPE flat-position buffer (`positions_flat[4 *
+/// seq_len]` axis-major) for a sequence containing text + image chunks.
+///
+/// Implements peer's MROPE position assignment for Qwen3-VL combined
+/// with the temporal-advance rule observed at
+/// `/opt/llama.cpp/tools/mtmd/mtmd.cpp:1295-1304`
+/// (`mtmd_image_tokens_get_decoder_pos` for `MTMD_POS_TYPE_MROPE`) and
+/// `/opt/llama.cpp/tools/mtmd/mtmd-helper.cpp:166-181`
+/// (`set_position_mrope_2d` writing `[t, y, x, z]` axes column-major).
+///
+/// **Position layout per axis** (column-major: `flat[axis * seq_len + t]`):
+///   - axis 0 = t (temporal)
+///   - axis 1 = y (height / row)
+///   - axis 2 = x (width / column)
+///   - axis 3 = z (image_idx for HunyuanVL — unused for Qwen3-VL,
+///     always 0)
+///
+/// **Per-token assignment**:
+///   - **Text token at sequence position `p`, with the global running
+///     position counter at `t`**: `[t, t, t, t]` — all four axes carry
+///     the same temporal value, mirroring peer at
+///     `mtmd-helper.cpp:155-162` `set_position_normal` and the M-RoPE
+///     text broadcast at `llama-batch.cpp:713-720`.
+///   - **Image-patch token at index `i` within image `img`** with the
+///     image starting at temporal position `t_img` and grid
+///     `(n_x, n_y)`:
+///     - axis 0 (t) = `t_img` (CONSTANT for ALL `n_x*n_y` patch tokens
+///       of one image — peer at mtmd.cpp:1300 `pos.t = pos_0`).
+///     - axis 1 (y) = `t_img + (i / n_x)` (peer at mtmd.cpp:1302
+///       `pos.y = pos_0 + (i / nx)`).
+///     - axis 2 (x) = `t_img + (i % n_x)` (peer at mtmd.cpp:1301
+///       `pos.x = pos_0 + (i % nx)`).
+///     - axis 3 (z) = `0` (peer at mtmd.cpp:1303 `pos.z = 0`).
+///   - **After an image chunk**, the global counter `t` advances by
+///     `max(n_x, n_y)` (NOT by `n_x * n_y`) per peer's
+///     `mtmd_image_tokens_get_n_pos` at mtmd.cpp:1354-1357 returning
+///     `max(nx, ny)` for `MTMD_POS_TYPE_MROPE`. This is why a 24×24
+///     image consumes 576 LM-sequence-position SLOTS but advances the
+///     temporal axis by only 24 (the LM "sees" an image as a 24-step
+///     scan along time, not 576 steps).
+///
+/// # Arguments
+///
+/// - `prompt_len`: total tokenized prompt length (text + image_pad
+///   placeholder expansion already merged).
+/// - `image_grids`: per-image `(grid, sequence_start)` pairs; SORTED by
+///   `sequence_start`. The N image regions in the prompt occupy
+///   `[seq_start..seq_start + grid.n_image_tokens()]` for each image.
+///   Text tokens live in the gaps between (and outside) these regions.
+///
+/// # Returns
+///
+/// `Vec<i32>` of length `4 * prompt_len`, axis-major.
+///
+/// # Errors
+/// - Image regions overlap or extend past `prompt_len`.
+/// - `image_grids` is not sorted by `sequence_start`.
+/// - Any `grid.n_image_tokens() == 0`.
+pub fn build_qwen3vl_positions(
+    prompt_len: usize,
+    image_grids: &[(Qwen3VlImageGrid, u32)],
+) -> anyhow::Result<Vec<i32>> {
+    use anyhow::anyhow;
+
+    // Validate ordering + non-overlap + bounds.
+    let mut last_end: u32 = 0;
+    for (i, (grid, seq_start)) in image_grids.iter().enumerate() {
+        let n_tokens = grid.n_image_tokens();
+        if n_tokens == 0 {
+            return Err(anyhow!(
+                "build_qwen3vl_positions: image[{i}] has zero tokens \
+                 (n_x={}, n_y={})",
+                grid.n_x,
+                grid.n_y
+            ));
+        }
+        if (*seq_start) < last_end {
+            return Err(anyhow!(
+                "build_qwen3vl_positions: image[{i}] starts at {seq_start} \
+                 which is before the prior region's end {last_end} — \
+                 overlapping or unsorted image regions"
+            ));
+        }
+        let region_end = (*seq_start)
+            .checked_add(n_tokens)
+            .ok_or_else(|| anyhow!("build_qwen3vl_positions: image[{i}] region overflow"))?;
+        if (region_end as usize) > prompt_len {
+            return Err(anyhow!(
+                "build_qwen3vl_positions: image[{i}] region {seq_start}..{region_end} \
+                 extends past prompt_len {prompt_len}"
+            ));
+        }
+        last_end = region_end;
+    }
+
+    let mut flat = vec![0i32; 4 * prompt_len];
+    // Global temporal counter — advances by 1 for every text token, by
+    // `max(n_x, n_y)` for every image chunk.
+    let mut t_global: i32 = 0;
+    let mut img_idx: usize = 0;
+    let mut p: usize = 0;
+    while p < prompt_len {
+        if img_idx < image_grids.len() && p == image_grids[img_idx].1 as usize {
+            // Image chunk start.
+            let (grid, _seq_start) = image_grids[img_idx];
+            let n_x = grid.n_x as i32;
+            let n_tokens = grid.n_image_tokens() as usize;
+            let t_img = t_global;
+            for i in 0..n_tokens {
+                let q = p + i;
+                let i_i32 = i as i32;
+                flat[0 * prompt_len + q] = t_img;                 // t (constant)
+                flat[1 * prompt_len + q] = t_img + (i_i32 / n_x); // y
+                flat[2 * prompt_len + q] = t_img + (i_i32 % n_x); // x
+                flat[3 * prompt_len + q] = 0;                     // z
+            }
+            t_global += grid.temporal_advance() as i32;
+            p += n_tokens;
+            img_idx += 1;
+        } else {
+            // Text token.
+            flat[0 * prompt_len + p] = t_global;
+            flat[1 * prompt_len + p] = t_global;
+            flat[2 * prompt_len + p] = t_global;
+            flat[3 * prompt_len + p] = t_global;
+            t_global += 1;
+            p += 1;
+        }
+    }
+    Ok(flat)
+}
 use super::forward_mlx::{
     MlxModelWeights, DenseKvBuffers, HbKvBuffers, dispatch_qmatmul,
     dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs,
@@ -1388,5 +1609,132 @@ impl MlxModelWeights {
             *v /= denom;
         }
         Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3D-mRoPE position synthesis tests (ADR-005 iter-224 Wedge-4d)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod qwen3vl_position_tests {
+    use super::{build_qwen3vl_positions, Qwen3VlImageGrid};
+
+    /// Helper: extract one axis as a Vec<i32> for assertion.
+    fn axis(flat: &[i32], axis: usize, prompt_len: usize) -> Vec<i32> {
+        flat[axis * prompt_len..(axis + 1) * prompt_len].to_vec()
+    }
+
+    #[test]
+    fn build_qwen3vl_positions_text_only_broadcast_t_across_axes() {
+        // 5 text tokens, no images. Every axis gets [0,1,2,3,4].
+        let flat = build_qwen3vl_positions(5, &[]).unwrap();
+        for ax in 0..4 {
+            assert_eq!(axis(&flat, ax, 5), vec![0, 1, 2, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn build_qwen3vl_positions_single_image_emits_correct_grid() {
+        // Layout: [text_0, text_1, IMG(2x3=6 tokens), text_8].
+        // Image grid n_x=3, n_y=2, sequence_start=2.
+        // After image: temporal advances by max(3,2)=3, so text_8 has t=2+3=5.
+        let grid = Qwen3VlImageGrid { n_x: 3, n_y: 2 };
+        let prompt_len = 2 + 6 + 1;
+        let flat = build_qwen3vl_positions(prompt_len, &[(grid, 2)]).unwrap();
+        // axis 0 (t): text=0,1; image all=2; text after=5.
+        assert_eq!(axis(&flat, 0, prompt_len), vec![0, 1, 2, 2, 2, 2, 2, 2, 5]);
+        // axis 1 (y): text=0,1; image i=0..6 → y=0,0,0,1,1,1; text=5.
+        assert_eq!(axis(&flat, 1, prompt_len), vec![0, 1, 2, 2, 2, 3, 3, 3, 5]);
+        // axis 2 (x): text=0,1; image i=0..6 → x=0,1,2,0,1,2; text=5.
+        assert_eq!(axis(&flat, 2, prompt_len), vec![0, 1, 2, 3, 4, 2, 3, 4, 5]);
+        // axis 3 (z): text=0,1; image all=0; text=5.
+        assert_eq!(axis(&flat, 3, prompt_len), vec![0, 1, 0, 0, 0, 0, 0, 0, 5]);
+    }
+
+    #[test]
+    fn build_qwen3vl_positions_multiple_images_global_counter_advances() {
+        // [text_0, IMG1(2x2=4), text_5, IMG2(3x3=9), text_15]
+        // IMG1 at seq 1, advance by max(2,2)=2 → t after IMG1 = 0+1+2 = 3
+        //   wait: text_0 has t=0, then IMG1 at t=1, advance by 2 → t=3 after IMG1.
+        // text_5 (in seq) is at seq pos 5, t=3.
+        // IMG2 at seq pos 6, t=4 (after one text token at t=3 → t advances to 4).
+        // After IMG2 (n_x=3, n_y=3, advance=3): t = 4+3 = 7.
+        // text_15 at seq pos 15, t=7.
+        let img1 = Qwen3VlImageGrid { n_x: 2, n_y: 2 };
+        let img2 = Qwen3VlImageGrid { n_x: 3, n_y: 3 };
+        let prompt_len = 1 + 4 + 1 + 9 + 1; // = 16
+        let flat = build_qwen3vl_positions(prompt_len, &[(img1, 1), (img2, 6)]).unwrap();
+        let t_axis = axis(&flat, 0, prompt_len);
+        assert_eq!(t_axis[0], 0); // text_0
+        assert_eq!(t_axis[1..5], [1, 1, 1, 1]); // IMG1 t-axis (constant)
+        assert_eq!(t_axis[5], 3); // text_5: after IMG1 advance, t=3
+        assert_eq!(t_axis[6..15], [4, 4, 4, 4, 4, 4, 4, 4, 4]); // IMG2 t-axis
+        assert_eq!(t_axis[15], 7); // text_15: after IMG2 advance, t=7
+    }
+
+    #[test]
+    fn build_qwen3vl_positions_h_w_swap_detectably_different() {
+        // Sabotage check: if we accidentally swap h/w, the axis 1 vs
+        // axis 2 outputs MUST differ for non-square images.
+        let grid_3x2 = Qwen3VlImageGrid { n_x: 3, n_y: 2 };
+        let flat = build_qwen3vl_positions(6, &[(grid_3x2, 0)]).unwrap();
+        let y = axis(&flat, 1, 6);
+        let x = axis(&flat, 2, 6);
+        // Image positions 0..6: y=[0,0,0,1,1,1], x=[0,1,2,0,1,2]
+        assert_eq!(y, vec![0, 0, 0, 1, 1, 1]);
+        assert_eq!(x, vec![0, 1, 2, 0, 1, 2]);
+        assert_ne!(y, x, "y and x axes must differ for non-square grid");
+    }
+
+    #[test]
+    fn build_qwen3vl_positions_rejects_overlapping_images() {
+        let img1 = Qwen3VlImageGrid { n_x: 4, n_y: 4 }; // 16 tokens
+        let img2 = Qwen3VlImageGrid { n_x: 2, n_y: 2 }; // 4 tokens
+        // img1 starts at 0, ends at 16; img2 at 10 overlaps.
+        let err = build_qwen3vl_positions(20, &[(img1, 0), (img2, 10)]).unwrap_err();
+        assert!(format!("{err}").contains("before the prior region"));
+    }
+
+    #[test]
+    fn build_qwen3vl_positions_rejects_image_past_prompt_len() {
+        let img = Qwen3VlImageGrid { n_x: 4, n_y: 4 }; // 16 tokens
+        // img at seq=10, region = 10..26, prompt_len=20.
+        let err = build_qwen3vl_positions(20, &[(img, 10)]).unwrap_err();
+        assert!(format!("{err}").contains("extends past prompt_len"));
+    }
+
+    #[test]
+    fn build_qwen3vl_positions_rejects_zero_tokens() {
+        let img = Qwen3VlImageGrid { n_x: 0, n_y: 5 };
+        let err = build_qwen3vl_positions(10, &[(img, 0)]).unwrap_err();
+        assert!(format!("{err}").contains("zero tokens"));
+    }
+
+    #[test]
+    fn build_qwen3vl_positions_image_at_prompt_start() {
+        // [IMG(2x2=4), text_4] — image at sequence position 0.
+        let grid = Qwen3VlImageGrid { n_x: 2, n_y: 2 };
+        let flat = build_qwen3vl_positions(5, &[(grid, 0)]).unwrap();
+        // t-axis: image at t=0 (constant), then text at t=2 (advance by max(2,2)=2).
+        assert_eq!(axis(&flat, 0, 5), vec![0, 0, 0, 0, 2]);
+        // y-axis: image i=0..4 → y=[0,0,1,1] (i/n_x), then text=2.
+        assert_eq!(axis(&flat, 1, 5), vec![0, 0, 1, 1, 2]);
+        // x-axis: image i=0..4 → x=[0,1,0,1] (i%n_x), then text=2.
+        assert_eq!(axis(&flat, 2, 5), vec![0, 1, 0, 1, 2]);
+    }
+
+    #[test]
+    fn qwen3vl_image_grid_temporal_advance_uses_max() {
+        // Per peer mtmd.cpp:1354-1357 MTMD_POS_TYPE_MROPE returns max(nx, ny).
+        assert_eq!(Qwen3VlImageGrid { n_x: 24, n_y: 24 }.temporal_advance(), 24);
+        assert_eq!(Qwen3VlImageGrid { n_x: 32, n_y: 16 }.temporal_advance(), 32);
+        assert_eq!(Qwen3VlImageGrid { n_x: 8, n_y: 40 }.temporal_advance(), 40);
+    }
+
+    #[test]
+    fn qwen3vl_image_grid_n_image_tokens_is_product() {
+        assert_eq!(Qwen3VlImageGrid { n_x: 24, n_y: 24 }.n_image_tokens(), 576);
+        assert_eq!(Qwen3VlImageGrid { n_x: 12, n_y: 8 }.n_image_tokens(), 96);
     }
 }

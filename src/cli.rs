@@ -494,17 +494,29 @@ pub struct GenerateArgs {
     #[arg(long, default_value = "256")]
     pub max_tokens: usize,
 
-    /// Sampling temperature (0.0 = greedy)
-    #[arg(long, default_value = "0.7")]
+    /// Sampling temperature (0.0 = greedy, deterministic).
+    ///
+    /// Default `0.0` mirrors `--temp 0` in llama-cli's deterministic mode and
+    /// gives the user predictable, complete, byte-reproducible output on every
+    /// run.  Pass any positive value (e.g. `--temperature 0.8`) to opt into
+    /// stochastic sampling — useful for creative-writing prompts where output
+    /// diversity matters more than reproducibility, but the cost is occasional
+    /// early-`<|im_end|>` stops on prompts where the model's distribution
+    /// has non-trivial mass on EOS at any step.
+    #[arg(long, default_value = "0.0")]
     pub temperature: f64,
 
     /// Top-p nucleus sampling
-    #[arg(long, default_value = "0.9")]
+    #[arg(long, default_value = "0.95")]
     pub top_p: f64,
 
     /// Top-k sampling (0 = disabled)
-    #[arg(long, default_value = "50")]
+    #[arg(long, default_value = "40")]
     pub top_k: usize,
+
+    /// Min-p sampling (0.0 = disabled)
+    #[arg(long, default_value = "0.05")]
+    pub min_p: f64,
 
     /// Repetition penalty (1.0 = disabled)
     #[arg(long, default_value = "1.0")]
@@ -525,6 +537,49 @@ pub struct GenerateArgs {
     /// Override chat template by reading from a file containing a Jinja2 template
     #[arg(long, conflicts_with = "chat_template")]
     pub chat_template_file: Option<PathBuf>,
+
+    /// Force thinking-mode rendering on: pass `enable_thinking=true` to the
+    /// chat template's Jinja context. For Qwen3-thinking / QwQ / GPT-OSS-
+    /// reasoning checkpoints, this opens an unfilled `<think>\n` block at
+    /// the end of the rendered prompt — the model emits reasoning content
+    /// + `</think>` + the answer (the "both" outcome).
+    ///
+    /// **Default behavior (NEITHER flag set) is auto-detect via the
+    /// canonical render-and-diff signal**: hf2q renders the resolved chat
+    /// template TWICE — once with `enable_thinking=true`, once with
+    /// `=false` — and checks if the bytes differ. If they do, the
+    /// template branches on the variable → the model class supports
+    /// thinking-mode → default-on (model produces BOTH reasoning trace
+    /// AND answer). If the bytes are identical (or no template can be
+    /// resolved), default is `false` (safe fallback).
+    ///
+    /// Mirrors llama.cpp's `--reasoning auto` decision logic at
+    /// `/opt/llama.cpp/common/chat-diff-analyzer.cpp:319-401` (the
+    /// `compare_thinking_enabled` function) and the user-facing decision
+    /// at `/opt/llama.cpp/tools/server/server-context.cpp:1050`.
+    ///
+    /// Pass `--enable-thinking` to override auto-detect ON (e.g. a custom
+    /// template that doesn't probe as thinking-capable but you know the
+    /// model supports it). Pass `--no-thinking` to override auto-detect
+    /// OFF (e.g. a template that probes as thinking-capable but the
+    /// model's actual checkpoint doesn't know how to close `</think>`,
+    /// improvising `<|end|>` instead). Mutually exclusive.
+    ///
+    /// 2026-05-02: added (commit `8c110f5`, plumb-only) → re-defaulted to
+    /// false (regression-fix iter 2) → name-substring heuristic (REJECTED
+    /// by user) → render-and-diff canonical signal (peer audit:
+    /// `/tmp/cfa-thinking-detect/peer-detection-report.md`). H2 audit:
+    /// `docs/research/decode-test-gap-2026-05-02.md`.
+    #[arg(long)]
+    pub enable_thinking: bool,
+
+    /// Force thinking-mode rendering off. See `--enable-thinking` for the
+    /// full rationale (auto-detect default + override semantics). Use this
+    /// when a model whose name LOOKS thinking-capable (e.g. `qwen-thinking-
+    /// distill`) actually breaks with the open-`<think>` prompt cue.
+    /// Mutually exclusive with `--enable-thinking`.
+    #[arg(long, conflicts_with = "enable_thinking")]
+    pub no_thinking: bool,
 
     // ADR-008: candle-era kernel mode flags removed.
     // The mlx-native backend handles all dispatch internally.

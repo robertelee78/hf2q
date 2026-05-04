@@ -41,12 +41,14 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub mod image_token_residual_add;
 pub mod mmproj;
 pub mod mmproj_weights;
 pub mod preprocess;
 pub mod vit;
 pub mod vit_dump;
 pub mod vit_gpu;
+pub mod vit_gpu_qwen3vl;
 
 #[allow(unused_imports)]
 pub use preprocess::{preprocess_rgb_chw, PreprocessConfig, GEMMA4_VISION_CONFIG};
@@ -54,15 +56,45 @@ pub use preprocess::{preprocess_rgb_chw, PreprocessConfig, GEMMA4_VISION_CONFIG}
 /// A single preprocessed image ready for the ViT forward pass.
 ///
 /// `pixel_values` carries the CHW-layout f32 tensor produced by
-/// `preprocess_rgb_chw` (length = `3 × target_size × target_size`).
+/// `preprocess_rgb_chw` (length = `3 × target_size × target_size`) for
+/// the SQUARE-input ClipClassic / Phase-1-Qwen3VL paths. For
+/// **variable-resolution** inputs (Qwen3-VL Phase-2 ViT relaxation,
+/// ADR-005 iter-225), the optional `(pixel_w, pixel_h)` pair carries
+/// the rectangular grid: when `Some(w)` AND `Some(h)`, the tensor
+/// length is `3 * h * w`. When both are `None`, the legacy square
+/// contract holds and consumers should treat the input as
+/// `[3, target_size, target_size]`.
+///
 /// `source_label` is a debug/log-friendly id (mime type for data URIs,
 /// file-name stem for file paths) so request-level tracing can
 /// correlate per-image timings without leaking the full URL or payload.
 #[derive(Debug, Clone)]
 pub struct PreprocessedImage {
     pub pixel_values: Vec<f32>,
+    /// Square input edge in pixels. For backward compatibility, this is
+    /// the trained ViT canvas size (768 for Qwen3-VL, 896 for Gemma4
+    /// SigLIP, etc). When `pixel_w`/`pixel_h` are `Some`, this field is
+    /// retained for compat but the rectangular fields are authoritative.
     pub target_size: u32,
+    /// Rectangular pixel-grid width (Phase-2 variable-resolution).
+    /// `None` ⇔ square input at `target_size × target_size`.
+    pub pixel_w: Option<u32>,
+    /// Rectangular pixel-grid height (Phase-2 variable-resolution).
+    /// `None` ⇔ square input at `target_size × target_size`.
+    pub pixel_h: Option<u32>,
     pub source_label: String,
+}
+
+impl PreprocessedImage {
+    /// Resolved pixel-grid `(W, H)` honoring the rectangular fields when
+    /// present and falling back to the square `target_size` otherwise.
+    /// Consumers downstream of preprocessing should use this in place of
+    /// reading `target_size` directly.
+    pub fn pixel_grid(&self) -> (u32, u32) {
+        let w = self.pixel_w.unwrap_or(self.target_size);
+        let h = self.pixel_h.unwrap_or(self.target_size);
+        (w, h)
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -2434,6 +2434,23 @@ pub fn compute_vision_embeddings_gpu_dispatch(
                      but arch is ClipClassic — preprocessing/arch mismatch"
                 ));
             }
+            // iter-224 Wedge-4c.1 scaffold: Qwen3-VL preprocessing today
+            // produces a square fixed-resolution `Siglip49(_)` payload
+            // (Risk R4 in Worker W's plan §F: "ship fixed-resolution;
+            // dynamic resolution is Phase 2"). The dispatch step below
+            // partitions Qwen3VlSiglip+Siglip49 inputs and delegates to
+            // `vit_gpu_qwen3vl::compute_vision_embeddings_gpu_qwen3vl`,
+            // which currently returns the 4c.1 scaffold Err. The defense
+            // here mirrors the (ClipClassic, Gemma4v) preprocessing-
+            // mismatch arm above.
+            (super::mmproj::ArchProfile::Qwen3VlSiglip, VisionInput::Siglip49(_)) => {}
+            (super::mmproj::ArchProfile::Qwen3VlSiglip, VisionInput::Gemma4v(_)) => {
+                return Err(anyhow!(
+                    "compute_vision_embeddings_gpu_dispatch: input {idx} is Gemma4v \
+                     but arch is Qwen3VlSiglip — preprocessing/arch mismatch (Qwen3-VL \
+                     uses square-fixed-resolution Siglip49 preprocessing in Phase 1)"
+                ));
+            }
             (super::mmproj::ArchProfile::Unknown, _) => unreachable!("guarded above"),
         }
     }
@@ -2458,6 +2475,62 @@ pub fn compute_vision_embeddings_gpu_dispatch(
     }
 
     let mut out: Vec<Option<Vec<f32>>> = (0..inputs.len()).map(|_| None).collect();
+    // iter-224 Wedge-4c.5 LANDED: Qwen3VlSiglip routes through
+    // `compute_vision_embeddings_gpu_qwen3vl` for the full ViT
+    // forward (CPU prelude + per-block transformer + DeepStack heads
+    // + main projector + augmented embed concat). The validator
+    // accepts the file at `serve --mmproj` startup; this branch is
+    // the production path for any image-bearing chat that survives
+    // the Wedge-4d preprocess gate at handlers.rs (text-only chat
+    // doesn't enter dispatch at all).
+    if matches!(arch, super::mmproj::ArchProfile::Qwen3VlSiglip) {
+        // Sub-iter 4c.2 closure: `num_position_embeddings` is sourced
+        // from the loaded `v.position_embd.weight` tensor's outer
+        // (count) axis. ggml stores the table as
+        // `(n_embd, count)` column-major (`pos_embd->ne[1] = count`,
+        // per `clip.cpp:272-289` `clip_graph::resize_position_embeddings`);
+        // hf2q's `mlx_native::gguf::GgufFile` parser at
+        // `mod.rs:861` reverses the dim order so the row-major view is
+        // `[count, n_embd]` → `shape()[0] = count`. The 4c.1 sentinel
+        // `num_position_embeddings = 1` is replaced here per Codex
+        // Phase-2b drift-trap closure.
+        let num_position_embeddings: u32 = mmproj_weights
+            .position_embd_weight()
+            .map_err(|e| {
+                anyhow!(
+                    "compute_vision_embeddings_gpu_dispatch (Qwen3VlSiglip): \
+                     v.position_embd.weight required for shape extraction: {e}"
+                )
+            })?
+            .shape()[0] as u32;
+        let cfg = super::vit_gpu_qwen3vl::Qwen3VlViTConfig::from_mmproj(
+            mmproj_cfg,
+            num_position_embeddings,
+        )?;
+        let r = super::vit_gpu_qwen3vl::compute_vision_embeddings_gpu_qwen3vl(
+            inputs,
+            mmproj_weights,
+            &cfg,
+            mmproj_cfg,
+        )?;
+        // 4c.4 landed the real arithmetic; indices are preserved by
+        // walking the returned-vec in input order (Wedge-4c.4 Phase-1
+        // accepts only single-image inputs, so r.len() == 1).
+        for (i, e) in r.into_iter().enumerate() {
+            out[i] = Some(e);
+        }
+        // Skip the gemma/siglip dispatch entirely — Qwen3VlSiglip arch
+        // implies all inputs are Qwen3-VL Siglip49 (validated above).
+        return out
+            .into_iter()
+            .enumerate()
+            .map(|(i, slot)| {
+                slot.ok_or_else(|| {
+                    anyhow!("compute_vision_embeddings_gpu_dispatch: slot {i} unfilled")
+                })
+            })
+            .collect();
+    }
     if !siglip_imgs.is_empty() {
         let r = compute_vision_embeddings_gpu(&siglip_imgs, mmproj_weights, mmproj_cfg, scale)?;
         for (i, e) in siglip_idx.into_iter().zip(r.into_iter()) {
@@ -5883,6 +5956,8 @@ mod tests {
             PreprocessedImage {
                 pixel_values: pixels,
                 target_size: cfg.image_size,
+                pixel_w: None,
+                pixel_h: None,
                 source_label: format!("synthetic-{seed}"),
             }
         };
@@ -7226,6 +7301,11 @@ mod tests {
             projector: crate::inference::vision::mmproj::ProjectorType::Mlp,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            // iter-224 Wedge-4b: Qwen3-VL-only fields default to None on
+            // non-Qwen3-VL fixtures (this is a Gemma4v synthetic fixture).
+            spatial_merge_size: None,
+            projection_dim: None,
+            deepstack_indexes: None,
         };
         (weights, cfg, patches, pos_x, pos_y)
     }

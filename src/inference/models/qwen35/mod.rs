@@ -31,7 +31,11 @@ pub mod decode_pool;
 pub mod delta_net;
 pub mod dense;
 pub mod dump_bisect;
+pub mod chunk_allocs_arena;
+pub mod dense_ffn_arena;
+pub mod dn_prefill_arena;
 pub mod fa_prefill_arena;
+pub mod fa_projections_arena;
 pub mod ffn;
 pub mod forward_cpu;
 pub mod in_memory_loader;
@@ -40,7 +44,11 @@ pub mod full_attn;
 pub mod gpu_delta_net;
 pub mod gpu_ffn;
 pub mod gpu_full_attn;
+pub use chunk_allocs_arena::ChunkAllocsArena;
+pub use dense_ffn_arena::{DenseFfnArena, MoeFfnArena};
+pub use dn_prefill_arena::DnPrefillArena;
 pub use fa_prefill_arena::FaPrefillArena;
+pub use fa_projections_arena::FaProjectionsArena;
 pub mod io_heads;
 pub mod kernels;
 pub mod kv_cache;
@@ -58,6 +66,72 @@ pub mod weight_pool;
 pub const ARCH_QWEN35: &str = "qwen35";
 /// `general.architecture` value for the MoE variant.
 pub const ARCH_QWEN35MOE: &str = "qwen35moe";
+
+/// `general.architecture` value emitted by hf2q's Wedge-4f convert pipeline
+/// for **Qwen3-VL text** models (`Qwen/Qwen3-VL-2B-Instruct`,
+/// `Qwen/Qwen3-VL-4B-Instruct`, etc.).
+///
+/// This is the dense Qwen3-VL variant. Note the underscore: the value is
+/// `qwen3_vl`, not the llama.cpp upstream's `qwen3vl`. hf2q's convert pipeline
+/// (`src/convert/...`) preserves HF's `model_type = "qwen3_vl_text"` family
+/// stem when it stamps `general.architecture`. Both the underscored and
+/// non-underscored variants are recognized by [`is_qwen3_vl_arch`] so we
+/// stay forward-compatible with future convert-pipeline alignment.
+///
+/// Wedge-4 / iter-227 (2026-05-02) introduces this constant solely so the
+/// runtime arch dispatch in `serve::cmd_generate` and
+/// `serve::api::engine::LoadedModel::load` can detect Qwen3-VL GGUFs and
+/// route them with an operator-actionable error rather than falling
+/// through to the Gemma 4 path and dying inside the per-layer MoE expert
+/// loader with `missing blk.0.ffn_gate_up_exps.weight`.
+///
+/// **Why not route to `Qwen35Model::load_from_gguf`?** Qwen3-VL text is a
+/// plain dense transformer with `attn_{q,k,v,o}` + `ffn_{gate,up,down}`
+/// tensors and zero SSM / DeltaNet structure. [`Qwen35Config::from_gguf`]
+/// requires `{prefix}.ssm.{state_size,group_count,inner_size,conv_kernel}`
+/// and `{prefix}.full_attention_interval` keys, none of which are emitted
+/// by Wedge-4f convert (correctly: Qwen3-VL has none of those features).
+/// A separate `Qwen3VlModel` load path is the structurally honest answer
+/// and is iter-228+ scope; iter-227 closes only the dispatch gap.
+pub const ARCH_QWEN3_VL: &str = "qwen3_vl";
+
+/// llama.cpp upstream's `general.architecture` string for the same family
+/// (no underscore). Recognized so a future convert-pipeline alignment to
+/// the upstream string doesn't silently re-break dispatch.
+pub const ARCH_QWEN3VL_UPSTREAM: &str = "qwen3vl";
+
+/// llama.cpp upstream's `general.architecture` string for the **MoE**
+/// Qwen3-VL variant (e.g. `Qwen3-VL-30B-A3B`). hf2q does not yet emit
+/// or load this variant, but it is recognized by [`is_qwen3_vl_arch`]
+/// so the dispatch error message tells the operator we know what they
+/// have but cannot serve it yet (rather than falling through silently).
+pub const ARCH_QWEN3VLMOE_UPSTREAM: &str = "qwen3vlmoe";
+
+/// True iff `arch` is any Qwen3-VL `general.architecture` string we
+/// recognize — covers both hf2q's underscored convention (`qwen3_vl`) and
+/// llama.cpp upstream's no-underscore convention (`qwen3vl`,
+/// `qwen3vlmoe`). Used at the runtime dispatch sites in
+/// `serve::cmd_generate` and `serve::api::engine::LoadedModel::load` so
+/// either arch-string spelling lands on the same operator-actionable
+/// error path.
+///
+/// Returns `false` for `qwen35` / `qwen35moe` (those route through the
+/// existing Qwen3.5 dense + MoE paths) and for unrelated arches like
+/// `gemma4`, `bert`, `nomic-bert`, etc.
+pub fn is_qwen3_vl_arch(arch: &str) -> bool {
+    arch == ARCH_QWEN3_VL
+        || arch == ARCH_QWEN3VL_UPSTREAM
+        || arch == ARCH_QWEN3VLMOE_UPSTREAM
+}
+
+/// True iff a Qwen3-VL `general.architecture` string identifies the
+/// MoE variant (Qwen3-VL-30B-A3B etc.). Today only the upstream
+/// `qwen3vlmoe` value triggers this; hf2q's convert pipeline does not
+/// yet emit a Qwen3-VL-MoE GGUF, but the predicate is wired so the
+/// dispatch error message can distinguish dense vs MoE Qwen3-VL.
+pub fn is_qwen3_vl_moe_arch(arch: &str) -> bool {
+    arch == ARCH_QWEN3VLMOE_UPSTREAM
+}
 
 /// Dense vs MoE flavor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -711,6 +785,84 @@ mod tests {
     fn key_prefix_roundtrip() {
         assert_eq!(Qwen35Variant::Dense.key_prefix(), ARCH_QWEN35);
         assert_eq!(Qwen35Variant::Moe.key_prefix(), ARCH_QWEN35MOE);
+    }
+
+    // ------------------------------------------------------------------
+    // Wedge-4 / iter-227 — Qwen3-VL arch dispatch predicates
+    // ------------------------------------------------------------------
+
+    /// hf2q's convert pipeline (Wedge-4f) emits `general.architecture =
+    /// "qwen3_vl"` (with underscore). The real GGUF inspected on
+    /// 2026-05-02 at `.cfa-archive/wedge4f-out/qwen3-vl-2b-q4_0.gguf`
+    /// carries this exact string. Pin the predicate against it so a
+    /// future convert-pipeline drift does not silently break the
+    /// `cmd_generate` / `cmd_serve` dispatch arm.
+    #[test]
+    fn iter227_recognizes_underscored_qwen3_vl_arch_string() {
+        assert!(is_qwen3_vl_arch(ARCH_QWEN3_VL));
+        assert!(is_qwen3_vl_arch("qwen3_vl"));
+        assert!(!is_qwen3_vl_moe_arch("qwen3_vl"));
+    }
+
+    /// llama.cpp upstream emits the no-underscore variant. We recognize
+    /// it so a future hf2q convert-pipeline alignment to the upstream
+    /// string does not re-break dispatch.
+    #[test]
+    fn iter227_recognizes_upstream_no_underscore_qwen3vl_arch_string() {
+        assert!(is_qwen3_vl_arch(ARCH_QWEN3VL_UPSTREAM));
+        assert!(is_qwen3_vl_arch("qwen3vl"));
+        assert!(!is_qwen3_vl_moe_arch("qwen3vl"));
+    }
+
+    /// llama.cpp upstream's MoE variant (Qwen3-VL-30B-A3B). hf2q does
+    /// not yet emit or serve this, but the predicate must distinguish it
+    /// from the dense variant so the dispatch error message can be
+    /// MoE-specific.
+    #[test]
+    fn iter227_recognizes_upstream_qwen3vlmoe_arch_string() {
+        assert!(is_qwen3_vl_arch(ARCH_QWEN3VLMOE_UPSTREAM));
+        assert!(is_qwen3_vl_moe_arch("qwen3vlmoe"));
+    }
+
+    /// Regression guard — `is_qwen3_vl_arch` must NOT widen onto the
+    /// existing Qwen3.5 / Qwen3.5-MoE arches (which have working
+    /// dispatch through `Qwen35LoadedModel::load`) or onto unrelated
+    /// families (Gemma 4, BERT, etc.). Iter-227 must be additive.
+    #[test]
+    fn iter227_does_not_widen_onto_existing_arches() {
+        for arch in &[
+            "qwen35",
+            "qwen35moe",
+            "gemma4",
+            "gemma3",
+            "bert",
+            "nomic-bert",
+            "llama",
+            "qwen3", // base Qwen3 (no VL)
+            "qwen2",
+            "",
+            "totally-fake-arch-name",
+        ] {
+            assert!(
+                !is_qwen3_vl_arch(arch),
+                "is_qwen3_vl_arch({arch:?}) must be false (regression guard for iter-227 dispatch)"
+            );
+            assert!(
+                !is_qwen3_vl_moe_arch(arch),
+                "is_qwen3_vl_moe_arch({arch:?}) must be false (regression guard for iter-227 dispatch)"
+            );
+        }
+    }
+
+    /// Sanity: `qwen3_vl` is NOT a `Qwen35Variant` — it routes through a
+    /// separate dispatch path. This test ensures Qwen35Variant::from_arch
+    /// stays narrow to the Qwen3.5 family even after the iter-227 const
+    /// additions.
+    #[test]
+    fn iter227_qwen3_vl_is_not_a_qwen35_variant() {
+        assert_eq!(Qwen35Variant::from_arch(ARCH_QWEN3_VL), None);
+        assert_eq!(Qwen35Variant::from_arch(ARCH_QWEN3VL_UPSTREAM), None);
+        assert_eq!(Qwen35Variant::from_arch(ARCH_QWEN3VLMOE_UPSTREAM), None);
     }
 
     /// Integration test against the real apex GGUF on disk. `#[ignore]` so

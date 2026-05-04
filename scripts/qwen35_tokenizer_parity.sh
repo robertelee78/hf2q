@@ -8,10 +8,19 @@
 #
 # The contract: hf2q's `build_tokenizer_from_gguf` (cmd_generate_qwen35
 # path) must produce token streams byte-equivalent to llama-tokenize on
-# the same GGUF — modulo BOS prepending, which llama-tokenize does
-# automatically when the GGUF declares `tokenizer.ggml.add_bos_token=true`
-# and hf2q does not (matches `cmd_generate`'s explicit-prepend pattern
-# at src/serve/mod.rs:597-608, kept consistent across arches).
+# the same GGUF, INCLUDING BOS. Both sides honour
+# `tokenizer.ggml.add_bos_token=true`:
+#  * llama-tokenize prepends BOS by default (use `--no-bos` to suppress).
+#  * hf2q's `tokenize_rendered_prompt_llama_style` explicitly prepends
+#    BOS via `resolve_token_id(..., "tokenizer.ggml.bos_token_id")`,
+#    falling back to `llama_cpp_special_token_id_for_model("gpt2", ...)`
+#    → 11 (mirrors llama-vocab.cpp:1838-1839 GPT-2 default
+#    `special_bos_id = 11`) when GGUF lacks an explicit
+#    `tokenizer.ggml.bos_token_id`.
+# 2026-05-03 — earlier versions of this script asserted hf2q does NOT
+# auto-prepend and stripped llama's leading BOS. That premise was stale
+# after ADR-015 iter42 (commit 0122100, 2026-04-29) which added
+# `add_bos_token` honour repo-wide. Both streams now compared with-BOS.
 #
 # Usage:
 #   scripts/qwen35_tokenizer_parity.sh <gguf_path>
@@ -64,15 +73,11 @@ extract_hf2q_ids() {
     | awk '/^TOKENIZE_DEBUG_IDS/{$1=""; print}' | sed 's/^ //'
 }
 
-# Strip leading BOS from llama-tokenize output if present. The apex
-# GGUF declares add_bos_token=true so llama-tokenize prepends BOS.
-# hf2q does not auto-prepend (consistent with the gemma path's
-# explicit-prepend at src/serve/mod.rs:597-608).
-strip_bos() {
-  local ids="$1"
-  local first_id="${ids%% *}"
-  local rest="${ids#* }"
-  echo "$rest"
+# 2026-05-03 — `strip_bos` removed: both sides auto-prepend BOS now,
+# so the streams compare directly. See the contract block at the top
+# of the file for why the prior strip-BOS premise is stale.
+trim_ws() {
+  echo "$1" | sed 's/[[:space:]]*$//'
 }
 
 PROMPTS=(
@@ -88,16 +93,13 @@ for prompt in "${PROMPTS[@]}"; do
   printf '\n--- fixture: %q ---\n' "$prompt"
   llama_ids="$(extract_llama_ids "$prompt")" || { echo "llama-tokenize failed"; exit 3; }
   hf2q_ids="$(extract_hf2q_ids "$prompt")"  || { echo "hf2q debug-tokenize failed"; exit 3; }
-  llama_aligned="$(strip_bos "$llama_ids")"
   echo "llama-tokenize: $llama_ids"
   echo "hf2q:           $hf2q_ids"
-  echo "llama (no-bos): $llama_aligned"
 
-  # Trim trailing whitespace before compare
-  llama_aligned="$(echo "$llama_aligned" | sed 's/ *$//')"
-  hf2q_ids="$(echo "$hf2q_ids" | sed 's/ *$//')"
+  llama_ids="$(trim_ws "$llama_ids")"
+  hf2q_ids="$(trim_ws "$hf2q_ids")"
 
-  if [[ "$llama_aligned" == "$hf2q_ids" ]]; then
+  if [[ "$llama_ids" == "$hf2q_ids" ]]; then
     echo "PARITY: PASS"
   else
     echo "PARITY: FAIL — token streams differ"

@@ -989,6 +989,11 @@ mod tests {
             projector: ProjectorType::Mlp,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
+            // iter-224 Wedge-4b: Qwen3-VL-only fields default to None on
+            // non-Qwen3-VL fixtures.
+            spatial_merge_size: None,
+            projection_dim: None,
+            deepstack_indexes: None,
         };
         let device = mlx_native::MlxDevice::new().expect("create device");
         let m = LoadedMmproj {
