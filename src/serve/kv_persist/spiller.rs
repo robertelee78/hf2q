@@ -156,6 +156,27 @@ pub trait KvCacheSpill: Send + Sync {
     ) -> Option<crate::serve::kv_persist::format::ModelFingerprint> {
         None
     }
+
+    /// ADR-017 Closure iter-3 (2026-05-04) — real per-family layer count.
+    ///
+    /// Replaces the [`BlockPrefixCacheSpiller::n_layers_for_family`]
+    /// hardcoded `1` (which was an A.3 stub the spec doc-comment
+    /// promised B-dense.1 would replace, but the replacement never
+    /// landed). The R-P5 ship-gate exposed this gap: every real
+    /// production model has dozens of layers, so iterating only
+    /// layer 0 misses ~98% of the live KV state and `pre_evict`
+    /// returns `Skipped` even when the registered hook is fully
+    /// wired.
+    ///
+    /// Default = 1 (preserves the A.3 stub semantics for
+    /// `StubGemma4Spill` and any not-yet-migrated hook).
+    /// `Gemma4DenseSpill` overrides to return its real
+    /// `num_layers` (typically 26-62 for Gemma 4 family
+    /// configurations).
+    fn n_layers(&self) -> usize {
+        1
+    }
+
 }
 
 /// Composite key for the per-family registration map. `String` for
@@ -220,6 +241,8 @@ impl<E> BlockPrefixCacheSpiller<E> {
     /// blocks). Idempotent enough that an operator running
     /// `cmd_serve` twice in a row doesn't accumulate stale hooks.
     pub fn register_family(&self, repo: String, quant: QuantType, hook: FamilyHook) {
+        let alignment = hook.lock().map(|g| g.block_alignment()).unwrap_or(0);
+        eprintln!("[KV-DIAG] register_family: repo={:?} quant={} alignment={}", repo, quant.as_str(), alignment);
         let mut g = self
             .registrations
             .write()
@@ -347,36 +370,30 @@ impl<E> BlockPrefixCacheSpiller<E> {
         QuantType::from_canonical_str(&handle.quant).ok()
     }
 
-    /// Convenience for telemetry / tests: number of layers the
-    /// spiller iterates per snapshot. A.3 ships a single-layer stub;
-    /// B-dense.1 / B-hybrid.1 expose the real layer count via the
-    /// per-family hook (see `KvCacheSpill::block_alignment` and the
-    /// future `n_layers()` extension).
-    fn n_layers_for_family(_hook: &FamilyHook) -> usize {
-        // A.3 stub: one logical layer. B-dense.1 will add a method
-        // to KvCacheSpill (e.g. `n_layers()`) and replace this
-        // single-layer enumeration with the per-family layer count.
-        1
+    /// ADR-017 Closure iter-3 (2026-05-04) — query the per-family
+    /// hook for its real layer count. Replaces the pre-iter-3
+    /// hardcoded `1` (an A.3 stub never replaced by B-dense.1).
+    ///
+    /// The hook lock is held only across a single `n_layers()` call;
+    /// on poison or any other failure the function returns 1 (the
+    /// safe pre-iter-3 fallback), causing the loop to behave
+    /// identically to the A.3 stub.
+    fn n_layers_for_family(hook: &FamilyHook) -> usize {
+        hook.lock().map(|g| g.n_layers()).unwrap_or(1)
     }
 
-    /// Returns the contiguous block ranges to snapshot for a single
-    /// layer at a given alignment. A.3 ships one block per layer;
-    /// B-dense.1 will replace this with the real prefix length
-    /// derived from the engine's KV cache occupancy.
-    fn ranges_for_layer(alignment: u32) -> Vec<Range<u32>> {
-        if alignment == 0 {
-            return Vec::new();
-        }
-        // A.3 stub: snapshot the first block. The real per-family
-        // hook computes prefix length and returns ranges
-        // [0..align), [align..2*align), ... up to the live prefix.
-        // The single-element Vec is intentional — B-dense.1 grows
-        // this past one element, and the Vec shape is the stable
-        // surface to avoid an API churn at that point.
-        #[allow(clippy::single_range_in_vec_init)]
-        let ranges = vec![0..alignment];
-        ranges
-    }
+    /// ADR-017 Closure iter-3 (2026-05-04) — pre_evict's per-layer
+    /// iteration cap. Each layer's snapshot loop generates ranges
+    /// `[0..align), [align..2*align), ...` until either this cap
+    /// is reached OR the hook returns `None` for a range (signaling
+    /// "no live state past this point"). Live state is contiguous
+    /// from token 0 in the KV cache (write_positions are monotonic
+    /// during prefill) so break-on-None is safe.
+    ///
+    /// 32768 = max plausible context length; covers the largest
+    /// in-tree Gemma 4 + Qwen 3.5 configs without runaway iteration.
+    /// At alignment = 256 this caps at 128 ranges per layer.
+    const MAX_PER_LAYER_TOKENS: u32 = 32768;
 }
 
 // ---------------------------------------------------------------------------
@@ -483,26 +500,16 @@ where
     /// when registry locking fails.
     fn pre_evict(&self, handle: &LoadedHandle, _engine: &Arc<LoadedEngine<E>>) -> SpillOutcome {
         let Some(quant) = Self::parse_quant(handle) else {
+            eprintln!("[KV-DIAG] pre_evict: parse_quant=None handle.quant={:?} handle.repo_id={:?}", handle.quant, handle.repo_id);
             return SpillOutcome::Skipped;
         };
-        // ADR-017 Closure iter-3 (2026-05-04): `LoadedHandle.repo_id`
-        // stores the pool-key form `format!("{repo}@{quant}")` (set
-        // at multi_model.rs:1014, 1164 when the manager admits an
-        // engine to the pool). Family hooks are registered under the
-        // BARE repo (LoaderWrapper::update_spiller_registration calls
-        // `spiller.register_family(repo: String, quant, ...)` with the
-        // unwrapped repo string from try_substitute_on_load). Without
-        // this strip, lookup_hook misses every hook → SpillOutcome::Skipped
-        // → R-P5 ratio ≈ 1.0 (the iter-1 / iter-2 finding). This was
-        // latent because R-P4's force_eviction_via_symlink does NOT
-        // route through `manager.evict()`; it forces eviction via the
-        // GGUF symlink trick, which triggers a different (in-process)
-        // restoration path that does not expose this asymmetry.
         let bare_repo: &str = handle
             .repo_id
             .strip_suffix(&format!("@{}", handle.quant))
             .unwrap_or(handle.repo_id.as_str());
+        eprintln!("[KV-DIAG] pre_evict: bare_repo={:?} quant={} registered_count={}", bare_repo, quant.as_str(), self.registered_count());
         let Some(hook_arc) = self.lookup_hook(bare_repo, quant) else {
+            eprintln!("[KV-DIAG] pre_evict: lookup_hook=None for ({}, {}) → Skipped", bare_repo, quant.as_str());
             return SpillOutcome::Skipped;
         };
 
@@ -514,20 +521,38 @@ where
             };
             g.block_alignment()
         };
+        eprintln!("[KV-DIAG] pre_evict: hook found, alignment={}", alignment);
         if alignment == 0 {
+            eprintln!("[KV-DIAG] pre_evict: alignment=0 → Skipped (likely C.1 stub still active; B-dense.2 substitution did not fire)");
             return SpillOutcome::Skipped;
         }
 
         let n_layers = Self::n_layers_for_family(&hook_arc);
-        let ranges = Self::ranges_for_layer(alignment);
+        eprintln!("[KV-DIAG] pre_evict: starting snapshot loop n_layers={}", n_layers);
 
         let mut enqueued: u32 = 0;
+        let mut snap_none: u32 = 0;
         // Chain-hash linkage: parent[N+1] = block_hash[N]. Genesis
         // (first written block) uses ParentBlockHash(None).
         let mut parent = ParentBlockHash(None);
 
         for layer_rank in 0..n_layers {
-            for range in &ranges {
+            // ADR-017 Closure iter-3: iterate block-aligned ranges
+            // [0..align), [align..2*align), ... up to MAX_PER_LAYER_TOKENS,
+            // breaking on the first `None` from `snapshot_block`. Live
+            // state is contiguous from token 0 (write_positions are
+            // monotonic during prefill), so the first None signals
+            // "no more live state in this layer" and we can stop.
+            // Pre-iter-3 used a hardcoded single [0..alignment) range
+            // regardless of layer (an A.3 stub never replaced by
+            // B-dense.1) — a ~98% under-snapshot for any production
+            // model with multiple layers or > 1 block of live state.
+            let mut range_start: u32 = 0;
+            while range_start < Self::MAX_PER_LAYER_TOKENS {
+                let range_end = range_start
+                    .saturating_add(alignment)
+                    .min(Self::MAX_PER_LAYER_TOKENS);
+                let range = range_start..range_end;
                 let snapshot = {
                     let g = match hook_arc.lock() {
                         Ok(g) => g,
@@ -537,7 +562,16 @@ where
                 };
                 let body = match snapshot {
                     Some(b) => b,
-                    None => continue, // hook has no state for this range
+                    None => {
+                        // First None signals end of live state for
+                        // this layer. KV cache fills contiguously
+                        // from token 0 during prefill, so we can
+                        // stop iterating this layer here. Counter
+                        // is informational only (lifted out of the
+                        // loop in production diagnostics).
+                        snap_none = snap_none.saturating_add(1);
+                        break;
+                    }
                 };
 
                 // body identity: sha256(body) == block_hash per
@@ -566,6 +600,8 @@ where
                         enqueued = enqueued.saturating_add(1);
                         // Advance the chain pointer for the next block.
                         parent = ParentBlockHash(Some(block_hash));
+                        // Advance to the next range in this layer.
+                        range_start = range_end;
                     }
                     Err(_full_or_disconnected) => {
                         // Back-pressure / writer-down → IoErr. We
@@ -577,6 +613,7 @@ where
             }
         }
 
+        eprintln!("[KV-DIAG] pre_evict: complete enqueued={} snap_none={} (n_layers={})", enqueued, snap_none, n_layers);
         if enqueued == 0 {
             SpillOutcome::Skipped
         } else {

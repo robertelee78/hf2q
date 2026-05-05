@@ -3069,7 +3069,10 @@ fn kv_snapshot_gemma(
 
     let kvs = match weights.dense_kvs.as_ref() {
         Some(v) => v,
-        None => return Ok(None),
+        None => {
+            eprintln!("[KV-DIAG] kv_snapshot_gemma: weights.dense_kvs=None for layer_rank={layer_rank}");
+            return Ok(None);
+        }
     };
     if layer_rank >= kvs.len() {
         anyhow::bail!(
@@ -3081,6 +3084,7 @@ fn kv_snapshot_gemma(
     let layer = &kvs[layer_rank];
     let capacity = layer.capacity;
     if capacity == 0 {
+        eprintln!("[KV-DIAG] kv_snapshot_gemma: layer={layer_rank} capacity=0 → Ok(None)");
         return Ok(None);
     }
     if range.end <= range.start {

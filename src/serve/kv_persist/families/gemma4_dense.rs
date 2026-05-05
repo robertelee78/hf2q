@@ -108,7 +108,7 @@
 //! the cache in the first place.
 
 use std::ops::Range;
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock};
 
 use mlx_native::{DType, MlxBuffer, MlxDevice};
 
@@ -258,7 +258,7 @@ pub struct Gemma4DenseSpill {
     /// and `engine` are set, `engine_arc` wins.
     engine: Arc<RwLock<Option<EngineHandle>>>,
 
-    /// Live `Weak<Engine>` slot — Phase B-dense.2 follow-up production
+    /// Live `Engine` clone — Phase B-dense.2 follow-up production
     /// path. The factory's `try_from_engine_arc` populates this when
     /// it downcasts to `Arc<Engine>`; `snapshot_block` /
     /// `restore_block` prefer it over the B-dense.1 `engine` slot
@@ -266,15 +266,29 @@ pub struct Gemma4DenseSpill {
     /// `MlxModelWeights.dense_kvs` and is the only path that can
     /// safely read/write it without crossing the worker boundary.
     ///
-    /// **P0 fix 2026-05-01**: this slot stores `Weak<Engine>`, not
-    /// `Arc<Engine>`. The spill OBSERVES the engine; the engine's
-    /// lifetime is owned by `HotSwapManager`. Storing a strong Arc
-    /// here defeats `LoaderWrapper::load`'s `Arc::try_unwrap` recovery
-    /// of the inner Engine (see `loader_wrapper.rs:333`), which aborts
-    /// pre-warm with the EngineBindable-contract violation. On every
-    /// snapshot/restore the slot is `.upgrade()`-ed; a dropped engine
-    /// (`None`) yields the `Skipped` no-op path, not an error.
-    engine_arc: Arc<RwLock<Option<Weak<Engine>>>>,
+    /// **P0-bench fix 2026-05-04 (Closure iter-3)**: this slot stores
+    /// an `Engine` value (cheap-clone of `Arc<EngineInner>`), NOT
+    /// `Weak<Engine>` and NOT `Arc<Engine>`. The pre-iter-3 design
+    /// stored `Weak<Engine>` to allow `LoaderWrapper::load`'s
+    /// `Arc::try_unwrap` to succeed — but the resulting `Weak`
+    /// could never `upgrade()` because no strong `Arc<Engine>`
+    /// survives `try_unwrap` (the inner Engine is moved by-value
+    /// into `LoadedEngine.engine`; the OUTER Arc is consumed). Net
+    /// effect: every `snapshot_block` call returned None →
+    /// SpillOutcome::Skipped → cache_dir empty after eviction. The
+    /// fix exploits Engine's own `#[derive(Clone)]` + internal
+    /// `inner: Arc<EngineInner>` topology: cloning Engine clones
+    /// only the inner `Arc<EngineInner>` (the worker channel),
+    /// which has no relationship to the OUTER `Arc<Engine>` that
+    /// `try_unwrap` operates on. So the spill gets live worker
+    /// access AND `try_unwrap` still succeeds.
+    ///
+    /// Lifecycle: the spill's `Engine` clone keeps the worker thread
+    /// alive (via Arc<EngineInner> strong-count) until the spill is
+    /// unregistered or replaced. This matches the per-model registration
+    /// scope of the spiller (each loaded model has one persistent
+    /// hook, not transient).
+    engine_arc: Arc<RwLock<Option<Engine>>>,
 
     /// Per-layer attention type. Captured from `Gemma4Config` at
     /// registration. Length == num_layers.
@@ -400,7 +414,9 @@ impl Gemma4DenseSpill {
                 .engine_arc
                 .write()
                 .map_err(|_| SpillErrorKind::CodecErr)?;
-            *g = Some(Arc::downgrade(&engine));
+            // ADR-017 Closure iter-3: clone Engine value (cheap),
+            // not Arc::downgrade — see field-level comment.
+            *g = Some((*engine).clone());
         }
         Ok(spill)
     }
@@ -417,11 +433,19 @@ impl Gemma4DenseSpill {
     /// contract-violation error. Call sites continue to pass
     /// `Arc<Engine>` (zero ergonomic change).
     pub fn set_engine_arc(&self, engine: Arc<Engine>) {
+        // ADR-017 Closure iter-3 (2026-05-04): clone the inner
+        // Engine value (cheap — only clones inner Arc<EngineInner>).
+        // We deliberately do NOT downgrade the OUTER Arc<Engine>
+        // because Weak<Engine>::upgrade() always returns None after
+        // LoaderWrapper::load's Arc::try_unwrap consumes the outer
+        // Arc — see the field-level doc comment for the full
+        // rationale.
+        let cloned: Engine = (*engine).clone();
         let mut g = self
             .engine_arc
             .write()
             .expect("Gemma4DenseSpill::engine_arc RwLock poisoned");
-        *g = Some(Arc::downgrade(&engine));
+        *g = Some(cloned);
     }
 
     /// Phase B-dense.2 follow-up — drop the live `Arc<Engine>` slot.
@@ -848,7 +872,7 @@ impl Gemma4DenseSpill {
     /// contract.
     fn snapshot_via_engine(
         &self,
-        engine: Arc<Engine>,
+        engine: &Engine,
         layer_rank: usize,
         range: Range<u32>,
     ) -> Option<Vec<u8>> {
@@ -915,7 +939,7 @@ impl Gemma4DenseSpill {
     /// `Engine::request_kv_restore`.
     fn restore_via_engine(
         &self,
-        engine: Arc<Engine>,
+        engine: &Engine,
         layer_rank: usize,
         range: Range<u32>,
         hdr: &PayloadHeader,
@@ -982,13 +1006,13 @@ impl KvCacheSpill for Gemma4DenseSpill {
         //     If the engine has been dropped (`None`), fall through to
         //     the EngineHandle path (which itself short-circuits to
         //     None when unset → Skipped no-op).
-        if let Some(engine_arc) = self
+        if let Some(engine) = self
             .engine_arc
             .read()
             .ok()
-            .and_then(|g| g.as_ref().and_then(Weak::upgrade))
+            .and_then(|g| g.as_ref().cloned())
         {
-            return self.snapshot_via_engine(engine_arc, layer_rank, range);
+            return self.snapshot_via_engine(&engine, layer_rank, range);
         }
 
         // 2b. B-dense.1 fallback — EngineHandle path. Preserved for
@@ -1113,9 +1137,9 @@ impl KvCacheSpill for Gemma4DenseSpill {
             .engine_arc
             .read()
             .ok()
-            .and_then(|g| g.as_ref().and_then(Weak::upgrade))
+            .and_then(|g| g.as_ref().cloned())
         {
-            return self.restore_via_engine(engine_arc, layer_rank, range, &hdr, payload);
+            return self.restore_via_engine(&engine_arc, layer_rank, range, &hdr, payload);
         }
 
         // 3. Validate range agrees with payload header. The spiller
@@ -1287,7 +1311,7 @@ impl KvCacheSpill for Gemma4DenseSpill {
             .engine_arc
             .read()
             .ok()
-            .and_then(|g| g.as_ref().and_then(Weak::upgrade))?;
+            .and_then(|g| g.as_ref().cloned())?;
         let descriptor = engine_arc.kv_spill_descriptor()?;
         let prov = &descriptor.provenance;
 
@@ -1307,6 +1331,13 @@ impl KvCacheSpill for Gemma4DenseSpill {
                 &prov.tokenizer_chat_template_hash,
             ),
         )
+    }
+
+    /// ADR-017 Closure iter-3 (2026-05-04) — real per-family layer
+    /// count. Replaces the spiller's pre-iter-3 hardcoded `1`
+    /// (which was the A.3 stub never replaced by B-dense.1).
+    fn n_layers(&self) -> usize {
+        self.num_layers
     }
 }
 
@@ -1579,14 +1610,19 @@ impl crate::serve::kv_persist::registry::FamilyHookFactory for Gemma4DenseSpillF
             .engine_arc
             .read()
             .ok()
-            .and_then(|g| g.as_ref().and_then(Weak::upgrade))
+            .and_then(|g| g.as_ref().cloned())
         {
             // Arc<Engine> production path. Both spill instances point
             // at the same Engine via Weak; the worker-thread bridge
             // serializes any concurrent snapshot/restore calls
             // through the channel anyway.
             let descriptor = engine_for_spiller.kv_spill_descriptor()?.clone();
-            Gemma4DenseSpill::new_with_engine(descriptor, engine_for_spiller).ok()?
+            // ADR-017 Closure iter-3: engine_for_spiller is now an
+            // Engine (not Arc<Engine>) since the field stores cheap
+            // clones. Re-wrap in Arc::new for new_with_engine's
+            // signature compatibility — this is a fresh Arc, no
+            // relationship to LoaderWrapper's outer Arc.
+            Gemma4DenseSpill::new_with_engine(descriptor, Arc::new(engine_for_spiller)).ok()?
         } else if let Some(handle_for_spiller) = spill_arc
             .engine
             .read()

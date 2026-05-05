@@ -3540,10 +3540,27 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         // unreachable without a prior model-swap eviction.  Off-path
         // (no `--kv-persist`) `state.kv_spiller` is `None` and the
         // helper returns immediately with an all-zero summary.
-        let drain_summary = drain_loaded_models_to_disk(
-            &state_for_warmup,
-            std::time::Duration::from_secs(30),
-        );
+        //
+        // ADR-017 Closure iter-3 (2026-05-04): wrap in
+        // `tokio::task::spawn_blocking` because the drain helper is
+        // synchronous and ends up calling `Engine::request_kv_snapshot`
+        // (engine.rs:2335) which uses `tokio::block_on` to wait for the
+        // worker reply. Calling `block_on` from inside the runtime's
+        // own async context panics with "Cannot block the current
+        // thread from within a runtime." The blocking-thread-pool
+        // path is the canonical Tokio pattern for running sync
+        // blocking code from async context — block_in_place would
+        // also work but spawn_blocking keeps the runtime threads
+        // available for axum's outstanding shutdown work.
+        let state_for_drain = state_for_warmup.clone();
+        let drain_summary = tokio::task::spawn_blocking(move || {
+            drain_loaded_models_to_disk(
+                &state_for_drain,
+                std::time::Duration::from_secs(30),
+            )
+        })
+        .await
+        .unwrap_or_default();
         tracing::info!(
             evicted = drain_summary.evicted,
             drain_ms = drain_summary.drain_ms,
