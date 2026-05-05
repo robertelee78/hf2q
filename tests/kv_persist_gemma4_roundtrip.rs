@@ -2743,12 +2743,6 @@ fn kv_persist_phase_d_r_p5_e2e() {
             "[Phase D R-P5] server #1 exited gracefully: status={:?}",
             exit_status
         );
-        // ADR-017 closure iter-3 diag: surface ALL server #1 stderr lines.
-        let s1_tail = server1.log_tail();
-        eprintln!("[Phase D R-P5] server #1 stderr_tail ({} lines):", s1_tail.len());
-        for line in s1_tail.iter() {
-            eprintln!("    {}", line);
-        }
         // ServerGuard::Drop will call child.kill() + child.wait() on
         // scope exit; both are harmless on an already-exited process
         // (kill returns ESRCH which we ignore).

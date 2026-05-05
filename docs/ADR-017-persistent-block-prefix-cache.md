@@ -1,6 +1,6 @@
 # ADR-017: Persistent Block Prefix Cache for serve mode
 
-- **Status:** **Accepted-In-Progress (Closure iter-1 2026-05-04; R-P5 architectural gap discovered; iter-2 architectural fix in progress).** Primary gates GREEN: K1/K2/K3 kill-gates FALSIFIED, R-C4 internal + R-P4 ship-gate PASS by measurement on Gemma 4 26B (R-P4 re-validated at HEAD `11002ee` 2026-05-04: ratio=0.000, no_cache=633.5s, cache_hit=7.1ms; matches iter-4 evidence). **Iter-1 finding (2026-05-04):** the new R-P5 production test (added by W1 in this iter) exposed an architectural gap — the spiller's only spill trigger is `pre_evict` on model eviction (`src/serve/multi_model.rs:1090, 1189`); there is no graceful-shutdown spill, no SIGTERM handler, no `/shutdown` endpoint, no in-flight write-through. R-P5's "cold-process resume with `ssd_cold_post_restart` cache state" therefore cannot be reached via the natural sequence (server up → prefill → kill → restart) without a prior model swap that triggered eviction. Empirically: bench at L=32K leaves `cache_dir` 0 bytes (just empty `locks/` and `models/` subdirs) after a 615-second prefill if no eviction occurred; ratio=1.029 ≫ 0.15 (FAIL). **Iter-2 plan (in progress):** add `POST /shutdown` HTTP endpoint that walks the loaded pool calling `manager.evict()` per entry (firing `pre_evict` → spill), drains the kv-writer queue with timeout, returns 200 OK; add SIGTERM handler that does the same drain logic before process exit; update R-P5 to call `/shutdown` before kill. Same fix unlocks Ctrl+C + `systemctl stop` + `launchd` graceful shutdown user-facing benefit (in-memory cache survives across server restarts). Per-family parity gate (Gemma 4 26B) GREEN by code+test+bench through R-P4; R-P5/R-P6/stress benches pending iter-2 architectural fix. B-hybrid (Qwen3.5-MoE) ships when ADR-013 unblocks (trait surface inherits forward). Operator-readiness P0/P1 round COMPLETE: P0-1 fsync(parent_dir), P0-3 *.tmp.<pid> orphan GC, P0-bench Weak<Engine>, P1-1 lock-step atomicity, P1-3 budget_bytes wiring, R-F1 HF2Q_KV_PERSIST=0 startup-disable, R-F6 cache --kv-namespace, R-F7 /metrics counters, F4 namespace fingerprint thread-through — all LANDED on origin/main. P0-2 (cross-process flock) FALSIFIED in code-read (already exists; finer-grained than oMLX). Remaining items: iter-2 graceful-shutdown spill (architectural fix; in-progress), R-P5/R-P6/stress re-bench post-fix, peer arm rebench (ADR-005 chat-template prerequisite), full matrix sweep (operator-controlled bench), B-hybrid (ADR-013 prerequisite). Per-family read at [`docs/ADR-017-per-family-status.md`](./ADR-017-per-family-status.md).
+- **Status:** **Phase-D-spill-side Accepted; Phase-E required for R-P5/R-P6 (Closure iters 1→4 landed 2026-05-04).** Primary gates: K1/K2/K3 kill-gates FALSIFIED + R-C4 internal + R-P4 ship-gate PASS at iter-4 (in-memory PromptCache replay path; ratio=0.000 on iter-4 evidence). **Closure iters 1→4 narrative (Code = Truth per project mantra):** iter-1 discovered R-P5 architectural gap via the new production test exposing zero-byte `cache_dir` after `pre_evict`; iter-2 added `/shutdown` HTTP endpoint + SIGTERM drain (commit `b2d0cda`); iter-3 closed a four-bug stack on the spill path — pool-key vs bare-repo lookup mismatch, A.3-stub `n_layers=1` + single-block range hardcodes never replaced by B-dense.1, `Weak<Engine>` engine_arc that could never upgrade in production, and a tokio nested-`block_on` panic — making the spill path actually write blocks to disk (commit `985be04`); iter-4 validated cross-process restoration plumbing (`post_admit` finds 44 metas, fingerprints match, restored=44/44) AND surfaced the next architectural gap: **forward_prefill resets `write_pos = 0` at every prefill (`forward_prefill.rs:446`) and re-runs the full prefill from token 0, overwriting the restored KV state.** The restored bytes are written into the buffer, then immediately discarded. The spill→restore plumbing is correct end-to-end; the request path doesn't use the cached state. **Phase E (LCP-based partial-prefill resume — explicitly deferred at `engine.rs:1442` "iter-97+ scope") is the missing layer for true R-P5/R-P6 cache-hit acceleration.** ADR-017's pre-iter-3 R-P4 "PASS at ratio=0.000" was iter-96 PromptCache full-equality replay (RAM, single-process), not actual cross-process KV restore — the iter-1 audit suspected this; iter-4 confirmed it from code. Spill side: 801 MB / 337 blocks written at L=512; restoration: 44/44 metas restored on cold-process restart with matching fingerprint. Phase E options: (a) implement iter-97+ LCP partial-prefill resume; (b) extend ADR-017 to also persist `PromptCache` for cross-process full-equality replay (smaller scope, ~150-300 LOC). User-facing iter-2 win independent of R-P5: Ctrl+C / `systemctl stop` / deploy graceful-shutdown now flushes KV cache to disk instead of silently discarding it. Operator-readiness P0/P1 round COMPLETE: P0-1 fsync(parent_dir), P0-3 *.tmp.<pid> orphan GC, P0-bench Weak<Engine>, P1-1 lock-step atomicity, P1-3 budget_bytes wiring, R-F1 HF2Q_KV_PERSIST=0 startup-disable, R-F6 cache --kv-namespace, R-F7 /metrics counters, F4 namespace fingerprint thread-through — all LANDED on origin/main. Remaining for closure: Phase E (LCP or PromptCache persistence — see iter-4 finding for design-options), R-P5/R-P6 re-bench post-Phase-E, full 32K bench, stress 24h (depends on Phase E for real cache-hit), R-C6 corruption injection (4 scenarios), peer arm rebench (post-ADR-005 chat-template fix), B-hybrid (post-ADR-013). Per-family read at [`docs/ADR-017-per-family-status.md`](./ADR-017-per-family-status.md).
 
   *Original Status (preserved for provenance): "Accepted (falsification-gated). ADR-017 is a committed decision: hf2q ships per-model SSD KV-cache persistence across the Phase 4 hot-swap eviction signal for every model family complete in code on serve-side. Phase A0 (falsification harness on M5 Max) is the first deliverable and the explicit ship-or-die gate — every kill-criterion in §10 is a hard exit that closes ADR-017 unmerged with rationale, not a 'circle back later' punt. Per-family parity gate is non-negotiable (no carve-out, no descope without Robert's explicit re-authorization)."*
 - **Date:** 2026-04-30
@@ -3386,6 +3386,79 @@ The spec's R-P5 "ssd_cold_post_restart" cache state implicitly assumes a *prior*
 **Why iter-2 is "truly done" not a workaround:** modifying the test to load a second model before kill would technically pass R-P5 with current architecture, but it would not match the spec's wording ("cold-process resume") and would leave Ctrl+C / system-shutdown behavior broken for end users. The architectural fix matches the spec semantically AND fixes a real user issue.
 
 **Remaining work after iter-2:** R-P5 re-bench, R-P6 bench (architecturally compatible — single-server multi-agent doesn't need eviction), stress 30-min reduced-duration smoke (after iter-2 enables real flush), corruption tests (R-C6 four scenarios), peer arm rebench (post-ADR-005 chat-template fix).
+
+---
+
+### Phase D Closure iter-2 2026-05-04 — graceful-shutdown spill landed (commit b2d0cda)
+
+Implementation of iter-1's plan landed (5 files, +451/-20 LOC). Three trigger surfaces converge on a single drain implementation (Option β chosen):
+- `POST /shutdown` HTTP endpoint (`api/handlers.rs`) — calls `libc::raise(SIGTERM)` on self, returns 202 Accepted with JSON receipt
+- SIGTERM / SIGINT signal handler (`mod.rs::shutdown_signal`) — pre-existing axum graceful-shutdown wakes, control returns to `cmd_serve`
+- `cmd_serve` post-`axum::serve` block — calls `drain_loaded_models_to_disk(state, 30s)`
+
+`drain_loaded_models_to_disk` (`mod.rs`): snapshots loaded `(repo, quant)` keys under read lock, releases, acquires write lock, calls `manager.evict()` per key (which fires `pre_evict` on the spiller → enqueues block writes), polls `pending_writer_queue_depth()` until zero or 30 s elapses. Off-path (no `--kv-persist`): returns all-zero summary, no eviction.
+
+User-facing benefits independent of R-P5 test:
+- `Ctrl+C` flushes KV cache to disk before exit (was silently discarded)
+- `systemctl stop hf2q` / `launchctl stop` / `kill <pid>` ditto
+- Deploy scripts / k8s pre-stop hooks can `POST /shutdown` for explicit JSON receipt + same drain semantics
+- Operator orchestrators get one drain implementation, three trigger surfaces
+
+R-P5 re-bench at L=32K showed `/shutdown` graceful exit clean (status=0), drain ran without panic, but `cache_dir` remained 0 bytes — every `pre_evict` returned `SpillOutcome::Skipped` for reasons unknown at iter-2 close. Iter-3 diagnoses.
+
+### Phase D Closure iter-3 2026-05-04 — four-bug stack closing the spill path (commit 985be04)
+
+Diagnostic bench at L=512 (5-min cycle) walked through four distinct bugs in the spill path. Each bug masked the next; fixing each one revealed the next failure mode. With all four fixed, server #1 now writes **801 MB / 337 blocks to cache_dir at L=512** (was 0 bytes across iters 1+2). Restoration on server #2 succeeds at the spiller level (44/44 blocks restored, fingerprint matches across processes) — that's the expected end of the spill→restore plumbing. Whether the restored state actually accelerates the second prefill is a SEPARATE question answered in iter-4 below.
+
+Bug 1: **`pre_evict` pool-key vs bare-repo lookup mismatch.** `LoadedHandle.repo_id` stores the pool-key form `format!("{repo}@{quant}")` (set at `multi_model.rs:1014, 1164`). `pre_evict` passed it directly to `lookup_hook` + `family_model_fp`, but `register_family` was called with the BARE repo (LoaderWrapper `:276` + cmd_serve C.1 stub `:2972`). Lookup always missed → `SpillOutcome::Skipped` → 0 blocks. Fixed by stripping the `@{quant}` suffix at the top of `pre_evict`. **R-P4 was unaffected because `force_eviction_via_symlink` does NOT route through `manager.evict()`**; it uses a GGUF symlink-swap path that triggers a different (in-process) restoration flow that does not expose this asymmetry. R-P5 is the first test in the codebase that exercises the explicit-evict → spill → cold-restart → recovery-scan → restore path end-to-end.
+
+Bug 2: **`n_layers_for_family` + `ranges_for_layer` hardcoded to A.3 stub values.** Two A.3 stubs whose doc-comments promised B-dense.1 would replace them with real per-family layer counts; the replacement never landed. `n_layers_for_family` returned 1 (Gemma 4 has 30+); `ranges_for_layer` returned single `[0..alignment)` regardless of prefill length. ~98% under-snapshot for any production model. Fixed by adding `n_layers()` default method to `KvCacheSpill` trait (Gemma4DenseSpill overrides to return `self.num_layers`); replaced hardcoded ranges with iterate-until-None loop using `MAX_PER_LAYER_TOKENS = 32K` cap. Live state is contiguous from token 0 (write_positions monotonic during prefill) so first None signals end of layer.
+
+Bug 3: **`engine_arc` `Weak<Engine>` can never upgrade in production.** The pre-iter-3 design (P0-bench commit `2b3f62d`) stored `Weak<Engine>` to allow `LoaderWrapper::load`'s `Arc::try_unwrap` to succeed. But `Weak::upgrade()` always returned None in production because no strong `Arc<Engine>` survives `try_unwrap` — the inner Engine is moved by-value into `LoadedEngine.engine`; the OUTER Arc is consumed. Net effect: every `snapshot_block` fell to path 2 (EngineHandle), which is unset in the production `Arc<E>` downcast path → returned None for every layer. Diagnostic at iter-3e showed `engine_arc_status="upgrade=None (Engine dropped)"` on all 30 layers. Fixed by storing `Engine` value (cheap-clone of inner `Arc<EngineInner>`) instead of `Weak<Engine>`. Cloning Engine clones only the inner Arc; the OUTER `Arc<Engine>` in LoaderWrapper is unaffected so `try_unwrap` still succeeds AND the spill has live worker access. Updated `set_engine_arc`, `snapshot_block` path 1, `restore_block` path 1, `model_fingerprint`, factory `try_construct` inner spill construction.
+
+Bug 4: **`drain_loaded_models_to_disk` panics with "Cannot block the current thread from within a runtime."** `drain_loaded_models_to_disk` calls `Engine::request_kv_snapshot` (`engine.rs:2335`) which uses `tokio::block_on` internally. `cmd_serve` invokes the drain INSIDE `rt.block_on(async move { ... })` so the nested `block_on` panics. Server #1 exited with code 101 at iter-3f. Diagnostic at iter-3g surfaced the full backtrace via `RUST_BACKTRACE=1`. Fixed by wrapping drain in `tokio::task::spawn_blocking` — the blocking-thread-pool is the canonical Tokio pattern for running sync code that internally calls `block_on`. Used `spawn_blocking` instead of `block_in_place` to keep runtime threads available for axum's outstanding shutdown work.
+
+Verbatim diagnostic at L=512 iter-4 bench (post iter-3 fix-stack):
+
+```
+[KV-DIAG] register_family: repo="gemma-4-26B-A4B-it-ara-abliterated-dwq" quant=Q4_K_M alignment=256
+[KV-DIAG] register_family: repo="gemma-4-26B-A4B-it-ara-abliterated-dwq" quant=Q4_K_M alignment=256
+[KV-DIAG] post_admit ENTER: repo="gemma-4-26B-A4B-it-ara-abliterated-dwq" quant=Q4_K_M registered_count=1
+[KV-DIAG] post_admit: model_fp=ModelFingerprint([218, 199, 152, 142, ...])  ← matches across processes
+[KV-DIAG] post_admit: index.iter_by_model returned 44 metas                  ← cache hits the disk
+[KV-DIAG] post_admit: restored=44 of 44 metas                                ← all restored
+```
+
+Bench: server #1 spills correctly (801 MB / 337 files at L=512). Server #2's `post_admit` finds the cached blocks via fingerprint match and successfully restores all 44 metas into the spill's hook. **But cache_hit_ttft is unchanged from no_cache_ttft (ratio 1.005 at L=512).** The restored bytes don't speed up the second prefill — that's iter-4 territory.
+
+### Phase D Closure iter-4 2026-05-04 — restored KV state is overwritten by next prefill (Phase E required for true cache hit)
+
+**Finding:** the post-iter-3 spill→restore plumbing is correct end-to-end. Spill writes blocks to disk (801 MB / 337 files). Recovery scan finds them on cold-process restart. Restore deserializes them back into `dense_kvs`. **But forward_prefill resets `write_pos = 0` at the start of every prefill** (`forward_prefill.rs:446`) and re-runs the full prefill from token 0, **overwriting the restored KV state**. The restored bytes are written into the buffer, then immediately discarded.
+
+**Code = truth (per project mantra):** the comment at `engine.rs:1442` documents the missing semantics:
+> "Iter-97+ scope: LCP-based partial-prefill resume. Compute the longest common prefix between the new prompt and `tokens`, set `kv_caches[*].write_pos = LCP`, pre-warm `dense_kvs[0..LCP)` by dequantizing `kv_caches[0..LCP)` via `tq_dequantize_kv`, then run `forward_prefill` for tokens `[LCP..N)`. Reports `cached_tokens = LCP` (any value `0 ≤ LCP ≤ prompt_tokens`). **Defers to a later iteration** because the dequant pre-warm is non-trivial — the iter-96 full-equality cache is a real, shippable subset."
+
+This deferral is accurate and load-bearing. The iter-96 cache (`PromptCache`) is RAM-only, full-equality, single-process. It replays the prior text+tokens response verbatim when `new_prompt == cached_prompt`. **There is no integration between PromptCache (iter-96) and ADR-017's KV-persist** — they are two separate caches that don't talk to each other. The pre-iter-3 R-P4 "PASS at ratio=0.000" was PromptCache replay (same-process, same-prompt), not actual KV-restore.
+
+**This is the architectural finding ADR-017 R-P5 hinges on.** The KV-persist infrastructure (Phase A0 / A.1 / A.3 / B-dense.1 / B-dense.2 / C.1 / D scaffolding) is shippable plumbing — it correctly persists block-aligned K/V state across processes. **What's missing is a Phase E** ("LCP partial-prefill resume" in the doc-comment scope language) that:
+1. On request arrival, computes LCP between the request's tokens and the restored `dense_kvs` token range
+2. Sets `write_pos = LCP` so prefill skips already-cached tokens
+3. Dequantizes / pre-warms layers 0..N for the cached prefix
+4. Runs `forward_prefill` for `[LCP..N)` — only the suffix
+5. Reports `cached_tokens = LCP` in the OpenAI usage shape
+
+OR alternatively: extend ADR-017 to also persist the `PromptCache` entry (tokens + result text + metadata), so cross-process full-equality matches use the existing iter-96 replay path. This is a smaller scope (~150-300 LOC) and would close R-P5 for full-equality scenarios; partial-prefill (LCP) would still wait for iter-97+.
+
+**Status update for ADR-017 Phase D:**
+- ✅ A0 / A.1 / A.3 / B-dense.1 / B-dense.2 / C.1: all SHIPPED (per pre-iter-1 status, no change)
+- ✅ Phase D scaffolding (test files, scripts, ADR-017-per-family-status.md): SHIPPED iter-1 (commit 6f2c9aa)
+- ✅ Graceful-shutdown spill: SHIPPED iter-2 (commit b2d0cda) — closes the iter-1 architectural gap; user-facing benefit independent of R-P5
+- ✅ Spill path correctness: SHIPPED iter-3 (commit 985be04) — closes 4 bugs; spill writes blocks to disk, post_admit restores them
+- ⛔ R-P5 / R-P6 cache-hit semantics: BLOCKED on Phase E (LCP partial-prefill OR PromptCache cross-process persistence)
+- ⏸ Stress 24h: code-complete, blocked on Phase E (continuous-load test depends on real cache-hit acceleration)
+- ⏸ Corruption injection (R-C6): not yet implemented
+
+**Phase D status: COMPLETE for the SPILL side; INCOMPLETE for the RESTORE-CONSUMER side. Closing this ADR requires Phase E.**
 
 ---
 

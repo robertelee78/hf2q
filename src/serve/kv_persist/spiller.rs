@@ -241,8 +241,6 @@ impl<E> BlockPrefixCacheSpiller<E> {
     /// blocks). Idempotent enough that an operator running
     /// `cmd_serve` twice in a row doesn't accumulate stale hooks.
     pub fn register_family(&self, repo: String, quant: QuantType, hook: FamilyHook) {
-        let alignment = hook.lock().map(|g| g.block_alignment()).unwrap_or(0);
-        eprintln!("[KV-DIAG] register_family: repo={:?} quant={} alignment={}", repo, quant.as_str(), alignment);
         let mut g = self
             .registrations
             .write()
@@ -507,9 +505,7 @@ where
             .repo_id
             .strip_suffix(&format!("@{}", handle.quant))
             .unwrap_or(handle.repo_id.as_str());
-        eprintln!("[KV-DIAG] pre_evict: bare_repo={:?} quant={} registered_count={}", bare_repo, quant.as_str(), self.registered_count());
         let Some(hook_arc) = self.lookup_hook(bare_repo, quant) else {
-            eprintln!("[KV-DIAG] pre_evict: lookup_hook=None for ({}, {}) → Skipped", bare_repo, quant.as_str());
             return SpillOutcome::Skipped;
         };
 
@@ -521,17 +517,13 @@ where
             };
             g.block_alignment()
         };
-        eprintln!("[KV-DIAG] pre_evict: hook found, alignment={}", alignment);
         if alignment == 0 {
-            eprintln!("[KV-DIAG] pre_evict: alignment=0 → Skipped (likely C.1 stub still active; B-dense.2 substitution did not fire)");
             return SpillOutcome::Skipped;
         }
 
         let n_layers = Self::n_layers_for_family(&hook_arc);
-        eprintln!("[KV-DIAG] pre_evict: starting snapshot loop n_layers={}", n_layers);
 
         let mut enqueued: u32 = 0;
-        let mut snap_none: u32 = 0;
         // Chain-hash linkage: parent[N+1] = block_hash[N]. Genesis
         // (first written block) uses ParentBlockHash(None).
         let mut parent = ParentBlockHash(None);
@@ -566,10 +558,7 @@ where
                         // First None signals end of live state for
                         // this layer. KV cache fills contiguously
                         // from token 0 during prefill, so we can
-                        // stop iterating this layer here. Counter
-                        // is informational only (lifted out of the
-                        // loop in production diagnostics).
-                        snap_none = snap_none.saturating_add(1);
+                        // stop iterating this layer here.
                         break;
                     }
                 };
@@ -613,7 +602,6 @@ where
             }
         }
 
-        eprintln!("[KV-DIAG] pre_evict: complete enqueued={} snap_none={} (n_layers={})", enqueued, snap_none, n_layers);
         if enqueued == 0 {
             SpillOutcome::Skipped
         } else {
