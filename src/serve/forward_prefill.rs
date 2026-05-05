@@ -609,6 +609,28 @@ impl MlxModelWeights {
         // Gemma-4 26B (8×1024×256 per layer vs 8×20022×256).
         let linear_capacity = seq_len + max_decode_tokens;
         let sw = self.sliding_window;
+        // ADR-017 Phase E.a iter-3.6 — when `HF2Q_KV_LCP_LONG_RESUME=1`,
+        // sliding layers use a LINEAR buffer (cap = max(sw, seq_len +
+        // max_decode_tokens)) instead of a ring (cap = sw). Per-token
+        // writes go to slot=tok_i (no `% sw` wrap). flash_attn_vec
+        // dispatches use `mask_type=2 + sliding_window=sw` so the
+        // kernel applies sliding-window masking based on slot index
+        // (which now equals logical position). Verified at
+        // `/opt/mlx-native/src/shaders/flash_attn_vec.metal:166-170`.
+        // The Chesterton's fence at `forward_mlx.rs:2632-2635` documents
+        // why the default ring path needs `mask_type=1`: with ring,
+        // slot ≠ logical position once wrap happens.
+        //
+        // When the env-flag is OFF (default), behavior is byte-identical
+        // to pre-iter-3.6 (sliding = ring, mask_type=1).
+        let kv_lcp_long_resume = crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
+            && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+            && crate::debug::INVESTIGATION_ENV.use_dense;
+        let sliding_layer_capacity = if kv_lcp_long_resume {
+            sw.max(seq_len + max_decode_tokens)
+        } else {
+            sw
+        };
         // ADR-017 Phase E.a iter-3: dense_kvs_vec source branches on
         // restored_lcp.
         //
@@ -635,8 +657,22 @@ impl MlxModelWeights {
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
                     let nkv = layer.num_kv_heads;
                     let hd = layer.head_dim;
-                    let layer_is_ring = layer.layer_type == LayerType::Sliding;
-                    let capacity = if layer_is_ring { sw } else { linear_capacity };
+                    let layer_is_sliding_model = layer.layer_type == LayerType::Sliding;
+                    // iter-3.6: when LONG_RESUME is on, sliding layers
+                    // get a LINEAR buffer (cap = sliding_layer_capacity).
+                    // The buffer is no longer a ring at the storage
+                    // level; the kernel applies sliding-window masking
+                    // via mask_type=2. The `is_sliding` field on
+                    // DenseKvBuffers continues to indicate the MODEL-
+                    // SIDE semantic (kernel needs sliding-window mask),
+                    // NOT whether the buffer is a ring. Read sites
+                    // distinguish "ring vs linear" by inspecting
+                    // INVESTIGATION_ENV.kv_lcp_long_resume directly.
+                    let capacity = if layer_is_sliding_model {
+                        sliding_layer_capacity
+                    } else {
+                        linear_capacity
+                    };
                     let n = nkv * capacity * hd;
                     let kbuf = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
                         .map_err(|e| anyhow::anyhow!("prefill dense K L{layer_idx}: {e}"))?;
@@ -646,7 +682,7 @@ impl MlxModelWeights {
                         k: kbuf,
                         v: vbuf,
                         capacity,
-                        is_sliding: layer_is_ring,
+                        is_sliding: layer_is_sliding_model,
                         // ADR-017 Phase E.a iter-3.5a — record dtype
                         // invariant. `kv_dtype` is set above from
                         // INVESTIGATION_ENV.f16_kv (read once via
@@ -693,7 +729,17 @@ impl MlxModelWeights {
                 let mut cached_iter = cached_arcs.into_iter();
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
                     let layer_is_ring = layer.layer_type == LayerType::Sliding;
-                    let required_cap = if layer_is_ring { sw } else { linear_capacity };
+                    // iter-3.6: when LONG_RESUME is on, sliding layers
+                    // are linear with cap = sliding_layer_capacity. The
+                    // resume path reuses the cached buffer in place;
+                    // its capacity must be ≥ the current request's
+                    // required_cap (which is the same formula used by
+                    // the alloc branch above).
+                    let required_cap = if layer_is_ring {
+                        sliding_layer_capacity
+                    } else {
+                        linear_capacity
+                    };
                     let cached_arc = cached_iter.next().ok_or_else(|| {
                         anyhow::anyhow!(
                             "forward_prefill resume: missing cached dense_kvs[layer={}]",
@@ -1090,9 +1136,13 @@ impl MlxModelWeights {
                     // Layout: [nkv, seq_len, hd], writing at pos = tok_i
                     // ====================================================
                     // Per-layer dense cap + ring-wrap write for sliding layers.
+                    // ADR-017 Phase E.a iter-3.6: when LONG_RESUME is
+                    // on, sliding layers are LINEAR (no wrap); writes
+                    // go to slot=tok_i. When OFF (default), sliding
+                    // layers wrap via slot=tok_i%cap (current behavior).
                     let layer_dense_cap = dense_kvs_vec[layer_idx].capacity;
-                    let layer_is_ring = dense_kvs_vec[layer_idx].is_sliding;
-                    let write_slot = if layer_is_ring {
+                    let layer_is_sliding = dense_kvs_vec[layer_idx].is_sliding;
+                    let write_slot = if layer_is_sliding && !kv_lcp_long_resume {
                         (tok_i % layer_dense_cap) as u32
                     } else {
                         tok_i as u32
@@ -1236,7 +1286,16 @@ impl MlxModelWeights {
                     // kv_seq_len: ring clamps to capacity (== sliding_window).
                     // Ring mode uses mask_type=1 (causal only) — the ring
                     // already applies the sliding-window constraint.
-                    let dense_kv_seq_len = if layer_is_ring {
+                    //
+                    // ADR-017 Phase E.a iter-3.6: when LONG_RESUME is on
+                    // and layer is sliding, the buffer is LINEAR (no
+                    // wrap), so kv_seq_len = tok_i+1 (full populated
+                    // count) and the kernel uses mask_type=2 +
+                    // sliding_window=sw for sliding-window masking.
+                    // When LONG_RESUME is off, behavior is byte-identical
+                    // to pre-iter-3.6.
+                    let use_linear_sliding = layer_is_sliding && kv_lcp_long_resume;
+                    let dense_kv_seq_len = if layer_is_sliding && !use_linear_sliding {
                         ((tok_i + 1).min(layer_dense_cap)) as u32
                     } else {
                         (tok_i + 1) as u32
@@ -1246,6 +1305,16 @@ impl MlxModelWeights {
                           &dense_kvs_vec[layer_idx].k, &dense_kvs_vec[layer_idx].v],
                         &[&self.activations.sdpa_out],
                     );
+                    let (mask_type_val, sliding_window_val) = if use_linear_sliding {
+                        // Linear sliding: kernel masks via slot index,
+                        // which equals logical position because the
+                        // buffer is non-wrapping.
+                        (2u32, sw as u32)
+                    } else {
+                        // Default: causal-only; ring applies sliding-window
+                        // for sliding layers; global layers don't need it.
+                        (1u32, 0u32)
+                    };
                     let p = FlashAttnVecParams {
                         num_heads: nh as u32,
                         num_kv_heads: nkv as u32,
@@ -1253,8 +1322,8 @@ impl MlxModelWeights {
                         kv_seq_len: dense_kv_seq_len,
                         kv_capacity: layer_dense_cap as u32,
                         scale: 1.0, // Gemma4: scale = 1.0 (llama.cpp oracle)
-                        mask_type: 1, // causal; ring applies the sliding window
-                        sliding_window: 0,
+                        mask_type: mask_type_val,
+                        sliding_window: sliding_window_val,
                         softcap: 0.0,
                     };
                     mlx_native::ops::flash_attn_vec::flash_attn_vec(
@@ -1812,7 +1881,12 @@ impl MlxModelWeights {
             .layers
             .iter()
             .any(|l| l.layer_type == LayerType::Sliding);
-        let snapshot_safe = !any_sliding_layer || seq_len <= sw;
+        // ADR-017 Phase E.a iter-3.6 — when LONG_RESUME is on, sliding
+        // layers were allocated with linear capacity (no ring wrap),
+        // so seq_len > sw is now SAFE. The snapshot path captures the
+        // full populated [0..seq_len) range, no wrap corruption. iter-7
+        // guard predicate stays in place for the LONG_RESUME=0 case.
+        let snapshot_safe = !any_sliding_layer || seq_len <= sw || kv_lcp_long_resume;
         let snapshot_for_lcp: Option<Vec<std::sync::Arc<DenseKvBuffers>>> =
             if crate::debug::INVESTIGATION_ENV.kv_lcp_resume
                 && crate::debug::INVESTIGATION_ENV.use_dense

@@ -2499,8 +2499,14 @@ impl MlxModelWeights {
                     let dense_kvs = self.dense_kvs.as_ref().unwrap();
                     let dense_cap = dense_kvs[layer_idx].capacity;
                     let layer_is_ring = dense_kvs[layer_idx].is_sliding;
-                    // Ring-buffer write for sliding layers; linear for global.
-                    let write_slot = if layer_is_ring {
+                    // ADR-017 Phase E.a iter-3.6: when LONG_RESUME is on
+                    // and layer is sliding, the buffer is LINEAR (no
+                    // wrap); decode writes go to slot=seq_pos. When OFF
+                    // (default), sliding wraps via slot=seq_pos%cap.
+                    let kv_lcp_long_resume_for_write = INVESTIGATION_ENV.kv_lcp_long_resume
+                        && INVESTIGATION_ENV.kv_lcp_resume
+                        && INVESTIGATION_ENV.use_dense;
+                    let write_slot = if layer_is_ring && !kv_lcp_long_resume_for_write {
                         (seq_pos % dense_cap) as u32
                     } else {
                         seq_pos as u32
@@ -2633,10 +2639,26 @@ impl MlxModelWeights {
                     // itself applies the sliding-window constraint — the
                     // kernel's sliding-window mask would incorrectly mask slots
                     // whose logical positions don't equal their slot index.
-                    let dense_kv_seq_len = if layer_is_ring {
+                    // ADR-017 Phase E.a iter-3.6: when LONG_RESUME is on
+                    // and layer is sliding, the buffer is LINEAR (cap >
+                    // sliding_window, slot index = logical position),
+                    // and the kernel masks via mask_type=2 +
+                    // sliding_window=sw. When OFF (default), behavior is
+                    // byte-identical to pre-iter-3.6 (ring + mask_type=1).
+                    let kv_lcp_long_resume = INVESTIGATION_ENV.kv_lcp_long_resume
+                        && INVESTIGATION_ENV.kv_lcp_resume
+                        && INVESTIGATION_ENV.use_dense;
+                    let use_linear_sliding = layer_is_ring && kv_lcp_long_resume;
+                    let dense_kv_seq_len = if layer_is_ring && !use_linear_sliding {
                         ((seq_pos + 1).min(dense_cap)) as u32
                     } else {
                         (seq_pos + 1) as u32
+                    };
+                    let (mask_type_val, sliding_window_val) = if use_linear_sliding {
+                        let model_sw = self.sliding_window.max(1);
+                        (2u32, model_sw as u32)
+                    } else {
+                        (1u32, 0u32)
                     };
                     let p = mlx_native::ops::flash_attn_vec::FlashAttnVecParams {
                         num_heads: nh as u32,
@@ -2645,8 +2667,8 @@ impl MlxModelWeights {
                         kv_seq_len: dense_kv_seq_len,
                         kv_capacity: dense_cap as u32,
                         scale: 1.0,
-                        mask_type: 1, // causal; ring applies the sliding window for us
-                        sliding_window: 0,
+                        mask_type: mask_type_val,
+                        sliding_window: sliding_window_val,
                         softcap: 0.0,
                     };
                     mlx_native::ops::flash_attn_vec::flash_attn_vec(

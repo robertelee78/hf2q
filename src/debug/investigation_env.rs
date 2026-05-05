@@ -295,6 +295,41 @@ pub struct InvestigationEnv {
     /// future iter; until then operators set this explicitly.
     pub kv_lcp_resume: bool,
 
+    /// `HF2Q_KV_LCP_LONG_RESUME` — enables LCP partial-prefill resume
+    /// for prompts where `prompt_len > sliding_window` on Gemma 4 (and
+    /// other sliding-window models). Default OFF.
+    ///
+    /// ADR-017 Phase E.a iter-3.6 — opt-in extension to iter-3.5c's
+    /// prefill-wrap restriction. When ON (and `HF2Q_KV_LCP_RESUME=1`
+    /// and `HF2Q_USE_DENSE=1`), sliding layers allocate LINEAR buffers
+    /// (`cap = max(sw, prompt_len + max_decode_tokens)`) instead of
+    /// ring buffers (`cap = sw`); the per-token KV write uses
+    /// `slot = tok_i` (no `% sw` wrap); the flash_attn_vec dispatch
+    /// uses `mask_type=2 + sliding_window=sw` instead of
+    /// `mask_type=1 + ring`. The kernel applies sliding-window
+    /// masking based on slot index (which now equals logical
+    /// position because the buffer is linear) — semantically
+    /// equivalent to the ring path but without wrap.
+    ///
+    /// Also lifts the `prompt_len <= sliding_window` skip in the
+    /// engine's prefill-wrap guards (`engine.rs:4516` non-streaming +
+    /// `engine.rs:7027` streaming) and the `seq_len <= sw` predicate
+    /// in `forward_prefill.rs:~1820` (snapshot creation guard).
+    ///
+    /// Memory cost: per cached entry, sliding-layer K+V grows from
+    /// `8 × sw × 256 × 2 × 2 = 8 MB` per layer to
+    /// `8 × N × 256 × 2 × 2 = 64 MB` per layer at N=8K (verified
+    /// estimate on Gemma 4 26B). 30 layers ⇒ ~1.9 GB extra resident
+    /// per cached entry. With registry capacity=1, total extra
+    /// resident is bounded.
+    ///
+    /// References:
+    ///   - flash_attn_vec.metal:166-170 (kernel mask_type=2 impl)
+    ///   - forward_mlx.rs:2632-2635 (Chesterton's fence: ring vs
+    ///     linear masking semantics)
+    ///   - docs/research/adr017-iter36-phaseB-architecture-2026-05-05.md
+    pub kv_lcp_long_resume: bool,
+
     /// `HF2Q_LAYER_POLICY` — per-layer SDPA policy selector.
     ///   - "dense_all": all layers dense.
     ///   - "tq_all" / unset: all layers TQ (default).
@@ -490,6 +525,11 @@ impl InvestigationEnv {
             // resume. Default OFF. See struct field doc for full
             // contract.
             kv_lcp_resume: env_eq_one("HF2Q_KV_LCP_RESUME"),
+            // ADR-017 Phase E.a iter-3.6 — long-prompt LCP resume (lifts
+            // iter-3.5c sliding-ring prefill-wrap restriction). Default
+            // OFF; opt-in via `HF2Q_KV_LCP_LONG_RESUME=1`. See struct
+            // field doc for full contract.
+            kv_lcp_long_resume: env_eq_one("HF2Q_KV_LCP_LONG_RESUME"),
 
             // Gate H release-check plumbing (ADR-007 §853-866; iter-108a).
             emit_nll: env_eq_one("HF2Q_EMIT_NLL"),

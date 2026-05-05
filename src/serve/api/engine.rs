@@ -4513,7 +4513,18 @@ fn generate_once_with_soft_tokens(
             });
             // iter-3.5c prefill-wrap guard — distinct from iter-3 v1's
             // decode-wrap guard (which iter-3.5b removed).
-            let prefill_safe = !has_sliding_layer || prompt_len <= sliding_window;
+            //
+            // ADR-017 Phase E.a iter-3.6: when HF2Q_KV_LCP_LONG_RESUME=1,
+            // sliding layers were allocated with linear (non-wrapping)
+            // capacity in forward_prefill, so the snapshot captures
+            // positions [0..N) faithfully even when N > sw. The guard
+            // skip is no longer needed; lift it for the long-resume
+            // path. (Default OFF: behavior is byte-identical to iter-7.)
+            let kv_lcp_long_resume = crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
+                && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+                && crate::debug::INVESTIGATION_ENV.use_dense;
+            let prefill_safe =
+                !has_sliding_layer || prompt_len <= sliding_window || kv_lcp_long_resume;
             // The `physical_decode_writes` counter is no longer
             // load-bearing for the (decode-)wrap guard (snapshot
             // makes the iter-3 v1 guard unnecessary); kept as a
@@ -7023,7 +7034,14 @@ fn generate_stream_once(
                 matches!(l.layer_type, crate::serve::config::LayerType::Sliding)
             });
             // iter-3.5c prefill-wrap guard (mirrors non-streaming).
-            let prefill_safe = !has_sliding_layer || prompt_tokens.len() <= sliding_window;
+            // ADR-017 Phase E.a iter-3.6: lift when LONG_RESUME=1 (mirrors
+            // engine.rs:4516 non-streaming site).
+            let kv_lcp_long_resume = crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
+                && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+                && crate::debug::INVESTIGATION_ENV.use_dense;
+            let prefill_safe = !has_sliding_layer
+                || prompt_tokens.len() <= sliding_window
+                || kv_lcp_long_resume;
             if prefill_safe {
                 let lcp_key = build_lcp_key_for_request(loaded, params);
                 // iter-3.5d headroom (mirrors non-streaming site).

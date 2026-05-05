@@ -1423,3 +1423,258 @@ fn iter7_qwen35_hybrid_lcp_deferred_marker() {
          test rather than deleting it so the lift surfaces in the diff."
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Iter-3.6 — long-prompt LCP partial-prefill RESUME byte-identity falsifier.
+//
+// Per the post-Codex-audit research dossier (`docs/research/adr017-iter36-
+// phaseB-architecture-2026-05-05.md`): iter-3.5c skips the LCP store when
+// `prompt_len > sliding_window` for sliding-layer models. iter-3.6 lifts
+// this restriction by switching sliding layers from ring(cap=sw) +
+// mask_type=1 to linear(cap=N+max) + mask_type=2 + sliding_window=sw,
+// gated by `HF2Q_KV_LCP_LONG_RESUME=1`.
+//
+// Verified at /opt/mlx-native/src/shaders/flash_attn_vec.metal:166-170:
+// the kernel implements `mask_type=2 + sliding_window` correctly when
+// the slot index equals the logical position (which is true for a
+// linear buffer). The Chesterton's fence at forward_mlx.rs:2632-2635
+// documents WHY today uses `mask_type=1 + ring`: with ring, slot ≠
+// logical position once wrap happens.
+//
+// ## Test design
+//
+// Mirror iter-3 falsifier with LONG prompts (Q + P both > sliding_window).
+//   * Server A: `HF2Q_KV_LCP_RESUME=1 + HF2Q_KV_LCP_LONG_RESUME=1 +
+//     HF2Q_USE_DENSE=1`. Send Q (long), then send P (long, shares prefix
+//     with Q at the rendered-template token level). Engine probe + LCP
+//     resume engages; iter-3.6 path produces decoded bytes from the
+//     resumed sliding-layer linear buffer.
+//   * Server B: control (no LONG_RESUME, default ring path).
+//
+// Engagement assertion: server A's `lcp_detected_total` advances ≥ 1
+// (proves the long-prompt store + take_prefix path engaged — currently
+// FAILS because iter-3.5c skips store).
+//
+// Falsifier: server_A_decoded(P_long) != server_B_decoded(P_long)
+// byte-for-byte. Either:
+//   1. iter-3.6 produces wrong output (silent miscompute) — kernel
+//      mask_type=2 disagrees with mask_type=1+ring on the same prompt.
+//   2. The capacity check formula is wrong and a stale snapshot gets
+//      installed.
+// Phase A is FALSIFIED → ship-blocker.
+//
+// ## Walk discipline
+//
+// This test fails TODAY (engagement assertion fires) because iter-3.5c
+// skip + no `kv_lcp_long_resume` plumbing. Implementation must:
+//   1. Add env flag (DONE).
+//   2. Wire flag through forward_prefill alloc + write_slot.
+//   3. Wire flag through flash_attn_vec params (prefill + decode).
+//   4. Lift engine guard at engine.rs:4516 + 7027 when flag is on.
+//   5. Lift snapshot guard at forward_prefill.rs:~1820 when flag is on.
+//   6. Adjust capacity-check formula at probe sites.
+//
+// Long-prompt fixture: same as iter-7. Two prompts > sliding_window
+// (1024 tokens for Gemma 4 default) with shared prefix.
+const ITER36_LONG_PROMPT_REP_COUNT: usize = 200;
+const ITER36_LONG_PROMPT_BASE: &str = "The quick brown fox jumps over the lazy dog. ";
+const ITER36_MAX_TOKENS: u32 = 8;
+
+fn iter36_build_prompt(suffix: &str) -> String {
+    let mut s = String::with_capacity(
+        ITER36_LONG_PROMPT_BASE.len() * ITER36_LONG_PROMPT_REP_COUNT + suffix.len() + 16,
+    );
+    for _ in 0..ITER36_LONG_PROMPT_REP_COUNT {
+        s.push_str(ITER36_LONG_PROMPT_BASE);
+    }
+    s.push_str(suffix);
+    s
+}
+
+/// ADR-017 Phase E.a iter-3.6 — long-prompt LCP partial-prefill resume
+/// byte-identity falsifier.
+///
+/// Asserts that with `HF2Q_KV_LCP_LONG_RESUME=1`, sending Q (long)
+/// then P (long, shares prefix with Q) on a server with the resume
+/// path engages the registry (`lcp_detected_total ≥ 1`) AND produces
+/// byte-identical output to a control server that runs fresh prefill
+/// of P (same long prompt).
+///
+/// Falsifier conditions:
+///   1. `lcp_detected_total < 1` ⇒ engine still skipping store; iter-3.6
+///      env flag not wired through OR snapshot guard not lifted OR
+///      engine guard not lifted.
+///   2. `server_A_decoded(P) != server_B_decoded(P)` ⇒ iter-3.6 path
+///      produces non-byte-identical output; mask_type=2 + linear
+///      sliding-window-attention disagrees with mask_type=1 + ring on
+///      the same prompt; CORRECTNESS BREAK.
+///
+/// Until Phase A iter-3.6 lands, this test FAILS at the engagement
+/// assertion. Per Walk discipline.
+#[test]
+fn iter3_6_long_prompt_resume_byte_identity() {
+    let model_path = match resolve_model_path_or_skip() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[iter-3.6 long-resume] {ENV_PHASE_D_GATE}=1 not set — short-circuit. \
+                 Set {ENV_PHASE_D_GATE}=1 + {ENV_MODEL_PATH}=PATH to run."
+            );
+            return;
+        }
+    };
+    let bin = hf2q_binary_path();
+    assert!(
+        bin.exists(),
+        "[iter-3.6 long-resume] hf2q binary not found at {} — \
+         did `cargo build --release` run?",
+        bin.display()
+    );
+
+    let prompt_q = iter36_build_prompt("Question Q ending here distinctively.");
+    let prompt_p =
+        iter36_build_prompt("Question P with different ending text continuing onward.");
+    eprintln!(
+        "[iter-3.6 long-resume] prompts built: Q={} chars, P={} chars (shared prefix \
+         {} reps × {} chars; both prompts target prompt_len > sliding_window=1024)",
+        prompt_q.len(),
+        prompt_p.len(),
+        ITER36_LONG_PROMPT_REP_COUNT,
+        ITER36_LONG_PROMPT_BASE.len()
+    );
+
+    // ── Server A: iter-3.6 long-resume path under test ──
+    let server_a = spawn_server(
+        &bin,
+        &model_path,
+        PORT_A,
+        &[
+            ("HF2Q_KV_LCP_RESUME", "1"),
+            ("HF2Q_KV_LCP_LONG_RESUME", "1"),
+        ],
+    );
+    wait_for_readyz(&server_a);
+    let canonical_a = fetch_canonical_model_id(&server_a);
+    eprintln!(
+        "[iter-3.6 long-resume] server A (LCP_RESUME=1, LONG_RESUME=1) ready on {}:{} model={}",
+        HOST, PORT_A, canonical_a
+    );
+
+    // Prime the LCP registry with Q (long, > sw). After iter-3.6
+    // implementation, this stores. Today, iter-3.5c skips store.
+    let q_decoded_a = chat_decode(&server_a, &canonical_a, &prompt_q, ITER36_MAX_TOKENS);
+    assert!(
+        !q_decoded_a.is_empty(),
+        "[iter-3.6 long-resume] Q decoded empty on server A"
+    );
+    eprintln!(
+        "[iter-3.6 long-resume] server A Q decoded {} bytes (priming long-prompt registry)",
+        q_decoded_a.len()
+    );
+
+    // Send P (long, shares prefix with Q). After iter-3.6, registry has
+    // Q's snapshot, probe engages, take_prefix returns Some(K), resume
+    // installs into weights.dense_kvs. Today, registry empty (skip),
+    // probe returns None, no resume.
+    let p_decoded_a = chat_decode(&server_a, &canonical_a, &prompt_p, ITER36_MAX_TOKENS);
+    assert!(
+        !p_decoded_a.is_empty(),
+        "[iter-3.6 long-resume] P decoded empty on server A"
+    );
+    eprintln!(
+        "[iter-3.6 long-resume] server A P decoded {} bytes (resume path under test)",
+        p_decoded_a.len()
+    );
+
+    // Engagement assertion — load-bearing falsifier #1.
+    let metrics_body_a = fetch_metrics(&server_a);
+    let lcp_detected_a = metric_lcp_detected_total(&metrics_body_a);
+    assert!(
+        lcp_detected_a >= 1,
+        "[iter-3.6 long-resume] FALSIFIED #1 — server A's \
+         hf2q_kv_lcp_detected_total={} (expected ≥ 1). The long-prompt LCP \
+         resume did NOT engage. Either:\n\
+         (a) HF2Q_KV_LCP_LONG_RESUME=1 not plumbed through engine guard \
+         (engine.rs:4516, 7027) — iter-3.5c still skipping store.\n\
+         (b) Snapshot guard at forward_prefill.rs:~1820 still gating on \
+         seq_len <= sw — long prompt skipped.\n\
+         (c) Capacity check formula at probe site rejects the cached entry.\n\n\
+         metrics excerpt:\n{}",
+        lcp_detected_a,
+        metrics_body_a
+            .lines()
+            .filter(|l| l.contains("lcp"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    eprintln!(
+        "[iter-3.6 long-resume] server A engagement confirmed: \
+         hf2q_kv_lcp_detected_total={}",
+        lcp_detected_a
+    );
+
+    drop(server_a);
+
+    // ── Server B: control (no LONG_RESUME, default ring path) ──
+    let server_b = spawn_server(&bin, &model_path, PORT_B, &[]);
+    wait_for_readyz(&server_b);
+    let canonical_b = fetch_canonical_model_id(&server_b);
+    eprintln!(
+        "[iter-3.6 long-resume] server B (control, ring path) ready on {}:{} model={}",
+        HOST, PORT_B, canonical_b
+    );
+
+    let p_decoded_b = chat_decode(&server_b, &canonical_b, &prompt_p, ITER36_MAX_TOKENS);
+    assert!(
+        !p_decoded_b.is_empty(),
+        "[iter-3.6 long-resume] P decoded empty on server B"
+    );
+    eprintln!(
+        "[iter-3.6 long-resume] server B P decoded {} bytes (control)",
+        p_decoded_b.len()
+    );
+
+    // Falsifier #2 — load-bearing byte-identity invariant.
+    if p_decoded_a != p_decoded_b {
+        let common_prefix = p_decoded_a
+            .as_bytes()
+            .iter()
+            .zip(p_decoded_b.as_bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let snippet_a = p_decoded_a
+            .get(common_prefix..common_prefix.saturating_add(120))
+            .unwrap_or("")
+            .to_string();
+        let snippet_b = p_decoded_b
+            .get(common_prefix..common_prefix.saturating_add(120))
+            .unwrap_or("")
+            .to_string();
+        panic!(
+            "[iter-3.6 long-resume] FALSIFIED #2 — P decoded bytes differ \
+             between iter-3.6 long-resume (A) and control ring (B).\n\
+             server A (long-resume) len={} bytes\n\
+             server B (control ring) len={} bytes\n\
+             diverge at byte={}\n\
+             A @ {}: {:?}\n\
+             B @ {}: {:?}\n\
+             ⇒ iter-3.6 mask_type=2 + linear sliding produces non-byte-\
+             identical output to mask_type=1 + ring on the same prompt. \
+             Phase A CORRECTNESS BREAK; do NOT promote env-flag.",
+            p_decoded_a.len(),
+            p_decoded_b.len(),
+            common_prefix,
+            common_prefix,
+            snippet_a,
+            common_prefix,
+            snippet_b
+        );
+    }
+    eprintln!(
+        "[iter-3.6 long-resume] PASS — server A (long-resume) bytes ({} bytes) \
+         == server B (control ring) bytes ({} bytes) BYTE-IDENTICAL. \
+         Phase A iter-3.6 invariant verified.",
+        p_decoded_a.len(),
+        p_decoded_b.len()
+    );
+}
