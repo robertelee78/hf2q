@@ -826,11 +826,84 @@ pub fn generate_qwen35_once(
         );
     } else {
         // Miss: full prefill.
-        let positions = prefill_positions_for(prompt_len);
-        let prefill_logits = qwen
-            .model
-            .forward_gpu_last_logits(prompt_tokens, &positions, &mut kv_cache)
-            .context("Qwen35Model::forward_gpu_last_logits (prefill)")?;
+        //
+        // ADR-017 Phase B-hybrid.2a — when HF2Q_KV_LCP_CHUNKED_PREFILL=1
+        // AND prompt_len divides evenly by the configured stride, run
+        // prefill in chunks instead of one monolithic call. Each chunk
+        // call propagates state (full-attn current_len cursor +
+        // DeltaNet recurrent state) via the kv_cache; the cumulative
+        // effect MUST be byte-identical to the monolithic call (the
+        // `phase_b2a_chunked_vs_monolithic_byte_identity` falsifier
+        // guards this invariant).
+        //
+        // Constraint: prompt_len % stride == 0. The DeltaNet
+        // chunk_gated_delta_rule kernel requires `seq_len % FIXED_BT
+        // (=64) == 0`; stride defaults to 1024 (16 internal chunks),
+        // and the chunked-prefill flow guarantees each call has
+        // seq_len = stride for all but the last call. For
+        // prompt_len % stride != 0, the last chunk would have a
+        // non-aligned seq_len that may take a different kernel path,
+        // breaking byte-identity. iter B.2b (next iter) extends to
+        // handle the partial-tail case via a dedicated final-chunk
+        // call; iter B.2a (this commit) keeps the constraint to
+        // verify the foundational invariant first.
+        let stride = crate::debug::INVESTIGATION_ENV.kv_lcp_deltanet_checkpoint_stride;
+        let chunked_eligible = crate::debug::INVESTIGATION_ENV.kv_lcp_chunked_prefill
+            && stride > 0
+            && prompt_len > stride;
+        let prefill_logits = if chunked_eligible {
+            // ADR-017 Phase B-hybrid.2a — chunked prefill with partial
+            // tail support. The first N-1 calls have seq_len = stride;
+            // the last call has seq_len = prompt_len - (N-1) * stride
+            // (which may be smaller than stride). The DeltaNet kernel
+            // dispatcher handles seq_len that doesn't satisfy the
+            // chunk_gated_delta_rule precondition by routing through
+            // the autoregressive path; the cumulative output across
+            // all N chunked calls MUST equal the monolithic call —
+            // that's the load-bearing falsifier invariant.
+            let n_chunks = (prompt_len + stride - 1) / stride;
+            eprintln!(
+                "[hf2q qwen35 chunked prefill] {} chunks (stride={}, \
+                 prompt_len={})",
+                n_chunks, stride, prompt_len
+            );
+            let mut last_logits: Option<Vec<f32>> = None;
+            for chunk_idx in 0..n_chunks {
+                let k_start = chunk_idx * stride;
+                let k_end = ((chunk_idx + 1) * stride).min(prompt_len);
+                let chunk_seq_len = k_end - k_start;
+                let chunk_tokens = &prompt_tokens[k_start..k_end];
+                // Build positions for [k_start..k_end). Positions are
+                // absolute (NOT chunk-relative) so RoPE sees the
+                // correct logical positions across the whole prompt.
+                let mut chunk_positions = vec![0i32; 4 * chunk_seq_len];
+                for axis in 0..4 {
+                    for t in 0..chunk_seq_len {
+                        chunk_positions[axis * chunk_seq_len + t] =
+                            (k_start + t) as i32;
+                    }
+                }
+                let logits = qwen
+                    .model
+                    .forward_gpu_last_logits(chunk_tokens, &chunk_positions, &mut kv_cache)
+                    .with_context(|| {
+                        format!(
+                            "qwen35 chunked prefill: chunk {}/{} (k_start={}, k_end={}, seq_len={})",
+                            chunk_idx + 1, n_chunks, k_start, k_end, chunk_seq_len
+                        )
+                    })?;
+                if chunk_idx == n_chunks - 1 {
+                    last_logits = Some(logits);
+                }
+            }
+            last_logits.expect("at least one chunk in chunked prefill")
+        } else {
+            let positions = prefill_positions_for(prompt_len);
+            qwen
+                .model
+                .forward_gpu_last_logits(prompt_tokens, &positions, &mut kv_cache)
+                .context("Qwen35Model::forward_gpu_last_logits (prefill)")?
+        };
         anyhow::ensure!(
             prefill_logits.len() == qwen.vocab_size,
             "qwen35 prefill logits len {} != vocab_size {}",

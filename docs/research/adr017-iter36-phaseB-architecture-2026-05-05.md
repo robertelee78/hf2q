@@ -360,3 +360,19 @@ Walk discipline mandatory at each phase. Codex Phase-2b audit mandatory at end o
 3. **Phase B.2 (Qwen35 DeltaNet checkpoints)** — after Phase B.1 ships and we measure speedup.
 
 Total estimated wall-time: 5-8 days across ~10-15 loop iters. The user accepts this cost ("we have plenty of time to do it right").
+
+### D.5 — Phase B.2a chunked-prefill blocker (2026-05-05)
+
+**Finding**: the foundational invariant for B.2 — that running prefill in chunks (with `kv_cache` state propagation between calls) produces output byte-identical to a single monolithic call — DOES NOT HOLD on Qwen 3.6 27B-DWQ46 today.
+
+Test: `tests/lcp_qwen35_chunked_prefill.rs::phase_b2a_chunked_vs_monolithic_byte_identity` with stride=64, prompt tokenizing to 108 tokens. Result: chunked decode = 41 bytes; monolithic decode = 47 bytes; diverge at byte offset 4.
+
+**Hypothesis (prime suspect)**: the DeltaNet kernel dispatcher uses different code paths based on `seq_len > 64 && seq_len % 64 == 0` (chunk-pipeline at `chunk_gated_delta_rule_fwd`) vs the fallback (autoregressive `gated_delta_net_decode`). Chunked prefill at stride=64 produces partial-tail chunks (seq_len ∈ [1, 63]) which take the autoregressive path; the cumulative state across multiple kernel-path-switching calls differs from a single monolithic call's state.
+
+**B.2 status**: BLOCKED pending root-cause. Two possible mitigations:
+1. Constrain chunked prefill to stride values where prompt_len is exactly divisible (no partial tail). Restricts when the speedup applies but preserves byte-identity. Mitigation lands in iter B.2b.
+2. Investigate + fix the kernel-path-divergence bug in mlx-native (chunk_gated_delta_rule vs autoregressive gated_delta_net dispatch). Larger scope; iter B.2c+.
+
+**Default impact**: zero. The chunked path is gated on `HF2Q_KV_LCP_CHUNKED_PREFILL=1` (default OFF). Default `cargo test` passes 2814/0/3. The falsifier test runs only under `HF2Q_KV_PERSIST_PHASE_D=1 + HF2Q_KV_PERSIST_QWEN35_E2E_MODEL_PATH=<gguf>` (explicit operator opt-in).
+
+The falsifier IS KEPT failing intentionally (per mantra "code + test == truth") so the bug stays visible until rooted out.

@@ -330,6 +330,39 @@ pub struct InvestigationEnv {
     ///   - docs/research/adr017-iter36-phaseB-architecture-2026-05-05.md
     pub kv_lcp_long_resume: bool,
 
+    /// `HF2Q_KV_LCP_CHUNKED_PREFILL` — when ON, Qwen 3.5/3.6 prefill
+    /// runs in fixed-size chunks of `kv_lcp_deltanet_checkpoint_stride`
+    /// tokens instead of one monolithic call. Default OFF.
+    ///
+    /// ADR-017 Phase B-hybrid.2a — chunked prefill is the foundation
+    /// for SSM-state checkpointing + partial-prefill resume. Each
+    /// chunk's call propagates the recurrent state via the `kv_cache`
+    /// (DeltaNet conv_state + recurrent state pingpong; full-attn
+    /// `current_len[0]` cursor). The cumulative effect of multiple
+    /// chunked calls MUST be byte-identical to a single monolithic
+    /// call — that's the falsifier test
+    /// `tests/lcp_qwen35_chunked_prefill.rs::
+    ///  phase_b2a_chunked_vs_monolithic_byte_identity`.
+    ///
+    /// Cost trade-off: chunked dispatch adds ~5-15 % wall (extra
+    /// kernel launches per chunk; extra `lm_head` matmul per chunk's
+    /// last token). Phase B.2 lifts this trade by actually engaging
+    /// LCP resume (skipping [0..K_aligned) chunks entirely on the
+    /// shared-prefix path), netting a positive speedup overall.
+    pub kv_lcp_chunked_prefill: bool,
+
+    /// `HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE` — default 1024 — the
+    /// stride between SSM-state checkpoints during chunked prefill.
+    /// MUST be a positive multiple of `FIXED_BT = 64` (per
+    /// `chunk_gated_delta_rule` precondition at gpu_delta_net.rs:1078).
+    /// Default 1024 = 16 internal chunks per stride.
+    ///
+    /// Memory cost: per cached entry, `ceil(N / stride)` checkpoints
+    /// at ~96 MB each (Qwen 3.6 27B 48 DeltaNet layers × ~2 MB
+    /// recurrent state). For N=8192, stride=1024: 8 checkpoints =
+    /// ~768 MB per cached entry. Capacity=1 registry ⇒ bounded.
+    pub kv_lcp_deltanet_checkpoint_stride: usize,
+
     /// `HF2Q_LAYER_POLICY` — per-layer SDPA policy selector.
     ///   - "dense_all": all layers dense.
     ///   - "tq_all" / unset: all layers TQ (default).
@@ -530,6 +563,20 @@ impl InvestigationEnv {
             // OFF; opt-in via `HF2Q_KV_LCP_LONG_RESUME=1`. See struct
             // field doc for full contract.
             kv_lcp_long_resume: env_eq_one("HF2Q_KV_LCP_LONG_RESUME"),
+            // ADR-017 Phase B-hybrid.2a — chunked prefill toggle.
+            kv_lcp_chunked_prefill: env_eq_one("HF2Q_KV_LCP_CHUNKED_PREFILL"),
+            // ADR-017 Phase B-hybrid.2a — checkpoint stride (default
+            // 1024). Constrained to a positive multiple of 64 by the
+            // chunk_gated_delta_rule precondition. We don't enforce the
+            // multiple-of-64 here at parse time; the chunked-prefill
+            // call site validates and rounds up if necessary.
+            kv_lcp_deltanet_checkpoint_stride: env::var(
+                "HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE",
+            )
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(1024),
 
             // Gate H release-check plumbing (ADR-007 §853-866; iter-108a).
             emit_nll: env_eq_one("HF2Q_EMIT_NLL"),
