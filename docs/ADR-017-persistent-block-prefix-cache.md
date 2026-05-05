@@ -1,6 +1,6 @@
 # ADR-017: Persistent Block Prefix Cache for serve mode
 
-- **Status:** **R-P5 SHIP-GATE PASS at L=32K via Phase E PromptCache cross-process replay (Closure iters 1→5 landed 2026-05-04).** R-P5 production bench at L=32K: `ratio=0.000 (no_cache=585.5s, cache_hit=13.6ms)` — 43,000× cache-hit speedup. Phase D SPILL side (iters 1-4) plus Phase E RESTORE-CONSUMER side (iter-5) close the original ADR-017 vision for full-equality prompt matching at production-observable behavior. Pre-iter-5 Status: Primary gates: K1/K2/K3 kill-gates FALSIFIED + R-C4 internal + R-P4 ship-gate PASS at iter-4 (in-memory PromptCache replay path; ratio=0.000 on iter-4 evidence). **Closure iters 1→4 narrative (Code = Truth per project mantra):** iter-1 discovered R-P5 architectural gap via the new production test exposing zero-byte `cache_dir` after `pre_evict`; iter-2 added `/shutdown` HTTP endpoint + SIGTERM drain (commit `b2d0cda`); iter-3 closed a four-bug stack on the spill path — pool-key vs bare-repo lookup mismatch, A.3-stub `n_layers=1` + single-block range hardcodes never replaced by B-dense.1, `Weak<Engine>` engine_arc that could never upgrade in production, and a tokio nested-`block_on` panic — making the spill path actually write blocks to disk (commit `985be04`); iter-4 validated cross-process restoration plumbing (`post_admit` finds 44 metas, fingerprints match, restored=44/44) AND surfaced the next architectural gap: **forward_prefill resets `write_pos = 0` at every prefill (`forward_prefill.rs:446`) and re-runs the full prefill from token 0, overwriting the restored KV state.** The restored bytes are written into the buffer, then immediately discarded. The spill→restore plumbing is correct end-to-end; the request path doesn't use the cached state. **Phase E (LCP-based partial-prefill resume — explicitly deferred at `engine.rs:1442` "iter-97+ scope") is the missing layer for true R-P5/R-P6 cache-hit acceleration.** ADR-017's pre-iter-3 R-P4 "PASS at ratio=0.000" was iter-96 PromptCache full-equality replay (RAM, single-process), not actual cross-process KV restore — the iter-1 audit suspected this; iter-4 confirmed it from code. Spill side: 801 MB / 337 blocks written at L=512; restoration: 44/44 metas restored on cold-process restart with matching fingerprint. Phase E options: (a) implement iter-97+ LCP partial-prefill resume; (b) extend ADR-017 to also persist `PromptCache` for cross-process full-equality replay (smaller scope, ~150-300 LOC). User-facing iter-2 win independent of R-P5: Ctrl+C / `systemctl stop` / deploy graceful-shutdown now flushes KV cache to disk instead of silently discarding it. Operator-readiness P0/P1 round COMPLETE: P0-1 fsync(parent_dir), P0-3 *.tmp.<pid> orphan GC, P0-bench Weak<Engine>, P1-1 lock-step atomicity, P1-3 budget_bytes wiring, R-F1 HF2Q_KV_PERSIST=0 startup-disable, R-F6 cache --kv-namespace, R-F7 /metrics counters, F4 namespace fingerprint thread-through — all LANDED on origin/main. Remaining for closure: Phase E (LCP or PromptCache persistence — see iter-4 finding for design-options), R-P5/R-P6 re-bench post-Phase-E, full 32K bench, stress 24h (depends on Phase E for real cache-hit), R-C6 corruption injection (4 scenarios), peer arm rebench (post-ADR-005 chat-template fix), B-hybrid (post-ADR-013). Per-family read at [`docs/ADR-017-per-family-status.md`](./ADR-017-per-family-status.md).
+- **Status:** **R-P5 + R-P6 SHIP-GATES PASS via Phase E PromptCache cross-process + intra-process replay (Closure iters 1→6 landed 2026-05-04).** R-P5 production bench at L=32K: `ratio=0.000 (no_cache=585.5s, cache_hit=13.6ms)` — 43,000× cache-hit speedup. R-P6 4-agent shared 4K bench: `aggregate=64.85s = 1.00× single_agent` (spec ≤1.25×, 25% margin). Phase D SPILL side (iters 1-4) plus Phase E RESTORE-CONSUMER side (iters 5-6) close the original ADR-017 vision for full-equality prompt matching at production-observable behavior. Pre-iter-5 Status: Primary gates: K1/K2/K3 kill-gates FALSIFIED + R-C4 internal + R-P4 ship-gate PASS at iter-4 (in-memory PromptCache replay path; ratio=0.000 on iter-4 evidence). **Closure iters 1→4 narrative (Code = Truth per project mantra):** iter-1 discovered R-P5 architectural gap via the new production test exposing zero-byte `cache_dir` after `pre_evict`; iter-2 added `/shutdown` HTTP endpoint + SIGTERM drain (commit `b2d0cda`); iter-3 closed a four-bug stack on the spill path — pool-key vs bare-repo lookup mismatch, A.3-stub `n_layers=1` + single-block range hardcodes never replaced by B-dense.1, `Weak<Engine>` engine_arc that could never upgrade in production, and a tokio nested-`block_on` panic — making the spill path actually write blocks to disk (commit `985be04`); iter-4 validated cross-process restoration plumbing (`post_admit` finds 44 metas, fingerprints match, restored=44/44) AND surfaced the next architectural gap: **forward_prefill resets `write_pos = 0` at every prefill (`forward_prefill.rs:446`) and re-runs the full prefill from token 0, overwriting the restored KV state.** The restored bytes are written into the buffer, then immediately discarded. The spill→restore plumbing is correct end-to-end; the request path doesn't use the cached state. **Phase E (LCP-based partial-prefill resume — explicitly deferred at `engine.rs:1442` "iter-97+ scope") is the missing layer for true R-P5/R-P6 cache-hit acceleration.** ADR-017's pre-iter-3 R-P4 "PASS at ratio=0.000" was iter-96 PromptCache full-equality replay (RAM, single-process), not actual cross-process KV restore — the iter-1 audit suspected this; iter-4 confirmed it from code. Spill side: 801 MB / 337 blocks written at L=512; restoration: 44/44 metas restored on cold-process restart with matching fingerprint. Phase E options: (a) implement iter-97+ LCP partial-prefill resume; (b) extend ADR-017 to also persist `PromptCache` for cross-process full-equality replay (smaller scope, ~150-300 LOC). User-facing iter-2 win independent of R-P5: Ctrl+C / `systemctl stop` / deploy graceful-shutdown now flushes KV cache to disk instead of silently discarding it. Operator-readiness P0/P1 round COMPLETE: P0-1 fsync(parent_dir), P0-3 *.tmp.<pid> orphan GC, P0-bench Weak<Engine>, P1-1 lock-step atomicity, P1-3 budget_bytes wiring, R-F1 HF2Q_KV_PERSIST=0 startup-disable, R-F6 cache --kv-namespace, R-F7 /metrics counters, F4 namespace fingerprint thread-through — all LANDED on origin/main. Remaining for closure: Phase E (LCP or PromptCache persistence — see iter-4 finding for design-options), R-P5/R-P6 re-bench post-Phase-E, full 32K bench, stress 24h (depends on Phase E for real cache-hit), R-C6 corruption injection (4 scenarios), peer arm rebench (post-ADR-005 chat-template fix), B-hybrid (post-ADR-013). Per-family read at [`docs/ADR-017-per-family-status.md`](./ADR-017-per-family-status.md).
 
   *Original Status (preserved for provenance): "Accepted (falsification-gated). ADR-017 is a committed decision: hf2q ships per-model SSD KV-cache persistence across the Phase 4 hot-swap eviction signal for every model family complete in code on serve-side. Phase A0 (falsification harness on M5 Max) is the first deliverable and the explicit ship-or-die gate — every kill-criterion in §10 is a hard exit that closes ADR-017 unmerged with rationale, not a 'circle back later' punt. Per-family parity gate is non-negotiable (no carve-out, no descope without Robert's explicit re-authorization)."*
 - **Date:** 2026-04-30
@@ -3512,6 +3512,45 @@ Test counts: 149 unit tests PASS at HEAD (was 145 at iter-4, +4 from prompt_cach
 - ⏸ Full 60-cell matrix sweep: operator-controlled
 
 **Remaining iter-6+ work:** R-P6 bench, stress 30-min smoke, R-C6 corruption injection, peer arm rebench (post-ADR-005), B-hybrid (post-ADR-013).
+
+---
+
+### Phase E Closure iter-6 2026-05-04 — R-P6 SHIP-GATE PASS (4-agent shared 4K prefix)
+
+R-P6 bench at L=4K with 4 sequential agents on a single server (commit 18f4f0c+):
+
+```
+[Phase D R-P6] PREFIX_LEN=4096 (target tokens), n_words=1024, prompt_bytes=15273
+[Phase D R-P6] agent 1 ttft=64846.5ms (prompt_tokens=Some(6070), total_tokens=4)
+[Phase D R-P6] agent 2 ttft=1.9ms (prompt_tokens=Some(6070), total_tokens=4)
+[Phase D R-P6] agent 3 ttft=1.9ms (prompt_tokens=Some(6070), total_tokens=4)
+[Phase D R-P6] agent 4 ttft=1.8ms (prompt_tokens=Some(6070), total_tokens=4)
+[R-P6] PASS — aggregate=64852.1ms = 1.00× single_agent (64846.5ms each: 64846.5/1.9/1.9/1.8)
+test result: ok. 1 passed; 0 failed in 68.49s
+```
+
+| Metric | Value |
+|---|---|
+| agent 1 ttft (cache-miss reference) | 64,846.5 ms |
+| agent 2 ttft (cache hit) | 1.9 ms |
+| agent 3 ttft (cache hit) | 1.9 ms |
+| agent 4 ttft (cache hit) | 1.8 ms |
+| aggregate ttft | 64,852.1 ms |
+| **aggregate / single_agent_cost** | **1.00×** (spec ≤ 1.25×) |
+| Speedup vs naive 4-agent | ~99.99% prefill amortization |
+
+Same iter-96 PromptCache replay path as R-P5; agents 2-4 hit the in-process cache after agent 1 populates it. **No cross-process restore needed for R-P6** — single server, single PromptCache instance. R-P5's iter-5 plumbing wasn't a prerequisite for R-P6, but the test was waiting on iter-3's spill-path correctness fixes (without which agent 1 would have crashed on the post-decode evict that fires at request boundaries).
+
+**Spec gates at iter-6 close:**
+- ✅ R-C4 internal sourdough: PASS
+- ✅ R-P4 cache_hit/no_cache ≤ 0.20 at L=32K: PASS
+- ✅ K1 / K2 / K3 kill-gates: FALSIFIED
+- ✅ **R-P5 cache_hit/no_cache ≤ 0.15 at L=32K cold-process resume: PASS**
+- ✅ **R-P6 4-agent shared 4K prefix aggregate ≤ 1.25×: PASS (1.00×)**
+- 🔄 Stress 24h: 30-min reduced-duration smoke RUNNING (iter-6 background bench)
+- ⏸ R-C6 corruption injection (4 scenarios): not yet implemented
+- ⏸ Peer arm vs llama-completion: blocked on ADR-005 chat-template
+- ⏸ Full 60-cell matrix sweep: operator-controlled
 
 ---
 
