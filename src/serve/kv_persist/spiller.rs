@@ -485,11 +485,28 @@ where
         let Some(quant) = Self::parse_quant(handle) else {
             return SpillOutcome::Skipped;
         };
-        let Some(hook_arc) = self.lookup_hook(&handle.repo_id, quant) else {
+        // ADR-017 Closure iter-3 (2026-05-04): `LoadedHandle.repo_id`
+        // stores the pool-key form `format!("{repo}@{quant}")` (set
+        // at multi_model.rs:1014, 1164 when the manager admits an
+        // engine to the pool). Family hooks are registered under the
+        // BARE repo (LoaderWrapper::update_spiller_registration calls
+        // `spiller.register_family(repo: String, quant, ...)` with the
+        // unwrapped repo string from try_substitute_on_load). Without
+        // this strip, lookup_hook misses every hook → SpillOutcome::Skipped
+        // → R-P5 ratio ≈ 1.0 (the iter-1 / iter-2 finding). This was
+        // latent because R-P4's force_eviction_via_symlink does NOT
+        // route through `manager.evict()`; it forces eviction via the
+        // GGUF symlink trick, which triggers a different (in-process)
+        // restoration path that does not expose this asymmetry.
+        let bare_repo: &str = handle
+            .repo_id
+            .strip_suffix(&format!("@{}", handle.quant))
+            .unwrap_or(handle.repo_id.as_str());
+        let Some(hook_arc) = self.lookup_hook(bare_repo, quant) else {
             return SpillOutcome::Skipped;
         };
 
-        let model_fp = self.family_model_fp(&handle.repo_id, quant);
+        let model_fp = self.family_model_fp(bare_repo, quant);
         let alignment = {
             let g = match hook_arc.lock() {
                 Ok(g) => g,
