@@ -3690,6 +3690,30 @@ fn warmup_once(loaded: &mut GemmaLoadedModel) -> Result<()> {
     Ok(())
 }
 
+/// ADR-017 Phase E option (a) iter-3 + Codex Phase-2b audit (re-audit
+/// LOW issue #2) — module-level warn-once helper for the
+/// `HF2Q_KV_LCP_RESUME=1 + HF2Q_USE_DENSE=0` misconfiguration.
+///
+/// Both the non-streaming (`generate_once_with_soft_tokens`) and the
+/// streaming (`generate_stream_once`) probe sites call this helper
+/// when they detect the misconfig. The internal `std::sync::Once`
+/// guarantees ONE log line per process across both call sites — so a
+/// pure-streaming deployment gets the warning on its first request,
+/// even though the non-streaming code path never fires.
+fn warn_lcp_resume_without_dense() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            "HF2Q_KV_LCP_RESUME=1 set but HF2Q_USE_DENSE=0 — iter-3 \
+             partial-prefill resume requires dense SDPA (TQ-packed \
+             kv_caches not safely resumable without a separate \
+             restoration path; Phase E.a v2 scope). LCP probe stays \
+             observation-only. To activate iter-3 resume, set BOTH \
+             HF2Q_KV_LCP_RESUME=1 AND HF2Q_USE_DENSE=1."
+        );
+    });
+}
+
 /// ADR-017 Phase E option (a) iter-2 — build the per-request `LcpKey`
 /// from a Gemma-loaded model + sampling params.
 ///
@@ -3847,24 +3871,7 @@ fn generate_once_with_soft_tokens(
                 if !crate::debug::INVESTIGATION_ENV.kv_lcp_resume {
                     None
                 } else if !crate::debug::INVESTIGATION_ENV.use_dense {
-                    // Codex audit LOW issue #3: warn (once) on the
-                    // `LCP_RESUME=1` + `USE_DENSE=0` combination so
-                    // operators don't silently get observation-only
-                    // when they explicitly asked for resume. Static
-                    // `std::sync::Once` ensures one log line per
-                    // process regardless of request volume.
-                    static ONCE: std::sync::Once = std::sync::Once::new();
-                    ONCE.call_once(|| {
-                        tracing::warn!(
-                            "HF2Q_KV_LCP_RESUME=1 set but HF2Q_USE_DENSE=0 — \
-                             iter-3 partial-prefill resume requires dense \
-                             SDPA (TQ-packed kv_caches not safely resumable \
-                             without a separate restoration path; Phase E.a \
-                             v2 scope). LCP probe stays observation-only. \
-                             To activate iter-3 resume, set BOTH \
-                             HF2Q_KV_LCP_RESUME=1 AND HF2Q_USE_DENSE=1."
-                        );
-                    });
+                    warn_lcp_resume_without_dense();
                     None
                 } else {
                     // Capacity check is a re-probe: take_prefix returns
@@ -4159,6 +4166,20 @@ fn generate_once_with_soft_tokens(
     let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
     generated_tokens.push(next_token);
 
+    // ADR-017 Phase E.a iter-3 + Codex Phase-2b audit follow-up:
+    // physical decode-side KV write counter. Each `forward_decode`
+    // call writes exactly one position to `dense_kvs[*][pos %
+    // capacity]`. Tracking this explicitly (vs deriving from
+    // `generated_tokens.len()` post-pop) makes the sliding-ring wrap
+    // guard's boundary check unambiguous: the guard at the LCP store
+    // path uses `prompt_len + physical_decode_writes` to decide
+    // whether the ring wrapped. Rationale: grammar-dead path POPs the
+    // last generated token, but the corresponding `forward_decode`
+    // call DID write KV. `completion_tokens` (post-pop) underrepresents
+    // physical writes by 1 in that case; an explicit counter is
+    // immune to that off-by-one ambiguity.
+    let mut physical_decode_writes: usize = 0;
+
     let first_fragment = loaded
         .tokenizer
         .decode(&[next_token], false)
@@ -4207,6 +4228,12 @@ fn generate_once_with_soft_tokens(
             let greedy_token = loaded
                 .weights
                 .forward_decode(next_token, pos, &mut loaded.ctx, &mut p)?;
+            // ADR-017 Phase E.a iter-3 — count physical KV write.
+            // `forward_decode` always writes exactly one position; this
+            // increments BEFORE any later EOS / stop_string / grammar-
+            // dead branches that might pop or break, so the count
+            // reflects actual GPU writes.
+            physical_decode_writes += 1;
             profiler.finish_token(p);
 
             next_token = if sample_logits {
@@ -4406,7 +4433,13 @@ fn generate_once_with_soft_tokens(
     if soft_tokens.is_empty() {
         if let Some(weights_dense_kvs) = loaded.weights.dense_kvs.as_ref() {
             let sliding_window = loaded.weights.sliding_window.max(1);
-            let total_writes = prompt_len.saturating_add(result.completion_tokens);
+            // ADR-017 Phase E.a iter-3 + Codex Phase-2b audit:
+            // sliding-ring wrap guard uses the explicit physical
+            // decode-write counter (NOT `result.completion_tokens`)
+            // to decide whether the ring wrapped. See `let mut
+            // physical_decode_writes` declaration above for the
+            // rationale.
+            let total_writes = prompt_len.saturating_add(physical_decode_writes);
             // Sliding-ring wrap guard: if total writes (prompt + decode)
             // exceeded the sliding window, the ring wrapped and
             // sliding-layer slots no longer faithfully represent
@@ -6069,14 +6102,17 @@ fn generate_stream_once(
         match detected {
             None => None,
             Some(_k_obs) => {
-                if !crate::debug::INVESTIGATION_ENV.kv_lcp_resume
-                    || !crate::debug::INVESTIGATION_ENV.use_dense
-                {
-                    // Note: the warn-once-on-RESUME-without-DENSE log
-                    // line is emitted by the non-streaming probe site
-                    // (engine.rs::generate_once_with_soft_tokens). One
-                    // global log per process is enough; no need to
-                    // duplicate here.
+                if !crate::debug::INVESTIGATION_ENV.kv_lcp_resume {
+                    None
+                } else if !crate::debug::INVESTIGATION_ENV.use_dense {
+                    // Codex audit LOW issue #2 (re-audit): streaming
+                    // path mirrors the non-streaming warn-once via the
+                    // shared module-level helper. The
+                    // std::sync::Once ensures only one log line per
+                    // process, regardless of which probe site
+                    // (streaming or non-streaming) hits the
+                    // misconfiguration first.
+                    warn_lcp_resume_without_dense();
                     None
                 } else {
                     let prefix_opt = loaded.lcp_registry.take_prefix(&lcp_key, prompt_tokens);
@@ -6538,6 +6574,14 @@ fn generate_stream_once(
     let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
     generated_tokens.push(next_token);
 
+    // ADR-017 Phase E.a iter-3 + Codex Phase-2b audit (streaming
+    // mirror): physical decode-write counter — see the matching
+    // declaration in `generate_once_with_soft_tokens` for full
+    // rationale. Used by the post-decode LCP store to decide whether
+    // the sliding ring wrapped (which would corrupt cached prompt-
+    // prefix state).
+    let mut physical_decode_writes: usize = 0;
+
     // Emit prefill-produced first token:
     let first_text = loaded
         .tokenizer
@@ -6591,6 +6635,11 @@ fn generate_stream_once(
                     return;
                 }
             };
+            // ADR-017 Phase E.a iter-3 — count physical KV write
+            // (mirrors non-streaming counter). One per `forward_decode`
+            // success; counted BEFORE any subsequent EOS / stop_string
+            // / grammar-dead branches.
+            physical_decode_writes += 1;
             next_token = if let Some(sp) = sampler_params.as_ref() {
                 let mut logits: Vec<f32> = match loaded.weights.logits_view() {
                     Ok(v) => v.to_vec(),
@@ -6888,7 +6937,12 @@ fn generate_stream_once(
     if soft_tokens.is_empty() {
         if let Some(weights_dense_kvs) = loaded.weights.dense_kvs.as_ref() {
             let sliding_window = loaded.weights.sliding_window.max(1);
-            let total_writes = prompt_tokens.len().saturating_add(completion_tokens);
+            // ADR-017 Phase E.a iter-3 + Codex Phase-2b audit: use the
+            // explicit physical decode-write counter (NOT
+            // `completion_tokens`) so the streaming wrap guard is
+            // immune to any pop / EOS / stop_string off-by-one
+            // accounting.
+            let total_writes = prompt_tokens.len().saturating_add(physical_decode_writes);
             let ring_safe = total_writes <= sliding_window
                 || !loaded.weights.layers.iter().any(|l| {
                     matches!(l.layer_type, crate::serve::config::LayerType::Sliding)
