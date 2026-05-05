@@ -1,0 +1,19 @@
+## Verdict
+APPROVED-WITH-CAVEATS
+
+## Findings
+- [LOW] [tests/lcp_partial_prefill_byte_identity.rs](/opt/hf2q/tests/lcp_partial_prefill_byte_identity.rs:1105) — Qwen3.5 marker test has no executable assertion
+  - What: `iter7_qwen35_hybrid_lcp_deferred_marker` is an always-pass `assert!(true)` documentation marker.
+  - Why bad: It will not fail if the Qwen3.5 deferral is accidentally lifted or partially wired; its only value is grep/discovery.
+  - Suggested fix: Keep the rationale in docs or replace with a real source-level guard if feasible. As-is, this is optional and not promotion-blocking.
+
+## Notes
+- Snapshot predicate: `!any_sliding_layer || seq_len <= sw` is correct for iter-7. It catches wrapped sliding-layer snapshots and permits pure-dense long prompts. It can validly match the engine store predicate at [engine.rs](/opt/hf2q/src/serve/api/engine.rs:4516); exact alignment is desirable here because one guard prevents unsafe snapshot construction and the other prevents unsafe publication.
+- `snap_cap = sw.max(seq_len + max_decode_tokens)` is sufficient for the live populated prefix and global live cap in current allocation rules. The existing earlier `linear_capacity = seq_len + max_decode_tokens` means usize overflow is not newly introduced by iter-7.
+- Copy bounds look sound. In both same-shape and strided branches, `copy_len_per_head = seq_len * hd * elem`, and iter-7 ensures `snap_cap >= seq_len` whenever the snapshot path runs. Source capacity is also at least `seq_len` for sliding-safe and global layers.
+- Test design is non-vacuous: Q and P differ, PromptCache lookup runs before LCP, and the test asserts `lcp_lookups_total Δ >= 2`, so `detected_delta == 0` cannot pass merely because the LCP probe never ran.
+- Env-gate idempotence holds: snapshot creation remains behind `kv_lcp_resume && use_dense`, now with an additional safety predicate.
+- Concurrency looks unchanged. `self.layers.iter().any(...)` reads immutable model metadata during the exclusive prefill path; no new lock/race concern observed.
+- Iter-3.6 compatibility is fine: the future mid-prefill snapshot lift should revisit/relax the `seq_len <= sw` predicate for sliding layers, not the pure-dense capacity fix.
+
+Specific recommendation before iter-4 default-ON: add an explicit pure-dense long-prompt regression if a pure-dense fixture is available, and keep the operator soak focused on both non-streaming and streaming store paths.
