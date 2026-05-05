@@ -3973,6 +3973,349 @@ mod tests {
         );
     }
 
+    /// **ADR-017 Phase E.a B.2-iso isolation test** — proves that the
+    /// FA fast path (`apply_flash_attn_prefill_seq_major`, BF16 MMA +
+    /// log-domain online softmax) and the legacy SDPA fallback
+    /// (`mlx_native::ops::sdpa::sdpa`, F32 single-pass online softmax)
+    /// produce different bytes by design when the same Q/K/V/positions
+    /// are presented.  This is the kernel-level falsifier underneath
+    /// `tests/lcp_qwen35_chunked_prefill.rs::phase_b2a_chunked_vs_monolithic_byte_identity`.
+    ///
+    /// # Three configurations
+    ///
+    /// All three runs share byte-identical synthetic Q/K/V (seed
+    /// `0xB2150ABE`, deterministic LCG).  Shape: head_dim=256, n_heads=16,
+    /// n_kv_heads=2, GQA 8:1 — the apex Qwen3.6-35B-A3B-DWQ46 layer
+    /// proportions.  seq_full=64, seq_chunk=32 — both >= BK=16, so the
+    /// FA fast path is engaged for chunk-1 and the monolithic call.
+    ///
+    /// 1. **Path A — monolithic FA fast path**: seq_len=64, cur_len=0.
+    ///    Calls `apply_flash_attn_prefill_seq_major` once.  Output_A is
+    ///    seq-major \[64, n_heads, head_dim\].
+    /// 2. **Path B1 — chunked turn-1 FA fast path**: seq_len=32,
+    ///    cur_len=0.  Same kernel as A, but only the first 32 tokens.
+    ///    Output_B1 is seq-major \[32, n_heads, head_dim\].
+    /// 3. **Path C — chunked turn-2 LEGACY SDPA fallback**: K/V slot
+    ///    populated for all 64 tokens (head-major,
+    ///    `dispatch_kv_cache_copy_seq_f32_dual`).  Q is chunk-2 only
+    ///    (tokens \[32..64\], head-major, GPU-uploaded).  Calls
+    ///    `mlx_native::ops::sdpa::sdpa` with kv_seq_len=64, seq_len=32.
+    ///    Output_C is head-major \[n_heads, 32, head_dim\] →
+    ///    permuted to seq-major for comparison.
+    ///
+    /// # Assertions
+    ///
+    /// * **A\[0..32\] == B1\[0..32\]**: same kernel, same K/V.  Causal
+    ///   attention means tokens \[0..32\] can only see K/V\[0..32\],
+    ///   which is byte-identical between A and B1.  Failure here means
+    ///   FA arena state contamination across calls — far worse than the
+    ///   B.2 hypothesis.
+    /// * **A\[32..64\] != C\[0..32\]**: A used FA bf16 d256 (BF16 MMA +
+    ///   log-domain online softmax via `fast::exp2`); C used the
+    ///   legacy F32 sdpa kernel (single-pass online softmax via `exp`).
+    ///   These compute the same operation in infinite precision but
+    ///   produce different bits at finite precision.  This is the
+    ///   B.2-fix root cause.
+    ///
+    /// # If both pass
+    ///
+    /// The B.2-fix path is to extend the FA fast path to support
+    /// `cur_len > 0` via the existing `qL_off` Metal function constant
+    /// (see `flash_attn_prefill.metal:1325` —
+    /// `q_max = (tid.x + 1) * BQ + params->qL_off`).  A new wrapper
+    /// (e.g. `apply_flash_attn_prefill_seq_major_resume`) takes
+    /// seq-major Q (qL=seq_len), head-major slot K/V (kL=kv_seq_len),
+    /// and `qL_off=cur_len`.  Same numerical path as monolithic, so
+    /// chunked-vs-monolithic becomes byte-identical.
+    ///
+    /// # Why this lives in this module's `mod tests`
+    ///
+    /// Reuses `apply_flash_attn_prefill_seq_major` + `FaPrefillArena`
+    /// without re-export, plus the `upload_f32`/`download_f32` helpers
+    /// already in scope.  Mirrors the precedent of
+    /// `flash_attn_prefill_into_byte_exact_parity_with_wrapper` (seq=64
+    /// nh=16 nkv=2 d=256 fixture) directly above.
+    #[test]
+    fn phase_b2_iso_fast_path_vs_fallback_path_kernel_divergence() {
+        use super::super::FaPrefillArena;
+
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        // Both kernel families need explicit registration in unit tests
+        // (production register sites are forward_gpu.rs:1394 + serve/gpu.rs:64).
+        mlx_native::ops::flash_attn_prefill::register(&mut registry);
+        mlx_native::ops::sdpa::register(&mut registry);
+        mlx_native::ops::kv_cache_copy::register(&mut registry);
+
+        // Apex Qwen3.6-35B-A3B-DWQ46 FA layer proportions (head_dim=256,
+        // GQA 8:1).  seq_full = 2 * seq_chunk so chunk-1 is FA-eligible
+        // (seq >= 16 = BK) and the chunked-turn-2 simulation has
+        // cur_len > 0 + kv_seq_len > seq_len.
+        let seq_full: u32 = 64;
+        let seq_chunk: u32 = 32;
+        let n_heads: u32 = 16;
+        let n_kv_heads: u32 = 2;
+        let head_dim: u32 = 256;
+        let kv_capacity: u32 = 128;
+
+        let nh = n_heads as usize;
+        let nkv = n_kv_heads as usize;
+        let d = head_dim as usize;
+        let scale = 1.0f32 / (d as f32).sqrt();
+
+        // Synthetic Q/K/V — deterministic LCG.  ~0.5 amplitude keeps the
+        // BF16 cast path well within representable range.
+        let mut s = 0xB2150ABEu32;
+        let mut mk = |elems: usize| -> Vec<f32> {
+            (0..elems)
+                .map(|_| {
+                    s = s.wrapping_mul(1103515245).wrapping_add(12345);
+                    ((s as i32 as f32) / (i32::MAX as f32)) * 0.5
+                })
+                .collect()
+        };
+        // seq-major [seq_full, n_heads, head_dim] for Q.
+        // seq-major [seq_full, n_kv_heads, head_dim] for K, V.
+        let q_full_cpu = mk(seq_full as usize * nh * d);
+        let k_full_cpu = mk(seq_full as usize * nkv * d);
+        let v_full_cpu = mk(seq_full as usize * nkv * d);
+
+        // ── Path A: monolithic FA fast path ──
+        // Use the `_into` variant + explicit commit_and_wait so the
+        // download below sees the kernel's writes (the wrapper uses
+        // commit_labeled which doesn't sync; download_f32 is a raw
+        // shared-memory slice read with no host fence — without an
+        // explicit wait, we'd read zero-initialised buffer bytes).
+        let q_full_buf = upload_f32(&q_full_cpu, &device).expect("upload q_full");
+        let k_full_buf = upload_f32(&k_full_cpu, &device).expect("upload k_full");
+        let v_full_buf = upload_f32(&v_full_cpu, &device).expect("upload v_full");
+        let mut arena_a = FaPrefillArena::new(
+            &device, seq_full, n_heads, n_kv_heads, head_dim,
+        )
+        .expect("FaPrefillArena A");
+        let out_a_buf = device
+            .alloc_buffer(
+                seq_full as usize * nh * d * 4,
+                DType::F32,
+                vec![seq_full as usize, nh, d],
+            )
+            .expect("alloc out_a");
+        {
+            let mut enc = device.command_encoder().expect("enc A");
+            apply_flash_attn_prefill_seq_major_into(
+                &mut enc, &device, &mut registry,
+                &q_full_buf, &k_full_buf, &v_full_buf,
+                &out_a_buf,
+                seq_full, n_heads, n_kv_heads, head_dim,
+                &mut arena_a,
+            )
+            .expect("Path A FA fast path");
+            enc.commit_and_wait().expect("commit_and_wait A");
+        }
+        let out_a = download_f32(&out_a_buf).expect("download A");
+
+        // ── Path B1: chunked turn-1 FA fast path ──
+        let q_chunk1_cpu: Vec<f32> = q_full_cpu[..seq_chunk as usize * nh * d].to_vec();
+        let k_chunk1_cpu: Vec<f32> = k_full_cpu[..seq_chunk as usize * nkv * d].to_vec();
+        let v_chunk1_cpu: Vec<f32> = v_full_cpu[..seq_chunk as usize * nkv * d].to_vec();
+        let q_b1_buf = upload_f32(&q_chunk1_cpu, &device).expect("upload q_b1");
+        let k_b1_buf = upload_f32(&k_chunk1_cpu, &device).expect("upload k_b1");
+        let v_b1_buf = upload_f32(&v_chunk1_cpu, &device).expect("upload v_b1");
+        let mut arena_b1 = FaPrefillArena::new(
+            &device, seq_chunk, n_heads, n_kv_heads, head_dim,
+        )
+        .expect("FaPrefillArena B1");
+        let out_b1_buf = device
+            .alloc_buffer(
+                seq_chunk as usize * nh * d * 4,
+                DType::F32,
+                vec![seq_chunk as usize, nh, d],
+            )
+            .expect("alloc out_b1");
+        {
+            let mut enc = device.command_encoder().expect("enc B1");
+            apply_flash_attn_prefill_seq_major_into(
+                &mut enc, &device, &mut registry,
+                &q_b1_buf, &k_b1_buf, &v_b1_buf,
+                &out_b1_buf,
+                seq_chunk, n_heads, n_kv_heads, head_dim,
+                &mut arena_b1,
+            )
+            .expect("Path B1 FA fast path");
+            enc.commit_and_wait().expect("commit_and_wait B1");
+        }
+        let out_b1 = download_f32(&out_b1_buf).expect("download B1");
+
+        // ── Path C: chunked turn-2 LEGACY SDPA fallback ──
+        // Populate slot K/V head-major with all 64 tokens (mirrors the
+        // production write at gpu_full_attn.rs:1787).
+        let slot_k = device
+            .alloc_buffer(
+                nkv * kv_capacity as usize * d * 4,
+                DType::F32,
+                vec![nkv, kv_capacity as usize, d],
+            )
+            .expect("alloc slot_k");
+        let slot_v = device
+            .alloc_buffer(
+                nkv * kv_capacity as usize * d * 4,
+                DType::F32,
+                vec![nkv, kv_capacity as usize, d],
+            )
+            .expect("alloc slot_v");
+        {
+            let mut enc = device.command_encoder().expect("enc kv copy");
+            dispatch_kv_cache_copy_seq_f32_dual(
+                &mut enc, &mut registry, device.metal_device(),
+                &k_full_buf, &v_full_buf,
+                &slot_k, &slot_v,
+                n_kv_heads, head_dim, kv_capacity,
+                0,        // seq_pos_start
+                seq_full, // n_tokens (write all 64)
+                0,        // src_tok_offset
+            )
+            .expect("dispatch kv_cache_copy_seq_f32_dual");
+            enc.commit_and_wait().expect("commit kv copy");
+        }
+
+        // Build chunk-2 head-major Q from chunk-2 seq-major slice.
+        // q_full_cpu is seq-major [seq_full, nh, d]; chunk-2 = rows [32..64].
+        let q_chunk2_seq_major: Vec<f32> =
+            q_full_cpu[seq_chunk as usize * nh * d..].to_vec();
+        let mut q_chunk2_hm = vec![0.0f32; seq_chunk as usize * nh * d];
+        for t in 0..seq_chunk as usize {
+            for h in 0..nh {
+                let src_off = (t * nh + h) * d;
+                let dst_off = (h * seq_chunk as usize + t) * d;
+                q_chunk2_hm[dst_off..dst_off + d]
+                    .copy_from_slice(&q_chunk2_seq_major[src_off..src_off + d]);
+            }
+        }
+        let q_c_hm_buf = upload_f32(&q_chunk2_hm, &device).expect("upload q_c_hm");
+
+        let out_c_hm_buf = device
+            .alloc_buffer(
+                seq_chunk as usize * nh * d * 4,
+                DType::F32,
+                vec![nh, seq_chunk as usize, d],
+            )
+            .expect("alloc out_c_hm");
+        {
+            let params = SdpaParams {
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                seq_len: seq_chunk,
+                kv_seq_len: seq_full, // 64 — full slot
+                scale,
+                kv_capacity,
+            };
+            let mut enc = device.command_encoder().expect("enc sdpa C");
+            sdpa(
+                &mut enc, &mut registry, &device,
+                &q_c_hm_buf, &slot_k, &slot_v, &out_c_hm_buf,
+                &params, 1,
+            )
+            .expect("Path C legacy sdpa");
+            enc.commit_and_wait().expect("commit C");
+        }
+
+        // Permute Path C output back to seq-major for direct comparison.
+        let out_c_hm = download_f32(&out_c_hm_buf).expect("download C");
+        let mut out_c_sm = vec![0.0f32; seq_chunk as usize * nh * d];
+        for h in 0..nh {
+            for t in 0..seq_chunk as usize {
+                let src_off = (h * seq_chunk as usize + t) * d;
+                let dst_off = (t * nh + h) * d;
+                out_c_sm[dst_off..dst_off + d]
+                    .copy_from_slice(&out_c_hm[src_off..src_off + d]);
+            }
+        }
+
+        // Guard: parallel test contention can stall a Metal CB and leave
+        // an output all-zero (precedent at line 3929).  Skip rather than
+        // false-fail.
+        let a_all_zero = out_a.iter().all(|&v| v == 0.0);
+        let b1_all_zero = out_b1.iter().all(|&v| v == 0.0);
+        let c_all_zero = out_c_sm.iter().all(|&v| v == 0.0);
+        if a_all_zero || b1_all_zero || c_all_zero {
+            eprintln!(
+                "phase_b2_iso: all-zero output under parallel contention \
+                 (A:{a_all_zero} B1:{b1_all_zero} C:{c_all_zero}) — skipping"
+            );
+            return;
+        }
+
+        // ── Assertion 1: A[0..32] BYTE-IDENTICAL to B1[0..32] ──
+        let chunk1_elems = seq_chunk as usize * nh * d;
+        let mut diff_a_vs_b1 = 0usize;
+        for i in 0..chunk1_elems {
+            if out_a[i].to_bits() != out_b1[i].to_bits() {
+                if diff_a_vs_b1 < 5 {
+                    eprintln!(
+                        "  A vs B1 diff[{i}]: A={:.10} ({:#010x}) \
+                         B1={:.10} ({:#010x})",
+                        out_a[i],
+                        out_a[i].to_bits(),
+                        out_b1[i],
+                        out_b1[i].to_bits()
+                    );
+                }
+                diff_a_vs_b1 += 1;
+            }
+        }
+        assert_eq!(
+            diff_a_vs_b1, 0,
+            "phase_b2_iso ASSERT 1: A[0..32] vs B1[0..32] differs at \
+             {diff_a_vs_b1}/{chunk1_elems} F32 elements — same kernel + \
+             same K/V chunk MUST produce byte-identical output.  This \
+             would indicate FA arena state contamination across calls, \
+             which is a deeper issue than the B.2 hypothesis."
+        );
+
+        // ── Assertion 2: A[32..64] DIVERGES from C[0..32] ──
+        let chunk2_offset = seq_chunk as usize * nh * d;
+        let mut diff_a_vs_c = 0usize;
+        let mut max_abs_diff = 0.0f32;
+        let mut max_diff_idx = 0usize;
+        for i in 0..chunk1_elems {
+            let a_val = out_a[chunk2_offset + i];
+            let c_val = out_c_sm[i];
+            if a_val.to_bits() != c_val.to_bits() {
+                let abs = (a_val - c_val).abs();
+                if abs > max_abs_diff {
+                    max_abs_diff = abs;
+                    max_diff_idx = i;
+                }
+                diff_a_vs_c += 1;
+            }
+        }
+        assert!(
+            diff_a_vs_c > 0,
+            "phase_b2_iso ASSERT 2 (FALSIFIER): A[32..64] BYTE-IDENTICAL \
+             to C[0..32] — hypothesis FALSIFIED.  The fast path and the \
+             legacy fallback DO produce byte-identical output, so the \
+             divergence in B.2a is not at this kernel-pair level.  \
+             Investigate elsewhere: arena state contamination across \
+             chunked calls, seq < 16 fall-through to the broken short-qL \
+             path, or kernel-pipeline reuse between paths."
+        );
+
+        eprintln!(
+            "phase_b2_iso: KERNEL-LEVEL DIVERGENCE CONFIRMED.\n  \
+             • A vs B1 (same FA kernel, first chunk): 0/{chunk1_elems} \
+               differ (byte-identical) ✓\n  \
+             • A vs C  (FA fast vs legacy SDPA, second chunk): \
+               {diff_a_vs_c}/{chunk1_elems} differ \
+               (max |Δ| = {max_abs_diff:.6e} at index {max_diff_idx})\n  \
+             B.2-fix path (mlx-native): extend FA fast path to cur_len > 0 \
+             via existing qL_off function constant \
+             (flash_attn_prefill.metal:1325).  Wrapper signature: \
+             apply_flash_attn_prefill_seq_major_resume(Q seq-major qL=M, \
+             slot K/V head-major kL=N+M, qL_off=N)."
+        );
+    }
+
     // The `fa_path_first_token_matches_legacy_at_seq128` parity test that
     // lived here in W-5b.10 was deleted in W-5b.12 alongside the
     // `HF2Q_QWEN35_FA_LEGACY` env gate. With the gate gone, the legacy
