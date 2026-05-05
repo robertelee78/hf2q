@@ -263,6 +263,37 @@ impl LoadedPool {
     /// memory yet should still be allowed to fit, the pool's own
     /// accounting determines that).
     pub fn from_hardware(hw: &HardwareProfile) -> Self {
+        // ADR-017 Closure iter-8 (2026-05-05): operator can override the
+        // hardware-derived budget via `HF2Q_POOL_BUDGET_BYTES` (raw bytes
+        // as a u64). Used by the stress smoke + production deployments
+        // that want a tighter cap than the default 80%-of-RAM.
+        //
+        // Why this exists: on RAM-rich hardware (e.g., 128 GB M5 Max)
+        // the default 80% budget = ~102 GB easily fits 4-5 16-GB models
+        // simultaneously. The LRU-evict path never fires under the
+        // stress-loop's swap-cycle workload, so KV-persist's
+        // `pre_evict` + `drop_family` paths are never exercised. With
+        // a 20 GB budget, every other model load forces eviction →
+        // exercises the spill+restore lifecycle for real leak
+        // detection. Iter-7 stress smoke surfaced this gap as a
+        // false-positive RSS-leak reading (60 GB of accumulated
+        // models, no real leak).
+        //
+        // Env unset: identical to pre-iter-8 behavior (80% of RAM at
+        // DEFAULT_POOL_CAPACITY model slots). Env set but unparseable:
+        // logged as a warning and falls through to the default —
+        // never panics on a malformed env, so misconfigured operators
+        // don't lose their server.
+        if let Ok(s) = std::env::var("HF2Q_POOL_BUDGET_BYTES") {
+            if let Ok(n) = s.parse::<u64>() {
+                return Self::with_capacity_and_budget(DEFAULT_POOL_CAPACITY, n);
+            } else {
+                eprintln!(
+                    "[ADR-017 iter-8] HF2Q_POOL_BUDGET_BYTES={s:?} did not \
+                     parse as u64; falling through to hardware-derived budget"
+                );
+            }
+        }
         Self::from_hardware_with(hw, DEFAULT_POOL_CAPACITY, DEFAULT_MEMORY_BUDGET_FRACTION)
     }
 
