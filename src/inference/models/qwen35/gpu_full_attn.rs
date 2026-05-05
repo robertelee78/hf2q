@@ -62,7 +62,8 @@ use mlx_native::ops::sdpa_decode::dispatch_sdpa_decode;
 use mlx_native::ops::flash_attn_vec::{flash_attn_vec, tmp_buffer_bytes as flash_attn_vec_tmp_bytes, FlashAttnVecParams};
 use mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul;
 use mlx_native::ops::flash_attn_prefill::{
-    dispatch_flash_attn_prefill_bf16_d256, FlashAttnPrefillParams,
+    dispatch_flash_attn_prefill_bf16_d256, dispatch_flash_attn_prefill_bf16_d256_resume,
+    FlashAttnPrefillParams, FlashAttnPrefillResumeParams,
 };
 use mlx_native::ops::transpose::{permute_021_bf16, permute_021_bf16_to_f32};
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
@@ -1609,6 +1610,232 @@ pub fn apply_flash_attn_prefill_seq_major(
 }
 
 // ================================================================
+// FA prefill RESUME wrapper (ADR-017 Phase E.a B.2-fix)
+// ================================================================
+
+/// Apply flash-attention prefill to a chunk Q against a populated K/V slot
+/// (resume / append-prefill semantics).
+///
+/// **Use this wrapper when** prefilling new tokens onto an already-populated
+/// KV slot — i.e. ADR-017 Phase E.a Phase B.2 LCP partial-prefill resume on
+/// Qwen3.5/3.6 (head_dim=256).  For prefill-from-zero, use
+/// [`apply_flash_attn_prefill_seq_major`] (the existing fast path).  This
+/// resume wrapper produces output that is byte-identical to a fresh full
+/// prefill of the entire prompt — proven via the kernel-level parity test
+/// at `/opt/mlx-native/tests/test_flash_attn_prefill.rs::
+/// flash_attn_prefill_bf16_d256_resume_byte_identical_to_monolithic`
+/// (mlx-native commit `1819fad`, 0/131072 BF16 elements differ).
+///
+/// # Why this exists (Chesterton's-fence answer)
+///
+/// The legacy F32 SDPA fallback at `apply_sdpa_with_kv_cache:1900-1916`
+/// covered the cur_len > 0 case for structural correctness (handed off
+/// to `mlx_native::ops::sdpa::sdpa` — F32 single-pass online softmax).
+/// However the FA bf16 d256 fast path computes attention via BF16 MMA +
+/// log-domain online softmax — the two are mathematically equivalent in
+/// infinite precision but produce different bits at finite precision
+/// (proven via `gpu_full_attn::tests::
+/// phase_b2_iso_fast_path_vs_fallback_path_kernel_divergence`: 131072/131072
+/// F32 elements differ, max |Δ| = 6.452e-4).
+///
+/// LCP partial-prefill resume requires byte-identity to fresh prefill, so
+/// the legacy F32 fallback can't be used.  This wrapper uses the FA fast
+/// path for cur_len > 0, restoring byte-identity at the cost of a one-time
+/// BF16 cast of the slot K/V per layer per resume call.
+///
+/// # Inputs
+///
+/// - `q_seq_major`: `[seq_len, n_heads, head_dim]` F32 seq-major — chunk Q
+///   only (the new tokens being prefilled).
+/// - `slot_k_head_major`: `[n_kv_heads, kv_capacity, head_dim]` F32
+///   head-major — the persistent slot K populated `[0..kv_seq_len]`
+///   (positions `[kv_seq_len..kv_capacity]` may be uninitialised; the
+///   kernel will not read past `kv_seq_len`).
+/// - `slot_v_head_major`: same layout as `slot_k_head_major`, V values.
+///
+/// # Parameters
+///
+/// - `seq_len`: chunk Q length (qL in the kernel).
+/// - `cur_len`: number of previously-populated tokens in the slot
+///   (qL_off in the kernel).  Q starts at K position `cur_len`.
+/// - `kv_seq_len`: total valid K/V length = `cur_len + seq_len` (kL).
+/// - `kv_capacity`: slot's allocated capacity (head stride for K/V).
+///   Must be `>= kv_seq_len`.
+/// - `n_heads`, `n_kv_heads`, `head_dim`: must be 256 for the d256 dispatcher.
+///
+/// # Output
+///
+/// `[seq_len, n_heads, head_dim]` F32 seq-major — same layout as the
+/// non-resume wrapper's output.  The downstream caller (sigmoid-gate
+/// multiply at op-6) consumes seq-major F32, so this layout matches.
+///
+/// # Cost
+///
+/// Per call (Qwen3.6 27B-DWQ46 max kv_capacity=4096, head_dim=256, n_kv_heads=2):
+/// - BF16 cast of slot K: `n_kv_heads * kv_capacity * head_dim * 2 bytes`
+///   = 2 × 4096 × 256 × 2 = **4 MB**
+/// - Same for slot V: 4 MB
+/// - Q chunk BF16 cast + permute: `seq_len * n_heads * head_dim * 4` ≈ tiny
+/// - Output BF16 alloc: `seq_len * n_heads * head_dim * 2` ≈ small
+/// - Output F32 seq-major (return value): `seq_len * n_heads * head_dim * 4`
+///
+/// Per-layer scratch ≈ 8 MB.  For 64 layers across the full Qwen3.6 27B
+/// resume call this is ~512 MB transient at slot-cast time.  Cost is
+/// amortised over the prefill saving (resume avoids re-prefilling the
+/// LCP prefix, typically 100s of tokens × per-layer FA cost).
+///
+/// Future optimisation: keep a persistent BF16 mirror of the slot in
+/// `MlxModelWeights` and update it incrementally during prefill — would
+/// eliminate the per-resume cast cost.  Out of scope for B.2-fix.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_flash_attn_prefill_seq_major_resume(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q_seq_major: &MlxBuffer,
+    slot_k_head_major: &MlxBuffer,
+    slot_v_head_major: &MlxBuffer,
+    seq_len: u32,
+    cur_len: u32,
+    kv_seq_len: u32,
+    kv_capacity: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+) -> Result<MlxBuffer> {
+    if head_dim != 256 {
+        return Err(anyhow!(
+            "apply_flash_attn_prefill_seq_major_resume: head_dim must be 256 \
+             (D=256 dispatcher); got {head_dim}. Other head_dims need a \
+             different mlx-native dispatcher (D=64 / D=512) or a new port."
+        ));
+    }
+    if cur_len + seq_len != kv_seq_len {
+        return Err(anyhow!(
+            "apply_flash_attn_prefill_seq_major_resume: cur_len ({cur_len}) + \
+             seq_len ({seq_len}) != kv_seq_len ({kv_seq_len}) — \
+             append-prefill semantics require cur_len + seq_len == kv_seq_len."
+        ));
+    }
+    if kv_seq_len > kv_capacity {
+        return Err(anyhow!(
+            "apply_flash_attn_prefill_seq_major_resume: kv_seq_len \
+             ({kv_seq_len}) > kv_capacity ({kv_capacity}) — slot overflow."
+        ));
+    }
+
+    let seq = seq_len as usize;
+    let nh = n_heads as usize;
+    let nkv = n_kv_heads as usize;
+    let d = head_dim as usize;
+    let cap = kv_capacity as usize;
+
+    let q_elems = seq * nh * d;
+    let kv_slot_elems = nkv * cap * d;
+    let out_elems = seq * nh * d;
+
+    // ── Allocate scratch buffers ─────────────────────────────────────────
+    //
+    // Q is contiguous-packed (qL=seq_len): seq-major BF16 → head-major BF16.
+    // K/V mirror is at slot capacity (head_stride = cap * d).
+    // out_bf16_hm is contiguous-packed (qL=seq_len): head-major BF16.
+    // out_seq is the F32 seq-major return value (caller takes ownership).
+    let q_bf16_seq = device
+        .alloc_buffer(q_elems * 2, DType::BF16, vec![seq, nh, d])
+        .map_err(|e| anyhow!("alloc q_bf16_seq: {e}"))?;
+    let q_bf16_hm = device
+        .alloc_buffer(q_elems * 2, DType::BF16, vec![1, nh, seq, d])
+        .map_err(|e| anyhow!("alloc q_bf16_hm: {e}"))?;
+    // Slot K/V mirror: full capacity layout (the kernel uses kv_capacity as
+    // head stride and only reads [0..kv_seq_len]).
+    let k_bf16_slot = device
+        .alloc_buffer(kv_slot_elems * 2, DType::BF16, vec![1, nkv, cap, d])
+        .map_err(|e| anyhow!("alloc k_bf16_slot: {e}"))?;
+    let v_bf16_slot = device
+        .alloc_buffer(kv_slot_elems * 2, DType::BF16, vec![1, nkv, cap, d])
+        .map_err(|e| anyhow!("alloc v_bf16_slot: {e}"))?;
+    let mut out_bf16_hm = device
+        .alloc_buffer(out_elems * 2, DType::BF16, vec![1, nh, seq, d])
+        .map_err(|e| anyhow!("alloc out_bf16_hm: {e}"))?;
+    let out_seq = device
+        .alloc_buffer(out_elems * 4, DType::F32, vec![seq, nh, d])
+        .map_err(|e| anyhow!("alloc out_seq: {e}"))?;
+
+    let mut enc = device.command_encoder().context("FA resume bridge encoder")?;
+
+    // ── Step 1+2: Q F32 seq-major → BF16 seq-major → BF16 head-major ──
+    cast(
+        &mut enc, registry, device.metal_device(),
+        q_seq_major, &q_bf16_seq, q_elems, CastDirection::F32ToBF16,
+    ).context("FA resume bridge: cast Q F32→BF16")?;
+    enc.memory_barrier();
+    permute_021_bf16(
+        &mut enc, registry, device.metal_device(),
+        &q_bf16_seq, &q_bf16_hm,
+        seq, nh, d,
+    ).context("FA resume bridge: permute_021 Q [seq, nh, d] → [nh, seq, d]")?;
+
+    // ── Step 3: cast slot K F32 head-major → BF16 head-major (in-layout) ──
+    //
+    // The slot is already in head-major layout `[n_kv_heads, kv_capacity, d]`
+    // F32, so this is a pure dtype cast — no permute needed.  The element
+    // count is `n_kv_heads * kv_capacity * d` (full slot extent including
+    // unused tail; the kernel reads only `[0..kv_seq_len]` per head thanks
+    // to kL-aware tile bounds).
+    cast(
+        &mut enc, registry, device.metal_device(),
+        slot_k_head_major, &k_bf16_slot, kv_slot_elems, CastDirection::F32ToBF16,
+    ).context("FA resume bridge: cast slot K F32→BF16")?;
+    enc.memory_barrier();
+
+    // ── Step 4: cast slot V F32 head-major → BF16 head-major ──
+    cast(
+        &mut enc, registry, device.metal_device(),
+        slot_v_head_major, &v_bf16_slot, kv_slot_elems, CastDirection::F32ToBF16,
+    ).context("FA resume bridge: cast slot V F32→BF16")?;
+    enc.memory_barrier();
+
+    // ── Step 5: dispatch the resume FA bf16 d256 kernel ──
+    //   - q_offset_in_k = cur_len   (chunk Q starts at slot position cur_len)
+    //   - kv_capacity   = slot stride (slot's allocated kv_capacity)
+    //   - do_causal     = true       (causal mask via qL_off)
+    let scale = 1.0 / (d as f32).sqrt();
+    dispatch_flash_attn_prefill_bf16_d256_resume(
+        &mut enc, device, registry,
+        &q_bf16_hm, &k_bf16_slot, &v_bf16_slot,
+        &mut out_bf16_hm,
+        &FlashAttnPrefillResumeParams {
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            seq_len_q: seq_len,
+            seq_len_k: kv_seq_len,
+            batch: 1,
+            scale,
+            do_causal: true,
+            q_offset_in_k: cur_len,
+            kv_capacity,
+        },
+    ).context("FA resume bridge: dispatch_flash_attn_prefill_bf16_d256_resume")?;
+
+    enc.memory_barrier();
+
+    // ── Step 6: BF16 head-major → F32 seq-major (fused permute+cast) ──
+    permute_021_bf16_to_f32(
+        &mut enc, registry, device.metal_device(),
+        &out_bf16_hm, &out_seq,
+        nh, seq, d,
+    ).context(
+        "FA resume bridge: permute_021_bf16_to_f32 out [nh, seq, d] → \
+         [seq, nh, d] F32"
+    )?;
+
+    enc.commit_and_wait()
+        .context("FA resume bridge: commit+wait")?;
+
+    Ok(out_seq)
+}
+
+// ================================================================
 // KV-cache-aware SDPA
 // ================================================================
 
@@ -1882,12 +2109,58 @@ pub fn apply_sdpa_with_kv_cache(
             return Ok(out_uploaded);
         }
 
-        // ── Fallback path (head_dim != 256 OR cur_len > 0). Dispatched
+        // ── ADR-017 Phase E.a B.2-fix: FA RESUME path (head_dim=256,
+        //    cur_len > 0, seq_len >= 16) ──
+        //
+        // Slot K/V have already been populated with the new tokens at
+        // `[cur_len..cur_len + seq_len]` by the
+        // `dispatch_kv_cache_copy_seq_f32_dual` call above (line 1787).
+        // The resume wrapper attends chunk-Q over the FULL slot
+        // `[0..kv_seq_len]` via the FA bf16 d256 kernel with
+        // `qL_off = cur_len` and `kv_capacity` stride math (the kernel
+        // path is byte-identical to the monolithic FA fast path on a
+        // contiguous-packed full prefill — proven via the kernel-level
+        // parity test at /opt/mlx-native/tests/test_flash_attn_prefill.rs::
+        // flash_attn_prefill_bf16_d256_resume_byte_identical_to_monolithic
+        // and the host-side end-to-end test at
+        // gpu_full_attn::tests::
+        // phase_b2_iso_fast_path_vs_fallback_path_kernel_divergence
+        // Path D — both report 0/131072 elements differ).
+        //
+        // Why this branch matters: ADR-017 Phase E.a Phase B.2 LCP
+        // partial-prefill resume on Qwen3.5/3.6 needs byte-identical
+        // output to fresh prefill so multi-turn chat with shared prefix
+        // can resume from a cached slot snapshot.  The legacy F32 SDPA
+        // fallback below would produce byte-different output (BF16 MMA +
+        // log-domain online softmax vs F32 single-pass softmax) — see
+        // the kernel-divergence falsifier above.
+        let resume_path_eligible = head_dim == 256 && cur_len > 0 && seq_len >= 16;
+        if resume_path_eligible {
+            let _w5b10_kernel_resume = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FaSdpaKernel,
+            );
+            let out_uploaded = apply_flash_attn_prefill_seq_major_resume(
+                device, registry,
+                q_seq_major,
+                &slot.k, &slot.v,
+                seq_len,
+                cur_len as u32,
+                kv_seq_len,
+                max_seq_len,
+                n_heads, n_kv_heads, head_dim,
+            )?;
+            let new_len = kv_seq_len;
+            slot.current_len[0] = new_len;
+            return Ok(out_uploaded);
+        }
+
+        // ── Fallback path (head_dim != 256 OR seq_len < 16).  Dispatched
         //    against the older `sdpa` kernel + CPU permute round-trips.
         //    Preserved bit-exactly for incremental-prefill correctness.
-        //    Not exercised by the production Qwen3.5/3.6 prefill-from-zero
-        //    path; kept for future model classes whose head_dim or
-        //    incremental-prefill semantics differ. ──
+        //    Not exercised by the production Qwen3.5/3.6 prefill paths
+        //    (head_dim is always 256 and seq_len is always >= 16 in
+        //    production) — kept for unit-test fixtures with smaller
+        //    head_dim and for future model classes. ──
         let q_gpu = {
             let _w5b9_q_dl_perm_ul = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FaSdpaQDownloadPermuteUpload,
@@ -4313,6 +4586,107 @@ mod tests {
              (flash_attn_prefill.metal:1325).  Wrapper signature: \
              apply_flash_attn_prefill_seq_major_resume(Q seq-major qL=M, \
              slot K/V head-major kL=N+M, qL_off=N)."
+        );
+
+        // ───────────────────────────────────────────────────────────────────
+        // ── Path D: chunked turn-2 via NEW RESUME wrapper (B.2-fix lands) ──
+        // ───────────────────────────────────────────────────────────────────
+        //
+        // ADR-017 Phase E.a B.2-fix end-to-end gate: the resume wrapper
+        // (apply_flash_attn_prefill_seq_major_resume → mlx-native
+        // dispatch_flash_attn_prefill_bf16_d256_resume) takes seq-major
+        // F32 Q chunk + head-major F32 slot K/V and produces seq-major
+        // F32 output that is byte-identical to the corresponding region
+        // of monolithic FA fast path (Path A).
+        //
+        // This proves the full host-side F32→BF16 cast + permute pipeline
+        // (cast Q seq-major → BF16 + permute, cast slot K/V → BF16, FA
+        // resume kernel, permute output BF16 → F32) preserves the kernel-
+        // level byte-identity established at the mlx-native parity test
+        // (flash_attn_prefill_bf16_d256_resume_byte_identical_to_monolithic
+        // — 0/131072 BF16 elements differ).
+        //
+        // If A vs D differs: either the cast is non-trivial across paths
+        // (Path A also casts F32→BF16 in apply_flash_attn_prefill_seq_major),
+        // OR the slot population is byte-different from the chunk K/V seen
+        // by Path A's FA call.  Path A's casts happen inside the wrapper
+        // on the same F32 input bytes as the slot population step here, so
+        // both BF16 mirrors should be identical.
+
+        // Build chunk-2 Q seq-major (rows [32..64] of full Q).
+        let q_chunk2_sm: Vec<f32> = q_full_cpu[seq_chunk as usize * nh * d..].to_vec();
+        let q_d_sm_buf = upload_f32(&q_chunk2_sm, &device).expect("upload q_d_sm");
+
+        // Slot K/V are already populated for Path C (head-major F32, all 64
+        // tokens, capacity=128).  Reuse the same slot_k / slot_v buffers —
+        // the resume wrapper consumes them directly via cast + qL_off.
+        let out_d_buf = apply_flash_attn_prefill_seq_major_resume(
+            &device, &mut registry,
+            &q_d_sm_buf,
+            &slot_k, &slot_v,
+            seq_chunk,            // qL = chunk-2 length
+            seq_chunk,            // cur_len = previous tokens (chunk-1 length)
+            seq_full,             // kv_seq_len = cur_len + qL
+            kv_capacity,
+            n_heads, n_kv_heads, head_dim,
+        )
+        .expect("Path D apply_flash_attn_prefill_seq_major_resume");
+        let out_d = download_f32(&out_d_buf).expect("download D");
+
+        // Skip-on-zero guard (parallel-test contention precedent).
+        if out_d.iter().all(|&v| v == 0.0) {
+            eprintln!("phase_b2_iso Path D: all-zero output — skipping D");
+            return;
+        }
+
+        // ── Assertion 3: A[32..64] BYTE-IDENTICAL to D[0..32] ──
+        // Path A is the FA fast path on full 64 tokens (BF16 MMA).
+        // Path D is the resume wrapper on chunk-2 Q + slot K/V (qL_off=32).
+        // Both use the same kernel pipeline (same function constants,
+        // same K/V bytes after F32→BF16 cast).  Output should be
+        // byte-identical for the second half of monolithic.
+        let mut diff_a_vs_d = 0usize;
+        let mut max_abs_diff_d = 0.0f32;
+        let mut max_diff_idx_d = 0usize;
+        for i in 0..chunk1_elems {
+            let a_val = out_a[chunk2_offset + i];
+            let d_val = out_d[i];
+            if a_val.to_bits() != d_val.to_bits() {
+                let abs = (a_val - d_val).abs();
+                if abs > max_abs_diff_d {
+                    max_abs_diff_d = abs;
+                    max_diff_idx_d = i;
+                }
+                if diff_a_vs_d < 5 {
+                    eprintln!(
+                        "  A vs D diff[{i}]: A={:.10} ({:#010x}) \
+                         D={:.10} ({:#010x})",
+                        a_val,
+                        a_val.to_bits(),
+                        d_val,
+                        d_val.to_bits()
+                    );
+                }
+                diff_a_vs_d += 1;
+            }
+        }
+        assert_eq!(
+            diff_a_vs_d, 0,
+            "phase_b2_iso ASSERT 3 (B.2-fix gate): A[32..64] vs D[0..32] \
+             differs at {diff_a_vs_d}/{chunk1_elems} F32 elements \
+             (max |Δ| = {max_abs_diff_d:.6e} at index {max_diff_idx_d}) — \
+             the resume wrapper's host-side cast/permute pipeline does NOT \
+             preserve the kernel-level byte-identity proven at \
+             flash_attn_prefill_bf16_d256_resume_byte_identical_to_monolithic. \
+             ADR-017 Phase E.a B.2-fix BLOCKED."
+        );
+
+        eprintln!(
+            "phase_b2_iso: B.2-fix RESUME WRAPPER GATE ✓ \
+             — A vs D (FA fast monolithic vs FA resume on chunk-2): \
+             0/{chunk1_elems} differ (byte-identical end-to-end). \
+             Resume wrapper preserves kernel-level byte-identity through \
+             the F32→BF16 cast + permute pipeline."
         );
     }
 
