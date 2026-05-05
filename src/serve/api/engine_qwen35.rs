@@ -309,12 +309,14 @@ impl Qwen35LoadedModel {
             load_duration,
             provenance,
             prompt_cache: HybridPromptCache::new(),
-            // ADR-017 Phase B-hybrid.1: per-process LCP registry,
-            // capacity=1 (mirror Gemma). Iter B.1 stores observability
-            // markers; iter B.2 will store HybridKvCacheCheckpoint
-            // payloads for partial-prefill resume.
+            // ADR-017 Phase B-hybrid.1 + B.3: per-process LCP registry.
+            // B.1 (capacity=1) → B.3 (capacity from env, default 64) for
+            // mid-prefill stride-aligned checkpointing.  See
+            // `qwen35_lcp_registry_capacity` for sizing rationale.
             lcp_registry:
-                crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
+                crate::serve::kv_persist::lcp_registry::LcpRegistry::new(
+                    qwen35_lcp_registry_capacity(),
+                ),
             // Wired by AppState via LoadedModel::generate at request
             // time; None by default.
             kv_metrics_sink: None,
@@ -698,6 +700,49 @@ fn build_lcp_key_for_qwen35(
     }
 }
 
+/// ADR-017 Phase E.a B.3 — chunk-position-keyed LcpKey for mid-prefill
+/// stride-aligned checkpointing.
+///
+/// Same fingerprint / chat-template hash as `build_lcp_key_for_qwen35`,
+/// but with the chunk position embedded in `tenant_id`.  This lets the
+/// engine store MULTIPLE entries from one prefill (one per stride
+/// boundary) under distinct keys without changing the underlying
+/// LcpRegistry data structure (LcpRegistry is a flat HashMap with one
+/// entry per key — chunk-position keys give us multi-entry-per-request
+/// while preserving the existing API).
+///
+/// The probe iterates chunk positions DESCENDING (largest first) to
+/// find the longest stride-aligned true-continuation match for the
+/// new prompt.  When `chunk_position == 0` this reduces to the base
+/// key (no chunk discriminator).
+fn build_lcp_key_for_qwen35_chunk(
+    qwen: &Qwen35LoadedModel,
+    params: &SamplingParams,
+    chunk_position: usize,
+) -> crate::serve::kv_persist::lcp_registry::LcpKey {
+    let mut key = build_lcp_key_for_qwen35(qwen, params);
+    if chunk_position > 0 {
+        key.tenant_id = format!("qwen35:lcp_chunk:{chunk_position}");
+    }
+    key
+}
+
+/// ADR-017 Phase E.a B.3 — read the registry capacity from
+/// `HF2Q_KV_LCP_RESUME_CAPACITY` env (default 64).  Sized for one
+/// 4096-token prompt at stride=64 (= 64 stride boundaries) so a single
+/// long-prompt request can fill the registry without evicting itself.
+/// Each entry is a full `HybridKvCacheSnapshot` (~300 MB on Qwen 3.6
+/// 35B-A3B), so the cap is also a memory ceiling: 64 entries ≈ 19 GB
+/// peak registry footprint.  Operators with multi-request workloads
+/// or long-context prompts can raise the cap accordingly.
+pub fn qwen35_lcp_registry_capacity() -> usize {
+    std::env::var("HF2Q_KV_LCP_RESUME_CAPACITY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(64)
+}
+
 /// `true` when the running text ends with any of the registered stop
 /// strings.  Mirrors `engine::hit_stop_string` (kept private to that
 /// module for Gemma; replicated here so the Qwen35 path stays
@@ -795,33 +840,31 @@ pub fn generate_qwen35_once(
     // SoftTokenInjection at `generate_qwen35_once` (the soft-token
     // variant lives at `generate_qwen35_once_with_soft_tokens` line
     // 907; this site is text-only by construction).
-    // ── ADR-017 Phase E.a B.2c: LCP partial-prefill resume probe ──
+    // ── ADR-017 Phase E.a B.2c + B.3: LCP partial-prefill resume probe ──
     //
     // Sequence: PromptCache full-equality first (fast path); if miss,
-    // probe lcp_registry for partial-prefix match.  When env-gated AND
-    // a true-continuation hit (k == cached_prompt_len) AND DeltaNet
-    // recurrent state correctness holds (snapshot taken at exactly
-    // cached_prompt_len), restore the snapshot and shorten the prefill
-    // to the suffix only.
+    // probe lcp_registry for the longest stride-aligned true-continuation
+    // match across all chunk-position-keyed entries from prior requests.
     //
-    // Why only true-continuation in v1: the DeltaNet recurrent state is
-    // position-dependent and evolves incrementally through prefill.  An
-    // end-of-prefill snapshot's recurrent state corresponds to position
-    // `cached_prompt_len`, so it's only correct for resume at exactly
-    // that position.  Partial-LCP (k < cached_prompt_len) would resume
-    // with a recurrent state from a LATER position than the actual
-    // resume point — byte-different output to a fresh prefill.  Mid-
-    // prefill stride-aligned checkpointing is a B.3 follow-up.
+    // B.3 mid-prefill checkpointing: prior requests stored snapshots at
+    // every chunk boundary k_end during their chunked prefill (under
+    // chunk-position-keyed LcpKey).  Each snapshot's DeltaNet recurrent
+    // state is at exactly position k_end, so resuming from there is
+    // byte-correct (no position-mismatch).  This generalises B.2c v1's
+    // true-continuation-only support: any LCP that lands on a stride
+    // boundary now hits a checkpoint.
     //
-    // For multi-turn chat (the dominant /cfa workload), each turn
-    // strictly extends the previous.  True-continuation LCP captures
-    // this case completely.
+    // Probe strategy: iterate chunk positions DESCENDING (from largest
+    // possible stride-aligned position ≤ prompt_len down to stride),
+    // probe each chunk-position-keyed LcpKey.  First true-continuation
+    // hit (k == cached_prompt_len) wins.  Stops at first hit because
+    // descending order = largest match first.
     let mut lcp_resume_start: usize = 0;
     if !prompt_cache_hit {
-        let lcp_key = build_lcp_key_for_qwen35(qwen, params);
+        let base_key = build_lcp_key_for_qwen35(qwen, params);
         let detected = crate::serve::kv_persist::lcp_registry::probe_lcp_opportunity(
             &mut qwen.lcp_registry,
-            &lcp_key,
+            &base_key,
             prompt_tokens,
             false, // is_multimodal: text-only path
         );
@@ -835,42 +878,76 @@ pub fn generate_qwen35_once(
         // unconditionally so metrics show pre-rollout LCP opportunity rate).
         let lcp_resume_enabled = crate::debug::INVESTIGATION_ENV.kv_lcp_resume;
         if lcp_resume_enabled {
+            let stride =
+                crate::debug::INVESTIGATION_ENV.kv_lcp_deltanet_checkpoint_stride;
+            // Iterate stride-aligned chunk positions descending.  The
+            // largest viable position is `(prompt_tokens.len() / stride)
+            // * stride` — any larger position would have cached_prompt_len
+            // > prompt_tokens.len(), failing the strict-prefix gate.
+            // Smallest is `stride` (positions < stride aren't checkpointed).
+            let max_chunk_pos = (prompt_tokens.len() / stride).saturating_mul(stride);
             eprintln!(
-                "[hf2q qwen35 lcp probe] enabled, registry_len={}, prompt_len={}",
+                "[hf2q qwen35 lcp probe] enabled, registry_len={}, prompt_len={}, \
+                 stride={}, scanning chunk positions [{stride}..={max_chunk_pos}]",
                 qwen.lcp_registry.len(),
-                prompt_tokens.len()
+                prompt_tokens.len(),
+                stride,
             );
-            // take_prefix consumes the entry (LRU semantics: a hit
-            // consumes the cached state for this request; the
-            // post-prefill store below re-installs an updated entry
-            // with the fresh prompt's full state).
-            match qwen.lcp_registry.take_prefix(&lcp_key, prompt_tokens) {
-                Some(prefix) if prefix.k == prefix.cached_prompt_len => {
-                    // True-continuation hit: restore + suffix-only prefill.
-                    let snapshot: &HybridKvCacheSnapshot = &prefix.dense_kvs[0];
-                    kv_cache
-                        .restore_from(snapshot)
-                        .context("qwen35 lcp_registry restore_from")?;
-                    lcp_resume_start = prefix.k;
-                    eprintln!(
-                        "[hf2q qwen35 lcp resume] TRUE-CONTINUATION HIT — \
-                         restoring at k={} (cached_prompt_len={})",
-                        prefix.k, prefix.cached_prompt_len
-                    );
+
+            let mut hit = false;
+            // Step from max_chunk_pos down to stride in -stride steps.
+            let mut chunk_pos = max_chunk_pos;
+            while chunk_pos >= stride && !hit {
+                let chunk_key =
+                    build_lcp_key_for_qwen35_chunk(qwen, params, chunk_pos);
+                if let Some(prefix) =
+                    qwen.lcp_registry.take_prefix(&chunk_key, prompt_tokens)
+                {
+                    if prefix.k == prefix.cached_prompt_len {
+                        // True-continuation at this stride boundary.
+                        // The snapshot's DeltaNet recurrent state is at
+                        // exactly this position — byte-correct resume.
+                        let snapshot: &HybridKvCacheSnapshot =
+                            &prefix.dense_kvs[0];
+                        kv_cache
+                            .restore_from(snapshot)
+                            .context("qwen35 lcp_registry restore_from")?;
+                        lcp_resume_start = prefix.k;
+                        eprintln!(
+                            "[hf2q qwen35 lcp resume] STRIDE-ALIGNED HIT — \
+                             restoring at k={} (cached_prompt_len={}, \
+                             chunk_pos={})",
+                            prefix.k, prefix.cached_prompt_len, chunk_pos
+                        );
+                        hit = true;
+                    } else {
+                        // k < cached_prompt_len: the cached prompt at
+                        // this chunk_pos diverges from new_tokens before
+                        // hitting cached_prompt_len.  Means turn-2's
+                        // tokens diverge from turn-1's tokens at some
+                        // position ≤ chunk_pos.  Don't restore — the
+                        // residual DeltaNet state would be wrong.
+                        // Continue descending; smaller chunk_pos may
+                        // still match.
+                        eprintln!(
+                            "[hf2q qwen35 lcp probe] PARTIAL HIT at \
+                             chunk_pos={} — k={} < cached_prompt_len={}, \
+                             continuing descent",
+                            chunk_pos, prefix.k, prefix.cached_prompt_len
+                        );
+                    }
                 }
-                Some(prefix) => {
-                    eprintln!(
-                        "[hf2q qwen35 lcp probe] PARTIAL HIT — k={} < \
-                         cached_prompt_len={}, skipping resume",
-                        prefix.k, prefix.cached_prompt_len
-                    );
+                if chunk_pos == stride {
+                    break;
                 }
-                None => {
-                    eprintln!(
-                        "[hf2q qwen35 lcp probe] MISS (registry_len={})",
-                        qwen.lcp_registry.len()
-                    );
-                }
+                chunk_pos -= stride;
+            }
+            if !hit {
+                eprintln!(
+                    "[hf2q qwen35 lcp probe] no stride-aligned match \
+                     (registry_len={})",
+                    qwen.lcp_registry.len()
+                );
             }
         }
     }
@@ -913,36 +990,62 @@ pub fn generate_qwen35_once(
         // call; iter B.2a (this commit) keeps the constraint to
         // verify the foundational invariant first.
         let stride = crate::debug::INVESTIGATION_ENV.kv_lcp_deltanet_checkpoint_stride;
-        // ADR-017 Phase E.a B.2c: when lcp_resume_start > 0 we have a
-        // restored snapshot at the LCP boundary; prefill the suffix only
-        // (`prompt_tokens[lcp_resume_start..]`).  Disable chunked + LCP
-        // composition for v1 — chunked-with-cur_len > 0 is byte-identical
-        // (proven via B.2a) but the chunked loop's k_start arithmetic
-        // assumes prefill starts from 0; bolt-on suffix-chunked support
-        // is a v2 polish.  Monolithic suffix prefill is byte-identical
-        // (proven via the B.2-fix end-to-end falsifier Path D).
-        let chunked_eligible = crate::debug::INVESTIGATION_ENV.kv_lcp_chunked_prefill
-            && stride > 0
+        // ADR-017 Phase E.a B.3: chunked prefill engagement requires
+        // HF2Q_KV_LCP_CHUNKED_PREFILL=1.  Mid-prefill stride-aligned
+        // checkpoints (B.3) only fire when chunked is engaged AND
+        // HF2Q_KV_LCP_RESUME=1 is also set (gated below at the per-chunk
+        // store site).
+        //
+        // Why we don't auto-enable chunked under LCP_RESUME=1: chunked
+        // prefill at 3+ chunks with a partial-tail < 16 tokens hits a
+        // kernel-level divergence — the partial-tail chunk falls to the
+        // legacy F32 SDPA path (qL ∈ [2, 15] has no FA-fast-or-resume
+        // coverage; see `gpu_full_attn.rs:1830-1852`), producing byte-
+        // different output than monolithic FA fast path.  Forcing
+        // chunked under LCP_RESUME would silently break byte-identity
+        // for any prompt that ends in a partial-tail < 16-token chunk
+        // (common: chat-template prompts rarely land on stride-aligned
+        // token counts).  Operators must explicitly opt into chunked
+        // prefill via HF2Q_KV_LCP_CHUNKED_PREFILL=1 alongside LCP_RESUME=1
+        // to engage B.3's mid-prefill stores.
+        //
+        // B.4 follow-up: kernel-level FA fast/resume support for seq < 16
+        // would close this divergence and enable auto-chunked-under-LCP.
+        let lcp_resume_enabled = crate::debug::INVESTIGATION_ENV.kv_lcp_resume;
+        let chunked_eligible = stride > 0
             && prompt_len > stride
-            && lcp_resume_start == 0;
+            && crate::debug::INVESTIGATION_ENV.kv_lcp_chunked_prefill;
         let prefill_logits = if chunked_eligible {
-            // ADR-017 Phase B-hybrid.2a — chunked prefill with partial
-            // tail support. The first N-1 calls have seq_len = stride;
-            // the last call has seq_len = prompt_len - (N-1) * stride
-            // (which may be smaller than stride). The DeltaNet kernel
-            // dispatcher handles seq_len that doesn't satisfy the
-            // chunk_gated_delta_rule precondition by routing through
-            // the autoregressive path; the cumulative output across
-            // all N chunked calls MUST equal the monolithic call —
-            // that's the load-bearing falsifier invariant.
+            // ADR-017 Phase B-hybrid.2a + B.3 — chunked prefill with mid-
+            // prefill stride-aligned checkpoint storage.  Each chunk's
+            // `forward_gpu_last_logits` call leaves the kv_cache state at
+            // position k_end; we snapshot under a chunk-position-keyed
+            // LcpKey so the next request's probe finds it.
+            //
+            // Resumed-suffix mode (`lcp_resume_start > 0`): the first
+            // chunk's `chunk_idx = lcp_resume_start / stride`.  The
+            // kv_cache is already populated through `lcp_resume_start`
+            // (via `restore_from(snapshot)`); the loop continues from
+            // there, byte-identical to a fresh prefill that reached
+            // `lcp_resume_start` via prior chunks.
+            anyhow::ensure!(
+                lcp_resume_start % stride == 0,
+                "qwen35 chunked prefill: lcp_resume_start ({}) must be \
+                 stride-aligned ({}) — snapshots are stored only at \
+                 stride boundaries, so this should be guaranteed by the \
+                 probe site",
+                lcp_resume_start,
+                stride
+            );
+            let first_chunk_idx = lcp_resume_start / stride;
             let n_chunks = (prompt_len + stride - 1) / stride;
             eprintln!(
                 "[hf2q qwen35 chunked prefill] {} chunks (stride={}, \
-                 prompt_len={})",
-                n_chunks, stride, prompt_len
+                 prompt_len={}, first_chunk_idx={})",
+                n_chunks, stride, prompt_len, first_chunk_idx
             );
             let mut last_logits: Option<Vec<f32>> = None;
-            for chunk_idx in 0..n_chunks {
+            for chunk_idx in first_chunk_idx..n_chunks {
                 let k_start = chunk_idx * stride;
                 let k_end = ((chunk_idx + 1) * stride).min(prompt_len);
                 let chunk_seq_len = k_end - k_start;
@@ -967,7 +1070,58 @@ pub fn generate_qwen35_once(
                         )
                     })?;
                 if chunk_idx == n_chunks - 1 {
-                    last_logits = Some(logits);
+                    last_logits = Some(logits.clone());
+                }
+
+                // ADR-017 Phase E.a B.3: snapshot after each STRIDE-ALIGNED
+                // chunk completion.  Includes the last chunk when k_end ==
+                // prompt_len AND prompt_len is stride-aligned — that covers
+                // the true-continuation case (turn-2 fully extends turn-1).
+                // Skip non-stride-aligned partial-tail chunks (last chunk
+                // when prompt_len isn't a multiple of stride): future
+                // stride-descending probes can't address them, so storing
+                // would burn ~300 MB without any chance of being looked up.
+                let stride_aligned = k_end % stride == 0;
+                let mid_store_disabled =
+                    std::env::var("HF2Q_KV_LCP_DISABLE_MID_STORE").as_deref() == Ok("1");
+                if lcp_resume_enabled && is_greedy && stride_aligned && !mid_store_disabled {
+                    match kv_cache.snapshot(&device) {
+                        Ok(snap) => {
+                            let chunk_key = build_lcp_key_for_qwen35_chunk(
+                                qwen, params, k_end,
+                            );
+                            let linear_capacity = kv_cache
+                                .linear_attn
+                                .first()
+                                .map(|s| s.recurrent.byte_len())
+                                .unwrap_or(0);
+                            if let Err(e) = qwen.lcp_registry.store(
+                                chunk_key,
+                                prompt_tokens[..k_end].to_vec(),
+                                vec![Arc::new(snap)],
+                                0,
+                                linear_capacity,
+                            ) {
+                                tracing::warn!(
+                                    "qwen35 lcp_registry mid-prefill store failed at \
+                                     chunk_pos={k_end}: {:?}",
+                                    e
+                                );
+                            } else {
+                                eprintln!(
+                                    "[hf2q qwen35 lcp store] mid-prefill snapshot \
+                                     at chunk_pos={k_end} (registry_len_after={})",
+                                    qwen.lcp_registry.len()
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "qwen35 lcp_registry mid-prefill snapshot skipped at chunk_pos={k_end}"
+                            );
+                        }
+                    }
                 }
             }
             last_logits.expect("at least one chunk in chunked prefill")
@@ -1051,34 +1205,50 @@ pub fn generate_qwen35_once(
             }
 
             // Snapshot 2: lcp_registry (partial-prefill resume, Phase E.a).
-            // Only stored when LCP resume is enabled — there's no point
-            // burning GB-scale memcpy on a registry whose entries will
-            // never be looked up.
-            if crate::debug::INVESTIGATION_ENV.kv_lcp_resume {
+            // ADR-017 Phase E.a B.3: when chunked prefill ran (lcp_resume_enabled
+            // AND prompt_len > stride), the in-loop mid-prefill checkpointing
+            // already stored every stride-aligned boundary INCLUDING the last
+            // (when prompt_len is stride-aligned).  This end-of-prefill store
+            // handles the short-prompt case where chunked DIDN'T fire
+            // (prompt_len ≤ stride): the probe can still find this entry under
+            // chunk_pos = prompt_len when stride-aligned.
+            //
+            // Skip when prompt_len isn't stride-aligned: the descending probe
+            // only tests stride boundaries, so a non-stride-aligned chunk_pos
+            // would never be looked up.  Burning GB-scale memcpy on an
+            // unreachable entry is wasteful.
+            //
+            // Skip when chunked already ran: mid-prefill loop already stored
+            // the last chunk boundary, no need to double-store.
+            let stride =
+                crate::debug::INVESTIGATION_ENV.kv_lcp_deltanet_checkpoint_stride;
+            let chunked_already_stored = stride > 0
+                && prompt_len > stride
+                && crate::debug::INVESTIGATION_ENV.kv_lcp_chunked_prefill;
+            let prompt_stride_aligned =
+                stride > 0 && prompt_len > 0 && prompt_len % stride == 0;
+            let should_store_eof =
+                crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+                    && !chunked_already_stored
+                    && prompt_stride_aligned;
+            if should_store_eof {
                 eprintln!(
-                    "[hf2q qwen35 lcp store] storing snapshot for prompt_len={} \
-                     (registry_len_before={})",
+                    "[hf2q qwen35 lcp store] end-of-prefill snapshot for prompt_len={} \
+                     (chunk_pos={prompt_len}, registry_len_before={})",
                     prompt_tokens.len(),
                     qwen.lcp_registry.len()
                 );
                 match kv_cache.snapshot(&device) {
                     Ok(snap) => {
-                        let lcp_key = build_lcp_key_for_qwen35(qwen, params);
-                        // sliding_window=0: Qwen3.5/3.6 uses pure-causal
-                        //   attention (no sliding-window mask), so the
-                        //   sliding_window field is irrelevant for restore.
-                        // linear_capacity: byte length of any linear-attn
-                        //   recurrent buffer — used by Gemma 4 dense
-                        //   resume (LcpRegistry's three-case capacity
-                        //   protocol §10.2).  For hybrid Qwen we still
-                        //   thread it through as informational.
+                        let chunk_key =
+                            build_lcp_key_for_qwen35_chunk(qwen, params, prompt_len);
                         let linear_capacity = kv_cache
                             .linear_attn
                             .first()
                             .map(|s| s.recurrent.byte_len())
                             .unwrap_or(0);
                         if let Err(e) = qwen.lcp_registry.store(
-                            lcp_key,
+                            chunk_key,
                             prompt_tokens.to_vec(),
                             vec![Arc::new(snap)],
                             0,
