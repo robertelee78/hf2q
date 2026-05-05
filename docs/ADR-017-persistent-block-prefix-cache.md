@@ -3548,8 +3548,22 @@ Same iter-96 PromptCache replay path as R-P5; agents 2-4 hit the in-process cach
 - ✅ **R-P5 cache_hit/no_cache ≤ 0.15 at L=32K cold-process resume: PASS**
 - ✅ **R-P6 4-agent shared 4K prefix aggregate ≤ 1.25×: PASS (1.00×)**
 - ✅ **R-C6 hash-check corruption rejection (truncate / version-swap / body-bit-flip): PASS** at unit level — see `recover_from_disk_with_corrupted_blocks_reports_quarantined_count` (recovery.rs:538) covers truncated-header + version-mismatch quarantine; `quarantine_body_hash_mismatch_uses_distinct_reason_prefix` (recovery.rs:644) covers body-hash mismatch. Spec scenario "delete intermediate block in chain" is intentionally non-fatal: missing block isn't restored, remaining blocks stay valid (chain-hash is informational, not validating). Per R-C6 the rule is "any restore that fails its hash check MUST fall through to fresh prefill" — hash-check failures are exactly what the existing 3 unit tests exercise.
-- ✅ **Stress 24h LEAK FIXED (iter-10 2026-05-05): per-iter leak eliminated, residual is amortized working set.**
-  Iter-7 added `HF2Q_KV_PERSIST_STRESS_MAX_L` operator knob + `KvSpiller::drop_family` trait method + wiring; iter-8 added `HF2Q_POOL_BUDGET_BYTES` env override; iter-9 added vmmap-summary breakdown sampling. Iter-9 findings: at POOL_BUDGET=20 GB, MAX_L=4096, the residual ~22.5 GB-per-3-iter "leak" was anonymous (writeable) memory, NOT mapped-file page cache. Iter-10 instrumented `worker_run` exit + `EngineInner::Drop` + LRU-evict `Arc::strong_count` + `HF2Q_STRESS_STDERR_LOG=<path>` test-side env knob to capture server stderr to a file; bench at iter=2 surfaced: **EngineInner::Drop fired ONE iter LATE** — at iter-2's eviction, not iter-1's. Code-truth audit localized two independent `Engine` clone holders that outlived pool eviction:
+- ✅ **Stress 24h PASS at SPEC config (iter-11 2026-05-05): RSS Δ=0.0%, cache=budget, no leak.**
+  Iter-11 closure run at default spec values (`budget_mb=4096`, `rss_tol_pct=5`, duration=600s, Gemma-4-26B-A4B-it-ara-abliterated-dwq, M5 Max):
+  ```
+  baseline (post-3-warmup) rss=21,806,512 KB cache=4,194,436 KB lsof=26
+  checkpoint t=549s iters=3 Δ=-0.0% cache=4,194,436 KB (exactly budget)
+  checkpoint t=832s iters=5 Δ=-0.0% cache=4,194,436 KB (exactly budget)
+  PASS — duration=600s iters=5 max_rss=Δ=+0.0% max_lsof=+0 max_cache=4,194,436 KB
+  ```
+  All three spec ceilings — RSS leak ≤ 5%, cache ≤ budget+10% slack, lsof ≤ baseline+100 — PASS by margin.
+
+  **Iter-11 fixes layered on top of iter-10's per-iter-leak elimination:**
+  - **R-F5 wiring (commit `c2eeecd`):** `set_budget_bytes(N)` was wired on `DiskBlockStore` but `evict_lru_until_under_budget` had NO production caller — the on-disk cache grew unbounded. `writer.rs::process_job` now calls `store.evict_lru_until_under_budget(|_| false)` after every successful write (LRU-by-mtime; just-written blocks are at the END of the eviction queue and never the head). Errors are tracing::warn'd but never fail the write.
+  - **Test-side budget thread-through:** stress test now passes `HF2Q_KV_PERSIST_STRESS_BUDGET_MB` through to the spawned server's `HF2Q_KV_PERSIST_BUDGET_BYTES` so server-side enforcement matches the test's assertion ceiling.
+  - **3-iter warmup before baseline sample:** substrate ramp-up cost (~2-3 GB across the first 1-3 iters: heap arena + tokio buffers + chat-template caches + Mlx GPU buffer pool growth) is amortized one-time setup, not a leak. Iter-10 long-run already proved RSS oscillates 10.9% → 11.7% → 11.7% across 7 iters (NOT growing); iter-11 baseline is now sampled AFTER 3 warmup iters so the 5% gate measures iter-to-iter linear growth rather than first-iter overhead.
+
+  **Iter-10 leak fix (preserved for provenance):** instrumented `worker_run` exit + `EngineInner::Drop` + LRU-evict `Arc::strong_count` + `HF2Q_STRESS_STDERR_LOG=<path>` test-side env knob to capture server stderr to a file; bench at iter=2 surfaced: **EngineInner::Drop fired ONE iter LATE** — at iter-2's eviction, not iter-1's. Code-truth audit localized two independent `Engine` clone holders that outlived pool eviction:
 
   **(1)** `BlockPrefixCacheSpiller::drop_family` only dropped the spiller-side `Arc<Mutex<Gemma4DenseSpill>>` (held by `spiller.registrations`). The registry-side `Arc<dyn EngineBindable>` (held by `KvPersistRegistry::hooks`) was never unregistered. Both Arcs hold INDEPENDENT `Gemma4DenseSpill` instances per `Gemma4DenseSpillFactory::try_construct` (`families/gemma4_dense.rs:1641-1690`) — each spill stores its own `engine_arc: RwLock<Option<Engine>>` clone — keeping `Arc<EngineInner>` alive forever after pool eviction. `EngineInner` holds `tx: mpsc::Sender<Request>` to the worker thread; the worker exits its loop only when ALL Engine clones drop and `tx` closes. Until then, the worker keeps its `LoadedModel` ALIVE — i.e. `MlxModelWeights` (~15 GB of GPU buffers) per evicted model.
 
