@@ -500,3 +500,221 @@ fn iter3_partial_prefix_byte_identity() {
         p_decoded_b.len()
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Iter-5 — R-C4-LCP 5-K-fraction byte-identity sweep (KILL-criterion).
+//
+// Per dossier §4.2 iter-5 row, this test sweeps 5 K fractions and
+// asserts byte-identity at each. Any single failure FALSIFIES Phase
+// E.a entirely; the env-gate must remain default-OFF until this test
+// passes for all fractions.
+//
+// Each K fraction is structured as (priming_prompt Q_k, probe_prompt
+// P_k) where:
+//   - K_k ≈ {N_min, N/4, N/2, 3N/4, N-1} where N = total prompt length.
+//   - LCP(Q_k, P_k) at the chat-template-rendered TOKEN level equals
+//     the first K_k tokens; P_k differs at position K_k.
+//   - All prompts have prompt_len < sliding_window=1024 (iter-3.5c
+//     prefill-wrap guard requires this for sliding-layer correctness;
+//     iter-3.6 will lift the restriction via mid-prefill snapshot).
+//
+// Cross-K interference management: each K fraction's pair is
+// distinguished by a unique sentinel-prefix ("K0:", "K1:", ...) so
+// the LCP probe between successive K fractions returns the sentinel-
+// prefix length only — well below the K_k of interest, so resume
+// engagement is dominated by intra-K-fraction matches.
+//
+// Cost: 1 server A spawn (resume on) + 1 server B spawn (control) +
+// 5 × 2 = 10 chat_decode calls = ~50s + ~10s = ~60s wall-time.
+// Operator-gated under HF2Q_KV_PERSIST_PHASE_D=1.
+
+const ITER5_FRACTION_PAIRS: &[(&str, &str)] = &[
+    // K_0 — small K (mostly differs early). Prompts share only the
+    // sentinel-prefix + a couple words.
+    (
+        "K0: The capital city is",
+        "K0: A different country is named differently and unique.",
+    ),
+    // K_1 — N/4 — share more, diverge ~25% in.
+    (
+        "K1: List in alphabetical order red green and",
+        "K1: List in alphabetical order red green or yellow always.",
+    ),
+    // K_2 — N/2 — share half before diverging.
+    (
+        "K2: The brown fox jumps over the lazy",
+        "K2: The brown fox jumps over the calm summer river quickly.",
+    ),
+    // K_3 — 3N/4 — large shared prefix, diverge near the end.
+    (
+        "K3: Once upon a time there lived a small village in the green",
+        "K3: Once upon a time there lived a small village in the desert mountains.",
+    ),
+    // K_4 — N-1 — only the last token differs (or close to it).
+    (
+        "K4: ABC DEF GHI JKL MNO PQR STU VWX YZ.",
+        "K4: ABC DEF GHI JKL MNO PQR STU VWX YZ!",
+    ),
+];
+
+const ITER5_MAX_TOKENS: u32 = 64;
+
+/// ADR-017 Phase E option (a) iter-5 — R-C4-LCP 5-K-fraction byte-
+/// identity sweep (KILL-criterion).
+///
+/// For each K fraction:
+///   1. Server A (resume on): send Q_k (primes registry), then send
+///      P_k (registry hit, resume engages with K = LCP).
+///   2. Server B (control, no resume): send P_k directly (fresh
+///      prefill).
+///   3. Assert server_A_decoded(P_k) == server_B_decoded(P_k) byte-
+///      identical.
+///   4. Track cumulative `hf2q_kv_lcp_detected_total` from server A's
+///      /metrics; assert it grows monotonically (≥ k+1 detections by
+///      end of fraction k).
+///
+/// Falsifier: any single fraction's byte-identity check fails →
+/// PANIC, Phase E.a is FALSIFIED, env-gate must stay default-OFF.
+#[test]
+fn iter5_r_c4_lcp_5_fraction_sweep() {
+    let model_path = match resolve_model_path_or_skip() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[iter-5 sweep] {ENV_PHASE_D_GATE}=1 not set — short-circuit. \
+                 Set {ENV_PHASE_D_GATE}=1 + {ENV_MODEL_PATH}=PATH to run."
+            );
+            return;
+        }
+    };
+    let bin = hf2q_binary_path();
+    assert!(
+        bin.exists(),
+        "[iter-5 sweep] hf2q binary not found at {} — \
+         did `cargo build --release` run?",
+        bin.display()
+    );
+
+    // ── Server A: resume path under test (single instance for all fractions) ──
+    let server_a = spawn_server(
+        &bin,
+        &model_path,
+        PORT_A,
+        &[("HF2Q_KV_LCP_RESUME", "1")],
+    );
+    wait_for_readyz(&server_a);
+    let canonical_a = fetch_canonical_model_id(&server_a);
+    eprintln!(
+        "[iter-5 sweep] server A (LCP_RESUME=1) ready on {}:{} model={}",
+        HOST, PORT_A, canonical_a
+    );
+
+    // Run all 5 fractions on server A (registry capacity=1 means each
+    // fraction's P_k store evicts the prior; sentinel-prefix
+    // distinguishes fractions to manage cross-K interference).
+    let mut server_a_decoded: Vec<String> = Vec::with_capacity(ITER5_FRACTION_PAIRS.len());
+    let mut prior_detected: u64 = 0;
+    for (frac_idx, (prime, probe)) in ITER5_FRACTION_PAIRS.iter().enumerate() {
+        let _q_decoded = chat_decode(&server_a, &canonical_a, prime, ITER5_MAX_TOKENS);
+        let p_decoded = chat_decode(&server_a, &canonical_a, probe, ITER5_MAX_TOKENS);
+        assert!(
+            !p_decoded.is_empty(),
+            "[iter-5 sweep] fraction {}: P decoded empty on server A",
+            frac_idx
+        );
+        // Engagement: probe should have detected on at least the
+        // post-prime LCP. Total detected counter monotonic.
+        let metrics = fetch_metrics(&server_a);
+        let now_detected = metric_lcp_detected_total(&metrics);
+        assert!(
+            now_detected > prior_detected,
+            "[iter-5 sweep] fraction {}: lcp_detected_total did not advance \
+             (prior={}, now={}). Either probe didn't engage, or sentinel-\
+             prefix design failed. Test invariant violated.",
+            frac_idx,
+            prior_detected,
+            now_detected
+        );
+        eprintln!(
+            "[iter-5 sweep] fraction {}: server A P decoded {} bytes \
+             (lcp_detected_total: {} → {})",
+            frac_idx,
+            p_decoded.len(),
+            prior_detected,
+            now_detected
+        );
+        prior_detected = now_detected;
+        server_a_decoded.push(p_decoded);
+    }
+    drop(server_a);
+
+    // ── Server B: control (no resume; single instance for all fractions) ──
+    let server_b = spawn_server(&bin, &model_path, PORT_B, &[]);
+    wait_for_readyz(&server_b);
+    let canonical_b = fetch_canonical_model_id(&server_b);
+    eprintln!(
+        "[iter-5 sweep] server B (control, no resume) ready on {}:{} model={}",
+        HOST, PORT_B, canonical_b
+    );
+
+    // Send each P_k to server B and capture decoded bytes for
+    // byte-identity comparison.
+    let mut all_pass = true;
+    for (frac_idx, (_prime, probe)) in ITER5_FRACTION_PAIRS.iter().enumerate() {
+        let p_decoded_b = chat_decode(&server_b, &canonical_b, probe, ITER5_MAX_TOKENS);
+        assert!(
+            !p_decoded_b.is_empty(),
+            "[iter-5 sweep] fraction {}: P decoded empty on server B",
+            frac_idx
+        );
+        let p_decoded_a = &server_a_decoded[frac_idx];
+        if *p_decoded_a != p_decoded_b {
+            all_pass = false;
+            let common_prefix = p_decoded_a
+                .as_bytes()
+                .iter()
+                .zip(p_decoded_b.as_bytes())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let snippet_a = p_decoded_a
+                .get(common_prefix..common_prefix.saturating_add(80))
+                .unwrap_or("")
+                .to_string();
+            let snippet_b = p_decoded_b
+                .get(common_prefix..common_prefix.saturating_add(80))
+                .unwrap_or("")
+                .to_string();
+            eprintln!(
+                "[iter-5 sweep] FRACTION {} FAIL — diverge at byte={} \
+                 (A.len={} bytes, B.len={} bytes)\n\
+                 A @ {}: {:?}\n  B @ {}: {:?}",
+                frac_idx,
+                common_prefix,
+                p_decoded_a.len(),
+                p_decoded_b.len(),
+                common_prefix,
+                snippet_a,
+                common_prefix,
+                snippet_b
+            );
+        } else {
+            eprintln!(
+                "[iter-5 sweep] fraction {} PASS — A == B byte-identical \
+                 ({} bytes)",
+                frac_idx,
+                p_decoded_a.len()
+            );
+        }
+    }
+
+    assert!(
+        all_pass,
+        "[iter-5 sweep] FAIL — at least one K fraction's byte-identity \
+         check failed. Phase E.a R-C4-LCP KILL-CRITERION TRIGGERED. \
+         Env-gate must stay default-OFF until divergence is root-caused."
+    );
+    eprintln!(
+        "[iter-5 sweep] ALL 5 FRACTIONS PASS — Phase E.a R-C4-LCP \
+         byte-identity verified across K ∈ {{small, N/4, N/2, 3N/4, N-1}}."
+    );
+}

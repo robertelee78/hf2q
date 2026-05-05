@@ -674,11 +674,27 @@ impl MlxModelWeights {
                         num_layers
                     );
                 }
+                // Iter-5 sweep finding (2026-05-05): the prior code
+                // used `cached_arcs.get(layer_idx).cloned()` to obtain
+                // each per-layer Arc, which clones the Arc and bumps
+                // strong_count to 2 — `Arc::try_unwrap` THEN fails
+                // unconditionally on the second sequential resume in a
+                // process. The iter-3 K<N falsifier didn't catch this
+                // because it engaged resume only ONCE; iter-5's
+                // 5-K-fraction sweep exercises 5 sequential resumes
+                // and surfaces the bug on fraction 1.
+                //
+                // Fix: drain `cached_arcs` via `into_iter()` so each
+                // Arc is MOVED (no clone), preserving strong_count=1
+                // at try_unwrap time. The order-preserving drain
+                // matches the per-layer iteration order of
+                // `self.layers`.
                 let mut v: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
+                let mut cached_iter = cached_arcs.into_iter();
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
                     let layer_is_ring = layer.layer_type == LayerType::Sliding;
                     let required_cap = if layer_is_ring { sw } else { linear_capacity };
-                    let cached_arc = cached_arcs.get(layer_idx).cloned().ok_or_else(|| {
+                    let cached_arc = cached_iter.next().ok_or_else(|| {
                         anyhow::anyhow!(
                             "forward_prefill resume: missing cached dense_kvs[layer={}]",
                             layer_idx

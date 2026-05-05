@@ -4479,30 +4479,73 @@ fn generate_once_with_soft_tokens(
     // when env-gates are off (no snapshot was taken; iter-2
     // observability-only mode), OR on the embedding-only path where
     // forward_prefill_embedding doesn't populate it.
+    //
+    // ADR-017 Phase E.a iter-3.5c — sliding-layer prefill-wrap guard.
+    //
+    // The end-of-prefill snapshot fixes DECODE-WRAP (decode mutates
+    // live buffers; snapshot is taken before decode runs). It does
+    // NOT fix PREFILL-WRAP: when `prompt_len > sliding_window`, the
+    // sliding ring wraps DURING prefill itself. The snapshot then
+    // captures the FINAL ring state — slots representing positions
+    // `[N-sw..N)`, not `[0..N)`. A future LCP resume at K<N would
+    // expect slots to represent `[0..K)` (P's shared prefix tokens);
+    // mismatch corrupts P's attention output.
+    //
+    // The dossier §3.4 argues sliding LCP > sw is "safe" but its
+    // argument assumes the cache was stored AT position LCP (mid-
+    // prefill); my impl stores at end-of-Q's-prefill. Different
+    // states. Per mantra "Never trust comments over code"; the code
+    // says "skip store on prefill wrap until iter-3.6 implements
+    // mid-prefill snapshot or rotated-ring resume".
+    //
+    // Skip the LCP store when the model has any sliding layer AND
+    // `prompt_len > sliding_window`. Pure-dense (global-only) models
+    // have linear-capacity buffers (max_position_embeddings, ~262144
+    // for Gemma 4) that don't wrap; for those, prefill-wrap doesn't
+    // exist. v1 limitation: long-prompt LCP hits skipped when sliding
+    // layers are present. Multi-turn chat with prompts ≤ sw still
+    // benefits.
     if soft_tokens.is_empty() {
         if let Some(snapshot) = loaded.weights.dense_kvs_snapshot_for_lcp.take() {
-            let lcp_key = build_lcp_key_for_request(loaded, params);
             let sliding_window = loaded.weights.sliding_window.max(1);
-            let linear_capacity = prompt_len + params.max_tokens.max(1);
+            let has_sliding_layer = loaded.weights.layers.iter().any(|l| {
+                matches!(l.layer_type, crate::serve::config::LayerType::Sliding)
+            });
+            // iter-3.5c prefill-wrap guard — distinct from iter-3 v1's
+            // decode-wrap guard (which iter-3.5b removed).
+            let prefill_safe = !has_sliding_layer || prompt_len <= sliding_window;
             // The `physical_decode_writes` counter is no longer
-            // load-bearing for the wrap guard (snapshot makes the
-            // guard unnecessary), but we keep it as a debug-only
-            // counter for /metrics scrape compatibility.
+            // load-bearing for the (decode-)wrap guard (snapshot
+            // makes the iter-3 v1 guard unnecessary); kept as a
+            // debug-only counter.
             let _ = physical_decode_writes;
-            match loaded.lcp_registry.store(
-                lcp_key,
-                prompt_tokens.to_vec(),
-                snapshot,
-                sliding_window,
-                linear_capacity,
-            ) {
-                Ok(()) => {}
-                Err(e) => {
-                    tracing::debug!(
-                        "lcp_registry.store rejected (unexpected): {:?}",
-                        e
-                    );
+            if prefill_safe {
+                let lcp_key = build_lcp_key_for_request(loaded, params);
+                let linear_capacity = prompt_len + params.max_tokens.max(1);
+                match loaded.lcp_registry.store(
+                    lcp_key,
+                    prompt_tokens.to_vec(),
+                    snapshot,
+                    sliding_window,
+                    linear_capacity,
+                ) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            "lcp_registry.store rejected (unexpected): {:?}",
+                            e
+                        );
+                    }
                 }
+            } else {
+                tracing::debug!(
+                    "lcp_registry.store skipped: prefill-wrap guard \
+                     (prompt_len={} > sliding_window={}; iter-3.5c \
+                     correctness preserves byte-identity for sliding \
+                     layers — iter-3.6 mid-prefill snapshot lifts this)",
+                    prompt_len,
+                    sliding_window
+                );
             }
         }
     }
@@ -6969,16 +7012,30 @@ fn generate_stream_once(
     let _ = physical_decode_writes; // retained debug counter
     if soft_tokens.is_empty() {
         if let Some(snapshot) = loaded.weights.dense_kvs_snapshot_for_lcp.take() {
-            let lcp_key = build_lcp_key_for_request(loaded, params);
             let sliding_window = loaded.weights.sliding_window.max(1);
-            let linear_capacity = prompt_tokens.len() + params.max_tokens.max(1);
-            let _ = loaded.lcp_registry.store(
-                lcp_key,
-                prompt_tokens.to_vec(),
-                snapshot,
-                sliding_window,
-                linear_capacity,
-            );
+            let has_sliding_layer = loaded.weights.layers.iter().any(|l| {
+                matches!(l.layer_type, crate::serve::config::LayerType::Sliding)
+            });
+            // iter-3.5c prefill-wrap guard (mirrors non-streaming).
+            let prefill_safe = !has_sliding_layer || prompt_tokens.len() <= sliding_window;
+            if prefill_safe {
+                let lcp_key = build_lcp_key_for_request(loaded, params);
+                let linear_capacity = prompt_tokens.len() + params.max_tokens.max(1);
+                let _ = loaded.lcp_registry.store(
+                    lcp_key,
+                    prompt_tokens.to_vec(),
+                    snapshot,
+                    sliding_window,
+                    linear_capacity,
+                );
+            } else {
+                tracing::debug!(
+                    "lcp_registry.store skipped (streaming): prefill-wrap \
+                     guard (prompt_len={} > sliding_window={})",
+                    prompt_tokens.len(),
+                    sliding_window
+                );
+            }
         }
     }
 }
