@@ -61,5 +61,12 @@ pub mod serve {
         pub mod recovery;
         #[path = "../../serve/kv_persist/writer.rs"]
         pub mod writer;
+        // ADR-017 Phase E option (a) iter-1 (2026-05-05): standalone
+        // LCP registry. Pure-data-structure module with no Metal /
+        // multi_model / api dependencies — qualifies for the narrow
+        // lib facade. Exposed so `tests/lcp_registry_unit.rs` can
+        // import it.
+        #[path = "../../serve/kv_persist/lcp_registry.rs"]
+        pub mod lcp_registry;
     }
 }

@@ -19,6 +19,13 @@ pub mod cache_ops;
 pub mod families;
 pub mod format;
 pub mod index;
+// ADR-017 Phase E option (a) iter-1 (2026-05-05): standalone LCP
+// (longest common prefix) registry. NOT yet wired into the request
+// flow — that's iter-2 / iter-3 scope. This iter ships only the
+// pure-data-structure substrate + 12 unit tests pinning the
+// correctness invariants identified in the research dossier at
+// `docs/research/adr017-phase-e-option-a-2026-05-05.md` §9 + §10.
+pub mod lcp_registry;
 pub mod loader_wrapper;
 pub mod metrics;
 pub mod prompt_cache_persist;
