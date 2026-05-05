@@ -472,6 +472,13 @@ mod phase_d_driver {
         pub fn log_tail(&self) -> Vec<String> {
             self.stderr_tail.lock().map(|g| g.clone()).unwrap_or_default()
         }
+        /// ADR-017 Closure iter-2 (2026-05-04): non-blocking child
+        /// status check for `wait_for_graceful_exit`. Returns
+        /// `Some(exit_status)` if the child has exited, `None` if
+        /// still running, `Err` only on lower-level wait failure.
+        pub fn try_wait_child(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            self.child.try_wait()
+        }
     }
 
     impl Drop for ServerGuard {
@@ -604,6 +611,80 @@ mod phase_d_driver {
             waited_secs: started.elapsed().as_secs(),
             last,
         })
+    }
+
+    /// ADR-017 Closure iter-2 (2026-05-04): trigger graceful
+    /// shutdown via `POST /shutdown`. The handler raises SIGTERM on
+    /// the server process, which causes the cmd_serve drain logic
+    /// (`drain_loaded_models_to_disk`) to evict every loaded model
+    /// and flush KV blocks to disk before the process exits.
+    ///
+    /// Returns the JSON receipt body (status, pid, queue depth) on
+    /// 202 Accepted. Caller should subsequently call
+    /// `wait_for_graceful_exit` to block until the process actually
+    /// terminates (the drain runs after this response).
+    pub fn trigger_graceful_shutdown(
+        server: &ServerGuard,
+    ) -> Result<serde_json::Value, DriverError> {
+        let url = format!(
+            "http://{}:{}/shutdown",
+            server.host(),
+            server.port()
+        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| DriverError::Transport(e.to_string()))?;
+        let resp = client
+            .post(&url)
+            .send()
+            .map_err(|e| DriverError::Transport(e.to_string()))?;
+        let status = resp.status().as_u16();
+        // 202 Accepted is the expected response per the handler;
+        // accept 200 too in case a future iter changes the code.
+        if !(200..300).contains(&status) {
+            let body = resp.text().unwrap_or_else(|_| "<unreadable>".into());
+            return Err(DriverError::Http { status, body });
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .map_err(|e| DriverError::Transport(e.to_string()))?;
+        Ok(body)
+    }
+
+    /// ADR-017 Closure iter-2 (2026-05-04): block until the server
+    /// process exits, with a timeout. Pairs with
+    /// `trigger_graceful_shutdown` for tests that want to verify
+    /// the drain ran AND the process is gone before launching a
+    /// successor. Polls `Child::try_wait` every 50 ms.
+    pub fn wait_for_graceful_exit(
+        server: &mut ServerGuard,
+        timeout: Duration,
+    ) -> Result<std::process::ExitStatus, DriverError> {
+        let start = Instant::now();
+        loop {
+            match server.try_wait_child() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        return Err(DriverError::ReadyzTimeout {
+                            waited_secs: start.elapsed().as_secs(),
+                            last: format!(
+                                "child still alive after {} s; \
+                                 graceful drain may have stalled",
+                                start.elapsed().as_secs()
+                            ),
+                        });
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    return Err(DriverError::Transport(format!(
+                        "try_wait_child: {e}"
+                    )));
+                }
+            }
+        }
     }
 
     /// Fetch the canonical model id from `/v1/models` so subsequent
@@ -2581,7 +2662,7 @@ fn kv_persist_phase_d_r_p5_e2e() {
 
     // ----- Server #1: no-cache decode (primes the on-disk cache) -----
     let no_cache_ttft = {
-        let server1 = phase_d_driver::spawn_hf2q_serve_with_kv_persist(
+        let mut server1 = phase_d_driver::spawn_hf2q_serve_with_kv_persist(
             &bin,
             &model_path,
             &cache_dir,
@@ -2618,16 +2699,60 @@ fn kv_persist_phase_d_r_p5_e2e() {
              (prompt_tokens={:?}, total_tokens={})",
             cap.ttft_ms, cap.prompt_tokens, cap.total_tokens
         );
-        // Server #1 is killed by ServerGuard's Drop on scope exit. The
-        // explicit Drop semantics are what wipe the in-RAM KV pool —
-        // the next server process must rebuild from disk.
+
+        // ADR-017 Closure iter-2 (2026-05-04): trigger graceful
+        // shutdown so the cmd_serve drain logic walks the loaded
+        // pool, fires `pre_evict` per entry, and flushes the async
+        // writer queue BEFORE the process exits. Without this the
+        // ServerGuard::Drop SIGKILL bypasses the spiller and the
+        // cache_dir stays empty (R-P5 ratio ≈ 1.0 — see ADR-017
+        // §"Phase D Closure iter-1" finding).
+        let receipt = phase_d_driver::trigger_graceful_shutdown(&server1)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "[Phase D R-P5] server #1 POST /shutdown failed: {e}\n\
+                     --- hf2q serve stderr_tail ({} lines) ---\n{}",
+                    server1.log_tail().len(),
+                    server1.log_tail().join("\n"),
+                )
+            });
+        eprintln!(
+            "[Phase D R-P5] server #1 /shutdown receipt: {}",
+            serde_json::to_string(&receipt).unwrap_or_else(|_| "<unserializable>".into())
+        );
+
+        // Wait for server #1 to actually exit (drain runs after the
+        // /shutdown response). Budget includes time for the spiller
+        // to flush all KV blocks: at L=32K with ~128 blocks × 1 MiB
+        // and ~500 ms APFS write+fsync per block (per ADR-017 B-F1
+        // measurement), full drain bound ≈ 70 s; 120 s gives 1.7×
+        // headroom.
+        let exit_status = phase_d_driver::wait_for_graceful_exit(
+            &mut server1,
+            std::time::Duration::from_secs(120),
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "[Phase D R-P5] server #1 did not exit gracefully: {e}\n\
+                 --- hf2q serve stderr_tail ({} lines) ---\n{}",
+                server1.log_tail().len(),
+                server1.log_tail().join("\n"),
+            )
+        });
+        eprintln!(
+            "[Phase D R-P5] server #1 exited gracefully: status={:?}",
+            exit_status
+        );
+        // ServerGuard::Drop will call child.kill() + child.wait() on
+        // scope exit; both are harmless on an already-exited process
+        // (kill returns ESRCH which we ignore).
         cap.ttft_ms
     };
 
     // Briefly wait for the OS to release the listening port before
-    // server #2 attempts to bind it. ServerGuard::Drop calls
-    // child.kill() + child.wait() but TIME_WAIT on the listening
-    // socket can linger ~1s on macOS.
+    // server #2 attempts to bind it. The graceful exit above already
+    // closed the listening socket, but TIME_WAIT on macOS can linger
+    // ~1 s after process exit.
     std::thread::sleep(std::time::Duration::from_millis(2000));
 
     // ----- Server #2: cold-process resume — reads cache from disk -----

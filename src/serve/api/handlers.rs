@@ -6916,6 +6916,87 @@ pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 // ---------------------------------------------------------------------------
+// POST /shutdown — ADR-017 Closure iter-2 (2026-05-04)
+// ---------------------------------------------------------------------------
+
+/// Handler for `POST /shutdown` (ADR-017 Closure iter-2). Triggers
+/// graceful server shutdown by raising `SIGTERM` on the current
+/// process; the existing `cmd_serve` post-`axum::serve` block then
+/// runs [`crate::serve::drain_loaded_models_to_disk`] to flush every
+/// loaded model's KV cache to disk before the process exits.
+///
+/// **Why this exists (Option β chosen 2026-05-04):** there is exactly
+/// one drain implementation. SIGTERM / SIGINT (Ctrl-C, `kill <pid>`,
+/// `systemctl stop`, `launchctl stop`) all converge on
+/// `drain_loaded_models_to_disk`. This HTTP endpoint exists as an
+/// alternative trigger surface for orchestrators that prefer HTTP
+/// (k8s pre-stop hooks, monitoring tooling, the ADR-017 R-P5 test
+/// harness — which needs deterministic completion + a JSON receipt).
+/// The handler's body is a thin wrapper: it logs, snapshots the
+/// current spiller queue depth (informational only), then raises
+/// SIGTERM. axum's graceful-shutdown waits for this response to
+/// finish before stopping new connections, so the JSON receipt is
+/// always delivered.
+///
+/// **Returns 202 Accepted (not 200 OK)** because the drain has not
+/// completed at response time — it runs after axum stops accepting
+/// new requests. Operators / tests can poll for actual exit by
+/// observing `Child::try_wait()` or by waiting for a connection
+/// refused on the listening port. The JSON body reports the
+/// pre-shutdown queue depth as a sanity check (zero indicates no
+/// pending writes; non-zero indicates the spiller is mid-flight).
+///
+/// **Off-path (no `--kv-persist`):** still returns 202 + raises
+/// SIGTERM; the drain helper short-circuits to a no-op when
+/// `state.kv_spiller` is `None`. The endpoint stays useful for
+/// graceful-engine-shutdown semantics even without kv-persist.
+pub async fn shutdown(State(state): State<AppState>) -> Response {
+    state
+        .metrics
+        .requests_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let pre_shutdown_queue_depth = state
+        .kv_spiller
+        .as_ref()
+        .map(|sp| sp.pending_writer_queue_depth())
+        .unwrap_or(0);
+    let kv_persist_enabled = state.kv_spiller.is_some();
+    let pid = std::process::id();
+
+    tracing::info!(
+        pid = pid,
+        kv_persist_enabled = kv_persist_enabled,
+        pre_shutdown_queue_depth = pre_shutdown_queue_depth,
+        "ADR-017: POST /shutdown received; raising SIGTERM"
+    );
+
+    // SAFETY: libc::raise is async-signal-safe and operates on the
+    // current process. No FFI invariants beyond passing a valid signal
+    // number; SIGTERM (15) is defined on every supported platform.
+    let raise_rc = unsafe { libc::raise(libc::SIGTERM) };
+    let raise_ok = raise_rc == 0;
+    if !raise_ok {
+        let errno = std::io::Error::last_os_error();
+        tracing::warn!(
+            errno = %errno,
+            "ADR-017: libc::raise(SIGTERM) returned non-zero; \
+             graceful-shutdown drain may not run"
+        );
+    }
+
+    let body = serde_json::json!({
+        "status": "accepted",
+        "pid": pid,
+        "kv_persist_enabled": kv_persist_enabled,
+        "pre_shutdown_queue_depth": pre_shutdown_queue_depth,
+        "raise_sigterm_rc": raise_rc,
+        "note": "graceful drain runs after this response; poll for process exit",
+    });
+    (StatusCode::ACCEPTED, Json(body)).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // GET /v1/models + GET /v1/models/:id
 // ---------------------------------------------------------------------------
 

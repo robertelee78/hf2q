@@ -559,6 +559,27 @@ pub struct AppState {
     /// Wired by `cmd_serve` after `DiskBlockStore::new_with_index`
     /// returns, via [`Self::with_kv_disk_store`].
     pub kv_disk_store: Option<Arc<crate::serve::kv_persist::DiskBlockStore>>,
+    /// ADR-017 Closure iter-2 (2026-05-04): the live
+    /// `BlockPrefixCacheSpiller` constructed in `cmd_serve` when
+    /// `--kv-persist` is enabled. Held here (concrete type, not
+    /// trait object) so `drain_loaded_models_to_disk` (graceful-
+    /// shutdown spill) can poll
+    /// [`BlockPrefixCacheSpiller::pending_writer_queue_depth`] to
+    /// know when the async writer queue has drained. The same `Arc`
+    /// is also wired into `HotSwapManager::new_with_spiller` (as a
+    /// trait object) so the eviction trigger sites at
+    /// `multi_model.rs:1090, 1189` keep working unchanged.
+    ///
+    /// `None` when `--kv-persist` is absent (kv-persist substrate is
+    /// opt-in per Phase C.1); the graceful-shutdown drain becomes a
+    /// no-op in that mode.
+    pub kv_spiller: Option<
+        Arc<
+            crate::serve::kv_persist::BlockPrefixCacheSpiller<
+                crate::serve::api::engine::Engine,
+            >,
+        >,
+    >,
 }
 
 /// BERT embedding model, discovered from `--embedding-model <path>` at
@@ -740,6 +761,11 @@ impl AppState {
             // ADR-017 §R-F7: gauge source wired post-construction by
             // `cmd_serve` once `--kv-persist` builds the substrate.
             kv_disk_store: None,
+            // ADR-017 Closure iter-2: graceful-shutdown spiller handle
+            // wired post-construction by `cmd_serve` when `--kv-persist`
+            // builds the substrate; otherwise None and the drain is a
+            // no-op.
+            kv_spiller: None,
         })
     }
 
@@ -801,6 +827,9 @@ impl AppState {
             // exercise the gauge surface; default `None` keeps router
             // unit tests independent of the kv-persist substrate.
             kv_disk_store: None,
+            // ADR-017 Closure iter-2: tests start without a spiller; the
+            // shutdown drain is a no-op for the test path.
+            kv_spiller: None,
         }
     }
 
@@ -822,6 +851,26 @@ impl AppState {
         store: Arc<crate::serve::kv_persist::DiskBlockStore>,
     ) -> Self {
         self.kv_disk_store = Some(store);
+        self
+    }
+
+    /// ADR-017 Closure iter-2 (2026-05-04): attach the live
+    /// `BlockPrefixCacheSpiller` so the graceful-shutdown drain
+    /// (`drain_loaded_models_to_disk`) can poll
+    /// [`BlockPrefixCacheSpiller::pending_writer_queue_depth`] until
+    /// the async writer queue has drained. Called by `cmd_serve`
+    /// after the spiller substrate is constructed; off-path (no
+    /// `--kv-persist`) leaves this `None` and the drain becomes a
+    /// no-op (logs `kv-persist not enabled; skipping drain`).
+    pub fn with_kv_spiller(
+        mut self,
+        spiller: Arc<
+            crate::serve::kv_persist::BlockPrefixCacheSpiller<
+                crate::serve::api::engine::Engine,
+            >,
+        >,
+    ) -> Self {
+        self.kv_spiller = Some(spiller);
         self
     }
 

@@ -42,6 +42,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/models/:model_id", get(handlers::get_model))
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route("/v1/embeddings", post(handlers::embeddings))
+        // ADR-017 Closure iter-2 (2026-05-04): graceful-shutdown
+        // trigger via HTTP. Calls `libc::raise(SIGTERM)` on itself
+        // so the same signal-driven drain path runs (single drain
+        // implementation; orchestrators that prefer HTTP get the
+        // same semantics as `kill <pid>`).
+        .route("/shutdown", post(handlers::shutdown))
         .fallback(fallback)
         // Apply layers outside-in. The axum convention is `.layer()` wraps,
         // so the last `.layer(X)` call becomes the outermost layer.

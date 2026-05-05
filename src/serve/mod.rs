@@ -3073,14 +3073,23 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             HotSwapManager::new_with_spiller(
                 pool,
                 loader_for_manager,
-                spiller as Arc<dyn crate::serve::multi_model::KvSpiller<api::engine::Engine>>,
+                Arc::clone(&spiller)
+                    as Arc<dyn crate::serve::multi_model::KvSpiller<api::engine::Engine>>,
             );
         manager.set_kv_counters(Arc::clone(&state.kv_spill_counters));
         state.pool = Arc::new(std::sync::RwLock::new(manager));
+        // ADR-017 Closure iter-2 (2026-05-04): expose the concrete
+        // spiller to the graceful-shutdown drain helper. The Arc is
+        // also held inside HotSwapManager (as a trait object) so the
+        // eviction trigger sites at multi_model.rs:1090,1189 keep
+        // working unchanged. Holding both references is intentional —
+        // shutdown drain needs concrete-type methods
+        // (`pending_writer_queue_depth`) the trait does not expose.
+        state.kv_spiller = Some(spiller);
 
         tracing::info!(
             cache_dir = %cache_dir.display(),
-            "ADR-017 C.1: kv-persist spiller substrate wired into HotSwapManager"
+            "ADR-017 C.1: kv-persist spiller substrate wired into HotSwapManager + AppState"
         );
 
         Some(wrapper)
@@ -3489,20 +3498,22 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             .context("axum::serve")?;
 
         // Axum has stopped accepting + drained in-flight HTTP responses.
-        // Each in-flight handler that called `engine.generate*` has already
-        // received its reply.  Iter-209: with the pool replacing the
-        // single-slot Option<Engine>, we shut down EVERY pooled engine in
-        // parallel (each owns a separate worker thread + its own GPU
-        // resources).  Without this, the tokio runtime drops at the
-        // bottom of `block_on` and the `mpsc::Sender` to each worker is
-        // closed implicitly; the worker exits its loop on the next
+        // Each in-flight handler that called `engine.generate*` has
+        // already received its reply.  Iter-209: with the pool replacing
+        // the single-slot Option<Engine>, we shut down EVERY pooled
+        // engine in parallel (each owns a separate worker thread + its
+        // own GPU resources).  Without this, the tokio runtime drops at
+        // the bottom of `block_on` and the `mpsc::Sender` to each worker
+        // is closed implicitly; the worker exits its loop on the next
         // `blocking_recv`, but a mid-decode generation gets cut off
         // rather than running to its natural finish_reason.
         //
-        // We snapshot the engine handles under the read lock, then drop
-        // the lock before awaiting (await-while-holding-RwLock would
-        // deadlock if any handler held it).  The pool itself is then
-        // cleared so refcounts drop deterministically.
+        // ORDERING (ADR-017 Closure iter-2): snapshot engine Arcs
+        // FIRST, then run the KV-cache drain (which evicts entries from
+        // the pool's manager, dropping its Arcs — the snapshot keeps
+        // the engines alive through the drain). After drain, run
+        // explicit `engine.shutdown().await` per snapshot Arc to clean
+        // up the worker threads.
         let shutdown_engines: Vec<_> = state_for_warmup
             .pool
             .read()
@@ -3514,6 +3525,33 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
                     .collect()
             })
             .unwrap_or_default();
+
+        // ADR-017 Closure iter-2 (2026-05-04): graceful-shutdown spill.
+        // SIGTERM / SIGINT (or `POST /shutdown`, which calls
+        // `libc::raise(SIGTERM)` on itself — see
+        // `api::handlers::shutdown`) fired the signal that
+        // `shutdown_signal()` was awaiting.  Now walk the loaded pool,
+        // fire `pre_evict` per entry to push block-aligned KV state
+        // into the async writer queue, and poll until the writer
+        // drains (or 30 s elapses).  Without this the in-memory KV
+        // cache is silently lost across server restarts — breaks
+        // Ctrl+C / `systemctl stop` / deploy semantics, and makes
+        // ADR-017 R-P5 ("ssd_cold_post_restart" cache state)
+        // unreachable without a prior model-swap eviction.  Off-path
+        // (no `--kv-persist`) `state.kv_spiller` is `None` and the
+        // helper returns immediately with an all-zero summary.
+        let drain_summary = drain_loaded_models_to_disk(
+            &state_for_warmup,
+            std::time::Duration::from_secs(30),
+        );
+        tracing::info!(
+            evicted = drain_summary.evicted,
+            drain_ms = drain_summary.drain_ms,
+            queue_depth_at_exit = drain_summary.queue_depth_at_exit,
+            timed_out = drain_summary.timed_out,
+            "ADR-017 graceful-shutdown KV-cache drain complete"
+        );
+
         for engine in shutdown_engines {
             match engine.shutdown().await {
                 Ok(()) => tracing::info!("hf2q-engine worker joined"),
@@ -3533,6 +3571,138 @@ fn system_fingerprint() -> String {
     // added via a build.rs; for now the pkg version + backend is sufficient
     // identity for OpenAI's `system_fingerprint` contract.
     format!("hf2q-{}-mlx-native", env!("CARGO_PKG_VERSION"))
+}
+
+/// ADR-017 Closure iter-2 (2026-05-04): summary of the
+/// graceful-shutdown KV-cache drain returned by
+/// [`drain_loaded_models_to_disk`]. Logged at INFO and surfaced to
+/// HTTP callers via the `POST /shutdown` handler so monitoring / CI
+/// pipelines can confirm the cache state at exit.
+#[derive(Debug, Clone, Default)]
+pub struct ShutdownDrainSummary {
+    /// Number of `(repo, quant)` pool entries that received a
+    /// `pre_evict` call. Each evicted entry's spill outcome is
+    /// already counted in `hf2q_pool_kv_spills_total{outcome=...}`
+    /// by the existing trigger sites; this field is the raw count
+    /// of `pre_evict` invocations regardless of per-entry outcome.
+    pub evicted: usize,
+    /// Wall-time milliseconds from the first `evict` call to the
+    /// final `pending_writer_queue_depth() == 0` observation (or
+    /// to the timeout deadline, whichever came first).
+    pub drain_ms: u64,
+    /// Writer queue depth observed at function exit. `0` indicates
+    /// a clean drain; non-zero indicates the timeout fired before
+    /// the async writer caught up (operator should bump
+    /// `--shutdown-drain-secs` or investigate writer-thread
+    /// throughput).
+    pub queue_depth_at_exit: usize,
+    /// `true` if the drain hit the deadline before the queue
+    /// emptied. Off-path (no kv-persist) returns `false` (queue
+    /// trivially empty, no timeout possible).
+    pub timed_out: bool,
+}
+
+/// ADR-017 Closure iter-2 (2026-05-04): graceful-shutdown KV-cache
+/// drain. Walks the loaded pool, fires `pre_evict` on every entry
+/// to flush block-aligned K/V state into the async writer queue,
+/// then polls [`BlockPrefixCacheSpiller::pending_writer_queue_depth`]
+/// until it reaches zero or `timeout` elapses.
+///
+/// **Why this exists (Chesterton's fence read of ADR-017's R-F2):**
+/// the spiller's only production trigger sites are eviction-driven
+/// (`MultiModelManager::evict` at `multi_model.rs:1090`, LRU-driven
+/// admission evict at `:1189`). There is no in-flight write-through,
+/// no periodic background flush, no graceful-shutdown spill in the
+/// pre-iter-2 architecture. So a `kill <pid>` / Ctrl-C / deploy
+/// silently discards the entire in-memory KV cache, and ADR-017
+/// R-P5 ("ssd_cold_post_restart" cache state) is unreachable
+/// without a prior model-swap eviction. This drain closes that gap
+/// at the graceful-shutdown boundary.
+///
+/// Called from two paths that converge on the same drain semantics
+/// (Option β chosen 2026-05-04):
+/// 1. `cmd_serve`'s post-`axum::serve` block — runs after SIGTERM /
+///    Ctrl-C / SIGINT delivery + axum's graceful-shutdown path.
+///    Catches `kill <pid>`, `Ctrl-C`, `systemctl stop`,
+///    `launchctl stop`.
+/// 2. `POST /shutdown` HTTP handler — calls `libc::raise(SIGTERM)`
+///    on itself so the same signal-driven path runs. This gives
+///    orchestrators that prefer HTTP (k8s pre-stop hooks, monitoring
+///    tooling, R-P5 test harness) the same drain semantics as Unix
+///    signals.
+///
+/// **Off-path (no `--kv-persist`):** `state.kv_spiller` is `None`
+/// and this function returns immediately with an all-zero
+/// `ShutdownDrainSummary`. The pool is NOT evicted in that case —
+/// the existing post-axum engine.shutdown() loop is the only
+/// shutdown path needed when kv-persist is disabled.
+///
+/// **Lock semantics:** the read lock is held only long enough to
+/// snapshot `(repo, quant)` keys, then dropped before the write
+/// lock is acquired. Holding read+write across the boundary would
+/// deadlock if any in-flight handler is still waking up after
+/// axum's graceful-shutdown.
+pub fn drain_loaded_models_to_disk(
+    state: &api::state::AppState,
+    timeout: std::time::Duration,
+) -> ShutdownDrainSummary {
+    let Some(spiller) = state.kv_spiller.as_ref() else {
+        // kv-persist disabled at startup; nothing to drain.
+        return ShutdownDrainSummary::default();
+    };
+
+    let start = std::time::Instant::now();
+
+    // 1. Snapshot the loaded (repo, quant) keys under the read lock,
+    //    then drop it before acquiring the write lock for evictions.
+    let keys: Vec<(String, crate::serve::quant_select::QuantType)> = state
+        .pool
+        .read()
+        .ok()
+        .map(|mgr| {
+            mgr.snapshot_engines()
+                .into_iter()
+                .map(|le| (le.repo.clone(), le.quant))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let evicted = if keys.is_empty() {
+        0
+    } else if let Ok(mut mgr) = state.pool.write() {
+        let mut count = 0usize;
+        for (repo, quant) in &keys {
+            // evict() fires pre_evict on the spiller (which enqueues
+            // block writes) BEFORE removing the entry from the pool's
+            // manager.engines map. The spiller's outcome is already
+            // recorded in hf2q_pool_kv_spills_total{outcome=...} by the
+            // existing trigger site (multi_model.rs:1090).
+            let _ = mgr.evict(repo, *quant);
+            count += 1;
+        }
+        count
+    } else {
+        // Lock poisoned; bail with zero progress and let the caller
+        // observe queue_depth_at_exit > 0 if any blocks were already
+        // in flight.
+        0
+    };
+
+    // 2. Poll the async writer queue until drained or timeout.
+    let poll_interval = std::time::Duration::from_millis(50);
+    let mut queue_depth_at_exit = spiller.pending_writer_queue_depth();
+    let mut timed_out = false;
+    while queue_depth_at_exit > 0 {
+        if start.elapsed() >= timeout {
+            timed_out = true;
+            break;
+        }
+        std::thread::sleep(poll_interval);
+        queue_depth_at_exit = spiller.pending_writer_queue_depth();
+    }
+
+    let drain_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    ShutdownDrainSummary { evicted, drain_ms, queue_depth_at_exit, timed_out }
 }
 
 /// Graceful-shutdown signal handler: wait for Ctrl-C or SIGTERM (Decision #17).
