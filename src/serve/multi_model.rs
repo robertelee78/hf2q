@@ -726,6 +726,23 @@ pub trait KvSpiller<E>: Send + Sync {
         quant: QuantType,
         engine: &Arc<LoadedEngine<E>>,
     ) -> RestoreOutcome;
+
+    /// ADR-017 Closure iter-7 (2026-05-04) — called AFTER the manager
+    /// has dropped its `Arc<LoadedEngine<E>>` from the engines map
+    /// (post-evict). The impl may release any per-family resources
+    /// it accumulated since registration (e.g. cloned `Engine` refs
+    /// that were keeping the worker thread alive — the iter-3
+    /// Phase-E engine_arc Engine clone is exactly this kind of
+    /// reference, and without explicit drop it leaks across
+    /// model-swap cycles).
+    ///
+    /// Default = no-op. `BlockPrefixCacheSpiller` overrides to call
+    /// its inherent `unregister_family`, which removes the family
+    /// hook from the registrations map; the inner spill's
+    /// `Arc<EngineInner>` strong-count drops to zero on the
+    /// concrete-spill drop, the worker thread exits via channel
+    /// close, and the model's RSS frees deterministically.
+    fn drop_family(&self, _repo: &str, _quant: QuantType) {}
 }
 
 /// No-op default [`KvSpiller`] — every method returns `Skipped` and
@@ -1100,6 +1117,16 @@ impl<E> HotSwapManager<E> {
         // engines map shouldn't have it either by the invariant — but
         // we remove unconditionally to be defensive.
         self.engines.remove(&k);
+        // ADR-017 Closure iter-7 (2026-05-04): drop the spiller's
+        // per-family hook AFTER engines.remove. The hook holds a
+        // cloned `Engine` (iter-3 Phase-E fix) whose inner
+        // `Arc<EngineInner>` keeps the worker thread alive — without
+        // this drop_family call, every model-swap cycle leaks ~16
+        // GB of RSS (verified iter-7 stress smoke: 19.5 GB → 80 GB
+        // after 3 iters). drop_family is a no-op for `NoopKvSpiller`
+        // (no state to release); `BlockPrefixCacheSpiller` overrides
+        // to call `unregister_family` on its registrations map.
+        self.spiller.drop_family(repo, quant);
         removed.map(|h| h.bytes_resident).unwrap_or(0)
     }
 
@@ -1208,6 +1235,17 @@ impl<E> HotSwapManager<E> {
             // own clones keep the engine alive until they release; the
             // pool slot is already free.
             self.engines.remove(&victim.repo_id);
+            // ADR-017 Closure iter-7 (2026-05-04): drop the spiller's
+            // per-family hook AFTER engines.remove. Symmetric with the
+            // explicit `evict()` path. victim.repo_id is the pool-key
+            // form `{repo}@{quant}`; unpack via the same helper that
+            // the metrics path uses so the spiller's bare-repo
+            // registration key is matched.
+            if let Some((victim_repo, victim_quant)) =
+                unpack_pool_key(&victim.repo_id, &victim.quant)
+            {
+                self.spiller.drop_family(&victim_repo, victim_quant);
+            }
         }
 
         // Admission-hook trigger (iter-212 / AC 5471).  Fire

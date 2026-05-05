@@ -865,6 +865,17 @@ where
             RestoreOutcome::RestoredBlocks(restored)
         }
     }
+
+    /// ADR-017 Closure iter-7 (2026-05-04) — drop the per-family
+    /// hook on permanent eviction. Releases the inner spill's
+    /// engine_arc Engine clone (Phase E iter-3 fix) which was
+    /// keeping `Arc<EngineInner>` alive AND therefore the worker
+    /// thread + model RSS. Without this drop hook, every
+    /// model-swap cycle leaks ~16-22 GB of RSS (verified iter-7
+    /// stress smoke: 19.5 GB → 80 GB after 3 iters).
+    fn drop_family(&self, repo: &str, quant: QuantType) {
+        let _ = self.unregister_family(repo, quant);
+    }
 }
 
 /// Parse the layer rank from a `payload_kind` string of the form

@@ -805,7 +805,32 @@ fn kv_persist_stress_24h() {
     );
 
     // ---- Continuous loop ----
-    let lengths: [usize; 4] = [512, 4096, 16384, 32768];
+    //
+    // ADR-017 Closure iter-7 (2026-05-04): operator can cap the L
+    // distribution via `HF2Q_KV_PERSIST_STRESS_MAX_L` to keep the
+    // smoke variant within the test budget. Default = 32768 (full
+    // range). For 30-min smoke validation set MAX_L=4096 so a
+    // single iter (prefill + decode + eviction) fits inside one
+    // 5-min checkpoint window on Gemma 4 26B M5 Max (per B-F4
+    // standing finding: prefill at L=32K = ~10 min; at L=4K = ~1
+    // min; iter wall = prefill + 60s eviction). Without this cap
+    // the iter-6 30-min smoke at random L picked an L=32K iter
+    // first and blocked the entire budget — see iter-6 stress note.
+    let max_l: usize = std::env::var("HF2Q_KV_PERSIST_STRESS_MAX_L")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32768);
+    let lengths: Vec<usize> = [512usize, 4096, 16384, 32768]
+        .into_iter()
+        .filter(|&l| l <= max_l)
+        .collect();
+    if lengths.is_empty() {
+        panic!(
+            "[stress] HF2Q_KV_PERSIST_STRESS_MAX_L={} is below the smallest \
+             L=512 in the distribution; choose ≥512",
+            max_l
+        );
+    }
     let start_time = Instant::now();
     let total_duration = Duration::from_secs(duration_sec);
     let checkpoint_interval = Duration::from_secs(CHECKPOINT_INTERVAL_SEC);
