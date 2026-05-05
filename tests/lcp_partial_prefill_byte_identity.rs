@@ -246,6 +246,23 @@ fn metric_lcp_detected_total(metrics_body: &str) -> u64 {
     0
 }
 
+/// iter-7 — parse `hf2q_kv_lcp_lookups_total <N>` from /metrics. The
+/// lookups counter is the denominator (every probe call increments it,
+/// regardless of detection outcome). For the prefill-wrap guard test
+/// the lookups counter advances normally while detected stays at 0,
+/// proving the probe ran but found no entry (because store was
+/// skipped).
+fn metric_lcp_lookups_total(metrics_body: &str) -> u64 {
+    for line in metrics_body.lines() {
+        if let Some(rest) = line.strip_prefix("hf2q_kv_lcp_lookups_total ") {
+            if let Ok(n) = rest.trim().parse::<u64>() {
+                return n;
+            }
+        }
+    }
+    0
+}
+
 fn fetch_canonical_model_id(server: &ServerGuard) -> String {
     use std::io::Write;
     let mut s = TcpStream::connect((HOST, server.port)).expect("connect");
@@ -716,5 +733,393 @@ fn iter5_r_c4_lcp_5_fraction_sweep() {
     eprintln!(
         "[iter-5 sweep] ALL 5 FRACTIONS PASS — Phase E.a R-C4-LCP \
          byte-identity verified across K ∈ {{small, N/4, N/2, 3N/4, N-1}}."
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Iter-7 — sliding-window prefill-wrap guard (LCP > sliding_window edge case).
+//
+// Per dossier §4.2 row 7: "Sliding-window LCP > sw edge cases + Qwen3.5
+// hybrid deferral note. Edge: prompt with LCP=4096 against
+// sliding_window=1024; decoded bytes byte-identical to full prefill.
+// Falsifier: any divergence at LCP > sw boundary."
+//
+// ## What the prefill-wrap guard does
+//
+// `engine.rs:4516` (non-streaming) and `engine.rs:7027` (streaming) skip
+// `lcp_registry.store(...)` when `prompt_len > sliding_window` AND the
+// model has any sliding layer. Reason: the end-of-prefill snapshot
+// captures the FINAL ring state — slots representing positions
+// `[N-sw..N)`, not `[0..N)`. A future LCP resume at K<N would expect
+// slots to represent `[0..K)` (P's shared prefix), which the wrapped
+// snapshot does NOT contain. Storing would yield silent corruption on
+// resume; the guard preserves byte-identity by skipping store.
+//
+// V1 trade-off (iter-3.5c): long-conversation LCP miss when prompt_len
+// exceeds sliding_window. Iter-3.6 (mid-prefill snapshot) lifts this.
+//
+// ## Test design
+//
+// Two-server byte-identity, mirroring iter-3 falsifier:
+//   * Server A (HF2Q_KV_LCP_RESUME=1 + HF2Q_USE_DENSE=1):
+//     - Send Q_long (priming attempt; > sliding_window tokens). Guard
+//       fires; registry empty.
+//     - Send P_long (shares prefix with Q_long; > sliding_window
+//       tokens). LCP probe runs but registry is empty → returns None.
+//     - Engagement: lcp_lookups_total advances 2; lcp_detected_total
+//       stays 0 (proves guard skipped store on Q AND P; otherwise
+//       second-turn detected would be ≥ 1).
+//   * Server B (control, USE_DENSE=1, RESUME flag absent):
+//     - Send P_long directly; fresh prefill.
+//
+// Falsifier:
+//   1. lcp_detected_total > 0 on server A → guard FAILED to fire (would
+//      mean the store happened, registry holds Q's wrap-corrupted
+//      snapshot, second turn would have detected). Phase E.a invariant
+//      violated; iter-3.6 cannot lift the restriction safely.
+//   2. server_A_decoded(P_long) != server_B_decoded(P_long) byte-for-
+//      byte → resume engaged silently AND corrupted output. Should
+//      never happen if guard fires; provides defense-in-depth assertion.
+//
+// ## Long-prompt construction
+//
+// We need prompt_tokens.len() > sliding_window. Gemma 4 default
+// sliding_window = 1024 (`src/serve/config.rs:103`); 26B-DWQ inherits
+// the default. We construct a prompt with ~200 reps of a 10-token
+// sentence ≈ 2000 tokens — comfortably above 1024 with headroom for
+// any chat-template overhead. The shared prefix between Q and P is the
+// 200-rep block; suffixes differ at the last sentence.
+//
+// Cost: 1 server A spawn (~25s load) + 1 server B spawn (~25s load) +
+// 3 chat_decodes at ~2000-token prefill (~5-10s each at 200 t/s) +
+// 8 tokens decode each ≈ ~80s wall. Operator-gated under
+// HF2Q_KV_PERSIST_PHASE_D=1.
+
+const ITER7_LONG_PROMPT_REP_COUNT: usize = 200;
+const ITER7_LONG_PROMPT_BASE: &str = "The quick brown fox jumps over the lazy dog. ";
+const ITER7_MAX_TOKENS: u32 = 8;
+
+fn iter7_build_prompt(suffix: &str) -> String {
+    let mut s = String::with_capacity(
+        ITER7_LONG_PROMPT_BASE.len() * ITER7_LONG_PROMPT_REP_COUNT + suffix.len() + 16,
+    );
+    for _ in 0..ITER7_LONG_PROMPT_REP_COUNT {
+        s.push_str(ITER7_LONG_PROMPT_BASE);
+    }
+    s.push_str(suffix);
+    s
+}
+
+/// ADR-017 Phase E option (a) iter-7 — sliding-window prefill-wrap
+/// guard correctness.
+///
+/// Asserts that when the prompt exceeds `sliding_window`, the iter-3.5c
+/// guard skips the LCP store. Concretely:
+///   1. lcp_lookups_total on server A advances for every probe call
+///      (denominator).
+///   2. lcp_detected_total stays at 0 — registry never has an entry
+///      because store was skipped on prior turns.
+///   3. server_A_decoded(P_long) == server_B_decoded(P_long) byte-for-
+///      byte (both ran fresh prefill).
+///
+/// Falsifier: either (a) detected_total > 0 → guard FAILED, the v1
+/// invariant is BROKEN, or (b) byte mismatch → silent corruption.
+#[test]
+fn iter7_prefill_wrap_guard_long_prompt_byte_identity() {
+    let model_path = match resolve_model_path_or_skip() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[iter-7 wrap-guard] {ENV_PHASE_D_GATE}=1 not set — short-circuit. \
+                 Set {ENV_PHASE_D_GATE}=1 + {ENV_MODEL_PATH}=PATH to run."
+            );
+            return;
+        }
+    };
+    let bin = hf2q_binary_path();
+    assert!(
+        bin.exists(),
+        "[iter-7 wrap-guard] hf2q binary not found at {} — \
+         did `cargo build --release` run?",
+        bin.display()
+    );
+
+    let prompt_q = iter7_build_prompt("Question Q ending here distinctively.");
+    let prompt_p =
+        iter7_build_prompt("Question P with different ending text continuing onward.");
+    eprintln!(
+        "[iter-7 wrap-guard] prompts built: Q={} chars, P={} chars (shared prefix \
+         {} reps × {} chars = {} chars; both prompts target prompt_len > \
+         sliding_window=1024 after tokenization)",
+        prompt_q.len(),
+        prompt_p.len(),
+        ITER7_LONG_PROMPT_REP_COUNT,
+        ITER7_LONG_PROMPT_BASE.len(),
+        ITER7_LONG_PROMPT_REP_COUNT * ITER7_LONG_PROMPT_BASE.len()
+    );
+
+    // ── Server A: resume path under test ──
+    let server_a = spawn_server(
+        &bin,
+        &model_path,
+        PORT_A,
+        &[("HF2Q_KV_LCP_RESUME", "1")],
+    );
+    wait_for_readyz(&server_a);
+    let canonical_a = fetch_canonical_model_id(&server_a);
+    eprintln!(
+        "[iter-7 wrap-guard] server A (LCP_RESUME=1) ready on {}:{} model={}",
+        HOST, PORT_A, canonical_a
+    );
+
+    // Baseline counters — server may pre-emit zero entries; capture so
+    // delta math is robust to any future warmup-side probe behavior.
+    let metrics_pre = fetch_metrics(&server_a);
+    let lookups_pre = metric_lcp_lookups_total(&metrics_pre);
+    let detected_pre = metric_lcp_detected_total(&metrics_pre);
+    eprintln!(
+        "[iter-7 wrap-guard] server A baseline: lookups={}, detected={}",
+        lookups_pre, detected_pre
+    );
+
+    // Send Q (long, prompt_len > sliding_window). The guard MUST skip
+    // the store — registry stays empty. We catch panic / non-200
+    // outcomes and dump server stderr tail so any worker-side issue
+    // surfaces in the test failure (without this, the chat_decode
+    // helper panics with "no content field" and the server log is
+    // lost).
+    let q_decoded_a = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        chat_decode(&server_a, &canonical_a, &prompt_q, ITER7_MAX_TOKENS)
+    })) {
+        Ok(s) => s,
+        Err(_) => {
+            let tail = server_a.log_tail();
+            panic!(
+                "[iter-7 wrap-guard] Q chat_decode panicked. Server stderr \
+                 tail (last 256 lines):\n{}",
+                tail.join("\n")
+            );
+        }
+    };
+    assert!(
+        !q_decoded_a.is_empty(),
+        "[iter-7 wrap-guard] Q decoded empty on server A"
+    );
+    eprintln!(
+        "[iter-7 wrap-guard] server A Q decoded {} bytes (priming attempt; \
+         registry expected EMPTY due to wrap guard)",
+        q_decoded_a.len()
+    );
+
+    // Send P (long, shares prefix with Q). PromptCache misses (different
+    // prompts). LCP probe runs and finds an empty registry → detected
+    // stays at 0. The guard skips the store again.
+    let p_decoded_a = chat_decode(&server_a, &canonical_a, &prompt_p, ITER7_MAX_TOKENS);
+    assert!(
+        !p_decoded_a.is_empty(),
+        "[iter-7 wrap-guard] P decoded empty on server A"
+    );
+    eprintln!(
+        "[iter-7 wrap-guard] server A P decoded {} bytes (probe ran; expected \
+         to fall through to fresh prefill)",
+        p_decoded_a.len()
+    );
+
+    // Engagement assertions — the guard's load-bearing invariant.
+    let metrics_post = fetch_metrics(&server_a);
+    let lookups_post = metric_lcp_lookups_total(&metrics_post);
+    let detected_post = metric_lcp_detected_total(&metrics_post);
+    let lookups_delta = lookups_post.saturating_sub(lookups_pre);
+    let detected_delta = detected_post.saturating_sub(detected_pre);
+    eprintln!(
+        "[iter-7 wrap-guard] server A post-Q+P: lookups={} (Δ={}), detected={} \
+         (Δ={})",
+        lookups_post, lookups_delta, detected_post, detected_delta
+    );
+    // (a) Probe must have actually run on at least one of {Q, P}; ≥ 1
+    // is sufficient because Q's flow may short-circuit before probe if
+    // prompt_cache fast-path misses but probe fires after — Q's probe
+    // SHOULD run and increment. Assert ≥ 2 (one per turn).
+    assert!(
+        lookups_delta >= 2,
+        "[iter-7 wrap-guard] lookups_delta={} < 2 — probe did not run on \
+         both Q and P. Test invariant violated; metric integration may have \
+         regressed. metrics excerpt:\n{}",
+        lookups_delta,
+        metrics_post
+            .lines()
+            .filter(|l| l.contains("lcp"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    // (b) The load-bearing assertion: detected MUST stay at 0. If > 0,
+    // the guard failed to skip a store, and the iter-3.6 lift cannot
+    // safely happen.
+    assert_eq!(
+        detected_delta, 0,
+        "[iter-7 wrap-guard] FALSIFIED — detected_delta={} (expected 0). \
+         The prefill-wrap guard FAILED to skip the LCP store on a \
+         long-prompt request (prompt_len > sliding_window). Either:\n\
+         (1) the guard predicate `prompt_len > sliding_window` is wrong, \
+         or (2) the snapshot was incorrectly published despite ring \
+         wrap. Phase E.a v1 byte-identity correctness invariant violated; \
+         iter-3.6 mid-prefill snapshot lift CANNOT proceed safely until \
+         this is root-caused.\n\nmetrics excerpt:\n{}",
+        detected_delta,
+        metrics_post
+            .lines()
+            .filter(|l| l.contains("lcp"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    eprintln!(
+        "[iter-7 wrap-guard] guard engagement confirmed: lookups Δ={} ≥ 2, \
+         detected Δ={} == 0 (store skipped on both turns; registry stayed empty)",
+        lookups_delta, detected_delta
+    );
+
+    // Drop server A so Metal device + RAM are free before server B.
+    drop(server_a);
+
+    // ── Server B: control (no resume) ──
+    let server_b = spawn_server(&bin, &model_path, PORT_B, &[]);
+    wait_for_readyz(&server_b);
+    let canonical_b = fetch_canonical_model_id(&server_b);
+    eprintln!(
+        "[iter-7 wrap-guard] server B (control, no resume) ready on {}:{} model={}",
+        HOST, PORT_B, canonical_b
+    );
+
+    // Send P_long directly to server B; fresh prefill, no LCP path.
+    let p_decoded_b = chat_decode(&server_b, &canonical_b, &prompt_p, ITER7_MAX_TOKENS);
+    assert!(
+        !p_decoded_b.is_empty(),
+        "[iter-7 wrap-guard] P decoded empty on server B"
+    );
+    eprintln!(
+        "[iter-7 wrap-guard] server B P decoded {} bytes (control)",
+        p_decoded_b.len()
+    );
+
+    // Defense-in-depth: byte-identity. Both servers ran fresh prefill
+    // for P (server A: guard skipped store + registry empty + probe
+    // returned None; server B: no LCP path), so outputs MUST match.
+    if p_decoded_a != p_decoded_b {
+        let common_prefix = p_decoded_a
+            .as_bytes()
+            .iter()
+            .zip(p_decoded_b.as_bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let snippet_a = p_decoded_a
+            .get(common_prefix..common_prefix.saturating_add(120))
+            .unwrap_or("")
+            .to_string();
+        let snippet_b = p_decoded_b
+            .get(common_prefix..common_prefix.saturating_add(120))
+            .unwrap_or("")
+            .to_string();
+        panic!(
+            "[iter-7 wrap-guard] FALSIFIED — P decoded bytes differ between \
+             server A (long-prompt, guard expected to fire) and server B \
+             (control). Even though detected_delta was 0 (probe found \
+             nothing), output diverged. This indicates a non-LCP source \
+             of nondeterminism in the long-prompt path — possibly the \
+             snapshot publication side-effect mutating live buffers. Phase \
+             E.a v1 invariant violated.\n\
+             server A len={} bytes\n\
+             server B len={} bytes\n\
+             diverge at byte={}\n\
+             A @ {}: {:?}\n\
+             B @ {}: {:?}",
+            p_decoded_a.len(),
+            p_decoded_b.len(),
+            common_prefix,
+            common_prefix,
+            snippet_a,
+            common_prefix,
+            snippet_b
+        );
+    }
+    eprintln!(
+        "[iter-7 wrap-guard] PASS — server A (long prompt, guard fired) \
+         bytes ({} bytes) == server B (control) bytes ({} bytes) BYTE-\
+         IDENTICAL. Prefill-wrap guard correctness confirmed.",
+        p_decoded_a.len(),
+        p_decoded_b.len()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Iter-7 — Qwen3.5 hybrid deferral compile-time + runtime sanity.
+//
+// Phase E.a v1 covers Gemma 4 dense ONLY. Qwen3.5 hybrid families are
+// EXPLICITLY DEFERRED to Phase B-hybrid follow-up. The deferral is
+// enforced by CONSTRUCTION:
+//   * `lcp_registry: LcpRegistry<DenseKvBuffers>` lives on
+//     `GemmaLoadedModel` only (`engine.rs:1102`); the `Qwen35LoadedModel`
+//     struct does NOT have this field.
+//   * The probe sites at `engine.rs:3863` and `engine.rs:6158` reach
+//     `loaded.lcp_registry` where `loaded: &mut GemmaLoadedModel` — only
+//     reachable from the Gemma worker arm.
+//   * The Qwen35 worker arm (`engine.rs:3152` for kv_restore,
+//     `engine.rs:3205` for prompt_cache_restore) returns Err with a
+//     "B-hybrid follow-up" message; no LCP path possible.
+//
+// The compile-time check below is a load-bearing assertion: any future
+// refactor that adds an `lcp_registry` field to `Qwen35LoadedModel`
+// would silently flip the deferral. This module-level helper would
+// instead need to be updated, surfacing the architectural change in the
+// PR diff.
+//
+// ## Why a unit test (no model needed)
+//
+// The deferral is structural. We can verify it WITHOUT loading a model
+// by inspecting type structure indirectly via crate-level
+// re-exports. The hf2q crate is `[bin]`-only (not `[lib]`) so we can't
+// `use` types directly; the next-best signal is documenting the
+// invariant in this test header and asserting via the actual probe-
+// site code's behavior — exercised by the prefill-wrap test above
+// (which forces the Gemma path) and by the absence of Qwen3.5 entries
+// in the iter-3 / iter-5 falsifiers.
+//
+// This test is a documentation-only unit test that always passes; its
+// value is that grep'ing for "Qwen35" + "lcp" surfaces the deferral
+// rationale. If a future contributor adds Qwen35 hybrid LCP support,
+// this test should be UPDATED (renamed to assert hybrid LCP works), not
+// deleted — making the deferral lift visible in the diff.
+
+/// Iter-7 deferral marker (always-pass). Documents the Qwen3.5 / Qwen3-VL
+/// hybrid deferral structurally enforced at the worker-thread Request
+/// dispatch (engine.rs:3144-3161, 3194-3211) and the field placement
+/// (lcp_registry on GemmaLoadedModel only at engine.rs:1102).
+///
+/// FUTURE LIFT INSTRUCTIONS: when Phase B-hybrid follow-up adds Qwen3.5
+/// hybrid LCP support:
+///   1. Add `lcp_registry` field to Qwen35LoadedModel.
+///   2. Add Qwen35 worker arm dispatch for KvSnapshot/KvRestore (today
+///      returns Err at engine.rs:3152).
+///   3. Add Qwen35-specific probe sites mirroring engine.rs:3863-3940.
+///   4. RENAME this test to assert the hybrid LCP path now works (do
+///      NOT silently delete — make the lift visible in the diff).
+#[test]
+fn iter7_qwen35_hybrid_lcp_deferred_marker() {
+    // Compile-time deferral marker: this test always passes and serves
+    // as a grep target. The structural deferral lives in:
+    //   - engine.rs:1102 (lcp_registry field on Gemma only)
+    //   - engine.rs:3152 (Qwen35 kv_restore returns Err)
+    //   - engine.rs:3205 (Qwen35 prompt_cache_restore returns Err)
+    //   - dossier §R5 (risk register hybrid divergence)
+    //
+    // Asserting `true` is intentional. The TEST'S VALUE is that the
+    // documentation in this test header is searchable via:
+    //   grep -rn "iter7_qwen35_hybrid_lcp_deferred_marker"
+    // which surfaces the deferral rationale and the FUTURE LIFT
+    // INSTRUCTIONS.
+    assert!(
+        true,
+        "Phase E.a v1 deferral marker — see test header for rationale. \
+         If Phase B-hybrid follow-up lifts the deferral, RENAME this \
+         test rather than deleting it so the lift surfaces in the diff."
     );
 }

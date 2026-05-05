@@ -1775,35 +1775,75 @@ impl MlxModelWeights {
         //
         // The snapshot path also mirrors the dtype/capacity/is_sliding
         // invariants of each source layer (iter-3.5a dtype field).
+        // ADR-017 Phase E.a iter-7 — long-prompt snapshot safety.
+        //
+        // Two preconditions must hold for a valid snapshot:
+        //   (a) For any sliding layer: prompt fit in the ring without
+        //       wrap. `seq_len <= sw` is the necessary+sufficient
+        //       condition (the per-token loop above wrote slots
+        //       [tok_i % sw] for tok_i ∈ [0, seq_len); slots stay
+        //       monotonic only when seq_len ≤ sw). When seq_len > sw,
+        //       the ring already wrapped and the live buffer's slot
+        //       contents no longer represent positions [0..N). NO
+        //       snapshot can faithfully reconstruct [0..K) for K ≤ N.
+        //   (b) The snapshot per-layer buffer must hold all populated
+        //       slots: snap_cap ≥ seq_len. iter-3.5d set snap_cap = sw
+        //       on the assumption "engine guard at engine.rs:4516
+        //       enforces seq_len ≤ sw for sliding-layer models". For
+        //       PURE-DENSE (global-only) models the engine guard does
+        //       NOT skip — `prefill_safe = !has_sliding_layer || ...`
+        //       — so a pure-dense long-prompt request (seq_len > sw)
+        //       reaches the per-head copy with `copy_len_per_head =
+        //       seq_len*hd*elem > snap_cap*hd*elem`. Result: dst slice
+        //       overrun → panic at line ~1881.
+        //
+        // Fix:
+        //   * snap_cap = max(sw, seq_len + max_decode_tokens) so
+        //     pure-dense long prompts fit AND multi-turn headroom
+        //     stays at sw for short prompts.
+        //   * `snapshot_safe` skips the entire snapshot path when any
+        //     sliding layer exists AND seq_len > sw — matching the
+        //     engine guard at engine.rs:4516. Skipped snapshots
+        //     return None; the engine's `dense_kvs_snapshot_for_lcp.
+        //     take()` then yields None and the store path naturally
+        //     no-ops. Two separate guards stay aligned by sharing the
+        //     same predicate (`!any_sliding || seq_len <= sw`).
+        let any_sliding_layer = self
+            .layers
+            .iter()
+            .any(|l| l.layer_type == LayerType::Sliding);
+        let snapshot_safe = !any_sliding_layer || seq_len <= sw;
         let snapshot_for_lcp: Option<Vec<std::sync::Arc<DenseKvBuffers>>> =
             if crate::debug::INVESTIGATION_ENV.kv_lcp_resume
                 && crate::debug::INVESTIGATION_ENV.use_dense
+                && snapshot_safe
             {
                 // Allocate fresh per-layer buffers + memcpy bytes from
                 // each live `dense_kvs_vec[i]` into the new snapshot.
                 let mut snap: Vec<std::sync::Arc<DenseKvBuffers>> =
                     Vec::with_capacity(num_layers);
-                // ADR-017 Phase E.a iter-3.5d — multi-turn chat
-                // headroom. Each subsequent turn's prompt is LONGER
-                // than the prior turn's; live-layer capacity sized
-                // for THIS request (`seq_len + max_decode_tokens` for
-                // global; `sliding_window` for sliding) is too small
-                // to admit the next turn under the engine probe's
-                // capacity check. Snapshot global-layer buffers with
-                // capacity = `sliding_window` so future turns up to
-                // sw fit. (iter-3.5c prefill-wrap guard already
-                // restricts cache to prompts ≤ sw, so sw is the
-                // right ceiling for a snapshot's per-layer capacity.)
+                // ADR-017 Phase E.a iter-3.5d + iter-7 — snapshot
+                // capacity policy.
                 //
-                // Memory cost on Gemma 4 26B: per cached entry,
-                // global-layer buffers grow from `(seq_len+max) × n_kv ×
-                // hd × elem_bytes` to `sw × n_kv × hd × elem_bytes`.
-                // Roughly 200 MB per cached entry at typical shapes.
-                // Capacity=1 registry ⇒ ≤ 200 MB extra resident.
-                let snap_cap = sw; // Both layer types use sw as the
-                                    // snapshot capacity. Sliding's
-                                    // live cap is already sw; global's
-                                    // gets headroom from this.
+                // iter-3.5d intent: for sliding-layer models the
+                // engine guard restricts cache to prompts ≤ sw, so
+                // snap_cap = sw is sufficient AND gives multi-turn
+                // headroom (subsequent turns' prompts up to sw fit
+                // under the engine probe's per-layer cap-check).
+                //
+                // iter-7 correction: pure-dense (global-only) models
+                // can have seq_len > sw (engine guard always passes
+                // because !has_sliding_layer). For those, snap_cap
+                // must be ≥ seq_len or the per-head memcpy at
+                // `copy_len_per_head = seq_len*hd*elem` overruns dst.
+                // Take max with `seq_len + max_decode_tokens` to
+                // accommodate both cases.
+                //
+                // Memory cost on Gemma 4 26B (sliding+global):
+                // sliding+short (seq_len ≤ sw) → snap_cap = sw →
+                // ~200 MB per cached entry. Capacity=1 registry ⇒
+                // ≤ 200 MB extra resident.
+                let snap_cap = sw.max(seq_len + max_decode_tokens);
                 for live_layer in dense_kvs_vec.iter() {
                     let nkv_dim = live_layer.k.shape().first().copied().unwrap_or(0);
                     let live_cap_dim = live_layer.k.shape().get(1).copied().unwrap_or(live_layer.capacity);
@@ -1912,6 +1952,20 @@ impl MlxModelWeights {
                 }
                 Some(snap)
             } else {
+                if crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+                    && crate::debug::INVESTIGATION_ENV.use_dense
+                    && !snapshot_safe
+                {
+                    tracing::debug!(
+                        "lcp_snapshot skipped (iter-7 prefill-wrap guard): \
+                         seq_len={} > sw={} on a model with sliding layers; \
+                         the live ring already wrapped during prefill so no \
+                         snapshot can faithfully reconstruct [0..K). The \
+                         engine-side guard at engine.rs:4516 also skips \
+                         store; both guards stay aligned.",
+                        seq_len, sw
+                    );
+                }
                 None
             };
         self.dense_kvs_snapshot_for_lcp = snapshot_for_lcp;
