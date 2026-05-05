@@ -550,7 +550,12 @@ where
     /// when registry locking fails.
     fn pre_evict(&self, handle: &LoadedHandle, _engine: &Arc<LoadedEngine<E>>) -> SpillOutcome {
         let Some(quant) = Self::parse_quant(handle) else {
-            eprintln!("[KV-DIAG] pre_evict: parse_quant=None handle.quant={:?} handle.repo_id={:?}", handle.quant, handle.repo_id);
+            tracing::warn!(
+                target: "hf2q::kv_persist::spiller",
+                quant = ?handle.quant,
+                repo_id = ?handle.repo_id,
+                "pre_evict: parse_quant=None — skipping spill"
+            );
             return SpillOutcome::Skipped;
         };
         let bare_repo: &str = handle
@@ -677,12 +682,19 @@ where
         // per-layer KV snapshot loop, also snapshot the per-model
         // `PromptCache` and enqueue it as a single
         // `payload_kind = "prompt-cache"` block.
-        eprintln!("[KV-DIAG] pre_evict: post-layer-loop, attempting snapshot_prompt_cache (enqueued so far={})", enqueued);
+        tracing::debug!(
+            target: "hf2q::kv_persist::spiller",
+            enqueued,
+            "pre_evict: post-layer-loop, attempting snapshot_prompt_cache"
+        );
         let prompt_cache_payload = {
             let g = match hook_arc.lock() {
                 Ok(g) => g,
                 Err(_) => {
-                    eprintln!("[KV-DIAG] pre_evict: hook_arc.lock() poisoned at prompt-cache call");
+                    tracing::error!(
+                        target: "hf2q::kv_persist::spiller",
+                        "pre_evict: hook_arc.lock() poisoned at prompt-cache call"
+                    );
                     return SpillOutcome::Error(SpillErrorKind::CodecErr);
                 }
             };
@@ -724,9 +736,15 @@ where
                 };
                 if pc_enqueue_result.is_ok() {
                     enqueued = enqueued.saturating_add(1);
-                    eprintln!("[KV-DIAG] pre_evict: prompt-cache enqueue OK");
+                    tracing::debug!(
+                        target: "hf2q::kv_persist::spiller",
+                        "pre_evict: prompt-cache enqueue OK"
+                    );
                 } else {
-                    eprintln!("[KV-DIAG] pre_evict: prompt-cache enqueue FAILED (writer disconnected)");
+                    tracing::warn!(
+                        target: "hf2q::kv_persist::spiller",
+                        "pre_evict: prompt-cache enqueue FAILED (writer disconnected)"
+                    );
                 }
                 // Note: writer-disconnected on prompt-cache is
                 // non-fatal — KV blocks already enqueued. iter-96
@@ -761,9 +779,17 @@ where
         quant: QuantType,
         _engine: &Arc<LoadedEngine<E>>,
     ) -> RestoreOutcome {
-        eprintln!("[KV-DIAG] post_admit ENTER repo={:?} quant={}", repo, quant.as_str());
+        tracing::debug!(
+            target: "hf2q::kv_persist::spiller",
+            repo = ?repo,
+            quant = quant.as_str(),
+            "post_admit ENTER"
+        );
         let Some(hook_arc) = self.lookup_hook(repo, quant) else {
-            eprintln!("[KV-DIAG] post_admit: lookup_hook=None → Skipped");
+            tracing::debug!(
+                target: "hf2q::kv_persist::spiller",
+                "post_admit: lookup_hook=None → Skipped"
+            );
             return RestoreOutcome::Skipped;
         };
 
@@ -776,7 +802,10 @@ where
             g.block_alignment()
         };
         if alignment == 0 {
-            eprintln!("[KV-DIAG] post_admit: alignment=0 → Skipped");
+            tracing::debug!(
+                target: "hf2q::kv_persist::spiller",
+                "post_admit: alignment=0 → Skipped"
+            );
             return RestoreOutcome::Skipped;
         }
 
@@ -784,7 +813,11 @@ where
         // ascending so restore replays in chain order (parent before
         // child); this matches the write-time chain advance.
         let mut metas = self.store.index().iter_by_model(&model_fp);
-        eprintln!("[KV-DIAG] post_admit: found {} metas in index", metas.len());
+        tracing::debug!(
+            target: "hf2q::kv_persist::spiller",
+            n_metas = metas.len(),
+            "post_admit: found metas in index"
+        );
         if metas.is_empty() {
             return RestoreOutcome::Skipped;
         }
@@ -876,7 +909,12 @@ where
             match restore_result {
                 Ok(()) => restored = restored.saturating_add(1),
                 Err(SpillErrorKind::CodecErr) => {
-                    eprintln!("[KV-DIAG] post_admit: restore_block layer={} CodecErr after {} restored", layer_rank, restored);
+                    tracing::warn!(
+                        target: "hf2q::kv_persist::spiller",
+                        layer = layer_rank,
+                        restored,
+                        "post_admit: restore_block CodecErr — bailing"
+                    );
                     return RestoreOutcome::Error(RestoreErrorKind::CodecErr);
                 }
                 Err(SpillErrorKind::IoErr) => {
@@ -884,17 +922,30 @@ where
                     // single block indicates a per-layer capacity /
                     // shape issue rather than corruption. Continue
                     // so the rest of the restoration completes.
-                    eprintln!("[KV-DIAG] post_admit: restore_block layer={} IoErr (skipped, continuing)", layer_rank);
+                    tracing::debug!(
+                        target: "hf2q::kv_persist::spiller",
+                        layer = layer_rank,
+                        "post_admit: restore_block IoErr (skipped, continuing)"
+                    );
                     continue;
                 }
                 Err(SpillErrorKind::ParityFail) => {
-                    eprintln!("[KV-DIAG] post_admit: restore_block layer={} ParityFail after {} restored", layer_rank, restored);
+                    tracing::warn!(
+                        target: "hf2q::kv_persist::spiller",
+                        layer = layer_rank,
+                        restored,
+                        "post_admit: restore_block ParityFail — bailing"
+                    );
                     return RestoreOutcome::Error(RestoreErrorKind::ParityFail);
                 }
             }
         }
 
-        eprintln!("[KV-DIAG] post_admit: loop done, restored={}", restored);
+        tracing::debug!(
+            target: "hf2q::kv_persist::spiller",
+            restored,
+            "post_admit: loop done"
+        );
         if restored == 0 {
             RestoreOutcome::Skipped
         } else {
