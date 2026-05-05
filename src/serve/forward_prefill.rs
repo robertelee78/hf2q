@@ -1783,20 +1783,80 @@ impl MlxModelWeights {
                 // each live `dense_kvs_vec[i]` into the new snapshot.
                 let mut snap: Vec<std::sync::Arc<DenseKvBuffers>> =
                     Vec::with_capacity(num_layers);
+                // ADR-017 Phase E.a iter-3.5d — multi-turn chat
+                // headroom. Each subsequent turn's prompt is LONGER
+                // than the prior turn's; live-layer capacity sized
+                // for THIS request (`seq_len + max_decode_tokens` for
+                // global; `sliding_window` for sliding) is too small
+                // to admit the next turn under the engine probe's
+                // capacity check. Snapshot global-layer buffers with
+                // capacity = `sliding_window` so future turns up to
+                // sw fit. (iter-3.5c prefill-wrap guard already
+                // restricts cache to prompts ≤ sw, so sw is the
+                // right ceiling for a snapshot's per-layer capacity.)
+                //
+                // Memory cost on Gemma 4 26B: per cached entry,
+                // global-layer buffers grow from `(seq_len+max) × n_kv ×
+                // hd × elem_bytes` to `sw × n_kv × hd × elem_bytes`.
+                // Roughly 200 MB per cached entry at typical shapes.
+                // Capacity=1 registry ⇒ ≤ 200 MB extra resident.
+                let snap_cap = sw; // Both layer types use sw as the
+                                    // snapshot capacity. Sliding's
+                                    // live cap is already sw; global's
+                                    // gets headroom from this.
                 for live_layer in dense_kvs_vec.iter() {
                     let nkv_dim = live_layer.k.shape().first().copied().unwrap_or(0);
-                    let cap_dim = live_layer.k.shape().get(1).copied().unwrap_or(live_layer.capacity);
+                    let live_cap_dim = live_layer.k.shape().get(1).copied().unwrap_or(live_layer.capacity);
                     let hd_dim = live_layer.k.shape().get(2).copied().unwrap_or(0);
                     let elem_bytes_layer = live_layer.dtype.size_of();
-                    let nbytes = nkv_dim * cap_dim * hd_dim * elem_bytes_layer;
+                    // Snapshot-side capacity = sw for both layer
+                    // types. snap_nbytes is the snapshot buffer's
+                    // total size; copy_bytes is the live → snap
+                    // memcpy length (live's `nbytes`, smaller for
+                    // global when sw > seq_len+max_decode).
+                    let snap_nbytes = nkv_dim * snap_cap * hd_dim * elem_bytes_layer;
+                    let live_nbytes = nkv_dim * live_cap_dim * hd_dim * elem_bytes_layer;
                     let mut k_snap = dev
-                        .alloc_buffer(nbytes, live_layer.dtype, vec![nkv_dim, cap_dim, hd_dim])
+                        .alloc_buffer(snap_nbytes, live_layer.dtype, vec![nkv_dim, snap_cap, hd_dim])
                         .map_err(|e| anyhow::anyhow!("snapshot K alloc: {e}"))?;
                     let mut v_snap = dev
-                        .alloc_buffer(nbytes, live_layer.dtype, vec![nkv_dim, cap_dim, hd_dim])
+                        .alloc_buffer(snap_nbytes, live_layer.dtype, vec![nkv_dim, snap_cap, hd_dim])
                         .map_err(|e| anyhow::anyhow!("snapshot V alloc: {e}"))?;
-                    // CPU memcpy via StorageModeShared. Same shape +
-                    // dtype as source; bytemuck::Pod typed via u8.
+                    // CPU memcpy via StorageModeShared. Copy length
+                    // is `seq_len * nkv * hd * elem_bytes` (only the
+                    // prompt-prefix slots; the rest of the snap
+                    // buffer stays zero-init). For sliding layers
+                    // this matches live (live cap = sw = snap cap).
+                    // For global layers, snap cap (sw) ≥ live cap
+                    // (seq_len + max), and we copy fewer bytes than
+                    // either capacity (just seq_len worth).
+                    //
+                    // BUT: sliding layers' live buffer at end of
+                    // prefill has [0..seq_len) populated only when
+                    // seq_len ≤ sw (which iter-3.5c guard enforces).
+                    // For global layers, prefill wrote positions
+                    // [0..seq_len) into slots [0..seq_len). Both
+                    // cases yield the same copy length: seq_len
+                    // tokens worth.
+                    //
+                    // Note: live's first dimension is nkv_dim and
+                    // STRIDE-WISE the slot axis is the second
+                    // dimension (cap_dim). Bytes layout is
+                    // [nkv][slot][hd]. Copying the FIRST `live_nbytes`
+                    // bytes from live copies all nkv × live_cap_dim
+                    // slots; for sliding that's the full ring (and
+                    // since seq_len ≤ sw = live_cap_dim, slots
+                    // beyond seq_len are the live-buffer's prior
+                    // alloc-zero state, which is fine for snap).
+                    //
+                    // For global with snap_cap > live_cap_dim, the
+                    // memory layout differs: snap has [nkv][snap_cap][hd]
+                    // while live has [nkv][live_cap][hd]. A flat
+                    // memcpy of `live_nbytes` bytes places live's
+                    // [nkv=0] block contiguously at snap's
+                    // [nkv=0..(live_cap × hd × elem_bytes/snap_stride)]
+                    // — WRONG for snap's strided layout. Need
+                    // per-head copying.
                     let k_src: &[u8] = live_layer
                         .k
                         .as_slice()
@@ -1811,13 +1871,41 @@ impl MlxModelWeights {
                     let v_dst: &mut [u8] = v_snap
                         .as_mut_slice()
                         .map_err(|e| anyhow::anyhow!("snapshot V dst as_mut_slice: {e}"))?;
-                    let copy_len = k_src.len().min(k_dst.len());
-                    k_dst[..copy_len].copy_from_slice(&k_src[..copy_len]);
-                    v_dst[..copy_len].copy_from_slice(&v_src[..copy_len]);
+                    if live_cap_dim == snap_cap {
+                        // Same shape — fast path, single memcpy of
+                        // the prompt-prefix slots only.
+                        let copy_len_per_head = seq_len * hd_dim * elem_bytes_layer;
+                        for h in 0..nkv_dim {
+                            let src_off = h * live_cap_dim * hd_dim * elem_bytes_layer;
+                            let dst_off = h * snap_cap * hd_dim * elem_bytes_layer;
+                            k_dst[dst_off..dst_off + copy_len_per_head]
+                                .copy_from_slice(&k_src[src_off..src_off + copy_len_per_head]);
+                            v_dst[dst_off..dst_off + copy_len_per_head]
+                                .copy_from_slice(&v_src[src_off..src_off + copy_len_per_head]);
+                        }
+                        let _ = live_nbytes; // silenced
+                    } else {
+                        // Different cap shapes (global w/ headroom):
+                        // strided per-head copy. Source stride is
+                        // `live_cap_dim × hd × elem`; dest stride is
+                        // `snap_cap × hd × elem`. Copy first
+                        // `seq_len × hd × elem` bytes per head.
+                        let copy_len_per_head = seq_len * hd_dim * elem_bytes_layer;
+                        let src_stride = live_cap_dim * hd_dim * elem_bytes_layer;
+                        let dst_stride = snap_cap * hd_dim * elem_bytes_layer;
+                        for h in 0..nkv_dim {
+                            let src_off = h * src_stride;
+                            let dst_off = h * dst_stride;
+                            k_dst[dst_off..dst_off + copy_len_per_head]
+                                .copy_from_slice(&k_src[src_off..src_off + copy_len_per_head]);
+                            v_dst[dst_off..dst_off + copy_len_per_head]
+                                .copy_from_slice(&v_src[src_off..src_off + copy_len_per_head]);
+                        }
+                    }
                     snap.push(std::sync::Arc::new(DenseKvBuffers {
                         k: k_snap,
                         v: v_snap,
-                        capacity: live_layer.capacity,
+                        capacity: snap_cap,
                         is_sliding: live_layer.is_sliding,
                         dtype: live_layer.dtype,
                     }));

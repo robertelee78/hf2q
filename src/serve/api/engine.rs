@@ -4521,7 +4521,13 @@ fn generate_once_with_soft_tokens(
             let _ = physical_decode_writes;
             if prefill_safe {
                 let lcp_key = build_lcp_key_for_request(loaded, params);
-                let linear_capacity = prompt_len + params.max_tokens.max(1);
+                // ADR-017 Phase E.a iter-3.5d — multi-turn chat
+                // headroom. Snapshot global-layer buffers were
+                // allocated with capacity = sliding_window (not
+                // prompt_len + max_decode_tokens). Report the
+                // larger value here so the probe-side capacity check
+                // admits future turns whose prompts grow toward sw.
+                let linear_capacity = sliding_window.max(prompt_len + params.max_tokens.max(1));
                 match loaded.lcp_registry.store(
                     lcp_key,
                     prompt_tokens.to_vec(),
@@ -7020,7 +7026,9 @@ fn generate_stream_once(
             let prefill_safe = !has_sliding_layer || prompt_tokens.len() <= sliding_window;
             if prefill_safe {
                 let lcp_key = build_lcp_key_for_request(loaded, params);
-                let linear_capacity = prompt_tokens.len() + params.max_tokens.max(1);
+                // iter-3.5d headroom (mirrors non-streaming site).
+                let linear_capacity =
+                    sliding_window.max(prompt_tokens.len() + params.max_tokens.max(1));
                 let _ = loaded.lcp_registry.store(
                     lcp_key,
                     prompt_tokens.to_vec(),
