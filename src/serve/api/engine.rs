@@ -4411,8 +4411,12 @@ fn generate_once_with_soft_tokens(
     // positions, not "the most recent sw positions".
     //
     // V1 fix: gate the store on `prompt_tokens.len() +
-    // completion_tokens <= sliding_window`. If decode wrapped (or
-    // would have wrapped), don't store — the cached state is no
+    // physical_decode_writes <= sliding_window` (Codex re-audit
+    // 2026-05-05: explicit physical-write counter incremented per
+    // `forward_decode` call, immune to grammar-pop / EOS-break /
+    // stop_string off-by-one accounting that `result.completion_tokens`
+    // would have introduced). If decode wrapped (or would have
+    // wrapped), don't store — the cached state is no
     // longer a faithful representation of the prompt prefix. This
     // makes long-conversation caching miss (each turn's prompt grows
     // and eventually exceeds sw) but preserves byte-identity
