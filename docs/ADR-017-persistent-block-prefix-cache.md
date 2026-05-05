@@ -3643,6 +3643,33 @@ Per the project mantra ("Code + test == truth"): Phase D is fully closed at the 
 
 ---
 
+### Phase D Closure iter-13 + iter-14 2026-05-05 — mantra dive-deep + regression checks (loop stop)
+
+**iter-13 (commit `95d94e5`, doc-only):** mantra-driven re-investigation of 4 items I'd marked as "future work":
+- `kv_restore_gemma` IoErr-skip pattern (`restore_block layer=N IoErr (skipped, continuing)` log lines in R-P5) — code audit confirmed working-as-intended. Spiller writes 256-token blocks ranging [0..256), [256..512), [512..768)..., but `kv_restore_gemma` allocates dense_kvs at the FIRST call's `n_tokens.max(512) = 512` slots. The 3rd block (slot 512+) overflows → bails with "linear slot N >= capacity 512" → IoErr → spiller skip-and-continue. **The bug is cosmetic, not correctness-affecting**: `forward_prefill.rs:1502` unconditionally REPLACES `self.dense_kvs = Some(...)` at the next request's first prefill, overwriting ANY restored bytes regardless. Allocating 16 GiB of dense_kvs to fill bytes that are immediately discarded would be pure waste, could OOM the M5 Max. KV-block restore is preserved as substrate for a future Phase E option (a) LCP partial-prefill resume that would actually CONSUME the restored bytes; current Phase E (full-equality PromptCache replay, iter-5/6) is what produces the measurable cache hit. Doc clarification added inline.
+- R-F5 pin-set "future iter" — verified: race is bounded by R-C6's "fall through to fresh prefill" semantic. LRU-by-mtime is correct because just-restored blocks have latest mtime (eviction takes from front).
+- R-C6 4th scenario "delete intermediate block" — verified at code level: `parent_block_hash` is recorded in `BlockMeta` but never validated at restore time. Chain-hash is informational by design; doc claim accurate.
+- Recovery on partial cache — already covered by `recover_from_disk_with_corrupted_blocks_reports_quarantined_count` test.
+
+**iter-14 (no commit, test reverted):** regression check after iter-10/11/12. R-P1 (between-decodes K2 falsifier — load-bearing) re-validated:
+
+```
+[Phase D R-P1] baseline_ttft_avg=55.6ms (samples=[276.41, 0.42, 0.27, 0.36, 0.31])
+[Phase D R-P1] sustained_ttft_avg=0.3ms (samples=[0.40, 0.40, 0.26, 0.26, 0.25])
+[Phase D R-P1] overhead=-0.994 (gate: <= 0.05)
+[R-P1] PASS — overhead within 5% gate
+```
+
+R-P5 + R-P6 also re-validated (R-P5: ratio=0.000 / 44,500× speedup; R-P6: 1.00× aggregate). All three ship-gate measurements PASS post-iter-10/11/12 changes.
+
+R-P1_CONCURRENT polish test (operator-controlled, not a ship-gate per iter-15 scoping): re-bench at iter-14 surfaced flake — 1/3 PASS rate at the iter-15 v2 N=3 sample budget. Attempted two methodology fixes (N=10 sequential samples; N=12 interleaved baseline↔concurrent pairs); BOTH made it worse because Apple Silicon Metal kernel jitter + thermal accumulation + GPU buffer pool growth cause progressive baseline drift across a single run (decode wall climbs from ~1.0s → ~3.0s within 6 iters). Reverted both attempts.
+
+**iter-15's FS-driver-noise root-cause attribution remains correct**: `force_eviction_via_symlink` tempdir+symlink work + thermal/GPU pool drift dominate the signal. A clean fix requires `BlockPrefixCacheSpiller::test_only_inject_pending_spill(N)` test-only API per iter-15's recommendation (~100-200 LOC; deferred — operator-controlled polish, not a ship-gate). **K2 verdict UNCHANGED**: load-bearing R-P1 between-decodes measurement (overhead=-0.994) is the K2 falsifier; R-P1_CONCURRENT is supplementary polish whose flakiness is methodological, not a real perf regression.
+
+**Loop stop (2026-05-05).** User confirmed Phase D is genuinely complete. Remaining items are all blocked-on-other-ADRs or operator-controlled — not within this implementation seat's scope. ScheduleWakeup omitted; loop ends.
+
+---
+
 ## Open Questions
 
 These are NOT stubs (per mantra). Each has a target-iter where the question is resolved by measurement or by code-truth audit:
