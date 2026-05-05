@@ -108,7 +108,7 @@ use crate::intelligence::hardware::HardwareProfile;
 /// once per load (no hot-path concern with cloning).  The `PathBuf` fields
 /// are `Option<_>` because `--tokenizer` / `--config` default to a
 /// next-to-the-GGUF lookup performed inside `LoadedModel::load`.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct EngineConfig {
     /// Optional explicit `tokenizer.json` path.  `None` ⇒ auto-resolve
     /// via `find_tokenizer` in `engine.rs` (sidecar lookup).
@@ -125,6 +125,27 @@ pub struct EngineConfig {
     /// `cmd_serve` startup both pass `true` so the returned engine is
     /// fully primed; tests using a `MockLoader` can pass `false`.
     pub warmup_synchronously: bool,
+    /// ADR-017 Phase E.a iter-2 — optional handle to the AppState-owned
+    /// `KvSpillCounters` (upcast to `Arc<dyn KvCacheMetricsSink>`) so
+    /// the engine worker thread's per-request LCP probe bumps the same
+    /// Arc the `/metrics` handler reads.  Set by `cmd_serve` from
+    /// `state.kv_spill_counters`. `None` for tests / standalone engine
+    /// constructions; the LCP probe becomes a no-op there.
+    pub kv_metrics_sink: Option<
+        std::sync::Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>,
+    >,
+}
+
+impl std::fmt::Debug for EngineConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineConfig")
+            .field("tokenizer_path", &self.tokenizer_path)
+            .field("config_path", &self.config_path)
+            .field("queue_capacity", &self.queue_capacity)
+            .field("warmup_synchronously", &self.warmup_synchronously)
+            .field("kv_metrics_sink_present", &self.kv_metrics_sink.is_some())
+            .finish()
+    }
 }
 
 /// Default pool capacity per ADR-005 Phase 4 narrative (line 929).

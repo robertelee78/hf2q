@@ -367,3 +367,108 @@ fn lcp_registry_store_rejects_empty_prompt() {
         .expect_err("empty prompt must reject");
     assert!(matches!(err, LcpStoreError::EmptyPrompt));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Iter-2 — `probe_lcp_opportunity` engine-side detection helper.
+//
+// These three tests pin the iter-2 gating contract: the engine.rs probe
+// returns `None` for any non-text-only request (multimodal soft_tokens
+// present) so the iter-3 partial-prefill path NEVER fires for vision
+// inputs, even when the cached LCP exists. Per dossier §10.5 — the
+// multimodal bail is a hard precondition, not a hint.
+//
+// Walk-discipline marker: tests are written BEFORE the helper impl.
+// Each test pins one independent invariant.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn probe_lcp_opportunity_gates_off_multimodal() {
+    // ADR-017 Phase E.a §10.5: requests with non-empty `soft_tokens`
+    // (vision / audio / per-position embedding overrides) MUST short-
+    // circuit to None even when a partial-prefix would otherwise hit.
+    // Reason: the cached KV state was generated under text-only
+    // embedding-lookup; replaying its prefix into a request whose
+    // first-N tokens have per-position overrides would silently
+    // corrupt outputs.
+    let mut reg: LcpRegistry<Vec<u8>> = LcpRegistry::new(4);
+    let k = key(0xAA, "t", 0);
+    let cached_prompt: Vec<u32> = (1..=10).collect();
+    let pl = payload(2, 0x55);
+    reg.store(k.clone(), cached_prompt.clone(), pl, 4096, 4096)
+        .expect("store");
+
+    // Same prompt, same key: a text-only probe would return Some(K) — but the
+    // multimodal flag must override.
+    let new_prompt: Vec<u32> = (1..=8).chain([900u32].iter().copied()).collect();
+    use hf2q::serve::kv_persist::lcp_registry::probe_lcp_opportunity;
+
+    let multimodal = probe_lcp_opportunity(&mut reg, &k, &new_prompt, /*has_soft_tokens=*/ true);
+    assert_eq!(
+        multimodal, None,
+        "multimodal request must NEVER probe LCP, even on cache-prone prompt"
+    );
+
+    // Sanity: same call with multimodal=false DOES hit, proving the gate
+    // (not absence of cache) caused the None above.
+    let text_only = probe_lcp_opportunity(&mut reg, &k, &new_prompt, /*has_soft_tokens=*/ false);
+    assert_eq!(
+        text_only,
+        Some(8),
+        "text-only probe on same prompt MUST hit (proves multimodal gate caused first None)"
+    );
+}
+
+#[test]
+fn probe_lcp_opportunity_returns_none_on_full_equality() {
+    // Iter-2 contract: full equality is the existing `PromptCache`
+    // (Phase E.b) win — `probe_lcp_opportunity` MUST NOT mask that path.
+    // The registry's `lookup` already enforces this (returns None when
+    // K == new_tokens.len()); the helper just preserves that semantic.
+    let mut reg: LcpRegistry<Vec<u8>> = LcpRegistry::new(4);
+    let k = key(0xAA, "t", 0);
+    let cached: Vec<u32> = (1..=10).collect();
+    reg.store(k.clone(), cached.clone(), payload(2, 0x66), 4096, 4096)
+        .expect("store");
+
+    use hf2q::serve::kv_persist::lcp_registry::probe_lcp_opportunity;
+
+    // Identical prompt — full equality.
+    let probe_full =
+        probe_lcp_opportunity(&mut reg, &k, &cached, /*has_soft_tokens=*/ false);
+    assert_eq!(
+        probe_full, None,
+        "full-equality lookup must yield None — PromptCache (E.b) handles that case"
+    );
+}
+
+#[test]
+fn probe_lcp_opportunity_returns_lcp_k_on_partial_match() {
+    // Iter-2 happy path: partial overlap returns `Some(K)` so the
+    // engine can bump `kv_lcp_detected_total` for observability.
+    // K equals the length of the longest common token-id prefix.
+    let mut reg: LcpRegistry<Vec<u8>> = LcpRegistry::new(4);
+    let k = key(0xAA, "t", 0);
+    let cached: Vec<u32> = (10..=29).collect(); // 20 tokens
+    reg.store(k.clone(), cached.clone(), payload(2, 0x77), 4096, 4096)
+        .expect("store");
+
+    use hf2q::serve::kv_persist::lcp_registry::probe_lcp_opportunity;
+
+    // Diverge at position 7 (token 17 → 999).
+    let new_prompt: Vec<u32> = (10..=16).chain([999u32].iter().copied()).collect();
+    let detected =
+        probe_lcp_opportunity(&mut reg, &k, &new_prompt, /*has_soft_tokens=*/ false);
+    assert_eq!(
+        detected,
+        Some(7),
+        "partial match must return Some(K=7) — 7 shared prefix tokens"
+    );
+
+    // Sanity: zero-overlap returns None (still respects K==0 ⇒ no opportunity).
+    let no_overlap: Vec<u32> = vec![1000, 1001, 1002];
+    let nope = probe_lcp_opportunity(&mut reg, &k, &no_overlap, /*has_soft_tokens=*/ false);
+    assert_eq!(
+        nope, None,
+        "zero-overlap prompt must yield None — no resume opportunity"
+    );
+}

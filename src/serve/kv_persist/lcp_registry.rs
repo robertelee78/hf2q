@@ -356,3 +356,67 @@ where
             .finish()
     }
 }
+
+// ---------------------------------------------------------------------------
+// iter-2 — engine-side detection helper.
+// ---------------------------------------------------------------------------
+
+/// ADR-017 Phase E.a iter-2 — engine-side LCP detection probe.
+///
+/// Given a registry, key, new prompt tokens, and a multimodal flag,
+/// returns `Some(K)` where `0 < K < new_tokens.len()` if a partial-
+/// prefix resume opportunity exists, else `None`. Used by
+/// `engine.rs::generate_once_with_soft_tokens` immediately AFTER the
+/// `PromptCache` full-equality miss (so E.b's win path is preserved)
+/// and BEFORE `forward_prefill_with_soft_tokens` so the iter-3
+/// partial-prefill modification has a single, named decision point.
+///
+/// ## Multimodal gate (dossier §10.5)
+///
+/// `has_soft_tokens == true` ⇒ always `None`. The cached KV state was
+/// generated under text-only embedding-lookup; replaying its prefix
+/// into a request whose first-N tokens have per-position soft-token
+/// overrides (vision / audio / deepstack) would silently corrupt
+/// outputs because the cached `[0..K)` KV state would not reflect the
+/// new request's per-position soft-token deltas. The bail is a hard
+/// precondition, not a hint.
+///
+/// ## Why a separate function (vs a method on `LcpRegistry`)
+///
+/// 1. **Engine call site has the multimodal flag, registry doesn't.**
+///    `LcpRegistry` is payload-agnostic; threading `has_soft_tokens`
+///    into `lookup` would couple the registry to the engine's
+///    multimodal scope. Keeping the gate in a free function lets the
+///    registry stay generic.
+/// 2. **Iter-2 ships an observability layer.** The probe returns
+///    `Option<usize>` (just K) — it never hands out the full
+///    `LcpPrefix<T>` payload, because iter-2 doesn't yet pre-warm
+///    `dense_kvs`. Iter-3 will swap callers to `LcpRegistry::lookup`
+///    directly to get the Arc-cloned payload.
+///
+/// Returns the LCP length `K` (1-indexed token count) on hit, `None`
+/// on any of: zero overlap (`K == 0`), full equality (`K == N`),
+/// fingerprint/tenant/params mismatch, or `has_soft_tokens == true`.
+///
+/// **Why `&mut`** — `LcpRegistry::lookup` is `&mut self` (it promotes
+/// the hit entry to MRU on each access). The probe inherits that.
+/// Engine sites already hold `loaded.lcp_registry` mutably (the worker
+/// thread is the sole owner per the `LoadedModel` ownership model
+/// mirrored from `prompt_cache`).
+pub fn probe_lcp_opportunity<T>(
+    registry: &mut LcpRegistry<T>,
+    key: &LcpKey,
+    new_tokens: &[u32],
+    has_soft_tokens: bool,
+) -> Option<usize>
+where
+    T: Send + Sync + 'static,
+{
+    if has_soft_tokens {
+        // Multimodal request — never probe LCP. The cached KV state
+        // was text-only; per-position soft-token overrides would
+        // diverge under partial-prefill resume.
+        return None;
+    }
+    registry.lookup(key, new_tokens).map(|prefix| prefix.k)
+}

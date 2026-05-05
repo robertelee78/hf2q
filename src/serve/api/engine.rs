@@ -1078,6 +1078,35 @@ pub struct GemmaLoadedModel {
     /// Owned by the worker thread; lives across requests.  See
     /// `PromptCache` doc for the cache contract.
     pub prompt_cache: PromptCache,
+    /// ADR-017 Phase E option (a) iter-2 — LCP partial-prefix
+    /// observability registry. Detects whether the current request's
+    /// prompt shares a non-trivial prefix with a previously-served
+    /// prompt under the same `(model_fingerprint, tenant_id,
+    /// params_hash)` tuple. Iter-2 ships **detection only**: hits
+    /// bump `KvSpillCounters::lcp_*` counters but the partial-prefill
+    /// resume path stays OFF — `forward_prefill` still resets
+    /// `write_pos = 0` per its iter-1 contract. Iter-3 (highest-risk;
+    /// requires Codex Phase-2b audit per memory
+    /// `feedback_codex_review_catches_unified_memory_races`) flips the
+    /// payload to `Vec<Arc<DenseKvBuffers>>` and conditionally honors
+    /// the cached prefix.
+    ///
+    /// Capacity = 16 entries — covers /cfa Phase 2 fan-out (≤8
+    /// workers sharing one system prompt) and multi-turn chat (last
+    /// 16 turns visible). Iter-3 may make this env-tunable via
+    /// `HF2Q_KV_LCP_CAPACITY`. Marker payload `()` because iter-2
+    /// stores the prompt-tokens key only — the actual KV state isn't
+    /// pinned until iter-3 lifts the ownership refactor.
+    pub lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry<()>,
+    /// ADR-017 Phase E.a iter-2 — handle to the AppState-owned
+    /// `KvSpillCounters` so per-request LCP probes bump the same Arc
+    /// the `/metrics` handler reads. `None` for tests / standalone
+    /// engine constructions / Qwen35 path (whose worker arm
+    /// short-circuits to 501 before any LCP probe could fire).
+    /// Set by `serve::load_engine` from `EngineConfig.kv_metrics_sink`
+    /// BEFORE `Engine::spawn` moves the loaded model into the worker.
+    pub kv_metrics_sink:
+        Option<std::sync::Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>>,
     /// ADR-017 §F4 — GGUF provenance captured at load time via
     /// `crate::serve::provenance::detect(&gguf)`. Threaded into the
     /// `KvSpillDescriptor` at `Engine::spawn` so the per-family hook
@@ -1955,6 +1984,16 @@ impl GemmaLoadedModel {
             eos_token_ids,
             load_duration,
             prompt_cache: PromptCache::new(),
+            // ADR-017 Phase E.a iter-2: detection-only LCP registry.
+            // Capacity 16 — covers /cfa Phase 2 fan-out + multi-turn
+            // chat last-16-turns visibility. Marker payload `()`.
+            lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry::new(16),
+            // ADR-017 Phase E.a iter-2: metrics sink wired by
+            // `serve::load_engine` AFTER this constructor returns
+            // (before `Engine::spawn` moves the loaded model). `None`
+            // until then; `record_lcp_probe` calls are gated on this
+            // being `Some`.
+            kv_metrics_sink: None,
             provenance,
         })
     }
@@ -3607,6 +3646,65 @@ fn warmup_once(loaded: &mut GemmaLoadedModel) -> Result<()> {
     Ok(())
 }
 
+/// ADR-017 Phase E option (a) iter-2 — build the per-request `LcpKey`
+/// from a Gemma-loaded model + sampling params.
+///
+/// The fingerprint side reuses the SAME provenance recipe the spiller
+/// uses (`Gemma4DenseSpill::model_fingerprint` at
+/// `gemma4_dense.rs:1326-1333`) so that ANY prompt seen on the
+/// KV-spill path and ANY prompt seen on the LCP-registry path key
+/// against the SAME byte-stable `ModelFingerprint`. That coherence
+/// matters at iter-3 wire-up time because the registry's payload will
+/// be Arc-cloned `DenseKvBuffers` whose KV state was generated under
+/// the same fingerprint — fingerprint divergence between the two
+/// caches would mask cross-cache safety regressions.
+///
+/// The `tenant_id` is hardcoded to the empty string for v1 (single-
+/// tenant). `params_hash = 0` because text-only Gemma 4 dense KV
+/// state generation is independent of decode-time sampling params
+/// (temperature, top_p, etc. apply post-prefill). Iter-3+ may tighten
+/// this if grammar / soft_tokens / RoPE-affecting flags become
+/// per-request configurable.
+fn build_lcp_key_for_request(
+    loaded: &GemmaLoadedModel,
+    _params: &SamplingParams,
+) -> crate::serve::kv_persist::lcp_registry::LcpKey {
+    use crate::serve::kv_persist::format::compute_model_fingerprint;
+    let (producer_version, source_sha256) = match &loaded.provenance {
+        crate::serve::provenance::Provenance::Hf2q {
+            producer_version,
+            source_sha256,
+            ..
+        } => (producer_version.as_str(), source_sha256.as_str()),
+        crate::serve::provenance::Provenance::External => ("", ""),
+    };
+    // External provenance ⇒ chat-template hash empty (legacy
+    // fallback at gemma4_dense.rs:1318-1324: External is
+    // `(repo, quant, "", "", "")` — preserves pre-iter-211 namespace
+    // collisions across re-quants of the same model).
+    let chat_template_hash = match &loaded.provenance {
+        crate::serve::provenance::Provenance::Hf2q { .. } => {
+            super::kv_spill_descriptor::KvSpillProvenance::hash_chat_template(
+                &loaded.chat_template,
+            )
+        }
+        crate::serve::provenance::Provenance::External => String::new(),
+    };
+    let quant = loaded.quant_type.as_deref().unwrap_or("");
+    let fp = compute_model_fingerprint(
+        &loaded.model_id,
+        quant,
+        producer_version,
+        source_sha256,
+        &chat_template_hash,
+    );
+    crate::serve::kv_persist::lcp_registry::LcpKey {
+        model_fingerprint: fp,
+        tenant_id: String::new(),
+        params_hash: 0,
+    }
+}
+
 /// Generate one full response: prefill the prompt, then decode up to
 /// `max_tokens`, halting on EOS or a configured stop string. The decode path
 /// is greedy-argmax (temperature 0). Richer sampling (top-p, top-k, seed,
@@ -3661,6 +3759,42 @@ fn generate_once_with_soft_tokens(
             cached.prompt_tokens
         );
         return Ok(cached);
+    }
+
+    // ── ADR-017 Phase E option (a) iter-2 — LCP partial-prefix probe ──
+    //
+    // Detection-only: bumps `hf2q_kv_lcp_lookups_total` always and
+    // `hf2q_kv_lcp_detected_total` when a non-trivial partial-prefix
+    // opportunity exists (`0 < K < N`). The partial-prefill resume
+    // path stays OFF — `forward_prefill_with_soft_tokens` below still
+    // resets `write_pos = 0` and re-runs from token 0. Iter-3
+    // (env-gated `HF2Q_KV_LCP_RESUME=1`, default-OFF, Codex Phase-2b
+    // audit gated) flips that.
+    //
+    // Multimodal request (`!soft_tokens.is_empty()`) ⇒ probe returns
+    // `None` unconditionally (cached KV state is text-only-bound; per-
+    // position soft-token overrides invalidate prefix reuse).  The
+    // probe returns `None` here so the lookup counter still increments
+    // but the detected counter doesn't — operators reading /metrics
+    // can attribute the gap.
+    {
+        let lcp_key = build_lcp_key_for_request(loaded, params);
+        let detected = crate::serve::kv_persist::lcp_registry::probe_lcp_opportunity(
+            &mut loaded.lcp_registry,
+            &lcp_key,
+            prompt_tokens,
+            !soft_tokens.is_empty(),
+        );
+        if let Some(sink) = loaded.kv_metrics_sink.as_ref() {
+            sink.record_lcp_probe(detected);
+        }
+        if let Some(k) = detected {
+            tracing::debug!(
+                "lcp_probe: detected — K={} of N={} (iter-2 reports only; partial-prefill OFF)",
+                k,
+                prompt_tokens.len()
+            );
+        }
     }
 
     // ── Sampler config — Tier 2/3/4 surface + grammar (iter-94 / iter-95) ──
@@ -4051,6 +4185,53 @@ fn generate_once_with_soft_tokens(
     // store happens AFTER all error paths above so a partial / failed
     // generation can never poison the cache.
     loaded.prompt_cache.store(prompt_tokens, params, &result);
+
+    // ADR-017 Phase E option (a) iter-2 — record this prompt in the
+    // LCP registry so future requests with shared-prefix prompts can
+    // be detected. Marker payload `()` per layer (iter-2 stores the
+    // prompt-token key only — the actual KV state isn't pinned until
+    // iter-3 lifts the ownership refactor and changes the payload to
+    // `Arc<DenseKvBuffers>`).
+    //
+    // Skip multimodal requests (`!soft_tokens.is_empty()`): the
+    // text-only-bound LCP registry must not record prompts whose
+    // KV state was generated under per-position soft-token overrides
+    // (cf. dossier §10.5 multimodal bail).  Keeping the registry
+    // text-only-pure means iter-3 can swap the marker for real KV
+    // payload without re-validating multimodal-ness on every lookup.
+    if soft_tokens.is_empty() {
+        let lcp_key = build_lcp_key_for_request(loaded, params);
+        let n_layers = loaded.weights.layers.len().max(1);
+        let payload: Vec<std::sync::Arc<()>> = (0..n_layers)
+            .map(|_| std::sync::Arc::new(()))
+            .collect();
+        // Iter-2 doesn't read the sliding-window / linear-capacity
+        // fields — they're stored for iter-3's bounds-aware restore
+        // path. Use loaded weights as source of truth (same way
+        // forward_prefill.rs derives them).
+        let sliding_window = loaded.weights.sliding_window.max(1);
+        let linear_capacity = prompt_len + params.max_tokens.max(1);
+        match loaded.lcp_registry.store(
+            lcp_key,
+            prompt_tokens.to_vec(),
+            payload,
+            sliding_window,
+            linear_capacity,
+        ) {
+            Ok(()) => {}
+            Err(e) => {
+                // Empty payload / empty prompt — both unreachable in
+                // this code path (we just generated against
+                // prompt_tokens which is non-empty per the assert at
+                // the top of this function; payload is non-empty per
+                // n_layers.max(1) above). Log + carry on; never panic.
+                tracing::debug!(
+                    "lcp_registry.store rejected (unexpected): {:?}",
+                    e
+                );
+            }
+        }
+    }
 
     Ok(result)
 }
@@ -5645,6 +5826,34 @@ fn generate_stream_once(
         return;
     }
 
+    // ── ADR-017 Phase E option (a) iter-2 — streaming-path LCP probe ──
+    //
+    // Mirrors the non-streaming probe at `generate_once_with_soft_tokens`
+    // (engine.rs ~3705). Same gate semantics: detection only; the
+    // partial-prefill path stays OFF; multimodal requests bump
+    // `lookups_total` but not `detected_total`. iter-3's env-gated
+    // partial-resume modification will land in `forward_prefill.rs`
+    // and be honored from BOTH probe sites.
+    {
+        let lcp_key = build_lcp_key_for_request(loaded, params);
+        let detected = crate::serve::kv_persist::lcp_registry::probe_lcp_opportunity(
+            &mut loaded.lcp_registry,
+            &lcp_key,
+            prompt_tokens,
+            !soft_tokens.is_empty(),
+        );
+        if let Some(sink) = loaded.kv_metrics_sink.as_ref() {
+            sink.record_lcp_probe(detected);
+        }
+        if let Some(k) = detected {
+            tracing::debug!(
+                "lcp_probe (streaming): detected — K={} of N={} (iter-2 reports only)",
+                k,
+                prompt_tokens.len()
+            );
+        }
+    }
+
     // Reasoning splitter — classifies each decoded fragment into the
     // content / reasoning_content slot. `None` when the model has no
     // registered reasoning markers; all fragments then route to `Content`.
@@ -6379,6 +6588,27 @@ fn generate_stream_once(
         &cache_result,
         Some(fragments),
     );
+
+    // ADR-017 Phase E.a iter-2 (streaming origin): mirror the
+    // non-streaming `lcp_registry.store` site so future shared-prefix
+    // requests detect against the streaming-served prompt too. Skip
+    // multimodal per dossier §10.5 (text-only-pure registry contract).
+    if soft_tokens.is_empty() {
+        let lcp_key = build_lcp_key_for_request(loaded, params);
+        let n_layers = loaded.weights.layers.len().max(1);
+        let payload: Vec<std::sync::Arc<()>> = (0..n_layers)
+            .map(|_| std::sync::Arc::new(()))
+            .collect();
+        let sliding_window = loaded.weights.sliding_window.max(1);
+        let linear_capacity = prompt_tokens.len() + params.max_tokens.max(1);
+        let _ = loaded.lcp_registry.store(
+            lcp_key,
+            prompt_tokens.to_vec(),
+            payload,
+            sliding_window,
+            linear_capacity,
+        );
+    }
 }
 
 fn hit_stop_string(text: &str, stops: &[String]) -> bool {

@@ -271,6 +271,18 @@ pub struct KvSpillCounters {
     /// fires; the array is sized for that single trigger and grows on
     /// future-trigger admission per [`KV_EVICTION_TRIGGERS`].
     evictions: [AtomicU64; KV_EVICTION_TRIGGER_COUNT],
+    /// ADR-017 Phase E option (a) iter-2: total per-request LCP probes
+    /// after `PromptCache` full-equality miss. Increments once per
+    /// post-miss probe regardless of detection outcome — denominator
+    /// for the detection-rate gauge.
+    lcp_lookups_total: AtomicU64,
+    /// ADR-017 Phase E.a iter-2: subset of `lcp_lookups_total` where a
+    /// non-trivial partial-prefix opportunity was detected
+    /// (`0 < K < new_tokens.len()`). Numerator for the detection-rate
+    /// gauge.  Iter-2 reports only — partial-prefill resume path stays
+    /// OFF until iter-3 (env-gated `HF2Q_KV_LCP_RESUME=1`, default-OFF,
+    /// Codex Phase-2b audit gated).
+    lcp_detected_total: AtomicU64,
 }
 
 // ADR-017 §R-F7: re-export the trait + label constant set from the
@@ -445,6 +457,18 @@ impl KvSpillCounters {
     pub fn snapshot_evictions(&self) -> [u64; KV_EVICTION_TRIGGER_COUNT] {
         [self.evictions[KV_EVICTION_TRIGGER_BUDGET_OVERFLOW].load(Ordering::Relaxed)]
     }
+
+    /// ADR-017 Phase E.a iter-2: snapshot the (lookups, detected) tuple
+    /// for `/metrics` emission. Both counters are emitted unconditionally
+    /// — Prometheus convention; absent counter ⇒ no histogram, missed
+    /// alerts (mirrors the quarantine-array discipline at
+    /// [`Self::snapshot_quarantines`]).
+    pub fn snapshot_lcp(&self) -> (u64, u64) {
+        (
+            self.lcp_lookups_total.load(Ordering::Relaxed),
+            self.lcp_detected_total.load(Ordering::Relaxed),
+        )
+    }
 }
 
 /// ADR-017 §R-F7: production [`KvCacheMetricsSink`] impl. The substrate
@@ -459,6 +483,19 @@ impl KvCacheMetricsSink for KvSpillCounters {
 
     fn record_eviction_budget_overflow(&self) {
         self.evictions[KV_EVICTION_TRIGGER_BUDGET_OVERFLOW].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// ADR-017 Phase E.a iter-2: record one LCP probe outcome.
+    /// `detected_k.is_some()` ⇒ both `lookups_total` and
+    /// `detected_total` increment; `None` ⇒ only `lookups_total`. The
+    /// `_k_value` discard is intentional — iter-2 keeps the cardinality
+    /// at 2 counters; iter-3+ may swap to a histogram if K-bucketed
+    /// distribution ever becomes the load-bearing observability shape.
+    fn record_lcp_probe(&self, detected_k: Option<usize>) {
+        self.lcp_lookups_total.fetch_add(1, Ordering::Relaxed);
+        if detected_k.is_some() {
+            self.lcp_detected_total.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1059,5 +1096,60 @@ mod tests {
         assert_eq!(attached.config, cfg);
         assert_eq!(attached.arch, ArchProfile::Gemma4Siglip);
         assert!(attached.config.projector.is_supported());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ADR-017 Phase E option (a) iter-2 — `record_lcp_probe` counter tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn kv_spill_counters_lcp_probe_records_lookups_unconditionally() {
+        // ADR-017 Phase E.a iter-2: every probe (even when no
+        // partial-prefix opportunity exists) bumps `lookups_total`.
+        // Operators read both counters from /metrics and compute the
+        // detection-rate gauge `(detected/lookups)` in dashboards;
+        // requiring `lookups_total` to be the denominator is the
+        // load-bearing invariant tested here.
+        let counters = KvSpillCounters::new();
+
+        // Probe outcomes: miss (None) → only lookups_total bumps.
+        counters.record_lcp_probe(None);
+        counters.record_lcp_probe(None);
+        counters.record_lcp_probe(None);
+
+        let (lookups, detected) = counters.snapshot_lcp();
+        assert_eq!(lookups, 3, "every probe must bump lookups_total");
+        assert_eq!(detected, 0, "None outcome must NOT bump detected_total");
+    }
+
+    #[test]
+    fn kv_spill_counters_lcp_probe_increments_detected_on_some() {
+        // ADR-017 Phase E.a iter-2: a `Some(K)` outcome bumps both
+        // counters. `K` value is intentionally NOT recorded in iter-2
+        // — the histogram-by-K shape would change cardinality and
+        // break dashboard-stable scrape lines.
+        let counters = KvSpillCounters::new();
+
+        counters.record_lcp_probe(Some(5));
+        counters.record_lcp_probe(Some(127));
+        counters.record_lcp_probe(None); // miss between hits
+        counters.record_lcp_probe(Some(42));
+
+        let (lookups, detected) = counters.snapshot_lcp();
+        assert_eq!(lookups, 4, "all 4 probes must bump lookups_total");
+        assert_eq!(
+            detected, 3,
+            "3 Some outcomes must bump detected_total; 1 None must not"
+        );
+    }
+
+    #[test]
+    fn kv_spill_counters_lcp_probe_starts_at_zero() {
+        // Defensive: a fresh counters table reports (0, 0) for LCP.
+        // The `/metrics` handler emits these unconditionally so a pre-
+        // first-request scrape sees `hf2q_kv_lcp_lookups_total 0`
+        // (Prometheus convention; absent counter ⇒ no histogram).
+        let counters = KvSpillCounters::new();
+        assert_eq!(counters.snapshot_lcp(), (0, 0));
     }
 }

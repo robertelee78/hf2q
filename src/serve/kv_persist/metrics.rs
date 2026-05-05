@@ -135,6 +135,20 @@ pub trait KvCacheMetricsSink: Send + Sync {
     /// NOT bump — the per-call NOT per-block invariant from
     /// `KvSpillCounters::record_spill` extends to this sink as well).
     fn record_eviction_budget_overflow(&self);
+
+    /// ADR-017 Phase E option (a) iter-2 — per-request LCP probe
+    /// observation.  Bumps `hf2q_kv_lcp_lookups_total` unconditionally
+    /// (every post-`PromptCache`-miss probe counts as a lookup) and
+    /// `hf2q_kv_lcp_detected_total` when `detected_k.is_some()` (a
+    /// non-trivial partial-prefix opportunity exists, i.e. `0 < K <
+    /// new_tokens.len()`). The optional `k_value` lets future
+    /// histogram-style sinks bucket by LCP length; the production
+    /// `KvSpillCounters` impl stores the count of detection events
+    /// only.
+    ///
+    /// Default impl is a no-op so non-production / mock sinks (tests)
+    /// can opt out without code churn.
+    fn record_lcp_probe(&self, _detected_k: Option<usize>) {}
 }
 
 /// Convenience alias used by trigger sites: the optional reference the

@@ -2610,7 +2610,17 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
         tokenizer_path: config.tokenizer_path.clone(),
         config_path: config.config_path.clone(),
     };
-    let loaded = api::engine::LoadedModel::load(&load_opts)?;
+    let mut loaded = api::engine::LoadedModel::load(&load_opts)?;
+    // ADR-017 Phase E.a iter-2: thread the metrics sink onto the
+    // GemmaLoadedModel BEFORE Engine::spawn moves `loaded` into the
+    // worker. Qwen35 / Qwen3VlText variants don't yet have an LCP
+    // probe site (their worker arm returns 501 before any prefill);
+    // skip them. None on the EngineConfig ⇒ no-op (test path).
+    if let Some(sink) = config.kv_metrics_sink.as_ref() {
+        if let api::engine::LoadedModel::Gemma(g) = &mut loaded {
+            g.kv_metrics_sink = Some(std::sync::Arc::clone(sink));
+        }
+    }
     let engine = api::engine::Engine::spawn(loaded, config.queue_capacity, None);
     load_info::emit_tracing(engine.info());
 
@@ -3163,6 +3173,12 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             config_path: args.config.clone(),
             queue_capacity: config.queue_capacity,
             warmup_synchronously: true,
+            // ADR-017 Phase E.a iter-2: cmd_serve startup pre-warm
+            // path. Thread the same AppState counters Arc here so the
+            // initial pre-warmed engine has the same LCP-probe sink
+            // wiring as engines admitted later via the auto-pipeline.
+            kv_metrics_sink: Some(std::sync::Arc::clone(&state.kv_spill_counters)
+                as std::sync::Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>),
         };
         // ADR-017 C.1: arm the LoaderWrapper's pending_bind slot for
         // the about-to-fire load_or_get. Synchronous contract — see
@@ -4755,6 +4771,7 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
+            kv_metrics_sink: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         // 0-tensor GGUF can't fully load, but the FAILURE shape proves
@@ -4788,6 +4805,7 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
+            kv_metrics_sink: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err(), "0-tensor synthetic GGUF must fail load");
@@ -4824,6 +4842,7 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
+            kv_metrics_sink: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(
@@ -4862,6 +4881,7 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
+            kv_metrics_sink: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err());
@@ -4884,6 +4904,7 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
+            kv_metrics_sink: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err());
@@ -4908,6 +4929,7 @@ mod tests {
             config_path: None,
             queue_capacity: 4,
             warmup_synchronously: false,
+            kv_metrics_sink: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err(), "minimal GGUF must fail downstream load");
@@ -4945,6 +4967,7 @@ mod tests {
                 config_path: None,
                 queue_capacity: 4,
                 warmup_synchronously: false,
+                kv_metrics_sink: None,
             };
             let result = super::load_engine(tmp.path(), &cfg);
             assert!(

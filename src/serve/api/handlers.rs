@@ -209,6 +209,14 @@ async fn resolve_engine_for_request(
         config_path: None,
         queue_capacity: state.engine_queue_capacity,
         warmup_synchronously: true,
+        // ADR-017 Phase E.a iter-2: thread the AppState-owned counters
+        // through to the engine worker so per-request LCP probes bump
+        // the same Arc the /metrics handler reads. Upcast
+        // `Arc<KvSpillCounters>` → `Arc<dyn KvCacheMetricsSink>` once
+        // here; the worker captures the trait-object and calls the
+        // default-no-op `record_lcp_probe` impl on non-prod builds.
+        kv_metrics_sink: Some(Arc::clone(&state.kv_spill_counters)
+            as Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>),
     };
     let pool_arc = state.pool.clone();
     let pool_repo_blocking = pool_repo.clone();
@@ -6741,6 +6749,33 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         s
     };
 
+    // ADR-017 Phase E option (a) iter-2: LCP partial-prefix detection
+    // observability. Both counters emit unconditionally (parseable
+    // zero on a process that has yet to serve a request).
+    //   * `hf2q_kv_lcp_lookups_total` — denominator: probes after
+    //     PromptCache full-equality miss.
+    //   * `hf2q_kv_lcp_detected_total` — numerator: probes that found
+    //     a non-trivial partial-prefix opportunity (`0 < K < N`).
+    // The detection-rate gauge `(detected/lookups)` lives in operator
+    // dashboards, not in the metrics surface itself, so a future
+    // change to the K-bucketed shape (histogram) doesn't break the
+    // counter contract here.
+    let (kv_lcp_lookups, kv_lcp_detected) = state.kv_spill_counters.snapshot_lcp();
+    let kv_lcp_block = {
+        let mut s = String::with_capacity(384);
+        s.push_str("# HELP hf2q_kv_lcp_lookups_total Total LCP probes after PromptCache full-equality miss (ADR-017 Phase E.a iter-2).\n");
+        s.push_str("# TYPE hf2q_kv_lcp_lookups_total counter\n");
+        s.push_str("hf2q_kv_lcp_lookups_total ");
+        s.push_str(&kv_lcp_lookups.to_string());
+        s.push('\n');
+        s.push_str("# HELP hf2q_kv_lcp_detected_total Probes that found a non-trivial partial-prefix opportunity (0 < K < N). Iter-2 reports only — partial-prefill resume path stays OFF.\n");
+        s.push_str("# TYPE hf2q_kv_lcp_detected_total counter\n");
+        s.push_str("hf2q_kv_lcp_detected_total ");
+        s.push_str(&kv_lcp_detected.to_string());
+        s.push('\n');
+        s
+    };
+
     // Gauges: read live from the BlockIndex via the AppState handle.
     // No --kv-persist substrate ⇒ both gauges report 0 (the surface
     // stays parseable; operators querying a non-kv-persist deployment
@@ -6785,6 +6820,7 @@ hf2q_kv_cache_bytes_on_disk {kv_cache_bytes}\n\
 # TYPE hf2q_kv_cache_blocks_total gauge\n\
 hf2q_kv_cache_blocks_total {kv_cache_blocks}\n\
 {kv_evictions_block}\
+{kv_lcp_block}\
 # HELP hf2q_requests_total Total HTTP requests reaching a handler (post-auth).\n\
 # TYPE hf2q_requests_total counter\n\
 hf2q_requests_total {req_total}\n\
@@ -6820,6 +6856,7 @@ hf2q_prompt_tokens_total {prompt_tok}\n\
         kv_restores_block = kv_restores_block,
         kv_quarantined_block = kv_quarantined_block,
         kv_evictions_block = kv_evictions_block,
+        kv_lcp_block = kv_lcp_block,
         kv_cache_bytes = kv_cache_bytes_on_disk,
         kv_cache_blocks = kv_cache_blocks_total,
         req_total = m.requests_total.load(Ordering::Relaxed),

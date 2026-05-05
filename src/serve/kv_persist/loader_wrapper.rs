@@ -518,6 +518,7 @@ mod tests {
                 config_path: None,
                 queue_capacity: 32,
                 warmup_synchronously: false,
+                kv_metrics_sink: None,
             },
         )
     }
