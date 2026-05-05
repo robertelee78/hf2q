@@ -356,8 +356,11 @@ impl OutputBackend for GgufBackend {
             "Writing GGUF tensors",
         );
 
-        // Build metadata key-value pairs
-        let mut metadata = build_metadata(model, input_dir);
+        // Build metadata key-value pairs. `?` propagates
+        // `BackendError::ValidationFailed` from the tokenizer-vocab
+        // invariants added 2026-05-05 (gguf.rs:2674-3056) — the convert
+        // CLI surfaces this as a non-zero exit with the validation reason.
+        let mut metadata = build_metadata(model, input_dir)?;
         // ADR-005 Phase 4 iter-211 — append the three (or two, when
         // mmproj is None) hf2q.provenance.* keys when the caller
         // configured a provenance binding via
@@ -2659,15 +2662,27 @@ fn read_full_vocab_size_from_config(input_dir: &Path) -> Option<u64> {
 /// metadata key-value pairs for embedding into the GGUF file.
 ///
 /// Parses `tokenizer.json` and `tokenizer_config.json` from `input_dir`.
-/// Returns `None` if `tokenizer.json` is missing (graceful skip).
-fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, MetaValue)>> {
+/// Return semantics:
+/// * `Ok(vec![...])` — full tokenizer metadata embedded.
+/// * `Ok(vec![])` — graceful skip: no `tokenizer.json` (or unparseable, or
+///   missing required sections like `model.vocab`). The GGUF will not
+///   embed tokenizer metadata and the runtime falls back to its own loader.
+/// * `Err(BackendError::ValidationFailed { reason })` — silent-corruption
+///   class: `vocab_size` cannot be authoritatively determined, OR the
+///   merged vocab/`tokenizer_config.json` cross-checks fail in a way that
+///   would yield the 2026-04-30 DWQ48/46 bug class (vocab truncated +
+///   `<|im_end|>` unresolvable + missing eos_token_id metadata).
+fn load_tokenizer_metadata(
+    input_dir: &Path,
+    arch: &str,
+) -> Result<Vec<(String, MetaValue)>, BackendError> {
     let tokenizer_path = input_dir.join("tokenizer.json");
     if !tokenizer_path.exists() {
         warn!(
             "No tokenizer.json found in {}; skipping tokenizer embedding",
             input_dir.display()
         );
-        return None;
+        return Ok(Vec::new());
     }
 
     let tokenizer_json: serde_json::Value = match std::fs::read_to_string(&tokenizer_path) {
@@ -2678,7 +2693,7 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
                     "Failed to parse tokenizer.json: {}; skipping tokenizer embedding",
                     e
                 );
-                return None;
+                return Ok(Vec::new());
             }
         },
         Err(e) => {
@@ -2686,7 +2701,7 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
                 "Failed to read tokenizer.json: {}; skipping tokenizer embedding",
                 e
             );
-            return None;
+            return Ok(Vec::new());
         }
     };
 
@@ -2696,7 +2711,10 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok());
 
-    let model_section = tokenizer_json.get("model")?;
+    let model_section = match tokenizer_json.get("model") {
+        Some(s) => s,
+        None => return Ok(Vec::new()),
+    };
 
     // Determine tokenizer model name
     let tokenizer_model_name = determine_tokenizer_model_name(model_section, arch);
@@ -2728,8 +2746,13 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
     // llama.cpp ships, what HF AutoTokenizer.vocab returns at runtime,
     // and what the embedding matrix expects.
 
-    // 1. Base BPE vocab from `tokenizer.json[model][vocab]`.
-    let vocab_obj = model_section.get("vocab")?.as_object()?;
+    // 1. Base BPE vocab from `tokenizer.json[model][vocab]`. Missing/
+    //    non-object → graceful skip (Ok(None)) — same as missing
+    //    tokenizer.json, no vocab to embed.
+    let vocab_obj = match model_section.get("vocab").and_then(|v| v.as_object()) {
+        Some(o) => o,
+        None => return Ok(Vec::new()),
+    };
     let base_vocab_size = vocab_obj.len();
     let mut id_to_token: std::collections::HashMap<u32, String> =
         std::collections::HashMap::with_capacity(base_vocab_size + 64);
@@ -2772,6 +2795,7 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
     //    matrix row count. Fall back to max observed id + 1 only as a
     //    last resort (legacy compat for malformed configs).
     let max_observed_id = id_to_token.keys().max().copied().unwrap_or(0) as usize;
+    let max_added_id = added_ids.iter().copied().max().unwrap_or(0) as usize;
     let target_vocab_size: usize = match read_full_vocab_size_from_config(input_dir) {
         Some(v) => {
             let v = v as usize;
@@ -2788,13 +2812,29 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
             }
         }
         None => {
-            warn!(
-                "No vocab_size in config.json; falling back to max observed token id+1 = {}. \
-                 If your model has added_tokens with ids beyond the base BPE range, the \
-                 resulting GGUF may be missing embedding rows.",
-                max_observed_id + 1
-            );
-            max_observed_id + 1
+            // 2026-05-05 — was a `warn!` + silent fallback. That fallback is
+            // exactly what produced the 2026-04-30 DWQ48/46 broken GGUFs:
+            // when `tokenizer.json` had no `added_tokens` parsed (or the
+            // parser failed silently), `max_observed_id` was 248043 (base
+            // BPE only) so the fallback chose 248044 instead of the true
+            // 248320, and the resulting GGUF had no embedding rows for
+            // ids 248044..248319 (`<|im_end|>` etc.). Hard-fail here;
+            // the operator's tooling must surface a real `vocab_size`
+            // rather than letting us guess.
+            return Err(BackendError::ValidationFailed {
+                reason: format!(
+                    "ValidationFailed: config.json in {} has no `vocab_size` (and no \
+                     `text_config.vocab_size`). Refusing to fall back to max-observed-id+1 \
+                     ({}) — that fallback is what produced the 2026-04-30 DWQ48/46 \
+                     broken-vocab regression. The HF source dir MUST declare `vocab_size`. \
+                     Without it we cannot tell whether ids {}..(true vocab) — typically \
+                     <|im_end|>, <|endoftext|>, vision/audio special tokens — should be \
+                     in this GGUF or not.",
+                    input_dir.display(),
+                    max_observed_id + 1,
+                    max_added_id.max(max_observed_id) + 1,
+                ),
+            });
         }
     };
     let total_tokens = target_vocab_size;
@@ -2886,6 +2926,62 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
     let eos_id = resolve_special_token_id("eos_token", &tokenizer_config, &vocab_entries);
     let unk_id = resolve_special_token_id("unk_token", &tokenizer_config, &vocab_entries);
     let pad_id = resolve_special_token_id("pad_token", &tokenizer_config, &vocab_entries);
+
+    // 8.5 Post-write invariants — the user's "post-write count check"
+    // (CFA 2026-05-05). The 2026-04-30 broken DWQ48/46 GGUFs all looked
+    // structurally fine at this point but had `eos_id == None` because
+    // the merged vocab was missing the eos_token string. Hard-fail here:
+    // `tokenizer_config.json` declared an `eos_token` but we cannot map
+    // it to an id in the resolved vocab. Skipping the eos_token_id
+    // emission silently is what produced the runaway-generation symptom.
+    if let Some(cfg) = tokenizer_config.as_ref() {
+        // tokenizer_config[eos_token] can be either a bare string
+        // ("<|im_end|>") or an AddedToken object ({"content": "<|im_end|>", ...}).
+        let eos_str_opt: Option<String> = cfg.get("eos_token").and_then(|v| {
+            v.as_str().map(|s| s.to_string()).or_else(|| {
+                v.get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string())
+            })
+        });
+        if let Some(eos_str) = eos_str_opt {
+            if eos_id.is_none() {
+                return Err(BackendError::ValidationFailed {
+                    reason: format!(
+                        "ValidationFailed: tokenizer_config.json declares eos_token = {:?} \
+                         but it is NOT in the merged vocab of {} ids (base BPE: {}, \
+                         added_tokens: {}). This is the exact silent-corruption signature \
+                         of the 2026-04-30 DWQ48/46 GGUFs — emitting now would produce \
+                         a model that cannot terminate generation. Common cause: \
+                         tokenizer.json[added_tokens] is missing or schema-shifted; \
+                         expected an array of {{id, content, special}} entries with \
+                         content strings that include the eos_token literal.",
+                        eos_str,
+                        total_tokens,
+                        base_vocab_size,
+                        added_ids.len(),
+                    ),
+                });
+            }
+        }
+    }
+    // Defensive: any added_token id outside [0, total_tokens) means the
+    // resolved vocab_size was too small for the data we read. Fall-through
+    // would gap-fill the high ids with `[PAD]` and silently drop the
+    // referenced tokens — same bug class.
+    if let Some(&out_of_range) = added_ids.iter().find(|id| (**id as usize) >= total_tokens) {
+        return Err(BackendError::ValidationFailed {
+            reason: format!(
+                "ValidationFailed: added_token id {} is >= resolved vocab_size {} for {}; \
+                 refusing to emit a GGUF that would gap-fill that id with `[PAD]`. Either \
+                 config.json[vocab_size] is too small or tokenizer.json[added_tokens] has \
+                 an out-of-range entry.",
+                out_of_range,
+                total_tokens,
+                input_dir.display(),
+            ),
+        });
+    }
 
     // Build metadata KV pairs. The four always-present entries go in via the
     // vec![] literal; conditional ones (merges, special token ids, chat template)
@@ -3033,7 +3129,7 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
         pad_id,
     );
 
-    Some(kv)
+    Ok(kv)
 }
 
 /// Check if a token string matches the byte fallback pattern `<0xNN>` where NN
@@ -3195,7 +3291,15 @@ fn resolve_special_token_id(
 }
 
 /// Build the GGUF metadata key-value list from model metadata.
-fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, MetaValue)> {
+///
+/// Returns `Err(BackendError::ValidationFailed)` when tokenizer-metadata
+/// invariants fail — see `load_tokenizer_metadata` for the bail conditions
+/// (no `vocab_size` in config, eos_token unresolvable in merged vocab,
+/// added_token id out of range).
+fn build_metadata(
+    model: &QuantizedModel,
+    input_dir: &Path,
+) -> Result<Vec<(String, MetaValue)>, BackendError> {
     let meta = &model.metadata;
     // ADR-012 Decision 1: resolve GGUF arch from architectures[0] for qwen35/qwen35moe.
     // For all other arches this returns model_type unchanged.
@@ -3459,12 +3563,15 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
         emit_qwen35_metadata(meta, arch, &mut kv);
     }
 
-    // Load and embed tokenizer metadata from input directory
-    if let Some(tok_kv) = load_tokenizer_metadata(input_dir, arch) {
-        kv.extend(tok_kv);
-    }
+    // Load and embed tokenizer metadata from input directory. `?` here
+    // surfaces vocab-corruption invariants (added 2026-05-05 CFA) — the
+    // outer `write` already returns Result<_, BackendError>, so the bail
+    // propagates cleanly to the convert CLI. Empty Vec means graceful
+    // skip (no tokenizer.json on disk).
+    let tok_kv = load_tokenizer_metadata(input_dir, arch)?;
+    kv.extend(tok_kv);
 
-    kv
+    Ok(kv)
 }
 
 /// Emit Qwen3.5-family (dense + MoE) GGUF metadata keys.
@@ -4296,7 +4403,7 @@ mod tests {
     #[test]
     fn test_metadata_keys() {
         let tmp = tempfile::tempdir().unwrap();
-        let kv = build_metadata(&model(vec![], 4), tmp.path());
+        let kv = build_metadata(&model(vec![], 4), tmp.path()).expect("build_metadata ok");
         let keys: Vec<&str> = kv.iter().map(|(k, _)| k.as_str()).collect();
         for expected in [
             "general.architecture",
@@ -5179,7 +5286,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
 
         let dense = model_with_metadata(meta_qwen35_dense());
-        let dense_kv = build_metadata(&dense, tmp.path());
+        let dense_kv = build_metadata(&dense, tmp.path()).expect("build_metadata dense ok");
         assert_eq!(
             metadata_u32(&dense_kv, "qwen35.block_count"),
             Some(65),
@@ -5187,7 +5294,7 @@ mod tests {
         );
 
         let moe = model_with_metadata(meta_qwen35_moe());
-        let moe_kv = build_metadata(&moe, tmp.path());
+        let moe_kv = build_metadata(&moe, tmp.path()).expect("build_metadata moe ok");
         assert_eq!(
             metadata_u32(&moe_kv, "qwen35moe.block_count"),
             Some(41),
@@ -5202,7 +5309,7 @@ mod tests {
         metadata.mtp_num_hidden_layers = Some(1);
 
         let model = model_with_metadata(metadata);
-        let kv = build_metadata(&model, tmp.path());
+        let kv = build_metadata(&model, tmp.path()).expect("build_metadata ok");
         assert_eq!(
             metadata_u32(&kv, "llama.block_count"),
             Some(32),
