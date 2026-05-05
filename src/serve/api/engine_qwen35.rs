@@ -1012,8 +1012,32 @@ pub fn generate_qwen35_once(
         // B.4 follow-up: kernel-level FA fast/resume support for seq < 16
         // would close this divergence and enable auto-chunked-under-LCP.
         let lcp_resume_enabled = crate::debug::INVESTIGATION_ENV.kv_lcp_resume;
+        // ADR-017 Phase E.a B.4 path (ii): skip the qL ∈ [2, 15] DANGER
+        // ZONE.  Chunked prefill where the partial-tail chunk has seq <
+        // 16 hits the FA bf16 d256 fast/resume short-qL gate at
+        // `gpu_full_attn.rs:1860` and falls to the legacy F32 SDPA path,
+        // producing byte-different output to monolithic FA fast path.
+        // Documented as a kernel-level gap at `gpu_full_attn.rs:1830-1852`
+        // ("qL ∈ [2, 15] has no known-good path on this kernel set").
+        //
+        // Workaround: when prompt_len % stride < 16 AND prompt_len %
+        // stride > 0 (i.e., last chunk would have seq < 16), refuse
+        // chunked prefill — the request runs monolithically instead.
+        // This loses B.3 mid-prefill caching for these specific prompt
+        // lengths but preserves byte-identity to monolithic for
+        // every other length.
+        //
+        // Coverage: at stride=64 the danger zone is prompt_len mod 64 ∈
+        // {1..15} — about 23% of prompt lengths.  The remaining 77%
+        // (stride-aligned + last-chunk-seq-≥-16) work correctly under
+        // chunked + B.3.  B.4 path (i) — Metal kernel work to support
+        // qL < 16 — would close this gap entirely; this workaround
+        // ships safe behavior in the meantime.
+        let tail = prompt_len % stride;
+        let in_danger_zone = tail > 0 && tail < 16;
         let chunked_eligible = stride > 0
             && prompt_len > stride
+            && !in_danger_zone
             && crate::debug::INVESTIGATION_ENV.kv_lcp_chunked_prefill;
         let prefill_logits = if chunked_eligible {
             // ADR-017 Phase B-hybrid.2a + B.3 — chunked prefill with mid-

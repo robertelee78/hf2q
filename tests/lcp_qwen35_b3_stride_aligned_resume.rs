@@ -71,19 +71,23 @@ const PORT_B: u16 = 52442;
 const HOST: &str = "127.0.0.1";
 const READYZ_BUDGET: Duration = Duration::from_secs(180);
 
-/// Long enough to span at least one stride=64 boundary after chat-
-/// template wrap (target turn-1 prompt_len ≈ 80-100 tokens → 2 chunks).
-/// Crafted to stay strictly in 2-chunk territory: chunked-prefill at
-/// 3+ chunks where the partial-tail chunk has seq < 16 hits a
-/// kernel-level divergence vs monolithic (B.4 follow-up;
-/// `gpu_full_attn.rs:1830-1852` documents qL ∈ [2, 15] has no
-/// FA-fast-or-resume path coverage on Qwen 3.6, so the partial-tail
-/// falls to legacy F32 SDPA producing byte-different output).
+/// Crafted to land turn-1 prompt_len in the SAFE zone after chat-
+/// template wrap: target ≥ 80 tokens (so chunked prefill engages: 2
+/// chunks of 64 + tail-≥-16) and turn-2 prompt_len also in safe zone
+/// (so chunked + LCP-resume composition passes B.4-workaround danger-
+/// zone check).
+///
+/// Why this matters: B.4 path (ii) workaround in engine_qwen35.rs
+/// disables chunked prefill when `prompt_len % stride ∈ {1..15}` (the
+/// kernel qL < 16 short-tile gap).  For B.3 mid-prefill stores to
+/// fire, prompt_len must be in the safe zone (% stride == 0 OR %
+/// stride ≥ 16).
 const TURN1_USER: &str =
     "I'm working on a Rust project organized by Domain-Driven Design \
      bounded contexts. Could you describe in detail how bounded contexts \
-     in DDD map to Rust crate boundaries with a concrete e-commerce \
-     example?";
+     in DDD map to Rust crate boundaries with a concrete example showing \
+     order, payment, and inventory in a typical e-commerce system that \
+     would help me structure my workspace?";
 
 /// Turn-2 user message — kept short; what matters is that the FIRST
 /// 64+ tokens of turn-2's tokenized prompt match turn-1's first 64+
