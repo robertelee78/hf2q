@@ -385,8 +385,25 @@ Possible deeper causes (not yet investigated):
 
 **B.2 status**: BLOCKED pending deeper root-cause. Mitigations:
 1. ~~Constrain chunked to divisible strides~~ — falsified by stride=54 experiment; bug isn't path-mismatch.
-2. **Pinpoint the per-state divergence**: write a unit-level test comparing `HybridKvCache` contents (conv_state + recurrent + full_attn current_len + full_attn K/V) after [54+54 chunked] vs [108 monolithic]. Find the FIRST differing field. Likely a single buffer's layout invariant is violated between calls.
-3. Fix the per-state bug. Likely small (single state-handoff fix) once located.
+2. **Pinpoint the per-state divergence**: ✅ DONE via diagnostic test
+   `forward_gpu::tests::phase_b2a_chunked_kv_cache_divergence_diagnostic`
+   (commit `e8910a2`). On Qwen 3.6 27B-DWQ46 with N=24, K=12:
+   * full_attn[0]: NO divergence (first layer; reads embeddings, not upstream KV).
+   * full_attn[1..16]: diverge at byte 12288 (= token 12 = split point K). Tokens [0..K) match; tokens [K..N) differ.
+   * ALL 48 linear_attn layers: conv_state + recurrent diverge from byte 0.
+3. Fix the per-state bug. **Diagnosis: not small.** The cascade pattern (all DeltaNet layers diverge end-to-end; downstream full-attn layers diverge only on tokens [K..N)) implies the broken hand-off is in forward_gpu_impl's interaction with a warm kv_cache. The kernel itself is correct (verified via `gated_delta_net_decode.metal:145 for(t=0;t<n_tokens)` autoregressive loop reads state_in / writes state_out per token; final state_out captures the seq_len-th state). Likely culprits (further investigation needed):
+   - Some forward_gpu_impl per-call setup (decode_pool reset, arena alloc, conv_state initialization) implicitly assumes fresh kv_cache and silently mis-handles a warm one.
+   - The `dn_prefill_arena` per-call lifecycle leaks state across calls when used in the chunked-prefill pattern.
+   - A subtle conv_state-vs-conv_state_scratch swap-parity invariant that holds for the "single monolithic call" use case but breaks across calls.
+
+**Realistic scope for fixing**: each candidate culprit requires hours of code-reading + targeted tests. Multi-iter effort. Without dedicated effort, Phase B.2 (chunked-prefill substrate for sparse DeltaNet checkpoints) is infeasible.
+
+**Phase B fallback architecture**: if the chunked-prefill path can't be made byte-identical to monolithic, the alternatives are:
+  - **B.2-end-only**: store ONLY the end-of-prefill snapshot (= full-equality replay = Phase E option (b), already shipped via HybridPromptCache). Provides full-prompt reuse, NOT partial-prefix.
+  - **B.2-kernel-hooks**: modify mlx-native kernels to emit checkpoints from within a single monolithic call. Multi-week scope; out of immediate reach.
+  - **B.2-chunked-fixed**: fix the chunked-prefill state hand-off (this iter's blocker). Investigation required.
+
+Given the cost trade-off (multi-iter blocker for an N×LCP_speedup that even Option 2 only delivers at ~75 % of DeltaNet bandwidth), the user should decide whether to invest more loop iters here or accept Qwen 3.5/3.6 LCP at full-equality-only and ship.
 
 **Default impact**: zero. The chunked path is gated on `HF2Q_KV_LCP_CHUNKED_PREFILL=1` (default OFF). Default `cargo test` passes 2814/0/3. The falsifier test runs only under `HF2Q_KV_PERSIST_PHASE_D=1 + HF2Q_KV_PERSIST_QWEN35_E2E_MODEL_PATH=<gguf>` (explicit operator opt-in).
 
