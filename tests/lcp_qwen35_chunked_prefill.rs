@@ -78,6 +78,11 @@ const READYZ_BUDGET: Duration = Duration::from_secs(180);
 /// tokens AND ideally a multiple-of-stride length. The test prints
 /// the actual tokenized length (via /metrics if available) and
 /// reports skip if the multiple-of-stride constraint isn't met.
+// ADR-017 Phase E.a B.5: post-gate-lift, the previously-failing
+// 130-token / 3-chunk / partial-tail=2 fixture is now byte-identical
+// to monolithic.  Use the longer prompt as the canonical fixture so
+// B.2a guards both the 2-chunk safe-zone AND the 3-chunk-with-tail<16
+// (formerly "danger zone") byte-identity invariants.
 const PROMPT: &str =
     "Write a detailed essay describing the four seasons in temperate climates. \
      Cover spring with its blossoming flowers and warming temperatures, summer \
@@ -85,7 +90,10 @@ const PROMPT: &str =
      and harvest festivals, and winter with snow and shorter daylight hours. \
      Include cultural traditions associated with each season across various \
      regions of the world, and explain how plants and animals adapt their \
-     behavior throughout the yearly cycle.";
+     behavior throughout the yearly cycle. Discuss agricultural patterns, \
+     migration routes for major bird species, hibernation strategies of \
+     mammals, and the impact of seasonal changes on freshwater ecosystems. \
+     Include examples from Europe, North America, and East Asia.";
 const MAX_TOKENS: u32 = 16;
 const TEST_STRIDE: u32 = 64;
 

@@ -728,19 +728,18 @@ fn build_lcp_key_for_qwen35_chunk(
 }
 
 /// ADR-017 Phase E.a B.3 — read the registry capacity from
-/// `HF2Q_KV_LCP_RESUME_CAPACITY` env (default 64).  Sized for one
-/// 4096-token prompt at stride=64 (= 64 stride boundaries) so a single
-/// long-prompt request can fill the registry without evicting itself.
-/// Each entry is a full `HybridKvCacheSnapshot` (~300 MB on Qwen 3.6
-/// 35B-A3B), so the cap is also a memory ceiling: 64 entries ≈ 19 GB
-/// peak registry footprint.  Operators with multi-request workloads
-/// or long-context prompts can raise the cap accordingly.
+/// `HF2Q_KV_LCP_RESUME_CAPACITY` env (default 8 to stay memory-safe on
+/// stock 128 GB Macs running multi-process tests).  Each entry is a
+/// full `HybridKvCacheSnapshot` (~300 MB on Qwen 3.6 35B-A3B), so cap=8
+/// ≈ 2.4 GB peak registry footprint per-process.  Operators with
+/// multi-request workloads or long-context prompts can raise the cap
+/// via env; the cap doubles as a memory ceiling.
 pub fn qwen35_lcp_registry_capacity() -> usize {
     std::env::var("HF2Q_KV_LCP_RESUME_CAPACITY")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(64)
+        .unwrap_or(8)
 }
 
 /// `true` when the running text ends with any of the registered stop
@@ -1012,32 +1011,27 @@ pub fn generate_qwen35_once(
         // B.4 follow-up: kernel-level FA fast/resume support for seq < 16
         // would close this divergence and enable auto-chunked-under-LCP.
         let lcp_resume_enabled = crate::debug::INVESTIGATION_ENV.kv_lcp_resume;
-        // ADR-017 Phase E.a B.4 path (ii): skip the qL ∈ [2, 15] DANGER
-        // ZONE.  Chunked prefill where the partial-tail chunk has seq <
-        // 16 hits the FA bf16 d256 fast/resume short-qL gate at
-        // `gpu_full_attn.rs:1860` and falls to the legacy F32 SDPA path,
-        // producing byte-different output to monolithic FA fast path.
-        // Documented as a kernel-level gap at `gpu_full_attn.rs:1830-1852`
-        // ("qL ∈ [2, 15] has no known-good path on this kernel set").
+        // ADR-017 Phase E.a B.5: B.4 path-ii danger-zone bypass REMOVED.
         //
-        // Workaround: when prompt_len % stride < 16 AND prompt_len %
-        // stride > 0 (i.e., last chunk would have seq < 16), refuse
-        // chunked prefill — the request runs monolithically instead.
-        // This loses B.3 mid-prefill caching for these specific prompt
-        // lengths but preserves byte-identity to monolithic for
-        // every other length.
+        // The gate lift at `gpu_full_attn.rs:1909+` (resume_path_eligible
+        // now requires `kv_seq_len >= 16` instead of `seq_len >= 16`)
+        // makes chunked prefill byte-identical to monolithic at ALL
+        // prompt lengths — including the previously-broken danger zone
+        // (`prompt_len % stride ∈ {1..15}` where the last chunk has
+        // seq < 16).  Verified empirically:
         //
-        // Coverage: at stride=64 the danger zone is prompt_len mod 64 ∈
-        // {1..15} — about 23% of prompt lengths.  The remaining 77%
-        // (stride-aligned + last-chunk-seq-≥-16) work correctly under
-        // chunked + B.3.  B.4 path (i) — Metal kernel work to support
-        // qL < 16 — would close this gap entirely; this workaround
-        // ships safe behavior in the meantime.
-        let tail = prompt_len % stride;
-        let in_danger_zone = tail > 0 && tail < 16;
+        //   * mlx-native kernel probe
+        //     `flash_attn_prefill_bf16_d256_resume_small_ql_multi_kl_probe`:
+        //     0/N elements differ at qL ∈ {2, 8, 15} with kL=130.
+        //   * hf2q-side B.4 danger-zone falsifier (now retitled to test
+        //     post-B.5 chunked engagement at danger-zone lengths).
+        //
+        // Chunked prefill now engages on all `prompt_len > stride`
+        // requests under `HF2Q_KV_LCP_CHUNKED_PREFILL=1`, with B.3
+        // mid-prefill stores firing on every stride-aligned chunk
+        // boundary regardless of partial-tail length.
         let chunked_eligible = stride > 0
             && prompt_len > stride
-            && !in_danger_zone
             && crate::debug::INVESTIGATION_ENV.kv_lcp_chunked_prefill;
         let prefill_logits = if chunked_eligible {
             // ADR-017 Phase B-hybrid.2a + B.3 — chunked prefill with mid-

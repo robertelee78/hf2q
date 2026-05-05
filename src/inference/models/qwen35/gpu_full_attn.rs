@@ -2109,32 +2109,44 @@ pub fn apply_sdpa_with_kv_cache(
             return Ok(out_uploaded);
         }
 
-        // ── ADR-017 Phase E.a B.2-fix: FA RESUME path (head_dim=256,
-        //    cur_len > 0, seq_len >= 16) ──
+        // ── ADR-017 Phase E.a B.2-fix + B.5: FA RESUME path
+        //    (head_dim=256, cur_len > 0, kv_seq_len >= 16) ──
         //
         // Slot K/V have already been populated with the new tokens at
         // `[cur_len..cur_len + seq_len]` by the
         // `dispatch_kv_cache_copy_seq_f32_dual` call above (line 1787).
         // The resume wrapper attends chunk-Q over the FULL slot
         // `[0..kv_seq_len]` via the FA bf16 d256 kernel with
-        // `qL_off = cur_len` and `kv_capacity` stride math (the kernel
-        // path is byte-identical to the monolithic FA fast path on a
-        // contiguous-packed full prefill — proven via the kernel-level
-        // parity test at /opt/mlx-native/tests/test_flash_attn_prefill.rs::
-        // flash_attn_prefill_bf16_d256_resume_byte_identical_to_monolithic
-        // and the host-side end-to-end test at
-        // gpu_full_attn::tests::
-        // phase_b2_iso_fast_path_vs_fallback_path_kernel_divergence
-        // Path D — both report 0/131072 elements differ).
+        // `qL_off = cur_len` and `kv_capacity` stride math.
         //
         // Why this branch matters: ADR-017 Phase E.a Phase B.2 LCP
         // partial-prefill resume on Qwen3.5/3.6 needs byte-identical
         // output to fresh prefill so multi-turn chat with shared prefix
-        // can resume from a cached slot snapshot.  The legacy F32 SDPA
-        // fallback below would produce byte-different output (BF16 MMA +
-        // log-domain online softmax vs F32 single-pass softmax) — see
-        // the kernel-divergence falsifier above.
-        let resume_path_eligible = head_dim == 256 && cur_len > 0 && seq_len >= 16;
+        // can resume from a cached slot snapshot.
+        //
+        // ── B.5 gate update ──
+        //
+        // Original gate (B.2-fix): `seq_len >= 16` — copied from the
+        // FAST path's gate, which exists because the documented qL < 16
+        // dim=10 NaN bug requires SINGLE K-TILE (kL <= 16).  But the
+        // RESUME path always has multi-K-tile (kL = cur_len + seq_len,
+        // and chunked-prefill stride is >= 64 so cur_len is typically
+        // large), so the SINGLE K-TILE condition never holds for resume.
+        //
+        // Verified empirically via the mlx-native kernel probe
+        // `flash_attn_prefill_bf16_d256_resume_small_ql_multi_kl_probe`
+        // (kL=130, qL ∈ {2, 8, 15}): 0/8192, 0/32768, 0/61440 BF16
+        // elements differ from monolithic.  Kernel produces byte-correct
+        // output at small qL when kL >= 16.  The B.4 danger-zone (qL
+        // < 16) was therefore overly conservative — a host-side gate
+        // gap, not a kernel-level limitation.
+        //
+        // B.5 v1 gate: `kv_seq_len >= 16` (multi-K-tile) replaces
+        // `seq_len >= 16`.  Closes the 23% danger-zone coverage gap and
+        // allows chunked + LCP-resume to engage on ALL prompt lengths.
+        let resume_path_eligible = head_dim == 256
+            && cur_len > 0
+            && kv_seq_len >= 16;
         if resume_path_eligible {
             let _w5b10_kernel_resume = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FaSdpaKernel,

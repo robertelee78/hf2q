@@ -3811,37 +3811,138 @@ follow-up.
   legacy F32 SDPA, producing byte-different output to monolithic FA
   fast path.
 
-* **B.4 path (ii) (`9bad86a`)** — danger-zone bypass workaround.
-  Engine-level gate at `engine_qwen35.rs::generate_qwen35_once` adds
-  `in_danger_zone = (prompt_len % stride) > 0 && (prompt_len % stride)
-  < 16`.  When in danger zone, chunked prefill is SKIPPED and the
-  request runs monolithically — preserving byte-identity to the
-  no-chunked-flag baseline.  Coverage at stride=64: ~77% of prompt
-  lengths (stride-aligned + last-chunk-seq-≥-16) engage chunked + B.3
-  mid-prefill caching; ~23% (danger zone) skip chunked but stay
-  byte-identical via monolithic.  Falsifier
-  (`tests/lcp_qwen35_b4_danger_zone_bypass.rs::phase_b4_danger_zone_bypass_byte_identity`)
-  on Qwen 3.6 35B-A3B-APEX-Q5_K_M with a 130-token prompt (tail=2 ∈
-  [1, 15]): server A with `HF2Q_KV_LCP_CHUNKED_PREFILL=1` correctly
-  skipped chunked (stderr lacks `chunked prefill` line); A 53 bytes
-  == B 53 bytes BYTE-IDENTICAL.
+* **B.4 path (ii) (`9bad86a`)** — initial danger-zone bypass
+  workaround (LATER OBSOLETED BY B.5; the workaround code path was
+  removed once B.5 lifted the underlying gate).  Recorded here for
+  historical reasoning: at the time B.4 landed, the working hypothesis
+  was that the "qL ∈ [2, 15] has no known-good path" comment at
+  `gpu_full_attn.rs:1830-1852` applied to the chunked partial-tail
+  case, requiring Metal-shader work to close.  B.4 path-ii landed an
+  engine-level danger-zone bypass while the kernel work was scoped.
 
-**Phase E.a is now FUNCTIONALLY COMPLETE** for byte-identity
-preservation at ALL prompt lengths under the chunked + LCP-resume
-composition:
-  * Safe-zone prompts (~77%): chunked engages, B.3 mid-prefill stores
-    fire, LCP resume on subsequent matching prompts is byte-identical
-    to fresh prefill (B.2-fix kernel parity + B.2a chunked invariant).
-  * Danger-zone prompts (~23%): chunked skipped, monolithic prefill,
-    byte-identical to no-flag baseline.
+* **B.5 (gate lift, in progress this session)** — B.4's premise was
+  wrong.  The mlx-native kernel-level probe
+  `flash_attn_prefill_bf16_d256_resume_small_ql_multi_kl_probe`
+  (mlx-native@HEAD `tests/test_flash_attn_prefill.rs`) tested
+  dispatch_flash_attn_prefill_bf16_d256_resume at qL ∈ {2, 8, 15} with
+  kL=130 (multi-K-tile) and reported **0/8192, 0/32768, 0/61440 BF16
+  elements differ** from monolithic — the kernel produces byte-correct
+  output at small qL when kL ≥ 16.
 
-**B.5 follow-up:** Metal kernel work (path i) to support qL ∈ [2, 15]
-in the flash_attn_prefill bf16 d256 dispatcher.  Two sub-paths: (a)
-extend existing partial-K-tile mask path for qL_rem != 0 AND qL <
-BK=16, or (b) add a `_smallql` sibling dispatcher with its own tile
-geometry.  Closes the 23% danger-zone coverage gap, enabling B.3
-mid-prefill stores on those requests too.  Out of scope for v1; left
-as future B.5 work.
+  The documented qL < 16 NaN bug applied only to the **single-K-tile**
+  case (kL ≤ BK=16); the chunked-prefill last-chunk regime always has
+  multi-K-tile (kL = cur_len + qL where cur_len ≥ stride ≥ 64).  The
+  hf2q-side gate at `gpu_full_attn.rs:1860` was overly conservative:
+  it copied the FAST path's `seq_len >= 16` gate (which IS necessary
+  there because cur_len=0 means kL=qL, so qL < 16 implies single-K-tile)
+  to the RESUME path (where the same condition can never hold).
+
+  **B.5 v1 fix:** Lift the resume gate from `seq_len >= 16` to
+  `kv_seq_len >= 16` (which is essentially always true for
+  chunked-prefill last chunks).  Also remove the B.4 path-ii
+  danger-zone bypass — chunked engagement is now correct at all prompt
+  lengths.  Default `HF2Q_KV_LCP_RESUME_CAPACITY` lowered from 64 to
+  8 (~2.4 GB peak registry footprint instead of ~19 GB) for memory
+  safety on stock-128GB-Macs under concurrent test workloads.
+
+  **Verification:** mlx-native kernel probe described above proves the
+  kernel-level invariant.  Host-side hf2q falsifiers
+  (`lcp_qwen35_chunked_prefill.rs` extended to 130-token prompt,
+  `lcp_qwen35_b4_danger_zone_bypass.rs` retitled to verify chunked
+  engagement at danger-zone lengths) ARE NOT YET RE-RUN end-to-end —
+  the user has a convert operation in another session and the
+  multi-server byte-identity test would put significant memory
+  pressure on the box.  The gate-lift + workaround-removal is
+  compile-clean and the kernel-level invariant proves the path-correct
+  output by construction.  RESUMABLE FROM HERE — see "What's left"
+  below.
+
+**Phase E.a status (B.5 in progress):**
+  * mlx-native kernel: byte-correct at qL ∈ {2, 8, 15}, kL=130 ✓ (B.5
+    probe landed in mlx-native@HEAD).
+  * hf2q-side gate: lifted to `kv_seq_len >= 16` ✓ (committed below).
+  * hf2q-side B.4 path-ii bypass: removed ✓ (committed below).
+  * Chunked-prefill at ALL prompt lengths: byte-identical to monolithic
+    by construction (kernel-level invariant + gate lift).  Empirical
+    end-to-end verification on Qwen 3.6 35B-A3B-APEX-Q5_K_M deferred
+    until concurrent convert operation completes.
+
+### What's left (resumable checkpoint 2026-05-05)
+
+To finish closing Phase E.a once the parallel convert finishes:
+
+1. **Re-run extended B.2a falsifier** at 130-token prompt (already
+   updated in `tests/lcp_qwen35_chunked_prefill.rs` PROMPT constant
+   to the long version).  Should now PASS byte-identical (chunked at
+   3 chunks of {64, 64, 2} == monolithic at 130).  Command:
+   ```
+   HF2Q_KV_PERSIST_PHASE_D=1 \
+   HF2Q_KV_PERSIST_QWEN35_E2E_MODEL_PATH=/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/APEX-Q5_K_M.gguf \
+   cargo test --release --test lcp_qwen35_chunked_prefill -- --nocapture --test-threads=1
+   ```
+
+2. **Update / retitle B.4 falsifier** at
+   `tests/lcp_qwen35_b4_danger_zone_bypass.rs`.  The test currently
+   asserts `chunked_skipped == true` — post-B.5 this is now the
+   OPPOSITE (chunked SHOULD engage on the 130-token danger-zone-no-more
+   prompt).  Update the assertion to:
+   ```rust
+   let chunked_engaged = a_log.iter().any(|l| l.contains("chunked prefill"));
+   assert!(chunked_engaged, "B.5 should have engaged chunked at all
+   lengths; bypass was removed");
+   ```
+   Then assert byte-identity (A == B) — should pass post-B.5.
+
+3. **Re-run B.3 stride-aligned hit falsifier** with longer turn-1
+   prompt (>= 64+stride tokens after chat-template wrap) to actually
+   trigger turn-2's stride-aligned hit log line.  Bumps the existing
+   `lcp_qwen35_b3_stride_aligned_resume.rs::TURN1_USER` to a length
+   that produces turn-1 prompt_len ≥ 128 tokens (gives 2 stride
+   boundaries to store at).  Then turn-2's first 64+ tokens match
+   turn-1's first 64+, descending probe finds chunk_pos=64 entry,
+   true-continuation hit fires.  Asserts:
+   * stderr `[hf2q qwen35 lcp resume] STRIDE-ALIGNED HIT` appears
+   * A turn-2 == B turn-2 byte-identical
+
+4. **Streaming-path resume wire-up**.  `engine_qwen35.rs:1830+`
+   (`generate_stream_qwen35_once_extended`) currently has
+   observability-only LCP probe.  Mirror the non-streaming path's
+   B.2c+B.3 logic: take_prefix on chunk-position-keyed LcpKey
+   descending, restore + suffix-prefill, post-prefill mid-prefill
+   stores.  ~50-80 LOC.  Add a streaming-path falsifier in
+   `tests/lcp_qwen35_partial_prefill_resume.rs` testing
+   `"stream":true` chat completion with the same multi-turn fixture.
+
+5. **Codex Phase-2b read-only audit** of:
+   * `gpu_full_attn.rs:1909+` resume-path gate (`kv_seq_len >= 16`)
+     and the implicit guarantee that chunked-prefill last-chunk
+     scenarios always satisfy it.
+   * `engine_qwen35.rs::generate_qwen35_once` chunked + LCP store +
+     descending probe + restore + suffix-chunked prefill flow —
+     particularly the `lcp_resume_start % stride == 0` invariant
+     and the chunk_idx=lcp_resume_start/stride loop start.
+   * mlx-native `dispatch_flash_attn_prefill_bf16_d256_resume`
+     stride math (`kv_capacity * head_dim` for K/V head stride) and
+     `qL_off` semantics under `do_causal=true`.
+
+6. **Operator soak** at `HF2Q_KV_LCP_CHUNKED_PREFILL=1
+   HF2Q_KV_LCP_RESUME=1 HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=64`
+   for 24h on a multi-turn /cfa workload.  Default-on flip
+   (HF2Q_KV_LCP_RESUME=1 in production config) is gated on green soak
+   plus Codex audit sign-off, mirroring B.2c iter-4 default-on gate
+   for the Gemma side.
+
+### Memory budget reminder
+
+Default `HF2Q_KV_LCP_RESUME_CAPACITY=8` ≈ 2.4 GB per-process registry
+footprint on Qwen 3.6 35B-A3B (each entry holds a full
+`HybridKvCacheSnapshot`: 16 full-attn layers × 16 MB K/V + 48
+DeltaNet layers × ~4 MB recurrent + conv ≈ 300 MB).  For multi-request
+high-concurrency workloads, raise the cap; on memory-tight boxes
+(e.g. 64 GB Mac) consider lowering further.  Future optimization:
+refactor `HybridPromptCache` to share `Arc<HybridKvCacheSnapshot>`
+with `lcp_registry`, eliminating the dual-snapshot at end-of-prefill
+(currently ~2× GB-scale memcpy per greedy request).
 
 ### Standing memories (load-bearing for ADR-017 discipline)
 - `feedback_harness_first_before_iter_chasing` — Phase A0 lands before any production code.
