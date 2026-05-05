@@ -2743,6 +2743,9 @@ fn kv_persist_phase_d_r_p5_e2e() {
             "[Phase D R-P5] server #1 exited gracefully: status={:?}",
             exit_status
         );
+        let s1_tail = server1.log_tail();
+        eprintln!("[Phase D R-P5] server #1 stderr_tail ({} lines), last 25:", s1_tail.len());
+        for l in s1_tail.iter().rev().take(25).rev() { eprintln!("    {}", l); }
         // ServerGuard::Drop will call child.kill() + child.wait() on
         // scope exit; both are harmless on an already-exited process
         // (kill returns ESRCH which we ignore).
@@ -2794,6 +2797,9 @@ fn kv_persist_phase_d_r_p5_e2e() {
              (prompt_tokens={:?}, total_tokens={})",
             cap.ttft_ms, cap.prompt_tokens, cap.total_tokens
         );
+        let s2_tail = server2.log_tail();
+        eprintln!("[Phase D R-P5] server #2 stderr_tail ({} lines), last 20:", s2_tail.len());
+        for l in s2_tail.iter().rev().take(20).rev() { eprintln!("    {}", l); }
         cap.ttft_ms
     };
 

@@ -1339,6 +1339,53 @@ impl KvCacheSpill for Gemma4DenseSpill {
     fn n_layers(&self) -> usize {
         self.num_layers
     }
+
+    /// ADR-017 Closure iter-5 / Phase E (2026-05-04) — snapshot the
+    /// loaded model's `PromptCache` via the worker bridge.
+    ///
+    /// Reads the engine_arc Engine clone (cheap — just inner
+    /// `Arc<EngineInner>` access) and dispatches a
+    /// `Request::PromptCacheSnapshot` round-trip to the worker
+    /// thread. The worker is the sole owner of `loaded.prompt_cache`
+    /// so the bridge is the only race-free read path.
+    ///
+    /// Returns `None` when:
+    ///   * `engine_arc` slot is empty (spill is unbound, e.g. between
+    ///     evict and admit cycles);
+    ///   * the worker bridge errors (engine gone — graceful
+    ///     fall-through);
+    ///   * the underlying serializer returns `None` (empty cache
+    ///     OR grammar-bound — see prompt_cache_persist module docs).
+    fn snapshot_prompt_cache(&self) -> Option<Vec<u8>> {
+        let engine = self
+            .engine_arc
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())?;
+        let result = engine.request_prompt_cache_snapshot().ok().flatten();
+        eprintln!("[KV-DIAG] snapshot_prompt_cache: result={} bytes", result.as_ref().map(|b| b.len()).unwrap_or(0));
+        result
+    }
+
+    /// ADR-017 Closure iter-5 / Phase E (2026-05-04) — restore the
+    /// loaded model's `PromptCache` from a serialized payload via
+    /// the worker bridge. Returns
+    /// `Err(SpillErrorKind::CodecErr)` on parse failure / engine
+    /// gone / non-Gemma model.
+    fn restore_prompt_cache(&mut self, payload: &[u8]) -> Result<(), SpillErrorKind> {
+        eprintln!("[KV-DIAG] restore_prompt_cache: payload {} bytes", payload.len());
+        let engine = self
+            .engine_arc
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+            .ok_or(SpillErrorKind::CodecErr)?;
+        let r = engine
+            .request_prompt_cache_restore(payload.to_vec())
+            .map_err(|_| SpillErrorKind::CodecErr);
+        eprintln!("[KV-DIAG] restore_prompt_cache: result={:?}", r);
+        r
+    }
 }
 
 // Send + Sync invariant: every field is Arc-wrapped Send+Sync state.

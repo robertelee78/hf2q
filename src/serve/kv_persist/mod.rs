@@ -21,6 +21,7 @@ pub mod format;
 pub mod index;
 pub mod loader_wrapper;
 pub mod metrics;
+pub mod prompt_cache_persist;
 pub mod recovery;
 pub mod registry;
 pub mod spiller;

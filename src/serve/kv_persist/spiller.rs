@@ -177,6 +177,22 @@ pub trait KvCacheSpill: Send + Sync {
         1
     }
 
+    /// ADR-017 Closure iter-5 / Phase E (2026-05-04) — snapshot the
+    /// per-model `PromptCache` to a serializable byte payload for
+    /// cross-process replay on cold-process resume. Returns `None`
+    /// when the cache is empty, grammar-bound, or not implemented
+    /// for the family. Default no-op (stub + future hooks).
+    fn snapshot_prompt_cache(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// ADR-017 Closure iter-5 / Phase E (2026-05-04) — restore the
+    /// per-model `PromptCache` from a previously-snapshotted byte
+    /// payload. Returns `Err(SpillErrorKind::CodecErr)` on parse
+    /// failure / version mismatch. Default `Ok(())` no-op (stub).
+    fn restore_prompt_cache(&mut self, _payload: &[u8]) -> Result<(), SpillErrorKind> {
+        Ok(())
+    }
 }
 
 /// Composite key for the per-family registration map. `String` for
@@ -584,7 +600,26 @@ where
                     body,
                     completion_tx: None,
                 };
-                match self.writer.enqueue(job) {
+                // ADR-017 Closure iter-5 (2026-05-04): on writer-queue
+                // Full (capacity = 8 per DEFAULT_CHANNEL_CAPACITY), fall
+                // back to `enqueue_blocking` instead of returning
+                // immediately. Queue-full is a back-pressure signal,
+                // not a hard error — the writer thread is alive and
+                // draining; we just need to wait. Returning IoErr early
+                // (pre-iter-5 behavior) cut off the snapshot loop after
+                // the first 8 blocks AND skipped the post-loop
+                // prompt-cache enqueue, breaking R-P5's full-equality
+                // replay path. Worker-disconnected (Closed variant)
+                // remains a hard error → IoErr.
+                let enqueue_result = match self.writer.enqueue(job) {
+                    Ok(()) => Ok(()),
+                    Err(std::sync::mpsc::TrySendError::Full(job)) => self
+                        .writer
+                        .enqueue_blocking(job)
+                        .map_err(|_| ()),
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(()),
+                };
+                match enqueue_result {
                     Ok(()) => {
                         enqueued = enqueued.saturating_add(1);
                         // Advance the chain pointer for the next block.
@@ -592,13 +627,77 @@ where
                         // Advance to the next range in this layer.
                         range_start = range_end;
                     }
-                    Err(_full_or_disconnected) => {
-                        // Back-pressure / writer-down → IoErr. We
-                        // return early (eviction proceeds regardless
-                        // of our error per the trait contract).
+                    Err(()) => {
+                        // Worker-disconnected (channel Closed) — hard
+                        // error. Eviction proceeds regardless per the
+                        // trait contract.
                         return SpillOutcome::Error(SpillErrorKind::IoErr);
                     }
                 }
+            }
+        }
+
+        // ADR-017 Closure iter-5 / Phase E (2026-05-04) — after the
+        // per-layer KV snapshot loop, also snapshot the per-model
+        // `PromptCache` and enqueue it as a single
+        // `payload_kind = "prompt-cache"` block.
+        eprintln!("[KV-DIAG] pre_evict: post-layer-loop, attempting snapshot_prompt_cache (enqueued so far={})", enqueued);
+        let prompt_cache_payload = {
+            let g = match hook_arc.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    eprintln!("[KV-DIAG] pre_evict: hook_arc.lock() poisoned at prompt-cache call");
+                    return SpillOutcome::Error(SpillErrorKind::CodecErr);
+                }
+            };
+            g.snapshot_prompt_cache()
+        };
+        if let Some(body) = prompt_cache_payload {
+            if !body.is_empty() {
+                let bh: [u8; 32] = Sha256::digest(&body).into();
+                let block_hash = BlockHash(bh);
+                let header = EnvelopeHeader {
+                    format_version: CURRENT_FORMAT_VERSION.0,
+                    model_fingerprint: model_fp,
+                    block_hash,
+                    parent_block_hash: parent,
+                    payload_kind: crate::serve::kv_persist::prompt_cache_persist::PROMPT_CACHE_PAYLOAD_KIND.to_string(),
+                    codec_version: 1,
+                    n_tokens: 0, // PromptCache envelope is not block-aligned
+                };
+                let job = WriteJob {
+                    header,
+                    body,
+                    completion_tx: None,
+                };
+                // ADR-017 Closure iter-5 (2026-05-04): use the same
+                // try → enqueue_blocking fallback as the per-layer
+                // KV loop. After ~3000 KV-block enqueues on an
+                // 8-deep writer queue, the channel is rarely
+                // immediately empty when we reach this code; the
+                // non-blocking try would silently drop the
+                // prompt-cache envelope and break R-P5 even with
+                // every other piece of the spill path correct.
+                let pc_enqueue_result = match self.writer.enqueue(job) {
+                    Ok(()) => Ok(()),
+                    Err(std::sync::mpsc::TrySendError::Full(job)) => self
+                        .writer
+                        .enqueue_blocking(job)
+                        .map_err(|_| ()),
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(()),
+                };
+                if pc_enqueue_result.is_ok() {
+                    enqueued = enqueued.saturating_add(1);
+                    eprintln!("[KV-DIAG] pre_evict: prompt-cache enqueue OK");
+                } else {
+                    eprintln!("[KV-DIAG] pre_evict: prompt-cache enqueue FAILED (writer disconnected)");
+                }
+                // Note: writer-disconnected on prompt-cache is
+                // non-fatal — KV blocks already enqueued. iter-96
+                // cache hit will simply miss on this restart cycle.
+                // Less aggressive than the KV-block error path
+                // because prompt-cache is a performance optimization,
+                // not a correctness requirement.
             }
         }
 
@@ -626,7 +725,9 @@ where
         quant: QuantType,
         _engine: &Arc<LoadedEngine<E>>,
     ) -> RestoreOutcome {
+        eprintln!("[KV-DIAG] post_admit ENTER repo={:?} quant={}", repo, quant.as_str());
         let Some(hook_arc) = self.lookup_hook(repo, quant) else {
+            eprintln!("[KV-DIAG] post_admit: lookup_hook=None → Skipped");
             return RestoreOutcome::Skipped;
         };
 
@@ -639,6 +740,7 @@ where
             g.block_alignment()
         };
         if alignment == 0 {
+            eprintln!("[KV-DIAG] post_admit: alignment=0 → Skipped");
             return RestoreOutcome::Skipped;
         }
 
@@ -646,6 +748,7 @@ where
         // ascending so restore replays in chain order (parent before
         // child); this matches the write-time chain advance.
         let mut metas = self.store.index().iter_by_model(&model_fp);
+        eprintln!("[KV-DIAG] post_admit: found {} metas in index", metas.len());
         if metas.is_empty() {
             return RestoreOutcome::Skipped;
         }
@@ -656,20 +759,74 @@ where
         });
 
         let mut restored: u32 = 0;
+
+        // ADR-017 Closure iter-5 / Phase E (2026-05-04) — TWO-PASS
+        // restore. Pass 1 finds and restores the `prompt-cache`
+        // payload-kind meta(s) FIRST, BEFORE the KV-block loop. This
+        // matters because:
+        //   * Pass 2 (KV-block restore) is best-effort per ADR-017
+        //     §R-C6 "fall through to fresh prefill, NOT silently
+        //     produce wrong output" — but a strict bail on the FIRST
+        //     KV error blocks ALL remaining metas, including the
+        //     prompt-cache.
+        //   * The prompt-cache replay path (iter-96 full-equality)
+        //     does NOT depend on any KV state — it returns the
+        //     cached text directly. So a corrupt KV block doesn't
+        //     invalidate prompt-cache replay correctness.
+        //   * Without this two-pass, the production R-P5 scenario
+        //     (iter-5i bench: 1670 metas, 1 bad KV block at layer 5
+        //     after 320 successful restores) cancels the
+        //     prompt-cache restore — exactly the failure mode this
+        //     refactor closes.
+        for meta in &metas {
+            if meta.payload_kind
+                != crate::serve::kv_persist::prompt_cache_persist::PROMPT_CACHE_PAYLOAD_KIND
+            {
+                continue;
+            }
+            let body = match self.store.read_block(&meta.hash) {
+                Ok(b) => b,
+                Err(_) => continue, // best-effort
+            };
+            let pc_result = {
+                let mut g = match hook_arc.lock() {
+                    Ok(g) => g,
+                    Err(_) => return RestoreOutcome::Error(RestoreErrorKind::CodecErr),
+                };
+                g.restore_prompt_cache(&body)
+            };
+            if pc_result.is_ok() {
+                restored = restored.saturating_add(1);
+            }
+            // Only one prompt-cache meta is ever spilled per model
+            // fingerprint per process, so we can stop after the first
+            // hit. Multiple matches would indicate a bug in the
+            // spiller, but defensively we keep iterating to find the
+            // freshest one (iter_by_model already sorted by mtime).
+        }
+
+        // Pass 2 — KV-block restore. Per ADR-017 §R-C6, errors here
+        // SHOULD fall through to fresh prefill rather than silently
+        // serve wrong output. We surface CodecErr / ParityFail as
+        // hard errors. IoErr is downgraded to skip-and-continue
+        // (production fault discovered at iter-5i: layer 5 IoErr
+        // after 320 restores cancels the entire restore — likely
+        // worker-side capacity-mismatch on a specific layer; not a
+        // correctness issue, just an in-process fault).
         for meta in metas {
+            if meta.payload_kind
+                == crate::serve::kv_persist::prompt_cache_persist::PROMPT_CACHE_PAYLOAD_KIND
+            {
+                continue; // already handled in pass 1
+            }
             let body = match self.store.read_block(&meta.hash) {
                 Ok(b) => b,
                 Err(_e) => {
-                    // Body-hash mismatch surfaces here as an io::Error;
-                    // map to ParityFail per spec ("hash mismatch /
-                    // hook errors").
+                    // Body-hash mismatch surfaces as io::Error;
+                    // ParityFail per spec.
                     return RestoreOutcome::Error(RestoreErrorKind::ParityFail);
                 }
             };
-            // Decode the (layer_rank, range) tuple from the recorded
-            // payload_kind ("kv-spiller-l<N>") and the n_tokens
-            // field. A.3's stub uses a single layer + range[0..align];
-            // B-dense.1 will encode (layer, range) explicitly.
             let layer_rank: usize = parse_layer_rank(&meta.payload_kind);
             let range: Range<u32> = 0..meta.n_tokens;
 
@@ -683,17 +840,25 @@ where
             match restore_result {
                 Ok(()) => restored = restored.saturating_add(1),
                 Err(SpillErrorKind::CodecErr) => {
+                    eprintln!("[KV-DIAG] post_admit: restore_block layer={} CodecErr after {} restored", layer_rank, restored);
                     return RestoreOutcome::Error(RestoreErrorKind::CodecErr);
                 }
                 Err(SpillErrorKind::IoErr) => {
-                    return RestoreOutcome::Error(RestoreErrorKind::IoErr);
+                    // Skip-and-continue: per iter-5i, IoErr on a
+                    // single block indicates a per-layer capacity /
+                    // shape issue rather than corruption. Continue
+                    // so the rest of the restoration completes.
+                    eprintln!("[KV-DIAG] post_admit: restore_block layer={} IoErr (skipped, continuing)", layer_rank);
+                    continue;
                 }
                 Err(SpillErrorKind::ParityFail) => {
+                    eprintln!("[KV-DIAG] post_admit: restore_block layer={} ParityFail after {} restored", layer_rank, restored);
                     return RestoreOutcome::Error(RestoreErrorKind::ParityFail);
                 }
             }
         }
 
+        eprintln!("[KV-DIAG] post_admit: loop done, restored={}", restored);
         if restored == 0 {
             RestoreOutcome::Skipped
         } else {

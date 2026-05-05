@@ -974,6 +974,25 @@ enum Request {
         write_pos: u32,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// ADR-017 Closure iter-5 / Phase E (2026-05-04) — serialize the
+    /// worker-side `loaded.prompt_cache` into a JSON byte payload via
+    /// [`crate::serve::kv_persist::prompt_cache_persist::try_serialize`].
+    /// Returns `Ok(None)` when the cache is empty or grammar-bound
+    /// (see module docs). The worker is the sole owner of the cache,
+    /// so this is the only race-free path to read it.
+    PromptCacheSnapshot {
+        reply: oneshot::Sender<Result<Option<Vec<u8>>>>,
+    },
+    /// ADR-017 Closure iter-5 / Phase E (2026-05-04) — restore the
+    /// worker-side `loaded.prompt_cache` from a JSON byte payload via
+    /// [`crate::serve::kv_persist::prompt_cache_persist::try_deserialize`].
+    /// Returns `Err(...)` on parse failure or schema-version mismatch.
+    /// Caller is expected to fire this BEFORE the first request
+    /// arrives at the freshly-loaded model.
+    PromptCacheRestore {
+        payload: Vec<u8>,
+        reply: oneshot::Sender<Result<()>>,
+    },
     /// Graceful-shutdown sentinel.
     Shutdown,
 }
@@ -2296,6 +2315,62 @@ impl Engine {
     /// are async paths (per multi_model.rs:887-892). Falls back to a
     /// `blocking_send` + `blocking_recv` pair when called from a
     /// non-tokio context (e.g. unit tests on the main thread).
+    /// ADR-017 Closure iter-5 / Phase E (2026-05-04) — synchronously
+    /// snapshot the loaded model's `PromptCache` into a JSON byte
+    /// payload. Returns `Ok(None)` when the cache is empty or
+    /// grammar-bound (see [`crate::serve::kv_persist::prompt_cache_persist`]
+    /// module docs).
+    ///
+    /// Drives a `Request::PromptCacheSnapshot` round-trip through the
+    /// worker thread (sole owner of `loaded.prompt_cache`). Same
+    /// channel + blocking-send/recv pattern as `request_kv_snapshot`.
+    pub fn request_prompt_cache_snapshot(&self) -> Result<Option<Vec<u8>>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let req = Request::PromptCacheSnapshot { reply: reply_tx };
+        match self.inner.tx.try_send(req) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(req)) => {
+                self.inner
+                    .tx
+                    .blocking_send(req)
+                    .context("engine worker is gone (prompt_cache_snapshot full→blocking)")?;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                anyhow::bail!("engine worker is gone (prompt_cache_snapshot)");
+            }
+        }
+        reply_rx
+            .blocking_recv()
+            .context("prompt_cache_snapshot reply dropped")?
+    }
+
+    /// ADR-017 Closure iter-5 / Phase E (2026-05-04) — synchronously
+    /// restore the loaded model's `PromptCache` from a JSON byte
+    /// payload. Returns `Err(...)` on parse failure / version
+    /// mismatch / non-Gemma model.
+    pub fn request_prompt_cache_restore(&self, payload: Vec<u8>) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let req = Request::PromptCacheRestore {
+            payload,
+            reply: reply_tx,
+        };
+        match self.inner.tx.try_send(req) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(req)) => {
+                self.inner
+                    .tx
+                    .blocking_send(req)
+                    .context("engine worker is gone (prompt_cache_restore full→blocking)")?;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                anyhow::bail!("engine worker is gone (prompt_cache_restore)");
+            }
+        }
+        reply_rx
+            .blocking_recv()
+            .context("prompt_cache_restore reply dropped")?
+    }
+
     pub fn request_kv_snapshot(
         &self,
         layer_rank: usize,
@@ -3019,6 +3094,55 @@ fn worker_run(
                     LoadedModel::Qwen3VlText(_) => Err(anyhow::anyhow!(
                         "kv_restore: not yet supported on Qwen3-VL text variant \
                          (iter-228a is load-only; KV cache allocation lands in iter-228b)"
+                    )),
+                };
+                let _ = reply.send(result);
+            }
+            Request::PromptCacheSnapshot { reply } => {
+                // ADR-017 Closure iter-5 / Phase E: serialize the
+                // loaded model's prompt_cache into JSON bytes. Only
+                // the Gemma variant has a `prompt_cache: PromptCache`
+                // field (engine_qwen35 uses HybridPromptCache, a
+                // different type — return Ok(None) for now; B-hybrid
+                // would extend with a Hybrid variant of the
+                // serializer).
+                let result: Result<Option<Vec<u8>>> = match &loaded {
+                    LoadedModel::Gemma(g) => Ok(
+                        crate::serve::kv_persist::prompt_cache_persist::try_serialize(
+                            &g.prompt_cache,
+                        ),
+                    ),
+                    LoadedModel::Qwen35(_) => Ok(None),
+                    LoadedModel::Qwen3VlText(_) => Ok(None),
+                };
+                let _ = reply.send(result);
+            }
+            Request::PromptCacheRestore { payload, reply } => {
+                // ADR-017 Closure iter-5 / Phase E: deserialize the
+                // JSON payload into a PromptCache and assign to
+                // loaded.prompt_cache. The next request that matches
+                // tokens+key will hit iter-96's full-equality replay
+                // path. Failure modes (parse error, version mismatch,
+                // unknown finish_reason) yield Err so the caller can
+                // fall through to fresh prefill — no silent
+                // corruption.
+                let result = match &mut loaded {
+                    LoadedModel::Gemma(g) => {
+                        match crate::serve::kv_persist::prompt_cache_persist::try_deserialize(&payload) {
+                            Some(cache) => {
+                                g.prompt_cache = cache;
+                                Ok(())
+                            }
+                            None => Err(anyhow::anyhow!(
+                                "prompt_cache_restore: deserialize failed (parse error, version mismatch, or unknown finish_reason)"
+                            )),
+                        }
+                    }
+                    LoadedModel::Qwen35(_) => Err(anyhow::anyhow!(
+                        "prompt_cache_restore: not yet supported on Qwen35 hybrid variant — see B-hybrid follow-up"
+                    )),
+                    LoadedModel::Qwen3VlText(_) => Err(anyhow::anyhow!(
+                        "prompt_cache_restore: not yet supported on Qwen3-VL text variant"
                     )),
                 };
                 let _ = reply.send(result);
