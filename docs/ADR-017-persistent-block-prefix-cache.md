@@ -3792,6 +3792,57 @@ has observability-only LCP probe (B-hybrid.1 from
 Full resume wire-up mirrors B.2c's non-streaming pattern; ~50 LOC
 follow-up.
 
+* **B.3 (`374bccb`)** — mid-prefill stride-aligned LCP checkpointing.
+  `engine_qwen35.rs` chunked prefill loop now stores
+  `HybridKvCacheSnapshot` at every stride-aligned chunk boundary under
+  chunk-position-keyed `LcpKey`s (built via new
+  `build_lcp_key_for_qwen35_chunk`).  Capacity is configurable via
+  `HF2Q_KV_LCP_RESUME_CAPACITY` (default 64 entries ≈ 19 GB peak on
+  Qwen 3.6 35B-A3B).  Probe site iterates chunk positions DESCENDING
+  (largest first), `take_prefix` on each chunk-position-keyed
+  `LcpKey`; first true-continuation hit (`k == cached_prompt_len`)
+  triggers `restore_from(&snapshot)` + suffix-chunked prefill from
+  that boundary.  When `lcp_resume_start > 0`, the chunked loop
+  iterates from `chunk_idx = lcp_resume_start / stride` forward —
+  each chunk's `cur_len > 0` routes through the FA bf16 d256 RESUME
+  kernel (B.2-fix proven byte-identical).  Surfaces a load-bearing
+  finding: chunked prefill at 3+ chunks where the partial-tail chunk
+  has seq < 16 hits the FA fast/resume short-qL gate and falls to
+  legacy F32 SDPA, producing byte-different output to monolithic FA
+  fast path.
+
+* **B.4 path (ii) (`9bad86a`)** — danger-zone bypass workaround.
+  Engine-level gate at `engine_qwen35.rs::generate_qwen35_once` adds
+  `in_danger_zone = (prompt_len % stride) > 0 && (prompt_len % stride)
+  < 16`.  When in danger zone, chunked prefill is SKIPPED and the
+  request runs monolithically — preserving byte-identity to the
+  no-chunked-flag baseline.  Coverage at stride=64: ~77% of prompt
+  lengths (stride-aligned + last-chunk-seq-≥-16) engage chunked + B.3
+  mid-prefill caching; ~23% (danger zone) skip chunked but stay
+  byte-identical via monolithic.  Falsifier
+  (`tests/lcp_qwen35_b4_danger_zone_bypass.rs::phase_b4_danger_zone_bypass_byte_identity`)
+  on Qwen 3.6 35B-A3B-APEX-Q5_K_M with a 130-token prompt (tail=2 ∈
+  [1, 15]): server A with `HF2Q_KV_LCP_CHUNKED_PREFILL=1` correctly
+  skipped chunked (stderr lacks `chunked prefill` line); A 53 bytes
+  == B 53 bytes BYTE-IDENTICAL.
+
+**Phase E.a is now FUNCTIONALLY COMPLETE** for byte-identity
+preservation at ALL prompt lengths under the chunked + LCP-resume
+composition:
+  * Safe-zone prompts (~77%): chunked engages, B.3 mid-prefill stores
+    fire, LCP resume on subsequent matching prompts is byte-identical
+    to fresh prefill (B.2-fix kernel parity + B.2a chunked invariant).
+  * Danger-zone prompts (~23%): chunked skipped, monolithic prefill,
+    byte-identical to no-flag baseline.
+
+**B.5 follow-up:** Metal kernel work (path i) to support qL ∈ [2, 15]
+in the flash_attn_prefill bf16 d256 dispatcher.  Two sub-paths: (a)
+extend existing partial-K-tile mask path for qL_rem != 0 AND qL <
+BK=16, or (b) add a `_smallql` sibling dispatcher with its own tile
+geometry.  Closes the 23% danger-zone coverage gap, enabling B.3
+mid-prefill stores on those requests too.  Out of scope for v1; left
+as future B.5 work.
+
 ### Standing memories (load-bearing for ADR-017 discipline)
 - `feedback_harness_first_before_iter_chasing` — Phase A0 lands before any production code.
 - `feedback_never_ship_fallback_without_rootcause` — no dense-only carve-out implying hybrid correctness.
