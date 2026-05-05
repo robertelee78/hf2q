@@ -61,11 +61,15 @@ MODEL_PATH="${ADR017_PHASE_D_MODEL_PATH:-$DEFAULT_MODEL_PATH}"
 PREFILL_LEN="$DEFAULT_PREFILL_LEN"
 ENABLE_PEER=0
 SKIP_AUDIT=0
+ENABLE_STRESS=0
+STRESS_DURATION=1800
+STRESS_BUDGET_MB=4096
 
 usage() {
   cat <<EOF
 Usage: scripts/adr017_phase_d.sh [--model PATH] [--prefill N] [--peer]
                                  [--rp1] [--rp1-concurrent] [--rp5] [--rp6]
+                                 [--stress] [--stress-duration SEC] [--stress-budget-mb MB]
                                  [--skip-process-audit]
 
 Drives ADR-017 Phase D coherence + perf validation tests.
@@ -81,6 +85,17 @@ Drives ADR-017 Phase D coherence + perf validation tests.
                            (sets HF2Q_KV_PERSIST_PHASE_D_R_P5=1)
   --rp6                    Opt in R-P6 4-agent shared-prefix ship-gate
                            (sets HF2Q_KV_PERSIST_PHASE_D_R_P6=1)
+  --stress                 Run the kv_persist_stress 24h smoke test alongside
+                           the gemma4_roundtrip suite. Default duration 1800s
+                           (30 min); pass --stress-duration to override (full
+                           24h gate uses 86400s, validates iter-to-iter RSS
+                           leak ≤ 5% across hundreds of swap cycles).
+  --stress-duration SEC    Override stress duration in seconds (default 1800)
+  --stress-budget-mb MB    Override stress on-disk cache budget in MB (default 4096
+                           = §R-F5 spec). Threaded through to the spawned
+                           server's HF2Q_KV_PERSIST_BUDGET_BYTES so the
+                           writer's post-write LRU eviction has a budget to
+                           enforce.
   --skip-process-audit     Bypass pre-bench process audit (NOT recommended)
   -h, --help               Show this help
 
@@ -89,7 +104,8 @@ Default-on tests (always run):
   R-P4 ship-gate (cache_hit_TTFT(32K) / no_cache_TTFT(32K) <= 0.20)
 
 Opt-in tests must be explicitly enabled via the flags above (or by exporting
-the corresponding HF2Q_KV_PERSIST_PHASE_D_* env var to 1 before invocation).
+the corresponding HF2Q_KV_PERSIST_PHASE_D_* / HF2Q_KV_PERSIST_STRESS_24H env
+var to 1 before invocation).
 
 Exit codes: 0=PASS  1=usage  2=test-fail  3=prereq-missing
 EOF
@@ -109,6 +125,13 @@ while [[ $# -gt 0 ]]; do
     --rp1-concurrent) export HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT=1; shift ;;
     --rp5) export HF2Q_KV_PERSIST_PHASE_D_R_P5=1; shift ;;
     --rp6) export HF2Q_KV_PERSIST_PHASE_D_R_P6=1; shift ;;
+    --stress) ENABLE_STRESS=1; shift ;;
+    --stress-duration)
+      [[ $# -ge 2 ]] || { echo "error: --stress-duration requires an argument" >&2; exit 1; }
+      STRESS_DURATION="$2"; shift 2 ;;
+    --stress-budget-mb)
+      [[ $# -ge 2 ]] || { echo "error: --stress-budget-mb requires an argument" >&2; exit 1; }
+      STRESS_BUDGET_MB="$2"; shift 2 ;;
     --skip-process-audit) SKIP_AUDIT=1; shift ;;
     -*) usage >&2; echo "error: unknown flag: $1" >&2; exit 1 ;;
     *)  usage >&2; echo "error: unexpected positional arg: $1" >&2; exit 1 ;;
@@ -225,6 +248,40 @@ else
   echo
   echo "=== ADR-017 Phase D — TEST FAILURE (cargo test exit=$rc) ==="
   EXIT_CODE=2
+fi
+
+# 5. Optional stress 24h gate (separate test crate; long-running).
+if [[ "$ENABLE_STRESS" -eq 1 ]] && [[ "$EXIT_CODE" -eq 0 ]]; then
+  echo
+  echo "--- cargo test --release --test kv_persist_stress (24h smoke gate) ---"
+  echo "    HF2Q_KV_PERSIST_STRESS_24H=1"
+  echo "    HF2Q_KV_PERSIST_E2E_MODEL_PATH=$MODEL_PATH"
+  echo "    HF2Q_KV_PERSIST_STRESS_DURATION_SEC=$STRESS_DURATION"
+  echo "    HF2Q_KV_PERSIST_STRESS_BUDGET_MB=$STRESS_BUDGET_MB"
+  echo "    HF2Q_KV_PERSIST_STRESS_MAX_L=4096"
+  echo
+  echo "    NB: spec is 86400s (24h). 1800s default = smoke validating"
+  echo "    the iter-10/11 leak fix + R-F5 budget eviction at SPEC config."
+  echo "    The post-warmup baseline + 5% rss_tol + 4GB cache budget are"
+  echo "    the spec values; the test FAILs if RSS or cache exceed."
+  echo
+
+  if HF2Q_KV_PERSIST_STRESS_24H=1 \
+      HF2Q_KV_PERSIST_E2E_MODEL_PATH="$MODEL_PATH" \
+      HF2Q_KV_PERSIST_STRESS_DURATION_SEC="$STRESS_DURATION" \
+      HF2Q_KV_PERSIST_STRESS_BUDGET_MB="$STRESS_BUDGET_MB" \
+      HF2Q_KV_PERSIST_STRESS_MAX_L="${HF2Q_KV_PERSIST_STRESS_MAX_L:-4096}" \
+      cargo test --release --test kv_persist_stress kv_persist_stress_24h \
+        -- --test-threads=1 --nocapture; then
+    echo
+    echo "=== ADR-017 Phase D — Stress 24h gate ==="
+    echo "  Stress 24h     : OPT-IN RUN (PASS implied by exit 0)"
+  else
+    rc=$?
+    echo
+    echo "=== ADR-017 Phase D — STRESS TEST FAILURE (cargo test exit=$rc) ==="
+    EXIT_CODE=2
+  fi
 fi
 
 exit "$EXIT_CODE"
