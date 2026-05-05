@@ -606,6 +606,84 @@ fn sample_rss_kb(pid: u32) -> Option<u64> {
     String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok()
 }
 
+/// ADR-017 Closure iter-9 (2026-05-05) — vmmap summary in KiB,
+/// distinguishing writeable (anon-style) from mapped-file (page-cache
+/// style). The pre-iter-9 stress smoke flagged a +115% RSS "leak" at
+/// POOL_BUDGET=20 GB even though eviction + drop_family fired
+/// correctly; hypothesis: most of the residual is mmap'd GGUF page
+/// cache that the kernel reclaims only under memory pressure, NOT a
+/// true anonymous-memory leak. This split lets the operator (and the
+/// test) verify which.
+///
+/// Returns `(writeable_kb, mapped_file_kb)` on success. macOS-only
+/// (vmmap is darwin-specific). On non-darwin or `vmmap` unavailable,
+/// returns `None`.
+#[cfg(target_os = "macos")]
+fn sample_vmmap_breakdown_kb(pid: u32) -> Option<(u64, u64)> {
+    let out = std::process::Command::new("vmmap")
+        .args(["-summary", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    // Look for lines like:
+    //   "TOTAL                              X.YG   ..."
+    //   "Mapped File                        X.YG   ..."
+    // Parse "Mapped File" as page-cache-equivalent. The remaining
+    // (TOTAL - mapped_file - shared/system mappings) approximates
+    // writeable. We don't try to be exact — just want order of
+    // magnitude for the leak-class diagnostic.
+    let mut total_kb: u64 = 0;
+    let mut mapped_file_kb: u64 = 0;
+    for line in s.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("total") && total_kb == 0 {
+            total_kb = parse_size_kb_from_vmmap_line(line);
+        } else if lower.contains("mapped file") {
+            mapped_file_kb = parse_size_kb_from_vmmap_line(line);
+        }
+    }
+    if total_kb == 0 {
+        return None;
+    }
+    let writeable_kb = total_kb.saturating_sub(mapped_file_kb);
+    Some((writeable_kb, mapped_file_kb))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sample_vmmap_breakdown_kb(_pid: u32) -> Option<(u64, u64)> {
+    None
+}
+
+/// Parse a vmmap summary line's size field. vmmap formats sizes like
+/// "1.5G", "300M", "42K". Returns KiB. Best-effort; returns 0 on
+/// any parse failure (the diagnostic just reports 0 in that case).
+fn parse_size_kb_from_vmmap_line(line: &str) -> u64 {
+    // Find a token matching e.g. "1.5G" / "300M" / "42K" / "120384"
+    for tok in line.split_whitespace() {
+        if tok.is_empty() {
+            continue;
+        }
+        let last = tok.chars().last().unwrap();
+        let (num_str, mul): (&str, u64) = match last {
+            'G' | 'g' => (&tok[..tok.len() - 1], 1024 * 1024),
+            'M' | 'm' => (&tok[..tok.len() - 1], 1024),
+            'K' | 'k' => (&tok[..tok.len() - 1], 1),
+            '0'..='9' => (tok, 1024 / 1024), // bytes — divide later
+            _ => continue,
+        };
+        if let Ok(n) = num_str.parse::<f64>() {
+            let kb = (n * mul as f64) as u64;
+            if kb > 0 {
+                return kb;
+            }
+        }
+    }
+    0
+}
+
 /// `lsof -p {pid} | wc -l` — descriptor count (header line included;
 /// stable baseline absorbs the +1 offset).
 fn sample_lsof_count(pid: u32) -> Option<u64> {
@@ -919,9 +997,21 @@ fn kv_persist_stress_24h() {
             };
             let lsof_delta = current_lsof as i64 - baseline_lsof as i64;
 
+            // ADR-017 Closure iter-9 (2026-05-05) — sample vmmap
+            // breakdown to distinguish writeable (anon) vs mapped-file
+            // (page-cache) growth. mapped-file growth is reclaimable
+            // by the kernel under pressure and should NOT count as a
+            // true leak.
+            let vmmap_str = match sample_vmmap_breakdown_kb(pid) {
+                Some((wr_kb, mf_kb)) => format!(
+                    " writeable={wr_kb}KB mapped_file={mf_kb}KB"
+                ),
+                None => String::new(),
+            };
+
             eprintln!(
                 "[stress] checkpoint t={elapsed_sec}s rss={current_rss_kb}KB(Δ={rss_pct_delta:+.1}%) \
-                 lsof={current_lsof}(Δ{lsof_delta:+}) cache={cache_kb}KB iters={iters}"
+                 lsof={current_lsof}(Δ{lsof_delta:+}) cache={cache_kb}KB iters={iters}{vmmap_str}"
             );
 
             // Hard-fail checks (defense-in-depth — final assertions
