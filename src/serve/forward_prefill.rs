@@ -1499,7 +1499,21 @@ impl MlxModelWeights {
 
         // Store dense KV buffers on self so forward_decode can use them
         // for dense attention during the decode phase (ADR-009 Track 3).
-        self.dense_kvs = Some(dense_kvs_vec);
+        //
+        // ADR-017 Phase E.a iter-2.5 (Strategy A): wrap each per-layer
+        // `DenseKvBuffers` in an `Arc` at assignment time. The
+        // `dense_kvs_vec` builder above remains `Vec<DenseKvBuffers>`
+        // (non-Arc) so the per-layer kernel writes earlier in this
+        // function still mutate the buffers in place via `&mut`; the
+        // Arc wrap fires once at the end-of-prefill handoff, when the
+        // buffers transition from "in-flight under exclusive prefill
+        // borrow" to "shared, readable from forward_decode".
+        self.dense_kvs = Some(
+            dense_kvs_vec
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect(),
+        );
         self.dense_sdpa_tmp = Some(sdpa_tmp);
 
         // iter-222 (2026-05-01): legacy iter-20/iter-21 Track A note about

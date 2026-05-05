@@ -2127,8 +2127,19 @@ impl MlxModelWeights {
             row3("RESIDUAL (sync + CPU)", residual_ms, pct(residual_ms));
         }
 
-        // Store dense KV buffers so forward_decode can use them
-        self.dense_kvs = Some(dense_kvs_vec);
+        // Store dense KV buffers so forward_decode can use them.
+        //
+        // ADR-017 Phase E.a iter-2.5: wrap each per-layer
+        // `DenseKvBuffers` in an `Arc` at the prefill→decode handoff
+        // (mirrors `forward_prefill.rs:1502`). Builder above keeps
+        // `Vec<DenseKvBuffers>` so the in-flight kernel writes mutate
+        // the buffers via `&mut`; Arc wrap fires once at end-of-prefill.
+        self.dense_kvs = Some(
+            dense_kvs_vec
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect(),
+        );
         self.dense_sdpa_tmp = Some(sdpa_tmp);
 
         // Metal-1 — safety-net stop in case the layer-range end was

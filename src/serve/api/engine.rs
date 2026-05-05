@@ -3462,7 +3462,12 @@ fn kv_restore_gemma(
                 is_sliding: s_is_sliding,
             });
         }
-        weights.dense_kvs = Some(all);
+        // ADR-017 Phase E.a iter-2.5: wrap each freshly-allocated
+        // `DenseKvBuffers` in an Arc to match the field's
+        // `Option<Vec<Arc<DenseKvBuffers>>>` shape. The just-built
+        // `all` Vec is consumed; each entry's strong_count starts at 1
+        // (no LcpRegistry clone yet — that's iter-3 territory).
+        weights.dense_kvs = Some(all.into_iter().map(Arc::new).collect());
     }
 
     let kvs = weights
@@ -3476,7 +3481,21 @@ fn kv_restore_gemma(
             layer_rank,
         );
     }
-    let layer = &mut kvs[layer_rank];
+    // ADR-017 Phase E.a iter-2.5: at iter-2.5 the LcpRegistry holds
+    // only marker payload `()`, so the Arc-cloned strong_count for
+    // every per-layer entry is 1 (worker thread is sole holder).
+    // `Arc::get_mut` always returns `Some(&mut DenseKvBuffers)` here.
+    // Iter-3 will need a Cow-on-write or registry-handoff discipline
+    // when the registry holds Arc-clones of the same buffer; until
+    // then the unwrap is safe by construction.
+    let layer = Arc::get_mut(&mut kvs[layer_rank]).ok_or_else(|| {
+        anyhow::anyhow!(
+            "kv_restore (iter-2.5): dense_kvs[layer_rank={}] Arc not exclusive — \
+             LcpRegistry must hold marker payload `()` (no Arc<DenseKvBuffers> \
+             clones outstanding) until iter-3 wires the partial-prefill resume path",
+            layer_rank,
+        )
+    })?;
     let capacity = layer.capacity;
     if capacity == 0 {
         anyhow::bail!("kv_restore: zero capacity layer");

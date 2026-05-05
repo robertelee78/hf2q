@@ -590,7 +590,28 @@ pub struct MlxModelWeights {
     /// Attention is permutation-invariant over cached K,V (RoPE is baked
     /// in before caching), so the ring's slot order doesn't matter for
     /// correctness — the kernel just attends to all populated slots.
-    pub dense_kvs: Option<Vec<DenseKvBuffers>>,
+    /// ADR-017 Phase E.a iter-2.5 (Strategy A): per-layer Arc-wrapped
+    /// owned KV buffers. The Arc tier is structural — at iter-2.5 the
+    /// worker thread is still the sole holder of every Arc (strong
+    /// count == 1 for every entry), so `Arc::get_mut` always succeeds
+    /// at the kv-restore mutation site (engine.rs ~3479). Iter-3 will
+    /// hand out Arc-clones to the LcpRegistry; at that point the
+    /// mutation discipline tightens (registry-cloned Arcs become
+    /// read-only via Arc::deref auto-coercion, and any in-place rewrite
+    /// must consume + re-store the Arc to bring strong_count back to 1).
+    ///
+    /// **Read-path consumers UNCHANGED.** `dense_kvs[i].k`,
+    /// `dense_kvs[i].v`, `dense_kvs[i].capacity`, `dense_kvs[i].is_sliding`
+    /// all auto-deref through `Arc::deref` so existing forward_mlx.rs
+    /// reader sites at lines 2432-2588 + 2794 compile without per-site
+    /// edits. Field-access syntax `(&Arc<T>).k` resolves through the
+    /// auto-deref chain `&Arc<T>` → `&T` → `&T.k` at zero cost.
+    ///
+    /// See dossier `docs/research/adr017-phase-e-option-a-2026-05-05.md`
+    /// §10.3 Strategy A for the full rationale (~25 LOC additive in
+    /// this file vs Strategy B's outer-Arc shape, which conflates
+    /// per-layer eviction with whole-Vec rebuilds).
+    pub dense_kvs: Option<Vec<std::sync::Arc<DenseKvBuffers>>>,
     /// Tmp buffer for flash_attn_vec when using dense decode.
     pub dense_sdpa_tmp: Option<MlxBuffer>,
     // iter-20 Leg F `leg_f_kvs` + `leg_f_sdpa_tmp` shadow-cache fields deleted
