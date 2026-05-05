@@ -1988,10 +1988,31 @@ impl GemmaLoadedModel {
             eos_token_ids,
             load_duration,
             prompt_cache: PromptCache::new(),
-            // ADR-017 Phase E.a iter-2: detection-only LCP registry.
-            // Capacity 16 — covers /cfa Phase 2 fan-out + multi-turn
-            // chat last-16-turns visibility. Marker payload `()`.
-            lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry::new(16),
+            // ADR-017 Phase E.a — LCP registry. Capacity = 1 for v1.
+            //
+            // Pre-iter-3 the payload was marker `()` (~0 bytes); iter-2
+            // chose 16 entries for /cfa fan-out + last-16-turn
+            // visibility at that cost. Iter-3 swapped the payload to
+            // real `DenseKvBuffers` Arc clones — per-entry size on
+            // Gemma 4 26B is ~4.8 GB (48 layers × ~100 MB/layer KV at
+            // F32). Capacity 16 with that payload would budget ~77 GB
+            // for LCP cache alone, OOM-class on a 128-GB M5 Max.
+            //
+            // Single-slot is the smallest defensible cache and covers
+            // the load-bearing v1 use case: multi-turn chat hits
+            // sequentially (turn N evicts turn N-1's entry; turn N+1
+            // gets turn N's). /cfa Phase 2 fan-out only worker 1
+            // benefits; workers 2-N either fall back to fresh prefill
+            // OR hit the upstream PromptCache full-equality replay
+            // (Phase E option b, shipped at `d17163b`). Both are
+            // acceptable v1 semantics.
+            //
+            // Future iter wires `HF2Q_KV_LCP_CAPACITY` env (default 1,
+            // operators raise as memory permits) AND `HF2Q_KV_LCP_BUDGET_BYTES`
+            // for byte-bounded eviction. Out-of-scope for iter-3 v1
+            // closure — single-slot v1 ships first; Codex audit gates
+            // promotion.
+            lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
             // ADR-017 Phase E.a iter-2: metrics sink wired by
             // `serve::load_engine` AFTER this constructor returns
             // (before `Engine::spawn` moves the loaded model). `None`
@@ -3823,9 +3844,27 @@ fn generate_once_with_soft_tokens(
             Some(_k_obs) => {
                 // Iter-3 env-gates: both must be ON, else stay
                 // observation-only (iter-2 behavior).
-                if !crate::debug::INVESTIGATION_ENV.kv_lcp_resume
-                    || !crate::debug::INVESTIGATION_ENV.use_dense
-                {
+                if !crate::debug::INVESTIGATION_ENV.kv_lcp_resume {
+                    None
+                } else if !crate::debug::INVESTIGATION_ENV.use_dense {
+                    // Codex audit LOW issue #3: warn (once) on the
+                    // `LCP_RESUME=1` + `USE_DENSE=0` combination so
+                    // operators don't silently get observation-only
+                    // when they explicitly asked for resume. Static
+                    // `std::sync::Once` ensures one log line per
+                    // process regardless of request volume.
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(
+                            "HF2Q_KV_LCP_RESUME=1 set but HF2Q_USE_DENSE=0 — \
+                             iter-3 partial-prefill resume requires dense \
+                             SDPA (TQ-packed kv_caches not safely resumable \
+                             without a separate restoration path; Phase E.a \
+                             v2 scope). LCP probe stays observation-only. \
+                             To activate iter-3 resume, set BOTH \
+                             HF2Q_KV_LCP_RESUME=1 AND HF2Q_USE_DENSE=1."
+                        );
+                    });
                     None
                 } else {
                     // Capacity check is a re-probe: take_prefix returns
@@ -3841,14 +3880,58 @@ fn generate_once_with_soft_tokens(
                     match prefix_opt {
                         None => None,
                         Some(prefix) => {
+                            // Aggregate capacity check.
                             let new_linear = prompt_tokens.len() + params.max_tokens.max(1);
                             let model_sw = loaded.weights.sliding_window.max(1);
-                            let cap_ok = prefix.linear_capacity >= new_linear
+                            let agg_ok = prefix.linear_capacity >= new_linear
                                 && prefix.sliding_window == model_sw;
-                            if !cap_ok {
+                            // Codex audit MED issue #2: per-layer
+                            // cap + is_sliding check BEFORE installing
+                            // the cached Arcs into weights. If any
+                            // layer's cached capacity < required or
+                            // is_sliding mismatches the model's layer
+                            // type, fall through to fresh prefill
+                            // GRACEFULLY (drop cached Arcs; engine
+                            // alloc-fresh on the None path) instead of
+                            // letting forward_prefill bail with a 500
+                            // after the install side-effect.
+                            let per_layer_ok = if !agg_ok {
+                                false
+                            } else if prefix.dense_kvs.len() != loaded.weights.layers.len() {
+                                false
+                            } else {
+                                prefix.dense_kvs.iter().enumerate().all(|(li, arc)| {
+                                    let layer = &loaded.weights.layers[li];
+                                    let layer_is_ring = matches!(
+                                        layer.layer_type,
+                                        crate::serve::config::LayerType::Sliding
+                                    );
+                                    let required_cap = if layer_is_ring {
+                                        model_sw
+                                    } else {
+                                        new_linear
+                                    };
+                                    arc.capacity >= required_cap
+                                        && arc.is_sliding == layer_is_ring
+                                })
+                            };
+                            if !per_layer_ok {
                                 // Drop the cached Arcs (registry already
                                 // consumed); fall through to fresh
-                                // prefill.
+                                // prefill. Log so operators can see
+                                // capacity misses.
+                                tracing::debug!(
+                                    "lcp_resume: capacity check failed (agg_ok={}, \
+                                     per_layer_ok={}, prefix.linear_cap={}, \
+                                     new_linear={}, prefix.sw={}, model_sw={}) — \
+                                     falling back to fresh prefill",
+                                    agg_ok,
+                                    per_layer_ok,
+                                    prefix.linear_capacity,
+                                    new_linear,
+                                    prefix.sliding_window,
+                                    model_sw,
+                                );
                                 drop(prefix);
                                 None
                             } else {
@@ -3860,11 +3943,9 @@ fn generate_once_with_soft_tokens(
                                 // strong_count == 1 per layer).
                                 loaded.weights.dense_kvs = Some(prefix.dense_kvs);
                                 tracing::debug!(
-                                    "lcp_resume: ENGAGED — K={} of N={} (linear_cap_ok={}, sw_match={})",
+                                    "lcp_resume: ENGAGED — K={} of N={} (per-layer cap ok)",
                                     k,
                                     prompt_tokens.len(),
-                                    prefix.linear_capacity >= new_linear,
-                                    prefix.sliding_window == model_sw,
                                 );
                                 Some(k)
                             }
@@ -4290,6 +4371,29 @@ fn generate_once_with_soft_tokens(
     // to 1 in the caller (registry drops its set), enabling the
     // partial-prefill resume path's `Arc::try_unwrap`.
     //
+    // ## Sliding-ring wrap safety (Codex audit issue #1, R12)
+    //
+    // Decode mutates `dense_kvs[*][slot=p%sw]` for sliding layers as
+    // it advances positions [N..N+M). When N+M > sliding_window, the
+    // ring WRAPS: decode-written slots overwrite prompt-written slots
+    // [0..(N+M-sw)). On a future LCP resume at K ≤ N, slots [0..K)
+    // would no longer hold pure prompt prefix — they'd hold
+    // assistant decode tokens. The kernel's permutation-invariant
+    // sliding semantic (`forward_prefill.rs:466-471`) is violated for
+    // resume because resume needs the slots to represent specific
+    // positions, not "the most recent sw positions".
+    //
+    // V1 fix: gate the store on `prompt_tokens.len() +
+    // completion_tokens <= sliding_window`. If decode wrapped (or
+    // would have wrapped), don't store — the cached state is no
+    // longer a faithful representation of the prompt prefix. This
+    // makes long-conversation caching miss (each turn's prompt grows
+    // and eventually exceeds sw) but preserves byte-identity
+    // correctness, which is the load-bearing iter-3 v1 invariant.
+    // Iter-3 v2 can lift this restriction by snapshotting dense_kvs
+    // at end-of-prefill (before decode mutates) — adds ~5 GB GPU
+    // memcpy per request on Gemma 4 26B; deferred for v1.
+    //
     // Skip multimodal requests (`!soft_tokens.is_empty()`): the
     // text-only-bound LCP registry must not record prompts whose
     // KV state was generated under per-position soft-token overrides
@@ -4301,13 +4405,24 @@ fn generate_once_with_soft_tokens(
     // populate it.
     if soft_tokens.is_empty() {
         if let Some(weights_dense_kvs) = loaded.weights.dense_kvs.as_ref() {
+            let sliding_window = loaded.weights.sliding_window.max(1);
+            let total_writes = prompt_len.saturating_add(result.completion_tokens);
+            // Sliding-ring wrap guard: if total writes (prompt + decode)
+            // exceeded the sliding window, the ring wrapped and
+            // sliding-layer slots no longer faithfully represent
+            // [0..total_writes). Skip store; future resume on this
+            // prefix would read corrupted state.
+            let ring_safe = total_writes <= sliding_window
+                || !loaded.weights.layers.iter().any(|l| {
+                    matches!(l.layer_type, crate::serve::config::LayerType::Sliding)
+                });
+            if ring_safe {
             let lcp_key = build_lcp_key_for_request(loaded, params);
             // Clone Arcs (cheap — strong_count++) so the registry's
             // set is independent of the engine's set. The engine
             // keeps `weights.dense_kvs` populated for forward_decode.
             let payload: Vec<std::sync::Arc<crate::serve::forward_mlx::DenseKvBuffers>> =
                 weights_dense_kvs.iter().map(std::sync::Arc::clone).collect();
-            let sliding_window = loaded.weights.sliding_window.max(1);
             let linear_capacity = prompt_len + params.max_tokens.max(1);
             match loaded.lcp_registry.store(
                 lcp_key,
@@ -4329,6 +4444,16 @@ fn generate_once_with_soft_tokens(
                         e
                     );
                 }
+            }
+            } else {
+                tracing::debug!(
+                    "lcp_registry.store skipped: sliding-ring wrap guard \
+                     (total_writes={} > sliding_window={}; iter-3 v1 \
+                     correctness preserves byte-identity at the cost of \
+                     long-conversation cache miss)",
+                    total_writes,
+                    sliding_window
+                );
             }
         }
     }
@@ -5947,6 +6072,11 @@ fn generate_stream_once(
                 if !crate::debug::INVESTIGATION_ENV.kv_lcp_resume
                     || !crate::debug::INVESTIGATION_ENV.use_dense
                 {
+                    // Note: the warn-once-on-RESUME-without-DENSE log
+                    // line is emitted by the non-streaming probe site
+                    // (engine.rs::generate_once_with_soft_tokens). One
+                    // global log per process is enough; no need to
+                    // duplicate here.
                     None
                 } else {
                     let prefix_opt = loaded.lcp_registry.take_prefix(&lcp_key, prompt_tokens);
@@ -5955,9 +6085,34 @@ fn generate_stream_once(
                         Some(prefix) => {
                             let new_linear = prompt_tokens.len() + params.max_tokens.max(1);
                             let model_sw = loaded.weights.sliding_window.max(1);
-                            let cap_ok = prefix.linear_capacity >= new_linear
+                            let agg_ok = prefix.linear_capacity >= new_linear
                                 && prefix.sliding_window == model_sw;
-                            if !cap_ok {
+                            // Per-layer cap + is_sliding check (same
+                            // shape as non-streaming probe site).
+                            let per_layer_ok = if !agg_ok {
+                                false
+                            } else if prefix.dense_kvs.len() != loaded.weights.layers.len() {
+                                false
+                            } else {
+                                prefix.dense_kvs.iter().enumerate().all(|(li, arc)| {
+                                    let layer = &loaded.weights.layers[li];
+                                    let layer_is_ring = matches!(
+                                        layer.layer_type,
+                                        crate::serve::config::LayerType::Sliding
+                                    );
+                                    let required_cap = if layer_is_ring {
+                                        model_sw
+                                    } else {
+                                        new_linear
+                                    };
+                                    arc.capacity >= required_cap
+                                        && arc.is_sliding == layer_is_ring
+                                })
+                            };
+                            if !per_layer_ok {
+                                tracing::debug!(
+                                    "lcp_resume (streaming): capacity check failed — falling back"
+                                );
                                 drop(prefix);
                                 None
                             } else {
@@ -6724,20 +6879,40 @@ fn generate_stream_once(
     // prompt too. Skip multimodal per dossier §10.5 (text-only-pure
     // registry contract). Skip when `weights.dense_kvs` is None
     // (embedding-only path).
+    //
+    // Sliding-ring wrap guard mirrors the non-streaming site (Codex
+    // audit issue #1, R12): if total writes (prompt + decode)
+    // exceeded the sliding window, the ring wrapped and decode-
+    // written slots overwrote prompt-written slots. Skip store; a
+    // future resume on this prefix would read corrupted state.
     if soft_tokens.is_empty() {
         if let Some(weights_dense_kvs) = loaded.weights.dense_kvs.as_ref() {
-            let lcp_key = build_lcp_key_for_request(loaded, params);
-            let payload: Vec<std::sync::Arc<crate::serve::forward_mlx::DenseKvBuffers>> =
-                weights_dense_kvs.iter().map(std::sync::Arc::clone).collect();
             let sliding_window = loaded.weights.sliding_window.max(1);
-            let linear_capacity = prompt_tokens.len() + params.max_tokens.max(1);
-            let _ = loaded.lcp_registry.store(
-                lcp_key,
-                prompt_tokens.to_vec(),
-                payload,
-                sliding_window,
-                linear_capacity,
-            );
+            let total_writes = prompt_tokens.len().saturating_add(completion_tokens);
+            let ring_safe = total_writes <= sliding_window
+                || !loaded.weights.layers.iter().any(|l| {
+                    matches!(l.layer_type, crate::serve::config::LayerType::Sliding)
+                });
+            if ring_safe {
+                let lcp_key = build_lcp_key_for_request(loaded, params);
+                let payload: Vec<std::sync::Arc<crate::serve::forward_mlx::DenseKvBuffers>> =
+                    weights_dense_kvs.iter().map(std::sync::Arc::clone).collect();
+                let linear_capacity = prompt_tokens.len() + params.max_tokens.max(1);
+                let _ = loaded.lcp_registry.store(
+                    lcp_key,
+                    prompt_tokens.to_vec(),
+                    payload,
+                    sliding_window,
+                    linear_capacity,
+                );
+            } else {
+                tracing::debug!(
+                    "lcp_registry.store skipped (streaming): sliding-ring wrap \
+                     guard (total_writes={} > sliding_window={})",
+                    total_writes,
+                    sliding_window
+                );
+            }
         }
     }
 }
