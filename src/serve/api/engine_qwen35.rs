@@ -34,6 +34,7 @@
 //!   live inference lands).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -794,6 +795,28 @@ pub fn generate_qwen35_once(
     // SoftTokenInjection at `generate_qwen35_once` (the soft-token
     // variant lives at `generate_qwen35_once_with_soft_tokens` line
     // 907; this site is text-only by construction).
+    // ── ADR-017 Phase E.a B.2c: LCP partial-prefill resume probe ──
+    //
+    // Sequence: PromptCache full-equality first (fast path); if miss,
+    // probe lcp_registry for partial-prefix match.  When env-gated AND
+    // a true-continuation hit (k == cached_prompt_len) AND DeltaNet
+    // recurrent state correctness holds (snapshot taken at exactly
+    // cached_prompt_len), restore the snapshot and shorten the prefill
+    // to the suffix only.
+    //
+    // Why only true-continuation in v1: the DeltaNet recurrent state is
+    // position-dependent and evolves incrementally through prefill.  An
+    // end-of-prefill snapshot's recurrent state corresponds to position
+    // `cached_prompt_len`, so it's only correct for resume at exactly
+    // that position.  Partial-LCP (k < cached_prompt_len) would resume
+    // with a recurrent state from a LATER position than the actual
+    // resume point — byte-different output to a fresh prefill.  Mid-
+    // prefill stride-aligned checkpointing is a B.3 follow-up.
+    //
+    // For multi-turn chat (the dominant /cfa workload), each turn
+    // strictly extends the previous.  True-continuation LCP captures
+    // this case completely.
+    let mut lcp_resume_start: usize = 0;
     if !prompt_cache_hit {
         let lcp_key = build_lcp_key_for_qwen35(qwen, params);
         let detected = crate::serve::kv_persist::lcp_registry::probe_lcp_opportunity(
@@ -805,9 +828,51 @@ pub fn generate_qwen35_once(
         if let Some(sink) = qwen.kv_metrics_sink.as_ref() {
             sink.record_lcp_probe(detected);
         }
-        // Iter B.2 will install cached HybridKvCacheCheckpoint here on
-        // a non-trivial detection AND env-gated; iter B.1 reports only.
         let _ = detected;
+
+        // B.2c gate: HF2Q_KV_LCP_RESUME=1 enables actual partial-prefill
+        // resume (default off for safe rollout; observability above runs
+        // unconditionally so metrics show pre-rollout LCP opportunity rate).
+        let lcp_resume_enabled = crate::debug::INVESTIGATION_ENV.kv_lcp_resume;
+        if lcp_resume_enabled {
+            eprintln!(
+                "[hf2q qwen35 lcp probe] enabled, registry_len={}, prompt_len={}",
+                qwen.lcp_registry.len(),
+                prompt_tokens.len()
+            );
+            // take_prefix consumes the entry (LRU semantics: a hit
+            // consumes the cached state for this request; the
+            // post-prefill store below re-installs an updated entry
+            // with the fresh prompt's full state).
+            match qwen.lcp_registry.take_prefix(&lcp_key, prompt_tokens) {
+                Some(prefix) if prefix.k == prefix.cached_prompt_len => {
+                    // True-continuation hit: restore + suffix-only prefill.
+                    let snapshot: &HybridKvCacheSnapshot = &prefix.dense_kvs[0];
+                    kv_cache
+                        .restore_from(snapshot)
+                        .context("qwen35 lcp_registry restore_from")?;
+                    lcp_resume_start = prefix.k;
+                    eprintln!(
+                        "[hf2q qwen35 lcp resume] TRUE-CONTINUATION HIT — \
+                         restoring at k={} (cached_prompt_len={})",
+                        prefix.k, prefix.cached_prompt_len
+                    );
+                }
+                Some(prefix) => {
+                    eprintln!(
+                        "[hf2q qwen35 lcp probe] PARTIAL HIT — k={} < \
+                         cached_prompt_len={}, skipping resume",
+                        prefix.k, prefix.cached_prompt_len
+                    );
+                }
+                None => {
+                    eprintln!(
+                        "[hf2q qwen35 lcp probe] MISS (registry_len={})",
+                        qwen.lcp_registry.len()
+                    );
+                }
+            }
+        }
     }
 
     let prefill_start = Instant::now();
@@ -848,9 +913,18 @@ pub fn generate_qwen35_once(
         // call; iter B.2a (this commit) keeps the constraint to
         // verify the foundational invariant first.
         let stride = crate::debug::INVESTIGATION_ENV.kv_lcp_deltanet_checkpoint_stride;
+        // ADR-017 Phase E.a B.2c: when lcp_resume_start > 0 we have a
+        // restored snapshot at the LCP boundary; prefill the suffix only
+        // (`prompt_tokens[lcp_resume_start..]`).  Disable chunked + LCP
+        // composition for v1 — chunked-with-cur_len > 0 is byte-identical
+        // (proven via B.2a) but the chunked loop's k_start arithmetic
+        // assumes prefill starts from 0; bolt-on suffix-chunked support
+        // is a v2 polish.  Monolithic suffix prefill is byte-identical
+        // (proven via the B.2-fix end-to-end falsifier Path D).
         let chunked_eligible = crate::debug::INVESTIGATION_ENV.kv_lcp_chunked_prefill
             && stride > 0
-            && prompt_len > stride;
+            && prompt_len > stride
+            && lcp_resume_start == 0;
         let prefill_logits = if chunked_eligible {
             // ADR-017 Phase B-hybrid.2a — chunked prefill with partial
             // tail support. The first N-1 calls have seq_len = stride;
@@ -897,6 +971,33 @@ pub fn generate_qwen35_once(
                 }
             }
             last_logits.expect("at least one chunk in chunked prefill")
+        } else if lcp_resume_start > 0 {
+            // Suffix-only monolithic prefill from the LCP boundary.
+            // The kv_cache is already populated through `lcp_resume_start`
+            // by `restore_from(snapshot)`; the suffix call's first chunk
+            // sees `cur_len = lcp_resume_start > 0`, which routes through
+            // the FA bf16 d256 RESUME kernel (head_dim=256 production
+            // path) — byte-identical to a fresh full prefill (B.2-fix
+            // landed in commit fff4b4d / mlx-native@1819fad).
+            let suffix_tokens = &prompt_tokens[lcp_resume_start..];
+            let suffix_len = suffix_tokens.len();
+            // Positions are absolute (axis-replicated 4x for IMROPE).
+            let mut suffix_positions = vec![0i32; 4 * suffix_len];
+            for axis in 0..4 {
+                for t in 0..suffix_len {
+                    suffix_positions[axis * suffix_len + t] =
+                        (lcp_resume_start + t) as i32;
+                }
+            }
+            eprintln!(
+                "[hf2q qwen35 lcp resume] suffix prefill {} tokens \
+                 (lcp_resume_start={}, prompt_len={})",
+                suffix_len, lcp_resume_start, prompt_len
+            );
+            qwen
+                .model
+                .forward_gpu_last_logits(suffix_tokens, &suffix_positions, &mut kv_cache)
+                .context("Qwen35Model::forward_gpu_last_logits (LCP resume suffix)")?
         } else {
             let positions = prefill_positions_for(prompt_len);
             qwen
@@ -925,7 +1026,18 @@ pub fn generate_qwen35_once(
         // snapshot captures KV state AFTER the prefill (current_len[0]
         // == prompt_len for full-attn slots; DeltaNet conv/recurrent
         // populated by the linear-attn layer's prefill emit).
+        //
+        // ADR-017 Phase E.a B.2b: snapshot BOTH the existing prompt_cache
+        // (Phase E.b full-equality replay, capacity 1) AND the lcp_registry
+        // (Phase E.a partial-prefill resume, capacity defined at
+        // Qwen35LoadedModel construction).  Two snapshots is wasteful
+        // (~2× GB-scale memcpy) — a follow-up should refactor
+        // HybridPromptCache to share Arc<HybridKvCacheSnapshot> with
+        // lcp_registry, eliminating the duplication.  Cost is one-time
+        // per request, amortised over the prefill saving on the next
+        // matching request.
         if is_greedy {
+            // Snapshot 1: prompt_cache (full-equality replay, Phase E.b).
             match kv_cache.snapshot(&device) {
                 Ok(snap) => qwen.prompt_cache.update(
                     prompt_tokens.to_vec(),
@@ -934,9 +1046,56 @@ pub fn generate_qwen35_once(
                     params,
                 ),
                 Err(e) => {
-                    // Snapshot failure is non-fatal — we just don't cache
-                    // this prefill.  Log and continue.
                     tracing::warn!(error = %e, "qwen35 prompt_cache snapshot skipped");
+                }
+            }
+
+            // Snapshot 2: lcp_registry (partial-prefill resume, Phase E.a).
+            // Only stored when LCP resume is enabled — there's no point
+            // burning GB-scale memcpy on a registry whose entries will
+            // never be looked up.
+            if crate::debug::INVESTIGATION_ENV.kv_lcp_resume {
+                eprintln!(
+                    "[hf2q qwen35 lcp store] storing snapshot for prompt_len={} \
+                     (registry_len_before={})",
+                    prompt_tokens.len(),
+                    qwen.lcp_registry.len()
+                );
+                match kv_cache.snapshot(&device) {
+                    Ok(snap) => {
+                        let lcp_key = build_lcp_key_for_qwen35(qwen, params);
+                        // sliding_window=0: Qwen3.5/3.6 uses pure-causal
+                        //   attention (no sliding-window mask), so the
+                        //   sliding_window field is irrelevant for restore.
+                        // linear_capacity: byte length of any linear-attn
+                        //   recurrent buffer — used by Gemma 4 dense
+                        //   resume (LcpRegistry's three-case capacity
+                        //   protocol §10.2).  For hybrid Qwen we still
+                        //   thread it through as informational.
+                        let linear_capacity = kv_cache
+                            .linear_attn
+                            .first()
+                            .map(|s| s.recurrent.byte_len())
+                            .unwrap_or(0);
+                        if let Err(e) = qwen.lcp_registry.store(
+                            lcp_key,
+                            prompt_tokens.to_vec(),
+                            vec![Arc::new(snap)],
+                            0,
+                            linear_capacity,
+                        ) {
+                            tracing::warn!(
+                                "qwen35 lcp_registry store skipped: {:?}",
+                                e
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "qwen35 lcp_registry snapshot skipped"
+                        );
+                    }
                 }
             }
         }
