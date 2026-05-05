@@ -1089,6 +1089,306 @@ fn iter7_prefill_wrap_guard_long_prompt_byte_identity() {
 // this test should be UPDATED (renamed to assert hybrid LCP works), not
 // deleted — making the deferral lift visible in the diff.
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Iter-8 — streaming-path byte-identity falsifier (mirror of iter-3 with
+// stream=true).
+//
+// Per Codex Phase-2b audit recommendation 2026-05-05 (verdict file
+// `docs/research/adr017-phase-e-a-iter7-codex-audit-2026-05-05.txt`):
+// "add an explicit pure-dense long-prompt regression if a pure-dense
+// fixture is available, and keep the operator soak focused on both
+// non-streaming and streaming store paths." The pure-dense fixture is
+// not available; the streaming-path coverage IS available and lands
+// here.
+//
+// ## Why streaming needs its own byte-identity test
+//
+// The streaming path (engine.rs:6080-7048) has its own probe site
+// (engine.rs:6158), its own resume gate (engine.rs:6182-6244), and its
+// own snapshot store site (engine.rs:7020-7048). Structural review
+// confirms it mirrors the non-streaming path verbatim, but
+// "structurally identical" is NOT the same as "byte-identical". A
+// regression in streaming-only emission (e.g., per-fragment encoding,
+// partial-token stop-string handling, SSE event ordering vs LCP
+// resume-state install timing) wouldn't surface in iter-3 and iter-5
+// (which use stream=false).
+//
+// ## Test design — same Q+P pair as iter-3, stream=true, accumulate
+//
+// Same priming and probe prompts as iter-3 (`PROMPT_Q`, `PROMPT_P`):
+//   * Server A (HF2Q_KV_LCP_RESUME=1 + HF2Q_USE_DENSE=1, stream=true):
+//     - Send Q (primes registry via streaming store at engine.rs:7020)
+//     - Send P (probe + take_prefix + resume engages via streaming
+//       resume gate at engine.rs:6182)
+//   * Server B (control, USE_DENSE=1, stream=true): send P fresh
+//
+// Engagement: server A's `hf2q_kv_lcp_detected_total` advances ≥ 1
+// (proves the streaming probe + take_prefix path engaged; without this
+// check a silent registry-miss would yield trivial byte-identity).
+//
+// Falsifier: server_A_streamed(P) != server_B_streamed(P). Either text
+// content differs (silent miscompute) OR the streaming-specific
+// emission breaks (event ordering / fragment encoding / SSE framing).
+//
+// ## SSE accumulation
+//
+// `chat_decode_stream` parses `text/event-stream` line-by-line. Each
+// `data: {json}` line carries `choices[0].delta.content` (or no content
+// for role/role-only init events). Concatenate all deltas; ignore
+// `data: [DONE]` and empty/keepalive lines. The accumulated string is
+// the canonical "what the streaming client saw".
+
+/// Send a streaming /v1/chat/completions request and accumulate
+/// `delta.content` deltas across SSE events into a single String. Used
+/// by iter-8 streaming byte-identity test.
+fn chat_decode_stream(server: &ServerGuard, model: &str, prompt: &str, max_tokens: u32) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let body = format!(
+        r#"{{"model":"{model}","messages":[{{"role":"user","content":"{prompt}"}}],"max_tokens":{max_tokens},"temperature":0,"stream":true}}"#
+    );
+    let mut s = TcpStream::connect((HOST, server.port)).expect("connect stream");
+    s.set_read_timeout(Some(Duration::from_secs(120))).ok();
+    s.set_write_timeout(Some(Duration::from_secs(30))).ok();
+    write!(
+        s,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {HOST}:{}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        server.port,
+        body.len(),
+        body
+    )
+    .unwrap();
+    let mut reader = BufReader::new(s);
+    let mut accumulated = String::new();
+    // Skip past response headers.
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("read header line");
+        if n == 0 {
+            panic!("[chat_decode_stream] EOF before headers ended");
+        }
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed.is_empty() {
+            // Blank line ⇒ end of headers.
+            break;
+        }
+    }
+    // Now read SSE events until [DONE] or EOF.
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("read sse line");
+        if n == 0 {
+            break; // EOF
+        }
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed.is_empty() {
+            continue; // SSE event boundary
+        }
+        if let Some(payload) = trimmed.strip_prefix("data: ") {
+            if payload == "[DONE]" {
+                break;
+            }
+            // Extract `delta.content` from the JSON payload. Naive
+            // string-search extractor; sufficient for the well-known
+            // OpenAI streaming shape
+            //   {"choices":[{"delta":{"content":"...","role":"assistant"...}}]}
+            // Some events carry only role (no content); we skip those
+            // by checking for the content key.
+            let key = "\"content\":\"";
+            if let Some(p) = payload.find(key) {
+                let rest = &payload[p + key.len()..];
+                let mut chars = rest.chars();
+                while let Some(c) = chars.next() {
+                    if c == '\\' {
+                        match chars.next() {
+                            Some('"') => accumulated.push('"'),
+                            Some('\\') => accumulated.push('\\'),
+                            Some('n') => accumulated.push('\n'),
+                            Some('r') => accumulated.push('\r'),
+                            Some('t') => accumulated.push('\t'),
+                            Some(other) => {
+                                accumulated.push('\\');
+                                accumulated.push(other);
+                            }
+                            None => break,
+                        }
+                    } else if c == '"' {
+                        break;
+                    } else {
+                        accumulated.push(c);
+                    }
+                }
+            }
+            // No content key on this event ⇒ role/init/finish frame; skip.
+        }
+        // Lines that don't start with "data: " (e.g. SSE comments or
+        // unknown headers) are ignored.
+    }
+    accumulated
+}
+
+/// ADR-017 Phase E option (a) iter-8 — streaming-path byte-identity
+/// falsifier (closes Codex Phase-2b audit recommendation re streaming
+/// store path coverage).
+///
+/// Mirrors iter-3 falsifier but `stream=true`. Asserts:
+///   1. Server A streaming-resume bytes == Server B streaming-control
+///      bytes byte-identical.
+///   2. Engagement via `hf2q_kv_lcp_detected_total ≥ 1` on server A
+///      after sending Q + P (proves the streaming probe + take_prefix
+///      path engaged).
+///
+/// Falsifier on either: streaming-path nondeterminism / silent
+/// miscompute / fragment encoding regression. Phase E.a v1 streaming
+/// invariant violated.
+#[test]
+fn iter8_streaming_path_byte_identity() {
+    let model_path = match resolve_model_path_or_skip() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[iter-8 streaming] {ENV_PHASE_D_GATE}=1 not set — short-circuit. \
+                 Set {ENV_PHASE_D_GATE}=1 + {ENV_MODEL_PATH}=PATH to run."
+            );
+            return;
+        }
+    };
+    let bin = hf2q_binary_path();
+    assert!(
+        bin.exists(),
+        "[iter-8 streaming] hf2q binary not found at {} — \
+         did `cargo build --release` run?",
+        bin.display()
+    );
+
+    // ── Server A: streaming-resume path under test ──
+    let server_a = spawn_server(
+        &bin,
+        &model_path,
+        PORT_A,
+        &[("HF2Q_KV_LCP_RESUME", "1")],
+    );
+    wait_for_readyz(&server_a);
+    let canonical_a = fetch_canonical_model_id(&server_a);
+    eprintln!(
+        "[iter-8 streaming] server A (LCP_RESUME=1, stream=true) ready on {}:{} model={}",
+        HOST, PORT_A, canonical_a
+    );
+
+    // Prime the LCP registry with Q via streaming.
+    let q_streamed_a = chat_decode_stream(&server_a, &canonical_a, PROMPT_Q, MAX_TOKENS);
+    assert!(
+        !q_streamed_a.is_empty(),
+        "[iter-8 streaming] Q streaming returned empty content on server A"
+    );
+    eprintln!(
+        "[iter-8 streaming] server A Q streamed {} bytes (priming registry)",
+        q_streamed_a.len()
+    );
+
+    // Send P via streaming — registry has Q's entry, streaming probe at
+    // engine.rs:6158 should hit, take_prefix at engine.rs:6183 fires,
+    // streaming resume engages at engine.rs:6238.
+    let p_streamed_a = chat_decode_stream(&server_a, &canonical_a, PROMPT_P, MAX_TOKENS);
+    assert!(
+        !p_streamed_a.is_empty(),
+        "[iter-8 streaming] P streaming returned empty content on server A"
+    );
+    eprintln!(
+        "[iter-8 streaming] server A P streamed {} bytes (resume path under test)",
+        p_streamed_a.len()
+    );
+
+    // Engagement assertion: confirm the streaming resume path engaged.
+    let metrics_body_a = fetch_metrics(&server_a);
+    let lcp_detected_a = metric_lcp_detected_total(&metrics_body_a);
+    assert!(
+        lcp_detected_a >= 1,
+        "[iter-8 streaming] server A's /metrics shows hf2q_kv_lcp_detected_total={} \
+         — the streaming LCP probe did NOT engage on the Q+P sequence. The \
+         byte-identity check below is therefore VACUOUS (server A took the \
+         fresh-prefill streaming path, same as server B). Test design \
+         assumption violated.\n\nmetrics excerpt:\n{}",
+        lcp_detected_a,
+        metrics_body_a
+            .lines()
+            .filter(|l| l.contains("lcp"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    eprintln!(
+        "[iter-8 streaming] server A engagement confirmed: \
+         hf2q_kv_lcp_detected_total={}",
+        lcp_detected_a
+    );
+
+    // Drop server A so Metal device + RAM are free before server B.
+    drop(server_a);
+
+    // ── Server B: streaming control (no resume) ──
+    let server_b = spawn_server(&bin, &model_path, PORT_B, &[]);
+    wait_for_readyz(&server_b);
+    let canonical_b = fetch_canonical_model_id(&server_b);
+    eprintln!(
+        "[iter-8 streaming] server B (control, no resume, stream=true) ready on {}:{} model={}",
+        HOST, PORT_B, canonical_b
+    );
+
+    let p_streamed_b = chat_decode_stream(&server_b, &canonical_b, PROMPT_P, MAX_TOKENS);
+    assert!(
+        !p_streamed_b.is_empty(),
+        "[iter-8 streaming] P streaming returned empty content on server B"
+    );
+    eprintln!(
+        "[iter-8 streaming] server B P streamed {} bytes (control)",
+        p_streamed_b.len()
+    );
+
+    // Falsifier: byte-for-byte identity of accumulated streaming
+    // content.
+    if p_streamed_a != p_streamed_b {
+        let common_prefix = p_streamed_a
+            .as_bytes()
+            .iter()
+            .zip(p_streamed_b.as_bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let snippet_a = p_streamed_a
+            .get(common_prefix..common_prefix.saturating_add(120))
+            .unwrap_or("")
+            .to_string();
+        let snippet_b = p_streamed_b
+            .get(common_prefix..common_prefix.saturating_add(120))
+            .unwrap_or("")
+            .to_string();
+        panic!(
+            "[iter-8 streaming] FAIL — P streamed bytes differ between resume \
+             (A) and fresh (B) streaming paths.\n\
+             server A (resume) len={} bytes\n\
+             server B (control) len={} bytes\n\
+             diverge at byte offset={}\n\
+             server A @ {}: {:?}\n\
+             server B @ {}: {:?}\n\
+             ⇒ iter-3.5 streaming resume produces non-byte-identical \
+             output. Phase E.a streaming invariant VIOLATED. Do NOT \
+             promote env-gate from default-OFF until divergence is \
+             root-caused.",
+            p_streamed_a.len(),
+            p_streamed_b.len(),
+            common_prefix,
+            common_prefix,
+            snippet_a,
+            common_prefix,
+            snippet_b
+        );
+    }
+    eprintln!(
+        "[iter-8 streaming] PASS — server A (streaming resume) bytes ({} bytes) \
+         == server B (streaming control) bytes ({} bytes) BYTE-IDENTICAL",
+        p_streamed_a.len(),
+        p_streamed_b.len()
+    );
+}
+
 /// Iter-7 deferral marker (always-pass). Documents the Qwen3.5 / Qwen3-VL
 /// hybrid deferral structurally enforced at the worker-thread Request
 /// dispatch (engine.rs:3144-3161, 3194-3211) and the field placement
