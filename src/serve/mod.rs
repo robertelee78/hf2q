@@ -2988,26 +2988,39 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             // hook. Until that fires, the C.1 stub remains the
             // active hook (Skipped on every snapshot/restore).
             //
-            // The shape config wired here is a *placeholder* for
-            // B-dense.2's harness scope: the real GGUF-derived shape
-            // landing extracts from the loaded `MlxModelWeights`
-            // (LayerSpec / DenseKvBuffers / sliding_window) and
-            // requires plumbing through the `cmd_serve` post-load
-            // path. The factory itself is fully shape-parametric;
-            // only the data fed to its constructor is placeholder.
+            // The shape config wired here is a *fallback* used only
+            // if the descriptor-based production substitution path
+            // fails to fire. Real GGUF-derived shape extraction is
+            // already in production at
+            // `src/serve/api/engine.rs:2063-2112`
+            // (`KvSpillDescriptor::from_gemma_loaded_model`) — it
+            // captures `LayerSpec` / `DenseKvBuffers` /
+            // `sliding_window` from the loaded `MlxModelWeights` at
+            // engine spawn. The factory consumes that descriptor at
+            // `src/serve/kv_persist/families/gemma4_dense.rs:1464-1479`
+            // (the `Arc<Engine>` downcast branch overrides the
+            // shape-equivalent fields of this fallback cfg with
+            // descriptor-derived values, falling back to this
+            // cfg's `max_decode_tokens` only when the descriptor
+            // value is 0). The factory itself is fully
+            // shape-parametric.
             //
             // The matrix harness in `tests/kv_persist_gemma4_roundtrip.rs`
             // exercises the seam end-to-end via subprocess + real
             // GGUF.
-            let placeholder_cfg = Gemma4DenseConfig {
+            let fallback_cfg = Gemma4DenseConfig {
                 // Two layers — one Sliding, one Full — minimum that
                 // exercises both layer-type branches in the spill's
                 // capacity_for_layer / alloc_layer paths. The real
                 // Gemma 4 26B has 64 layers (48 sliding + 16
-                // full-attention); this placeholder is *correct
-                // shape* but not *correct length* — the real-shape
-                // wiring is a follow-up plumbing task that pulls
-                // from MlxModelWeights post-load.
+                // full-attention); these fallback values are
+                // *correct shape* but not *correct length*. They
+                // only take effect if the production
+                // descriptor-downcast path at
+                // gemma4_dense.rs:1464 does NOT fire (e.g. the
+                // engine is wrapped in an Arc<EngineHandle> and
+                // hits the B-dense.1 backwards-compat fallback at
+                // gemma4_dense.rs:1485).
                 layer_types: vec![
                     crate::serve::config::LayerType::Sliding,
                     crate::serve::config::LayerType::Full,
@@ -3019,7 +3032,7 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
                 max_decode_tokens: 8192,
             };
             let factory: Arc<dyn FamilyHookFactory> =
-                Arc::new(Gemma4DenseSpillFactory::new(placeholder_cfg));
+                Arc::new(Gemma4DenseSpillFactory::new(fallback_cfg));
             registry.register_factory(pool_repo.clone(), pool_quant, factory);
             tracing::info!(
                 repo = %pool_repo,

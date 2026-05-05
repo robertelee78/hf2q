@@ -37,6 +37,10 @@
 #   scripts/adr017_phase_d.sh --peer                   # enable llama-completion R-C4 peer arm
 #   scripts/adr017_phase_d.sh --prefill 32768          # explicit R-P4 prefill length
 #   scripts/adr017_phase_d.sh --model /path/to.gguf    # override GGUF
+#   scripts/adr017_phase_d.sh --rp1                    # opt in K2 R-P1 sustained-decode overhead
+#   scripts/adr017_phase_d.sh --rp1-concurrent         # opt in K2 R-P1 concurrent-eviction polish
+#   scripts/adr017_phase_d.sh --rp5                    # opt in R-P5 cold-process resume ship-gate
+#   scripts/adr017_phase_d.sh --rp6                    # opt in R-P6 4-agent shared-prefix ship-gate
 #   scripts/adr017_phase_d.sh --skip-process-audit     # bypass pre-bench audit (NOT recommended)
 #
 # Exit codes:
@@ -60,15 +64,32 @@ SKIP_AUDIT=0
 
 usage() {
   cat <<EOF
-Usage: scripts/adr017_phase_d.sh [--model PATH] [--prefill N] [--peer] [--skip-process-audit]
+Usage: scripts/adr017_phase_d.sh [--model PATH] [--prefill N] [--peer]
+                                 [--rp1] [--rp1-concurrent] [--rp5] [--rp6]
+                                 [--skip-process-audit]
 
 Drives ADR-017 Phase D coherence + perf validation tests.
 
   --model PATH             GGUF path (default: $DEFAULT_MODEL_PATH)
   --prefill N              R-P4 prefill length in tokens (default: $DEFAULT_PREFILL_LEN)
   --peer                   Enable llama-completion R-C4 peer arm
+  --rp1                    Opt in K2 R-P1 sustained-decode overhead test
+                           (sets HF2Q_KV_PERSIST_PHASE_D_R_P1=1)
+  --rp1-concurrent         Opt in K2 R-P1 polish: concurrent-eviction-during-decode
+                           (sets HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT=1)
+  --rp5                    Opt in R-P5 cold-process resume ship-gate
+                           (sets HF2Q_KV_PERSIST_PHASE_D_R_P5=1)
+  --rp6                    Opt in R-P6 4-agent shared-prefix ship-gate
+                           (sets HF2Q_KV_PERSIST_PHASE_D_R_P6=1)
   --skip-process-audit     Bypass pre-bench process audit (NOT recommended)
   -h, --help               Show this help
+
+Default-on tests (always run):
+  R-C4 internal coherence (sourdough byte-equality)
+  R-P4 ship-gate (cache_hit_TTFT(32K) / no_cache_TTFT(32K) <= 0.20)
+
+Opt-in tests must be explicitly enabled via the flags above (or by exporting
+the corresponding HF2Q_KV_PERSIST_PHASE_D_* env var to 1 before invocation).
 
 Exit codes: 0=PASS  1=usage  2=test-fail  3=prereq-missing
 EOF
@@ -84,6 +105,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { echo "error: --prefill requires an argument" >&2; exit 1; }
       PREFILL_LEN="$2"; shift 2 ;;
     --peer) ENABLE_PEER=1; shift ;;
+    --rp1) export HF2Q_KV_PERSIST_PHASE_D_R_P1=1; shift ;;
+    --rp1-concurrent) export HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT=1; shift ;;
+    --rp5) export HF2Q_KV_PERSIST_PHASE_D_R_P5=1; shift ;;
+    --rp6) export HF2Q_KV_PERSIST_PHASE_D_R_P6=1; shift ;;
     --skip-process-audit) SKIP_AUDIT=1; shift ;;
     -*) usage >&2; echo "error: unknown flag: $1" >&2; exit 1 ;;
     *)  usage >&2; echo "error: unexpected positional arg: $1" >&2; exit 1 ;;
@@ -162,8 +187,10 @@ echo "    HF2Q_USE_DENSE=1"
 echo "    HF2Q_KV_PERSIST_E2E_MODEL_PATH=$MODEL_PATH"
 echo "    HF2Q_KV_PERSIST_E2E_PREFILL_LEN=$PREFILL_LEN"
 echo "    HF2Q_KV_PERSIST_PHASE_D_PEER=$([ "$ENABLE_PEER" -eq 1 ] && echo 1 || echo 0)"
-echo "    HF2Q_KV_PERSIST_PHASE_D_R_P1=${HF2Q_KV_PERSIST_PHASE_D_R_P1:-0}  (K2 ship-gate; OFF by default; set =1 in env to opt in)"
-echo "    HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT=${HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT:-0}  (K2 polish; concurrent-eviction-during-decode; OFF by default; set =1 in env to opt in)"
+echo "    HF2Q_KV_PERSIST_PHASE_D_R_P1=${HF2Q_KV_PERSIST_PHASE_D_R_P1:-0}  (K2 ship-gate; OFF by default; set =1 in env or pass --rp1 to opt in)"
+echo "    HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT=${HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT:-0}  (K2 polish; concurrent-eviction-during-decode; OFF by default; set =1 in env or pass --rp1-concurrent to opt in)"
+echo "    HF2Q_KV_PERSIST_PHASE_D_R_P5=${HF2Q_KV_PERSIST_PHASE_D_R_P5:-0}  (R-P5 cold-process resume ship-gate; OFF by default; set =1 in env or pass --rp5 to opt in)"
+echo "    HF2Q_KV_PERSIST_PHASE_D_R_P6=${HF2Q_KV_PERSIST_PHASE_D_R_P6:-0}  (R-P6 4-agent shared-prefix ship-gate; OFF by default; set =1 in env or pass --rp6 to opt in)"
 echo
 
 cd "$REPO_ROOT"
@@ -177,10 +204,21 @@ if HF2Q_KV_PERSIST_E2E=1 \
     HF2Q_KV_PERSIST_PHASE_D_PEER="$([ "$ENABLE_PEER" -eq 1 ] && echo 1 || echo 0)" \
     HF2Q_KV_PERSIST_PHASE_D_R_P1="${HF2Q_KV_PERSIST_PHASE_D_R_P1:-0}" \
     HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT="${HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT:-0}" \
+    HF2Q_KV_PERSIST_PHASE_D_R_P5="${HF2Q_KV_PERSIST_PHASE_D_R_P5:-0}" \
+    HF2Q_KV_PERSIST_PHASE_D_R_P6="${HF2Q_KV_PERSIST_PHASE_D_R_P6:-0}" \
     cargo test --release --test kv_persist_gemma4_roundtrip \
       -- --test-threads=1 --nocapture; then
   echo
-  echo "=== ADR-017 Phase D — ALL GATES PASS ==="
+  echo "=== ADR-017 Phase D — Gate accounting ==="
+  echo "  R-C4 internal: ALWAYS RUN (PASS implied by exit 0)"
+  echo "  R-P4         : ALWAYS RUN (PASS implied by exit 0)"
+  echo "  R-C4 peer    : $([ "$ENABLE_PEER" -eq 1 ] && echo 'OPT-IN RUN' || echo 'SKIPPED (--peer not set)')"
+  echo "  K2 R-P1      : $([ "${HF2Q_KV_PERSIST_PHASE_D_R_P1:-0}" = 1 ] && echo 'OPT-IN RUN' || echo 'SKIPPED (HF2Q_KV_PERSIST_PHASE_D_R_P1 unset)')"
+  echo "  K2 R-P1 conc : $([ "${HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT:-0}" = 1 ] && echo 'OPT-IN RUN' || echo 'SKIPPED (HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT unset)')"
+  echo "  R-P5         : $([ "${HF2Q_KV_PERSIST_PHASE_D_R_P5:-0}" = 1 ] && echo 'OPT-IN RUN' || echo 'SKIPPED (HF2Q_KV_PERSIST_PHASE_D_R_P5 unset)')"
+  echo "  R-P6         : $([ "${HF2Q_KV_PERSIST_PHASE_D_R_P6:-0}" = 1 ] && echo 'OPT-IN RUN' || echo 'SKIPPED (HF2Q_KV_PERSIST_PHASE_D_R_P6 unset)')"
+  echo
+  echo "Run scripts/adr017_phase_d.sh --help for env-var opt-ins to exercise additional gates."
   EXIT_CODE=0
 else
   rc=$?

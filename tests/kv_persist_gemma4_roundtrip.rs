@@ -133,6 +133,27 @@ const ENV_PHASE_D_R_P1: &str = "HF2Q_KV_PERSIST_PHASE_D_R_P1";
 /// run independently.
 const ENV_PHASE_D_R_P1_CONCURRENT: &str = "HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRENT";
 
+/// Phase D R-P5 cold-process-resume ship-gate. When set to "1" alongside
+/// `HF2Q_KV_PERSIST_PHASE_D=1`, the `kv_persist_phase_d_r_p5_e2e` test
+/// runs. R-P5 spec (`docs/ADR-017-persistent-block-prefix-cache.md:372`):
+/// `cache_hit_TTFT(32K) / no_cache_TTFT(32K) <= 0.15` for cold-process
+/// resume with `ssd_cold_post_restart` cache state — i.e. the SERVER
+/// process is killed between the no-cache and cache-hit decodes (cache
+/// survives on disk; in-RAM KV state is lost). Distinct from R-P4 which
+/// only forces a pool eviction within the same process.
+/// Default: short-circuit so `cargo test` is cheap.
+const ENV_PHASE_D_R_P5: &str = "HF2Q_KV_PERSIST_PHASE_D_R_P5";
+
+/// Phase D R-P6 multi-agent shared-prefix ship-gate. When set to "1"
+/// alongside `HF2Q_KV_PERSIST_PHASE_D=1`, the
+/// `kv_persist_phase_d_r_p6_e2e` test runs. R-P6 spec
+/// (`docs/ADR-017-persistent-block-prefix-cache.md:374`): with 4
+/// concurrent agents sharing a 4K system prompt, aggregate prefill cost
+/// `<= 1.25 * single_agent_prefill_cost(4K)` — one-time prefill
+/// amortized across 4 agents within 25%.
+/// Default: short-circuit so `cargo test` is cheap.
+const ENV_PHASE_D_R_P6: &str = "HF2Q_KV_PERSIST_PHASE_D_R_P6";
+
 /// Sourdough prompt — byte-identical to `scripts/sourdough_gate.sh`
 /// (DO NOT fix the typo; it is load-bearing for the fixture trajectory).
 const SOURDOUGH_PROMPT: &str =
@@ -1323,13 +1344,17 @@ fn kv_persist_gemma4_roundtrip_matrix_e2e() {
     let cells = generate_matrix();
     let runnable: Vec<&Cell> = cells.iter().filter(|c| c.is_runnable_today()).collect();
     if runnable.is_empty() {
-        eprintln!(
-            "[B-dense.2 matrix] {ENV_E2E_GATE}=1 set but no runnable cells \
+        // Master gate IS on, but no model path resolved for any cell.
+        // Per the same fail-hard discipline as the Phase D tests:
+        // setting the master gate must not silently skip-as-pass.
+        // Operator must either supply a model OR unset the gate.
+        panic!(
+            "[B-dense.2 matrix] {ENV_E2E_GATE}=1 is set but NO runnable cells \
              (no production-quant cell has a matching \
-              HF2Q_KV_PERSIST_E2E_MODEL_GEMMA4_* path). Set at least one to \
-              enable measurement."
+              HF2Q_KV_PERSIST_E2E_MODEL_GEMMA4_* path nor \
+              {ENV_MODEL_PATH_FALLBACK} path). Set at least one of these \
+             env vars or unset {ENV_E2E_GATE}=1."
         );
-        return;
     }
 
     eprintln!(
@@ -1392,18 +1417,66 @@ fn kv_persist_gemma4_roundtrip_matrix_e2e() {
 
 // ---------- Phase D env-gated tests (HF2Q_KV_PERSIST_PHASE_D=1) ----------
 
-/// Resolve the Phase D model path. Operator sets
-/// `HF2Q_KV_PERSIST_E2E_MODEL_PATH=/path/to.gguf` (the canonical
-/// Gemma 4 26B Q4_0 fixture per `scripts/adr017_phase_d.sh`).
-/// Returns `None` if unset or path missing.
-fn resolve_phase_d_model_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var(ENV_MODEL_PATH_FALLBACK) {
-        let pb = PathBuf::from(p);
-        if pb.exists() {
-            return Some(pb);
-        }
+/// Resolve the Phase D model path with fail-hard semantics for env-gated
+/// Phase D ship-gates. Behavior:
+///
+///   * If the master `HF2Q_KV_PERSIST_PHASE_D=1` env var is **unset**,
+///     returns `None` so the caller can `eprintln!` a diagnostic and
+///     `return` — this preserves the cheap short-circuit on default
+///     `cargo test` runs.
+///   * If the master gate **is** set but `HF2Q_KV_PERSIST_E2E_MODEL_PATH`
+///     is missing or the path doesn't exist, **panics** with a clear
+///     message. The pre-existing soft-skip-on-missing-model behavior
+///     made env-gated runs (`HF2Q_KV_PERSIST_PHASE_D=1 cargo test`) look
+///     like a PASS when they had silently short-circuited; this guard
+///     converts the silent skip into a hard FAIL so operators can't
+///     accidentally green-stamp a Phase D run that never executed.
+///
+/// Caller pattern (mirrors the inline-guard pattern it replaces):
+///
+/// ```ignore
+/// let model_path = match resolve_phase_d_model_path_or_fail("[Phase D R-PX]") {
+///     Some(p) => p,
+///     None => return, // master gate unset; short-circuit
+/// };
+/// ```
+fn resolve_phase_d_model_path_or_fail(test_tag: &str) -> Option<PathBuf> {
+    // Acquire ENV_LOCK to atomically read ENV_PHASE_D_GATE +
+    // ENV_MODEL_PATH_FALLBACK without racing parallel env-mutating
+    // shape tests (e.g. `phase_d_r_p1_env_gate_well_formed` which
+    // briefly sets the gate). Without this lock, a parallel mutation
+    // could leave the gate=1 while the model path is unset, causing
+    // a spurious panic in this fail-hard guard. Mirrors the lock
+    // discipline already established for env-mutating tests.
+    let _guard = ENV_LOCK.lock().unwrap();
+    let master_active = std::env::var(ENV_PHASE_D_GATE).as_deref() == Ok("1");
+    if !master_active {
+        // Master gate unset — caller must short-circuit cleanly. We
+        // return None and the caller handles the diagnostic.
+        return None;
     }
-    None
+    // Master gate is set: model path MUST resolve, or the test FAILS
+    // hard (no silent skip-as-pass).
+    match std::env::var(ENV_MODEL_PATH_FALLBACK) {
+        Ok(p) if !p.is_empty() => {
+            let pb = PathBuf::from(&p);
+            if !pb.exists() {
+                panic!(
+                    "{test_tag} {ENV_PHASE_D_GATE}=1 is set but \
+                     {ENV_MODEL_PATH_FALLBACK}={p} does not exist. \
+                     Set {ENV_MODEL_PATH_FALLBACK} to a valid GGUF path \
+                     or unset {ENV_PHASE_D_GATE}=1."
+                );
+            }
+            Some(pb)
+        }
+        _ => panic!(
+            "{test_tag} {ENV_PHASE_D_GATE}=1 is set but \
+             {ENV_MODEL_PATH_FALLBACK} is unset or empty. \
+             Set {ENV_MODEL_PATH_FALLBACK}=/path/to.gguf \
+             or unset {ENV_PHASE_D_GATE}=1."
+        ),
+    }
 }
 
 /// Phase D R-C4 coherence test (env-gated by
@@ -1430,21 +1503,16 @@ fn resolve_phase_d_model_path() -> Option<PathBuf> {
 /// prefix below the 3094-byte floor.
 #[test]
 fn kv_persist_phase_d_coherence_e2e() {
-    let active = std::env::var(ENV_PHASE_D_GATE).as_deref() == Ok("1");
-    if !active {
-        eprintln!(
-            "[Phase D coherence] {ENV_PHASE_D_GATE}=1 not set — short-circuit. \
-             Set {ENV_PHASE_D_GATE}=1 + HF2Q_KV_PERSIST_E2E_MODEL_PATH=PATH to run."
-        );
-        return;
-    }
-    let model_path = match resolve_phase_d_model_path() {
+    // Resolve gate + model path. When master gate is unset, returns None
+    // and we short-circuit cleanly (default `cargo test` stays fast).
+    // When master gate is set but model path missing, this PANICS with a
+    // clear message — preventing silent skip-as-pass on env-gated runs.
+    let model_path = match resolve_phase_d_model_path_or_fail("[Phase D coherence]") {
         Some(p) => p,
         None => {
             eprintln!(
-                "[Phase D coherence] {ENV_PHASE_D_GATE}=1 set but \
-                 HF2Q_KV_PERSIST_E2E_MODEL_PATH unset or path missing — \
-                 short-circuit."
+                "[Phase D coherence] {ENV_PHASE_D_GATE}=1 not set — short-circuit. \
+                 Set {ENV_PHASE_D_GATE}=1 + HF2Q_KV_PERSIST_E2E_MODEL_PATH=PATH to run."
             );
             return;
         }
@@ -1715,37 +1783,32 @@ fn kv_persist_phase_d_coherence_e2e() {
 /// Falsifier: ratio > 0.20.
 #[test]
 fn kv_persist_phase_d_r_p4_e2e() {
-    let active = std::env::var(ENV_PHASE_D_GATE).as_deref() == Ok("1");
-    if !active {
-        eprintln!(
-            "[Phase D R-P4] {ENV_PHASE_D_GATE}=1 not set — short-circuit. \
-             Set {ENV_PHASE_D_GATE}=1 + {ENV_PHASE_D_R_P4_PREFILL_LEN}=N + \
-             HF2Q_KV_PERSIST_E2E_MODEL_PATH=PATH to run."
-        );
-        return;
-    }
+    // Resolve gate + model. None ⇒ master gate unset (short-circuit);
+    // panics if master gate set + model missing. Prefill-len is also a
+    // hard requirement under master-gate-on (see below).
+    let model_path = match resolve_phase_d_model_path_or_fail("[Phase D R-P4]") {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[Phase D R-P4] {ENV_PHASE_D_GATE}=1 not set — short-circuit. \
+                 Set {ENV_PHASE_D_GATE}=1 + {ENV_PHASE_D_R_P4_PREFILL_LEN}=N + \
+                 HF2Q_KV_PERSIST_E2E_MODEL_PATH=PATH to run."
+            );
+            return;
+        }
+    };
+    // Master gate is on; PREFILL_LEN MUST resolve (no silent skip).
     let prefill_len: u32 = match std::env::var(ENV_PHASE_D_R_P4_PREFILL_LEN)
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
     {
         Some(n) if n > 0 => n,
-        _ => {
-            eprintln!(
-                "[Phase D R-P4] {ENV_PHASE_D_R_P4_PREFILL_LEN} unset or non-positive \
-                 — short-circuit. Set to 32768 for the canonical R-P4 cell."
-            );
-            return;
-        }
-    };
-    let model_path = match resolve_phase_d_model_path() {
-        Some(p) => p,
-        None => {
-            eprintln!(
-                "[Phase D R-P4] HF2Q_KV_PERSIST_E2E_MODEL_PATH unset or path missing \
-                 — short-circuit."
-            );
-            return;
-        }
+        _ => panic!(
+            "[Phase D R-P4] {ENV_PHASE_D_GATE}=1 is set but \
+             {ENV_PHASE_D_R_P4_PREFILL_LEN} is unset or non-positive. \
+             Set {ENV_PHASE_D_R_P4_PREFILL_LEN}=32768 for the canonical \
+             R-P4 cell, or unset {ENV_PHASE_D_GATE}=1."
+        ),
     };
 
     let bin = hf2q_binary_path();
@@ -1899,15 +1962,22 @@ fn kv_persist_phase_d_r_p4_e2e() {
 /// Falsifier: overhead > 0.05.
 #[test]
 fn kv_persist_phase_d_r_p1_decode_overhead_e2e() {
-    let active = std::env::var(ENV_PHASE_D_GATE).as_deref() == Ok("1");
-    if !active {
-        eprintln!(
-            "[Phase D R-P1] {ENV_PHASE_D_GATE}=1 not set — short-circuit. \
-             Set {ENV_PHASE_D_GATE}=1 + {ENV_PHASE_D_R_P1}=1 + \
-             HF2Q_KV_PERSIST_E2E_MODEL_PATH=PATH to run."
-        );
-        return;
-    }
+    // Resolve master gate + model. None ⇒ master gate unset
+    // (short-circuit); panics if master gate set + model missing.
+    let model_path = match resolve_phase_d_model_path_or_fail("[Phase D R-P1]") {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[Phase D R-P1] {ENV_PHASE_D_GATE}=1 not set — short-circuit. \
+                 Set {ENV_PHASE_D_GATE}=1 + {ENV_PHASE_D_R_P1}=1 + \
+                 HF2Q_KV_PERSIST_E2E_MODEL_PATH=PATH to run."
+            );
+            return;
+        }
+    };
+    // R-P1 is opt-in even within Phase D — the K2 ship-gate is
+    // operator-controlled so the cheap-decode-overhead measurement
+    // doesn't hijack every Phase D run.
     let r_p1_active = std::env::var(ENV_PHASE_D_R_P1).as_deref() == Ok("1");
     if !r_p1_active {
         eprintln!(
@@ -1917,16 +1987,6 @@ fn kv_persist_phase_d_r_p1_decode_overhead_e2e() {
         );
         return;
     }
-    let model_path = match resolve_phase_d_model_path() {
-        Some(p) => p,
-        None => {
-            eprintln!(
-                "[Phase D R-P1] HF2Q_KV_PERSIST_E2E_MODEL_PATH unset or path missing \
-                 — short-circuit."
-            );
-            return;
-        }
-    };
 
     let bin = hf2q_binary_path();
     assert!(
@@ -2128,15 +2188,19 @@ fn kv_persist_phase_d_r_p1_decode_overhead_e2e() {
 /// `rel_overhead > 0.05` under concurrent eviction.
 #[test]
 fn kv_persist_phase_d_r_p1_concurrent_eviction_e2e() {
-    let active = std::env::var(ENV_PHASE_D_GATE).as_deref() == Ok("1");
-    if !active {
-        eprintln!(
-            "[Phase D R-P1 concurrent] {ENV_PHASE_D_GATE}=1 not set — short-circuit. \
-             Set {ENV_PHASE_D_GATE}=1 + {ENV_PHASE_D_R_P1_CONCURRENT}=1 + \
-             HF2Q_KV_PERSIST_E2E_MODEL_PATH=PATH to run."
-        );
-        return;
-    }
+    // Resolve master gate + model. None ⇒ master gate unset
+    // (short-circuit); panics if master gate set + model missing.
+    let model_path = match resolve_phase_d_model_path_or_fail("[Phase D R-P1 concurrent]") {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[Phase D R-P1 concurrent] {ENV_PHASE_D_GATE}=1 not set — short-circuit. \
+                 Set {ENV_PHASE_D_GATE}=1 + {ENV_PHASE_D_R_P1_CONCURRENT}=1 + \
+                 HF2Q_KV_PERSIST_E2E_MODEL_PATH=PATH to run."
+            );
+            return;
+        }
+    };
     let r_p1c_active =
         std::env::var(ENV_PHASE_D_R_P1_CONCURRENT).as_deref() == Ok("1");
     if !r_p1c_active {
@@ -2148,16 +2212,6 @@ fn kv_persist_phase_d_r_p1_concurrent_eviction_e2e() {
         );
         return;
     }
-    let model_path = match resolve_phase_d_model_path() {
-        Some(p) => p,
-        None => {
-            eprintln!(
-                "[Phase D R-P1 concurrent] HF2Q_KV_PERSIST_E2E_MODEL_PATH unset \
-                 or path missing — short-circuit."
-            );
-            return;
-        }
-    };
 
     let bin = hf2q_binary_path();
     assert!(
@@ -2415,6 +2469,415 @@ fn kv_persist_phase_d_r_p1_concurrent_eviction_e2e() {
     );
 }
 
+/// Phase D R-P5 cold-process-resume ship-gate (env-gated by
+/// `HF2Q_KV_PERSIST_PHASE_D=1` + `HF2Q_KV_PERSIST_PHASE_D_R_P5=1` +
+/// `HF2Q_KV_PERSIST_E2E_PREFILL_LEN=N`). Default `cargo test`
+/// short-circuits.
+///
+/// R-P5 spec (`docs/ADR-017-persistent-block-prefix-cache.md:372`):
+/// `cache_hit_TTFT(32K) / no_cache_TTFT(32K) <= 0.15` for cold-process
+/// resume with `ssd_cold_post_restart` cache state. R-P5 is stricter
+/// than R-P4 (0.15 vs 0.20 ratio) AND requires a true cold process —
+/// the in-RAM KV pool state must be wiped between the two decodes.
+///
+/// **Methodology** (cold-process resume, NOT just pool eviction):
+///   1. Spawn server #1 with `--kv-persist=DIR`, wait readyz.
+///   2. Build a token-diverse prompt sized to ~prefill_len tokens.
+///   3. Decode 1 token at L=prefill_len → record `no_cache_ttft_ms`.
+///      This populates the on-disk block cache.
+///   4. **KILL server #1** via `Child::kill()` + `Child::wait()`. The
+///      cache survives on disk; the in-RAM KV pool state is wiped.
+///   5. Spawn server #2 with the SAME `--kv-persist=DIR`, wait readyz.
+///   6. Decode 1 token at the SAME prompt → record
+///      `cache_hit_ttft_ms`. The on-disk cache must repopulate the new
+///      process's KV pool.
+///   7. Assert `cache_hit_ttft_ms / no_cache_ttft_ms <= 0.15`.
+///
+/// Falsifier: ratio > 0.15.
+#[test]
+fn kv_persist_phase_d_r_p5_e2e() {
+    // Resolve master gate + model. None ⇒ master gate unset
+    // (short-circuit); panics if master gate set + model missing.
+    let model_path = match resolve_phase_d_model_path_or_fail("[Phase D R-P5]") {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[Phase D R-P5] {ENV_PHASE_D_GATE}=1 not set — short-circuit. \
+                 Set {ENV_PHASE_D_GATE}=1 + {ENV_PHASE_D_R_P5}=1 + \
+                 {ENV_PHASE_D_R_P4_PREFILL_LEN}=N + \
+                 HF2Q_KV_PERSIST_E2E_MODEL_PATH=PATH to run."
+            );
+            return;
+        }
+    };
+    // R-P5 is opt-in even within Phase D — the cold-process resume
+    // measurement spawns the server twice (cold-load cost paid 2×) so
+    // it doesn't auto-fire alongside the cheaper Phase D tests.
+    let r_p5_active = std::env::var(ENV_PHASE_D_R_P5).as_deref() == Ok("1");
+    if !r_p5_active {
+        eprintln!(
+            "[Phase D R-P5] {ENV_PHASE_D_R_P5}=1 not set — short-circuit. \
+             R-P5 cold-process-resume ship-gate is operator-controlled; set \
+             {ENV_PHASE_D_R_P5}=1 alongside {ENV_PHASE_D_GATE}=1 to run."
+        );
+        return;
+    }
+    // Master gate is on; PREFILL_LEN MUST resolve (no silent skip).
+    let prefill_len: u32 = match std::env::var(ENV_PHASE_D_R_P4_PREFILL_LEN)
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        Some(n) if n > 0 => n,
+        _ => panic!(
+            "[Phase D R-P5] {ENV_PHASE_D_GATE}=1 + {ENV_PHASE_D_R_P5}=1 \
+             are set but {ENV_PHASE_D_R_P4_PREFILL_LEN} is unset or \
+             non-positive. Set {ENV_PHASE_D_R_P4_PREFILL_LEN}=32768 for \
+             the canonical R-P5 cell, or unset {ENV_PHASE_D_GATE}=1."
+        ),
+    };
+
+    let bin = hf2q_binary_path();
+    assert!(
+        bin.exists(),
+        "[Phase D R-P5] hf2q binary not found at {} — \
+         did `cargo build --release` run?",
+        bin.display()
+    );
+
+    // SHARED on-disk cache_dir across both server processes — that's
+    // what makes this a "cold-process resume" rather than a fresh load:
+    // server #2 reads server #1's persisted blocks from this dir.
+    let cache_dir = std::env::temp_dir().join(format!(
+        "hf2q-kv-persist-phase-d-r-p5-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&cache_dir).expect("mkdir Phase D R-P5 cache_dir");
+
+    let port = std::env::var("HF2Q_KV_PERSIST_PHASE_D_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(phase_d_driver::PORT_DEFAULT);
+
+    // Build a token-diverse word-stream prompt sized to ~prefill_len
+    // tokens. Same `wordN` construction as the matrix runner +
+    // R-P4 — empirically ≈3.8 tokens/word under Gemma 4 BPE.
+    let n_words = (prefill_len as usize / 4).max(2);
+    let prompt: String = (0..n_words)
+        .map(|i| format!("word{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!(
+        "[Phase D R-P5] prefill_len={} (target tokens), n_words={}, prompt_bytes={}, \
+         cache_dir={}",
+        prefill_len,
+        n_words,
+        prompt.len(),
+        cache_dir.display(),
+    );
+
+    // ----- Server #1: no-cache decode (primes the on-disk cache) -----
+    let no_cache_ttft = {
+        let server1 = phase_d_driver::spawn_hf2q_serve_with_kv_persist(
+            &bin,
+            &model_path,
+            &cache_dir,
+            phase_d_driver::HOST,
+            port,
+        )
+        .expect("[Phase D R-P5] spawn server #1");
+        phase_d_driver::wait_for_readyz(&server1).unwrap_or_else(|e| {
+            panic!(
+                "[Phase D R-P5] server #1 /readyz did not return 200 within budget: {e}\n\
+                 --- hf2q serve stderr_tail ({} lines) ---\n{}",
+                server1.log_tail().len(),
+                server1.log_tail().join("\n"),
+            )
+        });
+        let canonical = phase_d_driver::fetch_canonical_model_id(&server1)
+            .expect("[Phase D R-P5] server #1 fetch canonical model id");
+        let cap = phase_d_driver::decode_full_text(
+            &server1,
+            &canonical,
+            &prompt,
+            4,
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "[Phase D R-P5] server #1 no-cache decode failed: {e}\n\
+                 --- hf2q serve stderr_tail ({} lines) ---\n{}",
+                server1.log_tail().len(),
+                server1.log_tail().join("\n"),
+            )
+        });
+        eprintln!(
+            "[Phase D R-P5] server #1 no_cache_ttft={:.1}ms \
+             (prompt_tokens={:?}, total_tokens={})",
+            cap.ttft_ms, cap.prompt_tokens, cap.total_tokens
+        );
+        // Server #1 is killed by ServerGuard's Drop on scope exit. The
+        // explicit Drop semantics are what wipe the in-RAM KV pool —
+        // the next server process must rebuild from disk.
+        cap.ttft_ms
+    };
+
+    // Briefly wait for the OS to release the listening port before
+    // server #2 attempts to bind it. ServerGuard::Drop calls
+    // child.kill() + child.wait() but TIME_WAIT on the listening
+    // socket can linger ~1s on macOS.
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+
+    // ----- Server #2: cold-process resume — reads cache from disk -----
+    let cache_hit_ttft = {
+        let server2 = phase_d_driver::spawn_hf2q_serve_with_kv_persist(
+            &bin,
+            &model_path,
+            &cache_dir,
+            phase_d_driver::HOST,
+            port,
+        )
+        .expect("[Phase D R-P5] spawn server #2 (cold-process resume)");
+        phase_d_driver::wait_for_readyz(&server2).unwrap_or_else(|e| {
+            panic!(
+                "[Phase D R-P5] server #2 /readyz did not return 200 within budget: {e}\n\
+                 --- hf2q serve stderr_tail ({} lines) ---\n{}",
+                server2.log_tail().len(),
+                server2.log_tail().join("\n"),
+            )
+        });
+        let canonical = phase_d_driver::fetch_canonical_model_id(&server2)
+            .expect("[Phase D R-P5] server #2 fetch canonical model id");
+        let cap = phase_d_driver::decode_full_text(
+            &server2,
+            &canonical,
+            &prompt,
+            4,
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "[Phase D R-P5] server #2 cache-hit decode failed: {e}\n\
+                 --- hf2q serve stderr_tail ({} lines) ---\n{}",
+                server2.log_tail().len(),
+                server2.log_tail().join("\n"),
+            )
+        });
+        eprintln!(
+            "[Phase D R-P5] server #2 cache_hit_ttft={:.1}ms \
+             (prompt_tokens={:?}, total_tokens={})",
+            cap.ttft_ms, cap.prompt_tokens, cap.total_tokens
+        );
+        cap.ttft_ms
+    };
+
+    let ratio = cache_hit_ttft / no_cache_ttft;
+    let pass = ratio <= 0.15;
+    if pass {
+        eprintln!(
+            "[R-P5] PASS — ratio={:.3} (no_cache={:.1}ms cache_hit={:.1}ms)",
+            ratio, no_cache_ttft, cache_hit_ttft
+        );
+    } else {
+        eprintln!(
+            "[R-P5] FAIL — ratio={:.3} > 0.15 (no_cache={:.1}ms cache_hit={:.1}ms)",
+            ratio, no_cache_ttft, cache_hit_ttft
+        );
+    }
+    assert!(
+        pass,
+        "[R-P5] ship-gate FAIL: ratio={:.3} > 0.15 \
+         (no_cache_ttft={:.1}ms cache_hit_ttft={:.1}ms prefill_len={})",
+        ratio, no_cache_ttft, cache_hit_ttft, prefill_len,
+    );
+}
+
+/// Phase D R-P6 multi-agent shared-prefix ship-gate (env-gated by
+/// `HF2Q_KV_PERSIST_PHASE_D=1` + `HF2Q_KV_PERSIST_PHASE_D_R_P6=1`).
+/// Default `cargo test` short-circuits.
+///
+/// R-P6 spec (`docs/ADR-017-persistent-block-prefix-cache.md:374`):
+/// with 4 concurrent agents sharing a 4K system prompt, aggregate
+/// prefill cost `<= 1.25 * single_agent_prefill_cost(4K)` — one-time
+/// prefill amortized across 4 agents within 25%.
+///
+/// **Methodology**:
+///   1. Spawn ONE server with `--kv-persist=DIR`, wait readyz.
+///   2. Build a SHARED 4K prefix prompt (deterministic via
+///      `format!("shared_word{i}")`).
+///   3. Agent 1: decode 1 token → record `agent1_ttft_ms`. On a fresh
+///      server this is a cache MISS — pays the full prefill cost.
+///   4. Agents 2/3/4: decode 1 token at the SAME shared prompt →
+///      record their TTFTs. Once the spiller has flushed agent 1's
+///      blocks to disk, these should be cache HITS (or at least
+///      partially-cache-served).
+///   5. `aggregate_ttft_ms = sum(agent1..agent4)`
+///   6. `single_agent_cost_ms = agent1_ttft_ms` (the no-cache reference)
+///   7. assert `aggregate / single_agent_cost <= 1.25` (spec direct).
+///
+/// CONCURRENCY NOTE: hf2q serve is single-tenant — exactly one
+/// /v1/chat/completions request runs at a time. Real "4 concurrent
+/// agents" semantics would require multi-request parallelism in the
+/// engine; for the persistence-cache acceptance criterion, what matters
+/// is whether agents 2-4 reuse agent-1-prefilled-and-spilled blocks,
+/// which is independent of concurrency. We therefore drive 4 sequential
+/// HTTP requests and rely on the cache amortization (NOT parallel CPU
+/// time) for the R-P6 contract. This is the strictest possible test of
+/// the spiller's hot-path: agents 2-4 are pure cache hits.
+///
+/// Falsifier: aggregate / single_agent_cost > 1.25.
+#[test]
+fn kv_persist_phase_d_r_p6_e2e() {
+    // Resolve master gate + model. None ⇒ master gate unset
+    // (short-circuit); panics if master gate set + model missing.
+    let model_path = match resolve_phase_d_model_path_or_fail("[Phase D R-P6]") {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[Phase D R-P6] {ENV_PHASE_D_GATE}=1 not set — short-circuit. \
+                 Set {ENV_PHASE_D_GATE}=1 + {ENV_PHASE_D_R_P6}=1 + \
+                 HF2Q_KV_PERSIST_E2E_MODEL_PATH=PATH to run."
+            );
+            return;
+        }
+    };
+    let r_p6_active = std::env::var(ENV_PHASE_D_R_P6).as_deref() == Ok("1");
+    if !r_p6_active {
+        eprintln!(
+            "[Phase D R-P6] {ENV_PHASE_D_R_P6}=1 not set — short-circuit. \
+             R-P6 multi-agent shared-prefix ship-gate is operator-controlled; \
+             set {ENV_PHASE_D_R_P6}=1 alongside {ENV_PHASE_D_GATE}=1 to run."
+        );
+        return;
+    }
+
+    let bin = hf2q_binary_path();
+    assert!(
+        bin.exists(),
+        "[Phase D R-P6] hf2q binary not found at {} — \
+         did `cargo build --release` run?",
+        bin.display()
+    );
+
+    let cache_dir = std::env::temp_dir().join(format!(
+        "hf2q-kv-persist-phase-d-r-p6-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&cache_dir).expect("mkdir Phase D R-P6 cache_dir");
+
+    let port = std::env::var("HF2Q_KV_PERSIST_PHASE_D_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(phase_d_driver::PORT_DEFAULT);
+
+    let server = phase_d_driver::spawn_hf2q_serve_with_kv_persist(
+        &bin,
+        &model_path,
+        &cache_dir,
+        phase_d_driver::HOST,
+        port,
+    )
+    .expect("[Phase D R-P6] spawn hf2q serve --kv-persist");
+    phase_d_driver::wait_for_readyz(&server).unwrap_or_else(|e| {
+        panic!(
+            "[Phase D R-P6] /readyz did not return 200 within budget: {e}\n\
+             --- hf2q serve stderr_tail ({} lines) ---\n{}",
+            server.log_tail().len(),
+            server.log_tail().join("\n"),
+        )
+    });
+    let canonical = phase_d_driver::fetch_canonical_model_id(&server)
+        .expect("[Phase D R-P6] fetch canonical model id");
+
+    // R-P6 spec is specifically L=4096 — hardcode (no env override).
+    // Build a SHARED prefix prompt sized to ~4K tokens. Distinct
+    // `shared_word{i}` namespace from the matrix/R-P4/R-P5 `word{i}`
+    // construction so cross-test cache contamination is impossible.
+    const PREFIX_LEN: u32 = 4096;
+    let n_words = (PREFIX_LEN as usize / 4).max(2);
+    let shared_prompt: String = (0..n_words)
+        .map(|i| format!("shared_word{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!(
+        "[Phase D R-P6] PREFIX_LEN={} (target tokens), n_words={}, prompt_bytes={}",
+        PREFIX_LEN,
+        n_words,
+        shared_prompt.len(),
+    );
+
+    // ----- 4 agents, sequential, all sharing the same 4K prefix -----
+    // Agent 1 is the cache MISS (single_agent_cost reference); Agents
+    // 2-4 should be cache HITS once the async writer has flushed agent
+    // 1's blocks. Each agent issues a separate HTTP request — see
+    // CONCURRENCY NOTE on the test docstring.
+    let mut agent_ttfts: Vec<f64> = Vec::with_capacity(4);
+    for i in 0..4 {
+        let cap = phase_d_driver::decode_full_text(
+            &server,
+            &canonical,
+            &shared_prompt,
+            4,
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "[Phase D R-P6] agent {} decode failed: {e}\n\
+                 --- hf2q serve stderr_tail ({} lines) ---\n{}",
+                i + 1,
+                server.log_tail().len(),
+                server.log_tail().join("\n"),
+            )
+        });
+        eprintln!(
+            "[Phase D R-P6] agent {} ttft={:.1}ms (prompt_tokens={:?}, total_tokens={})",
+            i + 1,
+            cap.ttft_ms,
+            cap.prompt_tokens,
+            cap.total_tokens,
+        );
+        agent_ttfts.push(cap.ttft_ms);
+    }
+    assert_eq!(agent_ttfts.len(), 4, "[Phase D R-P6] expected 4 agent TTFT samples");
+
+    let agent1 = agent_ttfts[0];
+    let agent2 = agent_ttfts[1];
+    let agent3 = agent_ttfts[2];
+    let agent4 = agent_ttfts[3];
+    let aggregate_ttft_ms: f64 = agent_ttfts.iter().sum();
+    let single_agent_cost_ms = agent1; // The no-cache reference.
+
+    // Spec direct: aggregate <= 1.25 * single_agent_cost.
+    let ratio = aggregate_ttft_ms / single_agent_cost_ms;
+    let pass = ratio <= 1.25;
+
+    if pass {
+        eprintln!(
+            "[R-P6] PASS — aggregate={:.1}ms = {:.2}× single_agent ({:.1}ms each: {:.1}/{:.1}/{:.1}/{:.1})",
+            aggregate_ttft_ms, ratio, single_agent_cost_ms, agent1, agent2, agent3, agent4
+        );
+    } else {
+        eprintln!(
+            "[R-P6] FAIL — aggregate={:.1}ms = {:.2}× single_agent (gate <= 1.25×) \
+             ({:.1}ms each: {:.1}/{:.1}/{:.1}/{:.1})",
+            aggregate_ttft_ms, ratio, single_agent_cost_ms, agent1, agent2, agent3, agent4
+        );
+    }
+    assert!(
+        pass,
+        "[R-P6] ship-gate FAIL: aggregate={:.1}ms / single_agent={:.1}ms = {:.3}× > 1.25× \
+         (per-agent ttfts: {:.1}/{:.1}/{:.1}/{:.1})",
+        aggregate_ttft_ms,
+        single_agent_cost_ms,
+        ratio,
+        agent1, agent2, agent3, agent4,
+    );
+}
+
 // ---------- Phase D always-on shape tests (no env required) ----------
 
 /// Phase D shape test: the new env gates are well-formed and the
@@ -2617,6 +3080,8 @@ fn phase_d_env_gates_are_well_formed() {
         ENV_PHASE_D_LLAMA_BIN,
         ENV_PHASE_D_R_P1,
         ENV_PHASE_D_R_P1_CONCURRENT,
+        ENV_PHASE_D_R_P5,
+        ENV_PHASE_D_R_P6,
     ] {
         let prior = std::env::var(gate).ok();
         std::env::remove_var(gate);

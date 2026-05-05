@@ -1,6 +1,6 @@
 # ADR-017: Persistent Block Prefix Cache for serve mode
 
-- **Status:** **Closed-Shipped (Phase D GREEN 2026-05-01; ALL 3 kill-gates FALSIFIED; operator-readiness P0/P1 round COMPLETE).** ADR-017 substrate is shippable + all kill-gates falsified by measurement: Phase D R-C4 internal coherence PASS (3632-byte sourdough byte-identical baseline==restored, 624× cache-hit TTFT speedup) + Phase D R-P4 perf ship-gate PASS (ratio=0.000 vs ≤0.20 spec; 49,585× speedup at L=32K cache-hit) + Phase D R-P1/K2 sustained-decode overhead PASS (overhead=−0.995, sustained 0.3 ms vs baseline 60.8 ms — sustained path is FASTER). All three kill-gates (K1, K2, K3) FALSIFIED with multiple orders of magnitude margin. Per-family parity gate (Gemma 4 26B) GREEN by code+test+bench; B-hybrid (Qwen3.5-MoE) ships when ADR-013 unblocks (trait surface inherits forward). Operator-readiness P0/P1 round COMPLETE: P0-1 fsync(parent_dir), P0-3 *.tmp.<pid> orphan GC, P0-bench Weak<Engine>, P1-1 lock-step atomicity, P1-3 budget_bytes wiring, R-F1 HF2Q_KV_PERSIST=0 startup-disable, R-F6 cache --kv-namespace, R-F7 /metrics counters, F4 namespace fingerprint thread-through — all LANDED on origin/main. P0-2 (cross-process flock) FALSIFIED in code-read (already exists; finer-grained than oMLX). Remaining items: peer arm rebench (ADR-005 chat-template prerequisite), full matrix sweep (operator-controlled bench), B-hybrid (ADR-013 prerequisite). None correctness or performance gating.
+- **Status:** **Accepted-In-Progress (Closure iter-1 2026-05-04; R-P5 architectural gap discovered; iter-2 architectural fix in progress).** Primary gates GREEN: K1/K2/K3 kill-gates FALSIFIED, R-C4 internal + R-P4 ship-gate PASS by measurement on Gemma 4 26B (R-P4 re-validated at HEAD `11002ee` 2026-05-04: ratio=0.000, no_cache=633.5s, cache_hit=7.1ms; matches iter-4 evidence). **Iter-1 finding (2026-05-04):** the new R-P5 production test (added by W1 in this iter) exposed an architectural gap — the spiller's only spill trigger is `pre_evict` on model eviction (`src/serve/multi_model.rs:1090, 1189`); there is no graceful-shutdown spill, no SIGTERM handler, no `/shutdown` endpoint, no in-flight write-through. R-P5's "cold-process resume with `ssd_cold_post_restart` cache state" therefore cannot be reached via the natural sequence (server up → prefill → kill → restart) without a prior model swap that triggered eviction. Empirically: bench at L=32K leaves `cache_dir` 0 bytes (just empty `locks/` and `models/` subdirs) after a 615-second prefill if no eviction occurred; ratio=1.029 ≫ 0.15 (FAIL). **Iter-2 plan (in progress):** add `POST /shutdown` HTTP endpoint that walks the loaded pool calling `manager.evict()` per entry (firing `pre_evict` → spill), drains the kv-writer queue with timeout, returns 200 OK; add SIGTERM handler that does the same drain logic before process exit; update R-P5 to call `/shutdown` before kill. Same fix unlocks Ctrl+C + `systemctl stop` + `launchd` graceful shutdown user-facing benefit (in-memory cache survives across server restarts). Per-family parity gate (Gemma 4 26B) GREEN by code+test+bench through R-P4; R-P5/R-P6/stress benches pending iter-2 architectural fix. B-hybrid (Qwen3.5-MoE) ships when ADR-013 unblocks (trait surface inherits forward). Operator-readiness P0/P1 round COMPLETE: P0-1 fsync(parent_dir), P0-3 *.tmp.<pid> orphan GC, P0-bench Weak<Engine>, P1-1 lock-step atomicity, P1-3 budget_bytes wiring, R-F1 HF2Q_KV_PERSIST=0 startup-disable, R-F6 cache --kv-namespace, R-F7 /metrics counters, F4 namespace fingerprint thread-through — all LANDED on origin/main. P0-2 (cross-process flock) FALSIFIED in code-read (already exists; finer-grained than oMLX). Remaining items: iter-2 graceful-shutdown spill (architectural fix; in-progress), R-P5/R-P6/stress re-bench post-fix, peer arm rebench (ADR-005 chat-template prerequisite), full matrix sweep (operator-controlled bench), B-hybrid (ADR-013 prerequisite). Per-family read at [`docs/ADR-017-per-family-status.md`](./ADR-017-per-family-status.md).
 
   *Original Status (preserved for provenance): "Accepted (falsification-gated). ADR-017 is a committed decision: hf2q ships per-model SSD KV-cache persistence across the Phase 4 hot-swap eviction signal for every model family complete in code on serve-side. Phase A0 (falsification harness on M5 Max) is the first deliverable and the explicit ship-or-die gate — every kill-criterion in §10 is a hard exit that closes ADR-017 unmerged with rationale, not a 'circle back later' punt. Per-family parity gate is non-negotiable (no carve-out, no descope without Robert's explicit re-authorization)."*
 - **Date:** 2026-04-30
@@ -471,11 +471,11 @@ scenario          ∈ {(a) cold_resume, (b) hot_swap_evict,
 
 ### Phase D — Closure (lands after C; ADR-017 status flips Accepted → "Closed-Shipped" or → "Closed-Unmerged" per kill-gate)
 
-- [ ] **Stress:** 24-hour continuous-load test on M5 Max under `tests/kv_persist_stress.rs` with continuous swap-in/swap-out cycles; cache directory size stays within budget; no resident-memory leak (RSS within 5% of baseline at hour 24); no descriptor leak (`lsof | wc -l` within 100 of baseline).
+- [ ] **Stress:** 24-hour continuous-load test on M5 Max under `tests/kv_persist_stress.rs` with continuous swap-in/swap-out cycles; cache directory size stays within budget; no resident-memory leak (RSS within 5% of baseline at hour 24); no descriptor leak (`lsof | wc -l` within 100 of baseline). *(Code-complete at `tests/kv_persist_stress.rs` (iter-1 W2 2026-05-04, 984 LOC, default `cargo test` short-circuits in 0.4s). Bench BLOCKED on iter-2 architectural fix — stress relies on the same eviction-spill path that R-P5 exposed as gap-bound. Will run after `/shutdown` endpoint lands.)*
 - [ ] **Corruption:** synthetic mid-write corruption injection (truncate file, flip bit in middle, swap header version, delete intermediate block in chain) — restore must reject and fall through to fresh prefill (no silent wrong-output). R-C6 mechanical verification.
-- [ ] **Per-family ship-gate read:** every in-scope family's parity gate documented GREEN at `docs/ADR-017-per-family-status.md` with measurement evidence and date.
-- [ ] **Operator documentation:** `docs/operating-kv-cache.md` lands with runbook (R-O1).
-- [ ] ADR-017 status flips Accepted → **Closed-Shipped** with the date and cumulative LOC; cross-link from ADR-005 Phase 4 closure section updated; `cmd_serve --kv-persist` becomes default ON.
+- [x] **Per-family ship-gate read:** every in-scope family's parity gate documented GREEN at `docs/ADR-017-per-family-status.md` with measurement evidence and date. *(Landed iter-1 W3 2026-05-04, 153 LOC. Per-family doc reflects honest state: Gemma 4 GREEN through R-P4; R-P5 OPEN per iter-1 finding; R-P6/stress pending iter-2.)*
+- [x] **Operator documentation:** `docs/operating-kv-cache.md` lands with runbook (R-O1).
+- [ ] ADR-017 status flips Accepted → **Closed-Shipped** with the date and cumulative LOC; cross-link from ADR-005 Phase 4 closure section updated; `cmd_serve --kv-persist` becomes default ON. *(Status currently Accepted-In-Progress; flip to Closed-Shipped deferred to post-iter-2 once R-P5 PASSes via graceful-shutdown spill.)*
 
 ---
 
@@ -3325,6 +3325,67 @@ No code changes this iter (regression watch only).
 iter-18+ wakeup remains the maintenance-mode cadence: foreign
 session pushes get a regression watch; no code unless an upstream
 ADR commits something that touches ADR-017 surface.
+
+---
+
+### Phase D Closure iter-1 2026-05-04 — R-P5 architectural gap discovered + iter-2 plan
+
+**Trigger:** /cfa "deeply investigate ADR-017; is Phase D done?" surfaced four open spec checkboxes (R-P5, R-P6, stress test, per-family-status doc) that the prior `Closed-Shipped` status line glossed over. User then directed: "do the work to make it truly done." Three parallel CFA workers added test scaffolding + per-family-status doc; bench execution then exposed the architectural gap.
+
+**Worker landings (W1, W2, W3 — file-disjoint, all builds PASS):**
+- **W1** (`tests/kv_persist_gemma4_roundtrip.rs`, +465 LOC, 2658→3123): added `kv_persist_phase_d_r_p5_e2e` (cold-process resume, ratio ≤ 0.15) and `kv_persist_phase_d_r_p6_e2e` (4-agent shared 4K prefix, aggregate ≤ 1.25×); refactored model-resolution into `resolve_phase_d_model_path_or_fail()` so all 7 env-gated tests fail hard (not silently skip) when `HF2Q_KV_PERSIST_PHASE_D=1` is set without a valid model path. Default `cargo test` runs all 18 tests in 0.42s (env-gated tests short-circuit cleanly).
+- **W2** (`tests/kv_persist_stress.rs`, NEW, 984 LOC): `kv_persist_stress_24h` test — env-gated `HF2Q_KV_PERSIST_STRESS_24H=1`, default duration 86400s, override via `HF2Q_KV_PERSIST_STRESS_DURATION_SEC`. Continuous random-L swap-cycle loop with per-checkpoint RSS / lsof / cache-size assertions (operator-tunable tolerances). Default `cargo test --test kv_persist_stress` PASS in 0.44s.
+- **W3** (`docs/ADR-017-per-family-status.md` NEW 153 LOC; `scripts/adr017_phase_d.sh` +43/-5 LOC; `src/serve/mod.rs` +27/-15 LOC comments-only; this doc §472-478 honest update): per-family doc with PENDING markers for R-P5/R-P6/stress; script `--rp5 --rp6` flag wiring + conditional gate-accounting (replaces unconditional "ALL GATES PASS" overstatement); production-comment cleanup at the cmd_serve registration block. shellcheck PASS, build PASS.
+
+**R-P4 baseline re-validation (current HEAD `11002ee`, 2026-05-04 18:51):**
+
+```
+[Phase D R-P4] no_cache_ttft=633532.1ms (prompt_tokens=Some(39862), total_tokens=4)
+[Phase D R-P4] cache_hit_ttft=7.1ms (prompt_tokens=Some(39862), total_tokens=4)
+[R-P4] PASS — ratio=0.000 (no_cache=633532.1ms cache_hit=7.1ms)
+test result: ok. 1 passed; 0 failed in 640.29s
+```
+
+R-P4 still PASSES at HEAD (matches iter-4's evidence: no_cache 633.5s vs iter-4 649.6s — within bench-process-audit noise; cache_hit 7.1ms vs iter-4 13.1ms — both effectively instant). No regression on the established gate. *Note: the absolute no_cache ttft of ~10 minutes at L=32K is dominated by the standing B-F4 issue — Gemma 4 dense prefill is 29-40× slower than llama.cpp; ADR-017's gate is ratio-based by design and survives slow base paths.*
+
+**R-P5 first bench at HEAD `11002ee` (2026-05-04 19:17, 20:57 wall):**
+
+```
+[Phase D R-P5] prefill_len=32768 (target tokens), n_words=8192, prompt_bytes=72617
+[Phase D R-P5] server #1 no_cache_ttft=615481.9ms (prompt_tokens=Some(39862), total_tokens=4)
+[Phase D R-P5] server #2 cache_hit_ttft=633065.0ms (prompt_tokens=Some(39862), total_tokens=4)
+[R-P5] FAIL — ratio=1.029 > 0.15 (no_cache=615481.9ms cache_hit=633065.0ms)
+```
+
+Server #2's cache_hit is **the same** as no_cache — server #2 did NOT hit the cache; it re-prefilled from scratch. Inspection of the leaked `cache_dir` (`/var/folders/.../hf2q-kv-persist-phase-d-r-p5-48883-...`) shows **0 bytes total** — only empty `locks/` and `models/` subdirs. Server #1 wrote zero blocks to disk during the 615-second prefill.
+
+**Root cause (verified by source-read; Chesterton's fence respected):**
+
+The spiller has exactly two production trigger sites, both eviction-tied:
+- `src/serve/multi_model.rs:1090` — `MultiModelManager::evict(repo, quant)` explicit eviction
+- `src/serve/multi_model.rs:1189` — admission-driven LRU evict (loading model B kicks out model A)
+
+There is **no**:
+- write-through-cache during normal prefill
+- periodic background spill
+- graceful-shutdown spill (no SIGTERM handler)
+- explicit `/shutdown` or `/flush` HTTP endpoint
+
+This is **intentional design** per spec R-F2: *"On model eviction (admission of distinct model triggering LRU evict, or explicit `HotSwapManager::evict`), the spiller extracts block-aligned K/V from the evicting engine's `HybridKvCache` and enqueues to a background writer thread."*
+
+The spec's R-P5 "ssd_cold_post_restart" cache state implicitly assumes a *prior* model swap put blocks on disk before the kill. The W1 test as written did NOT trigger an eviction (single-model, single-prefill, then `child.kill()`) — so the ssd_cold_post_restart state was unreachable. `Child::kill()` on Unix sends SIGKILL (uncatchable); even if a graceful-shutdown spill existed, SIGKILL would bypass it.
+
+**Iter-2 plan (in progress; chosen Option A "fix the architecture" per Robert's directive 2026-05-04):**
+
+1. Add `POST /shutdown` HTTP endpoint to the serve API. Body: walk `MultiModelManager.engines` map, call `manager.evict(repo, quant)` per pooled entry, drain the kv-writer queue (`AsyncWriterHandle::drain` with timeout), respond 200 OK with summary JSON. This gives operators (and tests) a clean shutdown semantic.
+2. Add SIGTERM handler in `cmd_serve` startup that runs the same drain logic before exit. Catches Ctrl+C, `kill <pid>` (no -9), `systemctl stop hf2q`, `launchctl stop`.
+3. Update `kv_persist_phase_d_r_p5_e2e` to POST `/shutdown` to server #1 before `child.kill()`. The kill becomes a defensive cleanup; the actual cache flush happens via /shutdown.
+4. Re-bench R-P5; expected ratio ≪ 0.20 (similar to R-P4) once spill actually fires.
+5. Independently this fix delivers a real user-facing benefit — the in-memory KV cache survives across graceful shutdowns (Ctrl+C, system reboots, deploys) instead of being silently discarded.
+
+**Why iter-2 is "truly done" not a workaround:** modifying the test to load a second model before kill would technically pass R-P5 with current architecture, but it would not match the spec's wording ("cold-process resume") and would leave Ctrl+C / system-shutdown behavior broken for end users. The architectural fix matches the spec semantically AND fixes a real user issue.
+
+**Remaining work after iter-2:** R-P5 re-bench, R-P6 bench (architecturally compatible — single-server multi-agent doesn't need eviction), stress 30-min reduced-duration smoke (after iter-2 enables real flush), corruption tests (R-C6 four scenarios), peer arm rebench (post-ADR-005 chat-template fix).
 
 ---
 
