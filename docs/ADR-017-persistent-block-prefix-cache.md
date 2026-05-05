@@ -3867,70 +3867,92 @@ follow-up.
     end-to-end verification on Qwen 3.6 35B-A3B-APEX-Q5_K_M deferred
     until concurrent convert operation completes.
 
-### What's left (resumable checkpoint 2026-05-05)
+### Final landed state (2026-05-05)
 
-To finish closing Phase E.a once the parallel convert finishes:
+All technical work landed.  The resumable checklist is closed except
+for the audit and operator soak gates that are inherently out-of-
+session work:
 
-1. **Re-run extended B.2a falsifier** at 130-token prompt (already
-   updated in `tests/lcp_qwen35_chunked_prefill.rs` PROMPT constant
-   to the long version).  Should now PASS byte-identical (chunked at
-   3 chunks of {64, 64, 2} == monolithic at 130).  Command:
-   ```
-   HF2Q_KV_PERSIST_PHASE_D=1 \
-   HF2Q_KV_PERSIST_QWEN35_E2E_MODEL_PATH=/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/APEX-Q5_K_M.gguf \
-   cargo test --release --test lcp_qwen35_chunked_prefill -- --nocapture --test-threads=1
-   ```
+1. ✓ **Extended B.2a falsifier at 130 tokens (3 chunks)** — `ba3f331`.
+   `tests/lcp_qwen35_chunked_prefill.rs` PROMPT bumped to ~330 chars
+   yielding prompt_len=130 → 3 chunks of {64, 64, 2}, partial-tail
+   seq=2 ∈ formerly-danger zone.  PASS: A 53 bytes == B 53 bytes
+   BYTE-IDENTICAL.  Pre-B.5 same fixture FAILED (chunked 57 vs
+   monolithic 53); post-B.5 the FA RESUME kernel handles the partial-
+   tail chunk byte-correctly via `kv_seq_len >= 16` gate.
 
-2. **Update / retitle B.4 falsifier** at
-   `tests/lcp_qwen35_b4_danger_zone_bypass.rs`.  The test currently
-   asserts `chunked_skipped == true` — post-B.5 this is now the
-   OPPOSITE (chunked SHOULD engage on the 130-token danger-zone-no-more
-   prompt).  Update the assertion to:
-   ```rust
-   let chunked_engaged = a_log.iter().any(|l| l.contains("chunked prefill"));
-   assert!(chunked_engaged, "B.5 should have engaged chunked at all
-   lengths; bypass was removed");
-   ```
-   Then assert byte-identity (A == B) — should pass post-B.5.
+2. ✓ **B.4→B.5 retitled falsifier** — `ba3f331`.
+   `tests/lcp_qwen35_b4_danger_zone_bypass.rs` updated to assert
+   chunked ENGAGEMENT (post-B.5) instead of skip (B.4 path-ii bypass
+   semantics).  PASS: chunked engaged on 130-token formerly-danger-
+   zone prompt; A 53 bytes == B 53 bytes byte-identical.
 
-3. **Re-run B.3 stride-aligned hit falsifier** with longer turn-1
-   prompt (>= 64+stride tokens after chat-template wrap) to actually
-   trigger turn-2's stride-aligned hit log line.  Bumps the existing
-   `lcp_qwen35_b3_stride_aligned_resume.rs::TURN1_USER` to a length
-   that produces turn-1 prompt_len ≥ 128 tokens (gives 2 stride
-   boundaries to store at).  Then turn-2's first 64+ tokens match
-   turn-1's first 64+, descending probe finds chunk_pos=64 entry,
-   true-continuation hit fires.  Asserts:
-   * stderr `[hf2q qwen35 lcp resume] STRIDE-ALIGNED HIT` appears
-   * A turn-2 == B turn-2 byte-identical
+3. ✓ **B.3 stride-aligned hit + byte-identity end-to-end** — `ba3f331`.
+   `tests/lcp_qwen35_b3_stride_aligned_resume.rs` strict-asserts
+   stride-aligned hit AND byte-identity.  PASS on Qwen 3.6 35B-A3B-
+   APEX-Q5_K_M: turn-1 stored at chunk_pos=64, turn-2 STRIDE-ALIGNED
+   HIT, restore_partial copied positions [0..64], suffix-chunked
+   prefill from chunk_idx=1, A turn-2 (111 bytes via LCP resume) ==
+   B turn-2 (111 bytes via fresh monolithic) BYTE-IDENTICAL.  This is
+   the load-bearing end-to-end Phase E.a verification.
 
-4. **Streaming-path resume wire-up**.  `engine_qwen35.rs:1830+`
-   (`generate_stream_qwen35_once_extended`) currently has
-   observability-only LCP probe.  Mirror the non-streaming path's
-   B.2c+B.3 logic: take_prefix on chunk-position-keyed LcpKey
-   descending, restore + suffix-prefill, post-prefill mid-prefill
-   stores.  ~50-80 LOC.  Add a streaming-path falsifier in
-   `tests/lcp_qwen35_partial_prefill_resume.rs` testing
-   `"stream":true` chat completion with the same multi-turn fixture.
+4. ✓ **Streaming-path resume wire-up** — `752d76f`.
+   `generate_stream_qwen35_once_extended` mirrors the non-streaming
+   B.2c+B.3+B.5 logic: descending-stride probe + `restore_partial` +
+   suffix-chunked prefill loop with mid-prefill stores at every
+   stride-aligned boundary.  Vision/extension paths
+   (`has_extension == true`) bypass for the same key-collision
+   reason `prompt_cache` does.  Falsifier
+   `tests/lcp_qwen35_streaming_resume.rs::phase_b5_streaming_lcp_resume_engagement`
+   PASS: turn-1 non-streaming stores at chunk_pos=64, turn-2 streaming
+   STRIDE-ALIGNED HIT, streamed 111 bytes "Bounded contexts define
+   logical separation..." matching the non-streaming B.3 turn-2 output
+   byte-for-byte.
 
-5. **Codex Phase-2b read-only audit** of:
+### What's left (out-of-session work)
+
+5. **Codex Phase-2b read-only audit** of the full B.2-fix → B.5 chain.
+   Specific surfaces:
    * `gpu_full_attn.rs:1909+` resume-path gate (`kv_seq_len >= 16`)
      and the implicit guarantee that chunked-prefill last-chunk
-     scenarios always satisfy it.
+     scenarios always satisfy it (proven by mlx-native@9462b47 kernel
+     probe at qL ∈ {2, 8, 15} kL=130; safe-zone kL inside chunked
+     follows from cur_len ≥ stride ≥ 64).
    * `engine_qwen35.rs::generate_qwen35_once` chunked + LCP store +
-     descending probe + restore + suffix-chunked prefill flow —
-     particularly the `lcp_resume_start % stride == 0` invariant
-     and the chunk_idx=lcp_resume_start/stride loop start.
-   * mlx-native `dispatch_flash_attn_prefill_bf16_d256_resume`
+     descending probe + restore_partial + suffix-chunked prefill
+     flow — particularly the `lcp_resume_start % stride == 0`
+     invariant and the `chunk_idx = lcp_resume_start / stride` loop
+     start.  Same flow in
+     `engine_qwen35.rs::generate_stream_qwen35_once_extended`.
+   * `kv_cache.rs::partial_copy_slot` (rank-4 `[n_seqs, n_kv_heads,
+     max_seq_len, head_dim]` partial-position memcpy across
+     differently-sized source/destination buffers).
+   * mlx-native@1819fad `dispatch_flash_attn_prefill_bf16_d256_resume`
      stride math (`kv_capacity * head_dim` for K/V head stride) and
      `qL_off` semantics under `do_causal=true`.
 
 6. **Operator soak** at `HF2Q_KV_LCP_CHUNKED_PREFILL=1
    HF2Q_KV_LCP_RESUME=1 HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=64`
    for 24h on a multi-turn /cfa workload.  Default-on flip
-   (HF2Q_KV_LCP_RESUME=1 in production config) is gated on green soak
-   plus Codex audit sign-off, mirroring B.2c iter-4 default-on gate
-   for the Gemma side.
+   (`HF2Q_KV_LCP_RESUME=1` in production config) is gated on green
+   soak plus Codex audit sign-off, mirroring B.2c iter-4 default-on
+   gate for the Gemma side.
+
+### Phase E.a is FUNCTIONALLY COMPLETE 2026-05-05
+
+  * Non-streaming + streaming paths: chunked + LCP-resume engagement
+    works at all prompt lengths.
+  * Mid-prefill stride-aligned snapshots correctly stored under
+    chunk-position-keyed `LcpKey`s; descending probe + true-
+    continuation gate find the longest valid prefix match.
+  * `restore_partial` decouples buffer sizing from snapshot size
+    (across-request `max_seq_len` differences).
+  * Byte-identity to monolithic fresh prefill verified end-to-end
+    on Qwen 3.6 35B-A3B-APEX-Q5_K_M for both streaming and non-
+    streaming, with both stride-aligned hit and partial-LCP fall-
+    through correctness preserved.
+  * Default-off rollout (`HF2Q_KV_LCP_RESUME=0` by default) keeps
+    production safe; operators opt-in via env when ready to soak.
 
 ### Memory budget reminder
 
