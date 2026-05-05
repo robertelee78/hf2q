@@ -6736,5 +6736,104 @@ mod tests {
                  to confirm."
             );
         }
+
+        // ── Sub-experiment C: compare kv_b (chunked end-of-call-1
+        // intermediate state) vs a fresh K-only monolithic call.
+        //
+        // Both process tokens [0..K) from zero state; mathematically
+        // they MUST produce byte-identical kv_cache state. If they
+        // diverge, the bug is in single-call state computation
+        // (chunked-call-1 itself produces wrong state). If they match,
+        // chunked-call-1 is fine and the bug is in chunked-call-2's
+        // input handling (state read, arena, or some forward_gpu_impl
+        // setup step that misbehaves on a warm cache).
+        let mut kv_c = HybridKvCache::new(&model.cfg, &device, max_seq_len, 1)
+            .expect("alloc kv_c");
+        let positions_c = build_positions(0, k);
+        let _logits_c = model
+            .forward_gpu_last_logits(&tokens[..k], &positions_c, &mut kv_c)
+            .expect("fresh K-only monolithic call");
+        let snap_c = kv_c.snapshot(&device).expect("snap_c");
+
+        // Re-do the chunked-call-1 in isolation to capture its
+        // end-state without the interference of call-2's writes.
+        let mut kv_d = HybridKvCache::new(&model.cfg, &device, max_seq_len, 1)
+            .expect("alloc kv_d");
+        let _logits_d = model
+            .forward_gpu_last_logits(&tokens[..k], &positions_c, &mut kv_d)
+            .expect("re-do chunked-call-1 in isolation");
+        let snap_d = kv_d.snapshot(&device).expect("snap_d");
+
+        let mut sub_c_divergence = false;
+        for i in 0..n_full_attn {
+            let cl_c = snap_c.full_attn_current_len[i][0];
+            let cl_d = snap_d.full_attn_current_len[i][0];
+            if cl_c != cl_d {
+                eprintln!(
+                    "[B.2a diag-sub-C] DIVERGE full_attn[{i}].current_len[0]: \
+                     fresh-K={} re-do-K={}",
+                    cl_c, cl_d
+                );
+                sub_c_divergence = true;
+            }
+            let c_k: &[u8] = snap_c.full_attn_k[i].as_slice::<u8>().expect("k c");
+            let d_k: &[u8] = snap_d.full_attn_k[i].as_slice::<u8>().expect("k d");
+            if c_k != d_k {
+                let first = c_k.iter().zip(d_k).position(|(a, b)| a != b).unwrap_or(0);
+                eprintln!(
+                    "[B.2a diag-sub-C] DIVERGE full_attn[{i}].k: \
+                     {} bytes; first diff at byte {first}",
+                    c_k.len()
+                );
+                sub_c_divergence = true;
+            }
+        }
+        for i in 0..n_linear {
+            let c_c: &[u8] = snap_c.linear_conv[i].as_slice::<u8>().expect("conv c");
+            let d_c: &[u8] = snap_d.linear_conv[i].as_slice::<u8>().expect("conv d");
+            if c_c != d_c {
+                let first = c_c.iter().zip(d_c).position(|(a, b)| a != b).unwrap_or(0);
+                eprintln!(
+                    "[B.2a diag-sub-C] DIVERGE linear_attn[{i}].conv_state: \
+                     first diff at byte {first}"
+                );
+                sub_c_divergence = true;
+            }
+            let c_r: &[u8] = snap_c.linear_recurrent[i]
+                .as_slice::<u8>()
+                .expect("rec c");
+            let d_r: &[u8] = snap_d.linear_recurrent[i]
+                .as_slice::<u8>()
+                .expect("rec d");
+            if c_r != d_r {
+                let first = c_r.iter().zip(d_r).position(|(a, b)| a != b).unwrap_or(0);
+                eprintln!(
+                    "[B.2a diag-sub-C] DIVERGE linear_attn[{i}].recurrent: \
+                     first diff at byte {first}"
+                );
+                sub_c_divergence = true;
+            }
+        }
+        eprintln!(
+            "[B.2a diag-sub-C] fresh-K vs re-do-K: any_divergence={}",
+            sub_c_divergence
+        );
+        if sub_c_divergence {
+            eprintln!(
+                "[B.2a diag-sub-C] CONCLUSION: forward_gpu_last_logits is \
+                 NON-DETERMINISTIC across two fresh calls with identical \
+                 inputs. This rules out chunked-prefill-specific bugs and \
+                 points at a fundamental nondeterminism (arena state, \
+                 thread-local pool, GPU residency, etc.). Phase B.2 cannot \
+                 proceed until determinism is fixed."
+            );
+        } else {
+            eprintln!(
+                "[B.2a diag-sub-C] CONCLUSION: single-call state is \
+                 deterministic. The end-of-chunked-call-1 state is correct. \
+                 Bug is in chunked-call-2's processing (warm-cache handling \
+                 in forward_gpu_impl)."
+            );
+        }
     }
 }
