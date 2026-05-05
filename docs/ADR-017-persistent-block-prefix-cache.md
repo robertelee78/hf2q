@@ -3701,6 +3701,97 @@ These are NOT stubs (per mantra). Each has a target-iter where the question is r
 - [`docs/research/adr017-phase-e-option-a-2026-05-05.md`](research/adr017-phase-e-option-a-2026-05-05.md) — Phase E option (a) LCP partial-prefill resume. iter-1 `9beb906`, iter-2 `d17163b`, iter-2.5 `70fca89`, iter-3 `a20606a`/`1006ab0`/`22e456a` (Codex APPROVED-WITH-CAVEATS), iter-3.5 `7ffb563` (dtype + decode-wrap snapshot), iter-3.5c + iter-5 `31d04b3` (prefill-wrap guard + KILL-criterion 5-K sweep PASS), iter-3.5d + iter-6 `04e6955` (snapshot capacity headroom + R-P7 + /cfa fan-out benches). **iter-7 LANDED** — long-prompt prefill-wrap guard byte-identity verified on Gemma 4 26B-DWQ (server A `lcp_lookups_total Δ=2`, `lcp_detected_total Δ=0` confirms guard skipped store; A=B 46 bytes byte-identical). Iter-7 surfaced + fixed a real latent overrun bug at `forward_prefill.rs:1881`: per-head memcpy used `seq_len*hd*elem` but iter-3.5d snap_cap = `sw`, so pure-dense (global-only) long prompts (`seq_len > sw`) overran dst (engine guard does not skip pure-dense long prompts). Fix in same iter: gate snapshot creation on `!any_sliding_layer || seq_len <= sw` (matches engine guard at engine.rs:4516); set `snap_cap = sw.max(seq_len + max_decode_tokens)` so pure-dense long prompts fit. Qwen3.5 hybrid deferral marker test documents the structural deferral (lcp_registry field on GemmaLoadedModel only at engine.rs:1102). 2804/0/13 bin tests + iter-3 + iter-5 + iter-6 + iter-7 all PASS post-fix. **Codex Phase-2b audit on iter-7 verdict: APPROVED-WITH-CAVEATS** (verdict file: [`adr017-phase-e-a-iter7-codex-audit-2026-05-05.txt`](research/adr017-phase-e-a-iter7-codex-audit-2026-05-05.txt); 1 LOW finding on the always-pass marker test is non-blocking and matches design intent). **iter-8 LANDED** — streaming-path byte-identity falsifier (`iter8_streaming_path_byte_identity`) PASS on Gemma 4 26B-DWQ: server A 144 streamed bytes (resume engaged, `lcp_detected_total=1`) == server B 144 streamed bytes (control), BYTE-IDENTICAL. Closes Codex audit recommendation re streaming store path coverage. **iter-4 (env-flip default-ON) gated only on operator soak under `HF2Q_KV_LCP_RESUME=1`.**
 - [`docs/research/cfa-hf2q-integration-2026-05-05.md`](research/cfa-hf2q-integration-2026-05-05.md) — /cfa ↔ hf2q integration design for v0.1. Singleton sidecar + server-side authoritative state (sessions / model_swap / 409-aware /shutdown / idle-timeout). Forward-points to E.a iter-3 as the gate at which /cfa Phase 2 fan-out (shared-prefix-different-suffix) starts hitting cache. Public-docs discipline: do NOT claim "R-P6 1.00× for /cfa" until E.a iter-3 ships — synthetic R-P6 fixture is byte-identical, real /cfa fan-out is shared-prefix-different-suffix.
 
+### Phase B-hybrid (Qwen 3.5/3.6) — LCP partial-prefill resume infrastructure
+
+**Status 2026-05-05:** Phase B-hybrid foundation LANDED on origin/main across `1c7cc4d`, `1819fad` (mlx-native), `fff4b4d`, `f800378`. Phase E.a Phase B.2 LCP partial-prefill resume on Qwen 3.5/3.6 hybrid (DeltaNet + full-attention) is functionally complete: kernel-level fast/fallback divergence diagnosed and closed, host-side wrapper + production wire-up green, end-to-end byte-identity preserved on the apex Qwen 3.6 35B-A3B-APEX-Q5_K_M model.
+
+**Iteration chain:**
+
+* **B.2-iso (`1c7cc4d`)** — kernel-level falsifier. Three-config test
+  (`gpu_full_attn::tests::phase_b2_iso_fast_path_vs_fallback_path_kernel_divergence`)
+  proves the FA bf16 d256 fast path and the legacy F32 SDPA fallback
+  produce byte-different outputs by design (BF16 MMA + log-domain
+  online softmax vs F32 single-pass online softmax). Result on M5 Max:
+  **131072 / 131072 F32 elements differ, max |Δ| = 6.452e-4.** This is
+  the root-cause diagnostic underneath the chunked-vs-monolithic
+  byte-identity falsifier — chunked prefill chunk-2 (cur_len > 0)
+  takes the legacy fallback while chunk-1 + monolithic take the FA
+  fast path, so the two cannot be byte-identical without a kernel
+  unification.
+
+* **B.2-fix mlx-native (`mlx-native@1819fad`)** —
+  `dispatch_flash_attn_prefill_bf16_d256_resume` +
+  `FlashAttnPrefillResumeParams`. Surfaces the existing kernel's
+  `qL_off` (function constant present since the Phase 1 port at
+  `flash_attn_prefill.metal:1045, 1325, 1437, 1445`) and
+  per-stride layout (`K_strides[3]`/`V_strides[3]` at
+  `flash_attn_prefill.metal:1048-1049`), enabling the FA fast path
+  for the partial-prefill regime (cur_len > 0 with slot K/V at
+  `kv_capacity * head_dim` head stride).
+  **Parity falsifier**:
+  `flash_attn_prefill_bf16_d256_resume_byte_identical_to_monolithic`
+  (Run A: monolithic full prefill; Run B: chunk-2 resume on
+  capacity-strided slot) reports **0 / 131072 BF16 elements differ**.
+
+* **B.2-fix hf2q (`fff4b4d`)** — host-side wrapper
+  `apply_flash_attn_prefill_seq_major_resume` + production wire-up at
+  `apply_sdpa_with_kv_cache:1860+`. Resume branch
+  (`resume_path_eligible = head_dim == 256 && cur_len > 0 && seq_len >= 16`)
+  fires BEFORE the legacy F32 SDPA fallback, dispatching the new
+  resume kernel via the F32→BF16 cast + permute pipeline.
+  **End-to-end host gate** (`phase_b2_iso` Path D): the wrapper
+  produces output byte-identical to the monolithic FA fast path —
+  **0 / 131072 F32 elements differ.** B.2a chunked-vs-monolithic
+  falsifier on Qwen 3.6 35B-A3B-APEX-Q5_K_M (chunked stride=64,
+  prompt_len=90, 2 chunks): **62 bytes == 62 bytes BYTE-IDENTICAL.**
+
+* **B.2b + B.2c v1 (`f800378`)** — engine-level LCP store + true-
+  continuation resume. Post-prefill `lcp_registry.store` mirrors the
+  existing `prompt_cache.update` (Phase E.b full-equality replay
+  capacity 1) for partial-prefill resume; pre-prefill
+  `lcp_registry.take_prefix` lookup with `k == cached_prompt_len`
+  triggers `kv_cache.restore_from(snapshot)` + suffix-only monolithic
+  prefill on `prompt_tokens[lcp_resume_start..]`. Suffix prefill's
+  first chunk sees `cur_len = lcp_resume_start > 0`, routes through
+  the FA bf16 d256 RESUME kernel (B.2-fix). End-to-end falsifier
+  (`tests/lcp_qwen35_partial_prefill_resume.rs::phase_b2c_lcp_resume_vs_fresh_prefill_byte_identity`)
+  on Qwen 3.6 35B-A3B-APEX-Q5_K_M: **5 bytes == 5 bytes BYTE-IDENTICAL**
+  (turn-1 "sky" cached + multi-turn turn-2 byte-equal across servers
+  with vs without `HF2Q_KV_LCP_RESUME=1`).
+
+**Why only true-continuation in v1:** the DeltaNet recurrent state is
+position-dependent and evolves incrementally through prefill. An
+end-of-prefill snapshot's recurrent state corresponds to position
+`cached_prompt_len`, so it's byte-correct ONLY for resume at exactly
+that position. Partial-LCP (`k < cached_prompt_len`) would resume
+with a recurrent state from a LATER position than the actual resume
+point — byte-different output. The engine probe correctly detects
+partial-LCP (`[hf2q qwen35 lcp probe] PARTIAL HIT — k=K < cached_prompt_len=N, skipping resume`)
+and falls through to fresh prefill, preserving correctness.
+
+**Real-world LCP engagement:** chat-completion workloads on Qwen 3.6
+empirically produce **partial-LCP not true-continuation** at the chat-
+template token boundary — trailing `<|im_start|>assistant\n` tokens
+in turn-1's prompt merge differently under turn-2's continued context,
+breaking strict-prefix at the BPE level (turn-1 prompt_len=25, turn-2
+prompt_len=47, k=21 — last 4 tokens of turn-1 don't match turn-2's
+same positions despite identical user content). B.2c v1 wires the
+infrastructure but the production resume path rarely fires until
+either:
+  * **B.3 mid-prefill stride-aligned checkpointing** — store snapshots
+    at every chunk boundary during chunked prefill; lookup finds the
+    largest stride-aligned LCP. Generalises true-continuation to
+    arbitrary LCP boundaries. Estimated ~300-500 LOC.
+  * Tokenizer-level work to produce strict-prefix tokens at chat
+    boundaries.
+  * Synthetic completion-API surface that bypasses the chat template.
+
+**Streaming path:** `generate_stream_qwen35_once_extended` currently
+has observability-only LCP probe (B-hybrid.1 from
+`memory_specialist project_adr017_phase_e_a_iter3_landed.md`).
+Full resume wire-up mirrors B.2c's non-streaming pattern; ~50 LOC
+follow-up.
+
 ### Standing memories (load-bearing for ADR-017 discipline)
 - `feedback_harness_first_before_iter_chasing` — Phase A0 lands before any production code.
 - `feedback_never_ship_fallback_without_rootcause` — no dense-only carve-out implying hybrid correctness.
