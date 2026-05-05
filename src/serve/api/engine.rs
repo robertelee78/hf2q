@@ -3361,6 +3361,38 @@ fn kv_restore_gemma(
                 // Linear capacity: at least enough for the payload.
                 // Use a generous default so the first prefill's
                 // realloc doesn't truncate already-restored bytes.
+                //
+                // ADR-017 Closure iter-13 (2026-05-05) note: the
+                // `n_tokens.max(512)` default is INTENTIONALLY small.
+                // The spiller writes 256-token blocks with ranges
+                // [0..256), [256..512), [512..768), ..., so for
+                // prefills > 512 tokens the 3rd+ blocks BAIL with
+                // "linear slot N >= capacity 512" → IoErr → spiller
+                // skip-and-continue. This is OBSERVABLE as
+                // `restore_block layer=N IoErr (skipped, continuing)`
+                // log lines in R-P5 traces.
+                //
+                // **The bug is cosmetic, not correctness-affecting**:
+                // forward_prefill at `forward_prefill.rs:1502`
+                // unconditionally REPLACES `self.dense_kvs = Some(...)`
+                // at the next request's first prefill — overwriting
+                // ANY restored bytes regardless of whether the
+                // restore loop completed successfully. So allocating
+                // a buffer big enough to hold ALL spilled blocks
+                // (32768 × 8 KV-heads × 256 head-dim × 4 bytes × 64
+                // layers ≈ 16 GiB) just so the restore loop can
+                // populate bytes that are immediately discarded
+                // would be pure waste — and could OOM the M5 Max
+                // when stacked against the 15 GB model weights.
+                //
+                // Phase E (full-equality PromptCache replay,
+                // iter-5/6) is the path that produces the
+                // measurable cache hit; KV-block restore is
+                // PRESERVED AS SUBSTRATE for a future Phase E
+                // option (a) LCP partial-prefill resume that
+                // would actually CONSUME the restored KV bytes.
+                // Until that lands, the IoErr-skip behavior is
+                // working-as-intended best-effort restore.
                 n_tokens.max(512)
             };
             // dtype: use the layer-K's allocator dtype convention by
