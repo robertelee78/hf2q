@@ -251,13 +251,15 @@ fn mtp_forward_draft_returns_logits() {
     std::fs::remove_file(&tmp).ok();
 }
 
+// ADR-017 iter-3.6 follow-up (2026-05-05): #[ignore] removed; path
+// fixed to actual fixture name (APEX-Q5_K_M.gguf). Test runtime-skips
+// when the artefact is absent.
 #[test]
-#[ignore]
 fn mtp_on_real_apex_returns_none() {
     let Some(device) = try_device() else { return };
     let path = std::path::PathBuf::from(
         "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/\
-         qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf",
+         APEX-Q5_K_M.gguf",
     );
     if !path.exists() {
         eprintln!("skipping: apex GGUF not at expected path");

@@ -3680,24 +3680,20 @@ mod tests {
     /// output for token 1 as running one two-token prefill (GPU version
     /// mirrors the CPU chunked-vs-monolithic test from delta_net.rs).
     ///
-    /// **#[ignore] 2026-04-25 — known regression (worktree adr-012-p8-p11).**
+    /// State-propagation correctness across chunked (token-by-token,
+    /// seq_len=1) vs monolithic (seq_len=2 prefill) paths for
+    /// `build_delta_net_layer`.
     ///
-    /// After the c9cd958 merge of ADR-013 into adr-012-p8-p11, this test
-    /// fails immediately at `t0_out[0]` with `mono=-0.016, chunk=0.000` —
-    /// the chunked path returns exact zero for the first-token output.
-    /// Mono and chunked paths feed identical inputs at t0 (same x, same
-    /// zero state), so the divergence cannot be precision; it points at
-    /// a real bug in the seq_len=1 (chunked) dispatch in
-    /// `build_delta_net_layer` — likely the new ping-pong scratch
-    /// buffer convention introduced in P13.3 isn't being respected by
-    /// the kernel for single-token prefill.
+    /// HISTORY: 2026-04-25 — flagged as a known-regression (`#[ignore]`d)
+    /// because chunked path returned zeros at t0_out[0]. Suspected
+    /// ping-pong scratch-buffer mishandling in seq_len=1 dispatch.
     ///
-    /// Tracking: this test is unchanged from origin/main; the failure
-    /// is pre-existing (verified pre-P9b on origin/main HEAD `cad1e9d`).
-    /// Out of scope for ADR-012 P9b. Owner: ADR-013 follow-up. Remove
-    /// the `#[ignore]` once the chunked-path zero-output bug is fixed.
+    /// 2026-05-05 (iter-3.6 follow-up audit): test is re-run and
+    /// PASSES on current main. The 2026-04-25 regression has been
+    /// fixed in subsequent work (likely ADR-015 or ADR-013 follow-ups).
+    /// Removing the `#[ignore]` so this regression test guards future
+    /// changes to the seq_len=1 chunked path.
     #[test]
-    #[ignore = "ADR-013 follow-up: chunked seq_len=1 dispatch returns zeros — pre-existing on origin/main, not an ADR-012 regression"]
     fn gpu_state_propagation_chunked_vs_monolithic() {
         let device = match MlxDevice::new() {
             Ok(d) => d,

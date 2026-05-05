@@ -619,13 +619,12 @@ mod tests {
 
     /// Integration smoke: load_from_gguf on the real apex returns a fully-
     /// shaped model with 40 layers (10 full-attn + 30 linear-attn), no MTP.
-    /// `#[ignore]`d so the 25 GB file isn't touched in regular test runs.
+    /// Runtime-skips when artefact absent (existing path-exists check).
     #[test]
-    #[ignore]
     fn load_from_real_apex_has_correct_shape() {
         let path = std::path::PathBuf::from(
             "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/\
-             qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf",
+             APEX-Q5_K_M.gguf",
         );
         if !path.exists() {
             eprintln!("skipping: apex GGUF not at expected path");

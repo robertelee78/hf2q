@@ -869,9 +869,9 @@ mod tests {
         assert_eq!(Qwen35Variant::from_arch(ARCH_QWEN3VLMOE_UPSTREAM), None);
     }
 
-    /// Integration test against the real apex GGUF on disk. `#[ignore]` so
-    /// `cargo test` stays fast; run explicitly with
-    /// `cargo test -p hf2q -- --ignored parses_real_apex_gguf`.
+    /// Integration test against the real apex GGUF on disk. Runtime-
+    /// skips when artefact absent (existing path-exists check). Path
+    /// fixed to `APEX-Q5_K_M.gguf` — the canonical fixture name.
     ///
     /// Verified values (dumped via `llama-gguf` + python parser on 2026-04-23):
     /// - num_hidden_layers = 40
@@ -883,11 +883,10 @@ mod tests {
     /// - num_experts       = 256
     /// - num_experts_per_tok = 8
     #[test]
-    #[ignore]
     fn parses_real_apex_gguf() {
         let path = std::path::PathBuf::from(
             "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/\
-             qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf",
+             APEX-Q5_K_M.gguf",
         );
         if !path.exists() {
             eprintln!("skipping: apex GGUF not at expected path");
@@ -950,15 +949,13 @@ mod tests {
     /// - All values are finite (no NaN / Inf from broken super-block arithmetic).
     /// - The value distribution is non-degenerate (std > 0).
     ///
-    /// `#[ignore]`d because it opens the 25 GB file and dequantizes ~32K
-    /// super-blocks; runs in ~100ms but we don't want every `cargo test`
-    /// invocation touching disk. Run via `--ignored`.
+    /// Opens the 25 GB file and dequantizes ~32K super-blocks; runs
+    /// in ~100ms with mmap. Runtime-skips when artefact absent.
     #[test]
-    #[ignore]
     fn dequantizes_real_apex_q5k_tensor() {
         let path = std::path::PathBuf::from(
             "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/\
-             qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf",
+             APEX-Q5_K_M.gguf",
         );
         if !path.exists() {
             eprintln!("skipping: apex GGUF not at expected path");

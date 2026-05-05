@@ -3929,6 +3929,20 @@ fn generate_once_with_soft_tokens(
                                 } else {
                                     mlx_native::DType::F32
                                 };
+                                // ADR-017 Phase E.a iter-3.6 follow-up
+                                // (Codex audit LOW #1): align per-layer
+                                // sliding required_cap with the alloc
+                                // formula. When LONG_RESUME=1, sliding
+                                // layers were allocated with
+                                // `max(sw, new_linear)`; the per-layer
+                                // check must demand ≥ same value, not
+                                // just `model_sw`. Today the aggregate
+                                // `prefix.linear_capacity >= new_linear`
+                                // saves us, but a future refactor could
+                                // admit an undersized sliding snapshot.
+                                let lr_long = crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
+                                    && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+                                    && crate::debug::INVESTIGATION_ENV.use_dense;
                                 prefix.dense_kvs.iter().enumerate().all(|(li, arc)| {
                                     let layer = &loaded.weights.layers[li];
                                     let layer_is_ring = matches!(
@@ -3936,7 +3950,7 @@ fn generate_once_with_soft_tokens(
                                         crate::serve::config::LayerType::Sliding
                                     );
                                     let required_cap = if layer_is_ring {
-                                        model_sw
+                                        if lr_long { model_sw.max(new_linear) } else { model_sw }
                                     } else {
                                         new_linear
                                     };
@@ -6222,6 +6236,20 @@ fn generate_stream_once(
                                 } else {
                                     mlx_native::DType::F32
                                 };
+                                // ADR-017 Phase E.a iter-3.6 follow-up
+                                // (Codex audit LOW #1): align per-layer
+                                // sliding required_cap with the alloc
+                                // formula. When LONG_RESUME=1, sliding
+                                // layers were allocated with
+                                // `max(sw, new_linear)`; the per-layer
+                                // check must demand ≥ same value, not
+                                // just `model_sw`. Today the aggregate
+                                // `prefix.linear_capacity >= new_linear`
+                                // saves us, but a future refactor could
+                                // admit an undersized sliding snapshot.
+                                let lr_long = crate::debug::INVESTIGATION_ENV.kv_lcp_long_resume
+                                    && crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+                                    && crate::debug::INVESTIGATION_ENV.use_dense;
                                 prefix.dense_kvs.iter().enumerate().all(|(li, arc)| {
                                     let layer = &loaded.weights.layers[li];
                                     let layer_is_ring = matches!(
@@ -6229,7 +6257,7 @@ fn generate_stream_once(
                                         crate::serve::config::LayerType::Sliding
                                     );
                                     let required_cap = if layer_is_ring {
-                                        model_sw
+                                        if lr_long { model_sw.max(new_linear) } else { model_sw }
                                     } else {
                                         new_linear
                                     };

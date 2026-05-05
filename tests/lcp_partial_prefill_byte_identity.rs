@@ -287,6 +287,14 @@ fn fetch_canonical_model_id(server: &ServerGuard) -> String {
 
 /// Send a /v1/chat/completions request with greedy decode (T=0) and
 /// return the assistant text from `choices[0].message.content`.
+///
+/// ADR-017 Phase E.a iter-3.6 follow-up (Codex audit LOW #2): assert
+/// HTTP 200 status AND that the response shape contains `"choices":[`
+/// before extracting `content`. This prevents a vacuous test pass
+/// where both servers return an error-shaped 5xx response that
+/// happens to contain a `content` field somewhere in the error
+/// message — the prior helper would have extracted that and compared
+/// equal between servers.
 fn chat_decode(server: &ServerGuard, model: &str, prompt: &str, max_tokens: u32) -> String {
     use std::io::{Read, Write};
     let body = format!(
@@ -305,8 +313,32 @@ fn chat_decode(server: &ServerGuard, model: &str, prompt: &str, max_tokens: u32)
     .unwrap();
     let mut buf = String::new();
     s.read_to_string(&mut buf).expect("read response");
+
+    // Codex audit LOW #2: parse HTTP status line; assert 200.
+    let status_line_end = buf.find("\r\n").unwrap_or(buf.len());
+    let status_line = &buf[..status_line_end];
+    let status_code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("malformed HTTP status line: {status_line:?}"));
+    assert_eq!(
+        status_code, 200,
+        "[chat_decode] expected HTTP 200, got {status_code}. \
+         Status line: {status_line:?}\nFull response:\n{buf}"
+    );
+
     let body_start = buf.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
     let body = &buf[body_start..];
+
+    // Codex audit LOW #2: assert response shape has the OpenAI choices
+    // array — guards against an error-shaped response containing an
+    // unrelated `content` field.
+    assert!(
+        body.contains("\"choices\":["),
+        "[chat_decode] response body lacks `\"choices\":[` — likely an \
+         error response. Body:\n{body}"
+    );
 
     // Naive JSON content extractor — sufficient for the well-known
     // shape `{"choices":[{"message":{"content":"...","role":"assistant"...}}]}`.

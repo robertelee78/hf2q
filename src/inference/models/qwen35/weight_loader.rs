@@ -1390,14 +1390,13 @@ mod tests {
     /// - Shapes match what the CPU reference expects.
     /// - Values are finite and non-degenerate (non-zero stddev).
     ///
-    /// `#[ignore]`d so regular `cargo test` doesn't touch the 25 GB file.
-    /// Memory cost: ~1-2 GB of dequantized f32 for one MoE linear layer.
+    /// Runtime-skips when artefact absent. Memory cost when run:
+    /// ~1-2 GB of dequantized f32 for one MoE linear layer.
     #[test]
-    #[ignore]
     fn load_real_apex_linear_attn_layer_0() {
         let path = std::path::PathBuf::from(
             "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/\
-             qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf",
+             APEX-Q5_K_M.gguf",
         );
         if !path.exists() {
             eprintln!("skipping: apex GGUF not at expected path");
@@ -1535,11 +1534,10 @@ mod tests {
 
     /// Integration test for a full-attention layer (layer 3 in apex).
     #[test]
-    #[ignore]
     fn load_real_apex_full_attn_layer_3() {
         let path = std::path::PathBuf::from(
             "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/\
-             qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf",
+             APEX-Q5_K_M.gguf",
         );
         if !path.exists() {
             eprintln!("skipping: apex GGUF not at expected path");
@@ -1595,11 +1593,10 @@ mod tests {
 
     /// Global tensors loadable from real apex.
     #[test]
-    #[ignore]
     fn load_real_apex_global_tensors() {
         let path = std::path::PathBuf::from(
             "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/\
-             qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf",
+             APEX-Q5_K_M.gguf",
         );
         if !path.exists() {
             eprintln!("skipping: apex GGUF not at expected path");

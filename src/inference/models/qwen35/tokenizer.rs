@@ -376,11 +376,10 @@ mod tests {
     /// reference" — the apex GGUF is a convenience reference for eyes,
     /// not a CI dependency, so the test gates on its existence.
     #[test]
-    #[ignore = "requires apex GGUF on disk"]
     fn apex_im_start_does_not_tokenize_to_oob_id() {
         let path = Path::new(
             "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/\
-             qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf",
+             APEX-Q5_K_M.gguf",
         );
         if !path.exists() {
             eprintln!("apex GGUF not present at {path:?}; skipping");
@@ -413,11 +412,10 @@ mod tests {
     /// equal to `qwen35`. Other values are an explicit error rather
     /// than a silent fallback.
     #[test]
-    #[ignore = "requires apex GGUF on disk"]
     fn build_succeeds_on_qwen35_gguf() {
         let path = Path::new(
             "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/\
-             qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf",
+             APEX-Q5_K_M.gguf",
         );
         if !path.exists() {
             eprintln!("apex GGUF not present; skipping");
