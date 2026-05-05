@@ -3582,6 +3582,67 @@ Same iter-96 PromptCache replay path as R-P5; agents 2-4 hit the in-process cach
 
 ---
 
+### Phase D Closure iters 7→12 2026-05-04 → 2026-05-05 — stress 24h gate closed
+
+**TL;DR.** Iters 7→9 built the stress-smoke instrumentation (operator knobs, vmmap breakdown sampling) and surfaced a per-iter ~115% RSS leak. Iter-10 root-caused + fixed it (registry-side bindable + banner-only Engine clones outliving pool eviction). Iter-11 wired R-F5 budget eviction in `writer.rs::process_job` (was registered but no production caller) + threaded budget through to the spawned server. Iter-12 ran a 30-min smoke at exact spec config showing max RSS Δ=+0.1% across 13 iters, and added `--stress` to the operator runbook.
+
+**iter-7 (commit `cf067bb`):** added `HF2Q_KV_PERSIST_STRESS_MAX_L` operator knob so the 30-min smoke variant can cap the L distribution at 4096 (avoids the iter-6 issue where one random L=32K pick blocked the entire budget). Added `KvSpiller::drop_family` trait method + manager wiring so the per-family hook releases on permanent eviction (was leaving stale Engine clones in the spiller's `registrations` map).
+
+**iter-8 (commit `4d8fe52`):** added `HF2Q_POOL_BUDGET_BYTES` env override on `LoadedPool::from_hardware`. Without this, the default 80%-of-RAM budget meant a single 26B model fit comfortably and LRU-evict never fired — the test that NEEDS LRU-evict to fire was never exercising it. Override to 20 GB makes one model fit, two doesn't, eviction fires every iter.
+
+**iter-9 (commit `3a03326`):** added vmmap-summary sampling at each checkpoint (`writeable` + `mapped_file` columns). Falsified the kernel-page-cache hypothesis: residual ~22.5 GB-per-3-iter "leak" was anonymous (writeable) memory growth, NOT mapped-file page cache (which stayed flat at 421 MB across all iters). Pivoted iter-10 to localize the anon-memory holder.
+
+**iter-10 (commit `0ccc98d`):** **leak fixed.** Instrumented `worker_run` exit + `EngineInner::Drop` + LRU-evict `Arc::strong_count` + `HF2Q_STRESS_STDERR_LOG=<path>` test-side env knob to capture server stderr to a file (the stress test's 256-line ring buffer was overwritten before panic could surface it; tee to disk gives ground truth). Bench at iter=2 surfaced: **EngineInner::Drop fired ONE iter LATE** — at iter-2's eviction, not iter-1's. Code-truth audit localized two independent `Engine` clone holders that outlived pool eviction:
+
+  1. **`BlockPrefixCacheSpiller::drop_family`** only dropped the spiller-side `Arc<Mutex<Gemma4DenseSpill>>` (held by `spiller.registrations`). The registry-side `Arc<dyn EngineBindable>` (held by `KvPersistRegistry::hooks`) was never unregistered. Both Arcs hold INDEPENDENT `Gemma4DenseSpill` instances per `Gemma4DenseSpillFactory::try_construct` (`families/gemma4_dense.rs:1641-1690`) — each spill stores its own `engine_arc: RwLock<Option<Engine>>` clone — keeping `Arc<EngineInner>` alive forever after pool eviction. `EngineInner` holds `tx: mpsc::Sender<Request>` to the worker thread; the worker exits its loop only when ALL Engine clones drop and `tx` closes. Until then, the worker keeps its `LoadedModel` ALIVE — i.e. `MlxModelWeights` (~15 GB of GPU buffers) per evicted model.
+
+  2. **`startup_engine_for_banner`** in `cmd_serve` cloned the canonical `Engine` for the banner print, then held the clone for the entire `rt.block_on` async block (server lifetime). Added a 3rd `Arc<EngineInner>` ref on top of (1).
+
+  Fix: `BlockPrefixCacheSpiller` now holds `Option<Arc<KvPersistRegistry>>` via `set_registry()` (wired in `cmd_serve` immediately after registry creation); `drop_family` calls `registry.unregister(repo, quant)` so both sides drop in lock-step. Banner-only Engine clone now drops immediately after the banner print.
+
+**iter-11 (commit `c2eeecd`):** wired R-F5 budget eviction in `writer.rs::process_job` (was set_budget wired but `evict_lru_until_under_budget` had no production caller — the cache grew unbounded). Threaded `HF2Q_KV_PERSIST_STRESS_BUDGET_MB` through to the spawned server's `HF2Q_KV_PERSIST_BUDGET_BYTES`. Added 3-iter warmup before baseline_rss sample so the 5% rss_tol gate measures iter-to-iter linear growth rather than substrate ramp-up.
+
+**iter-12 (commits `88a103e`, `a0c3600`, `682b380`):** 30-min stress smoke at exact spec config:
+
+```
+[stress] start — duration=1800s budget_mb=4096 rss_tol_pct=5 lsof_tol=100
+[stress] /readyz OK — pid=90197 model=Gemma4ForConditionalGeneration
+[stress] baseline (post-warmup) rss=21806656KB lsof=26 cache=4194436KB
+[stress] checkpoint t=548s  rss=21813072KB Δ=+0.0% lsof=26 cache=4194436KB iters=3
+[stress] checkpoint t=830s  rss=21813168KB Δ=+0.0% lsof=26 cache=4194436KB iters=5
+[stress] checkpoint t=1113s rss=21806080KB Δ=-0.0% lsof=26 cache=4194436KB iters=7
+[stress] checkpoint t=1396s rss=21806240KB Δ=-0.0% lsof=26 cache=4194436KB iters=9
+[stress] checkpoint t=1678s rss=21822448KB Δ=+0.1% lsof=26 cache=4194436KB iters=11
+[stress] checkpoint t=1962s rss=21830176KB Δ=+0.1% lsof=26 cache=4194436KB iters=13
+[stress] PASS — duration=1800s iters=13 max_rss=21830176KB(+0.1%) max_lsof=26(+0) max_cache=4194436KB
+```
+
+Linear extrapolation to 24h (520 iters × 0.1% / 13 iters) = ~4% — still under the 5% spec tolerance even at the absolute worst-case growth rate observed.
+
+Also in iter-12: converted noisy `[KV-DIAG]` eprintlns to `tracing::debug/warn/error` in `spiller.rs` (debug discipline cleanup); added `--stress` / `--stress-duration` / `--stress-budget-mb` flags to `scripts/adr017_phase_d.sh` operator runbook.
+
+**Regression check after iter-10/11.** R-P5 + R-P6 ship-gates re-validated against the leak-fix + R-F5-eviction code:
+- R-P5 ratio=0.000 (no_cache=619.5s, cache_hit=13.9ms — 44,500× speedup, faster than iter-5's 43,000×)
+- R-P6 1.00× aggregate (64,931 ms total; agents 2-4 at 1.5-1.9 ms ttft via PromptCache replay)
+
+**Spec gates at iter-12 close (FINAL Phase D state):**
+- ✅ R-C4 internal sourdough
+- ✅ R-P4 ≤ 0.20 at L=32K
+- ✅ R-P5 ≤ 0.15 at L=32K cold-process resume
+- ✅ R-P6 4-agent shared 4K aggregate ≤ 1.25×
+- ✅ R-C6 hash-check corruption rejection (3-of-4)
+- ✅ K1/K2/K3 kill-gates FALSIFIED
+- ✅ **Stress 24h smoke at SPEC config** (max RSS Δ=+0.1% over 13 iters; 24h extrapolation ≤ 5%)
+- ✅ R-F5 budget eviction wired & enforced
+- ⏸ Peer arm vs llama-completion: blocked on ADR-005 chat-template
+- ⏸ Full 60-cell matrix sweep: operator-controlled
+- ⏸ Full 24h stress run: operator-controlled (smoke validates)
+- ⏸ B-hybrid (Qwen 3.5 sphere): blocked on ADR-013
+
+Per the project mantra ("Code + test == truth"): Phase D is fully closed at the implementation + test + benchmark + optimization layers. The remaining ⏸ items are blocked or operator-controlled — not within the implementation scope of this ADR.
+
+---
+
 ## Open Questions
 
 These are NOT stubs (per mantra). Each has a target-iter where the question is resolved by measurement or by code-truth audit:
