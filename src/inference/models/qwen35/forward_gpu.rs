@@ -6544,4 +6544,197 @@ mod tests {
             "undersized chunk error must name the violation; got: {msg}"
         );
     }
+
+    /// ADR-017 Phase B-hybrid.2a diagnostic — pinpoint which kv_cache
+    /// buffer diverges between [chunked prefill of K + (N-K) tokens]
+    /// vs [monolithic prefill of N tokens] on the same prompt.
+    ///
+    /// The two-server falsifier
+    /// (`tests/lcp_qwen35_chunked_prefill.rs::
+    ///   phase_b2a_chunked_vs_monolithic_byte_identity`) caught the
+    /// divergence at the OUTPUT level (decoded bytes differ); this
+    /// test localizes the divergence to a SPECIFIC kv_cache buffer
+    /// (full_attn[i].k, full_attn[i].v, full_attn[i].current_len[0],
+    /// linear_attn[i].conv_state, OR linear_attn[i].recurrent) so the
+    /// fix can target the right code path.
+    ///
+    /// Runtime-skips when the Qwen 3.6 27B-DWQ46 GGUF is absent.
+    #[test]
+    fn phase_b2a_chunked_kv_cache_divergence_diagnostic() {
+        use crate::inference::models::qwen35::tokenizer::build_tokenizer_from_gguf;
+        use crate::inference::models::qwen35::model::Qwen35Model;
+        use crate::serve::header::LoadProgress;
+        use mlx_native::gguf::GgufFile;
+
+        let path = std::path::PathBuf::from(
+            "/opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf",
+        );
+        if !path.exists() {
+            eprintln!(
+                "[B.2a diagnostic] skipping: Qwen 3.6 27B-DWQ46 GGUF not at {}",
+                path.display()
+            );
+            return;
+        }
+        if MlxDevice::new().is_err() {
+            eprintln!("[B.2a diagnostic] skipping: no Metal device");
+            return;
+        }
+
+        let device = MlxDevice::new().expect("metal");
+        let gguf = GgufFile::open(&path).expect("open gguf");
+        let mut progress = LoadProgress::new(false, 1, 0);
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load");
+        let tok = build_tokenizer_from_gguf(&gguf).expect("build tokenizer");
+
+        // Tokenize a prompt that yields > 1 token (split point K must
+        // be ≥ 1 and ≤ N-1).
+        let prompt = "The four seasons of the year include spring, summer, autumn and winter, each with their own characteristics and cultural traditions.";
+        let enc = tok.encode(prompt, false).expect("encode");
+        let tokens: Vec<u32> = enc.get_ids().to_vec();
+        let n = tokens.len();
+        assert!(n >= 4, "test prompt too short: n={n}");
+        let k = n / 2;
+        eprintln!(
+            "[B.2a diagnostic] prompt tokenized to N={} tokens; split at K={}",
+            n, k
+        );
+
+        let max_seq_len = (n + 16) as u32;
+
+        // Build a [4 * len] axis-major positions buffer for tokens at
+        // absolute positions [start..start+len). Mirrors
+        // `engine_qwen35::prefill_positions_for` but supports a
+        // non-zero start.
+        fn build_positions(start: usize, len: usize) -> Vec<i32> {
+            let mut flat = vec![0i32; 4 * len];
+            for axis in 0..4 {
+                for t in 0..len {
+                    flat[axis * len + t] = (start + t) as i32;
+                }
+            }
+            flat
+        }
+
+        // ── Way A: monolithic ──
+        let mut kv_a = HybridKvCache::new(&model.cfg, &device, max_seq_len, 1)
+            .expect("alloc kv_a");
+        let positions_a = build_positions(0, n);
+        let _logits_a = model
+            .forward_gpu_last_logits(&tokens, &positions_a, &mut kv_a)
+            .expect("monolithic prefill");
+        let snap_a = kv_a.snapshot(&device).expect("snap_a");
+
+        // ── Way B: chunked at K ──
+        let mut kv_b = HybridKvCache::new(&model.cfg, &device, max_seq_len, 1)
+            .expect("alloc kv_b");
+        let positions_b1 = build_positions(0, k);
+        let _logits_b1 = model
+            .forward_gpu_last_logits(&tokens[..k], &positions_b1, &mut kv_b)
+            .expect("chunked prefill chunk 1");
+        let positions_b2 = build_positions(k, n - k);
+        let _logits_b2 = model
+            .forward_gpu_last_logits(&tokens[k..], &positions_b2, &mut kv_b)
+            .expect("chunked prefill chunk 2");
+        let snap_b = kv_b.snapshot(&device).expect("snap_b");
+
+        // Per-buffer comparison. Find the FIRST divergence and dump
+        // diagnostic info; don't panic — print all divergences for
+        // a complete picture.
+        let mut any_divergence = false;
+        let n_full_attn = snap_a.full_attn_k.len();
+        for i in 0..n_full_attn {
+            // current_len[0] should both be n.
+            let cl_a = snap_a.full_attn_current_len[i][0];
+            let cl_b = snap_b.full_attn_current_len[i][0];
+            if cl_a != cl_b {
+                eprintln!(
+                    "[B.2a diagnostic] DIVERGE full_attn[{i}].current_len[0]: \
+                     A={} B={}",
+                    cl_a, cl_b
+                );
+                any_divergence = true;
+            }
+            // K bytes
+            let a_k: &[u8] = snap_a.full_attn_k[i]
+                .as_slice::<u8>()
+                .expect("full_attn_k a slice");
+            let b_k: &[u8] = snap_b.full_attn_k[i]
+                .as_slice::<u8>()
+                .expect("full_attn_k b slice");
+            if a_k != b_k {
+                let first_diff = a_k.iter().zip(b_k).position(|(a, b)| a != b).unwrap_or(0);
+                eprintln!(
+                    "[B.2a diagnostic] DIVERGE full_attn[{i}].k: \
+                     {} bytes; first diff at byte {first_diff}",
+                    a_k.len()
+                );
+                any_divergence = true;
+            }
+            // V bytes
+            let a_v: &[u8] = snap_a.full_attn_v[i].as_slice::<u8>().expect("v a");
+            let b_v: &[u8] = snap_b.full_attn_v[i].as_slice::<u8>().expect("v b");
+            if a_v != b_v {
+                let first_diff = a_v.iter().zip(b_v).position(|(a, b)| a != b).unwrap_or(0);
+                eprintln!(
+                    "[B.2a diagnostic] DIVERGE full_attn[{i}].v: \
+                     {} bytes; first diff at byte {first_diff}",
+                    a_v.len()
+                );
+                any_divergence = true;
+            }
+        }
+        let n_linear = snap_a.linear_conv.len();
+        for i in 0..n_linear {
+            let a_c: &[u8] = snap_a.linear_conv[i]
+                .as_slice::<u8>()
+                .expect("conv a slice");
+            let b_c: &[u8] = snap_b.linear_conv[i]
+                .as_slice::<u8>()
+                .expect("conv b slice");
+            if a_c != b_c {
+                let first_diff = a_c.iter().zip(b_c).position(|(a, b)| a != b).unwrap_or(0);
+                eprintln!(
+                    "[B.2a diagnostic] DIVERGE linear_attn[{i}].conv_state: \
+                     {} bytes; first diff at byte {first_diff}",
+                    a_c.len()
+                );
+                any_divergence = true;
+            }
+            let a_r: &[u8] = snap_a.linear_recurrent[i]
+                .as_slice::<u8>()
+                .expect("rec a slice");
+            let b_r: &[u8] = snap_b.linear_recurrent[i]
+                .as_slice::<u8>()
+                .expect("rec b slice");
+            if a_r != b_r {
+                let first_diff = a_r.iter().zip(b_r).position(|(a, b)| a != b).unwrap_or(0);
+                eprintln!(
+                    "[B.2a diagnostic] DIVERGE linear_attn[{i}].recurrent: \
+                     {} bytes; first diff at byte {first_diff}",
+                    a_r.len()
+                );
+                any_divergence = true;
+            }
+        }
+
+        eprintln!(
+            "[B.2a diagnostic] N={n} K={k}, full_attn layers={n_full_attn}, \
+             linear_attn layers={n_linear}; any_divergence={any_divergence}"
+        );
+
+        // The test PASSES regardless of divergence — its purpose is
+        // diagnostic logging, not pass/fail gating. The user reads the
+        // [B.2a diagnostic] DIVERGE lines and identifies the FIRST
+        // diverging buffer to target the fix.
+        if !any_divergence {
+            eprintln!(
+                "[B.2a diagnostic] NO DIVERGENCE — chunked kv_cache is byte-\
+                 identical to monolithic at this N/K. Either the bug is in a \
+                 path NOT covered by this prompt/split, or the bug has been \
+                 fixed since the falsifier ran. Run the integration falsifier \
+                 to confirm."
+            );
+        }
+    }
 }

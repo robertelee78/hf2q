@@ -367,11 +367,26 @@ Total estimated wall-time: 5-8 days across ~10-15 loop iters. The user accepts t
 
 Test: `tests/lcp_qwen35_chunked_prefill.rs::phase_b2a_chunked_vs_monolithic_byte_identity` with stride=64, prompt tokenizing to 108 tokens. Result: chunked decode = 41 bytes; monolithic decode = 47 bytes; diverge at byte offset 4.
 
-**Hypothesis (prime suspect)**: the DeltaNet kernel dispatcher uses different code paths based on `seq_len > 64 && seq_len % 64 == 0` (chunk-pipeline at `chunk_gated_delta_rule_fwd`) vs the fallback (autoregressive `gated_delta_net_decode`). Chunked prefill at stride=64 produces partial-tail chunks (seq_len ∈ [1, 63]) which take the autoregressive path; the cumulative state across multiple kernel-path-switching calls differs from a single monolithic call's state.
+**Hypothesis (prime suspect, FALSIFIED 2026-05-05)**: the DeltaNet kernel dispatcher uses different code paths based on `seq_len > 64 && seq_len % 64 == 0` (chunk-pipeline at `chunk_gated_delta_rule_fwd`) vs the fallback (autoregressive `gated_delta_net_decode`). Chunked prefill at stride=64 produces partial-tail chunks (seq_len ∈ [1, 63]) which take the autoregressive path; the cumulative state across multiple kernel-path-switching calls differs from a single monolithic call's state.
 
-**B.2 status**: BLOCKED pending root-cause. Two possible mitigations:
-1. Constrain chunked prefill to stride values where prompt_len is exactly divisible (no partial tail). Restricts when the speedup applies but preserves byte-identity. Mitigation lands in iter B.2b.
-2. Investigate + fix the kernel-path-divergence bug in mlx-native (chunk_gated_delta_rule vs autoregressive gated_delta_net dispatch). Larger scope; iter B.2c+.
+**Diagnosis 2026-05-05 (stride=54 isolation)**: ran chunked-prefill with stride=54 against the same 108-token prompt. With stride=54, BOTH chunks (54 + 54 tokens) have seq_len < 64, forcing the autoregressive path. Monolithic seq_len=108 also takes the autoregressive path (108 % 64 != 0). So both paths now use the **same kernel route** (autoregressive throughout).
+
+Result: server A (chunked, both autoregressive) decoded gibberish — the model echoed the chat template (`<|im_start|>assistant\n\n<|im_start|>user\n\n`), implying the post-prefill state was broken. Server B (monolithic, autoregressive) decoded coherent text.
+
+**FALSIFIED**: the prime-suspect kernel-path-mismatch hypothesis is wrong. The bug exists even when chunked + monolithic take identical kernel routes.
+
+**ACTUAL ROOT CAUSE**: state propagation BETWEEN consecutive autoregressive `forward_gpu_last_logits` calls is broken. Two calls of [54-token autoregressive prefill] ≠ one call of [108-token autoregressive prefill] when run on the same `kv_cache`, even though both use the same kernel.
+
+Possible deeper causes (not yet investigated):
+- DeltaNet recurrent_state ping-pong (`HybridKvCache::swap_recurrent`) may not handle multi-call state hand-off correctly. The autoregressive path uses scratch + active swap internally; the swap state at end-of-call-1 may not match what call-2 expects.
+- DeltaNet `conv_state` (last K-1=3 token rows of QKV) may not be correctly persisted between calls. The chunk-pipeline path writes a final conv_state; the autoregressive per-token loop maintains conv_state via roll-and-append. If end-of-call-1 leaves conv_state in a non-canonical layout, call-2 misreads it.
+- An internal arena or scratch buffer within forward_gpu_impl is per-call but should persist across calls.
+- Some kv_cache invariant (e.g. expected current_len[0] alignment with conv_state contents) is violated by partial-prefill end-state.
+
+**B.2 status**: BLOCKED pending deeper root-cause. Mitigations:
+1. ~~Constrain chunked to divisible strides~~ — falsified by stride=54 experiment; bug isn't path-mismatch.
+2. **Pinpoint the per-state divergence**: write a unit-level test comparing `HybridKvCache` contents (conv_state + recurrent + full_attn current_len + full_attn K/V) after [54+54 chunked] vs [108 monolithic]. Find the FIRST differing field. Likely a single buffer's layout invariant is violated between calls.
+3. Fix the per-state bug. Likely small (single state-handoff fix) once located.
 
 **Default impact**: zero. The chunked path is gated on `HF2Q_KV_LCP_CHUNKED_PREFILL=1` (default OFF). Default `cargo test` passes 2814/0/3. The falsifier test runs only under `HF2Q_KV_PERSIST_PHASE_D=1 + HF2Q_KV_PERSIST_QWEN35_E2E_MODEL_PATH=<gguf>` (explicit operator opt-in).
 
