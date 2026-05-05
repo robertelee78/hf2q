@@ -229,6 +229,24 @@ pub struct BlockPrefixCacheSpiller<E> {
     /// trigger sites read without blocking each other; only
     /// register/unregister take the write lock.
     registrations: RwLock<HashMap<FamilyKey, FamilyHook>>,
+    /// ADR-017 Closure iter-10 (2026-05-05): optional KvPersistRegistry
+    /// reference so [`Self::drop_family`] also unregisters the
+    /// `Arc<dyn EngineBindable>` from the registry's `hooks` map. Both
+    /// the spiller's `registrations` and the registry's `hooks` hold
+    /// independent `Arc<Gemma4DenseSpill>` clones (per
+    /// `Gemma4DenseSpillFactory::try_construct` at
+    /// `families/gemma4_dense.rs:1641-1690`), and EACH spill instance
+    /// holds its own `engine_arc` field with an `Engine` clone
+    /// (`Arc<EngineInner>`). Without unregistering both sides on
+    /// permanent eviction, the registry-side `Arc<EngineInner>`
+    /// outlives the pool's `LoadedEngine`, keeping the worker thread +
+    /// `LoadedModel` (multi-GB `MlxModelWeights`) alive forever.
+    /// Wired by `cmd_serve` at startup (immediately after registry
+    /// creation); off-path callers that don't supply a registry leave
+    /// this `None` (drop_family becomes a single-side cleanup).
+    registry: RwLock<
+        Option<Arc<crate::serve::kv_persist::registry::KvPersistRegistry>>,
+    >,
     /// Phantom binding for the engine generic. The spiller does not
     /// actually access the engine at runtime — that's the per-family
     /// hook's job — so no `E` field is needed.
@@ -247,8 +265,26 @@ impl<E> BlockPrefixCacheSpiller<E> {
             store,
             writer,
             registrations: RwLock::new(HashMap::new()),
+            registry: RwLock::new(None),
             _phantom: PhantomData,
         }
+    }
+
+    /// ADR-017 Closure iter-10 — wire the registry so [`Self::drop_family`]
+    /// also clears the registry-side bindable hook. Idempotent: re-calling
+    /// overwrites the prior registry handle. Setting to `None` at runtime
+    /// is permitted but shouldn't normally happen — `cmd_serve` wires
+    /// once at startup. See the field-level doc-comment for the leak
+    /// rationale.
+    pub fn set_registry(
+        &self,
+        registry: Arc<crate::serve::kv_persist::registry::KvPersistRegistry>,
+    ) {
+        let mut g = self
+            .registry
+            .write()
+            .expect("BlockPrefixCacheSpiller::registry RwLock poisoned");
+        *g = Some(registry);
     }
 
     /// Register a per-family hook for `(repo, quant)`. Re-registering
@@ -875,6 +911,25 @@ where
     /// stress smoke: 19.5 GB → 80 GB after 3 iters).
     fn drop_family(&self, repo: &str, quant: QuantType) {
         let _ = self.unregister_family(repo, quant);
+        // ADR-017 Closure iter-10 (2026-05-05): also unregister the
+        // registry-side bindable hook. Both maps hold independent
+        // Arc<Gemma4DenseSpill> clones; releasing one keeps the
+        // OTHER alive, and each spill holds its own Engine clone
+        // (Arc<EngineInner>) — so leaking the registry side leaks
+        // the entire model worker thread + LoadedModel weights
+        // (~15 GB per stress iter). cmd_serve wires the registry
+        // via `set_registry` at startup. Off-path callers (no
+        // registry) silently no-op here.
+        let registry = {
+            let g = self
+                .registry
+                .read()
+                .expect("BlockPrefixCacheSpiller::registry RwLock poisoned");
+            g.clone()
+        };
+        if let Some(r) = registry {
+            let _ = r.unregister(repo, quant);
+        }
     }
 }
 

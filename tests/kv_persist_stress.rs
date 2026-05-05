@@ -219,17 +219,36 @@ mod stress_driver {
             .spawn()
             .map_err(|e| DriverError::SpawnFailed(e.to_string()))?;
         let stderr_tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        // ADR-017 Closure iter-10 (2026-05-05): when
+        // HF2Q_STRESS_STDERR_LOG=<path> is set, the reader thread also
+        // writes every server stderr line to that path (line-buffered
+        // via flush after every line). Lets post-run grep for
+        // [KV-DIAG] without having to panic the test to surface the
+        // ring-buffer tail.
+        let stderr_log_path = std::env::var_os("HF2Q_STRESS_STDERR_LOG")
+            .map(PathBuf::from);
         let stderr_thread = if let Some(stderr) = child.stderr.take() {
             let tail = Arc::clone(&stderr_tail);
             Some(thread::spawn(move || {
                 let mut reader = BufReader::new(stderr);
                 let mut buf = String::new();
+                let mut log_file = stderr_log_path.as_ref().and_then(|p| {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(p)
+                        .ok()
+                });
                 loop {
                     buf.clear();
                     match reader.read_line(&mut buf) {
                         Ok(0) => break,
                         Ok(_) => {
                             let line = buf.trim_end_matches(['\n', '\r']).to_string();
+                            if let Some(f) = log_file.as_mut() {
+                                let _ = writeln!(f, "{line}");
+                                let _ = f.flush();
+                            }
                             if let Ok(mut g) = tail.lock() {
                                 g.push(line);
                                 let drain = g.len().saturating_sub(256);

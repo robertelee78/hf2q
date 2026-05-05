@@ -2945,6 +2945,16 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         //    registry. Populated once per known family below.
         let registry = Arc::new(KvPersistRegistry::new());
 
+        // ADR-017 Closure iter-10 (2026-05-05): wire the registry into
+        // the spiller so `BlockPrefixCacheSpiller::drop_family` also
+        // unregisters the registry-side `Arc<dyn EngineBindable>` on
+        // permanent eviction. Without this, the registry's `hooks`
+        // map retains an `Arc<Gemma4DenseSpill>` whose `engine_arc`
+        // field holds an `Engine` clone (Arc<EngineInner>) — keeping
+        // the worker thread + LoadedModel weights alive forever
+        // (~15 GB anon memory leak per stress iter, verified iter-10c).
+        spiller.set_registry(Arc::clone(&registry));
+
         // 7. Stub-family registration: register `StubGemma4Spill`
         //    for the operator-supplied --model (if any). The stub
         //    returns Skipped on every snapshot/restore call (per
@@ -3467,6 +3477,19 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             maybe_print_serve_banner(engine.info(), &mut stdout, stdout_is_tty, quiet)
                 .context("print serve load banner")?;
         }
+        // ADR-017 Closure iter-10 (2026-05-05): drop the banner-only
+        // Engine clone NOW. Without this, the clone (an `Arc<EngineInner>`
+        // ref) lived for the entire `rt.block_on` async block — i.e. the
+        // whole server lifetime — which kept the canonical model's
+        // `EngineInner` alive even after the pool's LRU eviction dropped
+        // the manager's `Arc<LoadedEngine>`. The worker thread + its
+        // `LoadedModel` (multi-GB MlxModelWeights) never released, leaking
+        // ~15 GB of anon memory per stress iter (verified iter-10c stress
+        // smoke: cache_dir=13.9 GB but RSS=42 GB; the canonical engine
+        // wasn't being freed by eviction). Banner only needed `info()`
+        // which is a `&LoadInfo` borrow — we don't need the engine
+        // afterwards.
+        drop(startup_engine_for_banner);
         eprintln!("hf2q serving on http://{}", bind);
 
         // Iter-209: warmup ran SYNCHRONOUSLY at pre-warm time (when
