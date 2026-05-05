@@ -249,6 +249,27 @@ fn process_job(store: &DiskBlockStore, job: WriteJob, pending: &Arc<AtomicUsize>
         // as "caller didn't care".
         let _ = tx.try_send(result);
     }
+    // ADR-017 §R-F5 (closure iter-11 2026-05-05): enforce on-disk
+    // cache budget after every successful write. Pre-iter-11 the
+    // `set_budget_bytes(N)` plumbing was wired but `evict_lru_until_under_budget`
+    // had no production caller — the cache grew unbounded. We now
+    // call it post-write with `|_| false` (pin nothing): the LRU sort
+    // is by mtime so the just-written block is at the END of the
+    // eviction queue, never the head. Eviction is best-effort — an
+    // I/O error is logged but does NOT fail the write (the caller's
+    // block already landed; budget is a soft cap).
+    //
+    // Phase A.3+ pin-set wiring is left for future iter when the
+    // engine surfaces "blocks I'd want to restore from after a
+    // crash" — until then, LRU-by-mtime is a sound approximation
+    // (recently-spilled blocks are most likely to be hot).
+    if let Err(e) = store.evict_lru_until_under_budget(|_| false) {
+        tracing::warn!(
+            target: "hf2q::kv_persist::writer",
+            error = %e,
+            "kv_persist writer: post-write budget eviction failed; continuing"
+        );
+    }
     // ADR-017 iter-16 — pending-depth bookkeeping. Decrement AFTER the
     // write + completion-ack so a probe taken between dequeue and
     // ack-fire still observes the job as pending. `saturating_sub`

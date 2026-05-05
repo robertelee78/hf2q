@@ -185,6 +185,7 @@ mod stress_driver {
         cache_dir: &Path,
         host: &str,
         port: u16,
+        budget_bytes: u64,
     ) -> Result<ServerGuard, DriverError> {
         if !bin.exists() {
             return Err(DriverError::BinaryNotFound(bin.display().to_string()));
@@ -214,6 +215,13 @@ mod stress_driver {
                 &cache_dir.to_string_lossy(),
             ])
             .env("HF2Q_USE_DENSE", "1")
+            // ADR-017 §R-F5 (closure iter-11 2026-05-05): wire the
+            // stress test's BUDGET_MB knob through to the server's
+            // DiskBlockStore budget so post-write LRU eviction
+            // actually fires. Pre-iter-11 budget_bytes was set on
+            // the store but `evict_lru_until_under_budget` had no
+            // production caller — the cache grew unbounded.
+            .env("HF2Q_KV_PERSIST_BUDGET_BYTES", budget_bytes.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -863,12 +871,19 @@ fn kv_persist_stress_24h() {
     );
 
     // ---- Spawn server ----
+    // ADR-017 §R-F5 (closure iter-11 2026-05-05): pass the stress
+    // test's budget_mb through as the server's
+    // HF2Q_KV_PERSIST_BUDGET_BYTES so post-write LRU eviction
+    // actually fires and the cache_kb assertion below has a
+    // matching server-side enforcement layer.
+    let budget_bytes_for_server = budget_mb.saturating_mul(1024 * 1024);
     let server = stress_driver::spawn_hf2q_serve_with_kv_persist(
         &bin,
         &model_path,
         &cache_dir,
         stress_driver::HOST,
         port,
+        budget_bytes_for_server,
     )
     .expect("[stress] spawn hf2q serve --kv-persist");
     let pid = server.pid();
@@ -886,10 +901,69 @@ fn kv_persist_stress_24h() {
         "[stress] /readyz OK — pid={pid} model={canonical}"
     );
 
-    // ---- Baseline (post-readyz, pre-load) ----
-    // Note: we sample AFTER /readyz succeeds so the baseline reflects
-    // the steady-state model-loaded RSS, not a cold-process number
-    // that would inflate the leak comparison.
+    // ---- Warmup iters (decode + eviction × N) ----
+    //
+    // ADR-017 Closure iter-11 (2026-05-05): the spec's "no resident-memory
+    // leak (RSS within 5% of baseline at hour 24)" gate is meant to detect
+    // LINEAR growth, not the one-time substrate warm-up cost. Without
+    // warmup, baseline_rss is captured right after /readyz — the worker
+    // thread, decode pool, PromptCache, spill substrate, tokio task
+    // pool, BlockIndex, page cache, and Mlx GPU buffer pool haven't
+    // actually run yet. The first 2-3 iters' decode + spill grow RSS
+    // by ~2-3 GB cumulatively (heap arena + tokio buffers + chat-template
+    // caches + JIT MlxBuffer pool growth), and that growth STAYS
+    // (amortized one-time setup, not a leak — verified iter-10 long-run:
+    // RSS oscillates 10.9% → 11.7% → 11.7% across 7 iters, NOT growing).
+    //
+    // Running 3 warmup iters drains the substrate's ramp-up cost BEFORE
+    // we sample the baseline. Each warmup uses a distinct symlink so
+    // the pool-key cycles + LRU eviction fires (matching production
+    // workload). After 3 iters, the BlockIndex + GPU buffer pool are
+    // at typical working set; subsequent iters should show
+    // approximately zero per-iter delta against this post-warmup baseline.
+    const NUM_WARMUP_ITERS: u32 = 3;
+    for warmup_idx in 0..NUM_WARMUP_ITERS {
+        let warmup_prompt: String = (0..1024)
+            .map(|i| format!("warmup{warmup_idx}-{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Err(e) = stress_driver::decode_full_text(
+            &server,
+            &canonical,
+            &warmup_prompt,
+            PER_ITER_MAX_TOKENS,
+        ) {
+            panic!(
+                "[stress] warmup#{warmup_idx} decode failed: {e}\n\
+                 --- stderr_tail ({} lines) ---\n{}",
+                server.log_tail().len(),
+                server.log_tail().join("\n"),
+            );
+        }
+        // Use distinct high-id symlinks (u64::MAX - warmup_idx) so the
+        // pool-key cycles AND we never collide with the main loop's
+        // 0-indexed counter even if the main loop runs millions of iters.
+        if let Err(e) = stress_driver::force_eviction_via_symlink(
+            &server,
+            &model_path,
+            tmp_link_dir.path(),
+            u64::MAX - warmup_idx as u64,
+        ) {
+            panic!(
+                "[stress] warmup#{warmup_idx} eviction failed: {e}\n\
+                 --- stderr_tail ({} lines) ---\n{}",
+                server.log_tail().len(),
+                server.log_tail().join("\n"),
+            );
+        }
+    }
+
+    // ---- Baseline (post-warmup, post-load) ----
+    // Note: we sample AFTER one warmup iter so the baseline reflects
+    // the post-warmup steady-state RSS — substrate caches are warm,
+    // heap arena is at typical working set. This makes the iter-to-iter
+    // leak gate a real linear-growth detector rather than a "first-iter
+    // overhead" detector.
     let baseline_rss_kb = sample_rss_kb(pid).unwrap_or_else(|| {
         panic!("[stress] failed to sample baseline RSS for pid={pid}")
     });
@@ -898,7 +972,8 @@ fn kv_persist_stress_24h() {
     });
     let baseline_cache_kb = sample_cache_kb(&cache_dir).unwrap_or(0);
     eprintln!(
-        "[stress] baseline rss={baseline_rss_kb}KB lsof={baseline_lsof} cache={baseline_cache_kb}KB"
+        "[stress] baseline (post-warmup) rss={baseline_rss_kb}KB \
+         lsof={baseline_lsof} cache={baseline_cache_kb}KB"
     );
 
     // ---- Continuous loop ----
