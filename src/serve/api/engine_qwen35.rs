@@ -100,6 +100,39 @@ pub struct Qwen35LoadedModel {
     /// Owned by the worker thread (single-writer through `LoadedModel`),
     /// so no synchronization is needed.
     pub prompt_cache: HybridPromptCache,
+    /// ADR-017 Phase B-hybrid.1 (LCP partial-prefill resume for Qwen
+    /// 3.5/3.6) — observability foundation. Mirrors the
+    /// `GemmaLoadedModel::lcp_registry` field at engine.rs:1102, but
+    /// stores `HybridKvCacheSnapshot` (full-attn K/V + DeltaNet
+    /// conv_state + recurrent state) instead of `Vec<Arc<DenseKvBuffers>>`.
+    ///
+    /// **Iter B.1 scope (this commit)**: probe-only observability — the
+    /// engine probe runs after `HybridPromptCache::try_match` miss and
+    /// records `hf2q_kv_lcp_lookups_total` + `hf2q_kv_lcp_detected_total`
+    /// for Qwen35 requests. The probe ALWAYS returns None (no resume)
+    /// because hybrid SSM-state resume requires sparse mid-prefill
+    /// checkpoints, which is iter B.2 scope (per dossier
+    /// `docs/research/adr017-iter36-phaseB-architecture-2026-05-05.md`
+    /// Appendix D.2 — chunk-aligned DeltaNet checkpoints + chunked
+    /// prefill flow).
+    ///
+    /// **Iter B.2 scope (next iter)**: replace the marker payload with
+    /// a real `HybridKvCacheCheckpoint` carrying per-chunk-boundary
+    /// snapshots; engine resume gate restores at K_aligned and slices
+    /// tokens to [K_aligned..N) before calling forward_gpu_impl.
+    ///
+    /// Capacity = 1 — same as Gemma's lcp_registry. /cfa Phase 2
+    /// fan-out gets the speedup once B.2 ships; multi-turn chat too.
+    pub lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry<
+        crate::inference::models::qwen35::kv_cache::HybridKvCacheSnapshot,
+    >,
+    /// ADR-017 Phase B-hybrid.1 — handle to the AppState-owned
+    /// `KvSpillCounters` so per-request LCP probes from the Qwen35
+    /// worker thread bump the same Arc the `/metrics` handler reads.
+    /// Wired by `LoadedModel::generate*` calls. `None` when the engine
+    /// is constructed standalone (test paths).
+    pub kv_metrics_sink:
+        Option<std::sync::Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>>,
 }
 
 impl Qwen35LoadedModel {
@@ -275,6 +308,15 @@ impl Qwen35LoadedModel {
             load_duration,
             provenance,
             prompt_cache: HybridPromptCache::new(),
+            // ADR-017 Phase B-hybrid.1: per-process LCP registry,
+            // capacity=1 (mirror Gemma). Iter B.1 stores observability
+            // markers; iter B.2 will store HybridKvCacheCheckpoint
+            // payloads for partial-prefill resume.
+            lcp_registry:
+                crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
+            // Wired by AppState via LoadedModel::generate at request
+            // time; None by default.
+            kv_metrics_sink: None,
         })
     }
 }
@@ -614,6 +656,47 @@ fn sample_logits_qwen35(
     sampler_pure::sample_token(logits, &sp, generated)
 }
 
+/// ADR-017 Phase B-hybrid.1 — build the LcpKey for a Qwen35 request.
+///
+/// Mirrors `engine::build_lcp_key_for_request` (the Gemma version)
+/// at engine.rs:3742 with the same provenance / fingerprint logic.
+/// Tenant + params hash empty for v1 — same scope as Gemma's iter-2.
+fn build_lcp_key_for_qwen35(
+    qwen: &Qwen35LoadedModel,
+    _params: &SamplingParams,
+) -> crate::serve::kv_persist::lcp_registry::LcpKey {
+    use crate::serve::kv_persist::format::compute_model_fingerprint;
+    let (producer_version, source_sha256) = match &qwen.provenance {
+        crate::serve::provenance::Provenance::Hf2q {
+            producer_version,
+            source_sha256,
+            ..
+        } => (producer_version.as_str(), source_sha256.as_str()),
+        crate::serve::provenance::Provenance::External => ("", ""),
+    };
+    let chat_template_hash = match &qwen.provenance {
+        crate::serve::provenance::Provenance::Hf2q { .. } => {
+            super::kv_spill_descriptor::KvSpillProvenance::hash_chat_template(
+                &qwen.chat_template,
+            )
+        }
+        crate::serve::provenance::Provenance::External => String::new(),
+    };
+    let quant = qwen.quant_type.as_deref().unwrap_or("");
+    let fp = compute_model_fingerprint(
+        &qwen.model_id,
+        quant,
+        producer_version,
+        source_sha256,
+        &chat_template_hash,
+    );
+    crate::serve::kv_persist::lcp_registry::LcpKey {
+        model_fingerprint: fp,
+        tenant_id: String::new(),
+        params_hash: 0,
+    }
+}
+
 /// `true` when the running text ends with any of the registered stop
 /// strings.  Mirrors `engine::hit_stop_string` (kept private to that
 /// module for Gemma; replicated here so the Qwen35 path stays
@@ -694,6 +777,38 @@ pub fn generate_qwen35_once(
         .prompt_cache
         .try_match(prompt_tokens, params)
         .is_some();
+
+    // ── ADR-017 Phase B-hybrid.1 — LCP partial-prefix observability ──
+    //
+    // Mirrors Gemma's iter-2 probe at `engine.rs:3838-3940` but only
+    // runs when the HybridPromptCache full-equality check missed
+    // (matching the Gemma probe placement, post-PromptCache lookup).
+    //
+    // Iter B.1 scope (this commit): probe RUNS, increments
+    // `lcp_lookups_total` and `lcp_detected_total` for Qwen35
+    // requests. The `take_prefix` and `forward_gpu_with_resume`
+    // resume path is NOT YET WIRED — iter B.2 lands the chunk-aligned
+    // checkpoint storage + restore path.
+    //
+    // Skip multimodal: Qwen35 path doesn't currently expose
+    // SoftTokenInjection at `generate_qwen35_once` (the soft-token
+    // variant lives at `generate_qwen35_once_with_soft_tokens` line
+    // 907; this site is text-only by construction).
+    if !prompt_cache_hit {
+        let lcp_key = build_lcp_key_for_qwen35(qwen, params);
+        let detected = crate::serve::kv_persist::lcp_registry::probe_lcp_opportunity(
+            &mut qwen.lcp_registry,
+            &lcp_key,
+            prompt_tokens,
+            false, // is_multimodal: text-only path
+        );
+        if let Some(sink) = qwen.kv_metrics_sink.as_ref() {
+            sink.record_lcp_probe(detected);
+        }
+        // Iter B.2 will install cached HybridKvCacheCheckpoint here on
+        // a non-trivial detection AND env-gated; iter B.1 reports only.
+        let _ = detected;
+    }
 
     let prefill_start = Instant::now();
     let mut next_token: u32;
@@ -1485,6 +1600,24 @@ pub fn generate_stream_qwen35_once_extended(
             .prompt_cache
             .try_match(prompt_tokens, params)
             .is_some();
+
+    // ADR-017 Phase B-hybrid.1 — streaming-path LCP observability
+    // probe (mirrors non-streaming probe in `generate_qwen35_once`).
+    // Skip on multimodal / extension paths (has_extension true) and
+    // on prompt_cache hits.
+    if !prompt_cache_hit && !has_extension {
+        let lcp_key = build_lcp_key_for_qwen35(qwen, params);
+        let detected = crate::serve::kv_persist::lcp_registry::probe_lcp_opportunity(
+            &mut qwen.lcp_registry,
+            &lcp_key,
+            prompt_tokens,
+            false,
+        );
+        if let Some(sink) = qwen.kv_metrics_sink.as_ref() {
+            sink.record_lcp_probe(detected);
+        }
+        let _ = detected;
+    }
 
     let prefill_start = Instant::now();
     let mut next_token: u32;

@@ -8701,6 +8701,9 @@ assistant:
             load_duration: Duration::from_millis(7),
             provenance: crate::serve::provenance::Provenance::External,
             prompt_cache: super::super::engine_qwen35::HybridPromptCache::new(),
+            lcp_registry:
+                crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
+            kv_metrics_sink: None,
         };
         let qwen = LoadedModel::Qwen35(qwen_loaded);
 

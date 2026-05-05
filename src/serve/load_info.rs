@@ -1321,6 +1321,9 @@ mod tests {
             load_duration: Duration::from_millis(7),
             provenance: Provenance::External,
             prompt_cache: HybridPromptCache::new(),
+            lcp_registry:
+                crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
+            kv_metrics_sink: None,
         };
         let info = loaded.build_load_info(
             &gguf,

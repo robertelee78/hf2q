@@ -2616,9 +2616,21 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
     // worker. Qwen35 / Qwen3VlText variants don't yet have an LCP
     // probe site (their worker arm returns 501 before any prefill);
     // skip them. None on the EngineConfig ⇒ no-op (test path).
+    //
+    // ADR-017 Phase B-hybrid.1: Qwen35 ALSO gains kv_metrics_sink so
+    // its probe (added in this iter) can record `lcp_lookups_total`
+    // and `lcp_detected_total` on the SHARED `KvSpillCounters` Arc.
     if let Some(sink) = config.kv_metrics_sink.as_ref() {
-        if let api::engine::LoadedModel::Gemma(g) = &mut loaded {
-            g.kv_metrics_sink = Some(std::sync::Arc::clone(sink));
+        match &mut loaded {
+            api::engine::LoadedModel::Gemma(g) => {
+                g.kv_metrics_sink = Some(std::sync::Arc::clone(sink));
+            }
+            api::engine::LoadedModel::Qwen35(q) => {
+                q.kv_metrics_sink = Some(std::sync::Arc::clone(sink));
+            }
+            api::engine::LoadedModel::Qwen3VlText(_) => {
+                // Qwen3VlText path doesn't have an LCP probe yet.
+            }
         }
     }
     let engine = api::engine::Engine::spawn(loaded, config.queue_capacity, None);
