@@ -276,6 +276,25 @@ pub struct InvestigationEnv {
     /// Original parse: `std::env::var("HF2Q_USE_DENSE").as_deref() == Ok("1")`.
     pub use_dense: bool,
 
+    /// `HF2Q_KV_LCP_RESUME=1` — enable ADR-017 Phase E option (a) iter-3
+    /// LCP partial-prefill resume. Default OFF. When ON + the engine's
+    /// LcpRegistry lookup returns `Some(k)` + multimodal bail passes
+    /// (`soft_tokens.is_empty()`) + capacity precondition holds (cached
+    /// linear_capacity ≥ new request's seq_len + max_decode_tokens) +
+    /// `HF2Q_USE_DENSE=1` is also set (TQ-packed kv_caches not safely
+    /// resumable without separate restoration), the request bypasses
+    /// the wholesale `cache.write_pos = 0` reset at
+    /// `forward_prefill.rs:445-448` and resumes from token K — reusing
+    /// the cached `dense_kvs[*][0..K)` in place.
+    ///
+    /// Iter-3 is the highest-risk Phase E.a iter (per dossier §4.3
+    /// `docs/research/adr017-phase-e-option-a-2026-05-05.md`); this gate
+    /// makes the new code path opt-in until R-C4-LCP byte-identity at
+    /// 5 K fractions (iter-5) and R-P7 multi-turn-chat speedup
+    /// (iter-6) gates pass. Promotion to default-ON is a separate
+    /// future iter; until then operators set this explicitly.
+    pub kv_lcp_resume: bool,
+
     /// `HF2Q_LAYER_POLICY` — per-layer SDPA policy selector.
     ///   - "dense_all": all layers dense.
     ///   - "tq_all" / unset: all layers TQ (default).
@@ -466,6 +485,11 @@ impl InvestigationEnv {
             // SDPA regime selectors.
             use_dense: matches!(env::var("HF2Q_USE_DENSE").as_deref(), Ok("1")),
             layer_policy: env::var("HF2Q_LAYER_POLICY").ok(),
+
+            // ADR-017 Phase E option (a) iter-3 — LCP partial-prefill
+            // resume. Default OFF. See struct field doc for full
+            // contract.
+            kv_lcp_resume: env_eq_one("HF2Q_KV_LCP_RESUME"),
 
             // Gate H release-check plumbing (ADR-007 §853-866; iter-108a).
             emit_nll: env_eq_one("HF2Q_EMIT_NLL"),

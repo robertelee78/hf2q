@@ -363,9 +363,102 @@ impl MlxModelWeights {
         max_decode_tokens: usize,
         gpu: &mut GpuContext,
     ) -> Result<u32> {
+        // ADR-017 Phase E.a iter-3: thin wrapper. Pre-iter-3 callers
+        // (warmup, generate, embed_last, generate_stream_once) keep
+        // the 4-arg shape; the engine's Phase E.a probe site calls the
+        // explicit `_resume` variant when iter-3's gate fires.
+        self.forward_prefill_with_soft_tokens_resume(
+            prompt_tokens,
+            soft_tokens,
+            max_decode_tokens,
+            gpu,
+            None, // restored_lcp = None → wholesale reset, fresh dense_kvs
+        )
+    }
+
+    /// ADR-017 Phase E option (a) iter-3 — partial-prefill resume entry
+    /// point.
+    ///
+    /// `restored_lcp = None` is byte-identical to the pre-iter-3
+    /// `forward_prefill_with_soft_tokens` (wholesale `cache.write_pos =
+    /// 0` reset + fresh `dense_kvs` allocation + per-token loop from 0).
+    ///
+    /// `restored_lcp = Some(k)` resumes from token `k`:
+    ///   * `cache.write_pos` for full-attention layers is set to `k`;
+    ///     for sliding layers, `k % sliding_window`.
+    ///   * `cache.seq_len` is set to `min(k, capacity)` per layer.
+    ///   * `self.dense_kvs` MUST be populated by the caller with the
+    ///     cached per-layer `Arc<DenseKvBuffers>` clones from the
+    ///     `LcpRegistry` BEFORE this call. This function takes
+    ///     ownership via `Arc::try_unwrap`; the load-bearing precondition
+    ///     is `Arc::strong_count == 1` for every layer (the engine's
+    ///     `take_prefix` semantics produce that state).
+    ///   * Per-token loop iterates `[k..seq_len)` only — the cached
+    ///     bytes for `[0..k)` are reused in place via the GPU kernel
+    ///     reading through the existing buffer.
+    ///
+    /// # Preconditions for `restored_lcp = Some(k)`
+    ///
+    ///   * `0 < k < seq_len` (caller ensures via `LcpRegistry`'s
+    ///     full-equality + zero-overlap gates).
+    ///   * `self.dense_kvs.is_some()` (caller installed cached state).
+    ///   * Per-layer `dense_kvs[layer].capacity >= required_capacity`
+    ///     where required = `seq_len + max_decode_tokens` for global,
+    ///     `sliding_window` for sliding (caller checks; this function
+    ///     defensively bails on violation rather than silently
+    ///     corrupting state).
+    ///   * Per-layer `Arc::strong_count(&dense_kvs[layer]) == 1`
+    ///     (caller's `take_prefix` semantics ensure this; defensive
+    ///     bail on violation).
+    ///   * `soft_tokens.is_empty()` (multimodal LCP support is
+    ///     deferred to Phase E.a v2 per dossier §10.5; the engine's
+    ///     `probe_lcp_opportunity` enforces this upstream).
+    ///
+    /// # Errors
+    ///
+    /// In addition to the base `forward_prefill_with_soft_tokens`
+    /// error set, restored mode adds:
+    ///   * `restored_lcp = Some(k)` but `self.dense_kvs.is_none()`.
+    ///   * `restored_lcp = Some(k)` with `k == 0` or `k >= seq_len`.
+    ///   * Per-layer `Arc` not exclusive (`Arc::try_unwrap` failed).
+    ///   * Per-layer cached capacity < required.
+    ///   * `restored_lcp = Some(k)` with non-empty `soft_tokens`.
+    pub fn forward_prefill_with_soft_tokens_resume(
+        &mut self,
+        prompt_tokens: &[u32],
+        soft_tokens: &[SoftTokenInjection<'_>],
+        max_decode_tokens: usize,
+        gpu: &mut GpuContext,
+        restored_lcp: Option<usize>,
+    ) -> Result<u32> {
         let seq_len = prompt_tokens.len();
         if seq_len == 0 {
             anyhow::bail!("forward_prefill: empty prompt");
+        }
+        // ADR-017 Phase E.a iter-3 preconditions (validated upfront so
+        // we fail before touching any GPU state).
+        if let Some(k) = restored_lcp {
+            if k == 0 || k >= seq_len {
+                anyhow::bail!(
+                    "forward_prefill: restored_lcp={} out of range (must be 0 < k < seq_len={})",
+                    k,
+                    seq_len
+                );
+            }
+            if !soft_tokens.is_empty() {
+                anyhow::bail!(
+                    "forward_prefill: restored_lcp=Some(_) with non-empty soft_tokens \
+                     ({} ranges) — multimodal LCP is Phase E.a v2 scope",
+                    soft_tokens.len()
+                );
+            }
+            if self.dense_kvs.is_none() {
+                anyhow::bail!(
+                    "forward_prefill: restored_lcp=Some({}) but self.dense_kvs is None — \
+                     caller must install cached `Vec<Arc<DenseKvBuffers>>` BEFORE this call",
+                    k
+                );
+            }
         }
         let hs = self.hidden_size;
         // Validate soft-token ranges + embedding sizes upfront so we
@@ -440,11 +533,36 @@ impl MlxModelWeights {
         // OpenAI `/v1/chat/completions` and `/v1/embeddings` request is
         // semantically independent (multi-turn chat is handled by the client
         // sending full history), so wholesale reset is the correct semantics.
-        // When prompt-cache lands (Phase 2a Task #7) it'll need to revisit
-        // this and reset only positions past the cached prefix length.
-        for cache in self.kv_caches.iter_mut() {
-            cache.write_pos = 0;
-            cache.seq_len = 0;
+        //
+        // ADR-017 Phase E option (a) iter-3 (`restored_lcp = Some(k)`):
+        // instead of wholesale reset, position the per-layer
+        // `kv_caches` bookkeeping at `k` so the per-token loop below
+        // resumes at token `k` and writes new positions `[k..seq_len)`
+        // into the cached buffers in place. Full-attention layers use
+        // linear `write_pos = k`; sliding layers use `write_pos =
+        // k % sliding_window` (the ring's "next slot" pointer when
+        // `k` tokens have already been written) and `seq_len =
+        // min(k, sliding_window)` (the kernel's "valid populated
+        // slots" count, capped by the ring capacity).
+        match restored_lcp {
+            None => {
+                for cache in self.kv_caches.iter_mut() {
+                    cache.write_pos = 0;
+                    cache.seq_len = 0;
+                }
+            }
+            Some(k) => {
+                for cache in self.kv_caches.iter_mut() {
+                    if cache.is_sliding {
+                        let sw = cache.capacity.max(1);
+                        cache.write_pos = k % sw;
+                        cache.seq_len = k.min(sw);
+                    } else {
+                        cache.write_pos = k;
+                        cache.seq_len = k;
+                    }
+                }
+            }
         }
 
         let (exec, reg) = gpu.split();
@@ -491,19 +609,106 @@ impl MlxModelWeights {
         // Gemma-4 26B (8×1024×256 per layer vs 8×20022×256).
         let linear_capacity = seq_len + max_decode_tokens;
         let sw = self.sliding_window;
-        let mut dense_kvs_vec: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let nkv = layer.num_kv_heads;
-            let hd = layer.head_dim;
-            let layer_is_ring = layer.layer_type == LayerType::Sliding;
-            let capacity = if layer_is_ring { sw } else { linear_capacity };
-            let n = nkv * capacity * hd;
-            let k = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
-                .map_err(|e| anyhow::anyhow!("prefill dense K L{layer_idx}: {e}"))?;
-            let v = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
-                .map_err(|e| anyhow::anyhow!("prefill dense V L{layer_idx}: {e}"))?;
-            dense_kvs_vec.push(DenseKvBuffers { k, v, capacity, is_sliding: layer_is_ring });
-        }
+        // ADR-017 Phase E.a iter-3: dense_kvs_vec source branches on
+        // restored_lcp.
+        //
+        //   * `None` — pre-iter-3 path: allocate fresh per-layer
+        //     buffers sized for this request's seq_len+max_decode.
+        //   * `Some(_)` — caller installed cached `Vec<Arc<DenseKvBuffers>>`
+        //     into `self.dense_kvs` BEFORE calling. We `take` ownership
+        //     of those Arcs and unwrap each via `Arc::try_unwrap` so the
+        //     per-token loop can mutate the buffers in place. The
+        //     load-bearing precondition is `Arc::strong_count == 1`
+        //     (the engine's `LcpRegistry::take_prefix` produces this
+        //     state); on violation we bail with a clear error rather
+        //     than fall back to fresh-alloc, because falling back would
+        //     silently waste the cache hit and leak the cached Arc
+        //     refcount.
+        // Note on mutability: kernel writes to dense_kvs_vec[i].k/.v go
+        // through GPU-side buffer mutation (StorageModeShared), not Rust
+        // `&mut` borrows, so the binding stays immutable here.
+        let dense_kvs_vec: Vec<DenseKvBuffers> = match restored_lcp {
+            None => {
+                // Pre-iter-3 fresh-alloc path (byte-identical to the
+                // pre-iter-3 `forward_prefill_with_soft_tokens` body).
+                let mut v: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
+                for (layer_idx, layer) in self.layers.iter().enumerate() {
+                    let nkv = layer.num_kv_heads;
+                    let hd = layer.head_dim;
+                    let layer_is_ring = layer.layer_type == LayerType::Sliding;
+                    let capacity = if layer_is_ring { sw } else { linear_capacity };
+                    let n = nkv * capacity * hd;
+                    let kbuf = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
+                        .map_err(|e| anyhow::anyhow!("prefill dense K L{layer_idx}: {e}"))?;
+                    let vbuf = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
+                        .map_err(|e| anyhow::anyhow!("prefill dense V L{layer_idx}: {e}"))?;
+                    v.push(DenseKvBuffers { k: kbuf, v: vbuf, capacity, is_sliding: layer_is_ring });
+                }
+                v
+            }
+            Some(k_resume) => {
+                // Take cached Arcs out of self.dense_kvs and unwrap
+                // each. Defensive validations:
+                //   (1) Vec length matches num_layers.
+                //   (2) Per-layer capacity satisfies the new request.
+                //   (3) Per-layer Arc strong_count == 1 (try_unwrap
+                //       succeeds).
+                let cached_arcs = self.dense_kvs.take().expect(
+                    "restored_lcp=Some precondition: self.dense_kvs is Some (validated above)",
+                );
+                if cached_arcs.len() != num_layers {
+                    anyhow::bail!(
+                        "forward_prefill resume: cached dense_kvs len {} != num_layers {}",
+                        cached_arcs.len(),
+                        num_layers
+                    );
+                }
+                let mut v: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
+                for (layer_idx, layer) in self.layers.iter().enumerate() {
+                    let layer_is_ring = layer.layer_type == LayerType::Sliding;
+                    let required_cap = if layer_is_ring { sw } else { linear_capacity };
+                    let cached_arc = cached_arcs.get(layer_idx).cloned().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "forward_prefill resume: missing cached dense_kvs[layer={}]",
+                            layer_idx
+                        )
+                    })?;
+                    // Capacity precondition (zero_copy_only policy v1
+                    // — dossier §10.2 C1 case).
+                    let cached_cap = cached_arc.capacity;
+                    if cached_cap < required_cap {
+                        anyhow::bail!(
+                            "forward_prefill resume: cached dense_kvs[layer={}] capacity {} < required {} \
+                             (k_resume={}, sw={}, linear_capacity={})",
+                            layer_idx,
+                            cached_cap,
+                            required_cap,
+                            k_resume,
+                            sw,
+                            linear_capacity
+                        );
+                    }
+                    if cached_arc.is_sliding != layer_is_ring {
+                        anyhow::bail!(
+                            "forward_prefill resume: cached dense_kvs[layer={}] is_sliding={} \
+                             != model layer is_sliding={} (model architecture mismatch)",
+                            layer_idx,
+                            cached_arc.is_sliding,
+                            layer_is_ring
+                        );
+                    }
+                    let owned = std::sync::Arc::try_unwrap(cached_arc).map_err(|_arc| {
+                        anyhow::anyhow!(
+                            "forward_prefill resume: cached dense_kvs[layer={}] Arc not exclusive \
+                             (strong_count > 1) — engine's `take_prefix` precondition violated",
+                            layer_idx
+                        )
+                    })?;
+                    v.push(owned);
+                }
+                v
+            }
+        };
 
         // Tmp buffer for flash_attn_vec (sized for largest layer config)
         let max_nh = self.num_attention_heads;
@@ -611,10 +816,20 @@ impl MlxModelWeights {
         // ===================================================================
         // Process each prompt token through all layers
         // ===================================================================
+        //
+        // ADR-017 Phase E.a iter-3: when `restored_lcp = Some(k)`, skip
+        // tokens `[0..k)` because their KV state is already populated
+        // from the cached `dense_kvs[*]` and the per-layer `kv_caches`
+        // bookkeeping was set to k above. The `tok_i` index passed to
+        // the kernel still equals the true sequence position (so RoPE
+        // gets the correct position) — `enumerate()` over the unsliced
+        // iterator yields `(0, t0), (1, t1), ...` and `.skip(k)`
+        // forwards the iterator to `(k, tk), (k+1, tk+1), ...`.
         let prefill_start = Instant::now();
         let mut last_token = 0u32;
+        let resume_k = restored_lcp.unwrap_or(0);
 
-        for (tok_i, &tok) in prompt_tokens.iter().enumerate() {
+        for (tok_i, &tok) in prompt_tokens.iter().enumerate().skip(resume_k) {
             let seq_pos = tok_i;
 
             // Write position buffer

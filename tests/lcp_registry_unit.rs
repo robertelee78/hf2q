@@ -472,3 +472,122 @@ fn probe_lcp_opportunity_returns_lcp_k_on_partial_match() {
         "zero-overlap prompt must yield None — no resume opportunity"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Iter-3 — `take_prefix` consuming-lookup tests.
+//
+// These pin the contract that take_prefix removes the entry on hit
+// (so caller becomes sole Arc holder, ready for in-place mutation
+// during partial-prefill resume) and is a no-op on miss.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn take_prefix_returns_same_k_as_lookup_on_hit() {
+    // Iter-3 contract: take_prefix is a consuming variant; on hit it
+    // returns the SAME LcpPrefix shape as lookup.
+    let mut reg: LcpRegistry<Vec<u8>> = LcpRegistry::new(8);
+    let k = key(0xCC, "tenant", 7);
+    let cached: Vec<u32> = (1..=20).collect();
+    let pl = payload(2, 0xAB);
+    reg.store(k.clone(), cached.clone(), pl, 4096, 4096)
+        .expect("store");
+
+    // Diverging suffix at position 12.
+    let new_prompt: Vec<u32> = (1..=12).chain([900u32, 901].iter().copied()).collect();
+    let prefix = reg
+        .take_prefix(&k, &new_prompt)
+        .expect("take_prefix must hit on partial overlap");
+    assert_eq!(prefix.k, 12, "K must equal lookup's K");
+    assert_eq!(prefix.dense_kvs.len(), 2, "per-layer payload preserved");
+}
+
+#[test]
+fn take_prefix_removes_entry_so_subsequent_take_misses() {
+    // Iter-3 contract: after take_prefix succeeds, the entry is gone
+    // from the registry. A second take with the same prompt must miss.
+    let mut reg: LcpRegistry<Vec<u8>> = LcpRegistry::new(8);
+    let k = key(0xDD, "tenant", 7);
+    let cached: Vec<u32> = (1..=10).collect();
+    let pl = payload(2, 0xCD);
+    reg.store(k.clone(), cached.clone(), pl, 4096, 4096)
+        .expect("store");
+
+    let new_prompt: Vec<u32> = (1..=8).chain([999u32].iter().copied()).collect();
+
+    // First take hits.
+    assert!(
+        reg.take_prefix(&k, &new_prompt).is_some(),
+        "first take_prefix must hit"
+    );
+
+    // Second take on same key + same prompt now misses (entry consumed).
+    assert!(
+        reg.take_prefix(&k, &new_prompt).is_none(),
+        "second take_prefix on same prompt must miss after consume"
+    );
+
+    // Registry size confirms removal.
+    assert_eq!(reg.len(), 0, "registry must be empty after take");
+}
+
+#[test]
+fn take_prefix_no_op_on_miss() {
+    // Iter-3 safety: take_prefix on miss must NOT touch registry state.
+    // Otherwise a probe-and-take sequence on a key that doesn't fit
+    // could spuriously evict an unrelated entry.
+    let mut reg: LcpRegistry<Vec<u8>> = LcpRegistry::new(8);
+    let k_a = key(0xAA, "tenant", 7);
+    let k_b = key(0xBB, "tenant", 7); // different fingerprint
+    reg.store(k_a.clone(), vec![1, 2, 3], payload(2, 0xCD), 4096, 4096)
+        .expect("store a");
+
+    // Try take_prefix with key_b (no entry exists for k_b).
+    let miss = reg.take_prefix(&k_b, &[1, 2, 3]);
+    assert!(miss.is_none(), "take on missing key must be None");
+    assert_eq!(reg.len(), 1, "registry must keep the unrelated entry intact");
+
+    // Sanity: lookup against k_a still hits (entry preserved).
+    let hit = reg.lookup(&k_a, &[1, 2, 999]);
+    assert!(
+        hit.is_some(),
+        "unrelated entry must remain after miss-take on different key"
+    );
+}
+
+#[test]
+fn take_prefix_drops_caller_arc_to_strong_count_one() {
+    // Iter-3 load-bearing invariant: after take_prefix, the per-layer
+    // Arc<T> clones in the returned LcpPrefix have strong_count == 1
+    // (caller is sole holder). This is what enables `Arc::get_mut`
+    // / move-into-weights / in-place mutation during partial-prefill
+    // resume.
+    let mut reg: LcpRegistry<Vec<u8>> = LcpRegistry::new(4);
+    let k = key(0xEE, "tenant", 7);
+    let cached: Vec<u32> = (1..=10).collect();
+
+    // Build payload with our own clone we drop before strong-count check.
+    let pl_orig: Vec<Arc<Vec<u8>>> = (0..3).map(|i| Arc::new(vec![0x77, i as u8])).collect();
+    // Clone to keep originals' counts as registry-side reference only.
+    let pl_for_store: Vec<Arc<Vec<u8>>> = pl_orig.iter().map(Arc::clone).collect();
+    reg.store(k.clone(), cached.clone(), pl_for_store, 4096, 4096)
+        .expect("store");
+
+    // Drop caller's originals so registry holds the only Arc per layer.
+    drop(pl_orig);
+
+    let new_prompt: Vec<u32> = (1..=8).chain([42u32].iter().copied()).collect();
+    let prefix = reg
+        .take_prefix(&k, &new_prompt)
+        .expect("take_prefix must hit");
+
+    // Each per-layer Arc should now have strong_count == 1 (only the
+    // returned prefix holds it; registry dropped its set during take).
+    for (layer_idx, arc) in prefix.dense_kvs.iter().enumerate() {
+        let count = Arc::strong_count(arc);
+        assert_eq!(
+            count, 1,
+            "per-layer Arc after take_prefix must have strong_count=1 (layer {} got {})",
+            layer_idx, count
+        );
+    }
+}

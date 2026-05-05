@@ -327,6 +327,43 @@ where
         Some(result)
     }
 
+    /// ADR-017 Phase E option (a) iter-3 — **consuming variant of
+    /// [`Self::lookup`]**. Returns the same `Option<LcpPrefix<T>>` as
+    /// `lookup` AND removes the entry from the registry on hit so the
+    /// caller becomes the sole holder of the per-layer Arc clones
+    /// (post-take strong_count = 1, ignoring incidental clones).
+    ///
+    /// **Why this exists:** iter-3's partial-prefill resume mutates the
+    /// cached `dense_kvs[*]` buffers in place during the new prefill
+    /// (positions `[K..N')`). Sharing the Arc with the registry while
+    /// the engine is mutating would corrupt future cache hits. The
+    /// consuming take + post-prefill re-store dance gives the engine
+    /// exclusive ownership during prefill and re-publishes a fresh
+    /// snapshot at end-of-decode.
+    ///
+    /// **Distinction from lookup:** iter-2's observability probe MUST
+    /// keep the entry in the registry (multiple sequential probes on
+    /// the same key are valid and load-bearing for `/metrics`'s
+    /// detection-rate gauge). Iter-3's actual restore-and-mutate path
+    /// MUST consume. Two methods, two semantics.
+    ///
+    /// On miss (no entry, zero overlap, full equality, k==N) the
+    /// registry is unchanged.
+    pub fn take_prefix(&mut self, key: &LcpKey, new_tokens: &[u32]) -> Option<LcpPrefix<T>> {
+        // Re-use lookup's hit logic. lookup also promotes to MRU on
+        // hit; that's harmless because we're about to remove the entry
+        // entirely.
+        let prefix = self.lookup(key, new_tokens)?;
+        // Remove from HashMap + lru_order. After this, the only Arc
+        // clones outstanding are the ones we just handed back via
+        // `prefix.dense_kvs`.
+        self.entries.remove(key);
+        if let Some(pos) = self.lru_order.iter().position(|kk| kk == key) {
+            self.lru_order.remove(pos);
+        }
+        Some(prefix)
+    }
+
     /// Drop all entries. Used by tests and by future iter-2 wiring on
     /// model reload (when the registry's cached payloads become
     /// invalid — e.g. weights file changed). The underlying payloads
