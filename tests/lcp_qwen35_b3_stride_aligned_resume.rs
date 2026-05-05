@@ -290,6 +290,16 @@ fn chat_decode_messages(
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| panic!("malformed HTTP status line: {status_line:?}"));
+    if status_code != 200 {
+        // Extract body for diagnostic before panicking.
+        let body_start = buf.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+        let body_str = &buf[body_start..];
+        eprintln!(
+            "[chat_decode_messages] HTTP {} response body (first 500 chars):\n{}",
+            status_code,
+            &body_str[..body_str.len().min(500)]
+        );
+    }
     assert_eq!(
         status_code, 200,
         "[chat_decode_messages] expected HTTP 200, got {status_code}"
@@ -446,6 +456,22 @@ fn phase_b3_stride_aligned_lcp_resume_engagement() {
 
     // Step 4: turn-2 to A — should hit lcp_registry stride-aligned
     // checkpoint, restore, and prefill the suffix from there.
+    // Print server A's stderr-tail just before turn-2 so any 500 below
+    // can be diagnosed against the LCP probe + chunked prefill state.
+    {
+        let pre_turn2_log = server_a.log_tail();
+        eprintln!(
+            "[Phase B.3] server A stderr tail before turn-2 (last 20 lines):\n{}",
+            pre_turn2_log
+                .iter()
+                .rev()
+                .take(20)
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
     let a_turn2 = chat_decode_messages(&server_a, &canonical_a, &turn2_messages, MAX_TOKENS);
     eprintln!(
         "[Phase B.3] server A turn 2 → {} bytes: {:?}",
@@ -516,16 +542,35 @@ fn phase_b3_stride_aligned_lcp_resume_engagement() {
          path didn't run.  HF2Q_KV_LCP_RESUME env didn't propagate."
     );
 
-    // Optional: log whether stride-aligned-hit fired (B.3 resume engagement).
-    // Doesn't assert — depends on turn-1 having stored something AND turn-2's
-    // tokens sharing ≥ stride prefix with turn-1's tokens, which is fixture-
-    // dependent.  When stored entries from turn-1 don't match turn-2's prefix
-    // (typical for the first run where registry was empty before turn-1),
-    // the descending probe correctly reports no match and the engine falls
-    // through to fresh chunked prefill — correctness preserved.
+    // Post-B.5 LOAD-BEARING assertion: stride-aligned hit MUST fire on
+    // turn-2 (turn-1 stored a snapshot at chunk_pos=64, turn-2's tokens
+    // share ≥ 64 prefix with turn-1's tokens at the chat-template-prefix
+    // boundary, descending probe finds the match, restore_partial +
+    // suffix-chunked prefill takes the FA RESUME kernel for chunk-1 of
+    // suffix and produces byte-identical output to monolithic).
     let stride_aligned_hit = a_log
         .iter()
         .any(|l| l.contains("[hf2q qwen35 lcp resume] STRIDE-ALIGNED HIT"));
+    assert!(
+        stride_aligned_hit,
+        "[Phase B.3] FALSIFIED — server A's stderr lacks \
+         `[hf2q qwen35 lcp resume] STRIDE-ALIGNED HIT` line, meaning the \
+         B.3 mid-prefill stride-aligned resume DID NOT FIRE on turn 2.  \
+         Turn-1 stored at chunk_pos=64 (mid-prefill snapshot fired), \
+         turn-2 probe ran (probe_scanned=true), but no descending-stride \
+         match.  Either turn-2's first 64 tokens differ from turn-1's \
+         first 64 (chat-template prefix break earlier than expected) or \
+         the descending probe / take_prefix logic regressed.  Server A \
+         stderr tail (last 30):\n{}",
+        a_log
+            .iter()
+            .rev()
+            .take(30)
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
     eprintln!(
         "[Phase B.3] wiring observability: mid_store_fired={mid_store_fired}, \
          probe_scanned={probe_scanned}, stride_aligned_hit={stride_aligned_hit}"
@@ -533,7 +578,7 @@ fn phase_b3_stride_aligned_lcp_resume_engagement() {
 
     drop(server_a);
 
-    // Step 5: turn-2 to B (control — fresh prefill) for sanity check.
+    // Step 5: turn-2 to B (control — fresh prefill).
     let b_turn2 = chat_decode_messages(&server_b, &canonical_b, &turn2_messages, MAX_TOKENS);
     eprintln!(
         "[Phase B.3] server B turn 2 → {} bytes: {:?}",
@@ -542,11 +587,54 @@ fn phase_b3_stride_aligned_lcp_resume_engagement() {
     );
     assert!(!b_turn2.is_empty(), "[Phase B.3] B turn-2 decoded empty");
 
+    // Post-B.5 BYTE-IDENTITY gate: A's turn-2 (LCP-restored + suffix-
+    // chunked prefill) must byte-equal B's turn-2 (fresh monolithic
+    // prefill).  This proves the entire Phase E.a chain is byte-correct
+    // end-to-end:
+    //   1. Mid-prefill snapshot at chunk_pos=64 captures correct state.
+    //   2. restore_partial restores [0..64] positions to the (different-
+    //      sized) request kv_cache.
+    //   3. Suffix-chunked prefill from chunk_idx=1 uses FA RESUME kernel
+    //      at every subsequent chunk, byte-identical to monolithic
+    //      (B.2-fix kernel parity proved via 0/131072 BF16 elements).
+    //   4. Output greedy decoder produces same first token as monolithic.
+    if a_turn2 != b_turn2 {
+        let common_prefix = a_turn2
+            .as_bytes()
+            .iter()
+            .zip(b_turn2.as_bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let snippet_a = a_turn2
+            .get(common_prefix..common_prefix.saturating_add(120))
+            .unwrap_or("")
+            .to_string();
+        let snippet_b = b_turn2
+            .get(common_prefix..common_prefix.saturating_add(120))
+            .unwrap_or("")
+            .to_string();
+        panic!(
+            "[Phase B.3] FALSIFIED — A turn-2 (B.3 stride-aligned LCP \
+             resume → restore_partial + suffix-chunked prefill) produced \
+             non-byte-identical output to B turn-2 (control monolithic).\n\
+             A len={} bytes, B len={} bytes, diverge at byte={}\n\
+             A @ {}: {:?}\n\
+             B @ {}: {:?}",
+            a_turn2.len(),
+            b_turn2.len(),
+            common_prefix,
+            common_prefix,
+            snippet_a,
+            common_prefix,
+            snippet_b
+        );
+    }
+
     eprintln!(
-        "[Phase B.3] PASS — wiring verified (mid-prefill store fires + probe \
-         scans descending). End-to-end byte-identity gated on B.4 kernel \
-         FA-fast-path-for-seq<16 work. A turn-2 ({} bytes) and B turn-2 ({} \
-         bytes) decoded for diagnostic purposes.",
+        "[Phase B.3] PASS — A turn-2 ({} bytes via STRIDE-ALIGNED LCP \
+         resume + suffix-chunked prefill) == B turn-2 ({} bytes via fresh \
+         monolithic prefill) BYTE-IDENTICAL.  ADR-017 Phase E.a partial-\
+         prefill resume verified end-to-end.",
         a_turn2.len(),
         b_turn2.len()
     );

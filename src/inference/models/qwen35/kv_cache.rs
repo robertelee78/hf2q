@@ -224,6 +224,93 @@ fn deep_copy_buffer(device: &MlxDevice, src: &MlxBuffer) -> Result<MlxBuffer> {
     Ok(dst)
 }
 
+/// ADR-017 Phase E.a B.5 — partial-position copy of full-attn slot
+/// K/V buffers.  Both source and destination have shape
+/// `[n_seqs, n_kv_heads, max_seq_len_*, head_dim]` (rank-4, the
+/// `FullAttnKvSlot::new` layout) with F32 elements; we copy the first
+/// `n_tokens` positions per (seq, head).
+///
+/// The two buffers may have DIFFERENT `max_seq_len` dimensions; the
+/// per-head stride differs accordingly.  All other dimensions
+/// (`n_seqs`, `n_kv_heads`, `head_dim`) MUST match.
+fn partial_copy_slot(
+    src: &MlxBuffer,
+    dst: &mut MlxBuffer,
+    n_tokens: usize,
+    name: &str,
+) -> Result<()> {
+    let src_shape = src.shape();
+    let dst_shape = dst.shape();
+    anyhow::ensure!(
+        src_shape.len() == 4,
+        "partial_copy_slot ({name}): src shape rank {} != 4 (expected \
+         [n_seqs, n_kv_heads, max_seq_len, head_dim])",
+        src_shape.len()
+    );
+    anyhow::ensure!(
+        dst_shape.len() == 4,
+        "partial_copy_slot ({name}): dst shape rank {} != 4 (expected \
+         [n_seqs, n_kv_heads, max_seq_len, head_dim])",
+        dst_shape.len()
+    );
+    let src_n_seqs = src_shape[0];
+    let src_n_kv = src_shape[1];
+    let src_max_seq = src_shape[2];
+    let src_d = src_shape[3];
+    let dst_n_seqs = dst_shape[0];
+    let dst_n_kv = dst_shape[1];
+    let dst_max_seq = dst_shape[2];
+    let dst_d = dst_shape[3];
+    anyhow::ensure!(
+        src_n_seqs == dst_n_seqs && src_n_kv == dst_n_kv && src_d == dst_d,
+        "partial_copy_slot ({name}): non-seq-dim mismatch — \
+         src=[{src_n_seqs}, {src_n_kv}, _, {src_d}] vs \
+         dst=[{dst_n_seqs}, {dst_n_kv}, _, {dst_d}]"
+    );
+    anyhow::ensure!(
+        n_tokens <= src_max_seq && n_tokens <= dst_max_seq,
+        "partial_copy_slot ({name}): n_tokens={n_tokens} exceeds capacity \
+         (src_max_seq={src_max_seq}, dst_max_seq={dst_max_seq})"
+    );
+    if n_tokens == 0 {
+        return Ok(());
+    }
+    let elem_size = src.dtype().size_of();
+    anyhow::ensure!(
+        elem_size == dst.dtype().size_of(),
+        "partial_copy_slot ({name}): dtype size mismatch"
+    );
+    // Innermost (head_dim) is contiguous; per-head positions are
+    // `head_dim` elements at the same stride for both buffers.
+    let head_pos_bytes = src_d * elem_size;
+    let copy_bytes = n_tokens * head_pos_bytes;
+    // Per-head stride: max_seq_len * head_dim * elem_size.
+    let src_head_stride_bytes = src_max_seq * head_pos_bytes;
+    let dst_head_stride_bytes = dst_max_seq * head_pos_bytes;
+    // Per-seq stride: n_kv_heads * max_seq_len * head_dim * elem_size.
+    let src_seq_stride_bytes = src_n_kv * src_head_stride_bytes;
+    let dst_seq_stride_bytes = dst_n_kv * dst_head_stride_bytes;
+
+    let src_bytes: &[u8] = src
+        .as_slice::<u8>()
+        .map_err(|e| anyhow!("partial_copy_slot ({name}) src as_slice: {e}"))?;
+    let dst_bytes: &mut [u8] = dst
+        .as_mut_slice::<u8>()
+        .map_err(|e| anyhow!("partial_copy_slot ({name}) dst as_mut_slice: {e}"))?;
+
+    for seq in 0..src_n_seqs {
+        let src_seq_off = seq * src_seq_stride_bytes;
+        let dst_seq_off = seq * dst_seq_stride_bytes;
+        for head in 0..src_n_kv {
+            let src_off = src_seq_off + head * src_head_stride_bytes;
+            let dst_off = dst_seq_off + head * dst_head_stride_bytes;
+            dst_bytes[dst_off..dst_off + copy_bytes]
+                .copy_from_slice(&src_bytes[src_off..src_off + copy_bytes]);
+        }
+    }
+    Ok(())
+}
+
 /// Memcpy bytes from `src` to `dst`.  Both buffers must have equal
 /// `byte_len`; mismatches are caller bugs (different cache shapes) and
 /// surface as Err.
@@ -628,6 +715,118 @@ impl HybridKvCache {
         {
             copy_buffer_bytes(conv_snap, &mut slot.conv_state).context("restore conv_state")?;
             copy_buffer_bytes(rec_snap, &mut slot.recurrent).context("restore recurrent")?;
+        }
+        Ok(())
+    }
+
+    /// ADR-017 Phase E.a B.5 — partial-position restore for LCP resume
+    /// across requests with DIFFERENT max_seq_len.
+    ///
+    /// `restore_from` requires byte-equal slot K/V buffer sizes (same
+    /// max_seq_len at snapshot time and restore time).  For LCP partial-
+    /// prefill resume, the snapshot's source request and the new request
+    /// typically have DIFFERENT prompt lengths and therefore different
+    /// per-request `max_seq_len` allocations (see
+    /// `engine_qwen35.rs::alloc_kv_cache_for_request` — `max_seq =
+    /// (prompt_len + max_tokens + 64).max(128)`).  Byte-copy fails.
+    ///
+    /// `restore_partial` instead copies, per full-attn head, only the
+    /// first `n_tokens` positions of K and V — the slot positions that
+    /// hold the cached prefix at snapshot time.  The destination
+    /// `max_seq_len` may be larger; the unused tail [n_tokens..max_seq]
+    /// is left zero-initialised (which the kernel never reads thanks
+    /// to `kL`-aware tile bounds).  Sets `slot.current_len[0] =
+    /// n_tokens` for each full-attn slot.
+    ///
+    /// DeltaNet recurrent + conv state buffers are NOT sized to
+    /// `max_seq_len` (they're sized to model dimensions only) — those
+    /// are byte-copied directly via `copy_buffer_bytes`, same as
+    /// `restore_from`.
+    ///
+    /// MTP slot: same partial-position semantics as the regular
+    /// full-attn slots when present.
+    ///
+    /// # Errors
+    ///
+    /// * Slot count mismatch (different model architecture).
+    /// * `n_tokens` exceeds either source or destination per-head
+    ///   capacity.
+    /// * Per-head buffer size derivation fails (snapshot or destination
+    ///   not in `[n_kv_heads, max_seq, head_dim]` shape).
+    pub fn restore_partial(
+        &mut self,
+        snapshot: &HybridKvCacheSnapshot,
+        n_tokens: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            snapshot.full_attn_k.len() == self.full_attn.len(),
+            "restore_partial: full_attn slot count mismatch ({} snapshot vs {} cache)",
+            snapshot.full_attn_k.len(),
+            self.full_attn.len()
+        );
+        anyhow::ensure!(
+            snapshot.linear_conv.len() == self.linear_attn.len(),
+            "restore_partial: linear_attn slot count mismatch ({} snapshot vs {} cache)",
+            snapshot.linear_conv.len(),
+            self.linear_attn.len()
+        );
+
+        // Per-slot partial-position copy.  Each slot has shape
+        // [n_kv_heads, max_seq_len, head_dim] with F32 elements.  Copy
+        // first n_tokens positions per head.
+        for (slot, (k_snap, v_snap)) in self.full_attn.iter_mut().zip(
+            snapshot.full_attn_k.iter().zip(snapshot.full_attn_v.iter()),
+        ) {
+            partial_copy_slot(k_snap, &mut slot.k, n_tokens, "full_attn.k")?;
+            partial_copy_slot(v_snap, &mut slot.v, n_tokens, "full_attn.v")?;
+            // current_len[0] = n_tokens (the LCP boundary the snapshot
+            // was taken at; subsequent prefill chunks will write at
+            // positions [n_tokens..]).
+            anyhow::ensure!(
+                !slot.current_len.is_empty(),
+                "restore_partial: slot.current_len is empty"
+            );
+            slot.current_len[0] = n_tokens as u32;
+            for v in slot.current_len.iter_mut().skip(1) {
+                *v = n_tokens as u32;
+            }
+        }
+
+        // MTP slot (when present).
+        match (&snapshot.mtp, self.mtp_slot.as_mut()) {
+            (Some(snap), Some(slot)) => {
+                partial_copy_slot(&snap.k, &mut slot.k, n_tokens, "mtp.k")?;
+                partial_copy_slot(&snap.v, &mut slot.v, n_tokens, "mtp.v")?;
+                anyhow::ensure!(
+                    !slot.current_len.is_empty(),
+                    "restore_partial: mtp slot.current_len is empty"
+                );
+                slot.current_len[0] = n_tokens as u32;
+                for v in slot.current_len.iter_mut().skip(1) {
+                    *v = n_tokens as u32;
+                }
+            }
+            (None, None) => {}
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!(
+                    "restore_partial: mtp_slot presence mismatch between snapshot and cache"
+                );
+            }
+        }
+
+        // DeltaNet conv + recurrent state are NOT sized to max_seq_len
+        // (they're per-head/per-model dimensions only) — byte-copy
+        // directly.  Snapshot taken at any prompt position has correct
+        // recurrent state at THAT position; we want exactly that state.
+        for (slot, (conv_snap, rec_snap)) in self
+            .linear_attn
+            .iter_mut()
+            .zip(snapshot.linear_conv.iter().zip(snapshot.linear_recurrent.iter()))
+        {
+            copy_buffer_bytes(conv_snap, &mut slot.conv_state)
+                .context("restore_partial conv_state")?;
+            copy_buffer_bytes(rec_snap, &mut slot.recurrent)
+                .context("restore_partial recurrent")?;
         }
         Ok(())
     }

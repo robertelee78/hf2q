@@ -906,11 +906,23 @@ pub fn generate_qwen35_once(
                         // True-continuation at this stride boundary.
                         // The snapshot's DeltaNet recurrent state is at
                         // exactly this position — byte-correct resume.
+                        //
+                        // B.5: use `restore_partial` instead of
+                        // `restore_from` — the snapshot's full-attn slot
+                        // K/V buffers were sized to the SOURCE request's
+                        // max_seq_len, which typically differs from the
+                        // current request's
+                        // (alloc_kv_cache_for_request sizes per-request).
+                        // restore_partial copies only positions [0..k]
+                        // per head, decoupling buffer sizing from
+                        // snapshot size.  DeltaNet recurrent + conv
+                        // state are copied verbatim (size-independent
+                        // of max_seq_len).
                         let snapshot: &HybridKvCacheSnapshot =
                             &prefix.dense_kvs[0];
                         kv_cache
-                            .restore_from(snapshot)
-                            .context("qwen35 lcp_registry restore_from")?;
+                            .restore_partial(snapshot, prefix.k)
+                            .context("qwen35 lcp_registry restore_partial")?;
                         lcp_resume_start = prefix.k;
                         eprintln!(
                             "[hf2q qwen35 lcp resume] STRIDE-ALIGNED HIT — \

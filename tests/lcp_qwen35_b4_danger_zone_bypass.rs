@@ -1,24 +1,31 @@
-//! ADR-017 Phase E.a B.4 path (ii) — danger-zone bypass falsifier.
+//! ADR-017 Phase E.a B.4 → B.5 — formerly-danger-zone byte-identity
+//! falsifier.
 //!
-//! Asserts that when a Qwen 3.6 prompt's tokenized length lands in the
-//! qL ∈ [2, 15] danger zone (`prompt_len % stride ∈ {1..15}`), the
-//! engine correctly SKIPS chunked prefill and runs monolithically,
-//! producing decoded bytes byte-identical to a control server with no
-//! chunked-prefill flag set.
+//! **Test history note:** This test was originally written for B.4
+//! path (ii) to verify that prompts in the qL ∈ [2, 15] "danger zone"
+//! (`prompt_len % stride ∈ {1..15}`) had chunked prefill SKIPPED
+//! (the path-ii workaround) and ran monolithically.  B.5 lifted the
+//! kernel-side gate at `gpu_full_attn.rs:1909+` from `seq_len >= 16`
+//! to `kv_seq_len >= 16` for the resume path, proving via the
+//! mlx-native kernel probe (0/N BF16 elements differ at qL ∈ {2, 8,
+//! 15}, kL=130) that the documented "qL < 16 NaN bug" applied only
+//! to single-K-tile (kL ≤ 16); the chunked-prefill last-chunk regime
+//! always has multi-K-tile.  B.4 path-ii was REMOVED.
+//!
+//! Post-B.5 this test asserts the OPPOSITE: chunked prefill DOES
+//! engage on the formerly-danger-zone prompt AND produces byte-
+//! identical output to monolithic.  Same fixture, same byte-identity
+//! gate, opposite engagement assertion — captures the structural
+//! semantics shift.
 //!
 //! ## Why this matters
 //!
-//! The FA bf16 d256 fast/resume kernels gate on `seq_len >= 16`
-//! (`gpu_full_attn.rs:1860`).  Chunked prefill at 3+ chunks where the
-//! partial-tail chunk has seq < 16 falls to the legacy F32 SDPA path,
-//! which produces byte-different output to FA bf16 d256 (B.2-iso
-//! proved 131072/131072 F32 elements differ between the two kernels).
-//!
-//! The B.4 path (ii) workaround in `engine_qwen35.rs` adds a danger-
-//! zone check (`tail = prompt_len % stride; in_danger_zone = tail > 0
-//! && tail < 16`).  When in the danger zone, chunked prefill is
-//! skipped and the request runs monolithically — preserving byte-
-//! identity to the no-chunked-flag baseline.
+//! The FA bf16 d256 fast/resume kernels gate on `kv_seq_len >= 16`
+//! (`gpu_full_attn.rs:1909+`, post-B.5).  Chunked prefill's last chunk
+//! always has `kv_seq_len = cur_len + seq_len ≥ stride > 16` because
+//! cur_len ≥ stride (the prior chunk's full-stride contribution).  So
+//! the resume kernel handles the last chunk byte-correctly regardless
+//! of `seq_len ∈ [2, 15]`.
 //!
 //! ## Test design
 //!
@@ -26,13 +33,13 @@
 //!    HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=64`.
 //! 2. Spawn server B (control, no env flags).
 //! 3. Send a prompt long enough to cross 3 stride boundaries with a
-//!    partial-tail chunk in the danger zone (target prompt_len ≈ 130
-//!    tokens at stride=64 → chunks {64, 64, 2} where the last has
-//!    seq=2 ∈ [2, 15]).
-//! 4. Assert: A's stderr does NOT contain `[hf2q qwen35 chunked
-//!    prefill]` (the workaround skipped chunked).
+//!    partial-tail chunk in the formerly-danger zone (target
+//!    prompt_len ≈ 130 tokens at stride=64 → chunks {64, 64, 2}).
+//! 4. **Post-B.5 assertion:** A's stderr CONTAINS
+//!    `[hf2q qwen35 chunked prefill]` (chunked engaged at all lengths).
 //! 5. Assert: A's decoded bytes == B's decoded bytes (byte-identity
-//!    preserved by both running monolithic).
+//!    preserved at the kernel level by FA RESUME on the partial-tail
+//!    chunk).
 //!
 //! ## Operator gating
 //!
@@ -339,20 +346,21 @@ fn phase_b4_danger_zone_bypass_byte_identity() {
     assert!(!a_decoded.is_empty(), "[Phase B.4] A decoded empty");
     eprintln!("[Phase B.4] server A decoded {} bytes", a_decoded.len());
 
-    // Workaround engagement: chunked prefill MUST have been skipped
-    // (otherwise it'd hit the kernel divergence and produce different
-    // output than B's monolithic).
+    // Post-B.5 engagement: chunked prefill MUST engage on the
+    // formerly-danger-zone prompt (B.4 path-ii bypass was REMOVED in
+    // B.5 once the kernel probe proved byte-correctness at small qL
+    // multi-K-tile).  The kernel-level FA RESUME path now handles the
+    // partial-tail chunk byte-identically to monolithic.
     let a_log = server_a.log_tail();
-    let chunked_skipped = !a_log.iter().any(|l| l.contains("chunked prefill"));
+    let chunked_engaged = a_log.iter().any(|l| l.contains("chunked prefill"));
     assert!(
-        chunked_skipped,
-        "[Phase B.4] FALSIFIED — server A's stderr CONTAINS `chunked \
-         prefill` line, meaning chunked engaged on a danger-zone prompt. \
-         The B.4 workaround should have skipped chunked.  Either the \
-         tokenized prompt isn't in the danger zone (test fixture out of \
-         sync with tokenizer changes) OR the workaround in \
-         engine_qwen35.rs isn't gating correctly. Server A stderr tail \
-         (last 30 lines):\n{}",
+        chunked_engaged,
+        "[Phase B.4→B.5] FALSIFIED — server A's stderr LACKS `chunked \
+         prefill` line, meaning chunked SKIPPED on the formerly-danger-\
+         zone prompt.  B.5 should have engaged chunked at all lengths \
+         (the path-ii bypass was removed).  Either the bypass code came \
+         back, OR the chunked_eligible gate is rejecting the prompt for \
+         a different reason. Server A stderr tail (last 30 lines):\n{}",
         a_log
             .iter()
             .rev()
@@ -362,9 +370,13 @@ fn phase_b4_danger_zone_bypass_byte_identity() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+    let chunked_line = a_log
+        .iter()
+        .find(|l| l.contains("chunked prefill"))
+        .cloned()
+        .unwrap_or_default();
     eprintln!(
-        "[Phase B.4] B.4 workaround engaged: chunked prefill correctly \
-         skipped (no `chunked prefill` log line in stderr)"
+        "[Phase B.4→B.5] post-B.5 engagement: {chunked_line}"
     );
 
     drop(server_a);
@@ -419,10 +431,11 @@ fn phase_b4_danger_zone_bypass_byte_identity() {
     }
 
     eprintln!(
-        "[Phase B.4] PASS — A ({} bytes, danger-zone bypassed → \
-         monolithic) == B ({} bytes, control monolithic) BYTE-IDENTICAL. \
-         B.4 path (ii) workaround verified — danger-zone prompts no \
-         longer hit the FA-fast-vs-legacy-F32-SDPA kernel divergence.",
+        "[Phase B.4→B.5] PASS — A ({} bytes, chunked engaged via FA \
+         RESUME on partial-tail) == B ({} bytes, control monolithic) \
+         BYTE-IDENTICAL. B.5 verified — formerly-danger-zone prompts \
+         now correctly chunked at all stride boundaries with byte-\
+         equivalent output to monolithic.",
         a_decoded.len(),
         b_decoded.len()
     );
