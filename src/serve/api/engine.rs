@@ -3485,6 +3485,12 @@ fn kv_restore_gemma(
                 v,
                 capacity: s_cap,
                 is_sliding: s_is_sliding,
+                // ADR-017 Phase E.a iter-3.5a — dtype invariant.
+                // `kv_dtype` was set above from
+                // `INVESTIGATION_ENV.f16_kv`, same value the spiller
+                // passed in via the snapshot's k/v alloc_buffer
+                // parameter — stays in lockstep.
+                dtype: kv_dtype,
             });
         }
         // ADR-017 Phase E.a iter-2.5: wrap each freshly-allocated
@@ -3907,6 +3913,22 @@ fn generate_once_with_soft_tokens(
                             } else if prefix.dense_kvs.len() != loaded.weights.layers.len() {
                                 false
                             } else {
+                                // ADR-017 Phase E.a iter-3.5a — dtype
+                                // invariant added to the per-layer
+                                // check. Model-current `kv_dtype` is
+                                // resolved from `INVESTIGATION_ENV.f16_kv`
+                                // (same source used at every alloc
+                                // site). A cached entry with mismatched
+                                // dtype must NOT be installed: the
+                                // kernel's flash_attn_vec dispatch
+                                // takes dtype as a static branch and
+                                // would silently misread the cached
+                                // bytes.
+                                let model_kv_dtype = if crate::debug::INVESTIGATION_ENV.f16_kv {
+                                    mlx_native::DType::F16
+                                } else {
+                                    mlx_native::DType::F32
+                                };
                                 prefix.dense_kvs.iter().enumerate().all(|(li, arc)| {
                                     let layer = &loaded.weights.layers[li];
                                     let layer_is_ring = matches!(
@@ -3920,6 +3942,7 @@ fn generate_once_with_soft_tokens(
                                     };
                                     arc.capacity >= required_cap
                                         && arc.is_sliding == layer_is_ring
+                                        && arc.dtype == model_kv_dtype
                                 })
                             };
                             if !per_layer_ok {
@@ -4434,63 +4457,52 @@ fn generate_once_with_soft_tokens(
     // only on the embedding-only path (`forward_prefill_embedding`)
     // where dense_kvs is never built. Generation requests always
     // populate it.
+    // ADR-017 Phase E.a iter-3.5b — store the END-OF-PREFILL SNAPSHOT
+    // (NOT the live post-decode dense_kvs).
+    //
+    // forward_prefill_with_soft_tokens_resume populates
+    // `loaded.weights.dense_kvs_snapshot_for_lcp = Some(snapshot)` at
+    // end-of-prefill (BEFORE decode mutates) when the iter-3 env-gates
+    // are on. Decode then mutates `loaded.weights.dense_kvs` (the
+    // LIVE set) without touching the snapshot. Storing the snapshot
+    // here gives future LCP hits a buffer that faithfully represents
+    // [0..N) of the prompt — no decode-corrupted ring slots.
+    //
+    // The snapshot lifts the iter-3 v1 wrap restriction. Long-
+    // conversation prompts where `prompt_len + decode_tokens >
+    // sliding_window` are now cacheable; the wrap guard is GONE.
+    //
+    // Skip multimodal requests (`!soft_tokens.is_empty()`) per
+    // dossier §10.5.
+    //
+    // Skip when `dense_kvs_snapshot_for_lcp` is None — that happens
+    // when env-gates are off (no snapshot was taken; iter-2
+    // observability-only mode), OR on the embedding-only path where
+    // forward_prefill_embedding doesn't populate it.
     if soft_tokens.is_empty() {
-        if let Some(weights_dense_kvs) = loaded.weights.dense_kvs.as_ref() {
-            let sliding_window = loaded.weights.sliding_window.max(1);
-            // ADR-017 Phase E.a iter-3 + Codex Phase-2b audit:
-            // sliding-ring wrap guard uses the explicit physical
-            // decode-write counter (NOT `result.completion_tokens`)
-            // to decide whether the ring wrapped. See `let mut
-            // physical_decode_writes` declaration above for the
-            // rationale.
-            let total_writes = prompt_len.saturating_add(physical_decode_writes);
-            // Sliding-ring wrap guard: if total writes (prompt + decode)
-            // exceeded the sliding window, the ring wrapped and
-            // sliding-layer slots no longer faithfully represent
-            // [0..total_writes). Skip store; future resume on this
-            // prefix would read corrupted state.
-            let ring_safe = total_writes <= sliding_window
-                || !loaded.weights.layers.iter().any(|l| {
-                    matches!(l.layer_type, crate::serve::config::LayerType::Sliding)
-                });
-            if ring_safe {
+        if let Some(snapshot) = loaded.weights.dense_kvs_snapshot_for_lcp.take() {
             let lcp_key = build_lcp_key_for_request(loaded, params);
-            // Clone Arcs (cheap — strong_count++) so the registry's
-            // set is independent of the engine's set. The engine
-            // keeps `weights.dense_kvs` populated for forward_decode.
-            let payload: Vec<std::sync::Arc<crate::serve::forward_mlx::DenseKvBuffers>> =
-                weights_dense_kvs.iter().map(std::sync::Arc::clone).collect();
+            let sliding_window = loaded.weights.sliding_window.max(1);
             let linear_capacity = prompt_len + params.max_tokens.max(1);
+            // The `physical_decode_writes` counter is no longer
+            // load-bearing for the wrap guard (snapshot makes the
+            // guard unnecessary), but we keep it as a debug-only
+            // counter for /metrics scrape compatibility.
+            let _ = physical_decode_writes;
             match loaded.lcp_registry.store(
                 lcp_key,
                 prompt_tokens.to_vec(),
-                payload,
+                snapshot,
                 sliding_window,
                 linear_capacity,
             ) {
                 Ok(()) => {}
                 Err(e) => {
-                    // Empty payload / empty prompt — both unreachable
-                    // in this code path (we just generated against
-                    // prompt_tokens which is non-empty per the assert
-                    // at the top of this function; payload is non-empty
-                    // because dense_kvs is non-empty when generation
-                    // ran). Log + carry on; never panic.
                     tracing::debug!(
                         "lcp_registry.store rejected (unexpected): {:?}",
                         e
                     );
                 }
-            }
-            } else {
-                tracing::debug!(
-                    "lcp_registry.store skipped: sliding-ring wrap guard \
-                     (total_writes={} > sliding_window={}; iter-3 v1 \
-                     correctness preserves byte-identity at the cost of \
-                     long-conversation cache miss)",
-                    total_writes,
-                    sliding_window
-                );
             }
         }
     }
@@ -6134,6 +6146,22 @@ fn generate_stream_once(
                             } else if prefix.dense_kvs.len() != loaded.weights.layers.len() {
                                 false
                             } else {
+                                // ADR-017 Phase E.a iter-3.5a — dtype
+                                // invariant added to the per-layer
+                                // check. Model-current `kv_dtype` is
+                                // resolved from `INVESTIGATION_ENV.f16_kv`
+                                // (same source used at every alloc
+                                // site). A cached entry with mismatched
+                                // dtype must NOT be installed: the
+                                // kernel's flash_attn_vec dispatch
+                                // takes dtype as a static branch and
+                                // would silently misread the cached
+                                // bytes.
+                                let model_kv_dtype = if crate::debug::INVESTIGATION_ENV.f16_kv {
+                                    mlx_native::DType::F16
+                                } else {
+                                    mlx_native::DType::F32
+                                };
                                 prefix.dense_kvs.iter().enumerate().all(|(li, arc)| {
                                     let layer = &loaded.weights.layers[li];
                                     let layer_is_ring = matches!(
@@ -6147,6 +6175,7 @@ fn generate_stream_once(
                                     };
                                     arc.capacity >= required_cap
                                         && arc.is_sliding == layer_is_ring
+                                        && arc.dtype == model_kv_dtype
                                 })
                             };
                             if !per_layer_ok {
@@ -6926,51 +6955,30 @@ fn generate_stream_once(
         Some(fragments),
     );
 
-    // ADR-017 Phase E.a iter-3 (streaming origin): mirror the
-    // non-streaming `lcp_registry.store` site so future shared-prefix
-    // requests detect AND can resume against the streaming-served
-    // prompt too. Skip multimodal per dossier §10.5 (text-only-pure
-    // registry contract). Skip when `weights.dense_kvs` is None
-    // (embedding-only path).
+    // ADR-017 Phase E.a iter-3.5b (streaming origin): mirror the
+    // non-streaming snapshot-store site. Take the end-of-prefill
+    // snapshot (populated by `forward_prefill_with_soft_tokens_resume`
+    // BEFORE decode mutated the live buffers) and register it.
+    // Decode operated on the LIVE `weights.dense_kvs`, NOT the
+    // snapshot, so the snapshot faithfully represents [0..N) of the
+    // prompt. The wrap guard is no longer needed; long-conversation
+    // prompts are cacheable.
     //
-    // Sliding-ring wrap guard mirrors the non-streaming site (Codex
-    // audit issue #1, R12): if total writes (prompt + decode)
-    // exceeded the sliding window, the ring wrapped and decode-
-    // written slots overwrote prompt-written slots. Skip store; a
-    // future resume on this prefix would read corrupted state.
+    // Skip multimodal per §10.5; skip when snapshot is None
+    // (env-gates off / embedding-only path).
+    let _ = physical_decode_writes; // retained debug counter
     if soft_tokens.is_empty() {
-        if let Some(weights_dense_kvs) = loaded.weights.dense_kvs.as_ref() {
+        if let Some(snapshot) = loaded.weights.dense_kvs_snapshot_for_lcp.take() {
+            let lcp_key = build_lcp_key_for_request(loaded, params);
             let sliding_window = loaded.weights.sliding_window.max(1);
-            // ADR-017 Phase E.a iter-3 + Codex Phase-2b audit: use the
-            // explicit physical decode-write counter (NOT
-            // `completion_tokens`) so the streaming wrap guard is
-            // immune to any pop / EOS / stop_string off-by-one
-            // accounting.
-            let total_writes = prompt_tokens.len().saturating_add(physical_decode_writes);
-            let ring_safe = total_writes <= sliding_window
-                || !loaded.weights.layers.iter().any(|l| {
-                    matches!(l.layer_type, crate::serve::config::LayerType::Sliding)
-                });
-            if ring_safe {
-                let lcp_key = build_lcp_key_for_request(loaded, params);
-                let payload: Vec<std::sync::Arc<crate::serve::forward_mlx::DenseKvBuffers>> =
-                    weights_dense_kvs.iter().map(std::sync::Arc::clone).collect();
-                let linear_capacity = prompt_tokens.len() + params.max_tokens.max(1);
-                let _ = loaded.lcp_registry.store(
-                    lcp_key,
-                    prompt_tokens.to_vec(),
-                    payload,
-                    sliding_window,
-                    linear_capacity,
-                );
-            } else {
-                tracing::debug!(
-                    "lcp_registry.store skipped (streaming): sliding-ring wrap \
-                     guard (total_writes={} > sliding_window={})",
-                    total_writes,
-                    sliding_window
-                );
-            }
+            let linear_capacity = prompt_tokens.len() + params.max_tokens.max(1);
+            let _ = loaded.lcp_registry.store(
+                lcp_key,
+                prompt_tokens.to_vec(),
+                snapshot,
+                sliding_window,
+                linear_capacity,
+            );
         }
     }
 }

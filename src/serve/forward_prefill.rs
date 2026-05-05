@@ -642,7 +642,18 @@ impl MlxModelWeights {
                         .map_err(|e| anyhow::anyhow!("prefill dense K L{layer_idx}: {e}"))?;
                     let vbuf = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
                         .map_err(|e| anyhow::anyhow!("prefill dense V L{layer_idx}: {e}"))?;
-                    v.push(DenseKvBuffers { k: kbuf, v: vbuf, capacity, is_sliding: layer_is_ring });
+                    v.push(DenseKvBuffers {
+                        k: kbuf,
+                        v: vbuf,
+                        capacity,
+                        is_sliding: layer_is_ring,
+                        // ADR-017 Phase E.a iter-3.5a — record dtype
+                        // invariant. `kv_dtype` is set above from
+                        // INVESTIGATION_ENV.f16_kv (read once via
+                        // LazyLock); same dtype across all layers in
+                        // this allocation pass.
+                        dtype: kv_dtype,
+                    });
                 }
                 v
             }
@@ -1723,6 +1734,84 @@ impl MlxModelWeights {
         // Arc wrap fires once at the end-of-prefill handoff, when the
         // buffers transition from "in-flight under exclusive prefill
         // borrow" to "shared, readable from forward_decode".
+        // ADR-017 Phase E.a iter-3.5b — end-of-prefill snapshot for
+        // the LcpRegistry, BEFORE decode mutates the live buffers.
+        //
+        // Pre-iter-3.5b the engine stored Arc-clones of the LIVE
+        // buffers post-decode. Decode mutates `dense_kvs[*][slot=p%cap]`
+        // for sliding layers; when prompt+decode total exceeds
+        // sliding_window the ring wraps and decode-written slots
+        // overwrite prompt-prefix slots. The iter-3 v1 wrap-guard
+        // skipped store in that case (correctness preserved at the
+        // cost of long-conversation cache miss).
+        //
+        // iter-3.5b lifts the wrap restriction by snapshotting
+        // dense_kvs HERE (decode hasn't run yet — the per-token loop
+        // above only wrote prompt positions [0..N)). The snapshot is
+        // a true CPU-side memcpy via `as_mut_slice` / `as_slice`
+        // (StorageModeShared on Apple Silicon — read/write through
+        // the same physical bytes from CPU). Cost: one extra per-
+        // layer KV alloc + memcpy per resume-eligible request
+        // (~50ms / ~5 GB on Gemma 4 26B). Triggered only when env-
+        // gates `HF2Q_KV_LCP_RESUME=1` + `HF2Q_USE_DENSE=1` are both
+        // ON (the engine consumes `dense_kvs_snapshot_for_lcp` only
+        // in that mode).
+        //
+        // The snapshot path also mirrors the dtype/capacity/is_sliding
+        // invariants of each source layer (iter-3.5a dtype field).
+        let snapshot_for_lcp: Option<Vec<std::sync::Arc<DenseKvBuffers>>> =
+            if crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+                && crate::debug::INVESTIGATION_ENV.use_dense
+            {
+                // Allocate fresh per-layer buffers + memcpy bytes from
+                // each live `dense_kvs_vec[i]` into the new snapshot.
+                let mut snap: Vec<std::sync::Arc<DenseKvBuffers>> =
+                    Vec::with_capacity(num_layers);
+                for live_layer in dense_kvs_vec.iter() {
+                    let nkv_dim = live_layer.k.shape().first().copied().unwrap_or(0);
+                    let cap_dim = live_layer.k.shape().get(1).copied().unwrap_or(live_layer.capacity);
+                    let hd_dim = live_layer.k.shape().get(2).copied().unwrap_or(0);
+                    let elem_bytes_layer = live_layer.dtype.size_of();
+                    let nbytes = nkv_dim * cap_dim * hd_dim * elem_bytes_layer;
+                    let mut k_snap = dev
+                        .alloc_buffer(nbytes, live_layer.dtype, vec![nkv_dim, cap_dim, hd_dim])
+                        .map_err(|e| anyhow::anyhow!("snapshot K alloc: {e}"))?;
+                    let mut v_snap = dev
+                        .alloc_buffer(nbytes, live_layer.dtype, vec![nkv_dim, cap_dim, hd_dim])
+                        .map_err(|e| anyhow::anyhow!("snapshot V alloc: {e}"))?;
+                    // CPU memcpy via StorageModeShared. Same shape +
+                    // dtype as source; bytemuck::Pod typed via u8.
+                    let k_src: &[u8] = live_layer
+                        .k
+                        .as_slice()
+                        .map_err(|e| anyhow::anyhow!("snapshot K src as_slice: {e}"))?;
+                    let v_src: &[u8] = live_layer
+                        .v
+                        .as_slice()
+                        .map_err(|e| anyhow::anyhow!("snapshot V src as_slice: {e}"))?;
+                    let k_dst: &mut [u8] = k_snap
+                        .as_mut_slice()
+                        .map_err(|e| anyhow::anyhow!("snapshot K dst as_mut_slice: {e}"))?;
+                    let v_dst: &mut [u8] = v_snap
+                        .as_mut_slice()
+                        .map_err(|e| anyhow::anyhow!("snapshot V dst as_mut_slice: {e}"))?;
+                    let copy_len = k_src.len().min(k_dst.len());
+                    k_dst[..copy_len].copy_from_slice(&k_src[..copy_len]);
+                    v_dst[..copy_len].copy_from_slice(&v_src[..copy_len]);
+                    snap.push(std::sync::Arc::new(DenseKvBuffers {
+                        k: k_snap,
+                        v: v_snap,
+                        capacity: live_layer.capacity,
+                        is_sliding: live_layer.is_sliding,
+                        dtype: live_layer.dtype,
+                    }));
+                }
+                Some(snap)
+            } else {
+                None
+            };
+        self.dense_kvs_snapshot_for_lcp = snapshot_for_lcp;
+
         self.dense_kvs = Some(
             dense_kvs_vec
                 .into_iter()

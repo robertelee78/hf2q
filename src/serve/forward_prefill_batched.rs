@@ -280,7 +280,14 @@ impl MlxModelWeights {
             let v = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype,
                                       vec![nkv, capacity, hd])
                 .map_err(|e| anyhow::anyhow!("batched dense V L{layer_idx}: {e}"))?;
-            dense_kvs_vec.push(DenseKvBuffers { k, v, capacity, is_sliding: layer_is_ring });
+            dense_kvs_vec.push(DenseKvBuffers {
+                k,
+                v,
+                capacity,
+                is_sliding: layer_is_ring,
+                // ADR-017 Phase E.a iter-3.5a — dtype invariant.
+                dtype: kv_dtype,
+            });
         }
         let max_nh = nh;
         let max_hd = self.layers.iter().map(|l| l.head_dim).max().unwrap_or(512);

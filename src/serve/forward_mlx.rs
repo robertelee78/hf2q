@@ -612,6 +612,33 @@ pub struct MlxModelWeights {
     /// this file vs Strategy B's outer-Arc shape, which conflates
     /// per-layer eviction with whole-Vec rebuilds).
     pub dense_kvs: Option<Vec<std::sync::Arc<DenseKvBuffers>>>,
+    /// ADR-017 Phase E.a iter-3.5b — end-of-prefill snapshot for the
+    /// LcpRegistry. Populated by `forward_prefill_with_soft_tokens_resume`
+    /// AT THE END of the per-token prefill loop (after all prompt
+    /// positions written, BEFORE the function returns). Consumed by
+    /// `engine.rs::generate_*` at the post-decode LCP store site, then
+    /// cleared. `None` when the iter-3 env-gates (`HF2Q_KV_LCP_RESUME=1`
+    /// + `HF2Q_USE_DENSE=1`) are off (no snapshot needed; LCP path
+    /// inactive).
+    ///
+    /// **Why a separate field, not a return value:** changing
+    /// `forward_prefill_with_soft_tokens_resume`'s return type from
+    /// `Result<u32>` to `Result<(u32, Option<Vec<Arc<DenseKvBuffers>>>)>`
+    /// would touch every call site (warmup, generate, embed_last,
+    /// generate_stream_once, ...). A side-channel field on
+    /// `MlxModelWeights` minimizes the surface — only the post-decode
+    /// LCP store site reads it.
+    ///
+    /// **Why a snapshot, not a live-Arc clone:** decode mutates
+    /// `dense_kvs[*][slot=p%capacity]` for sliding layers. The
+    /// LcpRegistry must hold a SNAPSHOT taken at end-of-prefill
+    /// (decode hasn't run yet) so future LCP hits read pure
+    /// prompt-prefix state, not decode-corrupted ring slots. Lifts
+    /// the iter-3 v1 wrap-guard restriction (which previously
+    /// skipped store when `prompt_len + decode_writes > sliding_window`)
+    /// at the cost of one extra per-layer KV allocation + memcpy per
+    /// resume-eligible request (~50ms on Gemma 4 26B).
+    pub dense_kvs_snapshot_for_lcp: Option<Vec<std::sync::Arc<DenseKvBuffers>>>,
     /// Tmp buffer for flash_attn_vec when using dense decode.
     pub dense_sdpa_tmp: Option<MlxBuffer>,
     // iter-20 Leg F `leg_f_kvs` + `leg_f_sdpa_tmp` shadow-cache fields deleted
@@ -751,7 +778,7 @@ pub struct HbKvBuffers {
     pub norms_per_pos: usize,
 }
 
-/// Per-layer dense F32 KV buffers for dense attention path (ADR-009).
+/// Per-layer dense F32/F16 KV buffers for dense attention path (ADR-009).
 pub struct DenseKvBuffers {
     pub k: MlxBuffer,
     pub v: MlxBuffer,
@@ -761,6 +788,24 @@ pub struct DenseKvBuffers {
     pub capacity: usize,
     /// True if this is a sliding layer (ring-buffer semantics).
     pub is_sliding: bool,
+    /// ADR-017 Phase E.a iter-3.5a (Codex round-1 LOW #4) — KV element
+    /// dtype invariant. Today every engine in a process uses one
+    /// `HF2Q_F16_KV` setting (parsed at LazyLock init), so all
+    /// `DenseKvBuffers` in the live LcpRegistry necessarily share
+    /// dtype. Recording it explicitly:
+    ///
+    ///   * makes the invariant a load-bearing struct field (not a
+    ///     process-implicit assumption that could regress under any
+    ///     future hot-reload / multi-engine path),
+    ///   * lets the engine's `take_prefix` capacity-check site assert
+    ///     `cached.dtype == model.kv_dtype` per layer alongside the
+    ///     existing capacity + is_sliding checks, closing a class of
+    ///     silent-corruption bugs at the type level.
+    ///
+    /// Populated at every construction site: `forward_prefill.rs` per-
+    /// layer alloc, `forward_prefill_batched.rs` per-layer alloc, and
+    /// `engine.rs::kv_restore_gemma` per-layer alloc.
+    pub dtype: mlx_native::DType,
 }
 
 /// Per-call decode regime override for ADR-007 Gate H two-regime-one-process
@@ -1311,6 +1356,7 @@ impl MlxModelWeights {
             num_experts: cfg.num_experts,
             intermediate_size: cfg.intermediate_size,
             dense_kvs: None,
+            dense_kvs_snapshot_for_lcp: None,
             dense_sdpa_tmp: None,
             // iter-222 (2026-05-01): leg_f_kvs / leg_f_sdpa_tmp shadow-cache
             // fields deleted along with iter-34 dense-on-shadow Leg F branch.
