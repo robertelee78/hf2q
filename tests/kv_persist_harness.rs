@@ -187,22 +187,21 @@ pub struct MatrixCell {
 
 impl MatrixCell {
     /// True when the cell is runnable on the day. Gemma 4 26B + dense
-    /// across the four runnable quants is in scope. Qwen3.5-MoE waits
-    /// on ADR-013 unblock; TQ-active waits on ADR-007 codec stable +
-    /// Phase B-tq sequencing. Phase A0.1 returns the cell whose
-    /// `is_runnable_today` is true; A0.2/A0.3 then exercise them.
+    /// across the four runnable quants is in scope.  Gemma 4 26B +
+    /// **TQ-active** unblocked 2026-05-05 by ADR-007 codec_version=1
+    /// freeze + Phase B-tq.1 substrate (`families/tq_packed.rs`).
+    /// Qwen3.5-MoE waits on ADR-013 unblock.  Phase A0.1 returns the
+    /// cell whose `is_runnable_today` is true; A0.2/A0.3 then exercise
+    /// them.
     pub fn is_runnable_today(&self) -> bool {
         match self.family {
-            Family::Gemma4_26b => {
-                let runnable_quant = matches!(
-                    self.quant,
-                    WeightQuant::Q4_0
-                        | WeightQuant::Q4_K_M
-                        | WeightQuant::Q6_K
-                        | WeightQuant::Q8_0
-                );
-                runnable_quant && matches!(self.kv_path, KvPath::Dense)
-            }
+            Family::Gemma4_26b => matches!(
+                self.quant,
+                WeightQuant::Q4_0
+                    | WeightQuant::Q4_K_M
+                    | WeightQuant::Q6_K
+                    | WeightQuant::Q8_0
+            ),
             Family::Qwen35Moe_Dwq46 => false, // ADR-013 gate
         }
     }
@@ -1525,6 +1524,18 @@ pub fn run_cell(cell: MatrixCell) -> CellResult {
     } else {
         "A0.1 substrate; HF2Q_KV_PERSIST_E2E=1 + model path required for perf fields".to_string()
     };
+    // ADR-017 §A0.3 / §B-tq.1: when KvPath::TqActive AND R-C1 round-
+    // trip byte-exact passes, tq_cosine = 1.0 by construction.  The
+    // dequantize function is pure of (header, indices); when the
+    // restored bytes byte-equal the pre-spill bytes (R-C1), the
+    // dequantize outputs are element-wise byte-equal, hence cosine
+    // = 1.0 (≥ 0.9998 R-C2 gate trivially satisfied).  See
+    // `src/serve/kv_persist/families/tq_packed.rs::tests::tq_packed_v1_cosine_gate_a_satisfied_by_construction`
+    // for the unit-level proof.
+    let tq_cosine = match cell.kv_path {
+        KvPath::TqActive if kv_sha256_pre == kv_sha256_post => 1.0,
+        _ => f64::NAN,
+    };
     CellResult {
         cell,
         no_cache_ttft_ms: f64::NAN,
@@ -1537,7 +1548,7 @@ pub fn run_cell(cell: MatrixCell) -> CellResult {
         kv_sha256_pre,
         kv_sha256_post,
         first_token_max_abs_diff: f64::NAN,
-        tq_cosine: f64::NAN,
+        tq_cosine,
         shared_prefix_ratio: f64::NAN,
         ran: true,
         note,
@@ -2181,12 +2192,21 @@ fn matrix_generator_yields_runnable_gemma_subset() {
     );
     assert!(
         runnable.iter().all(|c| matches!(c.family, Family::Gemma4_26b)
-            && matches!(c.kv_path, KvPath::Dense)
             && matches!(
                 c.quant,
                 WeightQuant::Q4_0 | WeightQuant::Q4_K_M | WeightQuant::Q6_K | WeightQuant::Q8_0
             )),
-        "runnable filter must scope to gemma4 dense Q4_0/Q4_K_M/Q6_K/Q8_0"
+        "runnable filter must scope to gemma4 Q4_0/Q4_K_M/Q6_K/Q8_0 \
+         (KvPath::TqActive unblocked 2026-05-05 by ADR-007 codec freeze + B-tq.1 substrate)"
+    );
+    // Post-2026-05-05: both Dense AND TqActive paths are runnable for
+    // Gemma 4 26B; A0.3 matrix population depends on this expansion.
+    let dense_count = runnable.iter().filter(|c| matches!(c.kv_path, KvPath::Dense)).count();
+    let tq_count = runnable.iter().filter(|c| matches!(c.kv_path, KvPath::TqActive)).count();
+    assert!(dense_count > 0, "expected at least one dense runnable cell");
+    assert!(
+        tq_count > 0,
+        "expected at least one TqActive runnable cell post-B-tq.1 substrate"
     );
     let qwen_cells: Vec<_> = cells
         .iter()
