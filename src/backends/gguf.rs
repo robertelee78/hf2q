@@ -6247,6 +6247,18 @@ mod tests {
             serde_json::to_string(&tokenizer_config).unwrap(),
         )
         .unwrap();
+        // 2026-04-30 anti-DWQ-corruption guard in
+        // `read_full_vocab_size_from_config`: refuses to fall back to
+        // `max_observed_id+1` when config.json lacks `vocab_size`.
+        // The minimal_tokenizer_json fixture has 3 vocab entries +
+        // 2 added_tokens (ids 0..1), so 3 is the authoritative size
+        // for these fixtures.
+        let config = serde_json::json!({ "vocab_size": 3 });
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_string(&config).unwrap(),
+        )
+        .unwrap();
         if let Some(content) = chat_template_jinja {
             std::fs::write(dir.join("chat_template.jinja"), content).unwrap();
         }
