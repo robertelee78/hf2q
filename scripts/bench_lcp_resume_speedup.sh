@@ -94,15 +94,17 @@ my workspace?"
 # by the prefill saving.
 chat_request_ms() {
     local body="$1"
-    # macOS `date +%N` doesn't support nanoseconds — use python directly with
-    # explicit timing arg (bash command substitution + python -c with embedded
-    # vars was returning 0 in the prior implementation).  This invokes python
-    # ONCE and lets it do both the request timing AND the curl-equivalent post.
-    /usr/bin/python3 -c "
-import time, sys, urllib.request, json
+    # All values passed via stdin/env to avoid Python-source injection
+    # (Codex Phase-2b bench-audit finding: triple-quoted-string
+    # interpolation risk when ASSISTANT_Y contains `'''`).  HOST + PORT
+    # come via env.  `time.monotonic()` is process-local but this entire
+    # measurement happens in ONE python subprocess, so start/end are
+    # comparable.
+    HOST="$HOST" PORT="$PORT" /usr/bin/python3 -c "
+import os, time, sys, urllib.request
 body = sys.stdin.read()
 req = urllib.request.Request(
-    'http://$HOST:$PORT/v1/chat/completions',
+    f'http://{os.environ[\"HOST\"]}:{os.environ[\"PORT\"]}/v1/chat/completions',
     data=body.encode('utf-8'),
     headers={'Content-Type': 'application/json'},
     method='POST'
@@ -115,37 +117,44 @@ print(int((end - start) * 1000))
 " <<< "$body"
 }
 
+# Build request bodies via env-passed strings (Codex Phase-2b finding —
+# avoid triple-quoted-string injection in inline python source).
 build_turn1_body() {
+    MODEL_ID="$MODEL_ID" CONTENT="$TURN1_USER" MAX_TOKENS="$MAX_TOKENS" \
     /usr/bin/python3 -c "
-import json, sys
-body = json.dumps({
-    'model': '$MODEL_ID',
-    'messages': [{'role': 'user', 'content': '''$TURN1_USER'''}],
-    'max_tokens': $MAX_TOKENS,
+import json, os
+print(json.dumps({
+    'model': os.environ['MODEL_ID'],
+    'messages': [{'role': 'user', 'content': os.environ['CONTENT']}],
+    'max_tokens': int(os.environ['MAX_TOKENS']),
     'temperature': 0,
     'stream': False,
-})
-print(body)
+}))
 "
 }
 
 build_turn2_body() {
     local assistant_y="$1"
     local turn2_user="$2"
+    local turn1_user="${3:-$TURN1_USER}"
+    MODEL_ID="$MODEL_ID" \
+    TURN1_USER="$turn1_user" \
+    ASSISTANT_Y="$assistant_y" \
+    TURN2_USER="$turn2_user" \
+    MAX_TOKENS="$MAX_TOKENS" \
     /usr/bin/python3 -c "
-import json
-body = json.dumps({
-    'model': '$MODEL_ID',
+import json, os
+print(json.dumps({
+    'model': os.environ['MODEL_ID'],
     'messages': [
-        {'role': 'user',      'content': '''$TURN1_USER'''},
-        {'role': 'assistant', 'content': '''$assistant_y'''},
-        {'role': 'user',      'content': '''$turn2_user'''},
+        {'role': 'user',      'content': os.environ['TURN1_USER']},
+        {'role': 'assistant', 'content': os.environ['ASSISTANT_Y']},
+        {'role': 'user',      'content': os.environ['TURN2_USER']},
     ],
-    'max_tokens': $MAX_TOKENS,
+    'max_tokens': int(os.environ['MAX_TOKENS']),
     'temperature': 0,
     'stream': False,
-})
-print(body)
+}))
 "
 }
 
@@ -169,26 +178,17 @@ echo "[BENCH] turn-1 deterministic response: ${ASSISTANT_Y:0:60}..."
 # same prompt_len as the LCP-hit measurement (turn-2 multi-turn shape),
 # just no cache to hit.
 echo "[BENCH] measuring TTFT_cold (turn-2 shape, no LCP cache match) — $TRIALS trials..."
+# Codex Phase-2b finding: cold trials must have the SAME prompt_len as
+# LCP trials for fair speedup comparison.  Achieved by PREPENDING a
+# short trial-marker + space at the START of TURN1_USER (changes
+# first-64 tokens, ensures probe MISS, total token count delta < 5
+# tokens vs canonical TURN1_USER).
 COLD_TIMES=()
 for i in $(seq 1 "$TRIALS"); do
-    UNIQ_TURN1_USER="${TURN1_USER} Trial $i divergence-marker-$RANDOM-$RANDOM-$RANDOM-$RANDOM (this prefix is unique per trial so the LCP probe at chunk_pos=64 cannot match a prior trial's stored entry; fresh chunked prefill from chunk_idx=0 is exercised end-to-end)."
+    PREPEND="V$i-$RANDOM "
+    UNIQ_TURN1_USER="${PREPEND}${TURN1_USER}"
     UNIQ_TURN2_USER="Worker $i: summarize the difference for $i."
-    # Fake-multi-turn payload: real prompt is [user UNIQ_TURN1, assistant Y, user UNIQ_TURN2].
-    BODY=$(/usr/bin/python3 -c "
-import json
-body = json.dumps({
-    'model': '$MODEL_ID',
-    'messages': [
-        {'role': 'user',      'content': '''$UNIQ_TURN1_USER'''},
-        {'role': 'assistant', 'content': '''$ASSISTANT_Y'''},
-        {'role': 'user',      'content': '''$UNIQ_TURN2_USER'''},
-    ],
-    'max_tokens': $MAX_TOKENS,
-    'temperature': 0,
-    'stream': False,
-})
-print(body)
-")
+    BODY=$(build_turn2_body "$ASSISTANT_Y" "$UNIQ_TURN2_USER" "$UNIQ_TURN1_USER")
     ms=$(chat_request_ms "$BODY")
     COLD_TIMES+=("$ms")
     echo "  trial $i: ${ms} ms"
@@ -215,15 +215,33 @@ for i in $(seq 1 "$TRIALS"); do
 done
 
 # ── Phase 4: R-P6 aggregate (4 sequential requests sharing turn-1 prefix) ─
+# Codex Phase-2b finding: use single python process for both timing
+# AND request issuance — avoids cross-subprocess time.monotonic()
+# inconsistency and wall-clock-jump risk.
 echo "[BENCH] measuring R-P6 4-worker aggregate (1 trial)..."
-RP6_START=$(/usr/bin/python3 -c 'import time; print(int(time.time()*1000))')
+BODIES_FILE=$(mktemp)
 for w in 1 2 3 4; do
     UNIQ_TURN2="Worker $w: summarize the difference for $w."
-    BODY=$(build_turn2_body "$ASSISTANT_Y" "$UNIQ_TURN2")
-    chat_request_ms "$BODY" > /dev/null
+    build_turn2_body "$ASSISTANT_Y" "$UNIQ_TURN2" >> "$BODIES_FILE"
+    echo "" >> "$BODIES_FILE"  # newline-delimited
 done
-RP6_END=$(/usr/bin/python3 -c 'import time; print(int(time.time()*1000))')
-RP6_TOTAL=$((RP6_END - RP6_START))
+RP6_TOTAL=$(HOST="$HOST" PORT="$PORT" BODIES="$BODIES_FILE" /usr/bin/python3 -c "
+import os, time, urllib.request
+url = f'http://{os.environ[\"HOST\"]}:{os.environ[\"PORT\"]}/v1/chat/completions'
+with open(os.environ['BODIES'], 'r') as f:
+    bodies = [b for b in f.read().split('\n') if b.strip()]
+start = time.monotonic()
+for body in bodies:
+    req = urllib.request.Request(
+        url, data=body.encode('utf-8'),
+        headers={'Content-Type': 'application/json'},
+        method='POST'
+    )
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        _ = resp.read()
+print(int((time.monotonic() - start) * 1000))
+")
+rm -f "$BODIES_FILE"
 
 # ── Stats ─────────────────────────────────────────────────────────────────
 median() {
