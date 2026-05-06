@@ -88,10 +88,17 @@ run_one_trial() {
         --max-tokens 20 \
         > "$out_file" 2>&1 || { echo "  trial $trial_idx FAILED (exit $?)"; return 1; }
 
-    # Output + needle check
-    local response=$(cat "$out_file")
+    # Output + needle check.
+    # hf2q emits some bracketed banner lines (e.g. [HF2Q_TQ_CODEBOOK_BITS])
+    # to stderr that get interleaved with stdout via 2>&1. Strip those
+    # before checking, and concatenate all whitespace so cross-line
+    # split-token output still matches.
+    local cleaned=$(grep -v '^\[HF2Q_' "$out_file" \
+        | grep -v '^\[iter-' \
+        | sed -e 's/\[HF2Q_TQ_CODEBOOK_BITS\][^[:print:]]*[^[]*$//' \
+        | tr -d '\n ')
     local pass="FAIL"
-    if echo "$response" | grep -qF "$needle"; then
+    if echo "$cleaned" | grep -qF "$needle"; then
         pass="PASS"
     fi
 
