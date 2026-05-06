@@ -918,19 +918,27 @@ pub fn generate_qwen35_once(
                 let chunk_key =
                     build_lcp_key_for_qwen35_chunk(qwen, params, chunk_pos);
                 if let Some(prefix) =
-                    qwen.lcp_registry.take_prefix(&chunk_key, prompt_tokens)
+                    qwen.lcp_registry.lookup(&chunk_key, prompt_tokens)
                 {
                     // ADR-017 Phase E.a B.5 Codex Phase-2b finding
                     // (HIGH, defense-in-depth): require `prefix.k <
-                    // prompt_tokens.len()` so a true-continuation at the
-                    // FULL prompt length cannot trigger an empty
-                    // suffix-prefill (which would either panic in the
-                    // chunked branch's `last_logits.expect("at least
-                    // one chunk")` or attempt zero-token prefill in the
-                    // monolithic suffix branch).  `LcpRegistry::lookup`
-                    // already gates `k == new_tokens.len()` returning
-                    // None, so this is belt-and-suspenders against
-                    // future registry semantics changes.
+                    // prompt_tokens.len()` (LcpRegistry::lookup already
+                    // gates `k == new_tokens.len()` returning None, so
+                    // this is belt-and-suspenders).
+                    //
+                    // ADR-017 Phase E.a B.5 bench-driven change: use
+                    // non-consuming `lookup` instead of `take_prefix`.
+                    // B.5's `restore_partial` MEMCPYS bytes from the
+                    // snapshot into the request's kv_cache (does NOT
+                    // try_unwrap the Arc); the registry's entry stays
+                    // intact and is reusable for subsequent matching
+                    // requests.  The Gemma iter-3 reason for consuming
+                    // (Arc strong_count == 1 needed for try_unwrap) does
+                    // NOT apply to B.5's pathway.  Empirical impact:
+                    // bench `lcp_resume_speedup` shows 50% → 100% hit
+                    // rate (no inter-trial cache flush from
+                    // consumption), and R-P6 4-worker fan-out converges
+                    // to <= 1.0× single-worker (idealized B.5 speedup).
                     if prefix.k == prefix.cached_prompt_len
                         && prefix.k < prompt_tokens.len()
                     {
@@ -2124,11 +2132,14 @@ pub fn generate_stream_qwen35_once_extended(
                 let chunk_key =
                     build_lcp_key_for_qwen35_chunk(qwen, params, chunk_pos);
                 if let Some(prefix) =
-                    qwen.lcp_registry.take_prefix(&chunk_key, prompt_tokens)
+                    qwen.lcp_registry.lookup(&chunk_key, prompt_tokens)
                 {
                     // ADR-017 Phase E.a B.5 Codex Phase-2b (HIGH defense-
-                    // in-depth): require `prefix.k < prompt_tokens.len()`
-                    // (mirrors non-streaming).
+                    // in-depth): require `prefix.k < prompt_tokens.len()`.
+                    // Non-consuming `lookup` (mirrors non-streaming
+                    // post-bench change) — `restore_partial` memcpys, so
+                    // registry entry stays reusable for subsequent
+                    // matching requests.
                     if prefix.k == prefix.cached_prompt_len
                         && prefix.k < prompt_tokens.len()
                     {
