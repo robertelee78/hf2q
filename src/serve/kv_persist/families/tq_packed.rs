@@ -312,6 +312,253 @@ pub fn sha256_payload(payload: &[u8]) -> [u8; 32] {
 }
 
 // ============================================================================
+// Phase B-tq.2 — engine-side family hook
+// ============================================================================
+//
+// `TqPackedSpill` wraps the [`pack_tq_v1_payload`] / [`unpack_tq_v1_payload`]
+// envelope codec from B-tq.1 in the [`KvCacheSpill`] trait surface so the
+// Phase A.3 spiller can dispatch snapshot/restore to TQ-active layers without
+// changing the spiller core.
+//
+// **B-tq.2 v1 scope:** the hook holds an in-memory
+// `BTreeMap<(layer_rank, range_start), Vec<u8>>` of pre-packed `tq_packed_v1`
+// payloads.  The payloads can come from:
+//   * Synthetic test fixtures (current iter — proves the trait surface +
+//     round-trip parity).
+//   * Future engine wiring (B-tq.3) that hooks `dispatch_hadamard_quantize_kv`
+//     post-quantize results into the in-memory map.
+//
+// The on-disk envelope is FROZEN at codec_version=1 (B-tq.1 magic +
+// version regression tests pin this), so B-tq.3's engine integration
+// can land WITHOUT touching the on-disk wire format — the hook's
+// `snapshot_block` / `restore_block` impl stays byte-stable across the
+// transition.
+
+use std::collections::BTreeMap;
+use std::ops::Range;
+use std::sync::RwLock;
+
+use crate::serve::kv_persist::format::ModelFingerprint;
+use crate::serve::kv_persist::spiller::KvCacheSpill;
+use crate::serve::multi_model::SpillErrorKind;
+use crate::serve::quant_select::QuantType;
+
+/// Shape config for [`TqPackedSpill`].  Mirrors the ADR-007 codec
+/// parameters and the `tq_packed_v1` header fields.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TqPackedConfig {
+    /// Number of model layers (drives `KvCacheSpill::n_layers`).
+    pub num_layers: usize,
+    /// Per-layer K/V head count.  Length MUST equal `num_layers`.
+    pub nkv_heads: Vec<u32>,
+    /// Per-layer head dim.  Length MUST equal `num_layers`.
+    pub head_dim: Vec<u32>,
+    /// Lloyd-Max bit width.  Per ADR-007 production: 8.  Test fixtures
+    /// may use 2/3/4.
+    pub bits_per_coord: TqBitsPerCoord,
+    /// Per-block scale (set at quantize time; carried through the
+    /// envelope verbatim).  Tests use 1.0 unless they specifically
+    /// exercise non-trivial scale.
+    pub scale: f64,
+    /// Set bit 0 to indicate Hadamard rotation was applied before
+    /// quantization (production: always true on the TQ-active path).
+    pub flags: u32,
+    /// Block alignment in tokens.  ADR-017 §D3 default = 256.
+    pub block_tokens: u32,
+}
+
+impl TqPackedConfig {
+    /// Validate config invariants.
+    pub fn validate(&self) -> Result<(), SpillErrorKind> {
+        if self.num_layers == 0
+            || self.nkv_heads.len() != self.num_layers
+            || self.head_dim.len() != self.num_layers
+            || self.block_tokens == 0
+        {
+            return Err(SpillErrorKind::CodecErr);
+        }
+        Ok(())
+    }
+}
+
+/// Phase B-tq.2 family hook for TurboQuant-packed K/V layers.
+///
+/// The internal `blocks` map is keyed by `(layer_rank, range_start)`
+/// and stores pre-packed `tq_packed_v1` envelope payloads.
+/// `snapshot_block(layer, range)` returns the stored bytes verbatim;
+/// `restore_block(layer, range, payload)` validates the envelope and
+/// stores.  Both operations are O(log n) in the number of stored
+/// blocks (`BTreeMap` lookup).
+pub struct TqPackedSpill {
+    cfg: TqPackedConfig,
+    /// Pre-packed payloads keyed by (layer_rank, range_start).  Held
+    /// behind `RwLock` so `&self` snapshot calls don't serialize on a
+    /// write-lock — the spiller's trigger sites may run concurrent
+    /// snapshots from multiple tokio tasks.  `restore_block` takes
+    /// `&mut self` so the write-lock acquisition is lock-free.
+    blocks: RwLock<BTreeMap<(usize, u32), Vec<u8>>>,
+    /// Optional model fingerprint for §F4 namespace keying.  When
+    /// `None`, falls back to the spiller's legacy `(repo, quant, "",
+    /// "", "")` fingerprint per the trait default.
+    fingerprint: RwLock<Option<ModelFingerprint>>,
+}
+
+impl TqPackedSpill {
+    /// Construct a new TQ-packed spill from shape config.  The block
+    /// map starts empty; B-tq.3 engine wiring populates it via
+    /// [`Self::insert_block`] (or future
+    /// `snapshot_via_engine_post_quantize`).
+    pub fn new(cfg: TqPackedConfig) -> Result<Self, SpillErrorKind> {
+        cfg.validate()?;
+        Ok(Self {
+            cfg,
+            blocks: RwLock::new(BTreeMap::new()),
+            fingerprint: RwLock::new(None),
+        })
+    }
+
+    /// Set the model fingerprint for §F4 namespace keying.
+    pub fn set_fingerprint(&self, fp: ModelFingerprint) {
+        if let Ok(mut slot) = self.fingerprint.write() {
+            *slot = Some(fp);
+        }
+    }
+
+    /// Insert a pre-packed envelope payload (test fixture / future
+    /// engine wiring).  Returns `Err(SpillErrorKind::CodecErr)` if the
+    /// payload doesn't parse as `tq_packed_v1`.
+    pub fn insert_block(
+        &self,
+        layer_rank: usize,
+        range_start: u32,
+        payload: Vec<u8>,
+    ) -> Result<(), SpillErrorKind> {
+        if layer_rank >= self.cfg.num_layers {
+            return Err(SpillErrorKind::CodecErr);
+        }
+        let _ = unpack_tq_v1_payload(&payload)
+            .map_err(|_| SpillErrorKind::CodecErr)?;
+        if let Ok(mut map) = self.blocks.write() {
+            map.insert((layer_rank, range_start), payload);
+            Ok(())
+        } else {
+            Err(SpillErrorKind::IoErr)
+        }
+    }
+
+    /// Number of currently-cached blocks (test introspection).
+    pub fn block_count(&self) -> usize {
+        self.blocks.read().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Forge a synthetic `tq_packed_v1` payload for the given (layer,
+    /// range) using the spill's config.  The indices stream is
+    /// deterministic from `(layer_rank, range.start)`.  Used by tests
+    /// + future engine wiring as a fixture path.
+    pub fn synthesize_block(
+        &self,
+        layer_rank: usize,
+        range: Range<u32>,
+    ) -> Result<Vec<u8>, SpillErrorKind> {
+        if layer_rank >= self.cfg.num_layers {
+            return Err(SpillErrorKind::CodecErr);
+        }
+        let n_tokens = range.end.saturating_sub(range.start);
+        if n_tokens == 0 {
+            return Err(SpillErrorKind::CodecErr);
+        }
+        let header = TqPackedV1Header {
+            codec_version: TQ_PACKED_CODEC_VERSION_V1,
+            bits_per_coord: self.cfg.bits_per_coord,
+            head_dim: self.cfg.head_dim[layer_rank],
+            n_kv_heads: self.cfg.nkv_heads[layer_rank],
+            n_tokens,
+            flags: self.cfg.flags,
+            scale: self.cfg.scale,
+        };
+        let n_indices = header.indices_bytes_len();
+        let mut indices = vec![0u8; n_indices];
+        // Deterministic per-(layer, range_start) pattern.
+        for (i, b) in indices.iter_mut().enumerate() {
+            *b = ((i.wrapping_mul(31))
+                .wrapping_add((layer_rank as usize).wrapping_mul(0x9E37))
+                .wrapping_add(range.start as usize)
+                & 0xFF) as u8;
+        }
+        pack_tq_v1_payload(&header, &indices).map_err(|_| SpillErrorKind::CodecErr)
+    }
+}
+
+impl KvCacheSpill for TqPackedSpill {
+    fn block_alignment(&self) -> u32 {
+        self.cfg.block_tokens
+    }
+
+    fn n_layers(&self) -> usize {
+        self.cfg.num_layers
+    }
+
+    fn snapshot_block(&self, layer_rank: usize, range: Range<u32>) -> Option<Vec<u8>> {
+        if layer_rank >= self.cfg.num_layers {
+            return None;
+        }
+        let map = self.blocks.read().ok()?;
+        map.get(&(layer_rank, range.start)).cloned()
+    }
+
+    fn restore_block(
+        &mut self,
+        layer_rank: usize,
+        range: Range<u32>,
+        payload: &[u8],
+    ) -> Result<(), SpillErrorKind> {
+        if layer_rank >= self.cfg.num_layers {
+            return Err(SpillErrorKind::CodecErr);
+        }
+        let (header, _indices) =
+            unpack_tq_v1_payload(payload).map_err(|_| SpillErrorKind::CodecErr)?;
+        // Layout-mismatch guards: dtype-equivalent for TQ-packed is
+        // `(bits_per_coord, head_dim, n_kv_heads)`.  A future engine
+        // upgrade that bumps any of these without bumping
+        // `codec_version` would silently corrupt restored state — fail
+        // loud here.
+        if header.bits_per_coord != self.cfg.bits_per_coord {
+            return Err(SpillErrorKind::CodecErr);
+        }
+        if header.head_dim != self.cfg.head_dim[layer_rank] {
+            return Err(SpillErrorKind::CodecErr);
+        }
+        if header.n_kv_heads != self.cfg.nkv_heads[layer_rank] {
+            return Err(SpillErrorKind::CodecErr);
+        }
+        if header.n_tokens != range.end.saturating_sub(range.start) {
+            return Err(SpillErrorKind::CodecErr);
+        }
+        // Defensive: re-pack and assert byte-equality to catch
+        // post-decode tampering / wire-format drift before we commit
+        // to engine state.  Because pack is deterministic
+        // (B-tq.1 round-trip test), the re-packed bytes MUST byte-equal
+        // the input.
+        let (_h2, idx) = unpack_tq_v1_payload(payload).map_err(|_| SpillErrorKind::CodecErr)?;
+        let repacked = pack_tq_v1_payload(&header, idx).map_err(|_| SpillErrorKind::CodecErr)?;
+        if repacked != payload {
+            return Err(SpillErrorKind::ParityFail);
+        }
+        let mut map = self.blocks.write().map_err(|_| SpillErrorKind::IoErr)?;
+        map.insert((layer_rank, range.start), payload.to_vec());
+        Ok(())
+    }
+
+    fn model_fingerprint(
+        &self,
+        _repo: &str,
+        _quant: QuantType,
+    ) -> Option<ModelFingerprint> {
+        self.fingerprint.read().ok().and_then(|fp| fp.clone())
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -601,5 +848,200 @@ mod tests {
             "global layer 4-bit storage ratio: {ratio_global:.2}× \
              (dense={dense_f32_global} TQ={tq_packed_global})"
         );
+    }
+
+    // ========================================================================
+    // Phase B-tq.2 — TqPackedSpill engine-side hook tests
+    // ========================================================================
+
+    fn synthetic_cfg(num_layers: usize) -> TqPackedConfig {
+        TqPackedConfig {
+            num_layers,
+            nkv_heads: vec![2; num_layers],
+            head_dim: vec![256; num_layers],
+            bits_per_coord: TqBitsPerCoord::new(8).unwrap(),
+            scale: 0.125_f64,
+            flags: flags::HADAMARD_ROTATED,
+            block_tokens: 256,
+        }
+    }
+
+    /// `TqPackedSpill::new` validates config invariants.
+    #[test]
+    fn tq_packed_spill_rejects_invalid_config() {
+        let mut cfg = synthetic_cfg(4);
+        cfg.nkv_heads = vec![2, 2]; // length mismatch
+        assert_eq!(TqPackedSpill::new(cfg).err(), Some(SpillErrorKind::CodecErr));
+    }
+
+    /// `block_alignment` returns `cfg.block_tokens`; `n_layers` returns
+    /// `cfg.num_layers`.
+    #[test]
+    fn tq_packed_spill_trait_surface_constants() {
+        let spill = TqPackedSpill::new(synthetic_cfg(8)).expect("new");
+        assert_eq!(spill.block_alignment(), 256);
+        assert_eq!(spill.n_layers(), 8);
+    }
+
+    /// `snapshot_block` returns None when no block stored.
+    #[test]
+    fn tq_packed_spill_snapshot_empty_returns_none() {
+        let spill = TqPackedSpill::new(synthetic_cfg(2)).expect("new");
+        assert!(spill.snapshot_block(0, 0..256).is_none());
+        assert!(spill.snapshot_block(1, 256..512).is_none());
+    }
+
+    /// `snapshot_block` returns None for out-of-range layer.
+    #[test]
+    fn tq_packed_spill_snapshot_layer_out_of_range_returns_none() {
+        let spill = TqPackedSpill::new(synthetic_cfg(2)).expect("new");
+        let payload = spill.synthesize_block(0, 0..256).expect("synth");
+        spill.insert_block(0, 0, payload).expect("insert");
+        assert!(spill.snapshot_block(99, 0..256).is_none());
+    }
+
+    /// **B-tq.2 round-trip parity**: synthesize → insert → snapshot
+    /// returns the byte-identical payload.
+    #[test]
+    fn tq_packed_spill_synthesize_insert_snapshot_round_trip() {
+        let spill = TqPackedSpill::new(synthetic_cfg(4)).expect("new");
+        let payload = spill.synthesize_block(2, 256..512).expect("synth");
+        let payload_clone = payload.clone();
+        spill.insert_block(2, 256, payload).expect("insert");
+
+        let snapped = spill.snapshot_block(2, 256..512).expect("snapshot");
+        assert_eq!(snapped, payload_clone);
+
+        // The snapped bytes parse back to a header whose fields match
+        // the spill's config.
+        let (header, _) = unpack_tq_v1_payload(&snapped).expect("unpack");
+        assert_eq!(header.codec_version, TQ_PACKED_CODEC_VERSION_V1);
+        assert_eq!(header.bits_per_coord.0, 8);
+        assert_eq!(header.head_dim, 256);
+        assert_eq!(header.n_kv_heads, 2);
+        assert_eq!(header.n_tokens, 256);
+        assert_eq!(header.flags, flags::HADAMARD_ROTATED);
+    }
+
+    /// **B-tq.2 restore_block via trait**: writing through
+    /// `KvCacheSpill::restore_block` round-trips byte-equally to the
+    /// subsequent `snapshot_block`.
+    #[test]
+    fn tq_packed_spill_restore_via_trait_round_trip() {
+        let mut spill = TqPackedSpill::new(synthetic_cfg(4)).expect("new");
+        let payload = spill.synthesize_block(1, 0..256).expect("synth");
+        let payload_clone = payload.clone();
+
+        spill
+            .restore_block(1, 0..256, &payload)
+            .expect("restore_block");
+        let snapped = spill.snapshot_block(1, 0..256).expect("snapshot");
+        assert_eq!(snapped, payload_clone);
+    }
+
+    /// `restore_block` rejects payloads with a layout mismatch
+    /// (head_dim drift).  This is the load-bearing wire-format-drift
+    /// guard — without it, a future engine upgrade that bumped head_dim
+    /// without bumping `codec_version` would silently corrupt restored
+    /// state.
+    #[test]
+    fn tq_packed_spill_restore_rejects_head_dim_mismatch() {
+        let cfg = synthetic_cfg(4);
+        let mut spill = TqPackedSpill::new(cfg).expect("new");
+
+        // Build a payload claiming head_dim=128 (config says 256).
+        let bad_header = TqPackedV1Header {
+            codec_version: TQ_PACKED_CODEC_VERSION_V1,
+            bits_per_coord: TqBitsPerCoord::new(8).unwrap(),
+            head_dim: 128,
+            n_kv_heads: 2,
+            n_tokens: 256,
+            flags: 0,
+            scale: 1.0,
+        };
+        let bad_indices = vec![0u8; bad_header.indices_bytes_len()];
+        let bad_payload = pack_tq_v1_payload(&bad_header, &bad_indices).expect("pack");
+
+        assert_eq!(
+            spill.restore_block(0, 0..256, &bad_payload).err(),
+            Some(SpillErrorKind::CodecErr)
+        );
+    }
+
+    /// `restore_block` rejects payloads with a `bits_per_coord` mismatch.
+    #[test]
+    fn tq_packed_spill_restore_rejects_bits_per_coord_mismatch() {
+        let mut spill = TqPackedSpill::new(synthetic_cfg(2)).expect("new");
+        let bad_header = TqPackedV1Header {
+            codec_version: TQ_PACKED_CODEC_VERSION_V1,
+            bits_per_coord: TqBitsPerCoord::new(4).unwrap(), // config says 8
+            head_dim: 256,
+            n_kv_heads: 2,
+            n_tokens: 256,
+            flags: 0,
+            scale: 1.0,
+        };
+        let bad_indices = vec![0u8; bad_header.indices_bytes_len()];
+        let bad_payload = pack_tq_v1_payload(&bad_header, &bad_indices).expect("pack");
+        assert_eq!(
+            spill.restore_block(0, 0..256, &bad_payload).err(),
+            Some(SpillErrorKind::CodecErr)
+        );
+    }
+
+    /// `restore_block` rejects payloads whose declared `n_tokens`
+    /// disagrees with the requested range.
+    #[test]
+    fn tq_packed_spill_restore_rejects_range_mismatch() {
+        let mut spill = TqPackedSpill::new(synthetic_cfg(2)).expect("new");
+        let payload = spill.synthesize_block(0, 0..256).expect("synth"); // header says n_tokens=256
+        // Caller asks restore for 0..128 (128 tokens).
+        assert_eq!(
+            spill.restore_block(0, 0..128, &payload).err(),
+            Some(SpillErrorKind::CodecErr)
+        );
+    }
+
+    /// `model_fingerprint` returns None until set, then the configured
+    /// fingerprint after.
+    #[test]
+    fn tq_packed_spill_fingerprint_round_trip() {
+        let spill = TqPackedSpill::new(synthetic_cfg(2)).expect("new");
+        let fp = crate::serve::kv_persist::format::compute_model_fingerprint(
+            "test-repo/tq-fixture",
+            "Q8_0",
+            "hf2q-test",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "<chat>{messages}</chat>",
+        );
+        // Default trait impl returns None; via the override (configured
+        // fingerprint), it returns Some.
+        assert!(KvCacheSpill::model_fingerprint(
+            &spill,
+            "test-repo/tq-fixture",
+            QuantType::Q8_0,
+        )
+        .is_none());
+        spill.set_fingerprint(fp.clone());
+        let got = KvCacheSpill::model_fingerprint(
+            &spill,
+            "test-repo/tq-fixture",
+            QuantType::Q8_0,
+        );
+        assert_eq!(got, Some(fp));
+    }
+
+    /// `block_count` reflects the in-memory map.
+    #[test]
+    fn tq_packed_spill_block_count_tracks_inserts() {
+        let spill = TqPackedSpill::new(synthetic_cfg(4)).expect("new");
+        assert_eq!(spill.block_count(), 0);
+        let p0 = spill.synthesize_block(0, 0..256).expect("p0");
+        let p1 = spill.synthesize_block(1, 0..256).expect("p1");
+        let p2 = spill.synthesize_block(2, 256..512).expect("p2");
+        spill.insert_block(0, 0, p0).expect("ins0");
+        spill.insert_block(1, 0, p1).expect("ins1");
+        spill.insert_block(2, 256, p2).expect("ins2");
+        assert_eq!(spill.block_count(), 3);
     }
 }
