@@ -469,43 +469,31 @@ fn phase_b2c_lcp_resume_vs_fresh_prefill_byte_identity() {
         .any(|l| l.contains("[hf2q qwen35 lcp resume]"));
     let probe_partial = a_log
         .iter()
-        .any(|l| l.contains("[hf2q qwen35 lcp probe] PARTIAL HIT"));
-    let probe_miss = a_log
+        .any(|l| l.contains("PARTIAL HIT"));
+    let probe_ran = a_log
         .iter()
-        .any(|l| l.contains("[hf2q qwen35 lcp probe] MISS"));
+        .any(|l| l.contains("[hf2q qwen35 lcp probe] enabled"));
     let store_fired = a_log
         .iter()
-        .any(|l| l.contains("[hf2q qwen35 lcp store] storing"));
+        .any(|l| l.contains("[hf2q qwen35 lcp store]"));
     eprintln!(
         "[Phase B.2c] LCP path observability: \
          resume_engaged={resume_engaged}, partial_hit={probe_partial}, \
-         miss={probe_miss}, store_fired={store_fired}"
+         probe_ran={probe_ran}, store_fired={store_fired}"
     );
-    // At minimum, the store path should have fired (turn-1 finished and
-    // env-gated store ran).  The probe at turn-2 should have fired too
-    // (one of resume/partial/miss).  These prove the wiring is in the
-    // request flow.
+    // Post-B.5 invariant: the LCP probe MUST have run (proves env
+    // propagated + the request hit the probe site).  Stores fire only
+    // at stride boundaries (B.3 changed semantics from "always on
+    // greedy" to "stride-aligned only"); for default stride=1024 with
+    // short prompts (<1024 tokens), no store fires — that's expected
+    // behavior, not a regression.  The byte-identity gate below is the
+    // load-bearing invariant for this test.
     assert!(
-        store_fired,
+        probe_ran,
         "[Phase B.2c] FALSIFIED — server A's stderr lacks \
-         `[hf2q qwen35 lcp store]` line, meaning the post-prefill \
-         lcp_registry store did not fire for turn 1.  Either the env \
-         did not propagate or the store-eligibility gate (is_greedy + \
-         kv_lcp_resume) was not met.  Server A stderr tail (last 30):\n{}",
-        a_log
-            .iter()
-            .rev()
-            .take(30)
-            .rev()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    assert!(
-        resume_engaged || probe_partial || probe_miss,
-        "[Phase B.2c] FALSIFIED — server A's stderr shows neither resume \
-         nor probe (partial / miss) on turn 2, meaning the lookup path \
-         did not fire.  Server A stderr tail (last 30):\n{}",
+         `[hf2q qwen35 lcp probe] enabled` line, meaning the probe \
+         path did not fire.  HF2Q_KV_LCP_RESUME env didn't propagate.  \
+         Server A stderr tail (last 30):\n{}",
         a_log
             .iter()
             .rev()
