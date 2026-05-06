@@ -3977,6 +3977,29 @@ session work:
   * Default-off rollout (`HF2Q_KV_LCP_RESUME=0` by default) keeps
     production safe; operators opt-in via env when ready to soak.
 
+### Production speedup measured (`scripts/bench_lcp_resume_speedup.sh`)
+
+10-trial bench on Qwen 3.6 35B-A3B-APEX-Q5_K_M with
+`HF2Q_KV_LCP_CHUNKED_PREFILL=1 HF2Q_KV_LCP_RESUME=1
+HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=64`:
+
+  * **TTFT_cold (fair baseline, turn-2 shape, no LCP cache match):**
+    335 ms p50 (mean 334 ± 7 ms)
+  * **TTFT_lcp (turn-2 shape, STRIDE-ALIGNED HIT at chunk_pos=64):**
+    275 ms p50 (bimodal: 5 fast ~226 ms real LCP hits saving ~110 ms +
+    5 slow ~325 ms suffix-chunked Metal scheduling artifact)
+  * **LCP speedup p50: 1.22×** (saving 60 ms / request median);
+    speedup at hit: 1.55× (fast-trial-only median 225 ms vs cold 335 ms)
+  * **R-P6 4-worker aggregate: 0.79× of 4×cold** — 37% UNDER ADR-017
+    R-P6 ≤ 1.25× spec.  This is the load-bearing /cfa Phase 2
+    production-shape result: workers share `[SYSTEM] [QUEEN_SPEC]` +
+    role-divergent suffixes, fan-out aggregate prefill drops ~21%.
+
+Bench harness audited via Codex Phase-2b read-only (5 findings; 3
+correctness fixes landed in `9e560cb` — Python `-c` injection,
+baseline fairness, R-P6 cross-subprocess timer).  Verdict post-fix:
+APPROVED on the 3 correctness findings.
+
 ### Memory budget reminder
 
 Default `HF2Q_KV_LCP_RESUME_CAPACITY=8` ≈ 2.4 GB per-process registry
