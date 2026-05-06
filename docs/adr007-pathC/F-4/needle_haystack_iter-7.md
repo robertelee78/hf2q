@@ -18,7 +18,7 @@
   ("E[HF2Q_...] IEDA" instead of "EIEDA"). Fix: strip `[HF2Q_*]` and
   `[iter-*]` lines and concatenate all remaining whitespace before the grep.
 
-## Iter-7 results (partial)
+## Iter-7 + iter-8 results (complete at 4K + 8K)
 
 | Target tokens | Actual prefill | Position | Needle | Verdict |
 |---|---|---|---|---|
@@ -26,12 +26,21 @@
 | 4096  |  5557 | 0.5 | EIEDA | PASS |
 | 4096  |  5560 | 0.9 | ADEFE | PASS |
 | 8192  | 11086 | 0.1 | DDABA | PASS |
-| 8192  |     - | 0.5 | (in flight) | (iter-8) |
-| 8192  |     - | 0.9 | (in flight) | (iter-8) |
+| 8192  | 11083 | 0.5 | EAFDE | PASS |
+| 8192  | 11082 | 0.9 | GEAGB | PASS |
 
-**4/4 PASS rate at 4K + 8K early-position needles.** The model retrieves
-the planted needle at every trial completed so far, even when the needle
-is at the start (pos 0.1) or end (pos 0.9) of the haystack.
+**6/6 PASS — 100% needle retrieval at 4K + 8K targets across all sampled
+positions** (real prefill ~5.5K and ~11K tokens with the chat-template
+overhead). The model correctly retrieves the planted code at the start
+(pos 0.1), middle (pos 0.5), and end (pos 0.9) of the haystack.
+
+The initial iter-7 partial table reported FAIL at 8K pos 0.5 + 0.9
+because the harness's verdict logic (a `grep -F` on the raw log) failed
+when hf2q's `[HF2Q_TQ_CODEBOOK_BITS]` banner injected mid-output —
+splitting the needle between "E" and "AFDE" or "GE" and "AGB". The
+iter-8 fix uses a python post-processor that strips the banner anywhere
+on a line (not just lines starting with `[`) and concatenates remaining
+whitespace before grepping. Re-evaluation surfaced all 6 PASSes.
 
 Notes:
 - Actual prefill is ~36% larger than the target (chat-template overhead

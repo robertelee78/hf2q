@@ -89,14 +89,23 @@ run_one_trial() {
         > "$out_file" 2>&1 || { echo "  trial $trial_idx FAILED (exit $?)"; return 1; }
 
     # Output + needle check.
-    # hf2q emits some bracketed banner lines (e.g. [HF2Q_TQ_CODEBOOK_BITS])
-    # to stderr that get interleaved with stdout via 2>&1. Strip those
-    # before checking, and concatenate all whitespace so cross-line
-    # split-token output still matches.
-    local cleaned=$(grep -v '^\[HF2Q_' "$out_file" \
-        | grep -v '^\[iter-' \
-        | sed -e 's/\[HF2Q_TQ_CODEBOOK_BITS\][^[:print:]]*[^[]*$//' \
-        | tr -d '\n ')
+    # hf2q emits a [HF2Q_TQ_CODEBOOK_BITS] banner via stderr that gets
+    # interleaved with stdout under `2>&1`. The banner can split a
+    # token mid-output (e.g. model emits "E", banner injects, model
+    # continues "AFDE"). Strip the banner anywhere on a line — not
+    # just at line start — and concatenate whitespace so a needle
+    # split across the banner injection still matches.
+    local cleaned=$(python3 -c "
+import re, sys
+log = sys.stdin.read()
+log = re.sub(r'\[HF2Q_TQ_CODEBOOK_BITS\][^\n]*', '', log)
+log = re.sub(r'\[iter-21 Track B\][^\n]*', '', log)
+idx = log.find('--- mlx-native:')
+log = log[:idx] if idx >= 0 else log
+pre = log.find('tok/s)\n')
+log = log[pre + len('tok/s)\n'):] if pre >= 0 else log
+print(log.replace('\n','').replace(' ',''))
+" < "$out_file")
     local pass="FAIL"
     if echo "$cleaned" | grep -qF "$needle"; then
         pass="PASS"
