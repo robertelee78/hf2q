@@ -1399,4 +1399,161 @@ mod tests {
         let (out, _state) = gated_delta_net_cpu_ref(&q, &k, &v, &g, &beta, &state_in, p);
         assert_eq!(out.len(), 4);
     }
+
+    /// ADR-017 Phase E.a B.5 unit test: `partial_copy_slot` correctly
+    /// copies the first `n_tokens` positions per (seq, head) across
+    /// differently-sized source and destination buffers.
+    ///
+    /// Verifies:
+    /// * Pattern preservation: known F32 values at positions
+    ///   `[0..n_tokens]` per (seq, head) round-trip from src → dst
+    ///   via the per-head stride math.
+    /// * Tail isolation: dst positions `[n_tokens..dst_max_seq]`
+    ///   remain untouched (zero-initialised).
+    /// * Cross-head isolation: source head N's bytes don't leak into
+    ///   destination head M (different stride bases).
+    #[test]
+    fn partial_copy_slot_per_head_position_round_trip() {
+        let device = MlxDevice::new().expect("MlxDevice");
+        let n_seqs = 1usize;
+        let n_kv_heads = 2usize;
+        let head_dim = 4usize;
+        let src_max_seq = 8usize;
+        let dst_max_seq = 16usize;
+        let n_tokens = 5usize;
+
+        // Build src buffer with a unique known F32 pattern per
+        // (seq, head, pos, elem) so per-head + per-position
+        // isolation is verifiable: value = 1000 + 100*seq + 10*head +
+        // pos + 0.01*elem.
+        let src_elems = n_seqs * n_kv_heads * src_max_seq * head_dim;
+        let mut src_data = vec![0.0f32; src_elems];
+        for seq in 0..n_seqs {
+            for head in 0..n_kv_heads {
+                for pos in 0..src_max_seq {
+                    for elem in 0..head_dim {
+                        let idx = ((seq * n_kv_heads + head) * src_max_seq + pos)
+                            * head_dim
+                            + elem;
+                        src_data[idx] = 1000.0
+                            + 100.0 * seq as f32
+                            + 10.0 * head as f32
+                            + pos as f32
+                            + 0.01 * elem as f32;
+                    }
+                }
+            }
+        }
+        let src_bytes = src_elems * 4;
+        let src_shape = vec![n_seqs, n_kv_heads, src_max_seq, head_dim];
+        let mut src_buf = device
+            .alloc_buffer(src_bytes, DType::F32, src_shape)
+            .expect("alloc src");
+        src_buf
+            .as_mut_slice::<f32>()
+            .expect("src as_mut_slice")
+            .copy_from_slice(&src_data);
+
+        // dst zero-initialised at a different (larger) max_seq_len.
+        let dst_elems = n_seqs * n_kv_heads * dst_max_seq * head_dim;
+        let dst_bytes = dst_elems * 4;
+        let dst_shape = vec![n_seqs, n_kv_heads, dst_max_seq, head_dim];
+        let mut dst_buf = device
+            .alloc_buffer(dst_bytes, DType::F32, dst_shape)
+            .expect("alloc dst");
+
+        partial_copy_slot(&src_buf, &mut dst_buf, n_tokens, "test_partial_copy")
+            .expect("partial_copy_slot");
+
+        // Verify dst contents.
+        let dst_after = dst_buf
+            .as_slice::<f32>()
+            .expect("dst as_slice")
+            .to_vec();
+
+        // Per (seq, head, pos, elem):
+        //   pos < n_tokens : MUST equal src's value.
+        //   pos >= n_tokens: MUST be 0.0 (zero-initialised tail).
+        for seq in 0..n_seqs {
+            for head in 0..n_kv_heads {
+                for pos in 0..dst_max_seq {
+                    for elem in 0..head_dim {
+                        let dst_idx =
+                            ((seq * n_kv_heads + head) * dst_max_seq + pos)
+                                * head_dim
+                                + elem;
+                        if pos < n_tokens {
+                            // Compare to src[seq, head, pos, elem].
+                            let expected = 1000.0
+                                + 100.0 * seq as f32
+                                + 10.0 * head as f32
+                                + pos as f32
+                                + 0.01 * elem as f32;
+                            assert!(
+                                (dst_after[dst_idx] - expected).abs() < 1e-6,
+                                "partial_copy_slot: mismatch at \
+                                 seq={seq}, head={head}, pos={pos}, elem={elem} \
+                                 — got {}, expected {expected}",
+                                dst_after[dst_idx]
+                            );
+                        } else {
+                            assert_eq!(
+                                dst_after[dst_idx], 0.0,
+                                "partial_copy_slot: tail bleed at \
+                                 seq={seq}, head={head}, pos={pos} (>= n_tokens={n_tokens}) \
+                                 elem={elem} — got {}, expected 0.0",
+                                dst_after[dst_idx]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// ADR-017 Phase E.a B.5 unit test: `partial_copy_slot` rejects
+    /// rank mismatch (rank-3 instead of rank-4).
+    #[test]
+    fn partial_copy_slot_rejects_wrong_rank() {
+        let device = MlxDevice::new().expect("MlxDevice");
+        let bad_src = device
+            .alloc_buffer(64, DType::F32, vec![2, 4, 2]) // rank 3
+            .expect("alloc bad_src");
+        let mut good_dst = device
+            .alloc_buffer(64, DType::F32, vec![1, 2, 4, 2])
+            .expect("alloc good_dst");
+        let result = partial_copy_slot(&bad_src, &mut good_dst, 1, "test_rank");
+        assert!(
+            result.is_err(),
+            "partial_copy_slot should reject rank-3 source"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("rank") || err_msg.contains("expected"),
+            "error should mention rank/expected: {err_msg}"
+        );
+    }
+
+    /// ADR-017 Phase E.a B.5 unit test: `partial_copy_slot` rejects
+    /// `n_tokens > capacity`.
+    #[test]
+    fn partial_copy_slot_rejects_overshoot() {
+        let device = MlxDevice::new().expect("MlxDevice");
+        let src = device
+            .alloc_buffer(64, DType::F32, vec![1, 2, 4, 2])
+            .expect("alloc src");
+        let mut dst = device
+            .alloc_buffer(64, DType::F32, vec![1, 2, 4, 2])
+            .expect("alloc dst");
+        let result = partial_copy_slot(&src, &mut dst, 100, "test_overshoot");
+        assert!(
+            result.is_err(),
+            "partial_copy_slot should reject n_tokens > capacity"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("exceeds capacity"),
+            "error should mention capacity overshoot: {err_msg}"
+        );
+    }
 }
