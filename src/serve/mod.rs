@@ -675,6 +675,16 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         model_path.display()
     );
 
+    // ADR-007 Path C F-6.1: --kv-bits flag wins over env var. Set the env
+    // var BEFORE the engine accesses INVESTIGATION_ENV (LazyLock) so the
+    // `tq_codebook_bits` field is parsed from this value. Must run before
+    // any other module reads the env, hence early in cmd_generate.
+    if let Some(bits) = &args.kv_bits {
+        // clap's PossibleValuesParser already validated bits ∈ {"4","5","6","8"}.
+        std::env::set_var("HF2Q_TQ_CODEBOOK_BITS", bits);
+        tracing::info!("ADR-007 F-6.1: KV codebook bits set via --kv-bits {bits} (overrides HF2Q_TQ_CODEBOOK_BITS env)");
+    }
+
     // --- Architecture detection (fast: metadata-only GGUF open) ---
     {
         let gguf_peek = mlx_native::gguf::GgufFile::open(model_path)
@@ -4296,6 +4306,7 @@ fn cmd_parity_check(
             chat_template_file: None,
             benchmark: false,
             speculative: false,
+            kv_bits: None,
             enable_thinking: false,
             no_thinking: false,
         },
@@ -4481,6 +4492,7 @@ fn cmd_parity_capture(
                 chat_template_file: None,
                 benchmark: false,
                 speculative: false,
+                kv_bits: None,
                 enable_thinking: false,
                 no_thinking: false,
             },
@@ -5376,6 +5388,7 @@ mod tests {
             chat_template_file: None,
             benchmark: false,
             speculative: false,
+            kv_bits: None,
             enable_thinking: false,
             no_thinking: false,
         }

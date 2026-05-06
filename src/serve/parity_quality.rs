@@ -472,6 +472,7 @@ fn run_two_regime_decode(
             chat_template_file: None,
             benchmark: false,
             speculative: false,
+            kv_bits: None,
             enable_thinking: false,
             no_thinking: false,
         },

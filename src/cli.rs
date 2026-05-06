@@ -527,6 +527,28 @@ pub struct GenerateArgs {
     #[arg(long)]
     pub speculative: bool,
 
+    /// TurboQuant KV cache bit-width (ADR-007 Path C F-6.1).
+    ///
+    /// Selects the Lloyd-Max codebook used to compress the KV cache:
+    ///   - **8** (default): production-grade 8-bit Lloyd-Max HB SDPA. 256
+    ///     centroids, ±5.0652659 range. Gate A cosine 0.9998, Gate C
+    ///     1.24% PPL delta (intrinsic distortion floor — see ADR §F-2).
+    ///   - **6**: opt-in research mode. 64 centroids. Wider cosine spread.
+    ///   - **5**: opt-in research mode. 32 centroids. Wider PPL gap.
+    ///   - **4**: legacy 4-bit nibble-packed `flash_attn_vec_tq` path
+    ///     (close-section §1117 — 127-byte sourdough ceiling, 5.3% argmax
+    ///     divergence, 1.55% PPL — NOT shippable as default).
+    ///
+    /// 16-bit TQ is intentionally **NOT supported** — at 2 bytes/element
+    /// it is structurally redundant with F16 dense (`HF2Q_USE_DENSE=1`)
+    /// and adds no compression benefit. See ADR §F-2 finding.
+    ///
+    /// When unset, falls back to `HF2Q_TQ_CODEBOOK_BITS` env var (default 8).
+    /// When set, this flag wins and pre-populates the env var before the
+    /// engine initializes.
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(["4", "5", "6", "8"]))]
+    pub kv_bits: Option<String>,
+
     /// Override chat template with a Jinja2 string
     ///
     /// Priority order (per ADR-005 Phase 1): this flag > --chat-template-file >
