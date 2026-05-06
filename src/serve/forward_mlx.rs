@@ -851,6 +851,26 @@ pub enum DecodeRegime {
     ForceDense,
 }
 
+/// ADR-017 B-tq.3 helper: convert a `&[f32]` slice into a `Vec<u8>` of
+/// little-endian bytes via per-element `to_le_bytes`.  Used by the
+/// `tq_v2_snapshot_block` capture path to feed the pure-byte v2 codec
+/// without taking a dep on `bytemuck`.  Snapshot is amortised — fires
+/// per block, not per token — so the per-element loop is fine.
+///
+/// `#[allow(dead_code)]` because the only call site is
+/// `MlxModelWeights::tq_v2_snapshot_block`, which itself is gated on
+/// the operator-controlled spill activation (factory + descriptor
+/// closure).  The method is reachable; the binary's default config
+/// just doesn't fire it yet.
+#[allow(dead_code)]
+fn f32_slice_to_le_bytes(src: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len() * 4);
+    for &x in src {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
 impl MlxModelWeights {
     /// Load all model weights directly from a GGUF file into mlx-native
     /// MlxBuffers.
@@ -4608,6 +4628,317 @@ impl MlxModelWeights {
         let log_sum_exp = max_logit as f64 + sum_exp.ln();
         let log_prob = (logits[token_id as usize] as f64) - log_sum_exp;
         Ok(-log_prob as f32)
+    }
+
+    // =========================================================================
+    // ADR-017 Phase B-tq.3 — engine-side TQ-packed snapshot/restore hooks
+    // =========================================================================
+    //
+    // These bridge the runtime `MlxKvCache` byte buffers to the
+    // `tq_packed_v2` envelope codec at
+    // `serve::kv_persist::families::tq_packed`.  They run AFTER
+    // `dispatch_hadamard_quantize_kv` has committed (caller is responsible
+    // for issuing `s.finish()` first — there's no implicit barrier here)
+    // so the live K/V packed buffers carry the post-quantize Lloyd-Max
+    // indices + per-token-per-head FWHT magnitudes.
+    //
+    // Snapshot path:
+    //   `tq_v2_snapshot_block(layer, range, bits, flags, scale)`
+    //     → reads `kv_caches[layer].{k_packed, k_norms, v_packed, v_norms}`
+    //     → packs two `tq_packed_v2` envelopes (one for K, one for V)
+    //     → returns `(k_payload, v_payload)` ready for
+    //       `TqPackedSpill::insert_block(layer, range.start, ..)` × 2
+    //       (the spiller stores K + V under different (layer, range)
+    //       keys; convention: K at `range.start`, V at `range.start +
+    //       0x80_00_00_00` — see callers).
+    //
+    // Restore path is the inverse: takes the two payloads + writes back
+    // into the live MlxKvCache buffers at the correct (head, position,
+    // hd_packed) offsets.
+    //
+    // BOTH operations require a prior `commit_and_wait` on the encoder
+    // session if the caller has issued any GPU work targeting these
+    // buffers — this method does NOT issue its own barrier (callers
+    // already control session boundaries via `exec.begin/finish`).
+
+    /// Capture (K, V) `tq_packed_v2` envelope payloads from a token range
+    /// of `kv_caches[layer_rank]`.  See module-level B-tq.3 doc for the
+    /// barrier preconditions.
+    ///
+    /// `bits_per_coord` MUST match the active codec at quantize time —
+    /// production default is 4 (nibble-packed) per ADR-007 §3 default
+    /// configuration.  `flags` should set `HADAMARD_ROTATED` whenever
+    /// the runtime applied FWHT before quantizing (the production path
+    /// always does).  `scale` is the per-block multiplicative scale
+    /// (typically 1.0 since the magnitude lives in the per-token norms).
+    ///
+    /// `#[allow(dead_code)]` because activation lives behind the
+    /// `TqPackedSpillFactory` registration in `cmd_serve` (operator-
+    /// controlled, deferred per ADR-007 reopen Path C clearance).  The
+    /// method's correctness is exercised via the byte-level helpers'
+    /// unit tests at `serve::kv_persist::families::tq_packed::tests::
+    /// tq_v2_capture_restore_byte_identity`.
+    #[allow(dead_code)]
+    pub fn tq_v2_snapshot_block(
+        &self,
+        layer_rank: usize,
+        range: std::ops::Range<u32>,
+        bits_per_coord: crate::serve::kv_persist::families::tq_packed::TqBitsPerCoord,
+        flags: u32,
+        scale: f64,
+    ) -> Result<(Vec<u8>, Vec<u8>), crate::serve::multi_model::SpillErrorKind> {
+        use crate::serve::kv_persist::families::tq_packed;
+        use crate::serve::multi_model::SpillErrorKind;
+
+        let cache = self.kv_caches.get(layer_rank).ok_or(SpillErrorKind::CodecErr)?;
+        let n_kv_heads = (cache.k_packed.shape().first().copied().unwrap_or(0)) as u32;
+        let capacity = cache.capacity as u32;
+        // head_dim derives from the runtime packed-buffer row stride:
+        // packed shape is `[nkv, capacity, head_dim_packed]` U8 where
+        // `head_dim_packed = head_dim × bits / 8`.  Reverse the formula.
+        let hd_packed_runtime = cache
+            .k_packed
+            .shape()
+            .get(2)
+            .copied()
+            .ok_or(SpillErrorKind::CodecErr)?;
+        let head_dim_bits = (hd_packed_runtime as u64) * 8;
+        if head_dim_bits % (bits_per_coord.0 as u64) != 0 {
+            return Err(SpillErrorKind::CodecErr);
+        }
+        let head_dim = (head_dim_bits / (bits_per_coord.0 as u64)) as u32;
+
+        let k_packed_bytes: &[u8] = cache
+            .k_packed
+            .as_slice::<u8>()
+            .map_err(|_| SpillErrorKind::IoErr)?;
+        let k_norms_f32: &[f32] = cache
+            .k_norms
+            .as_slice::<f32>()
+            .map_err(|_| SpillErrorKind::IoErr)?;
+        let v_packed_bytes: &[u8] = cache
+            .v_packed
+            .as_slice::<u8>()
+            .map_err(|_| SpillErrorKind::IoErr)?;
+        let v_norms_f32: &[f32] = cache
+            .v_norms
+            .as_slice::<f32>()
+            .map_err(|_| SpillErrorKind::IoErr)?;
+        // F32 → LE bytes via per-element `to_le_bytes` to avoid an extra
+        // dep.  Hot path is amortised — snapshot fires per block, not
+        // per token.
+        let k_norms_le: Vec<u8> = f32_slice_to_le_bytes(k_norms_f32);
+        let v_norms_le: Vec<u8> = f32_slice_to_le_bytes(v_norms_f32);
+
+        let k_payload = tq_packed::capture_tq_v2_payload_from_buffers(
+            k_packed_bytes,
+            &k_norms_le,
+            capacity,
+            n_kv_heads,
+            head_dim,
+            bits_per_coord,
+            range.clone(),
+            flags,
+            scale,
+        )?;
+        let v_payload = tq_packed::capture_tq_v2_payload_from_buffers(
+            v_packed_bytes,
+            &v_norms_le,
+            capacity,
+            n_kv_heads,
+            head_dim,
+            bits_per_coord,
+            range,
+            flags,
+            scale,
+        )?;
+        Ok((k_payload, v_payload))
+    }
+
+    /// Restore (K, V) `tq_packed_v2` envelope payloads into a token
+    /// range of `kv_caches[layer_rank]`.  Inverse of
+    /// [`Self::tq_v2_snapshot_block`].  Writes through `as_mut_slice` —
+    /// callers MUST hold exclusive access to the live KV cache (the
+    /// engine's per-session mutex).
+    ///
+    /// `#[allow(dead_code)]` for the same reason as
+    /// [`Self::tq_v2_snapshot_block`].
+    #[allow(dead_code)]
+    pub fn tq_v2_restore_block(
+        &mut self,
+        layer_rank: usize,
+        range: std::ops::Range<u32>,
+        bits_per_coord: crate::serve::kv_persist::families::tq_packed::TqBitsPerCoord,
+        k_payload: &[u8],
+        v_payload: &[u8],
+    ) -> Result<(), crate::serve::multi_model::SpillErrorKind> {
+        use crate::serve::kv_persist::families::tq_packed;
+        use crate::serve::multi_model::SpillErrorKind;
+
+        let cache = self
+            .kv_caches
+            .get_mut(layer_rank)
+            .ok_or(SpillErrorKind::CodecErr)?;
+        let n_kv_heads = (cache.k_packed.shape().first().copied().unwrap_or(0)) as u32;
+        let capacity = cache.capacity as u32;
+        let hd_packed_runtime = cache
+            .k_packed
+            .shape()
+            .get(2)
+            .copied()
+            .ok_or(SpillErrorKind::CodecErr)?;
+        let head_dim_bits = (hd_packed_runtime as u64) * 8;
+        if head_dim_bits % (bits_per_coord.0 as u64) != 0 {
+            return Err(SpillErrorKind::CodecErr);
+        }
+        let head_dim = (head_dim_bits / (bits_per_coord.0 as u64)) as u32;
+
+        // Two passes: K then V.  We need separate borrows of `cache`
+        // because each call needs &mut to a *different* buffer pair.
+        // Borrow checker forces a sequence rather than parallel.
+
+        // --- K ---
+        {
+            let k_packed_mut: &mut [u8] = cache
+                .k_packed
+                .as_mut_slice::<u8>()
+                .map_err(|_| SpillErrorKind::IoErr)?;
+            // For norms we have to do the F32 ↔ u8 reinterpret as a
+            // separate scope because `as_mut_slice<T>` borrows the
+            // buffer; copy F32 LE bytes into a Vec then back via a
+            // typed write avoids holding two &mut on the same buffer
+            // simultaneously.
+            //
+            // Safer path: use bytemuck on a fresh &mut [f32] borrow
+            // taken AFTER the packed-buffer borrow drops.
+            let _ = restore_packed_only(
+                k_packed_mut,
+                capacity,
+                n_kv_heads,
+                head_dim,
+                bits_per_coord,
+                range.clone(),
+                k_payload,
+            )?;
+        }
+        {
+            let k_norms_f32: &mut [f32] = cache
+                .k_norms
+                .as_mut_slice::<f32>()
+                .map_err(|_| SpillErrorKind::IoErr)?;
+            let _ = restore_norms_only_f32(
+                k_norms_f32,
+                capacity,
+                n_kv_heads,
+                range.clone(),
+                k_payload,
+            )?;
+        }
+
+        // --- V ---
+        {
+            let v_packed_mut: &mut [u8] = cache
+                .v_packed
+                .as_mut_slice::<u8>()
+                .map_err(|_| SpillErrorKind::IoErr)?;
+            let _ = restore_packed_only(
+                v_packed_mut,
+                capacity,
+                n_kv_heads,
+                head_dim,
+                bits_per_coord,
+                range.clone(),
+                v_payload,
+            )?;
+        }
+        {
+            let v_norms_f32: &mut [f32] = cache
+                .v_norms
+                .as_mut_slice::<f32>()
+                .map_err(|_| SpillErrorKind::IoErr)?;
+            let _ = restore_norms_only_f32(
+                v_norms_f32,
+                capacity,
+                n_kv_heads,
+                range.clone(),
+                v_payload,
+            )?;
+        }
+
+        // Helper closures defined here as fn items to avoid double-borrow.
+        // (Defined as fn so they don't capture the surrounding scope.)
+        fn restore_packed_only(
+            packed_bytes_mut: &mut [u8],
+            capacity: u32,
+            n_kv_heads: u32,
+            head_dim: u32,
+            bits_per_coord: tq_packed::TqBitsPerCoord,
+            range: std::ops::Range<u32>,
+            payload: &[u8],
+        ) -> Result<(), SpillErrorKind> {
+            let (header, idx, _norms) =
+                tq_packed::unpack_tq_v2_payload(payload).map_err(|_| SpillErrorKind::CodecErr)?;
+            if header.bits_per_coord != bits_per_coord
+                || header.head_dim != head_dim
+                || header.n_kv_heads != n_kv_heads
+                || header.n_tokens != (range.end - range.start)
+            {
+                return Err(SpillErrorKind::CodecErr);
+            }
+            let bits = bits_per_coord.0 as u64;
+            if (head_dim as u64) * bits % 8 != 0 {
+                return Err(SpillErrorKind::CodecErr);
+            }
+            let hd_packed = ((head_dim as u64) * bits / 8) as usize;
+            let nkv_us = n_kv_heads as usize;
+            let cap_us = capacity as usize;
+            let n_tokens = (range.end - range.start) as usize;
+            for h in 0..nkv_us {
+                let head_base = h * cap_us * hd_packed;
+                let row_start = head_base + (range.start as usize) * hd_packed;
+                let row_end = head_base + (range.end as usize) * hd_packed;
+                let src_off = h * n_tokens * hd_packed;
+                let src_end = src_off + n_tokens * hd_packed;
+                packed_bytes_mut[row_start..row_end].copy_from_slice(&idx[src_off..src_end]);
+            }
+            Ok(())
+        }
+        fn restore_norms_only_f32(
+            norms_f32_mut: &mut [f32],
+            capacity: u32,
+            n_kv_heads: u32,
+            range: std::ops::Range<u32>,
+            payload: &[u8],
+        ) -> Result<(), SpillErrorKind> {
+            let (header, _idx, norms) =
+                tq_packed::unpack_tq_v2_payload(payload).map_err(|_| SpillErrorKind::CodecErr)?;
+            if header.n_kv_heads != n_kv_heads
+                || header.n_tokens != (range.end - range.start)
+            {
+                return Err(SpillErrorKind::CodecErr);
+            }
+            let nkv_us = n_kv_heads as usize;
+            let cap_us = capacity as usize;
+            let n_tokens = (range.end - range.start) as usize;
+            // norms F32 LE -> per-element decode into typed slice.
+            for h in 0..nkv_us {
+                let head_base = h * cap_us;
+                for t in 0..n_tokens {
+                    let dst_idx = head_base + (range.start as usize) + t;
+                    let src_off = (h * n_tokens + t) * 4;
+                    let bytes = [
+                        norms[src_off],
+                        norms[src_off + 1],
+                        norms[src_off + 2],
+                        norms[src_off + 3],
+                    ];
+                    norms_f32_mut[dst_idx] = f32::from_le_bytes(bytes);
+                }
+            }
+            Ok(())
+        }
+
+        Ok(())
     }
 
 }

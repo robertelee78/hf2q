@@ -102,7 +102,7 @@ context for operators) is satisfied by either.
   round-trip exactly, the dequantized state is element-wise byte-equal,
   so cosine = 1.0 trivially.
 
-## Forward compat (B-tq.2+)
+## Forward compat (B-tq.2 + B-tq.3)
 
 When the runtime TurboQuant path stabilizes (ADR-007 reopen 2026-05-05
 Path C completion plan), B-tq.2 lands the engine-side `KvCacheSpill`
@@ -112,3 +112,31 @@ the version requires a B-tq.X migration plan (read both versions,
 write only the latest).  `tq_packed::tests::tq_packed_v1_magic_is_frozen`
 + `tq_packed_v1_codec_version_is_frozen` enforce this at unit-test
 time so a regression on the wire format would surface as a CI failure.
+
+## v2 envelope (B-tq.3, 2026-05-06)
+
+B-tq.3 adds `payload_kind = "tq_packed_v2"` for engine wiring (magic
+`b"TQP2"` = `0x32_50_51_54`, codec_version = 2).  v2 is needed because
+v1's single `scale: f64` field cannot round-trip the runtime's
+per-token-per-head norms (`MlxKvCache.k_norms`/`v_norms` are
+`[num_kv_heads, capacity]` F32, not a single scalar).  v2 extends the
+body with an F32-LE norms stream after the indices:
+
+```
+bytes_on_disk_tq_v2 = 2 (K + V) × (40
+                                   + ceil(n_kv × n_tok × hd × bits / 8)
+                                   + 4 × n_kv × n_tok)
+```
+
+The norms tail is `n_kv × n_tok × 4` bytes per envelope (F32 LE).  At
+8K prefix with `n_kv=8`, `n_tok=8192` that's 256 KiB extra per K and
+per V envelope — a < 0.4% increase over v1's 67 MiB indices stream
+for the sliding 4-bit case.  Storage ratio vs dense F32 is
+effectively unchanged (8.00× → 7.97× at 8K, the loss vanishes at 32K).
+
+v1 remains FROZEN — both `tq_packed_v1_magic_is_frozen` and
+`tq_packed_v2_magic_is_frozen` (plus their `codec_version` siblings)
+enforce wire-format stability at CI-test time.  Cross-version reject
+tests (`tq_packed_v1_reader_rejects_v2_payload` + symmetric) prove
+the dispatcher in `TqPackedSpill::insert_block` cannot silently route
+the wrong codec.
