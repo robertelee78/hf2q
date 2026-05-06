@@ -158,6 +158,20 @@ pub struct InvestigationEnv {
     /// ack required.
     pub dump_pre_quant: bool,
 
+    /// `HF2Q_DUMP_PRE_QUANT_LAYERS=0,15,30,45,60` — comma-separated layer
+    /// indices to include in `dump_pre_quant`. Empty (default) means
+    /// `[0]` only (legacy behavior preserved). When set, the
+    /// `kv_seq_len == 23` gate is also relaxed to fire at every position
+    /// in `dump_pre_quant_positions` (or every position if that's empty).
+    /// Path C F-0.3 distribution measurement.
+    pub dump_pre_quant_layers: Vec<usize>,
+
+    /// `HF2Q_DUMP_PRE_QUANT_POSITIONS=23,50,100,200,500` — comma-separated
+    /// `kv_seq_len` values at which to fire the pre-quant dump. Empty
+    /// (default) means `[23]` only (legacy behavior preserved). Path C
+    /// F-0.3 distribution measurement.
+    pub dump_pre_quant_positions: Vec<usize>,
+
     /// `HF2Q_DUMP_LAYERS_LIST=0,5` — comma-separated layer indices to
     /// include in the TQ state dump. Empty list (default) means ALL layers
     /// when `dump_tq_state` is set. Parsed as `Vec<usize>`.
@@ -516,6 +530,8 @@ impl InvestigationEnv {
             dump_all_cache: env_eq_one("HF2Q_DUMP_ALL_CACHE"),
             dump_tq_state: env_eq_one("HF2Q_DUMP_TQ_STATE"),
             dump_pre_quant: env_eq_one("HF2Q_DUMP_PRE_QUANT"),
+            dump_pre_quant_layers: env_usize_list("HF2Q_DUMP_PRE_QUANT_LAYERS"),
+            dump_pre_quant_positions: env_usize_list("HF2Q_DUMP_PRE_QUANT_POSITIONS"),
             dump_tq_layers_list: env_usize_list("HF2Q_DUMP_LAYERS_LIST"),
             dump_rendered_prompt: env::var("HF2Q_DUMP_RENDERED_PROMPT").ok(),
             dump_prompt_tokens: env::var("HF2Q_DUMP_PROMPT_TOKENS").is_ok(),

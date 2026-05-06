@@ -1985,7 +1985,28 @@ impl MlxModelWeights {
                 // Fires BEFORE dispatch_hadamard_quantize_kv — captures raw F32 K (attn_k_normed)
                 // and V (attn_v or moe_expert_out) at the exact moment before TQ encode.
                 // Category-4 read-only diagnostic; no HF2Q_UNSAFE_EXPERIMENTS ack required.
-                if INVESTIGATION_ENV.dump_pre_quant && layer_idx == 0 && kv_seq_len == 23 {
+                // Path C F-0.3 generalization: if HF2Q_DUMP_PRE_QUANT_LAYERS or
+                // HF2Q_DUMP_PRE_QUANT_POSITIONS is set, fire at every matching
+                // (layer, kv_seq_len) pair and write per-(layer, position) files
+                // named L{layer:02}_p{pos:04}_{k,v}_pre_quant.f32.bin. Otherwise
+                // preserve legacy single-file behavior at L0 / kv_seq_len=23.
+                let pre_quant_layers_filter = &INVESTIGATION_ENV.dump_pre_quant_layers;
+                let pre_quant_positions_filter = &INVESTIGATION_ENV.dump_pre_quant_positions;
+                let pre_quant_extended = !pre_quant_layers_filter.is_empty()
+                    || !pre_quant_positions_filter.is_empty();
+                let layer_match = if pre_quant_extended {
+                    pre_quant_layers_filter.is_empty()
+                        || pre_quant_layers_filter.contains(&layer_idx)
+                } else {
+                    layer_idx == 0
+                };
+                let pos_match = if pre_quant_extended {
+                    pre_quant_positions_filter.is_empty()
+                        || pre_quant_positions_filter.contains(&kv_seq_len)
+                } else {
+                    kv_seq_len == 23
+                };
+                if INVESTIGATION_ENV.dump_pre_quant && layer_match && pos_match {
                     s.finish()
                         .map_err(|e| anyhow::anyhow!("pre_quant dump finish L{layer_idx}: {e}"))?;
                     let dump_dir = &INVESTIGATION_ENV.dump_dir;
@@ -1993,7 +2014,23 @@ impl MlxModelWeights {
                     std::fs::create_dir_all(&pre_quant_dir)
                         .map_err(|e| anyhow::anyhow!("pre_quant mkdir: {e}"))?;
 
-                    // k_pre_quant.f32.bin — K pre-quant [nkv, hd] F32 little-endian
+                    // Filenames: legacy = `k_pre_quant.f32.bin`; extended =
+                    // `L{layer:02}_p{kv_seq_len:04}_k_pre_quant.f32.bin`.
+                    let (k_fname, v_fname, meta_fname) = if pre_quant_extended {
+                        (
+                            format!("L{:02}_p{:04}_k_pre_quant.f32.bin", layer_idx, kv_seq_len),
+                            format!("L{:02}_p{:04}_v_pre_quant.f32.bin", layer_idx, kv_seq_len),
+                            format!("L{:02}_p{:04}_meta.json", layer_idx, kv_seq_len),
+                        )
+                    } else {
+                        (
+                            "k_pre_quant.f32.bin".to_string(),
+                            "v_pre_quant.f32.bin".to_string(),
+                            "meta.json".to_string(),
+                        )
+                    };
+
+                    // K pre-quant [nkv, hd] F32 little-endian
                     {
                         let k_raw: &[f32] = self.activations.attn_k_normed.as_slice()
                             .map_err(|e| anyhow::anyhow!("pre_quant k_normed read: {e}"))?;
@@ -2004,13 +2041,13 @@ impl MlxModelWeights {
                                 n_elems * std::mem::size_of::<f32>(),
                             )
                         };
-                        let kp = format!("{pre_quant_dir}/k_pre_quant.f32.bin");
+                        let kp = format!("{pre_quant_dir}/{k_fname}");
                         std::fs::write(&kp, k_bytes)
                             .map_err(|e| anyhow::anyhow!("write {kp}: {e}"))?;
-                        eprintln!("[PRE_QUANT_DUMP] k_pre_quant [{nkv},{hd}] f32 -> {kp}");
+                        eprintln!("[PRE_QUANT_DUMP] L{layer_idx} p{kv_seq_len} k_pre_quant [{nkv},{hd}] f32 -> {kp}");
                     }
 
-                    // v_pre_quant.f32.bin — V pre-quant [nkv, hd] F32 little-endian
+                    // V pre-quant [nkv, hd] F32 little-endian
                     {
                         let v_raw: &[f32] = v_src.as_slice()
                             .map_err(|e| anyhow::anyhow!("pre_quant v_src read: {e}"))?;
@@ -2021,10 +2058,10 @@ impl MlxModelWeights {
                                 n_elems * std::mem::size_of::<f32>(),
                             )
                         };
-                        let vp = format!("{pre_quant_dir}/v_pre_quant.f32.bin");
+                        let vp = format!("{pre_quant_dir}/{v_fname}");
                         std::fs::write(&vp, v_bytes)
                             .map_err(|e| anyhow::anyhow!("write {vp}: {e}"))?;
-                        eprintln!("[PRE_QUANT_DUMP] v_pre_quant [{nkv},{hd}] f32 -> {vp}");
+                        eprintln!("[PRE_QUANT_DUMP] L{layer_idx} p{kv_seq_len} v_pre_quant [{nkv},{hd}] f32 -> {vp}");
                     }
 
                     // meta.json sidecar with provenance
@@ -2047,7 +2084,7 @@ impl MlxModelWeights {
                         });
                         let meta_str = serde_json::to_string_pretty(&meta)
                             .map_err(|e| anyhow::anyhow!("pre_quant meta json: {e}"))?;
-                        let mp = format!("{pre_quant_dir}/meta.json");
+                        let mp = format!("{pre_quant_dir}/{meta_fname}");
                         std::fs::write(&mp, meta_str.as_bytes())
                             .map_err(|e| anyhow::anyhow!("write {mp}: {e}"))?;
                         eprintln!("[PRE_QUANT_DUMP] meta -> {mp}");
