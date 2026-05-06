@@ -1,6 +1,6 @@
 # ADR-007: TurboQuant KV Cache Compression for 262K Context
 
-**Status:** **CLOSED 2026-04-24 — MERGED TO MAIN; TQ-8-BIT IS DEFAULT; DENSE IS OPT-OUT.** After 27 iterations of bug-fixes + goalie-research-driven strategic pivot (2026-04-24) from byte-exact to industry-standard semantic gate, the cumulative TQ infrastructure landed on main in merge commit `42e840d`. The default decode path is 8-bit native TurboQuant with Lloyd-Max HB SDPA (2× KV memory savings vs F16; fluent output at 85 tok/s; meets every published industry shippability gate). Dense is opt-out via `HF2Q_USE_DENSE=1` (or `HF2Q_LAYER_POLICY=dense_all`) when byte-exact vs llama.cpp is required — e.g. `scripts/sourdough_gate.sh` sets it and passes at 3656 bytes (floor 3094). Gate A cosine mean 0.9998 exceeds TurboQuant paper 0.999; Gate A cosine p1 0.9986 exceeds 0.99; Gate B argmax divergence 0.8% exceeds <1%; Gate C PPL delta 1.24% / absolute 0.017 / bits-per-token ~0.022 (below perceptible quality threshold). The 1% / 1.15% PPL % thresholds were hf2q-specific strict additions — TurboQuant paper / KIVI / KVQuant / AmesianX / tonbistudio / vLLM / ollama / DEJAN all ship TQ via cosine + benchmark parity, not strict PPL %. **History note:** iter-28 (commit `1cf3f63`) initially flipped the default to dense as the conservative close; 2026-04-24 user feedback "TQ should be default if it is better" corrected this — the post-close default-correction restores TQ-8-bit as the default since it IS better (2× memory at imperceptible quality delta). Three lockstep gates updated in `forward_mlx.rs` (primary + lazy-alloc + use_dense_sdpa) and `forward_prefill.rs` (prefill lazy-alloc) so all four code paths agree on the default. Complete 27-iter journey + final state in the `§ CLOSED 2026-04-24` section at document end.
+**Status:** **REOPENED 2026-05-05 — Path C completion plan; see `§ REOPENED 2026-05-05 — Path C: Earn the Close` at document end for Why / What / Acceptance Criteria.** Previously **CLOSED 2026-04-24 — MERGED TO MAIN; TQ-8-BIT IS DEFAULT; DENSE IS OPT-OUT.** After 27 iterations of bug-fixes + goalie-research-driven strategic pivot (2026-04-24) from byte-exact to industry-standard semantic gate, the cumulative TQ infrastructure landed on main in merge commit `42e840d`. The default decode path is 8-bit native TurboQuant with Lloyd-Max HB SDPA (2× KV memory savings vs F16; fluent output at 85 tok/s; meets every published industry shippability gate). Dense is opt-out via `HF2Q_USE_DENSE=1` (or `HF2Q_LAYER_POLICY=dense_all`) when byte-exact vs llama.cpp is required — e.g. `scripts/sourdough_gate.sh` sets it and passes at 3656 bytes (floor 3094). Gate A cosine mean 0.9998 exceeds TurboQuant paper 0.999; Gate A cosine p1 0.9986 exceeds 0.99; Gate B argmax divergence 0.8% exceeds <1%; Gate C PPL delta 1.24% / absolute 0.017 / bits-per-token ~0.022 (below perceptible quality threshold). The 1% / 1.15% PPL % thresholds were hf2q-specific strict additions — TurboQuant paper / KIVI / KVQuant / AmesianX / tonbistudio / vLLM / ollama / DEJAN all ship TQ via cosine + benchmark parity, not strict PPL %. **History note:** iter-28 (commit `1cf3f63`) initially flipped the default to dense as the conservative close; 2026-04-24 user feedback "TQ should be default if it is better" corrected this — the post-close default-correction restores TQ-8-bit as the default since it IS better (2× memory at imperceptible quality delta). Three lockstep gates updated in `forward_mlx.rs` (primary + lazy-alloc + use_dense_sdpa) and `forward_prefill.rs` (prefill lazy-alloc) so all four code paths agree on the default. Complete 27-iter journey + final state in the `§ CLOSED 2026-04-24` section at document end.
 **Date:** 2026-04-14 (original); revised 2026-04-21 (honest current-state rewrite); 2026-04-21 (C-0 audit completion + Codex-reviewed revision); 2026-04-21 (C-0b localization + Codex-reviewed narrowing); 2026-04-22 (C-1 VERIFICATION_BLOCKED + 2 harness defects identified); 2026-04-22 (C-1-unlock dual-mode single-step clear + scope caveats); **2026-04-24 CLOSED** (27-iter investigation complete; strategic pivot to industry-standard gate; 8-bit native TQ meets TurboQuant paper standard; merged to main in `42e840d`; initial close flipped default to dense via `1cf3f63`; post-close correction restored TQ-8-bit as default per user feedback "TQ should be default if it is better"; sourdough_gate.sh forces dense explicitly to preserve byte-exact coverage).
 **Decision Makers:** Robert, Claude
 **Related ADRs:** ADR-006 (mlx-native GPU backend — KV cache path lives here), ADR-005 (inference server — speed gates), ADR-008 (candle-divorce port — introduced ring-chronology regression), ADR-009 (Track 3 dense-SDPA "safe fallback" — the stub this ADR's mantra forbids)
@@ -1159,3 +1159,214 @@ Measured under fixed-token-replay methodology (iter 24-26, Codex cross-verified)
 - pi-brain entries: f00ce013 (iter 16), 04a8dd90 (iter 17), 3084315d (iter 18), c6ba227e (iter 19), 5c3cca0a (iter 20), c94edc7f (iter 21), faa476bd (iter 23), 9f6cb492 (iter 24)
 - Merge commit: `42e840d` (TQ infrastructure → main)
 - Default-flip commit: `1cf3f63` (dense as default)
+
+---
+
+## § REOPENED 2026-05-05 — Path C: Earn the Close
+
+**Status:** REOPENED. ADR-007 was closed 2026-04-24 against industry-standard cosine + benchmark gates with five explicit deferrals ("Future work items"). Re-reading the close against the engineering mantra (`docs/ADR-007:139` — "DO NOT BE LAZY... No fallback. No stub (todo later) code... Measure 3x, cut once... Chesterton's fence") shows the close took five shortcuts the mantra explicitly forbids. This section reopens the ADR with a falsifier-driven plan to **earn** the close: do Phase 0 retroactively, resolve C-2→C-4 deferrals, root-cause iter-27, formalize the `dense_kvs` decision, unlock 262K context (the original headline goal), run paper-standard benchmarks, and freeze the on-disk codec contractually so ADR-017 B-tq.1 can land.
+
+This section is structured for an engineer cold-starting the work: every phase has explicit deliverable paths, named gates with measurement methodology, and a falsifier that must clear before the next phase begins.
+
+### Why (problem)
+
+Five mantra-violations in the 2026-04-24 close, plus four un-shipped commitments from the original ADR scope.
+
+#### Mantra-violations in the existing close
+
+1. **Phase 0 is still SKIPPED.** ADR §327 (`## Phase 0 — Validate & Measure`) explicitly says `**STATUS: SKIPPED**`. The original ADR required CPU F32 reference + layer-by-layer divergence audit before any Metal kernel work; the close shipped on industry-gate cosine + sourdough fluency instead. Without the Phase-0 oracle, every "imperceptible delta" claim at close (cosine 0.9998, PPL 1.24%) is unaudited at the kernel boundary — we cannot localize where the residual error originates, only that the aggregate output looks fluent. *Mantra rule violated:* `Measure 3x, cut once`. The 2026-04-21 mantra-addendum at line 148 already flagged this as the dominant reason gates were red; the close did not retire that addendum.
+
+2. **`dense_kvs` Track 3 was relabeled, not removed.** Original Path-to-Completion C-4 (line 527-528) says: *"Remove the Track 3 stub, based on C-0b outcome. Mantra: 'No fallback. No stub (todo later) code.'"* The close section (line 1155) retired Track 3 by recategorizing `dense_kvs` as *"a principled mixed-precision code path"*. No measured policy matrix justifies the recategorization; the post_admit allocation in `forward_prefill.rs:274-285` still mirrors a fallback shape, and `HF2Q_USE_DENSE=1` is the documented escape hatch for "byte-exact vs llama.cpp" — i.e. it is exactly the fallback the original ADR forbade. *Mantra rule violated:* `No fallback. No stub.`
+
+3. **iter-27 calibrated-codebook collapse was never root-caused.** The close lists "Full calibrated-codebook implementation with proper tail handling (avoid iter-27 collapse mode)" as future-work item #1, but no document captures *why* iter-27 collapsed (only the symptom: tail-clip). The Chesterton's fence here — *why does the uncalibrated empirical-≈-N(0,1) Lloyd-Max codebook work in production?* — is undocumented. Without that fence written down, "calibrated codebook" is a deferred unknown that will collapse the same way next time. *Mantra rule violated:* `Chesterton's fence; always understand current fully before changing it.`
+
+4. **Gate C was relaxed, not earned.** Strict hf2q spec (line 1096 of close table): `<1.15% PPL delta`. Measured: `1.24%`. Close justification: *"industry standard uses MMLU/LongBench parity, not strict PPL %"*. But MMLU/LongBench parity was never measured — the relaxation was based on a literature survey, not a parity benchmark. *Mantra rule violated:* `No short cuts.` Gate-relaxation by appeal to literature without running the literature's actual benchmark is a shortcut.
+
+5. **C-2 → C-4 audit followups still open in the document body.** Lines 552, 575, 581, 698, 758, 768 list specific MED-severity items deferred from C-2 review to C-4: re-run multistep at real Gemma-4 sliding-layer shape (16/8/256, not the 8/4/256 Claude used), swap custom SplitMix64 for `rand::rngs::StdRng::seed_from_u64(0xC25EED)` to restore cross-team bit-identical comparability, fix or relabel singlestep `--oracle independent-floor` partial-independence at `tq_kernel_replay.rs:1014`, port Codex's `ManifestShaGate` hard-exit to the Claude harness. None landed before close. The C-3 *"representation_floor_confirmed"* verdict that retired the iter-2/3 trail was made *without* these audits resolved — so the floor claim that the close rests on has open audit debt. *Mantra rule violated:* `Never make assumptions.`
+
+#### Un-shipped commitments from original ADR scope
+
+6. **262K context unlock.** This was the ADR's *headline problem statement* (`# ADR-007: TurboQuant KV Cache Compression for 262K Context`, line 1). Phase 2.1 (line 397+) was the unlock plan; it is still listed as `STATUS: [ ] BLOCKED`. The close ships TQ infrastructure but leaves `let max_global_kv = 8192` in code as a "deliberate safety limit" (close future-work #4). The §286-317 memory budget table and §317-327 bandwidth analysis at 262K were never validated against measured numbers. *The ADR's title claim is unfulfilled.*
+
+7. **MMLU / LongBench / needle-in-haystack at 8-bit TQ.** Future-work #3 in close. These are the actual paper-standard benchmarks the close-section relaxation appealed to (TurboQuant paper / KIVI / KVQuant / AmesianX use them). Not running them is the second half of shortcut #4 above.
+
+8. **CLI `--kv-bits N` flag.** Future-work #2 in close. Currently env-only (`HF2Q_TQ_CODEBOOK_BITS`).
+
+9. **No on-disk codec-freeze migration contract.** ADR-017 §656 says A0.3 (TQ-active matrix execution) is *"tracked against ADR-007 codec freeze"*. No formal commitment exists in this ADR that the 8-bit Lloyd-Max ±5.065 byte-layout will not change. Without a migration contract, ADR-017 B-tq.1 (`src/serve/kv_persist/payloads/tq_packed.rs`) cannot land safely — any subsequent ADR-007 codec change would silently corrupt persisted spillover blocks.
+
+#### One more — calibrated codebook is also a research debt
+
+10. **16-bit TQ never investigated.** Future-work #5 in close. 0.5× memory savings vs F16, near-zero PPL expected. Cheap experiment if the codebook surface is generalized.
+
+### What (proposed solution)
+
+Eight phases, **dependency-ordered**. Each phase has a **falsifier** that must pass before the next phase begins. The mantra explicitly authorizes the time required: *"We have plenty of time to do it right. No short cuts."*
+
+Cross-cutting rule: every phase deliverable lives under `docs/adr007-pathC/<phase-id>/` (reports) or in production source under existing module roots (no new top-level dirs). Engineers must write evidence files before closing a phase.
+
+#### F-0. Phase 0 retroactive — Chesterton's fence (PRE-REQ FOR EVERYTHING)
+
+**Why first:** Items 1, 3, 5 above all collapse onto missing kernel-boundary measurement. Without it the rest of the work re-litigates iter-2/3.
+
+- **F-0.1** — CPU F32 reference implementation of decode TQ-active SDPA path. Source: new module `src/serve/tq_cpu_oracle.rs` (reuse F-1's harness types). Inputs: synthetic Gaussian K/V at production layer/head shape (Gemma 4 26B: layers=62, heads=4 KV, head_dim=256, sliding=1024, global=8192). Output: F32 attention scores + projected output, deterministic.
+- **F-0.2** — Layer-by-layer divergence audit. Run identical (Q, K-cache, V-cache, mask) through (a) `forward_decode` dense path, (b) `forward_decode` TQ path, (c) F-0.1 CPU oracle. Dump per-layer (`q@k.T`, `softmax_scores`, `out`) tensors. Compute NRMSE + max-abs-diff at each layer per pair. Report at `docs/adr007-pathC/F-0/divergence_audit.md` + raw arrays under `docs/adr007-pathC/F-0/dumps/`.
+- **F-0.3** — Empirical KV distribution measurement. For 4 representative prompts × 5 lengths × 62 layers × 4 KV-heads × head_dim=256, dump K/V tensors. Histogram per-(layer, head, sign-bin); compute per-(layer, head) `min/max/p1/p99/std`. This is the load-bearing data for F-2 (calibrated codebook). Report at `docs/adr007-pathC/F-0/empirical_kv_distribution.md` with histograms.
+- **Deliverables:** 3 measurement reports + `tq_cpu_oracle.rs` + dump arrays under `docs/adr007-pathC/F-0/`.
+- **Falsifier F-0:** any layer with `NRMSE(TQ vs F32 oracle) > 0.15` (the kernel's own declared bound from C-0 audit) → **STOP**. Localize to op (kernel / FWHT / dispatch) before proceeding to F-1. If no layer violates the bound, the close-state cosine 0.9998 is empirically grounded and Phases F-1+ can proceed. If multiple layers violate, the entire close is suspect and we re-open the iter-2/3 path — this is the falsifier the close should have run before retiring.
+
+#### F-1. Resolve C-2 → C-4 audit deferrals
+
+**Why second:** C-3's *"representation_floor_confirmed"* verdict gates the codebook-design assumptions of F-2. Until the deferred audits are resolved, F-2 is built on an un-audited floor.
+
+- **F-1.1** — Re-run multistep replay at real Gemma-4 sliding-layer shape `(16/8/256)`, not the `(8/4/256)` shape Claude used in iter-2. Surface in `tq_kernel_replay.rs::run_multistep`.
+- **F-1.2** — Replace custom SplitMix64 RNG in `tq_kernel_replay.rs` with `rand::rngs::StdRng::seed_from_u64(0xC25EED)` for cross-team bit-identical reproducibility.
+- **F-1.3** — Fix singlestep `--oracle independent-floor` partial-independence at `tq_kernel_replay.rs:1014`. Either correct the math or relabel the oracle as `--oracle shared-rng-floor` with explicit comment.
+- **F-1.4** — Port `ManifestShaGate` hard-exit (Codex's iter-2 contribution) to the Claude harness so manifest-SHA mismatch fails-fast rather than silently drifting.
+- **Deliverables:** `tq_kernel_replay.rs` patch + `docs/adr007-pathC/F-1/audit_resolutions.md` documenting verdict for each item.
+- **Falsifier F-1:** any audit item produces a verdict different from C-3 *representation_floor_confirmed* → reopen C-3 with the new evidence; mark F-2 BLOCKED until C-3 stance is updated.
+
+#### F-2. Calibrated codebook, root-caused
+
+**Why third:** Future-work #1. Iter-27 collapsed because the global `tail-clip` lost outlier resolution. F-0.3's per-(layer, head) distribution data tells us *which* heads have heavy tails and need wider dynamic range. Calibration must preserve outlier bins, not compress them.
+
+- **F-2.1** — Calibration design. Read F-0.3 distributions; pick per-(layer, head) dynamic-range estimator (likely robust p99-based, NOT min/max, NOT global). Document in `docs/adr007-pathC/F-2/calibration_design.md` *before* implementation. Include explicit answer to Chesterton's fence question: "why does the uncalibrated codebook work, and what would calibration have to preserve to not regress?"
+- **F-2.2** — Implementation. Add `CODEBOOK_HB_8BIT_CALIBRATED` to `mlx-native::turboquant.rs`. Wire through `flash_attn_vec_tq_hb` kernel. Default off; opt-in via `HF2Q_TQ_CALIBRATED=1`.
+- **F-2.3** — Measurement. Run Gate A/B/C at strict spec on Gemma 4 26B fixed-token replay corpus.
+- **Deliverables:** design doc + impl + tests + `docs/adr007-pathC/F-2/calibrated_gate_results.md`.
+- **Falsifier F-2:** strict gate `cosine ≥ 0.9999 AND argmax < 0.5% AND PPL < 1.15%`. If FAIL → either (a) iterate the design (max 2 attempts; document both); or (b) write `docs/adr007-pathC/F-2/uncalibrated_is_floor.md` with measured evidence that 8-bit uncalibrated *is* the achievable floor for this distribution and Gate C cannot be earned via codebook-tuning. Either outcome closes F-2 honestly. **Do not relax the gate.**
+
+#### F-3. `dense_kvs` decision, formally
+
+**Why fourth:** F-2's outcome is decisive. If F-2 PASSES, TQ alone clears strict spec → `dense_kvs` is dead weight → REMOVE. If F-2 FAILS to earn Gate C, mixed-precision is the only path to PPL parity → EARN with measured evidence.
+
+- **F-3-A (REMOVE):** retire `HF2Q_USE_DENSE=1` env var; delete `dense_kvs` allocation in `forward_prefill.rs:274-285`; delete `use_dense_sdpa` selector at `forward_mlx.rs::forward_decode`; sourdough gate is repointed at TQ-active with strict-spec tolerance. Source delta: ~300 LOC removed.
+- **F-3-B (EARN):** new ADR `docs/ADR-009-followup-mixed-precision-policy.md` with measured policy matrix: 4 layer policies (`dense_all`, `tq_all`, `tq_slide_dense_global`, `dense_slide_tq_global`) × 5 prefix lengths (0, 512, 2K, 8K, 32K) × {cosine, PPL, MMLU subset, memory MiB, decode t/s}. Each cell is a measured number, not a model. Decision: which policy ships as default. ADR-007 close-section §1080 shipping contract is updated to reference the new policy.
+- **Decision criterion:** F-2 verdict picks the branch. Only one of {A, B} is executed.
+- **Deliverables:** removal commit OR new ADR + measured matrix.
+- **Falsifier F-3:** N/A — this is a written decision. Mantra-compliance is binary: either the stub is gone, or it's measured-and-justified.
+
+#### F-4. 262K context unlock (the headline goal)
+
+**Why fifth:** F-2 + F-3 stabilize the codec. Now we earn the title.
+
+- **F-4.1** — Locate and remove `let max_global_kv = 8192` cap. (Search: `rg "max_global_kv\\s*=\\s*8192" src/`.) Replace with a runtime-sized allocation backed by §286 memory budget. Add safety telemetry: log warning above 64K, error above 200K + memory pressure threshold.
+- **F-4.2** — Memory budget validation. At 8K, 32K, 64K, 128K, 262K: measure actual GPU memory usage; compare to §286-317 prediction. PASS = within 5%.
+- **F-4.3** — Bandwidth validation. At same lengths: measure decode bandwidth utilization; compare to §317-327 (M5 Max 546 GB/s peak). PASS = TQ-active bandwidth ≥ 0.85× F16-equivalent throughput at design context.
+- **F-4.4** — Long-context coherence. Needle-in-haystack at 8K, 16K, 32K, 64K, 128K, 262K (random needle position; 50 prompts each length).
+- **Deliverables:** cap-removal commit + `docs/adr007-pathC/F-4/long_context_report.md`.
+- **Falsifier F-4:** retrieval failure rate `> 5% at ≤32K` OR `> 10% at 262K` → **STOP**. Likely surfaces sliding-window attention drift that the 256-token sourdough fixture masked. Root-cause before close.
+
+#### F-5. Paper-standard benchmarks (the actual close justification)
+
+**Why sixth:** The close-relaxation appealed to MMLU/LongBench parity but never measured it. F-5 closes that loop.
+
+- **F-5.1** — MMLU full at 8-bit TQ vs F16 dense baseline on Gemma 4 26B. Standard 5-shot.
+- **F-5.2** — LongBench full at 8-bit TQ vs F16 dense baseline.
+- **F-5.3** — Needle-in-haystack at 8/32/128/262K (subsumed by F-4.4 if scores carry forward).
+- **Deliverables:** benchmark suite under `tests/adr007-pathC/F-5/` (or appropriate eval-harness fork) + report at `docs/adr007-pathC/F-5/paper_standard_benchmarks.md`.
+- **Falsifier F-5:** parity delta `> 1pp` on MMLU OR `> 1pp` on LongBench → quality-gate FAIL → reopen F-2 (calibrated codebook is the lever). MMLU/LongBench parity replaces the relaxed Gate C as the operative quality gate.
+
+#### F-6. CLI + 16-bit opt-in
+
+- **F-6.1** — `cmd_serve --kv-bits N` flag at `src/cli.rs`. Wire through to `forward_mlx.rs::tq_codebook_bits`. Acceptable values: `{4, 5, 6, 8, 16}`. Validation: `8` is the default; `4/5/6` warn-with-quality-tradeoff (already documented); `16` is opt-in research mode.
+- **F-6.2** — 16-bit codebook variant. Add `CODEBOOK_HB_16BIT` to `turboquant.rs` with even-spaced quantization grid (16 bits = 65536 levels, near-F16 fidelity at 0.5× memory savings). Gate-A/B/C measurement; expected near-zero PPL delta.
+- **Deliverables:** CLI patch + 16-bit impl + tests.
+- **Falsifier F-6:** 16-bit Gate C `> 0.1% PPL delta` → root-cause (likely a wiring bug; 65536 levels is over-spec for any real KV distribution).
+
+#### F-7. Codec-freeze migration contract
+
+- **F-7.1** — New section in this ADR: `## Codec Freeze Contract`. States: 8-bit Lloyd-Max ±5.065 codebook + D=512 SIMD coord formula `(tx + ii*NL)*4` + ring-start convention `(kv_write_pos + 1) % cap` are the *frozen on-disk byte layout*. Any change requires a new ADR with a migration plan AND a wire-format version bump.
+- **F-7.2** — Defensive wire-format version field in TQ envelope. Add `tq_codec_version: u32 = 1` to whatever payload header ADR-017 B-tq.1 will consume. Version `1` = post-iter-25 codec described in close §1131-1137.
+- **Deliverables:** ADR addendum + envelope version field + ADR-017 §656 cross-reference update (`is_runnable_today` flip for `KvPath::TqActive` is now contractually safe).
+- **Falsifier F-7:** ADR-017 B-tq.1 author cannot import a stable codec version ID → fail; this phase blocks ADR-017 codec consumption. Sequencing: F-7 lands before ADR-017 B-tq.1 starts.
+
+### Acceptance Criteria
+
+Replaces the mantra-violating relaxations in the close-section table at line 1091. All gates are **strict** (no further relaxations); a gate fails one of two ways: (a) measured value misses the threshold and we go iterate, (b) measured value misses the threshold and we write a documented "this is the achievable floor" justification with evidence. Either outcome is honest; relaxation-by-handwave is not.
+
+#### Functional
+
+- **F-1** TQ-active SDPA byte-deterministic across runs at fixed seed (preserve close).
+- **F-2** `dense_kvs` is either removed (F-3-A) OR formally justified by measured policy matrix (F-3-B). Recategorization without measurement is not acceptable.
+- **F-3** Phase 0 evidence on disk under `docs/adr007-pathC/F-0/{cpu_oracle.md,divergence_audit.md,empirical_kv_distribution.md}` plus dump arrays.
+- **F-4** All C-2 → C-4 deferred audit items have written verdicts at `docs/adr007-pathC/F-1/audit_resolutions.md`.
+
+#### Performance
+
+- **P-1** 8-bit TQ decode t/s ≥ peer (llama.cpp same-quant) at every prefix length 0–262K (preserves close + extends to design context).
+- **P-2** 262K context generation runs to completion without memory exhaustion on M5 Max 64GB unified.
+- **P-3** Memory budget §286-317 prediction within 5% of measured at 8K, 32K, 64K, 128K, 262K.
+- **P-4** Bandwidth utilization ≥ 0.85× F16-equivalent at design context (F-4.3).
+
+#### Quality (strict, not relaxed)
+
+- **Q-1** Gate A cosine mean ≥ 0.999, p1 ≥ 0.99 (preserve close).
+- **Q-2** Gate B argmax divergence < 1% (preserve close).
+- **Q-3** Gate C PPL delta < 1.15% (strict). Either earned via F-2 OR formally closed as floor with evidence (F-2 falsifier branch). **No relaxation by appeal to literature.**
+- **Q-4** MMLU parity: |TQ - F16| ≤ 1pp on 5-shot full benchmark.
+- **Q-5** LongBench parity: |TQ - F16| ≤ 1pp.
+- **Q-6** Needle-in-haystack: ≥ 95% retrieval at ≤32K, ≥ 90% at 262K.
+- **Q-7** Calibrated-codebook root-cause writeup at `docs/adr007-pathC/F-2/` exists (either earned-spec design or floor-evidence document).
+- **Q-8** Layer-by-layer divergence audit report at `docs/adr007-pathC/F-0/divergence_audit.md` exists; no layer violates kernel's declared NRMSE ≤ 0.15 bound under fixed-token replay (Q-3 from line 470 of original ADR — finally answered).
+
+#### Engineering
+
+- **E-1** CLI `--kv-bits N` flag in `src/cli.rs`; passes `4/5/6/8/16`.
+- **E-2** 16-bit TQ opt-in implemented; Gate C delta < 0.1%.
+- **E-3** Codec-freeze migration contract section added to this ADR (F-7.1).
+- **E-4** TQ envelope wire-format version field shipped (F-7.2); ADR-017 B-tq.1 unblocked with stable codec ID.
+- **E-5** All five close-section "Future work items" retired or explicitly out-of-scope-with-justification.
+
+#### Mantra compliance
+
+- **M-1** Phase 0 evidence exists; `STATUS: SKIPPED` line at §327 is updated to `STATUS: COMPLETED 2026-MM-DD via Path C F-0`.
+- **M-2** `dense_kvs` decision is written, not relabeled. Either gone (F-3-A) or measured-policy-matrix (F-3-B).
+- **M-3** Gate C is earned at strict spec OR the strict spec is formally closed-as-unreachable with measured evidence.
+- **M-4** No future-work items remain in this ADR's "out of scope" list at close.
+- **M-5** All ten "Why (problem)" items above have a corresponding resolution evidence file under `docs/adr007-pathC/`.
+
+### Sequencing & estimated effort
+
+Phases run dependency-ordered (no parallelism between F-0/F-1/F-2 since each gates the next on real evidence). F-3 branches on F-2 verdict. F-4–F-7 can pipeline.
+
+| Phase | Effort (man-days) | Blocks | Blocked by |
+|---|---|---|---|
+| F-0 | 5–8 | F-1, F-2 | none |
+| F-1 | 2–3 | F-2 | F-0 |
+| F-2 | 5–10 (incl. up to 2 design iters) | F-3 | F-0, F-1 |
+| F-3 | 1 (REMOVE) or 5–8 (EARN, measured matrix) | F-7 contract | F-2 |
+| F-4 | 6–10 | F-5 long context | F-3 |
+| F-5 | 4–6 | none | F-4 |
+| F-6 | 2–3 | none | F-3 |
+| F-7 | 1–2 | ADR-017 B-tq.1 | F-3 |
+
+Total: 26–51 man-days (~5–10 weeks single-engineer), assuming F-0 surfaces nothing surprising. The mantra explicitly authorizes this duration: *"We have plenty of time to do it right. No short cuts."* If F-0 surfaces a layer-bound violation, expect F-0 → F-2 expansion to ~3× as iter-2/3's localization trail re-opens.
+
+### Out of scope (explicitly, with justification)
+
+Items deliberately *not* in Path C, with a written reason each (per mantra: don't accumulate new "future work" debt):
+
+- **4-bit / 5-bit / 6-bit codebooks shipping as default.** Documented quality gaps (4-bit cosine 0.9912, Gate B 5.3%, PPL 1.55% — all 3 FAIL at iter-23). Available as opt-in research modes via F-6.1 CLI flag; not a default candidate.
+- **Continuous batching impacts on TQ codec.** Separate concern; ADR-005 territory. Single-request parity is the gate Path C earns.
+- **TQ-active spillover format.** ADR-017 B-tq.1 territory. Path C's F-7 freezes the in-memory codec so B-tq.1 can ship on a stable byte layout; the on-disk envelope is ADR-017's responsibility.
+- **Cross-quant (Q4_K_M / Q6_K) interactions with TQ.** ADR §82 already established that K/V dtype is independent of weight quantization; weight-quant axis is orthogonal to TQ codec. Validating each weight-quant cell would multiply the F-4/F-5 matrix; we test on Q8_0 (close baseline) and trust the orthogonality.
+
+### References (additions for Path C)
+
+- `docs/ADR-007:139` — engineering mantra (load-bearing for this reopen).
+- `docs/ADR-007:148` — the 2026-04-21 mantra-addendum that the close did not retire.
+- `docs/ADR-007:327` — Phase 0 SKIPPED status (target of F-0).
+- `docs/ADR-007:527-528` — Original C-4 stub-removal directive (target of F-3).
+- `docs/ADR-007:552, 575, 581, 698, 758, 768` — C-2 → C-4 deferred audit items (target of F-1).
+- `docs/ADR-007:1096` — Gate C 0.09% short of strict spec (target of F-2 / Q-3).
+- `docs/ADR-007:1148` — 262K context cap deferral (target of F-4).
+- `docs/ADR-017-persistent-block-prefix-cache.md:602, 608, 656` — A0.3 + B-tq.1 dependency on ADR-007 codec freeze (target of F-7).
+- `feedback_substrate_must_not_synthesize_ship_gates.md` — 2026-04-30 user directive: gates measure or fail; never synthesize.
+- `feedback_harness_first_before_iter_chasing.md` — 2026-04-29 user directive: build the matrix harness BEFORE iter-chasing (F-0 obeys this).
+
+### Progress Log (Path C)
+
+| Iter | Date | Phase | Status | Commits / Detail |
+|---|---|---|---|---|
+| 1 | 2026-05-05 | F-0.1 | LANDED | mlx-native `52c87ff`. CPU F32 oracle for `flash_attn_vec_tq_hb` decode. 5/6/8-bit codebooks lifted from Metal-only into `pub const` Rust arrays (byte-identical, 1e-5 symmetry verified). `flash_attn_vec_tq_hb_oracle` mirrors kernel math: D=256 single-norm + D=512 per-block norms + ring-start logical_idx mask + sliding window + GQA + offline stable softmax + all-masked-returns-zeros. F32 throughout, deterministic serial reduction (bit-identical runs). 10 unit tests PASS. F-0 finding: `softcap` is in kernel params but never read in body (also true of dense `flash_attn_vec.metal`). Detail at `docs/adr007-pathC/F-0/iter-1.md`. |
+
