@@ -879,12 +879,30 @@ pub fn generate_qwen35_once(
         if lcp_resume_enabled {
             let stride =
                 crate::debug::INVESTIGATION_ENV.kv_lcp_deltanet_checkpoint_stride;
+            // ADR-017 Phase E.a B.5 Codex Phase-2b finding (HIGH):
+            // guard `stride > 0` before any division.  If operators set
+            // `HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=0` the probe would
+            // otherwise panic on integer division by zero.  Skip the
+            // probe entirely on stride == 0 — there are no stride-aligned
+            // chunks to find anyway.
+            if stride == 0 {
+                eprintln!(
+                    "[hf2q qwen35 lcp probe] stride=0; skipping descending \
+                     scan (HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE must be > 0)"
+                );
+                // Fall through to the rest of the function with
+                // `lcp_resume_start = 0` — runs fresh prefill normally.
+            }
             // Iterate stride-aligned chunk positions descending.  The
             // largest viable position is `(prompt_tokens.len() / stride)
             // * stride` — any larger position would have cached_prompt_len
             // > prompt_tokens.len(), failing the strict-prefix gate.
             // Smallest is `stride` (positions < stride aren't checkpointed).
-            let max_chunk_pos = (prompt_tokens.len() / stride).saturating_mul(stride);
+            let max_chunk_pos = if stride == 0 {
+                0
+            } else {
+                (prompt_tokens.len() / stride).saturating_mul(stride)
+            };
             eprintln!(
                 "[hf2q qwen35 lcp probe] enabled, registry_len={}, prompt_len={}, \
                  stride={}, scanning chunk positions [{stride}..={max_chunk_pos}]",
@@ -902,7 +920,20 @@ pub fn generate_qwen35_once(
                 if let Some(prefix) =
                     qwen.lcp_registry.take_prefix(&chunk_key, prompt_tokens)
                 {
-                    if prefix.k == prefix.cached_prompt_len {
+                    // ADR-017 Phase E.a B.5 Codex Phase-2b finding
+                    // (HIGH, defense-in-depth): require `prefix.k <
+                    // prompt_tokens.len()` so a true-continuation at the
+                    // FULL prompt length cannot trigger an empty
+                    // suffix-prefill (which would either panic in the
+                    // chunked branch's `last_logits.expect("at least
+                    // one chunk")` or attempt zero-token prefill in the
+                    // monolithic suffix branch).  `LcpRegistry::lookup`
+                    // already gates `k == new_tokens.len()` returning
+                    // None, so this is belt-and-suspenders against
+                    // future registry semantics changes.
+                    if prefix.k == prefix.cached_prompt_len
+                        && prefix.k < prompt_tokens.len()
+                    {
                         // True-continuation at this stride boundary.
                         // The snapshot's DeltaNet recurrent state is at
                         // exactly this position — byte-correct resume.
@@ -1045,6 +1076,19 @@ pub fn generate_qwen35_once(
         let chunked_eligible = stride > 0
             && prompt_len > stride
             && crate::debug::INVESTIGATION_ENV.kv_lcp_chunked_prefill;
+        // ADR-017 Phase E.a B.5 Codex Phase-2b finding (MEDIUM):
+        // enforce `lcp_resume_start % stride == 0` at a single point
+        // before any prefill branch dispatch — covers chunked AND
+        // suffix-only branches.
+        if lcp_resume_start > 0 && stride > 0 {
+            anyhow::ensure!(
+                lcp_resume_start % stride == 0,
+                "qwen35 prefill: lcp_resume_start ({}) must be stride-\
+                 aligned ({}) — registry only stores at stride boundaries",
+                lcp_resume_start,
+                stride
+            );
+        }
         let prefill_logits = if chunked_eligible {
             // ADR-017 Phase B-hybrid.2a + B.3 — chunked prefill with mid-
             // prefill stride-aligned checkpoint storage.  Each chunk's
@@ -2055,7 +2099,18 @@ pub fn generate_stream_qwen35_once_extended(
         if lcp_resume_enabled {
             let stride =
                 crate::debug::INVESTIGATION_ENV.kv_lcp_deltanet_checkpoint_stride;
-            let max_chunk_pos = (prompt_tokens.len() / stride).saturating_mul(stride);
+            // ADR-017 Phase E.a B.5 Codex Phase-2b finding (HIGH):
+            // guard `stride > 0` before any division.
+            let max_chunk_pos = if stride == 0 {
+                eprintln!(
+                    "[hf2q qwen35 stream lcp probe] stride=0; skipping \
+                     descending scan (HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE \
+                     must be > 0)"
+                );
+                0
+            } else {
+                (prompt_tokens.len() / stride).saturating_mul(stride)
+            };
             eprintln!(
                 "[hf2q qwen35 stream lcp probe] enabled, registry_len={}, \
                  prompt_len={}, stride={}, scanning [{stride}..={max_chunk_pos}]",
@@ -2065,13 +2120,18 @@ pub fn generate_stream_qwen35_once_extended(
             );
             let mut hit = false;
             let mut chunk_pos = max_chunk_pos;
-            while chunk_pos >= stride && !hit {
+            while stride > 0 && chunk_pos >= stride && !hit {
                 let chunk_key =
                     build_lcp_key_for_qwen35_chunk(qwen, params, chunk_pos);
                 if let Some(prefix) =
                     qwen.lcp_registry.take_prefix(&chunk_key, prompt_tokens)
                 {
-                    if prefix.k == prefix.cached_prompt_len {
+                    // ADR-017 Phase E.a B.5 Codex Phase-2b (HIGH defense-
+                    // in-depth): require `prefix.k < prompt_tokens.len()`
+                    // (mirrors non-streaming).
+                    if prefix.k == prefix.cached_prompt_len
+                        && prefix.k < prompt_tokens.len()
+                    {
                         let snapshot: &HybridKvCacheSnapshot = &prefix.dense_kvs[0];
                         if let Err(e) = kv_cache.restore_partial(snapshot, prefix.k) {
                             send!(GenerationEvent::Error(format!(
@@ -2148,11 +2208,33 @@ pub fn generate_stream_qwen35_once_extended(
         let stride =
             crate::debug::INVESTIGATION_ENV.kv_lcp_deltanet_checkpoint_stride;
         let lcp_resume_enabled = crate::debug::INVESTIGATION_ENV.kv_lcp_resume;
+        // ADR-017 Phase E.a B.5 Codex Phase-2b finding (MEDIUM):
+        // mirror non-streaming chunked-eligibility — chunked engages
+        // ONLY under explicit `HF2Q_KV_LCP_CHUNKED_PREFILL=1`, not as
+        // an implicit consequence of `lcp_resume_start > 0`.  When
+        // LCP resume restores cache state but chunked is disabled, the
+        // suffix-only monolithic branch below handles the resumed
+        // prefill (cur_len > 0 → FA RESUME kernel — byte-identical to
+        // monolithic by B.2-fix).
         let chunked_eligible = !has_extension
             && stride > 0
             && prompt_len > stride
-            && (crate::debug::INVESTIGATION_ENV.kv_lcp_chunked_prefill
-                || lcp_resume_start > 0);
+            && crate::debug::INVESTIGATION_ENV.kv_lcp_chunked_prefill;
+        // ADR-017 Phase E.a B.5 Codex Phase-2b finding (MEDIUM):
+        // enforce `lcp_resume_start % stride == 0` at a single point
+        // before any prefill branch dispatch — covers both chunked and
+        // suffix-only branches (the registry only stores at stride
+        // boundaries, so this assertion should always hold; defense-
+        // in-depth against future registry-shape changes).
+        if lcp_resume_start > 0 && stride > 0 && lcp_resume_start % stride != 0 {
+            send!(GenerationEvent::Error(format!(
+                "qwen35 stream: lcp_resume_start ({}) must be stride-aligned \
+                 ({}) — registry should only contain stride-aligned chunk-position \
+                 keys",
+                lcp_resume_start, stride
+            )));
+            return;
+        }
         let prefill_logits_res = if has_extension {
             qwen.model.forward_gpu_last_logits_with_soft_tokens_and_deepstack(
                 prompt_tokens,
@@ -2163,14 +2245,8 @@ pub fn generate_stream_qwen35_once_extended(
             )
         } else if chunked_eligible {
             // Chunked prefill — mirrors non-streaming chunked block.
-            if lcp_resume_start % stride != 0 {
-                send!(GenerationEvent::Error(format!(
-                    "qwen35 stream: lcp_resume_start ({}) must be \
-                     stride-aligned ({})",
-                    lcp_resume_start, stride
-                )));
-                return;
-            }
+            // Stride alignment was already validated above (centralized
+            // assertion covers both chunked + suffix-only branches).
             let first_chunk_idx = lcp_resume_start / stride;
             let n_chunks = (prompt_len + stride - 1) / stride;
             eprintln!(
