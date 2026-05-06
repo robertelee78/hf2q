@@ -1364,11 +1364,77 @@ Items deliberately *not* in Path C, with a written reason each (per mantra: don'
 - `feedback_substrate_must_not_synthesize_ship_gates.md` — 2026-04-30 user directive: gates measure or fail; never synthesize.
 - `feedback_harness_first_before_iter_chasing.md` — 2026-04-29 user directive: build the matrix harness BEFORE iter-chasing (F-0 obeys this).
 
+## Codec Freeze Contract (F-7.1, landed 2026-05-05)
+
+**Effective date:** 2026-05-05 (Path C iter-4).
+**Authority:** Path C F-7.1; supersedes the implicit codec freeze that close-section §1131-1137 documented but did not contractualize.
+
+### What is frozen
+
+The following constitute the **on-disk codec for `payload_kind="kv-tq-packed"` at `codec_version=1`** (per ADR-017 `EnvelopeHeader`):
+
+1. **8-bit Lloyd-Max codebook** (256 centroids, range ±5.0652659, symmetry error 3.41e-10). Source of truth: `mlx-native/src/turboquant.rs::CODEBOOK_HB_8BIT`. Byte-identical mirror in `mlx-native/src/shaders/flash_attn_vec_tq_hb.metal::CODEBOOK_HB_8BIT` and `hadamard_quantize_kv_fast.metal::CODEBOOK_8BIT`.
+2. **D1 SRHT sign tables**: `TBQ_SIGNS_256` (32 bytes) and `TBQ_SIGNS_512` (64 bytes). Sources documented inline (AmesianX `cpy-utils.cuh` with sha256 references).
+3. **Encoder pipeline (D=256)**: D1 sign mask → unnormalized FWHT → ×inv_sqrt(d) → L2 norm → scale `(1/norm) * sqrt(d)` → nearest-centroid lookup (8-bit) → byte-pack 1 byte per element. Verified byte-equivalent CPU vs GPU at F-0.2.
+4. **Encoder pipeline (D=512)**: same as D=256 but with per-block norms `||rotated_block_i||/sqrt(256)` (block_i = elements [0..256), [256..512)). Verified at F-0.2 D=512 norm formula test.
+5. **Packed buffer layout**: `[num_kv_heads, kv_capacity, head_dim]` u8.
+6. **Norms buffer layout**: D=256 `[num_kv_heads, kv_capacity]` f32 (norms_per_pos=1); D=512 `[num_kv_heads, kv_capacity, 2]` f32 (norms_per_pos=2, block_idx innermost).
+7. **Ring-start convention**: `(kv_write_pos + 1) % kv_capacity` (close-section §1135 — load-bearing for restore-from-disk semantics).
+8. **D=512 SIMD coord formula**: `(tx + ii*NL)*4` matching D=256 striding (close-section §1133).
+9. **Decoder pipeline**: `value = codebook[byte_idx] * (norm * inv_sqrt(DK))` for D=256; `value = codebook[byte_idx] * (norm[block_idx] / scale_factor_d512)` for D=512. Verified byte-identical between GPU `flash_attn_vec_tq_hb` and CPU `tq_oracle::flash_attn_vec_tq_hb_oracle` at F-0.2.
+
+### Migration contract
+
+Any change to items (1)-(9) above is an **on-disk codec change** and requires:
+
+1. **A new ADR** documenting:
+   - The change motivation (why the existing codec is insufficient).
+   - The new codec specification (what changes, byte-by-byte).
+   - The migration plan (read-old-write-new compatibility window).
+2. **A `codec_version` bump** in `EnvelopeHeader::codec_version` (currently `u32 = 1`). The bumped value identifies the new codec; old codec_version files must remain readable until the migration window closes.
+3. **Validation** — the new codec must clear the same gates the existing codec cleared (Path C F-0 falsifier NRMSE ≤ 0.15, Gate A cosine ≥ 0.999, byte-equivalent CPU+GPU encoder).
+
+### Reserved `codec_version` values
+
+| codec_version | payload_kind | Status | Notes |
+|---|---|---|---|
+| 0 | (any) | RESERVED | Reader treats as legacy / unspecified — quarantine on read. |
+| **1** | **`kv-tq-packed`** | **PRODUCTION (Path C iter-4 freeze)** | 8-bit Lloyd-Max HB SDPA, items (1)-(9) above. F-0.2 NRMSE 0.000247 verified at Gemma 4 26B. |
+| 2 | `kv-tq-packed` | RESERVED | If/when calibrated codebook lands (F-2 outcome). |
+| 3 | `kv-tq-packed` | RESERVED | If/when 16-bit TQ opt-in lands (F-6 outcome). |
+
+5/6-bit codebooks (`CODEBOOK_HB_5BIT`, `CODEBOOK_HB_6BIT`) are NOT reserved as separate `codec_version` values — they are runtime opt-ins via `HF2Q_TQ_CODEBOOK_BITS` AND opt-out from spillover (close-section §1117, 5-bit cosine 0.9912 / Gate B 5.3% / PPL 1.55% all FAIL strict gates → not shippable for persistence).
+
+### Production wire-format
+
+```rust
+// src/serve/kv_persist/format.rs::EnvelopeHeader
+{
+    "format_version": 1,                  // ADR-017 envelope version
+    "model_fingerprint": { ... },
+    "block_hash": ...,
+    "parent_block_hash": ...,
+    "payload_kind": "kv-tq-packed",       // ADR-007 §F-7
+    "codec_version": 1,                   // ADR-007 §F-7 — frozen 2026-05-05
+    "n_tokens": ...
+}
+```
+
+ADR-017 §B-tq.1 (`src/serve/kv_persist/payloads/tq_packed.rs`) consumes this envelope. Per ADR-017 §656, the matrix harness's `is_runnable_today` for `KvPath::TqActive` is **contractually unblocked** by this freeze. ADR-017 §602 A0.3 dependency `ADR-007 codec stable` is satisfied.
+
+### Cross-reference
+
+- ADR-017:602 (A0.3 entry): "Decision point: GREEN → proceed Phase A; ANY KILL → close ADR-017 unmerged" — codec stability is no longer a kill risk.
+- ADR-017:608 (B-tq.1 entry): "Determinism unit tests against synthetic ADR-007 codec fixtures" — the codec fixtures are now the verified-byte-equivalent CPU encoder (`turboquant_hb_encode_d256`), runnable in any Rust unit test without a Metal device.
+- ADR-017:656 (filter note): `is_runnable_today() for KvPath::TqActive` can flip to true once B-tq.1 lands.
+- F-0.2 audit at `docs/adr007-pathC/F-0/divergence_audit.md` provides the empirical evidence underpinning this freeze (NRMSE 0.000247 at Gemma 4 26B production shape, 607× under the falsifier gate).
+
 ### Progress Log (Path C)
 
 | Iter | Date | Phase | Status | Commits / Detail |
 |---|---|---|---|---|
 | 1 | 2026-05-05 | F-0.1 | LANDED | mlx-native `52c87ff`. CPU F32 oracle for `flash_attn_vec_tq_hb` decode. 5/6/8-bit codebooks lifted from Metal-only into `pub const` Rust arrays (byte-identical, 1e-5 symmetry verified). `flash_attn_vec_tq_hb_oracle` mirrors kernel math: D=256 single-norm + D=512 per-block norms + ring-start logical_idx mask + sliding window + GQA + offline stable softmax + all-masked-returns-zeros. F32 throughout, deterministic serial reduction (bit-identical runs). 10 unit tests PASS. F-0 finding: `softcap` is in kernel params but never read in body (also true of dense `flash_attn_vec.metal`). Detail at `docs/adr007-pathC/F-0/iter-1.md`. |
 | 2 | 2026-05-05 | F-0.2 (encoder phase) | PARTIAL | mlx-native `3b50ac5`. CPU HB encoder `turboquant_hb_encode_d256` — byte-equivalent mirror of `hadamard_quantize_kv_fast.metal::hadamard_quantize_kv_hb<256>`. Lifts D1 sign tables (`TBQ_SIGNS_256`, `TBQ_SIGNS_512`) to `pub const` Rust. 7 new tests PASS: 8-bit roundtrip cosine ≥ 0.998 + NRMSE ≤ 0.07 (clears Gate A); 5-bit cosine ≥ 0.985; deterministic; zero-vec edge case; D1 sign self-inverse. **Two F-0 findings logged**: (a) pre-existing `turboquant_quantize` was missing the iter-14 D1 SRHT sign mask — never byte-equivalent to GPU; cross-check absent. (b) D=512 `simd_sum` masking suggests `norm0 == norm1 == ||full||/16` not per-block — hypothesis to verify in iter-3. Detail at `docs/adr007-pathC/F-0/iter-2.md`. |
-| 3 | 2026-05-05 | F-0.2 (SDPA + falsifier check) | **LANDED — F-0 FALSIFIER CLEARED** | mlx-native (commit pending). Adds `tests/test_tq_hb_encoder_byte_parity.rs` with 11 Metal-integration tests. **Encoder byte parity** at 5/6/8-bit, 5 seeds: 0/256 byte mismatches in every case. **D=512 norm formula** identified: `||rotated_block_i|| / sqrt(256)` (per-block, /16 baked in by design). **F-0 finding #2 FALSIFIED** — Metal `simd_sum` in a divergent branch reduces over active lanes only, kernel is correct. **SDPA kernel vs oracle NRMSE measured at production shape** (Gemma 4 26B: 32q/4kv/1024 @ 8-bit) = **0.000247** vs falsifier gate 0.15 → **607× margin**. Roundtrip cosine on Gate A: 0.99997 (matches close-section 0.9998). The 1.24% PPL gap is NOT a kernel-vs-spec divergence — it must originate from codec distortion floor (Lloyd-Max), SRHT incoherence assumption (F-0.3), or calibration opportunity (F-2). **F-1, F-0.3, F-2 unblocked.** Full report at `docs/adr007-pathC/F-0/divergence_audit.md`; iter detail at `docs/adr007-pathC/F-0/iter-3.md`. |
+| 3 | 2026-05-05 | F-0.2 (SDPA + falsifier check) | **LANDED — F-0 FALSIFIER CLEARED** | mlx-native `03785fe`. Adds `tests/test_tq_hb_encoder_byte_parity.rs` with 11 Metal-integration tests. **Encoder byte parity** at 5/6/8-bit, 5 seeds: 0/256 byte mismatches in every case. **D=512 norm formula** identified: `||rotated_block_i|| / sqrt(256)` (per-block, /16 baked in by design). **F-0 finding #2 FALSIFIED** — Metal `simd_sum` in a divergent branch reduces over active lanes only, kernel is correct. **SDPA kernel vs oracle NRMSE measured at production shape** (Gemma 4 26B: 32q/4kv/1024 @ 8-bit) = **0.000247** vs falsifier gate 0.15 → **607× margin**. Roundtrip cosine on Gate A: 0.99997 (matches close-section 0.9998). The 1.24% PPL gap is NOT a kernel-vs-spec divergence — it must originate from codec distortion floor (Lloyd-Max), SRHT incoherence assumption (F-0.3), or calibration opportunity (F-2). **F-1, F-0.3, F-2 unblocked.** Full report at `docs/adr007-pathC/F-0/divergence_audit.md`; iter detail at `docs/adr007-pathC/F-0/iter-3.md`. |
+| 4 | 2026-05-05 | F-7 (codec freeze contract) | LANDED | hf2q (commit pending). New `## Codec Freeze Contract` section in this ADR. Locks 8-bit Lloyd-Max HB codec at `payload_kind="kv-tq-packed"`, `codec_version=1` per `EnvelopeHeader` (already present at `format.rs:296`). Items (1)-(9) frozen: codebook bytes, D1 sign tables, encoder/decoder pipelines for D=256/D=512, packed/norms layouts, ring-start convention, SIMD coord formula. Migration contract: any change requires new ADR + `codec_version` bump + parity validation. Reserved values 0/2/3 for legacy/F-2-calibrated/F-6-16bit. **ADR-017 §602 A0.3 + §608 B-tq.1 + §656 `is_runnable_today` are now contractually unblocked.** No code changes — wire-format version field already exists in production envelope. |
 
