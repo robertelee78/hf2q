@@ -959,15 +959,17 @@ pub fn generate_qwen35_once(
                         // of max_seq_len).
                         let snapshot: &HybridKvCacheSnapshot =
                             &prefix.dense_kvs[0];
+                        let restore_start = Instant::now();
                         kv_cache
                             .restore_partial(snapshot, prefix.k)
                             .context("qwen35 lcp_registry restore_partial")?;
+                        let restore_ms = restore_start.elapsed().as_micros() as f64 / 1000.0;
                         lcp_resume_start = prefix.k;
                         eprintln!(
                             "[hf2q qwen35 lcp resume] STRIDE-ALIGNED HIT — \
                              restoring at k={} (cached_prompt_len={}, \
-                             chunk_pos={})",
-                            prefix.k, prefix.cached_prompt_len, chunk_pos
+                             chunk_pos={}, restore_ms={:.3})",
+                            prefix.k, prefix.cached_prompt_len, chunk_pos, restore_ms
                         );
                         hit = true;
                     } else {
@@ -2144,17 +2146,20 @@ pub fn generate_stream_qwen35_once_extended(
                         && prefix.k < prompt_tokens.len()
                     {
                         let snapshot: &HybridKvCacheSnapshot = &prefix.dense_kvs[0];
+                        let restore_start = Instant::now();
                         if let Err(e) = kv_cache.restore_partial(snapshot, prefix.k) {
                             send!(GenerationEvent::Error(format!(
                                 "qwen35 stream: lcp_registry restore_partial failed: {e:#}"
                             )));
                             return;
                         }
+                        let restore_ms = restore_start.elapsed().as_micros() as f64 / 1000.0;
                         lcp_resume_start = prefix.k;
                         eprintln!(
                             "[hf2q qwen35 stream lcp resume] STRIDE-ALIGNED HIT \
-                             — restoring at k={} (chunk_pos={})",
-                            prefix.k, chunk_pos
+                             — restoring at k={} (cached_prompt_len={}, chunk_pos={}, \
+                             restore_ms={:.3})",
+                            prefix.k, prefix.cached_prompt_len, chunk_pos, restore_ms
                         );
                         hit = true;
                     } else {

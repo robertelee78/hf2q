@@ -75,6 +75,48 @@ fi
 MODEL_ID=$(curl -s "http://$HOST:$PORT/v1/models" | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['id'])")
 echo "[BENCH] model id: $MODEL_ID"
 
+# ── Per-trial instrumentation helpers (loop iter-1) ─────────────────────────
+# Each trial snapshots /metrics + server.stderr line count BEFORE the request,
+# then again AFTER, so we can compute lookups/detected deltas and slice the
+# stderr lines belonging to this trial. Correlation works because the bench
+# sends requests sequentially.
+trial_metrics_lookups() {
+    curl -sf "http://$HOST:$PORT/metrics" 2>/dev/null \
+        | awk '/^hf2q_kv_lcp_lookups_total / {print $2}'
+}
+trial_metrics_detected() {
+    curl -sf "http://$HOST:$PORT/metrics" 2>/dev/null \
+        | awk '/^hf2q_kv_lcp_detected_total / {print $2}'
+}
+trial_stderr_lines() {
+    wc -l < "$LOG_DIR/server.stderr" 2>/dev/null | tr -d ' '
+}
+# Slice stderr lines [from..to] and extract the first matching K, cached_prompt_len,
+# chunk_pos, restore_ms from any STRIDE-ALIGNED HIT line. Also returns:
+#   - hit=1/0 (whether any STRIDE-ALIGNED HIT line is present)
+#   - K (matched LCP length, "" if no hit)
+#   - cached_prompt_len ("" if no hit)
+#   - chunk_pos ("" if no hit)
+#   - restore_ms ("" if no hit; new field added in loop iter-1)
+# Returns CSV: hit,K,cached_prompt_len,chunk_pos,restore_ms
+trial_parse_stderr_slice() {
+    local from="$1" to="$2"
+    local slice
+    slice=$(sed -n "${from},${to}p" "$LOG_DIR/server.stderr" 2>/dev/null)
+    local hit=0
+    local k="" cached_len="" chunk_pos="" restore_ms=""
+    if printf '%s\n' "$slice" | grep -q "STRIDE-ALIGNED HIT"; then
+        hit=1
+        local hit_line
+        hit_line=$(printf '%s\n' "$slice" | grep "STRIDE-ALIGNED HIT" | head -1)
+        k=$(printf '%s' "$hit_line" | grep -oE 'k=[0-9]+' | head -1 | cut -d= -f2)
+        cached_len=$(printf '%s' "$hit_line" | grep -oE 'cached_prompt_len=[0-9]+' | head -1 | cut -d= -f2)
+        chunk_pos=$(printf '%s' "$hit_line" | grep -oE 'chunk_pos=[0-9]+' | head -1 | cut -d= -f2)
+        restore_ms=$(printf '%s' "$hit_line" | grep -oE 'restore_ms=[0-9]+\.[0-9]+' | head -1 | cut -d= -f2)
+    fi
+    echo "${hit},${k},${cached_len},${chunk_pos},${restore_ms}"
+}
+
 # ── Helpers ───────────────────────────────────────────────────────────────
 # Turn-1 user content — long enough to span 1+ stride boundary after chat
 # template wrap (target prompt_len > 64 → at least 1 mid-prefill snapshot
@@ -184,14 +226,36 @@ echo "[BENCH] measuring TTFT_cold (turn-2 shape, no LCP cache match) — $TRIALS
 # first-64 tokens, ensures probe MISS, total token count delta < 5
 # tokens vs canonical TURN1_USER).
 COLD_TIMES=()
+COLD_LOOKUPS=()
+COLD_DETECTED=()
+COLD_HIT=()
+COLD_K=()
+COLD_CHUNK=()
+COLD_RESTORE=()
 for i in $(seq 1 "$TRIALS"); do
     PREPEND="V$i-$RANDOM "
     UNIQ_TURN1_USER="${PREPEND}${TURN1_USER}"
     UNIQ_TURN2_USER="Worker $i: summarize the difference for $i."
     BODY=$(build_turn2_body "$ASSISTANT_Y" "$UNIQ_TURN2_USER" "$UNIQ_TURN1_USER")
+    LOOKUPS_BEFORE=$(trial_metrics_lookups); LOOKUPS_BEFORE=${LOOKUPS_BEFORE:-0}
+    DETECTED_BEFORE=$(trial_metrics_detected); DETECTED_BEFORE=${DETECTED_BEFORE:-0}
+    STDERR_BEFORE=$(trial_stderr_lines); STDERR_BEFORE=${STDERR_BEFORE:-0}
     ms=$(chat_request_ms "$BODY")
+    LOOKUPS_AFTER=$(trial_metrics_lookups); LOOKUPS_AFTER=${LOOKUPS_AFTER:-0}
+    DETECTED_AFTER=$(trial_metrics_detected); DETECTED_AFTER=${DETECTED_AFTER:-0}
+    STDERR_AFTER=$(trial_stderr_lines); STDERR_AFTER=${STDERR_AFTER:-0}
+    LOOKUPS_DELTA=$((LOOKUPS_AFTER - LOOKUPS_BEFORE))
+    DETECTED_DELTA=$((DETECTED_AFTER - DETECTED_BEFORE))
+    PARSED=$(trial_parse_stderr_slice "$((STDERR_BEFORE+1))" "$STDERR_AFTER")
+    IFS=',' read -r T_HIT T_K T_CACHED T_CHUNK T_RESTORE <<< "$PARSED"
     COLD_TIMES+=("$ms")
-    echo "  trial $i: ${ms} ms"
+    COLD_LOOKUPS+=("$LOOKUPS_DELTA")
+    COLD_DETECTED+=("$DETECTED_DELTA")
+    COLD_HIT+=("$T_HIT")
+    COLD_K+=("${T_K:--}")
+    COLD_CHUNK+=("${T_CHUNK:--}")
+    COLD_RESTORE+=("${T_RESTORE:--}")
+    echo "  trial $i: ${ms} ms (lookups+${LOOKUPS_DELTA} detected+${DETECTED_DELTA} hit=${T_HIT} k=${T_K:--} chunk=${T_CHUNK:--} restore_ms=${T_RESTORE:--})"
 done
 
 # ── Phase 3: TTFT_lcp (turn-2 shape, matching LCP cache, stride-aligned hit) ─
@@ -206,12 +270,34 @@ echo "[BENCH] measuring TTFT_lcp (turn-2 shape, STRIDE-ALIGNED HIT) — $TRIALS 
 PRIME_BODY=$(build_turn2_body "$ASSISTANT_Y" "PRIME")
 chat_request_ms "$PRIME_BODY" > /dev/null
 LCP_TIMES=()
+LCP_LOOKUPS=()
+LCP_DETECTED=()
+LCP_HIT=()
+LCP_K=()
+LCP_CHUNK=()
+LCP_RESTORE=()
 for i in $(seq 1 "$TRIALS"); do
     UNIQ_TURN2_USER="Now in two sentences, summarize the main difference (trial $i)."
     BODY=$(build_turn2_body "$ASSISTANT_Y" "$UNIQ_TURN2_USER")
+    LOOKUPS_BEFORE=$(trial_metrics_lookups); LOOKUPS_BEFORE=${LOOKUPS_BEFORE:-0}
+    DETECTED_BEFORE=$(trial_metrics_detected); DETECTED_BEFORE=${DETECTED_BEFORE:-0}
+    STDERR_BEFORE=$(trial_stderr_lines); STDERR_BEFORE=${STDERR_BEFORE:-0}
     ms=$(chat_request_ms "$BODY")
+    LOOKUPS_AFTER=$(trial_metrics_lookups); LOOKUPS_AFTER=${LOOKUPS_AFTER:-0}
+    DETECTED_AFTER=$(trial_metrics_detected); DETECTED_AFTER=${DETECTED_AFTER:-0}
+    STDERR_AFTER=$(trial_stderr_lines); STDERR_AFTER=${STDERR_AFTER:-0}
+    LOOKUPS_DELTA=$((LOOKUPS_AFTER - LOOKUPS_BEFORE))
+    DETECTED_DELTA=$((DETECTED_AFTER - DETECTED_BEFORE))
+    PARSED=$(trial_parse_stderr_slice "$((STDERR_BEFORE+1))" "$STDERR_AFTER")
+    IFS=',' read -r T_HIT T_K T_CACHED T_CHUNK T_RESTORE <<< "$PARSED"
     LCP_TIMES+=("$ms")
-    echo "  trial $i: ${ms} ms"
+    LCP_LOOKUPS+=("$LOOKUPS_DELTA")
+    LCP_DETECTED+=("$DETECTED_DELTA")
+    LCP_HIT+=("$T_HIT")
+    LCP_K+=("${T_K:--}")
+    LCP_CHUNK+=("${T_CHUNK:--}")
+    LCP_RESTORE+=("${T_RESTORE:--}")
+    echo "  trial $i: ${ms} ms (lookups+${LOOKUPS_DELTA} detected+${DETECTED_DELTA} hit=${T_HIT} k=${T_K:--} chunk=${T_CHUNK:--} restore_ms=${T_RESTORE:--})"
 done
 
 # ── Phase 4: R-P6 aggregate (4 sequential requests sharing turn-1 prefix) ─
@@ -312,6 +398,45 @@ echo ""
 echo "[BENCH] Engagement counters (from server stderr):"
 echo "[BENCH]   STRIDE-ALIGNED HITs: $HITS"
 echo "[BENCH]   mid-prefill stores:  $STORES"
+echo ""
+
+# ── Loop iter-1 per-trial breakdown (instrumentation pass) ────────────────
+# Goal: surface whether bimodal slow-trials are probe-misses (k=- / detected=0)
+# or full-hits-with-slow-restore (k=N / restore_ms high). This is the data
+# that drives loop iter-2's hypothesis-narrowing.
+echo "[BENCH] Per-trial breakdown (loop iter-1 instrumentation):"
+printf "[BENCH]   COLD %-3s | %-6s | %-7s | %-8s | %-3s | %-4s | %-5s | %s\n" \
+    "i" "ms" "lookups" "detected" "hit" "k" "chunk" "restore_ms"
+for i in $(seq 0 $((${#COLD_TIMES[@]} - 1))); do
+    printf "[BENCH]      %-3s | %-6s | %-7s | %-8s | %-3s | %-4s | %-5s | %s\n" \
+        "$((i+1))" \
+        "${COLD_TIMES[$i]}" \
+        "${COLD_LOOKUPS[$i]}" \
+        "${COLD_DETECTED[$i]}" \
+        "${COLD_HIT[$i]}" \
+        "${COLD_K[$i]}" \
+        "${COLD_CHUNK[$i]}" \
+        "${COLD_RESTORE[$i]}"
+done
+echo ""
+printf "[BENCH]   LCP  %-3s | %-6s | %-7s | %-8s | %-3s | %-4s | %-5s | %s\n" \
+    "i" "ms" "lookups" "detected" "hit" "k" "chunk" "restore_ms"
+for i in $(seq 0 $((${#LCP_TIMES[@]} - 1))); do
+    printf "[BENCH]      %-3s | %-6s | %-7s | %-8s | %-3s | %-4s | %-5s | %s\n" \
+        "$((i+1))" \
+        "${LCP_TIMES[$i]}" \
+        "${LCP_LOOKUPS[$i]}" \
+        "${LCP_DETECTED[$i]}" \
+        "${LCP_HIT[$i]}" \
+        "${LCP_K[$i]}" \
+        "${LCP_CHUNK[$i]}" \
+        "${LCP_RESTORE[$i]}"
+done
+echo ""
+echo "[BENCH] Read: hit=1 means STRIDE-ALIGNED HIT fired this trial."
+echo "[BENCH]       hit=0 means probe missed (no stride-aligned cached_prompt)."
+echo "[BENCH]       k = matched LCP length in tokens. chunk = chunk_pos at hit."
+echo "[BENCH]       restore_ms = restore_partial wall on hit (snapshot Arc::clone+memcpy)."
 echo ""
 
 # Pass criteria.
