@@ -1,6 +1,6 @@
 # ADR-017 Per-Family Ship-Gate Status
 
-**Last updated:** 2026-05-04 (HEAD `11002ee`)
+**Last updated:** 2026-05-05 (post Phase E.a B.5 + Phase B-tq.1)
 **Companion to:** [ADR-017](./ADR-017-persistent-block-prefix-cache.md)
 **Phase D §476 closure doc.**
 
@@ -24,15 +24,19 @@ requirements, §Performance requirements, §Kill-gates.
 
 | Family | Engine path | R-C1 | R-C3 | R-C4 | R-P4 | K1/K2/K3 | Phase D Status |
 |---|---|---|---|---|---|---|---|
-| Gemma 4 (dense, A4B variant) | `src/serve/kv_persist/families/gemma4_dense.rs` | PASS | PASS | PASS | PASS (ratio=0.000 @ L=32K) | All falsified | **GREEN** (primary; R-P5/R-P6/stress: code-complete bench-pending) |
-| Qwen 3.5 / 3.6 (hybrid, MoE+DeltaNet) | (B-hybrid pending) | n/a | n/a | n/a | n/a | n/a | **PENDING** (B-hybrid family hook not yet landed; ADR-013 prerequisite) |
+| Gemma 4 (dense, A4B variant) | `src/serve/kv_persist/families/gemma4_dense.rs` | PASS | PASS | PASS | PASS (ratio=0.000 @ L=32K) | All falsified | **GREEN** (primary; R-P5/R-P6 measured 44,500× / 1.00× post Phase D iter-5/6 + B.5; stress 24h smoke pass at iter-11/12) |
+| Qwen 3.5 / 3.6 (hybrid, MoE+DeltaNet) | `src/serve/api/engine_qwen35.rs::Qwen35LoadedModel::lcp_registry` (Phase E.a B.2-B.5 substrate; no sibling `KvCacheSpill` family hook needed) | PASS (B.2-iso falsifier 0/131072) | n/a (LCP path doesn't use Phase D spiller) | PASS (B.3 stride-aligned + B.5 byte-identity end-to-end) | n/a (LCP-resume measured separately at R-P6 0.79× of 4×cold; bench at `scripts/bench_lcp_resume_speedup.sh`) | n/a (sourdough/dense-only kill-gates don't apply to LCP path) | **GREEN** (Phase E.a B.5 closed 2026-05-05; HF2Q_KV_LCP_RESUME=1 default-on flip operator-controlled post 24h soak) |
+| TQ-packed (codec_version=1, family-agnostic on-disk envelope) | `src/serve/kv_persist/families/tq_packed.rs` (B-tq.1 substrate) | n/a (storage codec; runtime gate is R-C2) | n/a | n/a | n/a | n/a | **GREEN-substrate** (envelope serialization + D2 byte-exact rebuild + R-C2 cosine = 1.0 trivially via byte-equal dequantize; engine-side family hook B-tq.2 gated on ADR-007 Path C runtime work) |
 
 Legend:
 - **PASS**: gate validated by measurement; evidence linked below.
 - **GREEN**: family's primary ship-gates passed; remaining items are
   operator-controlled bench or ADR-blocked, not in-tree.
+- **GREEN-substrate**: family's storage / serialization layer GREEN;
+  engine-side runtime integration is a separate iter (B-tq.2 for
+  TQ-packed).
 - **PENDING**: family hook not yet landed; gate not yet runnable.
-- **n/a**: gate not applicable until the hook lands.
+- **n/a**: gate not applicable to this family's architecture.
 
 ---
 

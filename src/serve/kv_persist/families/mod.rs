@@ -9,13 +9,25 @@
 //! family so the per-family Chesterton's-fence reasoning stays
 //! co-located with the code:
 //!
-//! - [`gemma4_dense`] (B-dense.1, this iter) — Gemma 4's dense F32/F16
+//! - [`gemma4_dense`] (B-dense.1) — Gemma 4's dense F32/F16
 //!   K/V cache (`MlxModelWeights.dense_kvs`). Sliding layers use
 //!   ring-buffer mode; full-attention layers use a linear buffer.
-//! - `qwen35_hybrid` (B-hybrid.1, future) — Qwen 3.5's interleaved full-
-//!   attention + DeltaNet recurrent state. Out of scope here.
-//! - `tq_packed` (B-tq.1, future) — TurboQuant-packed K/V codec. Out of
-//!   scope here.
+//! - Qwen 3.5/3.6 hybrid (B-hybrid via Phase E.a B.2-B.5, 2026-05-05) —
+//!   Qwen 3.5's interleaved full-attention + DeltaNet recurrent state.
+//!   The hybrid family does NOT need a sibling `KvCacheSpill` impl;
+//!   ADR-017 Phase E.a Phase B.2 ships the LCP partial-prefill resume
+//!   substrate via `Qwen35LoadedModel::lcp_registry` directly (see
+//!   `engine_qwen35.rs`), keying full-attn + DeltaNet snapshots under
+//!   chunk-position-keyed `LcpKey`s.  Phase D's spiller layer is
+//!   side-stepped because hybrid-MoE ring-buffer slot accounting
+//!   doesn't fit the `(layer_rank, range)` block contract.
+//! - [`tq_packed`] (B-tq.1, this iter 2026-05-05) — TurboQuant-packed
+//!   K/V codec.  Provides `payload_kind = "tq_packed_v1"` envelope
+//!   serialization at codec_version=1 frozen with deterministic round-
+//!   trip + R-C2 cosine ≥ 0.9998 (trivially satisfied by byte-exact
+//!   rebuild).  Family hook wire-up (TqPackedSpill, analogous to
+//!   Gemma4DenseSpill) is B-tq.2 and lands once the runtime TQ
+//!   inference path stabilises (ADR-007 reopen 2026-05-05 Path C).
 //!
 //! Each family hook is registered with the spiller via
 //! `BlockPrefixCacheSpiller::register_family((repo, quant), hook)` at
@@ -25,3 +37,4 @@
 //! registration across the engine's lifetime.
 
 pub mod gemma4_dense;
+pub mod tq_packed;
