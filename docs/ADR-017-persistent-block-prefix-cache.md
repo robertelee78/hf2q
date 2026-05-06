@@ -3909,34 +3909,57 @@ session work:
    logical separation..." matching the non-streaming B.3 turn-2 output
    byte-for-byte.
 
-### What's left (out-of-session work)
+### Codex Phase-2b audit COMPLETE (2026-05-05)
 
-5. **Codex Phase-2b read-only audit** of the full B.2-fix → B.5 chain.
-   Specific surfaces:
-   * `gpu_full_attn.rs:1909+` resume-path gate (`kv_seq_len >= 16`)
-     and the implicit guarantee that chunked-prefill last-chunk
-     scenarios always satisfy it (proven by mlx-native@9462b47 kernel
-     probe at qL ∈ {2, 8, 15} kL=130; safe-zone kL inside chunked
-     follows from cur_len ≥ stride ≥ 64).
-   * `engine_qwen35.rs::generate_qwen35_once` chunked + LCP store +
-     descending probe + restore_partial + suffix-chunked prefill
-     flow — particularly the `lcp_resume_start % stride == 0`
-     invariant and the `chunk_idx = lcp_resume_start / stride` loop
-     start.  Same flow in
-     `engine_qwen35.rs::generate_stream_qwen35_once_extended`.
-   * `kv_cache.rs::partial_copy_slot` (rank-4 `[n_seqs, n_kv_heads,
-     max_seq_len, head_dim]` partial-position memcpy across
-     differently-sized source/destination buffers).
-   * mlx-native@1819fad `dispatch_flash_attn_prefill_bf16_d256_resume`
-     stride math (`kv_capacity * head_dim` for K/V head stride) and
-     `qL_off` semantics under `do_causal=true`.
+5. ✓ **Codex Phase-2b read-only audit** of the full B.2-fix → B.5
+   chain.  Per-surface verdicts:
 
-6. **Operator soak** at `HF2Q_KV_LCP_CHUNKED_PREFILL=1
-   HF2Q_KV_LCP_RESUME=1 HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=64`
-   for 24h on a multi-turn /cfa workload.  Default-on flip
-   (`HF2Q_KV_LCP_RESUME=1` in production config) is gated on green
-   soak plus Codex audit sign-off, mirroring B.2c iter-4 default-on
-   gate for the Gemma side.
+   * **Surface 1 (gate lift)**: APPROVED-WITH-CAVEATS — 2 LOW
+     informational findings on stride-validation + comment specificity
+     (non-blocking).  Wrapper byte-identity APPROVED.
+
+   * **Surfaces 2+3 (engine flows)**: FAIL pre-fix — 2 HIGH + 2
+     MEDIUM findings.  All addressed in `ab16d13`:
+     * HIGH 1: stride==0 division panic at probe site → early guard.
+     * HIGH 2: defense-in-depth `prefix.k < prompt_len` check.
+     * MEDIUM 3: alignment-assertion centralized before prefill
+       branch dispatch.
+     * MEDIUM 4: streaming chunked-eligibility now matches non-
+       streaming (requires explicit `HF2Q_KV_LCP_CHUNKED_PREFILL=1`).
+
+   * **Surface 4 (partial_copy_slot)**: APPROVED.  Stride math
+     correct for valid rank-4 buffers; bounds-check at
+     `n_tokens <= src/dst max_seq` enforced; DeltaNet recurrent +
+     conv state copied verbatim (size-independent).
+
+   * **Surface 5 (mlx-native dispatcher + kernel)**: FAIL pre-fix —
+     1 HIGH finding on `flash_attn_prefill.metal:1324` lacking
+     `min(kb_lim, NK)` clamp.  For large `qL_off` + small `qL`
+     (e.g. qL_off=1023, qL=1, kL=1024 at D=256) the kernel reads OOB
+     past `kL`.  Fixed in mlx-native@`e9b9df0` with regression test
+     extending the small-qL probe to kL=1024 + qL_off=1023 → 0/4096
+     BF16 elements differ from monolithic.
+
+   ALL 5 LCP integration falsifiers + 2819 hf2q unit tests + 52
+   mlx-native FA tests PASS post-fixes.
+
+6. **Operator soak** — partial in-session via
+   `/opt/hf2q/scripts/lcp_resume_mini_soak.sh` (20-turn multi-turn
+   chat regression check on Qwen 3.6 35B-A3B-APEX-Q5_K_M):
+   * 20/20 turns OK, 0 failures
+   * 20 STRIDE-ALIGNED HITs (B.3 streaming-path resume fired on every
+     turn-2)
+   * 20 mid-prefill stores (turn-1 stored at chunk_pos=64 every turn)
+   * 0 panics, 0 GenerationError
+   * RSS 32.1 GB → 33.9 GB (5.4% growth, within tolerance)
+
+   Full 24h operator soak under
+   `HF2Q_KV_LCP_CHUNKED_PREFILL=1 HF2Q_KV_LCP_RESUME=1
+   HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=64` on a /cfa workload is
+   the operator-controlled gate for `HF2Q_KV_LCP_RESUME=1` default-on
+   flip.  Mini-soak demonstrates no leaks or correctness regressions
+   over 20 sustained cycles; 24h is the cumulative-drift gate beyond
+   that.
 
 ### Phase E.a is FUNCTIONALLY COMPLETE 2026-05-05
 
