@@ -190,6 +190,87 @@ pub fn hf_vit_name_to_gguf(hf_name: &str) -> Option<String> {
     None
 }
 
+/// ADR-021 iter-11b: classify a GGUF mmproj tensor as F32 vs F16
+/// per the llama.cpp peer's convention. Norms (`*norm.weight`,
+/// `*norm.bias`, `*ln*.weight`, `*ln*.bias`, `*pre_ln*`, `*post_ln*`)
+/// and ALL biases are stored at F32 — `clip_model_loader::warmup`
+/// asserts `a->type == GGML_TYPE_F32` (ggml.c:4989) on these inputs.
+/// Weights are F16 (or quantized; mmproj's F16 path keeps them as F16).
+///
+/// Cross-references:
+/// - `/opt/llama.cpp/convert_hf_to_gguf.py:11756-11770` (V_ENC_*norm
+///   + biases routed via `add_to_f32` cast)
+/// - peer mmproj tensor dump: 113 F32 + 196 Q4_0 + 1 F16 (compare to
+///   hf2q's prior 1 F32 + 315 F16 — wrong by 210 tensors).
+pub(crate) fn vit_emission_is_f32(gguf_name: &str) -> bool {
+    // All biases are F32.
+    if gguf_name.ends_with(".bias") {
+        return true;
+    }
+    // All norm weights are F32. Catches:
+    //   v.blk.{N}.ln{1,2}.weight       (clip-classic)
+    //   v.blk.{N}.attn_norm.weight     (siglip2 short form)
+    //   v.blk.{N}.ffn_norm.weight
+    //   v.blk.{N}.post_ffw_norm.weight (gemma4)
+    //   v.blk.{N}.ffn_post_norm.weight (gemma4 alias)
+    //   v.pre_ln.weight, v.post_ln.weight
+    //   v.deepstack.{N}.norm.weight    (Qwen3-VL DeepStack)
+    if gguf_name.contains("ln1.weight")
+        || gguf_name.contains("ln2.weight")
+        || gguf_name.contains("attn_norm.weight")
+        || gguf_name.contains("ffn_norm.weight")
+        || gguf_name.contains("post_ffw_norm.weight")
+        || gguf_name.contains("ffn_post_norm.weight")
+        || gguf_name.contains("pre_ln.weight")
+        || gguf_name.contains("post_ln.weight")
+        || gguf_name.ends_with(".norm.weight")
+    {
+        return true;
+    }
+    // Position-embedding table is also F32 in peer's mmproj (it's
+    // bilinear-resized at runtime; ggml's interpolate kernel asserts
+    // F32 input). Verified 2026-05-07 by tensor-dtype diff against
+    // /opt/llama.cpp/convert_hf_to_gguf.py output for Qwen3-VL-2B.
+    if gguf_name == "v.position_embd.weight" {
+        return true;
+    }
+    // patch_embd.bias is also F32 (handled by the .bias suffix above).
+    false
+}
+
+/// Cast raw HF bytes to F32 bytes. Inputs can be F32, F16, or BF16.
+/// Used by ADR-021 iter-11b for norm + bias tensors that the peer
+/// loader asserts F32 on.
+pub(crate) fn ensure_f32_bytes(tensor: &TensorRef) -> Result<Vec<u8>, VitConvertError> {
+    match tensor.dtype {
+        DType::F32 => Ok((*tensor.data).clone()),
+        DType::F16 => {
+            let n = tensor.numel();
+            let mut out = Vec::with_capacity(n * 4);
+            for i in 0..n {
+                let b = &tensor.data[i * 2..(i + 1) * 2];
+                let h = half::f16::from_le_bytes([b[0], b[1]]);
+                out.extend_from_slice(&h.to_f32().to_le_bytes());
+            }
+            Ok(out)
+        }
+        DType::BF16 => {
+            let n = tensor.numel();
+            let mut out = Vec::with_capacity(n * 4);
+            for i in 0..n {
+                let b = &tensor.data[i * 2..(i + 1) * 2];
+                let bf = half::bf16::from_le_bytes([b[0], b[1]]);
+                out.extend_from_slice(&bf.to_f32().to_le_bytes());
+            }
+            Ok(out)
+        }
+        other => Err(VitConvertError::Safetensors(format!(
+            "unsupported dtype {:?} on vision tensor {:?} (ensure_f32_bytes)",
+            other, tensor.name
+        ))),
+    }
+}
+
 /// Cast raw HF bytes to F16 bytes. Inputs can be F32 or F16 (common
 /// HF shapes). P10's F16 mmproj emitter downcasts F32 → F16 at convert time.
 fn ensure_f16_bytes(tensor: &TensorRef) -> Result<Vec<u8>, VitConvertError> {
@@ -316,13 +397,19 @@ pub fn load_vision_tensors(
         // the per-block ViT encoder match (which strips
         // `model.vision_tower.encoder.layer.` — different prefix).
         if let Some(gguf_name) = hf_qwen3vl_deepstack_to_gguf(name, &deepstack_indexes) {
-            let data = ensure_f16_bytes(tensor)?;
+            // ADR-021 iter-11b: route F32 (norms + biases) through the
+            // F32 path; weights stay F16. Peer convention.
+            let (data, dtype) = if vit_emission_is_f32(&gguf_name) {
+                (ensure_f32_bytes(tensor)?, DType::F32)
+            } else {
+                (ensure_f16_bytes(tensor)?, DType::F16)
+            };
             out.insert(
                 gguf_name.clone(),
                 VitTensor {
                     gguf_name,
                     shape: tensor.shape.clone(),
-                    dtype: DType::F16,
+                    dtype,
                     data,
                 },
             );
@@ -388,13 +475,19 @@ pub fn load_vision_tensors(
         });
 
         if let Some(gguf_name) = mapped {
-            let data = ensure_f16_bytes(tensor)?;
+            // ADR-021 iter-11b: route F32 (norms + biases) through the
+            // F32 path; weights stay F16. Peer convention.
+            let (data, dtype) = if vit_emission_is_f32(&gguf_name) {
+                (ensure_f32_bytes(tensor)?, DType::F32)
+            } else {
+                (ensure_f16_bytes(tensor)?, DType::F16)
+            };
             out.insert(
                 gguf_name.clone(),
                 VitTensor {
                     gguf_name,
                     shape: tensor.shape.clone(),
-                    dtype: DType::F16,
+                    dtype,
                     data,
                 },
             );

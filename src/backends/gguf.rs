@@ -3893,10 +3893,21 @@ fn emit_qwen3vl_metadata(
     ));
 
     // n_deepstack_layers — count of indices in
-    // text_config.deepstack_visual_indexes (peer
-    // convert_hf_to_gguf.py:11939 uses `len(...)`).
-    let n_deepstack = tc
-        .get("deepstack_visual_indexes")
+    // vision_config.deepstack_visual_indexes (peer
+    // convert_hf_to_gguf.py:11939 uses `len(...)`). The field lives
+    // under `vision_config`, NOT `text_config` — verified 2026-05-07
+    // against `Qwen/Qwen3-VL-2B-Instruct/config.json` where
+    // `text_config.deepstack_visual_indexes is None` and
+    // `vision_config.deepstack_visual_indexes = [5, 11, 17]`. Pre-fix
+    // hf2q read it from `text_config` and emitted 0, causing
+    // `n_embd_inp = n_embd * (1 + 0) = 2048` mismatch vs mmproj's
+    // `n_embd = 2048 * (1 + 3) = 8192` — `mtmd_init_from_file`
+    // bailed with "mismatch between text model (n_embd = 2048) and
+    // mmproj (n_embd = 8192)".
+    let n_deepstack = meta
+        .raw_config
+        .get("vision_config")
+        .and_then(|vc| vc.get("deepstack_visual_indexes"))
         .and_then(|v| v.as_array())
         .map(|arr| arr.len() as u32)
         .unwrap_or(0);

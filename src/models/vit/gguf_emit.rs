@@ -108,11 +108,27 @@ pub fn write_mmproj_gguf(
     for name in &names {
         let t = &tensors[*name];
         let numel: u64 = t.shape.iter().product::<usize>() as u64;
-        let size = numel * 2; // F16 = 2 bytes
+        // ADR-021 iter-11b: honor per-tensor dtype set by the converter
+        // (norms + biases are F32; weights are F16). Pre-fix this loop
+        // hardcoded F16 + 2-byte size, which produced 210 wrong-dtype
+        // tensors and crashed stock llama.cpp's `clip_model_loader::warmup`
+        // on `GGML_ASSERT(a->type == GGML_TYPE_F32)` at ggml.c:4989.
+        let (gguf_dtype, bytes_per_elem) = match t.dtype {
+            crate::ir::DType::F32 => (GGML_TYPE_F32, 4u64),
+            crate::ir::DType::F16 => (GGML_TYPE_F16, 2u64),
+            ref other => {
+                return Err(VitConvertError::GgufEmit(format!(
+                    "write_mmproj_gguf: unsupported dtype {:?} for tensor {:?} \
+                     — only F32 (norms + biases) and F16 (weights) are emitted",
+                    other, name
+                )));
+            }
+        };
+        let size = numel * bytes_per_elem;
         infos.push(Info {
             name: name.as_str(),
             shape: &t.shape,
-            dtype: GGML_TYPE_F16,
+            dtype: gguf_dtype,
             size,
             offset: running_offset,
         });
