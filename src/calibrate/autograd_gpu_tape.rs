@@ -42,6 +42,11 @@ use mlx_native::{
     ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params},
     ops::elementwise::{elementwise_add, elementwise_mul, scalar_mul_f32},
     ops::log_elementwise::{dispatch_log_backward_f32, dispatch_log_f32},
+    ops::rms_norm::dispatch_rms_norm,
+    ops::rms_norm_backward::{
+        dispatch_rms_norm_backward_dw, dispatch_rms_norm_backward_dx,
+        dispatch_rms_norm_compute_rms_inv,
+    },
     ops::row_sum::{dispatch_row_sum_backward_f32, dispatch_row_sum_f32},
     ops::softmax::dispatch_softmax,
     ops::softmax_backward::dispatch_softmax_backward,
@@ -96,6 +101,19 @@ enum OpKind {
         input_idx: usize,
         rows: usize,
         cols: usize,
+    },
+    /// RMS Normalization along the last dim of a 2-D tensor `[rows, dim]`
+    /// with per-feature scale `weight[dim]`.
+    /// Forward: `y[b, i] = x[b, i] · rsqrt(mean(x[b, :]²) + eps) · w[i]`.
+    /// Backward dispatches mlx-native's three-kernel chain
+    /// (`rms_norm_compute_rms_inv` → `rms_norm_backward_dx` →
+    /// `rms_norm_backward_dw`) producing both `dx` and `dw`.
+    RmsNorm {
+        input_idx: usize,
+        weight_idx: usize,
+        rows: usize,
+        dim: usize,
+        eps: f32,
     },
 }
 
@@ -377,6 +395,14 @@ pub fn backward(
             | OpKind::Log { input_idx }
             | OpKind::RowSum { input_idx, .. } => {
                 accumulate(&mut grads, input_idx, &parent_grads[0], tape)?;
+            }
+            OpKind::RmsNorm {
+                input_idx,
+                weight_idx,
+                ..
+            } => {
+                accumulate(&mut grads, input_idx, &parent_grads[0], tape)?;
+                accumulate(&mut grads, weight_idx, &parent_grads[1], tape)?;
             }
         }
     }
@@ -748,6 +774,107 @@ fn backward_dispatch(
 
             Ok((op, vec![dx_buf]))
         }
+        OpKind::RmsNorm {
+            input_idx,
+            weight_idx,
+            rows,
+            dim,
+            eps,
+        } => {
+            // Backward chain: rms_inv → backward_dx → backward_dw,
+            // all in ONE encoder with memory_barrier between rms_inv
+            // and the two consumers (dx and dw both read r).
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+
+            let x_buf = tape.with_node(input_idx, |n| n.value.clone());
+            let w_buf = tape.with_node(weight_idx, |n| n.value.clone());
+
+            let r_buf = device
+                .alloc_buffer(rows * 4, DType::F32, vec![rows])
+                .map_err(|e| anyhow!("backward rms_norm: alloc r: {e}"))?;
+            let dx_buf = device
+                .alloc_buffer(rows * dim * 4, DType::F32, vec![rows, dim])
+                .map_err(|e| anyhow!("backward rms_norm: alloc dx: {e}"))?;
+            let dw_buf = device
+                .alloc_buffer(dim * 4, DType::F32, vec![dim])
+                .map_err(|e| anyhow!("backward rms_norm: alloc dw: {e}"))?;
+
+            // Three params buffers (each [eps_or_dim_f, dim_or_rows_f]).
+            let mut params_inv = device
+                .alloc_buffer(8, DType::F32, vec![2])
+                .map_err(|e| anyhow!("backward rms_norm: alloc params_inv: {e}"))?;
+            params_inv
+                .as_mut_slice::<f32>()
+                .map_err(|e| anyhow!("backward rms_norm: params_inv write: {e}"))?
+                .copy_from_slice(&[eps, dim as f32]);
+            let mut params_dx = device
+                .alloc_buffer(8, DType::F32, vec![2])
+                .map_err(|e| anyhow!("backward rms_norm: alloc params_dx: {e}"))?;
+            params_dx
+                .as_mut_slice::<f32>()
+                .map_err(|e| anyhow!("backward rms_norm: params_dx write: {e}"))?
+                .copy_from_slice(&[dim as f32, 0.0]);
+            let mut params_dw = device
+                .alloc_buffer(8, DType::F32, vec![2])
+                .map_err(|e| anyhow!("backward rms_norm: alloc params_dw: {e}"))?;
+            params_dw
+                .as_mut_slice::<f32>()
+                .map_err(|e| anyhow!("backward rms_norm: params_dw write: {e}"))?
+                .copy_from_slice(&[dim as f32, rows as f32]);
+
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward rms_norm: encoder: {e}"))?;
+            dispatch_rms_norm_compute_rms_inv(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                &x_buf,
+                &r_buf,
+                &params_inv,
+                rows as u32,
+                dim as u32,
+            )
+            .map_err(|e| anyhow!("backward rms_norm: rms_inv: {e}"))?;
+            // RAW barrier — dx and dw both read r.
+            encoder.memory_barrier();
+            dispatch_rms_norm_backward_dx(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                &x_buf,
+                &w_buf,
+                out_grad,
+                &r_buf,
+                &dx_buf,
+                &params_dx,
+                rows as u32,
+                dim as u32,
+            )
+            .map_err(|e| anyhow!("backward rms_norm: dx: {e}"))?;
+            dispatch_rms_norm_backward_dw(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                &x_buf,
+                out_grad,
+                &r_buf,
+                &dw_buf,
+                &params_dw,
+                rows as u32,
+                dim as u32,
+            )
+            .map_err(|e| anyhow!("backward rms_norm: dw: {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward rms_norm: commit_and_wait: {e}"))?;
+
+            // Order matches the parent_grads consumer at line ~376:
+            //   accumulate(grads, input_idx, parent_grads[0])
+            //   accumulate(grads, weight_idx, parent_grads[1])
+            Ok((op, vec![dx_buf, dw_buf]))
+        }
     }
 }
 
@@ -906,6 +1033,102 @@ pub fn softmax(t: &GpuTensor) -> Result<GpuTensor> {
         tape: tape.clone(),
         node_idx,
         shape: vec![rows, cols],
+    })
+}
+
+/// RMS Normalization along the last dim with per-feature scale `weight`.
+/// Forward: `y[b, i] = x[b, i] · rsqrt(mean(x[b, :]²) + eps) · w[i]`.
+///
+/// `input` shape: `[rows, dim]`; `weight` shape: `[dim]`.
+/// Inputs must share the same tape.  Backward dispatches the
+/// three-kernel chain (`rms_norm_compute_rms_inv` → `rms_norm_backward_dx`
+/// → `rms_norm_backward_dw`) producing both `dx` and `dw`.
+pub fn rms_norm(
+    input: &GpuTensor,
+    weight: &GpuTensor,
+    eps: f32,
+) -> Result<GpuTensor> {
+    if !input.tape.ptr_eq(&weight.tape) {
+        return Err(anyhow!("rms_norm: input and weight must share the same tape"));
+    }
+    if input.shape.len() != 2 {
+        return Err(anyhow!(
+            "rms_norm: input must be 2-D [rows, dim]; got shape={:?}",
+            input.shape
+        ));
+    }
+    if weight.shape.len() != 1 {
+        return Err(anyhow!(
+            "rms_norm: weight must be 1-D [dim]; got shape={:?}",
+            weight.shape
+        ));
+    }
+    let rows = input.shape[0];
+    let dim = input.shape[1];
+    if weight.shape[0] != dim {
+        return Err(anyhow!(
+            "rms_norm: weight dim {} != input last-dim {dim}",
+            weight.shape[0]
+        ));
+    }
+    if !eps.is_finite() || eps < 0.0 {
+        return Err(anyhow!("rms_norm: eps must be finite + non-negative; got {eps}"));
+    }
+
+    let tape = &input.tape;
+    let device = tape.device();
+    let in_buf = tape.with_node(input.node_idx, |n| n.value.clone());
+    let w_buf = tape.with_node(weight.node_idx, |n| n.value.clone());
+
+    let out = device
+        .alloc_buffer(rows * dim * 4, DType::F32, vec![rows, dim])
+        .map_err(|e| anyhow!("rms_norm: alloc out: {e}"))?;
+    let mut params_buf = device
+        .alloc_buffer(8, DType::F32, vec![2])
+        .map_err(|e| anyhow!("rms_norm: alloc params: {e}"))?;
+    params_buf
+        .as_mut_slice::<f32>()
+        .map_err(|e| anyhow!("rms_norm: params write: {e}"))?
+        .copy_from_slice(&[eps, dim as f32]);
+
+    let mut registry = tape.0.registry.borrow_mut();
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("rms_norm: encoder: {e}"))?;
+    dispatch_rms_norm(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &in_buf,
+        &w_buf,
+        &out,
+        &params_buf,
+        rows as u32,
+        dim as u32,
+    )
+    .map_err(|e| anyhow!("rms_norm: dispatch: {e}"))?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("rms_norm: commit_and_wait: {e}"))?;
+    drop(registry);
+
+    let input_idx = input.node_idx;
+    let weight_idx = weight.node_idx;
+    let node_idx = tape.push_node(
+        OpKind::RmsNorm {
+            input_idx,
+            weight_idx,
+            rows,
+            dim,
+            eps,
+        },
+        out,
+        vec![rows, dim],
+    );
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: vec![rows, dim],
     })
 }
 
@@ -1793,6 +2016,172 @@ mod tests {
         match mul(&a, &b) {
             Err(e) => assert!(format!("{e}").contains("shape mismatch")),
             Ok(_) => panic!("expected error"),
+        }
+    }
+
+    /// CPU oracle for RMSNorm forward + backward.  Returns (y, dx, dw)
+    /// matching the analytical formulas in `rms_norm_backward.metal`.
+    fn rms_norm_cpu_oracle(
+        x: &[f32],
+        w: &[f32],
+        dy: &[f32],
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let mut r = vec![0f32; rows];
+        let mut y = vec![0f32; rows * dim];
+        for b in 0..rows {
+            let row = &x[b * dim..(b + 1) * dim];
+            let ms: f32 = row.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+            r[b] = (ms + eps).sqrt().recip();
+            for i in 0..dim {
+                y[b * dim + i] = row[i] * r[b] * w[i];
+            }
+        }
+
+        let mut dx = vec![0f32; rows * dim];
+        for b in 0..rows {
+            let r_b = r[b];
+            let s_b: f32 = (0..dim)
+                .map(|i| dy[b * dim + i] * x[b * dim + i] * w[i])
+                .sum();
+            let coeff = s_b * r_b * r_b / dim as f32;
+            for k in 0..dim {
+                dx[b * dim + k] = r_b * (dy[b * dim + k] * w[k] - x[b * dim + k] * coeff);
+            }
+        }
+
+        let mut dw = vec![0f32; dim];
+        for i in 0..dim {
+            let mut acc = 0.0f32;
+            for b in 0..rows {
+                acc += dy[b * dim + i] * x[b * dim + i] * r[b];
+            }
+            dw[i] = acc;
+        }
+
+        (y, dx, dw)
+    }
+
+    fn assert_close_vec(label: &str, gpu: &[f32], cpu: &[f32], rel_tol: f32, abs_tol: f32) {
+        assert_eq!(gpu.len(), cpu.len(), "{label}: length mismatch");
+        for (i, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            let diff = (g - c).abs();
+            let scale = g.abs().max(c.abs()).max(1.0);
+            assert!(
+                diff <= abs_tol || diff / scale <= rel_tol,
+                "{label}: i={i}: gpu={g} cpu={c} diff={diff}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_tape_rms_norm_forward_backward_parity() {
+        // 4 rows × 32 dim — non-trivial fixture exercising both
+        // dx and dw paths through the tape's backward router.
+        let rows = 4usize;
+        let dim = 32usize;
+        let eps = 1e-6;
+
+        let det = |i: usize, off: f32, scale: f32| (i as f32) * scale + off;
+        let x: Vec<f32> = (0..rows * dim).map(|i| det(i, 0.0, 0.0173).sin() * 0.5).collect();
+        let w: Vec<f32> = (0..dim)
+            .map(|i| 1.0 + 0.1 * (i as f32 - dim as f32 / 2.0) / dim as f32)
+            .collect();
+        let dy: Vec<f32> = (0..rows * dim)
+            .map(|i| det(i, 0.0, 0.0271).cos() * 0.3)
+            .collect();
+
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let xt = GpuTensor::from_vec(&tape, &x, vec![rows, dim]).unwrap();
+        let wt = GpuTensor::from_vec(&tape, &w, vec![dim]).unwrap();
+
+        let yt = rms_norm(&xt, &wt, eps).unwrap();
+        let y_gpu: Vec<f32> = yt.to_vec().unwrap();
+
+        // Wrap dy as an MlxBuffer of the same shape as y for backward.
+        let n_bytes = rows * dim * 4;
+        let mut dy_buf = tape
+            .device()
+            .alloc_buffer(n_bytes, DType::F32, vec![rows, dim])
+            .unwrap();
+        dy_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&dy);
+
+        let grads = backward(&yt, dy_buf).unwrap();
+        let dx_buf = grads[xt.node_idx()].as_ref().expect("x grad expected");
+        let dw_buf = grads[wt.node_idx()].as_ref().expect("w grad expected");
+        let dx_gpu: Vec<f32> = dx_buf.as_slice::<f32>().unwrap().to_vec();
+        let dw_gpu: Vec<f32> = dw_buf.as_slice::<f32>().unwrap().to_vec();
+
+        let (y_cpu, dx_cpu, dw_cpu) = rms_norm_cpu_oracle(&x, &w, &dy, rows, dim, eps);
+        assert_close_vec("y forward", &y_gpu, &y_cpu, 1e-5, 1e-6);
+        assert_close_vec("dx backward", &dx_gpu, &dx_cpu, 1e-4, 1e-6);
+        assert_close_vec("dw backward", &dw_gpu, &dw_cpu, 1e-4, 1e-6);
+    }
+
+    #[test]
+    fn gpu_tape_rms_norm_chained_through_matmul() {
+        // Compose: y = matmul(rms_norm(x, w_n, eps), w_p) — verify
+        // gradients flow correctly through the RMSNorm node back to
+        // both the input AND the norm weight, AS WELL AS through the
+        // matmul to its weight.
+        let rows = 32usize;
+        let dim = 32usize;
+        let out_dim = 32usize;
+        let eps = 1e-6;
+
+        let x: Vec<f32> = (0..rows * dim).map(|i| (i as f32 * 0.01).sin() * 0.4).collect();
+        let w_norm: Vec<f32> = (0..dim).map(|i| 1.0 + 0.05 * (i as f32 - 16.0)).collect();
+        let w_proj: Vec<f32> = (0..dim * out_dim)
+            .map(|i| (i as f32 * 0.013).cos() * 0.2)
+            .collect();
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let xt = GpuTensor::from_vec(&tape, &x, vec![rows, dim]).unwrap();
+        let wnt = GpuTensor::from_vec(&tape, &w_norm, vec![dim]).unwrap();
+        let wpt = GpuTensor::from_vec(&tape, &w_proj, vec![dim, out_dim]).unwrap();
+
+        let normed = rms_norm(&xt, &wnt, eps).unwrap();
+        let proj = matmul(&normed, &wpt).unwrap();
+
+        // dy = ones — simplest non-trivial gradient.
+        let dy = ones_like(&tape, &[rows, out_dim]).unwrap();
+        let grads = backward(&proj, dy).unwrap();
+
+        // All three input leaves must have grads.
+        assert!(grads[xt.node_idx()].is_some(), "x grad expected");
+        assert!(grads[wnt.node_idx()].is_some(), "w_norm grad expected");
+        assert!(grads[wpt.node_idx()].is_some(), "w_proj grad expected");
+        // x grad shape = [rows, dim]
+        let dx = grads[xt.node_idx()].as_ref().unwrap();
+        assert_eq!(dx.element_count(), rows * dim);
+        // w_norm grad shape = [dim]
+        let dwn = grads[wnt.node_idx()].as_ref().unwrap();
+        assert_eq!(dwn.element_count(), dim);
+        // w_proj grad shape = [dim, out_dim]
+        let dwp = grads[wpt.node_idx()].as_ref().unwrap();
+        assert_eq!(dwp.element_count(), dim * out_dim);
+    }
+
+    #[test]
+    fn gpu_tape_rms_norm_shape_mismatch_errors() {
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let xt = GpuTensor::from_vec(&tape, &vec![0.5; 4 * 32], vec![4, 32]).unwrap();
+        // Wrong-dim weight.
+        let bad_w = GpuTensor::from_vec(&tape, &vec![1.0; 16], vec![16]).unwrap();
+        match rms_norm(&xt, &bad_w, 1e-6) {
+            Err(e) => assert!(format!("{e}").contains("weight dim")),
+            Ok(_) => panic!("expected weight-dim mismatch error"),
+        }
+        // 1-D input.
+        let bad_x = GpuTensor::from_vec(&tape, &vec![0.5; 32], vec![32]).unwrap();
+        let w = GpuTensor::from_vec(&tape, &vec![1.0; 32], vec![32]).unwrap();
+        match rms_norm(&bad_x, &w, 1e-6) {
+            Err(e) => assert!(format!("{e}").contains("input must be 2-D")),
+            Ok(_) => panic!("expected input-shape error"),
         }
     }
 
