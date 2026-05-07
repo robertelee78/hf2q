@@ -3051,12 +3051,17 @@ fn worker_run(
                             registration.as_ref(),
                         )
                     }
-                    // iter-228a Qwen3-VL text MVP: short-circuit to the
-                    // forward-pending sentinel. iter-228b replaces this
-                    // with the live dense transformer forward (mirrors
-                    // the iter-215 → Wedge-3 split for Qwen3.5/3.6).
-                    LoadedModel::Qwen3VlText(_) => {
-                        crate::inference::models::qwen3vl_text::forward::qwen3vl_text_forward_pending_err()
+                    // iter-9b: live dense transformer forward via the
+                    // naive O(N²) re-prefill loop in
+                    // `engine_qwen3vl::generate_qwen3vl_text_once`.
+                    // Replaces the iter-228a 501 sentinel.
+                    LoadedModel::Qwen3VlText(q) => {
+                        super::engine_qwen3vl::generate_qwen3vl_text_once(
+                            q,
+                            &prompt_tokens,
+                            &params,
+                            registration.as_ref(),
+                        )
                     }
                 };
                 let _ = reply.send(result);
@@ -3267,16 +3272,47 @@ fn worker_run(
                             )
                         }
                     }
-                    // iter-228a Qwen3-VL text MVP: vision-aware generate
-                    // (with DeepStack chunks + 3D-mRoPE positions
-                    // already built by Wedge-4d/4e on the handler side)
-                    // returns the forward-pending sentinel until
-                    // iter-228b wires the real LM forward. The
-                    // ds_borrow + positions_flat bindings are retained
-                    // so the borrow lifetime check still runs.
-                    LoadedModel::Qwen3VlText(_) => {
-                        let _ = (&ds_borrow, &positions_flat);
-                        crate::inference::models::qwen3vl_text::forward::qwen3vl_text_forward_pending_err()
+                    // iter-9b: vision-aware generate via
+                    // `engine_qwen3vl::generate_qwen3vl_text_with_soft_tokens_once`.
+                    // Currently rejects non-empty soft_tokens with an
+                    // explicit error pointing at iter-9c (forward-path
+                    // soft-token splice not yet implemented). DeepStack
+                    // chunks ARE wired (forward Phase D) and the 3D-
+                    // mRoPE positions are passed through to the
+                    // forward call. This unblocks DeepStack-only image
+                    // chats and surfaces a clear error for
+                    // soft-token-required image chats until iter-9c.
+                    LoadedModel::Qwen3VlText(q) => {
+                        // Use caller-supplied positions when present;
+                        // fall back to text-only axis-major positions
+                        // for callers that didn't build any (e.g. the
+                        // chat handler routing a text-only request
+                        // through this arm by accident).
+                        let synth_positions: Vec<i32>;
+                        let pos_slice: &[i32] = if let Some(p) = positions_flat.as_deref() {
+                            p
+                        } else {
+                            let n = prompt_tokens.len();
+                            synth_positions = {
+                                let mut flat = vec![0i32; 4 * n];
+                                for axis in 0..4 {
+                                    for t in 0..n {
+                                        flat[axis * n + t] = t as i32;
+                                    }
+                                }
+                                flat
+                            };
+                            &synth_positions
+                        };
+                        super::engine_qwen3vl::generate_qwen3vl_text_with_soft_tokens_once(
+                            q,
+                            &prompt_tokens,
+                            &injections,
+                            ds_borrow.as_ref(),
+                            pos_slice,
+                            &params,
+                            registration.as_ref(),
+                        )
                     }
                 };
                 let _ = reply.send(result);
