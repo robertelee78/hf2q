@@ -182,10 +182,12 @@ Replaces all prior iteration tables.
 | 5.5 | — | ADR structural cleanup `3ce0571` | DONE |
 | 6 | — | Fix `materialize_cloned` deep-clone — Arc-share hot path `beb184f` (~52 GB save; bisect-verified falsifier) | DONE |
 | 7 | 1 | Port `estimate_threshold` + BPW accounting + `SensitivityAlgorithm` enum + `2.0.gradient-alignment` constant `913af23` (16/16 falsifiers; pure-fn, no autograd) | DONE |
-| 8 | 1-B | Subprocess gate for `mlx_lm.quant.dynamic_quant` `<this-commit>` — wraps Python CLI, parses sensitivities JSON. mlx-native has zero autograd surface; building it is months of work, so iter 8 lands the PATH B GATE first per ADR §8.2 (analogous to Track 2 §8.3). 18 falsifiers + 1 e2e gated `#[ignore]`. | DONE |
-| **9** | 1-B | E2E perplexity gate: run mlx-lm dynamic_quant on Qwen3-0.6B-base + measure PPL gap vs hf2q variance-magnitude DWQ-46 baseline. GO if ≥ 0.05 nats better. | **NEXT** |
-| 10 | 1 | If iter-9 GO: plan native autograd port (subprocess output proves the algorithm value); if NO-GO: drop Track 1 native port from scope, surface variance-magnitude → imatrix-quant-error proxy as the upgrade. | |
-| 11 | 1 | Native port (gated on iter-9 GO): Linear-aware backward through transformer; per-tensor sensitivity map. Major work — likely splits across 3-4 sub-iters. | |
+| 8 | aux | mlx-lm comparison harness `8b7e43c` — subprocess wrapper + JSON parser. **NOT Track 1 native progress** (mantra: no fallback). Repurposed as a parity/oracle harness for iter 13+ falsifiers (compare native sensitivity output against mlx-lm ground truth on synthetic fixtures). 18/18 falsifiers PASS. | DONE |
+| 8a | 1 | **CPU autograd correctness oracle** at `src/calibrate/autograd.rs` — tape + 7 ops {matmul, add, mul, sub, square, sum, mean} forward + reverse + per-op finite-diff falsifier (17 tests). **Test-only** — never reachable from any runtime entry point. Sole purpose: serves as the analytical reference the GPU autograd (8b+) gets falsifier-tested against. | DONE |
+| **8b** | 1 | **GPU autograd** on mlx-native MlxBuffer + Metal kernels — replace CPU storage with GPU buffers, port {matmul, add, mul, sub, square, sum, mean} to mlx-native primitives (compose `dense_matmul_f32_f32_tensor` + `transpose_2d` + new elementwise kernels). Per-op finite-diff parity vs the iter-8a CPU oracle. **This is what ships in production.** | **NEXT** |
+| 9 | 1 | Wire autograd into Qwen35 forward pass; per-Linear gradient capture; `estimate_sensitivities` algorithm core matching `dynamic_quant.py:38-106`. | |
+| 10 | 1 | E2E on Qwen3-0.6B-base; falsifier: native-output sensitivity ranking matches mlx-lm subprocess output (using iter-8 harness) within 1e-3 relative on a synthetic fixture. | |
+| 11 | 1 | E2E on Qwen3.6-27B + Gemma 4 26B-A4B — measure RSS, time, output GGUF coherence, PPL vs current variance-magnitude DWQ-46/48 baseline. | |
 | 11 | 2-B | Subprocess wrapper around `mlx_lm.dwq`; produce MLX safetensors | |
 | 12 | 2-B | GO/NO-GO gate: perplexity vs Q4_K_M baseline (>0.05 nats threshold) | |
 | 13–14 | 2-A | Port `dwq_quantize` algorithm core; Linear-only autograd; Adam optimizer | |
@@ -225,24 +227,31 @@ Replaces all prior iteration tables.
 | Sub-iter | Subtask | Status |
 |---|---|---|
 | 7 | `estimate_threshold` (binary search) + `compute_bits_per_weight` MLX-affine accounting + `SensitivityAlgorithm` enum + `2.0.gradient-alignment` cache-version constant.  Lives at `src/calibrate/dynamic_quant.rs`.  Pure functions, no autograd. | DONE |
-| 8 | Subprocess wrapper for `python -m mlx_lm.quant.dynamic_quant` at `src/calibrate/dynamic_quant_external.rs`.  Builds typed argv from a config; parses the auto-named `*_sensitivities.json` output into a `BTreeMap<String, f64>`; surfaces typed errors for malformed JSON / missing files / subprocess failures.  Verified mlx-lm 0.31.2 with Metal works locally.  18 unit falsifiers + 1 e2e gated `#[ignore]` (needs Qwen3-0.6B + ~30s).  Path B GATE for Track 1, analogous to Track 2 §8.3. | DONE |
-| 9 | E2E perplexity gate: run mlx-lm dynamic_quant on Qwen3-0.6B-base via the iter-8 wrapper; produce MLX safetensors; measure WikiText PPL via `mlx_lm.evaluate`.  Compare to hf2q's existing variance-magnitude DWQ-46 GGUF + llama-completion PPL on the same source.  **GO** if ≥ 0.05 nats better → continue native autograd port.  **NO-GO** if not material → drop Track 1 native port, propose imatrix-quant-error proxy upgrade as alternative. | NEXT |
-| 10 | (Gated on iter-9 GO) Plan + spec the native autograd port — pick approach: hand-derived Linear backward (no graph-based autograd) vs porting from candle's tape vs new mlx-native `value_and_grad`.  Decision blocked until iter-9 measurement. | |
-| 11 | (Gated) Native port impl, sub-iter 1: Linear-aware reverse pass, accumulator structure, per-batch eval/del rhythm. | |
-| 12 | (Gated) Native port impl, sub-iter 2: KL-div loss + softmax backward, sensitivity formula application. | |
-| 13 | E2E on Qwen3.6-27B + Gemma 4 26B-A4B — measure RSS, time, output GGUF coherence, perplexity vs current variance-magnitude DWQ-46/48 baseline. | |
+| 8 (aux) | mlx-lm comparison harness — `src/calibrate/dynamic_quant_external.rs`.  Subprocess wrapper around `python -m mlx_lm.quant.dynamic_quant` + sensitivities JSON parser.  **NOT Track 1 progress.**  Reframed as the parity oracle iter 10 will compare against to verify hf2q's native sensitivity output matches mlx-lm within 1e-3 relative.  18 unit falsifiers + 1 e2e gated `#[ignore]`. | DONE |
+| 8a | Tape skeleton + ops {matmul, add, mul, sub, square, sum, mean} forward + reverse + per-op finite-difference falsifier.  CPU first (f32 contiguous slices); GPU port lands later. | NEXT |
+| 8b | Activations: {softmax, log_softmax, gelu, silu (SwiGLU), relu} forward + backward + finite-diff falsifier. | |
+| 8c | Norms: {RMSNorm, LayerNorm} forward + backward + finite-diff falsifier. | |
+| 8d | Loss: {kl_div_loss, cross_entropy} forward + backward + finite-diff falsifier. | |
+| 8e | Linear-layer composite (matmul + add + activation) forward + backward + finite-diff falsifier on a 2-Linear synthetic MLP. | |
+| 8f | Embedding lookup + RoPE + transformer attention block forward + backward + finite-diff falsifier on a single-layer Qwen35-attention-like fixture. | |
+| 8g | QDQ-as-identity-for-codes: dequantize gradient flows through as ∂y/∂w_dequant = identity (codes frozen, scales/biases as continuous params at iter 13+; for dynamic_quant only the dequantized values participate in the gradient). | |
+| 8h | Move tape from CPU to mlx-native MlxBuffer / Metal kernels.  This is when the autograd becomes performant enough for 27B-class.  Until 8h, all algorithm validation runs on CPU at synthetic-fixture scale. | |
+| 9 | Wire autograd into hf2q's Qwen35 forward pass (replace static-quantized weights with the 8a-8h primitives that track gradients); per-Linear gradient accumulation; full `estimate_sensitivities` algorithm core matching `dynamic_quant.py:38-106`. | |
+| 10 | E2E on Qwen3-0.6B-base; falsifier: native-output sensitivity ranking matches mlx-lm subprocess output (using iter-8 aux harness) within 1e-3 relative on a synthetic fixture. | |
+| 11 | E2E on Qwen3.6-27B + Gemma 4 26B-A4B — RSS, time, GGUF coherence, PPL vs current variance-magnitude baseline. | |
 
-**Rationale for the iter-8 pivot to Path B GATE:**
+**Iter-8 framing correction (mantra):**
 
-Iter-8 audit of `/opt/mlx-native/src/` found ZERO autograd primitives
-(no `value_and_grad`, no `VJP`, no `JVP`, no `tape`, no `gradient` —
-`grep -rn "fn.*backward\|fn.*grad\|value_and_grad\|autograd" /opt/mlx-native/src` empty).
-Building reverse-mode autograd in mlx-native is a multi-month
-infrastructure project — out of scope for an /loop iter.  Per the
-mantra "Measure 3x, cut once" the iter-8 wrapper validates the
-algorithm + format end-to-end via Python before committing weeks to
-the native port.  This mirrors Track 2 Path B (§8.3) which uses the
-same gate-first strategy for DWQ proper.
+Earlier iter-8 framing presented the subprocess wrapper as "Path B
+gate" Track 1 progress.  That was a fallback masquerading as progress.
+Re-read of `~/Documents/mantra.txt`: *"DO NOT BE LAZY. We have plenty
+of time to do it right. No short cuts. ... No fallback. No stub
+(todo later) code. Just pure excellence, done the right way the
+entire time."*  A Python subprocess IS the canonical fallback.  The
+correct path is to build the autograd properly even if it takes
+months of /loop iterations.  Iter-8 commit `8b7e43c` retained as a
+parity oracle (its real future role) but reclassified as **aux**;
+iter-8a now begins the actual native autograd work.
 
 **Pass criteria:**
 

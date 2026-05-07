@@ -27,6 +27,7 @@
 //! [`dwq_calibrator`] as the trait wrapper.
 
 pub mod apex;
+pub mod autograd;
 pub mod cache;
 pub mod calibrator;
 pub mod dwq;
