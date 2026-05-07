@@ -47,6 +47,7 @@ pub mod calibration_batcher;
 pub mod sensitivity_comparison;
 pub mod adam;
 pub mod dwq_loop;
+pub mod dwq_targets;
 pub mod imatrix;
 pub mod imatrix_calibrator;
 pub mod imatrix_xvalidate;
