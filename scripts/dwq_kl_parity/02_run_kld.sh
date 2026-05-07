@@ -14,7 +14,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 CANDIDATE="${CANDIDATE:-./dwq_output}"
-BASELINE="${BASELINE:-jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated}"
+# NOTE: baseline must point at the local working dir (./abliterix_with_chat_template)
+# not the raw HF id. mlx_lm.utils.load() fails on the upstream config's
+# model_type="qwen3_5_moe_text" (mlx-lm 0.31.2 module is qwen3_5_moe). The working
+# dir's config.json has the type patched and chat_template injected.
+BASELINE="${BASELINE:-./abliterix_with_chat_template}"
 TOP_K="${TOP_K:-1024}"
 SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-1025}"
 NUM_SAMPLES="${NUM_SAMPLES:-512}"

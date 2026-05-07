@@ -13,8 +13,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-REF_MODEL="${REF_MODEL:-jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated}"
-RTN_OUT="${RTN_OUT:-./rtn_q4_output}"
+# Default to the local working dir (model_type patched + chat_template injected)
+# instead of the raw HF id — same reason as step 02.
+REF_MODEL="${REF_MODEL:-./abliterix_with_chat_template}"
+# Default to the rtn_output produced by Pass 1 of 01_run_dwq.sh.  Falls back
+# to a fresh convert if it doesn't exist.
+RTN_OUT="${RTN_OUT:-./rtn_output}"
 BITS="${BITS:-4}"
 GROUP_SIZE="${GROUP_SIZE:-64}"
 TOP_K="${TOP_K:-1024}"
@@ -27,8 +31,11 @@ DATA_PATH="${DATA_PATH:-allenai/tulu-3-sft-mixture}"
 echo "=== ADR-020 iter-19b step 03: RTN-Q4 baseline ==="
 echo ""
 
-# Step 3a — naive RTN Q4 via mlx_lm.convert.
-if [ ! -d "$RTN_OUT" ]; then
+# Step 3a — naive RTN Q4 via mlx_lm.convert (idempotent — Pass 1 of 01_run_dwq.sh
+# normally produces this for free).  Skip if rtn_output is already populated.
+if [ -f "$RTN_OUT/config.json" ] && ls "$RTN_OUT"/model-*.safetensors >/dev/null 2>&1; then
+    echo "[3a] RTN output already exists at $RTN_OUT — skipping convert"
+else
     echo "[3a] producing RTN-Q4 via mlx_lm.convert ..."
     mlx_lm.convert \
         --hf-path "$REF_MODEL" \
@@ -36,9 +43,8 @@ if [ ! -d "$RTN_OUT" ]; then
         --quantize \
         --q-bits "$BITS" \
         --q-group-size "$GROUP_SIZE" \
+        --q-mode affine \
         2>&1 | tee rtn_convert.log
-else
-    echo "[3a] RTN output already exists at $RTN_OUT — skipping convert"
 fi
 
 # Step 3b — measure KLD.

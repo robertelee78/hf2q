@@ -2,5 +2,7 @@
 abliterix_with_chat_template/
 dwq_output/
 rtn_q4_output/
+rtn_output/
+dwq_targets/
 *.log
 results.jsonl
