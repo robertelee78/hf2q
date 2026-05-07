@@ -1,6 +1,36 @@
 # ADR-020: DWQ streaming calibration — eliminate the 199 GB peak on 27B/35B
 
-**Status**: Proposed — 2026-05-06
+**Status**: Proposed — 2026-05-06; PIVOTED iteration 4.5 (taxonomy + algorithm correction)
+
+## Critical taxonomy correction (2026-05-06 iter 4.5)
+
+**hf2q's "DWQ-46" and "DWQ-48" are NOT what mlx-lm calls DWQ.** Reading
+`/opt/mlx-lm/mlx_lm/quant/dwq.py` and `/opt/mlx-lm/mlx_lm/quant/dynamic_quant.py`
+clarifies the gap:
+
+| Algorithm | mlx-lm name | What hf2q has | What hf2q SHOULD have |
+|---|---|---|---|
+| Distillation fine-tuning of quantized scales+biases via KL-div from full-precision teacher (gradient-based) | `DWQ` (`dwq.py`) | not implemented | (not in scope for this ADR) |
+| Sensitivity ranking → mixed-bit allocation (4-bit base, higher bits for sensitive tensors) | `dynamic_quant` (`dynamic_quant.py`) | misnamed as `DWQ-46`/`DWQ-48` | rename to `dynamic-quant` aligned with upstream + port mlx-lm's clean algorithm |
+
+`dynamic_quant.py:38-106` is the canonical clean implementation:
+- 60 lines of code
+- Per-batch sequential loop: `for batch ... in tqdm(...): targets = model(batch); _, grads = nn.value_and_grad(...); grad_accum += grads; del grads; mx.eval(grad_accum)`
+- Single persistent state: `grad_accum` (small — just gradient norms per layer)
+- Per-batch activations freed after each iteration
+- Total memory: model + 1 batch activations + grad_accum
+
+hf2q's current `DwqCalibrator` instead:
+- Builds a separate `RealActivationCapture(Qwen35Model)` with all-layer F32 host expansion (104 GB)
+- Holds full activations during all batches
+- Uses a custom sensitivity-from-activations metric (variance-magnitude) rather than gradient-based
+- Has accreted complexity over 100+ iters with cache-priming hoists, explicit drops, etc.
+
+## What this changes
+1. The "make working DWQ quants" target stays the same — sensitivity-based mixed-bit allocation in GGUF format. Just rename internally to `dynamic-quant` so future readers understand the taxonomy.
+2. **Replace `DwqCalibrator` with `DynamicQuantCalibrator`** that ports `mlx_lm/quant/dynamic_quant.py:estimate_sensitivities` exactly. The algorithm is gradient-based (KL-div between full-precision and qdq'd model) — different metric than hf2q's current variance-magnitude, but matches the published reference and is provably memory-bounded.
+3. **Drop A+B+D** as scoped earlier — A (mmap) and B (zero-copy MlxBuffer) are still useful but **not load-bearing for fitting on 128 GB**, because mlx-lm's algorithm doesn't need the all-layer F32 expansion in the first place. Per-batch processing + `del grads` keeps peak bounded by model size + 1-batch activations.
+
 **Driver**: User mission "/loop fully complete the research, and once research is complete, make working dwq quants (46 and 48) for the gemma4 and qwen3.6 families..."
 **Predecessors**: ADR-014 P11 closure (DwqKQuantizer + cache), `project_qwen35_dwq_pre_505b5b8_broken_2026_05_05.md`, `project_hf2q_dwq_oom_root_cause_2026_05_06.md`
 
@@ -98,16 +128,118 @@ Estimated 1-2 days of focused refactor. Touches `src/calibrate/dwq_calibrator.rs
 
 ## Implementation iteration plan
 
+**REVISION 2026-05-06 iteration 4 → 5:** dropped naive Phase 2 (drop-CPU-F32-after-upload).
+Even with that fix, peak ~158 GB (vs 128 GB box) — insufficient. User question
+"what is llama.cpp doing differently" surfaced the real architectural gap, captured
+in `Phase A+B+D` plan below. Commits `72fdee8` + `437217d` + `b3db220` retained;
+they are still load-bearing (Phase 1 + the deep-dive that informed this pivot).
+
 | Iter | Scope | Status |
 |---|---|---|
 | 2 | Research synthesis, ADR, memory updates, commit `72fdee8` | DONE |
 | 3 | Phase 1: TensorRef.data Arc refactor, falsifier test, regression check (104/104 PASS), commit `437217d` pushed | DONE |
-| 4 (this) | Phase 2 deep-dive: trace GPU upload + cache lifecycle, verify MlxBuffer COPIES (not aliases) | DONE |
-| 5 | Phase 2 implementation: drop host F32 vecs after one-time GPU upload completes | NEXT |
-| 6 | Phase 2 testing: synthetic model peak measurement + regression suite | |
-| 7 | E2E DWQ-46 27B with watchdog (no `ulimit -v` on macOS — RLIMIT_AS unimplemented) | |
-| 8 | Roll forward to all 4 family×bit combinations | |
-| 9 | Benchmark + ADR closure | |
+| 4 | Phase 2 deep-dive: trace GPU upload + cache lifecycle, verify MlxBuffer COPIES, commit `b3db220` | DONE |
+| 4.5 (this) | "What does llama.cpp do?" deep-dive surfaces architectural gap; pivot to A+B+D | DONE |
+| 5 | Phase A: mmap-backed safetensors load (replace `mmap[..].to_vec()` at safetensors.rs:437) | NEXT |
+| 6 | Phase B: `MlxBuffer::from_no_copy` in /opt/mlx-native using metal-rs `new_buffer_with_bytes_no_copy` (cross-repo) | |
+| 7 | Phase D: reuse serve path for DwqCalibrator (eliminate separate Qwen35Model build) | |
+| 8 | E2E DWQ-46 27B with watchdog; expected peak ≤ 10 GB matching llama.cpp profile | |
+| 9 | Roll forward to all 4 family×bit combinations + Gemma 4 26B-A4B | |
+| 10 | Benchmark vs llama.cpp imatrix peer reference; ADR closure | |
+
+## Why naive Phase 2 alone is insufficient — architectural finding
+
+Iteration 4.5 verified llama.cpp's load architecture (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m:1465`):
+```objc
+res->buffers[0].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:res->all_data
+                                                                length:size_aligned
+                                                               options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
+```
+Metal's `newBufferWithBytesNoCopy` **aliases an existing pointer** — for llama.cpp,
+that pointer is the mmap'd GGUF file. CPU and GPU see the SAME memory. **Zero bytes copied.**
+
+vs hf2q's mlx-native at `/opt/mlx-native/src/device.rs:143`: only has `device.new_buffer(...)`
+which always allocates fresh; uploads via `slice.copy_from_slice(data)` — full byte copy.
+
+Combined with hf2q's **deep-copy-from-mmap** at `src/input/safetensors.rs:437`
+(`mmap[..].to_vec()`) and host-F32 expansion in `weight_loader.rs::load_lazy_f32`, the
+3 multipliers produce the 199 GB peak:
+
+| Step | hf2q (current) | llama.cpp |
+|---|---|---|
+| Load weights from disk | deep-copy mmap → owned Vec<u8> (~52 GB) | mmap pointer kept (~0 GB resident) |
+| Build calibration model | F16/BF16 → F32 host expansion (~104 GB) | reuse same model handle (~0 GB extra) |
+| Upload to GPU | `alloc_buffer + copy_from_slice` (+~104 GB) | `newBufferWithBytesNoCopy` (~0 GB extra, alias) |
+| **Total peak** | **~260 GB** (with scratch ≈ 199 observed) | **~10 GB**  |
+
+The **mantra-correct fix** is architectural alignment, not patching the symptom. Phases
+A+B+D (below) bring hf2q's profile in line with llama.cpp.
+
+## Phase A: mmap-backed safetensors loader
+
+Replace `src/input/safetensors.rs:437` `mmap_clone[abs_start..abs_end].to_vec()` with
+a pattern that keeps the source Mmap alive and exposes tensor bytes as a slice into it.
+
+Two viable shapes:
+1. **`TensorRef.data: Arc<MmapView>`** where `MmapView { mmap: Arc<Mmap>, offset: usize, len: usize }`. Deref to `&[u8]`. Eliminates the owned Vec entirely.
+2. **Keep `Arc<Vec<u8>>` but defer materialization**: the Arc holds a closure that reads from mmap on first access. Worse — still materializes when accessed.
+
+Going with shape (1). Touches:
+- `src/input/safetensors.rs::read_tensors_eager` and `read_tensors_lazy` (already mmap-backed; the to_vec was the eager bridge)
+- `src/ir/mod.rs::TensorRef.data` field type
+- `src/ir/mod.rs::TensorRef::take_data_as_arc` semantics (was `Arc::new(mem::take(...))`; needs MmapView equivalent)
+- All existing read sites (267) — most work via Deref
+
+Falsifier test: load Qwen3.6-27B safetensors via the new path, assert `mach_task_basic_info` RSS stays under 5 GB (mmap-paged, demand-fault working set only). Compare to baseline before-A which would be ~52 GB.
+
+## Phase B: MlxBuffer::from_no_copy in /opt/mlx-native (cross-repo)
+
+mlx-native already depends on `metal = "0.33"` which exposes `Device::new_buffer_with_bytes_no_copy`.
+Add to `/opt/mlx-native/src/device.rs`:
+```rust
+/// Wrap an existing pointer as a StorageModeShared Metal buffer
+/// without copying bytes. Keeps `holder` alive for the buffer's lifetime
+/// via a deallocator closure — so dropping the MlxBuffer drops the holder
+/// at the right moment. Mirrors ggml-metal's `newBufferWithBytesNoCopy`
+/// pattern at ggml-metal-device.m:1465 (zero-copy mmap → GPU alias).
+pub fn alloc_buffer_no_copy(
+    &self,
+    holder: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    dtype: DType,
+    shape: Vec<usize>,
+) -> Result<MlxBuffer> { ... }
+```
+
+Falsifier: build a 100 MB Arc<Vec<u8>>, call `alloc_buffer_no_copy`, assert
+`metal_buf.contents() as usize == arc.as_ref().as_ptr() as usize` — same memory.
+
+Cross-repo: commit + push to /opt/mlx-native, bump version, update hf2q Cargo.toml dep.
+
+## Phase D: reuse serve path for DwqCalibrator
+
+`src/calibrate/dwq_calibrator.rs:333-345` builds `RealActivationCapture::from_lazy_tensor_map`
+which calls `Qwen35Model::load_from_lazy_tensor_map` — the all-layer-F32 expansion path.
+
+After A+B land, the same `Qwen35Model` build path will be cheap (mmap-aliased GPU buffers,
+no F32 host expansion needed if we ALSO migrate `load_lazy_f32` to skip the F32 cast and
+use type-specialized GPU kernels for F16/BF16 weights).
+
+Phase D investigates whether the existing `cmd_serve` load path is already memory-efficient
+enough to be tapped for activation capture, OR if Phase D needs to add a new
+`Qwen35Model::load_for_capture(Arc<Mmap>)` constructor that avoids the host F32 expansion.
+
+Falsifier: bare `hf2q convert --quant dwq-4-6 --input <Qwen3.6-27B>` with watchdog (poll RSS
+via mach_task_basic_info, SIGTERM if > 20 GB threshold) → process completes successfully,
+max RSS observed ≤ 20 GB. Compares to pre-fix 199 GB.
+
+### Why no naive Phase 2 (drop CPU F32 after upload)
+
+Even if we hoisted the GPU upload into `Qwen35Model::load_from_lazy_tensor_map` and dropped
+each layer's host F32 immediately after upload (the original Phase 2 plan), peak briefly
+hits both source bytes + uploaded GPU buffer + transient F32 expansion = ~158 GB. Still
+over 128 GB. The real fix has to eliminate the F32 expansion AND the upload copy — that's
+what A+B+D do together.
 
 ## Phase 2 implementation plan (verified iteration 4)
 
