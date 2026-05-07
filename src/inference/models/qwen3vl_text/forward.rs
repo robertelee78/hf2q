@@ -362,6 +362,21 @@ pub fn forward_text_prefill_logits_last(
         let lw = &weights.layers[il];
 
         // ── Phase A: pre-attn → Q/K/V → IMROPE ────────────────────
+        //
+        // **memory_barrier discipline (iter-9b-fix)**: every RAW
+        // dependency between dispatches in the SAME encoder needs an
+        // explicit `enc.memory_barrier()`. Apple Metal compute
+        // encoders run dispatches in parallel by default (multiple
+        // threadgroups concurrent on the same queue); without
+        // barriers a downstream kernel can read partially-written
+        // bytes from an upstream kernel and produce non-deterministic
+        // garbage. Mirrors qwen35's pattern at
+        // `gpu_full_attn.rs::full_attention_layer:2746-2768`.
+        //
+        // Pre-iter-9b-fix omitted these barriers — chat output was
+        // tokenized garbage ("BOT"/"ン"/"= -" in the top-5 vs peer's
+        // expected "2"/" plus"/" "). Adding barriers between every
+        // RAW pair fixes the race.
         let (q_rope, k_rope, v_seq) = {
             let mut session_a = executor
                 .begin()
@@ -373,6 +388,8 @@ pub fn forward_text_prefill_logits_last(
                 seq_len, hidden, rms_eps,
             )
             .with_context(|| format!("layer {il}: pre-attn rms_norm"))?;
+            // RAW: Q/K/V projections read attn_normed.
+            enc.memory_barrier();
 
             let q_seq = apply_linear_projection_f32(
                 enc, registry, device, &attn_normed, &lw.attn_q,
@@ -389,6 +406,8 @@ pub fn forward_text_prefill_logits_last(
                 seq_len, hidden, kv_dim,
             )
             .with_context(|| format!("layer {il}: V proj"))?;
+            // RAW: per-head rms_norm reads q_seq / k_seq.
+            enc.memory_barrier();
 
             // The kernel reads Q/K as `[seq * n_heads, head_dim]` (each
             // row independently normalized). Q/K buffers have shape
@@ -405,6 +424,8 @@ pub fn forward_text_prefill_logits_last(
                 seq_len, n_kv_heads, head_dim, rms_eps,
             )
             .with_context(|| format!("layer {il}: K per-head rms_norm"))?;
+            // RAW: IMROPE reads q_normed / k_normed.
+            enc.memory_barrier();
 
             // 3D-IMROPE: mode=40 (Imrope), sections=[24,20,20,0] for
             // Qwen3-VL-2B → first 64 slots rotated, next 64 identity.
@@ -461,17 +482,23 @@ pub fn forward_text_prefill_logits_last(
                 seq_len, hidden, hidden,
             )
             .with_context(|| format!("layer {il}: output proj"))?;
+            // RAW: residual add reads attn_proj.
+            enc.memory_barrier();
 
             let ffn_inp = elementwise_add_f32_2d(
                 enc, registry, device, &hidden_gpu, &attn_proj,
                 seq_len, hidden,
             )
             .with_context(|| format!("layer {il}: post-attn residual add"))?;
+            // RAW: ffn_norm reads ffn_inp.
+            enc.memory_barrier();
 
             let ffn_normed = rms_norm_2d(
                 enc, registry, device, &ffn_inp, &lw.ffn_norm, seq_len, hidden, rms_eps,
             )
             .with_context(|| format!("layer {il}: ffn rms_norm"))?;
+            // RAW: dense_ffn reads ffn_normed (and ffn_inp as residual).
+            enc.memory_barrier();
 
             // SwiGLU SiLU FFN with built-in residual add.
             //
@@ -630,6 +657,8 @@ pub fn forward_text_prefill_logits_last(
             1, hidden, rms_eps,
         )
         .context("final output rms_norm")?;
+        // RAW: LM head matmul reads final_normed.
+        enc.memory_barrier();
 
         let logits_buf = apply_linear_projection_f32(
             enc, registry, device, &final_normed, lm_head_weight,
