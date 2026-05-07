@@ -35,6 +35,12 @@ STOCK_RTN="./stock_rtn_output"
 STOCK_TARGETS="./stock_dwq_targets"
 STOCK_DWQ="./stock_dwq_output"
 
+# kld.py at line 328 hard-rejects baselines whose safetensors metadata
+# `format` != 'mlx'.  Native HF safetensors have format='pt'.  We must
+# convert BF16-as-mlx (--dtype bfloat16, no -q) before running kld.py.
+ABLITERATED_MLX_BF16="./abliterated_mlx_bf16"
+STOCK_MLX_BF16="./stock_mlx_bf16"
+
 # Same hyperparameters as the abliterated run (canonical mlx-lm defaults).
 BITS=4
 GROUP_SIZE=64
@@ -70,14 +76,28 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────
+# Step B0 — convert abliterated BF16 to mlx-format (kld.py prerequisite)
+# ─────────────────────────────────────────────────────────────────────
+if [ ! -f "$ABLITERATED_MLX_BF16/config.json" ] || ! ls "$ABLITERATED_MLX_BF16"/model-*.safetensors >/dev/null 2>&1; then
+    log "=== Step B0: mlx_lm.convert (BF16-as-mlx) → $ABLITERATED_MLX_BF16 ==="
+    START_S=$(date +%s)
+    mlx_lm.convert --hf-path ./abliterix_with_chat_template \
+        --mlx-path "$ABLITERATED_MLX_BF16" \
+        --dtype bfloat16 \
+        2>&1 | tee -a "$LOG"
+    DUR=$(($(date +%s) - START_S))
+    log "Step B0 done in ${DUR}s"
+fi
+
+# ─────────────────────────────────────────────────────────────────────
 # Step B — kld.py: abliterated DWQ output vs abliterated BF16 reference
 # ─────────────────────────────────────────────────────────────────────
-if [ "$SKIP_ABLITERATED" = "0" ] && [ ! -f "abliterated_dwq_kld.json" ]; then
+if [ "$SKIP_ABLITERATED" = "0" ] && [ ! -f "abliterated_dwq_kld.txt" ]; then
     log "=== Step B: kld.py on abliterated DWQ output ==="
     START_S=$(date +%s)
     python3 kld.py \
         --model ./dwq_output \
-        --baseline-model ./abliterix_with_chat_template \
+        --baseline-model "$ABLITERATED_MLX_BF16" \
         --top-k 1024 \
         --data-path allenai/tulu-3-sft-mixture \
         --sequence-length 1025 \
@@ -87,19 +107,18 @@ if [ "$SKIP_ABLITERATED" = "0" ] && [ ! -f "abliterated_dwq_kld.json" ]; then
         2>&1 | tee -a "$LOG"
     DUR=$(($(date +%s) - START_S))
     log "Step B done in ${DUR}s"
-    # mlx_lm.kld writes its own JSON if --output-dir given; we capture from log
     grep -aoE "Mean KLD:?\s*[0-9.eE+-]+" "$LOG" | tail -1 > abliterated_dwq_kld.txt
 fi
 
 # ─────────────────────────────────────────────────────────────────────
 # Step C — kld.py: abliterated RTN-Q4 output vs abliterated BF16
 # ─────────────────────────────────────────────────────────────────────
-if [ -d "./rtn_output" ] && [ ! -f "abliterated_rtn_kld.json" ]; then
+if [ -d "./rtn_output" ] && [ ! -f "abliterated_rtn_kld.txt" ]; then
     log "=== Step C: kld.py on abliterated RTN-Q4 ==="
     START_S=$(date +%s)
     python3 kld.py \
         --model ./rtn_output \
-        --baseline-model ./abliterix_with_chat_template \
+        --baseline-model "$ABLITERATED_MLX_BF16" \
         --top-k 1024 \
         --data-path allenai/tulu-3-sft-mixture \
         --sequence-length 1025 \
@@ -190,6 +209,20 @@ else:
 fi
 
 # ─────────────────────────────────────────────────────────────────────
+# Step F0 — convert stock BF16 to mlx-format (kld.py prerequisite for H/I)
+# ─────────────────────────────────────────────────────────────────────
+if [ ! -f "$STOCK_MLX_BF16/config.json" ] || ! ls "$STOCK_MLX_BF16"/model-*.safetensors >/dev/null 2>&1; then
+    log "=== Step F0: mlx_lm.convert (BF16-as-mlx) → $STOCK_MLX_BF16 ==="
+    START_S=$(date +%s)
+    mlx_lm.convert --hf-path "$STOCK_LOCAL" \
+        --mlx-path "$STOCK_MLX_BF16" \
+        --dtype bfloat16 \
+        2>&1 | tee -a "$LOG"
+    DUR=$(($(date +%s) - START_S))
+    log "Step F0 done in ${DUR}s"
+fi
+
+# ─────────────────────────────────────────────────────────────────────
 # Step G — 3-pass recipe on stock model
 # ─────────────────────────────────────────────────────────────────────
 log "=== Step G: 3-pass recipe on stock $STOCK_REPO ==="
@@ -241,7 +274,7 @@ log "=== Step H: LOAD-BEARING v1 parity — kld.py on stock DWQ ==="
 START_S=$(date +%s)
 python3 kld.py \
     --model "$STOCK_DWQ" \
-    --baseline-model "$STOCK_LOCAL" \
+    --baseline-model "$STOCK_MLX_BF16" \
     --top-k 1024 \
     --data-path allenai/tulu-3-sft-mixture \
     --sequence-length 1025 \
@@ -260,7 +293,7 @@ log "=== Step I: sanity — kld.py on stock RTN-Q4 (expect ~0.07418) ==="
 START_S=$(date +%s)
 python3 kld.py \
     --model "$STOCK_RTN" \
-    --baseline-model "$STOCK_LOCAL" \
+    --baseline-model "$STOCK_MLX_BF16" \
     --top-k 1024 \
     --data-path allenai/tulu-3-sft-mixture \
     --sequence-length 1025 \

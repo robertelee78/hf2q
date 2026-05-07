@@ -4,5 +4,13 @@ dwq_output/
 rtn_q4_output/
 rtn_output/
 dwq_targets/
+abliterated_mlx_bf16/
+stock_working_dir/
+stock_mlx_bf16/
+stock_rtn_output/
+stock_dwq_targets/
+stock_dwq_output/
+*_kld.txt
+*_kld.json
 *.log
 results.jsonl
