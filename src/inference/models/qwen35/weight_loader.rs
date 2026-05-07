@@ -469,7 +469,7 @@ fn tensor_ref_to_f32(mut tensor: TensorRef) -> Result<Vec<f32>> {
     // P13 type migration).  The early-drop semantic is preserved — the
     // old Vec/Arc is dropped immediately when the assignment overwrites
     // the field.
-    tensor.data = Vec::new();
+    tensor.data = std::sync::Arc::new(Vec::new());
     Ok(out)
 }
 

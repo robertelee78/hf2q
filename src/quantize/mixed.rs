@@ -273,7 +273,7 @@ mod tests {
             name: name.to_string(),
             shape,
             dtype: DType::F16,
-            data: vec![0u8; numel * 2],
+            data: std::sync::Arc::new(vec![0u8; numel * 2]),
         }
     }
 
@@ -453,7 +453,7 @@ mod tests {
             name: "model.layers.0.input_layernorm.weight".to_string(),
             shape: vec![8],
             dtype: DType::F16,
-            data: vec![0u8; 16],
+            data: std::sync::Arc::new(vec![0u8; 16]),
         };
         let config = LayerQuantConfig {
             bits: 4,

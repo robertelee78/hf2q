@@ -384,7 +384,7 @@ impl SafetensorsBackend {
                 vec![tensor.data.len()]
             };
 
-            entries.push((name.clone(), dtype_str, shape, tensor.data.clone()));
+            entries.push((name.clone(), dtype_str, shape, (*tensor.data).clone()));
 
             // For preserved tensors there is nothing more to emit.
             if tensor.quant_info.preserved {
@@ -761,7 +761,7 @@ mod tests {
             name: name.to_string(),
             shape: vec![4, 4],
             original_dtype: DType::F16,
-            data,
+            data: std::sync::Arc::new(data),
             quant_info: TensorQuantInfo {
                 method: if preserved {
                     "passthrough".to_string()

@@ -378,7 +378,7 @@ pub fn merge_expert_tensors(
         name: merged_name,
         shape: vec![n, rows, cols],
         dtype: first.dtype,
-        data: merged_data,
+        data: merged_data.into(),
     })
 }
 
@@ -529,7 +529,7 @@ pub fn split_and_rename_fused_gate_up_in_tensor_map(
                 name: gate_name,
                 shape: split_shape.clone(),
                 dtype: tensor.dtype,
-                data: gate_data,
+                data: gate_data.into(),
             },
         );
         tensor_map.tensors.insert(
@@ -538,7 +538,7 @@ pub fn split_and_rename_fused_gate_up_in_tensor_map(
                 name: up_name,
                 shape: split_shape,
                 dtype: tensor.dtype,
-                data: up_data,
+                data: up_data.into(),
             },
         );
     }
@@ -685,7 +685,7 @@ pub fn merge_moe_experts_in_tensor_map(
                 ),
                 shape: merged.shape,
                 dtype: merged.dtype,
-                data: merged.data,
+                data: merged.data.clone(),
             };
             tensor_map.tensors.insert(merged_ref.name.clone(), merged_ref);
         }
@@ -800,7 +800,7 @@ pub fn merge_moe_experts_in_place(
                     name: hf_name.clone(),
                     shape: qt.shape.clone(),
                     dtype: qt.original_dtype,
-                    data: qt.data.clone(),
+                    data: std::sync::Arc::clone(&qt.data),
                 });
                 expert_keys.push(hf_name);
             }
@@ -826,7 +826,7 @@ pub fn merge_moe_experts_in_place(
                 ),
                 shape: merged_ref.shape.clone(),
                 original_dtype: merged_ref.dtype,
-                data: merged_ref.data,
+                data: std::sync::Arc::clone(&merged_ref.data),
                 quant_info: crate::ir::TensorQuantInfo {
                     method: "passthrough".to_string(),
                     bits: merged_ref.dtype.element_size() as u8 * 8,
@@ -1372,25 +1372,25 @@ mod tests {
             name: "model.layers.0.mlp.experts.gate_up_proj".into(),
             shape: fused_shape.clone(),
             dtype: DType::F16,
-            data: layer0_gate_up.clone(),
+            data: layer0_gate_up.clone().into(),
         });
         eager.insert(TensorRef {
             name: "model.layers.0.mlp.experts.down_proj".into(),
             shape: down_shape.clone(),
             dtype: DType::F16,
-            data: layer0_down.clone(),
+            data: layer0_down.clone().into(),
         });
         eager.insert(TensorRef {
             name: "model.layers.1.mlp.experts.gate_up_proj".into(),
             shape: fused_shape.clone(),
             dtype: DType::F16,
-            data: layer1_gate_up.clone(),
+            data: layer1_gate_up.clone().into(),
         });
         eager.insert(TensorRef {
             name: "model.layers.1.mlp.experts.down_proj".into(),
             shape: down_shape.clone(),
             dtype: DType::F16,
-            data: layer1_down.clone(),
+            data: layer1_down.clone().into(),
         });
         split_and_rename_fused_gate_up_in_tensor_map(&mut eager, &metadata).unwrap();
 
@@ -1537,7 +1537,7 @@ mod tests {
                         name: name.clone(),
                         shape: shape.clone(),
                         dtype: DType::F16,
-                        data: data.clone(),
+                        data: data.clone().into(),
                     });
                     lazy.insert(LazyTensor::from_bytes(
                         LazyMeta::new(name, shape.clone(), DType::F16),
@@ -1649,7 +1649,7 @@ mod tests {
                 name: name.to_string(),
                 shape: shape.clone(),
                 dtype: DType::F16,
-                data: data.clone(),
+                data: data.clone().into(),
             });
             lazy.insert(LazyTensor::from_bytes(
                 LazyMeta::new(name.to_string(), shape.clone(), DType::F16),
@@ -1983,7 +1983,7 @@ mod tests {
             name: name.to_string(),
             shape: vec![rows, cols],
             dtype: DType::F32,
-            data,
+            data: std::sync::Arc::new(data),
         }
     }
 

@@ -487,9 +487,13 @@ fn clone_tensor_map_to_lazy(tensor_map: &crate::ir::TensorMap) -> crate::ir::laz
             tensor.shape.clone(),
             tensor.dtype,
         );
-        out.insert(crate::ir::lazy::LazyTensor::from_bytes(
+        // ADR-020 P13 step 4: from_arc_bytes + Arc::clone is a pointer-bump
+        // share, NOT a deep byte clone. Pre-2026-05-06 this was
+        // `from_bytes(meta, tensor.data.clone())` — the 52 GB clone for
+        // Qwen3.6-27B that dominated the 199 GB DWQ peak.
+        out.insert(crate::ir::lazy::LazyTensor::from_arc_bytes(
             meta,
-            tensor.data.clone(),
+            std::sync::Arc::clone(&tensor.data),
         ));
     }
     out
@@ -2046,7 +2050,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             for (_, t) in tensor_map.tensors.iter() {
                 let meta =
                     ir::lazy::LazyMeta::new(t.name.clone(), t.shape.clone(), t.dtype);
-                lazy_map.insert(ir::lazy::LazyTensor::from_bytes(meta, t.data.clone()));
+                lazy_map.insert(ir::lazy::LazyTensor::from_arc_bytes(meta, std::sync::Arc::clone(&t.data)));
             }
             match quality::measure_quality_streaming_lazy(
                 &lazy_map,

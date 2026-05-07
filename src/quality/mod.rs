@@ -253,7 +253,7 @@ pub fn dequantize_single_tensor(name: &str, qt: &QuantizedTensor) -> TensorRef {
             name: name.to_string(),
             shape: qt.shape.clone(),
             dtype,
-            data: qt.data.clone(),
+            data: std::sync::Arc::clone(&qt.data),
         };
     }
 
@@ -262,7 +262,7 @@ pub fn dequantize_single_tensor(name: &str, qt: &QuantizedTensor) -> TensorRef {
             name: name.to_string(),
             shape: qt.shape.clone(),
             dtype: DType::F16,
-            data: qt.data.clone(),
+            data: std::sync::Arc::clone(&qt.data),
         };
     }
 
@@ -298,7 +298,7 @@ pub fn dequantize_single_tensor(name: &str, qt: &QuantizedTensor) -> TensorRef {
             .collect(),
         None => {
             warn!("No scales for tensor '{}', treating as passthrough", name);
-            let data: Vec<u8> = vec![0u8; numel * 2];
+            let data = std::sync::Arc::new(vec![0u8; numel * 2]);
             return TensorRef {
                 name: name.to_string(),
                 shape: qt.shape.clone(),
@@ -332,7 +332,7 @@ pub fn dequantize_single_tensor(name: &str, qt: &QuantizedTensor) -> TensorRef {
         name: name.to_string(),
         shape: qt.shape.clone(),
         dtype: DType::F16,
-        data: f16_data,
+        data: f16_data.into(),
     }
 }
 
@@ -675,7 +675,7 @@ fn try_dequantize_codec_direct(name: &str, qt: &QuantizedTensor) -> Option<Tenso
         name: name.to_string(),
         shape: qt.shape.clone(),
         dtype: DType::F16,
-        data: f16_data,
+        data: f16_data.into(),
     })
 }
 
@@ -949,7 +949,7 @@ mod tests {
                 name: "test.weight".to_string(),
                 shape: vec![2],
                 original_dtype: DType::F16,
-                data: f16_data.clone(),
+                data: f16_data.clone().into(),
                 quant_info: crate::ir::TensorQuantInfo {
                     method: "passthrough".to_string(),
                     bits: 16,
@@ -1008,7 +1008,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         let t = result.tensors.get("test.weight").unwrap();
         assert_eq!(t.dtype, DType::F16);
-        assert_eq!(t.data, f16_data);
+        assert_eq!(*t.data, f16_data);
     }
 
     #[test]
@@ -1022,7 +1022,7 @@ mod tests {
             name: "test".to_string(),
             shape: vec![3],
             dtype: DType::F16,
-            data: f16_data,
+            data: f16_data.into(),
         };
 
         let vals = tensor_ref_to_f32(&tensor);
@@ -1069,13 +1069,13 @@ mod tests {
             name: "blk.0.ffn_up.weight".to_string(),
             shape: vec![1, ROW],
             dtype: DType::F16,
-            data: orig_q_f16,
+            data: orig_q_f16.into(),
         });
         orig_map.insert(TensorRef {
             name: "blk.0.ffn_down.weight".to_string(),
             shape: vec![1, ROW],
             dtype: DType::F16,
-            data: preserved_f16.clone(),
+            data: preserved_f16.clone().into(),
         });
 
         let mut tensors = HashMap::new();
@@ -1085,7 +1085,7 @@ mod tests {
                 name: "blk.0.ffn_up.weight".to_string(),
                 shape: vec![1, ROW],
                 original_dtype: DType::F16,
-                data: q_data,
+                data: q_data.into(),
                 quant_info: crate::ir::TensorQuantInfo {
                     method: "q8".to_string(),
                     bits: 8,
@@ -1103,7 +1103,7 @@ mod tests {
                 name: "blk.0.ffn_down.weight".to_string(),
                 shape: vec![1, ROW],
                 original_dtype: DType::F16,
-                data: preserved_f16,
+                data: preserved_f16.into(),
                 quant_info: crate::ir::TensorQuantInfo {
                     method: "passthrough".to_string(),
                     bits: 16,
@@ -1252,9 +1252,9 @@ mod tests {
                 t.shape.clone(),
                 t.dtype,
             );
-            lazy_map.insert(crate::ir::lazy::LazyTensor::from_bytes(
+            lazy_map.insert(crate::ir::lazy::LazyTensor::from_arc_bytes(
                 meta,
-                t.data.clone(),
+                std::sync::Arc::clone(&t.data),
             ));
         }
         let lazy = measure_quality_streaming_lazy(&lazy_map, &model, &metadata, &tmp, &progress)
@@ -1363,7 +1363,7 @@ mod tests {
                 name: name.to_string(),
                 shape: vec![1, QK_K],
                 dtype: DType::F16,
-                data: make_payload(i as f32),
+                data: make_payload(i as f32).into(),
             });
         }
 
@@ -1551,7 +1551,7 @@ mod tests {
                 name: "blk.0.attn_q.weight".to_string(),
                 shape: vec![1, ROW_LEN],
                 dtype: DType::F16,
-                data: payload.clone(),
+                data: payload.clone().into(),
             });
 
             let report = measure_quality_streaming(

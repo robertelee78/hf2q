@@ -609,7 +609,7 @@ fn transform_case1_in_proj_qkv(
     // v_bytes unused after the reorder; suppress the warning.
     let _ = v_bytes;
 
-    tensor.data = new_data;
+    tensor.data = std::sync::Arc::new(new_data);
     Ok(tensor)
 }
 
@@ -632,7 +632,7 @@ fn transform_case2_in_proj_z(
     let head_dim_total = head_v_dim * cols; // elements per "head" in the reorder
 
     let reordered = reorder_v_heads(&tensor.data, elem_size, nk, nv_per_k, head_dim_total)?;
-    tensor.data = reordered;
+    tensor.data = std::sync::Arc::new(reordered);
     Ok(tensor)
 }
 
@@ -653,7 +653,7 @@ fn transform_case3_in_proj_ab(
     let cols = if tensor.shape.len() >= 2 { tensor.shape[1] as u32 } else { 1 };
     // head_dim = 1 row = cols scalars
     let reordered = reorder_v_heads(&tensor.data, elem_size, nk, nv_per_k, cols)?;
-    tensor.data = reordered;
+    tensor.data = std::sync::Arc::new(reordered);
     Ok(tensor)
 }
 
@@ -705,7 +705,7 @@ fn transform_case6_out_proj(
         });
     }
 
-    tensor.data = new_data;
+    tensor.data = std::sync::Arc::new(new_data);
     Ok(tensor)
 }
 
@@ -813,7 +813,7 @@ fn transform_case4_linear_attn_scalar(
         }
 
         // Store as F32; downstream V-head reorder will use the new elem_size.
-        tensor.data = new_bytes;
+        tensor.data = std::sync::Arc::new(new_bytes);
         tensor.dtype = DType::F32;
         elem_size = 4;
     }
@@ -860,7 +860,7 @@ fn transform_case4_linear_attn_scalar(
         });
     }
 
-    tensor.data = reordered_data;
+    tensor.data = std::sync::Arc::new(reordered_data);
     Ok(tensor)
 }
 
@@ -945,7 +945,7 @@ fn transform_case5_conv1d(
         });
     }
 
-    tensor.data = new_data;
+    tensor.data = std::sync::Arc::new(new_data);
     Ok(tensor)
 }
 
@@ -1147,14 +1147,14 @@ pub fn transform_in_proj_qkvz(
         name: qkv_name,
         shape: vec![qkv_rows, hidden_size],
         dtype: tensor.dtype,
-        data: qkv_data,
+        data: qkv_data.into(),
     };
 
     let z_tensor = TensorRef {
         name: z_name,
         shape: vec![z_rows, hidden_size],
         dtype: tensor.dtype,
-        data: z_data,
+        data: z_data.into(),
     };
 
     Ok((qkv_tensor, z_tensor))
@@ -1370,7 +1370,7 @@ pub fn apply_qwen35_linear_attn_transforms_in_lazy_map(
 
         for tref in [qkv_reordered, z_reordered] {
             let meta = LazyMeta::new(tref.name.clone(), tref.shape.clone(), tref.dtype);
-            lazy_map.insert(LazyTensor::from_bytes(meta, tref.data));
+            lazy_map.insert(LazyTensor::from_arc_bytes(meta, tref.data));
         }
     }
 
@@ -1400,7 +1400,7 @@ pub fn apply_qwen35_linear_attn_transforms_in_lazy_map(
             transformed.shape.clone(),
             transformed.dtype,
         );
-        lazy_map.insert(LazyTensor::from_bytes(meta, transformed.data));
+        lazy_map.insert(LazyTensor::from_arc_bytes(meta, transformed.data));
     }
 
     Ok(())
@@ -1565,39 +1565,45 @@ pub fn apply_rms_norm_plus_one(
         return Ok(tensor);
     }
 
-    match tensor.dtype {
+    // ADR-020 P13 step 4: Arc::make_mut clones the inner Vec only if
+    // refcount > 1; otherwise returns the existing &mut Vec<u8> in place.
+    // For a freshly-loaded tensor at this site (single Arc owner), this
+    // is zero-copy.
+    let dtype = tensor.dtype;
+    let data = std::sync::Arc::make_mut(&mut tensor.data);
+    match dtype {
         DType::F32 => {
-            let n = tensor.data.len() / 4;
+            let n = data.len() / 4;
             for i in 0..n {
                 let off = i * 4;
                 let val = f32::from_le_bytes([
-                    tensor.data[off],
-                    tensor.data[off + 1],
-                    tensor.data[off + 2],
-                    tensor.data[off + 3],
+                    data[off],
+                    data[off + 1],
+                    data[off + 2],
+                    data[off + 3],
                 ]);
                 let result = (val + 1.0_f32).to_le_bytes();
-                tensor.data[off..off + 4].copy_from_slice(&result);
+                data[off..off + 4].copy_from_slice(&result);
             }
         }
         DType::BF16 => {
-            let n = tensor.data.len() / 2;
+            let n = data.len() / 2;
             for i in 0..n {
                 let off = i * 2;
-                let bits = u16::from_le_bytes([tensor.data[off], tensor.data[off + 1]]);
+                let bits = u16::from_le_bytes([data[off], data[off + 1]]);
                 let val = half::bf16::from_bits(bits).to_f32();
                 let result = half::bf16::from_f32(val + 1.0_f32).to_bits().to_le_bytes();
-                tensor.data[off..off + 2].copy_from_slice(&result);
+                data[off..off + 2].copy_from_slice(&result);
             }
         }
         DType::F16 => {
-            let n = tensor.data.len() / 2;
+            let n = data.len() / 2;
             for i in 0..n {
                 let off = i * 2;
-                let bits = u16::from_le_bytes([tensor.data[off], tensor.data[off + 1]]);
+                let bits = u16::from_le_bytes([data[off], data[off + 1]]);
                 let val = half::f16::from_bits(bits).to_f32();
                 let result = half::f16::from_f32(val + 1.0_f32).to_bits().to_le_bytes();
-                tensor.data[off..off + 2].copy_from_slice(&result);
+                data[off..off + 2].copy_from_slice(&result);
             }
         }
         other => {
@@ -1933,7 +1939,7 @@ mod tests {
                 name: name.to_string(),
                 shape: shape.clone(),
                 dtype: *dtype,
-                data: data.clone(),
+                data: data.clone().into(),
             });
             lazy.insert(LazyTensor::from_bytes(
                 LazyMeta::new(name.to_string(), shape.clone(), *dtype),
@@ -1961,8 +1967,7 @@ mod tests {
         let excluded_after = lazy_eager
             .get("model.layers.0.linear_attn.norm.weight")
             .unwrap();
-        assert_eq!(
-            &excluded_after.data, original_excluded,
+        assert_eq!(&**&excluded_after.data, original_excluded,
             "linear_attn.norm.weight must NOT have +1 applied"
         );
     }
@@ -2033,7 +2038,7 @@ mod tests {
                 name: name.to_string(),
                 shape: vec![4],
                 dtype: DType::F16,
-                data: data.clone(),
+                data: data.clone().into(),
             });
         }
         let eager_renamed = rename_mtp_tensors_to_layer_form(&mut eager, &metadata).unwrap();
@@ -2174,7 +2179,7 @@ mod tests {
         for i in 0u32..(n as u32) {
             data.extend_from_slice(&i.to_le_bytes());
         }
-        TensorRef { name: name.to_string(), shape, dtype: DType::F32, data }
+        TensorRef { name: name.to_string(), shape, dtype: DType::F32, data: std::sync::Arc::new(data) }
     }
 
     /// Read element `i` of a flat u32 buffer.
@@ -2281,8 +2286,7 @@ mod tests {
 
         for (pos, &expected) in EXPECTED_PERM.iter().enumerate() {
             let got = read_u32(&result, pos);
-            assert_eq!(
-                got, expected,
+            assert_eq!(                got, expected,
                 "spec-driven: dst[{}] = {} but expected {} \
                  (ggml tiled: outer=v, inner=k; HF grouped: outer=k, inner=v)",
                 pos, got, expected
@@ -2503,8 +2507,7 @@ mod tests {
         let k_start = q_elems;
         let k_elems = k_rows * cols as usize;
         for i in 0..k_elems {
-            assert_eq!(
-                read_u32(&result.data, k_start + i),
+            assert_eq!(                read_u32(&result.data, k_start + i),
                 (k_start + i) as u32,
                 "K elem {i} changed"
             );
@@ -2515,8 +2518,7 @@ mod tests {
         assert_eq!(result.data.len(), tensor.data.len(), "case1: length changed");
         let v_start_elem = (q_rows + k_rows) * cols as usize;
         // Element at v_start should be from k=0,v=0,d=0 (same as original)
-        assert_eq!(
-            read_u32(&result.data, v_start_elem),
+        assert_eq!(            read_u32(&result.data, v_start_elem),
             v_start_elem as u32,
             "V first element should be same (k=0,v=0 maps to dst v=0,k=0)"
         );
@@ -2626,7 +2628,7 @@ mod tests {
             name: "model.layers.0.linear_attn.A_log".to_string(),
             shape: vec![4],
             dtype: DType::F32,
-            data,
+            data: std::sync::Arc::new(data),
         };
 
         let result = transform_linear_attn_tensor(tensor, &ctx).unwrap();
@@ -2692,7 +2694,7 @@ mod tests {
             name: "model.layers.0.linear_attn.A_log".to_string(),
             shape: vec![4],
             dtype: DType::F32,
-            data,
+            data: std::sync::Arc::new(data),
         };
 
         let ctx2 = Qwen35ConvertContext {
@@ -2749,7 +2751,7 @@ mod tests {
             name: "model.layers.0.linear_attn.dt_bias".to_string(),
             shape: vec![4],
             dtype: DType::F32,
-            data,
+            data: std::sync::Arc::new(data),
         };
 
         let result = transform_linear_attn_tensor(tensor, &ctx).unwrap();
@@ -2829,7 +2831,7 @@ mod tests {
             name: "model.layers.0.linear_attn.conv1d.weight".to_string(),
             shape: vec![total_k, 1, d],
             dtype: DType::F32,
-            data,
+            data: std::sync::Arc::new(data),
         };
 
         let result = transform_linear_attn_tensor(tensor, &ctx).unwrap();
@@ -2860,8 +2862,7 @@ mod tests {
                 let dst_elem = dst_row * d + col;
                 let expected = src_elem as u32;
                 let got = read_u32(&result.data, dst_elem);
-                assert_eq!(
-                    got, expected,
+                assert_eq!(                    got, expected,
                     "V conv1d: dst_row={dst_row} col={col}: expected elem from src_row={src_row} ({expected}), got {got}"
                 );
             }
@@ -2877,7 +2878,7 @@ mod tests {
             name: "model.layers.0.linear_attn.conv1d.weight".to_string(),
             shape: vec![64, 4],
             dtype: DType::F32,
-            data: vec![0u8; 64 * 4 * 4],
+            data: std::sync::Arc::new(vec![0u8; 64 * 4 * 4]),
         };
         let err = transform_linear_attn_tensor(tensor, &ctx)
             .expect_err("conv1d with wrong shape should return error");
@@ -2949,7 +2950,7 @@ mod tests {
             name: "model.layers.0.linear_attn.in_proj_qkvz.weight".to_string(),
             shape: vec![total_rows, hidden_size],
             dtype: DType::F32,
-            data,
+            data: std::sync::Arc::new(data),
         };
 
         let (qkv, z) = transform_in_proj_qkvz(tensor.clone(), &ctx).unwrap();
@@ -3022,7 +3023,7 @@ mod tests {
             name: "model.layers.0.input_layernorm.weight".to_string(),
             shape: vec![inputs.len()],
             dtype: DType::F32,
-            data,
+            data: std::sync::Arc::new(data),
         };
 
         let result = apply_rms_norm_plus_one(tensor).unwrap();
@@ -3059,11 +3060,11 @@ mod tests {
             name: "model.layers.0.linear_attn.norm.weight".to_string(),
             shape: vec![inputs.len()],
             dtype: DType::F32,
-            data,
+            data: std::sync::Arc::new(data),
         };
 
         let result = apply_rms_norm_plus_one(tensor).unwrap();
-        assert_eq!(result.data, original, "linear_attn.norm.weight should NOT be +1'd");
+        assert_eq!(*result.data, original, "linear_attn.norm.weight should NOT be +1'd");
     }
 
     /// RMS norm +1: BF16 tensor — roundtrip through BF16 preserves +1 to within BF16 precision.
@@ -3079,7 +3080,7 @@ mod tests {
             name: "model.layers.0.post_attention_layernorm.weight".to_string(),
             shape: vec![inputs.len()],
             dtype: DType::BF16,
-            data,
+            data: std::sync::Arc::new(data),
         };
 
         let result = apply_rms_norm_plus_one(tensor).unwrap();
@@ -3163,7 +3164,7 @@ mod tests {
         };
 
         let result = transform_linear_attn_tensor(tensor, &ctx).unwrap();
-        assert_eq!(result.data, original_data, "should be identity when nv_per_k=1");
+        assert_eq!(*result.data, *original_data, "should be identity when nv_per_k=1");
     }
 
     // =========================================================================
@@ -3318,13 +3319,13 @@ mod tests {
             name: "blk.0.linear_attn.A_log".into(),
             shape: vec![4],
             dtype: DType::F32,
-            data: vec![0xAAu8; 16],
+            data: std::sync::Arc::new(vec![0xAAu8; 16]),
         });
         let meta = walker_metadata_qwen35moe(4, 4); // nk == nv
 
         apply_qwen35_linear_attn_transforms_in_tensor_map(&mut tm, &meta).unwrap();
         let t = tm.tensors.get("blk.0.linear_attn.A_log").unwrap();
-        assert_eq!(t.data, vec![0xAAu8; 16], "nv == nk must short-circuit unchanged");
+        assert_eq!(*t.data, vec![0xAAu8; 16], "nv == nk must short-circuit unchanged");
     }
 
     #[test]
@@ -3335,7 +3336,7 @@ mod tests {
             name: "blk.0.linear_attn.A_log".into(),
             shape: vec![4],
             dtype: DType::F32,
-            data: vec![0xCCu8; 16],
+            data: std::sync::Arc::new(vec![0xCCu8; 16]),
         });
         let mut meta = walker_metadata_qwen35moe(2, 4);
         meta.architecture = "Gemma4ForCausalLM".to_string();
@@ -3343,7 +3344,7 @@ mod tests {
 
         apply_qwen35_linear_attn_transforms_in_tensor_map(&mut tm, &meta).unwrap();
         let t = tm.tensors.get("blk.0.linear_attn.A_log").unwrap();
-        assert_eq!(t.data, vec![0xCCu8; 16], "non-Qwen3.5 arches must be no-op");
+        assert_eq!(*t.data, vec![0xCCu8; 16], "non-Qwen3.5 arches must be no-op");
     }
 
     #[test]
@@ -3354,14 +3355,14 @@ mod tests {
             name: "blk.0.attn_q.weight".into(),
             shape: vec![64, 64],
             dtype: DType::F16,
-            data: vec![0xBBu8; 64 * 64 * 2],
+            data: std::sync::Arc::new(vec![0xBBu8; 64 * 64 * 2]),
         });
         let meta = walker_metadata_qwen35moe(2, 4);
 
         apply_qwen35_linear_attn_transforms_in_tensor_map(&mut tm, &meta).unwrap();
         let t = tm.tensors.get("blk.0.attn_q.weight").unwrap();
         assert_eq!(
-            t.data,
+            *t.data,
             vec![0xBBu8; 64 * 64 * 2],
             "non-linear_attn tensor must pass through unchanged"
         );
@@ -3389,7 +3390,7 @@ mod tests {
             name: "blk.0.linear_attn.A_log".into(),
             shape: vec![4],
             dtype: DType::F32,
-            data: data.clone(),
+            data: data.clone().into(),
         });
         let meta = walker_metadata_qwen35moe(2, 4); // nk=2, nv=4
 

@@ -428,7 +428,7 @@ mod tests {
             name: name.to_string(),
             shape,
             dtype: DType::F16,
-            data,
+            data: std::sync::Arc::new(data),
         }
     }
 
@@ -460,7 +460,7 @@ mod tests {
             name: "model.layers.0.input_layernorm.weight".to_string(),
             shape: vec![4],
             dtype: DType::F16,
-            data: vec![0u8; 8],
+            data: std::sync::Arc::new(vec![0u8; 8]),
         });
 
         // Embedding (special rule: always gets max type, preserved by is_weight() name match).

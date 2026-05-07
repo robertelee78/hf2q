@@ -166,17 +166,17 @@ impl Quantizer for VariantKQuantizer {
         if must_preserve {
             let (data, dtype) = if tensor.dtype == DType::BF16 {
                 match tensor.to_f16() {
-                    Ok(converted) => (converted.data, DType::F16),
-                    Err(_) => (tensor.data.clone(), tensor.dtype),
+                    Ok(converted) => (std::sync::Arc::unwrap_or_clone(converted.data), DType::F16),
+                    Err(_) => ((*tensor.data).clone(), tensor.dtype),
                 }
             } else {
-                (tensor.data.clone(), tensor.dtype)
+                ((*tensor.data).clone(), tensor.dtype)
             };
             return Ok(QuantizedTensor {
                 name: tensor.name.clone(),
                 shape: tensor.shape.clone(),
                 original_dtype: tensor.dtype,
-                data,
+                data: std::sync::Arc::new(data),
                 quant_info: TensorQuantInfo {
                     method: "passthrough".to_string(),
                     bits: dtype.element_size() as u8 * 8,
@@ -246,7 +246,7 @@ impl Quantizer for VariantKQuantizer {
             name: tensor.name.clone(),
             shape: tensor.shape.clone(),
             original_dtype: tensor.dtype,
-            data: bytes,
+            data: bytes.into(),
             quant_info: TensorQuantInfo {
                 method: METHOD_K_QUANT_CODEC_DIRECT.to_string(),
                 bits: 0,
@@ -271,7 +271,7 @@ mod tests {
             name: name.to_string(),
             shape,
             dtype: DType::F32,
-            data,
+            data: std::sync::Arc::new(data),
         }
     }
 

@@ -232,7 +232,7 @@ pub fn truncate_padded_vocab(
         // P13 migration).  `tensor.data[..new_byte_len].to_vec()` allocates
         // a new Vec sized exactly for the de-padded slice.
         let truncated_data: Vec<u8> = tensor.data[..new_byte_len].to_vec();
-        tensor.data = truncated_data;
+        tensor.data = std::sync::Arc::new(truncated_data);
         tensor.shape[0] = new_rows;
         truncated += 1;
         tracing::info!(
@@ -304,7 +304,7 @@ mod tests {
             name: name.to_string(),
             shape: vec![padded_rows, hidden],
             dtype: DType::F16,
-            data,
+            data: data.into(),
         }
     }
 

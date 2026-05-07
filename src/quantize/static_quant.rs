@@ -83,18 +83,18 @@ fn preserve_tensor(tensor: &TensorRef) -> QuantizedTensor {
     // If bf16, convert to f16 first
     let (data, dtype) = if tensor.dtype == DType::BF16 {
         match tensor.to_f16() {
-            Ok(converted) => (converted.data, DType::F16),
-            Err(_) => (tensor.data.clone(), tensor.dtype),
+            Ok(converted) => (std::sync::Arc::unwrap_or_clone(converted.data), DType::F16),
+            Err(_) => ((*tensor.data).clone(), tensor.dtype),
         }
     } else {
-        (tensor.data.clone(), tensor.dtype)
+        ((*tensor.data).clone(), tensor.dtype)
     };
 
     QuantizedTensor {
         name: tensor.name.clone(),
         shape: tensor.shape.clone(),
         original_dtype: tensor.dtype,
-        data,
+        data: std::sync::Arc::new(data),
         quant_info: TensorQuantInfo {
             method: "passthrough".to_string(),
             bits: dtype.element_size() as u8 * 8,
@@ -124,7 +124,7 @@ fn convert_to_f16(tensor: &TensorRef) -> Result<QuantizedTensor, QuantizeError> 
                 name: tensor.name.clone(),
                 shape: tensor.shape.clone(),
                 dtype: DType::F16,
-                data: f16_data,
+                data: f16_data.into(),
             }
         }
         _ => {
@@ -139,7 +139,7 @@ fn convert_to_f16(tensor: &TensorRef) -> Result<QuantizedTensor, QuantizeError> 
         name: converted.name.clone(),
         shape: converted.shape.clone(),
         original_dtype: tensor.dtype,
-        data: converted.data,
+        data: std::sync::Arc::clone(&converted.data),
         quant_info: TensorQuantInfo {
             method: "f16".to_string(),
             bits: 16,
@@ -228,7 +228,7 @@ fn quantize_weight(
         name: tensor.name.clone(),
         shape: tensor.shape.clone(),
         original_dtype: tensor.dtype,
-        data: packed_data,
+        data: packed_data.into(),
         quant_info: TensorQuantInfo {
             method: format!("q{}", bits),
             bits,
@@ -338,7 +338,7 @@ mod tests {
             name: name.to_string(),
             shape,
             dtype: DType::F16,
-            data,
+            data: std::sync::Arc::new(data),
         }
     }
 
@@ -348,7 +348,7 @@ mod tests {
             name: "model.layers.0.input_layernorm.weight".to_string(),
             shape: vec![4],
             dtype: DType::F16,
-            data: vec![0u8; 8],
+            data: std::sync::Arc::new(vec![0u8; 8]),
         };
 
         let result = preserve_tensor(&norm);
@@ -415,7 +415,7 @@ mod tests {
             name: "model.layers.0.input_layernorm.weight".to_string(),
             shape: vec![4],
             dtype: DType::F16,
-            data: vec![0u8; 8],
+            data: std::sync::Arc::new(vec![0u8; 8]),
         };
 
         let quantizer = StaticQuantizer::new("q4").unwrap();
@@ -451,7 +451,7 @@ mod tests {
             name: "weight".to_string(),
             shape: vec![2, 2],
             dtype: DType::BF16,
-            data,
+            data: std::sync::Arc::new(data),
         };
 
         let result = quantize_weight(&tensor, 4, 4).unwrap();

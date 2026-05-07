@@ -774,7 +774,7 @@ mod tests {
             name: "model.layers.0.self_attn.q_proj.weight".to_string(),
             shape: vec![32, 32],
             dtype: DType::F16,
-            data: vec![0u8; 32 * 32 * 2],
+            data: std::sync::Arc::new(vec![0u8; 32 * 32 * 2]),
         };
 
         let config = LayerQuantConfig {

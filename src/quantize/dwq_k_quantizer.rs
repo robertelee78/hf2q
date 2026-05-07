@@ -392,7 +392,7 @@ mod tests {
             name: name.to_string(),
             shape: vec![QK_K],
             dtype: DType::F32,
-            data,
+            data: std::sync::Arc::new(data),
         }
     }
 
@@ -703,7 +703,7 @@ mod tests {
             name: "model.layers.0.input_layernorm.weight".to_string(),
             shape: vec![16],
             dtype: DType::F32,
-            data: vec![0u8; 16 * 4],
+            data: std::sync::Arc::new(vec![0u8; 16 * 4]),
         };
         let cfg = LayerQuantConfig {
             bits: 0,
@@ -774,7 +774,7 @@ mod tests {
             name: "model.layers.0.self_attn.q_proj.weight".to_string(),
             shape: vec![n_rows, QK_K],
             dtype: DType::F32,
-            data,
+            data: std::sync::Arc::new(data),
         };
 
         let q = DwqKQuantizer::new(DwqKVariant::P46, &[], CalibrationData::None);
@@ -797,7 +797,7 @@ mod tests {
             name: "model.visual.blocks.0.attn.proj.weight".to_string(),
             shape: vec![1152],
             dtype: DType::F32,
-            data,
+            data: std::sync::Arc::new(data),
         };
         let q = DwqKQuantizer::new(DwqKVariant::P46, &[], CalibrationData::None);
         let out = q.quantize_tensor(&tensor, &default_layer_config()).unwrap();
@@ -822,7 +822,7 @@ mod tests {
             name: "model.visual.blocks.0.attn.proj.weight".to_string(),
             shape: vec![1152],
             dtype: DType::F32,
-            data,
+            data: std::sync::Arc::new(data),
         };
         let q = DwqKQuantizer::new(DwqKVariant::P28, &[], CalibrationData::None);
         let out = q.quantize_tensor(&tensor, &default_layer_config()).unwrap();
@@ -854,7 +854,7 @@ mod tests {
             name: "model.layers.0.attn_weird.weight".to_string(),
             shape: vec![1153],
             dtype: DType::F32,
-            data,
+            data: std::sync::Arc::new(data),
         };
         let q = DwqKQuantizer::new(DwqKVariant::P46, &[], CalibrationData::None);
         let out = q.quantize_tensor(&tensor, &default_layer_config()).unwrap();

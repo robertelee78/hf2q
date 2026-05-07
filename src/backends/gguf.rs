@@ -1300,7 +1300,7 @@ fn repack_to_ggml_blocks(
             }
             return Ok(f32_data);
         }
-        return Ok(qt.data.clone());
+        return Ok((*qt.data).clone());
     }
 
     // ADR-014 P11-prereq Iter A (2026-04-27): codec-direct fast-path. Tensors
@@ -1343,7 +1343,7 @@ fn repack_to_ggml_blocks(
                 ),
             });
         }
-        return Ok(qt.data.clone());
+        return Ok((*qt.data).clone());
     }
 
     // Only repack if we have scales (quantized tensors)
@@ -1356,7 +1356,7 @@ fn repack_to_ggml_blocks(
                 "Tensor '{}' has no scales but is not preserved/f16; writing raw data",
                 qt.name
             );
-            return Ok(qt.data.clone());
+            return Ok((*qt.data).clone());
         }
     };
 
@@ -1372,7 +1372,7 @@ fn repack_to_ggml_blocks(
         GGML_TYPE_Q8_0 => repack_q8_0(qt, scales_bytes, total_elements),
         GGML_TYPE_F16 | GGML_TYPE_F32 => {
             // Should not reach here for F16/F32 (caught above), but handle gracefully
-            Ok(qt.data.clone())
+            Ok((*qt.data).clone())
         }
         _ => Err(BackendError::WriteFailed {
             reason: format!(
@@ -1418,7 +1418,7 @@ fn repack_q4_0(
     // hf2q packs consecutive pairs: byte = (pair[0] & 0x0F) | ((pair[1] & 0x0F) << 4)
     // Values are signed [-7, 7] stored as signed nibbles (two's complement in 4 bits).
     let mut signed_values: Vec<i8> = Vec::with_capacity(total_elements);
-    for &byte in &qt.data {
+    for &byte in qt.data.iter() {
         let lo = (byte & 0x0F) as i8;
         let hi = ((byte >> 4) & 0x0F) as i8;
         // Convert from unsigned 4-bit to signed: if >= 8, subtract 16
@@ -1542,7 +1542,7 @@ fn repack_q8_0(
 
     // Read int8 values from qt.data (8-bit: 1 byte per element, stored as u8 cast of i8)
     let mut signed_values: Vec<i8> = Vec::with_capacity(total_elements);
-    for &byte in &qt.data {
+    for &byte in qt.data.iter() {
         signed_values.push(byte as i8);
     }
     signed_values.truncate(total_elements);
@@ -1648,7 +1648,7 @@ fn repack_q6_k(
 
     // Read signed i8 values from qt.data (6-bit: 1 byte per element, stored as u8 cast of i8)
     let mut signed_values: Vec<i8> = Vec::with_capacity(total_elements);
-    for &byte in &qt.data {
+    for &byte in qt.data.iter() {
         signed_values.push(byte as i8);
     }
     signed_values.truncate(total_elements);
@@ -4098,7 +4098,7 @@ mod tests {
             name: name.into(),
             shape: vec![32, 32],
             original_dtype: DType::F16,
-            data: vec![0u8; 32 * 32 * 2],
+            data: std::sync::Arc::new(vec![0u8; 32 * 32 * 2]),
             quant_info: TensorQuantInfo {
                 method: if preserved {
                     "passthrough".into()
@@ -4702,7 +4702,7 @@ mod tests {
             name: "blk.0.attn_q.weight".into(),
             shape: vec![4, 256],
             original_dtype: DType::F16,
-            data: bytes.clone(),
+            data: bytes.clone().into(),
             quant_info: qi_codec_direct("Q4_K"),
         };
         let out = repack_to_ggml_blocks(&qt, GGML_TYPE_Q4_K).expect("repack must succeed");
@@ -4722,7 +4722,7 @@ mod tests {
             name: "blk.0.attn_v.weight".into(),
             shape: vec![2, 256],
             original_dtype: DType::F16,
-            data: bytes.clone(),
+            data: bytes.clone().into(),
             quant_info: qi_codec_direct("Q5_K"),
         };
         let out = repack_to_ggml_blocks(&qt, GGML_TYPE_Q5_K).expect("repack must succeed");
@@ -4736,7 +4736,7 @@ mod tests {
             name: "output.weight".into(),
             shape: vec![1, 256],
             original_dtype: DType::F16,
-            data: bytes.clone(),
+            data: bytes.clone().into(),
             quant_info: qi_codec_direct("Q6_K"),
         };
         let out = repack_to_ggml_blocks(&qt, GGML_TYPE_Q6_K).expect("repack must succeed");
@@ -4754,7 +4754,7 @@ mod tests {
             name: "blk.0.attn_q.weight".into(),
             shape: vec![1, 257],
             original_dtype: DType::F16,
-            data: bytes,
+            data: bytes.into(),
             quant_info: qi_codec_direct("Q4_K"),
         };
         let err = repack_to_ggml_blocks(&qt, GGML_TYPE_Q4_K).expect_err(
@@ -4777,7 +4777,7 @@ mod tests {
             name: "blk.0.weird.weight".into(),
             shape: vec![1, 256],
             original_dtype: DType::F16,
-            data: bytes,
+            data: bytes.into(),
             quant_info: qi_codec_direct("Q4_K"),
         };
         let err = repack_to_ggml_blocks(&qt, GGML_TYPE_F32)
@@ -4820,7 +4820,7 @@ mod tests {
             name: "test.weight".into(),
             shape: vec![8, 8],
             original_dtype: DType::F16,
-            data: packed_data,
+            data: packed_data.into(),
             quant_info: TensorQuantInfo {
                 method: "q4".into(),
                 bits: 4,
@@ -4906,7 +4906,7 @@ mod tests {
             name: "test.weight".into(),
             shape: vec![4, 8],
             original_dtype: DType::F16,
-            data: packed,
+            data: packed.into(),
             quant_info: TensorQuantInfo {
                 method: "q4".into(),
                 bits: 4,
@@ -4971,7 +4971,7 @@ mod tests {
             name: "test.weight".into(),
             shape: vec![8, 8],
             original_dtype: DType::F16,
-            data,
+            data: std::sync::Arc::new(data),
             quant_info: TensorQuantInfo {
                 method: "q8".into(),
                 bits: 8,
@@ -4997,7 +4997,7 @@ mod tests {
             name: "norm.weight".into(),
             shape: vec![4],
             original_dtype: DType::F16,
-            data: data.clone(),
+            data: data.clone().into(),
             quant_info: TensorQuantInfo {
                 method: "passthrough".into(),
                 bits: 16,

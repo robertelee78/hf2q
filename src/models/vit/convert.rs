@@ -194,7 +194,7 @@ pub fn hf_vit_name_to_gguf(hf_name: &str) -> Option<String> {
 /// HF shapes). P10's F16 mmproj emitter downcasts F32 → F16 at convert time.
 fn ensure_f16_bytes(tensor: &TensorRef) -> Result<Vec<u8>, VitConvertError> {
     match tensor.dtype {
-        DType::F16 => Ok(tensor.data.clone()),
+        DType::F16 => Ok((*tensor.data).clone()),
         DType::F32 => {
             let n = tensor.numel();
             let mut out = Vec::with_capacity(n * 2);
@@ -354,7 +354,7 @@ pub fn load_vision_tensors(
                     gguf_name: "v.patch_embd.weight".to_string(),
                     shape: slice0.0,
                     dtype: DType::F16,
-                    data: slice0.1,
+                    data: slice0.1.into(),
                 },
             );
             out.insert(
@@ -363,7 +363,7 @@ pub fn load_vision_tensors(
                     gguf_name: "v.patch_embd.weight.1".to_string(),
                     shape: slice1.0,
                     dtype: DType::F16,
-                    data: slice1.1,
+                    data: slice1.1.into(),
                 },
             );
             continue;
@@ -635,7 +635,7 @@ mod tests {
                 for x in &[1.0f32, 2.0, 3.0, 4.0] {
                     v.extend_from_slice(&x.to_le_bytes());
                 }
-                v
+                v.into()
             },
         };
         let f16_bytes = ensure_f16_bytes(&tensor).unwrap();
@@ -653,7 +653,7 @@ mod tests {
             name: "test".into(),
             shape: vec![2],
             dtype: DType::F16,
-            data: vec![0x00, 0x3c, 0x00, 0x40], // 1.0, 2.0 in F16
+            data: std::sync::Arc::new(vec![0x00, 0x3c, 0x00, 0x40]), // 1.0, 2.0 in F16
         };
         let out = ensure_f16_bytes(&tensor).unwrap();
         assert_eq!(out, vec![0x00, 0x3c, 0x00, 0x40]);
@@ -822,7 +822,7 @@ mod tests {
             shape: vec![1],
             dtype: DType::BF16,
             // BF16 1.0 = 0x3F80 (big-endian) stored little-endian → [0x80, 0x3f].
-            data: vec![0x80, 0x3f],
+            data: std::sync::Arc::new(vec![0x80, 0x3f]),
         };
         let out = ensure_f16_bytes(&tensor).unwrap();
         // F16 1.0 = 0x3c00, little-endian = [0x00, 0x3c].

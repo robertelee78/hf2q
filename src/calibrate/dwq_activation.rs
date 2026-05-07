@@ -284,7 +284,7 @@ mod tests {
                 name,
                 shape: vec![h, h],
                 dtype: DType::F16,
-                data: vec![0u8; h * h * 2],
+                data: std::sync::Arc::new(vec![0u8; h * h * 2]),
             });
             // One norm (preserved).
             let norm_name = format!("model.layers.{}.input_layernorm.weight", layer);
@@ -292,7 +292,7 @@ mod tests {
                 name: norm_name,
                 shape: vec![h],
                 dtype: DType::F16,
-                data: vec![0u8; h * 2],
+                data: std::sync::Arc::new(vec![0u8; h * 2]),
             });
         }
         // Embeddings + output (always preserved).
@@ -300,7 +300,7 @@ mod tests {
             name: "model.embed_tokens.weight".into(),
             shape: vec![256, h],
             dtype: DType::F16,
-            data: vec![0u8; 256 * h * 2],
+            data: std::sync::Arc::new(vec![0u8; 256 * h * 2]),
         });
         tm
     }

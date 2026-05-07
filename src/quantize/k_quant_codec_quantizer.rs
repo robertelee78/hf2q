@@ -145,7 +145,7 @@ pub fn f16_passthrough(
     name: &str,
 ) -> Result<QuantizedTensor, QuantizeError> {
     let f16_data: Vec<u8> = match tensor.dtype {
-        DType::F16 => tensor.data.clone(),
+        DType::F16 => (*tensor.data).clone(),
         DType::BF16 => {
             // Re-use the canonical BF16→F16 helper. Map IrError into a
             // typed quantize error so callers see a uniform error surface.
@@ -155,7 +155,7 @@ pub fn f16_passthrough(
                     reason: format!("f16-passthrough: BF16→F16 cast failed: {e}"),
                 }
             })?;
-            converted.data
+            std::sync::Arc::unwrap_or_clone(converted.data)
         }
         DType::F32 => {
             let mut out = Vec::with_capacity(tensor.data.len() / 2);
@@ -180,7 +180,7 @@ pub fn f16_passthrough(
         name: name.to_string(),
         shape: tensor.shape.clone(),
         original_dtype: tensor.dtype,
-        data: f16_data,
+        data: f16_data.into(),
         quant_info: TensorQuantInfo {
             method: "f16".to_string(),
             bits: 16,
@@ -247,17 +247,17 @@ impl Quantizer for KQuantCodecQuantizer {
             // method "passthrough" so GGUF backend handles via F16 path.
             let (data, dtype) = if tensor.dtype == DType::BF16 {
                 match tensor.to_f16() {
-                    Ok(converted) => (converted.data, DType::F16),
-                    Err(_) => (tensor.data.clone(), tensor.dtype),
+                    Ok(converted) => (std::sync::Arc::unwrap_or_clone(converted.data), DType::F16),
+                    Err(_) => ((*tensor.data).clone(), tensor.dtype),
                 }
             } else {
-                (tensor.data.clone(), tensor.dtype)
+                ((*tensor.data).clone(), tensor.dtype)
             };
             return Ok(QuantizedTensor {
                 name: tensor.name.clone(),
                 shape: tensor.shape.clone(),
                 original_dtype: tensor.dtype,
-                data,
+                data: std::sync::Arc::new(data),
                 quant_info: TensorQuantInfo {
                     method: "passthrough".to_string(),
                     bits: dtype.element_size() as u8 * 8,
@@ -356,7 +356,7 @@ impl Quantizer for KQuantCodecQuantizer {
             name: tensor.name.clone(),
             shape: tensor.shape.clone(),
             original_dtype: tensor.dtype,
-            data: bytes,
+            data: bytes.into(),
             quant_info: TensorQuantInfo {
                 method: METHOD_K_QUANT_CODEC_DIRECT.to_string(),
                 // bits=0 + group_size=0 sentinel: see module doc.
@@ -383,7 +383,7 @@ mod tests {
             name: name.to_string(),
             shape,
             dtype: DType::F32,
-            data,
+            data: std::sync::Arc::new(data),
         }
     }
 
@@ -396,7 +396,7 @@ mod tests {
             name: name.to_string(),
             shape,
             dtype: DType::BF16,
-            data,
+            data: std::sync::Arc::new(data),
         }
     }
 

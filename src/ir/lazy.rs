@@ -299,7 +299,7 @@ impl LazyTensor {
             name: meta.name,
             shape: meta.shape,
             dtype: meta.dtype,
-            data: bytes,
+            data: std::sync::Arc::new(bytes),
         })
     }
 
@@ -340,7 +340,7 @@ impl LazyTensor {
             name: self.meta.name.clone(),
             shape: self.meta.shape.clone(),
             dtype: self.meta.dtype,
-            data: bytes,
+            data: bytes.into(),
         })
     }
 
@@ -366,7 +366,7 @@ impl LazyTensor {
         LazyTensor::from_closure(new_meta, move || {
             let materialized = parent.materialize()?;
             let transformed = f(materialized)?;
-            Ok(transformed.data)
+            Ok(std::sync::Arc::unwrap_or_clone(transformed.data))
         })
     }
 
@@ -390,7 +390,7 @@ impl LazyTensor {
         LazyTensor::from_closure(new_meta, move || {
             let materialized = parent.materialize()?;
             let transformed = f(materialized)?;
-            Ok(transformed.data)
+            Ok(std::sync::Arc::unwrap_or_clone(transformed.data))
         })
     }
 }
@@ -556,7 +556,7 @@ impl LazyTensorMap {
         let mut out = Self::new();
         for (_, tref) in tensor_map.tensors.into_iter() {
             let meta = LazyMeta::new(tref.name.clone(), tref.shape.clone(), tref.dtype);
-            out.insert(LazyTensor::from_bytes(meta, tref.data));
+            out.insert(LazyTensor::from_arc_bytes(meta, tref.data));
         }
         out
     }
@@ -645,6 +645,74 @@ mod tests {
         assert_eq!(m.byte_len, 2 * 3 * 4);
     }
 
+    /// ADR-020 P13 step 4 falsifier — proves `Arc::clone(&tensor.data)`
+    /// + `LazyTensor::from_arc_bytes` is a pointer-bump share, not a
+    /// byte clone. Pre-refactor `clone_tensor_map_to_lazy` deep-cloned
+    /// each tensor's `Vec<u8>` via `tensor.data.clone()` — the 52 GB
+    /// clone for Qwen3.6-27B that dominated the 199 GB DWQ OOM peak.
+    ///
+    /// The assertion: `Arc::strong_count(&tensor.data) == 2` after the
+    /// share. One ref in `tensor.data`, one in the LazyTensor's
+    /// `MaterializedShared(arc)` state. Same byte allocation.
+    #[test]
+    fn arc_clone_lazy_view_shares_bytes_with_source_no_byte_copy() {
+        // Build a TensorRef with non-trivial bytes so a deep clone would
+        // be observable (different allocation address).
+        let bytes = f32_bytes(&[1.0, 2.0, 3.0, 4.0]); // 16 bytes
+        let source_data_arc: Arc<Vec<u8>> = Arc::new(bytes);
+        let source_addr = Arc::as_ptr(&source_data_arc);
+        let tensor = TensorRef {
+            name: "shared".to_string(),
+            shape: vec![4],
+            dtype: DType::F32,
+            data: Arc::clone(&source_data_arc),
+        };
+        // refcount: source_data_arc + tensor.data
+        assert_eq!(
+            Arc::strong_count(&source_data_arc),
+            2,
+            "before LazyTensor share: source + tensor"
+        );
+
+        // Mirror what `clone_tensor_map_to_lazy` does at main.rs:482-500.
+        let lazy = LazyTensor::from_arc_bytes(
+            LazyMeta::new(
+                tensor.name.clone(),
+                tensor.shape.clone(),
+                tensor.dtype,
+            ),
+            Arc::clone(&tensor.data),
+        );
+
+        // refcount: source_data_arc + tensor.data + lazy's MaterializedShared
+        assert_eq!(
+            Arc::strong_count(&source_data_arc),
+            3,
+            "after LazyTensor::from_arc_bytes: source + tensor + lazy_view all share \
+             the SAME Arc — no byte copy. Pre-refactor this would have been a deep \
+             clone of the Vec<u8>."
+        );
+
+        // Verify the actual allocation hasn't moved (proves no byte copy).
+        let after_addr = Arc::as_ptr(&source_data_arc);
+        assert_eq!(
+            source_addr, after_addr,
+            "Vec<u8> allocation address must not change — Arc share is pointer-bump only"
+        );
+
+        // Drop lazy_view → refcount goes back to 2. This is the post-
+        // calibrate ordering at main.rs:1525 (lazy_view drops at end of
+        // match arm) → main.rs:1549 (calibrator drops) → Phase 3 reads
+        // tensor.data with refcount=1 (sole owner; could try_unwrap
+        // for zero-copy if needed).
+        drop(lazy);
+        assert_eq!(
+            Arc::strong_count(&source_data_arc),
+            2,
+            "after lazy_view drops: refcount returns to source + tensor"
+        );
+    }
+
     #[test]
     fn test_materialize_pending_runs_closure_once() {
         let counter = Arc::new(AtomicUsize::new(0));
@@ -666,7 +734,7 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(tref.shape, vec![3]);
         assert_eq!(tref.dtype, DType::F32);
-        assert_eq!(tref.data, f32_bytes(&[1.0, 2.0, 3.0]));
+        assert_eq!(*tref.data, f32_bytes(&[1.0, 2.0, 3.0]));
     }
 
     /// Compile-time proof of FnOnce semantics: a `LazyTensor` is moved
@@ -726,30 +794,30 @@ mod tests {
         let lazy = LazyTensor::from_closure(m, move || Ok(f32_bytes(&input_eager)));
 
         let lazy = lazy.map(|t| {
-            let mut data = t.data;
+            let mut data = std::sync::Arc::unwrap_or_clone(t.data);
             for chunk in data.chunks_exact_mut(4) {
                 let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) * 2.0;
                 chunk.copy_from_slice(&v.to_le_bytes());
             }
-            Ok(TensorRef { data, ..t })
+            Ok(TensorRef { data: std::sync::Arc::new(data), ..t })
         });
 
         let lazy = lazy.map(|t| {
-            let mut data = t.data;
+            let mut data = std::sync::Arc::unwrap_or_clone(t.data);
             for chunk in data.chunks_exact_mut(4) {
                 let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) + 1.0;
                 chunk.copy_from_slice(&v.to_le_bytes());
             }
-            Ok(TensorRef { data, ..t })
+            Ok(TensorRef { data: std::sync::Arc::new(data), ..t })
         });
 
         let lazy = lazy.map(|t| {
-            let mut data = t.data;
+            let mut data = std::sync::Arc::unwrap_or_clone(t.data);
             for chunk in data.chunks_exact_mut(4) {
                 let v = -f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 chunk.copy_from_slice(&v.to_le_bytes());
             }
-            Ok(TensorRef { data, ..t })
+            Ok(TensorRef { data: std::sync::Arc::new(data), ..t })
         });
 
         let realised = lazy.materialize().unwrap();
@@ -821,7 +889,7 @@ mod tests {
                 name: t.name,
                 shape: vec![6],
                 dtype: DType::F16,
-                data,
+                data: std::sync::Arc::new(data),
             })
         });
 
@@ -957,19 +1025,19 @@ mod tests {
             name: "bf16_a".to_string(),
             shape: vec![4],
             dtype: DType::BF16,
-            data: bf16_bytes(&f32_a),
+            data: bf16_bytes(&f32_a).into(),
         });
         eager.insert(TensorRef {
             name: "bf16_b".to_string(),
             shape: vec![3],
             dtype: DType::BF16,
-            data: bf16_bytes(&f32_b),
+            data: bf16_bytes(&f32_b).into(),
         });
         eager.insert(TensorRef {
             name: "f16_c".to_string(),
             shape: vec![3],
             dtype: DType::F16,
-            data: f16_bytes(&f32_b),
+            data: f16_bytes(&f32_b).into(),
         });
 
         let lazy_count = lazy.convert_bf16_to_f16().expect("lazy convert");
@@ -1023,7 +1091,7 @@ mod tests {
         let t_arc = lazy_arc.materialize().expect("arc materialize");
         let t_vec = lazy_vec.materialize().expect("vec materialize");
 
-        assert_eq!(t_arc.data, t_vec.data, "Arc-path bytes equal Vec-path");
+        assert_eq!(*t_arc.data, *t_vec.data, "Arc-path bytes equal Vec-path");
         assert_eq!(t_arc.shape, t_vec.shape);
         assert_eq!(t_arc.dtype, t_vec.dtype);
     }
@@ -1039,7 +1107,7 @@ mod tests {
 
         let lazy = LazyTensor::from_arc_bytes(meta("shared", vec![2], DType::F32), shared);
         let t = lazy.materialize().expect("shared materialize");
-        assert_eq!(t.data, payload, "shared-refcount path returns equal bytes");
+        assert_eq!(*t.data, payload, "shared-refcount path returns equal bytes");
     }
 
     #[test]
@@ -1052,7 +1120,7 @@ mod tests {
 
         let lazy = LazyTensor::from_arc_bytes(meta("kept-live", vec![1], DType::F32), Arc::clone(&arc));
         let t = lazy.materialize_cloned().expect("borrowed materialize");
-        assert_eq!(t.data, payload);
+        assert_eq!(*t.data, payload);
 
         // After materialize_cloned, the lazy still owns its Arc clone —
         // the original `arc` strong count must be ≥ pre_count + 1
@@ -1089,9 +1157,9 @@ mod tests {
         assert_eq!(eager.len(), 2);
         let a = eager.get("a").unwrap();
         assert_eq!(a.shape, vec![2]);
-        assert_eq!(a.data, f32_bytes(&[1.0, 2.0]));
+        assert_eq!(*a.data, f32_bytes(&[1.0, 2.0]));
         let b = eager.get("b").unwrap();
-        assert_eq!(b.data, f32_bytes(&[42.0]));
+        assert_eq!(*b.data, f32_bytes(&[42.0]));
     }
 
     /// Compile-time proof that LazyTensor is Send. If the bound were
@@ -1115,6 +1183,6 @@ mod tests {
         assert_eq!(owned.name(), "k");
         assert!(map.get("k").is_none());
         let realised = owned.materialize().unwrap();
-        assert_eq!(realised.data, f32_bytes(&[3.14]));
+        assert_eq!(*realised.data, f32_bytes(&[3.14]));
     }
 }

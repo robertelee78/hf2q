@@ -529,7 +529,7 @@ mod tests {
         assert_eq!(tensor.shape, vec![2, 3]);
         assert_eq!(tensor.dtype, DType::F32);
         assert_eq!(tensor.data.len(), 24); // 6 * 4 bytes
-        assert_eq!(tensor.data, tensor_data);
+        assert_eq!(*tensor.data, tensor_data);
     }
 
     #[test]
@@ -595,7 +595,7 @@ mod tests {
             .1
             .materialize()
             .unwrap();
-        assert_eq!(realised.data, tensor_data);
+        assert_eq!(*realised.data, tensor_data);
     }
 
     /// Lazy reader and the legacy eager reader produce byte-identical
@@ -643,7 +643,7 @@ mod tests {
             let e = eager.get(name).unwrap();
             assert_eq!(m.shape, e.shape, "{name} shape");
             assert_eq!(m.dtype, e.dtype, "{name} dtype");
-            assert_eq!(m.data, e.data, "{name} bytes");
+            assert_eq!(*m.data, *e.data, "{name} bytes");
         }
     }
 
@@ -697,7 +697,7 @@ mod tests {
             .1
             .materialize()
             .unwrap();
-        assert_eq!(realised.data, big_data);
+        assert_eq!(*realised.data, big_data);
     }
 
     /// Header byte-range disagreeing with shape × dtype is a typed

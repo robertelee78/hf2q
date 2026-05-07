@@ -103,6 +103,21 @@ impl fmt::Display for DType {
 }
 
 /// A reference to a tensor that can provide lazy access to its data via mmap.
+///
+/// ADR-020 P13 step 4 (2026-05-06): `data` is now `Arc<Vec<u8>>` rather
+/// than `Vec<u8>`. This makes `TensorRef::clone()` and other previously-
+/// deep-copying paths cheap pointer-bumps. The 199 GB peak observed on
+/// Qwen3.6-27B DWQ stemmed from `clone_tensor_map_to_lazy` deep-cloning
+/// each tensor's bytes (52 GB total for 27B); with Arc-backed data
+/// this becomes a constant-time pointer share.
+///
+/// Read sites that previously did `&tensor.data[..]`, `tensor.data.len()`,
+/// `tensor.data.as_slice()` continue to work via `Arc<Vec<u8>>: Deref<Target=Vec<u8>>`.
+/// Write sites that did `tensor.data = bytes` now wrap with
+/// `Arc::new(bytes)`. Sites that mutate the bytes in-place (rare; the
+/// IR is mostly read-only) use `Arc::unwrap_or_clone(tensor.data)` to
+/// extract an owned Vec — zero-copy when refcount==1, one clone when
+/// shared.
 #[derive(Debug, Clone)]
 pub struct TensorRef {
     /// Fully qualified tensor name (e.g., "model.language_model.layers.0.self_attn.q_proj.weight")
@@ -111,13 +126,10 @@ pub struct TensorRef {
     pub shape: Vec<usize>,
     /// Data type of the tensor
     pub dtype: DType,
-    /// Raw data bytes (may be mmap'd)
-    pub data: Vec<u8>,
+    /// Raw data bytes (may be mmap'd). Arc-backed so TensorRef::clone()
+    /// is a pointer bump rather than a deep byte copy.
+    pub data: std::sync::Arc<Vec<u8>>,
 }
-
-// Safety: TensorRef contains only owned data (Vec<u8>) — inherently Send + Sync.
-unsafe impl Send for TensorRef {}
-unsafe impl Sync for TensorRef {}
 
 impl TensorRef {
     /// Total number of elements in this tensor.
@@ -157,8 +169,16 @@ impl TensorRef {
     /// large-blast-radius iter), this method becomes unnecessary —
     /// `Arc::clone(&self.data)` will be the cheap-share path with no
     /// `mem::take` required.  Until then this method is the bridge.
+    ///
+    /// ADR-020 P13 step 4 update (2026-05-06): TensorRef::data is now
+    /// already `Arc<Vec<u8>>`. This method returns the existing Arc
+    /// directly via `mem::take` (replacing with `Arc::new(Vec::new())`,
+    /// the Default for Arc<Vec<u8>>). The `take_*` semantic is preserved
+    /// — caller MUST NOT rely on `self.data` after this call.
+    /// Equivalent shorter spelling at call sites: `Arc::clone(&t.data)`
+    /// (preserves the source) or `mem::take(&mut t.data)` (drains it).
     pub fn take_data_as_arc(&mut self) -> std::sync::Arc<Vec<u8>> {
-        std::sync::Arc::new(std::mem::take(&mut self.data))
+        std::mem::take(&mut self.data)
     }
 
     /// Whether this tensor belongs to a vision encoder or multimodal projector.
@@ -255,7 +275,7 @@ impl TensorRef {
             name: self.name.clone(),
             shape: self.shape.clone(),
             dtype: DType::F16,
-            data: f16_data,
+            data: std::sync::Arc::new(f16_data),
         })
     }
 }
@@ -514,8 +534,9 @@ pub struct QuantizedTensor {
     pub shape: Vec<usize>,
     /// Original dtype before quantization
     pub original_dtype: DType,
-    /// Quantized data bytes
-    pub data: Vec<u8>,
+    /// Quantized data bytes. ADR-020 P13 step 4: Arc-backed so
+    /// QuantizedTensor::clone() is a pointer bump.
+    pub data: std::sync::Arc<Vec<u8>>,
     /// Quantization metadata
     pub quant_info: TensorQuantInfo,
 }
@@ -626,7 +647,7 @@ mod tests {
             name: "t".to_string(),
             shape: vec![5],
             dtype: DType::U8,
-            data: original_bytes.clone(),
+            data: original_bytes.clone().into(),
         };
 
         let arc = t.take_data_as_arc();
@@ -634,7 +655,7 @@ mod tests {
         // Arc holds the bytes.
         assert_eq!(&**arc, original_bytes.as_slice());
         // Source TensorRef.data is now empty (mem::take semantic).
-        assert_eq!(t.data, Vec::<u8>::new());
+        assert_eq!(*t.data, Vec::<u8>::new());
         // Refcount==1 → unwrap path is zero-copy when the Arc is consumed.
         assert_eq!(std::sync::Arc::strong_count(&arc), 1);
     }
@@ -646,7 +667,7 @@ mod tests {
             name: "t".to_string(),
             shape: vec![3],
             dtype: DType::U8,
-            data: vec![10, 20, 30],
+            data: std::sync::Arc::new(vec![10, 20, 30]),
         };
 
         let first = t.take_data_as_arc();
@@ -669,7 +690,7 @@ mod tests {
             name: "test".to_string(),
             shape: vec![3, 4, 5],
             dtype: DType::F32,
-            data: vec![0u8; 3 * 4 * 5 * 4],
+            data: std::sync::Arc::new(vec![0u8; 3 * 4 * 5 * 4]),
         };
         assert_eq!(t.numel(), 60);
         assert_eq!(t.size_bytes(), 240);
@@ -681,7 +702,7 @@ mod tests {
             name: "model.layers.0.self_attn.q_proj.weight".to_string(),
             shape: vec![4096, 4096],
             dtype: DType::F16,
-            data: vec![],
+            data: std::sync::Arc::new(vec![]),
         };
         assert!(weight.is_weight());
 
@@ -689,7 +710,7 @@ mod tests {
             name: "model.layers.0.input_layernorm.weight".to_string(),
             shape: vec![4096],
             dtype: DType::F16,
-            data: vec![],
+            data: std::sync::Arc::new(vec![]),
         };
         assert!(!norm.is_weight());
 
@@ -697,7 +718,7 @@ mod tests {
             name: "model.layers.0.self_attn.o_proj.bias".to_string(),
             shape: vec![4096],
             dtype: DType::F16,
-            data: vec![],
+            data: std::sync::Arc::new(vec![]),
         };
         assert!(!bias.is_weight());
     }
@@ -713,7 +734,7 @@ mod tests {
             name: "test".to_string(),
             shape: vec![1],
             dtype: DType::BF16,
-            data: bytes.to_vec(),
+            data: bytes.to_vec().into(),
         };
 
         let converted = tensor.to_f16().unwrap();
@@ -734,7 +755,7 @@ mod tests {
             name: "a".to_string(),
             shape: vec![2, 3],
             dtype: DType::F16,
-            data: vec![0u8; 12],
+            data: std::sync::Arc::new(vec![0u8; 12]),
         });
 
         assert_eq!(map.len(), 1);
@@ -748,7 +769,7 @@ mod tests {
             name: name.to_string(),
             shape: vec![4096, 4096],
             dtype: DType::F16,
-            data: vec![],
+            data: std::sync::Arc::new(vec![]),
         };
 
         // Vision tensors — should return true
@@ -768,7 +789,7 @@ mod tests {
             name: "model.vision_tower.encoder.layers.0.self_attn.q_proj.weight".to_string(),
             shape: vec![4096, 4096],
             dtype: DType::F16,
-            data: vec![],
+            data: std::sync::Arc::new(vec![]),
         };
         assert!(vt.is_weight(), "vision weight should pass is_weight()");
         assert!(vt.is_vision_tensor(), "vision weight should pass is_vision_tensor()");

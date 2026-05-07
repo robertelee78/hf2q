@@ -188,7 +188,7 @@ pub fn quantize_via_streaming_borrowed(
         // Refcount==1 when materialise() runs (the LazyTensor here is the
         // sole strong-ref holder; tensor_map's `&Vec<u8>` is a borrow).
         // → Arc::unwrap_or_clone path inside materialize() is zero-copy.
-        let shared: Arc<Vec<u8>> = Arc::new(t.data.clone());
+        let shared: Arc<Vec<u8>> = Arc::clone(&t.data);
         lazy_map.insert(LazyTensor::from_arc_bytes(meta, shared));
     }
     quantize_streaming(lazy_map, metadata, quantizer, bits, group_size, progress, false)
@@ -643,7 +643,7 @@ mod tests {
             name: name.to_string(),
             shape,
             dtype: DType::F16,
-            data: vec![0u8; numel * 2], // F16 = 2 bytes per element
+            data: std::sync::Arc::new(vec![0u8; numel * 2]), // F16 = 2 bytes per element
         }
     }
 
@@ -689,7 +689,7 @@ mod tests {
                 name: name.to_string(),
                 shape: shape.clone(),
                 dtype: *dtype,
-                data: data.clone(),
+                data: data.clone().into(),
             });
             lazy_map.insert(LazyTensor::from_bytes(
                 LazyMeta::new(name.to_string(), shape.clone(), *dtype),
@@ -908,7 +908,7 @@ mod tests {
                 name: name.to_string(),
                 shape: shape.clone(),
                 dtype: DType::BF16,
-                data: data.clone(),
+                data: data.clone().into(),
             });
             lazy_map.insert(LazyTensor::from_bytes(
                 LazyMeta::new(name.to_string(), shape, DType::BF16),
@@ -1037,7 +1037,7 @@ mod tests {
                 name: name.to_string(),
                 shape: shape.clone(),
                 dtype: DType::F16,
-                data: data.clone(),
+                data: data.clone().into(),
             });
             lazy_map.insert(LazyTensor::from_bytes(
                 LazyMeta::new(name.to_string(), shape.clone(), DType::F16),
@@ -4032,7 +4032,7 @@ mod tests {
                 .tensors
                 .get(TENSOR)
                 .unwrap_or_else(|| panic!("variant {v:?} missing {TENSOR}"));
-            results.push((*v, t.data.clone(), v.base_target()));
+            results.push((*v, (*t.data).clone(), v.base_target()));
         }
 
         // Sanity: at least one variant per base target → the matrix has
@@ -5680,7 +5680,7 @@ mod tests {
                     name: name.to_string(),
                     shape: vec![1, QK_K],
                     dtype: DType::F16,
-                    data: make_payload(i as f32),
+                    data: make_payload(i as f32).into(),
                 });
             }
             m
@@ -5784,7 +5784,7 @@ mod tests {
                 name: name.to_string(),
                 shape: vec![1, QK_K],
                 dtype: DType::F16,
-                data: make_payload(i as f32),
+                data: make_payload(i as f32).into(),
             });
         }
 
@@ -5855,7 +5855,7 @@ mod tests {
                 name: name.to_string(),
                 shape: vec![1, QK_K],
                 dtype: DType::F16,
-                data: make_payload(i as f32),
+                data: make_payload(i as f32).into(),
             });
         }
 
@@ -5950,7 +5950,7 @@ mod tests {
                 name: name.to_string(),
                 shape: vec![1, QK_K],
                 dtype: DType::F16,
-                data: make_payload(i as f32),
+                data: make_payload(i as f32).into(),
             });
         }
 
@@ -6180,7 +6180,7 @@ mod tests {
                     name: name.to_string(),
                     shape: vec![1, QK_K],
                     dtype: DType::F16,
-                    data: make_payload(i as f32),
+                    data: make_payload(i as f32).into(),
                 });
             }
             m
