@@ -171,6 +171,19 @@ enum OpKind {
         dim: usize,
         eps: f32,
     },
+    /// Zero-copy reshape — Arc-bumps the input buffer and pushes a node
+    /// with a new shape.  Backward = identity (shape-relabeled clone of
+    /// the upstream gradient, since the underlying GPU memory layout is
+    /// row-major-flat and a reshape is a pure metadata change).
+    /// ADR-020 iter-13c.
+    View {
+        input_idx: usize,
+        original_shape: Vec<usize>,
+    },
+    /// Per-element scalar multiply `Y = scalar · X` — ADR-020 iter-13c
+    /// dependency for KL-div temperature scaling (`scale = 1/T`).
+    /// Backward: `dX = scalar · dY`.
+    ScalarMul { input_idx: usize, scalar: f32 },
     /// Affine quant-dequant `qdq[i] = q_int[i] · scales[g(i)] + biases[g(i)]`
     /// — ADR-020 iter-13b Track 2 DWQ-proper training-loop op.
     ///
@@ -531,7 +544,9 @@ pub fn backward(
             | OpKind::RowSum { input_idx, .. }
             | OpKind::Transpose2d { input_idx, .. }
             | OpKind::Slice2dCols { input_idx, .. }
-            | OpKind::SiLU { input_idx } => {
+            | OpKind::SiLU { input_idx }
+            | OpKind::View { input_idx, .. }
+            | OpKind::ScalarMul { input_idx, .. } => {
                 accumulate(&mut grads, input_idx, &parent_grads[0], tape)?;
             }
             OpKind::Embedding { embedding_idx, .. } => {
@@ -1240,6 +1255,47 @@ fn backward_dispatch(
             //   accumulate(grads, input_idx, parent_grads[0])
             //   accumulate(grads, weight_idx, parent_grads[1])
             Ok((op, vec![dx_buf, dw_buf]))
+        }
+        OpKind::View {
+            ref original_shape, ..
+        } => {
+            // Backward = identity, but shape-relabeled to the input
+            // shape via zero-copy `with_shape`.  Downstream
+            // `accumulate` allocs based on the existing-grad shape;
+            // by writing the gradient with the original shape here
+            // we keep the parent's grad slot dimensionally
+            // consistent.
+            let dx = out_grad
+                .with_shape(original_shape.clone())
+                .map_err(|e| anyhow!("backward view: with_shape: {e}"))?;
+            Ok((op, vec![dx]))
+        }
+        OpKind::ScalarMul { scalar, .. } => {
+            // dX = scalar · dY.  Composed via mlx-native's
+            // `scalar_mul_f32` elementwise primitive.
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+            let n = out_grad.element_count();
+            let dx_buf = device
+                .alloc_buffer(n * 4, DType::F32, out_grad.shape().to_vec())
+                .map_err(|e| anyhow!("backward scalar_mul: alloc dx: {e}"))?;
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward scalar_mul: encoder: {e}"))?;
+            scalar_mul_f32(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                out_grad,
+                &dx_buf,
+                n,
+                scalar,
+            )
+            .map_err(|e| anyhow!("backward scalar_mul: dispatch: {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward scalar_mul: commit_and_wait: {e}"))?;
+            Ok((op, vec![dx_buf]))
         }
         OpKind::QdqAffine {
             n_total,
@@ -2117,6 +2173,96 @@ where
         tape: tape.clone(),
         node_idx,
         shape: lhs.shape.clone(),
+    })
+}
+
+/// Zero-copy reshape — produces a `GpuTensor` with `new_shape` whose
+/// underlying `MlxBuffer` Arc-shares storage with `t`.  Backward is
+/// identity (the upstream gradient is shape-relabeled back to `t`'s
+/// original shape).
+///
+/// `new_shape.iter().product()` must equal `t.numel()`.
+///
+/// ADR-020 iter-13c — required for `qdq_affine → reshape → matmul → KL`
+/// training-loop chain.
+pub fn view(t: &GpuTensor, new_shape: Vec<usize>) -> Result<GpuTensor> {
+    let new_numel: usize = new_shape.iter().product();
+    let old_numel: usize = t.shape.iter().product();
+    if new_numel != old_numel {
+        return Err(anyhow!(
+            "view: new_shape numel {new_numel} != input numel {old_numel} (input shape {:?}, requested {:?})",
+            t.shape,
+            new_shape
+        ));
+    }
+    let tape = &t.tape;
+    let in_buf = tape.with_node(t.node_idx, |n| n.value.clone());
+    let out_buf = in_buf
+        .with_shape(new_shape.clone())
+        .map_err(|e| anyhow!("view: with_shape: {e}"))?;
+    let original_shape = t.shape.clone();
+    let input_idx = t.node_idx;
+    let node_idx = tape.push_node(
+        OpKind::View {
+            input_idx,
+            original_shape,
+        },
+        out_buf,
+        new_shape.clone(),
+    );
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: new_shape,
+    })
+}
+
+/// Per-element scalar multiply `Y = scalar · X` — composes
+/// `mlx-native`'s `scalar_mul_f32` into a tape op.  Backward:
+/// `dX = scalar · dY`.
+///
+/// ADR-020 iter-13c — required for KL-div temperature scaling
+/// (`scale = 1/T` per mlx-lm `dwq.py`).
+pub fn scalar_mul(t: &GpuTensor, scalar: f32) -> Result<GpuTensor> {
+    if !scalar.is_finite() {
+        return Err(anyhow!("scalar_mul: scalar must be finite; got {scalar}"));
+    }
+    let tape = &t.tape;
+    let device = tape.device();
+    let n: usize = t.shape.iter().product();
+    let in_buf = tape.with_node(t.node_idx, |n| n.value.clone());
+    let out_buf = device
+        .alloc_buffer(n * 4, DType::F32, t.shape.clone())
+        .map_err(|e| anyhow!("scalar_mul: alloc out: {e}"))?;
+    let mut registry = tape.0.registry.borrow_mut();
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("scalar_mul: encoder: {e}"))?;
+    scalar_mul_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &in_buf,
+        &out_buf,
+        n,
+        scalar,
+    )
+    .map_err(|e| anyhow!("scalar_mul: dispatch: {e}"))?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("scalar_mul: commit_and_wait: {e}"))?;
+    drop(registry);
+
+    let input_idx = t.node_idx;
+    let node_idx = tape.push_node(
+        OpKind::ScalarMul { input_idx, scalar },
+        out_buf,
+        t.shape.clone(),
+    );
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: t.shape.clone(),
     })
 }
 
@@ -3401,6 +3547,156 @@ mod tests {
         // Subgraph A nodes (xat, wat) should NOT have grads.
         assert!(grads[xat.node_idx()].is_none(), "xa grad must be None");
         assert!(grads[wat.node_idx()].is_none(), "wa grad must be None");
+    }
+
+    /// iter-13c — view forward + backward identity.  Reshape `[6]` to
+    /// `[2, 3]` and back; verify that the gradient seeded as
+    /// `[2, 3]` ones flows back to the leaf as a `[6]` ones buffer
+    /// (zero-copy Arc-share, shape-relabeled).
+    #[test]
+    fn gpu_tape_view_forward_backward_identity() {
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let x = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let xt = GpuTensor::from_vec(&tape, &x, vec![6]).unwrap();
+        let v = view(&xt, vec![2, 3]).unwrap();
+        assert_eq!(v.shape(), &[2, 3]);
+        // Forward equality: v values match x values (zero-copy).
+        let v_host = v.to_vec().unwrap();
+        assert_close(&v_host, &x, 0.0, 0.0, "view forward");
+
+        // Backward identity: dy of [2, 3] ones → dx of [6] ones.
+        let dy = ones_like(&tape, &[2, 3]).unwrap();
+        let grads = backward(&v, dy).unwrap();
+        let g = grads[xt.node_idx()]
+            .as_ref()
+            .expect("xt grad")
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec();
+        assert_eq!(g.len(), 6);
+        for &v in &g {
+            assert_eq!(v, 1.0);
+        }
+    }
+
+    /// iter-13c — view chained with matmul.  Reshape a `[k*n]` 1-D
+    /// into `[k, n]`, matmul with a `[m, k]` lhs, get `[m, n]` output.
+    /// Backward must accumulate gradients in the leaf with the
+    /// original `[k*n]` shape.  Sizes chosen at the matmul backward
+    /// floor (m, k, n >= 32).
+    #[test]
+    fn gpu_tape_view_then_matmul_backward_accumulates_in_leaf() {
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let m = 32usize;
+        let k = 32usize;
+        let n = 32usize;
+        let x: Vec<f32> = (0..(m * k)).map(|i| (i as f32) * 0.001 - 0.05).collect();
+        let w_flat: Vec<f32> = (0..(k * n)).map(|i| (i as f32) * 0.01 + 0.1).collect();
+        let xt = GpuTensor::from_vec(&tape, &x, vec![m, k]).unwrap();
+        let w_1d = GpuTensor::from_vec(&tape, &w_flat, vec![k * n]).unwrap();
+        let w_2d = view(&w_1d, vec![k, n]).unwrap();
+        let y = matmul(&xt, &w_2d).unwrap();
+        assert_eq!(y.shape(), &[m, n]);
+        let dy = ones_like(&tape, &[m, n]).unwrap();
+        let grads = backward(&y, dy).unwrap();
+        let g = grads[w_1d.node_idx()]
+            .as_ref()
+            .expect("w grad")
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec();
+        assert_eq!(g.len(), k * n);
+        // dW = X^T @ dY (with dY = ones [m, n]); each output element
+        // dW[col, j] = Σ_r X[r, col] · dY[r, j] = Σ_r X[r, col].
+        // Flat index = col * n + j.  Verify a sample of rows.
+        for col in 0..k {
+            let mut acc = 0.0f64;
+            for r in 0..m {
+                acc += x[r * k + col] as f64;
+            }
+            // All n columns of dW[col, *] should equal acc (since dY = ones).
+            let acc32 = acc as f32;
+            for j in 0..n {
+                let got = g[col * n + j];
+                assert!(
+                    (got - acc32).abs() < 5e-3 * acc32.abs().max(1.0),
+                    "dW[col={col}, j={j}]: got {got} expected {acc32}"
+                );
+            }
+        }
+    }
+
+    /// iter-13c — scalar_mul forward + backward.  `Y = c · X`, `L = Σ Y`,
+    /// so `dL/dX = c` (constant).
+    #[test]
+    fn gpu_tape_scalar_mul_forward_backward() {
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let x: Vec<f32> = (0..32).map(|i| (i as f32) * 0.1 - 1.5).collect();
+        let xt = GpuTensor::from_vec(&tape, &x, vec![32]).unwrap();
+        let c = 0.5f32;
+        let y = scalar_mul(&xt, c).unwrap();
+        let y_host = y.to_vec().unwrap();
+        for i in 0..32 {
+            assert!((y_host[i] - c * x[i]).abs() < 1e-6);
+        }
+        let dy = ones_like(&tape, &[32]).unwrap();
+        let grads = backward(&y, dy).unwrap();
+        let g = grads[xt.node_idx()]
+            .as_ref()
+            .expect("x grad")
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec();
+        for &v in &g {
+            assert!((v - c).abs() < 1e-6);
+        }
+    }
+
+    /// iter-13c — scalar_mul finite-diff falsifier.  L = Σ_i (c·x[i])²,
+    /// dL/dx[i] = 2·c²·x[i].  Compare analytical vs central FD.
+    #[test]
+    fn gpu_tape_scalar_mul_finite_diff_falsifier() {
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let x: Vec<f32> = (0..16)
+            .map(|i| ((i as f32) * 0.213).sin() * 0.5)
+            .collect();
+        let c = 0.7f32;
+
+        // Analytical via tape.
+        let xt = GpuTensor::from_vec(&tape, &x, vec![16]).unwrap();
+        let y = scalar_mul(&xt, c).unwrap();
+        let y_sq = square(&y).unwrap();
+        let dy = ones_like(&tape, &[16]).unwrap();
+        let grads = backward(&y_sq, dy).unwrap();
+        let analytic = grads[xt.node_idx()]
+            .as_ref()
+            .unwrap()
+            .as_slice::<f32>()
+            .unwrap()
+            .to_vec();
+
+        // Central FD oracle on host.
+        let h = 1e-3f32;
+        for i in 0..16 {
+            let mut x_plus = x.clone();
+            x_plus[i] += h;
+            let mut x_minus = x.clone();
+            x_minus[i] -= h;
+            let l_plus: f64 = x_plus.iter().map(|v| ((c * v) as f64).powi(2)).sum();
+            let l_minus: f64 = x_minus.iter().map(|v| ((c * v) as f64).powi(2)).sum();
+            let fd = ((l_plus - l_minus) / (2.0 * h as f64)) as f32;
+            let tol = 1e-3 * fd.abs().max(1.0);
+            assert!(
+                (analytic[i] - fd).abs() < tol,
+                "FD x[{i}]: analytic={} fd={}",
+                analytic[i],
+                fd
+            );
+        }
     }
 
     /// iter-13b — qdq_affine forward parity vs CPU oracle, with q_int
