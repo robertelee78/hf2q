@@ -1,6 +1,152 @@
-# ADR-020: DWQ streaming calibration — eliminate the 199 GB peak on 27B/35B
+# ADR-020: DWQ + Mixed-Precision Quantization for hf2q (port from mlx-lm)
 
-**Status**: Proposed — 2026-05-06; PIVOTED iteration 4.5 (taxonomy + algorithm correction)
+**Status**: Proposed — 2026-05-06; PIVOTED iter 4.5 (taxonomy correction); EXPANDED iter 5 (10-researcher /cfa deep-dive)
+
+## Iter 5 research output (10 parallel researchers)
+
+Full deliverables at `/tmp/cfa-mlx-lm-deep-research/`. Headlines:
+
+| # | Topic | Headline finding |
+|---|---|---|
+| 1 | DWQ algorithm | KL-div distillation; optimizes scales+biases ONLY (codes frozen → no STE needed); 411 LOC; lr=1e-6, batch=4, samples=2048, max_seq=1025 |
+| 2 | Dynamic Quant | Signed first-order Taylor: `(grad·(w_low−w_high)).sum()/params_M` ≠ hf2q's variance-magnitude proxy. Cache invalidation forced. |
+| 3 | AWQ | 585 LOC scale-then-clip; activation-aware; needs `Catcher` per-Linear hook (~1-2 weeks port). Recommended AFTER dynamic_quant. |
+| 4 | GPTQ | 229 LOC Cholesky-based least-squares; smallest of 4 algos; output bit-identical to standard MLX quantized layer. Port estimate 1-2 weeks. |
+| 5 | Shared infra | `load(lazy=True)` + sharded safetensors at 5GB/shard + `donate_model=True` + `iterate_batches(pad_to=32)` + `kl_div_loss` Metal kernel (200 LOC, custom VJP) |
+| 6 | Memory tricks | **3 load-bearing**: per-batch `del grads + mx.eval(grad_accum)` (saves ~60GB/step), stream-targets-to-disk in compute_dwq_targets (drops teacher ~60GB), fix hf2q's `materialize_cloned` deep-clone defect at lazy.rs:314-345 (~20 LOC) |
+| 7 | File format | MLX safetensors (uint32 packed weight + fp16 scales + fp16 biases per group_size=64) ≠ GGUF Q4_K (super-block 256 weights, 6-bit compressed scales). DWQ→GGUF is LOSSY. DWQ output goes to MLX safetensors. |
+| 8 | Port checklist | Phase 1: dynamic_quant (~80 LOC core, hand-derived gradients, no autograd needed). Phase 2: DWQ via subprocess wrapper (mlx_lm.dwq) or native port (autograd needed). |
+| 9 | DWQ 2026 SOTA | DWQ has NO paper; canonical = Awni Hannun blog + GitHub. Best 4-bit MoE: 0.02663 KL on Qwen3.6-35B-A3B-4bit-DWQ (smcleod 2026-04). DWQ saturates at 6-bit. **DWQ remains SOTA for Apple Silicon W4A16 as of 2026.** FlatQuant/SpinQuant lead for NVIDIA W4A4 (different stack). |
+| 10 | Runtime support | **MASSIVE**: mlx-native already has affine 4/6/8-bit quantized_matmul kernels at `/opt/mlx-native/src/ops/quantized_matmul.rs` (1407 LOC) + `.metal`. Decode (qmv_fast) + MoE-routed expert variant present. Loader at `/opt/mlx-native/src/weight.rs:626 load_quantized_weights`. Only missing: prefill qmm tile kernel (~3-5 days port from existing GGML qmm template). hf2q can serve DWQ natively. |
+
+## Taxonomy lock-in (mlx-lm naming as of 2026)
+
+| What hf2q called | What it actually is | mlx-lm canonical | Output format | Status in hf2q |
+|---|---|---|---|---|
+| "DWQ-46" | Sensitivity ranking → mixed Q4/Q6 GGUF | `dynamic_quant.py` | MLX safetensors per-tensor `{bits, group_size}` overrides | Misnamed; algorithm differs (variance-magnitude vs gradient-Taylor) |
+| "DWQ-48" | Same with sensitive=Q8_0 | `dynamic_quant.py` (4/8 split) | Same | Same |
+| (not implemented) | Distillation fine-tuning of quantized scales+biases | `dwq.py` | MLX safetensors w/ trained fp16 scales+biases | NEW capability — port required |
+| (not implemented) | Activation-aware weight scaling | `awq.py` | MLX safetensors w/ scaled+clipped weights | Optional 3rd track |
+| (not implemented) | Cholesky-based weight least-squares | `gptq.py` | MLX safetensors (bit-identical to standard quantized) | Optional 4th track |
+
+## Port plan (4 algorithms, 3-week core + optional extensions)
+
+Per researcher #8 + #10 synthesis:
+
+### Track 1: Dynamic Quant (mixed-precision sensitivity-based) — REPLACE existing hf2q DWQ
+**Source:** `/opt/mlx-lm/mlx_lm/quant/dynamic_quant.py:38-146`
+**Output:** GGUF with per-tensor mixed Q4_K/Q5_K/Q6_K (this is what hf2q already does — keep this)
+**Port subtasks:**
+1. `estimate_sensitivities` algorithm (~80 LOC core): per-batch loop, qdq utility, gradient-alignment metric. Hand-derive `∂L/∂y · x^T` per Linear (no autograd graph).
+2. `estimate_threshold` binary search for target BPW (~40 LOC).
+3. Mixed-bit predicate dispatcher (already exists at `src/quantize/{mixed,layer_mix}.rs`).
+4. Cache key bumped from "1.0.variance-magnitude" → "2.0.gradient-alignment" (hard-fail on legacy reads).
+5. CLI: `--quant dynamic-quant-4-5` etc. (preserve `--quant dwq-4-6` as alias for backward compat).
+6. Falsifier: synthetic 4-layer Qwen → sensitivity vector matches mlx-lm output within 1e-3 relative.
+
+**Effort: 1-2 weeks. No autograd dep. No new file format. No mlx-native changes.**
+
+### Track 2: DWQ proper (distillation fine-tuning of quantized scales+biases) — NEW capability
+**Source:** `/opt/mlx-lm/mlx_lm/quant/dwq.py:69-209`
+**Output:** MLX safetensors (NOT GGUF — researcher #7 verified incompatible byte layouts)
+**Two viable paths per researcher #10:**
+
+- **Path B (validation, days 1-3):** hf2q produces DWQ-quantized MLX safetensors via subprocess wrapper around `mlx_lm.dwq`. Validates the algorithm + format. Runtime is `mlx_lm.generate` (Python) for measurement only.
+- **Path A (production, weeks 2-4, conditional on Path B success):** native port. Components:
+  - `dwq_quantize` algorithm core (~140 LOC port). Adam optimizer + KL-div + Linear-only autograd.
+  - `compute_dwq_targets` stream-to-disk (~60 LOC). Saves teacher logits per-batch to .safetensors files; teacher dropped before student loaded.
+  - hf2q runtime: load MLX safetensors via `mlx_native::weight::load_quantized_weights` (already exists). Add prefill `quantized_matmul_mm_affine.metal` kernel to mlx-native (3-5 days; template exists at `quantized_matmul_mm.metal` for GGML).
+  - Validation: `mlx_lm.generate` round-trip + perplexity vs Q4_K_M baseline.
+
+**GO/NO-GO gate after Path B (day 5):** if perplexity beats Q4_K_M baseline by >0.05 nats on 1k WikiText, commit to Path A.
+
+**Effort: 3-5 days for Path B (gate), then 3-4 weeks for Path A (full native).**
+
+### Track 3: AWQ (optional, post-Track-1+2)
+**Source:** `/opt/mlx-lm/mlx_lm/quant/awq.py:399-510`
+**Trigger:** if DWQ + dynamic_quant don't deliver sufficient quality at 3-bit / 2-bit
+**Effort: 1-2 weeks. Activation-aware needs `Catcher`-style per-Linear hooks; doubles as scaffolding for future GPTQ.**
+
+### Track 4: GPTQ (optional)
+**Source:** `/opt/mlx-lm/mlx_lm/quant/gptq.py:52-159`
+**Effort: 1-2 weeks. Smallest algo (229 LOC). Cholesky-based; mlx-native already has Cholesky binding.**
+
+## Memory architecture: 3 load-bearing patterns to port (researcher #6)
+
+Per the 199 GB observed peak vs llama.cpp's ~10 GB:
+
+### A. Per-batch `del grads + mx.eval(grad_accum)` rhythm
+**Source:** `dynamic_quant.py:80-86` + `dwq.py:178-179`
+**Saves:** ~60 GB/step on 27B-class
+**hf2q port:** in the new `estimate_sensitivities` and `dwq_quantize` Rust impls, after each batch:
+```rust
+gradient_accumulator += &batch_grads;
+drop(batch_grads);  // explicit drop — no accumulation
+device.commit_and_wait()?;  // mlx-native equivalent of mx.eval
+```
+
+### B. Stream-targets-to-disk
+**Source:** `dwq.py:29-66 compute_dwq_targets` + line 386-387 `del model`
+**Saves:** ~60 GB on 27B (lets teacher be dropped before student trains)
+**hf2q port:**
+1. New mode: `--quant dwq-4 --target-dir /path` precomputes teacher top-1024 logits + indices to .safetensors files
+2. Phase 1 (target precompute): teacher loaded, no student
+3. `drop(teacher)` between phases
+4. Phase 2 (student training): teacher gone, only student + per-batch targets read from disk
+
+### C. Fix `materialize_cloned` deep-clone defect — INDEPENDENT improvement
+**Source:** Researcher #6 verified at `/opt/hf2q/src/ir/lazy.rs:314-345`
+**Bug:** even though Phase 1 (commit `437217d`) made TensorRef.data: Arc<Vec<u8>>, the `materialize_cloned` impl at lines 317-321 still does `(**arc).clone()` — deep-copies the Vec inside the Arc. Should be `Arc::clone(arc)` returning the Arc directly.
+**Fix:** ~20 LOC in lazy.rs.
+**Saves:** ~52 GB on 27B (the deep clone of source weights for every materialize call).
+**Land first** — it's independent of the algorithm work and unblocks all subsequent paths.
+
+## File format reality check (researcher #7)
+
+DWQ-trained scales **cannot** survive a GGUF round-trip without quality loss:
+- MLX format: per-group fp16 scales + fp16 biases (group_size=64). 32 GB metadata overhead for a 4096×4096 layer.
+- GGUF Q4_K: per-super-block 6-bit compressed scales (256 weights/super-block, 8×32 sub-blocks, fixed format). Quantization op: snap fp16 trained scales onto 6-bit grid → loses subtlety.
+
+**Decision:** DWQ output is MLX safetensors only. Track 1 (dynamic_quant) keeps GGUF output. Track 2 (DWQ) gets new MLX-safetensors output path.
+
+## mlx-native runtime kernels — existing inventory (researcher #10)
+
+**MASSIVE FINDING:** mlx-native already supports MLX-affine quantized inference for 4/6/8-bit. Re-exported public symbols at `/opt/mlx-native/src/lib.rs:101`:
+- `quantized_matmul` — scalar baseline, 4/6/8-bit (works for prefill but slow)
+- `quantized_matmul_simd` — fp32 input, qmv (decode-only)
+- `quantized_matmul_simd_bf16` — bf16 input, qmv_fast (decode-only)
+- `quantized_matmul_simd_bf16_expert` — MoE-routed bf16 (Qwen3.6-A3B compatible!)
+
+Loader: `/opt/mlx-native/src/weight.rs:626 load_quantized_weights` reads `quantization_config.json` + sharded safetensors with `.weight + .scales + .biases` naming.
+
+**Missing for hf2q:** `quantized_matmul_mm_affine.metal` (prefill matrix-matrix with affine dequant). Template exists at `quantized_matmul_mm.metal` (GGML qmm). Substitute the dequant block: ~3-5 days kernel work.
+
+This drastically reduces Path A effort. Path A is now ~2-3 weeks of mostly Rust (loader + tensor variants + format detection in hf2q) + 3-5 days kernel work in mlx-native.
+
+## Updated iteration plan
+
+| Iter | Scope | Status |
+|---|---|---|
+| 2 | Initial research + ADR `72fdee8` | DONE |
+| 3 | Phase 1 TensorRef.data Arc refactor `437217d` | DONE |
+| 4 | Phase 2 deep-dive `b3db220` | DONE |
+| 4.5 | mlx-lm pivot: DWQ vs dynamic_quant taxonomy `35e33a5` | DONE |
+| 5 (this) | 10-researcher /cfa deep-dive | DONE — committing now |
+| 6 | Fix `materialize_cloned` deep-clone defect (researcher #6 finding); independent ~20 LOC win | NEXT |
+| 7-8 | Track 1: port `dynamic_quant.estimate_sensitivities` + `estimate_threshold` (algorithm core, hand-derived gradients) | |
+| 9 | Track 1 falsifier tests + GGUF emit verification | |
+| 10 | Track 1 e2e on Qwen3.6-27B + Gemma 4 26B-A4B; benchmark vs hf2q's existing variance-magnitude DWQ-46/48 | |
+| 11 | Track 2 Path B: subprocess wrapper around `mlx_lm.dwq`; produce MLX safetensors; validate via `mlx_lm.generate` | |
+| 12 | GO/NO-GO gate: if DWQ beats Q4_K_M by >0.05 nats, commit to Path A | |
+| 13-14 | Track 2 Path A part 1: port `dwq_quantize` algorithm core; Linear-only autograd; Adam optimizer | |
+| 15 | Track 2 Path A part 2: port `compute_dwq_targets` stream-to-disk; teacher-drop sequencing | |
+| 16 | Track 2 Path A part 3: mlx-native `quantized_matmul_mm_affine.metal` kernel | |
+| 17 | Track 2 Path A part 4: hf2q MLX-safetensors loader + tensor variants for runtime support | |
+| 18 | Track 2 e2e: hf2q produces + serves DWQ end-to-end | |
+| 19 | Tracks 3+4 (AWQ, GPTQ) — conditional on demand | |
+| 20 | Benchmark suite + ADR closure | |
+
+**Total: 14-16 weeks** of /loop iterations to land both algorithms with full runtime support. Phase 1 (commit 437217d) already shipped saves ~52 GB; iter 6 saves another ~52 GB; together they likely fit dynamic_quant-style runs on 128 GB without the rest of the stack.
 
 ## Critical taxonomy correction (2026-05-06 iter 4.5)
 
@@ -26,10 +172,43 @@ hf2q's current `DwqCalibrator` instead:
 - Uses a custom sensitivity-from-activations metric (variance-magnitude) rather than gradient-based
 - Has accreted complexity over 100+ iters with cache-priming hoists, explicit drops, etc.
 
-## What this changes
-1. The "make working DWQ quants" target stays the same — sensitivity-based mixed-bit allocation in GGUF format. Just rename internally to `dynamic-quant` so future readers understand the taxonomy.
-2. **Replace `DwqCalibrator` with `DynamicQuantCalibrator`** that ports `mlx_lm/quant/dynamic_quant.py:estimate_sensitivities` exactly. The algorithm is gradient-based (KL-div between full-precision and qdq'd model) — different metric than hf2q's current variance-magnitude, but matches the published reference and is provably memory-bounded.
-3. **Drop A+B+D** as scoped earlier — A (mmap) and B (zero-copy MlxBuffer) are still useful but **not load-bearing for fitting on 128 GB**, because mlx-lm's algorithm doesn't need the all-layer F32 expansion in the first place. Per-batch processing + `del grads` keeps peak bounded by model size + 1-batch activations.
+## What this changes (revised iteration 4.6 — dual-track)
+
+User directive (2026-05-06 22:55): **"we should support dwq and mixed precision; do both in ways that do not OOM, but cause best possible model outcome."**
+
+Two independent, complementary algorithms — port BOTH:
+
+### Track 1: Dynamic Quant (sensitivity-based mixed precision)
+Source: `/opt/mlx-lm/mlx_lm/quant/dynamic_quant.py:38-106` (`estimate_sensitivities` + `estimate_threshold`).
+- 60-line algorithm; gradient-based per-tensor sensitivity; binary-search bit threshold
+- Output: mixed-bit GGUF (4-bit base, 5/6/8-bit on sensitive tensors per target BPW)
+- Replaces hf2q's misnamed "DWQ-46/48" — same intent, mlx-lm's clean implementation
+- Memory: model + 1 batch activations + grad_accum
+
+### Track 2: DWQ proper (distillation fine-tuning)
+Source: `/opt/mlx-lm/mlx_lm/quant/dwq.py:69-209` (`dwq_quantize`).
+- 140-line algorithm; KL-div distillation; Adam optimizer fine-tunes scales+biases
+- Output: improved-quality quantized weights (TRAINED scales packed into GGUF block format)
+- New capability — hf2q didn't have this before
+- Memory: same as Track 1 + Adam state per trainable param (~2× the trainable param size)
+
+### Both tracks share infrastructure:
+- Calibration data pipeline (tokenize → batch → seed)
+- Per-batch sequential loop with `del grads` between iterations
+- qdq utility (quantize + dequantize for sensitivity OR for student model)
+- KL-div loss
+- GGUF emission with per-tensor bit/scale config
+
+### Cascade option (per mlx-lm LEARNED_QUANTS.md):
+Run dynamic_quant first → produces a mixed-bit model → then run DWQ on top → fine-tunes the trained scales for that mixed-bit allocation. **Best possible quality.** Costs more wall time but no extra peak RAM.
+
+### Phase 1 status (commit 437217d)
+TensorRef.data Arc<Vec<u8>> refactor stays — memory hygiene improvement that benefits both tracks. Don't revert.
+
+### A+B+D status
+- **A (mmap-backed loader)**: still nice-to-have for serve-path efficiency; not blocking either track since mlx-lm-style per-batch processing doesn't need full-model-in-RAM. Defer to post-tracks.
+- **B (zero-copy MlxBuffer)**: same — defer.
+- **D (serve-path reuse)**: **OBSOLETE.** mlx-lm pattern doesn't build a separate model at all; activations stream through during forward+backward, free between batches. The whole concept of "reuse serve path" was patching the wrong layer.
 
 **Driver**: User mission "/loop fully complete the research, and once research is complete, make working dwq quants (46 and 48) for the gemma4 and qwen3.6 families..."
 **Predecessors**: ADR-014 P11 closure (DwqKQuantizer + cache), `project_qwen35_dwq_pre_505b5b8_broken_2026_05_05.md`, `project_hf2q_dwq_oom_root_cause_2026_05_06.md`
