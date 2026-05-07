@@ -443,6 +443,7 @@ pub(crate) fn qwen3vl_dual_conv_patch_embed_cpu(
 /// smart-resized input. Output shape is
 /// `[(pixel_h / patch_size) * (pixel_w / patch_size), hidden]`
 /// row-major.
+#[cfg(test)]
 pub(crate) fn qwen3vl_dual_conv_patch_embed_cpu_hw(
     pixel_values: &[f32],
     weight_0: &[f32],
@@ -543,6 +544,7 @@ pub(crate) fn qwen3vl_dual_conv_patch_embed_cpu_hw(
 // 4c.3 closure: consumed by `compute_vision_embeddings_gpu_qwen3vl`
 // below for the prelude rearrange that block-orders patches before
 // the per-block forward (and for the resized-pos-embd parallel path).
+#[cfg(test)]
 pub(crate) fn qwen3vl_2x2_block_merge_reshape(
     input: &[f32],
     nx: usize,
@@ -981,6 +983,7 @@ fn qwen3vl_stage_a_gpu_to_cpu(
     Ok(s.to_vec())
 }
 
+#[cfg(test)]
 pub(crate) fn qwen3vl_resize_position_embeddings_bilinear(
     pos_embd_table: &[f32],
     num_position_embeddings: u32,
@@ -2326,6 +2329,7 @@ fn apply_qwen3vl_main_projector_gpu(
 /// - any input length != `n_image_tokens * lm_hidden`
 /// - empty input slice (must contain at least the base projector output
 ///   in slot 0)
+#[cfg(test)]
 fn qwen3vl_concat_augmented_embed_cpu(
     chunks: &[Vec<f32>],
     n_image_tokens: usize,
@@ -2815,6 +2819,13 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         n_pos_merged as u32,
     )
     .context("compute_vision_embeddings_gpu_qwen3vl: main projector")?;
+    // ADR-021 iter-4b — RAW barrier between main projector's writes
+    // to `main_out` and K5 feature_concat's reads. Without this the
+    // K5 dispatch can read `main_out` before the projector's
+    // `bert_bias_add_gpu` finishes writing, producing all-zero output
+    // for the chunk-0 slice of the augmented buffer (deterministic
+    // race on Apple Metal unified memory).
+    session.encoder_mut().memory_barrier();
 
     // -----------------------------------------------------------------
     // Stage C — GPU feature-axis concat (ADR-021 iter-4b).
