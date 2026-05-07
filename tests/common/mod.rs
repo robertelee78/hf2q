@@ -40,3 +40,4 @@
 pub mod llama_cpp_runner;
 pub mod metrics;
 pub mod mlx_lm_runner;
+pub mod serve_driver;
