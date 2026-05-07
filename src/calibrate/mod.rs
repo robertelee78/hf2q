@@ -44,6 +44,7 @@ pub mod qwen35_layer;
 pub mod qwen35_model;
 pub mod qwen35_gguf_adapter;
 pub mod calibration_batcher;
+pub mod sensitivity_comparison;
 pub mod imatrix;
 pub mod imatrix_calibrator;
 pub mod imatrix_xvalidate;
