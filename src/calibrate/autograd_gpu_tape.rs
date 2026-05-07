@@ -48,6 +48,7 @@ use mlx_native::{
         dispatch_rms_norm_compute_rms_inv,
     },
     ops::row_sum::{dispatch_row_sum_backward_f32, dispatch_row_sum_f32},
+    ops::slice_concat_2d::{dispatch_copy_2d_cols_into_f32, dispatch_slice_2d_cols_f32},
     ops::softmax::dispatch_softmax,
     ops::softmax_backward::dispatch_softmax_backward,
     ops::transpose::transpose_2d,
@@ -101,6 +102,29 @@ enum OpKind {
         input_idx: usize,
         rows: usize,
         cols: usize,
+    },
+    /// Slice a column range out of a 2D row-major tensor:
+    /// `Y[r, c] = X[r, start_col + c]`.  Forward via mlx-native's
+    /// `dispatch_slice_2d_cols_f32`.  Backward = scatter into a
+    /// zero-init `dX` of the full input shape via
+    /// `dispatch_copy_2d_cols_into_f32`.
+    Slice2dCols {
+        input_idx: usize,
+        rows: usize,
+        in_cols: usize,
+        out_cols: usize,
+        start_col: usize,
+    },
+    /// Concat two 2-D tensors along the column dim (left-to-right).
+    /// Output `[rows, lhs_cols + rhs_cols]`.  Forward = two
+    /// `copy_2d_cols_into_f32` dispatches into a zero-init dst.
+    /// Backward = two slices of the upstream gradient.
+    Concat2Cols {
+        lhs_idx: usize,
+        rhs_idx: usize,
+        rows: usize,
+        lhs_cols: usize,
+        rhs_cols: usize,
     },
     /// 2-D matrix transpose `Y[j, i] = X[i, j]`.  Input shape `[rows, cols]`,
     /// output shape `[cols, rows]`.  Backward: `dX = dY^T` (same kernel
@@ -403,8 +427,15 @@ pub fn backward(
             OpKind::Softmax { input_idx, .. }
             | OpKind::Log { input_idx }
             | OpKind::RowSum { input_idx, .. }
-            | OpKind::Transpose2d { input_idx, .. } => {
+            | OpKind::Transpose2d { input_idx, .. }
+            | OpKind::Slice2dCols { input_idx, .. } => {
                 accumulate(&mut grads, input_idx, &parent_grads[0], tape)?;
+            }
+            OpKind::Concat2Cols {
+                lhs_idx, rhs_idx, ..
+            } => {
+                accumulate(&mut grads, lhs_idx, &parent_grads[0], tape)?;
+                accumulate(&mut grads, rhs_idx, &parent_grads[1], tape)?;
             }
             OpKind::RmsNorm {
                 input_idx,
@@ -784,6 +815,113 @@ fn backward_dispatch(
 
             Ok((op, vec![dx_buf]))
         }
+        OpKind::Slice2dCols {
+            rows,
+            in_cols,
+            out_cols,
+            start_col,
+            ..
+        } => {
+            // dX[r, c] = dY[r, c - start_col] for start_col ≤ c < start_col + out_cols
+            //         = 0                       otherwise
+            // Implementation: zero-init dX of [rows, in_cols], then copy_2d_cols_into
+            // dy at start_col.
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+            let dx_buf = device
+                .alloc_buffer(rows * in_cols * 4, DType::F32, vec![rows, in_cols])
+                .map_err(|e| anyhow!("backward slice: alloc dx: {e}"))?;
+            // alloc_buffer zero-fills (per ADR-015 iter61a invariant).
+            let mut params_buf = device
+                .alloc_buffer(12, DType::F32, vec![3])
+                .map_err(|e| anyhow!("backward slice: alloc params: {e}"))?;
+            params_buf
+                .as_mut_slice::<u32>()
+                .map_err(|e| anyhow!("backward slice: params write: {e}"))?[..3]
+                .copy_from_slice(&[out_cols as u32, in_cols as u32, start_col as u32]);
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward slice: encoder: {e}"))?;
+            dispatch_copy_2d_cols_into_f32(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                out_grad,
+                &dx_buf,
+                &params_buf,
+                rows as u32,
+                out_cols as u32,
+                in_cols as u32,
+                start_col as u32,
+            )
+            .map_err(|e| anyhow!("backward slice: dispatch: {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward slice: commit_and_wait: {e}"))?;
+            Ok((op, vec![dx_buf]))
+        }
+        OpKind::Concat2Cols {
+            rows,
+            lhs_cols,
+            rhs_cols,
+            ..
+        } => {
+            // dlhs = dy[:, 0..lhs_cols], drhs = dy[:, lhs_cols..lhs_cols+rhs_cols]
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+            let total_cols = lhs_cols + rhs_cols;
+            let dlhs = device
+                .alloc_buffer(rows * lhs_cols * 4, DType::F32, vec![rows, lhs_cols])
+                .map_err(|e| anyhow!("backward concat: alloc dlhs: {e}"))?;
+            let drhs = device
+                .alloc_buffer(rows * rhs_cols * 4, DType::F32, vec![rows, rhs_cols])
+                .map_err(|e| anyhow!("backward concat: alloc drhs: {e}"))?;
+            let mut p_l = device
+                .alloc_buffer(12, DType::F32, vec![3])
+                .map_err(|e| anyhow!("backward concat: alloc p_l: {e}"))?;
+            p_l.as_mut_slice::<u32>()
+                .map_err(|e| anyhow!("backward concat: p_l write: {e}"))?[..3]
+                .copy_from_slice(&[total_cols as u32, lhs_cols as u32, 0u32]);
+            let mut p_r = device
+                .alloc_buffer(12, DType::F32, vec![3])
+                .map_err(|e| anyhow!("backward concat: alloc p_r: {e}"))?;
+            p_r.as_mut_slice::<u32>()
+                .map_err(|e| anyhow!("backward concat: p_r write: {e}"))?[..3]
+                .copy_from_slice(&[total_cols as u32, rhs_cols as u32, lhs_cols as u32]);
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward concat: encoder: {e}"))?;
+            dispatch_slice_2d_cols_f32(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                out_grad,
+                &dlhs,
+                &p_l,
+                rows as u32,
+                total_cols as u32,
+                lhs_cols as u32,
+                0u32,
+            )
+            .map_err(|e| anyhow!("backward concat: slice lhs: {e}"))?;
+            dispatch_slice_2d_cols_f32(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                out_grad,
+                &drhs,
+                &p_r,
+                rows as u32,
+                total_cols as u32,
+                rhs_cols as u32,
+                lhs_cols as u32,
+            )
+            .map_err(|e| anyhow!("backward concat: slice rhs: {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward concat: commit_and_wait: {e}"))?;
+            Ok((op, vec![dlhs, drhs]))
+        }
         OpKind::Transpose2d { rows, cols, .. } => {
             // dX = dY^T.  Same transpose_2d kernel applied to dy
             // (which has shape [cols, rows] — the forward output shape)
@@ -1071,6 +1209,180 @@ pub fn softmax(t: &GpuTensor) -> Result<GpuTensor> {
         tape: tape.clone(),
         node_idx,
         shape: vec![rows, cols],
+    })
+}
+
+/// Slice a column range out of a 2D row-major tensor.
+/// `Y[r, c] = X[r, start_col + c]` for `0 ≤ c < len`.
+/// Input shape `[rows, in_cols]`, output shape `[rows, len]`.
+pub fn slice_cols(t: &GpuTensor, start_col: usize, len: usize) -> Result<GpuTensor> {
+    if t.shape.len() != 2 {
+        return Err(anyhow!(
+            "slice_cols: input must be 2-D [rows, cols]; got shape={:?}",
+            t.shape
+        ));
+    }
+    let rows = t.shape[0];
+    let in_cols = t.shape[1];
+    if start_col + len > in_cols {
+        return Err(anyhow!(
+            "slice_cols: start_col({start_col}) + len({len}) > in_cols({in_cols})"
+        ));
+    }
+    if len == 0 {
+        return Err(anyhow!("slice_cols: len must be > 0"));
+    }
+    let tape = &t.tape;
+    let device = tape.device();
+    let in_buf = tape.with_node(t.node_idx, |n| n.value.clone());
+    let out_buf = device
+        .alloc_buffer(rows * len * 4, DType::F32, vec![rows, len])
+        .map_err(|e| anyhow!("slice_cols: alloc out: {e}"))?;
+    let mut params_buf = device
+        .alloc_buffer(12, DType::F32, vec![3])
+        .map_err(|e| anyhow!("slice_cols: alloc params: {e}"))?;
+    params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("slice_cols: params write: {e}"))?[..3]
+        .copy_from_slice(&[in_cols as u32, len as u32, start_col as u32]);
+    let mut registry = tape.0.registry.borrow_mut();
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("slice_cols: encoder: {e}"))?;
+    dispatch_slice_2d_cols_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &in_buf,
+        &out_buf,
+        &params_buf,
+        rows as u32,
+        in_cols as u32,
+        len as u32,
+        start_col as u32,
+    )
+    .map_err(|e| anyhow!("slice_cols: dispatch: {e}"))?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("slice_cols: commit_and_wait: {e}"))?;
+    drop(registry);
+    let input_idx = t.node_idx;
+    let node_idx = tape.push_node(
+        OpKind::Slice2dCols {
+            input_idx,
+            rows,
+            in_cols,
+            out_cols: len,
+            start_col,
+        },
+        out_buf,
+        vec![rows, len],
+    );
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: vec![rows, len],
+    })
+}
+
+/// Concat two 2-D tensors along the column dim (left-to-right).
+/// Input shapes `[rows, lhs_cols]` and `[rows, rhs_cols]`; output
+/// shape `[rows, lhs_cols + rhs_cols]`.  Both inputs must share the
+/// same tape and same `rows`.
+pub fn concat_cols(lhs: &GpuTensor, rhs: &GpuTensor) -> Result<GpuTensor> {
+    if !lhs.tape.ptr_eq(&rhs.tape) {
+        return Err(anyhow!("concat_cols: inputs must share the same tape"));
+    }
+    if lhs.shape.len() != 2 || rhs.shape.len() != 2 {
+        return Err(anyhow!(
+            "concat_cols: inputs must be 2-D; got lhs={:?} rhs={:?}",
+            lhs.shape,
+            rhs.shape
+        ));
+    }
+    if lhs.shape[0] != rhs.shape[0] {
+        return Err(anyhow!(
+            "concat_cols: row mismatch lhs.rows={} rhs.rows={}",
+            lhs.shape[0],
+            rhs.shape[0]
+        ));
+    }
+    let rows = lhs.shape[0];
+    let lhs_cols = lhs.shape[1];
+    let rhs_cols = rhs.shape[1];
+    let total_cols = lhs_cols + rhs_cols;
+
+    let tape = &lhs.tape;
+    let device = tape.device();
+    let lhs_buf = tape.with_node(lhs.node_idx, |n| n.value.clone());
+    let rhs_buf = tape.with_node(rhs.node_idx, |n| n.value.clone());
+    // alloc_buffer is zero-init (ADR-015 iter61a) so columns outside
+    // the two slabs stay 0.0 — required because copy_2d_cols_into
+    // writes the slab only.
+    let out_buf = device
+        .alloc_buffer(rows * total_cols * 4, DType::F32, vec![rows, total_cols])
+        .map_err(|e| anyhow!("concat_cols: alloc out: {e}"))?;
+    let mut p_l = device
+        .alloc_buffer(12, DType::F32, vec![3])
+        .map_err(|e| anyhow!("concat_cols: alloc p_l: {e}"))?;
+    p_l.as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("concat_cols: p_l write: {e}"))?[..3]
+        .copy_from_slice(&[lhs_cols as u32, total_cols as u32, 0u32]);
+    let mut p_r = device
+        .alloc_buffer(12, DType::F32, vec![3])
+        .map_err(|e| anyhow!("concat_cols: alloc p_r: {e}"))?;
+    p_r.as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("concat_cols: p_r write: {e}"))?[..3]
+        .copy_from_slice(&[rhs_cols as u32, total_cols as u32, lhs_cols as u32]);
+    let mut registry = tape.0.registry.borrow_mut();
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("concat_cols: encoder: {e}"))?;
+    dispatch_copy_2d_cols_into_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &lhs_buf,
+        &out_buf,
+        &p_l,
+        rows as u32,
+        lhs_cols as u32,
+        total_cols as u32,
+        0u32,
+    )
+    .map_err(|e| anyhow!("concat_cols: lhs dispatch: {e}"))?;
+    dispatch_copy_2d_cols_into_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &rhs_buf,
+        &out_buf,
+        &p_r,
+        rows as u32,
+        rhs_cols as u32,
+        total_cols as u32,
+        lhs_cols as u32,
+    )
+    .map_err(|e| anyhow!("concat_cols: rhs dispatch: {e}"))?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("concat_cols: commit_and_wait: {e}"))?;
+    drop(registry);
+    let node_idx = tape.push_node(
+        OpKind::Concat2Cols {
+            lhs_idx: lhs.node_idx,
+            rhs_idx: rhs.node_idx,
+            rows,
+            lhs_cols,
+            rhs_cols,
+        },
+        out_buf,
+        vec![rows, total_cols],
+    );
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: vec![rows, total_cols],
     })
 }
 
@@ -2274,6 +2586,128 @@ mod tests {
         match rms_norm(&bad_x, &w, 1e-6) {
             Err(e) => assert!(format!("{e}").contains("input must be 2-D")),
             Ok(_) => panic!("expected input-shape error"),
+        }
+    }
+
+    #[test]
+    fn gpu_tape_slice_cols_forward_backward_parity() {
+        // Slice cols [3..7] out of a [4, 12] tensor; backward dy
+        // should land in dx[3..7] with everything else zero.
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let rows = 4usize;
+        let in_cols = 12usize;
+        let start = 3usize;
+        let len = 4usize;
+        let x: Vec<f32> = (0..rows * in_cols).map(|i| (i as f32) * 0.1 - 0.5).collect();
+        let xt = GpuTensor::from_vec(&tape, &x, vec![rows, in_cols]).unwrap();
+        let yt = slice_cols(&xt, start, len).unwrap();
+        let y_vec: Vec<f32> = yt.to_vec().unwrap();
+        for r in 0..rows {
+            for c in 0..len {
+                let expected = x[r * in_cols + start + c];
+                assert_eq!(y_vec[r * len + c].to_bits(), expected.to_bits());
+            }
+        }
+
+        // Backward — dy = ones; expect dx[r, c] = 1 for c ∈ [start, start+len),
+        // dx[r, c] = 0 elsewhere.
+        let dy = ones_like(&tape, &[rows, len]).unwrap();
+        let grads = backward(&yt, dy).unwrap();
+        let dx = grads[xt.node_idx()].as_ref().unwrap();
+        let dx_vec: Vec<f32> = dx.as_slice::<f32>().unwrap().to_vec();
+        for r in 0..rows {
+            for c in 0..in_cols {
+                let expected = if c >= start && c < start + len { 1.0 } else { 0.0 };
+                assert_eq!(
+                    dx_vec[r * in_cols + c], expected,
+                    "dx mismatch at ({r}, {c})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_tape_concat_cols_forward_backward_parity() {
+        // concat([a:4×3, b:4×5]) → 4×8; backward dy = ones[4×8]
+        // → dlhs = ones[4×3], drhs = ones[4×5].
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let rows = 4usize;
+        let lhs_cols = 3usize;
+        let rhs_cols = 5usize;
+        let lhs: Vec<f32> = (0..rows * lhs_cols).map(|i| (i as f32) * 0.2).collect();
+        let rhs: Vec<f32> = (0..rows * rhs_cols)
+            .map(|i| 100.0 + (i as f32) * 0.3)
+            .collect();
+        let lt = GpuTensor::from_vec(&tape, &lhs, vec![rows, lhs_cols]).unwrap();
+        let rt = GpuTensor::from_vec(&tape, &rhs, vec![rows, rhs_cols]).unwrap();
+        let yt = concat_cols(&lt, &rt).unwrap();
+        let y_vec: Vec<f32> = yt.to_vec().unwrap();
+        let total = lhs_cols + rhs_cols;
+        for r in 0..rows {
+            for c in 0..lhs_cols {
+                assert_eq!(
+                    y_vec[r * total + c].to_bits(),
+                    lhs[r * lhs_cols + c].to_bits(),
+                    "lhs slab mismatch at ({r},{c})"
+                );
+            }
+            for c in 0..rhs_cols {
+                assert_eq!(
+                    y_vec[r * total + lhs_cols + c].to_bits(),
+                    rhs[r * rhs_cols + c].to_bits(),
+                    "rhs slab mismatch at ({r},{c})"
+                );
+            }
+        }
+
+        // Backward.
+        let dy = ones_like(&tape, &[rows, total]).unwrap();
+        let grads = backward(&yt, dy).unwrap();
+        let dlhs = grads[lt.node_idx()].as_ref().unwrap();
+        let drhs = grads[rt.node_idx()].as_ref().unwrap();
+        let dlhs_vec: Vec<f32> = dlhs.as_slice::<f32>().unwrap().to_vec();
+        let drhs_vec: Vec<f32> = drhs.as_slice::<f32>().unwrap().to_vec();
+        assert!(dlhs_vec.iter().all(|&v| v == 1.0));
+        assert!(drhs_vec.iter().all(|&v| v == 1.0));
+    }
+
+    #[test]
+    fn gpu_tape_slice_concat_round_trip_chain_identity() {
+        // Slice a tensor into 4 equal column chunks, then concat them
+        // back via a left-fold of concat_cols.  Output must equal the
+        // original tensor byte-for-byte; dx via backward must be ones.
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let rows = 5usize;
+        let cols = 16usize;
+        let chunk = 4usize;
+        let n_chunks = cols / chunk;
+        let x: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.07).collect();
+        let xt = GpuTensor::from_vec(&tape, &x, vec![rows, cols]).unwrap();
+        let mut chunks = Vec::with_capacity(n_chunks);
+        for h in 0..n_chunks {
+            chunks.push(slice_cols(&xt, h * chunk, chunk).unwrap());
+        }
+        // Left-fold: concat(concat(concat(c0, c1), c2), c3).
+        let mut acc = chunks[0].clone();
+        for c in chunks.iter().skip(1) {
+            acc = concat_cols(&acc, c).unwrap();
+        }
+        let acc_vec: Vec<f32> = acc.to_vec().unwrap();
+        for (i, (g, e)) in acc_vec.iter().zip(x.iter()).enumerate() {
+            assert_eq!(g.to_bits(), e.to_bits(), "round-trip mismatch at {i}");
+        }
+
+        let dy = ones_like(&tape, &[rows, cols]).unwrap();
+        let grads = backward(&acc, dy).unwrap();
+        let dx = grads[xt.node_idx()].as_ref().unwrap();
+        let dx_vec: Vec<f32> = dx.as_slice::<f32>().unwrap().to_vec();
+        // Each x element flows through exactly one slice → one concat
+        // path, so dx should be all 1.0.
+        for (i, v) in dx_vec.iter().enumerate() {
+            assert_eq!(*v, 1.0, "dx[{i}] = {v} != 1.0");
         }
     }
 

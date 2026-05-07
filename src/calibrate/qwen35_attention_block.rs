@@ -35,7 +35,7 @@
 use anyhow::{anyhow, Result};
 
 use crate::calibrate::autograd_gpu_tape::{
-    matmul, rms_norm, softmax, transpose, GpuTape, GpuTensor,
+    concat_cols, matmul, rms_norm, slice_cols, softmax, transpose, GpuTape, GpuTensor,
 };
 use crate::calibrate::dynamic_quant_gpu::{estimate_sensitivities, QuantizableInput};
 
@@ -298,6 +298,99 @@ pub fn estimate_attention_block_sensitivities(
         },
     ];
     estimate_sensitivities(tape, student_logits, teacher_logits, &quantizables)
+}
+
+/// Multi-head scaled-dot-product attention on the GpuTape.
+///
+/// Inputs: `q`, `k`, `v` all of shape `[batch, n_heads * head_dim]`.
+/// Output: `[batch, n_heads * head_dim]` — the per-head contexts
+/// concatenated along the column dim.
+///
+/// Per-head pipeline (matches the iter-10c single-head composition):
+/// ```text
+///   q_h = slice_cols(Q, h*head_dim, head_dim)    [batch, head_dim]
+///   k_h = slice_cols(K, h*head_dim, head_dim)
+///   v_h = slice_cols(V, h*head_dim, head_dim)
+///   k_h_t = transpose(k_h)                        [head_dim, batch]
+///   scores_h = matmul(q_h, k_h_t)                 [batch, batch]
+///   attn_h = softmax(scores_h)
+///   context_h = matmul(attn_h, v_h)               [batch, head_dim]
+/// ```
+///
+/// All `context_h` are then chained left-fold via `concat_cols` into
+/// the output `[batch, n_heads * head_dim]`.
+///
+/// The 1/√head_dim attention scale is assumed folded into the Q
+/// projection's weight upstream (matches `AttentionBlockWeights::new`).
+///
+/// Requires `head_dim ≥ 32` (mlx-native f32 dense matmul kernel
+/// constraint) and `n_heads ≥ 1`.  At `n_heads = 1`, the function
+/// is structurally equivalent to the single-head SDPA in `forward`
+/// (one slice = identity, no concat).
+pub fn multi_head_sdpa(
+    q: &GpuTensor,
+    k: &GpuTensor,
+    v: &GpuTensor,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<GpuTensor> {
+    if n_heads == 0 {
+        return Err(anyhow!("multi_head_sdpa: n_heads must be > 0"));
+    }
+    if head_dim < 32 {
+        return Err(anyhow!(
+            "multi_head_sdpa: head_dim={head_dim} but mlx-native f32 matmul requires head_dim ≥ 32"
+        ));
+    }
+    let hidden = n_heads * head_dim;
+    for (label, t) in [("q", q), ("k", k), ("v", v)] {
+        if t.shape().len() != 2 {
+            return Err(anyhow!(
+                "multi_head_sdpa: {label} must be 2-D [batch, hidden]; got shape={:?}",
+                t.shape()
+            ));
+        }
+        if t.shape()[1] != hidden {
+            return Err(anyhow!(
+                "multi_head_sdpa: {label}.cols={} != n_heads*head_dim = {n_heads}*{head_dim} = {hidden}",
+                t.shape()[1]
+            ));
+        }
+    }
+    if q.shape()[0] != k.shape()[0] || q.shape()[0] != v.shape()[0] {
+        return Err(anyhow!(
+            "multi_head_sdpa: row mismatch q={} k={} v={}",
+            q.shape()[0],
+            k.shape()[0],
+            v.shape()[0]
+        ));
+    }
+    let batch = q.shape()[0];
+    if batch < 32 {
+        // matmul backward requires m ≥ 32; and Q@K^T's first dim is `batch`.
+        return Err(anyhow!(
+            "multi_head_sdpa: batch={batch} but matmul backward requires batch ≥ 32"
+        ));
+    }
+
+    let mut contexts: Vec<GpuTensor> = Vec::with_capacity(n_heads);
+    for h in 0..n_heads {
+        let start = h * head_dim;
+        let q_h = slice_cols(q, start, head_dim)?;
+        let k_h = slice_cols(k, start, head_dim)?;
+        let v_h = slice_cols(v, start, head_dim)?;
+        let k_h_t = transpose(&k_h)?;
+        let scores_h = matmul(&q_h, &k_h_t)?;
+        let attn_h = softmax(&scores_h)?;
+        let context_h = matmul(&attn_h, &v_h)?;
+        contexts.push(context_h);
+    }
+    // Left-fold concat: concat(concat(concat(c0, c1), c2), c3) ...
+    let mut acc = contexts[0].clone();
+    for c in contexts.iter().skip(1) {
+        acc = concat_cols(&acc, c)?;
+    }
+    Ok(acc)
 }
 
 /// Streaming sensitivity estimator (ADR-020 iter-10d).
@@ -627,6 +720,186 @@ mod tests {
                 diff <= 1e-12 || diff / scale <= 1e-10,
                 "{k}: streaming={s} manual={m} diff={diff}"
             );
+        }
+    }
+
+    /// CPU oracle: multi-head SDPA without the √d scale.
+    /// Mirrors `multi_head_sdpa` exactly — same per-head loop +
+    /// concat ordering, computed on the host in fp32.
+    fn multi_head_sdpa_cpu_oracle(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        batch: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> Vec<f32> {
+        let hidden = n_heads * head_dim;
+        let mut out = vec![0f32; batch * hidden];
+        for h in 0..n_heads {
+            let start = h * head_dim;
+            // scores[b, b'] = Σ_d q[b, start+d] * k[b', start+d]
+            let mut scores = vec![0f32; batch * batch];
+            for b in 0..batch {
+                for bp in 0..batch {
+                    let mut acc = 0.0f32;
+                    for d in 0..head_dim {
+                        acc += q[b * hidden + start + d] * k[bp * hidden + start + d];
+                    }
+                    scores[b * batch + bp] = acc;
+                }
+            }
+            // softmax per row.
+            let mut attn = vec![0f32; batch * batch];
+            for b in 0..batch {
+                let row = &scores[b * batch..(b + 1) * batch];
+                let m = row.iter().fold(f32::NEG_INFINITY, |a, &x| a.max(x));
+                let mut sum = 0.0f32;
+                let mut e = vec![0f32; batch];
+                for (j, &x) in row.iter().enumerate() {
+                    e[j] = (x - m).exp();
+                    sum += e[j];
+                }
+                for j in 0..batch {
+                    attn[b * batch + j] = e[j] / sum;
+                }
+            }
+            // context[b, d] = Σ_b' attn[b, b'] * v[b', start+d]
+            for b in 0..batch {
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for bp in 0..batch {
+                        acc += attn[b * batch + bp] * v[bp * hidden + start + d];
+                    }
+                    out[b * hidden + start + d] = acc;
+                }
+            }
+        }
+        out
+    }
+
+    fn assert_close_inline(label: &str, gpu: &[f32], cpu: &[f32], rel_tol: f32, abs_tol: f32) {
+        assert_eq!(gpu.len(), cpu.len(), "{label}: length mismatch");
+        for (i, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            let diff = (g - c).abs();
+            let scale = g.abs().max(c.abs()).max(1.0);
+            assert!(
+                diff <= abs_tol || diff / scale <= rel_tol,
+                "{label}: i={i}: gpu={g} cpu={c} diff={diff}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_head_sdpa_n_heads_2_parity_with_cpu_oracle() {
+        // n_heads=2 × head_dim=32 → hidden=64; batch=32.
+        let batch = 32usize;
+        let n_heads = 2usize;
+        let head_dim = 32usize;
+        let hidden = n_heads * head_dim;
+        let q: Vec<f32> = (0..batch * hidden)
+            .map(|i| (i as f32 * 0.0091).sin() * 0.4)
+            .collect();
+        let k: Vec<f32> = (0..batch * hidden)
+            .map(|i| ((i as f32) * 0.0073 + 1.5).cos() * 0.3)
+            .collect();
+        let v: Vec<f32> = (0..batch * hidden)
+            .map(|i| ((i as f32) * 0.011 + 2.7).sin() * 0.5)
+            .collect();
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let qt = GpuTensor::from_vec(&tape, &q, vec![batch, hidden]).unwrap();
+        let kt = GpuTensor::from_vec(&tape, &k, vec![batch, hidden]).unwrap();
+        let vt = GpuTensor::from_vec(&tape, &v, vec![batch, hidden]).unwrap();
+        let context = multi_head_sdpa(&qt, &kt, &vt, n_heads, head_dim).unwrap();
+        let gpu: Vec<f32> = context.to_vec().unwrap();
+        let cpu = multi_head_sdpa_cpu_oracle(&q, &k, &v, batch, n_heads, head_dim);
+        assert_close_inline("multi-head sdpa n_heads=2", &gpu, &cpu, 1e-4, 1e-5);
+    }
+
+    #[test]
+    fn multi_head_sdpa_n_heads_1_matches_cpu_oracle() {
+        // n_heads=1 special-case: the function takes the single-slice
+        // path (slice covers full hidden) + no concat fold (only one
+        // context).  Validates the n_heads=1 base case against the
+        // CPU oracle.
+        let batch = 32usize;
+        let head_dim = 32usize;
+        let q: Vec<f32> = (0..batch * head_dim)
+            .map(|i| (i as f32 * 0.013).sin() * 0.4)
+            .collect();
+        let k: Vec<f32> = (0..batch * head_dim)
+            .map(|i| ((i as f32) * 0.011 + 1.0).cos() * 0.3)
+            .collect();
+        let v: Vec<f32> = (0..batch * head_dim)
+            .map(|i| ((i as f32) * 0.017 + 2.0).sin() * 0.5)
+            .collect();
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let qt = GpuTensor::from_vec(&tape, &q, vec![batch, head_dim]).unwrap();
+        let kt = GpuTensor::from_vec(&tape, &k, vec![batch, head_dim]).unwrap();
+        let vt = GpuTensor::from_vec(&tape, &v, vec![batch, head_dim]).unwrap();
+        let context = multi_head_sdpa(&qt, &kt, &vt, 1, head_dim).unwrap();
+        let gpu: Vec<f32> = context.to_vec().unwrap();
+        let cpu = multi_head_sdpa_cpu_oracle(&q, &k, &v, batch, 1, head_dim);
+        assert_close_inline("multi-head sdpa n_heads=1", &gpu, &cpu, 1e-4, 1e-5);
+    }
+
+    #[test]
+    fn multi_head_sdpa_backward_flows_to_qkv() {
+        // Backward through multi-head SDPA must produce gradients
+        // on q, k, v leaves with correct shapes + finite values.
+        use crate::calibrate::autograd_gpu_tape::{backward, ones_like};
+        let batch = 32usize;
+        let n_heads = 4usize;
+        let head_dim = 32usize;
+        let hidden = n_heads * head_dim;
+        let q: Vec<f32> = (0..batch * hidden).map(|i| (i as f32 * 0.0091).sin() * 0.4).collect();
+        let k: Vec<f32> = (0..batch * hidden).map(|i| (i as f32 * 0.0073).cos() * 0.3).collect();
+        let v: Vec<f32> = (0..batch * hidden).map(|i| (i as f32 * 0.011).sin() * 0.5).collect();
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let qt = GpuTensor::from_vec(&tape, &q, vec![batch, hidden]).unwrap();
+        let kt = GpuTensor::from_vec(&tape, &k, vec![batch, hidden]).unwrap();
+        let vt = GpuTensor::from_vec(&tape, &v, vec![batch, hidden]).unwrap();
+        let ctx = multi_head_sdpa(&qt, &kt, &vt, n_heads, head_dim).unwrap();
+        let dy = ones_like(&tape, &[batch, hidden]).unwrap();
+        let grads = backward(&ctx, dy).unwrap();
+        for (label, leaf) in &[("q", &qt), ("k", &kt), ("v", &vt)] {
+            let g = grads[leaf.node_idx()]
+                .as_ref()
+                .unwrap_or_else(|| panic!("{label} grad missing"));
+            assert_eq!(g.element_count(), batch * hidden);
+            let g_vec: Vec<f32> = g.as_slice::<f32>().unwrap().to_vec();
+            for (i, v) in g_vec.iter().enumerate() {
+                let val: f32 = *v;
+                assert!(val.is_finite(), "{label} grad[{i}] = {val} not finite");
+            }
+        }
+    }
+
+    #[test]
+    fn multi_head_sdpa_rejects_invalid_inputs() {
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let q = GpuTensor::from_vec(&tape, &vec![0.5; 32 * 64], vec![32, 64]).unwrap();
+        let k = q.clone();
+        let v = q.clone();
+        // n_heads=0
+        match multi_head_sdpa(&q, &k, &v, 0, 32) {
+            Err(e) => assert!(format!("{e}").contains("n_heads must be > 0")),
+            Ok(_) => panic!("expected n_heads=0 error"),
+        }
+        // head_dim < 32
+        match multi_head_sdpa(&q, &k, &v, 4, 16) {
+            Err(e) => assert!(format!("{e}").contains("head_dim ≥ 32")),
+            Ok(_) => panic!("expected head_dim<32 error"),
+        }
+        // mismatched hidden vs n_heads * head_dim
+        match multi_head_sdpa(&q, &k, &v, 3, 32) {
+            // 3 * 32 = 96 ≠ 64
+            Err(e) => assert!(format!("{e}").contains("n_heads*head_dim")),
+            Ok(_) => panic!("expected hidden mismatch error"),
         }
     }
 
