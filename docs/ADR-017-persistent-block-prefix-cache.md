@@ -501,7 +501,7 @@ Test stays default-off (`HF2Q_KV_PERSIST_TQ_E2E=1` + `HF2Q_KV_PERSIST_E2E_MODEL_
 
 ---
 
-**Phase B-tq.4 final state: GREEN (no longer GREEN-substrate).**  The harness drives the full live flow when env-gated.  Substrate (iter-1) + cmd_serve registration (iter-2) + integration test harness (iter-3) + driver extraction (B-tq.5) shipped across 4 commits this loop iteration:
+**Phase B-tq.4 final state: GREEN — live R-C1 VALIDATED.**  The harness drives the full live flow; live R-C1 byte-identity confirmed on a real Gemma 4 26B-A4B-DWQ GGUF on 2026-05-06.  Six commits across the B-tq.4 + B-tq.5 + iter-4 chain:
 
 | commit | iter | scope | LOC |
 |---|---|---|---|
@@ -509,8 +509,82 @@ Test stays default-off (`HF2Q_KV_PERSIST_TQ_E2E=1` + `HF2Q_KV_PERSIST_E2E_MODEL_
 | `b346425` | iter-2 | cmd_serve single-mode factory registration | ~80 |
 | `69b3bc2` | iter-3 | integration test harness (default-off) | ~340 |
 | `539e6f7` | B-tq.5 | shared driver extraction + iter-3 live R-C1 wire-up | ~+925 / ~-763 (net) |
+| `8e3b0f4` | val.1 | live R-C1 PASS on Gemma 4 26B-A4B-DWQ + advisory factory-grep | ~+54 / ~-15 |
+| `682d960` | iter-4 | descriptor-driven cfg + spill_arc/spiller_side cfg sync (real bug fix) | ~+211 / ~-52 |
 
-Total cumulative test count: **2866 unit (in-binary) + 19 integration (kv_persist_tq_packed_roundtrip)**.  Live R-C1 measurement on a real Gemma 4 GGUF is operator-driven; harness is fully automated when env-gated.
+Total cumulative test count: **2866 unit (in-binary) + 19 integration**.
+
+### Live validation evidence (2026-05-06)
+
+Running `kv_persist_tq_packed_b_tq_4_e2e` against
+`/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf`
+(15 GB, hf2q-built DWQ) with `HF2Q_TQ_KV=1` + `HF2Q_TQ_CODEBOOK_BITS=4`:
+
+```
+[B-tq.4 E2E] factory=TqPackedSpillFactory confirmed in stderr
+[B-tq.4 E2E] capture_a: 11 bytes (2 tokens, ttft=240.3ms)
+[B-tq.4 E2E] cache_dir post-drain: 2 entries
+[B-tq.4 E2E] capture_b: 11 bytes (2 tokens, ttft=233.6ms)
+[B-tq.4 E2E] R-C1 PASS — capture_a == capture_b BYTE-IDENTICAL
+```
+
+Long-prompt R-C1 (1127 prompt tokens, 32 output tokens):
+
+```
+[B-tq.4 perf] COLD: ttft_cold=11238.7ms
+[B-tq.4 perf] WARM: ttft_warm=11228.2ms
+[B-tq.4 perf] R-C1 PASS on long prompt — 167 bytes byte-identical
+[B-tq.4 perf] TTFT_warm / TTFT_cold = 0.9991
+```
+
+### Bugs surfaced + fixed during validation (commit `682d960`)
+
+The first live run revealed two bugs that the unit-test surface
+couldn't catch (both required a real GGUF + 30-layer model):
+
+1. **Hardcoded fallback cfg in factory**: `TqPackedSpillFactory::try_construct`
+   passed `self.cfg.clone()` (a 2-layer `[sliding, global]` fallback
+   from `cmd_serve`) to `try_from_engine_arc`.  Gemma 4 26B-A4B has
+   30 layers; the cfg's `head_dim[1]=512`/`nkv_heads[1]=2` mismatched
+   the actual layer-1 shape (sliding: 256/8) → `restore_block CodecErr`
+   on every layer ≥ 1.
+
+   **Fix**: factory downcasts `engine_dyn` to `Arc<Engine>`, reads
+   `engine.tq_packed_descriptor()` (per-layer-correct shape captured
+   at `Engine::spawn`), and builds a per-layer-correct `TqPackedConfig`.
+   Required adding `tq_packed_descriptor` field to `EngineInner` +
+   capture closure at `Engine::spawn` + `Engine::tq_packed_descriptor()`
+   accessor.
+
+2. **spiller_side cfg drift**: `try_construct` builds TWO spill
+   instances (bindable + spiller-side).  Bindable used `cfg_for_spill`
+   (descriptor-driven); spiller-side used `self.cfg.clone()` (fallback).
+   Net: snapshot wrote with correct shape, restore read with wrong
+   shape → mismatch.
+
+   **Fix**: pass `cfg_for_spill` into both spill constructors so
+   both instances share the descriptor-driven cfg.
+
+### Open follow-on (not B-tq.4 acceptance)
+
+- **Long-prompt perf**: `TTFT_warm/TTFT_cold = 0.9991` on a 1127-
+  token prompt — restore engages but brings no measurable speedup.
+  cache_dir post-drain has only 2 entries on this fixture (vs 26
+  observed on a different prompt during iter-4 debug).  Suggests
+  `/shutdown drain_loaded_models_to_disk` isn't capturing the full
+  pre-decode KV state, OR the warm path's `post_admit` restore
+  doesn't seed enough layers to skip prefill.  This is an
+  optimization concern (perf is informational; R-C1 byte-identity
+  is the load-bearing acceptance gate).
+- **8-bit codebook support**: The substrate currently snapshots
+  `kv_caches[].k_packed` which is the runtime's *4-bit* legacy
+  cache (`hd/2` packed bytes).  At `HF2Q_TQ_CODEBOOK_BITS=8` the
+  runtime additionally writes to `leg_hb_encoded` (the HB-packed
+  cache that 8-bit SDPA reads); the snapshot doesn't touch it yet.
+  Pinning the live test at 4-bit so snapshot/restore shape matches
+  what the runtime actively uses.  8-bit support is B-tq.6
+  follow-on (needs `leg_hb_encoded`-aware variants of
+  `tq_v2_snapshot_block` / `tq_v2_restore_block`).
 
 **Why earlier B-tq.3 wording was wrong.**  The iter immediately preceding this one stated B-tq.4 was "gated on ADR-007 Path C runtime correctness work clearance."  Path C closed substantively on 2026-05-05 at 10 of 11 phases (`docs/adr007-pathC/PATHC_CLOSURE.md`).  The codec-freeze contract (Path C F-7) is LANDED — that's the contract B-tq.4 codes against.  Path C F-0.2 NRMSE 0.000247 at Gemma 4 26B production shape proves codec correctness.  The remaining open Path C item is F-5 (MMLU + LongBench) — discretionary downstream-consumer-driven validation, NOT a B-tq.4 prerequisite.
 
