@@ -37,6 +37,7 @@ pub mod dwq_activation;
 pub mod dwq_calibrator;
 pub mod dynamic_quant;
 pub mod dynamic_quant_external;
+pub mod dynamic_quant_gpu;
 pub mod imatrix;
 pub mod imatrix_calibrator;
 pub mod imatrix_xvalidate;
