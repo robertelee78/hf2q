@@ -489,6 +489,31 @@ pub fn mean(t: &Tensor) -> Result<Tensor, AutogradError> {
 }
 
 // ============================================================================
+// Op: log (elementwise natural log)
+// ============================================================================
+
+/// Elementwise natural logarithm.  Caller must ensure `t` is strictly
+/// positive — `log(x ≤ 0)` produces NaN or `-inf` per IEEE 754.
+/// Backward: `dx = dy / x` (∂log(x)/∂x = 1/x).
+pub fn log(t: &Tensor) -> Result<Tensor, AutogradError> {
+    let v = t.to_vec();
+    let out: Vec<f32> = v.iter().map(|x| x.ln()).collect();
+    let v_snapshot = v.clone();
+    let parents = vec![t.node_idx];
+    let backward = Box::new(move |out_grad: &[f32], parent_grads: &mut [Vec<f32>]| {
+        for i in 0..out_grad.len() {
+            parent_grads[0][i] = out_grad[i] / v_snapshot[i];
+        }
+    });
+    let shape = t.shape();
+    let node_idx = t.tape.push_node(parents, backward, out, shape);
+    Ok(Tensor {
+        tape: t.tape.clone(),
+        node_idx,
+    })
+}
+
+// ============================================================================
 // Op: softmax — row-wise (along last dim of a 2-D tensor).
 // Numerically stable: subtract max-per-row before exp.
 // ============================================================================
@@ -977,6 +1002,47 @@ mod tests {
             1e-2,
         );
         assert_close(&g_w, &fd_w, 1e-3, 1e-2, "composed Linear+square+sum ∂L/∂W");
+    }
+
+    // ------------------------------------------------------------------
+    // log
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn log_forward_known_values() {
+        let tape = Tape::new();
+        let v = vec![1.0_f32, std::f32::consts::E, 1.0_f32 / std::f32::consts::E];
+        let x = Tensor::from_vec(&tape, v, vec![3]).unwrap();
+        let y = log(&x).unwrap();
+        let out = y.to_vec();
+        assert!(out[0].abs() < 1e-6, "log(1) ≈ 0; got {}", out[0]);
+        assert!((out[1] - 1.0).abs() < 1e-6, "log(e) ≈ 1; got {}", out[1]);
+        assert!((out[2] + 1.0).abs() < 1e-6, "log(1/e) ≈ -1; got {}", out[2]);
+    }
+
+    #[test]
+    fn log_backward_finite_diff_falsifier() {
+        // f(x) = sum(log(x));  ∂f/∂x_i = 1/x_i.
+        let tape = Tape::new();
+        let x_v = vec![1.5_f32, 2.5, 0.7, 4.0, 3.3]; // strictly positive
+        let x = Tensor::from_vec(&tape, x_v.clone(), vec![5]).unwrap();
+        let y = log(&x).unwrap();
+        let loss = sum(&y).unwrap();
+        let grads = backward(&loss).unwrap();
+        let analytical = grads[x.node_idx].clone().unwrap();
+        let expected: Vec<f32> = x_v.iter().map(|v| 1.0 / v).collect();
+        assert_close(&analytical, &expected, 1e-6, 1e-7, "log analytical ∂f/∂x = 1/x");
+
+        let fd = finite_diff_grad(
+            &x_v,
+            |p| {
+                let t = Tape::new();
+                let xx = Tensor::from_vec(&t, p.to_vec(), vec![5]).unwrap();
+                sum(&log(&xx).unwrap()).unwrap().to_vec()[0]
+            },
+            1e-3,
+        );
+        assert_close(&analytical, &fd, 1e-3, 1e-4, "log finite-diff");
     }
 
     // ------------------------------------------------------------------

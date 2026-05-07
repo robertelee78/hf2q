@@ -41,6 +41,7 @@ use mlx_native::{
     metal,
     ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params},
     ops::elementwise::{elementwise_add, elementwise_mul, scalar_mul_f32},
+    ops::log_elementwise::{dispatch_log_backward_f32, dispatch_log_f32},
     ops::softmax::dispatch_softmax,
     ops::softmax_backward::dispatch_softmax_backward,
     ops::transpose::transpose_2d,
@@ -83,6 +84,10 @@ enum OpKind {
         rows: usize,
         cols: usize,
     },
+    /// Elementwise natural log.  Backward `dx = dy / x` via mlx-native's
+    /// `dispatch_log_backward_f32`.  Caller must ensure forward input
+    /// is strictly positive.
+    Log { input_idx: usize },
 }
 
 struct GpuNode {
@@ -359,7 +364,7 @@ pub fn backward(
                 accumulate(&mut grads, lhs_idx, &parent_grads[0], tape)?;
                 accumulate(&mut grads, rhs_idx, &parent_grads[1], tape)?;
             }
-            OpKind::Softmax { input_idx, .. } => {
+            OpKind::Softmax { input_idx, .. } | OpKind::Log { input_idx } => {
                 accumulate(&mut grads, input_idx, &parent_grads[0], tape)?;
             }
         }
@@ -630,6 +635,32 @@ fn backward_dispatch(
 
             Ok((op, vec![da, db]))
         }
+        OpKind::Log { input_idx } => {
+            // dx = dy / x, where x is the FORWARD INPUT (not output).
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+            let x_buf = tape.with_node(input_idx, |n| n.value.clone());
+            let n = x_buf.byte_len() / 4;
+            let dx_buf = device
+                .alloc_buffer(n * 4, DType::F32, x_buf.shape().to_vec())
+                .map_err(|e| anyhow!("backward log: alloc dx: {e}"))?;
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward log: encoder: {e}"))?;
+            dispatch_log_backward_f32(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                &x_buf,
+                out_grad,
+                &dx_buf,
+            )
+            .map_err(|e| anyhow!("backward log: dispatch: {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward log: commit_and_wait: {e}"))?;
+            Ok((op, vec![dx_buf]))
+        }
         OpKind::Softmax { rows, cols, .. } => {
             // dx = y * (dy - sum_j(y · dy))  via mlx-native's
             // dispatch_softmax_backward kernel.  We need the FORWARD
@@ -672,6 +703,41 @@ fn backward_dispatch(
             Ok((op, vec![dx_buf]))
         }
     }
+}
+
+/// Elementwise natural log via mlx-native's `dispatch_log_f32`.
+/// Caller must ensure values are strictly positive.
+pub fn log(t: &GpuTensor) -> Result<GpuTensor> {
+    let tape = &t.tape;
+    let device = tape.device();
+    let n: usize = t.shape.iter().product();
+    let in_buf = tape.with_node(t.node_idx, |n| n.value.clone());
+    let out = device
+        .alloc_buffer(n * 4, DType::F32, t.shape.clone())
+        .map_err(|e| anyhow!("log: alloc out: {e}"))?;
+    let mut registry = tape.0.registry.borrow_mut();
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("log: encoder: {e}"))?;
+    dispatch_log_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &in_buf,
+        &out,
+    )
+    .map_err(|e| anyhow!("log: dispatch: {e}"))?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("log: commit_and_wait: {e}"))?;
+    drop(registry);
+    let input_idx = t.node_idx;
+    let node_idx = tape.push_node(OpKind::Log { input_idx }, out, t.shape.clone());
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: t.shape.clone(),
+    })
 }
 
 /// Row-wise softmax along the last dim of a 2-D tensor `[rows, cols]`.
@@ -1324,7 +1390,86 @@ mod tests {
         assert_close(ds_gpu, &ds_cpu, 1e-4, 1e-4, "matmul+mul chain dS");
     }
 
+    use crate::calibrate::autograd::log as cpu_log;
     use crate::calibrate::autograd::softmax as cpu_softmax;
+
+    /// `Y = log(X)` for strictly positive X; backward via dispatch_log_backward_f32.
+    #[test]
+    fn gpu_tape_log_forward_backward_parity() {
+        let n = 64;
+        let x: Vec<f32> = (0..n).map(|i| 0.1 + (i as f32) * 0.05).collect();
+
+        // GPU
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let xt = GpuTensor::from_vec(&tape, &x, vec![n]).unwrap();
+        let yt = log(&xt).expect("gpu log");
+        let y_gpu = yt.to_vec().unwrap();
+        let dy = ones_like(&tape, &[n]).unwrap();
+        let grads = backward(&yt, dy).unwrap();
+        let dx_gpu: &[f32] = grads[xt.node_idx()].as_ref().unwrap().as_slice().unwrap();
+
+        // Analytical: forward y = log(x), backward dx = 1/x.
+        let y_expected: Vec<f32> = x.iter().map(|v| v.ln()).collect();
+        let dx_expected: Vec<f32> = x.iter().map(|v| 1.0 / v).collect();
+        assert_close(&y_gpu, &y_expected, 1e-5, 1e-6, "log forward");
+        assert_close(dx_gpu, &dx_expected, 1e-5, 1e-6, "log backward dx = 1/x");
+
+        // Cross-check vs CPU oracle.
+        let cpu_tape = Tape::new();
+        let cx = Tensor::from_vec(&cpu_tape, x.clone(), vec![n]).unwrap();
+        let cy = cpu_log(&cx).unwrap();
+        let y_cpu = cy.to_vec();
+        assert_close(&y_gpu, &y_cpu, 1e-5, 1e-6, "log forward GPU↔CPU");
+    }
+
+    /// Composed: log_softmax(x) = log(softmax(x)).  Validates that
+    /// the autograd composition through softmax + log produces the
+    /// correct gradient (matches the analytical log_softmax backward).
+    #[test]
+    fn gpu_tape_log_softmax_via_composition_backward_parity() {
+        let rows = 4;
+        let cols = 32;
+        let x: Vec<f32> = (0..(rows * cols))
+            .map(|i| (i as f32) * 0.013 - 0.5)
+            .collect();
+        // Use a non-trivial weighted loss = sum(C · log_softmax(X)).
+        let c: Vec<f32> = (0..(rows * cols))
+            .map(|i| (i as f32) * 0.011 + 0.2)
+            .collect();
+
+        // GPU: y = log(softmax(x)); cy = c · y; backward(cy, ones) gives
+        //      dC = y, dX = log_softmax_backward(C).
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let xt = GpuTensor::from_vec(&tape, &x, vec![rows, cols]).unwrap();
+        let ct = GpuTensor::from_vec(&tape, &c, vec![rows, cols]).unwrap();
+        let sm = softmax(&xt).expect("softmax");
+        let lsm = log(&sm).expect("log");
+        let weighted = mul(&ct, &lsm).expect("mul");
+        let dy = ones_like(&tape, &[rows, cols]).unwrap();
+        let grads = backward(&weighted, dy).expect("backward");
+        let dx_gpu: &[f32] = grads[xt.node_idx()]
+            .as_ref()
+            .unwrap()
+            .as_slice()
+            .unwrap();
+
+        // CPU oracle via the same composition.
+        let cpu_tape = Tape::new();
+        let cx = Tensor::from_vec(&cpu_tape, x.clone(), vec![rows, cols]).unwrap();
+        let cc = Tensor::from_vec(&cpu_tape, c.clone(), vec![rows, cols]).unwrap();
+        let csm = cpu_softmax(&cx).unwrap();
+        let clsm = cpu_log(&csm).unwrap();
+        let cw = crate::calibrate::autograd::mul(&cc, &clsm).unwrap();
+        let cl = cpu_sum(&cw).unwrap();
+        let cgrads = cpu_backward(&cl).unwrap();
+        let dx_cpu = cgrads[cx.node_idx()].clone().unwrap();
+
+        // log(softmax) at extreme negative values can produce small
+        // numerical differences across CPU/GPU paths; use 1e-3 rel tol.
+        assert_close(dx_gpu, &dx_cpu, 1e-3, 1e-4, "log_softmax via composition");
+    }
 
     /// `Y = softmax(X)`; loss = sum(C · Y) for non-trivial C
     /// (a constant `loss = sum(softmax(X))` would have ∂L/∂X ≡ 0).
