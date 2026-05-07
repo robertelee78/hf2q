@@ -1775,22 +1775,39 @@ fn apply_qwen3vl_block_forward_gpu(
     // -----------------------------------------------------------------
     // Stage 8: FFN (qwen3vl.cpp:138-142).
     //
-    // Per /opt/llama.cpp/tools/mtmd/models/qwen3vl.cpp:140-145, the
-    // per-block FFN is a 2-layer GELU MLP — NOT a SwiGLU/GEGLU gate.
-    // The HF source `model.visual.blocks.{N}.mlp.linear_fc1/fc2` map
-    // through hf2q's converter (`src/models/vit/convert.rs:99-102`)
-    // to `v.blk.{N}.ffn_up/ffn_down` (NO `ffn_gate`). The peer's
-    // build_ffn(... gate=ff_gate, up=nullptr, down=ff_down, FFN_GELU)
-    // collapses to:
-    //   up_out   = up(ln2) + up_b
-    //   act_out  = GELU(up_out)
-    //   down_out = down(act_out) + down_b
+    // The peer at `/opt/llama.cpp/tools/mtmd/models/qwen3vl.cpp:138-142`
+    // calls `build_ffn(cur, ff_up, ff_up_b, ff_gate, ff_gate_b,
+    // ff_down, ff_down_b, FFN_GELU, il)`. `clip.cpp::build_ffn` at
+    // line 549-635 dispatches:
     //
-    // Pre-Wedge-4f the consumer ASSUMED GEGLU + asked for ffn_gate;
-    // those tensors don't exist for Qwen3-VL ViT and the request
-    // failed loud at runtime ("mmproj missing 'v.blk.0.ffn_gate.weight'").
-    // Fix: drop the gate path; do up → GELU → down. (2026-05-07.)
+    //   IF gate weight is non-null:
+    //     up_out   = (up @ cur) + up_b           // up branch
+    //     gate_out = (gate @ cur) + gate_b
+    //     act_out  = GEGLU_split(gate_out, up_out) // = GELU(gate)*up
+    //     down_out = (down @ act_out) + down_b
+    //   ELSE (gate is null, FFN_GELU op):
+    //     up_out   = (up @ cur) + up_b
+    //     act_out  = GELU(up_out)                 // plain 2-layer MLP
+    //     down_out = (down @ act_out) + down_b
+    //
+    // Different Qwen3-VL variants ship different FFN layouts:
+    //   - Qwen3-VL-2B-Instruct: HF source has `blocks.{N}.mlp.linear_fc1/fc2`
+    //     only (2 tensors), the converter maps them to
+    //     `v.blk.{N}.ffn_up/ffn_down`. NO `ffn_gate.weight` in the GGUF.
+    //     Runtime hits the ELSE branch → plain GELU.
+    //   - Larger variants ship a 3-tensor GEGLU layout with a gate
+    //     tensor.
+    //
+    // We mirror `build_ffn`'s presence-conditional dispatch so both
+    // layouts work without per-variant config branching: peek for
+    // `ffn_gate.weight`; if present, do GEGLU; if absent, do plain
+    // GELU. The synth weight builder
+    // `build_synth_qwen3vl_weights_with_deepstack` always writes a
+    // `ffn_gate` tensor, so the GEGLU branch stays exercised by the
+    // synth pin tests; real Qwen3-VL-2B exercises the plain-GELU
+    // branch via the live AC-3 fixture.
     // -----------------------------------------------------------------
+    let ffn_gate_w_opt = weights.block_tensor(block_idx, "ffn_gate.weight").ok();
     let up = vit_linear_gpu(
         encoder,
         registry,
@@ -1815,15 +1832,56 @@ fn apply_qwen3vl_block_forward_gpu(
     .context("apply_qwen3vl_block_forward_gpu: ffn_up bias")?;
     encoder.memory_barrier();
 
-    let activated = vit_qwen3vl_gelu_gpu(
-        encoder,
-        registry,
-        device,
-        &up,
-        ((n_pos as usize) * (intermediate as usize)) as u32,
-    )
-    .context("apply_qwen3vl_block_forward_gpu: gelu")?;
-    encoder.memory_barrier();
+    let activated = if let Some(ffn_gate_w) = ffn_gate_w_opt {
+        // GEGLU branch — Qwen3-VL variants with a gate tensor.
+        let gate = vit_linear_gpu(
+            encoder,
+            registry,
+            device,
+            &ln2,
+            ffn_gate_w,
+            n_pos,
+            hidden,
+            intermediate,
+        )
+        .context("apply_qwen3vl_block_forward_gpu: ffn_gate proj")?;
+        encoder.memory_barrier();
+        let gate = bert_bias_add_gpu(
+            encoder,
+            registry,
+            device,
+            &gate,
+            block_w("ffn_gate.bias")?,
+            n_pos,
+            intermediate,
+        )
+        .context("apply_qwen3vl_block_forward_gpu: ffn_gate bias")?;
+        encoder.memory_barrier();
+        let act = vit_qwen3vl_geglu_split_gpu(
+            encoder,
+            registry,
+            device,
+            &gate,
+            &up,
+            ((n_pos as usize) * (intermediate as usize)) as u32,
+        )
+        .context("apply_qwen3vl_block_forward_gpu: geglu split")?;
+        encoder.memory_barrier();
+        act
+    } else {
+        // Plain-GELU branch — Qwen3-VL-2B and any other variant whose
+        // GGUF lacks `ffn_gate.weight` (mirrors clip.cpp:594-597).
+        let act = vit_qwen3vl_gelu_gpu(
+            encoder,
+            registry,
+            device,
+            &up,
+            ((n_pos as usize) * (intermediate as usize)) as u32,
+        )
+        .context("apply_qwen3vl_block_forward_gpu: gelu")?;
+        encoder.memory_barrier();
+        act
+    };
 
     let down = vit_linear_gpu(
         encoder,
@@ -6379,34 +6437,36 @@ mod tests {
         // Pin trail (each ADR-021 port iter records its hash + a one-line
         // rationale).
         //
-        //   iter-1a 2026-05-07 — CPU-prelude path on commit 5f2ba02
+        //   iter-1a 2026-05-07 — CPU-prelude path on commit 5f2ba02.
+        //                         Stage A CPU + Stage B GPU GEGLU FFN
+        //                         (synth fixture provides ffn_gate).
         //                         fnv1a64=0xf1a71d67_3b0b5891
-        //   iter-2a 2026-05-07 — qwen3vl_dual_conv_patch_embed_gpu_to_cpu
-        //                         (K1 im2col + 2× dense_matmul + add +
-        //                         add_bias_row_2d). FP-reduction-order
-        //                         drift in middle elements; first8/last8
-        //                         byte-identical to iter-1a.
+        //   iter-2a 2026-05-07 — Stage A GPU (K1+matmul+add+bias).
+        //                         FP-reduction-order drift in middle
+        //                         elements; first8/last8 byte-identical
+        //                         to iter-1a.
         //                         fnv1a64=0x7da7f3ad_353c585b
-        //   iter-7  2026-05-07 — `apply_qwen3vl_block_forward_gpu`'s FFN
-        //                         changed from buggy 3-tensor GEGLU
-        //                         (gate+up+down → asked for nonexistent
-        //                         `ffn_gate.weight`) to the canonical
-        //                         2-layer GELU MLP per qwen3vl.cpp:140-145
-        //                         (up→GELU→down). Per-block output
-        //                         differs by O(0.001) per element (LN
-        //                         + projector amplify the drift through
-        //                         2 layers + projector). Surfaced when
-        //                         the live AC-3 multimodal run hit
-        //                         "mmproj missing 'v.blk.0.ffn_gate.weight'".
-        //                         fnv1a64=0x6ccafc79_ae15b0ee
-        const EXPECTED_FNV1A64: u64 = 0x6cca_fc79_ae15_b0ee;
+        //   iter-7  2026-05-07 — Real-Qwen3-VL-2B AC-3 surfaced that
+        //                         qwen3vl.cpp's `build_ffn` is
+        //                         tensor-presence-conditional: GEGLU
+        //                         when the gate weight exists, plain
+        //                         GELU when it doesn't. hf2q now
+        //                         mirrors that branch. Synth fixture
+        //                         provides ffn_gate so GEGLU branch
+        //                         stays exercised → pin matches iter-2a
+        //                         exactly (`0x7da7f3ad_353c585b`).
+        //                         Real Qwen3-VL-2B GGUF has no
+        //                         ffn_gate → plain-GELU branch fires
+        //                         in serve, exercised by the AC-3
+        //                         live fixture.
+        const EXPECTED_FNV1A64: u64 = 0x7da7_f3ad_353c_585b;
         const EXPECTED_FIRST8: [u32; 8] = [
-            0x3b43_22b6, 0x3b15_90bf, 0x3ba1_124c, 0x3c05_23f0,
-            0x3c0b_b68c, 0x3bbf_0687, 0x3b4f_fac7, 0x3b6f_2cac,
+            0x3b43_3e0f, 0x3b15_c486, 0x3ba1_1b92, 0x3c05_1b52,
+            0x3c0b_aa1a, 0x3bbf_01b9, 0x3b50_238e, 0x3b6f_5af2,
         ];
         const EXPECTED_LAST8: [u32; 8] = [
-            0xbb22_532e, 0x384d_1920, 0x3aa7_be39, 0x3836_ec00,
-            0xbb09_8ded, 0xbb2a_2074, 0xba36_c922, 0x3adc_9415,
+            0xbb22_572b, 0x384c_57e0, 0x3aa7_c065, 0x3837_f620,
+            0xbb09_8b6f, 0xbb2a_2262, 0xba36_da0c, 0x3adc_9039,
         ];
         assert_eq!(out.len(), EXPECTED_LEN);
         // Hash + spot-pin checks: only enforced when a real value is
