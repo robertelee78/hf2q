@@ -29,6 +29,7 @@
 pub mod apex;
 pub mod autograd;
 pub mod autograd_gpu;
+pub mod autograd_gpu_tape;
 pub mod cache;
 pub mod calibrator;
 pub mod dwq;
