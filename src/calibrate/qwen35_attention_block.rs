@@ -944,17 +944,21 @@ mod tests {
         let cfg = AttentionBlockConfig::smallest();
         let weights = deterministic_weights(&cfg, 4242);
 
-        // Sub-pass 1: Q4_0 student.  Fresh device + tape — independent
-        // of sub-pass 2.
-        let device_q4 = MlxDevice::new().expect("device q4");
-        let tape_t = GpuTape::new(device_q4);
+        // Single shared device + tape for both Q4_0 and Q8_0 sub-passes.
+        // tape.reset() between passes drops per-sub-pass node Arcs;
+        // device persists to avoid Metal residency-set contention
+        // under parallel test load (same fix pattern as iter-11b
+        // streaming test).
+        let device = MlxDevice::new().expect("device shared");
+        let tape_t = GpuTape::new(device);
         let x_vec: Vec<f32> = (0..cfg.batch * cfg.hidden)
             .map(|i| (i as f32 * 0.0091).sin() * 0.35)
             .collect();
+
+        // Sub-pass 1: Q4_0 student.
         let x_t = GpuTensor::from_vec(&tape_t, &x_vec, vec![cfg.batch, cfg.hidden]).unwrap();
         let teacher_leaves = AttentionBlockLeaves::from_weights(&tape_t, &cfg, &weights).unwrap();
         let teacher_out = forward(&cfg, &x_t, &teacher_leaves).unwrap();
-
         let student4_leaves = AttentionBlockLeaves::from_weights_qdq(
             &tape_t,
             &cfg,
@@ -971,6 +975,11 @@ mod tests {
             &weights,
         )
         .unwrap();
+        // Drop sub-pass 1 nodes (release MlxBuffer Arcs) before
+        // sub-pass 2 builds its forward graph.  Local GpuTensors
+        // (x_t, teacher_leaves, student4_leaves, teacher_out,
+        // student4_out) drop at end of this block.
+        tape_t.reset();
 
         for k in &["W_q", "W_k", "W_v", "W_o"] {
             let s = sens_q4
@@ -987,23 +996,21 @@ mod tests {
             );
         }
 
-        // Sub-pass 2: Q8_0 student.  Fresh device + tape (no leakage).
-        let device_q8 = MlxDevice::new().expect("device q8");
-        let tape_t2 = GpuTape::new(device_q8);
-        let x_t2 = GpuTensor::from_vec(&tape_t2, &x_vec, vec![cfg.batch, cfg.hidden]).unwrap();
+        // Sub-pass 2: Q8_0 student on the same tape (post-reset).
+        let x_t2 = GpuTensor::from_vec(&tape_t, &x_vec, vec![cfg.batch, cfg.hidden]).unwrap();
         let teacher_leaves2 =
-            AttentionBlockLeaves::from_weights(&tape_t2, &cfg, &weights).unwrap();
+            AttentionBlockLeaves::from_weights(&tape_t, &cfg, &weights).unwrap();
         let teacher_out2 = forward(&cfg, &x_t2, &teacher_leaves2).unwrap();
         let student8_leaves = AttentionBlockLeaves::from_weights_qdq(
-            &tape_t2,
+            &tape_t,
             &cfg,
             &weights,
-            |w| qdq_q8_0_gpu(tape_t2.device(), w),
+            |w| qdq_q8_0_gpu(tape_t.device(), w),
         )
         .unwrap();
         let student8_out = forward(&cfg, &x_t2, &student8_leaves).unwrap();
         let sens_q8 = estimate_attention_block_sensitivities(
-            &tape_t2,
+            &tape_t,
             &student8_out,
             &teacher_out2,
             &student8_leaves,
