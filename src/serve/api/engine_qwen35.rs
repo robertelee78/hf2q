@@ -864,13 +864,41 @@ pub fn generate_qwen35_once(
     // descending order = largest match first.
     let mut lcp_resume_start: usize = 0;
     if !prompt_cache_hit {
-        let base_key = build_lcp_key_for_qwen35(qwen, params);
-        let detected = crate::serve::kv_persist::lcp_registry::probe_lcp_opportunity(
-            &mut qwen.lcp_registry,
-            &base_key,
-            prompt_tokens,
-            false, // is_multimodal: text-only path
-        );
+        // Chunk-aligned observability probe (counter-fix 2026-05-06,
+        // Codex Phase-2b follow-up): qwen35 stores under chunk-keyed
+        // LcpKeys via build_lcp_key_for_qwen35_chunk(qwen, params,
+        // chunk_pos), so a BASE-key probe always returned None and
+        // hf2q_kv_lcp_detected_total never incremented even when
+        // resume engaged. probe_lcp_opportunity_chunk_aligned scans
+        // stride-aligned chunk positions descending — the same shape
+        // as the actual resume probe loop below, but side-effect-free
+        // (no restore_partial). Returns Some(K) on the largest match
+        // so detected_total now accurately reflects "resume would have
+        // engaged on this request".
+        //
+        // Precompute the BASE key BEFORE taking the &mut on the
+        // registry — the closure derives chunk-position keys by cloning
+        // base_key and overwriting tenant_id (mirrors
+        // build_lcp_key_for_qwen35_chunk's body). Avoids borrow conflict
+        // between &mut qwen.lcp_registry and immutable use of qwen
+        // inside the closure.
+        let stride_for_observe =
+            crate::debug::INVESTIGATION_ENV.kv_lcp_deltanet_checkpoint_stride;
+        let base_key_for_observe = build_lcp_key_for_qwen35(qwen, params);
+        let detected =
+            crate::serve::kv_persist::lcp_registry::probe_lcp_opportunity_chunk_aligned(
+                &mut qwen.lcp_registry,
+                prompt_tokens,
+                stride_for_observe,
+                false, // is_multimodal: text-only path
+                |chunk_pos| {
+                    let mut key = base_key_for_observe.clone();
+                    if chunk_pos > 0 {
+                        key.tenant_id = format!("qwen35:lcp_chunk:{chunk_pos}");
+                    }
+                    key
+                },
+            );
         if let Some(sink) = qwen.kv_metrics_sink.as_ref() {
             sink.record_lcp_probe(detected);
         }
@@ -2105,13 +2133,28 @@ pub fn generate_stream_qwen35_once_extended(
     // (has_extension true) and on prompt_cache hits.
     let mut lcp_resume_start: usize = 0;
     if !prompt_cache_hit && !has_extension {
-        let base_key = build_lcp_key_for_qwen35(qwen, params);
-        let detected = crate::serve::kv_persist::lcp_registry::probe_lcp_opportunity(
-            &mut qwen.lcp_registry,
-            &base_key,
-            prompt_tokens,
-            false,
-        );
+        // Streaming counterpart of the non-streaming chunk-aligned
+        // observability probe (counter-fix 2026-05-06). Same shape as
+        // generate_qwen35_once: precompute base key, then descend
+        // stride-aligned chunk positions side-effect-free so
+        // detected_total accurately reflects qwen35 resume opportunity.
+        let stride_for_observe =
+            crate::debug::INVESTIGATION_ENV.kv_lcp_deltanet_checkpoint_stride;
+        let base_key_for_observe = build_lcp_key_for_qwen35(qwen, params);
+        let detected =
+            crate::serve::kv_persist::lcp_registry::probe_lcp_opportunity_chunk_aligned(
+                &mut qwen.lcp_registry,
+                prompt_tokens,
+                stride_for_observe,
+                false,
+                |chunk_pos| {
+                    let mut key = base_key_for_observe.clone();
+                    if chunk_pos > 0 {
+                        key.tenant_id = format!("qwen35:lcp_chunk:{chunk_pos}");
+                    }
+                    key
+                },
+            );
         if let Some(sink) = qwen.kv_metrics_sink.as_ref() {
             sink.record_lcp_probe(detected);
         }

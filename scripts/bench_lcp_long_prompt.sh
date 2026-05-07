@@ -469,6 +469,131 @@ for i in $(seq 0 $((${#LCP_TTFT[@]} - 1))); do
 done
 echo ""
 
+# ── llama.cpp peer baseline (optional, gated on PEER=1) ───────────────────
+# Spirit-rule "as fast as peer" verification. Spins up llama-server on a
+# separate port, runs the same TTFT-strict measurement on a single
+# turn-2-shape canonical prompt cold + repeat, and prints a comparison
+# block. NEVER changes the hf2q acceptance gate (peer is informational).
+#
+# llama.cpp does automatic kv-cache reuse for shared prefixes via its
+# slot machinery — sending the same prompt twice → second is faster.
+# This is the apples-to-apples comparison for the iter-3 default-on
+# claim "85.41× TTFT speedup on long prompts".
+if [ "${PEER:-0}" = "1" ]; then
+    echo "[BENCH] === llama.cpp peer baseline (PEER=1) ==="
+    PEER_PORT="${PEER_PORT:-52484}"
+    LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/opt/homebrew/bin/llama-server}"
+    if [ ! -x "$LLAMA_SERVER_BIN" ]; then
+        echo "[BENCH] llama-server not found at $LLAMA_SERVER_BIN — skipping peer arm" >&2
+    else
+        echo "[BENCH] starting llama-server on port $PEER_PORT (model load ~15-30s)..."
+        $CAFFEINATE "$LLAMA_SERVER_BIN" \
+            --model "$MODEL" \
+            --host "$HOST" \
+            --port "$PEER_PORT" \
+            --ctx-size 16384 \
+            --n-gpu-layers -1 \
+            --no-mmap \
+            > "$LOG_DIR/peer.stdout" 2> "$LOG_DIR/peer.stderr" &
+        PEER_PID=$!
+        peer_cleanup() { kill "$PEER_PID" 2>/dev/null || true; wait "$PEER_PID" 2>/dev/null || true; }
+        trap "cleanup; peer_cleanup" EXIT
+        # llama-server uses /health
+        for i in $(seq 1 180); do
+            if curl -sf "http://$HOST:$PEER_PORT/health" > /dev/null 2>&1; then
+                echo "[BENCH] llama-server ready after ${i}s"
+                break
+            fi
+            sleep 1
+        done
+        if ! curl -sf "http://$HOST:$PEER_PORT/health" > /dev/null 2>&1; then
+            echo "[BENCH] llama-server failed to come up — peer arm skipped" >&2
+            kill "$PEER_PID" 2>/dev/null || true
+        else
+            # Issue same chat request to llama.cpp; first = cold, second+ = cache reuse.
+            peer_chat_ttft_ms() {
+                local body="$1"
+                HOST="$HOST" PORT="$PEER_PORT" /usr/bin/python3 -c "
+import os, time, sys, urllib.request, json
+body = sys.stdin.read()
+req = urllib.request.Request(
+    f'http://{os.environ[\"HOST\"]}:{os.environ[\"PORT\"]}/v1/chat/completions',
+    data=body.encode('utf-8'),
+    headers={'Content-Type': 'application/json'},
+    method='POST'
+)
+start = time.monotonic()
+ttft = None
+with urllib.request.urlopen(req, timeout=600) as resp:
+    for raw in resp:
+        line = raw.decode('utf-8', errors='replace').rstrip()
+        if not line.startswith('data: '):
+            continue
+        payload = line[6:]
+        if payload == '[DONE]':
+            continue
+        try:
+            j = json.loads(payload)
+            if ttft is None:
+                delta = j.get('choices', [{}])[0].get('delta', {})
+                if delta.get('content') is not None and delta.get('content') != '':
+                    ttft = time.monotonic() - start
+        except Exception:
+            pass
+total = time.monotonic() - start
+print(f'{int(ttft*1000) if ttft is not None else -1} {int(total*1000)}')
+" <<< "$body"
+            }
+            # Build a single-turn body (use canonical TURN1_USER from hf2q arm,
+            # which is the long ADR-017 head bytes loaded into LONG_PROMPT_FILE).
+            PEER_BODY=$(MODEL_ID=peer-llama \
+                CONTENT_FILE="$LONG_PROMPT_FILE" \
+                MAX_TOKENS="$MAX_TOKENS" \
+                /usr/bin/python3 -c "
+import json, os
+with open(os.environ['CONTENT_FILE'], 'r') as f:
+    content = f.read()
+print(json.dumps({
+    'model': os.environ['MODEL_ID'],
+    'messages': [{'role': 'user', 'content': content}],
+    'max_tokens': int(os.environ['MAX_TOKENS']),
+    'temperature': 0,
+    'stream': True,
+}))
+")
+            # Cold (first request — full prefill)
+            PEER_COLD=$(peer_chat_ttft_ms "$PEER_BODY")
+            PEER_COLD_TTFT=$(echo "$PEER_COLD" | awk '{print $1}')
+            PEER_COLD_TOTAL=$(echo "$PEER_COLD" | awk '{print $2}')
+            # Warm × 3 (slot-based prefix reuse should kick in)
+            PEER_WARM_TTFTS=()
+            for i in 1 2 3; do
+                R=$(peer_chat_ttft_ms "$PEER_BODY")
+                PEER_WARM_TTFTS+=("$(echo "$R" | awk '{print $1}')")
+            done
+            PEER_WARM_P50=$(median "${PEER_WARM_TTFTS[@]}")
+            if [ "$PEER_COLD_TTFT" != "-1" ] && [ "$PEER_WARM_P50" != "-1" ] && [ "$PEER_WARM_P50" -gt 0 ]; then
+                PEER_SPEEDUP=$(/usr/bin/python3 -c "print(f'{$PEER_COLD_TTFT/$PEER_WARM_P50:.2f}')")
+            else
+                PEER_SPEEDUP="N/A"
+            fi
+            echo ""
+            echo "[BENCH] === llama.cpp peer baseline ==="
+            echo "[BENCH]   peer cold TTFT:    ${PEER_COLD_TTFT} ms (total ${PEER_COLD_TOTAL} ms)"
+            echo "[BENCH]   peer warm TTFT p50: ${PEER_WARM_P50} ms (3 trials: ${PEER_WARM_TTFTS[*]})"
+            echo "[BENCH]   peer speedup:      ${PEER_SPEEDUP}× (cold/warm)"
+            echo ""
+            echo "[BENCH] === side-by-side (TTFT-strict) ==="
+            echo "[BENCH]                    │ cold (no cache)  │ warm/LCP (cache hit) │ speedup"
+            echo "[BENCH]   hf2q default-on   │ ${COLD_TTFT_P50} ms          │ ${LCP_TTFT_P50} ms             │ ${TTFT_SPEEDUP}×"
+            echo "[BENCH]   llama.cpp slot-reuse │ ${PEER_COLD_TTFT} ms          │ ${PEER_WARM_P50} ms             │ ${PEER_SPEEDUP}×"
+            echo ""
+            kill "$PEER_PID" 2>/dev/null || true
+            wait "$PEER_PID" 2>/dev/null || true
+        fi
+    fi
+fi
+
 # ── Acceptance block ──────────────────────────────────────────────────────
 # TTFT speedup hard line: ≥ 5× on long-prompt (prefill dominates at ~5K tokens;
 # decode floor is ~160 ms vs cold prefill ~9-19 s → structural ceiling ~60-120×;

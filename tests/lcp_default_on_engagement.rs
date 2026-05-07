@@ -577,11 +577,22 @@ fn default_on_engagement_no_env() {
         panic!(
             "[default_on_engagement_no_env] FAIL: STRIDE-ALIGNED HIT count={hits} < 1. \
              Default-on did not engage on turn-2. lookups={lookups}, detected={detected}. \
-             (detected_total is known-broken for qwen35 chunked workloads — BASE-key \
-             probe vs CHUNK-keyed stores; counter-fix is a follow-up.) \
              \n--- last [hf2q qwen35 lcp ...] stderr lines ---\n  {lcp_dump}"
         );
     }
+
+    // Counter-fix 2026-05-06: hf2q_kv_lcp_detected_total now uses
+    // probe_lcp_opportunity_chunk_aligned which scans stride-aligned
+    // chunk positions descending — the same shape as the resume probe
+    // but side-effect-free. detected_total accurately reflects "resume
+    // would have engaged" for qwen35 chunked workloads. Assert it.
+    assert!(
+        detected >= 1,
+        "[default_on_engagement_no_env] FAIL: hf2q_kv_lcp_detected_total={detected} < 1 \
+         despite STRIDE-ALIGNED HIT count={hits}. The chunk-aligned observability \
+         probe at engine_qwen35.rs:867 should detect the same opportunities the \
+         resume path acts on. Counter regressed since the 2026-05-06 fix?"
+    );
 
     eprintln!("[default_on_engagement_no_env] PASS: default-on LCP probe engaged ({hits} hits).");
 }

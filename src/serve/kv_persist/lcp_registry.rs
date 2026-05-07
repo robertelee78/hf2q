@@ -757,3 +757,69 @@ where
     }
     registry.lookup(key, new_tokens).map(|prefix| prefix.k)
 }
+
+/// Chunk-aligned partial-prefix observability probe — the qwen35
+/// counterpart to [`probe_lcp_opportunity`].
+///
+/// For workloads that store under chunk-position-keyed LcpKeys
+/// (qwen35 mid-prefill snapshots — see
+/// `engine_qwen35.rs::generate_qwen35_*` chunked-prefill stores at
+/// every `chunk_pos = k_end` boundary), the BASE-key probe in
+/// [`probe_lcp_opportunity`] never matches because stored keys carry
+/// chunk_pos in their `params_hash` and the BASE key uses chunk_pos=0
+/// (or unset). Result: `hf2q_kv_lcp_detected_total` was always 0 for
+/// production qwen35 chunked workloads — a known observability bug
+/// from iter-2 (caught by Codex Phase-2b 2026-05-06; counter-fix
+/// landed here).
+///
+/// This helper iterates stride-aligned chunk positions DESCENDING,
+/// builds the chunk-keyed `LcpKey` via the supplied closure, and
+/// returns `Some(K)` from the FIRST true-continuation hit (largest
+/// matched LCP wins because we descend from the largest viable
+/// chunk_pos). Returns `None` on `has_soft_tokens=true`, `stride==0`,
+/// `new_tokens.is_empty()`, or no match at any chunk position.
+///
+/// Side-effect note: this calls `registry.lookup` (which promotes
+/// matched entries to MRU). Observability promotes are correct —
+/// the entries WERE looked up, just to count them. The actual
+/// resume work happens in the caller's separate gated branch and
+/// does not duplicate this descent.
+pub fn probe_lcp_opportunity_chunk_aligned<T, F>(
+    registry: &mut LcpRegistry<T>,
+    new_tokens: &[u32],
+    stride: usize,
+    has_soft_tokens: bool,
+    mut key_for_chunk_pos: F,
+) -> Option<usize>
+where
+    T: Send + Sync + 'static + ByteSized,
+    F: FnMut(usize) -> LcpKey,
+{
+    if has_soft_tokens {
+        return None;
+    }
+    if stride == 0 || new_tokens.is_empty() {
+        return None;
+    }
+    let max_chunk_pos = (new_tokens.len() / stride).saturating_mul(stride);
+    if max_chunk_pos < stride {
+        // Prompt shorter than one stride — no chunk boundaries to scan.
+        return None;
+    }
+    let mut chunk_pos = max_chunk_pos;
+    loop {
+        let key = key_for_chunk_pos(chunk_pos);
+        if let Some(prefix) = registry.lookup(&key, new_tokens) {
+            if prefix.k == prefix.cached_prompt_len && prefix.k < new_tokens.len() {
+                return Some(prefix.k);
+            }
+            // PARTIAL HIT (k < cached_prompt_len) — divergence within
+            // the cached prompt; descend to a smaller chunk_pos.
+        }
+        if chunk_pos == stride {
+            break;
+        }
+        chunk_pos -= stride;
+    }
+    None
+}
