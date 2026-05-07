@@ -181,7 +181,8 @@ Replaces all prior iteration tables.
 | 5 | — | 10-researcher /cfa deep-dive `ede887c` | DONE |
 | 5.5 | — | ADR structural cleanup `3ce0571` | DONE |
 | 6 | — | Fix `materialize_cloned` deep-clone — Arc-share hot path `beb184f` (~52 GB save; bisect-verified falsifier) | DONE |
-| **7–8** | 1 | Port `dynamic_quant.estimate_sensitivities` + `estimate_threshold` | **NEXT** |
+| 7 | 1 | Port `estimate_threshold` + BPW accounting + `SensitivityAlgorithm` enum + `2.0.gradient-alignment` constant `<this-commit>` (16/16 falsifiers; pure-fn, no autograd) | DONE |
+| **8** | 1 | Port `estimate_sensitivities` (autograd backbone) — Linear-aware backward through transformer; per-tensor sensitivity map | **NEXT** |
 | 9 | 1 | Track 1 falsifier tests + GGUF emit verification | |
 | 10 | 1 | Track 1 e2e on Qwen3.6-27B + Gemma 4 26B-A4B; bench vs current variance-magnitude | |
 | 11 | 2-B | Subprocess wrapper around `mlx_lm.dwq`; produce MLX safetensors | |
@@ -217,7 +218,15 @@ Replaces all prior iteration tables.
 
 **Source:** `/opt/mlx-lm/mlx_lm/quant/dynamic_quant.py:38-146`.
 **Output:** GGUF with mixed Q4_K/Q5_K/Q6_K/Q8_0 (current hf2q output format — keep).
-**Subtasks:** algorithm core (`estimate_sensitivities` ~80 LOC), binary-search threshold (`estimate_threshold` ~40 LOC), predicate dispatcher (already exists at `src/quantize/{mixed,layer_mix}.rs`), cache key bump `1.0.variance-magnitude` → `2.0.gradient-alignment` (hard-fail on legacy reads), CLI `--quant dynamic-quant-4-5` + `--quant dwq-4-6` alias.
+
+**Sub-iter breakdown:**
+
+| Sub-iter | Subtask | Status |
+|---|---|---|
+| 7 | `estimate_threshold` (binary search) + `compute_bits_per_weight` MLX-affine accounting + `SensitivityAlgorithm` enum + `2.0.gradient-alignment` cache-version constant.  Lives at `src/calibrate/dynamic_quant.rs`.  Pure functions, no autograd. | **DONE** |
+| 8 | `estimate_sensitivities` algorithm core — per-tensor signed first-order Taylor: `(grad·(w_low−w_high)).sum() / (params/1e6)`.  Requires Linear-aware autograd through transformer.  Hand-derived `∂L/∂y · x^T` per Linear; no graph-based autograd. | NEXT |
+| 9 | Wire into existing `mixed.rs`/`layer_mix.rs` predicate dispatcher; CLI alias `--quant dynamic-quant-4-6` mapped to existing `Dwq46` enum (preserve `--quant dwq-4-6` for backward compat); end-to-end on synthetic 4-layer Qwen → sensitivity vector matches `mlx_lm dynamic-quant` output within 1e-3 relative. | |
+| 10 | E2E on Qwen3.6-27B + Gemma 4 26B-A4B — measure RSS, time, output GGUF coherence, perplexity vs current variance-magnitude DWQ-46/48 baseline. | |
 
 **Pass criteria:**
 
