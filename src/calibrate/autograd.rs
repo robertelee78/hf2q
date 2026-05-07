@@ -489,6 +489,77 @@ pub fn mean(t: &Tensor) -> Result<Tensor, AutogradError> {
 }
 
 // ============================================================================
+// Op: softmax — row-wise (along last dim of a 2-D tensor).
+// Numerically stable: subtract max-per-row before exp.
+// ============================================================================
+
+/// Row-wise softmax for a 2-D tensor `[rows, cols]`.  Numerically
+/// stable form: `y[b, i] = exp(x[b, i] − max_j x[b, j]) / Σ_k exp(x[b, k] − max_j x[b, j])`.
+///
+/// Backward (companion to [`Self::matmul`]'s pattern):
+///   `dx[b, i] = y[b, i] · (dy[b, i] − Σ_j y[b, j] · dy[b, j])`
+pub fn softmax(t: &Tensor) -> Result<Tensor, AutogradError> {
+    let shape = t.shape();
+    if shape.len() != 2 {
+        return Err(AutogradError::ShapeMismatch {
+            lhs: shape,
+            rhs: vec![0, 0],
+            op: "softmax (must be 2-D)",
+        });
+    }
+    let rows = shape[0];
+    let cols = shape[1];
+    let v = t.to_vec();
+    let mut out = vec![0.0_f32; rows * cols];
+    for b in 0..rows {
+        let off = b * cols;
+        // Phase 1: row max (stability).
+        let mut row_max = f32::NEG_INFINITY;
+        for i in 0..cols {
+            let x = v[off + i];
+            if x > row_max {
+                row_max = x;
+            }
+        }
+        // Phase 2: exp(x - max) + accumulate sum.
+        let mut row_sum = 0.0_f32;
+        for i in 0..cols {
+            let e = (v[off + i] - row_max).exp();
+            out[off + i] = e;
+            row_sum += e;
+        }
+        // Phase 3: normalize.
+        let inv_sum = 1.0 / row_sum;
+        for i in 0..cols {
+            out[off + i] *= inv_sum;
+        }
+    }
+
+    // Backward closure captures the forward output (y).
+    let y_snapshot = out.clone();
+    let parents = vec![t.node_idx];
+    let backward = Box::new(move |out_grad: &[f32], parent_grads: &mut [Vec<f32>]| {
+        // dx[b, i] = y[b, i] * (dy[b, i] - Σ_j y[b, j] * dy[b, j])
+        for b in 0..rows {
+            let off = b * cols;
+            let mut row_dot = 0.0_f32;
+            for i in 0..cols {
+                row_dot += y_snapshot[off + i] * out_grad[off + i];
+            }
+            for i in 0..cols {
+                parent_grads[0][off + i] =
+                    y_snapshot[off + i] * (out_grad[off + i] - row_dot);
+            }
+        }
+    });
+    let node_idx = t.tape.push_node(parents, backward, out, shape);
+    Ok(Tensor {
+        tape: t.tape.clone(),
+        node_idx,
+    })
+}
+
+// ============================================================================
 // Op: matmul — supports 2D × 2D and (B, M, K) × (K, N).
 // Sufficient for Linear forward (input @ W^T) at iter-8a.
 // ============================================================================
@@ -906,6 +977,96 @@ mod tests {
             1e-2,
         );
         assert_close(&g_w, &fd_w, 1e-3, 1e-2, "composed Linear+square+sum ∂L/∂W");
+    }
+
+    // ------------------------------------------------------------------
+    // softmax
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn softmax_forward_rows_sum_to_one() {
+        let tape = Tape::new();
+        let v: Vec<f32> = vec![1.0, 2.0, 3.0, -1.0, -2.0, -3.0];
+        let x = Tensor::from_vec(&tape, v, vec![2, 3]).unwrap();
+        let y = softmax(&x).unwrap();
+        let out = y.to_vec();
+        // Each row sums to 1.
+        let row0 = out[0] + out[1] + out[2];
+        let row1 = out[3] + out[4] + out[5];
+        assert!((row0 - 1.0).abs() < 1e-6, "row0 sum={row0}");
+        assert!((row1 - 1.0).abs() < 1e-6, "row1 sum={row1}");
+        // Each element in (0, 1].
+        for v in out.iter() {
+            assert!(*v > 0.0 && *v <= 1.0, "softmax element out of (0, 1]: {v}");
+        }
+    }
+
+    #[test]
+    fn softmax_forward_uniform_input_gives_uniform_output() {
+        let tape = Tape::new();
+        let v: Vec<f32> = vec![5.0, 5.0, 5.0, 5.0]; // 1 row × 4 cols
+        let x = Tensor::from_vec(&tape, v, vec![1, 4]).unwrap();
+        let y = softmax(&x).unwrap();
+        let out = y.to_vec();
+        for v in out.iter() {
+            assert!((v - 0.25).abs() < 1e-6, "uniform softmax should be 0.25; got {v}");
+        }
+    }
+
+    #[test]
+    fn softmax_forward_numerical_stability_large_inputs() {
+        // 1000.0 would overflow exp without max-subtract.  Numerically
+        // stable softmax must still produce finite values that sum to 1.
+        let tape = Tape::new();
+        let v: Vec<f32> = vec![1000.0, 1001.0, 1002.0];
+        let x = Tensor::from_vec(&tape, v, vec![1, 3]).unwrap();
+        let y = softmax(&x).unwrap();
+        let out = y.to_vec();
+        let sum = out.iter().sum::<f32>();
+        assert!((sum - 1.0).abs() < 1e-6, "stable softmax sum={sum}");
+        for v in out.iter() {
+            assert!(v.is_finite(), "softmax produced non-finite: {v}");
+        }
+    }
+
+    #[test]
+    fn softmax_backward_finite_diff_falsifier() {
+        // Falsifier: analytical softmax backward must match
+        // central-difference numerical gradient.  Use a small
+        // 2-row × 4-col fixture; loss = sum(softmax(x)) is constant 2
+        // (each row sums to 1) so dL/dx ≡ 0 — but that's the trivial
+        // case.  Use loss = sum(c * softmax(x)) for non-trivial c.
+        let tape = Tape::new();
+        let x_v: Vec<f32> = vec![0.5, -0.3, 0.7, -1.1, 1.2, 0.4, -0.8, 0.1];
+        let c_v: Vec<f32> = vec![1.0, 2.0, 0.5, 1.5, -0.7, 0.3, 1.1, -0.4];
+        let x = Tensor::from_vec(&tape, x_v.clone(), vec![2, 4]).unwrap();
+        let c = Tensor::from_vec(&tape, c_v.clone(), vec![2, 4]).unwrap();
+        let y = softmax(&x).unwrap();
+        let cy = mul(&c, &y).unwrap();
+        let loss = sum(&cy).unwrap();
+        let grads = backward(&loss).unwrap();
+        let analytical = grads[x.node_idx].clone().unwrap();
+
+        let fd = finite_diff_grad(
+            &x_v,
+            |p| {
+                let t = Tape::new();
+                let xx = Tensor::from_vec(&t, p.to_vec(), vec![2, 4]).unwrap();
+                let cc = Tensor::from_vec(&t, c_v.clone(), vec![2, 4]).unwrap();
+                let yy = softmax(&xx).unwrap();
+                sum(&mul(&cc, &yy).unwrap()).unwrap().to_vec()[0]
+            },
+            1e-3,
+        );
+        assert_close(&analytical, &fd, 1e-3, 1e-4, "softmax backward");
+    }
+
+    #[test]
+    fn softmax_non_2d_errors() {
+        let tape = Tape::new();
+        let x = Tensor::from_vec(&tape, vec![1.0, 2.0, 3.0], vec![3]).unwrap();
+        let r = softmax(&x);
+        assert!(r.is_err(), "non-2D softmax must error");
     }
 
     // ------------------------------------------------------------------

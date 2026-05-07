@@ -41,6 +41,8 @@ use mlx_native::{
     metal,
     ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params},
     ops::elementwise::{elementwise_add, elementwise_mul, scalar_mul_f32},
+    ops::softmax::dispatch_softmax,
+    ops::softmax_backward::dispatch_softmax_backward,
     ops::transpose::transpose_2d,
     DType, KernelRegistry, MlxBuffer, MlxDevice,
 };
@@ -74,6 +76,13 @@ enum OpKind {
     /// `lhs_idx == rhs_idx` (square via mul-self) is supported — the
     /// accumulator sums both contributions, yielding `2·A·dY`.
     ElementwiseMul { lhs_idx: usize, rhs_idx: usize },
+    /// Row-wise softmax along the last dim of a 2-D tensor `[rows, cols]`.
+    /// Backward via mlx-native's `dispatch_softmax_backward` kernel.
+    Softmax {
+        input_idx: usize,
+        rows: usize,
+        cols: usize,
+    },
 }
 
 struct GpuNode {
@@ -350,6 +359,9 @@ pub fn backward(
                 accumulate(&mut grads, lhs_idx, &parent_grads[0], tape)?;
                 accumulate(&mut grads, rhs_idx, &parent_grads[1], tape)?;
             }
+            OpKind::Softmax { input_idx, .. } => {
+                accumulate(&mut grads, input_idx, &parent_grads[0], tape)?;
+            }
         }
     }
     Ok(grads)
@@ -618,7 +630,111 @@ fn backward_dispatch(
 
             Ok((op, vec![da, db]))
         }
+        OpKind::Softmax { rows, cols, .. } => {
+            // dx = y * (dy - sum_j(y · dy))  via mlx-native's
+            // dispatch_softmax_backward kernel.  We need the FORWARD
+            // softmax output `y` saved in this node's value.
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+
+            let y_buf = tape.with_node(node_idx, |n| n.value.clone());
+            let dx_buf = device
+                .alloc_buffer(rows * cols * 4, DType::F32, vec![rows, cols])
+                .map_err(|e| anyhow!("backward softmax: alloc dx: {e}"))?;
+            // Params buffer: [cols_f, 0] as f32.
+            let mut params_buf = device
+                .alloc_buffer(8, DType::F32, vec![2])
+                .map_err(|e| anyhow!("backward softmax: alloc params: {e}"))?;
+            params_buf
+                .as_mut_slice::<f32>()
+                .map_err(|e| anyhow!("backward softmax: params write: {e}"))?
+                .copy_from_slice(&[cols as f32, 0.0]);
+
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward softmax: encoder: {e}"))?;
+            dispatch_softmax_backward(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                &y_buf,
+                out_grad,
+                &dx_buf,
+                &params_buf,
+                rows as u32,
+                cols as u32,
+            )
+            .map_err(|e| anyhow!("backward softmax: dispatch: {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward softmax: commit_and_wait: {e}"))?;
+
+            Ok((op, vec![dx_buf]))
+        }
     }
+}
+
+/// Row-wise softmax along the last dim of a 2-D tensor `[rows, cols]`.
+/// Numerically stable form via mlx-native's `dispatch_softmax`.
+pub fn softmax(t: &GpuTensor) -> Result<GpuTensor> {
+    if t.shape.len() != 2 {
+        return Err(anyhow!(
+            "softmax: input must be 2-D [rows, cols]; got shape={:?}",
+            t.shape
+        ));
+    }
+    let rows = t.shape[0];
+    let cols = t.shape[1];
+    let tape = &t.tape;
+    let device = tape.device();
+
+    let in_buf = tape.with_node(t.node_idx, |n| n.value.clone());
+    let out = device
+        .alloc_buffer(rows * cols * 4, DType::F32, vec![rows, cols])
+        .map_err(|e| anyhow!("softmax: alloc out: {e}"))?;
+    let mut params_buf = device
+        .alloc_buffer(8, DType::F32, vec![2])
+        .map_err(|e| anyhow!("softmax: alloc params: {e}"))?;
+    params_buf
+        .as_mut_slice::<f32>()
+        .map_err(|e| anyhow!("softmax: params write: {e}"))?
+        .copy_from_slice(&[cols as f32, 0.0]);
+
+    let mut registry = tape.0.registry.borrow_mut();
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("softmax: encoder: {e}"))?;
+    dispatch_softmax(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &in_buf,
+        &out,
+        &params_buf,
+        rows as u32,
+        cols as u32,
+    )
+    .map_err(|e| anyhow!("softmax: dispatch: {e}"))?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("softmax: commit_and_wait: {e}"))?;
+    drop(registry);
+
+    let input_idx = t.node_idx;
+    let node_idx = tape.push_node(
+        OpKind::Softmax {
+            input_idx,
+            rows,
+            cols,
+        },
+        out,
+        vec![rows, cols],
+    );
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: vec![rows, cols],
+    })
 }
 
 /// Elementwise `Y = A + B` via mlx-native's `elementwise_add`.
@@ -1206,6 +1322,97 @@ mod tests {
         assert_close(dx_gpu, &dx_cpu, 1e-4, 1e-4, "matmul+mul chain dX");
         assert_close(dw_gpu, &dw_cpu, 1e-4, 1e-4, "matmul+mul chain dW");
         assert_close(ds_gpu, &ds_cpu, 1e-4, 1e-4, "matmul+mul chain dS");
+    }
+
+    use crate::calibrate::autograd::softmax as cpu_softmax;
+
+    /// `Y = softmax(X)`; loss = sum(C · Y) for non-trivial C
+    /// (a constant `loss = sum(softmax(X))` would have ∂L/∂X ≡ 0).
+    #[test]
+    fn gpu_tape_softmax_forward_parity_with_cpu_oracle() {
+        let rows = 4;
+        let cols = 32;
+        let x: Vec<f32> = (0..(rows * cols))
+            .map(|i| (i as f32) * 0.013 - 0.5)
+            .collect();
+
+        // GPU
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let xt = GpuTensor::from_vec(&tape, &x, vec![rows, cols]).unwrap();
+        let yt = softmax(&xt).expect("gpu softmax");
+        let y_gpu = yt.to_vec().unwrap();
+
+        // CPU oracle
+        let cpu_tape = Tape::new();
+        let cx = Tensor::from_vec(&cpu_tape, x.clone(), vec![rows, cols]).unwrap();
+        let cy = cpu_softmax(&cx).unwrap();
+        let y_cpu = cy.to_vec();
+
+        assert_close(&y_gpu, &y_cpu, 1e-5, 1e-6, "softmax forward");
+
+        // Sanity: rows of y_gpu sum to 1.
+        for b in 0..rows {
+            let s: f32 = y_gpu[b * cols..(b + 1) * cols].iter().sum();
+            assert!((s - 1.0).abs() < 1e-5, "row {b} sum={s}");
+        }
+    }
+
+    #[test]
+    fn gpu_tape_softmax_backward_parity_with_cpu_oracle() {
+        // Use a non-trivial weighted loss = sum(C · softmax(X)) so dL/dX ≠ 0.
+        let rows = 4;
+        let cols = 32;
+        let x: Vec<f32> = (0..(rows * cols))
+            .map(|i| (i as f32) * 0.011 - 0.7)
+            .collect();
+        let c: Vec<f32> = (0..(rows * cols))
+            .map(|i| (i as f32) * 0.017 + 0.3)
+            .collect();
+
+        // GPU: y = softmax(x); cy = c * y; dY = c (since loss = sum(c·y) ⇒ ∂loss/∂y = c).
+        // Equivalently we can invoke backward(yt, dy=c).
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let xt = GpuTensor::from_vec(&tape, &x, vec![rows, cols]).unwrap();
+        let yt = softmax(&xt).expect("gpu softmax");
+        // Construct dY = C as a leaf MlxBuffer.
+        let mut dy_buf = tape
+            .device()
+            .alloc_buffer(rows * cols * 4, DType::F32, vec![rows, cols])
+            .unwrap();
+        dy_buf
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&c);
+        let grads = backward(&yt, dy_buf).expect("gpu backward");
+        let dx_gpu: &[f32] = grads[xt.node_idx()]
+            .as_ref()
+            .unwrap()
+            .as_slice()
+            .unwrap();
+
+        // CPU oracle: same path via tape with mul(c, softmax(x)) then sum.
+        let cpu_tape = Tape::new();
+        let cx = Tensor::from_vec(&cpu_tape, x.clone(), vec![rows, cols]).unwrap();
+        let cc = Tensor::from_vec(&cpu_tape, c.clone(), vec![rows, cols]).unwrap();
+        let cy = cpu_softmax(&cx).unwrap();
+        let cl = cpu_sum(&crate::calibrate::autograd::mul(&cc, &cy).unwrap()).unwrap();
+        let cgrads = cpu_backward(&cl).unwrap();
+        let dx_cpu = cgrads[cx.node_idx()].clone().unwrap();
+
+        assert_close(dx_gpu, &dx_cpu, 1e-4, 1e-5, "softmax backward");
+    }
+
+    #[test]
+    fn gpu_tape_softmax_non_2d_errors() {
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let x = GpuTensor::from_vec(&tape, &[1.0; 32], vec![32]).unwrap();
+        match softmax(&x) {
+            Err(e) => assert!(format!("{e}").contains("must be 2-D")),
+            Ok(_) => panic!("non-2D softmax must error"),
+        }
     }
 
     #[test]
