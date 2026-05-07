@@ -704,6 +704,7 @@ pub(crate) fn make_synthetic_kv_engine_for_test(
             registration: None,
             token_bytes: std::sync::OnceLock::new(),
             kv_spill_descriptor: Some(descriptor_for_engine),
+            tq_packed_descriptor: None,
         }),
     }
 }
@@ -739,6 +740,7 @@ pub(crate) fn make_synthetic_engine_for_test(arch: LoadedArch) -> Engine {
             registration: None,
             token_bytes: std::sync::OnceLock::new(),
             kv_spill_descriptor: None,
+            tq_packed_descriptor: None,
         }),
     }
 }
@@ -805,6 +807,19 @@ struct EngineInner {
     /// real (non-stub) hook from the live shape without round-tripping
     /// through the worker channel.
     kv_spill_descriptor: Option<super::kv_spill_descriptor::KvSpillDescriptor>,
+
+    /// **ADR-017 §B-tq.4 iter-4** — per-layer TQ-packed runtime
+    /// shape captured at engine spawn (mirrors `kv_spill_descriptor`
+    /// for the dense path).  Populated when `HF2Q_TQ_KV=1` AND the
+    /// loaded model is Gemma 4.  `None` otherwise.
+    ///
+    /// The factory's `try_construct` reads this to build a per-
+    /// layer-correct `TqPackedConfig` instead of the
+    /// `cmd_serve` fallback (which was a 2-layer
+    /// [sliding, global] cfg that mis-shapes Gemma 4's actual
+    /// layer pattern and caused `restore_block CodecErr` bails on
+    /// `layer >= 1`).
+    tq_packed_descriptor: Option<super::tq_packed_descriptor::TqPackedSpillDescriptor>,
 }
 
 #[cfg(test)]
@@ -2018,6 +2033,8 @@ impl GemmaLoadedModel {
             prompt_cache: PromptCache::new(),
             // ADR-017 Phase E.a — LCP registry. Capacity = 1 for v1.
             //
+            // ADR-017 Phase E.a default-on — byte-budget LcpRegistry.
+            //
             // Pre-iter-3 the payload was marker `()` (~0 bytes); iter-2
             // chose 16 entries for /cfa fan-out + last-16-turn
             // visibility at that cost. Iter-3 swapped the payload to
@@ -2026,21 +2043,22 @@ impl GemmaLoadedModel {
             // F32). Capacity 16 with that payload would budget ~77 GB
             // for LCP cache alone, OOM-class on a 128-GB M5 Max.
             //
-            // Single-slot is the smallest defensible cache and covers
-            // the load-bearing v1 use case: multi-turn chat hits
-            // sequentially (turn N evicts turn N-1's entry; turn N+1
-            // gets turn N's). /cfa Phase 2 fan-out only worker 1
-            // benefits; workers 2-N either fall back to fresh prefill
-            // OR hit the upstream PromptCache full-equality replay
-            // (Phase E option b, shipped at `d17163b`). Both are
-            // acceptable v1 semantics.
+            // This iter replaces entry-count cap with byte-budget
+            // eviction. The budget is computed from `sysinfo`
+            // `available_memory() × 5%` clamped to `[1 GiB, 16 GiB]`,
+            // giving ≈5 GB on a fresh 128 GB Mac (≈1 Gemma-26B entry at
+            // F32 per the ~4.8 GB estimate). Operators who want more
+            // entries raise the budget via `HF2Q_KV_LCP_RESUME_CAPACITY`
+            // (byte-suffix form: e.g. `10g` = 10 GiB; legacy entry-count
+            // form `8` still accepted with a deprecation warning).
             //
-            // Future iter wires `HF2Q_KV_LCP_CAPACITY` env (default 1,
-            // operators raise as memory permits) AND `HF2Q_KV_LCP_BUDGET_BYTES`
-            // for byte-bounded eviction. Out-of-scope for iter-3 v1
-            // closure — single-slot v1 ships first; Codex audit gates
-            // promotion.
-            lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
+            // `HF2Q_KV_LCP_RESUME_CAPACITY` env override is honoured:
+            // bare integers < 4096 = legacy entry-count × 300 MB;
+            // bare integers ≥ 4096 = raw byte count; suffix b/k/m/g =
+            // bytes with multiplier.
+            lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry::with_byte_budget(
+                crate::serve::kv_persist::lcp_registry::default_lcp_byte_budget()
+            ),
             // ADR-017 Phase E.a iter-2: metrics sink wired by
             // `serve::load_engine` AFTER this constructor returns
             // (before `Engine::spawn` moves the loaded model). `None`
@@ -2230,6 +2248,46 @@ impl Engine {
                 // shape against the dense Qwen3-VL KV cache).
                 LoadedModel::Qwen3VlText(_) => None,
             };
+
+        // **ADR-017 §B-tq.4 iter-4** — capture the per-layer TQ-active
+        // shape descriptor when `HF2Q_TQ_KV=1` AND the loaded model
+        // exposes per-layer `kv_caches[i].k_packed`.  Used by
+        // `TqPackedSpillFactory::try_construct` to build a per-layer-
+        // correct cfg instead of the cmd_serve fallback.
+        let tq_packed_descriptor: Option<super::tq_packed_descriptor::TqPackedSpillDescriptor> =
+            if super::tq_packed_descriptor::is_tq_active_mode() {
+                match &loaded {
+                    LoadedModel::Gemma(g) => {
+                        let provenance_for_tq = match &g.provenance {
+                            crate::serve::provenance::Provenance::Hf2q {
+                                producer_version,
+                                source_sha256,
+                                ..
+                            } => super::kv_spill_descriptor::KvSpillProvenance {
+                                producer_version: producer_version.clone(),
+                                source_sha256: source_sha256.clone(),
+                                tokenizer_chat_template_hash:
+                                    super::kv_spill_descriptor::KvSpillProvenance::hash_chat_template(
+                                        &g.chat_template,
+                                    ),
+                            },
+                            crate::serve::provenance::Provenance::External => {
+                                super::kv_spill_descriptor::KvSpillProvenance::default()
+                            }
+                        };
+                        super::tq_packed_descriptor::TqPackedSpillDescriptor::from_gemma_loaded_model_tq(
+                            &g.weights,
+                            provenance_for_tq,
+                        )
+                    }
+                    // TQ-active KV-persist is Gemma-4-only at this iter
+                    // (per family-scoping discipline established by B-dense.1).
+                    LoadedModel::Qwen35(_) | LoadedModel::Qwen3VlText(_) => None,
+                }
+            } else {
+                None
+            };
+
         let kv_spill_active = kv_spill_descriptor.is_some();
         let gguf = mlx_native::gguf::GgufFile::open(loaded.model_path())
             .expect("re-open loaded GGUF for Engine load-info snapshot");
@@ -2279,6 +2337,7 @@ impl Engine {
                 registration,
                 token_bytes: std::sync::OnceLock::new(),
                 kv_spill_descriptor,
+                tq_packed_descriptor,
             }),
         }
     }
@@ -2384,6 +2443,17 @@ impl Engine {
         &self,
     ) -> Option<&super::kv_spill_descriptor::KvSpillDescriptor> {
         self.inner.kv_spill_descriptor.as_ref()
+    }
+
+    /// **ADR-017 §B-tq.4 iter-4** — accessor for the per-layer
+    /// TQ-packed runtime shape.  `None` unless `HF2Q_TQ_KV=1` AND
+    /// loaded model is Gemma 4.  Read by
+    /// `TqPackedSpillFactory::try_construct` to build a per-layer-
+    /// correct cfg.
+    pub fn tq_packed_descriptor(
+        &self,
+    ) -> Option<&super::tq_packed_descriptor::TqPackedSpillDescriptor> {
+        self.inner.tq_packed_descriptor.as_ref()
     }
 
     /// Phase B-dense.2 follow-up: synchronously read a layer's
@@ -3873,28 +3943,68 @@ fn warmup_once(loaded: &mut GemmaLoadedModel) -> Result<()> {
     Ok(())
 }
 
-/// ADR-017 Phase E option (a) iter-3 + Codex Phase-2b audit (re-audit
-/// LOW issue #2) — module-level warn-once helper for the
-/// `HF2Q_KV_LCP_RESUME=1 + HF2Q_USE_DENSE=0` misconfiguration.
+/// ADR-017 Phase E.a default-on + Codex Phase-2b audit (re-audit LOW issue
+/// #2) — module-level auto-disable + warn-once helper for the
+/// `kv_lcp_resume=true + HF2Q_USE_DENSE=0` configuration.
+///
+/// Under default-on, this fires on every default-config engine that does
+/// NOT also have `HF2Q_USE_DENSE=1`. The auto-disable preserves backward
+/// compatibility: existing operators on `HF2Q_USE_DENSE=0` do not pay
+/// correctness or performance surprises from the default flip.
 ///
 /// Both the non-streaming (`generate_once_with_soft_tokens`) and the
-/// streaming (`generate_stream_once`) probe sites call this helper
-/// when they detect the misconfig. The internal `std::sync::Once`
-/// guarantees ONE log line per process across both call sites — so a
-/// pure-streaming deployment gets the warning on its first request,
-/// even though the non-streaming code path never fires.
+/// streaming (`generate_stream_once`) probe sites call this helper.
+/// The internal `std::sync::Once` guarantees exactly ONE log line per
+/// process across both call sites.
+///
+/// **Effective LCP behavior** (computed at each call site, not here):
+/// - `use_dense=true` → LCP enabled regardless.
+/// - `use_dense=false && HF2Q_KV_LCP_RESUME` was explicitly `"1"` →
+///   operator opt-in; LCP remains enabled and we log a different warning
+///   (the existing "misconfiguration" text).
+/// - `use_dense=false && default-on (env not explicitly "1")` →
+///   auto-disable; this function fires once.
 fn warn_lcp_resume_without_dense() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        tracing::warn!(
-            "HF2Q_KV_LCP_RESUME=1 set but HF2Q_USE_DENSE=0 — iter-3 \
-             partial-prefill resume requires dense SDPA (TQ-packed \
-             kv_caches not safely resumable without a separate \
-             restoration path; Phase E.a v2 scope). LCP probe stays \
-             observation-only. To activate iter-3 resume, set BOTH \
-             HF2Q_KV_LCP_RESUME=1 AND HF2Q_USE_DENSE=1."
+        eprintln!(
+            "[hf2q lcp] LCP partial-prefill resume is default-ON but \
+             HF2Q_USE_DENSE=0; auto-disabling LCP for this process. \
+             Set HF2Q_USE_DENSE=1 to re-enable, or \
+             HF2Q_KV_LCP_RESUME=0 to silence."
         );
     });
+}
+
+/// Compute the *effective* `kv_lcp_resume` flag at a request gate site,
+/// applying the Q3 auto-disable rule:
+///
+/// - If `parsed` is false → disabled (env was explicitly `=0`/`=off`/etc.).
+/// - If `use_dense` is true → enabled (dense SDPA required for LCP).
+/// - If `use_dense` is false AND `HF2Q_KV_LCP_RESUME` was explicitly `"1"`
+///   → operator override: remain enabled (warn once via a different path).
+/// - If `use_dense` is false AND default-on (env not explicitly `"1"`) →
+///   auto-disable and emit the warn-once via `warn_lcp_resume_without_dense`.
+///
+/// Returns the effective bool.
+pub(crate) fn effective_kv_lcp_resume(parsed: bool, use_dense: bool) -> bool {
+    if !parsed {
+        return false;
+    }
+    if use_dense {
+        return true;
+    }
+    // use_dense is false. Check if user explicitly set the var to "1".
+    let explicitly_one =
+        crate::debug::investigation_env::is_kv_lcp_resume_explicitly_one();
+    if explicitly_one {
+        // Operator intentionally set HF2Q_KV_LCP_RESUME=1 even on dense=0.
+        // Honour their intent; the existing misconfig warning covers this.
+        return true;
+    }
+    // Default-on + dense=0 → auto-disable with a single warn-once.
+    warn_lcp_resume_without_dense();
+    false
 }
 
 /// ADR-017 Phase E option (a) iter-2 — build the per-request `LcpKey`
@@ -4049,12 +4159,15 @@ fn generate_once_with_soft_tokens(
         match detected {
             None => None,
             Some(_k_obs) => {
-                // Iter-3 env-gates: both must be ON, else stay
-                // observation-only (iter-2 behavior).
-                if !crate::debug::INVESTIGATION_ENV.kv_lcp_resume {
-                    None
-                } else if !crate::debug::INVESTIGATION_ENV.use_dense {
-                    warn_lcp_resume_without_dense();
+                // Q3 auto-disable: compute effective LCP flag. Under default-on
+                // with HF2Q_USE_DENSE=0, effective_kv_lcp_resume emits a
+                // warn-once and returns false. Explicit HF2Q_KV_LCP_RESUME=1
+                // overrides the auto-disable.
+                let lcp_enabled = effective_kv_lcp_resume(
+                    crate::debug::INVESTIGATION_ENV.kv_lcp_resume,
+                    crate::debug::INVESTIGATION_ENV.use_dense,
+                );
+                if !lcp_enabled {
                     None
                 } else {
                     // Capacity check is a re-probe: take_prefix returns
@@ -6369,17 +6482,14 @@ fn generate_stream_once(
         match detected {
             None => None,
             Some(_k_obs) => {
-                if !crate::debug::INVESTIGATION_ENV.kv_lcp_resume {
-                    None
-                } else if !crate::debug::INVESTIGATION_ENV.use_dense {
-                    // Codex audit LOW issue #2 (re-audit): streaming
-                    // path mirrors the non-streaming warn-once via the
-                    // shared module-level helper. The
-                    // std::sync::Once ensures only one log line per
-                    // process, regardless of which probe site
-                    // (streaming or non-streaming) hits the
-                    // misconfiguration first.
-                    warn_lcp_resume_without_dense();
+                // Q3 auto-disable: mirrors the non-streaming gate. The shared
+                // std::sync::Once inside warn_lcp_resume_without_dense ensures
+                // exactly one log line per process across both probe sites.
+                let lcp_enabled = effective_kv_lcp_resume(
+                    crate::debug::INVESTIGATION_ENV.kv_lcp_resume,
+                    crate::debug::INVESTIGATION_ENV.use_dense,
+                );
+                if !lcp_enabled {
                     None
                 } else {
                     let prefix_opt = loaded.lcp_registry.take_prefix(&lcp_key, prompt_tokens);
@@ -7252,13 +7362,21 @@ fn generate_stream_once(
                 // iter-3.5d headroom (mirrors non-streaming site).
                 let linear_capacity =
                     sliding_window.max(prompt_tokens.len() + params.max_tokens.max(1));
-                let _ = loaded.lcp_registry.store(
+                // Codex Phase-2b 2026-05-06: surface store errors instead
+                // of `let _ = ...` so EntryExceedsBudget / EmptyPrompt /
+                // EmptyPayload aren't swallowed silently. Mantra: no fallback.
+                if let Err(e) = loaded.lcp_registry.store(
                     lcp_key,
                     prompt_tokens.to_vec(),
                     snapshot,
                     sliding_window,
                     linear_capacity,
-                );
+                ) {
+                    tracing::warn!(
+                        error = ?e,
+                        "gemma streaming lcp_registry store failed"
+                    );
+                }
             } else {
                 tracing::debug!(
                     "lcp_registry.store skipped (streaming): prefill-wrap \
@@ -7998,6 +8116,7 @@ assistant:
                 registration: None,
                 token_bytes: std::sync::OnceLock::new(),
                 kv_spill_descriptor: None,
+            tq_packed_descriptor: None,
             }),
         }
     }
@@ -9198,6 +9317,7 @@ assistant:
                 registration: None,
                 token_bytes: std::sync::OnceLock::new(),
                 kv_spill_descriptor: descriptor,
+                tq_packed_descriptor: None,
             }),
         }
     }

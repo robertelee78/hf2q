@@ -1452,9 +1452,42 @@ impl crate::serve::kv_persist::registry::FamilyHookFactory for TqPackedSpillFact
         Arc<std::sync::Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>>,
         Arc<dyn crate::serve::kv_persist::EngineBindable>,
     )> {
-        // 1. Try to materialize a fully-wired spill from the engine.
-        //    None on type mismatch ⇒ no substitution.
-        let spill = TqPackedSpill::try_from_engine_arc(self.cfg.clone(), engine_dyn)?;
+        // **ADR-017 §B-tq.4 iter-4** — prefer the live engine
+        // descriptor over the `cmd_serve` fallback `cfg`.  The
+        // fallback was a 2-layer `[sliding, global]` shape that
+        // mis-shapes Gemma 4's actual layer pattern (most layers
+        // sliding, every Nth global) — caused
+        // `restore_block CodecErr` bails on `layer >= 1`.
+        //
+        // Downcast `engine_dyn` to `Arc<Engine>` to read the
+        // descriptor, then fall back to `self.cfg` if the descriptor
+        // isn't populated (HF2Q_TQ_KV=0 path or non-Gemma).
+        let cfg_for_spill: TqPackedConfig = match engine_dyn
+            .clone()
+            .downcast::<crate::serve::api::engine::Engine>()
+        {
+            Ok(engine_arc) => {
+                let descriptor = engine_arc.tq_packed_descriptor().cloned();
+                drop(engine_arc); // release strong-count
+                match descriptor {
+                    Some(d) => TqPackedConfig {
+                        num_layers: d.num_layers,
+                        nkv_heads: d.nkv_heads,
+                        head_dim: d.head_dim,
+                        bits_per_coord: d.bits_per_coord,
+                        scale: d.scale,
+                        flags: d.flags,
+                        block_tokens: d.block_tokens,
+                    },
+                    None => self.cfg.clone(),
+                }
+            }
+            Err(_) => self.cfg.clone(),
+        };
+
+        // 1. Try to materialize a fully-wired spill from the engine
+        //    using the per-layer-correct cfg.
+        let spill = TqPackedSpill::try_from_engine_arc(cfg_for_spill.clone(), engine_dyn)?;
 
         // 2. Wrap in the dual-end tuple.  Both ends point at the
         //    SAME spill instance (Arc), so binding/unbinding through
@@ -1483,8 +1516,14 @@ impl crate::serve::kv_persist::registry::FamilyHookFactory for TqPackedSpillFact
             .read()
             .ok()
             .and_then(|g| g.as_ref().cloned())?;
+        // **B-tq.4 iter-4 fix**: spiller_side MUST use the same
+        // descriptor-driven cfg as spill_arc.  Earlier code passed
+        // `self.cfg.clone()` (the cmd_serve fallback) which mismatched
+        // the bindable's cfg and caused `restore_block CodecErr` on
+        // every layer >= 1 (because fallback cfg = [sliding, global]
+        // pattern that doesn't match Gemma 4's actual layer mix).
         let spiller_side =
-            TqPackedSpill::new_with_engine(self.cfg.clone(), spiller_engine).ok()?;
+            TqPackedSpill::new_with_engine(cfg_for_spill, spiller_engine).ok()?;
         let kv_hook: Arc<
             std::sync::Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>,
         > = Arc::new(std::sync::Mutex::new(spiller_side));
