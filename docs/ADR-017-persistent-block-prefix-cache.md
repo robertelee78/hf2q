@@ -636,7 +636,12 @@ Total: ~680 production + ~200 test ≈ 880 LOC.  The work is template-following 
 - [ ] **Corruption:** synthetic mid-write corruption injection (truncate file, flip bit in middle, swap header version, delete intermediate block in chain) — restore must reject and fall through to fresh prefill (no silent wrong-output). R-C6 mechanical verification.
 - [x] **Per-family ship-gate read:** every in-scope family's parity gate documented GREEN at `docs/ADR-017-per-family-status.md` with measurement evidence and date. *(Landed iter-1 W3 2026-05-04, 153 LOC. Per-family doc reflects honest state: Gemma 4 GREEN through R-P4; R-P5 OPEN per iter-1 finding; R-P6/stress pending iter-2.)*
 - [x] **Operator documentation:** `docs/operating-kv-cache.md` lands with runbook (R-O1).
-- [x] ADR-017 status flips Accepted → **Closed-Shipped** with the date and cumulative LOC; cross-link from ADR-005 Phase 4 closure section updated; `cmd_serve --kv-persist` becomes default ON. *(Status flipped to **Closed-Shipped** at top-of-doc 2026-05-04 via Phase E PromptCache replay (R-P5 44,500× / R-P6 1.00× measured); Phase E.a B.5 hybrid LCP closure 2026-05-05; Phase B-tq.1 envelope substrate 2026-05-05.  `cmd_serve --kv-persist` is not yet default-on — operator opt-in via env per R-F1 stays the rollout posture; default-on flip is post-24h-soak operator action.)*
+- [x] ADR-017 status flips Accepted → **Closed-Shipped** with the date and cumulative LOC; cross-link from ADR-005 Phase 4 closure section updated; `cmd_serve --kv-persist` becomes default ON. *(Status flipped to **Closed-Shipped** at top-of-doc 2026-05-04 via Phase E PromptCache replay (R-P5 44,500× / R-P6 1.00× measured); Phase E.a B.5 hybrid LCP closure 2026-05-05; Phase B-tq.1 envelope substrate 2026-05-05.
+
+  **Two distinct operator gates here, do not conflate**:
+
+  * **`cmd_serve --kv-persist=PATH`** (R-F1, cross-process disk spill/restore + cross-process PromptCache replay) — operator opt-in stays the rollout posture; default-on flip is post-24h-soak operator action.
+  * **`HF2Q_KV_LCP_RESUME=1`** (in-process partial-prefill LCP resume, Phase E.a) — **flipped default-ON at commit `d581331` 2026-05-06** via the dual-/cfa default-on session (Codex Phase-2b APPROVED).  Operator opt-out via `HF2Q_KV_LCP_RESUME=0`.)*
 
 ---
 
@@ -4135,14 +4140,28 @@ session work:
     on Qwen 3.6 35B-A3B-APEX-Q5_K_M for both streaming and non-
     streaming, with both stride-aligned hit and partial-LCP fall-
     through correctness preserved.
-  * Default-off rollout (`HF2Q_KV_LCP_RESUME=0` by default) keeps
-    production safe; operators opt-in via env when ready to soak.
+  * **Default-on flip** (commit `d581331` 2026-05-06) —
+    `HF2Q_KV_LCP_RESUME=1` is the default; opt-out via
+    `HF2Q_KV_LCP_RESUME=0`.  Landed via the dual-/cfa default-on
+    session (Codex Phase-2b APPROVED).
 
-### Production speedup measured (`scripts/bench_lcp_resume_speedup.sh`)
+### Production speedup measured (pre-default-on, superseded by perf-loop iter-3)
 
-10-trial bench on Qwen 3.6 35B-A3B-APEX-Q5_K_M with
-`HF2Q_KV_LCP_CHUNKED_PREFILL=1 HF2Q_KV_LCP_RESUME=1
-HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=64`:
+The historical numbers below are the bench output BEFORE the
+`d581331` default-on flip and BEFORE perf-loop-iter-3
+instrumentation (`restore_ms` per-trial logging + recursive cache
+counter). They are documented here for the closure-narrative
+trail.  See `project_adr017_phase_e_a_perf_loop_iter1.md` in memory
+for the post-flip finding: the bench-fixture prompt at 109 tokens is
+small-prompt-bound (decode floor ~160 ms dominates) → structural
+speedup ceiling on that fixture is ~2.2×, observed 1.49×.  Iter-2
+of the perf loop pivots to a long-prompt fixture (5-10K tok) +
+TTFT-strict (SSE first-token) + llama.cpp peer-baseline; that work
+is operator-driven post-merge.
+
+10-trial bench on Qwen 3.6 35B-A3B-APEX-Q5_K_M
+*pre-`d581331`*, `HF2Q_KV_LCP_CHUNKED_PREFILL=1
+HF2Q_KV_LCP_RESUME=1 HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=64`:
 
   * **TTFT_cold (fair baseline, turn-2 shape, no LCP cache match):**
     335 ms p50 (mean 334 ± 7 ms)
@@ -4152,7 +4171,7 @@ HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=64`:
   * **LCP speedup p50: 1.22×** (saving 60 ms / request median);
     speedup at hit: 1.55× (fast-trial-only median 225 ms vs cold 335 ms)
   * **R-P6 4-worker aggregate: 0.79× of 4×cold** — 37% UNDER ADR-017
-    R-P6 ≤ 1.25× spec.  This is the load-bearing /cfa Phase 2
+    R-P6 ≤ 1.25× spec.  This was the pre-flip `/cfa` Phase 2
     production-shape result: workers share `[SYSTEM] [QUEEN_SPEC]` +
     role-divergent suffixes, fan-out aggregate prefill drops ~21%.
 
@@ -4161,17 +4180,45 @@ correctness fixes landed in `9e560cb` — Python `-c` injection,
 baseline fairness, R-P6 cross-subprocess timer).  Verdict post-fix:
 APPROVED on the 3 correctness findings.
 
+**Separately**, the cross-process PromptCache full-equality replay
+path (Phase E / B-tq.6 / B-tq.7) is now measured at **9324× warm
+TTFT speedup** on dense Gemma 4 26B-A4B-DWQ at 4-bit and **7572× at
+8-bit** (production default), 1127-token prompt — see
+`§ Phase B-tq.7` above for evidence.  That mechanism (PromptCache
+hit short-circuits prefill) is orthogonal to the LCP partial-prefill
+resume above; both ship in current main.
+
 ### Memory budget reminder
 
-Default `HF2Q_KV_LCP_RESUME_CAPACITY=8` ≈ 2.4 GB per-process registry
-footprint on Qwen 3.6 35B-A3B (each entry holds a full
-`HybridKvCacheSnapshot`: 16 full-attn layers × 16 MB K/V + 48
-DeltaNet layers × ~4 MB recurrent + conv ≈ 300 MB).  For multi-request
-high-concurrency workloads, raise the cap; on memory-tight boxes
-(e.g. 64 GB Mac) consider lowering further.  Future optimization:
-refactor `HybridPromptCache` to share `Arc<HybridKvCacheSnapshot>`
-with `lcp_registry`, eliminating the dual-snapshot at end-of-prefill
-(currently ~2× GB-scale memcpy per greedy request).
+`HF2Q_KV_LCP_RESUME_CAPACITY` is now a **byte budget** (refactored
+post-`c04d5d2`).  Resolution priority at engine init:
+
+1. **`HF2Q_KV_LCP_RESUME_CAPACITY` env override** — accepts:
+   * Bare integer + suffix (`b/B`=bytes, `k/K`=KiB, `m/M`=MiB,
+     `g/G`=GiB).  E.g. `2g` = 2 GiB.
+   * Bare integer ≥ 4096 → raw byte count.
+   * Bare integer < 4096 → **legacy entry-count** (backward-compat
+     path); auto-converts via `n × 300 MB` heuristic and emits a
+     one-time deprecation `eprintln!` directing operators to the
+     byte-suffix form.
+2. **sysinfo auto-probe** (env unset) — `available_memory() × 5%`
+   clamped to `[1 GiB, 16 GiB]`.  Defensible slice of free RAM
+   (≈5 GiB on a fresh 128 GiB Mac, ~16 Qwen35-35B entries) without
+   OOM-class budgets that the old `cap=64` would have produced
+   (~19 GiB).
+3. **Floor fallback** — if `available_memory()` returns 0 (paranoia
+   path), the floor (1 GiB) is returned with a one-time warning.
+
+Always emits one info-level `eprintln!` naming the chosen budget
+and source on the first `LcpRegistry` construction (guards the
+"no silent feature flip" invariant).
+
+Per-entry cost on Qwen 3.6 35B-A3B is ~300 MB (16 full-attn layers
+× 16 MB K/V + 48 DeltaNet layers × ~4 MB recurrent + conv).  Future
+optimization: refactor `HybridPromptCache` to share
+`Arc<HybridKvCacheSnapshot>` with `lcp_registry`, eliminating the
+dual-snapshot at end-of-prefill (currently ~2× GB-scale memcpy per
+greedy request).
 
 ### Standing memories (load-bearing for ADR-017 discipline)
 - `feedback_harness_first_before_iter_chasing` — Phase A0 lands before any production code.
@@ -4188,3 +4235,125 @@ with `lcp_registry`, eliminating the dual-snapshot at end-of-prefill
 - `feedback_use_cfa_worktrees` — ADR-017 implementation iterations should use `/cfa` worktrees per project standing directive.
 - `feedback_commit_push_cadence` — every meaningful unit of progress commits + pushes immediately.
 - `feedback_oom_prevention` — ADR-017's 24-hour stress test runs solo (no concurrent model-loading sessions); 35B-A3B apex per-process ~30 GiB risk.
+
+---
+
+### Phase E.a is DEFAULT-ON 2026-05-06 — superseded by byte-budget LcpRegistry
+
+The 2026-05-05 "FUNCTIONALLY COMPLETE" framing above (1.22× / 0.79× / `default-OFF`)
+is HISTORICAL. As of commit `d581331` Phase E.a runs default-ON with a byte-budget
+LcpRegistry. The numbers in §"Production speedup measured" (335 ms / 275 ms / 1.22× /
+0.79×) were a small-prompt-fixture measurement artifact; long-prompt measurement
+under default-ON delivers 85× TTFT speedup and ~0.02× R-P6 aggregate.
+
+#### Default-ON closure scope (CFA session `cfa-lcp-default-on-2026-05-06`)
+
+* **Byte-budget `LcpRegistry`** — replaced entry-count cap=8 magic-number with
+  byte-budget LRU eviction. New `ByteSized` trait implemented for `DenseKvBuffers`
+  (k+v `MlxBuffer::byte_len`) and `HybridKvCacheSnapshot` (delegates to existing
+  `total_bytes()`). Registry tracks `current_bytes`, evicts LRU until
+  `current_bytes + new_bytes ≤ byte_budget`. Single entry larger than budget →
+  typed `Err(EntryExceedsBudget)`, never silent no-op.
+* **Dynamic capacity at engine init** — `default_lcp_byte_budget()` reads
+  `HF2Q_KV_LCP_RESUME_CAPACITY` (b/k/m/g suffixes for bytes; bare-int < 4096 =
+  legacy entry-count × 300 MB w/ deprecation eprintln; bare-int ≥ 4096 = raw
+  bytes), else `sysinfo::available_memory() × 5%` clamped to `[1 GiB, 16 GiB]`.
+  Cross-platform via existing `sysinfo` crate (no new sysctl/libc).
+* **Env-flip** — `kv_lcp_resume` and `kv_lcp_chunked_prefill` flipped from
+  `env_eq_one` (default OFF) to `env_default_true` (default ON; opt-out via
+  `=0` / `=false` / `=off`).
+* **Auto-disable on `HF2Q_USE_DENSE=0`** — `effective_kv_lcp_resume(parsed,
+  use_dense)` auto-disables LCP under default-on with `use_dense=false`,
+  emitting one warn-once via `std::sync::Once` (mirrors prior
+  `warn_lcp_resume_without_dense`). Operators who explicitly set
+  `HF2Q_KV_LCP_RESUME=1` override the auto-disable.
+* **No silent fallback** — all `let _ = registry.store(...)` sites replaced
+  with `if let Err(e) = ... { tracing::warn!(...) }`.
+* **Counter-semantics fix** — `probe_lcp_opportunity_chunk_aligned` (new
+  helper in `lcp_registry.rs`) iterates stride-aligned chunk positions
+  descending, side-effect-free, so `hf2q_kv_lcp_detected_total` accurately
+  reflects qwen35 chunked-prefill resume opportunities (the BASE-key probe
+  at `engine_qwen35.rs:867` was structurally broken from iter-2; it always
+  returned `None` because qwen35 stores under `build_lcp_key_for_qwen35_chunk`
+  CHUNK keys, not the BASE key).
+
+#### Codex Phase-2b 2026-05-06 review
+
+Initial verdict on the multi-worker patch: `request_changes / severity:high`.
+Five issues caught and remediated before commit:
+
+1. `lcp_registry.rs` same-key reinsert bypassed `EntryExceedsBudget` gate
+   (HIGH; pinned by `byte_budget_same_key_reinsert_exceeds_budget_returns_err`
+   regression test).
+2. `engine_qwen35.rs:882` (non-streaming) missing `effective_kv_lcp_resume`
+   wiring (HIGH).
+3. `engine_qwen35.rs:2112` (streaming) same missing wiring (HIGH).
+4. `engine.rs:7298` silent `let _ = registry.store(...)` (MED).
+5. `engine_qwen35.rs:2428` silent `let _ = registry.store(...)` EOF store (MED).
+
+#### Production speedup measured 2026-05-06 (`scripts/bench_lcp_long_prompt.sh`)
+
+5-trial bench on Qwen 3.6 35B-A3B-APEX-Q5_K_M with the default-on env (no
+`HF2Q_KV_LCP_*` set; `HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=64` for the
+~8 K-token shared prefix):
+
+| Metric | Cold (no-LCP-match) | LCP (stride-aligned hit) | Speedup |
+|---|---|---|---|
+| TTFT-strict (first content delta) p50 | 20 840 ms | 244 ms | **85.41×** |
+| Total request wall (TTFT + 16-tok decode) p50 | 20 933 ms | 335 ms | 62.49× |
+| Restore-partial wall (median) | — | 6 ms | — |
+| Matched LCP length (k) | — | 8 384 / 8 425 (99.5%) | — |
+| R-P6 4-worker aggregate | 4 × 20 840 = 83 360 ms | **1 533 ms** | **0.02× of 4×cold** |
+
+Acceptance ladder (re-tightened from the 2026-05-05 regression-floor): TTFT
+≥ 5× hard PASS; R-P6 ≤ 1.0× hard PASS; ≤ 0.5× stretch PASS (predicted ~0.27×
+based on iter-2 modelling; measured 0.02×).
+
+The 2026-05-05 numbers (1.22× / 0.79×) reflected a 109-token chat-templated
+fixture where decode-floor (~160 ms / 16 tok) dominated TTFT and the
+structural speedup ceiling was ~2.2×. The default-ON bench
+(`scripts/bench_lcp_long_prompt.sh`) uses an ~8 K-token fixture sourced from
+this ADR's head bytes — prefill dominates by ~120× over decode, so the LCP
+win is exposed end-to-end. **Both numbers are correct in their own measurement
+context**; the 2026-05-06 numbers are the realistic-workload measurement that
+the spirit-rule "as fast as peer" requires.
+
+#### Default-ON engagement test
+
+`tests/lcp_default_on_engagement.rs` (gated under `HF2Q_KV_PERSIST_PHASE_D=1`):
+two-server design verifies (a) default-on path engages on a long-shared-prefix
+two-turn sequence (`STRIDE-ALIGNED HIT count = 1`) AND (b) explicit
+`HF2Q_KV_LCP_RESUME=0` opt-out fully disables the resume path
+(`STRIDE-ALIGNED HIT count = 0`). Both PASS post-commit on Qwen 3.6 35B-A3B-APEX.
+
+#### Memory budget — superseded
+
+The 2026-05-05 "Default `HF2Q_KV_LCP_RESUME_CAPACITY=8` ≈ 2.4 GB" guidance is
+SUPERSEDED. The 2026-05-06 default is sysinfo-derived: `available_memory × 5%`
+clamped to `[1 GiB, 16 GiB]`, picked at engine init. On a 128 GB Mac with
+~100 GB free this gives ~5 GB ≈ 16 entries at 300 MB each — a natural
+replacement for the hand-derived cap=8. Operators who explicitly set
+`HF2Q_KV_LCP_RESUME_CAPACITY=10g` raise the budget; legacy `=8` (bare-int
+< 4096) is interpreted as entry-count × 300 MB with a deprecation eprintln.
+
+#### Open follow-ups (not blocking default-on)
+
+1. **R-C4 5-K byte-identity sweep on Apex-Q5_K_M** — the existing automated
+   sweep (`tests/lcp_partial_prefill_byte_identity.rs::iter5_r_c4_lcp_5_fraction_sweep`)
+   uses Gemma 4 26B for fixture stability. Operator-run procedure for
+   Apex-Q5_K_M documented at
+   `.claude/swarm/cfa-lcp-default-on-2026-05-06/manual-acceptance.md`.
+2. **llama.cpp peer-baseline arm** in long-prompt bench — non-blocker per
+   spec (operators can run `llama-server --slots --prompt-cache-all` and
+   compare manually).
+3. **/metrics gauge for `current_bytes` + `byte_budget`** — operator
+   observability, not required for default-on flip.
+
+#### Standing memories added 2026-05-06
+
+- `project_adr017_phase_e_a_perf_loop_iter3_default_on_LANDED_2026_05_06` —
+  default-on closure, byte-budget refactor, Codex remediation, live numbers.
+- `project_adr017_phase_e_a_perf_loop_iter1` /
+  `project_adr017_phase_e_a_perf_loop_iter2` — perf-parity loop forensics
+  showing the 2026-05-05 "underperformance" was a small-prompt fixture
+  artifact, not an engine bug.
