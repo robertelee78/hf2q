@@ -84,6 +84,9 @@ use mlx_native::ops::block_merge_2x2::{
 };
 use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
 use mlx_native::ops::elementwise::{elementwise_add, elementwise_mul};
+use mlx_native::ops::feature_concat::{
+    dispatch_feature_concat_f32, register as register_feature_concat,
+};
 use mlx_native::ops::gelu::dispatch_gelu;
 use mlx_native::ops::im2col_2d_3ch::{
     dispatch_im2col_2d_3ch_f32, register as register_im2col_2d_3ch,
@@ -2635,6 +2638,7 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
     mlx_native::ops::gelu::register(&mut registry);
     register_vit_custom_shaders(&mut registry);
     register_bert_custom_shaders(&mut registry);
+    register_feature_concat(&mut registry);
     // SAFETY: executor outlives session via this function's scope.
     let device_ref: *const MlxDevice = executor.device() as *const _;
     let device: &MlxDevice = unsafe { &*device_ref };
@@ -2812,21 +2816,18 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
     )
     .context("compute_vision_embeddings_gpu_qwen3vl: main projector")?;
 
-    session
-        .finish()
-        .map_err(|e| anyhow!("compute_vision_embeddings_gpu_qwen3vl: finish: {e}"))?;
-
     // -----------------------------------------------------------------
-    // Stage C — Read back main + deepstack outputs and concat on CPU.
+    // Stage C — GPU feature-axis concat (ADR-021 iter-4b).
     //
-    // Per qwen3vl.cpp:186 `ggml_concat(ctx0, embeddings,
-    // deepstack_features, 0)` is along the innermost (feature) axis.
-    // In hf2q row-major terms this builds `[n_image_tokens,
-    // lm_hidden*(1+N_deepstack)]` where each row carries
-    // `[base[t]; ds_0[t]; ...; ds_{N-1}[t]]`. CPU concat is byte-
-    // identical to a fused-kernel concat for this small tensor and
-    // keeps 4c.4 surgical (no new shaders); 4c.5+ may revisit if a
-    // perf gap appears.
+    // qwen3vl.cpp:186 `ggml_concat(ctx0, embeddings,
+    // deepstack_features, 0)` builds `[n_image_tokens,
+    // lm_hidden*(1+N_deepstack)]` row-major where each row carries
+    // `[base[t]; ds_0[t]; ...; ds_{N-1}[t]]`. iter-4b runs the concat
+    // on the GPU via K5 `feature_concat_f32` BEFORE session.finish(),
+    // so the final readback is a single `as_slice::<f32>()` on the
+    // augmented buffer rather than per-chunk Vec<f32> readbacks +
+    // CPU memcpy. Eliminates the `qwen3vl_concat_augmented_embed_cpu`
+    // call entirely.
     // -----------------------------------------------------------------
     let merge_factor = (cfg.spatial_merge_size as usize).pow(2);
     if merge_factor == 0 || n_pos_merged % merge_factor != 0 {
@@ -2840,53 +2841,78 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
     }
     let n_image_tokens = n_pos_merged / merge_factor;
     let lm_hidden = cfg.out_hidden_size as usize;
-    let chunk_len = n_image_tokens * lm_hidden;
+    let augmented_dim = cfg.augmented_embed_dim() as usize;
+    let expected_augmented_len = n_image_tokens * augmented_dim;
 
-    let main_slice: &[f32] = main_out
-        .as_slice::<f32>()
-        .map_err(|e| anyhow!("compute_vision_embeddings_gpu_qwen3vl: main readback: {e}"))?;
-    if main_slice.len() != chunk_len {
-        return Err(anyhow!(
-            "compute_vision_embeddings_gpu_qwen3vl: main projector readback len {} \
-             != expected {} (n_image_tokens={n_image_tokens}, lm_hidden={lm_hidden})",
-            main_slice.len(),
-            chunk_len
-        ));
-    }
-    // Build the chunks list in canonical order: chunk 0 = main, then
-    // chunks 1..N = deepstack heads in ascending block-index order
-    // (matches `cfg.deepstack_indexes` ordering).
-    let mut chunks: Vec<Vec<f32>> = Vec::with_capacity(1 + deepstack_outputs.len());
-    chunks.push(main_slice.to_vec());
+    let augmented_buf = device
+        .alloc_buffer(
+            expected_augmented_len * 4,
+            DType::F32,
+            vec![n_image_tokens, augmented_dim],
+        )
+        .map_err(|e| anyhow!(
+            "compute_vision_embeddings_gpu_qwen3vl: alloc augmented buf: {e}"
+        ))?;
+
+    // Chunk 0 — main projector output at column offset 0.
+    dispatch_feature_concat_f32(
+        session.encoder_mut(),
+        &mut registry,
+        device.metal_device(),
+        &main_out,
+        &augmented_buf,
+        n_image_tokens as u32,
+        lm_hidden as u32,
+        0,
+        augmented_dim as u32,
+    )
+    .with_context(|| {
+        format!(
+            "compute_vision_embeddings_gpu_qwen3vl: K5 feature_concat (main) — \
+             n_image_tokens={n_image_tokens} lm_hidden={lm_hidden} augmented_dim={augmented_dim}"
+        )
+    })?;
+    session.encoder_mut().memory_barrier();
+
+    // Chunks 1..N — DeepStack heads, each at column offset (i+1)*lm_hidden.
     for (i, head_out) in deepstack_outputs.iter().enumerate() {
-        let head_slice: &[f32] = head_out.as_slice::<f32>().map_err(|e| {
-            anyhow!(
-                "compute_vision_embeddings_gpu_qwen3vl: deepstack head {i} readback: {e}"
+        let dst_offset = ((i + 1) * lm_hidden) as u32;
+        dispatch_feature_concat_f32(
+            session.encoder_mut(),
+            &mut registry,
+            device.metal_device(),
+            head_out,
+            &augmented_buf,
+            n_image_tokens as u32,
+            lm_hidden as u32,
+            dst_offset,
+            augmented_dim as u32,
+        )
+        .with_context(|| {
+            format!(
+                "compute_vision_embeddings_gpu_qwen3vl: K5 feature_concat (deepstack {i}) — \
+                 dst_offset={dst_offset}"
             )
         })?;
-        if head_slice.len() != chunk_len {
-            return Err(anyhow!(
-                "compute_vision_embeddings_gpu_qwen3vl: deepstack head {i} readback len \
-                 {} != expected {} (n_image_tokens={n_image_tokens}, lm_hidden={lm_hidden})",
-                head_slice.len(),
-                chunk_len
-            ));
-        }
-        chunks.push(head_slice.to_vec());
+        session.encoder_mut().memory_barrier();
     }
 
-    let augmented = qwen3vl_concat_augmented_embed_cpu(&chunks, n_image_tokens, lm_hidden)
-        .context("compute_vision_embeddings_gpu_qwen3vl: feature-dim concat")?;
-    let expected_augmented_len = n_image_tokens * (cfg.augmented_embed_dim() as usize);
-    if augmented.len() != expected_augmented_len {
+    session
+        .finish()
+        .map_err(|e| anyhow!("compute_vision_embeddings_gpu_qwen3vl: finish: {e}"))?;
+
+    let augmented_slice: &[f32] = augmented_buf.as_slice::<f32>().map_err(|e| {
+        anyhow!("compute_vision_embeddings_gpu_qwen3vl: augmented readback: {e}")
+    })?;
+    if augmented_slice.len() < expected_augmented_len {
         return Err(anyhow!(
-            "compute_vision_embeddings_gpu_qwen3vl: augmented embed len {} != \
-             n_image_tokens*augmented_embed_dim = {n_image_tokens}*{} = {expected_augmented_len}",
-            augmented.len(),
-            cfg.augmented_embed_dim()
+            "compute_vision_embeddings_gpu_qwen3vl: augmented embed len {} < \
+             expected {expected_augmented_len} (n_image_tokens={n_image_tokens}, \
+             augmented_dim={augmented_dim})",
+            augmented_slice.len()
         ));
     }
-    Ok(vec![augmented])
+    Ok(vec![augmented_slice[..expected_augmented_len].to_vec()])
 }
 
 // ---------------------------------------------------------------------------
