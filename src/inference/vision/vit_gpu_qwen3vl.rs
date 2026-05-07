@@ -641,49 +641,65 @@ pub(crate) fn qwen3vl_2x2_block_merge_reshape(
 // patch grid before adding it to the dual-conv patch embedding.
 // iter-225 Phase-2: signature lifted from square `target_n_per_side`
 // to rectangular `(target_n_x, target_n_y)`.
-/// ADR-021 K1 helper: GPU dual-stem patch embed → CPU readback.
+/// ADR-021 iter-3b consolidated Stage A1+A2+A3 GPU helper.
 ///
-/// Drop-in equivalent of [`qwen3vl_dual_conv_patch_embed_cpu_hw`]
-/// that runs the dual-conv2d patch embed on the GPU via
-/// `im2col_2d_3ch_f32` + 2× `dense_matmul_f32_f32_tensor` +
-/// `elementwise_add` + (optional) `add_bias_row_2d_f32`, then reads
-/// the result back to a `Vec<f32>`.
+/// Runs the dual-conv patch embed (A1: K1 + 2× dense_matmul +
+/// elementwise_add + optional add_bias_row), the antialiased bilinear
+/// pos-embd resize (A2: K2), AND the inline pos-embd add
+/// (A3: elementwise_add) in a SINGLE GPU session, returning the
+/// `[n_pos_pre, n_embd]` row-major `Vec<f32>` ready for A4 (block
+/// merge, still CPU at iter-3b — replaced by K4 in iter-4a).
 ///
-/// The CPU-side readback is interim — iters 3a/3b/4a collapse it
-/// once the rest of Stage A also runs on the GPU. For iter-2a the
-/// downstream stages (bilinear pos-embd resize, inline add, 2×2
-/// block-merge) still consume `Vec<f32>`, so this helper returns
-/// the same shape the CPU function returned.
+/// Replaces the per-stage helpers that landed at iter-2a and iter-3a
+/// (each opened its own session and read back to host); consolidating
+/// removes 2× redundant Vec<f32>↔MlxBuffer round-trips and 2×
+/// session.finish() commit-and-wait stalls between stages.
 ///
 /// # Float-summation order
 ///
 /// `dense_matmul_f32_f32_tensor` reduces over the K axis using
 /// simdgroup MMA tiles, NOT the (ic, dy, dx) sequential order
-/// `patch_embed_forward_hw` uses. Therefore output is **byte-equal
-/// up to FP reduction order** rather than strict byte-identical to
-/// the CPU oracle. Drift bound is empirical (measured by
-/// `adr021_iter1a_e2e_byte_pinned_baseline_2026_05_07`'s ULP
-/// assertion after iter-2a lands).
-fn qwen3vl_dual_conv_patch_embed_gpu_to_cpu(
+/// `patch_embed_forward_hw` uses. Output is **byte-equal up to FP
+/// reduction order** rather than strict byte-identical to the CPU
+/// oracle. The bilinear weighted-sum and final pos-embd add are
+/// straight-line iterations whose order matches the CPU oracle, so
+/// they introduce no additional drift on top of A1's matmul.
+fn qwen3vl_stage_a1_a3_gpu_to_cpu(
     pixel_values: &[f32],
     weight_0: &[f32],
     weight_1: &[f32],
     bias: Option<&[f32]>,
+    pos_embd_table: &[f32],
+    num_position_embeddings: u32,
     pixel_h: u32,
     pixel_w: u32,
     patch_size: u32,
     hidden: u32,
 ) -> Result<Vec<f32>> {
+    let ctx = "qwen3vl_stage_a1_a3_gpu_to_cpu";
     if patch_size == 0 || pixel_h == 0 || pixel_w == 0 {
         return Err(anyhow!(
-            "qwen3vl_dual_conv_patch_embed_gpu_to_cpu: patch_size ({patch_size}), \
-             pixel_h ({pixel_h}), pixel_w ({pixel_w}) must all be > 0"
+            "{ctx}: patch_size ({patch_size}), pixel_h ({pixel_h}), \
+             pixel_w ({pixel_w}) must all be > 0"
         ));
     }
     if pixel_h % patch_size != 0 || pixel_w % patch_size != 0 {
         return Err(anyhow!(
-            "qwen3vl_dual_conv_patch_embed_gpu_to_cpu: pixel grid \
-             ({pixel_h}x{pixel_w}) must be divisible by patch_size ({patch_size})"
+            "{ctx}: pixel grid ({pixel_h}x{pixel_w}) must be divisible by \
+             patch_size ({patch_size})"
+        ));
+    }
+    if num_position_embeddings == 0 {
+        return Err(anyhow!(
+            "{ctx}: num_position_embeddings must be > 0"
+        ));
+    }
+    let trained_n = (num_position_embeddings as f64).sqrt() as u32;
+    if trained_n.saturating_mul(trained_n) != num_position_embeddings {
+        return Err(anyhow!(
+            "{ctx}: num_position_embeddings ({num_position_embeddings}) is not \
+             a perfect square (trained pos-embd table must be square per \
+             clip.cpp:277)"
         ));
     }
     let nps_x = (pixel_w / patch_size) as usize;
@@ -694,50 +710,54 @@ fn qwen3vl_dual_conv_patch_embed_gpu_to_cpu(
     let h = hidden as usize;
     let expected_pixels = 3 * (pixel_h as usize) * (pixel_w as usize);
     let expected_w = h * k_total;
+    let expected_pos_table = (num_position_embeddings as usize) * h;
     if pixel_values.len() != expected_pixels {
         return Err(anyhow!(
-            "qwen3vl_dual_conv_patch_embed_gpu_to_cpu: pixel_values.len() ({}) != \
-             3*pixel_h*pixel_w ({expected_pixels})",
+            "{ctx}: pixel_values.len() ({}) != 3*pixel_h*pixel_w ({expected_pixels})",
             pixel_values.len()
         ));
     }
     if weight_0.len() != expected_w {
         return Err(anyhow!(
-            "qwen3vl_dual_conv_patch_embed_gpu_to_cpu: weight_0.len() ({}) != \
-             hidden*3*p² ({expected_w})",
+            "{ctx}: weight_0.len() ({}) != hidden*3*p² ({expected_w})",
             weight_0.len()
         ));
     }
     if weight_1.len() != expected_w {
         return Err(anyhow!(
-            "qwen3vl_dual_conv_patch_embed_gpu_to_cpu: weight_1.len() ({}) != \
-             hidden*3*p² ({expected_w})",
+            "{ctx}: weight_1.len() ({}) != hidden*3*p² ({expected_w})",
             weight_1.len()
         ));
     }
     if let Some(b) = bias {
         if b.len() != h {
             return Err(anyhow!(
-                "qwen3vl_dual_conv_patch_embed_gpu_to_cpu: bias.len() ({}) != \
-                 hidden ({h})",
+                "{ctx}: bias.len() ({}) != hidden ({h})",
                 b.len()
             ));
         }
     }
+    if pos_embd_table.len() != expected_pos_table {
+        return Err(anyhow!(
+            "{ctx}: pos_embd_table.len() ({}) != num_position_embeddings*hidden \
+             ({expected_pos_table})",
+            pos_embd_table.len()
+        ));
+    }
 
     let executor = GraphExecutor::new(
-        MlxDevice::new()
-            .map_err(|e| anyhow!("qwen3vl_dual_conv_patch_embed_gpu_to_cpu: device: {e}"))?,
+        MlxDevice::new().map_err(|e| anyhow!("{ctx}: device: {e}"))?,
     );
     let mut session = executor
         .begin()
-        .map_err(|e| anyhow!("qwen3vl_dual_conv_patch_embed_gpu_to_cpu: begin: {e}"))?;
+        .map_err(|e| anyhow!("{ctx}: begin: {e}"))?;
     // SAFETY: executor outlives session via this function's stack frame.
     let device_ref: *const MlxDevice = executor.device() as *const _;
     let device: &MlxDevice = unsafe { &*device_ref };
     let mut registry = KernelRegistry::new();
     register_im2col_2d_3ch(&mut registry);
     register_add_bias_row_2d(&mut registry);
+    register_bilinear_resize_2d(&mut registry);
 
     // Allocate + upload pixels and weights.
     let mut pixels_buf = device
@@ -845,8 +865,8 @@ fn qwen3vl_dual_conv_patch_embed_gpu_to_cpu(
     .map_err(|e| anyhow!("elementwise_add: {e}"))?;
     session.encoder_mut().memory_barrier();
 
-    // Optional bias broadcast: out[m,n] = summed[m,n] + bias[n]
-    let final_buf = if let Some(bias_slice) = bias {
+    // A1.bias — Optional bias broadcast: out[m,n] = summed[m,n] + bias[n]
+    let patches_pre_buf = if let Some(bias_slice) = bias {
         let mut bias_buf = device
             .alloc_buffer(bias_slice.len() * 4, DType::F32, vec![h])
             .map_err(|e| anyhow!("alloc bias: {e}"))?;
@@ -874,115 +894,65 @@ fn qwen3vl_dual_conv_patch_embed_gpu_to_cpu(
         summed_buf
     };
 
-    session
-        .finish()
-        .map_err(|e| anyhow!("session finish: {e}"))?;
-
-    let s: &[f32] = final_buf
-        .as_slice::<f32>()
-        .map_err(|e| anyhow!("readback: {e}"))?;
-    Ok(s.to_vec())
-}
-
-/// ADR-021 K2 helper: GPU bilinear pos-embd resize → CPU readback.
-///
-/// Drop-in equivalent of [`qwen3vl_resize_position_embeddings_bilinear`]
-/// that runs the antialiased bilinear resize on the GPU via
-/// `bilinear_resize_2d_f32`, then reads the result back to a
-/// `Vec<f32>`. The CPU-side readback is interim — collapsed in the
-/// joint Stage A helper a future iter introduces.
-///
-/// Tolerance: AC-1 for K2 is **1 ULP per element** because the
-/// bilinear weighted-sum has float-sum-order ambiguity in principle;
-/// in practice the straight-line CPU+GPU iteration produces
-/// byte-identical output for square targets and within 1 ULP for
-/// rectangular targets.
-fn qwen3vl_resize_position_embeddings_bilinear_gpu_to_cpu(
-    pos_embd_table: &[f32],
-    num_position_embeddings: u32,
-    n_embd: u32,
-    target_n_x: u32,
-    target_n_y: u32,
-) -> Result<Vec<f32>> {
-    if num_position_embeddings == 0 || n_embd == 0 || target_n_x == 0 || target_n_y == 0 {
-        return Err(anyhow!(
-            "qwen3vl_resize_position_embeddings_bilinear_gpu_to_cpu: \
-             num_position_embeddings ({num_position_embeddings}), n_embd ({n_embd}), \
-             target_n_x ({target_n_x}), target_n_y ({target_n_y}) must all be > 0"
-        ));
-    }
-    let trained_n = (num_position_embeddings as f64).sqrt() as u32;
-    if trained_n.saturating_mul(trained_n) != num_position_embeddings {
-        return Err(anyhow!(
-            "qwen3vl_resize_position_embeddings_bilinear_gpu_to_cpu: \
-             num_position_embeddings ({num_position_embeddings}) is not a \
-             perfect square (trained position-embedding table must be square \
-             per clip.cpp:277)"
-        ));
-    }
-    let expected_table = (num_position_embeddings as usize) * (n_embd as usize);
-    if pos_embd_table.len() != expected_table {
-        return Err(anyhow!(
-            "qwen3vl_resize_position_embeddings_bilinear_gpu_to_cpu: \
-             pos_embd_table.len() ({}) != num_position_embeddings*n_embd \
-             ({expected_table})",
-            pos_embd_table.len()
-        ));
-    }
-
-    let executor = GraphExecutor::new(MlxDevice::new().map_err(|e| {
-        anyhow!("qwen3vl_resize_position_embeddings_bilinear_gpu_to_cpu: device: {e}")
-    })?);
-    let mut session = executor.begin().map_err(|e| {
-        anyhow!("qwen3vl_resize_position_embeddings_bilinear_gpu_to_cpu: begin: {e}")
-    })?;
-    let device_ref: *const MlxDevice = executor.device() as *const _;
-    let device: &MlxDevice = unsafe { &*device_ref };
-    let mut registry = KernelRegistry::new();
-    register_bilinear_resize_2d(&mut registry);
-
-    let h = n_embd as usize;
-    let mut src_buf = device
+    // A2 — K2 antialiased bilinear pos-embd resize from
+    // [trained_n, trained_n, hidden] → [nps_y, nps_x, hidden].
+    let mut pos_src_buf = device
         .alloc_buffer(
             pos_embd_table.len() * 4,
             DType::F32,
             vec![trained_n as usize, trained_n as usize, h],
         )
         .map_err(|e| anyhow!("alloc pos_embd src: {e}"))?;
-    src_buf
+    pos_src_buf
         .as_mut_slice::<f32>()
         .map_err(|e| anyhow!("pos_embd src mut: {e}"))?
         .copy_from_slice(pos_embd_table);
-
-    let target_total = (target_n_y as usize) * (target_n_x as usize) * h;
-    let dst_buf = device
+    let pos_resized_buf = device
         .alloc_buffer(
-            target_total * 4,
+            num_patches * h * 4,
             DType::F32,
-            vec![target_n_y as usize, target_n_x as usize, h],
+            vec![nps_y, nps_x, h],
         )
-        .map_err(|e| anyhow!("alloc pos_embd dst: {e}"))?;
-
+        .map_err(|e| anyhow!("alloc pos_embd resized: {e}"))?;
     dispatch_bilinear_resize_2d_f32(
         session.encoder_mut(),
         &mut registry,
         device.metal_device(),
-        &src_buf,
-        &dst_buf,
+        &pos_src_buf,
+        &pos_resized_buf,
         trained_n,
-        target_n_x,
-        target_n_y,
-        n_embd,
+        nps_x as u32,
+        nps_y as u32,
+        hidden,
     )
     .map_err(|e| anyhow!("bilinear_resize_2d_f32 dispatch: {e}"))?;
+    session.encoder_mut().memory_barrier();
+
+    // A3 — inline pos-embd add: final[m,n] = patches_pre[m,n] + pos_resized[m,n]
+    let summed_with_pos_buf = device
+        .alloc_buffer(num_patches * h * 4, DType::F32, vec![num_patches, h])
+        .map_err(|e| anyhow!("alloc summed_with_pos: {e}"))?;
+    elementwise_add(
+        session.encoder_mut(),
+        &mut registry,
+        device.metal_device(),
+        &patches_pre_buf,
+        &pos_resized_buf,
+        &summed_with_pos_buf,
+        num_patches * h,
+        DType::F32,
+    )
+    .map_err(|e| anyhow!("elementwise_add(patches+pos_embd): {e}"))?;
+    session.encoder_mut().memory_barrier();
+
     session
         .finish()
         .map_err(|e| anyhow!("session finish: {e}"))?;
 
-    Ok(dst_buf
+    let s: &[f32] = summed_with_pos_buf
         .as_slice::<f32>()
-        .map_err(|e| anyhow!("readback: {e}"))?
-        .to_vec())
+        .map_err(|e| anyhow!("readback: {e}"))?;
+    Ok(s.to_vec())
 }
 
 pub(crate) fn qwen3vl_resize_position_embeddings_bilinear(
@@ -2592,55 +2562,31 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         .get(super::mmproj::TENSOR_PATCH_EMBD_BIAS)
         .and_then(|b| mmproj_weights.tensor_as_f32_owned(b).ok());
 
-    // ADR-021 iter-2a: dual conv patch embed runs on the GPU
-    // (im2col_2d_3ch_f32 + 2× dense_matmul_f32_f32_tensor +
-    // elementwise_add + add_bias_row_2d_f32). Result is read back to
-    // a Vec<f32> for now; iters 3a/3b/4a remove the readback when the
-    // rest of Stage A becomes GPU-resident.
-    let patches_pre = qwen3vl_dual_conv_patch_embed_gpu_to_cpu(
-        pixel_values,
-        &patch_embd_f32,
-        &patch_embd_1_f32,
-        patch_bias_f32.as_deref(),
-        pixel_h,
-        pixel_w,
-        cfg.patch_size,
-        cfg.n_embd,
-    )
-    .context("compute_vision_embeddings_gpu_qwen3vl: dual conv patch embed (GPU)")?;
-
-    // A2. Resize trained position embedding to runtime patch grid +
-    //     element-wise add to patches_pre (qwen3vl.cpp:47-58).
+    // ADR-021 iter-3b: A1 (dual-conv patch embed) + A2 (bilinear
+    // pos-embd resize) + A3 (inline pos-embd add) all run in a single
+    // GPU session via the consolidated `qwen3vl_stage_a1_a3_gpu_to_cpu`
+    // helper, which returns the post-add `[n_pos_pre, n_embd]`
+    // row-major Vec<f32>. Iter-4a folds K4 (block-merge) into the
+    // same session and removes the Vec<f32> readback altogether.
     let pos_embd_buf = mmproj_weights
         .position_embd_weight()
         .map_err(|e| anyhow!("compute_vision_embeddings_gpu_qwen3vl: {e}"))?;
     let pos_embd_f32 = mmproj_weights
         .tensor_as_f32_owned(pos_embd_buf)
         .context("compute_vision_embeddings_gpu_qwen3vl: pos_embd → f32 widen")?;
-    // ADR-021 iter-3a: bilinear pos-embd resize runs on the GPU
-    // (bilinear_resize_2d_f32). Result is read back to a Vec<f32> for
-    // now; the joint-Stage-A helper a future iter introduces removes
-    // this readback alongside iter-3b/4a.
-    let pos_embd_resized = qwen3vl_resize_position_embeddings_bilinear_gpu_to_cpu(
+    let summed = qwen3vl_stage_a1_a3_gpu_to_cpu(
+        pixel_values,
+        &patch_embd_f32,
+        &patch_embd_1_f32,
+        patch_bias_f32.as_deref(),
         &pos_embd_f32,
         cfg.num_position_embeddings,
+        pixel_h,
+        pixel_w,
+        cfg.patch_size,
         cfg.n_embd,
-        n_x_pre,
-        n_y_pre,
     )
-    .context("compute_vision_embeddings_gpu_qwen3vl: pos embed resize (GPU)")?;
-    if pos_embd_resized.len() != patches_pre.len() {
-        return Err(anyhow!(
-            "compute_vision_embeddings_gpu_qwen3vl: pos_embd_resized.len() ({}) \
-             != patches_pre.len() ({}) — resize shape contract violated",
-            pos_embd_resized.len(),
-            patches_pre.len()
-        ));
-    }
-    let mut summed = patches_pre;
-    for (a, b) in summed.iter_mut().zip(pos_embd_resized.iter()) {
-        *a += *b;
-    }
+    .context("compute_vision_embeddings_gpu_qwen3vl: Stage A1+A2+A3 (GPU)")?;
 
     // A3. 2x2 block-merge reshape (qwen3vl.cpp:27-37 + the parallel
     //     pos-embd reshape at 48-57). The block-merge MUST run AFTER
