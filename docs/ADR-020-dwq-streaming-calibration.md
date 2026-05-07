@@ -179,9 +179,9 @@ Replaces all prior iteration tables.
 | 4 | — | Phase 2 deep-dive `b3db220` | DONE |
 | 4.5 | — | mlx-lm pivot — DWQ vs dynamic_quant taxonomy `35e33a5` | DONE |
 | 5 | — | 10-researcher /cfa deep-dive `ede887c` | DONE |
-| 5.5 | — | ADR structural cleanup (this) | DONE |
-| **6** | — | Fix `materialize_cloned` deep-clone (~20 LOC, ~52 GB save) | **NEXT** |
-| 7–8 | 1 | Port `dynamic_quant.estimate_sensitivities` + `estimate_threshold` | |
+| 5.5 | — | ADR structural cleanup `3ce0571` | DONE |
+| 6 | — | Fix `materialize_cloned` deep-clone — Arc-share hot path `beb184f` (~52 GB save; bisect-verified falsifier) | DONE |
+| **7–8** | 1 | Port `dynamic_quant.estimate_sensitivities` + `estimate_threshold` | **NEXT** |
 | 9 | 1 | Track 1 falsifier tests + GGUF emit verification | |
 | 10 | 1 | Track 1 e2e on Qwen3.6-27B + Gemma 4 26B-A4B; bench vs current variance-magnitude | |
 | 11 | 2-B | Subprocess wrapper around `mlx_lm.dwq`; produce MLX safetensors | |
@@ -200,24 +200,18 @@ Replaces all prior iteration tables.
 
 ## 8. Acceptance criteria (per track)
 
-### 8.1 Iter 6 — `materialize_cloned` Arc-share fix
+### 8.1 Iter 6 — `materialize_cloned` Arc-share fix — DONE `beb184f`
 
-**Files:** `/opt/hf2q/src/ir/lazy.rs:314-345`.
+**Files:** `/opt/hf2q/src/ir/lazy.rs:314-356` (production) + `lazy.rs:1075-1212` (tests).
 
-**Pass criteria (all must hold):**
+**Pass criteria (all met):**
 
-1. **Falsifier unit test** in `src/ir/lazy.rs` (or co-located `tests/` file): construct a `LazyTensor` from `from_arc_bytes(Arc::new(vec))`; call `materialize_cloned()`; assert `Arc::strong_count(&result.data) >= 2` (proves shared, not deep-copied). Test name: `materialize_cloned_shares_arc_no_byte_copy`. Test FAILS on current code, PASSES after fix.
-2. **Existing test suite green:** `cargo test` PASSES (current baseline 104/104 from commit `437217d`).
-3. **No new dependencies.**
-4. **LOC budget:** ≤ 30 LOC delta in `src/ir/lazy.rs`. Mechanical change only.
-5. **Commit message** cites this ADR section + observed save (~52 GB on 27B-class).
-
-**How to verify locally:**
-```bash
-cd /opt/hf2q
-cargo test --test '*' materialize_cloned_shares_arc
-cargo test  # full suite
-```
+1. ✅ **Falsifier `materialize_cloned_shares_arc_no_byte_copy`** asserts `Arc::ptr_eq(&src, &t.data)` (strongest available check) + `Arc::strong_count >= 3` (caller + lazy + t). **Bisect-verified**: test FAILS without the fix at the `ptr_eq` assertion; PASSES with it.
+2. ✅ **Companion falsifier `materialize_cloned_owned_vec_path_byte_equal`** covers the `Materialized(Vec<u8>)` one-owner path; ensures the rare variant still works.
+3. ✅ **Full suite green:** 20/20 `ir::lazy` unit tests + 2878/0/3 full bin suite + all integration test binaries (zero failures).
+4. ✅ **No new dependencies.**
+5. ✅ **Production-code delta:** 6 LOC inside `materialize_cloned` (rest of the diff is doc comments + 2 new tests).
+6. ✅ **Commit cites this ADR section** + observed save (~52 GB on 27B-class).
 
 ### 8.2 Track 1 — Dynamic Quant (mixed-precision sensitivity)
 
