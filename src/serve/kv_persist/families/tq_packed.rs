@@ -1375,6 +1375,36 @@ impl KvCacheSpill for TqPackedSpill {
     ) -> Option<ModelFingerprint> {
         self.fingerprint.read().ok().and_then(|fp| fp.clone())
     }
+
+    /// **Phase B-tq.6** — snapshot the per-model `PromptCache` via
+    /// the engine worker bridge.  Mirrors `Gemma4DenseSpill::snapshot_prompt_cache`.
+    /// Without this impl, the TQ-active path inherits the trait
+    /// default no-op (returns `None`) — `/shutdown drain` would NOT
+    /// flush the prompt_cache to disk → warm-path full-equality
+    /// replay (R-P5 = 44,500× speedup) would never engage.
+    fn snapshot_prompt_cache(&self) -> Option<Vec<u8>> {
+        let engine = self
+            .engine_arc
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())?;
+        engine.request_prompt_cache_snapshot().ok().flatten()
+    }
+
+    /// **Phase B-tq.6** — restore the per-model `PromptCache` from a
+    /// previously-snapshotted byte payload.  Inverse of
+    /// `snapshot_prompt_cache`.
+    fn restore_prompt_cache(&mut self, payload: &[u8]) -> Result<(), SpillErrorKind> {
+        let engine = self
+            .engine_arc
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+            .ok_or(SpillErrorKind::CodecErr)?;
+        engine
+            .request_prompt_cache_restore(payload.to_vec())
+            .map_err(|_| SpillErrorKind::CodecErr)
+    }
 }
 
 // ============================================================================
