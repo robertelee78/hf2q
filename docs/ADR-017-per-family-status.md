@@ -1,6 +1,6 @@
 # ADR-017 Per-Family Ship-Gate Status
 
-**Last updated:** 2026-05-06 (post Phase B-tq.4 iter-1+2+3 + B-tq.5 driver extraction — full automation when env-gated; live R-C1 measurement on a real GGUF is operator-driven)
+**Last updated:** 2026-05-06 (post Phase B-tq.4 iter-1+2+3 + B-tq.5 driver extraction + iter-4 descriptor wiring + B-tq.6 R-P5 unlock — full automation + 9324× warm-path TTFT speedup on Gemma 4 26B-A4B-DWQ live R-C1+R-P5)
 **Companion to:** [ADR-017](./ADR-017-persistent-block-prefix-cache.md)
 **Phase D §476 closure doc.**
 

@@ -565,26 +565,28 @@ couldn't catch (both required a real GGUF + 30-layer model):
    **Fix**: pass `cfg_for_spill` into both spill constructors so
    both instances share the descriptor-driven cfg.
 
-### Open follow-on (not B-tq.4 acceptance)
+### Phase B-tq.6 Status: GREEN — R-P5 UNLOCKED (commit `ad01f26`)
 
-- **Long-prompt perf**: `TTFT_warm/TTFT_cold = 0.9991` on a 1127-
-  token prompt — restore engages but brings no measurable speedup.
-  cache_dir post-drain has only 2 entries on this fixture (vs 26
-  observed on a different prompt during iter-4 debug).  Suggests
-  `/shutdown drain_loaded_models_to_disk` isn't capturing the full
-  pre-decode KV state, OR the warm path's `post_admit` restore
-  doesn't seed enough layers to skip prefill.  This is an
-  optimization concern (perf is informational; R-C1 byte-identity
-  is the load-bearing acceptance gate).
-- **8-bit codebook support**: The substrate currently snapshots
-  `kv_caches[].k_packed` which is the runtime's *4-bit* legacy
-  cache (`hd/2` packed bytes).  At `HF2Q_TQ_CODEBOOK_BITS=8` the
-  runtime additionally writes to `leg_hb_encoded` (the HB-packed
-  cache that 8-bit SDPA reads); the snapshot doesn't touch it yet.
-  Pinning the live test at 4-bit so snapshot/restore shape matches
-  what the runtime actively uses.  8-bit support is B-tq.6
-  follow-on (needs `leg_hb_encoded`-aware variants of
-  `tq_v2_snapshot_block` / `tq_v2_restore_block`).
+The long-prompt perf gap surfaced at iter-4 (`TTFT_warm/TTFT_cold ≈ 1.0`) had two root causes; both fixed.
+
+**Bug 1 (commit `256a6cd`)**: `tq_v2_snapshot_block` always returned `Some(zero-padded bytes)` for ranges beyond `cache.seq_len`, so the spiller's `pre_evict` loop never broke and over-snapshotted phantom blocks.  Fix: gate snapshot on `range.start < cache.seq_len`; return `CodecErr` (→ `None` via `.ok()?`) past the live boundary.  Effect: 1127-token prompt now writes 100 cache blocks (matches expected ~120-150 with dedupe) instead of phantom-overwriting 3840 calls.
+
+**Bug 2 (commit `ad01f26`)**: `TqPackedSpill` inherited the trait default no-ops for `snapshot_prompt_cache` / `restore_prompt_cache` — so the per-model `PromptCache` (full-equality `(prompt_tokens → decoded_tokens)` map) was never persisted to disk on `/shutdown` drain.  Warm path therefore always did full prefill.  Fix: implement both hooks on `TqPackedSpill` mirroring `Gemma4DenseSpill::snapshot_prompt_cache`/`restore_prompt_cache`; both delegate to `Engine::request_prompt_cache_*` worker-bridge methods (which already work for any model with a `prompt_cache: PromptCache` field — the cache is per-MODEL, not per-quant).
+
+### Live R-P5 measurement (Gemma 4 26B-A4B-DWQ, `HF2Q_TQ_KV=1`, 1127-token prompt)
+
+```
+COLD:  ttft_cold = 11188.5 ms  (full prefill on cold engine)
+WARM:  ttft_warm =     1.2 ms  (PromptCache full-equality replay)
+TTFT_warm / TTFT_cold = 0.0001   ← 9324× speedup
+R-C1 PASS — 167 bytes byte-identical across processes
+```
+
+Compare to dense path R-P5 (44,500× on a different fixture).  Both modes are within R-P5 spec (`≤ 0.15`, i.e. ≥ 6.7× speedup).  Pre-fix the warm-path R-C1 held only via greedy decode determinism (both runs did full prefill independently); post-fix the equivalence is observably caused by cache-hit replay.
+
+### Remaining follow-on (not B-tq.4 acceptance)
+
+- **8-bit codebook support**: The substrate currently snapshots `kv_caches[].k_packed` which is the runtime's *4-bit* legacy cache (`hd/2` packed bytes).  At `HF2Q_TQ_CODEBOOK_BITS=8` the runtime additionally writes to `leg_hb_encoded` (the HB-packed cache that 8-bit SDPA reads); the snapshot doesn't touch it yet.  Pinning the live test at 4-bit so snapshot/restore shape matches what the runtime actively uses.  8-bit support is **B-tq.7** follow-on (needs `leg_hb_encoded`-aware variants of `tq_v2_snapshot_block` / `tq_v2_restore_block`).
 
 **Why earlier B-tq.3 wording was wrong.**  The iter immediately preceding this one stated B-tq.4 was "gated on ADR-007 Path C runtime correctness work clearance."  Path C closed substantively on 2026-05-05 at 10 of 11 phases (`docs/adr007-pathC/PATHC_CLOSURE.md`).  The codec-freeze contract (Path C F-7) is LANDED — that's the contract B-tq.4 codes against.  Path C F-0.2 NRMSE 0.000247 at Gemma 4 26B production shape proves codec correctness.  The remaining open Path C item is F-5 (MMLU + LongBench) — discretionary downstream-consumer-driven validation, NOT a B-tq.4 prerequisite.
 
