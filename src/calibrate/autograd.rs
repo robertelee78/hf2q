@@ -199,6 +199,13 @@ impl Tensor {
         self.tape.0.borrow().nodes[self.node_idx].shape.clone()
     }
 
+    /// Tape node index — exposed so `#[cfg(test)]` parity assertions in
+    /// the GPU autograd module can index into the gradient vector
+    /// returned by [`backward`].  Not for production use.
+    pub fn node_idx(&self) -> usize {
+        self.node_idx
+    }
+
     pub fn numel(&self) -> usize {
         self.shape().iter().product()
     }
