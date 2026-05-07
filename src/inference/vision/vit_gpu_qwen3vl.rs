@@ -393,10 +393,10 @@ impl Qwen3VlViTConfig {
 ///   patch_embed split into the two GGUF tensors; T=0 → `v.patch_embd.weight`,
 ///   T=1 → `v.patch_embd.weight.1`)
 //
-// 4c.3 closure: consumed by `compute_vision_embeddings_gpu_qwen3vl`
-// below (the patch+pos prelude on the CPU side, then upload to GPU
-// for the per-block transformer loop). The `#[allow(dead_code)]`
-// from 4c.2 is dropped here.
+// Square-input wrapper retained for unit tests only — the production
+// `compute_vision_embeddings_gpu_qwen3vl` path uses the rectangular
+// `qwen3vl_dual_conv_patch_embed_cpu_hw` variant directly.
+#[cfg(test)]
 pub(crate) fn qwen3vl_dual_conv_patch_embed_cpu(
     pixel_values: &[f32],
     weight_0: &[f32],

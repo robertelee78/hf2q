@@ -61,7 +61,6 @@
 use std::collections::BTreeMap;
 
 use anyhow::{anyhow, Result};
-use mlx_native::MlxBuffer;
 
 use crate::calibrate::autograd_gpu_tape::{
     backward, log, matmul, mul, ones_like, row_sum, softmax, sub, GpuTape, GpuTensor,
@@ -234,48 +233,6 @@ pub fn estimate_sensitivities(
         out.insert(q.path.clone(), sensitivity);
     }
     Ok(out)
-}
-
-/// Identical-format CPU oracle of [`estimate_sensitivities`] used in
-/// tests.  Builds the same forward + KL-div graph on the CPU oracle's
-/// `Tape` and applies the same sensitivity formula.
-#[cfg(test)]
-pub fn estimate_sensitivities_cpu_oracle(
-    student_logits_cpu: &[f32],
-    teacher_logits_cpu: &[f32],
-    batch: usize,
-    vocab: usize,
-    quantizables: &[(String, Vec<f32>, Vec<f32>)],
-) -> Result<BTreeMap<String, f64>> {
-    use crate::calibrate::autograd as cpu;
-
-    // For the CPU oracle we directly compute dq = softmax(q) − softmax(p)
-    // analytically (verified by autograd::tests::kl_div_loss_backward_via_
-    // composition_dq_equals_softmax_q_minus_p) — this avoids needing to
-    // wire each quantizable's grad through a CPU `Tape` (the CPU oracle
-    // doesn't have a synthetic-2-Linear-model helper, and the analytical
-    // identity makes building one unnecessary for parity).
-    //
-    // Then for each quantizable, the gradient w.r.t. its weight is
-    // computed by the CALLER (test harness) and passed in via the
-    // pre-computed `_low − _high` deltas.  This routine just applies
-    // the sensitivity formula; the GPU side does the real autograd.
-    //
-    // (Iter 10+ adds a CPU oracle that wires through Tape end-to-end.
-    //  At iter 9 the GPU-side test verifies its own gradient by
-    //  building both a GPU forward and a CPU oracle forward on
-    //  identical inputs and comparing the dQ result analytically.)
-    let _ = (
-        student_logits_cpu,
-        teacher_logits_cpu,
-        batch,
-        vocab,
-        quantizables,
-    );
-    // The CPU-oracle test path lives directly in the unit test below;
-    // this helper exists for symmetry / future iteration use.  Returning
-    // an empty map for now (callers don't invoke this — see tests).
-    Ok(BTreeMap::new())
 }
 
 #[cfg(test)]

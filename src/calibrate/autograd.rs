@@ -223,14 +223,6 @@ impl Tensor {
         }
     }
 
-    fn read_value<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&[f32], &[usize]) -> R,
-    {
-        let inner = self.tape.0.borrow();
-        let n = &inner.nodes[self.node_idx];
-        f(&n.forward_value, &n.shape)
-    }
 }
 
 /// Run backward from `loss` (a 0-D or 1-elem tensor) and return a

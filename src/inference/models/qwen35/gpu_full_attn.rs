@@ -1879,7 +1879,10 @@ pub fn apply_sdpa_with_kv_cache(
 ) -> Result<MlxBuffer> {
     let seq = seq_len as usize;
     let nh = n_heads as usize;
-    let nkv = n_kv_heads as usize;
+    // GQA k/v-head count is unused in this dispatch path — the cache
+    // layout downstream re-derives it from buffer shapes.  Kept named
+    // for symmetry with the surrounding nh/d/max_sl shape derivations.
+    let _nkv = n_kv_heads as usize;
     let d = head_dim as usize;
     let max_sl = max_seq_len as usize;
     let cur_len = slot.current_len[0] as usize;
