@@ -47,6 +47,7 @@ use mlx_native::{
         dispatch_rms_norm_backward_dw, dispatch_rms_norm_backward_dx,
         dispatch_rms_norm_compute_rms_inv,
     },
+    ops::embedding_autograd::{dispatch_embedding_lookup_f32, dispatch_embedding_scatter_add_f32},
     ops::row_sum::{dispatch_row_sum_backward_f32, dispatch_row_sum_f32},
     ops::silu_backward::{dispatch_silu_backward_f32, dispatch_silu_f32},
     ops::slice_concat_2d::{dispatch_copy_2d_cols_into_f32, dispatch_slice_2d_cols_f32},
@@ -103,6 +104,19 @@ enum OpKind {
         input_idx: usize,
         rows: usize,
         cols: usize,
+    },
+    /// Embedding-table lookup `Y[b, h] = E[ids[b], h]`.  One parent
+    /// (the embedding table); `ids` is a u32 tensor stored as an
+    /// `MlxBuffer` inside this variant — non-differentiable, NOT a
+    /// tape parent.  Backward is a scatter-add into a zero-init
+    /// `dE[vocab, hidden]` via mlx-native's
+    /// `dispatch_embedding_scatter_add_f32`.
+    Embedding {
+        embedding_idx: usize,
+        ids_buf: MlxBuffer,
+        batch: usize,
+        vocab: usize,
+        hidden: usize,
     },
     /// Elementwise SiLU (swish): `silu(x) = x · sigmoid(x)`.
     /// Backward via mlx-native's `dispatch_silu_backward_f32`
@@ -457,6 +471,9 @@ pub fn backward(
             | OpKind::Slice2dCols { input_idx, .. }
             | OpKind::SiLU { input_idx } => {
                 accumulate(&mut grads, input_idx, &parent_grads[0], tape)?;
+            }
+            OpKind::Embedding { embedding_idx, .. } => {
+                accumulate(&mut grads, embedding_idx, &parent_grads[0], tape)?;
             }
             OpKind::Concat2Cols {
                 lhs_idx, rhs_idx, ..
@@ -841,6 +858,49 @@ fn backward_dispatch(
                 .map_err(|e| anyhow!("backward softmax: commit_and_wait: {e}"))?;
 
             Ok((op, vec![dx_buf]))
+        }
+        OpKind::Embedding {
+            ids_buf,
+            batch,
+            vocab,
+            hidden,
+            ..
+        } => {
+            // dE[id, h] = Σ_{b: ids[b] == id} dy[b, h]  via
+            // mlx-native's scatter-add kernel into a zero-init buffer.
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+            // alloc_buffer is zero-fill (ADR-015 iter61a).
+            let de_buf = device
+                .alloc_buffer(vocab * hidden * 4, DType::F32, vec![vocab, hidden])
+                .map_err(|e| anyhow!("backward embedding: alloc dE: {e}"))?;
+            let mut params_buf = device
+                .alloc_buffer(12, DType::F32, vec![3])
+                .map_err(|e| anyhow!("backward embedding: alloc params: {e}"))?;
+            params_buf
+                .as_mut_slice::<u32>()
+                .map_err(|e| anyhow!("backward embedding: params write: {e}"))?[..3]
+                .copy_from_slice(&[vocab as u32, hidden as u32, batch as u32]);
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward embedding: encoder: {e}"))?;
+            dispatch_embedding_scatter_add_f32(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                out_grad,
+                &ids_buf,
+                &de_buf,
+                &params_buf,
+                vocab as u32,
+                hidden as u32,
+                batch as u32,
+            )
+            .map_err(|e| anyhow!("backward embedding: dispatch: {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward embedding: commit_and_wait: {e}"))?;
+            Ok((op, vec![de_buf]))
         }
         OpKind::SiLU { input_idx } => {
             // dx = dy · silu'(x), where x is the FORWARD INPUT.
@@ -1269,6 +1329,100 @@ pub fn softmax(t: &GpuTensor) -> Result<GpuTensor> {
         tape: tape.clone(),
         node_idx,
         shape: vec![rows, cols],
+    })
+}
+
+/// Embedding-table lookup: `Y[b, h] = E[ids[b], h]`.
+///
+/// `embedding` shape: `[vocab, hidden]`.
+/// `ids`: `&[u32]` of length `batch`; each value must be < vocab.
+/// Output shape: `[batch, hidden]`.
+///
+/// Backward = scatter-add into `dE` of shape `[vocab, hidden]`
+/// via mlx-native's `dispatch_embedding_scatter_add_f32`.
+pub fn embedding(embedding: &GpuTensor, ids: &[u32]) -> Result<GpuTensor> {
+    if embedding.shape.len() != 2 {
+        return Err(anyhow!(
+            "embedding: table must be 2-D [vocab, hidden]; got shape={:?}",
+            embedding.shape
+        ));
+    }
+    let vocab = embedding.shape[0];
+    let hidden = embedding.shape[1];
+    let batch = ids.len();
+    if batch == 0 {
+        return Err(anyhow!("embedding: ids must have at least one element"));
+    }
+    for (i, &id) in ids.iter().enumerate() {
+        if (id as usize) >= vocab {
+            return Err(anyhow!(
+                "embedding: ids[{i}]={id} ≥ vocab={vocab}"
+            ));
+        }
+    }
+
+    let tape = &embedding.tape;
+    let device = tape.device();
+    let table_buf = tape.with_node(embedding.node_idx, |n| n.value.clone());
+
+    // Upload ids to GPU (u32).
+    let mut ids_buf = device
+        .alloc_buffer(batch * 4, DType::U32, vec![batch])
+        .map_err(|e| anyhow!("embedding: alloc ids: {e}"))?;
+    ids_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("embedding: ids write: {e}"))?
+        .copy_from_slice(ids);
+
+    let out_buf = device
+        .alloc_buffer(batch * hidden * 4, DType::F32, vec![batch, hidden])
+        .map_err(|e| anyhow!("embedding: alloc output: {e}"))?;
+    let mut params_buf = device
+        .alloc_buffer(8, DType::F32, vec![2])
+        .map_err(|e| anyhow!("embedding: alloc params: {e}"))?;
+    params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("embedding: params write: {e}"))?[..2]
+        .copy_from_slice(&[vocab as u32, hidden as u32]);
+
+    let mut registry = tape.0.registry.borrow_mut();
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("embedding: encoder: {e}"))?;
+    dispatch_embedding_lookup_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &table_buf,
+        &ids_buf,
+        &out_buf,
+        &params_buf,
+        vocab as u32,
+        hidden as u32,
+        batch as u32,
+    )
+    .map_err(|e| anyhow!("embedding: dispatch: {e}"))?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("embedding: commit_and_wait: {e}"))?;
+    drop(registry);
+
+    let embedding_idx = embedding.node_idx;
+    let node_idx = tape.push_node(
+        OpKind::Embedding {
+            embedding_idx,
+            ids_buf,
+            batch,
+            vocab,
+            hidden,
+        },
+        out_buf,
+        vec![batch, hidden],
+    );
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: vec![batch, hidden],
     })
 }
 
@@ -2692,6 +2846,99 @@ mod tests {
         match rms_norm(&bad_x, &w, 1e-6) {
             Err(e) => assert!(format!("{e}").contains("input must be 2-D")),
             Ok(_) => panic!("expected input-shape error"),
+        }
+    }
+
+    #[test]
+    fn gpu_tape_embedding_forward_backward_parity() {
+        // Build embedding table; lookup with deterministic ids;
+        // verify forward output matches the table rows; backward
+        // with dy=ones produces dE[id] = (count of id in batch).
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let vocab = 16usize;
+        let hidden = 8usize;
+        let table: Vec<f32> = (0..vocab * hidden).map(|i| (i as f32) * 0.13).collect();
+        let et = GpuTensor::from_vec(&tape, &table, vec![vocab, hidden]).unwrap();
+        let ids: Vec<u32> = vec![3, 7, 0, 15, 5, 5, 12, 1];
+        let yt = embedding(&et, &ids).unwrap();
+        assert_eq!(yt.shape(), [ids.len(), hidden]);
+        let y_vec: Vec<f32> = yt.to_vec().unwrap();
+        for (b, &id) in ids.iter().enumerate() {
+            for h in 0..hidden {
+                assert_eq!(
+                    y_vec[b * hidden + h].to_bits(),
+                    table[id as usize * hidden + h].to_bits(),
+                    "forward mismatch at b={b} h={h}"
+                );
+            }
+        }
+
+        // Backward: dy = ones → dE[id, h] = count(id in ids).
+        let dy = ones_like(&tape, &[ids.len(), hidden]).unwrap();
+        let grads = backward(&yt, dy).unwrap();
+        let de = grads[et.node_idx()].as_ref().unwrap();
+        let de_vec: Vec<f32> = de.as_slice::<f32>().unwrap().to_vec();
+        for id in 0..vocab {
+            let count = ids.iter().filter(|&&i| i as usize == id).count() as f32;
+            for h in 0..hidden {
+                assert_eq!(
+                    de_vec[id * hidden + h], count,
+                    "dE[id={id}, h={h}] expected {count}, got {}",
+                    de_vec[id * hidden + h]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_tape_embedding_chained_through_matmul_backward() {
+        // Compose: y = matmul(embedding(E, ids), W).
+        // Backward must flow gradients to BOTH E and W.
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let vocab = 32usize;
+        let hidden = 32usize;
+        let out_dim = 32usize;
+        let table: Vec<f32> = (0..vocab * hidden)
+            .map(|i| (i as f32 * 0.011).sin() * 0.3)
+            .collect();
+        let w_proj: Vec<f32> = (0..hidden * out_dim)
+            .map(|i| (i as f32 * 0.013).cos() * 0.2)
+            .collect();
+        let et = GpuTensor::from_vec(&tape, &table, vec![vocab, hidden]).unwrap();
+        let wt = GpuTensor::from_vec(&tape, &w_proj, vec![hidden, out_dim]).unwrap();
+        let ids: Vec<u32> = (0..32).map(|i| (i * 3 + 1) as u32 % vocab as u32).collect();
+        let embed_out = embedding(&et, &ids).unwrap();
+        let proj = matmul(&embed_out, &wt).unwrap();
+        let dy = ones_like(&tape, &[ids.len(), out_dim]).unwrap();
+        let grads = backward(&proj, dy).unwrap();
+        // Both E and W must have grads.
+        let de = grads[et.node_idx()]
+            .as_ref()
+            .expect("E grad expected");
+        let dw = grads[wt.node_idx()]
+            .as_ref()
+            .expect("W grad expected");
+        assert_eq!(de.element_count(), vocab * hidden);
+        assert_eq!(dw.element_count(), hidden * out_dim);
+        let de_vec: Vec<f32> = de.as_slice::<f32>().unwrap().to_vec();
+        let dw_vec: Vec<f32> = dw.as_slice::<f32>().unwrap().to_vec();
+        for v in de_vec.iter().chain(dw_vec.iter()) {
+            let val: f32 = *v;
+            assert!(val.is_finite(), "grad not finite: {val}");
+        }
+    }
+
+    #[test]
+    fn gpu_tape_embedding_rejects_oob_ids() {
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let et = GpuTensor::from_vec(&tape, &vec![0.0; 8 * 4], vec![8, 4]).unwrap();
+        match embedding(&et, &[3, 9, 0]) {
+            // 9 ≥ vocab=8
+            Err(e) => assert!(format!("{e}").contains("≥ vocab")),
+            Ok(_) => panic!("expected oob id error"),
         }
     }
 
