@@ -974,6 +974,34 @@ enum Request {
         write_pos: u32,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// **Phase B-tq.4** — TQ-packed K/V snapshot.  Worker thread
+    /// reads `MlxModelWeights.kv_caches[layer]` via
+    /// [`crate::serve::forward_mlx::MlxModelWeights::tq_v2_snapshot_block`]
+    /// and returns `(k_payload, v_payload)` — two
+    /// `tq_packed_v2` envelopes.  Mirror of [`Request::KvSnapshot`]
+    /// for the TurboQuant-active KV path; Qwen35/Qwen3VL arms return
+    /// `Err` (TQ is Gemma-4-only at this iter, per the
+    /// family-scoping discipline).
+    TqPackedKvSnapshot {
+        layer_rank: usize,
+        range: std::ops::Range<u32>,
+        bits_per_coord: crate::serve::kv_persist::families::tq_packed::TqBitsPerCoord,
+        flags: u32,
+        scale: f64,
+        reply: oneshot::Sender<Result<(Vec<u8>, Vec<u8>)>>,
+    },
+    /// **Phase B-tq.4** — TQ-packed K/V restore.  Worker thread
+    /// writes `(k_payload, v_payload)` into
+    /// `MlxModelWeights.kv_caches[layer]` via
+    /// [`crate::serve::forward_mlx::MlxModelWeights::tq_v2_restore_block`].
+    TqPackedKvRestore {
+        layer_rank: usize,
+        range: std::ops::Range<u32>,
+        bits_per_coord: crate::serve::kv_persist::families::tq_packed::TqBitsPerCoord,
+        k_payload: Vec<u8>,
+        v_payload: Vec<u8>,
+        reply: oneshot::Sender<Result<()>>,
+    },
     /// ADR-017 Closure iter-5 / Phase E (2026-05-04) — serialize the
     /// worker-side `loaded.prompt_cache` into a JSON byte payload via
     /// [`crate::serve::kv_persist::prompt_cache_persist::try_serialize`].
@@ -2525,6 +2553,88 @@ impl Engine {
             .context("kv_restore reply dropped")?
     }
 
+    /// **Phase B-tq.4** — synchronously snapshot a layer's TQ-packed
+    /// K/V state for the given token-position `range`.  Sends a
+    /// `Request::TqPackedKvSnapshot` to the worker thread; worker
+    /// reads `MlxModelWeights.kv_caches[layer]` and packs two
+    /// `tq_packed_v2` envelopes (one for K, one for V).  Returns
+    /// `(k_payload, v_payload)`.
+    ///
+    /// Mirror of [`Self::request_kv_snapshot`] for the TurboQuant-
+    /// active KV path.  Called by
+    /// [`crate::serve::kv_persist::families::tq_packed::TqPackedSpill::snapshot_via_engine`]
+    /// from inside `KvCacheSpill::snapshot_block`.
+    pub fn tq_packed_v2_snapshot_block(
+        &self,
+        layer_rank: usize,
+        range: std::ops::Range<u32>,
+        bits_per_coord: crate::serve::kv_persist::families::tq_packed::TqBitsPerCoord,
+        flags: u32,
+        scale: f64,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let req = Request::TqPackedKvSnapshot {
+            layer_rank,
+            range,
+            bits_per_coord,
+            flags,
+            scale,
+            reply: reply_tx,
+        };
+        match self.inner.tx.try_send(req) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(req)) => {
+                self.inner
+                    .tx
+                    .blocking_send(req)
+                    .context("engine worker is gone (tq_packed_kv_snapshot full→blocking)")?;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                anyhow::bail!("engine worker is gone (tq_packed_kv_snapshot)");
+            }
+        }
+        reply_rx
+            .blocking_recv()
+            .context("tq_packed_kv_snapshot reply dropped")?
+    }
+
+    /// **Phase B-tq.4** — synchronously restore a layer's TQ-packed
+    /// K/V state from `(k_payload, v_payload)` envelopes.  Inverse of
+    /// [`Self::tq_packed_v2_snapshot_block`].
+    pub fn tq_packed_v2_restore_block(
+        &self,
+        layer_rank: usize,
+        range: std::ops::Range<u32>,
+        bits_per_coord: crate::serve::kv_persist::families::tq_packed::TqBitsPerCoord,
+        k_payload: &[u8],
+        v_payload: &[u8],
+    ) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let req = Request::TqPackedKvRestore {
+            layer_rank,
+            range,
+            bits_per_coord,
+            k_payload: k_payload.to_vec(),
+            v_payload: v_payload.to_vec(),
+            reply: reply_tx,
+        };
+        match self.inner.tx.try_send(req) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(req)) => {
+                self.inner
+                    .tx
+                    .blocking_send(req)
+                    .context("engine worker is gone (tq_packed_kv_restore full→blocking)")?;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                anyhow::bail!("engine worker is gone (tq_packed_kv_restore)");
+            }
+        }
+        reply_rx
+            .blocking_recv()
+            .context("tq_packed_kv_restore reply dropped")?
+    }
+
     /// Run a single-prompt warmup pass. Blocks until the worker finishes it.
     /// Typical cost is one prefill + a few decode tokens on a tiny prompt —
     /// at the 10ms-order on M5 Max. The warmup's job is to compile all
@@ -3158,6 +3268,73 @@ fn worker_run(
                     LoadedModel::Qwen3VlText(_) => Err(anyhow::anyhow!(
                         "kv_restore: not yet supported on Qwen3-VL text variant \
                          (iter-228a is load-only; KV cache allocation lands in iter-228b)"
+                    )),
+                };
+                let _ = reply.send(result);
+            }
+            // **Phase B-tq.4** — TQ-packed snapshot/restore worker
+            // dispatch.  Mirror of `Request::KvSnapshot`/`KvRestore`
+            // for the TurboQuant-active KV path.  Reads/writes via
+            // `MlxModelWeights::tq_v2_*` (shipped at
+            // `forward_mlx.rs:4667+` in commit b7e975d).
+            Request::TqPackedKvSnapshot {
+                layer_rank,
+                range,
+                bits_per_coord,
+                flags,
+                scale,
+                reply,
+            } => {
+                let result: Result<(Vec<u8>, Vec<u8>)> = match &loaded {
+                    LoadedModel::Gemma(g) => g
+                        .weights
+                        .tq_v2_snapshot_block(
+                            layer_rank,
+                            range,
+                            bits_per_coord,
+                            flags,
+                            scale,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("tq_v2_snapshot_block failed: {:?}", e)
+                        }),
+                    LoadedModel::Qwen35(_) => Err(anyhow::anyhow!(
+                        "tq_packed_kv_snapshot: not supported on Qwen35 variant \
+                         (TQ-active path is Gemma 4 only at this iter — see B-tq.4)"
+                    )),
+                    LoadedModel::Qwen3VlText(_) => Err(anyhow::anyhow!(
+                        "tq_packed_kv_snapshot: not supported on Qwen3-VL text \
+                         variant (iter-228 is load-only; TQ-active wiring deferred)"
+                    )),
+                };
+                let _ = reply.send(result);
+            }
+            Request::TqPackedKvRestore {
+                layer_rank,
+                range,
+                bits_per_coord,
+                k_payload,
+                v_payload,
+                reply,
+            } => {
+                let result: Result<()> = match &mut loaded {
+                    LoadedModel::Gemma(g) => g
+                        .weights
+                        .tq_v2_restore_block(
+                            layer_rank,
+                            range,
+                            bits_per_coord,
+                            &k_payload,
+                            &v_payload,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("tq_v2_restore_block failed: {:?}", e)
+                        }),
+                    LoadedModel::Qwen35(_) => Err(anyhow::anyhow!(
+                        "tq_packed_kv_restore: not supported on Qwen35 variant"
+                    )),
+                    LoadedModel::Qwen3VlText(_) => Err(anyhow::anyhow!(
+                        "tq_packed_kv_restore: not supported on Qwen3-VL text variant"
                     )),
                 };
                 let _ = reply.send(result);

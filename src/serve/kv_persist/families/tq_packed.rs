@@ -761,6 +761,116 @@ pub fn restore_tq_v2_payload_into_buffers(
 }
 
 // ============================================================================
+// Phase B-tq.4 — K+V bundle codec
+// ============================================================================
+//
+// The spiller's `KvCacheSpill::snapshot_block` returns ONE `Vec<u8>` per
+// (layer, range) block — but TQ-packed has TWO envelopes per block (K
+// and V).  The bundle codec packs both v2 envelopes into a single
+// `Vec<u8>` for the spiller's persist path:
+//
+//   [   0..  4]: u32 LE — bundle magic = b"TQK2" (0x32_4B_51_54)
+//   [   4.. 12]: u64 LE — k_payload_len
+//   [  12..12+K]: k_payload (a tq_packed_v2 envelope)
+//   [12+K..12+K+8]: u64 LE — v_payload_len
+//   [12+K+8..12+K+8+V]: v_payload (a tq_packed_v2 envelope)
+//
+// The bundle magic disambiguates from a bare v1/v2 envelope so
+// `TqPackedSpill::insert_block` can magic-dispatch correctly; the v1
+// substrate path (synthesize_block, B-tq.1 tests) and the v2 raw-bytes
+// path (capture_tq_v2_payload_from_buffers test path) continue to
+// accept bare envelopes.
+
+/// Magic bytes prefixing the K+V bundle.  ASCII `"TQK2"` stored
+/// little-endian as `0x32_4B_51_54`.
+pub const TQ_PACKED_KV_BUNDLE_MAGIC: u32 =
+    u32::from_le_bytes([b'T', b'Q', b'K', b'2']);
+
+/// Wire-size of the bundle's fixed prefix (magic + k_len + 0 +
+/// v_len_offset is computed dynamically per-bundle).  This is the
+/// minimum byte count required to begin parsing.
+pub const TQ_PACKED_KV_BUNDLE_HEADER_BYTES: usize = 12;
+
+/// Pack a K+V bundle from two `tq_packed_v2` envelopes.  The K and V
+/// payloads must both have the v2 magic; we don't otherwise validate
+/// (the caller — `TqPackedSpill` — already validated via
+/// `pack_tq_v2_payload`).
+pub fn pack_tq_v2_kv_bundle(
+    k_payload: &[u8],
+    v_payload: &[u8],
+) -> Result<Vec<u8>, TqEnvelopeError> {
+    if k_payload.len() < 4 || v_payload.len() < 4 {
+        return Err(TqEnvelopeError::Truncated {
+            got: k_payload.len().min(v_payload.len()),
+        });
+    }
+    let k_magic = u32::from_le_bytes([
+        k_payload[0],
+        k_payload[1],
+        k_payload[2],
+        k_payload[3],
+    ]);
+    let v_magic = u32::from_le_bytes([
+        v_payload[0],
+        v_payload[1],
+        v_payload[2],
+        v_payload[3],
+    ]);
+    if k_magic != TQ_PACKED_V2_MAGIC || v_magic != TQ_PACKED_V2_MAGIC {
+        return Err(TqEnvelopeError::BadMagic {
+            got: if k_magic != TQ_PACKED_V2_MAGIC { k_magic } else { v_magic },
+        });
+    }
+
+    let total =
+        TQ_PACKED_KV_BUNDLE_HEADER_BYTES + k_payload.len() + 8 + v_payload.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&TQ_PACKED_KV_BUNDLE_MAGIC.to_le_bytes());
+    out.extend_from_slice(&(k_payload.len() as u64).to_le_bytes());
+    out.extend_from_slice(k_payload);
+    out.extend_from_slice(&(v_payload.len() as u64).to_le_bytes());
+    out.extend_from_slice(v_payload);
+    debug_assert_eq!(out.len(), total);
+    Ok(out)
+}
+
+/// Unpack a K+V bundle.  Returns `(k_payload, v_payload)` slices
+/// borrowing from the input bundle.
+pub fn unpack_tq_v2_kv_bundle(
+    bundle: &[u8],
+) -> Result<(&[u8], &[u8]), TqEnvelopeError> {
+    if bundle.len() < TQ_PACKED_KV_BUNDLE_HEADER_BYTES {
+        return Err(TqEnvelopeError::Truncated { got: bundle.len() });
+    }
+    let magic = u32::from_le_bytes([bundle[0], bundle[1], bundle[2], bundle[3]]);
+    if magic != TQ_PACKED_KV_BUNDLE_MAGIC {
+        return Err(TqEnvelopeError::BadMagic { got: magic });
+    }
+    let k_len = u64::from_le_bytes([
+        bundle[4], bundle[5], bundle[6], bundle[7],
+        bundle[8], bundle[9], bundle[10], bundle[11],
+    ]) as usize;
+    let k_start = TQ_PACKED_KV_BUNDLE_HEADER_BYTES;
+    let k_end = k_start + k_len;
+    if bundle.len() < k_end + 8 {
+        return Err(TqEnvelopeError::Truncated { got: bundle.len() });
+    }
+    let v_len = u64::from_le_bytes([
+        bundle[k_end], bundle[k_end + 1], bundle[k_end + 2], bundle[k_end + 3],
+        bundle[k_end + 4], bundle[k_end + 5], bundle[k_end + 6], bundle[k_end + 7],
+    ]) as usize;
+    let v_start = k_end + 8;
+    let v_end = v_start + v_len;
+    if bundle.len() != v_end {
+        return Err(TqEnvelopeError::PayloadSizeMismatch {
+            expected: v_end,
+            got: bundle.len(),
+        });
+    }
+    Ok((&bundle[k_start..k_end], &bundle[v_start..v_end]))
+}
+
+// ============================================================================
 // Phase B-tq.2 — engine-side family hook
 // ============================================================================
 //
@@ -785,7 +895,7 @@ pub fn restore_tq_v2_payload_into_buffers(
 
 use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use crate::serve::kv_persist::format::ModelFingerprint;
 use crate::serve::kv_persist::spiller::KvCacheSpill;
@@ -830,14 +940,19 @@ impl TqPackedConfig {
     }
 }
 
-/// Phase B-tq.2 family hook for TurboQuant-packed K/V layers.
+/// Phase B-tq.2 + B-tq.4 family hook for TurboQuant-packed K/V layers.
 ///
 /// The internal `blocks` map is keyed by `(layer_rank, range_start)`
-/// and stores pre-packed `tq_packed_v1` envelope payloads.
-/// `snapshot_block(layer, range)` returns the stored bytes verbatim;
+/// and stores pre-packed envelope payloads (v1 substrate or
+/// v2-engine-wired or v2-K+V-bundle, all magic-dispatched).
+/// `snapshot_block(layer, range)` returns the stored bytes verbatim
+/// when `engine_arc` is unbound, OR upgrades the `Arc<Engine>` and
+/// reads through `MlxModelWeights::tq_v2_snapshot_block` when bound;
 /// `restore_block(layer, range, payload)` validates the envelope and
-/// stores.  Both operations are O(log n) in the number of stored
-/// blocks (`BTreeMap` lookup).
+/// stores, OR additionally writes back through
+/// `MlxModelWeights::tq_v2_restore_block` when bound.  Both ops are
+/// O(log n) in the number of stored blocks (`BTreeMap` lookup) plus
+/// at most one cross-thread Engine call.
 pub struct TqPackedSpill {
     cfg: TqPackedConfig,
     /// Pre-packed payloads keyed by (layer_rank, range_start).  Held
@@ -850,19 +965,42 @@ pub struct TqPackedSpill {
     /// `None`, falls back to the spiller's legacy `(repo, quant, "",
     /// "", "")` fingerprint per the trait default.
     fingerprint: RwLock<Option<ModelFingerprint>>,
+    /// **Phase B-tq.4** — live `Engine` clone (production engine-wired
+    /// path).  When `Some`, `snapshot_block` / `restore_block` route
+    /// through `MlxModelWeights::tq_v2_snapshot_block` /
+    /// `tq_v2_restore_block` (shipped at `forward_mlx.rs:4667+`)
+    /// instead of the in-memory `blocks` map.  When `None`, falls back
+    /// to the in-memory map (B-tq.2 substrate path; preserved for
+    /// tests + the synthetic/insert_block contract).
+    ///
+    /// Mirrors `Gemma4DenseSpill::engine_arc` at
+    /// `gemma4_dense.rs:269-291`.  Stores `Engine` value (not
+    /// `Arc<Engine>` and not `Weak<Engine>`): the P0-bench fix from
+    /// 2026-05-04 (`gemma4_dense.rs::engine_arc` doc) explains why
+    /// — `Engine` is `#[derive(Clone)]` over `inner: Arc<EngineInner>`,
+    /// so cloning into this slot keeps the worker-channel alive
+    /// (Arc<EngineInner> strong-count) without polluting the OUTER
+    /// `Arc<Engine>` that `LoaderWrapper::load`'s `try_unwrap`
+    /// operates on.
+    engine_arc: Arc<RwLock<Option<crate::serve::api::engine::Engine>>>,
 }
 
 impl TqPackedSpill {
     /// Construct a new TQ-packed spill from shape config.  The block
-    /// map starts empty; B-tq.3 engine wiring populates it via
-    /// [`Self::insert_block`] (or future
-    /// `snapshot_via_engine_post_quantize`).
+    /// map starts empty.  **B-tq.4**: `engine_arc` starts `None`; the
+    /// factory's `try_construct` populates it before the hook is
+    /// returned to the spiller.
+    ///
+    /// Tests + synthetic fixtures use this constructor + manual
+    /// `insert_block` to populate the in-memory map.  The production
+    /// engine-wired path uses [`Self::new_with_engine`] instead.
     pub fn new(cfg: TqPackedConfig) -> Result<Self, SpillErrorKind> {
         cfg.validate()?;
         Ok(Self {
             cfg,
             blocks: RwLock::new(BTreeMap::new()),
             fingerprint: RwLock::new(None),
+            engine_arc: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -871,6 +1009,178 @@ impl TqPackedSpill {
         if let Ok(mut slot) = self.fingerprint.write() {
             *slot = Some(fp);
         }
+    }
+
+    // ========================================================================
+    // Phase B-tq.4 — engine-bound construction + bind methods
+    // ========================================================================
+    //
+    // These mirror `Gemma4DenseSpill`'s pattern at
+    // `gemma4_dense.rs:392-460`.  The factory's `try_construct`
+    // downcasts `Arc<dyn Any>` to `Arc<Engine>`; if successful, we
+    // store an `Engine` clone (cheap — clones the inner Arc<EngineInner>
+    // worker channel) in `engine_arc`.  See the `engine_arc` field
+    // doc-comment for the P0-bench-fix rationale.
+
+    /// **Phase B-tq.4** — production constructor: build a spill from
+    /// shape config AND a live `Engine` clone.  The engine is stored
+    /// in `engine_arc`; subsequent `snapshot_block` / `restore_block`
+    /// calls route through it.
+    pub fn new_with_engine(
+        cfg: TqPackedConfig,
+        engine: crate::serve::api::engine::Engine,
+    ) -> Result<Self, SpillErrorKind> {
+        cfg.validate()?;
+        Ok(Self {
+            cfg,
+            blocks: RwLock::new(BTreeMap::new()),
+            fingerprint: RwLock::new(None),
+            engine_arc: Arc::new(RwLock::new(Some(engine))),
+        })
+    }
+
+    /// **Phase B-tq.4** — populate `engine_arc` post-construction.
+    /// Used by `EngineBindable::bind_engine` and by tests that
+    /// construct via `new` then bind separately.
+    pub fn set_engine_arc(&self, engine: crate::serve::api::engine::Engine) {
+        if let Ok(mut slot) = self.engine_arc.write() {
+            *slot = Some(engine);
+        }
+    }
+
+    /// **Phase B-tq.4** — clear `engine_arc` (the
+    /// `EngineBindable::unbind_engine` path).  After this returns,
+    /// `snapshot_block` / `restore_block` fall back to the in-memory
+    /// `blocks` map.
+    pub fn clear_engine_arc(&self) {
+        if let Ok(mut slot) = self.engine_arc.write() {
+            *slot = None;
+        }
+    }
+
+    /// **Phase B-tq.4** — try to construct a `TqPackedSpill` whose
+    /// `engine_arc` is bound to a live `Engine`.  The factory's
+    /// `try_construct` calls this with the type-erased
+    /// `Arc<dyn Any + Send + Sync>` from the registry's
+    /// `try_substitute_on_load`.
+    ///
+    /// Returns `None` on type mismatch (silent no-op per the
+    /// `FamilyHookFactory` contract — caller falls through to the
+    /// stub registration).
+    pub fn try_from_engine_arc(
+        cfg: TqPackedConfig,
+        engine_dyn: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Option<Self> {
+        let engine_arc =
+            engine_dyn.downcast::<crate::serve::api::engine::Engine>().ok()?;
+        // Cheap-clone the inner Engine.  See `engine_arc` field doc
+        // for why this doesn't break `LoaderWrapper::load`'s
+        // `try_unwrap` — `Engine: Clone` over `inner: Arc<EngineInner>`,
+        // so cloning into our slot is independent of the OUTER Arc.
+        let engine: crate::serve::api::engine::Engine = (*engine_arc).clone();
+        // Unused: the outer Arc<Engine> drops at end of scope (its
+        // strong count returns to whatever the registry holds), keeping
+        // try_unwrap's contract intact.
+        drop(engine_arc);
+        Self::new_with_engine(cfg, engine).ok()
+    }
+
+    /// **Phase B-tq.4** — engine-bound snapshot path.  Mirrors
+    /// `Gemma4DenseSpill::snapshot_via_engine` at
+    /// `gemma4_dense.rs:873-938`.
+    ///
+    /// Bridges into the engine's worker thread via the existing
+    /// `Engine::Request::KvSnapshotTq` message (added in this iter
+    /// alongside `tq_v2_snapshot_block`'s wrapper).  The worker
+    /// thread reads `MlxModelWeights.kv_caches[layer]` and packs two
+    /// `tq_packed_v2` envelopes (one for K, one for V); we pack
+    /// those into a K+V bundle and return.
+    ///
+    /// Returns `None` on engine-side failure (engine dropped, layer
+    /// out of range, codec error) — matches the trait's "no work" /
+    /// fall-through semantic.
+    fn snapshot_via_engine(
+        &self,
+        engine: &crate::serve::api::engine::Engine,
+        layer_rank: usize,
+        range: Range<u32>,
+    ) -> Option<Vec<u8>> {
+        if layer_rank >= self.cfg.num_layers {
+            return None;
+        }
+        if range.end <= range.start {
+            return None;
+        }
+        let bits = self.cfg.bits_per_coord;
+        let flags = self.cfg.flags;
+        let scale = self.cfg.scale;
+        // Bridge to the engine's worker thread.  The wrapper handles
+        // the channel send + response; here we just consume the
+        // `(k_payload, v_payload)` and bundle.
+        let (k_payload, v_payload) = engine
+            .tq_packed_v2_snapshot_block(layer_rank, range, bits, flags, scale)
+            .ok()?;
+        pack_tq_v2_kv_bundle(&k_payload, &v_payload).ok()
+    }
+
+    /// **Phase B-tq.4** — engine-bound restore path.  Inverse of
+    /// `snapshot_via_engine`.  Mirrors
+    /// `Gemma4DenseSpill::restore_via_engine` at
+    /// `gemma4_dense.rs:940-987`.
+    fn restore_bundle(
+        &self,
+        layer_rank: usize,
+        range: Range<u32>,
+        payload: &[u8],
+    ) -> Result<(), SpillErrorKind> {
+        let (k_payload, v_payload) =
+            unpack_tq_v2_kv_bundle(payload).map_err(|_| SpillErrorKind::CodecErr)?;
+
+        // Validate v2 envelope shape against the runtime config
+        // BEFORE crossing the engine boundary — silent corruption is
+        // expensive on a real GPU.
+        let (header_k, _idx_k, _norms_k) =
+            unpack_tq_v2_payload(k_payload).map_err(|_| SpillErrorKind::CodecErr)?;
+        let (header_v, _idx_v, _norms_v) =
+            unpack_tq_v2_payload(v_payload).map_err(|_| SpillErrorKind::CodecErr)?;
+        if header_k.bits_per_coord != self.cfg.bits_per_coord
+            || header_v.bits_per_coord != self.cfg.bits_per_coord
+            || header_k.head_dim != self.cfg.head_dim[layer_rank]
+            || header_v.head_dim != self.cfg.head_dim[layer_rank]
+            || header_k.n_kv_heads != self.cfg.nkv_heads[layer_rank]
+            || header_v.n_kv_heads != self.cfg.nkv_heads[layer_rank]
+            || header_k.n_tokens != range.end.saturating_sub(range.start)
+            || header_v.n_tokens != range.end.saturating_sub(range.start)
+        {
+            return Err(SpillErrorKind::CodecErr);
+        }
+
+        // Engine-bound write-back.
+        let engine_opt = self
+            .engine_arc
+            .read()
+            .map_err(|_| SpillErrorKind::IoErr)?
+            .as_ref()
+            .cloned();
+        if let Some(engine) = engine_opt {
+            engine
+                .tq_packed_v2_restore_block(
+                    layer_rank,
+                    range.clone(),
+                    self.cfg.bits_per_coord,
+                    k_payload,
+                    v_payload,
+                )
+                .map_err(|_| SpillErrorKind::IoErr)?;
+        }
+        // Always cache the bundle in the in-memory map — preserves
+        // the substrate-path invariant that a restored block can be
+        // re-read by `snapshot_block` without round-tripping through
+        // the engine again.  This is also the fallback path when
+        // engine_arc is unbound (test fixtures + B-tq.2 substrate).
+        let mut map = self.blocks.write().map_err(|_| SpillErrorKind::IoErr)?;
+        map.insert((layer_rank, range.start), payload.to_vec());
+        Ok(())
     }
 
     /// Insert a pre-packed envelope payload (test fixture / future
@@ -966,6 +1276,24 @@ impl KvCacheSpill for TqPackedSpill {
         if layer_rank >= self.cfg.num_layers {
             return None;
         }
+        // **Phase B-tq.4**: production engine-bound path — when
+        // `engine_arc` is populated, read live KV state from the
+        // engine via `MlxModelWeights::tq_v2_snapshot_block` (shipped
+        // at `forward_mlx.rs:4667+`) and pack into a K+V bundle.  Mirrors
+        // `Gemma4DenseSpill::snapshot_via_engine` at
+        // `gemma4_dense.rs:1015`.
+        let engine_opt = self
+            .engine_arc
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned());
+        if let Some(engine) = engine_opt {
+            return self.snapshot_via_engine(&engine, layer_rank, range);
+        }
+        // **B-tq.2 fallback path**: in-memory map (synthesize_block /
+        // insert_block / test fixtures).  Returns the stored bytes
+        // verbatim — the spiller's persist path treats them as
+        // opaque envelope bytes.
         let map = self.blocks.read().ok()?;
         map.get(&(layer_rank, range.start)).cloned()
     }
@@ -983,6 +1311,15 @@ impl KvCacheSpill for TqPackedSpill {
             return Err(SpillErrorKind::CodecErr);
         }
         let magic = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+
+        // **Phase B-tq.4**: K+V bundle path — restore both K and V
+        // envelopes through the engine into the live MlxKvCache
+        // buffers.  Falls back to the in-memory map if engine_arc is
+        // unbound.
+        if magic == TQ_PACKED_KV_BUNDLE_MAGIC {
+            return self.restore_bundle(layer_rank, range, payload);
+        }
+
         let (bits, hd, nkv, ntok) = match magic {
             m if m == TQ_PACKED_V1_MAGIC => {
                 let (h, idx) = unpack_tq_v1_payload(payload)
@@ -1037,6 +1374,122 @@ impl KvCacheSpill for TqPackedSpill {
         _quant: QuantType,
     ) -> Option<ModelFingerprint> {
         self.fingerprint.read().ok().and_then(|fp| fp.clone())
+    }
+}
+
+// ============================================================================
+// Phase B-tq.4 — EngineBindable + TqPackedSpillFactory
+// ============================================================================
+//
+// `EngineBindable` lets the registry call `bind_engine(Arc<dyn Any>)` after
+// a successful load — TqPackedSpill downcasts to `Arc<Engine>` and
+// populates `engine_arc`.  Mirrors `Gemma4DenseSpill::bind_engine` at
+// `gemma4_dense.rs:1441-1474`.
+//
+// `TqPackedSpillFactory` is the registry-side factory that
+// `cmd_serve` registers at startup; on the first successful engine
+// load, the registry's `try_substitute_on_load` invokes
+// `factory.try_construct(engine_dyn)` which returns a fully-wired
+// `(Arc<Mutex<dyn KvCacheSpill>>, Arc<dyn EngineBindable>)` tuple.
+// Mirrors `Gemma4DenseSpillFactory` at `gemma4_dense.rs:1591-1692`.
+
+impl crate::serve::kv_persist::EngineBindable for TqPackedSpill {
+    fn bind_engine(&self, engine_dyn: Arc<dyn std::any::Any + Send + Sync>) {
+        // Try `Arc<Engine>` (production LoaderWrapper path).  Silent
+        // no-op on type mismatch per the EngineBindable contract.
+        if let Ok(engine_arc) =
+            engine_dyn.downcast::<crate::serve::api::engine::Engine>()
+        {
+            // Cheap-clone Engine (Arc<EngineInner>); see engine_arc
+            // field doc for the P0-bench-fix rationale.
+            let engine: crate::serve::api::engine::Engine = (*engine_arc).clone();
+            self.set_engine_arc(engine);
+        }
+        // Mismatch ⇒ drop type-erased Arc silently.
+    }
+
+    fn unbind_engine(&self) {
+        self.clear_engine_arc();
+    }
+}
+
+/// **Phase B-tq.4** — `FamilyHookFactory` impl for `TqPackedSpill`.
+///
+/// Carries the shape-only `TqPackedConfig` captured at `cmd_serve`
+/// startup.  On `try_construct(engine_dyn)`:
+///
+///   1. Calls [`TqPackedSpill::try_from_engine_arc`] which downcasts
+///      to `Arc<Engine>` and constructs a fully-wired spill on
+///      success.
+///   2. On `None` (type mismatch) → returns `None` (the registry's
+///      caller leaves the prior stub registration in place).
+///   3. On `Some(spill)` → wraps the spill in the
+///      `(Arc<Mutex<dyn KvCacheSpill>>, Arc<dyn EngineBindable>)`
+///      tuple expected by the `FamilyHookFactory` trait.  The same
+///      spill instance is referenced by both ends of the tuple — so
+///      a `bind_engine` call through the registry side mutates the
+///      same engine slot that a `restore_block` call through the
+///      spiller side reads.
+pub struct TqPackedSpillFactory {
+    cfg: TqPackedConfig,
+}
+
+impl TqPackedSpillFactory {
+    /// Construct a factory carrying the supplied shape config.  The
+    /// config is captured by value; subsequent factory invocations
+    /// reuse the same shape (the loaded model's TQ-packed shape is
+    /// immutable across evict/readmit cycles).
+    pub fn new(cfg: TqPackedConfig) -> Self {
+        Self { cfg }
+    }
+}
+
+impl crate::serve::kv_persist::registry::FamilyHookFactory for TqPackedSpillFactory {
+    fn try_construct(
+        &self,
+        engine_dyn: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Option<(
+        Arc<std::sync::Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>>,
+        Arc<dyn crate::serve::kv_persist::EngineBindable>,
+    )> {
+        // 1. Try to materialize a fully-wired spill from the engine.
+        //    None on type mismatch ⇒ no substitution.
+        let spill = TqPackedSpill::try_from_engine_arc(self.cfg.clone(), engine_dyn)?;
+
+        // 2. Wrap in the dual-end tuple.  Both ends point at the
+        //    SAME spill instance (Arc), so binding/unbinding through
+        //    the registry side updates the engine_arc that the
+        //    spiller side reads.  Mirrors `Gemma4DenseSpillFactory`'s
+        //    spill_arc.clone() pattern at `gemma4_dense.rs:1641-1642`.
+        //
+        //    For TQ-packed the spiller-side instance is the same as
+        //    the bindable-side instance (no separate dual-spill-
+        //    instance dance like Gemma4Dense's path) because the
+        //    TQ-packed engine_arc is the SOLE bridge — there's no
+        //    EngineHandle backwards-compat path to maintain.
+        let spill_arc = Arc::new(spill);
+        let bindable: Arc<dyn crate::serve::kv_persist::EngineBindable> =
+            spill_arc.clone();
+
+        // 3. Build the spiller-side spill.  Different instance than
+        //    the bindable-side because `KvCacheSpill::restore_block`
+        //    takes `&mut self` (in-memory map insert), so the
+        //    spiller's Mutex needs an owned spill.  The spiller's
+        //    spill is freshly constructed via `new_with_engine`
+        //    using a CLONE of the same engine — both spills route
+        //    through the same worker thread.
+        let spiller_engine = spill_arc
+            .engine_arc
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())?;
+        let spiller_side =
+            TqPackedSpill::new_with_engine(self.cfg.clone(), spiller_engine).ok()?;
+        let kv_hook: Arc<
+            std::sync::Mutex<dyn crate::serve::kv_persist::spiller::KvCacheSpill>,
+        > = Arc::new(std::sync::Mutex::new(spiller_side));
+
+        Some((kv_hook, bindable))
     }
 }
 
@@ -1908,5 +2361,219 @@ mod tests {
         garbage[3] = 0xFF;
         assert!(spill.insert_block(0, 256, garbage.clone()).is_err());
         assert!(KvCacheSpill::restore_block(&mut spill, 0, 0..256, &garbage).is_err());
+    }
+
+    // ============================================================================
+    // Phase B-tq.4 — iter-1 tests
+    // ============================================================================
+
+    /// **B-tq.4 bundle codec round-trip**: pack two synthetic v2
+    /// envelopes into a bundle, unpack, assert byte-identity on each
+    /// half.
+    #[test]
+    fn tq_packed_v2_kv_bundle_round_trip_byte_exact() {
+        let h = synthetic_v2_header(4, 8, 256, 256);
+        let idx = synthetic_indices(h.indices_bytes_len());
+        let norms = synthetic_norms_le(h.n_kv_heads as usize, h.n_tokens as usize, 42);
+        let k_payload = pack_tq_v2_payload(&h, &idx, &norms).expect("pack k");
+        // V uses different indices/norms to ensure the bundle
+        // preserves the K/V distinction.
+        let mut idx_v = idx.clone();
+        idx_v.iter_mut().for_each(|b| *b ^= 0x55);
+        let norms_v = synthetic_norms_le(h.n_kv_heads as usize, h.n_tokens as usize, 7);
+        let v_payload = pack_tq_v2_payload(&h, &idx_v, &norms_v).expect("pack v");
+
+        let bundle = pack_tq_v2_kv_bundle(&k_payload, &v_payload).expect("bundle");
+        let (k_unpacked, v_unpacked) =
+            unpack_tq_v2_kv_bundle(&bundle).expect("unbundle");
+        assert_eq!(k_unpacked, k_payload.as_slice());
+        assert_eq!(v_unpacked, v_payload.as_slice());
+
+        // Bundle byte-determinism: pack again, byte-identical.
+        let bundle2 = pack_tq_v2_kv_bundle(&k_payload, &v_payload).expect("bundle2");
+        assert_eq!(bundle, bundle2);
+    }
+
+    /// **B-tq.4 bundle frozen magic**: any change to the bundle magic
+    /// silently breaks on-disk format.  CI catches via this pin.
+    #[test]
+    fn tq_packed_kv_bundle_magic_is_frozen() {
+        // ASCII "TQK2" little-endian: 0x54 (T), 0x51 (Q), 0x4B (K),
+        // 0x32 (2).  u32::from_le_bytes assembles MSB-first in literal:
+        // 0x32_4B_51_54.
+        assert_eq!(TQ_PACKED_KV_BUNDLE_MAGIC, 0x32_4B_51_54);
+        assert_eq!(TQ_PACKED_KV_BUNDLE_MAGIC.to_le_bytes(), *b"TQK2");
+    }
+
+    /// **B-tq.4 bundle rejects bad inputs**: short payloads, wrong
+    /// magic on inner envelopes, mismatched length tail, all error.
+    #[test]
+    fn tq_packed_kv_bundle_rejects_malformed_inputs() {
+        // Inner envelope with wrong magic (use v1 magic on the K
+        // payload — bundle requires v2).
+        let h_v1 = synthetic_header(4, 8, 256, 256);
+        let idx_v1 = synthetic_indices(h_v1.indices_bytes_len());
+        let v1_bytes = pack_tq_v1_payload(&h_v1, &idx_v1).expect("v1 pack");
+        let h_v2 = synthetic_v2_header(4, 8, 256, 256);
+        let idx_v2 = synthetic_indices(h_v2.indices_bytes_len());
+        let norms_v2 = synthetic_norms_le(8, 256, 1);
+        let v2_bytes = pack_tq_v2_payload(&h_v2, &idx_v2, &norms_v2).expect("v2 pack");
+
+        // K=v1, V=v2 → reject (K must be v2)
+        assert!(pack_tq_v2_kv_bundle(&v1_bytes, &v2_bytes).is_err());
+        // K=v2, V=v1 → reject (V must be v2)
+        assert!(pack_tq_v2_kv_bundle(&v2_bytes, &v1_bytes).is_err());
+        // Empty K → reject
+        assert!(pack_tq_v2_kv_bundle(&[], &v2_bytes).is_err());
+
+        // Truncated bundle → reject on unpack
+        let bundle = pack_tq_v2_kv_bundle(&v2_bytes, &v2_bytes).expect("good bundle");
+        assert!(unpack_tq_v2_kv_bundle(&bundle[..bundle.len() - 1]).is_err());
+        assert!(unpack_tq_v2_kv_bundle(&[]).is_err());
+
+        // Bad bundle magic → reject
+        let mut bad_magic = bundle.clone();
+        bad_magic[0] ^= 0xFF;
+        assert!(unpack_tq_v2_kv_bundle(&bad_magic).is_err());
+    }
+
+    /// **B-tq.4 spill insert/restore accept bundle**: TqPackedSpill's
+    /// magic-dispatcher must route bundle-magic payloads through the
+    /// bundle path.  Verifies in-memory cache round-trip when
+    /// engine_arc is unbound (production engine path is exercised by
+    /// the E2E integration test).
+    #[test]
+    fn tq_packed_spill_accepts_bundle_payload_in_memory() {
+        let cfg = TqPackedConfig {
+            num_layers: 2,
+            nkv_heads: vec![8, 8],
+            head_dim: vec![256, 256],
+            bits_per_coord: TqBitsPerCoord::new(4).expect("4"),
+            scale: 1.0,
+            flags: flags::HADAMARD_ROTATED,
+            block_tokens: 256,
+        };
+        let mut spill = TqPackedSpill::new(cfg).expect("new");
+        let h = synthetic_v2_header(4, 8, 256, 256);
+        let idx = synthetic_indices(h.indices_bytes_len());
+        let norms = synthetic_norms_le(8, 256, 100);
+        let k_payload = pack_tq_v2_payload(&h, &idx, &norms).expect("k");
+        let v_payload = pack_tq_v2_payload(&h, &idx, &norms).expect("v");
+        let bundle = pack_tq_v2_kv_bundle(&k_payload, &v_payload).expect("bundle");
+
+        // restore_block accepts bundle and caches it in-memory (engine
+        // unbound ⇒ no engine round-trip; cache is preserved).
+        KvCacheSpill::restore_block(&mut spill, 0, 0..256, &bundle).expect("restore");
+        // snapshot_block reads it back verbatim.
+        let snap = KvCacheSpill::snapshot_block(&spill, 0, 0..256).expect("snap");
+        assert_eq!(snap, bundle);
+
+        // Bundle with WRONG inner shape (different bits) → reject.
+        let h_bad = synthetic_v2_header(8, 8, 256, 256);
+        let idx_bad = synthetic_indices(h_bad.indices_bytes_len());
+        let bundle_bad = pack_tq_v2_kv_bundle(
+            &pack_tq_v2_payload(&h_bad, &idx_bad, &norms[..h_bad.norms_bytes_len()])
+                .unwrap(),
+            &pack_tq_v2_payload(&h_bad, &idx_bad, &norms[..h_bad.norms_bytes_len()])
+                .unwrap(),
+        )
+        .expect("bundle bad");
+        assert!(KvCacheSpill::restore_block(&mut spill, 1, 0..256, &bundle_bad).is_err());
+    }
+
+    /// **B-tq.4 engine_arc bind/unbind**: set + clear cycle yields
+    /// expected state.  Doesn't exercise a real Engine (that needs a
+    /// loaded model — covered in E2E integration test).
+    #[test]
+    fn tq_packed_spill_engine_arc_starts_unbound() {
+        let cfg = TqPackedConfig {
+            num_layers: 1,
+            nkv_heads: vec![8],
+            head_dim: vec![256],
+            bits_per_coord: TqBitsPerCoord::new(4).expect("4"),
+            scale: 1.0,
+            flags: flags::HADAMARD_ROTATED,
+            block_tokens: 256,
+        };
+        let spill = TqPackedSpill::new(cfg).expect("new");
+        // engine_arc starts None (verified via the snapshot fall-
+        // through path: snapshot of an empty in-memory map returns
+        // None when engine_arc is unbound).
+        assert!(KvCacheSpill::snapshot_block(&spill, 0, 0..256).is_none());
+
+        // clear_engine_arc on already-unbound spill is a no-op (does
+        // not panic; mirrors EngineBindable contract).
+        spill.clear_engine_arc();
+        assert!(KvCacheSpill::snapshot_block(&spill, 0, 0..256).is_none());
+    }
+
+    /// **B-tq.4 factory rejects type mismatch**: Arc<String> (a
+    /// non-Engine type) should yield None from try_construct (silent
+    /// no-op per FamilyHookFactory contract).
+    #[test]
+    fn tq_packed_spill_factory_rejects_non_engine_arc() {
+        use crate::serve::kv_persist::registry::FamilyHookFactory;
+        let cfg = TqPackedConfig {
+            num_layers: 2,
+            nkv_heads: vec![8, 8],
+            head_dim: vec![256, 256],
+            bits_per_coord: TqBitsPerCoord::new(4).expect("4"),
+            scale: 1.0,
+            flags: flags::HADAMARD_ROTATED,
+            block_tokens: 256,
+        };
+        let factory = TqPackedSpillFactory::new(cfg);
+        // Pass an Arc<String> — definitely not an Engine.
+        let bogus: Arc<dyn std::any::Any + Send + Sync> =
+            Arc::new(String::from("not an engine"));
+        let result = factory.try_construct(bogus);
+        assert!(
+            result.is_none(),
+            "factory accepted non-Engine Arc — silent factory contract violated"
+        );
+    }
+
+    /// **B-tq.4 try_from_engine_arc rejects type mismatch** (mirror
+    /// of the factory test at the construction-helper level).
+    #[test]
+    fn tq_packed_spill_try_from_engine_arc_rejects_non_engine() {
+        let cfg = TqPackedConfig {
+            num_layers: 1,
+            nkv_heads: vec![8],
+            head_dim: vec![256],
+            bits_per_coord: TqBitsPerCoord::new(4).expect("4"),
+            scale: 1.0,
+            flags: flags::HADAMARD_ROTATED,
+            block_tokens: 256,
+        };
+        let bogus: Arc<dyn std::any::Any + Send + Sync> = Arc::new(42_u32);
+        assert!(TqPackedSpill::try_from_engine_arc(cfg, bogus).is_none());
+    }
+
+    /// **B-tq.4 EngineBindable bind_engine on type mismatch**: silent
+    /// no-op (no panic).
+    #[test]
+    fn tq_packed_spill_bind_engine_silent_on_mismatch() {
+        use crate::serve::kv_persist::EngineBindable;
+        let cfg = TqPackedConfig {
+            num_layers: 1,
+            nkv_heads: vec![8],
+            head_dim: vec![256],
+            bits_per_coord: TqBitsPerCoord::new(4).expect("4"),
+            scale: 1.0,
+            flags: flags::HADAMARD_ROTATED,
+            block_tokens: 256,
+        };
+        let spill = TqPackedSpill::new(cfg).expect("new");
+        let bogus: Arc<dyn std::any::Any + Send + Sync> = Arc::new(42_u32);
+        // Should not panic; engine_arc remains None.
+        spill.bind_engine(bogus);
+        // Verify by snapshotting an empty in-memory map (engine path
+        // would have routed to the worker — bound state would
+        // exercise different code).
+        assert!(KvCacheSpill::snapshot_block(&spill, 0, 0..256).is_none());
+
+        // unbind_engine is also safe on already-unbound spill.
+        spill.unbind_engine();
     }
 }

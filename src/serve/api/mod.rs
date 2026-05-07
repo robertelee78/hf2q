@@ -31,6 +31,7 @@ pub mod engine_qwen35;
 pub mod engine_qwen3vl;
 pub mod grammar;
 pub mod kv_spill_descriptor;
+pub mod tq_packed_descriptor;
 pub mod registry;
 pub mod handlers;
 pub mod router;
