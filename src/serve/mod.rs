@@ -2848,6 +2848,9 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         use crate::serve::kv_persist::families::gemma4_dense::{
             Gemma4DenseConfig, Gemma4DenseSpillFactory,
         };
+        use crate::serve::kv_persist::families::tq_packed::{
+            flags as tq_flags, TqBitsPerCoord, TqPackedConfig, TqPackedSpillFactory,
+        };
         use crate::serve::kv_persist::registry::FamilyHookFactory;
         use crate::serve::kv_persist::{
             AsyncWriterHandle, BlockPrefixCacheSpiller, DiskBlockStore, KvPersistRegistry,
@@ -3073,14 +3076,86 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
                 sliding_window: 4096,
                 max_decode_tokens: 8192,
             };
+            // **ADR-017 B-tq.4 iter-2 — single-registration policy.**
+            //
+            // Decision: register EITHER Gemma4DenseSpillFactory OR
+            // TqPackedSpillFactory per (repo, quant) FamilyKey, NOT
+            // both.  Reason: `KvPersistRegistry::register_factory`
+            // uses `HashMap<FamilyKey, Arc<dyn FamilyHookFactory>>`
+            // (registry.rs:158); the second registration overwrites
+            // the first.  Dual-registration would require either
+            // (a) a `Vec<Factory>` per key (changes registry trait
+            // surface) or (b) two distinct FamilyKeys (changes the
+            // bind/unbind discovery path).  Neither is justified
+            // when the runtime is in exactly one mode at a time —
+            // `HF2Q_TQ_KV=1` puts the engine on the TQ-active path
+            // for every layer and request; the dense factory's
+            // descriptor closure already returns None when
+            // `dense_kvs` is None.  So at runtime exactly one is
+            // active; we register exactly one.
+            //
+            // Detection: `is_tq_active_mode()` reads `HF2Q_TQ_KV`
+            // env at cmd_serve startup.  Mid-process toggling of
+            // the env doesn't re-shape the descriptor (matches the
+            // Gemma4Dense pattern at engine.rs:2149-2158 — env read
+            // ONCE at spawn).  This iter is correct for the static
+            // operator-time mode selection; future ADR-017 B-tq.5
+            // (if needed) can lift the FamilyKey shape to allow
+            // dual-mode swap-on-evict.
             let factory: Arc<dyn FamilyHookFactory> =
-                Arc::new(Gemma4DenseSpillFactory::new(fallback_cfg));
+                if crate::serve::api::tq_packed_descriptor::is_tq_active_mode() {
+                    // **TQ-active path**: register TqPackedSpillFactory.
+                    //
+                    // Fallback config matches the canonical Gemma 4
+                    // 26B layer split (48 sliding + 16 full-attention
+                    // = 64 layers) at production shape.  The factory's
+                    // descriptor downcast at
+                    // `tq_packed.rs::TqPackedSpillFactory::try_construct`
+                    // re-derives shape from the live engine's
+                    // `MlxModelWeights`; this fallback only takes effect
+                    // if the descriptor downcast fails (e.g. an
+                    // EngineHandle path materializes — out of scope at
+                    // this iter, the auto-LoaderWrapper-bind always
+                    // delivers Arc<Engine>).
+                    let bits = TqBitsPerCoord::new(
+                        crate::serve::api::tq_packed_descriptor::parse_tq_codebook_bits(
+                            std::env::var("HF2Q_TQ_CODEBOOK_BITS").ok().as_deref(),
+                        ),
+                    )
+                    .expect("HF2Q_TQ_CODEBOOK_BITS validated to be in {2,3,4,5,6,8}");
+                    let tq_fallback_cfg = TqPackedConfig {
+                        // Two layers minimum exercising the
+                        // sliding/global split (mirrors the dense
+                        // fallback at the same indentation level
+                        // above).  Real shape is descriptor-driven
+                        // post-substitute.
+                        num_layers: 2,
+                        nkv_heads: vec![8, 2],
+                        head_dim: vec![256, 512],
+                        bits_per_coord: bits,
+                        scale: 1.0,
+                        flags: tq_flags::HADAMARD_ROTATED,
+                        block_tokens: crate::serve::kv_persist::format::BLOCK_TOKENS,
+                    };
+                    Arc::new(TqPackedSpillFactory::new(tq_fallback_cfg))
+                } else {
+                    // **Dense path** (default): register
+                    // Gemma4DenseSpillFactory.
+                    Arc::new(Gemma4DenseSpillFactory::new(fallback_cfg))
+                };
+            let factory_kind = if crate::serve::api::tq_packed_descriptor::is_tq_active_mode() {
+                "TqPackedSpillFactory"
+            } else {
+                "Gemma4DenseSpillFactory"
+            };
             registry.register_factory(pool_repo.clone(), pool_quant, factory);
             tracing::info!(
                 repo = %pool_repo,
                 quant = %pool_quant.as_str(),
-                "ADR-017 B-dense.2: registered Gemma4DenseSpillFactory \
-                 (lazy real-hook construction at first engine load)"
+                factory = factory_kind,
+                "ADR-017 B-dense.2 + B-tq.4 iter-2: registered single-mode factory \
+                 (lazy real-hook construction at first engine load); HF2Q_TQ_KV \
+                 selects TQ-active mode at startup"
             );
         }
 
