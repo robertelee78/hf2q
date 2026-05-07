@@ -4357,3 +4357,155 @@ replacement for the hand-derived cap=8. Operators who explicitly set
   `project_adr017_phase_e_a_perf_loop_iter2` — perf-parity loop forensics
   showing the 2026-05-05 "underperformance" was a small-prompt fixture
   artifact, not an engine bug.
+
+---
+
+### Phase E.a follow-up wave 2026-05-06 (commit `4e9e70e`)
+
+The three open follow-ups from the default-on closure (`d581331`) — counter
+accuracy, R-C4 sweep verification, llama.cpp peer-baseline arm — were
+addressed same-day in commit `4e9e70e`. Two closed structurally, one
+verified by proxy.
+
+#### 1. `hf2q_kv_lcp_detected_total` counter — CLOSED structurally
+
+Iter-2 wired the observability counter against
+`probe_lcp_opportunity(&base_key, ...)` at the qwen35 site, but iter-B.3
+introduced chunk-keyed mid-prefill stores (`build_lcp_key_for_qwen35_chunk`
+with `tenant_id = "qwen35:lcp_chunk:<chunk_pos>"`). The two key namespaces
+never matched, so `detected_total` was structurally **0** for production
+qwen35 chunked workloads since iter-B.3 — a silent observability regression.
+The truth-signal was the `STRIDE-ALIGNED HIT` stderr line, which the
+default-on engagement test had to parse rather than asserting on the
+`/metrics` counter directly.
+
+Fix in `4e9e70e`: new helper
+`probe_lcp_opportunity_chunk_aligned<T, F>` in
+`src/serve/kv_persist/lcp_registry.rs` that iterates stride-aligned chunk
+positions descending, side-effect-free (calls `registry.lookup` only — no
+`restore_partial`), via a caller-supplied closure that builds the
+chunk-keyed `LcpKey` on demand. Returns `Some(K)` from the first
+true-continuation hit (largest match wins because we descend from
+`max_chunk_pos`). Wired into both qwen35 probe sites — non-streaming
+`engine_qwen35.rs:867` + streaming `engine_qwen35.rs:2118` — replacing
+the broken BASE-key probe. The closure clones a precomputed BASE key
+and overwrites `tenant_id` so the registry's `&mut` borrow doesn't
+conflict with per-iteration key construction.
+
+Verification on Qwen 3.6 35B-A3B-APEX-Q5_K_M (re-run engagement test):
+
+| Metric | Before fix | After fix |
+|---|---|---|
+| `hf2q_kv_lcp_lookups_total` | 2 | 2 |
+| `hf2q_kv_lcp_detected_total` | **0** (broken) | **1** (accurate) |
+| `STRIDE-ALIGNED HIT` stderr count | 1 | 1 |
+
+The engagement test's assertion was strengthened to `detected >= 1`
+alongside the stderr `STRIDE-ALIGNED HIT` count — both now pass and the
+"counter known-broken" comment was removed.
+
+#### 2. R-C4 5-K byte-identity sweep — VERIFIED BY PROXY
+
+The canonical Gemma 4 26B-DWQ fixture model
+(`/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/`) only contains
+`config.json` on this hardware — no `.gguf`. The Apex-Q5_K_M Gemma model
+that IS on disk fails hf2q's GGUF parse with `unsupported GGML type ID 7`.
+The iter5 fixture prompts (~6-10 words each) tokenize below `stride=64`
+on Qwen 3.6 35B-A3B-APEX, so chunked-prefill never engages and
+`detected_total` stays correctly at 0 (no chunk-aligned stores exist to
+detect). Both blockers preclude running iter5 unmodified on currently-
+available models.
+
+Per the mantra rule "don't claim what you can't verify", AC-6 was
+verified by proxy:
+
+* The byte-budget refactor is shape-preserving — only LRU eviction
+  accounting (`current_bytes`, byte-budget gate) and
+  `default_lcp_byte_budget()` computation changed; the
+  `Arc<HybridKvCacheSnapshot>` contents handed back from `take_prefix`
+  on hit are bit-for-bit unchanged from the pre-refactor path.
+  (Verifiable by code-grep: `restore_partial(snapshot, prefix.k)` is
+  the only payload-touching call in the resume path, and that
+  signature didn't change.)
+* End-to-end correctness on Qwen 3.6 35B-A3B-APEX:
+  - **Default-on engagement test** PASS — `STRIDE-ALIGNED HIT count = 1`
+    on default-on path, `= 0` on opt-out path.
+  - **`scripts/bench_lcp_long_prompt.sh`** PASS — 85.41× TTFT speedup
+    with deterministic decoded text across all 5 LCP trials. If the
+    byte-budget refactor had perturbed the cached payload, the decoded
+    text would diverge from the warmup baseline (token sampling at
+    `temperature=0` is fully determined by KV state).
+
+Operator follow-up (still open): re-run iter5 on Gemma 4 26B-DWQ once
+that fixture model is restored to disk, OR rewrite iter5 fixtures to
+satisfy the qwen35 chunked-prefill engagement preconditions (long
+shared prefix where `K_k` divergence falls past at least one stride
+boundary).
+
+#### 3. llama.cpp peer-baseline arm — CLOSED
+
+Added to `scripts/bench_lcp_long_prompt.sh`, gated on `PEER=1` (default
+off — keeps the fast hf2q-only path the default; opting in costs
+~30s wall for `llama-server` boot + 4 trials). When enabled the
+script:
+
+1. Spawns `llama-server` on a separate port (default `52484`,
+   override via `PEER_PORT=N`) with `--ctx-size 16384 --n-gpu-layers -1`.
+2. Waits up to 180s for `/health` 200.
+3. Runs the same long-prompt body cold + 3 warm trials with TTFT-strict
+   streaming measurement (gates on first content delta, same predicate
+   as the hf2q arm). llama.cpp's slot-based kv-cache reuse is
+   automatic — repeat requests with shared prefix hit the cache.
+4. Prints a side-by-side comparison block:
+   ```
+   hf2q default-on        │ COLD ms │ LCP   ms │ X×
+   llama.cpp slot-reuse   │ COLD ms │ warm  ms │ Y×
+   ```
+
+Peer arm NEVER gates the hf2q acceptance block — peer is informational.
+The spirit-rule "as fast as peer" is operator-run on the long-prompt
+fixture by setting `PEER=1`.
+
+**Known follow-up on peer-arm SSE parsing**: the first `PEER=1` run
+(2026-05-06) produced `peer cold TTFT = -1 ms` because the python
+parser in `chat_request_streaming_ms` gates on
+`delta.get('content') is not None and != ''`. llama.cpp's chat
+completions stream emits a different SSE delta shape — the
+content-delta predicate doesn't match. The peer server boots cleanly
+(`/health` 200 within 7 s) and total wall completes (4 533 ms cold
+response observed), so the arm STRUCTURALLY works; only the
+TTFT-strict measurement parser needs a llama.cpp-aware variant.
+Operator-run peer comparison should use the total-wall numbers in the
+meantime, OR drop in a parser variant that probes both
+`choices[0].delta.content` and `choices[0].text` (older SSE shape).
+
+#### Live re-bench post-counter-fix (3-trial, Qwen 3.6 35B-A3B-APEX-Q5_K_M)
+
+```
+COLD TTFT-strict p50:  19 247 ms
+LCP  TTFT-strict p50:     218 ms
+TTFT speedup:           88.29×  (matches 5-trial 85.41× from d581331 within variance)
+R-P6 4-worker aggregate:  1 197 ms / 4×cold = 0.02×
+LCP detected_total:        1 per LCP request  ← counter accurate post-4e9e70e
+```
+
+All 3 LCP trials hit at `k=8384` of 8 425-token prompt (99.5% LCP
+match). `restore_partial` median 6.0 ms.
+
+#### Status snapshot 2026-05-06 EOD
+
+* Default-ON: live (`d581331`), all engine probes use the
+  effective-flag helper with auto-disable + warn-once on
+  `HF2Q_USE_DENSE=0`.
+* Counter accuracy: live (`4e9e70e`), qwen35 chunked workloads
+  produce accurate `detected_total` numbers — verified live in the
+  3-trial bench above.
+* AC-6 byte-identity: VERIFIED BY PROXY on Qwen 3.6 35B-A3B-APEX
+  (engagement + long-prompt bench); iter5 sweep blocked on
+  fixture-model availability — operator follow-up.
+* Spirit-rule "as fast as peer": peer arm landed (`PEER=1` opt-in);
+  llama.cpp SSE-parsing follow-up tracked above.
+
+The `2026-05-05 "FUNCTIONALLY COMPLETE"` framing remains historical
+record; current production status is `2026-05-06 DEFAULT-ON` with
+counter-accuracy fix and peer-baseline arm.
