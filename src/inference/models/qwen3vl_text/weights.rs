@@ -15,7 +15,9 @@
 //! expects the post-reverse shape:
 //!
 //! ```text
-//!   token_embd.weight                F16     [vocab_size, hidden_size]
+//!   token_embd.weight                F32     [vocab_size, hidden_size]
+//!     (loaded via `load_tensor_f32` — mlx-native casts on-disk F16 → F32
+//!      transparently; see weight loader at line 167 for rationale)
 //!   blk.{N}.attn_norm.weight         F32     [hidden_size]
 //!   blk.{N}.attn_q.weight            Q4_0    [hidden_size, hidden_size]
 //!   blk.{N}.attn_k.weight            Q4_0    [n_kv_heads*head_dim, hidden_size]
@@ -113,11 +115,15 @@ pub struct Qwen3VlTextLayerWeights {
 ///
 /// Owns every byte the forward path will consume. When
 /// [`Self::tied_word_embeddings`] is `true`, [`Self::output`] is `None`
-/// and the LM head re-uses [`Self::token_embd`] (the F16 embedding
-/// table). When `false`, [`Self::output`] holds the dedicated `output.weight`
+/// and the LM head re-uses [`Self::token_embd`] (the F32 embedding
+/// table — see the load-site rationale at `Self::load_from_gguf`).
+/// When `false`, [`Self::output`] holds the dedicated `output.weight`
 /// tensor.
 pub struct Qwen3VlTextWeights {
-    /// Token embedding table, shape `[hidden_size, vocab_size]`, F16.
+    /// Token embedding table, shape `[vocab_size, hidden_size]`, F32.
+    /// On-disk F16 is cast to F32 by the mlx-native loader (see the
+    /// load-site rationale at the call to `load_tensor_f32` in
+    /// `Self::load_from_gguf` for the F16-vs-F32 trade-off).
     pub token_embd: MlxBuffer,
     /// Per-layer weights, indexed by layer id.
     pub layers: Vec<Qwen3VlTextLayerWeights>,
@@ -164,9 +170,38 @@ impl Qwen3VlTextWeights {
 
         // -------------------- Global tensors --------------------
 
+        // ──────────────────────────────────────────────────────────────
+        // token_embd: load as F32, not raw F16.
+        //
+        // The Qwen3-VL-2B GGUF stores `token_embd.weight` as F16 on disk,
+        // but the forward path needs F32 access for two distinct uses:
+        //
+        //   1. **Embedding lookup** (per-token row gather into the
+        //      residual stream's first slab) — `embed_tokens`
+        //      (`io_heads.rs::embed_tokens`) takes a `&[f32]` table.
+        //   2. **Tied LM head** — when
+        //      `cfg.tied_word_embeddings == true`,
+        //      `apply_linear_projection_f32` consumes the embedding
+        //      matrix as `weight`. Its dtype dispatch (Q4_0 / BF16 /
+        //      F32) does not handle F16; the F32 branch (line
+        //      `gpu_full_attn.rs:646`) casts F32→BF16 inline at first
+        //      call. F16 input would error at the dtype match.
+        //
+        // Memory cost: vocab × hidden × 4 bytes — for the canonical 2B
+        // model that's 151_936 × 2_048 × 4 = 1_244 MiB on GPU. The F16
+        // alternative would have been 622 MiB but would have required
+        // either a 1-shot CPU cast at first forward (paying the cost
+        // every cold load) or adding F16 weight support to
+        // `apply_linear_projection_f32` (cross-cutting mlx-native
+        // change). The 622 MiB delta is acceptable on M5 Max (96 GiB).
+        //
+        // This mirrors the qwen35 path:
+        // `inference/models/qwen35/weight_loader.rs:159` calls
+        // `load_f32_tensor("token_embd.weight", ...)`. The mlx-native
+        // loader transparently casts F16→F32 during load.
         let token_embd = gguf
-            .load_tensor("token_embd.weight", device)
-            .map_err(|e| anyhow!("token_embd.weight load: {e}"))?;
+            .load_tensor_f32("token_embd.weight", device)
+            .map_err(|e| anyhow!("token_embd.weight load (as F32): {e}"))?;
         validate_shape(
             "token_embd.weight",
             &token_embd,
