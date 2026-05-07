@@ -300,6 +300,113 @@ pub fn estimate_attention_block_sensitivities(
     estimate_sensitivities(tape, student_logits, teacher_logits, &quantizables)
 }
 
+/// Streaming sensitivity estimator (ADR-020 iter-10d).
+///
+/// Processes a sequence of independent batches one at a time, accumulating
+/// per-batch sensitivity scalars into a running mean.  Each batch builds
+/// a FRESH `GpuTape` + does its own forward+backward; the tape is dropped
+/// at the end of the iteration so per-batch forward intermediates +
+/// backward grads are reclaimed before the next batch starts.  Memory
+/// stays bounded to a single batch's tape footprint regardless of the
+/// total batch count.
+///
+/// This mirrors mlx-lm `dynamic_quant.py:75-86`'s streaming rhythm:
+///
+/// ```python
+/// for batch in batches:
+///     targets = teacher(batch)           # teacher forward
+///     _, grads = nn.value_and_grad(student, loss_fn)(batch, targets)
+///     grad_accum = tree_map(lambda x, y: x + y, grad_accum, grads)
+///     del grads                          # drop per-batch grads
+///     mx.eval(grad_accum)                # force GPU sync
+/// ```
+///
+/// Mathematically equivalent to running `estimate_sensitivities` on
+/// each batch separately and averaging the scalar results — proven by
+/// the identity:
+///
+/// ```text
+///   mean_b s_b = Σ_b (grad_b · (W_low − W_high)).sum() / (numel · n_batches)
+///              = (Σ_b grad_b · (W_low − W_high)).sum() / (numel · n_batches)
+///              = (grad_accum / n_batches · (W_low − W_high)).sum() / numel
+/// ```
+///
+/// Both formulations yield the same scalar within float-sum-order
+/// tolerance, so we use the per-batch-mean formulation here (smaller
+/// memory footprint: stores 4 × f64 scalars instead of 4 × full-weight
+/// gradient buffers).
+///
+/// `batch_inputs` is an iterator over the per-batch input `[batch, hidden]`
+/// row-major flat fp32 buffers.  Each batch must match `cfg.batch *
+/// cfg.hidden` in length.
+///
+/// Returns the per-quantizable mean sensitivity scalar.
+pub fn estimate_attention_block_sensitivities_streaming<I, B>(
+    cfg: &AttentionBlockConfig,
+    weights: &AttentionBlockWeights,
+    qdq_fn: impl Fn(&[f32]) -> Result<Vec<f32>>,
+    batch_inputs: I,
+) -> Result<std::collections::BTreeMap<String, f64>>
+where
+    I: IntoIterator<Item = B>,
+    B: AsRef<[f32]>,
+{
+    cfg.validate()?;
+    let mut scalar_accum: std::collections::BTreeMap<String, f64> =
+        std::collections::BTreeMap::new();
+    let mut n_batches: usize = 0;
+
+    for batch_buf in batch_inputs {
+        let batch = batch_buf.as_ref();
+        if batch.len() != cfg.batch * cfg.hidden {
+            return Err(anyhow!(
+                "streaming: batch length {} != batch*hidden = {}*{} = {}",
+                batch.len(),
+                cfg.batch,
+                cfg.hidden,
+                cfg.batch * cfg.hidden
+            ));
+        }
+
+        // Fresh device + tape per batch — this is the load-bearing
+        // memory bound: when this scope exits the entire tape is
+        // dropped (Drop on GpuTapeInner releases all MlxBuffer Arcs;
+        // Metal reclaims the unified-memory pages).
+        let device = mlx_native::MlxDevice::new()
+            .map_err(|e| anyhow!("streaming batch: device: {e}"))?;
+        let tape = GpuTape::new(device);
+
+        let xt = GpuTensor::from_vec(&tape, batch, vec![cfg.batch, cfg.hidden])?;
+        let teacher_leaves = AttentionBlockLeaves::from_weights(&tape, cfg, weights)?;
+        let teacher_out = forward(cfg, &xt, &teacher_leaves)?;
+        let student_leaves =
+            AttentionBlockLeaves::from_weights_qdq(&tape, cfg, weights, &qdq_fn)?;
+        let student_out = forward(cfg, &xt, &student_leaves)?;
+        let per_batch = estimate_attention_block_sensitivities(
+            &tape,
+            &student_out,
+            &teacher_out,
+            &student_leaves,
+            weights,
+        )?;
+        for (k, v) in per_batch {
+            *scalar_accum.entry(k).or_insert(0.0) += v;
+        }
+        n_batches += 1;
+        // tape, teacher_leaves, student_leaves, teacher_out, student_out
+        // all drop here — per-batch state reclaimed before next iter.
+    }
+
+    if n_batches == 0 {
+        return Err(anyhow!("streaming: zero batches provided"));
+    }
+    let n = n_batches as f64;
+    for v in scalar_accum.values_mut() {
+        *v /= n;
+    }
+    Ok(scalar_accum)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +539,114 @@ mod tests {
                 "{label}: qdq Q4_0 vs Q8_0 max-abs-diff {d} too small — sensitivity formula will be degenerate"
             );
         }
+    }
+
+    #[test]
+    fn attention_block_streaming_vs_per_batch_mean_byte_close() {
+        // Streaming pattern test: process N batches one at a time
+        // (each on a fresh tape that's dropped after the iteration);
+        // compare against running estimate_sensitivities on each
+        // batch separately and averaging the scalars by hand.
+        //
+        // Per the identity in `estimate_attention_block_sensitivities_streaming`,
+        // both formulations are mathematically equivalent — any
+        // discrepancy is float-sum-order at the f64 accumulation step.
+        // Tight rel_tol = 1e-12 (f64 precision).
+        let cfg = AttentionBlockConfig::smallest();
+        let weights = deterministic_weights(&cfg, 555);
+
+        // Three independent batches with different input distributions.
+        let n_batches = 3;
+        let mut batches: Vec<Vec<f32>> = Vec::with_capacity(n_batches);
+        for b in 0..n_batches {
+            let batch: Vec<f32> = (0..cfg.batch * cfg.hidden)
+                .map(|i| {
+                    let v = (i as f32 * 0.0091 + b as f32 * 0.7).sin();
+                    v * (0.3 + 0.1 * b as f32)
+                })
+                .collect();
+            batches.push(batch);
+        }
+
+        // Run streaming (fresh tape per batch, drops after each).
+        let device_for_qdq = MlxDevice::new().expect("device for qdq");
+        let stream_result = estimate_attention_block_sensitivities_streaming(
+            &cfg,
+            &weights,
+            |w| qdq_q4_0_gpu(&device_for_qdq, w),
+            batches.iter().map(|b| b.as_slice()),
+        )
+        .unwrap();
+
+        // Manual per-batch + average reference.
+        let mut manual_accum: std::collections::BTreeMap<String, f64> =
+            std::collections::BTreeMap::new();
+        for batch in &batches {
+            let device = MlxDevice::new().expect("device per-batch");
+            let tape = GpuTape::new(device);
+            let xt = GpuTensor::from_vec(&tape, batch, vec![cfg.batch, cfg.hidden]).unwrap();
+            let teacher_leaves =
+                AttentionBlockLeaves::from_weights(&tape, &cfg, &weights).unwrap();
+            let teacher_out = forward(&cfg, &xt, &teacher_leaves).unwrap();
+            let student_leaves = AttentionBlockLeaves::from_weights_qdq(
+                &tape,
+                &cfg,
+                &weights,
+                |w| qdq_q4_0_gpu(tape.device(), w),
+            )
+            .unwrap();
+            let student_out = forward(&cfg, &xt, &student_leaves).unwrap();
+            let per_batch = estimate_attention_block_sensitivities(
+                &tape,
+                &student_out,
+                &teacher_out,
+                &student_leaves,
+                &weights,
+            )
+            .unwrap();
+            for (k, v) in per_batch {
+                *manual_accum.entry(k).or_insert(0.0) += v;
+            }
+        }
+        for v in manual_accum.values_mut() {
+            *v /= n_batches as f64;
+        }
+
+        // Compare keys + scalars.
+        assert_eq!(
+            stream_result.keys().collect::<Vec<_>>(),
+            manual_accum.keys().collect::<Vec<_>>(),
+            "streaming and manual key sets differ"
+        );
+        for k in stream_result.keys() {
+            let s = stream_result[k];
+            let m = manual_accum[k];
+            let diff = (s - m).abs();
+            let scale = s.abs().max(m.abs()).max(1e-12);
+            assert!(
+                diff <= 1e-12 || diff / scale <= 1e-10,
+                "{k}: streaming={s} manual={m} diff={diff}"
+            );
+        }
+    }
+
+    #[test]
+    fn attention_block_streaming_zero_batches_errors() {
+        let cfg = AttentionBlockConfig::smallest();
+        let weights = deterministic_weights(&cfg, 1);
+        let device = MlxDevice::new().expect("device");
+        let empty: Vec<&[f32]> = Vec::new();
+        let err = estimate_attention_block_sensitivities_streaming(
+            &cfg,
+            &weights,
+            |w| qdq_q4_0_gpu(&device, w),
+            empty,
+        )
+        .expect_err("zero batches must error");
+        assert!(
+            format!("{err}").contains("zero batches"),
+            "wrong error: {err}"
+        );
     }
 
     #[test]
