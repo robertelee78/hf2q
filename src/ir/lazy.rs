@@ -306,19 +306,26 @@ impl LazyTensor {
     /// Materialise a by-reference copy of an already-resident tensor.
     ///
     /// This is intentionally narrower than [`Self::materialize`]: it only
-    /// supports [`LazyState::Materialized`] entries and returns a typed error
-    /// for pending `FnOnce` entries. The streaming contract remains intact for
-    /// mmap-backed tensors; this exists for bridge paths whose caller already
-    /// chose to keep bytes resident and must pass a `&LazyTensorMap` through an
-    /// existing trait surface.
+    /// supports already-resident entries ([`LazyState::Materialized`] or
+    /// [`LazyState::MaterializedShared`]) and returns a typed error for
+    /// pending `FnOnce` entries. The streaming contract remains intact for
+    /// mmap-backed tensors; this exists for bridge paths whose caller
+    /// already chose to keep bytes resident and must pass a
+    /// `&LazyTensorMap` through an existing trait surface.
+    ///
+    /// ADR-020 iter-6: the `MaterializedShared` arm hands the same
+    /// `Arc<Vec<u8>>` over to the returned `TensorRef` (pointer-bump
+    /// share), instead of deep-cloning the inner `Vec`. The original
+    /// `LazyTensor` keeps its Arc clone — by-reference semantic
+    /// preserved. On 27B-class models this saves ~52 GB peak per
+    /// `clone_tensor_map_to_lazy → load_lazy_f32` pass. The
+    /// `Materialized` arm still must clone the inner `Vec` because that
+    /// variant doesn't share — it's the one-owner form used by tests
+    /// and post-merge spans (cf. lazy.rs module-level docs).
     pub fn materialize_cloned(&self) -> Result<TensorRef, MaterializeError> {
-        let bytes = match &self.state {
-            LazyState::Materialized(bytes) => bytes.clone(),
-            LazyState::MaterializedShared(arc) => {
-                // Always clone the Vec — by-reference semantic must keep
-                // the Arc live; only `materialize(self)` consumes it.
-                (**arc).clone()
-            }
+        let data: std::sync::Arc<Vec<u8>> = match &self.state {
+            LazyState::Materialized(bytes) => std::sync::Arc::new(bytes.clone()),
+            LazyState::MaterializedShared(arc) => std::sync::Arc::clone(arc),
             LazyState::Pending(_) => {
                 return Err(MaterializeError::Transform {
                     name: self.meta.name.clone(),
@@ -328,11 +335,11 @@ impl LazyTensor {
             }
         };
 
-        if bytes.len() != self.meta.byte_len {
+        if data.len() != self.meta.byte_len {
             return Err(MaterializeError::SizeMismatch {
                 name: self.meta.name.clone(),
                 expected: self.meta.byte_len,
-                actual: bytes.len(),
+                actual: data.len(),
             });
         }
 
@@ -340,7 +347,7 @@ impl LazyTensor {
             name: self.meta.name.clone(),
             shape: self.meta.shape.clone(),
             dtype: self.meta.dtype,
-            data: bytes.into(),
+            data,
         })
     }
 
@@ -1075,7 +1082,9 @@ mod tests {
     /// ADR-014 P7 iter-76 — `LazyTensor::from_arc_bytes` materialises
     /// equivalently to `from_bytes`.  When refcount==1 the inner Vec
     /// is unwrapped (zero-copy); when >1 the inner is cloned.
-    /// `materialize_cloned` always clones (keeps the Arc live).
+    /// ADR-020 iter-6: `materialize_cloned` Arc-shares (no Vec clone)
+    /// for the `MaterializedShared` variant; the `Materialized`
+    /// (owned-Vec) variant still wraps a fresh Arc.
     #[test]
     fn test_from_arc_bytes_materialize_byte_equal_to_from_bytes() {
         use std::sync::Arc;
@@ -1110,26 +1119,85 @@ mod tests {
         assert_eq!(*t.data, payload, "shared-refcount path returns equal bytes");
     }
 
+    /// ADR-020 iter-6: `materialize_cloned` on `MaterializedShared` shares
+    /// the Arc (pointer-bump) instead of deep-cloning the inner Vec.  The
+    /// returned `TensorRef.data` and the source Arc must point to the
+    /// same allocation (`Arc::ptr_eq`); the lazy retains its own Arc
+    /// clone (by-reference semantic preserved); after dropping both
+    /// `lazy` and `t`, the source's strong count returns to its pre-call
+    /// value.  This is the falsifier for the ~52 GB save on 27B-class
+    /// `clone_tensor_map_to_lazy` paths (ADR-020 §8.1 acceptance criteria).
     #[test]
-    fn test_from_arc_bytes_materialize_cloned_keeps_arc_live() {
+    fn materialize_cloned_shares_arc_no_byte_copy() {
         use std::sync::Arc;
 
-        let payload = f32_bytes(&[42.0]);
+        let payload = f32_bytes(&[1.0, 2.0, 3.0, 4.0]);
         let arc: Arc<Vec<u8>> = Arc::new(payload.clone());
         let pre_count = Arc::strong_count(&arc);
+        assert_eq!(pre_count, 1, "test setup: only the test holds the Arc");
 
-        let lazy = LazyTensor::from_arc_bytes(meta("kept-live", vec![1], DType::F32), Arc::clone(&arc));
-        let t = lazy.materialize_cloned().expect("borrowed materialize");
-        assert_eq!(*t.data, payload);
+        let lazy = LazyTensor::from_arc_bytes(
+            meta("share-test", vec![4], DType::F32),
+            Arc::clone(&arc),
+        );
+        // After construction: caller's `arc` + lazy's clone = 2.
+        assert_eq!(Arc::strong_count(&arc), 2);
 
-        // After materialize_cloned, the lazy still owns its Arc clone —
-        // the original `arc` strong count must be ≥ pre_count + 1
-        // (lazy's clone) - 1 (lazy dropped on next line) = pre_count.
+        let t = lazy
+            .materialize_cloned()
+            .expect("borrowed materialize on shared variant");
+
+        // The returned TensorRef.data must point to the SAME allocation.
+        // ptr_eq is the strongest available check — strong_count >= 3
+        // is a corollary that proves no byte clone occurred.
+        assert!(
+            Arc::ptr_eq(&arc, &t.data),
+            "materialize_cloned must share the Arc, not deep-clone the Vec"
+        );
+        assert!(
+            Arc::strong_count(&arc) >= 3,
+            "Arc::strong_count must be >= 3 (caller + lazy + t); got {}",
+            Arc::strong_count(&arc)
+        );
+
+        // Bytes still match (read-through deref).
+        assert_eq!(**t.data, *payload);
+
+        // Drop t → strong count drops by 1 (back to caller + lazy = 2).
+        drop(t);
+        assert_eq!(Arc::strong_count(&arc), 2);
+
+        // Drop lazy → strong count back to caller-only.  By-reference
+        // semantic verified: lazy never leaked an extra ref past its
+        // own lifetime.
         drop(lazy);
         assert_eq!(
             Arc::strong_count(&arc),
             pre_count,
             "post-drop refcount restored — materialize_cloned doesn't leak"
+        );
+    }
+
+    /// `materialize_cloned` on the `Materialized` (owned-Vec) variant
+    /// must still produce a valid `TensorRef` with byte-equal contents.
+    /// This variant cannot share an Arc (the Vec is owned, not Arc'd),
+    /// so the returned Arc has fresh refcount=1 — that's the one-owner
+    /// path documented at lazy.rs module-level docs.
+    #[test]
+    fn materialize_cloned_owned_vec_path_byte_equal() {
+        use std::sync::Arc;
+
+        let payload = f32_bytes(&[5.0, 6.0]);
+        let lazy = LazyTensor::from_bytes(meta("owned", vec![2], DType::F32), payload.clone());
+        let t = lazy
+            .materialize_cloned()
+            .expect("borrowed materialize on owned variant");
+
+        assert_eq!(**t.data, *payload);
+        assert_eq!(
+            Arc::strong_count(&t.data),
+            1,
+            "owned-Vec variant: returned Arc is fresh (no upstream to share)"
         );
     }
 
