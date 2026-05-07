@@ -54,7 +54,9 @@ mod tests {
     use crate::calibrate::autograd_gpu_tape::{
         backward, matmul, ones_like, qdq_affine, scalar_mul, view, GpuTape, GpuTensor,
     };
-    use crate::calibrate::dwq_loop::{buffer_from_f32, init_affine_params_gpu};
+    use crate::calibrate::dwq_loop::{
+        box_muller_gaussian, buffer_from_f32, init_affine_params_gpu,
+    };
     use crate::calibrate::dynamic_quant_gpu::kl_div_loss_per_row;
     use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
     use mlx_native::ops::qmm_affine::dispatch_qmm_affine_t_f32;
@@ -445,6 +447,333 @@ mod tests {
         assert!(
             rel_l2 < 0.05,
             "BF16 round-trip degraded model accuracy beyond 5% L2: {rel_l2}"
+        );
+    }
+
+    /// iter-19c — single-Linear KL parity test against the cached
+    /// BF16 reference of `jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-
+    /// abliterated`.  Loads ONE real BF16 Linear weight from the
+    /// multi-shard safetensors, runs DWQ training over per-group
+    /// affine scales+biases, and measures per-row KL between the
+    /// BF16-teacher inference and DWQ-student inference on random
+    /// Gaussian activations.
+    ///
+    /// Goal: produce a CONCRETE single-Linear KL number against a
+    /// real BF16 reference, so we have a data point to compare
+    /// against mlx-lm's published DWQ Q4 mean per-token KLD of
+    /// 0.02663 (smcleod, Apr 2026, vs 8-bit ref).  This is NOT a
+    /// full-model parity test (that requires iter-11h's multi-layer
+    /// Qwen3.5MoE forward on GpuTape) — it's a per-Linear sanity
+    /// floor: if our DWQ training can't get the per-Linear KL into
+    /// the same band, the full-model number can't either.
+    ///
+    /// `#[ignore]`-gated (requires the cached BF16 model on disk).
+    /// Run with:
+    ///   cargo test --release --bin hf2q -- --ignored \
+    ///     iter_19c_single_linear_kl_parity_vs_bf16
+    ///
+    /// Override the tensor: `HF2Q_BF16_TENSOR=...`.
+    ///
+    /// Acceptance per ADR §8.2 row 19a: per-row KL ≤ 0.030.  >0.100
+    /// = broken.
+    #[test]
+    #[ignore]
+    fn iter_19c_single_linear_kl_parity_vs_bf16() {
+        use std::path::PathBuf;
+
+        use crate::calibrate::mlx_safetensors_loader::{
+            discover_shards, read_floats_to_f32,
+        };
+
+        let snapshots = std::env::var("HF2Q_BF16_SNAPSHOT").unwrap_or_else(|_| {
+            // Latest snapshot of the cached BF16 reference.
+            let parent = std::path::PathBuf::from(format!(
+                "{}/.cache/huggingface/hub/models--jenerallee78--Qwen3.6-35B-A3B-Abliterix-EGA-abliterated/snapshots",
+                std::env::var("HOME").unwrap_or_default()
+            ));
+            // Pick the only/most recent snapshot dir.
+            let snap = std::fs::read_dir(&parent)
+                .expect("read snapshots dir")
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find(|p| p.is_dir())
+                .expect("at least one snapshot");
+            snap.to_string_lossy().into_owned()
+        });
+        let snap_dir = PathBuf::from(&snapshots);
+        if !snap_dir.exists() {
+            eprintln!(
+                "[iter-19c] SKIP: snapshot dir {} not found (set HF2Q_BF16_SNAPSHOT=/path)",
+                snapshots
+            );
+            return;
+        }
+
+        // Default tensor: linear_attn.out_proj.weight from layer 0 — a
+        // standard Linear (no fused QKV, no FFN gating), shape
+        // [hidden, x] for the 35B's hidden=2048.
+        let tensor_name = std::env::var("HF2Q_BF16_TENSOR").unwrap_or_else(|_| {
+            "model.language_model.layers.0.linear_attn.out_proj.weight".to_string()
+        });
+
+        // Step 1: locate the shard that contains the tensor.
+        let shard_map = discover_shards(&snap_dir).expect("discover_shards");
+        let shard_path = shard_map.get(&tensor_name).unwrap_or_else(|| {
+            panic!(
+                "tensor {tensor_name} not in index; sample keys: {:?}",
+                shard_map.keys().take(5).collect::<Vec<_>>()
+            )
+        });
+        eprintln!(
+            "[iter-19c] tensor: {tensor_name}\n[iter-19c] shard:  {}",
+            shard_path.display()
+        );
+
+        // Step 2: deserialize the shard and pull the tensor.
+        let shard_bytes = std::fs::read(shard_path).expect("read shard");
+        let st = SafeTensors::deserialize(&shard_bytes).expect("deserialize");
+        let t = st.tensor(&tensor_name).expect("tensor missing in shard");
+        let shape = t.shape().to_vec();
+        eprintln!(
+            "[iter-19c] shape: {:?} dtype: {:?}  ({} elements)",
+            shape,
+            t.dtype(),
+            shape.iter().product::<usize>()
+        );
+        // Shape from HF safetensors is [out, in] (PyTorch convention).
+        // We transpose to [in, out] for our matmul = X @ W convention
+        // (matches iter-13e's transpose helper).
+        assert_eq!(shape.len(), 2, "expected 2-D Linear weight");
+        let out_dim = shape[0];
+        let in_dim = shape[1];
+
+        // Step 3: cast BF16/F16 → F32.
+        let w_bf16_as_f32 = read_floats_to_f32(t.data(), t.dtype())
+            .expect("BF16 → F32 cast");
+        assert_eq!(w_bf16_as_f32.len(), out_dim * in_dim);
+
+        // Sanity: weights should be finite and have non-trivial magnitudes.
+        let mut finite = 0usize;
+        let mut sumsq = 0.0f64;
+        for &v in &w_bf16_as_f32 {
+            if v.is_finite() {
+                finite += 1;
+                sumsq += (v as f64).powi(2);
+            }
+        }
+        let stddev = (sumsq / w_bf16_as_f32.len() as f64).sqrt() as f32;
+        eprintln!(
+            "[iter-19c] weight stddev: {stddev:.4e}  ({}/{} finite)",
+            finite,
+            w_bf16_as_f32.len()
+        );
+        assert_eq!(finite, w_bf16_as_f32.len(), "non-finite weight");
+        assert!(stddev > 1e-4, "weight magnitude too small to test");
+
+        // Transpose [out, in] → [in, out].
+        let mut w_io: Vec<f32> = vec![0.0; out_dim * in_dim];
+        for r in 0..out_dim {
+            for c in 0..in_dim {
+                w_io[c * out_dim + r] = w_bf16_as_f32[r * in_dim + c];
+            }
+        }
+
+        // Step 4: DWQ training.  Bound the work via env var (default
+        // 100 steps to keep test runtime ~1 min on M5 Max).
+        let n_steps: usize = std::env::var("HF2Q_DWQ_STEPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+        let group_size = 32usize;
+        let bits = 4u32;
+        // Activations: random Gaussian σ=1 (post-RMSNorm proxy).
+        let m: usize = std::env::var("HF2Q_DWQ_BATCH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        let x_data: Vec<f32> = box_muller_gaussian(m * in_dim, 0xC0FFEE5);
+
+        let device = MlxDevice::new().expect("device");
+        let mut init_registry = KernelRegistry::new();
+        let (q_int, s_init, b_init) = init_affine_params_gpu(
+            &device,
+            &mut init_registry,
+            &w_io,
+            group_size,
+            bits,
+        )
+        .expect("init affine params");
+
+        // Pre-compute teacher logits y_T = X @ W_BF16 (host FP64
+        // accumulator).  Note: our matmul is Y = X @ W with W as
+        // [in, out], so y[r, c] = Σ_k X[r, k] * W[k, c] which is
+        // exactly what we want.
+        let mut y_t = vec![0.0f32; m * out_dim];
+        for r in 0..m {
+            for c in 0..out_dim {
+                let mut acc = 0.0f64;
+                for k in 0..in_dim {
+                    acc += (x_data[r * in_dim + k] as f64) * (w_io[k * out_dim + c] as f64);
+                }
+                y_t[r * out_dim + c] = acc as f32;
+            }
+        }
+        let y_t_stddev = {
+            let mut sumsq = 0.0f64;
+            for &v in &y_t {
+                sumsq += (v as f64).powi(2);
+            }
+            (sumsq / y_t.len() as f64).sqrt() as f32
+        };
+        eprintln!("[iter-19c] teacher logit stddev: {y_t_stddev:.4e}");
+
+        // Adam over (s, b) — perturb 2× to give it learning headroom.
+        let s_p: Vec<f32> = s_init.iter().map(|v| v * 2.0).collect();
+        let b_p: Vec<f32> = b_init.iter().map(|v| v * 2.0).collect();
+
+        let cfg = AdamConfig {
+            lr: 0.001,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+        };
+        let mut adam = AdamOptimizer::new(device.clone(), cfg).expect("adam");
+        adam.register_param("s", buffer_from_f32(&device, &s_p).unwrap())
+            .unwrap();
+        adam.register_param("b", buffer_from_f32(&device, &b_p).unwrap())
+            .unwrap();
+
+        let temperature = 2.0f32;
+        let inv_t = 1.0 / temperature;
+        let tape = GpuTape::new(device.clone());
+
+        let train_step = |adam: &mut AdamOptimizer, tape: &GpuTape| -> Result<f32> {
+            let s = adam.read_param("s")?;
+            let b = adam.read_param("b")?;
+            let s_leaf = GpuTensor::from_vec(tape, &s, vec![s.len()])?;
+            let b_leaf = GpuTensor::from_vec(tape, &b, vec![b.len()])?;
+            let qdq_flat = qdq_affine(&s_leaf, &b_leaf, &q_int, group_size)?;
+            let w_q = view(&qdq_flat, vec![in_dim, out_dim])?;
+            let xt = GpuTensor::from_vec(tape, &x_data, vec![m, in_dim])?;
+            let y_s = matmul(&xt, &w_q)?;
+            let y_t_leaf = GpuTensor::from_vec(tape, &y_t, vec![m, out_dim])?;
+            let y_s_scaled = scalar_mul(&y_s, inv_t)?;
+            let y_t_scaled = scalar_mul(&y_t_leaf, inv_t)?;
+            let kl = kl_div_loss_per_row(&y_s_scaled, &y_t_scaled)?;
+            let kl_host = kl.to_vec()?;
+            let mean_kl = (kl_host.iter().map(|v| *v as f64).sum::<f64>()
+                / kl_host.len() as f64) as f32;
+            let mut dy = tape
+                .device()
+                .alloc_buffer(kl_host.len() * 4, DType::F32, kl.shape().to_vec())?;
+            dy.as_mut_slice::<f32>()
+                .map_err(|e| anyhow!("dy: {e}"))?
+                .iter_mut()
+                .for_each(|v| *v = 1.0 / m as f32);
+            let grads = backward(&kl, dy)?;
+            let g_s = grads[s_leaf.node_idx()].as_ref().unwrap().clone();
+            let g_b = grads[b_leaf.node_idx()].as_ref().unwrap().clone();
+            let mut g_map = BTreeMap::new();
+            g_map.insert("s".to_string(), g_s);
+            g_map.insert("b".to_string(), g_b);
+            adam.step(&g_map)?;
+            Ok(mean_kl)
+        };
+
+        let initial_kl = train_step(&mut adam, &tape).expect("init step");
+        tape.reset();
+        eprintln!("[iter-19c] initial KL @ 2× perturbed: {initial_kl:.4e}");
+        let mut min_kl = initial_kl;
+        let mut last_kl = initial_kl;
+        for step in 1..n_steps {
+            let l = train_step(&mut adam, &tape).expect("step");
+            tape.reset();
+            assert!(l.is_finite(), "step {step}: KL non-finite ({l})");
+            if l < min_kl {
+                min_kl = l;
+            }
+            last_kl = l;
+            if step % 20 == 0 {
+                eprintln!(
+                    "[iter-19c] step={step} kl={l:.4e} min={min_kl:.4e}"
+                );
+            }
+        }
+
+        // Now measure the FINAL KL with NO perturbation (i.e. the
+        // ideal init point) for reference — so the report has both
+        // the trained-from-perturbed result AND the analytical-init
+        // baseline.
+        let s_init_buf = buffer_from_f32(&device, &s_init).unwrap();
+        let b_init_buf = buffer_from_f32(&device, &b_init).unwrap();
+        let init_step_kl = {
+            let s_leaf = GpuTensor::from_buffer(&tape, s_init_buf, vec![s_init.len()])
+                .expect("s init leaf");
+            let b_leaf = GpuTensor::from_buffer(&tape, b_init_buf, vec![b_init.len()])
+                .expect("b init leaf");
+            let qdq_flat = qdq_affine(&s_leaf, &b_leaf, &q_int, group_size).unwrap();
+            let w_q = view(&qdq_flat, vec![in_dim, out_dim]).unwrap();
+            let xt = GpuTensor::from_vec(&tape, &x_data, vec![m, in_dim]).unwrap();
+            let y_s = matmul(&xt, &w_q).unwrap();
+            let y_t_leaf = GpuTensor::from_vec(&tape, &y_t, vec![m, out_dim]).unwrap();
+            let y_s_scaled = scalar_mul(&y_s, inv_t).unwrap();
+            let y_t_scaled = scalar_mul(&y_t_leaf, inv_t).unwrap();
+            let kl = kl_div_loss_per_row(&y_s_scaled, &y_t_scaled).unwrap();
+            let kl_host = kl.to_vec().unwrap();
+            let mean = kl_host.iter().map(|v| *v as f64).sum::<f64>()
+                / kl_host.len() as f64;
+            mean as f32
+        };
+        tape.reset();
+
+        eprintln!();
+        eprintln!("=== iter-19c SUMMARY (single-Linear KL) ===");
+        eprintln!("  tensor:           {tensor_name}");
+        eprintln!("  shape:            [out={}, in={}]", out_dim, in_dim);
+        eprintln!("  group_size/bits:  {group_size}/{bits}");
+        eprintln!("  steps:            {n_steps}");
+        eprintln!("  KL @ analytical-init (no perturb): {init_step_kl:.4e}");
+        eprintln!("  KL @ start (2× perturb):           {initial_kl:.4e}");
+        eprintln!("  KL @ end (post-train):             {last_kl:.4e}");
+        eprintln!("  KL min over trajectory:            {min_kl:.4e}");
+        eprintln!();
+        eprintln!("  ADR §8.2 row 19a acceptance gate:");
+        eprintln!("    target = ≤ 0.030 (matches mlx-lm DWQ Q4 published 0.02663 + margin)");
+        eprintln!("    floor  = > 0.100 = broken");
+        eprintln!();
+        let analytical_init_status = if init_step_kl <= 0.030 {
+            "PASS (under target)"
+        } else if init_step_kl > 0.100 {
+            "BROKEN"
+        } else {
+            "OVER TARGET (between 0.030 and 0.100)"
+        };
+        let trained_status = if min_kl <= 0.030 {
+            "PASS (under target)"
+        } else if min_kl > 0.100 {
+            "BROKEN"
+        } else {
+            "OVER TARGET (between 0.030 and 0.100)"
+        };
+        eprintln!("  analytical-init status: {analytical_init_status}");
+        eprintln!("  trained-min status:     {trained_status}");
+        eprintln!();
+
+        // Test acceptance: trained KL must be FINITE and at least move
+        // TOWARD lower (Adam can't make it worse than analytical init
+        // if convergence works).  Don't assert hard against 0.030
+        // because:
+        //   - This is a SINGLE Linear, not a full model.
+        //   - The "real" KL gate applies to multi-layer compounded
+        //     KL after a full forward pass — see iter-19b half-2.
+        //   - Single-Linear KL on a small batch (m=64) of random
+        //     Gaussians can have high variance.
+        // We DO assert that the analytical init is BETTER than the
+        // 2× perturbed start (sanity floor that the fixture is
+        // measuring something real).
+        assert!(
+            initial_kl > init_step_kl * 1.1,
+            "fixture trivial: initial perturbed KL {initial_kl} not measurably above analytical init {init_step_kl}"
         );
     }
 

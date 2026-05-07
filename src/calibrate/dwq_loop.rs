@@ -131,6 +131,45 @@ pub fn init_affine_params_gpu(
     Ok((q_int, scales, biases))
 }
 
+/// Box-Muller transform → unit-variance Gaussian samples from a
+/// stable small PRNG (xorshift64*).  Deterministic given `seed`.
+///
+/// Used by iter-13e and iter-19c as a calibration-activation proxy
+/// (post-RMSNorm residual stream stddev ≈ 1.0).
+pub fn box_muller_gaussian(n: usize, seed: u64) -> Vec<f32> {
+    let mut state = if seed == 0 { 0xDEAD_BEEF_CAFE_BABE } else { seed };
+    let mut next_u64 = || -> u64 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut next_uniform = || -> f32 {
+        // 24-bit mantissa from upper 53 bits → uniform in [2^-24, 1).
+        // Avoid 0 so log() in Box-Muller stays finite.
+        let r = (next_u64() >> 11) as f32 / (1u64 << 53) as f32;
+        r.max(f32::EPSILON)
+    };
+    let mut out = Vec::with_capacity(n);
+    while out.len() + 1 < n {
+        let u1 = next_uniform();
+        let u2 = next_uniform();
+        let mag = (-2.0 * u1.ln()).sqrt();
+        let z0 = mag * (std::f32::consts::TAU * u2).cos();
+        let z1 = mag * (std::f32::consts::TAU * u2).sin();
+        out.push(z0);
+        out.push(z1);
+    }
+    if out.len() < n {
+        let u1 = next_uniform();
+        let u2 = next_uniform();
+        let z0 = (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos();
+        out.push(z0);
+    }
+    out.truncate(n);
+    out
+}
+
 /// Build a fresh f32 `MlxBuffer` from host data — used by the
 /// training loop to wrap Adam-managed parameter state.
 pub fn buffer_from_f32(device: &MlxDevice, data: &[f32]) -> Result<MlxBuffer> {
@@ -1116,42 +1155,6 @@ mod tests {
             }
         }
         dst
-    }
-
-    /// Box-Muller transform → unit-variance Gaussian samples from a
-    /// stable small PRNG (xorshift64*).  Deterministic given `seed`.
-    fn box_muller_gaussian(n: usize, seed: u64) -> Vec<f32> {
-        let mut state = if seed == 0 { 0xDEAD_BEEF_CAFE_BABE } else { seed };
-        let mut next_u64 = || -> u64 {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        let mut next_uniform = || -> f32 {
-            // 24-bit mantissa from upper 53 bits → uniform in [2^-24, 1).
-            // Avoid 0 so log() in Box-Muller stays finite.
-            let r = (next_u64() >> 11) as f32 / (1u64 << 53) as f32;
-            r.max(f32::EPSILON)
-        };
-        let mut out = Vec::with_capacity(n);
-        while out.len() + 1 < n {
-            let u1 = next_uniform();
-            let u2 = next_uniform();
-            let mag = (-2.0 * u1.ln()).sqrt();
-            let z0 = mag * (std::f32::consts::TAU * u2).cos();
-            let z1 = mag * (std::f32::consts::TAU * u2).sin();
-            out.push(z0);
-            out.push(z1);
-        }
-        if out.len() < n {
-            let u1 = next_uniform();
-            let u2 = next_uniform();
-            let z0 = (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos();
-            out.push(z0);
-        }
-        out.truncate(n);
-        out
     }
 
     /// Sanity test: init kernel output equals the CPU oracle from the
