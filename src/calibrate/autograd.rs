@@ -489,6 +489,49 @@ pub fn mean(t: &Tensor) -> Result<Tensor, AutogradError> {
 }
 
 // ============================================================================
+// Op: row_sum (per-row sum reduction along last dim of a 2-D tensor)
+// ============================================================================
+
+/// `output[b] = Σ_j input[b, j]` for a 2-D input `[rows, cols]`.
+/// Output shape: `[rows]`.  Backward: `dx[b, i] = d_out[b]` (broadcast).
+pub fn row_sum(t: &Tensor) -> Result<Tensor, AutogradError> {
+    let shape = t.shape();
+    if shape.len() != 2 {
+        return Err(AutogradError::ShapeMismatch {
+            lhs: shape,
+            rhs: vec![0, 0],
+            op: "row_sum (must be 2-D)",
+        });
+    }
+    let rows = shape[0];
+    let cols = shape[1];
+    let v = t.to_vec();
+    let mut out = vec![0.0_f32; rows];
+    for b in 0..rows {
+        let mut s = 0.0_f32;
+        for i in 0..cols {
+            s += v[b * cols + i];
+        }
+        out[b] = s;
+    }
+    let parents = vec![t.node_idx];
+    let backward = Box::new(move |out_grad: &[f32], parent_grads: &mut [Vec<f32>]| {
+        // dx[b, i] = d_out[b]   broadcast along cols.
+        for b in 0..rows {
+            let g = out_grad[b];
+            for i in 0..cols {
+                parent_grads[0][b * cols + i] = g;
+            }
+        }
+    });
+    let node_idx = t.tape.push_node(parents, backward, out, vec![rows]);
+    Ok(Tensor {
+        tape: t.tape.clone(),
+        node_idx,
+    })
+}
+
+// ============================================================================
 // Op: log (elementwise natural log)
 // ============================================================================
 
@@ -1002,6 +1045,124 @@ mod tests {
             1e-2,
         );
         assert_close(&g_w, &fd_w, 1e-3, 1e-2, "composed Linear+square+sum ∂L/∂W");
+    }
+
+    // ------------------------------------------------------------------
+    // row_sum
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn row_sum_forward_known_values() {
+        let tape = Tape::new();
+        // [[1, 2, 3, 4], [5, 6, 7, 8]] → [10, 26]
+        let v = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let x = Tensor::from_vec(&tape, v, vec![2, 4]).unwrap();
+        let y = row_sum(&x).unwrap();
+        assert_eq!(y.to_vec(), vec![10.0, 26.0]);
+        assert_eq!(y.shape(), vec![2]);
+    }
+
+    #[test]
+    fn row_sum_backward_finite_diff_falsifier() {
+        // f = sum(c * row_sum(x))  for non-trivial c
+        let tape = Tape::new();
+        let x_v = vec![1.0_f32, 2.0, 3.0, 4.0, 0.5, -1.5, 2.5, -0.7]; // 2×4
+        let c_v = vec![1.5_f32, -0.3]; // [2]
+        let x = Tensor::from_vec(&tape, x_v.clone(), vec![2, 4]).unwrap();
+        let c = Tensor::from_vec(&tape, c_v.clone(), vec![2]).unwrap();
+        let rs = row_sum(&x).unwrap();
+        let cm = mul(&c, &rs).unwrap();
+        let loss = sum(&cm).unwrap();
+        let grads = backward(&loss).unwrap();
+        let analytical = grads[x.node_idx].clone().unwrap();
+
+        // Analytical: ∂(c[b] · sum_j x[b, j])/∂x[b, i] = c[b] for all i.
+        let mut expected = vec![0.0_f32; 2 * 4];
+        for b in 0..2 {
+            for i in 0..4 {
+                expected[b * 4 + i] = c_v[b];
+            }
+        }
+        assert_close(&analytical, &expected, 1e-6, 1e-7, "row_sum analytical");
+
+        let fd = finite_diff_grad(
+            &x_v,
+            |p| {
+                let t = Tape::new();
+                let xx = Tensor::from_vec(&t, p.to_vec(), vec![2, 4]).unwrap();
+                let cc = Tensor::from_vec(&t, c_v.clone(), vec![2]).unwrap();
+                sum(&mul(&cc, &row_sum(&xx).unwrap()).unwrap())
+                    .unwrap()
+                    .to_vec()[0]
+            },
+            1e-3,
+        );
+        assert_close(&analytical, &fd, 1e-3, 1e-4, "row_sum finite-diff");
+    }
+
+    #[test]
+    fn kl_div_loss_via_composition_known_values() {
+        // KL(P||Q) where P=Q must be 0.
+        // P = Q = softmax([1, 2, 3, 4]) = [0.0321, 0.0871, 0.2369, 0.6439]
+        let tape = Tape::new();
+        let logits_p = Tensor::from_vec(&tape, vec![1.0, 2.0, 3.0, 4.0], vec![1, 4]).unwrap();
+        let logits_q = Tensor::from_vec(&tape, vec![1.0, 2.0, 3.0, 4.0], vec![1, 4]).unwrap();
+        let p = softmax(&logits_p).unwrap();
+        let log_p = log(&p).unwrap();
+        let q = softmax(&logits_q).unwrap();
+        let log_q = log(&q).unwrap();
+        let diff = sub(&log_p, &log_q).unwrap();
+        let weighted = mul(&p, &diff).unwrap();
+        let kl_per_row = row_sum(&weighted).unwrap();
+        let kl = kl_per_row.to_vec()[0];
+        // KL(P||P) = 0 (within fp32 tolerance).
+        assert!(kl.abs() < 1e-6, "KL(P||P) ≈ 0; got {kl}");
+    }
+
+    #[test]
+    fn kl_div_loss_backward_via_composition_dq_equals_softmax_q_minus_p() {
+        // For loss = sum(KL(P || Q)), the backward analytical is
+        //   ∂loss/∂logits_q = softmax(logits_q) - softmax(logits_p)
+        // (the standard cross-entropy backward when P is detached).
+        // We construct the loss via composition (no fused kernel) and
+        // verify it.
+        let tape = Tape::new();
+        let logits_p_v = vec![0.5, -0.3, 1.2, 0.7, -0.8, 0.4, 1.0, -0.2];
+        let logits_q_v = vec![0.7, -0.1, 0.9, 0.5, -0.6, 0.3, 0.8, 0.0];
+        let logits_p =
+            Tensor::from_vec(&tape, logits_p_v.clone(), vec![2, 4]).unwrap();
+        let logits_q =
+            Tensor::from_vec(&tape, logits_q_v.clone(), vec![2, 4]).unwrap();
+        let p = softmax(&logits_p).unwrap();
+        let log_p = log(&p).unwrap();
+        let q = softmax(&logits_q).unwrap();
+        let log_q = log(&q).unwrap();
+        let diff = sub(&log_p, &log_q).unwrap();
+        let weighted = mul(&p, &diff).unwrap();
+        let kl_per_row = row_sum(&weighted).unwrap();
+        let total = sum(&kl_per_row).unwrap();
+        let grads = backward(&total).unwrap();
+        let dq = grads[logits_q.node_idx].clone().unwrap();
+
+        // Analytical: dq = softmax(q) - softmax(p).
+        let p_vals = p.to_vec();
+        let q_vals = q.to_vec();
+        let expected: Vec<f32> = q_vals
+            .iter()
+            .zip(p_vals.iter())
+            .map(|(qv, pv)| qv - pv)
+            .collect();
+        // Note: P is NOT detached in this composition, so KL backward
+        // includes the P-side gradient too.  But ∂loss/∂logits_q is
+        // exactly softmax(q) - softmax(p) regardless — the path
+        // through P doesn't affect logits_q's gradient.
+        assert_close(
+            &dq,
+            &expected,
+            1e-4,
+            1e-5,
+            "KL composition: dq == softmax(q) - softmax(p)",
+        );
     }
 
     // ------------------------------------------------------------------

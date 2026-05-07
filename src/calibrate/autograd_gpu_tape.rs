@@ -42,6 +42,7 @@ use mlx_native::{
     ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params},
     ops::elementwise::{elementwise_add, elementwise_mul, scalar_mul_f32},
     ops::log_elementwise::{dispatch_log_backward_f32, dispatch_log_f32},
+    ops::row_sum::{dispatch_row_sum_backward_f32, dispatch_row_sum_f32},
     ops::softmax::dispatch_softmax,
     ops::softmax_backward::dispatch_softmax_backward,
     ops::transpose::transpose_2d,
@@ -88,6 +89,14 @@ enum OpKind {
     /// `dispatch_log_backward_f32`.  Caller must ensure forward input
     /// is strictly positive.
     Log { input_idx: usize },
+    /// Per-row sum reduction along last dim of a 2-D tensor.
+    /// `output[b] = Σ_j input[b, j]`; output shape `[rows]`.
+    /// Backward broadcasts: `dx[b, i] = d_out[b]`.
+    RowSum {
+        input_idx: usize,
+        rows: usize,
+        cols: usize,
+    },
 }
 
 struct GpuNode {
@@ -364,7 +373,9 @@ pub fn backward(
                 accumulate(&mut grads, lhs_idx, &parent_grads[0], tape)?;
                 accumulate(&mut grads, rhs_idx, &parent_grads[1], tape)?;
             }
-            OpKind::Softmax { input_idx, .. } | OpKind::Log { input_idx } => {
+            OpKind::Softmax { input_idx, .. }
+            | OpKind::Log { input_idx }
+            | OpKind::RowSum { input_idx, .. } => {
                 accumulate(&mut grads, input_idx, &parent_grads[0], tape)?;
             }
         }
@@ -635,6 +646,41 @@ fn backward_dispatch(
 
             Ok((op, vec![da, db]))
         }
+        OpKind::RowSum { input_idx, rows, cols } => {
+            // dx[b, i] = d_out[b]  via row_sum_backward_f32 broadcast.
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+            let dx_buf = device
+                .alloc_buffer(rows * cols * 4, DType::F32, vec![rows, cols])
+                .map_err(|e| anyhow!("backward row_sum: alloc dx: {e}"))?;
+            let mut params_buf = device
+                .alloc_buffer(8, DType::F32, vec![2])
+                .map_err(|e| anyhow!("backward row_sum: alloc params: {e}"))?;
+            params_buf
+                .as_mut_slice::<f32>()
+                .map_err(|e| anyhow!("backward row_sum: params write: {e}"))?
+                .copy_from_slice(&[cols as f32, 0.0]);
+
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward row_sum: encoder: {e}"))?;
+            dispatch_row_sum_backward_f32(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                out_grad,
+                &dx_buf,
+                &params_buf,
+                rows as u32,
+                cols as u32,
+            )
+            .map_err(|e| anyhow!("backward row_sum: dispatch: {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward row_sum: commit_and_wait: {e}"))?;
+            let _ = input_idx; // distributed by parent-grad logic in backward()
+            Ok((op, vec![dx_buf]))
+        }
         OpKind::Log { input_idx } => {
             // dx = dy / x, where x is the FORWARD INPUT (not output).
             let device = tape.device();
@@ -703,6 +749,66 @@ fn backward_dispatch(
             Ok((op, vec![dx_buf]))
         }
     }
+}
+
+/// Per-row sum reduction along the last dim of a 2-D tensor `[rows, cols]`.
+/// Returns shape `[rows]`.  Backward broadcasts the upstream gradient
+/// across cols.
+pub fn row_sum(t: &GpuTensor) -> Result<GpuTensor> {
+    if t.shape.len() != 2 {
+        return Err(anyhow!(
+            "row_sum: input must be 2-D [rows, cols]; got shape={:?}",
+            t.shape
+        ));
+    }
+    let rows = t.shape[0];
+    let cols = t.shape[1];
+    let tape = &t.tape;
+    let device = tape.device();
+
+    let in_buf = tape.with_node(t.node_idx, |n| n.value.clone());
+    let out = device
+        .alloc_buffer(rows * 4, DType::F32, vec![rows])
+        .map_err(|e| anyhow!("row_sum: alloc out: {e}"))?;
+    let mut params_buf = device
+        .alloc_buffer(8, DType::F32, vec![2])
+        .map_err(|e| anyhow!("row_sum: alloc params: {e}"))?;
+    params_buf
+        .as_mut_slice::<f32>()
+        .map_err(|e| anyhow!("row_sum: params write: {e}"))?
+        .copy_from_slice(&[cols as f32, 0.0]);
+
+    let mut registry = tape.0.registry.borrow_mut();
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("row_sum: encoder: {e}"))?;
+    dispatch_row_sum_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &in_buf,
+        &out,
+        &params_buf,
+        rows as u32,
+        cols as u32,
+    )
+    .map_err(|e| anyhow!("row_sum: dispatch: {e}"))?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("row_sum: commit_and_wait: {e}"))?;
+    drop(registry);
+
+    let input_idx = t.node_idx;
+    let node_idx = tape.push_node(
+        OpKind::RowSum { input_idx, rows, cols },
+        out,
+        vec![rows],
+    );
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: vec![rows],
+    })
 }
 
 /// Elementwise natural log via mlx-native's `dispatch_log_f32`.
@@ -1391,7 +1497,45 @@ mod tests {
     }
 
     use crate::calibrate::autograd::log as cpu_log;
+    use crate::calibrate::autograd::row_sum as cpu_row_sum;
     use crate::calibrate::autograd::softmax as cpu_softmax;
+
+    #[test]
+    fn gpu_tape_row_sum_forward_backward_parity() {
+        let rows = 4;
+        let cols = 32;
+        let x: Vec<f32> = (0..(rows * cols))
+            .map(|i| (i as f32) * 0.013 - 0.5)
+            .collect();
+
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let xt = GpuTensor::from_vec(&tape, &x, vec![rows, cols]).unwrap();
+        let yt = row_sum(&xt).expect("gpu row_sum");
+        let y_gpu = yt.to_vec().unwrap();
+
+        // CPU reference
+        let mut y_expected = vec![0.0_f32; rows];
+        for b in 0..rows {
+            for i in 0..cols {
+                y_expected[b] += x[b * cols + i];
+            }
+        }
+        assert_close(&y_gpu, &y_expected, 1e-4, 1e-5, "row_sum forward");
+
+        // Backward with dy = ones[rows] gives dx[b, i] = 1.0 broadcast.
+        let dy = ones_like(&tape, &[rows]).unwrap();
+        let grads = backward(&yt, dy).unwrap();
+        let dx_gpu: &[f32] = grads[xt.node_idx()].as_ref().unwrap().as_slice().unwrap();
+        let dx_expected = vec![1.0_f32; rows * cols];
+        assert_close(dx_gpu, &dx_expected, 1e-6, 1e-7, "row_sum backward");
+
+        // Cross-check via CPU oracle composed with mul.
+        let cpu_tape = Tape::new();
+        let cx = Tensor::from_vec(&cpu_tape, x.clone(), vec![rows, cols]).unwrap();
+        let cy = cpu_row_sum(&cx).unwrap();
+        assert_close(&y_gpu, &cy.to_vec(), 1e-4, 1e-5, "row_sum GPU↔CPU");
+    }
 
     /// `Y = log(X)` for strictly positive X; backward via dispatch_log_backward_f32.
     #[test]
@@ -1557,6 +1701,74 @@ mod tests {
         match softmax(&x) {
             Err(e) => assert!(format!("{e}").contains("must be 2-D")),
             Ok(_) => panic!("non-2D softmax must error"),
+        }
+    }
+
+    /// **The key dynamic_quant gradient test.**
+    ///
+    /// Builds KL-divergence loss via composition end-to-end on GPU
+    /// using softmax + log + sub + mul + row_sum + sum, then verifies
+    /// the gradient w.r.t. logits_q matches the analytical identity
+    /// `dq = softmax(logits_q) - softmax(logits_p)`.  This is the
+    /// EXACT gradient mlx-lm `dynamic_quant.estimate_sensitivities`
+    /// computes — once Track 1 wires this in.
+    #[test]
+    fn gpu_tape_kl_div_via_composition_dq_equals_softmax_q_minus_p() {
+        let rows = 4;
+        let cols = 32;
+        let logits_p_v: Vec<f32> =
+            (0..(rows * cols)).map(|i| (i as f32) * 0.011 - 0.4).collect();
+        let logits_q_v: Vec<f32> =
+            (0..(rows * cols)).map(|i| (i as f32) * 0.013 - 0.3).collect();
+
+        // GPU: total = sum(row_sum(p · (log_p − log_q)))
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let lp = GpuTensor::from_vec(&tape, &logits_p_v, vec![rows, cols]).unwrap();
+        let lq = GpuTensor::from_vec(&tape, &logits_q_v, vec![rows, cols]).unwrap();
+        let p = softmax(&lp).expect("p");
+        let log_p = log(&p).expect("log_p");
+        let q = softmax(&lq).expect("q");
+        let log_q = log(&q).expect("log_q");
+        let diff = sub(&log_p, &log_q).expect("diff");
+        let weighted = mul(&p, &diff).expect("weighted");
+        let kl_per_row = row_sum(&weighted).expect("kl per row");
+        // Seed backward with ones[rows] (= sum reduction's gradient).
+        let dy = ones_like(&tape, &[rows]).unwrap();
+        let grads = backward(&kl_per_row, dy).expect("backward");
+        let dq_gpu: &[f32] = grads[lq.node_idx()]
+            .as_ref()
+            .expect("got dq")
+            .as_slice()
+            .unwrap();
+
+        // Analytical: dq = softmax(q) - softmax(p).  Read the GPU softmax
+        // outputs directly (they're already on tape).
+        let p_vals = p.to_vec().unwrap();
+        let q_vals = q.to_vec().unwrap();
+        let dq_expected: Vec<f32> = q_vals
+            .iter()
+            .zip(p_vals.iter())
+            .map(|(qv, pv)| qv - pv)
+            .collect();
+        // Composition through softmax+log can drift; loosen rel_tol.
+        assert_close(
+            dq_gpu,
+            &dq_expected,
+            5e-3,
+            1e-4,
+            "GPU KL composition: dq == softmax(q) - softmax(p)",
+        );
+    }
+
+    #[test]
+    fn gpu_tape_row_sum_non_2d_errors() {
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let x = GpuTensor::from_vec(&tape, &[1.0; 32], vec![32]).unwrap();
+        match row_sum(&x) {
+            Err(e) => assert!(format!("{e}").contains("must be 2-D")),
+            Ok(_) => panic!("non-2D row_sum must error"),
         }
     }
 
