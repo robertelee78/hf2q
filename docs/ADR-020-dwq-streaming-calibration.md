@@ -100,14 +100,74 @@ Estimated 1-2 days of focused refactor. Touches `src/calibrate/dwq_calibrator.rs
 
 | Iter | Scope | Status |
 |---|---|---|
-| 2 (this) | Research synthesis, ADR, memory updates, commit | DONE |
-| 3 | Phase 1: TensorRef.data Arc refactor, falsifier test, regression check, commit + push | NEXT |
-| 4 | Phase 1 polish: any remaining 267-site fallout, full test suite | |
-| 5 | Phase 2 design doc: streaming calibrator API contract before code | |
-| 6-8 | Phase 2 implementation: DwqCalibrator + Qwen35Model::load_layer streaming | |
-| 9 | E2E DWQ-46 27B with ulimit safety net, validate criterion 1-5 | |
-| 10 | Roll forward to all 4 family×bit combinations | |
-| 11 | Benchmark + ADR closure | |
+| 2 | Research synthesis, ADR, memory updates, commit `72fdee8` | DONE |
+| 3 | Phase 1: TensorRef.data Arc refactor, falsifier test, regression check (104/104 PASS), commit `437217d` pushed | DONE |
+| 4 (this) | Phase 2 deep-dive: trace GPU upload + cache lifecycle, verify MlxBuffer COPIES (not aliases) | DONE |
+| 5 | Phase 2 implementation: drop host F32 vecs after one-time GPU upload completes | NEXT |
+| 6 | Phase 2 testing: synthetic model peak measurement + regression suite | |
+| 7 | E2E DWQ-46 27B with watchdog (no `ulimit -v` on macOS — RLIMIT_AS unimplemented) | |
+| 8 | Roll forward to all 4 family×bit combinations | |
+| 9 | Benchmark + ADR closure | |
+
+## Phase 2 implementation plan (verified iteration 4)
+
+### What's actually held in memory
+After `Qwen35Model::load_from_lazy_tensor_map` completes:
+- `Qwen35Model.layers: Vec<Qwen35LayerWeights>` — each with multiple `Vec<f32>` (attn_norm, wq, wk, wv, etc.). For 27B dense: ~104 GB total CPU F32.
+- `Qwen35Model.token_embd: Vec<f32>`, `output_weight: Vec<f32>`, `output_norm: Vec<f32>` — additional CPU F32.
+
+After `forward_gpu_impl` first call (cache prime):
+- Thread-local `cell` cache holds `Vec<LayerWeightsGpu>` + `OutputHeadGpu` — ALL uploaded via `upload_f32(data, device)` at `gpu_full_attn.rs:258-270`.
+- `upload_f32` calls `device.alloc_buffer(byte_len, ...)` → fresh StorageModeShared `MlxBuffer` → `slice.copy_from_slice(data)` — **copies bytes**, not aliases.
+- After cache prime: BOTH the host `Vec<f32>` AND the GPU `MlxBuffer` hold ~104 GB each. Total: ~208 GB just for layers.
+
+### Precise fix
+Drop the host `Vec<f32>` fields **after** the GPU cache primes (one-time, per `forward_gpu_impl:1869-1900`). This is safe because:
+- `MlxBuffer` owns its own StorageModeShared allocation (not aliased to the Vec<f32>); dropping the source Vec doesn't affect the GPU buffer.
+- Cache is keyed on `model_ptr` so subsequent calls with the same `&Qwen35Model` reuse the cache without needing the host F32.
+
+### Implementation shape
+The clean fix is to hoist the upload into `Qwen35Model::load_from_lazy_tensor_map` itself (consume CPU F32 → produce GPU bundle → drop CPU). Concrete API:
+```rust
+pub struct Qwen35Model {
+    pub cfg: Qwen35Config,
+    pub gpu_layers: Vec<LayerWeightsGpu>,    // pre-uploaded
+    pub gpu_output_head: OutputHeadGpu,       // pre-uploaded
+    pub gpu_token_embd: MlxBuffer,            // pre-uploaded
+    // CPU `layers: Vec<Qwen35LayerWeights>` REMOVED — replaced by `gpu_layers`
+    // CPU `token_embd: Vec<f32>` REMOVED
+    // CPU `output_weight: Vec<f32>` REMOVED
+    // CPU `output_norm: Vec<f32>` REMOVED
+    pub mtp: Option<...>,
+}
+```
+Then `forward_gpu_impl` reads from `self.gpu_layers` directly — no upload, no cache rebuild. The constructor (`load_from_lazy_tensor_map`) becomes:
+1. Build CPU `Qwen35LayerWeights` structures with `Vec<f32>` (peak: 104 GB CPU + 52 GB tensor_map = 156 GB transient).
+2. Upload each layer to GPU via existing `LayerWeightsGpu::from_cpu(&w, &device)` paths (peak briefly +104 GB during upload = 260 GB).
+3. **Immediately drop the CPU layer data** before next layer's upload — `mem::replace(&mut layer.attn.wq, Vec::new())` etc. — so peak only holds 1 layer's F32 host + 1 layer's GPU + cumulative-uploaded GPU.
+4. After loop: only `gpu_layers` resident (~104 GB GPU), CPU F32 fully dropped.
+5. Final peak: ~52 GB tensor_map (Arc-shared post Phase 1) + ~104 GB GPU layers + scratch ≈ 160 GB.
+
+That's still over 128 GB. To fit, **also stream the CPU→GPU per-tensor inside layer construction**: load one F32 tensor → upload → drop, instead of building the whole layer's Vec<f32>s before uploading any of them. That keeps peak per layer at ~1-2 GB CPU F32 + cumulative GPU.
+
+Final expected peak: 52 GB tensor_map + 104 GB GPU bundle + 2 GB transient scratch = **~158 GB**. Hmm — still over 128 GB by ~30 GB.
+
+### Phase 2 may not be enough — ADR-020 amendment
+
+Even with both Phase 1 (52 GB clone removed) AND Phase 2 (host F32 freed), peak ≈ 158 GB on Qwen3.6-27B due to the GPU-resident weights themselves consuming 104 GB. To fit in 128 GB:
+- **Phase 3 (open question)**: do GPU weights need to be F32, or can they be F16? F16 GPU = 52 GB → total peak ~106 GB → fits.
+- Look at how `forward_gpu_impl` uses the F32 weights — most ML inference does FP16/BF16 attention math; F32 host might just be the "expand for safety" that gets cast back at GPU op time.
+- The `upload_q4_0_from_f32` for output weight already shows we can push weights through narrower formats. Same for layer weights?
+
+**Phase 3 may be required** — keep weights in F16 on GPU. ~24 hours additional refactor. Or accept Phase 2-only result + run with watchdog at 130 GB threshold (slightly above box capacity, swap absorbs slack).
+
+### MoE-specific note (35B-A3B)
+For Qwen3.6-35B-MoE the `MoeQ` path is already quantized (`load_lazy_moe_ffn_quantized`) — experts go straight to GPU q4 buffers, NO F32 expansion. So the 35B case is much smaller: ~10-15 GB CPU F32 (just attention + shared experts + small tensors). 35B-MoE may already fit post-Phase 1; Phase 2 may suffice for 35B but be insufficient for 27B-dense.
+
+### Test strategy
+- Synthetic Qwen 4-layer dense fixture with measurable weights (~100 MB scale).
+- Falsifier: assert RSS delta from before-load to after-load is ~ source size + ~scratch, NOT 2× source. Use `mach_task_basic_info` for RSS measurement on macOS (no `RLIMIT_AS` enforcement available — must measure post-hoc rather than gate via ulimit).
+- Production verification: `/usr/bin/time -l` on bare DWQ-46 27B run (after watchdog scaffold).
 
 ## References
 
