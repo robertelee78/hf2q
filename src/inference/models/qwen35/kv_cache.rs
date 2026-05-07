@@ -198,6 +198,14 @@ impl HybridKvCacheSnapshot {
     }
 }
 
+impl crate::serve::kv_persist::lcp_registry::ByteSized for HybridKvCacheSnapshot {
+    /// Exact byte count of the snapshot across all KV / SSM slots.
+    /// Delegates to `self.total_bytes()` which sums every `MlxBuffer::byte_len()`.
+    fn byte_len(&self) -> u64 {
+        self.total_bytes() as u64
+    }
+}
+
 /// Allocate a fresh `MlxBuffer` of the same byte-length / dtype / shape
 /// as `src`, and memcpy the source bytes into it.  Used by the snapshot
 /// path to produce buffers that DON'T alias the source.

@@ -290,23 +290,27 @@ pub struct InvestigationEnv {
     /// Original parse: `std::env::var("HF2Q_USE_DENSE").as_deref() == Ok("1")`.
     pub use_dense: bool,
 
-    /// `HF2Q_KV_LCP_RESUME=1` — enable ADR-017 Phase E option (a) iter-3
-    /// LCP partial-prefill resume. Default OFF. When ON + the engine's
-    /// LcpRegistry lookup returns `Some(k)` + multimodal bail passes
-    /// (`soft_tokens.is_empty()`) + capacity precondition holds (cached
-    /// linear_capacity ≥ new request's seq_len + max_decode_tokens) +
-    /// `HF2Q_USE_DENSE=1` is also set (TQ-packed kv_caches not safely
-    /// resumable without separate restoration), the request bypasses
-    /// the wholesale `cache.write_pos = 0` reset at
-    /// `forward_prefill.rs:445-448` and resumes from token K — reusing
-    /// the cached `dense_kvs[*][0..K)` in place.
+    /// `HF2Q_KV_LCP_RESUME` — ADR-017 Phase E option (a) LCP partial-prefill
+    /// resume. **Default ON**; opt-out via `HF2Q_KV_LCP_RESUME=0` / `=false`
+    /// / `=off`. When ON + the engine's LcpRegistry lookup returns `Some(k)`
+    /// + multimodal bail passes (`soft_tokens.is_empty()`) + capacity
+    /// precondition holds (cached linear_capacity ≥ new request's
+    /// seq_len + max_decode_tokens) + `HF2Q_USE_DENSE=1` is also set
+    /// (TQ-packed kv_caches not safely resumable without separate
+    /// restoration), the request bypasses the wholesale
+    /// `cache.write_pos = 0` reset at `forward_prefill.rs:445-448`
+    /// and resumes from token K — reusing the cached
+    /// `dense_kvs[*][0..K)` in place.
     ///
-    /// Iter-3 is the highest-risk Phase E.a iter (per dossier §4.3
-    /// `docs/research/adr017-phase-e-option-a-2026-05-05.md`); this gate
-    /// makes the new code path opt-in until R-C4-LCP byte-identity at
-    /// 5 K fractions (iter-5) and R-P7 multi-turn-chat speedup
-    /// (iter-6) gates pass. Promotion to default-ON is a separate
-    /// future iter; until then operators set this explicitly.
+    /// Auto-disable: when this flag is true via default-on but
+    /// `HF2Q_USE_DENSE=0`, the engine gate auto-disables LCP and logs
+    /// exactly one warning per process (see `engine.rs::warn_lcp_resume_without_dense`).
+    /// Operators who explicitly set `HF2Q_KV_LCP_RESUME=1` override
+    /// the auto-disable (explicit opt-in always wins).
+    ///
+    /// R-C4-LCP byte-identity at 5 K fractions (iter-5) and R-P7
+    /// multi-turn-chat speedup (iter-6) gates both passed; default-ON
+    /// promotion landed in the E.a default-on iter.
     pub kv_lcp_resume: bool,
 
     /// `HF2Q_KV_LCP_LONG_RESUME` — enables LCP partial-prefill resume
@@ -346,7 +350,14 @@ pub struct InvestigationEnv {
 
     /// `HF2Q_KV_LCP_CHUNKED_PREFILL` — when ON, Qwen 3.5/3.6 prefill
     /// runs in fixed-size chunks of `kv_lcp_deltanet_checkpoint_stride`
-    /// tokens instead of one monolithic call. Default OFF.
+    /// tokens instead of one monolithic call. **Default ON**; opt-out via
+    /// `HF2Q_KV_LCP_CHUNKED_PREFILL=0` / `=false` / `=off`.
+    ///
+    /// Both `kv_lcp_resume` and `kv_lcp_chunked_prefill` must be ON
+    /// together for Qwen 3.5/3.6 to get any LCP benefit: the engine
+    /// gate at `engine_qwen35.rs:1083-1088` computes
+    /// `chunked_eligible = lcp_resume_enabled && kv_lcp_chunked_prefill`.
+    /// Per decisions.json Q6: both flags flip together.
     ///
     /// ADR-017 Phase B-hybrid.2a — chunked prefill is the foundation
     /// for SSM-state checkpointing + partial-prefill resume. Each
@@ -570,17 +581,18 @@ impl InvestigationEnv {
             use_dense: matches!(env::var("HF2Q_USE_DENSE").as_deref(), Ok("1")),
             layer_policy: env::var("HF2Q_LAYER_POLICY").ok(),
 
-            // ADR-017 Phase E option (a) iter-3 — LCP partial-prefill
-            // resume. Default OFF. See struct field doc for full
-            // contract.
-            kv_lcp_resume: env_eq_one("HF2Q_KV_LCP_RESUME"),
+            // ADR-017 Phase E.a default-on — LCP partial-prefill resume.
+            // Default ON; opt-out via HF2Q_KV_LCP_RESUME=0 / =false / =off.
+            // See struct field doc for full contract.
+            kv_lcp_resume: env_default_true("HF2Q_KV_LCP_RESUME"),
             // ADR-017 Phase E.a iter-3.6 — long-prompt LCP resume (lifts
             // iter-3.5c sliding-ring prefill-wrap restriction). Default
             // OFF; opt-in via `HF2Q_KV_LCP_LONG_RESUME=1`. See struct
             // field doc for full contract.
             kv_lcp_long_resume: env_eq_one("HF2Q_KV_LCP_LONG_RESUME"),
-            // ADR-017 Phase B-hybrid.2a — chunked prefill toggle.
-            kv_lcp_chunked_prefill: env_eq_one("HF2Q_KV_LCP_CHUNKED_PREFILL"),
+            // ADR-017 Phase E.a default-on — chunked prefill toggle.
+            // Default ON; opt-out via HF2Q_KV_LCP_CHUNKED_PREFILL=0 / =false / =off.
+            kv_lcp_chunked_prefill: env_default_true("HF2Q_KV_LCP_CHUNKED_PREFILL"),
             // ADR-017 Phase B-hybrid.2a — checkpoint stride (default
             // 1024). Constrained to a positive multiple of 64 by the
             // chunk_gated_delta_rule precondition. We don't enforce the
@@ -883,6 +895,41 @@ impl InvestigationEnv {
 /// Mirrors `std::env::var(name).map_or(false, |v| v == "1")`.
 fn env_eq_one(name: &str) -> bool {
     env::var(name).is_ok_and(|v| v == "1")
+}
+
+/// Default-ON boolean: returns `true` when the env var is unset OR set to
+/// a truthy value (`"1"`, `"true"`, `"on"`, case-insensitive); returns
+/// `false` only when explicitly set to a falsy value (`"0"`, `"false"`,
+/// `"off"`, case-insensitive). Any other non-empty unrecognized value is
+/// treated as `true` (permissive default-on: if someone sets a var they
+/// probably want it on). Used for feature flags that are default-ON and
+/// opt-out via `=0` / `=false` / `=off`.
+fn env_default_true(name: &str) -> bool {
+    match env::var(name).ok().as_deref() {
+        // Env unset → default ON.
+        None => true,
+        // Truthy: "1", "true", "on" (case-insensitive) → ON.
+        Some(v) if v.eq_ignore_ascii_case("1")
+            || v.eq_ignore_ascii_case("true")
+            || v.eq_ignore_ascii_case("on") => true,
+        // Falsy: "0", "false", "off" (case-insensitive) → OFF.
+        Some(v) if v.eq_ignore_ascii_case("0")
+            || v.eq_ignore_ascii_case("false")
+            || v.eq_ignore_ascii_case("off") => false,
+        // Non-empty unrecognized value → permissive default-on.
+        Some(_) => true,
+    }
+}
+
+/// Returns `true` iff `HF2Q_KV_LCP_RESUME` is set to exactly `"1"`.
+///
+/// Used in the auto-disable logic at the engine gate: when `kv_lcp_resume`
+/// is `true` from `env_default_true` but `HF2Q_USE_DENSE=0`, we need to
+/// distinguish "user explicitly requested LCP" (env == "1") from "user
+/// never touched the env" (default-on). Only the explicit-`"1"` path
+/// overrides the auto-disable; default-on is silently disabled on dense=0.
+pub fn is_kv_lcp_resume_explicitly_one() -> bool {
+    std::env::var("HF2Q_KV_LCP_RESUME").as_deref() == Ok("1")
 }
 
 /// Mirrors `std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok())`.
@@ -1293,5 +1340,143 @@ mod tests {
             InvestigationEnv::from_env().layer_policy.as_deref(),
             Some("some_future_policy")
         );
+    }
+
+    // ── env_default_true ────────────────────────────────────────────────────
+
+    /// When the env var is unset, `env_default_true` must return `true`
+    /// (default-on semantics).
+    #[test]
+    fn env_default_true_unset_returns_true() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&["HF2Q_KV_LCP_RESUME"]);
+        assert!(
+            env_default_true("HF2Q_KV_LCP_RESUME"),
+            "unset env var must return true (default-on)"
+        );
+    }
+
+    /// `=1` must return `true`.
+    #[test]
+    fn env_default_true_eq_one_returns_true() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_KV_LCP_RESUME"]);
+        guard.set("HF2Q_KV_LCP_RESUME", "1");
+        assert!(
+            env_default_true("HF2Q_KV_LCP_RESUME"),
+            "=1 must return true"
+        );
+    }
+
+    /// `=0` must return `false` (explicit opt-out).
+    #[test]
+    fn env_default_true_eq_zero_returns_false() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_KV_LCP_RESUME"]);
+        guard.set("HF2Q_KV_LCP_RESUME", "0");
+        assert!(
+            !env_default_true("HF2Q_KV_LCP_RESUME"),
+            "=0 must return false (opt-out)"
+        );
+    }
+
+    /// `=true` (case-insensitive) must return `true`.
+    #[test]
+    fn env_default_true_eq_true_string_returns_true() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_KV_LCP_RESUME"]);
+        for v in &["true", "True", "TRUE"] {
+            guard.set("HF2Q_KV_LCP_RESUME", v);
+            assert!(
+                env_default_true("HF2Q_KV_LCP_RESUME"),
+                "={v} must return true"
+            );
+        }
+    }
+
+    /// `=off` (case-insensitive) must return `false`.
+    #[test]
+    fn env_default_true_eq_off_returns_false() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_KV_LCP_RESUME"]);
+        for v in &["off", "OFF", "Off"] {
+            guard.set("HF2Q_KV_LCP_RESUME", v);
+            assert!(
+                !env_default_true("HF2Q_KV_LCP_RESUME"),
+                "={v} must return false (opt-out)"
+            );
+        }
+    }
+
+    /// `=false` (case-insensitive) must return `false`.
+    #[test]
+    fn env_default_true_eq_false_string_returns_false() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_KV_LCP_RESUME"]);
+        for v in &["false", "False", "FALSE"] {
+            guard.set("HF2Q_KV_LCP_RESUME", v);
+            assert!(
+                !env_default_true("HF2Q_KV_LCP_RESUME"),
+                "={v} must return false (opt-out)"
+            );
+        }
+    }
+
+    /// `kv_lcp_resume` field is `true` when env is unset (default-on via
+    /// `env_default_true`).
+    #[test]
+    fn kv_lcp_resume_defaults_true_when_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&["HF2Q_KV_LCP_RESUME"]);
+        assert!(
+            InvestigationEnv::from_env().kv_lcp_resume,
+            "kv_lcp_resume must default to true (default-on)"
+        );
+    }
+
+    /// `kv_lcp_resume` field is `false` when `HF2Q_KV_LCP_RESUME=0`.
+    #[test]
+    fn kv_lcp_resume_false_when_zero() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_KV_LCP_RESUME"]);
+        guard.set("HF2Q_KV_LCP_RESUME", "0");
+        assert!(
+            !InvestigationEnv::from_env().kv_lcp_resume,
+            "kv_lcp_resume must be false when HF2Q_KV_LCP_RESUME=0"
+        );
+    }
+
+    /// `kv_lcp_chunked_prefill` field is `true` when env is unset (default-on).
+    #[test]
+    fn kv_lcp_chunked_prefill_defaults_true_when_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&["HF2Q_KV_LCP_CHUNKED_PREFILL"]);
+        assert!(
+            InvestigationEnv::from_env().kv_lcp_chunked_prefill,
+            "kv_lcp_chunked_prefill must default to true (default-on)"
+        );
+    }
+
+    /// `is_kv_lcp_resume_explicitly_one` returns true only when the env is
+    /// exactly `"1"`.
+    #[test]
+    fn is_kv_lcp_resume_explicitly_one_contract() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_KV_LCP_RESUME"]);
+
+        // Unset → false (not explicitly set).
+        assert!(!is_kv_lcp_resume_explicitly_one(), "unset must return false");
+
+        // "1" → true.
+        guard.set("HF2Q_KV_LCP_RESUME", "1");
+        assert!(is_kv_lcp_resume_explicitly_one(), r#""1" must return true"#);
+
+        // "true" → false (not the literal "1").
+        guard.set("HF2Q_KV_LCP_RESUME", "true");
+        assert!(!is_kv_lcp_resume_explicitly_one(), r#""true" must return false (only "1" qualifies)"#);
+
+        // "0" → false.
+        guard.set("HF2Q_KV_LCP_RESUME", "0");
+        assert!(!is_kv_lcp_resume_explicitly_one(), r#""0" must return false"#);
     }
 }

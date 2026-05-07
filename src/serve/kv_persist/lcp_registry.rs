@@ -1,4 +1,4 @@
-//! ADR-017 Phase E option (a) iter-1 — `LcpRegistry` standalone module.
+//! ADR-017 Phase E option (a) — `LcpRegistry` standalone module.
 //!
 //! Per the research dossier at
 //! `docs/research/adr017-phase-e-option-a-2026-05-05.md` §9 + §10, this
@@ -7,7 +7,7 @@
 //! the load-bearing substrate for iter-3's high-risk
 //! `forward_prefill.rs` LCP partial-prefill resume modification.
 //!
-//! ## What this module does (iter-1 scope)
+//! ## What this module does
 //!
 //! - Stores `(LcpKey, prompt_token_ids, payload, sliding_window,
 //!   linear_capacity)` tuples.
@@ -21,21 +21,20 @@
 //!     match, where `dense_kvs` is a `Vec<Arc<T>>` clone (Arc-pinned
 //!     handle that survives concurrent registry eviction — §10.3
 //!     Strategy A; §6 R3).
-//! - LRU eviction on capacity overflow; `lookup` promotes to MRU.
+//! - **Byte-budget LRU eviction** (iter E.a default-on): entries are
+//!   evicted LRU-first until `current_bytes + new_bytes <= byte_budget`.
+//!   The budget is computed from sysinfo `available_memory() × 5%`
+//!   (clamped to `[1 GiB, 16 GiB]`) or overridden via
+//!   `HF2Q_KV_LCP_RESUME_CAPACITY`. `lookup` promotes hit entries to MRU.
+//!   Entry count is secondarily bounded by a `capacity` ceiling (default
+//!   `usize::MAX` in byte-budget mode; set explicitly by `new(n)` shim).
 //!
-//! ## What this module does NOT do (deferred to later iters)
+//! ## ByteSized trait
 //!
-//! - **iter-2:** wire the registry into `engine.rs` request flow at the
-//!   site identified in dossier §2.1 (after PromptCache full-equality
-//!   miss; before fresh-prefill). v2 includes the `soft_tokens.is_empty()`
-//!   text-only scope gate from §10.5.
-//! - **iter-2.5:** refactor `MlxModelWeights::dense_kvs` from
-//!   `Option<Vec<DenseKvBuffers>>` to `Option<Vec<Arc<DenseKvBuffers>>>`
-//!   per §10.3 Strategy A.
-//! - **iter-3:** modify `forward_prefill.rs:446` wholesale-reset to
-//!   conditionally accept `restored_lcp: Option<usize>` and skip the
-//!   `[0..K)` token range. Highest-risk iter; requires Codex Phase-2b
-//!   audit per project memory `feedback_codex_review_catches_unified_memory_races`.
+//! The registry requires `T: ByteSized` to compute exact byte counts at
+//! store time. Production payload types implement this via their existing
+//! byte-reporting APIs (`MlxBuffer::byte_len` for `DenseKvBuffers`;
+//! `HybridKvCacheSnapshot::total_bytes` for Qwen35). No estimators.
 //!
 //! ## Generic over the payload type `T`
 //!
@@ -44,8 +43,7 @@
 //! `Arc<DenseKvBuffers>` per layer). Unit tests at
 //! `tests/lcp_registry_unit.rs` use `T = Vec<u8>` as a marker payload
 //! since `MlxBuffer` requires a Metal device that unit tests don't have.
-//! The registry is generic over `T: Send + Sync + 'static` to support
-//! both regimes.
+//! The registry is generic over `T: Send + Sync + 'static + ByteSized`.
 //!
 //! ## LRU implementation
 //!
@@ -68,9 +66,156 @@
 //! keep the payload alive.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use crate::serve::kv_persist::format::ModelFingerprint;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ByteSized trait
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Exact byte size of a registry payload at store time.
+///
+/// Implementors MUST return the true byte count from existing byte-reporting
+/// APIs (e.g. `MlxBuffer::byte_len`, `HybridKvCacheSnapshot::total_bytes`).
+/// No estimators. The registry uses this to enforce byte-budget eviction.
+pub trait ByteSized {
+    /// Returns the exact byte count of this value.
+    fn byte_len(&self) -> u64;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dynamic byte-budget probe
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compute the byte budget for `LcpRegistry` at engine-init time.
+///
+/// Priority order:
+///
+/// 1. **`HF2Q_KV_LCP_RESUME_CAPACITY` env override** — accepts:
+///    - Bare integer with a suffix (`b`/`B` = bytes; `k`/`K` = ×1024;
+///      `m`/`M` = ×1024²; `g`/`G` = ×1024³). E.g. `2g` = 2 GiB.
+///    - Bare integer ≥ 4096 → treated as a raw byte count.
+///    - Bare integer < 4096 → **legacy entry-count** (backward-compat):
+///      converts via `n × 300 MB` heuristic (300 MB was the measured
+///      per-entry cost on Qwen 3.6 35B-A3B at cap=8 time; see
+///      `c04d5d2` motivation). Emits a one-time deprecation
+///      `eprintln!` directing operators to the byte-suffix form.
+///
+/// 2. **sysinfo probe** (env unset): `available_memory() × 5%` clamped
+///    to `[1 GiB, 16 GiB]`. The 5% / floor / ceiling triple ensures we
+///    claim a defensible slice of free RAM (≈5 GB on a fresh 128 GB Mac,
+///    ~16 Gemma-26B entries or ~16 Qwen35-35B entries) without OOM-
+///    class budgets that cap=64 (19 GB) would cause.
+///
+///    If `available_memory()` returns 0 (shouldn't happen, but paranoia
+///    rule: no magic number fallback), the floor (1 GiB) is returned
+///    with a one-time warning.
+///
+/// Always emits one info-level `eprintln!` naming the chosen budget and
+/// source on the first call (guards the invariant: no silent feature flip).
+pub fn default_lcp_byte_budget() -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const FLOOR: u64 = GIB;          // 1 GiB minimum
+    const CEILING: u64 = 16 * GIB;  // 16 GiB maximum
+
+    static LOG_ONCE: Once = Once::new();
+
+    let env_val = std::env::var("HF2Q_KV_LCP_RESUME_CAPACITY").ok();
+
+    if let Some(raw) = env_val {
+        // Try to parse as integer + optional suffix.
+        let trimmed = raw.trim();
+        let (digits, suffix) = if let Some(last) = trimmed.chars().last() {
+            match last {
+                'b' | 'B' | 'k' | 'K' | 'm' | 'M' | 'g' | 'G' => {
+                    (&trimmed[..trimmed.len() - 1], Some(last))
+                }
+                _ => (trimmed, None),
+            }
+        } else {
+            (trimmed, None)
+        };
+
+        if let Ok(n) = digits.parse::<u64>() {
+            let budget = if let Some(suffix_char) = suffix {
+                // Suffix form: always byte-budget.
+                let multiplier: u64 = match suffix_char {
+                    'b' | 'B' => 1,
+                    'k' | 'K' => 1024,
+                    'm' | 'M' => 1024 * 1024,
+                    'g' | 'G' => 1024 * 1024 * 1024,
+                    _ => unreachable!("suffix already validated above"),
+                };
+                n.saturating_mul(multiplier)
+            } else if n < 4096 {
+                // Legacy entry-count path: n × 300 MB heuristic.
+                let bytes = n.saturating_mul(300 * 1024 * 1024);
+                // Emit deprecation warning exactly once.
+                static LEGACY_ONCE: Once = Once::new();
+                LEGACY_ONCE.call_once(|| {
+                    eprintln!(
+                        "[hf2q lcp] HF2Q_KV_LCP_RESUME_CAPACITY={n} interpreted as \
+                         legacy entry-count (={bytes} bytes); use {n}g for byte-budget"
+                    );
+                });
+                bytes
+            } else {
+                // Bare integer ≥ 4096: raw byte count.
+                n
+            };
+
+            LOG_ONCE.call_once(|| {
+                eprintln!(
+                    "[hf2q lcp] byte_budget={} MB (source=env HF2Q_KV_LCP_RESUME_CAPACITY={})",
+                    budget / (1024 * 1024),
+                    raw.trim()
+                );
+            });
+            return budget;
+        }
+        // Unparsable env value: fall through to sysinfo probe.
+        static PARSE_WARN_ONCE: Once = Once::new();
+        PARSE_WARN_ONCE.call_once(|| {
+            eprintln!(
+                "[hf2q lcp] WARNING: HF2Q_KV_LCP_RESUME_CAPACITY={:?} is not a \
+                 parsable integer (with optional b/k/m/g suffix); falling back to \
+                 sysinfo probe",
+                raw
+            );
+        });
+    }
+
+    // sysinfo probe path.
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let avail = sys.available_memory();
+
+    let budget = if avail == 0 {
+        // Paranoia: sysinfo returned 0 — use floor and warn.
+        static ZERO_AVAIL_ONCE: Once = Once::new();
+        ZERO_AVAIL_ONCE.call_once(|| {
+            eprintln!(
+                "[hf2q lcp] WARNING: sysinfo available_memory() returned 0 bytes; \
+                 using floor budget of 1 GiB"
+            );
+        });
+        FLOOR
+    } else {
+        let computed = (avail as f64 * 0.05) as u64;
+        computed.clamp(FLOOR, CEILING)
+    };
+
+    LOG_ONCE.call_once(|| {
+        eprintln!(
+            "[hf2q lcp] byte_budget={} MB (source=sysinfo available_memory={} GB × 5%)",
+            budget / (1024 * 1024),
+            avail / (1024 * 1024 * 1024)
+        );
+    });
+
+    budget
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -134,6 +279,16 @@ pub enum LcpStoreError {
     /// Empty payload (`dense_kvs.is_empty()`) — every model has ≥1
     /// layer; an empty payload is a misconfiguration.
     EmptyPayload,
+    /// The entry's byte size exceeds the entire byte budget. Even after
+    /// evicting all existing entries, this entry cannot fit. The caller
+    /// must decide whether to skip or abort — silently dropping is NOT
+    /// an option (mantra: no fallback / no stub).
+    EntryExceedsBudget {
+        /// Byte size of the entry that could not be stored.
+        entry_bytes: u64,
+        /// The configured byte budget.
+        budget_bytes: u64,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -153,16 +308,21 @@ struct LcpEntry<T> {
     dense_kvs: Vec<Arc<T>>,
     sliding_window: usize,
     linear_capacity: usize,
+    /// Exact byte count of the payload, computed at store time via
+    /// `T: ByteSized`. Used for byte-budget accounting: subtracted on
+    /// eviction, added on successful insert.
+    bytes: u64,
 }
 
-/// Generic over the cached payload type `T: Send + Sync + 'static`.
+/// Generic over the cached payload type `T: Send + Sync + 'static + ByteSized`.
 /// Production wires `T = DenseKvBuffers`; tests use `T = Vec<u8>`.
 pub struct LcpRegistry<T>
 where
-    T: Send + Sync + 'static,
+    T: Send + Sync + 'static + ByteSized,
 {
-    /// Maximum number of entries. Inserts beyond this evict the LRU
-    /// entry first.
+    /// Entry-count safety ceiling. In byte-budget mode this is
+    /// `usize::MAX` (no entry-count limit beyond physical memory).
+    /// In shim-`new(n)` mode this is `n` (preserves old test behavior).
     capacity: usize,
     /// Insertion-order vector tracking LRU → MRU. `lru_order[0]` is
     /// the LRU candidate; `lru_order.last()` is the MRU. `lookup` hits
@@ -170,18 +330,52 @@ where
     lru_order: Vec<LcpKey>,
     /// Keyed by `LcpKey`; storage for the actual cached state.
     entries: HashMap<LcpKey, LcpEntry<T>>,
+    /// Maximum bytes the registry may hold. Evict LRU entries until
+    /// `current_bytes + new_bytes <= byte_budget` before each new-key
+    /// insert. Set to `u64::MAX` by the `new(n)` back-compat shim.
+    byte_budget: u64,
+    /// Running total of bytes currently stored across all entries.
+    /// Invariant: `current_bytes == sum(entry.bytes for entry in entries)`.
+    current_bytes: u64,
 }
 
 impl<T> LcpRegistry<T>
 where
-    T: Send + Sync + 'static,
+    T: Send + Sync + 'static + ByteSized,
 {
-    /// Construct a new registry with the supplied LRU capacity (in
-    /// entries, NOT in bytes).
+    /// Construct a registry with a **byte-budget** eviction policy.
     ///
-    /// **Panics** when `capacity == 0` — a zero-capacity registry
-    /// would immediately evict every store, which is always a
-    /// misconfiguration. Mirrors `LoadedPool` at `multi_model.rs:208-211`.
+    /// Entries are evicted LRU-first until `current_bytes + new_bytes <=
+    /// byte_budget` before each new-key insert. The entry-count ceiling is
+    /// `usize::MAX` (effectively unbounded by count; memory is the limit).
+    ///
+    /// **Panics** when `byte_budget == 0` — a zero-budget registry would
+    /// immediately evict every store, which is always a misconfiguration.
+    pub fn with_byte_budget(byte_budget: u64) -> Self {
+        assert!(
+            byte_budget > 0,
+            "LcpRegistry::with_byte_budget(0) is a misconfiguration — every \
+             store would immediately evict itself; refusing to construct"
+        );
+        Self {
+            capacity: usize::MAX,
+            lru_order: Vec::new(),
+            entries: HashMap::new(),
+            byte_budget,
+            current_bytes: 0,
+        }
+    }
+
+    /// Back-compat shim: construct a registry with an **entry-count** cap,
+    /// mirroring the original `new(capacity)` API.
+    ///
+    /// The byte budget is set to `u64::MAX` (effectively unbounded by bytes;
+    /// entry count is the limit). All 5 existing call sites in unit test
+    /// fixtures and the `new(1)` test helpers stay unchanged.
+    ///
+    /// **Panics** when `capacity == 0` — a zero-capacity registry would
+    /// immediately evict every store, which is always a misconfiguration.
+    /// Mirrors `LoadedPool` at `multi_model.rs:208-211`.
     pub fn new(capacity: usize) -> Self {
         assert!(
             capacity > 0,
@@ -192,6 +386,8 @@ where
             capacity,
             lru_order: Vec::with_capacity(capacity),
             entries: HashMap::with_capacity(capacity),
+            byte_budget: u64::MAX,
+            current_bytes: 0,
         }
     }
 
@@ -205,23 +401,45 @@ where
         self.entries.is_empty()
     }
 
-    /// Store a prompt + payload tuple under `key`. Evicts the LRU
-    /// entry if `len() >= capacity` (re-inserting under an existing
-    /// key does NOT count toward capacity — it's an overwrite).
+    /// Total bytes currently stored across all entries.
+    ///
+    /// Invariant: equals `sum(entry.bytes for all entries)`. Updated on
+    /// every store, eviction, and clear.
+    pub fn current_bytes(&self) -> u64 {
+        self.current_bytes
+    }
+
+    /// Configured byte budget. Eviction runs until `current_bytes +
+    /// new_bytes <= byte_budget` before a new-key insert.
+    pub fn byte_budget(&self) -> u64 {
+        self.byte_budget
+    }
+
+    /// Store a prompt + payload tuple under `key`.
+    ///
+    /// **Byte-budget eviction**: for new-key inserts, evicts LRU entries
+    /// until `current_bytes + new_bytes <= byte_budget`. If even after
+    /// evicting all entries the single entry still exceeds the budget,
+    /// returns `Err(LcpStoreError::EntryExceedsBudget)` — never silently
+    /// no-ops.
+    ///
+    /// **Same-key reinsert**: subtracts the old entry's bytes, adds the
+    /// new entry's bytes; no eviction of OTHER entries (total entry count
+    /// is unchanged). Promotes to MRU.
+    ///
+    /// **Entry-count ceiling**: secondarily bounded by `capacity`; evicts
+    /// LRU if `entries.len() >= capacity` (back-compat shim behavior).
     ///
     /// `prompt_tokens` is the full prompt as token-IDs (NOT the
     /// prompt + decoded-output concatenation; see dossier §10.6 R12).
     /// `dense_kvs` is the per-layer payload (one `Arc<T>` per layer,
     /// non-empty).
     ///
-    /// Same-key store overwrites the prior payload (matches `PromptCache`
-    /// + `BlockPrefixCacheSpiller::register_family` semantics — the
-    /// freshest registration wins).
-    ///
     /// # Errors
     ///
     /// - [`LcpStoreError::EmptyPrompt`] when `prompt_tokens.is_empty()`.
     /// - [`LcpStoreError::EmptyPayload`] when `dense_kvs.is_empty()`.
+    /// - [`LcpStoreError::EntryExceedsBudget`] when `new_bytes > byte_budget`.
     pub fn store(
         &mut self,
         key: LcpKey,
@@ -237,18 +455,36 @@ where
             return Err(LcpStoreError::EmptyPayload);
         }
 
-        let entry = LcpEntry {
-            prompt: prompt_tokens,
-            dense_kvs,
-            sliding_window,
-            linear_capacity,
-        };
+        // Compute the exact byte count of the new payload via ByteSized.
+        let new_bytes: u64 = dense_kvs.iter().map(|a| a.byte_len()).sum();
 
-        // Re-insert path: overwrite + promote to MRU. Doesn't grow
-        // size; doesn't trigger eviction of OTHER entries because the
-        // total entry count is unchanged.
+        // Same-key reinsert path: overwrite + promote to MRU.
+        // Codex Phase-2b finding 2026-05-06 (HIGH): the same-key path must
+        // honour EntryExceedsBudget identically to the new-key path. Letting
+        // an oversize payload through here would leave current_bytes above
+        // byte_budget and silently violate the store invariant the falsifier
+        // (tests/lcp_registry_byte_budget_falsifier.rs) asserts after every
+        // store. Mantra: no fallback, no silent-disable.
         if self.entries.contains_key(&key) {
-            self.entries.insert(key.clone(), entry);
+            if new_bytes > self.byte_budget {
+                return Err(LcpStoreError::EntryExceedsBudget {
+                    entry_bytes: new_bytes,
+                    budget_bytes: self.byte_budget,
+                });
+            }
+            let old_bytes = self.entries[&key].bytes;
+            self.current_bytes = self.current_bytes.saturating_sub(old_bytes);
+            self.entries.insert(
+                key.clone(),
+                LcpEntry {
+                    prompt: prompt_tokens,
+                    dense_kvs,
+                    sliding_window,
+                    linear_capacity,
+                    bytes: new_bytes,
+                },
+            );
+            self.current_bytes += new_bytes;
             // Promote to MRU.
             if let Some(pos) = self.lru_order.iter().position(|k| k == &key) {
                 let k = self.lru_order.remove(pos);
@@ -257,10 +493,31 @@ where
             return Ok(());
         }
 
-        // Capacity pass: evict LRU if at capacity.
+        // New-key insert path.
+        // Check: single entry larger than entire budget → hard error (no fallback).
+        if new_bytes > self.byte_budget {
+            return Err(LcpStoreError::EntryExceedsBudget {
+                entry_bytes: new_bytes,
+                budget_bytes: self.byte_budget,
+            });
+        }
+
+        // Byte-budget eviction: evict LRU entries until within budget.
+        while self.current_bytes + new_bytes > self.byte_budget && !self.lru_order.is_empty() {
+            if let Some(victim) = self.lru_order.first().cloned() {
+                if let Some(evicted) = self.entries.remove(&victim) {
+                    self.current_bytes = self.current_bytes.saturating_sub(evicted.bytes);
+                }
+                self.lru_order.remove(0);
+            }
+        }
+
+        // Entry-count ceiling eviction (back-compat shim: capacity < usize::MAX).
         while self.entries.len() >= self.capacity {
             if let Some(victim) = self.lru_order.first().cloned() {
-                self.entries.remove(&victim);
+                if let Some(evicted) = self.entries.remove(&victim) {
+                    self.current_bytes = self.current_bytes.saturating_sub(evicted.bytes);
+                }
                 self.lru_order.remove(0);
             } else {
                 // Defensive: lru_order out-of-sync with entries.
@@ -268,8 +525,44 @@ where
             }
         }
 
-        self.entries.insert(key.clone(), entry);
+        self.entries.insert(
+            key.clone(),
+            LcpEntry {
+                prompt: prompt_tokens,
+                dense_kvs,
+                sliding_window,
+                linear_capacity,
+                bytes: new_bytes,
+            },
+        );
+        self.current_bytes += new_bytes;
         self.lru_order.push(key);
+
+        // Q2 empirical sizing log: emit ONCE on the first successful new-key
+        // insert so operators can verify the budget admits a reasonable
+        // number of entries for their model + hardware.
+        {
+            static EMPIRICAL_ONCE: Once = Once::new();
+            EMPIRICAL_ONCE.call_once(|| {
+                let budget_mb = if self.byte_budget == u64::MAX {
+                    // back-compat shim (entry-count mode): no meaningful budget to report
+                    return;
+                } else {
+                    self.byte_budget / (1024 * 1024)
+                };
+                let entry_mb = new_bytes / (1024 * 1024);
+                let admits = if new_bytes > 0 {
+                    self.byte_budget / new_bytes
+                } else {
+                    0
+                };
+                eprintln!(
+                    "[hf2q lcp] empirical: budget={budget_mb} MB / \
+                     first_entry={entry_mb} MB → admits ≈{admits} entries"
+                );
+            });
+        }
+
         Ok(())
     }
 
@@ -356,8 +649,11 @@ where
         let prefix = self.lookup(key, new_tokens)?;
         // Remove from HashMap + lru_order. After this, the only Arc
         // clones outstanding are the ones we just handed back via
-        // `prefix.dense_kvs`.
-        self.entries.remove(key);
+        // `prefix.dense_kvs`. Subtract the entry's bytes from
+        // current_bytes to keep the accounting invariant exact.
+        if let Some(removed) = self.entries.remove(key) {
+            self.current_bytes = self.current_bytes.saturating_sub(removed.bytes);
+        }
         if let Some(pos) = self.lru_order.iter().position(|kk| kk == key) {
             self.lru_order.remove(pos);
         }
@@ -368,14 +664,16 @@ where
     /// model reload (when the registry's cached payloads become
     /// invalid — e.g. weights file changed). The underlying payloads
     /// remain alive as long as in-flight callers hold their `Arc<T>`
-    /// clones — see §6 R3.
+    /// clones — see §6 R3. Resets `current_bytes` to 0.
     pub fn clear(&mut self) {
         self.entries.clear();
         self.lru_order.clear();
+        self.current_bytes = 0;
     }
 
-    /// Configured LRU capacity. Diagnostic accessor; the registry
-    /// enforces the bound automatically on `store`.
+    /// Configured entry-count safety ceiling. In byte-budget mode this is
+    /// `usize::MAX`. In shim-`new(n)` mode this is `n`. Diagnostic
+    /// accessor; the registry enforces the bound automatically on `store`.
     pub fn capacity(&self) -> usize {
         self.capacity
     }
@@ -383,11 +681,13 @@ where
 
 impl<T> std::fmt::Debug for LcpRegistry<T>
 where
-    T: Send + Sync + 'static,
+    T: Send + Sync + 'static + ByteSized,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LcpRegistry")
             .field("capacity", &self.capacity)
+            .field("byte_budget", &self.byte_budget)
+            .field("current_bytes", &self.current_bytes)
             .field("len", &self.entries.len())
             .field("lru_order_len", &self.lru_order.len())
             .finish()
@@ -447,7 +747,7 @@ pub fn probe_lcp_opportunity<T>(
     has_soft_tokens: bool,
 ) -> Option<usize>
 where
-    T: Send + Sync + 'static,
+    T: Send + Sync + 'static + ByteSized,
 {
     if has_soft_tokens {
         // Multimodal request — never probe LCP. The cached KV state

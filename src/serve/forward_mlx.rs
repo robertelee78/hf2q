@@ -808,6 +808,15 @@ pub struct DenseKvBuffers {
     pub dtype: mlx_native::DType,
 }
 
+impl crate::serve::kv_persist::lcp_registry::ByteSized for DenseKvBuffers {
+    /// Exact byte count of the K + V buffers for this layer.
+    /// Uses `MlxBuffer::byte_len()` — the same API used at forward_mlx.rs:1167+
+    /// and 5158+. No estimation.
+    fn byte_len(&self) -> u64 {
+        (self.k.byte_len() + self.v.byte_len()) as u64
+    }
+}
+
 /// Per-call decode regime override for ADR-007 Gate H two-regime-one-process
 /// runs (W12 iter-108a blocker #3).
 ///
@@ -4691,6 +4700,29 @@ impl MlxModelWeights {
         use crate::serve::multi_model::SpillErrorKind;
 
         let cache = self.kv_caches.get(layer_rank).ok_or(SpillErrorKind::CodecErr)?;
+
+        // **B-tq.4 iter-5 fix** — gate snapshot on live state.  The
+        // spiller's `pre_evict` loop iterates `[0..align), [align..2*align), ...`
+        // up to `MAX_PER_LAYER_TOKENS=32768`, breaking on the first
+        // `None` return (signals end-of-live-state for this layer).
+        // Without this gate, snapshot ALWAYS returned Some(zero-padded
+        // bytes) for ranges beyond `seq_len`, causing the loop to run
+        // for ALL 128 ranges × 30 layers = 3840 snapshot calls per
+        // eviction.  Most of those write zero-padded "phantom" blocks
+        // that all hash to the same value → pile up in the writer
+        // queue → some blocks lose to back-pressure → cache_dir ends
+        // up with only 2 entries on a 1127-token prompt instead of
+        // the expected ~120-150.  Worse: warm restore reads "phantom"
+        // blocks instead of live state.
+        //
+        // Fix: return CodecErr (which the spill's wrapping
+        // `snapshot_via_engine` converts to None via `.ok()?`) when
+        // `range.start >= cache.seq_len` — signals the spiller that
+        // live state is exhausted for this layer.
+        if (range.start as usize) >= cache.seq_len {
+            return Err(SpillErrorKind::CodecErr);
+        }
+
         let n_kv_heads = (cache.k_packed.shape().first().copied().unwrap_or(0)) as u32;
         let capacity = cache.capacity as u32;
         // head_dim derives from the runtime packed-buffer row stride:

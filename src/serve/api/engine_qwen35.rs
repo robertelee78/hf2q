@@ -309,13 +309,16 @@ impl Qwen35LoadedModel {
             load_duration,
             provenance,
             prompt_cache: HybridPromptCache::new(),
-            // ADR-017 Phase B-hybrid.1 + B.3: per-process LCP registry.
-            // B.1 (capacity=1) → B.3 (capacity from env, default 64) for
-            // mid-prefill stride-aligned checkpointing.  See
-            // `qwen35_lcp_registry_capacity` for sizing rationale.
+            // ADR-017 Phase E.a default-on — byte-budget LcpRegistry.
+            // Budget computed from sysinfo available_memory() × 5%
+            // clamped to [1 GiB, 16 GiB], or overridden via
+            // `HF2Q_KV_LCP_RESUME_CAPACITY` (byte-suffix form e.g. `2g`;
+            // legacy bare-integer < 4096 still accepted as entry-count
+            // × 300 MB with a deprecation warning). See
+            // `qwen35_lcp_registry_byte_budget` for the sizing rationale.
             lcp_registry:
-                crate::serve::kv_persist::lcp_registry::LcpRegistry::new(
-                    qwen35_lcp_registry_capacity(),
+                crate::serve::kv_persist::lcp_registry::LcpRegistry::with_byte_budget(
+                    qwen35_lcp_registry_byte_budget(),
                 ),
             // Wired by AppState via LoadedModel::generate at request
             // time; None by default.
@@ -727,19 +730,20 @@ fn build_lcp_key_for_qwen35_chunk(
     key
 }
 
-/// ADR-017 Phase E.a B.3 — read the registry capacity from
-/// `HF2Q_KV_LCP_RESUME_CAPACITY` env (default 8 to stay memory-safe on
-/// stock 128 GB Macs running multi-process tests).  Each entry is a
-/// full `HybridKvCacheSnapshot` (~300 MB on Qwen 3.6 35B-A3B), so cap=8
-/// ≈ 2.4 GB peak registry footprint per-process.  Operators with
-/// multi-request workloads or long-context prompts can raise the cap
-/// via env; the cap doubles as a memory ceiling.
-pub fn qwen35_lcp_registry_capacity() -> usize {
-    std::env::var("HF2Q_KV_LCP_RESUME_CAPACITY")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(8)
+/// ADR-017 Phase E.a default-on — byte budget for the Qwen35 LCP registry.
+///
+/// Delegates entirely to `default_lcp_byte_budget()` in `lcp_registry.rs`,
+/// which probes `sysinfo::available_memory() × 5%` clamped to
+/// `[1 GiB, 16 GiB]`, with `HF2Q_KV_LCP_RESUME_CAPACITY` override support.
+///
+/// Rationale: `HybridKvCacheSnapshot::total_bytes()` is the exact per-entry
+/// cost (e.g. ~300 MB on Qwen 3.6 35B-A3B at stride=1024 with 8K tokens,
+/// per the `c04d5d2` motivation for cap=8 ≈ 2.4 GB). The sysinfo-derived
+/// budget on a 128 GB Mac with ~100 GB free ≈ 5 GB ≈ 16 entries at 300 MB
+/// each — a natural replacement for the hard-coded cap=8. Operators who
+/// want more entries raise the budget via `HF2Q_KV_LCP_RESUME_CAPACITY=10g`.
+pub fn qwen35_lcp_registry_byte_budget() -> u64 {
+    crate::serve::kv_persist::lcp_registry::default_lcp_byte_budget()
 }
 
 /// `true` when the running text ends with any of the registered stop
@@ -872,10 +876,18 @@ pub fn generate_qwen35_once(
         }
         let _ = detected;
 
-        // B.2c gate: HF2Q_KV_LCP_RESUME=1 enables actual partial-prefill
-        // resume (default off for safe rollout; observability above runs
-        // unconditionally so metrics show pre-rollout LCP opportunity rate).
-        let lcp_resume_enabled = crate::debug::INVESTIGATION_ENV.kv_lcp_resume;
+        // B.2c gate: HF2Q_KV_LCP_RESUME enables actual partial-prefill
+        // resume (default ON since 2026-05-06; observability above runs
+        // unconditionally so metrics show LCP opportunity rate even when
+        // resume is disabled). Q3 auto-disable: under default-on with
+        // HF2Q_USE_DENSE=0, effective_kv_lcp_resume emits a one-shot
+        // warn-once and returns false. Explicit HF2Q_KV_LCP_RESUME=1
+        // overrides the auto-disable. Codex Phase-2b 2026-05-06 caught
+        // this site missing the helper — added to mirror engine.rs:4099.
+        let lcp_resume_enabled = crate::serve::api::engine::effective_kv_lcp_resume(
+            crate::debug::INVESTIGATION_ENV.kv_lcp_resume,
+            crate::debug::INVESTIGATION_ENV.use_dense,
+        );
         if lcp_resume_enabled {
             let stride =
                 crate::debug::INVESTIGATION_ENV.kv_lcp_deltanet_checkpoint_stride;
@@ -2105,7 +2117,13 @@ pub fn generate_stream_qwen35_once_extended(
         }
         let _ = detected;
 
-        let lcp_resume_enabled = crate::debug::INVESTIGATION_ENV.kv_lcp_resume;
+        // Streaming gate — same Q3 auto-disable wiring as the non-streaming
+        // site above. Codex Phase-2b 2026-05-06 caught this site missing
+        // the helper.
+        let lcp_resume_enabled = crate::serve::api::engine::effective_kv_lcp_resume(
+            crate::debug::INVESTIGATION_ENV.kv_lcp_resume,
+            crate::debug::INVESTIGATION_ENV.use_dense,
+        );
         if lcp_resume_enabled {
             let stride =
                 crate::debug::INVESTIGATION_ENV.kv_lcp_deltanet_checkpoint_stride;
@@ -2421,13 +2439,20 @@ pub fn generate_stream_qwen35_once_extended(
                             .first()
                             .map(|s| s.recurrent.byte_len())
                             .unwrap_or(0);
-                        let _ = qwen.lcp_registry.store(
+                        // Codex Phase-2b 2026-05-06: surface store errors
+                        // instead of `let _ = ...`. Mantra: no fallback.
+                        if let Err(e) = qwen.lcp_registry.store(
                             chunk_key,
                             prompt_tokens.to_vec(),
                             vec![Arc::new(snap)],
                             0,
                             linear_capacity,
-                        );
+                        ) {
+                            tracing::warn!(
+                                error = ?e,
+                                "qwen35 streaming lcp_registry EOF store failed"
+                            );
+                        }
                     }
                 }
             }
