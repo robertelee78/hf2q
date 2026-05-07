@@ -1,6 +1,6 @@
 # ADR-017 Per-Family Ship-Gate Status
 
-**Last updated:** 2026-05-06 (post Phase B-tq.3 codec_version=2 + engine wiring)
+**Last updated:** 2026-05-06 (post Phase B-tq.3 codec_version=2 + engine wiring; B-tq.4 dependency story corrected — plumbing-bound, not Path-C-bound)
 **Companion to:** [ADR-017](./ADR-017-persistent-block-prefix-cache.md)
 **Phase D §476 closure doc.**
 
@@ -26,7 +26,7 @@ requirements, §Performance requirements, §Kill-gates.
 |---|---|---|---|---|---|---|---|
 | Gemma 4 (dense, A4B variant) | `src/serve/kv_persist/families/gemma4_dense.rs` | PASS | PASS | PASS | PASS (ratio=0.000 @ L=32K) | All falsified | **GREEN** (primary; R-P5/R-P6 measured 44,500× / 1.00× post Phase D iter-5/6 + B.5; stress 24h smoke pass at iter-11/12) |
 | Qwen 3.5 / 3.6 (hybrid, MoE+DeltaNet) | `src/serve/api/engine_qwen35.rs::Qwen35LoadedModel::lcp_registry` (Phase E.a B.2-B.5 substrate; no sibling `KvCacheSpill` family hook needed) | PASS (B.2-iso falsifier 0/131072) | n/a (LCP path doesn't use Phase D spiller) | PASS (B.3 stride-aligned + B.5 byte-identity end-to-end) | n/a (LCP-resume measured separately at R-P6 0.79× of 4×cold; bench at `scripts/bench_lcp_resume_speedup.sh`) | n/a (sourdough/dense-only kill-gates don't apply to LCP path) | **GREEN** (Phase E.a B.5 closed 2026-05-05; HF2Q_KV_LCP_RESUME=1 default-on flip operator-controlled post 24h soak) |
-| TQ-packed (codec_version=1 substrate + codec_version=2 engine-wired) | `src/serve/kv_persist/families/tq_packed.rs` (B-tq.1 v1 envelope + B-tq.2 `TqPackedSpill` hook + B-tq.3 v2 engine wiring) + `src/serve/forward_mlx.rs::MlxModelWeights::tq_v2_snapshot_block`/`tq_v2_restore_block` | PASS (v1 + v2 round-trip byte-exact = R-C1) | n/a | PASS (D2 byte-exact rebuild → cosine = 1.0 = R-C2 trivially; v2 capture→restore byte-identity on synthetic `[nkv, capacity, hd_packed]` U8 + `[nkv, capacity]` F32 buffers) | n/a (no inference perf bench at substrate level) | n/a | **GREEN-substrate** (envelope + family hook + engine wiring landed 2026-05-06; `TqPackedSpillFactory` registration in `cmd_serve` is operator-controlled — gated on ADR-007 reopen Path C runtime correctness clearance) |
+| TQ-packed (codec_version=1 substrate + codec_version=2 engine-wired) | `src/serve/kv_persist/families/tq_packed.rs` (B-tq.1 v1 envelope + B-tq.2 `TqPackedSpill` hook + B-tq.3 v2 engine wiring) + `src/serve/forward_mlx.rs::MlxModelWeights::tq_v2_snapshot_block`/`tq_v2_restore_block` | PASS (v1 + v2 round-trip byte-exact = R-C1) | n/a | PASS (D2 byte-exact rebuild → cosine = 1.0 = R-C2 trivially; v2 capture→restore byte-identity on synthetic `[nkv, capacity, hd_packed]` U8 + `[nkv, capacity]` F32 buffers) | n/a (no inference perf bench at substrate level) | n/a | **GREEN-substrate** (envelope + family hook + engine wiring landed 2026-05-06; `TqPackedSpillFactory` registration in `cmd_serve` is plumbing-bound — ~880 LOC mirroring `Gemma4DenseSpillFactory` at `gemma4_dense.rs:1591-1692` per ADR-017 §B-tq.4 enumeration. NOT blocked on ADR-007 Path C; codec-freeze contract F-7 LANDED 2026-05-05 per `docs/adr007-pathC/PATHC_CLOSURE.md`) |
 
 Legend:
 - **PASS**: gate validated by measurement; evidence linked below.

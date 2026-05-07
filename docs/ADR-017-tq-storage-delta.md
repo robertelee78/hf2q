@@ -102,16 +102,34 @@ context for operators) is satisfied by either.
   round-trip exactly, the dequantized state is element-wise byte-equal,
   so cosine = 1.0 trivially.
 
-## Forward compat (B-tq.2 + B-tq.3)
+## Forward compat (B-tq.2 + B-tq.3 + B-tq.4)
 
-When the runtime TurboQuant path stabilizes (ADR-007 reopen 2026-05-05
-Path C completion plan), B-tq.2 lands the engine-side `KvCacheSpill`
-hook (analogous to `Gemma4DenseSpill`) without touching this storage
-codec.  The on-disk envelope at codec_version=1 is FROZEN — bumping
-the version requires a B-tq.X migration plan (read both versions,
+ADR-007 Path C closed substantively at 10 of 11 phases on 2026-05-05
+(`docs/adr007-pathC/PATHC_CLOSURE.md`).  Path C F-7 (codec-freeze
+contract) is LANDED — `codec_version=1` is contractually frozen, and
+the runtime TurboQuant correctness audit (Path C F-0.2 NRMSE 0.000247
+at Gemma 4 26B production shape) is empirically grounded.  This
+unblocks the full B-tq.* chain on the storage-codec side:
+
+* **B-tq.1** (envelope substrate, codec_version=1) LANDED 2026-05-05.
+* **B-tq.2** (`TqPackedSpill` engine-side family hook) LANDED 2026-05-05.
+* **B-tq.3** (codec_version=2 engine wiring with per-token norms +
+  `MlxModelWeights::tq_v2_snapshot_block`/`tq_v2_restore_block`)
+  LANDED 2026-05-06.
+* **B-tq.4** (activation factory: `TqPackedSpillFactory` registration
+  in `cmd_serve` mirroring `Gemma4DenseSpillFactory`) — plumbing-bound
+  per ADR-017 §B-tq.4 enumeration; ~880 LOC.  NOT blocked on ADR-007
+  Path C remaining item F-5 (MMLU/LongBench paper-standard benchmarks)
+  which `PATHC_CLOSURE.md` documents as "discretionary downstream-
+  consumer-driven validation".
+
+The on-disk envelope at codec_version=1 is FROZEN — bumping the
+version requires a B-tq.X migration plan (read all prior versions,
 write only the latest).  `tq_packed::tests::tq_packed_v1_magic_is_frozen`
 + `tq_packed_v1_codec_version_is_frozen` enforce this at unit-test
 time so a regression on the wire format would surface as a CI failure.
+codec_version=2 is similarly frozen via
+`tq_packed_v2_magic_is_frozen` + `tq_packed_v2_codec_version_is_frozen`.
 
 ## v2 envelope (B-tq.3, 2026-05-06)
 
