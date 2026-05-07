@@ -79,6 +79,9 @@ use mlx_native::ops::add_bias_row_2d::{
 use mlx_native::ops::bilinear_resize_2d::{
     dispatch_bilinear_resize_2d_f32, register as register_bilinear_resize_2d,
 };
+use mlx_native::ops::block_merge_2x2::{
+    dispatch_block_merge_2x2_f32, register as register_block_merge_2x2,
+};
 use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
 use mlx_native::ops::elementwise::{elementwise_add, elementwise_mul};
 use mlx_native::ops::gelu::dispatch_gelu;
@@ -641,19 +644,20 @@ pub(crate) fn qwen3vl_2x2_block_merge_reshape(
 // patch grid before adding it to the dual-conv patch embedding.
 // iter-225 Phase-2: signature lifted from square `target_n_per_side`
 // to rectangular `(target_n_x, target_n_y)`.
-/// ADR-021 iter-3b consolidated Stage A1+A2+A3 GPU helper.
+/// ADR-021 iter-4a consolidated Stage A GPU helper (A1+A2+A3+A4).
 ///
-/// Runs the dual-conv patch embed (A1: K1 + 2× dense_matmul +
-/// elementwise_add + optional add_bias_row), the antialiased bilinear
-/// pos-embd resize (A2: K2), AND the inline pos-embd add
-/// (A3: elementwise_add) in a SINGLE GPU session, returning the
-/// `[n_pos_pre, n_embd]` row-major `Vec<f32>` ready for A4 (block
-/// merge, still CPU at iter-3b — replaced by K4 in iter-4a).
+/// Runs the entire CPU prelude on the GPU in ONE session:
 ///
-/// Replaces the per-stage helpers that landed at iter-2a and iter-3a
-/// (each opened its own session and read back to host); consolidating
-/// removes 2× redundant Vec<f32>↔MlxBuffer round-trips and 2×
-/// session.finish() commit-and-wait stalls between stages.
+///   A1   im2col_2d_3ch_f32 + 2× dense_matmul_f32_f32_tensor +
+///        elementwise_add + optional add_bias_row_2d_f32
+///        — dual-conv patch embed.
+///   A2   bilinear_resize_2d_f32 — antialiased pos-embd resize.
+///   A3   elementwise_add — patches + resized_pos_embd.
+///   A4   block_merge_2x2_f32 — 2×2 block-major reshape.
+///
+/// Returns the `[n_pos_merged, n_embd]` row-major `Vec<f32>` ready
+/// for Stage B. The Vec<f32> readback is the last remaining seam;
+/// iter-4b folds Stage A into Stage B's session and removes it.
 ///
 /// # Float-summation order
 ///
@@ -661,10 +665,10 @@ pub(crate) fn qwen3vl_2x2_block_merge_reshape(
 /// simdgroup MMA tiles, NOT the (ic, dy, dx) sequential order
 /// `patch_embed_forward_hw` uses. Output is **byte-equal up to FP
 /// reduction order** rather than strict byte-identical to the CPU
-/// oracle. The bilinear weighted-sum and final pos-embd add are
-/// straight-line iterations whose order matches the CPU oracle, so
-/// they introduce no additional drift on top of A1's matmul.
-fn qwen3vl_stage_a1_a3_gpu_to_cpu(
+/// oracle. K2 / K4 / elementwise_add are straight-line iterations
+/// whose order matches the CPU oracle — they introduce no additional
+/// drift on top of A1's matmul.
+fn qwen3vl_stage_a_gpu_to_cpu(
     pixel_values: &[f32],
     weight_0: &[f32],
     weight_1: &[f32],
@@ -676,7 +680,7 @@ fn qwen3vl_stage_a1_a3_gpu_to_cpu(
     patch_size: u32,
     hidden: u32,
 ) -> Result<Vec<f32>> {
-    let ctx = "qwen3vl_stage_a1_a3_gpu_to_cpu";
+    let ctx = "qwen3vl_stage_a_gpu_to_cpu";
     if patch_size == 0 || pixel_h == 0 || pixel_w == 0 {
         return Err(anyhow!(
             "{ctx}: patch_size ({patch_size}), pixel_h ({pixel_h}), \
@@ -758,6 +762,7 @@ fn qwen3vl_stage_a1_a3_gpu_to_cpu(
     register_im2col_2d_3ch(&mut registry);
     register_add_bias_row_2d(&mut registry);
     register_bilinear_resize_2d(&mut registry);
+    register_block_merge_2x2(&mut registry);
 
     // Allocate + upload pixels and weights.
     let mut pixels_buf = device
@@ -928,7 +933,7 @@ fn qwen3vl_stage_a1_a3_gpu_to_cpu(
     .map_err(|e| anyhow!("bilinear_resize_2d_f32 dispatch: {e}"))?;
     session.encoder_mut().memory_barrier();
 
-    // A3 — inline pos-embd add: final[m,n] = patches_pre[m,n] + pos_resized[m,n]
+    // A3 — inline pos-embd add: summed[m,n] = patches_pre[m,n] + pos_resized[m,n]
     let summed_with_pos_buf = device
         .alloc_buffer(num_patches * h * 4, DType::F32, vec![num_patches, h])
         .map_err(|e| anyhow!("alloc summed_with_pos: {e}"))?;
@@ -945,11 +950,29 @@ fn qwen3vl_stage_a1_a3_gpu_to_cpu(
     .map_err(|e| anyhow!("elementwise_add(patches+pos_embd): {e}"))?;
     session.encoder_mut().memory_barrier();
 
+    // A4 — K4 2×2 block-merge: [nps_y, nps_x, n_embd] -> [num_patches, n_embd]
+    // in 2×2-block-major order (matches qwen3vl.cpp:27-37).
+    let merged_buf = device
+        .alloc_buffer(num_patches * h * 4, DType::F32, vec![num_patches, h])
+        .map_err(|e| anyhow!("alloc merged: {e}"))?;
+    dispatch_block_merge_2x2_f32(
+        session.encoder_mut(),
+        &mut registry,
+        device.metal_device(),
+        &summed_with_pos_buf,
+        &merged_buf,
+        nps_x as u32,
+        nps_y as u32,
+        hidden,
+    )
+    .map_err(|e| anyhow!("block_merge_2x2_f32 dispatch: {e}"))?;
+    session.encoder_mut().memory_barrier();
+
     session
         .finish()
         .map_err(|e| anyhow!("session finish: {e}"))?;
 
-    let s: &[f32] = summed_with_pos_buf
+    let s: &[f32] = merged_buf
         .as_slice::<f32>()
         .map_err(|e| anyhow!("readback: {e}"))?;
     Ok(s.to_vec())
@@ -2562,19 +2585,20 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         .get(super::mmproj::TENSOR_PATCH_EMBD_BIAS)
         .and_then(|b| mmproj_weights.tensor_as_f32_owned(b).ok());
 
-    // ADR-021 iter-3b: A1 (dual-conv patch embed) + A2 (bilinear
-    // pos-embd resize) + A3 (inline pos-embd add) all run in a single
-    // GPU session via the consolidated `qwen3vl_stage_a1_a3_gpu_to_cpu`
-    // helper, which returns the post-add `[n_pos_pre, n_embd]`
-    // row-major Vec<f32>. Iter-4a folds K4 (block-merge) into the
-    // same session and removes the Vec<f32> readback altogether.
+    // ADR-021 iter-4a: A1 (dual-conv patch embed) + A2 (bilinear
+    // pos-embd resize) + A3 (inline pos-embd add) + A4 (2×2
+    // block-merge) all run in ONE GPU session via the consolidated
+    // `qwen3vl_stage_a_gpu_to_cpu` helper, which returns the post-
+    // merge `[n_pos_merged, n_embd]` row-major Vec<f32> ready for
+    // Stage B's per-block forward. Iter-4b folds the readback into
+    // Stage B's session and eliminates the final Vec<f32> seam.
     let pos_embd_buf = mmproj_weights
         .position_embd_weight()
         .map_err(|e| anyhow!("compute_vision_embeddings_gpu_qwen3vl: {e}"))?;
     let pos_embd_f32 = mmproj_weights
         .tensor_as_f32_owned(pos_embd_buf)
         .context("compute_vision_embeddings_gpu_qwen3vl: pos_embd → f32 widen")?;
-    let summed = qwen3vl_stage_a1_a3_gpu_to_cpu(
+    let merged = qwen3vl_stage_a_gpu_to_cpu(
         pixel_values,
         &patch_embd_f32,
         &patch_embd_1_f32,
@@ -2586,21 +2610,11 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         cfg.patch_size,
         cfg.n_embd,
     )
-    .context("compute_vision_embeddings_gpu_qwen3vl: Stage A1+A2+A3 (GPU)")?;
+    .context("compute_vision_embeddings_gpu_qwen3vl: Stage A (GPU, full pipeline)")?;
 
-    // A3. 2x2 block-merge reshape (qwen3vl.cpp:27-37 + the parallel
-    //     pos-embd reshape at 48-57). The block-merge MUST run AFTER
-    //     the pos-embd add — both inputs share the same plain
-    //     row-major y-major-then-x-major layout, the add is correct
-    //     in that layout, and qwen3vl.cpp's matching pair of reshapes
-    //     at 27-37 / 48-57 just reorders the summed result.
-    let merged = qwen3vl_2x2_block_merge_reshape(
-        &summed,
-        n_x_pre as usize,
-        n_y_pre as usize,
-        cfg.n_embd as usize,
-    )
-    .context("compute_vision_embeddings_gpu_qwen3vl: 2x2 block-merge")?;
+    // A4 was folded into `qwen3vl_stage_a_gpu_to_cpu` above (iter-4a).
+    // The returned `merged` is the [n_pos_merged, n_embd] row-major
+    // block-merged tensor that downstream Stage B consumes directly.
 
     // -----------------------------------------------------------------
     // Stage B — Upload merged tensor to GPU + run per-block forward.
