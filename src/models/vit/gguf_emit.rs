@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
 
 use super::config::VisionConfig;
@@ -170,12 +170,16 @@ fn align_up(n: u64, to: u64) -> u64 {
     }
 }
 
-fn current_pos<W: Write>(_w: &mut BufWriter<W>) -> std::io::Result<u64> {
-    // BufWriter doesn't expose Seek; approximate via underlying stream_position
-    // when available. For our writer we can't; fall back to not-implemented.
-    // Proper implementation: use a counting writer. For P10 we track offsets
-    // manually in-caller. Caller never uses this; inline below.
-    Ok(0)
+fn current_pos(w: &mut BufWriter<File>) -> std::io::Result<u64> {
+    // BufWriter<File> implements Seek (transitive over W: Write + Seek), and
+    // `stream_position()` flushes any buffered bytes before delegating to the
+    // underlying file's position cursor. Without this real implementation the
+    // 32-byte tensor-data alignment padding at lines 138-143 wrote ZERO bytes
+    // (header_end was always 0 → align_up(0, 32) = 0 → empty 0..0 range), so
+    // every emitted mmproj GGUF was 1 byte short and every tensor's data was
+    // misaligned by one byte. Bug discovered 2026-05-07 via Wedge-4f live
+    // smoke test on Qwen3-VL-2B-Instruct against ADR-021's worktree.
+    w.stream_position()
 }
 
 /// Write a GGUF string: u64 length prefix + UTF-8 bytes.

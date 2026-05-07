@@ -1023,7 +1023,7 @@ where
                 Ok(e) => e,
                 Err(e) => {
                     return Err(ApiError::generation_error(format!(
-                        "ViT forward failed: {e}"
+                        "ViT forward failed: {e:#}"
                     ))
                     .into_response());
                 }

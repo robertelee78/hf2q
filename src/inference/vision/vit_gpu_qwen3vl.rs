@@ -1774,34 +1774,23 @@ fn apply_qwen3vl_block_forward_gpu(
 
     // -----------------------------------------------------------------
     // Stage 8: FFN (qwen3vl.cpp:138-142).
-    //   gate = Linear(ln2, ffn_gate.w) + ffn_gate.b
-    //   up   = Linear(ln2, ffn_up.w)   + ffn_up.b
-    //   act  = GELU(gate) * up   (FFN_GELU + gate present → geglu_split)
-    //   down = Linear(act, ffn_down.w) + ffn_down.b
+    //
+    // Per /opt/llama.cpp/tools/mtmd/models/qwen3vl.cpp:140-145, the
+    // per-block FFN is a 2-layer GELU MLP — NOT a SwiGLU/GEGLU gate.
+    // The HF source `model.visual.blocks.{N}.mlp.linear_fc1/fc2` map
+    // through hf2q's converter (`src/models/vit/convert.rs:99-102`)
+    // to `v.blk.{N}.ffn_up/ffn_down` (NO `ffn_gate`). The peer's
+    // build_ffn(... gate=ff_gate, up=nullptr, down=ff_down, FFN_GELU)
+    // collapses to:
+    //   up_out   = up(ln2) + up_b
+    //   act_out  = GELU(up_out)
+    //   down_out = down(act_out) + down_b
+    //
+    // Pre-Wedge-4f the consumer ASSUMED GEGLU + asked for ffn_gate;
+    // those tensors don't exist for Qwen3-VL ViT and the request
+    // failed loud at runtime ("mmproj missing 'v.blk.0.ffn_gate.weight'").
+    // Fix: drop the gate path; do up → GELU → down. (2026-05-07.)
     // -----------------------------------------------------------------
-    let gate = vit_linear_gpu(
-        encoder,
-        registry,
-        device,
-        &ln2,
-        block_w("ffn_gate.weight")?,
-        n_pos,
-        hidden,
-        intermediate,
-    )
-    .context("apply_qwen3vl_block_forward_gpu: ffn_gate proj")?;
-    encoder.memory_barrier();
-    let gate = bert_bias_add_gpu(
-        encoder,
-        registry,
-        device,
-        &gate,
-        block_w("ffn_gate.bias")?,
-        n_pos,
-        intermediate,
-    )
-    .context("apply_qwen3vl_block_forward_gpu: ffn_gate bias")?;
-    encoder.memory_barrier();
     let up = vit_linear_gpu(
         encoder,
         registry,
@@ -1826,15 +1815,14 @@ fn apply_qwen3vl_block_forward_gpu(
     .context("apply_qwen3vl_block_forward_gpu: ffn_up bias")?;
     encoder.memory_barrier();
 
-    let activated = vit_qwen3vl_geglu_split_gpu(
+    let activated = vit_qwen3vl_gelu_gpu(
         encoder,
         registry,
         device,
-        &gate,
         &up,
         ((n_pos as usize) * (intermediate as usize)) as u32,
     )
-    .context("apply_qwen3vl_block_forward_gpu: geglu split")?;
+    .context("apply_qwen3vl_block_forward_gpu: gelu")?;
     encoder.memory_barrier();
 
     let down = vit_linear_gpu(
@@ -6389,11 +6377,7 @@ mod tests {
         // exceed by up to 1 ULP per element due to bilinear sum order.
         const EXPECTED_LEN: usize = 1024;
         // Pin trail (each ADR-021 port iter records its hash + a one-line
-        // rationale; first8 + last8 stay byte-identical across all iters
-        // observed so far — middle elements drift only by FP-reduction
-        // order in dense_matmul tiles). The FNV pin is the **strict
-        // tripwire**; first8/last8 are the **structural pin** (they should
-        // not move and any change there means a real index-math bug).
+        // rationale).
         //
         //   iter-1a 2026-05-07 — CPU-prelude path on commit 5f2ba02
         //                         fnv1a64=0xf1a71d67_3b0b5891
@@ -6403,14 +6387,26 @@ mod tests {
         //                         drift in middle elements; first8/last8
         //                         byte-identical to iter-1a.
         //                         fnv1a64=0x7da7f3ad_353c585b
-        const EXPECTED_FNV1A64: u64 = 0x7da7_f3ad_353c_585b;
+        //   iter-7  2026-05-07 — `apply_qwen3vl_block_forward_gpu`'s FFN
+        //                         changed from buggy 3-tensor GEGLU
+        //                         (gate+up+down → asked for nonexistent
+        //                         `ffn_gate.weight`) to the canonical
+        //                         2-layer GELU MLP per qwen3vl.cpp:140-145
+        //                         (up→GELU→down). Per-block output
+        //                         differs by O(0.001) per element (LN
+        //                         + projector amplify the drift through
+        //                         2 layers + projector). Surfaced when
+        //                         the live AC-3 multimodal run hit
+        //                         "mmproj missing 'v.blk.0.ffn_gate.weight'".
+        //                         fnv1a64=0x6ccafc79_ae15b0ee
+        const EXPECTED_FNV1A64: u64 = 0x6cca_fc79_ae15_b0ee;
         const EXPECTED_FIRST8: [u32; 8] = [
-            0x3b43_3e0f, 0x3b15_c486, 0x3ba1_1b92, 0x3c05_1b52,
-            0x3c0b_aa1a, 0x3bbf_01b9, 0x3b50_238e, 0x3b6f_5af2,
+            0x3b43_22b6, 0x3b15_90bf, 0x3ba1_124c, 0x3c05_23f0,
+            0x3c0b_b68c, 0x3bbf_0687, 0x3b4f_fac7, 0x3b6f_2cac,
         ];
         const EXPECTED_LAST8: [u32; 8] = [
-            0xbb22_572b, 0x384c_57e0, 0x3aa7_c065, 0x3837_f620,
-            0xbb09_8b6f, 0xbb2a_2262, 0xba36_da0c, 0x3adc_9039,
+            0xbb22_532e, 0x384d_1920, 0x3aa7_be39, 0x3836_ec00,
+            0xbb09_8ded, 0xbb2a_2074, 0xba36_c922, 0x3adc_9415,
         ];
         assert_eq!(out.len(), EXPECTED_LEN);
         // Hash + spot-pin checks: only enforced when a real value is
