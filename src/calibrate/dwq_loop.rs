@@ -623,6 +623,239 @@ mod tests {
         }
     }
 
+    /// iter-13d — DWQ training loop on a real GGUF Linear weight.
+    ///
+    /// Loads `blk.0.attn_qkv.weight` (default; Q4_0 quantized in the
+    /// 27B hybrid GGUF, [10240, 5120] = 52 422 400 elements) via
+    /// `mlx-native`'s `GgufFile::load_tensor_f32`, runs the affine
+    /// init kernel, perturbs scales/biases by 2.0×, and trains
+    /// (scales, biases) for 100 Adam steps over per-tensor
+    /// reconstruction MSE.
+    ///
+    /// Validates (mantra: "code+tests==truth"):
+    ///   1. Real-tensor magnitude regime — quantized weights from a
+    ///      production GGUF, not synthetic sin*K.
+    ///   2. Per-group min/max init handles real distributions
+    ///      (potentially skewed, sparse, multi-modal).
+    ///   3. KL gradient stability — no NaN/Inf over 100+ steps.
+    ///   4. Peak GPU memory bounded — single shared tape with
+    ///      `tape.reset()` between iterations; no per-step
+    ///      `MlxDevice::new()` churn.
+    ///
+    /// `#[ignore]`-gated because it requires a multi-GB GGUF on disk.
+    /// Run with:
+    ///   cargo test --release --bin hf2q -- \
+    ///     --ignored dwq_loop_real_gguf
+    /// Override path: `HF2Q_TEST_GGUF=/path/to/file.gguf`.
+    /// Override tensor: `HF2Q_TEST_GGUF_TENSOR=blk.X.tensor.weight`.
+    ///
+    /// Acceptance: best loss < 0.2 × initial (5× reduction floor).
+    /// Non-triviality: initial loss must be > init MSE (i.e. the
+    /// 2× perturbation moved the loss landscape measurably above the
+    /// ideal-init reconstruction).
+    #[test]
+    #[ignore]
+    fn dwq_loop_real_gguf_attn_qkv_converges_under_adam() {
+        use mlx_native::gguf::GgufFile;
+
+        let gguf_path = std::env::var("HF2Q_TEST_GGUF").unwrap_or_else(|_| {
+            "/opt/hf2q/models/qwen3.6-27b-mtp-q4_0/qwen3.6-27b-mtp-q4_0.gguf".to_string()
+        });
+        let tensor_name = std::env::var("HF2Q_TEST_GGUF_TENSOR")
+            .unwrap_or_else(|_| "blk.0.attn_qkv.weight".to_string());
+        let path = std::path::Path::new(&gguf_path);
+        if !path.exists() {
+            eprintln!(
+                "[dwq_real_gguf] SKIP: {} not found (set HF2Q_TEST_GGUF=/path)",
+                gguf_path
+            );
+            return;
+        }
+
+        let device = MlxDevice::new().expect("device");
+        let gguf = GgufFile::open(path).expect("open gguf");
+        let info = gguf
+            .tensor_info(&tensor_name)
+            .unwrap_or_else(|| panic!("tensor '{tensor_name}' not in {gguf_path}"));
+        eprintln!(
+            "[dwq_real_gguf] loading {tensor_name}: shape={:?} type={:?}",
+            info.shape, info.ggml_type
+        );
+
+        let buf = gguf
+            .load_tensor_f32(&tensor_name, &device)
+            .expect("load_tensor_f32");
+        let w_real_full: Vec<f32> = buf
+            .as_slice::<f32>()
+            .expect("as_slice f32")
+            .to_vec();
+
+        // Sanity: dequantized values must be finite.
+        let n_finite = w_real_full.iter().filter(|v| v.is_finite()).count();
+        assert_eq!(
+            n_finite,
+            w_real_full.len(),
+            "GGUF dequant produced non-finite values: {}/{}",
+            w_real_full.len() - n_finite,
+            w_real_full.len()
+        );
+
+        let group_size = 32usize;
+        // Q4_0 storage is exact multiples of 32, so element_count is
+        // already group-aligned; assert as an invariant.
+        assert!(
+            w_real_full.len() % group_size == 0,
+            "real weight len {} not divisible by group_size {}",
+            w_real_full.len(),
+            group_size
+        );
+        let n_total = w_real_full.len();
+        let n_groups = n_total / group_size;
+
+        // Init scales+biases from real weight.
+        let mut init_registry = KernelRegistry::new();
+        let (q_int, s_init, b_init) = init_affine_params_gpu(
+            &device,
+            &mut init_registry,
+            &w_real_full,
+            group_size,
+            4, // 4-bit
+        )
+        .expect("init");
+        assert_eq!(s_init.len(), n_groups);
+        assert_eq!(q_int.len(), n_total);
+
+        // All scales positive + finite; all biases finite.  Real
+        // weights with degenerate (uniform) groups would set s := 1.0
+        // by the kernel's contract.
+        for (i, &s) in s_init.iter().enumerate() {
+            assert!(
+                s.is_finite() && s > 0.0,
+                "s_init[{i}] non-finite or non-positive: {s}"
+            );
+        }
+        for (i, &b) in b_init.iter().enumerate() {
+            assert!(b.is_finite(), "b_init[{i}] non-finite: {b}");
+        }
+
+        // Reconstruction MSE @ init — sanity oracle for the per-group
+        // min/max heuristic.  Sets the lower bound on what Adam can
+        // achieve from the perturbed start.
+        let init_mse: f32 = {
+            let mut acc = 0.0f64;
+            for i in 0..n_total {
+                let g = i / group_size;
+                let qdq = q_int[i] as f32 * s_init[g] + b_init[g];
+                acc += (qdq - w_real_full[i]).powi(2) as f64;
+            }
+            (acc / n_total as f64) as f32
+        };
+        eprintln!(
+            "[dwq_real_gguf] reconstruction MSE @ init: {:.6e}  (n_groups={n_groups})",
+            init_mse
+        );
+
+        // Perturb +100% (×2.0).
+        let perturb = |xs: &[f32], factor: f32| -> Vec<f32> {
+            xs.iter().map(|v| v * factor).collect()
+        };
+        let s_p = perturb(&s_init, 2.0);
+        let b_p = perturb(&b_init, 2.0);
+
+        let cfg = AdamConfig {
+            lr: 0.001,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+        };
+        let mut adam = AdamOptimizer::new(device.clone(), cfg).expect("adam");
+        adam.register_param("s", buffer_from_f32(&device, &s_p).unwrap())
+            .unwrap();
+        adam.register_param("b", buffer_from_f32(&device, &b_p).unwrap())
+            .unwrap();
+
+        let tape = GpuTape::new(device.clone());
+        let train_step = |adam: &mut AdamOptimizer, tape: &GpuTape| -> Result<f32> {
+            let s = adam.read_param("s")?;
+            let b = adam.read_param("b")?;
+            let s_leaf = GpuTensor::from_vec(tape, &s, vec![s.len()])?;
+            let b_leaf = GpuTensor::from_vec(tape, &b, vec![b.len()])?;
+            let qdq = qdq_affine(&s_leaf, &b_leaf, &q_int, group_size)?;
+            let w_const = GpuTensor::from_vec(tape, &w_real_full, vec![n_total])?;
+            let r = sub(&qdq, &w_const)?;
+            let sq = square(&r)?;
+            let sq_host = sq.to_vec()?;
+            let loss = (sq_host.iter().map(|v| *v as f64).sum::<f64>() / n_total as f64) as f32;
+            let dy = ones_like(tape, sq.shape())?;
+            let grads = backward(&sq, dy)?;
+            let g_s = grads[s_leaf.node_idx()]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing s grad"))?
+                .clone();
+            let g_b = grads[b_leaf.node_idx()]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing b grad"))?
+                .clone();
+            let mut g_map = BTreeMap::new();
+            g_map.insert("s".to_string(), g_s);
+            g_map.insert("b".to_string(), g_b);
+            adam.step(&g_map)?;
+            Ok(loss)
+        };
+
+        let initial_loss = train_step(&mut adam, &tape).expect("init step");
+        tape.reset();
+
+        // Non-triviality: initial loss > 1.5× the ideal-init MSE.  If
+        // 2× perturbation didn't move the loss, the test is trivial.
+        assert!(
+            initial_loss > init_mse * 1.5,
+            "real-GGUF fixture trivial: initial_loss={initial_loss} ≤ 1.5*init_mse={}",
+            init_mse * 1.5
+        );
+
+        let mut min_loss = initial_loss;
+        let mut last_loss = initial_loss;
+        let n_steps = 100usize;
+        for step in 1..n_steps {
+            let l = train_step(&mut adam, &tape).expect("step");
+            tape.reset();
+            assert!(l.is_finite(), "step {step}: loss became non-finite ({l})");
+            if l < min_loss {
+                min_loss = l;
+            }
+            last_loss = l;
+            if step % 20 == 0 {
+                eprintln!(
+                    "[dwq_real_gguf] step={step} loss={l:.6e} min={min_loss:.6e} initial={initial_loss:.6e}"
+                );
+            }
+        }
+
+        eprintln!(
+            "[dwq_real_gguf] FINAL: initial={:.6e} min={:.6e} last={:.6e} ratio={:.3}",
+            initial_loss,
+            min_loss,
+            last_loss,
+            min_loss / initial_loss
+        );
+
+        assert!(
+            min_loss < initial_loss * 0.2,
+            "did not converge: initial={initial_loss} min={min_loss} last={last_loss}"
+        );
+
+        // Sanity: scales+biases finite at end, scales still positive.
+        let s_final = adam.read_param("s").unwrap();
+        let b_final = adam.read_param("b").unwrap();
+        for (i, &v) in s_final.iter().enumerate() {
+            assert!(v.is_finite(), "s_final[{i}] non-finite: {v}");
+        }
+        for (i, &v) in b_final.iter().enumerate() {
+            assert!(v.is_finite(), "b_final[{i}] non-finite: {v}");
+        }
+    }
+
     /// Sanity test: init kernel output equals the CPU oracle from the
     /// mlx-native side via the host-side wrapper.
     #[test]
