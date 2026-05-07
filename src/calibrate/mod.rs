@@ -38,6 +38,7 @@ pub mod dwq_calibrator;
 pub mod dynamic_quant;
 pub mod dynamic_quant_gpu;
 pub mod qdq_gpu;
+pub mod qwen35_attention_block;
 pub mod imatrix;
 pub mod imatrix_calibrator;
 pub mod imatrix_xvalidate;

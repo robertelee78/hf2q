@@ -102,6 +102,15 @@ enum OpKind {
         rows: usize,
         cols: usize,
     },
+    /// 2-D matrix transpose `Y[j, i] = X[i, j]`.  Input shape `[rows, cols]`,
+    /// output shape `[cols, rows]`.  Backward: `dX = dY^T` (same kernel
+    /// applied with rows/cols swapped, since transpose is its own
+    /// inverse op gradient-wise).
+    Transpose2d {
+        input_idx: usize,
+        rows: usize,
+        cols: usize,
+    },
     /// RMS Normalization along the last dim of a 2-D tensor `[rows, dim]`
     /// with per-feature scale `weight[dim]`.
     /// Forward: `y[b, i] = x[b, i] · rsqrt(mean(x[b, :]²) + eps) · w[i]`.
@@ -393,7 +402,8 @@ pub fn backward(
             }
             OpKind::Softmax { input_idx, .. }
             | OpKind::Log { input_idx }
-            | OpKind::RowSum { input_idx, .. } => {
+            | OpKind::RowSum { input_idx, .. }
+            | OpKind::Transpose2d { input_idx, .. } => {
                 accumulate(&mut grads, input_idx, &parent_grads[0], tape)?;
             }
             OpKind::RmsNorm {
@@ -774,6 +784,34 @@ fn backward_dispatch(
 
             Ok((op, vec![dx_buf]))
         }
+        OpKind::Transpose2d { rows, cols, .. } => {
+            // dX = dY^T.  Same transpose_2d kernel applied to dy
+            // (which has shape [cols, rows] — the forward output shape)
+            // produces dx of shape [rows, cols] — the forward input shape.
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+            let dx_buf = device
+                .alloc_buffer(rows * cols * 4, DType::F32, vec![rows, cols])
+                .map_err(|e| anyhow!("backward transpose: alloc dx: {e}"))?;
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward transpose: encoder: {e}"))?;
+            transpose_2d(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                out_grad,
+                &dx_buf,
+                cols, // dy is [cols, rows]; transpose its rows=cols, cols=rows
+                rows,
+                DType::F32,
+            )
+            .map_err(|e| anyhow!("backward transpose: dispatch: {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward transpose: commit_and_wait: {e}"))?;
+            Ok((op, vec![dx_buf]))
+        }
         OpKind::RmsNorm {
             input_idx,
             weight_idx,
@@ -1033,6 +1071,60 @@ pub fn softmax(t: &GpuTensor) -> Result<GpuTensor> {
         tape: tape.clone(),
         node_idx,
         shape: vec![rows, cols],
+    })
+}
+
+/// 2-D matrix transpose: `Y[j, i] = X[i, j]`.  Input `[rows, cols]`,
+/// output `[cols, rows]`.  Backward via the same `transpose_2d` kernel
+/// (transpose is its own gradient-wise inverse: `dX = dY^T`).
+pub fn transpose(t: &GpuTensor) -> Result<GpuTensor> {
+    if t.shape.len() != 2 {
+        return Err(anyhow!(
+            "transpose: input must be 2-D [rows, cols]; got shape={:?}",
+            t.shape
+        ));
+    }
+    let rows = t.shape[0];
+    let cols = t.shape[1];
+    let tape = &t.tape;
+    let device = tape.device();
+    let in_buf = tape.with_node(t.node_idx, |n| n.value.clone());
+    let out_buf = device
+        .alloc_buffer(rows * cols * 4, DType::F32, vec![cols, rows])
+        .map_err(|e| anyhow!("transpose: alloc out: {e}"))?;
+    let mut registry = tape.0.registry.borrow_mut();
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("transpose: encoder: {e}"))?;
+    transpose_2d(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &in_buf,
+        &out_buf,
+        rows,
+        cols,
+        DType::F32,
+    )
+    .map_err(|e| anyhow!("transpose: dispatch: {e}"))?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("transpose: commit_and_wait: {e}"))?;
+    drop(registry);
+    let input_idx = t.node_idx;
+    let node_idx = tape.push_node(
+        OpKind::Transpose2d {
+            input_idx,
+            rows,
+            cols,
+        },
+        out_buf,
+        vec![cols, rows],
+    );
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: vec![cols, rows],
     })
 }
 
