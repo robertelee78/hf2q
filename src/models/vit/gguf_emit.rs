@@ -258,8 +258,14 @@ fn build_metadata(cfg: &VisionConfig) -> Vec<(String, MetaValue)> {
             "general.name".into(),
             MetaValue::String("hf2q-mmproj".into()),
         ),
-        ("clip.has_vision_encoder".into(), MetaValue::Uint32(1)),
-        ("clip.has_text_encoder".into(), MetaValue::Uint32(0)),
+        // ADR-021 iter-11b: stock llama.cpp's `clip_model_loader::get_bool`
+        // (clip.cpp:2744) calls `gguf_get_val_bool` which asserts the
+        // metadata type is Bool, not Uint32. Pre-fix these were emitted
+        // as Uint32(0/1) and crashed `llama-mtmd-cli` on
+        // `GGML_ASSERT(type_to_gguf_type<T>::value == type)`. Surfaced
+        // 2026-05-07 by the live peer-reference run.
+        ("clip.has_vision_encoder".into(), MetaValue::Bool(true)),
+        ("clip.has_text_encoder".into(), MetaValue::Bool(false)),
         (
             "clip.projector_type".into(),
             MetaValue::String(cfg.projector_type.clone()),

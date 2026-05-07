@@ -3563,6 +3563,21 @@ fn build_metadata(
         emit_qwen35_metadata(meta, arch, &mut kv);
     }
 
+    // ADR-021 iter-11b: qwen3vl / qwen3vlmoe metadata emission. The
+    // `qwen3vl.rope.dimension_sections` key is REQUIRED by stock
+    // llama.cpp's loader (peer's `convert_hf_to_gguf.py:1177` emits
+    // it via `add_rope_dimension_sections(mrope_section[:4])`); the
+    // others (`rope.freq_base` / `attention.layer_norm_rms_epsilon`
+    // / `attention.key_length` / `attention.value_length` /
+    // `n_deepstack_layers`) make hf2q's converter output 1:1 with
+    // /opt/llama.cpp/convert_hf_to_gguf.py for the same input model.
+    // Surfaced 2026-05-07 by `llama-mtmd-cli` failing to load the
+    // hf2q-converted Qwen3-VL-2B-Instruct GGUF with "key not found in
+    // model: qwen3vl.rope.dimension_sections".
+    if arch == "qwen3vl" || arch == "qwen3vlmoe" {
+        emit_qwen3vl_metadata(meta, arch, &mut kv);
+    }
+
     // Load and embed tokenizer metadata from input directory. `?` here
     // surfaces vocab-corruption invariants (added 2026-05-05 CFA) — the
     // outer `write` already returns Result<_, BackendError>, so the bail
@@ -3778,6 +3793,117 @@ fn emit_qwen35_metadata(
         // Note: expert_count and expert_used_count are already emitted by the common
         // path in build_metadata (lines 2004-2015) using meta.num_experts / meta.top_k_experts.
     }
+}
+
+/// ADR-021 iter-11b: emit Qwen3-VL family metadata required by stock
+/// llama.cpp / `llama-mtmd-cli` to load the GGUF without
+/// `--override-kv`. Mirrors the keys
+/// `/opt/llama.cpp/convert_hf_to_gguf.py` writes for the same model:
+///
+/// - `{arch}.rope.dimension_sections`     ARRAY[INT32; 4]  (mandatory; loader bails without it)
+/// - `{arch}.rope.freq_base`              FLOAT32
+/// - `{arch}.attention.layer_norm_rms_epsilon` FLOAT32
+/// - `{arch}.attention.key_length`        UINT32  (= head_dim)
+/// - `{arch}.attention.value_length`      UINT32  (= head_dim)
+/// - `{arch}.n_deepstack_layers`          UINT32  (count of deepstack residual injection layers)
+///
+/// Sources for values:
+/// - `mrope_section`             ← `text_config.rope_scaling.mrope_section`
+/// - `rope_theta`                ← `text_config.rope_theta`
+/// - `rms_norm_eps`              ← `text_config.rms_norm_eps`
+/// - `head_dim`                  ← `text_config.head_dim` (or hidden / num_heads fallback)
+/// - `n_deepstack_layers`        ← len(`text_config.deepstack_visual_indexes`)
+fn emit_qwen3vl_metadata(
+    meta: &crate::ir::ModelMetadata,
+    arch: &str,
+    kv: &mut Vec<(String, MetaValue)>,
+) {
+    let tc = meta
+        .raw_config
+        .get("text_config")
+        .cloned()
+        .unwrap_or_default();
+
+    // mrope_section: pad/truncate to exactly 4 i32 elements (peer pads
+    // with 0 when source has 3). Default to [24, 20, 20, 0] for
+    // Qwen3-VL-2B's hidden=2048 / head_dim=128 layout.
+    let mrope_section_default: [i32; 4] = [24, 20, 20, 0];
+    let mrope_section: Vec<i32> = tc
+        .get("rope_scaling")
+        .and_then(|rs| rs.get("mrope_section"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            let mut out: Vec<i32> = arr
+                .iter()
+                .filter_map(|x| x.as_i64().map(|n| n as i32))
+                .collect();
+            // Pad to 4 (peer convention).
+            while out.len() < 4 {
+                out.push(0);
+            }
+            out.truncate(4);
+            out
+        })
+        .unwrap_or_else(|| mrope_section_default.to_vec());
+    kv.push((
+        format!("{}.rope.dimension_sections", arch),
+        MetaValue::ArrayInt32(mrope_section),
+    ));
+
+    // rope_theta — peer default 5e6 for Qwen3-VL-2B/4B Instruct.
+    let rope_theta = tc
+        .get("rope_theta")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(5_000_000.0) as f32;
+    kv.push((
+        format!("{}.rope.freq_base", arch),
+        MetaValue::Float32(rope_theta),
+    ));
+
+    // rms_norm_eps — peer default 1e-6.
+    let rms_eps = tc
+        .get("rms_norm_eps")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0e-6) as f32;
+    kv.push((
+        format!("{}.attention.layer_norm_rms_epsilon", arch),
+        MetaValue::Float32(rms_eps),
+    ));
+
+    // key_length / value_length — peer reads `text_config.head_dim`
+    // when present, else derives from hidden / num_attention_heads.
+    let head_dim = tc
+        .get("head_dim")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .unwrap_or_else(|| {
+            if meta.num_attention_heads > 0 {
+                (meta.hidden_size as u32) / meta.num_attention_heads
+            } else {
+                128
+            }
+        });
+    kv.push((
+        format!("{}.attention.key_length", arch),
+        MetaValue::Uint32(head_dim),
+    ));
+    kv.push((
+        format!("{}.attention.value_length", arch),
+        MetaValue::Uint32(head_dim),
+    ));
+
+    // n_deepstack_layers — count of indices in
+    // text_config.deepstack_visual_indexes (peer
+    // convert_hf_to_gguf.py:11939 uses `len(...)`).
+    let n_deepstack = tc
+        .get("deepstack_visual_indexes")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.len() as u32)
+        .unwrap_or(0);
+    kv.push((
+        format!("{}.n_deepstack_layers", arch),
+        MetaValue::Uint32(n_deepstack),
+    ));
 }
 
 /// Map global bit width to a GGML file type code.
@@ -4028,6 +4154,16 @@ pub(crate) fn arch_gguf_name(metadata: &crate::ir::ModelMetadata) -> String {
         "Qwen3_5ForCausalLM" | "Qwen3_5ForConditionalGeneration" => "qwen35".to_string(),
         // llama-arch.cpp:43  { LLM_ARCH_QWEN35MOE, "qwen35moe" }
         "Qwen3_5MoeForCausalLM" | "Qwen3_5MoeForConditionalGeneration" => "qwen35moe".to_string(),
+        // llama-arch.cpp:40  { LLM_ARCH_QWEN3VL,    "qwen3vl"    }
+        // HF arch is `Qwen3VLForConditionalGeneration` (model_type=`qwen3_vl`).
+        // The peer drops the underscore for the canonical GGUF arch name;
+        // we mirror that so hf2q's converter output is loadable by stock
+        // llama.cpp / `llama-mtmd-cli` without `--override-kv`.
+        // Fix landed 2026-05-07 after live peer-reference run surfaced the
+        // mismatch (`unknown model architecture: 'qwen3_vl'`).
+        "Qwen3VLForConditionalGeneration" => "qwen3vl".to_string(),
+        // llama-arch.cpp:41  { LLM_ARCH_QWEN3VLMOE, "qwen3vlmoe" }
+        "Qwen3VLMoeForConditionalGeneration" => "qwen3vlmoe".to_string(),
         _ => metadata.model_type.clone(),
     }
 }
