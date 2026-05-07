@@ -72,13 +72,15 @@ Driver C closed. Another ~52 GB saved. Independent of all algorithm work. See AC
 
 Replaces hf2q's misnamed `DWQ-46/48`. Native Rust port; no autograd dep; output stays GGUF (current format). See AC §8.2.
 
-### Step 3 (iters 11–12): Track 2 Path B — subprocess validation of mlx-lm `dwq.py`
+### Step 3 (iters 13–17): Track 2 — native DWQ port
 
-GO/NO-GO gate before committing to native port. Validates the algorithm + output format end-to-end via `mlx_lm.dwq` + `mlx_lm.generate`. See AC §8.3.
-
-### Step 4 (iters 13–18, conditional): Track 2 Path A — native DWQ port
-
-Conditional on Path B passing the perplexity gate. Native Rust port + Adam + Linear-only autograd + stream-to-disk targets + mlx-native prefill kernel. See AC §8.4.
+Direct native port of `dwq_quantize` (mlx-lm `dwq.py:69-209`) reusing
+the iter-8 GPU autograd toolchain: KL-div loss, log_softmax,
+log/softmax/sub/mul/row_sum primitives, Adam optimizer over the
+trainable scales+biases of QDQ'd weights, stream-to-disk targets,
+new mlx-native prefill `quantized_matmul_mm_affine.metal` kernel.
+No subprocess gates, no Python intermediaries — see AC §8.3 + §11
+"Architectural principle: no external tools".
 
 ### Step 5 (iters 19+, optional): Tracks 3+4 — AWQ, GPTQ
 
@@ -182,7 +184,7 @@ Replaces all prior iteration tables.
 | 5.5 | — | ADR structural cleanup `3ce0571` | DONE |
 | 6 | — | Fix `materialize_cloned` deep-clone — Arc-share hot path `beb184f` (~52 GB save; bisect-verified falsifier) | DONE |
 | 7 | 1 | Port `estimate_threshold` + BPW accounting + `SensitivityAlgorithm` enum + `2.0.gradient-alignment` constant `913af23` (16/16 falsifiers; pure-fn, no autograd) | DONE |
-| 8 | aux | mlx-lm comparison harness `8b7e43c` — subprocess wrapper + JSON parser. **NOT Track 1 native progress** (mantra: no fallback). Repurposed as a parity/oracle harness for iter 13+ falsifiers (compare native sensitivity output against mlx-lm ground truth on synthetic fixtures). 18/18 falsifiers PASS. | DONE |
+| 8 | — | ~~mlx-lm subprocess wrapper~~ — **REVERTED** at `<this-commit>` as architecturally misaligned (we don't use external tools).  See §11 "Architectural principle: no external tools". | REVERTED |
 | 8a | 1 | **CPU autograd correctness oracle** at `src/calibrate/autograd.rs` — tape + 7 ops {matmul, add, mul, sub, square, sum, mean} forward + reverse + per-op finite-diff falsifier (17 tests). **Test-only** — never reachable from any runtime entry point. Sole purpose: serves as the analytical reference the GPU autograd (8b+) gets falsifier-tested against. | DONE |
 | 8b | 1 | **GPU matmul** at `src/calibrate/autograd_gpu.rs` — `matmul_forward_f32` + `matmul_backward_f32` standalone functions composed from `dense_matmul_f32_f32_tensor` + `transpose_2d`. Forward: pre-transpose `W` then dispatch.  Backward: 1 dispatch for `dX = dY @ W^T`, 2 transposes + 1 dispatch for `dW = X^T @ dY`. 5 falsifiers PASS including parity with CPU oracle on `[4, 32] @ [32, 4]` forward + `[32, 32] @ [32, 32]` forward+backward, all within 1e-4 rel tol. | DONE |
 | 8b.1 | 1 | **GPU autograd tape** at `src/calibrate/autograd_gpu_tape.rs` — `GpuTape` (`Rc<RefCell<...>>`) + `GpuTensor` types wrapping the iter-8b primitives. `OpKind` enum (`Leaf`, `Matmul {lhs_idx, rhs_idx, m, k, n}`); `backward(output, output_grad)` walks tape in reverse + dispatches per-op via `dense_matmul_f32_f32_tensor` + `transpose_2d` + `elementwise_add` (gradient accumulation when a node is parent to multiple children). 6 falsifiers PASS including **two-matmul chain `Z = (X @ W1) @ W2` backward** producing all 3 gradients (`dX`, `dW1`, `dW2`) matching CPU oracle within 1e-4 rel tol. | DONE |
@@ -192,20 +194,17 @@ Replaces all prior iteration tables.
 | 8f | 1 | **GPU KL-div via composition + row_sum kernel** — new `row_sum_f32` + `row_sum_backward_f32` Metal kernels in mlx-native (per-row reduction with broadcast backward).  hf2q wires `OpKind::RowSum {input_idx, rows, cols}` into GpuTape.  KL-div composes from softmax + log + sub + mul + row_sum.  **THE KEY TEST**: `gpu_tape_kl_div_via_composition_dq_equals_softmax_q_minus_p` — end-to-end KL forward + backward produces `dq = softmax(q) - softmax(p)` matching the analytical identity within 5e-3 rel tol.  This is the EXACT gradient mlx-lm `dynamic_quant.estimate_sensitivities` computes. **Autograd toolchain complete for dynamic_quant.** | DONE |
 | 9 | 1 | **`estimate_sensitivities` algorithm core** at `src/calibrate/dynamic_quant_gpu.rs` — `SyntheticTwoLinearModel` (forward `logits = X @ W1 @ W2`), `kl_div_loss_per_row(logits_q, logits_p)` (composes softmax + log + sub + mul + row_sum), `estimate_sensitivities(tape, student_logits, teacher_logits, quantizables) -> BTreeMap<String, f64>` applies the full sensitivity formula `(∇_W KL · (W_low − W_high)).sum() / (numel / 1e6)` matching `dynamic_quant.py:38-106`. 3 falsifiers PASS including `iter9_estimate_sensitivities_two_linear_synthetic` — 32×32×32×32 synthetic MLP with HAND-DERIVED analytical reference (`∇_W2 = H1^T @ dq`, `∇_W1 = X^T @ (dq @ W2^T)` where `dq = softmax(student) − softmax(teacher)`); GPU sensitivity scalars match the reference within 5e-3 rel tol. | DONE |
 | **10** | 1 | Wire estimate_sensitivities into a real 4-layer Qwen35 attention block (RMSNorm + Q/K/V/O projections); add per-batch streaming with `del grads + mx.eval(grad_accum)` rhythm; add real qdq primitive (CPU oracle + GPU). | **NEXT** |
-| 9 | 1 | Wire autograd into Qwen35 forward pass; per-Linear gradient capture; `estimate_sensitivities` algorithm core matching `dynamic_quant.py:38-106`. | |
-| 10 | 1 | E2E on Qwen3-0.6B-base; falsifier: native-output sensitivity ranking matches mlx-lm subprocess output (using iter-8 harness) within 1e-3 relative on a synthetic fixture. | |
-| 11 | 1 | E2E on Qwen3.6-27B + Gemma 4 26B-A4B — measure RSS, time, output GGUF coherence, PPL vs current variance-magnitude DWQ-46/48 baseline. | |
-| 11 | 2-B | Subprocess wrapper around `mlx_lm.dwq`; produce MLX safetensors | |
-| 12 | 2-B | GO/NO-GO gate: perplexity vs Q4_K_M baseline (>0.05 nats threshold) | |
-| 13–14 | 2-A | Port `dwq_quantize` algorithm core; Linear-only autograd; Adam optimizer | |
-| 15 | 2-A | Port `compute_dwq_targets` stream-to-disk; teacher-drop sequencing | |
-| 16 | 2-A | mlx-native `quantized_matmul_mm_affine.metal` kernel | |
-| 17 | 2-A | hf2q MLX-safetensors loader + tensor variants for runtime support | |
-| 18 | 2-A | Track 2 e2e: hf2q produces + serves DWQ end-to-end | |
-| 19 | 3/4 | AWQ, GPTQ — conditional on demand | |
-| 20 | — | Benchmark suite + ADR closure | |
+| 11 | 1 | E2E on Qwen3-0.6B-base — measure sensitivity ranking, hand-spot-check vs current variance-magnitude DWQ-46 ranking on a few well-known sensitive layers (lm_head, output_norm). | |
+| 12 | 1 | E2E on Qwen3.6-27B + Gemma 4 26B-A4B — measure RSS, time, output GGUF coherence, PPL vs variance-magnitude DWQ-46/48 baseline. | |
+| 13 | 2 | Port `dwq_quantize` algorithm core directly to native GPU autograd — Linear-only Adam optimizer reusing iter-8 toolchain.  No subprocess wrappers. | |
+| 14 | 2 | Port `compute_dwq_targets` stream-to-disk; teacher-drop sequencing. | |
+| 15 | 2 | mlx-native `quantized_matmul_mm_affine.metal` kernel. | |
+| 16 | 2 | hf2q MLX-safetensors loader + tensor variants for runtime support. | |
+| 17 | 2 | Track 2 e2e: hf2q produces + serves DWQ end-to-end. | |
+| 18 | 3/4 | AWQ, GPTQ — conditional on demand. | |
+| 19 | — | Benchmark suite + ADR closure. | |
 
-**Total: 14–16 weeks** of `/loop` iterations.
+**Total: ~12 weeks** of `/loop` iterations (after removing Path B subprocess gates from the plan).
 
 ---
 
@@ -244,7 +243,7 @@ Replaces all prior iteration tables.
 | 8g | QDQ-as-identity-for-codes: dequantize gradient flows through as ∂y/∂w_dequant = identity (codes frozen, scales/biases as continuous params at iter 13+; for dynamic_quant only the dequantized values participate in the gradient). | |
 | 8h | Move tape from CPU to mlx-native MlxBuffer / Metal kernels.  This is when the autograd becomes performant enough for 27B-class.  Until 8h, all algorithm validation runs on CPU at synthetic-fixture scale. | |
 | 9 | Wire autograd into hf2q's Qwen35 forward pass (replace static-quantized weights with the 8a-8h primitives that track gradients); per-Linear gradient accumulation; full `estimate_sensitivities` algorithm core matching `dynamic_quant.py:38-106`. | |
-| 10 | E2E on Qwen3-0.6B-base; falsifier: native-output sensitivity ranking matches mlx-lm subprocess output (using iter-8 aux harness) within 1e-3 relative on a synthetic fixture. | |
+| 10 | E2E on Qwen3-0.6B-base; falsifier: native-output sensitivity ranking is monotone in expected hand-checked direction on well-known sensitive layers (lm_head, output_norm). | |
 | 11 | E2E on Qwen3.6-27B + Gemma 4 26B-A4B — RSS, time, GGUF coherence, PPL vs current variance-magnitude baseline. | |
 
 **Iter-8 framing correction (mantra):**
@@ -262,7 +261,7 @@ iter-8a now begins the actual native autograd work.
 
 **Pass criteria:**
 
-1. **Sensitivity vector parity falsifier:** synthetic 4-layer Qwen fixture (≤ 100 MB, fits in test budget); compute sensitivities via hf2q's new path AND via subprocess to `python -m mlx_lm dynamic-quant` on same fixture; assert per-tensor relative diff `< 1e-3`. Test in `tests/dynamic_quant_sensitivity_parity.rs`.
+1. **Sensitivity vector analytical falsifier:** synthetic 4-layer Qwen fixture (≤ 100 MB, fits in test budget); hand-derive `∇_W = X^T @ (dq @ next_W^T)` chain analytically; assert hf2q's per-tensor sensitivity agrees with the analytical reference to within 5e-3 rel tol (matches iter-9's `iter9_estimate_sensitivities_two_linear_synthetic` pattern).  Test in `src/calibrate/dynamic_quant_gpu.rs`.
 2. **Binary-search threshold falsifier:** for synthetic fixture with known optimal threshold T, assert `estimate_threshold` converges within `1e-3 * (max - min)` tolerance and selected predicate matches expected layer-allocation map.
 3. **Cache key bump enforcement:** loading a `1.0.variance-magnitude`-keyed sensitivity JSON from `~/.cache/hf2q/sensitivity/` fails with a clear error instructing the user to delete the cache or recompute.
 4. **CLI parity:** `hf2q convert --quant dwq-4-6 ...` and `hf2q convert --quant dynamic-quant-4-6 ...` produce byte-identical GGUF (alias preserved).
@@ -280,51 +279,49 @@ gguf-dump --no-tensors /tmp/test.gguf | grep -E '(tokens|eos_token_id)'
 hf2q serve --model /tmp/test.gguf --prompt "the quick brown fox" --max-tokens 16
 ```
 
-### 8.3 Track 2 Path B — Subprocess validation gate
-
-**Source:** `/opt/mlx-lm/mlx_lm/quant/dwq.py` invoked as `python -m mlx_lm dwq ...`.
-**Output:** MLX safetensors directory.
-
-**Pass criteria (all must hold to gate Path A):**
-
-1. **Subprocess wrapper lands** in `src/wrappers/mlx_lm_dwq.rs` (or `scripts/`); takes `--input <fp16-source>` + `--bits 4 --group-size 64` + `--num-samples 2048 --max-seq-length 1025 --learning-rate 1e-6 --batch-size 4`; returns MLX safetensors at `--mlx-path <out>`.
-2. **DWQ output validates with `mlx_lm.generate`:** loads + generates 32 tokens of coherent English on a fixed prompt; no NaN, no degeneracy.
-3. **Perplexity GO/NO-GO gate** on 1k WikiText-2 test split:
-   - Baseline: `mlx_lm.generate` on the same source quantized to Q4_K_M via existing hf2q.
-   - Test: DWQ output via Path B.
-   - **GO if:** `ppl(DWQ) < ppl(Q4_K_M) - 0.05 nats` (i.e., DWQ is at least 0.05 nats better in cross-entropy).
-   - **NO-GO if:** delta < 0.05 nats (Path A not worth the effort).
-4. **Memory profile during subprocess:** max RSS observed `< 100 GB` on Qwen3.6-27B with default samples=2048. (mlx-lm is the gold-standard here; if it OOMs, our box is too small for default-samples DWQ regardless.)
-5. **Decision logged in ADR §10 "Path A GO/NO-GO outcome"** with measured perplexity numbers + recommendation.
-
-**How to verify locally:**
-```bash
-hf2q dwq-via-mlx-lm --input <fp16-source> --output /tmp/dwq-test/ --bits 4
-python -m mlx_lm.evaluate --model /tmp/dwq-test/ --task wikitext-2-ppl
-python -m mlx_lm.evaluate --model <Q4_K_M-baseline> --task wikitext-2-ppl
-# delta-PPL > 0.05 nats → GO
-```
-
-### 8.4 Track 2 Path A — Native DWQ port
-
-**Conditional:** only execute if Path B's GO gate passes.
+### 8.3 Track 2 — Native DWQ port
 
 **Source:** `/opt/mlx-lm/mlx_lm/quant/dwq.py:69-209`.
 **Output:** MLX safetensors via new hf2q output format.
 
+Per the architectural principle (§11), Track 2 ports `dwq_quantize`
+directly to native GPU autograd reusing the iter-8 toolchain — no
+subprocess gates, no Python intermediaries.  The autograd toolchain
+proven for `estimate_sensitivities` at iter 9 covers everything the
+DWQ algorithm needs (Adam optimizer is ~50 LOC of arithmetic over
+the same gradient buffers; KL-div + log_softmax + softmax already
+landed; Linear-only forward already landed).
+
 **Pass criteria:**
 
-1. **`dwq_quantize` algorithm parity falsifier:** on a synthetic 4-layer Qwen fixture, run hf2q's native dwq + mlx-lm's `mlx_lm.dwq` with identical seeds + hyperparameters; assert per-parameter relative diff `< 1e-3` after 20 training steps.
-2. **`compute_dwq_targets` stream-to-disk parity:** byte-identical safetensors target files vs mlx-lm reference on synthetic fixture.
-3. **Adam optimizer parity:** Adam state (m, v, t) byte-identical to mlx-lm's `optimizers.Adam(learning_rate=1e-6, bias_correction=True)` after 20 steps on synthetic gradient stream.
-4. **Linear-only autograd correctness:** gradient-check via finite differences on `kl_div_loss(logits, targets)` for a 2-Linear synthetic forward pass; max relative error `< 1e-3`.
-5. **mlx-native `quantized_matmul_mm_affine.metal` kernel:**
-   - falsifier: scalar-baseline `quantized_matmul` vs new `mm_affine` kernel produce byte-identical output on randomized 1024×1024 affine-quantized weight + 256×1024 input.
-   - perf: at least 5× faster than the scalar baseline on Qwen3.6-27B prefill (single-layer microbench).
-6. **hf2q MLX-safetensors loader:** loads the output of (1) via `mlx_native::weight::load_quantized_weights`; serve-path generation matches the perplexity from Path B's `mlx_lm.generate` round-trip within 0.01 nats.
-7. **End-to-end memory budget:** `hf2q convert --quant dwq-native-4 --target-dir /tmp/targets` on Qwen3.6-27B; max RSS `< 100 GB`.
-8. **End-to-end quality:** delta-PPL vs Q4_K_M baseline `> 0.05 nats` (matches Path B gate, confirms native parity).
-9. **Per-family pass:** all four combos {Qwen 3.6 35B-A3B-Abliterix-EGA, Gemma 4 26B-A4B-it-ara} × {dwq-4, dwq-6} satisfy criteria 7–8.
+1. **`dwq_quantize` algorithm core landed natively** — Adam optimizer
+   over the trainable scales+biases of QDQ'd weights; KL-div loss
+   reusing iter-8f composition; per-batch streaming with
+   `del grads + commit_and_wait` rhythm matching mlx-lm's
+   `del grads + mx.eval(grad_accum)` pattern at `dwq.py:178-179`.
+2. **Synthetic-fixture training convergence falsifier:** on a tiny
+   2-Linear fixture, 20 Adam steps must drive validation KL strictly
+   downward (matches mlx-lm's `validation_loss < initial_validation_loss`
+   guard at `dwq.py:202-207`).
+3. **`compute_dwq_targets` stream-to-disk** matching `dwq.py:29-66` —
+   safetensors target files written before student loads, teacher
+   dropped between phases.
+4. **mlx-native `quantized_matmul_mm_affine.metal` kernel:**
+   - falsifier: scalar-baseline `quantized_matmul` vs new `mm_affine`
+     kernel byte-identical on randomized 1024×1024 affine-quantized
+     weight + 256×1024 input.
+   - perf: at least 5× faster than the scalar baseline on
+     Qwen3.6-27B prefill (single-layer microbench).
+5. **hf2q MLX-safetensors loader:** loads the trained output via
+   `mlx_native::weight::load_quantized_weights`; serve-path generation
+   produces non-degenerate text on a fixed prompt.
+6. **End-to-end memory budget:** `hf2q convert --quant dwq-native-4`
+   on Qwen3.6-27B; max RSS `< 100 GB`.
+7. **End-to-end quality:** delta-PPL vs Q4_K_M baseline `> 0.05 nats`.
+8. **Per-family pass:** all four combos {Qwen 3.6 35B-A3B-Abliterix-EGA,
+   Gemma 4 26B-A4B-it-ara} × {dwq-4, dwq-6} satisfy criteria 6–7.
+
+### 8.4 (reserved — was Track 2 Path A; now folded into §8.3 above)
 
 ### 8.5 Track 3 — AWQ (optional)
 
@@ -353,29 +350,78 @@ python -m mlx_lm.evaluate --model <Q4_K_M-baseline> --task wikitext-2-ppl
 
 ---
 
-## 10. Path A GO/NO-GO outcome
+## 10. (reserved)
 
-*Filled in after iter 12 measurement.*
-
-- Baseline Q4_K_M perplexity: TBD
-- Path B DWQ perplexity: TBD
-- Delta: TBD
-- **Decision:** TBD (GO / NO-GO)
+*(Section 10 originally tracked the Path B GO/NO-GO measurement.
+Path B was reverted as architecturally misaligned — see §11.  No
+gate measurement is performed; Track 2 ports natively.)*
 
 ---
 
-## 11. Alternatives considered
+## 11. Architectural principle: no external tools
+
+**hf2q does not call out to external runtimes for production
+compute.**  No Python subprocesses, no `mlx-lm` shellouts, no
+`llama-cli` wrappers, no other repo's CLI as a runtime dependency.
+Reference repos (`/opt/mlx-lm`, `/opt/llama.cpp`, `/opt/candle`,
+`/opt/omlx`, `/opt/vllm`) exist as **read-only sources of
+algorithmic ideas** — we read their code to understand the math,
+then implement natively in hf2q + mlx-native.
+
+**Why this matters:**
+
+- **Robustness.** Subprocess wrappers create brittle
+  Python-environment dependencies (mlx-lm version pin, virtualenv
+  layout, command-line surface drift).  hf2q is a self-contained
+  Rust binary.
+- **Performance.** Spawning a Python process to compute one
+  gradient amounts to seconds of process-startup + tokenizer-load
+  overhead per call — orders of magnitude worse than a native
+  call.
+- **Mantra alignment.**  `~/Documents/mantra.txt` says *"No
+  fallback. No stub. Just pure excellence, done the right way the
+  entire time."*  A Python subprocess IS the canonical fallback,
+  no matter how it's labeled ("Path B gate", "comparison harness",
+  "parity oracle").  Calling Python for "validation" before
+  writing the real code is a form of avoiding the work.
+- **Architectural cleanliness.** External tools live in a
+  different version space, ship updates on a different cadence,
+  surface different errors.  Keeping hf2q's compute graph fully
+  inside the Rust + Metal stack means one repo, one build, one
+  failure mode.
+
+**What the principle DOES allow:**
+
+- Reading reference repos' source code (e.g.,
+  `/opt/mlx-lm/mlx_lm/quant/dwq.py`) to understand algorithms.
+- The CPU correctness oracle in `src/calibrate/autograd.rs` —
+  pure Rust, `#[cfg(test)]`-only callers, never reachable from
+  any production codepath.  This is a TEST artifact, not an
+  external tool.
+- Linking against `mlx-native` (which we own, modify, and ship
+  alongside hf2q in lockstep).
+
+**What was reverted under this principle:**
+
+| Commit | Module | Reason |
+|---|---|---|
+| `8b7e43c` (`hf2q`) | `src/calibrate/dynamic_quant_external.rs` | Python `mlx_lm.quant.dynamic_quant` subprocess wrapper.  Deleted. |
+| (planned, never landed) | `src/wrappers/mlx_lm_dwq.rs` | Track 2 Path B was a planned `mlx_lm.dwq` subprocess gate.  Removed from §7 iteration plan. |
+
+---
+
+## 12. Alternatives considered
 
 - **Run on bigger box for cache priming:** requires external infra (cloud Mac 192–256 GB or Linux GPU). One-off cost per model + cache copy. Rejected — user wants the code FIXED, no fallback.
 - **Lower `--calibration-samples` to 256:** empirically still kernel-panicked (init load hits 100+ GB before samples matter); also a quality compromise. Rejected.
 - **Substitute K-quants (`q5_k_m`/`q6_k`):** explicit "no cheating, real DWQ" directive. Rejected.
 - **`HF2Q_STREAMING_PHASE3_MUT=1` flag alone:** only addresses Phase 3 dispatch; verified empirically same 199 GB peak. Rejected.
 - **Convert DWQ output → GGUF:** researcher #7 verified format incompatibility (lossy snap). DWQ output ships as MLX safetensors only.
-- **Skip Path B, go straight to Path A:** rejected. Path A is 3–4 weeks of native autograd + kernel work; Path B is 3–5 days and answers "is DWQ worth porting natively for these models" before committing.
+- **Subprocess gates before native port:** explored briefly at iter 8; reverted under §11 architectural principle. Track 2 ports natively from the start.
 
 ---
 
-## 12. References
+## 13. References
 
 - **hf2q code:** `src/main.rs:482-496`, `src/ir/mod.rs:25-50`, `src/ir/lazy.rs:130-225` + `:314-345`, `src/inference/models/qwen35/weight_loader.rs:700-750`, `src/inference/models/qwen35/full_attn.rs::FullAttnLayerWeights`
 - **mlx-lm sources (read-only reference):** `/opt/mlx-lm/mlx_lm/quant/{dwq,dynamic_quant,awq,gptq}.py`; `/opt/mlx-lm/mlx_lm/tuner/`; `/opt/mlx-lm/mlx_lm/utils.py`
