@@ -37,7 +37,7 @@ use tokenizers::Tokenizer;
 
 use crate::inference::models::qwen3vl_text::forward::forward_text_prefill_logits_last;
 use crate::inference::models::qwen3vl_text::Qwen3VlTextModel;
-use crate::serve::forward_prefill::DeepstackInjection;
+use crate::serve::forward_prefill::{DeepstackInjection, SoftTokenInjection};
 use crate::serve::load_info::{
     self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, TokenizerSource,
 };
@@ -436,6 +436,7 @@ pub fn generate_qwen3vl_text_once(
             &tokens_so_far,
             &positions,
             None, // text-only: no DeepStack chunks
+            &[],  // text-only: no soft-token injections
         )
         .with_context(|| format!("forward step {step}"))?;
 
@@ -541,7 +542,7 @@ pub fn generate_qwen3vl_text_once(
 pub fn generate_qwen3vl_text_with_soft_tokens_once(
     qwen: &mut Qwen3VlTextLoadedModel,
     prompt_tokens: &[u32],
-    soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
+    soft_tokens: &[SoftTokenInjection<'_>],
     deepstack: Option<&DeepstackInjection<'_>>,
     positions_flat: &[i32],
     params: &SamplingParams,
@@ -616,31 +617,22 @@ pub fn generate_qwen3vl_text_with_soft_tokens_once(
             }
         }
 
-        // iter-9b limitation: forward_text_prefill_logits_last does
-        // NOT yet take soft tokens. The image-bearing path requires
-        // pre-mutation of the embedding stream BEFORE the forward
-        // runs. iter-9b adds this via a follow-up extension to the
-        // forward function (next sub-iter); for now the function call
-        // signature only accepts `deepstack`. We surface a clear
-        // error if soft_tokens is non-empty so iter-9c can land the
-        // splice.
-        if !soft_tokens.is_empty() {
-            return Err(anyhow!(
-                "generate_qwen3vl_text_with_soft_tokens_once: soft-token splicing is not \
-                 yet implemented in this iter (iter-9b text path); the forward function \
-                 needs an `Option<&[SoftTokenInjection]>` extension to override the \
-                 token-embed-lookup rows at image-pad positions. Tracked as iter-9c. \
-                 (n_soft_token_ranges={}, n_image_tokens={})",
-                soft_tokens.len(),
-                soft_tokens.iter().map(|s| s.range.len()).sum::<usize>(),
-            ));
-        }
-
+        // iter-10a: soft-token splicing is implemented inside
+        // `forward_text_prefill_logits_last` (CPU-side overwrite of
+        // `<|image_pad|>` rows with ViT-projected embeddings before
+        // the GPU upload). The forward re-runs from scratch each
+        // step (no KV cache yet), so the embed table is re-read
+        // every step — the override pass MUST run every step too,
+        // otherwise step > 0 would forget the image embeddings and
+        // the prompt would degrade to placeholder-token semantics.
+        // The validate cost is small relative to the 28-layer
+        // forward, so we pay it every step rather than caching.
         let mut logits = forward_text_prefill_logits_last(
             &mut qwen.model,
             &tokens_so_far,
             &current_positions,
             deepstack,
+            soft_tokens,
         )
         .with_context(|| format!("forward step {step} (multimodal)"))?;
 

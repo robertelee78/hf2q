@@ -90,7 +90,7 @@ use crate::inference::models::qwen35::gpu_full_attn::{
 };
 use crate::inference::models::qwen35::io_heads::embed_tokens;
 use crate::inference::vision::image_token_residual_add::image_token_residual_add_gpu;
-use crate::serve::forward_prefill::DeepstackInjection;
+use crate::serve::forward_prefill::{DeepstackInjection, SoftTokenInjection};
 
 use super::Qwen3VlTextModel;
 
@@ -214,6 +214,7 @@ pub fn forward_text_prefill_logits_last(
     tokens: &[u32],
     positions_flat: &[i32],
     deepstack: Option<&DeepstackInjection<'_>>,
+    soft_tokens: &[SoftTokenInjection<'_>],
 ) -> Result<Vec<f32>> {
     if tokens.is_empty() {
         return Err(anyhow!(
@@ -300,21 +301,104 @@ pub fn forward_text_prefill_logits_last(
     let weights = &model.weights;
 
     // ──────────────────────────────────────────────────────────────────
-    // Step 1: Token embedding lookup (CPU side)
+    // Step 1: Token embedding lookup (CPU side) + soft-token splice
     // ──────────────────────────────────────────────────────────────────
     //
     // weights.token_embd is F32 [vocab, hidden] (cast at load time from
     // GGUF F16 — see weights.rs::load_from_gguf rationale).
     let token_embd_cpu = download_f32(&weights.token_embd)
         .context("download token_embd for embedding lookup")?;
-    let hidden_cpu = embed_tokens(tokens, &token_embd_cpu, vocab, hidden);
+    let mut hidden_cpu = embed_tokens(tokens, &token_embd_cpu, vocab, hidden);
     drop(token_embd_cpu); // release the 1.24 GB CPU buffer ASAP
+
+    // Soft-token splicing (iter-10a) — replace the per-token embed-table
+    // rows at `<|image_pad|>` (or other override) positions with
+    // ViT-projected vision-token embeddings supplied by the chat
+    // handler. Mirrors qwen35's `embed_tokens_gpu_with_soft_tokens`
+    // contract documented at `crate::serve::forward_prefill::SoftTokenInjection`.
+    //
+    // Each SoftTokenInjection carries an `embeddings: &MlxBuffer` of
+    // shape `[range.len(), hidden_size]` F32 row-major. We download the
+    // override rows (CPU) and overwrite `hidden_cpu[range, :]` before
+    // the GPU upload. Keeps the override path entirely CPU-side ahead
+    // of the prefill upload — no extra GPU dispatch needed.
+    if !soft_tokens.is_empty() {
+        // Validate ranges + non-overlap once before doing any copies.
+        // Mirrors `embed_tokens_gpu_with_soft_tokens`'s validate pass.
+        let h = hidden as usize;
+        let mut occupied: Vec<bool> = vec![false; seq_len_usize];
+        for inj in soft_tokens {
+            if inj.range.start >= inj.range.end {
+                return Err(anyhow!(
+                    "forward_text: SoftTokenInjection has empty/inverted range \
+                     [{}, {}); each injection must cover ≥ 1 token",
+                    inj.range.start, inj.range.end
+                ));
+            }
+            if inj.range.end > seq_len_usize {
+                return Err(anyhow!(
+                    "forward_text: SoftTokenInjection range [{}, {}) extends past \
+                     prompt_len ({})",
+                    inj.range.start, inj.range.end, seq_len_usize
+                ));
+            }
+            for p in inj.range.clone() {
+                if occupied[p] {
+                    return Err(anyhow!(
+                        "forward_text: SoftTokenInjection ranges overlap at position {p}"
+                    ));
+                }
+                occupied[p] = true;
+            }
+            // Validate the override buffer's logical span. The MlxBuffer
+            // may carry bucket-rounded byte_len from the pool; we compare
+            // against the row-major span we'll actually read.
+            let required_bytes = inj.range.len() * h * 4;
+            let span = inj.embeddings.byte_len()
+                .saturating_sub(inj.embeddings.byte_offset() as usize);
+            if span < required_bytes {
+                return Err(anyhow!(
+                    "forward_text: SoftTokenInjection embeddings span {} < required {} \
+                     (range.len()={} * hidden={} * 4)",
+                    span, required_bytes, inj.range.len(), hidden
+                ));
+            }
+            if inj.embeddings.dtype() != DType::F32 {
+                return Err(anyhow!(
+                    "forward_text: SoftTokenInjection embeddings dtype must be F32; got {:?}",
+                    inj.embeddings.dtype()
+                ));
+            }
+        }
+        // All injections validated; perform the overwrite passes.
+        for inj in soft_tokens {
+            let chunk = inj.embeddings
+                .as_slice::<f32>()
+                .map_err(|e| anyhow!("soft-token embeddings as_slice: {e}"))?;
+            for (i, p) in inj.range.clone().enumerate() {
+                let src_off = i * h;
+                let dst_off = p * h;
+                hidden_cpu[dst_off..dst_off + h]
+                    .copy_from_slice(&chunk[src_off..src_off + h]);
+            }
+        }
+    }
 
     // ──────────────────────────────────────────────────────────────────
     // Step 2: Open the GPU session shared across all 28 layers + head
     // ──────────────────────────────────────────────────────────────────
     let (executor, registry) = model.ctx.split();
     let device = executor.device();
+
+    // Register the LM-side image-token residual-add shader (Wedge-4c.5
+    // / iter-9a). Idempotent: safe to call every forward; the registry
+    // detects the existing entry and short-circuits. Non-multimodal
+    // forwards (deepstack=None) never dispatch the kernel anyway, so
+    // the registration cost is amortized once and free thereafter.
+    // Mirrors qwen35::forward_gpu's primed-path registration at
+    // `forward_gpu.rs:1884-1885`.
+    crate::inference::vision::image_token_residual_add::
+        register_image_token_residual_add_shader(registry);
 
     // Upload initial residual stream `hidden_gpu` and IMROPE positions.
     // Both are persistent across the full forward.
@@ -855,7 +939,7 @@ mod tests {
         }
 
         let logits = forward_text_prefill_logits_last(
-            &mut model, &tokens, &positions, None,
+            &mut model, &tokens, &positions, None, &[],
         )
         .expect("forward must succeed on the canonical GGUF");
 

@@ -409,7 +409,13 @@ pub async fn chat_completions(
     let result = match gen_outcome {
         Ok(r) => r,
         Err(e) => {
-            let msg = format!("{e}");
+            // Use {e:#} so the FULL error chain comes through to the
+            // operator (anyhow's `Context` wrappers + the underlying
+            // root cause). iter-11b fixed this at the streaming arm
+            // (`87ab42b`); the non-streaming arm here was missed and
+            // surfaced with iter-10a's multimodal failure ("forward
+            // step 0 (multimodal)" hid the real underlying error).
+            let msg = format!("{e:#}");
             // Distinguish queue_full (→ 429) from other engine errors (→ 500).
             if msg.contains("queue_full") {
                 state.metrics.chat_completions_queue_full.fetch_add(1, Ordering::Relaxed);
