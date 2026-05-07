@@ -1,6 +1,6 @@
 # ADR-021: Qwen3-VL ViT Prelude → GPU Port
 
-**Status**: Queued — runs after ADR-020 (DWQ) closes (iters 10–19). Linear sequencing chosen 2026-05-07 by user.
+**Status**: In Progress — user pivoted 2026-05-07 to begin ADR-021 ahead of ADR-020 iters 10–19 closure. Iter-1a baseline first.
 
 **Driver**: User mission — "fall back is a forbidden term"; "GPU EVERYWHERE we can; CPU == poop slow"; "we'd never want a user to use CPU for something that should be GPU." `compute_vision_embeddings_gpu_qwen3vl` (the production GPU vision path for Qwen3-VL) currently calls 5 CPU functions in the middle of an otherwise-GPU pipeline. Pre-dates ADR-020 §11 "no external tools / no CPU fallback." Misaligned architecturally.
 
@@ -95,7 +95,7 @@ The `Vec<f32>` readback at 2522-2552 collapses to a single `feature_concat_f32` 
 
 | # | Sub | Description | Status |
 |---|---|---|---|
-| 1 | a | Capture pre-port byte-identical golden via test on current `main`; commit baseline fixture | pending |
+| 1 | a | Capture pre-port byte-identical golden via test on current `main`; commit baseline fixture | LANDED on branch `adr-021/impl` worktree `/tmp/hf2q-adr-021`. Test `adr021_iter1a_e2e_byte_pinned_baseline_2026_05_07` pins fnv1a64=`0xf1a71d67_3b0b5891`, len=1024, first8 + last8 f32 bit patterns. Captured from CPU-prelude path on commit 5f2ba02. |
 | 1 | b | Add K1 `im2col_2d_3ch_f32` Metal kernel + Rust dispatch + parity test | pending |
 | 2 | a | Wire K1 + 2× existing `dense_matmul_f32_f32_tensor` + bias_add to replace `qwen3vl_dual_conv_patch_embed_cpu_hw` at line 2241; AC-1 + AC-2 byte-identical | pending |
 | 3 | a | Add K2 `bilinear_resize_2d_f32` + parity test; replace `qwen3vl_resize_position_embeddings_bilinear` at 2261 | pending |

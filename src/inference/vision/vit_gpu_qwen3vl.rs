@@ -5846,4 +5846,217 @@ mod tests {
         // 2 patches × hidden = 64 floats.
         assert_eq!(phase2_rect.len(), 2 * (hidden as usize));
     }
+
+    // ---------------------------------------------------------------
+    // ADR-021 — Qwen3-VL ViT prelude → GPU port
+    // ---------------------------------------------------------------
+
+    /// FNV-1a 64-bit hash of the little-endian byte representation of
+    /// the input f32 slice. Stable across machines and runs because
+    /// (a) IEEE-754 f32 bit patterns are deterministic given identical
+    /// inputs + identical computation graph, and (b) FNV-1a is a fixed
+    /// algorithm.
+    fn fnv1a64_of_f32_slice(xs: &[f32]) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut h: u64 = FNV_OFFSET;
+        for x in xs {
+            for &b in &x.to_bits().to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+        }
+        h
+    }
+
+    /// Overwrite an existing `LoadedMmprojWeights` tensor's f32 contents
+    /// with a deterministic seeded sin pattern. Used by ADR-021's
+    /// byte-pinned baseline test to give every weight tensor a
+    /// non-trivial value (the default constant-fill collapses
+    /// LayerNorm to zero and would defeat the e2e parity test).
+    fn override_tensor_with_seeded_sin(
+        weights: &LoadedMmprojWeights,
+        name: &str,
+        scale: f32,
+        offset: f32,
+    ) {
+        let buf = weights
+            .get(name)
+            .unwrap_or_else(|| panic!("ADR-021 baseline: missing tensor '{name}'"));
+        let n = buf.byte_len() / 4;
+        // SAFETY: synthetic mmproj weights are unique-owned by this test
+        // and no GPU work has been encoded against them yet — overwriting
+        // the underlying StorageModeShared backing is the established
+        // synth-test pattern (see `fill_f32` at build_synth_qwen3vl_*).
+        let s: &mut [f32] =
+            unsafe { std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut f32, n) };
+        for (i, v) in s.iter_mut().enumerate() {
+            *v = (((i as f32) + offset) * 0.017_3_f32).sin() * scale;
+        }
+    }
+
+    /// ADR-021 iter-1a: pre-port byte-identical golden f32 baseline.
+    ///
+    /// Captures the FNV-1a hash + spot-pinned f32 bit patterns for the
+    /// augmented-embed output of `compute_vision_embeddings_gpu_qwen3vl`
+    /// run with deterministic pseudo-random pixels + seeded-random
+    /// weights through the CURRENT CPU prelude path. After each
+    /// CPU-helper → Metal-kernel swap (iters 2a, 3a, 3b, 4a, 4b), this
+    /// test re-runs and the assertions catch any byte-level drift.
+    ///
+    /// Fixture: `synth_qwen3vl_block_cfg(2)` → 2 ViT layers, hidden=32,
+    /// patch=16, image=128, deepstack=[0]. Weights are first
+    /// constant-filled by `build_synth_qwen3vl_weights_with_deepstack`
+    /// then EVERY relevant tensor is overwritten by a seeded sin pattern
+    /// with a per-tensor offset so that:
+    ///   - patch_embd produces non-trivial dual-conv output
+    ///   - position_embd makes the resize + add measurable
+    ///   - LN gains/biases are non-degenerate
+    ///   - attn / ffn / mm / deepstack weights are non-trivial
+    ///
+    /// The pinned hash + spot bits act as a tripwire: ANY single bit
+    /// flip in the output at any stage of the prelude is detected.
+    /// AC-2 byte-identity for K1/K4/K5 swaps is verified against this
+    /// hash; K2 (bilinear) gets ULP-bound treatment in its own kernel
+    /// parity test (per ADR `1 ULP for K2 bilinear`).
+    #[test]
+    fn adr021_iter1a_e2e_byte_pinned_baseline_2026_05_07() {
+        let device = mlx_native::MlxDevice::new().expect("MlxDevice");
+        let (mut vit_cfg, mmproj_cfg) = synth_qwen3vl_block_cfg(2);
+        vit_cfg.deepstack_indexes = vec![0];
+
+        // Constant-fill base; then surgical override below.
+        let weights = build_synth_qwen3vl_weights_with_deepstack(
+            device,
+            vit_cfg.n_layer,
+            vit_cfg.n_embd,
+            vit_cfg.intermediate_size,
+            (vit_cfg.num_position_embeddings as f64).sqrt() as u32,
+            1.0, // ln_gain (overridden below)
+            0.0, // ln_bias (overridden below)
+            0.0, // proj_w (overridden below)
+            0.0, // ffn_w (overridden below)
+            vit_cfg.patch_size,
+            &vit_cfg.deepstack_indexes,
+            vit_cfg.out_hidden_size,
+        );
+
+        // Seeded sin overrides for every load-bearing tensor. Different
+        // per-tensor `offset` so different tensors carry different
+        // patterns and LN never collapses to a zero variance vector.
+        override_tensor_with_seeded_sin(&weights, "v.patch_embd.weight", 0.05, 1.0);
+        override_tensor_with_seeded_sin(&weights, "v.patch_embd.weight.1", 0.05, 313.0);
+        override_tensor_with_seeded_sin(&weights, "v.position_embd.weight", 0.03, 727.0);
+        override_tensor_with_seeded_sin(&weights, "v.post_ln.weight", 1.0, 11.0);
+        override_tensor_with_seeded_sin(&weights, "v.post_ln.bias", 0.01, 17.0);
+        for il in 0..(vit_cfg.n_layer as usize) {
+            let blk = format!("v.blk.{il}");
+            override_tensor_with_seeded_sin(&weights, &format!("{blk}.ln1.weight"), 1.0, (101 + il) as f32);
+            override_tensor_with_seeded_sin(&weights, &format!("{blk}.ln1.bias"),   0.01, (151 + il) as f32);
+            override_tensor_with_seeded_sin(&weights, &format!("{blk}.ln2.weight"), 1.0, (201 + il) as f32);
+            override_tensor_with_seeded_sin(&weights, &format!("{blk}.ln2.bias"),   0.01, (251 + il) as f32);
+            for which in ["attn_q", "attn_k", "attn_v", "attn_out"] {
+                override_tensor_with_seeded_sin(&weights, &format!("{blk}.{which}.weight"), 0.04, (301 + il * 7) as f32);
+                override_tensor_with_seeded_sin(&weights, &format!("{blk}.{which}.bias"),   0.01, (401 + il * 7) as f32);
+            }
+            for which in ["ffn_gate", "ffn_up"] {
+                override_tensor_with_seeded_sin(&weights, &format!("{blk}.{which}.weight"), 0.03, (501 + il * 5) as f32);
+                override_tensor_with_seeded_sin(&weights, &format!("{blk}.{which}.bias"),   0.01, (601 + il * 5) as f32);
+            }
+            override_tensor_with_seeded_sin(&weights, &format!("{blk}.ffn_down.weight"), 0.03, (701 + il * 3) as f32);
+            override_tensor_with_seeded_sin(&weights, &format!("{blk}.ffn_down.bias"),   0.01, (801 + il * 3) as f32);
+        }
+        // Main projector + flagged DeepStack head (vit_cfg.deepstack_indexes = [0]).
+        override_tensor_with_seeded_sin(&weights, "mm.0.weight", 0.02, 9001.0);
+        override_tensor_with_seeded_sin(&weights, "mm.0.bias",   0.01, 9011.0);
+        override_tensor_with_seeded_sin(&weights, "mm.2.weight", 0.02, 9101.0);
+        override_tensor_with_seeded_sin(&weights, "mm.2.bias",   0.01, 9111.0);
+        for &il in &vit_cfg.deepstack_indexes {
+            let il_us = il as usize;
+            override_tensor_with_seeded_sin(&weights, &format!("v.deepstack.{il_us}.norm.weight"), 1.0, (10001 + il_us) as f32);
+            override_tensor_with_seeded_sin(&weights, &format!("v.deepstack.{il_us}.norm.bias"),   0.01, (10101 + il_us) as f32);
+            override_tensor_with_seeded_sin(&weights, &format!("v.deepstack.{il_us}.fc1.weight"),  0.02, (10201 + il_us) as f32);
+            override_tensor_with_seeded_sin(&weights, &format!("v.deepstack.{il_us}.fc1.bias"),    0.01, (10301 + il_us) as f32);
+            override_tensor_with_seeded_sin(&weights, &format!("v.deepstack.{il_us}.fc2.weight"),  0.02, (10401 + il_us) as f32);
+            override_tensor_with_seeded_sin(&weights, &format!("v.deepstack.{il_us}.fc2.bias"),    0.01, (10501 + il_us) as f32);
+        }
+
+        // Pseudo-random pixels — square `image_size×image_size` (128²).
+        // Phase-1 entry: pixel_w/pixel_h derived from mmproj_cfg.image_size.
+        let pixel_h: u32 = mmproj_cfg.image_size;
+        let pixel_w: u32 = mmproj_cfg.image_size;
+        let n_px = 3 * (pixel_h as usize) * (pixel_w as usize);
+        let pixel_values: Vec<f32> = (0..n_px)
+            .map(|i| (((i as f32) * 0.011_7_f32).sin() * 0.5).clamp(-1.0, 1.0))
+            .collect();
+        let img = crate::inference::vision::PreprocessedImage {
+            pixel_values,
+            target_size: pixel_h,
+            pixel_w: Some(pixel_w),
+            pixel_h: Some(pixel_h),
+            source_label: "adr021-iter1a-baseline".to_string(),
+        };
+        let inputs = vec![crate::inference::vision::vit_gpu::VisionInput::Siglip49(img)];
+
+        let result = compute_vision_embeddings_gpu_qwen3vl(
+            &inputs, &weights, &vit_cfg, &mmproj_cfg,
+        )
+        .expect("ADR-021 iter-1a baseline must succeed");
+        assert_eq!(result.len(), 1);
+        let out = &result[0];
+
+        // n_x_pre = 128/16 = 8; n_pos_merged = 64;
+        // n_image_tokens = 64/4 = 16; augmented_embed_dim = lm_h*(1+|ds|) = 32*(1+1) = 64.
+        let expected_len = 16 * (vit_cfg.augmented_embed_dim() as usize);
+        assert_eq!(
+            out.len(),
+            expected_len,
+            "ADR-021 iter-1a baseline: augmented embed must be n_image_tokens(16) \
+             * augmented_embed_dim({}) = {expected_len}",
+            vit_cfg.augmented_embed_dim()
+        );
+
+        let h = fnv1a64_of_f32_slice(out);
+        let mut first8 = [0u32; 8];
+        let mut last8 = [0u32; 8];
+        for i in 0..8 {
+            first8[i] = out[i].to_bits();
+            last8[i] = out[out.len() - 8 + i].to_bits();
+        }
+
+        eprintln!("=== ADR-021 iter-1a baseline ===");
+        eprintln!("len = {}", out.len());
+        eprintln!("fnv1a64 = 0x{:016x}", h);
+        eprintln!("first8 = {:08x?}", first8);
+        eprintln!("last8 = {:08x?}", last8);
+
+        // Pinned values captured on commit head of ADR-021 iter-1a
+        // (CPU-prelude path). After each iter swap (iter-2a K1, iter-3a
+        // K2, iter-3b add, iter-4a K4, iter-4b K5) re-run this test —
+        // K1/K4/K5 swaps must keep these pins byte-identical; K2 may
+        // exceed by up to 1 ULP per element due to bilinear sum order.
+        const EXPECTED_LEN: usize = 1024;
+        // Pinned 2026-05-07 from CPU-prelude path on commit 5f2ba02
+        // (HEAD of `main` at ADR-021 iter-1a start).
+        const EXPECTED_FNV1A64: u64 = 0xf1a7_1d67_3b0b_5891;
+        const EXPECTED_FIRST8: [u32; 8] = [
+            0x3b43_3e0f, 0x3b15_c486, 0x3ba1_1b92, 0x3c05_1b52,
+            0x3c0b_aa1a, 0x3bbf_01b9, 0x3b50_238e, 0x3b6f_5af2,
+        ];
+        const EXPECTED_LAST8: [u32; 8] = [
+            0xbb22_572b, 0x384c_57e0, 0x3aa7_c065, 0x3837_f620,
+            0xbb09_8b6f, 0xbb2a_2262, 0xba36_da0c, 0x3adc_9039,
+        ];
+        assert_eq!(out.len(), EXPECTED_LEN);
+        // Hash + spot-pin checks: only enforced when a real value is
+        // pinned (sentinel 0 means "first capture, fill me in").
+        if EXPECTED_FNV1A64 != 0 {
+            assert_eq!(h, EXPECTED_FNV1A64,
+                "ADR-021 iter-1a byte-pinned hash drift — re-run \
+                 from a clean main, capture the printed fnv1a64, \
+                 update EXPECTED_FNV1A64 if the drift is intentional");
+            assert_eq!(first8, EXPECTED_FIRST8, "first8 bit drift");
+            assert_eq!(last8, EXPECTED_LAST8, "last8 bit drift");
+        }
+    }
 }
