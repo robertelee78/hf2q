@@ -36,12 +36,13 @@
 //!
 //! # Scope of this iter
 //!
-//! - **Done in iter-8a-2 (this iter)**: full prefill — token embedding
-//!   lookup, per-layer attn + FFN chain, final RMSNorm + LM head
-//!   (tied + untied), returns last-position logits.
-//! - **Deferred to iter-9a**: DeepStack residual injection at LM
-//!   layers `il < n_deepstack_layers` (per-position add of vision
-//!   slab into image-token positions).
+//! - **Done in iter-8a-2**: full prefill — token embedding lookup,
+//!   per-layer attn + FFN chain, final RMSNorm + LM head (tied +
+//!   untied), returns last-position logits.
+//! - **Done in iter-9a (this iter)**: DeepStack residual injection at
+//!   LM layers `il < n_deepstack_layers` via position-gated
+//!   `image_token_residual_add_gpu` — equivalent to peer's full-tensor
+//!   add since deepstack slabs are zero outside image-token positions.
 //! - **Deferred to iter-9b**: Engine seam wiring (replace the
 //!   [`qwen3vl_text_forward_pending`] sentinel in
 //!   `serve/api/engine.rs::worker_run` Qwen3VlText match arms);
@@ -88,6 +89,8 @@ use crate::inference::models::qwen35::gpu_full_attn::{
     apply_sdpa_causal_from_seq_major, download_f32, upload_f32,
 };
 use crate::inference::models::qwen35::io_heads::embed_tokens;
+use crate::inference::vision::image_token_residual_add::image_token_residual_add_gpu;
+use crate::serve::forward_prefill::DeepstackInjection;
 
 use super::Qwen3VlTextModel;
 
@@ -192,11 +195,14 @@ pub fn qwen3vl_text_forward_pending_err<T>() -> Result<T> {
 ///    0. iter-9b's engine seam adds the generate loop (re-prefill per
 ///    decoded token at first; KV-cache-incremental later).
 ///
-/// 5. **No deepstack injection** — peer's `qwen3vl.cpp:146-150`
+/// 5. **DeepStack injection (iter-9a)** — peer's `qwen3vl.cpp:146-150`
 ///    `cur += t_inp_embd_slab[il+1]` for `il < n_deepstack_layers` is
-///    iter-9a scope. For the iter-8a-2 prefill smoke test against
-///    text-only prompts (no images), this is a no-op anyway since the
-///    deepstack slabs would be zero.
+///    dispatched via `image_token_residual_add_gpu` (position-gated
+///    in-place add). When `deepstack = None`, this is skipped (text-
+///    only prompts: no image rows so the add would be a no-op anyway).
+///    Per-layer chunk indexing: `chunks[il]` corresponds to peer slab
+///    `il+1` (chunks[0] = peer's deepstack slab 1, chunks[1] = slab 2,
+///    chunks[2] = slab 3 for `n_deepstack_layers = 3`).
 ///
 /// 6. **No soft-token splicing** — `<|image_pad|>` placeholder
 ///    positions in `tokens` are passed through to `embed_tokens`
@@ -207,6 +213,7 @@ pub fn forward_text_prefill_logits_last(
     model: &mut Qwen3VlTextModel,
     tokens: &[u32],
     positions_flat: &[i32],
+    deepstack: Option<&DeepstackInjection<'_>>,
 ) -> Result<Vec<f32>> {
     if tokens.is_empty() {
         return Err(anyhow!(
@@ -223,6 +230,54 @@ pub fn forward_text_prefill_logits_last(
         ));
     }
     let seq_len = seq_len_usize as u32;
+
+    // ── DeepStack invariants (iter-9a) ────────────────────────────────
+    //
+    // When deepstack is supplied:
+    //   - chunks.len() must be ≥ cfg.n_deepstack_layers (peer reads
+    //     slab `il+1` for `il < n_deepstack_layers`, so the supplied
+    //     chunks must cover all the LM layers that consume one).
+    //   - image_token_positions.len() must be > 0 (otherwise the caller
+    //     should pass `deepstack = None`; the kernel rejects empty
+    //     position arrays).
+    //   - all positions must be < seq_len (the kernel scatter-adds at
+    //     `cur[positions[k], h] += chunk[k, h]`; out-of-range positions
+    //     would write past the residual stream).
+    //   - each chunk's storage must hold ≥ n_image_tokens × hidden ×
+    //     sizeof(f32) bytes (validated by `image_token_residual_add_gpu`
+    //     itself; we let the dispatch's own error message surface).
+    if let Some(ds) = deepstack {
+        let n_image_tokens = ds.n_image_tokens();
+        let n_chunks = ds.n_deepstack();
+        let n_required = model.cfg.n_deepstack_layers;
+        if n_chunks < n_required {
+            return Err(anyhow!(
+                "forward_text_prefill_logits_last: deepstack.chunks.len() ({}) < \
+                 cfg.n_deepstack_layers ({}). The peer dispatch \
+                 (`qwen3vl.cpp:146-150`) reads chunk `il` for every LM layer \
+                 `il < n_deepstack_layers`; missing chunks would silently skip \
+                 their dispatch and break image conditioning.",
+                n_chunks, n_required
+            ));
+        }
+        if n_image_tokens == 0 {
+            return Err(anyhow!(
+                "forward_text_prefill_logits_last: deepstack supplied with \
+                 image_token_positions.len() == 0; pass `deepstack = None` for \
+                 text-only prompts (the per-image-token kernel rejects empty \
+                 position arrays)."
+            ));
+        }
+        for (i, &pos) in ds.image_token_positions.iter().enumerate() {
+            if (pos as usize) >= seq_len_usize {
+                return Err(anyhow!(
+                    "forward_text_prefill_logits_last: deepstack.image_token_positions[{}] \
+                     = {} >= seq_len ({}); position out of range",
+                    i, pos, seq_len_usize
+                ));
+            }
+        }
+    }
 
     let cfg = model.cfg.clone();
     let hidden = cfg.hidden_size;
@@ -451,7 +506,7 @@ pub fn forward_text_prefill_logits_last(
             l_out
         };
 
-        // ── DeepStack residual injection (iter-9a scope) ───────────
+        // ── Phase D: DeepStack residual injection (iter-9a) ────────
         //
         // Peer `qwen3vl.cpp:146-150`:
         //     if (il < n_deepstack_layers) {
@@ -460,9 +515,59 @@ pub fn forward_text_prefill_logits_last(
         //         cur = ggml_add(cur, ds);
         //     }
         //
-        // For text-only prompts (no images) the deepstack slabs would
-        // be zero, so the add is a no-op. iter-9a wires the per-image-
-        // token slab + position-gated `image_token_residual_add_gpu`.
+        // The peer reads slab `il+1` from `t_inp_embd` (a single
+        // `[n_tokens, (1+n_deepstack)*n_embd]` matrix where slab 0 is
+        // the base token embedding and slabs 1..n+1 are the deepstack
+        // residuals). Our `DeepstackInjection.chunks` separates these
+        // into per-layer buffers (so `chunks[il]` corresponds to peer
+        // slab `il+1`); the indexing is "layer i reads the i-th
+        // deepstack chunk", offset-by-one relative to the peer's view.
+        //
+        // The add is **position-gated**: peer adds `ds` to the full
+        // `[n_tokens, n_embd]` slice, but the deepstack slabs are zero
+        // outside the image-token positions (peer's mtmd populates
+        // them from the projector + augmented embeddings only at image
+        // positions). We exploit this by dispatching
+        // `image_token_residual_add_gpu` which ONLY touches
+        // `cur[positions[k], h]` for k in 0..n_image_tokens. This is
+        // bit-equivalent to the peer's full-tensor add (zero rows are
+        // a no-op) and saves O((seq_len - n_image_tokens) × hidden)
+        // wasted memory traffic.
+        //
+        // For text-only prompts (`deepstack = None`), this whole branch
+        // is skipped — no images means no deepstack injection.
+        if let Some(ds) = deepstack {
+            if il < cfg.n_deepstack_layers {
+                let chunk = ds.chunks[il];
+                let n_image_tokens = ds.n_image_tokens() as u32;
+                // The kernel mutates `cur` (= `l_out`) in place via
+                // Metal device-side write. Wrap in its own session so
+                // the encoder lifecycle is scoped tightly.
+                {
+                    let mut session_d = executor.begin().with_context(|| {
+                        format!("layer {il}: begin Phase D (deepstack) session")
+                    })?;
+                    let enc = session_d.encoder_mut();
+                    image_token_residual_add_gpu(
+                        enc,
+                        registry,
+                        device,
+                        &l_out,
+                        chunk,
+                        &ds.image_token_positions,
+                        seq_len,
+                        n_image_tokens,
+                        hidden,
+                    )
+                    .with_context(|| {
+                        format!("layer {il}: deepstack residual add (slab {il})")
+                    })?;
+                    session_d.finish().with_context(|| {
+                        format!("layer {il}: finish Phase D (deepstack) session")
+                    })?;
+                }
+            }
+        }
 
         hidden_gpu = l_out;
     }
@@ -720,8 +825,10 @@ mod tests {
             }
         }
 
-        let logits = forward_text_prefill_logits_last(&mut model, &tokens, &positions)
-            .expect("forward must succeed on the canonical GGUF");
+        let logits = forward_text_prefill_logits_last(
+            &mut model, &tokens, &positions, None,
+        )
+        .expect("forward must succeed on the canonical GGUF");
 
         assert_eq!(
             logits.len(),
