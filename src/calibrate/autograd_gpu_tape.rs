@@ -38,7 +38,9 @@ use std::rc::Rc;
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::{
+    metal,
     ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params},
+    ops::elementwise::{elementwise_add, elementwise_mul, scalar_mul_f32},
     ops::transpose::transpose_2d,
     DType, KernelRegistry, MlxBuffer, MlxDevice,
 };
@@ -59,6 +61,19 @@ enum OpKind {
         k: usize,
         n: usize,
     },
+    /// Elementwise `Y = A + B`; A, B, Y all same shape.  Backward:
+    /// `dA = dY`, `dB = dY` (both contributions are the upstream
+    /// gradient itself; the accumulator handles the case `lhs_idx ==
+    /// rhs_idx` by summing — i.e. `A + A = 2A → dA = 2·dY`).
+    ElementwiseAdd { lhs_idx: usize, rhs_idx: usize },
+    /// Elementwise `Y = A − B`; A, B, Y all same shape.  Backward:
+    /// `dA = dY`, `dB = −dY` (computed via `scalar_mul_f32(-1, dy)`).
+    ElementwiseSub { lhs_idx: usize, rhs_idx: usize },
+    /// Elementwise `Y = A · B`; A, B, Y all same shape.  Backward:
+    /// `dA = dY · B`, `dB = dY · A` (each via `elementwise_mul`).
+    /// `lhs_idx == rhs_idx` (square via mul-self) is supported — the
+    /// accumulator sums both contributions, yielding `2·A·dY`.
+    ElementwiseMul { lhs_idx: usize, rhs_idx: usize },
 }
 
 struct GpuNode {
@@ -328,7 +343,10 @@ pub fn backward(
         // Distribute `parent_grads` into the accumulator.
         match op {
             OpKind::Leaf => {} // no parents
-            OpKind::Matmul { lhs_idx, rhs_idx, .. } => {
+            OpKind::Matmul { lhs_idx, rhs_idx, .. }
+            | OpKind::ElementwiseAdd { lhs_idx, rhs_idx }
+            | OpKind::ElementwiseSub { lhs_idx, rhs_idx }
+            | OpKind::ElementwiseMul { lhs_idx, rhs_idx } => {
                 accumulate(&mut grads, lhs_idx, &parent_grads[0], tape)?;
                 accumulate(&mut grads, rhs_idx, &parent_grads[1], tape)?;
             }
@@ -511,7 +529,299 @@ fn backward_dispatch(
 
             Ok((op, vec![dx_buf, dw_buf]))
         }
+        OpKind::ElementwiseAdd { .. } => {
+            // dA = dY, dB = dY.  Cheapest: hand the same MlxBuffer to
+            // both parents (Arc-share).  The accumulator copies on
+            // first-touch and adds on subsequent touches; sharing a
+            // single buffer between two parents that DON'T alias each
+            // other is safe because each parent gets its own slot.
+            // For lhs_idx == rhs_idx (a + a), the accumulator sums the
+            // two contributions producing dA = 2·dY ✓.
+            Ok((op, vec![out_grad.clone(), out_grad.clone()]))
+        }
+        OpKind::ElementwiseSub { .. } => {
+            // dA = dY, dB = -dY.  -dY computed via scalar_mul_f32(-1, dY).
+            // For lhs_idx == rhs_idx (a - a = 0 in forward): accumulator
+            // sums dY + (-dY) = 0 ✓ (analytically correct).
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+            let n = out_grad.byte_len() / 4;
+            let neg_dy = device
+                .alloc_buffer(n * 4, DType::F32, out_grad.shape().to_vec())
+                .map_err(|e| anyhow!("backward sub: alloc neg_dy: {e}"))?;
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward sub: encoder: {e}"))?;
+            scalar_mul_f32(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                out_grad,
+                &neg_dy,
+                n,
+                -1.0,
+            )
+            .map_err(|e| anyhow!("backward sub: scalar_mul_f32(-1): {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward sub: commit_and_wait: {e}"))?;
+            Ok((op, vec![out_grad.clone(), neg_dy]))
+        }
+        OpKind::ElementwiseMul { lhs_idx, rhs_idx } => {
+            // dA = dY · B, dB = dY · A.  Each via elementwise_mul.
+            // lhs_idx == rhs_idx (square via mul-self): accumulator
+            // sums dY·a + dY·a = 2·a·dY ✓.
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+            let n = out_grad.byte_len() / 4;
+
+            let (a_buf, b_buf) = {
+                let nodes = tape.0.nodes.borrow();
+                (nodes[lhs_idx].value.clone(), nodes[rhs_idx].value.clone())
+            };
+
+            let da = device
+                .alloc_buffer(n * 4, DType::F32, out_grad.shape().to_vec())
+                .map_err(|e| anyhow!("backward mul: alloc dA: {e}"))?;
+            let db = device
+                .alloc_buffer(n * 4, DType::F32, out_grad.shape().to_vec())
+                .map_err(|e| anyhow!("backward mul: alloc dB: {e}"))?;
+
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward mul: encoder: {e}"))?;
+            elementwise_mul(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                out_grad,
+                &b_buf,
+                &da,
+                n,
+                DType::F32,
+            )
+            .map_err(|e| anyhow!("backward mul: dA = dY·B: {e}"))?;
+            elementwise_mul(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                out_grad,
+                &a_buf,
+                &db,
+                n,
+                DType::F32,
+            )
+            .map_err(|e| anyhow!("backward mul: dB = dY·A: {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward mul: commit_and_wait: {e}"))?;
+
+            Ok((op, vec![da, db]))
+        }
     }
+}
+
+/// Elementwise `Y = A + B` via mlx-native's `elementwise_add`.
+/// Inputs must share the same shape + tape.
+pub fn add(lhs: &GpuTensor, rhs: &GpuTensor) -> Result<GpuTensor> {
+    elementwise_op(
+        lhs,
+        rhs,
+        "add",
+        |encoder, registry, device, a, b, out, n| {
+            elementwise_add(encoder, registry, device, a, b, out, n, DType::F32)
+                .map_err(|e| anyhow!("elementwise_add: {e}"))
+        },
+        |lhs_idx, rhs_idx| OpKind::ElementwiseAdd { lhs_idx, rhs_idx },
+    )
+}
+
+/// Elementwise `Y = A - B` composed from `scalar_mul_f32(-1, b)` +
+/// `elementwise_add`.  Inputs must share the same shape + tape.
+pub fn sub(lhs: &GpuTensor, rhs: &GpuTensor) -> Result<GpuTensor> {
+    if !lhs.tape.ptr_eq(&rhs.tape) {
+        return Err(anyhow!("sub: cross-tape op (lhs.tape != rhs.tape)"));
+    }
+    if lhs.shape != rhs.shape {
+        return Err(anyhow!(
+            "sub: shape mismatch lhs={:?} rhs={:?}",
+            lhs.shape,
+            rhs.shape
+        ));
+    }
+    let tape = &lhs.tape;
+    let device = tape.device();
+    let n: usize = lhs.shape.iter().product();
+    let neg_b = device
+        .alloc_buffer(n * 4, DType::F32, lhs.shape.clone())
+        .map_err(|e| anyhow!("sub: alloc neg_b: {e}"))?;
+    let out = device
+        .alloc_buffer(n * 4, DType::F32, lhs.shape.clone())
+        .map_err(|e| anyhow!("sub: alloc out: {e}"))?;
+
+    let (a_buf, b_buf) = {
+        let nodes = tape.0.nodes.borrow();
+        (
+            nodes[lhs.node_idx].value.clone(),
+            nodes[rhs.node_idx].value.clone(),
+        )
+    };
+    let mut registry = tape.0.registry.borrow_mut();
+    // Encoder 1: produce neg_b = -1·b.  We commit_and_wait before the
+    // add so the elementwise_add reliably sees the negated values.
+    // Single-encoder back-to-back compute dispatches that read each
+    // other's outputs require an explicit memory barrier in Metal;
+    // two encoders sequenced via commit_and_wait give equivalent
+    // ordering without us needing to reach into the encoder's
+    // memory_barrier API.
+    {
+        let mut encoder = device
+            .command_encoder()
+            .map_err(|e| anyhow!("sub: encoder1: {e}"))?;
+        scalar_mul_f32(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            &b_buf,
+            &neg_b,
+            n,
+            -1.0,
+        )
+        .map_err(|e| anyhow!("sub: scalar_mul_f32(-1): {e}"))?;
+        encoder
+            .commit_and_wait()
+            .map_err(|e| anyhow!("sub: commit_and_wait scalar_mul: {e}"))?;
+    }
+    // Encoder 2: out = a + neg_b.
+    {
+        let mut encoder = device
+            .command_encoder()
+            .map_err(|e| anyhow!("sub: encoder2: {e}"))?;
+        elementwise_add(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            &a_buf,
+            &neg_b,
+            &out,
+            n,
+            DType::F32,
+        )
+        .map_err(|e| anyhow!("sub: elementwise_add(a, -b): {e}"))?;
+        encoder
+            .commit_and_wait()
+            .map_err(|e| anyhow!("sub: commit_and_wait add: {e}"))?;
+    }
+    drop(registry);
+
+    let lhs_idx = lhs.node_idx;
+    let rhs_idx = rhs.node_idx;
+    let node_idx = tape.push_node(
+        OpKind::ElementwiseSub { lhs_idx, rhs_idx },
+        out,
+        lhs.shape.clone(),
+    );
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: lhs.shape.clone(),
+    })
+}
+
+/// Elementwise `Y = A · B` via mlx-native's `elementwise_mul`.
+/// Inputs must share the same shape + tape.  When both args are the
+/// same tensor (`mul(&x, &x)`) the result is `x²`; backward correctly
+/// produces `2·x·dY` via the accumulator.
+pub fn mul(lhs: &GpuTensor, rhs: &GpuTensor) -> Result<GpuTensor> {
+    elementwise_op(
+        lhs,
+        rhs,
+        "mul",
+        |encoder, registry, device, a, b, out, n| {
+            elementwise_mul(encoder, registry, device, a, b, out, n, DType::F32)
+                .map_err(|e| anyhow!("elementwise_mul: {e}"))
+        },
+        |lhs_idx, rhs_idx| OpKind::ElementwiseMul { lhs_idx, rhs_idx },
+    )
+}
+
+/// Convenience: `square(x) = mul(&x, &x)`.  Backward produces
+/// `2·x·dY` correctly via the accumulator (both parent slots are
+/// the same node, contributions sum).
+pub fn square(t: &GpuTensor) -> Result<GpuTensor> {
+    mul(t, t)
+}
+
+/// Internal helper: dispatch a binary elementwise op + record its node.
+fn elementwise_op<F, K>(
+    lhs: &GpuTensor,
+    rhs: &GpuTensor,
+    label: &str,
+    dispatch: F,
+    op_kind: K,
+) -> Result<GpuTensor>
+where
+    F: FnOnce(
+        &mut mlx_native::CommandEncoder,
+        &mut KernelRegistry,
+        &metal::DeviceRef,
+        &MlxBuffer,
+        &MlxBuffer,
+        &MlxBuffer,
+        usize,
+    ) -> Result<()>,
+    K: FnOnce(usize, usize) -> OpKind,
+{
+    if !lhs.tape.ptr_eq(&rhs.tape) {
+        return Err(anyhow!("{label}: cross-tape op (lhs.tape != rhs.tape)"));
+    }
+    if lhs.shape != rhs.shape {
+        return Err(anyhow!(
+            "{label}: shape mismatch lhs={:?} rhs={:?}",
+            lhs.shape,
+            rhs.shape
+        ));
+    }
+    let tape = &lhs.tape;
+    let device = tape.device();
+    let n: usize = lhs.shape.iter().product();
+    let out = device
+        .alloc_buffer(n * 4, DType::F32, lhs.shape.clone())
+        .map_err(|e| anyhow!("{label}: alloc out: {e}"))?;
+
+    let (a_buf, b_buf) = {
+        let nodes = tape.0.nodes.borrow();
+        (
+            nodes[lhs.node_idx].value.clone(),
+            nodes[rhs.node_idx].value.clone(),
+        )
+    };
+    let mut registry = tape.0.registry.borrow_mut();
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("{label}: encoder: {e}"))?;
+    dispatch(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &a_buf,
+        &b_buf,
+        &out,
+        n,
+    )?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("{label}: commit_and_wait: {e}"))?;
+    drop(registry);
+
+    let lhs_idx = lhs.node_idx;
+    let rhs_idx = rhs.node_idx;
+    let node_idx = tape.push_node(op_kind(lhs_idx, rhs_idx), out, lhs.shape.clone());
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: lhs.shape.clone(),
+    })
 }
 
 /// Build a GPU `MlxBuffer` of shape `[rows, cols]` filled with `1.0`
@@ -704,6 +1014,221 @@ mod tests {
                 assert!(msg.contains("shape mismatch"), "got: {msg}");
             }
             Ok(_) => panic!("shape mismatch must error"),
+        }
+    }
+
+    use crate::calibrate::autograd::{
+        add as cpu_add, mul as cpu_mul, square as cpu_square, sub as cpu_sub,
+    };
+
+    /// `Y = A + B`; loss = sum(Y).  Backward: dA = ones, dB = ones.
+    /// GPU vs CPU oracle parity.
+    #[test]
+    fn gpu_tape_add_forward_backward_parity() {
+        let m = 8;
+        let n = 32; // shape m*n must satisfy any kernel constraints; elementwise has none
+        let a: Vec<f32> = (0..(m * n)).map(|i| (i as f32) * 0.0011 + 0.05).collect();
+        let b: Vec<f32> = (0..(m * n)).map(|i| (i as f32) * -0.0007 + 0.1).collect();
+
+        // GPU
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let at = GpuTensor::from_vec(&tape, &a, vec![m, n]).unwrap();
+        let bt = GpuTensor::from_vec(&tape, &b, vec![m, n]).unwrap();
+        let yt = add(&at, &bt).expect("gpu add");
+        let y_gpu = yt.to_vec().unwrap();
+        let dy = ones_like(&tape, &[m, n]).unwrap();
+        let grads = backward(&yt, dy).unwrap();
+        let da_gpu: &[f32] = grads[at.node_idx()].as_ref().unwrap().as_slice().unwrap();
+        let db_gpu: &[f32] = grads[bt.node_idx()].as_ref().unwrap().as_slice().unwrap();
+
+        // CPU oracle
+        let cpu_tape = Tape::new();
+        let ca = Tensor::from_vec(&cpu_tape, a.clone(), vec![m, n]).unwrap();
+        let cb = Tensor::from_vec(&cpu_tape, b.clone(), vec![m, n]).unwrap();
+        let cy = cpu_add(&ca, &cb).unwrap();
+        let y_cpu = cy.to_vec();
+        let cl = cpu_sum(&cy).unwrap();
+        let cgrads = cpu_backward(&cl).unwrap();
+        let da_cpu = cgrads[ca.node_idx()].clone().unwrap();
+        let db_cpu = cgrads[cb.node_idx()].clone().unwrap();
+
+        assert_close(&y_gpu, &y_cpu, 1e-6, 1e-7, "add forward");
+        assert_close(da_gpu, &da_cpu, 1e-6, 1e-7, "add dA");
+        assert_close(db_gpu, &db_cpu, 1e-6, 1e-7, "add dB");
+    }
+
+    /// `Y = A − B`; loss = sum(Y).  Backward: dA = ones, dB = −ones.
+    #[test]
+    fn gpu_tape_sub_forward_backward_parity() {
+        let m = 8;
+        let n = 32;
+        let a: Vec<f32> = (0..(m * n)).map(|i| (i as f32) * 0.0009 + 0.03).collect();
+        let b: Vec<f32> = (0..(m * n)).map(|i| (i as f32) * 0.0013 - 0.04).collect();
+
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let at = GpuTensor::from_vec(&tape, &a, vec![m, n]).unwrap();
+        let bt = GpuTensor::from_vec(&tape, &b, vec![m, n]).unwrap();
+        let yt = sub(&at, &bt).expect("gpu sub");
+        let y_gpu = yt.to_vec().unwrap();
+        let dy = ones_like(&tape, &[m, n]).unwrap();
+        let grads = backward(&yt, dy).unwrap();
+        let da_gpu: &[f32] = grads[at.node_idx()].as_ref().unwrap().as_slice().unwrap();
+        let db_gpu: &[f32] = grads[bt.node_idx()].as_ref().unwrap().as_slice().unwrap();
+
+        let cpu_tape = Tape::new();
+        let ca = Tensor::from_vec(&cpu_tape, a.clone(), vec![m, n]).unwrap();
+        let cb = Tensor::from_vec(&cpu_tape, b.clone(), vec![m, n]).unwrap();
+        let cy = cpu_sub(&ca, &cb).unwrap();
+        let y_cpu = cy.to_vec();
+        let cl = cpu_sum(&cy).unwrap();
+        let cgrads = cpu_backward(&cl).unwrap();
+        let da_cpu = cgrads[ca.node_idx()].clone().unwrap();
+        let db_cpu = cgrads[cb.node_idx()].clone().unwrap();
+
+        assert_close(&y_gpu, &y_cpu, 1e-6, 1e-7, "sub forward");
+        assert_close(da_gpu, &da_cpu, 1e-6, 1e-7, "sub dA = ones");
+        assert_close(db_gpu, &db_cpu, 1e-6, 1e-7, "sub dB = -ones");
+    }
+
+    /// `Y = A · B`; loss = sum(Y).  Backward: dA = B, dB = A.
+    #[test]
+    fn gpu_tape_mul_forward_backward_parity() {
+        let m = 8;
+        let n = 32;
+        let a: Vec<f32> = (0..(m * n)).map(|i| (i as f32) * 0.001 + 0.5).collect();
+        let b: Vec<f32> = (0..(m * n)).map(|i| (i as f32) * 0.002 - 0.3).collect();
+
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let at = GpuTensor::from_vec(&tape, &a, vec![m, n]).unwrap();
+        let bt = GpuTensor::from_vec(&tape, &b, vec![m, n]).unwrap();
+        let yt = mul(&at, &bt).expect("gpu mul");
+        let y_gpu = yt.to_vec().unwrap();
+        let dy = ones_like(&tape, &[m, n]).unwrap();
+        let grads = backward(&yt, dy).unwrap();
+        let da_gpu: &[f32] = grads[at.node_idx()].as_ref().unwrap().as_slice().unwrap();
+        let db_gpu: &[f32] = grads[bt.node_idx()].as_ref().unwrap().as_slice().unwrap();
+
+        // Analytical: dA = B, dB = A (when loss = sum(A·B)).
+        assert_close(da_gpu, &b, 1e-6, 1e-7, "mul analytical dA == B");
+        assert_close(db_gpu, &a, 1e-6, 1e-7, "mul analytical dB == A");
+
+        // Cross-check vs CPU oracle.
+        let cpu_tape = Tape::new();
+        let ca = Tensor::from_vec(&cpu_tape, a.clone(), vec![m, n]).unwrap();
+        let cb = Tensor::from_vec(&cpu_tape, b.clone(), vec![m, n]).unwrap();
+        let cy = cpu_mul(&ca, &cb).unwrap();
+        let y_cpu = cy.to_vec();
+        assert_close(&y_gpu, &y_cpu, 1e-6, 1e-7, "mul forward");
+    }
+
+    /// `Y = X²` via `mul(&x, &x)`; loss = sum(Y).  Backward: dX = 2X.
+    /// Validates that `lhs_idx == rhs_idx` produces the correct
+    /// accumulation (2 contributions to the same parent sum to 2·X·dY).
+    #[test]
+    fn gpu_tape_square_via_mul_self_finite_diff() {
+        let m = 4;
+        let n = 32;
+        let x: Vec<f32> = (0..(m * n)).map(|i| (i as f32) * 0.0017 - 0.2).collect();
+
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let xt = GpuTensor::from_vec(&tape, &x, vec![m, n]).unwrap();
+        let yt = square(&xt).expect("gpu square");
+        let y_gpu = yt.to_vec().unwrap();
+        let dy = ones_like(&tape, &[m, n]).unwrap();
+        let grads = backward(&yt, dy).unwrap();
+        let dx_gpu: &[f32] = grads[xt.node_idx()].as_ref().unwrap().as_slice().unwrap();
+
+        // Analytical: dX = 2X.
+        let analytical: Vec<f32> = x.iter().map(|v| 2.0 * v).collect();
+        assert_close(
+            dx_gpu,
+            &analytical,
+            1e-6,
+            1e-7,
+            "square via mul-self analytical dX == 2X",
+        );
+
+        // CPU oracle parity.
+        let cpu_tape = Tape::new();
+        let cx = Tensor::from_vec(&cpu_tape, x.clone(), vec![m, n]).unwrap();
+        let cy = cpu_square(&cx).unwrap();
+        let y_cpu = cy.to_vec();
+        let cl = cpu_sum(&cy).unwrap();
+        let cgrads = cpu_backward(&cl).unwrap();
+        let dx_cpu = cgrads[cx.node_idx()].clone().unwrap();
+        assert_close(&y_gpu, &y_cpu, 1e-6, 1e-7, "square forward");
+        assert_close(dx_gpu, &dx_cpu, 1e-6, 1e-7, "square backward");
+    }
+
+    /// Composed: `Y = (X @ W) · S`; loss = sum(Y).
+    /// Exercises matmul + elementwise mul end-to-end with backward
+    /// flowing through both ops.  All gradients (dX, dW, dS) match
+    /// CPU oracle — validates op composition.
+    #[test]
+    fn gpu_tape_matmul_then_mul_chain_backward_parity() {
+        let m = 32;
+        let k = 32;
+        let n = 32;
+        let x: Vec<f32> = (0..(m * k)).map(|i| (i as f32) * 0.0009 + 0.01).collect();
+        let w: Vec<f32> = (0..(k * n)).map(|i| (i as f32) * 0.0011 - 0.02).collect();
+        let s: Vec<f32> = (0..(m * n)).map(|i| (i as f32) * 0.0013 + 0.03).collect();
+
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let xt = GpuTensor::from_vec(&tape, &x, vec![m, k]).unwrap();
+        let wt = GpuTensor::from_vec(&tape, &w, vec![k, n]).unwrap();
+        let st = GpuTensor::from_vec(&tape, &s, vec![m, n]).unwrap();
+        let xw = matmul(&xt, &wt).expect("matmul");
+        let yt = mul(&xw, &st).expect("mul");
+        let dy = ones_like(&tape, &[m, n]).unwrap();
+        let grads = backward(&yt, dy).unwrap();
+        let dx_gpu: &[f32] = grads[xt.node_idx()].as_ref().unwrap().as_slice().unwrap();
+        let dw_gpu: &[f32] = grads[wt.node_idx()].as_ref().unwrap().as_slice().unwrap();
+        let ds_gpu: &[f32] = grads[st.node_idx()].as_ref().unwrap().as_slice().unwrap();
+
+        // CPU oracle
+        let cpu_tape = Tape::new();
+        let cx = Tensor::from_vec(&cpu_tape, x.clone(), vec![m, k]).unwrap();
+        let cw = Tensor::from_vec(&cpu_tape, w.clone(), vec![k, n]).unwrap();
+        let cs = Tensor::from_vec(&cpu_tape, s.clone(), vec![m, n]).unwrap();
+        let cxw = cpu_matmul(&cx, &cw).unwrap();
+        let cy = cpu_mul(&cxw, &cs).unwrap();
+        let cl = cpu_sum(&cy).unwrap();
+        let cgrads = cpu_backward(&cl).unwrap();
+        let dx_cpu = cgrads[cx.node_idx()].clone().unwrap();
+        let dw_cpu = cgrads[cw.node_idx()].clone().unwrap();
+        let ds_cpu = cgrads[cs.node_idx()].clone().unwrap();
+
+        assert_close(dx_gpu, &dx_cpu, 1e-4, 1e-4, "matmul+mul chain dX");
+        assert_close(dw_gpu, &dw_cpu, 1e-4, 1e-4, "matmul+mul chain dW");
+        assert_close(ds_gpu, &ds_cpu, 1e-4, 1e-4, "matmul+mul chain dS");
+    }
+
+    #[test]
+    fn gpu_tape_add_shape_mismatch_errors() {
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let a = GpuTensor::from_vec(&tape, &[0.0; 8], vec![8]).unwrap();
+        let b = GpuTensor::from_vec(&tape, &[0.0; 16], vec![16]).unwrap();
+        match add(&a, &b) {
+            Err(e) => assert!(format!("{e}").contains("shape mismatch")),
+            Ok(_) => panic!("expected error"),
+        }
+    }
+
+    #[test]
+    fn gpu_tape_mul_shape_mismatch_errors() {
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let a = GpuTensor::from_vec(&tape, &[0.0; 8], vec![8]).unwrap();
+        let b = GpuTensor::from_vec(&tape, &[0.0; 16], vec![16]).unwrap();
+        match mul(&a, &b) {
+            Err(e) => assert!(format!("{e}").contains("shape mismatch")),
+            Ok(_) => panic!("expected error"),
         }
     }
 
