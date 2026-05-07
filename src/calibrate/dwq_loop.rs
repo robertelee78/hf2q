@@ -856,6 +856,304 @@ mod tests {
         }
     }
 
+    /// iter-13e — real-tensor KL-div training loop.
+    ///
+    /// Closes the conceptual gap between iter-13c's synthetic 2-Linear
+    /// KL test and iter-13d's real-tensor reconstruction-MSE test by
+    /// running the FULL DWQ chain
+    /// `qdq_affine → view → matmul → kl_div_loss_per_row → backward →
+    /// Adam.step` on a real GGUF tensor.
+    ///
+    /// Setup:
+    ///   - W_real = `blk.0.attn_qkv.weight` from the 27B Q4_0 GGUF
+    ///     (shape [10240, 5120] in GGUF [out, in]; transposed to
+    ///     [5120, 10240] for our matmul convention).
+    ///   - X = Gaussian(0, 1) of shape [m=64, in=5120], deterministic
+    ///     seed (proxy for post-RMSNorm activations whose stddev
+    ///     after layer norm is ~1.0).
+    ///   - Teacher logits = X @ W_real_T (shape [64, 10240]).
+    ///   - Student logits = X @ view(qdq_affine(W_real, s, b),
+    ///                               [5120, 10240]).
+    ///   - Loss = mean(KL(softmax(scale·teacher) || softmax(scale·student)))
+    ///     where scale = 1/T = 0.5 (T=2.0 per mlx-lm dwq.py default).
+    ///   - Optimizer: Adam(lr=1e-3, β1=0.9, β2=0.999, ε=1e-8) over
+    ///     (scales, biases); q_int frozen.
+    ///
+    /// Per mlx-lm `tuner/losses.py:377` `kl_div_loss(logits_q,
+    /// logits_p)` takes RAW logits (computes logsumexp internally);
+    /// `q` is the student, `p` is the teacher; reduction="none"
+    /// returns shape `[batch]` per row, summed in dwq.py at
+    /// `dwq.py:117`: `loss = (mask * losses).sum() / ntoks`.
+    ///
+    /// Acceptance: best KL after 100 Adam steps < 0.34 × initial KL
+    /// (3× reduction floor — KL is stricter than reconstruction MSE).
+    /// Non-triviality: initial KL > 1e-4 (otherwise the 2×
+    /// perturbation didn't move the loss landscape).
+    ///
+    /// Test gate: `#[ignore]` (multi-GB GGUF on disk).  Run with:
+    ///   cargo test --release --bin hf2q -- \
+    ///     --ignored dwq_loop_real_gguf_kl
+    /// Override path: `HF2Q_TEST_GGUF=/path/to/file.gguf`.
+    /// Override tensor: `HF2Q_TEST_GGUF_TENSOR=blk.X.tensor.weight`.
+    #[test]
+    #[ignore]
+    fn dwq_loop_real_gguf_kl_div_with_random_activations_converges() {
+        use crate::calibrate::autograd_gpu_tape::{matmul, scalar_mul, view};
+        use crate::calibrate::dynamic_quant_gpu::kl_div_loss_per_row;
+        use mlx_native::gguf::GgufFile;
+
+        let gguf_path = std::env::var("HF2Q_TEST_GGUF").unwrap_or_else(|_| {
+            "/opt/hf2q/models/qwen3.6-27b-mtp-q4_0/qwen3.6-27b-mtp-q4_0.gguf".to_string()
+        });
+        let tensor_name = std::env::var("HF2Q_TEST_GGUF_TENSOR")
+            .unwrap_or_else(|_| "blk.0.attn_qkv.weight".to_string());
+        let path = std::path::Path::new(&gguf_path);
+        if !path.exists() {
+            eprintln!("[dwq_kl_real] SKIP: {gguf_path} not found");
+            return;
+        }
+
+        let device = MlxDevice::new().expect("device");
+        let gguf = GgufFile::open(path).expect("open gguf");
+        let info = gguf
+            .tensor_info(&tensor_name)
+            .unwrap_or_else(|| panic!("tensor '{tensor_name}' not in {gguf_path}"));
+        // GGUF shape is [out, in]; we'll transpose for matmul.
+        assert_eq!(info.shape.len(), 2, "expected 2-D Linear weight");
+        let out_dim = info.shape[0];
+        let in_dim = info.shape[1];
+        eprintln!(
+            "[dwq_kl_real] {tensor_name}: GGUF[out, in]=[{out_dim}, {in_dim}], type={:?}",
+            info.ggml_type
+        );
+
+        let buf = gguf
+            .load_tensor_f32(&tensor_name, &device)
+            .expect("load_tensor_f32");
+        let w_real_oi: Vec<f32> = buf.as_slice::<f32>().unwrap().to_vec();
+        // Transpose to [in, out] = [5120, 10240] for our matmul.
+        let w_real_io: Vec<f32> = transpose_2d(&w_real_oi, out_dim, in_dim);
+        let n_total = w_real_io.len();
+        assert_eq!(n_total, in_dim * out_dim);
+
+        let group_size = 32usize;
+        // After transpose, contiguous axis is the output dim.  group_size
+        // must divide n_total which it does for any out_dim divisible by 32.
+        assert!(
+            n_total % group_size == 0,
+            "n_total {} not divisible by group_size {}",
+            n_total,
+            group_size
+        );
+
+        // Init scales/biases from the TRANSPOSED weight (groups along
+        // contiguous out_dim axis; same convention as mlx affine quant).
+        let mut init_registry = KernelRegistry::new();
+        let (q_int, s_init, b_init) = init_affine_params_gpu(
+            &device,
+            &mut init_registry,
+            &w_real_io,
+            group_size,
+            4,
+        )
+        .expect("init");
+
+        // Perturb 2× to give Adam something to learn.
+        let perturb = |xs: &[f32], factor: f32| -> Vec<f32> {
+            xs.iter().map(|v| v * factor).collect()
+        };
+        let s_p = perturb(&s_init, 2.0);
+        let b_p = perturb(&b_init, 2.0);
+
+        // Activations: deterministic Gaussian, stddev 1.0 (proxy for
+        // post-RMSNorm residual stream).  Box-Muller via a stable
+        // small PRNG; seed fixed for reproducibility.
+        let m = 64usize;
+        let x_data: Vec<f32> = box_muller_gaussian(m * in_dim, /* seed */ 0xC0FFEE5);
+
+        // Pre-compute teacher logits y_T = X @ W_real (host CPU oracle
+        // FP64 accumulation for numerical stability).  Treated as a
+        // constant tape leaf each step.
+        let mut y_t = vec![0.0f32; m * out_dim];
+        for r in 0..m {
+            for c in 0..out_dim {
+                let mut acc = 0.0f64;
+                for k in 0..in_dim {
+                    acc += (x_data[r * in_dim + k] as f64)
+                        * (w_real_io[k * out_dim + c] as f64);
+                }
+                y_t[r * out_dim + c] = acc as f32;
+            }
+        }
+        // Sanity: teacher logits should be finite and have non-trivial
+        // stddev (a degenerate fixture would NOT produce gradient flow).
+        let mut sum = 0.0f64;
+        let mut sumsq = 0.0f64;
+        for &v in &y_t {
+            assert!(v.is_finite(), "teacher logit non-finite: {v}");
+            sum += v as f64;
+            sumsq += (v as f64).powi(2);
+        }
+        let mean = sum / y_t.len() as f64;
+        let var = sumsq / y_t.len() as f64 - mean * mean;
+        let stddev = var.sqrt() as f32;
+        eprintln!("[dwq_kl_real] teacher logit stddev: {stddev:.4}");
+        assert!(stddev > 0.1, "teacher logits too flat: stddev={stddev}");
+
+        let cfg = AdamConfig {
+            lr: 0.001,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+        };
+        let mut adam = AdamOptimizer::new(device.clone(), cfg).expect("adam");
+        adam.register_param("s", buffer_from_f32(&device, &s_p).unwrap())
+            .unwrap();
+        adam.register_param("b", buffer_from_f32(&device, &b_p).unwrap())
+            .unwrap();
+
+        let temperature = 2.0f32;
+        let inv_t = 1.0 / temperature;
+        let tape = GpuTape::new(device.clone());
+
+        let train_step = |adam: &mut AdamOptimizer, tape: &GpuTape| -> Result<f32> {
+            let s = adam.read_param("s")?;
+            let b = adam.read_param("b")?;
+            let s_leaf = GpuTensor::from_vec(tape, &s, vec![s.len()])?;
+            let b_leaf = GpuTensor::from_vec(tape, &b, vec![b.len()])?;
+            let qdq_flat = qdq_affine(&s_leaf, &b_leaf, &q_int, group_size)?;
+            let w_q_2d = view(&qdq_flat, vec![in_dim, out_dim])?;
+            let xt = GpuTensor::from_vec(tape, &x_data, vec![m, in_dim])?;
+            let y_s = matmul(&xt, &w_q_2d)?;
+            let y_t_leaf = GpuTensor::from_vec(tape, &y_t, vec![m, out_dim])?;
+            let y_s_scaled = scalar_mul(&y_s, inv_t)?;
+            let y_t_scaled = scalar_mul(&y_t_leaf, inv_t)?;
+            // KL(p || q) per row = Σ p · (log p - log q); q = student.
+            let kl = kl_div_loss_per_row(&y_s_scaled, &y_t_scaled)?;
+            let kl_host = kl.to_vec()?;
+            let loss_mean = (kl_host.iter().map(|v| *v as f64).sum::<f64>()
+                / kl_host.len() as f64) as f32;
+
+            // Backward seed: dy = ones / m so the leaf gradients have
+            // mean-grad semantics matching the host-side mean reduction.
+            let mut dy_buf = tape
+                .device()
+                .alloc_buffer(kl_host.len() * 4, DType::F32, kl.shape().to_vec())?;
+            dy_buf
+                .as_mut_slice::<f32>()
+                .map_err(|e| anyhow!("dy slice: {e}"))?
+                .iter_mut()
+                .for_each(|v| *v = 1.0 / m as f32);
+            let grads = backward(&kl, dy_buf)?;
+            let g_s = grads[s_leaf.node_idx()]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing s grad"))?
+                .clone();
+            let g_b = grads[b_leaf.node_idx()]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing b grad"))?
+                .clone();
+            let mut g_map = BTreeMap::new();
+            g_map.insert("s".to_string(), g_s);
+            g_map.insert("b".to_string(), g_b);
+            adam.step(&g_map)?;
+            Ok(loss_mean)
+        };
+
+        let initial_loss = train_step(&mut adam, &tape).expect("init step");
+        tape.reset();
+        eprintln!("[dwq_kl_real] initial KL = {initial_loss:.6e}");
+        assert!(
+            initial_loss > 1e-4,
+            "real-GGUF KL fixture is trivial: initial_loss={initial_loss}"
+        );
+
+        let mut min_loss = initial_loss;
+        let mut last_loss = initial_loss;
+        let n_steps = 100usize;
+        for step in 1..n_steps {
+            let l = train_step(&mut adam, &tape).expect("step");
+            tape.reset();
+            assert!(l.is_finite(), "step {step}: loss non-finite ({l})");
+            if l < min_loss {
+                min_loss = l;
+            }
+            last_loss = l;
+            if step % 20 == 0 {
+                eprintln!(
+                    "[dwq_kl_real] step={step} loss={l:.6e} min={min_loss:.6e} initial={initial_loss:.6e}"
+                );
+            }
+        }
+        eprintln!(
+            "[dwq_kl_real] FINAL: initial={:.6e} min={:.6e} last={:.6e} ratio={:.3}",
+            initial_loss,
+            min_loss,
+            last_loss,
+            min_loss / initial_loss
+        );
+
+        assert!(
+            min_loss < initial_loss * 0.34,
+            "did not converge: initial={initial_loss} min={min_loss}"
+        );
+
+        // Sanity: final params finite.
+        let s_final = adam.read_param("s").unwrap();
+        let b_final = adam.read_param("b").unwrap();
+        for v in s_final.iter().chain(b_final.iter()) {
+            assert!(v.is_finite(), "final param non-finite: {v}");
+        }
+    }
+
+    /// Transpose a row-major [rows, cols] FP32 buffer into [cols, rows].
+    fn transpose_2d(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        assert_eq!(src.len(), rows * cols);
+        let mut dst = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                dst[c * rows + r] = src[r * cols + c];
+            }
+        }
+        dst
+    }
+
+    /// Box-Muller transform → unit-variance Gaussian samples from a
+    /// stable small PRNG (xorshift64*).  Deterministic given `seed`.
+    fn box_muller_gaussian(n: usize, seed: u64) -> Vec<f32> {
+        let mut state = if seed == 0 { 0xDEAD_BEEF_CAFE_BABE } else { seed };
+        let mut next_u64 = || -> u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut next_uniform = || -> f32 {
+            // 24-bit mantissa from upper 53 bits → uniform in [2^-24, 1).
+            // Avoid 0 so log() in Box-Muller stays finite.
+            let r = (next_u64() >> 11) as f32 / (1u64 << 53) as f32;
+            r.max(f32::EPSILON)
+        };
+        let mut out = Vec::with_capacity(n);
+        while out.len() + 1 < n {
+            let u1 = next_uniform();
+            let u2 = next_uniform();
+            let mag = (-2.0 * u1.ln()).sqrt();
+            let z0 = mag * (std::f32::consts::TAU * u2).cos();
+            let z1 = mag * (std::f32::consts::TAU * u2).sin();
+            out.push(z0);
+            out.push(z1);
+        }
+        if out.len() < n {
+            let u1 = next_uniform();
+            let u2 = next_uniform();
+            let z0 = (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos();
+            out.push(z0);
+        }
+        out.truncate(n);
+        out
+    }
+
     /// Sanity test: init kernel output equals the CPU oracle from the
     /// mlx-native side via the host-side wrapper.
     #[test]
