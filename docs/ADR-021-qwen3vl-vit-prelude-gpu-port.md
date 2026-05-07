@@ -1,8 +1,16 @@
 # ADR-021: Qwen3-VL ViT Prelude → GPU Port
 
-**Status**: PARTIAL — branch `adr-021/impl` (worktrees `/tmp/hf2q-adr-021` + `/tmp/mlx-native-adr-021`).
+**Status**: **LANDED — ALL ACCEPTANCE CRITERIA MET** 2026-05-07. Branch `adr-021/impl` (worktrees `/tmp/hf2q-adr-021` + `/tmp/mlx-native-adr-021`).
 
-**LANDED + LIVE-VERIFIED**: ViT prelude port (Stage A + Stage B + Stage C). All 5 CPU prelude functions replaced with 4 new Metal kernels + helpers (single shared GPU session). 39/0 hf2q + 12/0 mlx-native ADR-021 parity tests pass. AC-6 measured: **91.57× Stage A wall speedup**. AC-1/2/4/5/6 met. **AC-3 ViT-side verified live on real Qwen3-VL-2B-Instruct** (3 PNG shapes via `/v1/chat/completions`):
+**Final live verification 2026-05-07** — three multimodal `/v1/chat/completions stream:false` requests against `Qwen/Qwen3-VL-2B-Instruct` via hf2q's OWN runtime (no peer fallback, full ViT + LM forward end-to-end):
+
+```
+square 256×256 red   →  'red'    (finish_reason=stop)
+wide   256×128 blue  →  'blue'   (finish_reason=stop)
+tall   128×256 green →  'green'  (finish_reason=stop)
+```
+
+ViT-side timings (Stage A→C in single GPU session):
 
 ```
 square 256×256 red:   embed_dim=524288 forward_ms=97 arch="qwen3vl_siglip"
@@ -10,9 +18,26 @@ wide   256×128 blue:  embed_dim=262144 forward_ms=46 arch="qwen3vl_siglip"
 tall   128×256 green: embed_dim=262144 forward_ms=43 arch="qwen3vl_siglip"
 ```
 
-The real-model run forced 3 latent-bug fixes: (1) `gguf_emit::current_pos` `Ok(0)` stub → file off-by-one corrupting every tensor's data alignment (fix `bb9ebfd`), (2) per-block FFN was hardcoded GEGLU but `clip.cpp::build_ffn` is tensor-presence-conditional — Qwen3-VL-2B has 2-tensor MLP (no `ffn_gate`), bigger variants ship 3-tensor GEGLU; hf2q now mirrors `if (gate)` branch, and (3) error-chain truncation in `handlers.rs` (`{e}` → `{e:#}`).
+LM-side: 28 layers × 3 sessions/layer × naive O(N²) re-prefill (no KV cache yet — iter-9c follow-up). Total chat wall ~2-5s for the small test prompts. AC-3 closure literal bytes generated above.
 
-**NOT YET LANDED — AC-3 generated-text leg**: The chat handler reaches the text-LM forward and bails with `qwen3vl_text_forward_pending` (iter-228b sentinel) — Qwen3-VL text-LM dense forward (biased GQA + per-head Q/K RMSNorm + 3D-mRoPE + GQA flash-attention + SiLU FFN + DeepStack residual injection + tied LM head) is multi-iteration work tracked below as iters 8–11. **Until iter-228b lands the literal generated-text bytes per AC-3 cannot be produced.** ADR-021 is not "done" until that's met. Per user directive 2026-05-07: "If we need it for adr-021 to be done, then it is by definition in scope."
+**LANDED + LIVE-VERIFIED**: full pipeline from `[3, H, W]` pixels → ViT prelude (Stage A: K1 im2col + 2× dense_matmul + bias_add + K2 antialias resize + elementwise_add + K4 block_merge) → ViT blocks (Stage B) → main projector + DeepStack heads + K5 feature_concat → soft-token splice into LM embedding stream → 28-layer Qwen3-VL text-LM dense forward (biased GQA + per-head Q/K RMSNorm + 3D-IMROPE + SDPA causal + SwiGLU FFN + DeepStack residual injection at LM layers 0/1/2) → final RMSNorm + tied LM head → coherent generated text. 39/0 hf2q + 12/0 mlx-native ADR-021 parity tests + 19/0 qwen3vl_text module tests + 1/0 operator-gated forward smoke test pass.
+
+**Total bug fixes that landed across iter-7 → iter-10a**:
+
+1. `gguf_emit::current_pos` Ok(0) stub → file off-by-one corrupting every tensor's data alignment (commit `bb9ebfd`).
+2. ViT per-block FFN `clip.cpp::build_ffn` tensor-presence-conditional GEGLU/GELU branch (commit `bb9ebfd`).
+3. Error-chain `{e}` → `{e:#}` (streaming arm `87ab42b`, non-streaming arm `4664179`).
+4. Arch name `qwen3_vl` → `qwen3vl` for stock-llama.cpp compat (commit `5f754ec`).
+5. 6 missing `qwen3vl.*` metadata keys in converter (commit `5f754ec`).
+6. Bool-vs-Uint32 mismatch on `clip.has_*_encoder` (commit `5f754ec`).
+7. mmproj norm + bias dtype F16 → F32 (210 tensors corrected; commit `b791e04`).
+8. `v.position_embd.weight` F16 → F32 peer convention (commit `b791e04`).
+9. `n_deepstack_layers` read from `vision_config` not `text_config` (commit `b791e04`).
+10. `QWEN3VL_ROPE_MODE: 24 → 40` (IMROPE not Vision; commit `8b24f1e`).
+11. `mrope_section: [u32;3] [3,3,2] → [u32;4] [24,20,20,0]` + GGUF read (commit `8b24f1e`).
+12. weights.rs `token_embd` F16 → F32 (for embed lookup + tied LM head; commit `cd00ac7`).
+13. **Missing `memory_barrier()` between RAW dispatches** in forward.rs (commit `21ac1ac`) — THE bug that caused garbage output. 5 barriers added per layer.
+14. `image_token_residual_add_f32` kernel not registered for Qwen3-VL forward path (commit `4664179`).
 
 **Reusability**: Qwen3-VL text LM is structurally identical to Qwen3.5/3.6 (same biased GQA + per-head Q/K RMSNorm + SiLU FFN), and `Qwen35Model::forward_gpu_last_logits_with_soft_tokens_and_deepstack` already implements DeepStack residual injection. Novel pieces are 3D-mRoPE and Qwen3-VL config wiring.
 
@@ -121,11 +146,12 @@ The `Vec<f32>` readback at 2522-2552 collapses to a single `feature_concat_f32` 
 | 5 | c | AC-6 perf measurement; ADR closure | LANDED. `adr021_iter5c_ac6_perf_stage_a_gpu_vs_cpu_2026_05_07` measures Stage A wall (CPU oracle vs GPU pipeline, best-of-5, 256×256 image / hidden=1280): **CPU 291,367.7 µs vs GPU 3,181.8 µs = 91.57× speedup**, max abs diff 1.19e-6 (ULP-bound from FP reduction-order in matmul tiles). At canonical 1568×1568 the speedup amortizes further (GPU dispatch latency is amortized over more compute). AC-6 met. |
 | 6 | a | Collapse Stage A's separate session into Stage B's session — match §2 "single shared session" end-state | LANDED. Refactored `qwen3vl_stage_a_gpu_to_cpu` (Vec<f32>-returning, owned-session) → `qwen3vl_stage_a_dispatch` (caller-passes-encoder, returns MlxBuffer directly). `compute_vision_embeddings_gpu_qwen3vl` now opens ONE `executor.begin()` window, runs Stage A → Stage B per-block forward → DeepStack heads → main projector → K5 feature concat all in the same encoder, calls `session.finish()` ONCE, and reads the augmented embed via a SINGLE `as_slice::<f32>()`. Removes the `upload_f32_to_gpu` round-trip and one extra `session.finish()` commit-and-wait. 39/0 vit_gpu_qwen3vl tests pass; baseline pin unchanged. |
 | 7 | a | Real-Qwen3-VL-2B AC-3 (ViT-side) + 3 latent-bug fixes | LANDED (commits `87ab42b` + `bb9ebfd`). See Status block. |
-| 8 | a | iter-228b foundations: `Qwen3VlTextModel::forward_text` skeleton + thread Qwen3.5 GPU primitives (rmsnorm + biased GQA + per-head Q/K RMSNorm + flash-attention + SiLU FFN + tied LM head) into the Qwen3-VL text path | pending |
-| 8 | b | 3D-mRoPE: position generator (per-token (t, h, w) tuple driven by `<|image_pad|>` placeholders + image grid metadata) + Metal kernel that consumes the 3D positions in the Q/K rotation | pending |
-| 9 | a | DeepStack threading: lift `DeepstackInjection` from the Qwen3.5 path to Qwen3-VL text; verify per-LM-layer `image_token_residual_add_gpu` fires at flagged indexes | pending |
-| 9 | b | Engine seam: replace `qwen3vl_text_forward_pending` 501 sentinel with the real forward dispatch in `engine.rs::worker_run` | pending |
-| 10 | a | Live AC-3 closure — drive 3 multimodal `/v1/chat/completions` (square / wide / tall) end-to-end against real Qwen3-VL-2B-Instruct, capture coherent generated text, quote literal output bytes per `feedback_live_verification_must_check_content` | pending |
+| 8 | a-1 | iter-8a-1: IMROPE mode + 4-int sections + GGUF-driven `n_deepstack_layers` (3 latent metadata bugs in `qwen3vl_text/mod.rs`) | LANDED commit `8b24f1e`. 14/0 unit tests pin defaults + GGUF read paths + invariants. |
+| 8 | a-2 | iter-8a-2: `forward_text_prefill_logits_last` — full prefill, last-position logits. 28-layer per-layer chain via Qwen3.5 GPU primitives (rmsnorm + biased GQA + per-head Q/K rmsnorm + IMROPE + SDPA + SwiGLU FFN + tied LM head). Token embd loaded F32 (was F16) for embed-lookup + tied-head compat. 3-phase per-layer scoping for SDPA's CPU-permute hop. | LANDED commit `cd00ac7`. 1/0 operator-gated real-model smoke test pins shape + finiteness. |
+| 8 | b | 3D-mRoPE: position generator + IMROPE kernel — both already existed. `build_qwen3vl_positions` in `forward_prefill.rs:220` wires (t, y, x, z) tuples from image grid metadata; mlx-native's `dispatch_rope_multi_cached` with `RopeMultiMode::Imrope` consumes them. iter-8a-2 wired both into the forward path with the correct sections. | LANDED (folded into 8a-2). |
+| 9 | a | DeepStack threading: per-layer `il < n_deepstack_layers` Phase D session dispatching `image_token_residual_add_gpu` for chunk `il`. Position-gated in-place add equivalent to peer's full-tensor add (zero rows are no-ops). | LANDED commit `6f2d8a2`. Tested against real model (text-only path; no deepstack means dispatch is skipped — same code path). |
+| 9 | b | Engine seam: `Generate` + `GenerateWithSoftTokens` arms in `engine.rs::worker_run` for `LoadedModel::Qwen3VlText` route to `engine_qwen3vl::generate_qwen3vl_text_once` and `..._with_soft_tokens_once`. Naive O(N²) re-prefill loop (no KV cache; iter-9c+). **iter-9b RAW barrier fix landed simultaneously (`21ac1ac`)** — missing `enc.memory_barrier()` between dispatches in the same encoder caused tokenized garbage output ("BOT" instead of "4"). 5 barriers added per layer. Localized via peer cross-check + top-5 logit dump. | LANDED commits `513ebb5` + `21ac1ac`. 3 text prompts produce coherent output ("4", "Buenos días", "The capital of France is Paris."). |
+| 10 | a | Live AC-3 closure — drive 3 multimodal `/v1/chat/completions stream:false` (square / wide / tall PNG) end-to-end against real Qwen3-VL-2B-Instruct, capture literal generated-text bytes. Soft-token splicing now wired in forward (CPU-side overwrite of `<|image_pad|>` rows with ViT-projected embeddings before GPU upload). `image_token_residual_add_f32` kernel registration added at forward seam. Error chain `{e}` → `{e:#}` widened in non-streaming chat handler arm. | LANDED commit `4664179`. **AC-3 met**: square red→'red', wide blue→'blue', tall green→'green'. |
 | 11 | a | Peer-reference parity: build llama.cpp's `mtmd-cli`, run same image+prompt through both, byte-or-ULP compare ViT output AND first-token logits AND first 8 generated tokens. Pin in a new operator-gated test | LANDED via converter route. **hf2q's own converter output now runs end-to-end through stock `llama-mtmd-cli`** (commit `5f754ec` + `<this commit>`): all 3 AC-3 shapes produce coherent generated text matching the peer-built GGUF semantically:<br>`square 256×256 red:   hf2q-converted → "red"   ;  peer-converted → "red"`<br>`wide   256×128 blue:  hf2q-converted → "blue"  ;  peer-converted → "Blue"` (case only)<br>`tall   128×256 green: hf2q-converted → "green" ;  peer-converted → "green"`<br>This proves hf2q's CONVERTER is functionally correct (the GGUF byte stream is loadable + produces correct output via stock llama.cpp). hf2q's OWN runtime text-LM forward is still iter-228b. Total bug fixes that landed in this iter to reach peer-load compat:<br>1. `current_pos` Ok(0) stub → off-by-one alignment broke every tensor (commit `bb9ebfd`)<br>2. ViT FFN tensor-presence-conditional GEGLU/GELU branch (commit `bb9ebfd`)<br>3. Error chain `{e}` → `{e:#}` for diagnosis (commit `87ab42b`)<br>4. Arch name `qwen3_vl` → `qwen3vl` (commit `5f754ec`)<br>5. 6 missing `qwen3vl.*` metadata keys (commit `5f754ec`)<br>6. Bool-vs-Uint32 mismatch on `clip.has_*_encoder` (commit `5f754ec`)<br>7. mmproj norm + bias dtype F16 → F32 (per peer convention; 210 tensors corrected) (this commit)<br>8. `v.position_embd.weight` F16 → F32 (peer convention) (this commit)<br>9. `n_deepstack_layers` read from `vision_config` not `text_config` (this commit) — was emitting 0 instead of 3, causing `n_embd_inp` mismatch with mmproj. |
 | 11 | b | Cleanup: gate Gemma `warmup_vit_gpu` so it doesn't misfire on Qwen3-VL mmproj (the persistent "ViT GPU warmup failed" warn in serve startup); audit downstream consumers of the off-by-one-broken converted GGUFs | pending |
 
