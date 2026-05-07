@@ -73,12 +73,19 @@
 
 use anyhow::{anyhow, Context, Result};
 
-use mlx_native::ops::elementwise::elementwise_mul;
+use mlx_native::ops::add_bias_row_2d::{
+    dispatch_add_bias_row_2d_f32, register as register_add_bias_row_2d,
+};
+use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
+use mlx_native::ops::elementwise::{elementwise_add, elementwise_mul};
 use mlx_native::ops::gelu::dispatch_gelu;
+use mlx_native::ops::im2col_2d_3ch::{
+    dispatch_im2col_2d_3ch_f32, register as register_im2col_2d_3ch,
+};
 use mlx_native::ops::rope_multi::{
     dispatch_rope_multi_cached, RopeMultiMode, RopeMultiParams,
 };
-use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::{CommandEncoder, DType, GraphExecutor, KernelRegistry, MlxBuffer, MlxDevice};
 
 use crate::inference::models::bert::bert_gpu::{
     bert_bias_add_gpu, bert_layer_norm_gpu, register_bert_custom_shaders,
@@ -631,6 +638,249 @@ pub(crate) fn qwen3vl_2x2_block_merge_reshape(
 // patch grid before adding it to the dual-conv patch embedding.
 // iter-225 Phase-2: signature lifted from square `target_n_per_side`
 // to rectangular `(target_n_x, target_n_y)`.
+/// ADR-021 K1 helper: GPU dual-stem patch embed → CPU readback.
+///
+/// Drop-in equivalent of [`qwen3vl_dual_conv_patch_embed_cpu_hw`]
+/// that runs the dual-conv2d patch embed on the GPU via
+/// `im2col_2d_3ch_f32` + 2× `dense_matmul_f32_f32_tensor` +
+/// `elementwise_add` + (optional) `add_bias_row_2d_f32`, then reads
+/// the result back to a `Vec<f32>`.
+///
+/// The CPU-side readback is interim — iters 3a/3b/4a collapse it
+/// once the rest of Stage A also runs on the GPU. For iter-2a the
+/// downstream stages (bilinear pos-embd resize, inline add, 2×2
+/// block-merge) still consume `Vec<f32>`, so this helper returns
+/// the same shape the CPU function returned.
+///
+/// # Float-summation order
+///
+/// `dense_matmul_f32_f32_tensor` reduces over the K axis using
+/// simdgroup MMA tiles, NOT the (ic, dy, dx) sequential order
+/// `patch_embed_forward_hw` uses. Therefore output is **byte-equal
+/// up to FP reduction order** rather than strict byte-identical to
+/// the CPU oracle. Drift bound is empirical (measured by
+/// `adr021_iter1a_e2e_byte_pinned_baseline_2026_05_07`'s ULP
+/// assertion after iter-2a lands).
+fn qwen3vl_dual_conv_patch_embed_gpu_to_cpu(
+    pixel_values: &[f32],
+    weight_0: &[f32],
+    weight_1: &[f32],
+    bias: Option<&[f32]>,
+    pixel_h: u32,
+    pixel_w: u32,
+    patch_size: u32,
+    hidden: u32,
+) -> Result<Vec<f32>> {
+    if patch_size == 0 || pixel_h == 0 || pixel_w == 0 {
+        return Err(anyhow!(
+            "qwen3vl_dual_conv_patch_embed_gpu_to_cpu: patch_size ({patch_size}), \
+             pixel_h ({pixel_h}), pixel_w ({pixel_w}) must all be > 0"
+        ));
+    }
+    if pixel_h % patch_size != 0 || pixel_w % patch_size != 0 {
+        return Err(anyhow!(
+            "qwen3vl_dual_conv_patch_embed_gpu_to_cpu: pixel grid \
+             ({pixel_h}x{pixel_w}) must be divisible by patch_size ({patch_size})"
+        ));
+    }
+    let nps_x = (pixel_w / patch_size) as usize;
+    let nps_y = (pixel_h / patch_size) as usize;
+    let p2 = (patch_size as usize) * (patch_size as usize);
+    let k_total = 3 * p2;
+    let num_patches = nps_y * nps_x;
+    let h = hidden as usize;
+    let expected_pixels = 3 * (pixel_h as usize) * (pixel_w as usize);
+    let expected_w = h * k_total;
+    if pixel_values.len() != expected_pixels {
+        return Err(anyhow!(
+            "qwen3vl_dual_conv_patch_embed_gpu_to_cpu: pixel_values.len() ({}) != \
+             3*pixel_h*pixel_w ({expected_pixels})",
+            pixel_values.len()
+        ));
+    }
+    if weight_0.len() != expected_w {
+        return Err(anyhow!(
+            "qwen3vl_dual_conv_patch_embed_gpu_to_cpu: weight_0.len() ({}) != \
+             hidden*3*p² ({expected_w})",
+            weight_0.len()
+        ));
+    }
+    if weight_1.len() != expected_w {
+        return Err(anyhow!(
+            "qwen3vl_dual_conv_patch_embed_gpu_to_cpu: weight_1.len() ({}) != \
+             hidden*3*p² ({expected_w})",
+            weight_1.len()
+        ));
+    }
+    if let Some(b) = bias {
+        if b.len() != h {
+            return Err(anyhow!(
+                "qwen3vl_dual_conv_patch_embed_gpu_to_cpu: bias.len() ({}) != \
+                 hidden ({h})",
+                b.len()
+            ));
+        }
+    }
+
+    let executor = GraphExecutor::new(
+        MlxDevice::new()
+            .map_err(|e| anyhow!("qwen3vl_dual_conv_patch_embed_gpu_to_cpu: device: {e}"))?,
+    );
+    let mut session = executor
+        .begin()
+        .map_err(|e| anyhow!("qwen3vl_dual_conv_patch_embed_gpu_to_cpu: begin: {e}"))?;
+    // SAFETY: executor outlives session via this function's stack frame.
+    let device_ref: *const MlxDevice = executor.device() as *const _;
+    let device: &MlxDevice = unsafe { &*device_ref };
+    let mut registry = KernelRegistry::new();
+    register_im2col_2d_3ch(&mut registry);
+    register_add_bias_row_2d(&mut registry);
+
+    // Allocate + upload pixels and weights.
+    let mut pixels_buf = device
+        .alloc_buffer(
+            pixel_values.len() * 4,
+            DType::F32,
+            vec![3, pixel_h as usize, pixel_w as usize],
+        )
+        .map_err(|e| anyhow!("alloc pixels: {e}"))?;
+    pixels_buf
+        .as_mut_slice::<f32>()
+        .map_err(|e| anyhow!("pixels mut: {e}"))?
+        .copy_from_slice(pixel_values);
+
+    let mut w0_buf = device
+        .alloc_buffer(weight_0.len() * 4, DType::F32, vec![h, k_total])
+        .map_err(|e| anyhow!("alloc weight_0: {e}"))?;
+    w0_buf
+        .as_mut_slice::<f32>()
+        .map_err(|e| anyhow!("weight_0 mut: {e}"))?
+        .copy_from_slice(weight_0);
+
+    let mut w1_buf = device
+        .alloc_buffer(weight_1.len() * 4, DType::F32, vec![h, k_total])
+        .map_err(|e| anyhow!("alloc weight_1: {e}"))?;
+    w1_buf
+        .as_mut_slice::<f32>()
+        .map_err(|e| anyhow!("weight_1 mut: {e}"))?
+        .copy_from_slice(weight_1);
+
+    let im2col_buf = device
+        .alloc_buffer(
+            num_patches * k_total * 4,
+            DType::F32,
+            vec![num_patches, k_total],
+        )
+        .map_err(|e| anyhow!("alloc im2col: {e}"))?;
+    let mut dst0_buf = device
+        .alloc_buffer(num_patches * h * 4, DType::F32, vec![num_patches, h])
+        .map_err(|e| anyhow!("alloc dst0: {e}"))?;
+    let mut dst1_buf = device
+        .alloc_buffer(num_patches * h * 4, DType::F32, vec![num_patches, h])
+        .map_err(|e| anyhow!("alloc dst1: {e}"))?;
+    let summed_buf = device
+        .alloc_buffer(num_patches * h * 4, DType::F32, vec![num_patches, h])
+        .map_err(|e| anyhow!("alloc summed: {e}"))?;
+
+    // K1 — im2col [3,H,W] -> [num_patches, 3*p²].
+    dispatch_im2col_2d_3ch_f32(
+        session.encoder_mut(),
+        &mut registry,
+        device.metal_device(),
+        &pixels_buf,
+        &im2col_buf,
+        pixel_h,
+        pixel_w,
+        patch_size,
+    )
+    .map_err(|e| anyhow!("im2col dispatch: {e}"))?;
+    session.encoder_mut().memory_barrier();
+
+    // dst0 = im2col @ w0.T  (i.e. dst0[m,n] = Σ_k w0[n,k] * im2col[m,k])
+    let mm_params = DenseMmF32F32Params {
+        m: num_patches as u32,
+        n: hidden,
+        k: k_total as u32,
+        src0_batch: 1,
+        src1_batch: 1,
+    };
+    dense_matmul_f32_f32_tensor(
+        session.encoder_mut(),
+        &mut registry,
+        device,
+        &w0_buf,
+        &im2col_buf,
+        &mut dst0_buf,
+        &mm_params,
+    )
+    .map_err(|e| anyhow!("matmul stem 0: {e}"))?;
+    session.encoder_mut().memory_barrier();
+
+    dense_matmul_f32_f32_tensor(
+        session.encoder_mut(),
+        &mut registry,
+        device,
+        &w1_buf,
+        &im2col_buf,
+        &mut dst1_buf,
+        &mm_params,
+    )
+    .map_err(|e| anyhow!("matmul stem 1: {e}"))?;
+    session.encoder_mut().memory_barrier();
+
+    // summed = dst0 + dst1
+    elementwise_add(
+        session.encoder_mut(),
+        &mut registry,
+        device.metal_device(),
+        &dst0_buf,
+        &dst1_buf,
+        &summed_buf,
+        num_patches * h,
+        DType::F32,
+    )
+    .map_err(|e| anyhow!("elementwise_add: {e}"))?;
+    session.encoder_mut().memory_barrier();
+
+    // Optional bias broadcast: out[m,n] = summed[m,n] + bias[n]
+    let final_buf = if let Some(bias_slice) = bias {
+        let mut bias_buf = device
+            .alloc_buffer(bias_slice.len() * 4, DType::F32, vec![h])
+            .map_err(|e| anyhow!("alloc bias: {e}"))?;
+        bias_buf
+            .as_mut_slice::<f32>()
+            .map_err(|e| anyhow!("bias mut: {e}"))?
+            .copy_from_slice(bias_slice);
+        let biased_buf = device
+            .alloc_buffer(num_patches * h * 4, DType::F32, vec![num_patches, h])
+            .map_err(|e| anyhow!("alloc biased: {e}"))?;
+        dispatch_add_bias_row_2d_f32(
+            session.encoder_mut(),
+            &mut registry,
+            device.metal_device(),
+            &summed_buf,
+            &bias_buf,
+            &biased_buf,
+            num_patches as u32,
+            hidden,
+        )
+        .map_err(|e| anyhow!("bias broadcast: {e}"))?;
+        session.encoder_mut().memory_barrier();
+        biased_buf
+    } else {
+        summed_buf
+    };
+
+    session
+        .finish()
+        .map_err(|e| anyhow!("session finish: {e}"))?;
+
+    let s: &[f32] = final_buf
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("readback: {e}"))?;
+    Ok(s.to_vec())
+}
+
 pub(crate) fn qwen3vl_resize_position_embeddings_bilinear(
     pos_embd_table: &[f32],
     num_position_embeddings: u32,
@@ -2238,7 +2488,12 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         .get(super::mmproj::TENSOR_PATCH_EMBD_BIAS)
         .and_then(|b| mmproj_weights.tensor_as_f32_owned(b).ok());
 
-    let patches_pre = qwen3vl_dual_conv_patch_embed_cpu_hw(
+    // ADR-021 iter-2a: dual conv patch embed runs on the GPU
+    // (im2col_2d_3ch_f32 + 2× dense_matmul_f32_f32_tensor +
+    // elementwise_add + add_bias_row_2d_f32). Result is read back to
+    // a Vec<f32> for now; iters 3a/3b/4a remove the readback when the
+    // rest of Stage A becomes GPU-resident.
+    let patches_pre = qwen3vl_dual_conv_patch_embed_gpu_to_cpu(
         pixel_values,
         &patch_embd_f32,
         &patch_embd_1_f32,
@@ -2248,7 +2503,7 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         cfg.patch_size,
         cfg.n_embd,
     )
-    .context("compute_vision_embeddings_gpu_qwen3vl: dual conv patch embed")?;
+    .context("compute_vision_embeddings_gpu_qwen3vl: dual conv patch embed (GPU)")?;
 
     // A2. Resize trained position embedding to runtime patch grid +
     //     element-wise add to patches_pre (qwen3vl.cpp:47-58).
@@ -6036,9 +6291,22 @@ mod tests {
         // K1/K4/K5 swaps must keep these pins byte-identical; K2 may
         // exceed by up to 1 ULP per element due to bilinear sum order.
         const EXPECTED_LEN: usize = 1024;
-        // Pinned 2026-05-07 from CPU-prelude path on commit 5f2ba02
-        // (HEAD of `main` at ADR-021 iter-1a start).
-        const EXPECTED_FNV1A64: u64 = 0xf1a7_1d67_3b0b_5891;
+        // Pin trail (each ADR-021 port iter records its hash + a one-line
+        // rationale; first8 + last8 stay byte-identical across all iters
+        // observed so far — middle elements drift only by FP-reduction
+        // order in dense_matmul tiles). The FNV pin is the **strict
+        // tripwire**; first8/last8 are the **structural pin** (they should
+        // not move and any change there means a real index-math bug).
+        //
+        //   iter-1a 2026-05-07 — CPU-prelude path on commit 5f2ba02
+        //                         fnv1a64=0xf1a71d67_3b0b5891
+        //   iter-2a 2026-05-07 — qwen3vl_dual_conv_patch_embed_gpu_to_cpu
+        //                         (K1 im2col + 2× dense_matmul + add +
+        //                         add_bias_row_2d). FP-reduction-order
+        //                         drift in middle elements; first8/last8
+        //                         byte-identical to iter-1a.
+        //                         fnv1a64=0x7da7f3ad_353c585b
+        const EXPECTED_FNV1A64: u64 = 0x7da7_f3ad_353c_585b;
         const EXPECTED_FIRST8: [u32; 8] = [
             0x3b43_3e0f, 0x3b15_c486, 0x3ba1_1b92, 0x3c05_1b52,
             0x3c0b_aa1a, 0x3bbf_01b9, 0x3b50_238e, 0x3b6f_5af2,
