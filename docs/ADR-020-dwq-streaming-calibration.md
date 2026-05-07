@@ -181,10 +181,11 @@ Replaces all prior iteration tables.
 | 5 | — | 10-researcher /cfa deep-dive `ede887c` | DONE |
 | 5.5 | — | ADR structural cleanup `3ce0571` | DONE |
 | 6 | — | Fix `materialize_cloned` deep-clone — Arc-share hot path `beb184f` (~52 GB save; bisect-verified falsifier) | DONE |
-| 7 | 1 | Port `estimate_threshold` + BPW accounting + `SensitivityAlgorithm` enum + `2.0.gradient-alignment` constant `<this-commit>` (16/16 falsifiers; pure-fn, no autograd) | DONE |
-| **8** | 1 | Port `estimate_sensitivities` (autograd backbone) — Linear-aware backward through transformer; per-tensor sensitivity map | **NEXT** |
-| 9 | 1 | Track 1 falsifier tests + GGUF emit verification | |
-| 10 | 1 | Track 1 e2e on Qwen3.6-27B + Gemma 4 26B-A4B; bench vs current variance-magnitude | |
+| 7 | 1 | Port `estimate_threshold` + BPW accounting + `SensitivityAlgorithm` enum + `2.0.gradient-alignment` constant `913af23` (16/16 falsifiers; pure-fn, no autograd) | DONE |
+| 8 | 1-B | Subprocess gate for `mlx_lm.quant.dynamic_quant` `<this-commit>` — wraps Python CLI, parses sensitivities JSON. mlx-native has zero autograd surface; building it is months of work, so iter 8 lands the PATH B GATE first per ADR §8.2 (analogous to Track 2 §8.3). 18 falsifiers + 1 e2e gated `#[ignore]`. | DONE |
+| **9** | 1-B | E2E perplexity gate: run mlx-lm dynamic_quant on Qwen3-0.6B-base + measure PPL gap vs hf2q variance-magnitude DWQ-46 baseline. GO if ≥ 0.05 nats better. | **NEXT** |
+| 10 | 1 | If iter-9 GO: plan native autograd port (subprocess output proves the algorithm value); if NO-GO: drop Track 1 native port from scope, surface variance-magnitude → imatrix-quant-error proxy as the upgrade. | |
+| 11 | 1 | Native port (gated on iter-9 GO): Linear-aware backward through transformer; per-tensor sensitivity map. Major work — likely splits across 3-4 sub-iters. | |
 | 11 | 2-B | Subprocess wrapper around `mlx_lm.dwq`; produce MLX safetensors | |
 | 12 | 2-B | GO/NO-GO gate: perplexity vs Q4_K_M baseline (>0.05 nats threshold) | |
 | 13–14 | 2-A | Port `dwq_quantize` algorithm core; Linear-only autograd; Adam optimizer | |
@@ -223,10 +224,25 @@ Replaces all prior iteration tables.
 
 | Sub-iter | Subtask | Status |
 |---|---|---|
-| 7 | `estimate_threshold` (binary search) + `compute_bits_per_weight` MLX-affine accounting + `SensitivityAlgorithm` enum + `2.0.gradient-alignment` cache-version constant.  Lives at `src/calibrate/dynamic_quant.rs`.  Pure functions, no autograd. | **DONE** |
-| 8 | `estimate_sensitivities` algorithm core — per-tensor signed first-order Taylor: `(grad·(w_low−w_high)).sum() / (params/1e6)`.  Requires Linear-aware autograd through transformer.  Hand-derived `∂L/∂y · x^T` per Linear; no graph-based autograd. | NEXT |
-| 9 | Wire into existing `mixed.rs`/`layer_mix.rs` predicate dispatcher; CLI alias `--quant dynamic-quant-4-6` mapped to existing `Dwq46` enum (preserve `--quant dwq-4-6` for backward compat); end-to-end on synthetic 4-layer Qwen → sensitivity vector matches `mlx_lm dynamic-quant` output within 1e-3 relative. | |
-| 10 | E2E on Qwen3.6-27B + Gemma 4 26B-A4B — measure RSS, time, output GGUF coherence, perplexity vs current variance-magnitude DWQ-46/48 baseline. | |
+| 7 | `estimate_threshold` (binary search) + `compute_bits_per_weight` MLX-affine accounting + `SensitivityAlgorithm` enum + `2.0.gradient-alignment` cache-version constant.  Lives at `src/calibrate/dynamic_quant.rs`.  Pure functions, no autograd. | DONE |
+| 8 | Subprocess wrapper for `python -m mlx_lm.quant.dynamic_quant` at `src/calibrate/dynamic_quant_external.rs`.  Builds typed argv from a config; parses the auto-named `*_sensitivities.json` output into a `BTreeMap<String, f64>`; surfaces typed errors for malformed JSON / missing files / subprocess failures.  Verified mlx-lm 0.31.2 with Metal works locally.  18 unit falsifiers + 1 e2e gated `#[ignore]` (needs Qwen3-0.6B + ~30s).  Path B GATE for Track 1, analogous to Track 2 §8.3. | DONE |
+| 9 | E2E perplexity gate: run mlx-lm dynamic_quant on Qwen3-0.6B-base via the iter-8 wrapper; produce MLX safetensors; measure WikiText PPL via `mlx_lm.evaluate`.  Compare to hf2q's existing variance-magnitude DWQ-46 GGUF + llama-completion PPL on the same source.  **GO** if ≥ 0.05 nats better → continue native autograd port.  **NO-GO** if not material → drop Track 1 native port, propose imatrix-quant-error proxy upgrade as alternative. | NEXT |
+| 10 | (Gated on iter-9 GO) Plan + spec the native autograd port — pick approach: hand-derived Linear backward (no graph-based autograd) vs porting from candle's tape vs new mlx-native `value_and_grad`.  Decision blocked until iter-9 measurement. | |
+| 11 | (Gated) Native port impl, sub-iter 1: Linear-aware reverse pass, accumulator structure, per-batch eval/del rhythm. | |
+| 12 | (Gated) Native port impl, sub-iter 2: KL-div loss + softmax backward, sensitivity formula application. | |
+| 13 | E2E on Qwen3.6-27B + Gemma 4 26B-A4B — measure RSS, time, output GGUF coherence, perplexity vs current variance-magnitude DWQ-46/48 baseline. | |
+
+**Rationale for the iter-8 pivot to Path B GATE:**
+
+Iter-8 audit of `/opt/mlx-native/src/` found ZERO autograd primitives
+(no `value_and_grad`, no `VJP`, no `JVP`, no `tape`, no `gradient` —
+`grep -rn "fn.*backward\|fn.*grad\|value_and_grad\|autograd" /opt/mlx-native/src` empty).
+Building reverse-mode autograd in mlx-native is a multi-month
+infrastructure project — out of scope for an /loop iter.  Per the
+mantra "Measure 3x, cut once" the iter-8 wrapper validates the
+algorithm + format end-to-end via Python before committing weeks to
+the native port.  This mirrors Track 2 Path B (§8.3) which uses the
+same gate-first strategy for DWQ proper.
 
 **Pass criteria:**
 
