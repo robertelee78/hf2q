@@ -19,7 +19,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-REF_MODEL="${REF_MODEL:-jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated}"
+# NOTE: by default we run against the LOCAL working dir built by
+# 00_prep_working_dir.sh (which has the chat_template + model_type
+# fixes baked in).  Override REF_MODEL to use a different path /
+# HF id directly.
+REF_MODEL="${REF_MODEL:-./abliterix_with_chat_template}"
 OUT_DIR="${OUT_DIR:-./dwq_output}"
 BITS="${BITS:-4}"
 GROUP_SIZE="${GROUP_SIZE:-64}"
