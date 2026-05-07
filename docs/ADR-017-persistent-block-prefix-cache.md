@@ -584,9 +584,29 @@ R-C1 PASS — 167 bytes byte-identical across processes
 
 Compare to dense path R-P5 (44,500× on a different fixture).  Both modes are within R-P5 spec (`≤ 0.15`, i.e. ≥ 6.7× speedup).  Pre-fix the warm-path R-C1 held only via greedy decode determinism (both runs did full prefill independently); post-fix the equivalence is observably caused by cache-hit replay.
 
-### Remaining follow-on (not B-tq.4 acceptance)
+### Phase B-tq.7 Status: GREEN — 8-bit codebook (production default) live R-P5 (commit `1176cf3`)
 
-- **8-bit codebook support**: The substrate currently snapshots `kv_caches[].k_packed` which is the runtime's *4-bit* legacy cache (`hd/2` packed bytes).  At `HF2Q_TQ_CODEBOOK_BITS=8` the runtime additionally writes to `leg_hb_encoded` (the HB-packed cache that 8-bit SDPA reads); the snapshot doesn't touch it yet.  Pinning the live test at 4-bit so snapshot/restore shape matches what the runtime actively uses.  8-bit support is **B-tq.7** follow-on (needs `leg_hb_encoded`-aware variants of `tq_v2_snapshot_block` / `tq_v2_restore_block`).
+The substrate now supports both bit widths.  `tq_v2_snapshot_block` and `tq_v2_restore_block` branch on `bits_per_coord.0 >= 5`:
+- **bits = 4** (legacy): reads/writes `kv_caches[layer].k_packed` (nibble-packed, `[nkv, cap, hd/2]`)
+- **bits ∈ {5,6,8}** (production): reads/writes `leg_hb_encoded[layer].k_packed` (byte-packed, `[nkv, cap, hd]`)
+
+Three additional pieces shipped in B-tq.7:
+
+1. **`norms_per_pos` derived from `head_dim`** in the v2 envelope codec.  Gemma 4 global layers (D=512) have 2 norms per (head, position); previously the v2 envelope undersized the norms tail by half on those layers.  Codec_version stays at 2 — `norms_per_pos = (head_dim / 256).max(1)` is deterministic from `head_dim` so the wire format doesn't change.
+2. **Bounds-check on restore**: Gemma 4 global layers use dynamic capacity sizing — at server-B `post_admit` time, the layer's buffer may be too small to hold the snapshot's range (warmup-time `cap=2` vs snapshot `range 0..256` for global).  Restore now returns `CodecErr` instead of panicking; spiller bails gracefully; the prompt_cache replay (R-P5) still delivers the warm-path benefit since it short-circuits prefill before the cache needs to grow.
+3. **Descriptor capture from `weights.layers[i]`** instead of `kv_caches[i].k_packed.shape()` so 8-bit `head_dim` resolves correctly without depending on the lazily-allocated `leg_hb_encoded` (which is `None` at `Engine::spawn`).
+
+### Live R-P5 measurement at production-default 8-bit (Gemma 4 26B-A4B-DWQ)
+
+```
+COLD: ttft_cold = 11360.5 ms  (1127 prompt tokens, full prefill)
+WARM: ttft_warm =     1.5 ms  (PromptCache full-equality replay)
+TTFT_warm / TTFT_cold = 0.0001    ← 7572× speedup
+cache_dir post-drain: 121 block files
+R-C1 PASS — 167 bytes byte-identical
+```
+
+Small-prompt R-C1 at 8-bit also PASS (`ttft_warm = 0.5 ms`, 11 bytes byte-identical).
 
 **Why earlier B-tq.3 wording was wrong.**  The iter immediately preceding this one stated B-tq.4 was "gated on ADR-007 Path C runtime correctness work clearance."  Path C closed substantively on 2026-05-05 at 10 of 11 phases (`docs/adr007-pathC/PATHC_CLOSURE.md`).  The codec-freeze contract (Path C F-7) is LANDED — that's the contract B-tq.4 codes against.  Path C F-0.2 NRMSE 0.000247 at Gemma 4 26B production shape proves codec correctness.  The remaining open Path C item is F-5 (MMLU + LongBench) — discretionary downstream-consumer-driven validation, NOT a B-tq.4 prerequisite.
 

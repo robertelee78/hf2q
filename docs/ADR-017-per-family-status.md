@@ -1,6 +1,6 @@
 # ADR-017 Per-Family Ship-Gate Status
 
-**Last updated:** 2026-05-06 (post Phase B-tq.4 iter-1+2+3 + B-tq.5 driver extraction + iter-4 descriptor wiring + B-tq.6 R-P5 unlock — full automation + 9324× warm-path TTFT speedup on Gemma 4 26B-A4B-DWQ live R-C1+R-P5)
+**Last updated:** 2026-05-06 (post B-tq.7 — 8-bit codebook (production default) GREEN; live R-P5 at 7572× warm speedup on 1127-token prompt; both 4-bit and 8-bit paths support full snapshot/restore + R-C1 byte-identity)
 **Companion to:** [ADR-017](./ADR-017-persistent-block-prefix-cache.md)
 **Phase D §476 closure doc.**
 
