@@ -316,6 +316,164 @@ pub fn read_floats_to_f32(bytes: &[u8], dtype: Dtype) -> Result<Vec<f32>> {
     }
 }
 
+/// Pack a flat `[bits]`-wide code stream into mlx's u32-packed
+/// little-endian byte layout — inverse of [`unpack_u32_packed`].
+///
+/// `codes.len() % pack_factor` must be 0, where `pack_factor = 32 /
+/// bits` (8 for bits=4, 4 for bits=8).  Element index `j` within a
+/// pack group occupies bits `[j*bits, (j+1)*bits)` of the resulting
+/// u32, LOW bits first — matches mlx's `left_shift(i*bits)` packing
+/// at `mlx/ops.cpp:4762-4772`.  Bytes are emitted little-endian
+/// per safetensors raw-tensor convention.
+///
+/// Returns the byte buffer that the caller can wrap in a
+/// `safetensors::tensor::TensorView` of dtype `Dtype::U32`.
+pub fn pack_u32_codes(codes: &[u8], bits: u32) -> Result<Vec<u8>> {
+    if !(bits == 4 || bits == 8) {
+        return Err(anyhow!(
+            "pack_u32_codes: bits must be 4 or 8 in iter-16/16b; got {bits}"
+        ));
+    }
+    let pack_factor = (32 / bits) as usize;
+    if codes.len() % pack_factor != 0 {
+        return Err(anyhow!(
+            "pack_u32_codes: codes.len()={} not divisible by pack_factor={}",
+            codes.len(),
+            pack_factor
+        ));
+    }
+    let mask: u32 = (1u32 << bits) - 1;
+    let mut out = Vec::with_capacity(codes.len() / pack_factor * 4);
+    for chunk in codes.chunks_exact(pack_factor) {
+        let mut word: u32 = 0;
+        for (j, &c) in chunk.iter().enumerate() {
+            if (c as u32) > mask {
+                return Err(anyhow!(
+                    "pack_u32_codes: code {} at chunk position {j} exceeds {bits}-bit mask {mask}",
+                    c
+                ));
+            }
+            word |= ((c as u32) & mask) << (j as u32 * bits);
+        }
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Cast a `Vec<f32>` to safetensors-ready raw bytes in the requested
+/// dtype.  `dtype` must be one of `F32`, `F16`, `BF16` — the same
+/// types accepted by [`read_floats_to_f32`].  Bytes are little-endian.
+pub fn write_floats_from_f32(values: &[f32], dtype: Dtype) -> Result<Vec<u8>> {
+    match dtype {
+        Dtype::F32 => Ok(values.iter().flat_map(|f| f.to_le_bytes()).collect()),
+        Dtype::F16 => Ok(values
+            .iter()
+            .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+            .collect()),
+        Dtype::BF16 => Ok(values
+            .iter()
+            .flat_map(|f| half::bf16::from_f32(*f).to_le_bytes())
+            .collect()),
+        other => Err(anyhow!(
+            "write_floats_from_f32: dtype {other:?} not supported (expected F32/F16/BF16)"
+        )),
+    }
+}
+
+/// Owned safetensors-ready byte buffers + shape/dtype metadata for
+/// one mlx affine-quantized Linear.  Caller wraps these into
+/// `TensorView`s via [`MlxAffineLinear::to_safetensors_views`] and
+/// passes them to `safetensors::serialize`.  The owned buffers must
+/// outlive the views.
+pub struct MlxAffineLinearBytes {
+    pub weight: Vec<u8>,
+    pub scales: Vec<u8>,
+    pub biases: Vec<u8>,
+    pub n: usize,
+    pub k_packed: usize, // K * bits / 32  — last dim of weight
+    pub n_groups: usize, // K / group_size — last dim of scales/biases
+    pub float_dtype: Dtype,
+}
+
+impl MlxAffineLinear {
+    /// Serialize this Linear's `(weight, scales, biases)` triplet
+    /// into safetensors-ready owned byte buffers + shape metadata.
+    /// `float_dtype` controls the on-disk dtype of `scales` and
+    /// `biases` — mlx-lm typically saves at `BF16`
+    /// (`mlx-lm/quant/dwq.py:78` `dtype: mx.Dtype = mx.bfloat16`).
+    ///
+    /// Caller wraps the resulting `MlxAffineLinearBytes` via
+    /// [`MlxAffineLinear::to_safetensors_views`] (or directly
+    /// constructs `TensorView`s) and concatenates with views from
+    /// other layers before calling `safetensors::serialize`.
+    pub fn to_safetensors_bytes(&self, float_dtype: Dtype) -> Result<MlxAffineLinearBytes> {
+        // Validate q_int range against the bit-width.
+        let max_code = (1u32 << self.bits) as usize - 1;
+        for (i, &c) in self.q_int.iter().enumerate() {
+            if c as usize > max_code {
+                return Err(anyhow!(
+                    "to_safetensors_bytes: q_int[{i}]={c} exceeds {}-bit max {max_code}",
+                    self.bits
+                ));
+            }
+        }
+        let pack_factor = (32 / self.bits) as usize;
+        if self.k % pack_factor != 0 {
+            return Err(anyhow!(
+                "to_safetensors_bytes: K ({}) must be divisible by pack_factor {pack_factor}",
+                self.k
+            ));
+        }
+        let weight = pack_u32_codes(&self.q_int, self.bits)?;
+        let n_groups = self.k / self.group_size;
+        let scales = write_floats_from_f32(&self.scales, float_dtype)?;
+        let biases = write_floats_from_f32(&self.biases, float_dtype)?;
+        Ok(MlxAffineLinearBytes {
+            weight,
+            scales,
+            biases,
+            n: self.n,
+            k_packed: self.k / pack_factor,
+            n_groups,
+            float_dtype,
+        })
+    }
+}
+
+impl MlxAffineLinearBytes {
+    /// Wrap the owned byte buffers into `TensorView`s ready for
+    /// `safetensors::serialize`.  The returned views borrow from
+    /// `self`; `self` must live until `serialize` returns.
+    ///
+    /// Returns `(weight_view, scales_view, biases_view)` ready to be
+    /// keyed by `<path>.weight`, `<path>.scales`, `<path>.biases` per
+    /// mlx-lm's flat-parameter naming convention.
+    pub fn to_safetensors_views(
+        &self,
+    ) -> Result<(
+        safetensors::tensor::TensorView<'_>,
+        safetensors::tensor::TensorView<'_>,
+        safetensors::tensor::TensorView<'_>,
+    )> {
+        use safetensors::tensor::TensorView;
+        let w = TensorView::new(Dtype::U32, vec![self.n, self.k_packed], &self.weight)
+            .map_err(|e| anyhow!("weight TensorView: {e:?}"))?;
+        let s = TensorView::new(
+            self.float_dtype,
+            vec![self.n, self.n_groups],
+            &self.scales,
+        )
+        .map_err(|e| anyhow!("scales TensorView: {e:?}"))?;
+        let b = TensorView::new(
+            self.float_dtype,
+            vec![self.n, self.n_groups],
+            &self.biases,
+        )
+        .map_err(|e| anyhow!("biases TensorView: {e:?}"))?;
+        Ok((w, s, b))
+    }
+}
+
 /// Discover the model.safetensors shard files in a directory.
 /// Returns the index map (tensor_name → shard_filename) if a sharded
 /// `model.safetensors.index.json` is present, or a single `[(*, "model.safetensors")]`
@@ -367,21 +525,10 @@ mod tests {
 
     /// Pack a flat Vec<u8> of `bits`-wide codes into the u32-packed
     /// layout that mlx's `affine_quantize` writes.  Inverse of
-    /// `unpack_u32_packed`.
+    /// `unpack_u32_packed`.  Test-internal alias for the public
+    /// `pack_u32_codes` function (kept for legacy test references).
     fn pack_u32(codes: &[u8], bits: u32) -> Vec<u8> {
-        assert!(bits == 4 || bits == 8);
-        let pack_factor = (32 / bits) as usize;
-        assert!(codes.len() % pack_factor == 0);
-        let mask: u32 = (1u32 << bits) - 1;
-        let mut out = Vec::with_capacity(codes.len() / pack_factor * 4);
-        for chunk in codes.chunks_exact(pack_factor) {
-            let mut word: u32 = 0;
-            for (j, &c) in chunk.iter().enumerate() {
-                word |= ((c as u32) & mask) << (j as u32 * bits);
-            }
-            out.extend_from_slice(&word.to_le_bytes());
-        }
-        out
+        super::pack_u32_codes(codes, bits).expect("pack_u32_codes")
     }
 
     #[test]
@@ -730,6 +877,221 @@ mod tests {
         let map = discover_shards(tmp.path()).unwrap();
         assert_eq!(map.len(), 1);
         assert!(map.contains_key("__single__"));
+    }
+
+    /// iter-16b — writer round-trips with reader for the round-trip
+    /// fixture: serialize an MlxAffineLinear via `to_safetensors_bytes`
+    /// + `to_safetensors_views`, concatenate via
+    /// `safetensors::serialize`, deserialize via the iter-16 reader,
+    /// and assert byte-identical recovery of (q_int, scales, biases).
+    #[test]
+    fn writer_round_trips_with_reader_f32_scales() {
+        let n = 4usize;
+        let k = 32usize;
+        let group_size = 8usize;
+        let bits = 4u32;
+        let groups_per_row = k / group_size;
+
+        let q_int: Vec<u8> = (0..(n * k)).map(|i| ((i * 11 + 3) % 16) as u8).collect();
+        let scales: Vec<f32> = (0..(n * groups_per_row))
+            .map(|i| 0.05 + i as f32 * 0.011)
+            .collect();
+        let biases: Vec<f32> = (0..(n * groups_per_row))
+            .map(|i| -0.13 + i as f32 * 0.029)
+            .collect();
+        let lin = MlxAffineLinear {
+            n,
+            k,
+            group_size,
+            bits,
+            q_int: q_int.clone(),
+            scales: scales.clone(),
+            biases: biases.clone(),
+        };
+
+        let bytes_owned = lin.to_safetensors_bytes(Dtype::F32).unwrap();
+        let (w_view, s_view, b_view) = bytes_owned.to_safetensors_views().unwrap();
+        let bytes = safetensors::tensor::serialize(
+            [
+                ("layer.weight".to_string(), &w_view),
+                ("layer.scales".to_string(), &s_view),
+                ("layer.biases".to_string(), &b_view),
+            ],
+            None,
+        )
+        .unwrap();
+
+        let st = SafeTensors::deserialize(&bytes).unwrap();
+        let lin2 =
+            MlxAffineLinear::from_safetensors(&st, "layer", bits, group_size).unwrap();
+        assert_eq!(lin2.n, n);
+        assert_eq!(lin2.k, k);
+        assert_eq!(lin2.group_size, group_size);
+        assert_eq!(lin2.bits, bits);
+        assert_eq!(lin2.q_int, q_int);
+        assert_eq!(lin2.scales, scales);
+        assert_eq!(lin2.biases, biases);
+    }
+
+    /// iter-16b — round-trip with BF16 scales (matches mlx-lm's
+    /// default save dtype).  Scales+biases must be representable in
+    /// bf16 (small powers of 2 + small integers) for byte-identical
+    /// recovery; otherwise compare within bf16 precision.
+    #[test]
+    fn writer_round_trips_with_reader_bf16_scales() {
+        let n = 2usize;
+        let k = 16usize;
+        let group_size = 8usize;
+        let bits = 4u32;
+        let groups_per_row = k / group_size;
+
+        let q_int: Vec<u8> = (0..(n * k)).map(|i| (i % 16) as u8).collect();
+        // BF16-representable: powers of 2 and small integers.
+        let scales: Vec<f32> = vec![0.0625, 0.125, 0.25, 0.5];
+        let biases: Vec<f32> = vec![-1.0, 0.5, 2.0, -0.25];
+        let lin = MlxAffineLinear {
+            n,
+            k,
+            group_size,
+            bits,
+            q_int: q_int.clone(),
+            scales: scales.clone(),
+            biases: biases.clone(),
+        };
+
+        let bytes_owned = lin.to_safetensors_bytes(Dtype::BF16).unwrap();
+        let (w_view, s_view, b_view) = bytes_owned.to_safetensors_views().unwrap();
+        let bytes = safetensors::tensor::serialize(
+            [
+                ("l.weight".to_string(), &w_view),
+                ("l.scales".to_string(), &s_view),
+                ("l.biases".to_string(), &b_view),
+            ],
+            None,
+        )
+        .unwrap();
+        let st = SafeTensors::deserialize(&bytes).unwrap();
+        let lin2 =
+            MlxAffineLinear::from_safetensors(&st, "l", bits, group_size).unwrap();
+        assert_eq!(lin2.q_int, q_int);
+        // BF16-exact for bf16-representable values.
+        assert_eq!(lin2.scales, scales);
+        assert_eq!(lin2.biases, biases);
+    }
+
+    /// iter-16b — pack convention parity: writer must produce the
+    /// exact byte layout that mlx's left_shift(i*bits) packing
+    /// produces.  Same hand-computed fixture as
+    /// `unpack_u32_low_bits_are_lowest_index`.
+    #[test]
+    fn writer_pack_convention_matches_canonical_fixture() {
+        let codes: Vec<u8> = vec![0xA, 0x3, 0x7, 0x1, 0x5, 0xE, 0x2, 0x9];
+        let packed = pack_u32_codes(&codes, 4).unwrap();
+        // Same canonical bytes as iter-16's reader test:
+        //   byte 0 = 0xA | (0x3 << 4) = 0x3A
+        //   byte 1 = 0x7 | (0x1 << 4) = 0x17
+        //   byte 2 = 0x5 | (0xE << 4) = 0xE5
+        //   byte 3 = 0x2 | (0x9 << 4) = 0x92
+        assert_eq!(packed, vec![0x3Au8, 0x17, 0xE5, 0x92]);
+    }
+
+    /// iter-16b — writer rejects out-of-range codes for the requested
+    /// bit-width (catches bugs where an 8-bit code accidentally lands
+    /// in a 4-bit Linear).
+    #[test]
+    fn writer_rejects_out_of_range_codes() {
+        let codes = vec![0u8, 1, 2, 3, 4, 5, 6, 16]; // 16 > 4-bit max
+        let res = pack_u32_codes(&codes, 4);
+        assert!(res.is_err());
+        let msg = format!("{:?}", res.err().unwrap());
+        assert!(msg.contains("exceeds"), "unexpected error: {msg}");
+    }
+
+    /// iter-16b — multi-Linear save+load: verify the writer composes
+    /// correctly when multiple Linears are batched into one
+    /// safetensors file.  Mirrors mlx-lm's `save_model` flow where
+    /// many `<path>.{weight, scales, biases}` triplets share one
+    /// safetensors file.
+    #[test]
+    fn writer_multi_linear_save_load() {
+        let group_size = 8usize;
+        let bits = 4u32;
+        let make_lin = |n: usize, k: usize, seed: u32| -> MlxAffineLinear {
+            let groups_per_row = k / group_size;
+            let q_int: Vec<u8> = (0..(n * k))
+                .map(|i| ((i as u32 * 7 + seed) % 16) as u8)
+                .collect();
+            let scales: Vec<f32> = (0..(n * groups_per_row))
+                .map(|i| 0.04 + (i as f32 + seed as f32) * 0.001)
+                .collect();
+            let biases: Vec<f32> = (0..(n * groups_per_row))
+                .map(|i| -0.05 + (i as f32 + seed as f32) * 0.002)
+                .collect();
+            MlxAffineLinear {
+                n,
+                k,
+                group_size,
+                bits,
+                q_int,
+                scales,
+                biases,
+            }
+        };
+        let lin_q = make_lin(8, 16, 1);
+        let lin_k = make_lin(8, 16, 2);
+        let lin_v = make_lin(8, 16, 3);
+
+        // Owned buffers must outlive the views (borrow checker
+        // enforces this, hence the explicit binding).
+        let bytes_q = lin_q.to_safetensors_bytes(Dtype::BF16).unwrap();
+        let bytes_k = lin_k.to_safetensors_bytes(Dtype::BF16).unwrap();
+        let bytes_v = lin_v.to_safetensors_bytes(Dtype::BF16).unwrap();
+        let (qw, qs, qb) = bytes_q.to_safetensors_views().unwrap();
+        let (kw, ks, kb) = bytes_k.to_safetensors_views().unwrap();
+        let (vw, vs, vb) = bytes_v.to_safetensors_views().unwrap();
+        let serialized = safetensors::tensor::serialize(
+            [
+                ("q_proj.weight".to_string(), &qw),
+                ("q_proj.scales".to_string(), &qs),
+                ("q_proj.biases".to_string(), &qb),
+                ("k_proj.weight".to_string(), &kw),
+                ("k_proj.scales".to_string(), &ks),
+                ("k_proj.biases".to_string(), &kb),
+                ("v_proj.weight".to_string(), &vw),
+                ("v_proj.scales".to_string(), &vs),
+                ("v_proj.biases".to_string(), &vb),
+            ],
+            None,
+        )
+        .unwrap();
+        let st = SafeTensors::deserialize(&serialized).unwrap();
+
+        for (name, expected) in &[("q_proj", &lin_q), ("k_proj", &lin_k), ("v_proj", &lin_v)] {
+            let got = MlxAffineLinear::from_safetensors(&st, name, bits, group_size).unwrap();
+            // q_int is integer-exact regardless of float dtype.
+            assert_eq!(got.q_int, expected.q_int);
+            // scales/biases: BF16 has ~7-bit mantissa, so non-power-of-2
+            // values round-trip with ~0.4% precision loss.  Compare
+            // within bf16 precision, not byte-identical.
+            for (i, (a, b)) in
+                got.scales.iter().zip(expected.scales.iter()).enumerate()
+            {
+                let tol = 0.01 * b.abs().max(1e-3);
+                assert!(
+                    (a - b).abs() < tol,
+                    "{name}.scales[{i}]: got {a} expected {b} tol {tol}"
+                );
+            }
+            for (i, (a, b)) in
+                got.biases.iter().zip(expected.biases.iter()).enumerate()
+            {
+                let tol = 0.01 * b.abs().max(1e-3);
+                assert!(
+                    (a - b).abs() < tol,
+                    "{name}.biases[{i}]: got {a} expected {b} tol {tol}"
+                );
+            }
+        }
     }
 
     /// End-to-end iter-15 → iter-16 integration: load an mlx-format
