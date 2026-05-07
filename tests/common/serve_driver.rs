@@ -179,7 +179,14 @@ pub fn spawn_hf2q_serve_with_kv_persist(
                         let line = buf.trim_end_matches(['\n', '\r']).to_string();
                         if let Ok(mut g) = tail.lock() {
                             g.push(line);
-                            let drain = g.len().saturating_sub(256);
+                            // Roll at 4096 lines.  The previous 256-line cap
+                            // dropped the early `cmd_serve` factory-
+                            // registration log line (B-tq.4 iter-3 needs
+                            // it for stderr-grep assertion); 4096 fits a
+                            // typical 60-180 s cold load + 16-token decode
+                            // without burning excess RAM (4096 × ~150 B avg
+                            // ≈ 600 KiB).
+                            let drain = g.len().saturating_sub(4096);
                             if drain > 0 {
                                 g.drain(..drain);
                             }
