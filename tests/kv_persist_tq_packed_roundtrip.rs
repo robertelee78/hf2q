@@ -302,18 +302,12 @@ fn kv_persist_tq_packed_b_tq_4_e2e() {
     let extra_env: &[(&str, &str)] = &[
         ("HF2Q_TQ_KV", "1"),
         // Pin codebook bits at production default for reproducibility.
-        // **CRITICAL** — substrate currently snapshots
-        // `kv_caches[].k_packed` which is the runtime's *4-bit*
-        // legacy cache (`hd/2` packed bytes per token).  At
-        // `HF2Q_TQ_CODEBOOK_BITS=8` the runtime additionally writes
-        // to `leg_hb_encoded` (the HB-packed cache that 8-bit SDPA
-        // reads); our snapshot doesn't touch that buffer yet.
-        // Pinning the live test at 4-bit so the snapshot/restore
-        // shape matches what the runtime actively uses.
-        // 8-bit support is a follow-on iter (B-tq.6) — needs
-        // `leg_hb_encoded`-aware variants of `tq_v2_snapshot_block`
-        // / `tq_v2_restore_block`.
-        ("HF2Q_TQ_CODEBOOK_BITS", "4"),
+        // **B-tq.7** — pin at 8-bit (production default per ADR-007
+        // §1234).  At bits >= 5, `tq_v2_snapshot_block` reads from
+        // `leg_hb_encoded[layer]` (the HB-packed cache that 8-bit
+        // SDPA actually uses).  At bits == 4 it falls back to
+        // `kv_caches[layer]` (the legacy 4-bit nibble cache).
+        ("HF2Q_TQ_CODEBOOK_BITS", "8"),
         // Lift tracing filter to INFO so the cmd_serve registration
         // log line at mod.rs:3076+ is visible in stderr (see
         // `check_tq_factory_registered_advisory`).
@@ -581,18 +575,12 @@ fn kv_persist_tq_packed_b_tq_4_long_prompt_perf() {
 
     let extra_env: &[(&str, &str)] = &[
         ("HF2Q_TQ_KV", "1"),
-        // **CRITICAL** — substrate currently snapshots
-        // `kv_caches[].k_packed` which is the runtime's *4-bit*
-        // legacy cache (`hd/2` packed bytes per token).  At
-        // `HF2Q_TQ_CODEBOOK_BITS=8` the runtime additionally writes
-        // to `leg_hb_encoded` (the HB-packed cache that 8-bit SDPA
-        // reads); our snapshot doesn't touch that buffer yet.
-        // Pinning the live test at 4-bit so the snapshot/restore
-        // shape matches what the runtime actively uses.
-        // 8-bit support is a follow-on iter (B-tq.6) — needs
-        // `leg_hb_encoded`-aware variants of `tq_v2_snapshot_block`
-        // / `tq_v2_restore_block`.
-        ("HF2Q_TQ_CODEBOOK_BITS", "4"),
+        // **B-tq.7** — pin at 8-bit (production default per ADR-007
+        // §1234).  At bits >= 5, `tq_v2_snapshot_block` reads from
+        // `leg_hb_encoded[layer]` (the HB-packed cache that 8-bit
+        // SDPA actually uses).  At bits == 4 it falls back to
+        // `kv_caches[layer]` (the legacy 4-bit nibble cache).
+        ("HF2Q_TQ_CODEBOOK_BITS", "8"),
         ("RUST_LOG", "info,hf2q=info"),
     ];
 

@@ -101,29 +101,31 @@ impl TqPackedSpillDescriptor {
         let bits = read_tq_codebook_bits_env();
         let bits_per_coord = TqBitsPerCoord::new(bits).ok()?;
 
+        // **B-tq.7** — at bits >= 5 the runtime stores K/V in
+        // `leg_hb_encoded[layer]` (1 byte per coord, shape
+        // `[nkv, capacity, head_dim]` per `HbKvBuffers` doc); at
+        // bits == 4 it stores in the legacy `kv_caches[layer].k_packed`
+        // (nibble-packed, shape `[nkv, capacity, head_dim/2]`).
+        //
+        // **Note**: `leg_hb_encoded` is lazily allocated at FIRST
+        // `forward_decode` (warmup), so at `Engine::spawn` time it's
+        // `None`.  We can't read its shape directly here.  Instead,
+        // derive `head_dim` and `n_kv_heads` from the per-layer model
+        // config (`weights.layers[i].{head_dim, num_kv_heads}`) which
+        // is stable from GGUF-load time.  At restore-time the
+        // snapshot/restore code reads the actual buffer (which is
+        // populated by then).
         let num_layers = weights.kv_caches.len();
-        if num_layers == 0 {
+        if num_layers == 0 || weights.layers.len() != num_layers {
             return None;
         }
 
         let mut nkv_heads = Vec::with_capacity(num_layers);
         let mut head_dim = Vec::with_capacity(num_layers);
-        for cache in &weights.kv_caches {
-            let shape = cache.k_packed.shape();
-            // Expect `[nkv, capacity, hd_packed]`.
-            if shape.len() != 3 {
-                return None;
-            }
-            let nkv = shape[0] as u32;
-            let hd_packed = shape[2] as u64;
-            let head_dim_bits = hd_packed * 8;
-            let bits_u64 = bits as u64;
-            if bits_u64 == 0 || head_dim_bits % bits_u64 != 0 {
-                return None;
-            }
-            let hd = (head_dim_bits / bits_u64) as u32;
-            nkv_heads.push(nkv);
-            head_dim.push(hd);
+        for layer_idx in 0..num_layers {
+            let layer_cfg = &weights.layers[layer_idx];
+            nkv_heads.push(layer_cfg.num_kv_heads as u32);
+            head_dim.push(layer_cfg.head_dim as u32);
         }
 
         Some(Self {

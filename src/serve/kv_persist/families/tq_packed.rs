@@ -406,9 +406,29 @@ impl TqPackedV2Header {
         total_bits.div_ceil(8)
     }
 
-    /// Number of bytes the F32 norms stream occupies (4 × nkv × ntok).
+    /// Norms-per-position derived from `head_dim`.  Per the runtime
+    /// allocator at `forward_mlx.rs:1289+` and `forward_mlx.rs:1705+`,
+    /// `norms_per_pos = (head_dim / 256).max(1)` — i.e. 1 for
+    /// `head_dim <= 256` (sliding layers in Gemma 4) and 2 for
+    /// `head_dim = 512` (global layers).  Exposed as a method (not a
+    /// header field) so the v2 wire format stays at codec_version=2;
+    /// the value is a deterministic function of `head_dim` so callers
+    /// always agree.
+    pub fn norms_per_pos(&self) -> usize {
+        ((self.head_dim as usize) / 256).max(1)
+    }
+
+    /// Number of bytes the F32 norms stream occupies
+    /// (`4 × nkv × ntok × norms_per_pos`).  At sliding layers
+    /// (head_dim ≤ 256) `norms_per_pos = 1` and the formula reduces
+    /// to the prior `4 × nkv × ntok`; at global layers
+    /// (head_dim = 512) `norms_per_pos = 2` and the buffer holds two
+    /// per-block norms per (head, position).
     pub fn norms_bytes_len(&self) -> usize {
-        (self.n_kv_heads as usize) * (self.n_tokens as usize) * 4
+        (self.n_kv_heads as usize)
+            * (self.n_tokens as usize)
+            * self.norms_per_pos()
+            * 4
     }
 
     /// Total payload byte length (header + indices + norms).
@@ -627,10 +647,16 @@ pub fn capture_tq_v2_payload_from_buffers(
     if packed_bytes.len() != expected_packed {
         return Err(SpillErrorKind::CodecErr);
     }
-    // norms: nkv × cap × 4 (F32 LE).
+    // **B-tq.7**: norms_per_pos = (head_dim / 256).max(1).  D=256
+    // sliding layers have 1 norm per position; D=512 global layers
+    // have 2.  norms layout = `[nkv, capacity, norms_per_pos]` F32.
+    let norms_per_pos = ((head_dim as usize) / 256).max(1);
+    let norms_stride = norms_per_pos * 4; // F32 = 4 bytes per norm value
+
+    // norms: nkv × cap × norms_per_pos × 4 (F32 LE).
     let expected_norms = nkv_us
         .checked_mul(cap_us)
-        .and_then(|v| v.checked_mul(4))
+        .and_then(|v| v.checked_mul(norms_stride))
         .ok_or(SpillErrorKind::CodecErr)?;
     if norms_bytes_le.len() != expected_norms {
         return Err(SpillErrorKind::CodecErr);
@@ -645,12 +671,13 @@ pub fn capture_tq_v2_payload_from_buffers(
         idx.extend_from_slice(&packed_bytes[row_start..row_end]);
     }
 
-    // Extract norms: [head, range.start..range.end] in F32 LE bytes.
-    let mut norms = Vec::with_capacity(nkv_us * n_tokens * 4);
+    // Extract norms: [head, range.start..range.end, 0..norms_per_pos]
+    // in F32 LE bytes.  Stride per (head, pos) is `norms_stride` bytes.
+    let mut norms = Vec::with_capacity(nkv_us * n_tokens * norms_stride);
     for h in 0..nkv_us {
-        let head_base = h * cap_us * 4;
-        let row_start = head_base + (range.start as usize) * 4;
-        let row_end = head_base + (range.end as usize) * 4;
+        let head_base = h * cap_us * norms_stride;
+        let row_start = head_base + (range.start as usize) * norms_stride;
+        let row_end = head_base + (range.end as usize) * norms_stride;
         norms.extend_from_slice(&norms_bytes_le[row_start..row_end]);
     }
 
@@ -722,9 +749,13 @@ pub fn restore_tq_v2_payload_into_buffers(
     if packed_bytes_mut.len() != expected_packed {
         return Err(SpillErrorKind::CodecErr);
     }
+    // **B-tq.7**: norms_per_pos derived from head_dim.
+    let norms_per_pos = ((head_dim as usize) / 256).max(1);
+    let norms_stride = norms_per_pos * 4;
+
     let expected_norms = nkv_us
         .checked_mul(cap_us)
-        .and_then(|v| v.checked_mul(4))
+        .and_then(|v| v.checked_mul(norms_stride))
         .ok_or(SpillErrorKind::CodecErr)?;
     if norms_bytes_mut_le.len() != expected_norms {
         return Err(SpillErrorKind::CodecErr);
@@ -732,7 +763,7 @@ pub fn restore_tq_v2_payload_into_buffers(
 
     // Body length sanity (already enforced by unpack but cheap).
     let expected_idx_len = nkv_us * n_tokens * hd_packed;
-    let expected_norms_len = nkv_us * n_tokens * 4;
+    let expected_norms_len = nkv_us * n_tokens * norms_stride;
     if idx.len() != expected_idx_len || norms.len() != expected_norms_len {
         return Err(SpillErrorKind::CodecErr);
     }
@@ -747,13 +778,14 @@ pub fn restore_tq_v2_payload_into_buffers(
         packed_bytes_mut[row_start..row_end].copy_from_slice(&idx[src_off..src_end]);
     }
 
-    // Write norms: [head, range.start..range.end] (F32 LE bytes).
+    // Write norms: [head, range.start..range.end, 0..norms_per_pos]
+    // (F32 LE bytes) with stride = norms_stride per (head, pos).
     for h in 0..nkv_us {
-        let head_base = h * cap_us * 4;
-        let row_start = head_base + (range.start as usize) * 4;
-        let row_end = head_base + (range.end as usize) * 4;
-        let src_off = h * n_tokens * 4;
-        let src_end = src_off + n_tokens * 4;
+        let head_base = h * cap_us * norms_stride;
+        let row_start = head_base + (range.start as usize) * norms_stride;
+        let row_end = head_base + (range.end as usize) * norms_stride;
+        let src_off = h * n_tokens * norms_stride;
+        let src_end = src_off + n_tokens * norms_stride;
         norms_bytes_mut_le[row_start..row_end].copy_from_slice(&norms[src_off..src_end]);
     }
 

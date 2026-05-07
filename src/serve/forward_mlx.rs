@@ -4699,63 +4699,74 @@ impl MlxModelWeights {
         use crate::serve::kv_persist::families::tq_packed;
         use crate::serve::multi_model::SpillErrorKind;
 
-        let cache = self.kv_caches.get(layer_rank).ok_or(SpillErrorKind::CodecErr)?;
-
-        // **B-tq.4 iter-5 fix** — gate snapshot on live state.  The
-        // spiller's `pre_evict` loop iterates `[0..align), [align..2*align), ...`
-        // up to `MAX_PER_LAYER_TOKENS=32768`, breaking on the first
-        // `None` return (signals end-of-live-state for this layer).
-        // Without this gate, snapshot ALWAYS returned Some(zero-padded
-        // bytes) for ranges beyond `seq_len`, causing the loop to run
-        // for ALL 128 ranges × 30 layers = 3840 snapshot calls per
-        // eviction.  Most of those write zero-padded "phantom" blocks
-        // that all hash to the same value → pile up in the writer
-        // queue → some blocks lose to back-pressure → cache_dir ends
-        // up with only 2 entries on a 1127-token prompt instead of
-        // the expected ~120-150.  Worse: warm restore reads "phantom"
-        // blocks instead of live state.
+        // **B-tq.7** — at bits >= 5 the runtime stores K/V in
+        // `leg_hb_encoded[layer_rank]` (1 byte per coord, shape
+        // `[nkv, capacity, head_dim]`); at bits == 4 it stores in
+        // `kv_caches[layer_rank].k_packed` (nibble-packed, shape
+        // `[nkv, capacity, head_dim/2]`).  The active SDPA reads
+        // from the matching buffer; snapshot must do the same.
         //
-        // Fix: return CodecErr (which the spill's wrapping
-        // `snapshot_via_engine` converts to None via `.ok()?`) when
-        // `range.start >= cache.seq_len` — signals the spiller that
-        // live state is exhausted for this layer.
-        if (range.start as usize) >= cache.seq_len {
+        // Branch up-front so the seq_len gate, shape derivation,
+        // and byte reads all use the same buffer.
+        let use_hb = bits_per_coord.0 >= 5;
+
+        let (k_packed_bytes, k_norms_f32, v_packed_bytes, v_norms_f32, capacity_runtime, hd_packed_runtime, n_kv_heads_runtime, seq_len_live):
+            (&[u8], &[f32], &[u8], &[f32], usize, usize, usize, usize) = if use_hb {
+            let hb = self
+                .leg_hb_encoded
+                .as_ref()
+                .ok_or(SpillErrorKind::CodecErr)?;
+            let lay = hb.get(layer_rank).ok_or(SpillErrorKind::CodecErr)?;
+            let cache = self
+                .kv_caches
+                .get(layer_rank)
+                .ok_or(SpillErrorKind::CodecErr)?;
+            // HB shares the kv_caches' seq_len bookkeeping (same
+            // forward_decode increments both); read from kv_caches.
+            (
+                lay.k_packed.as_slice::<u8>().map_err(|_| SpillErrorKind::IoErr)?,
+                lay.k_norms.as_slice::<f32>().map_err(|_| SpillErrorKind::IoErr)?,
+                lay.v_packed.as_slice::<u8>().map_err(|_| SpillErrorKind::IoErr)?,
+                lay.v_norms.as_slice::<f32>().map_err(|_| SpillErrorKind::IoErr)?,
+                lay.capacity,
+                lay.k_packed.shape().get(2).copied().unwrap_or(0),
+                lay.k_packed.shape().first().copied().unwrap_or(0),
+                cache.seq_len,
+            )
+        } else {
+            let cache = self
+                .kv_caches
+                .get(layer_rank)
+                .ok_or(SpillErrorKind::CodecErr)?;
+            (
+                cache.k_packed.as_slice::<u8>().map_err(|_| SpillErrorKind::IoErr)?,
+                cache.k_norms.as_slice::<f32>().map_err(|_| SpillErrorKind::IoErr)?,
+                cache.v_packed.as_slice::<u8>().map_err(|_| SpillErrorKind::IoErr)?,
+                cache.v_norms.as_slice::<f32>().map_err(|_| SpillErrorKind::IoErr)?,
+                cache.capacity,
+                cache.k_packed.shape().get(2).copied().unwrap_or(0),
+                cache.k_packed.shape().first().copied().unwrap_or(0),
+                cache.seq_len,
+            )
+        };
+
+        // Gate snapshot on live state (B-tq.4 iter-5 fix; same logic
+        // for both buffer paths).
+        if (range.start as usize) >= seq_len_live {
             return Err(SpillErrorKind::CodecErr);
         }
 
-        let n_kv_heads = (cache.k_packed.shape().first().copied().unwrap_or(0)) as u32;
-        let capacity = cache.capacity as u32;
-        // head_dim derives from the runtime packed-buffer row stride:
-        // packed shape is `[nkv, capacity, head_dim_packed]` U8 where
-        // `head_dim_packed = head_dim × bits / 8`.  Reverse the formula.
-        let hd_packed_runtime = cache
-            .k_packed
-            .shape()
-            .get(2)
-            .copied()
-            .ok_or(SpillErrorKind::CodecErr)?;
+        let n_kv_heads = n_kv_heads_runtime as u32;
+        let capacity = capacity_runtime as u32;
+        // head_dim derives from the runtime packed-buffer row stride.
+        // 4-bit (kv_caches): `hd_packed = head_dim/2`, hd = hd_packed*8/4 = hd_packed*2.
+        // 8-bit (leg_hb_encoded): `hd_packed = head_dim`, hd = hd_packed*8/8 = hd_packed.
+        // Generalised: `hd = hd_packed * 8 / bits`.
         let head_dim_bits = (hd_packed_runtime as u64) * 8;
         if head_dim_bits % (bits_per_coord.0 as u64) != 0 {
             return Err(SpillErrorKind::CodecErr);
         }
         let head_dim = (head_dim_bits / (bits_per_coord.0 as u64)) as u32;
-
-        let k_packed_bytes: &[u8] = cache
-            .k_packed
-            .as_slice::<u8>()
-            .map_err(|_| SpillErrorKind::IoErr)?;
-        let k_norms_f32: &[f32] = cache
-            .k_norms
-            .as_slice::<f32>()
-            .map_err(|_| SpillErrorKind::IoErr)?;
-        let v_packed_bytes: &[u8] = cache
-            .v_packed
-            .as_slice::<u8>()
-            .map_err(|_| SpillErrorKind::IoErr)?;
-        let v_norms_f32: &[f32] = cache
-            .v_norms
-            .as_slice::<f32>()
-            .map_err(|_| SpillErrorKind::IoErr)?;
         // F32 → LE bytes via per-element `to_le_bytes` to avoid an extra
         // dep.  Hot path is amortised — snapshot fires per block, not
         // per token.
@@ -4807,42 +4818,121 @@ impl MlxModelWeights {
         use crate::serve::kv_persist::families::tq_packed;
         use crate::serve::multi_model::SpillErrorKind;
 
-        let cache = self
-            .kv_caches
-            .get_mut(layer_rank)
-            .ok_or(SpillErrorKind::CodecErr)?;
-        let n_kv_heads = (cache.k_packed.shape().first().copied().unwrap_or(0)) as u32;
-        let capacity = cache.capacity as u32;
-        let hd_packed_runtime = cache
-            .k_packed
-            .shape()
-            .get(2)
-            .copied()
-            .ok_or(SpillErrorKind::CodecErr)?;
-        let head_dim_bits = (hd_packed_runtime as u64) * 8;
-        if head_dim_bits % (bits_per_coord.0 as u64) != 0 {
-            return Err(SpillErrorKind::CodecErr);
-        }
-        let head_dim = (head_dim_bits / (bits_per_coord.0 as u64)) as u32;
+        // **B-tq.7** — branch on bits like the snapshot path does.
+        // Restore writes back to `leg_hb_encoded[layer_rank]` at
+        // bits >= 5; otherwise to `kv_caches[layer_rank]`.
+        let use_hb = bits_per_coord.0 >= 5;
 
-        // Two passes: K then V.  We need separate borrows of `cache`
-        // because each call needs &mut to a *different* buffer pair.
-        // Borrow checker forces a sequence rather than parallel.
+        // Borrow the layer's K/V buffers from the appropriate field.
+        // Branch separately for K then V to keep borrow lifetimes
+        // tight (each `as_mut_slice` borrows the buffer).
+        let (capacity, n_kv_heads, head_dim) = if use_hb {
+            let hb = self
+                .leg_hb_encoded
+                .as_ref()
+                .ok_or(SpillErrorKind::CodecErr)?;
+            let lay = hb.get(layer_rank).ok_or(SpillErrorKind::CodecErr)?;
+            let cap = lay.capacity as u32;
+            let nkv = lay.k_packed.shape().first().copied().unwrap_or(0) as u32;
+            let hd_packed = lay.k_packed.shape().get(2).copied().unwrap_or(0);
+            let head_dim_bits = (hd_packed as u64) * 8;
+            if head_dim_bits % (bits_per_coord.0 as u64) != 0 {
+                return Err(SpillErrorKind::CodecErr);
+            }
+            let hd = (head_dim_bits / (bits_per_coord.0 as u64)) as u32;
+            (cap, nkv, hd)
+        } else {
+            let cache = self
+                .kv_caches
+                .get(layer_rank)
+                .ok_or(SpillErrorKind::CodecErr)?;
+            let cap = cache.capacity as u32;
+            let nkv = cache.k_packed.shape().first().copied().unwrap_or(0) as u32;
+            let hd_packed = cache.k_packed.shape().get(2).copied().unwrap_or(0);
+            let head_dim_bits = (hd_packed as u64) * 8;
+            if head_dim_bits % (bits_per_coord.0 as u64) != 0 {
+                return Err(SpillErrorKind::CodecErr);
+            }
+            let hd = (head_dim_bits / (bits_per_coord.0 as u64)) as u32;
+            (cap, nkv, hd)
+        };
+
+        // Two passes (K, V) × two operations (packed indices, F32 norms),
+        // each requiring a separate `&mut` borrow.  Inner closure
+        // `with_layer` factors out the source-of-truth selection.
+
+        macro_rules! borrow_k_packed {
+            () => {{
+                if use_hb {
+                    self.leg_hb_encoded
+                        .as_mut()
+                        .ok_or(SpillErrorKind::CodecErr)?[layer_rank]
+                        .k_packed
+                        .as_mut_slice::<u8>()
+                        .map_err(|_| SpillErrorKind::IoErr)?
+                } else {
+                    self.kv_caches[layer_rank]
+                        .k_packed
+                        .as_mut_slice::<u8>()
+                        .map_err(|_| SpillErrorKind::IoErr)?
+                }
+            }};
+        }
+        macro_rules! borrow_k_norms {
+            () => {{
+                if use_hb {
+                    self.leg_hb_encoded
+                        .as_mut()
+                        .ok_or(SpillErrorKind::CodecErr)?[layer_rank]
+                        .k_norms
+                        .as_mut_slice::<f32>()
+                        .map_err(|_| SpillErrorKind::IoErr)?
+                } else {
+                    self.kv_caches[layer_rank]
+                        .k_norms
+                        .as_mut_slice::<f32>()
+                        .map_err(|_| SpillErrorKind::IoErr)?
+                }
+            }};
+        }
+        macro_rules! borrow_v_packed {
+            () => {{
+                if use_hb {
+                    self.leg_hb_encoded
+                        .as_mut()
+                        .ok_or(SpillErrorKind::CodecErr)?[layer_rank]
+                        .v_packed
+                        .as_mut_slice::<u8>()
+                        .map_err(|_| SpillErrorKind::IoErr)?
+                } else {
+                    self.kv_caches[layer_rank]
+                        .v_packed
+                        .as_mut_slice::<u8>()
+                        .map_err(|_| SpillErrorKind::IoErr)?
+                }
+            }};
+        }
+        macro_rules! borrow_v_norms {
+            () => {{
+                if use_hb {
+                    self.leg_hb_encoded
+                        .as_mut()
+                        .ok_or(SpillErrorKind::CodecErr)?[layer_rank]
+                        .v_norms
+                        .as_mut_slice::<f32>()
+                        .map_err(|_| SpillErrorKind::IoErr)?
+                } else {
+                    self.kv_caches[layer_rank]
+                        .v_norms
+                        .as_mut_slice::<f32>()
+                        .map_err(|_| SpillErrorKind::IoErr)?
+                }
+            }};
+        }
 
         // --- K ---
         {
-            let k_packed_mut: &mut [u8] = cache
-                .k_packed
-                .as_mut_slice::<u8>()
-                .map_err(|_| SpillErrorKind::IoErr)?;
-            // For norms we have to do the F32 ↔ u8 reinterpret as a
-            // separate scope because `as_mut_slice<T>` borrows the
-            // buffer; copy F32 LE bytes into a Vec then back via a
-            // typed write avoids holding two &mut on the same buffer
-            // simultaneously.
-            //
-            // Safer path: use bytemuck on a fresh &mut [f32] borrow
-            // taken AFTER the packed-buffer borrow drops.
+            let k_packed_mut: &mut [u8] = borrow_k_packed!();
             let _ = restore_packed_only(
                 k_packed_mut,
                 capacity,
@@ -4854,14 +4944,12 @@ impl MlxModelWeights {
             )?;
         }
         {
-            let k_norms_f32: &mut [f32] = cache
-                .k_norms
-                .as_mut_slice::<f32>()
-                .map_err(|_| SpillErrorKind::IoErr)?;
+            let k_norms_f32: &mut [f32] = borrow_k_norms!();
             let _ = restore_norms_only_f32(
                 k_norms_f32,
                 capacity,
                 n_kv_heads,
+                head_dim,
                 range.clone(),
                 k_payload,
             )?;
@@ -4869,10 +4957,7 @@ impl MlxModelWeights {
 
         // --- V ---
         {
-            let v_packed_mut: &mut [u8] = cache
-                .v_packed
-                .as_mut_slice::<u8>()
-                .map_err(|_| SpillErrorKind::IoErr)?;
+            let v_packed_mut: &mut [u8] = borrow_v_packed!();
             let _ = restore_packed_only(
                 v_packed_mut,
                 capacity,
@@ -4884,14 +4969,12 @@ impl MlxModelWeights {
             )?;
         }
         {
-            let v_norms_f32: &mut [f32] = cache
-                .v_norms
-                .as_mut_slice::<f32>()
-                .map_err(|_| SpillErrorKind::IoErr)?;
+            let v_norms_f32: &mut [f32] = borrow_v_norms!();
             let _ = restore_norms_only_f32(
                 v_norms_f32,
                 capacity,
                 n_kv_heads,
+                head_dim,
                 range.clone(),
                 v_payload,
             )?;
@@ -4925,6 +5008,26 @@ impl MlxModelWeights {
             let nkv_us = n_kv_heads as usize;
             let cap_us = capacity as usize;
             let n_tokens = (range.end - range.start) as usize;
+            // **B-tq.7**: bounds-check write target.  Global layers
+            // in Gemma 4 use dynamic capacity sizing — at server-B
+            // post_admit time, the layer's buffer may be too small to
+            // hold the snapshot's range (e.g. global layer cap=2 at
+            // warmup vs snapshot range 0..256).  Writing OOB would
+            // panic the worker thread.  Return CodecErr instead so
+            // the spiller bails on this layer cleanly; the
+            // prompt_cache replay path (R-P5) still gives the warm
+            // benefit since it short-circuits prefill before the
+            // cache needs to grow.
+            let expected_buf_len = nkv_us
+                .checked_mul(cap_us)
+                .and_then(|v| v.checked_mul(hd_packed))
+                .ok_or(SpillErrorKind::CodecErr)?;
+            if packed_bytes_mut.len() != expected_buf_len {
+                return Err(SpillErrorKind::CodecErr);
+            }
+            if (range.end as usize) > cap_us {
+                return Err(SpillErrorKind::CodecErr);
+            }
             for h in 0..nkv_us {
                 let head_base = h * cap_us * hd_packed;
                 let row_start = head_base + (range.start as usize) * hd_packed;
@@ -4939,32 +5042,54 @@ impl MlxModelWeights {
             norms_f32_mut: &mut [f32],
             capacity: u32,
             n_kv_heads: u32,
+            head_dim: u32,
             range: std::ops::Range<u32>,
             payload: &[u8],
         ) -> Result<(), SpillErrorKind> {
             let (header, _idx, norms) =
                 tq_packed::unpack_tq_v2_payload(payload).map_err(|_| SpillErrorKind::CodecErr)?;
             if header.n_kv_heads != n_kv_heads
+                || header.head_dim != head_dim
                 || header.n_tokens != (range.end - range.start)
             {
                 return Err(SpillErrorKind::CodecErr);
             }
+            // **B-tq.7**: norms_per_pos derived from head_dim.  D=256
+            // sliding layers → 1 norm/pos; D=512 global layers → 2.
+            let norms_per_pos = ((head_dim as usize) / 256).max(1);
             let nkv_us = n_kv_heads as usize;
             let cap_us = capacity as usize;
             let n_tokens = (range.end - range.start) as usize;
+            // **B-tq.7**: bounds-check write target (matches
+            // restore_packed_only).
+            let expected_norms_len = nkv_us
+                .checked_mul(cap_us)
+                .and_then(|v| v.checked_mul(norms_per_pos))
+                .ok_or(SpillErrorKind::CodecErr)?;
+            if norms_f32_mut.len() != expected_norms_len {
+                return Err(SpillErrorKind::CodecErr);
+            }
+            if (range.end as usize) > cap_us {
+                return Err(SpillErrorKind::CodecErr);
+            }
             // norms F32 LE -> per-element decode into typed slice.
+            // Layout: dst is `[nkv, capacity, norms_per_pos]` flat F32;
+            // src is `[nkv, n_tokens, norms_per_pos]` packed F32 LE.
             for h in 0..nkv_us {
-                let head_base = h * cap_us;
+                let head_base = h * cap_us * norms_per_pos;
                 for t in 0..n_tokens {
-                    let dst_idx = head_base + (range.start as usize) + t;
-                    let src_off = (h * n_tokens + t) * 4;
-                    let bytes = [
-                        norms[src_off],
-                        norms[src_off + 1],
-                        norms[src_off + 2],
-                        norms[src_off + 3],
-                    ];
-                    norms_f32_mut[dst_idx] = f32::from_le_bytes(bytes);
+                    for k in 0..norms_per_pos {
+                        let dst_idx = head_base + (range.start as usize + t) * norms_per_pos + k;
+                        let src_off =
+                            ((h * n_tokens + t) * norms_per_pos + k) * 4;
+                        let bytes = [
+                            norms[src_off],
+                            norms[src_off + 1],
+                            norms[src_off + 2],
+                            norms[src_off + 3],
+                        ];
+                        norms_f32_mut[dst_idx] = f32::from_le_bytes(bytes);
+                    }
                 }
             }
             Ok(())
