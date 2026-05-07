@@ -481,7 +481,36 @@ scenario          ∈ {(a) cold_resume, (b) hot_swap_evict,
 
 * **iter-3** (commit `69b3bc2`, ~340 LOC) — integration test harness `tests/kv_persist_tq_packed_roundtrip.rs`.  Three layers: always-on smokes verify gate-resolution + binary path; env-gated E2E test (`HF2Q_KV_PERSIST_TQ_E2E=1` + `HF2Q_KV_PERSIST_E2E_MODEL_PATH=PATH`) panics on missing path (no silent skip); operator runbook documents the exact curl sequence to validate R-C1 byte-identity manually on a real Gemma 4 GGUF.  Live automation deferred to B-tq.5 (driver extraction).
 
-**Phase B-tq.5 (live E2E driver extraction) — NEXT.**  The full automated round-trip (spawn → POST → drain → restart → replay → assert R-C1) requires the `phase_d_driver` subprocess driver currently inline at `kv_persist_gemma4_roundtrip.rs:411-1080+` (~700 LOC, private mod).  Rust integration tests can't import across binaries; B-tq.5 extracts the driver to `tests/common/serve_driver.rs` (or equivalent shared-mod pattern) so both `kv_persist_gemma4_roundtrip` and `kv_persist_tq_packed_roundtrip` can drive live subprocess flows.  This refactor touches a stable test binary; lifting it is iter-scoped work that benefits multiple tests, hence its own iter rather than rolled into B-tq.4.
+**Phase B-tq.5 Status: GREEN (2026-05-06)** — driver extraction LANDED at commit `539e6f7`.  Two pieces shipped:
+
+* **Shared driver** at `tests/common/serve_driver.rs` (652 LOC) — generic by design (`extra_env: &[(&str, &str)]` arg).  Carries `ServerGuard` + `spawn_hf2q_serve_with_kv_persist` + `wait_for_readyz` + `trigger_graceful_shutdown` + `wait_for_graceful_exit` + `fetch_canonical_model_id` + `decode_full_text` + `force_eviction_via_symlink`.
+* **Wrapper consolidation** — `tests/kv_persist_gemma4_roundtrip.rs::mod phase_d_driver` is now a thin `pub use crate::common::serve_driver::*;` re-export plus the gemma4-specific peer-arm helpers (`run_llama_completion_peer` + `resolve_llama_completion_bin`).  All 65 existing `phase_d_driver::*` call sites resolve via re-export; 9 `spawn_hf2q_serve_with_kv_persist` call sites updated to pass `&[("HF2Q_USE_DENSE", "1")]` as the new `extra_env` argument.  33/33 gemma4 tests PASS post-refactor; full hf2q suite 2866/0/3.
+
+**B-tq.4 iter-3 acceptance test now AUTOMATED.**  `kv_persist_tq_packed_b_tq_4_e2e` replaced its runbook-deferred body with a real subprocess round-trip via the shared driver:
+
+1. Spawn server A with `HF2Q_TQ_KV=1` on port 52341.
+2. `wait_for_readyz`; assert stderr_tail carries `factory=TqPackedSpillFactory`.
+3. Fetch canonical model id; POST chat completion (round 1); capture decoded text.
+4. POST `/shutdown`; wait for graceful exit.
+5. Verify cache_dir has block files (proves spiller fired).
+6. Spawn server B against the SAME cache_dir; `wait_for_readyz`; re-assert factory.
+7. POST the SAME prompt; capture decoded text.
+8. R-C1 ASSERT: `capture_a.text == capture_b.text` byte-identical.
+
+Test stays default-off (`HF2Q_KV_PERSIST_TQ_E2E=1` + `HF2Q_KV_PERSIST_E2E_MODEL_PATH=PATH` operator-supplied).  Without the gate, short-circuits cleanly.  Live measurement is operator-driven post-merge work.
+
+---
+
+**Phase B-tq.4 final state: GREEN (no longer GREEN-substrate).**  The harness drives the full live flow when env-gated.  Substrate (iter-1) + cmd_serve registration (iter-2) + integration test harness (iter-3) + driver extraction (B-tq.5) shipped across 4 commits this loop iteration:
+
+| commit | iter | scope | LOC |
+|---|---|---|---|
+| `62bb8b5` | iter-1 | substrate: descriptor + engine_arc + Engine worker bridge + bundle codec + factory + 12 unit tests | ~1,100 |
+| `b346425` | iter-2 | cmd_serve single-mode factory registration | ~80 |
+| `69b3bc2` | iter-3 | integration test harness (default-off) | ~340 |
+| `539e6f7` | B-tq.5 | shared driver extraction + iter-3 live R-C1 wire-up | ~+925 / ~-763 (net) |
+
+Total cumulative test count: **2866 unit (in-binary) + 19 integration (kv_persist_tq_packed_roundtrip)**.  Live R-C1 measurement on a real Gemma 4 GGUF is operator-driven; harness is fully automated when env-gated.
 
 **Why earlier B-tq.3 wording was wrong.**  The iter immediately preceding this one stated B-tq.4 was "gated on ADR-007 Path C runtime correctness work clearance."  Path C closed substantively on 2026-05-05 at 10 of 11 phases (`docs/adr007-pathC/PATHC_CLOSURE.md`).  The codec-freeze contract (Path C F-7) is LANDED — that's the contract B-tq.4 codes against.  Path C F-0.2 NRMSE 0.000247 at Gemma 4 26B production shape proves codec correctness.  The remaining open Path C item is F-5 (MMLU + LongBench) — discretionary downstream-consumer-driven validation, NOT a B-tq.4 prerequisite.
 
