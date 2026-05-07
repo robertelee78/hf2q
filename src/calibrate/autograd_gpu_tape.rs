@@ -48,6 +48,7 @@ use mlx_native::{
         dispatch_rms_norm_compute_rms_inv,
     },
     ops::row_sum::{dispatch_row_sum_backward_f32, dispatch_row_sum_f32},
+    ops::silu_backward::{dispatch_silu_backward_f32, dispatch_silu_f32},
     ops::slice_concat_2d::{dispatch_copy_2d_cols_into_f32, dispatch_slice_2d_cols_f32},
     ops::softmax::dispatch_softmax,
     ops::softmax_backward::dispatch_softmax_backward,
@@ -103,6 +104,10 @@ enum OpKind {
         rows: usize,
         cols: usize,
     },
+    /// Elementwise SiLU (swish): `silu(x) = x · sigmoid(x)`.
+    /// Backward via mlx-native's `dispatch_silu_backward_f32`
+    /// (uses the FORWARD INPUT, not the forward output).
+    SiLU { input_idx: usize },
     /// Slice a column range out of a 2D row-major tensor:
     /// `Y[r, c] = X[r, start_col + c]`.  Forward via mlx-native's
     /// `dispatch_slice_2d_cols_f32`.  Backward = scatter into a
@@ -196,6 +201,27 @@ impl GpuTape {
 
     fn node_count(&self) -> usize {
         self.0.nodes.borrow().len()
+    }
+
+    /// Clear all tape nodes, dropping their `MlxBuffer` Arcs so Metal
+    /// can reclaim the GPU memory pages.  Keeps the underlying
+    /// `MlxDevice` and `KernelRegistry` warm — designed for the
+    /// per-batch streaming pattern where each batch reuses the same
+    /// device but starts with a fresh forward+backward graph.
+    ///
+    /// **CALLER MUST NOT HOLD ANY `GpuTensor` from BEFORE the reset.**
+    /// Reset invalidates all node indices; previously-held `GpuTensor`s
+    /// will silently reference invalid (or wrong) nodes after reset
+    /// (no run-time check).  The streaming pattern naturally satisfies
+    /// this: per-iteration `GpuTensor`s are local + drop at end of
+    /// iteration before reset is called.
+    ///
+    /// Used by ADR-020 iter-10d streaming sensitivity estimator
+    /// (eliminates the per-batch `MlxDevice::new()` churn that
+    /// previously caused intermittent Metal residency-set contention
+    /// flakes — single shared device across all batches).
+    pub fn reset(&self) {
+        self.0.nodes.borrow_mut().clear();
     }
 
     fn with_node<R>(&self, idx: usize, f: impl FnOnce(&GpuNode) -> R) -> R {
@@ -428,7 +454,8 @@ pub fn backward(
             | OpKind::Log { input_idx }
             | OpKind::RowSum { input_idx, .. }
             | OpKind::Transpose2d { input_idx, .. }
-            | OpKind::Slice2dCols { input_idx, .. } => {
+            | OpKind::Slice2dCols { input_idx, .. }
+            | OpKind::SiLU { input_idx } => {
                 accumulate(&mut grads, input_idx, &parent_grads[0], tape)?;
             }
             OpKind::Concat2Cols {
@@ -813,6 +840,39 @@ fn backward_dispatch(
                 .commit_and_wait()
                 .map_err(|e| anyhow!("backward softmax: commit_and_wait: {e}"))?;
 
+            Ok((op, vec![dx_buf]))
+        }
+        OpKind::SiLU { input_idx } => {
+            // dx = dy · silu'(x), where x is the FORWARD INPUT.
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+            let x_buf = tape.with_node(input_idx, |n| n.value.clone());
+            let n = x_buf.element_count();
+            let dx_buf = device
+                .alloc_buffer(n * 4, DType::F32, x_buf.shape().to_vec())
+                .map_err(|e| anyhow!("backward silu: alloc dx: {e}"))?;
+            let mut params_buf = device
+                .alloc_buffer(4, DType::F32, vec![1])
+                .map_err(|e| anyhow!("backward silu: alloc params: {e}"))?;
+            params_buf
+                .as_mut_slice::<u32>()
+                .map_err(|e| anyhow!("backward silu: params write: {e}"))?[0] = n as u32;
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward silu: encoder: {e}"))?;
+            dispatch_silu_backward_f32(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                &x_buf,
+                out_grad,
+                &dx_buf,
+                &params_buf,
+            )
+            .map_err(|e| anyhow!("backward silu: dispatch: {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward silu: commit_and_wait: {e}"))?;
             Ok((op, vec![dx_buf]))
         }
         OpKind::Slice2dCols {
@@ -1209,6 +1269,52 @@ pub fn softmax(t: &GpuTensor) -> Result<GpuTensor> {
         tape: tape.clone(),
         node_idx,
         shape: vec![rows, cols],
+    })
+}
+
+/// Elementwise SiLU (swish): `Y = silu(X) = X · sigmoid(X)`.
+/// Same shape as input.  Backward via mlx-native's
+/// `dispatch_silu_backward_f32` using the FORWARD INPUT.
+pub fn silu(t: &GpuTensor) -> Result<GpuTensor> {
+    let tape = &t.tape;
+    let device = tape.device();
+    let n: usize = t.shape.iter().product();
+    if n == 0 {
+        return Err(anyhow!("silu: input must have at least one element"));
+    }
+    let in_buf = tape.with_node(t.node_idx, |n| n.value.clone());
+    let out_buf = device
+        .alloc_buffer(n * 4, DType::F32, t.shape.clone())
+        .map_err(|e| anyhow!("silu: alloc out: {e}"))?;
+    let mut params_buf = device
+        .alloc_buffer(4, DType::F32, vec![1])
+        .map_err(|e| anyhow!("silu: alloc params: {e}"))?;
+    params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("silu: params write: {e}"))?[0] = n as u32;
+    let mut registry = tape.0.registry.borrow_mut();
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("silu: encoder: {e}"))?;
+    dispatch_silu_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &in_buf,
+        &out_buf,
+        &params_buf,
+    )
+    .map_err(|e| anyhow!("silu: dispatch: {e}"))?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("silu: commit_and_wait: {e}"))?;
+    drop(registry);
+    let input_idx = t.node_idx;
+    let node_idx = tape.push_node(OpKind::SiLU { input_idx }, out_buf, t.shape.clone());
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: t.shape.clone(),
     })
 }
 
@@ -2586,6 +2692,56 @@ mod tests {
         match rms_norm(&bad_x, &w, 1e-6) {
             Err(e) => assert!(format!("{e}").contains("input must be 2-D")),
             Ok(_) => panic!("expected input-shape error"),
+        }
+    }
+
+    #[test]
+    fn gpu_tape_silu_forward_backward_parity() {
+        // SiLU forward + backward through the tape; verify against
+        // the analytical CPU oracle.
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let n = 64usize;
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 - 32.0) * 0.1).collect();
+        let xt = GpuTensor::from_vec(&tape, &x, vec![n]).unwrap();
+        let yt = silu(&xt).unwrap();
+        let y_gpu: Vec<f32> = yt.to_vec().unwrap();
+        let y_cpu: Vec<f32> = x.iter().map(|&v| v / (1.0 + (-v).exp())).collect();
+        for (i, (g, c)) in y_gpu.iter().zip(y_cpu.iter()).enumerate() {
+            let diff = (g - c).abs();
+            let scale = g.abs().max(c.abs()).max(1.0);
+            assert!(
+                diff <= 1e-7 || diff / scale <= 1e-6,
+                "silu forward i={i}: gpu={g} cpu={c}"
+            );
+        }
+
+        // Backward — dy[i] = sin(i) for variety.
+        let dy_vals: Vec<f32> = (0..n).map(|i| (i as f32 * 0.13).sin()).collect();
+        let mut dy_buf = tape.device().alloc_buffer(n * 4, DType::F32, vec![n]).unwrap();
+        dy_buf
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&dy_vals);
+        let grads = backward(&yt, dy_buf).unwrap();
+        let dx = grads[xt.node_idx()].as_ref().unwrap();
+        let dx_gpu: Vec<f32> = dx.as_slice::<f32>().unwrap().to_vec();
+        let dx_cpu: Vec<f32> = x
+            .iter()
+            .zip(dy_vals.iter())
+            .map(|(&xv, &dyv)| {
+                let s = 1.0 / (1.0 + (-xv).exp());
+                let deriv = s * (1.0 + xv * (1.0 - s));
+                dyv * deriv
+            })
+            .collect();
+        for (i, (g, c)) in dx_gpu.iter().zip(dx_cpu.iter()).enumerate() {
+            let diff = (g - c).abs();
+            let scale = g.abs().max(c.abs()).max(1.0);
+            assert!(
+                diff <= 1e-6 || diff / scale <= 1e-5,
+                "silu backward i={i}: gpu={g} cpu={c}"
+            );
         }
     }
 

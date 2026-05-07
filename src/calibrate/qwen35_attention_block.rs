@@ -449,6 +449,17 @@ where
         std::collections::BTreeMap::new();
     let mut n_batches: usize = 0;
 
+    // Single shared device + tape across all batches.  The tape is
+    // RESET (nodes cleared, MlxBuffer Arcs dropped) between batches
+    // — that's the memory-bound mechanism.  Reusing one device
+    // avoids the Metal residency-set contention that would otherwise
+    // flake the streaming-vs-bulk parity test (each `MlxDevice::new`
+    // re-registers a residency set with the system; rapid churn on
+    // macOS produces intermittent corrupted state).
+    let device = mlx_native::MlxDevice::new()
+        .map_err(|e| anyhow!("streaming: device: {e}"))?;
+    let tape = GpuTape::new(device);
+
     for batch_buf in batch_inputs {
         let batch = batch_buf.as_ref();
         if batch.len() != cfg.batch * cfg.hidden {
@@ -460,14 +471,6 @@ where
                 cfg.batch * cfg.hidden
             ));
         }
-
-        // Fresh device + tape per batch — this is the load-bearing
-        // memory bound: when this scope exits the entire tape is
-        // dropped (Drop on GpuTapeInner releases all MlxBuffer Arcs;
-        // Metal reclaims the unified-memory pages).
-        let device = mlx_native::MlxDevice::new()
-            .map_err(|e| anyhow!("streaming batch: device: {e}"))?;
-        let tape = GpuTape::new(device);
 
         let xt = GpuTensor::from_vec(&tape, batch, vec![cfg.batch, cfg.hidden])?;
         let teacher_leaves = AttentionBlockLeaves::from_weights(&tape, cfg, weights)?;
@@ -486,8 +489,11 @@ where
             *scalar_accum.entry(k).or_insert(0.0) += v;
         }
         n_batches += 1;
-        // tape, teacher_leaves, student_leaves, teacher_out, student_out
-        // all drop here — per-batch state reclaimed before next iter.
+        // Drop all per-batch GpuTensors (xt, teacher_leaves, student_leaves,
+        // teacher_out, student_out) by resetting the tape — clears
+        // its nodes vec, dropping the MlxBuffer Arcs.  Metal reclaims
+        // unified-memory pages before next iteration.
+        tape.reset();
     }
 
     if n_batches == 0 {
@@ -671,26 +677,29 @@ mod tests {
         )
         .unwrap();
 
-        // Manual per-batch + average reference.
+        // Manual per-batch + average reference — uses the SAME
+        // device + tape-reset pattern as streaming for apples-to-apples
+        // comparison (avoids per-batch MlxDevice::new flakes).
         let mut manual_accum: std::collections::BTreeMap<String, f64> =
             std::collections::BTreeMap::new();
+        let manual_device = MlxDevice::new().expect("manual device");
+        let manual_tape = GpuTape::new(manual_device);
         for batch in &batches {
-            let device = MlxDevice::new().expect("device per-batch");
-            let tape = GpuTape::new(device);
-            let xt = GpuTensor::from_vec(&tape, batch, vec![cfg.batch, cfg.hidden]).unwrap();
+            let xt = GpuTensor::from_vec(&manual_tape, batch, vec![cfg.batch, cfg.hidden])
+                .unwrap();
             let teacher_leaves =
-                AttentionBlockLeaves::from_weights(&tape, &cfg, &weights).unwrap();
+                AttentionBlockLeaves::from_weights(&manual_tape, &cfg, &weights).unwrap();
             let teacher_out = forward(&cfg, &xt, &teacher_leaves).unwrap();
             let student_leaves = AttentionBlockLeaves::from_weights_qdq(
-                &tape,
+                &manual_tape,
                 &cfg,
                 &weights,
-                |w| qdq_q4_0_gpu(tape.device(), w),
+                |w| qdq_q4_0_gpu(manual_tape.device(), w),
             )
             .unwrap();
             let student_out = forward(&cfg, &xt, &student_leaves).unwrap();
             let per_batch = estimate_attention_block_sensitivities(
-                &tape,
+                &manual_tape,
                 &student_out,
                 &teacher_out,
                 &student_leaves,
@@ -700,6 +709,7 @@ mod tests {
             for (k, v) in per_batch {
                 *manual_accum.entry(k).or_insert(0.0) += v;
             }
+            manual_tape.reset();
         }
         for v in manual_accum.values_mut() {
             *v /= n_batches as f64;
