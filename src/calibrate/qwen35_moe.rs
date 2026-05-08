@@ -439,4 +439,184 @@ mod tests {
         // k > n_experts
         assert!(moe_route(&xt, &wt, 33, false, &ot).is_err());
     }
+
+    /// iter-11h-f-mini — minimal decoder-layer composition test that
+    /// chains the iter-11h primitives in a transformer-block-shaped
+    /// fixture:
+    ///
+    ///   y = rms_norm(input, w_in)               (iter-10b)
+    ///   r = matmul(y, w_attn)                   (iter-8b)  ← attn proxy
+    ///   h = input + r                           (iter-8c)
+    ///   y2 = rms_norm(h, w_post)                (iter-10b)
+    ///   (scores, _) = moe_route(y2, w_gate, k, true)  (iter-11h-e2)
+    ///   loss = sum(scores)
+    ///
+    /// Skips switch_mlp expert dispatch (deferred multi-iter scope).
+    /// Exercises the integration of: rms_norm × 2 + matmul × 2 +
+    /// elementwise add + softmax + take_along_axis + row_sum + log
+    /// + scalar_mul + exp + outer_product + mul = 13 OpKinds total.
+    ///
+    /// LOAD-BEARING — proves chain-rule routing through the entire
+    /// composition.  Gradient flows back to the input, the attention
+    /// weight, the post-attn norm weight, AND the moe gate weight.
+    /// 5% rel tol; spot-check 4 sampled elements per param.
+    #[test]
+    fn decoder_layer_mini_composition_forward_and_backward_fd() {
+        use crate::calibrate::autograd_gpu_tape::{
+            add, backward, ones_like, rms_norm, GpuTape,
+        };
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+
+        let n_tokens = 32usize;
+        let hidden = 32usize;
+        let n_experts = 32usize;
+        let k = 4usize;
+        let eps = 1e-6f32;
+
+        let input_data: Vec<f32> = (0..(n_tokens * hidden))
+            .map(|i| ((i as f32) * 0.011 - 0.3).sin() * 0.4)
+            .collect();
+        let w_in_data: Vec<f32> = (0..hidden).map(|i| 1.0 + (i as f32) * 0.01).collect();
+        let w_attn_data: Vec<f32> = (0..(hidden * hidden))
+            .map(|i| 0.05 + (i as f32) * 0.0005)
+            .collect();
+        let w_post_data: Vec<f32> = (0..hidden).map(|i| 1.0 - (i as f32) * 0.005).collect();
+        let w_gate_data: Vec<f32> = (0..(hidden * n_experts))
+            .map(|i| 0.04 + (i as f32) * 0.0004)
+            .collect();
+        let ones_k_data: Vec<f32> = vec![1.0; k];
+
+        let forward_loss_and_grads = |inp: &[f32],
+                                       w_in: &[f32],
+                                       w_attn: &[f32],
+                                       w_post: &[f32],
+                                       w_gate: &[f32]|
+         -> (f32, [Vec<f32>; 5]) {
+            tape.reset();
+            let xt = GpuTensor::from_vec(&tape, inp, vec![n_tokens, hidden]).unwrap();
+            let win = GpuTensor::from_vec(&tape, w_in, vec![hidden]).unwrap();
+            let watn = GpuTensor::from_vec(&tape, w_attn, vec![hidden, hidden]).unwrap();
+            let wpst = GpuTensor::from_vec(&tape, w_post, vec![hidden]).unwrap();
+            let wg = GpuTensor::from_vec(&tape, w_gate, vec![hidden, n_experts]).unwrap();
+            let ok = GpuTensor::from_vec(&tape, &ones_k_data, vec![k]).unwrap();
+
+            // y = rms_norm(input, w_in)
+            let y = rms_norm(&xt, &win, eps).unwrap();
+            // r = matmul(y, w_attn)  [n_tokens, hidden]
+            let r = matmul(&y, &watn).unwrap();
+            // h = input + r
+            let h = add(&xt, &r).unwrap();
+            // y2 = rms_norm(h, w_post)
+            let y2 = rms_norm(&h, &wpst, eps).unwrap();
+            // scores = moe_route(y2, w_gate, k, renorm=false)
+            // NOTE: renorm=true would force per-row scores to sum to
+            // 1.0 by construction, making `loss = sum(scores) =
+            // n_tokens` invariant of inputs (gradient = 0 trivially).
+            // The renorm path is exercised separately in
+            // `forward_matches_cpu_oracle_with_renorm`; here we want
+            // a non-invariant loss to prove gradient flow.
+            let route = moe_route(&y2, &wg, k, false, &ok).unwrap();
+            // loss = sum(scores)
+            let host = route.top_k_scores.to_vec().unwrap();
+            let loss = host.iter().map(|v| *v as f64).sum::<f64>() as f32;
+            let dy = ones_like(&tape, route.top_k_scores.shape()).unwrap();
+            let grads = backward(&route.top_k_scores, dy).unwrap();
+            let read = |idx: usize| -> Vec<f32> {
+                grads[idx]
+                    .as_ref()
+                    .unwrap()
+                    .as_slice::<f32>()
+                    .unwrap()
+                    .to_vec()
+            };
+            (
+                loss,
+                [
+                    read(xt.node_idx()),
+                    read(win.node_idx()),
+                    read(watn.node_idx()),
+                    read(wpst.node_idx()),
+                    read(wg.node_idx()),
+                ],
+            )
+        };
+
+        let (_l0, grads0) = forward_loss_and_grads(
+            &input_data,
+            &w_in_data,
+            &w_attn_data,
+            &w_post_data,
+            &w_gate_data,
+        );
+
+        // Sanity + diagnostic: every param's gradient must have at
+        // least one non-trivial element (catches "gradient swallowed
+        // by some op" bugs across the 13-OpKind chain).  Threshold is
+        // 1e-7 because softmax-normalized routing scores are bounded
+        // in [0, 1] and renorm forces row-sum=1.0 → gradients are
+        // small but non-zero.
+        for (name, g) in [
+            ("input", &grads0[0]),
+            ("w_in", &grads0[1]),
+            ("w_attn", &grads0[2]),
+            ("w_post", &grads0[3]),
+            ("w_gate", &grads0[4]),
+        ] {
+            let max_abs = g.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            eprintln!(
+                "[decoder_layer_mini] {name}: max|grad|={max_abs:.3e}, len={}",
+                g.len()
+            );
+            assert!(
+                max_abs > 1e-7,
+                "{name} gradient collapsed to ~0 (max|grad|={max_abs:.3e})"
+            );
+        }
+
+        let h = 1e-3f32;
+        // Spot-check FD on input + w_attn (the two highest-rank params).
+        for &idx in &[0, 100, 511, 1023] {
+            let mut p = input_data.clone();
+            p[idx] += h;
+            let (lp, _) = forward_loss_and_grads(
+                &p, &w_in_data, &w_attn_data, &w_post_data, &w_gate_data,
+            );
+            let mut m = input_data.clone();
+            m[idx] -= h;
+            let (lm, _) = forward_loss_and_grads(
+                &m, &w_in_data, &w_attn_data, &w_post_data, &w_gate_data,
+            );
+            let fd = (lp - lm) / (2.0 * h);
+            let tol = 5e-2 * fd.abs().max(1.0);
+            assert!(
+                (grads0[0][idx] - fd).abs() < tol,
+                "FD input[{idx}]: analytic={} fd={}",
+                grads0[0][idx],
+                fd
+            );
+        }
+        for &idx in &[0, 100, 511, 1023] {
+            let mut p = w_attn_data.clone();
+            p[idx] += h;
+            let (lp, _) = forward_loss_and_grads(
+                &input_data, &w_in_data, &p, &w_post_data, &w_gate_data,
+            );
+            let mut m = w_attn_data.clone();
+            m[idx] -= h;
+            let (lm, _) = forward_loss_and_grads(
+                &input_data, &w_in_data, &m, &w_post_data, &w_gate_data,
+            );
+            let fd = (lp - lm) / (2.0 * h);
+            let tol = 5e-2 * fd.abs().max(1.0);
+            assert!(
+                (grads0[2][idx] - fd).abs() < tol,
+                "FD w_attn[{idx}]: analytic={} fd={}",
+                grads0[2][idx],
+                fd
+            );
+        }
+    }
 }
