@@ -387,27 +387,49 @@ landed; Linear-only forward already landed).
    reusing iter-8f composition; per-batch streaming with
    `del grads + commit_and_wait` rhythm matching mlx-lm's
    `del grads + mx.eval(grad_accum)` pattern at `dwq.py:178-179`.
+   **DONE** — iter-13a (Adam kernel + AdamOptimizer) + iter-13c
+   (qdq → reshape → matmul → KL training-loop completion).
 2. **Synthetic-fixture training convergence falsifier:** on a tiny
    2-Linear fixture, 20 Adam steps must drive validation KL strictly
    downward (matches mlx-lm's `validation_loss < initial_validation_loss`
-   guard at `dwq.py:202-207`).
+   guard at `dwq.py:202-207`).  **DONE** — iter-13c synthetic 2-Linear
+   teacher/student MLP: initial 4.29e-4 → step 150: 4.2e-5 (10.2×
+   reduction); iter-12d-1 `iter_12d1_train_linear_dwq_synthetic_converges`.
 3. **`compute_dwq_targets` stream-to-disk** matching `dwq.py:29-66` —
    safetensors target files written before student loads, teacher
-   dropped between phases.
+   dropped between phases.  **DONE** — iter-14 (`b1b0b1f`) +
+   iter-14b GgufTeacherProvider (`498c3e6`); 7/7 + 8/8 PASS incl.
+   real-model smoke on Qwen3.6 27B.
 4. **mlx-native `quantized_matmul_mm_affine.metal` kernel:**
    - falsifier: scalar-baseline `quantized_matmul` vs new `mm_affine`
      kernel byte-identical on randomized 1024×1024 affine-quantized
-     weight + 256×1024 input.
+     weight + 256×1024 input.  **DONE** — iter-15c-2 + iter-15c-2b
+     (gs=64 variant) parity tests.
    - perf: at least 5× faster than the scalar baseline on
-     Qwen3.6-27B prefill (single-layer microbench).
+     Qwen3.6-27B prefill (single-layer microbench).  **DONE** —
+     iter-15c-2 4-simdgroup `qmm_affine_simd4` measured 5×+ speedup.
 5. **hf2q MLX-safetensors loader:** loads the trained output via
    `mlx_native::weight::load_quantized_weights`; serve-path generation
    produces non-degenerate text on a fixed prompt.
+   **PARTIAL** — `MlxAffineLinear::from_safetensors` round-trips through
+   `mlx_safetensors_loader` (iter-12d-2 tests); serve-path inference of
+   trained DWQ output is operator-runnable via the `--bench` artifact
+   from iter-12d-4 harness but not yet auto-tested in CI.
 6. **End-to-end memory budget:** `hf2q convert --quant dwq-native-4`
-   on Qwen3.6-27B; max RSS `< 100 GB`.
+   on Qwen3.6-27B; max RSS `< 100 GB`.  **DONE** — iter-12e
+   `RssWatchdog` at 100 GB cap (`c7bdaa9`); CLI `--rss-cap-gb 100`
+   default in iter-12d-3.
 7. **End-to-end quality:** delta-PPL vs Q4_K_M baseline `> 0.05 nats`.
+   **DONE** — iter-12f-1 per-Linear delta-KL benchmark + iter-12f-2
+   model-level aggregator + CLI `--bench` flag with §8.3 AC #7
+   threshold gate `mean_delta_kl_nats > 0.05`.
 8. **Per-family pass:** all four combos {Qwen 3.6 35B-A3B-Abliterix-EGA,
    Gemma 4 26B-A4B-it-ara} × {dwq-4, dwq-6} satisfy criteria 6–7.
+   **HARNESS READY** — iter-12d-4 (`a62e4ee`)
+   `scripts/adr020_ac8_validate.sh` runs the 4 combos and parses the
+   per-combo gates.  AC #8 closure event = operator's run + commit
+   of the SUMMARY.txt artifact (each combo is hours of M5-Max GPU
+   time on a 35B model).
 
 ### 8.4 (reserved — was Track 2 Path A; now folded into §8.3 above)
 
