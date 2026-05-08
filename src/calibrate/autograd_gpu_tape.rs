@@ -268,6 +268,12 @@ enum OpKind {
         cols: usize,
         k: usize,
     },
+    /// ADR-020 iter-11h-misc-1 — elementwise divide `y = a / b`.
+    /// Forward: `y[i] = a[i] / b[i]`.
+    /// Backward: `da[i] = dy[i] / b[i]`, `db[i] = -dy[i] · y[i] / b[i]`.
+    /// Both backward formulas use forward output `y` (autograd-canonical
+    /// pattern; saves recomputing `a/b²`).
+    Divide { lhs_idx: usize, rhs_idx: usize },
 }
 
 struct GpuNode {
@@ -658,6 +664,10 @@ pub fn backward(
             OpKind::OuterProduct {
                 lhs_idx, rhs_idx, ..
             } => {
+                accumulate(&mut grads, lhs_idx, &parent_grads[0], tape)?;
+                accumulate(&mut grads, rhs_idx, &parent_grads[1], tape)?;
+            }
+            OpKind::Divide { lhs_idx, rhs_idx } => {
                 accumulate(&mut grads, lhs_idx, &parent_grads[0], tape)?;
                 accumulate(&mut grads, rhs_idx, &parent_grads[1], tape)?;
             }
@@ -1467,6 +1477,40 @@ fn backward_dispatch(
             //   accumulate(grads, scales_idx, parent_grads[0])
             //   accumulate(grads, biases_idx, parent_grads[1])
             Ok((op, vec![d_scales_buf, d_biases_buf]))
+        }
+        OpKind::Divide { lhs_idx, rhs_idx } => {
+            // y = a/b stored at this node; backward needs y, b, dy.
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+            let b_buf = tape.with_node(rhs_idx, |n| n.value.clone());
+            let y_buf = tape.with_node(node_idx, |n| n.value.clone());
+            let n = y_buf.element_count();
+            let _ = lhs_idx; // a is not needed in backward (uses y instead)
+            let da_buf = device
+                .alloc_buffer(n * 4, DType::F32, y_buf.shape().to_vec())
+                .map_err(|e| anyhow!("backward divide: alloc da: {e}"))?;
+            let db_buf = device
+                .alloc_buffer(n * 4, DType::F32, y_buf.shape().to_vec())
+                .map_err(|e| anyhow!("backward divide: alloc db: {e}"))?;
+            let mut params_buf = device
+                .alloc_buffer(4, DType::U32, vec![1])
+                .map_err(|e| anyhow!("backward divide: alloc params: {e}"))?;
+            params_buf
+                .as_mut_slice::<u32>()
+                .map_err(|e| anyhow!("backward divide: params write: {e}"))?[0] = n as u32;
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward divide: encoder: {e}"))?;
+            mlx_native::ops::divide_elementwise::dispatch_divide_backward_f32(
+                &mut encoder, &mut registry, device.metal_device(),
+                &b_buf, &y_buf, out_grad, &da_buf, &db_buf, &params_buf,
+            )
+            .map_err(|e| anyhow!("backward divide: dispatch: {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward divide: commit: {e}"))?;
+            // Order matches accumulate: lhs (da), rhs (db).
+            Ok((op, vec![da_buf, db_buf]))
         }
         OpKind::TakeAlongAxisTopK {
             ref indices_buf,
@@ -2788,6 +2832,73 @@ pub fn exp(t: &GpuTensor) -> Result<GpuTensor> {
         tape: tape.clone(),
         node_idx,
         shape: t.shape.clone(),
+    })
+}
+
+/// ADR-020 iter-11h-misc-1 — elementwise divide `Y = A / B` on
+/// GpuTape.  Forward via `divide_f32`; backward via
+/// `divide_backward_f32` (single dispatch produces both `da` and
+/// `db`).  Cleaner than the `exp(-log(x))` reciprocal trick used in
+/// iter-11h-e2's renorm path; works for negative `B` too.
+pub fn divide(lhs: &GpuTensor, rhs: &GpuTensor) -> Result<GpuTensor> {
+    if !lhs.tape.ptr_eq(&rhs.tape) {
+        return Err(anyhow!(
+            "divide: lhs and rhs must share the same tape"
+        ));
+    }
+    if lhs.shape != rhs.shape {
+        return Err(anyhow!(
+            "divide: shape mismatch: lhs={:?} rhs={:?}",
+            lhs.shape, rhs.shape
+        ));
+    }
+
+    let tape = &lhs.tape;
+    let device = tape.device();
+    let lhs_buf = tape.with_node(lhs.node_idx, |n| n.value.clone());
+    let rhs_buf = tape.with_node(rhs.node_idx, |n| n.value.clone());
+    let n = lhs_buf.element_count();
+
+    let out = device
+        .alloc_buffer(n * 4, DType::F32, lhs.shape.clone())
+        .map_err(|e| anyhow!("divide: alloc out: {e}"))?;
+    let mut params_buf = device
+        .alloc_buffer(4, DType::U32, vec![1])
+        .map_err(|e| anyhow!("divide: alloc params: {e}"))?;
+    params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("divide: params write: {e}"))?[0] = n as u32;
+
+    let mut registry = tape.0.registry.borrow_mut();
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("divide: encoder: {e}"))?;
+    mlx_native::ops::divide_elementwise::dispatch_divide_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &lhs_buf,
+        &rhs_buf,
+        &out,
+        &params_buf,
+    )
+    .map_err(|e| anyhow!("divide: forward dispatch: {e}"))?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("divide: commit_and_wait: {e}"))?;
+    drop(registry);
+
+    let lhs_idx = lhs.node_idx;
+    let rhs_idx = rhs.node_idx;
+    let node_idx = tape.push_node(
+        OpKind::Divide { lhs_idx, rhs_idx },
+        out,
+        lhs.shape.clone(),
+    );
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: lhs.shape.clone(),
     })
 }
 
@@ -5123,6 +5234,62 @@ mod tests {
                 (g_x0[i] - fd).abs() < tol,
                 "FD x[{i}]: analytic={} fd={}",
                 g_x0[i], fd
+            );
+        }
+    }
+
+    /// iter-11h-misc-1 — `divide` GpuTape forward + backward FD
+    /// falsifier on every a[i] and b[i] element.
+    #[test]
+    fn divide_forward_and_backward_fd() {
+        use mlx_native::MlxDevice;
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+
+        let n = 8usize;
+        let a_data: Vec<f32> = (0..n).map(|i| 0.5 + (i as f32) * 0.1).collect();
+        let b_data: Vec<f32> = (0..n).map(|i| 1.0 + (i as f32) * 0.07).collect();
+
+        let forward_loss_and_grads = |a: &[f32], b: &[f32]| -> (f32, Vec<f32>, Vec<f32>) {
+            tape.reset();
+            let at = GpuTensor::from_vec(&tape, a, vec![n]).unwrap();
+            let bt = GpuTensor::from_vec(&tape, b, vec![n]).unwrap();
+            let yt = divide(&at, &bt).unwrap();
+            let host = yt.to_vec().unwrap();
+            let loss = host.iter().map(|v| *v as f64).sum::<f64>() as f32;
+            let dy = ones_like(&tape, yt.shape()).unwrap();
+            let grads = backward(&yt, dy).unwrap();
+            let g_a = grads[at.node_idx()].as_ref().unwrap()
+                .as_slice::<f32>().unwrap().to_vec();
+            let g_b = grads[bt.node_idx()].as_ref().unwrap()
+                .as_slice::<f32>().unwrap().to_vec();
+            (loss, g_a, g_b)
+        };
+
+        let (_l0, g_a0, g_b0) = forward_loss_and_grads(&a_data, &b_data);
+        let h = 1e-3f32;
+        for i in 0..n {
+            // FD on a
+            let mut p = a_data.clone(); p[i] += h;
+            let (lp, _, _) = forward_loss_and_grads(&p, &b_data);
+            let mut m = a_data.clone(); m[i] -= h;
+            let (lm, _, _) = forward_loss_and_grads(&m, &b_data);
+            let fd_a = (lp - lm) / (2.0 * h);
+            let tol_a = 1e-2 * fd_a.abs().max(1.0);
+            assert!(
+                (g_a0[i] - fd_a).abs() < tol_a,
+                "FD a[{i}]: analytic={} fd={}", g_a0[i], fd_a
+            );
+            // FD on b
+            let mut p = b_data.clone(); p[i] += h;
+            let (lp, _, _) = forward_loss_and_grads(&a_data, &p);
+            let mut m = b_data.clone(); m[i] -= h;
+            let (lm, _, _) = forward_loss_and_grads(&a_data, &m);
+            let fd_b = (lp - lm) / (2.0 * h);
+            let tol_b = 1e-2 * fd_b.abs().max(1.0);
+            assert!(
+                (g_b0[i] - fd_b).abs() < tol_b,
+                "FD b[{i}]: analytic={} fd={}", g_b0[i], fd_b
             );
         }
     }
