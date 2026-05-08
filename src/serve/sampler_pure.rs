@@ -137,6 +137,60 @@ pub fn sample_token(
     sample_greedy(logits)
 }
 
+/// ADR-020 AC#7 — sample a token AND return its log-probability under
+/// the model's *raw* distribution (computed BEFORE the in-place
+/// rep-penalty / temperature transforms applied by [`sample_token`]).
+///
+/// `log_softmax(logits)[chosen]` is the standard "model confidence"
+/// signal that AC#7's boundary harness compares between
+/// vanilla-vs-overlay serves: when DWQ training has recovered from
+/// quantization noise, the overlay's logprob on the chosen token
+/// should be *less* negative (i.e. higher confidence).
+///
+/// Caller contract:
+/// - `logits` is mutably borrowed for the duration; on return the
+///   slice carries whatever in-place mutations [`sample_token`]
+///   applied (rep penalty / temperature / softmax).  Callers that
+///   need the raw logits must clone before calling.
+/// - Returned `(token, logprob)` pair: the logprob is in nats and is
+///   negative (since `log_softmax` ≤ 0).  For numerical stability the
+///   log-sum-exp uses the standard `max + log(Σ exp(x - max))` form.
+///
+/// Allocates a `Vec<f32>` of size `logits.len()` for the precomputed
+/// log_softmax.  At Gemma 4's `vocab_size=262144` this is ~1 MB per
+/// call — non-trivial but small relative to the 50ms-class decode
+/// step, and only paid when the caller explicitly opts in via this
+/// entry point (the existing [`sample_token`] is unchanged).
+pub fn sample_token_with_logprob(
+    logits: &mut [f32],
+    params: &SamplingParams,
+    previous_tokens: &[u32],
+) -> (u32, f32) {
+    // log_softmax(x)[i] = x[i] - (max + log(Σ exp(x - max)))
+    let max_logit = logits
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, |acc, v| if v > acc { v } else { acc });
+    if !max_logit.is_finite() {
+        // Degenerate input (all -inf or NaN-only) — fall back to greedy
+        // and report neg-inf logprob so callers can detect the case.
+        let token = sample_greedy(logits);
+        return (token, f32::NEG_INFINITY);
+    }
+    let mut sum_exp = 0.0f32;
+    for &v in logits.iter() {
+        sum_exp += (v - max_logit).exp();
+    }
+    let log_z = max_logit + sum_exp.ln();
+    let raw_logprobs: Vec<f32> = logits.iter().map(|&v| v - log_z).collect();
+    let token = sample_token(logits, params, previous_tokens);
+    let logprob = raw_logprobs
+        .get(token as usize)
+        .copied()
+        .unwrap_or(f32::NEG_INFINITY);
+    (token, logprob)
+}
+
 /// Sample a single token from a pre-extracted top-K (indices, values) pair.
 ///
 /// ADR-005 iter-25. Same llama.cpp-shape sampling chain as
@@ -840,5 +894,92 @@ mod tests {
         let b = sample_token_from_topk(&top_indices_b, &top_values_b, &params);
         assert_eq!(a, 20, "expected max-value idx 20, got {}", a);
         assert_eq!(b, 20, "scrambled order changed greedy result: {}", b);
+    }
+
+    /// ADR-020 AC#7 — `sample_token_with_logprob` returns the chosen
+    /// token + its log-softmax under the raw model distribution.
+    /// Greedy on a uniform-shifted distribution gives `-log(N)` per
+    /// element; the chosen token's logprob must be ≈ -log(vocab_size).
+    #[test]
+    fn sample_token_with_logprob_uniform_distribution() {
+        // Uniform logits → uniform softmax → log_softmax = -log(N) for all.
+        let n = 64usize;
+        let mut logits = vec![0.5_f32; n];
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            max_tokens: 1,
+        };
+        let (_token, logprob) = sample_token_with_logprob(&mut logits, &params, &[]);
+        let expected = -(n as f32).ln();
+        assert!(
+            (logprob - expected).abs() < 1e-4,
+            "uniform logprob: expected {expected:.6}, got {logprob:.6}"
+        );
+    }
+
+    /// Greedy on a one-hot-ish distribution: chosen token has nearly
+    /// all the probability mass, so logprob ≈ 0.
+    #[test]
+    fn sample_token_with_logprob_concentrated_distribution() {
+        let n = 64usize;
+        let mut logits = vec![-100.0_f32; n];
+        logits[42] = 100.0;
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            max_tokens: 1,
+        };
+        let (token, logprob) = sample_token_with_logprob(&mut logits, &params, &[]);
+        assert_eq!(token, 42);
+        assert!(
+            logprob > -1e-3,
+            "concentrated logprob: expected ≈ 0, got {logprob:.6}"
+        );
+    }
+
+    /// Two-token logits where token 1 has 2× the probability of token 0:
+    ///   logits = [0.0, ln(2)]  →  softmax = [1/3, 2/3]
+    ///   greedy picks token 1; logprob = ln(2/3) ≈ -0.4055
+    #[test]
+    fn sample_token_with_logprob_known_two_token_distribution() {
+        let mut logits = vec![0.0_f32, 2.0_f32.ln()];
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            max_tokens: 1,
+        };
+        let (token, logprob) = sample_token_with_logprob(&mut logits, &params, &[]);
+        assert_eq!(token, 1, "greedy should pick the larger logit");
+        let expected = (2.0_f32 / 3.0).ln();
+        assert!(
+            (logprob - expected).abs() < 1e-5,
+            "two-token logprob: expected {expected:.6}, got {logprob:.6}"
+        );
+    }
+
+    /// Degenerate: all -inf logits → greedy fallback + logprob = -inf.
+    #[test]
+    fn sample_token_with_logprob_all_neg_inf_returns_inf() {
+        let mut logits = vec![f32::NEG_INFINITY; 16];
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            max_tokens: 1,
+        };
+        let (_token, logprob) = sample_token_with_logprob(&mut logits, &params, &[]);
+        assert!(logprob.is_infinite() && logprob < 0.0);
     }
 }
