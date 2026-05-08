@@ -40,7 +40,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{anyhow, Result};
 
-use crate::ir::TensorMap;
+use crate::ir::{lazy::LazyTensorMap, TensorMap};
 
 /// Compute FD sensitivity for a single Linear weight tensor.
 ///
@@ -831,6 +831,62 @@ pub fn extract_dense_layer_weights_f32(
                 9
             )
         })?;
+        tref.to_f32_vec()
+            .map_err(|e| anyhow!("decode {key:?}: {e}"))
+    };
+
+    Ok(DenseLayerWeightsF32 {
+        w_attn_norm: pull("attn_norm.weight")?,
+        w_q: pull("attn_q.weight")?,
+        w_k: pull("attn_k.weight")?,
+        w_v: pull("attn_v.weight")?,
+        w_o: pull("attn_output.weight")?,
+        w_ffn_norm: pull("post_attention_norm.weight")?,
+        w_gate: pull("ffn_gate.weight")?,
+        w_up: pull("ffn_up.weight")?,
+        w_down: pull("ffn_down.weight")?,
+    })
+}
+
+/// ADR-020 iter-12b-3-extract-layer-lazy — `LazyTensorMap` variant of
+/// [`extract_dense_layer_weights_f32`].
+///
+/// Borrowed-materialization version: uses `LazyTensor::materialize_cloned`
+/// for each of the 9 GGUF-named tensors so the source map's contents
+/// stay intact for downstream byte-emission (DWQ calibration must not
+/// drop weights from the map mid-pipeline).
+///
+/// # Constraint
+///
+/// `materialize_cloned` REQUIRES the lazy tensor to be already-resident
+/// (`Materialized` or `MaterializedShared` state).  Pending lazy
+/// tensors return a `MaterializeError::Transform` —
+/// surfaced here as an actionable error annotated with the offending
+/// key.  Callers operating on Pending maps must materialize the
+/// per-layer subset first (e.g. via `LazyTensorMap::materialize_all`
+/// or per-tensor materialize-and-reinsert).
+///
+/// # Errors
+///
+/// * `Err` for any missing key (silent partial-load is forbidden).
+/// * `Err` propagating from `materialize_cloned` (Pending state) or
+///   `to_f32_vec` (non-float / shape-mismatched dtypes).
+pub fn extract_dense_layer_weights_f32_from_lazy(
+    lazy_map: &LazyTensorMap,
+    layer_idx: usize,
+) -> Result<DenseLayerWeightsF32> {
+    let prefix = format!("blk.{layer_idx}.");
+    let pull = |suffix: &str| -> Result<Vec<f32>> {
+        let key = format!("{prefix}{suffix}");
+        let lazy = lazy_map.get(&key).ok_or_else(|| {
+            anyhow!(
+                "extract_dense_layer_weights_f32_from_lazy: tensor {key:?} missing \
+                 from LazyTensorMap (expected 9 GGUF-named tensors per layer)"
+            )
+        })?;
+        let tref = lazy
+            .materialize_cloned()
+            .map_err(|e| anyhow!("materialize {key:?}: {e}"))?;
         tref.to_f32_vec()
             .map_err(|e| anyhow!("decode {key:?}: {e}"))
     };
@@ -1723,6 +1779,83 @@ mod tests {
         assert!(
             msg.contains("decode") && msg.contains("attn_norm"),
             "error must annotate decode + tensor name: {msg}"
+        );
+    }
+
+    /// ADR-020 iter-12b-3-extract-layer-lazy — lazy-map variant
+    /// produces bit-equal output to the eager variant on the same
+    /// 9-tensor fixture.
+    #[test]
+    fn extract_dense_layer_weights_f32_from_lazy_matches_eager() {
+        use crate::ir::lazy::LazyTensorMap;
+        use crate::ir::{DType, TensorMap, TensorRef};
+
+        let layer_idx = 2usize;
+        let hidden = 32usize;
+        let intermediate = 64usize;
+
+        let mk_v = |n: usize, base: f32| -> Vec<f32> {
+            (0..n).map(|i| base + (i as f32) * 0.001).collect()
+        };
+        let mk_tref = |name: String, values: &[f32], shape: Vec<usize>| {
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for v in values {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            TensorRef {
+                name,
+                shape,
+                dtype: DType::F32,
+                data: std::sync::Arc::new(bytes),
+            }
+        };
+
+        let mut eager = TensorMap::new();
+        let p = format!("blk.{layer_idx}.");
+        let h_sq = hidden * hidden;
+        let h_inter = hidden * intermediate;
+        eager.insert(mk_tref(format!("{p}attn_norm.weight"), &mk_v(hidden, 1.0), vec![hidden]));
+        eager.insert(mk_tref(format!("{p}attn_q.weight"), &mk_v(h_sq, 0.1), vec![hidden, hidden]));
+        eager.insert(mk_tref(format!("{p}attn_k.weight"), &mk_v(h_sq, 0.2), vec![hidden, hidden]));
+        eager.insert(mk_tref(format!("{p}attn_v.weight"), &mk_v(h_sq, 0.3), vec![hidden, hidden]));
+        eager.insert(mk_tref(format!("{p}attn_output.weight"), &mk_v(h_sq, 0.4), vec![hidden, hidden]));
+        eager.insert(mk_tref(format!("{p}post_attention_norm.weight"), &mk_v(hidden, 1.05), vec![hidden]));
+        eager.insert(mk_tref(format!("{p}ffn_gate.weight"), &mk_v(h_inter, 0.5), vec![intermediate, hidden]));
+        eager.insert(mk_tref(format!("{p}ffn_up.weight"), &mk_v(h_inter, 0.6), vec![intermediate, hidden]));
+        eager.insert(mk_tref(format!("{p}ffn_down.weight"), &mk_v(h_inter, 0.7), vec![hidden, intermediate]));
+
+        let eager_extracted = extract_dense_layer_weights_f32(&eager, layer_idx)
+            .expect("eager extract");
+
+        let lazy = LazyTensorMap::from_eager(eager);
+        let lazy_extracted = extract_dense_layer_weights_f32_from_lazy(&lazy, layer_idx)
+            .expect("lazy extract");
+
+        // Bit-equal output across both extractors.
+        assert_eq!(eager_extracted.w_attn_norm, lazy_extracted.w_attn_norm);
+        assert_eq!(eager_extracted.w_q, lazy_extracted.w_q);
+        assert_eq!(eager_extracted.w_k, lazy_extracted.w_k);
+        assert_eq!(eager_extracted.w_v, lazy_extracted.w_v);
+        assert_eq!(eager_extracted.w_o, lazy_extracted.w_o);
+        assert_eq!(eager_extracted.w_ffn_norm, lazy_extracted.w_ffn_norm);
+        assert_eq!(eager_extracted.w_gate, lazy_extracted.w_gate);
+        assert_eq!(eager_extracted.w_up, lazy_extracted.w_up);
+        assert_eq!(eager_extracted.w_down, lazy_extracted.w_down);
+    }
+
+    /// ADR-020 iter-12b-3-extract-layer-lazy — empty lazy map returns
+    /// the same missing-key error pattern as the eager variant.
+    #[test]
+    fn extract_dense_layer_weights_f32_from_lazy_rejects_missing_tensor() {
+        use crate::ir::lazy::LazyTensorMap;
+
+        let lazy = LazyTensorMap::new();
+        let r = extract_dense_layer_weights_f32_from_lazy(&lazy, 0);
+        assert!(r.is_err());
+        let msg = format!("{}", r.err().unwrap());
+        assert!(
+            msg.contains("missing") && msg.contains("blk.0."),
+            "error must name the missing key: {msg}"
         );
     }
 }
