@@ -259,6 +259,19 @@ fn cmd_dwq_train(args: cli::DwqTrainArgs) -> Result<(), AppError> {
     let counter = std::cell::Cell::new(0usize);
     let limit = args.limit;
     let skip_huge = args.skip_huge;
+
+    // ADR-020 AC#5 — `--tensor-filter <regex>` lets the operator target
+    // a subset of tensor names (e.g. one layer's full MoE bucket).
+    // Compile fail-fast at startup so a typo doesn't waste hours of
+    // GPU time before a regex error surfaces mid-scan.
+    let tensor_filter_re: Option<regex::Regex> = match args.tensor_filter.as_ref() {
+        Some(pat) => Some(regex::Regex::new(pat).map_err(|e| {
+            AppError::Conversion(anyhow::anyhow!(
+                "--tensor-filter regex compile failed: {e}"
+            ))
+        })?),
+        None => None,
+    };
     let name_filter = |name: &str| -> bool {
         if !name.ends_with(".weight") {
             return false;
@@ -279,6 +292,14 @@ fn cmd_dwq_train(args: cli::DwqTrainArgs) -> Result<(), AppError> {
             || name.ends_with("_exps.scale")
         {
             return false;
+        }
+        // `--tensor-filter <regex>` AND'd in here, AFTER cheap suffix
+        // checks but BEFORE the limit counter so the counter only
+        // bumps for tensors that actually match.
+        if let Some(re) = tensor_filter_re.as_ref() {
+            if !re.is_match(name) {
+                return false;
+            }
         }
         if let Some(lim) = limit {
             let cur = counter.get();

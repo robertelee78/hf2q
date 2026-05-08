@@ -242,6 +242,17 @@ pub struct DwqTrainArgs {
     /// meaningful at `--perturb-factor 1.0` (default for production).
     #[arg(long, default_value_t = false)]
     pub bench: bool,
+
+    /// ADR-020 AC#5 — restrict training to tensor names matching this
+    /// regex.  Useful for targeted MoE bucket training (e.g.
+    /// `^blk\.29\.ffn_(gate_up|down)_exps\.weight$` covers one layer's
+    /// full bucket without spending GPU time on every layer).  Applied
+    /// AFTER the `.weight`/skip_huge/norm-pattern filters but BEFORE
+    /// the `--limit` counter, so `--limit N` still bounds the count
+    /// of matched tensors.  Invalid regex causes a fail-fast error
+    /// at startup.
+    #[arg(long)]
+    pub tensor_filter: Option<String>,
 }
 
 /// `hf2q cache` subcommands. ADR-005 Phase 3 iter-205 (AC line 5351).
