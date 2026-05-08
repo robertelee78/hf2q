@@ -154,17 +154,18 @@ Iter 12 → 13 root cause investigation (preserved for future ADR readers):
 - Fix: deterministic flat-distribution ids `(t*17 + s*13 + 7) % n_experts` (matches the proven `tests/test_quantized_matmul_id_mm.rs` pattern), and direct `dispatch_id_mm_for_test` against mv_id reference (already CPU-validated in P1.5) — removes the CPU-quantizer noise floor and isolates the mm_id template body as the only variable. Q4_0 baseline at the same shape went GREEN, falsifying the dequant-bug hypothesis.
 - Lesson: when porting a kernel that depends on a routing-table primitive (map0-produced hids), test fixtures must match the routing primitive's per-bucket capacity OR test against a known-good kernel path at the same shape.
 
-#### Phase 2 — Q5_K full coverage [IN PROGRESS — iter 19+]
+#### Phase 2 — Q5_K full coverage [LANDED 2026-05-08 — iter 20]
 
 ##### Phase 2 progress (live)
 
 | Step | Status | Commit | Evidence |
 |------|--------|--------|----------|
-| P2.1 mm_id (simdgroup MMA) | DONE | mlx-native 8d9bad9 (iter 19) | `kernel_mul_mm_id_q5_K_f32` ported from llama.cpp (port of `dequantize_q5_K` at ggml-metal.metal:699 + Q4_K mm_id template path). Q5_K bypass at dispatch sites retired. |
+| P2.1 mm_id (simdgroup MMA) | DONE | mlx-native 8d9bad9 (iter 19) | `kernel_mul_mm_id_q5_K_f32` ported from llama.cpp (port of `dequantize_q5_K` at ggml-metal.metal:699 + Q4_K mm_id template path). Q5_K bypass at dispatch sites retired. 2/2 parity tests vs mv_id reference. |
 | P2.2 mm_id_tensor | DONE | mlx-native 8d9bad9 (iter 19) | Sibling `kernel_mul_mm_id_q5_K_tensor_f32` for M3+ tensor cores. |
-| P2.3 dense mv | PENDING (iter 20) | — | `kernel_mul_mv_q5_K_f32` — used at decode (m=1) and prefill m≤8 on dense (non-MoE) Q5_K weights (e.g. attn_gate, ffn_*_shexp). |
-| P2.4 dense mm + mm_tensor | PENDING (iter 20+) | — | `kernel_mul_mm_q5_K_f32` + tensor sibling for prefill m>8 dense Q5_K weights. |
-| P2.5 Integration | PENDING | — | `qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/APEX-Q5_K_M.gguf` already loads + generates coherent text via the qwen35moe forward path; iter 19 confirmed that the new mm_id kernels engage for prefill > 32 tokens without regression. AC-2 + AC-3 closure: long-prompt prefill + first-32-token byte-equal vs llama-completion. |
+| P2.3 dense mv | DONE | mlx-native 29fa455 (iter 20) | `kernel_mul_mv_q5_K_f32` — port of llama.cpp `kernel_mul_mv_q5_K_f32_impl` (ggml-metal.metal:7837); body is Q4_K mv plus the Q5_K mv_id qh/acc2 high-bit block. Dispatch geometry: Q5_K joins Q4_K + Q6_K's (2, 32, 2) K-quant arm. |
+| P2.4 dense mm + mm_tensor | DONE | mlx-native 29fa455 (iter 20) | `kernel_mul_mm_q5_K_f32` + `kernel_mul_mm_q5_K_tensor_f32` template instantiations. block_q5_K typedef + K_SCALE_SIZE + get_scale_min_k4_just2 helper + dequantize_q5_K(_t)<type4x4> templates ported into both mm shaders. |
+| P2.5 Integration + parity | DONE | mlx-native 29fa455 (iter 20) | tests/adr_022_phase2_q5_k_dense_parity.rs — 4/4 GREEN (mv m=1, mv m=4, mm m=64, mm m=32 K=4096). Smoke: Qwen 3.6 35B-A3B-APEX-Q5_K_M still produces coherent CoT output post-port (prefill 48 t/s warm, decode 132 t/s). Long-prompt bench (iter 19): hf2q decode 129 t/s **beats** llama.cpp's 104 t/s (1.24×); hf2q prefill 608 t/s vs llama.cpp 1500 t/s (0.40× — pre-existing qwen35 prefill pipeline gap, ADR-013/015 scope). |
+
 
 
 
