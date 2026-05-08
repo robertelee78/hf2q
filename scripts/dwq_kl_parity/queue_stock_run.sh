@@ -365,39 +365,6 @@ if [ ! -f "abliterated_dwq_v2_kld.txt" ] && [ -d "./dwq_targets" ]; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────
-# Step K — dwq_v2 on stock (gated on stock targets+rtn from earlier steps)
-# ─────────────────────────────────────────────────────────────────────
-if [ ! -f "stock_dwq_v2_kld.txt" ] && [ -d "$STOCK_TARGETS" ] && [ -d "$STOCK_RTN" ]; then
-    if [ ! -d "$STOCK_DWQ_V2" ] || ! ls "$STOCK_DWQ_V2"/model-*.safetensors >/dev/null 2>&1; then
-        log "=== Step K.1: dwq_v2 training on stock (sensitivity p=50, warmup=100, clip=1.0) ==="
-        START_S=$(date +%s)
-        HF2Q_DWQ_SENSITIVITY_PERCENTILE=50 \
-        HF2Q_DWQ_WARMUP_STEPS=100 \
-        HF2Q_DWQ_LR_FINAL_FRAC=0.1 \
-        HF2Q_DWQ_GRAD_CLIP=1.0 \
-        python3 dwq_v2.py \
-            --model "$STOCK_LOCAL" \
-            --quantized-model "$STOCK_RTN" \
-            --target-dir "$STOCK_TARGETS" \
-            --mlx-path "$STOCK_DWQ_V2" \
-            --bits "$BITS" --group-size "$GROUP_SIZE" \
-            --num-samples "$NUM_SAMPLES" --max-seq-length "$MAX_SEQ_LENGTH" \
-            --learning-rate "$LR" --batch-size "$BATCH_SIZE" --seed "$SEED" \
-            --grad-checkpoint \
-            2>&1 | tee -a "$LOG"
-        log "Step K.1 done in $(($(date +%s) - START_S))s"
-    fi
-    log "=== Step K.2: kld.py on stock dwq_v2 output ==="
-    START_S=$(date +%s)
-    python3 kld.py --model "$STOCK_DWQ_V2" --baseline-model "$STOCK_MLX_BF16" \
-        --top-k 1024 --data-path allenai/tulu-3-sft-mixture \
-        --sequence-length 1025 --num-samples 512 --batch-size 4 --seed 123 \
-        2>&1 | tee -a "$LOG"
-    log "Step K.2 done in $(($(date +%s) - START_S))s"
-    grep -aoE '"mean_kl_per_token":\s*[0-9.eE+-]+' "$LOG" | tail -1 > stock_dwq_v2_kld.txt || true
-fi
-
-# ─────────────────────────────────────────────────────────────────────
 # Step L — hf2q convert --quant imatrix-adaptive on abliterated + kld
 # ─────────────────────────────────────────────────────────────────────
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q-adr020-iter10/target/release/hf2q}"
@@ -443,6 +410,41 @@ if [ ! -f "stock_imatrix_kld.txt" ]; then
         ls -la "$STOCK_IMATRIX" 2>&1 | tee -a "$LOG"
         echo "imatrix-adaptive-gguf-only" > stock_imatrix_kld.txt
     fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Step K — dwq_v2 on stock (LOAD-BEARING — does method improvement help
+# on the case where canonical recipe is known to work?).  Re-ordered
+# AFTER L/M so the cheap mixed-precision GGUFs surface first.
+# ─────────────────────────────────────────────────────────────────────
+if [ ! -f "stock_dwq_v2_kld.txt" ] && [ -d "$STOCK_TARGETS" ] && [ -d "$STOCK_RTN" ]; then
+    if [ ! -d "$STOCK_DWQ_V2" ] || ! ls "$STOCK_DWQ_V2"/model-*.safetensors >/dev/null 2>&1; then
+        log "=== Step K.1: dwq_v2 training on stock (sensitivity p=50, warmup=100, clip=1.0) ==="
+        START_S=$(date +%s)
+        HF2Q_DWQ_SENSITIVITY_PERCENTILE=50 \
+        HF2Q_DWQ_WARMUP_STEPS=100 \
+        HF2Q_DWQ_LR_FINAL_FRAC=0.1 \
+        HF2Q_DWQ_GRAD_CLIP=1.0 \
+        python3 dwq_v2.py \
+            --model "$STOCK_LOCAL" \
+            --quantized-model "$STOCK_RTN" \
+            --target-dir "$STOCK_TARGETS" \
+            --mlx-path "$STOCK_DWQ_V2" \
+            --bits "$BITS" --group-size "$GROUP_SIZE" \
+            --num-samples "$NUM_SAMPLES" --max-seq-length "$MAX_SEQ_LENGTH" \
+            --learning-rate "$LR" --batch-size "$BATCH_SIZE" --seed "$SEED" \
+            --grad-checkpoint \
+            2>&1 | tee -a "$LOG"
+        log "Step K.1 done in $(($(date +%s) - START_S))s"
+    fi
+    log "=== Step K.2: kld.py on stock dwq_v2 output ==="
+    START_S=$(date +%s)
+    python3 kld.py --model "$STOCK_DWQ_V2" --baseline-model "$STOCK_MLX_BF16" \
+        --top-k 1024 --data-path allenai/tulu-3-sft-mixture \
+        --sequence-length 1025 --num-samples 512 --batch-size 4 --seed 123 \
+        2>&1 | tee -a "$LOG"
+    log "Step K.2 done in $(($(date +%s) - START_S))s"
+    grep -aoE '"mean_kl_per_token":\s*[0-9.eE+-]+' "$LOG" | tail -1 > stock_dwq_v2_kld.txt || true
 fi
 
 log "=== Queue complete — all steps ==="
