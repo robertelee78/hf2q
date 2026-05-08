@@ -676,6 +676,9 @@ fn load_lazy_moe_ffn_quantized(
         shared_gate: load_lazy_f32(lookup, &format!("{p}.ffn_gate_shexp.weight"))?,
         shared_up: load_lazy_f32(lookup, &format!("{p}.ffn_up_shexp.weight"))?,
         shared_down: load_lazy_f32(lookup, &format!("{p}.ffn_down_shexp.weight"))?,
+        expert_gate_affine: None,
+        expert_up_affine: None,
+        expert_down_affine: None,
     })
 }
 
