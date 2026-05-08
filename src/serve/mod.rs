@@ -806,55 +806,108 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         &loaded, &gguf, load_elapsed, None, false,
     );
 
-    // Iter-1 mmproj wire-up on `generate`: when `--mmproj <path>` is set,
-    // validate the GGUF + populate `info.vision_projector` so the banner
-    // reflects the actual vision capability instead of "mmproj-required
-    // (no mmproj loaded)". This mirrors the validation half of the
-    // `serve --mmproj` path (~mod.rs:3432) without paying for ViT weight
-    // upload + warmup, which `generate` doesn't exercise today (no
-    // `--image` flag yet — that's iter-2).
-    if let Some(mmp_path) = args.mmproj.as_ref() {
-        anyhow::ensure!(
-            mmp_path.exists(),
-            "mmproj not found: {}",
-            mmp_path.display()
-        );
-        let mmp_gguf = mlx_native::gguf::GgufFile::open(mmp_path)
-            .map_err(|e| anyhow::anyhow!("mmproj GGUF header parse failed: {e}"))?;
-        let mmp_config = crate::inference::vision::mmproj::MmprojConfig::from_gguf(&mmp_gguf)
-            .map_err(|e| anyhow::anyhow!("mmproj GGUF config parse failed: {e}"))?;
-        let actual_names: Vec<&str> = mmp_gguf.tensor_names();
-        crate::inference::vision::mmproj::validate_tensor_set(&mmp_config, &actual_names)
+    anyhow::ensure!(
+        args.image.is_none() || args.mmproj.is_some(),
+        "--image requires --mmproj <path>; pass the projector GGUF that pairs \
+         with this base model (e.g. mmproj-gemma4-f16.gguf alongside the main \
+         GGUF on the same HF repo)"
+    );
+
+    // mmproj-on-generate (iter-2): when `--mmproj <path>` is set, validate
+    // the GGUF + load the projector weights onto the Metal device when
+    // `--image` is also given (otherwise validate-only is sufficient for
+    // banner accuracy). The fully-loaded `LoadedMmproj` is consumed
+    // downstream by the vision pipeline (preprocess → ViT forward →
+    // soft-token splice) before prefill. Mirrors the SERVE
+    // `cmd_serve --mmproj` path (mod.rs:3432) so SERVE + CLI exercise
+    // one validation surface.
+    let loaded_mmproj: Option<api::state::LoadedMmproj> =
+        if let Some(mmp_path) = args.mmproj.as_ref() {
+            anyhow::ensure!(
+                mmp_path.exists(),
+                "mmproj not found: {}",
+                mmp_path.display()
+            );
+            let mmp_gguf = mlx_native::gguf::GgufFile::open(mmp_path)
+                .map_err(|e| anyhow::anyhow!("mmproj GGUF header parse failed: {e}"))?;
+            let mmp_config =
+                crate::inference::vision::mmproj::MmprojConfig::from_gguf(&mmp_gguf)
+                    .map_err(|e| anyhow::anyhow!("mmproj GGUF config parse failed: {e}"))?;
+            let actual_names: Vec<&str> = mmp_gguf.tensor_names();
+            crate::inference::vision::mmproj::validate_tensor_set(
+                &mmp_config,
+                &actual_names,
+            )
             .map_err(|e| anyhow::anyhow!("mmproj GGUF tensor-set validation: {e}"))?;
-        let arch_profile = crate::inference::vision::mmproj::detect_arch_profile_with_projector(
-            &mmp_config.projector,
-            &actual_names,
-        );
-        anyhow::ensure!(
-            arch_profile.is_supported(),
-            "mmproj arch profile is Unknown — neither Gemma 4 SigLIP nor \
-             classic CLIP nor Qwen3-VL SigLIP markers found. hf2q's ViT \
-             forward path cannot dispatch on this file."
-        );
-        let mmproj_sha256 = mmp_gguf
-            .metadata_string("hf2q.mmproj_sha256")
-            .map(|s| s.to_string());
-        info.vision_projector = Some(load_info::VisionProjector {
-            mmproj_path: mmp_path.clone(),
-            mmproj_sha256,
-        });
-        tracing::info!(
-            path = %mmp_path.display(),
-            image_size = mmp_config.image_size,
-            patch_size = mmp_config.patch_size,
-            hidden = mmp_config.hidden_size,
-            layers = mmp_config.num_hidden_layers,
-            projector = mmp_config.projector.as_str(),
-            arch = arch_profile.as_str(),
-            "Loaded mmproj GGUF header (generate iter-1: weights + ViT \
-             warmup deferred to image-input iter-2)"
-        );
-    }
+            let arch_profile =
+                crate::inference::vision::mmproj::detect_arch_profile_with_projector(
+                    &mmp_config.projector,
+                    &actual_names,
+                );
+            anyhow::ensure!(
+                arch_profile.is_supported(),
+                "mmproj arch profile is Unknown — neither Gemma 4 SigLIP nor \
+                 classic CLIP nor Qwen3-VL SigLIP markers found. hf2q's ViT \
+                 forward path cannot dispatch on this file."
+            );
+            let mmproj_sha256 = mmp_gguf
+                .metadata_string("hf2q.mmproj_sha256")
+                .map(|s| s.to_string());
+            info.vision_projector = Some(load_info::VisionProjector {
+                mmproj_path: mmp_path.clone(),
+                mmproj_sha256,
+            });
+            // Load weights on demand: only when --image is set does the
+            // generate path need the projector resident on the GPU. This
+            // keeps text-only `generate --mmproj` cheap (banner + header
+            // parse) while paying full cost (~10s on M5 Max) when the
+            // user actually intends to run vision.
+            if args.image.is_some() {
+                let device = mlx_native::MlxDevice::new().map_err(|e| {
+                    anyhow::anyhow!("MlxDevice for mmproj load: {e}")
+                })?;
+                let weights =
+                    crate::inference::vision::mmproj_weights::LoadedMmprojWeights::load(
+                        &mmp_gguf,
+                        &mmp_config,
+                        device,
+                    )
+                    .map_err(|e| anyhow::anyhow!("mmproj weight load: {e}"))?;
+                let model_id = mmp_path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "mmproj".into());
+                tracing::info!(
+                    path = %mmp_path.display(),
+                    image_size = mmp_config.image_size,
+                    patch_size = mmp_config.patch_size,
+                    hidden = mmp_config.hidden_size,
+                    layers = mmp_config.num_hidden_layers,
+                    projector = mmp_config.projector.as_str(),
+                    arch = arch_profile.as_str(),
+                    tensors_loaded = weights.len(),
+                    "Loaded mmproj GGUF header + tensor set + weights"
+                );
+                Some(api::state::LoadedMmproj {
+                    gguf_path: mmp_path.clone(),
+                    config: mmp_config,
+                    arch: arch_profile,
+                    weights: std::sync::Arc::new(weights),
+                    model_id,
+                })
+            } else {
+                tracing::info!(
+                    path = %mmp_path.display(),
+                    image_size = mmp_config.image_size,
+                    patch_size = mmp_config.patch_size,
+                    arch = arch_profile.as_str(),
+                    "Loaded mmproj GGUF header (no --image; weight load skipped)"
+                );
+                None
+            }
+        } else {
+            None
+        };
 
     load_info::emit_tracing(&info);
     let mut stdout = std::io::stdout();
@@ -942,7 +995,117 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
             }
         }
     }
-    let prompt_tokens = prompt_tokens; // freeze
+    // mmproj-on-generate (iter-2) — image pipeline.
+    //
+    // When `--image <path>` is set (and `--mmproj <path>` is set, validated
+    // upstream), preprocess the image, run the GPU ViT forward through the
+    // shared `inference::vision::pipeline` module, expand the
+    // `<|image|>`/family placeholder tokens into per-image runs of
+    // placeholder ids, and produce per-image `SoftTokenData` slots
+    // carrying the projected vision embeddings as GPU buffers. The
+    // expanded prompt + soft tokens drive `forward_prefill_with_soft_tokens`
+    // below — at the placeholder positions the per-token embed step
+    // reads from the override buffer instead of the embed table, so the
+    // model sees the projected vision rows.
+    //
+    // SERVE's `/v1/chat/completions` runs the same pipeline end-to-end
+    // (process_multimodal_content → run_vit_forward →
+    // expand_image_placeholders → forward_prefill_with_soft_tokens) so
+    // both paths exercise byte-identical vision math.
+    let mut soft_tokens_owned: Vec<api::engine::SoftTokenData> = Vec::new();
+    let prompt_tokens = if let Some(image_path) = args.image.as_ref() {
+        let mmproj = loaded_mmproj
+            .as_ref()
+            .expect("--mmproj checked above when --image is set");
+        let image_input = crate::inference::vision::parse_image_url(
+            image_path.to_string_lossy().as_ref(),
+        )
+        .with_context(|| format!("--image: parse {}", image_path.display()))?;
+        let bytes = crate::inference::vision::load_image_bytes(&image_input)
+            .with_context(|| format!("--image: load {}", image_path.display()))?;
+        let preprocessed_input = match mmproj.arch {
+            crate::inference::vision::mmproj::ArchProfile::Gemma4Siglip => {
+                let cfg = &crate::inference::vision::preprocess::GEMMA4V_PREPROCESS_DEFAULT;
+                let pp = crate::inference::vision::preprocess::preprocess_gemma4v(&bytes, cfg)
+                    .with_context(|| format!("--image: gemma4v preprocess {}", image_path.display()))?;
+                let source_label = image_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("image")
+                    .to_string();
+                crate::inference::vision::vit_gpu::VisionInput::Gemma4v(
+                    crate::inference::vision::vit_gpu::Gemma4vPreprocessedImage {
+                        patches: pp.patches,
+                        pos_x: pp.pos_x,
+                        pos_y: pp.pos_y,
+                        n_x: pp.n_x,
+                        n_y: pp.n_y,
+                        source_label,
+                    },
+                )
+            }
+            crate::inference::vision::mmproj::ArchProfile::ClipClassic => {
+                let preprocess_cfg = mmproj.config.preprocess_config();
+                let pixel_values = crate::inference::vision::preprocess_rgb_chw(&bytes, &preprocess_cfg)
+                    .with_context(|| format!("--image: clip preprocess {}", image_path.display()))?;
+                let source_label = image_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("image")
+                    .to_string();
+                crate::inference::vision::vit_gpu::VisionInput::Siglip49(
+                    crate::inference::vision::PreprocessedImage {
+                        pixel_values,
+                        target_size: preprocess_cfg.target_size,
+                        pixel_w: None,
+                        pixel_h: None,
+                        source_label,
+                    },
+                )
+            }
+            crate::inference::vision::mmproj::ArchProfile::Qwen3VlSiglip => {
+                anyhow::bail!(
+                    "--image with Qwen3-VL mmproj on `hf2q generate` is not \
+                     supported: the Qwen3-VL text LM forward path lives behind \
+                     iter-228b (cmd_generate routes via `qwen3vl_text_forward_pending` \
+                     501 today). Use `hf2q serve --mmproj <qwen3vl-mmproj>` for \
+                     Qwen3-VL vision; this CLI works for Gemma4 + classic-CLIP."
+                );
+            }
+            crate::inference::vision::mmproj::ArchProfile::Unknown => unreachable!(
+                "Unknown arch rejected at mmproj load above"
+            ),
+        };
+        let pipeline_out = crate::inference::vision::pipeline::run_vit_forward(
+            std::slice::from_ref(&preprocessed_input),
+            mmproj,
+            mlx_w.hidden_size,
+        )
+        .context("--image: ViT forward")?;
+        let (expanded_tokens, soft_tokens, _image_token_positions) =
+            crate::inference::vision::pipeline::expand_image_placeholders(
+                &tokenizer,
+                &prompt_tokens,
+                &pipeline_out.embeddings,
+                pipeline_out.family,
+                pipeline_out.per_row_floats,
+                mlx_w.hidden_size,
+            )
+            .context("--image: soft-token expansion")?;
+        tracing::info!(
+            image = %image_path.display(),
+            arch = mmproj.arch.as_str(),
+            n_image_tokens = pipeline_out.total_image_tokens(),
+            forward_ms = pipeline_out.forward_ms,
+            prompt_tokens_pre = prompt_tokens.len(),
+            prompt_tokens_post = expanded_tokens.len(),
+            "vision pipeline complete; prompt expanded with soft tokens"
+        );
+        soft_tokens_owned = soft_tokens;
+        expanded_tokens
+    } else {
+        prompt_tokens
+    };
     tracing::info!("Prompt: {} tokens", prompt_tokens.len());
     if INVESTIGATION_ENV.dump_prompt_tokens {
         eprintln!(
@@ -980,7 +1143,25 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // parity is validated.
     let use_batched = INVESTIGATION_ENV.batched_prefill;
     let prefill_start = std::time::Instant::now();
-    let last_token = if use_batched {
+    let last_token = if !soft_tokens_owned.is_empty() {
+        // Image-augmented prefill — borrow the owned soft-token buffers
+        // for the borrowed-slice contract that
+        // forward_prefill_with_soft_tokens expects. The owned `Vec<SoftTokenData>`
+        // lives until function exit, so the borrowed slice is valid for
+        // the duration of the call. The `_batched` variant doesn't yet
+        // accept soft tokens (Phase 2c iter-97 wired the per-token
+        // path); CLI image-input thus routes through the per-token
+        // prefill regardless of HF2Q_BATCHED_PREFILL.
+        let borrowed: Vec<crate::serve::forward_prefill::SoftTokenInjection<'_>> =
+            soft_tokens_owned
+                .iter()
+                .map(|s| crate::serve::forward_prefill::SoftTokenInjection {
+                    range: s.range.clone(),
+                    embeddings: &s.embeddings,
+                })
+                .collect();
+        mlx_w.forward_prefill_with_soft_tokens(&prompt_tokens, &borrowed, args.max_tokens, &mut ctx)?
+    } else if use_batched {
         mlx_w.forward_prefill_batched(&prompt_tokens, args.max_tokens, &mut ctx)?
     } else {
         mlx_w.forward_prefill(&prompt_tokens, args.max_tokens, &mut ctx)?

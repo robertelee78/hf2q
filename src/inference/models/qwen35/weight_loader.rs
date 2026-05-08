@@ -74,6 +74,15 @@ pub struct MoeFfnWeightsQ {
     pub shared_gate: Vec<f32>,
     pub shared_up: Vec<f32>,
     pub shared_down: Vec<f32>,
+    /// ADR-020 AC#5 Iter C2.4 — DWQ-overlay mlx-affine expert stacks
+    /// (packed-U32 weight + BF16 scales + BF16 biases).  When `Some`,
+    /// the corresponding `expert_*_q` buffer above stays
+    /// resident-but-unused; gpu_ffn dispatch sites gate on these
+    /// `Option`s and route to `mlx_native::quantized_matmul_id_into`.
+    /// Qwen35 splits gate + up (no fused gate_up like Gemma 4).
+    pub expert_gate_affine: Option<crate::serve::forward_mlx::MlxAffineMoeStack>,
+    pub expert_up_affine: Option<crate::serve::forward_mlx::MlxAffineMoeStack>,
+    pub expert_down_affine: Option<crate::serve::forward_mlx::MlxAffineMoeStack>,
 }
 
 // ============================================================================
@@ -1077,6 +1086,9 @@ pub fn load_moe_ffn_quantized(
         shared_gate,
         shared_up,
         shared_down,
+        expert_gate_affine: None,
+        expert_up_affine: None,
+        expert_down_affine: None,
     })
 }
 
