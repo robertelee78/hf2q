@@ -480,6 +480,21 @@ landed; Linear-only forward already landed).
        returned **"2 plus 2 equals 4."** to "What is 2 plus 2?" at
        1559ms TTFT / 123 t/s decode on M5 Max — confirms the helper
        indirection is byte-clean on the legacy GGML production path.
+     - **MoE overlay E2E test 2026-05-08**: dwq-train --limit 2
+       on Gemma 4 26B Apex emitted 129 trained tensors via Iter
+       C2.1's rank-3 path: 128 per-expert `blk.29.ffn_down.{0..127}`
+       (KL ratios 0.155-0.226, well below 0.34 acceptance) + 1
+       dense `blk.9.ffn_down`.  Safetensors metadata + stem
+       structure verified via Python safetensors lib (387 tensors =
+       129 stems × 3, format=`mlx-affine-dwq-v1`, bits=4, gs=32).
+       Serve with --dwq-overlay reported `1 dense Linears + 1 MoE
+       stacks overridden` — Iter C2.2 MoE bucket aggregation
+       handles real DWQ output correctly.  HTTP chat returned
+       **"Two plus two equals four."** at 534ms TTFT / 62 t/s
+       decode.  (Note: layer 29's affine MoE dispatch did NOT fire
+       because gate_up_affine remained None — full MoE-affine
+       dispatch test still gates on a multi-bucket DWQ training
+       covering both gate_up_exps + down_exps for the same layer.)
      - `MlxAffineMoeStack` derives Clone (cheap — `MlxBuffer` is
        internally Arc-wrapped, no GPU data copy).
      - `MoeFfnWeightsGpuQ` gains `expert_{gate,up,down}_affine` slots
