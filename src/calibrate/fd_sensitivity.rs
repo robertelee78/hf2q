@@ -40,6 +40,8 @@ use std::collections::BTreeMap;
 
 use anyhow::{anyhow, Result};
 
+use crate::ir::TensorMap;
+
 /// Compute FD sensitivity for a single Linear weight tensor.
 ///
 /// # Arguments
@@ -757,6 +759,95 @@ pub fn fd_sensitivity_inputs_for_dense_layer(
     ])
 }
 
+/// ADR-020 iter-12b-3-extract-layer — owned bundle of FP32 weights
+/// for one dense-arch decoder layer.
+///
+/// Field shapes (GGUF native ordering):
+///   * `w_attn_norm`, `w_ffn_norm`: `[hidden]`
+///   * `w_q`, `w_k`, `w_v`, `w_o`: `[hidden, hidden]` row-major
+///     (GGUF stores as `[output, input]`; that's `[n, k]` for matmul
+///     `Y = X @ W^T`, which is what
+///     `fd_sensitivity_inputs_for_dense_layer` expects directly —
+///     no transpose).
+///   * `w_gate`, `w_up`: `[intermediate, hidden]` row-major.
+///   * `w_down`: `[hidden, intermediate]` row-major.
+///
+/// All as `Vec<f32>` regardless of source dtype — `to_f32_vec`
+/// handles F32/F16/BF16 decode.
+#[derive(Debug, Clone)]
+pub struct DenseLayerWeightsF32 {
+    pub w_attn_norm: Vec<f32>,
+    pub w_q: Vec<f32>,
+    pub w_k: Vec<f32>,
+    pub w_v: Vec<f32>,
+    pub w_o: Vec<f32>,
+    pub w_ffn_norm: Vec<f32>,
+    pub w_gate: Vec<f32>,
+    pub w_up: Vec<f32>,
+    pub w_down: Vec<f32>,
+}
+
+/// ADR-020 iter-12b-3-extract-layer — pull the 9 GGUF-named weight
+/// tensors for one dense decoder layer out of a `TensorMap`, decoded
+/// to FP32.
+///
+/// Naming matches the qwen35 / dense-arch GGUF convention used by
+/// `qwen35_gguf_adapter::weights_from_gguf_tensors`:
+///   blk.{i}.attn_norm.weight
+///   blk.{i}.attn_q.weight
+///   blk.{i}.attn_k.weight
+///   blk.{i}.attn_v.weight
+///   blk.{i}.attn_output.weight
+///   blk.{i}.post_attention_norm.weight
+///   blk.{i}.ffn_gate.weight
+///   blk.{i}.ffn_up.weight
+///   blk.{i}.ffn_down.weight
+///
+/// Each lookup produces a fresh `Vec<f32>` via [`crate::ir::TensorRef::to_f32_vec`];
+/// this function does NOT cache, so repeated calls re-decode.  Callers that
+/// score every layer should call once per layer in a single sweep.
+///
+/// Returns the weights in GGUF native ordering — directly feedable to
+/// [`fd_sensitivity_inputs_for_dense_layer`] without transpose.
+///
+/// # Errors
+///
+/// * `Err` for ANY missing key (silent partial load would corrupt the
+///   FD scoring chain).
+/// * Propagates `to_f32_vec` errors (UnsupportedDtype on quantized
+///   inputs — the calibrator must hand FP32/F16/BF16 weights, NOT
+///   GGML block formats).
+pub fn extract_dense_layer_weights_f32(
+    tensor_map: &TensorMap,
+    layer_idx: usize,
+) -> Result<DenseLayerWeightsF32> {
+    let prefix = format!("blk.{layer_idx}.");
+    let pull = |suffix: &str| -> Result<Vec<f32>> {
+        let key = format!("{prefix}{suffix}");
+        let tref = tensor_map.tensors.get(&key).ok_or_else(|| {
+            anyhow!(
+                "extract_dense_layer_weights_f32: tensor {key:?} missing from TensorMap \
+                 (expected {} GGUF-named tensors per layer)",
+                9
+            )
+        })?;
+        tref.to_f32_vec()
+            .map_err(|e| anyhow!("decode {key:?}: {e}"))
+    };
+
+    Ok(DenseLayerWeightsF32 {
+        w_attn_norm: pull("attn_norm.weight")?,
+        w_q: pull("attn_q.weight")?,
+        w_k: pull("attn_k.weight")?,
+        w_v: pull("attn_v.weight")?,
+        w_o: pull("attn_output.weight")?,
+        w_ffn_norm: pull("post_attention_norm.weight")?,
+        w_gate: pull("ffn_gate.weight")?,
+        w_up: pull("ffn_up.weight")?,
+        w_down: pull("ffn_down.weight")?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1448,6 +1539,190 @@ mod tests {
         assert!(
             msg.contains("n_heads") && msg.contains("hidden"),
             "error must mention n_heads + hidden: {msg}"
+        );
+    }
+
+    /// ADR-020 iter-12b-3-extract-layer — `extract_dense_layer_weights_f32`
+    /// pulls all 9 GGUF-named tensors and decodes via `to_f32_vec`.
+    /// End-to-end test: synthetic TensorMap → extract → feed into
+    /// `fd_sensitivity_inputs_for_dense_layer` → 7 finite scores.
+    #[test]
+    fn extract_dense_layer_weights_f32_pulls_all_nine_tensors() {
+        use crate::ir::{DType, TensorMap, TensorRef};
+
+        let layer_idx = 5usize;
+        let hidden = 32usize;
+        let intermediate = 64usize;
+
+        // Helper: build an F32 TensorRef from values + shape.
+        let mk_tref = |name: &str, values: &[f32], shape: Vec<usize>| {
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for v in values {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            TensorRef {
+                name: name.into(),
+                shape,
+                dtype: DType::F32,
+                data: std::sync::Arc::new(bytes),
+            }
+        };
+
+        let mut tensor_map = TensorMap::new();
+        let mk_v = |n: usize, base: f32| -> Vec<f32> {
+            (0..n).map(|i| base + (i as f32) * 0.001).collect()
+        };
+
+        let attn_norm = mk_v(hidden, 1.0);
+        let q = mk_v(hidden * hidden, 0.1);
+        let k = mk_v(hidden * hidden, 0.2);
+        let v = mk_v(hidden * hidden, 0.3);
+        let o = mk_v(hidden * hidden, 0.4);
+        let post_norm = mk_v(hidden, 1.0);
+        let gate = mk_v(intermediate * hidden, 0.5);
+        let up = mk_v(intermediate * hidden, 0.6);
+        let down = mk_v(hidden * intermediate, 0.7);
+
+        tensor_map.insert(mk_tref(
+            &format!("blk.{layer_idx}.attn_norm.weight"),
+            &attn_norm,
+            vec![hidden],
+        ));
+        tensor_map.insert(mk_tref(
+            &format!("blk.{layer_idx}.attn_q.weight"),
+            &q,
+            vec![hidden, hidden],
+        ));
+        tensor_map.insert(mk_tref(
+            &format!("blk.{layer_idx}.attn_k.weight"),
+            &k,
+            vec![hidden, hidden],
+        ));
+        tensor_map.insert(mk_tref(
+            &format!("blk.{layer_idx}.attn_v.weight"),
+            &v,
+            vec![hidden, hidden],
+        ));
+        tensor_map.insert(mk_tref(
+            &format!("blk.{layer_idx}.attn_output.weight"),
+            &o,
+            vec![hidden, hidden],
+        ));
+        tensor_map.insert(mk_tref(
+            &format!("blk.{layer_idx}.post_attention_norm.weight"),
+            &post_norm,
+            vec![hidden],
+        ));
+        tensor_map.insert(mk_tref(
+            &format!("blk.{layer_idx}.ffn_gate.weight"),
+            &gate,
+            vec![intermediate, hidden],
+        ));
+        tensor_map.insert(mk_tref(
+            &format!("blk.{layer_idx}.ffn_up.weight"),
+            &up,
+            vec![intermediate, hidden],
+        ));
+        tensor_map.insert(mk_tref(
+            &format!("blk.{layer_idx}.ffn_down.weight"),
+            &down,
+            vec![hidden, intermediate],
+        ));
+
+        let extracted = extract_dense_layer_weights_f32(&tensor_map, layer_idx)
+            .expect("extract must succeed on valid map");
+
+        // Bit-exact F32 round-trip: each Vec equals the input.
+        assert_eq!(extracted.w_attn_norm, attn_norm);
+        assert_eq!(extracted.w_q, q);
+        assert_eq!(extracted.w_k, k);
+        assert_eq!(extracted.w_v, v);
+        assert_eq!(extracted.w_o, o);
+        assert_eq!(extracted.w_ffn_norm, post_norm);
+        assert_eq!(extracted.w_gate, gate);
+        assert_eq!(extracted.w_up, up);
+        assert_eq!(extracted.w_down, down);
+
+        // End-to-end: feeds into fd_sensitivity_inputs_for_dense_layer
+        // without transpose, produces 7 valid LinearFdInputOwned, FD
+        // scoring gives 7 finite scores.
+        let batch = 32usize;
+        let n_heads = 2usize;
+        let head_dim = 16usize;
+        let x_layer: Vec<f32> = (0..(batch * hidden))
+            .map(|i| ((i as f32) * 0.013).sin() * 0.3)
+            .collect();
+        let triples = fd_sensitivity_inputs_for_dense_layer(
+            layer_idx,
+            batch,
+            hidden,
+            intermediate,
+            n_heads,
+            head_dim,
+            1e-6,
+            &x_layer,
+            &extracted.w_attn_norm,
+            &extracted.w_q,
+            &extracted.w_k,
+            &extracted.w_v,
+            &extracted.w_o,
+            &extracted.w_ffn_norm,
+            &extracted.w_gate,
+            &extracted.w_up,
+            &extracted.w_down,
+        )
+        .expect("feed extracted into fd_sensitivity_inputs_for_dense_layer");
+        let borrowed: Vec<LinearFdInput<'_>> =
+            triples.iter().map(|t| t.as_borrowed()).collect();
+        let scores = compute_fd_sensitivity_per_linear(&borrowed, 4, 8, 32, 2.0)
+            .expect("FD score the extracted layer");
+        assert_eq!(scores.len(), 7);
+        for (name, s) in &scores {
+            assert!(s.is_finite(), "score for {name} not finite: {s}");
+        }
+    }
+
+    /// ADR-020 iter-12b-3-extract-layer — missing tensor errs loudly,
+    /// NOT silently with partial output.
+    #[test]
+    fn extract_dense_layer_weights_f32_rejects_missing_tensor() {
+        use crate::ir::TensorMap;
+
+        let layer_idx = 0usize;
+        // Empty TensorMap — every lookup should fail.
+        let tensor_map = TensorMap::new();
+        let r = extract_dense_layer_weights_f32(&tensor_map, layer_idx);
+        assert!(r.is_err());
+        let msg = format!("{}", r.err().unwrap());
+        assert!(
+            msg.contains("missing") && msg.contains("blk.0."),
+            "error must name the missing key: {msg}"
+        );
+    }
+
+    /// ADR-020 iter-12b-3-extract-layer — quantized-dtype tensors err
+    /// during decode.  Falsifier for "silently coerce GGML blocks to
+    /// FP32" anti-pattern.
+    #[test]
+    fn extract_dense_layer_weights_f32_propagates_decode_errors() {
+        use crate::ir::{DType, TensorMap, TensorRef};
+
+        let mut tensor_map = TensorMap::new();
+        // Insert just attn_norm with WRONG dtype (I32) so to_f32_vec
+        // hits the unsupported-dtype branch.
+        let bytes = vec![0u8; 4 * 32]; // 32 elements × 4 bytes
+        tensor_map.insert(TensorRef {
+            name: "blk.0.attn_norm.weight".into(),
+            shape: vec![32],
+            dtype: DType::I32,
+            data: std::sync::Arc::new(bytes),
+        });
+        let r = extract_dense_layer_weights_f32(&tensor_map, 0);
+        assert!(r.is_err());
+        let msg = format!("{}", r.err().unwrap());
+        assert!(
+            msg.contains("decode") && msg.contains("attn_norm"),
+            "error must annotate decode + tensor name: {msg}"
         );
     }
 }
