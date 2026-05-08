@@ -563,13 +563,26 @@ landed; Linear-only forward already landed).
    - **Harness E2E first run 2026-05-08** (10 prompts):
      `samples_used=10/10`, `baseline_mean_ll=-0.067849`,
      `overlay_mean_ll=-0.067938`, `boundary_delta_nats=-0.000089`,
-     `AC#7 verdict=FAIL` (vs +0.05 threshold).  Expected outcome:
-     overlay covered only layer 29 of 30 + training convergence
-     ratio was ~1.000 (perturb=1.0 production-init mode produces
-     minimal headroom).  The harness mechanic is PROVEN; passing
-     verdict requires a full-coverage DWQ training run
-     (operator-driven, multi-hour GPU time per `scripts/adr020_ac8
-     _validate.sh`).
+     `AC#7 verdict=FAIL` (vs +0.05 threshold).
+   - **MATHEMATICAL FINDING 2026-05-08**: at the production
+     `--perturb-factor 1.0` default, `train_linear_dwq_synthetic_teacher`
+     is a NO-OP by construction.  `dwq_loop.rs:1009-1010` sets
+     `s_p = s_init * 1.0 = s_init` (no perturbation); the initial
+     state is the optimal per-Linear projection of W_real onto the
+     discrete grid.  With synthetic Gaussian `X` and per-Linear
+     teacher `y_T = X @ W_real`, the student
+     `y_S = X @ qdq(s_init, b_init, q_int)^T` is already at the
+     projection minimum — gradient ≈ 0, KL ratio = 1.000 (verified
+     in the qwen35 layer-10 training: 768/768 ratio=1.000 outputs).
+     The synthetic per-Linear approach mathematically CANNOT exceed
+     the projection.  For real DWQ benefit at perturb=1.0 the
+     algorithm needs EITHER a full-model teacher (cross-layer
+     error compensation, mlx-lm's approach at
+     `mlx_lm/quant/dwq.py:69-209`) OR real-corpus activations
+     (not synthetic Gaussian X).  Both extensions are out of scope
+     for the current §8.3 implementation.  The serve-side AC#5
+     infrastructure works correctly; AC#7 PASS verdict gates on
+     the algorithmic upgrade.
 8. **Per-family pass:** all four combos {Qwen 3.6 35B-A3B-Abliterix-EGA,
    Gemma 4 26B-A4B-it-ara} × {dwq-4, dwq-6} satisfy criteria 6–7.
    **HARNESS READY** — iter-12d-4 (`a62e4ee`)
