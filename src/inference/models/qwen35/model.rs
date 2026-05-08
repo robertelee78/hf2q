@@ -84,6 +84,17 @@ impl Qwen35LayerWeights {
             Qwen35LayerWeights::LinearAttn { ffn, .. } => ffn,
         }
     }
+
+    /// ADR-020 AC#5 Iter C2.4 — mutable accessor for the FFN slot, used
+    /// by `Qwen35Model::apply_dwq_overlay` to populate the
+    /// `MoeFfnWeightsQ::expert_*_affine` slots without re-allocating
+    /// the layer.
+    pub fn ffn_mut(&mut self) -> &mut Qwen35FfnWeights {
+        match self {
+            Qwen35LayerWeights::FullAttn { ffn, .. } => ffn,
+            Qwen35LayerWeights::LinearAttn { ffn, .. } => ffn,
+        }
+    }
 }
 
 // ================================================================
@@ -370,6 +381,237 @@ impl Qwen35Model {
     /// Per-layer kind lookup.
     pub fn layer_kind(&self, idx: u32) -> Option<Qwen35LayerKind> {
         self.layers.get(idx as usize).map(|l| l.kind())
+    }
+
+    /// ADR-020 AC#5 Iter C2.4 — overlay a DWQ-trained mlx-affine
+    /// safetensors file on top of an already-GGUF-loaded Qwen35 model.
+    ///
+    /// Walks the safetensors stems looking for SEPARATE per-expert
+    /// gate/up/down stems (`blk.{i}.ffn_gate.{e}`, `ffn_up.{e}`,
+    /// `ffn_down.{e}`).  Aggregates into stacked `MlxAffineMoeStack`
+    /// per (layer, role) bucket and assigns to
+    /// `MoeFfnWeightsQ.expert_{gate,up,down}_affine`.
+    ///
+    /// Note Qwen35 splits gate + up (no fused `ffn_gate_up.{e}`
+    /// — that's Gemma 4's convention).  Dense Qwen35 layers are not
+    /// covered (the production qwen35 path's dense layers go through
+    /// DenseFfnWeightsQ, not MlxModelWeights).  The overlay's `format`
+    /// metadata field is validated; `bits`/`group_size` come from
+    /// metadata too (default 4 / 32 if absent).
+    ///
+    /// Returns the count of MoE buckets overridden.  Logs each
+    /// unmatched stem at `tracing::warn!`.
+    pub fn apply_dwq_overlay(
+        &mut self,
+        device: &mlx_native::MlxDevice,
+        path: &std::path::Path,
+    ) -> anyhow::Result<usize> {
+        use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
+        use crate::serve::forward_mlx::{
+            parse_dwq_moe_expert_role, parse_dwq_overlay_metadata, MlxAffineMoeStack, MoeBaseRole,
+        };
+        use anyhow::Context;
+
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("qwen35 apply_dwq_overlay: read {}", path.display()))?;
+        let (_n, metadata_obj) = safetensors::SafeTensors::read_metadata(&bytes)
+            .map_err(|e| anyhow::anyhow!("qwen35 apply_dwq_overlay: read_metadata: {e:?}"))?;
+        let (bits, group_size) =
+            parse_dwq_overlay_metadata(metadata_obj.metadata().as_ref())
+                .with_context(|| format!("qwen35 apply_dwq_overlay: metadata of {}", path.display()))?;
+        let st = safetensors::SafeTensors::deserialize(&bytes)
+            .map_err(|e| anyhow::anyhow!("qwen35 apply_dwq_overlay: deserialize: {e:?}"))?;
+
+        let mut moe_buckets: std::collections::HashMap<
+            (usize, MoeBaseRole),
+            Vec<(usize, MlxAffineLinear)>,
+        > = std::collections::HashMap::new();
+        let mut unknown_skipped: usize = 0;
+
+        for name in st.names() {
+            let stem = match name.strip_suffix(".weight") {
+                Some(s) => s,
+                None => continue,
+            };
+            if st.tensor(&format!("{stem}.scales")).is_err()
+                || st.tensor(&format!("{stem}.biases")).is_err()
+            {
+                continue;
+            }
+            let after_blk = match stem.strip_prefix("blk.") {
+                Some(s) => s,
+                None => continue,
+            };
+            let dot = match after_blk.find('.') {
+                Some(d) => d,
+                None => continue,
+            };
+            let layer_idx: usize = match after_blk[..dot].parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if layer_idx >= self.layers.len() {
+                continue;
+            }
+            let role = &after_blk[(dot + 1)..];
+            // Only MoE per-expert stems matter for qwen35 — dense
+            // attention/mlp Linears are loaded into separate
+            // structs that this overlay does not currently touch
+            // (operator follow-up if needed).
+            if let Some((base, expert_idx)) = parse_dwq_moe_expert_role(role) {
+                let linear = MlxAffineLinear::from_safetensors(&st, stem, bits, group_size)
+                    .with_context(|| format!("qwen35 apply_dwq_overlay: parse {stem}"))?;
+                moe_buckets
+                    .entry((layer_idx, base))
+                    .or_default()
+                    .push((expert_idx, linear));
+            } else {
+                unknown_skipped += 1;
+            }
+        }
+
+        let mut moe_stacked: usize = 0;
+        for ((layer_idx, base), mut linears) in moe_buckets.into_iter() {
+            linears.sort_by_key(|(e, _)| *e);
+            let n_experts = linears.len();
+            for (i, (e, _)) in linears.iter().enumerate() {
+                if *e != i {
+                    anyhow::bail!(
+                        "qwen35 DWQ overlay: bucket (layer={layer_idx}, base={:?}) non-contiguous expert idx (got {} at slot {})",
+                        base, e, i,
+                    );
+                }
+            }
+            let n = linears[0].1.n;
+            let k = linears[0].1.k;
+            let bits_per = linears[0].1.bits;
+            let gs_per = linears[0].1.group_size;
+            for (e, l) in &linears[1..] {
+                if l.n != n || l.k != k || l.bits != bits_per || l.group_size != gs_per {
+                    anyhow::bail!(
+                        "qwen35 DWQ overlay: bucket (layer={layer_idx}, base={:?}) expert {} shape mismatch",
+                        base, e,
+                    );
+                }
+            }
+            if bits_per != 4 || gs_per != 32 {
+                anyhow::bail!(
+                    "qwen35 DWQ overlay: only bits=4 group_size=32 supported (got bits={}, gs={})",
+                    bits_per, gs_per,
+                );
+            }
+            let pack_factor = 32 / bits_per as usize;
+            let k_packed = k / pack_factor;
+            let groups_per_row = k / (gs_per as usize);
+
+            // Pack + BF16 conversion + upload.
+            let stack_words = n_experts * n * k_packed;
+            let mut packed_stack: Vec<u32> = vec![0u32; stack_words];
+            let mut scales_stack_bf16: Vec<u16> =
+                vec![0u16; n_experts * n * groups_per_row];
+            let mut biases_stack_bf16: Vec<u16> =
+                vec![0u16; n_experts * n * groups_per_row];
+            for (e, lin) in &linears {
+                for row in 0..n {
+                    for kp in 0..k_packed {
+                        let mut word: u32 = 0;
+                        for j in 0..pack_factor {
+                            let code = lin.q_int[row * k + kp * pack_factor + j] as u32;
+                            debug_assert!(code <= 0xF);
+                            word |= (code & 0xF) << (j * 4);
+                        }
+                        packed_stack[((*e * n) + row) * k_packed + kp] = word;
+                    }
+                }
+                let s_offset = e * n * groups_per_row;
+                for (i, v) in lin.scales.iter().enumerate() {
+                    scales_stack_bf16[s_offset + i] = half::bf16::from_f32(*v).to_bits();
+                }
+                for (i, v) in lin.biases.iter().enumerate() {
+                    biases_stack_bf16[s_offset + i] = half::bf16::from_f32(*v).to_bits();
+                }
+            }
+
+            let mut weight_buf = device
+                .alloc_buffer(
+                    stack_words * std::mem::size_of::<u32>(),
+                    mlx_native::DType::U32,
+                    vec![n_experts, n, k_packed],
+                )
+                .map_err(|e| anyhow::anyhow!("qwen35 MoE stack weight alloc: {e}"))?;
+            weight_buf
+                .as_mut_slice::<u32>()
+                .map_err(|e| anyhow::anyhow!("qwen35 MoE stack weight slice: {e}"))?
+                .copy_from_slice(&packed_stack);
+            let mut scales_buf = device
+                .alloc_buffer(
+                    scales_stack_bf16.len() * std::mem::size_of::<u16>(),
+                    mlx_native::DType::BF16,
+                    vec![n_experts, n, groups_per_row],
+                )
+                .map_err(|e| anyhow::anyhow!("qwen35 MoE stack scales alloc: {e}"))?;
+            scales_buf
+                .as_mut_slice::<u16>()
+                .map_err(|e| anyhow::anyhow!("qwen35 MoE stack scales slice: {e}"))?
+                .copy_from_slice(&scales_stack_bf16);
+            let mut biases_buf = device
+                .alloc_buffer(
+                    biases_stack_bf16.len() * std::mem::size_of::<u16>(),
+                    mlx_native::DType::BF16,
+                    vec![n_experts, n, groups_per_row],
+                )
+                .map_err(|e| anyhow::anyhow!("qwen35 MoE stack biases alloc: {e}"))?;
+            biases_buf
+                .as_mut_slice::<u16>()
+                .map_err(|e| anyhow::anyhow!("qwen35 MoE stack biases slice: {e}"))?
+                .copy_from_slice(&biases_stack_bf16);
+
+            let stack = MlxAffineMoeStack {
+                weight: weight_buf,
+                scales: scales_buf,
+                biases: biases_buf,
+                n,
+                k,
+                bits: bits_per,
+                group_size: gs_per as u32,
+                num_experts: n_experts,
+            };
+
+            // Assign to the right MoE slot.
+            let layer = &mut self.layers[layer_idx];
+            if let Qwen35FfnWeights::MoeQ(moeq) = layer.ffn_mut() {
+                match base {
+                    MoeBaseRole::Gate => moeq.expert_gate_affine = Some(stack),
+                    MoeBaseRole::Up => moeq.expert_up_affine = Some(stack),
+                    MoeBaseRole::Down => moeq.expert_down_affine = Some(stack),
+                    MoeBaseRole::GateUp => {
+                        tracing::warn!(
+                            layer_idx,
+                            n_experts,
+                            "qwen35 DWQ overlay: fused ffn_gate_up.{{e}} not supported (Gemma 4 convention); skipping bucket"
+                        );
+                        continue;
+                    }
+                }
+                moe_stacked += 1;
+                tracing::debug!(layer_idx, ?base, n_experts, n, k, "qwen35 DWQ overlay applied");
+            } else {
+                tracing::warn!(
+                    layer_idx,
+                    "qwen35 DWQ overlay: layer FFN is not MoeQ; skipping {:?} bucket",
+                    base
+                );
+            }
+        }
+
+        tracing::info!(
+            moe_stacked,
+            unknown_skipped,
+            bits,
+            group_size,
+            "qwen35 DWQ overlay applied: {moe_stacked} MoE expert stacks"
+        );
+        Ok(moe_stacked)
     }
 }
 
