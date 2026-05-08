@@ -543,6 +543,220 @@ pub fn fd_sensitivity_inputs_for_attn_linears(
     ])
 }
 
+/// Host multi-head SDPA: `out[b, head·hd + d] = Σ_b' softmax(Q·K^T)[b, b'] · V[b', head·hd + d]`.
+///
+/// Direct port of the CPU oracle in
+/// `qwen35_attention_block::tests::multi_head_sdpa_cpu_oracle`.  No causal
+/// mask — DWQ calibration uses bidirectional attention over the
+/// calibration batch (matches the synthetic-fixture forward in
+/// `qwen35_layer::forward` which is bidirectional too).
+fn sdpa_host(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    batch: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let hidden = n_heads * head_dim;
+    let mut out = vec![0f32; batch * hidden];
+    for h in 0..n_heads {
+        let start = h * head_dim;
+        // scores[b, b'] = Σ_d Q[b, start+d] · K[b', start+d]
+        let mut scores = vec![0f32; batch * batch];
+        for b in 0..batch {
+            for bp in 0..batch {
+                let mut acc = 0.0f32;
+                for d in 0..head_dim {
+                    acc += q[b * hidden + start + d] * k[bp * hidden + start + d];
+                }
+                scores[b * batch + bp] = acc;
+            }
+        }
+        // Per-row softmax.
+        let mut attn = vec![0f32; batch * batch];
+        for b in 0..batch {
+            let row = &scores[b * batch..(b + 1) * batch];
+            let m = row.iter().fold(f32::NEG_INFINITY, |a, &x| a.max(x));
+            let mut sum = 0.0f32;
+            let mut e = vec![0f32; batch];
+            for (j, &x) in row.iter().enumerate() {
+                e[j] = (x - m).exp();
+                sum += e[j];
+            }
+            for j in 0..batch {
+                attn[b * batch + j] = e[j] / sum;
+            }
+        }
+        // out[b, d] = Σ_b' attn[b, b'] · V[b', start+d]
+        for b in 0..batch {
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for bp in 0..batch {
+                    acc += attn[b * batch + bp] * v[bp * hidden + start + d];
+                }
+                out[b * hidden + start + d] = acc;
+            }
+        }
+    }
+    out
+}
+
+/// Host SiLU activation: `silu(x) = x · σ(x) = x / (1 + e^{-x})`.
+fn silu_host(x: &[f32]) -> Vec<f32> {
+    x.iter().map(|&v| v / (1.0 + (-v).exp())).collect()
+}
+
+/// ADR-020 iter-12b-2-ffn — capture FD-sensitivity inputs for ALL
+/// 7 Linears of one dense decoder layer (Q, K, V, O, gate, up, down).
+///
+/// CPU mirror of `qwen35_layer::forward`'s op chain — captures the
+/// per-Linear (X, W, y_T) triple at every Linear in the layer:
+///
+///   normed_attn = rms_norm(x_layer_input, w_attn_norm)
+///   Q  = normed_attn @ w_q^T          ← X_q  = normed_attn,  y_T_q  = Q
+///   K  = normed_attn @ w_k^T          ← X_k  = normed_attn,  y_T_k  = K
+///   V  = normed_attn @ w_v^T          ← X_v  = normed_attn,  y_T_v  = V
+///   context = multi_head_sdpa(Q,K,V)
+///   O  = context @ w_o^T              ← X_o  = context,      y_T_o  = O
+///   y_attn = x_layer_input + O
+///   normed_ffn = rms_norm(y_attn, w_ffn_norm)
+///   gate = normed_ffn @ w_gate^T      ← X_g  = normed_ffn,   y_T_g  = gate
+///   up   = normed_ffn @ w_up^T        ← X_u  = normed_ffn,   y_T_u  = up
+///   pre  = silu(gate) ⊙ up
+///   down = pre @ w_down^T             ← X_d  = pre,          y_T_d  = down
+///
+/// Names follow GGUF convention so the calibrator can route scores
+/// directly to the bit-allocation map.
+///
+/// Returns the 7 inputs in canonical (Q, K, V, O, gate, up, down)
+/// order so callers can index by name OR position.  Ordering matches
+/// the dispatch order in `qwen35_layer::forward`, NOT alphabetical.
+///
+/// # Shape contract
+///
+/// All `[batch, hidden]` for residual-stream / projection outputs.
+/// `w_q/k/v/o`: `[hidden, hidden]`.  `w_gate/up`: `[intermediate, hidden]`.
+/// `w_down`: `[hidden, intermediate]`.
+#[allow(clippy::too_many_arguments)]
+pub fn fd_sensitivity_inputs_for_dense_layer(
+    layer_idx: usize,
+    batch: usize,
+    hidden: usize,
+    intermediate: usize,
+    n_heads: usize,
+    head_dim: usize,
+    eps: f32,
+    x_layer_input: &[f32],
+    w_attn_norm: &[f32],
+    w_q: &[f32],
+    w_k: &[f32],
+    w_v: &[f32],
+    w_o: &[f32],
+    w_ffn_norm: &[f32],
+    w_gate: &[f32],
+    w_up: &[f32],
+    w_down: &[f32],
+) -> Result<[LinearFdInputOwned; 7]> {
+    if n_heads * head_dim != hidden {
+        return Err(anyhow!(
+            "fd_sensitivity_inputs_for_dense_layer: n_heads({}) * head_dim({}) != hidden({})",
+            n_heads,
+            head_dim,
+            hidden
+        ));
+    }
+    if x_layer_input.len() != batch * hidden {
+        return Err(anyhow!(
+            "x_layer_input len {} != batch({}) * hidden({}) = {}",
+            x_layer_input.len(),
+            batch,
+            hidden,
+            batch * hidden
+        ));
+    }
+    if w_attn_norm.len() != hidden || w_ffn_norm.len() != hidden {
+        return Err(anyhow!(
+            "norm weights: w_attn_norm.len()={}, w_ffn_norm.len()={}, expected {}",
+            w_attn_norm.len(),
+            w_ffn_norm.len(),
+            hidden
+        ));
+    }
+    let hidden_sq = hidden * hidden;
+    for (label, w) in [("w_q", w_q), ("w_k", w_k), ("w_v", w_v), ("w_o", w_o)] {
+        if w.len() != hidden_sq {
+            return Err(anyhow!("{label} len {} != hidden² {}", w.len(), hidden_sq));
+        }
+    }
+    let hidden_inter = hidden * intermediate;
+    let inter_hidden = intermediate * hidden;
+    if w_gate.len() != hidden_inter || w_up.len() != hidden_inter {
+        return Err(anyhow!(
+            "ffn projections: w_gate.len()={}, w_up.len()={}, expected hidden·inter = {}",
+            w_gate.len(),
+            w_up.len(),
+            hidden_inter
+        ));
+    }
+    if w_down.len() != inter_hidden {
+        return Err(anyhow!(
+            "w_down len {} != inter·hidden {}",
+            w_down.len(),
+            inter_hidden
+        ));
+    }
+
+    // Attn block.
+    let normed_attn = rms_norm_host(x_layer_input, w_attn_norm, batch, hidden, eps);
+    let q_out = matmul_x_wt(&normed_attn, w_q, batch, hidden, hidden);
+    let k_out = matmul_x_wt(&normed_attn, w_k, batch, hidden, hidden);
+    let v_out = matmul_x_wt(&normed_attn, w_v, batch, hidden, hidden);
+    let context = sdpa_host(&q_out, &k_out, &v_out, batch, n_heads, head_dim);
+    let o_out = matmul_x_wt(&context, w_o, batch, hidden, hidden);
+
+    // Residual after attn.
+    let y_attn: Vec<f32> = x_layer_input
+        .iter()
+        .zip(o_out.iter())
+        .map(|(a, b)| a + b)
+        .collect();
+
+    // FFN block.
+    let normed_ffn = rms_norm_host(&y_attn, w_ffn_norm, batch, hidden, eps);
+    let gate_out = matmul_x_wt(&normed_ffn, w_gate, batch, intermediate, hidden);
+    let up_out = matmul_x_wt(&normed_ffn, w_up, batch, intermediate, hidden);
+    let silu_gate = silu_host(&gate_out);
+    let pre_down: Vec<f32> = silu_gate
+        .iter()
+        .zip(up_out.iter())
+        .map(|(a, b)| a * b)
+        .collect();
+    let down_out = matmul_x_wt(&pre_down, w_down, batch, hidden, intermediate);
+
+    // Pack 7 LinearFdInputOwned in canonical forward order.
+    let mk = |name: String, w: &[f32], x: Vec<f32>, y_t: Vec<f32>, n: usize, k: usize| {
+        LinearFdInputOwned {
+            name,
+            w: w.to_vec(),
+            x,
+            y_t,
+            n,
+            k,
+            m: batch,
+        }
+    };
+    Ok([
+        mk(format!("blk.{layer_idx}.attn_q.weight"), w_q, normed_attn.clone(), q_out, hidden, hidden),
+        mk(format!("blk.{layer_idx}.attn_k.weight"), w_k, normed_attn.clone(), k_out, hidden, hidden),
+        mk(format!("blk.{layer_idx}.attn_v.weight"), w_v, normed_attn,         v_out, hidden, hidden),
+        mk(format!("blk.{layer_idx}.attn_output.weight"), w_o, context, o_out, hidden, hidden),
+        mk(format!("blk.{layer_idx}.ffn_gate.weight"), w_gate, normed_ffn.clone(), gate_out, intermediate, hidden),
+        mk(format!("blk.{layer_idx}.ffn_up.weight"),   w_up,   normed_ffn,         up_out,   intermediate, hidden),
+        mk(format!("blk.{layer_idx}.ffn_down.weight"), w_down, pre_down, down_out, hidden, intermediate),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1098,6 +1312,142 @@ mod tests {
         assert!(
             msg.contains("w_attn_norm") && msg.contains("hidden"),
             "error must mention the offending tensor + dim: {msg}"
+        );
+    }
+
+    /// ADR-020 iter-12b-2-ffn — `fd_sensitivity_inputs_for_dense_layer`
+    /// captures all 7 Linears with valid (X, W, y_T) triples + the
+    /// inner ones (attn_o, ffn_gate/up/down) line up with their CPU
+    /// chain.
+    #[test]
+    fn dense_layer_capture_produces_all_seven_linears() {
+        let layer_idx = 3usize;
+        let batch = 32usize;
+        let hidden = 64usize;
+        let intermediate = 128usize;
+        let n_heads = 2usize;
+        let head_dim = 32usize;
+        let eps = 1e-6f32;
+
+        // Deterministic xorshift fixture.
+        let mut s: u64 = 0xDEAD_BEEF_F00D_F00D;
+        let mut next = move || -> f32 {
+            s ^= s >> 33;
+            s = s.wrapping_mul(0xff51_afd7_ed55_8ccd);
+            s ^= s >> 33;
+            ((s as i64) as f32) / (i64::MAX as f32)
+        };
+        let x_layer: Vec<f32> = (0..(batch * hidden)).map(|_| next() * 0.5).collect();
+        let w_attn_norm: Vec<f32> = (0..hidden).map(|_| 1.0 + next() * 0.05).collect();
+        let w_q: Vec<f32> = (0..(hidden * hidden)).map(|_| next() * 0.4).collect();
+        let w_k: Vec<f32> = (0..(hidden * hidden)).map(|_| next() * 0.4).collect();
+        let w_v: Vec<f32> = (0..(hidden * hidden)).map(|_| next() * 0.4).collect();
+        let w_o: Vec<f32> = (0..(hidden * hidden)).map(|_| next() * 0.4).collect();
+        let w_ffn_norm: Vec<f32> = (0..hidden).map(|_| 1.0 + next() * 0.05).collect();
+        let w_gate: Vec<f32> =
+            (0..(hidden * intermediate)).map(|_| next() * 0.4).collect();
+        let w_up: Vec<f32> =
+            (0..(hidden * intermediate)).map(|_| next() * 0.4).collect();
+        let w_down: Vec<f32> =
+            (0..(intermediate * hidden)).map(|_| next() * 0.4).collect();
+
+        let triples = fd_sensitivity_inputs_for_dense_layer(
+            layer_idx,
+            batch,
+            hidden,
+            intermediate,
+            n_heads,
+            head_dim,
+            eps,
+            &x_layer,
+            &w_attn_norm,
+            &w_q,
+            &w_k,
+            &w_v,
+            &w_o,
+            &w_ffn_norm,
+            &w_gate,
+            &w_up,
+            &w_down,
+        )
+        .expect("dense layer capture must succeed");
+
+        // 1. Canonical name + dispatch order.
+        let expected_names = [
+            format!("blk.{layer_idx}.attn_q.weight"),
+            format!("blk.{layer_idx}.attn_k.weight"),
+            format!("blk.{layer_idx}.attn_v.weight"),
+            format!("blk.{layer_idx}.attn_output.weight"),
+            format!("blk.{layer_idx}.ffn_gate.weight"),
+            format!("blk.{layer_idx}.ffn_up.weight"),
+            format!("blk.{layer_idx}.ffn_down.weight"),
+        ];
+        for (t, name) in triples.iter().zip(expected_names.iter()) {
+            assert_eq!(t.name, *name, "name mismatch");
+        }
+
+        // 2. Q/K/V share bit-equal post-attn-norm input X.
+        assert_eq!(triples[0].x, triples[1].x, "Q/K share X");
+        assert_eq!(triples[0].x, triples[2].x, "Q/V share X");
+
+        // 3. ffn_gate / ffn_up share bit-equal post-FFN-norm input X.
+        assert_eq!(triples[4].x, triples[5].x, "gate/up share X");
+
+        // 4. attn_o, ffn_down each have their own X (context, pre).
+        assert_ne!(triples[3].x, triples[0].x, "attn_o X must differ from Q's X");
+        assert_ne!(triples[6].x, triples[4].x, "ffn_down X must differ from gate's X");
+
+        // 5. Per-Linear y_T = X @ W^T to FP32 precision.
+        for t in &triples {
+            let y_expected = matmul_x_wt(&t.x, &t.w, t.m, t.n, t.k);
+            for (i, (a, b)) in t.y_t.iter().zip(y_expected.iter()).enumerate() {
+                let d = (a - b).abs();
+                assert!(
+                    d < 1e-3,
+                    "{}: y_t[{i}] = {a} != X@W^T = {b} (diff {d})",
+                    t.name
+                );
+            }
+        }
+
+        // 6. All 7 borrow + dispatch through compute_fd_sensitivity_per_linear.
+        let borrowed: Vec<LinearFdInput<'_>> =
+            triples.iter().map(|t| t.as_borrowed()).collect();
+        let scores =
+            compute_fd_sensitivity_per_linear(&borrowed, 4, 8, 32, 2.0).unwrap();
+        assert_eq!(scores.len(), 7, "all 7 Linears get a score");
+        for t in &triples {
+            let s = scores
+                .get(&t.name)
+                .copied()
+                .unwrap_or_else(|| panic!("missing score for {}", t.name));
+            assert!(s.is_finite(), "{} score not finite: {s}", t.name);
+        }
+    }
+
+    /// ADR-020 iter-12b-2-ffn — n_heads / head_dim must factor hidden;
+    /// otherwise SDPA can't tile correctly and downstream y_T_o would
+    /// be garbage.  Falsifier for the silent-tile-mismatch class.
+    #[test]
+    fn dense_layer_capture_rejects_invalid_head_factoring() {
+        let r = fd_sensitivity_inputs_for_dense_layer(
+            0, 32, 64, 128, /*n_heads*/ 3, /*head_dim*/ 32, 1e-6,
+            &vec![0.0f32; 32 * 64],
+            &vec![1.0f32; 64],
+            &vec![0.0f32; 64 * 64],
+            &vec![0.0f32; 64 * 64],
+            &vec![0.0f32; 64 * 64],
+            &vec![0.0f32; 64 * 64],
+            &vec![1.0f32; 64],
+            &vec![0.0f32; 64 * 128],
+            &vec![0.0f32; 64 * 128],
+            &vec![0.0f32; 128 * 64],
+        );
+        assert!(r.is_err());
+        let msg = format!("{}", r.err().unwrap());
+        assert!(
+            msg.contains("n_heads") && msg.contains("hidden"),
+            "error must mention n_heads + hidden: {msg}"
         );
     }
 }
