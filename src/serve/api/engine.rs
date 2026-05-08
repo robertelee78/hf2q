@@ -7647,6 +7647,20 @@ pub fn render_chat_prompt_with_tools(
 
 /// Resolve tokenizer path the same way `cmd_generate` does.
 fn find_tokenizer(model_path: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
+    // ADR-022 P1.8 / P1.10 — Same antipattern as the now-removed
+    // `find_config` walk: previously walked `models/<subdir>/tokenizer.json`
+    // and silently returned a peer model's tokenizer (e.g. qwen3.6's was
+    // returned for a Gemma4 GGUF, producing token-id-mismatched garbage
+    // output). Operator: "fallbacks in general are an antipattern" — the
+    // walk is removed. Resolution order is now strict and explicit:
+    //
+    //   1. `--tokenizer <path>` (CLI flag)
+    //   2. `tokenizer.json` next to the .gguf
+    //
+    // No filesystem walk fallback. Future P1.11 work: parse the embedded
+    // tokenizer from GGUF metadata (`tokenizer.ggml.tokens`, scores,
+    // merges, special-token ids) so the on-disk tokenizer.json is no
+    // longer required either, mirroring how llama.cpp self-bootstraps.
     if let Some(p) = explicit {
         return Ok(p.to_path_buf());
     }
@@ -7655,26 +7669,11 @@ fn find_tokenizer(model_path: &Path, explicit: Option<&Path>) -> Result<PathBuf>
     if candidate.exists() {
         return Ok(candidate);
     }
-    for subdir in &["gemma4", "gemma-4"] {
-        let candidate = Path::new("models").join(subdir).join("tokenizer.json");
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-    let models_dir = Path::new("models");
-    if models_dir.is_dir() {
-        for entry in std::fs::read_dir(models_dir)? {
-            let entry = entry?;
-            if entry.path().is_dir() {
-                let tok = entry.path().join("tokenizer.json");
-                if tok.exists() {
-                    return Ok(tok);
-                }
-            }
-        }
-    }
     anyhow::bail!(
-        "Cannot find tokenizer.json. Use --tokenizer to specify the path explicitly."
+        "Cannot find tokenizer.json next to {}. Use --tokenizer <path> to specify it explicitly. \
+         (The legacy `models/<subdir>/tokenizer.json` walk was removed under ADR-022 P1.10 — it \
+         was silently picking peer models' tokenizers.)",
+        model_path.display()
     )
 }
 

@@ -5329,6 +5329,124 @@ mod dense_placeholder_tests {
     }
 }
 
+/// ADR-022 P1.9 iter-15 — `dispatch_qmatmul` F32 routing test.
+///
+/// Hypothesis: an `MlxQWeight` with `ggml_dtype = F32` (router weight from
+/// APEX-format Gemma4 GGUF) routes through `dense_matmul_f32_f32_tensor`
+/// and produces `output[m, n] = sum_k input[m, k] * weight[n, k]`
+/// matching a CPU reference.
+///
+/// Falsifier: pre-iter-15 hf2q dispatched F32 weights through
+/// `quantized_matmul_ggml`, which (correctly) returned an error because
+/// the GGML block kernels require block-format input. With this routing
+/// fix the same call must succeed and produce the expected matmul.
+#[cfg(test)]
+mod dispatch_qmatmul_f32_router_test {
+    use super::*;
+
+    #[test]
+    fn f32_router_weight_routes_to_dense_matmul() {
+        let device = match mlx_native::MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping f32_router_weight_routes_to_dense_matmul: no MlxDevice");
+                return;
+            }
+        };
+        let mut registry = mlx_native::KernelRegistry::new();
+
+        // [n=4 output, k=64 inner] — k≥32 required by dense_mm_f32_f32 kernel.
+        let n: usize = 4;
+        let k: usize = 64;
+        let m: usize = 2;
+
+        // Deterministic pseudo-random fixtures.
+        let mut state: u64 = 0xDEAD_BEEF_F00D_F00D;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0
+        };
+        let weight: Vec<f32> = (0..(n * k)).map(|_| next()).collect();
+        let input: Vec<f32> = (0..(m * k)).map(|_| next()).collect();
+
+        // CPU reference: out[m, n] = sum_k input[m, k] * weight[n, k].
+        let mut expected = vec![0.0f32; m * n];
+        for mi in 0..m {
+            for ni in 0..n {
+                let mut acc = 0.0f64;
+                for ki in 0..k {
+                    acc += (input[mi * k + ki] as f64) * (weight[ni * k + ki] as f64);
+                }
+                expected[mi * n + ni] = acc as f32;
+            }
+        }
+
+        // GPU buffers.
+        let f32_sz = std::mem::size_of::<f32>();
+        let mut weight_buf = device
+            .alloc_buffer(n * k * f32_sz, mlx_native::DType::F32, vec![n, k])
+            .expect("alloc weight");
+        weight_buf
+            .as_mut_slice::<f32>()
+            .expect("weight write")
+            .copy_from_slice(&weight);
+
+        let mut input_buf = device
+            .alloc_buffer(m * k * f32_sz, mlx_native::DType::F32, vec![m, k])
+            .expect("alloc input");
+        input_buf
+            .as_mut_slice::<f32>()
+            .expect("input write")
+            .copy_from_slice(&input);
+
+        let mut output_buf = device
+            .alloc_buffer(m * n * f32_sz, mlx_native::DType::F32, vec![m, n])
+            .expect("alloc output");
+
+        let qweight = MlxQWeight {
+            buffer: weight_buf,
+            info: super::super::gpu::QuantWeightInfo {
+                ggml_dtype: mlx_native::GgmlType::F32,
+                rows: n,
+                cols: k,
+            },
+        };
+
+        // Run through GraphSession (mirrors production dispatch path).
+        let executor = mlx_native::GraphExecutor::new(device.clone());
+        let mut session = executor.begin().expect("begin session");
+        dispatch_qmatmul(
+            &mut session,
+            &mut registry,
+            &device,
+            &input_buf,
+            &qweight,
+            &mut output_buf,
+            m as u32,
+        )
+        .expect("dispatch_qmatmul F32 path");
+        session.finish().expect("session finish");
+
+        // Validate output.
+        let got: &[f32] = output_buf.as_slice().expect("read output");
+        let mut max_abs_diff = 0.0f32;
+        for i in 0..(m * n) {
+            let d = (got[i] - expected[i]).abs();
+            if d > max_abs_diff {
+                max_abs_diff = d;
+            }
+        }
+        assert!(
+            max_abs_diff < 1e-4,
+            "F32 dispatch_qmatmul mismatch: max|diff|={max_abs_diff}, got={:?}, expected={:?}",
+            got,
+            expected
+        );
+    }
+}
+
 /// Helper: load a GGUF tensor as raw quantized bytes into an MlxQWeight.
 ///
 /// The tensor name is looked up in the GGUF file, its raw GGML block data
@@ -5469,10 +5587,19 @@ pub fn dispatch_rms_norm_unit_perhead_dual_perm(
     Ok(())
 }
 
-/// Run one quantized matmul through the GraphSession.
+/// Run one weight matmul through the GraphSession, routing by GGUF dtype.
 ///
-/// Dispatches `output = input @ weight.T` where weight is in GGML block format.
-/// The output buffer is pre-allocated by the caller.
+/// Dispatches `output = input @ weight.T`. The output buffer is pre-allocated
+/// by the caller.  This is the single GGUF-format dispatcher: the
+/// `weight.info.ggml_dtype` field selects the underlying kernel, NOT a
+/// fallback chain. F32 → `dense_matmul_f32_f32_tensor` (peer of llama.cpp's
+/// `kernel_mul_mm_f32_f32`); Q* / IQ* → `quantized_matmul_ggml`.
+///
+/// ADR-022 P1.9 — APEX-format Gemma4 GGUFs preserve `ffn_gate_inp.weight`
+/// (router projection) as F32 for accuracy. mlx-native's
+/// `quantized_matmul_ggml` correctly refuses F32 because the GGML block
+/// kernels require block-format input; this wrapper routes F32 to the
+/// dense F32 matmul kernel that mlx-native already ships.
 ///
 /// Takes `registry` and `device` separately to avoid borrow conflicts on
 /// `GpuContext` (registry is `&mut`, device is `&`).
@@ -5485,6 +5612,31 @@ pub fn dispatch_qmatmul(
     output: &mut MlxBuffer,
     m: u32,
 ) -> Result<()> {
+    if weight.info.ggml_dtype == mlx_native::GgmlType::F32 {
+        // F32 dense path. Weight buffer holds [n_rows, k_cols] f32 row-major.
+        // dense_matmul_f32_f32_tensor expects:
+        //   src0 = weight  [src0_batch, n, k] f32 → [1, rows, cols]
+        //   src1 = input   [src1_batch, m, k] f32 → [1, m, cols]
+        //   dst  = output  [src1_batch, m, n] f32 → [1, m, rows]
+        let params = mlx_native::DenseMmF32F32Params {
+            m,
+            n: weight.info.rows as u32,
+            k: weight.info.cols as u32,
+            src0_batch: 1,
+            src1_batch: 1,
+        };
+        return mlx_native::dense_matmul_f32_f32_tensor(
+            session.encoder_mut(),
+            registry,
+            device,
+            &weight.buffer,
+            input,
+            output,
+            &params,
+        )
+        .map_err(|e| anyhow::anyhow!("dense_matmul_f32_f32_tensor failed: {e}"));
+    }
+
     let params = weight.matmul_params(m)?;
     session.quantized_matmul_ggml(
         registry,
