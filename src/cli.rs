@@ -606,12 +606,16 @@ pub struct GenerateArgs {
     /// `hf2q generate` validates the GGUF + parses `MmprojConfig` +
     /// loads the projector weights onto the Metal device, and surfaces
     /// the file in the load banner (`vision = <path> (sha256 ...)`).
-    /// Image-input wire-up on the CLI (`--image`) is a follow-up; today
-    /// the flag exercises the load path so the banner reports actual
-    /// vision capability instead of "mmproj-required (no mmproj loaded)".
     /// Mirror of `serve --mmproj`.
     #[arg(long)]
     pub mmproj: Option<PathBuf>,
+
+    /// Path to an input image (PNG / JPEG / WebP). Requires `--mmproj`.
+    /// When supplied, `hf2q generate` runs the ViT GPU forward, splices
+    /// the vision embeddings into the prompt at the chat template's
+    /// image markers, and decodes against the augmented sequence.
+    #[arg(long)]
+    pub image: Option<PathBuf>,
 
     /// Sampling temperature (0.0 = greedy, deterministic).
     ///

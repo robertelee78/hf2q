@@ -466,20 +466,22 @@ fn alloc_one_f32_placeholder(
         .map_err(|e| anyhow::anyhow!("dense MoE placeholder alloc ({label}): {e}"))
 }
 
-/// ADR-020 AC#5 Iter C2.2 — stacked mlx-affine MoE expert weights for
-/// one (role, layer) tuple.  Each buffer holds the full expert stack
-/// in row-major order: `weight[e, n, k_packed]` U32, `scales[e, n,
-/// k/group_size]` F32, `biases[e, n, k/group_size]` F32.
+/// ADR-020 AC#5 Iter C2.2/C2.3 — stacked mlx-affine MoE expert weights
+/// for one (role, layer) tuple.  Each buffer holds the full expert
+/// stack in row-major order: `weight[e, n, k_packed]` U32,
+/// `scales[e, n, k/group_size]` BF16, `biases[e, n, k/group_size]` BF16.
 ///
-/// Consumed by the qwen35moe path's MoE-id dispatch (Iter C2.3) via
-/// `mlx_native::quantized_matmul_id` (already mlx-affine format —
-/// same kernel that mlx-lm uses).
+/// Consumed by the MoE-id dispatch path (Iter C2.3) via
+/// `mlx_native::quantized_matmul_id_into` (same packed-U32 kernel
+/// that mlx-lm uses).  BF16 scales/biases are the kernel's native
+/// dtype — F32 input from `MlxAffineLinear::scales`/`biases` is cast
+/// at upload time inside `MlxAffineMoeStack::from_per_expert_linears`.
 pub struct MlxAffineMoeStack {
     /// Packed-U32 weight stack `[n_experts, N, K/pack_factor]`.
     pub weight: MlxBuffer,
-    /// F32 scales stack `[n_experts, N, K/group_size]`.
+    /// BF16 scales stack `[n_experts, N, K/group_size]`.
     pub scales: MlxBuffer,
-    /// F32 biases stack `[n_experts, N, K/group_size]`.
+    /// BF16 biases stack `[n_experts, N, K/group_size]`.
     pub biases: MlxBuffer,
     /// Output dim per expert.
     pub n: usize,
