@@ -1062,7 +1062,6 @@ mod tests {
 
         // Routing: top_k=2, per-token weights + indices.  Alternate to ensure
         // both experts are active and have varying routing weights.
-        let top_k = 2;
         let expert_ids: Vec<Vec<usize>> = (0..n_tokens)
             .map(|t| if t % 2 == 0 { vec![0, 1] } else { vec![1, 0] })
             .collect();

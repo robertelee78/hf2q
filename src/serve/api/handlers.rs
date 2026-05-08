@@ -8542,7 +8542,7 @@ mod multimodal_tests {
             for j in 0..(1 + n_deepstack) {
                 for h in 0..hidden {
                     augmented[r * per_row_floats + j * hidden + h] =
-                        ((r * 1000 + j * 100 + h) as f32);
+                        (r * 1000 + j * 100 + h) as f32;
                 }
             }
         }

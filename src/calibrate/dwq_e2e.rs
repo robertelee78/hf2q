@@ -60,7 +60,7 @@ mod tests {
     use crate::calibrate::dynamic_quant_gpu::kl_div_loss_per_row;
     use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
     use mlx_native::ops::qmm_affine::dispatch_qmm_affine_t_f32;
-    use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
+    use mlx_native::{DType, KernelRegistry, MlxDevice};
 
     /// Run iter-15's fused kernel with the given (q_int, scales,
     /// biases) and return the FP32 host logits.  Helper used by both
