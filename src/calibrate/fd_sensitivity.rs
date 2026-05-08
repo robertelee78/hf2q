@@ -36,6 +36,8 @@
 //! `compute_layer_sensitivity` in the `DwqCalibrator` dispatch) is
 //! iter-12b-3.
 
+use std::collections::BTreeMap;
+
 use anyhow::{anyhow, Result};
 
 /// Compute FD sensitivity for a single Linear weight tensor.
@@ -320,6 +322,80 @@ fn stable_log_softmax_scaled(logits: &[f32], inv_t: f32) -> Vec<f32> {
         .iter()
         .map(|&l| l * inv_t - max_val - log_sum)
         .collect()
+}
+
+/// ADR-020 iter-12b-2-prep — borrowed bundle of one Linear's FD
+/// sensitivity inputs, mirroring `mlx-lm`'s
+/// `dynamic_quant.estimate_sensitivities` per-tensor input shape.
+///
+/// All slices use the same row-major layout as
+/// [`compute_fd_sensitivity`].  `name` is the Linear's path (e.g.
+/// `"blk.0.ffn_gate_inp.weight"`) — used as the `BTreeMap` key in the
+/// returned sensitivity dict so the calibrator can attribute scores
+/// back to specific tensors when allocating bits.
+pub struct LinearFdInput<'a> {
+    pub name: String,
+    pub w: &'a [f32],
+    pub x: &'a [f32],
+    pub y_t: &'a [f32],
+    pub n: usize,
+    pub k: usize,
+    pub m: usize,
+}
+
+/// ADR-020 iter-12b-2-prep — compute FD sensitivity for a list of
+/// Linears, returning an `mlx-lm`-shaped `BTreeMap<name → score>`.
+///
+/// Wraps the per-Linear [`compute_fd_sensitivity`] primitive in a list-
+/// shaped API matching `dynamic_quant_gpu::estimate_sensitivities`'s
+/// return type.  Bridges iter-12b-1 (per-Linear primitive) to
+/// iter-12b-3 (calibrator wire-up): downstream code can take the
+/// returned scores → wrap in `LayerSensitivity` → feed to
+/// `allocate_bits_by_sensitivity` for the bit assignment, OR map
+/// directly to a quantizer mask without going through the layer-
+/// indexed heuristic struct.
+///
+/// Fail-loud on duplicate `name` keys (silent map-overwrite would
+/// drop sensitivity data and produce wrong allocations).  Same per-
+/// Linear validation as [`compute_fd_sensitivity`].
+///
+/// # Arguments
+///
+/// * `linears` — slice of `LinearFdInput` per Linear under
+///   consideration; ordering does not affect output.
+/// * `low_bits`, `high_bits`, `group_size`, `temperature` — same
+///   semantics as [`compute_fd_sensitivity`]; applied uniformly across
+///   all Linears (bit-pair sweeps are the caller's job).
+///
+/// # Errors
+///
+/// * Any per-Linear validation failure from [`compute_fd_sensitivity`]
+///   (annotated with the offending Linear's name).
+/// * Duplicate `name` across the input slice.
+pub fn compute_fd_sensitivity_per_linear(
+    linears: &[LinearFdInput<'_>],
+    low_bits: u32,
+    high_bits: u32,
+    group_size: usize,
+    temperature: f32,
+) -> Result<BTreeMap<String, f32>> {
+    let mut out = BTreeMap::new();
+    for lin in linears {
+        if out.contains_key(&lin.name) {
+            return Err(anyhow!(
+                "compute_fd_sensitivity_per_linear: duplicate name {:?} in input \
+                 — bit allocation would silently lose data",
+                lin.name
+            ));
+        }
+        let score = compute_fd_sensitivity(
+            lin.w, lin.x, lin.y_t, lin.n, lin.k, lin.m,
+            low_bits, high_bits, group_size, temperature,
+        )
+        .map_err(|e| anyhow!("compute_fd_sensitivity for {:?}: {e}", lin.name))?;
+        out.insert(lin.name.clone(), score);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -631,5 +707,143 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// ADR-020 iter-12b-2-prep — `compute_fd_sensitivity_per_linear`
+    /// returns scores for every Linear in the input slice and matches
+    /// the per-Linear primitive's score for each.
+    #[test]
+    fn per_linear_dispatch_matches_individual_compute() {
+        let n = 32usize;
+        let k = 64usize;
+        let m = 16usize;
+        let group_size = 32usize;
+        let bits_low = 4u32;
+        let bits_high = 8u32;
+        let t = 2.0f32;
+
+        let w_a: Vec<f32> = (0..(n * k))
+            .map(|i| ((i as f32) * 0.011).sin() * 0.5)
+            .collect();
+        let w_b: Vec<f32> = (0..(n * k))
+            .map(|i| {
+                // Outlier-laden: a few extreme values to push FD
+                // sensitivity above the smooth fixture.
+                let base = ((i as f32) * 0.013).cos() * 0.4;
+                if i % 50 == 0 { base + 4.0 } else { base }
+            })
+            .collect();
+        let x_a = deterministic_x(m, k, 0.1);
+        let x_b = deterministic_x(m, k, 0.7);
+        let y_t_a = host_matmul_xwt(&x_a, &w_a, m, n, k);
+        let y_t_b = host_matmul_xwt(&x_b, &w_b, m, n, k);
+
+        let s_a_solo = compute_fd_sensitivity(
+            &w_a, &x_a, &y_t_a, n, k, m, bits_low, bits_high, group_size, t,
+        )
+        .unwrap();
+        let s_b_solo = compute_fd_sensitivity(
+            &w_b, &x_b, &y_t_b, n, k, m, bits_low, bits_high, group_size, t,
+        )
+        .unwrap();
+
+        let linears = [
+            LinearFdInput {
+                name: "linear.a".into(),
+                w: &w_a,
+                x: &x_a,
+                y_t: &y_t_a,
+                n,
+                k,
+                m,
+            },
+            LinearFdInput {
+                name: "linear.b".into(),
+                w: &w_b,
+                x: &x_b,
+                y_t: &y_t_b,
+                n,
+                k,
+                m,
+            },
+        ];
+
+        let dict = compute_fd_sensitivity_per_linear(
+            &linears, bits_low, bits_high, group_size, t,
+        )
+        .unwrap();
+        assert_eq!(dict.len(), 2, "one entry per input Linear");
+        let s_a_dict = *dict.get("linear.a").expect("linear.a entry");
+        let s_b_dict = *dict.get("linear.b").expect("linear.b entry");
+
+        // Per-Linear scores must match the individual primitive
+        // bit-for-bit (no double-rounding, no normalization drift).
+        assert_eq!(s_a_dict, s_a_solo, "linear.a score must match solo call");
+        assert_eq!(s_b_dict, s_b_solo, "linear.b score must match solo call");
+
+        // Outlier weight (linear.b) must rank higher than smooth
+        // (linear.a) — both positive, b > a.
+        assert!(
+            s_a_dict > 0.0 && s_b_dict > 0.0,
+            "expected positive scores; got a={s_a_dict}, b={s_b_dict}"
+        );
+        assert!(
+            s_b_dict > s_a_dict,
+            "outlier-laden weight (b={s_b_dict}) must rank above smooth (a={s_a_dict})"
+        );
+    }
+
+    /// ADR-020 iter-12b-2-prep — duplicate-name input must Err
+    /// loudly.  Falsifier: the previous "naive map.insert" would
+    /// silently overwrite the first entry's score, dropping
+    /// sensitivity data and producing wrong bit allocations.
+    #[test]
+    fn per_linear_dispatch_rejects_duplicate_names() {
+        let n = 32usize;
+        let k = 64usize;
+        let m = 16usize;
+        let w: Vec<f32> = (0..(n * k))
+            .map(|i| ((i as f32) * 0.011).sin() * 0.5)
+            .collect();
+        let x = deterministic_x(m, k, 0.1);
+        let y_t = host_matmul_xwt(&x, &w, m, n, k);
+
+        let linears = [
+            LinearFdInput {
+                name: "dup".into(),
+                w: &w,
+                x: &x,
+                y_t: &y_t,
+                n,
+                k,
+                m,
+            },
+            LinearFdInput {
+                name: "dup".into(),
+                w: &w,
+                x: &x,
+                y_t: &y_t,
+                n,
+                k,
+                m,
+            },
+        ];
+
+        let res = compute_fd_sensitivity_per_linear(&linears, 4, 8, 32, 2.0);
+        assert!(res.is_err(), "duplicate name must Err");
+        let msg = format!("{}", res.err().unwrap());
+        assert!(
+            msg.contains("duplicate") && msg.contains("dup"),
+            "error must mention duplicate + name; got: {msg}"
+        );
+    }
+
+    /// ADR-020 iter-12b-2-prep — empty input slice returns an empty
+    /// map (not an Err).  Edge case sanity: zero Linears = no work to
+    /// do = empty dict, NOT a panic / silent error.
+    #[test]
+    fn per_linear_dispatch_empty_input_returns_empty_map() {
+        let dict = compute_fd_sensitivity_per_linear(&[], 4, 8, 32, 2.0).unwrap();
+        assert!(dict.is_empty(), "empty input → empty dict");
     }
 }
