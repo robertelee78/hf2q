@@ -495,6 +495,21 @@ landed; Linear-only forward already landed).
        because gate_up_affine remained None — full MoE-affine
        dispatch test still gates on a multi-bucket DWQ training
        covering both gate_up_exps + down_exps for the same layer.)
+     - **FULL AFFINE MoE DISPATCH LIVE 2026-05-08**: with
+       `--tensor-filter '^blk\.29\.ffn_(gate_up|down)_exps\.weight$'`
+       (commit `b50a6a3`), dwq-train emitted 256 trained tensors
+       (128 gate_up + 128 down for layer 29; 475 MB safetensors).
+       Loader reported `0 dense Linears + 2 MoE stacks` — BOTH
+       gate_up_affine AND down_affine populated for layer 29 so
+       `gemma_moe_use_affine` evaluates true at layer 29 and
+       `dispatch_moe_id_routed` routes through
+       `mlx_native::quantized_matmul_id_into` on the affine path.
+       HTTP chat returned **"Two plus two equals four."** at 528ms
+       TTFT / 61.8 t/s decode.  This proves the full Iter C2.3
+       affine MoE dispatch path end-to-end on Gemma 4 26B.
+       Qwen 3.6 35B-A3B parity test pending (different
+       architecture: separate gate + up + down rather than
+       fused gate_up + down).
      - `MlxAffineMoeStack` derives Clone (cheap — `MlxBuffer` is
        internally Arc-wrapped, no GPU data copy).
      - `MoeFfnWeightsGpuQ` gains `expert_{gate,up,down}_affine` slots
