@@ -398,6 +398,151 @@ pub fn compute_fd_sensitivity_per_linear(
     Ok(out)
 }
 
+/// ADR-020 iter-12b-2-attn — owned per-Linear FD input bundle.
+///
+/// CPU-side companion to [`LinearFdInput`] for callers that need to
+/// MATERIALIZE the (X, W, y_T) triple before calling
+/// [`compute_fd_sensitivity_per_linear`].  Capture helpers that
+/// derive `X` by running normalization / activations on a layer's
+/// residual stream return owned tensors; this struct holds them and
+/// exposes [`Self::as_borrowed`] to convert into a borrow at the
+/// dispatch site.
+#[derive(Debug, Clone)]
+pub struct LinearFdInputOwned {
+    pub name: String,
+    pub w: Vec<f32>,
+    pub x: Vec<f32>,
+    pub y_t: Vec<f32>,
+    pub n: usize,
+    pub k: usize,
+    pub m: usize,
+}
+
+impl LinearFdInputOwned {
+    /// Borrow as a [`LinearFdInput`] for [`compute_fd_sensitivity_per_linear`].
+    pub fn as_borrowed(&self) -> LinearFdInput<'_> {
+        LinearFdInput {
+            name: self.name.clone(),
+            w: &self.w,
+            x: &self.x,
+            y_t: &self.y_t,
+            n: self.n,
+            k: self.k,
+            m: self.m,
+        }
+    }
+}
+
+/// Host RMS-norm reference: `out[i, j] = x[i, j] * w[j] / sqrt(mean(x[i,
+/// :]^2) + eps)`.  Per-row reduction in FP64 to match the GPU kernel's
+/// numerical contract on long-hidden tensors.
+fn rms_norm_host(x: &[f32], w: &[f32], rows: usize, dim: usize, eps: f32) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * dim];
+    for r in 0..rows {
+        let mut sumsq = 0.0f64;
+        for c in 0..dim {
+            let v = x[r * dim + c] as f64;
+            sumsq += v * v;
+        }
+        let inv_rms = (1.0_f64 / ((sumsq / dim as f64) + eps as f64).sqrt()) as f32;
+        for c in 0..dim {
+            out[r * dim + c] = x[r * dim + c] * inv_rms * w[c];
+        }
+    }
+    out
+}
+
+/// ADR-020 iter-12b-2-attn — capture FD-sensitivity inputs for the
+/// 3 attn-block Linears (Q, K, V) of one dense decoder layer.
+///
+/// For DWQ sensitivity scoring: each of Q/K/V receives the same
+/// post-attn-norm activation as input, and emits its local matmul
+/// output.  Computing this triple per-Linear lets
+/// [`compute_fd_sensitivity_per_linear`] measure local quantization
+/// impact without running the full attention block.
+///
+/// # Names
+///
+/// Output entries are named `blk.{layer_idx}.attn_{q,k,v}.weight`,
+/// matching GGUF naming convention so calibrator wire-up
+/// (iter-12b-3) can key directly into the `BTreeMap<name → score>`
+/// returned by [`compute_fd_sensitivity_per_linear`].
+///
+/// # Shape contract
+///
+/// * `x_layer_input`: `[batch, hidden]` row-major — the residual
+///   stream entering the layer (from `LayerActivations::layer_inputs`).
+/// * `w_attn_norm`: `[hidden]` — pre-attn RMS-norm scale.
+/// * `w_q`, `w_k`, `w_v`: `[hidden, hidden]` — attn projection weights.
+/// * Output `y_T` per Linear: `[batch, hidden]` — local matmul output
+///   `X_attn @ W^T` where `X_attn = rms_norm(x_layer_input, w_attn_norm)`.
+///
+/// # Errors
+///
+/// Shape validation: `x_layer_input.len() == batch * hidden`,
+/// `w_attn_norm.len() == hidden`, each `w_*.len() == hidden * hidden`.
+#[allow(clippy::too_many_arguments)]
+pub fn fd_sensitivity_inputs_for_attn_linears(
+    layer_idx: usize,
+    batch: usize,
+    hidden: usize,
+    eps: f32,
+    x_layer_input: &[f32],
+    w_attn_norm: &[f32],
+    w_q: &[f32],
+    w_k: &[f32],
+    w_v: &[f32],
+) -> Result<[LinearFdInputOwned; 3]> {
+    if x_layer_input.len() != batch * hidden {
+        return Err(anyhow!(
+            "fd_sensitivity_inputs_for_attn_linears: x_layer_input len {} != batch({}) * hidden({}) = {}",
+            x_layer_input.len(),
+            batch,
+            hidden,
+            batch * hidden,
+        ));
+    }
+    if w_attn_norm.len() != hidden {
+        return Err(anyhow!(
+            "w_attn_norm len {} != hidden {}",
+            w_attn_norm.len(),
+            hidden
+        ));
+    }
+    let hidden_sq = hidden * hidden;
+    for (label, w) in [("w_q", w_q), ("w_k", w_k), ("w_v", w_v)] {
+        if w.len() != hidden_sq {
+            return Err(anyhow!(
+                "{label} len {} != hidden² {}",
+                w.len(),
+                hidden_sq
+            ));
+        }
+    }
+
+    // Shared input: post-attn-norm of the residual stream.
+    let x_attn = rms_norm_host(x_layer_input, w_attn_norm, batch, hidden, eps);
+
+    let mk = |name: &str, w: &[f32]| -> LinearFdInputOwned {
+        let y_t = matmul_x_wt(&x_attn, w, batch, hidden, hidden);
+        LinearFdInputOwned {
+            name: name.to_string(),
+            w: w.to_vec(),
+            x: x_attn.clone(),
+            y_t,
+            n: hidden,
+            k: hidden,
+            m: batch,
+        }
+    };
+
+    Ok([
+        mk(&format!("blk.{layer_idx}.attn_q.weight"), w_q),
+        mk(&format!("blk.{layer_idx}.attn_k.weight"), w_k),
+        mk(&format!("blk.{layer_idx}.attn_v.weight"), w_v),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -845,5 +990,114 @@ mod tests {
     fn per_linear_dispatch_empty_input_returns_empty_map() {
         let dict = compute_fd_sensitivity_per_linear(&[], 4, 8, 32, 2.0).unwrap();
         assert!(dict.is_empty(), "empty input → empty dict");
+    }
+
+    /// ADR-020 iter-12b-2-attn — `fd_sensitivity_inputs_for_attn_linears`
+    /// produces the canonical (X, W, y_T) triple per Linear and
+    /// composes correctly with `compute_fd_sensitivity_per_linear`.
+    #[test]
+    fn attn_linears_capture_produces_valid_fd_inputs() {
+        let layer_idx = 7usize;
+        let batch = 32usize;
+        let hidden = 64usize;
+        let eps = 1e-6f32;
+
+        // Deterministic fixtures.
+        let x_layer: Vec<f32> = (0..(batch * hidden))
+            .map(|i| ((i as f32) * 0.011 - 0.4).sin() * 0.5)
+            .collect();
+        let w_attn_norm: Vec<f32> =
+            (0..hidden).map(|i| 1.0 + (i as f32) * 0.005).collect();
+        let w_q: Vec<f32> = (0..(hidden * hidden))
+            .map(|i| ((i as f32) * 0.013).cos() * 0.4)
+            .collect();
+        let w_k: Vec<f32> = (0..(hidden * hidden))
+            .map(|i| ((i as f32) * 0.017).sin() * 0.4)
+            .collect();
+        let w_v: Vec<f32> = (0..(hidden * hidden))
+            .map(|i| ((i as f32) * 0.019).cos() * 0.4)
+            .collect();
+
+        let triples = fd_sensitivity_inputs_for_attn_linears(
+            layer_idx, batch, hidden, eps,
+            &x_layer, &w_attn_norm, &w_q, &w_k, &w_v,
+        )
+        .expect("capture must succeed");
+
+        // 1. Names match GGUF convention.
+        assert_eq!(triples[0].name, format!("blk.{layer_idx}.attn_q.weight"));
+        assert_eq!(triples[1].name, format!("blk.{layer_idx}.attn_k.weight"));
+        assert_eq!(triples[2].name, format!("blk.{layer_idx}.attn_v.weight"));
+
+        // 2. All three share the SAME X (post-attn-norm).  Bit-equal.
+        assert_eq!(triples[0].x, triples[1].x);
+        assert_eq!(triples[0].x, triples[2].x);
+
+        // 3. Shapes correct for [batch, hidden] @ [hidden, hidden]^T.
+        for t in &triples {
+            assert_eq!(t.n, hidden);
+            assert_eq!(t.k, hidden);
+            assert_eq!(t.m, batch);
+            assert_eq!(t.w.len(), hidden * hidden);
+            assert_eq!(t.x.len(), batch * hidden);
+            assert_eq!(t.y_t.len(), batch * hidden);
+        }
+
+        // 4. y_T = X @ W^T to FP32 precision (verifies the per-Linear
+        //    matmul wasn't accidentally swapped or transposed).
+        for (t, w_expected) in triples.iter().zip([&w_q, &w_k, &w_v]) {
+            let y_expected = matmul_x_wt(&t.x, w_expected, batch, hidden, hidden);
+            for (i, (a, b)) in t.y_t.iter().zip(y_expected.iter()).enumerate() {
+                let d = (a - b).abs();
+                assert!(
+                    d < 1e-4,
+                    "{}: y_t[{i}] = {a} != X@W^T = {b} (diff {d})",
+                    t.name
+                );
+            }
+        }
+
+        // 5. End-to-end composition: attn-block triples flow into the
+        //    list-shaped FD scorer and produce per-Linear scores.
+        let borrowed: Vec<LinearFdInput<'_>> =
+            triples.iter().map(|t| t.as_borrowed()).collect();
+        let scores =
+            compute_fd_sensitivity_per_linear(&borrowed, 4, 8, 32, 2.0).unwrap();
+        assert_eq!(scores.len(), 3, "three attn Linears → three scores");
+        for t in &triples {
+            let s = scores
+                .get(&t.name)
+                .copied()
+                .unwrap_or_else(|| panic!("missing score for {}", t.name));
+            assert!(
+                s.is_finite(),
+                "score for {} not finite: {s}",
+                t.name
+            );
+        }
+    }
+
+    /// ADR-020 iter-12b-2-attn — input-shape rejection.  Falsifier
+    /// for "silent shape mismatch" anti-pattern that would compute
+    /// garbage sensitivities on misaligned weights.
+    #[test]
+    fn attn_linears_capture_rejects_shape_mismatch() {
+        let r = fd_sensitivity_inputs_for_attn_linears(
+            0,
+            16,
+            32,
+            1e-6,
+            &vec![0.0f32; 16 * 32],
+            &vec![1.0f32; 31], // wrong: 31 vs 32
+            &vec![0.0f32; 32 * 32],
+            &vec![0.0f32; 32 * 32],
+            &vec![0.0f32; 32 * 32],
+        );
+        assert!(r.is_err());
+        let msg = format!("{}", r.err().unwrap());
+        assert!(
+            msg.contains("w_attn_norm") && msg.contains("hidden"),
+            "error must mention the offending tensor + dim: {msg}"
+        );
     }
 }
