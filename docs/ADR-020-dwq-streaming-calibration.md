@@ -470,21 +470,29 @@ landed; Linear-only forward already landed).
      - `Qwen35LoadedModel::load` calls `Qwen35Model::apply_dwq_overlay`
        after `load_from_gguf` when `opts.dwq_overlay_path.is_some()`
        (hf2q `924a846`, Iter C2.4 #3).
-   - **Outstanding** (Iter C2.4 #4 + smoke runs):
-     - **gpu_ffn.rs dispatch routing**: 6 `quantized_matmul_id_ggml_pooled`
-       call sites in `src/inference/models/qwen35/gpu_ffn.rs` (lines
-       2453, 2473, 2575, 2854, 2874, 2954) need gate-and-route to
-       `mlx_native::quantized_matmul_id_into` when the corresponding
-       `MoeFfnWeightsQ::expert_*_affine` slot is `Some`.  Each site is
-       mechanically similar: 50-line refactor wrapping the existing
-       `with_id_mm_scratch` closure with an affine-vs-ggml branch.
-       Estimated 1-1.5 hours.
-     - **Iter E2**: Qwen 3.6 35B-A3B-APEX end-to-end smoke (gated on
-       Iter C2.4 #4).
-     - **Gemma 4 MoE smoke**: requires full DWQ training of one
-       complete MoE bucket (128 experts × all roles) so the
-       contiguous-experts check in `apply_dwq_overlay` finds an
-       intact stack — operator-runnable.
+   - **Iter C2.4 #4 LANDED 2026-05-08** (hf2q `31f3994`):
+     - `dispatch_moe_id_routed` helper at gpu_ffn.rs:80 unifies the
+       affine vs legacy GGML pool routing in a single function.  All
+       6 production call sites refactored (3 decode + 3 prefill,
+       gate/up/down each).
+     - `MlxAffineMoeStack` derives Clone (cheap — `MlxBuffer` is
+       internally Arc-wrapped, no GPU data copy).
+     - `MoeFfnWeightsGpuQ` gains `expert_{gate,up,down}_affine` slots
+       + `attach_affine_overlay` post-construction setter.
+     - `forward_gpu.rs::upload_layer_weights_gpu` calls
+       `attach_affine_overlay` immediately after `from_quantized` to
+       propagate the affine slots populated by
+       `Qwen35Model::apply_dwq_overlay`.
+   - **Outstanding (smoke runs)**:
+     - **Iter E2**: Qwen 3.6 35B-A3B-APEX end-to-end smoke — requires
+       a full DWQ training (128 experts × {gate, up, down} per layer
+       × 30+ layers — ~hours of M5-Max GPU time) so the
+       contiguous-experts check in `Qwen35Model::apply_dwq_overlay`
+       finds intact buckets.  Operator-runnable.
+     - **Gemma 4 MoE smoke**: same constraint; Iter E from this
+       session validated dense-only on Gemma 4 ("Two plus two equals
+       four.").  Full Gemma 4 MoE coverage gates on a full DWQ
+       training of the fused-gate-up + down expert stacks.
 6. **End-to-end memory budget:** `hf2q convert --quant dwq-native-4`
    on Qwen3.6-27B; max RSS `< 100 GB`.  **DONE** — iter-12e
    `RssWatchdog` at 100 GB cap (`c7bdaa9`); CLI `--rss-cap-gb 100`
