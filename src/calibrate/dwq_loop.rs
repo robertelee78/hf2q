@@ -182,6 +182,319 @@ pub fn buffer_from_f32(device: &MlxDevice, data: &[f32]) -> Result<MlxBuffer> {
     Ok(buf)
 }
 
+/// ADR-020 iter-12d-1 — public API extracted from iter-17b's training
+/// loop.  Trains a single Linear layer's affine quant params via DWQ
+/// using a synthetic teacher (X @ W_real FP64 host oracle).
+///
+/// This is the building block iter-12d-2 (production driver — iterate
+/// across all GGUF Linears) builds on.  The synthetic teacher is the
+/// minimum viable variant: it captures DWQ's per-Linear optimization
+/// quality without requiring full-model forward (which is iter-11h-f
+/// scope).  For real-teacher per-Linear training, swap the X @ W_real
+/// host oracle for activations captured from a teacher forward pass.
+///
+/// ## Algorithm (mirrors iter-17b exactly)
+///
+///   1. `init_affine_params_gpu(W_real)` → frozen `q_int` + initial
+///      `scales` + `biases` (per-group symmetric affine).
+///   2. Perturb `scales` and `biases` by `perturb_factor` (typically 2.0×
+///      for real GGUF magnitudes; the iter-13e calibration showed real
+///      Q4_0 weights have stddev ~0.014 which needs more perturbation
+///      headroom than synthetic fixtures).
+///   3. Generate `X` ~ Box-Muller Gaussian σ=1 (post-RMSNorm proxy).
+///   4. Compute teacher `y_T = X @ W_real` on host in FP64.
+///   5. For `n_steps`:
+///      - Forward: `qdq_affine(s, b, q_int) → view([n,k]) → transpose →
+///        matmul(X, W_q^T) → scalar_mul(1/T) → kl_div_loss(y_S, y_T)`
+///      - Backward: ones-seeded `dy = 1/m` per row → `backward(kl)` →
+///        gradients on `s` and `b`.
+///      - `adam.step({"s": g_s, "b": g_b})`.
+///   6. Pack final `s`, `b` + frozen `q_int` into `MlxAffineLinear`.
+///
+/// ## Convergence contract
+///
+/// Loss must drop below `initial_kl × convergence_ratio`.  iter-17b's
+/// real-GGUF measurement: 53× reduction (ratio = 0.019 << 0.34).
+/// Default `convergence_ratio = 0.34` matches iter-17b's acceptance
+/// floor.  Returns `Err` if not met.
+///
+/// ## Shape contract
+///
+/// * `w_real` — `[n, k]` row-major (one row per output channel,
+///   matching llama.cpp/GGUF convention).  `k % group_size == 0`.
+/// * Returned `MlxAffineLinear`:
+///   - `n` × `k` shape preserved
+///   - `q_int` is the frozen 1-byte-per-code quant index (length n·k)
+///   - `scales`, `biases` are the trained f32 vectors
+///     (length `n × (k / group_size)` each)
+///
+/// ## Acceptance constraints
+///
+/// * `n >= 32`, `k >= 32`, `n_tokens >= 32` — matmul backward kernel
+///   floor.
+/// * `bits ∈ {2, 3, 4, 5, 6, 7, 8}` — `qdq_affine` supported range.
+/// * `group_size` is a power of 2 in `[2, 1024]` and divides `k`.
+#[derive(Debug, Clone)]
+pub struct DwqLinearTrainResult {
+    /// Trained Linear ready for safetensors save (iter-16b).
+    pub linear: crate::calibrate::mlx_safetensors_loader::MlxAffineLinear,
+    /// KL loss on the FIRST training step (post-perturbation).
+    pub kl_initial: f32,
+    /// Minimum KL loss observed across all training steps.
+    pub kl_min: f32,
+    /// KL loss on the FINAL training step.
+    pub kl_final: f32,
+    /// Number of Adam steps actually run (== `n_steps` requested unless
+    /// caller passes 0).
+    pub steps_run: usize,
+}
+
+/// Configuration for [`train_linear_dwq_synthetic_teacher`].  Defaults
+/// match the iter-17b acceptance fixture so callers can pass
+/// `DwqTrainingConfig::default()` and reproduce iter-17b's measured
+/// 53× KL reduction on real GGUF tensors.
+#[derive(Debug, Clone)]
+pub struct DwqTrainingConfig {
+    /// Quantization bits — typically 4 for Q4_0-equivalent.
+    pub bits: u32,
+    /// Quant group size — typically 32 (matches GGUF Q4_0 block size).
+    pub group_size: usize,
+    /// Calibration batch size (`m` in matmul).  Must be >= 32 for
+    /// matmul backward floor.
+    pub n_tokens: usize,
+    /// Number of Adam steps.  iter-17b empirically uses 50.
+    pub n_steps: usize,
+    /// Adam learning rate.  iter-17b: 0.002.
+    pub lr: f32,
+    /// Distillation temperature.  iter-17b: 2.0.
+    pub temperature: f32,
+    /// Initial perturbation factor on scales/biases.  iter-17b: 2.0.
+    pub perturb_factor: f32,
+    /// PRNG seed for the Box-Muller Gaussian X.
+    pub seed: u64,
+    /// Convergence floor (assertion threshold for `kl_min / kl_initial`).
+    /// iter-17b: 0.34.  Set to a value > 1.0 to disable the convergence
+    /// check (e.g. for diagnostic runs).
+    pub convergence_ratio: f32,
+}
+
+impl Default for DwqTrainingConfig {
+    fn default() -> Self {
+        Self {
+            bits: 4,
+            group_size: 32,
+            n_tokens: 32,
+            n_steps: 50,
+            lr: 0.002,
+            temperature: 2.0,
+            perturb_factor: 2.0,
+            seed: 0xDEADBEEF,
+            convergence_ratio: 0.34,
+        }
+    }
+}
+
+/// Train a single Linear's DWQ affine quant params (synthetic teacher).
+/// See [`DwqLinearTrainResult`] for the algorithm + convergence contract.
+pub fn train_linear_dwq_synthetic_teacher(
+    device: &MlxDevice,
+    w_real: &[f32],
+    n: usize,
+    k: usize,
+    cfg: &DwqTrainingConfig,
+) -> Result<DwqLinearTrainResult> {
+    use std::collections::BTreeMap;
+
+    use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+    use crate::calibrate::autograd_gpu_tape::{
+        backward, matmul, qdq_affine, scalar_mul, transpose, view, GpuTape, GpuTensor,
+    };
+    use crate::calibrate::dynamic_quant_gpu::kl_div_loss_per_row;
+    use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
+
+    // ---- Validation ----
+    if w_real.len() != n * k {
+        return Err(anyhow!(
+            "train_linear_dwq_synthetic_teacher: w_real.len()={} != n*k={}*{}={}",
+            w_real.len(), n, k, n * k
+        ));
+    }
+    if n < 32 || k < 32 {
+        return Err(anyhow!(
+            "train_linear_dwq_synthetic_teacher: n={n} k={k} below matmul floor (>= 32)"
+        ));
+    }
+    if cfg.n_tokens < 32 {
+        return Err(anyhow!(
+            "train_linear_dwq_synthetic_teacher: n_tokens={} < 32 (matmul backward floor)",
+            cfg.n_tokens
+        ));
+    }
+    if cfg.group_size == 0 || k % cfg.group_size != 0 {
+        return Err(anyhow!(
+            "train_linear_dwq_synthetic_teacher: k={k} not divisible by group_size={}",
+            cfg.group_size
+        ));
+    }
+    if cfg.n_steps == 0 {
+        return Err(anyhow!(
+            "train_linear_dwq_synthetic_teacher: n_steps must be > 0"
+        ));
+    }
+
+    let groups_per_row = k / cfg.group_size;
+    let m = cfg.n_tokens;
+
+    // ---- Phase 1: init affine params from real weight ----
+    let mut init_registry = KernelRegistry::new();
+    let (q_int, s_init, b_init) = init_affine_params_gpu(
+        device,
+        &mut init_registry,
+        w_real,
+        cfg.group_size,
+        cfg.bits,
+    )
+    .context("init_affine_params_gpu")?;
+    if q_int.len() != n * k {
+        return Err(anyhow!(
+            "init_affine_params_gpu: q_int.len()={} != n*k={}",
+            q_int.len(), n * k
+        ));
+    }
+    if s_init.len() != n * groups_per_row || b_init.len() != n * groups_per_row {
+        return Err(anyhow!(
+            "init_affine_params_gpu: s/b length mismatch (got s={}, b={}, expected {})",
+            s_init.len(), b_init.len(), n * groups_per_row
+        ));
+    }
+
+    // ---- Phase 2: perturb ----
+    let s_p: Vec<f32> = s_init.iter().map(|v| v * cfg.perturb_factor).collect();
+    let b_p: Vec<f32> = b_init.iter().map(|v| v * cfg.perturb_factor).collect();
+
+    // ---- Phase 3: synthetic activations + teacher ----
+    let x_data: Vec<f32> = box_muller_gaussian(m * k, cfg.seed);
+    let mut y_teacher = vec![0.0f32; m * n];
+    for r in 0..m {
+        for c in 0..n {
+            let mut acc = 0.0f64;
+            for kk in 0..k {
+                acc += (x_data[r * k + kk] as f64) * (w_real[c * k + kk] as f64);
+            }
+            y_teacher[r * n + c] = acc as f32;
+        }
+    }
+
+    // ---- Phase 4: Adam training loop ----
+    let adam_cfg = AdamConfig {
+        lr: cfg.lr,
+        beta1: 0.9,
+        beta2: 0.999,
+        eps: 1e-8,
+    };
+    let mut adam = AdamOptimizer::new(device.clone(), adam_cfg).context("AdamOptimizer::new")?;
+    adam.register_param("s", buffer_from_f32(device, &s_p)?)?;
+    adam.register_param("b", buffer_from_f32(device, &b_p)?)?;
+
+    let inv_t = 1.0 / cfg.temperature;
+    let tape = GpuTape::new(device.clone());
+
+    let step = |adam: &mut AdamOptimizer, tape: &GpuTape| -> Result<f32> {
+        let s = adam.read_param("s")?;
+        let b = adam.read_param("b")?;
+        let s_leaf = GpuTensor::from_vec(tape, &s, vec![s.len()])?;
+        let b_leaf = GpuTensor::from_vec(tape, &b, vec![b.len()])?;
+        let qdq_flat = qdq_affine(&s_leaf, &b_leaf, &q_int, cfg.group_size)?;
+        let w_q = view(&qdq_flat, vec![n, k])?;
+        let w_q_t = transpose(&w_q)?;
+        let xt = GpuTensor::from_vec(tape, &x_data, vec![m, k])?;
+        let y_s = matmul(&xt, &w_q_t)?;
+        let y_t_leaf = GpuTensor::from_vec(tape, &y_teacher, vec![m, n])?;
+        let y_s_scaled = scalar_mul(&y_s, inv_t)?;
+        let y_t_scaled = scalar_mul(&y_t_leaf, inv_t)?;
+        let kl = kl_div_loss_per_row(&y_s_scaled, &y_t_scaled)?;
+        let kl_host = kl.to_vec()?;
+        let loss = (kl_host.iter().map(|v| *v as f64).sum::<f64>()
+            / kl_host.len() as f64) as f32;
+        let mut dy_buf = tape
+            .device()
+            .alloc_buffer(kl_host.len() * 4, DType::F32, kl.shape().to_vec())
+            .map_err(|e| anyhow!("dy alloc: {e}"))?;
+        dy_buf
+            .as_mut_slice::<f32>()
+            .map_err(|e| anyhow!("dy slice: {e}"))?
+            .iter_mut()
+            .for_each(|v| *v = 1.0 / m as f32);
+        let grads = backward(&kl, dy_buf)?;
+        let g_s = grads[s_leaf.node_idx()]
+            .as_ref()
+            .ok_or_else(|| anyhow!("missing s grad"))?
+            .clone();
+        let g_b = grads[b_leaf.node_idx()]
+            .as_ref()
+            .ok_or_else(|| anyhow!("missing b grad"))?
+            .clone();
+        let mut g_map = BTreeMap::new();
+        g_map.insert("s".to_string(), g_s);
+        g_map.insert("b".to_string(), g_b);
+        adam.step(&g_map)?;
+        Ok(loss)
+    };
+
+    let initial_loss = step(&mut adam, &tape).context("initial step")?;
+    if !initial_loss.is_finite() {
+        return Err(anyhow!(
+            "train_linear_dwq_synthetic_teacher: initial KL non-finite ({initial_loss})"
+        ));
+    }
+    tape.reset();
+
+    let mut min_loss = initial_loss;
+    let mut last_loss = initial_loss;
+    for s_idx in 1..cfg.n_steps {
+        let l = step(&mut adam, &tape).with_context(|| format!("step {s_idx}"))?;
+        tape.reset();
+        if !l.is_finite() {
+            return Err(anyhow!(
+                "train_linear_dwq_synthetic_teacher: KL non-finite at step {s_idx} ({l})"
+            ));
+        }
+        if l < min_loss {
+            min_loss = l;
+        }
+        last_loss = l;
+    }
+
+    // ---- Phase 5: convergence gate + pack ----
+    let ratio = min_loss / initial_loss;
+    if ratio > cfg.convergence_ratio {
+        return Err(anyhow!(
+            "train_linear_dwq_synthetic_teacher: did not converge — \
+             initial_kl={initial_loss}, min_kl={min_loss}, ratio={ratio} > {}",
+            cfg.convergence_ratio
+        ));
+    }
+
+    let s_trained = adam.read_param("s")?;
+    let b_trained = adam.read_param("b")?;
+    let linear = MlxAffineLinear {
+        n,
+        k,
+        group_size: cfg.group_size,
+        bits: cfg.bits,
+        q_int: q_int.clone(),
+        scales: s_trained,
+        biases: b_trained,
+    };
+    Ok(DwqLinearTrainResult {
+        linear,
+        kl_initial: initial_loss,
+        kl_min: min_loss,
+        kl_final: last_loss,
+        steps_run: cfg.n_steps,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1159,6 +1472,118 @@ mod tests {
 
     /// Sanity test: init kernel output equals the CPU oracle from the
     /// mlx-native side via the host-side wrapper.
+    /// ADR-020 iter-12d-1 — convergence + structural test for the
+    /// extracted public API.  Synthetic deterministic W (no real GGUF
+    /// dependency, so this runs in CI unconditionally).  Asserts:
+    ///   - kl_min < kl_initial × convergence_ratio (default 0.34)
+    ///   - returned MlxAffineLinear has correct shapes + bit-width
+    ///   - q_int values are in the expected unsigned range for `bits=4`
+    #[test]
+    fn iter_12d1_train_linear_dwq_synthetic_converges() {
+        use super::{train_linear_dwq_synthetic_teacher, DwqTrainingConfig};
+
+        let device = MlxDevice::new().expect("device");
+        let n = 64usize;
+        let k = 64usize;
+        // Deterministic non-trivial W with stddev ~0.5 (much larger than
+        // real Q4_0 magnitudes; lets the convergence gate clear easily
+        // without needing the iter-17b-style 53× reduction).
+        let w_real: Vec<f32> = (0..(n * k))
+            .map(|i| ((i as f32) * 0.0173 - 0.4).sin() * 0.5)
+            .collect();
+
+        let cfg = DwqTrainingConfig {
+            n_tokens: 32,
+            n_steps: 30,
+            convergence_ratio: 0.5, // synthetic stddev=0.5 → ~3-5× reduction in 30 steps
+            ..DwqTrainingConfig::default()
+        };
+        let result = train_linear_dwq_synthetic_teacher(&device, &w_real, n, k, &cfg)
+            .expect("train_linear_dwq_synthetic_teacher");
+
+        // Convergence gate
+        assert!(
+            result.kl_min < result.kl_initial * cfg.convergence_ratio,
+            "did not converge: kl_initial={} kl_min={} ratio={} >= {}",
+            result.kl_initial,
+            result.kl_min,
+            result.kl_min / result.kl_initial,
+            cfg.convergence_ratio
+        );
+
+        // Returned MlxAffineLinear shape + bits
+        assert_eq!(result.linear.n, n);
+        assert_eq!(result.linear.k, k);
+        assert_eq!(result.linear.group_size, cfg.group_size);
+        assert_eq!(result.linear.bits, cfg.bits);
+        assert_eq!(result.linear.q_int.len(), n * k);
+        assert_eq!(result.linear.scales.len(), n * (k / cfg.group_size));
+        assert_eq!(result.linear.biases.len(), n * (k / cfg.group_size));
+        assert_eq!(result.steps_run, cfg.n_steps);
+
+        // q_int values are in the expected range for `bits=4`:
+        // qdq_legacy stores asymmetric signed range mapped to unsigned [0, 15].
+        let max_code = (1u32 << cfg.bits) - 1;
+        for &q in &result.linear.q_int {
+            assert!(
+                (q as u32) <= max_code,
+                "q_int code {q} exceeds bits={} range [0, {max_code}]",
+                cfg.bits
+            );
+        }
+
+        // KL trajectory diagnostics — should all be finite + non-negative
+        // (KL is a non-negative divergence).
+        for (label, v) in [
+            ("kl_initial", result.kl_initial),
+            ("kl_min", result.kl_min),
+            ("kl_final", result.kl_final),
+        ] {
+            assert!(v.is_finite(), "{label} non-finite: {v}");
+            assert!(v >= -1e-6, "{label} significantly negative: {v}");
+        }
+    }
+
+    /// ADR-020 iter-12d-1 — input validation: reject n < 32, k < 32,
+    /// k not divisible by group_size, n_steps == 0, w_real shape mismatch.
+    #[test]
+    fn iter_12d1_train_linear_dwq_rejects_invalid_inputs() {
+        use super::{train_linear_dwq_synthetic_teacher, DwqTrainingConfig};
+
+        let device = MlxDevice::new().expect("device");
+        let cfg = DwqTrainingConfig::default();
+        let any_w = vec![0.1f32; 1024];
+
+        // n < 32
+        let r = train_linear_dwq_synthetic_teacher(&device, &any_w, 16, 64, &cfg);
+        assert!(r.is_err());
+
+        // k not divisible by group_size (group_size=32, k=33)
+        let bad_k_w = vec![0.1f32; 32 * 33];
+        let r = train_linear_dwq_synthetic_teacher(&device, &bad_k_w, 32, 33, &cfg);
+        assert!(r.is_err());
+
+        // w shape mismatch
+        let r = train_linear_dwq_synthetic_teacher(&device, &any_w, 64, 64, &cfg);
+        assert!(r.is_err());
+
+        // n_steps == 0
+        let bad_cfg = DwqTrainingConfig {
+            n_steps: 0,
+            ..cfg.clone()
+        };
+        let r = train_linear_dwq_synthetic_teacher(&device, &any_w[..32 * 32], 32, 32, &bad_cfg);
+        assert!(r.is_err());
+
+        // n_tokens < 32
+        let bad_cfg = DwqTrainingConfig {
+            n_tokens: 16,
+            ..cfg
+        };
+        let r = train_linear_dwq_synthetic_teacher(&device, &any_w[..32 * 32], 32, 32, &bad_cfg);
+        assert!(r.is_err());
+    }
+
     #[test]
     fn init_affine_params_gpu_round_trip_recovers_w_within_quant_error() {
         let device = MlxDevice::new().expect("device");
