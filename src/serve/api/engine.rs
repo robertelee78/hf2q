@@ -4412,12 +4412,19 @@ fn generate_once_with_soft_tokens(
     // argmax token (~20 µs of wasted GPU work, negligible vs the
     // ~10-100ms layer forward) and re-derives the next token from the
     // mask + sample chain.
+    //
+    // ADR-020 AC#7 — `params.logprobs` ALSO forces the slow path so
+    // we can read logits CPU-side + compute log_softmax(logits)[chosen]
+    // via sampler_pure::sample_token_with_logprob.  Greedy GPU-argmax
+    // skips the readback, so without this we have no logits over which
+    // to compute the per-token logprob.
     let sample_logits = params.temperature > 0.0
         || params.top_k > 0
         || params.top_p < 1.0
         || params.repetition_penalty != 1.0
         || !params.logit_bias.is_empty()
-        || params.grammar.is_some();
+        || params.grammar.is_some()
+        || params.logprobs;
     let sampler_params = if sample_logits {
         Some(SamplerParams {
             temperature: params.temperature as f64,
@@ -4497,11 +4504,17 @@ fn generate_once_with_soft_tokens(
     // untouched.  This removes the wave-2.5 `if in_tool_body { mask }`
     // wrapper and the sibling `Arc<AtomicBool>` it implied — exactly
     // the architecture the audit caught at engine.rs:1401, 1489, etc.
+    // ADR-020 AC#7 — closure returns (token, optional logprob).
+    // Logprob is `Some` iff the request set `logprobs:true`; computed
+    // via `sampler_pure::sample_token_with_logprob` over the
+    // post-bias / post-grammar-mask logits (so the logprob reflects
+    // the distribution the sampler actually ran against).
+    let want_logprobs = params.logprobs;
     let sample_from_live_logits =
         |weights: &mut MlxModelWeights,
          generated: &[u32],
          runtime: Option<&super::grammar::GrammarRuntime>|
-         -> Result<u32> {
+         -> Result<(u32, Option<f32>)> {
             let sp = sampler_params.as_ref().expect("sample_logits gate");
             let mut logits: Vec<f32> = weights.logits_view()?.to_vec();
             // Tier 4 logit_bias FIRST: additive per OpenAI convention.
@@ -4521,8 +4534,23 @@ fn generate_once_with_soft_tokens(
             if let (Some(rt), Some(tb)) = (runtime, token_bytes_ref) {
                 super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
             }
-            Ok(sampler_pure::sample_token(&mut logits, sp, generated))
+            if want_logprobs {
+                let (tok, lp) =
+                    sampler_pure::sample_token_with_logprob(&mut logits, sp, generated);
+                Ok((tok, Some(lp)))
+            } else {
+                Ok((sampler_pure::sample_token(&mut logits, sp, generated), None))
+            }
         };
+    // ADR-020 AC#7 — per-completion-token logprob accumulator.
+    // Length tracks `completion_tokens` and is moved into
+    // `GenerationResult.logprobs` at end-of-decode.  Stays `None` when
+    // the request did not opt in to logprobs.
+    let mut logprobs_acc: Option<Vec<f32>> = if want_logprobs {
+        Some(Vec::with_capacity(params.max_tokens))
+    } else {
+        None
+    };
 
     // --- Prefill ---
     // Iter-98: route through forward_prefill_with_soft_tokens. Empty
@@ -4557,7 +4585,11 @@ fn generate_once_with_soft_tokens(
     // (response_format fixes audit divergence A1; Required eagerly
     // constrains the model to emit a tool call from byte 0).
     let mut next_token = if sample_logits {
-        let tok = sample_from_live_logits(&mut loaded.weights, &[], grammar_runtime.as_ref())?;
+        let (tok, lp) = sample_from_live_logits(&mut loaded.weights, &[], grammar_runtime.as_ref())?;
+        if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp) {
+            acc.push(lp_val);
+        }
+        let tok = tok;
         // Feed the chosen token's bytes through the grammar runtime so
         // the next step's mask is correctly narrowed.  No-op when no
         // grammar OR when the runtime is awaiting trigger (suspended
@@ -4674,11 +4706,14 @@ fn generate_once_with_soft_tokens(
                 // `Arc<AtomicBool>` and the `if in_body { mask }` /
                 // `if in_body { accept }` split that the audit caught at
                 // engine.rs:1401, 1489.
-                let tok = sample_from_live_logits(
+                let (tok, lp) = sample_from_live_logits(
                     &mut loaded.weights,
                     &generated_tokens,
                     grammar_runtime.as_ref(),
                 )?;
+                if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp) {
+                    acc.push(lp_val);
+                }
                 // Advance the grammar runtime by the chosen token's bytes.
                 // Self-gates internally — see GrammarRuntime::accept_bytes.
                 if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
@@ -4799,7 +4834,7 @@ fn generate_once_with_soft_tokens(
         prefill_duration,
         decode_duration,
         cached_tokens: 0, // iter-96: 0 on cache miss; > 0 on hit (handled by fast-path return earlier)
-        logprobs: None,
+        logprobs: logprobs_acc,
     };
 
     // Store this generation in the prompt cache — same eligibility
