@@ -1891,7 +1891,20 @@ impl GemmaLoadedModel {
         // config.json path lives on in the calibration / parity /
         // safetensors pipelines (parity_quality.rs:442, mod.rs:4351 +
         // 4509) which have no GGUF input.
-        let tokenizer_path = find_tokenizer(model_path, opts.tokenizer_path.as_deref())?;
+        //
+        // ADR-022 P1.11 — same single-source-of-truth principle for the
+        // tokenizer: if the operator passes `--tokenizer <path>` or there's
+        // a `tokenizer.json` next to the .gguf we honor it (legacy HF-checkout
+        // ergonomics); otherwise we build directly from
+        // `tokenizer.ggml.{tokens,merges,token_type,...}` GGUF metadata via
+        // `gemma4::tokenizer::build_tokenizer_from_gguf`. Parity verified
+        // by `tests/adr_022_phase1_p11_gemma4_tokenizer_parity.rs` (5/5
+        // cases byte-identical to the on-disk tokenizer.json on the
+        // abliterated Gemma4-A4B file).
+        let tokenizer_path_opt = resolve_tokenizer_path_optional(
+            model_path,
+            opts.tokenizer_path.as_deref(),
+        );
 
         // Open GGUF (header + metadata only).
         let gguf = mlx_native::gguf::GgufFile::open(model_path)
@@ -1993,9 +2006,23 @@ impl GemmaLoadedModel {
             &mut load_progress,
         )?;
 
-        // Load tokenizer.
-        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+        // Load tokenizer. ADR-022 P1.11: prefer on-disk tokenizer.json when
+        // present (HF-checkout ergonomics), else build directly from GGUF
+        // metadata. Both produce byte-identical token streams for Gemma4
+        // per the parity test in
+        // `tests/adr_022_phase1_p11_gemma4_tokenizer_parity.rs`.
+        let mut tokenizer = match tokenizer_path_opt.as_ref() {
+            Some(p) => Tokenizer::from_file(p)
+                .map_err(|e| anyhow::anyhow!("Failed to load tokenizer from {}: {e}", p.display()))?,
+            None => crate::inference::models::gemma4::tokenizer::build_tokenizer_from_gguf(&gguf)
+                .context("Failed to build Gemma4 tokenizer from GGUF metadata")?,
+        };
+        let tokenizer_path = tokenizer_path_opt.unwrap_or_else(|| {
+            // Synthetic sentinel for the load_info banner — communicates
+            // "GGUF-embedded" in the path slot without misrepresenting an
+            // on-disk file. Downstream code only uses this path for display.
+            std::path::PathBuf::from("<gguf-embedded>")
+        });
         tokenizer
             .with_truncation(None)
             .map_err(|e| anyhow::anyhow!("Failed to disable tokenizer truncation: {e}"))?;
@@ -7646,6 +7673,27 @@ pub fn render_chat_prompt_with_tools(
 }
 
 /// Resolve tokenizer path the same way `cmd_generate` does.
+/// ADR-022 P1.11 — non-erroring sibling of `find_tokenizer` for the
+/// GGUF-embedded path. Returns `Some(path)` only for (a) explicit
+/// `--tokenizer <path>`, or (b) `tokenizer.json` next to the .gguf.
+/// Returns `None` otherwise — the caller falls back to
+/// `gemma4::tokenizer::build_tokenizer_from_gguf`.
+fn resolve_tokenizer_path_optional(
+    model_path: &Path,
+    explicit: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(p) = explicit {
+        return Some(p.to_path_buf());
+    }
+    let dir = model_path.parent().unwrap_or(Path::new("."));
+    let candidate = dir.join("tokenizer.json");
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    None
+}
+
+#[allow(dead_code)]
 fn find_tokenizer(model_path: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
     // ADR-022 P1.8 / P1.10 — Same antipattern as the now-removed
     // `find_config` walk: previously walked `models/<subdir>/tokenizer.json`
