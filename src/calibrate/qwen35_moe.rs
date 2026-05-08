@@ -45,7 +45,7 @@ use anyhow::{anyhow, Result};
 use mlx_native::{DType, MlxBuffer};
 
 use super::autograd_gpu_tape::{
-    add, divide, matmul, mul, outer_product, row_sum, silu, softmax,
+    add, divide, matmul, mul, outer_product, rms_norm, row_sum, silu, softmax,
     take_along_axis_topk, GpuTape, GpuTensor,
 };
 
@@ -304,6 +304,125 @@ pub fn switch_mlp(
         });
     }
     Ok(accum.expect("active_experts non-empty (guard above)"))
+}
+
+/// Borrowed bundle of all per-layer weight tensors for one
+/// frozen-router DWQ decoder layer.  The lifetime parameter pins all
+/// refs to the same tape lifetime, so the caller can construct a
+/// `Vec<DecoderLayerWeights<'_>>` from a single tape and pass it to
+/// `qwen35_moe_forward_on_tape` once that lands.
+///
+/// Field shapes (mirrors iter-11h-f-2 / iter-11h-f-3):
+///   * `w_in`         `[hidden]`              — pre-attn rms-norm weight
+///   * `w_attn`       `[hidden, hidden]`      — attn proxy matmul weight
+///   * `w_post`       `[hidden]`              — pre-mlp rms-norm weight
+///   * `w_gate`       `[hidden, n_experts]`   — router projection
+///   * `gate_projs`   each `[hidden, intermediate]`
+///   * `up_projs`     each `[hidden, intermediate]`
+///   * `down_projs`   each `[intermediate, hidden]`
+///
+/// `gate_projs.len() == up_projs.len() == down_projs.len() == n_experts`.
+pub struct DecoderLayerWeights<'a> {
+    pub w_in: &'a GpuTensor,
+    pub w_attn: &'a GpuTensor,
+    pub w_post: &'a GpuTensor,
+    pub w_gate: &'a GpuTensor,
+    pub gate_projs: &'a [GpuTensor],
+    pub up_projs: &'a [GpuTensor],
+    pub down_projs: &'a [GpuTensor],
+}
+
+/// ADR-020 iter-11h-f-4 — public-API extraction of one frozen-router
+/// DWQ decoder-layer forward, mirroring the inline closure used in
+/// iter-11h-f-2 + iter-11h-f-3.
+///
+/// Builds the chain (attn proxy + MoE FFN with residuals):
+///
+/// ```text
+///   y1   = rms_norm(x, w_in)                       // pre-attn
+///   r    = matmul(y1, w_attn)                      // attn proxy
+///   h1   = x + r                                   // residual 1
+///   y2   = rms_norm(h1, w_post)                    // pre-mlp
+///   route = moe_route(y2, w_gate, k=k)             // router scores+ids
+///   (scores, indices) read off-tape                // frozen-router DWQ
+///   mlp  = switch_mlp(y2, gate_projs, up_projs,
+///                     down_projs, ids, scores)
+///   out  = h1 + mlp                                // residual 2
+/// ```
+///
+/// The `attn proxy` is a single matmul, not real GQA attention — that
+/// mirrors the DWQ training proxy: the router stays frozen, and the
+/// attn block is a black box from gradient's perspective.  Use this
+/// in DWQ training code paths; do NOT use this for inference (use
+/// `serve::forward_mlx` for real attention).
+///
+/// `ones_k` must be a leaf tensor of shape `[k]` filled with `1.0`,
+/// owned by the same tape.  Caller materializes it once and reuses
+/// across layers (`moe_route` consumes it as the renorm constant).
+///
+/// All matmul dims must satisfy `m, n, k >= 32` per
+/// [`switch_mlp`] / mlx-native dense f32 matmul kernel constraints.
+///
+/// Returns the residual-out tensor `[n_tokens, hidden]`, ready to
+/// feed as `x` to the next layer.
+pub fn decoder_layer_on_tape(
+    tape: &GpuTape,
+    x: &GpuTensor,
+    weights: &DecoderLayerWeights<'_>,
+    k: usize,
+    eps: f32,
+    ones_k: &GpuTensor,
+) -> Result<GpuTensor> {
+    if x.shape().len() != 2 {
+        return Err(anyhow!(
+            "decoder_layer_on_tape: x must be 2-D [n_tokens, hidden]; got shape={:?}",
+            x.shape()
+        ));
+    }
+    let n_tokens = x.shape()[0];
+    let n_experts = weights.gate_projs.len();
+    if weights.up_projs.len() != n_experts || weights.down_projs.len() != n_experts {
+        return Err(anyhow!(
+            "decoder_layer_on_tape: gate_projs/up_projs/down_projs lengths must agree; \
+             got {}/{}/{}",
+            n_experts,
+            weights.up_projs.len(),
+            weights.down_projs.len()
+        ));
+    }
+
+    let y1 = rms_norm(x, weights.w_in, eps)?;
+    let r = matmul(&y1, weights.w_attn)?;
+    let h1 = add(x, &r)?;
+    let y2 = rms_norm(&h1, weights.w_post, eps)?;
+    let route = moe_route(&y2, weights.w_gate, k, false, ones_k)?;
+
+    // Read routing scores + indices off-tape (frozen-router DWQ
+    // assumption — gradient does NOT flow back through the router;
+    // mirrors iter-11h-e3c's contract).
+    let scores_host: Vec<f32> = route.top_k_scores.to_vec()?;
+    let indices_host: Vec<u32> = route
+        .top_k_indices
+        .as_slice::<u32>()
+        .map_err(|e| anyhow!("decoder_layer_on_tape: read top_k_indices: {e}"))?
+        .to_vec();
+    let expert_ids: Vec<Vec<usize>> = (0..n_tokens)
+        .map(|t| (0..k).map(|kk| indices_host[t * k + kk] as usize).collect())
+        .collect();
+    let routing_weights: Vec<Vec<f32>> = (0..n_tokens)
+        .map(|t| (0..k).map(|kk| scores_host[t * k + kk]).collect())
+        .collect();
+
+    let mlp_out = switch_mlp(
+        tape,
+        &y2,
+        weights.gate_projs,
+        weights.up_projs,
+        weights.down_projs,
+        &expert_ids,
+        &routing_weights,
+    )?;
+    add(&h1, &mlp_out)
 }
 
 #[cfg(test)]
@@ -1038,9 +1157,7 @@ mod tests {
     /// f-2; per-OpKind FD already covered by iter-11h-e3a/b/c).
     #[test]
     fn iter_11h_f3_two_layer_stacked_decoder_gradient_flow() {
-        use crate::calibrate::autograd_gpu_tape::{
-            add, backward, ones_like, rms_norm, GpuTape,
-        };
+        use crate::calibrate::autograd_gpu_tape::{backward, ones_like, GpuTape};
         use mlx_native::MlxDevice;
 
         let device = MlxDevice::new().expect("device");
@@ -1197,40 +1314,23 @@ mod tests {
         }
         let ok = GpuTensor::from_vec(&tape, &ones_k_data, vec![k]).unwrap();
 
-        // Forward chain — stack 2 decoder layers.
+        // Forward chain — stack 2 decoder layers via the iter-11h-f-4
+        // public API.  Validates that `decoder_layer_on_tape` composes
+        // through the same residual chain that f-3 originally tested
+        // inline.  Refactor preserves the original test's contract.
         let mut current = xt.clone();
         for l in 0..n_layers {
-            let y1 = rms_norm(&current, &win_per_layer[l], eps).unwrap();
-            let r = matmul(&y1, &watn_per_layer[l]).unwrap();
-            let h1 = add(&current, &r).unwrap();
-            let y2 = rms_norm(&h1, &wpst_per_layer[l], eps).unwrap();
-            let route = moe_route(&y2, &wg_per_layer[l], k, false, &ok).unwrap();
-
-            let scores_host: Vec<f32> = route.top_k_scores.to_vec().unwrap();
-            let indices_host: Vec<u32> =
-                route.top_k_indices.as_slice::<u32>().unwrap().to_vec();
-            let expert_ids: Vec<Vec<usize>> = (0..n_tokens)
-                .map(|t| {
-                    (0..k)
-                        .map(|kk| indices_host[t * k + kk] as usize)
-                        .collect()
-                })
-                .collect();
-            let routing_weights: Vec<Vec<f32>> = (0..n_tokens)
-                .map(|t| (0..k).map(|kk| scores_host[t * k + kk]).collect())
-                .collect();
-
-            let mlp_out = super::switch_mlp(
-                &tape,
-                &y2,
-                &gate_t_per_layer[l],
-                &up_t_per_layer[l],
-                &down_t_per_layer[l],
-                &expert_ids,
-                &routing_weights,
-            )
-            .expect("switch_mlp forward");
-            current = add(&h1, &mlp_out).unwrap();
+            let weights = super::DecoderLayerWeights {
+                w_in: &win_per_layer[l],
+                w_attn: &watn_per_layer[l],
+                w_post: &wpst_per_layer[l],
+                w_gate: &wg_per_layer[l],
+                gate_projs: &gate_t_per_layer[l],
+                up_projs: &up_t_per_layer[l],
+                down_projs: &down_t_per_layer[l],
+            };
+            current = super::decoder_layer_on_tape(&tape, &current, &weights, k, eps, &ok)
+                .expect("decoder_layer_on_tape forward");
         }
         let final_out = current;
 
@@ -1283,6 +1383,162 @@ mod tests {
             );
             for (i, v) in g.iter().enumerate() {
                 assert!(v.is_finite(), "{name} grad[{i}] = {v} not finite");
+            }
+        }
+
+        drop(grads);
+        drop(tape);
+    }
+
+    /// ADR-020 iter-11h-f-4 — public-API smoke test for
+    /// `decoder_layer_on_tape`.
+    ///
+    /// Single-layer call to the new public API; mirrors iter-11h-f-2's
+    /// gradient-flow assertions to prove the extracted function carries
+    /// the same contract as the inline closure.  Gates `f-3`'s
+    /// 2-layer test, which was refactored to use this same API.
+    ///
+    /// Falsifier: if `decoder_layer_on_tape` ever skips a stage in
+    /// the chain (drops a residual, skips switch_mlp, etc.), the
+    /// gradient on at least one of the 6 probed leaves will collapse
+    /// to ~0.
+    #[test]
+    fn iter_11h_f4_decoder_layer_on_tape_public_api_gradient_flow() {
+        use crate::calibrate::autograd_gpu_tape::{backward, ones_like, GpuTape};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+
+        // n_tokens, hidden, intermediate all >=32 — same kernel-floor
+        // constraint as iter-11h-f-3.
+        let n_tokens = 32usize;
+        let hidden = 32usize;
+        let intermediate = 32usize;
+        let n_experts = 4usize;
+        let k = 2usize;
+        let eps = 1e-6f32;
+
+        let input_data: Vec<f32> = (0..(n_tokens * hidden))
+            .map(|i| ((i as f32) * 0.017 - 0.1).cos() * 0.3)
+            .collect();
+        let w_in_data: Vec<f32> =
+            (0..hidden).map(|i| 1.0 + (i as f32) * 0.013).collect();
+        let w_attn_data: Vec<f32> = (0..(hidden * hidden))
+            .map(|i| 0.04 + (i as f32) * 0.0007)
+            .collect();
+        let w_post_data: Vec<f32> =
+            (0..hidden).map(|i| 1.0 - (i as f32) * 0.004).collect();
+        let w_gate_data: Vec<f32> = (0..(hidden * n_experts))
+            .map(|i| 0.03 + (i as f32) * 0.0006)
+            .collect();
+        let ones_k_data = vec![1.0f32; k];
+
+        let mut gate_data: Vec<Vec<f32>> = Vec::with_capacity(n_experts);
+        let mut up_data: Vec<Vec<f32>> = Vec::with_capacity(n_experts);
+        let mut down_data: Vec<Vec<f32>> = Vec::with_capacity(n_experts);
+        for e in 0..n_experts {
+            let off = (e as f32) * 0.09;
+            gate_data.push(
+                (0..(hidden * intermediate))
+                    .map(|i| 0.04 + (i as f32) * 0.0008 + off)
+                    .collect(),
+            );
+            up_data.push(
+                (0..(hidden * intermediate))
+                    .map(|i| 0.05 + (i as f32) * 0.0006 + off)
+                    .collect(),
+            );
+            down_data.push(
+                (0..(intermediate * hidden))
+                    .map(|i| 0.03 + (i as f32) * 0.0009 + off)
+                    .collect(),
+            );
+        }
+
+        let tape = GpuTape::new(device.clone());
+
+        let xt = GpuTensor::from_vec(&tape, &input_data, vec![n_tokens, hidden])
+            .unwrap();
+        let win = GpuTensor::from_vec(&tape, &w_in_data, vec![hidden]).unwrap();
+        let watn = GpuTensor::from_vec(&tape, &w_attn_data, vec![hidden, hidden])
+            .unwrap();
+        let wpst = GpuTensor::from_vec(&tape, &w_post_data, vec![hidden]).unwrap();
+        let wg = GpuTensor::from_vec(
+            &tape,
+            &w_gate_data,
+            vec![hidden, n_experts],
+        )
+        .unwrap();
+        let ok = GpuTensor::from_vec(&tape, &ones_k_data, vec![k]).unwrap();
+
+        let mut gate_t: Vec<GpuTensor> = Vec::with_capacity(n_experts);
+        let mut up_t: Vec<GpuTensor> = Vec::with_capacity(n_experts);
+        let mut down_t: Vec<GpuTensor> = Vec::with_capacity(n_experts);
+        for e in 0..n_experts {
+            gate_t.push(
+                GpuTensor::from_vec(&tape, &gate_data[e], vec![hidden, intermediate])
+                    .unwrap(),
+            );
+            up_t.push(
+                GpuTensor::from_vec(&tape, &up_data[e], vec![hidden, intermediate])
+                    .unwrap(),
+            );
+            down_t.push(
+                GpuTensor::from_vec(&tape, &down_data[e], vec![intermediate, hidden])
+                    .unwrap(),
+            );
+        }
+
+        let weights = super::DecoderLayerWeights {
+            w_in: &win,
+            w_attn: &watn,
+            w_post: &wpst,
+            w_gate: &wg,
+            gate_projs: &gate_t,
+            up_projs: &up_t,
+            down_projs: &down_t,
+        };
+
+        let out = super::decoder_layer_on_tape(&tape, &xt, &weights, k, eps, &ok)
+            .expect("decoder_layer_on_tape forward");
+        assert_eq!(
+            out.shape(),
+            &[n_tokens, hidden],
+            "decoder_layer_on_tape output shape"
+        );
+
+        // Loss = sum(out).
+        let host = out.to_vec().unwrap();
+        let loss = host.iter().map(|v| *v as f64).sum::<f64>() as f32;
+        assert!(loss.is_finite(), "loss non-finite: {loss}");
+
+        let dy = ones_like(&tape, out.shape()).unwrap();
+        let grads = backward(&out, dy).unwrap();
+        let read = |idx: usize| -> Vec<f32> {
+            grads[idx]
+                .as_ref()
+                .unwrap()
+                .as_slice::<f32>()
+                .unwrap()
+                .to_vec()
+        };
+
+        for (name, g) in [
+            ("input", read(xt.node_idx())),
+            ("w_in", read(win.node_idx())),
+            ("w_attn", read(watn.node_idx())),
+            ("w_post", read(wpst.node_idx())),
+            ("e0_gate", read(gate_t[0].node_idx())),
+            ("e0_down", read(down_t[0].node_idx())),
+        ] {
+            let max_abs = g.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            assert!(
+                max_abs > 1e-7,
+                "{name} gradient collapsed (max|grad|={max_abs:.3e}) — \
+                 decoder_layer_on_tape skipped a stage in the chain"
+            );
+            for v in &g {
+                assert!(v.is_finite(), "{name} grad non-finite: {v}");
             }
         }
 
