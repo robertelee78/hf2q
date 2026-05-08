@@ -38,11 +38,13 @@ const TYPE_FLOAT64: u32 = 12;
 const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_Q4_0: u32 = 2;
+const GGML_TYPE_Q5_1: u32 = 7;
 const GGML_TYPE_Q8_0: u32 = 8;
 const GGML_TYPE_Q4_K: u32 = 12;
 const GGML_TYPE_Q5_K: u32 = 13;
 const GGML_TYPE_Q6_K: u32 = 14;
 const GGML_TYPE_I16: u32 = 17;
+const GGML_TYPE_IQ4_NL: u32 = 20;
 
 #[derive(Debug)]
 pub struct GgufPatchOptions {
@@ -552,11 +554,15 @@ fn tensor_byte_len(dims: &[u64], ggml_type: u32) -> Result<u64> {
         GGML_TYPE_F32 => (1, 4),
         GGML_TYPE_F16 => (1, 2),
         GGML_TYPE_Q4_0 => (32, 18),
+        // ADR-022 Phase 1 — Q5_1 (legacy 5-bit asymmetric, 32-element block).
+        GGML_TYPE_Q5_1 => (32, 24),
         GGML_TYPE_Q8_0 => (32, 34),
         GGML_TYPE_Q4_K => (256, 144),
         GGML_TYPE_Q5_K => (256, 176),
         GGML_TYPE_Q6_K => (256, 210),
         GGML_TYPE_I16 => (1, 2),
+        // ADR-022 Phase 1 — IQ4_NL (4-bit codebook, 32-element block).
+        GGML_TYPE_IQ4_NL => (32, 18),
         other => bail!("unsupported GGML type ID {other}"),
     };
     if total % block_values != 0 {

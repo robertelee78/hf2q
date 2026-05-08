@@ -532,6 +532,13 @@ pub fn matmul(lhs: &GpuTensor, rhs: &GpuTensor) -> Result<GpuTensor> {
     )
     .context("matmul: transpose W → W^T")?;
 
+    // ADR-020 iter-11h-e3a-1: RAW barrier — transpose above writes w_t_buf;
+    // dense_matmul below reads w_t_buf.  Apple Metal compute encoders run
+    // threadgroups in parallel by default; without barrier the matmul races
+    // the transpose, reading partial bytes → deterministic-but-wrong y_buf
+    // (root cause of attention_block_streaming W_k flake at ~5-15% rate).
+    encoder.memory_barrier();
+
     let params = DenseMmF32F32Params {
         m: m as u32,
         n: n as u32,
@@ -831,6 +838,15 @@ fn backward_dispatch(
                 DType::F32,
             )
             .context("backward matmul: transpose X → X^T")?;
+
+            // ADR-020 iter-11h-e3a-1: RAW barrier for the dW matmul.
+            // Both transposes above WRITE buffers (dy_t_buf, x_t_buf) that the
+            // dense_matmul below READS.  Without `memory_barrier`, Apple Metal
+            // compute encoders run threadgroups in parallel by default and the
+            // matmul kernel will race the transposes, reading partial bytes →
+            // deterministic-but-wrong gradient (W_k flake at ~5-10% rate).
+            // See `feedback_metal_raw_barrier_per_dispatch` memory entry.
+            encoder.memory_barrier();
 
             let dw_params = DenseMmF32F32Params {
                 m: k as u32,

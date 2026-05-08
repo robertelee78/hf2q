@@ -181,7 +181,161 @@ fn run(cli: Cli) -> Result<(), AppError> {
         // --yes, mutually-exclusive-flags) is a user-input mistake;
         // exit-3 is the documented signal.
         Command::Cache(args) => serve::cmd_cache(args).map_err(AppError::Input),
+        Command::DwqTrain(args) => cmd_dwq_train(args),
     }
+}
+
+/// ADR-020 iter-12d-3 — wire `train_all_linears_dwq` into the CLI.
+///
+/// Reads its config from `cli::DwqTrainArgs`, builds the per-tensor
+/// `name_filter` (top-N limit + skip_huge), invokes the production
+/// driver, prints a per-tensor disposition log, writes the serialized
+/// mlx-format safetensors to disk.
+fn cmd_dwq_train(args: cli::DwqTrainArgs) -> Result<(), AppError> {
+    use anyhow::Context as _;
+    use crate::calibrate::dwq_loop::{train_all_linears_dwq, DwqTrainingConfig};
+    use safetensors::tensor::Dtype;
+
+    if !args.gguf.exists() {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "input GGUF does not exist: {}",
+            args.gguf.display()
+        )));
+    }
+    if let Some(parent) = args.output.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Err(AppError::Input(anyhow::anyhow!(
+                "output parent directory does not exist: {}",
+                parent.display()
+            )));
+        }
+    }
+
+    // RSS cap: 0 → disabled; >0 → cap in GB → bytes.
+    let rss_cap_bytes: Option<u64> = if args.rss_cap_gb > 0.0 {
+        let bytes = (args.rss_cap_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+        Some(bytes)
+    } else {
+        None
+    };
+
+    let cfg = DwqTrainingConfig {
+        bits: args.bits,
+        group_size: args.group_size,
+        n_tokens: args.n_tokens,
+        n_steps: args.steps,
+        lr: args.lr,
+        temperature: args.temperature,
+        perturb_factor: args.perturb_factor,
+        seed: args.seed,
+        convergence_ratio: args.convergence_ratio,
+        rss_cap_bytes,
+        compute_bench: args.bench,
+    };
+
+    println!(
+        "[dwq-train] gguf={}  output={}",
+        args.gguf.display(),
+        args.output.display()
+    );
+    println!(
+        "[dwq-train] bits={} group_size={} n_tokens={} steps={} lr={} T={} perturb={} seed={:#x} convergence_ratio={} limit={:?} skip_huge={}",
+        cfg.bits,
+        cfg.group_size,
+        cfg.n_tokens,
+        cfg.n_steps,
+        cfg.lr,
+        cfg.temperature,
+        cfg.perturb_factor,
+        cfg.seed,
+        cfg.convergence_ratio,
+        args.limit,
+        args.skip_huge,
+    );
+
+    // Counter shared with the closure for the optional `--limit` cap.
+    // RefCell-free since the closure runs serially inside the driver
+    // (one tensor at a time).
+    let counter = std::cell::Cell::new(0usize);
+    let limit = args.limit;
+    let skip_huge = args.skip_huge;
+    let name_filter = |name: &str| -> bool {
+        if !name.ends_with(".weight") {
+            return false;
+        }
+        if skip_huge && (name.starts_with("token_embd") || name.starts_with("output")) {
+            return false;
+        }
+        if let Some(lim) = limit {
+            let cur = counter.get();
+            if cur >= lim {
+                return false;
+            }
+            counter.set(cur + 1);
+        }
+        true
+    };
+
+    let result = train_all_linears_dwq(&args.gguf, &cfg, Dtype::BF16, name_filter)
+        .context("DWQ training failed")
+        .map_err(AppError::Conversion)?;
+
+    println!(
+        "[dwq-train] trained={} skipped={} bytes={}",
+        result.trained.len(),
+        result.skipped.len(),
+        result.safetensors_bytes.len()
+    );
+    for t in &result.trained {
+        let ratio = if t.kl_initial > 0.0 {
+            t.kl_min / t.kl_initial
+        } else {
+            f32::NAN
+        };
+        let bench_str = match &t.bench {
+            Some(b) => format!(
+                "  bench: q4_0={:.4e} dwq={:.4e} delta={:+.4e}",
+                b.q4_0_kl_nats, b.dwq_kl_nats, b.delta_kl_nats
+            ),
+            None => String::new(),
+        };
+        println!(
+            "  TRAINED  {:60}  [n={:5} k={:5}]  kl: init={:.4e} min={:.4e} ratio={:.3}{}",
+            t.name, t.n, t.k, t.kl_initial, t.kl_min, ratio, bench_str,
+        );
+    }
+    for s in &result.skipped {
+        // Filter-rejection skips are noisy; suppress unless verbose.
+        // For now print everything — the operator wants the full picture
+        // on a fresh run.  Add a `--quiet` flag in a future iter.
+        println!("  SKIPPED  {:60}  --  {}", s.name, s.reason);
+    }
+
+    // ADR-020 iter-12f-2 — print aggregate bench summary + §8.3 AC #7 gate.
+    if let Some(mean_delta) = result.mean_delta_kl_nats {
+        const ACCEPTANCE_THRESHOLD: f32 = 0.05; // §8.3 AC #7 nats/Linear floor
+        let n_with_bench = result.trained.iter().filter(|t| t.bench.is_some()).count();
+        let gate = if mean_delta > ACCEPTANCE_THRESHOLD {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        println!(
+            "[dwq-train] bench summary: mean_delta_kl_nats = {:+.6} across {} Linears \
+             (§8.3 AC #7 threshold {:+.2}: {})",
+            mean_delta, n_with_bench, ACCEPTANCE_THRESHOLD, gate
+        );
+    }
+
+    std::fs::write(&args.output, &result.safetensors_bytes)
+        .with_context(|| format!("write output {}", args.output.display()))
+        .map_err(AppError::Conversion)?;
+    println!(
+        "[dwq-train] wrote {} bytes to {}",
+        result.safetensors_bytes.len(),
+        args.output.display()
+    );
+    Ok(())
 }
 
 fn cmd_gguf_patch(args: cli::GgufPatchArgs) -> Result<(), AppError> {

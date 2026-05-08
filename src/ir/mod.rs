@@ -239,6 +239,63 @@ impl TensorRef {
         false
     }
 
+    /// ADR-020 iter-12b-3-extract — decode tensor data to a flat
+    /// `Vec<f32>` regardless of the source float dtype (F32 / F16 /
+    /// BF16).
+    ///
+    /// Produces a fresh allocation; does NOT share storage with the
+    /// underlying `Arc<Vec<u8>>`.  Returns elements in row-major
+    /// order matching `self.shape`.
+    ///
+    /// # Errors
+    ///
+    /// * `IrError::UnsupportedDtype` for non-float dtypes (I32/I64/U8/
+    ///   U16/U32/Bool — these aren't quantization arms; they're
+    ///   integer auxiliaries that DWQ scoring should never see).
+    /// * `IrError::ShapeMismatch` when `data.len()` doesn't match the
+    ///   expected element-count × element-size product (catches
+    ///   torn / partial mmap reads before they become silent garbage
+    ///   in the calibrator).
+    pub fn to_f32_vec(&self) -> Result<Vec<f32>, IrError> {
+        let element_count = self.numel();
+        let expected_bytes = element_count * self.dtype.element_size();
+        if self.data.len() != expected_bytes {
+            return Err(IrError::ShapeMismatch {
+                name: self.name.clone(),
+                expected: expected_bytes,
+                actual: self.data.len(),
+            });
+        }
+        match self.dtype {
+            DType::F32 => {
+                let mut out = Vec::with_capacity(element_count);
+                for c in self.data.chunks_exact(4) {
+                    out.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                }
+                Ok(out)
+            }
+            DType::F16 => {
+                let mut out = Vec::with_capacity(element_count);
+                for c in self.data.chunks_exact(2) {
+                    let h = half::f16::from_le_bytes([c[0], c[1]]);
+                    out.push(h.to_f32());
+                }
+                Ok(out)
+            }
+            DType::BF16 => {
+                let mut out = Vec::with_capacity(element_count);
+                for c in self.data.chunks_exact(2) {
+                    let bf = half::bf16::from_le_bytes([c[0], c[1]]);
+                    out.push(bf.to_f32());
+                }
+                Ok(out)
+            }
+            other => Err(IrError::UnsupportedDtype {
+                dtype: other.to_string(),
+            }),
+        }
+    }
+
     /// Convert bf16 data to f16 in-place, returning a new TensorRef.
     pub fn to_f16(&self) -> Result<TensorRef, IrError> {
         if self.dtype == DType::F16 {
@@ -834,5 +891,138 @@ mod tests {
             router_aux_loss_coef: None,
         };
         assert!(meta.is_moe());
+    }
+
+    /// ADR-020 iter-12b-3-extract — `to_f32_vec` round-trips an F32
+    /// payload bit-exactly.  Confirms the byte layout decode matches
+    /// the encode: `f32::to_le_bytes` → `f32::from_le_bytes`.
+    #[test]
+    fn to_f32_vec_round_trips_f32_bit_exactly() {
+        let values: Vec<f32> = vec![0.0, 1.5, -2.25, std::f32::consts::PI, -1e-10, 4.2e6];
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for v in &values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let t = TensorRef {
+            name: "test_f32".into(),
+            shape: vec![values.len()],
+            dtype: DType::F32,
+            data: std::sync::Arc::new(bytes),
+        };
+        let out = t.to_f32_vec().expect("F32 decode must succeed");
+        assert_eq!(out.len(), values.len());
+        for (a, b) in out.iter().zip(values.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "F32 round-trip not bit-exact");
+        }
+    }
+
+    /// ADR-020 iter-12b-3-extract — `to_f32_vec` decodes BF16 with
+    /// the half-crate's canonical bf16→f32 widening (mantissa zero-
+    /// extended, exponent preserved).
+    #[test]
+    fn to_f32_vec_decodes_bf16_to_canonical_f32() {
+        // 1.0 in bf16 = 0x3F80 (sign=0, exp=127, mantissa=0).
+        // 2.0 in bf16 = 0x4000.  -1.5 = 0xBFC0.
+        let values_bf16: Vec<half::bf16> = vec![
+            half::bf16::from_f32(1.0),
+            half::bf16::from_f32(2.0),
+            half::bf16::from_f32(-1.5),
+            half::bf16::from_f32(0.5),
+        ];
+        let mut bytes = Vec::with_capacity(values_bf16.len() * 2);
+        for v in &values_bf16 {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let t = TensorRef {
+            name: "test_bf16".into(),
+            shape: vec![values_bf16.len()],
+            dtype: DType::BF16,
+            data: std::sync::Arc::new(bytes),
+        };
+        let out = t.to_f32_vec().expect("BF16 decode must succeed");
+        let expected: Vec<f32> = values_bf16.iter().map(|v| v.to_f32()).collect();
+        for (i, (a, b)) in out.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "BF16[{i}] decode mismatch");
+        }
+    }
+
+    /// ADR-020 iter-12b-3-extract — `to_f32_vec` decodes F16
+    /// (half-precision IEEE 754) likewise.
+    #[test]
+    fn to_f32_vec_decodes_f16_to_canonical_f32() {
+        let values_f16: Vec<half::f16> = vec![
+            half::f16::from_f32(1.0),
+            half::f16::from_f32(-2.5),
+            half::f16::from_f32(0.125),
+        ];
+        let mut bytes = Vec::with_capacity(values_f16.len() * 2);
+        for v in &values_f16 {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let t = TensorRef {
+            name: "test_f16".into(),
+            shape: vec![values_f16.len()],
+            dtype: DType::F16,
+            data: std::sync::Arc::new(bytes),
+        };
+        let out = t.to_f32_vec().expect("F16 decode must succeed");
+        let expected: Vec<f32> = values_f16.iter().map(|v| v.to_f32()).collect();
+        for (a, b) in out.iter().zip(expected.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+
+    /// ADR-020 iter-12b-3-extract — non-float dtypes Err with
+    /// `UnsupportedDtype`.  Falsifier: silently treating I32 bytes as
+    /// F32 would corrupt sensitivity scores in any downstream FD
+    /// analysis.
+    #[test]
+    fn to_f32_vec_rejects_non_float_dtypes() {
+        for dtype in [DType::I32, DType::I64, DType::U8, DType::U16, DType::U32, DType::Bool] {
+            let bytes = vec![0u8; 16];
+            let t = TensorRef {
+                name: format!("test_{dtype}"),
+                shape: vec![1],
+                dtype,
+                data: std::sync::Arc::new(bytes),
+            };
+            // Set shape so byte-len check passes — we want the dtype-arm
+            // rejection, not a byte-len error.
+            let element_count = t.data.len() / dtype.element_size();
+            let t = TensorRef {
+                name: format!("test_{dtype}"),
+                shape: vec![element_count],
+                dtype,
+                data: t.data.clone(),
+            };
+            let r = t.to_f32_vec();
+            assert!(r.is_err(), "{dtype} must be rejected");
+            let msg = format!("{:?}", r.err().unwrap());
+            assert!(
+                msg.contains("UnsupportedDtype"),
+                "{dtype}: error not UnsupportedDtype: {msg}"
+            );
+        }
+    }
+
+    /// ADR-020 iter-12b-3-extract — torn-mmap detection.  Falsifier:
+    /// a partial F32 payload (e.g. truncated mmap) must Err with
+    /// `ShapeMismatch`, NOT silently produce partial output.
+    #[test]
+    fn to_f32_vec_rejects_byte_len_mismatch() {
+        // Shape says 4 elements (16 bytes for F32) but data only 12 bytes.
+        let t = TensorRef {
+            name: "torn".into(),
+            shape: vec![4],
+            dtype: DType::F32,
+            data: std::sync::Arc::new(vec![0u8; 12]),
+        };
+        let r = t.to_f32_vec();
+        assert!(r.is_err());
+        let msg = format!("{:?}", r.err().unwrap());
+        assert!(
+            msg.contains("ShapeMismatch"),
+            "expected ShapeMismatch, got: {msg}"
+        );
     }
 }

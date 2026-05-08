@@ -733,6 +733,108 @@ mod tests {
         }
     }
 
+    /// ADR-020 iter-11h-e3a regression sentinel: each invocation gets
+    /// a FRESH tape (no reset reused).  Pre-fix this would diverge
+    /// at iter ≥ ~10 due to the missing matmul memory_barrier; post-fix
+    /// it is byte-identical across all iterations.  Catches the
+    /// matmul-RAW-barrier bug class even if tape lifecycle is bypassed.
+    #[test]
+    fn matmul_raw_barrier_fresh_tape_regression_sentinel() {
+        let cfg = AttentionBlockConfig::smallest();
+        let weights = deterministic_weights(&cfg, 555);
+        let batch: Vec<f32> = (0..cfg.batch * cfg.hidden)
+            .map(|i| (i as f32 * 0.0091).sin() * 0.3)
+            .collect();
+
+        let n_repeat = 50;
+        let mut wk_values: Vec<f64> = Vec::with_capacity(n_repeat);
+        for r in 0..n_repeat {
+            let device = MlxDevice::new().expect("device");
+            let tape = GpuTape::new(device);
+            let xt = GpuTensor::from_vec(&tape, &batch, vec![cfg.batch, cfg.hidden]).unwrap();
+            let teacher_leaves =
+                AttentionBlockLeaves::from_weights(&tape, &cfg, &weights).unwrap();
+            let teacher_out = forward(&cfg, &xt, &teacher_leaves).unwrap();
+            let student_leaves = AttentionBlockLeaves::from_weights_qdq(
+                &tape, &cfg, &weights,
+                |w| qdq_q4_0_gpu(tape.device(), w),
+            ).unwrap();
+            let student_out = forward(&cfg, &xt, &student_leaves).unwrap();
+            let per_batch = estimate_attention_block_sensitivities(
+                &tape, &student_out, &teacher_out, &student_leaves, &weights,
+            ).unwrap();
+            let wk = per_batch["W_k"];
+            wk_values.push(wk);
+            if r > 0 && wk != wk_values[0] {
+                eprintln!("[matmul-raw-barrier-sentinel] regression at r={r}: W_k={wk} != canonical={}", wk_values[0]);
+            }
+        }
+        let canonical = wk_values[0];
+        for (i, v) in wk_values.iter().enumerate() {
+            assert_eq!(v.to_bits(), canonical.to_bits(),
+                "iter {i}: W_k={v} != canonical={canonical}");
+        }
+    }
+
+    /// ADR-020 iter-11h-e3a regression sentinel — heavy variant.  Runs
+    /// `estimate_attention_block_sensitivities` 200× on a single shared
+    /// tape (with reset() between iterations) and asserts ALL 200 W_k
+    /// scores are byte-identical.  Pre-fix this would diverge at iter ≥
+    /// ~30 with one of a small set of repeated wrong values
+    /// (-16550.30, -20572.34, +21826.42, +39993.52, 0) due to the
+    /// matmul transpose→matmul RAW dependency racing without
+    /// `encoder.memory_barrier()`.
+    #[test]
+    fn matmul_raw_barrier_repetition_regression_sentinel() {
+        let cfg = AttentionBlockConfig::smallest();
+        let weights = deterministic_weights(&cfg, 555);
+        let batch: Vec<f32> = (0..cfg.batch * cfg.hidden)
+            .map(|i| (i as f32 * 0.0091).sin() * 0.3)
+            .collect();
+
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+
+        // 200-iter sentinel: pre-fix this would diverge ~10-15% of the
+        // time at iter ≥ ~30; post-fix it must be byte-identical across
+        // all 200 iters.  Lower than the 1000-iter probe used during
+        // root-cause investigation but enough to catch any RAW-barrier
+        // regression.
+        let n_repeat = 200;
+        let mut wk_values: Vec<f64> = Vec::with_capacity(n_repeat);
+
+        for r in 0..n_repeat {
+            let xt = GpuTensor::from_vec(&tape, &batch, vec![cfg.batch, cfg.hidden]).unwrap();
+            let teacher_leaves =
+                AttentionBlockLeaves::from_weights(&tape, &cfg, &weights).unwrap();
+            let teacher_out = forward(&cfg, &xt, &teacher_leaves).unwrap();
+            let student_leaves = AttentionBlockLeaves::from_weights_qdq(
+                &tape, &cfg, &weights,
+                |w| qdq_q4_0_gpu(tape.device(), w),
+            ).unwrap();
+            let student_out = forward(&cfg, &xt, &student_leaves).unwrap();
+            let per_batch = estimate_attention_block_sensitivities(
+                &tape, &student_out, &teacher_out, &student_leaves, &weights,
+            ).unwrap();
+            let wk = per_batch["W_k"];
+            wk_values.push(wk);
+            if r > 0 && wk != wk_values[0] {
+                eprintln!("[matmul-raw-barrier-probe] regression at r={r}: W_k={wk} != canonical={}", wk_values[0]);
+            }
+            tape.reset();
+        }
+
+        let canonical = wk_values[0];
+        for (i, v) in wk_values.iter().enumerate() {
+            assert_eq!(
+                v.to_bits(), canonical.to_bits(),
+                "iter {i}: W_k={v} != canonical={canonical} \
+                 — likely missing memory_barrier between transpose+matmul \
+                 (see autograd_gpu_tape.rs forward+backward matmul)"
+            );
+        }
+    }
+
     /// CPU oracle: multi-head SDPA without the √d scale.
     /// Mirrors `multi_head_sdpa` exactly — same per-head loop +
     /// concat ordering, computed on the host in fp32.

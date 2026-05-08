@@ -7460,6 +7460,8 @@ fn ggml_type_label(t: mlx_native::GgmlType) -> &'static str {
         GgmlType::Q5_K => "Q5_K",
         GgmlType::Q6_K => "Q6_K",
         GgmlType::I16 => "I16",
+        GgmlType::Q5_1 => "Q5_1",
+        GgmlType::IQ4_NL => "IQ4_NL",
     }
 }
 
@@ -8540,7 +8542,7 @@ mod multimodal_tests {
             for j in 0..(1 + n_deepstack) {
                 for h in 0..hidden {
                     augmented[r * per_row_floats + j * hidden + h] =
-                        ((r * 1000 + j * 100 + h) as f32);
+                        (r * 1000 + j * 100 + h) as f32;
                 }
             }
         }

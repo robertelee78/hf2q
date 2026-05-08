@@ -152,7 +152,7 @@ fn transpose_2d_row_major(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calibrate::autograd_gpu_tape::{GpuTape, GpuTensor};
+    use crate::calibrate::autograd_gpu_tape::GpuTape;
     use crate::calibrate::qwen35_model::{forward, ModelLeaves};
     use mlx_native::MlxDevice;
 

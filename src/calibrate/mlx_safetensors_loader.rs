@@ -943,7 +943,6 @@ mod tests {
         let k = 16usize;
         let group_size = 8usize;
         let bits = 4u32;
-        let groups_per_row = k / group_size;
 
         let q_int: Vec<u8> = (0..(n * k)).map(|i| (i % 16) as u8).collect();
         // BF16-representable: powers of 2 and small integers.

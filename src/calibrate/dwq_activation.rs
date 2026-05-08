@@ -37,13 +37,20 @@ use std::ops::RangeInclusive;
 use tracing::{debug, info};
 
 use crate::inference::models::qwen35::activation_capture::ActivationCapture;
+use crate::ir::lazy::LazyTensorMap;
 use crate::ir::{ModelMetadata, QuantizedModel, TensorMap};
 use crate::progress::ProgressReporter;
 
 use super::dwq::{
     generate_calibration_tokens, run_dwq_calibration_internal, DwqConfig, DwqError,
 };
-use super::sensitivity::{allocate_bits_by_sensitivity, compute_layer_sensitivity};
+use super::fd_sensitivity::{
+    compute_fd_sensitivity_per_linear, extract_dense_layer_weights_f32_from_lazy,
+    fd_sensitivity_inputs_for_dense_layer, LinearFdInput,
+};
+use super::sensitivity::{
+    aggregate_fd_scores_per_layer, allocate_bits_by_sensitivity, compute_layer_sensitivity,
+};
 
 /// Run activation-aware DWQ calibration.
 ///
@@ -168,6 +175,193 @@ pub fn capture_activations_to_sensitive_ranges(
         sensitive_count = sensitive_indices.len(),
         total = allocated.len(),
         "Activation-derived bit allocation: {} of {} layers above {:.1}-bit midpoint",
+        sensitive_indices.len(),
+        allocated.len(),
+        midpoint
+    );
+
+    Ok(indices_to_ranges(&sensitive_indices))
+}
+
+/// ADR-020 iter-12b-3-wireup — FD-scored sibling of
+/// [`capture_activations_to_sensitive_ranges`].
+///
+/// Runs the full FD chain end-to-end:
+///
+///   1. generate calibration tokens (same shared helper)
+///   2. capture activations (same `ActivationCapture::run_calibration_prompt`)
+///   3. for each layer:
+///      - extract its 9 GGUF-named weights from `model: &LazyTensorMap`
+///      - run `fd_sensitivity_inputs_for_dense_layer` to materialize
+///        per-Linear (X, W, y_T) triples
+///      - dispatch through `compute_fd_sensitivity_per_linear` to get
+///        per-Linear sensitivity scores
+///   4. aggregate per-Linear scores into per-layer
+///      `Vec<LayerSensitivity>` via `aggregate_fd_scores_per_layer`
+///   5. allocate bits via the existing `allocate_bits_by_sensitivity`
+///      pipeline; same `> midpoint` filter as the heuristic path
+///
+/// This is NOT a fallback for the variance-magnitude heuristic — it's
+/// the canonical mlx-lm-equivalent FD-based scorer (closer to mlx-lm's
+/// `dynamic_quant.estimate_sensitivities` formula projected to layer
+/// granularity than the variance heuristic ever was).  Both paths
+/// remain so callers can A/B during the rollout, but the FD path is
+/// the intended replacement.
+///
+/// # Constraint (per `extract_dense_layer_weights_f32_from_lazy`)
+///
+/// Every layer's 9 GGUF-named tensors MUST be already-resident in
+/// `model` (Materialized / MaterializedShared state).  The
+/// DwqCalibrator path satisfies this through its activation-capture
+/// residency span.
+///
+/// # FD parameters (hardcoded for the qwen35-class fixture)
+///
+/// * `low_bits` / `high_bits` ← `config.base_bits` / `config.sensitive_bits`
+/// * `group_size` = 32  (Q4_0/Q8_0 GGUF block size)
+/// * `temperature` = 2.0  (mlx-lm canonical for KL softmax sharpening)
+pub fn capture_activations_to_sensitive_ranges_fd(
+    model: &LazyTensorMap,
+    metadata: &ModelMetadata,
+    config: &DwqConfig,
+    capture: &mut dyn ActivationCapture,
+) -> Result<Vec<RangeInclusive<usize>>, DwqError> {
+    let num_layers = metadata.num_layers as usize;
+    let hidden = metadata.hidden_size as usize;
+    let intermediate = metadata
+        .intermediate_size
+        .ok_or_else(|| DwqError::GpuError {
+            reason: "FD sensitivity requires metadata.intermediate_size; missing for arch"
+                .to_string(),
+        })? as usize;
+    let n_heads = metadata.num_attention_heads as usize;
+    let head_dim = metadata
+        .head_dim
+        .map(|h| h as usize)
+        .unwrap_or_else(|| hidden / n_heads.max(1));
+    if n_heads * head_dim != hidden {
+        return Err(DwqError::GpuError {
+            reason: format!(
+                "FD wireup: n_heads({n_heads}) × head_dim({head_dim}) = {} != hidden({hidden}) — \
+                 cannot tile multi-head SDPA",
+                n_heads * head_dim
+            ),
+        });
+    }
+
+    // Step 1: generate calibration tokens.
+    let calibration_tokens =
+        generate_calibration_tokens(config.calibration_samples, metadata.vocab_size as u32);
+    if calibration_tokens.is_empty() {
+        return Err(DwqError::NoCalibrationData {
+            reason: format!(
+                "Failed to generate calibration tokens (samples={}, vocab_size={})",
+                config.calibration_samples, metadata.vocab_size
+            ),
+        });
+    }
+
+    // Step 2: capture activations.
+    let activations = capture
+        .run_calibration_prompt(&calibration_tokens)
+        .map_err(|e| DwqError::GpuError {
+            reason: format!("ActivationCapture::run_calibration_prompt failed: {e}"),
+        })?;
+    activations.validate().map_err(|e| DwqError::GpuError {
+        reason: format!("LayerActivations shape invariant: {e}"),
+    })?;
+    if (activations.num_layers as usize) != num_layers {
+        return Err(DwqError::GpuError {
+            reason: format!(
+                "LayerActivations.num_layers ({}) != metadata.num_layers ({num_layers})",
+                activations.num_layers
+            ),
+        });
+    }
+
+    // Step 3: per-layer FD scoring.  Iterate layer-by-layer so per-layer
+    // weight tensors live only as long as the score dispatch needs them
+    // (memory bound = single-layer footprint, not all layers at once).
+    let batch = activations.seq_len as usize;
+    let eps = 1e-6f32;
+    let group_size = 32usize;
+    let temperature = 2.0f32;
+    let low_bits = config.base_bits as u32;
+    let high_bits = config.sensitive_bits as u32;
+    let mut all_scores: std::collections::BTreeMap<String, f32> =
+        std::collections::BTreeMap::new();
+
+    for layer_idx in 0..num_layers {
+        let weights = extract_dense_layer_weights_f32_from_lazy(model, layer_idx)
+            .map_err(|e| DwqError::GpuError {
+                reason: format!("FD wireup layer {layer_idx} extract: {e}"),
+            })?;
+
+        let triples = fd_sensitivity_inputs_for_dense_layer(
+            layer_idx,
+            batch,
+            hidden,
+            intermediate,
+            n_heads,
+            head_dim,
+            eps,
+            &activations.layer_inputs[layer_idx],
+            &weights.w_attn_norm,
+            &weights.w_q,
+            &weights.w_k,
+            &weights.w_v,
+            &weights.w_o,
+            &weights.w_ffn_norm,
+            &weights.w_gate,
+            &weights.w_up,
+            &weights.w_down,
+        )
+        .map_err(|e| DwqError::GpuError {
+            reason: format!("FD wireup layer {layer_idx} per-Linear inputs: {e}"),
+        })?;
+
+        let borrowed: Vec<LinearFdInput<'_>> =
+            triples.iter().map(|t| t.as_borrowed()).collect();
+        let layer_scores = compute_fd_sensitivity_per_linear(
+            &borrowed,
+            low_bits,
+            high_bits,
+            group_size,
+            temperature,
+        )
+        .map_err(|e| DwqError::GpuError {
+            reason: format!("FD wireup layer {layer_idx} score: {e}"),
+        })?;
+        // Drop owned weights as soon as scores are extracted.
+        drop(triples);
+        drop(weights);
+        all_scores.extend(layer_scores);
+    }
+
+    // Step 4: aggregate per-Linear scores into per-layer LayerSensitivity.
+    let sensitivities = aggregate_fd_scores_per_layer(&all_scores, num_layers)
+        .map_err(|e| DwqError::GpuError {
+            reason: format!("FD wireup aggregate: {e}"),
+        })?;
+
+    // Step 5: bit allocation → ranges (same midpoint filter as heuristic path).
+    let allocated = allocate_bits_by_sensitivity(
+        &sensitivities,
+        config.base_bits,
+        config.sensitive_bits,
+    );
+    let midpoint = (config.base_bits as f32 + config.sensitive_bits as f32) / 2.0;
+    let sensitive_indices: Vec<usize> = allocated
+        .iter()
+        .enumerate()
+        .filter(|(_, &b)| (b as f32) > midpoint)
+        .map(|(i, _)| i)
+        .collect();
+
+    info!(
+        sensitive_count = sensitive_indices.len(),
+        total = allocated.len(),
+        "FD-derived bit allocation: {} of {} layers above {:.1}-bit midpoint",
         sensitive_indices.len(),
         allocated.len(),
         midpoint
@@ -612,5 +806,143 @@ mod tests {
                  every layer gets base_bits=4 (no sensitive promotion)"
             );
         }
+    }
+
+    /// ADR-020 iter-12b-3-wireup — `capture_activations_to_sensitive_ranges_fd`
+    /// runs end-to-end on a synthetic 2-layer LazyTensorMap with
+    /// MockActivationCapture and produces a valid Vec<RangeInclusive>.
+    ///
+    /// Validates the full FD chain composition:
+    ///   tokens → activations → per-layer extract → per-Linear FD score →
+    ///   per-layer aggregate → bit allocation → ranges
+    fn gguf_named_dense_layer_map(
+        num_layers: u32,
+        hidden: usize,
+        intermediate: usize,
+    ) -> TensorMap {
+        let mut tm = TensorMap::new();
+        let mk_f32_tref = |name: String, values: Vec<f32>, shape: Vec<usize>| {
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for v in values {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            TensorRef {
+                name,
+                shape,
+                dtype: DType::F32,
+                data: std::sync::Arc::new(bytes),
+            }
+        };
+        for i in 0..num_layers {
+            let p = format!("blk.{i}.");
+            // Per-layer fixture — identical Q/K/V/O so all 4 attn Linears
+            // get the same FD score; differentiate ffn block to ensure
+            // some layers rank above midpoint.
+            let h_sq = hidden * hidden;
+            let h_inter = hidden * intermediate;
+            let layer_scale = (i as f32) * 0.1 + 0.5;
+            let attn_w: Vec<f32> =
+                (0..h_sq).map(|j| layer_scale + (j as f32) * 0.001).collect();
+            let ffn_w_inter: Vec<f32> =
+                (0..h_inter).map(|j| layer_scale + (j as f32) * 0.001).collect();
+
+            tm.insert(mk_f32_tref(
+                format!("{p}attn_norm.weight"),
+                vec![1.0; hidden],
+                vec![hidden],
+            ));
+            tm.insert(mk_f32_tref(format!("{p}attn_q.weight"), attn_w.clone(), vec![hidden, hidden]));
+            tm.insert(mk_f32_tref(format!("{p}attn_k.weight"), attn_w.clone(), vec![hidden, hidden]));
+            tm.insert(mk_f32_tref(format!("{p}attn_v.weight"), attn_w.clone(), vec![hidden, hidden]));
+            tm.insert(mk_f32_tref(format!("{p}attn_output.weight"), attn_w, vec![hidden, hidden]));
+            tm.insert(mk_f32_tref(
+                format!("{p}post_attention_norm.weight"),
+                vec![1.0; hidden],
+                vec![hidden],
+            ));
+            tm.insert(mk_f32_tref(format!("{p}ffn_gate.weight"), ffn_w_inter.clone(), vec![intermediate, hidden]));
+            tm.insert(mk_f32_tref(format!("{p}ffn_up.weight"), ffn_w_inter.clone(), vec![intermediate, hidden]));
+            tm.insert(mk_f32_tref(format!("{p}ffn_down.weight"), ffn_w_inter, vec![hidden, intermediate]));
+        }
+        tm
+    }
+
+    #[test]
+    fn fd_wireup_runs_end_to_end_on_synthetic_layers() {
+        use crate::ir::lazy::LazyTensorMap;
+
+        let num_layers = 2u32;
+        let hidden = 32usize;
+        let intermediate = 64usize;
+        let n_heads = 4u32;
+
+        let mut metadata = tiny_metadata(num_layers, hidden as u32);
+        metadata.intermediate_size = Some(intermediate as u64);
+        metadata.num_attention_heads = n_heads;
+        metadata.head_dim = Some((hidden as u32) / n_heads);
+
+        let eager = gguf_named_dense_layer_map(num_layers, hidden, intermediate);
+        let lazy = LazyTensorMap::from_eager(eager);
+
+        let mut capture = MockActivationCapture::new(num_layers, hidden as u32);
+        let config = DwqConfig {
+            calibration_samples: 32,
+            base_bits: 4,
+            sensitive_bits: 8,
+            arch: DwqArch::Qwen35MoE,
+            ..DwqConfig::default()
+        };
+
+        let ranges = capture_activations_to_sensitive_ranges_fd(
+            &lazy,
+            &metadata,
+            &config,
+            &mut capture,
+        )
+        .expect("FD wireup must succeed on synthetic 2-layer fixture");
+
+        // Result is a Vec<RangeInclusive<usize>>.  Validate basic structural
+        // invariants: each range covers in-bounds layer indices; ranges
+        // are sorted and non-overlapping (per indices_to_ranges contract).
+        let mut last_end: Option<usize> = None;
+        for r in &ranges {
+            assert!(*r.start() <= *r.end(), "malformed range {r:?}");
+            assert!(*r.end() < (num_layers as usize), "range {r:?} exceeds num_layers");
+            if let Some(le) = last_end {
+                assert!(*r.start() > le, "ranges overlap or unsorted");
+            }
+            last_end = Some(*r.end());
+        }
+    }
+
+    /// ADR-020 iter-12b-3-wireup — missing `intermediate_size` in
+    /// metadata Errs loudly.  Falsifier for "silently default
+    /// intermediate to hidden_size × 2" anti-pattern (would compute
+    /// FD scores against the wrong shape and produce noise).
+    #[test]
+    fn fd_wireup_rejects_missing_intermediate_size() {
+        use crate::ir::lazy::LazyTensorMap;
+
+        let mut metadata = tiny_metadata(1, 32);
+        metadata.intermediate_size = None; // explicitly missing
+        let lazy = LazyTensorMap::new();
+        let mut capture = MockActivationCapture::new(1, 32);
+        let config = DwqConfig {
+            calibration_samples: 16,
+            base_bits: 4,
+            sensitive_bits: 8,
+            arch: DwqArch::Qwen35MoE,
+            ..DwqConfig::default()
+        };
+
+        let r = capture_activations_to_sensitive_ranges_fd(
+            &lazy, &metadata, &config, &mut capture,
+        );
+        assert!(r.is_err());
+        let msg = format!("{:?}", r.err().unwrap());
+        assert!(
+            msg.contains("intermediate_size"),
+            "error must name the missing metadata field: {msg}"
+        );
     }
 }
