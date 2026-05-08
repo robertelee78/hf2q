@@ -162,6 +162,15 @@ impl ArchFamily {
             ArchFamily::Llama4Reserved => "llama4",
         }
     }
+
+    /// `true` iff this architecture supports a separate mmproj GGUF for
+    /// vision (so the banner should distinguish "mmproj-required (none
+    /// loaded)" from "n/a (text-only arch)").  Gemma4 ships as
+    /// text+mmproj pairs; Qwen3-VL text LM has a companion ViT.  Pure
+    /// text architectures (Qwen35) never carry vision.
+    pub fn supports_mmproj(&self) -> bool {
+        matches!(self, ArchFamily::Gemma4 | ArchFamily::Qwen3VlText)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -416,13 +425,16 @@ fn fmt_provenance(provenance: &Provenance) -> String {
     }
 }
 
-fn fmt_vision(vision: &Option<VisionProjector>) -> String {
+fn fmt_vision(arch: ArchFamily, vision: &Option<VisionProjector>) -> String {
     match vision {
-        None => "none".to_string(),
         Some(v) => {
             let sha = v.mmproj_sha256.as_deref().unwrap_or("none");
             format!("{} (sha256 {sha})", v.mmproj_path.display())
         }
+        None if arch.supports_mmproj() => {
+            "mmproj-required (no mmproj loaded; pass --mmproj at serve)".to_string()
+        }
+        None => "n/a (text-only arch)".to_string(),
     }
 }
 
@@ -504,7 +516,7 @@ pub fn print_banner<W: std::io::Write>(
     writeln!(
         w,
         "{d}hf2q load: vision = {}{r}",
-        fmt_vision(&info.vision_projector)
+        fmt_vision(info.arch_family, &info.vision_projector)
     )?;
     writeln!(
         w,
@@ -1224,7 +1236,7 @@ mod tests {
              hf2q load: tokenizer = gguf-embedded (<= mirrors llama-vocab.cpp)\n\
              hf2q load: chat_template = gguf-embedded\n\
              hf2q load: provenance = hf2q (producer hf2q 0.1.0, source_sha 7f3a…)\n\
-             hf2q load: vision = none\n\
+             hf2q load: vision = n/a (text-only arch)\n\
              hf2q load: kv_spill = inactive\n\
              hf2q load: ready in 6.84 s\n"
         );
@@ -1251,7 +1263,7 @@ mod tests {
         assert!(got.contains("max_ctx_train = none, kv_budget = none"));
         assert!(got.contains("chat_template = none"));
         assert!(got.contains("provenance = external"));
-        assert!(got.contains("vision = none"));
+        assert!(got.contains("vision = n/a (text-only arch)"));
     }
 
     #[test]
