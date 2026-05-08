@@ -1,9 +1,34 @@
 # ADR-022: mlx-native kernel coverage parity with llama.cpp peer
 
-- **Status**: proposed
+- **Status**: **LANDED 2026-05-08**
 - **Date**: 2026-05-08
 - **Deciders**:
 - **Tags**: mlx-native, metal, quantization, kernel-coverage, parity
+
+> ## Phase 5 — Exit-criteria sweep (iter 23)
+>
+> All Phase-1..Phase-4 work complete. AC-by-AC verification:
+>
+> | AC | Status | Evidence |
+> |----|--------|----------|
+> | AC-1 (matrix complete) | ✅ MET | `git grep '"unsupported"' src/ops/quantized_matmul*.rs` returns only F32 \| F16 \| I16 (type-not-applicable) across all 6 sites. |
+> | AC-2 (Gemma4 generates "Paris") | ✅ MET | iter 18 + iter 23 re-verify: "The capital of France is **Paris**.<turn\|>" at temp=0 on the original failing file. |
+> | AC-3 (peer byte-parity) | ✅ MET | `scripts/adr022_p18_byte_equal.sh` PASS — hf2q + llama-completion produce byte-identical "2 + 2 = 4<turn\|>" from the same rendered prompt. |
+> | AC-4 (Q5_K mm_id engaged) | ✅ MET | iter 23 added `HF2Q_LOG_MM_ID_ROUTE=1` env-gated trace; long-prompt run on Qwen 3.6 APEX-Q5_K_M shows `dispatch_id_mm_pooled engaged: type=Q5_K n_tokens=165 top_k=8 k=2048 n=512 n_experts=256` (and Q6_K at n_tokens=1320 for ffn_down_exps). |
+> | AC-5 (mv_ext perf parity ≤5% gap) | DEFERRED to ADR-013/015 | mv_ext kernels coverage-complete (28 instantiations, 8/8 parity). Standalone perf bench requires the qwen35 prefill pipeline gap to close first (current 0.40× of llama.cpp on prefill is in the broader pipeline, not in mv_ext). Operator-decided iter 19. |
+> | AC-6 (no regressions) | ✅ MET | All ADR-022 commits passed parity tests + end-to-end smoke on both fixtures (Gemma4 APEX-Q5_K_M coherent throughout; Qwen 3.6 APEX-Q5_K_M coherent throughout). No previously-passing test regressed. |
+> | AC-7 (memory + LANDED flip) | ✅ MET | `project_adr022_phase{1,2,3,4}_LANDED_2026_05_08.md` memories created; this header now reads LANDED. |
+>
+> **Phase 5 commits** (this iter):
+> - mlx-native: env-gated `HF2Q_LOG_MM_ID_ROUTE` trace in `dispatch_id_mm` + `dispatch_id_mm_pooled` for AC-4 evidence.
+> - hf2q: this header + ADR-final memory note.
+>
+> **Total ADR-022 work** (iters 1-23):
+> - 7 quantized types fully covered (Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q5_1, IQ4_NL).
+> - 70+ kernel instantiations across {mv, mv_id, mm, mm_id, mm_tensor, mm_id_tensor, mv_ext × 4 r1 widths, perm021}.
+> - hf2q-side: GGUF-only inference (no required config.json), embedded tokenizer (no required tokenizer.json), F32 weight routing in `dispatch_qmatmul`, find_tokenizer walk-fallback removed.
+> - 30+ parity tests + 1 byte-equal regression script.
+> - Both fixtures coherent end-to-end. Decode beats llama.cpp on Q5_K (1.24×); prefill gap is ADR-013/015 scope.
 
 ---
 
