@@ -1,9 +1,29 @@
 # ADR-022: mlx-native kernel coverage parity with llama.cpp peer
 
-- **Status**: proposed
+- **Status**: in-flight (Phase 1 foundation landed on `adr-022/phase-1` 2026-05-08)
 - **Date**: 2026-05-08
 - **Deciders**:
 - **Tags**: mlx-native, metal, quantization, kernel-coverage, parity
+
+## Implementation log
+
+### Phase 1 — in flight on `adr-022/phase-1` branch (both repos)
+
+- **2026-05-08 P1.1+P1.2+P1.4 LANDED** (mlx-native @ 534d152)
+  - `GgmlType::Q5_1` / `IQ4_NL` enum variants + block dimensions
+  - `GGML_TYPE_Q5_1 = 7` / `GGML_TYPE_IQ4_NL = 20` loader recognition
+  - Pure-Rust host `dequantize_q5_1` / `dequantize_iq4_nl` + `KVALUES_IQ4_NL`
+  - 8/8 parity tests pass (`tests/adr_022_phase1_dequant_parity.rs`)
+- **2026-05-08 P1.3+P1.4 LANDED** (hf2q @ 188343f)
+  - `gguf_patch.rs::tensor_byte_len` arms + GGML type IDs
+  - `BlockIQ4_NL` + `quantize_row_iq4_nl` + `dequantize_row_iq4_nl_bytes` + `KVALUES_IQ4_NL`
+  - `serve::api::handlers::ggml_type_label` + `serve::load_info` histogram arms (downstream consumers)
+  - 7/7 hf2q-side unit tests pass; pre-existing 3130-test suite unchanged
+- **PENDING**:
+  - P1.5: mv + mv_id Metal kernels (4 kernels)
+  - P1.6: mm + mm_tensor + mm_id + mm_id_tensor + mm_t_bf16_perm021 template instantiations (10 kernels)
+  - P1.7: `mul_mv_ext` r1 family for Q5_1 + IQ4_NL (8 kernels) — evaluate batching with Phase 4 at P1-pre-merge gate
+  - P1.8: full-file load + first-32-token byte-equal vs `llama-cli` integration test
 
 ---
 
