@@ -122,6 +122,26 @@ Phase 1 exit AC:
 - `./target/release/hf2q generate --model /opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf --prompt "What is 2+2?" --max-tokens 64` produces coherent text. (Coherence-checked per `feedback_metal_raw_barrier_per_dispatch.md` — "What is 2+2?" answer must be coherent, not garbage.)
 - First-32-token byte-equal vs `llama-cli` at `--temp 0 --top-p 1 --top-k 0 --repeat-penalty 1` on the same file with the same prompt.
 
+##### Phase 1 progress (live)
+
+| Step | Status | Commit | Evidence |
+|------|--------|--------|----------|
+| P1.1 GgmlType + loader recognition | DONE | (early Phase 1) | mlx-native loads Q5_1 + IQ4_NL tensors |
+| P1.2 host dequantize_{q5_1,iq4_nl} | DONE | (early Phase 1) | adr_022_phase1_dequant_parity 8/8 |
+| P1.3 hf2q gguf_patch + q_legacy IQ4_NL | DONE | (early Phase 1) | 7 unit tests in q_legacy.rs |
+| P1.4 per-block parity (Q5_1 + IQ4_NL) | DONE | (early Phase 1) | tests/adr_022_phase1_dequant_parity.rs |
+| P1.5 4 mv kernels (Q5_1+IQ4_NL × dense+id) | DONE | 8bfa86e + 469bc11 | tests/adr_022_phase1_{dense_mv,mv_id}_gpu_parity 8/8 |
+| P1.6 mm+mm_tensor+mm_id+mm_id_tensor | DONE | 633abd0 (iter 13) | dense_mm_parity_prefill GREEN max_abs ~1.7e-3; mm_id_parity_prefill_path GREEN max_abs ~2.1e-3 (both tensor + non-tensor variants via env-flip) |
+| P1.6 mm_t_bf16_perm021 | N/A | — | Attention Q@K^T only (ADR-013 P21); no model in scope quantizes attention as Q5_1 / IQ4_NL |
+| P1.7 mul_mv_ext r1 family | PENDING | — | Phase 4 candidate; not on Gemma4 critical path |
+| P1.8 Integration: full-file load + first-32 byte-equal | PENDING | — | Final Phase-1 gate |
+
+Iter 12 → 13 root cause investigation (preserved for future ADR readers):
+- iter 12 misdiagnosed mm_id RED parity as a Q5_1 dequant template bug.
+- Root cause was the test fixture: random-distribution `ids` over (n_tokens=64, top_k=8, n_experts=8) → 6.7σ variance; some experts received > n_tokens routings → overflowed `hids[n_experts × n_tokens]` row.
+- Fix: deterministic flat-distribution ids `(t*17 + s*13 + 7) % n_experts` (matches the proven `tests/test_quantized_matmul_id_mm.rs` pattern), and direct `dispatch_id_mm_for_test` against mv_id reference (already CPU-validated in P1.5) — removes the CPU-quantizer noise floor and isolates the mm_id template body as the only variable. Q4_0 baseline at the same shape went GREEN, falsifying the dequant-bug hypothesis.
+- Lesson: when porting a kernel that depends on a routing-table primitive (map0-produced hids), test fixtures must match the routing primitive's per-bucket capacity OR test against a known-good kernel path at the same shape.
+
 #### Phase 2 — Q5_K full coverage
 
 Closes Q5_K row. Validates against `/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/APEX-Q5_K_M.gguf` (operator's existing Q5_K_M fixture, llama.cpp-built per memory `project_qwen35_dwq_pre_505b5b8_broken_2026_05_05.md`). ~2 days.
