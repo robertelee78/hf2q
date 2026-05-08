@@ -2302,6 +2302,110 @@ mod tests {
         }
     }
 
+    /// ADR-020 AC#7 — STRONG NEGATIVE RESULT (FALSIFIES Option B).
+    ///
+    /// Hypothesis under test (2026-05-08): a non-uniform X mimicking
+    /// real post-RMSNorm activations would break the perturb=1.0
+    /// ratio=1.000 plateau.
+    ///
+    /// EMPIRICAL OUTCOME on M5 Max: `kl_min == kl_initial` (ratio
+    /// 1.0000) even with asymmetric real-corpus-like X.  The min-max
+    /// init `s_init = (w_max - w_min) / (n_bins - 1)` is so close to
+    /// optimal at bits=4 that `qdq(s_init, b_init, q_int) ≈ W_real`
+    /// up to discretization (~1 ULP); thus `y_S = X @ qdq^T ≈ X @
+    /// W_real^T = y_T` for ANY X distribution → KL ≈ 0 → gradient ≈
+    /// 0 → no movement under Adam.
+    ///
+    /// **Implication**: Option B (real-corpus X with per-Linear
+    /// teacher) does NOT close the AC#7 boundary gap.  The remaining
+    /// viable path is Option A (full-model teacher matching mlx-lm's
+    /// `dwq_quantize` at `mlx_lm/quant/dwq.py:108-114`), which is
+    /// substantial scope.
+    ///
+    /// Real activation distribution proxy used here:
+    /// - Sample base z ~ Gaussian σ=1
+    /// - Per-row RMSNorm (unit-norm per token)
+    /// - Per-column heavy-tail amplitude exp(0.5 * gauss(j))
+    ///
+    /// This test PASSES by asserting the negative result; future
+    /// iterations on AC#7 must either falsify this finding (e.g.
+    /// with a different real-X construction that does break the
+    /// plateau) or pivot to Option A.
+    #[test]
+    fn perturb_1_0_with_real_corpus_x_does_not_break_noop_plateau() {
+        use super::{box_muller_gaussian, train_linear_dwq_synthetic_teacher, DwqTrainingConfig};
+
+        let device = MlxDevice::new().expect("device");
+        let n = 64usize;
+        let k = 64usize;
+        let m = 32usize;
+        // Real-Q5_K-style W (small stddev, multimodal phasing across
+        // groups — exercises per-group s/b separately).
+        let w_real: Vec<f32> = (0..(n * k))
+            .map(|i| {
+                let phase = (i % 32) as f32 * 0.0911;
+                ((i as f32) * 0.0091 - 0.3).sin() * 0.014 + phase.cos() * 0.005
+            })
+            .collect();
+
+        // Build asymmetric "real-corpus-like" X.
+        let z_base = box_muller_gaussian(m * k, 0xCAFE_BABE);
+        let z_chan_scale = box_muller_gaussian(k, 0xDEAD_F00D);
+        let mut x_real_corpus: Vec<f32> = vec![0.0; m * k];
+        for r in 0..m {
+            // Per-row unit-norm (RMSNorm proxy).
+            let row_start = r * k;
+            let row_end = row_start + k;
+            let row = &z_base[row_start..row_end];
+            let rms = (row.iter().map(|v| v * v).sum::<f32>() / k as f32).sqrt();
+            let inv = if rms > 1e-8 { 1.0 / rms } else { 1.0 };
+            for c in 0..k {
+                // Per-column heavy-tailed amplitude
+                let col_amp = (0.5 * z_chan_scale[c]).exp();
+                x_real_corpus[row_start + c] = row[c] * inv * col_amp;
+            }
+        }
+
+        let cfg = DwqTrainingConfig {
+            n_tokens: m,
+            n_steps: 30,
+            perturb_factor: 1.0,
+            convergence_ratio: 100.0, // disable gate; we assert the ratio ourselves
+            x_override: Some(x_real_corpus),
+            ..DwqTrainingConfig::default()
+        };
+        let result = train_linear_dwq_synthetic_teacher(&device, &w_real, n, k, &cfg)
+            .expect("train (real-corpus X)");
+
+        // EMPIRICAL FINDING (asserted as ground truth):
+        // `kl_min == kl_initial` (ratio 1.0000) — i.e., NO improvement
+        // even with asymmetric real-corpus-like X.  This is the
+        // falsified-hypothesis assertion: the test PASSES by
+        // confirming the no-op plateau holds at perturb=1.0
+        // regardless of X distribution.
+        let ratio = result.kl_min / result.kl_initial;
+        assert!(
+            ratio >= 0.999,
+            "UNEXPECTED: real-corpus X actually broke the plateau at \
+             perturb=1.0!  ratio={ratio:.6} kl_initial={:e} kl_min={:e}.  \
+             If this fires, the original no-op finding needs revisiting \
+             — examine whether the X construction in this test ended up \
+             aligning with a non-trivial gradient direction Adam could \
+             follow.",
+            result.kl_initial,
+            result.kl_min,
+        );
+        assert!(result.kl_initial.is_finite() && result.kl_initial > 0.0);
+        assert!(result.kl_min.is_finite() && result.kl_min >= 0.0);
+        eprintln!(
+            "[ac7-real-x falsifier confirmed] kl_initial={:e} kl_min={:e} ratio={ratio:.6} — \
+             plateau holds; Option B (real-corpus X with per-Linear teacher) does NOT \
+             close AC#7.  Pivot path: Option A (full-model teacher).",
+            result.kl_initial,
+            result.kl_min,
+        );
+    }
+
     /// `x_override` length validation: reject mismatched length, accept
     /// the correct `n_tokens × k`.
     #[test]

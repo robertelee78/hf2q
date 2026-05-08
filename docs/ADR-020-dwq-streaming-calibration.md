@@ -576,13 +576,24 @@ landed; Linear-only forward already landed).
      in the qwen35 layer-10 training: 768/768 ratio=1.000 outputs).
      The synthetic per-Linear approach mathematically CANNOT exceed
      the projection.  For real DWQ benefit at perturb=1.0 the
-     algorithm needs EITHER a full-model teacher (cross-layer
-     error compensation, mlx-lm's approach at
-     `mlx_lm/quant/dwq.py:69-209`) OR real-corpus activations
-     (not synthetic Gaussian X).  Both extensions are out of scope
-     for the current §8.3 implementation.  The serve-side AC#5
-     infrastructure works correctly; AC#7 PASS verdict gates on
-     the algorithmic upgrade.
+     algorithm needs a full-model teacher (cross-layer error
+     compensation, mlx-lm's approach at
+     `mlx_lm/quant/dwq.py:69-209`).
+     - **Option B (real-corpus X) FALSIFIED 2026-05-08**: extended
+       `DwqTrainingConfig` with `x_override` field + landed test
+       `perturb_1_0_with_real_corpus_x_does_not_break_noop_plateau`.
+       Even with asymmetric real-corpus-like X (RMSNorm proxy +
+       heavy-tail per-channel amplitudes), `kl_min == kl_initial`
+       at perturb=1.0.  Reason: min-max init makes
+       `qdq(s_init, b_init, q_int) ≈ W_real` to ~1 ULP, so
+       `y_S = X @ qdq^T ≈ y_T` regardless of X distribution.  Test
+       PASSES by asserting ratio ≥ 0.999 — the plateau is
+       X-independent.
+     - **Option A (full-model teacher)** remains the only viable
+       path.  Substantial scope (full backprop through Gemma /
+       qwen35 attention + FFN + MoE).
+     - The serve-side AC#5 infrastructure works correctly; AC#7
+       PASS verdict gates on Option A.
 8. **Per-family pass:** all four combos {Qwen 3.6 35B-A3B-Abliterix-EGA,
    Gemma 4 26B-A4B-it-ara} × {dwq-4, dwq-6} satisfy criteria 6–7.
    **HARNESS READY** — iter-12d-4 (`a62e4ee`)
