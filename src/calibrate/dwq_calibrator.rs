@@ -504,6 +504,13 @@ mod tests {
         }
     }
 
+    /// ADR-020 iter-12b-5 — populate `intermediate_size` + `head_dim`
+    /// so the FD scorer wireup (`capture_activations_to_sensitive_ranges_fd`)
+    /// has the metadata it needs.  Heuristic-path tests don't read
+    /// these fields, so this strict version is a superset (heuristic
+    /// tests still pass).  Defaults: `intermediate_size = hidden × 2`
+    /// (typical Qwen35 fixture proportions), `head_dim = hidden /
+    /// num_attention_heads = hidden` (single-head).
     fn dummy_metadata(num_layers: u32, hidden_size: u32) -> ModelMetadata {
         ModelMetadata {
             architecture: "TestArch".into(),
@@ -519,12 +526,18 @@ mod tests {
             shard_count: 1,
             num_experts: None,
             top_k_experts: None,
-            intermediate_size: None,
+            // ADR-020 iter-12b-5: FD wireup needs intermediate_size; set
+            // to hidden × 2 (typical proportion).  Heuristic path
+            // ignores this field so existing tests are unaffected.
+            intermediate_size: Some((hidden_size as u64) * 2),
             raw_config: serde_json::Value::Null,
             explicit_layer_types: None,
             full_attention_interval: None,
             attn_output_gate: None,
-            head_dim: None,
+            // ADR-020 iter-12b-5: FD wireup uses head_dim;
+            // single-head fixture so head_dim == hidden.  Heuristic
+            // path ignores; safe to populate.
+            head_dim: Some(hidden_size),
             partial_rotary_factor: None,
             rope_parameters: None,
             linear_conv_kernel_dim: None,
@@ -540,6 +553,76 @@ mod tests {
             output_router_logits: None,
             router_aux_loss_coef: None,
         }
+    }
+
+    /// ADR-020 iter-12b-5 — `LazyTensorMap` populated with the 9
+    /// GGUF-named dense-layer weight tensors per layer that the FD
+    /// scorer wireup needs.
+    ///
+    /// Per-layer naming matches `qwen35_gguf_adapter`:
+    ///   blk.{i}.{attn_norm,attn_q,attn_k,attn_v,attn_output,
+    ///            post_attention_norm,ffn_gate,ffn_up,ffn_down}.weight
+    ///
+    /// All tensors F32 with deterministic seed-driven values so
+    /// fingerprint hashing is stable across runs.  Use this in tests
+    /// that drive the FD path; heuristic-path tests can keep
+    /// `LazyTensorMap::new()` (the variance scorer reads only
+    /// activations, not weights).
+    fn dummy_lazy_map_with_dense_layers(
+        num_layers: u32,
+        hidden: usize,
+        intermediate: usize,
+    ) -> LazyTensorMap {
+        use crate::ir::{DType, TensorMap, TensorRef};
+        let mut tm = TensorMap::new();
+        let mk = |name: String, values: Vec<f32>, shape: Vec<usize>| {
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for v in values {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            TensorRef {
+                name,
+                shape,
+                dtype: DType::F32,
+                data: std::sync::Arc::new(bytes),
+            }
+        };
+        // Deterministic xorshift seeded by tensor name (cheap + stable).
+        let mk_v = |seed_str: &str, n: usize| -> Vec<f32> {
+            let mut s: u64 = seed_str
+                .bytes()
+                .fold(0xDEAD_F00D_BEEF_CAFE_u64, |acc, b| {
+                    acc.wrapping_mul(0x9e37_79b1_85eb_ca87).wrapping_add(b as u64)
+                });
+            (0..n)
+                .map(|_| {
+                    s ^= s >> 33;
+                    s = s.wrapping_mul(0xff51_afd7_ed55_8ccd);
+                    s ^= s >> 33;
+                    ((s as i64) as f32) / (i64::MAX as f32) * 0.3
+                })
+                .collect()
+        };
+        for i in 0..num_layers {
+            let p = format!("blk.{i}.");
+            tm.insert(mk(format!("{p}attn_norm.weight"), vec![1.0; hidden], vec![hidden]));
+            tm.insert(mk(format!("{p}post_attention_norm.weight"), vec![1.0; hidden], vec![hidden]));
+            for name in ["attn_q", "attn_k", "attn_v", "attn_output"] {
+                let key = format!("{p}{name}.weight");
+                let values = mk_v(&key, hidden * hidden);
+                tm.insert(mk(key, values, vec![hidden, hidden]));
+            }
+            let gate_key = format!("{p}ffn_gate.weight");
+            let up_key = format!("{p}ffn_up.weight");
+            let down_key = format!("{p}ffn_down.weight");
+            let gate_v = mk_v(&gate_key, hidden * intermediate);
+            let up_v = mk_v(&up_key, hidden * intermediate);
+            let down_v = mk_v(&down_key, hidden * intermediate);
+            tm.insert(mk(gate_key, gate_v, vec![intermediate, hidden]));
+            tm.insert(mk(up_key, up_v, vec![intermediate, hidden]));
+            tm.insert(mk(down_key, down_v, vec![hidden, intermediate]));
+        }
+        LazyTensorMap::from_eager(tm)
     }
 
     fn nonempty_corpus() -> CalibrationCorpus {
@@ -888,5 +971,62 @@ mod tests {
         // Without capture, Qwen35MoE still reports true.
         let calib2 = DwqCalibrator::new(DwqArch::Qwen35MoE, None, 4, 6, 1024);
         assert!(calib2.requires_forward_pass());
+    }
+
+    /// ADR-020 iter-12b-5 — `dummy_lazy_map_with_dense_layers` produces
+    /// a LazyTensorMap that the FD wireup
+    /// (`capture_activations_to_sensitive_ranges_fd`) accepts end-to-end.
+    ///
+    /// Falsifier: any future regression in the helper (missing tensor,
+    /// wrong shape, wrong dtype) causes the FD path to Err with an
+    /// actionable message; this test would catch it before iter-12b-6
+    /// production cutover lands.
+    #[test]
+    fn dummy_lazy_map_feeds_fd_wireup_end_to_end() {
+        use crate::calibrate::dwq_activation::capture_activations_to_sensitive_ranges_fd;
+
+        let num_layers = 2u32;
+        let hidden = 32usize;
+        let intermediate = 64usize;
+
+        let lazy = dummy_lazy_map_with_dense_layers(num_layers, hidden, intermediate);
+        let mut metadata = dummy_metadata(num_layers, hidden as u32);
+        // FD path needs n_heads × head_dim == hidden.  dummy_metadata
+        // sets head_dim = hidden by default (single-head); n_heads = 1
+        // already.  Override here to a multi-head config to exercise
+        // the SDPA tile loop.
+        metadata.num_attention_heads = 4;
+        metadata.head_dim = Some((hidden / 4) as u32);
+        metadata.intermediate_size = Some(intermediate as u64);
+
+        let mut capture = MockActivationCapture::new(num_layers, hidden as u32);
+        let config = DwqConfig {
+            calibration_samples: 32,
+            base_bits: 4,
+            sensitive_bits: 8,
+            arch: DwqArch::Qwen35MoE,
+            ..DwqConfig::default()
+        };
+
+        let ranges = capture_activations_to_sensitive_ranges_fd(
+            &lazy,
+            &metadata,
+            &config,
+            &mut capture,
+        )
+        .expect("FD wireup must accept the dummy lazy map fixture");
+
+        // Structural invariants — same shape contract as
+        // `fd_wireup_runs_end_to_end_on_synthetic_layers`: ranges in
+        // bounds, sorted, non-overlapping.
+        let mut last_end: Option<usize> = None;
+        for r in &ranges {
+            assert!(*r.start() <= *r.end());
+            assert!(*r.end() < num_layers as usize);
+            if let Some(le) = last_end {
+                assert!(*r.start() > le, "ranges overlap or unsorted");
+            }
+            last_end = Some(*r.end());
+        }
     }
 }
