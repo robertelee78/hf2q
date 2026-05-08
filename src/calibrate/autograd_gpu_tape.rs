@@ -274,6 +274,11 @@ enum OpKind {
     /// Both backward formulas use forward output `y` (autograd-canonical
     /// pattern; saves recomputing `a/b²`).
     Divide { lhs_idx: usize, rhs_idx: usize },
+    /// ADR-020 iter-11h-misc-3 — elementwise `y = sqrt(x)`.
+    /// Backward: `dx[i] = dy[i] / (2 · y[i])` (uses forward output;
+    /// autograd-canonical pattern that avoids recomputing `1/(2√x)`).
+    /// Caller responsibility: `x[i] >= 0` (sqrt of negative is NaN).
+    Sqrt { input_idx: usize },
 }
 
 struct GpuNode {
@@ -623,6 +628,7 @@ pub fn backward(
             | OpKind::Slice2dCols { input_idx, .. }
             | OpKind::SiLU { input_idx }
             | OpKind::Exp { input_idx }
+            | OpKind::Sqrt { input_idx }
             | OpKind::TakeAlongAxisTopK { input_idx, .. }
             | OpKind::View { input_idx, .. }
             | OpKind::ScalarMul { input_idx, .. } => {
@@ -1115,6 +1121,33 @@ fn backward_dispatch(
             encoder
                 .commit_and_wait()
                 .map_err(|e| anyhow!("backward silu: commit_and_wait: {e}"))?;
+            Ok((op, vec![dx_buf]))
+        }
+        OpKind::Sqrt { .. } => {
+            // dx = dy / (2 · y), where y is the FORWARD OUTPUT.
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+            let y_buf = tape.with_node(node_idx, |n| n.value.clone());
+            let n = y_buf.element_count();
+            let dx_buf = device
+                .alloc_buffer(n * 4, DType::F32, y_buf.shape().to_vec())
+                .map_err(|e| anyhow!("backward sqrt: alloc dx: {e}"))?;
+            let mut params_buf = device
+                .alloc_buffer(4, DType::U32, vec![1])
+                .map_err(|e| anyhow!("backward sqrt: alloc params: {e}"))?;
+            params_buf
+                .as_mut_slice::<u32>()
+                .map_err(|e| anyhow!("backward sqrt: params write: {e}"))?[0] = n as u32;
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward sqrt: encoder: {e}"))?;
+            mlx_native::ops::sqrt_elementwise::dispatch_sqrt_backward_f32(
+                &mut encoder, &mut registry, device.metal_device(),
+                &y_buf, out_grad, &dx_buf, &params_buf,
+            ).map_err(|e| anyhow!("backward sqrt: dispatch: {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward sqrt: commit: {e}"))?;
             Ok((op, vec![dx_buf]))
         }
         OpKind::Exp { .. } => {
@@ -2828,6 +2861,57 @@ pub fn exp(t: &GpuTensor) -> Result<GpuTensor> {
 
     let input_idx = t.node_idx;
     let node_idx = tape.push_node(OpKind::Exp { input_idx }, out, t.shape.clone());
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: t.shape.clone(),
+    })
+}
+
+/// ADR-020 iter-11h-misc-3 — elementwise sqrt on GpuTape.
+/// Forward `y = sqrt(x)` via `sqrt_f32`; backward `dx = dy / (2y)`
+/// via `sqrt_backward_f32` (uses forward output, autograd-canonical).
+///
+/// Caller responsibility: `x[i] >= 0` for all i (sqrt of negative
+/// is NaN per IEEE 754; backward at `x = 0` produces NaN via
+/// division by zero).  For numerically-safe usage where x can be
+/// near zero, add a small eps before calling.
+pub fn sqrt(t: &GpuTensor) -> Result<GpuTensor> {
+    let tape = &t.tape;
+    let device = tape.device();
+    let in_buf = tape.with_node(t.node_idx, |n| n.value.clone());
+    let n = in_buf.element_count();
+
+    let out = device
+        .alloc_buffer(n * 4, DType::F32, t.shape.clone())
+        .map_err(|e| anyhow!("sqrt: alloc out: {e}"))?;
+    let mut params_buf = device
+        .alloc_buffer(4, DType::U32, vec![1])
+        .map_err(|e| anyhow!("sqrt: alloc params: {e}"))?;
+    params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("sqrt: params write: {e}"))?[0] = n as u32;
+
+    let mut registry = tape.0.registry.borrow_mut();
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("sqrt: encoder: {e}"))?;
+    mlx_native::ops::sqrt_elementwise::dispatch_sqrt_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &in_buf,
+        &out,
+        &params_buf,
+    )
+    .map_err(|e| anyhow!("sqrt: forward dispatch: {e}"))?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("sqrt: commit_and_wait: {e}"))?;
+    drop(registry);
+
+    let input_idx = t.node_idx;
+    let node_idx = tape.push_node(OpKind::Sqrt { input_idx }, out, t.shape.clone());
     Ok(GpuTensor {
         tape: tape.clone(),
         node_idx,
@@ -5290,6 +5374,46 @@ mod tests {
             assert!(
                 (g_b0[i] - fd_b).abs() < tol_b,
                 "FD b[{i}]: analytic={} fd={}", g_b0[i], fd_b
+            );
+        }
+    }
+
+    /// iter-11h-misc-3 — `sqrt` GpuTape forward + backward FD.
+    /// Composed with mul to exercise gradient through both.
+    #[test]
+    fn sqrt_forward_and_backward_fd() {
+        use mlx_native::MlxDevice;
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+
+        let n = 16usize;
+        let x_data: Vec<f32> = (0..n).map(|i| 0.5 + (i as f32) * 0.1).collect();
+
+        let forward_loss_and_grad = |xv: &[f32]| -> (f32, Vec<f32>) {
+            tape.reset();
+            let xt = GpuTensor::from_vec(&tape, xv, vec![n]).unwrap();
+            let yt = sqrt(&xt).unwrap();
+            let host = yt.to_vec().unwrap();
+            let loss = host.iter().map(|v| *v as f64).sum::<f64>() as f32;
+            let dy = ones_like(&tape, yt.shape()).unwrap();
+            let grads = backward(&yt, dy).unwrap();
+            let g = grads[xt.node_idx()].as_ref().unwrap()
+                .as_slice::<f32>().unwrap().to_vec();
+            (loss, g)
+        };
+
+        let (_l0, g0) = forward_loss_and_grad(&x_data);
+        let h = 1e-3f32;
+        for i in 0..n {
+            let mut p = x_data.clone(); p[i] += h;
+            let (lp, _) = forward_loss_and_grad(&p);
+            let mut m = x_data.clone(); m[i] -= h;
+            let (lm, _) = forward_loss_and_grad(&m);
+            let fd = (lp - lm) / (2.0 * h);
+            let tol = 1e-2 * fd.abs().max(1.0);
+            assert!(
+                (g0[i] - fd).abs() < tol,
+                "FD x[{i}]: analytic={} fd={}", g0[i], fd
             );
         }
     }
