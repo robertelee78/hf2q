@@ -48,6 +48,7 @@ pub mod sensitivity_comparison;
 pub mod adam;
 pub mod dwq_loop;
 pub mod dwq_targets;
+pub mod gguf_teacher;
 pub mod mlx_safetensors_loader;
 pub mod dwq_e2e;
 pub mod imatrix;
