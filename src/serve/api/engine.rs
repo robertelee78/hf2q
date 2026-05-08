@@ -1884,25 +1884,21 @@ impl GemmaLoadedModel {
             model_path.display()
         );
 
-        // Resolve tokenizer + config paths the same way cmd_generate does.
+        // ADR-022 P1.8 — GGUF is the single source of truth on the
+        // inference path. The opts.config_path field is no longer
+        // consulted here: the GGUF carries every Gemma4Config field
+        // (verified key-by-key in `Gemma4Config::from_gguf`). The legacy
+        // config.json path lives on in the calibration / parity /
+        // safetensors pipelines (parity_quality.rs:442, mod.rs:4351 +
+        // 4509) which have no GGUF input.
         let tokenizer_path = find_tokenizer(model_path, opts.tokenizer_path.as_deref())?;
-        let config_path = find_config(model_path, opts.config_path.as_deref())?;
-
-        // ADR-018 C3: legacy `tracing::info!("Engine load: {model,tokenizer,config} = ...")`
-        // triplet was deleted here. The same facts now flow through
-        // `emit_tracing(&info)` at every CLI/SERVE entry that constructs
-        // a `LoadInfo`: structured `model_path`, `tokenizer_source`
-        // (HfTokenizerJson { path }), and the on-disk `config_path` is
-        // load-internal — it produces `Gemma4Config` whose fields
-        // `n_layers`, `hidden_size`, `vocab_size`, etc. emit_tracing
-        // surfaces structurally.
-
-        let config = Gemma4Config::from_config_json(&config_path)
-            .context("Failed to parse config.json")?;
 
         // Open GGUF (header + metadata only).
         let gguf = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
+
+        let config = Gemma4Config::from_gguf(&gguf)
+            .context("Failed to derive Gemma4Config from GGUF metadata")?;
 
         // ADR-017 §F4 + ADR-005 iter-211: detect hf2q-origin provenance
         // (producer_version + source_sha256 + optional mmproj_sha256) at
@@ -7683,6 +7679,7 @@ fn find_tokenizer(model_path: &Path, explicit: Option<&Path>) -> Result<PathBuf>
 }
 
 /// Resolve config.json path (same heuristics as cmd_generate).
+#[allow(dead_code)]
 fn find_config(model_path: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(p) = explicit {
         return Ok(p.to_path_buf());
@@ -7714,6 +7711,7 @@ fn find_config(model_path: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
         "Cannot find config.json. Use --config to specify the path explicitly."
     )
 }
+
 
 // ---------------------------------------------------------------------------
 // Tests
