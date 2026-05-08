@@ -7460,6 +7460,8 @@ fn ggml_type_label(t: mlx_native::GgmlType) -> &'static str {
         GgmlType::Q5_K => "Q5_K",
         GgmlType::Q6_K => "Q6_K",
         GgmlType::I16 => "I16",
+        GgmlType::Q5_1 => "Q5_1",
+        GgmlType::IQ4_NL => "IQ4_NL",
     }
 }
 

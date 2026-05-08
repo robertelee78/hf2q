@@ -67,6 +67,20 @@ pub const BLOCK_Q5_0_SIZE: usize = 2 + 4 + QK5_0 / 2;
 /// per `ggml-common.h:239`.
 pub const BLOCK_Q5_1_SIZE: usize = 2 + 2 + 4 + QK5_1 / 2;
 
+/// Block size for IQ4_NL (32-element non-linear codebook block).
+pub const QK4_NL: usize = 32;
+
+/// Block size in bytes — F16 d (2) + 16 packed nibbles (`QK4_NL/2`)
+/// = 18 bytes. Matches `sizeof(block_iq4_nl)` per `ggml-common.h:441-442`.
+pub const BLOCK_IQ4_NL_SIZE: usize = 2 + QK4_NL / 2;
+
+/// IQ4_NL non-linear codebook constants. 16 signed entries selected by
+/// 4-bit indices in `block_iq4_nl::qs`. Verified byte-equal with
+/// `/opt/llama.cpp/ggml/src/ggml-common.h:1109-1112`. ADR-022 Phase 1.
+pub const KVALUES_IQ4_NL: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
+
 /// Errors from legacy block-32 operations.
 #[derive(Error, Debug)]
 pub enum QLegacyError {
@@ -1013,6 +1027,211 @@ pub fn dequantize_row_q5_1_bytes(data: &[u8], out: &mut [f32]) -> Result<usize, 
     dequantize_row_q5_1(&blocks, out)
 }
 
+// ────────────────────────── IQ4_NL ──────────────────────────
+
+/// IQ4_NL block — F16 scale + 16 packed 4-bit indices into the
+/// `KVALUES_IQ4_NL` codebook. Layout matches `block_iq4_nl`
+/// (`ggml-common.h:438-441`). ADR-022 Phase 1.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockIQ4_NL {
+    /// Block scale `d` (F16 bits).
+    pub d_bits: u16,
+    /// 16 bytes packing 32 × 4-bit codebook indices.
+    pub qs: [u8; QK4_NL / 2],
+}
+
+impl BlockIQ4_NL {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < BLOCK_IQ4_NL_SIZE {
+            return None;
+        }
+        let d_bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let mut qs = [0u8; QK4_NL / 2];
+        qs.copy_from_slice(&bytes[2..2 + QK4_NL / 2]);
+        Some(Self { d_bits, qs })
+    }
+
+    pub fn to_bytes(&self) -> [u8; BLOCK_IQ4_NL_SIZE] {
+        let mut out = [0u8; BLOCK_IQ4_NL_SIZE];
+        out[0..2].copy_from_slice(&self.d_bits.to_le_bytes());
+        out[2..2 + QK4_NL / 2].copy_from_slice(&self.qs);
+        out
+    }
+
+    pub fn d(&self) -> f32 {
+        half::f16::from_bits(self.d_bits).to_f32()
+    }
+}
+
+/// Quantize F32 row to `BlockIQ4_NL` blocks.
+///
+/// For each block: choose `d` so that the 16 codebook entries scaled by
+/// `d` minimize the squared error against the input row's 32 values.
+/// llama.cpp's `quantize_row_iq4_nl_impl` is more sophisticated (uses
+/// IMatrix-weighted importance + grid search); this naive version fits
+/// `d = max_abs / 113` (max codebook magnitude in the positive direction)
+/// then nearest-codebook-entry per element. Sufficient for round-trip
+/// parity tests; not a substitute for llama.cpp's quantizer when shipping
+/// real GGUFs.
+///
+/// Reference: `/opt/llama.cpp/ggml/src/ggml-quants.c:4794-4905`.
+/// ADR-022 Phase 1.
+pub fn quantize_row_iq4_nl(
+    row: &[f32],
+    blocks: &mut [BlockIQ4_NL],
+) -> Result<(), QLegacyError> {
+    if !row.len().is_multiple_of(QK4_NL) {
+        return Err(QLegacyError::NotBlockAligned {
+            actual: row.len(),
+            qk: QK4_NL,
+        });
+    }
+    let nb = row.len() / QK4_NL;
+    if blocks.len() < nb {
+        return Err(QLegacyError::BlockSizeMismatch {
+            actual: blocks.len(),
+            n_blocks: nb,
+            bytes_per_block: BLOCK_IQ4_NL_SIZE,
+        });
+    }
+
+    for i in 0..nb {
+        let x = &row[i * QK4_NL..(i + 1) * QK4_NL];
+
+        // Choose d such that the largest-magnitude codebook entry covers
+        // the largest-magnitude input. Codebook is asymmetric: max
+        // magnitude in [-127, 113] is 127 (negative side). Pick d so
+        // that min(x) maps near -127 if x has a large negative value,
+        // else max(x) near 113. This naive choice mirrors the
+        // `make_qkx2_quants` / `make_q3_quants` style "d = abs_max /
+        // largest codebook entry on dominant side".
+        let mut max_abs = 0.0_f32;
+        for &v in x.iter() {
+            if v.abs() > max_abs {
+                max_abs = v.abs();
+            }
+        }
+        let d = if max_abs == 0.0 {
+            0.0_f32
+        } else {
+            max_abs / 113.0
+        };
+
+        // Pack 32 indices into 16 bytes: index for position j in low
+        // nibble of qs[j], index for position j+16 in high nibble of
+        // qs[j]. Mirrors `dequantize_row_iq4_nl` byte ordering.
+        let mut qs = [0u8; QK4_NL / 2];
+        let inv_d = if d == 0.0 { 0.0 } else { 1.0 / d };
+        for j in 0..(QK4_NL / 2) {
+            let lo_target = x[j] * inv_d;
+            let hi_target = x[j + QK4_NL / 2] * inv_d;
+            let lo_idx = nearest_kvalue_iq4_nl_index(lo_target);
+            let hi_idx = nearest_kvalue_iq4_nl_index(hi_target);
+            qs[j] = (lo_idx & 0x0F) | ((hi_idx & 0x0F) << 4);
+        }
+
+        blocks[i] = BlockIQ4_NL {
+            d_bits: half::f16::from_f32(d).to_bits(),
+            qs,
+        };
+    }
+    Ok(())
+}
+
+/// Find the codebook index whose value (as f32) is closest to `target`.
+fn nearest_kvalue_iq4_nl_index(target: f32) -> u8 {
+    let mut best_idx: u8 = 0;
+    let mut best_err = f32::MAX;
+    for (idx, &kv) in KVALUES_IQ4_NL.iter().enumerate() {
+        let err = (target - kv as f32).abs();
+        if err < best_err {
+            best_err = err;
+            best_idx = idx as u8;
+        }
+    }
+    best_idx
+}
+
+/// Dequantize `BlockIQ4_NL` blocks to F32. Pure-Rust port of
+/// `dequantize_row_iq4_nl` (`ggml-quants.c:2649`). ADR-022 Phase 1.
+pub fn dequantize_row_iq4_nl(
+    blocks: &[BlockIQ4_NL],
+    out: &mut [f32],
+) -> Result<usize, QLegacyError> {
+    let expected = blocks.len() * QK4_NL;
+    if out.len() < expected {
+        return Err(QLegacyError::BlockSizeMismatch {
+            actual: out.len(),
+            n_blocks: blocks.len(),
+            bytes_per_block: QK4_NL,
+        });
+    }
+    for (i, block) in blocks.iter().enumerate() {
+        let d = block.d();
+        for j in 0..(QK4_NL / 2) {
+            let lo = (block.qs[j] & 0x0F) as usize;
+            let hi = (block.qs[j] >> 4) as usize;
+            out[i * QK4_NL + j] = d * KVALUES_IQ4_NL[lo] as f32;
+            out[i * QK4_NL + j + QK4_NL / 2] = d * KVALUES_IQ4_NL[hi] as f32;
+        }
+    }
+    Ok(blocks.len() * QK4_NL)
+}
+
+/// Quantize F32 row to flat IQ4_NL block bytes.
+pub fn quantize_row_iq4_nl_to_bytes(row: &[f32]) -> Result<Vec<u8>, QLegacyError> {
+    if !row.len().is_multiple_of(QK4_NL) {
+        return Err(QLegacyError::NotBlockAligned {
+            actual: row.len(),
+            qk: QK4_NL,
+        });
+    }
+    let nb = row.len() / QK4_NL;
+    let mut blocks = vec![
+        BlockIQ4_NL {
+            d_bits: 0,
+            qs: [0u8; QK4_NL / 2],
+        };
+        nb
+    ];
+    quantize_row_iq4_nl(row, &mut blocks)?;
+    let mut out = Vec::with_capacity(nb * BLOCK_IQ4_NL_SIZE);
+    for b in &blocks {
+        out.extend_from_slice(&b.to_bytes());
+    }
+    Ok(out)
+}
+
+/// Decode flat IQ4_NL block bytes to F32.
+pub fn dequantize_row_iq4_nl_bytes(
+    data: &[u8],
+    out: &mut [f32],
+) -> Result<usize, QLegacyError> {
+    if data.len() % BLOCK_IQ4_NL_SIZE != 0 {
+        return Err(QLegacyError::BlockSizeMismatch {
+            actual: data.len(),
+            n_blocks: data.len() / BLOCK_IQ4_NL_SIZE,
+            bytes_per_block: BLOCK_IQ4_NL_SIZE,
+        });
+    }
+    let n_blocks = data.len() / BLOCK_IQ4_NL_SIZE;
+    let mut blocks = Vec::with_capacity(n_blocks);
+    for i in 0..n_blocks {
+        let start = i * BLOCK_IQ4_NL_SIZE;
+        let end = start + BLOCK_IQ4_NL_SIZE;
+        let block = BlockIQ4_NL::from_bytes(&data[start..end]).ok_or(
+            QLegacyError::BlockSizeMismatch {
+                actual: data.len(),
+                n_blocks,
+                bytes_per_block: BLOCK_IQ4_NL_SIZE,
+            },
+        )?;
+        blocks.push(block);
+    }
+    dequantize_row_iq4_nl(&blocks, out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1770,5 +1989,142 @@ mod tests {
         let r4 = rmse(&row, &d4);
         let r8 = rmse(&row, &d8);
         assert!(r8 < r4, "Q8_0 RMSE {r8} should be < Q4_0 RMSE {r4}");
+    }
+
+    // ─────────────────── IQ4_NL tests (ADR-022 Phase 1) ───────────────────
+
+    /// Block size matches llama.cpp's static_assert
+    /// `sizeof(block_iq4_nl) == sizeof(ggml_half) + QK4_NL/2`.
+    #[test]
+    fn adr022_iq4_nl_block_size_matches_c_struct() {
+        assert_eq!(BLOCK_IQ4_NL_SIZE, 2 + 16);
+        assert_eq!(BLOCK_IQ4_NL_SIZE, 18);
+        assert_eq!(QK4_NL, 32);
+    }
+
+    /// Pin the codebook bytes against llama.cpp's frozen
+    /// `kvalues_iq4nl` table (ggml-common.h:1109-1112). Any drift breaks
+    /// every existing IQ4_NL GGUF on disk.
+    #[test]
+    fn adr022_iq4_nl_codebook_byte_equal_to_llama_cpp() {
+        assert_eq!(
+            KVALUES_IQ4_NL,
+            [
+                -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+            ]
+        );
+    }
+
+    /// Round-trip BlockIQ4_NL via to_bytes / from_bytes.
+    #[test]
+    fn adr022_iq4_nl_block_byte_round_trip() {
+        let block = BlockIQ4_NL {
+            d_bits: 0xABCD,
+            qs: {
+                let mut a = [0u8; QK4_NL / 2];
+                for (i, slot) in a.iter_mut().enumerate() {
+                    *slot = (i as u8).wrapping_mul(13).wrapping_add(7);
+                }
+                a
+            },
+        };
+        let bytes = block.to_bytes();
+        assert_eq!(bytes.len(), BLOCK_IQ4_NL_SIZE);
+        let decoded = BlockIQ4_NL::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.d_bits, block.d_bits);
+        assert_eq!(decoded.qs, block.qs);
+    }
+
+    /// Quantizing all-zero F32 input yields a block with `d=0` and any
+    /// codebook indices (decoded back to all zeros).
+    #[test]
+    fn adr022_iq4_nl_zero_input_yields_zero_output() {
+        let row = vec![0.0_f32; QK4_NL];
+        let mut blocks = vec![BlockIQ4_NL {
+            d_bits: 0,
+            qs: [0u8; QK4_NL / 2],
+        }];
+        quantize_row_iq4_nl(&row, &mut blocks).unwrap();
+        let mut out = vec![0.0_f32; QK4_NL];
+        dequantize_row_iq4_nl(&blocks, &mut out).unwrap();
+        for &v in &out {
+            assert_eq!(v, 0.0_f32);
+        }
+    }
+
+    /// Hand-crafted single-block dequant: d=2.0, qs[0]=0x21
+    /// → pos 0 = 2 * KVALUES[1] = -208
+    /// → pos 16 = 2 * KVALUES[2] = -166
+    /// → other positions = 2 * KVALUES[0] = -254.
+    #[test]
+    fn adr022_iq4_nl_single_block_byte_layout() {
+        let mut bytes = Vec::with_capacity(BLOCK_IQ4_NL_SIZE);
+        let d = 2.0_f32;
+        bytes.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+        let mut qs = [0u8; 16];
+        qs[0] = 0x21;
+        bytes.extend_from_slice(&qs);
+
+        let mut decoded = vec![0.0_f32; QK4_NL];
+        dequantize_row_iq4_nl_bytes(&bytes, &mut decoded).unwrap();
+
+        assert!((decoded[0] - (-208.0_f32)).abs() < 1e-3);
+        assert!((decoded[16] - (-166.0_f32)).abs() < 1e-3);
+        for &v in &decoded[1..16] {
+            assert!((v - (-254.0_f32)).abs() < 1e-3);
+        }
+        for &v in &decoded[17..32] {
+            assert!((v - (-254.0_f32)).abs() < 1e-3);
+        }
+    }
+
+    /// Random-uniform round-trip with codebook half-gap bound.
+    #[test]
+    fn adr022_iq4_nl_round_trip_random_uniform_within_codebook_half_gap() {
+        let mut state: u64 = 0xAD2204F1_u64.wrapping_mul(0x2545F4914F6CDD1D);
+        let n = 10 * QK4_NL;
+        let mut row = Vec::with_capacity(n);
+        for _ in 0..n {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let bits = state.wrapping_mul(0x2545F4914F6CDD1D);
+            row.push(((bits >> 11) as f32) / (1u64 << 53) as f32 * 2.0 - 1.0);
+        }
+
+        let bytes = quantize_row_iq4_nl_to_bytes(&row).unwrap();
+        assert_eq!(bytes.len(), 10 * BLOCK_IQ4_NL_SIZE);
+
+        let mut decoded = vec![0.0_f32; n];
+        dequantize_row_iq4_nl_bytes(&bytes, &mut decoded).unwrap();
+
+        let max_delta = row
+            .iter()
+            .zip(decoded.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+
+        assert!(
+            max_delta <= 0.15_f32,
+            "IQ4_NL round-trip max abs delta {max_delta} exceeds 0.15 bound"
+        );
+    }
+
+    /// quantize → dequantize → quantize must be byte-idempotent: after
+    /// one round-trip the dequantized values lie exactly on `d *
+    /// codebook[idx]`, so re-quantizing produces the same indices.
+    #[test]
+    fn adr022_iq4_nl_quantize_dequant_quantize_idempotent() {
+        let row: Vec<f32> = (0..QK4_NL)
+            .map(|i| (i as f32 * 0.123).sin() * 0.7)
+            .collect();
+        let bytes_a = quantize_row_iq4_nl_to_bytes(&row).unwrap();
+        let mut decoded = vec![0.0_f32; QK4_NL];
+        dequantize_row_iq4_nl_bytes(&bytes_a, &mut decoded).unwrap();
+        let bytes_b = quantize_row_iq4_nl_to_bytes(&decoded).unwrap();
+        assert_eq!(
+            bytes_a, bytes_b,
+            "IQ4_NL quantize-dequantize-quantize must be idempotent"
+        );
     }
 }
