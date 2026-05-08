@@ -236,6 +236,20 @@ enum OpKind {
     /// Backward: `dx[i] = dy[i] · y[i]` (uses forward output, not input
     /// — autograd-canonical pattern, no recompute).
     Exp { input_idx: usize },
+    /// ADR-020 iter-11h-c2 — vector outer product `Y = lhs ⊗ rhs`.
+    /// Forward: `y[i, j] = lhs[i] · rhs[j]` (output shape `[N, M]`).
+    /// Backward: `dlhs[i] = Σ_j dy[i,j]·rhs[j]`,
+    ///           `drhs[j] = Σ_i dy[i,j]·lhs[i]`.
+    /// Required by `gated_delta_update`'s state-update term
+    /// `state += outer(delta, k)` (mlx-lm/gated_delta.py:166).  Distinct
+    /// from matmul (matmul has a 32-floor on inner-dim; outer products
+    /// have inner-dim = 1).
+    OuterProduct {
+        lhs_idx: usize,
+        rhs_idx: usize,
+        n: usize,
+        m: usize,
+    },
 }
 
 struct GpuNode {
@@ -613,6 +627,12 @@ pub fn backward(
             } => {
                 accumulate(&mut grads, input_idx, &parent_grads[0], tape)?;
                 accumulate(&mut grads, weight_idx, &parent_grads[1], tape)?;
+            }
+            OpKind::OuterProduct {
+                lhs_idx, rhs_idx, ..
+            } => {
+                accumulate(&mut grads, lhs_idx, &parent_grads[0], tape)?;
+                accumulate(&mut grads, rhs_idx, &parent_grads[1], tape)?;
             }
         }
     }
@@ -1420,6 +1440,47 @@ fn backward_dispatch(
             //   accumulate(grads, scales_idx, parent_grads[0])
             //   accumulate(grads, biases_idx, parent_grads[1])
             Ok((op, vec![d_scales_buf, d_biases_buf]))
+        }
+        OpKind::OuterProduct {
+            lhs_idx,
+            rhs_idx,
+            n,
+            m,
+        } => {
+            // dlhs[i] = Σ_j dy[i,j]·rhs[j],  drhs[j] = Σ_i dy[i,j]·lhs[i].
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+            let lhs_buf = tape.with_node(lhs_idx, |nd| nd.value.clone());
+            let rhs_buf = tape.with_node(rhs_idx, |nd| nd.value.clone());
+            let dlhs_buf = device
+                .alloc_buffer(n * 4, DType::F32, vec![n])
+                .map_err(|e| anyhow!("backward outer: alloc dlhs: {e}"))?;
+            let drhs_buf = device
+                .alloc_buffer(m * 4, DType::F32, vec![m])
+                .map_err(|e| anyhow!("backward outer: alloc drhs: {e}"))?;
+            let mut params_buf = device
+                .alloc_buffer(8, DType::U32, vec![2])
+                .map_err(|e| anyhow!("backward outer: alloc params: {e}"))?;
+            params_buf
+                .as_mut_slice::<u32>()
+                .map_err(|e| anyhow!("backward outer: params write: {e}"))?
+                .copy_from_slice(&[n as u32, m as u32]);
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward outer: encoder: {e}"))?;
+            mlx_native::ops::outer_product::dispatch_outer_product_backward_lhs_f32(
+                &mut encoder, &mut registry, device.metal_device(),
+                out_grad, &rhs_buf, &dlhs_buf, &params_buf, n as u32, m as u32,
+            ).map_err(|e| anyhow!("backward outer: dlhs dispatch: {e}"))?;
+            mlx_native::ops::outer_product::dispatch_outer_product_backward_rhs_f32(
+                &mut encoder, &mut registry, device.metal_device(),
+                out_grad, &lhs_buf, &drhs_buf, &params_buf, n as u32, m as u32,
+            ).map_err(|e| anyhow!("backward outer: drhs dispatch: {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward outer: commit_and_wait: {e}"))?;
+            // Order matches accumulate(grads, lhs_idx, parent_grads[0]) etc.
+            Ok((op, vec![dlhs_buf, drhs_buf]))
         }
         OpKind::Conv1dDepthwiseCausal {
             input_idx,
@@ -2666,6 +2727,90 @@ pub fn exp(t: &GpuTensor) -> Result<GpuTensor> {
         tape: tape.clone(),
         node_idx,
         shape: t.shape.clone(),
+    })
+}
+
+/// ADR-020 iter-11h-c2 — vector outer product `Y = lhs ⊗ rhs` on
+/// GpuTape.  Forward: `y[i, j] = lhs[i] · rhs[j]` with output shape
+/// `[N, M]`.  Backward routes via `dispatch_outer_product_backward_lhs_f32`
+/// + `dispatch_outer_product_backward_rhs_f32`.
+///
+/// Shape contract: `lhs.shape == [N]`, `rhs.shape == [M]`, output
+/// shape `[N, M]`.
+///
+/// Required by `gated_delta_update`'s state-update term `state +=
+/// outer(delta, k)` (mlx-lm/gated_delta.py:_gated_delta_step_ops:166).
+/// Distinct from `matmul` since matmul has a 32-element floor on
+/// inner-dim (M, N, K ≥ 32 for backward dW dispatch); outer products
+/// have inner-dim = 1, falling below that floor.
+pub fn outer_product(lhs: &GpuTensor, rhs: &GpuTensor) -> Result<GpuTensor> {
+    if !lhs.tape.ptr_eq(&rhs.tape) {
+        return Err(anyhow!(
+            "outer_product: lhs and rhs must share the same tape"
+        ));
+    }
+    if lhs.shape.len() != 1 || rhs.shape.len() != 1 {
+        return Err(anyhow!(
+            "outer_product: both inputs must be 1-D vectors; got lhs={:?}, rhs={:?}",
+            lhs.shape, rhs.shape
+        ));
+    }
+    let n = lhs.shape[0];
+    let m = rhs.shape[0];
+    if n == 0 || m == 0 {
+        return Err(anyhow!(
+            "outer_product: dims must be > 0 (got N={n}, M={m})"
+        ));
+    }
+
+    let tape = &lhs.tape;
+    let device = tape.device();
+    let lhs_buf = tape.with_node(lhs.node_idx, |nd| nd.value.clone());
+    let rhs_buf = tape.with_node(rhs.node_idx, |nd| nd.value.clone());
+
+    let out = device
+        .alloc_buffer(n * m * 4, DType::F32, vec![n, m])
+        .map_err(|e| anyhow!("outer_product: alloc out: {e}"))?;
+    let mut params_buf = device
+        .alloc_buffer(8, DType::U32, vec![2])
+        .map_err(|e| anyhow!("outer_product: alloc params: {e}"))?;
+    params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("outer_product: params write: {e}"))?
+        .copy_from_slice(&[n as u32, m as u32]);
+
+    let mut registry = tape.0.registry.borrow_mut();
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("outer_product: encoder: {e}"))?;
+    mlx_native::ops::outer_product::dispatch_outer_product_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &lhs_buf,
+        &rhs_buf,
+        &out,
+        &params_buf,
+        n as u32,
+        m as u32,
+    )
+    .map_err(|e| anyhow!("outer_product: forward dispatch: {e}"))?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("outer_product: commit_and_wait: {e}"))?;
+    drop(registry);
+
+    let lhs_idx = lhs.node_idx;
+    let rhs_idx = rhs.node_idx;
+    let node_idx = tape.push_node(
+        OpKind::OuterProduct { lhs_idx, rhs_idx, n, m },
+        out,
+        vec![n, m],
+    );
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: vec![n, m],
     })
 }
 
@@ -4666,6 +4811,81 @@ mod tests {
                 "FD w[{j}]: analytic={} fd={}",
                 g_w0[j],
                 fd
+            );
+        }
+    }
+
+    /// iter-11h-c2 — `outer_product` GpuTape forward + backward FD
+    /// falsifier.  Composed with elementwise mul to exercise gradient
+    /// flow into both lhs and rhs paths.
+    #[test]
+    fn outer_product_forward_and_backward_fd() {
+        use mlx_native::MlxDevice;
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+
+        let n = 5usize;
+        let m = 4usize;
+        let lhs_data: Vec<f32> = (0..n).map(|i| 0.4 + (i as f32) * 0.1).collect();
+        let rhs_data: Vec<f32> = (0..m).map(|i| 0.3 + (i as f32) * 0.07).collect();
+
+        let forward_loss_and_grads = |l: &[f32], r: &[f32]| -> (f32, Vec<f32>, Vec<f32>) {
+            tape.reset();
+            let lt = GpuTensor::from_vec(&tape, l, vec![n]).unwrap();
+            let rt = GpuTensor::from_vec(&tape, r, vec![m]).unwrap();
+            let out = outer_product(&lt, &rt).unwrap();
+            let host = out.to_vec().unwrap();
+            let loss = host.iter().map(|v| *v as f64).sum::<f64>() as f32;
+            let dy = ones_like(&tape, out.shape()).unwrap();
+            let grads = backward(&out, dy).unwrap();
+            let g_l = grads[lt.node_idx()].as_ref().unwrap()
+                .as_slice::<f32>().unwrap().to_vec();
+            let g_r = grads[rt.node_idx()].as_ref().unwrap()
+                .as_slice::<f32>().unwrap().to_vec();
+            (loss, g_l, g_r)
+        };
+
+        // Hand-checked forward: y[i, j] = lhs[i] * rhs[j].
+        tape.reset();
+        let lt = GpuTensor::from_vec(&tape, &lhs_data, vec![n]).unwrap();
+        let rt = GpuTensor::from_vec(&tape, &rhs_data, vec![m]).unwrap();
+        let out = outer_product(&lt, &rt).unwrap();
+        let host = out.to_vec().unwrap();
+        for i in 0..n {
+            for j in 0..m {
+                let expected = lhs_data[i] * rhs_data[j];
+                assert!(
+                    (host[i * m + j] - expected).abs() < 1e-6 * expected.abs().max(1.0),
+                    "outer y[{i},{j}]: got={} expected={}",
+                    host[i * m + j], expected
+                );
+            }
+        }
+
+        let (_l0, g_l0, g_r0) = forward_loss_and_grads(&lhs_data, &rhs_data);
+        let h = 1e-3f32;
+        for i in 0..n {
+            let mut p = lhs_data.clone(); p[i] += h;
+            let (lp, _, _) = forward_loss_and_grads(&p, &rhs_data);
+            let mut mn = lhs_data.clone(); mn[i] -= h;
+            let (lm, _, _) = forward_loss_and_grads(&mn, &rhs_data);
+            let fd = (lp - lm) / (2.0 * h);
+            let tol = 1e-2 * fd.abs().max(1.0);
+            assert!(
+                (g_l0[i] - fd).abs() < tol,
+                "FD lhs[{i}]: analytic={} fd={}", g_l0[i], fd
+            );
+        }
+        for j in 0..m {
+            let mut p = rhs_data.clone(); p[j] += h;
+            let (lp, _, _) = forward_loss_and_grads(&lhs_data, &p);
+            let mut mn = rhs_data.clone(); mn[j] -= h;
+            let (lm, _, _) = forward_loss_and_grads(&lhs_data, &mn);
+            let fd = (lp - lm) / (2.0 * h);
+            let tol = 1e-2 * fd.abs().max(1.0);
+            assert!(
+                (g_r0[j] - fd).abs() < tol,
+                "FD rhs[{j}]: analytic={} fd={}", g_r0[j], fd
             );
         }
     }
