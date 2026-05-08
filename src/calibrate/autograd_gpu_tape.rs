@@ -2422,6 +2422,54 @@ pub fn ones_like(tape: &GpuTape, shape: &[usize]) -> Result<MlxBuffer> {
     Ok(buf)
 }
 
+/// ADR-020 iter-11h-a — `RMSNormGated` as a composition of existing
+/// GpuTape ops.  Matches the canonical mlx-lm semantic from
+/// `mlx-lm/mlx_lm/models/qwen3_next.py:65-78` (`Qwen3NextRMSNormGated`):
+///
+/// ```text
+/// out = _precise_swiglu(input, gate, rms_norm(input, weight, eps))
+///     = silu(gate) * rms_norm(input, weight, eps)            (per :59-62)
+/// ```
+///
+/// Both forward AND backward come for free via the existing
+/// `RmsNorm`, `SiLU`, `ElementwiseMul` `OpKind`s — no new Metal
+/// kernel needed.  Shipping this as a single `pub fn` keeps the
+/// composition atomic + tested + reusable, which iter-11h's full
+/// Qwen3.5MoE forward will need at the linear-attention
+/// (`GatedDeltaNet`) layer (`mlx-lm/qwen3_5.py:200`:
+/// `out = self.norm(out, z)`).
+///
+/// Shape contract:
+///   * `input` : `[rows, dim]` (rows × hidden axis)
+///   * `weight`: `[dim]` (per-feature scale)
+///   * `gate`  : `[rows, dim]` (per-element gate signal — typically
+///     a Linear projection of the residual stream)
+///   * Output : `[rows, dim]` matching `input`
+pub fn rms_norm_gated(
+    input: &GpuTensor,
+    weight: &GpuTensor,
+    gate: &GpuTensor,
+    eps: f32,
+) -> Result<GpuTensor> {
+    if !input.tape.ptr_eq(&gate.tape) {
+        return Err(anyhow!(
+            "rms_norm_gated: input and gate must share the same tape"
+        ));
+    }
+    // rms_norm validates input + weight + eps internally; gate-shape
+    // validation is here since rms_norm doesn't see gate.
+    if gate.shape != input.shape {
+        return Err(anyhow!(
+            "rms_norm_gated: gate shape {:?} != input shape {:?}",
+            gate.shape,
+            input.shape
+        ));
+    }
+    let normed = rms_norm(input, weight, eps)?;
+    let activated = silu(gate)?;
+    mul(&activated, &normed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3927,5 +3975,192 @@ mod tests {
                 fd_b
             );
         }
+    }
+
+    /// iter-11h-a — `rms_norm_gated` forward parity vs hand-computed
+    /// reference: `out = silu(gate) * rms_norm(input, weight, eps)`.
+    ///
+    /// Hand-computes the reference per-row to defend against bugs in
+    /// the composition (e.g. wrong operand order to `mul`).
+    #[test]
+    fn rms_norm_gated_forward_matches_hand_oracle() {
+        use mlx_native::MlxDevice;
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+
+        let rows = 4usize;
+        let dim = 8usize;
+        let eps = 1e-6f32;
+        let input_data: Vec<f32> = (0..(rows * dim))
+            .map(|i| ((i as f32) * 0.137 - 0.5).sin() * 0.6)
+            .collect();
+        let weight_data: Vec<f32> = (0..dim).map(|i| 1.0 + (i as f32) * 0.05).collect();
+        let gate_data: Vec<f32> = (0..(rows * dim))
+            .map(|i| ((i as f32) * 0.071 + 0.3).cos() * 0.4)
+            .collect();
+
+        let input = GpuTensor::from_vec(&tape, &input_data, vec![rows, dim]).unwrap();
+        let weight = GpuTensor::from_vec(&tape, &weight_data, vec![dim]).unwrap();
+        let gate = GpuTensor::from_vec(&tape, &gate_data, vec![rows, dim]).unwrap();
+
+        let out = rms_norm_gated(&input, &weight, &gate, eps).expect("rms_norm_gated");
+        let got = out.to_vec().expect("readback");
+        assert_eq!(got.len(), rows * dim);
+
+        // Hand oracle.
+        let mut expected = vec![0.0f32; rows * dim];
+        for r in 0..rows {
+            // RMSNorm: y = x * weight / sqrt(mean(x^2) + eps)
+            let mut ss = 0.0f64;
+            for c in 0..dim {
+                let v = input_data[r * dim + c] as f64;
+                ss += v * v;
+            }
+            let inv_rms = 1.0 / ((ss / dim as f64) + eps as f64).sqrt();
+            for c in 0..dim {
+                let normed =
+                    (input_data[r * dim + c] as f64 * inv_rms * weight_data[c] as f64) as f32;
+                let g = gate_data[r * dim + c];
+                let silu_g = g * (1.0 / (1.0 + (-g).exp()));
+                expected[r * dim + c] = silu_g * normed;
+            }
+        }
+        assert_close(&got, &expected, 1e-4, 1e-5, "rms_norm_gated forward");
+    }
+
+    /// iter-11h-a — `rms_norm_gated` backward via finite-difference.
+    /// Builds a scalar loss `L = sum(rms_norm_gated(input, weight, gate))`
+    /// and asserts that analytic gradients of `L` w.r.t. each parameter
+    /// agree with central-difference within 1% relative tolerance.
+    ///
+    /// This is THE load-bearing falsifier — proves that backward
+    /// correctly routes through silu, rms_norm, AND mul into all three
+    /// parameters (input, weight, gate).  Without this, regressions in
+    /// any of those three OpKinds' backward could go undetected when
+    /// composed via rms_norm_gated.
+    #[test]
+    fn rms_norm_gated_backward_finite_diff() {
+        use mlx_native::MlxDevice;
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+
+        let rows = 3usize;
+        let dim = 4usize;
+        let eps = 1e-5f32;
+        let input_data: Vec<f32> = (0..(rows * dim))
+            .map(|i| ((i as f32) * 0.231 + 0.1).sin() * 0.7)
+            .collect();
+        let weight_data: Vec<f32> = (0..dim).map(|i| 0.8 + (i as f32) * 0.1).collect();
+        let gate_data: Vec<f32> = (0..(rows * dim))
+            .map(|i| ((i as f32) * 0.157 - 0.2).cos() * 0.6)
+            .collect();
+
+        let forward_loss_and_grads = |inp: &[f32], w: &[f32], g: &[f32]| -> (f32, Vec<f32>, Vec<f32>, Vec<f32>) {
+            tape.reset();
+            let input = GpuTensor::from_vec(&tape, inp, vec![rows, dim]).unwrap();
+            let weight = GpuTensor::from_vec(&tape, w, vec![dim]).unwrap();
+            let gate = GpuTensor::from_vec(&tape, g, vec![rows, dim]).unwrap();
+            let out = rms_norm_gated(&input, &weight, &gate, eps).unwrap();
+            let out_host = out.to_vec().unwrap();
+            let loss = out_host.iter().map(|v| *v as f64).sum::<f64>() as f32;
+            let dy = ones_like(&tape, out.shape()).unwrap();
+            let grads = backward(&out, dy).unwrap();
+            let g_in = grads[input.node_idx()]
+                .as_ref()
+                .unwrap()
+                .as_slice::<f32>()
+                .unwrap()
+                .to_vec();
+            let g_w = grads[weight.node_idx()]
+                .as_ref()
+                .unwrap()
+                .as_slice::<f32>()
+                .unwrap()
+                .to_vec();
+            let g_gate = grads[gate.node_idx()]
+                .as_ref()
+                .unwrap()
+                .as_slice::<f32>()
+                .unwrap()
+                .to_vec();
+            (loss, g_in, g_w, g_gate)
+        };
+
+        let (_l0, g_in0, g_w0, g_gate0) =
+            forward_loss_and_grads(&input_data, &weight_data, &gate_data);
+
+        let h = 1e-3f32;
+        // FD on every input element.
+        for i in 0..(rows * dim) {
+            let mut p = input_data.clone();
+            p[i] += h;
+            let (lp, _, _, _) = forward_loss_and_grads(&p, &weight_data, &gate_data);
+            let mut m = input_data.clone();
+            m[i] -= h;
+            let (lm, _, _, _) = forward_loss_and_grads(&m, &weight_data, &gate_data);
+            let fd = (lp - lm) / (2.0 * h);
+            let tol = 1e-2 * fd.abs().max(1.0);
+            assert!(
+                (g_in0[i] - fd).abs() < tol,
+                "FD input[{i}]: analytic={} fd={}",
+                g_in0[i],
+                fd
+            );
+        }
+        // FD on every weight element.
+        for j in 0..dim {
+            let mut p = weight_data.clone();
+            p[j] += h;
+            let (lp, _, _, _) = forward_loss_and_grads(&input_data, &p, &gate_data);
+            let mut m = weight_data.clone();
+            m[j] -= h;
+            let (lm, _, _, _) = forward_loss_and_grads(&input_data, &m, &gate_data);
+            let fd = (lp - lm) / (2.0 * h);
+            let tol = 1e-2 * fd.abs().max(1.0);
+            assert!(
+                (g_w0[j] - fd).abs() < tol,
+                "FD weight[{j}]: analytic={} fd={}",
+                g_w0[j],
+                fd
+            );
+        }
+        // FD on every gate element.
+        for i in 0..(rows * dim) {
+            let mut p = gate_data.clone();
+            p[i] += h;
+            let (lp, _, _, _) = forward_loss_and_grads(&input_data, &weight_data, &p);
+            let mut m = gate_data.clone();
+            m[i] -= h;
+            let (lm, _, _, _) = forward_loss_and_grads(&input_data, &weight_data, &m);
+            let fd = (lp - lm) / (2.0 * h);
+            let tol = 1e-2 * fd.abs().max(1.0);
+            assert!(
+                (g_gate0[i] - fd).abs() < tol,
+                "FD gate[{i}]: analytic={} fd={}",
+                g_gate0[i],
+                fd
+            );
+        }
+    }
+
+    /// Validation: gate shape mismatch surfaces an error rather than
+    /// silently producing wrong output.
+    #[test]
+    fn rms_norm_gated_rejects_gate_shape_mismatch() {
+        use mlx_native::MlxDevice;
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+
+        let input = GpuTensor::from_vec(&tape, &vec![0.0f32; 4 * 8], vec![4, 8]).unwrap();
+        let weight = GpuTensor::from_vec(&tape, &vec![1.0f32; 8], vec![8]).unwrap();
+        // Wrong gate shape (4, 7) instead of (4, 8).
+        let gate = GpuTensor::from_vec(&tape, &vec![0.0f32; 4 * 7], vec![4, 7]).unwrap();
+        let res = rms_norm_gated(&input, &weight, &gate, 1e-6);
+        let err = match res {
+            Ok(_) => panic!("expected gate shape mismatch error"),
+            Err(e) => e,
+        };
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("gate shape") && msg.contains("input shape"));
     }
 }
