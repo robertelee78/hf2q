@@ -1003,35 +1003,25 @@ where
             Vec::<(u32, u32)>::new(),
         )
     } else {
-        let n_images = preprocessed_inputs.len();
         let mmproj = state
             .mmproj
             .as_ref()
             .expect("mmproj checked in process_multimodal_content");
-        let head_dim_f =
-            (mmproj.config.hidden_size / mmproj.config.num_attention_heads) as f32;
-        let scale = 1.0f32 / head_dim_f.sqrt();
-        let t0 = std::time::Instant::now();
         // ADR-005 Phase 2c iter-116a: arch-profile dispatch routes
-        // through `compute_vision_embeddings_gpu_dispatch` (W25) which
-        // partitions the heterogeneous input slice into homogeneous
-        // batches per `ArchProfile` and runs the matching forward.
-        // For `ClipClassic` mmprojs the dispatch is a thin wrapper
-        // around `compute_vision_embeddings_gpu`; for `Gemma4Siglip`
-        // it routes to `compute_vision_embeddings_gpu_gemma4v`; for
-        // `Qwen3VlSiglip` (Wedge-4d) it routes to
-        // `compute_vision_embeddings_gpu_qwen3vl` and returns the
-        // augmented `[n_image_tokens, hidden * (1 + N_deepstack)]`
-        // buffer.
-        let embeddings =
-            match crate::inference::vision::vit_gpu::compute_vision_embeddings_gpu_dispatch(
+        // through `compute_vision_embeddings_gpu_dispatch` (W25). The
+        // body of (a) ViT forward, (b) per-row-floats derivation, (c)
+        // Qwen3-VL grid extraction, (d) embedding-stride validation
+        // lives in `inference::vision::pipeline::run_vit_forward`
+        // (extracted iter-2 of mmproj-on-generate so SERVE + CLI share
+        // one path); request-shape-specific concerns (chat-message
+        // rewriting) stay here at the call site.
+        let pipeline_out =
+            match crate::inference::vision::pipeline::run_vit_forward(
                 &preprocessed_inputs,
-                mmproj.arch,
-                &mmproj.weights,
-                &mmproj.config,
-                scale,
+                mmproj,
+                engine.hidden_size(),
             ) {
-                Ok(e) => e,
+                Ok(out) => out,
                 Err(e) => {
                     return Err(ApiError::generation_error(format!(
                         "ViT forward failed: {e:#}"
@@ -1039,94 +1029,17 @@ where
                     .into_response());
                 }
             };
-        let elapsed_ms = t0.elapsed().as_millis() as u64;
-        tracing::info!(
-            n_images,
-            embed_dim = embeddings.first().map(|e| e.len()).unwrap_or(0),
-            forward_ms = elapsed_ms,
-            arch = mmproj.arch.as_str(),
-            "Vision embeddings computed via GPU ViT forward"
-        );
-        // Per-row stride depends on family — Qwen3-VL emits an augmented
-        // embed `hidden * (1 + N_deepstack)` floats per image token,
-        // while Gemma emits exactly `hidden` floats per image token.
-        let family = mmproj.arch.vision_family();
-        let n_deepstack = mmproj
-            .config
-            .deepstack_indexes
-            .as_ref()
-            .map(|v| v.len())
-            .unwrap_or(0);
-        let hidden = engine.hidden_size();
-        let per_row_floats = match family {
-            crate::inference::vision::mmproj::VisionFamily::Gemma => hidden,
-            crate::inference::vision::mmproj::VisionFamily::Qwen3Vl => {
-                hidden.saturating_mul(1 + n_deepstack)
-            }
-            crate::inference::vision::mmproj::VisionFamily::Unknown => hidden,
-        };
-        // Validate every embedding's element count is a positive multiple
-        // of `per_row_floats` so the soft-token expansion has a unique
-        // answer for `N_image_tokens`.
-        for (i, e) in embeddings.iter().enumerate() {
-            if per_row_floats == 0 || e.is_empty() || e.len() % per_row_floats != 0 {
-                return Err(ApiError::generation_error(format!(
-                    "vision embedding [{i}] length {} is not a positive multiple \
-                     of per_row_floats {per_row_floats} (family={family:?}, \
-                     hidden={hidden}, n_deepstack={n_deepstack})",
-                    e.len()
-                ))
-                .into_response());
-            }
-        }
-        // ADR-005 iter-225 (Wedge-4 Phase-2): collect per-image
-        // post-merge token grids `(n_x_token, n_y_token)` from the
-        // preprocessed inputs. For Qwen3-VL the per-image grid is
-        // derived from the smart-resized pixel grid via
-        // `(pixel_w / stride, pixel_h / stride)` where stride =
-        // patch_size * spatial_merge_size. This is the AUTHORITATIVE
-        // grid threaded into `dispatch_qwen3vl_seam_split` so the
-        // 3D-mRoPE position synthesis sees per-image rectangular
-        // (n_x, n_y) instead of inferring it via post-hoc
-        // factorization.
-        //
-        // For non-Qwen3VL families this Vec stays empty (the seam
-        // dispatch is skipped at the caller).
-        let qwen3vl_image_grids: Vec<(u32, u32)> = if matches!(
-            family,
-            crate::inference::vision::mmproj::VisionFamily::Qwen3Vl
-        ) {
-            let stride = mmproj
-                .config
-                .patch_size
-                .saturating_mul(mmproj.config.spatial_merge_size.unwrap_or(1));
-            preprocessed_inputs
-                .iter()
-                .map(|input| {
-                    use crate::inference::vision::vit_gpu::VisionInput;
-                    match input {
-                        VisionInput::Siglip49(p) => {
-                            let (pw, ph) = p.pixel_grid();
-                            let nx = if stride > 0 { pw / stride } else { 0 };
-                            let ny = if stride > 0 { ph / stride } else { 0 };
-                            (nx, ny)
-                        }
-                        VisionInput::Gemma4v(_) => (0, 0),
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let rewritten = rewrite_messages_for_vision_placeholders_family(&req.messages, family);
+        let n_images = pipeline_out.embeddings.len();
+        let rewritten =
+            rewrite_messages_for_vision_placeholders_family(&req.messages, pipeline_out.family);
         (
             rewritten,
-            embeddings,
-            Some(elapsed_ms),
+            pipeline_out.embeddings,
+            Some(pipeline_out.forward_ms),
             Some(n_images),
-            family,
-            per_row_floats,
-            qwen3vl_image_grids,
+            pipeline_out.family,
+            pipeline_out.per_row_floats,
+            pipeline_out.qwen3vl_image_grids,
         )
     };
 

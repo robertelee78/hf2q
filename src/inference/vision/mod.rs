@@ -44,6 +44,7 @@ use std::time::Duration;
 pub mod image_token_residual_add;
 pub mod mmproj;
 pub mod mmproj_weights;
+pub mod pipeline;
 pub mod preprocess;
 pub mod vit;
 pub mod vit_dump;
