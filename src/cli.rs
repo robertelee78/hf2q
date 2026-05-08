@@ -101,6 +101,19 @@ pub enum Command {
     /// All clear operations atomically rewrite the cache manifest;
     /// concurrent serves observe coherent before/after state.
     Cache(CacheArgs),
+
+    /// ADR-020 iter-12d-3 — DWQ training over all Linears in a GGUF
+    /// model.  Iterates every rank-2 Linear weight tensor, runs
+    /// per-Linear DWQ training (qdq_affine + Adam over scales/biases
+    /// to minimize KL vs the FP32 GGUF teacher), packs trained quant
+    /// params into ONE mlx-format safetensors output file
+    /// (`<stem>.weight` U32-packed + `<stem>.scales`/`.biases` BF16).
+    ///
+    /// Skips: 1-D tensors, n<32 or k<32 dims, k % group_size != 0,
+    /// tensors that fail to converge under `--convergence-ratio`.
+    /// All skipped tensors are reported with reasons in the per-tensor
+    /// disposition log.
+    DwqTrain(DwqTrainArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -134,6 +147,82 @@ pub struct GgufPatchArgs {
 pub struct CacheArgs {
     #[command(subcommand)]
     pub action: CacheAction,
+}
+
+/// ADR-020 iter-12d-3 — `hf2q dwq-train` arguments.
+///
+/// Defaults match the iter-17b acceptance fixture (4-bit, group_size=32,
+/// n_tokens=32, 50 Adam steps at lr=0.002, T=2.0, perturb=2.0,
+/// convergence_ratio=0.34) which produced a measured 53× KL reduction
+/// on real Qwen3.6 27B Q4_0 weights.
+#[derive(clap::Args, Debug, Clone)]
+pub struct DwqTrainArgs {
+    /// Input GGUF model file (any supported ggml_type — load_tensor_f32
+    /// dequantizes to FP32 internally).
+    #[arg(long)]
+    pub gguf: PathBuf,
+
+    /// Output mlx-format safetensors path.  Per trained tensor:
+    /// `<stem>.weight` (U32 packed quant codes), `<stem>.scales`,
+    /// `<stem>.biases` (BF16 by default).
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Quantization bits — typically 4.  Range [2, 8].
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(2..=8))]
+    pub bits: u32,
+
+    /// Quant group size — typically 32 (matches GGUF Q4_0 block size).
+    /// Must be a power of 2 in [2, 1024] and divide each tensor's k.
+    #[arg(long, default_value_t = 32)]
+    pub group_size: usize,
+
+    /// Calibration batch size (m in matmul).  Must be >= 32 (matmul
+    /// backward kernel floor).
+    #[arg(long, default_value_t = 32)]
+    pub n_tokens: usize,
+
+    /// Number of Adam steps per Linear.
+    #[arg(long, default_value_t = 50)]
+    pub steps: usize,
+
+    /// Adam learning rate.
+    #[arg(long, default_value_t = 0.002)]
+    pub lr: f32,
+
+    /// Distillation temperature.
+    #[arg(long, default_value_t = 2.0)]
+    pub temperature: f32,
+
+    /// Initial perturbation factor on scales/biases.
+    #[arg(long, default_value_t = 2.0)]
+    pub perturb_factor: f32,
+
+    /// PRNG seed for the Box-Muller Gaussian X.
+    #[arg(long, default_value_t = 0xDEAD_BEEF)]
+    pub seed: u64,
+
+    /// Convergence ratio (kl_min / kl_initial threshold; tensor is
+    /// rejected if ratio exceeds this).  iter-17b: 0.34.  Set
+    /// > 1.0 to disable the convergence gate.
+    #[arg(long, default_value_t = 0.34)]
+    pub convergence_ratio: f32,
+
+    /// Maximum number of Linear tensors to train (omit to train all).
+    /// Useful for smoke-testing on a small subset before a full run.
+    #[arg(long)]
+    pub limit: Option<usize>,
+
+    /// Skip token_embd + output (lm_head) tensors — they're typically
+    /// huge and not part of mlx-lm's DWQ scope.  Default: true.
+    /// Pass `--skip-huge false` to include them.
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub skip_huge: bool,
 }
 
 /// `hf2q cache` subcommands. ADR-005 Phase 3 iter-205 (AC line 5351).
@@ -1984,6 +2073,115 @@ mod tests {
                 args.quant, *expected,
                 "variant {s} parsed to {:?} but expected {:?}",
                 args.quant, expected,
+            );
+        }
+    }
+
+    /// ADR-020 iter-12d-3 — verify `dwq-train` CLI parses with the
+    /// minimum required args + accepts every documented optional flag
+    /// at non-default values.  Catches silent argument-name typos that
+    /// would otherwise only surface at runtime.
+    #[test]
+    fn iter_12d3_dwq_train_parses_full_arg_surface() {
+        let cli = Cli::try_parse_from([
+            "hf2q",
+            "dwq-train",
+            "--gguf",
+            "/path/to/model.gguf",
+            "--output",
+            "/path/to/out.safetensors",
+            "--bits",
+            "8",
+            "--group-size",
+            "64",
+            "--n-tokens",
+            "64",
+            "--steps",
+            "100",
+            "--lr",
+            "0.001",
+            "--temperature",
+            "1.5",
+            "--perturb-factor",
+            "1.8",
+            "--seed",
+            "42",
+            "--convergence-ratio",
+            "0.5",
+            "--limit",
+            "8",
+            "--skip-huge",
+            "true",
+        ])
+        .expect("dwq-train must parse with full arg surface");
+
+        let Command::DwqTrain(args) = cli.command else {
+            panic!("expected DwqTrain subcommand");
+        };
+        assert_eq!(args.gguf.to_str(), Some("/path/to/model.gguf"));
+        assert_eq!(args.output.to_str(), Some("/path/to/out.safetensors"));
+        assert_eq!(args.bits, 8);
+        assert_eq!(args.group_size, 64);
+        assert_eq!(args.n_tokens, 64);
+        assert_eq!(args.steps, 100);
+        assert!((args.lr - 0.001).abs() < 1e-9);
+        assert!((args.temperature - 1.5).abs() < 1e-9);
+        assert!((args.perturb_factor - 1.8).abs() < 1e-9);
+        assert_eq!(args.seed, 42);
+        assert!((args.convergence_ratio - 0.5).abs() < 1e-9);
+        assert_eq!(args.limit, Some(8));
+        assert!(args.skip_huge);
+    }
+
+    /// ADR-020 iter-12d-3 — defaults match the iter-17b acceptance
+    /// fixture (4-bit, gs=32, 32 tokens, 50 steps, lr=0.002, T=2.0,
+    /// perturb=2.0, convergence=0.34, limit=None, skip_huge=true).
+    #[test]
+    fn iter_12d3_dwq_train_defaults_match_iter17b_fixture() {
+        let cli = Cli::try_parse_from([
+            "hf2q",
+            "dwq-train",
+            "--gguf",
+            "/x.gguf",
+            "--output",
+            "/y.safetensors",
+        ])
+        .expect("dwq-train must parse with only required args");
+        let Command::DwqTrain(args) = cli.command else {
+            panic!("expected DwqTrain");
+        };
+        assert_eq!(args.bits, 4);
+        assert_eq!(args.group_size, 32);
+        assert_eq!(args.n_tokens, 32);
+        assert_eq!(args.steps, 50);
+        assert!((args.lr - 0.002).abs() < 1e-9);
+        assert!((args.temperature - 2.0).abs() < 1e-9);
+        assert!((args.perturb_factor - 2.0).abs() < 1e-9);
+        assert_eq!(args.seed, 0xDEAD_BEEF);
+        assert!((args.convergence_ratio - 0.34).abs() < 1e-9);
+        assert_eq!(args.limit, None);
+        assert!(args.skip_huge);
+    }
+
+    /// ADR-020 iter-12d-3 — clap rejects out-of-range bits values.
+    /// Catches accidentally setting bits=0 or bits=16 (qdq_affine
+    /// supports only [2, 8]).
+    #[test]
+    fn iter_12d3_dwq_train_rejects_out_of_range_bits() {
+        for bad_bits in ["0", "1", "9", "16"] {
+            let r = Cli::try_parse_from([
+                "hf2q",
+                "dwq-train",
+                "--gguf",
+                "/x.gguf",
+                "--output",
+                "/y.safetensors",
+                "--bits",
+                bad_bits,
+            ]);
+            assert!(
+                r.is_err(),
+                "bits={bad_bits} must be rejected (qdq_affine range is [2, 8])"
             );
         }
     }
