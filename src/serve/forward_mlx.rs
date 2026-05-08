@@ -466,6 +466,33 @@ fn alloc_one_f32_placeholder(
         .map_err(|e| anyhow::anyhow!("dense MoE placeholder alloc ({label}): {e}"))
 }
 
+/// ADR-020 AC#5 Iter C2.2 — stacked mlx-affine MoE expert weights for
+/// one (role, layer) tuple.  Each buffer holds the full expert stack
+/// in row-major order: `weight[e, n, k_packed]` U32, `scales[e, n,
+/// k/group_size]` F32, `biases[e, n, k/group_size]` F32.
+///
+/// Consumed by the qwen35moe path's MoE-id dispatch (Iter C2.3) via
+/// `mlx_native::quantized_matmul_id` (already mlx-affine format —
+/// same kernel that mlx-lm uses).
+pub struct MlxAffineMoeStack {
+    /// Packed-U32 weight stack `[n_experts, N, K/pack_factor]`.
+    pub weight: MlxBuffer,
+    /// F32 scales stack `[n_experts, N, K/group_size]`.
+    pub scales: MlxBuffer,
+    /// F32 biases stack `[n_experts, N, K/group_size]`.
+    pub biases: MlxBuffer,
+    /// Output dim per expert.
+    pub n: usize,
+    /// Input dim per expert.
+    pub k: usize,
+    /// Quant bit-width (4 in Iter C2.x).
+    pub bits: u32,
+    /// Per-group axis length (32 in Iter C2.x).
+    pub group_size: u32,
+    /// Number of experts.
+    pub num_experts: usize,
+}
+
 /// Per-expert MoE weights for one layer (quantized, GGML block format).
 pub struct MlxMoeWeights {
     /// Stacked gate_up weights: all experts concatenated into `[n_experts, N, packed_K]`.
@@ -495,6 +522,15 @@ pub struct MlxMoeWeights {
     ///   `output = unit_norm(residual) * router_combined_weight`
     /// This replaces the 3-step CPU sequence: unit_norm → scale → mul.
     pub router_combined_weight: MlxBuffer,
+    /// ADR-020 AC#5 Iter C2.2 — optional DWQ-overlay-applied affine
+    /// stacks, replacing `stacked_gate_up` + `stacked_down` for the
+    /// qwen35moe MoE dispatch path (Iter C2.3 wires the routing).
+    /// `gate_up_affine` covers the FUSED gate+up case (qwen3.5 GGUF
+    /// `ffn_gate_up_exps`); `gate_affine` + `up_affine` cover the
+    /// SEPARATE case (uncommon — added for completeness, not yet
+    /// produced by hf2q dwq-train).
+    pub gate_up_affine: Option<MlxAffineMoeStack>,
+    pub down_affine: Option<MlxAffineMoeStack>,
 }
 
 impl MlxMoeWeights {
@@ -541,6 +577,8 @@ impl MlxMoeWeights {
             top_k: 0,
             moe_intermediate_size: 0,
             router_combined_weight: alloc_one_f32_placeholder(mlx_device, "router_combined_weight")?,
+            gate_up_affine: None,
+            down_affine: None,
         })
     }
 }
@@ -1070,7 +1108,8 @@ pub fn parse_dwq_overlay_role(role: &str) -> DwqOverlayRole {
         "ffn_gate" => DwqOverlayRole::FfnGate,
         "ffn_up" => DwqOverlayRole::FfnUp,
         "ffn_down" => DwqOverlayRole::FfnDown,
-        r if r.starts_with("ffn_gate.")
+        r if r.starts_with("ffn_gate_up.")
+            || r.starts_with("ffn_gate.")
             || r.starts_with("ffn_up.")
             || r.starts_with("ffn_down.") =>
         {
@@ -1078,6 +1117,40 @@ pub fn parse_dwq_overlay_role(role: &str) -> DwqOverlayRole {
         }
         _ => DwqOverlayRole::Unknown,
     }
+}
+
+/// ADR-020 AC#5 Iter C2.2 — base role buckets for stacked MoE expert
+/// loading.  An expert stem `ffn_gate_up.{N}` maps to `GateUp`,
+/// `ffn_down.{N}` → `Down`, `ffn_gate.{N}` → `Gate`, `ffn_up.{N}` →
+/// `Up`.  GateUp is the FUSED case (qwen3.5 GGUF `ffn_gate_up_exps`);
+/// Gate + Up separately is the unfused case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MoeBaseRole {
+    GateUp,
+    Gate,
+    Up,
+    Down,
+}
+
+/// Parse a per-expert MoE stem's role suffix (e.g. `ffn_gate_up.13`)
+/// into `(MoeBaseRole, expert_idx)`.  Returns `None` if the role does
+/// not match a known per-expert pattern.
+pub fn parse_dwq_moe_expert_role(role: &str) -> Option<(MoeBaseRole, usize)> {
+    // `ffn_gate_up.` must be checked before `ffn_gate.` to avoid the
+    // longer prefix being consumed as `Gate.up.{e}` (which would be
+    // "Gate" with a stray `up.` suffix).
+    let (base, rest) = if let Some(rest) = role.strip_prefix("ffn_gate_up.") {
+        (MoeBaseRole::GateUp, rest)
+    } else if let Some(rest) = role.strip_prefix("ffn_gate.") {
+        (MoeBaseRole::Gate, rest)
+    } else if let Some(rest) = role.strip_prefix("ffn_up.") {
+        (MoeBaseRole::Up, rest)
+    } else if let Some(rest) = role.strip_prefix("ffn_down.") {
+        (MoeBaseRole::Down, rest)
+    } else {
+        return None;
+    };
+    rest.parse::<usize>().ok().map(|e| (base, e))
 }
 
 impl MlxModelWeights {
@@ -1432,6 +1505,8 @@ impl MlxModelWeights {
                     top_k: cfg.top_k_experts,
                     moe_intermediate_size: cfg.moe_intermediate_size,
                     router_combined_weight,
+                    gate_up_affine: None,
+                    down_affine: None,
                 }
             } else {
                 // Dense layer — produce a placeholder MoE bundle so the
@@ -1743,14 +1818,20 @@ impl MlxModelWeights {
         }
 
         let mut overridden: usize = 0;
-        let mut moe_skipped: usize = 0;
         let mut unknown_skipped: usize = 0;
+
+        // ADR-020 AC#5 Iter C2.2 — stage MoE per-expert linears for
+        // post-pass aggregation.  Key: `(layer_idx, MoeBaseRole)`,
+        // value: Vec<(expert_idx, MlxAffineLinear)>.
+        type MoeBucket = std::collections::HashMap<
+            (usize, MoeBaseRole),
+            Vec<(usize, MlxAffineLinear)>,
+        >;
+        let mut moe_buckets: MoeBucket = std::collections::HashMap::new();
 
         for stem in &stems {
             let linear = MlxAffineLinear::from_safetensors(&st, stem, bits, group_size)
                 .with_context(|| format!("apply_dwq_overlay: parse {stem}"))?;
-            let qweight = MlxQWeight::from_mlx_affine_linear(device, &linear)
-                .with_context(|| format!("apply_dwq_overlay: build qweight for {stem}"))?;
 
             // Match `blk.{i}.<role>` patterns.
             let after_blk = match stem.strip_prefix("blk.") {
@@ -1784,23 +1865,58 @@ impl MlxModelWeights {
             }
             let role = &after_blk[(dot + 1)..];
             match parse_dwq_overlay_role(role) {
-                DwqOverlayRole::AttnQ => self.layers[layer_idx].attn.q_proj = qweight,
-                DwqOverlayRole::AttnK => self.layers[layer_idx].attn.k_proj = qweight,
+                DwqOverlayRole::AttnQ => {
+                    self.layers[layer_idx].attn.q_proj =
+                        MlxQWeight::from_mlx_affine_linear(device, &linear)
+                            .with_context(|| format!("apply_dwq_overlay: build qweight for {stem}"))?;
+                }
+                DwqOverlayRole::AttnK => {
+                    self.layers[layer_idx].attn.k_proj =
+                        MlxQWeight::from_mlx_affine_linear(device, &linear)
+                            .with_context(|| format!("apply_dwq_overlay: build qweight for {stem}"))?;
+                }
                 DwqOverlayRole::AttnV => {
                     if self.layers[layer_idx].attn.v_proj.is_some() {
-                        self.layers[layer_idx].attn.v_proj = Some(qweight);
+                        self.layers[layer_idx].attn.v_proj = Some(
+                            MlxQWeight::from_mlx_affine_linear(device, &linear)
+                                .with_context(|| format!("apply_dwq_overlay: build qweight for {stem}"))?,
+                        );
                     } else {
                         tracing::warn!(stem = %stem, "DWQ overlay: attn_v but slot is None (k_eq_v); skipping");
                         unknown_skipped += 1;
                         continue;
                     }
                 }
-                DwqOverlayRole::AttnOutput => self.layers[layer_idx].attn.o_proj = qweight,
-                DwqOverlayRole::FfnGate => self.layers[layer_idx].mlp.gate_proj = qweight,
-                DwqOverlayRole::FfnUp => self.layers[layer_idx].mlp.up_proj = qweight,
-                DwqOverlayRole::FfnDown => self.layers[layer_idx].mlp.down_proj = qweight,
+                DwqOverlayRole::AttnOutput => {
+                    self.layers[layer_idx].attn.o_proj =
+                        MlxQWeight::from_mlx_affine_linear(device, &linear)
+                            .with_context(|| format!("apply_dwq_overlay: build qweight for {stem}"))?;
+                }
+                DwqOverlayRole::FfnGate => {
+                    self.layers[layer_idx].mlp.gate_proj =
+                        MlxQWeight::from_mlx_affine_linear(device, &linear)
+                            .with_context(|| format!("apply_dwq_overlay: build qweight for {stem}"))?;
+                }
+                DwqOverlayRole::FfnUp => {
+                    self.layers[layer_idx].mlp.up_proj =
+                        MlxQWeight::from_mlx_affine_linear(device, &linear)
+                            .with_context(|| format!("apply_dwq_overlay: build qweight for {stem}"))?;
+                }
+                DwqOverlayRole::FfnDown => {
+                    self.layers[layer_idx].mlp.down_proj =
+                        MlxQWeight::from_mlx_affine_linear(device, &linear)
+                            .with_context(|| format!("apply_dwq_overlay: build qweight for {stem}"))?;
+                }
                 DwqOverlayRole::MoeExpert => {
-                    moe_skipped += 1;
+                    if let Some((base, expert_idx)) = parse_dwq_moe_expert_role(role) {
+                        moe_buckets
+                            .entry((layer_idx, base))
+                            .or_default()
+                            .push((expert_idx, linear));
+                    } else {
+                        tracing::warn!(stem = %stem, role = %role, "DWQ overlay: malformed MoE expert stem; skipping");
+                        unknown_skipped += 1;
+                    }
                     continue;
                 }
                 DwqOverlayRole::Unknown => {
@@ -1810,24 +1926,168 @@ impl MlxModelWeights {
                 }
             }
             overridden += 1;
-            tracing::debug!(stem = %stem, "DWQ overlay applied");
+            tracing::debug!(stem = %stem, "DWQ overlay applied (dense)");
         }
 
-        if moe_skipped > 0 {
-            tracing::warn!(
-                count = moe_skipped,
-                "DWQ overlay: {moe_skipped} MoE expert tensors skipped (AC#5 Iter C2 not yet landed)"
+        // ADR-020 AC#5 Iter C2.2 — second pass: aggregate per-expert
+        // bucketed Linears into MlxAffineMoeStack and assign to the
+        // matching MoE slot.  Verifies expert indices form a contiguous
+        // 0..n_experts range with consistent shape across experts.
+        let mut moe_stacked: usize = 0;
+        for ((layer_idx, base), mut linears) in moe_buckets.into_iter() {
+            // Sort by expert idx, dedup, validate contiguous 0..n_experts.
+            linears.sort_by_key(|(e, _)| *e);
+            let n_experts = linears.len();
+            for (i, (e, _)) in linears.iter().enumerate() {
+                if *e != i {
+                    anyhow::bail!(
+                        "DWQ overlay MoE bucket (layer={layer_idx}, base={:?}) has non-contiguous expert idx (got {} at slot {})",
+                        base,
+                        e,
+                        i,
+                    );
+                }
+            }
+            // All experts share shape — validate from the first.
+            let n = linears[0].1.n;
+            let k = linears[0].1.k;
+            let bits_per = linears[0].1.bits;
+            let gs_per = linears[0].1.group_size;
+            for (e, l) in &linears[1..] {
+                if l.n != n || l.k != k || l.bits != bits_per || l.group_size != gs_per {
+                    anyhow::bail!(
+                        "DWQ overlay MoE bucket (layer={layer_idx}, base={:?}) expert {} shape ({},{},bits={},gs={}) ≠ expert 0 ({},{},bits={},gs={})",
+                        base, e,
+                        l.n, l.k, l.bits, l.group_size,
+                        n, k, bits_per, gs_per,
+                    );
+                }
+            }
+            if bits_per != 4 || gs_per != 32 {
+                anyhow::bail!(
+                    "DWQ overlay MoE bucket (layer={layer_idx}, base={:?}): only bits=4 group_size=32 supported in Iter C2.2 (got bits={}, gs={})",
+                    base, bits_per, gs_per,
+                );
+            }
+            let pack_factor = 32 / bits_per as usize;
+            let k_packed = k / pack_factor;
+            let groups_per_row = k / (gs_per as usize);
+
+            // Pack each expert's q_int → U32 and concatenate.  Each
+            // expert contributes `n * k_packed` u32s.
+            let stack_words = n_experts * n * k_packed;
+            let mut packed_stack: Vec<u32> = vec![0u32; stack_words];
+            let mut scales_stack: Vec<f32> = vec![0.0f32; n_experts * n * groups_per_row];
+            let mut biases_stack: Vec<f32> = vec![0.0f32; n_experts * n * groups_per_row];
+            for (e, lin) in &linears {
+                for row in 0..n {
+                    for kp in 0..k_packed {
+                        let mut word: u32 = 0;
+                        for j in 0..pack_factor {
+                            let code = lin.q_int[row * k + kp * pack_factor + j] as u32;
+                            debug_assert!(code <= 0xF);
+                            word |= (code & 0xF) << (j * 4);
+                        }
+                        packed_stack[((*e * n) + row) * k_packed + kp] = word;
+                    }
+                }
+                let s_offset = e * n * groups_per_row;
+                scales_stack[s_offset..s_offset + n * groups_per_row]
+                    .copy_from_slice(&lin.scales);
+                biases_stack[s_offset..s_offset + n * groups_per_row]
+                    .copy_from_slice(&lin.biases);
+            }
+
+            // Allocate GPU buffers + upload.
+            let mut weight_buf = device
+                .alloc_buffer(
+                    stack_words * std::mem::size_of::<u32>(),
+                    mlx_native::DType::U32,
+                    vec![n_experts, n, k_packed],
+                )
+                .map_err(|e| anyhow::anyhow!("MoE stack weight alloc: {e}"))?;
+            weight_buf
+                .as_mut_slice::<u32>()
+                .map_err(|e| anyhow::anyhow!("MoE stack weight slice: {e}"))?
+                .copy_from_slice(&packed_stack);
+
+            let mut scales_buf = device
+                .alloc_buffer(
+                    scales_stack.len() * std::mem::size_of::<f32>(),
+                    mlx_native::DType::F32,
+                    vec![n_experts, n, groups_per_row],
+                )
+                .map_err(|e| anyhow::anyhow!("MoE stack scales alloc: {e}"))?;
+            scales_buf
+                .as_mut_slice::<f32>()
+                .map_err(|e| anyhow::anyhow!("MoE stack scales slice: {e}"))?
+                .copy_from_slice(&scales_stack);
+
+            let mut biases_buf = device
+                .alloc_buffer(
+                    biases_stack.len() * std::mem::size_of::<f32>(),
+                    mlx_native::DType::F32,
+                    vec![n_experts, n, groups_per_row],
+                )
+                .map_err(|e| anyhow::anyhow!("MoE stack biases alloc: {e}"))?;
+            biases_buf
+                .as_mut_slice::<f32>()
+                .map_err(|e| anyhow::anyhow!("MoE stack biases slice: {e}"))?
+                .copy_from_slice(&biases_stack);
+
+            let stack = MlxAffineMoeStack {
+                weight: weight_buf,
+                scales: scales_buf,
+                biases: biases_buf,
+                n,
+                k,
+                bits: bits_per,
+                group_size: gs_per as u32,
+                num_experts: n_experts,
+            };
+            let layer = &mut self.layers[layer_idx];
+            match base {
+                MoeBaseRole::GateUp => {
+                    layer.moe.gate_up_affine = Some(stack);
+                }
+                MoeBaseRole::Down => {
+                    layer.moe.down_affine = Some(stack);
+                }
+                MoeBaseRole::Gate | MoeBaseRole::Up => {
+                    // Separate gate / up case — not yet wired into a
+                    // dispatch path (Iter C2.3 only routes the FUSED
+                    // gate_up case for qwen3.5).  Surface as warning;
+                    // operator can revisit when a non-fused MoE GGUF
+                    // arch shows up.
+                    tracing::warn!(
+                        layer_idx,
+                        ?base,
+                        n_experts,
+                        "DWQ overlay: separate gate/up MoE case not wired to dispatch yet (qwen3.5 uses fused gate_up); stack constructed but unused"
+                    );
+                    let _ = stack;
+                }
+            }
+            moe_stacked += 1;
+            tracing::debug!(
+                layer_idx,
+                ?base,
+                n_experts,
+                n,
+                k,
+                "DWQ overlay applied (MoE stack)"
             );
         }
+
         tracing::info!(
             overridden,
-            moe_skipped,
+            moe_stacked,
             unknown_skipped,
             bits,
             group_size,
-            "DWQ overlay applied: {overridden} dense Linears overridden"
+            "DWQ overlay applied: {overridden} dense Linears + {moe_stacked} MoE stacks"
         );
-        Ok(overridden)
+        Ok(overridden + moe_stacked)
     }
 
     #[allow(dead_code)]
@@ -6152,6 +6412,46 @@ mod ac5_iter_b_affine_qweight_roundtrip {
                 direct[i],
             );
         }
+    }
+
+    /// AC#5 Iter C2.2 — `parse_dwq_moe_expert_role` covers all 4 MoE
+    /// base roles + handles invalid suffixes correctly.
+    #[test]
+    fn parse_dwq_moe_expert_role_covers_all_bases() {
+        use super::{parse_dwq_moe_expert_role, MoeBaseRole};
+        // Fused gate+up case (qwen3.5 GGUF).
+        assert_eq!(
+            parse_dwq_moe_expert_role("ffn_gate_up.0"),
+            Some((MoeBaseRole::GateUp, 0))
+        );
+        assert_eq!(
+            parse_dwq_moe_expert_role("ffn_gate_up.127"),
+            Some((MoeBaseRole::GateUp, 127))
+        );
+        // Separate gate / up (uncommon; future archs).
+        assert_eq!(
+            parse_dwq_moe_expert_role("ffn_gate.5"),
+            Some((MoeBaseRole::Gate, 5))
+        );
+        assert_eq!(
+            parse_dwq_moe_expert_role("ffn_up.7"),
+            Some((MoeBaseRole::Up, 7))
+        );
+        // Down expert.
+        assert_eq!(
+            parse_dwq_moe_expert_role("ffn_down.42"),
+            Some((MoeBaseRole::Down, 42))
+        );
+        // Critical: `ffn_gate_up.X` must not match the `ffn_gate.` prefix.
+        assert_ne!(
+            parse_dwq_moe_expert_role("ffn_gate_up.3"),
+            Some((MoeBaseRole::Gate, 3))
+        );
+        // Invalid suffixes.
+        assert_eq!(parse_dwq_moe_expert_role("ffn_gate_up.abc"), None);
+        assert_eq!(parse_dwq_moe_expert_role("ffn_gate"), None);
+        assert_eq!(parse_dwq_moe_expert_role("attn_q.0"), None);
+        assert_eq!(parse_dwq_moe_expert_role(""), None);
     }
 
     /// AC#5 Iter D — `parse_dwq_overlay_role` covers all production
