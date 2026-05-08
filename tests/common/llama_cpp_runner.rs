@@ -467,15 +467,22 @@ mod tests {
     #[test]
     fn perplexity_wrapper_missing_binary_returns_sentinel_and_none() {
         // We drive through the public API but mutate the env-var
-        // through a dedicated mutex so we don't race the harness's
-        // own env-touching tests in this same crate.
-        use std::sync::Mutex;
-        static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = TEST_ENV_LOCK.lock().expect("TEST_ENV_LOCK poisoned");
-        // SAFETY: TEST_ENV_LOCK serialises every env-mutating test
-        // in this `#[cfg(test)] mod tests` block; the unsafe call is
-        // bounded to this critical section, so no other Rust thread
-        // can observe a partial state.
+        // through the binary-wide shared lock from
+        // `tests/common/env_lock.rs` so we don't race
+        // `tests/peer_parity_gates.rs`'s sibling tests that also
+        // mutate `HF2Q_LLAMA_PERPLEXITY_BIN`. (Historical bug 2026-05-08:
+        // a local `static TEST_ENV_LOCK` here did NOT coordinate with
+        // the sibling lock in peer_parity_gates.rs — the two ran in
+        // the same binary process and racy `set_var`/`remove_var`
+        // pairs caused `peer_perplexity_wrapper_handles_missing_binary`
+        // to read a `$PATH`-resolved real binary instead of the
+        // guaranteed-absent override → cascade failures via mutex
+        // poisoning. See `tests/common/env_lock.rs` for full history.)
+        let _guard = super::super::env_lock::lock_env();
+        // SAFETY: lock_env() serialises every env-mutating test in
+        // this binary; the unsafe call is bounded to this critical
+        // section, so no other Rust thread can observe a partial
+        // state.
         unsafe {
             std::env::set_var(
                 "HF2Q_LLAMA_PERPLEXITY_BIN",

@@ -204,21 +204,24 @@ mod inference {
 use ppl_driver::measure_ppl_qwen35;
 
 use std::fmt;
-use std::sync::Mutex;
 
+use common::env_lock::lock_env;
 use common::llama_cpp_runner;
 use common::metrics::RunMetrics;
 use common::mlx_lm_runner;
 
-/// Serialises any test that mutates a process-global env var
-/// (`HF2Q_*_BIN` overrides). Cargo's default test runner is
-/// multi-threaded; `std::env::set_var` is process-wide, so two tests
-/// flipping the same key at once would race. We hold this mutex for
-/// the entire duration of each env-mutating smoke and release it
-/// (along with the var) on exit. This is the canonical Rust idiom for
-/// env-var-touching tests in shared binaries (see `tempfile`'s own
-/// test suite for the same pattern).
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+// `ENV_LOCK` (and its poison-recovery wrapper `lock_env`) lives in
+// `tests/common/env_lock.rs` so that all env-mutating tests across
+// every module loaded into this integration-test binary serialize
+// against the SAME mutex instance. The previous local
+// `static ENV_LOCK: Mutex<()> = Mutex::new(())` here did not coordinate
+// with the sibling lock in `common/llama_cpp_runner.rs::tests`, which
+// led to a real race where two tests both mutated
+// `HF2Q_LLAMA_PERPLEXITY_BIN` and the loser's `resolve_binary` read
+// observed an unset env var → fell back to `$PATH` → found the real
+// `llama-perplexity` → panicked on the missing-binary sentinel
+// assertion → poisoned the local mutex → cascaded sibling failures.
+// See `tests/common/env_lock.rs` for the full incident write-up.
 
 // ---------------------------------------------------------------------
 // Backend + Peer identifiers (Decision 15 columns 2 + 4)
@@ -1166,7 +1169,7 @@ fn gate_cell_ppl_tolerance_check() {
 /// other test in this binary that touches the same env var.
 #[test]
 fn subprocess_wrapper_handles_missing_binary() {
-    let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
+    let _guard = lock_env();
     // SAFETY: ENV_LOCK serialises every env-mutating test in this
     // binary; the unsafe `set_var`/`remove_var` calls are bounded to
     // this critical section, so no other Rust thread can observe a
@@ -1205,7 +1208,7 @@ fn subprocess_wrapper_handles_missing_binary() {
 /// other test in this binary that touches the same env var.
 #[test]
 fn subprocess_wrapper_handles_missing_python_module() {
-    let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
+    let _guard = lock_env();
     // SAFETY: see comment in `subprocess_wrapper_handles_missing_binary`.
     unsafe {
         std::env::set_var("HF2Q_PYTHON_BIN", "/nonexistent/python3-test-stub");
@@ -1362,7 +1365,7 @@ fn wikitext2_smoke_fixture_loads_to_512_tokens() {
 /// other test in this binary that touches the same env var.
 #[test]
 fn peer_perplexity_wrapper_handles_missing_binary() {
-    let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
+    let _guard = lock_env();
     // SAFETY: ENV_LOCK serialises every env-mutating test in this
     // binary; the unsafe set/remove calls are bounded to this
     // critical section.
