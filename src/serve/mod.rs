@@ -802,9 +802,60 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     let gguf = mlx_native::gguf::GgufFile::open(model_path)
         .map_err(|e| anyhow::anyhow!("GGUF re-open (post-load, banner+prompt): {e}"))?;
 
-    let info = <api::engine::GemmaLoadedModel as load_info::LoadInfoBuilder>::build_load_info(
+    let mut info = <api::engine::GemmaLoadedModel as load_info::LoadInfoBuilder>::build_load_info(
         &loaded, &gguf, load_elapsed, None, false,
     );
+
+    // Iter-1 mmproj wire-up on `generate`: when `--mmproj <path>` is set,
+    // validate the GGUF + populate `info.vision_projector` so the banner
+    // reflects the actual vision capability instead of "mmproj-required
+    // (no mmproj loaded)". This mirrors the validation half of the
+    // `serve --mmproj` path (~mod.rs:3432) without paying for ViT weight
+    // upload + warmup, which `generate` doesn't exercise today (no
+    // `--image` flag yet — that's iter-2).
+    if let Some(mmp_path) = args.mmproj.as_ref() {
+        anyhow::ensure!(
+            mmp_path.exists(),
+            "mmproj not found: {}",
+            mmp_path.display()
+        );
+        let mmp_gguf = mlx_native::gguf::GgufFile::open(mmp_path)
+            .map_err(|e| anyhow::anyhow!("mmproj GGUF header parse failed: {e}"))?;
+        let mmp_config = crate::inference::vision::mmproj::MmprojConfig::from_gguf(&mmp_gguf)
+            .map_err(|e| anyhow::anyhow!("mmproj GGUF config parse failed: {e}"))?;
+        let actual_names: Vec<&str> = mmp_gguf.tensor_names();
+        crate::inference::vision::mmproj::validate_tensor_set(&mmp_config, &actual_names)
+            .map_err(|e| anyhow::anyhow!("mmproj GGUF tensor-set validation: {e}"))?;
+        let arch_profile = crate::inference::vision::mmproj::detect_arch_profile_with_projector(
+            &mmp_config.projector,
+            &actual_names,
+        );
+        anyhow::ensure!(
+            arch_profile.is_supported(),
+            "mmproj arch profile is Unknown — neither Gemma 4 SigLIP nor \
+             classic CLIP nor Qwen3-VL SigLIP markers found. hf2q's ViT \
+             forward path cannot dispatch on this file."
+        );
+        let mmproj_sha256 = mmp_gguf
+            .metadata_string("hf2q.mmproj_sha256")
+            .map(|s| s.to_string());
+        info.vision_projector = Some(load_info::VisionProjector {
+            mmproj_path: mmp_path.clone(),
+            mmproj_sha256,
+        });
+        tracing::info!(
+            path = %mmp_path.display(),
+            image_size = mmp_config.image_size,
+            patch_size = mmp_config.patch_size,
+            hidden = mmp_config.hidden_size,
+            layers = mmp_config.num_hidden_layers,
+            projector = mmp_config.projector.as_str(),
+            arch = arch_profile.as_str(),
+            "Loaded mmproj GGUF header (generate iter-1: weights + ViT \
+             warmup deferred to image-input iter-2)"
+        );
+    }
+
     load_info::emit_tracing(&info);
     let mut stdout = std::io::stdout();
     load_info::print_banner(&info, &mut stdout, stdout_is_tty)

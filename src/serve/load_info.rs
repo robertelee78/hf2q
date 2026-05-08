@@ -432,7 +432,7 @@ fn fmt_vision(arch: ArchFamily, vision: &Option<VisionProjector>) -> String {
             format!("{} (sha256 {sha})", v.mmproj_path.display())
         }
         None if arch.supports_mmproj() => {
-            "mmproj-required (no mmproj loaded; pass --mmproj at serve)".to_string()
+            "mmproj-required (no mmproj loaded; pass --mmproj)".to_string()
         }
         None => "n/a (text-only arch)".to_string(),
     }
