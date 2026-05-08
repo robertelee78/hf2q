@@ -134,7 +134,17 @@ Phase 1 exit AC:
 | P1.6 mm+mm_tensor+mm_id+mm_id_tensor | DONE | 633abd0 (iter 13) | dense_mm_parity_prefill GREEN max_abs ~1.7e-3; mm_id_parity_prefill_path GREEN max_abs ~2.1e-3 (both tensor + non-tensor variants via env-flip) |
 | P1.6 mm_t_bf16_perm021 | N/A | — | Attention Q@K^T only (ADR-013 P21); no model in scope quantizes attention as Q5_1 / IQ4_NL |
 | P1.7 mul_mv_ext r1 family | PENDING | — | Phase 4 candidate; not on Gemma4 critical path |
-| P1.8 Integration: full-file load + first-32 byte-equal | PENDING | — | Final Phase-1 gate |
+| P1.8 Integration: full-file load + first-32 byte-equal | IN PROGRESS | iter 14 (9cd0a8a config gate; F32-router blocker discovered) | Loader runs GGUF-only; forward path blocks on F32 router projection — see P1.9 |
+| P1.9 F32 weight routing in `dispatch_qmatmul` | PENDING (iter 15) | — | `blk.{i}.ffn_gate_inp.weight` is `[2816, 128] F32` in APEX-Q5_K_M; mlx-native's `quantized_matmul_ggml` (correctly) refuses F32 — hf2q's `dispatch_qmatmul` wrapper needs an F32 fast-path to `hf2q_dense_mm_f32_f32` (kernel already shipped in mlx-native, registered in `kernel_registry.rs:128`). Operator alignment: NO FALLBACK pattern — wrapper inspects `weight.info.ggml_dtype` and dispatches to the correct kernel, not to a "fallback" path. |
+
+Iter 14 root-cause notes (preserved for iter 15 + future readers):
+
+- Operator pushback: "requiring config.json seems dumb" + "fallbacks are an antipattern". Both are correct: GGUF metadata carries every `Gemma4Config` field, and the engine.rs `if config_path { json } else { gguf }` conditional WAS a fallback. Iter 14 fix: `Gemma4Config::from_gguf` is the single source of truth on the GGUF path; the legacy `find_config` walked over `models/<subdir>/` was finding a peer model's config.json (e.g. qwen3.6's) when no Gemma4 config existed, silently substituting wrong arch params — that's the antipattern operator was flagging.
+- 392 F32 tensors in `gemma4-ara-2pass-APEX-Q5_K_M.gguf`: 362 are 1D scalars (norms, eps, freq_factors, layer_output_scale) and 30 are `[2816, 128]` per-layer router weights `ffn_gate_inp.weight`. Only the routers go through `dispatch_qmatmul`. The 362 scalars are consumed by RMS-norm / embedding / RoPE kernels that have their own dispatch.
+- llama.cpp peer pattern: `ggml_mul_mat` (in `ggml/src/ggml-cpu/ggml-cpu.c`) treats F32 as a regular type — the dense F32 matmul kernel is just one of many in its dispatch table. Our `quantized_matmul_ggml` is GGUF-format-aware but currently rejects F32; the `_ggml` suffix means "GGUF block format" but F32 IS a valid GGUF format (type id 0). Two architectural options for iter 15:
+  1. Add F32 arm to `quantized_matmul_ggml` that dispatches to `hf2q_dense_mm_f32_f32` directly. Pro: single dispatcher, type-agnostic. Con: blurs the "quantized" name.
+  2. hf2q-side `dispatch_qmatmul` wrapper inspects `weight.info.ggml_dtype` and forks to the correct kernel. Pro: keeps mlx-native's kernel boundaries clean. Con: every consumer must wrap.
+   — Operator decision pending; default-recommend option 2 (smaller blast radius, hf2q already has the wrapper).
 
 Iter 12 → 13 root cause investigation (preserved for future ADR readers):
 - iter 12 misdiagnosed mm_id RED parity as a Q5_1 dequant template bug.
