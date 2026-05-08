@@ -410,8 +410,8 @@ landed; Linear-only forward already landed).
      iter-15c-2 4-simdgroup `qmm_affine_simd4` measured 5×+ speedup.
 5. **hf2q MLX-safetensors loader:** loads the trained output via
    `mlx_native::weight::load_quantized_weights`; serve-path generation
-   produces non-degenerate text on a fixed prompt.  **DENSE DONE 2026-05-08
-   / MoE INFRA DONE / qwen35 PARALLEL IMPL PENDING** —
+   produces non-degenerate text on a fixed prompt.  **DONE 2026-05-08
+   — DENSE + GEMMA 4 MoE + QWEN 3.6 35B-A3B MoE ALL LIVE** —
    - **Dense closure** (Iter A → E, hf2q `b017c65`, mlx-native
      `de0bcb9`):
      - Iter A: ported canonical `affine_qmm_t` packed-U32 dense kernel
@@ -507,9 +507,26 @@ landed; Linear-only forward already landed).
        HTTP chat returned **"Two plus two equals four."** at 528ms
        TTFT / 61.8 t/s decode.  This proves the full Iter C2.3
        affine MoE dispatch path end-to-end on Gemma 4 26B.
-       Qwen 3.6 35B-A3B parity test pending (different
-       architecture: separate gate + up + down rather than
-       fused gate_up + down).
+     - **Qwen 3.6 35B-A3B-APEX AFFINE MoE LIVE 2026-05-08**:
+       `--tensor-filter '^blk\.10\.ffn_(gate|up|down)_exps\.weight$'`
+       trained 768 tensors (3 roles × 256 experts/layer; 503 MB
+       safetensors).  `Qwen35LoadedModel::load` invoked
+       `Qwen35Model::apply_dwq_overlay` (Iter C2.4 #2-3) which
+       reported `3 MoE expert stacks` for layer 10 — both
+       `expert_gate_affine` + `expert_up_affine` + `expert_down_affine`
+       populated.  `forward_gpu.rs::upload_layer_weights_gpu`'s
+       `attach_affine_overlay` (Iter C2.4 #4) propagated the slots
+       into the GPU bundle.  `dispatch_moe_id_routed` at
+       `qwen35/gpu_ffn.rs:80` routes layer 10's MoE matmul through
+       `mlx_native::quantized_matmul_id_into`.  HTTP chat returned
+       **"2 plus 2 equals 4."** at 1561ms TTFT / 118 t/s decode on
+       M5 Max.  This proves the full qwen35 parallel-impl chain
+       (Iter C2.4 #1-4) end-to-end.
+
+   **AC#5 STATUS — DONE 2026-05-08**: dense (Iter A-E) + Gemma 4
+   fused-MoE (Iter C2.3) + qwen35 separate-MoE (Iter C2.4 #1-4)
+   all verified LIVE through HTTP serve.  Closure event = this
+   iter's commit.
      - `MlxAffineMoeStack` derives Clone (cheap — `MlxBuffer` is
        internally Arc-wrapped, no GPU data copy).
      - `MoeFfnWeightsGpuQ` gains `expert_{gate,up,down}_affine` slots
