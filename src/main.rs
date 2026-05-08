@@ -230,6 +230,7 @@ fn cmd_dwq_train(args: cli::DwqTrainArgs) -> Result<(), AppError> {
         seed: args.seed,
         convergence_ratio: args.convergence_ratio,
         rss_cap_bytes,
+        compute_bench: args.bench,
     };
 
     println!(
@@ -291,9 +292,16 @@ fn cmd_dwq_train(args: cli::DwqTrainArgs) -> Result<(), AppError> {
         } else {
             f32::NAN
         };
+        let bench_str = match &t.bench {
+            Some(b) => format!(
+                "  bench: q4_0={:.4e} dwq={:.4e} delta={:+.4e}",
+                b.q4_0_kl_nats, b.dwq_kl_nats, b.delta_kl_nats
+            ),
+            None => String::new(),
+        };
         println!(
-            "  TRAINED  {:60}  [n={:5} k={:5}]  kl: init={:.4e} min={:.4e} ratio={:.3}",
-            t.name, t.n, t.k, t.kl_initial, t.kl_min, ratio,
+            "  TRAINED  {:60}  [n={:5} k={:5}]  kl: init={:.4e} min={:.4e} ratio={:.3}{}",
+            t.name, t.n, t.k, t.kl_initial, t.kl_min, ratio, bench_str,
         );
     }
     for s in &result.skipped {
@@ -301,6 +309,22 @@ fn cmd_dwq_train(args: cli::DwqTrainArgs) -> Result<(), AppError> {
         // For now print everything — the operator wants the full picture
         // on a fresh run.  Add a `--quiet` flag in a future iter.
         println!("  SKIPPED  {:60}  --  {}", s.name, s.reason);
+    }
+
+    // ADR-020 iter-12f-2 — print aggregate bench summary + §8.3 AC #7 gate.
+    if let Some(mean_delta) = result.mean_delta_kl_nats {
+        const ACCEPTANCE_THRESHOLD: f32 = 0.05; // §8.3 AC #7 nats/Linear floor
+        let n_with_bench = result.trained.iter().filter(|t| t.bench.is_some()).count();
+        let gate = if mean_delta > ACCEPTANCE_THRESHOLD {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        println!(
+            "[dwq-train] bench summary: mean_delta_kl_nats = {:+.6} across {} Linears \
+             (§8.3 AC #7 threshold {:+.2}: {})",
+            mean_delta, n_with_bench, ACCEPTANCE_THRESHOLD, gate
+        );
     }
 
     std::fs::write(&args.output, &result.safetensors_bytes)

@@ -406,6 +406,19 @@ pub struct DwqTrainingConfig {
     ///
     /// §8.3 AC #6 cap is 100 GB → `Some(100 * 1024 * 1024 * 1024)`.
     pub rss_cap_bytes: Option<u64>,
+    /// ADR-020 iter-12f-2 — run the per-Linear delta-KL benchmark
+    /// (DWQ vs Q4_0, forward KL against FP32 teacher) inline during
+    /// training.  When `true`, each `DwqLinearTrained` row carries a
+    /// `bench: Some(PerLinearKlComparison)` and the aggregate
+    /// `mean_delta_kl_nats` lands in `DwqAllLinearsResult`.
+    ///
+    /// **Apples-to-apples constraint** (per §8.3 AC #7): only meaningful
+    /// when `perturb_factor == 1.0` (training starts from the optimal
+    /// Q4_0-equivalent init).  At `perturb_factor > 1.0` the comparison
+    /// trivially favors Q4_0 since DWQ training is recovering from a
+    /// degraded start.  iter-12f-2 prints a warning if the operator
+    /// requests bench with `perturb_factor != 1.0`.
+    pub compute_bench: bool,
 }
 
 impl Default for DwqTrainingConfig {
@@ -421,6 +434,7 @@ impl Default for DwqTrainingConfig {
             seed: 0xDEADBEEF,
             convergence_ratio: 0.34,
             rss_cap_bytes: None,
+            compute_bench: false,
         }
     }
 }
@@ -438,6 +452,9 @@ pub struct DwqLinearTrained {
     pub kl_initial: f32,
     pub kl_min: f32,
     pub steps_run: usize,
+    /// ADR-020 iter-12f-2 — optional per-Linear DWQ-vs-Q4_0 KL benchmark.
+    /// `Some` iff `cfg.compute_bench` was true during training.
+    pub bench: Option<crate::calibrate::dwq_benchmark::PerLinearKlComparison>,
 }
 
 /// Reason a tensor was skipped during a model scan (rank mismatch,
@@ -462,6 +479,17 @@ pub struct DwqAllLinearsResult {
     /// `<name>.weight` (U32-packed quant codes), `<name>.scales`,
     /// `<name>.biases` triplets per trained tensor.
     pub safetensors_bytes: Vec<u8>,
+    /// ADR-020 iter-12f-2 — mean `delta_kl_nats` aggregated across
+    /// trained Linears that have a `bench` populated (i.e.
+    /// `cfg.compute_bench == true`).  `None` if compute_bench was
+    /// false or zero Linears trained.  Positive ⇒ DWQ outperforms
+    /// Q4_0 at the per-Linear level on average.
+    ///
+    /// §8.3 AC #7 acceptance gate: `mean_delta_kl_nats > 0.05` (per
+    /// Linear) is the recommended floor.  Caller decides what to
+    /// do with the result; the driver does not auto-fail on a low
+    /// mean.
+    pub mean_delta_kl_nats: Option<f32>,
 }
 
 /// ADR-020 iter-12d-2 — production driver: scan a real GGUF model,
@@ -632,6 +660,36 @@ where
             }
         };
 
+        // ADR-020 iter-12f-2 — optional inline benchmark vs Q4_0 baseline.
+        // Runs while we still have w_real loaded to avoid a redundant
+        // GGUF re-dequant.  Only meaningful at perturb_factor == 1.0
+        // (warned about below).
+        let bench: Option<crate::calibrate::dwq_benchmark::PerLinearKlComparison> = if cfg
+            .compute_bench
+        {
+            match crate::calibrate::dwq_benchmark::benchmark_dwq_vs_q4_0_kl(
+                &device,
+                &w_real,
+                n,
+                k,
+                &result.linear,
+                cfg.n_tokens,
+                cfg.temperature,
+                cfg.seed,
+            ) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    skipped.push(DwqLinearSkipped {
+                        name: format!("{name} (bench)"),
+                        reason: format!("benchmark failed: {e}"),
+                    });
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         trained.push(DwqLinearTrained {
             name: name.clone(),
             n,
@@ -639,6 +697,7 @@ where
             kl_initial: result.kl_initial,
             kl_min: result.kl_min,
             steps_run: result.steps_run,
+            bench,
         });
         // mlx-lm naming convention strips the trailing ".weight" suffix
         // before re-attaching ".weight"/.scales"/.biases" — but since GGUF
@@ -663,10 +722,40 @@ where
         .map_err(|e| anyhow!("safetensors serialize: {e}"))?;
     // Discard the type holder so MlxAffineLinear is in scope.
     let _ = std::any::type_name::<MlxAffineLinear>();
+
+    // ADR-020 iter-12f-2 — aggregate per-Linear bench results.
+    let mean_delta_kl_nats: Option<f32> = if cfg.compute_bench {
+        if cfg.perturb_factor != 1.0 {
+            eprintln!(
+                "[dwq] WARNING: compute_bench=true with perturb_factor={} — \
+                 the DWQ-vs-Q4_0 comparison is only meaningful at \
+                 perturb_factor == 1.0 (training starts from optimal init).  \
+                 Reported mean_delta_kl_nats may underrepresent DWQ quality.",
+                cfg.perturb_factor
+            );
+        }
+        let with_bench: Vec<&DwqLinearTrained> = trained
+            .iter()
+            .filter(|t| t.bench.is_some())
+            .collect();
+        if with_bench.is_empty() {
+            None
+        } else {
+            let sum: f64 = with_bench
+                .iter()
+                .map(|t| t.bench.as_ref().unwrap().delta_kl_nats as f64)
+                .sum();
+            Some((sum / with_bench.len() as f64) as f32)
+        }
+    } else {
+        None
+    };
+
     Ok(DwqAllLinearsResult {
         trained,
         skipped,
         safetensors_bytes,
+        mean_delta_kl_nats,
     })
 }
 
@@ -2035,6 +2124,18 @@ mod tests {
         assert!(
             cfg.rss_cap_bytes.is_none(),
             "DwqTrainingConfig::default() must have rss_cap_bytes = None"
+        );
+    }
+
+    /// ADR-020 iter-12f-2 — DwqTrainingConfig::default() has
+    /// compute_bench=false so existing iter-12d-1/2/3 + iter-12e
+    /// callers inherit no-bench behavior (zero perf cost).
+    #[test]
+    fn iter_12f2_default_config_has_no_bench() {
+        let cfg = super::DwqTrainingConfig::default();
+        assert!(
+            !cfg.compute_bench,
+            "DwqTrainingConfig::default() must have compute_bench = false"
         );
     }
 

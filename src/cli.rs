@@ -231,6 +231,14 @@ pub struct DwqTrainArgs {
     /// Pass `0` to disable the watchdog entirely (default: 100 GB).
     #[arg(long, default_value_t = 100.0)]
     pub rss_cap_gb: f64,
+
+    /// ADR-020 iter-12f-2 — run per-Linear DWQ-vs-Q4_0 KL benchmark
+    /// inline during training.  Surfaces a per-tensor `delta_kl_nats`
+    /// in the disposition log + final aggregate `mean_delta_kl_nats`.
+    /// §8.3 AC #7 acceptance gate is `mean > 0.05 nats`.  Only
+    /// meaningful at `--perturb-factor 1.0` (default for production).
+    #[arg(long, default_value_t = false)]
+    pub bench: bool,
 }
 
 /// `hf2q cache` subcommands. ADR-005 Phase 3 iter-205 (AC line 5351).
@@ -2139,6 +2147,42 @@ mod tests {
         assert!((args.convergence_ratio - 0.5).abs() < 1e-9);
         assert_eq!(args.limit, Some(8));
         assert!(args.skip_huge);
+    }
+
+    /// ADR-020 iter-12f-2 — `--bench` flag parses + defaults to false
+    /// (zero perf cost for the common no-bench path).
+    #[test]
+    fn iter_12f2_dwq_train_bench_flag_parses() {
+        // Default (no flag): bench should be false.
+        let cli_default = Cli::try_parse_from([
+            "hf2q",
+            "dwq-train",
+            "--gguf",
+            "/x.gguf",
+            "--output",
+            "/y.safetensors",
+        ])
+        .expect("must parse");
+        let Command::DwqTrain(args) = cli_default.command else {
+            panic!("expected DwqTrain");
+        };
+        assert!(!args.bench, "default bench must be false");
+
+        // Explicit --bench: bench should be true.
+        let cli_bench = Cli::try_parse_from([
+            "hf2q",
+            "dwq-train",
+            "--gguf",
+            "/x.gguf",
+            "--output",
+            "/y.safetensors",
+            "--bench",
+        ])
+        .expect("must parse with --bench");
+        let Command::DwqTrain(args) = cli_bench.command else {
+            panic!("expected DwqTrain");
+        };
+        assert!(args.bench, "--bench flag must set bench=true");
     }
 
     /// ADR-020 iter-12d-3 — defaults match the iter-17b acceptance
