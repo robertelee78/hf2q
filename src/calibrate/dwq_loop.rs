@@ -427,6 +427,16 @@ pub struct DwqTrainingConfig {
     /// degraded start.  iter-12f-2 prints a warning if the operator
     /// requests bench with `perturb_factor != 1.0`.
     pub compute_bench: bool,
+    /// ADR-020 AC#7 follow-up — when `Some(x_data)`, override the
+    /// synthetic `box_muller_gaussian` activation `X` with the
+    /// caller-supplied vector.  Length must equal `n_tokens × k` for
+    /// the target Linear.  Used to test the hypothesis that a
+    /// non-uniform X (e.g. real captured activation samples) breaks
+    /// the perturb=1.0 ratio=1.000 plateau by giving Adam meaningful
+    /// signal to optimize against.  `None` preserves the existing
+    /// synthetic Gaussian X behavior — zero perf cost on the no-op
+    /// path.
+    pub x_override: Option<Vec<f32>>,
 }
 
 impl Default for DwqTrainingConfig {
@@ -443,6 +453,7 @@ impl Default for DwqTrainingConfig {
             convergence_ratio: 0.34,
             rss_cap_bytes: None,
             compute_bench: false,
+            x_override: None,
         }
     }
 }
@@ -1009,8 +1020,19 @@ pub fn train_linear_dwq_synthetic_teacher(
     let s_p: Vec<f32> = s_init.iter().map(|v| v * cfg.perturb_factor).collect();
     let b_p: Vec<f32> = b_init.iter().map(|v| v * cfg.perturb_factor).collect();
 
-    // ---- Phase 3: synthetic activations + teacher ----
-    let x_data: Vec<f32> = box_muller_gaussian(m * k, cfg.seed);
+    // ---- Phase 3: activations (synthetic Gaussian by default; caller
+    //              can override with real captured X via cfg.x_override) ----
+    let x_data: Vec<f32> = if let Some(x_user) = cfg.x_override.as_ref() {
+        if x_user.len() != m * k {
+            return Err(anyhow!(
+                "x_override length {} != n_tokens × k = {} × {} = {}",
+                x_user.len(), m, k, m * k
+            ));
+        }
+        x_user.clone()
+    } else {
+        box_muller_gaussian(m * k, cfg.seed)
+    };
     let mut y_teacher = vec![0.0f32; m * n];
     for r in 0..m {
         for c in 0..n {
@@ -2185,6 +2207,125 @@ mod tests {
             assert!(v.is_finite(), "{label} non-finite: {v}");
             assert!(v >= -1e-6, "{label} significantly negative: {v}");
         }
+    }
+
+    /// ADR-020 AC#7 follow-up — `x_override` accepts a caller-supplied
+    /// X distribution.  Hypothesis test: a non-uniform X (heavy-tailed
+    /// distribution mimicking real post-RMSNorm activations) produces a
+    /// DIFFERENT KL trajectory than the default synthetic Gaussian X
+    /// on the same W and same perturb=1.0 init.
+    ///
+    /// This is the testable falsifier for the perturb=1.0-no-op finding
+    /// (memory `project_adr020_dwq_perturb1_noop_finding_2026_05_08`).
+    /// If the hypothesis holds, real-corpus X is the smaller-bite fix
+    /// for AC#7 boundary closure (vs full-model teacher).
+    ///
+    /// Test contract: BOTH runs use the same W and same seed, but
+    /// override X for the second.  Asserts that `kl_initial` differs
+    /// between the two runs (the X distribution shifts the
+    /// per-Linear KL surface).  The ABSOLUTE direction of the
+    /// improvement is data-dependent; this test asserts the surface
+    /// is sensitive to X, not which surface is more favorable.
+    #[test]
+    fn x_override_changes_kl_surface_at_perturb_1_0() {
+        use super::{box_muller_gaussian, train_linear_dwq_synthetic_teacher, DwqTrainingConfig};
+
+        let device = MlxDevice::new().expect("device");
+        let n = 64usize;
+        let k = 64usize;
+        let m = 32usize;
+        // Real-Q5_K-style W: small stddev (~0.014 per memory).
+        let w_real: Vec<f32> = (0..(n * k))
+            .map(|i| ((i as f32) * 0.0091 - 0.3).sin() * 0.014)
+            .collect();
+
+        // Run 1: default Gaussian X (no override).
+        let cfg_default = DwqTrainingConfig {
+            n_tokens: m,
+            n_steps: 5, // short — we're testing the kl_initial surface, not convergence
+            perturb_factor: 1.0,
+            convergence_ratio: 100.0, // disable gate
+            ..DwqTrainingConfig::default()
+        };
+        let r_default = train_linear_dwq_synthetic_teacher(&device, &w_real, n, k, &cfg_default)
+            .expect("train (gaussian X)");
+
+        // Run 2: same model, override X with a HEAVY-TAILED distribution.
+        // Cube the standard Gaussian — pushes mass into the tails (kurtosis
+        // ≈ 15 vs 3 for Gaussian).  This is a poor proxy for real
+        // post-RMSNorm activations but is enough to demonstrate the X
+        // surface shifts the KL.
+        let x_gauss = box_muller_gaussian(m * k, cfg_default.seed);
+        let x_heavy: Vec<f32> = x_gauss.iter().map(|v| v.powi(3)).collect();
+        let cfg_override = DwqTrainingConfig {
+            x_override: Some(x_heavy.clone()),
+            ..cfg_default.clone()
+        };
+        let r_override = train_linear_dwq_synthetic_teacher(&device, &w_real, n, k, &cfg_override)
+            .expect("train (heavy-tailed X override)");
+
+        // Sanity: same model + same init → q_int is byte-identical (X
+        // doesn't affect the discrete grid; only s/b training depends
+        // on X).
+        assert_eq!(
+            r_default.linear.q_int, r_override.linear.q_int,
+            "x_override changed q_int — should not happen (init is deterministic and X-independent)"
+        );
+
+        // The interesting assertion: the KL surface at the SAME init
+        // (perturb=1.0 → s_init/b_init) is X-dependent.  kl_initial
+        // SHOULD differ between the two runs because the matmul output
+        // y = X @ W^T has different magnitudes under different X
+        // distributions, and the softmax + KL operates on those.
+        // Relative-difference threshold: kl values for small-stddev W can
+        // be tiny (~1e-7) so an absolute threshold doesn't generalize.
+        // 50% relative drift between two distributions is well above
+        // numerical noise.
+        let kl_min = r_default.kl_initial.min(r_override.kl_initial).max(1e-12);
+        let kl_max = r_default.kl_initial.max(r_override.kl_initial);
+        let rel_diff = (kl_max - kl_min) / kl_min;
+        assert!(
+            rel_diff > 0.5,
+            "kl_initial unchanged by x_override (default={:e} override={:e} \
+             rel_diff={rel_diff:.3}): X distribution should materially shift \
+             the KL surface",
+            r_default.kl_initial,
+            r_override.kl_initial,
+        );
+        // Both must be finite and non-negative (KL is a divergence).
+        for (label, v) in [
+            ("default kl_initial", r_default.kl_initial),
+            ("override kl_initial", r_override.kl_initial),
+        ] {
+            assert!(v.is_finite(), "{label} non-finite: {v}");
+            assert!(v >= -1e-6, "{label} significantly negative: {v}");
+        }
+    }
+
+    /// `x_override` length validation: reject mismatched length, accept
+    /// the correct `n_tokens × k`.
+    #[test]
+    fn x_override_rejects_wrong_length() {
+        use super::{train_linear_dwq_synthetic_teacher, DwqTrainingConfig};
+
+        let device = MlxDevice::new().expect("device");
+        let n = 32usize;
+        let k = 32usize;
+        let w_real: Vec<f32> = vec![0.01_f32; n * k];
+        let cfg = DwqTrainingConfig {
+            n_tokens: 32,
+            n_steps: 1,
+            convergence_ratio: 100.0,
+            x_override: Some(vec![0.0_f32; 999]), // wrong length
+            ..DwqTrainingConfig::default()
+        };
+        let res = train_linear_dwq_synthetic_teacher(&device, &w_real, n, k, &cfg);
+        assert!(res.is_err(), "expected length-mismatch error");
+        let msg = format!("{}", res.err().unwrap());
+        assert!(
+            msg.contains("x_override length"),
+            "error message should call out x_override length: {msg}"
+        );
     }
 
     /// ADR-020 iter-12d-1 — input validation: reject n < 32, k < 32,

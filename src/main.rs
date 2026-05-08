@@ -231,6 +231,9 @@ fn cmd_dwq_train(args: cli::DwqTrainArgs) -> Result<(), AppError> {
         convergence_ratio: args.convergence_ratio,
         rss_cap_bytes,
         compute_bench: args.bench,
+        // CLI doesn't currently surface x_override; the activation
+        // capture wiring (real corpus → per-Linear X) is iter+ scope.
+        x_override: None,
     };
 
     println!(
