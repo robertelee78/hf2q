@@ -390,7 +390,15 @@ pub struct DwqTrainingConfig {
     pub lr: f32,
     /// Distillation temperature.  iter-17b: 2.0.
     pub temperature: f32,
-    /// Initial perturbation factor on scales/biases.  iter-17b: 2.0.
+    /// Initial perturbation factor on scales/biases.  Default `1.0`
+    /// (production: start from the optimal Q4_0-equivalent symmetric
+    /// init, train DOWN from there to find a better local optimum).
+    /// Set `> 1.0` for the iter-13e/iter-17b "training recovers from
+    /// degradation" test fixture (measures convergence behavior on a
+    /// deliberately-degraded start; kl_initial = 0.7-ish, kl_min
+    /// drops by 50-90% over Adam steps).  Production benchmarks
+    /// (iter-12f) require `1.0` since the DWQ-vs-Q4_0 comparison only
+    /// makes sense when both arms start from the same optimal init.
     pub perturb_factor: f32,
     /// PRNG seed for the Box-Muller Gaussian X.
     pub seed: u64,
@@ -430,7 +438,7 @@ impl Default for DwqTrainingConfig {
             n_steps: 50,
             lr: 0.002,
             temperature: 2.0,
-            perturb_factor: 2.0,
+            perturb_factor: 1.0,
             seed: 0xDEADBEEF,
             convergence_ratio: 0.34,
             rss_cap_bytes: None,
@@ -1957,9 +1965,15 @@ mod tests {
             .map(|i| ((i as f32) * 0.0173 - 0.4).sin() * 0.5)
             .collect();
 
+        // This test exercises iter-13e/iter-17b's "training recovers from
+        // a degraded init" semantic, so opt-in to perturb=2.0 explicitly.
+        // The production default (perturb=1.0) starts at optimum and
+        // can't show convergence_ratio < 1.0 within a finite step
+        // budget — that's the iter-12f-1 benchmark's job.
         let cfg = DwqTrainingConfig {
             n_tokens: 32,
             n_steps: 30,
+            perturb_factor: 2.0,    // explicit degradation start
             convergence_ratio: 0.5, // synthetic stddev=0.5 → ~3-5× reduction in 30 steps
             ..DwqTrainingConfig::default()
         };

@@ -194,8 +194,11 @@ pub struct DwqTrainArgs {
     #[arg(long, default_value_t = 2.0)]
     pub temperature: f32,
 
-    /// Initial perturbation factor on scales/biases.
-    #[arg(long, default_value_t = 2.0)]
+    /// Initial perturbation factor on scales/biases.  Default 1.0
+    /// (production: start from optimal Q4_0-equivalent init, train down).
+    /// Set > 1.0 for iter-17b's "training recovers from degradation"
+    /// test fixture.  iter-12f benchmarks require 1.0 (apples-to-apples).
+    #[arg(long, default_value_t = 1.0)]
     pub perturb_factor: f32,
 
     /// PRNG seed for the Box-Muller Gaussian X.
@@ -2185,11 +2188,14 @@ mod tests {
         assert!(args.bench, "--bench flag must set bench=true");
     }
 
-    /// ADR-020 iter-12d-3 — defaults match the iter-17b acceptance
-    /// fixture (4-bit, gs=32, 32 tokens, 50 steps, lr=0.002, T=2.0,
-    /// perturb=2.0, convergence=0.34, limit=None, skip_huge=true).
+    /// ADR-020 iter-12d-3 + iter-12g — defaults match the production
+    /// preset (4-bit, gs=32, 32 tokens, 50 steps, lr=0.002, T=2.0,
+    /// **perturb=1.0** (production: start from optimal Q4_0-equivalent
+    /// init), convergence=0.34, limit=None, skip_huge=true).  Pass
+    /// `--perturb-factor 2.0` explicitly to opt into iter-17b's
+    /// degradation-recovery test fixture.
     #[test]
-    fn iter_12d3_dwq_train_defaults_match_iter17b_fixture() {
+    fn iter_12d3_dwq_train_defaults_match_production_preset() {
         let cli = Cli::try_parse_from([
             "hf2q",
             "dwq-train",
@@ -2208,7 +2214,11 @@ mod tests {
         assert_eq!(args.steps, 50);
         assert!((args.lr - 0.002).abs() < 1e-9);
         assert!((args.temperature - 2.0).abs() < 1e-9);
-        assert!((args.perturb_factor - 2.0).abs() < 1e-9);
+        assert!(
+            (args.perturb_factor - 1.0).abs() < 1e-9,
+            "iter-12g: production-correct perturb default is 1.0, got {}",
+            args.perturb_factor
+        );
         assert_eq!(args.seed, 0xDEAD_BEEF);
         assert!((args.convergence_ratio - 0.34).abs() < 1e-9);
         assert_eq!(args.limit, None);
