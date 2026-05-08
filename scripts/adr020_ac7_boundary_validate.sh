@@ -155,6 +155,43 @@ OVERLAY_MODEL=$(get_model_id "$OVERLAY_PORT")
 echo "[ac7] baseline model=$BASELINE_MODEL"
 echo "[ac7] overlay  model=$OVERLAY_MODEL"
 
+# ─── ADR-020 AC#7 — hard precondition: hf2q chat API must surface
+#     `logprobs` (currently a schema-only field; serve emits None).
+#     Surface the gap at startup so the operator doesn't waste a
+#     20-prompt eval pass and parse N "NA" lines before seeing the
+#     issue.
+echo "[ac7] preflighting: checking serve fills choices[0].logprobs.content[]..."
+preflight=$(curl -sm15 "http://127.0.0.1:$BASELINE_PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d "$(python3 -c "import json,sys; print(json.dumps({'model':sys.argv[1],'messages':[{'role':'user','content':'Hello'}],'max_tokens':1,'temperature':0.0,'logprobs':True}))" "$BASELINE_MODEL")" \
+    | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    lp = d['choices'][0].get('logprobs')
+    if lp and 'content' in lp and lp['content']:
+        print('OK')
+    else:
+        print('MISSING')
+except Exception as e:
+    print(f'PARSE_ERR:{e}')
+")
+if [[ "$preflight" != "OK" ]]; then
+    echo "[ac7] PRECONDITION FAILED: serve API not filling logprobs (got: $preflight)" >&2
+    echo "[ac7] hf2q's /v1/chat/completions surface accepts the logprobs:true" >&2
+    echo "[ac7] flag (per src/serve/api/schema.rs:728) but the inference loop" >&2
+    echo "[ac7] does not capture per-token log-probabilities — the response's" >&2
+    echo "[ac7] choices[0].logprobs is always None.  Fix path: capture the" >&2
+    echo "[ac7] chosen token's log_softmax(logits)[token_id] in" >&2
+    echo "[ac7] sampler_pure.rs::sample_token + plumb through GenerationResult" >&2
+    echo "[ac7] + populate ChoiceLogprobs in api/schema.rs's response builders." >&2
+    echo "[ac7] AC#7 boundary harness CANNOT proceed until this lands." >&2
+    echo "[ac7] AC#7 per-Linear (training-time) closure remains valid via" >&2
+    echo "[ac7] iter-12f-1 + iter-12f-2's mean_delta_kl_nats." >&2
+    exit 2
+fi
+echo "[ac7] preflight: logprobs OK"
+
 # ─────────────── eval ───────────────
 # For each prompt, request 1 token with logprobs and capture the top
 # logprob.  Negative → larger NLL.  Aggregate across N prompts.

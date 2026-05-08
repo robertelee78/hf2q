@@ -550,9 +550,22 @@ landed; Linear-only forward already landed).
    `RssWatchdog` at 100 GB cap (`c7bdaa9`); CLI `--rss-cap-gb 100`
    default in iter-12d-3.
 7. **End-to-end quality:** delta-PPL vs Q4_K_M baseline `> 0.05 nats`.
-   **DONE** — iter-12f-1 per-Linear delta-KL benchmark + iter-12f-2
-   model-level aggregator + CLI `--bench` flag with §8.3 AC #7
-   threshold gate `mean_delta_kl_nats > 0.05`.
+   **DONE (per-Linear) / SERVE BOUNDARY BLOCKED ON API GAP** —
+   - **Per-Linear closure**: iter-12f-1 + iter-12f-2 + CLI `--bench`
+     flag with threshold gate `mean_delta_kl_nats > 0.05`.
+   - **Serve boundary harness ready** at
+     `scripts/adr020_ac7_boundary_validate.sh` but blocked on the
+     hf2q chat-completions API not surfacing per-token logprobs.
+     Discovered 2026-05-08: schema accepts `logprobs:true` (per
+     `src/serve/api/schema.rs:728`) but the inference loop does
+     not capture `log_softmax(logits)[token_id]` at the sampling
+     site, so `choices[0].logprobs` is always `None` in both
+     non-streaming and SSE responses.  Harness now fails fast at
+     preflight rather than running 20 prompts and reporting N×NA.
+     Fix scope: capture per-step log-prob in
+     `src/serve/sampler_pure.rs::sample_token` + plumb through
+     `GenerationResult` + populate `ChoiceLogprobs` in the response
+     builders.  Multi-iter scope; tracked as a follow-up.
 8. **Per-family pass:** all four combos {Qwen 3.6 35B-A3B-Abliterix-EGA,
    Gemma 4 26B-A4B-it-ara} × {dwq-4, dwq-6} satisfy criteria 6–7.
    **HARNESS READY** — iter-12d-4 (`a62e4ee`)
