@@ -250,6 +250,24 @@ enum OpKind {
         n: usize,
         m: usize,
     },
+    /// ADR-020 iter-11h-e1 — gather along last axis using a
+    /// non-differentiable index buffer.  Forward: `y[r, j] = x[r,
+    /// indices[r, j]]`.  Backward: zero-init dx + scatter `dx[r,
+    /// indices[r, j]] = dy[r, j]` (top-K indices are distinct within
+    /// a row → no collisions).
+    ///
+    /// `indices_buf` is owned by the variant (cloned at construction)
+    /// since indices are integers and don't flow gradients.
+    ///
+    /// Used by MoE router on GpuTape: `scores = take_along_axis(
+    /// softmax(gate_logits), top_k_inds, axis=-1)`.
+    TakeAlongAxisTopK {
+        input_idx: usize,
+        indices_buf: MlxBuffer,
+        rows: usize,
+        cols: usize,
+        k: usize,
+    },
 }
 
 struct GpuNode {
@@ -591,6 +609,7 @@ pub fn backward(
             | OpKind::Slice2dCols { input_idx, .. }
             | OpKind::SiLU { input_idx }
             | OpKind::Exp { input_idx }
+            | OpKind::TakeAlongAxisTopK { input_idx, .. }
             | OpKind::View { input_idx, .. }
             | OpKind::ScalarMul { input_idx, .. } => {
                 accumulate(&mut grads, input_idx, &parent_grads[0], tape)?;
@@ -1440,6 +1459,40 @@ fn backward_dispatch(
             //   accumulate(grads, scales_idx, parent_grads[0])
             //   accumulate(grads, biases_idx, parent_grads[1])
             Ok((op, vec![d_scales_buf, d_biases_buf]))
+        }
+        OpKind::TakeAlongAxisTopK {
+            ref indices_buf,
+            rows,
+            cols,
+            k,
+            ..
+        } => {
+            // dx is rows*cols (zero-init via alloc_buffer); scatter dy to
+            // dx[r, indices[r,j]] for each (r, j).
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+            let dx_buf = device
+                .alloc_buffer(rows * cols * 4, DType::F32, vec![rows, cols])
+                .map_err(|e| anyhow!("backward take_along_axis: alloc dx: {e}"))?;
+            let mut params_buf = device
+                .alloc_buffer(12, DType::U32, vec![3])
+                .map_err(|e| anyhow!("backward take_along_axis: alloc params: {e}"))?;
+            params_buf
+                .as_mut_slice::<u32>()
+                .map_err(|e| anyhow!("backward take_along_axis: params write: {e}"))?
+                .copy_from_slice(&[rows as u32, cols as u32, k as u32]);
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward take_along_axis: encoder: {e}"))?;
+            mlx_native::ops::take_along_axis::dispatch_take_along_axis_backward_f32(
+                &mut encoder, &mut registry, device.metal_device(),
+                out_grad, indices_buf, &dx_buf, &params_buf,
+                rows as u32, cols as u32, k as u32,
+            ).map_err(|e| anyhow!("backward take_along_axis: dispatch: {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward take_along_axis: commit: {e}"))?;
+            Ok((op, vec![dx_buf]))
         }
         OpKind::OuterProduct {
             lhs_idx,
@@ -2727,6 +2780,105 @@ pub fn exp(t: &GpuTensor) -> Result<GpuTensor> {
         tape: tape.clone(),
         node_idx,
         shape: t.shape.clone(),
+    })
+}
+
+/// ADR-020 iter-11h-e1 — gather along last axis using a precomputed
+/// (non-differentiable) index buffer.  Forward: `y[r, j] = x[r,
+/// indices[r, j]]`.  Backward: zero-init dx + scatter dy to
+/// `dx[r, indices[r, j]]`.
+///
+/// The `indices` buffer is passed as a raw `MlxBuffer` (not a tape
+/// node) because integer indices don't flow gradients.  For MoE
+/// routing, the caller pre-computes top-K indices via the production
+/// `top_k_f32` kernel (or any non-differentiable selection) and
+/// passes them here.
+///
+/// Shape contract:
+///   * `input` : `[rows, cols]`
+///   * `indices` (`MlxBuffer`): `[rows * k]` u32, must be valid
+///     indices in `[0, cols)` for each row.  Top-K from
+///     argpartition gives distinct indices per row → no scatter
+///     collisions in backward.
+///   * Output : `[rows, k]`
+pub fn take_along_axis_topk(
+    input: &GpuTensor,
+    indices: MlxBuffer,
+    k: usize,
+) -> Result<GpuTensor> {
+    if input.shape.len() != 2 {
+        return Err(anyhow!(
+            "take_along_axis_topk: input must be 2-D [rows, cols]; got {:?}",
+            input.shape
+        ));
+    }
+    let rows = input.shape[0];
+    let cols = input.shape[1];
+    if k == 0 || k > cols {
+        return Err(anyhow!(
+            "take_along_axis_topk: k must be in (0, cols={cols}]; got {k}"
+        ));
+    }
+    if indices.element_count() != rows * k {
+        return Err(anyhow!(
+            "take_along_axis_topk: indices.element_count {} != rows*k = {}",
+            indices.element_count(),
+            rows * k
+        ));
+    }
+    if indices.dtype() != DType::U32 {
+        return Err(anyhow!(
+            "take_along_axis_topk: indices must be U32; got {}",
+            indices.dtype()
+        ));
+    }
+
+    let tape = &input.tape;
+    let device = tape.device();
+    let in_buf = tape.with_node(input.node_idx, |n| n.value.clone());
+
+    let out = device
+        .alloc_buffer(rows * k * 4, DType::F32, vec![rows, k])
+        .map_err(|e| anyhow!("take_along_axis_topk: alloc out: {e}"))?;
+    let mut params_buf = device
+        .alloc_buffer(12, DType::U32, vec![3])
+        .map_err(|e| anyhow!("take_along_axis_topk: alloc params: {e}"))?;
+    params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("take_along_axis_topk: params write: {e}"))?
+        .copy_from_slice(&[rows as u32, cols as u32, k as u32]);
+
+    let mut registry = tape.0.registry.borrow_mut();
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("take_along_axis_topk: encoder: {e}"))?;
+    mlx_native::ops::take_along_axis::dispatch_take_along_axis_f32(
+        &mut encoder, &mut registry, device.metal_device(),
+        &in_buf, &indices, &out, &params_buf,
+        rows as u32, cols as u32, k as u32,
+    )
+    .map_err(|e| anyhow!("take_along_axis_topk: forward dispatch: {e}"))?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("take_along_axis_topk: commit_and_wait: {e}"))?;
+    drop(registry);
+
+    let input_idx = input.node_idx;
+    let node_idx = tape.push_node(
+        OpKind::TakeAlongAxisTopK {
+            input_idx,
+            indices_buf: indices,
+            rows,
+            cols,
+            k,
+        },
+        out,
+        vec![rows, k],
+    );
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: vec![rows, k],
     })
 }
 
@@ -4886,6 +5038,83 @@ mod tests {
             assert!(
                 (g_r0[j] - fd).abs() < tol,
                 "FD rhs[{j}]: analytic={} fd={}", g_r0[j], fd
+            );
+        }
+    }
+
+    /// iter-11h-e1 — `take_along_axis_topk` GpuTape forward + backward
+    /// FD falsifier.  Composed with softmax (loss flows through softmax
+    /// of input, then gather of top-K, then sum-reduce of gathered
+    /// values).  This proves end-to-end:
+    ///   1. softmax forward + backward
+    ///   2. take_along_axis forward gather
+    ///   3. take_along_axis backward scatter
+    ///   4. Composition into a meaningful loss landscape.
+    ///
+    /// Catches: missed scatter into non-selected positions, wrong
+    /// indices buffer ownership, parent-edge confusion on the input.
+    #[test]
+    fn take_along_axis_topk_forward_and_backward_fd() {
+        use mlx_native::{DType, MlxDevice};
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device.clone());
+
+        let rows = 3usize;
+        let cols = 5usize;
+        let k = 2usize;
+        let x_data: Vec<f32> = (0..(rows * cols))
+            .map(|i| ((i as f32) * 0.137 - 0.4).sin() * 0.5)
+            .collect();
+        // Hand-pick top-K indices (would normally come from argpartition).
+        let indices_data: Vec<u32> = vec![
+            0, 3,
+            1, 4,
+            2, 4,
+        ];
+
+        let forward_loss_and_grad = |xv: &[f32]| -> (f32, Vec<f32>) {
+            tape.reset();
+            // Build a fresh indices buffer per call (forward consumes
+            // it; backward routes through the variant's clone).
+            let mut idx_buf = device
+                .alloc_buffer(rows * k * 4, DType::U32, vec![rows, k])
+                .unwrap();
+            idx_buf
+                .as_mut_slice::<u32>()
+                .unwrap()
+                .copy_from_slice(&indices_data);
+
+            let xt = GpuTensor::from_vec(&tape, xv, vec![rows, cols]).unwrap();
+            let sm = softmax(&xt).unwrap();  // softmax on x to give meaningful gradient
+            let gathered = take_along_axis_topk(&sm, idx_buf, k).unwrap();
+            let host = gathered.to_vec().unwrap();
+            let loss = host.iter().map(|v| *v as f64).sum::<f64>() as f32;
+            let dy = ones_like(&tape, gathered.shape()).unwrap();
+            let grads = backward(&gathered, dy).unwrap();
+            let g_x = grads[xt.node_idx()]
+                .as_ref()
+                .unwrap()
+                .as_slice::<f32>()
+                .unwrap()
+                .to_vec();
+            (loss, g_x)
+        };
+
+        let (_l0, g_x0) = forward_loss_and_grad(&x_data);
+        let h = 1e-3f32;
+        for i in 0..(rows * cols) {
+            let mut p = x_data.clone();
+            p[i] += h;
+            let (lp, _) = forward_loss_and_grad(&p);
+            let mut m = x_data.clone();
+            m[i] -= h;
+            let (lm, _) = forward_loss_and_grad(&m);
+            let fd = (lp - lm) / (2.0 * h);
+            let tol = 5e-2 * fd.abs().max(1.0);
+            assert!(
+                (g_x0[i] - fd).abs() < tol,
+                "FD x[{i}]: analytic={} fd={}",
+                g_x0[i], fd
             );
         }
     }
