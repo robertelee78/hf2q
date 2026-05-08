@@ -458,14 +458,29 @@ landed; Linear-only forward already landed).
        `gate_up_affine.is_some() && down_affine.is_some()` and route
        to `quantized_matmul_id_into` for the affine path
        (hf2q `fc04575`).
-   - **Outstanding** (next session):
-     - **qwen35 parallel impl**: Qwen35Model uses its own
-       `MoeFfnWeightsQ` (separate from `MlxMoeWeights`); needs a
-       parallel `Qwen35Model::apply_dwq_overlay` + `MoeFfnWeightsQ`
-       affine slot extension + the 6 `gpu_ffn.rs`
-       `quantized_matmul_id_ggml_pooled` call sites gated-and-routed.
-     - **Iter E2**: Qwen 3.6 35B-A3B-APEX end-to-end smoke once
-       qwen35 parallel impl lands.
+   - **qwen35 parallel impl** (Iter C2.4 #1-3, hf2q `924a846`):
+     - `MoeFfnWeightsQ` extended with `expert_{gate,up,down}_affine:
+        Option<MlxAffineMoeStack>` (hf2q `acafd18` cleaned, Iter C2.4
+        #1).
+     - `Qwen35Model::apply_dwq_overlay` (hf2q `38fd627`, Iter C2.4 #2)
+       parallel to MlxModelWeights variant.  Splits gate + up (vs
+       Gemma 4's fused gate_up); routes Gate/Up/Down buckets to
+       corresponding `MoeFfnWeightsQ` slots; warns + skips fused
+       GateUp buckets (Gemma 4 convention).
+     - `Qwen35LoadedModel::load` calls `Qwen35Model::apply_dwq_overlay`
+       after `load_from_gguf` when `opts.dwq_overlay_path.is_some()`
+       (hf2q `924a846`, Iter C2.4 #3).
+   - **Outstanding** (Iter C2.4 #4 + smoke runs):
+     - **gpu_ffn.rs dispatch routing**: 6 `quantized_matmul_id_ggml_pooled`
+       call sites in `src/inference/models/qwen35/gpu_ffn.rs` (lines
+       2453, 2473, 2575, 2854, 2874, 2954) need gate-and-route to
+       `mlx_native::quantized_matmul_id_into` when the corresponding
+       `MoeFfnWeightsQ::expert_*_affine` slot is `Some`.  Each site is
+       mechanically similar: 50-line refactor wrapping the existing
+       `with_id_mm_scratch` closure with an affine-vs-ggml branch.
+       Estimated 1-1.5 hours.
+     - **Iter E2**: Qwen 3.6 35B-A3B-APEX end-to-end smoke (gated on
+       Iter C2.4 #4).
      - **Gemma 4 MoE smoke**: requires full DWQ training of one
        complete MoE bucket (128 experts × all roles) so the
        contiguous-experts check in `apply_dwq_overlay` finds an
