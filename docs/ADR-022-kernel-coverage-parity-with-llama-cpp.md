@@ -86,7 +86,7 @@ No Metal kernel ships without all three.
 
 ### 2.2 Phases (sequential; merge boundaries; nothing WIP at boundary)
 
-#### Phase 1 — Gemma4 unblock: Q5_1 + IQ4_NL full type coverage
+#### Phase 1 — Gemma4 unblock: Q5_1 + IQ4_NL full type coverage [LANDED 2026-05-08]
 
 Closes `Q5_1` and `IQ4_NL` rows in the matrix. Unblocks the operator's APEX-Q5_K_M Gemma4 file. ~3 days.
 
@@ -133,11 +133,11 @@ Phase 1 exit AC:
 | P1.5 4 mv kernels (Q5_1+IQ4_NL × dense+id) | DONE | 8bfa86e + 469bc11 | tests/adr_022_phase1_{dense_mv,mv_id}_gpu_parity 8/8 |
 | P1.6 mm+mm_tensor+mm_id+mm_id_tensor | DONE | 633abd0 (iter 13) | dense_mm_parity_prefill GREEN max_abs ~1.7e-3; mm_id_parity_prefill_path GREEN max_abs ~2.1e-3 (both tensor + non-tensor variants via env-flip) |
 | P1.6 mm_t_bf16_perm021 | N/A | — | Attention Q@K^T only (ADR-013 P21); no model in scope quantizes attention as Q5_1 / IQ4_NL |
-| P1.7 mul_mv_ext r1 family | PENDING (in flight) | — | Q5_1 + IQ4_NL across the ~5 mv_ext_r1_* template instantiations llama.cpp ships. Lands in Phase 1. |
+| P1.7 mul_mv_ext r1 family (Q5_1 + IQ4_NL) | PENDING; **needs operator decision** — pull into Phase 1 now, OR follow ADR §7 strict order (Phase 4 ships the whole mv_ext family at once). | — | Q5_1 + IQ4_NL across the ~5 mv_ext_r1_* template instantiations llama.cpp ships at `ggml-metal.metal:3936-3939, 3951-3954`. mv_ext is a perf kernel (m∈{2,3,4,5} batch-decode) — does not change correctness. Phase 4 plan ships Q4_0/Q8_0/Q4_K/Q5_K/Q6_K + Q5_1 + IQ4_NL together because the helper code (deq_t4, FC_mul_mv_nsg/nxpsg, dispatch routing) is shared. ADR §6 Phase-1 exit ACs (AC-2 + AC-3) are met without mv_ext; AC-5 (mv_ext perf parity) is explicitly owned by Phase 4. |
 | P1.8 Integration: coherent generation + first-32 byte-equal | DONE (coherence + byte-equal) | e866e6c + iter 16 script | "What is 2+2?" → "2 + 2 = 4<turn\|>" on the original failing file. Prefill 46 tok/s, decode 72.6 tok/s. Byte-equal sub-AC GREEN as runnable regression: `scripts/adr022_p18_byte_equal.sh` — hf2q dumps rendered prompt via `HF2Q_DUMP_RENDERED_PROMPT`, replays through `llama-completion -no-cnv --jinja` under matched greedy sampling (--top-k 1), asserts byte-identical text output. PASS confirms the entire weight-type stack (Q5_1, IQ4_NL, Q6_K, Q8_0, F32) dispatches identically across both runtimes. |
 | P1.9 F32 weight routing in `dispatch_qmatmul` | DONE | e866e6c | Type-aware routing: `weight.info.ggml_dtype == F32` → `dense_matmul_f32_f32_tensor`; everything else → `quantized_matmul_ggml`. Single match arm, no fallback chain. |
 | P1.10 `find_tokenizer` walk-fallback removed | DONE | e866e6c | Same antipattern as `find_config` walk: silently picked qwen3.6's tokenizer for the Gemma4 GGUF → token-id-mismatched garbage output. Walk over `models/<subdir>/tokenizer.json` removed; resolution is now strict (`--tokenizer` flag → sibling-of-GGUF → fail-loud). |
-| P1.11 GGUF-embedded tokenizer parsing | PENDING (in flight) | — | The Gemma4 file carries `tokenizer.ggml.{tokens,token_type,merges,special_token_ids,...}` in its metadata block; parsing that block in mlx-native + a hf2q adapter removes the on-disk tokenizer.json requirement entirely (matches llama.cpp's self-bootstrap). Lands in Phase 1. |
+| P1.11 GGUF-embedded tokenizer parsing | PENDING; **needs operator decision** — pull into Phase 1 now, OR fold into Phase 5 (exit-criteria sweep, which is where loader hardening naturally lives). | — | The Gemma4 file carries `tokenizer.ggml.{tokens,token_type,merges,special_token_ids,...}` in its metadata block; parsing that block in mlx-native + a hf2q adapter removes the on-disk tokenizer.json requirement entirely (matches llama.cpp's self-bootstrap). Operator-flagged gap from iter 14: "we should work with just the gguf." Phase 1 closes without P1.11 because the workaround (placing tokenizer.json adjacent to the .gguf) keeps inference functional; the gap is real and tracked but doesn't block kernel-coverage progress. |
 
 Iter 14 root-cause notes (preserved for iter 15 + future readers):
 
