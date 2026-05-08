@@ -1794,6 +1794,208 @@ mod tests {
         drop(tape);
     }
 
+    /// ADR-020 iter-11h-f-6 — moderate-scale validation of
+    /// `qwen35_moe_forward_on_tape` at MoE-realistic shapes.
+    ///
+    /// Bumps from f-5's tiny `n_experts=4 / k=2` / `n_layers=3` to a
+    /// configuration that exercises the sparse-routing regime (some
+    /// experts get 0 routings) and a deeper stack:
+    ///   `n_layers=4`, `n_tokens=32`, `hidden=128`, `intermediate=128`,
+    ///   `n_experts=16`, `k=4` — only 4 / 16 experts active per token.
+    ///
+    /// At `n_tokens=32` × `k=4` = 128 routings spread over 16 experts,
+    /// some experts will land 0 routings by the random fixture +
+    /// softmax → top-K winner selection.  This exercises
+    /// `switch_mlp`'s "skip experts with empty active-token bucket"
+    /// path, which f-3 / f-5 didn't because all 4 experts were always
+    /// active there.
+    ///
+    /// Falsifier: if the API ever regresses on a deeper / sparser
+    /// stack (gradient collapses, NaN appears, output goes
+    /// non-finite), this test catches it before iter-11h-f real-GGUF
+    /// integration tries to load actual Qwen3.5 35B-A3B weights.
+    ///
+    /// Memory budget: 4 layers × 16 experts × 3 weight tensors × 128×
+    /// 128 fp32 = ~3 MB total tape leaves — trivial vs. real model.
+    #[test]
+    fn iter_11h_f6_qwen35_moe_forward_moderate_scale_gradient_flow() {
+        use crate::calibrate::autograd_gpu_tape::{backward, ones_like, GpuTape};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+
+        let n_layers = 4usize;
+        let n_tokens = 32usize;
+        let hidden = 128usize;
+        let intermediate = 128usize;
+        let n_experts = 16usize;
+        let k = 4usize;
+        let eps = 1e-6f32;
+
+        // Pseudo-random fixture (deterministic via xorshift).
+        let mut rng_state: u64 = 0xCAFE_BABE_F00D_BA11;
+        let mut next = move || -> f32 {
+            rng_state ^= rng_state >> 33;
+            rng_state = rng_state.wrapping_mul(0xff51_afd7_ed55_8ccd);
+            rng_state ^= rng_state >> 33;
+            ((rng_state as i64) as f32) / (i64::MAX as f32)
+        };
+
+        let input_data: Vec<f32> =
+            (0..(n_tokens * hidden)).map(|_| next() * 0.3).collect();
+
+        let tape = GpuTape::new(device.clone());
+
+        let xt = GpuTensor::from_vec(&tape, &input_data, vec![n_tokens, hidden])
+            .unwrap();
+
+        // Place per-layer leaves on the tape.  Use one helper closure
+        // per shape so it stays compact.
+        let mut win_t: Vec<GpuTensor> = Vec::new();
+        let mut watn_t: Vec<GpuTensor> = Vec::new();
+        let mut wpst_t: Vec<GpuTensor> = Vec::new();
+        let mut wg_t: Vec<GpuTensor> = Vec::new();
+        let mut gate_t_l: Vec<Vec<GpuTensor>> = Vec::new();
+        let mut up_t_l: Vec<Vec<GpuTensor>> = Vec::new();
+        let mut down_t_l: Vec<Vec<GpuTensor>> = Vec::new();
+
+        for _l in 0..n_layers {
+            // Norm weights — tight around 1.0 so RMS-norm is stable.
+            let w_in: Vec<f32> = (0..hidden).map(|_| 1.0 + next() * 0.05).collect();
+            let w_post: Vec<f32> = (0..hidden).map(|_| 1.0 + next() * 0.05).collect();
+            // Attn proxy + router gate — small magnitude.
+            let w_attn: Vec<f32> =
+                (0..(hidden * hidden)).map(|_| next() * 0.05).collect();
+            let w_gate: Vec<f32> =
+                (0..(hidden * n_experts)).map(|_| next() * 0.1).collect();
+
+            win_t.push(GpuTensor::from_vec(&tape, &w_in, vec![hidden]).unwrap());
+            watn_t.push(
+                GpuTensor::from_vec(&tape, &w_attn, vec![hidden, hidden]).unwrap(),
+            );
+            wpst_t.push(GpuTensor::from_vec(&tape, &w_post, vec![hidden]).unwrap());
+            wg_t.push(
+                GpuTensor::from_vec(&tape, &w_gate, vec![hidden, n_experts]).unwrap(),
+            );
+
+            let mut gates: Vec<GpuTensor> = Vec::with_capacity(n_experts);
+            let mut ups: Vec<GpuTensor> = Vec::with_capacity(n_experts);
+            let mut downs: Vec<GpuTensor> = Vec::with_capacity(n_experts);
+            for _e in 0..n_experts {
+                let g: Vec<f32> = (0..(hidden * intermediate))
+                    .map(|_| next() * 0.05)
+                    .collect();
+                let u: Vec<f32> = (0..(hidden * intermediate))
+                    .map(|_| next() * 0.05)
+                    .collect();
+                let d: Vec<f32> = (0..(intermediate * hidden))
+                    .map(|_| next() * 0.05)
+                    .collect();
+                gates.push(
+                    GpuTensor::from_vec(&tape, &g, vec![hidden, intermediate]).unwrap(),
+                );
+                ups.push(
+                    GpuTensor::from_vec(&tape, &u, vec![hidden, intermediate]).unwrap(),
+                );
+                downs.push(
+                    GpuTensor::from_vec(&tape, &d, vec![intermediate, hidden]).unwrap(),
+                );
+            }
+            gate_t_l.push(gates);
+            up_t_l.push(ups);
+            down_t_l.push(downs);
+        }
+
+        let layers: Vec<super::DecoderLayerWeights<'_>> = (0..n_layers)
+            .map(|l| super::DecoderLayerWeights {
+                w_in: &win_t[l],
+                w_attn: &watn_t[l],
+                w_post: &wpst_t[l],
+                w_gate: &wg_t[l],
+                gate_projs: &gate_t_l[l],
+                up_projs: &up_t_l[l],
+                down_projs: &down_t_l[l],
+            })
+            .collect();
+
+        let out = super::qwen35_moe_forward_on_tape(&tape, &xt, &layers, k, eps)
+            .expect("qwen35_moe_forward_on_tape forward");
+        assert_eq!(out.shape(), &[n_tokens, hidden], "output shape");
+
+        let host = out.to_vec().unwrap();
+        for (i, v) in host.iter().enumerate() {
+            assert!(v.is_finite(), "out[{i}] = {v} not finite");
+        }
+        let loss = host.iter().map(|v| *v as f64).sum::<f64>() as f32;
+        assert!(loss.is_finite(), "loss non-finite: {loss}");
+        eprintln!(
+            "[iter-11h-f-6] forward OK at n_layers={n_layers}, hidden={hidden}, \
+             n_experts={n_experts}, k={k}, loss={loss:.4}"
+        );
+
+        let dy = ones_like(&tape, out.shape()).unwrap();
+        let grads = backward(&out, dy).unwrap();
+        let read = |idx: usize| -> Vec<f32> {
+            grads[idx]
+                .as_ref()
+                .unwrap()
+                .as_slice::<f32>()
+                .unwrap()
+                .to_vec()
+        };
+
+        // Critical leaves: input X (deepest chain) + L0 w_in (deepest
+        // layer's leaf).  If the chain rule fails at depth 4 OR if a
+        // sparse expert path eats gradient, these collapse.
+        let g_input = read(xt.node_idx());
+        let max_input = g_input.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        eprintln!("[iter-11h-f-6] input max|grad|={max_input:.3e}");
+        assert!(max_input > 1e-7, "input X gradient collapsed at depth 4");
+        for v in &g_input {
+            assert!(v.is_finite(), "input grad non-finite: {v}");
+        }
+
+        let g_l0_win = read(win_t[0].node_idx());
+        let max_l0 = g_l0_win.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        eprintln!("[iter-11h-f-6] L0_w_in max|grad|={max_l0:.3e}");
+        assert!(max_l0 > 1e-7, "L0 w_in gradient collapsed at depth 4");
+
+        // Survey a few experts in different layers — at least one
+        // active expert per layer must have non-trivial gradient.
+        // Routing is deterministic from the fixture; we don't know
+        // which experts won, only that at least some did.
+        let mut layers_with_active_experts = 0usize;
+        for l in 0..n_layers {
+            let mut layer_has_active = false;
+            for e in 0..n_experts {
+                let g = read(gate_t_l[l][e].node_idx());
+                let max_abs = g.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                if max_abs > 1e-7 {
+                    layer_has_active = true;
+                }
+                for (i, v) in g.iter().enumerate() {
+                    assert!(v.is_finite(), "L{l} e{e} gate grad[{i}]={v} non-finite");
+                }
+            }
+            if layer_has_active {
+                layers_with_active_experts += 1;
+            }
+        }
+        eprintln!(
+            "[iter-11h-f-6] {layers_with_active_experts}/{n_layers} layers have \
+             at least one active expert with non-trivial grad"
+        );
+        assert_eq!(
+            layers_with_active_experts, n_layers,
+            "every layer must have at least one active expert with non-trivial grad — \
+             a layer with all-zero expert gradients means switch_mlp produced no \
+             gradient path through ANY active expert"
+        );
+
+        drop(grads);
+        drop(tape);
+    }
+
     /// ADR-020 iter-11h-e3c — switch_mlp composition forward+backward FD.
     ///
     /// Builds a small frozen-router switch_mlp over E=2 experts, K=2 active
