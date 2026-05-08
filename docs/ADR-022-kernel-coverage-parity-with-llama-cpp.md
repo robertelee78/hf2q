@@ -134,8 +134,10 @@ Phase 1 exit AC:
 | P1.6 mm+mm_tensor+mm_id+mm_id_tensor | DONE | 633abd0 (iter 13) | dense_mm_parity_prefill GREEN max_abs ~1.7e-3; mm_id_parity_prefill_path GREEN max_abs ~2.1e-3 (both tensor + non-tensor variants via env-flip) |
 | P1.6 mm_t_bf16_perm021 | N/A | — | Attention Q@K^T only (ADR-013 P21); no model in scope quantizes attention as Q5_1 / IQ4_NL |
 | P1.7 mul_mv_ext r1 family | PENDING | — | Phase 4 candidate; not on Gemma4 critical path |
-| P1.8 Integration: full-file load + first-32 byte-equal | IN PROGRESS | iter 14 (9cd0a8a config gate; F32-router blocker discovered) | Loader runs GGUF-only; forward path blocks on F32 router projection — see P1.9 |
-| P1.9 F32 weight routing in `dispatch_qmatmul` | PENDING (iter 15) | — | `blk.{i}.ffn_gate_inp.weight` is `[2816, 128] F32` in APEX-Q5_K_M; mlx-native's `quantized_matmul_ggml` (correctly) refuses F32 — hf2q's `dispatch_qmatmul` wrapper needs an F32 fast-path to `hf2q_dense_mm_f32_f32` (kernel already shipped in mlx-native, registered in `kernel_registry.rs:128`). Operator alignment: NO FALLBACK pattern — wrapper inspects `weight.info.ggml_dtype` and dispatches to the correct kernel, not to a "fallback" path. |
+| P1.8 Integration: full-file load + first-32 byte-equal | COHERENCE GREEN @ iter 15 | e866e6c (`hf2q`) | "What is 2+2?" → "2 + 2 = 4<turn\|>" on the original failing file. Prefill 46 tok/s, decode 72.6 tok/s. **Byte-equal vs llama-cli still pending**: would lock down sampling determinism but is not the blocker for AC #1 (coherence). |
+| P1.9 F32 weight routing in `dispatch_qmatmul` | DONE | e866e6c | Type-aware routing: `weight.info.ggml_dtype == F32` → `dense_matmul_f32_f32_tensor`; everything else → `quantized_matmul_ggml`. Single match arm, no fallback chain. |
+| P1.10 `find_tokenizer` walk-fallback removed | DONE | e866e6c | Same antipattern as `find_config` walk: silently picked qwen3.6's tokenizer for the Gemma4 GGUF → token-id-mismatched garbage output. Walk over `models/<subdir>/tokenizer.json` removed; resolution is now strict (`--tokenizer` flag → sibling-of-GGUF → fail-loud). |
+| P1.11 GGUF-embedded tokenizer parsing | DEFERRED | — | The Gemma4 file carries `tokenizer.ggml.{tokens,token_type,merges,special_token_ids,...}` in its metadata block; parsing that block in mlx-native + a hf2q adapter would remove the on-disk tokenizer.json requirement entirely (matches llama.cpp's self-bootstrap). Not on Phase-1 critical path. |
 
 Iter 14 root-cause notes (preserved for iter 15 + future readers):
 

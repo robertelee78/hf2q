@@ -521,7 +521,7 @@ mod tests {
         let seq_len = 5usize;
         let make_batch = |seed: u32| -> Vec<u32> {
             (0..(batch_size * seq_len))
-                .map(|i| ((i as u32 * 13 + seed) % cfg.vocab as u32))
+                .map(|i| (i as u32 * 13 + seed) % cfg.vocab as u32)
                 .collect()
         };
         let train_batches = vec![make_batch(1), make_batch(2), make_batch(3)];
