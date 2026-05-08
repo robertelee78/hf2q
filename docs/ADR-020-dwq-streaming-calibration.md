@@ -589,9 +589,28 @@ landed; Linear-only forward already landed).
        `y_S = X @ qdq^T ≈ y_T` regardless of X distribution.  Test
        PASSES by asserting ratio ≥ 0.999 — the plateau is
        X-independent.
-     - **Option A (full-model teacher)** remains the only viable
-       path.  Substantial scope (full backprop through Gemma /
-       qwen35 attention + FFN + MoE).
+     - **Option A (full-model teacher)** is the only remaining
+       viable path.  Existing infra inventory (verified
+       2026-05-08):
+       - `GgufTeacherProvider` at `src/calibrate/gguf_teacher.rs:50`
+         — full-model forward via Qwen35Model returning
+         logits[batch×seq×vocab].  Implements
+         `TeacherLogitsProvider` trait.
+       - `compute_dwq_targets` at `src/calibrate/dwq_targets.rs:103`
+         — drives teacher over calibration splits, saves top-K to
+         disk per safetensors (mirrors mlx-lm's `dwq.py:29`).
+       - `qwen35_moe_forward_on_tape` at `src/calibrate/qwen35_moe.rs:454`
+         — differentiable N-layer MoE forward on `GpuTape`.  Attn
+         is single-matmul proxy (gradient flows through MLP/MoE only;
+         router is frozen).
+       - Adam optimizer + `kl_div_loss_per_row` + autograd_gpu_tape:
+         ready.
+       Missing wiring:
+       - `train_all_linears_full_model_dwq` function (~500-1000 LOC)
+       - `--full-model-teacher` CLI flag + `--calibration-data <path>`
+       - 2-layer synthetic fixture test + real-GGUF smoke
+       Scope: multi-week implementation + 3-6 hour DWQ run per
+       family on M5 Max.  Future-iter scope.
      - The serve-side AC#5 infrastructure works correctly; AC#7
        PASS verdict gates on Option A.
 8. **Per-family pass:** all four combos {Qwen 3.6 35B-A3B-Abliterix-EGA,
