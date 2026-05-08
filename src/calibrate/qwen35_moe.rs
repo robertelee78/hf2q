@@ -26,11 +26,12 @@
 //!      Indices are non-differentiable → no tape node.
 //!   4. `scores = take_along_axis_topk(probs, indices, k)`  → `[n_tokens, k]`
 //!   5. Optional renorm (`norm_topk_prob == true`):
-//!         `sum_k = row_sum(scores)`             → `[n_tokens]`
-//!         `recip = exp(scalar_mul(-1, log(sum_k)))`  → `[n_tokens]`
-//!            (reciprocal composed from exp + log; no new kernel needed)
-//!         `recip_broadcast = outer_product(recip, ones_k)` → `[n_tokens, k]`
-//!         `normalized = mul(scores, recip_broadcast)`
+//!         `sum_k         = row_sum(scores)`                      → `[n_tokens]`
+//!         `sum_broadcast = outer_product(sum_k, ones_k)`          → `[n_tokens, k]`
+//!         `normalized    = divide(scores, sum_broadcast)`
+//!         (uses iter-11h-misc-1's `divide` primitive directly —
+//!          replaces an earlier `exp(-log(sum))` reciprocal trick
+//!          which was a workaround for not having `divide` yet.)
 //!
 //! ## Returns
 //!
@@ -44,7 +45,7 @@ use anyhow::{anyhow, Result};
 use mlx_native::{DType, MlxBuffer};
 
 use super::autograd_gpu_tape::{
-    exp, log, matmul, mul, outer_product, row_sum, scalar_mul, softmax,
+    divide, matmul, outer_product, row_sum, softmax,
     take_along_axis_topk, GpuTensor,
 };
 
@@ -143,15 +144,13 @@ pub fn moe_route(
     let final_scores = if norm_topk_prob {
         // Step 5a: sum_k = row_sum(scores)  → [n_tokens]
         let sum_k = row_sum(&scores)?;
-        // Step 5b: reciprocal via exp(-log(sum)).  All sums are
-        // positive (sum of softmax outputs), so log/exp are safe.
-        let log_sum = log(&sum_k)?;
-        let neg_log_sum = scalar_mul(&log_sum, -1.0)?;
-        let recip = exp(&neg_log_sum)?;
-        // Step 5c: broadcast recip to [n_tokens, k] via outer with ones_k.
-        let recip_broadcast = outer_product(&recip, ones_k)?;
-        // Step 5d: normalized = scores * recip_broadcast.
-        mul(&scores, &recip_broadcast)?
+        // Step 5b: broadcast sum_k to [n_tokens, k] via outer with ones_k.
+        let sum_broadcast = outer_product(&sum_k, ones_k)?;
+        // Step 5c: normalized = scores / sum_broadcast.  Direct divide
+        // primitive (iter-11h-misc-1) replaces the older
+        // exp(-log(sum)) reciprocal-via-log trick — fewer ops, no
+        // log positivity constraint, cleaner backward path.
+        divide(&scores, &sum_broadcast)?
     } else {
         scores
     };
