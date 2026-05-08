@@ -229,6 +229,13 @@ enum OpKind {
         channels: usize,
         k: usize,
     },
+    /// ADR-020 iter-11h-c1 — elementwise exponential.  Building block
+    /// for GatedDeltaNet's `alpha = exp(-g[t])` state-decay (`mlx-lm/
+    /// qwen3_5.py:GatedDeltaNet.__call__`).
+    /// Forward: `y[i] = exp(x[i])`.
+    /// Backward: `dx[i] = dy[i] · y[i]` (uses forward output, not input
+    /// — autograd-canonical pattern, no recompute).
+    Exp { input_idx: usize },
 }
 
 struct GpuNode {
@@ -569,6 +576,7 @@ pub fn backward(
             | OpKind::Transpose2d { input_idx, .. }
             | OpKind::Slice2dCols { input_idx, .. }
             | OpKind::SiLU { input_idx }
+            | OpKind::Exp { input_idx }
             | OpKind::View { input_idx, .. }
             | OpKind::ScalarMul { input_idx, .. } => {
                 accumulate(&mut grads, input_idx, &parent_grads[0], tape)?;
@@ -1050,6 +1058,39 @@ fn backward_dispatch(
             encoder
                 .commit_and_wait()
                 .map_err(|e| anyhow!("backward silu: commit_and_wait: {e}"))?;
+            Ok((op, vec![dx_buf]))
+        }
+        OpKind::Exp { .. } => {
+            // dx = dy · y, where y is the FORWARD OUTPUT (this node's value).
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+            let y_buf = tape.with_node(node_idx, |n| n.value.clone());
+            let n = y_buf.element_count();
+            let dx_buf = device
+                .alloc_buffer(n * 4, DType::F32, y_buf.shape().to_vec())
+                .map_err(|e| anyhow!("backward exp: alloc dx: {e}"))?;
+            let mut params_buf = device
+                .alloc_buffer(4, DType::F32, vec![1])
+                .map_err(|e| anyhow!("backward exp: alloc params: {e}"))?;
+            params_buf
+                .as_mut_slice::<u32>()
+                .map_err(|e| anyhow!("backward exp: params write: {e}"))?[0] = n as u32;
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward exp: encoder: {e}"))?;
+            mlx_native::ops::exp_elementwise::dispatch_exp_backward_f32(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                &y_buf,
+                out_grad,
+                &dx_buf,
+                &params_buf,
+            )
+            .map_err(|e| anyhow!("backward exp: dispatch: {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward exp: commit_and_wait: {e}"))?;
             Ok((op, vec![dx_buf]))
         }
         OpKind::Slice2dCols {
@@ -2573,6 +2614,59 @@ pub fn rms_norm_gated(
     let normed = rms_norm(input, weight, eps)?;
     let activated = silu(gate)?;
     mul(&activated, &normed)
+}
+
+/// ADR-020 iter-11h-c1 — elementwise exponential on GpuTape.
+///
+/// Forward: `y[i] = exp(x[i])`.
+/// Backward: `dx = dy · y` (uses forward output, not input — matches
+/// the Metal kernel's interface; saves a recompute).
+///
+/// Required for GatedDeltaNet's `alpha = exp(-g[t])` state-decay
+/// factor in the recurrent linear-attention update (mlx-lm/qwen3_5.py:
+/// `GatedDeltaNet.__call__`); building block toward iter-11h-c2's
+/// full `gated_delta_update` composition.
+pub fn exp(t: &GpuTensor) -> Result<GpuTensor> {
+    let tape = &t.tape;
+    let device = tape.device();
+    let in_buf = tape.with_node(t.node_idx, |n| n.value.clone());
+    let n = in_buf.element_count();
+
+    let out = device
+        .alloc_buffer(n * 4, DType::F32, t.shape.clone())
+        .map_err(|e| anyhow!("exp: alloc out: {e}"))?;
+    let mut params_buf = device
+        .alloc_buffer(4, DType::U32, vec![1])
+        .map_err(|e| anyhow!("exp: alloc params: {e}"))?;
+    params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("exp: params write: {e}"))?[0] = n as u32;
+
+    let mut registry = tape.0.registry.borrow_mut();
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("exp: encoder: {e}"))?;
+    mlx_native::ops::exp_elementwise::dispatch_exp_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &in_buf,
+        &out,
+        &params_buf,
+    )
+    .map_err(|e| anyhow!("exp: forward dispatch: {e}"))?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("exp: commit_and_wait: {e}"))?;
+    drop(registry);
+
+    let input_idx = t.node_idx;
+    let node_idx = tape.push_node(OpKind::Exp { input_idx }, out, t.shape.clone());
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: t.shape.clone(),
+    })
 }
 
 /// ADR-020 iter-11h-b2 — depthwise causal 1-D convolution on GpuTape.
@@ -4484,6 +4578,92 @@ mod tests {
             assert!(
                 (g_w0[j] - fd).abs() < tol,
                 "FD weight[{j}]: analytic={} fd={}",
+                g_w0[j],
+                fd
+            );
+        }
+    }
+
+    /// iter-11h-c1 — `exp` GpuTape forward + backward FD falsifier.
+    /// Composed with matmul to exercise gradient flow through both
+    /// elementwise + linear ops.
+    #[test]
+    fn exp_forward_and_backward_fd_via_matmul_chain() {
+        use mlx_native::MlxDevice;
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+
+        // matmul kernel has a 32-floor on dW backward — use 32^3.
+        let m = 32usize;
+        let k = 32usize;
+        let n = 32usize;
+        // loss = sum(exp(X @ W))  → dW = X^T @ (dy · exp(X@W))
+        // FD on a few X[i] AND a few W[j] vs analytic (full sweep too slow).
+        let x_data: Vec<f32> = (0..(m * k))
+            .map(|i| ((i as f32) * 0.0137 - 0.2).sin() * 0.1)
+            .collect();
+        let w_data: Vec<f32> = (0..(k * n))
+            .map(|i| 0.05 + (i as f32) * 0.001)
+            .collect();
+
+        let forward_loss_and_grads =
+            |x: &[f32], w: &[f32]| -> (f32, Vec<f32>, Vec<f32>) {
+                tape.reset();
+                let xt = GpuTensor::from_vec(&tape, x, vec![m, k]).unwrap();
+                let wt = GpuTensor::from_vec(&tape, w, vec![k, n]).unwrap();
+                let xw = matmul(&xt, &wt).unwrap();
+                let exp_xw = exp(&xw).unwrap();
+                let exp_host = exp_xw.to_vec().unwrap();
+                let loss = exp_host.iter().map(|v| *v as f64).sum::<f64>() as f32;
+                let dy = ones_like(&tape, exp_xw.shape()).unwrap();
+                let grads = backward(&exp_xw, dy).unwrap();
+                let g_x = grads[xt.node_idx()]
+                    .as_ref()
+                    .unwrap()
+                    .as_slice::<f32>()
+                    .unwrap()
+                    .to_vec();
+                let g_w = grads[wt.node_idx()]
+                    .as_ref()
+                    .unwrap()
+                    .as_slice::<f32>()
+                    .unwrap()
+                    .to_vec();
+                (loss, g_x, g_w)
+            };
+
+        let (_l0, g_x0, g_w0) = forward_loss_and_grads(&x_data, &w_data);
+        let h = 1e-3f32;
+        // Spot-check 8 X positions + 8 W positions (full sweep over
+        // 1024 + 1024 elements is needlessly slow at 32^3).
+        for &i in &[0, 17, 31, 100, 256, 511, 800, 1023] {
+            let mut p = x_data.clone();
+            p[i] += h;
+            let (lp, _, _) = forward_loss_and_grads(&p, &w_data);
+            let mut mn = x_data.clone();
+            mn[i] -= h;
+            let (lm, _, _) = forward_loss_and_grads(&mn, &w_data);
+            let fd = (lp - lm) / (2.0 * h);
+            let tol = 5e-2 * fd.abs().max(1.0);
+            assert!(
+                (g_x0[i] - fd).abs() < tol,
+                "FD x[{i}]: analytic={} fd={}",
+                g_x0[i],
+                fd
+            );
+        }
+        for &j in &[0, 13, 31, 100, 256, 511, 800, 1023] {
+            let mut p = w_data.clone();
+            p[j] += h;
+            let (lp, _, _) = forward_loss_and_grads(&x_data, &p);
+            let mut mn = w_data.clone();
+            mn[j] -= h;
+            let (lm, _, _) = forward_loss_and_grads(&x_data, &mn);
+            let fd = (lp - lm) / (2.0 * h);
+            let tol = 5e-2 * fd.abs().max(1.0);
+            assert!(
+                (g_w0[j] - fd).abs() < tol,
+                "FD w[{j}]: analytic={} fd={}",
                 g_w0[j],
                 fd
             );
