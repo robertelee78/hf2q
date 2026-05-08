@@ -205,6 +205,30 @@ enum OpKind {
         n_total: usize,
         group_size: usize,
     },
+    /// ADR-020 iter-11h-b2 — depthwise causal 1-D convolution with
+    /// zero-pad on the past (training-mode; no decode state).  Required
+    /// by full Qwen3.5MoE forward on GpuTape (`GatedDeltaNet`'s
+    /// `self.conv1d` step in `mlx-lm/qwen3_5.py:105-112`).
+    ///
+    /// Forward (per output `(t, c)`):
+    ///   `y[t, c] = Σ_{k where t+k-(K-1)>=0} weight[c, k] · input[t+k-(K-1), c]`
+    ///
+    /// Backward dispatches mlx-native's two backward kernels in one
+    /// encoder:
+    ///   `dispatch_conv1d_depthwise_causal_backward_dx_f32` (input grad)
+    ///   `dispatch_conv1d_depthwise_causal_backward_dw_f32` (weight grad)
+    ///
+    /// Shape contract:
+    ///   input  : `[n_tokens, channels]` row-major f32
+    ///   weight : `[channels, K]` row-major f32
+    ///   output : `[n_tokens, channels]` row-major f32
+    Conv1dDepthwiseCausal {
+        input_idx: usize,
+        weight_idx: usize,
+        n_tokens: usize,
+        channels: usize,
+        k: usize,
+    },
 }
 
 struct GpuNode {
@@ -573,6 +597,14 @@ pub fn backward(
             } => {
                 accumulate(&mut grads, scales_idx, &parent_grads[0], tape)?;
                 accumulate(&mut grads, biases_idx, &parent_grads[1], tape)?;
+            }
+            OpKind::Conv1dDepthwiseCausal {
+                input_idx,
+                weight_idx,
+                ..
+            } => {
+                accumulate(&mut grads, input_idx, &parent_grads[0], tape)?;
+                accumulate(&mut grads, weight_idx, &parent_grads[1], tape)?;
             }
         }
     }
@@ -1347,6 +1379,79 @@ fn backward_dispatch(
             //   accumulate(grads, scales_idx, parent_grads[0])
             //   accumulate(grads, biases_idx, parent_grads[1])
             Ok((op, vec![d_scales_buf, d_biases_buf]))
+        }
+        OpKind::Conv1dDepthwiseCausal {
+            input_idx,
+            n_tokens,
+            channels,
+            k,
+            ..
+        } => {
+            // Backward: dispatch dx + dw kernels in one encoder.
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+
+            let x_buf = tape.with_node(input_idx, |n| n.value.clone());
+            // weight_idx via op match: re-borrow.
+            let weight_idx = if let OpKind::Conv1dDepthwiseCausal { weight_idx, .. } = op {
+                weight_idx
+            } else {
+                unreachable!()
+            };
+            let w_buf = tape.with_node(weight_idx, |n| n.value.clone());
+
+            let dx_buf = device
+                .alloc_buffer(n_tokens * channels * 4, DType::F32, vec![n_tokens, channels])
+                .map_err(|e| anyhow!("backward conv1d_dwc: alloc dx: {e}"))?;
+            let dw_buf = device
+                .alloc_buffer(channels * k * 4, DType::F32, vec![channels, k])
+                .map_err(|e| anyhow!("backward conv1d_dwc: alloc dw: {e}"))?;
+
+            let mut params_buf = device
+                .alloc_buffer(12, DType::U32, vec![3])
+                .map_err(|e| anyhow!("backward conv1d_dwc: alloc params: {e}"))?;
+            params_buf
+                .as_mut_slice::<u32>()
+                .map_err(|e| anyhow!("backward conv1d_dwc: params write: {e}"))?
+                .copy_from_slice(&[n_tokens as u32, channels as u32, k as u32]);
+
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward conv1d_dwc: encoder: {e}"))?;
+            mlx_native::ops::conv1d_depthwise_causal::dispatch_conv1d_depthwise_causal_backward_dx_f32(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                out_grad,
+                &w_buf,
+                &dx_buf,
+                &params_buf,
+                n_tokens as u32,
+                channels as u32,
+                k as u32,
+            )
+            .map_err(|e| anyhow!("backward conv1d_dwc: dx dispatch: {e}"))?;
+            mlx_native::ops::conv1d_depthwise_causal::dispatch_conv1d_depthwise_causal_backward_dw_f32(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                &x_buf,
+                out_grad,
+                &dw_buf,
+                &params_buf,
+                n_tokens as u32,
+                channels as u32,
+                k as u32,
+            )
+            .map_err(|e| anyhow!("backward conv1d_dwc: dw dispatch: {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward conv1d_dwc: commit_and_wait: {e}"))?;
+
+            // Order matches the parent_grads consumer:
+            //   accumulate(grads, input_idx, parent_grads[0])
+            //   accumulate(grads, weight_idx, parent_grads[1])
+            Ok((op, vec![dx_buf, dw_buf]))
         }
     }
 }
@@ -2468,6 +2573,129 @@ pub fn rms_norm_gated(
     let normed = rms_norm(input, weight, eps)?;
     let activated = silu(gate)?;
     mul(&activated, &normed)
+}
+
+/// ADR-020 iter-11h-b2 — depthwise causal 1-D convolution on GpuTape.
+///
+/// Forward delegates to `mlx_native::ops::conv1d_depthwise_causal::
+/// dispatch_conv1d_depthwise_causal_forward_f32` (training-mode: no
+/// state, no fused SiLU; matches iter-11h-b1 kernels).  Backward is
+/// the corresponding dx + dw dispatches in one encoder.
+///
+/// Shape contract:
+///   * `input` : `[n_tokens, channels]` row-major f32
+///   * `weight`: `[channels, K]` row-major f32 (per-channel filter
+///     of length K, depthwise = each channel is independent)
+///   * Output : `[n_tokens, channels]`
+///
+/// Used by Qwen3.5MoE's `GatedDeltaNet` linear-attention layer
+/// (`mlx-lm/qwen3_5.py:105-112` defines `nn.Conv1d` with
+/// `groups=conv_dim`, i.e. depthwise; inference path uses
+/// production `ssm_conv` kernel which fuses SiLU + decode state,
+/// training-time backward routes through THIS path which decouples
+/// silu via the existing `OpKind::SiLU`).
+pub fn conv1d_depthwise_causal(
+    input: &GpuTensor,
+    weight: &GpuTensor,
+    k: usize,
+) -> Result<GpuTensor> {
+    if !input.tape.ptr_eq(&weight.tape) {
+        return Err(anyhow!(
+            "conv1d_depthwise_causal: input and weight must share the same tape"
+        ));
+    }
+    if input.shape.len() != 2 {
+        return Err(anyhow!(
+            "conv1d_depthwise_causal: input must be 2-D [n_tokens, channels]; got shape={:?}",
+            input.shape
+        ));
+    }
+    if weight.shape.len() != 2 {
+        return Err(anyhow!(
+            "conv1d_depthwise_causal: weight must be 2-D [channels, K]; got shape={:?}",
+            weight.shape
+        ));
+    }
+    let n_tokens = input.shape[0];
+    let channels = input.shape[1];
+    if weight.shape[0] != channels {
+        return Err(anyhow!(
+            "conv1d_depthwise_causal: weight rows {} != input channels {channels}",
+            weight.shape[0]
+        ));
+    }
+    if weight.shape[1] != k {
+        return Err(anyhow!(
+            "conv1d_depthwise_causal: weight cols {} != K {k}",
+            weight.shape[1]
+        ));
+    }
+    if k == 0 || n_tokens == 0 || channels == 0 {
+        return Err(anyhow!(
+            "conv1d_depthwise_causal: all dimensions must be > 0 (got n_tokens={n_tokens}, channels={channels}, K={k})"
+        ));
+    }
+
+    let tape = &input.tape;
+    let device = tape.device();
+    let in_buf = tape.with_node(input.node_idx, |n| n.value.clone());
+    let w_buf = tape.with_node(weight.node_idx, |n| n.value.clone());
+
+    let out = device
+        .alloc_buffer(
+            n_tokens * channels * 4,
+            DType::F32,
+            vec![n_tokens, channels],
+        )
+        .map_err(|e| anyhow!("conv1d_depthwise_causal: alloc out: {e}"))?;
+    let mut params_buf = device
+        .alloc_buffer(12, DType::U32, vec![3])
+        .map_err(|e| anyhow!("conv1d_depthwise_causal: alloc params: {e}"))?;
+    params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("conv1d_depthwise_causal: params write: {e}"))?
+        .copy_from_slice(&[n_tokens as u32, channels as u32, k as u32]);
+
+    let mut registry = tape.0.registry.borrow_mut();
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("conv1d_depthwise_causal: encoder: {e}"))?;
+    mlx_native::ops::conv1d_depthwise_causal::dispatch_conv1d_depthwise_causal_forward_f32(
+        &mut encoder,
+        &mut registry,
+        device.metal_device(),
+        &in_buf,
+        &w_buf,
+        &out,
+        &params_buf,
+        n_tokens as u32,
+        channels as u32,
+        k as u32,
+    )
+    .map_err(|e| anyhow!("conv1d_depthwise_causal: forward dispatch: {e}"))?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("conv1d_depthwise_causal: commit_and_wait: {e}"))?;
+    drop(registry);
+
+    let input_idx = input.node_idx;
+    let weight_idx = weight.node_idx;
+    let node_idx = tape.push_node(
+        OpKind::Conv1dDepthwiseCausal {
+            input_idx,
+            weight_idx,
+            n_tokens,
+            channels,
+            k,
+        },
+        out,
+        vec![n_tokens, channels],
+    );
+    Ok(GpuTensor {
+        tape: tape.clone(),
+        node_idx,
+        shape: vec![n_tokens, channels],
+    })
 }
 
 #[cfg(test)]
@@ -4138,6 +4366,125 @@ mod tests {
                 (g_gate0[i] - fd).abs() < tol,
                 "FD gate[{i}]: analytic={} fd={}",
                 g_gate0[i],
+                fd
+            );
+        }
+    }
+
+    /// iter-11h-b2 — `conv1d_depthwise_causal` GpuTape forward + backward.
+    /// Forward parity vs hand-computed FP64 oracle.  Backward
+    /// finite-difference falsifier on every input AND every weight
+    /// element.  Caught regression class: backward routing wires
+    /// `parent_grads[0] → input` and `parent_grads[1] → weight` —
+    /// reversal would make the FD on weight fail.
+    #[test]
+    fn conv1d_depthwise_causal_forward_and_backward_fd() {
+        use mlx_native::MlxDevice;
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+
+        let n_tokens = 8usize;
+        let channels = 4usize;
+        let k = 3usize;
+        let input_data: Vec<f32> = (0..(n_tokens * channels))
+            .map(|i| ((i as f32) * 0.137 - 0.4).sin() * 0.7)
+            .collect();
+        let weight_data: Vec<f32> = (0..(channels * k))
+            .map(|i| 0.2 + (i as f32) * 0.05)
+            .collect();
+
+        let forward_loss_and_grads = |inp: &[f32], w: &[f32]| -> (f32, Vec<f32>, Vec<f32>) {
+            tape.reset();
+            let input =
+                GpuTensor::from_vec(&tape, inp, vec![n_tokens, channels]).unwrap();
+            let weight =
+                GpuTensor::from_vec(&tape, w, vec![channels, k]).unwrap();
+            let out = conv1d_depthwise_causal(&input, &weight, k).unwrap();
+            let out_host = out.to_vec().unwrap();
+            let loss = out_host.iter().map(|v| *v as f64).sum::<f64>() as f32;
+            let dy = ones_like(&tape, out.shape()).unwrap();
+            let grads = backward(&out, dy).unwrap();
+            let g_in = grads[input.node_idx()]
+                .as_ref()
+                .unwrap()
+                .as_slice::<f32>()
+                .unwrap()
+                .to_vec();
+            let g_w = grads[weight.node_idx()]
+                .as_ref()
+                .unwrap()
+                .as_slice::<f32>()
+                .unwrap()
+                .to_vec();
+            (loss, g_in, g_w)
+        };
+
+        // Hand-computed forward oracle — defends against incorrect
+        // tape wiring in addition to the kernel-level parity test in
+        // mlx-native.
+        let mut expected_y = vec![0.0f32; n_tokens * channels];
+        for t in 0..n_tokens {
+            for c in 0..channels {
+                let mut acc = 0.0f64;
+                for kk in 0..k {
+                    let i_signed =
+                        (t as isize) + (kk as isize) - (k as isize - 1);
+                    if i_signed < 0 {
+                        continue;
+                    }
+                    let i = i_signed as usize;
+                    acc += weight_data[c * k + kk] as f64 * input_data[i * channels + c] as f64;
+                }
+                expected_y[t * channels + c] = acc as f32;
+            }
+        }
+        // First call also does a forward — verify it.
+        tape.reset();
+        let input_t = GpuTensor::from_vec(&tape, &input_data, vec![n_tokens, channels]).unwrap();
+        let weight_t = GpuTensor::from_vec(&tape, &weight_data, vec![channels, k]).unwrap();
+        let out_t = conv1d_depthwise_causal(&input_t, &weight_t, k).unwrap();
+        let out_host = out_t.to_vec().unwrap();
+        for i in 0..(n_tokens * channels) {
+            assert!(
+                (out_host[i] - expected_y[i]).abs() < 1e-5 * expected_y[i].abs().max(1.0),
+                "forward y[{i}]: got={} expected={}",
+                out_host[i],
+                expected_y[i]
+            );
+        }
+
+        // Now FD backward.
+        let (_l0, g_in0, g_w0) = forward_loss_and_grads(&input_data, &weight_data);
+        let h = 1e-3f32;
+        for i in 0..(n_tokens * channels) {
+            let mut p = input_data.clone();
+            p[i] += h;
+            let (lp, _, _) = forward_loss_and_grads(&p, &weight_data);
+            let mut m = input_data.clone();
+            m[i] -= h;
+            let (lm, _, _) = forward_loss_and_grads(&m, &weight_data);
+            let fd = (lp - lm) / (2.0 * h);
+            let tol = 1e-2 * fd.abs().max(1.0);
+            assert!(
+                (g_in0[i] - fd).abs() < tol,
+                "FD input[{i}]: analytic={} fd={}",
+                g_in0[i],
+                fd
+            );
+        }
+        for j in 0..(channels * k) {
+            let mut p = weight_data.clone();
+            p[j] += h;
+            let (lp, _, _) = forward_loss_and_grads(&input_data, &p);
+            let mut m = weight_data.clone();
+            m[j] -= h;
+            let (lm, _, _) = forward_loss_and_grads(&input_data, &m);
+            let fd = (lp - lm) / (2.0 * h);
+            let tol = 1e-2 * fd.abs().max(1.0);
+            assert!(
+                (g_w0[j] - fd).abs() < tol,
+                "FD weight[{j}]: analytic={} fd={}",
+                g_w0[j],
                 fd
             );
         }
