@@ -1010,6 +1010,76 @@ fn f32_slice_to_le_bytes(src: &[f32]) -> Vec<u8> {
     out
 }
 
+/// ADR-020 AC#5 Iter D — classification of `blk.{i}.<role>` stems
+/// emitted by `hf2q dwq-train`.  Drives slot-routing in
+/// [`MlxModelWeights::apply_dwq_overlay`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DwqOverlayRole {
+    AttnQ,
+    AttnK,
+    AttnV,
+    AttnOutput,
+    FfnGate,
+    FfnUp,
+    FfnDown,
+    /// Per-expert MoE tensor (`ffn_gate.{e}`, `ffn_up.{e}`,
+    /// `ffn_down.{e}`); skipped in Iter D, handled in Iter C2.
+    MoeExpert,
+    /// Stem doesn't match any known DWQ role.
+    Unknown,
+}
+
+/// ADR-020 AC#5 Iter D — parse the DWQ safetensors metadata header,
+/// extracting `(bits, group_size)`.  Defaults `(4, 32)` if the
+/// metadata is absent (legacy DWQ output).  Returns an error if a
+/// `format` field is present but doesn't match `mlx-affine-dwq-v1`.
+pub fn parse_dwq_overlay_metadata(
+    metadata: Option<&std::collections::HashMap<String, String>>,
+) -> Result<(u32, usize)> {
+    match metadata {
+        Some(meta) => {
+            if let Some(format_str) = meta.get("format") {
+                if format_str != "mlx-affine-dwq-v1" {
+                    anyhow::bail!(
+                        "DWQ overlay: unsupported format '{}' (expected 'mlx-affine-dwq-v1')",
+                        format_str
+                    );
+                }
+            }
+            let bits = meta
+                .get("bits")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(4u32);
+            let group_size = meta
+                .get("group_size")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(32usize);
+            Ok((bits, group_size))
+        }
+        None => Ok((4u32, 32usize)),
+    }
+}
+
+/// Classify a DWQ stem's role token (the part after `blk.{i}.`).
+pub fn parse_dwq_overlay_role(role: &str) -> DwqOverlayRole {
+    match role {
+        "attn_q" => DwqOverlayRole::AttnQ,
+        "attn_k" => DwqOverlayRole::AttnK,
+        "attn_v" => DwqOverlayRole::AttnV,
+        "attn_output" => DwqOverlayRole::AttnOutput,
+        "ffn_gate" => DwqOverlayRole::FfnGate,
+        "ffn_up" => DwqOverlayRole::FfnUp,
+        "ffn_down" => DwqOverlayRole::FfnDown,
+        r if r.starts_with("ffn_gate.")
+            || r.starts_with("ffn_up.")
+            || r.starts_with("ffn_down.") =>
+        {
+            DwqOverlayRole::MoeExpert
+        }
+        _ => DwqOverlayRole::Unknown,
+    }
+}
+
 impl MlxModelWeights {
     /// Load all model weights directly from a GGUF file into mlx-native
     /// MlxBuffers.
@@ -1608,6 +1678,158 @@ impl MlxModelWeights {
     /// (Wired by iter-108b's release-check.sh Gate 5 harness; no in-tree
     /// caller as of iter-108a — the surface is designed for the
     /// iter-108b two-regime release-check entry point.)
+    /// ADR-020 AC#5 Iter D — overlay a DWQ-trained mlx-affine safetensors
+    /// file on top of an already-GGUF-loaded model.  For each Linear
+    /// stem present in the safetensors file (`<stem>.weight`/.scales/.biases`
+    /// triplet), the matching slot in `MlxModelWeights` is replaced by
+    /// an affine-mode `MlxQWeight` (per Iter B + Iter C dispatch routing).
+    ///
+    /// The safetensors `bits` + `group_size` are read from the file's
+    /// metadata (embedded by `train_all_linears_dwq` since AC#5 Iter D).
+    /// Older DWQ safetensors without metadata fall back to bits=4,
+    /// group_size=32 (the production default).
+    ///
+    /// Stem mapping (dense layers only — MoE expert tensors are skipped
+    /// with a warning, tracked as Iter C2):
+    ///
+    /// | Stem | Slot |
+    /// |---|---|
+    /// | `blk.{i}.attn_q` | `layers[i].attn.q_proj` |
+    /// | `blk.{i}.attn_k` | `layers[i].attn.k_proj` |
+    /// | `blk.{i}.attn_v` | `layers[i].attn.v_proj` (if Some) |
+    /// | `blk.{i}.attn_output` | `layers[i].attn.o_proj` |
+    /// | `blk.{i}.ffn_gate` | `layers[i].mlp.gate_proj` |
+    /// | `blk.{i}.ffn_up` | `layers[i].mlp.up_proj` |
+    /// | `blk.{i}.ffn_down` | `layers[i].mlp.down_proj` |
+    ///
+    /// Returns the count of overridden Linears.  Logs each unmatched
+    /// stem at `tracing::warn!` so operators can audit which trained
+    /// tensors were ignored.
+    pub fn apply_dwq_overlay(
+        &mut self,
+        device: &MlxDevice,
+        path: &std::path::Path,
+    ) -> Result<usize> {
+        use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
+        use anyhow::Context;
+
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("apply_dwq_overlay: read {}", path.display()))?;
+
+        // Pull metadata via `read_metadata` (the deserialized SafeTensors
+        // hides its `Metadata` field; `read_metadata` is the public path).
+        let (_n, metadata_obj) = safetensors::SafeTensors::read_metadata(&bytes)
+            .map_err(|e| anyhow::anyhow!("apply_dwq_overlay: read_metadata: {e:?}"))?;
+
+        let (bits, group_size) = parse_dwq_overlay_metadata(metadata_obj.metadata().as_ref())
+            .with_context(|| format!("apply_dwq_overlay: parse metadata of {}", path.display()))?;
+
+        let st = safetensors::SafeTensors::deserialize(&bytes)
+            .map_err(|e| anyhow::anyhow!("apply_dwq_overlay: deserialize safetensors: {e:?}"))?;
+
+        // Walk all `<stem>.weight` keys; require `<stem>.scales` +
+        // `<stem>.biases` to be present too.
+        let mut stems: Vec<String> = Vec::new();
+        for name in st.names() {
+            if let Some(stem) = name.strip_suffix(".weight") {
+                if st.tensor(&format!("{stem}.scales")).is_err() {
+                    continue;
+                }
+                if st.tensor(&format!("{stem}.biases")).is_err() {
+                    continue;
+                }
+                stems.push(stem.to_string());
+            }
+        }
+
+        let mut overridden: usize = 0;
+        let mut moe_skipped: usize = 0;
+        let mut unknown_skipped: usize = 0;
+
+        for stem in &stems {
+            let linear = MlxAffineLinear::from_safetensors(&st, stem, bits, group_size)
+                .with_context(|| format!("apply_dwq_overlay: parse {stem}"))?;
+            let qweight = MlxQWeight::from_mlx_affine_linear(device, &linear)
+                .with_context(|| format!("apply_dwq_overlay: build qweight for {stem}"))?;
+
+            // Match `blk.{i}.<role>` patterns.
+            let after_blk = match stem.strip_prefix("blk.") {
+                Some(s) => s,
+                None => {
+                    tracing::warn!(stem = %stem, "DWQ overlay: stem does not start with 'blk.'; skipping");
+                    unknown_skipped += 1;
+                    continue;
+                }
+            };
+            let dot = match after_blk.find('.') {
+                Some(d) => d,
+                None => {
+                    tracing::warn!(stem = %stem, "DWQ overlay: stem missing '.<role>'; skipping");
+                    unknown_skipped += 1;
+                    continue;
+                }
+            };
+            let layer_idx: usize = match after_blk[..dot].parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::warn!(stem = %stem, "DWQ overlay: layer idx not numeric; skipping");
+                    unknown_skipped += 1;
+                    continue;
+                }
+            };
+            if layer_idx >= self.layers.len() {
+                tracing::warn!(stem = %stem, layer = layer_idx, "DWQ overlay: layer idx out of range; skipping");
+                unknown_skipped += 1;
+                continue;
+            }
+            let role = &after_blk[(dot + 1)..];
+            match parse_dwq_overlay_role(role) {
+                DwqOverlayRole::AttnQ => self.layers[layer_idx].attn.q_proj = qweight,
+                DwqOverlayRole::AttnK => self.layers[layer_idx].attn.k_proj = qweight,
+                DwqOverlayRole::AttnV => {
+                    if self.layers[layer_idx].attn.v_proj.is_some() {
+                        self.layers[layer_idx].attn.v_proj = Some(qweight);
+                    } else {
+                        tracing::warn!(stem = %stem, "DWQ overlay: attn_v but slot is None (k_eq_v); skipping");
+                        unknown_skipped += 1;
+                        continue;
+                    }
+                }
+                DwqOverlayRole::AttnOutput => self.layers[layer_idx].attn.o_proj = qweight,
+                DwqOverlayRole::FfnGate => self.layers[layer_idx].mlp.gate_proj = qweight,
+                DwqOverlayRole::FfnUp => self.layers[layer_idx].mlp.up_proj = qweight,
+                DwqOverlayRole::FfnDown => self.layers[layer_idx].mlp.down_proj = qweight,
+                DwqOverlayRole::MoeExpert => {
+                    moe_skipped += 1;
+                    continue;
+                }
+                DwqOverlayRole::Unknown => {
+                    tracing::warn!(stem = %stem, role = %role, "DWQ overlay: unknown role; skipping");
+                    unknown_skipped += 1;
+                    continue;
+                }
+            }
+            overridden += 1;
+            tracing::debug!(stem = %stem, "DWQ overlay applied");
+        }
+
+        if moe_skipped > 0 {
+            tracing::warn!(
+                count = moe_skipped,
+                "DWQ overlay: {moe_skipped} MoE expert tensors skipped (AC#5 Iter C2 not yet landed)"
+            );
+        }
+        tracing::info!(
+            overridden,
+            moe_skipped,
+            unknown_skipped,
+            bits,
+            group_size,
+            "DWQ overlay applied: {overridden} dense Linears overridden"
+        );
+        Ok(overridden)
+    }
+
     #[allow(dead_code)]
     pub fn set_decode_regime(&mut self, regime: DecodeRegime) {
         self.decode_regime = regime;
@@ -5930,6 +6152,171 @@ mod ac5_iter_b_affine_qweight_roundtrip {
                 direct[i],
             );
         }
+    }
+
+    /// AC#5 Iter D — `parse_dwq_overlay_role` covers all production
+    /// stems plus rejects unknowns.  Pure CPU; no MlxDevice required.
+    #[test]
+    fn parse_dwq_overlay_role_covers_all_dense_stems() {
+        use super::{parse_dwq_overlay_role, DwqOverlayRole};
+        // Dense Linears.
+        assert_eq!(parse_dwq_overlay_role("attn_q"), DwqOverlayRole::AttnQ);
+        assert_eq!(parse_dwq_overlay_role("attn_k"), DwqOverlayRole::AttnK);
+        assert_eq!(parse_dwq_overlay_role("attn_v"), DwqOverlayRole::AttnV);
+        assert_eq!(
+            parse_dwq_overlay_role("attn_output"),
+            DwqOverlayRole::AttnOutput
+        );
+        assert_eq!(parse_dwq_overlay_role("ffn_gate"), DwqOverlayRole::FfnGate);
+        assert_eq!(parse_dwq_overlay_role("ffn_up"), DwqOverlayRole::FfnUp);
+        assert_eq!(parse_dwq_overlay_role("ffn_down"), DwqOverlayRole::FfnDown);
+        // MoE per-expert (Iter C2 territory).
+        assert_eq!(
+            parse_dwq_overlay_role("ffn_gate.0"),
+            DwqOverlayRole::MoeExpert
+        );
+        assert_eq!(
+            parse_dwq_overlay_role("ffn_up.255"),
+            DwqOverlayRole::MoeExpert
+        );
+        assert_eq!(
+            parse_dwq_overlay_role("ffn_down.42"),
+            DwqOverlayRole::MoeExpert
+        );
+        // Unknown roles.
+        assert_eq!(
+            parse_dwq_overlay_role("token_embd"),
+            DwqOverlayRole::Unknown
+        );
+        assert_eq!(parse_dwq_overlay_role(""), DwqOverlayRole::Unknown);
+        assert_eq!(parse_dwq_overlay_role("output"), DwqOverlayRole::Unknown);
+    }
+
+    /// AC#5 Iter D — `parse_dwq_overlay_metadata` honors metadata when
+    /// present, defaults sanely when absent, rejects mismatched format.
+    #[test]
+    fn parse_dwq_overlay_metadata_handles_all_cases() {
+        use super::parse_dwq_overlay_metadata;
+        use std::collections::HashMap;
+
+        // Absent metadata → defaults (4, 32).
+        let (bits, gs) = parse_dwq_overlay_metadata(None).unwrap();
+        assert_eq!(bits, 4);
+        assert_eq!(gs, 32);
+
+        // Format mismatch → error.
+        let mut bad_format = HashMap::new();
+        bad_format.insert("format".to_string(), "wrong-format".to_string());
+        assert!(parse_dwq_overlay_metadata(Some(&bad_format)).is_err());
+
+        // Correct format + custom bits/gs.
+        let mut meta = HashMap::new();
+        meta.insert("format".to_string(), "mlx-affine-dwq-v1".to_string());
+        meta.insert("bits".to_string(), "8".to_string());
+        meta.insert("group_size".to_string(), "64".to_string());
+        let (bits, gs) = parse_dwq_overlay_metadata(Some(&meta)).unwrap();
+        assert_eq!(bits, 8);
+        assert_eq!(gs, 64);
+
+        // Format absent + valid bits/gs → values respected.
+        let mut nofmt = HashMap::new();
+        nofmt.insert("bits".to_string(), "4".to_string());
+        nofmt.insert("group_size".to_string(), "32".to_string());
+        let (bits, gs) = parse_dwq_overlay_metadata(Some(&nofmt)).unwrap();
+        assert_eq!(bits, 4);
+        assert_eq!(gs, 32);
+
+        // Garbage bits → falls back to default 4.
+        let mut garbage = HashMap::new();
+        garbage.insert("format".to_string(), "mlx-affine-dwq-v1".to_string());
+        garbage.insert("bits".to_string(), "not-a-number".to_string());
+        let (bits, gs) = parse_dwq_overlay_metadata(Some(&garbage)).unwrap();
+        assert_eq!(bits, 4);
+        assert_eq!(gs, 32);
+    }
+
+    /// AC#5 Iter D — full DWQ-format safetensors round-trip:
+    /// MlxAffineLinear → safetensors-on-disk-with-metadata → re-read +
+    /// rebuild MlxAffineLinear → byte-identical contents.  Confirms the
+    /// metadata embed (Iter D step 1) + the safetensors loader contract
+    /// hold without MlxModelWeights involvement.
+    #[test]
+    fn dwq_safetensors_metadata_roundtrip() {
+        use crate::calibrate::mlx_safetensors_loader::{MlxAffineLinear, MlxAffineLinearBytes};
+        use safetensors::tensor::{serialize, Dtype};
+        use std::collections::HashMap;
+
+        let n = 32usize;
+        let k = 64usize;
+        let group_size = 32usize;
+        let bits = 4u32;
+        let groups_per_row = k / group_size;
+        let q_int: Vec<u8> = (0..(n * k)).map(|i| ((i * 3 + 7) % 16) as u8).collect();
+        let scales: Vec<f32> = (0..(n * groups_per_row))
+            .map(|i| 0.05 + (i as f32) * 0.001)
+            .collect();
+        let biases: Vec<f32> = (0..(n * groups_per_row))
+            .map(|i| -0.1 + (i as f32) * 0.002)
+            .collect();
+
+        let linear = MlxAffineLinear {
+            n,
+            k,
+            group_size,
+            bits,
+            q_int: q_int.clone(),
+            scales: scales.clone(),
+            biases: biases.clone(),
+        };
+        let stem = "blk.0.attn_q";
+        let bytes_owned: MlxAffineLinearBytes = linear.to_safetensors_bytes(Dtype::F32).unwrap();
+        let (w, s, b) = bytes_owned.to_safetensors_views().unwrap();
+        let pairs: Vec<(String, _)> = vec![
+            (format!("{stem}.weight"), w),
+            (format!("{stem}.scales"), s),
+            (format!("{stem}.biases"), b),
+        ];
+        let mut metadata = HashMap::new();
+        metadata.insert("format".to_string(), "mlx-affine-dwq-v1".to_string());
+        metadata.insert("bits".to_string(), bits.to_string());
+        metadata.insert("group_size".to_string(), group_size.to_string());
+
+        let serialized = serialize(
+            pairs.iter().map(|(k, v)| (k.as_str(), v)),
+            Some(metadata),
+        )
+        .unwrap();
+
+        // Verify metadata round-trips via read_metadata.
+        let (_n, md) = safetensors::SafeTensors::read_metadata(&serialized).unwrap();
+        let meta_map = md.metadata().as_ref().expect("metadata present");
+        assert_eq!(meta_map.get("format").unwrap(), "mlx-affine-dwq-v1");
+        assert_eq!(meta_map.get("bits").unwrap(), "4");
+        assert_eq!(meta_map.get("group_size").unwrap(), "32");
+
+        let (parsed_bits, parsed_gs) =
+            super::parse_dwq_overlay_metadata(Some(meta_map)).unwrap();
+        assert_eq!(parsed_bits, bits);
+        assert_eq!(parsed_gs, group_size);
+
+        // Rebuild the MlxAffineLinear via from_safetensors and compare.
+        let st = safetensors::SafeTensors::deserialize(&serialized).unwrap();
+        let stems: Vec<&str> = st
+            .names()
+            .iter()
+            .filter_map(|n| n.strip_suffix(".weight"))
+            .collect();
+        assert_eq!(stems.len(), 1);
+        assert_eq!(stems[0], stem);
+
+        let rebuilt = MlxAffineLinear::from_safetensors(&st, stem, parsed_bits, parsed_gs).unwrap();
+        assert_eq!(rebuilt.n, n);
+        assert_eq!(rebuilt.k, k);
+        assert_eq!(rebuilt.bits, bits);
+        assert_eq!(rebuilt.group_size, group_size);
+        assert_eq!(rebuilt.q_int, q_int);
+        assert_eq!(rebuilt.scales, scales);
+        assert_eq!(rebuilt.biases, biases);
     }
 
     #[test]

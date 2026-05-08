@@ -778,6 +778,9 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         model_path: model_path.clone(),
         tokenizer_path: args.tokenizer.clone(),
         config_path: args.config.clone(),
+        // cmd_generate path: no DWQ overlay surface yet (cli::GenerateArgs
+        // doesn't carry --dwq-overlay; only ServeArgs does).
+        dwq_overlay_path: None,
     };
     let load_start = std::time::Instant::now();
     let loaded = api::engine::GemmaLoadedModel::load(&load_opts)
@@ -1972,6 +1975,9 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         model_path: model_path.clone(),
         tokenizer_path: args.tokenizer.clone(),
         config_path: args.config.clone(),
+        // cmd_generate path: no DWQ overlay surface yet (cli::GenerateArgs
+        // doesn't carry --dwq-overlay; only ServeArgs does).
+        dwq_overlay_path: None,
     };
     let load_start = std::time::Instant::now();
     let loaded = Qwen35LoadedModel::load(&load_opts).context("Qwen35LoadedModel::load")?;
@@ -2619,6 +2625,9 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
         model_path: path.to_path_buf(),
         tokenizer_path: config.tokenizer_path.clone(),
         config_path: config.config_path.clone(),
+        // ADR-020 AC#5 Iter D — propagated from `cmd_serve`'s
+        // `args.dwq_overlay` via `multi_model::EngineConfig`.
+        dwq_overlay_path: config.dwq_overlay_path.clone(),
     };
     let mut loaded = api::engine::LoadedModel::load(&load_opts)?;
     // ADR-017 Phase E.a iter-2: thread the metrics sink onto the
@@ -3276,6 +3285,8 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             // wiring as engines admitted later via the auto-pipeline.
             kv_metrics_sink: Some(std::sync::Arc::clone(&state.kv_spill_counters)
                 as std::sync::Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>),
+            // ADR-020 AC#5 Iter D — propagate `--dwq-overlay` flag.
+            dwq_overlay_path: args.dwq_overlay.clone(),
         };
         // ADR-017 C.1: arm the LoaderWrapper's pending_bind slot for
         // the about-to-fire load_or_get. Synchronous contract — see
@@ -4871,6 +4882,7 @@ mod tests {
             queue_capacity: 4,
             warmup_synchronously: false,
             kv_metrics_sink: None,
+            dwq_overlay_path: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         // 0-tensor GGUF can't fully load, but the FAILURE shape proves
@@ -4905,6 +4917,7 @@ mod tests {
             queue_capacity: 4,
             warmup_synchronously: false,
             kv_metrics_sink: None,
+            dwq_overlay_path: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err(), "0-tensor synthetic GGUF must fail load");
@@ -4942,6 +4955,7 @@ mod tests {
             queue_capacity: 4,
             warmup_synchronously: false,
             kv_metrics_sink: None,
+            dwq_overlay_path: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(
@@ -4981,6 +4995,7 @@ mod tests {
             queue_capacity: 4,
             warmup_synchronously: false,
             kv_metrics_sink: None,
+            dwq_overlay_path: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err());
@@ -5004,6 +5019,7 @@ mod tests {
             queue_capacity: 4,
             warmup_synchronously: false,
             kv_metrics_sink: None,
+            dwq_overlay_path: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err());
@@ -5029,6 +5045,7 @@ mod tests {
             queue_capacity: 4,
             warmup_synchronously: false,
             kv_metrics_sink: None,
+            dwq_overlay_path: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err(), "minimal GGUF must fail downstream load");
@@ -5067,6 +5084,7 @@ mod tests {
                 queue_capacity: 4,
                 warmup_synchronously: false,
                 kv_metrics_sink: None,
+            dwq_overlay_path: None,
             };
             let result = super::load_engine(tmp.path(), &cfg);
             assert!(

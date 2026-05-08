@@ -794,6 +794,18 @@ pub struct ServeArgs {
     #[arg(long)]
     pub mmproj: Option<PathBuf>,
 
+    /// ADR-020 AC#5 Iter D — overlay a DWQ-trained mlx-affine
+    /// safetensors file on top of the GGUF-loaded weights.  For each
+    /// trained Linear stem (`blk.{i}.attn_q`, `attn_k`, `attn_v`,
+    /// `attn_output`, `ffn_gate`, `ffn_up`, `ffn_down`), the matching
+    /// slot is replaced with an affine-mode `MlxQWeight` that
+    /// dispatches through `qmm_affine_t_packed_simd4_b4` (mlx-native
+    /// d0de92a).  Currently only dense families (Gemma 4) honor the
+    /// overlay; qwen35moe MoE-expert tensors are skipped with a warning
+    /// pending Iter C2.  Source: `hf2q dwq-train --output ...`.
+    #[arg(long)]
+    pub dwq_overlay: Option<PathBuf>,
+
     /// Suppress the human-readable serve load banner on stdout.
     #[arg(long, default_value_t = false)]
     pub quiet: bool,

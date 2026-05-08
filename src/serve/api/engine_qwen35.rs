@@ -3238,6 +3238,7 @@ mod tests {
             model_path: std::path::PathBuf::from("/tmp/iter-215-does-not-exist.gguf"),
             tokenizer_path: None,
             config_path: None,
+            dwq_overlay_path: None,
         };
         let res = Qwen35LoadedModel::load(&opts);
         assert!(res.is_err());

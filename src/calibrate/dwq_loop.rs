@@ -725,8 +725,23 @@ where
         views_pairs.push((format!("{stem}.scales"), s));
         views_pairs.push((format!("{stem}.biases"), bi));
     }
+    // ADR-020 AC#5 Iter D — embed `bits` + `group_size` in safetensors
+    // metadata so `MlxModelWeights::apply_dwq_overlay` can reconstruct
+    // MlxAffineLinear without additional CLI flags or guessing.  The
+    // `format` marker lets the loader fail-fast on non-DWQ safetensors.
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("format".to_string(), "mlx-affine-dwq-v1".to_string());
+    metadata.insert("bits".to_string(), cfg.bits.to_string());
+    metadata.insert(
+        "group_size".to_string(),
+        cfg.group_size.to_string(),
+    );
+    metadata.insert(
+        "trained_count".to_string(),
+        all_bytes.len().to_string(),
+    );
     let safetensors_bytes = safetensors::tensor::serialize(views_pairs.iter()
-        .map(|(k, v)| (k.as_str(), v)), None)
+        .map(|(k, v)| (k.as_str(), v)), Some(metadata))
         .map_err(|e| anyhow!("safetensors serialize: {e}"))?;
     // Discard the type holder so MlxAffineLinear is in scope.
     let _ = std::any::type_name::<MlxAffineLinear>();

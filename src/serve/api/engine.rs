@@ -1796,6 +1796,14 @@ pub struct LoadOptions {
     pub model_path: PathBuf,
     pub tokenizer_path: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
+    /// ADR-020 AC#5 Iter D — optional path to a DWQ-trained mlx-affine
+    /// safetensors file.  When `Some`, applied as an overlay over the
+    /// GGUF-loaded weights via `MlxModelWeights::apply_dwq_overlay`,
+    /// replacing each trained Linear with the DWQ output.
+    ///
+    /// Only the dense families (Gemma 4) consume this in Iter D; the
+    /// qwen35moe path will gain DWQ-overlay support in Iter C2.
+    pub dwq_overlay_path: Option<PathBuf>,
 }
 
 impl LoadedModel {
@@ -1999,12 +2007,32 @@ impl GemmaLoadedModel {
             0
         };
         let mut load_progress = header::LoadProgress::new(stderr_is_tty, verbosity, n_layers);
-        let weights = MlxModelWeights::load_from_gguf(
+        let mut weights = MlxModelWeights::load_from_gguf(
             &gguf,
             &config,
             &mut ctx,
             &mut load_progress,
         )?;
+
+        // ADR-020 AC#5 Iter D — DWQ overlay (mlx-affine packed-U32
+        // safetensors) applied after the GGUF load.  Replaces each
+        // trained Linear's MlxQWeight with an affine-mode counterpart
+        // that dispatches through `qmm_affine_t_packed_simd4_b4`.
+        if let Some(overlay_path) = opts.dwq_overlay_path.as_ref() {
+            let overridden = weights
+                .apply_dwq_overlay(ctx.device(), overlay_path)
+                .with_context(|| {
+                    format!(
+                        "DWQ overlay from {} failed",
+                        overlay_path.display()
+                    )
+                })?;
+            tracing::info!(
+                count = overridden,
+                path = %overlay_path.display(),
+                "DWQ overlay applied to GemmaLoadedModel"
+            );
+        }
 
         // Load tokenizer. ADR-022 P1.11: prefer on-disk tokenizer.json when
         // present (HF-checkout ergonomics), else build directly from GGUF

@@ -134,6 +134,12 @@ pub struct EngineConfig {
     pub kv_metrics_sink: Option<
         std::sync::Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>,
     >,
+    /// ADR-020 AC#5 Iter D — optional path to a DWQ-trained mlx-affine
+    /// safetensors overlay.  When `Some`, applied after GGUF load via
+    /// `MlxModelWeights::apply_dwq_overlay` (dense families only;
+    /// qwen35moe MoE-expert tensors skipped pending Iter C2).  Set by
+    /// `cmd_serve` from `args.dwq_overlay`.
+    pub dwq_overlay_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for EngineConfig {
@@ -144,6 +150,7 @@ impl std::fmt::Debug for EngineConfig {
             .field("queue_capacity", &self.queue_capacity)
             .field("warmup_synchronously", &self.warmup_synchronously)
             .field("kv_metrics_sink_present", &self.kv_metrics_sink.is_some())
+            .field("dwq_overlay_path", &self.dwq_overlay_path)
             .finish()
     }
 }

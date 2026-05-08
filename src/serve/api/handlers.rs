@@ -217,6 +217,11 @@ async fn resolve_engine_for_request(
         // default-no-op `record_lcp_probe` impl on non-prod builds.
         kv_metrics_sink: Some(Arc::clone(&state.kv_spill_counters)
             as Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>),
+        // ADR-020 AC#5 Iter D — request-time auto-pipeline does not
+        // surface DWQ overlay (it auto-resolves `(repo, quant)` from
+        // the request).  Only the cmd_serve startup pre-warm path
+        // honors `--dwq-overlay`.
+        dwq_overlay_path: None,
     };
     let pool_arc = state.pool.clone();
     let pool_repo_blocking = pool_repo.clone();
