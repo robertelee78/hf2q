@@ -430,6 +430,14 @@ impl GpuTensor {
         self.node_idx
     }
 
+    /// Borrow the parent tape.  Required by external module
+    /// compositions (e.g. `qwen35_moe::moe_route`) that need to
+    /// allocate side-band buffers on the same device or push nodes
+    /// alongside the in-flight computation.
+    pub fn tape(&self) -> &GpuTape {
+        &self.tape
+    }
+
     /// Read forward-computed values to CPU.  Caller responsibility:
     /// any pending GPU work for this tensor must already be committed
     /// + waited (the public ops do `commit_and_wait` before returning).
