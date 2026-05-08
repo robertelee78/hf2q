@@ -381,6 +381,13 @@ impl Calibrator for DwqCalibrator {
             ..DwqConfig::default()
         };
 
+        // ADR-020 iter-12b-4 wireup REVERTED 2026-05-08 — FD path
+        // exists at `dwq_activation::capture_activations_to_sensitive_ranges_fd`
+        // and tests green in isolation, but cutover broke 6 calibrator
+        // tests that pass empty `LazyTensorMap::new()` (heuristic path
+        // doesn't read the map; FD path needs all 9 GGUF-named tensors
+        // per layer + metadata.intermediate_size).  iter-12b-5 will
+        // upgrade those test fixtures + flip back to FD.
         let sensitive_ranges =
             capture_activations_to_sensitive_ranges(meta, &dwq_config, capture).map_err(
                 |e| CalibrationError::Other {

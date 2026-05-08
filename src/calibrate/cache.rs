@@ -45,7 +45,14 @@ use thiserror::Error;
 
 use super::imatrix::Stats as ImatrixStats;
 
-/// Pinned version string for the sensitivity computation algorithm.
+/// Pinned version string for the LEGACY variance-magnitude
+/// sensitivity algorithm.  Stays at `1.0.variance-magnitude` even
+/// after iter-12b-4 cutover — the new FD scorer uses
+/// `SENSITIVITY_ALGORITHM_VERSION_GRADIENT_ALIGNMENT` from
+/// `src/calibrate/dynamic_quant.rs` for its cache key, so cached
+/// payloads from both eras coexist without overwriting (legacy
+/// runs can still rehydrate from `1.0.variance-magnitude` files).
+///
 /// Bump when [`crate::calibrate::sensitivity::compute_layer_sensitivity`]
 /// or any of its inputs (variance/max-magnitude formula, prefilter
 /// rules, layer enumeration order) changes — the bump invalidates
