@@ -280,10 +280,37 @@ impl ProfileAccumulator {
 // Weight storage for the mlx-native forward path
 // ---------------------------------------------------------------------------
 
-/// Pre-loaded quantized weight buffer paired with its GGML metadata.
+/// ADR-020 AC#5 Iter B — extra metadata + buffers for an mlx-affine
+/// (DWQ) packed-U32 weight.  When this is `Some`, the parent
+/// [`MlxQWeight`]'s `buffer` is interpreted as packed-U32 affine-quant
+/// codes (shape `[N, K/pack_factor]`, dtype `U32`) instead of GGML
+/// block-format bytes; `info.ggml_dtype` is unused on the affine path.
+///
+/// `scales` and `biases` are the per-group `(s, b)` pairs from the
+/// DWQ-trained safetensors.  Held as F32 buffers (cast at load time
+/// from BF16/F32 depending on the on-disk safetensors dtype) so the
+/// kernel can read them without an inline cast.
+pub struct MlxAffineExtra {
+    /// Per-group scales, F32, shape `[N, K/group_size]`.
+    pub scales: MlxBuffer,
+    /// Per-group biases (zero-points), F32, shape `[N, K/group_size]`.
+    pub biases: MlxBuffer,
+    /// Quantization bit-width (currently only 4 supported).
+    pub bits: u32,
+    /// Per-group axis length (currently only 32 supported via `simd4_b4`).
+    pub group_size: u32,
+}
+
+/// Pre-loaded quantized weight buffer paired with its GGML metadata
+/// (or its mlx-affine metadata, when `affine` is `Some`).
 pub struct MlxQWeight {
     pub buffer: MlxBuffer,
     pub info: QuantWeightInfo,
+    /// `Some(...)` when this weight was loaded from a DWQ-trained mlx
+    /// safetensors overlay.  `None` for the default GGML-block-loaded
+    /// path.  Routing in `dispatch_qmatmul` checks `affine.is_some()`
+    /// FIRST and skips both the F32 and GGML branches when set.
+    pub affine: Option<MlxAffineExtra>,
 }
 
 impl MlxQWeight {
@@ -296,6 +323,108 @@ impl MlxQWeight {
             n: self.info.rows as u32,
             k: self.info.cols as u32,
             ggml_type: self.info.ggml_dtype,
+        })
+    }
+
+    /// AC#5 Iter B — construct an affine-mode `MlxQWeight` from a
+    /// loaded `MlxAffineLinear` (the safetensors loader's runtime
+    /// representation).  Uploads the packed-U32 weight + F32 scales +
+    /// F32 biases to GPU buffers.
+    ///
+    /// The `info.ggml_dtype` is stamped to `GgmlType::F32` as a sentinel
+    /// (unused on the affine path; routing gates on `affine.is_some()`
+    /// before the F32 check).  `info.rows = N`, `info.cols = K`.
+    pub fn from_mlx_affine_linear(
+        device: &MlxDevice,
+        linear: &crate::calibrate::mlx_safetensors_loader::MlxAffineLinear,
+    ) -> Result<Self> {
+        if linear.bits != 4 {
+            anyhow::bail!(
+                "MlxQWeight::from_mlx_affine_linear: only bits=4 supported in AC#5 Iter B; got {}",
+                linear.bits
+            );
+        }
+        if linear.group_size != 32 {
+            anyhow::bail!(
+                "MlxQWeight::from_mlx_affine_linear: only group_size=32 supported in AC#5 Iter B; got {}",
+                linear.group_size
+            );
+        }
+        let n = linear.n;
+        let k = linear.k;
+        let pack_factor = (32 / linear.bits) as usize;
+        if k % pack_factor != 0 {
+            anyhow::bail!(
+                "MlxQWeight::from_mlx_affine_linear: K ({k}) must be divisible by pack_factor ({pack_factor})"
+            );
+        }
+        let k_packed = k / pack_factor;
+        let groups_per_row = k / linear.group_size;
+
+        // Pack the unpacked u8 codes back to U32 mlx-on-disk layout
+        // (low nibble at slot 0).  Mirrors mlx/ops.cpp:4762-4772.
+        let mut packed = vec![0u32; n * k_packed];
+        for row in 0..n {
+            for kp in 0..k_packed {
+                let mut word: u32 = 0;
+                for j in 0..pack_factor {
+                    let code = linear.q_int[row * k + kp * pack_factor + j] as u32;
+                    debug_assert!(code <= 0xF);
+                    word |= (code & 0xF) << (j * 4);
+                }
+                packed[row * k_packed + kp] = word;
+            }
+        }
+
+        let mut weight_buf = device
+            .alloc_buffer(
+                n * k_packed * std::mem::size_of::<u32>(),
+                mlx_native::DType::U32,
+                vec![n, k_packed],
+            )
+            .map_err(|e| anyhow::anyhow!("affine weight alloc: {e}"))?;
+        weight_buf
+            .as_mut_slice::<u32>()
+            .map_err(|e| anyhow::anyhow!("affine weight slice: {e}"))?
+            .copy_from_slice(&packed);
+
+        let mut scales_buf = device
+            .alloc_buffer(
+                n * groups_per_row * std::mem::size_of::<f32>(),
+                mlx_native::DType::F32,
+                vec![n, groups_per_row],
+            )
+            .map_err(|e| anyhow::anyhow!("affine scales alloc: {e}"))?;
+        scales_buf
+            .as_mut_slice::<f32>()
+            .map_err(|e| anyhow::anyhow!("affine scales slice: {e}"))?
+            .copy_from_slice(&linear.scales);
+
+        let mut biases_buf = device
+            .alloc_buffer(
+                n * groups_per_row * std::mem::size_of::<f32>(),
+                mlx_native::DType::F32,
+                vec![n, groups_per_row],
+            )
+            .map_err(|e| anyhow::anyhow!("affine biases alloc: {e}"))?;
+        biases_buf
+            .as_mut_slice::<f32>()
+            .map_err(|e| anyhow::anyhow!("affine biases slice: {e}"))?
+            .copy_from_slice(&linear.biases);
+
+        Ok(Self {
+            buffer: weight_buf,
+            info: QuantWeightInfo {
+                ggml_dtype: mlx_native::GgmlType::F32, // sentinel; affine path bypasses it
+                rows: n,
+                cols: k,
+            },
+            affine: Some(MlxAffineExtra {
+                scales: scales_buf,
+                biases: biases_buf,
+                bits: linear.bits,
+                group_size: linear.group_size as u32,
+            }),
         })
     }
 }
@@ -404,6 +533,7 @@ impl MlxMoeWeights {
                     rows: 1,
                     cols: 1,
                 },
+                affine: None,
             },
             per_expert_scale: alloc_one_f32_placeholder(mlx_device, "per_expert_scale")?,
             gate_up_ggml_dtype: mlx_native::GgmlType::F32,
@@ -1043,6 +1173,7 @@ impl MlxModelWeights {
                     rows,
                     cols,
                 },
+                affine: None,
             })
         } else {
             None
@@ -5412,6 +5543,7 @@ mod dispatch_qmatmul_f32_router_test {
                 rows: n,
                 cols: k,
             },
+            affine: None,
         };
 
         // Run through GraphSession (mirrors production dispatch path).
@@ -5447,6 +5579,177 @@ mod dispatch_qmatmul_f32_router_test {
     }
 }
 
+/// ADR-020 AC#5 Iter B — `MlxQWeight::from_mlx_affine_linear` round-trip
+/// + GPU dispatch parity test.
+///
+/// Hypothesis: an MlxAffineLinear constructed in-process (skipping the
+/// safetensors disk round-trip), uploaded via `from_mlx_affine_linear`,
+/// and dispatched via the new `qmm_affine_t_packed_simd4_b4` kernel
+/// produces output matching a CPU oracle that does
+/// `y = x @ (q_int * scales + biases)^T`.
+///
+/// Falsifier: any divergence in the packed-U32 emission inside
+/// `from_mlx_affine_linear` (e.g. wrong slot ordering, wrong nibble
+/// position) would surface as a measurable error vs the CPU oracle.
+#[cfg(test)]
+mod ac5_iter_b_affine_qweight_roundtrip {
+    use super::*;
+    use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
+    use mlx_native::ops::qmm_affine::dispatch_qmm_affine_t_packed_simd4_b4;
+
+    #[test]
+    fn from_mlx_affine_linear_roundtrips_through_packed_kernel() {
+        let device = match mlx_native::MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping ac5_iter_b: no MlxDevice");
+                return;
+            }
+        };
+        let mut registry = mlx_native::KernelRegistry::new();
+
+        let m = 16usize;
+        let n = 64usize;
+        let k = 96usize;
+        let group_size = 32usize;
+        let bits = 4u32;
+        let pack_factor = (32 / bits) as usize;
+        let groups_per_row = k / group_size;
+
+        // Synthetic deterministic linear: q_int in [0, 16), scales/biases F32.
+        let q_int: Vec<u8> = (0..(n * k)).map(|i| ((i * 11 + 5) % 16) as u8).collect();
+        let scales: Vec<f32> = (0..(n * groups_per_row))
+            .map(|i| 0.05 + (i as f32) * 0.0017)
+            .collect();
+        let biases: Vec<f32> = (0..(n * groups_per_row))
+            .map(|i| -0.13 + (i as f32) * 0.0023)
+            .collect();
+        let linear = MlxAffineLinear {
+            n,
+            k,
+            group_size,
+            bits,
+            q_int: q_int.clone(),
+            scales: scales.clone(),
+            biases: biases.clone(),
+        };
+
+        // Hf2q: pack into MlxQWeight via the AC#5 Iter B constructor.
+        let qweight =
+            MlxQWeight::from_mlx_affine_linear(&device, &linear).expect("from_mlx_affine_linear");
+        assert_eq!(qweight.info.rows, n);
+        assert_eq!(qweight.info.cols, k);
+        let extra = qweight.affine.as_ref().expect("affine extra");
+        assert_eq!(extra.bits, bits);
+        assert_eq!(extra.group_size, group_size as u32);
+        assert_eq!(qweight.buffer.element_count(), n * (k / pack_factor));
+        assert_eq!(extra.scales.element_count(), n * groups_per_row);
+        assert_eq!(extra.biases.element_count(), n * groups_per_row);
+
+        // Upload x.
+        let x: Vec<f32> = (0..(m * k))
+            .map(|i| ((i as f32) * 0.013 - 0.4).sin() * 0.6)
+            .collect();
+        let mut x_buf = device
+            .alloc_buffer(m * k * 4, mlx_native::DType::F32, vec![m, k])
+            .expect("x");
+        x_buf
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&x);
+
+        let y_buf = device
+            .alloc_buffer(m * n * 4, mlx_native::DType::F32, vec![m, n])
+            .expect("y");
+
+        // meta: [M, N, K, group_size]
+        let mut meta = device
+            .alloc_buffer(16, mlx_native::DType::U32, vec![4])
+            .unwrap();
+        meta.as_mut_slice::<u32>().unwrap().copy_from_slice(&[
+            m as u32,
+            n as u32,
+            k as u32,
+            group_size as u32,
+        ]);
+
+        let mut encoder = device.command_encoder().unwrap();
+        dispatch_qmm_affine_t_packed_simd4_b4(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            &x_buf,
+            &qweight.buffer,
+            &extra.scales,
+            &extra.biases,
+            &y_buf,
+            &meta,
+            m as u32,
+            n as u32,
+            k as u32,
+            group_size as u32,
+            bits,
+        )
+        .expect("dispatch packed simd4");
+        encoder.commit_and_wait().unwrap();
+
+        // CPU oracle: y[r, col] = sum_k x[r, k] * (q_int[col, k] * scales[col, g] + biases[col, g]).
+        let mut expected = vec![0.0f32; m * n];
+        for r in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0f64;
+                for g in 0..groups_per_row {
+                    let s = scales[col * groups_per_row + g] as f64;
+                    let b = biases[col * groups_per_row + g] as f64;
+                    for i in 0..group_size {
+                        let kk = g * group_size + i;
+                        let q = q_int[col * k + kk] as f64;
+                        acc += (x[r * k + kk] as f64) * (q * s + b);
+                    }
+                }
+                expected[r * n + col] = acc as f32;
+            }
+        }
+
+        let got = y_buf.as_slice::<f32>().unwrap();
+        let mut max_abs = 0.0f32;
+        for i in 0..(m * n) {
+            let d = (got[i] - expected[i]).abs();
+            if d > max_abs {
+                max_abs = d;
+            }
+        }
+        assert!(
+            max_abs < 1e-3,
+            "max|y - oracle| = {max_abs} (m={m}, n={n}, k={k})"
+        );
+    }
+
+    #[test]
+    fn from_mlx_affine_linear_rejects_unsupported_bits() {
+        let device = match mlx_native::MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping: no MlxDevice");
+                return;
+            }
+        };
+        // bits=8 is not supported by the simd4_b4 kernel — constructor
+        // must reject so we surface the gap at load time, not dispatch time.
+        let linear = MlxAffineLinear {
+            n: 32,
+            k: 32,
+            group_size: 32,
+            bits: 8,
+            q_int: vec![0u8; 32 * 32],
+            scales: vec![0.1f32; 32],
+            biases: vec![0.0f32; 32],
+        };
+        let res = MlxQWeight::from_mlx_affine_linear(&device, &linear);
+        assert!(res.is_err(), "should reject bits=8");
+    }
+}
+
 /// Helper: load a GGUF tensor as raw quantized bytes into an MlxQWeight.
 ///
 /// The tensor name is looked up in the GGUF file, its raw GGML block data
@@ -5478,6 +5781,7 @@ fn load_gguf_qweight(
             rows,
             cols,
         },
+        affine: None,
     })
 }
 

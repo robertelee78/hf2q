@@ -50,7 +50,7 @@ thiserror = "2"
 # ADR-015 iter56 — path-pin to local mlx-native (which now has the new
 # `gated_delta_net_decode` op merged at commit 641ab78). Revert to
 # `mlx-native = "0.6"` once mlx-native publishes a 0.7 with this kernel.
-mlx-native = { version = "0.6", path = "/opt/mlx-native" }
+mlx-native = { version = "0.7", path = "/opt/mlx-native" }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).
