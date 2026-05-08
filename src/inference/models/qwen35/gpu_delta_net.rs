@@ -3558,19 +3558,27 @@ mod tests {
         )
         .expect("build_delta_net_layer");
 
+        // Sync barrier: build_delta_net_layer uses commit_labeled (non-blocking).
+        // Without this empty-encoder commit_and_wait, download_f32's as_slice would
+        // read alloc-init zeros / partial GPU writes. See
+        // feedback_metal_test_commit_labeled_then_download_needs_sync.
+        device
+            .command_encoder()
+            .expect("sync enc full_delta_net_layer")
+            .commit_and_wait()
+            .expect("sync wait full_delta_net_layer");
         let gpu_out = download_f32(&gpu_out_buf).expect("download gpu_out");
         assert_eq!(gpu_out.len(), cpu_out.len(), "output length mismatch");
 
-        // Guard: parallel test runs share the Metal device; a contended command buffer
-        // may return without executing, yielding all-zero output.  Skip rather than fail.
-        let all_gpu_zero = gpu_out.iter().all(|&v| v == 0.0);
-        let cpu_nonzero = cpu_out.iter().any(|&v| v != 0.0);
-        if all_gpu_zero && cpu_nonzero {
-            eprintln!(
-                "full_delta_net_layer_gpu_matches_cpu_ref: GPU output all-zero under parallel test contention — skipping"
-            );
-            return;
-        }
+        // No silent all-zero short-circuit (per mantra "no fallback"). Sync above
+        // guarantees GPU work completes before this read; if output is still all-
+        // zero, the kernel chain failed — fail loud so root cause surfaces.
+        assert!(
+            gpu_out.iter().any(|&v| v != 0.0),
+            "full_delta_net_layer_gpu_matches_cpu_ref: GPU output all-zero — \
+             dispatch chain likely failed silently. cpu_first_8={:?}",
+            &cpu_out[..8.min(cpu_out.len())]
+        );
 
         // Compute max absolute error.
         let max_err = gpu_out
