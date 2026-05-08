@@ -1996,6 +1996,183 @@ mod tests {
         drop(tape);
     }
 
+    /// ADR-020 AC#7 Option A foundation — qdq-wrapped MoE forward proves
+    /// gradient flow back to per-Linear (s, b) leaves, NOT just the F32
+    /// weight tensors.  Single decoder layer, n_experts=2, k=1.  Builds
+    /// each expert's gate/up/down via `qdq_affine(s, b, q_int)` →
+    /// reshape, threads the qdq tensors into `decoder_layer_on_tape`,
+    /// runs forward + ones-seeded backward, and asserts:
+    ///
+    ///   1. Backward succeeds (no chain breaks introduced by qdq).
+    ///   2. Gradients are present on EVERY (s, b) leaf — not just the
+    ///      qdq output tensors.  This is the load-bearing assertion:
+    ///      proves the autograd chain `s/b → qdq_affine → matmul →
+    ///      switch_mlp → forward output` correctly routes contributions
+    ///      back to the trainable params.
+    ///
+    /// If this passes, the smallest provable Option A wiring step is
+    /// closed: the building blocks compose into a full-model
+    /// differentiable DWQ student forward.  Future iters can scale to
+    /// real models + add the teacher-loss + Adam loop on top.
+    #[test]
+    fn ac7_option_a_foundation_qdq_wrapped_moe_layer_routes_gradients_to_s_b() {
+        use crate::calibrate::autograd_gpu_tape::{backward, ones_like, qdq_affine, view, GpuTape, GpuTensor};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let n_tokens = 32usize;
+        let hidden = 32usize;
+        let intermediate = 32usize;
+        let n_experts = 2usize;
+        let k = 1usize;
+        let group_size = 32usize;
+        let bits = 4u32;
+        let pack_factor = (32 / bits) as usize;
+        let _ = pack_factor;
+        let eps = 1e-6f32;
+
+        // Deterministic xorshift RNG.
+        let mut rng_state: u64 = 0xCAFE_F00D_DEAD_BABE;
+        let mut next = move || -> f32 {
+            rng_state ^= rng_state >> 33;
+            rng_state = rng_state.wrapping_mul(0xff51_afd7_ed55_8ccd);
+            rng_state ^= rng_state >> 33;
+            ((rng_state as i64) as f32) / (i64::MAX as f32)
+        };
+
+        let tape = GpuTape::new(device.clone());
+
+        // Input + per-layer F32 small weights (norm/attn/router).
+        let input_data: Vec<f32> = (0..(n_tokens * hidden)).map(|_| next() * 0.3).collect();
+        let xt = GpuTensor::from_vec(&tape, &input_data, vec![n_tokens, hidden]).unwrap();
+        let w_in_data: Vec<f32> = (0..hidden).map(|_| 1.0 + next() * 0.05).collect();
+        let w_post_data: Vec<f32> = (0..hidden).map(|_| 1.0 + next() * 0.05).collect();
+        let w_attn_data: Vec<f32> = (0..(hidden * hidden)).map(|_| next() * 0.05).collect();
+        let w_gate_data: Vec<f32> = (0..(hidden * n_experts)).map(|_| next() * 0.1).collect();
+        let w_in_t = GpuTensor::from_vec(&tape, &w_in_data, vec![hidden]).unwrap();
+        let w_post_t = GpuTensor::from_vec(&tape, &w_post_data, vec![hidden]).unwrap();
+        let w_attn_t = GpuTensor::from_vec(&tape, &w_attn_data, vec![hidden, hidden]).unwrap();
+        let w_gate_t = GpuTensor::from_vec(&tape, &w_gate_data, vec![hidden, n_experts]).unwrap();
+
+        // Per-expert (s, b, q_int) leaves + qdq-derived gate/up/down tensors.
+        let groups_per_gate_up_row = hidden / group_size; // input dim partitioned for gate/up
+        let groups_per_down_row = intermediate / group_size; // input dim partitioned for down
+
+        // Storage for s/b leaves so they outlive the test.
+        let mut gate_s_leaves: Vec<GpuTensor> = Vec::with_capacity(n_experts);
+        let mut gate_b_leaves: Vec<GpuTensor> = Vec::with_capacity(n_experts);
+        let mut up_s_leaves: Vec<GpuTensor> = Vec::with_capacity(n_experts);
+        let mut up_b_leaves: Vec<GpuTensor> = Vec::with_capacity(n_experts);
+        let mut down_s_leaves: Vec<GpuTensor> = Vec::with_capacity(n_experts);
+        let mut down_b_leaves: Vec<GpuTensor> = Vec::with_capacity(n_experts);
+        // Storage for qdq-output tensors (lives until decoder_layer_on_tape returns).
+        let mut gate_w_t: Vec<GpuTensor> = Vec::with_capacity(n_experts);
+        let mut up_w_t: Vec<GpuTensor> = Vec::with_capacity(n_experts);
+        let mut down_w_t: Vec<GpuTensor> = Vec::with_capacity(n_experts);
+
+        for _e in 0..n_experts {
+            // gate/up: shape [hidden, intermediate] — n=intermediate, k=hidden
+            // → groups = n × (k/group_size) = intermediate × groups_per_gate_up_row
+            let gate_n_groups = intermediate * groups_per_gate_up_row;
+            let s_gate: Vec<f32> = (0..gate_n_groups).map(|_| 0.05 + next().abs() * 0.001).collect();
+            let b_gate: Vec<f32> = (0..gate_n_groups).map(|_| -0.1 + next() * 0.005).collect();
+            let q_int_gate: Vec<u8> = (0..(intermediate * hidden))
+                .map(|i| ((i * 7) % 16) as u8)
+                .collect();
+            let s_gate_leaf = GpuTensor::from_vec(&tape, &s_gate, vec![gate_n_groups]).unwrap();
+            let b_gate_leaf = GpuTensor::from_vec(&tape, &b_gate, vec![gate_n_groups]).unwrap();
+            let gate_qdq = qdq_affine(&s_gate_leaf, &b_gate_leaf, &q_int_gate, group_size).unwrap();
+            let gate_view = view(&gate_qdq, vec![intermediate, hidden]).unwrap();
+            gate_s_leaves.push(s_gate_leaf);
+            gate_b_leaves.push(b_gate_leaf);
+            gate_w_t.push(gate_view);
+
+            let s_up: Vec<f32> = (0..gate_n_groups).map(|_| 0.05 + next().abs() * 0.001).collect();
+            let b_up: Vec<f32> = (0..gate_n_groups).map(|_| -0.1 + next() * 0.005).collect();
+            let q_int_up: Vec<u8> = (0..(intermediate * hidden))
+                .map(|i| ((i * 11) % 16) as u8)
+                .collect();
+            let s_up_leaf = GpuTensor::from_vec(&tape, &s_up, vec![gate_n_groups]).unwrap();
+            let b_up_leaf = GpuTensor::from_vec(&tape, &b_up, vec![gate_n_groups]).unwrap();
+            let up_qdq = qdq_affine(&s_up_leaf, &b_up_leaf, &q_int_up, group_size).unwrap();
+            let up_view = view(&up_qdq, vec![intermediate, hidden]).unwrap();
+            up_s_leaves.push(s_up_leaf);
+            up_b_leaves.push(b_up_leaf);
+            up_w_t.push(up_view);
+
+            // down: shape [intermediate, hidden] — n=hidden, k=intermediate
+            let down_n_groups = hidden * groups_per_down_row;
+            let s_down: Vec<f32> = (0..down_n_groups).map(|_| 0.05 + next().abs() * 0.001).collect();
+            let b_down: Vec<f32> = (0..down_n_groups).map(|_| -0.1 + next() * 0.005).collect();
+            let q_int_down: Vec<u8> = (0..(hidden * intermediate))
+                .map(|i| ((i * 13) % 16) as u8)
+                .collect();
+            let s_down_leaf = GpuTensor::from_vec(&tape, &s_down, vec![down_n_groups]).unwrap();
+            let b_down_leaf = GpuTensor::from_vec(&tape, &b_down, vec![down_n_groups]).unwrap();
+            let down_qdq = qdq_affine(&s_down_leaf, &b_down_leaf, &q_int_down, group_size).unwrap();
+            let down_view = view(&down_qdq, vec![hidden, intermediate]).unwrap();
+            down_s_leaves.push(s_down_leaf);
+            down_b_leaves.push(b_down_leaf);
+            down_w_t.push(down_view);
+        }
+
+        let layer = super::DecoderLayerWeights {
+            w_in: &w_in_t,
+            w_attn: &w_attn_t,
+            w_post: &w_post_t,
+            w_gate: &w_gate_t,
+            gate_projs: &gate_w_t,
+            up_projs: &up_w_t,
+            down_projs: &down_w_t,
+        };
+        let layers = [layer];
+        let out = super::qwen35_moe_forward_on_tape(&tape, &xt, &layers, k, eps)
+            .expect("qwen35_moe_forward_on_tape (qdq-wrapped weights)");
+        assert_eq!(out.shape(), &[n_tokens, hidden]);
+
+        // Ones-seeded backward.
+        let dy_buf = ones_like(&tape, out.shape()).expect("ones_like for dy");
+        let grads = backward(&out, dy_buf).expect("backward");
+
+        // Read grad at a given leaf's node_idx.
+        let read = |t: &GpuTensor| -> Vec<f32> {
+            grads[t.node_idx()]
+                .as_ref()
+                .unwrap_or_else(|| panic!("grad missing at node_idx={}", t.node_idx()))
+                .as_slice::<f32>()
+                .unwrap()
+                .to_vec()
+        };
+
+        // The load-bearing assertion: gradients exist on EVERY (s, b)
+        // leaf for ALL n_experts × {gate, up, down} = 6 (s, b) pairs.
+        for e in 0..n_experts {
+            for (label, leaf) in [
+                (format!("gate_s[expert={e}]"), &gate_s_leaves[e]),
+                (format!("gate_b[expert={e}]"), &gate_b_leaves[e]),
+                (format!("up_s[expert={e}]"),   &up_s_leaves[e]),
+                (format!("up_b[expert={e}]"),   &up_b_leaves[e]),
+                (format!("down_s[expert={e}]"), &down_s_leaves[e]),
+                (format!("down_b[expert={e}]"), &down_b_leaves[e]),
+            ] {
+                let host: Vec<f32> = read(leaf);
+                let max_abs = host.iter().map(|v: &f32| v.abs()).fold(0.0f32, f32::max);
+                assert!(
+                    max_abs.is_finite(),
+                    "{label}: grad max_abs non-finite = {max_abs}"
+                );
+                assert!(
+                    max_abs > 0.0,
+                    "{label}: grad is identically zero — qdq → matmul → \
+                     switch_mlp backward chain is broken at this leaf"
+                );
+            }
+        }
+
+        drop(grads);
+        drop(tape);
+    }
+
     /// ADR-020 iter-11h-e3c — switch_mlp composition forward+backward FD.
     ///
     /// Builds a small frozen-router switch_mlp over E=2 experts, K=2 active
