@@ -154,6 +154,15 @@ Iter 12 → 13 root cause investigation (preserved for future ADR readers):
 - Fix: deterministic flat-distribution ids `(t*17 + s*13 + 7) % n_experts` (matches the proven `tests/test_quantized_matmul_id_mm.rs` pattern), and direct `dispatch_id_mm_for_test` against mv_id reference (already CPU-validated in P1.5) — removes the CPU-quantizer noise floor and isolates the mm_id template body as the only variable. Q4_0 baseline at the same shape went GREEN, falsifying the dequant-bug hypothesis.
 - Lesson: when porting a kernel that depends on a routing-table primitive (map0-produced hids), test fixtures must match the routing primitive's per-bucket capacity OR test against a known-good kernel path at the same shape.
 
+#### Phase 3 — Q4_K dense mm + Q8_0 perm021 [LANDED 2026-05-08 — iter 21]
+
+| Step | Status | Commit | Evidence |
+|------|--------|--------|----------|
+| P3.1 Q4_K dense mm + mm_tensor | DONE | mlx-native 1d8c67d | Block typedef + dequantize_q4_K(_t)<type4x4> template + kernel_mul_mm_q4_K_f32 + kernel_mul_mm_q4_K_tensor_f32 instantiations. Sibling of Phase 2's Q5_K kernels minus the qh high-bit branch. |
+| P3.2 Q8_0 perm021 | DONE | mlx-native 1d8c67d | `kernel_mul_mm_q8_0_tensor_bf16_perm021` template instantiation. Uses existing block_q8_0 + dequantize_q8_0_t. Public dispatcher `quantized_matmul_mm_tensor_perm021` accepts Q8_0 alongside Q4_0 + Q6_K. |
+| P3.3 AC-1 cleared | DONE | mlx-native 1d8c67d | `git grep '"unsupported"' src/ops/quantized_matmul*.rs` returns ONLY F32 \| F16 \| I16 arms (type-not-applicable). The post-ADR matrix in §2.1 is true. |
+| P3.4 Parity tests | DONE | mlx-native 1d8c67d | tests/adr_022_phase3_q4_k_dense_parity.rs — 4/4 GREEN (mv m=1, mv m=4, mm m=64, mm m=32 K=2048). Q8_0 perm021 covered indirectly by the existing ADR-013 P21 attention path tests once it's wired in by ADR-013/015 follow-up. |
+
 #### Phase 2 — Q5_K full coverage [LANDED 2026-05-08 — iter 20]
 
 ##### Phase 2 progress (live)
