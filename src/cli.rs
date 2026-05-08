@@ -602,6 +602,17 @@ pub struct GenerateArgs {
     #[arg(long, default_value = "256")]
     pub max_tokens: usize,
 
+    /// Path to a multimodal projector GGUF (mmproj). When supplied,
+    /// `hf2q generate` validates the GGUF + parses `MmprojConfig` +
+    /// loads the projector weights onto the Metal device, and surfaces
+    /// the file in the load banner (`vision = <path> (sha256 ...)`).
+    /// Image-input wire-up on the CLI (`--image`) is a follow-up; today
+    /// the flag exercises the load path so the banner reports actual
+    /// vision capability instead of "mmproj-required (no mmproj loaded)".
+    /// Mirror of `serve --mmproj`.
+    #[arg(long)]
+    pub mmproj: Option<PathBuf>,
+
     /// Sampling temperature (0.0 = greedy, deterministic).
     ///
     /// Default `0.0` mirrors `--temp 0` in llama-cli's deterministic mode and

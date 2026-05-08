@@ -468,6 +468,7 @@ fn run_two_regime_decode(
             min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: tokens,
+            mmproj: None,
             chat_template: None,
             chat_template_file: None,
             benchmark: false,
