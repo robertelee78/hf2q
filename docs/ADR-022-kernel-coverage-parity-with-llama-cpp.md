@@ -98,7 +98,7 @@ Kernels (×2 types = 14 implementations):
 - 2 `mm_id` template instantiations
 - 2 `mm_id_tensor` template instantiations
 - 2 `mm_tensor_bf16_perm021` template instantiations
-- ~5 `mv_ext_r1_*` template instantiations per type (defer to Phase 4 if appropriate; see Phase 4 note)
+- ~5 `mv_ext_r1_*` template instantiations per type. **Operator standing rule (2026-05-08): no deferrals without explicit approval.** The earlier "defer to Phase 4 if appropriate" wording is hereby retracted; mv_ext lands in Phase 1 alongside the rest of the Q5_1 / IQ4_NL surface.
 
 Block + dequant primitives (shared across 4 metal files):
 - `block_q5_1` typedef: `{ half d; half m; uint qh; uchar qs[16]; }` — 24 B
@@ -133,11 +133,11 @@ Phase 1 exit AC:
 | P1.5 4 mv kernels (Q5_1+IQ4_NL × dense+id) | DONE | 8bfa86e + 469bc11 | tests/adr_022_phase1_{dense_mv,mv_id}_gpu_parity 8/8 |
 | P1.6 mm+mm_tensor+mm_id+mm_id_tensor | DONE | 633abd0 (iter 13) | dense_mm_parity_prefill GREEN max_abs ~1.7e-3; mm_id_parity_prefill_path GREEN max_abs ~2.1e-3 (both tensor + non-tensor variants via env-flip) |
 | P1.6 mm_t_bf16_perm021 | N/A | — | Attention Q@K^T only (ADR-013 P21); no model in scope quantizes attention as Q5_1 / IQ4_NL |
-| P1.7 mul_mv_ext r1 family | PENDING | — | Phase 4 candidate; not on Gemma4 critical path |
-| P1.8 Integration: full-file load + first-32 byte-equal | COHERENCE GREEN @ iter 15 | e866e6c (`hf2q`) | "What is 2+2?" → "2 + 2 = 4<turn\|>" on the original failing file. Prefill 46 tok/s, decode 72.6 tok/s. **Byte-equal vs llama-cli sub-AC**: llama-cli (b9010-d05fe1d7d) emits a "[Start thinking]" reasoning prelude on this abliterated Gemma4-A4B-it model and llama-cli's `-no-cnv` flag is unsupported in this build (operator must use `llama-completion`). Confirmed difference is chat-template / prompt rendering, NOT kernel-level mismatch — both tools dispatch correctly through Q5_1+IQ4_NL+Q6_K+Q8_0+F32 weights. Strict byte-equal deferred to a Phase-1.5 sub-task that compares post-`--dump-rendered-prompt` token streams under matched sampling. |
+| P1.7 mul_mv_ext r1 family | PENDING (in flight) | — | Q5_1 + IQ4_NL across the ~5 mv_ext_r1_* template instantiations llama.cpp ships. Lands in Phase 1. |
+| P1.8 Integration: coherent generation + first-32 byte-equal | COHERENCE GREEN; BYTE-EQUAL PENDING (in flight) | e866e6c (`hf2q`) | "What is 2+2?" → "2 + 2 = 4<turn\|>" on the original failing file. Prefill 46 tok/s, decode 72.6 tok/s. Byte-equal sub-AC: hf2q `--dump-rendered-prompt` + `llama-completion` replaying matched bytes under matched sampling, then assert first-32 token id streams are byte-equal. Lands in Phase 1. |
 | P1.9 F32 weight routing in `dispatch_qmatmul` | DONE | e866e6c | Type-aware routing: `weight.info.ggml_dtype == F32` → `dense_matmul_f32_f32_tensor`; everything else → `quantized_matmul_ggml`. Single match arm, no fallback chain. |
 | P1.10 `find_tokenizer` walk-fallback removed | DONE | e866e6c | Same antipattern as `find_config` walk: silently picked qwen3.6's tokenizer for the Gemma4 GGUF → token-id-mismatched garbage output. Walk over `models/<subdir>/tokenizer.json` removed; resolution is now strict (`--tokenizer` flag → sibling-of-GGUF → fail-loud). |
-| P1.11 GGUF-embedded tokenizer parsing | DEFERRED | — | The Gemma4 file carries `tokenizer.ggml.{tokens,token_type,merges,special_token_ids,...}` in its metadata block; parsing that block in mlx-native + a hf2q adapter would remove the on-disk tokenizer.json requirement entirely (matches llama.cpp's self-bootstrap). Not on Phase-1 critical path. |
+| P1.11 GGUF-embedded tokenizer parsing | PENDING (in flight) | — | The Gemma4 file carries `tokenizer.ggml.{tokens,token_type,merges,special_token_ids,...}` in its metadata block; parsing that block in mlx-native + a hf2q adapter removes the on-disk tokenizer.json requirement entirely (matches llama.cpp's self-bootstrap). Lands in Phase 1. |
 
 Iter 14 root-cause notes (preserved for iter 15 + future readers):
 
