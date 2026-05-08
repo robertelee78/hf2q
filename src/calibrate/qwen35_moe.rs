@@ -1005,6 +1005,291 @@ mod tests {
         // proven (iter-11h-e3a/b/c each have their own FD test).
     }
 
+    /// ADR-020 iter-11h-f-3 — 2-layer stacked decoder composition.
+    ///
+    /// Extends iter-11h-f-2's single decoder layer to TWO stacked
+    /// layers with cross-layer residuals, each carrying its own
+    /// distinct (w_in, w_attn, w_post, w_gate, per-expert weights).
+    ///
+    /// Validates that:
+    ///   1. The full chain compiles + runs forward without GPU
+    ///      buffer/arena races at depth (matmul barrier-fix from
+    ///      iter-11h-e3a-1 holds across stacked switch_mlp calls).
+    ///   2. Gradient flows back through BOTH layers — every leaf
+    ///      tensor receives non-trivial, finite gradient.
+    ///   3. The chain rule reaches the deepest leaf (input X) after
+    ///      passing through `2 ×` rms_norm + matmul + add + rms_norm
+    ///      + moe_route(off-tape) + switch_mlp + add stages.
+    ///
+    /// Per-layer chain (mirrors iter-11h-f-2):
+    /// ```
+    ///   y1_l = rms_norm(x_l, w_in_l)
+    ///   r_l  = matmul(y1_l, w_attn_l)
+    ///   h1_l = x_l + r_l
+    ///   y2_l = rms_norm(h1_l, w_post_l)
+    ///   route = moe_route(y2_l, w_gate_l, k=2)
+    ///   (scores, indices) read off-tape  // frozen-router DWQ
+    ///   mlp = switch_mlp(y2_l, gate_l, up_l, down_l, ids, weights)
+    ///   x_{l+1} = h1_l + mlp
+    /// ```
+    /// loss = sum(x_2)
+    ///
+    /// FD-falsifier deferred (same routing-discontinuity reason as
+    /// f-2; per-OpKind FD already covered by iter-11h-e3a/b/c).
+    #[test]
+    fn iter_11h_f3_two_layer_stacked_decoder_gradient_flow() {
+        use crate::calibrate::autograd_gpu_tape::{
+            add, backward, ones_like, rms_norm, GpuTape,
+        };
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+
+        let n_layers = 2usize;
+        // n_tokens, hidden, intermediate all >=32 — mlx-native dense
+        // f32 matmul kernel + its backward dW kernel both require
+        // k>=32 (one NK=32 tile minimum); the backward dW dispatch
+        // hits m=n_tokens as its k-dim.
+        let n_tokens = 32usize;
+        let hidden = 32usize;
+        let intermediate = 32usize;
+        let n_experts = 4usize;
+        let k = 2usize;
+        let eps = 1e-6f32;
+
+        let input_data: Vec<f32> = (0..(n_tokens * hidden))
+            .map(|i| ((i as f32) * 0.013 - 0.2).sin() * 0.4)
+            .collect();
+        let ones_k_data: Vec<f32> = vec![1.0; k];
+
+        // Per-layer weight fixtures (distinct via per-layer offset).
+        let w_in_per_layer: Vec<Vec<f32>> = (0..n_layers)
+            .map(|l| {
+                (0..hidden)
+                    .map(|i| 1.0 + (i as f32) * 0.01 + (l as f32) * 0.05)
+                    .collect()
+            })
+            .collect();
+        let w_attn_per_layer: Vec<Vec<f32>> = (0..n_layers)
+            .map(|l| {
+                (0..(hidden * hidden))
+                    .map(|i| 0.05 + (i as f32) * 0.0005 + (l as f32) * 0.01)
+                    .collect()
+            })
+            .collect();
+        let w_post_per_layer: Vec<Vec<f32>> = (0..n_layers)
+            .map(|l| {
+                (0..hidden)
+                    .map(|i| 1.0 - (i as f32) * 0.005 + (l as f32) * 0.03)
+                    .collect()
+            })
+            .collect();
+        let w_gate_per_layer: Vec<Vec<f32>> = (0..n_layers)
+            .map(|l| {
+                (0..(hidden * n_experts))
+                    .map(|i| 0.04 + (i as f32) * 0.0004 + (l as f32) * 0.02)
+                    .collect()
+            })
+            .collect();
+
+        // Per-layer × per-expert weights (distinct).
+        let mut gate_per_layer: Vec<Vec<Vec<f32>>> = Vec::with_capacity(n_layers);
+        let mut up_per_layer: Vec<Vec<Vec<f32>>> = Vec::with_capacity(n_layers);
+        let mut down_per_layer: Vec<Vec<Vec<f32>>> = Vec::with_capacity(n_layers);
+        for l in 0..n_layers {
+            let mut gates: Vec<Vec<f32>> = Vec::with_capacity(n_experts);
+            let mut ups: Vec<Vec<f32>> = Vec::with_capacity(n_experts);
+            let mut downs: Vec<Vec<f32>> = Vec::with_capacity(n_experts);
+            for e in 0..n_experts {
+                let off = (e as f32) * 0.07 + (l as f32) * 0.11;
+                gates.push(
+                    (0..(hidden * intermediate))
+                        .map(|i| 0.05 + (i as f32) * 0.0007 + off)
+                        .collect(),
+                );
+                ups.push(
+                    (0..(hidden * intermediate))
+                        .map(|i| 0.04 + (i as f32) * 0.0009 + off)
+                        .collect(),
+                );
+                downs.push(
+                    (0..(intermediate * hidden))
+                        .map(|i| 0.03 + (i as f32) * 0.0011 + off)
+                        .collect(),
+                );
+            }
+            gate_per_layer.push(gates);
+            up_per_layer.push(ups);
+            down_per_layer.push(downs);
+        }
+
+        let tape = GpuTape::new(device.clone());
+
+        // Place all leaf tensors on the tape FIRST so we hold node
+        // indices for backward extraction.
+        let xt = GpuTensor::from_vec(&tape, &input_data, vec![n_tokens, hidden])
+            .unwrap();
+
+        let mut win_per_layer: Vec<GpuTensor> = Vec::with_capacity(n_layers);
+        let mut watn_per_layer: Vec<GpuTensor> = Vec::with_capacity(n_layers);
+        let mut wpst_per_layer: Vec<GpuTensor> = Vec::with_capacity(n_layers);
+        let mut wg_per_layer: Vec<GpuTensor> = Vec::with_capacity(n_layers);
+        let mut gate_t_per_layer: Vec<Vec<GpuTensor>> = Vec::with_capacity(n_layers);
+        let mut up_t_per_layer: Vec<Vec<GpuTensor>> = Vec::with_capacity(n_layers);
+        let mut down_t_per_layer: Vec<Vec<GpuTensor>> = Vec::with_capacity(n_layers);
+
+        for l in 0..n_layers {
+            win_per_layer.push(
+                GpuTensor::from_vec(&tape, &w_in_per_layer[l], vec![hidden]).unwrap(),
+            );
+            watn_per_layer.push(
+                GpuTensor::from_vec(
+                    &tape,
+                    &w_attn_per_layer[l],
+                    vec![hidden, hidden],
+                )
+                .unwrap(),
+            );
+            wpst_per_layer.push(
+                GpuTensor::from_vec(&tape, &w_post_per_layer[l], vec![hidden])
+                    .unwrap(),
+            );
+            wg_per_layer.push(
+                GpuTensor::from_vec(
+                    &tape,
+                    &w_gate_per_layer[l],
+                    vec![hidden, n_experts],
+                )
+                .unwrap(),
+            );
+            let mut gates: Vec<GpuTensor> = Vec::with_capacity(n_experts);
+            let mut ups: Vec<GpuTensor> = Vec::with_capacity(n_experts);
+            let mut downs: Vec<GpuTensor> = Vec::with_capacity(n_experts);
+            for e in 0..n_experts {
+                gates.push(
+                    GpuTensor::from_vec(
+                        &tape,
+                        &gate_per_layer[l][e],
+                        vec![hidden, intermediate],
+                    )
+                    .unwrap(),
+                );
+                ups.push(
+                    GpuTensor::from_vec(
+                        &tape,
+                        &up_per_layer[l][e],
+                        vec![hidden, intermediate],
+                    )
+                    .unwrap(),
+                );
+                downs.push(
+                    GpuTensor::from_vec(
+                        &tape,
+                        &down_per_layer[l][e],
+                        vec![intermediate, hidden],
+                    )
+                    .unwrap(),
+                );
+            }
+            gate_t_per_layer.push(gates);
+            up_t_per_layer.push(ups);
+            down_t_per_layer.push(downs);
+        }
+        let ok = GpuTensor::from_vec(&tape, &ones_k_data, vec![k]).unwrap();
+
+        // Forward chain — stack 2 decoder layers.
+        let mut current = xt.clone();
+        for l in 0..n_layers {
+            let y1 = rms_norm(&current, &win_per_layer[l], eps).unwrap();
+            let r = matmul(&y1, &watn_per_layer[l]).unwrap();
+            let h1 = add(&current, &r).unwrap();
+            let y2 = rms_norm(&h1, &wpst_per_layer[l], eps).unwrap();
+            let route = moe_route(&y2, &wg_per_layer[l], k, false, &ok).unwrap();
+
+            let scores_host: Vec<f32> = route.top_k_scores.to_vec().unwrap();
+            let indices_host: Vec<u32> =
+                route.top_k_indices.as_slice::<u32>().unwrap().to_vec();
+            let expert_ids: Vec<Vec<usize>> = (0..n_tokens)
+                .map(|t| {
+                    (0..k)
+                        .map(|kk| indices_host[t * k + kk] as usize)
+                        .collect()
+                })
+                .collect();
+            let routing_weights: Vec<Vec<f32>> = (0..n_tokens)
+                .map(|t| (0..k).map(|kk| scores_host[t * k + kk]).collect())
+                .collect();
+
+            let mlp_out = super::switch_mlp(
+                &tape,
+                &y2,
+                &gate_t_per_layer[l],
+                &up_t_per_layer[l],
+                &down_t_per_layer[l],
+                &expert_ids,
+                &routing_weights,
+            )
+            .expect("switch_mlp forward");
+            current = add(&h1, &mlp_out).unwrap();
+        }
+        let final_out = current;
+
+        // Loss = sum(final_out).
+        let host = final_out.to_vec().unwrap();
+        let loss = host.iter().map(|v| *v as f64).sum::<f64>() as f32;
+        eprintln!("[iter-11h-f-3] loss={loss:.6}");
+        assert!(loss.is_finite(), "loss non-finite: {loss}");
+
+        // Backward + extract per-leaf gradients.
+        let dy = ones_like(&tape, final_out.shape()).unwrap();
+        let grads = backward(&final_out, dy).unwrap();
+        let read = |idx: usize| -> Vec<f32> {
+            grads[idx]
+                .as_ref()
+                .unwrap()
+                .as_slice::<f32>()
+                .unwrap()
+                .to_vec()
+        };
+
+        // Probe gradient on input X + per-layer leaves to prove the
+        // chain rule reaches BOTH layers.
+        let mut probe: Vec<(String, Vec<f32>)> = Vec::new();
+        probe.push(("input".into(), read(xt.node_idx())));
+        for l in 0..n_layers {
+            probe.push((format!("L{l}_w_in"), read(win_per_layer[l].node_idx())));
+            probe.push((format!("L{l}_w_attn"), read(watn_per_layer[l].node_idx())));
+            probe.push((format!("L{l}_w_post"), read(wpst_per_layer[l].node_idx())));
+            probe.push((
+                format!("L{l}_e0_gate"),
+                read(gate_t_per_layer[l][0].node_idx()),
+            ));
+            probe.push((
+                format!("L{l}_e0_down"),
+                read(down_t_per_layer[l][0].node_idx()),
+            ));
+        }
+
+        for (name, g) in &probe {
+            let max_abs = g.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            eprintln!(
+                "[iter-11h-f-3] {name}: max|grad|={max_abs:.3e}, len={}",
+                g.len()
+            );
+            assert!(
+                max_abs > 1e-7,
+                "{name} gradient collapsed to ~0 (max|grad|={max_abs:.3e}) — \
+                 cross-layer chain rule failed at depth"
+            );
+            for (i, v) in g.iter().enumerate() {
+                assert!(v.is_finite(), "{name} grad[{i}] = {v} not finite");
+            }
+        }
+
+        drop(grads);
+        drop(tape);
+    }
+
     /// ADR-020 iter-11h-e3c — switch_mlp composition forward+backward FD.
     ///
     /// Builds a small frozen-router switch_mlp over E=2 experts, K=2 active
