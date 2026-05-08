@@ -598,6 +598,155 @@ where
                 continue;
             }
         };
+        // ADR-020 AC#5 Iter C2.1 — rank-3 expert-stacked MoE tensors
+        // (`blk.{i}.ffn_gate_exps.weight`, `ffn_up_exps.weight`,
+        // `ffn_down_exps.weight`, fused `ffn_gate_up_exps.weight`) get
+        // per-expert training.  Each expert is sliced out as a rank-2
+        // Linear, trained independently via the synthetic teacher, and
+        // emitted as a separate safetensors triplet keyed by
+        // `blk.{i}.<role_no_exps>.{e}` (matches HF-style per-expert
+        // naming + the parse_dwq_overlay_role MoeExpert stem pattern).
+        if info.shape.len() == 3 && name.contains("_exps.weight") {
+            let n_experts = info.shape[0];
+            let n = info.shape[1];
+            let k = info.shape[2];
+            if n < 32 || k < 32 {
+                skipped.push(DwqLinearSkipped {
+                    name: name.clone(),
+                    reason: format!("MoE expert dim too small (n={n} k={k} need >=32)"),
+                });
+                continue;
+            }
+            if k % cfg.group_size != 0 {
+                skipped.push(DwqLinearSkipped {
+                    name: name.clone(),
+                    reason: format!("MoE expert k={k} not divisible by group_size={}", cfg.group_size),
+                });
+                continue;
+            }
+
+            // Load + dequant rank-3 expert stack as one big F32 buffer.
+            let buf = match gguf.load_tensor_f32(&name, &device) {
+                Ok(b) => b,
+                Err(e) => {
+                    skipped.push(DwqLinearSkipped {
+                        name: name.clone(),
+                        reason: format!("MoE load_tensor_f32 failed: {e}"),
+                    });
+                    continue;
+                }
+            };
+            let w_full: Vec<f32> = match buf.as_slice::<f32>() {
+                Ok(s) => s.to_vec(),
+                Err(e) => {
+                    skipped.push(DwqLinearSkipped {
+                        name: name.clone(),
+                        reason: format!("MoE buffer slice failed: {e}"),
+                    });
+                    continue;
+                }
+            };
+            // Drop the F32 buffer eagerly — we cloned into `w_full` so
+            // the GPU-resident copy is no longer needed for the rest of
+            // this scan.  Saves multi-GB peak RSS on large MoE tensors.
+            drop(buf);
+
+            // Rename stem: strip `_exps.weight` → `<base_role>` (e.g.
+            // `blk.0.ffn_gate_exps` → `blk.0.ffn_gate`,
+            // `blk.0.ffn_gate_up_exps` → `blk.0.ffn_gate_up`).
+            let stem_no_weight = name.strip_suffix(".weight").unwrap_or(&name);
+            let base_stem = stem_no_weight
+                .strip_suffix("_exps")
+                .unwrap_or(stem_no_weight);
+
+            let per_expert_floats = n * k;
+            let mut moe_trained = 0usize;
+            let mut moe_failed = 0usize;
+            for expert in 0..n_experts {
+                if let Some(w) = &watchdog {
+                    if w.is_aborted() {
+                        return Err(anyhow!(
+                            "train_all_linears_dwq: RSS watchdog aborted MoE scan at \
+                             expert {expert}/{n_experts} of {name}"
+                        ));
+                    }
+                }
+                let w_expert: Vec<f32> = w_full
+                    [expert * per_expert_floats..(expert + 1) * per_expert_floats]
+                    .to_vec();
+                let result = match train_linear_dwq_synthetic_teacher(
+                    &device,
+                    &w_expert,
+                    n,
+                    k,
+                    cfg,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        skipped.push(DwqLinearSkipped {
+                            name: format!("{base_stem}.{expert}.weight"),
+                            reason: format!("MoE expert training failed: {e}"),
+                        });
+                        moe_failed += 1;
+                        continue;
+                    }
+                };
+                let bytes = match result.linear.to_safetensors_bytes(float_dtype) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        skipped.push(DwqLinearSkipped {
+                            name: format!("{base_stem}.{expert}.weight"),
+                            reason: format!("MoE to_safetensors_bytes failed: {e}"),
+                        });
+                        moe_failed += 1;
+                        continue;
+                    }
+                };
+
+                let bench: Option<crate::calibrate::dwq_benchmark::PerLinearKlComparison> = if cfg
+                    .compute_bench
+                {
+                    match crate::calibrate::dwq_benchmark::benchmark_dwq_vs_q4_0_kl(
+                        &device,
+                        &w_expert,
+                        n,
+                        k,
+                        &result.linear,
+                        cfg.n_tokens,
+                        cfg.temperature,
+                        cfg.seed,
+                    ) {
+                        Ok(b) => Some(b),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+
+                trained.push(DwqLinearTrained {
+                    name: format!("{base_stem}.{expert}.weight"),
+                    n,
+                    k,
+                    kl_initial: result.kl_initial,
+                    kl_min: result.kl_min,
+                    steps_run: result.steps_run,
+                    bench,
+                });
+                let stem = format!("{base_stem}.{expert}");
+                all_bytes.push((stem, bytes));
+                moe_trained += 1;
+            }
+            tracing::info!(
+                tensor = %name,
+                base_stem = %base_stem,
+                n_experts,
+                trained = moe_trained,
+                failed = moe_failed,
+                "MoE expert tensor processed"
+            );
+            continue;
+        }
+
         if info.shape.len() != 2 {
             skipped.push(DwqLinearSkipped {
                 name: name.clone(),
