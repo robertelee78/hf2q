@@ -1975,12 +1975,15 @@ impl MlxModelWeights {
             let k_packed = k / pack_factor;
             let groups_per_row = k / (gs_per as usize);
 
-            // Pack each expert's q_int → U32 and concatenate.  Each
-            // expert contributes `n * k_packed` u32s.
+            // Pack each expert's q_int → U32 and convert F32 → BF16
+            // for scales/biases (the `quantized_matmul_id` kernel's
+            // native dtype, mirroring mlx-lm's BF16 on-disk convention).
             let stack_words = n_experts * n * k_packed;
             let mut packed_stack: Vec<u32> = vec![0u32; stack_words];
-            let mut scales_stack: Vec<f32> = vec![0.0f32; n_experts * n * groups_per_row];
-            let mut biases_stack: Vec<f32> = vec![0.0f32; n_experts * n * groups_per_row];
+            let mut scales_stack_bf16: Vec<u16> =
+                vec![0u16; n_experts * n * groups_per_row];
+            let mut biases_stack_bf16: Vec<u16> =
+                vec![0u16; n_experts * n * groups_per_row];
             for (e, lin) in &linears {
                 for row in 0..n {
                     for kp in 0..k_packed {
@@ -1994,10 +1997,12 @@ impl MlxModelWeights {
                     }
                 }
                 let s_offset = e * n * groups_per_row;
-                scales_stack[s_offset..s_offset + n * groups_per_row]
-                    .copy_from_slice(&lin.scales);
-                biases_stack[s_offset..s_offset + n * groups_per_row]
-                    .copy_from_slice(&lin.biases);
+                for (i, v) in lin.scales.iter().enumerate() {
+                    scales_stack_bf16[s_offset + i] = half::bf16::from_f32(*v).to_bits();
+                }
+                for (i, v) in lin.biases.iter().enumerate() {
+                    biases_stack_bf16[s_offset + i] = half::bf16::from_f32(*v).to_bits();
+                }
             }
 
             // Allocate GPU buffers + upload.
@@ -2015,27 +2020,27 @@ impl MlxModelWeights {
 
             let mut scales_buf = device
                 .alloc_buffer(
-                    scales_stack.len() * std::mem::size_of::<f32>(),
-                    mlx_native::DType::F32,
+                    scales_stack_bf16.len() * std::mem::size_of::<u16>(),
+                    mlx_native::DType::BF16,
                     vec![n_experts, n, groups_per_row],
                 )
                 .map_err(|e| anyhow::anyhow!("MoE stack scales alloc: {e}"))?;
             scales_buf
-                .as_mut_slice::<f32>()
+                .as_mut_slice::<u16>()
                 .map_err(|e| anyhow::anyhow!("MoE stack scales slice: {e}"))?
-                .copy_from_slice(&scales_stack);
+                .copy_from_slice(&scales_stack_bf16);
 
             let mut biases_buf = device
                 .alloc_buffer(
-                    biases_stack.len() * std::mem::size_of::<f32>(),
-                    mlx_native::DType::F32,
+                    biases_stack_bf16.len() * std::mem::size_of::<u16>(),
+                    mlx_native::DType::BF16,
                     vec![n_experts, n, groups_per_row],
                 )
                 .map_err(|e| anyhow::anyhow!("MoE stack biases alloc: {e}"))?;
             biases_buf
-                .as_mut_slice::<f32>()
+                .as_mut_slice::<u16>()
                 .map_err(|e| anyhow::anyhow!("MoE stack biases slice: {e}"))?
-                .copy_from_slice(&biases_stack);
+                .copy_from_slice(&biases_stack_bf16);
 
             let stack = MlxAffineMoeStack {
                 weight: weight_buf,
