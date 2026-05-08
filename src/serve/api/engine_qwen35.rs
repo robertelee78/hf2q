@@ -211,11 +211,34 @@ impl Qwen35LoadedModel {
             verbosity,
             cfg_preview.num_hidden_layers as usize,
         );
-        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
+        let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
             .context("Qwen35Model::load_from_gguf")?;
         // ADR-018 C3: legacy `tracing::info!("Qwen35 SERVE load: weights loaded ({} layers, variant={:?})", ...)`
         // was deleted here. `emit_tracing(&info)` surfaces both `n_layers`
         // and architecture facts as structured fields.
+
+        // ADR-020 AC#5 Iter C2.4 #3 — DWQ overlay (mlx-affine packed-U32
+        // safetensors) applied after the GGUF load.  Replaces each
+        // trained MoE-expert (gate / up / down) bucket with a stacked
+        // MlxAffineMoeStack that the gpu_ffn.rs MoE dispatch routes
+        // through `mlx_native::quantized_matmul_id_into` (Iter C2.4 #4).
+        if let Some(overlay_path) = opts.dwq_overlay_path.as_ref() {
+            let device = mlx_native::MlxDevice::new()
+                .map_err(|e| anyhow::anyhow!("Qwen35 DWQ overlay device: {e}"))?;
+            let stacked = model
+                .apply_dwq_overlay(&device, overlay_path)
+                .with_context(|| {
+                    format!(
+                        "Qwen35 DWQ overlay from {} failed",
+                        overlay_path.display()
+                    )
+                })?;
+            tracing::info!(
+                count = stacked,
+                path = %overlay_path.display(),
+                "DWQ overlay applied to Qwen35LoadedModel"
+            );
+        }
 
         // ---- Resolve EOS ----
         // Qwen3.5/3.6: `tokenizer.ggml.eos_token_id` is typically 151645

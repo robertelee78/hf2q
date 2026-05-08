@@ -927,7 +927,32 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
 
     // Resolve prompt
     let prompt_text_raw = resolve_prompt(&args)?;
-    let prompt_text = render_chat_template(&gguf, &args, Some(&tokenizer), &prompt_text_raw)?;
+    // mmproj-on-generate (iter-2): when --image is set, prepend the
+    // family placeholder literal so the rendered chat template emits
+    // it inside the user role marker. Mirrors SERVE's
+    // rewrite_messages_for_vision_placeholders_family — without the
+    // placeholder in user content, the chat template emits zero
+    // `<|image|>` markers and expand_image_placeholders fails. Today
+    // generate accepts a single --image; if/when --image becomes
+    // multi-valued, multiple literals are concatenated in CLI order.
+    let prompt_text_with_image_marker = if args.image.is_some() {
+        if let Some(mmproj) = loaded_mmproj.as_ref() {
+            let family = mmproj.arch.vision_family();
+            let placeholder = family
+                .placeholder_token_literal()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "mmproj arch profile {:?} has no placeholder token literal",
+                    mmproj.arch
+                ))?;
+            let (open, close) = family.marker_pair();
+            format!("{open}{placeholder}{close}\n{prompt_text_raw}")
+        } else {
+            prompt_text_raw
+        }
+    } else {
+        prompt_text_raw
+    };
+    let prompt_text = render_chat_template(&gguf, &args, Some(&tokenizer), &prompt_text_with_image_marker)?;
 
     // ADR-005 1bNEW.0c: dump rendered prompt and exit if requested
     if let Some(dump_path) = INVESTIGATION_ENV.dump_rendered_prompt.as_deref() {
