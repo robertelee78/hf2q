@@ -476,6 +476,7 @@ fn alloc_one_f32_placeholder(
 /// that mlx-lm uses).  BF16 scales/biases are the kernel's native
 /// dtype — F32 input from `MlxAffineLinear::scales`/`biases` is cast
 /// at upload time inside `MlxAffineMoeStack::from_per_expert_linears`.
+#[derive(Clone)]
 pub struct MlxAffineMoeStack {
     /// Packed-U32 weight stack `[n_experts, N, K/pack_factor]`.
     pub weight: MlxBuffer,

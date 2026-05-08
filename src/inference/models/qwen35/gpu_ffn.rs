@@ -74,6 +74,107 @@ use mlx_native::ops::quantized_matmul_id_ggml::{
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
+use crate::serve::forward_mlx::MlxAffineMoeStack;
+
+/// ADR-020 AC#5 Iter C2.4 #4 — single-call dispatch wrapper that routes
+/// per-MoE-role expert matmuls between the legacy GGML pooled path
+/// (default) and the new mlx-affine packed-U32 kernel path (active
+/// when a DWQ overlay populated the `expert_*_affine` slot).
+///
+/// On the affine path, calls `mlx_native::quantized_matmul_id_into`
+/// directly (writes into the caller's pre-allocated output buffer; no
+/// scratch arena needed since the affine kernel doesn't use one).
+///
+/// On the legacy path, threads through the existing
+/// `decode_pool::with_id_mm_scratch` pool so the `IdMmScratch`
+/// allocations stay reused across decode steps.
+///
+/// The decision is per-call (not per-layer) so the operator can
+/// produce partial overlays that override only some roles per layer
+/// — e.g. if a DWQ training landed `ffn_gate.{e}` for some layers
+/// but not `ffn_up.{e}`, the up dispatch gracefully falls back to
+/// the legacy GGML buffer for that layer.  The contiguous-experts
+/// guard in `Qwen35Model::apply_dwq_overlay` keeps each role bucket
+/// self-consistent (all-or-nothing per role per layer).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_moe_id_routed(
+    enc: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    legacy_weight: &MlxBuffer,
+    affine: Option<&MlxAffineMoeStack>,
+    ids: &MlxBuffer,
+    output: &mut MlxBuffer,
+    legacy_params: &GgmlQuantizedMatmulIdParams,
+    pool_slot: super::decode_pool::MmIdSlot,
+    pool_n_experts: u32,
+    pool_rows: u32,
+    label: &str,
+) -> anyhow::Result<()> {
+    if let Some(stack) = affine {
+        // Affine path: kernel writes into `output` directly.  M/N/K
+        // come from legacy_params (truth source for shape — the
+        // affine stack carries n/k for shape validation only).
+        debug_assert_eq!(
+            stack.n as u32, legacy_params.n,
+            "{label}: affine stack n ({}) != legacy_params.n ({})",
+            stack.n, legacy_params.n
+        );
+        debug_assert_eq!(
+            stack.k as u32, legacy_params.k,
+            "{label}: affine stack k ({}) != legacy_params.k ({})",
+            stack.k, legacy_params.k
+        );
+        let m = legacy_params.n_tokens;
+        mlx_native::quantized_matmul_id_into(
+            enc,
+            registry,
+            device,
+            input,
+            &stack.weight,
+            &stack.scales,
+            &stack.biases,
+            ids,
+            output,
+            &mlx_native::QuantizedMatmulIdParams {
+                m,
+                k: legacy_params.k,
+                n: legacy_params.n,
+                group_size: stack.group_size,
+                bits: stack.bits,
+                n_expert_used: legacy_params.top_k,
+                num_experts: legacy_params.n_experts,
+            },
+        )
+        .map_err(|e| anyhow!("{label} qmatmul_id_into (affine): {e}"))
+    } else {
+        // Legacy path: pooled scratch + GGML kernel.  Same body as
+        // pre-Iter C2.4 #4 (preserved for byte-identity on non-overlay
+        // serves).
+        super::decode_pool::with_id_mm_scratch(
+            pool_slot,
+            device,
+            pool_n_experts,
+            pool_rows,
+            |scratch| {
+                quantized_matmul_id_ggml_pooled(
+                    enc,
+                    registry,
+                    device,
+                    input,
+                    legacy_weight,
+                    ids,
+                    output,
+                    scratch,
+                    legacy_params,
+                )
+            },
+        )
+        .map_err(|e| anyhow!("{label} qmatmul_id_pooled: {e}"))
+    }
+}
+
 use super::ffn::{DenseFfnShape, DenseFfnWeights, MoeFfnShape, MoeFfnWeights};
 use super::gpu_full_attn::{download_f32, upload_bf16_from_f32, upload_f32};
 use super::weight_loader::DenseFfnWeightsQ;
@@ -252,6 +353,15 @@ pub struct MoeFfnWeightsGpuQ {
     pub shared_up: MlxBuffer,
     /// Shared-expert down_proj: `[hidden_size, shared_intermediate]` F32.
     pub shared_down: MlxBuffer,
+    /// ADR-020 AC#5 Iter C2.4 #4 — DWQ-overlay mlx-affine expert
+    /// stacks (cloned from the originating `MoeFfnWeightsQ` after the
+    /// overlay was applied at load time).  When `Some`, the matching
+    /// `expert_*_q` buffer above stays resident-but-unused; the
+    /// `dispatch_moe_id_routed` helper at the top of this module
+    /// gates on these `Option`s and routes per-role.
+    pub expert_gate_affine: Option<crate::serve::forward_mlx::MlxAffineMoeStack>,
+    pub expert_up_affine: Option<crate::serve::forward_mlx::MlxAffineMoeStack>,
+    pub expert_down_affine: Option<crate::serve::forward_mlx::MlxAffineMoeStack>,
 }
 
 fn ggml_type_stride(t: GgmlType, rows: usize, cols: usize) -> Result<u64> {
@@ -332,7 +442,27 @@ impl MoeFfnWeightsGpuQ {
                 .context("upload shared_up bf16")?,
             shared_down: upload_bf16_from_f32(shared_down_f32, device)
                 .context("upload shared_down bf16")?,
+            expert_gate_affine: None,
+            expert_up_affine: None,
+            expert_down_affine: None,
         })
+    }
+
+    /// ADR-020 AC#5 Iter C2.4 #4 — attach DWQ-overlay affine stacks
+    /// post-construction.  Called from `forward_gpu.rs` immediately
+    /// after `from_quantized` when the originating `MoeFfnWeightsQ`
+    /// has populated `expert_*_affine` slots (from
+    /// `Qwen35Model::apply_dwq_overlay`).  Cheap clone — `MlxBuffer`
+    /// is internally Arc-wrapped (no GPU copy).
+    pub fn attach_affine_overlay(
+        &mut self,
+        gate: Option<&crate::serve::forward_mlx::MlxAffineMoeStack>,
+        up: Option<&crate::serve::forward_mlx::MlxAffineMoeStack>,
+        down: Option<&crate::serve::forward_mlx::MlxAffineMoeStack>,
+    ) {
+        self.expert_gate_affine = gate.cloned();
+        self.expert_up_affine = up.cloned();
+        self.expert_down_affine = down.cloned();
     }
 }
 
@@ -2444,46 +2574,36 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnPhaseCGateUpSharedDown,
             );
-            super::decode_pool::with_id_mm_scratch(
+            dispatch_moe_id_routed(
+                enc,
+                registry,
+                device,
+                x,
+                &weights.expert_gate_q,
+                weights.expert_gate_affine.as_ref(),
+                &ids_buf,
+                &mut gate_all_buf,
+                &gate_params,
                 super::decode_pool::MmIdSlot::Gate,
-                device,
                 ne32,
                 seq_len * shape.num_experts_per_tok,
-                |scratch| {
-                    quantized_matmul_id_ggml_pooled(
-                        enc,
-                        registry,
-                        device,
-                        x,
-                        &weights.expert_gate_q,
-                        &ids_buf,
-                        &mut gate_all_buf,
-                        scratch,
-                        &gate_params,
-                    )
-                },
-            )
-            .map_err(|e| anyhow!("gate_all qmatmul_id_pooled: {e}"))?;
-            super::decode_pool::with_id_mm_scratch(
+                "gate_all",
+            )?;
+            dispatch_moe_id_routed(
+                enc,
+                registry,
+                device,
+                x,
+                &weights.expert_up_q,
+                weights.expert_up_affine.as_ref(),
+                &ids_buf,
+                &mut up_all_buf,
+                &up_params,
                 super::decode_pool::MmIdSlot::Up,
-                device,
                 ne32,
                 seq_len * shape.num_experts_per_tok,
-                |scratch| {
-                    quantized_matmul_id_ggml_pooled(
-                        enc,
-                        registry,
-                        device,
-                        x,
-                        &weights.expert_up_q,
-                        &ids_buf,
-                        &mut up_all_buf,
-                        scratch,
-                        &up_params,
-                    )
-                },
-            )
-            .map_err(|e| anyhow!("up_all qmatmul_id_pooled: {e}"))?;
+                "up_all",
+            )?;
             // ADR-015 iter7b — pooled (q_into path; y_s_buf flows into
             // dispatch_moe_weighted_reduce, no CPU download).
             proj_pooled(
@@ -2566,26 +2686,21 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnPhaseEDown,
             );
-            super::decode_pool::with_id_mm_scratch(
-                super::decode_pool::MmIdSlot::Down,
+            dispatch_moe_id_routed(
+                enc,
+                registry,
                 device,
+                &h_all_buf,
+                &weights.expert_down_q,
+                weights.expert_down_affine.as_ref(),
+                &ids_buf,
+                &mut y_all_buf,
+                &down_params,
+                super::decode_pool::MmIdSlot::Down,
                 ne32,
                 total_rows as u32,
-                |scratch| {
-                    quantized_matmul_id_ggml_pooled(
-                        enc,
-                        registry,
-                        device,
-                        &h_all_buf,
-                        &weights.expert_down_q,
-                        &ids_buf,
-                        &mut y_all_buf,
-                        scratch,
-                        &down_params,
-                    )
-                },
-            )
-            .map_err(|e| anyhow!("y_all qmatmul_id_pooled: {e}"))?;
+                "y_all_decode",
+            )?;
         }
 
         // Barrier E→F: moe_weighted_reduce reads y_all, y_s_buf, sh_logit_buf.
@@ -2845,46 +2960,36 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnPhaseCGateUpSharedDown,
             );
-            super::decode_pool::with_id_mm_scratch(
+            dispatch_moe_id_routed(
+                enc,
+                registry,
+                device,
+                x,
+                &weights.expert_gate_q,
+                weights.expert_gate_affine.as_ref(),
+                &arena.ids_buf,
+                &mut arena.gate_all_buf,
+                &gate_params,
                 super::decode_pool::MmIdSlot::Gate,
-                device,
                 ne32,
                 seq_len * shape.num_experts_per_tok,
-                |scratch| {
-                    quantized_matmul_id_ggml_pooled(
-                        enc,
-                        registry,
-                        device,
-                        x,
-                        &weights.expert_gate_q,
-                        &arena.ids_buf,
-                        &mut arena.gate_all_buf,
-                        scratch,
-                        &gate_params,
-                    )
-                },
-            )
-            .map_err(|e| anyhow!("gate_all qmatmul_id_pooled: {e}"))?;
-            super::decode_pool::with_id_mm_scratch(
+                "gate_all_pf",
+            )?;
+            dispatch_moe_id_routed(
+                enc,
+                registry,
+                device,
+                x,
+                &weights.expert_up_q,
+                weights.expert_up_affine.as_ref(),
+                &arena.ids_buf,
+                &mut arena.up_all_buf,
+                &up_params,
                 super::decode_pool::MmIdSlot::Up,
-                device,
                 ne32,
                 seq_len * shape.num_experts_per_tok,
-                |scratch| {
-                    quantized_matmul_id_ggml_pooled(
-                        enc,
-                        registry,
-                        device,
-                        x,
-                        &weights.expert_up_q,
-                        &arena.ids_buf,
-                        &mut arena.up_all_buf,
-                        scratch,
-                        &up_params,
-                    )
-                },
-            )
-            .map_err(|e| anyhow!("up_all qmatmul_id_pooled: {e}"))?;
+                "up_all_pf",
+            )?;
             proj_pooled(
                 enc,
                 registry,
@@ -2945,26 +3050,21 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnPhaseEDown,
             );
-            super::decode_pool::with_id_mm_scratch(
-                super::decode_pool::MmIdSlot::Down,
+            dispatch_moe_id_routed(
+                enc,
+                registry,
                 device,
+                &arena.h_all_buf,
+                &weights.expert_down_q,
+                weights.expert_down_affine.as_ref(),
+                &arena.ids_buf,
+                &mut arena.y_all_buf,
+                &down_params,
+                super::decode_pool::MmIdSlot::Down,
                 ne32,
                 total_rows as u32,
-                |scratch| {
-                    quantized_matmul_id_ggml_pooled(
-                        enc,
-                        registry,
-                        device,
-                        &arena.h_all_buf,
-                        &weights.expert_down_q,
-                        &arena.ids_buf,
-                        &mut arena.y_all_buf,
-                        scratch,
-                        &down_params,
-                    )
-                },
-            )
-            .map_err(|e| anyhow!("y_all qmatmul_id_pooled: {e}"))?;
+                "y_all_pf",
+            )?;
         }
 
         // Barrier E→F.
@@ -3894,6 +3994,9 @@ mod tests {
             shared_gate: upload_f32(&shared_gate_f32, &device).expect("sh_gate"),
             shared_up: upload_f32(&shared_up_f32, &device).expect("sh_up"),
             shared_down: upload_f32(&shared_down_f32, &device).expect("sh_down"),
+            expert_gate_affine: None,
+            expert_up_affine: None,
+            expert_down_affine: None,
         };
 
         let x_buf = upload_f32(&x_cpu, &device).expect("upload x");
