@@ -475,6 +475,11 @@ landed; Linear-only forward already landed).
        affine vs legacy GGML pool routing in a single function.  All
        6 production call sites refactored (3 decode + 3 prefill,
        gate/up/down each).
+     - **Regression test 2026-05-08**: vanilla qwen35 serve (no
+       overlay) on Qwen 3.6 35B-A3B-APEX with the new helper
+       returned **"2 plus 2 equals 4."** to "What is 2 plus 2?" at
+       1559ms TTFT / 123 t/s decode on M5 Max — confirms the helper
+       indirection is byte-clean on the legacy GGML production path.
      - `MlxAffineMoeStack` derives Clone (cheap — `MlxBuffer` is
        internally Arc-wrapped, no GPU data copy).
      - `MoeFfnWeightsGpuQ` gains `expert_{gate,up,down}_affine` slots
