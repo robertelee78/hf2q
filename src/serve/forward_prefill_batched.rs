@@ -1453,16 +1453,30 @@ impl MlxModelWeights {
                     bucket_finish!(s, exec, t0, &PROFILE_MLP_DN_MM_NS, &PROFILE_MLP_DN_MM_COUNT, 1, "mlp_dn");
                 }
 
-                // MoE gate_up experts: quantized_matmul_id_ggml with n_tokens = seq_len
-                if self.layers[layer_idx].moe.stacked_gate_up.is_none()
-                    || self.layers[layer_idx].moe.stacked_down.is_none()
+                // ADR-020 AC#5 Iter C2.3 — Gemma 4 MoE dispatch route
+                // either through the legacy GGML id-mm pool (default) OR
+                // the mlx-affine quantized_matmul_id_into kernel (when a
+                // DWQ overlay was applied at load time).  The two are
+                // mutually exclusive: overlay populates *_affine slots
+                // and the legacy stacked_* buffers stay resident but
+                // unused for the rest of the model lifetime.
+                let gemma_moe_use_affine =
+                    self.layers[layer_idx].moe.gate_up_affine.is_some()
+                        && self.layers[layer_idx].moe.down_affine.is_some();
+                if !gemma_moe_use_affine
+                    && (self.layers[layer_idx].moe.stacked_gate_up.is_none()
+                        || self.layers[layer_idx].moe.stacked_down.is_none())
                 {
                     anyhow::bail!("batched prefill requires fused MoE _id path at L{layer_idx}");
                 }
                 let ggml_type_gu = self.layers[layer_idx].moe.gate_up_ggml_dtype;
+                let gu_w_buf: &mlx_native::MlxBuffer = if gemma_moe_use_affine {
+                    &self.layers[layer_idx].moe.gate_up_affine.as_ref().unwrap().weight
+                } else {
+                    self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap()
+                };
                 s.barrier_between(
-                    &[&pf_moe_norm_out, &pf_expert_ids,
-                      self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap()],
+                    &[&pf_moe_norm_out, &pf_expert_ids, gu_w_buf],
                     &[&pf_moe_gate_up],
                 );
                 let profile_moe = std::env::var("HF2Q_PROFILE_MOE").is_ok() || profile_buckets_on;
@@ -1472,23 +1486,49 @@ impl MlxModelWeights {
                     s = exec.begin().map_err(|e| anyhow::anyhow!("MoE-profile begin (gu) L{layer_idx}: {e}"))?;
                     Some(t0)
                 } else { None };
-                s.quantized_matmul_id_ggml_pooled(
-                    reg, dev,
-                    &pf_moe_norm_out,
-                    self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
-                    &pf_expert_ids,
-                    &mut pf_moe_gate_up,
-                    &mut pf_moe_mm_scratch,
-                    &mlx_native::GgmlQuantizedMatmulIdParams {
-                        n_tokens: seq_len as u32,
-                        top_k: top_k as u32,
-                        n: (2 * moe_int) as u32,
-                        k: hs as u32,
-                        n_experts: num_experts as u32,
-                        expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
-                        ggml_type: ggml_type_gu,
-                    },
-                ).map_err(|e| anyhow::anyhow!("batched gate_up_id L{layer_idx}: {e}"))?;
+                if gemma_moe_use_affine {
+                    let stack = self.layers[layer_idx].moe.gate_up_affine.as_ref().unwrap();
+                    mlx_native::quantized_matmul_id_into(
+                        s.encoder_mut(),
+                        reg,
+                        dev,
+                        &pf_moe_norm_out,
+                        &stack.weight,
+                        &stack.scales,
+                        &stack.biases,
+                        &pf_expert_ids,
+                        &pf_moe_gate_up,
+                        &mlx_native::QuantizedMatmulIdParams {
+                            m: seq_len as u32,
+                            k: hs as u32,
+                            n: (2 * moe_int) as u32,
+                            group_size: stack.group_size,
+                            bits: stack.bits,
+                            n_expert_used: top_k as u32,
+                            num_experts: num_experts as u32,
+                        },
+                    )
+                    .map_err(|e| anyhow::anyhow!("batched gate_up_id (affine) L{layer_idx}: {e}"))?;
+                    let _ = ggml_type_gu;
+                } else {
+                    s.quantized_matmul_id_ggml_pooled(
+                        reg, dev,
+                        &pf_moe_norm_out,
+                        self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
+                        &pf_expert_ids,
+                        &mut pf_moe_gate_up,
+                        &mut pf_moe_mm_scratch,
+                        &mlx_native::GgmlQuantizedMatmulIdParams {
+                            n_tokens: seq_len as u32,
+                            top_k: top_k as u32,
+                            n: (2 * moe_int) as u32,
+                            k: hs as u32,
+                            n_experts: num_experts as u32,
+                            expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
+                            ggml_type: ggml_type_gu,
+                        },
+                    ).map_err(|e| anyhow::anyhow!("batched gate_up_id L{layer_idx}: {e}"))?;
+                }
                 if let Some(t0) = moe_gu_t0 {
                     bucket_finish!(s, exec, t0, &PROFILE_MOE_GU_NS, &PROFILE_MOE_GU_COUNT, 1, "moe_gu");
                 }
@@ -1514,11 +1554,15 @@ impl MlxModelWeights {
                     bucket_finish!(s, exec, t0, &PROFILE_MOE_POST_NS, &PROFILE_MOE_POST_COUNT, 1, "moe_swiglu");
                 }
 
-                // MoE down experts: quantized_matmul_id_ggml with n_tokens = seq_len*top_k, top_k=1
+                // MoE down experts: same affine vs ggml routing as gate_up.
                 let ggml_type_dn = self.layers[layer_idx].moe.down_ggml_dtype;
+                let dn_w_buf: &mlx_native::MlxBuffer = if gemma_moe_use_affine {
+                    &self.layers[layer_idx].moe.down_affine.as_ref().unwrap().weight
+                } else {
+                    self.layers[layer_idx].moe.stacked_down.as_ref().unwrap()
+                };
                 s.barrier_between(
-                    &[&pf_moe_swiglu, &pf_expert_ids,
-                      self.layers[layer_idx].moe.stacked_down.as_ref().unwrap()],
+                    &[&pf_moe_swiglu, &pf_expert_ids, dn_w_buf],
                     &[&pf_moe_down],
                 );
                 let moe_dn_t0 = if std::env::var("HF2Q_PROFILE_MOE").is_ok() || profile_buckets_on {
@@ -1527,23 +1571,49 @@ impl MlxModelWeights {
                     s = exec.begin().map_err(|e| anyhow::anyhow!("MoE-profile begin (dn) L{layer_idx}: {e}"))?;
                     Some(t0)
                 } else { None };
-                s.quantized_matmul_id_ggml_pooled(
-                    reg, dev,
-                    &pf_moe_swiglu,
-                    self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
-                    &pf_expert_ids,
-                    &mut pf_moe_down,
-                    &mut pf_moe_mm_scratch,
-                    &mlx_native::GgmlQuantizedMatmulIdParams {
-                        n_tokens: (seq_len * top_k) as u32,
-                        top_k: 1,
-                        n: hs as u32,
-                        k: moe_int as u32,
-                        n_experts: num_experts as u32,
-                        expert_stride: self.layers[layer_idx].moe.down_expert_stride,
-                        ggml_type: ggml_type_dn,
-                    },
-                ).map_err(|e| anyhow::anyhow!("batched down_id L{layer_idx}: {e}"))?;
+                if gemma_moe_use_affine {
+                    let stack = self.layers[layer_idx].moe.down_affine.as_ref().unwrap();
+                    mlx_native::quantized_matmul_id_into(
+                        s.encoder_mut(),
+                        reg,
+                        dev,
+                        &pf_moe_swiglu,
+                        &stack.weight,
+                        &stack.scales,
+                        &stack.biases,
+                        &pf_expert_ids,
+                        &pf_moe_down,
+                        &mlx_native::QuantizedMatmulIdParams {
+                            m: (seq_len * top_k) as u32,
+                            k: moe_int as u32,
+                            n: hs as u32,
+                            group_size: stack.group_size,
+                            bits: stack.bits,
+                            n_expert_used: 1,
+                            num_experts: num_experts as u32,
+                        },
+                    )
+                    .map_err(|e| anyhow::anyhow!("batched down_id (affine) L{layer_idx}: {e}"))?;
+                    let _ = ggml_type_dn;
+                } else {
+                    s.quantized_matmul_id_ggml_pooled(
+                        reg, dev,
+                        &pf_moe_swiglu,
+                        self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
+                        &pf_expert_ids,
+                        &mut pf_moe_down,
+                        &mut pf_moe_mm_scratch,
+                        &mlx_native::GgmlQuantizedMatmulIdParams {
+                            n_tokens: (seq_len * top_k) as u32,
+                            top_k: 1,
+                            n: hs as u32,
+                            k: moe_int as u32,
+                            n_experts: num_experts as u32,
+                            expert_stride: self.layers[layer_idx].moe.down_expert_stride,
+                            ggml_type: ggml_type_dn,
+                        },
+                    ).map_err(|e| anyhow::anyhow!("batched down_id L{layer_idx}: {e}"))?;
+                }
                 if let Some(t0) = moe_dn_t0 {
                     bucket_finish!(s, exec, t0, &PROFILE_MOE_DN_NS, &PROFILE_MOE_DN_COUNT, 1, "moe_dn");
                 }
