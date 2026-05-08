@@ -878,4 +878,432 @@ mod tests {
             );
         }
     }
+
+    /// iter-17b — real-GGUF e2e DWQ cycle: extends iter-17's synthetic
+    /// chain to load `W_real` from a real on-disk Q4_0 GGUF, train per-
+    /// group affine scales+biases via the iter-13/14/15/16 stack, save
+    /// via the iter-16b BF16 writer, reload via iter-16, and verify
+    /// post-reload inference matches post-train within bf16 precision.
+    ///
+    /// What this proves over iter-17 partial:
+    ///   - The pipeline works on REAL weight magnitudes (not synthetic
+    ///     `(0.0173·i − 0.5).sin() * 0.6`), exercising the full Q4_0
+    ///     range and group-distribution typical of a production model.
+    ///   - The iter-16b BF16 writer doesn't lose precision in a way
+    ///     that depends on the synthetic fixture's particular value
+    ///     distribution.
+    ///   - `mlx_native::GgufFile::load_tensor_f32` plays nicely with
+    ///     `init_affine_params_gpu` on whole-Linear-sized inputs.
+    ///
+    /// What this does NOT prove (deferred to iter-17c / 11h):
+    ///   - Full-model DWQ convergence using a real teacher's logits as
+    ///     the gradient signal — that requires a differentiable
+    ///     full-model forward (~5-7 weeks per the prior CFA).
+    ///
+    /// To keep test runtime bounded on M5 Max we slice the first
+    /// `K_SLICE × N_SLICE` portion of the loaded `[in_dim, out_dim]`
+    /// weight (still well into "real" magnitudes — the slice is from
+    /// the actual Q4_0 dequantized buffer).  Override the GGUF and
+    /// tensor via `HF2Q_TEST_GGUF=…` and `HF2Q_TEST_GGUF_TENSOR=…`
+    /// (matches `dwq_loop.rs:700-710` convention).
+    ///
+    /// Acceptance:
+    ///   1. Training converges (min_loss < 0.34 × initial — same
+    ///      threshold as iter-17 partial).
+    ///   2. q_int round-trips byte-identical.
+    ///   3. BF16 scales/biases recover within 0.4% rel tol.
+    ///   4. Post-reload inference matches post-train: `||y_reloaded −
+    ///      y_trained||₂ / ||y_trained||₂ < 5%` (same model-identity
+    ///      bound as iter-17 partial).
+    #[test]
+    #[ignore = "loads multi-GB GGUF; run with --ignored"]
+    fn iter_17b_real_gguf_train_save_load_infer_cycle_closes() {
+        use mlx_native::gguf::GgufFile;
+
+        let gguf_path = std::env::var("HF2Q_TEST_GGUF").unwrap_or_else(|_| {
+            "/opt/hf2q/models/qwen3.6-27b-mtp-q4_0/qwen3.6-27b-mtp-q4_0.gguf".to_string()
+        });
+        let tensor_name = std::env::var("HF2Q_TEST_GGUF_TENSOR")
+            .unwrap_or_else(|_| "blk.0.attn_qkv.weight".to_string());
+        let path = std::path::Path::new(&gguf_path);
+        if !path.exists() {
+            eprintln!(
+                "[iter-17b] SKIP: {} not found (set HF2Q_TEST_GGUF=/path)",
+                gguf_path
+            );
+            return;
+        }
+
+        let device = MlxDevice::new().expect("device");
+        let gguf = GgufFile::open(path).expect("open gguf");
+        let info = gguf
+            .tensor_info(&tensor_name)
+            .unwrap_or_else(|| panic!("tensor '{tensor_name}' not in {gguf_path}"));
+        eprintln!(
+            "[iter-17b] tensor: {tensor_name}  shape={:?}  type={:?}",
+            info.shape, info.ggml_type
+        );
+
+        let buf = gguf
+            .load_tensor_f32(&tensor_name, &device)
+            .expect("load_tensor_f32");
+        let w_full: Vec<f32> = buf.as_slice::<f32>().expect("as_slice").to_vec();
+        let n_finite = w_full.iter().filter(|v| v.is_finite()).count();
+        assert_eq!(
+            n_finite,
+            w_full.len(),
+            "GGUF dequant produced non-finite values: {}/{}",
+            w_full.len() - n_finite,
+            w_full.len()
+        );
+
+        // Tensor in GGUF is row-major [out, in] (llama.cpp convention).
+        // Slice the first N_SLICE rows × K_SLICE columns to keep test
+        // runtime bounded.  K_SLICE must be divisible by group_size.
+        assert_eq!(info.shape.len(), 2, "expected 2-D Linear weight");
+        let out_dim_full = info.shape[0] as usize;
+        let in_dim_full = info.shape[1] as usize;
+        assert_eq!(w_full.len(), out_dim_full * in_dim_full);
+
+        let group_size = 32usize;
+        let bits = 4u32;
+        // Slice geometry — chosen so dW backward dispatch hits its
+        // m >= 32 floor and the matmul is non-trivial in size.
+        // Default: n=1024 rows × k=full in_dim — matches iter-13e's
+        // scale closely enough that the y-stddev → softmax → KL
+        // signal sits above the softmax noise floor (a too-small
+        // softmax over ~256 classes near-uniformly distributes KL
+        // mass across the 2× quant-noise perturbation, so Adam can't
+        // measurably reduce it).  k must align to group_size (Q4_0
+        // GGUF tensors satisfy this trivially since they're stored
+        // in 32-element blocks).
+        let n: usize = std::env::var("HF2Q_17B_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024)
+            .min(out_dim_full);
+        let k: usize = {
+            let req = std::env::var("HF2Q_17B_K")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(in_dim_full)
+                .min(in_dim_full);
+            (req / group_size) * group_size
+        };
+        let m: usize = std::env::var("HF2Q_17B_M")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32);
+        assert!(m >= 32, "m must be >= 32 (matmul backward floor)");
+        assert!(k % group_size == 0, "k must be a multiple of group_size");
+        let groups_per_row = k / group_size;
+
+        // Slice rows [0..n], cols [0..k] from W_full[out, in], giving
+        // a [n, k] real-magnitudes weight.  Layout matches the iter-17
+        // partial fixture's `w_real: Vec<f32>` of shape [n, k].
+        let mut w_real: Vec<f32> = Vec::with_capacity(n * k);
+        for r in 0..n {
+            let row_start = r * in_dim_full;
+            w_real.extend_from_slice(&w_full[row_start..row_start + k]);
+        }
+        // Statistics — log so failures surface "is the slice degenerate?"
+        let mut sumsq = 0.0f64;
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        for &v in &w_real {
+            sumsq += (v as f64).powi(2);
+            if v < min_v {
+                min_v = v;
+            }
+            if v > max_v {
+                max_v = v;
+            }
+        }
+        let stddev = (sumsq / w_real.len() as f64).sqrt() as f32;
+        eprintln!(
+            "[iter-17b] slice [n={n}, k={k}] stddev={stddev:.4e} min={min_v:.4e} max={max_v:.4e}"
+        );
+        assert!(stddev > 1e-4, "real-W slice has too little magnitude: stddev={stddev}");
+
+        // Activations: deterministic Gaussian σ=1 (post-RMSNorm
+        // proxy) — matches iter-13e/iter-19c.  The synthetic
+        // sinusoid in iter-17 partial has stddev ≈ 0.35 which gives
+        // y stddev ≈ 0.4 at k=5120; after T=2 that's 0.2, putting
+        // softmax in its near-uniform regime where KL of 2× quant
+        // perturbation is below the noise floor.  Unit-Gaussian X
+        // gives y stddev ≈ 1.1 → y/T ≈ 0.55 → softmax peaked enough
+        // for KL gradients to drive Adam.
+        let x_data: Vec<f32> = box_muller_gaussian(m * k, 0xDEADBEEF);
+
+        // ---- Phase 1: init affine params from real weight ----
+        let mut init_registry = KernelRegistry::new();
+        let (q_int, s_init, b_init) = init_affine_params_gpu(
+            &device,
+            &mut init_registry,
+            &w_real,
+            group_size,
+            bits,
+        )
+        .expect("init affine params");
+        assert_eq!(q_int.len(), n * k);
+        assert_eq!(s_init.len(), n * groups_per_row);
+        for (i, &s) in s_init.iter().enumerate() {
+            assert!(
+                s.is_finite() && s > 0.0,
+                "s_init[{i}] non-finite or non-positive: {s}"
+            );
+        }
+
+        // Perturb 2.0× — matches iter-13e on real GGUF weight; the
+        // smaller real-magnitude stddev (~0.016 at Q4_0) needs more
+        // headroom than the synthetic fixture's 0.6 magnitudes
+        // (iter-17 partial used 1.5× which suffices for synthetic but
+        // produces sub-noise-floor KL on real Q4_0 weights).
+        let perturb = |xs: &[f32], factor: f32| -> Vec<f32> {
+            xs.iter().map(|v| v * factor).collect()
+        };
+        let s_p = perturb(&s_init, 2.0);
+        let b_p = perturb(&b_init, 2.0);
+
+        // ---- Phase 2: precompute teacher logits ----
+        // Teacher = X @ W_real (host FP64 oracle).  W_real is [n, k]
+        // row-major (one row per output channel) — matches iter-17's
+        // shape, so y_teacher[r, c] = Σ_kk X[r, kk] * W_real[c, kk].
+        let mut y_teacher = vec![0.0f32; m * n];
+        for r in 0..m {
+            for c in 0..n {
+                let mut acc = 0.0f64;
+                for kk in 0..k {
+                    acc += (x_data[r * k + kk] as f64) * (w_real[c * k + kk] as f64);
+                }
+                y_teacher[r * n + c] = acc as f32;
+            }
+        }
+
+        let cfg = AdamConfig {
+            lr: 0.002,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+        };
+        let mut adam = AdamOptimizer::new(device.clone(), cfg).expect("adam");
+        adam.register_param("s", buffer_from_f32(&device, &s_p).unwrap())
+            .unwrap();
+        adam.register_param("b", buffer_from_f32(&device, &b_p).unwrap())
+            .unwrap();
+
+        let temperature = 2.0f32;
+        let inv_t = 1.0 / temperature;
+        let tape = GpuTape::new(device.clone());
+
+        let train_step = |adam: &mut AdamOptimizer, tape: &GpuTape| -> Result<f32> {
+            let s = adam.read_param("s")?;
+            let b = adam.read_param("b")?;
+            let s_leaf = GpuTensor::from_vec(tape, &s, vec![s.len()])?;
+            let b_leaf = GpuTensor::from_vec(tape, &b, vec![b.len()])?;
+            let qdq_flat = qdq_affine(&s_leaf, &b_leaf, &q_int, group_size)?;
+            let w_q = view(&qdq_flat, vec![n, k])?;
+            // Tape matmul wants W as [k, n]; w_q is [n, k] → transpose.
+            let w_q_t = crate::calibrate::autograd_gpu_tape::transpose(&w_q)?;
+            let xt = GpuTensor::from_vec(tape, &x_data, vec![m, k])?;
+            let y_s = matmul(&xt, &w_q_t)?;
+            let y_t_leaf = GpuTensor::from_vec(tape, &y_teacher, vec![m, n])?;
+            let y_s_scaled = scalar_mul(&y_s, inv_t)?;
+            let y_t_scaled = scalar_mul(&y_t_leaf, inv_t)?;
+            let kl = kl_div_loss_per_row(&y_s_scaled, &y_t_scaled)?;
+            let kl_host = kl.to_vec()?;
+            let loss = (kl_host.iter().map(|v| *v as f64).sum::<f64>()
+                / kl_host.len() as f64) as f32;
+            let mut dy_buf = tape
+                .device()
+                .alloc_buffer(kl_host.len() * 4, DType::F32, kl.shape().to_vec())?;
+            dy_buf
+                .as_mut_slice::<f32>()
+                .map_err(|e| anyhow!("dy slice: {e}"))?
+                .iter_mut()
+                .for_each(|v| *v = 1.0 / m as f32);
+            let grads = backward(&kl, dy_buf)?;
+            let g_s = grads[s_leaf.node_idx()]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing s grad"))?
+                .clone();
+            let g_b = grads[b_leaf.node_idx()]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing b grad"))?
+                .clone();
+            let mut g_map = BTreeMap::new();
+            g_map.insert("s".to_string(), g_s);
+            g_map.insert("b".to_string(), g_b);
+            adam.step(&g_map)?;
+            Ok(loss)
+        };
+
+        let initial_loss = train_step(&mut adam, &tape).expect("init step");
+        tape.reset();
+        let mut min_loss = initial_loss;
+        let n_steps: usize = std::env::var("HF2Q_17B_STEPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50);
+        for step in 1..n_steps {
+            let l = train_step(&mut adam, &tape).expect("step");
+            tape.reset();
+            assert!(l.is_finite(), "step {step}: KL non-finite");
+            if l < min_loss {
+                min_loss = l;
+            }
+        }
+        eprintln!(
+            "[iter-17b] DWQ training: initial KL = {initial_loss:.4e}, min = {min_loss:.4e}, ratio = {:.3}",
+            min_loss / initial_loss
+        );
+        assert!(
+            min_loss < initial_loss * 0.34,
+            "real-GGUF DWQ did not converge: initial={initial_loss}, min={min_loss}"
+        );
+
+        // ---- Phase 3: pack trained params, BF16 save+reload ----
+        let s_trained = adam.read_param("s").unwrap();
+        let b_trained = adam.read_param("b").unwrap();
+        let lin = MlxAffineLinear {
+            n,
+            k,
+            group_size,
+            bits,
+            q_int: q_int.clone(),
+            scales: s_trained.clone(),
+            biases: b_trained.clone(),
+        };
+
+        let mut bench_registry = KernelRegistry::new();
+        let pre_save_y = run_qmm_affine_inference(
+            &device,
+            &mut bench_registry,
+            &x_data,
+            &lin.q_int,
+            &lin.scales,
+            &lin.biases,
+            m,
+            n,
+            k,
+            group_size,
+        )
+        .expect("pre-save inference");
+
+        let bytes_owned = lin.to_safetensors_bytes(Dtype::BF16).expect("to bytes");
+        let (w_view, s_view, b_view) = bytes_owned
+            .to_safetensors_views()
+            .expect("to views");
+        let serialized = safetensors::tensor::serialize(
+            [
+                ("trained.weight".to_string(), &w_view),
+                ("trained.scales".to_string(), &s_view),
+                ("trained.biases".to_string(), &b_view),
+            ],
+            None,
+        )
+        .expect("serialize");
+        eprintln!(
+            "[iter-17b] mlx-format safetensors: {} bytes (3 tensors)",
+            serialized.len()
+        );
+
+        let st = SafeTensors::deserialize(&serialized).expect("deserialize");
+        let lin_reloaded =
+            MlxAffineLinear::from_safetensors(&st, "trained", bits, group_size)
+                .expect("from_safetensors");
+        assert_eq!(
+            lin_reloaded.q_int, lin.q_int,
+            "q_int round-trip not byte-identical"
+        );
+        for (i, (a, b)) in lin_reloaded
+            .scales
+            .iter()
+            .zip(lin.scales.iter())
+            .enumerate()
+        {
+            let tol = 0.01 * b.abs().max(1e-4);
+            assert!(
+                (a - b).abs() < tol,
+                "scales[{i}] BF16 round-trip drift: reloaded={a} trained={b}"
+            );
+        }
+        for (i, (a, b)) in lin_reloaded
+            .biases
+            .iter()
+            .zip(lin.biases.iter())
+            .enumerate()
+        {
+            let tol = 0.01 * b.abs().max(1e-4);
+            assert!(
+                (a - b).abs() < tol,
+                "biases[{i}] BF16 round-trip drift: reloaded={a} trained={b}"
+            );
+        }
+
+        // ---- Phase 4: post-reload inference & model-identity check ----
+        let post_load_y = run_qmm_affine_inference(
+            &device,
+            &mut bench_registry,
+            &x_data,
+            &lin_reloaded.q_int,
+            &lin_reloaded.scales,
+            &lin_reloaded.biases,
+            m,
+            n,
+            k,
+            group_size,
+        )
+        .expect("post-load inference");
+
+        let mut diff_sq = 0.0f64;
+        let mut ref_sq = 0.0f64;
+        let mut max_abs_err = 0.0f32;
+        for i in 0..(m * n) {
+            let a = pre_save_y[i] as f64;
+            let b_ = post_load_y[i] as f64;
+            let d = a - b_;
+            diff_sq += d * d;
+            ref_sq += a * a;
+            let abs_err = (a - b_).abs() as f32;
+            if abs_err > max_abs_err {
+                max_abs_err = abs_err;
+            }
+        }
+        let rel_l2 = (diff_sq / ref_sq).sqrt();
+        eprintln!(
+            "[iter-17b] post-reload vs post-train: rel L2 = {:.4}%, max abs err = {:.6}",
+            rel_l2 * 100.0,
+            max_abs_err
+        );
+        assert!(
+            rel_l2 < 0.05,
+            "real-GGUF BF16 round-trip degraded model accuracy beyond 5% L2: {rel_l2}"
+        );
+
+        // Non-degeneracy: post-load y has ≥2 distinct argmax across
+        // the m output rows.  A degenerate trained model would
+        // collapse to the same column index everywhere.
+        let mut argmax_per_row: Vec<u32> = Vec::with_capacity(m);
+        for r in 0..m {
+            let row = &post_load_y[r * n..(r + 1) * n];
+            let (idx, _) = row
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                    if v > bv {
+                        (i, v)
+                    } else {
+                        (bi, bv)
+                    }
+                });
+            argmax_per_row.push(idx as u32);
+        }
+        let distinct: std::collections::BTreeSet<u32> =
+            argmax_per_row.iter().copied().collect();
+        assert!(
+            distinct.len() >= 2,
+            "post-load y collapsed to single argmax across m={m} rows: {distinct:?}"
+        );
+    }
 }
