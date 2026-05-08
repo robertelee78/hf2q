@@ -445,6 +445,14 @@ pub struct GenerationResult {
     /// extends to LCP-based partial-prefill resume which can report
     /// any value `0 ≤ cached_tokens ≤ prompt_tokens`.
     pub cached_tokens: usize,
+    /// ADR-020 AC#7 — per-completion-token log-probabilities under the
+    /// model's RAW (pre-temperature/pre-rep-penalty) softmax.  `None`
+    /// when the request did not set `logprobs: true`; otherwise length
+    /// equals `completion_tokens`.  Populated in the decode loop via
+    /// [`crate::serve::sampler_pure::sample_token_with_logprob`].
+    /// Consumed by the response builder to populate
+    /// [`crate::serve::api::schema::ChoiceLogprobs`].
+    pub logprobs: Option<Vec<f32>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1720,6 +1728,7 @@ impl PromptCache {
             prefill_duration: Duration::ZERO,
             decode_duration: Duration::ZERO,
             cached_tokens: prompt_tokens.len(),
+            logprobs: None,
         };
         Some((result, self.fragments.as_ref()))
     }
@@ -4790,6 +4799,7 @@ fn generate_once_with_soft_tokens(
         prefill_duration,
         decode_duration,
         cached_tokens: 0, // iter-96: 0 on cache miss; > 0 on hit (handled by fast-path return earlier)
+        logprobs: None,
     };
 
     // Store this generation in the prompt cache — same eligibility
@@ -7385,6 +7395,7 @@ fn generate_stream_once(
         prefill_duration,
         decode_duration,
         cached_tokens: 0,
+            logprobs: None,
     };
 
     // ADR-005 iter-224 W-A2.2: streaming-origin fragment capture.
@@ -8324,6 +8335,7 @@ assistant:
             prefill_duration: Duration::ZERO,
             decode_duration: Duration::ZERO,
             cached_tokens: 0,
+            logprobs: None,
         };
         cache.store(tokens, params, &result);
         cache
@@ -8732,6 +8744,7 @@ assistant:
             prefill_duration: Duration::ZERO,
             decode_duration: Duration::ZERO,
             cached_tokens: 0,
+            logprobs: None,
         };
 
         let mut cache = PromptCache::new();
@@ -8782,6 +8795,7 @@ assistant:
             prefill_duration: Duration::ZERO,
             decode_duration: Duration::ZERO,
             cached_tokens: 0,
+            logprobs: None,
         };
 
         // Build a fragment vec exercising all three variants and both
@@ -9631,6 +9645,7 @@ mod streaming_prompt_cache_replay_tests {
             prefill_duration: Duration::ZERO,
             decode_duration: Duration::ZERO,
             cached_tokens: 7,
+            logprobs: None,
         }
     }
 
@@ -9771,6 +9786,7 @@ mod streaming_prompt_cache_replay_tests {
             prefill_duration: Duration::ZERO,
             decode_duration: Duration::ZERO,
             cached_tokens: 4,
+            logprobs: None,
         };
 
         let res = replay_cached_streaming_response(
@@ -9844,6 +9860,7 @@ mod streaming_prompt_cache_replay_tests {
             prefill_duration: Duration::ZERO,
             decode_duration: Duration::ZERO,
             cached_tokens: 0,
+            logprobs: None,
         };
         let mut cache = PromptCache::new();
         cache.store(&prompt, &params, &result);
@@ -10018,6 +10035,7 @@ mod streaming_prompt_cache_replay_tests {
             prefill_duration: Duration::ZERO,
             decode_duration: Duration::ZERO,
             cached_tokens: 4,
+            logprobs: None,
         };
 
         let (tx, mut rx) = mpsc::channel(16);
@@ -10201,6 +10219,7 @@ mod streaming_prompt_cache_replay_tests {
             prefill_duration: Duration::ZERO,
             decode_duration: Duration::ZERO,
             cached_tokens: 5,
+            logprobs: None,
         };
 
         let (tx, mut rx) = mpsc::channel(32);
@@ -10302,6 +10321,7 @@ mod streaming_prompt_cache_replay_tests {
             prefill_duration: Duration::ZERO,
             decode_duration: Duration::ZERO,
             cached_tokens: 3,
+            logprobs: None,
         };
 
         let (tx, mut rx) = mpsc::channel(16);
@@ -10391,6 +10411,7 @@ mod streaming_prompt_cache_replay_tests {
             prefill_duration: Duration::ZERO,
             decode_duration: Duration::ZERO,
             cached_tokens: 6,
+            logprobs: None,
         };
 
         let (tx, mut rx) = mpsc::channel(64);
@@ -10682,6 +10703,7 @@ mod streaming_prompt_cache_replay_tests {
             prefill_duration: Duration::ZERO,
             decode_duration: Duration::ZERO,
             cached_tokens: 0,
+            logprobs: None,
         };
         cache.store_with_fragments(&tokens, &params, &result, Some(frags.clone()));
 
@@ -10815,6 +10837,7 @@ mod streaming_prompt_cache_replay_tests {
             prefill_duration: Duration::ZERO,
             decode_duration: Duration::ZERO,
             cached_tokens: 0,
+            logprobs: None,
         };
         cache.store(&tokens, &params, &result);
         // Confirm fragments=None (legacy single-arg store).

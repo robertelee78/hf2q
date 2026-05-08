@@ -1534,6 +1534,7 @@ pub fn generate_qwen35_once(
         prefill_duration,
         decode_duration,
         cached_tokens: if prompt_cache_hit { prompt_len } else { 0 },
+            logprobs: None,
     })
 }
 
@@ -1732,6 +1733,7 @@ pub fn generate_qwen35_once_with_soft_tokens(
         // No prompt-cache fast-path on the soft-tokens path; cached
         // tokens count is always 0 for vision-augmented requests.
         cached_tokens: 0,
+            logprobs: None,
     })
 }
 
@@ -1967,6 +1969,7 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
         prefill_duration,
         decode_duration,
         cached_tokens: 0,
+            logprobs: None,
     })
 }
 

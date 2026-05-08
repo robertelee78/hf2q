@@ -486,6 +486,7 @@ pub fn generate_qwen3vl_text_once(
         decode_duration,
         // iter-9b has no prompt cache wired; cached_tokens is always 0.
         cached_tokens: 0,
+            logprobs: None,
     })
 }
 
@@ -670,5 +671,6 @@ pub fn generate_qwen3vl_text_with_soft_tokens_once(
         prefill_duration,
         decode_duration,
         cached_tokens: 0,
+            logprobs: None,
     })
 }
