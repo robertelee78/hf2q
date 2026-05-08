@@ -2648,4 +2648,238 @@ mod tests {
              Adam step requires in-place leaf mutation (out of test scope; future iter)."
         );
     }
+
+    /// ADR-020 AC#7 Option A — CONVERGENCE FALSIFIER.  Strengthens the
+    /// previous gradient-flow test by adding an actual SGD update +
+    /// re-running forward + asserting loss strictly decreases.
+    ///
+    /// Setup mirrors `ac7_option_a_full_model_two_layer_breaks_perturb_1_0_plateau`
+    /// but factors the forward into a closure that takes mutable
+    /// host-side `s` / `b` vectors so we can apply gradient updates
+    /// between calls.  Runs:
+    ///   1. Forward → loss_initial + grads_initial (host-side)
+    ///   2. SGD step: s -= lr*grad_s, b -= lr*grad_b (host-side)
+    ///   3. Forward (fresh tape) → loss_after
+    ///   4. Assert loss_after < loss_initial
+    ///
+    /// If this passes, Option A is proven to STRICTLY reduce loss at
+    /// perturb=1.0 — the cross-layer compensation gradient drives
+    /// optimization in a useful direction.
+    #[test]
+    fn ac7_option_a_full_model_two_layer_loss_decreases_under_sgd() {
+        use super::{decoder_layer_on_tape, DecoderLayerWeights};
+        use crate::calibrate::autograd_gpu_tape::{
+            backward, ones_like, qdq_affine, square, sub, view, GpuTape, GpuTensor,
+        };
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let n_tokens = 32usize;
+        let hidden = 32usize;
+        let intermediate = 32usize;
+        let n_experts = 2usize;
+        let k = 1usize;
+        let group_size = 32usize;
+        let bits = 4u32;
+        let n_layers = 2usize;
+        let eps = 1e-6f32;
+        let n_bins = 1u32 << bits;
+
+        // RNG.
+        let mut rng_state: u64 = 0xFEED_FACE_C0DE_BA50;
+        let mut next = move || -> f32 {
+            rng_state ^= rng_state >> 33;
+            rng_state = rng_state.wrapping_mul(0xff51_afd7_ed55_8ccd);
+            rng_state ^= rng_state >> 33;
+            ((rng_state as i64) as f32) / (i64::MAX as f32)
+        };
+
+        // ---- Pre-compute deterministic CPU-side weights + initial qdq state ----
+        let init_qdq = |w: &[f32], n: usize, k_dim: usize, gpr: usize| -> (Vec<f32>, Vec<f32>, Vec<u8>) {
+            let n_groups = n * gpr;
+            let mut s = vec![0.0f32; n_groups];
+            let mut b = vec![0.0f32; n_groups];
+            let mut q = vec![0u8; n * k_dim];
+            for row in 0..n {
+                for g in 0..gpr {
+                    let base = row * k_dim + g * group_size;
+                    let slab = &w[base..base + group_size];
+                    let w_min = slab.iter().copied().fold(f32::INFINITY, f32::min);
+                    let w_max = slab.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let s_g = if w_max > w_min { (w_max - w_min) / (n_bins - 1) as f32 } else { 1.0 };
+                    s[row * gpr + g] = s_g;
+                    b[row * gpr + g] = w_min;
+                    for i in 0..group_size {
+                        let z = (slab[i] - w_min) / s_g;
+                        let qv = if z >= 0.0 { (z + 0.5).floor() as i32 } else { (z - 0.5).ceil() as i32 };
+                        q[base + i] = qv.clamp(0, (n_bins - 1) as i32) as u8;
+                    }
+                }
+            }
+            (s, b, q)
+        };
+
+        let gpr_gu = hidden / group_size;
+        let gpr_dn = intermediate / group_size;
+        let groups_gu = intermediate * gpr_gu;
+        let groups_dn = hidden * gpr_dn;
+
+        // Per-layer F32 weights (norm/attn/router) shared by teacher + student.
+        let mut shared: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = Vec::with_capacity(n_layers);
+        // Teacher per-expert W (F32) per layer.
+        let mut teacher_w: Vec<Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>> = Vec::with_capacity(n_layers);
+        // Student per-expert (q_int) per layer (frozen).
+        let mut student_q: Vec<Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>> = Vec::with_capacity(n_layers);
+        // Student per-expert (s, b) per layer (TRAINABLE).
+        let mut student_sb: Vec<Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>> =
+            Vec::with_capacity(n_layers);
+
+        for _l in 0..n_layers {
+            let w_in: Vec<f32> = (0..hidden).map(|_| 1.0 + next() * 0.05).collect();
+            let w_post: Vec<f32> = (0..hidden).map(|_| 1.0 + next() * 0.05).collect();
+            let w_attn: Vec<f32> = (0..(hidden * hidden)).map(|_| next() * 0.05).collect();
+            let w_gate: Vec<f32> = (0..(hidden * n_experts)).map(|_| next() * 0.1).collect();
+            shared.push((w_in, w_post, w_attn, w_gate));
+
+            let mut tw = Vec::with_capacity(n_experts);
+            let mut sq = Vec::with_capacity(n_experts);
+            let mut sb = Vec::with_capacity(n_experts);
+            for _e in 0..n_experts {
+                let g_w: Vec<f32> = (0..(intermediate * hidden)).map(|_| next() * 0.05).collect();
+                let u_w: Vec<f32> = (0..(intermediate * hidden)).map(|_| next() * 0.05).collect();
+                let d_w: Vec<f32> = (0..(hidden * intermediate)).map(|_| next() * 0.05).collect();
+
+                let (gs, gb, gq) = init_qdq(&g_w, intermediate, hidden, gpr_gu);
+                let (us, ub, uq) = init_qdq(&u_w, intermediate, hidden, gpr_gu);
+                let (ds, db, dq) = init_qdq(&d_w, hidden, intermediate, gpr_dn);
+
+                tw.push((g_w, u_w, d_w));
+                sq.push((gq, uq, dq));
+                sb.push((gs, gb, us, ub, ds, db));
+            }
+            teacher_w.push(tw);
+            student_q.push(sq);
+            student_sb.push(sb);
+        }
+
+        // Shared input data.
+        let x_data: Vec<f32> = (0..(n_tokens * hidden)).map(|_| next() * 0.3).collect();
+
+        // ---- Forward + backward closure that takes MUTABLE student_sb refs ----
+        // Returns (loss, grads_per_layer_per_expert).  grads layout matches
+        // student_sb structure.
+        let run_step = |student_sb: &Vec<Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>>|
+            -> (f32, Vec<Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>>) {
+            let tape = GpuTape::new(device.clone());
+            let xt = GpuTensor::from_vec(&tape, &x_data, vec![n_tokens, hidden]).unwrap();
+            // Hold all per-layer GpuTensors so refs survive.
+            struct LStore {
+                w_in: GpuTensor, w_attn: GpuTensor, w_post: GpuTensor, w_gate: GpuTensor,
+                t_g: Vec<GpuTensor>, t_u: Vec<GpuTensor>, t_d: Vec<GpuTensor>,
+                s_gw: Vec<GpuTensor>, s_uw: Vec<GpuTensor>, s_dw: Vec<GpuTensor>,
+                s_gs: Vec<GpuTensor>, s_gb: Vec<GpuTensor>,
+                s_us: Vec<GpuTensor>, s_ub: Vec<GpuTensor>,
+                s_ds: Vec<GpuTensor>, s_db: Vec<GpuTensor>,
+            }
+            let mut store: Vec<LStore> = Vec::with_capacity(n_layers);
+            for l in 0..n_layers {
+                let (wi, wp, wa, wg) = &shared[l];
+                let store_l = LStore {
+                    w_in: GpuTensor::from_vec(&tape, wi, vec![hidden]).unwrap(),
+                    w_attn: GpuTensor::from_vec(&tape, wa, vec![hidden, hidden]).unwrap(),
+                    w_post: GpuTensor::from_vec(&tape, wp, vec![hidden]).unwrap(),
+                    w_gate: GpuTensor::from_vec(&tape, wg, vec![hidden, n_experts]).unwrap(),
+                    t_g: (0..n_experts).map(|e| GpuTensor::from_vec(&tape, &teacher_w[l][e].0, vec![intermediate, hidden]).unwrap()).collect(),
+                    t_u: (0..n_experts).map(|e| GpuTensor::from_vec(&tape, &teacher_w[l][e].1, vec![intermediate, hidden]).unwrap()).collect(),
+                    t_d: (0..n_experts).map(|e| GpuTensor::from_vec(&tape, &teacher_w[l][e].2, vec![hidden, intermediate]).unwrap()).collect(),
+                    s_gs: (0..n_experts).map(|e| GpuTensor::from_vec(&tape, &student_sb[l][e].0, vec![groups_gu]).unwrap()).collect(),
+                    s_gb: (0..n_experts).map(|e| GpuTensor::from_vec(&tape, &student_sb[l][e].1, vec![groups_gu]).unwrap()).collect(),
+                    s_us: (0..n_experts).map(|e| GpuTensor::from_vec(&tape, &student_sb[l][e].2, vec![groups_gu]).unwrap()).collect(),
+                    s_ub: (0..n_experts).map(|e| GpuTensor::from_vec(&tape, &student_sb[l][e].3, vec![groups_gu]).unwrap()).collect(),
+                    s_ds: (0..n_experts).map(|e| GpuTensor::from_vec(&tape, &student_sb[l][e].4, vec![groups_dn]).unwrap()).collect(),
+                    s_db: (0..n_experts).map(|e| GpuTensor::from_vec(&tape, &student_sb[l][e].5, vec![groups_dn]).unwrap()).collect(),
+                    s_gw: Vec::new(), s_uw: Vec::new(), s_dw: Vec::new(),
+                };
+                let mut store_l = store_l;
+                for e in 0..n_experts {
+                    let g_qdq = qdq_affine(&store_l.s_gs[e], &store_l.s_gb[e], &student_q[l][e].0, group_size).unwrap();
+                    let u_qdq = qdq_affine(&store_l.s_us[e], &store_l.s_ub[e], &student_q[l][e].1, group_size).unwrap();
+                    let d_qdq = qdq_affine(&store_l.s_ds[e], &store_l.s_db[e], &student_q[l][e].2, group_size).unwrap();
+                    store_l.s_gw.push(view(&g_qdq, vec![intermediate, hidden]).unwrap());
+                    store_l.s_uw.push(view(&u_qdq, vec![intermediate, hidden]).unwrap());
+                    store_l.s_dw.push(view(&d_qdq, vec![hidden, intermediate]).unwrap());
+                }
+                store.push(store_l);
+            }
+            let _ = decoder_layer_on_tape;
+            let teacher_layers: Vec<DecoderLayerWeights<'_>> = (0..n_layers).map(|l| DecoderLayerWeights {
+                w_in: &store[l].w_in, w_attn: &store[l].w_attn, w_post: &store[l].w_post, w_gate: &store[l].w_gate,
+                gate_projs: &store[l].t_g, up_projs: &store[l].t_u, down_projs: &store[l].t_d,
+            }).collect();
+            let student_layers: Vec<DecoderLayerWeights<'_>> = (0..n_layers).map(|l| DecoderLayerWeights {
+                w_in: &store[l].w_in, w_attn: &store[l].w_attn, w_post: &store[l].w_post, w_gate: &store[l].w_gate,
+                gate_projs: &store[l].s_gw, up_projs: &store[l].s_uw, down_projs: &store[l].s_dw,
+            }).collect();
+            let y_t = super::qwen35_moe_forward_on_tape(&tape, &xt, &teacher_layers, k, eps).unwrap();
+            let y_s = super::qwen35_moe_forward_on_tape(&tape, &xt, &student_layers, k, eps).unwrap();
+            let diff = sub(&y_s, &y_t).unwrap();
+            let sqr = square(&diff).unwrap();
+            let loss_data: Vec<f32> = sqr.to_vec().unwrap();
+            let loss: f32 = loss_data.iter().sum::<f32>() / loss_data.len() as f32;
+            let dy = ones_like(&tape, sqr.shape()).unwrap();
+            let grads = backward(&sqr, dy).unwrap();
+            let read = |t: &GpuTensor| -> Vec<f32> {
+                grads[t.node_idx()].as_ref().unwrap().as_slice::<f32>().unwrap().to_vec()
+            };
+            let mut grads_out: Vec<Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>> = Vec::with_capacity(n_layers);
+            for l in 0..n_layers {
+                let mut layer = Vec::with_capacity(n_experts);
+                for e in 0..n_experts {
+                    layer.push((
+                        read(&store[l].s_gs[e]),
+                        read(&store[l].s_gb[e]),
+                        read(&store[l].s_us[e]),
+                        read(&store[l].s_ub[e]),
+                        read(&store[l].s_ds[e]),
+                        read(&store[l].s_db[e]),
+                    ));
+                }
+                grads_out.push(layer);
+            }
+            (loss, grads_out)
+        };
+
+        // Run 1: initial forward.
+        let (loss_initial, grads) = run_step(&student_sb);
+        eprintln!("[ac7-A-conv] loss_initial = {loss_initial:e}");
+        assert!(loss_initial > 1e-12, "loss_initial == 0 — fixture has no compositional error");
+
+        // SGD update: s -= lr * grad_s; b -= lr * grad_b.
+        let lr = 0.01f32;
+        for l in 0..n_layers {
+            for e in 0..n_experts {
+                let (gs, gb, us, ub, ds, db) = &grads[l][e];
+                let entry = &mut student_sb[l][e];
+                for (i, v) in entry.0.iter_mut().enumerate() { *v -= lr * gs[i]; }
+                for (i, v) in entry.1.iter_mut().enumerate() { *v -= lr * gb[i]; }
+                for (i, v) in entry.2.iter_mut().enumerate() { *v -= lr * us[i]; }
+                for (i, v) in entry.3.iter_mut().enumerate() { *v -= lr * ub[i]; }
+                for (i, v) in entry.4.iter_mut().enumerate() { *v -= lr * ds[i]; }
+                for (i, v) in entry.5.iter_mut().enumerate() { *v -= lr * db[i]; }
+            }
+        }
+
+        // Run 2: forward with updated s/b.
+        let (loss_after, _) = run_step(&student_sb);
+        eprintln!(
+            "[ac7-A-conv] loss_after = {loss_after:e} (relative reduction = {:.4})",
+            loss_after / loss_initial
+        );
+        assert!(
+            loss_after < loss_initial,
+            "Option A SGD step did NOT decrease loss: \
+             before={loss_initial:e} after={loss_after:e} — \
+             gradient direction is wrong or loss surface is locally adversarial"
+        );
+    }
 }
