@@ -228,10 +228,10 @@ fn safetensors_directory_emit_f16() {
 }
 
 // ---------------------------------------------------------------------
-// Test 2 — directory emit, dwq-4-6 (companion scales/biases triples)
+// Test 2 — directory emit, dynamic-quant-4-6 (companion scales/biases triples)
 // ---------------------------------------------------------------------
 
-/// `--quant dwq-4-6 --format safetensors` produces:
+/// `--quant dynamic-quant-4-6 --format safetensors` produces:
 ///   - `model.safetensors` (single shard — fixture is well under 5 GB)
 ///   - `quantization_config.json` (legacy hf2q sidecar — Chesterton)
 ///   - `config.json` (mlx-lm-style injection: top-level `quantization`
@@ -256,7 +256,7 @@ fn safetensors_directory_emit_dwq46() {
     run_convert_with_env(
         &input_dir,
         &output_dir,
-        "dwq-4-6",
+        "dynamic-quant-4-6",
         &[("HF2Q_USE_LEGACY_DWQ_Q4_0", "1")],
     );
 
@@ -417,7 +417,7 @@ fn safetensors_directory_round_trips_through_safetensors_reader() {
     let output_dir = tmp.path().join("out_dwq_rt");
     build_synthetic_gemma4_fixture(&input_dir);
 
-    run_convert(&input_dir, &output_dir, "dwq-4-6");
+    run_convert(&input_dir, &output_dir, "dynamic-quant-4-6");
 
     let st_path = output_dir.join("model.safetensors");
     let bytes = fs::read(&st_path).unwrap();
@@ -541,7 +541,7 @@ fn safetensors_directory_loads_in_mlx_lm() {
     let output_dir = tmp.path().join("out_mlx_lm");
     build_synthetic_gemma4_fixture(&input_dir);
 
-    run_convert(&input_dir, &output_dir, "dwq-4-6");
+    run_convert(&input_dir, &output_dir, "dynamic-quant-4-6");
 
     // P10 iter-1 wiring: route through `tests/common/mlx_lm_runner.rs`
     // so the missing-binary contract is honoured (Decision 21 — no
@@ -588,7 +588,7 @@ fn safetensors_dwq46_cosine_similarity_above_99_9_percent() {
     let output_dir = tmp.path().join("out_cosine");
     build_synthetic_gemma4_fixture(&input_dir);
 
-    run_convert(&input_dir, &output_dir, "dwq-4-6");
+    run_convert(&input_dir, &output_dir, "dynamic-quant-4-6");
 
     // P10 iter-1 wiring: the reference DWQ is materialised by the
     // operator (P11 swaps in real qwen3.6 reference DWQ artefacts);

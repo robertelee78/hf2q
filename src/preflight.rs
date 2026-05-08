@@ -458,10 +458,10 @@ fn estimate_output_size(metadata: &ModelMetadata, quant: &QuantMethod, bits: Opt
         // imatrix-adaptive — per-tensor optimal precision (Q4_K base
         // with _M upgrades on token_embd / output / select layers).
         QuantMethod::ImatrixAdaptive => 5.0,
-        QuantMethod::Dwq46
-        | QuantMethod::Dwq48
-        | QuantMethod::Dwq68
-        | QuantMethod::Dwq28 => 5.0 * 1.1,
+        QuantMethod::DynamicQuant46
+        | QuantMethod::DynamicQuant48
+        | QuantMethod::DynamicQuant68
+        | QuantMethod::DynamicQuant28 => 5.0 * 1.1,
         QuantMethod::Auto => 4.0 * 1.1, // Conservative estimate
     };
 

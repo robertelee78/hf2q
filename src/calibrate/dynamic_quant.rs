@@ -20,7 +20,7 @@
 //!
 //! mlx-lm's algorithm is **per-quantizable-leaf** (Linear + Embedding) —
 //! each tensor gets its own scalar score and its own bit allocation.
-//! hf2q's legacy `dwq-4-6/4-8` is per-LAYER (one score per transformer
+//! hf2q's legacy `dynamic-quant-4-6/4-8` is per-LAYER (one score per transformer
 //! block, applied to all attention + FFN linears in that block).  This
 //! module operates at the per-tensor granularity to match mlx-lm; the
 //! existing per-layer dispatcher at `src/quantize/{mixed,layer_mix}.rs`

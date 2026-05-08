@@ -248,7 +248,7 @@ fn lookup_imatrix_weights<'a>(
         CalibrationData::ImatrixWithStats(map) => {
             map.get(tensor_name).map(|s| s.values.as_slice())
         }
-        CalibrationData::Dwq(_) => None,
+        CalibrationData::DynamicQuant(_) => None,
     }
 }
 
@@ -275,7 +275,7 @@ pub fn quantize_row_to_bytes(
     calibration: &CalibrationData,
     tensor_name: &str,
 ) -> Result<Vec<u8>, KQuantCodecError> {
-    if let CalibrationData::Dwq(_) = calibration {
+    if let CalibrationData::DynamicQuant(_) = calibration {
         return Err(KQuantCodecError::DwqAtRowQuantize {
             tensor: tensor_name.to_string(),
         });
@@ -628,7 +628,7 @@ mod tests {
         let row = smooth_ramp(QK_K);
         let mut dwq_map = HashMap::new();
         dwq_map.insert("blk.0.attn_q.weight".to_string(), vec![0.5_f32]);
-        let calib = CalibrationData::Dwq(dwq_map);
+        let calib = CalibrationData::DynamicQuant(dwq_map);
 
         let err = quantize_row_to_bytes(
             &row,
@@ -822,7 +822,7 @@ mod tests {
         let row = vec![0.5_f32; 32];
         let mut dwq_map = HashMap::new();
         dwq_map.insert("blk.0.x.weight".to_string(), vec![0.7_f32]);
-        let calib = CalibrationData::Dwq(dwq_map);
+        let calib = CalibrationData::DynamicQuant(dwq_map);
 
         for target in [
             KQuantTarget::Q4Legacy,

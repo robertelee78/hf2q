@@ -7,7 +7,7 @@
 //! ## Why this crate exists
 //!
 //! Iter C wires `DwqKQuantizer` (Iter B's deliverable) into
-//! `cmd_convert`'s Dwq46/48/68/28 dispatch arm — production
+//! `cmd_convert`'s DynamicQuant46/48/68/28 dispatch arm — production
 //! `--quant dwq46/48/68/28` now emits Q4_K_M-family GGUFs by default.
 //! These tests close the loop by driving the CLI end-to-end (matching
 //! the Iter A precedent at `tests/codec_direct_type_code.rs`), so a
@@ -18,19 +18,19 @@
 //!
 //! ## Coverage
 //!
-//! * `dwq46_emits_q4_k_m_gguf_via_cli` — `--quant dwq-4-6` against a
+//! * `dwq46_emits_q4_k_m_gguf_via_cli` — `--quant dynamic-quant-4-6` against a
 //!   block-aligned `LlamaForCausalLM` fixture; assert at least one
 //!   tensor reports `GGML_TYPE_Q4_K` (12), NOT `GGML_TYPE_Q4_0` (2).
-//! * `dwq48_emits_q4_k_base_with_q8_0_sensitive` — `--quant dwq-4-8`
+//! * `dwq48_emits_q4_k_base_with_q8_0_sensitive` — `--quant dynamic-quant-4-8`
 //!   with a sensitive layer marked via `--sensitive-layers`; assert the
 //!   base tensor is Q4_K AND the sensitive tensor is Q8_0.  Both type
 //!   codes must coexist in the same GGUF — locks the per-tensor
 //!   dispatch policy at the byte-on-disk layer.
-//! * `dwq68_emits_q6_k_base_via_cli` — `--quant dwq-6-8`; assert at
+//! * `dwq68_emits_q6_k_base_via_cli` — `--quant dynamic-quant-6-8`; assert at
 //!   least one tensor is `GGML_TYPE_Q6_K` (14).  Locks the Q6_K base
 //!   leg of `DwqKVariant::P68` end-to-end.
 //! * `legacy_q4_0_dwq_path_still_available_via_env_var` —
-//!   `HF2Q_USE_LEGACY_DWQ_Q4_0=1 hf2q convert --quant dwq-4-6`; assert
+//!   `HF2Q_USE_LEGACY_DWQ_Q4_0=1 hf2q convert --quant dynamic-quant-4-6`; assert
 //!   tensors are Q4_0 (the OLD format) — proves the escape hatch works
 //!   and the legacy path is genuinely byte-distinct from the new one.
 //!
@@ -81,7 +81,7 @@ fn setup_dwq_fixture(dir: &Path) {
     )
     .unwrap();
     // Minimal tokenizer.json — DwqArch::Other path doesn't open it for
-    // dwq-4-6/4-8/6-8 (qwen35 is the only arch that requires the
+    // dynamic-quant-4-6/4-8/6-8 (qwen35 is the only arch that requires the
     // tokenizer for capture-spec construction).
     fs::write(dir.join("tokenizer.json"), "{}").unwrap();
     fs::write(dir.join("tokenizer_config.json"), "{}").unwrap();
@@ -183,10 +183,10 @@ fn dump_types(table: &[(String, GgmlType)]) -> String {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// T1 — `--quant dwq-4-6` emits Q4_K_M-family GGUFs (NOT Q4_0)
+// T1 — `--quant dynamic-quant-4-6` emits Q4_K_M-family GGUFs (NOT Q4_0)
 // ────────────────────────────────────────────────────────────────────
 
-/// Iter C lock: `--quant dwq-4-6` must produce a GGUF whose at-least-
+/// Iter C lock: `--quant dynamic-quant-4-6` must produce a GGUF whose at-least-
 /// one weight tensor reports `GGML_TYPE_Q4_K = 12`.  Pre-Iter C, the
 /// same command emitted `GGML_TYPE_Q4_0 = 2` for every weight (the
 /// legacy `MixedBitQuantizer` + `StaticQuantizer("q4")` path).  This
@@ -207,7 +207,7 @@ fn dwq46_emits_q4_k_m_gguf_via_cli() {
             "--format",
             "gguf",
             "--quant",
-            "dwq-4-6",
+            "dynamic-quant-4-6",
             "--output",
             output_dir.to_str().unwrap(),
             "--skip-quality",
@@ -220,7 +220,7 @@ fn dwq46_emits_q4_k_m_gguf_via_cli() {
     assert!(
         stderr.contains("DwqKQuantizer dispatch")
             || stderr.contains("Q4_K_M-family default"),
-        "dwq-4-6 must log the Iter C DwqKQuantizer dispatch line; stderr:\n{stderr}"
+        "dynamic-quant-4-6 must log the Iter C DwqKQuantizer dispatch line; stderr:\n{stderr}"
     );
 
     let gguf_path = locate_gguf(&output_dir);
@@ -236,13 +236,13 @@ fn dwq46_emits_q4_k_m_gguf_via_cli() {
     let q4_0_count = table.iter().filter(|(_, t)| *t == GgmlType::Q4_0).count();
     assert!(
         q4_k_count > 0,
-        "Iter C lock: --quant dwq-4-6 must emit at least one Q4_K (12) tensor \
+        "Iter C lock: --quant dynamic-quant-4-6 must emit at least one Q4_K (12) tensor \
          (NOT Q4_0 = 2); table:\n{}",
         dump_types(&table)
     );
     assert_eq!(
         q4_0_count, 0,
-        "Iter C lock: --quant dwq-4-6 must NOT emit Q4_0 (2) tensors after the \
+        "Iter C lock: --quant dynamic-quant-4-6 must NOT emit Q4_0 (2) tensors after the \
          DwqKQuantizer wiring; legacy Q4_0 emit is gated behind \
          HF2Q_USE_LEGACY_DWQ_Q4_0=1.  Table:\n{}",
         dump_types(&table)
@@ -250,10 +250,10 @@ fn dwq46_emits_q4_k_m_gguf_via_cli() {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// T2 — `--quant dwq-4-8` emits Q4_K base + Q8_0 sensitive
+// T2 — `--quant dynamic-quant-4-8` emits Q4_K base + Q8_0 sensitive
 // ────────────────────────────────────────────────────────────────────
 
-/// Iter C lock: `--quant dwq-4-8` with `--sensitive-layers 1` puts
+/// Iter C lock: `--quant dynamic-quant-4-8` with `--sensitive-layers 1` puts
 /// layer 0 in the base bucket (→ Q4_K) AND layer 1 in the sensitive
 /// bucket (→ Q8_0).  Both type codes must coexist in the same GGUF —
 /// proves the per-tensor `target_for(tensor_name)` dispatch survives
@@ -274,7 +274,7 @@ fn dwq48_emits_q4_k_base_with_q8_0_sensitive() {
             "--format",
             "gguf",
             "--quant",
-            "dwq-4-8",
+            "dynamic-quant-4-8",
             // Layer 1 sensitive (singleton); layer 0 stays base.  The
             // synthetic fixture is `DwqArch::Other` so the calibrator
             // returns no derived ranges → the CLI flag is honoured
@@ -317,7 +317,7 @@ fn dwq48_emits_q4_k_base_with_q8_0_sensitive() {
     assert_eq!(
         base_layer0.1,
         GgmlType::Q4_K,
-        "Iter C: dwq-4-8 base-bucket (layer 0, NOT in sensitive set) must be \
+        "Iter C: dynamic-quant-4-8 base-bucket (layer 0, NOT in sensitive set) must be \
          Q4_K; got {:?} for {}.  Full table:\n{}",
         base_layer0.1,
         base_layer0.0,
@@ -326,7 +326,7 @@ fn dwq48_emits_q4_k_base_with_q8_0_sensitive() {
     assert_eq!(
         sensitive_layer1.1,
         GgmlType::Q8_0,
-        "Iter C: dwq-4-8 sensitive-bucket (layer 1, in --sensitive-layers 1) \
+        "Iter C: dynamic-quant-4-8 sensitive-bucket (layer 1, in --sensitive-layers 1) \
          must be Q8_0; got {:?} for {}.  Full table:\n{}",
         sensitive_layer1.1,
         sensitive_layer1.0,
@@ -336,16 +336,16 @@ fn dwq48_emits_q4_k_base_with_q8_0_sensitive() {
     let q4_0_count = table.iter().filter(|(_, t)| *t == GgmlType::Q4_0).count();
     assert_eq!(
         q4_0_count, 0,
-        "Iter C: dwq-4-8 must NOT emit Q4_0 tensors; table:\n{}",
+        "Iter C: dynamic-quant-4-8 must NOT emit Q4_0 tensors; table:\n{}",
         dump_types(&table)
     );
 }
 
 // ────────────────────────────────────────────────────────────────────
-// T3 — `--quant dwq-6-8` emits Q6_K base
+// T3 — `--quant dynamic-quant-6-8` emits Q6_K base
 // ────────────────────────────────────────────────────────────────────
 
-/// Iter C lock: `--quant dwq-6-8` produces at least one
+/// Iter C lock: `--quant dynamic-quant-6-8` produces at least one
 /// `GGML_TYPE_Q6_K = 14` tensor (the base bucket for `DwqKVariant::P68`).
 /// Locks the Q6_K base leg end-to-end so a regression that drops
 /// `KQuantTarget::Q6K` from the variant table is caught at the
@@ -366,7 +366,7 @@ fn dwq68_emits_q6_k_base_via_cli() {
             "--format",
             "gguf",
             "--quant",
-            "dwq-6-8",
+            "dynamic-quant-6-8",
             "--output",
             output_dir.to_str().unwrap(),
             "--skip-quality",
@@ -381,13 +381,13 @@ fn dwq68_emits_q6_k_base_via_cli() {
     let q4_0_count = table.iter().filter(|(_, t)| *t == GgmlType::Q4_0).count();
     assert!(
         q6_k_count > 0,
-        "Iter C lock: --quant dwq-6-8 must emit at least one Q6_K (14) tensor; \
+        "Iter C lock: --quant dynamic-quant-6-8 must emit at least one Q6_K (14) tensor; \
          table:\n{}",
         dump_types(&table)
     );
     assert_eq!(
         q4_0_count, 0,
-        "Iter C lock: --quant dwq-6-8 must NOT emit Q4_0 (2) tensors after the \
+        "Iter C lock: --quant dynamic-quant-6-8 must NOT emit Q4_0 (2) tensors after the \
          DwqKQuantizer wiring.  Table:\n{}",
         dump_types(&table)
     );
@@ -427,7 +427,7 @@ fn legacy_q4_0_dwq_path_still_available_via_env_var() {
             "--format",
             "gguf",
             "--quant",
-            "dwq-4-6",
+            "dynamic-quant-4-6",
             "--output",
             output_dir.to_str().unwrap(),
             "--skip-quality",
@@ -452,7 +452,7 @@ fn legacy_q4_0_dwq_path_still_available_via_env_var() {
     let q6_k_count = table.iter().filter(|(_, t)| *t == GgmlType::Q6_K).count();
     assert!(
         q4_0_count > 0,
-        "Iter C escape hatch: HF2Q_USE_LEGACY_DWQ_Q4_0=1 + --quant dwq-4-6 must \
+        "Iter C escape hatch: HF2Q_USE_LEGACY_DWQ_Q4_0=1 + --quant dynamic-quant-4-6 must \
          emit at least one Q4_0 (2) tensor; table:\n{}",
         dump_types(&table)
     );

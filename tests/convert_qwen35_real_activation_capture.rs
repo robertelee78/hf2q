@@ -186,7 +186,7 @@ fn dwq_on_qwen35_surfaces_not_ready_not_fallback() {
     let input = tmp.path().join("qwen35-dwq-in");
     setup(&input);
 
-    for variant in ["dwq-2-8", "dwq-4-6", "dwq-4-8", "dwq-6-8"] {
+    for variant in ["dynamic-quant-2-8", "dynamic-quant-4-6", "dynamic-quant-4-8", "dynamic-quant-6-8"] {
         let output = tmp.path().join(format!("out-{variant}.gguf"));
         let out = Command::cargo_bin("hf2q")
             .unwrap()

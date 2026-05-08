@@ -218,7 +218,7 @@ impl Calibrator for DwqCalibrator {
                 sensitive_bits = self.sensitive_bits,
                 "dwq calibrator: arch is weight-space; emitting empty Dwq map"
             );
-            return Ok(CalibrationData::Dwq(HashMap::new()));
+            return Ok(CalibrationData::DynamicQuant(HashMap::new()));
         }
 
         // The corpus is informational for DWQ — calibration tokens
@@ -300,7 +300,7 @@ impl Calibrator for DwqCalibrator {
                         entries = map.len(),
                         "dwq sensitivity cache HIT (iter-95: pre-Qwen35Model-build short-circuit)"
                     );
-                    return Ok(CalibrationData::Dwq(map));
+                    return Ok(CalibrationData::DynamicQuant(map));
                 }
                 Ok(None) => {
                     info!(
@@ -429,7 +429,7 @@ impl Calibrator for DwqCalibrator {
             }
         }
 
-        Ok(CalibrationData::Dwq(map))
+        Ok(CalibrationData::DynamicQuant(map))
     }
 }
 
@@ -615,7 +615,7 @@ mod tests {
         ));
     }
 
-    /// `DwqArch::Other` returns `Ok(CalibrationData::Dwq(empty))` —
+    /// `DwqArch::Other` returns `Ok(CalibrationData::DynamicQuant(empty))` —
     /// the explicit "weight-space path is the intended downstream
     /// codec" shape. Capture is NOT consulted (None is fine).
     #[test]
@@ -634,7 +634,7 @@ mod tests {
             .expect("DwqArch::Other path must succeed without capture");
 
         match data {
-            CalibrationData::Dwq(m) => {
+            CalibrationData::DynamicQuant(m) => {
                 assert!(
                     m.is_empty(),
                     "DwqArch::Other returns empty Dwq map (weight-space contract); \
@@ -642,7 +642,7 @@ mod tests {
                     m.len()
                 );
             }
-            other => panic!("expected CalibrationData::Dwq(empty), got {other:?}"),
+            other => panic!("expected CalibrationData::DynamicQuant(empty), got {other:?}"),
         }
     }
 
@@ -673,7 +673,7 @@ mod tests {
             .expect("Qwen35MoE round-trip via mock must succeed");
 
         let map = match data {
-            CalibrationData::Dwq(m) => m,
+            CalibrationData::DynamicQuant(m) => m,
             other => panic!("expected CalibrationData::Dwq, got {other:?}"),
         };
 
@@ -750,7 +750,7 @@ mod tests {
             "second same-key call must be served from cache"
         );
         match (first, second) {
-            (CalibrationData::Dwq(a), CalibrationData::Dwq(b)) => assert_eq!(a, b),
+            (CalibrationData::DynamicQuant(a), CalibrationData::DynamicQuant(b)) => assert_eq!(a, b),
             other => panic!("expected DWQ maps, got {other:?}"),
         }
     }
@@ -823,7 +823,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(counter.load(Ordering::SeqCst), 1);
-        assert!(matches!(data, CalibrationData::Dwq(_)));
+        assert!(matches!(data, CalibrationData::DynamicQuant(_)));
     }
 
     #[test]

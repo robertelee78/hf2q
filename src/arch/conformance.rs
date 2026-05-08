@@ -438,7 +438,7 @@ mod tests {
     fn quality_report_dwq46_enforces_110_percent_bound() {
         let under = QualityReport {
             arch: "qwen35",
-            quant_label: "dwq46".to_string(),
+            quant_label: "dynamic-quant-46".to_string(),
             f16_perplexity: Some(10.0),
             dwq_perplexity: Some(10.9),
             median_kl_nats: Some(0.01),
@@ -450,7 +450,7 @@ mod tests {
 
         let over = QualityReport {
             arch: "qwen35",
-            quant_label: "dwq46".to_string(),
+            quant_label: "dynamic-quant-46".to_string(),
             f16_perplexity: Some(10.0),
             dwq_perplexity: Some(11.5),
             median_kl_nats: Some(0.01),
@@ -464,7 +464,7 @@ mod tests {
     fn quality_report_skipped_passes() {
         let r = QualityReport {
             arch: "qwen35",
-            quant_label: "dwq48".to_string(),
+            quant_label: "dynamic-quant-48".to_string(),
             f16_perplexity: None,
             dwq_perplexity: None,
             median_kl_nats: None,

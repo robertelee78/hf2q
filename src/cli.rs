@@ -889,10 +889,10 @@ impl std::fmt::Display for OutputFormat {
 /// | `imatrix-q5_k_m`   | imatrix      | k-quant Q5_K   |                                       |
 /// | `imatrix-q6_k`     | imatrix      | k-quant Q6_K   |                                       |
 /// | `imatrix-adaptive` | imatrix      | k-quant adapt  | Per-tensor optimal precision (apex)   |
-/// | `dwq-4-6`          | dwq          | bit-pair (4,6) | Apple/MLX distilled weight quant      |
-/// | `dwq-4-8`          | dwq          | bit-pair (4,8) |                                       |
-/// | `dwq-6-8`          | dwq          | bit-pair (6,8) |                                       |
-/// | `dwq-2-8`          | dwq          | bit-pair (2,8) |                                       |
+/// | `dynamic-quant-4-6`          | dwq          | bit-pair (4,6) | Apple/MLX distilled weight quant      |
+/// | `dynamic-quant-4-8`          | dwq          | bit-pair (4,8) |                                       |
+/// | `dynamic-quant-6-8`          | dwq          | bit-pair (6,8) |                                       |
+/// | `dynamic-quant-2-8`          | dwq          | bit-pair (2,8) |                                       |
 ///
 /// ## Decision 13 — clean cut, no aliases
 ///
@@ -1005,19 +1005,21 @@ pub enum QuantMethod {
     /// with `layer_mix::target_for` per-tensor target dispatch.
     #[value(name = "imatrix-adaptive")]
     ImatrixAdaptive,
-    /// `dwq-4-6` — Apple/MLX distilled weight quantization with
-    /// (base=4, sensitive=6) bit pair.
-    #[value(name = "dwq-4-6")]
-    Dwq46,
-    /// `dwq-4-8` — DWQ with (base=4, sensitive=8) bit pair.
-    #[value(name = "dwq-4-8")]
-    Dwq48,
-    /// `dwq-6-8` — DWQ with (base=6, sensitive=8) bit pair.
-    #[value(name = "dwq-6-8")]
-    Dwq68,
-    /// `dwq-2-8` — DWQ with (base=2, sensitive=8) bit pair.
-    #[value(name = "dwq-2-8")]
-    Dwq28,
+    /// `dynamic-quant-4-6` — mixed-bit allocation with sensitivity-
+    /// driven per-tensor (base=Q4, sensitive=Q6) bit pair.  Ports
+    /// mlx-lm's `dynamic_quant.py` (NOT real DWQ — the dwq-* names
+    /// were misnamed pre-ADR-020 §1.3; corrected here).
+    #[value(name = "dynamic-quant-4-6")]
+    DynamicQuant46,
+    /// `dynamic-quant-4-8` — mixed-bit (base=Q4, sensitive=Q8).
+    #[value(name = "dynamic-quant-4-8")]
+    DynamicQuant48,
+    /// `dynamic-quant-6-8` — mixed-bit (base=Q6, sensitive=Q8).
+    #[value(name = "dynamic-quant-6-8")]
+    DynamicQuant68,
+    /// `dynamic-quant-2-8` — mixed-bit (base=Q2, sensitive=Q8).
+    #[value(name = "dynamic-quant-2-8")]
+    DynamicQuant28,
 }
 
 impl std::fmt::Display for QuantMethod {
@@ -1050,10 +1052,10 @@ impl std::fmt::Display for QuantMethod {
             Self::ImatrixQ5KM => write!(f, "imatrix-q5_k_m"),
             Self::ImatrixQ6K => write!(f, "imatrix-q6_k"),
             Self::ImatrixAdaptive => write!(f, "imatrix-adaptive"),
-            Self::Dwq46 => write!(f, "dwq-4-6"),
-            Self::Dwq48 => write!(f, "dwq-4-8"),
-            Self::Dwq68 => write!(f, "dwq-6-8"),
-            Self::Dwq28 => write!(f, "dwq-2-8"),
+            Self::DynamicQuant46 => write!(f, "dynamic-quant-4-6"),
+            Self::DynamicQuant48 => write!(f, "dynamic-quant-4-8"),
+            Self::DynamicQuant68 => write!(f, "dynamic-quant-6-8"),
+            Self::DynamicQuant28 => write!(f, "dynamic-quant-2-8"),
         }
     }
 }
@@ -1063,10 +1065,10 @@ impl QuantMethod {
     /// Returns None for non-DWQ variants.
     pub fn dwq_bit_pair(self) -> Option<(u8, u8)> {
         match self {
-            Self::Dwq46 => Some((4, 6)),
-            Self::Dwq48 => Some((4, 8)),
-            Self::Dwq68 => Some((6, 8)),
-            Self::Dwq28 => Some((2, 8)),
+            Self::DynamicQuant46 => Some((4, 6)),
+            Self::DynamicQuant48 => Some((4, 8)),
+            Self::DynamicQuant68 => Some((6, 8)),
+            Self::DynamicQuant28 => Some((2, 8)),
             _ => None,
         }
     }
@@ -1113,24 +1115,24 @@ impl QuantMethod {
             | Self::ImatrixQ5KM
             | Self::ImatrixQ6K
             | Self::ImatrixAdaptive
-            | Self::Dwq46
-            | Self::Dwq48
-            | Self::Dwq68
-            | Self::Dwq28 => true,
+            | Self::DynamicQuant46
+            | Self::DynamicQuant48
+            | Self::DynamicQuant68
+            | Self::DynamicQuant28 => true,
         }
     }
 
     /// Return the default output filename suffix for this quant method.
     ///
-    /// DWQ variants produce compact suffixes like "dwq46", "dwq48", etc.
+    /// DWQ variants produce compact suffixes like "dynamic-quant-46", "dynamic-quant-48", etc.
     /// All other variants return their Display string unchanged (e.g.
     /// "imatrix-q4_k_m", "q4_k_m", "q4").
     pub fn default_filename_suffix(self) -> String {
         match self {
-            Self::Dwq46 => "dwq46".to_string(),
-            Self::Dwq48 => "dwq48".to_string(),
-            Self::Dwq68 => "dwq68".to_string(),
-            Self::Dwq28 => "dwq28".to_string(),
+            Self::DynamicQuant46 => "dynamic-quant-46".to_string(),
+            Self::DynamicQuant48 => "dynamic-quant-48".to_string(),
+            Self::DynamicQuant68 => "dynamic-quant-68".to_string(),
+            Self::DynamicQuant28 => "dynamic-quant-28".to_string(),
             other => other.to_string(),
         }
     }
@@ -1164,25 +1166,25 @@ pub fn map_deleted_quant_hint(raw: &str) -> Option<String> {
         )),
         "dwq-mixed-4-6" => Some(
             "`--quant dwq-mixed-4-6` was renamed in ADR-014 P8 \
-             (Decision 13). Use `--quant dwq-4-6` (same algorithm, \
+             (Decision 13). Use `--quant dynamic-quant-4-6` (same algorithm, \
              cosmetic rename)."
                 .to_string(),
         ),
         "dwq-mixed-4-8" => Some(
             "`--quant dwq-mixed-4-8` was renamed in ADR-014 P8 \
-             (Decision 13). Use `--quant dwq-4-8` (same algorithm, \
+             (Decision 13). Use `--quant dynamic-quant-4-8` (same algorithm, \
              cosmetic rename)."
                 .to_string(),
         ),
         "dwq-mixed-6-8" => Some(
             "`--quant dwq-mixed-6-8` was renamed in ADR-014 P8 \
-             (Decision 13). Use `--quant dwq-6-8` (same algorithm, \
+             (Decision 13). Use `--quant dynamic-quant-6-8` (same algorithm, \
              cosmetic rename)."
                 .to_string(),
         ),
         "dwq-mixed-2-8" => Some(
             "`--quant dwq-mixed-2-8` was renamed in ADR-014 P8 \
-             (Decision 13). Use `--quant dwq-2-8` (same algorithm, \
+             (Decision 13). Use `--quant dynamic-quant-2-8` (same algorithm, \
              cosmetic rename)."
                 .to_string(),
         ),
@@ -1203,9 +1205,14 @@ pub enum CalibrationFlag {
     /// `imatrix` — llama.cpp-style importance matrix
     /// (ImatrixCalibrator).
     Imatrix,
-    /// `dwq` — Apple/MLX distilled weight quantization
-    /// (DwqCalibrator).
-    Dwq,
+    /// `dynamic-quant` — variance-magnitude (legacy) / gradient-Taylor
+    /// (per ADR-020 §8.2) sensitivity ranking that drives mixed-bit
+    /// allocation. Misnamed "dwq" pre-ADR-020 but the algorithm is
+    /// mlx-lm's `dynamic_quant.py`, not real DWQ.  Routes through
+    /// [`crate::calibrate::dwq_calibrator::DwqCalibrator`] (internal
+    /// type rename pending iter-12a-2).
+    #[value(name = "dynamic-quant")]
+    DynamicQuant,
 }
 
 impl std::fmt::Display for CalibrationFlag {
@@ -1213,7 +1220,7 @@ impl std::fmt::Display for CalibrationFlag {
         match self {
             Self::None => write!(f, "none"),
             Self::Imatrix => write!(f, "imatrix"),
-            Self::Dwq => write!(f, "dwq"),
+            Self::DynamicQuant => write!(f, "dynamic-quant"),
         }
     }
 }
@@ -1562,10 +1569,10 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
         QuantMethod::ImatrixAdaptive => {
             // imatrix-calibrated per-tensor optimal precision (replaces former Apex).
         }
-        QuantMethod::Dwq46
-        | QuantMethod::Dwq48
-        | QuantMethod::Dwq68
-        | QuantMethod::Dwq28 => {
+        QuantMethod::DynamicQuant46
+        | QuantMethod::DynamicQuant48
+        | QuantMethod::DynamicQuant68
+        | QuantMethod::DynamicQuant28 => {
             // DWQ weight/activation calibration → bit-pair output.
         }
     }
@@ -1663,11 +1670,11 @@ pub fn is_diagonal_cell(cal: CalibrationFlag, fmt: OutputFormatFlag) -> bool {
             | (Imatrix, KQuantQ5KM)
             | (Imatrix, KQuantQ6K)
             | (Imatrix, KQuantAdaptive)
-            // dwq × bit-pair-* (DWQ cells)
-            | (Dwq, BitPair46)
-            | (Dwq, BitPair48)
-            | (Dwq, BitPair68)
-            | (Dwq, BitPair28)
+            // dynamic-quant × bit-pair-* (mixed-bit cells, was misnamed "DWQ")
+            | (DynamicQuant, BitPair46)
+            | (DynamicQuant, BitPair48)
+            | (DynamicQuant, BitPair68)
+            | (DynamicQuant, BitPair28)
     )
 }
 
@@ -1760,10 +1767,10 @@ mod tests {
 
     #[test]
     fn test_dwq_bit_pair_dispatch_table() {
-        assert_eq!(QuantMethod::Dwq46.dwq_bit_pair(), Some((4, 6)));
-        assert_eq!(QuantMethod::Dwq48.dwq_bit_pair(), Some((4, 8)));
-        assert_eq!(QuantMethod::Dwq68.dwq_bit_pair(), Some((6, 8)));
-        assert_eq!(QuantMethod::Dwq28.dwq_bit_pair(), Some((2, 8)));
+        assert_eq!(QuantMethod::DynamicQuant46.dwq_bit_pair(), Some((4, 6)));
+        assert_eq!(QuantMethod::DynamicQuant48.dwq_bit_pair(), Some((4, 8)));
+        assert_eq!(QuantMethod::DynamicQuant68.dwq_bit_pair(), Some((6, 8)));
+        assert_eq!(QuantMethod::DynamicQuant28.dwq_bit_pair(), Some((2, 8)));
     }
 
     #[test]
@@ -1796,10 +1803,10 @@ mod tests {
 
     #[test]
     fn test_dwq_default_filename_suffix() {
-        assert_eq!(QuantMethod::Dwq46.default_filename_suffix(), "dwq46");
-        assert_eq!(QuantMethod::Dwq48.default_filename_suffix(), "dwq48");
-        assert_eq!(QuantMethod::Dwq68.default_filename_suffix(), "dwq68");
-        assert_eq!(QuantMethod::Dwq28.default_filename_suffix(), "dwq28");
+        assert_eq!(QuantMethod::DynamicQuant46.default_filename_suffix(), "dynamic-quant-46");
+        assert_eq!(QuantMethod::DynamicQuant48.default_filename_suffix(), "dynamic-quant-48");
+        assert_eq!(QuantMethod::DynamicQuant68.default_filename_suffix(), "dynamic-quant-68");
+        assert_eq!(QuantMethod::DynamicQuant28.default_filename_suffix(), "dynamic-quant-28");
     }
 
     #[test]
@@ -1833,14 +1840,14 @@ mod tests {
 
     #[test]
     fn test_dwq_display_strings() {
-        assert_eq!(QuantMethod::Dwq46.to_string(), "dwq-4-6");
-        assert_eq!(QuantMethod::Dwq48.to_string(), "dwq-4-8");
-        assert_eq!(QuantMethod::Dwq68.to_string(), "dwq-6-8");
-        assert_eq!(QuantMethod::Dwq28.to_string(), "dwq-2-8");
+        assert_eq!(QuantMethod::DynamicQuant46.to_string(), "dynamic-quant-4-6");
+        assert_eq!(QuantMethod::DynamicQuant48.to_string(), "dynamic-quant-4-8");
+        assert_eq!(QuantMethod::DynamicQuant68.to_string(), "dynamic-quant-6-8");
+        assert_eq!(QuantMethod::DynamicQuant28.to_string(), "dynamic-quant-2-8");
     }
 
     // ---- Gemma-4 regression snapshot guard ----
-    // Asserts that the Dwq46 dispatch path continues to produce
+    // Asserts that the DynamicQuant46 dispatch path continues to produce
     // (base_bits=4, sensitive_bits=6) — byte-identical to pre-change behaviour.
     // This guard will fail if any future refactor silently changes the Gemma-4
     // quantization parameters.
@@ -1912,15 +1919,15 @@ mod tests {
     fn test_gemma4_regression_dwq46_dispatch_unchanged() {
         // Dispatch table entry must still be (4, 6).
         assert_eq!(
-            QuantMethod::Dwq46.dwq_bit_pair(),
+            QuantMethod::DynamicQuant46.dwq_bit_pair(),
             Some((4, 6)),
-            "Gemma-4 regression: Dwq46 must dispatch to (base=4, sensitive=6)"
+            "Gemma-4 regression: DynamicQuant46 must dispatch to (base=4, sensitive=6)"
         );
         // Default filename suffix (new behaviour per ADR Decision 10(c)).
         assert_eq!(
-            QuantMethod::Dwq46.default_filename_suffix(),
-            "dwq46",
-            "Gemma-4 regression: Dwq46 filename suffix must be 'dwq46'"
+            QuantMethod::DynamicQuant46.default_filename_suffix(),
+            "dynamic-quant-46",
+            "Gemma-4 regression: DynamicQuant46 filename suffix must be 'dwq46'"
         );
     }
 
@@ -1946,10 +1953,10 @@ mod tests {
             ("imatrix-q5_k_m", QuantMethod::ImatrixQ5KM),
             ("imatrix-q6_k", QuantMethod::ImatrixQ6K),
             ("imatrix-adaptive", QuantMethod::ImatrixAdaptive),
-            ("dwq-4-6", QuantMethod::Dwq46),
-            ("dwq-4-8", QuantMethod::Dwq48),
-            ("dwq-6-8", QuantMethod::Dwq68),
-            ("dwq-2-8", QuantMethod::Dwq28),
+            ("dynamic-quant-4-6", QuantMethod::DynamicQuant46),
+            ("dynamic-quant-4-8", QuantMethod::DynamicQuant48),
+            ("dynamic-quant-6-8", QuantMethod::DynamicQuant68),
+            ("dynamic-quant-2-8", QuantMethod::DynamicQuant28),
         ];
         assert_eq!(
             cases.len(),
@@ -2035,10 +2042,10 @@ mod tests {
     #[test]
     fn test_dwq_mixed_4_6_rejected_with_hint() {
         let cases = [
-            ("dwq-mixed-4-6", "dwq-4-6"),
-            ("dwq-mixed-4-8", "dwq-4-8"),
-            ("dwq-mixed-6-8", "dwq-6-8"),
-            ("dwq-mixed-2-8", "dwq-2-8"),
+            ("dwq-mixed-4-6", "dynamic-quant-4-6"),
+            ("dwq-mixed-4-8", "dynamic-quant-4-8"),
+            ("dwq-mixed-6-8", "dynamic-quant-6-8"),
+            ("dwq-mixed-2-8", "dynamic-quant-2-8"),
         ];
         for (raw, expected_suggest) in cases {
             let result = Cli::try_parse_from([
@@ -2081,10 +2088,10 @@ mod tests {
             QuantMethod::ImatrixQ5KM,
             QuantMethod::ImatrixQ6K,
             QuantMethod::ImatrixAdaptive,
-            QuantMethod::Dwq46,
-            QuantMethod::Dwq48,
-            QuantMethod::Dwq68,
-            QuantMethod::Dwq28,
+            QuantMethod::DynamicQuant46,
+            QuantMethod::DynamicQuant48,
+            QuantMethod::DynamicQuant68,
+            QuantMethod::DynamicQuant28,
         ];
         assert_eq!(all_variants.len(), 17, "expected 17 variants");
         for v in all_variants {
@@ -2162,10 +2169,10 @@ mod tests {
             // `Dwq` alias lives in `CalibrationFlag` (the orthogonal
             // `--calibration` axis from Decision 12 §off-diagonal), not
             // in `QuantMethod`, so it doesn't round-trip through `--quant`.
-            QuantMethod::Dwq46,
-            QuantMethod::Dwq48,
-            QuantMethod::Dwq68,
-            QuantMethod::Dwq28,
+            QuantMethod::DynamicQuant46,
+            QuantMethod::DynamicQuant48,
+            QuantMethod::DynamicQuant68,
+            QuantMethod::DynamicQuant28,
         ];
         assert_eq!(
             all_variants.len(),
@@ -2253,14 +2260,14 @@ mod tests {
     fn both_flags_with_env_accepted_off_diagonal() {
         // Off-diagonal: dwq calibrator with k-quant-q4_k_m output.
         let pair = validate_off_diagonal_selector(
-            Some(CalibrationFlag::Dwq),
+            Some(CalibrationFlag::DynamicQuant),
             Some(OutputFormatFlag::KQuantQ4KM),
             Some("1"),
         )
         .expect("off-diagonal cell with env=1 must be accepted");
         assert_eq!(
             pair,
-            Some((CalibrationFlag::Dwq, OutputFormatFlag::KQuantQ4KM))
+            Some((CalibrationFlag::DynamicQuant, OutputFormatFlag::KQuantQ4KM))
         );
 
         // Diagonal cells don't need the env at all.
@@ -2331,10 +2338,10 @@ mod tests {
             (Imatrix, KQuantQ6K),
             (Imatrix, KQuantAdaptive),
             // dwq × bit-pair
-            (Dwq, BitPair46),
-            (Dwq, BitPair48),
-            (Dwq, BitPair68),
-            (Dwq, BitPair28),
+            (DynamicQuant, BitPair46),
+            (DynamicQuant, BitPair48),
+            (DynamicQuant, BitPair68),
+            (DynamicQuant, BitPair28),
         ];
         for (c, f) in diagonal_cells {
             assert!(
@@ -2472,7 +2479,7 @@ mod tests {
             input: Some(tmp.path().to_path_buf()),
             repo: None,
             format: OutputFormat::Safetensors,
-            quant: QuantMethod::Dwq46,
+            quant: QuantMethod::DynamicQuant46,
             calibration: None,
             output_format: None,
             sensitive_layers: None,

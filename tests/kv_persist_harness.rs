@@ -52,8 +52,8 @@
 
 #![allow(dead_code)]
 // The matrix-axis enum variants below mirror on-disk and CLI names
-// verbatim (`Q4_0`, `Q4_K_M`, `Q6_K`, `Q8_0`, `Dwq46`, `Dwq48`,
-// `Qwen35Moe_Dwq46`). Renaming them to UpperCamelCase would fork the
+// verbatim (`Q4_0`, `Q4_K_M`, `Q6_K`, `Q8_0`, `DynamicQuant46`, `DynamicQuant48`,
+// `Qwen35Moe_DynamicQuant46`). Renaming them to UpperCamelCase would fork the
 // nomenclature from every call-site that already encodes the GGUF /
 // safetensors / `--quant` flag spelling. This is an intentional
 // stable-name choice, not laziness.
@@ -110,7 +110,7 @@ const DEFAULT_CHAT_GGUF: &str = concat!(
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Family {
     Gemma4_26b,
-    Qwen35Moe_Dwq46,
+    Qwen35Moe_DynamicQuant46,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -119,8 +119,8 @@ pub enum WeightQuant {
     Q4_K_M,
     Q6_K,
     Q8_0,
-    Dwq46,
-    Dwq48,
+    DynamicQuant46,
+    DynamicQuant48,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -202,7 +202,7 @@ impl MatrixCell {
                     | WeightQuant::Q6_K
                     | WeightQuant::Q8_0
             ),
-            Family::Qwen35Moe_Dwq46 => false, // ADR-013 gate
+            Family::Qwen35Moe_DynamicQuant46 => false, // ADR-013 gate
         }
     }
 
@@ -228,14 +228,14 @@ impl MatrixCell {
 /// matrix execution surfaces both runnable AND skipped-with-reason cells in
 /// the results report so reviewers can audit the skip set.
 pub fn generate_matrix() -> Vec<MatrixCell> {
-    let families = [Family::Gemma4_26b, Family::Qwen35Moe_Dwq46];
+    let families = [Family::Gemma4_26b, Family::Qwen35Moe_DynamicQuant46];
     let quants = [
         WeightQuant::Q4_0,
         WeightQuant::Q4_K_M,
         WeightQuant::Q6_K,
         WeightQuant::Q8_0,
-        WeightQuant::Dwq46,
-        WeightQuant::Dwq48,
+        WeightQuant::DynamicQuant46,
+        WeightQuant::DynamicQuant48,
     ];
     let kv_paths = [KvPath::Dense, KvPath::TqActive];
     let prefix_lens = [
@@ -1331,8 +1331,8 @@ pub mod subprocess_driver {
             // shape but only 16 of 64 layers are full-attn; remaining
             // 48 are DeltaNet boundary snapshots which the on-disk
             // envelope captures as fixed-size state slabs.
-            (Family::Qwen35Moe_Dwq46, KvPath::Dense) => 768 * 1024,
-            (Family::Qwen35Moe_Dwq46, KvPath::TqActive) => 256 * 1024,
+            (Family::Qwen35Moe_DynamicQuant46, KvPath::Dense) => 768 * 1024,
+            (Family::Qwen35Moe_DynamicQuant46, KvPath::TqActive) => 256 * 1024,
         }
     }
 }
@@ -1357,11 +1357,11 @@ pub mod subprocess_driver {
 pub fn run_cell(cell: MatrixCell) -> CellResult {
     if !cell.is_runnable_today() {
         let why = match cell.family {
-            Family::Qwen35Moe_Dwq46 => "qwen3.5-moe family blocked on ADR-013",
+            Family::Qwen35Moe_DynamicQuant46 => "qwen3.5-moe family blocked on ADR-013",
             Family::Gemma4_26b => match cell.kv_path {
                 KvPath::TqActive => "TQ-active path blocked on ADR-007 codec stable",
                 KvPath::Dense => match cell.quant {
-                    WeightQuant::Dwq46 | WeightQuant::Dwq48 => {
+                    WeightQuant::DynamicQuant46 | WeightQuant::DynamicQuant48 => {
                         "DWQ quant gemma4 GGUF path not yet enabled for KV persistence"
                     }
                     _ => "unknown skip reason",
@@ -1392,8 +1392,8 @@ pub fn run_cell(cell: MatrixCell) -> CellResult {
             WeightQuant::Q4_K_M => "Q4_K_M",
             WeightQuant::Q6_K => "Q6_K",
             WeightQuant::Q8_0 => "Q8_0",
-            WeightQuant::Dwq46 => "DWQ46",
-            WeightQuant::Dwq48 => "DWQ48",
+            WeightQuant::DynamicQuant46 => "DWQ46",
+            WeightQuant::DynamicQuant48 => "DWQ48",
         },
         "hf2q-a0.1-substrate",
         "0000000000000000000000000000000000000000000000000000000000000000",
@@ -1571,15 +1571,15 @@ pub fn run_cell(cell: MatrixCell) -> CellResult {
 fn resolve_cell_model_path(cell: &MatrixCell) -> Option<PathBuf> {
     let family_tag = match cell.family {
         Family::Gemma4_26b => "GEMMA4_26B",
-        Family::Qwen35Moe_Dwq46 => "QWEN35MOE_DWQ46",
+        Family::Qwen35Moe_DynamicQuant46 => "QWEN35MOE_DWQ46",
     };
     let quant_tag = match cell.quant {
         WeightQuant::Q4_0 => "Q4_0",
         WeightQuant::Q4_K_M => "Q4_K_M",
         WeightQuant::Q6_K => "Q6_K",
         WeightQuant::Q8_0 => "Q8_0",
-        WeightQuant::Dwq46 => "DWQ46",
-        WeightQuant::Dwq48 => "DWQ48",
+        WeightQuant::DynamicQuant46 => "DWQ46",
+        WeightQuant::DynamicQuant48 => "DWQ48",
     };
     let specific = format!("HF2Q_KV_PERSIST_E2E_MODEL_{family_tag}_{quant_tag}");
     if let Ok(p) = std::env::var(&specific) {
@@ -2210,7 +2210,7 @@ fn matrix_generator_yields_runnable_gemma_subset() {
     );
     let qwen_cells: Vec<_> = cells
         .iter()
-        .filter(|c| matches!(c.family, Family::Qwen35Moe_Dwq46))
+        .filter(|c| matches!(c.family, Family::Qwen35Moe_DynamicQuant46))
         .collect();
     assert!(
         qwen_cells.iter().all(|c| !c.is_runnable_today()),
@@ -2268,8 +2268,8 @@ fn run_cell_smoke_small_prefix() {
 #[test]
 fn run_cell_short_circuits_qwen() {
     let cell = MatrixCell {
-        family: Family::Qwen35Moe_Dwq46,
-        quant: WeightQuant::Dwq46,
+        family: Family::Qwen35Moe_DynamicQuant46,
+        quant: WeightQuant::DynamicQuant46,
         kv_path: KvPath::Dense,
         prefix_len: PrefixLen::L8K,
         cache_state: CacheState::SsdWarmPagecache,
@@ -2941,7 +2941,7 @@ fn synthesize_cache_hit_prediction_rejects_nan_no_cache_ttft() {
 /// blocks into the synthetic spiller's round-trip helper.
 #[test]
 fn representative_block_bytes_nonzero_for_every_family_kv_path() {
-    for family in [Family::Gemma4_26b, Family::Qwen35Moe_Dwq46] {
+    for family in [Family::Gemma4_26b, Family::Qwen35Moe_DynamicQuant46] {
         for kv_path in [KvPath::Dense, KvPath::TqActive] {
             let n = subprocess_driver::representative_block_bytes(&family, &kv_path);
             assert!(

@@ -18,7 +18,7 @@
 //!
 //! The split lets `(Calibrator, OutputFormat)` compose orthogonally
 //! — `Imatrix × KQuant` and `Dwq × BitPair` are both reachable, and
-//! the CLI (`--quant imatrix-q4_k_m`, `--quant dwq-4-6`) picks the
+//! the CLI (`--quant imatrix-q4_k_m`, `--quant dynamic-quant-4-6`) picks the
 //! validated cells.
 //!
 //! ## This iter — minimal Calibrator API
@@ -168,12 +168,13 @@ pub enum CalibrationData {
     /// collapse).
     ImatrixWithStats(HashMap<String, ImatrixStats>),
 
-    /// DWQ sensitivity scores — per-layer scalar importance that
-    /// drives the bit-pair allocation in
-    /// [`crate::calibrate::dwq::DwqQuantizer`]. Each entry's `Vec<f32>`
+    /// dynamic-quant sensitivity scores — per-layer scalar importance
+    /// that drives the bit-pair allocation in
+    /// [`crate::calibrate::dwq::DwqQuantizer`] (struct keeps internal
+    /// name pending iter-12a-2 type rename). Each entry's `Vec<f32>`
     /// is a single value (the layer's sensitivity score) wrapped for
     /// uniform shape with the imatrix variant.
-    Dwq(HashMap<String, Vec<f32>>),
+    DynamicQuant(HashMap<String, Vec<f32>>),
 }
 
 impl CalibrationData {
@@ -189,7 +190,7 @@ impl CalibrationData {
             CalibrationData::None => 0,
             CalibrationData::Imatrix(m) => m.len(),
             CalibrationData::ImatrixWithStats(m) => m.len(),
-            CalibrationData::Dwq(m) => m.len(),
+            CalibrationData::DynamicQuant(m) => m.len(),
         }
     }
 
@@ -429,7 +430,7 @@ mod tests {
         assert!(!CalibrationData::None.is_some());
         assert!(CalibrationData::Imatrix(HashMap::new()).is_some());
         assert!(CalibrationData::ImatrixWithStats(HashMap::new()).is_some());
-        assert!(CalibrationData::Dwq(HashMap::new()).is_some());
+        assert!(CalibrationData::DynamicQuant(HashMap::new()).is_some());
     }
 
     #[test]

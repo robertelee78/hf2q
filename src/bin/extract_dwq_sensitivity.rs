@@ -112,7 +112,7 @@ fn main() -> anyhow::Result<()> {
         })?;
         *q_type_hist.entry(format!("{q:?}")).or_default() += 1;
 
-        // Sensitivity rule for dwq-4-6: base=Q4_K, sensitive=Q5_K (or Q6_K
+        // Sensitivity rule for dynamic-quant-4-6: base=Q4_K, sensitive=Q5_K (or Q6_K
         // if the layer was promoted by a K-quant variant policy bump).
         // Anything with more bits than Q4_K counts as sensitive.
         // mlx_native::ops::quantized_matmul_ggml::GgmlType variants today:

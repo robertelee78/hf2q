@@ -91,10 +91,10 @@ fn variant_menu_complete() {
         "imatrix-q5_k_m",
         "imatrix-q6_k",
         "imatrix-adaptive",
-        "dwq-4-6",
-        "dwq-4-8",
-        "dwq-6-8",
-        "dwq-2-8",
+        "dynamic-quant-4-6",
+        "dynamic-quant-4-8",
+        "dynamic-quant-6-8",
+        "dynamic-quant-2-8",
     ];
     assert_eq!(menu.len(), 17, "Decision-12 menu must have 17 cells");
     for variant in menu {
@@ -197,7 +197,7 @@ fn variant_menu_filename_suffix() {
     let menu_variants = [
         "f16", "bf16", "q2", "q4", "q8", "q4_k_m", "q5_k_m", "q6_k",
         "imatrix-q4_k_m", "imatrix-q5_k_m", "imatrix-q6_k",
-        "imatrix-adaptive", "dwq-4-6", "dwq-4-8", "dwq-6-8", "dwq-2-8",
+        "imatrix-adaptive", "dynamic-quant-4-6", "dynamic-quant-4-8", "dynamic-quant-6-8", "dynamic-quant-2-8",
     ];
     let tmp = tempfile::tempdir().expect("tempdir");
     let input = tmp.path().join("model");
@@ -640,10 +640,10 @@ fn variant_to_routing(variant: &str) -> (&'static str, &'static str) {
         // imatrix-adaptive — ImatrixCalibrator + VariantKQuantizer
         "imatrix-adaptive" => ("imatrix", "Q4_K_M"),
         // DWQ — DwqCalibrator + run_dwq_with_sensitive_ranges (byte-emit; QuantizedModel.quant_method = "dwq-mixed-N-M")
-        "dwq-4-6" => ("dwq", "dwq-mixed-4-6"),
-        "dwq-4-8" => ("dwq", "dwq-mixed-4-8"),
-        "dwq-6-8" => ("dwq", "dwq-mixed-6-8"),
-        "dwq-2-8" => ("dwq", "dwq-mixed-2-8"),
+        "dynamic-quant-4-6" => ("dwq", "dwq-mixed-4-6"),
+        "dynamic-quant-4-8" => ("dwq", "dwq-mixed-4-8"),
+        "dynamic-quant-6-8" => ("dwq", "dwq-mixed-6-8"),
+        "dynamic-quant-2-8" => ("dwq", "dwq-mixed-2-8"),
         other => panic!("unknown variant in test mirror: {other:?}"),
     }
 }
@@ -666,10 +666,10 @@ fn every_decision12_variant_has_a_routing_entry() {
         "imatrix-q5_k_m",
         "imatrix-q6_k",
         "imatrix-adaptive",
-        "dwq-4-6",
-        "dwq-4-8",
-        "dwq-6-8",
-        "dwq-2-8",
+        "dynamic-quant-4-6",
+        "dynamic-quant-4-8",
+        "dynamic-quant-6-8",
+        "dynamic-quant-2-8",
     ];
     assert_eq!(menu.len(), 17, "Decision-12 menu must have 17 cells");
     for variant in menu {
@@ -725,10 +725,10 @@ fn quantizer_routing_partitions_match_decision12_table() {
     assert_eq!(quant, "Q4_K_M");
     // DWQ × bit-pair
     for (variant, expected_quant) in [
-        ("dwq-4-6", "dwq-mixed-4-6"),
-        ("dwq-4-8", "dwq-mixed-4-8"),
-        ("dwq-6-8", "dwq-mixed-6-8"),
-        ("dwq-2-8", "dwq-mixed-2-8"),
+        ("dynamic-quant-4-6", "dwq-mixed-4-6"),
+        ("dynamic-quant-4-8", "dwq-mixed-4-8"),
+        ("dynamic-quant-6-8", "dwq-mixed-6-8"),
+        ("dynamic-quant-2-8", "dwq-mixed-2-8"),
     ] {
         let (calib, quant) = variant_to_routing(variant);
         assert_eq!(calib, "dwq");

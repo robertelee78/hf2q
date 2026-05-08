@@ -18,7 +18,7 @@
 //!   ActivationCapture impl per Decision 13. The actual non-noop
 //!   calibration path runs against qwen35 fixtures in
 //!   `tests/convert_qwen35_*.rs`.
-//! * T4 — `--quant dwq-4-6` on a non-qwen35 fixture (`DwqArch::Other`)
+//! * T4 — `--quant dynamic-quant-4-6` on a non-qwen35 fixture (`DwqArch::Other`)
 //!   routes through the calibrator-driven DWQ byte-emit and produces a
 //!   GGUF with the documented `dwq-mixed-4-6` quant_method tag.
 //! * T5 — `--quant imatrix-adaptive` on the tiny fixture surfaces
@@ -336,7 +336,7 @@ fn imatrix_q4_k_m_differs_from_q4_k_m() {
 }
 
 // ---------------------------------------------------------------------
-// T4: dwq-4-6 routes through DwqCalibrator (DwqArch::Other path)
+// T4: dynamic-quant-4-6 routes through DwqCalibrator (DwqArch::Other path)
 // ---------------------------------------------------------------------
 
 #[test]
@@ -355,7 +355,7 @@ fn dwq_4_6_routes_through_dwq_calibrator() {
             "--format",
             "gguf",
             "--quant",
-            "dwq-4-6",
+            "dynamic-quant-4-6",
             "--output",
             output_dir.to_str().unwrap(),
             "--skip-quality",
@@ -380,13 +380,13 @@ fn dwq_4_6_routes_through_dwq_calibrator() {
             || stderr.contains("ADR-014 P2 iter-2")
             || stderr.contains("dwq calibrator: arch is weight-space")
             || stderr.contains("DwqKQuantizer dispatch"),
-        "dwq-4-6 dispatch must log the calibrator-driven path \
+        "dynamic-quant-4-6 dispatch must log the calibrator-driven path \
          (or the Iter C DwqKQuantizer dispatch), got: {stderr}"
     );
 
     // Output GGUF must exist.
     let gguf = locate_gguf(&output_dir);
-    assert!(gguf.exists(), "dwq-4-6 must produce a GGUF");
+    assert!(gguf.exists(), "dynamic-quant-4-6 must produce a GGUF");
 }
 
 // ---------------------------------------------------------------------
@@ -690,11 +690,11 @@ fn streaming_phase3_byte_identical_matrix_across_kquants() {
 }
 
 // ---------------------------------------------------------------------
-// T12: HF2Q_STREAMING_PHASE3 byte-identity for DwqK arm via dwq-4-6 (iter-63)
+// T12: HF2Q_STREAMING_PHASE3 byte-identity for DwqK arm via dynamic-quant-4-6 (iter-63)
 // ---------------------------------------------------------------------
 
 /// ADR-014 P7 iter-63 — extend the SHA gate to the DwqK arm
-/// (--quant dwq-4-6).  DwqK is the most complex Phase 3 dispatch:
+/// (--quant dynamic-quant-4-6).  DwqK is the most complex Phase 3 dispatch:
 /// per-tensor sensitive vs base routing via `is_sensitive_tensor` +
 /// `target_for(tensor_name)` + delegate to `KQuantCodecQuantizer` +
 /// `legacy_quant_method` override post-quantize.
@@ -722,7 +722,7 @@ fn streaming_phase3_byte_identical_dwq_4_6() {
             "convert",
             "--input", input_dir.to_str().unwrap(),
             "--format", "gguf",
-            "--quant", "dwq-4-6",
+            "--quant", "dynamic-quant-4-6",
             "--output", eager_dir.to_str().unwrap(),
             "--skip-quality",
         ])
@@ -736,7 +736,7 @@ fn streaming_phase3_byte_identical_dwq_4_6() {
             "convert",
             "--input", input_dir.to_str().unwrap(),
             "--format", "gguf",
-            "--quant", "dwq-4-6",
+            "--quant", "dynamic-quant-4-6",
             "--output", stream_dir.to_str().unwrap(),
             "--skip-quality",
         ])
@@ -748,7 +748,7 @@ fn streaming_phase3_byte_identical_dwq_4_6() {
 
     assert_eq!(
         eager_sha, stream_sha,
-        "dwq-4-6: HF2Q_STREAMING_PHASE3=1 GGUF must be byte-identical to \
+        "dynamic-quant-4-6: HF2Q_STREAMING_PHASE3=1 GGUF must be byte-identical to \
          eager — DwqK streaming wedge has lost byte-identity at file level\n\
          eager:  {eager_sha}\nstream: {stream_sha}"
     );
@@ -965,7 +965,7 @@ fn eager_run_to_run_determinism_q4_k_m() {
 /// 4-arm coverage now complete at the file level:
 ///   - K-quant codec direct       (iter-61 q4_k_m, iter-62 q5_k_m/q6_k)
 ///   - StaticQuantizer            (iter-67 f16 — THIS)
-///   - DwqK                       (iter-63 dwq-4-6)
+///   - DwqK                       (iter-63 dynamic-quant-4-6)
 ///   - ImatrixAdaptive            (deferred — needs qwen35 fixture)
 #[test]
 fn streaming_phase3_byte_identical_f16() {
@@ -1154,7 +1154,7 @@ fn streaming_phase3_mut_byte_identical_to_eager_q4_k_m() {
 /// (single K-quant codec arm) to the full 4-arm Phase 3 matrix:
 ///   - q5_k_m  → K-quant codec arm
 ///   - q6_k    → K-quant codec arm
-///   - dwq-4-6 → DwqK arm (iter-88)
+///   - dynamic-quant-4-6 → DwqK arm (iter-88)
 ///   - f16     → StaticQuantizer arm (iter-87)
 /// (imatrix-adaptive remains hardware-gated per iter-75; ImatrixAdaptive
 /// _MUT wire-up at iter-85 is structurally identical to other arms.)
@@ -1164,7 +1164,7 @@ fn streaming_phase3_mut_byte_identical_to_eager_q4_k_m() {
 /// has its file-level SHA-256 byte-identity locked vs eager.
 #[test]
 fn streaming_phase3_mut_byte_identical_matrix_across_arms() {
-    for variant in &["q5_k_m", "q6_k", "dwq-4-6", "f16"] {
+    for variant in &["q5_k_m", "q6_k", "dynamic-quant-4-6", "f16"] {
         let tmp = tempfile::tempdir().expect("tempdir");
         let input_dir = tmp.path().join("input");
         let eager_dir = tmp.path().join(format!("out_eager_mut_{}", variant.replace('-', "_")));

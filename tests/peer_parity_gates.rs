@@ -328,23 +328,23 @@ pub const GATE_CELLS: [GateCell; 8] = [
         rss_tolerance: 1.10,
         ppl_tolerance: 1.02,
     },
-    // Row 3: 27B dense | safetensors | DWQ (dwq-4-6)
+    // Row 3: 27B dense | safetensors | DWQ (dynamic-quant-4-6)
     //        | mlx_lm DWQ                  | ≤ 1.10× | ≤ 1.10× | ≤ 1.02×
     GateCell {
         model_id: "27B dense",
         backend: BackendKind::Safetensors,
-        calibrator_variant: "DWQ (dwq-4-6)",
+        calibrator_variant: "DWQ (dynamic-quant-4-6)",
         peer_id: PeerId::MlxLmDwq,
         speed_tolerance: 1.10,
         rss_tolerance: 1.10,
         ppl_tolerance: 1.02,
     },
-    // Row 4: 27B dense | GGUF | DWQ (dwq-4-6)
+    // Row 4: 27B dense | GGUF | DWQ (dynamic-quant-4-6)
     //        | (no peer; vs hf2q current pipeline) | ≤ 1.0× | ≤ 0.50× | ≤ 1.0×
     GateCell {
         model_id: "27B dense",
         backend: BackendKind::Gguf,
-        calibrator_variant: "DWQ (dwq-4-6)",
+        calibrator_variant: "DWQ (dynamic-quant-4-6)",
         peer_id: PeerId::Hf2qCurrentPipeline,
         speed_tolerance: 1.0,
         rss_tolerance: 0.50,
@@ -372,23 +372,23 @@ pub const GATE_CELLS: [GateCell; 8] = [
         rss_tolerance: 1.10,
         ppl_tolerance: 1.02,
     },
-    // Row 7: apex MoE | safetensors | DWQ (dwq-4-6)
+    // Row 7: apex MoE | safetensors | DWQ (dynamic-quant-4-6)
     //        | mlx_lm DWQ                  | ≤ 1.10× | ≤ 1.10× | ≤ 1.02×
     GateCell {
         model_id: "apex MoE",
         backend: BackendKind::Safetensors,
-        calibrator_variant: "DWQ (dwq-4-6)",
+        calibrator_variant: "DWQ (dynamic-quant-4-6)",
         peer_id: PeerId::MlxLmDwq,
         speed_tolerance: 1.10,
         rss_tolerance: 1.10,
         ppl_tolerance: 1.02,
     },
-    // Row 8: apex MoE | GGUF | DWQ (dwq-4-6)
+    // Row 8: apex MoE | GGUF | DWQ (dynamic-quant-4-6)
     //        | (no peer; vs hf2q current pipeline) | ≤ 1.0× | ≤ 0.50× | ≤ 1.0×
     GateCell {
         model_id: "apex MoE",
         backend: BackendKind::Gguf,
-        calibrator_variant: "DWQ (dwq-4-6)",
+        calibrator_variant: "DWQ (dynamic-quant-4-6)",
         peer_id: PeerId::Hf2qCurrentPipeline,
         speed_tolerance: 1.0,
         rss_tolerance: 0.50,
@@ -1247,12 +1247,12 @@ fn gate_cells_match_decision_15_verbatim() {
     let expected: [(&str, BackendKind, &str, PeerId, f64, f64, f64); 8] = [
         ("27B dense", BackendKind::Gguf, "None (q4_k_m)", PeerId::LlamaCppUncalibratedQ4KM, 1.10, 1.10, 1.02),
         ("27B dense", BackendKind::Gguf, "Imatrix (imatrix-q4_k_m)", PeerId::LlamaCppImatrixQ4KM, 1.10, 1.10, 1.02),
-        ("27B dense", BackendKind::Safetensors, "DWQ (dwq-4-6)", PeerId::MlxLmDwq, 1.10, 1.10, 1.02),
-        ("27B dense", BackendKind::Gguf, "DWQ (dwq-4-6)", PeerId::Hf2qCurrentPipeline, 1.0, 0.50, 1.0),
+        ("27B dense", BackendKind::Safetensors, "DWQ (dynamic-quant-4-6)", PeerId::MlxLmDwq, 1.10, 1.10, 1.02),
+        ("27B dense", BackendKind::Gguf, "DWQ (dynamic-quant-4-6)", PeerId::Hf2qCurrentPipeline, 1.0, 0.50, 1.0),
         ("apex MoE", BackendKind::Gguf, "None (q4_k_m)", PeerId::LlamaCppUncalibratedQ4KM, 1.10, 1.10, 1.02),
         ("apex MoE", BackendKind::Gguf, "Imatrix (imatrix-q4_k_m)", PeerId::LlamaCppImatrixQ4KM, 1.10, 1.10, 1.02),
-        ("apex MoE", BackendKind::Safetensors, "DWQ (dwq-4-6)", PeerId::MlxLmDwq, 1.10, 1.10, 1.02),
-        ("apex MoE", BackendKind::Gguf, "DWQ (dwq-4-6)", PeerId::Hf2qCurrentPipeline, 1.0, 0.50, 1.0),
+        ("apex MoE", BackendKind::Safetensors, "DWQ (dynamic-quant-4-6)", PeerId::MlxLmDwq, 1.10, 1.10, 1.02),
+        ("apex MoE", BackendKind::Gguf, "DWQ (dynamic-quant-4-6)", PeerId::Hf2qCurrentPipeline, 1.0, 0.50, 1.0),
     ];
 
     for (idx, (cell, want)) in GATE_CELLS.iter().zip(expected.iter()).enumerate() {

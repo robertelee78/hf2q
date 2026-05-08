@@ -54,10 +54,10 @@ enum QuantMethodMirror {
     // imatrix-adaptive — per-tensor optimal precision (preserves Apex)
     ImatrixAdaptive,
     // DWQ cells — dwq × bit-pair
-    Dwq46,
-    Dwq48,
-    Dwq68,
-    Dwq28,
+    DynamicQuant46,
+    DynamicQuant48,
+    DynamicQuant68,
+    DynamicQuant28,
 }
 
 /// Local mirror of `crate::calibrate::dwq::DwqArch`.
@@ -136,7 +136,7 @@ fn select_calibrator_mirror(
 ) -> Box<dyn CalibratorContract> {
     use QuantMethodMirror::*;
     match method {
-        Dwq46 | Dwq48 | Dwq68 | Dwq28 => {
+        DynamicQuant46 | DynamicQuant48 | DynamicQuant68 | DynamicQuant28 => {
             Box::new(DwqMirror { arch })
         }
         ImatrixQ4KM | ImatrixQ5KM | ImatrixQ6K | ImatrixAdaptive => {
@@ -181,10 +181,10 @@ fn select_calibrator_returns_none_for_static_methods() {
 #[test]
 fn select_calibrator_returns_dwq_for_dwq_methods() {
     let dwq_methods = [
-        QuantMethodMirror::Dwq46,
-        QuantMethodMirror::Dwq48,
-        QuantMethodMirror::Dwq68,
-        QuantMethodMirror::Dwq28,
+        QuantMethodMirror::DynamicQuant46,
+        QuantMethodMirror::DynamicQuant48,
+        QuantMethodMirror::DynamicQuant68,
+        QuantMethodMirror::DynamicQuant28,
     ];
     for m in dwq_methods {
         // arch=Other so no capture is needed for the trait-level check.
@@ -223,9 +223,9 @@ fn select_calibrator_returns_imatrix_for_imatrix_methods() {
 
 #[test]
 fn select_calibrator_dwq_arch_propagated() {
-    // Dwq46 with Qwen35MoE → requires_forward_pass == true.
+    // DynamicQuant46 with Qwen35MoE → requires_forward_pass == true.
     let c1 = select_calibrator_mirror(
-        QuantMethodMirror::Dwq46,
+        QuantMethodMirror::DynamicQuant46,
         DwqArchMirror::Qwen35MoE,
     );
     assert_eq!(c1.name(), "dwq");
@@ -234,16 +234,16 @@ fn select_calibrator_dwq_arch_propagated() {
         "DwqCalibrator + Qwen35MoE must require forward pass"
     );
 
-    // Dwq68 with Qwen35Dense → requires_forward_pass == true.
+    // DynamicQuant68 with Qwen35Dense → requires_forward_pass == true.
     let c2 = select_calibrator_mirror(
-        QuantMethodMirror::Dwq68,
+        QuantMethodMirror::DynamicQuant68,
         DwqArchMirror::Qwen35Dense,
     );
     assert!(c2.requires_forward_pass());
 
-    // Dwq28 with Other → requires_forward_pass == false.
+    // DynamicQuant28 with Other → requires_forward_pass == false.
     let c3 =
-        select_calibrator_mirror(QuantMethodMirror::Dwq28, DwqArchMirror::Other);
+        select_calibrator_mirror(QuantMethodMirror::DynamicQuant28, DwqArchMirror::Other);
     assert!(!c3.requires_forward_pass());
 }
 
@@ -254,10 +254,10 @@ fn select_calibrator_dwq_arch_other_no_capture_required() {
     // downstream weight-space contract for DwqArch::Other is
     // enforced separately in DwqCalibrator's unit tests.)
     for m in [
-        QuantMethodMirror::Dwq46,
-        QuantMethodMirror::Dwq48,
-        QuantMethodMirror::Dwq68,
-        QuantMethodMirror::Dwq28,
+        QuantMethodMirror::DynamicQuant46,
+        QuantMethodMirror::DynamicQuant48,
+        QuantMethodMirror::DynamicQuant68,
+        QuantMethodMirror::DynamicQuant28,
     ] {
         let calibrator = select_calibrator_mirror(m, DwqArchMirror::Other);
         assert_eq!(calibrator.name(), "dwq");
@@ -277,7 +277,7 @@ fn mirror_covers_every_quant_method() {
     fn classify(m: QuantMethodMirror) -> &'static str {
         use QuantMethodMirror::*;
         match m {
-            Dwq46 | Dwq48 | Dwq68 | Dwq28 => "dwq",
+            DynamicQuant46 | DynamicQuant48 | DynamicQuant68 | DynamicQuant28 => "dwq",
             ImatrixQ4KM | ImatrixQ5KM | ImatrixQ6K | ImatrixAdaptive => "imatrix",
             Auto | F16 | Bf16 | Q2 | Q4 | Q8 | Q4KM | Q5KM | Q6K => "none",
         }
@@ -296,10 +296,10 @@ fn mirror_covers_every_quant_method() {
     assert_eq!(classify(QuantMethodMirror::ImatrixQ5KM), "imatrix");
     assert_eq!(classify(QuantMethodMirror::ImatrixQ6K), "imatrix");
     assert_eq!(classify(QuantMethodMirror::ImatrixAdaptive), "imatrix");
-    assert_eq!(classify(QuantMethodMirror::Dwq46), "dwq");
-    assert_eq!(classify(QuantMethodMirror::Dwq48), "dwq");
-    assert_eq!(classify(QuantMethodMirror::Dwq68), "dwq");
-    assert_eq!(classify(QuantMethodMirror::Dwq28), "dwq");
+    assert_eq!(classify(QuantMethodMirror::DynamicQuant46), "dwq");
+    assert_eq!(classify(QuantMethodMirror::DynamicQuant48), "dwq");
+    assert_eq!(classify(QuantMethodMirror::DynamicQuant68), "dwq");
+    assert_eq!(classify(QuantMethodMirror::DynamicQuant28), "dwq");
 }
 
 /// ADR-014 P8 Decision 12: select_calibrator(ImatrixQ4KM) returns the
@@ -312,12 +312,12 @@ fn select_calibrator_imatrix_q4_k_m_routes_to_imatrix_calibrator() {
     assert!(calib.requires_forward_pass());
 }
 
-/// ADR-014 P8 Decision 12: select_calibrator(Dwq46) returns DwqCalibrator
+/// ADR-014 P8 Decision 12: select_calibrator(DynamicQuant46) returns DwqCalibrator
 /// (calibrator.name() == "dwq").
 #[test]
 fn select_calibrator_dwq_4_6_routes_to_dwq_calibrator() {
     let calib =
-        select_calibrator_mirror(QuantMethodMirror::Dwq46, DwqArchMirror::Qwen35MoE);
+        select_calibrator_mirror(QuantMethodMirror::DynamicQuant46, DwqArchMirror::Qwen35MoE);
     assert_eq!(calib.name(), "dwq");
     assert!(
         calib.requires_forward_pass(),

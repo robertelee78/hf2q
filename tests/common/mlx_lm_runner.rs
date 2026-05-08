@@ -1,6 +1,6 @@
 //! ADR-014 P10 iter-1 — subprocess wrappers for the mlx-lm
 //! cross-validation gates (Decision 15: 27B-dense + apex-MoE
-//! `safetensors + DWQ (dwq-4-6) vs mlx_lm DWQ` cells; plus the two
+//! `safetensors + DWQ (dynamic-quant-4-6) vs mlx_lm DWQ` cells; plus the two
 //! P9-deferred gates in `tests/safetensors_mlx_lm_round_trip.rs`).
 //!
 //! Per Decision 21 sovereignty: hf2q never links to mlx-lm at build
@@ -136,7 +136,7 @@ fn run_python_script(python: &Path, script: &str) -> (RunMetrics, String) {
 
 /// Runs `mlx_lm.convert` against `input_hf_dir`, producing a DWQ-4-6
 /// reference at `output_dir`. Used by the
-/// `safetensors + DWQ (dwq-4-6) vs mlx_lm DWQ` Decision 15 cells.
+/// `safetensors + DWQ (dynamic-quant-4-6) vs mlx_lm DWQ` Decision 15 cells.
 pub fn run_mlx_lm_convert(input_hf_dir: &Path, output_dir: &Path) -> RunMetrics {
     let python = match resolve_python_bin() {
         Some(p) => p,

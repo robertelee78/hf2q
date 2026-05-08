@@ -5,7 +5,7 @@
 //! DWQ calibration runs a forward pass through the calibration corpus
 //! to capture activations and produce per-layer sensitivity scores.
 //! Different bit-pair variants of the **same model on the same corpus**
-//! (e.g. `dwq-4-6` and `dwq-4-8`) produce identical sensitivity scores
+//! (e.g. `dynamic-quant-4-6` and `dynamic-quant-4-8`) produce identical sensitivity scores
 //! — only the downstream bit-allocation table differs. Without caching,
 //! each `hf2q convert ... --quant dwq-X-Y` invocation re-runs the
 //! forward pass from scratch, wasting tens of minutes per variant.
@@ -13,7 +13,7 @@
 //! This cache stores the per-layer sensitivity vector keyed on the
 //! triple `(model_meta_fingerprint, corpus_sha,
 //! sensitivity_algorithm_version)`. The second
-//! `hf2q convert ... --quant dwq-4-8` (after a `dwq-4-6` run on the
+//! `hf2q convert ... --quant dynamic-quant-4-8` (after a `dynamic-quant-4-6` run on the
 //! same model + same corpus) gets a cache hit and skips the forward
 //! pass entirely.
 //!

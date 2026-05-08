@@ -62,19 +62,19 @@ const CELLS: &[Cell] = &[
         model_path: "/opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf",
     },
     Cell {
-        fixture: "dwq46",
+        fixture: "dynamic-quant-46",
         prompt: "Hello, my name is",
         prompt_slug: "hello-my-name-is",
         model_path: "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46.gguf",
     },
     Cell {
-        fixture: "dwq46",
+        fixture: "dynamic-quant-46",
         prompt: "The quick brown fox",
         prompt_slug: "the-quick-brown-fox",
         model_path: "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46.gguf",
     },
     Cell {
-        fixture: "dwq46",
+        fixture: "dynamic-quant-46",
         prompt: "What is 2+2?",
         prompt_slug: "what-is-22",
         model_path: "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46.gguf",

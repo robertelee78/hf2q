@@ -16,7 +16,6 @@ mod debug;
 mod doctor;
 pub mod models;
 pub mod gguf_patch;
-pub mod gpu;
 pub mod inference;
 pub mod input;
 pub mod intelligence;
@@ -270,7 +269,7 @@ enum CaptureSpec {
 ///
 /// | Variant family                | Calibrator                                    |
 /// |-------------------------------|-----------------------------------------------|
-/// | `Dwq46` / `Dwq48` / `Dwq68` / `Dwq28` | [`DwqCalibrator`]                     |
+/// | `DynamicQuant46` / `DynamicQuant48` / `DynamicQuant68` / `DynamicQuant28` | [`DwqCalibrator`]                     |
 /// | `ImatrixQ4KM` / `ImatrixQ5KM` / `ImatrixQ6K` / `ImatrixAdaptive` | [`ImatrixCalibrator`] (requires capture for forward-pass arches; returns `Err(ForwardPassUnavailable)` otherwise — no NoneCalibrator silent fallback) |
 /// | `Auto` / `F16` / `Bf16` / `Q2` / `Q4` / `Q8` / `Q4KM` / `Q5KM` / `Q6K` | [`NoneCalibrator`] (uncalibrated path) |
 ///
@@ -310,7 +309,7 @@ fn select_calibrator(
 ) -> Result<Box<dyn calibrate::calibrator::Calibrator>, calibrate::calibrator::CalibrationError> {
     use cli::QuantMethod::*;
     match method {
-        Dwq46 | Dwq48 | Dwq68 | Dwq28 => {
+        DynamicQuant46 | DynamicQuant48 | DynamicQuant68 | DynamicQuant28 => {
             // P4 iter-1: route qwen35 DWQ through the lazy build path so
             // the calibrator constructs RealActivationCapture from the
             // resident tensor map.
@@ -428,13 +427,13 @@ fn build_calibration_corpus(
 /// for compactness — the same minimisation
 /// [`crate::calibrate::dwq_activation::indices_to_ranges`] applies.
 ///
-/// Returns an empty `Vec` for `CalibrationData::Dwq(empty)` (the
+/// Returns an empty `Vec` for `CalibrationData::DynamicQuant(empty)` (the
 /// `DwqArch::Other` weight-space contract) and for `CalibrationData::None`.
 fn dwq_calibration_to_sensitive_ranges(
     data: &calibrate::calibrator::CalibrationData,
 ) -> Vec<std::ops::RangeInclusive<usize>> {
     let map = match data {
-        calibrate::calibrator::CalibrationData::Dwq(m) => m,
+        calibrate::calibrator::CalibrationData::DynamicQuant(m) => m,
         _ => return Vec::new(),
     };
     let prefix = calibrate::dwq_calibrator::SENSITIVITY_TENSOR_PREFIX;
@@ -797,10 +796,10 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 "imatrix-q5_k_m" => cli::QuantMethod::ImatrixQ5KM,
                 "imatrix-q6_k" => cli::QuantMethod::ImatrixQ6K,
                 "imatrix-adaptive" => cli::QuantMethod::ImatrixAdaptive,
-                "dwq-4-6" => cli::QuantMethod::Dwq46,
-                "dwq-4-8" => cli::QuantMethod::Dwq48,
-                "dwq-6-8" => cli::QuantMethod::Dwq68,
-                "dwq-2-8" => cli::QuantMethod::Dwq28,
+                "dynamic-quant-4-6" => cli::QuantMethod::DynamicQuant46,
+                "dynamic-quant-4-8" => cli::QuantMethod::DynamicQuant48,
+                "dynamic-quant-6-8" => cli::QuantMethod::DynamicQuant68,
+                "dynamic-quant-2-8" => cli::QuantMethod::DynamicQuant28,
                 other => {
                     return Err(AppError::Conversion(anyhow::anyhow!(
                         "Auto mode recommended '{}' which is not in the \
@@ -851,7 +850,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     if config.bits.is_some() && config.quant.dwq_bit_pair().is_some() {
         return Err(AppError::Conversion(anyhow::anyhow!(
             "--bits is not used for DWQ; use --quant dwq-N-M to choose \
-             bit-pair variants (e.g. dwq-4-6, dwq-4-8, dwq-6-8, dwq-2-8)"
+             bit-pair variants (e.g. dynamic-quant-4-6, dynamic-quant-4-8, dynamic-quant-6-8, dynamic-quant-2-8)"
         )));
     }
 
@@ -1391,10 +1390,10 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
 
     let needs_dwq_lazy_capture = matches!(
         config.quant,
-        cli::QuantMethod::Dwq46
-            | cli::QuantMethod::Dwq48
-            | cli::QuantMethod::Dwq68
-            | cli::QuantMethod::Dwq28
+        cli::QuantMethod::DynamicQuant46
+            | cli::QuantMethod::DynamicQuant48
+            | cli::QuantMethod::DynamicQuant68
+            | cli::QuantMethod::DynamicQuant28
     ) && dwq_arch_for_dispatch.requires_activation_capture()
         && !backend.requires_native_quantization();
 
@@ -1491,7 +1490,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                              clone_tensor_map_to_lazy + calibrate (saves ~tensor_map bytes \
                              of peak memory on dense + MoE qwen35 sources)"
                         );
-                        Some(calibrate::calibrator::CalibrationData::Dwq(map))
+                        Some(calibrate::calibrator::CalibrationData::DynamicQuant(map))
                     }
                     _ => None,
                 },
@@ -1718,10 +1717,10 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 .context("imatrix-adaptive (variant K-quant) quantization failed")
                 .map_err(AppError::Conversion)?
             }
-            cli::QuantMethod::Dwq46
-            | cli::QuantMethod::Dwq48
-            | cli::QuantMethod::Dwq68
-            | cli::QuantMethod::Dwq28 => {
+            cli::QuantMethod::DynamicQuant46
+            | cli::QuantMethod::DynamicQuant48
+            | cli::QuantMethod::DynamicQuant68
+            | cli::QuantMethod::DynamicQuant28 => {
                 // ADR-014 P4: DWQ capture runs above through
                 // DwqCalibrator::with_activation_capture_lazy, directly
                 // from the resident tensor map. Convert the
@@ -1823,16 +1822,16 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     // fallback (per Iter B's contract; `dwq28` users
                     // wait for the codec port).
                     let variant = match config.quant {
-                        cli::QuantMethod::Dwq46 => {
+                        cli::QuantMethod::DynamicQuant46 => {
                             quantize::dwq_k_quantizer::DwqKVariant::P46
                         }
-                        cli::QuantMethod::Dwq48 => {
+                        cli::QuantMethod::DynamicQuant48 => {
                             quantize::dwq_k_quantizer::DwqKVariant::P48
                         }
-                        cli::QuantMethod::Dwq68 => {
+                        cli::QuantMethod::DynamicQuant68 => {
                             quantize::dwq_k_quantizer::DwqKVariant::P68
                         }
-                        cli::QuantMethod::Dwq28 => {
+                        cli::QuantMethod::DynamicQuant28 => {
                             quantize::dwq_k_quantizer::DwqKVariant::P28
                         }
                         // Outer match arm guarantees one of the four
@@ -2769,17 +2768,17 @@ fn detect_quant_method_from_path(path: &std::path::Path) -> String {
 
     // ADR-014 P8 Decision 12: detect the 17-variant menu strings.
     // Long forms before short to avoid substring collisions (e.g.
-    // "imatrix-q4_k_m" matched before "q4_k_m"; "dwq-4-6" matched
-    // before "dwq46"; "q4_k_m" matched before "q4").
+    // "imatrix-q4_k_m" matched before "q4_k_m"; "dynamic-quant-4-6" matched
+    // before "dynamic-quant-46"; "q4_k_m" matched before "q4").
     let known = [
         // Imatrix-calibrated K-quant (longest first)
         "imatrix-q4_k_m", "imatrix-q5_k_m", "imatrix-q6_k", "imatrix-adaptive",
         // Uncalibrated K-quant
         "q4_k_m", "q5_k_m", "q6_k",
         // DWQ kebab forms
-        "dwq-4-6", "dwq-4-8", "dwq-6-8", "dwq-2-8",
+        "dynamic-quant-4-6", "dynamic-quant-4-8", "dynamic-quant-6-8", "dynamic-quant-2-8",
         // DWQ filename suffixes
-        "dwq46", "dwq48", "dwq68", "dwq28",
+        "dynamic-quant-46", "dynamic-quant-48", "dynamic-quant-68", "dynamic-quant-28",
         // Flat / legacy block-quant variants
         "bf16", "f16",
         "q2", "q4", "q8",
@@ -2816,10 +2815,10 @@ fn quantizer_default_bits(method: &cli::QuantMethod) -> u8 {
         cli::QuantMethod::Q5KM | cli::QuantMethod::ImatrixQ5KM => 5,
         cli::QuantMethod::Q6K | cli::QuantMethod::ImatrixQ6K => 6,
         cli::QuantMethod::ImatrixAdaptive => 4, // Q4_K_M base
-        cli::QuantMethod::Dwq46 => 4,
-        cli::QuantMethod::Dwq48 => 4,
-        cli::QuantMethod::Dwq68 => 6,
-        cli::QuantMethod::Dwq28 => 2,
+        cli::QuantMethod::DynamicQuant46 => 4,
+        cli::QuantMethod::DynamicQuant48 => 4,
+        cli::QuantMethod::DynamicQuant68 => 6,
+        cli::QuantMethod::DynamicQuant28 => 2,
     }
 }
 

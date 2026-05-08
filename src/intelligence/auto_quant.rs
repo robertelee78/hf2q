@@ -809,8 +809,8 @@ fn next_valid_bits(base: u8, steps: u8) -> u8 {
 /// | Dense ≤30B  | any       | `imatrix-q4_k_m`   |
 /// | Dense >30B  | <64 GB    | `imatrix-q4_k_m`   |
 /// | Dense >30B  | ≥64 GB    | `imatrix-q5_k_m`   |
-/// | MoE any     | <96 GB    | `dwq-4-6`          |
-/// | MoE any     | ≥96 GB    | `dwq-4-8`          |
+/// | MoE any     | <96 GB    | `dynamic-quant-4-6`          |
+/// | MoE any     | ≥96 GB    | `dynamic-quant-4-8`          |
 ///
 /// `base_bits` is consulted only as a tiebreaker for the legacy
 /// flat / passthrough cells (16 → `f16`, 8 → `q8`, etc.); when an
@@ -853,9 +853,9 @@ fn plan_to_quant_method(
 
     if fingerprint.is_moe() {
         if total_gb >= 96.0 {
-            return "dwq-4-8".to_string();
+            return "dynamic-quant-4-8".to_string();
         }
-        return "dwq-4-6".to_string();
+        return "dynamic-quant-4-6".to_string();
     }
 
     // Dense path.
@@ -1415,10 +1415,10 @@ mod tests {
             plan_to_quant_method(16, ArchFamily::DenseDecoder, &fp_dense, &hw),
             "f16"
         );
-        // MoE on 128 GB → dwq-4-8 (≥96 GB).
+        // MoE on 128 GB → dynamic-quant-4-8 (≥96 GB).
         assert_eq!(
             plan_to_quant_method(2, ArchFamily::GemmaMoE, &fp_moe, &hw),
-            "dwq-4-8"
+            "dynamic-quant-4-8"
         );
     }
 
@@ -1463,27 +1463,27 @@ mod tests {
         );
     }
 
-    /// Decision 18 row 4: MoE any AND <96 GB → `dwq-4-6`.
+    /// Decision 18 row 4: MoE any AND <96 GB → `dynamic-quant-4-6`.
     #[test]
     fn test_decision18_moe_apex_64gb_resolves_to_dwq_4_6() {
         let hw = make_hardware("Apple M5 Max", 64);
         let fp = make_moe_fingerprint();
         let result = plan_to_quant_method(4, ArchFamily::GemmaMoE, &fp, &hw);
         assert_eq!(
-            result, "dwq-4-6",
-            "MoE with 64 GB RAM (<96 GB) → dwq-4-6, got: {result}"
+            result, "dynamic-quant-4-6",
+            "MoE with 64 GB RAM (<96 GB) → dynamic-quant-4-6, got: {result}"
         );
     }
 
-    /// Decision 18 row 5: MoE any AND ≥96 GB → `dwq-4-8`.
+    /// Decision 18 row 5: MoE any AND ≥96 GB → `dynamic-quant-4-8`.
     #[test]
     fn test_decision18_moe_apex_128gb_resolves_to_dwq_4_8() {
         let hw = make_hardware("Apple M5 Max", 128);
         let fp = make_moe_fingerprint();
         let result = plan_to_quant_method(4, ArchFamily::GemmaMoE, &fp, &hw);
         assert_eq!(
-            result, "dwq-4-8",
-            "MoE with 128 GB RAM (≥96 GB) → dwq-4-8, got: {result}"
+            result, "dynamic-quant-4-8",
+            "MoE with 128 GB RAM (≥96 GB) → dynamic-quant-4-8, got: {result}"
         );
     }
 

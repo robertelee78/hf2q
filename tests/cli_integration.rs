@@ -304,7 +304,7 @@ fn test_convert_help_lists_all_four_dwq_variants() {
         .unwrap();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for variant in ["dwq-4-6", "dwq-4-8", "dwq-6-8", "dwq-2-8"] {
+    for variant in ["dynamic-quant-4-6", "dynamic-quant-4-8", "dynamic-quant-6-8", "dynamic-quant-2-8"] {
         assert!(
             stdout.contains(variant),
             "--help must list {variant} (Decision 12 menu)"
@@ -337,7 +337,7 @@ fn test_bits_with_dwq_variant_errors_with_exact_message() {
     .unwrap();
     std::fs::write(input_dir.join("model.safetensors"), [0u8; 16]).unwrap();
 
-    for variant in ["dwq-2-8", "dwq-4-6", "dwq-4-8", "dwq-6-8"] {
+    for variant in ["dynamic-quant-2-8", "dynamic-quant-4-6", "dynamic-quant-4-8", "dynamic-quant-6-8"] {
         Command::cargo_bin("hf2q")
             .unwrap()
             .args([
@@ -361,7 +361,7 @@ fn test_bits_with_dwq_variant_errors_with_exact_message() {
 
 #[test]
 fn test_dwq_mixed48_dry_run_succeeds() {
-    // dwq-4-8 must be accepted by clap and reach the dry-run path.
+    // dynamic-quant-4-8 must be accepted by clap and reach the dry-run path.
     let tmp = tempfile::tempdir().unwrap();
     let input_dir = tmp.path().join("input");
 
@@ -390,7 +390,7 @@ fn test_dwq_mixed48_dry_run_succeeds() {
             "--format",
             "gguf",
             "--quant",
-            "dwq-4-8",
+            "dynamic-quant-4-8",
             "--dry-run",
         ])
         .assert()
@@ -421,7 +421,7 @@ fn test_dwq46_and_dwq48_default_filenames_do_not_collide() {
     .unwrap();
     std::fs::write(input46.join("model.safetensors"), [0u8; 16]).unwrap();
 
-    // dwq-4-6 should produce *-dwq46.gguf
+    // dynamic-quant-4-6 should produce *-dwq46.gguf
     let out46 = Command::cargo_bin("hf2q")
         .unwrap()
         .args([
@@ -431,23 +431,23 @@ fn test_dwq46_and_dwq48_default_filenames_do_not_collide() {
             "--format",
             "gguf",
             "--quant",
-            "dwq-4-6",
+            "dynamic-quant-4-6",
             "--dry-run",
         ])
         .output()
         .unwrap();
     let stderr46 = String::from_utf8_lossy(&out46.stderr);
     assert!(
-        stderr46.contains("dwq46"),
-        "dwq-4-6 dry-run output should mention 'dwq46' suffix; stderr={}",
+        stderr46.contains("dynamic-quant-46"),
+        "dynamic-quant-4-6 dry-run output should mention 'dwq46' suffix; stderr={}",
         stderr46
     );
     assert!(
-        !stderr46.contains("dwq48"),
-        "dwq-4-6 must not mention 'dwq48'"
+        !stderr46.contains("dynamic-quant-48"),
+        "dynamic-quant-4-6 must not mention 'dwq48'"
     );
 
-    // dwq-4-8 should produce *-dwq48.gguf
+    // dynamic-quant-4-8 should produce *-dwq48.gguf
     let out48 = Command::cargo_bin("hf2q")
         .unwrap()
         .args([
@@ -457,19 +457,19 @@ fn test_dwq46_and_dwq48_default_filenames_do_not_collide() {
             "--format",
             "gguf",
             "--quant",
-            "dwq-4-8",
+            "dynamic-quant-4-8",
             "--dry-run",
         ])
         .output()
         .unwrap();
     let stderr48 = String::from_utf8_lossy(&out48.stderr);
     assert!(
-        stderr48.contains("dwq48"),
-        "dwq-4-8 dry-run output should mention 'dwq48' suffix; stderr={}",
+        stderr48.contains("dynamic-quant-48"),
+        "dynamic-quant-4-8 dry-run output should mention 'dwq48' suffix; stderr={}",
         stderr48
     );
     assert!(
-        !stderr48.contains("dwq46"),
-        "dwq-4-8 must not mention 'dwq46'"
+        !stderr48.contains("dynamic-quant-46"),
+        "dynamic-quant-4-8 must not mention 'dwq46'"
     );
 }
