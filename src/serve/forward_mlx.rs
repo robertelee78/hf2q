@@ -5725,6 +5725,213 @@ mod ac5_iter_b_affine_qweight_roundtrip {
         );
     }
 
+    /// AC#5 Iter C — `dispatch_qmatmul` routes MlxQWeight with
+    /// `affine.is_some()` through the new packed kernel.  This is the
+    /// production entry point; correctness here = AC #5 dense closure
+    /// at the dispatch boundary.
+    #[test]
+    fn dispatch_qmatmul_routes_affine_weight_to_packed_kernel() {
+        let device = match mlx_native::MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping: no MlxDevice");
+                return;
+            }
+        };
+        let mut registry = mlx_native::KernelRegistry::new();
+
+        let m = 8usize;
+        let n = 32usize;
+        let k = 64usize;
+        let gs = 32usize;
+        let bits = 4u32;
+        let groups_per_row = k / gs;
+
+        let q_int: Vec<u8> = (0..(n * k)).map(|i| ((i * 7 + 3) % 16) as u8).collect();
+        let scales: Vec<f32> = (0..(n * groups_per_row))
+            .map(|i| 0.07 + (i as f32) * 0.0011)
+            .collect();
+        let biases: Vec<f32> = (0..(n * groups_per_row))
+            .map(|i| -0.09 + (i as f32) * 0.0027)
+            .collect();
+        let linear = MlxAffineLinear {
+            n,
+            k,
+            group_size: gs,
+            bits,
+            q_int: q_int.clone(),
+            scales: scales.clone(),
+            biases: biases.clone(),
+        };
+        let qweight =
+            MlxQWeight::from_mlx_affine_linear(&device, &linear).expect("from_mlx_affine_linear");
+
+        let x: Vec<f32> = (0..(m * k))
+            .map(|i| ((i as f32) * 0.011 - 0.3).cos() * 0.5)
+            .collect();
+        let mut x_buf = device
+            .alloc_buffer(m * k * 4, mlx_native::DType::F32, vec![m, k])
+            .expect("x");
+        x_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&x);
+
+        let mut y_buf = device
+            .alloc_buffer(m * n * 4, mlx_native::DType::F32, vec![m, n])
+            .expect("y");
+
+        // Drive through GraphSession exactly like production.
+        let executor = mlx_native::GraphExecutor::new(device.clone());
+        let mut session = executor.begin().expect("begin session");
+        dispatch_qmatmul(
+            &mut session,
+            &mut registry,
+            &device,
+            &x_buf,
+            &qweight,
+            &mut y_buf,
+            m as u32,
+        )
+        .expect("dispatch_qmatmul affine route");
+        session.finish().expect("finish");
+
+        // CPU oracle — same formula as Iter B test.
+        let mut expected = vec![0.0f32; m * n];
+        for r in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0f64;
+                for g in 0..groups_per_row {
+                    let s = scales[col * groups_per_row + g] as f64;
+                    let b = biases[col * groups_per_row + g] as f64;
+                    for i in 0..gs {
+                        let kk = g * gs + i;
+                        let q = q_int[col * k + kk] as f64;
+                        acc += (x[r * k + kk] as f64) * (q * s + b);
+                    }
+                }
+                expected[r * n + col] = acc as f32;
+            }
+        }
+
+        let got = y_buf.as_slice::<f32>().unwrap();
+        let mut max_abs = 0.0f32;
+        for i in 0..(m * n) {
+            let d = (got[i] - expected[i]).abs();
+            if d > max_abs {
+                max_abs = d;
+            }
+        }
+        assert!(
+            max_abs < 1e-3,
+            "dispatch_qmatmul affine route: max|y - oracle| = {max_abs}"
+        );
+    }
+
+    /// AC#5 Iter C — affine route is byte-identical to direct kernel
+    /// dispatch.  Confirms `dispatch_qmatmul` doesn't introduce any
+    /// per-call drift (e.g. wrong meta values, batch-dim confusion).
+    #[test]
+    fn dispatch_qmatmul_affine_equals_direct_kernel() {
+        let device = match mlx_native::MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping: no MlxDevice");
+                return;
+            }
+        };
+        let mut registry = mlx_native::KernelRegistry::new();
+
+        let m = 4usize;
+        let n = 32usize;
+        let k = 32usize;
+        let gs = 32usize;
+        let bits = 4u32;
+        let groups_per_row = k / gs;
+
+        let q_int: Vec<u8> = (0..(n * k)).map(|i| ((i * 5 + 1) % 16) as u8).collect();
+        let scales: Vec<f32> = (0..(n * groups_per_row))
+            .map(|i| 0.05 + (i as f32) * 0.001)
+            .collect();
+        let biases: Vec<f32> = (0..(n * groups_per_row))
+            .map(|i| -0.1 + (i as f32) * 0.002)
+            .collect();
+        let linear = MlxAffineLinear {
+            n,
+            k,
+            group_size: gs,
+            bits,
+            q_int,
+            scales,
+            biases,
+        };
+        let qweight =
+            MlxQWeight::from_mlx_affine_linear(&device, &linear).expect("from_mlx_affine_linear");
+        let extra = qweight.affine.as_ref().unwrap();
+
+        let x: Vec<f32> = (0..(m * k))
+            .map(|i| ((i as f32) * 0.017 + 0.2).sin() * 0.4)
+            .collect();
+        let mut x_buf = device
+            .alloc_buffer(m * k * 4, mlx_native::DType::F32, vec![m, k])
+            .expect("x");
+        x_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&x);
+
+        let mut y_via_dispatch = device
+            .alloc_buffer(m * n * 4, mlx_native::DType::F32, vec![m, n])
+            .expect("y_d");
+        let y_direct = device
+            .alloc_buffer(m * n * 4, mlx_native::DType::F32, vec![m, n])
+            .expect("y_k");
+        let mut meta = device
+            .alloc_buffer(16, mlx_native::DType::U32, vec![4])
+            .unwrap();
+        meta.as_mut_slice::<u32>().unwrap().copy_from_slice(&[
+            m as u32, n as u32, k as u32, gs as u32,
+        ]);
+
+        // Direct kernel call.
+        let mut encoder = device.command_encoder().unwrap();
+        mlx_native::ops::qmm_affine::dispatch_qmm_affine_t_packed_simd4_b4(
+            &mut encoder,
+            &mut registry,
+            device.metal_device(),
+            &x_buf,
+            &qweight.buffer,
+            &extra.scales,
+            &extra.biases,
+            &y_direct,
+            &meta,
+            m as u32, n as u32, k as u32, gs as u32, bits,
+        )
+        .unwrap();
+        encoder.commit_and_wait().unwrap();
+
+        // dispatch_qmatmul path.
+        let executor = mlx_native::GraphExecutor::new(device.clone());
+        let mut session = executor.begin().expect("begin session");
+        dispatch_qmatmul(
+            &mut session,
+            &mut registry,
+            &device,
+            &x_buf,
+            &qweight,
+            &mut y_via_dispatch,
+            m as u32,
+        )
+        .expect("dispatch_qmatmul");
+        session.finish().expect("finish");
+
+        let direct = y_direct.as_slice::<f32>().unwrap();
+        let dispatch = y_via_dispatch.as_slice::<f32>().unwrap();
+        for i in 0..(m * n) {
+            assert_eq!(
+                dispatch[i].to_bits(),
+                direct[i].to_bits(),
+                "y[{i}] (m={m} n={n}): dispatch={} direct={}",
+                dispatch[i],
+                direct[i],
+            );
+        }
+    }
+
     #[test]
     fn from_mlx_affine_linear_rejects_unsupported_bits() {
         let device = match mlx_native::MlxDevice::new() {
@@ -5916,6 +6123,47 @@ pub fn dispatch_qmatmul(
     output: &mut MlxBuffer,
     m: u32,
 ) -> Result<()> {
+    // ADR-020 AC#5 Iter C — affine route MUST be checked first (before
+    // F32/GGML).  When `weight.affine` is `Some`, the buffer holds
+    // packed-U32 mlx-affine codes and `info.ggml_dtype` is a sentinel.
+    if let Some(extra) = weight.affine.as_ref() {
+        if extra.bits != 4 || extra.group_size != 32 {
+            return Err(anyhow::anyhow!(
+                "dispatch_qmatmul affine: only bits=4, group_size=32 supported in AC#5 Iter C; got bits={} gs={}",
+                extra.bits,
+                extra.group_size,
+            ));
+        }
+        let n = weight.info.rows as u32;
+        let k = weight.info.cols as u32;
+        // Per-call meta buffer [M, N, K, group_size] — M varies per
+        // dispatch (decode m=1 vs prefill m≥2), so it can't be cached
+        // on the weight.
+        let mut meta = device
+            .alloc_buffer(16, mlx_native::DType::U32, vec![4])
+            .map_err(|e| anyhow::anyhow!("affine meta alloc: {e}"))?;
+        meta.as_mut_slice::<u32>()
+            .map_err(|e| anyhow::anyhow!("affine meta slice: {e}"))?
+            .copy_from_slice(&[m, n, k, extra.group_size]);
+        return mlx_native::ops::qmm_affine::dispatch_qmm_affine_t_packed_simd4_b4(
+            session.encoder_mut(),
+            registry,
+            device.metal_device(),
+            input,
+            &weight.buffer,
+            &extra.scales,
+            &extra.biases,
+            output,
+            &meta,
+            m,
+            n,
+            k,
+            extra.group_size,
+            extra.bits,
+        )
+        .map_err(|e| anyhow::anyhow!("qmm_affine_t_packed_simd4_b4 failed: {e}"));
+    }
+
     if weight.info.ggml_dtype == mlx_native::GgmlType::F32 {
         // F32 dense path. Weight buffer holds [n_rows, k_cols] f32 row-major.
         // dense_matmul_f32_f32_tensor expects:
