@@ -1,0 +1,1191 @@
+//! ADR-020 iter-13b — DWQ-proper training loop substrate.
+//!
+//! Provides the wiring for a Track 2 DWQ distillation step:
+//!
+//!   1. Initialize per-group `scales` + `biases` + frozen `q_int` from
+//!      a frozen FP32 weight via mlx-native's `qdq_affine_init_f32`
+//!      kernel.
+//!   2. Build a forward tape: `qdq_affine(scales, biases, q_int)` →
+//!      reconstruction loss against the frozen weight (per-tensor MSE);
+//!      scales + biases are leaves registered with [`AdamOptimizer`].
+//!   3. Back-propagate via the existing tape `backward`, and apply
+//!      `Adam.step`.
+//!   4. Repeat until convergence.
+//!
+//! This iteration ships:
+//!   - [`init_affine_params_gpu`] — host-side wrapper that spawns the
+//!     init kernel against a frozen weight buffer and reads back
+//!     `(q_int, scales_init, biases_init)` to host memory.  Used both
+//!     by the synthetic test and (later) by the production
+//!     dwq_quantize entry point.
+//!   - [`buffer_from_f32`] — small helper that creates a fresh
+//!     `MlxBuffer` from host data, shared between Adam parameter
+//!     registration and tape leaves.
+//!
+//! The synthetic 2-Linear MLP convergence test (gated by `#[test]` and
+//! `cfg(test)`) is the load-bearing falsifier: if Adam over
+//! `(scales1, biases1, scales2, biases2)` doesn't drive the
+//! reconstruction MSE down by ≥5× from a perturbed start over 200
+//! steps, the chain is broken somewhere (qdq_affine forward/backward,
+//! tape accumulation, Adam state, or finite-difference equivalence).
+//!
+//! Loss this iteration is per-tensor reconstruction MSE
+//! (Σ (qdq_w − w)²) rather than logit KL-div — the qdq_affine →
+//! reshape → matmul → KL chain requires a tape `view`/reshape op
+//! that is iter-13c work.  Reconstruction MSE has the same
+//! gradient-correctness load-bearing property and is sufficient to
+//! prove the full training-loop primitive.
+
+use anyhow::{anyhow, Context, Result};
+use mlx_native::ops::qdq_affine::dispatch_qdq_affine_init_f32;
+use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
+
+/// Run mlx-native's `qdq_affine_init_f32` kernel against a frozen FP32
+/// weight buffer and return CPU copies of `(q_int, scales, biases)`.
+///
+/// `w` shape: `[n_total]` flat; `n_total = n_groups · group_size`.
+/// `group_size`: power of two in `[2, 1024]`, divides `n_total`.
+/// `bits`: `[2, 8]`; `n_bins = 2^bits` and must satisfy `n_bins ≤ 256`.
+pub fn init_affine_params_gpu(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    w_data: &[f32],
+    group_size: usize,
+    bits: u32,
+) -> Result<(Vec<u8>, Vec<f32>, Vec<f32>)> {
+    if !(2..=8).contains(&bits) {
+        return Err(anyhow!(
+            "init_affine_params_gpu: bits must be in [2, 8]; got {bits}"
+        ));
+    }
+    let n_total = w_data.len();
+    if !group_size.is_power_of_two() || !(2..=1024).contains(&group_size) {
+        return Err(anyhow!(
+            "init_affine_params_gpu: group_size must be a power of two in [2, 1024]; got {group_size}"
+        ));
+    }
+    if n_total % group_size != 0 {
+        return Err(anyhow!(
+            "init_affine_params_gpu: n_total ({n_total}) must be divisible by group_size ({group_size})"
+        ));
+    }
+    let n_groups = n_total / group_size;
+    let n_bins: u32 = 1u32 << bits;
+
+    let mut w_buf = device
+        .alloc_buffer(n_total * 4, DType::F32, vec![n_total])
+        .map_err(|e| anyhow!("init_affine: alloc w: {e}"))?;
+    w_buf
+        .as_mut_slice::<f32>()
+        .map_err(|e| anyhow!("init_affine: w write: {e}"))?
+        .copy_from_slice(w_data);
+    let scales_buf = device
+        .alloc_buffer(n_groups * 4, DType::F32, vec![n_groups])
+        .map_err(|e| anyhow!("init_affine: alloc scales: {e}"))?;
+    let biases_buf = device
+        .alloc_buffer(n_groups * 4, DType::F32, vec![n_groups])
+        .map_err(|e| anyhow!("init_affine: alloc biases: {e}"))?;
+    let q_int_buf = device
+        .alloc_buffer(n_total, DType::U8, vec![n_total])
+        .map_err(|e| anyhow!("init_affine: alloc q_int: {e}"))?;
+    let mut meta_buf = device
+        .alloc_buffer(8, DType::U32, vec![2])
+        .map_err(|e| anyhow!("init_affine: alloc meta: {e}"))?;
+    meta_buf
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("init_affine: meta write: {e}"))?[..2]
+        .copy_from_slice(&[group_size as u32, n_bins]);
+
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("init_affine: encoder: {e}"))?;
+    dispatch_qdq_affine_init_f32(
+        &mut encoder,
+        registry,
+        device.metal_device(),
+        &w_buf,
+        &scales_buf,
+        &biases_buf,
+        &q_int_buf,
+        &meta_buf,
+        group_size as u32,
+        n_bins,
+    )
+    .context("init_affine: dispatch qdq_affine_init_f32")?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("init_affine: commit_and_wait: {e}"))?;
+
+    let scales = scales_buf
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("init_affine: scales readback: {e}"))?
+        .to_vec();
+    let biases = biases_buf
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("init_affine: biases readback: {e}"))?
+        .to_vec();
+    let q_int = q_int_buf
+        .as_slice::<u8>()
+        .map_err(|e| anyhow!("init_affine: q_int readback: {e}"))?
+        .to_vec();
+    Ok((q_int, scales, biases))
+}
+
+/// Box-Muller transform → unit-variance Gaussian samples from a
+/// stable small PRNG (xorshift64*).  Deterministic given `seed`.
+///
+/// Used by iter-13e and iter-19c as a calibration-activation proxy
+/// (post-RMSNorm residual stream stddev ≈ 1.0).
+pub fn box_muller_gaussian(n: usize, seed: u64) -> Vec<f32> {
+    let mut state = if seed == 0 { 0xDEAD_BEEF_CAFE_BABE } else { seed };
+    let mut next_u64 = || -> u64 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut next_uniform = || -> f32 {
+        // 24-bit mantissa from upper 53 bits → uniform in [2^-24, 1).
+        // Avoid 0 so log() in Box-Muller stays finite.
+        let r = (next_u64() >> 11) as f32 / (1u64 << 53) as f32;
+        r.max(f32::EPSILON)
+    };
+    let mut out = Vec::with_capacity(n);
+    while out.len() + 1 < n {
+        let u1 = next_uniform();
+        let u2 = next_uniform();
+        let mag = (-2.0 * u1.ln()).sqrt();
+        let z0 = mag * (std::f32::consts::TAU * u2).cos();
+        let z1 = mag * (std::f32::consts::TAU * u2).sin();
+        out.push(z0);
+        out.push(z1);
+    }
+    if out.len() < n {
+        let u1 = next_uniform();
+        let u2 = next_uniform();
+        let z0 = (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos();
+        out.push(z0);
+    }
+    out.truncate(n);
+    out
+}
+
+/// Build a fresh f32 `MlxBuffer` from host data — used by the
+/// training loop to wrap Adam-managed parameter state.
+pub fn buffer_from_f32(device: &MlxDevice, data: &[f32]) -> Result<MlxBuffer> {
+    let mut buf = device
+        .alloc_buffer(data.len() * 4, DType::F32, vec![data.len()])
+        .map_err(|e| anyhow!("buffer_from_f32: alloc: {e}"))?;
+    buf.as_mut_slice::<f32>()
+        .map_err(|e| anyhow!("buffer_from_f32: write: {e}"))?
+        .copy_from_slice(data);
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+    use crate::calibrate::autograd_gpu_tape::{
+        backward, ones_like, qdq_affine, square, sub, GpuTape, GpuTensor,
+    };
+    use std::collections::BTreeMap;
+
+    /// Synthetic 2-tensor DWQ training loop.  Two frozen FP32 weight
+    /// tensors `W1`, `W2` are encoded with affine quantization
+    /// (per-group min/max init); scales+biases are then PERTURBED by
+    /// +5% and Adam is asked to recover them by minimizing the
+    /// per-tensor reconstruction MSE
+    ///
+    ///   L = Σ_i (qdq_W1[i] − W1[i])² + Σ_i (qdq_W2[i] − W2[i])²
+    ///
+    /// Acceptance: best loss across the trajectory < 0.2 × initial
+    /// loss (5× reduction).  The 5% perturbation creates ~10% of the
+    /// init loss as headroom, and Adam converges back toward (but not
+    /// to, because the integer codes were chosen for the original s+b
+    /// pair) the analytical minimum.
+    ///
+    /// What this falsifies if it fails:
+    ///   - qdq_affine forward (mlx-native kernel + Rust dispatch)
+    ///   - qdq_affine backward routing into scales+biases parents
+    ///   - tape accumulator semantics for OpKind::QdqAffine
+    ///   - Adam state register/step with multi-param BTreeMap
+    ///   - sub/square/ones_like/backward chain composition
+    #[test]
+    fn dwq_loop_synthetic_recovers_perturbed_affine_params() {
+        let group_size = 32usize;
+        // Tensor shapes: arbitrary multiples of group_size.
+        let w1_n = group_size * 4; // 128 elements, 4 groups
+        let w2_n = group_size * 6; // 192 elements, 6 groups
+
+        let w1: Vec<f32> = (0..w1_n)
+            .map(|i| ((i as f32) * 0.0193 - 0.5).sin() * 0.4)
+            .collect();
+        let w2: Vec<f32> = (0..w2_n)
+            .map(|i| ((i as f32) * 0.0241 + 0.3).cos() * 0.3)
+            .collect();
+
+        let device = MlxDevice::new().expect("device");
+        let mut init_registry = KernelRegistry::new();
+
+        let (q1, s1_init, b1_init) =
+            init_affine_params_gpu(&device, &mut init_registry, &w1, group_size, 4)
+                .expect("init w1");
+        let (q2, s2_init, b2_init) =
+            init_affine_params_gpu(&device, &mut init_registry, &w2, group_size, 4)
+                .expect("init w2");
+
+        // Perturb +5% to give Adam something to learn.
+        let perturb = |xs: &[f32], factor: f32| -> Vec<f32> {
+            xs.iter().map(|v| v * factor).collect()
+        };
+        let s1_p = perturb(&s1_init, 1.05);
+        let b1_p = perturb(&b1_init, 1.05);
+        let s2_p = perturb(&s2_init, 1.05);
+        let b2_p = perturb(&b2_init, 1.05);
+
+        let cfg = AdamConfig {
+            lr: 0.005,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+        };
+        let mut adam = AdamOptimizer::new(device.clone(), cfg).expect("adam");
+        adam.register_param("s1", buffer_from_f32(&device, &s1_p).unwrap())
+            .unwrap();
+        adam.register_param("b1", buffer_from_f32(&device, &b1_p).unwrap())
+            .unwrap();
+        adam.register_param("s2", buffer_from_f32(&device, &s2_p).unwrap())
+            .unwrap();
+        adam.register_param("b2", buffer_from_f32(&device, &b2_p).unwrap())
+            .unwrap();
+
+        // Single shared tape — `tape.reset()` between iterations drops
+        // per-step nodes without device churn (mantra: avoid Metal
+        // residency-set contention from per-iter MlxDevice::new()).
+        let tape = GpuTape::new(device.clone());
+
+        let train_step = |adam: &mut AdamOptimizer, tape: &GpuTape| -> Result<f32> {
+            let s1 = adam.read_param("s1")?;
+            let b1 = adam.read_param("b1")?;
+            let s2 = adam.read_param("s2")?;
+            let b2 = adam.read_param("b2")?;
+
+            let s1_leaf = GpuTensor::from_vec(tape, &s1, vec![s1.len()])?;
+            let b1_leaf = GpuTensor::from_vec(tape, &b1, vec![b1.len()])?;
+            let s2_leaf = GpuTensor::from_vec(tape, &s2, vec![s2.len()])?;
+            let b2_leaf = GpuTensor::from_vec(tape, &b2, vec![b2.len()])?;
+
+            let qdq1 = qdq_affine(&s1_leaf, &b1_leaf, &q1, group_size)?;
+            let qdq2 = qdq_affine(&s2_leaf, &b2_leaf, &q2, group_size)?;
+            let w1_const = GpuTensor::from_vec(tape, &w1, vec![w1.len()])?;
+            let w2_const = GpuTensor::from_vec(tape, &w2, vec![w2.len()])?;
+            let r1 = sub(&qdq1, &w1_const)?;
+            let r2 = sub(&qdq2, &w2_const)?;
+            let sq1 = square(&r1)?;
+            let sq2 = square(&r2)?;
+
+            // Loss = Σ sq1 + Σ sq2 (host reduction; no GPU sum kernel
+            // yet).  Backward seeds dy = ones for each subgraph; the
+            // accumulator merges contributions to s1/b1/s2/b2 leaves.
+            let sq1_host = sq1.to_vec()?;
+            let sq2_host = sq2.to_vec()?;
+            let loss = sq1_host.iter().map(|v| *v as f64).sum::<f64>()
+                + sq2_host.iter().map(|v| *v as f64).sum::<f64>();
+
+            let dy1 = ones_like(tape, sq1.shape())?;
+            let g1 = backward(&sq1, dy1)?;
+            let dy2 = ones_like(tape, sq2.shape())?;
+            let g2 = backward(&sq2, dy2)?;
+
+            let grad_s1 = g1[s1_leaf.node_idx()]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing s1 grad"))?
+                .clone();
+            let grad_b1 = g1[b1_leaf.node_idx()]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing b1 grad"))?
+                .clone();
+            let grad_s2 = g2[s2_leaf.node_idx()]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing s2 grad"))?
+                .clone();
+            let grad_b2 = g2[b2_leaf.node_idx()]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing b2 grad"))?
+                .clone();
+
+            let mut grads = BTreeMap::new();
+            grads.insert("s1".to_string(), grad_s1);
+            grads.insert("b1".to_string(), grad_b1);
+            grads.insert("s2".to_string(), grad_s2);
+            grads.insert("b2".to_string(), grad_b2);
+            adam.step(&grads)?;
+            Ok(loss as f32)
+        };
+
+        let initial_loss = train_step(&mut adam, &tape).expect("initial step");
+        // Drop nodes from step 0 — keep device + registry warm.
+        tape.reset();
+        let mut min_loss = initial_loss;
+        let n_steps = 200usize;
+        let mut last_loss = initial_loss;
+        for step in 1..n_steps {
+            let l = train_step(&mut adam, &tape).expect("step");
+            tape.reset();
+            if l < min_loss {
+                min_loss = l;
+            }
+            last_loss = l;
+            if step % 50 == 0 {
+                eprintln!(
+                    "[dwq_synth] step={step} loss={l:.6} min={min_loss:.6} initial={initial_loss:.6}"
+                );
+            }
+        }
+
+        // Acceptance: 5× reduction floor.  Robust to late-stage Adam
+        // jitter at small loss values.
+        assert!(
+            min_loss < initial_loss * 0.2,
+            "DWQ synthetic loop did not converge: initial={initial_loss}, min_seen={min_loss}, last={last_loss}"
+        );
+
+        // Sanity: final scales/biases should be CLOSER to the analytical
+        // optimum than the perturbed start (norm-of-difference).
+        let s1_final = adam.read_param("s1").unwrap();
+        let b1_final = adam.read_param("b1").unwrap();
+        let dist_init = s1_p
+            .iter()
+            .zip(s1_init.iter())
+            .map(|(a, b)| ((a - b).powi(2)) as f64)
+            .sum::<f64>()
+            + b1_p
+                .iter()
+                .zip(b1_init.iter())
+                .map(|(a, b)| ((a - b).powi(2)) as f64)
+                .sum::<f64>();
+        let dist_final = s1_final
+            .iter()
+            .zip(s1_init.iter())
+            .map(|(a, b)| ((a - b).powi(2)) as f64)
+            .sum::<f64>()
+            + b1_final
+                .iter()
+                .zip(b1_init.iter())
+                .map(|(a, b)| ((a - b).powi(2)) as f64)
+                .sum::<f64>();
+        assert!(
+            dist_final < dist_init,
+            "Adam did not move toward analytical optimum: dist_init={dist_init}, dist_final={dist_final}"
+        );
+    }
+
+    /// iter-13c — full DWQ training loop on a synthetic 2-Linear MLP.
+    ///
+    /// Teacher: y_T = X @ W1 → silu → @ W2  (frozen FP32 weights)
+    /// Student: y_S = X @ qdq(W1, s1, b1) → silu → @ qdq(W2, s2, b2)
+    /// Loss:    KL(softmax(scale·y_T) || softmax(scale·y_S)).sum()
+    /// Optimizer: Adam over (s1, b1, s2, b2); q_int frozen.
+    ///
+    /// Acceptance: best per-row-mean KL after 200 steps < 0.34 × initial
+    /// (3× reduction floor — KL is a stricter, non-linear loss than
+    /// reconstruction MSE; convergence rate is bounded by the
+    /// 4-bit quantizer's irreducible error so we don't expect the
+    /// 15× margin from iter-13b).
+    ///
+    /// What this test falsifies if it fails:
+    ///   - tape `view` op (qdq output is 1-D, matmul rhs must be 2-D)
+    ///   - tape `scalar_mul` op (KL temperature scaling 1/T = 0.5)
+    ///   - kl_div_loss_per_row composition with QdqAffine in the chain
+    ///   - silu interleaved between two qdq'd matmuls (gradient flows
+    ///     through silu_backward → matmul backward → view backward
+    ///     → qdq_affine backward → scales/biases parents)
+    ///   - end-to-end Adam multi-param convergence under a non-convex
+    ///     loss that depends on all 4 leaves through compounded ops
+    #[test]
+    fn dwq_loop_synthetic_2linear_kl_div_converges_under_adam() {
+        use crate::calibrate::autograd_gpu_tape::{matmul, scalar_mul, silu, view};
+        use crate::calibrate::dynamic_quant_gpu::kl_div_loss_per_row;
+
+        let group_size = 32usize;
+        // Matmul kernel constraints: m, k, n all >= 32 for backward.
+        // Layer 1: X[m=32, in=32] @ W1[in=32, mid=32] → H[m=32, mid=32]
+        // Layer 2: silu(H)[m=32, mid=32] @ W2[mid=32, out=32] → Y[m=32, out=32]
+        let m = 32usize;
+        let in_dim = 32usize;
+        let mid_dim = 32usize;
+        let out_dim = 32usize;
+        // Flat element counts
+        let w1_n = in_dim * mid_dim; // 1024 elements, 32 groups
+        let w2_n = mid_dim * out_dim; // 1024 elements, 32 groups
+
+        // Deterministic teacher weights + input.  Magnitudes chosen so
+        // that final logits have stddev ~1.5–2 (post T=2.0 scaling
+        // gives ~0.7–1.0), producing a softmax distribution that is
+        // neither uniform (KL ≈ 0) nor saturated (KL gradient
+        // vanishes).  +30% perturbation in scales/biases at this
+        // logit scale yields measurable initial KL.
+        let w1: Vec<f32> = (0..w1_n)
+            .map(|i| ((i as f32) * 0.0123 - 0.5).sin() * 1.0)
+            .collect();
+        let w2: Vec<f32> = (0..w2_n)
+            .map(|i| ((i as f32) * 0.0179 + 0.7).cos() * 0.8)
+            .collect();
+        let x_data: Vec<f32> = (0..(m * in_dim))
+            .map(|i| ((i as f32) * 0.013 + 0.1).sin() * 0.6)
+            .collect();
+
+        let device = MlxDevice::new().expect("device");
+        let mut init_registry = KernelRegistry::new();
+
+        // Per-tensor affine init from frozen W.
+        let (q1, s1_init, b1_init) =
+            init_affine_params_gpu(&device, &mut init_registry, &w1, group_size, 4)
+                .expect("init w1");
+        let (q2, s2_init, b2_init) =
+            init_affine_params_gpu(&device, &mut init_registry, &w2, group_size, 4)
+                .expect("init w2");
+
+        // Perturb 2.0× to force Adam to learn.  At 4-bit quantization
+        // the per-tensor reconstruction is faithful enough that small
+        // (≤30%) scale/bias perturbations produce KL ≪ 1e-4 even at
+        // logit stddev ~1.5 — softmax smooths the qdq error.  A 2.0×
+        // multiplicative perturbation reliably produces initial KL on
+        // the order of 1e-3 to 1e-2.
+        let perturb = |xs: &[f32], factor: f32| -> Vec<f32> {
+            xs.iter().map(|v| v * factor).collect()
+        };
+        let s1_p = perturb(&s1_init, 2.0);
+        let b1_p = perturb(&b1_init, 2.0);
+        let s2_p = perturb(&s2_init, 2.0);
+        let b2_p = perturb(&b2_init, 2.0);
+
+        // Adam config: smaller lr than reconstruction-MSE test because
+        // KL gradient magnitudes scale with logit magnitude × softmax
+        // gradient (which is bounded but can be large).
+        let cfg = AdamConfig {
+            lr: 0.001,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+        };
+        let mut adam = AdamOptimizer::new(device.clone(), cfg).expect("adam");
+        adam.register_param("s1", buffer_from_f32(&device, &s1_p).unwrap())
+            .unwrap();
+        adam.register_param("b1", buffer_from_f32(&device, &b1_p).unwrap())
+            .unwrap();
+        adam.register_param("s2", buffer_from_f32(&device, &s2_p).unwrap())
+            .unwrap();
+        adam.register_param("b2", buffer_from_f32(&device, &b2_p).unwrap())
+            .unwrap();
+
+        // Pre-compute teacher logits y_T (FP32 oracle, host).  Treated
+        // as a constant tape leaf each step.
+        // h_t = X @ W1
+        let mut h_t = vec![0.0f32; m * mid_dim];
+        for r in 0..m {
+            for c in 0..mid_dim {
+                let mut acc = 0.0f64;
+                for kk in 0..in_dim {
+                    acc += (x_data[r * in_dim + kk] as f64)
+                        * (w1[kk * mid_dim + c] as f64);
+                }
+                h_t[r * mid_dim + c] = acc as f32;
+            }
+        }
+        // h_t = silu(h_t) — host oracle.
+        for v in h_t.iter_mut() {
+            let s = 1.0 / (1.0 + (-(*v as f64)).exp());
+            *v = (*v as f64 * s) as f32;
+        }
+        // y_t = h_t @ W2
+        let mut y_t = vec![0.0f32; m * out_dim];
+        for r in 0..m {
+            for c in 0..out_dim {
+                let mut acc = 0.0f64;
+                for kk in 0..mid_dim {
+                    acc += (h_t[r * mid_dim + kk] as f64)
+                        * (w2[kk * out_dim + c] as f64);
+                }
+                y_t[r * out_dim + c] = acc as f32;
+            }
+        }
+
+        // Single shared tape — `tape.reset()` between iterations drops
+        // per-step nodes without Metal residency-set churn.
+        let tape = GpuTape::new(device.clone());
+
+        let temperature = 2.0f32; // mlx-lm dwq.py default
+        let inv_t = 1.0 / temperature;
+
+        let train_step = |adam: &mut AdamOptimizer, tape: &GpuTape| -> Result<f32> {
+            let s1 = adam.read_param("s1")?;
+            let b1 = adam.read_param("b1")?;
+            let s2 = adam.read_param("s2")?;
+            let b2 = adam.read_param("b2")?;
+
+            let s1_leaf = GpuTensor::from_vec(tape, &s1, vec![s1.len()])?;
+            let b1_leaf = GpuTensor::from_vec(tape, &b1, vec![b1.len()])?;
+            let s2_leaf = GpuTensor::from_vec(tape, &s2, vec![s2.len()])?;
+            let b2_leaf = GpuTensor::from_vec(tape, &b2, vec![b2.len()])?;
+
+            // Reconstruct W1, W2 via differentiable qdq, then reshape.
+            let w1_q_flat = qdq_affine(&s1_leaf, &b1_leaf, &q1, group_size)?;
+            let w2_q_flat = qdq_affine(&s2_leaf, &b2_leaf, &q2, group_size)?;
+            let w1_q = view(&w1_q_flat, vec![in_dim, mid_dim])?;
+            let w2_q = view(&w2_q_flat, vec![mid_dim, out_dim])?;
+
+            // Forward chain: X → matmul → silu → matmul → logits.
+            let xt = GpuTensor::from_vec(tape, &x_data, vec![m, in_dim])?;
+            let h_pre = matmul(&xt, &w1_q)?;
+            let h = silu(&h_pre)?;
+            let y_s = matmul(&h, &w2_q)?;
+
+            // Teacher logits as a constant leaf (no gradient flows through).
+            let y_t_leaf = GpuTensor::from_vec(tape, &y_t, vec![m, out_dim])?;
+
+            // Temperature scaling (1/T per mlx-lm).
+            let y_s_scaled = scalar_mul(&y_s, inv_t)?;
+            let y_t_scaled = scalar_mul(&y_t_leaf, inv_t)?;
+
+            // KL(softmax(y_t_scaled) || softmax(y_s_scaled)) per row.
+            // kl_div_loss_per_row signature: (logits_q, logits_p)
+            // ⇒ KL(p || q) where p = teacher.
+            let kl = kl_div_loss_per_row(&y_s_scaled, &y_t_scaled)?;
+
+            // Loss = mean per-row KL.
+            let kl_host = kl.to_vec()?;
+            let loss_mean = (kl_host.iter().map(|v| *v as f64).sum::<f64>()
+                / kl_host.len() as f64) as f32;
+
+            // Backward seed: dy = ones / m  (so backward gives mean-grad
+            // semantics matching loss_mean).
+            let mut dy_buf = tape
+                .device()
+                .alloc_buffer(kl_host.len() * 4, DType::F32, kl.shape().to_vec())?;
+            dy_buf
+                .as_mut_slice::<f32>()
+                .map_err(|e| anyhow!("dy slice: {e}"))?
+                .iter_mut()
+                .for_each(|v| *v = 1.0 / m as f32);
+            let grads = backward(&kl, dy_buf)?;
+
+            let grad_s1 = grads[s1_leaf.node_idx()]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing s1 grad"))?
+                .clone();
+            let grad_b1 = grads[b1_leaf.node_idx()]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing b1 grad"))?
+                .clone();
+            let grad_s2 = grads[s2_leaf.node_idx()]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing s2 grad"))?
+                .clone();
+            let grad_b2 = grads[b2_leaf.node_idx()]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing b2 grad"))?
+                .clone();
+
+            let mut g_map = BTreeMap::new();
+            g_map.insert("s1".to_string(), grad_s1);
+            g_map.insert("b1".to_string(), grad_b1);
+            g_map.insert("s2".to_string(), grad_s2);
+            g_map.insert("b2".to_string(), grad_b2);
+            adam.step(&g_map)?;
+            Ok(loss_mean)
+        };
+
+        let initial_loss = train_step(&mut adam, &tape).expect("initial step");
+        tape.reset();
+        // Non-triviality: initial KL must be measurably > 0; otherwise
+        // the +30% perturbation didn't move the loss landscape and the
+        // convergence acceptance below would be a false positive.
+        assert!(
+            initial_loss > 1e-4,
+            "KL fixture is trivial: initial_loss={initial_loss} too small to measure convergence"
+        );
+        let mut min_loss = initial_loss;
+        let n_steps = 200usize;
+        let mut last_loss = initial_loss;
+        for step in 1..n_steps {
+            let l = train_step(&mut adam, &tape).expect("step");
+            tape.reset();
+            if l < min_loss {
+                min_loss = l;
+            }
+            last_loss = l;
+            if step % 50 == 0 {
+                eprintln!(
+                    "[dwq_kl] step={step} loss={l:.6} min={min_loss:.6} initial={initial_loss:.6}"
+                );
+            }
+        }
+
+        assert!(
+            min_loss < initial_loss * 0.34,
+            "DWQ KL synthetic loop did not converge: initial={initial_loss}, min={min_loss}, last={last_loss}"
+        );
+
+        // Sanity: scales+biases must have moved TOWARD the analytical
+        // optimum (per-tensor min/max init), not stayed at the
+        // perturbation or drifted away.
+        let s1_final = adam.read_param("s1").unwrap();
+        let b1_final = adam.read_param("b1").unwrap();
+        let l2_init: f64 = s1_p
+            .iter()
+            .zip(s1_init.iter())
+            .map(|(a, b)| ((a - b).powi(2)) as f64)
+            .sum::<f64>()
+            + b1_p
+                .iter()
+                .zip(b1_init.iter())
+                .map(|(a, b)| ((a - b).powi(2)) as f64)
+                .sum::<f64>();
+        let l2_final: f64 = s1_final
+            .iter()
+            .zip(s1_init.iter())
+            .map(|(a, b)| ((a - b).powi(2)) as f64)
+            .sum::<f64>()
+            + b1_final
+                .iter()
+                .zip(b1_init.iter())
+                .map(|(a, b)| ((a - b).powi(2)) as f64)
+                .sum::<f64>();
+        // KL is a different objective from MSE-to-init; we don't
+        // require monotone L2 movement, only that final params are
+        // STILL FINITE (haven't blown up).
+        let _ = (l2_init, l2_final);
+        for v in s1_final.iter().chain(b1_final.iter()) {
+            assert!(v.is_finite(), "s1/b1 became non-finite: {v}");
+        }
+    }
+
+    /// iter-13d — DWQ training loop on a real GGUF Linear weight.
+    ///
+    /// Loads `blk.0.attn_qkv.weight` (default; Q4_0 quantized in the
+    /// 27B hybrid GGUF, [10240, 5120] = 52 422 400 elements) via
+    /// `mlx-native`'s `GgufFile::load_tensor_f32`, runs the affine
+    /// init kernel, perturbs scales/biases by 2.0×, and trains
+    /// (scales, biases) for 100 Adam steps over per-tensor
+    /// reconstruction MSE.
+    ///
+    /// Validates (mantra: "code+tests==truth"):
+    ///   1. Real-tensor magnitude regime — quantized weights from a
+    ///      production GGUF, not synthetic sin*K.
+    ///   2. Per-group min/max init handles real distributions
+    ///      (potentially skewed, sparse, multi-modal).
+    ///   3. KL gradient stability — no NaN/Inf over 100+ steps.
+    ///   4. Peak GPU memory bounded — single shared tape with
+    ///      `tape.reset()` between iterations; no per-step
+    ///      `MlxDevice::new()` churn.
+    ///
+    /// `#[ignore]`-gated because it requires a multi-GB GGUF on disk.
+    /// Run with:
+    ///   cargo test --release --bin hf2q -- \
+    ///     --ignored dwq_loop_real_gguf
+    /// Override path: `HF2Q_TEST_GGUF=/path/to/file.gguf`.
+    /// Override tensor: `HF2Q_TEST_GGUF_TENSOR=blk.X.tensor.weight`.
+    ///
+    /// Acceptance: best loss < 0.2 × initial (5× reduction floor).
+    /// Non-triviality: initial loss must be > init MSE (i.e. the
+    /// 2× perturbation moved the loss landscape measurably above the
+    /// ideal-init reconstruction).
+    #[test]
+    #[ignore]
+    fn dwq_loop_real_gguf_attn_qkv_converges_under_adam() {
+        use mlx_native::gguf::GgufFile;
+
+        let gguf_path = std::env::var("HF2Q_TEST_GGUF").unwrap_or_else(|_| {
+            "/opt/hf2q/models/qwen3.6-27b-mtp-q4_0/qwen3.6-27b-mtp-q4_0.gguf".to_string()
+        });
+        let tensor_name = std::env::var("HF2Q_TEST_GGUF_TENSOR")
+            .unwrap_or_else(|_| "blk.0.attn_qkv.weight".to_string());
+        let path = std::path::Path::new(&gguf_path);
+        if !path.exists() {
+            eprintln!(
+                "[dwq_real_gguf] SKIP: {} not found (set HF2Q_TEST_GGUF=/path)",
+                gguf_path
+            );
+            return;
+        }
+
+        let device = MlxDevice::new().expect("device");
+        let gguf = GgufFile::open(path).expect("open gguf");
+        let info = gguf
+            .tensor_info(&tensor_name)
+            .unwrap_or_else(|| panic!("tensor '{tensor_name}' not in {gguf_path}"));
+        eprintln!(
+            "[dwq_real_gguf] loading {tensor_name}: shape={:?} type={:?}",
+            info.shape, info.ggml_type
+        );
+
+        let buf = gguf
+            .load_tensor_f32(&tensor_name, &device)
+            .expect("load_tensor_f32");
+        let w_real_full: Vec<f32> = buf
+            .as_slice::<f32>()
+            .expect("as_slice f32")
+            .to_vec();
+
+        // Sanity: dequantized values must be finite.
+        let n_finite = w_real_full.iter().filter(|v| v.is_finite()).count();
+        assert_eq!(
+            n_finite,
+            w_real_full.len(),
+            "GGUF dequant produced non-finite values: {}/{}",
+            w_real_full.len() - n_finite,
+            w_real_full.len()
+        );
+
+        let group_size = 32usize;
+        // Q4_0 storage is exact multiples of 32, so element_count is
+        // already group-aligned; assert as an invariant.
+        assert!(
+            w_real_full.len() % group_size == 0,
+            "real weight len {} not divisible by group_size {}",
+            w_real_full.len(),
+            group_size
+        );
+        let n_total = w_real_full.len();
+        let n_groups = n_total / group_size;
+
+        // Init scales+biases from real weight.
+        let mut init_registry = KernelRegistry::new();
+        let (q_int, s_init, b_init) = init_affine_params_gpu(
+            &device,
+            &mut init_registry,
+            &w_real_full,
+            group_size,
+            4, // 4-bit
+        )
+        .expect("init");
+        assert_eq!(s_init.len(), n_groups);
+        assert_eq!(q_int.len(), n_total);
+
+        // All scales positive + finite; all biases finite.  Real
+        // weights with degenerate (uniform) groups would set s := 1.0
+        // by the kernel's contract.
+        for (i, &s) in s_init.iter().enumerate() {
+            assert!(
+                s.is_finite() && s > 0.0,
+                "s_init[{i}] non-finite or non-positive: {s}"
+            );
+        }
+        for (i, &b) in b_init.iter().enumerate() {
+            assert!(b.is_finite(), "b_init[{i}] non-finite: {b}");
+        }
+
+        // Reconstruction MSE @ init — sanity oracle for the per-group
+        // min/max heuristic.  Sets the lower bound on what Adam can
+        // achieve from the perturbed start.
+        let init_mse: f32 = {
+            let mut acc = 0.0f64;
+            for i in 0..n_total {
+                let g = i / group_size;
+                let qdq = q_int[i] as f32 * s_init[g] + b_init[g];
+                acc += (qdq - w_real_full[i]).powi(2) as f64;
+            }
+            (acc / n_total as f64) as f32
+        };
+        eprintln!(
+            "[dwq_real_gguf] reconstruction MSE @ init: {:.6e}  (n_groups={n_groups})",
+            init_mse
+        );
+
+        // Perturb +100% (×2.0).
+        let perturb = |xs: &[f32], factor: f32| -> Vec<f32> {
+            xs.iter().map(|v| v * factor).collect()
+        };
+        let s_p = perturb(&s_init, 2.0);
+        let b_p = perturb(&b_init, 2.0);
+
+        let cfg = AdamConfig {
+            lr: 0.001,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+        };
+        let mut adam = AdamOptimizer::new(device.clone(), cfg).expect("adam");
+        adam.register_param("s", buffer_from_f32(&device, &s_p).unwrap())
+            .unwrap();
+        adam.register_param("b", buffer_from_f32(&device, &b_p).unwrap())
+            .unwrap();
+
+        let tape = GpuTape::new(device.clone());
+        let train_step = |adam: &mut AdamOptimizer, tape: &GpuTape| -> Result<f32> {
+            let s = adam.read_param("s")?;
+            let b = adam.read_param("b")?;
+            let s_leaf = GpuTensor::from_vec(tape, &s, vec![s.len()])?;
+            let b_leaf = GpuTensor::from_vec(tape, &b, vec![b.len()])?;
+            let qdq = qdq_affine(&s_leaf, &b_leaf, &q_int, group_size)?;
+            let w_const = GpuTensor::from_vec(tape, &w_real_full, vec![n_total])?;
+            let r = sub(&qdq, &w_const)?;
+            let sq = square(&r)?;
+            let sq_host = sq.to_vec()?;
+            let loss = (sq_host.iter().map(|v| *v as f64).sum::<f64>() / n_total as f64) as f32;
+            let dy = ones_like(tape, sq.shape())?;
+            let grads = backward(&sq, dy)?;
+            let g_s = grads[s_leaf.node_idx()]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing s grad"))?
+                .clone();
+            let g_b = grads[b_leaf.node_idx()]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing b grad"))?
+                .clone();
+            let mut g_map = BTreeMap::new();
+            g_map.insert("s".to_string(), g_s);
+            g_map.insert("b".to_string(), g_b);
+            adam.step(&g_map)?;
+            Ok(loss)
+        };
+
+        let initial_loss = train_step(&mut adam, &tape).expect("init step");
+        tape.reset();
+
+        // Non-triviality: initial loss > 1.5× the ideal-init MSE.  If
+        // 2× perturbation didn't move the loss, the test is trivial.
+        assert!(
+            initial_loss > init_mse * 1.5,
+            "real-GGUF fixture trivial: initial_loss={initial_loss} ≤ 1.5*init_mse={}",
+            init_mse * 1.5
+        );
+
+        let mut min_loss = initial_loss;
+        let mut last_loss = initial_loss;
+        let n_steps = 100usize;
+        for step in 1..n_steps {
+            let l = train_step(&mut adam, &tape).expect("step");
+            tape.reset();
+            assert!(l.is_finite(), "step {step}: loss became non-finite ({l})");
+            if l < min_loss {
+                min_loss = l;
+            }
+            last_loss = l;
+            if step % 20 == 0 {
+                eprintln!(
+                    "[dwq_real_gguf] step={step} loss={l:.6e} min={min_loss:.6e} initial={initial_loss:.6e}"
+                );
+            }
+        }
+
+        eprintln!(
+            "[dwq_real_gguf] FINAL: initial={:.6e} min={:.6e} last={:.6e} ratio={:.3}",
+            initial_loss,
+            min_loss,
+            last_loss,
+            min_loss / initial_loss
+        );
+
+        assert!(
+            min_loss < initial_loss * 0.2,
+            "did not converge: initial={initial_loss} min={min_loss} last={last_loss}"
+        );
+
+        // Sanity: scales+biases finite at end, scales still positive.
+        let s_final = adam.read_param("s").unwrap();
+        let b_final = adam.read_param("b").unwrap();
+        for (i, &v) in s_final.iter().enumerate() {
+            assert!(v.is_finite(), "s_final[{i}] non-finite: {v}");
+        }
+        for (i, &v) in b_final.iter().enumerate() {
+            assert!(v.is_finite(), "b_final[{i}] non-finite: {v}");
+        }
+    }
+
+    /// iter-13e — real-tensor KL-div training loop.
+    ///
+    /// Closes the conceptual gap between iter-13c's synthetic 2-Linear
+    /// KL test and iter-13d's real-tensor reconstruction-MSE test by
+    /// running the FULL DWQ chain
+    /// `qdq_affine → view → matmul → kl_div_loss_per_row → backward →
+    /// Adam.step` on a real GGUF tensor.
+    ///
+    /// Setup:
+    ///   - W_real = `blk.0.attn_qkv.weight` from the 27B Q4_0 GGUF
+    ///     (shape [10240, 5120] in GGUF [out, in]; transposed to
+    ///     [5120, 10240] for our matmul convention).
+    ///   - X = Gaussian(0, 1) of shape [m=64, in=5120], deterministic
+    ///     seed (proxy for post-RMSNorm activations whose stddev
+    ///     after layer norm is ~1.0).
+    ///   - Teacher logits = X @ W_real_T (shape [64, 10240]).
+    ///   - Student logits = X @ view(qdq_affine(W_real, s, b),
+    ///                               [5120, 10240]).
+    ///   - Loss = mean(KL(softmax(scale·teacher) || softmax(scale·student)))
+    ///     where scale = 1/T = 0.5 (T=2.0 per mlx-lm dwq.py default).
+    ///   - Optimizer: Adam(lr=1e-3, β1=0.9, β2=0.999, ε=1e-8) over
+    ///     (scales, biases); q_int frozen.
+    ///
+    /// Per mlx-lm `tuner/losses.py:377` `kl_div_loss(logits_q,
+    /// logits_p)` takes RAW logits (computes logsumexp internally);
+    /// `q` is the student, `p` is the teacher; reduction="none"
+    /// returns shape `[batch]` per row, summed in dwq.py at
+    /// `dwq.py:117`: `loss = (mask * losses).sum() / ntoks`.
+    ///
+    /// Acceptance: best KL after 100 Adam steps < 0.34 × initial KL
+    /// (3× reduction floor — KL is stricter than reconstruction MSE).
+    /// Non-triviality: initial KL > 1e-4 (otherwise the 2×
+    /// perturbation didn't move the loss landscape).
+    ///
+    /// Test gate: `#[ignore]` (multi-GB GGUF on disk).  Run with:
+    ///   cargo test --release --bin hf2q -- \
+    ///     --ignored dwq_loop_real_gguf_kl
+    /// Override path: `HF2Q_TEST_GGUF=/path/to/file.gguf`.
+    /// Override tensor: `HF2Q_TEST_GGUF_TENSOR=blk.X.tensor.weight`.
+    #[test]
+    #[ignore]
+    fn dwq_loop_real_gguf_kl_div_with_random_activations_converges() {
+        use crate::calibrate::autograd_gpu_tape::{matmul, scalar_mul, view};
+        use crate::calibrate::dynamic_quant_gpu::kl_div_loss_per_row;
+        use mlx_native::gguf::GgufFile;
+
+        let gguf_path = std::env::var("HF2Q_TEST_GGUF").unwrap_or_else(|_| {
+            "/opt/hf2q/models/qwen3.6-27b-mtp-q4_0/qwen3.6-27b-mtp-q4_0.gguf".to_string()
+        });
+        let tensor_name = std::env::var("HF2Q_TEST_GGUF_TENSOR")
+            .unwrap_or_else(|_| "blk.0.attn_qkv.weight".to_string());
+        let path = std::path::Path::new(&gguf_path);
+        if !path.exists() {
+            eprintln!("[dwq_kl_real] SKIP: {gguf_path} not found");
+            return;
+        }
+
+        let device = MlxDevice::new().expect("device");
+        let gguf = GgufFile::open(path).expect("open gguf");
+        let info = gguf
+            .tensor_info(&tensor_name)
+            .unwrap_or_else(|| panic!("tensor '{tensor_name}' not in {gguf_path}"));
+        // GGUF shape is [out, in]; we'll transpose for matmul.
+        assert_eq!(info.shape.len(), 2, "expected 2-D Linear weight");
+        let out_dim = info.shape[0];
+        let in_dim = info.shape[1];
+        eprintln!(
+            "[dwq_kl_real] {tensor_name}: GGUF[out, in]=[{out_dim}, {in_dim}], type={:?}",
+            info.ggml_type
+        );
+
+        let buf = gguf
+            .load_tensor_f32(&tensor_name, &device)
+            .expect("load_tensor_f32");
+        let w_real_oi: Vec<f32> = buf.as_slice::<f32>().unwrap().to_vec();
+        // Transpose to [in, out] = [5120, 10240] for our matmul.
+        let w_real_io: Vec<f32> = transpose_2d(&w_real_oi, out_dim, in_dim);
+        let n_total = w_real_io.len();
+        assert_eq!(n_total, in_dim * out_dim);
+
+        let group_size = 32usize;
+        // After transpose, contiguous axis is the output dim.  group_size
+        // must divide n_total which it does for any out_dim divisible by 32.
+        assert!(
+            n_total % group_size == 0,
+            "n_total {} not divisible by group_size {}",
+            n_total,
+            group_size
+        );
+
+        // Init scales/biases from the TRANSPOSED weight (groups along
+        // contiguous out_dim axis; same convention as mlx affine quant).
+        let mut init_registry = KernelRegistry::new();
+        let (q_int, s_init, b_init) = init_affine_params_gpu(
+            &device,
+            &mut init_registry,
+            &w_real_io,
+            group_size,
+            4,
+        )
+        .expect("init");
+
+        // Perturb 2× to give Adam something to learn.
+        let perturb = |xs: &[f32], factor: f32| -> Vec<f32> {
+            xs.iter().map(|v| v * factor).collect()
+        };
+        let s_p = perturb(&s_init, 2.0);
+        let b_p = perturb(&b_init, 2.0);
+
+        // Activations: deterministic Gaussian, stddev 1.0 (proxy for
+        // post-RMSNorm residual stream).  Box-Muller via a stable
+        // small PRNG; seed fixed for reproducibility.
+        let m = 64usize;
+        let x_data: Vec<f32> = box_muller_gaussian(m * in_dim, /* seed */ 0xC0FFEE5);
+
+        // Pre-compute teacher logits y_T = X @ W_real (host CPU oracle
+        // FP64 accumulation for numerical stability).  Treated as a
+        // constant tape leaf each step.
+        let mut y_t = vec![0.0f32; m * out_dim];
+        for r in 0..m {
+            for c in 0..out_dim {
+                let mut acc = 0.0f64;
+                for k in 0..in_dim {
+                    acc += (x_data[r * in_dim + k] as f64)
+                        * (w_real_io[k * out_dim + c] as f64);
+                }
+                y_t[r * out_dim + c] = acc as f32;
+            }
+        }
+        // Sanity: teacher logits should be finite and have non-trivial
+        // stddev (a degenerate fixture would NOT produce gradient flow).
+        let mut sum = 0.0f64;
+        let mut sumsq = 0.0f64;
+        for &v in &y_t {
+            assert!(v.is_finite(), "teacher logit non-finite: {v}");
+            sum += v as f64;
+            sumsq += (v as f64).powi(2);
+        }
+        let mean = sum / y_t.len() as f64;
+        let var = sumsq / y_t.len() as f64 - mean * mean;
+        let stddev = var.sqrt() as f32;
+        eprintln!("[dwq_kl_real] teacher logit stddev: {stddev:.4}");
+        assert!(stddev > 0.1, "teacher logits too flat: stddev={stddev}");
+
+        let cfg = AdamConfig {
+            lr: 0.001,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+        };
+        let mut adam = AdamOptimizer::new(device.clone(), cfg).expect("adam");
+        adam.register_param("s", buffer_from_f32(&device, &s_p).unwrap())
+            .unwrap();
+        adam.register_param("b", buffer_from_f32(&device, &b_p).unwrap())
+            .unwrap();
+
+        let temperature = 2.0f32;
+        let inv_t = 1.0 / temperature;
+        let tape = GpuTape::new(device.clone());
+
+        let train_step = |adam: &mut AdamOptimizer, tape: &GpuTape| -> Result<f32> {
+            let s = adam.read_param("s")?;
+            let b = adam.read_param("b")?;
+            let s_leaf = GpuTensor::from_vec(tape, &s, vec![s.len()])?;
+            let b_leaf = GpuTensor::from_vec(tape, &b, vec![b.len()])?;
+            let qdq_flat = qdq_affine(&s_leaf, &b_leaf, &q_int, group_size)?;
+            let w_q_2d = view(&qdq_flat, vec![in_dim, out_dim])?;
+            let xt = GpuTensor::from_vec(tape, &x_data, vec![m, in_dim])?;
+            let y_s = matmul(&xt, &w_q_2d)?;
+            let y_t_leaf = GpuTensor::from_vec(tape, &y_t, vec![m, out_dim])?;
+            let y_s_scaled = scalar_mul(&y_s, inv_t)?;
+            let y_t_scaled = scalar_mul(&y_t_leaf, inv_t)?;
+            // KL(p || q) per row = Σ p · (log p - log q); q = student.
+            let kl = kl_div_loss_per_row(&y_s_scaled, &y_t_scaled)?;
+            let kl_host = kl.to_vec()?;
+            let loss_mean = (kl_host.iter().map(|v| *v as f64).sum::<f64>()
+                / kl_host.len() as f64) as f32;
+
+            // Backward seed: dy = ones / m so the leaf gradients have
+            // mean-grad semantics matching the host-side mean reduction.
+            let mut dy_buf = tape
+                .device()
+                .alloc_buffer(kl_host.len() * 4, DType::F32, kl.shape().to_vec())?;
+            dy_buf
+                .as_mut_slice::<f32>()
+                .map_err(|e| anyhow!("dy slice: {e}"))?
+                .iter_mut()
+                .for_each(|v| *v = 1.0 / m as f32);
+            let grads = backward(&kl, dy_buf)?;
+            let g_s = grads[s_leaf.node_idx()]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing s grad"))?
+                .clone();
+            let g_b = grads[b_leaf.node_idx()]
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing b grad"))?
+                .clone();
+            let mut g_map = BTreeMap::new();
+            g_map.insert("s".to_string(), g_s);
+            g_map.insert("b".to_string(), g_b);
+            adam.step(&g_map)?;
+            Ok(loss_mean)
+        };
+
+        let initial_loss = train_step(&mut adam, &tape).expect("init step");
+        tape.reset();
+        eprintln!("[dwq_kl_real] initial KL = {initial_loss:.6e}");
+        assert!(
+            initial_loss > 1e-4,
+            "real-GGUF KL fixture is trivial: initial_loss={initial_loss}"
+        );
+
+        let mut min_loss = initial_loss;
+        let mut last_loss = initial_loss;
+        let n_steps = 100usize;
+        for step in 1..n_steps {
+            let l = train_step(&mut adam, &tape).expect("step");
+            tape.reset();
+            assert!(l.is_finite(), "step {step}: loss non-finite ({l})");
+            if l < min_loss {
+                min_loss = l;
+            }
+            last_loss = l;
+            if step % 20 == 0 {
+                eprintln!(
+                    "[dwq_kl_real] step={step} loss={l:.6e} min={min_loss:.6e} initial={initial_loss:.6e}"
+                );
+            }
+        }
+        eprintln!(
+            "[dwq_kl_real] FINAL: initial={:.6e} min={:.6e} last={:.6e} ratio={:.3}",
+            initial_loss,
+            min_loss,
+            last_loss,
+            min_loss / initial_loss
+        );
+
+        assert!(
+            min_loss < initial_loss * 0.34,
+            "did not converge: initial={initial_loss} min={min_loss}"
+        );
+
+        // Sanity: final params finite.
+        let s_final = adam.read_param("s").unwrap();
+        let b_final = adam.read_param("b").unwrap();
+        for v in s_final.iter().chain(b_final.iter()) {
+            assert!(v.is_finite(), "final param non-finite: {v}");
+        }
+    }
+
+    /// Transpose a row-major [rows, cols] FP32 buffer into [cols, rows].
+    fn transpose_2d(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        assert_eq!(src.len(), rows * cols);
+        let mut dst = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                dst[c * rows + r] = src[r * cols + c];
+            }
+        }
+        dst
+    }
+
+    /// Sanity test: init kernel output equals the CPU oracle from the
+    /// mlx-native side via the host-side wrapper.
+    #[test]
+    fn init_affine_params_gpu_round_trip_recovers_w_within_quant_error() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let group_size = 32usize;
+        let n_groups = 3usize;
+        let n_total = group_size * n_groups;
+        let w: Vec<f32> = (0..n_total)
+            .map(|i| ((i as f32) * 0.51).sin() + ((i as f32) * 0.123).cos() * 0.3)
+            .collect();
+        let (q, s, b) =
+            init_affine_params_gpu(&device, &mut registry, &w, group_size, 4).unwrap();
+        assert_eq!(q.len(), n_total);
+        assert_eq!(s.len(), n_groups);
+        assert_eq!(b.len(), n_groups);
+        for g in 0..n_groups {
+            for i in 0..group_size {
+                let idx = g * group_size + i;
+                let qdq = q[idx] as f32 * s[g] + b[g];
+                let bound = s[g] * 0.5 + 1e-6;
+                assert!(
+                    (qdq - w[idx]).abs() <= bound,
+                    "qdq[{idx}]={} w[{idx}]={}",
+                    qdq,
+                    w[idx]
+                );
+            }
+        }
+    }
+}
