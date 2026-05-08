@@ -294,6 +294,227 @@ impl Default for DwqTrainingConfig {
     }
 }
 
+/// ADR-020 iter-12d-2 — per-Linear training summary inside a model
+/// scan (one entry per successfully-trained tensor).
+#[derive(Debug, Clone)]
+pub struct DwqLinearTrained {
+    /// GGUF tensor name (e.g. `"blk.0.attn_qkv.weight"`).
+    pub name: String,
+    /// Output dim (number of rows of the f32 weight slice).
+    pub n: usize,
+    /// Input dim (number of cols).
+    pub k: usize,
+    pub kl_initial: f32,
+    pub kl_min: f32,
+    pub steps_run: usize,
+}
+
+/// Reason a tensor was skipped during a model scan (rank mismatch,
+/// quant-config violation, training failure).  Surfaced so callers
+/// (e.g. CLI wrapper) can print a per-tensor disposition log.
+#[derive(Debug, Clone)]
+pub struct DwqLinearSkipped {
+    pub name: String,
+    pub reason: String,
+}
+
+/// Aggregate output of [`train_all_linears_dwq`] — the trained
+/// per-Linear quant params packed as a single mlx-format safetensors
+/// byte stream + structured per-tensor diagnostics.
+#[derive(Debug)]
+pub struct DwqAllLinearsResult {
+    /// One entry per successfully-trained Linear, in scan order.
+    pub trained: Vec<DwqLinearTrained>,
+    /// One entry per skipped tensor, with reason.
+    pub skipped: Vec<DwqLinearSkipped>,
+    /// Serialized mlx-format safetensors output containing
+    /// `<name>.weight` (U32-packed quant codes), `<name>.scales`,
+    /// `<name>.biases` triplets per trained tensor.
+    pub safetensors_bytes: Vec<u8>,
+}
+
+/// ADR-020 iter-12d-2 — production driver: scan a real GGUF model,
+/// enumerate all rank-2 Linear weight tensors, run iter-12d-1's
+/// `train_linear_dwq_synthetic_teacher` per tensor, accumulate trained
+/// `MlxAffineLinear` outputs into a single mlx-format safetensors byte
+/// stream.
+///
+/// ## Filtering
+///
+/// Tensors are skipped (and recorded in `result.skipped`) if any of:
+///   - `name_filter(name) == false`
+///   - rank != 2 (1-D bias / norm tensors)
+///   - `n < 32` or `k < 32` (matmul kernel floor)
+///   - `k % cfg.group_size != 0`
+///   - GGUF dequant fails (unsupported `ggml_type`)
+///   - Training fails to converge (`kl_min > kl_initial × convergence_ratio`)
+///
+/// ## Output safetensors layout
+///
+/// Per trained tensor:
+///   - `<name>.weight` — U32, shape `[n, k * bits / 32]`
+///   - `<name>.scales` — `cfg.float_dtype` (default BF16), shape `[n, k / group_size]`
+///   - `<name>.biases` — `cfg.float_dtype`, shape `[n, k / group_size]`
+///
+/// Matches mlx-lm's flat-parameter naming convention so the output
+/// loads cleanly via `MlxAffineLinear::from_safetensors`.
+pub fn train_all_linears_dwq<F>(
+    gguf_path: &std::path::Path,
+    cfg: &DwqTrainingConfig,
+    float_dtype: safetensors::tensor::Dtype,
+    name_filter: F,
+) -> Result<DwqAllLinearsResult>
+where
+    F: Fn(&str) -> bool,
+{
+    use crate::calibrate::mlx_safetensors_loader::{MlxAffineLinear, MlxAffineLinearBytes};
+    use mlx_native::gguf::GgufFile;
+
+    let device = MlxDevice::new()
+        .map_err(|e| anyhow!("train_all_linears_dwq: device: {e}"))?;
+    let gguf = GgufFile::open(gguf_path)
+        .with_context(|| format!("open gguf {}", gguf_path.display()))?;
+
+    // Snapshot tensor names up front (release borrows on gguf maps before
+    // re-borrowing for tensor_info / load_tensor_f32 in the loop body).
+    let names: Vec<String> = gguf
+        .tensor_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let mut trained: Vec<DwqLinearTrained> = Vec::new();
+    let mut skipped: Vec<DwqLinearSkipped> = Vec::new();
+    // Owned per-tensor bytes; views into these are passed to safetensors
+    // serialize once at the end.
+    let mut all_bytes: Vec<(String, MlxAffineLinearBytes)> = Vec::new();
+
+    for name in names {
+        if !name_filter(&name) {
+            skipped.push(DwqLinearSkipped {
+                name: name.clone(),
+                reason: "filtered out by name_filter".to_string(),
+            });
+            continue;
+        }
+        let info = match gguf.tensor_info(&name) {
+            Some(i) => i,
+            None => {
+                skipped.push(DwqLinearSkipped {
+                    name: name.clone(),
+                    reason: "tensor_info missing (gguf inconsistency)".to_string(),
+                });
+                continue;
+            }
+        };
+        if info.shape.len() != 2 {
+            skipped.push(DwqLinearSkipped {
+                name: name.clone(),
+                reason: format!("rank={} (need 2)", info.shape.len()),
+            });
+            continue;
+        }
+        let n = info.shape[0];
+        let k = info.shape[1];
+        if n < 32 || k < 32 {
+            skipped.push(DwqLinearSkipped {
+                name: name.clone(),
+                reason: format!("dim too small (n={n} k={k} need >=32)"),
+            });
+            continue;
+        }
+        if k % cfg.group_size != 0 {
+            skipped.push(DwqLinearSkipped {
+                name: name.clone(),
+                reason: format!("k={k} not divisible by group_size={}", cfg.group_size),
+            });
+            continue;
+        }
+
+        // Load + dequant via mlx-native (handles all supported ggml types).
+        let buf = match gguf.load_tensor_f32(&name, &device) {
+            Ok(b) => b,
+            Err(e) => {
+                skipped.push(DwqLinearSkipped {
+                    name: name.clone(),
+                    reason: format!("load_tensor_f32 failed: {e}"),
+                });
+                continue;
+            }
+        };
+        let w_real: Vec<f32> = match buf.as_slice::<f32>() {
+            Ok(s) => s.to_vec(),
+            Err(e) => {
+                skipped.push(DwqLinearSkipped {
+                    name: name.clone(),
+                    reason: format!("buffer slice failed: {e}"),
+                });
+                continue;
+            }
+        };
+
+        // Train.  Capture errors as skip reasons rather than aborting the
+        // whole scan — production driver should keep going through partial
+        // failures so the operator gets a complete disposition log.
+        let result = match train_linear_dwq_synthetic_teacher(&device, &w_real, n, k, cfg) {
+            Ok(r) => r,
+            Err(e) => {
+                skipped.push(DwqLinearSkipped {
+                    name: name.clone(),
+                    reason: format!("training failed: {e}"),
+                });
+                continue;
+            }
+        };
+        let bytes = match result.linear.to_safetensors_bytes(float_dtype) {
+            Ok(b) => b,
+            Err(e) => {
+                skipped.push(DwqLinearSkipped {
+                    name: name.clone(),
+                    reason: format!("to_safetensors_bytes failed: {e}"),
+                });
+                continue;
+            }
+        };
+
+        trained.push(DwqLinearTrained {
+            name: name.clone(),
+            n,
+            k,
+            kl_initial: result.kl_initial,
+            kl_min: result.kl_min,
+            steps_run: result.steps_run,
+        });
+        // mlx-lm naming convention strips the trailing ".weight" suffix
+        // before re-attaching ".weight"/.scales"/.biases" — but since GGUF
+        // tensor names already end in ".weight" (e.g. "blk.0.attn_qkv.weight"),
+        // we strip it once here to avoid producing ".weight.weight" keys.
+        let stem = name.strip_suffix(".weight").unwrap_or(&name).to_string();
+        all_bytes.push((stem, bytes));
+    }
+
+    // Build views over the owned bytes + serialize.
+    let mut views_pairs: Vec<(String, _)> = Vec::with_capacity(all_bytes.len() * 3);
+    for (stem, b) in &all_bytes {
+        let (w, s, bi) = b
+            .to_safetensors_views()
+            .with_context(|| format!("to_safetensors_views for {stem}"))?;
+        views_pairs.push((format!("{stem}.weight"), w));
+        views_pairs.push((format!("{stem}.scales"), s));
+        views_pairs.push((format!("{stem}.biases"), bi));
+    }
+    let safetensors_bytes = safetensors::tensor::serialize(views_pairs.iter()
+        .map(|(k, v)| (k.as_str(), v)), None)
+        .map_err(|e| anyhow!("safetensors serialize: {e}"))?;
+    // Discard the type holder so MlxAffineLinear is in scope.
+    let _ = std::any::type_name::<MlxAffineLinear>();
+    Ok(DwqAllLinearsResult {
+        trained,
+        skipped,
+        safetensors_bytes,
+    })
+}
+
 /// Train a single Linear's DWQ affine quant params (synthetic teacher).
 /// See [`DwqLinearTrainResult`] for the algorithm + convergence contract.
 pub fn train_linear_dwq_synthetic_teacher(
@@ -1582,6 +1803,155 @@ mod tests {
         };
         let r = train_linear_dwq_synthetic_teacher(&device, &any_w[..32 * 32], 32, 32, &bad_cfg);
         assert!(r.is_err());
+    }
+
+    /// ADR-020 iter-12d-2 — production driver test (real GGUF; gated
+    /// on `HF2Q_TEST_GGUF` env var so unit-test runs without the
+    /// model file present skip cleanly).  Verifies:
+    ///   - scan produces a non-empty `trained` set
+    ///   - serialized safetensors is non-empty + parseable by
+    ///     safetensors::SafeTensors::deserialize
+    ///   - every trained tensor's `<name>.weight`/`.scales`/`.biases`
+    ///     triplet round-trips through MlxAffineLinear::from_safetensors
+    ///   - skipped tensors carry a non-empty reason
+    ///
+    /// To keep the test runtime bounded under real models (~100+
+    /// Linears), the test filters to ONLY the first 4 matching
+    /// tensors via name_filter.  Override with HF2Q_TEST_GGUF_LIMIT
+    /// for broader coverage.
+    #[test]
+    fn iter_12d2_train_all_linears_dwq_real_gguf() {
+        use super::{train_all_linears_dwq, DwqTrainingConfig};
+        use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
+        use safetensors::tensor::Dtype;
+        use safetensors::SafeTensors;
+
+        let gguf_path = match std::env::var("HF2Q_TEST_GGUF") {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("[iter-12d-2] SKIP: HF2Q_TEST_GGUF not set");
+                return;
+            }
+        };
+        let path = std::path::PathBuf::from(&gguf_path);
+        if !path.exists() {
+            eprintln!("[iter-12d-2] SKIP: {gguf_path} does not exist");
+            return;
+        }
+
+        let limit: usize = std::env::var("HF2Q_TEST_GGUF_LIMIT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        let counter = std::cell::Cell::new(0usize);
+        let name_filter = |name: &str| -> bool {
+            // Must end in `.weight` (Linear weights only) AND be one of the
+            // first `limit` matching names.
+            if !name.ends_with(".weight") {
+                return false;
+            }
+            // Skip token embedding + output head (huge) — they bloat scan time.
+            if name.starts_with("token_embd") || name.starts_with("output") {
+                return false;
+            }
+            let cur = counter.get();
+            if cur >= limit {
+                return false;
+            }
+            counter.set(cur + 1);
+            true
+        };
+
+        let cfg = DwqTrainingConfig {
+            n_steps: 30,
+            // Real Q4_0 stddev needs the full iter-17b-style 0.34 floor.
+            convergence_ratio: 0.34,
+            ..DwqTrainingConfig::default()
+        };
+
+        let result = train_all_linears_dwq(&path, &cfg, Dtype::BF16, name_filter)
+            .expect("train_all_linears_dwq");
+
+        eprintln!(
+            "[iter-12d-2] trained={} skipped={} safetensors_bytes={}",
+            result.trained.len(),
+            result.skipped.len(),
+            result.safetensors_bytes.len()
+        );
+
+        // At least one tensor must have trained successfully (otherwise
+        // either the GGUF is empty or the convergence floor is wrong for
+        // this model — both are real failures the test should catch).
+        assert!(
+            !result.trained.is_empty(),
+            "no Linears trained — first skipped reasons: {:?}",
+            result.skipped.iter().take(3).collect::<Vec<_>>()
+        );
+
+        // Skipped tensors must carry a non-empty reason.
+        for s in &result.skipped {
+            assert!(
+                !s.reason.is_empty(),
+                "skipped tensor {} has empty reason",
+                s.name
+            );
+        }
+
+        // Safetensors must parse + contain 3 keys per trained tensor.
+        let parsed = SafeTensors::deserialize(&result.safetensors_bytes)
+            .expect("safetensors parse");
+        let parsed_names: std::collections::HashSet<String> =
+            parsed.names().into_iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            parsed_names.len(),
+            result.trained.len() * 3,
+            "expected 3 tensors per trained Linear, got {} for {} trained",
+            parsed_names.len(),
+            result.trained.len()
+        );
+        for t in &result.trained {
+            let stem = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+            for suffix in [".weight", ".scales", ".biases"] {
+                let key = format!("{stem}{suffix}");
+                assert!(
+                    parsed_names.contains(&key),
+                    "missing safetensors key {key}"
+                );
+            }
+        }
+
+        // Each triplet must round-trip through MlxAffineLinear::from_safetensors.
+        for t in &result.trained {
+            let stem = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+            let lin = MlxAffineLinear::from_safetensors(
+                &parsed,
+                stem,
+                cfg.bits,
+                cfg.group_size,
+            )
+            .unwrap_or_else(|e| {
+                panic!("MlxAffineLinear::from_safetensors {stem}: {e}")
+            });
+            assert_eq!(lin.n, t.n);
+            assert_eq!(lin.k, t.k);
+            assert_eq!(lin.q_int.len(), t.n * t.k);
+            assert_eq!(
+                lin.scales.len(),
+                t.n * (t.k / cfg.group_size),
+                "scales length mismatch for {stem}"
+            );
+
+            // KL diagnostics must reflect actual training (kl_min < kl_initial).
+            assert!(
+                t.kl_min <= t.kl_initial,
+                "kl_min={} > kl_initial={} for {}",
+                t.kl_min,
+                t.kl_initial,
+                t.name
+            );
+            assert!(t.kl_initial.is_finite());
+            assert!(t.kl_min.is_finite());
+        }
     }
 
     #[test]
