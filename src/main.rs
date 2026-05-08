@@ -266,6 +266,20 @@ fn cmd_dwq_train(args: cli::DwqTrainArgs) -> Result<(), AppError> {
         if skip_huge && (name.starts_with("token_embd") || name.starts_with("output")) {
             return false;
         }
+        // ADR-020 AC#5 Iter E — exclude 1-D norm/scale tensors *before*
+        // the limit counter so `--limit N` actually trains N Linears
+        // (not N candidates that mostly hit the rank-2 reject inside
+        // train_all_linears_dwq).  Catches Gemma 4 + Qwen35 norm/scale
+        // patterns: `_norm.weight` (attn_norm, attn_q_norm, attn_k_norm,
+        // post_attention_norm, pre_ffw_norm_*, post_ffw_norm_*,
+        // output_norm), `_scale.weight` (layer_output_scale), and
+        // MoE per-expert scale tensors (`_exps.scale`).
+        if name.contains("_norm.weight")
+            || name.ends_with("_scale.weight")
+            || name.ends_with("_exps.scale")
+        {
+            return false;
+        }
         if let Some(lim) = limit {
             let cur = counter.get();
             if cur >= lim {
