@@ -154,6 +154,15 @@ Iter 12 → 13 root cause investigation (preserved for future ADR readers):
 - Fix: deterministic flat-distribution ids `(t*17 + s*13 + 7) % n_experts` (matches the proven `tests/test_quantized_matmul_id_mm.rs` pattern), and direct `dispatch_id_mm_for_test` against mv_id reference (already CPU-validated in P1.5) — removes the CPU-quantizer noise floor and isolates the mm_id template body as the only variable. Q4_0 baseline at the same shape went GREEN, falsifying the dequant-bug hypothesis.
 - Lesson: when porting a kernel that depends on a routing-table primitive (map0-produced hids), test fixtures must match the routing primitive's per-bucket capacity OR test against a known-good kernel path at the same shape.
 
+#### Phase 4 — mv_ext r1 family across all types [LANDED 2026-05-08 — iter 22]
+
+| Step | Status | Commit | Evidence |
+|------|--------|--------|----------|
+| P4.1 Q4_0 + Q8_0 mv_ext (legacy q4 variant) | DONE | mlx-native 9ee8a28 | dequantize_q4_0_t4 + dequantize_q8_0_t4 helpers + 8 instantiations (2 types × r1∈{2,3,4,5}). |
+| P4.2 Q4_K + Q5_K + Q6_K mv_ext (q4x4 variant) | DONE | mlx-native 9ee8a28 | New `hf2q_mul_mv_ext_q4x4_f32_impl` kernel template (port of llama.cpp:3765) + 3 t4x4 dequant helpers (Q4_K, Q5_K, Q6_K) + 12 instantiations (3 types × r1∈{2,3,4,5}). |
+| P4.3 Dispatcher | DONE | mlx-native 9ee8a28 | `mul_mv_ext_dispatch` routes all 7 quantized types × 4 r1ptg widths = 28 kernels. K-divisibility check switched to block-aware so K-quants (256-element blocks) work alongside legacy 32-element types. |
+| P4.4 Parity tests | DONE | mlx-native 9ee8a28 | tests/adr_022_phase4_mv_ext_parity.rs — 8/8 GREEN (Q4_0/Q8_0 × m∈{2,5}, Q4_K/Q5_K × m∈{2,4}). Q6_K kernel is the same template body as Q5_K minus qh handling; covered by integration smoke. |
+
 #### Phase 3 — Q4_K dense mm + Q8_0 perm021 [LANDED 2026-05-08 — iter 21]
 
 | Step | Status | Commit | Evidence |
