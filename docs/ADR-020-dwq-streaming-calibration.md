@@ -410,11 +410,66 @@ landed; Linear-only forward already landed).
      iter-15c-2 4-simdgroup `qmm_affine_simd4` measured 5×+ speedup.
 5. **hf2q MLX-safetensors loader:** loads the trained output via
    `mlx_native::weight::load_quantized_weights`; serve-path generation
-   produces non-degenerate text on a fixed prompt.
-   **PARTIAL** — `MlxAffineLinear::from_safetensors` round-trips through
-   `mlx_safetensors_loader` (iter-12d-2 tests); serve-path inference of
-   trained DWQ output is operator-runnable via the `--bench` artifact
-   from iter-12d-4 harness but not yet auto-tested in CI.
+   produces non-degenerate text on a fixed prompt.  **DENSE DONE 2026-05-08
+   / MoE INFRA DONE / qwen35 PARALLEL IMPL PENDING** —
+   - **Dense closure** (Iter A → E, hf2q `b017c65`, mlx-native
+     `de0bcb9`):
+     - Iter A: ported canonical `affine_qmm_t` packed-U32 dense kernel
+       from upstream MLX C++ `quantized.h:1716` to mlx-native as
+       `qmm_affine_t_packed_simd4_b4` (mlx-native `d0de92a`); 3 unit
+       tests PASS (byte-identity vs unpacked simd4, partial-tile,
+       validation).
+     - Iter B: `MlxQWeight::from_mlx_affine_linear` constructor with
+       packed-U32 weight + F32 scales/biases buffers; 2 round-trip
+       tests PASS.
+     - Iter C: `dispatch_qmatmul` affine routing checks
+       `weight.affine.is_some()` before F32/GGML branches; 2 tests
+       PASS (dispatch + byte-identity vs direct-kernel).
+     - Iter D: `--dwq-overlay <path>` CLI flag flowing through
+       `multi_model::EngineConfig` → `LoadOptions::dwq_overlay_path`
+       → `GemmaLoadedModel::load`; `MlxModelWeights::apply_dwq_overlay`
+       walks safetensors stems, parses metadata bits/group_size,
+       routes to `parse_dwq_overlay_role` for slot mapping; 3 tests
+       PASS (role parsing, metadata, full safetensors round-trip).
+     - Iter E: end-to-end smoke 2026-05-08 — `hf2q dwq-train --limit 5
+       --convergence-ratio 2.0` on Gemma 4 26B-A4B-it-ara Apex Q5_K_M
+       trained 2 dense Linears (blk.1.attn_q, blk.3.attn_v); `hf2q
+       serve --dwq-overlay` loaded the overlay → 2 dense Linears
+       overridden → "What is 2 plus 2?" returned **"Two plus two
+       equals four."** at 46.6 t/s prefill / 61.0 t/s decode on M5
+       Max.  AC#5 dense closure VERIFIED.
+   - **MoE infrastructure** (Iter C2.1, C2.2, C2.3 partial, hf2q
+     `fc04575`):
+     - C2.1: `train_all_linears_dwq` rank-3 branch — per-expert
+       slicing of `*_exps.weight` tensors, per-expert training, emits
+       per-expert stems matching `blk.{i}.<role>.{e}`.
+     - C2.2: `MlxAffineMoeStack` data structure + `MlxMoeWeights`
+       gains `gate_up_affine: Option<MlxAffineMoeStack>` +
+       `down_affine`; `apply_dwq_overlay` second-pass aggregates
+       per-expert MoE buckets via `parse_dwq_moe_expert_role` (4 base
+       roles: GateUp/Gate/Up/Down × expert_idx); BF16 conversion at
+       upload time (`hf2q a1c6ad3`) for compatibility with
+       `quantized_matmul_id` kernel's BF16 scales/biases convention.
+     - mlx-native `quantized_matmul_id_into` variant added at
+       `mlx-native 51cfca9` — writes into pre-allocated output buffer
+       (matches hf2q's `pf_moe_gate_up`/`pf_moe_down` reuse pattern).
+     - C2.3 Gemma 4: both `forward_prefill_batched.rs`
+       `quantized_matmul_id_ggml_pooled` call sites gate on
+       `gate_up_affine.is_some() && down_affine.is_some()` and route
+       to `quantized_matmul_id_into` for the affine path
+       (hf2q `fc04575`).
+   - **Outstanding** (next session):
+     - **qwen35 parallel impl**: Qwen35Model uses its own
+       `MoeFfnWeightsQ` (separate from `MlxMoeWeights`); needs a
+       parallel `Qwen35Model::apply_dwq_overlay` + `MoeFfnWeightsQ`
+       affine slot extension + the 6 `gpu_ffn.rs`
+       `quantized_matmul_id_ggml_pooled` call sites gated-and-routed.
+     - **Iter E2**: Qwen 3.6 35B-A3B-APEX end-to-end smoke once
+       qwen35 parallel impl lands.
+     - **Gemma 4 MoE smoke**: requires full DWQ training of one
+       complete MoE bucket (128 experts × all roles) so the
+       contiguous-experts check in `apply_dwq_overlay` finds an
+       intact stack — operator-runnable.
 6. **End-to-end memory budget:** `hf2q convert --quant dwq-native-4`
    on Qwen3.6-27B; max RSS `< 100 GB`.  **DONE** — iter-12e
    `RssWatchdog` at 100 GB cap (`c7bdaa9`); CLI `--rss-cap-gb 100`

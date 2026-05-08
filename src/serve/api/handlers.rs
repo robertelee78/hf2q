@@ -3041,160 +3041,20 @@ fn expand_image_placeholders_family(
     (Vec<u32>, Vec<engine::SoftTokenData>, Vec<Vec<u32>>),
     Response,
 > {
-    let n_images = embeddings.len();
-    let hidden = engine.hidden_size();
-    if hidden == 0 || per_row_floats == 0 {
-        return Err(ApiError::generation_error(format!(
-            "expand_image_placeholders_family: degenerate hidden ({}) or \
-             per_row_floats ({})",
-            hidden, per_row_floats
-        ))
-        .into_response());
-    }
-    let placeholder_literal = match family.placeholder_token_literal() {
-        Some(s) => s,
-        None => {
-            return Err(ApiError::generation_error(format!(
-                "expand_image_placeholders_family: VisionFamily::{:?} has no \
-                 placeholder token literal — handler should have rejected \
-                 this profile upstream",
-                family
-            ))
-            .into_response());
-        }
-    };
-    let img_token_id: u32 = match engine.tokenizer().token_to_id(placeholder_literal) {
-        Some(id) => id,
-        None => {
-            return Err(ApiError::generation_error(format!(
-                "tokenizer has no `{placeholder_literal}` special-token id; \
-                 the loaded chat model does not support vision input through \
-                 hf2q's soft-token path"
-            ))
-            .into_response());
-        }
-    };
-    let placeholder_positions: Vec<usize> = prompt_tokens
-        .iter()
-        .enumerate()
-        .filter_map(|(p, t)| if *t == img_token_id { Some(p) } else { None })
-        .collect();
-    if placeholder_positions.len() != n_images {
-        return Err(ApiError::generation_error(format!(
-            "rendered prompt has {} `{placeholder_literal}` placeholder(s) \
-             but request carries {} image(s); the chat template likely \
-             dropped or duplicated image markers — check \
-             `tokenizer_config.json` and the GGUF chat template",
-            placeholder_positions.len(),
-            n_images
-        ))
-        .into_response());
-    }
-    // Validate per-image embedding length matches per_row_floats × N.
-    for (i, e) in embeddings.iter().enumerate() {
-        if e.len() % per_row_floats != 0 || e.is_empty() {
-            return Err(ApiError::generation_error(format!(
-                "vision embedding [{i}] length {} is not a positive multiple \
-                 of per_row_floats {per_row_floats} (family={family:?}, \
-                 hidden={hidden})",
-                e.len()
-            ))
-            .into_response());
-        }
-    }
-    // Apple Silicon: MlxDevice::new() returns the singleton Metal
-    // device.  Buffers it allocates are usable by any other GpuContext
-    // / device handle in this process via shared-memory semantics, so
-    // the handler can alloc + populate the soft-token buffers off the
-    // worker thread.
-    let mlx_dev = match mlx_native::MlxDevice::new() {
-        Ok(d) => d,
-        Err(e) => {
-            return Err(
-                ApiError::generation_error(format!("MlxDevice init failed: {e}")).into_response(),
-            );
-        }
-    };
-    let total_extra: usize = embeddings
-        .iter()
-        .map(|e| e.len() / per_row_floats)
-        .sum::<usize>()
-        .saturating_sub(n_images); // each placeholder already counts once
-    let mut prompt_expanded: Vec<u32> = Vec::with_capacity(prompt_tokens.len() + total_extra);
-    let mut soft_tokens: Vec<engine::SoftTokenData> = Vec::with_capacity(n_images);
-    // Per-image expanded-prompt absolute positions (the contiguous run
-    // each `<|image_pad|>` placeholder expands into). Wedge-4d uses
-    // these to populate `DeepstackInjection.image_token_positions` at
-    // the engine seam. For Gemma the slot is unused (Gemma doesn't have
-    // DeepStack heads); we still emit it for shape symmetry.
-    let mut image_token_positions: Vec<Vec<u32>> = Vec::with_capacity(n_images);
-    let mut last_pos = 0usize;
-    for (i, &pos) in placeholder_positions.iter().enumerate() {
-        prompt_expanded.extend_from_slice(&prompt_tokens[last_pos..pos]);
-        let n_image_tokens = embeddings[i].len() / per_row_floats;
-        let start = prompt_expanded.len();
-        for _ in 0..n_image_tokens {
-            prompt_expanded.push(img_token_id);
-        }
-        let end = prompt_expanded.len();
-        // Soft-token slot stores ONLY the BASE chunk (first `hidden`
-        // floats per row). For Gemma family `per_row_floats == hidden`
-        // → the entire embedding is the base chunk. For Qwen3-VL family
-        // `per_row_floats == hidden * (1 + N_deepstack)` → we slice out
-        // the first column-chunk via per-row stride. The full augmented
-        // embedding is preserved on the AppState side for the engine
-        // seam to split (see `dispatch_qwen3vl_seam_split`).
-        let byte_len = n_image_tokens * hidden * std::mem::size_of::<f32>();
-        let mut buf = match mlx_dev.alloc_buffer(
-            byte_len,
-            mlx_native::DType::F32,
-            vec![n_image_tokens, hidden],
-        ) {
-            Ok(b) => b,
-            Err(e) => {
-                return Err(ApiError::generation_error(format!(
-                    "soft-token buffer alloc failed (image {i}): {e}"
-                ))
-                .into_response());
-            }
-        };
-        match buf.as_mut_slice::<f32>() {
-            Ok(dst) => {
-                debug_assert_eq!(dst.len(), n_image_tokens * hidden);
-                if per_row_floats == hidden {
-                    // Gemma-style: contiguous copy.
-                    dst.copy_from_slice(&embeddings[i]);
-                } else {
-                    // Qwen3-VL-style: per-row strided copy of the first
-                    // `hidden`-float chunk (the base chunk). Subsequent
-                    // chunks are split out by the engine seam.
-                    for row in 0..n_image_tokens {
-                        let src_base = row * per_row_floats;
-                        let dst_base = row * hidden;
-                        dst[dst_base..dst_base + hidden].copy_from_slice(
-                            &embeddings[i][src_base..src_base + hidden],
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                return Err(ApiError::generation_error(format!(
-                    "soft-token buffer mut slice failed (image {i}): {e}"
-                ))
-                .into_response());
-            }
-        }
-        soft_tokens.push(engine::SoftTokenData {
-            range: start..end,
-            embeddings: buf,
-        });
-        // Record per-image expanded-prompt positions for downstream
-        // DeepstackInjection construction at the engine seam.
-        image_token_positions.push((start..end).map(|p| p as u32).collect());
-        last_pos = pos + 1;
-    }
-    prompt_expanded.extend_from_slice(&prompt_tokens[last_pos..]);
-    Ok((prompt_expanded, soft_tokens, image_token_positions))
+    // Thin handler-side wrapper around the shared
+    // `inference::vision::pipeline::expand_image_placeholders` so SERVE
+    // and the CLI `--image` path use one implementation. The wrapper
+    // converts anyhow errors into the OpenAI-shaped `ApiError::generation_error`
+    // response so existing callers' error semantics are preserved.
+    crate::inference::vision::pipeline::expand_image_placeholders(
+        engine.tokenizer(),
+        prompt_tokens,
+        embeddings,
+        family,
+        per_row_floats,
+        engine.hidden_size(),
+    )
+    .map_err(|e| ApiError::generation_error(format!("{e:#}")).into_response())
 }
 
 /// Pre-compile the request's `response_format` to a parsed GBNF grammar.
