@@ -223,6 +223,14 @@ pub struct DwqTrainArgs {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     pub skip_huge: bool,
+
+    /// ADR-020 iter-12e — RSS watchdog cap (gigabytes).  When set,
+    /// spawns a background thread polling resident-set size every 5s.
+    /// If RSS exceeds the cap, the training scan aborts cleanly with
+    /// a peak-RSS report.  §8.3 AC #6 caps DWQ training at 100 GB.
+    /// Pass `0` to disable the watchdog entirely (default: 100 GB).
+    #[arg(long, default_value_t = 100.0)]
+    pub rss_cap_gb: f64,
 }
 
 /// `hf2q cache` subcommands. ADR-005 Phase 3 iter-205 (AC line 5351).

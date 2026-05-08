@@ -172,6 +172,128 @@ pub fn box_muller_gaussian(n: usize, seed: u64) -> Vec<f32> {
 
 /// Build a fresh f32 `MlxBuffer` from host data — used by the
 /// training loop to wrap Adam-managed parameter state.
+/// ADR-020 iter-12e — sample the current process's resident-set size.
+///
+/// On Apple Silicon Metal-backed processes a large fraction of the
+/// "RSS" reported by the kernel is the unified-memory `StorageModeShared`
+/// allocation pool, which is the metric §8.3 AC #6 caps at 100 GB.
+///
+/// Implementation uses `sysinfo::System::new()` then `refresh_processes`
+/// + `process(get_current_pid())` + `Process::memory()` (returns bytes
+/// in sysinfo 0.30+).  Returns 0 if the process can't be located in
+/// sysinfo's snapshot (impossible in practice but the public contract
+/// is "best-effort poll, never panic").
+pub fn current_rss_bytes() -> u64 {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    let pid = match sysinfo::get_current_pid() {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::new().with_memory(),
+    );
+    sys.process(Pid::from(pid.as_u32() as usize))
+        .map(|p| p.memory())
+        .unwrap_or(0)
+}
+
+/// ADR-020 iter-12e — background RSS watchdog.  Spawns a polling
+/// thread that samples [`current_rss_bytes`] every `poll_interval`
+/// (default 5s).  When RSS exceeds `cap_bytes`, sets the shared
+/// abort flag — the [`train_all_linears_dwq`] driver checks the flag
+/// between per-tensor trainings and bails with a clear error +
+/// disposition log.
+///
+/// Drop semantics: dropping the watchdog signals the polling thread
+/// to stop and joins it (best-effort; the thread checks the stop flag
+/// at every poll boundary so the stop is at most `poll_interval` late).
+pub struct RssWatchdog {
+    cap_bytes: u64,
+    aborted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    peak_rss_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RssWatchdog {
+    /// Spawn a watchdog thread polling every `poll_interval`.  Returns
+    /// immediately; caller drops the handle to stop the watchdog.
+    pub fn spawn(cap_bytes: u64, poll_interval: std::time::Duration) -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let aborted = Arc::new(AtomicBool::new(false));
+        let peak = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let aborted_th = aborted.clone();
+        let peak_th = peak.clone();
+        let stop_th = stop.clone();
+        let handle = std::thread::Builder::new()
+            .name("dwq-rss-watchdog".to_string())
+            .spawn(move || {
+                while !stop_th.load(Ordering::Relaxed) {
+                    let rss = current_rss_bytes();
+                    let prev = peak_th.load(Ordering::Relaxed);
+                    if rss > prev {
+                        peak_th.store(rss, Ordering::Relaxed);
+                    }
+                    if rss > cap_bytes {
+                        aborted_th.store(true, Ordering::Relaxed);
+                        // Continue polling so peak stays accurate even
+                        // after the cap was exceeded (helps the driver's
+                        // post-abort error message report the worst-case
+                        // RSS observed).
+                    }
+                    std::thread::sleep(poll_interval);
+                }
+            })
+            .expect("spawn dwq-rss-watchdog thread");
+        Self {
+            cap_bytes,
+            aborted,
+            peak_rss_bytes: peak,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// Cap configured at spawn time (bytes).
+    pub fn cap_bytes(&self) -> u64 {
+        self.cap_bytes
+    }
+
+    /// Cheap clone of the abort flag for the driver to poll.
+    pub fn aborted_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.aborted.clone()
+    }
+
+    /// Highest RSS observed by the watchdog so far (bytes).
+    pub fn peak_rss_bytes(&self) -> u64 {
+        self.peak_rss_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Has the cap been exceeded since spawn?
+    pub fn is_aborted(&self) -> bool {
+        self.aborted
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for RssWatchdog {
+    fn drop(&mut self) {
+        self.stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 pub fn buffer_from_f32(device: &MlxDevice, data: &[f32]) -> Result<MlxBuffer> {
     let mut buf = device
         .alloc_buffer(data.len() * 4, DType::F32, vec![data.len()])
@@ -276,6 +398,14 @@ pub struct DwqTrainingConfig {
     /// iter-17b: 0.34.  Set to a value > 1.0 to disable the convergence
     /// check (e.g. for diagnostic runs).
     pub convergence_ratio: f32,
+    /// ADR-020 iter-12e — RSS watchdog cap (bytes).  When `Some(cap)`,
+    /// `train_all_linears_dwq` spawns a background thread polling the
+    /// process's resident-set size every 5s and aborts the scan if RSS
+    /// exceeds this cap.  Defaults to `None` (no watchdog) so existing
+    /// callers keep the iter-12d-1/2 behavior unchanged.
+    ///
+    /// §8.3 AC #6 cap is 100 GB → `Some(100 * 1024 * 1024 * 1024)`.
+    pub rss_cap_bytes: Option<u64>,
 }
 
 impl Default for DwqTrainingConfig {
@@ -290,6 +420,7 @@ impl Default for DwqTrainingConfig {
             perturb_factor: 2.0,
             seed: 0xDEADBEEF,
             convergence_ratio: 0.34,
+            rss_cap_bytes: None,
         }
     }
 }
@@ -389,7 +520,31 @@ where
     // serialize once at the end.
     let mut all_bytes: Vec<(String, MlxAffineLinearBytes)> = Vec::new();
 
+    // ADR-020 iter-12e — optional RSS watchdog.  Lives for the duration
+    // of the scan; dropped at function exit (Drop joins the thread).
+    let watchdog: Option<RssWatchdog> = cfg.rss_cap_bytes.map(|cap| {
+        RssWatchdog::spawn(cap, std::time::Duration::from_secs(5))
+    });
+
     for name in names {
+        // Pre-tensor watchdog check — abort the scan if RSS cap exceeded.
+        if let Some(w) = &watchdog {
+            if w.is_aborted() {
+                return Err(anyhow!(
+                    "train_all_linears_dwq: RSS watchdog aborted scan — \
+                     peak RSS {} bytes ({:.2} GB) exceeded cap {} bytes \
+                     ({:.2} GB) after {} trained tensors (next would have \
+                     been '{}')",
+                    w.peak_rss_bytes(),
+                    w.peak_rss_bytes() as f64 / 1024.0_f64.powi(3),
+                    w.cap_bytes(),
+                    w.cap_bytes() as f64 / 1024.0_f64.powi(3),
+                    trained.len(),
+                    name,
+                ));
+            }
+        }
+
         if !name_filter(&name) {
             skipped.push(DwqLinearSkipped {
                 name: name.clone(),
@@ -1803,6 +1958,84 @@ mod tests {
         };
         let r = train_linear_dwq_synthetic_teacher(&device, &any_w[..32 * 32], 32, 32, &bad_cfg);
         assert!(r.is_err());
+    }
+
+    /// ADR-020 iter-12e — current_rss_bytes returns a non-zero value
+    /// (the test process always has some resident memory).  Sanity gate
+    /// for the sysinfo wiring; failure here means the watchdog can't
+    /// see process memory at all.
+    #[test]
+    fn iter_12e_current_rss_bytes_is_positive() {
+        let rss = super::current_rss_bytes();
+        assert!(
+            rss > 1024 * 1024,
+            "current_rss_bytes() returned {rss}; expected > 1 MB \
+             (test process must have resident memory)"
+        );
+    }
+
+    /// ADR-020 iter-12e — RssWatchdog with cap below current RSS triggers
+    /// `is_aborted()` within a few poll cycles.  Verifies the polling
+    /// thread runs + the abort flag is set + peak_rss reflects current.
+    #[test]
+    fn iter_12e_rss_watchdog_triggers_when_cap_below_current() {
+        use super::RssWatchdog;
+        use std::time::Duration;
+
+        // Cap intentionally far below any possible test-process RSS.
+        let cap = 1024u64; // 1 KB — guaranteed to trigger
+        let w = RssWatchdog::spawn(cap, Duration::from_millis(50));
+
+        // Poll up to 1s (20× 50ms) for the abort to surface.
+        let mut tries = 0;
+        while !w.is_aborted() && tries < 20 {
+            std::thread::sleep(Duration::from_millis(50));
+            tries += 1;
+        }
+        assert!(
+            w.is_aborted(),
+            "watchdog did not abort within 1s (cap=1KB; current RSS = {} bytes)",
+            super::current_rss_bytes()
+        );
+        assert!(
+            w.peak_rss_bytes() > cap,
+            "peak_rss_bytes ({}) <= cap ({})",
+            w.peak_rss_bytes(),
+            cap
+        );
+        assert_eq!(w.cap_bytes(), cap);
+    }
+
+    /// ADR-020 iter-12e — RssWatchdog with extremely high cap does NOT
+    /// trigger.  Catches false-positive aborts from a misconfigured
+    /// cap-comparison.
+    #[test]
+    fn iter_12e_rss_watchdog_does_not_trigger_below_cap() {
+        use super::RssWatchdog;
+        use std::time::Duration;
+
+        // Cap = 1 PB — unreachable on any real machine.
+        let cap = 1024u64 * 1024 * 1024 * 1024 * 1024; // 1 PB
+        let w = RssWatchdog::spawn(cap, Duration::from_millis(50));
+
+        // Wait 200ms (≥ 4 poll cycles) — abort flag must remain false.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !w.is_aborted(),
+            "watchdog falsely aborted at cap=1PB (peak={})",
+            w.peak_rss_bytes()
+        );
+    }
+
+    /// ADR-020 iter-12e — DwqTrainingConfig::default() has rss_cap_bytes=None
+    /// so existing iter-12d-1/2 callers inherit no-watchdog behavior.
+    #[test]
+    fn iter_12e_default_config_has_no_rss_cap() {
+        let cfg = super::DwqTrainingConfig::default();
+        assert!(
+            cfg.rss_cap_bytes.is_none(),
+            "DwqTrainingConfig::default() must have rss_cap_bytes = None"
+        );
     }
 
     /// ADR-020 iter-12d-2 — production driver test (real GGUF; gated

@@ -211,6 +211,14 @@ fn cmd_dwq_train(args: cli::DwqTrainArgs) -> Result<(), AppError> {
         }
     }
 
+    // RSS cap: 0 → disabled; >0 → cap in GB → bytes.
+    let rss_cap_bytes: Option<u64> = if args.rss_cap_gb > 0.0 {
+        let bytes = (args.rss_cap_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+        Some(bytes)
+    } else {
+        None
+    };
+
     let cfg = DwqTrainingConfig {
         bits: args.bits,
         group_size: args.group_size,
@@ -221,6 +229,7 @@ fn cmd_dwq_train(args: cli::DwqTrainArgs) -> Result<(), AppError> {
         perturb_factor: args.perturb_factor,
         seed: args.seed,
         convergence_ratio: args.convergence_ratio,
+        rss_cap_bytes,
     };
 
     println!(
