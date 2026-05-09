@@ -285,6 +285,63 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-101 vec4 norm fusion (item D) — FALSIFIED by GPU pure-time bench
+
+Iter-99 item D estimated 2.8-3.4% decode ROI from porting llama.cpp's
+`kernel_rms_norm_mul_add_f32_4` (vec4 variant) over hf2q's scalar
+`fused_norm_add_f32`. Hypothesis from iter-99 lookup: `dot(x[i00],
+x[i00])` with `float4` reduces memory ops 4× per access; `simd_sum` skips
+the tree-reduction barriers in hf2q's scalar path.
+
+Built `tests/test_fused_ops.rs:bench_fused_norm_add_f32_gemma_decode`
+mirroring iter-94/97 CPU/GPU split methodology via
+`commit_wait_with_gpu_time`. Measures both **per-call isolated** (cold
+encoder, commit per call — exposes per-CB sync floor) and
+**session-120** (120 dispatches in ONE encoder, ONE commit — mirrors
+production decode amortization at 4 norm calls per layer × 30 layers).
+
+Shape: `rows=1, dim=2816` (gemma-4-26b decode hidden_size).
+
+| Mode | CPU wall p50 | GPU pure p50 | Per-call GPU |
+|---|---:|---:|---:|
+| Per-call isolated | 203.25 µs | 28.21 µs | — |
+| Session-120 amortized | 268.04 µs | 60.42 µs | **0.50 µs/call** |
+
+**Per-token norm contribution (120 calls @ 0.50 µs/call GPU + 2.23 µs/call
+CPU wall) = 0.27 ms = 1.7% of 15.86 ms decode token.**
+
+**Verdict (TESTABLE → FALSIFIED)**: even hypothetical total elimination
+of all 120 norm dispatches saves only 1.7% decode. Vec4's best-case 4×
+GPU-pure improvement = 0.375 µs/call × 120 = 45 µs/token = **0.28%
+decode speedup** — within thermal noise. Item D dead by physics.
+
+The 1.7% ceiling explains why iter-98 listed norm sites as "already
+fused" / "small" — internal categorization was directionally correct.
+Iter-99 item D inherited llama.cpp's relative ROI claim without
+measuring at hf2q's actual call count + per-call cost.
+
+10th hypothesis falsification on M5 Max where a llama.cpp lever did
+NOT port to a hf2q win. Memory updated: `feedback_metal_compiler_auto_
+optimizes_static_levers`.
+
+**Pivot to real levers** (dispatch-count reduction, NOT within-kernel
+optimization):
+- Task #19 / iter-98 #1: **FWHTs into FA-vec-tq-hb** — saves 2/layer ×
+  30 = 60 dispatches/token = 960 µs = ~6% decode (real lever).
+- Task #18 / iter-98 #2: **Q6_K + Q5_K swiglu-fused-down mv_id** —
+  saves 1/layer × 30 = 30 dispatches/token = 480 µs = ~3% decode.
+- Task #14 / iter-99 #I: **bin_fuse_4** — needs scoping pass to find
+  decode-graph chains.
+
+The dispatch-count axis works because at the per-dispatch GPU floor of
+~16 µs (iter-90), each saved dispatch = ~16 µs of token budget. The
+within-kernel axis fails because individual kernels already run below
+the floor.
+
+Bench retained as regression-gate: `cargo test --release --test
+test_fused_ops bench_fused_norm_add_f32_gemma_decode -- --ignored
+--nocapture`.
+
 ### Iter-100 FA-vec nwg A/B (item A) — FALSIFIED at gemma decode kL ≤ 170
 
 Iter-99 item A claimed llama.cpp's nwg=32 + nsg-ramp could be a long-
