@@ -285,6 +285,59 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-112 ADR-029 DRAFT — n-gram speculative decode scope ready for operator
+
+Per iter-110/111 closure, the decode peer gap is structural within the
+TQ-HB + Q5_K_M regime. Iter-112 scopes path A (speculative decode) by
+reading vLLM's n-gram proposer + hf2q's forward path:
+
+**Algorithm** (vLLM `/opt/vllm/vllm/v1/spec_decode/ngram_proposer.py:198-285`):
+KMP-style longest-prefix-suffix match. Pure CPU, no draft model.
+Find longest n-gram with length in [min_n, max_n] matching the suffix
+ending at the current position; propose the K tokens that followed
+that n-gram earlier in the sequence.
+
+**Verify** (per llama.cpp `common/speculative.cpp` + standard SD): run
+the model on `[T_t, draft_1..draft_K]` (K+1 tokens), argmax each
+position, accept the longest matching prefix, take the model's argmax
+at the first non-matching position. KV cache truncates to accept_count.
+
+**hf2q integration challenge**: `forward_prefill` returns a single u32
+token, not per-position logits. New entrypoint `forward_decode_verify(
+draft_tokens) -> Vec<f32>` needed. Risk-medium: KV-cache rollback for
+rejected positions across all 30 layers + sliding windows (ADR-017
+Phase E.a's `kv_restore_gemma` infra is the candidate base).
+
+**Phased scope** (full ADR-029-DRAFT at `docs/research/adr-029-DRAFT-
+spec-decode-2026-05-09.md`):
+
+| Phase | LOC | Hrs | Risk |
+|---|---:|---:|---|
+| 1: n-gram proposer | ~80 | 2 | Low |
+| 2: forward_decode_verify + KV rollback | ~300 | 6-12 | **Medium** |
+| 3: generation-loop integration | ~100 | 3 | Low |
+| 4: bench + tune (iterative) | — | iterative | Low |
+| **Total** | ~480 | **~12-20 hrs** | Medium overall |
+
+**Expected outcome** (per iter-99 vLLM/dflash literature):
+- Acceptance rate 60-80% on natural-language outputs
+- Decode lift 1.6-3.0× depending on acceptance
+- gemma-4-26b decode 63 t/s → **100-190 t/s** target range
+- Conservative middle: **125 t/s = 1.42× llama.cpp HEAD's 88 t/s**
+- **MANTRA SATISFIED at K=3, acceptance ≥ 60%**
+
+**Operator decision points** (NO implementation starts until approved):
+1. Approve scope (12-20 hrs engineering across multiple iters)?
+2. Acceptance criteria: minimum decode 88 t/s, stretch ≥ 100 t/s?
+3. Quality gate: temp=0 greedy byte-identical to default decode (vLLM
+   contract preserves this; temp>0 may differ slightly)?
+4. Phasing: incremental commits with byte-identity gates at each phase,
+   OR build complete + validate at end?
+
+**Per `feedback_no_deferrals_without_explicit_approval`**: this is NOT
+a deferral. Concrete work is scoped, ROI is bounded, expected outcome
+satisfies mantra. Awaiting operator approval to begin Phase 1.
+
 ### Iter-111 KV TQ-HB encode bench + closure of decode budget at 60.4%
 
 Final big unmeasured kernel benched. dispatch_hadamard_quantize_kv_hb at
