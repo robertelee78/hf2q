@@ -306,6 +306,31 @@ For this project phase the sliding_wrap 752-byte batched-vs-batched ceiling is *
 
   iter-72 actionable: write `/opt/mlx-native/tests/bench_mm_id_q6_k_decode.rs` (or extend existing bench infrastructure) to time `kernel_mul_mv_id_q6_K_f32` at the gemma decode shape. Estimated ~80 LOC; gives concrete µs/call data without distorting the production hot path.
 
+- 2026-05-09 (iter-72 HF2Q_DUAL_BUFFER sweep — confirms async-commit is at-optimum default): Empirical sweep of `HF2Q_DUAL_BUFFER` split-point on gemma decode (32 tokens, 3 trials each):
+
+  | split | tok/s (3-trial median) |
+  |------:|----------------------:|
+  | 1     | 64.2 |
+  | **3 (default)** | **64.5** |
+  | 5     | 64.2 |
+  | 10    | 63.8 |
+  | 15    | 63.4 |
+  | 20    | 63.0 |
+  | 25    | 61.9 |
+  | 99 (effectively disabled) | 61.7 |
+
+  Dual-buffer async commit gives ~3-4% over no-async (64.5 vs 61.7 tok/s); the default split=3 is already optimal. No env-knob win available for decode.
+
+  Q6_K mv_id µbench writing (the iter-71 actionable) requires a `pack_q6_K` test helper that doesn't currently exist in `mlx-native/tests/test_quantized_matmul_id_ggml.rs` — it has pack_q4_0, pack_q8_0, pack_q5_k, but no pack_q6_K. Existing Q6_K coverage is end-to-end (the gemma APEX-Q5_K_M model itself exercises Q6_K mv_id at runtime). Writing a standalone Q6_K µbench is multi-day scope (Q6_K block layout has 6-bit weights packed via ql/qh/scales — non-trivial pack helper). The 35× prefill win from iter-64+iter-68 has higher operator-visible impact; decode 0.62× is real but not the highest-leverage attack right now.
+
+  **Honest closure of iter-69..72 decode chain:** decode gap is structural (per-kernel-time, distributed across 528 dispatches/token). No 1-line fix exists. Next concrete action requires either:
+  1. **Multi-iter /cfa swarm scope** (operator gate) for hand-optimization of suspect mv_id kernels with proper bench infrastructure
+  2. **Pivot back to prefill** for further wins on top of the 35× iter-64+68 fix (the L6 MoE sensitivity work in ADR-010 §1 — would unlock default-on)
+  3. **Other ADR-022/system work** the operator wants to prioritize
+
+  Iter-73 default if no operator pick: pivot to ADR-010 L6 MoE sensitivity attack (router matmul exact alignment) since the prefill default-on flip is the next user-visible win after iter-64/68 made batched correct + fast.
+
+
 
 
 
