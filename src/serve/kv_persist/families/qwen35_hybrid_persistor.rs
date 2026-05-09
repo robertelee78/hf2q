@@ -58,7 +58,7 @@ use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::{DType, MlxBuffer, MlxDevice};
 
 use crate::inference::models::qwen35::kv_cache::{
-    HybridKvCache, HybridKvCacheSnapshot, MtpKvSnapshot,
+    HybridKvCache, HybridKvCacheSnapshot, MtpKvSnapshot, TqKvSnapshot,
 };
 use crate::serve::kv_persist::format::ModelFingerprint;
 
@@ -68,15 +68,28 @@ pub const QH35_MAGIC: [u8; 4] = *b"QH35";
 
 /// Current codec version.
 /// - v1 (iter-2): always-Some K/V per slot.
-/// - v2 (iter-23a-γ, this iter): per-slot `kv_present: u8` byte before
-///   shape so None entries can round-trip without K/V payload (the F32-
-///   drop precondition for iter-23c+). v2 deserializer also accepts v1
+/// - v2 (iter-23a-γ): per-slot `kv_present: u8` byte before shape so
+///   None entries can round-trip without K/V payload (the F32-drop
+///   precondition for iter-23c+). v2 deserializer also accepts v1
 ///   envelopes via fallback (every slot treated as present).
-pub const QH35_CODEC_VERSION: u32 = 2;
+/// - v3 (iter-36 = sub-iter 23d-β, this iter): per-slot `tq_present: u8`
+///   byte after the v2 body, with optional TQ payload (`norms_per_pos`
+///   + 4 byte_len-prefixed buffer blobs). Closes the iter-34 cross-
+///   process replay gap: in TQ-only mode (slot.k=None) the codec
+///   round-trips slot.tq state so cold-start hydrate restores both
+///   the F32 absence AND the TQ presence. v3 deserializer accepts v1
+///   AND v2 envelopes via fallback (every slot treated as tq_absent).
+pub const QH35_CODEC_VERSION: u32 = 3;
 
-/// Per-slot `kv_present` byte values (v2 only).
+/// Per-slot `kv_present` byte values (v2 / v3).
 pub const QH35_KV_PRESENT: u8 = 1;
 pub const QH35_KV_ABSENT: u8 = 0;
+
+/// Per-slot `tq_present` byte values (v3 only). `KV_PRESENT`/`ABSENT`
+/// constants intentionally NOT shared — `kv` and `tq` are orthogonal
+/// presence flags (a slot may have only F32, only TQ, both, or neither).
+pub const QH35_TQ_PRESENT: u8 = 1;
+pub const QH35_TQ_ABSENT: u8 = 0;
 
 /// Full-attn codec discriminator. Iter-2 ships only F32Dense; iter-11
 /// wires TqV2.
@@ -597,6 +610,20 @@ pub fn serialize_hybrid_snapshot(
             }
             _ => unreachable!("k_opt.is_some() == v_opt.is_some() asserted above"),
         }
+
+        // ADR-027 Phase B iter-36 (sub-iter 23d-β): per-slot tq_present
+        // byte + optional TQ payload. v3 only — earlier versions
+        // implicitly emit no TQ.
+        let tq_opt = snapshot.full_attn_tq.get(slot_idx).and_then(|t| t.as_ref());
+        match tq_opt {
+            Some(tq) => {
+                write_u8(&mut out, QH35_TQ_PRESENT);
+                serialize_tq_blob(&mut out, tq, slot_idx, "full_attn")?;
+            }
+            None => {
+                write_u8(&mut out, QH35_TQ_ABSENT);
+            }
+        }
     }
 
     // --- Per linear-attn slot (iter-3) ---
@@ -709,9 +736,126 @@ pub fn serialize_hybrid_snapshot(
         }
         out.extend_from_slice(mk_bytes);
         out.extend_from_slice(mv_bytes);
+
+        // ADR-027 Phase B iter-36 (sub-iter 23d-β): MTP TQ payload — same
+        // format as full-attn slot TQ (see `serialize_tq_blob`).
+        let mtp_tq_opt = mtp.tq.as_ref();
+        match mtp_tq_opt {
+            Some(tq) => {
+                write_u8(&mut out, QH35_TQ_PRESENT);
+                serialize_tq_blob(&mut out, tq, 0, "mtp")?;
+            }
+            None => {
+                write_u8(&mut out, QH35_TQ_ABSENT);
+            }
+        }
     }
 
     Ok(out)
+}
+
+/// ADR-027 Phase B iter-36 (sub-iter 23d-β): serialize one TQ payload
+/// blob. Layout:
+///
+/// ```text
+/// [norms_per_pos: u32 LE]
+/// [k_packed_byte_len: u64 LE] [k_packed_bytes...]
+/// [k_norms_byte_len:  u64 LE] [k_norms_bytes...]
+/// [v_packed_byte_len: u64 LE] [v_packed_bytes...]
+/// [v_norms_byte_len:  u64 LE] [v_norms_bytes...]
+/// ```
+///
+/// Caller emits the per-slot `tq_present: u8` byte BEFORE invoking
+/// this function (so v3 readers can skip the entire blob on
+/// `tq_present == 0`).
+fn serialize_tq_blob(
+    out: &mut Vec<u8>,
+    tq: &TqKvSnapshot,
+    slot_idx: usize,
+    family: &str,
+) -> Result<()> {
+    let kp = tq
+        .k_packed
+        .as_slice::<u8>()
+        .map_err(|e| anyhow!("QH35 serialize: {family}[{slot_idx}].tq.k_packed as_slice: {e}"))?;
+    let kn = tq
+        .k_norms
+        .as_slice::<u8>()
+        .map_err(|e| anyhow!("QH35 serialize: {family}[{slot_idx}].tq.k_norms as_slice: {e}"))?;
+    let vp = tq
+        .v_packed
+        .as_slice::<u8>()
+        .map_err(|e| anyhow!("QH35 serialize: {family}[{slot_idx}].tq.v_packed as_slice: {e}"))?;
+    let vn = tq
+        .v_norms
+        .as_slice::<u8>()
+        .map_err(|e| anyhow!("QH35 serialize: {family}[{slot_idx}].tq.v_norms as_slice: {e}"))?;
+
+    write_u32_le(out, tq.norms_per_pos);
+    write_u64_le(out, kp.len() as u64);
+    out.extend_from_slice(kp);
+    write_u64_le(out, kn.len() as u64);
+    out.extend_from_slice(kn);
+    write_u64_le(out, vp.len() as u64);
+    out.extend_from_slice(vp);
+    write_u64_le(out, vn.len() as u64);
+    out.extend_from_slice(vn);
+    Ok(())
+}
+
+/// ADR-027 Phase B iter-36 (sub-iter 23d-β): deserialize one TQ payload
+/// blob. Mirror of [`serialize_tq_blob`]. Allocates 4 fresh `MlxBuffer`s
+/// via `device` and copies the bytes verbatim.
+///
+/// Caller has already consumed the `tq_present: u8` byte and confirmed
+/// it equals `QH35_TQ_PRESENT`.
+fn deserialize_tq_blob(
+    bytes: &[u8],
+    cursor: &mut usize,
+    device: &MlxDevice,
+    slot_idx: usize,
+    family: &str,
+) -> Result<TqKvSnapshot> {
+    let norms_per_pos = read_u32_le(bytes, cursor)?;
+
+    // Helper closure to read one byte_len-prefixed buffer into a fresh
+    // U8 MlxBuffer (TQ payloads are dtype-tagged at the cache layer; on
+    // disk every buffer is just bytes).
+    let read_blob = |bytes: &[u8],
+                     cursor: &mut usize,
+                     device: &MlxDevice,
+                     name: &str|
+     -> Result<MlxBuffer> {
+        let n = read_u64_le(bytes, cursor)? as usize;
+        let src = read_bytes(bytes, cursor, n)?;
+        let mut buf = device
+            .alloc_buffer(n, DType::U8, vec![n])
+            .map_err(|e| anyhow!("QH35 deserialize: alloc {family}[{slot_idx}].tq.{name}: {e}"))?;
+        let dst = buf
+            .as_mut_slice::<u8>()
+            .map_err(|e| anyhow!("QH35 deserialize: {family}[{slot_idx}].tq.{name} mut_slice: {e}"))?;
+        ensure!(
+            dst.len() == src.len(),
+            "QH35 deserialize: {family}[{slot_idx}].tq.{name} dst.len {} != src.len {}",
+            dst.len(),
+            src.len()
+        );
+        dst.copy_from_slice(src);
+        Ok(buf)
+    };
+
+    let k_packed = read_blob(bytes, cursor, device, "k_packed")?;
+    let k_norms = read_blob(bytes, cursor, device, "k_norms")?;
+    let v_packed = read_blob(bytes, cursor, device, "v_packed")?;
+    let v_norms = read_blob(bytes, cursor, device, "v_norms")?;
+
+    Ok(TqKvSnapshot {
+        k_packed,
+        k_norms,
+        v_packed,
+        v_norms,
+        norms_per_pos,
+    })
 }
 
 /// Deserialize a QH35 envelope back into a `HybridKvCacheSnapshot` against
@@ -758,12 +902,15 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
     // ADR-027 sub-sub-iter 23a-γ: v2 adds per-slot kv_present byte;
     // accept BOTH v1 (legacy, always-Some) and v2 (Optional). v1
     // envelopes are read with implicit kv_present=1 for every slot.
+    // iter-36 (sub-iter 23d-β): v3 adds tq_present:u8 per slot. v1/v2
+    // envelopes are read with implicit tq_present=0.
     ensure!(
-        codec_version == 1 || codec_version == 2,
-        "QH35 deserialize: unsupported codec_version {} (expected 1 or 2)",
+        codec_version == 1 || codec_version == 2 || codec_version == 3,
+        "QH35 deserialize: unsupported codec_version {} (expected 1, 2, or 3)",
         codec_version
     );
-    let codec_v2 = codec_version == 2;
+    let codec_v2 = codec_version >= 2;
+    let codec_v3 = codec_version >= 3;
 
     let header_cfg = Qwen35HybridConfig {
         n_full_attn: read_u32_le(bytes, cursor)?,
@@ -793,6 +940,11 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
     let mut full_attn_k: Vec<Option<MlxBuffer>> = Vec::with_capacity(cfg.n_full_attn as usize);
     let mut full_attn_v: Vec<Option<MlxBuffer>> = Vec::with_capacity(cfg.n_full_attn as usize);
     let mut full_attn_current_len: Vec<Vec<u32>> = Vec::with_capacity(cfg.n_full_attn as usize);
+    // iter-36 (sub-iter 23d-β): TQ snapshot per slot. v3 deserializes
+    // from the envelope; v1/v2 leave all entries None.
+    let mut full_attn_tq: Vec<Option<TqKvSnapshot>> = (0..cfg.n_full_attn as usize)
+        .map(|_| None)
+        .collect();
 
     for expected_slot in 0..cfg.n_full_attn as usize {
         let slot_idx = read_u32_le(bytes, cursor)? as usize;
@@ -828,6 +980,23 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
             full_attn_k.push(None);
             full_attn_v.push(None);
             full_attn_current_len.push(current_len);
+            // ADR-027 Phase B iter-36 (sub-iter 23d-β): v3 tq_present
+            // byte AFTER the kv block, regardless of kv_present state.
+            // v1/v2 envelopes don't have this byte — leave full_attn_tq[i]
+            // at its initial None.
+            if codec_v3 {
+                let tq_byte = read_u8(bytes, cursor)?;
+                ensure!(
+                    tq_byte == QH35_TQ_PRESENT || tq_byte == QH35_TQ_ABSENT,
+                    "QH35 deserialize: invalid tq_present byte {} at full_attn[{slot_idx}] \
+                     (expected 0 or 1)",
+                    tq_byte
+                );
+                if tq_byte == QH35_TQ_PRESENT {
+                    full_attn_tq[slot_idx] =
+                        Some(deserialize_tq_blob(bytes, cursor, device, slot_idx, "full_attn")?);
+                }
+            }
             continue;
         }
 
@@ -889,6 +1058,20 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
         full_attn_k.push(Some(k_buf));
         full_attn_v.push(Some(v_buf));
         full_attn_current_len.push(current_len);
+        // iter-36 (sub-iter 23d-β): tq_present byte after kv block on v3.
+        if codec_v3 {
+            let tq_byte = read_u8(bytes, cursor)?;
+            ensure!(
+                tq_byte == QH35_TQ_PRESENT || tq_byte == QH35_TQ_ABSENT,
+                "QH35 deserialize: invalid tq_present byte {} at full_attn[{slot_idx}] \
+                 (expected 0 or 1)",
+                tq_byte
+            );
+            if tq_byte == QH35_TQ_PRESENT {
+                full_attn_tq[slot_idx] =
+                    Some(deserialize_tq_blob(bytes, cursor, device, slot_idx, "full_attn")?);
+            }
+        }
     }
 
     // --- Per linear-attn slot (iter-3) ---
@@ -1012,6 +1195,23 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
             );
             dst.copy_from_slice(mv_src);
         }
+        // iter-36 (sub-iter 23d-β): MTP TQ payload after kv block on v3.
+        let mtp_tq = if codec_v3 {
+            let tq_byte = read_u8(bytes, cursor)?;
+            ensure!(
+                tq_byte == QH35_TQ_PRESENT || tq_byte == QH35_TQ_ABSENT,
+                "QH35 deserialize: invalid tq_present byte {} at mtp \
+                 (expected 0 or 1)",
+                tq_byte
+            );
+            if tq_byte == QH35_TQ_PRESENT {
+                Some(deserialize_tq_blob(bytes, cursor, device, 0, "mtp")?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         Some(MtpKvSnapshot {
             // ADR-027 sub-sub-iter 23a-α: Optional MTP K/V — codec
             // emits Some today (iter-23d will branch on a kv_present
@@ -1019,25 +1219,20 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
             k: Some(mk_buf),
             v: Some(mv_buf),
             current_len: mtp_current_len,
-            // iter-35 (sub-iter 23d-α): codec stays v2 here; TQ
-            // persistence is iter-36 = sub-iter 23d-β scope. Today
-            // the codec emits None for TQ; in-memory snapshot path
-            // (HybridKvCache::snapshot) captures TQ via Some(_).
-            tq: None,
+            tq: mtp_tq,
         })
     } else {
         None
     };
 
-    // iter-35 (sub-iter 23d-α): codec stays v2 — TQ deserialize
-    // produces None per slot. iter-36 (sub-iter 23d-β) bumps the
-    // codec to v3 with `tq_present:u8` per slot to round-trip TQ.
-    let n_full_attn_slots = full_attn_k.len();
     Ok(HybridKvCacheSnapshot {
         full_attn_k,
         full_attn_v,
         full_attn_current_len,
-        full_attn_tq: (0..n_full_attn_slots).map(|_| None).collect(),
+        // iter-36 (sub-iter 23d-β): full_attn_tq populated by the
+        // per-slot loop above (v3 reads tq_present + payload; v1/v2
+        // leave entries at the initial-None state set at vec-init).
+        full_attn_tq,
         mtp,
         linear_conv,
         linear_recurrent,
@@ -1448,7 +1643,9 @@ mod tests {
         // kv_present(1) + shape(32) + k_byte_len(8) + v_byte_len(8) +
         // current_len(4 * n_seqs=1) = 57. Per-slot body: K(256) +
         // V(256) = 512. Per-slot total = 569. n_full_attn=3.
-        assert_eq!(bytes.len(), 24 + 3 * 569);
+        // iter-36 (sub-iter 23d-β): v3 adds tq_present:u8 per slot.
+        // Per-slot overhead is now 569 (v2 body) + 1 (tq_present) = 570.
+        assert_eq!(bytes.len(), 24 + 3 * 570);
         let restored =
             deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
         assert!(snapshots_byte_equal(&snap, &restored));
@@ -1561,7 +1758,10 @@ mod tests {
         // Plus header(24) + 2 full-attn slots @ 569 each (codec v2
         // adds per-slot kv_present byte) = 24 + 1138 = 1162.
         // Total = 1160 + 972 = 2132 bytes.
-        assert_eq!(bytes.len(), 24 + 2 * 569 + 3 * 324);
+        // iter-36 (sub-iter 23d-β): v3 adds tq_present:u8 per slot.
+        // Per-full-attn-slot overhead 569 → 570; linear-attn unchanged
+        // (TQ doesn't apply to linear-attn slots).
+        assert_eq!(bytes.len(), 24 + 2 * 570 + 3 * 324);
     }
 
     /// Iter-4: extends a snapshot with an MTP slot containing
@@ -1739,10 +1939,11 @@ mod tests {
             linear_recurrent: Vec::new(),
         };
         let bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize");
-        // Envelope: header(24) + per-slot None overhead = slot_idx(4) +
-        // kv_present(1) + current_len(4 * n_seqs=1) = 9 bytes per slot.
-        // 3 slots × 9 = 27. Total = 51.
-        assert_eq!(bytes.len(), 24 + 3 * 9);
+        // iter-36 (sub-iter 23d-β): v3 envelope.
+        // Per-slot None-K/V overhead = slot_idx(4) + kv_present(1) +
+        // current_len(4 * n_seqs=1) + tq_present(1) = 10 bytes per slot.
+        // 3 slots × 10 = 30. Total = 24 + 30 = 54.
+        assert_eq!(bytes.len(), 24 + 3 * 10);
 
         let restored = deserialize_hybrid_snapshot(&bytes, &cfg, &device)
             .expect("deserialize");
@@ -1788,6 +1989,222 @@ mod tests {
             .expect("deserialize_lcp_sidecar");
         assert_eq!(cursor, bytes.len(), "sidecar codec must consume all bytes");
         assert_eq!(restored, sidecar);
+    }
+
+    /// ADR-027 Phase B iter-36 (sub-iter 23d-β): synthetic snapshot
+    /// with `full_attn_tq` populated round-trips byte-equal through
+    /// the v3 codec. THE LOAD-BEARING TEST for cross-process replay
+    /// in TQ-only mode (the iter-34 production deployment scenario
+    /// where slot.k=None at restore time).
+    #[test]
+    fn qh35_codec_v3_round_trip_with_tq_payload_byte_equal() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let n_full_attn: u32 = 2;
+        let cfg = synth_cfg(n_full_attn, 1); // n_seqs=1
+
+        // Build a TQ-only snapshot: K/V are None per slot, but TQ is
+        // Some(_) with synthetic deterministic byte content.
+        // TQ shape: synth helper uses head_dim=4, max_seq=2, n_kv_heads=1, n_seqs=1
+        // Per slot: k_packed [1,1,2,4]u8 = 8 bytes; k_norms [1,1,2,1]f32 = 8 bytes; same for v.
+        // Total per TQ blob: 32 bytes data + 4 norms_per_pos + 4×8(byte_lens) = 68 bytes.
+        let mut full_attn_tq: Vec<Option<TqKvSnapshot>> = Vec::new();
+        for slot in 0..n_full_attn as usize {
+            let mut k_packed = device.alloc_buffer(8, DType::U8, vec![8]).unwrap();
+            let mut k_norms = device.alloc_buffer(8, DType::F32, vec![2]).unwrap();
+            let mut v_packed = device.alloc_buffer(8, DType::U8, vec![8]).unwrap();
+            let mut v_norms = device.alloc_buffer(8, DType::F32, vec![2]).unwrap();
+            for (i, b) in k_packed.as_mut_slice::<u8>().unwrap().iter_mut().enumerate() {
+                *b = ((slot * 31 + i * 7) % 251) as u8;
+            }
+            for (i, b) in v_packed.as_mut_slice::<u8>().unwrap().iter_mut().enumerate() {
+                *b = ((slot * 13 + i * 11) % 251) as u8;
+            }
+            for (i, f) in k_norms.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+                *f = (slot as f32) * 0.5 + (i as f32) * 0.125;
+            }
+            for (i, f) in v_norms.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+                *f = (slot as f32) * 0.25 + (i as f32) * 0.0625;
+            }
+            full_attn_tq.push(Some(TqKvSnapshot {
+                k_packed,
+                k_norms,
+                v_packed,
+                v_norms,
+                norms_per_pos: 1,
+            }));
+        }
+
+        let snap = HybridKvCacheSnapshot {
+            full_attn_k: (0..n_full_attn as usize).map(|_| None).collect(),
+            full_attn_v: (0..n_full_attn as usize).map(|_| None).collect(),
+            full_attn_current_len: (0..n_full_attn as usize)
+                .map(|s| vec![s as u32 + 1])
+                .collect(),
+            full_attn_tq,
+            mtp: None,
+            linear_conv: Vec::new(),
+            linear_recurrent: Vec::new(),
+        };
+
+        let bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize v3");
+
+        let restored = deserialize_hybrid_snapshot(&bytes, &cfg, &device)
+            .expect("deserialize v3");
+
+        // K/V remain None per slot (TQ-only mode).
+        for i in 0..n_full_attn as usize {
+            assert!(restored.full_attn_k[i].is_none(),
+                "slot[{i}].k expected None (TQ-only)");
+            assert!(restored.full_attn_v[i].is_none(),
+                "slot[{i}].v expected None (TQ-only)");
+        }
+        // TQ payload byte-equal across all 4 buffers per slot.
+        for i in 0..n_full_attn as usize {
+            let src = snap.full_attn_tq[i].as_ref().unwrap();
+            let dst = restored.full_attn_tq[i].as_ref()
+                .expect(&format!("restored.full_attn_tq[{i}] must be Some"));
+            assert_eq!(src.norms_per_pos, dst.norms_per_pos,
+                "slot[{i}].norms_per_pos mismatch");
+            assert_eq!(
+                src.k_packed.as_slice::<u8>().unwrap(),
+                dst.k_packed.as_slice::<u8>().unwrap(),
+                "slot[{i}].k_packed bytes mismatch"
+            );
+            assert_eq!(
+                src.k_norms.as_slice::<u8>().unwrap(),
+                dst.k_norms.as_slice::<u8>().unwrap(),
+                "slot[{i}].k_norms bytes mismatch"
+            );
+            assert_eq!(
+                src.v_packed.as_slice::<u8>().unwrap(),
+                dst.v_packed.as_slice::<u8>().unwrap(),
+                "slot[{i}].v_packed bytes mismatch"
+            );
+            assert_eq!(
+                src.v_norms.as_slice::<u8>().unwrap(),
+                dst.v_norms.as_slice::<u8>().unwrap(),
+                "slot[{i}].v_norms bytes mismatch"
+            );
+        }
+        assert_eq!(restored.full_attn_current_len, snap.full_attn_current_len);
+    }
+
+    /// ADR-027 Phase B iter-36 — backward compatibility: v3 deserializer
+    /// accepts v2 envelopes (no tq_present byte). full_attn_tq is all-None.
+    #[test]
+    fn qh35_codec_v3_deserializer_accepts_v2_envelope_with_implicit_no_tq() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let n_full_attn: u32 = 3;
+        let cfg = synth_cfg(n_full_attn, 1); // n_seqs=1
+        let snap = synth_full_attn_only_snapshot(&device, &cfg);
+
+        // Synthesize a v3 envelope, then HACK the codec_version byte
+        // back to 2 + STRIP the tq_present:u8 bytes per slot to simulate
+        // a real v2 envelope on disk.
+        let mut bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize v3");
+        // Header: magic(4) + codec_version(4) — write 2 in place of 3.
+        bytes[4] = 2;
+        bytes[5] = 0; bytes[6] = 0; bytes[7] = 0;
+        // Strip the trailing tq_present:u8 from each full-attn slot.
+        // v3 per-slot byte size = 570 (per the byte-count test). v2 = 569.
+        // Slot 0 starts at offset 24+2 (skip 2-byte _reserved). After
+        // header(24) + n_full_attn(4) + n_linear_attn(4) + has_mtp(1) +
+        // codec_tag(1) + n_seqs(4) + _reserved(2) = 16 bytes header tail,
+        // slot 0 begins at offset 40. Stripping is fragile — easier to
+        // skip the test's surgery and just round-trip the v3 directly.
+        // For this test, we'll instead build a v2 by writing minimal v2
+        // envelope BYTES and verify deserialize works.
+        //
+        // Practical compromise: use the v2 deserializer's known behavior:
+        // codec_version=3 with empty tq is byte-equivalent to codec_version=2
+        // EXCEPT for the trailing tq_present=0 byte per slot.
+        // The simplest backward-compat assertion: an authentic v2 envelope
+        // reconstructed manually. Skip the surgery; rely on v3 round-trip
+        // and the v2 round-trip test (already passing post-iter-36 byte
+        // assertion update) to prove backward compat.
+        let _ = bytes;
+
+        // Build a v2-style envelope by serializing then truncating tq_present
+        // bytes. Locate them at the END of each slot's body in v3 layout.
+        // The v3 layout for a Some-K/V slot in synth_full_attn_only_snapshot
+        // (head_dim=4, max_seq=2, n_kv_heads=1, n_seqs=1):
+        //   slot_idx(4) + kv_present(1) + shape(4*8=32) + k_byte_len(8) +
+        //   v_byte_len(8) + current_len(4) + k_bytes(32) + v_bytes(32) +
+        //   tq_present(1)
+        // = 122 bytes per slot in v3. Actually we relied on synth helper
+        // sizing — use bytes_per_slot from v2 which we know is 569 vs v3 570.
+        // The 1-byte delta is ALWAYS at the slot's tail.
+        //
+        // To reconstruct v2: take v3 bytes, write codec_version=2, then
+        // delete the 1-byte tq_present at each slot's tail.
+        let mut v3_bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize");
+        // Confirm v3 size matches expectation (header 24 + 3 * 570).
+        assert_eq!(v3_bytes.len(), 24 + (n_full_attn as usize) * 570);
+        // Header: codec_version → 2.
+        v3_bytes[4] = 2;
+        // Walk slots in REVERSE and remove the tq_present byte at each tail.
+        // V3 slot size = 570; tq_present is the LAST byte of each slot.
+        for slot_rev in (0..n_full_attn as usize).rev() {
+            // V3 layout: header(24) + slot[0..i] each at full v3 size.
+            // After header: slot 0 at offset 24, ends at 24+570.
+            // The tq_present byte for slot s is at offset
+            // 24 + (s+1) * 570 - 1.
+            let tq_byte_offset = 24 + (slot_rev + 1) * 570 - 1;
+            v3_bytes.remove(tq_byte_offset);
+        }
+        // Now v3_bytes has length 24 + 3 * 569 — a valid v2 envelope.
+        let v2_bytes = v3_bytes;
+        assert_eq!(v2_bytes.len(), 24 + (n_full_attn as usize) * 569);
+
+        // V3 deserializer must accept this v2 envelope; full_attn_tq all None.
+        let restored = deserialize_hybrid_snapshot(&v2_bytes, &cfg, &device)
+            .expect("v3 deserializer must accept v2 envelope");
+        assert_eq!(restored.full_attn_tq.len(), n_full_attn as usize);
+        for i in 0..n_full_attn as usize {
+            assert!(restored.full_attn_tq[i].is_none(),
+                "v2 envelope must yield None TQ per slot (got Some at {i})");
+            // K/V restored as Some via v2 path.
+            assert!(restored.full_attn_k[i].is_some());
+            assert!(restored.full_attn_v[i].is_some());
+        }
+    }
+
+    /// ADR-027 Phase B iter-36 — defensive: corrupt tq_present byte
+    /// rejected with clear error.
+    #[test]
+    fn qh35_codec_v3_rejects_invalid_tq_present_byte() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = synth_cfg(1, 1); // n_seqs=1
+        let snap = synth_full_attn_only_snapshot(&device, &cfg);
+        let mut bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize");
+        // tq_present byte is the last byte of slot 0's body.
+        // Slot size = 570 bytes; offset = header(24) + 570 - 1 = 593.
+        let tq_byte_offset = 24 + 570 - 1;
+        bytes[tq_byte_offset] = 99;
+        let err = deserialize_hybrid_snapshot(&bytes, &cfg, &device).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid tq_present byte"),
+            "expected tq_present validation error, got: {msg}"
+        );
     }
 
     #[test]
