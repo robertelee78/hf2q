@@ -21,11 +21,18 @@
 #
 # # Env overrides
 #
-#   MODEL=...     model GGUF path (defaults to qwen36 35B-A3B-APEX-Q5_K_M)
-#   LENGTHS=...   long-context sweep lengths (default 4096,8192;
-#                 add 16384,32768 for extended validation; multi-min wall)
-#   SKIP_TESTS=1  skip cargo test (assume already green; saves ~30s)
-#   SKIP_BUILD=1  skip cargo build (assume already built; saves ~5s)
+#   MODEL=...           model GGUF path (defaults to qwen36 35B-A3B-APEX-Q5_K_M)
+#   LENGTHS=...         long-context sweep lengths (default 4096,8192;
+#                       add 16384,32768 for extended validation; multi-min wall)
+#   NULL_TEMPLATE=...   null/passthrough Jinja template path forwarded to
+#                       the long-context sweep (gate 5). Default:
+#                       `scripts/qwen35_raw_passthrough.jinja` (the
+#                       canonical 1-line `{{ messages[0].content }}`
+#                       artifact, ADR-005 Phase 1; consolidated in iter-52).
+#                       Override only if you have a custom template that
+#                       primes the model differently.
+#   SKIP_TESTS=1        skip cargo test (assume already green; saves ~30s)
+#   SKIP_BUILD=1        skip cargo build (assume already built; saves ~5s)
 #
 # # Exit codes
 #
@@ -135,7 +142,9 @@ echo ""
 
 # ── Gate 5: long-context sweep at LENGTHS ──
 echo "${BOLD}[5/5] long-context sweep at $LENGTHS (F32 vs TQ via null template)${RESET}"
-if MODEL="$MODEL" bash scripts/adr027-long-context-sweep.sh "$LENGTHS" 64 2>&1 | tail -10; then
+# Forward NULL_TEMPLATE override (or pass through default canonical path
+# resolution in the sub-script) so operator's choice flows end-to-end.
+if MODEL="$MODEL" NULL_TEMPLATE="${NULL_TEMPLATE:-}" bash scripts/adr027-long-context-sweep.sh "$LENGTHS" 64 2>&1 | tail -10; then
     echo "${GREEN}    ✓ long-context sweep PASS at all lengths${RESET}"
 else
     echo "${RED}    ✗ long-context sweep FAILED${RESET}" >&2
