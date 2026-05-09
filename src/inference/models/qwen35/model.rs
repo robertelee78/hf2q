@@ -427,6 +427,17 @@ impl Qwen35Model {
             Vec<(usize, MlxAffineLinear)>,
         > = std::collections::HashMap::new();
         let mut unknown_skipped: usize = 0;
+        // ADR-020 AC#7 iter B1 — track whether lm_head ("output") was overlaid.
+        // The lm_head weights live as `Vec<f32>` (NOT a per-layer MlxQWeight),
+        // so the overlay path dequantizes the DWQ-trained codes back to f32
+        // and overwrites `self.output_weight` in place.  The next forward
+        // call re-quantizes these to Q4_0 via `upload_q4_0_from_f32` (in
+        // `forward_gpu.rs::ensure_gpu_cache_primed`); the round-trip loses
+        // the per-group DWQ bias term but preserves the trained scale +
+        // codes — measurable AC#7 signal without requiring a new affine
+        // matmul kernel path.  A future iter (B2) replaces this with an
+        // Option<MlxQWeight> dispatch that preserves the bias.
+        let mut lm_head_overridden: bool = false;
 
         for name in st.names() {
             let stem = match name.strip_suffix(".weight") {
@@ -436,6 +447,36 @@ impl Qwen35Model {
             if st.tensor(&format!("{stem}.scales")).is_err()
                 || st.tensor(&format!("{stem}.biases")).is_err()
             {
+                continue;
+            }
+            // ── lm_head ("output.weight") special-case ─────────────────────
+            // The Phase 3c trainer emits `output.weight` for the LM head
+            // (per `dwq_loop.rs::3949`); it does NOT have the `blk.{i}.`
+            // prefix, so dispatch it here before the per-layer parser.
+            if stem == "output" {
+                let linear = MlxAffineLinear::from_safetensors(&st, stem, bits, group_size)
+                    .with_context(|| format!("qwen35 apply_dwq_overlay: parse {stem}"))?;
+                let h = self.cfg.hidden_size as usize;
+                let v = self.output_weight.len() / h.max(1);
+                if linear.n != v || linear.k != h {
+                    anyhow::bail!(
+                        "qwen35 DWQ overlay: output shape ({}, {}) != model lm_head ({}, {})",
+                        linear.n, linear.k, v, h,
+                    );
+                }
+                let groups_per_row = linear.k / linear.group_size;
+                let mut dequant = vec![0f32; linear.n * linear.k];
+                for i in 0..linear.n {
+                    for j in 0..linear.k {
+                        let g = j / linear.group_size;
+                        let scale = linear.scales[i * groups_per_row + g];
+                        let bias  = linear.biases[i * groups_per_row + g];
+                        dequant[i * linear.k + j] =
+                            scale * (linear.q_int[i * linear.k + j] as f32) + bias;
+                    }
+                }
+                self.output_weight = dequant;
+                lm_head_overridden = true;
                 continue;
             }
             let after_blk = match stem.strip_prefix("blk.") {
@@ -606,12 +647,14 @@ impl Qwen35Model {
 
         tracing::info!(
             moe_stacked,
+            lm_head_overridden,
             unknown_skipped,
             bits,
             group_size,
-            "qwen35 DWQ overlay applied: {moe_stacked} MoE expert stacks"
+            "qwen35 DWQ overlay applied: {moe_stacked} MoE expert stacks{}",
+            if lm_head_overridden { " + lm_head (Vec<f32> overwrite, re-quants to Q4_0 on next forward)" } else { "" }
         );
-        Ok(moe_stacked)
+        Ok(moe_stacked + if lm_head_overridden { 1 } else { 0 })
     }
 }
 
