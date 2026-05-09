@@ -106,24 +106,26 @@ fn write_kv_with_optional_tq_encode(
     cur_len: u32,
     n_tokens: u32,
 ) -> Result<()> {
-    // (1) Existing F32 KV cache write — byte-identical to pre-iter-15.
-    // iter-29 (sub-sub-iter 23c-α): slot.k/v are Optional. Today the
-    // alloc path always emits Some; iter-30 will skip this F32 write
-    // entirely when tq_kv_active=true (slot.k/v=None) for the actual
-    // memory savings.
-    let dst_k = slot.k.as_ref().expect(
-        "F32 KV write target slot.k is None — iter-30 alloc branch \
-         needs to also skip this write site (caller bug today).",
-    );
-    let dst_v = slot.v.as_ref().expect("F32 KV write target slot.v is None (see slot.k)");
-    dispatch_kv_cache_copy_seq_f32_dual(
-        enc, registry, device.metal_device(),
-        k_seq_major, v_seq_major,
-        dst_k, dst_v,
-        n_kv_heads, head_dim, max_seq_len,
-        cur_len, n_tokens, 0,
-    )
-    .context("kv_cache_copy_seq_f32_dual (write_kv_with_optional_tq_encode)")?;
+    // (1) F32 KV cache write — byte-identical to pre-iter-15 when
+    // slot.k/v are Some.
+    //
+    // iter-34 (sub-sub-iter 23c-β.5): when slot.k.is_none() (TQ-only
+    // mode, alloc dropped the F32 K/V backing for the 3.94× memory
+    // savings), skip the F32 write entirely. The TQ encode below still
+    // runs and populates slot.tq, which the read-side (decode SDPA via
+    // iter-15's dispatch_decode_sdpa_with_optional_tq + iter-33's
+    // TQ-cache prefill resume helper) consumes — F32 backing is unused
+    // and not allocated.
+    if let (Some(dst_k), Some(dst_v)) = (slot.k.as_ref(), slot.v.as_ref()) {
+        dispatch_kv_cache_copy_seq_f32_dual(
+            enc, registry, device.metal_device(),
+            k_seq_major, v_seq_major,
+            dst_k, dst_v,
+            n_kv_heads, head_dim, max_seq_len,
+            cur_len, n_tokens, 0,
+        )
+        .context("kv_cache_copy_seq_f32_dual (write_kv_with_optional_tq_encode)")?;
+    }
 
     // (2) TQ encode shadow path. Skip cleanly when:
     //     - slot.tq is None (legacy F32-only mode)
@@ -2486,25 +2488,45 @@ pub fn apply_sdpa_with_kv_cache(
             let _w5b10_kernel_resume = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FaSdpaKernel,
             );
-            // iter-29 (sub-sub-iter 23c-α): F32 prefill resume path.
-            // Today alloc always emits Some; iter-30 must keep this
-            // path Some-only (TQ prefill goes through encode_seq_tokens_to_tq
-            // in write_kv_with_optional_tq_encode, not this resume).
-            let kbuf = slot.k.as_ref().expect(
-                "apply_flash_attn_prefill_seq_major_resume: slot.k is None — \
-                 iter-30 must NOT drop F32 backing on the F32 prefill path.",
-            );
-            let vbuf = slot.v.as_ref().expect("prefill resume F32: slot.v is None");
-            let out_uploaded = apply_flash_attn_prefill_seq_major_resume(
-                device, registry,
-                q_seq_major,
-                kbuf, vbuf,
-                seq_len,
-                cur_len as u32,
-                kv_seq_len,
-                max_seq_len,
-                n_heads, n_kv_heads, head_dim,
-            )?;
+            // iter-34 (sub-sub-iter 23c-β.5): branch on F32 vs TQ-only KV.
+            //   F32 path (slot.k=Some): legacy resume kernel reads slot.k/v
+            //                           directly at full slot capacity stride.
+            //   TQ path (slot.k=None):  iter-33's TQ-cache helper dequants
+            //                           slot.tq → tight head-major F32 temp,
+            //                           dispatches the SAME resume kernel
+            //                           against the temp buffers.
+            //
+            // iter-33's `apply_flash_attn_prefill_seq_major_resume_via_tq_cache_nrmse_vs_f32`
+            // test pinned the parity contract at NRMSE 0.003 (49× headroom
+            // under the 0.15 threshold). Cell C/D of the iter-21 cross-axis
+            // sweep validates byte-identical sampled tokens vs F32 baseline.
+            let out_uploaded = if let (Some(kbuf), Some(vbuf)) =
+                (slot.k.as_ref(), slot.v.as_ref())
+            {
+                apply_flash_attn_prefill_seq_major_resume(
+                    device, registry,
+                    q_seq_major,
+                    kbuf, vbuf,
+                    seq_len,
+                    cur_len as u32,
+                    kv_seq_len,
+                    max_seq_len,
+                    n_heads, n_kv_heads, head_dim,
+                )?
+            } else {
+                // TQ-only mode: route through dequant+resume helper.
+                // slot.tq must be Some (alloc invariant: tq_kv_active=true ⇒
+                // both `slot.k.is_none()` AND `slot.tq.is_some()`).
+                apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
+                    device, registry,
+                    slot, q_seq_major,
+                    seq_len,
+                    cur_len as u32,
+                    kv_seq_len,
+                    max_seq_len,
+                    n_heads, n_kv_heads, head_dim,
+                )?
+            };
             let new_len = kv_seq_len;
             slot.current_len[0] = new_len;
             return Ok(out_uploaded);

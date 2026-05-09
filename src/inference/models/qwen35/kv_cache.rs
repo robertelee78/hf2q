@@ -1061,7 +1061,7 @@ impl HybridKvCache {
                     let rank = full_attn.len() as u32;
                     per_layer_slot.push(LayerSlot::Full(rank));
                     let mut slot = alloc_full_attn_slot(
-                        cfg, device, max_seq_len, n_seqs,
+                        cfg, device, max_seq_len, n_seqs, tq_kv_active,
                     )
                     .with_context(|| format!("alloc full-attn slot (layer {layer_idx})"))?;
                     if tq_kv_active {
@@ -1092,7 +1092,7 @@ impl HybridKvCache {
         }
 
         let mtp_slot = if cfg.mtp_num_hidden_layers > 0 {
-            let mut slot = alloc_full_attn_slot(cfg, device, max_seq_len, n_seqs)
+            let mut slot = alloc_full_attn_slot(cfg, device, max_seq_len, n_seqs, tq_kv_active)
                 .context("alloc MTP full-attn slot")?;
             if tq_kv_active {
                 slot.tq = Some(
@@ -1670,7 +1670,42 @@ fn alloc_full_attn_slot(
     device: &MlxDevice,
     max_seq_len: u32,
     n_seqs: u32,
+    tq_kv_active: bool,
 ) -> Result<FullAttnKvSlot> {
+    // ADR-027 Phase B iter-34 (sub-sub-iter 23c-β.5) — the LOAD-BEARING
+    // memory-savings switch.
+    //
+    // When tq_kv_active=true, the slot's F32 K/V backing is dropped
+    // (k=None, v=None). The SDPA read path for production qwen35
+    // (head_dim=256) is fully covered by the TQ-only chain:
+    //   * Decode: dispatch_decode_sdpa_with_optional_tq (iter-15) reads
+    //     slot.tq directly; F32 fallback is unreachable when head_dim
+    //     ∈ {256, 512} AND slot.tq.is_some().
+    //   * Prefill RESUME: apply_flash_attn_prefill_seq_major_resume_via_tq_cache
+    //     (iter-33) dequants slot.tq → temp F32 (unrotated, head-major),
+    //     dispatches the same dense resume kernel against the temp
+    //     buffers. iter-33 NRMSE 0.003 vs F32 baseline confirms parity.
+    //   * Prefill FRESH (cur_len=0, fast path): reads k_seq_major directly
+    //     (the just-computed chunk K/V), not from the cache; cache-write
+    //     side is gated below to skip the F32 write (write_kv_with_optional_tq_encode).
+    //
+    // Memory savings at qwen36 35B-A3B-APEX 8K shape: 33.55 MB F32 K+V
+    // per slot dropped → 8.52 MB TQ packed+norms only = 3.94×.
+    // Regression-pin: full_attn_bytes_breakdown_tq_on_drops_f32_at_qwen36_*.
+    if tq_kv_active {
+        return Ok(FullAttnKvSlot {
+            k: None,
+            v: None,
+            current_len: vec![0; n_seqs as usize],
+            // tq is populated by HybridKvCache::new_with_options' subsequent
+            // alloc_tq_full_attn_buffers call (separate from this fn's
+            // F32 alloc; see new_with_options for the wiring).
+            tq: None,
+        });
+    }
+
+    // Legacy F32 path (tq_kv_active=false, default — preserves all 71
+    // existing HybridKvCache::new(...) callers' behavior bit-identically).
     // Layout: [n_seqs, n_kv_heads, max_seq_len, head_dim] — matches SDPA kernel's
     // expected K/V layout: [batch, n_kv_heads, kv_seq_len, head_dim] (head_dim innermost).
     // kv_capacity = max_seq_len; kv_seq_len = current_len at forward time.
@@ -1693,9 +1728,6 @@ fn alloc_full_attn_slot(
         .map_err(|e| anyhow!("alloc full-attn V: {e}"))?;
 
     Ok(FullAttnKvSlot {
-        // iter-29 (sub-sub-iter 23c-α): wrap in Some today; iter-30
-        // (sub-sub-iter 23c-β) adds a tq_kv_active branch here that
-        // skips the alloc and emits None for the 3.94× memory win.
         k: Some(k),
         v: Some(v),
         current_len: vec![0; n_seqs as usize],
@@ -2837,12 +2869,14 @@ mod tests {
             );
             let tq = slot.tq.as_ref().unwrap();
             assert_eq!(tq.norms_per_pos, 1, "head_dim=256 → norms_per_pos=1");
-            // K/V F32 buffers also remain allocated (shadow cache).
-            // iter-29 (sub-sub-iter 23c-α): iter-30 will drop these to
-            // None for the actual 3.94× memory savings; this assertion
-            // pins the iter-29 shadow-cache invariant.
-            assert!(slot.k.as_ref().expect("iter-29 shadow K still Some").byte_len() > 0);
-            assert!(slot.v.as_ref().expect("iter-29 shadow V still Some").byte_len() > 0);
+            // iter-34 (sub-sub-iter 23c-β.5): F32 K/V backing is dropped
+            // when tq_kv_active=true. The slot now carries ONLY the TQ
+            // buffers + current_len cursor (no F32 K/V allocation).
+            // This is the load-bearing memory-savings invariant.
+            assert!(slot.k.is_none(),
+                "iter-34: slot.k must be None when tq_kv_active=true (F32 alloc dropped)");
+            assert!(slot.v.is_none(),
+                "iter-34: slot.v must be None when tq_kv_active=true (F32 alloc dropped)");
         }
         // MTP slot: tq present iff cfg has MTP. moe_cfg_40layer() sets
         // mtp_num_hidden_layers=0 → mtp_slot is None entirely.
@@ -2860,11 +2894,13 @@ mod tests {
     #[test]
     fn hybrid_kv_cache_new_with_options_tq_on_byte_count_at_qwen36_apex_shape() {
         // Empirical byte-count parity at qwen36 35B-A3B-APEX shape:
-        // each full-attn slot now holds F32 K (16 MB) + F32 V (16 MB)
-        // + TQ packed K+V (8.13 MB) + TQ norms K+V (128 KB) =
-        // 40_517_632 bytes per slot (up from 33_554_432 F32-only).
-        // iter-11 will drop the F32 K+V backing, restoring 33.55 MB →
-        // 8.52 MB savings (3.94×).
+        // each full-attn slot now holds ONLY TQ packed K+V (8.13 MB)
+        // + TQ norms K+V (128 KB) = 8_519_680 bytes per slot.
+        //
+        // iter-34 (sub-sub-iter 23c-β.5): F32 K+V backing dropped (was
+        // 16 MB each in shadow mode pre-iter-34). Per-slot total
+        // 8_519_680 bytes — the load-bearing 3.94× memory savings vs
+        // the 33.55 MB F32-only baseline (1×2×8192×256×4 each for K+V).
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -2882,26 +2918,42 @@ mod tests {
         let slot = &cache.full_attn[0];
         assert!(slot.tq.is_some());
         let tq = slot.tq.as_ref().unwrap();
-        // F32 K and V each 16 MB at this shape (1×2×8192×256×4).
-        // iter-29 (sub-sub-iter 23c-α): iter-30 drops these to None.
-        let f32_each = 1 * 2 * 8192 * 256 * 4;
-        assert_eq!(slot.k.as_ref().expect("iter-29 shadow K Some").byte_len(), f32_each);
-        assert_eq!(slot.v.as_ref().expect("iter-29 shadow V Some").byte_len(), f32_each);
+        // iter-34: F32 K and V are dropped — slot.k and slot.v are None.
+        assert!(slot.k.is_none(),
+            "iter-34: slot.k must be None when tq_kv_active=true (was 16 MB F32 in shadow mode)");
+        assert!(slot.v.is_none(),
+            "iter-34: slot.v must be None when tq_kv_active=true (was 16 MB F32 in shadow mode)");
         // TQ K_packed + V_packed: 1×2×8192×256 each (U8) = 4 MB each.
         assert_eq!(tq.k_packed.byte_len(), 1 * 2 * 8192 * 256);
         assert_eq!(tq.v_packed.byte_len(), 1 * 2 * 8192 * 256);
         // TQ K_norms + V_norms: 1×2×8192×1×4 each = 64 KB.
         assert_eq!(tq.k_norms.byte_len(), 1 * 2 * 8192 * 1 * 4);
         assert_eq!(tq.v_norms.byte_len(), 1 * 2 * 8192 * 1 * 4);
-        // Per-slot total in shadow-cache mode (iter-8): F32 + TQ.
-        // F32 K+V = 33_554_432; TQ K+V (packed+norms) = 8_519_680;
-        // shadow total = 42_074_112 bytes (iter-11 drops F32 → 8.5 MB only).
-        let per_slot_total = 2 * f32_each + tq.total_bytes();
-        assert_eq!(per_slot_total, 42_074_112);
-        // Once iter-11 drops F32 in TQ mode, per_slot_total ==
-        // tq.total_bytes() == 8_519_680. Documenting the target here
-        // so iter-11 has a regression-pin.
-        assert_eq!(tq.total_bytes(), 8_519_680);
+        // **Load-bearing 3.94× memory savings regression-pin:**
+        // per-slot total = TQ packed+norms only (no F32 backing).
+        // Pre-iter-34 shadow mode: 2 × 16 MB F32 + 8.52 MB TQ = 42_074_112.
+        // Post-iter-34: 8_519_680 (3.94× smaller; 33.55 MB saved per slot).
+        let per_slot_total = tq.total_bytes();
+        assert_eq!(per_slot_total, 8_519_680,
+            "iter-34: per-slot total must be TQ-only (3.94× savings vs F32+TQ shadow mode)");
+        // Reference: pre-iter-34 shadow total was 42_074_112 bytes
+        // (2 × 16 MB F32 K+V + 8.52 MB TQ). Now 8_519_680 bytes.
+        let pre_iter34_shadow_total = 2 * (1 * 2 * 8192 * 256 * 4) + 8_519_680;
+        assert_eq!(pre_iter34_shadow_total, 42_074_112);
+        // **The dossier-quoted 3.94× savings is vs the F32-ONLY baseline**
+        // (legacy `HybridKvCache::new()` mode = 33_554_432 bytes per slot,
+        // TQ buffers absent). iter-34 TQ-only = 8_519_680 bytes.
+        // 33_554_432 / 8_519_680 = 3.937× ≈ 3.94×.
+        let f32_only_baseline = 1 * 2 * 8192 * 256 * 4 * 2; // K + V each at 16 MB
+        assert_eq!(f32_only_baseline, 33_554_432);
+        let savings_ratio_vs_f32_only = f32_only_baseline as f64 / per_slot_total as f64;
+        assert!(savings_ratio_vs_f32_only > 3.93 && savings_ratio_vs_f32_only < 3.95,
+            "expected 3.94× F32-only→TQ-only savings, got {savings_ratio_vs_f32_only:.4}×");
+        // Bonus: vs pre-iter-34 shadow mode (which carried F32 + TQ),
+        // savings is 4.94×.
+        let savings_ratio_vs_shadow = pre_iter34_shadow_total as f64 / per_slot_total as f64;
+        assert!(savings_ratio_vs_shadow > 4.93 && savings_ratio_vs_shadow < 4.95,
+            "expected 4.94× shadow→TQ-only savings, got {savings_ratio_vs_shadow:.4}×");
     }
 
     #[test]
@@ -4364,14 +4416,33 @@ mod tests {
             }
         }
 
-        // Populate F32 slot.k / slot.v (head-major).
+        // iter-34 (sub-sub-iter 23c-β.5): slot.k/v are None when
+        // tq_kv_active=true (the F32 alloc was dropped for the 3.94×
+        // memory savings). For Path A (the F32 reference path) we
+        // allocate F32 K/V buffers LOCALLY at full slot capacity
+        // shape `[1, n_kv_heads, max_seq_len, head_dim]` and populate
+        // them with the same source data the TQ path encodes from.
         let cap = cache_capacity as usize;
+        let f32_kv_elems = (n_kv_heads as usize) * cap * (head_dim as usize);
+        let mut local_k_f32 = device
+            .alloc_buffer(
+                f32_kv_elems * 4, DType::F32,
+                vec![1, n_kv_heads as usize, cap, head_dim as usize],
+            )
+            .expect("alloc local F32 K (Path A reference)");
+        let mut local_v_f32 = device
+            .alloc_buffer(
+                f32_kv_elems * 4, DType::F32,
+                vec![1, n_kv_heads as usize, cap, head_dim as usize],
+            )
+            .expect("alloc local F32 V (Path A reference)");
         {
-            let slot = &mut cache.full_attn[0];
-            let kbuf = slot.k.as_mut().expect("legacy⇒Some(k)");
-            let dst_k = kbuf.as_mut_slice::<f32>().expect("k mut");
-            let vbuf = slot.v.as_mut().expect("legacy⇒Some(v)");
-            let dst_v = vbuf.as_mut_slice::<f32>().expect("v mut");
+            let dst_k = local_k_f32.as_mut_slice::<f32>().expect("local k mut");
+            let dst_v = local_v_f32.as_mut_slice::<f32>().expect("local v mut");
+            // Zero the unused [n_tokens..max_seq_len) tail so the kernel
+            // attends over a well-defined region.
+            for v in dst_k.iter_mut() { *v = 0.0; }
+            for v in dst_v.iter_mut() { *v = 0.0; }
             for h in 0..n_kv_heads as usize {
                 for t in 0..n_tokens as usize {
                     for d in 0..head_dim as usize {
@@ -4444,17 +4515,23 @@ mod tests {
             .expect("alloc q");
         q_gpu.as_mut_slice::<f32>().unwrap().copy_from_slice(&q_cpu);
 
-        // Path A (REFERENCE).
-        let slot_ref = &cache.full_attn[0];
-        let kbuf_ref = slot_ref.k.as_ref().expect("ref k");
-        let vbuf_ref = slot_ref.v.as_ref().expect("ref v");
+        // Path A (REFERENCE): F32 prefill resume reading from
+        // locally-allocated F32 K/V (slot.k/v are None in iter-34's
+        // TQ-only mode).
         let out_a = apply_flash_attn_prefill_seq_major_resume(
             &device, &mut registry,
-            &q_gpu, kbuf_ref, vbuf_ref,
+            &q_gpu, &local_k_f32, &local_v_f32,
             chunk2_seq_len, cur_len, n_tokens, cache_capacity,
             n_heads, n_kv_heads, head_dim,
         )
         .expect("F32 prefill resume");
+
+        let slot_ref = &cache.full_attn[0];
+        // iter-34 invariant pin: in tq_kv_active=true mode the slot's
+        // F32 K/V are dropped at alloc time.
+        assert!(slot_ref.k.is_none(),
+            "iter-34: slot.k must be None when tq_kv_active=true");
+        assert!(slot_ref.v.is_none(), "iter-34: slot.v must be None");
 
         // Path B (UNDER TEST).
         let out_b = apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
@@ -4688,13 +4765,17 @@ mod tests {
     }
 
     #[test]
-    fn full_attn_bytes_breakdown_tq_on_shadow_at_qwen36_8k() {
-        // Shadow-cache mode (iter-15 design): F32 + TQ both alloc.
-        // Per slot: F32 K+V = 33_554_432 + TQ packed K+V = 8_388_608
-        // + TQ norms K+V = 131_072 = 42_074_112 bytes.
-        // 10 slots × 42_074_112 = 420_741_120 bytes total.
-        // Projected iter-19 savings ratio per slot:
-        //   f32_bytes / tq_bytes = 33_554_432 / 8_519_680 ≈ 3.94×
+    fn full_attn_bytes_breakdown_tq_on_drops_f32_at_qwen36_8k() {
+        // ADR-027 Phase B iter-34 (sub-sub-iter 23c-β.5): TQ-only mode
+        // (alloc-drop). F32 K+V backing absent (iter-34 alloc skip);
+        // only TQ packed+norms allocated. Per slot:
+        //   F32 K+V       = 0 (was 33_554_432 in shadow mode pre-iter-34)
+        //   TQ packed K+V = 8_388_608
+        //   TQ norms K+V  = 131_072
+        //   Per-slot total = 8_519_680 bytes (3.94× smaller than F32-only baseline).
+        // 10 slots × 8_519_680 = 85_196_800 bytes total
+        // (vs pre-iter-34 shadow 420_741_120 = 4.94× shadow→TQ savings;
+        //  vs F32-only baseline 335_544_320 = 3.94× absolute savings).
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -4708,30 +4789,27 @@ mod tests {
         let breakdown = cache.full_attn_bytes_breakdown();
         assert_eq!(breakdown.n_full_attn_slots, 10);
         assert!(!breakdown.has_mtp_slot);
-        // F32 backing unchanged from tq_off.
-        assert_eq!(breakdown.f32_k_v_bytes, 10 * 33_554_432);
+        // **iter-34 LOAD-BEARING REGRESSION-PIN: F32 K/V alloc dropped.**
+        assert_eq!(breakdown.f32_k_v_bytes, 0,
+            "iter-34: f32_k_v_bytes MUST be 0 in TQ-only mode (alloc-drop)");
         // TQ packed: 1×2×8192×256 (U8) = 4_194_304 per K, ×2 (K+V) ×10 slots.
         assert_eq!(breakdown.tq_packed_bytes, 10 * 2 * 4_194_304);
         // TQ norms: 1×2×8192×1 (F32) = 65_536 per K, ×2 (K+V) ×10 slots.
         assert_eq!(breakdown.tq_norms_bytes, 10 * 2 * 65_536);
-        // Total = 335_544_320 (F32) + 83_886_080 (TQ packed) + 1_310_720 (TQ norms).
-        assert_eq!(breakdown.total_bytes(), 420_741_120);
-        // Projected iter-19 savings — drop F32 leaves only TQ.
-        let ratio = breakdown.projected_iter19_savings_ratio().unwrap();
-        assert!(
-            (3.5..=4.5).contains(&ratio),
-            "projected_iter19_savings_ratio {ratio:.4} outside expected [3.5, 4.5] window"
-        );
+        // Total = 0 (F32) + 83_886_080 (TQ packed) + 1_310_720 (TQ norms).
+        assert_eq!(breakdown.total_bytes(), 85_196_800);
+        // Pre-iter-34 shadow total reference: 420_741_120 bytes.
+        // Reduction: 420_741_120 / 85_196_800 = 4.94×.
     }
 
     #[test]
-    fn full_attn_bytes_breakdown_tq_on_shadow_at_qwen36_32k() {
-        // 32K context — verifies the §1 ADR claim at production-realistic
-        // scale (max_seq_len=32768). Per slot: F32 K+V = 4× 8K =
-        // 134_217_728; TQ packed K+V = 4× 8K = 33_554_432; TQ norms K+V
-        // = 4× 8K = 524_288. Per-slot total in shadow mode = 168_296_448.
-        // 10 slots × 168_296_448 = 1_682_964_480 bytes ≈ 1.57 GiB.
-        // Iter-19 target: 10 × 34_078_720 (TQ only) = 340_787_200 bytes ≈ 325 MiB.
+    fn full_attn_bytes_breakdown_tq_on_drops_f32_at_qwen36_32k() {
+        // ADR-027 Phase B iter-34 (sub-sub-iter 23c-β.5): TQ-only mode
+        // at production-realistic 32K context. The dossier-quoted
+        // 3.94× memory savings vs F32-only baseline:
+        //   F32-only baseline (pre-Phase B): 1.34 GB (= 10 × 134_217_728)
+        //   iter-34 TQ-only: 340_787_200 bytes ≈ 325 MiB
+        //   Savings: 1_342_177_280 / 340_787_200 = 3.94×
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -4744,29 +4822,28 @@ mod tests {
             .expect("kv tq-on at 32K");
         let breakdown = cache.full_attn_bytes_breakdown();
         assert_eq!(breakdown.n_full_attn_slots, 10);
-        assert_eq!(breakdown.f32_k_v_bytes, 10 * 134_217_728);
+        // **iter-34 LOAD-BEARING REGRESSION-PIN AT 32K SHAPE.**
+        assert_eq!(breakdown.f32_k_v_bytes, 0,
+            "iter-34 at 32K: f32_k_v_bytes MUST be 0 in TQ-only mode");
         assert_eq!(breakdown.tq_packed_bytes, 10 * 33_554_432);
         assert_eq!(breakdown.tq_norms_bytes, 10 * 524_288);
-        assert_eq!(breakdown.total_bytes(), 1_682_964_480);
-        // The §1 ADR table claim: post-iter-19 total = ~340 MiB at 32K
-        // (down from F32-only 1.34 GB). Verify the projection holds.
-        let projected_iter19_total =
-            breakdown.tq_total_bytes();
-        assert_eq!(projected_iter19_total, 340_787_200); // ~325 MiB
-        // §1 says "1.34 GB total" for F32 dense at 32K → matches our
-        // 1_342_177_280 = 10 × 134_217_728 byte count exactly.
-        assert_eq!(breakdown.f32_k_v_bytes, 1_342_177_280);
-        // Savings ratio at 32K should match 8K (shape-invariant).
-        let ratio = breakdown.projected_iter19_savings_ratio().unwrap();
-        assert!(
-            (3.5..=4.5).contains(&ratio),
-            "32K savings ratio {ratio:.4} outside [3.5, 4.5]"
-        );
+        // Per-slot total: 33_554_432 + 524_288 = 34_078_720 bytes.
+        // 10 slots × 34_078_720 = 340_787_200 bytes ≈ 325 MiB.
+        assert_eq!(breakdown.total_bytes(), 340_787_200);
+        // **The 3.94× savings claim VS F32-ONLY baseline:**
+        let f32_only_baseline_per_slot: usize = 1 * 2 * 32768 * 256 * 4 * 2; // K+V
+        assert_eq!(f32_only_baseline_per_slot, 134_217_728);
+        let f32_only_total = 10 * f32_only_baseline_per_slot;
+        assert_eq!(f32_only_total, 1_342_177_280); // 1.34 GB matches §1 ADR claim
+        let savings_ratio = f32_only_total as f64 / breakdown.total_bytes() as f64;
+        assert!((3.93..=3.95).contains(&savings_ratio),
+            "iter-34 32K F32-only→TQ-only savings: expected ~3.94×, got {savings_ratio:.4}×");
     }
 
     #[test]
     fn full_attn_bytes_breakdown_with_mtp_includes_mtp_slot() {
-        // MTP slot bytes count toward both F32 and TQ totals.
+        // ADR-027 iter-34: MTP slot ALSO drops F32 in TQ mode and
+        // contributes only TQ packed+norms to the breakdown.
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -4780,12 +4857,13 @@ mod tests {
             .expect("kv tq-on with mtp");
         let breakdown = cache.full_attn_bytes_breakdown();
         assert!(breakdown.has_mtp_slot);
-        // 10 regular full-attn + 1 MTP = 11 slots' worth.
-        let per_slot_f32 = 1 * 2 * 1024 * 256 * 4 * 2; // K + V
+        // 10 regular full-attn + 1 MTP = 11 slots' worth of TQ; no F32.
         let per_slot_tq_packed = 1 * 2 * 1024 * 256 * 2;
         let per_slot_tq_norms = 1 * 2 * 1024 * 1 * 4 * 2;
         assert_eq!(breakdown.n_full_attn_slots, 10);
-        assert_eq!(breakdown.f32_k_v_bytes, 11 * per_slot_f32);
+        // iter-34 invariant — MTP slot also dropped F32.
+        assert_eq!(breakdown.f32_k_v_bytes, 0,
+            "iter-34: MTP slot must also drop F32 K/V");
         assert_eq!(breakdown.tq_packed_bytes, 11 * per_slot_tq_packed);
         assert_eq!(breakdown.tq_norms_bytes, 11 * per_slot_tq_norms);
     }
