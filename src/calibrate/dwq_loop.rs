@@ -1995,6 +1995,60 @@ pub fn train_one_linear_dwq_step(
     Ok(loss_scalar)
 }
 
+/// ADR-020 AC#7 Option A — variant of [`train_one_linear_dwq_step`]
+/// that takes FULL-vocab teacher logits + does the per-row top-K
+/// selection internally via [`pick_top_k_per_position`].
+///
+/// This is the canonical entry point for the in-memory full-model
+/// training path: caller does ONE teacher forward per batch
+/// (producing `[n_rows, vocab]` logits), then drives K Adam steps
+/// against in-memory data with no disk round-trip.
+///
+/// Equivalent to:
+/// ```ignore
+///   let (topk_logits, topk_indices) = pick_top_k_per_position(
+///       teacher_logits_full, n_rows, 1, vocab, top_k)?;
+///   train_one_linear_dwq_step(adam, device, tensor_id, pack,
+///       x_batch, &topk_logits, &topk_indices, n_rows, top_k, T)
+/// ```
+/// but spelled out so call sites don't have to thread the
+/// pre-pick step + `seq=1` reshape boilerplate.
+pub fn train_one_linear_dwq_step_with_full_teacher_logits(
+    adam: &mut crate::calibrate::adam::AdamOptimizer,
+    device: &MlxDevice,
+    tensor_id: &str,
+    pack: &DwqQuantPack,
+    x_batch: &[f32],
+    teacher_logits_full: &[f32],
+    n_rows: usize,
+    vocab: usize,
+    top_k: usize,
+    temperature: f32,
+) -> Result<f32> {
+    if vocab != pack.n {
+        return Err(anyhow!(
+            "train_one_linear_dwq_step_with_full_teacher_logits: vocab ({vocab}) != pack.n ({})",
+            pack.n
+        ));
+    }
+    let (topk_logits, topk_indices) =
+        pick_top_k_per_position(teacher_logits_full, n_rows, 1, vocab, top_k)
+            .context("train_one_linear_dwq_step_with_full_teacher_logits: pick_top_k_per_position")?;
+    train_one_linear_dwq_step(
+        adam,
+        device,
+        tensor_id,
+        pack,
+        x_batch,
+        &topk_logits,
+        &topk_indices,
+        n_rows,
+        top_k,
+        temperature,
+    )
+    .context("train_one_linear_dwq_step_with_full_teacher_logits: inner step")
+}
+
 /// ADR-020 iter-12d-2 — per-Linear training summary inside a model
 /// scan (one entry per successfully-trained tensor).
 #[derive(Debug, Clone)]
@@ -4984,6 +5038,140 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — full-vocab variant equivalence:
+    /// `train_one_linear_dwq_step_with_full_teacher_logits` produces
+    /// the SAME loss and the SAME post-step Adam param values as the
+    /// pre-pick + `train_one_linear_dwq_step` path.  Proves the
+    /// wrapper is purely an ergonomic convenience with no semantic
+    /// drift.
+    #[test]
+    fn train_one_linear_dwq_step_with_full_teacher_logits_equivalent_to_pre_pick() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let n = 32;
+        let k = 32;
+        let group_size = 8;
+        let n_rows = 32;
+        let vocab = n;
+        let top_k = 4;
+
+        let w: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.013 - 0.4).sin() * 1.5).collect();
+        let pack = super::quant_pack_for_dwq(&device, &w, n, k, 4, group_size).expect("pack");
+
+        let x_batch: Vec<f32> = (0..n_rows * k).map(|i| ((i as f32) * 0.07).cos() * 0.6).collect();
+        let teacher_full: Vec<f32> = (0..n_rows * vocab)
+            .map(|i| ((i as f32) * 0.041 + 0.3).sin() * 2.0)
+            .collect();
+
+        // Path A: pre-pick → step
+        let mut adam_a = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-3,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .expect("adam a");
+        super::register_affine_pair(&mut adam_a, &device, "X", &pack.scales, &pack.biases)
+            .expect("reg a");
+        let (tlogits, tidx) = super::pick_top_k_per_position(
+            &teacher_full, n_rows, 1, vocab, top_k,
+        )
+        .expect("pick");
+        let loss_a = super::train_one_linear_dwq_step(
+            &mut adam_a, &device, "X", &pack,
+            &x_batch, &tlogits, &tidx, n_rows, top_k, 2.0,
+        )
+        .expect("step a");
+        let s_a = adam_a.read_param("X.scales").unwrap();
+        let b_a = adam_a.read_param("X.biases").unwrap();
+
+        // Path B: full-vocab variant
+        let mut adam_b = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-3,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .expect("adam b");
+        super::register_affine_pair(&mut adam_b, &device, "X", &pack.scales, &pack.biases)
+            .expect("reg b");
+        let loss_b = super::train_one_linear_dwq_step_with_full_teacher_logits(
+            &mut adam_b, &device, "X", &pack,
+            &x_batch, &teacher_full, n_rows, vocab, top_k, 2.0,
+        )
+        .expect("step b");
+        let s_b = adam_b.read_param("X.scales").unwrap();
+        let b_b = adam_b.read_param("X.biases").unwrap();
+
+        assert!(
+            (loss_a - loss_b).abs() < 1e-5,
+            "loss A={loss_a} B={loss_b}"
+        );
+        for i in 0..s_a.len() {
+            assert!(
+                (s_a[i] - s_b[i]).abs() < 1e-6,
+                "s[{i}] A={} B={}",
+                s_a[i],
+                s_b[i]
+            );
+            assert!(
+                (b_a[i] - b_b[i]).abs() < 1e-6,
+                "b[{i}] A={} B={}",
+                b_a[i],
+                b_b[i]
+            );
+        }
+    }
+
+    /// ADR-020 AC#7 Option A — full-vocab variant rejects vocab !=
+    /// pack.n at the top of the call (BEFORE any GPU work).
+    #[test]
+    fn train_one_linear_dwq_step_with_full_teacher_logits_rejects_vocab_mismatch() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let n = 32;
+        let k = 32;
+        let w: Vec<f32> = (0..n * k).map(|i| (i as f32) * 0.01).collect();
+        let pack = super::quant_pack_for_dwq(&device, &w, n, k, 4, 8).expect("pack");
+
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-3,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .expect("adam");
+        super::register_affine_pair(&mut adam, &device, "X", &pack.scales, &pack.biases).unwrap();
+
+        let res = super::train_one_linear_dwq_step_with_full_teacher_logits(
+            &mut adam, &device, "X", &pack,
+            &vec![0.0; 32 * 32], &vec![0.0; 32 * 64], // vocab=64 != pack.n=32
+            32, 64, 4, 1.0,
+        );
+        let err = match res {
+            Ok(_) => panic!("expected vocab-mismatch error"),
+            Err(e) => e,
+        };
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("vocab (64)") && msg.contains("pack.n (32)"),
+            "got: {msg}"
+        );
     }
 
     /// ADR-020 AC#7 Option A — `train_one_linear_dwq_step` happy
