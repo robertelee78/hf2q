@@ -2119,6 +2119,68 @@ kernel work where K-axis parallelism matters (e.g., extending to other
 quant types, dense-attention variants) MUST consider both nwg and nsg
 from day 1 — not implicit-1 in either dimension.
 
+### iter-128: PRODUCTION VALIDATION — hf2q BEATS PEER on qwen3.6 35B
+
+Operator triggered: "qwen was 120+ -- have we regressed? how do we
+compare to peers?" Production A/B with rebuilt binary (Path D in,
+hf2q HEAD `cbae809`):
+
+#### hf2q vs llama.cpp peer (qwen3.6-35B-A3B-APEX-Q5_K_M, M5 Max)
+
+| Scenario              | hf2q t/s | llama.cpp t/s | Ratio        |
+|-----------------------|----------|---------------|--------------|
+| Short cold (tg64-eq)  | **128.0** | 101.0         | **1.27× peer** |
+| Long (kL=4096 decode) | **110.2** | ~96.6         | **1.14× peer** |
+
+llama.cpp tg256 = 101.06 t/s (cold). pp4096+tg256 combined = 1156.82 t/s
+(extracted decode ≈ 96.6 t/s post-prefill).
+
+#### Status vs ADR-028 mantra
+
+1. ✅ **Coherence ≥ peers**: byte-identical sourdough + long-context
+   F32-vs-TQ-on equivalence at kL ∈ {4096, 8192}.
+2. ✅ **Speed ≥ peers**: 1.14-1.27× of peer. **MET** at qwen3.6 35B.
+3. ✅ **TQ enabled**: 3.94× per-slot KV memory savings (llama.cpp has
+   none) + adaptive NSG=4 long-context lever.
+
+ADR-028 mantra MET on Qwen3.6 35B. The earlier "still kinda slow at
+58.5 t/s" complaint reflected an intermediate state; current production
+is 128 t/s short / 110 t/s long, beating peer.
+
+#### Path D production-vs-kernel-bench gap (investigation needed)
+
+Kernel bench (mlx-native iter-127d): NSG=4 at kL=4096 = 1.84× faster
+than NSG=1 = 95 µs/call saved.
+
+End-to-end A/B at qwen 4096-prefill + 256-decode:
+- HF2Q_TQ_NSG=1 forced: 110.0 t/s
+- Default (NSG=4 adaptive): 110.2 t/s
+- Δ: +0.2% (noise)
+
+Predicted: ~18% decode speedup. Observed: ~0%. Gap explanations to test:
+1. **Production decode budget** — iter-125's "FA = 39% of decode at
+   qwen sw=4096" was extrapolated from gemma. Real qwen FA% may be
+   smaller. (Bench-first to verify.)
+2. **Layer count assumption** — iter-125 used 30 layers; qwen3.6 35B
+   has 64 layers (some sliding, some full). Per-token kernel cost
+   distribution differs.
+3. **Other dispatches dominate** — at 9 ms/token decode, FA is at
+   most 3 ms (per-token mux of full + sliding layers). Saving 1 ms
+   from FA when total is 9 ms = 11% — closer to predicted but not
+   18%.
+4. **GraphSession encoding overhead** — per-token CPU overhead is
+   significant (~2 ms/token from iter-103 isolated/session split).
+   This is unaffected by Path D.
+
+Worth investigating but **NOT a Path D bug** — kernel bench correctness
+is verified by 3/3 NSG-equivalence tests at kL=64/128/1024.
+
+#### Production decode budget — re-measurement scope
+
+Add task #25.5: per-kernel timing harness during ACTUAL qwen forward_decode
+to validate the iter-125 budget map at qwen production. Currently iter-125
+extrapolated from gemma decode shape, not measured at qwen directly.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
