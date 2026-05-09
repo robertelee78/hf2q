@@ -5036,8 +5036,22 @@ impl MlxModelWeights {
                 1, hs as u32,
             ).map_err(|e| anyhow::anyhow!("final norm: {e}"))?;
 
-            // lm_head: cast F32->F16, dense GEMM F16, cast F16->F32
-            if let Some(ref lm_head_f16) = self.lm_head_f16 {
+            // iter-144: kernel-profile lm_head — match production path at 4051+:
+            // prefer Q8_0 (auto-picked for big-vocab models like gemma4 262144),
+            // fall back to F16 if no Q8_0 weight present.
+            if let Some(ref q8) = self.lm_head_q8 {
+                s.barrier_between(
+                    &[&self.activations.norm_out, &q8.buffer],
+                    &[&self.activations.logits],
+                );
+                dispatch_qmatmul(
+                    &mut s, reg, dev,
+                    &self.activations.norm_out,
+                    q8,
+                    &mut self.activations.logits,
+                    1,
+                )?;
+            } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
                 mlx_native::ops::elementwise::cast(
                     s.encoder_mut(), reg, metal_dev,
                     &self.activations.norm_out, &self.activations.hidden_f16,
@@ -5059,7 +5073,7 @@ impl MlxModelWeights {
                     vocab_size, CastDirection::F16ToF32,
                 ).map_err(|e| anyhow::anyhow!("cast F16->F32: {e}"))?;
             } else {
-                anyhow::bail!("Kernel profile requires GPU lm_head (F16 weight)");
+                anyhow::bail!("Kernel profile requires GPU lm_head (Q8_0 or F16 weight)");
             }
 
             // Softcap (params pre-initialized at model load time)

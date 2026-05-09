@@ -1,0 +1,534 @@
+Skip to main content
+The GB10 Solution Atlas is now open source, the inference engine made for the community with breakneck inference speeds (Qwen3.6-35B-FP8 100+ tok/s) : r/LocalLLaMA
+ 
+
+r/LocalLLaMA
+
+ 
+Get App
+Log In
+
+Expand user menu
+Skip to Navigation Skip to Right Sidebar
+ 
+Back
+ 
+Go to LocalLLaMA
+r/LocalLLaMA
+•
+3d ago
+Live-Possession-6726
+
+The GB10 Solution Atlas is now open source, the inference engine made for the community with breakneck inference speeds (Qwen3.6-35B-FP8 100+ tok/s)
+
+Resources
+ 
+
+0:18 / 0:26
+
+
+
+
+Some of you saw our post a couple weeks back about hitting 102 tok/s stable on Qwen3.5-35B on a DGX Spark. A lot of you asked "cool, where's the code?" Today's the day: Github
+
+Atlas is open source. Pure Rust + CUDA, no PyTorch, no Python runtime, ~2.5 GB image, <2 minute cold start. We rewrote the whole stack from HTTP handler to kernel dispatch because the bottleneck on Spark wasn't the silicon, it was 20+ GB of generic Python machinery sitting between your prompt and the GPU. We need community support to keep elevating Atlas for developers.
+
+Numbers on a single DGX Spark (GB10):
+
+Qwen3.5-35B (NVFP4, MTP K=2): 130 tok/s peak, ~111 tok/s sustained → 3.0–3.3x vLLM at testing time
+
+Qwen3.5-122B (NVFP4, EP=2): ~50 tok/s decode
+
+Qwen3-Next-80B-A3B (NVFP4, MTP): ~87 tok/s
+
+Nemotron-3 Nano 30B (FP8): ~88 tok/s
+
+Full model matrix on the site (Minimax2.7, Qwen3.6, Gemma too!)
+
+What's actually different:
+
+Hand-tuned CUDA kernels for Blackwell SM120/121 meaning attention, MoE, GDN, Mamba-2. No generic fallbacks.
+
+Native NVFP4 + FP8 on tensor cores
+
+MTP (Multi-Token Prediction) speculative decoding for up to 3x throughput on decode
+
+OpenAI + Anthropic API on the same port, works with Claude Code, Cline, OpenCode, Open WebUI out of the box
+
+Try it (two commands):
+
+docker pull avarok/atlas-gb10:latest
+sudo docker run -d --name atlas --network host --gpus all --ipc=host \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  avarok/atlas-gb10:latest serve Qwen/Qwen3.6-35B-A3B-FP8 \
+  --port 8888 --speculative --enable-prefix-caching
+What's next especially for the non-Spark folks: we're working with Spectral Compute on a Strix Halo port, and AMD is giving us hardware to do it properly. RTX 6000 Pro Blackwell is also on the roadmap. Same kernel philosophy, adapted per chip, we'd rather do four chips well than twenty chips badly.
+
+X/Twitter
+Site
+Discord
+
+Will be in comments all day. Hit us with edge cases, weird models, broken configs. The roadmap is genuinely community-driven. MiniMax M2.7 landed because someone in Discord asked.
+ 
+Upvote
+65
+
+Downvote
+ 
+21
+Go to comments
+
+
+Share
+ u/SaladChefs avatar
+SaladChefs
+•
+Promoted
+ 
+Your GPU doesn't need sleep. While you're out for 8 hours, a top-tier card can earn $1.74 a night - and that adds up.
+Learn More
+salad.com
+ Thumbnail image: Your GPU doesn't need sleep. While you're out for 8 hours, a top-tier card can earn $1.74 a night - and that adds up.
+ 
+Sort by:
+
+Best
+ 
+Search Comments
+Expand comment search
+Comments Section
+ u/dtdisapointingresult avatar
+dtdisapointingresult
+•
+3d ago
+•
+Edited 3d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+Sorry guys, I hate to be a sourpuss, I know you must have spent a lot of work on Atlas, but you gotta actually prove what you're bringing to the table above the competition, such as the community favorite spark-vllm-docker. None of your doc shows any advantage. And honestly your README is all over the place.
+
+Why are you promoting a model like 27B at FP8 KV cache on a system with 128GB VRAM? Why should I care about saving a couple of GB of VRAM when I have 70GB+ free after loading the model and KV cache BF16?
+Why are so many of your performance examples reducing accuracy in some way? Do you realize many people care more about accuracy than speed? I'd just run a IQ2 GGUF if all I cared about was posting a high token/sec in a README.
+Why not pick the same baseline to test on every model: one optimized for accuracy (FP8 weights, BF16 cache, which is what many people use), one optimized for speed (your preferred 4-bit quant, your preferred quantized KV cache). This way people can compare apples to apples. I know quantizing stuff down makes speed faster. What I want to know is how much Atlas makes things faster (assuming it does at all)
+On that note, why do you have an MTP benchmark for MoEs, but not for Qwen 27B which is like the single biggest beneficiary of MTP. This is 5 minutes of testing that makes number go up on the most important local model whose main weakness is slowness. It makes me think you can't tell the forest from the trees.
+WHY do you disable reasoning by default on Qwen 27B? You're going against the model's defaults. No other server does this. This should be a decision left up to the user, to disable it via chat-template-kwargs. Is Atlas meant to be an opinionated backend? And of course, your README makes no mention of how to re-enable reasoning. I don't care to test using VLLM flags at this point.
+Your container cannot be stopped with CTRL+C, what's up with that? I gotta CTRL+Z then use 'docker stop atlas' to make it stop.
+Where are the (fair) benchmarks compared to other solutions? What are you bringing to the table?
+But you know me, I can't complain.
+
+My own tests on DGX Spark:
+
+Test 1: my primary Qwen 27B setup where accuracy > speed
+
+spark-vllm-docker with Qwen 3.6 27B FP8, BF16 KV cache, no MTP: 8.0 tok/sec (I actually enable MTP of course, only turned it off for speed benchmarks. I get 19 tok/sec on a coding prompt with MTP)
+
+Test 2: atlas with your own recommendations from README
+
+atlas with Qwen 3.5 27B NVFP4, FP8 KV cache, no MTP: 13.9 tok/sec
+
+docker run --rm --name atlas --network host --gpus all --ipc=host -v ~/.cache/huggingface:/root/.cache/huggingface avarok/atlas-gb10:latest serve Kbenkhaled/Qwen3.5-27B-NVFP4 --port 8000  --kv-cache-dtype fp8
+Test 3: attempting equivalent of Atlas test with spark-vllm-docker
+
+Used QuantTrio/Qwen3.6-27B-AWQ (4-bit quant) and FP8 KV: 11.8 tok/sec
+
+My suggestion
+
+I can see Atlas + NVFP4 brings 17% gen speed boost over AWQ in spark-vllm-docker. This is something worth mentioning, and would bring some people to Atlas. Focus on stuff like that in your README.
+
+ u/Commando501 avatar
+Commando501
+•
+2d ago
+Easily one of the best comments I've read in awhile. We need more people like you.
+ u/Live-Possession-6726 avatar
+Live-Possession-6726
+OP
+•
+2d ago
+Hey thanks for the honest feedback u/dtdisapointingresult. Atlas is amazing because it's 2.5GBs, cold start is miles ahead of everything else (<2 mins vs 8+), and there's no dastardly dependency chain. That's what we're showing the community, simplicity and speed. We also have support for these giant models on a single spark too like Nemotron-super and Qwen-122B, we're advertising smaller ones because tokens go brr and people like to run multiple agents, and there was once a time where even those were only viable for 64GB+ VRAM, but clearly times have changed with a new optimization every week. And we can also do EP, TP for Minimax 2.7 for example for great speeds as well.
+
+Most of these quantizations are customizable flags, in our discord we consistently recommend BF16 KV cache dtype for example, and not bringing the MTP quantization down because it will ruin tool calls and accuracy as a whole. You're right about the 27B setup, we're better at dense and MTP enabled would actually run laps with the baseline speedup you're already seeing. We have so many benchmarks from the community, it's hard to keep up with all of these newer ones while fully handling dev as dynamic duo so I'm not sure what you mean by "fair". Please bring your reasoning request to issues on Github or #features on our Discord channel 😄
+
+ u/dtdisapointingresult avatar
+dtdisapointingresult
+•
+2d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+I did notice a huge startup/loading speed improvement compared to spark-vllm-docker, I didn't time it but I'd mention that too. It might make people reach for Atlas for quick experiments.
+
+RE: benchmarks, most people (at least on the Spark's Nvidia forum and Discord) are using the spark-vllm-docker image. So when you're bringing a new challenger, you have to compare yourself to it IMO.
+
+Your README's performance numbers are meaningless on their own because people can't tell from your README if Atlas is any better than what they already have. It's not like we have our models' tok/sec memorized.
+
+The reason I tested spark-vllm-docker with 27B AWQ is because I suspected "if they're not posting direct comparison numbers that means they're worse."
+
+As it happens, yours is actually faster. So it's surprising that you don't post these comparisons to show why Spark users should switch. Show real numbers. Brag about your faster inference speed, brag about your faster loading speed (but be fair. Use similar flags on both to do an apples-to-apples comparison, otherwise you'll get called out).
+ u/sixx7 avatar
+sixx7
+•
+3d ago
+Does it work with 2x GB10 in parallel?
+
+ u/Live-Possession-6726 avatar
+Live-Possession-6726
+OP
+•
+2d ago
+Yeah, we support models like Minimax2.7 TP=2
+reality_comes
+•
+3d ago
+I will try it
+Rattling33
+•
+3d ago
+Yay! Glad to hear for strix halo. Looking forrrward
+Zyguard7777777
+•
+2d ago
+Might be worth looking at https://github.com/causalflow-ai/petit-kernel for amd gpus and strix halo 
+ u/naglerrr avatar
+naglerrr
+•
+3d ago
+Would be nice if this were integrated into sparkrun.
+
+ u/Live-Possession-6726 avatar
+Live-Possession-6726
+OP
+•
+3d ago
+We need community help making this possible :)
+u/TrimRx avatar
+u/TrimRx
+•
+Promoted
+ 
+Your personal weight loss program just for you.
+View More
+trimrx.com
+Clickable image which will reveal the video player: Your personal weight loss program just for you. 
+Collapse video player
+ 
+
+0:00 / 0:00
+
+
+
+
+Dazzling_Equipment_9
+•
+3d ago
+I'm really looking forward to the Strixhalo version. We recently got the Hipfire, and now the Atlas will be another great new option.
+
+ u/Live-Possession-6726 avatar
+Live-Possession-6726
+OP
+•
+3d ago
+I prefer aiming down sights, but that's pretty cool too. What's currently option #1?
+
+Dazzling_Equipment_9
+•
+3d ago
+At this stage, the familiar llama.cpp is still the go-to choice—and for good reason. It’s excellent, extremely powerful, highly compatible, and very easy to use. Its sheer scale and “do-it-all” nature are both its greatest strengths and its biggest drawbacks. Because it tries to serve every platform equally, it’s hard to deeply optimize it for specific chips, which can make it feel somewhat generic and mediocre.
+
+That said, this isn’t a criticism of llama.cpp itself. We simply hope to see more diverse options emerge, so people can easily pick the solution that’s highly tuned for their particular hardware. I’m glad to see that Atlas is set to fill this gap in the future.
+ u/stefan_evm avatar
+stefan_evm
+•
+2d ago
+Thanks a lot!!!
+I've been watching your project for quite some time. It's truly very, very promising.
+Tonylu99
+•
+14h ago
+Is it good with high concurrency like 10 or 25?
+ u/Powerful_Ad8150 avatar
+Powerful_Ad8150
+•
+3d ago
+I'm keeping my fingers crossed for you, but: 1) the readme file could be a bit more polished; 2) make a simple GUI for loading models - for 30 years I haven't been able to understand how people can waste time on the command line, and I think there are many like me :); 3) dgx clusters? 4) there are no numbers for minimax 2.7
+ u/Icy_Programmer7186 avatar
+Icy_Programmer7186
+•
+2d ago
+Hi,
+this is brilliant.
+
+Do you plan to do Qwen/Qwen3.6-27B or Qwen/Qwen3.6-27B-FP8?
+
+ u/Live-Possession-6726 avatar
+Live-Possession-6726
+OP
+•
+2d ago
+Already there u/Icy_Programmer7186 !
+ u/blbd avatar
+blbd
+•
+11h ago
+I'm not sure I am following exactly what fundamental improvements this offers over llama.cpp. 
+New to Reddit?
+Create your account and connect with a world of communities.
+ 
+Continue with Email
+Continue with Phone Number
+By continuing, you agree to our User Agreement and acknowledge that you understand the Privacy Policy.
+Related Answers Section
+Related Answers
+Open source inference engine for LLMs
+Best LLM engines for fast inference
+Qwen 3.6 model performance benchmarks
+Qwen 3.6 vs Gemini comparison
+Best practices for hosting LLaMA locally
+More posts you may like
+[Tech Support] TUF A15 constant BSOD loop (Kmode, Memory Management) - Passes MemTest86
+
+r/Asustuf
+•
+2mo ago
+[Tech Support] TUF A15 constant BSOD loop (Kmode, Memory Management) - Passes MemTest86
+r/Asustuf - [Tech Support] TUF A15 constant BSOD loop (Kmode, Memory Management) - Passes MemTest86
+7 upvotes · 11 comments
+ u/USPS_Official avatar
+USPS_Official
+•
+Promoted
+ 
+When you have loads and loads to ship, USPS Ground Advantage® takes your packages from dock to door without missing a beat.
+ Thumbnail image: When you have loads and loads to ship, USPS Ground Advantage® takes your packages from dock to door without missing a beat.
+usps.com
+Learn More
+THE GB10 SOLUTION has arrived, Atlas image attached ~115tok/s Qwen3.5-35B DGX Spark
+
+r/LocalLLaMA
+•
+2mo ago
+THE GB10 SOLUTION has arrived, Atlas image attached ~115tok/s Qwen3.5-35B DGX Spark
+80 upvotes · 151 comments
+Seriously evaluating a GB10 for local inference, want community input before I request a vendor seed unit
+
+r/LocalLLaMA
+•
+1mo ago
+Seriously evaluating a GB10 for local inference, want community input before I request a vendor seed unit
+46 comments
+Have the GB10 devices become the current "best value" for LLMs?
+
+r/LocalLLaMA
+•
+1mo ago
+Have the GB10 devices become the current "best value" for LLMs?
+11 upvotes · 51 comments
+Google Plans 1000x AI Infrastructure Explosion in 4-5 Years -The Risk of Under-Investing Is Pretty High
+r/AI4tech
+•
+5mo ago
+Google Plans 1000x AI Infrastructure Explosion in 4-5 Years -The Risk of Under-Investing Is Pretty High
+r/AI4tech - Google Plans 1000x AI Infrastructure Explosion in 4-5 Years -The Risk of Under-Investing Is Pretty High
+43 upvotes · 7 comments
+Gemma4 - Someone at Google just merged a PR titled "casually dropping the most capable open weights on the planet"
+
+r/LocalLLM
+•
+1mo ago
+Gemma4 - Someone at Google just merged a PR titled "casually dropping the most capable open weights on the planet"
+418 upvotes · 82 comments
+Supercharging LLM inference on Google TPUs: Achieving 3X speedups with diffusion-style speculative decoding- Google Developers Blog
+
+r/LocalLLaMA
+•
+4d ago
+Supercharging LLM inference on Google TPUs: Achieving 3X speedups with diffusion-style speculative decoding- Google Developers Blog
+r/LocalLLaMA - Supercharging LLM inference on Google TPUs: Achieving 3X speedups with diffusion-style speculative decoding- Google Developers Blog
+googleblog
+72 upvotes · 15 comments
+Nova X870E - Successful UEFI Crossflash to NZXT N9
+
+r/ASRock
+•
+1mo ago
+Nova X870E - Successful UEFI Crossflash to NZXT N9
+r/ASRock - Nova X870E - Successful UEFI Crossflash to NZXT N9
+25 upvotes · 30 comments
+Google Chrome silently installs a 4GB AI model to your device without your consent!
+
+r/indotech
+•
+3d ago
+Google Chrome silently installs a 4GB AI model to your device without your consent!
+r/indotech - Google Chrome silently installs a 4GB AI model to your device without your consent!
+gadgetreview
+72 upvotes · 34 comments
+This Is The First Time I've Ever Seen An LLM Operate A GUI As Fast As A Person, And It's Surreal.
+
+r/accelerate
+•
+9d ago
+This Is The First Time I've Ever Seen An LLM Operate A GUI As Fast As A Person, And It's Surreal.
+r/accelerate - This Is The First Time I've Ever Seen An LLM Operate A GUI As Fast As A Person, And It's Surreal.
+0:40
+76 upvotes · 15 comments
+Local model management with Ollama: DeepSeek R1 and Nemotron 3 setup
+
+r/AIToolsPerformance
+•
+2mo ago
+Local model management with Ollama: DeepSeek R1 and Nemotron 3 setup
+2 upvotes · 2 comments
+Google Chrome Accused of Silently Installing 4GB AI Model on User Devices
+
+r/pwnhub
+•
+2d ago
+Google Chrome Accused of Silently Installing 4GB AI Model on User Devices
+131 upvotes · 23 comments
+Accelerating Gemma 4: faster inference with multi-token prediction drafters
+
+r/Bard
+•
+4d ago
+Accelerating Gemma 4: faster inference with multi-token prediction drafters
+r/Bard - Accelerating Gemma 4: faster inference with  multi-token prediction drafters
+blog
+151 upvotes · 9 comments
+This is why I still consider Google the most formidable AI company in the long run. Having everything from chips and infrastructure to models and distribution channels is an insane level of vertical integration.
+
+r/GeminiAI
+•
+16d ago
+This is why I still consider Google the most formidable AI company in the long run. Having everything from chips and infrastructure to models and distribution channels is an insane level of vertical integration.
+r/GeminiAI - This is why I still consider Google the most formidable AI company in the long run. Having everything from chips and infrastructure to models and distribution channels is an insane level of vertical integration.
+deepmind
+40 upvotes · 16 comments
+Atlas will be powered by Nvidia and Google Deepmind
+
+r/GOOG_Stock
+•
+4mo ago
+Atlas will be powered by Nvidia and Google Deepmind
+62 upvotes · 7 comments
+I benchmarked ROLV vs cuBLAS on real Llama 4 Maverick weights — 20.7x faster, 177x TTFT, 81.5% less energy
+
+r/LocalLLaMA
+•
+2mo ago
+I benchmarked ROLV vs cuBLAS on real Llama 4 Maverick weights — 20.7x faster, 177x TTFT, 81.5% less energy
+1 upvote · 5 comments
+Hydronic AHU hv71h, Navien npe240-a2, h2air, nest learning - fan issue
+
+r/hvacadvice
+•
+2mo ago
+Hydronic AHU hv71h, Navien npe240-a2, h2air, nest learning - fan issue
+1 upvote · 2 comments
+Ai Pixar ads are printing, Nano banana pro + Kling 3.0 + Kubflow
+r/AI_UGC_Marketing
+•
+11d ago
+Ai Pixar ads are printing, Nano banana pro + Kling 3.0 + Kubflow
+r/AI_UGC_Marketing - Ai Pixar ads are printing, Nano banana pro + Kling 3.0 + Kubflow
+2:19
+11 upvotes · 25 comments
+GAN i4 vs GAN 12 ui?
+
+r/Cubers
+•
+1mo ago
+GAN i4 vs GAN 12 ui?
+r/Cubers - GAN i4 vs GAN 12 ui?
+0:08
+5 upvotes · 7 comments
+I feel left behind. Where are these advanced "Agent-based" local LLM interfaces?
+
+r/LocalLLM
+•
+3d ago
+I feel left behind. Where are these advanced "Agent-based" local LLM interfaces?
+202 upvotes · 80 comments
+Local AI Final Boss — M3 Ultra v.s. GB10
+
+r/LocalLLM
+•
+4mo ago
+Local AI Final Boss — M3 Ultra v.s. GB10
+r/LocalLLM - Local AI Final Boss — M3 Ultra v.s. GB10
+325 upvotes · 82 comments
+[WTS] Weikav Nut65 Aluminium Plate - Like new
+
+r/mkindia
+•
+2mo ago
+[WTS] Weikav Nut65 Aluminium Plate - Like new
+r/mkindia - [WTS] Weikav Nut65 Aluminium Plate - Like new
+2
+6 upvotes · 9 comments
+Wan2.2 + SVI + TrippleKSampler
+
+r/StableDiffusion
+•
+2mo ago
+Wan2.2 + SVI + TrippleKSampler
+1 upvote · 3 comments
+Incompressible Knowledge Probes: Estimating Black-Box LLM Parameter Counts via Factual Capacity, Li et al. 2026 [Knowledge of obscure facts robustly predicts param count; estimates for all SotA closed LLMs]
+r/mlscaling
+•
+10d ago
+Incompressible Knowledge Probes: Estimating Black-Box LLM Parameter Counts via Factual Capacity, Li et al. 2026 [Knowledge of obscure facts robustly predicts param count; estimates for all SotA closed LLMs]
+r/mlscaling - Incompressible Knowledge Probes: Estimating Black-Box LLM Parameter Counts via Factual Capacity, Li et al. 2026 [Knowledge of obscure facts robustly predicts param count; estimates for all SotA closed LLMs]
+24 upvotes · 18 comments
+Atlas will be powered by Nvidia and Google Deepmind
+
+r/google
+•
+4mo ago
+Atlas will be powered by Nvidia and Google Deepmind
+113 upvotes · 12 comments
+VIEW POST IN
+
+Русский
+日本語
+繁體中文
+हिन्दी
+Português (Brasil)
+简体中文
+Français
+Tiếng Việt
+See more
+Community Info Section
+r/LocalLLaMA
+Llama
+ Join
+LocalLlama
+Subreddit to discuss locally hostable AI
+Public
+Reddit Rules
+Privacy Policy
+User Agreement
+Your Privacy Choices
+Accessibility
+Reddit, Inc. © 2026. All rights reserved.
+
+Collapse Navigation
+Home
+Popular
+News
+Explore
+RESOURCES
+About Reddit
+Advertise
+Developer Platform
+Reddit Pro
+BETA
+Help
+Blog
+Careers
+Press
+Best of Reddit
+Reddit Rules
+Privacy Policy
+User Agreement
+Your Privacy Choices
+Accessibility
+Reddit, Inc. © 2026. All rights reserved.
+ 

@@ -2880,6 +2880,50 @@ DS4 fusion port is **NOT** the right walk-phase target here. The task
 #23 sizing was correct in iter-121 + confirmed by H2-falsified iter-143
 data; the Phase E surfaced this conclusively today.
 
+### iter-144: per-kernel attribution — KV cache copy is 37.6× slower than peer
+
+Fixed `forward_decode_kernel_profile` to support Q8_0 lm_head (was hard-
+coded F16-only at line 5061; gemma4 auto-picks Q8_0 at vocab=262144 →
+kernel-profile bailed). Now mirrors production path at line 4051.
+
+#### TOP 3 slowest kernels (gemma4 APEX-Q5_K_M, kernel-profile mode)
+
+| Rank | Kernel | hf2q µs/layer | candle µs/layer | ratio | per-token overhead |
+|------|--------|---:|---:|---:|---:|
+| 1 | **KV cache copy** | 150 | 4 | **37.6×** | **4390 µs** |
+| 2 | O-proj matmul | 171 | 11 | 15.6× | 4802 µs |
+| 3 | SDPA | 206 | 17 | 12.1× | 5670 µs |
+
+**Note**: kernel-profile mode inflates absolute times by ~3.27× session
+overhead vs production (47312 µs/token reported here vs 14450 µs measured
+in iter-143). Ratios are RELATIVE — hf2q-vs-candle gap is real even
+after deflation.
+
+KV cache copy is the standout: **37.6× slower than peer at 2 dispatches
+per layer × 30 layers = 60 dispatches/token**. At deflated rate
+(4390/3.27 ≈ 1.34 ms/token real overhead), this alone could explain
+~30% of the 4.65 ms gap to peer.
+
+#### Hypothesis to test (iter-145)
+
+H3: hf2q's KV cache copy path does extra work peer skips:
+- Either dtype cast (F32→F16) per layer where peer keeps F32
+- Or sliding-window ring-buffer write logic peer simplifies
+- Or the F32 K + F32 V copy goes through 2 separate kernel dispatches
+  instead of one combined
+
+Read locations to inspect:
+- `forward_mlx.rs` ~3204..3251 (`dense_kvs[layer_idx].k`/`.v` copy/cast)
+- llama.cpp `kernel_cpy_f32_*` family for peer copy
+
+If the gap reduces to <5× by porting peer's KV-cache-copy shape, that
+recovers ~1.0-1.3 ms/token = ~7% of decode = a real walk-phase win
+(unlike DS4 fusion's 0.09%).
+
+iter-145 plan: bisect KV cache copy with focused µbench harness +
+read llama.cpp's KV write path; identify the single change that closes
+the 37.6× ratio gap.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)

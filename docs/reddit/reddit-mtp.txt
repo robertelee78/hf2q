@@ -1,0 +1,3268 @@
+2.5x faster inference with Qwen 3.6 27B using MTP - Finally a viable option for local agentic coding - 262k context on 48GB - Fixed chat template - Drop-in OpenAI and Anthropic API endpoints
+
+Resources
+2026-05-07 edit: I have updated the hardware based recommendations with more focus on quality. I do not recommend q4_0 KV cache anymore beyond 64k context. After multiple rounds of testing with the different size quants, it appears 3 is the optimal number for draft speculative decoding. The fastest and best quality quant is q8_0-mtp. F16, which I have also uploaded is actually better but ultra slow (6x slower than q8_0). Many keep saying 8bit is virtually lossless compared to 16bit, and 6bit almost as good as 8bit, but this is simply not true: time and time again I have noticed huge differences in quality and correctness between 8bit and 16bit versions of various models.
+The recent PR to llama.cpp bring MTP support to Qwen 3.6 27B. This uses the built-in tensor layers for speculative decoding. None of the existing GGUF have it, as they need to be converted with this PR.
+
+I have tested it locally on my mac M2 Max 96GB, and the results are amazing: 2.5x speed increase, bringing it to 28 tok/s!
+
+I have converted the most useful quants and uploaded them to HF. Even if you are using apple silicon, you should use those instead of MLX. You can download them here:
+
+https://huggingface.co/froggeric/Qwen3.6-27B-MTP-GGUF
+
+This also includes 7 fixes I made to the original jinja chat template, due to vLLM specificity which broke in other tools:
+
+https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates
+
+For now, you will need to compile your own version of llama.cpp to use them. It is fairly simple to do:
+
+git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
+cd llama.cpp
+git fetch origin pull/22673/head:mtp-pr && git checkout mtp-pr
+
+cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target llama-cli llama-server
+Then to start serving with the API endpoint, use a command similar to:
+
+llama-server -m Qwen3.6-27B-Q5_K_M-mtp.gguf \
+  --spec-type mtp --spec-draft-n-max 3 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  -np 1 -c 262144 --temp 0.7 --top-k 20 -ngl 99 --port 8081
+Vision currently crashes llama.cpp when used alongside MTP. Reported 2026-05-06 in the current PR.
+That's it. Three optimizations in one command:
+
+Flag	What it does	Impact
+--spec-type mtp --spec-draft-n-max 3	Multi-Token Prediction (built into the model)	2.5x faster generation
+--cache-type-k q8_0 --cache-type-v q8_0	8-bit KV cache (instead of 16-bit)	Half the KV memory, negligible quality loss
+-c 262144	262K context window	Full native context on 48 GB Mac with q8_0 KV
+Adjust -m, -c, and --cache-type-k/v for your hardware, according to the tables below.
+
+Here are my recommendations based on your hardware:
+
+Apple Silicon
+
+Qwen3.6-27B is a hybrid model — only 16 of 65 layers use KV cache (verified). The other 48 are linear attention (fixed 898 MiB recurrent state). KV memory is ~4× less than a standard dense model. Runtimes that don't handle this (e.g. vllm) allocate KV for all 65 layers and show much higher memory usage.
+
+Numbers below are total memory used (model + KV cache + 0.9 GB recurrent state). Must leave ≥ 8 GB for macOS (16 GB Macs excepted).
+
+RAM	Quant	KV cache	Max context	Total used	Vision
+16 GB	IQ2_M	q8_0	42K	12.0 GB	✗
+24 GB	IQ3_M		46K	16.0 GB	✗
+24 GB	IQ3_M	q8_0	91K	16.0 GB	✗
+32 GB	Q5_K_M		74K	24.0 GB	✗
+32 GB	Q5_K_M	q8_0	147K	24.0 GB	✗
+32 GB	Q4_K_M		99K	24.0 GB	✓
+48 GB	Q6_K		262K	39.7 GB	✓
+48 GB	Q8_0		173K	40.0 GB	✓
+48 GB	Q8_0	q8_0	262K	37.3 GB	✓
+64 GB	Q8_0		262K	45.8 GB	✓
+96 GB	Q8_0		262K	45.8 GB	✓
+NVIDIA GPU
+
+Same model memory as Apple Silicon, plus ~1 GB CUDA overhead.
+
+VRAM	Quant	KV cache	Max context	Total VRAM used	Vision
+12 GB	IQ2_M	q8_0	11K	12.0 GB	✗
+16 GB	IQ3_M		30K	16.0 GB	✗
+16 GB	IQ3_M	q8_0	60K	16.0 GB	✗
+24 GB	Q4_K_M		83K	24.0 GB	✓
+24 GB	Q4_K_M	q8_0	167K	24.0 GB	✓
+24 GB	Q5_K_M		58K	24.0 GB	✗
+48 GB	Q6_K		262K	40.7 GB	✓
+48 GB	Q8_0		262K	46.8 GB	✓
+80 GB	Q8_0		262K	46.8 GB	✓
+16 GB Mac: IQ2_M/q8_0 — 42K text-only. No vision.
+
+24 GB Mac: IQ3_M — 46K (f16 KV) or 91K (q8_0). Vision at 32–65K.
+
+32 GB Mac: Q5_K_M — 74K text-only (f16 KV), 147K (q8_0). Q4_K_M for vision at 99K.
+
+48 GB Mac: Q6_K/f16 KV — 262K with vision. Q8_0/q8_0 KV for 262K at higher model quality.
+
+64 GB+ Mac: Q8_0/f16 KV — 262K with vision. Maximum quality at practical speed.
+
+12 GB GPU: IQ2_M/q8_0 — 11K. Very limited, no vision.
+
+16 GB GPU: IQ3_M — 30K (f16 KV) or 60K (q8_0). No vision.
+
+24 GB GPU: Q4_K_M — 83K with vision (f16 KV). Q5_K_M — 58K text-only (f16 KV), 116K (q8_0).
+
+48 GB+ GPU: Q6_K/f16 KV — 262K with vision. Q8_0 for max quality.
+Leave KV cache at f16 (blank column) for best quality. Use q8_0 KV only when f16 doesn't give enough context. q4_0 KV should not exceed 64K context.
+
+Vision adds ~0.9 GB for mmproj. macOS needs ≥ 8 GB for itself (16 GB Macs excepted — use ~4 GB). You can increase available memory by raising the wired memory limit, e.g. for a 96 GB Mac: sudo sysctl iogpu.wired_limit_mb=90112 (88 GB). NVIDIA reserves ~1 GB for CUDA.
+ 
+
+Man, these past 6 months have brought us more than the last 2 years combined. On the one hand we've seen really powerful open models (glms, kimis, deepseeks, minimaxs, mimos, etc) and more importantly for this community, really useful "good enough" truly local models in gemmas and qwens.
+
+Now we're seeing lots of inference improvements that can be ran on consumer hardware, and that's what we mostly care about. Insane progress in a very short timespan.
+
+SmartCustard9944
+•
+3d ago
+•
+Edited 3d ago
+Better inference and intelligence
+-> Better and faster contributions
+Go to 1
+This loop gets better and better with time. This feels like a self improving intelligence, just that it’s hybrid (AI + human in the loop) and highly distributed and parallel (many humans).
+
+13 more replies
+PrzemChuck
+•
+3d ago
+There are decades where nothing happens; and there are weeks where decades happen. Vladimir Ilyich Lenin
+
+ u/Eisenstein avatar
+Eisenstein
+•
+3d ago
+Actual quote: "There are years, centuries, in which nothing happens, and there are days, like yesterday, into which a whole lifetime is compressed." -Adriaan Schade van Westrum
+
+Misattributed to Lenin. He wasn't actually that witty and mostly just wrote about Communist ideology.
+
+2 more replies
+ 
+3 more replies
+gordi555
+•
+3d ago
+On RTX Pro 6000 MaxQ I got/get...
+
+qwen 3.6 2.7B Q8 = 36 tokens per second
+qwen 3.6 2.7B Q8 (mtp) = 78 tokens per second
+
+I've lost about 20% prompt processing but these generation speeds are massively worth it.
+
+Output looks exactly the same in terms of quality.
+
+Amazing!
+
+switchandplay
+•
+3d ago
+I believe MTP, like other current speculative decoding techniques, will not reduce output quality- the ‘primary model’ is still in control of the final token emitted. Speculative decoding just speeds up generation when the speculator and the primary model are at a consensus. This happens often in coding environments, which is why we see a relatively higher speedup in this domain. In the case of MTP, the primary model is also the speculator, but the exact same verification flows ensue for tokens. In vLLM (and transformers I think), the model emits a token and the integrated MTP system suggests the next n (1-5 ish, based on config). Then the model verifies them.
+
+4 more replies
+ u/OpenAI avatar
+u/OpenAI
+•
+Promoted
+ 
+Faster prototyping shortens feedback loops. Codex helps teams get there sooner. Try Codex for Free.
+Sign Up
+chatgpt.com
+Clickable image which will reveal the video player: Faster prototyping shortens feedback loops. Codex helps teams get there sooner. Try Codex for Free. 
+Collapse video player
+ 
+
+0:00 / 0:00
+
+
+
+
+jacek2023
+•
+3d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+When was turbo3/turbo4 merged? Or is this part of MTP PR?
+
+pmttyji
+•
+3d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+When was turbo3/turbo4 merged?
+Custom fork probably.
+
+llama.cpp Links related to TurboQuant here to track progress.
+
+https://github.com/ggml-org/llama.cpp/issues/20977
+https://github.com/ggml-org/llama.cpp/pull/21089
+https://github.com/ggml-org/llama.cpp/discussions/20969
+
+rerri
+•
+3d ago
+But if you look at OP's compile instructions, it doesn't seem like TurboQuant PR is included.
+
+5 more replies
+ 
+2 more replies
+ 
+6 more replies
+sagiroth
+•
+3d ago
+Profile Badge for the Achievement Top 1% Commenter Top 1% Commenter
+It's great and I appreciate all the work the community is doing, but its so draining to keep up with this! :D
+
+ u/Several-Tax31 avatar
+Several-Tax31
+•
+3d ago
+I think we need to do a better job in this community on tracking the llama.cpp optimizations and which one works with which model etc. All information is so fragmented among the posts. I have a hard time myself. 
+
+clofresh
+•
+3d ago
+If only there were a magic technology that could take large quantities of text and turn it into smaller, more meaningful quantities of text!
+
+1 more reply
+ 
+3 more replies
+ 
+5 more replies
+ u/yes_i_tried_google avatar
+yes_i_tried_google
+•
+3d ago
+Same success here. RTX 3090 ti. Though finding draft max 4 gives best success for me.
+
+iq4 with MTP enabled (custom build from open PRs)
+Qwen 3.6 27B. Full 256k ctx, IQ4_XS. q4/q4. 100 tok/sec
+
+Qwen 3.6 35B. 200k ctx, IQ4_XS. q4/q4. 200 tok/sec
+
+https://huggingface.co/localweights/Qwen3.6-27B-MTP-IQ4_XS-GGUF
+
+https://huggingface.co/localweights/Qwen3.6-35B-A3B-MTP-IQ4_XS-GGUF
+
+ u/Pineapple_King avatar
+Pineapple_King
+•
+3d ago
+How did you get it to run? OPs compile instructions dont work on nvidia or at all. turboquant missing, no mtp
+
+ u/splice42 avatar
+splice42
+•
+3d ago
+OP's quantized models shit themselves if you try to run them on a CUDA compiled llama.cpp and turboquant is not available on the pulled/patched llama.cpp version. So OP is actually just kinda vibing it all and it's not a very systematic or complete set of instructions.
+
+If you pull the code but use the standard CUDA compilation command line (available in the build guide for llama.cpp), you'll get a binary that works. But you'll need another model than OP's for it to work. I used https://huggingface.co/eepos/Qwen3.6-27B-MTP-Q6_K-GGUF and it works fine. Don't use the turboquant kv. You may need to set -np 1 for it to run properly since MTP decoding doesn't support parallel requests in this version of llama.cpp but mine tries to default to 4.
+
+However, no vision model seems to work correct, all just crash and dump core. So this is early days for MTP in llama and there still needs to be some work.
+
+7 more replies
+ u/yes_i_tried_google avatar
+yes_i_tried_google
+•
+3d ago
+I’ll publish my steps tonight and reply. Didn’t follow OPs steps, just coincidence I got it running yesterday on my 3090 and almost imploded when I saw the near x3 increase in speed.
+
+Above models are public now too, contain some instructions
+
+4 more replies
+ u/ex-arman68 avatar
+ex-arman68
+OP
+•
+3d ago
+I made a mistake by including turboquants recommendations, and forgot to include the build instructions for it. The PR is currently too unstable and uncertain. I have removed my turboquants recommendations, and replaced them with q4_0 for the KV cache.
+
+4 more replies
+ 
+1 more reply
+ 
+6 more replies
+VergeOfTranscendence
+•
+3d ago
+Thanks for the models, I will definitely give them a try. But I have a question that others here might be able to answer. Is this better than the Qwen 3.6 Dflash models? Also, I use most of the times iq3_XS models and usually fit 256k context in 16gb VRAM GPU, so I wonder if all your quants can do 256k (if we don't use mmproj).
+
+AvidCyclist250
+•
+3d ago
+Whoever downovted you is clueless. You're asking the right question.
+ u/ex-arman68 avatar
+ex-arman68
+OP
+•
+3d ago
+According to my calculations, the max context you can get with iQ2_M is around 64k with 16GB VRAM GPU. I am not sure how you are able to reach 256k context with iQ3_XS which is even larger.
+
+11 more replies
+ u/Soactuaries avatar
+u/Soactuaries
+•
+Promoted
+ 
+Actuaries are solving problems around the world every single day. Learn how you can lead a career with impact.
+Sign Up
+soa.org
+Clickable image which will reveal the video player: Actuaries are solving problems around the world every single day. Learn how you can lead a career with impact. 
+Collapse video player
+ 
+
+0:00 / 0:00
+
+
+
+
+ u/fatboy93 avatar
+fatboy93
+•
+3d ago
+I love how you put the memory used tables at different contexts here. That is something I sorely miss from others, and makes it a guessing game if I should go for a larger quant or a smaller quant, and what amount of stuff I can throw at the model.
+
+ u/ex-arman68 avatar
+ex-arman68
+OP
+•
+3d ago
+Thank you, that was the point
+ u/Extra-Library-5258 avatar
+Extra-Library-5258
+•
+3d ago
+Thanks @ex-arman68!
+
+On M5 Max 128GB. MTP decode speed is legit... 37 tok/s at 1K and 33 tok/s at 16K on Q8_0, which is 2x+ what I get with the same model on oMLX.
+
+Heads up if you're on Apple Silicon doing long context: llama.cpp's Metal prefill is the bottleneck. At 64K it takes almost 4 minutes to first token, and 128K straight up times out. oMLX handles 128K prefill in ~5.5 min. The Metal backend just isn't as optimized for the big batch matmuls during prefill.
+
+So if you're on a Mac: great for short/medium context, but don't expect miracles past 64K. Also, froggeric's GGUFs are confirmed broken (every token is <|box_end|>), use RDson or Radamanthys11 instead.
+
+Turbo4 KV is NOT in this PR. Use q8_0 or q4_0.
+
+12 more replies
+ u/DHasselhoff77 avatar
+DHasselhoff77
+•
+3d ago
+Can't get it to work on CUDA. I built the linked PR branch but after prompt processing no tokens are produced even though the GPU runs at 100% load. This is what gets printed:
+
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = -1
+srv  get_availabl: updating prompt cache
+srv          load:  - looking for better prompt, base f_keep = -1.000, sim = 0.000
+srv        update:  - cache state: 0 prompts, 0.000 MiB (limits: 8192.000 MiB, 30208 tokens, 8589934592 est)
+srv  get_availabl: prompt cache update took 0.01 ms
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> ?min-p -> ?xtc -> temp-ext -> dist 
+slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+slot update_slots: id  0 | task 0 | new prompt, n_ctx_slot = 30208, n_keep = 0, task.n_tokens = 11
+slot update_slots: id  0 | task 0 | n_tokens = 0, memory_seq_rm [0, end)
+slot update_slots: id  0 | task 0 | prompt processing progress, n_tokens = 7, batch.n_tokens = 7, progress = 0.636364
+slot update_slots: id  0 | task 0 | n_tokens = 7, memory_seq_rm [7, end)
+slot init_sampler: id  0 | task 0 | init sampler, took 0.01 ms, tokens: text = 11, total = 11
+slot update_slots: id  0 | task 0 | prompt processing done, n_tokens = 11, batch.n_tokens = 4
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+And freezes there.
+
+Tried the "IQ3_M" quant. Also the PR branch doesn't seem to have "turbo4" support that was recommended by the OP: Unsupported cache type: turbo4.
+
+Command tried:
+
+      ${mtp-llama-server} --model Qwen3.6/Qwen3.6-27B-IQ3_M-mtp.gguf
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      -c 30000
+      --jinja --temp 0.6 --top-k 20 --top-p 0.95 --min-p 0.0
+      --presence_penalty 0.0
+      --spec-type mtp --spec-draft-n-max 4
+      --chat-template-kwargs '{"preserve_thinking": true}'
+      --parallel 1
+      --chat-template-kwargs '{"enable_thinking":true}'
+      --chat-template-file Qwen3.6/chat_template.jinja
+
+6 more replies
+New to Reddit?
+Create your account and connect with a world of communities.
+ 
+Continue with Email
+Continue with Phone Number
+By continuing, you agree to our User Agreement and acknowledge that you understand the Privacy Policy.
+Related Answers Section
+Related Answers
+Optimal hardware for Qwen 3.6 27B MTP
+Parallel computing solutions for Qwen 3.6
+Understanding MTP in relation to Qwen models
+Best practices for hosting LLaMA locally
+How to optimize LLaMA for specific tasks
+More posts you may like
+Qwen 3.6 27B MTP on v100 32GB: 54 t/s
+
+r/LocalLLaMA
+•
+4d ago
+Qwen 3.6 27B MTP on v100 32GB: 54 t/s
+79 upvotes · 42 comments
+ u/nyxcosmetics avatar
+nyxcosmetics
+•
+Promoted
+ 
+Try Lip IV Hydrating Gloss Stain. Soaking Wet Shine, Long Lasting Stain. Up to 12 Hour Hydration.
+ Thumbnail image: Try Lip IV Hydrating Gloss Stain. Soaking Wet Shine, Long Lasting Stain. Up to 12 Hour Hydration.
+ulta.com
+Shop Now
+Qwen3.6-27B with MTP grafted on Unsloth UD XL: 2.5x throughput via unmerged llama.cpp PR
+
+r/LocalLLaMA
+•
+3d ago
+Qwen3.6-27B with MTP grafted on Unsloth UD XL: 2.5x throughput via unmerged llama.cpp PR
+170 upvotes · 86 comments
+Built a Chrome extension that runs EmbeddingGemma-300M (q4) in-browser to score HN/Reddit/X feeds — no backend, full fine-tuning loop
+
+r/LocalLLaMA
+•
+2mo ago
+Built a Chrome extension that runs EmbeddingGemma-300M (q4) in-browser to score HN/Reddit/X feeds — no backend, full fine-tuning loop
+r/LocalLLaMA - Built a Chrome extension that runs EmbeddingGemma-300M (q4) in-browser to score HN/Reddit/X feeds — no backend, full fine-tuning loop
+0:55
+6 upvotes · 1 comment
+MTP - The proofs in the puddin! Using it with Qwen3.6-27b
+
+r/LocalLLaMA
+•
+3d ago
+MTP - The proofs in the puddin! Using it with Qwen3.6-27b
+r/LocalLLaMA - MTP - The proofs in the puddin! Using it with Qwen3.6-27b
+13 comments
+Need advice: Qwen3.6 27B MTP or 35B-A3B MoE MTP on 16GB VRAM RTX 5080)?
+
+r/LocalLLaMA
+•
+3d ago
+Need advice: Qwen3.6 27B MTP or 35B-A3B MoE MTP on 16GB VRAM RTX 5080)?
+4 upvotes · 38 comments
+Qwen3.6 27B NVFP4 + MTP on a single RTX 5090: 200k context working in vLLM
+
+r/LocalLLaMA
+•
+3d ago
+Qwen3.6 27B NVFP4 + MTP on a single RTX 5090: 200k context working in vLLM
+75 upvotes · 66 comments
+How to run Qwen3.5-27B with speculative decoding with llama.cpp llama-server?
+
+r/LocalLLaMA
+•
+26d ago
+How to run Qwen3.5-27B with speculative decoding with llama.cpp llama-server?
+5 upvotes · 14 comments
+200+ TPS on Qwen3.6-27B and 35B-A3B with consumer hardware (RTX 3090s) - method provided!
+
+r/LocalLLM
+•
+7d ago
+200+ TPS on Qwen3.6-27B and 35B-A3B with consumer hardware (RTX 3090s) - method provided!
+31 upvotes · 21 comments
+Qwen 3.6 27b Q4.0 MTP GGUF
+
+r/LocalLLaMA
+•
+4d ago
+Qwen 3.6 27b Q4.0 MTP GGUF
+24 upvotes · 21 comments
+An Overnight Stack for Qwen3.6–27B: 85 TPS, 125K Context, Vision — on One RTX 3090 | by Wasif Basharat | Apr, 2026
+
+r/LocalLLaMA
+•
+16d ago
+An Overnight Stack for Qwen3.6–27B: 85 TPS, 125K Context, Vision — on One RTX 3090 | by Wasif Basharat | Apr, 2026
+r/LocalLLaMA - An Overnight Stack for Qwen3.6–27B: 85 TPS, 125K Context, Vision — on One RTX 3090 | by Wasif Basharat | Apr, 2026
+medium
+311 upvotes · 186 comments
+Running Qwen3.5 / Qwen3.6 with NextN MTP (Multi-Token Prediction) speculative decode in llama.cpp — single RTX 3090 Ti GPU guide
+
+r/LocalLLaMA
+•
+2d ago
+Running Qwen3.5 / Qwen3.6 with NextN MTP (Multi-Token Prediction) speculative decode in llama.cpp — single RTX 3090 Ti GPU guide
+42 upvotes · 25 comments
+How to use Llama-swap, Open WebUI, Semantic Router Filter, and Qwen3.5 to its fullest
+
+r/LocalLLM
+•
+2mo ago
+How to use Llama-swap, Open WebUI, Semantic Router Filter, and Qwen3.5 to its fullest
+r/LocalLLM - How to use Llama-swap, Open WebUI, Semantic Router Filter, and Qwen3.5 to its fullest
+38 upvotes · 15 comments
+As MTP prepares to land in llama.cpp, Models that support MTP
+
+r/LocalLLaMA
+•
+5d ago
+As MTP prepares to land in llama.cpp, Models that support MTP
+113 upvotes · 55 comments
+Qwen3.6-27B-INT4 clocking 100 tps with 256k context length on 1x RTX 5090 via vllm 0.19
+
+r/LocalLLaMA
+•
+13d ago
+Qwen3.6-27B-INT4 clocking 100 tps with 256k context length on 1x RTX 5090 via vllm 0.19
+252 upvotes · 102 comments
+Get faster qwen 3.6 27b
+
+r/LocalLLaMA
+•
+3d ago
+Get faster qwen 3.6 27b
+169 upvotes · 76 comments
+Qwen3.6-27B at ~80 tps with 218k context window on 1x RTX 5090 served by vllm 0.19
+
+r/LocalLLaMA
+•
+14d ago
+Qwen3.6-27B at ~80 tps with 218k context window on 1x RTX 5090 served by vllm 0.19
+336 upvotes · 133 comments
+Debug Android apps offline - fast paced llama chatbot - GGUF support - APK exporting/installation - In app preview - easy to use editor
+
+r/vibecoding
+•
+2mo ago
+Debug Android apps offline - fast paced llama chatbot - GGUF support - APK exporting/installation - In app preview - easy to use editor
+r/vibecoding - Debug Android apps offline - fast paced llama chatbot - GGUF support - APK exporting/installation - In app preview - easy to use editor
+youtube
+1 upvote
+First Level Release-- Controlling and Designing with Claude 4.6 OPUS in Fusion via Local MCP
+
+r/Fusion360
+•
+1mo ago
+First Level Release-- Controlling and Designing with Claude 4.6 OPUS in Fusion via Local MCP
+20 comments
+Open source Swift library for on-device speech AI — ASR that beats Whisper Large v3, full-duplex speech-to-speech, native async/await
+
+r/swift
+•
+2mo ago
+Open source Swift library for on-device speech AI — ASR that beats Whisper Large v3, full-duplex speech-to-speech, native async/await
+16 upvotes · 4 comments
+Qwen 3.5 27B what tps are you managing?
+
+r/StrixHalo
+•
+2mo ago
+Qwen 3.5 27B what tps are you managing?
+6 upvotes · 23 comments
+Run Qwen3.6-27B at up to 2x throughput on a single RTX 3090
+
+r/LocalLLM
+•
+12d ago
+Run Qwen3.6-27B at up to 2x throughput on a single RTX 3090
+r/LocalLLM - Run Qwen3.6-27B at up to 2x throughput on a single RTX 3090
+github
+5 upvotes · 2 comments
+I fine-tuned Qwen3.5-27B with 35k examples into an AI companion - after 2,000 conversations here’s what actually matters for personality
+
+r/LocalLLaMA
+•
+2mo ago
+I fine-tuned Qwen3.5-27B with 35k examples into an AI companion - after 2,000 conversations here’s what actually matters for personality
+51 upvotes · 59 comments
+I forked chrome and build a browser for agents with Claude Code (Benchmarked 90% on Mind2Web) [Open Source]
+
+r/ClaudeCode
+•
+2mo ago
+I forked chrome and build a browser for agents with Claude Code (Benchmarked 90% on Mind2Web) [Open Source]
+r/ClaudeCode - I forked chrome and build a browser for agents with Claude Code (Benchmarked 90% on Mind2Web) [Open Source]
+1:35
+11 upvotes · 10 comments
+Quality (Intelligence) testing on MTP
+
+r/LocalLLaMA
+•
+3d ago
+Quality (Intelligence) testing on MTP
+14 comments
+I built WiretapKMP, a Kotlin Multiplatform network inspector and mocking library (all on device without network proxy).
+
+r/androiddev
+•
+1mo ago
+I built WiretapKMP, a Kotlin Multiplatform network inspector and mocking library (all on device without network proxy).
+r/androiddev - I built WiretapKMP, a Kotlin Multiplatform network inspector and mocking library (all on device without network proxy).
+VIEW POST IN
+
+繁體中文
+Tiếng Việt
+简体中文
+Português (Brasil)
+Русский
+日本語
+Français
+हिन्दी
+See more
+Community Info Section
+r/LocalLLaMA
+Llama
+ Join
+LocalLlama
+Subreddit to discuss locally hostable AI
+Public
+Reddit Rules
+Privacy Policy
+User Agreement
+Your Privacy Choices
+Accessibility
+Reddit, Inc. © 2026. All rights reserved.
+
+Collapse Navigation
+Home
+Popular
+News
+Explore
+RESOURCES
+About Reddit
+Advertise
+Developer Platform
+Reddit Pro
+BETA
+Help
+Blog
+Careers
+Press
+Best of Reddit
+Reddit Rules
+Privacy Policy
+User Agreement
+Your Privacy Choices
+Accessibility
+Reddit, Inc. © 2026. All rights reserved.
+Skip to main content
+2.5x faster inference with Qwen 3.6 27B using MTP - Finally a viable option for local agentic coding - 262k context on 48GB - Fixed chat template - Drop-in OpenAI and Anthropic API endpoints : r/LocalLLaMA
+ 
+
+r/LocalLLaMA
+
+ 
+Get App
+Log In
+
+Expand user menu
+Skip to Navigation Skip to Right Sidebar
+ 
+Back
+ 
+Go to LocalLLaMA
+r/LocalLLaMA
+•
+3d ago
+ex-arman68
+
+2.5x faster inference with Qwen 3.6 27B using MTP - Finally a viable option for local agentic coding - 262k context on 48GB - Fixed chat template - Drop-in OpenAI and Anthropic API endpoints
+
+Resources
+2026-05-07 edit: I have updated the hardware based recommendations with more focus on quality. I do not recommend q4_0 KV cache anymore beyond 64k context. After multiple rounds of testing with the different size quants, it appears 3 is the optimal number for draft speculative decoding. The fastest and best quality quant is q8_0-mtp. F16, which I have also uploaded is actually better but ultra slow (6x slower than q8_0). Many keep saying 8bit is virtually lossless compared to 16bit, and 6bit almost as good as 8bit, but this is simply not true: time and time again I have noticed huge differences in quality and correctness between 8bit and 16bit versions of various models.
+The recent PR to llama.cpp bring MTP support to Qwen 3.6 27B. This uses the built-in tensor layers for speculative decoding. None of the existing GGUF have it, as they need to be converted with this PR.
+
+I have tested it locally on my mac M2 Max 96GB, and the results are amazing: 2.5x speed increase, bringing it to 28 tok/s!
+
+I have converted the most useful quants and uploaded them to HF. Even if you are using apple silicon, you should use those instead of MLX. You can download them here:
+
+https://huggingface.co/froggeric/Qwen3.6-27B-MTP-GGUF
+
+This also includes 7 fixes I made to the original jinja chat template, due to vLLM specificity which broke in other tools:
+
+https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates
+
+For now, you will need to compile your own version of llama.cpp to use them. It is fairly simple to do:
+
+git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
+cd llama.cpp
+git fetch origin pull/22673/head:mtp-pr && git checkout mtp-pr
+
+cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target llama-cli llama-server
+Then to start serving with the API endpoint, use a command similar to:
+
+llama-server -m Qwen3.6-27B-Q5_K_M-mtp.gguf \
+  --spec-type mtp --spec-draft-n-max 3 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  -np 1 -c 262144 --temp 0.7 --top-k 20 -ngl 99 --port 8081
+Vision currently crashes llama.cpp when used alongside MTP. Reported 2026-05-06 in the current PR.
+That's it. Three optimizations in one command:
+
+Flag	What it does	Impact
+--spec-type mtp --spec-draft-n-max 3	Multi-Token Prediction (built into the model)	2.5x faster generation
+--cache-type-k q8_0 --cache-type-v q8_0	8-bit KV cache (instead of 16-bit)	Half the KV memory, negligible quality loss
+-c 262144	262K context window	Full native context on 48 GB Mac with q8_0 KV
+Adjust -m, -c, and --cache-type-k/v for your hardware, according to the tables below.
+
+Here are my recommendations based on your hardware:
+
+Apple Silicon
+
+Qwen3.6-27B is a hybrid model — only 16 of 65 layers use KV cache (verified). The other 48 are linear attention (fixed 898 MiB recurrent state). KV memory is ~4× less than a standard dense model. Runtimes that don't handle this (e.g. vllm) allocate KV for all 65 layers and show much higher memory usage.
+
+Numbers below are total memory used (model + KV cache + 0.9 GB recurrent state). Must leave ≥ 8 GB for macOS (16 GB Macs excepted).
+
+RAM	Quant	KV cache	Max context	Total used	Vision
+16 GB	IQ2_M	q8_0	42K	12.0 GB	✗
+24 GB	IQ3_M		46K	16.0 GB	✗
+24 GB	IQ3_M	q8_0	91K	16.0 GB	✗
+32 GB	Q5_K_M		74K	24.0 GB	✗
+32 GB	Q5_K_M	q8_0	147K	24.0 GB	✗
+32 GB	Q4_K_M		99K	24.0 GB	✓
+48 GB	Q6_K		262K	39.7 GB	✓
+48 GB	Q8_0		173K	40.0 GB	✓
+48 GB	Q8_0	q8_0	262K	37.3 GB	✓
+64 GB	Q8_0		262K	45.8 GB	✓
+96 GB	Q8_0		262K	45.8 GB	✓
+NVIDIA GPU
+
+Same model memory as Apple Silicon, plus ~1 GB CUDA overhead.
+
+VRAM	Quant	KV cache	Max context	Total VRAM used	Vision
+12 GB	IQ2_M	q8_0	11K	12.0 GB	✗
+16 GB	IQ3_M		30K	16.0 GB	✗
+16 GB	IQ3_M	q8_0	60K	16.0 GB	✗
+24 GB	Q4_K_M		83K	24.0 GB	✓
+24 GB	Q4_K_M	q8_0	167K	24.0 GB	✓
+24 GB	Q5_K_M		58K	24.0 GB	✗
+48 GB	Q6_K		262K	40.7 GB	✓
+48 GB	Q8_0		262K	46.8 GB	✓
+80 GB	Q8_0		262K	46.8 GB	✓
+16 GB Mac: IQ2_M/q8_0 — 42K text-only. No vision.
+
+24 GB Mac: IQ3_M — 46K (f16 KV) or 91K (q8_0). Vision at 32–65K.
+
+32 GB Mac: Q5_K_M — 74K text-only (f16 KV), 147K (q8_0). Q4_K_M for vision at 99K.
+
+48 GB Mac: Q6_K/f16 KV — 262K with vision. Q8_0/q8_0 KV for 262K at higher model quality.
+
+64 GB+ Mac: Q8_0/f16 KV — 262K with vision. Maximum quality at practical speed.
+
+12 GB GPU: IQ2_M/q8_0 — 11K. Very limited, no vision.
+
+16 GB GPU: IQ3_M — 30K (f16 KV) or 60K (q8_0). No vision.
+
+24 GB GPU: Q4_K_M — 83K with vision (f16 KV). Q5_K_M — 58K text-only (f16 KV), 116K (q8_0).
+
+48 GB+ GPU: Q6_K/f16 KV — 262K with vision. Q8_0 for max quality.
+Leave KV cache at f16 (blank column) for best quality. Use q8_0 KV only when f16 doesn't give enough context. q4_0 KV should not exceed 64K context.
+
+Vision adds ~0.9 GB for mmproj. macOS needs ≥ 8 GB for itself (16 GB Macs excepted — use ~4 GB). You can increase available memory by raising the wired memory limit, e.g. for a 96 GB Mac: sudo sysctl iogpu.wired_limit_mb=90112 (88 GB). NVIDIA reserves ~1 GB for CUDA.
+ 
+Upvote
+1.2K
+
+Downvote
+ 
+367
+Go to comments
+
+
+2
+
+Share
+ u/InworldAI avatar
+InworldAI
+•
+Promoted
+ 
+Inworld Realtime TTS just ranked #1 on Artificial Analysis, beating ElevenLabs, Google, and MiniMax.
+Sign Up
+platform.inworld.ai
+ Thumbnail image: Inworld Realtime TTS just ranked #1 on Artificial Analysis, beating ElevenLabs, Google, and MiniMax.
+ 
+Sort by:
+
+Best
+ 
+Search Comments
+Expand comment search
+Comments Section
+ u/WithoutReason1729 avatar
+WithoutReason1729
+MOD
+•
+3d ago
+•
+Stickied comment
+Your post is getting popular and we just featured it on our Discord! Come check it out!
+
+You've also been given a special flair for your contribution. We appreciate your post!
+
+I am a bot and this action was performed automatically.
+ u/ResidentPositive4122 avatar
+ResidentPositive4122
+•
+3d ago
+Profile Badge for the Achievement Top 1% Commenter Top 1% Commenter
+Legend.
+
+Man, these past 6 months have brought us more than the last 2 years combined. On the one hand we've seen really powerful open models (glms, kimis, deepseeks, minimaxs, mimos, etc) and more importantly for this community, really useful "good enough" truly local models in gemmas and qwens.
+
+Now we're seeing lots of inference improvements that can be ran on consumer hardware, and that's what we mostly care about. Insane progress in a very short timespan.
+
+SmartCustard9944
+•
+3d ago
+•
+Edited 3d ago
+Better inference and intelligence
+-> Better and faster contributions
+Go to 1
+This loop gets better and better with time. This feels like a self improving intelligence, just that it’s hybrid (AI + human in the loop) and highly distributed and parallel (many humans).
+
+13 more replies
+PrzemChuck
+•
+3d ago
+There are decades where nothing happens; and there are weeks where decades happen. Vladimir Ilyich Lenin
+
+ u/Eisenstein avatar
+Eisenstein
+•
+3d ago
+Actual quote: "There are years, centuries, in which nothing happens, and there are days, like yesterday, into which a whole lifetime is compressed." -Adriaan Schade van Westrum
+
+Misattributed to Lenin. He wasn't actually that witty and mostly just wrote about Communist ideology.
+
+2 more replies
+ 
+3 more replies
+gordi555
+•
+3d ago
+On RTX Pro 6000 MaxQ I got/get...
+
+qwen 3.6 2.7B Q8 = 36 tokens per second
+qwen 3.6 2.7B Q8 (mtp) = 78 tokens per second
+
+I've lost about 20% prompt processing but these generation speeds are massively worth it.
+
+Output looks exactly the same in terms of quality.
+
+Amazing!
+
+switchandplay
+•
+3d ago
+I believe MTP, like other current speculative decoding techniques, will not reduce output quality- the ‘primary model’ is still in control of the final token emitted. Speculative decoding just speeds up generation when the speculator and the primary model are at a consensus. This happens often in coding environments, which is why we see a relatively higher speedup in this domain. In the case of MTP, the primary model is also the speculator, but the exact same verification flows ensue for tokens. In vLLM (and transformers I think), the model emits a token and the integrated MTP system suggests the next n (1-5 ish, based on config). Then the model verifies them.
+
+4 more replies
+ u/OpenAI avatar
+u/OpenAI
+•
+Promoted
+ 
+Faster prototyping shortens feedback loops. Codex helps teams get there sooner. Try Codex for Free.
+Sign Up
+chatgpt.com
+Clickable image which will reveal the video player: Faster prototyping shortens feedback loops. Codex helps teams get there sooner. Try Codex for Free. 
+Collapse video player
+ 
+
+0:00 / 0:00
+
+
+
+
+jacek2023
+•
+3d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+When was turbo3/turbo4 merged? Or is this part of MTP PR?
+
+pmttyji
+•
+3d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+When was turbo3/turbo4 merged?
+Custom fork probably.
+
+llama.cpp Links related to TurboQuant here to track progress.
+
+https://github.com/ggml-org/llama.cpp/issues/20977
+https://github.com/ggml-org/llama.cpp/pull/21089
+https://github.com/ggml-org/llama.cpp/discussions/20969
+
+rerri
+•
+3d ago
+But if you look at OP's compile instructions, it doesn't seem like TurboQuant PR is included.
+
+5 more replies
+ 
+2 more replies
+ 
+6 more replies
+sagiroth
+•
+3d ago
+Profile Badge for the Achievement Top 1% Commenter Top 1% Commenter
+It's great and I appreciate all the work the community is doing, but its so draining to keep up with this! :D
+
+ u/Several-Tax31 avatar
+Several-Tax31
+•
+3d ago
+I think we need to do a better job in this community on tracking the llama.cpp optimizations and which one works with which model etc. All information is so fragmented among the posts. I have a hard time myself. 
+
+clofresh
+•
+3d ago
+If only there were a magic technology that could take large quantities of text and turn it into smaller, more meaningful quantities of text!
+
+1 more reply
+ 
+3 more replies
+ 
+5 more replies
+ u/yes_i_tried_google avatar
+yes_i_tried_google
+•
+3d ago
+Same success here. RTX 3090 ti. Though finding draft max 4 gives best success for me.
+
+iq4 with MTP enabled (custom build from open PRs)
+Qwen 3.6 27B. Full 256k ctx, IQ4_XS. q4/q4. 100 tok/sec
+
+Qwen 3.6 35B. 200k ctx, IQ4_XS. q4/q4. 200 tok/sec
+
+https://huggingface.co/localweights/Qwen3.6-27B-MTP-IQ4_XS-GGUF
+
+https://huggingface.co/localweights/Qwen3.6-35B-A3B-MTP-IQ4_XS-GGUF
+
+ u/Pineapple_King avatar
+Pineapple_King
+•
+3d ago
+How did you get it to run? OPs compile instructions dont work on nvidia or at all. turboquant missing, no mtp
+
+ u/splice42 avatar
+splice42
+•
+3d ago
+OP's quantized models shit themselves if you try to run them on a CUDA compiled llama.cpp and turboquant is not available on the pulled/patched llama.cpp version. So OP is actually just kinda vibing it all and it's not a very systematic or complete set of instructions.
+
+If you pull the code but use the standard CUDA compilation command line (available in the build guide for llama.cpp), you'll get a binary that works. But you'll need another model than OP's for it to work. I used https://huggingface.co/eepos/Qwen3.6-27B-MTP-Q6_K-GGUF and it works fine. Don't use the turboquant kv. You may need to set -np 1 for it to run properly since MTP decoding doesn't support parallel requests in this version of llama.cpp but mine tries to default to 4.
+
+However, no vision model seems to work correct, all just crash and dump core. So this is early days for MTP in llama and there still needs to be some work.
+
+7 more replies
+ u/yes_i_tried_google avatar
+yes_i_tried_google
+•
+3d ago
+I’ll publish my steps tonight and reply. Didn’t follow OPs steps, just coincidence I got it running yesterday on my 3090 and almost imploded when I saw the near x3 increase in speed.
+
+Above models are public now too, contain some instructions
+
+4 more replies
+ u/ex-arman68 avatar
+ex-arman68
+OP
+•
+3d ago
+I made a mistake by including turboquants recommendations, and forgot to include the build instructions for it. The PR is currently too unstable and uncertain. I have removed my turboquants recommendations, and replaced them with q4_0 for the KV cache.
+
+4 more replies
+ 
+1 more reply
+ 
+6 more replies
+VergeOfTranscendence
+•
+3d ago
+Thanks for the models, I will definitely give them a try. But I have a question that others here might be able to answer. Is this better than the Qwen 3.6 Dflash models? Also, I use most of the times iq3_XS models and usually fit 256k context in 16gb VRAM GPU, so I wonder if all your quants can do 256k (if we don't use mmproj).
+
+AvidCyclist250
+•
+3d ago
+Whoever downovted you is clueless. You're asking the right question.
+ u/ex-arman68 avatar
+ex-arman68
+OP
+•
+3d ago
+According to my calculations, the max context you can get with iQ2_M is around 64k with 16GB VRAM GPU. I am not sure how you are able to reach 256k context with iQ3_XS which is even larger.
+
+11 more replies
+ u/Soactuaries avatar
+u/Soactuaries
+•
+Promoted
+ 
+Actuaries are solving problems around the world every single day. Learn how you can lead a career with impact.
+Sign Up
+soa.org
+Clickable image which will reveal the video player: Actuaries are solving problems around the world every single day. Learn how you can lead a career with impact. 
+Collapse video player
+ 
+
+0:00 / 0:00
+
+
+
+
+ u/fatboy93 avatar
+fatboy93
+•
+3d ago
+I love how you put the memory used tables at different contexts here. That is something I sorely miss from others, and makes it a guessing game if I should go for a larger quant or a smaller quant, and what amount of stuff I can throw at the model.
+
+ u/ex-arman68 avatar
+ex-arman68
+OP
+•
+3d ago
+Thank you, that was the point
+ u/Extra-Library-5258 avatar
+Extra-Library-5258
+•
+3d ago
+Thanks @ex-arman68!
+
+On M5 Max 128GB. MTP decode speed is legit... 37 tok/s at 1K and 33 tok/s at 16K on Q8_0, which is 2x+ what I get with the same model on oMLX.
+
+Heads up if you're on Apple Silicon doing long context: llama.cpp's Metal prefill is the bottleneck. At 64K it takes almost 4 minutes to first token, and 128K straight up times out. oMLX handles 128K prefill in ~5.5 min. The Metal backend just isn't as optimized for the big batch matmuls during prefill.
+
+So if you're on a Mac: great for short/medium context, but don't expect miracles past 64K. Also, froggeric's GGUFs are confirmed broken (every token is <|box_end|>), use RDson or Radamanthys11 instead.
+
+Turbo4 KV is NOT in this PR. Use q8_0 or q4_0.
+
+12 more replies
+ u/DHasselhoff77 avatar
+DHasselhoff77
+•
+3d ago
+Can't get it to work on CUDA. I built the linked PR branch but after prompt processing no tokens are produced even though the GPU runs at 100% load. This is what gets printed:
+
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = -1
+srv  get_availabl: updating prompt cache
+srv          load:  - looking for better prompt, base f_keep = -1.000, sim = 0.000
+srv        update:  - cache state: 0 prompts, 0.000 MiB (limits: 8192.000 MiB, 30208 tokens, 8589934592 est)
+srv  get_availabl: prompt cache update took 0.01 ms
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> ?min-p -> ?xtc -> temp-ext -> dist 
+slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+slot update_slots: id  0 | task 0 | new prompt, n_ctx_slot = 30208, n_keep = 0, task.n_tokens = 11
+slot update_slots: id  0 | task 0 | n_tokens = 0, memory_seq_rm [0, end)
+slot update_slots: id  0 | task 0 | prompt processing progress, n_tokens = 7, batch.n_tokens = 7, progress = 0.636364
+slot update_slots: id  0 | task 0 | n_tokens = 7, memory_seq_rm [7, end)
+slot init_sampler: id  0 | task 0 | init sampler, took 0.01 ms, tokens: text = 11, total = 11
+slot update_slots: id  0 | task 0 | prompt processing done, n_tokens = 11, batch.n_tokens = 4
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+And freezes there.
+
+Tried the "IQ3_M" quant. Also the PR branch doesn't seem to have "turbo4" support that was recommended by the OP: Unsupported cache type: turbo4.
+
+Command tried:
+
+      ${mtp-llama-server} --model Qwen3.6/Qwen3.6-27B-IQ3_M-mtp.gguf
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      -c 30000
+      --jinja --temp 0.6 --top-k 20 --top-p 0.95 --min-p 0.0
+      --presence_penalty 0.0
+      --spec-type mtp --spec-draft-n-max 4
+      --chat-template-kwargs '{"preserve_thinking": true}'
+      --parallel 1
+      --chat-template-kwargs '{"enable_thinking":true}'
+      --chat-template-file Qwen3.6/chat_template.jinja
+
+6 more replies
+New to Reddit?
+Create your account and connect with a world of communities.
+ 
+Continue with Email
+Continue with Phone Number
+By continuing, you agree to our User Agreement and acknowledge that you understand the Privacy Policy.
+Related Answers Section
+Related Answers
+Optimal hardware for Qwen 3.6 27B MTP
+Parallel computing solutions for Qwen 3.6
+Understanding MTP in relation to Qwen models
+Best practices for hosting LLaMA locally
+How to optimize LLaMA for specific tasks
+More posts you may like
+Qwen 3.6 27B MTP on v100 32GB: 54 t/s
+
+r/LocalLLaMA
+•
+4d ago
+Qwen 3.6 27B MTP on v100 32GB: 54 t/s
+79 upvotes · 42 comments
+ u/nyxcosmetics avatar
+nyxcosmetics
+•
+Promoted
+ 
+Try Lip IV Hydrating Gloss Stain. Soaking Wet Shine, Long Lasting Stain. Up to 12 Hour Hydration.
+ Thumbnail image: Try Lip IV Hydrating Gloss Stain. Soaking Wet Shine, Long Lasting Stain. Up to 12 Hour Hydration.
+ulta.com
+Shop Now
+Qwen3.6-27B with MTP grafted on Unsloth UD XL: 2.5x throughput via unmerged llama.cpp PR
+
+r/LocalLLaMA
+•
+3d ago
+Qwen3.6-27B with MTP grafted on Unsloth UD XL: 2.5x throughput via unmerged llama.cpp PR
+170 upvotes · 86 comments
+Built a Chrome extension that runs EmbeddingGemma-300M (q4) in-browser to score HN/Reddit/X feeds — no backend, full fine-tuning loop
+
+r/LocalLLaMA
+•
+2mo ago
+Built a Chrome extension that runs EmbeddingGemma-300M (q4) in-browser to score HN/Reddit/X feeds — no backend, full fine-tuning loop
+r/LocalLLaMA - Built a Chrome extension that runs EmbeddingGemma-300M (q4) in-browser to score HN/Reddit/X feeds — no backend, full fine-tuning loop
+0:55
+6 upvotes · 1 comment
+MTP - The proofs in the puddin! Using it with Qwen3.6-27b
+
+r/LocalLLaMA
+•
+3d ago
+MTP - The proofs in the puddin! Using it with Qwen3.6-27b
+r/LocalLLaMA - MTP - The proofs in the puddin! Using it with Qwen3.6-27b
+13 comments
+Need advice: Qwen3.6 27B MTP or 35B-A3B MoE MTP on 16GB VRAM RTX 5080)?
+
+r/LocalLLaMA
+•
+3d ago
+Need advice: Qwen3.6 27B MTP or 35B-A3B MoE MTP on 16GB VRAM RTX 5080)?
+4 upvotes · 38 comments
+Qwen3.6 27B NVFP4 + MTP on a single RTX 5090: 200k context working in vLLM
+
+r/LocalLLaMA
+•
+3d ago
+Qwen3.6 27B NVFP4 + MTP on a single RTX 5090: 200k context working in vLLM
+75 upvotes · 66 comments
+How to run Qwen3.5-27B with speculative decoding with llama.cpp llama-server?
+
+r/LocalLLaMA
+•
+26d ago
+How to run Qwen3.5-27B with speculative decoding with llama.cpp llama-server?
+5 upvotes · 14 comments
+200+ TPS on Qwen3.6-27B and 35B-A3B with consumer hardware (RTX 3090s) - method provided!
+
+r/LocalLLM
+•
+7d ago
+200+ TPS on Qwen3.6-27B and 35B-A3B with consumer hardware (RTX 3090s) - method provided!
+31 upvotes · 21 comments
+Qwen 3.6 27b Q4.0 MTP GGUF
+
+r/LocalLLaMA
+•
+4d ago
+Qwen 3.6 27b Q4.0 MTP GGUF
+24 upvotes · 21 comments
+An Overnight Stack for Qwen3.6–27B: 85 TPS, 125K Context, Vision — on One RTX 3090 | by Wasif Basharat | Apr, 2026
+
+r/LocalLLaMA
+•
+16d ago
+An Overnight Stack for Qwen3.6–27B: 85 TPS, 125K Context, Vision — on One RTX 3090 | by Wasif Basharat | Apr, 2026
+r/LocalLLaMA - An Overnight Stack for Qwen3.6–27B: 85 TPS, 125K Context, Vision — on One RTX 3090 | by Wasif Basharat | Apr, 2026
+medium
+311 upvotes · 186 comments
+Running Qwen3.5 / Qwen3.6 with NextN MTP (Multi-Token Prediction) speculative decode in llama.cpp — single RTX 3090 Ti GPU guide
+
+r/LocalLLaMA
+•
+2d ago
+Running Qwen3.5 / Qwen3.6 with NextN MTP (Multi-Token Prediction) speculative decode in llama.cpp — single RTX 3090 Ti GPU guide
+42 upvotes · 25 comments
+How to use Llama-swap, Open WebUI, Semantic Router Filter, and Qwen3.5 to its fullest
+
+r/LocalLLM
+•
+2mo ago
+How to use Llama-swap, Open WebUI, Semantic Router Filter, and Qwen3.5 to its fullest
+r/LocalLLM - How to use Llama-swap, Open WebUI, Semantic Router Filter, and Qwen3.5 to its fullest
+38 upvotes · 15 comments
+As MTP prepares to land in llama.cpp, Models that support MTP
+
+r/LocalLLaMA
+•
+5d ago
+As MTP prepares to land in llama.cpp, Models that support MTP
+113 upvotes · 55 comments
+Qwen3.6-27B-INT4 clocking 100 tps with 256k context length on 1x RTX 5090 via vllm 0.19
+
+r/LocalLLaMA
+•
+13d ago
+Qwen3.6-27B-INT4 clocking 100 tps with 256k context length on 1x RTX 5090 via vllm 0.19
+252 upvotes · 102 comments
+Get faster qwen 3.6 27b
+
+r/LocalLLaMA
+•
+3d ago
+Get faster qwen 3.6 27b
+169 upvotes · 76 comments
+Qwen3.6-27B at ~80 tps with 218k context window on 1x RTX 5090 served by vllm 0.19
+
+r/LocalLLaMA
+•
+14d ago
+Qwen3.6-27B at ~80 tps with 218k context window on 1x RTX 5090 served by vllm 0.19
+336 upvotes · 133 comments
+Debug Android apps offline - fast paced llama chatbot - GGUF support - APK exporting/installation - In app preview - easy to use editor
+
+r/vibecoding
+•
+2mo ago
+Debug Android apps offline - fast paced llama chatbot - GGUF support - APK exporting/installation - In app preview - easy to use editor
+r/vibecoding - Debug Android apps offline - fast paced llama chatbot - GGUF support - APK exporting/installation - In app preview - easy to use editor
+youtube
+1 upvote
+First Level Release-- Controlling and Designing with Claude 4.6 OPUS in Fusion via Local MCP
+
+r/Fusion360
+•
+1mo ago
+First Level Release-- Controlling and Designing with Claude 4.6 OPUS in Fusion via Local MCP
+20 comments
+Open source Swift library for on-device speech AI — ASR that beats Whisper Large v3, full-duplex speech-to-speech, native async/await
+
+r/swift
+•
+2mo ago
+Open source Swift library for on-device speech AI — ASR that beats Whisper Large v3, full-duplex speech-to-speech, native async/await
+16 upvotes · 4 comments
+Qwen 3.5 27B what tps are you managing?
+
+r/StrixHalo
+•
+2mo ago
+Qwen 3.5 27B what tps are you managing?
+6 upvotes · 23 comments
+Run Qwen3.6-27B at up to 2x throughput on a single RTX 3090
+
+r/LocalLLM
+•
+12d ago
+Run Qwen3.6-27B at up to 2x throughput on a single RTX 3090
+r/LocalLLM - Run Qwen3.6-27B at up to 2x throughput on a single RTX 3090
+github
+5 upvotes · 2 comments
+I fine-tuned Qwen3.5-27B with 35k examples into an AI companion - after 2,000 conversations here’s what actually matters for personality
+
+r/LocalLLaMA
+•
+2mo ago
+I fine-tuned Qwen3.5-27B with 35k examples into an AI companion - after 2,000 conversations here’s what actually matters for personality
+51 upvotes · 59 comments
+I forked chrome and build a browser for agents with Claude Code (Benchmarked 90% on Mind2Web) [Open Source]
+
+r/ClaudeCode
+•
+2mo ago
+I forked chrome and build a browser for agents with Claude Code (Benchmarked 90% on Mind2Web) [Open Source]
+r/ClaudeCode - I forked chrome and build a browser for agents with Claude Code (Benchmarked 90% on Mind2Web) [Open Source]
+1:35
+11 upvotes · 10 comments
+Quality (Intelligence) testing on MTP
+
+r/LocalLLaMA
+•
+3d ago
+Quality (Intelligence) testing on MTP
+14 comments
+I built WiretapKMP, a Kotlin Multiplatform network inspector and mocking library (all on device without network proxy).
+
+r/androiddev
+•
+1mo ago
+I built WiretapKMP, a Kotlin Multiplatform network inspector and mocking library (all on device without network proxy).
+r/androiddev - I built WiretapKMP, a Kotlin Multiplatform network inspector and mocking library (all on device without network proxy).
+VIEW POST IN
+
+繁體中文
+Tiếng Việt
+简体中文
+Português (Brasil)
+Русский
+日本語
+Français
+हिन्दी
+See more
+Community Info Section
+r/LocalLLaMA
+Llama
+ Join
+LocalLlama
+Subreddit to discuss locally hostable AI
+Public
+Reddit Rules
+Privacy Policy
+User Agreement
+Your Privacy Choices
+Accessibility
+Reddit, Inc. © 2026. All rights reserved.
+
+Collapse Navigation
+Home
+Popular
+News
+Explore
+RESOURCES
+About Reddit
+Advertise
+Developer Platform
+Reddit Pro
+BETA
+Help
+Blog
+Careers
+Press
+Best of Reddit
+Reddit Rules
+Privacy Policy
+User Agreement
+Your Privacy Choices
+Accessibility
+Reddit, Inc. © 2026. All rights reserved.
+Skip to main content
+2.5x faster inference with Qwen 3.6 27B using MTP - Finally a viable option for local agentic coding - 262k context on 48GB - Fixed chat template - Drop-in OpenAI and Anthropic API endpoints : r/LocalLLaMA
+ 
+
+r/LocalLLaMA
+
+ 
+Get App
+Log In
+
+Expand user menu
+Skip to Navigation Skip to Right Sidebar
+ 
+Back
+ 
+Go to LocalLLaMA
+r/LocalLLaMA
+•
+3d ago
+ex-arman68
+
+2.5x faster inference with Qwen 3.6 27B using MTP - Finally a viable option for local agentic coding - 262k context on 48GB - Fixed chat template - Drop-in OpenAI and Anthropic API endpoints
+
+Resources
+2026-05-07 edit: I have updated the hardware based recommendations with more focus on quality. I do not recommend q4_0 KV cache anymore beyond 64k context. After multiple rounds of testing with the different size quants, it appears 3 is the optimal number for draft speculative decoding. The fastest and best quality quant is q8_0-mtp. F16, which I have also uploaded is actually better but ultra slow (6x slower than q8_0). Many keep saying 8bit is virtually lossless compared to 16bit, and 6bit almost as good as 8bit, but this is simply not true: time and time again I have noticed huge differences in quality and correctness between 8bit and 16bit versions of various models.
+The recent PR to llama.cpp bring MTP support to Qwen 3.6 27B. This uses the built-in tensor layers for speculative decoding. None of the existing GGUF have it, as they need to be converted with this PR.
+
+I have tested it locally on my mac M2 Max 96GB, and the results are amazing: 2.5x speed increase, bringing it to 28 tok/s!
+
+I have converted the most useful quants and uploaded them to HF. Even if you are using apple silicon, you should use those instead of MLX. You can download them here:
+
+https://huggingface.co/froggeric/Qwen3.6-27B-MTP-GGUF
+
+This also includes 7 fixes I made to the original jinja chat template, due to vLLM specificity which broke in other tools:
+
+https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates
+
+For now, you will need to compile your own version of llama.cpp to use them. It is fairly simple to do:
+
+git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
+cd llama.cpp
+git fetch origin pull/22673/head:mtp-pr && git checkout mtp-pr
+
+cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target llama-cli llama-server
+Then to start serving with the API endpoint, use a command similar to:
+
+llama-server -m Qwen3.6-27B-Q5_K_M-mtp.gguf \
+  --spec-type mtp --spec-draft-n-max 3 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  -np 1 -c 262144 --temp 0.7 --top-k 20 -ngl 99 --port 8081
+Vision currently crashes llama.cpp when used alongside MTP. Reported 2026-05-06 in the current PR.
+That's it. Three optimizations in one command:
+
+Flag	What it does	Impact
+--spec-type mtp --spec-draft-n-max 3	Multi-Token Prediction (built into the model)	2.5x faster generation
+--cache-type-k q8_0 --cache-type-v q8_0	8-bit KV cache (instead of 16-bit)	Half the KV memory, negligible quality loss
+-c 262144	262K context window	Full native context on 48 GB Mac with q8_0 KV
+Adjust -m, -c, and --cache-type-k/v for your hardware, according to the tables below.
+
+Here are my recommendations based on your hardware:
+
+Apple Silicon
+
+Qwen3.6-27B is a hybrid model — only 16 of 65 layers use KV cache (verified). The other 48 are linear attention (fixed 898 MiB recurrent state). KV memory is ~4× less than a standard dense model. Runtimes that don't handle this (e.g. vllm) allocate KV for all 65 layers and show much higher memory usage.
+
+Numbers below are total memory used (model + KV cache + 0.9 GB recurrent state). Must leave ≥ 8 GB for macOS (16 GB Macs excepted).
+
+RAM	Quant	KV cache	Max context	Total used	Vision
+16 GB	IQ2_M	q8_0	42K	12.0 GB	✗
+24 GB	IQ3_M		46K	16.0 GB	✗
+24 GB	IQ3_M	q8_0	91K	16.0 GB	✗
+32 GB	Q5_K_M		74K	24.0 GB	✗
+32 GB	Q5_K_M	q8_0	147K	24.0 GB	✗
+32 GB	Q4_K_M		99K	24.0 GB	✓
+48 GB	Q6_K		262K	39.7 GB	✓
+48 GB	Q8_0		173K	40.0 GB	✓
+48 GB	Q8_0	q8_0	262K	37.3 GB	✓
+64 GB	Q8_0		262K	45.8 GB	✓
+96 GB	Q8_0		262K	45.8 GB	✓
+NVIDIA GPU
+
+Same model memory as Apple Silicon, plus ~1 GB CUDA overhead.
+
+VRAM	Quant	KV cache	Max context	Total VRAM used	Vision
+12 GB	IQ2_M	q8_0	11K	12.0 GB	✗
+16 GB	IQ3_M		30K	16.0 GB	✗
+16 GB	IQ3_M	q8_0	60K	16.0 GB	✗
+24 GB	Q4_K_M		83K	24.0 GB	✓
+24 GB	Q4_K_M	q8_0	167K	24.0 GB	✓
+24 GB	Q5_K_M		58K	24.0 GB	✗
+48 GB	Q6_K		262K	40.7 GB	✓
+48 GB	Q8_0		262K	46.8 GB	✓
+80 GB	Q8_0		262K	46.8 GB	✓
+16 GB Mac: IQ2_M/q8_0 — 42K text-only. No vision.
+
+24 GB Mac: IQ3_M — 46K (f16 KV) or 91K (q8_0). Vision at 32–65K.
+
+32 GB Mac: Q5_K_M — 74K text-only (f16 KV), 147K (q8_0). Q4_K_M for vision at 99K.
+
+48 GB Mac: Q6_K/f16 KV — 262K with vision. Q8_0/q8_0 KV for 262K at higher model quality.
+
+64 GB+ Mac: Q8_0/f16 KV — 262K with vision. Maximum quality at practical speed.
+
+12 GB GPU: IQ2_M/q8_0 — 11K. Very limited, no vision.
+
+16 GB GPU: IQ3_M — 30K (f16 KV) or 60K (q8_0). No vision.
+
+24 GB GPU: Q4_K_M — 83K with vision (f16 KV). Q5_K_M — 58K text-only (f16 KV), 116K (q8_0).
+
+48 GB+ GPU: Q6_K/f16 KV — 262K with vision. Q8_0 for max quality.
+Leave KV cache at f16 (blank column) for best quality. Use q8_0 KV only when f16 doesn't give enough context. q4_0 KV should not exceed 64K context.
+
+Vision adds ~0.9 GB for mmproj. macOS needs ≥ 8 GB for itself (16 GB Macs excepted — use ~4 GB). You can increase available memory by raising the wired memory limit, e.g. for a 96 GB Mac: sudo sysctl iogpu.wired_limit_mb=90112 (88 GB). NVIDIA reserves ~1 GB for CUDA.
+ 
+Upvote
+1.2K
+
+Downvote
+ 
+367
+Go to comments
+
+
+2
+
+Share
+ u/InworldAI avatar
+InworldAI
+•
+Promoted
+ 
+Inworld Realtime TTS just ranked #1 on Artificial Analysis, beating ElevenLabs, Google, and MiniMax.
+Sign Up
+platform.inworld.ai
+ Thumbnail image: Inworld Realtime TTS just ranked #1 on Artificial Analysis, beating ElevenLabs, Google, and MiniMax.
+ 
+Sort by:
+
+Best
+ 
+Search Comments
+Expand comment search
+Comments Section
+ u/WithoutReason1729 avatar
+WithoutReason1729
+MOD
+•
+3d ago
+•
+Stickied comment
+Your post is getting popular and we just featured it on our Discord! Come check it out!
+
+You've also been given a special flair for your contribution. We appreciate your post!
+
+I am a bot and this action was performed automatically.
+ u/ResidentPositive4122 avatar
+ResidentPositive4122
+•
+3d ago
+Profile Badge for the Achievement Top 1% Commenter Top 1% Commenter
+Legend.
+
+Man, these past 6 months have brought us more than the last 2 years combined. On the one hand we've seen really powerful open models (glms, kimis, deepseeks, minimaxs, mimos, etc) and more importantly for this community, really useful "good enough" truly local models in gemmas and qwens.
+
+Now we're seeing lots of inference improvements that can be ran on consumer hardware, and that's what we mostly care about. Insane progress in a very short timespan.
+
+SmartCustard9944
+•
+3d ago
+•
+Edited 3d ago
+Better inference and intelligence
+-> Better and faster contributions
+Go to 1
+This loop gets better and better with time. This feels like a self improving intelligence, just that it’s hybrid (AI + human in the loop) and highly distributed and parallel (many humans).
+
+13 more replies
+PrzemChuck
+•
+3d ago
+There are decades where nothing happens; and there are weeks where decades happen. Vladimir Ilyich Lenin
+
+ u/Eisenstein avatar
+Eisenstein
+•
+3d ago
+Actual quote: "There are years, centuries, in which nothing happens, and there are days, like yesterday, into which a whole lifetime is compressed." -Adriaan Schade van Westrum
+
+Misattributed to Lenin. He wasn't actually that witty and mostly just wrote about Communist ideology.
+
+2 more replies
+ 
+3 more replies
+gordi555
+•
+3d ago
+On RTX Pro 6000 MaxQ I got/get...
+
+qwen 3.6 2.7B Q8 = 36 tokens per second
+qwen 3.6 2.7B Q8 (mtp) = 78 tokens per second
+
+I've lost about 20% prompt processing but these generation speeds are massively worth it.
+
+Output looks exactly the same in terms of quality.
+
+Amazing!
+
+switchandplay
+•
+3d ago
+I believe MTP, like other current speculative decoding techniques, will not reduce output quality- the ‘primary model’ is still in control of the final token emitted. Speculative decoding just speeds up generation when the speculator and the primary model are at a consensus. This happens often in coding environments, which is why we see a relatively higher speedup in this domain. In the case of MTP, the primary model is also the speculator, but the exact same verification flows ensue for tokens. In vLLM (and transformers I think), the model emits a token and the integrated MTP system suggests the next n (1-5 ish, based on config). Then the model verifies them.
+
+4 more replies
+ u/OpenAI avatar
+u/OpenAI
+•
+Promoted
+ 
+Faster prototyping shortens feedback loops. Codex helps teams get there sooner. Try Codex for Free.
+Sign Up
+chatgpt.com
+Clickable image which will reveal the video player: Faster prototyping shortens feedback loops. Codex helps teams get there sooner. Try Codex for Free. 
+Collapse video player
+ 
+
+0:00 / 0:00
+
+
+
+
+jacek2023
+•
+3d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+When was turbo3/turbo4 merged? Or is this part of MTP PR?
+
+pmttyji
+•
+3d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+When was turbo3/turbo4 merged?
+Custom fork probably.
+
+llama.cpp Links related to TurboQuant here to track progress.
+
+https://github.com/ggml-org/llama.cpp/issues/20977
+https://github.com/ggml-org/llama.cpp/pull/21089
+https://github.com/ggml-org/llama.cpp/discussions/20969
+
+rerri
+•
+3d ago
+But if you look at OP's compile instructions, it doesn't seem like TurboQuant PR is included.
+
+5 more replies
+ 
+2 more replies
+ 
+6 more replies
+sagiroth
+•
+3d ago
+Profile Badge for the Achievement Top 1% Commenter Top 1% Commenter
+It's great and I appreciate all the work the community is doing, but its so draining to keep up with this! :D
+
+ u/Several-Tax31 avatar
+Several-Tax31
+•
+3d ago
+I think we need to do a better job in this community on tracking the llama.cpp optimizations and which one works with which model etc. All information is so fragmented among the posts. I have a hard time myself. 
+
+clofresh
+•
+3d ago
+If only there were a magic technology that could take large quantities of text and turn it into smaller, more meaningful quantities of text!
+
+1 more reply
+ 
+3 more replies
+ 
+5 more replies
+ u/yes_i_tried_google avatar
+yes_i_tried_google
+•
+3d ago
+Same success here. RTX 3090 ti. Though finding draft max 4 gives best success for me.
+
+iq4 with MTP enabled (custom build from open PRs)
+Qwen 3.6 27B. Full 256k ctx, IQ4_XS. q4/q4. 100 tok/sec
+
+Qwen 3.6 35B. 200k ctx, IQ4_XS. q4/q4. 200 tok/sec
+
+https://huggingface.co/localweights/Qwen3.6-27B-MTP-IQ4_XS-GGUF
+
+https://huggingface.co/localweights/Qwen3.6-35B-A3B-MTP-IQ4_XS-GGUF
+
+ u/Pineapple_King avatar
+Pineapple_King
+•
+3d ago
+How did you get it to run? OPs compile instructions dont work on nvidia or at all. turboquant missing, no mtp
+
+ u/splice42 avatar
+splice42
+•
+3d ago
+OP's quantized models shit themselves if you try to run them on a CUDA compiled llama.cpp and turboquant is not available on the pulled/patched llama.cpp version. So OP is actually just kinda vibing it all and it's not a very systematic or complete set of instructions.
+
+If you pull the code but use the standard CUDA compilation command line (available in the build guide for llama.cpp), you'll get a binary that works. But you'll need another model than OP's for it to work. I used https://huggingface.co/eepos/Qwen3.6-27B-MTP-Q6_K-GGUF and it works fine. Don't use the turboquant kv. You may need to set -np 1 for it to run properly since MTP decoding doesn't support parallel requests in this version of llama.cpp but mine tries to default to 4.
+
+However, no vision model seems to work correct, all just crash and dump core. So this is early days for MTP in llama and there still needs to be some work.
+
+7 more replies
+ u/yes_i_tried_google avatar
+yes_i_tried_google
+•
+3d ago
+I’ll publish my steps tonight and reply. Didn’t follow OPs steps, just coincidence I got it running yesterday on my 3090 and almost imploded when I saw the near x3 increase in speed.
+
+Above models are public now too, contain some instructions
+
+4 more replies
+ u/ex-arman68 avatar
+ex-arman68
+OP
+•
+3d ago
+I made a mistake by including turboquants recommendations, and forgot to include the build instructions for it. The PR is currently too unstable and uncertain. I have removed my turboquants recommendations, and replaced them with q4_0 for the KV cache.
+
+4 more replies
+ 
+1 more reply
+ 
+6 more replies
+VergeOfTranscendence
+•
+3d ago
+Thanks for the models, I will definitely give them a try. But I have a question that others here might be able to answer. Is this better than the Qwen 3.6 Dflash models? Also, I use most of the times iq3_XS models and usually fit 256k context in 16gb VRAM GPU, so I wonder if all your quants can do 256k (if we don't use mmproj).
+
+AvidCyclist250
+•
+3d ago
+Whoever downovted you is clueless. You're asking the right question.
+ u/ex-arman68 avatar
+ex-arman68
+OP
+•
+3d ago
+According to my calculations, the max context you can get with iQ2_M is around 64k with 16GB VRAM GPU. I am not sure how you are able to reach 256k context with iQ3_XS which is even larger.
+
+11 more replies
+ u/Soactuaries avatar
+u/Soactuaries
+•
+Promoted
+ 
+Actuaries are solving problems around the world every single day. Learn how you can lead a career with impact.
+Sign Up
+soa.org
+Clickable image which will reveal the video player: Actuaries are solving problems around the world every single day. Learn how you can lead a career with impact. 
+Collapse video player
+ 
+
+0:00 / 0:00
+
+
+
+
+ u/fatboy93 avatar
+fatboy93
+•
+3d ago
+I love how you put the memory used tables at different contexts here. That is something I sorely miss from others, and makes it a guessing game if I should go for a larger quant or a smaller quant, and what amount of stuff I can throw at the model.
+
+ u/ex-arman68 avatar
+ex-arman68
+OP
+•
+3d ago
+Thank you, that was the point
+ u/Extra-Library-5258 avatar
+Extra-Library-5258
+•
+3d ago
+Thanks @ex-arman68!
+
+On M5 Max 128GB. MTP decode speed is legit... 37 tok/s at 1K and 33 tok/s at 16K on Q8_0, which is 2x+ what I get with the same model on oMLX.
+
+Heads up if you're on Apple Silicon doing long context: llama.cpp's Metal prefill is the bottleneck. At 64K it takes almost 4 minutes to first token, and 128K straight up times out. oMLX handles 128K prefill in ~5.5 min. The Metal backend just isn't as optimized for the big batch matmuls during prefill.
+
+So if you're on a Mac: great for short/medium context, but don't expect miracles past 64K. Also, froggeric's GGUFs are confirmed broken (every token is <|box_end|>), use RDson or Radamanthys11 instead.
+
+Turbo4 KV is NOT in this PR. Use q8_0 or q4_0.
+
+12 more replies
+ u/DHasselhoff77 avatar
+DHasselhoff77
+•
+3d ago
+Can't get it to work on CUDA. I built the linked PR branch but after prompt processing no tokens are produced even though the GPU runs at 100% load. This is what gets printed:
+
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = -1
+srv  get_availabl: updating prompt cache
+srv          load:  - looking for better prompt, base f_keep = -1.000, sim = 0.000
+srv        update:  - cache state: 0 prompts, 0.000 MiB (limits: 8192.000 MiB, 30208 tokens, 8589934592 est)
+srv  get_availabl: prompt cache update took 0.01 ms
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> ?min-p -> ?xtc -> temp-ext -> dist 
+slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+slot update_slots: id  0 | task 0 | new prompt, n_ctx_slot = 30208, n_keep = 0, task.n_tokens = 11
+slot update_slots: id  0 | task 0 | n_tokens = 0, memory_seq_rm [0, end)
+slot update_slots: id  0 | task 0 | prompt processing progress, n_tokens = 7, batch.n_tokens = 7, progress = 0.636364
+slot update_slots: id  0 | task 0 | n_tokens = 7, memory_seq_rm [7, end)
+slot init_sampler: id  0 | task 0 | init sampler, took 0.01 ms, tokens: text = 11, total = 11
+slot update_slots: id  0 | task 0 | prompt processing done, n_tokens = 11, batch.n_tokens = 4
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+And freezes there.
+
+Tried the "IQ3_M" quant. Also the PR branch doesn't seem to have "turbo4" support that was recommended by the OP: Unsupported cache type: turbo4.
+
+Command tried:
+
+      ${mtp-llama-server} --model Qwen3.6/Qwen3.6-27B-IQ3_M-mtp.gguf
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      -c 30000
+      --jinja --temp 0.6 --top-k 20 --top-p 0.95 --min-p 0.0
+      --presence_penalty 0.0
+      --spec-type mtp --spec-draft-n-max 4
+      --chat-template-kwargs '{"preserve_thinking": true}'
+      --parallel 1
+      --chat-template-kwargs '{"enable_thinking":true}'
+      --chat-template-file Qwen3.6/chat_template.jinja
+
+6 more replies
+New to Reddit?
+Create your account and connect with a world of communities.
+ 
+Continue with Email
+Continue with Phone Number
+By continuing, you agree to our User Agreement and acknowledge that you understand the Privacy Policy.
+Related Answers Section
+Related Answers
+Optimal hardware for Qwen 3.6 27B MTP
+Parallel computing solutions for Qwen 3.6
+Understanding MTP in relation to Qwen models
+Best practices for hosting LLaMA locally
+How to optimize LLaMA for specific tasks
+More posts you may like
+Qwen 3.6 27B MTP on v100 32GB: 54 t/s
+
+r/LocalLLaMA
+•
+4d ago
+Qwen 3.6 27B MTP on v100 32GB: 54 t/s
+79 upvotes · 42 comments
+ u/nyxcosmetics avatar
+nyxcosmetics
+•
+Promoted
+ 
+Try Lip IV Hydrating Gloss Stain. Soaking Wet Shine, Long Lasting Stain. Up to 12 Hour Hydration.
+ Thumbnail image: Try Lip IV Hydrating Gloss Stain. Soaking Wet Shine, Long Lasting Stain. Up to 12 Hour Hydration.
+ulta.com
+Shop Now
+Qwen3.6-27B with MTP grafted on Unsloth UD XL: 2.5x throughput via unmerged llama.cpp PR
+
+r/LocalLLaMA
+•
+3d ago
+Qwen3.6-27B with MTP grafted on Unsloth UD XL: 2.5x throughput via unmerged llama.cpp PR
+170 upvotes · 86 comments
+Built a Chrome extension that runs EmbeddingGemma-300M (q4) in-browser to score HN/Reddit/X feeds — no backend, full fine-tuning loop
+
+r/LocalLLaMA
+•
+2mo ago
+Built a Chrome extension that runs EmbeddingGemma-300M (q4) in-browser to score HN/Reddit/X feeds — no backend, full fine-tuning loop
+r/LocalLLaMA - Built a Chrome extension that runs EmbeddingGemma-300M (q4) in-browser to score HN/Reddit/X feeds — no backend, full fine-tuning loop
+0:55
+6 upvotes · 1 comment
+MTP - The proofs in the puddin! Using it with Qwen3.6-27b
+
+r/LocalLLaMA
+•
+3d ago
+MTP - The proofs in the puddin! Using it with Qwen3.6-27b
+r/LocalLLaMA - MTP - The proofs in the puddin! Using it with Qwen3.6-27b
+13 comments
+Need advice: Qwen3.6 27B MTP or 35B-A3B MoE MTP on 16GB VRAM RTX 5080)?
+
+r/LocalLLaMA
+•
+3d ago
+Need advice: Qwen3.6 27B MTP or 35B-A3B MoE MTP on 16GB VRAM RTX 5080)?
+4 upvotes · 38 comments
+Qwen3.6 27B NVFP4 + MTP on a single RTX 5090: 200k context working in vLLM
+
+r/LocalLLaMA
+•
+3d ago
+Qwen3.6 27B NVFP4 + MTP on a single RTX 5090: 200k context working in vLLM
+75 upvotes · 66 comments
+How to run Qwen3.5-27B with speculative decoding with llama.cpp llama-server?
+
+r/LocalLLaMA
+•
+26d ago
+How to run Qwen3.5-27B with speculative decoding with llama.cpp llama-server?
+5 upvotes · 14 comments
+200+ TPS on Qwen3.6-27B and 35B-A3B with consumer hardware (RTX 3090s) - method provided!
+
+r/LocalLLM
+•
+7d ago
+200+ TPS on Qwen3.6-27B and 35B-A3B with consumer hardware (RTX 3090s) - method provided!
+31 upvotes · 21 comments
+Qwen 3.6 27b Q4.0 MTP GGUF
+
+r/LocalLLaMA
+•
+4d ago
+Qwen 3.6 27b Q4.0 MTP GGUF
+24 upvotes · 21 comments
+An Overnight Stack for Qwen3.6–27B: 85 TPS, 125K Context, Vision — on One RTX 3090 | by Wasif Basharat | Apr, 2026
+
+r/LocalLLaMA
+•
+16d ago
+An Overnight Stack for Qwen3.6–27B: 85 TPS, 125K Context, Vision — on One RTX 3090 | by Wasif Basharat | Apr, 2026
+r/LocalLLaMA - An Overnight Stack for Qwen3.6–27B: 85 TPS, 125K Context, Vision — on One RTX 3090 | by Wasif Basharat | Apr, 2026
+medium
+311 upvotes · 186 comments
+Running Qwen3.5 / Qwen3.6 with NextN MTP (Multi-Token Prediction) speculative decode in llama.cpp — single RTX 3090 Ti GPU guide
+
+r/LocalLLaMA
+•
+2d ago
+Running Qwen3.5 / Qwen3.6 with NextN MTP (Multi-Token Prediction) speculative decode in llama.cpp — single RTX 3090 Ti GPU guide
+42 upvotes · 25 comments
+How to use Llama-swap, Open WebUI, Semantic Router Filter, and Qwen3.5 to its fullest
+
+r/LocalLLM
+•
+2mo ago
+How to use Llama-swap, Open WebUI, Semantic Router Filter, and Qwen3.5 to its fullest
+r/LocalLLM - How to use Llama-swap, Open WebUI, Semantic Router Filter, and Qwen3.5 to its fullest
+38 upvotes · 15 comments
+As MTP prepares to land in llama.cpp, Models that support MTP
+
+r/LocalLLaMA
+•
+5d ago
+As MTP prepares to land in llama.cpp, Models that support MTP
+113 upvotes · 55 comments
+Qwen3.6-27B-INT4 clocking 100 tps with 256k context length on 1x RTX 5090 via vllm 0.19
+
+r/LocalLLaMA
+•
+13d ago
+Qwen3.6-27B-INT4 clocking 100 tps with 256k context length on 1x RTX 5090 via vllm 0.19
+252 upvotes · 102 comments
+Get faster qwen 3.6 27b
+
+r/LocalLLaMA
+•
+3d ago
+Get faster qwen 3.6 27b
+169 upvotes · 76 comments
+Qwen3.6-27B at ~80 tps with 218k context window on 1x RTX 5090 served by vllm 0.19
+
+r/LocalLLaMA
+•
+14d ago
+Qwen3.6-27B at ~80 tps with 218k context window on 1x RTX 5090 served by vllm 0.19
+336 upvotes · 133 comments
+Debug Android apps offline - fast paced llama chatbot - GGUF support - APK exporting/installation - In app preview - easy to use editor
+
+r/vibecoding
+•
+2mo ago
+Debug Android apps offline - fast paced llama chatbot - GGUF support - APK exporting/installation - In app preview - easy to use editor
+r/vibecoding - Debug Android apps offline - fast paced llama chatbot - GGUF support - APK exporting/installation - In app preview - easy to use editor
+youtube
+1 upvote
+First Level Release-- Controlling and Designing with Claude 4.6 OPUS in Fusion via Local MCP
+
+r/Fusion360
+•
+1mo ago
+First Level Release-- Controlling and Designing with Claude 4.6 OPUS in Fusion via Local MCP
+20 comments
+Open source Swift library for on-device speech AI — ASR that beats Whisper Large v3, full-duplex speech-to-speech, native async/await
+
+r/swift
+•
+2mo ago
+Open source Swift library for on-device speech AI — ASR that beats Whisper Large v3, full-duplex speech-to-speech, native async/await
+16 upvotes · 4 comments
+Qwen 3.5 27B what tps are you managing?
+
+r/StrixHalo
+•
+2mo ago
+Qwen 3.5 27B what tps are you managing?
+6 upvotes · 23 comments
+Run Qwen3.6-27B at up to 2x throughput on a single RTX 3090
+
+r/LocalLLM
+•
+12d ago
+Run Qwen3.6-27B at up to 2x throughput on a single RTX 3090
+r/LocalLLM - Run Qwen3.6-27B at up to 2x throughput on a single RTX 3090
+github
+5 upvotes · 2 comments
+I fine-tuned Qwen3.5-27B with 35k examples into an AI companion - after 2,000 conversations here’s what actually matters for personality
+
+r/LocalLLaMA
+•
+2mo ago
+I fine-tuned Qwen3.5-27B with 35k examples into an AI companion - after 2,000 conversations here’s what actually matters for personality
+51 upvotes · 59 comments
+I forked chrome and build a browser for agents with Claude Code (Benchmarked 90% on Mind2Web) [Open Source]
+
+r/ClaudeCode
+•
+2mo ago
+I forked chrome and build a browser for agents with Claude Code (Benchmarked 90% on Mind2Web) [Open Source]
+r/ClaudeCode - I forked chrome and build a browser for agents with Claude Code (Benchmarked 90% on Mind2Web) [Open Source]
+1:35
+11 upvotes · 10 comments
+Quality (Intelligence) testing on MTP
+
+r/LocalLLaMA
+•
+3d ago
+Quality (Intelligence) testing on MTP
+14 comments
+I built WiretapKMP, a Kotlin Multiplatform network inspector and mocking library (all on device without network proxy).
+
+r/androiddev
+•
+1mo ago
+I built WiretapKMP, a Kotlin Multiplatform network inspector and mocking library (all on device without network proxy).
+r/androiddev - I built WiretapKMP, a Kotlin Multiplatform network inspector and mocking library (all on device without network proxy).
+VIEW POST IN
+
+繁體中文
+Tiếng Việt
+简体中文
+Português (Brasil)
+Русский
+日本語
+Français
+हिन्दी
+See more
+Community Info Section
+r/LocalLLaMA
+Llama
+ Join
+LocalLlama
+Subreddit to discuss locally hostable AI
+Public
+Reddit Rules
+Privacy Policy
+User Agreement
+Your Privacy Choices
+Accessibility
+Reddit, Inc. © 2026. All rights reserved.
+
+Collapse Navigation
+Home
+Popular
+News
+Explore
+RESOURCES
+About Reddit
+Advertise
+Developer Platform
+Reddit Pro
+BETA
+Help
+Blog
+Careers
+Press
+Best of Reddit
+Reddit Rules
+Privacy Policy
+User Agreement
+Your Privacy Choices
+Accessibility
+Reddit, Inc. © 2026. All rights reserved.
+Skip to main content
+2.5x faster inference with Qwen 3.6 27B using MTP - Finally a viable option for local agentic coding - 262k context on 48GB - Fixed chat template - Drop-in OpenAI and Anthropic API endpoints : r/LocalLLaMA
+ 
+
+r/LocalLLaMA
+
+ 
+Get App
+Log In
+
+Expand user menu
+Skip to Navigation Skip to Right Sidebar
+ 
+Back
+ 
+Go to LocalLLaMA
+r/LocalLLaMA
+•
+3d ago
+ex-arman68
+
+2.5x faster inference with Qwen 3.6 27B using MTP - Finally a viable option for local agentic coding - 262k context on 48GB - Fixed chat template - Drop-in OpenAI and Anthropic API endpoints
+
+Resources
+2026-05-07 edit: I have updated the hardware based recommendations with more focus on quality. I do not recommend q4_0 KV cache anymore beyond 64k context. After multiple rounds of testing with the different size quants, it appears 3 is the optimal number for draft speculative decoding. The fastest and best quality quant is q8_0-mtp. F16, which I have also uploaded is actually better but ultra slow (6x slower than q8_0). Many keep saying 8bit is virtually lossless compared to 16bit, and 6bit almost as good as 8bit, but this is simply not true: time and time again I have noticed huge differences in quality and correctness between 8bit and 16bit versions of various models.
+The recent PR to llama.cpp bring MTP support to Qwen 3.6 27B. This uses the built-in tensor layers for speculative decoding. None of the existing GGUF have it, as they need to be converted with this PR.
+
+I have tested it locally on my mac M2 Max 96GB, and the results are amazing: 2.5x speed increase, bringing it to 28 tok/s!
+
+I have converted the most useful quants and uploaded them to HF. Even if you are using apple silicon, you should use those instead of MLX. You can download them here:
+
+https://huggingface.co/froggeric/Qwen3.6-27B-MTP-GGUF
+
+This also includes 7 fixes I made to the original jinja chat template, due to vLLM specificity which broke in other tools:
+
+https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates
+
+For now, you will need to compile your own version of llama.cpp to use them. It is fairly simple to do:
+
+git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
+cd llama.cpp
+git fetch origin pull/22673/head:mtp-pr && git checkout mtp-pr
+
+cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target llama-cli llama-server
+Then to start serving with the API endpoint, use a command similar to:
+
+llama-server -m Qwen3.6-27B-Q5_K_M-mtp.gguf \
+  --spec-type mtp --spec-draft-n-max 3 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  -np 1 -c 262144 --temp 0.7 --top-k 20 -ngl 99 --port 8081
+Vision currently crashes llama.cpp when used alongside MTP. Reported 2026-05-06 in the current PR.
+That's it. Three optimizations in one command:
+
+Flag	What it does	Impact
+--spec-type mtp --spec-draft-n-max 3	Multi-Token Prediction (built into the model)	2.5x faster generation
+--cache-type-k q8_0 --cache-type-v q8_0	8-bit KV cache (instead of 16-bit)	Half the KV memory, negligible quality loss
+-c 262144	262K context window	Full native context on 48 GB Mac with q8_0 KV
+Adjust -m, -c, and --cache-type-k/v for your hardware, according to the tables below.
+
+Here are my recommendations based on your hardware:
+
+Apple Silicon
+
+Qwen3.6-27B is a hybrid model — only 16 of 65 layers use KV cache (verified). The other 48 are linear attention (fixed 898 MiB recurrent state). KV memory is ~4× less than a standard dense model. Runtimes that don't handle this (e.g. vllm) allocate KV for all 65 layers and show much higher memory usage.
+
+Numbers below are total memory used (model + KV cache + 0.9 GB recurrent state). Must leave ≥ 8 GB for macOS (16 GB Macs excepted).
+
+RAM	Quant	KV cache	Max context	Total used	Vision
+16 GB	IQ2_M	q8_0	42K	12.0 GB	✗
+24 GB	IQ3_M		46K	16.0 GB	✗
+24 GB	IQ3_M	q8_0	91K	16.0 GB	✗
+32 GB	Q5_K_M		74K	24.0 GB	✗
+32 GB	Q5_K_M	q8_0	147K	24.0 GB	✗
+32 GB	Q4_K_M		99K	24.0 GB	✓
+48 GB	Q6_K		262K	39.7 GB	✓
+48 GB	Q8_0		173K	40.0 GB	✓
+48 GB	Q8_0	q8_0	262K	37.3 GB	✓
+64 GB	Q8_0		262K	45.8 GB	✓
+96 GB	Q8_0		262K	45.8 GB	✓
+NVIDIA GPU
+
+Same model memory as Apple Silicon, plus ~1 GB CUDA overhead.
+
+VRAM	Quant	KV cache	Max context	Total VRAM used	Vision
+12 GB	IQ2_M	q8_0	11K	12.0 GB	✗
+16 GB	IQ3_M		30K	16.0 GB	✗
+16 GB	IQ3_M	q8_0	60K	16.0 GB	✗
+24 GB	Q4_K_M		83K	24.0 GB	✓
+24 GB	Q4_K_M	q8_0	167K	24.0 GB	✓
+24 GB	Q5_K_M		58K	24.0 GB	✗
+48 GB	Q6_K		262K	40.7 GB	✓
+48 GB	Q8_0		262K	46.8 GB	✓
+80 GB	Q8_0		262K	46.8 GB	✓
+16 GB Mac: IQ2_M/q8_0 — 42K text-only. No vision.
+
+24 GB Mac: IQ3_M — 46K (f16 KV) or 91K (q8_0). Vision at 32–65K.
+
+32 GB Mac: Q5_K_M — 74K text-only (f16 KV), 147K (q8_0). Q4_K_M for vision at 99K.
+
+48 GB Mac: Q6_K/f16 KV — 262K with vision. Q8_0/q8_0 KV for 262K at higher model quality.
+
+64 GB+ Mac: Q8_0/f16 KV — 262K with vision. Maximum quality at practical speed.
+
+12 GB GPU: IQ2_M/q8_0 — 11K. Very limited, no vision.
+
+16 GB GPU: IQ3_M — 30K (f16 KV) or 60K (q8_0). No vision.
+
+24 GB GPU: Q4_K_M — 83K with vision (f16 KV). Q5_K_M — 58K text-only (f16 KV), 116K (q8_0).
+
+48 GB+ GPU: Q6_K/f16 KV — 262K with vision. Q8_0 for max quality.
+Leave KV cache at f16 (blank column) for best quality. Use q8_0 KV only when f16 doesn't give enough context. q4_0 KV should not exceed 64K context.
+
+Vision adds ~0.9 GB for mmproj. macOS needs ≥ 8 GB for itself (16 GB Macs excepted — use ~4 GB). You can increase available memory by raising the wired memory limit, e.g. for a 96 GB Mac: sudo sysctl iogpu.wired_limit_mb=90112 (88 GB). NVIDIA reserves ~1 GB for CUDA.
+ 
+Upvote
+1.2K
+
+Downvote
+ 
+367
+Go to comments
+
+
+2
+
+Share
+ u/InworldAI avatar
+InworldAI
+•
+Promoted
+ 
+Inworld Realtime TTS just ranked #1 on Artificial Analysis, beating ElevenLabs, Google, and MiniMax.
+Sign Up
+platform.inworld.ai
+ Thumbnail image: Inworld Realtime TTS just ranked #1 on Artificial Analysis, beating ElevenLabs, Google, and MiniMax.
+ 
+Sort by:
+
+Best
+ 
+Search Comments
+Expand comment search
+Comments Section
+ u/WithoutReason1729 avatar
+WithoutReason1729
+MOD
+•
+3d ago
+•
+Stickied comment
+Your post is getting popular and we just featured it on our Discord! Come check it out!
+
+You've also been given a special flair for your contribution. We appreciate your post!
+
+I am a bot and this action was performed automatically.
+ u/ResidentPositive4122 avatar
+ResidentPositive4122
+•
+3d ago
+Profile Badge for the Achievement Top 1% Commenter Top 1% Commenter
+Legend.
+
+Man, these past 6 months have brought us more than the last 2 years combined. On the one hand we've seen really powerful open models (glms, kimis, deepseeks, minimaxs, mimos, etc) and more importantly for this community, really useful "good enough" truly local models in gemmas and qwens.
+
+Now we're seeing lots of inference improvements that can be ran on consumer hardware, and that's what we mostly care about. Insane progress in a very short timespan.
+
+SmartCustard9944
+•
+3d ago
+•
+Edited 3d ago
+Better inference and intelligence
+-> Better and faster contributions
+Go to 1
+This loop gets better and better with time. This feels like a self improving intelligence, just that it’s hybrid (AI + human in the loop) and highly distributed and parallel (many humans).
+
+13 more replies
+PrzemChuck
+•
+3d ago
+There are decades where nothing happens; and there are weeks where decades happen. Vladimir Ilyich Lenin
+
+ u/Eisenstein avatar
+Eisenstein
+•
+3d ago
+Actual quote: "There are years, centuries, in which nothing happens, and there are days, like yesterday, into which a whole lifetime is compressed." -Adriaan Schade van Westrum
+
+Misattributed to Lenin. He wasn't actually that witty and mostly just wrote about Communist ideology.
+
+2 more replies
+ 
+3 more replies
+gordi555
+•
+3d ago
+On RTX Pro 6000 MaxQ I got/get...
+
+qwen 3.6 2.7B Q8 = 36 tokens per second
+qwen 3.6 2.7B Q8 (mtp) = 78 tokens per second
+
+I've lost about 20% prompt processing but these generation speeds are massively worth it.
+
+Output looks exactly the same in terms of quality.
+
+Amazing!
+
+switchandplay
+•
+3d ago
+I believe MTP, like other current speculative decoding techniques, will not reduce output quality- the ‘primary model’ is still in control of the final token emitted. Speculative decoding just speeds up generation when the speculator and the primary model are at a consensus. This happens often in coding environments, which is why we see a relatively higher speedup in this domain. In the case of MTP, the primary model is also the speculator, but the exact same verification flows ensue for tokens. In vLLM (and transformers I think), the model emits a token and the integrated MTP system suggests the next n (1-5 ish, based on config). Then the model verifies them.
+
+4 more replies
+ u/OpenAI avatar
+u/OpenAI
+•
+Promoted
+ 
+Faster prototyping shortens feedback loops. Codex helps teams get there sooner. Try Codex for Free.
+Sign Up
+chatgpt.com
+Clickable image which will reveal the video player: Faster prototyping shortens feedback loops. Codex helps teams get there sooner. Try Codex for Free. 
+Collapse video player
+ 
+
+0:00 / 0:00
+
+
+
+
+jacek2023
+•
+3d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+When was turbo3/turbo4 merged? Or is this part of MTP PR?
+
+pmttyji
+•
+3d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+When was turbo3/turbo4 merged?
+Custom fork probably.
+
+llama.cpp Links related to TurboQuant here to track progress.
+
+https://github.com/ggml-org/llama.cpp/issues/20977
+https://github.com/ggml-org/llama.cpp/pull/21089
+https://github.com/ggml-org/llama.cpp/discussions/20969
+
+rerri
+•
+3d ago
+But if you look at OP's compile instructions, it doesn't seem like TurboQuant PR is included.
+
+5 more replies
+ 
+2 more replies
+ 
+6 more replies
+sagiroth
+•
+3d ago
+Profile Badge for the Achievement Top 1% Commenter Top 1% Commenter
+It's great and I appreciate all the work the community is doing, but its so draining to keep up with this! :D
+
+ u/Several-Tax31 avatar
+Several-Tax31
+•
+3d ago
+I think we need to do a better job in this community on tracking the llama.cpp optimizations and which one works with which model etc. All information is so fragmented among the posts. I have a hard time myself. 
+
+clofresh
+•
+3d ago
+If only there were a magic technology that could take large quantities of text and turn it into smaller, more meaningful quantities of text!
+
+1 more reply
+ 
+3 more replies
+ 
+5 more replies
+ u/yes_i_tried_google avatar
+yes_i_tried_google
+•
+3d ago
+Same success here. RTX 3090 ti. Though finding draft max 4 gives best success for me.
+
+iq4 with MTP enabled (custom build from open PRs)
+Qwen 3.6 27B. Full 256k ctx, IQ4_XS. q4/q4. 100 tok/sec
+
+Qwen 3.6 35B. 200k ctx, IQ4_XS. q4/q4. 200 tok/sec
+
+https://huggingface.co/localweights/Qwen3.6-27B-MTP-IQ4_XS-GGUF
+
+https://huggingface.co/localweights/Qwen3.6-35B-A3B-MTP-IQ4_XS-GGUF
+
+ u/Pineapple_King avatar
+Pineapple_King
+•
+3d ago
+How did you get it to run? OPs compile instructions dont work on nvidia or at all. turboquant missing, no mtp
+
+ u/splice42 avatar
+splice42
+•
+3d ago
+OP's quantized models shit themselves if you try to run them on a CUDA compiled llama.cpp and turboquant is not available on the pulled/patched llama.cpp version. So OP is actually just kinda vibing it all and it's not a very systematic or complete set of instructions.
+
+If you pull the code but use the standard CUDA compilation command line (available in the build guide for llama.cpp), you'll get a binary that works. But you'll need another model than OP's for it to work. I used https://huggingface.co/eepos/Qwen3.6-27B-MTP-Q6_K-GGUF and it works fine. Don't use the turboquant kv. You may need to set -np 1 for it to run properly since MTP decoding doesn't support parallel requests in this version of llama.cpp but mine tries to default to 4.
+
+However, no vision model seems to work correct, all just crash and dump core. So this is early days for MTP in llama and there still needs to be some work.
+
+7 more replies
+ u/yes_i_tried_google avatar
+yes_i_tried_google
+•
+3d ago
+I’ll publish my steps tonight and reply. Didn’t follow OPs steps, just coincidence I got it running yesterday on my 3090 and almost imploded when I saw the near x3 increase in speed.
+
+Above models are public now too, contain some instructions
+
+4 more replies
+ u/ex-arman68 avatar
+ex-arman68
+OP
+•
+3d ago
+I made a mistake by including turboquants recommendations, and forgot to include the build instructions for it. The PR is currently too unstable and uncertain. I have removed my turboquants recommendations, and replaced them with q4_0 for the KV cache.
+
+4 more replies
+ 
+1 more reply
+ 
+6 more replies
+VergeOfTranscendence
+•
+3d ago
+Thanks for the models, I will definitely give them a try. But I have a question that others here might be able to answer. Is this better than the Qwen 3.6 Dflash models? Also, I use most of the times iq3_XS models and usually fit 256k context in 16gb VRAM GPU, so I wonder if all your quants can do 256k (if we don't use mmproj).
+
+AvidCyclist250
+•
+3d ago
+Whoever downovted you is clueless. You're asking the right question.
+ u/ex-arman68 avatar
+ex-arman68
+OP
+•
+3d ago
+According to my calculations, the max context you can get with iQ2_M is around 64k with 16GB VRAM GPU. I am not sure how you are able to reach 256k context with iQ3_XS which is even larger.
+
+11 more replies
+ u/Soactuaries avatar
+u/Soactuaries
+•
+Promoted
+ 
+Actuaries are solving problems around the world every single day. Learn how you can lead a career with impact.
+Sign Up
+soa.org
+Clickable image which will reveal the video player: Actuaries are solving problems around the world every single day. Learn how you can lead a career with impact. 
+Collapse video player
+ 
+
+0:00 / 0:00
+
+
+
+
+ u/fatboy93 avatar
+fatboy93
+•
+3d ago
+I love how you put the memory used tables at different contexts here. That is something I sorely miss from others, and makes it a guessing game if I should go for a larger quant or a smaller quant, and what amount of stuff I can throw at the model.
+
+ u/ex-arman68 avatar
+ex-arman68
+OP
+•
+3d ago
+Thank you, that was the point
+ u/Extra-Library-5258 avatar
+Extra-Library-5258
+•
+3d ago
+Thanks @ex-arman68!
+
+On M5 Max 128GB. MTP decode speed is legit... 37 tok/s at 1K and 33 tok/s at 16K on Q8_0, which is 2x+ what I get with the same model on oMLX.
+
+Heads up if you're on Apple Silicon doing long context: llama.cpp's Metal prefill is the bottleneck. At 64K it takes almost 4 minutes to first token, and 128K straight up times out. oMLX handles 128K prefill in ~5.5 min. The Metal backend just isn't as optimized for the big batch matmuls during prefill.
+
+So if you're on a Mac: great for short/medium context, but don't expect miracles past 64K. Also, froggeric's GGUFs are confirmed broken (every token is <|box_end|>), use RDson or Radamanthys11 instead.
+
+Turbo4 KV is NOT in this PR. Use q8_0 or q4_0.
+
+12 more replies
+ u/DHasselhoff77 avatar
+DHasselhoff77
+•
+3d ago
+Can't get it to work on CUDA. I built the linked PR branch but after prompt processing no tokens are produced even though the GPU runs at 100% load. This is what gets printed:
+
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = -1
+srv  get_availabl: updating prompt cache
+srv          load:  - looking for better prompt, base f_keep = -1.000, sim = 0.000
+srv        update:  - cache state: 0 prompts, 0.000 MiB (limits: 8192.000 MiB, 30208 tokens, 8589934592 est)
+srv  get_availabl: prompt cache update took 0.01 ms
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> ?min-p -> ?xtc -> temp-ext -> dist 
+slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+slot update_slots: id  0 | task 0 | new prompt, n_ctx_slot = 30208, n_keep = 0, task.n_tokens = 11
+slot update_slots: id  0 | task 0 | n_tokens = 0, memory_seq_rm [0, end)
+slot update_slots: id  0 | task 0 | prompt processing progress, n_tokens = 7, batch.n_tokens = 7, progress = 0.636364
+slot update_slots: id  0 | task 0 | n_tokens = 7, memory_seq_rm [7, end)
+slot init_sampler: id  0 | task 0 | init sampler, took 0.01 ms, tokens: text = 11, total = 11
+slot update_slots: id  0 | task 0 | prompt processing done, n_tokens = 11, batch.n_tokens = 4
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+And freezes there.
+
+Tried the "IQ3_M" quant. Also the PR branch doesn't seem to have "turbo4" support that was recommended by the OP: Unsupported cache type: turbo4.
+
+Command tried:
+
+      ${mtp-llama-server} --model Qwen3.6/Qwen3.6-27B-IQ3_M-mtp.gguf
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      -c 30000
+      --jinja --temp 0.6 --top-k 20 --top-p 0.95 --min-p 0.0
+      --presence_penalty 0.0
+      --spec-type mtp --spec-draft-n-max 4
+      --chat-template-kwargs '{"preserve_thinking": true}'
+      --parallel 1
+      --chat-template-kwargs '{"enable_thinking":true}'
+      --chat-template-file Qwen3.6/chat_template.jinja
+
+6 more replies
+New to Reddit?
+Create your account and connect with a world of communities.
+ 
+Continue with Email
+Continue with Phone Number
+By continuing, you agree to our User Agreement and acknowledge that you understand the Privacy Policy.
+Related Answers Section
+Related Answers
+Optimal hardware for Qwen 3.6 27B MTP
+Parallel computing solutions for Qwen 3.6
+Understanding MTP in relation to Qwen models
+Best practices for hosting LLaMA locally
+How to optimize LLaMA for specific tasks
+More posts you may like
+Qwen 3.6 27B MTP on v100 32GB: 54 t/s
+
+r/LocalLLaMA
+•
+4d ago
+Qwen 3.6 27B MTP on v100 32GB: 54 t/s
+79 upvotes · 42 comments
+ u/nyxcosmetics avatar
+nyxcosmetics
+•
+Promoted
+ 
+Try Lip IV Hydrating Gloss Stain. Soaking Wet Shine, Long Lasting Stain. Up to 12 Hour Hydration.
+ Thumbnail image: Try Lip IV Hydrating Gloss Stain. Soaking Wet Shine, Long Lasting Stain. Up to 12 Hour Hydration.
+ulta.com
+Shop Now
+Qwen3.6-27B with MTP grafted on Unsloth UD XL: 2.5x throughput via unmerged llama.cpp PR
+
+r/LocalLLaMA
+•
+3d ago
+Qwen3.6-27B with MTP grafted on Unsloth UD XL: 2.5x throughput via unmerged llama.cpp PR
+170 upvotes · 86 comments
+Built a Chrome extension that runs EmbeddingGemma-300M (q4) in-browser to score HN/Reddit/X feeds — no backend, full fine-tuning loop
+
+r/LocalLLaMA
+•
+2mo ago
+Built a Chrome extension that runs EmbeddingGemma-300M (q4) in-browser to score HN/Reddit/X feeds — no backend, full fine-tuning loop
+r/LocalLLaMA - Built a Chrome extension that runs EmbeddingGemma-300M (q4) in-browser to score HN/Reddit/X feeds — no backend, full fine-tuning loop
+0:55
+6 upvotes · 1 comment
+MTP - The proofs in the puddin! Using it with Qwen3.6-27b
+
+r/LocalLLaMA
+•
+3d ago
+MTP - The proofs in the puddin! Using it with Qwen3.6-27b
+r/LocalLLaMA - MTP - The proofs in the puddin! Using it with Qwen3.6-27b
+13 comments
+Need advice: Qwen3.6 27B MTP or 35B-A3B MoE MTP on 16GB VRAM RTX 5080)?
+
+r/LocalLLaMA
+•
+3d ago
+Need advice: Qwen3.6 27B MTP or 35B-A3B MoE MTP on 16GB VRAM RTX 5080)?
+4 upvotes · 38 comments
+Qwen3.6 27B NVFP4 + MTP on a single RTX 5090: 200k context working in vLLM
+
+r/LocalLLaMA
+•
+3d ago
+Qwen3.6 27B NVFP4 + MTP on a single RTX 5090: 200k context working in vLLM
+75 upvotes · 66 comments
+How to run Qwen3.5-27B with speculative decoding with llama.cpp llama-server?
+
+r/LocalLLaMA
+•
+26d ago
+How to run Qwen3.5-27B with speculative decoding with llama.cpp llama-server?
+5 upvotes · 14 comments
+200+ TPS on Qwen3.6-27B and 35B-A3B with consumer hardware (RTX 3090s) - method provided!
+
+r/LocalLLM
+•
+7d ago
+200+ TPS on Qwen3.6-27B and 35B-A3B with consumer hardware (RTX 3090s) - method provided!
+31 upvotes · 21 comments
+Qwen 3.6 27b Q4.0 MTP GGUF
+
+r/LocalLLaMA
+•
+4d ago
+Qwen 3.6 27b Q4.0 MTP GGUF
+24 upvotes · 21 comments
+An Overnight Stack for Qwen3.6–27B: 85 TPS, 125K Context, Vision — on One RTX 3090 | by Wasif Basharat | Apr, 2026
+
+r/LocalLLaMA
+•
+16d ago
+An Overnight Stack for Qwen3.6–27B: 85 TPS, 125K Context, Vision — on One RTX 3090 | by Wasif Basharat | Apr, 2026
+r/LocalLLaMA - An Overnight Stack for Qwen3.6–27B: 85 TPS, 125K Context, Vision — on One RTX 3090 | by Wasif Basharat | Apr, 2026
+medium
+311 upvotes · 186 comments
+Running Qwen3.5 / Qwen3.6 with NextN MTP (Multi-Token Prediction) speculative decode in llama.cpp — single RTX 3090 Ti GPU guide
+
+r/LocalLLaMA
+•
+2d ago
+Running Qwen3.5 / Qwen3.6 with NextN MTP (Multi-Token Prediction) speculative decode in llama.cpp — single RTX 3090 Ti GPU guide
+42 upvotes · 25 comments
+How to use Llama-swap, Open WebUI, Semantic Router Filter, and Qwen3.5 to its fullest
+
+r/LocalLLM
+•
+2mo ago
+How to use Llama-swap, Open WebUI, Semantic Router Filter, and Qwen3.5 to its fullest
+r/LocalLLM - How to use Llama-swap, Open WebUI, Semantic Router Filter, and Qwen3.5 to its fullest
+38 upvotes · 15 comments
+As MTP prepares to land in llama.cpp, Models that support MTP
+
+r/LocalLLaMA
+•
+5d ago
+As MTP prepares to land in llama.cpp, Models that support MTP
+113 upvotes · 55 comments
+Qwen3.6-27B-INT4 clocking 100 tps with 256k context length on 1x RTX 5090 via vllm 0.19
+
+r/LocalLLaMA
+•
+13d ago
+Qwen3.6-27B-INT4 clocking 100 tps with 256k context length on 1x RTX 5090 via vllm 0.19
+252 upvotes · 102 comments
+Get faster qwen 3.6 27b
+
+r/LocalLLaMA
+•
+3d ago
+Get faster qwen 3.6 27b
+169 upvotes · 76 comments
+Qwen3.6-27B at ~80 tps with 218k context window on 1x RTX 5090 served by vllm 0.19
+
+r/LocalLLaMA
+•
+14d ago
+Qwen3.6-27B at ~80 tps with 218k context window on 1x RTX 5090 served by vllm 0.19
+336 upvotes · 133 comments
+Debug Android apps offline - fast paced llama chatbot - GGUF support - APK exporting/installation - In app preview - easy to use editor
+
+r/vibecoding
+•
+2mo ago
+Debug Android apps offline - fast paced llama chatbot - GGUF support - APK exporting/installation - In app preview - easy to use editor
+r/vibecoding - Debug Android apps offline - fast paced llama chatbot - GGUF support - APK exporting/installation - In app preview - easy to use editor
+youtube
+1 upvote
+First Level Release-- Controlling and Designing with Claude 4.6 OPUS in Fusion via Local MCP
+
+r/Fusion360
+•
+1mo ago
+First Level Release-- Controlling and Designing with Claude 4.6 OPUS in Fusion via Local MCP
+20 comments
+Open source Swift library for on-device speech AI — ASR that beats Whisper Large v3, full-duplex speech-to-speech, native async/await
+
+r/swift
+•
+2mo ago
+Open source Swift library for on-device speech AI — ASR that beats Whisper Large v3, full-duplex speech-to-speech, native async/await
+16 upvotes · 4 comments
+Qwen 3.5 27B what tps are you managing?
+
+r/StrixHalo
+•
+2mo ago
+Qwen 3.5 27B what tps are you managing?
+6 upvotes · 23 comments
+Run Qwen3.6-27B at up to 2x throughput on a single RTX 3090
+
+r/LocalLLM
+•
+12d ago
+Run Qwen3.6-27B at up to 2x throughput on a single RTX 3090
+r/LocalLLM - Run Qwen3.6-27B at up to 2x throughput on a single RTX 3090
+github
+5 upvotes · 2 comments
+I fine-tuned Qwen3.5-27B with 35k examples into an AI companion - after 2,000 conversations here’s what actually matters for personality
+
+r/LocalLLaMA
+•
+2mo ago
+I fine-tuned Qwen3.5-27B with 35k examples into an AI companion - after 2,000 conversations here’s what actually matters for personality
+51 upvotes · 59 comments
+I forked chrome and build a browser for agents with Claude Code (Benchmarked 90% on Mind2Web) [Open Source]
+
+r/ClaudeCode
+•
+2mo ago
+I forked chrome and build a browser for agents with Claude Code (Benchmarked 90% on Mind2Web) [Open Source]
+r/ClaudeCode - I forked chrome and build a browser for agents with Claude Code (Benchmarked 90% on Mind2Web) [Open Source]
+1:35
+11 upvotes · 10 comments
+Quality (Intelligence) testing on MTP
+
+r/LocalLLaMA
+•
+3d ago
+Quality (Intelligence) testing on MTP
+14 comments
+I built WiretapKMP, a Kotlin Multiplatform network inspector and mocking library (all on device without network proxy).
+
+r/androiddev
+•
+1mo ago
+I built WiretapKMP, a Kotlin Multiplatform network inspector and mocking library (all on device without network proxy).
+r/androiddev - I built WiretapKMP, a Kotlin Multiplatform network inspector and mocking library (all on device without network proxy).
+VIEW POST IN
+
+繁體中文
+Tiếng Việt
+简体中文
+Português (Brasil)
+Русский
+日本語
+Français
+हिन्दी
+See more
+Community Info Section
+r/LocalLLaMA
+Llama
+ Join
+LocalLlama
+Subreddit to discuss locally hostable AI
+Public
+Reddit Rules
+Privacy Policy
+User Agreement
+Your Privacy Choices
+Accessibility
+Reddit, Inc. © 2026. All rights reserved.
+
+Collapse Navigation
+Home
+Popular
+News
+Explore
+RESOURCES
+About Reddit
+Advertise
+Developer Platform
+Reddit Pro
+BETA
+Help
+Blog
+Careers
+Press
+Best of Reddit
+Reddit Rules
+Privacy Policy
+User Agreement
+Your Privacy Choices
+Accessibility
+Reddit, Inc. © 2026. All rights reserved.
+Skip to main content
+2.5x faster inference with Qwen 3.6 27B using MTP - Finally a viable option for local agentic coding - 262k context on 48GB - Fixed chat template - Drop-in OpenAI and Anthropic API endpoints : r/LocalLLaMA
+ 
+
+r/LocalLLaMA
+
+ 
+Get App
+Log In
+
+Expand user menu
+Skip to Navigation Skip to Right Sidebar
+ 
+Back
+ 
+Go to LocalLLaMA
+r/LocalLLaMA
+•
+3d ago
+ex-arman68
+
+2.5x faster inference with Qwen 3.6 27B using MTP - Finally a viable option for local agentic coding - 262k context on 48GB - Fixed chat template - Drop-in OpenAI and Anthropic API endpoints
+
+Resources
+2026-05-07 edit: I have updated the hardware based recommendations with more focus on quality. I do not recommend q4_0 KV cache anymore beyond 64k context. After multiple rounds of testing with the different size quants, it appears 3 is the optimal number for draft speculative decoding. The fastest and best quality quant is q8_0-mtp. F16, which I have also uploaded is actually better but ultra slow (6x slower than q8_0). Many keep saying 8bit is virtually lossless compared to 16bit, and 6bit almost as good as 8bit, but this is simply not true: time and time again I have noticed huge differences in quality and correctness between 8bit and 16bit versions of various models.
+The recent PR to llama.cpp bring MTP support to Qwen 3.6 27B. This uses the built-in tensor layers for speculative decoding. None of the existing GGUF have it, as they need to be converted with this PR.
+
+I have tested it locally on my mac M2 Max 96GB, and the results are amazing: 2.5x speed increase, bringing it to 28 tok/s!
+
+I have converted the most useful quants and uploaded them to HF. Even if you are using apple silicon, you should use those instead of MLX. You can download them here:
+
+https://huggingface.co/froggeric/Qwen3.6-27B-MTP-GGUF
+
+This also includes 7 fixes I made to the original jinja chat template, due to vLLM specificity which broke in other tools:
+
+https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates
+
+For now, you will need to compile your own version of llama.cpp to use them. It is fairly simple to do:
+
+git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
+cd llama.cpp
+git fetch origin pull/22673/head:mtp-pr && git checkout mtp-pr
+
+cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target llama-cli llama-server
+Then to start serving with the API endpoint, use a command similar to:
+
+llama-server -m Qwen3.6-27B-Q5_K_M-mtp.gguf \
+  --spec-type mtp --spec-draft-n-max 3 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  -np 1 -c 262144 --temp 0.7 --top-k 20 -ngl 99 --port 8081
+Vision currently crashes llama.cpp when used alongside MTP. Reported 2026-05-06 in the current PR.
+That's it. Three optimizations in one command:
+
+Flag	What it does	Impact
+--spec-type mtp --spec-draft-n-max 3	Multi-Token Prediction (built into the model)	2.5x faster generation
+--cache-type-k q8_0 --cache-type-v q8_0	8-bit KV cache (instead of 16-bit)	Half the KV memory, negligible quality loss
+-c 262144	262K context window	Full native context on 48 GB Mac with q8_0 KV
+Adjust -m, -c, and --cache-type-k/v for your hardware, according to the tables below.
+
+Here are my recommendations based on your hardware:
+
+Apple Silicon
+
+Qwen3.6-27B is a hybrid model — only 16 of 65 layers use KV cache (verified). The other 48 are linear attention (fixed 898 MiB recurrent state). KV memory is ~4× less than a standard dense model. Runtimes that don't handle this (e.g. vllm) allocate KV for all 65 layers and show much higher memory usage.
+
+Numbers below are total memory used (model + KV cache + 0.9 GB recurrent state). Must leave ≥ 8 GB for macOS (16 GB Macs excepted).
+
+RAM	Quant	KV cache	Max context	Total used	Vision
+16 GB	IQ2_M	q8_0	42K	12.0 GB	✗
+24 GB	IQ3_M		46K	16.0 GB	✗
+24 GB	IQ3_M	q8_0	91K	16.0 GB	✗
+32 GB	Q5_K_M		74K	24.0 GB	✗
+32 GB	Q5_K_M	q8_0	147K	24.0 GB	✗
+32 GB	Q4_K_M		99K	24.0 GB	✓
+48 GB	Q6_K		262K	39.7 GB	✓
+48 GB	Q8_0		173K	40.0 GB	✓
+48 GB	Q8_0	q8_0	262K	37.3 GB	✓
+64 GB	Q8_0		262K	45.8 GB	✓
+96 GB	Q8_0		262K	45.8 GB	✓
+NVIDIA GPU
+
+Same model memory as Apple Silicon, plus ~1 GB CUDA overhead.
+
+VRAM	Quant	KV cache	Max context	Total VRAM used	Vision
+12 GB	IQ2_M	q8_0	11K	12.0 GB	✗
+16 GB	IQ3_M		30K	16.0 GB	✗
+16 GB	IQ3_M	q8_0	60K	16.0 GB	✗
+24 GB	Q4_K_M		83K	24.0 GB	✓
+24 GB	Q4_K_M	q8_0	167K	24.0 GB	✓
+24 GB	Q5_K_M		58K	24.0 GB	✗
+48 GB	Q6_K		262K	40.7 GB	✓
+48 GB	Q8_0		262K	46.8 GB	✓
+80 GB	Q8_0		262K	46.8 GB	✓
+16 GB Mac: IQ2_M/q8_0 — 42K text-only. No vision.
+
+24 GB Mac: IQ3_M — 46K (f16 KV) or 91K (q8_0). Vision at 32–65K.
+
+32 GB Mac: Q5_K_M — 74K text-only (f16 KV), 147K (q8_0). Q4_K_M for vision at 99K.
+
+48 GB Mac: Q6_K/f16 KV — 262K with vision. Q8_0/q8_0 KV for 262K at higher model quality.
+
+64 GB+ Mac: Q8_0/f16 KV — 262K with vision. Maximum quality at practical speed.
+
+12 GB GPU: IQ2_M/q8_0 — 11K. Very limited, no vision.
+
+16 GB GPU: IQ3_M — 30K (f16 KV) or 60K (q8_0). No vision.
+
+24 GB GPU: Q4_K_M — 83K with vision (f16 KV). Q5_K_M — 58K text-only (f16 KV), 116K (q8_0).
+
+48 GB+ GPU: Q6_K/f16 KV — 262K with vision. Q8_0 for max quality.
+Leave KV cache at f16 (blank column) for best quality. Use q8_0 KV only when f16 doesn't give enough context. q4_0 KV should not exceed 64K context.
+
+Vision adds ~0.9 GB for mmproj. macOS needs ≥ 8 GB for itself (16 GB Macs excepted — use ~4 GB). You can increase available memory by raising the wired memory limit, e.g. for a 96 GB Mac: sudo sysctl iogpu.wired_limit_mb=90112 (88 GB). NVIDIA reserves ~1 GB for CUDA.
+ 
+Upvote
+1.2K
+
+Downvote
+ 
+367
+Go to comments
+
+
+2
+
+Share
+ u/InworldAI avatar
+InworldAI
+•
+Promoted
+ 
+Inworld Realtime TTS just ranked #1 on Artificial Analysis, beating ElevenLabs, Google, and MiniMax.
+Sign Up
+platform.inworld.ai
+ Thumbnail image: Inworld Realtime TTS just ranked #1 on Artificial Analysis, beating ElevenLabs, Google, and MiniMax.
+ 
+Sort by:
+
+Best
+ 
+Search Comments
+Expand comment search
+Comments Section
+ u/WithoutReason1729 avatar
+WithoutReason1729
+MOD
+•
+3d ago
+•
+Stickied comment
+Your post is getting popular and we just featured it on our Discord! Come check it out!
+
+You've also been given a special flair for your contribution. We appreciate your post!
+
+I am a bot and this action was performed automatically.
+ u/ResidentPositive4122 avatar
+ResidentPositive4122
+•
+3d ago
+Profile Badge for the Achievement Top 1% Commenter Top 1% Commenter
+Legend.
+
+Man, these past 6 months have brought us more than the last 2 years combined. On the one hand we've seen really powerful open models (glms, kimis, deepseeks, minimaxs, mimos, etc) and more importantly for this community, really useful "good enough" truly local models in gemmas and qwens.
+
+Now we're seeing lots of inference improvements that can be ran on consumer hardware, and that's what we mostly care about. Insane progress in a very short timespan.
+
+SmartCustard9944
+•
+3d ago
+•
+Edited 3d ago
+Better inference and intelligence
+-> Better and faster contributions
+Go to 1
+This loop gets better and better with time. This feels like a self improving intelligence, just that it’s hybrid (AI + human in the loop) and highly distributed and parallel (many humans).
+
+13 more replies
+PrzemChuck
+•
+3d ago
+There are decades where nothing happens; and there are weeks where decades happen. Vladimir Ilyich Lenin
+
+ u/Eisenstein avatar
+Eisenstein
+•
+3d ago
+Actual quote: "There are years, centuries, in which nothing happens, and there are days, like yesterday, into which a whole lifetime is compressed." -Adriaan Schade van Westrum
+
+Misattributed to Lenin. He wasn't actually that witty and mostly just wrote about Communist ideology.
+
+2 more replies
+ 
+3 more replies
+gordi555
+•
+3d ago
+On RTX Pro 6000 MaxQ I got/get...
+
+qwen 3.6 2.7B Q8 = 36 tokens per second
+qwen 3.6 2.7B Q8 (mtp) = 78 tokens per second
+
+I've lost about 20% prompt processing but these generation speeds are massively worth it.
+
+Output looks exactly the same in terms of quality.
+
+Amazing!
+
+switchandplay
+•
+3d ago
+I believe MTP, like other current speculative decoding techniques, will not reduce output quality- the ‘primary model’ is still in control of the final token emitted. Speculative decoding just speeds up generation when the speculator and the primary model are at a consensus. This happens often in coding environments, which is why we see a relatively higher speedup in this domain. In the case of MTP, the primary model is also the speculator, but the exact same verification flows ensue for tokens. In vLLM (and transformers I think), the model emits a token and the integrated MTP system suggests the next n (1-5 ish, based on config). Then the model verifies them.
+
+4 more replies
+ u/OpenAI avatar
+u/OpenAI
+•
+Promoted
+ 
+Faster prototyping shortens feedback loops. Codex helps teams get there sooner. Try Codex for Free.
+Sign Up
+chatgpt.com
+Clickable image which will reveal the video player: Faster prototyping shortens feedback loops. Codex helps teams get there sooner. Try Codex for Free. 
+Collapse video player
+ 
+
+0:00 / 0:00
+
+
+
+
+jacek2023
+•
+3d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+When was turbo3/turbo4 merged? Or is this part of MTP PR?
+
+pmttyji
+•
+3d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+When was turbo3/turbo4 merged?
+Custom fork probably.
+
+llama.cpp Links related to TurboQuant here to track progress.
+
+https://github.com/ggml-org/llama.cpp/issues/20977
+https://github.com/ggml-org/llama.cpp/pull/21089
+https://github.com/ggml-org/llama.cpp/discussions/20969
+
+rerri
+•
+3d ago
+But if you look at OP's compile instructions, it doesn't seem like TurboQuant PR is included.
+
+5 more replies
+ 
+2 more replies
+ 
+6 more replies
+sagiroth
+•
+3d ago
+Profile Badge for the Achievement Top 1% Commenter Top 1% Commenter
+It's great and I appreciate all the work the community is doing, but its so draining to keep up with this! :D
+
+ u/Several-Tax31 avatar
+Several-Tax31
+•
+3d ago
+I think we need to do a better job in this community on tracking the llama.cpp optimizations and which one works with which model etc. All information is so fragmented among the posts. I have a hard time myself. 
+
+clofresh
+•
+3d ago
+If only there were a magic technology that could take large quantities of text and turn it into smaller, more meaningful quantities of text!
+
+1 more reply
+ 
+3 more replies
+ 
+5 more replies
+ u/yes_i_tried_google avatar
+yes_i_tried_google
+•
+3d ago
+Same success here. RTX 3090 ti. Though finding draft max 4 gives best success for me.
+
+iq4 with MTP enabled (custom build from open PRs)
+Qwen 3.6 27B. Full 256k ctx, IQ4_XS. q4/q4. 100 tok/sec
+
+Qwen 3.6 35B. 200k ctx, IQ4_XS. q4/q4. 200 tok/sec
+
+https://huggingface.co/localweights/Qwen3.6-27B-MTP-IQ4_XS-GGUF
+
+https://huggingface.co/localweights/Qwen3.6-35B-A3B-MTP-IQ4_XS-GGUF
+
+ u/Pineapple_King avatar
+Pineapple_King
+•
+3d ago
+How did you get it to run? OPs compile instructions dont work on nvidia or at all. turboquant missing, no mtp
+
+ u/splice42 avatar
+splice42
+•
+3d ago
+OP's quantized models shit themselves if you try to run them on a CUDA compiled llama.cpp and turboquant is not available on the pulled/patched llama.cpp version. So OP is actually just kinda vibing it all and it's not a very systematic or complete set of instructions.
+
+If you pull the code but use the standard CUDA compilation command line (available in the build guide for llama.cpp), you'll get a binary that works. But you'll need another model than OP's for it to work. I used https://huggingface.co/eepos/Qwen3.6-27B-MTP-Q6_K-GGUF and it works fine. Don't use the turboquant kv. You may need to set -np 1 for it to run properly since MTP decoding doesn't support parallel requests in this version of llama.cpp but mine tries to default to 4.
+
+However, no vision model seems to work correct, all just crash and dump core. So this is early days for MTP in llama and there still needs to be some work.
+
+7 more replies
+ u/yes_i_tried_google avatar
+yes_i_tried_google
+•
+3d ago
+I’ll publish my steps tonight and reply. Didn’t follow OPs steps, just coincidence I got it running yesterday on my 3090 and almost imploded when I saw the near x3 increase in speed.
+
+Above models are public now too, contain some instructions
+
+4 more replies
+ u/ex-arman68 avatar
+ex-arman68
+OP
+•
+3d ago
+I made a mistake by including turboquants recommendations, and forgot to include the build instructions for it. The PR is currently too unstable and uncertain. I have removed my turboquants recommendations, and replaced them with q4_0 for the KV cache.
+
+4 more replies
+ 
+1 more reply
+ 
+6 more replies
+VergeOfTranscendence
+•
+3d ago
+Thanks for the models, I will definitely give them a try. But I have a question that others here might be able to answer. Is this better than the Qwen 3.6 Dflash models? Also, I use most of the times iq3_XS models and usually fit 256k context in 16gb VRAM GPU, so I wonder if all your quants can do 256k (if we don't use mmproj).
+
+AvidCyclist250
+•
+3d ago
+Whoever downovted you is clueless. You're asking the right question.
+ u/ex-arman68 avatar
+ex-arman68
+OP
+•
+3d ago
+According to my calculations, the max context you can get with iQ2_M is around 64k with 16GB VRAM GPU. I am not sure how you are able to reach 256k context with iQ3_XS which is even larger.
+
+11 more replies
+ u/Soactuaries avatar
+u/Soactuaries
+•
+Promoted
+ 
+Actuaries are solving problems around the world every single day. Learn how you can lead a career with impact.
+Sign Up
+soa.org
+Clickable image which will reveal the video player: Actuaries are solving problems around the world every single day. Learn how you can lead a career with impact. 
+Collapse video player
+ 
+
+0:00 / 0:00
+
+
+
+
+ u/fatboy93 avatar
+fatboy93
+•
+3d ago
+I love how you put the memory used tables at different contexts here. That is something I sorely miss from others, and makes it a guessing game if I should go for a larger quant or a smaller quant, and what amount of stuff I can throw at the model.
+
+ u/ex-arman68 avatar
+ex-arman68
+OP
+•
+3d ago
+Thank you, that was the point
+ u/Extra-Library-5258 avatar
+Extra-Library-5258
+•
+3d ago
+Thanks @ex-arman68!
+
+On M5 Max 128GB. MTP decode speed is legit... 37 tok/s at 1K and 33 tok/s at 16K on Q8_0, which is 2x+ what I get with the same model on oMLX.
+
+Heads up if you're on Apple Silicon doing long context: llama.cpp's Metal prefill is the bottleneck. At 64K it takes almost 4 minutes to first token, and 128K straight up times out. oMLX handles 128K prefill in ~5.5 min. The Metal backend just isn't as optimized for the big batch matmuls during prefill.
+
+So if you're on a Mac: great for short/medium context, but don't expect miracles past 64K. Also, froggeric's GGUFs are confirmed broken (every token is <|box_end|>), use RDson or Radamanthys11 instead.
+
+Turbo4 KV is NOT in this PR. Use q8_0 or q4_0.
+
+12 more replies
+ u/DHasselhoff77 avatar
+DHasselhoff77
+•
+3d ago
+Can't get it to work on CUDA. I built the linked PR branch but after prompt processing no tokens are produced even though the GPU runs at 100% load. This is what gets printed:
+
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = -1
+srv  get_availabl: updating prompt cache
+srv          load:  - looking for better prompt, base f_keep = -1.000, sim = 0.000
+srv        update:  - cache state: 0 prompts, 0.000 MiB (limits: 8192.000 MiB, 30208 tokens, 8589934592 est)
+srv  get_availabl: prompt cache update took 0.01 ms
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> ?min-p -> ?xtc -> temp-ext -> dist 
+slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+slot update_slots: id  0 | task 0 | new prompt, n_ctx_slot = 30208, n_keep = 0, task.n_tokens = 11
+slot update_slots: id  0 | task 0 | n_tokens = 0, memory_seq_rm [0, end)
+slot update_slots: id  0 | task 0 | prompt processing progress, n_tokens = 7, batch.n_tokens = 7, progress = 0.636364
+slot update_slots: id  0 | task 0 | n_tokens = 7, memory_seq_rm [7, end)
+slot init_sampler: id  0 | task 0 | init sampler, took 0.01 ms, tokens: text = 11, total = 11
+slot update_slots: id  0 | task 0 | prompt processing done, n_tokens = 11, batch.n_tokens = 4
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+And freezes there.
+
+Tried the "IQ3_M" quant. Also the PR branch doesn't seem to have "turbo4" support that was recommended by the OP: Unsupported cache type: turbo4.
+
+Command tried:
+
+      ${mtp-llama-server} --model Qwen3.6/Qwen3.6-27B-IQ3_M-mtp.gguf
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      -c 30000
+      --jinja --temp 0.6 --top-k 20 --top-p 0.95 --min-p 0.0
+      --presence_penalty 0.0
+      --spec-type mtp --spec-draft-n-max 4
+      --chat-template-kwargs '{"preserve_thinking": true}'
+      --parallel 1
+      --chat-template-kwargs '{"enable_thinking":true}'
+      --chat-template-file Qwen3.6/chat_template.jinja
+
+6 more replies
+New to Reddit?
+Create your account and connect with a world of communities.
+ 
+Continue with Email
+Continue with Phone Number
+By continuing, you agree to our User Agreement and acknowledge that you understand the Privacy Policy.
+Related Answers Section
+Related Answers
+Optimal hardware for Qwen 3.6 27B MTP
+Parallel computing solutions for Qwen 3.6
+Understanding MTP in relation to Qwen models
+Best practices for hosting LLaMA locally
+How to optimize LLaMA for specific tasks
+More posts you may like
+Qwen 3.6 27B MTP on v100 32GB: 54 t/s
+
+r/LocalLLaMA
+•
+4d ago
+Qwen 3.6 27B MTP on v100 32GB: 54 t/s
+79 upvotes · 42 comments
+ u/nyxcosmetics avatar
+nyxcosmetics
+•
+Promoted
+ 
+Try Lip IV Hydrating Gloss Stain. Soaking Wet Shine, Long Lasting Stain. Up to 12 Hour Hydration.
+ Thumbnail image: Try Lip IV Hydrating Gloss Stain. Soaking Wet Shine, Long Lasting Stain. Up to 12 Hour Hydration.
+ulta.com
+Shop Now
+Qwen3.6-27B with MTP grafted on Unsloth UD XL: 2.5x throughput via unmerged llama.cpp PR
+
+r/LocalLLaMA
+•
+3d ago
+Qwen3.6-27B with MTP grafted on Unsloth UD XL: 2.5x throughput via unmerged llama.cpp PR
+170 upvotes · 86 comments
+Built a Chrome extension that runs EmbeddingGemma-300M (q4) in-browser to score HN/Reddit/X feeds — no backend, full fine-tuning loop
+
+r/LocalLLaMA
+•
+2mo ago
+Built a Chrome extension that runs EmbeddingGemma-300M (q4) in-browser to score HN/Reddit/X feeds — no backend, full fine-tuning loop
+r/LocalLLaMA - Built a Chrome extension that runs EmbeddingGemma-300M (q4) in-browser to score HN/Reddit/X feeds — no backend, full fine-tuning loop
+0:55
+6 upvotes · 1 comment
+MTP - The proofs in the puddin! Using it with Qwen3.6-27b
+
+r/LocalLLaMA
+•
+3d ago
+MTP - The proofs in the puddin! Using it with Qwen3.6-27b
+r/LocalLLaMA - MTP - The proofs in the puddin! Using it with Qwen3.6-27b
+13 comments
+Need advice: Qwen3.6 27B MTP or 35B-A3B MoE MTP on 16GB VRAM RTX 5080)?
+
+r/LocalLLaMA
+•
+3d ago
+Need advice: Qwen3.6 27B MTP or 35B-A3B MoE MTP on 16GB VRAM RTX 5080)?
+4 upvotes · 38 comments
+Qwen3.6 27B NVFP4 + MTP on a single RTX 5090: 200k context working in vLLM
+
+r/LocalLLaMA
+•
+3d ago
+Qwen3.6 27B NVFP4 + MTP on a single RTX 5090: 200k context working in vLLM
+75 upvotes · 66 comments
+How to run Qwen3.5-27B with speculative decoding with llama.cpp llama-server?
+
+r/LocalLLaMA
+•
+26d ago
+How to run Qwen3.5-27B with speculative decoding with llama.cpp llama-server?
+5 upvotes · 14 comments
+200+ TPS on Qwen3.6-27B and 35B-A3B with consumer hardware (RTX 3090s) - method provided!
+
+r/LocalLLM
+•
+7d ago
+200+ TPS on Qwen3.6-27B and 35B-A3B with consumer hardware (RTX 3090s) - method provided!
+31 upvotes · 21 comments
+Qwen 3.6 27b Q4.0 MTP GGUF
+
+r/LocalLLaMA
+•
+4d ago
+Qwen 3.6 27b Q4.0 MTP GGUF
+24 upvotes · 21 comments
+An Overnight Stack for Qwen3.6–27B: 85 TPS, 125K Context, Vision — on One RTX 3090 | by Wasif Basharat | Apr, 2026
+
+r/LocalLLaMA
+•
+16d ago
+An Overnight Stack for Qwen3.6–27B: 85 TPS, 125K Context, Vision — on One RTX 3090 | by Wasif Basharat | Apr, 2026
+r/LocalLLaMA - An Overnight Stack for Qwen3.6–27B: 85 TPS, 125K Context, Vision — on One RTX 3090 | by Wasif Basharat | Apr, 2026
+medium
+311 upvotes · 186 comments
+Running Qwen3.5 / Qwen3.6 with NextN MTP (Multi-Token Prediction) speculative decode in llama.cpp — single RTX 3090 Ti GPU guide
+
+r/LocalLLaMA
+•
+2d ago
+Running Qwen3.5 / Qwen3.6 with NextN MTP (Multi-Token Prediction) speculative decode in llama.cpp — single RTX 3090 Ti GPU guide
+42 upvotes · 25 comments
+How to use Llama-swap, Open WebUI, Semantic Router Filter, and Qwen3.5 to its fullest
+
+r/LocalLLM
+•
+2mo ago
+How to use Llama-swap, Open WebUI, Semantic Router Filter, and Qwen3.5 to its fullest
+r/LocalLLM - How to use Llama-swap, Open WebUI, Semantic Router Filter, and Qwen3.5 to its fullest
+38 upvotes · 15 comments
+As MTP prepares to land in llama.cpp, Models that support MTP
+
+r/LocalLLaMA
+•
+5d ago
+As MTP prepares to land in llama.cpp, Models that support MTP
+113 upvotes · 55 comments
+Qwen3.6-27B-INT4 clocking 100 tps with 256k context length on 1x RTX 5090 via vllm 0.19
+
+r/LocalLLaMA
+•
+13d ago
+Qwen3.6-27B-INT4 clocking 100 tps with 256k context length on 1x RTX 5090 via vllm 0.19
+252 upvotes · 102 comments
+Get faster qwen 3.6 27b

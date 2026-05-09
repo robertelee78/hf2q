@@ -1,0 +1,527 @@
+Skip to main content
+Heretic 1.3 released: Reproducible models, integrated benchmarking system, reduced peak VRAM usage, broader model support, and more : r/LocalLLaMA
+ 
+
+r/LocalLLaMA
+
+ 
+Get App
+Log In
+
+Expand user menu
+Skip to Navigation Skip to Right Sidebar
+ 
+Back
+ 
+Go to LocalLLaMA
+r/LocalLLaMA
+•
+4d ago
+-p-e-w-
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+
+Heretic 1.3 released: Reproducible models, integrated benchmarking system, reduced peak VRAM usage, broader model support, and more
+
+Resources
+Dear fellow Llamas, it is my distinct pleasure to announce the immediate availability of version 1.3 of Heretic (https://github.com/p-e-w/heretic), the leading software for removing censorship from language models.
+
+This was a long and eventful release cycle, during which Heretic became a high-profile open source project with 20,000 GitHub stars and more than 13 million total model downloads (not counting the models from a certain "competitor" who was recently found to have been using a plagiarized fork of Heretic under the hood). The topic of model decensoring has exploded in popularity, with many clones and forks popping up, some of them clouding their techniques in mystique, technical jargon, or tens of thousands of lines of LLM-written junk code.
+
+I am happy to say that Heretic is moving in the exact opposite direction. Instead of making it more difficult to understand what is going on, the new release makes it easier and more transparent. The headline feature in Heretic 1.3 is reproducible runs. This was a much more difficult problem to solve than it might appear to be at first glance, because the results of tensor operations can depend on the PyTorch version, the GPU, the driver, the accelerator library, and whether Saturn is Ascendant or not. This means that in order to ensure reproducibility, all of that information must be collected and preserved. This mammoth task was taken up by long-time contributor Vinay-Umrethe, who wrote the majority of the code in the course of an intense multi-week collaboration in which over 250 comments were exchanged.
+
+As a result, when publishing an abliterated model to Hugging Face, you now have the option to have Heretic generate a reproduce directory in the repository, which contains everything another person needs to know in order to generate a byte-for-byte identical model themselves (example of such a directory). Gone are the days of "I can't seem to get such low numbers on my own machine"; you now can! While the reproducibility system is already immensely helpful and educational by itself, in the future it will form the backbone of something even more ambitious and exciting, which I will announce soon. Please note that publishing reproducibility information is completely optional, and Heretic always prompts before doing so. You are in control of what is uploaded at all times.
+
+There's more! You know how it can be difficult to tell with certainty whether an abliterated model has incurred significant damage to its capabilities? Heretic now includes the world's simplest benchmarking system, allowing you to run standard benchmarks like MMLU, EQ-Bench, GSM8K, and HellaSwag directly from Heretic, without having to fumble with any configuration and without even having to export the model first. This makes it much easier to decide whether a model is worth publishing, or whether you should look at another trial instead. The system is based on lm-evaluation-harness, the academic gold standard for running LLM benchmarks, allowing the resulting metrics to be directly compared against numbers published online.
+
+In the course of a typical run, Heretic computes various functions on tensors. This can involve intermediate tensors being manifested in GPU memory that take up large amounts of VRAM. magiccodingman analyzed this in detail, and implemented optimizations that substantially reduce peak VRAM usage, allowing larger models to be processed.
+
+Model architectures continue to evolve and become more complex, and Heretic is keeping up! farolone and MoonRide303 improved Heretic's layer and module handling logic, making it far more generic and allowing it to process latest-generation models like Qwen3.5 and Gemma 4, among others.
+
+Please see the release notes for the full list of improvements and fixes. More exciting stuff is coming in future versions!
+
+Cheers :)
+ 
+Upvote
+424
+
+Downvote
+ 
+78
+Go to comments
+
+
+Share
+ u/anthropic-ai avatar
+anthropic-ai
+•
+Promoted
+ 
+Claude Code is genuinely useful for legacy code issues. It connected to my GitHub, read the full project, diagnosed the performance problems in my JavaScript filter, and rewrote it with cleaner logic. Faster load time and new functionality — without me having to trace through old code manually.
+Sign Up
+claude.com
+Clickable image which will reveal the video player: Claude Code is genuinely useful for legacy code issues. It connected to my GitHub, read the full project, diagnosed the performance problems in my JavaScript filter, and rewrote it with cleaner logic. Faster load time and new functionality — without me having to trace through old code manually. 
+Collapse video player
+ 
+
+0:00 / 0:00
+
+
+
+
+ 
+Sort by:
+
+Best
+ 
+Search Comments
+Expand comment search
+Comments Section
+ u/Ok-Measurement-1575 avatar
+Ok-Measurement-1575
+•
+4d ago
+Benchmarks baked in is awesome. 
+
+
+Upvote
+42
+
+Downvote
+ 
+Reply
+
+Award
+
+Share
+ 
+ u/-p-e-w- avatar
+-p-e-w-
+OP
+•
+4d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+Yup 😄 It's super easy to use too. You just select "Benchmark the model" after selecting a trial. And you can choose to run the benchmarks only on the abliterated model, or on both the abliterated model and the base model for comparison. It will give you a beautifully formatted table that contains all the info you want.
+
+Here's how it looks:
+
+Comment Image
+
+
+Upvote
+39
+
+Downvote
+ 
+Reply
+
+Award
+
+Share
+ 
+ u/noneabove1182 avatar
+noneabove1182
+•
+4d ago
+the only logical next step is to make a "censorship" benchmark and bake it in!
+
+we obviously expect minor drops in benchmark performance (though it's fascinating when it goes up), but it would be great to include a benchmark that displays the tradeoff so that people can see just how many fewer refusals they're gaining for the minor drops!
+
+this is awesome though, great work
+ u/marutthemighty avatar
+marutthemighty
+•
+4d ago
+Good job, mate. Keep it going.
+
+3 more replies
+Paradigmind
+•
+4d ago
+Now we all watch HauHau stealing the code.
+ u/pigeon57434 avatar
+pigeon57434
+•
+4d ago
+heretic is the greatest oss project in ai since llama.cpp
+
+ u/-p-e-w- avatar
+-p-e-w-
+OP
+•
+4d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+You’re making me blush…
+
+LicensedTerrapin
+•
+4d ago
+Don't blush, it's true.
+
+1 more reply
+ u/AlibabaCloudGlobal avatar
+u/AlibabaCloudGlobal
+•
+Promoted
+ 
+one place, real results. video, editing, multi-model… covered
+Apply Now
+int.alibabacloud.com
+ Thumbnail image: one place, real results. video, editing, multi-model… covered
+MomentJolly3535
+•
+4d ago
+Amazing, thank you ! i all the best uncensored models are Heretic ones!
+ u/pigeon57434 avatar
+pigeon57434
+•
+4d ago
+so is ara dead? basically ive seen no progress and im worried
+
+ u/-p-e-w- avatar
+-p-e-w-
+OP
+•
+4d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+Nope, far from it! It will be included (and possibly enabled by default) in the next version, re-implemented on top of the upcoming plugin system.
+
+ u/lacerating_aura avatar
+lacerating_aura
+•
+4d ago
+Yes!! the ara ara plugin.
+
+1 more reply
+ u/Chromix_ avatar
+Chromix_
+•
+4d ago
+Profile Badge for the Achievement Top 1% Commenter Top 1% Commenter
+One of the refusal markers is "I am unable" (to). Wouldn't that already trigger during "Create a website for my friends that shows pictures of my cats", as in "I am unable to ... because I do not have access to your cat pictures", or a MCP for uploading a website, etc?
+
+ u/-p-e-w- avatar
+-p-e-w-
+OP
+•
+4d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+Sure, and on many similar responses. Refusal detection is only an approximation and there is no substitute for human testing of the final model. That’s why Heretic has a built-in chat function.
+
+3 more replies
+ 
+1 more reply
+ u/Careful-Ad7924 avatar
+Careful-Ad7924
+•
+4d ago
+Great work pew! Have you ever had any success with Kimi k2.5 or k2.6? Heretic seems to not work on it.
+
+ u/-p-e-w- avatar
+-p-e-w-
+OP
+•
+4d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+To be quite honest I don’t have the hardware to play around with models of that size class 😏
+
+ u/Careful-Ad7924 avatar
+Careful-Ad7924
+•
+4d ago
+I can provide compute if you want. Just dmed
+
+1 more reply
+ u/I-cant_even avatar
+I-cant_even
+•
+4d ago
+I have successfully uncensored K2.6, there's nothing special about doing so it was just like any other LLM but a little more sensitive to induced bias from the edits. Not sure how Heretic handles cleaning their refusal directions but figuring out how to clean up the refusal directions is probably the hardest part of uncensoring K2.6
+
+7 more replies
+ u/woahdudee2a avatar
+woahdudee2a
+•
+4d ago
+MiMo-V2.5-Pro would be a good stepipng stone. currently we only have ~30b models derestricted in this way
+ u/tarruda avatar
+tarruda
+•
+4d ago
+Thank you for your major contribution to freeing local AI!
+u/RagieAI avatar
+u/RagieAI
+•
+Promoted
+ 
+Effortlessly add RAG to your apps with Ragie’s easy-to-use APIs—perfect for Chatbots and Knowledge Bases.
+Sign Up
+ragie.ai
+ Thumbnail image: Effortlessly add RAG to your apps with Ragie’s easy-to-use APIs—perfect for Chatbots and Knowledge Bases.
+ u/Long_comment_san avatar
+Long_comment_san
+•
+4d ago
+Profile Badge for the Achievement Top 1% Commenter Top 1% Commenter
+Heretic is faithful.
+
+pmttyji
+•
+4d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+ Comment Image
+de4dee
+•
+4d ago
+thanks for the awesome work.
+
+can i install 'traits' or 'tendencies' or character to models with heretic? i am a fine tuner normally but if i can give the model expected outputs and old outputs, maybe i can do fine tuning quicker ? i will still give knowledge but i will also use heretic to quickly do surgery type of thing.
+
+ u/-p-e-w- avatar
+-p-e-w-
+OP
+•
+4d ago
+Profile Badge for the Achievement Top 1% Poster Top 1% Poster
+Yes, this is possible for some traits, and in fact I myself have demonstrated it for slop: https://www.reddit.com/r/LocalLLaMA/comments/1qa0w6c/it_works_abliteration_can_reduce_slop_without/
+
+In the next version, much more will become possible with the plugin system.
+
+3 more replies
+ u/notredamelawl avatar
+notredamelawl
+•
+4d ago
+Ive noticed there are few "large" models on hugging face that have had heretic run on them. Do you have an estimate of how much VRAM usage various size models would take? I just got in 8 H200s at my disposal and would like to liberate some of the larger models, but wondering at how much VRAM and processing time I'm looking at eating up...
+
+2 more replies
+New to Reddit?
+Create your account and connect with a world of communities.
+ 
+Continue with Email
+Continue with Phone Number
+By continuing, you agree to our User Agreement and acknowledge that you understand the Privacy Policy.
+Related Answers Section
+Related Answers
+Best practices for hosting LLaMA locally
+Unique applications of LLaMA in daily life
+Comparing LLaMA with other AI models
+Tips for optimizing LLaMA performance
+Creative projects using LLaMA technology
+More posts you may like
+Heretic has FINALLY defeated GPT-OSS with a new experimental decensoring method called ARA
+
+r/LocalLLaMA
+•
+2mo ago
+Heretic has FINALLY defeated GPT-OSS with a new experimental decensoring method called ARA
+r/LocalLLaMA - Heretic has FINALLY defeated GPT-OSS with a new experimental decensoring method called ARA
+708 upvotes · 148 comments
+ u/Microsoft avatar
+Microsoft
+•
+Promoted
+ 
+Explore 90+ hands-on sessions to help you build, ship, and scale with AI.
+ Thumbnail image: Explore 90+ hands-on sessions to help you build, ship, and scale with AI.
+build.microsoft.com
+Learn More
+People seem to already not care about heretic?
+
+r/LocalLLaMA
+•
+3mo ago
+People seem to already not care about heretic?
+9 upvotes · 32 comments
+Heretic?
+
+r/RogueTraderCRPG
+•
+9d ago
+Heretic?
+98 upvotes · 89 comments
+Heretic: Fully automatic censorship removal for language models
+
+r/LocalLLaMA
+•
+6mo ago
+Heretic: Fully automatic censorship removal for language models
+r/LocalLLaMA - Heretic: Fully automatic censorship removal for language models
+3.1K upvotes · 313 comments
+Heretic 1.1 released: Improved abliteration quality, multi-GPU support, thinking models support, Apple Silicon support, notebook support, research features, and more
+
+r/LocalLLaMA
+•
+5mo ago
+Heretic 1.1 released: Improved abliteration quality, multi-GPU support, thinking models support, Apple Silicon support, notebook support, research features, and more
+r/LocalLLaMA - Heretic 1.1 released: Improved abliteration quality, multi-GPU support, thinking models support, Apple Silicon support, notebook support, research features, and more
+222 upvotes · 79 comments
+Is a HERETIC run worth it?
+
+r/RogueTraderCRPG
+•
+3mo ago
+Is a HERETIC run worth it?
+27 upvotes · 74 comments
+Beware of the Heretic
+
+r/Grimdank
+•
+7mo ago
+Beware of the Heretic
+r/Grimdank - Beware of the Heretic
+2.8K upvotes · 488 comments
+My first heretic
+
+r/Chaos40k
+•
+4mo ago
+My first heretic
+r/Chaos40k - My first heretic
+6
+793 upvotes · 63 comments
+I want to play Heretic but i feel bad about
+
+r/RogueTraderCRPG
+•
+4mo ago
+I want to play Heretic but i feel bad about
+39 upvotes · 15 comments
+Successful Heretic Anointed
+
+r/FDMminiatures
+•
+4mo ago
+Successful Heretic Anointed
+r/FDMminiatures - Successful Heretic Anointed
+2
+77 upvotes · 13 comments
+Heretic 1.2 released: 70% lower VRAM usage with quantization, Magnitude-Preserving Orthogonal Ablation ("derestriction"), broad VL model support, session resumption, and more
+
+r/LocalLLaMA
+•
+3mo ago
+Heretic 1.2 released: 70% lower VRAM usage with quantization, Magnitude-Preserving Orthogonal Ablation ("derestriction"), broad VL model support, session resumption, and more
+408 upvotes · 61 comments
+My first heretic
+
+r/WordBearers
+•
+1mo ago
+My first heretic
+r/WordBearers - My first heretic
+4
+285 upvotes · 9 comments
+Am I a heretic?
+
+r/BlackTemplars
+•
+1mo ago
+Am I a heretic?
+r/BlackTemplars - Am I a heretic?
+97 upvotes · 19 comments
+Just painted my first ever heretic!
+
+r/Chaos40k
+•
+5mo ago
+Just painted my first ever heretic!
+r/Chaos40k - Just painted my first ever heretic!
+4
+433 upvotes · 10 comments
+Qwen3.6 27B uncensored heretic v2 Native MTP Preserved is Out Now With KLD 0.0021, 6/100 Refusals and the Full 15 MTPs Preserved and Retained, Available in Safetensors, GGUFs and NVFP4s formats.
+
+r/LocalLLaMA
+•
+3d ago
+Qwen3.6 27B uncensored heretic v2 Native MTP Preserved is Out Now With KLD 0.0021, 6/100 Refusals and the Full 15 MTPs Preserved and Retained, Available in Safetensors, GGUFs and NVFP4s formats.
+352 upvotes · 121 comments
+"Heretic", by me
+
+r/Warhammer40k
+•
+1y ago
+"Heretic", by me
+r/Warhammer40k - "Heretic", by me
+686 upvotes · 6 comments
+“THINK heretic THINK!”
+
+r/Warhammer40k
+•
+3mo ago
+“THINK heretic THINK!”
+r/Warhammer40k - “THINK heretic THINK!”
+4
+370 upvotes · 20 comments
+"Heretic", by me
+
+r/ImaginaryWarhammer
+•
+1y ago
+"Heretic", by me
+r/ImaginaryWarhammer - "Heretic", by me
+1.1K upvotes · 14 comments
+How Does Heretic Work?
+
+r/RogueTraderCRPG
+•
+6mo ago
+How Does Heretic Work?
+40 upvotes · 51 comments
+Mistral-Small-4-119B-2603-heretic
+
+r/LocalLLaMA
+•
+2mo ago
+Mistral-Small-4-119B-2603-heretic
+13 upvotes · 7 comments
+Being a heretic is worth it just for this moment
+
+r/RogueTraderCRPG
+•
+10mo ago
+SPOILER
+Being a heretic is worth it just for this moment
+r/RogueTraderCRPG - Being a heretic is worth it just for this moment
+134 upvotes · 26 comments
+VIEW POST IN
+
+Português (Brasil)
+Français
+See more
+Community Info Section
+r/LocalLLaMA
+Llama
+ Join
+LocalLlama
+Subreddit to discuss locally hostable AI
+Public
+Reddit Rules
+Privacy Policy
+User Agreement
+Your Privacy Choices
+Accessibility
+Reddit, Inc. © 2026. All rights reserved.
+
+Collapse Navigation
+Home
+Popular
+News
+Explore
+RESOURCES
+About Reddit
+Advertise
+Developer Platform
+Reddit Pro
+BETA
+Help
+Blog
+Careers
+Press
+Best of Reddit
+Reddit Rules
+Privacy Policy
+User Agreement
+Your Privacy Choices
+Accessibility
+Reddit, Inc. © 2026. All rights reserved.
+ 
