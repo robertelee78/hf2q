@@ -285,6 +285,47 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-90 dispatch-count BUG FIX + corrected per-dispatch breakdown
+
+**Bug discovered in iter-89's HF2Q_MLX_PROFILE reporting.** The `avg_dispatches`
+helper at `forward_mlx.rs:214` summed each token's `s*_dispatches` array
+across all 30 layers. But each `s*_dispatches[layer_idx]` is assigned
+the CUMULATIVE counter at end of that layer (not the per-layer delta) —
+so summing it 30× over-counts by a factor of ~15 (sum of arithmetic
+progression 1+2+…+30 = 465 vs 30 layers).
+
+Iter-89 reported 16,300 dispatches/token; correct count is **990
+dispatches/token**.
+
+| Metric | Iter-89 (buggy) | Iter-90 (corrected) | Reality check |
+|---|---:|---:|:---|
+| Total dispatches/token | 16,300 | **990** | Matches candle baseline (~105) × 9.4× |
+| Body dispatches/token | 15,310 | **986** (33 per layer × 30 layers) | Reasonable |
+| Head dispatches/token | 990 | **4** | LM-head + softcap + argmax = 3-4 ops |
+| µs / dispatch | 0.97 µs | **15.8 µs** | Apple Metal GPU dispatch latency |
+
+**Corrected per-dispatch comparison vs llama.cpp HEAD**:
+- hf2q decode: 15.71 ms / 990 dispatches = **15.86 µs/dispatch**
+- llama.cpp at 90 t/s = 11.11 ms/token; assuming similar ~990 dispatches
+  (per iter-71 dispatch-count parity): **11.22 µs/dispatch** → 29% faster
+
+**Conclusion**: decode gap is **per-dispatch GPU time**, not dispatch
+count. Closing requires per-kernel optimization (kernel selection, tile
+geometry, shmem layout), not fusion/dispatch-count reduction. Confirms
+iter-71's earlier finding using clean methodology.
+
+Highest-leverage attacks (from iter-86 cool profile per-call ms/call):
+- MOE_GATE_UP: 6.59 ms/call × 30 = 198 ms (17% of pp2455; for decode
+  similar mv_id cost dominates)
+- MOE_DOWN: 5.82 ms/call × 30 = 175 ms
+- FA_GL: 12.59 ms/call × 5 = 63 ms (D=512 head_dim, gemma full-attn)
+- FA_SW: 3.61 ms/call × 25 = 90 ms (D=256, sliding-window)
+
+Code: forward_mlx.rs `avg_dispatches` rewritten to use `last()` of
+each layer-array; head_only computed as final-cumulative minus body-
+cumulative. Verified end-to-end: 990 dispatches/token reported on
+gemma APEX-Q5_K_M decode, matching expected order-of-magnitude.
+
 ### Iter-89 first quantitative decode profile (ADR-028 #3 partial)
 
 Ran `HF2Q_MLX_PROFILE=1` (production-side ProfileAccumulator) on a

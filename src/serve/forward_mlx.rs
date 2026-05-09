@@ -210,19 +210,36 @@ impl ProfileAccumulator {
             eprintln!("║   Unaccounted:  {:8.1} us ({:5.1}%)", overhead, overhead / total_avg * 100.0);
         }
 
-        // Dispatch counts
-        let avg_dispatches = |getter: &dyn Fn(&TokenProfile) -> &Vec<usize>| -> f64 {
+        // Dispatch counts.
+        //
+        // ADR-028 iter-90 BUG FIX: prior code used `getter(t).iter().sum()`
+        // which double-counted because each `s*_dispatches[layer_idx]` is
+        // assigned `total_dispatches` (the CUMULATIVE counter at end of
+        // that layer), not the per-layer delta. Sum-of-cumulatives across
+        // 30 layers reports ~15× the real per-token dispatch count
+        // (e.g. 15310 reported vs 990 actual on gemma-4-26b decode at
+        // HEAD `06a8eb3`). Per-token dispatch count is whatever the LAST
+        // layer captured. `head_dispatches` is also a cumulative total
+        // (assigned `total_dispatches` after the head ops at line 4288),
+        // so the FINAL total per token == `head_dispatches`. We therefore
+        // report body == s1_dispatches[last_layer], head == head_dispatches
+        // - s1_dispatches[last_layer], total == head_dispatches.
+        let last_layer_dispatch_avg = |getter: &dyn Fn(&TokenProfile) -> &Vec<usize>| -> f64 {
             let total: usize = measured.iter()
-                .map(|t| getter(t).iter().sum::<usize>())
+                .map(|t| getter(t).last().copied().unwrap_or(0))
                 .sum();
             total as f64 / n as f64
         };
-        let s1_disp = avg_dispatches(&|t| &t.s1_dispatches);
-        let s2_disp = avg_dispatches(&|t| &t.s2_dispatches);
-        let s3_disp = avg_dispatches(&|t| &t.s3_dispatches);
-        let s4_disp = avg_dispatches(&|t| &t.s4_dispatches);
-        let head_disp: f64 = measured.iter().map(|t| t.head_dispatches as f64).sum::<f64>() / n as f64;
-        let total_disp = s1_disp + s2_disp + s3_disp + s4_disp + head_disp;
+        let s1_disp = last_layer_dispatch_avg(&|t| &t.s1_dispatches);
+        let s2_disp = last_layer_dispatch_avg(&|t| &t.s2_dispatches);
+        let s3_disp = last_layer_dispatch_avg(&|t| &t.s3_dispatches);
+        let s4_disp = last_layer_dispatch_avg(&|t| &t.s4_dispatches);
+        let total_token_disp: f64 = measured.iter()
+            .map(|t| t.head_dispatches as f64).sum::<f64>() / n as f64;
+        // Head-only count is the delta between final cumulative and the body cumulative.
+        let body_cum = s1_disp + s2_disp + s3_disp + s4_disp;
+        let head_disp = (total_token_disp - body_cum).max(0.0);
+        let total_disp = total_token_disp;
 
         eprintln!("║");
         eprintln!("║ Dispatch counts per token:");
