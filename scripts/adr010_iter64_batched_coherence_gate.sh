@@ -161,14 +161,27 @@ while len(' '.join(out).split())<n:
     i+=1
 print(' '.join(out))
 " > "$PERF_PROMPT_FILE"
-    PERF_LINE=$(HF2Q_BATCHED_PREFILL=1 HF2Q_UNSAFE_EXPERIMENTS=1 \
-        timeout 180 "$HF2Q" generate --model "$MODEL" --prompt-file "$PERF_PROMPT_FILE" --max-tokens 1 2>&1 | grep "^prefill:" | head -1)
-    PERF_TOK_S=$(echo "$PERF_LINE" | grep -oE "\(([0-9]+) tok/s\)" | grep -oE "[0-9]+" | head -1)
-    echo "  measured: $PERF_LINE"
-    if [[ -z "$PERF_TOK_S" ]]; then
-        echo "  ✗ FAIL: could not parse pp1024 perf result." >&2
-        exit 3
-    fi
+    # Iter-77: median-of-3 measurement to reduce thermal-noise sensitivity.
+    # Single-shot measurement showed 1864-1941 t/s variance across runs;
+    # median-of-3 is more reliable and gives a steady metric for floor checks.
+    # Skip the warmup overhead — first run is the warmup, take min of run 2/3
+    # plus run 1 if there's outlier behavior. Simpler: take median of 3 trials.
+    declare -a PERF_TRIALS=()
+    for trial in 1 2 3; do
+        PERF_LINE=$(HF2Q_BATCHED_PREFILL=1 HF2Q_UNSAFE_EXPERIMENTS=1 \
+            timeout 180 "$HF2Q" generate --model "$MODEL" --prompt-file "$PERF_PROMPT_FILE" --max-tokens 1 2>&1 | grep "^prefill:" | head -1)
+        PERF_TRIAL_TOK_S=$(echo "$PERF_LINE" | grep -oE "\(([0-9]+) tok/s\)" | grep -oE "[0-9]+" | head -1)
+        if [[ -z "$PERF_TRIAL_TOK_S" ]]; then
+            echo "  ✗ FAIL: could not parse pp1024 perf result on trial $trial." >&2
+            echo "  raw line: $PERF_LINE" >&2
+            exit 3
+        fi
+        echo "  trial $trial: $PERF_LINE"
+        PERF_TRIALS+=("$PERF_TRIAL_TOK_S")
+    done
+    # Median of 3 = sort + take middle element.
+    PERF_TOK_S=$(printf '%s\n' "${PERF_TRIALS[@]}" | sort -n | sed -n '2p')
+    echo "  median: $PERF_TOK_S tok/s (over 3 trials)"
     if (( PERF_TOK_S < PERF_FLOOR_TOK_S )); then
         echo "  ✗ FAIL: $PERF_TOK_S tok/s < ${PERF_FLOOR_TOK_S} tok/s floor."
         echo "  iter-68 tensor mm_id baseline was 1942 t/s; current measurement"
