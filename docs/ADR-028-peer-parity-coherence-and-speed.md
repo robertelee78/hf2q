@@ -285,6 +285,45 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-89 first quantitative decode profile (ADR-028 #3 partial)
+
+Ran `HF2Q_MLX_PROFILE=1` (production-side ProfileAccumulator) on a
+13-token decode (after 2 warmup) on gemma APEX-Q5_K_M:
+
+| Metric | Value |
+|---|---:|
+| Per-token decode | **15.85 ms / 63.1 t/s** |
+| Total dispatches per token | **16,300** (S1: 15,310 + Head: 990) |
+| Per-dispatch encoder time | **0.97 µs/dispatch** (CPU-side) |
+| Per-layer dispatches | **~510** (15310 / 30 layers) |
+| Session model | single-session (1 GPU session/token) |
+
+**Encode-bound finding**: 16300 × 0.97 µs = 15.81 ms ≈ token total. The
+decode is dominated by encoder/dispatch overhead, NOT GPU kernel time.
+
+**Comparison vs candle Phase 0 baseline**: ~105 dispatches/token → we
+have **155× more dispatches**. This reflects the per-layer fan-out from:
+- 8 active MoE experts × 2 (gate_up + down) = 16 mv_id calls per layer
+- FA-vec-tq-hb (leg_hb_encoded) path with multi-step quantization sub-
+  dispatches per layer
+- Per-block K-quant scale/dequant sub-passes inside mv kernels
+- Norm/add/embed/permute small kernels each as a separate dispatch
+
+llama.cpp also has high dispatch counts (iter-71 confirmed parity); the
+~30% per-dispatch encoder gap accounts for the 0.65-0.70× decode peer.
+
+**Highest-leverage attack**: cut dispatch count by 2× via kernel fusion.
+At 8000 dispatches × 0.97 µs ≈ 8 ms/token = **125 t/s = BEATS llama.cpp
+HEAD by 30%**. iter-90 to break down the 510-per-layer count by site.
+
+**`forward_decode_kernel_profile` rebuild needed for site-level
+breakdown**: existing fn at forward_mlx.rs:4400 (gated
+`HF2Q_MLX_KERNEL_PROFILE=1`) requires F16 lm_head — fails on our gemma
+APEX-Q5_K_M (Q6_K LM-head). Need to either (a) generalize to support
+quantized lm_head, or (b) add per-bucket counters to the production
+forward_decode (mirroring forward_prefill_batched.rs's 20+ buckets).
+~150-200 LOC, single file change.
+
 ## Consequences
 
 ### Positive
