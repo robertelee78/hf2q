@@ -2793,6 +2793,93 @@ saved per layer.
 iter-143 plan: run H1+H2 tests on gemma4 APEX-Q5_K_M production decode.
 **No kernel changes until measurements distinguish H1 vs H2.**
 
+### iter-143: H1+H2 measurements RUN — H2 falsified, H1 confirmed
+
+#### Run 1 — hf2q production decode with HF2Q_SPLIT_TIMING=1
+
+```
+HF2Q_SPLIT_TIMING=1 /opt/hf2q/target/release/hf2q generate \
+  --model models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf \
+  --prompt "Hello, my name is" --max-tokens 12 --temperature 0
+```
+
+Output (steady-state tokens 2-12, dropping warmup token-1):
+```
+[SPLIT] BODY: encode=0.43ms gpu=13.22ms dispatches=986 barriers=459
+[SPLIT] BODY: encode=0.42ms gpu=13.29ms dispatches=986 barriers=459
+[SPLIT] BODY: encode=0.43ms gpu=13.38ms dispatches=986 barriers=459
+[SPLIT] BODY: encode=0.43ms gpu=13.41ms dispatches=986 barriers=459
+[SPLIT] BODY: encode=0.45ms gpu=13.72ms dispatches=986 barriers=459
+[SPLIT] BODY: encode=0.45ms gpu=13.62ms dispatches=986 barriers=459
+[SPLIT] BODY: encode=0.42ms gpu=13.63ms dispatches=986 barriers=459
+[SPLIT] BODY: encode=0.38ms gpu=13.77ms dispatches=986 barriers=459
+[SPLIT] BODY: encode=0.40ms gpu=13.80ms dispatches=986 barriers=459
+[SPLIT] BODY: encode=0.44ms gpu=14.07ms dispatches=986 barriers=459
+```
+Token throughput: **69.2 tok/s** (12 tokens / 0.17 s).
+
+Steady-state per-token figures:
+- **encode_ns: 0.43 ms median** (CPU dispatch encoding)
+- **gpu_ns: 13.6 ms median** (commit + wait_until_completed)
+- BODY total: 14.03 ms; head + sampling: ~0.42 ms; per-token: 14.45 ms
+- Dispatches/token: 986 (BODY only) → 32.9 dispatches/layer at 30 layers
+- Barriers/token: 459 (BODY) → 15.3 barriers/layer
+
+#### Run 2 — llama.cpp peer baseline on same fixture
+
+```
+llama-bench --model gemma4-ara-2pass-APEX-Q5_K_M.gguf -p 0 -n 16 -t 1
+```
+
+Output:
+```
+| gemma4 26B.A4B Q6_K | 19.15 GiB | 25.23 B | BLAS,MTL | 1 | tg16 | 102.05 ± 2.95 |
+```
+
+llama.cpp build d05fe1d7d (9010) reports **102.05 tok/s tg16** on the
+same gguf. Per-token: **9.80 ms**.
+
+#### Verdict
+
+**Gap to peer**: 14.45 - 9.80 = **4.65 ms/token (32% slower than peer)**.
+Peer ratio: 69.2 / 102.05 = **0.678× peer** (consistent with iter-121's
+0.71× ± measurement noise).
+
+**H1 (per-kernel GPU time dominates) — CONFIRMED.**
+- BODY GPU = 13.6 ms vs peer total = 9.80 ms → 3.8 ms gap is GPU-side
+- Even if our encode were ZERO, peer ratio = 69.2 vs (14.45-0.43=14.02)
+  baseline = 1/14.02 = 71.3 tok/s → still 0.70× peer
+
+**H2 (encode-CPU bottleneck) — FALSIFIED.**
+- Encode = 0.43 ms / 14.45 ms = **3.0% of decode**
+- Eliminating ALL encode-CPU saves at most 3% of decode time
+- DS4 fusion saves at most 1 dispatch / layer × 30 layers × 0.44 µs/disp
+  = 13 µs/token = **0.09% of decode** — well below iter-121's 1% sizing
+
+**Task #23 (DS4 fused gate+up+SwiGLU port) FORMALLY CLOSED as not-worth.**
+The walk-phase peer-port for kernel fusion is a rounding-error optimization
+on H1-bound code paths.
+
+#### Where the gap actually is
+
+The 4.65 ms gap lives entirely in GPU kernel TIME at the gemma4 shape.
+Per-kernel attribution (from the existing forward_decode_kernel_profile,
+session-overhead-inflated but ratios are still relative-truth):
+- MoE expert dispatches (Q6_K mv_id × 8 experts × 30 layers)
+- LM head (F16 GEMM, vocab=262144)
+- FA / FA-vec for sliding (sw=1024) + 5 global-attn layers (full kv)
+- Q6_K dense FFN (gate+up+down)
+
+Bisection plan iter-144+:
+1. Run xctrace Metal System Trace on hf2q + llama.cpp at this fixture
+   (script `scripts/profile-decode-mst.sh` already exists)
+2. Aggregate per-kernel µs+count → which kernel families own the 4.65 ms
+3. Port the slowest 1-2 kernels at peer parity
+
+DS4 fusion port is **NOT** the right walk-phase target here. The task
+#23 sizing was correct in iter-121 + confirmed by H2-falsified iter-143
+data; the Phase E surfaced this conclusively today.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
