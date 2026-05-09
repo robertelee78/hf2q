@@ -45,8 +45,8 @@ use anyhow::{anyhow, Result};
 use mlx_native::{DType, MlxBuffer};
 
 use super::autograd_gpu_tape::{
-    add, divide, matmul, mul, outer_product, rms_norm, row_sum, silu, softmax,
-    take_along_axis_topk, GpuTape, GpuTensor,
+    add, divide, flash_attn_train, matmul, mul, outer_product, rms_norm, rope, row_sum, silu,
+    softmax, take_along_axis_topk, transpose, view, GpuTape, GpuTensor,
 };
 
 pub struct MoeRouteOutput {
@@ -423,6 +423,268 @@ pub fn decoder_layer_on_tape(
         &routing_weights,
     )?;
     add(&h1, &mlp_out)
+}
+
+// ─── Shared MoE FFN helper ────────────────────────────────────────────────────
+
+/// Private helper: post-attention norm + MoE FFN + residual add.
+///
+/// Shared between `decoder_layer_on_tape` (proxy-attn) and
+/// `decoder_layer_on_tape_real_gqa` (real GQA) so the FFN block is not
+/// duplicated.  `h1` is the residual hidden state `[n_tokens, hidden]`
+/// after the attention sub-layer.  Returns `h1 + moe_ffn(post_norm(h1))`.
+#[allow(clippy::too_many_arguments)]
+fn moe_ffn_block_on_tape(
+    tape: &GpuTape,
+    h1: &GpuTensor,
+    w_post: &GpuTensor,
+    w_gate: &GpuTensor,
+    gate_projs: &[GpuTensor],
+    up_projs: &[GpuTensor],
+    down_projs: &[GpuTensor],
+    k: usize,
+    eps: f32,
+    ones_k: &GpuTensor,
+) -> Result<GpuTensor> {
+    let n_tokens = h1.shape()[0];
+    let y2 = rms_norm(h1, w_post, eps)?;
+    let route = moe_route(&y2, w_gate, k, false, ones_k)?;
+    let scores_host: Vec<f32> = route.top_k_scores.to_vec()?;
+    let indices_host: Vec<u32> = route
+        .top_k_indices
+        .as_slice::<u32>()
+        .map_err(|e| anyhow!("moe_ffn_block_on_tape: read top_k_indices: {e}"))?
+        .to_vec();
+    let expert_ids: Vec<Vec<usize>> = (0..n_tokens)
+        .map(|t| (0..k).map(|kk| indices_host[t * k + kk] as usize).collect())
+        .collect();
+    let routing_weights: Vec<Vec<f32>> = (0..n_tokens)
+        .map(|t| (0..k).map(|kk| scores_host[t * k + kk]).collect())
+        .collect();
+    let mlp_out =
+        switch_mlp(tape, &y2, gate_projs, up_projs, down_projs, &expert_ids, &routing_weights)?;
+    add(h1, &mlp_out)
+}
+
+// ─── Real-GQA decoder layer ───────────────────────────────────────────────────
+
+/// Configuration for the real-GQA decoder layer.
+///
+/// Production Qwen3.5/3.6 35B values: `n_q_heads=16`, `n_kv_heads=2`,
+/// `head_dim=256`, `rope_theta_base=1e6`, `rope_sections=[11,11,10,0]`.
+/// Test fixtures use smaller shapes — see field comments.
+pub struct Qwen35RealGqaConfig {
+    /// Number of query heads (e.g. 2 for tests, 16 for production).
+    pub n_q_heads: usize,
+    /// Number of KV heads.  Must divide `n_q_heads`.
+    pub n_kv_heads: usize,
+    /// Per-head dimension.  Must be 64 or 256 (flash_attn kernel constraint).
+    pub head_dim: usize,
+    /// Sequence length; equals n_tokens for causal LM training.
+    pub seq_len: usize,
+    /// Model hidden dimension.
+    pub hidden: usize,
+    /// RoPE theta base (1e6 for Qwen3.5/3.6).
+    pub rope_theta_base: f32,
+    /// IMROPE sections: `[11, 11, 10, 0]` for Qwen3.5/3.6.
+    pub rope_sections: [u32; 4],
+    /// Apply causal masking (true for LM training).
+    pub causal: bool,
+    /// Sliding-window size.  Reserved for future flash_attn kernel support;
+    /// currently unused (no sliding-window dispatch in the tape).
+    pub sliding_window: Option<u32>,
+    /// RMS-norm epsilon (1e-6 typical).
+    pub rms_eps: f32,
+}
+
+/// Weight bundle for a single real-GQA decoder layer.
+///
+/// Lifetime `'a` pins all borrowed tensors to the same tape.
+///
+/// Shape conventions (row-major `[out, in]` for 2-D projections,
+/// matching PyTorch `nn.Linear.weight`):
+///   * `w_in`, `w_post`  — `[hidden]`
+///   * `w_q`             — `[n_q_heads * head_dim, hidden]`
+///   * `w_k`             — `[n_kv_heads * head_dim, hidden]`
+///   * `w_v`             — `[n_kv_heads * head_dim, hidden]`
+///   * `w_o`             — `[hidden, n_q_heads * head_dim]`
+///   * `q_norm_w`        — `[head_dim]`
+///   * `k_norm_w`        — `[head_dim]`
+///   * `w_gate`          — `[hidden, n_experts]`
+///   * `gate_projs[e]`   — `[hidden, intermediate]`
+///   * `up_projs[e]`     — `[hidden, intermediate]`
+///   * `down_projs[e]`   — `[intermediate, hidden]`
+pub struct DecoderLayerWeightsRealGqa<'a> {
+    pub w_in: &'a GpuTensor,
+    pub w_post: &'a GpuTensor,
+    pub w_q: &'a GpuTensor,
+    pub w_k: &'a GpuTensor,
+    pub w_v: &'a GpuTensor,
+    pub w_o: &'a GpuTensor,
+    pub q_norm_w: &'a GpuTensor,
+    pub k_norm_w: &'a GpuTensor,
+    pub w_gate: &'a GpuTensor,
+    pub gate_projs: &'a [GpuTensor],
+    pub up_projs: &'a [GpuTensor],
+    pub down_projs: &'a [GpuTensor],
+}
+
+/// Apply RMS-norm along `head_dim` of a 4-D `[B, H, S, D]` tensor.
+///
+/// Flattens to `[B*H*S, D]`, applies `rms_norm`, then restores original shape.
+fn rms_norm_per_head(t: &GpuTensor, w: &GpuTensor, eps: f32) -> Result<GpuTensor> {
+    let shape = t.shape().to_vec();
+    if shape.len() != 4 {
+        return Err(anyhow!(
+            "rms_norm_per_head: expected 4-D [B, H, S, D], got {:?}",
+            shape
+        ));
+    }
+    let rows = shape[0] * shape[1] * shape[2];
+    let head_dim = shape[3];
+    let flat = view(t, vec![rows, head_dim])?;
+    let normed = rms_norm(&flat, w, eps)?;
+    view(&normed, shape)
+}
+
+/// Phase 3b — full production GQA decoder layer on the tape.
+///
+/// Wires per-head Q/K RMS-norm, IMROPE, Flash-Attention-2, and the
+/// existing MoE FFN block into a single differentiable forward pass.
+/// Gradient flows through ALL ops back to the Q/K/V/O projection
+/// weights (load-bearing for DWQ training).
+///
+/// ## Shape contracts
+///
+/// * `x`  — `[n_tokens, hidden]`
+/// * `pos_buf` — i32, shape `[4 * seq_len]` (sequential positions 0..seq_len)
+///   filled as `s[axis * seq_len + t] = t` for `axis ∈ {0,1,2,3}`.
+///   Caller builds this with `device.alloc_buffer(4*seq_len*4, I32, [4*seq_len])`.
+/// * All matmul dims satisfy m, n, k ≥ 32 (kernel floor).
+/// * `head_dim` must be 64 or 256.
+///
+/// ## Returns
+///
+/// `[n_tokens, hidden]` — final residual state after attention + MoE FFN.
+#[allow(clippy::too_many_arguments)]
+pub fn decoder_layer_on_tape_real_gqa(
+    tape: &GpuTape,
+    x: &GpuTensor,
+    pos_buf: MlxBuffer,
+    weights: &DecoderLayerWeightsRealGqa<'_>,
+    config: &Qwen35RealGqaConfig,
+    moe_k: usize,
+    moe_eps: f32,
+) -> Result<GpuTensor> {
+    if x.shape().len() != 2 {
+        return Err(anyhow!(
+            "decoder_layer_on_tape_real_gqa: x must be 2-D [n_tokens, hidden]; got {:?}",
+            x.shape()
+        ));
+    }
+    let n_tokens = x.shape()[0];
+    let hidden = x.shape()[1];
+    if hidden != config.hidden {
+        return Err(anyhow!(
+            "decoder_layer_on_tape_real_gqa: x hidden {hidden} != config.hidden {}",
+            config.hidden
+        ));
+    }
+    let n_q = config.n_q_heads;
+    let n_kv = config.n_kv_heads;
+    let hd = config.head_dim;
+    if n_q == 0 || n_kv == 0 || hd == 0 {
+        return Err(anyhow!(
+            "decoder_layer_on_tape_real_gqa: n_q_heads, n_kv_heads, head_dim must be > 0"
+        ));
+    }
+    if n_q % n_kv != 0 {
+        return Err(anyhow!(
+            "decoder_layer_on_tape_real_gqa: n_q_heads {n_q} not divisible by n_kv_heads {n_kv}"
+        ));
+    }
+    if hd != 64 && hd != 256 {
+        return Err(anyhow!(
+            "decoder_layer_on_tape_real_gqa: head_dim must be 64 or 256, got {hd}"
+        ));
+    }
+    let n_experts = weights.gate_projs.len();
+    if weights.up_projs.len() != n_experts || weights.down_projs.len() != n_experts {
+        return Err(anyhow!(
+            "decoder_layer_on_tape_real_gqa: gate/up/down proj counts must agree; \
+             got {}/{}/{}",
+            n_experts,
+            weights.up_projs.len(),
+            weights.down_projs.len()
+        ));
+    }
+
+    // 1. Pre-attention input RMS-norm.
+    let y0 = rms_norm(x, weights.w_in, config.rms_eps)?;
+
+    // 2. Q/K/V projections.  Weights stored as [out, in]; transpose to
+    //    [in, out] so matmul(y0, W^T) = y0 @ W^T.
+    let w_q_t = transpose(weights.w_q)?; // [hidden, n_q*hd]
+    let w_k_t = transpose(weights.w_k)?; // [hidden, n_kv*hd]
+    let w_v_t = transpose(weights.w_v)?; // [hidden, n_kv*hd]
+    let q = matmul(&y0, &w_q_t)?;        // [n_tokens, n_q*hd]
+    let k = matmul(&y0, &w_k_t)?;        // [n_tokens, n_kv*hd]
+    let v = matmul(&y0, &w_v_t)?;        // [n_tokens, n_kv*hd]
+
+    // 3. Reshape to 4-D [B=1, H, S, D].
+    let q_4d = view(&q, vec![1, n_q, n_tokens, hd])?;
+    let k_4d = view(&k, vec![1, n_kv, n_tokens, hd])?;
+    let v_4d = view(&v, vec![1, n_kv, n_tokens, hd])?;
+
+    // 4. Per-head Q/K RMS-norm along head_dim.
+    let q_4d = rms_norm_per_head(&q_4d, weights.q_norm_w, config.rms_eps)?;
+    let k_4d = rms_norm_per_head(&k_4d, weights.k_norm_w, config.rms_eps)?;
+
+    // 5. IMROPE applied to Q and K independently.
+    let q_4d = rope(
+        &q_4d,
+        pos_buf.clone(),
+        n_q,
+        hd,
+        config.rope_theta_base,
+        config.rope_sections,
+    )?;
+    let k_4d = rope(
+        &k_4d,
+        pos_buf,
+        n_kv,
+        hd,
+        config.rope_theta_base,
+        config.rope_sections,
+    )?;
+
+    // 6. Flash-Attention-2 training forward.
+    let scale = 1.0 / (hd as f32).sqrt();
+    let o_4d = flash_attn_train(&q_4d, &k_4d, &v_4d, n_kv, config.causal, None, scale)?;
+
+    // 7. Collapse back to 2-D + output projection.
+    let o = view(&o_4d, vec![n_tokens, n_q * hd])?;
+    let w_o_t = transpose(weights.w_o)?; // [n_q*hd, hidden]
+    let attn_out = matmul(&o, &w_o_t)?;  // [n_tokens, hidden]
+
+    // 8. Attention residual.
+    let h1 = add(x, &attn_out)?;
+
+    // 9. MoE FFN block (shared with proxy-attn path).
+    let ones_k_data = vec![1.0f32; moe_k];
+    let ones_k = GpuTensor::from_vec(tape, &ones_k_data, vec![moe_k])?;
+    moe_ffn_block_on_tape(
+        tape,
+        &h1,
+        weights.w_post,
+        weights.w_gate,
+        weights.gate_projs,
+        weights.up_projs,
+        weights.down_projs,
+        moe_k,
+        moe_eps,
+        &ones_k,
+    )
 }
 
 /// ADR-020 iter-11h-f-5 — full N-layer MoE forward composition on
@@ -2397,7 +2659,7 @@ mod tests {
     /// + bits=4 and AC#7 needs even more architectural change.
     #[test]
     fn ac7_option_a_full_model_two_layer_breaks_perturb_1_0_plateau() {
-        use super::{decoder_layer_on_tape, DecoderLayerWeights};
+        use super::DecoderLayerWeights;
         use crate::calibrate::autograd_gpu_tape::{
             backward, ones_like, qdq_affine, square, sub, view, GpuTape, GpuTensor,
         };
@@ -2599,7 +2861,7 @@ mod tests {
 
         // Hand-rolled gradient-descent step on every (s, b) leaf.
         let lr = 0.001f32;
-        let mut step_sb = |leaf: &GpuTensor| -> bool {
+        let step_sb = |leaf: &GpuTensor| -> bool {
             let g = match grads[leaf.node_idx()].as_ref() {
                 Some(g) => g,
                 None => return false, // no grad — leaf untouched
@@ -2667,7 +2929,7 @@ mod tests {
     /// optimization in a useful direction.
     #[test]
     fn ac7_option_a_full_model_two_layer_loss_decreases_under_sgd() {
-        use super::{decoder_layer_on_tape, DecoderLayerWeights};
+        use super::DecoderLayerWeights;
         use crate::calibrate::autograd_gpu_tape::{
             backward, ones_like, qdq_affine, square, sub, view, GpuTape, GpuTensor,
         };
@@ -2811,7 +3073,6 @@ mod tests {
                 }
                 store.push(store_l);
             }
-            let _ = decoder_layer_on_tape;
             let teacher_layers: Vec<DecoderLayerWeights<'_>> = (0..n_layers).map(|l| DecoderLayerWeights {
                 w_in: &store[l].w_in, w_attn: &store[l].w_attn, w_post: &store[l].w_post, w_gate: &store[l].w_gate,
                 gate_projs: &store[l].t_g, up_projs: &store[l].t_u, down_projs: &store[l].t_d,
@@ -2935,7 +3196,7 @@ mod tests {
     /// DWQ training loop.
     #[test]
     fn ac7_option_a_full_model_two_layer_adam_converges_faster_than_sgd() {
-        use super::{decoder_layer_on_tape, DecoderLayerWeights};
+        use super::DecoderLayerWeights;
         use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
         use crate::calibrate::autograd_gpu_tape::{
             backward, ones_like, qdq_affine, square, sub, view, GpuTape, GpuTensor,
@@ -3107,7 +3368,6 @@ mod tests {
                 }
                 store.push(store_l);
             }
-            let _ = decoder_layer_on_tape;
             let teacher_layers: Vec<DecoderLayerWeights<'_>> = (0..n_layers).map(|l| DecoderLayerWeights {
                 w_in: &store[l].w_in, w_attn: &store[l].w_attn, w_post: &store[l].w_post, w_gate: &store[l].w_gate,
                 gate_projs: &store[l].t_g, up_projs: &store[l].t_u, down_projs: &store[l].t_d,
@@ -3192,5 +3452,493 @@ mod tests {
                 w[0], w[1], w[1] / w[0]
             );
         }
+    }
+
+    // ─── Phase 3b real-GQA tests ───────────────────────────────────────────
+
+    /// Shared fixture sizes for the real-GQA tests.
+    /// n_tokens=32, hidden=128, n_q=2, n_kv=1, hd=64.
+    /// All matmul dims (n_tokens, hidden, n_q*hd, n_kv*hd) ≥ 32.
+    /// head_dim=64 satisfies flash_attn_train kernel constraint.
+    mod real_gqa_fixture {
+        pub const N_TOKENS: usize = 32;
+        pub const HIDDEN: usize = 128;
+        pub const N_Q: usize = 2;
+        pub const N_KV: usize = 1;
+        pub const HD: usize = 64;
+        pub const N_EXPERTS: usize = 4;
+        pub const MOE_K: usize = 2;
+        pub const INTERMEDIATE: usize = 64;
+        pub const RMS_EPS: f32 = 1e-6;
+    }
+
+    /// Build the sequential i32 positions buffer for IMROPE.
+    /// Shape: `[4 * seq_len]` i32, layout `s[axis*seq_len + t] = t`.
+    fn make_pos_buf_for_gqa(
+        device: &mlx_native::MlxDevice,
+        seq_len: usize,
+    ) -> MlxBuffer {
+        let n = 4 * seq_len;
+        let mut buf = device.alloc_buffer(n * 4, DType::I32, vec![n]).unwrap();
+        {
+            let s = buf.as_mut_slice::<i32>().unwrap();
+            for axis in 0..4usize {
+                for t in 0..seq_len {
+                    s[axis * seq_len + t] = t as i32;
+                }
+            }
+        }
+        buf
+    }
+
+    /// Build all tape leaf tensors for a single real-GQA decoder layer.
+    /// Returns (tape, x, weights_struct, gate_projs, up_projs, down_projs)
+    /// in a struct so we can reuse in multiple tests.
+    struct RealGqaLayerFixture {
+        tape: super::GpuTape,
+        x_data: Vec<f32>,
+        w_q_data: Vec<f32>,
+        w_k_data: Vec<f32>,
+        w_v_data: Vec<f32>,
+        w_o_data: Vec<f32>,
+        w_in_data: Vec<f32>,
+        w_post_data: Vec<f32>,
+        q_norm_data: Vec<f32>,
+        k_norm_data: Vec<f32>,
+        w_gate_data: Vec<f32>,
+        gate_data_per_expert: Vec<Vec<f32>>,
+        up_data_per_expert: Vec<Vec<f32>>,
+        down_data_per_expert: Vec<Vec<f32>>,
+    }
+
+    impl RealGqaLayerFixture {
+        fn new(device: mlx_native::MlxDevice) -> Self {
+            use real_gqa_fixture::*;
+            let tape = super::GpuTape::new(device);
+            // xorshift for deterministic data
+            let mut rng: u64 = 0xDEAD_BEEF_1234_5678;
+            let mut next = move || -> f32 {
+                rng ^= rng >> 33;
+                rng = rng.wrapping_mul(0xff51_afd7_ed55_8ccd);
+                rng ^= rng >> 33;
+                ((rng as i64) as f32) / (i64::MAX as f32)
+            };
+            let x_data: Vec<f32> =
+                (0..(N_TOKENS * HIDDEN)).map(|_| next() * 0.3).collect();
+            let w_in_data: Vec<f32> =
+                (0..HIDDEN).map(|_| 1.0 + next() * 0.05).collect();
+            let w_post_data: Vec<f32> =
+                (0..HIDDEN).map(|_| 1.0 + next() * 0.05).collect();
+            let q_norm_data: Vec<f32> =
+                (0..HD).map(|_| 1.0 + next() * 0.02).collect();
+            let k_norm_data: Vec<f32> =
+                (0..HD).map(|_| 1.0 + next() * 0.02).collect();
+            let w_q_data: Vec<f32> =
+                (0..(N_Q * HD * HIDDEN)).map(|_| next() * 0.05).collect();
+            let w_k_data: Vec<f32> =
+                (0..(N_KV * HD * HIDDEN)).map(|_| next() * 0.05).collect();
+            let w_v_data: Vec<f32> =
+                (0..(N_KV * HD * HIDDEN)).map(|_| next() * 0.05).collect();
+            let w_o_data: Vec<f32> =
+                (0..(HIDDEN * N_Q * HD)).map(|_| next() * 0.05).collect();
+            // Router weights with strong bias so routing is stable across
+            // small weight perturbations in the FD falsifier.
+            let w_gate_data: Vec<f32> = (0..(HIDDEN * N_EXPERTS))
+                .map(|i| {
+                    let row = i / N_EXPERTS;
+                    let col = i % N_EXPERTS;
+                    // Expert 0 and 1 get a large positive bias → always top-2.
+                    if col < MOE_K { 2.0 + (row as f32) * 0.001 + next() * 0.01 }
+                    else { -2.0 + next() * 0.01 }
+                })
+                .collect();
+            let mut gate_data_per_expert: Vec<Vec<f32>> = Vec::with_capacity(N_EXPERTS);
+            let mut up_data_per_expert: Vec<Vec<f32>> = Vec::with_capacity(N_EXPERTS);
+            let mut down_data_per_expert: Vec<Vec<f32>> = Vec::with_capacity(N_EXPERTS);
+            for e in 0..N_EXPERTS {
+                let off = (e as f32) * 0.1;
+                gate_data_per_expert.push(
+                    (0..(HIDDEN * INTERMEDIATE))
+                        .map(|_| next() * 0.03 + off * 0.01)
+                        .collect(),
+                );
+                up_data_per_expert.push(
+                    (0..(HIDDEN * INTERMEDIATE))
+                        .map(|_| next() * 0.03 + off * 0.01)
+                        .collect(),
+                );
+                down_data_per_expert.push(
+                    (0..(INTERMEDIATE * HIDDEN))
+                        .map(|_| next() * 0.03 + off * 0.01)
+                        .collect(),
+                );
+            }
+            RealGqaLayerFixture {
+                tape,
+                x_data,
+                w_q_data, w_k_data, w_v_data, w_o_data,
+                w_in_data, w_post_data, q_norm_data, k_norm_data,
+                w_gate_data,
+                gate_data_per_expert, up_data_per_expert, down_data_per_expert,
+            }
+        }
+
+        /// Materialise all leaf tensors on the fixture's tape and run one
+        /// forward pass.  Returns `(out_tensor, w_q_leaf, w_k_leaf, w_v_leaf, w_o_leaf)`.
+        fn forward_with_data(
+            &self,
+            w_q_data: &[f32],
+            w_k_data: &[f32],
+            w_v_data: &[f32],
+            w_o_data: &[f32],
+        ) -> (
+            super::GpuTensor,
+            super::GpuTensor,
+            super::GpuTensor,
+            super::GpuTensor,
+            super::GpuTensor,
+        ) {
+            use real_gqa_fixture::*;
+            use super::{
+                Qwen35RealGqaConfig, DecoderLayerWeightsRealGqa,
+                decoder_layer_on_tape_real_gqa, GpuTensor,
+            };
+
+            let tape = &self.tape;
+            let device = tape.device();
+
+            let xt = GpuTensor::from_vec(tape, &self.x_data, vec![N_TOKENS, HIDDEN]).unwrap();
+            let w_in = GpuTensor::from_vec(tape, &self.w_in_data, vec![HIDDEN]).unwrap();
+            let w_post = GpuTensor::from_vec(tape, &self.w_post_data, vec![HIDDEN]).unwrap();
+            let qn = GpuTensor::from_vec(tape, &self.q_norm_data, vec![HD]).unwrap();
+            let kn = GpuTensor::from_vec(tape, &self.k_norm_data, vec![HD]).unwrap();
+            let wq = GpuTensor::from_vec(tape, w_q_data, vec![N_Q * HD, HIDDEN]).unwrap();
+            let wk = GpuTensor::from_vec(tape, w_k_data, vec![N_KV * HD, HIDDEN]).unwrap();
+            let wv = GpuTensor::from_vec(tape, w_v_data, vec![N_KV * HD, HIDDEN]).unwrap();
+            let wo = GpuTensor::from_vec(tape, w_o_data, vec![HIDDEN, N_Q * HD]).unwrap();
+            let wg = GpuTensor::from_vec(tape, &self.w_gate_data, vec![HIDDEN, N_EXPERTS]).unwrap();
+
+            let mut gate_t: Vec<GpuTensor> = Vec::with_capacity(N_EXPERTS);
+            let mut up_t: Vec<GpuTensor> = Vec::with_capacity(N_EXPERTS);
+            let mut down_t: Vec<GpuTensor> = Vec::with_capacity(N_EXPERTS);
+            for e in 0..N_EXPERTS {
+                gate_t.push(
+                    GpuTensor::from_vec(tape, &self.gate_data_per_expert[e], vec![HIDDEN, INTERMEDIATE]).unwrap(),
+                );
+                up_t.push(
+                    GpuTensor::from_vec(tape, &self.up_data_per_expert[e], vec![HIDDEN, INTERMEDIATE]).unwrap(),
+                );
+                down_t.push(
+                    GpuTensor::from_vec(tape, &self.down_data_per_expert[e], vec![INTERMEDIATE, HIDDEN]).unwrap(),
+                );
+            }
+
+            let weights = DecoderLayerWeightsRealGqa {
+                w_in: &w_in, w_post: &w_post,
+                w_q: &wq, w_k: &wk, w_v: &wv, w_o: &wo,
+                q_norm_w: &qn, k_norm_w: &kn,
+                w_gate: &wg,
+                gate_projs: &gate_t, up_projs: &up_t, down_projs: &down_t,
+            };
+            let config = Qwen35RealGqaConfig {
+                n_q_heads: N_Q, n_kv_heads: N_KV, head_dim: HD,
+                seq_len: N_TOKENS, hidden: HIDDEN,
+                rope_theta_base: 10000.0,
+                // sections sum must equal rope_dim/2 = head_dim/2 = 32
+                rope_sections: [8, 8, 8, 8],
+                causal: true, sliding_window: None, rms_eps: RMS_EPS,
+            };
+            let pos_buf = make_pos_buf_for_gqa(&device, N_TOKENS);
+            let out = decoder_layer_on_tape_real_gqa(
+                tape, &xt, pos_buf, &weights, &config, MOE_K, RMS_EPS,
+            ).unwrap();
+
+            let wq_ret = wq;
+            let wk_ret = wk;
+            let wv_ret = wv;
+            let wo_ret = wo;
+            (out, wq_ret, wk_ret, wv_ret, wo_ret)
+        }
+    }
+
+    /// Phase 3b — Test 1: forward shape sanity.
+    ///
+    /// Verifies that `decoder_layer_on_tape_real_gqa` produces output
+    /// shape `[n_tokens, hidden]` with all-finite values.
+    #[test]
+    fn real_gqa_decoder_layer_forward_produces_correct_shape() {
+        use real_gqa_fixture::*;
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let fix = RealGqaLayerFixture::new(device);
+        let (out, _, _, _, _) =
+            fix.forward_with_data(&fix.w_q_data, &fix.w_k_data, &fix.w_v_data, &fix.w_o_data);
+
+        assert_eq!(
+            out.shape(),
+            &[N_TOKENS, HIDDEN],
+            "real_gqa output shape must be [n_tokens, hidden]"
+        );
+        let host = out.to_vec().unwrap();
+        for (i, v) in host.iter().enumerate() {
+            assert!(v.is_finite(), "real_gqa output[{i}] = {v} not finite");
+        }
+        eprintln!(
+            "[real_gqa_fwd] OK — shape={:?}, loss_proxy={:.4}",
+            out.shape(),
+            host.iter().map(|v| *v as f64).sum::<f64>()
+        );
+    }
+
+    /// Phase 3b — Test 2: finite-difference falsifier on Q/K/V/O projections.
+    ///
+    /// LOAD-BEARING correctness signal for the real-GQA attention path.
+    ///
+    /// The rope and flash_attn_train ops cast F32↔BF16 internally.  To keep
+    /// FD reliable, all weight/input data is pre-rounded to BF16 before
+    /// perturbing (matching the protocol in `tape_flash_attn_train_backward_finite_diff_q`).
+    /// `eps=2e-2` (≈5× BF16 ULP at magnitude 0.5) ensures the perturbation
+    /// survives the F32→BF16 quantization boundary.
+    ///
+    /// Absolute tolerances per weight (calibrated from existing Phase 3a tests):
+    ///   * `w_q`, `w_k`, `w_v` — `atol=0.5` (gradient traverses rope BF16 ×2 +
+    ///     flash_attn BF16 round-trips, accumulating systematic BF16 error)
+    ///   * `w_o`               — `atol=0.2` (rope BF16 ×2 in pre-projection
+    ///     path; w_o matmul is F32-exact on top of the BF16 flash_attn output)
+    ///
+    /// These tolerances are empirically validated by the existing Phase 3a FD
+    /// tests: `tape_rope_backward_finite_diff` uses `atol=0.15` for rope alone;
+    /// `tape_flash_attn_train_backward_finite_diff_k` uses `atol=0.3` for flash
+    /// attn alone.  A compound BF16 chain (rope + flash + rms_norm + matmul)
+    /// justifies the wider bounds.
+    ///
+    /// Even at these widened tolerances, the tests are load-bearing: gradient
+    /// sign + order-of-magnitude must agree.  A completely broken backward
+    /// (e.g. gradient = 0, or gradient of wrong sign, or 10× off) will fail.
+    #[test]
+    fn real_gqa_decoder_layer_finite_diff_qkvo() {
+        use crate::calibrate::autograd_gpu_tape::{backward, ones_like};
+        use mlx_native::MlxDevice;
+
+        // Pre-round f32 to BF16 and back — idem-potent under BF16 cast so
+        // FD perturbations are not swallowed by quantization boundaries.
+        let to_bf16 = |v: &[f32]| -> Vec<f32> {
+            v.iter().map(|&x| half::bf16::from_f32(x).to_f32()).collect()
+        };
+
+        // eps must be ≥ 5× BF16 ULP at magnitude ~0.5 (ULP ≈ 3.9e-3).
+        let eps = 2e-2f32;
+        let probe_idx = 0usize;
+
+        // Helper: run forward+backward for given w_q/k/v/o (all pre-rounded).
+        let run = |wq: Vec<f32>, wk: Vec<f32>, wv: Vec<f32>, wo: Vec<f32>|
+            -> (f32, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)
+        {
+            let dev = MlxDevice::new().unwrap();
+            let fix = RealGqaLayerFixture::new(dev);
+            let tape = &fix.tape;
+            let (out, wq_t, wk_t, wv_t, wo_t) = fix.forward_with_data(&wq, &wk, &wv, &wo);
+            let loss_host = out.to_vec().unwrap();
+            let loss: f32 = loss_host.iter().map(|v| *v as f64).sum::<f64>() as f32;
+            let dy = ones_like(tape, out.shape()).unwrap();
+            let grads = backward(&out, dy).unwrap();
+            let read_g = |idx: usize| -> Vec<f32> {
+                grads[idx].as_ref().unwrap().as_slice::<f32>().unwrap().to_vec()
+            };
+            (loss, read_g(wq_t.node_idx()), read_g(wk_t.node_idx()),
+             read_g(wv_t.node_idx()), read_g(wo_t.node_idx()))
+        };
+
+        // Pull baseline weight vectors from the deterministic fixture.
+        let base_fix = RealGqaLayerFixture::new(MlxDevice::new().unwrap());
+        // Pre-round to BF16.
+        let wq0 = to_bf16(&base_fix.w_q_data);
+        let wk0 = to_bf16(&base_fix.w_k_data);
+        let wv0 = to_bf16(&base_fix.w_v_data);
+        let wo0 = to_bf16(&base_fix.w_o_data);
+
+        // Analytical gradients from the baseline.
+        let (_, g_wq0, g_wk0, g_wv0, g_wo0) =
+            run(wq0.clone(), wk0.clone(), wv0.clone(), wo0.clone());
+
+        // ── w_q FD ──────────────────────────────────────────────────────────
+        let fd_wq = {
+            let mut p = wq0.clone(); p[probe_idx] += eps;
+            let mut m = wq0.clone(); m[probe_idx] -= eps;
+            let (lp, _, _, _, _) = run(p, wk0.clone(), wv0.clone(), wo0.clone());
+            let (lm, _, _, _, _) = run(m, wk0.clone(), wv0.clone(), wo0.clone());
+            (lp - lm) / (2.0 * eps)
+        };
+        let a_wq = g_wq0[probe_idx]; let d_wq = (a_wq - fd_wq).abs();
+        eprintln!("[real_gqa_fd] w_q[{probe_idx}]: analytic={a_wq:.4e} fd={fd_wq:.4e} diff={d_wq:.4e}");
+        assert!(
+            a_wq.signum() == fd_wq.signum(),
+            "w_q FD sign mismatch: analytic={a_wq:.4e} fd={fd_wq:.4e}"
+        );
+        assert!(
+            d_wq < 0.5,
+            "w_q FD magnitude check FAILED (atol=0.5): analytic={a_wq:.4e} fd={fd_wq:.4e} diff={d_wq:.4e}"
+        );
+
+        // ── w_k FD ──────────────────────────────────────────────────────────
+        let fd_wk = {
+            let mut p = wk0.clone(); p[probe_idx] += eps;
+            let mut m = wk0.clone(); m[probe_idx] -= eps;
+            let (lp, _, _, _, _) = run(wq0.clone(), p, wv0.clone(), wo0.clone());
+            let (lm, _, _, _, _) = run(wq0.clone(), m, wv0.clone(), wo0.clone());
+            (lp - lm) / (2.0 * eps)
+        };
+        let a_wk = g_wk0[probe_idx]; let d_wk = (a_wk - fd_wk).abs();
+        eprintln!("[real_gqa_fd] w_k[{probe_idx}]: analytic={a_wk:.4e} fd={fd_wk:.4e} diff={d_wk:.4e}");
+        assert!(
+            a_wk.signum() == fd_wk.signum(),
+            "w_k FD sign mismatch: analytic={a_wk:.4e} fd={fd_wk:.4e}"
+        );
+        assert!(
+            d_wk < 0.5,
+            "w_k FD magnitude check FAILED (atol=0.5): analytic={a_wk:.4e} fd={fd_wk:.4e} diff={d_wk:.4e}"
+        );
+
+        // ── w_v FD ──────────────────────────────────────────────────────────
+        let fd_wv = {
+            let mut p = wv0.clone(); p[probe_idx] += eps;
+            let mut m = wv0.clone(); m[probe_idx] -= eps;
+            let (lp, _, _, _, _) = run(wq0.clone(), wk0.clone(), p, wo0.clone());
+            let (lm, _, _, _, _) = run(wq0.clone(), wk0.clone(), m, wo0.clone());
+            (lp - lm) / (2.0 * eps)
+        };
+        let a_wv = g_wv0[probe_idx]; let d_wv = (a_wv - fd_wv).abs();
+        eprintln!("[real_gqa_fd] w_v[{probe_idx}]: analytic={a_wv:.4e} fd={fd_wv:.4e} diff={d_wv:.4e}");
+        assert!(
+            a_wv.signum() == fd_wv.signum(),
+            "w_v FD sign mismatch: analytic={a_wv:.4e} fd={fd_wv:.4e}"
+        );
+        assert!(
+            d_wv < 0.5,
+            "w_v FD magnitude check FAILED (atol=0.5): analytic={a_wv:.4e} fd={fd_wv:.4e} diff={d_wv:.4e}"
+        );
+
+        // ── w_o FD ──────────────────────────────────────────────────────────
+        // w_o is the output projection applied AFTER the BF16 flash_attn output;
+        // only the flash_attn BF16 round-trip contributes systematic error here,
+        // so we use a tighter atol=0.2 (vs 0.5 for Q/K/V which also traverse rope).
+        let fd_wo = {
+            let mut p = wo0.clone(); p[probe_idx] += eps;
+            let mut m = wo0.clone(); m[probe_idx] -= eps;
+            let (lp, _, _, _, _) = run(wq0.clone(), wk0.clone(), wv0.clone(), p);
+            let (lm, _, _, _, _) = run(wq0.clone(), wk0.clone(), wv0.clone(), m);
+            (lp - lm) / (2.0 * eps)
+        };
+        let a_wo = g_wo0[probe_idx]; let d_wo = (a_wo - fd_wo).abs();
+        eprintln!("[real_gqa_fd] w_o[{probe_idx}]: analytic={a_wo:.4e} fd={fd_wo:.4e} diff={d_wo:.4e}");
+        assert!(
+            a_wo.signum() == fd_wo.signum(),
+            "w_o FD sign mismatch: analytic={a_wo:.4e} fd={fd_wo:.4e}"
+        );
+        assert!(
+            d_wo < 0.2,
+            "w_o FD magnitude check FAILED (atol=0.2): analytic={a_wo:.4e} fd={fd_wo:.4e} diff={d_wo:.4e}"
+        );
+    }
+
+    /// Phase 3b — Test 3: convergence with perturbed w_q.
+    ///
+    /// Pins teacher targets to a forward pass with optimal w_q, then
+    /// trains a student w_q starting from perturb=+0.1*noise over 30
+    /// SGD steps.  Asserts head-vs-tail-avg loss ratio < 0.80 (≥ 20%
+    /// decrease), proving gradient sign is correct end-to-end.
+    #[test]
+    fn real_gqa_decoder_layer_perturbed_w_q_converges() {
+        use real_gqa_fixture::*;
+        use crate::calibrate::autograd_gpu_tape::{backward, ones_like};
+        use mlx_native::MlxDevice;
+
+        let n_steps = 30usize;
+        let lr = 3e-3f32;
+
+        // ---- Build teacher target ----
+        let device = MlxDevice::new().unwrap();
+        let fix_teacher = RealGqaLayerFixture::new(device.clone());
+        let (teacher_out, _, _, _, _) = fix_teacher.forward_with_data(
+            &fix_teacher.w_q_data, &fix_teacher.w_k_data,
+            &fix_teacher.w_v_data, &fix_teacher.w_o_data,
+        );
+        let teacher_target: Vec<f32> = teacher_out.to_vec().unwrap();
+
+        // ---- Student: perturb w_q by +0.1 * small noise ----
+        let mut rng: u64 = 0xBEEF_CAFE_1111_2222;
+        let mut next_noise = move || -> f32 {
+            rng ^= rng >> 33;
+            rng = rng.wrapping_mul(0xff51_afd7_ed55_8ccd);
+            rng ^= rng >> 33;
+            ((rng as i64) as f32) / (i64::MAX as f32)
+        };
+        let w_q_size = N_Q * HD * HIDDEN;
+        let mut w_q_student: Vec<f32> = fix_teacher.w_q_data
+            .iter()
+            .map(|&v| v + 0.1 * next_noise())
+            .collect();
+
+        // ---- SGD loop ----
+        // One step: build fresh tape, run forward, backward, update w_q.
+        let mut losses: Vec<f32> = Vec::with_capacity(n_steps + 1);
+
+        for _step in 0..n_steps {
+            let dev_step = MlxDevice::new().unwrap();
+            let fix_step = RealGqaLayerFixture::new(dev_step.clone());
+            let tape = &fix_step.tape;
+
+            // Build tensors on this step's tape.
+            use crate::calibrate::autograd_gpu_tape::{GpuTensor, sub, square};
+            let (out, wq_t, _, _, _) = fix_step.forward_with_data(
+                &w_q_student, &fix_teacher.w_k_data,
+                &fix_teacher.w_v_data, &fix_teacher.w_o_data,
+            );
+
+            // MSE loss against teacher target.
+            let target_t = GpuTensor::from_vec(
+                tape, &teacher_target, vec![N_TOKENS, HIDDEN],
+            ).unwrap();
+            let diff = sub(&out, &target_t).unwrap();
+            let sqr = square(&diff).unwrap();
+
+            let loss_host: Vec<f32> = sqr.to_vec().unwrap();
+            let loss: f32 = loss_host.iter().sum::<f32>() / loss_host.len() as f32;
+            losses.push(loss);
+            eprintln!("[real_gqa_conv] step={_step} loss={loss:.4e}");
+
+            let dy = ones_like(tape, sqr.shape()).unwrap();
+            let grads = backward(&sqr, dy).unwrap();
+            let g_wq = grads[wq_t.node_idx()]
+                .as_ref()
+                .unwrap()
+                .as_slice::<f32>()
+                .unwrap()
+                .to_vec();
+
+            // SGD update.
+            for i in 0..w_q_size {
+                w_q_student[i] -= lr * g_wq[i];
+            }
+        }
+
+        // Head (first 5) vs tail (last 5) average loss.
+        let head_n = 5usize.min(n_steps / 2);
+        let tail_n = 5usize.min(n_steps / 2);
+        let head_avg: f32 =
+            losses[..head_n].iter().sum::<f32>() / head_n as f32;
+        let tail_avg: f32 =
+            losses[n_steps - tail_n..].iter().sum::<f32>() / tail_n as f32;
+        let ratio = tail_avg / head_avg;
+        eprintln!(
+            "[real_gqa_conv] head_avg={head_avg:.4e} tail_avg={tail_avg:.4e} ratio={ratio:.4}"
+        );
+        assert!(
+            ratio < 0.80,
+            "w_q convergence FAILED: tail/head ratio={ratio:.4} >= 0.80 — \
+             gradient sign may be wrong.  Trajectory: {:?}",
+            losses
+        );
     }
 }
