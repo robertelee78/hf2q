@@ -56,6 +56,20 @@ pub struct FullAttnKvSlot {
     /// Per-seq write cursor. `current_len[s]` = number of tokens already
     /// stored for sequence s.
     pub current_len: Vec<u32>,
+    /// ADR-027 Phase B iter-8 — TQ-active K/V buffers. `Some` when the
+    /// containing `HybridKvCache` was constructed via
+    /// `new_with_options(.., tq_kv_active = true)` (production path:
+    /// `HF2Q_TQ_KV=1`); `None` in the legacy F32-only path (default,
+    /// preserves all 71 existing `HybridKvCache::new(...)` callers).
+    ///
+    /// **Iter-8 scope (this commit):** allocator branching only. The
+    /// SDPA dispatch + KV write branches that consume these buffers
+    /// are iter-9 scope. In iter-8, when `tq.is_some()` the F32 `k` /
+    /// `v` are STILL allocated alongside (shadow-cache pattern;
+    /// mirrors Gemma's `dense_kvs` + `leg_hb_encoded` co-existence at
+    /// `forward_mlx.rs:739+824`).  iter-11 (post-NRMSE-parity) drops
+    /// the F32 backing in TQ mode for the full 3.94× memory savings.
+    pub tq: Option<TqFullAttnKvBuffers>,
 }
 
 /// Per-linear-attention-layer SSM state + conv ring buffer.
@@ -401,6 +415,40 @@ impl HybridKvCache {
         max_seq_len: u32,
         n_seqs: u32,
     ) -> Result<Self> {
+        // ADR-027 Phase B iter-8: legacy constructor delegates to the
+        // tq-aware variant with tq_kv_active=false. ALL 71 existing
+        // call sites stay unchanged; production TQ-active dispatch
+        // routes through `new_with_options` from iter-9 forward.
+        Self::new_with_options(cfg, device, max_seq_len, n_seqs, false)
+    }
+
+    /// ADR-027 Phase B iter-8 — tq-aware constructor. When
+    /// `tq_kv_active = true` each full-attention slot (including the
+    /// optional MTP slot) is augmented with a [`TqFullAttnKvBuffers`]
+    /// alongside its existing F32 K/V buffers (shadow-cache pattern,
+    /// mirrors Gemma's `dense_kvs` + `leg_hb_encoded` co-existence at
+    /// `forward_mlx.rs:739+824`).
+    ///
+    /// In iter-8 the TQ buffers are allocated + zero-initialized only;
+    /// the SDPA dispatch + KV-write branches that consume them are
+    /// iter-9 scope. iter-11 (post-NRMSE-parity) drops the F32 backing
+    /// in TQ mode for the full 3.94× memory savings claim from §1.
+    ///
+    /// Linear-attn slots are unchanged regardless of `tq_kv_active`
+    /// (DeltaNet SSM state is already compressed; per ADR-027 §3
+    /// non-goal "TQ on linear-attn DeltaNet state").
+    ///
+    /// # Errors
+    ///
+    /// Same preconditions as [`Self::new`] plus any TQ allocation
+    /// failure (propagated from [`alloc_tq_full_attn_buffers`]).
+    pub fn new_with_options(
+        cfg: &Qwen35Config,
+        device: &MlxDevice,
+        max_seq_len: u32,
+        n_seqs: u32,
+        tq_kv_active: bool,
+    ) -> Result<Self> {
         if max_seq_len == 0 {
             return Err(anyhow!("HybridKvCache: max_seq_len must be > 0"));
         }
@@ -420,10 +468,21 @@ impl HybridKvCache {
                 Qwen35LayerKind::FullAttention => {
                     let rank = full_attn.len() as u32;
                     per_layer_slot.push(LayerSlot::Full(rank));
-                    full_attn.push(alloc_full_attn_slot(
+                    let mut slot = alloc_full_attn_slot(
                         cfg, device, max_seq_len, n_seqs,
                     )
-                    .with_context(|| format!("alloc full-attn slot (layer {layer_idx})"))?);
+                    .with_context(|| format!("alloc full-attn slot (layer {layer_idx})"))?;
+                    if tq_kv_active {
+                        slot.tq = Some(
+                            alloc_tq_full_attn_buffers(
+                                cfg, device, max_seq_len, n_seqs,
+                            )
+                            .with_context(|| {
+                                format!("alloc tq full-attn buffers (layer {layer_idx})")
+                            })?,
+                        );
+                    }
+                    full_attn.push(slot);
                 }
                 Qwen35LayerKind::LinearAttention => {
                     let rank = linear_attn.len() as u32;
@@ -441,10 +500,15 @@ impl HybridKvCache {
         }
 
         let mtp_slot = if cfg.mtp_num_hidden_layers > 0 {
-            Some(
-                alloc_full_attn_slot(cfg, device, max_seq_len, n_seqs)
-                    .context("alloc MTP full-attn slot")?,
-            )
+            let mut slot = alloc_full_attn_slot(cfg, device, max_seq_len, n_seqs)
+                .context("alloc MTP full-attn slot")?;
+            if tq_kv_active {
+                slot.tq = Some(
+                    alloc_tq_full_attn_buffers(cfg, device, max_seq_len, n_seqs)
+                        .context("alloc tq full-attn buffers (MTP slot)")?,
+                );
+            }
+            Some(slot)
         } else {
             None
         };
@@ -900,6 +964,9 @@ fn alloc_full_attn_slot(
         k,
         v,
         current_len: vec![0; n_seqs as usize],
+        // ADR-027 Phase B iter-8: tq is None on the legacy F32 path.
+        // Set by `HybridKvCache::new_with_options` when tq_kv_active=true.
+        tq: None,
     })
 }
 
@@ -1948,6 +2015,174 @@ mod tests {
         for f in buffers.v_norms.as_slice::<f32>().expect("v_norms slice") {
             assert_eq!(*f, 0.0_f32);
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-027 Phase B iter-8 — HybridKvCache::new_with_options tests
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn hybrid_kv_cache_new_with_options_tq_off_keeps_tq_none_per_slot() {
+        // Default path (tq_kv_active=false): every full-attn slot has
+        // tq=None. Mirrors the legacy `HybridKvCache::new(...)` behavior
+        // exactly. This test pins the regression contract for all 71
+        // existing call sites.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, false)
+            .expect("kv");
+        assert!(!cache.full_attn.is_empty(), "test fixture has full-attn layers");
+        for (i, slot) in cache.full_attn.iter().enumerate() {
+            assert!(
+                slot.tq.is_none(),
+                "full_attn[{i}].tq must be None when tq_kv_active=false"
+            );
+        }
+        // Legacy `new()` is byte-identical to `new_with_options(... false)`.
+        let legacy = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv legacy");
+        assert_eq!(legacy.full_attn.len(), cache.full_attn.len());
+        for slot in legacy.full_attn.iter() {
+            assert!(slot.tq.is_none(), "legacy `new()` keeps tq=None");
+        }
+    }
+
+    #[test]
+    fn hybrid_kv_cache_new_with_options_tq_on_populates_tq_per_full_attn_slot() {
+        // tq_kv_active=true: every full-attn slot gets a populated
+        // TqFullAttnKvBuffers alongside its existing F32 K/V buffers
+        // (shadow-cache pattern; iter-11 drops the F32 backing).
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, true)
+            .expect("kv tq-on");
+        assert!(!cache.full_attn.is_empty());
+        let n_full_attn = cache.full_attn.len();
+        for (i, slot) in cache.full_attn.iter().enumerate() {
+            assert!(
+                slot.tq.is_some(),
+                "full_attn[{i}].tq must be Some when tq_kv_active=true"
+            );
+            let tq = slot.tq.as_ref().unwrap();
+            assert_eq!(tq.norms_per_pos, 1, "head_dim=256 → norms_per_pos=1");
+            // K/V F32 buffers also remain allocated (shadow cache).
+            assert!(slot.k.byte_len() > 0);
+            assert!(slot.v.byte_len() > 0);
+        }
+        // MTP slot: tq present iff cfg has MTP. moe_cfg_40layer() sets
+        // mtp_num_hidden_layers=0 → mtp_slot is None entirely.
+        assert!(cache.mtp_slot.is_none(), "moe_cfg_40layer has no MTP");
+        // Linear-attn slots are unchanged (no TQ field — DeltaNet SSM
+        // state stays F32 per ADR-027 §3 non-goal).
+        assert_eq!(
+            cache.full_attn.len() + cache.linear_attn.len(),
+            cfg.layer_types.len(),
+            "every model layer maps to exactly one slot"
+        );
+        let _ = n_full_attn;
+    }
+
+    #[test]
+    fn hybrid_kv_cache_new_with_options_tq_on_byte_count_at_qwen36_apex_shape() {
+        // Empirical byte-count parity at qwen36 35B-A3B-APEX shape:
+        // each full-attn slot now holds F32 K (16 MB) + F32 V (16 MB)
+        // + TQ packed K+V (8.13 MB) + TQ norms K+V (128 KB) =
+        // 40_517_632 bytes per slot (up from 33_554_432 F32-only).
+        // iter-11 will drop the F32 K+V backing, restoring 33.55 MB →
+        // 8.52 MB savings (3.94×).
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let max_seq_len: u32 = 8192;
+        let n_seqs: u32 = 1;
+        let cache = HybridKvCache::new_with_options(
+            &cfg, &device, max_seq_len, n_seqs, true,
+        )
+        .expect("kv tq-on");
+        let slot = &cache.full_attn[0];
+        assert!(slot.tq.is_some());
+        let tq = slot.tq.as_ref().unwrap();
+        // F32 K and V each 16 MB at this shape (1×2×8192×256×4).
+        let f32_each = 1 * 2 * 8192 * 256 * 4;
+        assert_eq!(slot.k.byte_len(), f32_each);
+        assert_eq!(slot.v.byte_len(), f32_each);
+        // TQ K_packed + V_packed: 1×2×8192×256 each (U8) = 4 MB each.
+        assert_eq!(tq.k_packed.byte_len(), 1 * 2 * 8192 * 256);
+        assert_eq!(tq.v_packed.byte_len(), 1 * 2 * 8192 * 256);
+        // TQ K_norms + V_norms: 1×2×8192×1×4 each = 64 KB.
+        assert_eq!(tq.k_norms.byte_len(), 1 * 2 * 8192 * 1 * 4);
+        assert_eq!(tq.v_norms.byte_len(), 1 * 2 * 8192 * 1 * 4);
+        // Per-slot total in shadow-cache mode (iter-8): F32 + TQ.
+        // F32 K+V = 33_554_432; TQ K+V (packed+norms) = 8_519_680;
+        // shadow total = 42_074_112 bytes (iter-11 drops F32 → 8.5 MB only).
+        let per_slot_total = 2 * f32_each + tq.total_bytes();
+        assert_eq!(per_slot_total, 42_074_112);
+        // Once iter-11 drops F32 in TQ mode, per_slot_total ==
+        // tq.total_bytes() == 8_519_680. Documenting the target here
+        // so iter-11 has a regression-pin.
+        assert_eq!(tq.total_bytes(), 8_519_680);
+    }
+
+    #[test]
+    fn hybrid_kv_cache_new_with_options_tq_on_with_mtp_populates_mtp_tq() {
+        // Synthetic cfg with MTP enabled — the MTP full-attn slot
+        // should ALSO get a populated tq when tq_kv_active=true.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let mut cfg = moe_cfg_40layer();
+        cfg.mtp_num_hidden_layers = 1;
+        let cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, true)
+            .expect("kv tq-on with mtp");
+        assert!(cache.mtp_slot.is_some(), "cfg has MTP layer");
+        let mtp = cache.mtp_slot.as_ref().unwrap();
+        assert!(
+            mtp.tq.is_some(),
+            "MTP slot should ALSO have tq populated when tq_kv_active=true"
+        );
+    }
+
+    #[test]
+    fn hybrid_kv_cache_new_with_options_tq_off_with_mtp_keeps_mtp_tq_none() {
+        // Same MTP cfg but tq_kv_active=false: MTP slot has tq=None.
+        // Ensures the MTP arm honors the flag identically to regular
+        // full-attn slots.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let mut cfg = moe_cfg_40layer();
+        cfg.mtp_num_hidden_layers = 1;
+        let cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, false)
+            .expect("kv tq-off with mtp");
+        assert!(cache.mtp_slot.is_some());
+        assert!(
+            cache.mtp_slot.as_ref().unwrap().tq.is_none(),
+            "MTP slot tq=None when tq_kv_active=false"
+        );
     }
 
     #[test]
