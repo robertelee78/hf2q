@@ -29,7 +29,7 @@ use std::time::Instant;
 use crate::debug::INVESTIGATION_ENV;
 use super::config::LayerType;
 use super::forward_mlx::{
-    DenseKvBuffers, MlxModelWeights, dispatch_qmatmul,
+    DenseKvBuffers, HbKvBuffers, MlxModelWeights, dispatch_qmatmul,
     dispatch_rms_norm_unit_perhead_dual_perm,
 };
 use super::gpu::GpuContext;
@@ -295,6 +295,55 @@ impl MlxModelWeights {
             max_nh as u32, max_hd as u32);
         let sdpa_tmp = dev.alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
             .map_err(|e| anyhow::anyhow!("batched sdpa_tmp: {e}"))?;
+
+        // ADR-010 iter-64 — eager allocation of leg_hb_encoded for batched
+        // prefill, mirrors per-token forward_prefill.rs:804-852. Without
+        // this block, self.leg_hb_encoded was lazily allocated at the first
+        // decode that needed HB cache (forward_mlx.rs:2314), AFTER batched-
+        // prefill returned — leaving the buffers zero-initialized for the
+        // decode SDPA reads → garbage attention → gibberish tokens. See
+        // ADR-010 §Status Log 2026-05-09 iter-63 smoking-gun localization.
+        let tq_codebook_bits_prefill: u32 = match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
+            Ok("4") => 0,
+            Ok("5") => 5, Ok("6") => 6, Ok("8") => 8,
+            _ => 8,  // DEFAULT: 8-bit (matches forward_prefill.rs)
+        };
+        let tq_scale_factor_d512: f32 = match std::env::var("HF2Q_SCALE_FORMULA").as_deref() {
+            Ok("sqrt256") => 16.0_f32,
+            Ok("sqrt512") => 512.0_f32.sqrt(),
+            _ => 1.0_f32,  // bare (iter-16 default)
+        };
+        if tq_codebook_bits_prefill >= 5 {
+            eprintln!("[iter-21 Track B] Allocating leg_hb_encoded ({}-bit, {} layers) [batched]",
+                      tq_codebook_bits_prefill, num_layers);
+            let mut leg_hb_vec: Vec<HbKvBuffers> = Vec::with_capacity(num_layers);
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let nkv_l = layer.num_kv_heads;
+                let hd_l = layer.head_dim;
+                let layer_is_ring = layer.layer_type == LayerType::Sliding;
+                let capacity = if layer_is_ring { sw } else { linear_capacity };
+                let norms_per_pos = (hd_l / 256).max(1);
+                let norms_n = nkv_l * capacity * norms_per_pos;
+                let k_packed = dev.alloc_buffer(nkv_l * capacity * hd_l, mlx_native::DType::U8,
+                    vec![nkv_l, capacity, hd_l])
+                    .map_err(|e| anyhow::anyhow!("leg_hb batched K packed L{layer_idx}: {e}"))?;
+                let k_norms = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
+                    if norms_per_pos == 1 { vec![nkv_l, capacity] } else { vec![nkv_l, capacity, norms_per_pos] })
+                    .map_err(|e| anyhow::anyhow!("leg_hb batched K norms L{layer_idx}: {e}"))?;
+                let v_packed = dev.alloc_buffer(nkv_l * capacity * hd_l, mlx_native::DType::U8,
+                    vec![nkv_l, capacity, hd_l])
+                    .map_err(|e| anyhow::anyhow!("leg_hb batched V packed L{layer_idx}: {e}"))?;
+                let v_norms = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
+                    if norms_per_pos == 1 { vec![nkv_l, capacity] } else { vec![nkv_l, capacity, norms_per_pos] })
+                    .map_err(|e| anyhow::anyhow!("leg_hb batched V norms L{layer_idx}: {e}"))?;
+                leg_hb_vec.push(HbKvBuffers {
+                    k_packed, k_norms, v_packed, v_norms,
+                    capacity, is_sliding: layer_is_ring, norms_per_pos,
+                });
+            }
+            self.leg_hb_encoded = Some(leg_hb_vec);
+            eprintln!("[iter-21 Track B] leg_hb_encoded ready ({} layers) [batched]", num_layers);
+        }
 
         // -------------------------------------------------------------------
         // Batched activation buffers (seq_len × ...)
@@ -1324,6 +1373,47 @@ impl MlxModelWeights {
                 }
                 if let Some(t0) = t0_kv_copy {
                     bucket_finish!(s, exec, t0, &PROFILE_B_KV_COPY_NS, &PROFILE_B_KV_COPY_COUNT, 1, "kv_copy");
+                }
+
+                // ADR-010 iter-64 — HB encode K/V into leg_hb_encoded for
+                // batched prefill (mirrors per-token forward_prefill.rs:1234-1272).
+                // Decode reads from leg_hb_encoded via flash_attn_vec_tq_hb;
+                // without this block the buffers stay zero-initialized →
+                // gibberish post-prefill. Use the SAME write-position
+                // semantics as the dense KV copy above (dst_seq_pos_start /
+                // n_copy / src_tok_offset) so dense and HB caches stay in
+                // lockstep on sliding-window ring positions.
+                if tq_codebook_bits_prefill >= 5 && !INVESTIGATION_ENV.skip_tq_encode {
+                    if let Some(ref leg_hb_enc) = self.leg_hb_encoded {
+                        let hb_cap = leg_hb_enc[layer_idx].capacity as u32;
+                        let hb_is_ring = leg_hb_enc[layer_idx].is_sliding;
+                        s.barrier_between(
+                            &[&pf_k_normed],
+                            &[&leg_hb_enc[layer_idx].k_packed, &leg_hb_enc[layer_idx].k_norms],
+                        );
+                        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq(
+                            s.encoder_mut(), reg, metal_dev,
+                            &pf_k_normed,
+                            &leg_hb_enc[layer_idx].k_packed,
+                            &leg_hb_enc[layer_idx].k_norms,
+                            nkv as u32, hd as u32,
+                            hb_cap, dst_seq_pos_start, n_copy as u32, src_tok_offset,
+                            hb_is_ring, tq_scale_factor_d512, tq_codebook_bits_prefill,
+                        ).map_err(|e| anyhow::anyhow!("batched HB encode K L{layer_idx}: {e}"))?;
+                        s.barrier_between(
+                            &[&pf_v_normed],
+                            &[&leg_hb_enc[layer_idx].v_packed, &leg_hb_enc[layer_idx].v_norms],
+                        );
+                        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq(
+                            s.encoder_mut(), reg, metal_dev,
+                            &pf_v_normed,
+                            &leg_hb_enc[layer_idx].v_packed,
+                            &leg_hb_enc[layer_idx].v_norms,
+                            nkv as u32, hd as u32,
+                            hb_cap, dst_seq_pos_start, n_copy as u32, src_tok_offset,
+                            hb_is_ring, tq_scale_factor_d512, tq_codebook_bits_prefill,
+                        ).map_err(|e| anyhow::anyhow!("batched HB encode V L{layer_idx}: {e}"))?;
+                    }
                 }
 
                 // ADR-011 Phase 3 Wave P3b.3 — MLP + MoE continue in the
