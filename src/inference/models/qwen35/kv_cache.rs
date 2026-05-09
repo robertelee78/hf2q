@@ -362,6 +362,9 @@ impl FullAttnKvSlot {
             ring_start: params.ring_start,
             scale_factor_d512: params.scale_factor_d512,
             codebook_bits: params.codebook_bits,
+            // ADR-028 iter-106: caller pre-rotates Q (qwen35 path keeps
+            // current FWHT-pre dispatch).
+            fuse_fwht_pre: 0,
         };
         mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb(
             encoder,

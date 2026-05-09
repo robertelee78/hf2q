@@ -3445,6 +3445,11 @@ impl MlxModelWeights {
                             ring_start: ring_start_hb,
                             scale_factor_d512: tq_scale_factor_d512,
                             codebook_bits: tq_codebook_bits,
+                            // ADR-028 iter-106: 0 = caller pre-rotates Q
+                            // (current production path; FWHT-pre dispatch
+                            // above remains). Iter-107+ flips to 1 + drops
+                            // the FWHT dispatch once the gate suite clears.
+                            fuse_fwht_pre: 0,
                         };
                         mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb(
                             s.encoder_mut(), reg, dev,
