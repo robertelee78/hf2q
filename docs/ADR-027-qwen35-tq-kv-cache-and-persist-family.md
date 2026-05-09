@@ -179,11 +179,59 @@ Falsifier: needle-haystack 12/12 at 4K-32K on Qwen 3.6 APEX-Q5_K_M with `HF2Q_TQ
 
 ### 4.7 Cold-resume seam (cmd_generate_qwen35 + on-disk LCP back-end)
 
-`cmd_generate_qwen35` (`src/serve/mod.rs:1915`) is the dedicated qwen35 dispatch path. Phase A iter-5 wires:
+**Iter-6 investigation finding (2026-05-08):** the cache shape that
+`Qwen35HybridConfig` captures (specifically `full_attn_shape`'s
+`max_seq_len` and `n_seqs`) is determined PER-PREFILL via
+`HybridKvCache::new(&cfg, &device, max_seq_len, n_seqs)`
+(kv_cache.rs:347+, called from `forward_gpu.rs::forward` and the
+spec-decode path at runtime). It is NOT a load-time invariant — a
+single loaded model can serve prefills with different `max_seq_len`s
+across requests.
 
-- `Qwen35LoadedModel` (`src/serve/api/engine_qwen35.rs:127`) gains a `disk_persistor: Option<Qwen35DiskPersistor>` field — `None` when `HF2Q_KV_PERSIST` env is unset, `Some(persistor)` otherwise. The persistor reads `~/.cache/hf2q/qwen35_kv/<repo>/<quant>/<lcp_key>.bin` files into the in-memory `LcpRegistry` on construction (cold-resume hydrate), and writes back on insert.
-- The `LcpRegistry` insert path (already existing) gets a write-through hook to the persistor when present. The lookup path is unchanged: in-memory hits remain hot.
-- `cmd_serve` (qwen35 startup) constructs the persistor when `HF2Q_KV_PERSIST` is set and threads it through `LoadOptions` to `Qwen35LoadedModel::load`.
+Consequence: iter-5's `Qwen35DiskPersistor::new(cache_dir, cfg)`
+signature is over-specified. The persistor cannot be constructed at
+engine load with a "fixed" cfg because the runtime cfg varies per
+prefill.
+
+Two iter-6 design candidates (operator decision required):
+
+**Candidate A — refactor persistor to take cfg per-call.**
+Drop `cfg` field from `Qwen35DiskPersistor`; pass `&Qwen35HybridConfig`
+to `write` / `read` / new `hydrate_for_cfg`. Construction only needs
+`cache_dir`. iter-5's 5 unit tests + the persistor's per-cfg
+fingerprint subdir layout still hold; only the API surface changes.
+
+**Candidate B — construct persistor lazily at first prefill.**
+Persistor lives in worker-thread state (not `Qwen35LoadedModel`),
+constructed when the first prefill knows its cfg. Different
+threading + ownership story; load path stays untouched. cmd_serve
+just threads the `kv_persist_dir: Option<PathBuf>` env into the
+worker spawn config.
+
+Iter-6 starts with operator picking A or B, then implements the
+chosen path. The wire-up itself (`Qwen35LoadedModel` field,
+LoadOptions plumbing, store-call write-through, cold-resume
+hydrate) is identical in either; only "where is the persistor
+owned" differs.
+
+Both candidates preserve the iter-2/3/4/5 deliverables: the
+serialize / deserialize / disk back-end module work as-shipped.
+What changes is only how / where the persistor is instantiated.
+
+**Originally drafted iter-6 (now superseded):**
+
+- ~~`Qwen35LoadedModel` (`engine_qwen35.rs:127`) gains a
+  `disk_persistor: Option<Qwen35DiskPersistor>` field — `None` when
+  `HF2Q_KV_PERSIST` env is unset, `Some(persistor)` otherwise.~~
+- ~~The `LcpRegistry` insert path gets a write-through hook to the
+  persistor when present. The lookup path is unchanged.~~
+- ~~`cmd_serve` (qwen35 startup) constructs the persistor when
+  `HF2Q_KV_PERSIST` is set and threads it through `LoadOptions` to
+  `Qwen35LoadedModel::load`.~~
+
+The struck-through plan assumed load-time cfg is sufficient; it
+isn't. iter-6a (this commit) documents the finding; iter-6b ships
+the chosen candidate.
 
 ### 4.8 Ban list (Chesterton's fence-respected)
 
@@ -278,4 +326,9 @@ Each iter ships a complete, mantra-clean deliverable. No iter is "enable later";
 |------|------|-------|--------|------------------|
 | 1a | 2026-05-08 | – | LANDED | Original design doc. Mechanically mirrored Gemma4DenseSpill onto HybridKvCache. |
 | 1b | 2026-05-08 | – | LANDED | Chesterton's-fence revision: existing `families/mod.rs:15-23` documents that qwen35 hybrid deliberately doesn't fit the spiller's `(layer_rank, range)` block contract. Pivot to snapshot-based persistor wrapping the existing `HybridKvCache::snapshot()` substrate + `LcpRegistry`. |
-| 2 | (pending) | A | – | – |
+| 2 | 2026-05-08 | A | LANDED | `Qwen35HybridPersistor` full-attn slot codec. hf2q `e574046`. 6/6 PASS. |
+| 3 | 2026-05-08 | A | LANDED | Linear-attn slot codec (no swap_parity per Chesterton's-fence revision §4.4). hf2q `9213cad`. 7/7 PASS. |
+| 4 | 2026-05-08 | A | LANDED | MTP slot codec. hf2q `9e98c18`. 9/9 PASS. |
+| 5 | 2026-05-08 | A | LANDED | `Qwen35DiskPersistor` disk back-end (write/read/hydrate, atomic, fingerprint-isolated). hf2q `bb6e9f0`. 14/14 PASS. |
+| 6a | 2026-05-08 | A | LANDED | Investigation: cache shape is per-prefill (kv_cache.rs:347+), not load-time. Iter-5's `Qwen35DiskPersistor::new(cache_dir, cfg)` over-specifies. Iter-6b operator decision: Candidate A (per-call cfg API refactor) vs Candidate B (worker-owned lazy construction). §4.7 expanded. |
+| 6b | (pending) | A | – | Operator chooses A or B; implement engine wire-up + write-through + cold-resume hydrate. |
