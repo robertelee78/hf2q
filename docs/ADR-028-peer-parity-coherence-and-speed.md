@@ -285,6 +285,58 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-100 FA-vec nwg A/B (item A) — FALSIFIED at gemma decode kL ≤ 170
+
+Iter-99 item A claimed llama.cpp's nwg=32 + nsg-ramp could be a long-
+context decode lever. Direct read of llama.cpp's dispatch logic
+(`ggml-metal-ops.cpp:2944-2956`) corrected the prior agent's claim:
+**llama.cpp ALWAYS uses nwg=32 for FA-vec** — the `if (false)` branch
+labelled "for small KV caches, we could launch a single workgroup" is
+explicitly disabled with the comment "this does not lead to significant
+improvement, so disabled". The `2*nwg*nsg*ncpsg < ne11` loop only ramps
+`nsg` (1→4), not nwg.
+
+hf2q's TQ-HB FA-vec uses `compute_nwg(_kv_seq_len) = 16` by default
+(`flash_attn_vec_tq_hb.rs:113-122`, env override `HF2Q_TQ_NWG`).
+threadgroup_size is fixed at `(32, 1, 1)` = 1 simdgroup (nsg=1
+structurally).
+
+A/B/C decode bench on gemma-4-26b APEX-Q5_K_M, prompt=42 tokens,
+max-tokens=128 (kL range 42→170), `--temperature 0` `--benchmark`:
+
+| HF2Q_TQ_NWG | Decode t/s | Δ vs default | Note |
+|---:|---:|---:|---|
+| 1 | 49.0 | **-23%** | Single WG can't saturate GPU |
+| 16 (default) | **63.6** | baseline | |
+| 32 (llama.cpp parity) | 63.4 | -0.3% (noise) | No improvement |
+
+**Verdict (TESTABLE → FALSIFIED)**:
+- nwg=16 already saturates the GPU at decode kL ≤ 170. Bumping to 32
+  does nothing (within thermal noise floor).
+- The `nsg=1` structural fix (vs llama.cpp's nsg-up-to-4) MIGHT matter
+  at long kL (kL ≥ 1024) but is OUT-OF-SCOPE for the peer-bench we're
+  trying to close — `llama-bench tg128` runs at kL ≤ 128.
+- Per `feedback_metal_compiler_auto_optimizes_static_levers` — 9th
+  hypothesis falsification on M5 Max where a llama.cpp constant did NOT
+  port to a hf2q win.
+
+**Chesterton's fence**: hf2q's compute_nwg=16 default was a real
+choice, not a bug. Confirmed correct at the benchmarked kL range; no
+change.
+
+**Pivot**: iter-100+ continues with iter-99 items B (DS4 gate+up+SwiGLU
+fusion, ~5%), D (vec4 norm fusion, ~3%), I (bin_fuse_4, ~6%) — items
+with actual measured ROI in their source repos. Item A closed without
+code change.
+
+Test command:
+```
+HF2Q_TQ_NWG=N /opt/hf2q/target/release/hf2q generate \
+  --model gemma4-ara-2pass-APEX-Q5_K_M.gguf \
+  --prompt "List 30 common English words..." --max-tokens 128 \
+  --temperature 0 --benchmark
+```
+
 ### Iter-99 peer-repo + reddit research synthesis (2026-05-09)
 
 Distilled from 8 parallel /swarm-advanced researcher agents over
