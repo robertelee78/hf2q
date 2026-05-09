@@ -2999,6 +2999,52 @@ iter-147 plan: A/B coherence (logits sample-by-sample) at
 HF2Q_USE_DENSE=1 vs default to verify byte-equivalent output, then
 either default-flip or document the trade-off.
 
+### iter-147: USE_DENSE coherence diverges + bisection isolates 1.4ms in SDPA
+
+#### Coherence A/B (gemma4 APEX-Q5_K_M, --temperature 0)
+
+Short prompt ("The capital of France is"): **identical** output
+" capital of France is **Paris**.<turn|>" — both paths.
+
+Long prompt ("Write a short poem about the ocean.", 40 tokens):
+- DEFAULT: "...A deep and endless, liquid roar..."
+- USE_DENSE: "...A deep and ancient, restless roar..."
+
+**Both coherent and on-topic, but token-level divergent past ~15 tokens.**
+Expected — TQ-HB lossy 8-bit codebook quantization produces slightly
+different K/V values vs dense F32. Argmax compounds small logit
+differences. Default-flip is a precision/speed tradeoff requiring
+operator approval (not a free lunch).
+
+#### Bisection: where do the 2.16 ms live?
+
+| Mode | gpu_ns | dispatches | tok/s | Note |
+|------|---:|---:|---:|---|
+| Default (TQ-HB full) | 13.4 ms | 986 | 69.3 | baseline |
+| HF2Q_SKIP_TQ_ENCODE=1 | 13.0 ms | 866 | ~70 | -120 disp, -0.4ms (gibberish output) |
+| HF2Q_USE_DENSE=1 (legacy KV) | 12.0 ms | 986 | 82.2 | swap to FA-vec, -1.4ms |
+| HF2Q_USE_DENSE=1 + iter-146 fused | 12.0 ms | 956 | 81.5 | -30 KV disp absorbed |
+
+**Conclusion**: 0.4 ms in TQ-HB encode (fusable), 1.4 ms in
+FA-vec-tq-hb vs FA-vec SDPA kernel choice. The bigger lever is the
+SDPA kernel itself.
+
+#### Walk-phase iter-148 target
+
+Fuse `dispatch_hadamard_quantize_kv_hb` K+V into one dispatch
+(`hadamard_quantize_kv_hb_dual`). Saves 30 dispatches/decode-token at
+gemma4. **Zero coherence cost** (byte-identical to 2-dispatch
+reference by kernel construction). Estimated savings: ~0.4 ms/token =
+~3% decode = **0.679× → 0.700× peer**.
+
+For the bigger 1.4 ms SDPA gap, options gated on operator decision:
+- **Path D**: faster FA-vec-tq-hb (further shader optimization;
+  iter-127 NSG axis already capped at NSG=4 for kL>1024)
+- **Path E**: default-flip USE_DENSE=1 — 17.6% speedup but
+  token-divergence on long contexts (precision tradeoff)
+- **Path F**: USE_DENSE=1 + smaller F16 KV (still F-precision but
+  half memory)
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
