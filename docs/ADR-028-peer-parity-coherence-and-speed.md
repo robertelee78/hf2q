@@ -2559,6 +2559,45 @@ Closure for gemma4 still requires structural levers per iter-128:
 - DS4-style fused MoE-FFN (~150-200 LOC if dispatch encode dominates)
 - Q5_K_M → Q4_K (operator decision, quality cost)
 
+### iter-136: Phase 2 GPU readiness — sustained-session work item
+
+iter-134 landed the Shape B API surface scaffold (`forward_decode_verify_batched`).
+iter-135 documented 7-step line-level refactor roadmap.
+iter-136 verified iter-134/135 scaffold is regression-clean:
+
+- ✅ qwen3.6 short context: 127.4 t/s (≈ 128 baseline, no regression)
+- ✅ Sourdough byte-identity F32-vs-TQ-on at kL=4096: PASS
+- ✅ All 26 verifier unit tests + 12 byte-identity FA tests + 3
+  NSG-equivalence tests + 8 NSG validation tests still green
+- ✅ Both repos compile clean
+
+#### Implementation scope honesty
+
+Each step of the iter-135 roadmap (extract helper, thread params,
+implement Shape B body, integration test, production wire-up) is
+~200-400 LOC of careful refactoring on a 2324-LOC function. Each step
+must run sourdough byte-identity (ADR-027 production fixture) plus
+12-15 byte-identity tests AS its regression gate.
+
+In 3-min /loop windows, fragmented partial-refactor commits are LIKELY
+to ship broken intermediate states or untested change sets. Per
+operator's "do it right, no shortcuts, no stub" mantra, the Phase 2
+GPU implementation is best executed in a SUSTAINED focus session
+(60-90 min uninterrupted), not crons.
+
+#### Recommended next session shape
+
+A single sustained block executing the full iter-135 roadmap end-to-end
+with sourdough gates between each substep. Estimated wall: 90-180 min
+(model load + bench + 7 substeps + integration test + perf measurement).
+Likely 1500-2500 LOC delta total across forward_prefill_batched.rs +
+spec_decode/ + tests.
+
+Until that session, the Phase 2 GPU API surface (iter-134) plus Shape
+S serial verify (iter-123) are the production-ready spec-decode
+infrastructure. Phase 2 GPU's predicted 1.6-3.0× decode speedup (from
+60-80% n-gram acceptance) is gated on this sustained session.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
