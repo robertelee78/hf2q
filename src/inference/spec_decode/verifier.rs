@@ -40,6 +40,25 @@
 //! impl must clear this gate via `scripts/sourdough_gate.sh` before
 //! Phase 3 production wire-up.
 
+/// ADR-028 iter-140 Path A Phase 2 GPU step 4/7 — argmax-capture mode.
+///
+/// Selects whether `forward_prefill_batched`-class entrypoints emit a
+/// single argmax (last-row only — the existing prefill semantics) or a
+/// per-position argmax for each input token (Shape B verify mode).
+///
+/// Used by `forward_decode_verify_batched` (iter-139 delegation, future
+/// iter-141+ batched body) to request per-position emission. Default
+/// production callers (cmd_generate_qwen35) use `Last`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgmaxCapture {
+    /// Emit only the last-row argmax. Matches pre-iter-140
+    /// forward_prefill_batched semantics. Returns Vec<u32> of length 1.
+    Last,
+    /// Emit per-position argmax — one entry for each input token.
+    /// Returns Vec<u32> of length tokens.len().
+    All,
+}
+
 /// Errors a verifier can produce.
 #[derive(Debug, thiserror::Error)]
 pub enum VerifierError {
