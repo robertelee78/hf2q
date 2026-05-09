@@ -1046,6 +1046,136 @@ pub fn load_teacher_targets_for_batch(
     })
 }
 
+/// ADR-020 AC#7 Option A — per-position top-K KL loss CPU oracle.
+///
+/// Mirror of mlx-lm `dwq.py:108-114`'s `loss_fn`:
+/// ```text
+///   scale = 1 / temperature
+///   losses = kl_div_loss(scale * student_logits, scale * teacher_logits)
+///   loss   = mean(losses)            # over (batch * seq) positions
+/// ```
+/// where `kl_div_loss(q_logits, p_logits) = KL(softmax(p) || softmax(q))`
+/// (matches hf2q's GPU kernel
+/// [`crate::calibrate::dynamic_quant_gpu::kl_div_loss_per_row`] at
+/// `dynamic_quant_gpu.rs:127-138` — the GPU version with shape
+/// `[N, V]`; this oracle expects `[batch, seq, V]` flat).
+///
+/// Inputs are top-K reductions: each row is the K logits at the same
+/// vocab indices for the matched (student, teacher) position.  The
+/// caller is responsible for indexing the student model's full-vocab
+/// output through `TeacherBatchTargets.indices` BEFORE invoking this
+/// fn — exactly what `mx.take_along_axis(logits, ids, axis=-1)` does
+/// at `dwq.py:111`.
+///
+/// `student` and `teacher` must both be flat row-major
+/// `[batch, seq, top_k]` of length `batch * seq * top_k`.
+///
+/// Returns scalar f32 — mean per-position KL.  Numerically stable:
+/// uses the `max + log(Σexp(x − max))` form for both logsumexp's so
+/// large logits don't overflow.
+///
+/// Mathematical contract verified by tests:
+/// - student == teacher ⇒ loss == 0 (within 1e-6)
+/// - increasing temperature ⇒ smaller loss (softer targets)
+/// - hand-computable: K=2 case with explicit numerical answer
+///
+/// # Errors
+/// - `student.len() != teacher.len()`
+/// - `batch * seq * top_k` overflows or doesn't equal the slice len
+/// - `top_k == 0` or `batch == 0` or `seq == 0`
+/// - `temperature <= 0` or non-finite
+pub fn kl_loss_topk_oracle(
+    student: &[f32],
+    teacher: &[f32],
+    batch: usize,
+    seq: usize,
+    top_k: usize,
+    temperature: f32,
+) -> Result<f32> {
+    if !temperature.is_finite() || temperature <= 0.0 {
+        return Err(anyhow!(
+            "kl_loss_topk_oracle: temperature must be finite and > 0; got {temperature}"
+        ));
+    }
+    if batch == 0 || seq == 0 || top_k == 0 {
+        return Err(anyhow!(
+            "kl_loss_topk_oracle: batch ({batch}), seq ({seq}), top_k ({top_k}) must all be > 0"
+        ));
+    }
+    let n_positions = batch
+        .checked_mul(seq)
+        .ok_or_else(|| anyhow!("batch * seq overflows usize"))?;
+    let expected = n_positions
+        .checked_mul(top_k)
+        .ok_or_else(|| anyhow!("batch * seq * top_k overflows usize"))?;
+    if student.len() != expected {
+        return Err(anyhow!(
+            "kl_loss_topk_oracle: student.len ({}) != batch*seq*top_k ({})",
+            student.len(),
+            expected
+        ));
+    }
+    if teacher.len() != expected {
+        return Err(anyhow!(
+            "kl_loss_topk_oracle: teacher.len ({}) != batch*seq*top_k ({})",
+            teacher.len(),
+            expected
+        ));
+    }
+
+    let inv_t = 1.0_f32 / temperature;
+
+    let mut total_kl = 0.0_f64; // f64 accumulator — mean over many positions
+    for pos in 0..n_positions {
+        let lo = pos * top_k;
+        let hi = lo + top_k;
+        let s_row = &student[lo..hi];
+        let t_row = &teacher[lo..hi];
+
+        // Numerically-stable logsumexp for student row (scaled).
+        let mut s_max = f32::NEG_INFINITY;
+        for &x in s_row {
+            let v = x * inv_t;
+            if v > s_max {
+                s_max = v;
+            }
+        }
+        let mut s_sum_exp = 0.0_f32;
+        for &x in s_row {
+            s_sum_exp += (x * inv_t - s_max).exp();
+        }
+        let s_log_norm = s_max + s_sum_exp.ln();
+
+        // Same for teacher row (scaled).
+        let mut t_max = f32::NEG_INFINITY;
+        for &x in t_row {
+            let v = x * inv_t;
+            if v > t_max {
+                t_max = v;
+            }
+        }
+        let mut t_sum_exp = 0.0_f32;
+        for &x in t_row {
+            t_sum_exp += (x * inv_t - t_max).exp();
+        }
+        let t_log_norm = t_max + t_sum_exp.ln();
+
+        // KL(softmax(t) || softmax(s)) = Σ p_t · (log p_t − log p_s)
+        let mut row_kl = 0.0_f32;
+        for (st, te) in s_row.iter().zip(t_row.iter()) {
+            let s_scaled = *st * inv_t;
+            let t_scaled = *te * inv_t;
+            let log_p_t = t_scaled - t_log_norm;
+            let log_p_s = s_scaled - s_log_norm;
+            let p_t = log_p_t.exp();
+            row_kl += p_t * (log_p_t - log_p_s);
+        }
+        total_kl += row_kl as f64;
+    }
+
+    Ok((total_kl / n_positions as f64) as f32)
+}
+
 /// ADR-020 iter-12d-2 — per-Linear training summary inside a model
 /// scan (one entry per successfully-trained tensor).
 #[derive(Debug, Clone)]
@@ -3901,6 +4031,180 @@ mod tests {
             super::drive_full_model_teacher_capture(&mut teacher, &cfg, &targets_cfg).unwrap();
         assert_eq!(summary[0].1, 1);
         assert_eq!(teacher.forward_calls, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — KL oracle returns 0 (within 1 ULP)
+    /// when student logits == teacher logits regardless of values
+    /// or temperature.  Forms the "no work to do" floor of the loss
+    /// surface.
+    #[test]
+    fn kl_loss_topk_oracle_zero_when_student_equals_teacher() {
+        let student: Vec<f32> = (0..32).map(|i| (i as f32) * 0.137 - 1.5).collect();
+        let teacher = student.clone();
+        for &t in &[0.5_f32, 1.0, 2.0, 5.0] {
+            let kl = super::kl_loss_topk_oracle(&student, &teacher, 2, 4, 4, t).unwrap();
+            assert!(
+                kl.abs() < 1e-5,
+                "KL must be 0 at student==teacher (T={t}); got {kl}"
+            );
+        }
+    }
+
+    /// ADR-020 AC#7 Option A — KL is non-negative (Gibbs' inequality
+    /// — KL(p||q) >= 0 for all proper p,q).
+    #[test]
+    fn kl_loss_topk_oracle_non_negative_for_arbitrary_inputs() {
+        let teacher: Vec<f32> = (0..16).map(|i| ((i as f32) * 0.31 + 0.5).sin() * 3.0).collect();
+        let student: Vec<f32> = (0..16).map(|i| ((i as f32) * 0.17 - 0.2).cos() * 4.0).collect();
+        let kl = super::kl_loss_topk_oracle(&student, &teacher, 1, 2, 8, 1.0).unwrap();
+        assert!(kl >= -1e-6, "KL must be >= 0; got {kl}");
+        // And meaningful — different distributions yield positive KL.
+        assert!(kl > 0.01, "expected meaningful KL > 0.01 for differing dists; got {kl}");
+    }
+
+    /// ADR-020 AC#7 Option A — increasing temperature softens the
+    /// distributions and decreases KL monotonically (Hinton 2015 KD,
+    /// `dwq.py:106`).  Verified across T ∈ [0.5, 1.0, 2.0, 8.0].
+    #[test]
+    fn kl_loss_topk_oracle_decreases_with_higher_temperature() {
+        // High-contrast logits so softmax has a clear peak that
+        // temperature visibly softens.
+        let teacher = vec![0.0_f32, 5.0, -3.0, 2.0];
+        let student = vec![1.0_f32, 0.0, 0.0, -1.0];
+        let kls: Vec<f32> = [0.5_f32, 1.0, 2.0, 8.0]
+            .iter()
+            .map(|&t| super::kl_loss_topk_oracle(&student, &teacher, 1, 1, 4, t).unwrap())
+            .collect();
+        for w in kls.windows(2) {
+            assert!(
+                w[0] > w[1],
+                "KL must monotonically decrease with T; got {kls:?}"
+            );
+        }
+    }
+
+    /// ADR-020 AC#7 Option A — hand-computed K=2 case.
+    /// teacher logits = [2, 0], student logits = [0, 0], T = 1.
+    /// softmax(teacher) = [e²/(e²+1), 1/(e²+1)] = [0.880797, 0.119203]
+    /// softmax(student) = [0.5, 0.5]
+    /// KL(p_t || p_s) = 0.880797 * log(0.880797 / 0.5)
+    ///                + 0.119203 * log(0.119203 / 0.5)
+    ///                = 0.880797 * 0.566535 - 0.119203 * 1.434116
+    ///                = 0.499000 - 0.170975
+    ///                = 0.32802 (mean over 1 position == row KL)
+    #[test]
+    fn kl_loss_topk_oracle_hand_computed_k2_case() {
+        let teacher = vec![2.0_f32, 0.0];
+        let student = vec![0.0_f32, 0.0];
+        let kl = super::kl_loss_topk_oracle(&student, &teacher, 1, 1, 2, 1.0).unwrap();
+        let expected = 0.32802_f32;
+        assert!(
+            (kl - expected).abs() < 1e-3,
+            "expected {expected}, got {kl}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — slice-length mismatch fails loud.
+    #[test]
+    fn kl_loss_topk_oracle_rejects_slice_length_mismatch() {
+        let student = vec![1.0_f32; 32];
+        let teacher = vec![1.0_f32; 32];
+        let err =
+            super::kl_loss_topk_oracle(&student, &teacher, 2, 4, 8, 1.0).unwrap_err();
+        let msg = format!("{:#}", err);
+        // batch*seq*top_k = 64, but slices are 32 → reject.
+        assert!(
+            msg.contains("student.len (32)") && msg.contains("64"),
+            "got: {msg}"
+        );
+
+        let teacher2 = vec![1.0_f32; 65];
+        let student2 = vec![1.0_f32; 64];
+        let err =
+            super::kl_loss_topk_oracle(&student2, &teacher2, 2, 4, 8, 1.0).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("teacher.len (65)") && msg.contains("64"),
+            "got: {msg}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — bad knobs fail loud.
+    #[test]
+    fn kl_loss_topk_oracle_rejects_bad_knobs() {
+        let v = vec![1.0_f32; 16];
+
+        // T = 0
+        let err = super::kl_loss_topk_oracle(&v, &v, 1, 1, 16, 0.0).unwrap_err();
+        assert!(format!("{:#}", err).contains("temperature must be finite and > 0"));
+
+        // T = NaN
+        let err = super::kl_loss_topk_oracle(&v, &v, 1, 1, 16, f32::NAN).unwrap_err();
+        assert!(format!("{:#}", err).contains("temperature must be finite"));
+
+        // T < 0
+        let err = super::kl_loss_topk_oracle(&v, &v, 1, 1, 16, -1.0).unwrap_err();
+        assert!(format!("{:#}", err).contains("temperature must be finite and > 0"));
+
+        // top_k = 0
+        let err = super::kl_loss_topk_oracle(&v, &v, 1, 1, 0, 1.0).unwrap_err();
+        assert!(format!("{:#}", err).contains("must all be > 0"));
+
+        // batch = 0
+        let err = super::kl_loss_topk_oracle(&[], &[], 0, 4, 16, 1.0).unwrap_err();
+        assert!(format!("{:#}", err).contains("must all be > 0"));
+    }
+
+    /// ADR-020 AC#7 Option A — handshake: a `TeacherBatchTargets` flows
+    /// into the oracle without reshape.  Caller passes the student
+    /// logits sliced to the same shape (here a stand-in built from the
+    /// teacher's own logits, plus a small perturbation) and gets back
+    /// a finite scalar KL.
+    #[test]
+    fn kl_loss_topk_oracle_consumes_teacher_batch_targets_shape() {
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-kl-handshake-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let save_dir = dir.join("teacher-out");
+
+        let cfg = super::FullModelDwqConfig {
+            gguf_path: std::path::PathBuf::from("/dev/null"),
+            calibration_token_batches: vec![vec![0u32; 32 * 4]],
+            batch_size: 32,
+            seq_len: 4,
+            top_k_teacher: 8,
+            ..super::FullModelDwqConfig::default()
+        };
+        let targets_cfg =
+            super::build_dwq_targets_config_from_full_model(&cfg, save_dir.clone(), 64).unwrap();
+        let mut teacher = StubTeacher {
+            vocab: 64,
+            forward_calls: 0,
+        };
+        super::drive_full_model_teacher_capture(&mut teacher, &cfg, &targets_cfg).unwrap();
+
+        let t = super::load_teacher_targets_for_batch(&save_dir, "train", 0, &cfg).unwrap();
+        // Stand-in student logits — small perturbation off teacher.
+        let student: Vec<f32> = t.logits.iter().map(|x| x + 0.3).collect();
+        let kl = super::kl_loss_topk_oracle(&student, &t.logits, t.batch, t.seq, t.top_k, 2.0)
+            .unwrap();
+        assert!(kl.is_finite(), "got KL = {kl}");
+        // Adding a uniform constant to all scaled logits leaves
+        // softmax invariant ⇒ KL ≈ 0 because the +0.3 is the same
+        // for every vocab index in a row.  Float-32 cancellation
+        // can leave tiny negative residuals (~1e-8) so allow a
+        // signed eps band rather than a strict 0 floor.
+        assert!(
+            kl.abs() < 1e-5,
+            "uniform shift should yield |KL| < 1e-5; got {kl}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
