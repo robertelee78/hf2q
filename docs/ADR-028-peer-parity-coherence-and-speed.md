@@ -1981,6 +1981,77 @@ needed on priority vs Shape B (spec-decode).**
 | Helps when?           | Always at decode kL > 1024       | Repetitive output (60-80% acceptance) |
 | Stand-alone benefit?  | YES                              | YES                    |
 
+### iter-126: Path D scope refined — nsg axis is the actual lever
+
+Re-read llama.cpp's flash_attn_vec at `ggml-metal.metal:6782`:
+
+```c
+for (int ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG) { ... }
+```
+
+Their K-loop strides by `NWG*NSG` and uses `iwg*NSG + sgitg` as the
+per-simdgroup index. At long context they grow nsg ∈ {1,2,4} (per
+`ggml-metal-ops.cpp:2953`: `while (2*nwg*nsg*ncpsg < ne11 && nsg < 4)
+{ nsg *= 2; }`).
+
+**At kL=4096:** llama.cpp uses nwg=32, nsg=4 → 128 simdgroups split K
+(1 K-iter each). hf2q uses nwg=32, **nsg=1 implicit** (32 simdgroups,
+4 K-iters each). That's the **structural 4× gap** at long context.
+
+#### Our kernel state confirms the diagnosis
+
+`/opt/mlx-native/src/shaders/flash_attn_vec_tq_hb.metal`:
+- threadgroup_size: `MTLSize::new(32, 1, 1)` = 1 simdgroup
+- K-loop: `for (ic0 = iwg; ; ic0 += NWG)` — no sgitg in loop
+- sgitg used only at line 575 (`if (sgitg == 0)`) which is always-true
+  with nsg=1
+
+#### Path D refinement
+
+Original iter-125 estimate: 300 LOC reduce-kernel rewrite. **Refined**:
+
+The lever is **add nsg axis** to flash_attn_vec_tq_hb (NOT lift nwg
+cap). This avoids the reduce-kernel rewrite entirely (nwg stays at 32,
+partial buffer same size). Required changes:
+
+1. `threadgroup_size`: `(32, 1, 1)` → `(32, NSG, 1)` so workgroup has
+   NSG simdgroups.
+2. K-loop: `for (ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG)`.
+3. Shared memory: ss[] / so[] / sm[] sized `NSG × per-simdgroup` (or
+   per-simdgroup banks via `+ sgitg*SH` offset like llama.cpp 6714-17).
+4. Cross-simdgroup reduce inside the workgroup at end-of-K (online
+   softmax: each simdgroup has local M, S, partial output; combine via
+   threadgroup_barrier + simd_max + simd_sum).
+5. Final write gated by `(sgitg == 0)` (already in place).
+
+Estimated **150-200 LOC** in mlx-native + ~20 LOC dispatch wiring in
+hf2q's kernel-args struct. Bench needed at kL ∈ {1024, 4096, 8192}
+with nsg ∈ {1, 2, 4} sweep.
+
+#### Predicted savings (refined from iter-125 with K-block model)
+
+| kL    | nwg=32 nsg=1 (today) | nwg=32 nsg=4 (Path D)     | Savings/call |
+|-------|----------------------|---------------------------|--------------|
+| 1024  | 1 K-iter, 45 µs      | 1 K-iter, ~45 µs          | 0 (saturated) |
+| 4096  | 4 K-iter, 200 µs     | 1 K-iter, **~50 µs**      | **150 µs**   |
+| 8192  | 8 K-iter, 431 µs     | 2 K-iter, **~100 µs**     | **331 µs**   |
+
+Per-token at qwen sw=4096 production: 30 layers × 150 µs = **4.5 ms
+saved/token** = 28% decode speedup. Same headline as iter-125 but
+**~50% smaller scope**.
+
+#### Standing rule for kernel parallelism levers
+
+llama.cpp uses BOTH nwg and nsg, with nsg growing past short context.
+hf2q has only ever tuned nwg. Future kernel work where K-axis
+parallelism matters (e.g., extending to other quant types) should
+consider nsg as a first-class axis, not implicit-1.
+
+**Operator decision still needed**: priority of Path D (kernel
+structural refactor, ~200 LOC) vs Shape B (prefill structural refactor,
+~180 LOC). Path D's win is bigger AT LONG CONTEXT; Shape B's win is
+broader (any model when n-grams hit). Can land independently.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
