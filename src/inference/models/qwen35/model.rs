@@ -1549,6 +1549,134 @@ mod tests {
         }
     }
 
+    // ── ADR-020 AC#7 — apply_dwq_overlay end-to-end dispatch tests ──
+    // Drive the FULL `Qwen35Model::apply_dwq_overlay` path (stem matcher
+    // → role helper → counter increment → return-value computation)
+    // against a synthetic safetensors file written to a tempfile.
+    // Catches dispatch-loop integration bugs the per-helper unit tests
+    // can't see (e.g. wrong stem regex, mis-routed role enum, off-by-one
+    // in the return count, lm_head/attn ordering interaction).
+    //
+    // Uses a real MlxDevice for buffer alloc inside apply_dwq_overlay's
+    // re-Q4_0 path; runtime-skips if Metal isn't available.
+
+    fn write_synthetic_overlay(
+        path: &std::path::Path,
+        triplets: &[(String, MlxAffineLinear)],
+        bits: u32,
+        group_size: usize,
+    ) {
+        use crate::calibrate::mlx_safetensors_loader::MlxAffineLinearBytes;
+        use safetensors::tensor::Dtype;
+        // Owned per-Linear bytes must outlive the borrowed views.
+        // F32 scales/biases for byte-identical round-trip in the test;
+        // production overlays save as BF16 (writer_round_trips_with_reader_bf16_scales
+        // covers that path).  F32 keeps the assertion deterministic at
+        // dequantize_to_f32 bit-identity.
+        let owned: Vec<(String, MlxAffineLinearBytes)> = triplets.iter()
+            .map(|(stem, lin)| (stem.clone(),
+                lin.to_safetensors_bytes(Dtype::F32).expect("to_safetensors_bytes")))
+            .collect();
+        let mut entries: Vec<(String, safetensors::tensor::TensorView<'_>)> = Vec::new();
+        for (stem, bytes) in &owned {
+            let (w, s, b) = bytes.to_safetensors_views().expect("views");
+            entries.push((format!("{stem}.weight"), w));
+            entries.push((format!("{stem}.scales"), s));
+            entries.push((format!("{stem}.biases"), b));
+        }
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("format".to_string(), "mlx-affine-dwq-v1".to_string());
+        metadata.insert("bits".to_string(), bits.to_string());
+        metadata.insert("group_size".to_string(), group_size.to_string());
+        let serialized = safetensors::tensor::serialize(entries, Some(metadata))
+            .expect("safetensors serialize");
+        std::fs::write(path, &serialized).expect("write tempfile");
+    }
+
+    #[test]
+    fn apply_dwq_overlay_e2e_lm_head_plus_attn_q() {
+        // Build a tiny dense Qwen35Model with layer 0 as FullAttention.
+        let mut cfg = dense_cfg_12();
+        cfg.layer_types[0] = Qwen35LayerKind::FullAttention;
+        let n_q = cfg.num_attention_heads as usize * cfg.head_dim as usize;
+        let h   = cfg.hidden_size as usize;
+        let v   = cfg.vocab_size as usize;
+        let mut model = Qwen35Model::empty_from_cfg(cfg);
+
+        // Synthetic: lm_head (output) and one attn_q on layer 0.
+        let lin_output = synth_attn_linear(v, h);
+        let lin_attn_q = synth_attn_linear(n_q, h);
+        let triplets = vec![
+            ("output".to_string(), lin_output.clone()),
+            ("blk.0.attn_q".to_string(), lin_attn_q.clone()),
+        ];
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("overlay.safetensors");
+        write_synthetic_overlay(&path, &triplets, 4, 32);
+
+        let device = match mlx_native::MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[apply_dwq_overlay_e2e] SKIP: no Metal device: {e}");
+                return;
+            }
+        };
+
+        let n_overrides = model.apply_dwq_overlay(&device, &path)
+            .expect("apply_dwq_overlay must succeed on a clean overlay");
+        assert_eq!(n_overrides, 2,
+            "expected 2 overrides (1 lm_head + 1 attn_q); got {n_overrides}");
+
+        // lm_head: Vec<f32> matches dequantized DWQ codes bit-identically.
+        assert_eq!(model.output_weight, lin_output.dequantize_to_f32(),
+            "lm_head Vec<f32> must equal MlxAffineLinear::dequantize_to_f32 output");
+
+        // attn_q: layer 0's wq matches dequantized DWQ codes.
+        match &model.layers[0] {
+            Qwen35LayerWeights::FullAttn { attn, .. } => {
+                assert_eq!(attn.wq, lin_attn_q.dequantize_to_f32(),
+                    "layer-0 wq must equal MlxAffineLinear::dequantize_to_f32 output");
+            }
+            _ => panic!("layer 0 must be FullAttn after override"),
+        }
+    }
+
+    #[test]
+    fn apply_dwq_overlay_e2e_dense_ffn_stem_skipped_on_cpu_dense_variant() {
+        // The B2.B handler errors when ffn variant is `Dense` (CPU
+        // test-only; production uses `DenseQ`).  This test confirms the
+        // dispatch loop catches that error path: ffn_gate stem on a
+        // Dense (not DenseQ) layer increments unknown_skipped and the
+        // overall return count is 0.
+        let mut cfg = dense_cfg_12();
+        cfg.layer_types[0] = Qwen35LayerKind::FullAttention;
+        let h     = cfg.hidden_size as usize;
+        let inter = cfg.intermediate_size.expect("dense_cfg_12 sets intermediate_size") as usize;
+        let mut model = Qwen35Model::empty_from_cfg(cfg);
+
+        // Synthetic ffn_gate sized correctly but routed at a Dense (not
+        // DenseQ) FFN; helper must error → handler logs warn + skips.
+        let lin_gate = synth_attn_linear(h, inter);
+        let triplets = vec![
+            ("blk.0.ffn_gate".to_string(), lin_gate),
+        ];
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("overlay.safetensors");
+        write_synthetic_overlay(&path, &triplets, 4, 32);
+
+        let device = match mlx_native::MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => { eprintln!("SKIP: {e}"); return; }
+        };
+
+        let n_overrides = model.apply_dwq_overlay(&device, &path)
+            .expect("apply_dwq_overlay must succeed even when ffn variant gates");
+        assert_eq!(n_overrides, 0,
+            "expected 0 overrides — Dense (not DenseQ) variant must be skipped; got {n_overrides}");
+    }
+
     /// Integration smoke: load_from_gguf on the real apex returns a fully-
     /// shaped model with 40 layers (10 full-attn + 30 linear-attn), no MTP.
     /// Runtime-skips when artefact absent (existing path-exists check).
