@@ -169,6 +169,27 @@ If iter-21 sweep fails after any sub-iter lands, revert that sub-iter and invest
 
 Per the /loop's iter cadence (~10 min execution + commit per iter), this is 5 iters × ~10 min = ~1 hour of focused execution. Plus contingency for test failures + sweep harness re-runs.
 
+### iter-24 empirical scope finding (refinement)
+
+Attempted iter-23a end-to-end; cargo surfaced **~55 errors across 4 files**, not the projected 30 across 2:
+
+| File | Sites | Why |
+|------|-------|-----|
+| `kv_cache.rs` | ~12 | snapshot/restore producers + total_bytes + ByteSized + 4 test fixtures |
+| `qwen35_hybrid_persistor.rs` | ~25 | codec serialize/deserialize loops (`.shape()`, `as_slice()`, `byte_len()` reads) — many more sites than just cfg_from_cache |
+| `qwen35_disk_persistor.rs` (tests) | ~10 | synth_snapshot test helpers push K/V buffers directly |
+| `gpu_full_attn.rs` (tests) | ~4 | mtp_tests.rs + similar synth-snapshot test fixtures |
+
+Refined sub-iter sequence (split 23a into 23a-α, 23a-β, 23a-γ):
+
+- **23a-α** (~50 LOC): `MtpKvSnapshot.k/v` Optional + producer/consumer updates. Single struct, smaller blast radius. Tests: 5+ MTP-side fixtures need `Some()` wrapping.
+- **23a-β** (~80 LOC): `HybridKvCacheSnapshot.full_attn_k/v` Optional + producer in `HybridKvCache::snapshot` + consumer in `restore_from`/`restore_partial` (kv_cache.rs only — codec deferred to 23a-γ).
+- **23a-γ** (~120 LOC): persist codec + test fixtures (qwen35_hybrid_persistor.rs + qwen35_disk_persistor.rs tests + forward_gpu.rs tests). Includes the `kv_present: u8` per-slot byte.
+
+Total revised: 250 LOC across 3 sub-iters of iter-23a alone, then iter-23b/c/d/e per the original plan.
+
+Lesson for future estimates: when refactoring shared types, count BOTH production read sites AND test-fixture write sites — both are mechanical updates but both surface as cargo errors.
+
 ## Acceptance criteria for the whole iter-23 sequence
 
 1. ✅ Cross-axis sweep harness (iter-21) passes after every sub-iter — byte-identical output across all 4 cells.
