@@ -235,7 +235,7 @@ fn trim_last_seq(tokens: &[u32], batch_size: usize, seq_len: usize) -> Vec<u32> 
 /// LARGEST values; the order WITHIN the top-K is implementation-
 /// defined for argpartition, but we sort descending here for
 /// determinism + downstream consumer simplicity.
-fn top_k_per_row(values: &[f32], k: usize) -> (Vec<f32>, Vec<u32>) {
+pub(crate) fn top_k_per_row(values: &[f32], k: usize) -> (Vec<f32>, Vec<u32>) {
     debug_assert!(k > 0 && k <= values.len());
 
     // Min-heap over (Reverse(NaN-safe-value), Reverse(idx)) so the

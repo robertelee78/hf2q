@@ -1757,6 +1757,74 @@ pub fn collect_grads_for_adam(
     Ok(out)
 }
 
+/// ADR-020 AC#7 Option A — full-vocab teacher logits → row-major
+/// `[batch, seq, top_k]` (logits, indices) ready to feed
+/// [`train_one_linear_dwq_step`].
+///
+/// Mirror of mlx-lm's argpartition pattern at
+/// `mx.argpartition(logits, kth=-K, axis=-1)[..., -K:]` which the
+/// existing `compute_dwq_targets` uses for offline teacher dumps.
+/// This fn runs the same per-row top-K selection on a freshly-
+/// produced teacher forward output (no disk round-trip), letting
+/// callers train against a teacher that's still resident in
+/// memory.
+///
+/// Uses the canonical
+/// [`crate::calibrate::dwq_targets::top_k_per_row`] for one source
+/// of truth — this fn just iterates over the (batch, seq) rows of
+/// `[batch, seq, vocab]` and concatenates.  Output: descending-by-
+/// value within each row, ties broken by lower index (deterministic).
+///
+/// # Errors
+/// - `logits_full.len() != batch * seq * vocab`
+/// - `top_k == 0` or `top_k > vocab`
+/// - any of `batch`, `seq`, `vocab` is `0`
+pub fn pick_top_k_per_position(
+    logits_full: &[f32],
+    batch: usize,
+    seq: usize,
+    vocab: usize,
+    top_k: usize,
+) -> Result<(Vec<f32>, Vec<u32>)> {
+    if batch == 0 || seq == 0 || vocab == 0 {
+        return Err(anyhow!(
+            "pick_top_k_per_position: batch ({batch}), seq ({seq}), vocab ({vocab}) must all be > 0"
+        ));
+    }
+    if top_k == 0 || top_k > vocab {
+        return Err(anyhow!(
+            "pick_top_k_per_position: top_k must be in (0, vocab={vocab}]; got {top_k}"
+        ));
+    }
+    let bs = batch
+        .checked_mul(seq)
+        .ok_or_else(|| anyhow!("pick_top_k_per_position: batch*seq overflows"))?;
+    let expected = bs
+        .checked_mul(vocab)
+        .ok_or_else(|| anyhow!("pick_top_k_per_position: batch*seq*vocab overflows"))?;
+    if logits_full.len() != expected {
+        return Err(anyhow!(
+            "pick_top_k_per_position: logits_full.len ({}) != batch*seq*vocab ({})",
+            logits_full.len(),
+            expected
+        ));
+    }
+
+    let mut out_logits: Vec<f32> = Vec::with_capacity(bs * top_k);
+    let mut out_indices: Vec<u32> = Vec::with_capacity(bs * top_k);
+    for r in 0..bs {
+        let row_lo = r * vocab;
+        let row_hi = row_lo + vocab;
+        let row = &logits_full[row_lo..row_hi];
+        let (l, i) = crate::calibrate::dwq_targets::top_k_per_row(row, top_k);
+        out_logits.extend_from_slice(&l);
+        out_indices.extend_from_slice(&i);
+    }
+    debug_assert_eq!(out_logits.len(), bs * top_k);
+    debug_assert_eq!(out_indices.len(), bs * top_k);
+    Ok((out_logits, out_indices))
+}
+
 /// ADR-020 AC#7 Option A — run ONE SGD/Adam step on a single Linear
 /// with the full pipeline composed.  Composition skeleton that ties
 /// every primitive landed in this iter chain into one call.
@@ -4782,6 +4850,138 @@ mod tests {
             super::drive_full_model_teacher_capture(&mut teacher, &cfg, &targets_cfg).unwrap();
         assert_eq!(summary[0].1, 1);
         assert_eq!(teacher.forward_calls, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — `pick_top_k_per_position` hand
+    /// computed: 2 rows × vocab=5, top_k=2.  Each row's top-2
+    /// values + indices match by inspection.
+    ///
+    ///   row 0: [10, 20, 5, 30, 25]   → top-2 = (30,3), (25,4)
+    ///   row 1: [3, 9, 7, 1, 5]       → top-2 = (9,1),  (7,2)
+    #[test]
+    fn pick_top_k_per_position_hand_computed() {
+        let logits = vec![
+            10.0_f32, 20.0, 5.0, 30.0, 25.0,
+            3.0, 9.0, 7.0, 1.0, 5.0,
+        ];
+        let (l, i) = super::pick_top_k_per_position(&logits, 1, 2, 5, 2).expect("pick");
+        assert_eq!(l, vec![30.0, 25.0, 9.0, 7.0]);
+        assert_eq!(i, vec![3u32, 4, 1, 2]);
+    }
+
+    /// ADR-020 AC#7 Option A — `pick_top_k_per_position` rejects
+    /// shape mismatch + zero dims + top_k > vocab.
+    #[test]
+    fn pick_top_k_per_position_rejects_bad_inputs() {
+        let logits = vec![0.0_f32; 10];
+        // logits.len = 10, batch*seq*vocab = 1*2*5 = 10 OK
+        // top_k=6 > vocab=5
+        let err = super::pick_top_k_per_position(&logits, 1, 2, 5, 6).unwrap_err();
+        assert!(format!("{:#}", err).contains("top_k must be in (0, vocab=5]"));
+
+        // shape mismatch
+        let err = super::pick_top_k_per_position(&logits, 1, 2, 6, 2).unwrap_err();
+        assert!(format!("{:#}", err).contains("logits_full.len (10)"));
+
+        // zero dim
+        let err = super::pick_top_k_per_position(&[], 0, 2, 5, 2).unwrap_err();
+        assert!(format!("{:#}", err).contains("must all be > 0"));
+    }
+
+    /// ADR-020 AC#7 Option A — output of `pick_top_k_per_position`
+    /// matches what `compute_dwq_targets` writes to disk on the
+    /// SAME logits → cross-checks that this in-memory path
+    /// reproduces the offline teacher-capture pipeline byte-for-byte.
+    #[test]
+    fn pick_top_k_per_position_matches_compute_dwq_targets_offline_oracle() {
+        // Build a synthetic full-vocab teacher logits tensor at
+        // (batch=2, seq=3, vocab=16).  Use the same SyntheticTeacher-
+        // style sin/cos formula so the values are deterministic.
+        let batch = 2;
+        let seq = 3;
+        let vocab = 16;
+        let top_k = 4;
+        let n = batch * seq;
+        let logits: Vec<f32> = (0..n * vocab)
+            .map(|i| {
+                let r = i / vocab;
+                let v = i % vocab;
+                ((0.01 * v as f32) + 0.1 * r as f32).sin()
+                    + 0.7 * ((0.05 * v as f32) + 0.3 * (r % seq) as f32).cos()
+            })
+            .collect();
+
+        // In-memory pick.
+        let (l_mem, i_mem) = super::pick_top_k_per_position(&logits, batch, seq, vocab, top_k)
+            .expect("mem");
+
+        // Offline oracle: drive compute_dwq_targets with a stub
+        // teacher that returns these EXACT logits, then read back
+        // the safetensors.
+        struct ReplayTeacher {
+            data: Vec<f32>,
+        }
+        impl crate::calibrate::dwq_targets::TeacherLogitsProvider for ReplayTeacher {
+            fn forward_logits(
+                &mut self,
+                _tokens: &[u32],
+                _batch_size: usize,
+                _seq_len: usize,
+                _vocab: usize,
+            ) -> anyhow::Result<Vec<f32>> {
+                Ok(self.data.clone())
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-pick-topk-cross-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // compute_dwq_targets trims the LAST seq position (next-token
+        // target convention).  To make the comparison match cleanly,
+        // pass cfg with seq_len = seq+1 so the on-disk seq dim equals
+        // our `seq` here.
+        let cfg = crate::calibrate::dwq_targets::ComputeTargetsConfig {
+            top_k,
+            save_dir: dir.clone(),
+            vocab,
+        };
+        // Build a single batch's worth of fake tokens of the right
+        // total size (batch * (seq+1)).
+        let tokens = vec![0u32; batch * (seq + 1)];
+        let split = crate::calibrate::dwq_targets::CalibrationSplit {
+            name: "train",
+            batches: std::slice::from_ref(&tokens),
+            batch_size: batch,
+            seq_len: seq + 1,
+        };
+        let mut teacher = ReplayTeacher {
+            data: logits.clone(),
+        };
+        crate::calibrate::dwq_targets::compute_dwq_targets(&mut teacher, &[split], &cfg)
+            .expect("compute_dwq_targets");
+        let (l_disk, i_disk, b_d, s_d, k_d) =
+            crate::calibrate::dwq_targets::load_dwq_target(&dir, "train", 0).expect("load");
+        assert_eq!(b_d, batch);
+        assert_eq!(s_d, seq);
+        assert_eq!(k_d, top_k);
+
+        assert_eq!(l_mem.len(), l_disk.len());
+        assert_eq!(i_mem.len(), i_disk.len());
+        for j in 0..l_mem.len() {
+            assert!(
+                (l_mem[j] - l_disk[j]).abs() < 1e-6,
+                "logit mismatch at {j}: mem={} disk={}",
+                l_mem[j],
+                l_disk[j]
+            );
+            assert_eq!(i_mem[j], i_disk[j], "index mismatch at {j}");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
