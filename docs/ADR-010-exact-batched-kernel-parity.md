@@ -295,6 +295,18 @@ For this project phase the sliding_wrap 752-byte batched-vs-batched ceiling is *
 
   No "deferred without approval" — this is a pure investigation chain. The typo-sweep clean result + structural alignment of mv_id kernels means there's no obvious 1-line win analogous to iter-68; closing the decode gap takes engineering effort proportional to the 0.62× → 1.0× target.
 
+- 2026-05-09 (iter-71 FUSION-COUNT analysis — gap is per-kernel-time, not dispatch count): Read `/opt/llama.cpp/src/models/gemma4.cpp` graph build to count llama.cpp's per-layer logical operations:
+  - Pre-attn norm (1) + QKV matmuls (3) + Q/K head_norm (2) + RoPE (2) + build_attn (1 fused op = SDPA + KV write + O proj) + post-attn norm (1) + (MoE: router + moe_ffn fused + post-norm = 3) + end-of-layer norm + per-layer gemma4 ops (~4)
+  - = ~17 logical ops per layer → matches hf2q's 17.6 dispatches/layer measured in iter-69
+  - llama.cpp's `build_moe_ffn` and our `kernel_mul_mv_id_<q>_f32` both fuse all 8 active expert dispatches into a single kernel call (mlx-native uses `threadgroups = (ceil(N/2), n_tokens*top_k, 1)` geometry to handle 8 expert dispatches in one kernel launch). So expert fusion is at parity.
+
+  **Conclusion: the dispatch count is at parity with llama.cpp; the 6.5 ms/token gap is per-kernel-time, NOT dispatch overhead.** Per-dispatch hf2q ~30 µs avg vs llama.cpp's ~18 µs avg means each kernel is ~12 µs slower on hf2q at decode. That's compute (memory-bandwidth, threadgroup-occupancy, per-thread arithmetic) — not graph fusion. Bucket-profiler extension to decode would REGRESS perf 10× (50-200 µs/bucket sync overhead × 17 buckets/layer × 30 layers = saturates the dispatch floor and masks the data we want).
+
+  Better path forward: standalone µbench in mlx-native that times each suspect kernel at Gemma decode shapes (m=1, K=2816, N=1408, top_k=8, n_experts=128 for MoE; m=1, K=2816, N=2816 for QKV/O; m=1, K=2816, N=11264 for FFN). Compare per-kernel µs/call to llama.cpp's same kernel via a sister bench. Then optimize whichever kernel is most over-budget.
+
+  iter-72 actionable: write `/opt/mlx-native/tests/bench_mm_id_q6_k_decode.rs` (or extend existing bench infrastructure) to time `kernel_mul_mv_id_q6_K_f32` at the gemma decode shape. Estimated ~80 LOC; gives concrete µs/call data without distorting the production hot path.
+
+
 
 
 
