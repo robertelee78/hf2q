@@ -285,6 +285,85 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-111 KV TQ-HB encode bench + closure of decode budget at 60.4%
+
+Final big unmeasured kernel benched. dispatch_hadamard_quantize_kv_hb at
+gemma decode shape (num_kv_heads=8, head_dim=256, codebook=8-bit), 120
+calls/token (4/layer × 30):
+
+| Mode | CPU p50 | GPU p50 |
+|---|---:|---:|
+| Per-call isolated | 212.79 µs | 33.42 µs |
+| Session-120 amortized | 291.04 µs (2.43 µs/call) | **0.69 µs/call** |
+
+**Per-token: 0.29 ms = 1.8% of decode.** Tiny — KV encode is dispatch-
+bound, not the hot kernel.
+
+**Final cumulative inventory** (15.86 ms decode token):
+
+| Group | Per-token | % decode |
+|---|---:|---:|
+| LM head Q8_0 (1 call) | 1.58 ms | 9.9% |
+| FA-vec-tq-hb (30) | 1.43 ms | 9.0% |
+| mv_id Q6_K MoE (60) | 0.96 ms | 6.0% |
+| Q+K+V+O proj (120) | 2.62 ms | 16.5% |
+| Dense FFN gate+up+down (90) | ~1.96 ms | ~12.4% |
+| Router (30) | 0.25 ms | 1.6% |
+| KV TQ-HB encode (120) | 0.29 ms | 1.8% |
+| norm + FWHT (180) | 0.49 ms | 3.1% |
+| **Subtotal measured (711 dispatches)** | **9.58 ms** | **60.4%** |
+| Unaccounted (~279 dispatches × ~16 µs) | ~6.25 ms | ~39.6% |
+
+**Remaining 279 unaccounted dispatches** = KV format conv (60) + head
+norm + RoPE (60) + triple norm B8 (90) + gelu_mul + moe_routing (60) +
+moe_weighted_sum (30) + post-FF norm2 + end-layer (60). All at the
+16 µs/dispatch floor where iter-101 confirmed within-kernel ROI ≈ 0.28%
+per kernel.
+
+**Structural decoupling of the decode budget**:
+1. **Big kernels at ceiling** (~8.61 ms = 54%): LM head at memory bw
+   ceiling (587 GB/s), projs + dense FFN + FA + mv_id at compute/bw
+   ceiling for shape × quant. **Near-optimal — no improvement possible
+   within current Q5_K_M + TQ-HB regime.**
+2. **Medium dispatch-bound kernels** (~0.78 ms = 5%): norm + FWHT +
+   KV encode at session-amortized 0.5-0.7 µs/call. Already efficient.
+3. **Small dispatch-floor kernels** (~6.25 ms = 40%): ~280 dispatches
+   at 16 µs each. Only fusion-or-elimination changes these; most have
+   already-fused neighbors per iter-98.
+
+**Decode peer-gap closure paths** (operator decision required):
+
+A. **Speculative decode** (n-gram, MTP, DFlash) — orthogonal 2-4× lever
+   per iter-99 vLLM/dflash research. NO kernel rewrite, NO quality loss.
+   vLLM n-gram is lowest-risk: pure CPU proposer + 1 batched verify
+   forward. **HIGHEST RECOMMENDED.**
+
+B. **Drop TQ-HB**: recovers ~3 ms (FA + KV encode + FWHTs structural
+   overhead). Loses 3.94× memory savings. **MANTRA-VIOLATING — would
+   need explicit operator approval.**
+
+C. **Switch Q5_K_M → Q4_K-mixed**: saves ~10-15% bandwidth on the big
+   kernels (LM head + projs + dense FFN) = ~0.5-1 ms/token. Loses some
+   coherence quality. **REQUIRES OPERATOR APPROVAL** per
+   `feedback_no_deferrals`.
+
+D. **Fuse small-dispatch chains**: bin_fuse_4 (item I) + DS4 gate+up+
+   SwiGLU (item B) target ~280 floor-bound dispatches. Iter-101 ROI
+   ≈ 0.28% per kernel; combined ~1-3% if all merge. **DIMINISHING
+   RETURNS** — engineering cost vs ROI is bad.
+
+**Mantra status post-iter-111** (full inventory complete):
+- ✅ Coherence
+- ✅ Prefill (1.13×–1.87× faster)
+- ❌ Decode 0.65× peer at FA=1 — STRUCTURAL within current TQ-HB +
+  Q5_K_M regime. Closure requires operator pick from {A, B, C}.
+
+**Iter-112 plan**: scope path A (vLLM-style n-gram speculative decode)
+infrastructure. Read /opt/vllm/vllm/v1/spec_decode/ngram_proposer.py
+to map the algorithm onto hf2q's verifier path, draft an ADR
+extension or new ADR-029, present operator with concrete commitment
+estimate.
+
 ### Iter-110 dense FFN inventory + structural-gap synthesis (55.7% mapped)
 
 Bench `bench_iter110_dense_ffn` localizes the dense FFN portion. gemma-4-26b
