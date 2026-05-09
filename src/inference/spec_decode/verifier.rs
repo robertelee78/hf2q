@@ -148,6 +148,73 @@ fn argmax_u32(logits: &[f32]) -> u32 {
     best_idx
 }
 
+/// Greedy variant of `accept_prefix` that takes per-position argmaxes
+/// (Vec<u32>) instead of full logits. ADR-028 iter-123 Shape S.
+///
+/// Used by `forward_decode_verify_serial`: forward_decode already
+/// returns argmax (no need to materialize full logits and re-argmax).
+///
+/// Returns `(accept_count, model_token)` matching `accept_prefix` semantics:
+/// - `accept_count` = leading `drafts[i] == model_argmaxes[i]` matches.
+/// - `model_token` = `model_argmaxes[accept_count]` (the "free" extra token).
+///
+/// Contract identical to `accept_prefix(drafts, &one_hot_at_each(argmaxes))`
+/// but skips the O(K × vocab) one-hot allocation.
+pub fn accept_prefix_argmax(drafts: &[u32], model_argmaxes: &[u32]) -> (usize, u32) {
+    if model_argmaxes.is_empty() {
+        return (0, 0);
+    }
+    let mut accept_count = 0;
+    for i in 0..drafts.len() {
+        if i >= model_argmaxes.len() { break; }
+        if model_argmaxes[i] == drafts[i] {
+            accept_count += 1;
+        } else {
+            return (accept_count, model_argmaxes[i]);
+        }
+    }
+    if accept_count < model_argmaxes.len() {
+        (accept_count, model_argmaxes[accept_count])
+    } else {
+        (accept_count, *model_argmaxes.last().unwrap())
+    }
+}
+
+/// Pure KV-rollback math. ADR-028 iter-123 Shape S contract.
+///
+/// Given a per-layer KV-cache cursor `(write_pos, seq_len)` with
+/// `capacity` slots and `is_sliding` mode, compute the new cursor
+/// after rolling back `trim` writes.
+///
+/// - **Full attention** (`is_sliding=false`): `write_pos` is monotonic
+///   from 0; rollback subtracts. `seq_len` decreases by the same amount.
+/// - **Sliding window** (`is_sliding=true`): `write_pos` is modulo
+///   `capacity`; rollback steps back with wrap-around. `seq_len` still
+///   decreases monotonically (caller invariant: `seq_len ≤ capacity`).
+///
+/// `trim` is clamped to `seq_len` — over-rollback is a no-op past 0.
+pub fn rollback_kv_state(
+    write_pos: usize,
+    seq_len: usize,
+    capacity: usize,
+    is_sliding: bool,
+    trim: usize,
+) -> (usize, usize) {
+    let trim = trim.min(seq_len);
+    let new_seq_len = seq_len - trim;
+    let new_write_pos = if is_sliding {
+        if capacity == 0 {
+            0
+        } else {
+            // Wrap with: new = (old - trim mod cap + cap) mod cap.
+            (write_pos + capacity - (trim % capacity)) % capacity
+        }
+    } else {
+        write_pos.saturating_sub(trim)
+    };
+    (new_write_pos, new_seq_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,5 +645,120 @@ mod tests {
         // where ground_truth_next ignores the input).
         let d = ground_truth_next(&[1u32, 2, 3, 4, 6], 256);
         assert_ne!(a, d, "ground_truth_next must be input-sensitive");
+    }
+
+    // ===== ADR-028 iter-123 Shape S — accept_prefix_argmax + rollback_kv_state =====
+
+    #[test]
+    fn accept_prefix_argmax_full_accept() {
+        let drafts = vec![10u32, 20, 30];
+        let argmaxes = vec![10u32, 20, 30, 40];
+        let (accept, tok) = accept_prefix_argmax(&drafts, &argmaxes);
+        assert_eq!(accept, 3);
+        assert_eq!(tok, 40);
+    }
+
+    #[test]
+    fn accept_prefix_argmax_partial_accept() {
+        let drafts = vec![10u32, 20, 30];
+        let argmaxes = vec![10u32, 20, 99, 40];
+        let (accept, tok) = accept_prefix_argmax(&drafts, &argmaxes);
+        assert_eq!(accept, 2);
+        assert_eq!(tok, 99);
+    }
+
+    #[test]
+    fn accept_prefix_argmax_zero_accept() {
+        let drafts = vec![10u32, 20, 30];
+        let argmaxes = vec![99u32, 20, 30, 40];
+        let (accept, tok) = accept_prefix_argmax(&drafts, &argmaxes);
+        assert_eq!(accept, 0);
+        assert_eq!(tok, 99);
+    }
+
+    #[test]
+    fn accept_prefix_argmax_matches_logits_variant() {
+        // The argmax variant must agree with the logits variant on
+        // the same problem.
+        let drafts = vec![10u32, 20, 30];
+        let argmaxes = vec![10u32, 20, 99, 40];
+        let logits: VerifyLogits = argmaxes.iter().map(|&t| one_hot(100, t)).collect();
+        let (a1, t1) = accept_prefix(&drafts, &logits);
+        let (a2, t2) = accept_prefix_argmax(&drafts, &argmaxes);
+        assert_eq!((a1, t1), (a2, t2));
+    }
+
+    #[test]
+    fn accept_prefix_argmax_empty() {
+        let (a, t) = accept_prefix_argmax(&[], &[]);
+        assert_eq!((a, t), (0, 0));
+    }
+
+    #[test]
+    fn rollback_full_attention_subtracts() {
+        // capacity=4096, write_pos=100, seq_len=100, trim 3.
+        let (wp, sl) = rollback_kv_state(100, 100, 4096, false, 3);
+        assert_eq!((wp, sl), (97, 97));
+    }
+
+    #[test]
+    fn rollback_full_attention_zero_trim() {
+        let (wp, sl) = rollback_kv_state(100, 100, 4096, false, 0);
+        assert_eq!((wp, sl), (100, 100));
+    }
+
+    #[test]
+    fn rollback_full_attention_clamps_at_zero() {
+        // Rollback past 0 → clamped (saturating_sub). seq_len caps trim.
+        let (wp, sl) = rollback_kv_state(100, 100, 4096, false, 200);
+        assert_eq!((wp, sl), (0, 0));
+    }
+
+    #[test]
+    fn rollback_sliding_wraps_no_wrap() {
+        // wp=10 trim=3, no wrap needed. cap=100.
+        let (wp, sl) = rollback_kv_state(10, 50, 100, true, 3);
+        assert_eq!((wp, sl), (7, 47));
+    }
+
+    #[test]
+    fn rollback_sliding_wraps_through_zero() {
+        // wp=2, trim=3, cap=10. (2 + 10 - 3) % 10 = 9.
+        let (wp, sl) = rollback_kv_state(2, 10, 10, true, 3);
+        assert_eq!((wp, sl), (9, 7));
+    }
+
+    #[test]
+    fn rollback_sliding_wraps_full_circle() {
+        // trim equal to capacity → write_pos unchanged (full wrap),
+        // but seq_len capped to 0.
+        let (wp, sl) = rollback_kv_state(2, 10, 10, true, 10);
+        // (2 + 10 - 0) % 10 = 2  (trim%cap = 0).
+        assert_eq!((wp, sl), (2, 0));
+    }
+
+    #[test]
+    fn rollback_sliding_zero_capacity_safe() {
+        // Defensive: capacity=0 should not divide-by-zero.
+        let (wp, sl) = rollback_kv_state(0, 0, 0, true, 5);
+        assert_eq!((wp, sl), (0, 0));
+    }
+
+    #[test]
+    fn rollback_invariant_seq_len_le_capacity() {
+        // Property: post-rollback seq_len never exceeds capacity.
+        for cap in [1usize, 8, 64, 256, 1024] {
+            for sl in 0..=cap {
+                for wp in 0..=cap.saturating_sub(1).max(0) {
+                    for is_sliding in [false, true] {
+                        for trim in [0usize, 1, sl, sl/2, sl+1] {
+                            let (_nwp, nsl) = rollback_kv_state(wp, sl, cap, is_sliding, trim);
+                            assert!(nsl <= cap, "seq_len > cap: cap={cap} wp={wp} sl={sl} sliding={is_sliding} trim={trim} → nsl={nsl}");
+                            assert!(nsl <= sl, "seq_len grew: cap={cap} wp={wp} sl={sl} trim={trim} → nsl={nsl}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

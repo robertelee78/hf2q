@@ -4418,6 +4418,65 @@ impl MlxModelWeights {
 
     // forward_prefill() is defined in forward_prefill.rs (ADR-009 Track 1).
 
+    /// ADR-028 iter-123 / ADR-029 Phase 2 Shape S — serial spec-decode verify.
+    ///
+    /// Forwards each `tokens[i]` through the model at position `seq_pos + i`,
+    /// collecting the model's argmax at each step. Returns `Vec<u32>` of
+    /// argmaxes (length == `tokens.len()`).
+    ///
+    /// **Shape S contract**: each token is a full `forward_decode` (own
+    /// `GraphSession` begin/finish + `commit_and_wait`). This runs at
+    /// `K × default-decode-latency` — NO speedup vs default decode.
+    ///
+    /// Use case: byte-identity correctness gate for the `accept_prefix`
+    /// wiring + `rollback_kv` helper. Shape B (batched single-pass) lands
+    /// later for the actual speed lift.
+    ///
+    /// At greedy temperature, `forward_decode_verify_serial(&[t0, t1, t2])`
+    /// produces argmaxes byte-identical to calling `forward_decode(t0)`
+    /// then `forward_decode(t1)` then `forward_decode(t2)` independently.
+    pub fn forward_decode_verify_serial(
+        &mut self,
+        tokens: &[u32],
+        seq_pos: usize,
+        gpu: &mut GpuContext,
+    ) -> Result<Vec<u32>> {
+        let mut argmaxes = Vec::with_capacity(tokens.len());
+        for (i, &tok) in tokens.iter().enumerate() {
+            let mut prof: Option<TokenProfile> = None;
+            let argmax = self.forward_decode(tok, seq_pos + i, gpu, &mut prof)?;
+            argmaxes.push(argmax);
+        }
+        Ok(argmaxes)
+    }
+
+    /// ADR-028 iter-123 / ADR-029 Phase 2 — KV-cache rollback after partial accept.
+    ///
+    /// Rolls back the last `trim` writes across all layers. Sliding-window
+    /// caches wrap (write_pos modulo capacity); full-attention caches go
+    /// monotonic. The math is delegated to
+    /// [`crate::inference::spec_decode::verifier::rollback_kv_state`] —
+    /// see its tests for invariants.
+    ///
+    /// After this call, the next `forward_decode`/`forward_decode_verify_serial`
+    /// invocation resumes at `current_seq_pos - trim`. The K_packed/V_packed
+    /// data past the new `seq_len` is left as garbage; this is safe because
+    /// kernels only read `< seq_len` and writes always go to current
+    /// `write_pos`.
+    pub fn rollback_kv(&mut self, trim: usize) {
+        for cache in &mut self.kv_caches {
+            let (wp, sl) = crate::inference::spec_decode::verifier::rollback_kv_state(
+                cache.write_pos,
+                cache.seq_len,
+                cache.capacity,
+                cache.is_sliding,
+                trim,
+            );
+            cache.write_pos = wp;
+            cache.seq_len = sl;
+        }
+    }
+
     /// Per-kernel-type profiling forward pass.
     ///
     /// Breaks the single session into one session PER KERNEL TYPE PER LAYER,
