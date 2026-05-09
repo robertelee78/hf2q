@@ -546,6 +546,33 @@ fn cmd_dwq_train_full_model(args: cli::DwqTrainArgs) -> Result<(), AppError> {
         result.skipped.len(),
         result.safetensors_bytes.len()
     );
+
+    // ADR-020 AC#7 foundation F1 — operator-visible trajectory summary.
+    // Pure computation lives in `TrajectorySummary::from_losses`
+    // (`src/calibrate/dwq_loop.rs`) so it's unit-tested independent
+    // of GPU-bearing training code.
+    if !result.loss_trajectory.is_empty() {
+        let s = crate::calibrate::dwq_loop::TrajectorySummary::from_losses(
+            &result.loss_trajectory,
+        );
+        println!(
+            "[dwq-train full-model] loss trajectory: \
+             n={n} first={first:.4e} last={last:.4e} \
+             min={min:.4e}@step{min_step} max={max:.4e}@step{max_step} \
+             reduction_ratio={ratio:.4} \
+             worse_than_first={worse}/{n}",
+            n = s.n,
+            first = s.first,
+            last = s.last,
+            min = s.min_value,
+            min_step = s.min_step,
+            max = s.max_value,
+            max_step = s.max_step,
+            ratio = s.reduction_ratio,
+            worse = s.worse_than_first,
+        );
+    }
+
     for t in &result.trained {
         println!(
             "  TRAINED  {:60}  [n={:6} k={:6}]  kl_initial={:.4e} kl_min={:.4e} steps={}",

@@ -3079,6 +3079,82 @@ pub struct DwqAllLinearsResult {
     /// do with the result; the driver does not auto-fail on a low
     /// mean.
     pub mean_delta_kl_nats: Option<f32>,
+    /// ADR-020 AC#7 foundation F1 — per-step KL loss trajectory from
+    /// `train_all_linears_full_model_dwq`.  One entry per Adam step,
+    /// in step order.  Empty for the synthetic-teacher per-Linear
+    /// driver (`train_all_linears_dwq`) which tracks per-Linear
+    /// trajectories internally instead of a single global one.
+    ///
+    /// Operators inspect this to verify Adam is actually reducing
+    /// the model-level KL (vs random-walking on noisy gradients);
+    /// the boundary delta-NLL signal is downstream of this trajectory.
+    pub loss_trajectory: Vec<f32>,
+}
+
+/// ADR-020 AC#7 foundation F1 — pure summary statistics over a
+/// loss trajectory.  Surfaces three convergence questions:
+///
+///   1. Did training make the loss any smaller? (`reduction_ratio`,
+///      `min_value` vs `first`)
+///   2. Did it ever go DOWN, even briefly? (`min_step`)
+///   3. How often did training make things worse than start?
+///      (`worse_than_first` count)
+///
+/// `reduction_ratio = min_value / first` — strictly < 1.0 means
+/// training found at least one step with lower loss than start.
+/// `worse_than_first / n` close to 1.0 indicates random walk or
+/// divergence; close to 0.0 indicates monotone-ish convergence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrajectorySummary {
+    pub n: usize,
+    pub first: f32,
+    pub last: f32,
+    pub min_value: f32,
+    pub min_step: usize,
+    pub max_value: f32,
+    pub max_step: usize,
+    pub worse_than_first: usize,
+    /// `min_value / first` (NaN when `n == 0` OR `|first| < EPSILON`).
+    pub reduction_ratio: f32,
+}
+
+impl TrajectorySummary {
+    /// Compute summary statistics from a step-ordered loss trajectory.
+    /// Empty input returns a sentinel with `n=0` and NaN values.
+    pub fn from_losses(losses: &[f32]) -> Self {
+        if losses.is_empty() {
+            return Self {
+                n: 0,
+                first: f32::NAN, last: f32::NAN,
+                min_value: f32::NAN, min_step: 0,
+                max_value: f32::NAN, max_step: 0,
+                worse_than_first: 0,
+                reduction_ratio: f32::NAN,
+            };
+        }
+        let n = losses.len();
+        let first = losses[0];
+        let last  = losses[n - 1];
+        let mut min_value = f32::INFINITY;
+        let mut min_step  = 0usize;
+        let mut max_value = f32::NEG_INFINITY;
+        let mut max_step  = 0usize;
+        let mut worse_than_first = 0usize;
+        for (i, &v) in losses.iter().enumerate() {
+            if v < min_value { min_value = v; min_step = i; }
+            if v > max_value { max_value = v; max_step = i; }
+            if v > first { worse_than_first += 1; }
+        }
+        let reduction_ratio = if first.abs() > f32::EPSILON {
+            min_value / first
+        } else {
+            f32::NAN
+        };
+        Self {
+            n, first, last, min_value, min_step,
+            max_value, max_step, worse_than_first, reduction_ratio,
+        }
+    }
 }
 
 /// ADR-020 iter-12d-2 — production driver: scan a real GGUF model,
@@ -3509,6 +3585,10 @@ where
         skipped,
         safetensors_bytes,
         mean_delta_kl_nats,
+        // Synthetic-teacher per-Linear driver tracks trajectories
+        // per Linear (in `DwqLinearTrained.kl_initial / kl_min`),
+        // not a single global trajectory.  Empty here is correct.
+        loss_trajectory: Vec::new(),
     })
 }
 
@@ -4056,6 +4136,14 @@ pub fn train_all_linears_full_model_dwq(
 
     let mut first_step_kl = f32::NAN;
     let mut last_step_kl  = f32::NAN;
+    // ADR-020 AC#7 foundation F1 — capture the full per-step trajectory
+    // so operators can see whether Adam actually reduces KL or
+    // random-walks on noisy gradients.  The per-Linear `kl_min` field
+    // below is computed as the trajectory minimum (replacing the
+    // previous `first.min(last)` heuristic which missed interior
+    // dips/spikes).  Per-step `loss_scalar` is already a `to_vec()`
+    // GPU→CPU readback so this adds no additional sync cost.
+    let mut loss_trajectory: Vec<f32> = Vec::with_capacity(cfg.n_steps);
 
     for step in 0..cfg.n_steps {
         if let Some(w) = &watchdog { if w.is_aborted() {
@@ -4250,6 +4338,17 @@ pub fn train_all_linears_full_model_dwq(
         let loss_scalar = loss_v[0];
         if step == 0 { first_step_kl = loss_scalar; }
         last_step_kl = loss_scalar;
+        loss_trajectory.push(loss_scalar);
+        // ADR-020 AC#7 foundation F1 — visible per-step trajectory.
+        // Always-on: emitting one line per step is information operators
+        // need to validate convergence (or detect divergence) on real
+        // data; n_steps is bounded by --full-model-n-steps (typical
+        // 200-500) so the volume is small relative to the work being
+        // done (one full-model forward + backward per step).
+        println!(
+            "[dwq-train full-model] step={step:>4}/{n_steps} loss={loss_scalar:.6e}",
+            n_steps = cfg.n_steps,
+        );
 
         let dy = ones_like(&tape, loss.shape()).context("ones_like dy")?;
         let grads = backward(&loss, dy).context("backward")?;
@@ -4328,10 +4427,26 @@ pub fn train_all_linears_full_model_dwq(
             .map_err(|e| anyhow!("safetensors serialize: {e}"))?
     };
 
+    // ADR-020 AC#7 foundation F1 — TRUE minimum across the full
+    // trajectory (not just first.min(last), which silently missed
+    // interior dips when training was non-monotonic — the case we
+    // observed on real-corpus 27B at n_steps=20).
+    let trajectory_min: f32 = loss_trajectory
+        .iter()
+        .copied()
+        .fold(f32::INFINITY, |a, b| a.min(b));
+    let kl_min_for_summary = if trajectory_min.is_finite() {
+        trajectory_min
+    } else {
+        // No steps run — preserve the previous fallback so the
+        // empty-trajectory case still produces a sane scalar.
+        last_step_kl.min(first_step_kl)
+    };
+
     for (tid, pack, _n, _k) in &all_linears {
         trained.push(DwqLinearTrained {
             name: tid.clone(), n: pack.n, k: pack.k,
-            kl_initial: first_step_kl, kl_min: last_step_kl.min(first_step_kl),
+            kl_initial: first_step_kl, kl_min: kl_min_for_summary,
             steps_run: cfg.n_steps, bench: None,
         });
     }
@@ -4339,6 +4454,7 @@ pub fn train_all_linears_full_model_dwq(
     Ok(DwqAllLinearsResult {
         trained, skipped, safetensors_bytes,
         mean_delta_kl_nats: None,
+        loss_trajectory,
     })
 }
 
@@ -4562,6 +4678,98 @@ mod tests {
         backward, ones_like, qdq_affine, square, sub, GpuTape, GpuTensor,
     };
     use std::collections::BTreeMap;
+
+    // ── ADR-020 AC#7 foundation F1 — TrajectorySummary tests ─────────
+    // Pure computation; no GPU.  Validates the math behind the
+    // operator-visible "loss trajectory: ..." summary line printed by
+    // `cmd_dwq_train_full_model`.
+
+    #[test]
+    fn trajectory_summary_empty_returns_nan_sentinel() {
+        let s = TrajectorySummary::from_losses(&[]);
+        assert_eq!(s.n, 0);
+        assert!(s.first.is_nan() && s.last.is_nan() && s.min_value.is_nan()
+                && s.max_value.is_nan() && s.reduction_ratio.is_nan(),
+                "empty trajectory must yield NaN sentinels");
+        assert_eq!(s.worse_than_first, 0);
+    }
+
+    #[test]
+    fn trajectory_summary_single_step_is_first_eq_last_eq_min_eq_max() {
+        let s = TrajectorySummary::from_losses(&[0.5]);
+        assert_eq!(s.n, 1);
+        assert_eq!(s.first, 0.5);
+        assert_eq!(s.last, 0.5);
+        assert_eq!(s.min_value, 0.5);
+        assert_eq!(s.max_value, 0.5);
+        assert_eq!(s.min_step, 0);
+        assert_eq!(s.max_step, 0);
+        assert_eq!(s.worse_than_first, 0);
+        assert!((s.reduction_ratio - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn trajectory_summary_monotone_decrease_reports_correct_min() {
+        // Strictly decreasing — clean convergence.
+        let s = TrajectorySummary::from_losses(&[1.0, 0.8, 0.6, 0.4, 0.2]);
+        assert_eq!(s.n, 5);
+        assert_eq!(s.first, 1.0);
+        assert_eq!(s.last, 0.2);
+        assert_eq!(s.min_value, 0.2);
+        assert_eq!(s.min_step, 4);
+        assert_eq!(s.max_value, 1.0);
+        assert_eq!(s.max_step, 0);
+        assert_eq!(s.worse_than_first, 0);
+        assert!((s.reduction_ratio - 0.2).abs() < 1e-6,
+                "reduction_ratio = min/first = 0.2 / 1.0 = 0.2; got {}",
+                s.reduction_ratio);
+    }
+
+    #[test]
+    fn trajectory_summary_interior_min_caught_when_last_recovers() {
+        // Non-monotonic: dips at step 2, recovers above first by step 4.
+        // Falsifies the previous `first.min(last)` heuristic which would
+        // have reported `min = first = 1.0`.
+        let s = TrajectorySummary::from_losses(&[1.0, 0.7, 0.3, 0.9, 1.2]);
+        assert_eq!(s.first, 1.0);
+        assert_eq!(s.last, 1.2);
+        assert_eq!(s.min_value, 0.3,
+                   "must catch interior min at step 2, not first.min(last)");
+        assert_eq!(s.min_step, 2);
+        assert_eq!(s.max_value, 1.2);
+        assert_eq!(s.max_step, 4);
+        // Step 4 (1.2) is strictly worse than first (1.0); steps 1-3 are not.
+        assert_eq!(s.worse_than_first, 1);
+        assert!((s.reduction_ratio - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn trajectory_summary_diverging_reports_high_worse_than_first() {
+        // Random-walk-style divergence — the case we observed empirically
+        // on the 27B real-corpus 20-step run (delta_nats trended worse).
+        let s = TrajectorySummary::from_losses(
+            &[0.5, 0.6, 0.55, 0.7, 0.8, 0.9, 1.0]
+        );
+        assert_eq!(s.first, 0.5);
+        assert_eq!(s.min_value, 0.5);  // first step IS the best — never improved
+        assert_eq!(s.min_step, 0);
+        assert_eq!(s.max_value, 1.0);
+        assert_eq!(s.max_step, 6);
+        assert_eq!(s.worse_than_first, 6,
+                   "all 6 non-first steps must be flagged as worse");
+        assert!((s.reduction_ratio - 1.0).abs() < 1e-6,
+                "no improvement → ratio = 1.0; got {}", s.reduction_ratio);
+    }
+
+    #[test]
+    fn trajectory_summary_zero_first_yields_nan_ratio() {
+        // Edge: degenerate first==0 must not divide-by-zero.
+        let s = TrajectorySummary::from_losses(&[0.0, 0.1, 0.2]);
+        assert_eq!(s.first, 0.0);
+        assert_eq!(s.min_value, 0.0);
+        assert!(s.reduction_ratio.is_nan(),
+                "first==0 ⇒ ratio undefined; got {}", s.reduction_ratio);
+    }
 
     /// Synthetic 2-tensor DWQ training loop.  Two frozen FP32 weight
     /// tensors `W1`, `W2` are encoded with affine quantization
