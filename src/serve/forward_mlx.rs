@@ -3220,23 +3220,38 @@ impl MlxModelWeights {
                         &[&self.activations.attn_k_normed, v_src],
                         &[&dense_kvs[layer_idx].k, &dense_kvs[layer_idx].v],
                     );
+                    // ADR-028 iter-146: fused K+V single-position copy (default-on).
+                    // HF2Q_KV_DUAL_LEGACY=1 forces 2-dispatch reference path for
+                    // forensic A/B parity audit; matches W-5b.10/14 sunset cadence.
+                    let use_legacy_2dispatch = INVESTIGATION_ENV.kv_dual_legacy;
                     if kv_is_f16 {
-                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
-                            s.encoder_mut(), reg, metal_dev,
-                            &self.activations.attn_k_normed,
-                            &dense_kvs[layer_idx].k,
-                            nkv as u32, hd as u32,
-                            dense_cap as u32, write_slot,
-                        ).map_err(|e| anyhow::anyhow!("decode F16 K copy L{layer_idx}: {e}"))?;
-                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
-                            s.encoder_mut(), reg, metal_dev,
-                            v_src,
-                            &dense_kvs[layer_idx].v,
-                            nkv as u32, hd as u32,
-                            dense_cap as u32, write_slot,
-                        ).map_err(|e| anyhow::anyhow!("decode F16 V copy L{layer_idx}: {e}"))?;
-                        total_dispatches += 2;
-                    } else {
+                        if use_legacy_2dispatch {
+                            mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
+                                s.encoder_mut(), reg, metal_dev,
+                                &self.activations.attn_k_normed,
+                                &dense_kvs[layer_idx].k,
+                                nkv as u32, hd as u32,
+                                dense_cap as u32, write_slot,
+                            ).map_err(|e| anyhow::anyhow!("decode F16 K copy L{layer_idx}: {e}"))?;
+                            mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
+                                s.encoder_mut(), reg, metal_dev,
+                                v_src,
+                                &dense_kvs[layer_idx].v,
+                                nkv as u32, hd as u32,
+                                dense_cap as u32, write_slot,
+                            ).map_err(|e| anyhow::anyhow!("decode F16 V copy L{layer_idx}: {e}"))?;
+                            total_dispatches += 2;
+                        } else {
+                            mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16_kv_dual(
+                                s.encoder_mut(), reg, metal_dev,
+                                &self.activations.attn_k_normed, v_src,
+                                &dense_kvs[layer_idx].k, &dense_kvs[layer_idx].v,
+                                nkv as u32, hd as u32,
+                                dense_cap as u32, write_slot,
+                            ).map_err(|e| anyhow::anyhow!("decode F16 KV dual copy L{layer_idx}: {e}"))?;
+                            total_dispatches += 1;
+                        }
+                    } else if use_legacy_2dispatch {
                         // F32 batched: one dispatch per K, one per V (all heads at once).
                         mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
                             s.encoder_mut(), reg, metal_dev,
@@ -3253,6 +3268,16 @@ impl MlxModelWeights {
                             dense_cap as u32, write_slot,
                         ).map_err(|e| anyhow::anyhow!("decode F32 V batch copy L{layer_idx}: {e}"))?;
                         total_dispatches += 2;
+                    } else {
+                        // ADR-028 iter-146: fused F32 K+V into single dispatch.
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_kv_dual(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_k_normed, v_src,
+                            &dense_kvs[layer_idx].k, &dense_kvs[layer_idx].v,
+                            nkv as u32, hd as u32,
+                            dense_cap as u32, write_slot,
+                        ).map_err(|e| anyhow::anyhow!("decode F32 KV dual copy L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
                     }
 
                     // ADR-009 Phase 3A: dump full cached K/V for the detail layer,

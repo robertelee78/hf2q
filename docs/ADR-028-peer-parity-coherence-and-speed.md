@@ -2924,6 +2924,81 @@ iter-145 plan: bisect KV cache copy with focused µbench harness +
 read llama.cpp's KV write path; identify the single change that closes
 the 37.6× ratio gap.
 
+### iter-145+146: fused dispatch_kv_cache_copy_batch_f32_kv_dual + finding
+
+#### iter-145 LANDED in mlx-native (commit `a4e8b0f`)
+
+Two fused MSL kernels: `kv_cache_copy_batch_f32_kv_dual` (F32→F32) +
+`kv_cache_copy_batch_f32_to_f16_kv_dual` (F32→F16). Each thread copies
+one (K, V) element pair at the same coords. 2 byte-identity unit tests
+PASS at gemma4 production shape (nh=8, hd=256, cap=1024).
+
+#### iter-146 hf2q wire-up + A/B test
+
+Wired at `forward_mlx.rs:3225+`, behind `HF2Q_KV_DUAL_LEGACY=1` env
+override. Default-on; legacy preserved for forensic A/B parity.
+
+**A/B at HF2Q_USE_DENSE=1 (the path my edit covers)**:
+
+| Mode | dispatches | barriers | gpu_ns | tok/s |
+|------|---:|---:|---:|---:|
+| NEW fused | 956 | 432 | 12.0 ms | 81.5 |
+| LEGACY 2-disp | 986 | 432 | 12.0 ms | 82.2 |
+| Δ NEW | -30 | 0 | 0 | -0.7 |
+
+Wire-up CONFIRMED: 30 dispatches saved per token (exactly the predicted
+60→30 KV copy reduction). Tok/s parity within noise — savings absorbed
+by Apple GPU dispatch floor.
+
+#### iter-146 SURPRISE FINDING — dense path is 17.6% faster than default
+
+Comparing the same gemma4 APEX-Q5_K_M decode:
+
+| Path | tok/s | ms/tok | vs peer (102 tok/s) |
+|------|---:|---:|---:|
+| **Default** (TQ-HB encode + FA-vec-tq-hb) | 69.3 | 14.43 | 0.679× |
+| **HF2Q_USE_DENSE=1** (dense_kvs + FA-vec) | **81.5** | **12.27** | **0.799×** |
+| llama.cpp peer (HEAD build 9010) | 102.05 | 9.80 | 1.0× |
+
+**Default path adds ~2.16 ms/token of TQ-HB overhead.** At gemma4
+production with `tq_kv = inactive` reported at load time, the
+`dispatch_hadamard_quantize_kv_hb` calls run anyway and contribute to
+the 4.65 ms gap to peer.
+
+#### Diagnostic mislabel found (kernel-profile reports)
+
+The `forward_decode_kernel_profile` "KV cache copy" attribution at
+`forward_mlx.rs:4710-4750` actually times
+`dispatch_hadamard_quantize_kv` (TQ-HB encode) for the kernel-profile
+session, NOT `dispatch_kv_cache_copy_batch_f32`. The 37.6× ratio
+finding in iter-144 was correct in flagging the slowest *family*, but
+the kernel name shown was misleading — the actual hot kernel is the
+TQ-HB encoder.
+
+#### Walk-phase pivot
+
+The iter-145/146 fused-batch-copy work LANDED + wire-up CONFIRMS the
+fusion mechanism works (30 dispatches saved). Infrastructure is
+production-useful for dense_kvs paths (HF2Q_USE_DENSE=1, qwen3.6 dense
+mode, future models).
+
+**But for gemma4 default decode, the bigger lever is the TQ-HB encode
+overhead, not the cache copy fusion.** Two next-iter targets:
+
+1. **iter-147A**: Build `dispatch_hadamard_quantize_kv_hb_dual` —
+   fused K+V Hadamard quantize. Targets ~30 dispatches saved at the
+   real hot kernel (replicates iter-145/146 pattern at the right
+   target).
+2. **iter-147B**: Investigate whether HF2Q_USE_DENSE=1 should be
+   default-on for gemma4. Per `tq_kv = inactive` at load, the TQ-HB
+   path may be running for no benefit. **17.6% speedup → 0.679× to
+   0.799× peer** is a real walk-phase win if it doesn't regress
+   coherence.
+
+iter-147 plan: A/B coherence (logits sample-by-sample) at
+HF2Q_USE_DENSE=1 vs default to verify byte-equivalent output, then
+either default-flip or document the trade-off.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)

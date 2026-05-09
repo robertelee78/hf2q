@@ -445,6 +445,14 @@ pub struct InvestigationEnv {
     /// Original parse: `map_or(false, |v| v == "1")`.
     pub split_timing: bool,
 
+    /// `HF2Q_KV_DUAL_LEGACY=1` — force the legacy 2-dispatch K+V cache
+    /// copy path (one for K, one for V) instead of the iter-145 fused
+    /// single-dispatch dual kernel. ADR-028 forensic A/B switch; both
+    /// paths are bit-identical by mlx-native unit tests
+    /// (`test_kv_cache_copy_batch_f32_kv_dual_byte_identity` +
+    /// `test_kv_cache_copy_batch_f32_to_f16_kv_dual_byte_identity`).
+    pub kv_dual_legacy: bool,
+
     /// `HF2Q_MLX_KERNEL_PROFILE=1` — per-kernel profile mode.
     /// Original parse: `map_or(false, |v| v == "1")`.
     pub mlx_kernel_profile: bool,
@@ -614,6 +622,7 @@ impl InvestigationEnv {
             // Profiling / timing.
             mlx_timing: env::var("HF2Q_MLX_TIMING").is_ok(),
             split_timing: env_eq_one("HF2Q_SPLIT_TIMING"),
+            kv_dual_legacy: env_eq_one("HF2Q_KV_DUAL_LEGACY"),
             mlx_kernel_profile: env_eq_one("HF2Q_MLX_KERNEL_PROFILE"),
             mlx_profile: env_eq_one("HF2Q_MLX_PROFILE"),
 
