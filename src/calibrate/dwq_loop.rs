@@ -834,6 +834,75 @@ pub fn build_calibration_split_from_full_model<'a>(
     }
 }
 
+/// ADR-020 AC#7 Option A — owned teacher provider + paired
+/// `ComputeTargetsConfig` ready for the teacher-capture pass.
+///
+/// The struct owns the loaded [`GgufTeacherProvider`] (which holds a
+/// multi-GB Qwen35Model on the GPU) so the caller can drive
+/// [`crate::calibrate::dwq_targets::compute_dwq_targets`] without
+/// re-loading the model.  The split is intentionally NOT included
+/// here — its borrow lifetime would tie the prepared bundle to the
+/// cfg, which complicates ownership.  Caller composes the split via
+/// [`build_calibration_split_from_full_model`] at the call site.
+pub struct PreparedFullModelTeacherInputs {
+    pub teacher: crate::calibrate::gguf_teacher::GgufTeacherProvider,
+    pub targets_cfg: crate::calibrate::dwq_targets::ComputeTargetsConfig,
+}
+
+/// ADR-020 AC#7 Option A — open the teacher GGUF and assemble every
+/// non-corpus input that [`crate::calibrate::dwq_targets::compute_dwq_targets`]
+/// needs.
+///
+/// Composition step that ties together:
+///   1. `cfg.validate()` — fail loud on bad knobs BEFORE any disk I/O
+///   2. `GgufTeacherProvider::from_gguf_path(cfg.gguf_path)` — load
+///      the teacher (multi-GB; ~30s+ wallclock on M5 Max for 35B)
+///   3. extract `vocab` from the loaded model (NOT from the cfg —
+///      the GGUF is the source of truth, see
+///      `gguf_teacher.rs:85-90`)
+///   4. `build_dwq_targets_config_from_full_model` to assemble the
+///      `ComputeTargetsConfig`
+///
+/// The caller still owns `cfg`; this fn does NOT consume it because
+/// the split helper borrows `cfg.calibration_token_batches`.
+///
+/// Returns the owned teacher + the targets cfg.  Caller drives
+/// `compute_dwq_targets(&mut prepared.teacher,
+/// &[build_calibration_split_from_full_model(&cfg, "train")],
+/// &prepared.targets_cfg)`.
+pub fn prepare_full_model_teacher_inputs(
+    cfg: &FullModelDwqConfig,
+    save_dir: std::path::PathBuf,
+) -> Result<PreparedFullModelTeacherInputs> {
+    // Step 1 — validate BEFORE any I/O.
+    cfg.validate()
+        .context("prepare_full_model_teacher_inputs: cfg.validate")?;
+
+    // Step 2 — open teacher.  This is the heavy step (model load +
+    // GPU upload).
+    let teacher = crate::calibrate::gguf_teacher::GgufTeacherProvider::from_gguf_path(
+        &cfg.gguf_path,
+    )
+    .with_context(|| {
+        format!(
+            "prepare_full_model_teacher_inputs: GgufTeacherProvider::from_gguf_path {}",
+            cfg.gguf_path.display()
+        )
+    })?;
+
+    // Step 3 — derive vocab from the loaded model (authoritative).
+    let vocab = teacher.vocab();
+
+    // Step 4 — assemble the targets cfg.
+    let targets_cfg = build_dwq_targets_config_from_full_model(cfg, save_dir, vocab)
+        .context("prepare_full_model_teacher_inputs: build_dwq_targets_config_from_full_model")?;
+
+    Ok(PreparedFullModelTeacherInputs {
+        teacher,
+        targets_cfg,
+    })
+}
+
 /// ADR-020 iter-12d-2 — per-Linear training summary inside a model
 /// scan (one entry per successfully-trained tensor).
 #[derive(Debug, Clone)]
@@ -3486,6 +3555,130 @@ mod tests {
         assert_eq!(split.batches[0][0], 1);
         assert_eq!(split.batches[1][0], 2);
         assert_eq!(split.batches[2][0], 3);
+    }
+
+    /// ADR-020 AC#7 Option A — `prepare_full_model_teacher_inputs`
+    /// must fail at `cfg.validate()` BEFORE attempting to open the
+    /// GGUF.  Verifies the validate-first ordering: a clearly-invalid
+    /// cfg (gguf_path empty) returns a "validate" error rather than a
+    /// file-open error, even if `/dev/null` was passed.
+    #[test]
+    fn prepare_full_model_teacher_inputs_validates_before_io() {
+        let cfg = super::FullModelDwqConfig {
+            // gguf_path stays empty (default) — validate() must catch
+            // this before from_gguf_path is even called.
+            calibration_token_batches: vec![vec![0u32; 32 * 512]],
+            ..super::FullModelDwqConfig::default()
+        };
+        assert!(cfg.gguf_path.as_os_str().is_empty(), "fixture invariant");
+
+        let res = super::prepare_full_model_teacher_inputs(
+            &cfg,
+            std::path::PathBuf::from("/tmp/teacher-out-validate-first"),
+        );
+        let err = match res {
+            Ok(_) => panic!("expected validate-first error, got Ok"),
+            Err(e) => e,
+        };
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("cfg.validate") && msg.contains("gguf_path must be non-empty"),
+            "expected validate-first error, got: {msg}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — `prepare_full_model_teacher_inputs`
+    /// surfaces a file-open error when the gguf_path passes validate
+    /// (non-empty) but does not exist on disk.  This proves the
+    /// validate→open ordering: bad path bypasses the empty-string
+    /// check but is still caught loudly by the open step.
+    #[test]
+    fn prepare_full_model_teacher_inputs_surfaces_open_error_for_missing_gguf() {
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-prepare-missing-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // The path is non-empty (passes validate) but does not exist.
+        let bogus = dir.join("does-not-exist.gguf");
+        let cfg = super::FullModelDwqConfig {
+            gguf_path: bogus.clone(),
+            calibration_token_batches: vec![vec![0u32; 32 * 512]],
+            ..super::FullModelDwqConfig::default()
+        };
+
+        let res = super::prepare_full_model_teacher_inputs(
+            &cfg,
+            std::path::PathBuf::from("/tmp/teacher-out-missing"),
+        );
+        let err = match res {
+            Ok(_) => panic!("expected open-stage error, got Ok"),
+            Err(e) => e,
+        };
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("from_gguf_path") || msg.contains("GgufFile::open"),
+            "expected open-stage error, got: {msg}"
+        );
+        // And it must include the path we asked to open so operators
+        // can grep their log for it.
+        assert!(
+            msg.contains(&*bogus.to_string_lossy()),
+            "error must echo the path; got: {msg}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — end-to-end teacher prep on a real GGUF.
+    /// Gated on `HF2Q_TEST_GGUF` env var so the test skips cleanly
+    /// when the model file is not present.  Verifies:
+    ///   - the teacher loads from the path
+    ///   - `prepared.targets_cfg.vocab` matches `prepared.teacher.vocab()`
+    ///   - `prepared.targets_cfg.top_k` round-trips from cfg
+    ///   - `prepared.targets_cfg.save_dir` matches the caller-supplied path
+    #[test]
+    fn prepare_full_model_teacher_inputs_real_gguf_e2e() {
+        let gguf_path = match std::env::var("HF2Q_TEST_GGUF") {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("[adr-020 ac#7 prep] SKIP: HF2Q_TEST_GGUF not set");
+                return;
+            }
+        };
+        let path = std::path::PathBuf::from(&gguf_path);
+        if !path.exists() {
+            eprintln!("[adr-020 ac#7 prep] SKIP: {gguf_path} does not exist");
+            return;
+        }
+
+        let cfg = super::FullModelDwqConfig {
+            gguf_path: path,
+            calibration_token_batches: vec![vec![0u32; 32 * 4]],
+            batch_size: 32,
+            seq_len: 4,
+            top_k_teacher: 64,
+            ..super::FullModelDwqConfig::default()
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-prepare-e2e-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let save_dir = dir.join("teacher-out");
+
+        let prepared = match super::prepare_full_model_teacher_inputs(&cfg, save_dir.clone()) {
+            Ok(p) => p,
+            Err(e) => panic!("real-GGUF teacher prep failed: {e:#}"),
+        };
+        assert!(prepared.teacher.vocab() > 0);
+        assert_eq!(prepared.targets_cfg.vocab, prepared.teacher.vocab());
+        assert_eq!(prepared.targets_cfg.top_k, 64);
+        assert_eq!(prepared.targets_cfg.save_dir, save_dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ADR-020 AC#7 Option A — adapter chain: JSONL loader output →
