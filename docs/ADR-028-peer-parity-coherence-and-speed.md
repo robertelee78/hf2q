@@ -1814,6 +1814,71 @@ Gemma 4 26B-Q5_K_M) is **structurally bounded** within current TQ-HB
 **iter-121 verdict: more kernel sniping won't close the gap. Path A is
 the right next investment.**
 
+### iter-122: Path A architecture refinement — serial-first then batched
+
+Re-read `forward_decode` at `serve/forward_mlx.rs:2233` and
+`forward_prefill` at `serve/forward_prefill.rs:332`. Two viable shapes
+for `forward_decode_verify`:
+
+**Shape S (serial)**:
+```
+fn forward_decode_verify(spec_tokens: &[u32], start_pos: usize) -> Vec<u32> {
+    let mut model_tokens = Vec::with_capacity(spec_tokens.len());
+    for (i, &tok) in spec_tokens.iter().enumerate() {
+        model_tokens.push(self.forward_decode(tok, start_pos + i, gpu, prof)?);
+    }
+    model_tokens
+}
+```
+- ✅ Correctness: each forward_decode is a complete pass with its own
+  GraphSession begin/finish. No ownership conflict.
+- ❌ Speed: k × commit_and_wait = k × ~16 ms. Defeats spec-decode
+  purpose by serializing the k speculative forwards.
+- Use case: byte-identity gate vs default decode. Prove the
+  accept-prefix wiring is correct before any batching.
+
+**Shape B (batched)**:
+- Reuses forward_prefill's k-token machinery, in append-mode (resume
+  from current `kv.write_pos` instead of resetting to 0).
+- Per-position logits: prefill already computes them in the per-token
+  loop (`forward_prefill.rs:1736-1762`); just need to capture
+  argmax at each step instead of discarding.
+- Single GraphSession encloses all k tokens → 1 commit_and_wait → real
+  speedup.
+- iter-118 failed here on `GraphSession::finish` ownership when
+  re-binding session inside loop. Cleaner: don't loop sessions; let
+  prefill's existing session encompass all k tokens.
+
+#### Refined iter-117 sequencing
+
+1. **iter-122/123**: Land Shape S (serial) — pure correctness gate.
+   Wires `accept_prefix` against existing `forward_decode`. Adds
+   `rollback_kv(accept_count, full_count)` helper. Tests:
+   `spec_decode_byte_identity_vs_default_decode` (already drafted in
+   `verifier.rs`).
+2. **iter-124+**: Land Shape B (batched) — refactor prefill to expose
+   per-position argmax capture + append-mode. **Operator green-light
+   needed** before structural refactor.
+3. **iter-125+**: Production wire-up + acceptance-rate measurement.
+
+#### KV rollback contract
+
+After verify with `accept_count < k`:
+```rust
+for cache in &mut self.kv_caches {
+    let trim = full_count - accept_count;
+    cache.write_pos = cache.write_pos.saturating_sub(trim);
+    if cache.is_sliding {
+        cache.write_pos %= cache.capacity; // ring wrap
+    }
+    cache.seq_len = cache.seq_len.saturating_sub(trim);
+}
+```
+
+Sliding-window layers need ring-wrap. TQ-HB cache's per-token-per-head
+norms occupy slots in same write_pos space → rollback handles them
+implicitly.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
