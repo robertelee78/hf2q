@@ -117,6 +117,10 @@ pub struct Qwen35HybridConfig {
     /// Per-linear-attn-slot recurrent-state shape
     /// `[D_k, D_v, num_v_heads, n_seqs]`. Iter-3 scope.
     pub linear_recurrent_shape: [u64; 4],
+    /// MTP slot shape `[n_seqs, n_kv_heads, max_seq_len, head_dim]` (iter-4).
+    /// Same rank as `full_attn_shape` but allowed to differ — Qwen3.6
+    /// MTP block has its own head-count config.  Ignored when has_mtp = false.
+    pub mtp_shape: [u64; 4],
 }
 
 impl Qwen35HybridConfig {
@@ -171,6 +175,12 @@ impl Qwen35HybridConfig {
             "QH35 config drift: linear_recurrent_shape = {:?} vs {:?}",
             self.linear_recurrent_shape,
             other.linear_recurrent_shape
+        );
+        ensure!(
+            self.mtp_shape == other.mtp_shape,
+            "QH35 config drift: mtp_shape = {:?} vs {:?}",
+            self.mtp_shape,
+            other.mtp_shape
         );
         Ok(())
     }
@@ -460,7 +470,67 @@ pub fn serialize_hybrid_snapshot(
         out.extend_from_slice(rec_bytes);
     }
 
-    // MTP: ITER-4 SCOPE — deserialize still bails when cfg.has_mtp = true.
+    // --- MTP slot (iter-4) ---
+    // MtpKvSnapshot has the same field shape as a single FullAttnKvSlot
+    // snapshot (k, v, current_len). Layout mirrors per-full-attn-slot
+    // exactly except the shape is from cfg.mtp_shape (Qwen3.6 MTP can
+    // declare its own head count independent of regular full-attn).
+    if cfg.has_mtp {
+        let mtp = snapshot.mtp.as_ref().expect("mtp present per cfg + assert above");
+        ensure!(
+            mtp.k.shape().len() == 4,
+            "QH35 serialize: mtp.k shape rank {} != 4",
+            mtp.k.shape().len()
+        );
+        let mk_shape: [u64; 4] = [
+            mtp.k.shape()[0] as u64,
+            mtp.k.shape()[1] as u64,
+            mtp.k.shape()[2] as u64,
+            mtp.k.shape()[3] as u64,
+        ];
+        ensure!(
+            mk_shape == cfg.mtp_shape,
+            "QH35 serialize: mtp.k shape {:?} != cfg.mtp_shape {:?}",
+            mk_shape,
+            cfg.mtp_shape
+        );
+        let mv_shape: [u64; 4] = [
+            mtp.v.shape()[0] as u64,
+            mtp.v.shape()[1] as u64,
+            mtp.v.shape()[2] as u64,
+            mtp.v.shape()[3] as u64,
+        ];
+        ensure!(
+            mv_shape == cfg.mtp_shape,
+            "QH35 serialize: mtp.v shape {:?} != cfg.mtp_shape {:?}",
+            mv_shape,
+            cfg.mtp_shape
+        );
+        ensure!(
+            mtp.current_len.len() == cfg.n_seqs as usize,
+            "QH35 serialize: mtp.current_len.len() = {} != n_seqs = {}",
+            mtp.current_len.len(),
+            cfg.n_seqs
+        );
+        let mk_bytes: &[u8] = mtp
+            .k
+            .as_slice::<u8>()
+            .map_err(|e| anyhow!("QH35 serialize: mtp.k as_slice: {e}"))?;
+        let mv_bytes: &[u8] = mtp
+            .v
+            .as_slice::<u8>()
+            .map_err(|e| anyhow!("QH35 serialize: mtp.v as_slice: {e}"))?;
+        for &dim in &mk_shape {
+            write_u64_le(&mut out, dim);
+        }
+        write_u64_le(&mut out, mk_bytes.len() as u64);
+        write_u64_le(&mut out, mv_bytes.len() as u64);
+        for &cl in mtp.current_len.iter() {
+            write_u32_le(&mut out, cl);
+        }
+        out.extend_from_slice(mk_bytes);
+        out.extend_from_slice(mv_bytes);
+    }
 
     Ok(out)
 }
@@ -507,6 +577,7 @@ pub fn deserialize_hybrid_snapshot(
         full_attn_shape: cfg.full_attn_shape,
         linear_conv_shape: cfg.linear_conv_shape,
         linear_recurrent_shape: cfg.linear_recurrent_shape,
+        mtp_shape: cfg.mtp_shape,
     };
     let _reserved = read_u16_le(bytes, &mut cursor)?;
 
@@ -657,15 +728,67 @@ pub fn deserialize_hybrid_snapshot(
         linear_recurrent.push(rec_buf);
     }
 
-    // MTP: ITER-4 SCOPE — still bails when cfg.has_mtp = true.
-    let mtp: Option<MtpKvSnapshot> = None;
-    if cfg.has_mtp {
-        return Err(anyhow!(
-            "QH35 deserialize: cfg.has_mtp = true but MTP read path is iter-4 \
-             scope (not yet implemented). Until iter-4 ships, do not call this \
-             function with MTP present."
-        ));
-    }
+    // --- MTP slot (iter-4) ---
+    let mtp: Option<MtpKvSnapshot> = if cfg.has_mtp {
+        let mut mk_shape_arr = [0u64; 4];
+        for dim in &mut mk_shape_arr {
+            *dim = read_u64_le(bytes, &mut cursor)?;
+        }
+        ensure!(
+            mk_shape_arr == cfg.mtp_shape,
+            "QH35 deserialize: mtp shape on disk {:?} != cfg.mtp_shape {:?}",
+            mk_shape_arr,
+            cfg.mtp_shape
+        );
+        let mk_byte_len = read_u64_le(bytes, &mut cursor)? as usize;
+        let mv_byte_len = read_u64_le(bytes, &mut cursor)? as usize;
+        let mut mtp_current_len = Vec::with_capacity(cfg.n_seqs as usize);
+        for _ in 0..cfg.n_seqs {
+            mtp_current_len.push(read_u32_le(bytes, &mut cursor)?);
+        }
+        let mk_src = read_bytes(bytes, &mut cursor, mk_byte_len)?;
+        let mv_src = read_bytes(bytes, &mut cursor, mv_byte_len)?;
+        let mtp_shape_usize: Vec<usize> =
+            mk_shape_arr.iter().map(|d| *d as usize).collect();
+        let dtype = full_attn_dtype_for_codec(header_cfg.full_attn_codec);
+        let mut mk_buf = device
+            .alloc_buffer(mk_byte_len, dtype, mtp_shape_usize.clone())
+            .map_err(|e| anyhow!("QH35 deserialize: alloc mtp.k: {e}"))?;
+        let mut mv_buf = device
+            .alloc_buffer(mv_byte_len, dtype, mtp_shape_usize)
+            .map_err(|e| anyhow!("QH35 deserialize: alloc mtp.v: {e}"))?;
+        {
+            let dst = mk_buf
+                .as_mut_slice::<u8>()
+                .map_err(|e| anyhow!("QH35 deserialize: mtp.k mut_slice: {e}"))?;
+            ensure!(
+                dst.len() == mk_src.len(),
+                "QH35 deserialize: mtp.k dst.len() = {} != src.len() = {}",
+                dst.len(),
+                mk_src.len()
+            );
+            dst.copy_from_slice(mk_src);
+        }
+        {
+            let dst = mv_buf
+                .as_mut_slice::<u8>()
+                .map_err(|e| anyhow!("QH35 deserialize: mtp.v mut_slice: {e}"))?;
+            ensure!(
+                dst.len() == mv_src.len(),
+                "QH35 deserialize: mtp.v dst.len() = {} != src.len() = {}",
+                dst.len(),
+                mv_src.len()
+            );
+            dst.copy_from_slice(mv_src);
+        }
+        Some(MtpKvSnapshot {
+            k: mk_buf,
+            v: mv_buf,
+            current_len: mtp_current_len,
+        })
+    } else {
+        None
+    };
 
     Ok(HybridKvCacheSnapshot {
         full_attn_k,
@@ -762,16 +885,29 @@ mod tests {
         n_linear_attn: u32,
         n_seqs: u32,
     ) -> Qwen35HybridConfig {
-        // Tiny shapes — keep the test bytes small + auditable.
+        synth_cfg_full(n_full_attn, n_linear_attn, false, n_seqs)
+    }
+
+    /// Iter-4: same as synth_cfg_with_linear but allows toggling MTP.
+    fn synth_cfg_full(
+        n_full_attn: u32,
+        n_linear_attn: u32,
+        has_mtp: bool,
+        n_seqs: u32,
+    ) -> Qwen35HybridConfig {
         Qwen35HybridConfig {
             n_full_attn,
             n_linear_attn,
-            has_mtp: false,
+            has_mtp,
             n_seqs,
             full_attn_shape: [n_seqs as u64, 2, 8, 4],
             full_attn_codec: FullAttnCodec::F32Dense,
             linear_conv_shape: [4, 3, n_seqs as u64],
             linear_recurrent_shape: [4, 8, 2, n_seqs as u64],
+            // MTP at a slightly different head_dim so the per-cfg shape
+            // path is exercised — Qwen3.6 MTP block does declare its own
+            // head_count in production.
+            mtp_shape: [n_seqs as u64, 4, 8, 4],
         }
     }
 
@@ -997,6 +1133,94 @@ mod tests {
         // Plus header(24) + 2 full-attn slots @ 568 each = 24 + 1136 = 1160.
         // Total = 1160 + 972 = 2132 bytes.
         assert_eq!(bytes.len(), 24 + 2 * 568 + 3 * 324);
+    }
+
+    /// Iter-4: extends a snapshot with an MTP slot containing
+    /// deterministic byte patterns at a possibly-different shape than
+    /// the regular full-attn slots (per cfg.mtp_shape).
+    fn synth_full_plus_linear_plus_mtp_snapshot(
+        device: &MlxDevice,
+        cfg: &Qwen35HybridConfig,
+    ) -> HybridKvCacheSnapshot {
+        let mut snap = synth_full_plus_linear_snapshot(device, cfg);
+        if cfg.has_mtp {
+            let elems: usize = cfg.mtp_shape.iter().product::<u64>() as usize;
+            let bytes_len = elems * std::mem::size_of::<f32>();
+            let shape_usize: Vec<usize> =
+                cfg.mtp_shape.iter().map(|d| *d as usize).collect();
+            let mut k = device
+                .alloc_buffer(bytes_len, DType::F32, shape_usize.clone())
+                .expect("alloc mtp.k");
+            {
+                let dst = k.as_mut_slice::<u8>().expect("mtp.k mut_slice");
+                for (i, b) in dst.iter_mut().enumerate() {
+                    *b = ((19 * i + 5) % 251) as u8;
+                }
+            }
+            let mut v = device
+                .alloc_buffer(bytes_len, DType::F32, shape_usize)
+                .expect("alloc mtp.v");
+            {
+                let dst = v.as_mut_slice::<u8>().expect("mtp.v mut_slice");
+                for (i, b) in dst.iter_mut().enumerate() {
+                    *b = ((23 * i + 7) % 251) as u8;
+                }
+            }
+            let current_len: Vec<u32> = (0..cfg.n_seqs).map(|s| 99 + s).collect();
+            snap.mtp = Some(MtpKvSnapshot {
+                k,
+                v,
+                current_len,
+            });
+        }
+        snap
+    }
+
+    #[test]
+    fn qh35_round_trip_with_mtp_byte_equal() {
+        // ADR-027 Phase A iter-4: full + linear + MTP round-trip.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = synth_cfg_full(2, 3, true, 1);
+        let snap = synth_full_plus_linear_plus_mtp_snapshot(&device, &cfg);
+        let bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize");
+        let restored =
+            deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
+        // Compare full + linear + MTP byte-equal.
+        assert!(snapshots_byte_equal(&snap, &restored));
+        assert!(restored.mtp.is_some());
+        let r_mtp = restored.mtp.as_ref().unwrap();
+        let s_mtp = snap.mtp.as_ref().unwrap();
+        let r_k = r_mtp.k.as_slice::<u8>().expect("rk slice");
+        let s_k = s_mtp.k.as_slice::<u8>().expect("sk slice");
+        assert_eq!(r_k, s_k);
+        let r_v = r_mtp.v.as_slice::<u8>().expect("rv slice");
+        let s_v = s_mtp.v.as_slice::<u8>().expect("sv slice");
+        assert_eq!(r_v, s_v);
+        assert_eq!(r_mtp.current_len, s_mtp.current_len);
+    }
+
+    #[test]
+    fn qh35_round_trip_mtp_only_no_linear_byte_equal() {
+        // Edge case: MTP present but no linear-attn slots.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = synth_cfg_full(1, 0, true, 1);
+        let snap = synth_full_plus_linear_plus_mtp_snapshot(&device, &cfg);
+        let bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize");
+        let restored =
+            deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
+        assert!(snapshots_byte_equal(&snap, &restored));
     }
 
     #[test]
