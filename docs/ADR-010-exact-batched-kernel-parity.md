@@ -280,5 +280,21 @@ For this project phase the sliding_wrap 752-byte batched-vs-batched ceiling is *
 
   Note: iter-69 is a DECODE-side investigation — independent of the iter-64/iter-68 PREFILL fixes. The prefill work delivered 29× / 35× speedup vs per-token default and is shipping (gated). Decode gap is the next operator-facing perf hill.
 
+- 2026-05-09 (iter-70 DECODE typo-sweep clean — bottleneck is structural, not a missed pipeline): Sweep-compiled all 9 quantized matmul .metal sources via `xcrun -sdk macosx metal -c`: ALL OK. The iter-68 typo trick doesn't repeat for decode. Direct kernel comparison `kernel_mul_mv_id_q6_K_f32` (mlx-native quantized_matmul_id_ggml.metal:803-887) vs llama.cpp `kernel_mul_mv_q6_K_f32_impl<N_R0_Q6_K=2>` (ggml-metal-impl.h:57): both use 2 rows-per-threadgroup geometry, identical Q6_K dequant kernel pattern (kmask1-4 + 4-way SIMD reduce), simd_sum across 32 threads. Structurally aligned.
+
+  Decode gap is therefore NOT in a single broken kernel — it's distributed across the 17.6 dispatches/layer × 30 layers = ~528 dispatches/token. At ~30 µs/dispatch combined compute+overhead, hf2q's 16.16 ms/token leaves no slack vs llama.cpp's 9.7 ms/token. The 6.5 ms/token gap likely splits between:
+    1. **Per-kernel compute time** — possibly slower per call due to threadgroup geometry / shmem layout differences (need per-kernel µbench to localize)
+    2. **Kernel fusion / dispatch count** — llama.cpp has more aggressive fusion (single SDPA-with-RMS-norm, Q+K+V head-norm fused, etc.); hf2q has not yet ported all those fusions
+    3. **Dispatch-floor overhead** — Apple Silicon Metal dispatch latency is ~5-10 µs each; 528 × 7.5 µs = 4 ms is at the ceiling of 6.5 ms gap
+
+  Next iter actionables (operator pick-list):
+  - **iter-71 EXTEND BUCKET PROFILER TO DECODE** — port forward_prefill_batched's `HF2Q_PROFILE_BUCKETS` instrumentation to the decode path. ~80 LOC. Gives per-kernel µs/call on decode, localizing whether the 0.62× peer gap is per-kernel-time or dispatch-count bound.
+  - **iter-71 METAL CAPTURE FOR DECODE** — extend HF2Q_METAL_CAPTURE wiring to forward_decode (currently prefill-only). ~30 LOC. Operator can inspect .gputrace in Xcode for kernel-level breakdown.
+  - **iter-71 KERNEL FUSION SURVEY** — read llama.cpp's `kernel_mul_mv_id_q*_f32_n_*` family for any fused variants we haven't ported (e.g., MV+RMS or MV+SwiGLU fusion).
+  - **iter-71 PIVOT to llama.cpp Q6_K mv kernel µbench** — write a standalone Metal benchmark of just `kernel_mul_mv_q6_K_f32` vs `kernel_mul_mv_id_q6_K_f32` on identical shapes, measure per-call time, compare to mlx-native at same shapes.
+
+  No "deferred without approval" — this is a pure investigation chain. The typo-sweep clean result + structural alignment of mv_id kernels means there's no obvious 1-line win analogous to iter-68; closing the decode gap takes engineering effort proportional to the 0.62× → 1.0× target.
+
+
 
 
