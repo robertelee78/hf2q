@@ -179,3 +179,23 @@ For this project phase the sliding_wrap 752-byte batched-vs-batched ceiling is *
   - **Standing Chesterton's fence still holds:** the ADR-010 documented MoE router top-K threshold sensitivity at L6 is the legitimate reason batched-prefill was originally gated. The bit-rot since Apr 20 is a SECOND, deeper bug riding on top — bypassing the L6 sensitivity gate would not have produced gibberish on a 27-token prompt; that requires a recent regression.
   - **Next iter actionable (no deferral):** test seq-batch vs per-token TQ encoder symmetry directly (mlx-native test write `dispatch_hadamard_quantize_kv_seq` output and compare to `dispatch_hadamard_quantize_kv` per-token loop output, byte-for-byte). If asymmetric → that's the fix target. If symmetric → look at ring chronology in batched (e9fd6fc-era).
   - **No regression test gate exists** for batched-prefill correctness in the Rust suite — only `scripts/sourdough_gate.sh` (manual). Adding a Rust regression gate is part of the fix.
+
+- 2026-05-09 (iter-63 SMOKING GUN — hypothesis from iter-62 was WRONG, real bug is more obvious):
+  - **Direct code-read of `forward_prefill_batched.rs` at HEAD: NO TQ/HB encode calls anywhere** (grep -inE "tq|hadamard|hb|quantize" returns only matmul calls). The seq-batch encoder hypothesis from iter-62 is moot — the encoder isn't even called in batched.
+  - **Per-token `forward_prefill.rs` (which works) DOES the encode in two places:** (a) eager allocation `self.leg_hb_encoded = Some(leg_hb_vec)` at lines 815-852 with one `HbKvBuffers` per layer (k_packed/k_norms/v_packed/v_norms allocated `nkv * capacity * head_dim` U8 bytes); (b) per-token K and V HB encode via `dispatch_hadamard_quantize_kv_hb` at lines 1234-1272 inside the per-token layer loop.
+  - **Decode reads `leg_hb_encoded`** via `flash_attn_vec_tq_hb` — banner `[HF2Q_TQ_CODEBOOK_BITS] 8-bit Lloyd-Max native HB SDPA (default)`. The lazy-allocation guard at `forward_mlx.rs:2314` (`if cb_bits >= 5 && self.leg_hb_encoded.is_none()`) fires AT first decode step that needs HB cache. For batched-prefill flow this allocation fires AFTER prefill, AFTER token 1 (which reads no KV cache), so token 2 reads ZERO-INITIALIZED `leg_hb_encoded[layer].k_packed/v_packed` → garbage attention → garbage tokens (`1211789444444444440`).
+  - **Trace-confirmed by bench output ordering:**
+    ```
+    Batched prefill complete: 27 tokens in 211.1 ms, first decode token = 236812
+    prefill: 27 tok in 229ms (118 tok/s)
+
+    4[iter-21 Track B] Allocated leg_hb_encoded (30 layers, 8-bit)  ← AFTER prefill, AFTER first decode
+    [HF2Q_TQ_CODEBOOK_BITS] 8-bit Lloyd-Max native HB SDPA (default)
+    1211789444444444440  ← gibberish from zero-init leg_hb_encoded
+    ```
+    Token "4" (id=236812) comes from prefill's last hidden state via LM head (no KV read). Token 2+ reads `leg_hb_encoded` which was just allocated empty.
+  - **Fix is small and mechanical** (~70 LOC in `forward_prefill_batched.rs`, mirror of `forward_prefill.rs:804-852` + `:1234-1272`):
+    1. Eager allocation of `self.leg_hb_encoded` near line 268 (where `linear_capacity` and `dense_kvs_vec` are set up): parse `HF2Q_TQ_CODEBOOK_BITS`, allocate per-layer `HbKvBuffers` with same `nkv * capacity * head_dim` U8 packed + `nkv * capacity * norms_per_pos` F32 norms layout.
+    2. Per-layer HB encode block in the existing layer loop, IMMEDIATELY AFTER the dense KV copy at line ~1326. Call `mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq` for K (`pf_k_normed`) and V (`pf_v_normed`) over all `seq_len` positions, using the SAME `dst_seq_pos_start` / `n_copy` / `src_tok_offset` as the dense copy so the dense and HB caches stay in lockstep on sliding-window ring positions.
+    3. `dispatch_hadamard_quantize_kv_hb_seq` already exists at `mlx-native/src/ops/hadamard_quantize_kv.rs:547`, signature compatible.
+  - **Iter-64 will land the fix and validate** with the same `What is 2+2?` coherence test + pp128/pp512/pp1024 vs llama-bench peer comparison. Expected outcome (per Apr-20 `9091b8c` baseline): batched ≈ 0.90× of llama on Gemma-4, byte-identical to per-token output, restoring 25-38× speedup over per-token default once batched is shippable.
