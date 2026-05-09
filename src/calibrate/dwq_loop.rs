@@ -2147,8 +2147,8 @@ pub fn train_two_linear_dwq_step(
 /// realistic-topology training step.
 ///
 /// Add new variants here as more pieces of the production model
-/// (RMSNorm, residual add, attention-output matmul) are needed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// (residual add, attention-output matmul) are needed.
+#[derive(Debug, Clone, PartialEq)]
 pub enum InterLayerOp {
     /// No-op pass-through — produces the chain semantics of
     /// [`train_n_linear_dwq_step`] when used uniformly.
@@ -2158,6 +2158,13 @@ pub enum InterLayerOp {
     /// `silu(gate(x)) * up(x)` — the partial pattern here covers
     /// just the silu path).
     SiLU,
+    /// Apply `rms_norm(x, weight, eps)` on the last axis.  Mirror
+    /// of LLM pre-/post-norm pattern (Qwen35's
+    /// `input_layernorm` + `post_attention_layernorm`).
+    /// `weight.len()` MUST equal the dim being normalized
+    /// (validated at dispatch time when the input tensor's last
+    /// dim is known).
+    RmsNorm { eps: f32, weight: Vec<f32> },
 }
 
 /// ADR-020 AC#7 Option A — N-Linear chain with non-Linear ops
@@ -2200,7 +2207,8 @@ pub fn train_n_linear_with_inter_ops_dwq_step(
     temperature: f32,
 ) -> Result<f32> {
     use crate::calibrate::autograd_gpu_tape::{
-        backward, matmul, ones_like, qdq_affine, silu, transpose, view, GpuTape, GpuTensor,
+        backward, matmul, ones_like, qdq_affine, rms_norm, silu, transpose, view, GpuTape,
+        GpuTensor,
     };
 
     if layers.is_empty() {
@@ -2299,11 +2307,34 @@ pub fn train_n_linear_with_inter_ops_dwq_step(
         let w_t_2d = transpose(&w_2d)?;
         let pre_act = matmul(&h_cur, &w_t_2d)?;
         // Apply the inter-layer op AFTER the matmul.
-        h_cur = match inter_ops[i] {
+        h_cur = match &inter_ops[i] {
             InterLayerOp::Identity => pre_act,
             InterLayerOp::SiLU => silu(&pre_act).with_context(|| {
                 format!("train_n_linear_with_inter_ops_dwq_step: silu after layer[{i}]")
             })?,
+            InterLayerOp::RmsNorm { eps, weight } => {
+                let dim = pre_act.shape().last().copied().ok_or_else(|| {
+                    anyhow!(
+                        "train_n_linear_with_inter_ops_dwq_step: pre_act has no last dim at layer[{i}]"
+                    )
+                })?;
+                if weight.len() != dim {
+                    return Err(anyhow!(
+                        "train_n_linear_with_inter_ops_dwq_step: RmsNorm weight.len ({}) != \
+                         pre_act last dim ({}) at layer[{i}]",
+                        weight.len(),
+                        dim
+                    ));
+                }
+                let w_t = GpuTensor::from_vec(&tape, weight, vec![dim]).with_context(|| {
+                    format!(
+                        "train_n_linear_with_inter_ops_dwq_step: RmsNorm weight leaf at layer[{i}]"
+                    )
+                })?;
+                rms_norm(&pre_act, &w_t, *eps).with_context(|| {
+                    format!("train_n_linear_with_inter_ops_dwq_step: rms_norm after layer[{i}]")
+                })?
+            }
         };
         sb_leaves.push((s_t, b_t));
     }
