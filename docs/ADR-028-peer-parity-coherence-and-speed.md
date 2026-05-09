@@ -285,6 +285,61 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-103 hot-kernel inventory — FA-vec-tq-hb dominates at 9% (compute-bound)
+
+Goal: locate where the 4.75 ms peer-gap actually lives. Bench 4 kernels
+at production decode shape with the iter-94/97 CPU/GPU split methodology
+(commit_wait_with_gpu_time + session-N amortization). Updates the per-
+token decode budget.
+
+**Measurements** (gemma-4-26b APEX-Q5_K_M, decode token = 15.86 ms):
+
+| Kernel | Calls/token | Session GPU/call | Per-token | % decode |
+|---|---:|---:|---:|---:|
+| FA-vec-tq-hb (kL=128) | 30 | **40.39 µs** | **1.39 ms** | **8.8%** |
+| FA-vec-tq-hb (kL=64) | 30 | 40.67 µs | 1.45 ms | 9.2% |
+| FA-vec-tq-hb (kL=256) | 30 | 40.90 µs | 1.43 ms | 9.0% |
+| mv_id Q6_K MoE (gate_up + down) | 60 | 16.04 µs | 0.96 ms | 6.0% |
+| fused_norm_add_f32 | 120 | 0.50 µs | 0.27 ms | 1.7% |
+| fwht_sign_premult_f32 | 60 | 0.71 µs | 0.22 ms | 1.4% |
+| **Subtotal measured** | 270 | — | **2.88 ms** | **18%** |
+| Unaccounted | 720 | — | 13 ms | 82% |
+
+**Critical finding (TESTABLE)**: FA-vec-tq-hb runs at **40 µs/call**
+GPU pure — 2.5× the 16 µs floor → it is **compute-bound, not dispatch-
+bound**. Flat across kL=64..256, meaning kernel time does NOT grow
+linearly with kL (nwg=16 splits the work evenly). At gemma's typical
+sliding-window kL ≤ 1024, FA-vec-tq-hb owns ~9% of decode.
+
+This is the FIRST measured kernel that's NOT at the 16 µs floor.
+Confirms kernel-time gap (not dispatch-count gap) is the real lever
+per iter-71 + iter-90 + iter-101 + iter-102 reframe.
+
+**Why FA-vec-tq-hb is heavier than llama.cpp's FA-vec**: TQ-HB path
+performs 8-bit codebook lookup per K row + per-token-per-head F32 norm
+multiply (tiers 5/6/8). llama.cpp's F16 K/V FA-vec skips the lookup +
+norm. The TQ overhead is the cost of the **3.94× memory savings**
+(ADR-027 Phase B). Trading memory bandwidth for codebook-lookup
+compute. This is structural; matching llama.cpp's FA-vec speed would
+require dropping TQ-HB or porting llama.cpp's nsg-ramp (also doesn't
+help at kL ≤ 256 per iter-100).
+
+**The 82% unaccounted bucket** — iter-104 must measure:
+- QKV proj mv (90 calls/token at hidden=2816 × 2816 shape)
+- O-proj mv (30 calls/token)
+- dense_down mv (30 calls/token, dense FFN portion of MoE)
+- router mv (30 calls/token)
+- KV format conv (60 calls/token)
+- KV TQ-HB encode (120 calls/token)
+- LM head (1 call/token at vocab=262144 × hidden=2816 — could be huge)
+
+Hypothesis from kernel size: LM head + QKV proj + dense_down probably
+hold 50-70% of the unaccounted bucket. iter-104 bench will confirm.
+
+Bench retained as regression-gate: `cargo test --release --test
+test_tq_hb_encoder_byte_parity bench_fa_vec_tq_hb_gemma_decode --
+--ignored --nocapture`.
+
 ### Iter-102 FWHT fusion ROI ceiling — 1.4% (not 6%) — reframes "saved-dispatch" math
 
 Bench `bench_fwht_sign_premult_gemma_decode` (gemma decode shape:
