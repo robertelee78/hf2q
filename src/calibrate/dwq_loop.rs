@@ -2902,6 +2902,72 @@ pub fn train_one_linear_dwq_loop(
     Ok(losses)
 }
 
+/// ADR-020 AC#7 Option A — multi-step training driver for the
+/// [`train_n_linear_with_pre_input_op_dwq_step`] variant.  Mirrors
+/// how [`train_one_linear_dwq_loop`] wraps
+/// [`train_one_linear_dwq_step_with_full_teacher_logits`] for the
+/// single-Linear case.
+///
+/// For each batch the function:
+/// 1. Selects top-K logits from `batch.teacher_logits_full` via
+///    [`pick_top_k_per_position`] (vocab = `layers.last().n`).
+/// 2. Calls [`train_n_linear_with_pre_input_op_dwq_step`] with the
+///    resulting `(topk_logits, topk_indices)`.
+/// 3. Appends the returned scalar loss to the output Vec.
+///
+/// An empty `batches` slice yields an empty Vec without error.
+/// On failure the error is wrapped with `batch[i]` so the
+/// offending batch index is identifiable in logs.
+///
+/// # Errors
+/// - `layers` empty or shape mismatch → propagated from inner step
+/// - `top_k` out of range → propagated from inner step
+/// - `pre_input_op == Residual` → propagated from inner step
+/// - `batch.teacher_logits_full.len() != batch.n_rows * vocab`
+///   → propagated from [`pick_top_k_per_position`]
+pub fn train_n_linear_with_pre_input_op_dwq_loop(
+    adam: &mut crate::calibrate::adam::AdamOptimizer,
+    device: &MlxDevice,
+    layers: &[(&str, &DwqQuantPack)],
+    pre_input_op: &InterLayerOp,
+    inter_ops: &[InterLayerOp],
+    batches: &[DwqOneLinearBatch],
+    top_k: usize,
+    temperature: f32,
+) -> Result<Vec<f32>> {
+    let vocab = layers
+        .last()
+        .map(|(_, p)| p.n)
+        .ok_or_else(|| anyhow!("train_n_linear_with_pre_input_op_dwq_loop: layers must be non-empty"))?;
+    let mut losses: Vec<f32> = Vec::with_capacity(batches.len());
+    for (i, batch) in batches.iter().enumerate() {
+        let (topk_logits, topk_indices) = pick_top_k_per_position(
+            &batch.teacher_logits_full,
+            batch.n_rows,
+            1,
+            vocab,
+            top_k,
+        )
+        .with_context(|| format!("train_n_linear_with_pre_input_op_dwq_loop: batch[{i}] pick_top_k"))?;
+        let loss = train_n_linear_with_pre_input_op_dwq_step(
+            adam,
+            device,
+            layers,
+            pre_input_op,
+            inter_ops,
+            &batch.x_batch,
+            &topk_logits,
+            &topk_indices,
+            batch.n_rows,
+            top_k,
+            temperature,
+        )
+        .with_context(|| format!("train_n_linear_with_pre_input_op_dwq_loop: batch[{i}]"))?;
+        losses.push(loss);
+    }
+    Ok(losses)
+}
+
 /// ADR-020 iter-12d-2 — per-Linear training summary inside a model
 /// scan (one entry per successfully-trained tensor).
 #[derive(Debug, Clone)]
@@ -10076,6 +10142,205 @@ mod tests {
         assert!(
             mismatches <= tol,
             "q_int mismatches: {mismatches}/{n_total} (tol={tol})"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — happy-path 5-batch test for the new
+    /// multi-step loop driver.  Proves the loop returns 5 finite
+    /// losses and advances Adam 5 steps without leaking state.
+    ///
+    /// Uses pre_input_op = RmsNorm{} and inter_ops = [Identity,
+    /// Identity] — same topology as the single-step rms_norm test.
+    #[test]
+    fn train_n_linear_with_pre_input_op_dwq_loop_happy_path() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let dim = 32usize;
+        let group_size = 8usize;
+        let n_rows = 32usize;
+        let top_k = 4usize;
+        let eps = 1e-6_f32;
+
+        let w1: Vec<f32> = (0..dim * dim).map(|i| ((i as f32) * 0.013 - 0.4).sin() * 0.08).collect();
+        let w2: Vec<f32> = (0..dim * dim).map(|i| ((i as f32) * 0.017 + 0.2).cos() * 0.08).collect();
+        let rms_weight: Vec<f32> = vec![1.0_f32; dim];
+
+        let pack1 = super::quant_pack_for_dwq(&device, &w1, dim, dim, 4, group_size).unwrap();
+        let pack2 = super::quant_pack_for_dwq(&device, &w2, dim, dim, 4, group_size).unwrap();
+
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig { lr: 1e-3, beta1: 0.9, beta2: 0.999, eps: 1e-8 },
+        )
+        .unwrap();
+        super::register_affine_pair(&mut adam, &device, "L1", &pack1.scales, &pack1.biases).unwrap();
+        super::register_affine_pair(&mut adam, &device, "L2", &pack2.scales, &pack2.biases).unwrap();
+
+        let batches: Vec<super::DwqOneLinearBatch> = (0..5)
+            .map(|b| {
+                let x: Vec<f32> = (0..n_rows * dim)
+                    .map(|i| ((i as f32 + b as f32 * 77.0) * 0.05).cos() * 0.4)
+                    .collect();
+                let t: Vec<f32> = (0..n_rows * dim)
+                    .map(|i| ((i as f32 + b as f32 * 31.0) * 0.041).sin() * 1.0)
+                    .collect();
+                super::DwqOneLinearBatch { x_batch: x, teacher_logits_full: t, n_rows }
+            })
+            .collect();
+
+        let layers: Vec<(&str, &super::DwqQuantPack)> = vec![("L1", &pack1), ("L2", &pack2)];
+        let losses = super::train_n_linear_with_pre_input_op_dwq_loop(
+            &mut adam,
+            &device,
+            &layers,
+            &super::InterLayerOp::RmsNorm { eps, weight: rms_weight },
+            &[super::InterLayerOp::Identity, super::InterLayerOp::Identity],
+            &batches,
+            top_k,
+            2.0,
+        )
+        .expect("loop should succeed");
+
+        assert_eq!(losses.len(), 5, "expected 5 losses");
+        for (i, l) in losses.iter().enumerate() {
+            assert!(l.is_finite(), "loss[{i}] not finite: {l}");
+        }
+        assert_eq!(adam.step_count(), 5);
+    }
+
+    /// ADR-020 AC#7 Option A — transformer-block FFN sub-pattern
+    /// convergence test.  Wires the loop driver into a 2-layer chain
+    /// with pre-norm topology (RmsNorm → L1 → Identity → L2 →
+    /// Residual{skip_from:0}) over 30 steps.
+    ///
+    /// Crucially: `saved[0]` inside `forward_chain_on_tape` is
+    /// `h_init` passed to that function, which for the
+    /// `train_n_linear_with_pre_input_op_dwq_step` path equals
+    /// `h_pre = rms_norm(x)` — NOT raw `x`.  Teacher targets must
+    /// therefore be computed with `rms_norm(x)` as the Residual's
+    /// skip tensor, not raw `x`.
+    #[test]
+    fn train_n_linear_with_pre_input_op_dwq_loop_transformer_block_converges() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use crate::calibrate::autograd_gpu_tape::{
+            add, matmul, qdq_affine, rms_norm, transpose, view, GpuTape, GpuTensor,
+        };
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let dim = 32usize;
+        let group_size = 8usize;
+        let n_rows = 32usize;
+        let top_k = 4usize;
+        let n_steps = 30usize;
+        let eps = 1e-6_f32;
+
+        // Weights with small magnitudes so the rms_norm → L1 → L2 →
+        // residual cascade stays bounded even with +0.5 bias perturbation.
+        let w1: Vec<f32> = (0..dim * dim).map(|i| ((i as f32) * 0.013 - 0.4).sin() * 0.08).collect();
+        let w2: Vec<f32> = (0..dim * dim).map(|i| ((i as f32) * 0.017 + 0.2).cos() * 0.08).collect();
+        let rms_weight: Vec<f32> = vec![1.0_f32; dim];
+
+        let pack1 = super::quant_pack_for_dwq(&device, &w1, dim, dim, 4, group_size).unwrap();
+        let pack2 = super::quant_pack_for_dwq(&device, &w2, dim, dim, 4, group_size).unwrap();
+
+        let x_batch: Vec<f32> = (0..n_rows * dim)
+            .map(|i| ((i as f32) * 0.05 - 0.1).cos() * 0.5)
+            .collect();
+
+        // Teacher: compute the optimum forward pass.
+        // Topology: rms_norm(x) → L1 (Identity) → L2 → add(L2_out, rms_norm(x))
+        //
+        // saved[0] in forward_chain_on_tape = h_init = h_pre = rms_norm(x).
+        // The Residual{skip_from:0} adds saved[0] = rms_norm(x) back after L2.
+        let teacher_logits_full: Vec<f32> = {
+            let tape = GpuTape::new(device.clone());
+            let s1 = GpuTensor::from_vec(&tape, &pack1.scales, vec![pack1.scales.len()]).unwrap();
+            let b1 = GpuTensor::from_vec(&tape, &pack1.biases, vec![pack1.biases.len()]).unwrap();
+            let s2 = GpuTensor::from_vec(&tape, &pack2.scales, vec![pack2.scales.len()]).unwrap();
+            let b2 = GpuTensor::from_vec(&tape, &pack2.biases, vec![pack2.biases.len()]).unwrap();
+            let x_t = GpuTensor::from_vec(&tape, &x_batch, vec![n_rows, dim]).unwrap();
+            let rms_w = GpuTensor::from_vec(&tape, &rms_weight, vec![dim]).unwrap();
+            // h_pre = rms_norm(x) — this becomes h_init AND saved[0] in the chain.
+            let h_pre = rms_norm(&x_t, &rms_w, eps).unwrap();
+            let w1_qdq = qdq_affine(&s1, &b1, &pack1.q_int_bytes, group_size).unwrap();
+            let w1_2d = view(&w1_qdq, vec![dim, dim]).unwrap();
+            let w1_t = transpose(&w1_2d).unwrap();
+            // Layer 0 matmul; Identity inter_op → layer1 = h_pre @ W1^T
+            let layer1 = matmul(&h_pre, &w1_t).unwrap();
+            let w2_qdq = qdq_affine(&s2, &b2, &pack2.q_int_bytes, group_size).unwrap();
+            let w2_2d = view(&w2_qdq, vec![dim, dim]).unwrap();
+            let w2_t = transpose(&w2_2d).unwrap();
+            let layer2 = matmul(&layer1, &w2_t).unwrap();
+            // Residual{skip_from:0}: add saved[0] = h_pre back.
+            let logits = add(&layer2, &h_pre).unwrap();
+            logits.to_vec().unwrap()
+        };
+
+        // Register Adam with PERTURBED biases on L1 (+0.5) to give gradients something to descend.
+        let b1_perturbed: Vec<f32> = pack1.biases.iter().map(|v| v + 0.5).collect();
+        let b1_opt_dist: f32 = b1_perturbed.iter().zip(pack1.biases.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig { lr: 1e-3, beta1: 0.9, beta2: 0.999, eps: 1e-8 },
+        )
+        .unwrap();
+        super::register_affine_pair(&mut adam, &device, "L1", &pack1.scales, &b1_perturbed).unwrap();
+        super::register_affine_pair(&mut adam, &device, "L2", &pack2.scales, &pack2.biases).unwrap();
+
+        // 30 identical batches; same x and teacher each step.
+        let batches: Vec<super::DwqOneLinearBatch> = (0..n_steps)
+            .map(|_| super::DwqOneLinearBatch {
+                x_batch: x_batch.clone(),
+                teacher_logits_full: teacher_logits_full.clone(),
+                n_rows,
+            })
+            .collect();
+
+        let layers: Vec<(&str, &super::DwqQuantPack)> = vec![("L1", &pack1), ("L2", &pack2)];
+        let losses = super::train_n_linear_with_pre_input_op_dwq_loop(
+            &mut adam,
+            &device,
+            &layers,
+            &super::InterLayerOp::RmsNorm { eps, weight: rms_weight.clone() },
+            &[
+                super::InterLayerOp::Identity,
+                super::InterLayerOp::Residual { skip_from: 0 },
+            ],
+            &batches,
+            top_k,
+            2.0,
+        )
+        .expect("loop should succeed");
+
+        assert_eq!(losses.len(), n_steps, "expected {n_steps} losses");
+        for (i, l) in losses.iter().enumerate() {
+            assert!(l.is_finite(), "loss[{i}] not finite: {l}");
+        }
+
+        let avg = |s: &[f32]| s.iter().sum::<f32>() / s.len() as f32;
+        let head = avg(&losses[..5]);
+        let tail = avg(&losses[25..30]);
+        assert!(head > 0.0, "head avg loss must be > 0; got {head}");
+        assert!(
+            tail < 0.8 * head,
+            "tail avg ({tail:.6}) must be < 80% of head avg ({head:.6}); losses={losses:?}"
+        );
+
+        // Gradient sign: L1 biases should have moved toward optimum.
+        let (_, b1_after) = super::read_affine_pair(&adam, "L1").unwrap();
+        let b1_after_dist: f32 = b1_after.iter().zip(pack1.biases.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            b1_after_dist < b1_opt_dist,
+            "L1 biases should move toward optimum after {n_steps} steps; \
+             init_dist={b1_opt_dist:.6}, after_dist={b1_after_dist:.6}"
         );
     }
 }
