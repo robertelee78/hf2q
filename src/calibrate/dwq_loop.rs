@@ -5107,6 +5107,177 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// ADR-020 AC#7 Option A — END-TO-END INTEGRATION on the
+    /// in-memory training path.  Wires every primitive landed in
+    /// this iter chain into one test that mirrors the operator-
+    /// driven workflow:
+    ///
+    ///   1. dequantized W_real  →  quant_pack_for_dwq             (pack)
+    ///   2. perturbed b (init away from optimum)
+    ///   3. register_affine_pair                                  (Adam state)
+    ///   4. CPU teacher forward y_T = x @ W_real^T                (synthetic teacher)
+    ///   5. DwqOneLinearBatch { x, teacher_logits, n_rows }
+    ///   6. train_one_linear_dwq_loop drives K Adam steps
+    ///   7. read_affine_pair returns the trained s, b
+    ///
+    /// Acceptance criteria:
+    /// - read_affine_pair returns FRESH values that differ from the
+    ///   perturbed init (Adam moved them)
+    /// - per-step losses are all finite + non-NaN
+    /// - tail loss < head loss by ≥ 20%
+    /// - trained b is closer to pack.biases (the projection optimum)
+    ///   than the perturbed init was (sum-abs-distance metric)
+    ///
+    /// This proves the full in-memory training path composes
+    /// correctly without any disk round-trip — every primitive
+    /// landed in commits abe43d4..6868819 cooperates end-to-end.
+    #[test]
+    fn end_to_end_in_memory_training_path_chain_integration() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use crate::calibrate::autograd_gpu_tape::{
+            matmul, qdq_affine, transpose, view, GpuTape, GpuTensor,
+        };
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let n = 32; // vocab dim of the lm_head-style Linear
+        let k = 32; // hidden dim
+        let group_size = 8;
+        let n_rows = 32; // batch * seq
+        let top_k = 4;
+
+        // (1) "Teacher's lm_head" weight, dequantized to f32.
+        let w_real: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32) * 0.0173 - 0.6).sin() * 1.4 - 0.1)
+            .collect();
+
+        // (2) Pack via the production path.
+        let pack =
+            super::quant_pack_for_dwq(&device, &w_real, n, k, 4, group_size).expect("pack");
+        assert_eq!(pack.scales.len(), n * k / group_size);
+
+        // (3) Compute teacher logits at the OPTIMUM (so the loss
+        //     basin minimum is at pack.scales / pack.biases).  Same
+        //     forward chain as train_one_linear_dwq_step but on a
+        //     read-only tape.
+        let x_batch: Vec<f32> = (0..n_rows * k)
+            .map(|i| ((i as f32) * 0.05 - 0.1).cos() * 0.5)
+            .collect();
+        let teacher_logits_at_opt: Vec<f32> = {
+            let tape = GpuTape::new(device.clone());
+            let s_t = GpuTensor::from_vec(&tape, &pack.scales, vec![pack.scales.len()]).unwrap();
+            let b_t = GpuTensor::from_vec(&tape, &pack.biases, vec![pack.biases.len()]).unwrap();
+            let x_t = GpuTensor::from_vec(&tape, &x_batch, vec![n_rows, k]).unwrap();
+            let w_qdq = qdq_affine(&s_t, &b_t, &pack.q_int_bytes, group_size).unwrap();
+            let w_2d = view(&w_qdq, vec![n, k]).unwrap();
+            let w_t = transpose(&w_2d).unwrap();
+            let logits = matmul(&x_t, &w_t).unwrap();
+            logits.to_vec().unwrap()
+        };
+
+        // (4) Perturb b away from optimum — biases shifted +0.5.
+        let b_perturbed: Vec<f32> = pack.biases.iter().map(|x| x + 0.5).collect();
+        let init_distance: f32 = pack
+            .biases
+            .iter()
+            .zip(b_perturbed.iter())
+            .map(|(a, c)| (a - c).abs())
+            .sum();
+        assert!(
+            init_distance > 0.0,
+            "perturbation must yield a non-zero distance to optimum"
+        );
+
+        // (5) Adam.
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-3,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .expect("adam");
+        let (s_name, b_name) = super::register_affine_pair(
+            &mut adam,
+            &device,
+            "lm_head.weight",
+            &pack.scales,
+            &b_perturbed,
+        )
+        .expect("register");
+        assert_eq!(s_name, "lm_head.weight.scales");
+        assert_eq!(b_name, "lm_head.weight.biases");
+
+        // (6) Build a sequence of identical batches (drives Adam
+        //     steps; teacher targets are pinned to the optimum).
+        let n_steps = 40;
+        let batches: Vec<super::DwqOneLinearBatch> = (0..n_steps)
+            .map(|_| super::DwqOneLinearBatch {
+                x_batch: x_batch.clone(),
+                teacher_logits_full: teacher_logits_at_opt.clone(),
+                n_rows,
+            })
+            .collect();
+
+        // (7) Drive multi-step training through the loop driver.
+        let losses = super::train_one_linear_dwq_loop(
+            &mut adam,
+            &device,
+            "lm_head.weight",
+            &pack,
+            &batches,
+            top_k,
+            2.0,
+        )
+        .expect("loop");
+        assert_eq!(losses.len(), n_steps);
+        for (i, l) in losses.iter().enumerate() {
+            assert!(l.is_finite() && !l.is_nan(), "loss[{i}] not finite: {l}");
+        }
+
+        // Convergence: tail < 0.8 * head.
+        let avg = |s: &[f32]| s.iter().sum::<f32>() / s.len() as f32;
+        let head = avg(&losses[..5]);
+        let tail = avg(&losses[n_steps - 5..]);
+        assert!(head > 0.0, "head loss must be > 0; got {head}");
+        assert!(
+            tail < 0.8 * head,
+            "tail loss avg ({tail}) must be < 80% of head loss avg ({head}); \
+             losses={losses:?}"
+        );
+
+        // (8) read_affine_pair: trained values exist + are different
+        //     from the perturbed init.
+        let (s_trained, b_trained) =
+            super::read_affine_pair(&adam, "lm_head.weight").expect("read");
+        assert_eq!(s_trained.len(), pack.scales.len());
+        assert_eq!(b_trained.len(), pack.biases.len());
+        let b_trained_distance_to_init: f32 = b_perturbed
+            .iter()
+            .zip(b_trained.iter())
+            .map(|(a, c)| (a - c).abs())
+            .sum();
+        assert!(
+            b_trained_distance_to_init > 0.0,
+            "trained b must differ from perturbed init"
+        );
+
+        // (9) Trained b is CLOSER to optimum than perturbed init.
+        let trained_distance_to_opt: f32 = pack
+            .biases
+            .iter()
+            .zip(b_trained.iter())
+            .map(|(a, c)| (a - c).abs())
+            .sum();
+        assert!(
+            trained_distance_to_opt < init_distance,
+            "trained b distance-to-optimum ({trained_distance_to_opt}) must be \
+             smaller than init distance ({init_distance})"
+        );
+    }
+
     /// ADR-020 AC#7 Option A — `train_one_linear_dwq_loop` happy
     /// path: 5 batches → 5 losses, all finite, Adam.step_count == 5.
     #[test]
