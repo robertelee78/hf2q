@@ -672,6 +672,53 @@ landed; Linear-only forward already landed).
        3-6 hour DWQ run per family on M5 Max.  Future-iter scope
        but FOUNDATION COMPLETE — every algorithmic uncertainty is
        resolved.
+
+       **Primitive inventory landed 2026-05-08** (commits abe43d4..09a6f73,
+       all in `src/calibrate/dwq_loop.rs`, dwq_loop suite 51/0/2 →
+       86/0/2):
+       - **Input pipeline (teacher side)** — disk → student-input,
+         end-to-end with axis cross-checks at every boundary:
+         `load_calibration_corpus_jsonl`, `build_dwq_targets_config_from_full_model`,
+         `build_calibration_split_from_full_model`, `prepare_full_model_teacher_inputs`,
+         `drive_full_model_teacher_capture(_prepared)`,
+         `load_teacher_targets_for_batch` returning typed
+         `TeacherBatchTargets`.
+       - **Loss primitives** — both CPU oracle AND GPU autograd, with
+         cross-checked parity within 1e-4: `kl_loss_topk_oracle` (CPU)
+         + `kl_loss_topk_via_tape` (GPU); `take_along_topk_indices`
+         (CPU) + `gather_student_topk_via_tape` (GPU); plus
+         `build_topk_indices_buffer`.
+       - **Adam-side primitives**: `enum AffineParamKind` +
+         `affine_param_name` + `register_affine_pair` +
+         `read_affine_pair` (canonical `.scales` / `.biases`
+         suffix discipline); `DwqQuantPack` + `quant_pack_for_dwq`
+         (init wrapper carrying n×k×group_size); `collect_grads_for_adam`
+         (autograd → Adam name-keyed map adapter, fail-loud on
+         missing-grad / duplicate-name / tape-mismatch).
+       - **Per-Linear composer**: `train_one_linear_dwq_step` ties
+         every primitive together for ONE step; perturbed-b
+         convergence test (40 Adam steps, head-vs-tail loss decreases
+         by ≥ 20%) proves the gradient SIGN is correct.
+       - **Sizing constraint discovered**: matmul GPU backward kernel
+         requires BOTH `m >= 32` (rows of x) AND `n >= 32` (cols of
+         W^T == output dim).  Sub-32 dims fail at backward dispatch
+         with a kernel-level error; test fixtures pinned to 32.
+
+       Remaining ladder for AC#7 closure event (per `project_adr020_ac7_option_a_primitives_landed_2026_05_08`
+       memory):
+       1. Multi-Linear case — interior Linears at depth d need a
+          full forward chain to logits before s/b can receive a
+          cross-layer gradient.  Production
+          `train_all_linears_full_model_dwq` calls full
+          `Qwen35Model::forward_gpu` with affine leaves substituted
+          (parallel to the qwen35_moe_forward_on_tape simplified arch
+          at qwen35_moe.rs:454).
+       2. CLI wiring: `--full-model-teacher` + `--calibration-data
+          <path>` flags in `DwqTrainArgs`.
+       3. AC#7 closure event: operator runs full DWQ training +
+          `scripts/adr020_ac7_boundary_validate.sh`, expects
+          `boundary_delta_nats > +0.05`.
+
      - The serve-side AC#5 infrastructure works correctly; AC#7
        PASS verdict gates on the implementation ladder above.
 8. **Per-family pass:** all four combos {Qwen 3.6 35B-A3B-Abliterix-EGA,
