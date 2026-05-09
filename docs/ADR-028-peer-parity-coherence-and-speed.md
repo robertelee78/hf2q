@@ -1701,6 +1701,62 @@ work. nwg=16 stays optimal at kL ≤ 512 (saturated GPU). A
 without touching short-context perf — surgical 5-LOC change in
 `/opt/mlx-native/src/ops/flash_attn_vec_tq_hb.rs:113`.
 
+### iter-120: nwg saturation curve at gemma decode shape (test-first bisection)
+
+Per operator: "test test test with bisection is always right 1st step;
+guess + code-change + rerun pipeline is anti-pattern". iter-120 ran a
+nwg ∈ {8, 16, 24, 32} sweep via `HF2Q_TQ_NWG` env override (NO code
+change) at `bench_fa_vec_tq_hb_gemma_decode` kL ∈ {1024, 1536}.
+
+#### Bench data (mlx-native HEAD `bf9c47e`, GPU p50 µs/call from SESSION-30)
+
+| kL    | nwg=8  | nwg=16 | nwg=24 | nwg=32 |
+|-------|--------|--------|--------|--------|
+| 1024  | 148.98 | 78.08  | 78.96  | **45.09** |
+| 1536  | 221.55 | 113.71 | 79.69  | **78.70** |
+
+#### Mathematical model derived from data
+
+K-loop kernel structure (`flash_attn_vec_tq_hb.metal:407`):
+```
+for (uint ic0 = iwg; ; ic0 += NWG) { ... if (ic >= kv_seq_len) break; }
+```
+
+Per-WG K-iters = `ceil(K_blocks / NWG)` where
+`K_blocks = ceil(kv_seq_len / C)` and `C=32` (cache values per simdgroup).
+
+Verified prediction:
+- kL=1024 → 32 K-blocks → nwg=32 = 1 iter/WG (saturated). nwg=16 = 2
+  iter/WG (predicted 2× slower; measured 1.73×).
+- kL=1536 → 48 K-blocks → nwg=24 = 2 iter, nwg=32 = 2 iter (load
+  imbalance), nwg=48 → 1 iter/WG (predicted ~50% speedup).
+
+#### Conditional-finding implications
+
+**Gemma 4** (`sliding_window=1024` per `serve/config.rs:111`): kL caps
+at 1024 → nwg=32 already optimal. iter-119 lever exhausted for Gemma.
+
+**Qwen 3.5/3.6** (`sliding_window=4096` per `serve/header.rs:160`):
+kL=4096 → 128 K-blocks → nwg=32 = 4 iter/WG ceiling. nwg=128 would give
+1 iter/WG (predicted ~4× FA speedup at long context).
+
+**Blocker for nwg > 32**: `flash_attn_vec_reduce` kernel
+(`flash_attn_vec.metal:351`) uses `tiisg` (thread index in simdgroup,
+0..31) to read partial results — caps at nwg=32 by construction.
+
+Lifting the cap requires reduce-kernel rewrite (multi-iter scope:
+simdgroup-of-simdgroups reduce or batched read). Listed under
+**Path D** (Qwen long-context decode lever) for future operator
+priority decision; not on critical path while ADR-028 production
+fixture targets shorter contexts.
+
+#### Standing rule
+
+Adding nwg-axis levers MUST be data-justified by per-kL K-block model
++ measured per-WG iter-count. nwg-axis sweeps without divisor analysis
+produce noise (e.g., nwg=24 ≈ nwg=16 at kL=1024 because both give
+2-iter bottleneck despite 50% more parallelism).
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
