@@ -1915,6 +1915,72 @@ Commit `311c6e3`:
 Shape B (batched single-pass for real speedup) remains gated on
 operator green-light per iter-122 sequencing.
 
+### iter-125: Path D measured — 39% decode budget at Qwen sw=4096
+
+Per operator emphasis on test-first measurement, extended
+`bench_fa_vec_tq_hb_gemma_decode` to qwen-realistic kL ∈ {4096, 8192}
+to size Path D (FA reduce-kernel cap > 32 for long-context decode).
+
+#### Bench data at gemma decode shape (16 heads, 8 kv-heads, head_dim=256, 8-bit codebook)
+
+| kL    | GPU/call (SESSION p50) | Per-token (30 layers) | % of 15.86 ms decode |
+|-------|------------------------|-------------------------|------------------------|
+| 64    | 40.69 µs               | 1.22 ms                 | 7.7%                   |
+| 1024  | 45.09 µs (nwg=32)      | 1.35 ms                 | 8.5%                   |
+| 1536  | 78.70 µs (nwg=32)      | 2.36 ms                 | 14.9%                  |
+| 4096  | **201.60 µs**          | **6.23 ms**             | **39.3%**              |
+| 8192  | **431.20 µs**          | **13.12 ms**            | **82.7%**              |
+
+#### What the data confirms
+
+Per the iter-120 K-block model (`per-WG iters = ceil(K_blocks / NWG)`):
+
+| kL    | K_blocks | nwg=32 iters | nwg=128 iters | Predicted savings |
+|-------|----------|--------------|---------------|--------------------|
+| 4096  | 128      | 4            | 1             | 4× (~150 µs/call)  |
+| 8192  | 256      | 8            | 2             | 4× (~330 µs/call)  |
+
+#### Production scope — critical for Qwen 3.5/3.6
+
+Qwen 3.5/3.6 has `sliding_window=4096` (`serve/header.rs:160`). After
+prefill, decode steady-state runs at kL=4096. Long-context conversation
+beyond 4096 tokens stays at kL=4096 due to the sliding cap. **At
+production decode shape, FA-vec-tq-hb consumes 39% of the budget.**
+
+If Path D lands (nwg=128 with reduce-kernel rewrite):
+- Predicted savings at kL=4096: ~4.5 ms/token (~28% decode speedup)
+- Predicted savings at kL=8192: ~9 ms/token (~57% decode speedup)
+
+These are **larger than the entire spec-decode lift** (Shape B ~1.6-3.0×
+on the average kL=512 short-context fixture).
+
+#### Implementation cost
+
+Multi-iter scope per iter-120 finding. Reduce-kernel rewrite needs:
+1. Replace `tiisg`-based partial-result indexing in
+   `flash_attn_vec.metal:351` with a simdgroup-of-simdgroups reduce
+   pattern (or batched read with multiple passes for nwg up to 128).
+2. Resize `tmp_buffer_bytes` to `max_nwg=128` (memory: 16 heads × 128
+   × 258 × 4 = 2.1 MB — fine).
+3. Update `compute_nwg(kv_seq_len)` to scale nwg ∈ {16, 32, 64, 128}
+   based on K-block divisor analysis.
+4. Byte-identity tests at extended nwg.
+
+Estimated 200-400 LOC across mlx-native + hf2q. **Operator decision
+needed on priority vs Shape B (spec-decode).**
+
+#### Path D vs Shape B priority comparison (operator decision input)
+
+| Criterion             | Path D                          | Shape B (Spec-decode) |
+|-----------------------|----------------------------------|------------------------|
+| Predicted speedup     | 4× FA at kL=4096 = 28% decode    | 1.6-3.0× decode lift  |
+| Quality impact        | None (kernel-level, byte-id)     | None (greedy)         |
+| Scope                 | Reduce kernel rewrite (~300 LOC) | Prefill refactor (~180 LOC) |
+| Risk                  | Low (well-bounded kernel surgery) | Medium (forward_prefill changes are load-bearing) |
+| Helps which model?    | Qwen 3.5/3.6 (long context)      | All models (when n-grams hit) |
+| Helps when?           | Always at decode kL > 1024       | Repetitive output (60-80% acceptance) |
+| Stand-alone benefit?  | YES                              | YES                    |
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
