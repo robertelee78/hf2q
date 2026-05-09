@@ -285,6 +285,80 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-99 peer-repo + reddit research synthesis (2026-05-09)
+
+Distilled from 8 parallel /swarm-advanced researcher agents over
+`/opt/{dflash,ds4,llama.cpp,candle,omlx,vllm}` and `docs/reddit/reddit-
+{atlas,heretic,mtp}.txt`. Full report:
+`docs/research/peer-repos-decode-gap-2026-05-09.md`.
+
+**Headline correction (Chesterton's fence — tearing down a fence with no
+foundation):**
+
+- Iter-89's "candle baseline ~105 dispatches/token" line was **unsourced
+  and wrong**. Direct read of candle's decoder loops (`candle-transformers/
+  src/models/quantized_llama.rs:558-586`, `quantized_qwen3_moe.rs:
+  125-219`) shows roughly 14 dispatches/layer × N layers ≈ **400-1000
+  dispatches/token**. Same order as hf2q's 990. The "9.4× headroom"
+  claim collapses. Lines 732 + 775 retracted in-place.
+- Reframes the gap: per-dispatch GPU time (~16 µs hf2q vs ~11 µs
+  llama.cpp HEAD per iter-90) is the structural lever, NOT graph
+  density. Confirms iter-71's earlier finding using independent data.
+
+**Action items ranked by ROI × risk (additive to iter-98 fusion plan):**
+
+| # | Action | Tag | Source | Est ROI | Risk |
+|---|--------|-----|--------|---------|------|
+| A | Verify FA-vec `nwg=32` engaged at decode kL ≥ 512 | TESTABLE | llama.cpp ggml-metal-ops.cpp:2944-3052 | small (long-ctx only) | low |
+| B | Fuse gate+up+SwiGLU into one Q5_K mv_id kernel for gemma-4 dense FFN | TESTABLE | DS4 dense.metal:203-271 | ~56 dispatches/token (~5%) | medium |
+| C | Persistent batch-encoder (one compute encoder per decode step) | TESTABLE | DS4 ds4_metal.m:223-235 | unknown — measure encode-CPU first | medium |
+| D | Port `kernel_rms_norm_fuse_impl<F=2/3>` `_4` (vec4) suffix variant | TESTABLE | llama.cpp ggml-metal.metal:2986-3059 | ~2.8-3.4% per iter-93 | low |
+| E | 2-pass SDPA-vector for long-K (kL ≥ 512) | TESTABLE | candle/MLX scaled_dot_product_attention.metal:434+577 | hot path FA_GL D=512 12.59 ms/call | medium |
+| F | N-gram speculative decode (verify-batched, no draft model) | TESTABLE | vLLM v1/spec_decode/ngram_proposer.py | 2-4× at acceptance ≥ 60% | medium |
+| G | DFlash block-diffusion drafter (z-lab gemma-4-26B-A4B-it-DFlash exists) | SPECULATIVE | dflash + omlx | 3-4× claimed Apple Silicon | high |
+| H | MTP K=3 self-spec for **qwen3.6**, NOT gemma | OUT-OF-SCOPE for ADR-028 | reddit-mtp + ds4 | 2× M5 Max for qwen | high |
+| I | `bin_fuse_f32_f32_f32_4` chain | TESTABLE | llama.cpp bin_fuse_impl 1209-1364 | ~6% per ADR-028 #14 | low |
+| J | Apple `mpp::tensor_ops::matmul2d` for K-quants | SPECULATIVE | greenfield (neither candle nor llama.cpp use it) | unknown | very high |
+
+**Scope split:**
+- **ADR-028** (gemma-4-26b decode parity): items A, B, C, D, E, I — kernel
+  + scheduling work to close 0.65× → ≥ 1.0×.
+- **ADR-027 §11** (qwen MTP / spec decode): items F, G, H — separate
+  workstream. **MTP architecturally inapplicable to gemma** (gemma was
+  not trained with MTP heads); local `qwen3.6-27b-mtp-q4_0.gguf` predates
+  PR #22673's converter and likely lacks the `*.nextn.*` tensor heads.
+- **OUT-OF-SCOPE for now**: J (Apple tensor cores) — research-grade.
+
+**Closures (saved future cycles by ruling out):**
+- **Heretic**: abliteration tool, version-number "1.3" misread as
+  speedup. Zero inference signal. Lane closed.
+- **vLLM PagedAttention / continuous batching**: CUDA/Triton-only, no
+  Metal port in repo. Cannot follow.
+- **oQ quantization**: software quant producing mlx-lm safetensors, not
+  GGUF K-quants. Different format, separate scope.
+- **Atlas as a peer to chase**: real Atlas decode is 13.9 t/s on
+  Qwen3.5-27B NVFP4 (counter-data from `dtdisapointingresult`). hf2q's
+  63 t/s already beats it. Atlas is not the peer.
+- **GB10 = NVIDIA Grace-Blackwell, not Apple Silicon.** All "3×" claims
+  trace to either GB10 (irrelevant) or to Qwen MTP (item H).
+
+**Iter-100+ attack order (refined from iter-98 #1/#2/#3):**
+1. Iter-98 #1 — **Fuse FWHTs into FA-vec-tq-hb** (~6% decode). Highest
+   self-found ROI from per-layer dispatch categorization.
+2. Iter-98 #2 — **Q6_K + Q5_K swiglu-fused-down mv_id** (~3% decode).
+   Reference Q4_0 implementation exists.
+3. Iter-99 #B — **gate+up+SwiGLU mv_id fusion** (~5% decode). DS4 has the
+   exact pattern; needs Q5_K port.
+4. Iter-99 #C — **persistent batch-encoder** instrumentation. Measure
+   encode-CPU separately from kernel-CPU first; only port if encode-CPU
+   is a measurable share.
+5. Iter-99 #A — **verify FA-vec `nwg=32`** at decode kL ≥ 512. One-shot
+   verification, low cost.
+
+Combined optimistic ROI: ~17-20% decode speedup → 63 → 74-76 t/s. Closes
+~50% of the 4.75 ms peer gap. Items E/F/G/H are larger ceilings but
+higher risk; pursue after items 1-5 land.
+
 ### Iter-98 dispatch categorization per layer — fusion target ranking
 
 Read `forward_decode` body (forward_mlx.rs:238-1715) and counted
@@ -729,7 +803,7 @@ dispatches/token**.
 
 | Metric | Iter-89 (buggy) | Iter-90 (corrected) | Reality check |
 |---|---:|---:|:---|
-| Total dispatches/token | 16,300 | **990** | Matches candle baseline (~105) × 9.4× |
+| Total dispatches/token | 16,300 | **990** | Same order as candle (~400-1000) — see iter-99 retraction |
 | Body dispatches/token | 15,310 | **986** (33 per layer × 30 layers) | Reasonable |
 | Head dispatches/token | 990 | **4** | LM-head + softcap + argmax = 3-4 ops |
 | µs / dispatch | 0.97 µs | **15.8 µs** | Apple Metal GPU dispatch latency |
@@ -772,13 +846,11 @@ Ran `HF2Q_MLX_PROFILE=1` (production-side ProfileAccumulator) on a
 **Encode-bound finding**: 16300 × 0.97 µs = 15.81 ms ≈ token total. The
 decode is dominated by encoder/dispatch overhead, NOT GPU kernel time.
 
-**Comparison vs candle Phase 0 baseline**: ~105 dispatches/token → we
-have **155× more dispatches**. This reflects the per-layer fan-out from:
-- 8 active MoE experts × 2 (gate_up + down) = 16 mv_id calls per layer
-- FA-vec-tq-hb (leg_hb_encoded) path with multi-step quantization sub-
-  dispatches per layer
-- Per-block K-quant scale/dequant sub-passes inside mv kernels
-- Norm/add/embed/permute small kernels each as a separate dispatch
+**Comparison vs candle Phase 0 baseline**: this iter-89 line ("~105
+dispatches/token") **was wrong**. See iter-99: candle issues ~400-1000
+dispatches/token, same order as hf2q's 990. Retracted; the structural
+gap is per-dispatch GPU time (~16 µs vs ~11 µs llama.cpp HEAD), not
+dispatch density.
 
 llama.cpp also has high dispatch counts (iter-71 confirmed parity); the
 ~30% per-dispatch encoder gap accounts for the 0.65-0.70× decode peer.
