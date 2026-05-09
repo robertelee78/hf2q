@@ -605,14 +605,73 @@ landed; Linear-only forward already landed).
          router is frozen).
        - Adam optimizer + `kl_div_loss_per_row` + autograd_gpu_tape:
          ready.
-       Missing wiring:
-       - `train_all_linears_full_model_dwq` function (~500-1000 LOC)
-       - `--full-model-teacher` CLI flag + `--calibration-data <path>`
-       - 2-layer synthetic fixture test + real-GGUF smoke
-       Scope: multi-week implementation + 3-6 hour DWQ run per
-       family on M5 Max.  Future-iter scope.
+       **Empirical foundation already PROVEN 2026-05-08** (commits
+       `28bedfd`, `220a5e1`, `8d5bef6`, `59bcb6d`):
+       - Test `ac7_option_a_foundation_qdq_wrapped_moe_layer_routes_gradients_to_s_b`
+         (qwen35_moe.rs:1999): qdq → matmul → switch_mlp → backward
+         routes gradients to ALL 12 (s, b) leaves on a 1-layer MoE.
+       - Test `ac7_option_a_full_model_two_layer_breaks_perturb_1_0_plateau`
+         (qwen35_moe.rs:2374): 2-layer F32-teacher vs qdq-student MSE loss
+         is non-zero at perturb=1.0; gradient routes to 24 leaves.
+       - Test `ac7_option_a_full_model_two_layer_loss_decreases_under_sgd`
+         (qwen35_moe.rs:2669): 10 SGD steps × lr=0.01 → ratio 0.689,
+         strictly monotonic.
+       - Test `ac7_option_a_full_model_two_layer_adam_converges_faster_than_sgd`
+         (qwen35_moe.rs:2929): Adam wiring (register_param + step +
+         read_param) at lr=1e-5 → ratio 0.679, monotonic.  Adam at
+         lr=0.01 EXPLODES (documented).
+       **Implementation ladder for production** (concrete file:line
+       references; remaining work for AC#7 PASS):
+       1. **Add `pub struct FullModelDwqConfig`** in
+          `src/calibrate/dwq_loop.rs` (sibling of
+          `DwqTrainingConfig` at line 379).  Fields:
+          `bits, group_size, n_steps, lr, batch_size, seq_len,
+           gguf_path, calibration_token_batches: Vec<Vec<u32>>`.
+       2. **Add `pub fn train_all_linears_full_model_dwq(
+          cfg: &FullModelDwqConfig
+          ) -> Result<DwqAllLinearsResult>`** in `dwq_loop.rs`
+          (sibling of `train_all_linears_dwq` at line 539).  Body
+          combines:
+          - Load student weights via
+            `Qwen35Model::load_from_gguf` (model.rs:180), then for
+            each Linear extract W_real → init_qdq (CPU helper from
+            `ac7_option_a_foundation_qdq_wrapped_moe_layer` test;
+            extract to a public helper).
+          - Load teacher via
+            `GgufTeacherProvider::from_gguf_path` (gguf_teacher.rs:64).
+          - For each batch: invoke
+            `compute_dwq_targets`-style top-K capture, then run
+            student forward via `qwen35_moe_forward_on_tape`
+            (qwen35_moe.rs:454), compute KL via
+            `kl_div_loss_per_row` (dynamic_quant_gpu.rs:127), call
+            `backward` (autograd_gpu_tape.rs).
+          - Adam loop over all per-Linear (s, b) using the proven
+            `register_param` / `step` / `read_param` pattern from
+            `ac7_option_a_full_model_two_layer_adam_converges_faster_than_sgd`.
+          - Emit `MlxAffineLinear` per trained Linear; collect into
+            `DwqAllLinearsResult.trained` with the existing
+            `to_safetensors_bytes` serialization.
+       3. **CLI wiring** in `src/cli.rs` (DwqTrainArgs at line 158):
+          add `--full-model-teacher: bool` flag + `--calibration-data
+          <path>` for token-stream input.  In `src/main.rs::cmd_dwq_train`
+          (line 194), branch: when `args.full_model_teacher`, call
+          the new function; else preserve existing
+          `train_all_linears_dwq` behavior.
+       4. **Tests** in `tests/full_model_dwq_e2e.rs` (NEW): synthetic
+          2-layer teacher fixture (mirrors
+          `ac7_option_a_full_model_two_layer_loss_decreases_under_sgd`)
+          + real-GGUF smoke (Qwen 3.6 27B with `--limit 1` for fast
+          CI gate).
+       5. **AC#7 closure event**: operator runs full Gemma 4 / qwen35
+          DWQ training with `--full-model-teacher`, then
+          `scripts/adr020_ac7_boundary_validate.sh` against the
+          resulting overlay.  Expected `boundary_delta_nats > +0.05`.
+       Scope estimate: ~500 LOC implementation + ~200 LOC tests +
+       3-6 hour DWQ run per family on M5 Max.  Future-iter scope
+       but FOUNDATION COMPLETE — every algorithmic uncertainty is
+       resolved.
      - The serve-side AC#5 infrastructure works correctly; AC#7
-       PASS verdict gates on Option A.
+       PASS verdict gates on the implementation ladder above.
 8. **Per-family pass:** all four combos {Qwen 3.6 35B-A3B-Abliterix-EGA,
    Gemma 4 26B-A4B-it-ara} × {dwq-4, dwq-6} satisfy criteria 6–7.
    **HARNESS READY** — iter-12d-4 (`a62e4ee`)
