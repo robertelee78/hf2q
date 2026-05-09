@@ -3102,6 +3102,85 @@ Real next-iter targets (operator pick required):
    precision/speed tradeoff — 17.6% speedup, token-divergent on
    long contexts but coherent. Operator decision gate.
 
+### iter-150: peer FA-vec architecture + structural-distribution finding
+
+#### llama.cpp's FA-vec layout (the peer model)
+
+Read `kernel_flash_attn_ext_vec` at
+`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:6666`:
+
+- `NW = 32` (simdgroup width, fixed)
+- `NL = NW/NE = 8` lanes per cache-element when `NE = 4`
+- Each simdgroup processes **NE = 4 cache positions in parallel**
+  inside its inner `for cc in 0..C/NE` loop
+- 2D parallelism: simdgroups across cache blocks (NSG axis) +
+  NE=4 cache positions per simdgroup (NL axis)
+
+#### hf2q's FA-vec-tq-hb layout (current)
+
+Read `flash_attn_vec_tq_hb_impl` at
+`/opt/mlx-native/src/shaders/flash_attn_vec_tq_hb.metal:276`:
+
+- `NW = 32`, `NL = NW = 32` (full simdgroup processes 1 cache pos)
+- Each simdgroup handles **1 cache position per K-loop iteration**
+- 1D parallelism: simdgroups across cache blocks (NSG axis only)
+
+**Architectural gap**: peer gets **~4× cache-position throughput per
+simdgroup** for the same simdgroup count. At kL=1024 (gemma4
+sliding), this would shave up to ~3-4× off FA-vec-tq-hb time.
+
+#### Production-mode microbench (16 heads, 8 kv, hd=256, current HEAD)
+
+```
+[BENCH iter-103] FA-vec-tq-hb session-30 GPU/call vs kL:
+  kL=128:    40.02 µs/call → 1.42 ms/token (30 layers)
+  kL=512:    40.83 µs/call → 1.43 ms/token
+  kL=1024:   43.66 µs/call → 1.47 ms/token (gemma4 sliding cap)
+  kL=4096:  194.07 µs/call → 6.05 ms/token (qwen3.5/3.6 long-ctx)
+  kL=8192:  418.87 µs/call → 12.78 ms/token (qwen long)
+```
+
+At gemma4 default decode (sliding=1024), FA-vec-tq-hb = 1.47 ms/token =
+**~10% of 14.45 ms decode**. Eliminating FA entirely (USE_DENSE swap)
+saves at most 1.4 ms (iter-147 finding), confirms upper bound on
+single-kernel optimization at this fixture.
+
+#### Structural-distribution finding
+
+The 4.65 ms gap to peer (hf2q 14.45 vs llama.cpp 9.80) is NOT
+concentrated in one kernel. Per iter-111 inventory, the gap is
+**distributed** — hf2q is roughly 30% slower than llama.cpp **across
+multiple kernel families** (FA-vec, projs, MLP matmuls, LM head). 32%
+gap × 6 kernel families = no single 4ms target.
+
+What llama.cpp does differently architecture-wise:
+1. FA-vec uses NE=4 (4 cache positions per simdgroup vs hf2q's 1)
+2. mat-vec kernels use SIMD-group matrix-multiply intrinsics where
+   shape allows (`simdgroup_matrix_multiply`)
+3. KV cache write is plain F16 (no Hadamard rotation — but trades
+   memory)
+4. F16 LM head GEMM has tile-tuned shaders for big-vocab models
+
+#### Walk-phase outlook
+
+Single-kernel optimization (e.g., FA-vec-tq-hb NE=4 port) saves at
+most ~0.5-1 ms (5-7% decode) — not enough to close 32% gap alone but
+the highest-ROI walk-phase target available.
+
+Closing the full 4.65 ms requires either:
+- **Multi-kernel parallel attack**: NE=4 FA + faster LM head + better
+  matmuls (multi-iter, ~10-20+ iters of shader work)
+- **Path A spec-decode** (run-phase, 1.6-3.0× lever, no kernel work)
+- **Path E USE_DENSE default-flip** (17.6% in one toggle, but
+  precision tradeoff)
+
+Recommend operator pick:
+- If walk-phase budget for shader work is large → start NE=4 port
+  (iter-151+, multi-iter scope, 5-7% decode win)
+- If walk-phase budget is small → stop here, declare structural;
+  switch to run-phase Path A (the largest lever)
+- If user-facing perf is urgent → Path E USE_DENSE default-flip
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
