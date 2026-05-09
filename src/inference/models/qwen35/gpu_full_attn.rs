@@ -268,15 +268,19 @@ fn dispatch_decode_sdpa_with_optional_tq(
             sliding_window: 0,
             softcap: 0.0,
         };
-        // iter-29 (sub-sub-iter 23c-α): F32 fallback path. Only
-        // reachable when slot.tq is None OR head_dim ∉ {256, 512}.
-        // Today the alloc path always emits Some; iter-30 must
-        // guarantee this branch is unreachable when alloc returns None
-        // (i.e., tq_kv_active=true ⇒ head_dim ∈ {256, 512} ⇒ TQ branch
-        // taken above ⇒ this expect never fires).
+        // iter-29 (sub-sub-iter 23c-α) + iter-34 (sub-sub-iter 23c-β.5):
+        // F32 fallback path. Only reachable when slot.tq is None OR
+        // head_dim ∉ {256, 512}. iter-34 invariant: when tq_kv_active=true
+        // (slot.k=None), slot.tq is Some AND production qwen35 head_dim=256
+        // ⇒ the TQ branch above is taken ⇒ this expect is unreachable
+        // in production TQ mode. Reachable in legacy F32 mode (slot.k=Some)
+        // and in test fixtures with non-256 head_dim (which use legacy
+        // F32 mode anyway). expect-on-None therefore signals a regression
+        // of the iter-34 alloc/SDPA gating invariant.
         let kbuf = slot.k.as_ref().expect(
             "flash_attn_vec F32 fallback: slot.k is None but TQ branch \
-             not taken — iter-30 alloc/SDPA gating bug.",
+             not taken — iter-34 alloc/SDPA gating invariant regressed \
+             (tq_kv_active=true ⇒ slot.tq=Some ⇒ TQ chain above runs).",
         );
         let vbuf = slot.v.as_ref().expect("flash_attn_vec F32: slot.v is None (see slot.k)");
         flash_attn_vec(
@@ -2293,9 +2297,16 @@ pub fn apply_sdpa_with_kv_cache(
             // head_dim=256 — this branch is small-fixture-only. iter-30
             // alloc preserves Some on the F32 path; expect on the
             // unreachable None case.
+            // iter-34 invariant: TQ requires head_dim ∈ {256,512}; this
+            // branch only fires for head_dim outside that set, which
+            // tq_kv_active=true is never paired with in production
+            // (qwen35 head_dim is always 256). Test fixtures with
+            // smaller head_dim use legacy F32 mode (tq_kv_active=false),
+            // so slot.k is Some.
             let kbuf = slot.k.as_ref().expect(
                 "dispatch_sdpa_decode F32 head_dim fallback: slot.k is None — \
-                 iter-30 alloc/SDPA gating bug (TQ requires head_dim ∈ {256,512}).",
+                 iter-34 alloc/SDPA gating invariant regressed (TQ requires \
+                 head_dim ∈ {256,512}; this fallback should never see slot.k=None).",
             );
             let vbuf = slot.v.as_ref().expect("dispatch_sdpa_decode F32: slot.v is None");
             dispatch_sdpa_decode(
@@ -2563,9 +2574,15 @@ pub fn apply_sdpa_with_kv_cache(
             };
             let mut enc = device.command_encoder().context("enc sdpa kv-cache prefill")?;
             // iter-29 (sub-sub-iter 23c-α): F32 head_dim-fallback prefill.
+            // iter-34 invariant: head_dim-fallback prefill only fires
+            // for head_dim ≠ 256 (production qwen35 head_dim is always
+            // 256). Such test fixtures use legacy F32 mode, so slot.k
+            // is Some. Reaching this expect-on-None means the alloc
+            // gating regressed.
             let kbuf = slot.k.as_ref().expect(
                 "sdpa F32 head_dim fallback prefill: slot.k is None — \
-                 iter-30 must keep F32 backing for the head_dim fallback.",
+                 iter-34 alloc/SDPA gating invariant regressed (this \
+                 fallback should only see legacy F32 fixtures with slot.k=Some).",
             );
             let vbuf = slot.v.as_ref().expect("sdpa F32 prefill: slot.v is None");
             sdpa(&mut enc, registry, device, &q_gpu, kbuf, vbuf, &out_buf, &params, 1)
@@ -3534,9 +3551,13 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
         ).context("flash_attn_vec kv-cache decode_into (FA-layer decode iter-15)")?;
     } else {
         // iter-29 (sub-sub-iter 23c-α): F32 head_dim-fallback decode_into.
+        // iter-34 invariant: head_dim-fallback decode_into only fires
+        // for head_dim ≠ 256 (test-fixture-only). Same gating as the
+        // sister site at apply_sdpa_with_kv_cache; expect-on-None
+        // signals an alloc gating regression.
         let kbuf = slot.k.as_ref().expect(
             "dispatch_sdpa_decode F32 head_dim fallback (decode_into): \
-             slot.k is None — iter-30 alloc/SDPA gating bug.",
+             slot.k is None — iter-34 alloc/SDPA gating invariant regressed.",
         );
         let vbuf = slot.v.as_ref().expect("dispatch_sdpa_decode F32 decode_into: slot.v is None");
         dispatch_sdpa_decode(
