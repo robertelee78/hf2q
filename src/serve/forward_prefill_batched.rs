@@ -1836,8 +1836,18 @@ impl MlxModelWeights {
             // need to wait on the GPU copy (the copy is still in flight on
             // its command buffer, but decode won't run until that buffer
             // commits at the end of the prefill).
-            self.kv_caches[layer_idx].write_pos = seq_len;
-            self.kv_caches[layer_idx].seq_len = seq_len.min(self.kv_caches[layer_idx].capacity);
+            //
+            // ADR-028 iter-138 Path A Phase 2 GPU step 3/7 — append-mode
+            // KV cursor advance. start_pos=0 (cold prefill, production
+            // default): write_pos = seq_len, seq_len.min(capacity) —
+            // identical to pre-iter-138. start_pos>0 (future verify):
+            // write_pos = start_pos + seq_len, advancing past the existing
+            // cache state. The K/V data at slots [0, start_pos) is
+            // preserved (the kernel writes only at slots produced by
+            // pf_positions, which iter-137 also offset by start_pos).
+            let new_write_pos = start_pos + seq_len;
+            self.kv_caches[layer_idx].write_pos = new_write_pos;
+            self.kv_caches[layer_idx].seq_len = new_write_pos.min(self.kv_caches[layer_idx].capacity);
 
             // ADR-010 batched sub-stage dump at (layer_idx, target_tok)
             if let Some((dump_layer, target_tok)) = batched_dump {
