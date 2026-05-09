@@ -2350,6 +2350,43 @@ impl MlxModelWeights {
     ///    emission at line 1966+ with a loop over each output position).
     /// 3. Output buffer for K+1 argmaxes.
     /// 4. Integration test: byte-identity vs K+1 serial forward_decode.
+    ///
+    /// # iter-135 scoping addendum (precise line-level diff for iter-136 to execute)
+    ///
+    /// The append-mode parameterization is a 4-site edit on this file
+    /// (call counts and exact line numbers as of HEAD `972a2b4`):
+    ///
+    /// | Site | Line | Current                                                | After (param=start_pos)                       |
+    /// |------|------|--------------------------------------------------------|------------------------------------------------|
+    /// |  A   | 469  | `for (i, slot) in p[..seq_len].iter_mut().enumerate()` | (unchanged loop, body changes)                |
+    /// |  A   | 470  | `*slot = i as u32`                                     | `*slot = (start_pos + i) as u32`              |
+    /// |  B   | 1823 | `write_pos = seq_len`                                  | `write_pos = start_pos + seq_len`             |
+    /// |  C   | 1824 | `seq_len = seq_len.min(capacity)`                      | `seq_len = (start_pos + seq_len).min(capacity)` |
+    /// |  D   | (LM head) | `dispatch_argmax_f32` last-row-only             | per-position-loop (impl scope iter-137)       |
+    ///
+    /// **Refactor strategy**: factor out a `forward_batched_inner(
+    /// tokens, start_pos: usize, capture_argmax: AllOrLast) -> Vec<u32>`
+    /// helper. forward_prefill_batched becomes a thin wrapper calling
+    /// `forward_batched_inner(tokens, 0, AllOrLast::Last)` and unwrapping
+    /// the single argmax. forward_decode_verify_batched calls
+    /// `forward_batched_inner(tokens, current_pos, AllOrLast::All)` and
+    /// returns the full Vec.
+    ///
+    /// This refactor is multi-iter scope (requires comprehensive
+    /// regression testing of forward_prefill_batched at start_pos=0,
+    /// which is THE production decode/prefill path on qwen35). Per
+    /// operator's "do it right, regression-gated" mantra, the refactor
+    /// must be incremental:
+    /// - iter-136: factor out the inner helper (NSG-equivalent
+    ///   byte-identity gate + 8/8 sourdough byte-identity validation).
+    /// - iter-137: thread `start_pos` parameter (default 0 → identical).
+    /// - iter-138: thread `capture_argmax` parameter (Last default).
+    /// - iter-139: implement Shape B body in
+    ///   forward_decode_verify_batched (start_pos = current write_pos,
+    ///   capture_argmax = All).
+    /// - iter-140: spec-decode-loop integration test (proposer →
+    ///   verify_batched → accept_prefix_argmax → rollback_kv).
+    /// - iter-141+: production wire-up + acceptance-rate measurement.
     pub fn forward_decode_verify_batched(
         &mut self,
         _tokens: &[u32],
