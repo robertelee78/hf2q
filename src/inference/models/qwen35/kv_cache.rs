@@ -486,6 +486,87 @@ impl FullAttnKvSlot {
 
         Ok(dst)
     }
+
+    /// ADR-027 Phase B iter-32 (sub-sub-iter 23c-β.3) — dequant + un-rotate
+    /// chain: dequant TQ to temp F32 (rotated domain), then apply
+    /// `FWHT × sign-undo` per-(head, position) chunk so the output is in the
+    /// **original (unrotated) F32 K/V domain**.
+    ///
+    /// **Why this exists:** the existing dense F32 prefill SDPA kernel
+    /// (`apply_flash_attn_prefill_seq_major_resume` and friends) reads
+    /// K/V in the unrotated domain. Dropping in
+    /// `dequant_seq_to_temp_f32_unrotated` as a `slot.k.as_ref()` replacement
+    /// makes the dense prefill SDPA work against TQ-only KV with no
+    /// kernel changes (iter-33 wires this into the production path).
+    ///
+    /// **Round-trip property:** for any K written via
+    /// `encode_seq_tokens_to_tq`, this helper recovers K to within the
+    /// quant round-trip floor (iter-13 NRMSE 0.008 on single-position;
+    /// `dequant_seq_to_temp_f32_unrotated_recovers_original_within_nrmse_threshold`
+    /// validates this seq variant under the same 0.15 ADR-007 §F-0.3
+    /// threshold at production cache shape).
+    ///
+    /// Output layout: same as `dequant_seq_to_temp_f32`
+    /// (`[n_kv_heads, n_tokens, head_dim]` head-major F32) — only the
+    /// values change (now in the unrotated domain).
+    ///
+    /// **Internal pipeline (single GPU encoder):**
+    /// 1. `dispatch_tq_dequantize_hb_kv_seq` (iter-30) →  temp_f32 (rotated).
+    /// 2. RAW barrier (FWHT-undo reads what dequant just wrote).
+    /// 3. `dispatch_fwht_sign_undo_f32` with `num_heads = n_kv_heads * n_tokens`
+    ///    — each (head, token) chunk of `head_dim` elements is one
+    ///    independent rotation group; the kernel's threadgroup-per-head
+    ///    grid fans out across all `(n_kv_heads × n_tokens)` chunks.
+    ///
+    /// # Errors
+    ///
+    /// Same as `dequant_seq_to_temp_f32` plus FWHT dispatch errors
+    /// (`head_dim` ∉ {256, 512}).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dequant_seq_to_temp_f32_unrotated(
+        &self,
+        is_k: bool,
+        n_tokens: u32,
+        start_pos: u32,
+        cache_capacity: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        encoder: &mut mlx_native::CommandEncoder,
+        registry: &mut mlx_native::KernelRegistry,
+        device: &MlxDevice,
+    ) -> Result<MlxBuffer> {
+        // (1) Dequant in the rotated domain.
+        let dst = self.dequant_seq_to_temp_f32(
+            is_k, n_tokens, start_pos, cache_capacity,
+            n_kv_heads, head_dim, encoder, registry, device,
+        )?;
+
+        // (2) RAW barrier: FWHT-undo kernel reads what dequant just wrote.
+        encoder.memory_barrier();
+
+        // (3) Per-(head, token) FWHT × sign-undo. The fwht_sign_undo
+        // kernel processes `num_heads` independent chunks of `head_dim`
+        // elements; we fan out across all `n_kv_heads × n_tokens` chunks
+        // by passing the product as `num_heads`. Layout: temp_f32 is
+        // `[n_kv_heads, n_tokens, head_dim]` flattened — each (h, t) chunk
+        // of `head_dim` elements is one rotation group at offset
+        // `(h * n_tokens + t) * head_dim`.
+        let total_chunks = n_kv_heads
+            .checked_mul(n_tokens)
+            .ok_or_else(|| anyhow!(
+                "dequant_seq_to_temp_f32_unrotated: n_kv_heads ({n_kv_heads}) × \
+                 n_tokens ({n_tokens}) overflow u32"
+            ))?;
+        mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
+            encoder, registry, device.metal_device(),
+            &dst, total_chunks, head_dim,
+        )
+        .map_err(|e| anyhow!(
+            "dequant_seq_to_temp_f32_unrotated: dispatch_fwht_sign_undo_f32: {e}"
+        ))?;
+
+        Ok(dst)
+    }
 }
 
 /// ADR-027 Phase B iter-10 — parameters for the qwen35 TQ SDPA dispatch.
@@ -4075,6 +4156,136 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ADR-027 Phase B iter-32 (sub-sub-iter 23c-β.3) —
+    /// `dequant_seq_to_temp_f32_unrotated` round-trip recovery test.
+    ///
+    /// **Round-trip property:** for any K written via
+    /// `encode_seq_tokens_to_tq`, the dequant + FWHT-undo + sign-undo
+    /// chain recovers K to within the quant round-trip floor (iter-13
+    /// measured NRMSE 0.008 on single-position; this test validates
+    /// the seq variant under the same 0.15 ADR-007 §F-0.3 threshold
+    /// at production cache shape: cfg=moe_cfg_40layer, n_tokens=6,
+    /// head_dim=256).
+    ///
+    /// Without this contract, iter-33's drop-in replacement of
+    /// `slot.k.as_ref()` with `dequant_seq_to_temp_f32_unrotated`
+    /// output would silently degrade dense prefill SDPA accuracy.
+    /// This test is the load-bearing parity gate.
+    ///
+    /// Sequence:
+    /// (1) Build TQ-active cache + synthesize N tokens of F32 K.
+    /// (2) Encode K via `encode_seq_tokens_to_tq` (writes TQ buffers).
+    /// (3) `dequant_seq_to_temp_f32_unrotated` reads TQ + un-rotates.
+    /// (4) Download both original F32 K and recovered K to CPU; compute
+    ///     NRMSE per (kv_head, token, dim) flattened.
+    /// (5) Assert NRMSE < 0.15 (ADR-007 §F-0.3 threshold).
+    #[test]
+    fn dequant_seq_to_temp_f32_unrotated_recovers_original_within_nrmse_threshold() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache_capacity: u32 = 32;
+        let n_tokens: u32 = 6;
+        let n_kv_heads = cfg.num_key_value_heads;
+        let head_dim = cfg.head_dim;
+        assert_eq!(head_dim, 256);
+
+        let mut cache =
+            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+                .expect("kv tq-on");
+        let slot = &mut cache.full_attn[0];
+
+        // Build a [n_tokens, n_kv_heads, head_dim] f32 K source with
+        // deterministic values that span both signs and magnitudes
+        // (so the quant codebook coverage is exercised).
+        let stride = (n_kv_heads as usize) * (head_dim as usize);
+        let total_elems = (n_tokens as usize) * stride;
+        let mut k_orig_cpu = vec![0f32; total_elems];
+        for t in 0..n_tokens as usize {
+            for h in 0..n_kv_heads as usize {
+                for d in 0..head_dim as usize {
+                    let v = ((t * 31 + h * 17 + d) as f32 / 137.0).sin() * 0.4
+                        + ((t + h + d) as f32 * 0.0011).cos() * 0.15;
+                    k_orig_cpu[t * stride + h * head_dim as usize + d] = v;
+                }
+            }
+        }
+        let mut seq_k = device
+            .alloc_buffer(
+                total_elems * 4, DType::F32,
+                vec![n_tokens as usize, n_kv_heads as usize, head_dim as usize],
+            )
+            .expect("alloc seq_k");
+        seq_k
+            .as_mut_slice::<f32>()
+            .expect("seq_k mut")
+            .copy_from_slice(&k_orig_cpu);
+
+        let mut registry = mlx_native::KernelRegistry::new();
+
+        // Encode K seq into TQ.
+        {
+            let mut enc = device.command_encoder().expect("encoder");
+            slot.encode_seq_tokens_to_tq(
+                &seq_k, /*is_k=*/ true, n_tokens, n_kv_heads, head_dim,
+                cache_capacity, /*write_pos=*/ 0, /*src_tok_offset=*/ 0,
+                /*sliding=*/ false, /*scale_factor_d512=*/ 1.0,
+                /*codebook_bits=*/ 8,
+                &mut enc, &mut registry, &device,
+            )
+            .expect("encode K seq");
+            enc.commit_and_wait().expect("encode commit");
+        }
+
+        // Dequant + un-rotate via the iter-32 helper.
+        let recovered = {
+            let mut enc = device.command_encoder().expect("encoder dequant");
+            let buf = slot
+                .dequant_seq_to_temp_f32_unrotated(
+                    /*is_k=*/ true, n_tokens, /*start_pos=*/ 0,
+                    cache_capacity, n_kv_heads, head_dim,
+                    &mut enc, &mut registry, &device,
+                )
+                .expect("dequant_seq_to_temp_f32_unrotated");
+            enc.commit_and_wait().expect("dequant commit");
+            buf
+        };
+
+        // Output layout: [n_kv_heads, n_tokens, head_dim].
+        // Reference (k_orig_cpu) layout: [n_tokens, n_kv_heads, head_dim].
+        // Permute to compare.
+        let recovered_slice = recovered.as_slice::<f32>().expect("recovered slice");
+        let mut recovered_seq_major = vec![0f32; total_elems];
+        for h in 0..n_kv_heads as usize {
+            for t in 0..n_tokens as usize {
+                for d in 0..head_dim as usize {
+                    let head_major_off = h * (n_tokens as usize) * (head_dim as usize)
+                        + t * (head_dim as usize) + d;
+                    let seq_major_off = t * stride + h * (head_dim as usize) + d;
+                    recovered_seq_major[seq_major_off] = recovered_slice[head_major_off];
+                }
+            }
+        }
+
+        // NRMSE between original K and recovered K.
+        let nrmse_value = nrmse(&recovered_seq_major, &k_orig_cpu);
+        assert!(
+            nrmse_value < 0.15,
+            "TQ round-trip NRMSE {nrmse_value:.6} >= 0.15 (ADR-007 §F-0.3 threshold)"
+        );
+        // Iter-13 single-position measured 0.008. Seq variant should be in
+        // the same ballpark — failing this is a regression signal even if
+        // technically under threshold.
+        eprintln!(
+            "[iter-32 round-trip NRMSE] {nrmse_value:.6} (iter-13 single-pos: ~0.008)"
+        );
     }
 
     /// ADR-027 Phase B iter-31 — defensive: helper errors loud when
