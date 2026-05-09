@@ -958,6 +958,217 @@ fn alloc_linear_attn_slot(
     })
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// ADR-027 Phase B iter-7 — TQ-active full-attn KV buffer infra (additive)
+// ──────────────────────────────────────────────────────────────────────────
+//
+// Mirrors mlx-native `forward_mlx.rs::HbKvBuffers` (Gemma 4 TQ-active path)
+// shape contract, extended with the qwen35 `n_seqs` axis. Iter-7 ships only
+// the buffer types + allocator + tests so iter-8's SDPA dispatch (via
+// `flash_attn_vec_tq_hb` from mlx-native) has a stable target.
+//
+// **Iter-7 scope (this file region):**
+// - `TqFullAttnKvBuffers` struct (parallel to `FullAttnKvSlot` in TQ mode).
+// - `tq_norms_per_pos_for(head_dim) -> u32` (1 for head_dim=256; 2 for
+//   head_dim=512; mirror of `forward_mlx.rs:2326`).
+// - `alloc_tq_full_attn_buffers(cfg, device, max_seq_len, n_seqs)` —
+//   returns a fully-allocated TQ buffer set with U8 packed indices +
+//   F32 norms zero-initialized.
+// - Tests prove byte-count parity (~3.94× smaller than F32 at qwen36 APEX
+//   shape) + correct shape per qwen35 cache layout.
+//
+// **NOT yet wired into `HybridKvCache::new`** — that's iter-8 along with
+// the SDPA dispatch branch. Iter-7 keeps the existing F32 path completely
+// untouched (Chesterton's fence on the live serve path).
+
+/// ADR-027 Phase B iter-7 — TQ-active K/V buffer set for one full-attn
+/// slot (qwen35). Holds Hadamard-rotated 8-bit-quantized K/V indices and
+/// per-position F32 norms.
+///
+/// Shape convention matches the qwen35 F32 cache layout (4D with `n_seqs`
+/// as the outer axis), differing from Gemma's HbKvBuffers shape which is
+/// 3D (no batch axis). The mlx-native `flash_attn_vec_tq_hb` kernel reads
+/// the inner three axes `[n_kv_heads, max_seq_len, head_dim]` per
+/// sequence; the n_seqs outer dimension is consumed at the call site.
+///
+/// Constructed by [`alloc_tq_full_attn_buffers`]. Iter-8 wires this into
+/// the `HybridKvCache::new` allocator branch + the SDPA dispatch.
+pub struct TqFullAttnKvBuffers {
+    /// Byte-packed K indices `[n_seqs, n_kv_heads, max_seq_len, head_dim]`
+    /// U8.  One byte per element (8-bit Lloyd-Max codebook index).
+    pub k_packed: MlxBuffer,
+    /// K per-(seq, head, position) F32 norms.  Shape:
+    /// `[n_seqs, n_kv_heads, max_seq_len, norms_per_pos]` F32.
+    /// At head_dim=256 (qwen35 / qwen35moe) `norms_per_pos = 1`;
+    /// at head_dim=512 it would be 2 (matches Gemma's formula).
+    pub k_norms: MlxBuffer,
+    /// Byte-packed V indices, same shape as `k_packed`.
+    pub v_packed: MlxBuffer,
+    /// V per-(seq, head, position) F32 norms, same shape as `k_norms`.
+    pub v_norms: MlxBuffer,
+    /// Number of F32 norms per position (1 for head_dim=256;
+    /// 2 for head_dim=512).  Cached so SDPA dispatch (iter-8) doesn't
+    /// recompute from `head_dim`.
+    pub norms_per_pos: u32,
+}
+
+/// Number of F32 norms per (seq, head, position) for a given head_dim.
+/// Mirrors mlx-native's formula at `forward_mlx.rs:2326`:
+/// `(head_dim / 256).max(1)`.
+///
+/// Returns 1 for head_dim ∈ [1, 256] (qwen35 + qwen35moe production at
+/// head_dim=256).  Returns 2 for head_dim=512.  Returns 3 for head_dim
+/// ∈ [768, 1023] etc. — but production qwen35 head_dim is always 256,
+/// so this is conservative future-proofing only.
+#[inline]
+pub fn tq_norms_per_pos_for(head_dim: u32) -> u32 {
+    (head_dim / 256).max(1)
+}
+
+/// Allocate one full-attn slot's worth of TQ-active K/V buffers (U8
+/// packed + F32 norms) zero-initialized.  Mirrors the production shape
+/// the mlx-native `flash_attn_vec_tq_hb` kernel consumes per sequence,
+/// extended with the qwen35 `n_seqs` outer axis.
+///
+/// **Iter-7 scope:** standalone allocator only — no `HybridKvCache`
+/// integration yet.  Iter-8 wires this into the per-slot allocator.
+///
+/// # Errors
+///
+/// Returns an error if any buffer allocation fails or if `max_seq_len`
+/// or `n_seqs` is zero (mirrors `HybridKvCache::new`'s preflight).
+pub fn alloc_tq_full_attn_buffers(
+    cfg: &Qwen35Config,
+    device: &MlxDevice,
+    max_seq_len: u32,
+    n_seqs: u32,
+) -> Result<TqFullAttnKvBuffers> {
+    if max_seq_len == 0 {
+        return Err(anyhow!(
+            "alloc_tq_full_attn_buffers: max_seq_len must be > 0"
+        ));
+    }
+    if n_seqs == 0 {
+        return Err(anyhow!(
+            "alloc_tq_full_attn_buffers: n_seqs must be > 0"
+        ));
+    }
+
+    let n_kv_heads = cfg.num_key_value_heads as usize;
+    let head_dim = cfg.head_dim;
+    let norms_per_pos = tq_norms_per_pos_for(head_dim);
+
+    // Packed: [n_seqs, n_kv_heads, max_seq_len, head_dim] U8.
+    // 1 byte per element (8-bit Lloyd-Max index).
+    let packed_elems = (n_seqs as usize)
+        * n_kv_heads
+        * (max_seq_len as usize)
+        * (head_dim as usize);
+    let packed_bytes = packed_elems; // U8 → 1 byte/elem
+    let packed_shape = vec![
+        n_seqs as usize,
+        n_kv_heads,
+        max_seq_len as usize,
+        head_dim as usize,
+    ];
+
+    // Norms: [n_seqs, n_kv_heads, max_seq_len, norms_per_pos] F32.
+    // norms_per_pos=1 collapses to a 3-D view at the kernel level,
+    // but we keep the 4-D shape on the buffer so cfg-shape validation
+    // is unambiguous (every dim is explicit).
+    let norms_elems = (n_seqs as usize)
+        * n_kv_heads
+        * (max_seq_len as usize)
+        * (norms_per_pos as usize);
+    let norms_bytes = norms_elems * std::mem::size_of::<f32>();
+    let norms_shape = vec![
+        n_seqs as usize,
+        n_kv_heads,
+        max_seq_len as usize,
+        norms_per_pos as usize,
+    ];
+
+    let mut k_packed = device
+        .alloc_buffer(packed_bytes, DType::U8, packed_shape.clone())
+        .map_err(|e| anyhow!("alloc TQ full-attn K packed: {e}"))?;
+    let mut k_norms = device
+        .alloc_buffer(norms_bytes, DType::F32, norms_shape.clone())
+        .map_err(|e| anyhow!("alloc TQ full-attn K norms: {e}"))?;
+    let mut v_packed = device
+        .alloc_buffer(packed_bytes, DType::U8, packed_shape)
+        .map_err(|e| anyhow!("alloc TQ full-attn V packed: {e}"))?;
+    let mut v_norms = device
+        .alloc_buffer(norms_bytes, DType::F32, norms_shape)
+        .map_err(|e| anyhow!("alloc TQ full-attn V norms: {e}"))?;
+
+    // Zero-init all four buffers — mirrors `HybridKvCache::reset_all_buffers`
+    // discipline (defends against StorageModeShared returning recycled
+    // non-zero memory).  ADR-015 iter61a.
+    if let Ok(s) = k_packed.as_mut_slice::<u8>() {
+        s.fill(0);
+    }
+    if let Ok(s) = v_packed.as_mut_slice::<u8>() {
+        s.fill(0);
+    }
+    if let Ok(s) = k_norms.as_mut_slice::<f32>() {
+        s.fill(0.0);
+    }
+    if let Ok(s) = v_norms.as_mut_slice::<f32>() {
+        s.fill(0.0);
+    }
+
+    Ok(TqFullAttnKvBuffers {
+        k_packed,
+        k_norms,
+        v_packed,
+        v_norms,
+        norms_per_pos,
+    })
+}
+
+/// Total bytes the TQ-active full-attn slot occupies (sum of all 4
+/// buffers).  Useful for memory accounting + the parity test.
+impl TqFullAttnKvBuffers {
+    pub fn total_bytes(&self) -> usize {
+        self.k_packed.byte_len()
+            + self.k_norms.byte_len()
+            + self.v_packed.byte_len()
+            + self.v_norms.byte_len()
+    }
+}
+
+impl std::fmt::Debug for TqFullAttnKvBuffers {
+    /// Surface only counts + total bytes — `MlxBuffer` does not implement
+    /// `Debug` (Metal device handles can't be safely printed). Mirrors
+    /// the `HybridKvCacheSnapshot` Debug impl above.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TqFullAttnKvBuffers")
+            .field("k_packed_bytes", &self.k_packed.byte_len())
+            .field("k_norms_bytes", &self.k_norms.byte_len())
+            .field("v_packed_bytes", &self.v_packed.byte_len())
+            .field("v_norms_bytes", &self.v_norms.byte_len())
+            .field("norms_per_pos", &self.norms_per_pos)
+            .field("total_bytes", &self.total_bytes())
+            .finish()
+    }
+}
+
+/// Compute the F32 K+V byte count for one full-attn slot at the given
+/// shape.  Matches the existing `alloc_full_attn_slot` formula.  Used
+/// by the iter-7 parity test to assert the TQ savings ratio.
+pub fn full_attn_slot_f32_bytes(
+    cfg: &Qwen35Config,
+    max_seq_len: u32,
+    n_seqs: u32,
+) -> usize {
+    let elems = (n_seqs as usize)
+        * (cfg.num_key_value_heads as usize)
+        * (max_seq_len as usize)
+        * (cfg.head_dim as usize);
+    // K + V, 4 bytes each (F32).
+    2 * elems * std::mem::size_of::<f32>()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1563,5 +1774,204 @@ mod tests {
             err_msg.contains("exceeds capacity"),
             "error should mention capacity overshoot: {err_msg}"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-027 Phase B iter-7 — TQ-active full-attn KV alloc tests
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tq_norms_per_pos_for_qwen35_head_dim_256_is_one() {
+        // Qwen 3.5 / 3.6 production head_dim = 256 (verified by
+        // Qwen35Config::head_dim default + APEX-Q5_K_M GGUF metadata).
+        // Mirrors mlx-native `forward_mlx.rs:2326` formula exactly.
+        assert_eq!(tq_norms_per_pos_for(256), 1);
+        // Boundary cases — head_dim < 256 still rounds to 1.
+        assert_eq!(tq_norms_per_pos_for(1), 1);
+        assert_eq!(tq_norms_per_pos_for(64), 1);
+        assert_eq!(tq_norms_per_pos_for(128), 1);
+        assert_eq!(tq_norms_per_pos_for(255), 1);
+        // head_dim = 512 → 2 (Gemma-class shape, future-proof for any
+        // qwen variant that lifts head_dim).
+        assert_eq!(tq_norms_per_pos_for(512), 2);
+        // head_dim = 768 → 3 (purely for the saturating math; no
+        // production model uses this today).
+        assert_eq!(tq_norms_per_pos_for(768), 3);
+    }
+
+    #[test]
+    fn tq_full_attn_buffers_alloc_byte_count_qwen36_apex_shape() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        // Qwen 3.6 35B-A3B-APEX-Q5_K_M production shape:
+        //   n_kv_heads = 2, head_dim = 256, max_seq_len = 8192,
+        //   n_seqs = 1.  These are the exact values
+        //   `alloc_kv_cache_for_request` would pass for an 8K-token
+        //   request.  Test asserts the exact byte counts so any future
+        //   shape drift surfaces immediately.
+        let cfg = moe_cfg_40layer();
+        assert_eq!(cfg.num_key_value_heads, 2);
+        assert_eq!(cfg.head_dim, 256);
+
+        let max_seq_len: u32 = 8192;
+        let n_seqs: u32 = 1;
+        let buffers = alloc_tq_full_attn_buffers(
+            &cfg, &device, max_seq_len, n_seqs,
+        )
+        .expect("alloc_tq_full_attn_buffers");
+
+        // Expected byte counts at qwen36 APEX shape:
+        //   k_packed: 1 × 2 × 8192 × 256 × 1 byte  = 4_194_304 bytes
+        //   k_norms : 1 × 2 × 8192 × 1   × 4 bytes =    65_536 bytes
+        //   v_packed: same as k_packed             = 4_194_304 bytes
+        //   v_norms : same as k_norms              =    65_536 bytes
+        //   total                                  = 8_519_680 bytes
+        let expected_packed = 1 * 2 * 8192 * 256;
+        let expected_norms = 1 * 2 * 8192 * 1 * 4;
+        let expected_total = 2 * expected_packed + 2 * expected_norms;
+        assert_eq!(buffers.k_packed.byte_len(), expected_packed);
+        assert_eq!(buffers.k_norms.byte_len(), expected_norms);
+        assert_eq!(buffers.v_packed.byte_len(), expected_packed);
+        assert_eq!(buffers.v_norms.byte_len(), expected_norms);
+        assert_eq!(buffers.total_bytes(), expected_total);
+        assert_eq!(buffers.norms_per_pos, 1);
+    }
+
+    #[test]
+    fn tq_full_attn_buffers_byte_count_3p94x_smaller_than_f32() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        // Qwen36 APEX shape — proves the 3.2× peer-parity claim from
+        // ADR-027 §1's KV-memory table is achievable.  At
+        // (n_seqs=1, n_kv_heads=2, max_seq_len=8192, head_dim=256):
+        //
+        //   F32 K+V : 2 × (1 × 2 × 8192 × 256 × 4) = 33_554_432 bytes
+        //   TQ K+V  : (4_194_304 + 65_536) × 2     =  8_519_680 bytes
+        //   ratio   : 33_554_432 / 8_519_680       = 3.94×
+        //
+        // The ADR §1 quote says 3.2× total cache reduction including
+        // linear-attn (which stays F32) — at the FULL-ATTN-SLOT level
+        // (this test's measurement) the ratio is closer to 4× because
+        // norms overhead is small at head_dim=256.
+        let cfg = moe_cfg_40layer();
+        let max_seq_len: u32 = 8192;
+        let n_seqs: u32 = 1;
+        let f32_bytes = full_attn_slot_f32_bytes(&cfg, max_seq_len, n_seqs);
+        let tq_buffers = alloc_tq_full_attn_buffers(
+            &cfg, &device, max_seq_len, n_seqs,
+        )
+        .expect("alloc_tq_full_attn_buffers");
+        let tq_bytes = tq_buffers.total_bytes();
+
+        let ratio = f32_bytes as f64 / tq_bytes as f64;
+        assert!(
+            (3.5..=4.5).contains(&ratio),
+            "TQ savings ratio {ratio:.3}× outside expected [3.5, 4.5] window. \
+             f32_bytes={f32_bytes}, tq_bytes={tq_bytes}"
+        );
+        // Spot-check the exact byte counts so any silent shape drift
+        // surfaces.
+        assert_eq!(f32_bytes, 33_554_432);
+        assert_eq!(tq_bytes, 8_519_680);
+    }
+
+    #[test]
+    fn tq_full_attn_buffers_alloc_rejects_zero_max_seq_len() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let err = alloc_tq_full_attn_buffers(&cfg, &device, 0, 1).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("max_seq_len must be > 0"),
+            "expected max_seq_len-zero error"
+        );
+    }
+
+    #[test]
+    fn tq_full_attn_buffers_alloc_rejects_zero_n_seqs() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let err = alloc_tq_full_attn_buffers(&cfg, &device, 8192, 0).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("n_seqs must be > 0"),
+            "expected n_seqs-zero error"
+        );
+    }
+
+    #[test]
+    fn tq_full_attn_buffers_alloc_initializes_to_zero() {
+        // ADR-015 iter61a discipline: every owned GPU buffer must be
+        // zero-initialized so the SDPA dispatch (iter-8) cannot read
+        // recycled non-zero StorageModeShared bytes pre-write.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let buffers = alloc_tq_full_attn_buffers(&cfg, &device, 32, 1)
+            .expect("alloc_tq_full_attn_buffers");
+        // U8 packed buffers all-zero.
+        for byte in buffers.k_packed.as_slice::<u8>().expect("k_packed slice") {
+            assert_eq!(*byte, 0u8);
+        }
+        for byte in buffers.v_packed.as_slice::<u8>().expect("v_packed slice") {
+            assert_eq!(*byte, 0u8);
+        }
+        // F32 norms all-zero.
+        for f in buffers.k_norms.as_slice::<f32>().expect("k_norms slice") {
+            assert_eq!(*f, 0.0_f32);
+        }
+        for f in buffers.v_norms.as_slice::<f32>().expect("v_norms slice") {
+            assert_eq!(*f, 0.0_f32);
+        }
+    }
+
+    #[test]
+    fn tq_full_attn_buffers_alloc_shape_at_n_seqs_2() {
+        // Defensive: prove the n_seqs outer axis is honored correctly
+        // (Gemma's HbKvBuffers is 3-D; qwen35's 4-D shape is the new
+        // contract).  Matters for spec-decode prefill where n_seqs > 1.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let buffers = alloc_tq_full_attn_buffers(&cfg, &device, 64, 2)
+            .expect("alloc_tq_full_attn_buffers");
+        // Expected: k_packed = [n_seqs=2, n_kv_heads=2, max_seq_len=64,
+        // head_dim=256] = 2*2*64*256 = 65_536 bytes (U8).
+        assert_eq!(buffers.k_packed.byte_len(), 65_536);
+        assert_eq!(buffers.k_packed.shape(), &[2, 2, 64, 256]);
+        // k_norms = [n_seqs=2, n_kv_heads=2, max_seq_len=64,
+        // norms_per_pos=1] = 2*2*64*1 elems × 4 bytes = 1024 bytes.
+        assert_eq!(buffers.k_norms.byte_len(), 1024);
+        assert_eq!(buffers.k_norms.shape(), &[2, 2, 64, 1]);
     }
 }
