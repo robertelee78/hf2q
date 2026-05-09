@@ -2849,37 +2849,76 @@ mod tests {
             (loss, grads_out)
         };
 
-        // Run 1: initial forward.
-        let (loss_initial, grads) = run_step(&student_sb);
-        eprintln!("[ac7-A-conv] loss_initial = {loss_initial:e}");
-        assert!(loss_initial > 1e-12, "loss_initial == 0 — fixture has no compositional error");
-
-        // SGD update: s -= lr * grad_s; b -= lr * grad_b.
+        // Multi-step SGD: 10 steps with lr=0.01.  Tracks the loss
+        // trajectory + asserts substantial reduction at the end.
         let lr = 0.01f32;
-        for l in 0..n_layers {
-            for e in 0..n_experts {
-                let (gs, gb, us, ub, ds, db) = &grads[l][e];
-                let entry = &mut student_sb[l][e];
-                for (i, v) in entry.0.iter_mut().enumerate() { *v -= lr * gs[i]; }
-                for (i, v) in entry.1.iter_mut().enumerate() { *v -= lr * gb[i]; }
-                for (i, v) in entry.2.iter_mut().enumerate() { *v -= lr * us[i]; }
-                for (i, v) in entry.3.iter_mut().enumerate() { *v -= lr * ub[i]; }
-                for (i, v) in entry.4.iter_mut().enumerate() { *v -= lr * ds[i]; }
-                for (i, v) in entry.5.iter_mut().enumerate() { *v -= lr * db[i]; }
+        let n_steps = 10usize;
+        let mut loss_trajectory: Vec<f32> = Vec::with_capacity(n_steps + 1);
+
+        let (loss_initial, mut grads) = run_step(&student_sb);
+        loss_trajectory.push(loss_initial);
+        assert!(loss_initial > 1e-12, "loss_initial == 0 — fixture has no compositional error");
+        eprintln!("[ac7-A-conv] step 0 loss = {loss_initial:e}");
+
+        for step_i in 0..n_steps {
+            // SGD update: s -= lr * grad_s; b -= lr * grad_b.
+            for l in 0..n_layers {
+                for e in 0..n_experts {
+                    let (gs, gb, us, ub, ds, db) = &grads[l][e];
+                    let entry = &mut student_sb[l][e];
+                    for (i, v) in entry.0.iter_mut().enumerate() { *v -= lr * gs[i]; }
+                    for (i, v) in entry.1.iter_mut().enumerate() { *v -= lr * gb[i]; }
+                    for (i, v) in entry.2.iter_mut().enumerate() { *v -= lr * us[i]; }
+                    for (i, v) in entry.3.iter_mut().enumerate() { *v -= lr * ub[i]; }
+                    for (i, v) in entry.4.iter_mut().enumerate() { *v -= lr * ds[i]; }
+                    for (i, v) in entry.5.iter_mut().enumerate() { *v -= lr * db[i]; }
+                }
             }
+            let (loss_step, grads_step) = run_step(&student_sb);
+            loss_trajectory.push(loss_step);
+            grads = grads_step;
+            eprintln!(
+                "[ac7-A-conv] step {} loss = {loss_step:e} (rel = {:.4})",
+                step_i + 1,
+                loss_step / loss_initial,
+            );
         }
 
-        // Run 2: forward with updated s/b.
-        let (loss_after, _) = run_step(&student_sb);
+        let loss_final = *loss_trajectory.last().unwrap();
+        let ratio_final = loss_final / loss_initial;
         eprintln!(
-            "[ac7-A-conv] loss_after = {loss_after:e} (relative reduction = {:.4})",
-            loss_after / loss_initial
+            "[ac7-A-conv] FINAL: loss_initial={loss_initial:e} loss_final={loss_final:e} \
+             ratio={ratio_final:.4} ({n_steps} steps × lr={lr})"
         );
+
+        // 10 SGD steps with lr=0.01 measured at 31% reduction
+        // (ratio ≈ 0.69) on M5 Max.  Adam (with momentum + adaptive
+        // lr) would converge substantially faster — vanilla SGD is
+        // intentionally chosen here to keep the test fixture
+        // dependency-free and to validate the gradient direction
+        // alone.  Threshold 0.85 gives 25%+ headroom over the
+        // measured rate while still strictly disqualifying the
+        // ratio=1.000 plateau of the per-Linear synthetic teacher
+        // (Option B, falsified).
         assert!(
-            loss_after < loss_initial,
-            "Option A SGD step did NOT decrease loss: \
-             before={loss_initial:e} after={loss_after:e} — \
-             gradient direction is wrong or loss surface is locally adversarial"
+            ratio_final < 0.85,
+            "Option A multi-step SGD failed to converge: \
+             ratio={ratio_final:.4} after {n_steps} steps; expected < 0.85.  \
+             Trajectory: {:?}",
+            loss_trajectory
+                .iter()
+                .map(|l| l / loss_initial)
+                .collect::<Vec<_>>(),
         );
+
+        // Trajectory must be MONOTONIC NON-INCREASING (lr is small
+        // enough that we shouldn't bounce out of the basin).
+        for (i, w) in loss_trajectory.windows(2).enumerate() {
+            assert!(
+                w[1] <= w[0] * 1.01, // 1% slack for numerical noise
+                "loss bounced at step {i}: {} → {} (ratio {:.4})",
+                w[0], w[1], w[1] / w[0]
+            );
+        }
     }
 }
