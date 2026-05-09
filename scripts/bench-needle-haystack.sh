@@ -39,6 +39,16 @@ TRIALS="${2:-3}"
 # so MAX_TOKENS=256+ is required for the answer to appear in the
 # truncated output. Operator overrides via env when targeting qwen35/qwen36.
 MAX_TOKENS="${MAX_TOKENS:-20}"
+# iter-40: optional --chat-template-file override. qwen36 APEX-Q5_K_M
+# (and likely other long-context-fine-tuned thinking models) emits
+# `<|im_end|>` as the first assistant token at ≥~4100 prefill tokens
+# under the GGUF-embedded chat template — see memory file
+# `project_iter40_qwen36_chat_template_long_context_eos_2026_05_09.md`.
+# Set CHAT_TEMPLATE_FILE to a null/passthrough template (e.g. one whose
+# body is just `{{ messages[0].content }}`) to bypass chat templating
+# for long-context needle-haystack runs. Empty string (default) uses
+# the GGUF embedded template.
+CHAT_TEMPLATE_FILE="${CHAT_TEMPLATE_FILE:-}"
 
 if [ ! -f "$MODEL" ]; then
     echo "ERROR: MODEL not found: $MODEL"
@@ -59,6 +69,7 @@ echo "  LENGTHS  = $LENGTHS"
 echo "  TRIALS/length = $TRIALS"
 echo "  HF2Q_TQ_KV   = ${HF2Q_TQ_KV:-unset (F32 KV cache)}"
 echo "  HF2Q_KV_PERSIST = ${HF2Q_KV_PERSIST:-unset}"
+echo "  CHAT_TEMPLATE_FILE = ${CHAT_TEMPLATE_FILE:-unset (use GGUF embedded)}"
 echo
 
 mkdir -p "$OUT_ROOT"
@@ -119,10 +130,16 @@ run_one_trial() {
 
     local actual_chars=$(wc -c < "$prompt_file" | tr -d ' ')
 
+    # iter-40: optional --chat-template-file pass-through.
+    local chat_template_arg=()
+    if [ -n "$CHAT_TEMPLATE_FILE" ]; then
+        chat_template_arg=(--chat-template-file "$CHAT_TEMPLATE_FILE")
+    fi
     timeout 1800 "$HF2Q" generate \
         --model "$MODEL" \
         --prompt-file "$prompt_file" \
         --max-tokens "$MAX_TOKENS" \
+        "${chat_template_arg[@]}" \
         > "$out_file" 2>&1 || { echo "  trial $trial_idx FAILED (exit $?)"; return 1; }
 
     # Output + needle check.
