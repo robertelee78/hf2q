@@ -439,8 +439,9 @@ mod tests {
                 }
             }
             Some(MtpKvSnapshot {
-                k,
-                v,
+                // ADR-027 sub-sub-iter 23a-α: test fixture wraps in Some.
+                k: Some(k),
+                v: Some(v),
                 current_len: (0..cfg.n_seqs).map(|s| 100 + s).collect(),
             })
         } else {
@@ -511,8 +512,13 @@ mod tests {
         match (&a.mtp, &b.mtp) {
             (None, None) => true,
             (Some(am), Some(bm)) => {
-                am.k.as_slice::<u8>().unwrap() == bm.k.as_slice::<u8>().unwrap()
-                    && am.v.as_slice::<u8>().unwrap() == bm.v.as_slice::<u8>().unwrap()
+                // ADR-027 sub-sub-iter 23a-α: Optional MTP K/V — compare
+                // Some-to-Some byte-equal (None-to-None test fixture path
+                // not exercised today; iter-23c+ adds it).
+                am.k.as_ref().expect("am.k some").as_slice::<u8>().unwrap()
+                    == bm.k.as_ref().expect("bm.k some").as_slice::<u8>().unwrap()
+                    && am.v.as_ref().expect("am.v some").as_slice::<u8>().unwrap()
+                        == bm.v.as_ref().expect("bm.v some").as_slice::<u8>().unwrap()
                     && am.current_len == bm.current_len
             }
             _ => false,

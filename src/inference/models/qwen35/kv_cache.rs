@@ -529,9 +529,18 @@ impl FullAttnKvBytesBreakdown {
 /// MTP slot snapshot — same shape as a `FullAttnKvSlot` snapshot but kept
 /// as a dedicated struct so `Option<MtpKvSnapshot>` is explicit rather
 /// than overloading `full_attn_k`/`full_attn_v` with a sentinel.
+///
+/// **ADR-027 Phase B sub-sub-iter 23a-α (Optional fields)**: K/V are
+/// Optional so iter-23c+ can drop the F32 backing in TQ mode without
+/// producing zero-byte garbage. iter-23a-α scope: producers and
+/// consumers always emit/expect `Some` (no behavior change today).
+/// `MtpKvSnapshot` itself stays `Option<MtpKvSnapshot>` at the
+/// `HybridKvCacheSnapshot.mtp` level — that signals "MTP slot present
+/// at all"; the inner `Option<MlxBuffer>` signals "F32 backing present
+/// for the MTP slot's K/V".
 pub struct MtpKvSnapshot {
-    pub k: MlxBuffer,
-    pub v: MlxBuffer,
+    pub k: Option<MlxBuffer>,
+    pub v: Option<MlxBuffer>,
     pub current_len: Vec<u32>,
 }
 
@@ -547,7 +556,13 @@ impl HybridKvCacheSnapshot {
             n += v.byte_len();
         }
         if let Some(s) = &self.mtp {
-            n += s.k.byte_len() + s.v.byte_len();
+            // ADR-027 sub-sub-iter 23a-α: Optional MTP K/V — sum only Some.
+            if let Some(buf) = &s.k {
+                n += buf.byte_len();
+            }
+            if let Some(buf) = &s.v {
+                n += buf.byte_len();
+            }
         }
         for c in &self.linear_conv {
             n += c.byte_len();
@@ -1088,8 +1103,11 @@ impl HybridKvCache {
         }
         let mtp = match &self.mtp_slot {
             Some(slot) => Some(MtpKvSnapshot {
-                k: deep_copy_buffer(device, &slot.k).context("snapshot mtp.k")?,
-                v: deep_copy_buffer(device, &slot.v).context("snapshot mtp.v")?,
+                // ADR-027 sub-sub-iter 23a-α: producers always emit
+                // Some today. iter-23c+ branches on slot's TQ-mode and
+                // pushes None when F32 backing is dropped.
+                k: Some(deep_copy_buffer(device, &slot.k).context("snapshot mtp.k")?),
+                v: Some(deep_copy_buffer(device, &slot.v).context("snapshot mtp.v")?),
                 current_len: slot.current_len.clone(),
             }),
             None => None,
@@ -1159,8 +1177,16 @@ impl HybridKvCache {
         }
         match (&snapshot.mtp, self.mtp_slot.as_mut()) {
             (Some(snap), Some(slot)) => {
-                copy_buffer_bytes(&snap.k, &mut slot.k).context("restore mtp.k")?;
-                copy_buffer_bytes(&snap.v, &mut slot.v).context("restore mtp.v")?;
+                // ADR-027 sub-sub-iter 23a-α: Optional MTP K/V — copy
+                // only when source is Some (iter-23c+ may produce None
+                // in TQ mode, in which case we skip the F32 restore;
+                // slot.tq carries the actual decode-state).
+                if let Some(snap_k) = &snap.k {
+                    copy_buffer_bytes(snap_k, &mut slot.k).context("restore mtp.k")?;
+                }
+                if let Some(snap_v) = &snap.v {
+                    copy_buffer_bytes(snap_v, &mut slot.v).context("restore mtp.v")?;
+                }
                 anyhow::ensure!(
                     snap.current_len.len() == slot.current_len.len(),
                     "restore_from: mtp current_len shape mismatch"
@@ -1259,8 +1285,14 @@ impl HybridKvCache {
         // MTP slot (when present).
         match (&snapshot.mtp, self.mtp_slot.as_mut()) {
             (Some(snap), Some(slot)) => {
-                partial_copy_slot(&snap.k, &mut slot.k, n_tokens, "mtp.k")?;
-                partial_copy_slot(&snap.v, &mut slot.v, n_tokens, "mtp.v")?;
+                // ADR-027 sub-sub-iter 23a-α: Optional MTP K/V — copy
+                // only when source is Some.
+                if let Some(snap_k) = &snap.k {
+                    partial_copy_slot(snap_k, &mut slot.k, n_tokens, "mtp.k")?;
+                }
+                if let Some(snap_v) = &snap.v {
+                    partial_copy_slot(snap_v, &mut slot.v, n_tokens, "mtp.v")?;
+                }
                 anyhow::ensure!(
                     !slot.current_len.is_empty(),
                     "restore_partial: mtp slot.current_len is empty"

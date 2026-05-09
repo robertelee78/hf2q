@@ -586,16 +586,30 @@ pub fn serialize_hybrid_snapshot(
     // declare its own head count independent of regular full-attn).
     if cfg.has_mtp {
         let mtp = snapshot.mtp.as_ref().expect("mtp present per cfg + assert above");
+        // ADR-027 sub-sub-iter 23a-α: Optional MTP K/V — codec rejects
+        // None today (iter-23d will extend with kv_present byte).
+        // serializer-side `expect` is load-bearing: production path
+        // (iter-22 LANDED) always populates Some; failing here means
+        // a bug in iter-23c+ alloc that emitted None without updating
+        // the codec.
+        let mtp_k = mtp
+            .k
+            .as_ref()
+            .expect("QH35 serialize: mtp.k is None (iter-23a-α producers always Some — see codec extension iter-23d)");
+        let mtp_v = mtp
+            .v
+            .as_ref()
+            .expect("QH35 serialize: mtp.v is None (iter-23a-α producers always Some — see codec extension iter-23d)");
         ensure!(
-            mtp.k.shape().len() == 4,
+            mtp_k.shape().len() == 4,
             "QH35 serialize: mtp.k shape rank {} != 4",
-            mtp.k.shape().len()
+            mtp_k.shape().len()
         );
         let mk_shape: [u64; 4] = [
-            mtp.k.shape()[0] as u64,
-            mtp.k.shape()[1] as u64,
-            mtp.k.shape()[2] as u64,
-            mtp.k.shape()[3] as u64,
+            mtp_k.shape()[0] as u64,
+            mtp_k.shape()[1] as u64,
+            mtp_k.shape()[2] as u64,
+            mtp_k.shape()[3] as u64,
         ];
         ensure!(
             mk_shape == cfg.mtp_shape,
@@ -604,10 +618,10 @@ pub fn serialize_hybrid_snapshot(
             cfg.mtp_shape
         );
         let mv_shape: [u64; 4] = [
-            mtp.v.shape()[0] as u64,
-            mtp.v.shape()[1] as u64,
-            mtp.v.shape()[2] as u64,
-            mtp.v.shape()[3] as u64,
+            mtp_v.shape()[0] as u64,
+            mtp_v.shape()[1] as u64,
+            mtp_v.shape()[2] as u64,
+            mtp_v.shape()[3] as u64,
         ];
         ensure!(
             mv_shape == cfg.mtp_shape,
@@ -621,12 +635,10 @@ pub fn serialize_hybrid_snapshot(
             mtp.current_len.len(),
             cfg.n_seqs
         );
-        let mk_bytes: &[u8] = mtp
-            .k
+        let mk_bytes: &[u8] = mtp_k
             .as_slice::<u8>()
             .map_err(|e| anyhow!("QH35 serialize: mtp.k as_slice: {e}"))?;
-        let mv_bytes: &[u8] = mtp
-            .v
+        let mv_bytes: &[u8] = mtp_v
             .as_slice::<u8>()
             .map_err(|e| anyhow!("QH35 serialize: mtp.v as_slice: {e}"))?;
         for &dim in &mk_shape {
@@ -910,8 +922,11 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
             dst.copy_from_slice(mv_src);
         }
         Some(MtpKvSnapshot {
-            k: mk_buf,
-            v: mv_buf,
+            // ADR-027 sub-sub-iter 23a-α: Optional MTP K/V — codec
+            // emits Some today (iter-23d will branch on a kv_present
+            // byte to support None for TQ-only mode).
+            k: Some(mk_buf),
+            v: Some(mv_buf),
             current_len: mtp_current_len,
         })
     } else {
@@ -1472,8 +1487,9 @@ mod tests {
             }
             let current_len: Vec<u32> = (0..cfg.n_seqs).map(|s| 99 + s).collect();
             snap.mtp = Some(MtpKvSnapshot {
-                k,
-                v,
+                // ADR-027 sub-sub-iter 23a-α: test fixture wraps in Some.
+                k: Some(k),
+                v: Some(v),
                 current_len,
             });
         }
@@ -1500,11 +1516,13 @@ mod tests {
         assert!(restored.mtp.is_some());
         let r_mtp = restored.mtp.as_ref().unwrap();
         let s_mtp = snap.mtp.as_ref().unwrap();
-        let r_k = r_mtp.k.as_slice::<u8>().expect("rk slice");
-        let s_k = s_mtp.k.as_slice::<u8>().expect("sk slice");
+        // ADR-027 sub-sub-iter 23a-α: Optional MTP K/V — codec round-trip
+        // produces Some today (iter-23d adds None support).
+        let r_k = r_mtp.k.as_ref().expect("r_mtp.k some").as_slice::<u8>().expect("rk slice");
+        let s_k = s_mtp.k.as_ref().expect("s_mtp.k some").as_slice::<u8>().expect("sk slice");
         assert_eq!(r_k, s_k);
-        let r_v = r_mtp.v.as_slice::<u8>().expect("rv slice");
-        let s_v = s_mtp.v.as_slice::<u8>().expect("sv slice");
+        let r_v = r_mtp.v.as_ref().expect("r_mtp.v some").as_slice::<u8>().expect("rv slice");
+        let s_v = s_mtp.v.as_ref().expect("s_mtp.v some").as_slice::<u8>().expect("sv slice");
         assert_eq!(r_v, s_v);
         assert_eq!(r_mtp.current_len, s_mtp.current_len);
     }
