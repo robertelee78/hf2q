@@ -1995,6 +1995,153 @@ pub fn train_one_linear_dwq_step(
     Ok(loss_scalar)
 }
 
+/// ADR-020 AC#7 Option A — run ONE Adam step on a 2-Linear chain
+/// where BOTH Linears have trainable affine s/b.
+///
+/// Proves cross-Linear gradient routing: a perturbation on W1
+/// (upstream Linear) must descend via gradients flowing through
+/// W2's qdq forward.  Smallest case where the cross-Linear
+/// dependency structure of a real model can be tested without the
+/// full transformer infrastructure.
+///
+/// Forward chain (x → W1 → W2 → logits):
+/// ```text
+///   layer1 = x @ qdq(s1, b1, q_int1)^T      # [N, n1]
+///   logits = layer1 @ qdq(s2, b2, q_int2)^T # [N, n2]   (n2 = vocab)
+///   gather + KL vs teacher_topk             # → loss
+///   backward → grads on s1, b1, s2, b2
+/// ```
+///
+/// Pre-conditions (caller's responsibility):
+/// - register_affine_pair(adam, …, tensor_id1, pack1) called
+/// - register_affine_pair(adam, …, tensor_id2, pack2) called
+/// - pack1.k == x_batch's k dimension
+/// - pack1.n == pack2.k (interior shape match: layer 1's output is
+///   layer 2's input)
+/// - pack2.n == vocab
+///
+/// Returns the scalar loss for this step.
+pub fn train_two_linear_dwq_step(
+    adam: &mut crate::calibrate::adam::AdamOptimizer,
+    device: &MlxDevice,
+    tensor_id1: &str,
+    pack1: &DwqQuantPack,
+    tensor_id2: &str,
+    pack2: &DwqQuantPack,
+    x_batch: &[f32],
+    teacher_topk_logits: &[f32],
+    teacher_indices: &[u32],
+    n_rows: usize,
+    top_k: usize,
+    temperature: f32,
+) -> Result<f32> {
+    use crate::calibrate::autograd_gpu_tape::{
+        backward, matmul, ones_like, qdq_affine, transpose, view, GpuTape, GpuTensor,
+    };
+
+    if !temperature.is_finite() || temperature <= 0.0 {
+        return Err(anyhow!(
+            "train_two_linear_dwq_step: temperature must be finite and > 0; got {temperature}"
+        ));
+    }
+    if pack1.n != pack2.k {
+        return Err(anyhow!(
+            "train_two_linear_dwq_step: pack1.n ({}) must equal pack2.k ({}) — \
+             layer 1's output dim must match layer 2's input dim",
+            pack1.n,
+            pack2.k
+        ));
+    }
+    if top_k == 0 || top_k > pack2.n {
+        return Err(anyhow!(
+            "train_two_linear_dwq_step: top_k ({top_k}) must be in (0, vocab=pack2.n={}]",
+            pack2.n
+        ));
+    }
+    if x_batch.len() != n_rows * pack1.k {
+        return Err(anyhow!(
+            "train_two_linear_dwq_step: x_batch.len ({}) != n_rows * pack1.k ({})",
+            x_batch.len(),
+            n_rows * pack1.k
+        ));
+    }
+    if teacher_topk_logits.len() != n_rows * top_k
+        || teacher_indices.len() != n_rows * top_k
+    {
+        return Err(anyhow!(
+            "train_two_linear_dwq_step: teacher arrays must be length n_rows * top_k = {}",
+            n_rows * top_k
+        ));
+    }
+
+    let s1_name = affine_param_name(tensor_id1, AffineParamKind::Scale);
+    let b1_name = affine_param_name(tensor_id1, AffineParamKind::Bias);
+    let s2_name = affine_param_name(tensor_id2, AffineParamKind::Scale);
+    let b2_name = affine_param_name(tensor_id2, AffineParamKind::Bias);
+    let s1_v = adam.read_param(&s1_name).context("read s1")?;
+    let b1_v = adam.read_param(&b1_name).context("read b1")?;
+    let s2_v = adam.read_param(&s2_name).context("read s2")?;
+    let b2_v = adam.read_param(&b2_name).context("read b2")?;
+    let n_groups1 = (pack1.n * pack1.k) / pack1.group_size;
+    let n_groups2 = (pack2.n * pack2.k) / pack2.group_size;
+    if s1_v.len() != n_groups1 || b1_v.len() != n_groups1 {
+        return Err(anyhow!(
+            "train_two_linear_dwq_step: s1/b1.len != n_groups1 ({n_groups1})"
+        ));
+    }
+    if s2_v.len() != n_groups2 || b2_v.len() != n_groups2 {
+        return Err(anyhow!(
+            "train_two_linear_dwq_step: s2/b2.len != n_groups2 ({n_groups2})"
+        ));
+    }
+
+    let tape = GpuTape::new(device.clone());
+    let s1_t = GpuTensor::from_vec(&tape, &s1_v, vec![n_groups1]).context("s1 leaf")?;
+    let b1_t = GpuTensor::from_vec(&tape, &b1_v, vec![n_groups1]).context("b1 leaf")?;
+    let s2_t = GpuTensor::from_vec(&tape, &s2_v, vec![n_groups2]).context("s2 leaf")?;
+    let b2_t = GpuTensor::from_vec(&tape, &b2_v, vec![n_groups2]).context("b2 leaf")?;
+    let x_t = GpuTensor::from_vec(&tape, x_batch, vec![n_rows, pack1.k]).context("x leaf")?;
+    let t_topk = GpuTensor::from_vec(&tape, teacher_topk_logits, vec![n_rows, top_k])
+        .context("teacher_topk leaf")?;
+
+    // Layer 1: layer1 = x @ qdq(s1, b1)^T
+    let w1_qdq = qdq_affine(&s1_t, &b1_t, &pack1.q_int_bytes, pack1.group_size)
+        .context("qdq W1")?;
+    let w1_2d = view(&w1_qdq, vec![pack1.n, pack1.k]).context("view W1")?;
+    let w1_t_2d = transpose(&w1_2d).context("transpose W1")?;
+    let layer1 = matmul(&x_t, &w1_t_2d).context("matmul layer1")?;
+
+    // Layer 2: logits = layer1 @ qdq(s2, b2)^T
+    let w2_qdq = qdq_affine(&s2_t, &b2_t, &pack2.q_int_bytes, pack2.group_size)
+        .context("qdq W2")?;
+    let w2_2d = view(&w2_qdq, vec![pack2.n, pack2.k]).context("view W2")?;
+    let w2_t_2d = transpose(&w2_2d).context("transpose W2")?;
+    let logits = matmul(&layer1, &w2_t_2d).context("matmul logits")?;
+
+    // Gather student top-K + KL.
+    let idx_buf =
+        build_topk_indices_buffer(device, teacher_indices, n_rows, top_k).context("idx_buf")?;
+    let s_topk = gather_student_topk_via_tape(&logits, idx_buf, top_k).context("gather")?;
+    let loss = kl_loss_topk_via_tape(&s_topk, &t_topk, temperature).context("kl")?;
+    let loss_v = loss.to_vec().context("loss readback")?;
+    let loss_scalar = loss_v[0];
+
+    let dy = ones_like(&tape, loss.shape()).context("dy")?;
+    let grads = backward(&loss, dy).context("backward")?;
+    let map = collect_grads_for_adam(
+        &grads,
+        &[
+            (s1_name.as_str(), &s1_t),
+            (b1_name.as_str(), &b1_t),
+            (s2_name.as_str(), &s2_t),
+            (b2_name.as_str(), &b2_t),
+        ],
+    )
+    .context("collect grads")?;
+    adam.step(&map).context("adam.step")?;
+    Ok(loss_scalar)
+}
+
 /// ADR-020 AC#7 Option A — variant of [`train_one_linear_dwq_step`]
 /// that takes FULL-vocab teacher logits + does the per-row top-K
 /// selection internally via [`pick_top_k_per_position`].
@@ -5105,6 +5252,227 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — `train_two_linear_dwq_step` happy
+    /// path: 4 params register, both pairs change after one step,
+    /// loss is finite.
+    #[test]
+    fn train_two_linear_dwq_step_changes_both_layer_params() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let n1 = 32; // hidden dim
+        let k1 = 32; // input dim of layer 1
+        let n2 = 32; // vocab
+        let group_size = 8;
+        let n_rows = 32;
+        let top_k = 4;
+
+        let w1: Vec<f32> = (0..n1 * k1).map(|i| ((i as f32) * 0.013 - 0.4).sin() * 1.5).collect();
+        let w2: Vec<f32> = (0..n2 * n1).map(|i| ((i as f32) * 0.017 + 0.2).cos() * 1.2).collect();
+        let pack1 = super::quant_pack_for_dwq(&device, &w1, n1, k1, 4, group_size).unwrap();
+        let pack2 = super::quant_pack_for_dwq(&device, &w2, n2, n1, 4, group_size).unwrap();
+
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-3,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .unwrap();
+        super::register_affine_pair(&mut adam, &device, "L1", &pack1.scales, &pack1.biases)
+            .unwrap();
+        super::register_affine_pair(&mut adam, &device, "L2", &pack2.scales, &pack2.biases)
+            .unwrap();
+        assert_eq!(adam.n_params(), 4);
+
+        let s1_before = adam.read_param("L1.scales").unwrap();
+        let b1_before = adam.read_param("L1.biases").unwrap();
+        let s2_before = adam.read_param("L2.scales").unwrap();
+        let b2_before = adam.read_param("L2.biases").unwrap();
+
+        let x_batch: Vec<f32> = (0..n_rows * k1).map(|i| ((i as f32) * 0.07).cos() * 0.6).collect();
+        let teacher_topk: Vec<f32> = (0..n_rows * top_k).map(|i| (i as f32 * 0.31).sin() * 3.0).collect();
+        let teacher_idx: Vec<u32> = (0..n_rows)
+            .flat_map(|r| (0..top_k).map(move |kk| ((kk * 3 + r) % n2) as u32))
+            .collect();
+
+        let loss = super::train_two_linear_dwq_step(
+            &mut adam, &device,
+            "L1", &pack1, "L2", &pack2,
+            &x_batch, &teacher_topk, &teacher_idx,
+            n_rows, top_k, 2.0,
+        )
+        .expect("step");
+        assert!(loss.is_finite(), "loss must be finite; got {loss}");
+        assert_eq!(adam.step_count(), 1);
+
+        let s1_after = adam.read_param("L1.scales").unwrap();
+        let b1_after = adam.read_param("L1.biases").unwrap();
+        let s2_after = adam.read_param("L2.scales").unwrap();
+        let b2_after = adam.read_param("L2.biases").unwrap();
+
+        let dist = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).sum()
+        };
+        let d1_s = dist(&s1_before, &s1_after);
+        let d1_b = dist(&b1_before, &b1_after);
+        let d2_s = dist(&s2_before, &s2_after);
+        let d2_b = dist(&b2_before, &b2_after);
+        // Both layers must receive non-zero gradients — proves
+        // cross-Linear gradient routing through W2 → layer1 → W1.
+        assert!(d1_s + d1_b > 0.0, "L1 params must change; sum={d1_s}+{d1_b}=0");
+        assert!(d2_s + d2_b > 0.0, "L2 params must change; sum={d2_s}+{d2_b}=0");
+    }
+
+    /// ADR-020 AC#7 Option A — cross-Linear gradient routing under
+    /// Adam: perturb b on the UPSTREAM Linear (W1) only, leave W2
+    /// at optimum, pin teacher targets to the optimum, run K steps.
+    /// W1's perturbed b must descend toward optimum because the
+    /// gradient flows via backprop THROUGH W2's qdq forward.  This
+    /// is the foundational test for multi-Linear training.
+    #[test]
+    fn train_two_linear_dwq_step_w1_converges_via_backprop_through_w2() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use crate::calibrate::autograd_gpu_tape::{
+            matmul, qdq_affine, transpose, view, GpuTape, GpuTensor,
+        };
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let n1 = 32;
+        let k1 = 32;
+        let n2 = 32;
+        let group_size = 8;
+        let n_rows = 32;
+        let top_k = 4;
+
+        let w1: Vec<f32> = (0..n1 * k1).map(|i| ((i as f32) * 0.013 - 0.4).sin() * 1.5).collect();
+        let w2: Vec<f32> = (0..n2 * n1).map(|i| ((i as f32) * 0.017 + 0.2).cos() * 1.2).collect();
+        let pack1 = super::quant_pack_for_dwq(&device, &w1, n1, k1, 4, group_size).unwrap();
+        let pack2 = super::quant_pack_for_dwq(&device, &w2, n2, n1, 4, group_size).unwrap();
+
+        let x_batch: Vec<f32> = (0..n_rows * k1).map(|i| ((i as f32) * 0.05 - 0.1).cos() * 0.5).collect();
+
+        // Compute teacher_logits at the optimum for BOTH layers.
+        let teacher_logits_at_opt: Vec<f32> = {
+            let tape = GpuTape::new(device.clone());
+            let s1_t = GpuTensor::from_vec(&tape, &pack1.scales, vec![pack1.scales.len()]).unwrap();
+            let b1_t = GpuTensor::from_vec(&tape, &pack1.biases, vec![pack1.biases.len()]).unwrap();
+            let s2_t = GpuTensor::from_vec(&tape, &pack2.scales, vec![pack2.scales.len()]).unwrap();
+            let b2_t = GpuTensor::from_vec(&tape, &pack2.biases, vec![pack2.biases.len()]).unwrap();
+            let x_t = GpuTensor::from_vec(&tape, &x_batch, vec![n_rows, k1]).unwrap();
+            let w1_qdq = qdq_affine(&s1_t, &b1_t, &pack1.q_int_bytes, group_size).unwrap();
+            let w1_2d = view(&w1_qdq, vec![n1, k1]).unwrap();
+            let w1_t = transpose(&w1_2d).unwrap();
+            let layer1 = matmul(&x_t, &w1_t).unwrap();
+            let w2_qdq = qdq_affine(&s2_t, &b2_t, &pack2.q_int_bytes, group_size).unwrap();
+            let w2_2d = view(&w2_qdq, vec![n2, n1]).unwrap();
+            let w2_t = transpose(&w2_2d).unwrap();
+            let logits = matmul(&layer1, &w2_t).unwrap();
+            logits.to_vec().unwrap()
+        };
+        let (teacher_topk, teacher_idx) =
+            super::pick_top_k_per_position(&teacher_logits_at_opt, n_rows, 1, n2, top_k).unwrap();
+
+        // Perturb b1 only.
+        let b1_perturbed: Vec<f32> = pack1.biases.iter().map(|x| x + 0.5).collect();
+        let init_dist_w1: f32 = pack1.biases.iter().zip(b1_perturbed.iter()).map(|(a, c)| (a - c).abs()).sum();
+
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-3,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .unwrap();
+        super::register_affine_pair(&mut adam, &device, "L1", &pack1.scales, &b1_perturbed)
+            .unwrap();
+        super::register_affine_pair(&mut adam, &device, "L2", &pack2.scales, &pack2.biases)
+            .unwrap();
+
+        let n_steps = 40;
+        let mut losses = Vec::with_capacity(n_steps);
+        for _ in 0..n_steps {
+            let l = super::train_two_linear_dwq_step(
+                &mut adam, &device,
+                "L1", &pack1, "L2", &pack2,
+                &x_batch, &teacher_topk, &teacher_idx,
+                n_rows, top_k, 2.0,
+            )
+            .unwrap();
+            losses.push(l);
+        }
+
+        let avg = |s: &[f32]| s.iter().sum::<f32>() / s.len() as f32;
+        let head = avg(&losses[..5]);
+        let tail = avg(&losses[n_steps - 5..]);
+        assert!(head > 0.0, "head loss must be > 0; got {head}");
+        assert!(
+            tail < 0.8 * head,
+            "tail loss avg ({tail}) must be < 80% of head loss avg ({head}); \
+             losses={losses:?}"
+        );
+
+        // W1's perturbed b1 has descended toward optimum.
+        let (_s1_trained, b1_trained) = super::read_affine_pair(&adam, "L1").unwrap();
+        let trained_dist_w1: f32 = pack1.biases.iter().zip(b1_trained.iter()).map(|(a, c)| (a - c).abs()).sum();
+        assert!(
+            trained_dist_w1 < init_dist_w1,
+            "W1 b distance-to-opt: trained={trained_dist_w1} init={init_dist_w1} \
+             — gradient flowing THROUGH W2's qdq forward must descend W1 toward optimum"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — interior-shape mismatch (pack1.n !=
+    /// pack2.k) fails loud BEFORE any GPU work.
+    #[test]
+    fn train_two_linear_dwq_step_rejects_interior_shape_mismatch() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let pack1 = super::quant_pack_for_dwq(&device, &vec![0.0; 32 * 32], 32, 32, 4, 8).unwrap();
+        // pack2.k = 64 (mismatch with pack1.n = 32)
+        let pack2 = super::quant_pack_for_dwq(&device, &vec![0.0; 32 * 64], 32, 64, 4, 8).unwrap();
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-3,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .unwrap();
+        super::register_affine_pair(&mut adam, &device, "L1", &pack1.scales, &pack1.biases)
+            .unwrap();
+        super::register_affine_pair(&mut adam, &device, "L2", &pack2.scales, &pack2.biases)
+            .unwrap();
+
+        let res = super::train_two_linear_dwq_step(
+            &mut adam, &device,
+            "L1", &pack1, "L2", &pack2,
+            &vec![0.0; 32 * 32], &vec![0.0; 32 * 4], &vec![0u32; 32 * 4],
+            32, 4, 1.0,
+        );
+        let err = match res {
+            Ok(_) => panic!("expected interior-shape error"),
+            Err(e) => e,
+        };
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("pack1.n (32)") && msg.contains("pack2.k (64)"),
+            "got: {msg}"
+        );
     }
 
     /// ADR-020 AC#7 Option A — END-TO-END INTEGRATION on the
