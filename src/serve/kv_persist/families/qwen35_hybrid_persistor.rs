@@ -58,7 +58,7 @@ use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::{DType, MlxBuffer, MlxDevice};
 
 use crate::inference::models::qwen35::kv_cache::{
-    HybridKvCacheSnapshot, MtpKvSnapshot,
+    HybridKvCache, HybridKvCacheSnapshot, MtpKvSnapshot,
 };
 
 /// Magic bytes prefixing every QH35 (Qwen3.5 Hybrid) envelope. ASCII for
@@ -284,6 +284,114 @@ fn read_bytes<'a>(buf: &'a [u8], cursor: &mut usize, n: usize) -> Result<&'a [u8
     );
     *cursor = end;
     Ok(&buf[pos..end])
+}
+
+/// Derive a `Qwen35HybridConfig` from a live `HybridKvCache`. The cache
+/// is the runtime authority on shape (`HybridKvCache::new(cfg, dev,
+/// max_seq_len, n_seqs)` at kv_cache.rs:347+ allocates per-prefill
+/// from the input config + runtime params); reading the actually-
+/// allocated buffers gives the QH35 envelope writer the exact dims to
+/// stamp.
+///
+/// `codec` is the operator's choice of full-attn codec for THIS
+/// snapshot — iter-6b.2 always passes `FullAttnCodec::F32Dense`;
+/// Phase B iter-11 introduces `TqV2`.
+///
+/// Errors: empty full_attn AND empty mtp (degenerate cache shape;
+/// indicates the model has no full-attention layers + no MTP, which
+/// cannot happen for any in-tree qwen35 / qwen35moe variant).
+pub fn cfg_from_cache(
+    cache: &HybridKvCache,
+    codec: FullAttnCodec,
+) -> Result<Qwen35HybridConfig> {
+    let n_full_attn = cache.full_attn.len() as u32;
+    let n_linear_attn = cache.linear_attn.len() as u32;
+    let has_mtp = cache.mtp_slot.is_some();
+    let n_seqs = cache.n_seqs;
+
+    // full_attn_shape: prefer a real full_attn slot; fall back to mtp
+    // (same rank/role) when full_attn is empty.
+    let full_attn_shape: [u64; 4] = if let Some(slot) = cache.full_attn.first() {
+        let s = slot.k.shape();
+        ensure!(
+            s.len() == 4,
+            "cfg_from_cache: full_attn[0].k shape rank {} != 4",
+            s.len()
+        );
+        [s[0] as u64, s[1] as u64, s[2] as u64, s[3] as u64]
+    } else if let Some(slot) = cache.mtp_slot.as_ref() {
+        let s = slot.k.shape();
+        ensure!(
+            s.len() == 4,
+            "cfg_from_cache: mtp_slot.k shape rank {} != 4",
+            s.len()
+        );
+        [s[0] as u64, s[1] as u64, s[2] as u64, s[3] as u64]
+    } else {
+        return Err(anyhow!(
+            "cfg_from_cache: cache has no full_attn slots AND no mtp_slot \
+             (impossible for any in-tree qwen35 model)"
+        ));
+    };
+
+    // MTP shape: prefer mtp_slot; otherwise use full_attn_shape (same
+    // rank/role; ignored at write/read time when has_mtp = false).
+    let mtp_shape: [u64; 4] = if let Some(slot) = cache.mtp_slot.as_ref() {
+        let s = slot.k.shape();
+        ensure!(
+            s.len() == 4,
+            "cfg_from_cache: mtp_slot.k shape rank {} != 4",
+            s.len()
+        );
+        [s[0] as u64, s[1] as u64, s[2] as u64, s[3] as u64]
+    } else {
+        full_attn_shape
+    };
+
+    // linear_conv_shape / linear_recurrent_shape: prefer first real
+    // slot; fall back to small-but-valid sentinel shapes when no
+    // linear-attn layers exist (the field is ignored at serialize
+    // time when n_linear_attn == 0; sentinel keeps assert_matches
+    // stable across runs).
+    let (linear_conv_shape, linear_recurrent_shape) = if let Some(slot) =
+        cache.linear_attn.first()
+    {
+        let cs = slot.conv_state.shape();
+        ensure!(
+            cs.len() == 3,
+            "cfg_from_cache: linear_attn[0].conv_state shape rank {} != 3",
+            cs.len()
+        );
+        let rs = slot.recurrent.shape();
+        ensure!(
+            rs.len() == 4,
+            "cfg_from_cache: linear_attn[0].recurrent shape rank {} != 4",
+            rs.len()
+        );
+        (
+            [cs[0] as u64, cs[1] as u64, cs[2] as u64],
+            [rs[0] as u64, rs[1] as u64, rs[2] as u64, rs[3] as u64],
+        )
+    } else {
+        // Sentinel: the values are unused when n_linear_attn = 0; the
+        // assert_matches comparison still requires equality between
+        // serialize-time and deserialize-time cfgs, so the sentinel
+        // must be deterministic. All-zeros chosen to be obviously
+        // sentinel-shaped in any debug log.
+        ([0, 0, 0], [0, 0, 0, 0])
+    };
+
+    Ok(Qwen35HybridConfig {
+        n_full_attn,
+        n_linear_attn,
+        has_mtp,
+        n_seqs,
+        full_attn_shape,
+        full_attn_codec: codec,
+        linear_conv_shape,
+        linear_recurrent_shape,
+        mtp_shape,
+    })
 }
 
 // ---------------------------------------------------------------------------

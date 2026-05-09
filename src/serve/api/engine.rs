@@ -1813,6 +1813,16 @@ pub struct LoadOptions {
     /// Only the dense families (Gemma 4) consume this in Iter D; the
     /// qwen35moe path will gain DWQ-overlay support in Iter C2.
     pub dwq_overlay_path: Option<PathBuf>,
+
+    /// ADR-027 Phase A iter-6b.2 — root directory for cold-process LCP
+    /// resume on the qwen35 family. When `Some`, `Qwen35LoadedModel::load`
+    /// constructs a `Qwen35DiskPersistor` rooted here; the lcp_registry
+    /// store call sites write through to disk on insert (per-cfg
+    /// fingerprint subdirs); the first prefill of any new cfg lazily
+    /// hydrates pre-existing snapshots into the in-memory registry.
+    /// Sourced from `HF2Q_KV_PERSIST` env at cmd_serve / cmd_generate
+    /// startup; `None` keeps the legacy in-process-only behavior.
+    pub kv_persist_dir: Option<PathBuf>,
 }
 
 impl LoadedModel {
@@ -9158,6 +9168,7 @@ assistant:
             lcp_registry:
                 crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
             kv_metrics_sink: None,
+            disk_persistor: None,
         };
         let qwen = LoadedModel::Qwen35(qwen_loaded);
 

@@ -781,6 +781,13 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         // cmd_generate path: no DWQ overlay surface yet (cli::GenerateArgs
         // doesn't carry --dwq-overlay; only ServeArgs does).
         dwq_overlay_path: None,
+        // ADR-027 Phase A iter-6b.2: cmd_generate(_qwen35) honors
+        // HF2Q_KV_PERSIST so qwen35 cold-process LCP resume works on the
+        // CLI. Empty / unset env → None → in-process-only.
+        kv_persist_dir: std::env::var("HF2Q_KV_PERSIST")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from),
     };
     let load_start = std::time::Instant::now();
     let loaded = api::engine::GemmaLoadedModel::load(&load_opts)
@@ -2235,6 +2242,13 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         // cmd_generate path: no DWQ overlay surface yet (cli::GenerateArgs
         // doesn't carry --dwq-overlay; only ServeArgs does).
         dwq_overlay_path: None,
+        // ADR-027 Phase A iter-6b.2: cmd_generate(_qwen35) honors
+        // HF2Q_KV_PERSIST so qwen35 cold-process LCP resume works on the
+        // CLI. Empty / unset env → None → in-process-only.
+        kv_persist_dir: std::env::var("HF2Q_KV_PERSIST")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from),
     };
     let load_start = std::time::Instant::now();
     let loaded = Qwen35LoadedModel::load(&load_opts).context("Qwen35LoadedModel::load")?;
@@ -2885,6 +2899,11 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
         // ADR-020 AC#5 Iter D — propagated from `cmd_serve`'s
         // `args.dwq_overlay` via `multi_model::EngineConfig`.
         dwq_overlay_path: config.dwq_overlay_path.clone(),
+        // ADR-027 Phase A iter-6b.2: cmd_serve honors HF2Q_KV_PERSIST.
+        kv_persist_dir: std::env::var("HF2Q_KV_PERSIST")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from),
     };
     let mut loaded = api::engine::LoadedModel::load(&load_opts)?;
     // ADR-017 Phase E.a iter-2: thread the metrics sink onto the

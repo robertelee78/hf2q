@@ -34,7 +34,6 @@
 //!   live inference lands).
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -134,6 +133,21 @@ pub struct Qwen35LoadedModel {
     /// is constructed standalone (test paths).
     pub kv_metrics_sink:
         Option<std::sync::Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>>,
+
+    /// ADR-027 Phase A iter-6b.2 — disk back-end for cold-process LCP
+    /// resume. `Some` iff `LoadOptions.kv_persist_dir` was set
+    /// (sourced from `HF2Q_KV_PERSIST` env). When present,
+    /// `store_lcp_with_disk_writeback` writes through to disk on every
+    /// successful `lcp_registry.store`, ensuring snapshots persist
+    /// across process crashes / restarts. `None` keeps the legacy
+    /// in-process-only behavior (no I/O cost).
+    ///
+    /// Iter-6b.3 (separate commit) wires automatic re-insertion of
+    /// disk snapshots into the in-memory registry on cold start;
+    /// iter-6b.2 ships write-only durability.
+    pub disk_persistor: Option<std::sync::Arc<
+        crate::serve::kv_persist::families::qwen35_disk_persistor::Qwen35DiskPersistor,
+    >>,
 }
 
 impl Qwen35LoadedModel {
@@ -346,8 +360,120 @@ impl Qwen35LoadedModel {
             // Wired by AppState via LoadedModel::generate at request
             // time; None by default.
             kv_metrics_sink: None,
+            // ADR-027 Phase A iter-6b.2: construct disk persistor when
+            // HF2Q_KV_PERSIST is set. Failure to mkdir → log + None
+            // (graceful fallback to in-process-only; do NOT bail engine
+            // load on persistence-layer failure — degrades to legacy
+            // behavior, doesn't break inference).
+            disk_persistor: opts.kv_persist_dir.as_ref().and_then(|cache_dir| {
+                match crate::serve::kv_persist::families::qwen35_disk_persistor::Qwen35DiskPersistor::new(cache_dir.clone()) {
+                    Ok(p) => {
+                        tracing::info!(
+                            cache_dir = %cache_dir.display(),
+                            "ADR-027 iter-6b.2: Qwen35DiskPersistor constructed; \
+                             cold-process LCP resume enabled"
+                        );
+                        Some(std::sync::Arc::new(p))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            cache_dir = %cache_dir.display(),
+                            error = %e,
+                            "ADR-027 iter-6b.2: Qwen35DiskPersistor construction failed; \
+                             falling back to in-process-only LCP"
+                        );
+                        None
+                    }
+                }
+            }),
         })
     }
+
+    /// ADR-027 Phase A iter-6b.2 — write-through helper that stores a
+    /// snapshot in the in-memory `LcpRegistry` AND, when a disk
+    /// persistor is bound, writes it through to the cfg-fingerprint
+    /// subdir on disk.
+    ///
+    /// Cfg is derived from `kv_cache` via
+    /// `qwen35_hybrid_persistor::cfg_from_cache(kv_cache,
+    /// FullAttnCodec::F32Dense)` — runtime authority on shape per
+    /// ADR-027 §4.7 iter-6a finding. Phase B iter-11 will extend this
+    /// site to thread the codec choice from Self when TQ-active mode
+    /// flips on.
+    ///
+    /// Disk write failures are logged via `tracing::warn!` but do NOT
+    /// fail the in-memory store — the runtime path stays correct;
+    /// only the cold-resume back-end loses durability for that one
+    /// snapshot. (Mantra-aligned: persistence-layer failure must
+    /// not break inference.)
+    ///
+    /// Called from the 4 existing `lcp_registry.store` sites in this
+    /// file (mid-prefill snapshot writes); replaces the bare
+    /// `lcp_registry.store(…)` calls.
+    pub fn store_lcp_with_disk_writeback(
+        &mut self,
+        kv_cache: &crate::inference::models::qwen35::kv_cache::HybridKvCache,
+        key: crate::serve::kv_persist::lcp_registry::LcpKey,
+        prompt_tokens: Vec<u32>,
+        snapshot: crate::inference::models::qwen35::kv_cache::HybridKvCacheSnapshot,
+        sliding_window: usize,
+        linear_capacity: usize,
+    ) -> Result<(), crate::serve::kv_persist::lcp_registry::LcpStoreError> {
+        // 1) Disk write-through (if persistor is bound). Errors are
+        //    logged + swallowed so they don't break the in-memory path.
+        if let Some(persistor) = &self.disk_persistor {
+            match crate::serve::kv_persist::families::qwen35_hybrid_persistor::cfg_from_cache(
+                kv_cache,
+                crate::serve::kv_persist::families::qwen35_hybrid_persistor::FullAttnCodec::F32Dense,
+            ) {
+                Ok(cfg) => {
+                    let key_hex = lcp_key_to_filename_hex(&key);
+                    if let Err(e) = persistor.write(&cfg, &key_hex, &snapshot) {
+                        tracing::warn!(
+                            cache_dir = %persistor.cache_dir().display(),
+                            key_hex = %key_hex,
+                            error = %format!("{e:#}"),
+                            "ADR-027 iter-6b.2: disk persistor write failed; \
+                             in-memory store will still proceed"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        cache_dir = %persistor.cache_dir().display(),
+                        error = %format!("{e:#}"),
+                        "ADR-027 iter-6b.2: cfg_from_cache failed; disk \
+                         write-through skipped (in-memory store still proceeds)"
+                    );
+                }
+            }
+        }
+        // 2) In-memory store — exact pre-iter-6b.2 semantics.
+        self.lcp_registry.store(
+            key,
+            prompt_tokens,
+            vec![std::sync::Arc::new(snapshot)],
+            sliding_window,
+            linear_capacity,
+        )
+    }
+
+}
+
+/// ADR-027 Phase A iter-6b.2 — derive the on-disk filename hex from a
+/// `LcpKey`. SHA-256 over the model_fingerprint + tenant_id +
+/// params_hash; first 16 bytes hex-encoded (32-char filename).
+fn lcp_key_to_filename_hex(
+    key: &crate::serve::kv_persist::lcp_registry::LcpKey,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"QH35-lcp-key-fname-v1");
+    h.update(&key.model_fingerprint.0);
+    h.update(key.tenant_id.as_bytes());
+    h.update(&key.params_hash.to_le_bytes());
+    let digest = h.finalize();
+    hex::encode(&digest[..16])
 }
 
 impl LoadInfoBuilder for Qwen35LoadedModel {
@@ -1242,10 +1368,16 @@ pub fn generate_qwen35_once(
                                 .first()
                                 .map(|s| s.recurrent.byte_len())
                                 .unwrap_or(0);
-                            if let Err(e) = qwen.lcp_registry.store(
+                            // ADR-027 iter-6b.2: route store through the
+                            // disk-write-through helper so HF2Q_KV_PERSIST
+                            // sessions persist mid-prefill snapshots.
+                            // Helper falls back to bare in-memory store
+                            // when disk_persistor is None (zero-cost).
+                            if let Err(e) = qwen.store_lcp_with_disk_writeback(
+                                &kv_cache,
                                 chunk_key,
                                 prompt_tokens[..k_end].to_vec(),
-                                vec![Arc::new(snap)],
+                                snap,
                                 0,
                                 linear_capacity,
                             ) {
@@ -1394,10 +1526,12 @@ pub fn generate_qwen35_once(
                             .first()
                             .map(|s| s.recurrent.byte_len())
                             .unwrap_or(0);
-                        if let Err(e) = qwen.lcp_registry.store(
+                        // ADR-027 iter-6b.2: write-through helper.
+                        if let Err(e) = qwen.store_lcp_with_disk_writeback(
+                            &kv_cache,
                             chunk_key,
                             prompt_tokens.to_vec(),
-                            vec![Arc::new(snap)],
+                            snap,
                             0,
                             linear_capacity,
                         ) {
@@ -2403,10 +2537,12 @@ pub fn generate_stream_qwen35_once_extended(
                             .first()
                             .map(|s| s.recurrent.byte_len())
                             .unwrap_or(0);
-                        if let Err(e) = qwen.lcp_registry.store(
+                        // ADR-027 iter-6b.2: write-through helper.
+                        if let Err(e) = qwen.store_lcp_with_disk_writeback(
+                            &kv_cache,
                             chunk_key,
                             prompt_tokens[..k_end].to_vec(),
-                            vec![Arc::new(snap)],
+                            snap,
                             0,
                             linear_capacity,
                         ) {
@@ -2510,10 +2646,12 @@ pub fn generate_stream_qwen35_once_extended(
                             .unwrap_or(0);
                         // Codex Phase-2b 2026-05-06: surface store errors
                         // instead of `let _ = ...`. Mantra: no fallback.
-                        if let Err(e) = qwen.lcp_registry.store(
+                        // ADR-027 iter-6b.2: write-through helper.
+                        if let Err(e) = qwen.store_lcp_with_disk_writeback(
+                            &kv_cache,
                             chunk_key,
                             prompt_tokens.to_vec(),
-                            vec![Arc::new(snap)],
+                            snap,
                             0,
                             linear_capacity,
                         ) {
@@ -3265,6 +3403,7 @@ mod tests {
             tokenizer_path: None,
             config_path: None,
             dwq_overlay_path: None,
+            kv_persist_dir: None,
         };
         let res = Qwen35LoadedModel::load(&opts);
         assert!(res.is_err());

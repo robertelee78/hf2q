@@ -1340,6 +1340,7 @@ mod tests {
             lcp_registry:
                 crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
             kv_metrics_sink: None,
+            disk_persistor: None,
         };
         let info = loaded.build_load_info(
             &gguf,
