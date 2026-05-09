@@ -2321,4 +2321,47 @@ impl MlxModelWeights {
 
         Ok(first_token)
     }
+
+    /// ADR-028 iter-134 Path A Phase 2 GPU — forward_decode_verify_batched scaffold.
+    ///
+    /// Speculative-decode verify: forward `tokens` through the model in a
+    /// single batched pass (vs Shape S iter-123's K serial forward_decode
+    /// calls). Returns one argmax per input token.
+    ///
+    /// **Shape B contract** (vs Shape S serial):
+    /// - Single GraphSession encloses all K+1 token forwards (1
+    ///   commit_and_wait, not K+1).
+    /// - Append-mode KV: positions written are `[start_seq_pos,
+    ///   start_seq_pos + tokens.len())`.
+    /// - Per-position argmax: emits argmax at each token position, not
+    ///   just last.
+    ///
+    /// At greedy temperature, output for a fixed prefix is byte-identical
+    /// to calling `forward_decode` K+1 times serially (same numerics,
+    /// just batched dispatch). This is the speedup Path A delivers.
+    ///
+    /// # Implementation status
+    ///
+    /// **iter-134**: scaffold only — returns
+    /// `Err(NotYetImplemented)`. Subsequent iter-135+ will fill in:
+    /// 1. Append-mode initialization (replace `kv_caches[i].write_pos =
+    ///    seq_len` at line 1823 with `+= tokens.len()`).
+    /// 2. Per-position LM head + argmax loop (replace last-row-only
+    ///    emission at line 1966+ with a loop over each output position).
+    /// 3. Output buffer for K+1 argmaxes.
+    /// 4. Integration test: byte-identity vs K+1 serial forward_decode.
+    pub fn forward_decode_verify_batched(
+        &mut self,
+        _tokens: &[u32],
+        _start_seq_pos: usize,
+        _gpu: &mut GpuContext,
+    ) -> Result<Vec<u32>> {
+        anyhow::bail!(
+            "forward_decode_verify_batched: ADR-028 iter-134 scaffold only — \
+             implementation lands in iter-135+ once append-mode + per-position \
+             argmax wiring is approved by operator. Use \
+             forward_decode_verify_serial (iter-123 Shape S) for correctness \
+             gates in the meantime."
+        )
+    }
 }
