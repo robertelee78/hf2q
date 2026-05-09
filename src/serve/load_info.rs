@@ -299,11 +299,17 @@ pub struct LoadInfo {
     /// ADR-027 Phase B iter-17 — `true` iff this load will allocate
     /// TQ-active full-attn KV buffers (sourced from `HF2Q_TQ_KV` env
     /// at engine load via `is_tq_active_mode()`). When `true`, every
-    /// per-prefill cache allocates TQ-encoded buffers alongside F32
-    /// K/V (shadow-cache mode); the decode SDPA dispatch routes
-    /// through `flash_attn_vec_tq_hb`. iter-16 validated coherence on
-    /// real qwen36 35B-A3B-APEX-Q5_K_M (output BYTE-IDENTICAL to F32
-    /// baseline at 128 vs 128 tok/s).
+    /// per-prefill cache allocates ONLY the TQ-encoded buffers
+    /// (`k_packed`/`k_norms`/`v_packed`/`v_norms` per full-attn slot);
+    /// the F32 K/V backing is DROPPED at alloc time per iter-34
+    /// (sub-iter 23c-β.5) for the **3.94× per-slot KV memory savings**
+    /// vs the F32-only baseline. The decode SDPA dispatch routes
+    /// through `flash_attn_vec_tq_hb`; the prefill resume SDPA dequants
+    /// slot.tq → temp F32 (unrotated) and dispatches the same dense
+    /// resume kernel via `apply_flash_attn_prefill_seq_major_resume_via_tq_cache`
+    /// (iter-33). iter-16 validated coherence on real qwen36
+    /// 35B-A3B-APEX-Q5_K_M (output BYTE-IDENTICAL to F32 baseline at
+    /// ~128 tok/s); iter-43 extended byte-identity to 32K context.
     ///
     /// Currently surfaced only for `Qwen35` family; Gemma's TQ-on
     /// state is reflected in `kv_spill_active` via the
@@ -545,12 +551,15 @@ pub fn print_banner<W: std::io::Write>(
     // ADR-027 Phase B iter-17 — surface TQ-on state to operators so
     // HF2Q_TQ_KV=1 loads are visibly distinct from the F32 default at
     // load time. Format mirrors `kv_spill = {active|inactive}` for
-    // grep symmetry.
+    // grep symmetry. iter-48 (sub-iter 23e+1) extends the active
+    // string with the iter-34 memory-savings ratio so operators see
+    // the realized 3.94× savings at load time without having to
+    // consult the ADR.
     writeln!(
         w,
         "{d}hf2q load: tq_kv = {}{r}",
         if info.tq_kv_active {
-            "active (8-bit Lloyd-Max + D1 SRHT, ADR-027 Phase B)"
+            "active (8-bit Lloyd-Max + D1 SRHT, ADR-027 Phase B; F32 K/V dropped at alloc — 3.94× per-slot KV savings)"
         } else {
             "inactive"
         }
