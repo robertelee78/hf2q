@@ -80,7 +80,7 @@ echo "=== ADR-010 iter-64 batched-prefill coherence gate ==="
 echo "Model: $MODEL"
 echo
 
-echo "[1/3] Per-token prefill (reference truth)"
+echo "[1/4] Per-token prefill (reference truth)"
 PER_TOKEN_OUT=$(timeout 120 "$HF2Q" generate --model "$MODEL" --prompt-file "$PROMPT_FILE" --max-tokens 8 2>&1)
 PER_TOKEN_DECODED=$(echo "$PER_TOKEN_OUT" | extract_decoded)
 echo "  decoded: [$PER_TOKEN_DECODED]"
@@ -93,7 +93,7 @@ fi
 echo "  ✓ per-token reference OK"
 echo
 
-echo "[2/3] Batched prefill (gated HF2Q_BATCHED_PREFILL=1 + UNSAFE)"
+echo "[2/4] Batched prefill (gated HF2Q_BATCHED_PREFILL=1 + UNSAFE)"
 BATCHED_OUT=$(HF2Q_BATCHED_PREFILL=1 HF2Q_UNSAFE_EXPERIMENTS=1 \
     timeout 120 "$HF2Q" generate --model "$MODEL" --prompt-file "$PROMPT_FILE" --max-tokens 8 2>&1)
 BATCHED_DECODED=$(echo "$BATCHED_OUT" | extract_decoded)
@@ -139,11 +139,57 @@ fi
 echo "  ✓ batched coherence OK (byte-identical to per-token reference)"
 echo
 
-echo "[3/3] Verdict"
+# Iter-75 perf-sanity check: catches perf regression that wouldn't trip
+# the correctness gate. Iter-68 measured 1942 t/s at pp1024 batched on
+# gemma APEX-Q5_K_M (M5 Max, 0834dce..133722d era). A 25% drop floor of
+# 1500 t/s catches anything that regresses the iter-68 tensor mm_id win
+# (e.g., the typo coming back, dispatcher routing breaking, etc.).
+# Skip with HF2Q_GATE_SKIP_PERF=1 if running on slower hardware or under
+# thermal throttle.
+PERF_FLOOR_TOK_S="${HF2Q_GATE_PERF_FLOOR:-1500}"
+if [[ "${HF2Q_GATE_SKIP_PERF:-0}" != "1" ]]; then
+    echo "[3/4] Perf sanity at pp1024 batched (floor: ${PERF_FLOOR_TOK_S} tok/s)"
+    PERF_PROMPT_FILE=$(mktemp -t adr010-iter64-pp1024.XXXXXX)
+    trap "rm -f $PROMPT_FILE $PERF_PROMPT_FILE" EXIT
+    python3 -c "
+words=['the','quick','brown','fox','jumps','over','lazy','dog','and','runs','through','green','meadow','past','silver','river','where','the','old','willow','stands']
+n=1024
+out=[]
+i=0
+while len(' '.join(out).split())<n:
+    out.append(words[i%len(words)])
+    i+=1
+print(' '.join(out))
+" > "$PERF_PROMPT_FILE"
+    PERF_LINE=$(HF2Q_BATCHED_PREFILL=1 HF2Q_UNSAFE_EXPERIMENTS=1 \
+        timeout 180 "$HF2Q" generate --model "$MODEL" --prompt-file "$PERF_PROMPT_FILE" --max-tokens 1 2>&1 | grep "^prefill:" | head -1)
+    PERF_TOK_S=$(echo "$PERF_LINE" | grep -oE "\(([0-9]+) tok/s\)" | grep -oE "[0-9]+" | head -1)
+    echo "  measured: $PERF_LINE"
+    if [[ -z "$PERF_TOK_S" ]]; then
+        echo "  ✗ FAIL: could not parse pp1024 perf result." >&2
+        exit 3
+    fi
+    if (( PERF_TOK_S < PERF_FLOOR_TOK_S )); then
+        echo "  ✗ FAIL: $PERF_TOK_S tok/s < ${PERF_FLOOR_TOK_S} tok/s floor."
+        echo "  iter-68 tensor mm_id baseline was 1942 t/s; current measurement"
+        echo "  suggests a perf regression in the batched-prefill path."
+        echo "  Likely root causes: tensor-mm probe failure (re-check shader"
+        echo "  compile gate), dispatcher routing change, or kernel-level slowdown."
+        exit 1
+    fi
+    echo "  ✓ perf sanity OK ($PERF_TOK_S t/s ≥ ${PERF_FLOOR_TOK_S} t/s floor)"
+    echo
+else
+    echo "[3/4] Perf sanity SKIPPED (HF2Q_GATE_SKIP_PERF=1)"
+    echo
+fi
+
+echo "[4/4] Verdict"
 echo "  per-token: [$PER_TOKEN_DECODED]"
 echo "  batched:   [$BATCHED_DECODED]"
 echo
-echo "✓ PASS — batched-prefill coherence gate green at HEAD."
+echo "✓ PASS — batched-prefill coherence + perf gate green at HEAD."
 echo "  iter-64 leg_hb_encoded fix is locked in for this fixture."
-echo "  iter-74 byte-identity strict gate also passing."
+echo "  iter-74 byte-identity strict gate passing."
+echo "  iter-75 pp1024 perf-sanity floor passing."
 exit 0
