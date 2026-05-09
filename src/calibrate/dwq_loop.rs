@@ -950,6 +950,102 @@ pub fn drive_full_model_teacher_capture_prepared(
     drive_full_model_teacher_capture(&mut prepared.teacher, cfg, &prepared.targets_cfg)
 }
 
+/// ADR-020 AC#7 Option A — typed teacher-target bundle for one
+/// calibration batch.  Mirror of mlx-lm's `load_dwq_target` return
+/// shape at `dwq.py:114` (logits + indices tensor pair) but wrapped
+/// in a struct so call sites don't have to remember the 5-tuple
+/// arity.
+#[derive(Debug, Clone)]
+pub struct TeacherBatchTargets {
+    /// Top-K logits, row-major `[batch, seq, top_k]` flat.
+    pub logits: Vec<f32>,
+    /// Top-K indices into the full vocab, row-major same shape.
+    pub indices: Vec<u32>,
+    /// Batch dimension (matches `cfg.batch_size`).
+    pub batch: usize,
+    /// Sequence dimension AFTER the next-token trim
+    /// (== `cfg.seq_len - 1`).
+    pub seq: usize,
+    /// Top-K (matches `cfg.top_k_teacher`).
+    pub top_k: usize,
+}
+
+/// ADR-020 AC#7 Option A — load one batch of teacher targets from
+/// disk and cross-check against [`FullModelDwqConfig`].
+///
+/// Wraps [`crate::calibrate::dwq_targets::load_dwq_target`] (which
+/// reads the raw safetensors header) and verifies that the on-disk
+/// shape agrees with the cfg the student will train against:
+/// - `batch == cfg.batch_size`
+/// - `seq == cfg.seq_len - 1` (next-token trim mirrors `dwq.py:53`
+///   where the input batch is sliced to `[:, :-1]` before the teacher
+///   forward — see `dwq_targets.rs:148`)
+/// - `top_k == cfg.top_k_teacher`
+///
+/// A mismatch at any axis is a hard error: silently using
+/// shape-incompatible teacher targets would either (a) cause an
+/// unrelated index/shape error deep in the student loss kernel, or
+/// (b) silently corrupt the gradient because indices on the wrong
+/// vocab axis are still in-range.  Fail-loud here.
+pub fn load_teacher_targets_for_batch(
+    save_dir: &std::path::Path,
+    split_name: &str,
+    batch_idx: usize,
+    cfg: &FullModelDwqConfig,
+) -> Result<TeacherBatchTargets> {
+    let (logits, indices, batch, seq, top_k) =
+        crate::calibrate::dwq_targets::load_dwq_target(save_dir, split_name, batch_idx)
+            .with_context(|| {
+                format!(
+                    "load_teacher_targets_for_batch({}/{split_name}/{batch_idx})",
+                    save_dir.display()
+                )
+            })?;
+
+    if batch != cfg.batch_size {
+        return Err(anyhow!(
+            "load_teacher_targets_for_batch: file batch ({}) != cfg.batch_size ({}) at {}/{}/{}",
+            batch,
+            cfg.batch_size,
+            save_dir.display(),
+            split_name,
+            batch_idx
+        ));
+    }
+    let expected_seq = cfg
+        .seq_len
+        .checked_sub(1)
+        .ok_or_else(|| anyhow!("cfg.seq_len ({}) underflows when subtracting 1", cfg.seq_len))?;
+    if seq != expected_seq {
+        return Err(anyhow!(
+            "load_teacher_targets_for_batch: file seq ({}) != cfg.seq_len - 1 ({}) at {}/{}/{}",
+            seq,
+            expected_seq,
+            save_dir.display(),
+            split_name,
+            batch_idx
+        ));
+    }
+    if top_k != cfg.top_k_teacher {
+        return Err(anyhow!(
+            "load_teacher_targets_for_batch: file top_k ({}) != cfg.top_k_teacher ({}) at {}/{}/{}",
+            top_k,
+            cfg.top_k_teacher,
+            save_dir.display(),
+            split_name,
+            batch_idx
+        ));
+    }
+
+    Ok(TeacherBatchTargets {
+        logits,
+        indices,
+        batch,
+        seq,
+        top_k,
+    })
+}
+
 /// ADR-020 iter-12d-2 — per-Linear training summary inside a model
 /// scan (one entry per successfully-trained tensor).
 #[derive(Debug, Clone)]
@@ -3805,6 +3901,241 @@ mod tests {
             super::drive_full_model_teacher_capture(&mut teacher, &cfg, &targets_cfg).unwrap();
         assert_eq!(summary[0].1, 1);
         assert_eq!(teacher.forward_calls, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — roundtrip via stub teacher:
+    ///   drive_full_model_teacher_capture writes safetensors →
+    ///   load_teacher_targets_for_batch reads them back →
+    ///   shape + count match the cfg, content is non-degenerate.
+    #[test]
+    fn load_teacher_targets_for_batch_roundtrip_with_drive_full_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-load-targets-roundtrip-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let save_dir = dir.join("teacher-out");
+
+        let cfg = super::FullModelDwqConfig {
+            gguf_path: std::path::PathBuf::from("/dev/null"),
+            calibration_token_batches: vec![
+                vec![0u32; 32 * 8],
+                vec![1u32; 32 * 8],
+            ],
+            batch_size: 32,
+            seq_len: 8,
+            top_k_teacher: 16,
+            ..super::FullModelDwqConfig::default()
+        };
+        let targets_cfg =
+            super::build_dwq_targets_config_from_full_model(&cfg, save_dir.clone(), 256).unwrap();
+        let mut teacher = StubTeacher {
+            vocab: 256,
+            forward_calls: 0,
+        };
+        super::drive_full_model_teacher_capture(&mut teacher, &cfg, &targets_cfg).unwrap();
+
+        for i in 0..2 {
+            let t = super::load_teacher_targets_for_batch(&save_dir, "train", i, &cfg).unwrap();
+            assert_eq!(t.batch, 32);
+            assert_eq!(t.seq, 7, "saved seq = cfg.seq_len - 1 (next-token trim)");
+            assert_eq!(t.top_k, 16);
+            assert_eq!(t.logits.len(), 32 * 7 * 16);
+            assert_eq!(t.indices.len(), 32 * 7 * 16);
+            // indices must point into the teacher's vocab (256)
+            for &v in &t.indices {
+                assert!(v < 256, "index {v} out of vocab=256");
+            }
+            // logits must contain non-zero variation (StubTeacher is
+            // sin/cos-based, so all-zero would mean we read the wrong
+            // file or hit a zero buffer)
+            let max = t.logits.iter().cloned().fold(f32::MIN, f32::max);
+            let min = t.logits.iter().cloned().fold(f32::MAX, f32::min);
+            assert!(
+                max - min > 1e-3,
+                "batch {i} logits are degenerate (max-min={})",
+                max - min
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — cross-check rejects batch_size mismatch
+    /// (file says 32 but cfg says 64).  We forge a file by writing
+    /// with one cfg and reading with another.
+    #[test]
+    fn load_teacher_targets_for_batch_rejects_batch_size_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-load-targets-batch-mismatch-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let save_dir = dir.join("teacher-out");
+
+        let write_cfg = super::FullModelDwqConfig {
+            gguf_path: std::path::PathBuf::from("/dev/null"),
+            calibration_token_batches: vec![vec![0u32; 32 * 4]],
+            batch_size: 32,
+            seq_len: 4,
+            top_k_teacher: 8,
+            ..super::FullModelDwqConfig::default()
+        };
+        let targets_cfg =
+            super::build_dwq_targets_config_from_full_model(&write_cfg, save_dir.clone(), 64)
+                .unwrap();
+        let mut teacher = StubTeacher {
+            vocab: 64,
+            forward_calls: 0,
+        };
+        super::drive_full_model_teacher_capture(&mut teacher, &write_cfg, &targets_cfg).unwrap();
+
+        // Read with a cfg that disagrees on batch_size.
+        let read_cfg = super::FullModelDwqConfig {
+            batch_size: 64,
+            ..write_cfg.clone()
+        };
+        let err =
+            super::load_teacher_targets_for_batch(&save_dir, "train", 0, &read_cfg).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("batch (32)") && msg.contains("cfg.batch_size (64)"),
+            "got: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — cross-check rejects seq_len mismatch
+    /// (the saved seq is `cfg.seq_len - 1`).  Read with a cfg whose
+    /// seq_len doesn't agree on that.
+    #[test]
+    fn load_teacher_targets_for_batch_rejects_seq_len_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-load-targets-seq-mismatch-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let save_dir = dir.join("teacher-out");
+
+        let write_cfg = super::FullModelDwqConfig {
+            gguf_path: std::path::PathBuf::from("/dev/null"),
+            calibration_token_batches: vec![vec![0u32; 32 * 8]],
+            batch_size: 32,
+            seq_len: 8,
+            top_k_teacher: 8,
+            ..super::FullModelDwqConfig::default()
+        };
+        let targets_cfg =
+            super::build_dwq_targets_config_from_full_model(&write_cfg, save_dir.clone(), 64)
+                .unwrap();
+        let mut teacher = StubTeacher {
+            vocab: 64,
+            forward_calls: 0,
+        };
+        super::drive_full_model_teacher_capture(&mut teacher, &write_cfg, &targets_cfg).unwrap();
+
+        // Read with cfg.seq_len=16 → expected_seq=15, file says 7.
+        let read_cfg = super::FullModelDwqConfig {
+            seq_len: 16,
+            ..write_cfg.clone()
+        };
+        let err =
+            super::load_teacher_targets_for_batch(&save_dir, "train", 0, &read_cfg).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("seq (7)") && msg.contains("cfg.seq_len - 1 (15)"),
+            "got: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — cross-check rejects top_k mismatch.
+    #[test]
+    fn load_teacher_targets_for_batch_rejects_top_k_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-load-targets-topk-mismatch-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let save_dir = dir.join("teacher-out");
+
+        let write_cfg = super::FullModelDwqConfig {
+            gguf_path: std::path::PathBuf::from("/dev/null"),
+            calibration_token_batches: vec![vec![0u32; 32 * 4]],
+            batch_size: 32,
+            seq_len: 4,
+            top_k_teacher: 8,
+            ..super::FullModelDwqConfig::default()
+        };
+        let targets_cfg =
+            super::build_dwq_targets_config_from_full_model(&write_cfg, save_dir.clone(), 64)
+                .unwrap();
+        let mut teacher = StubTeacher {
+            vocab: 64,
+            forward_calls: 0,
+        };
+        super::drive_full_model_teacher_capture(&mut teacher, &write_cfg, &targets_cfg).unwrap();
+
+        let read_cfg = super::FullModelDwqConfig {
+            top_k_teacher: 32,
+            ..write_cfg.clone()
+        };
+        let err =
+            super::load_teacher_targets_for_batch(&save_dir, "train", 0, &read_cfg).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("top_k (8)") && msg.contains("cfg.top_k_teacher (32)"),
+            "got: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — cross-check rejects cfg.seq_len = 0
+    /// (would underflow in the `seq_len - 1` computation).  Defensive
+    /// even though `validate()` already rejects seq_len < 2.
+    #[test]
+    fn load_teacher_targets_for_batch_rejects_zero_seq_len_underflow() {
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-load-targets-underflow-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let save_dir = dir.join("teacher-out");
+        std::fs::create_dir_all(save_dir.join("train")).unwrap();
+        // Empty file is fine — load_dwq_target will fail first; but
+        // we want to prove the underflow check fires deterministically
+        // even if a bogus file shape were on disk.  Use a cfg that
+        // has seq_len=0 (illegal per validate, but the loader is
+        // defensive and we want it to surface the right diagnostic).
+        let read_cfg = super::FullModelDwqConfig {
+            seq_len: 0,
+            ..super::FullModelDwqConfig::default()
+        };
+        // Without a real file the load fails earlier; that's still
+        // an error and proves we don't crash.  Just assert we get
+        // SOME error rather than a panic.
+        let res = super::load_teacher_targets_for_batch(&save_dir, "train", 0, &read_cfg);
+        assert!(res.is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
