@@ -432,6 +432,15 @@ pub struct HybridKvCache {
     /// Precomputed `full_attn_rank` for each model layer index, for O(1)
     /// lookup in the hot path.
     per_layer_slot: Vec<LayerSlot>,
+    /// ADR-027 Phase B iter-28 (sub-iter 23b) — cache records its own
+    /// TQ-active mode at construction time. Today this mirrors
+    /// `slot.tq.is_some()` for every full-attn slot, but having it on the
+    /// cache itself is the precondition for sub-iter 23c, where
+    /// `FullAttnKvSlot.k`/`v` become `Option<MlxBuffer>` and the alloc
+    /// branch needs to know whether to skip the F32 K/V allocation. Kept
+    /// `pub` for symmetry with `n_seqs` / `max_seq_len` (read-only state
+    /// derived from constructor inputs).
+    pub tq_kv_active: bool,
 }
 
 /// Resolved slot index for a given model layer.
@@ -899,6 +908,7 @@ impl HybridKvCache {
             n_seqs,
             conv_channels,
             per_layer_slot,
+            tq_kv_active,
         };
         // ADR-015 iter61a (broken-window fix): explicitly zero every owned
         // GPU buffer to defend against StorageModeShared returning recycled,
@@ -2621,6 +2631,52 @@ mod tests {
             mtp.tq.is_some(),
             "MTP slot should ALSO have tq populated when tq_kv_active=true"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-027 Phase B iter-28 (sub-iter 23b) — HybridKvCache.tq_kv_active
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn hybrid_kv_cache_tq_kv_active_field_matches_constructor_arg() {
+        // The cache itself records its TQ-mode at construction. iter-29
+        // (sub-iter 23c) keys the F32 K/V alloc branch off this field;
+        // until then it must mirror `slot.tq.is_some()` for every
+        // full-attn slot (and for the MTP slot if present).
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+
+        // tq_kv_active=false: field reads false; every slot.tq is None.
+        let off = HybridKvCache::new_with_options(&cfg, &device, 64, 1, false)
+            .expect("kv tq-off");
+        assert!(!off.tq_kv_active, "tq_kv_active must propagate (false)");
+        for (i, slot) in off.full_attn.iter().enumerate() {
+            assert!(
+                slot.tq.is_none(),
+                "tq_kv_active=false implies full_attn[{i}].tq.is_none()"
+            );
+        }
+
+        // tq_kv_active=true: field reads true; every slot.tq is Some.
+        let on = HybridKvCache::new_with_options(&cfg, &device, 64, 1, true)
+            .expect("kv tq-on");
+        assert!(on.tq_kv_active, "tq_kv_active must propagate (true)");
+        for (i, slot) in on.full_attn.iter().enumerate() {
+            assert!(
+                slot.tq.is_some(),
+                "tq_kv_active=true implies full_attn[{i}].tq.is_some()"
+            );
+        }
+
+        // Legacy `new()` defaults to false (regression contract).
+        let legacy = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv legacy");
+        assert!(!legacy.tq_kv_active, "legacy `new()` ⇒ tq_kv_active=false");
     }
 
     // ──────────────────────────────────────────────────────────────────
