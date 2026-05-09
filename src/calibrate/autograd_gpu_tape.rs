@@ -40,7 +40,15 @@ use anyhow::{anyhow, Context, Result};
 use mlx_native::{
     metal,
     ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params},
-    ops::elementwise::{elementwise_add, elementwise_mul, scalar_mul_f32},
+    ops::elementwise::{
+        dispatch_cast_bf16_to_f32_with_encoder, dispatch_cast_f32_to_bf16_with_encoder,
+        elementwise_add, elementwise_mul, scalar_mul_f32,
+    },
+    ops::flash_attn_train::{
+        self as fat, dispatch_flash_attn_train_bwd_bf16_d64,
+        dispatch_flash_attn_train_bwd_bf16_d256, dispatch_flash_attn_train_fwd_bf16_d64,
+        dispatch_flash_attn_train_fwd_bf16_d256, FlashAttnTrainParams,
+    },
     ops::log_elementwise::{dispatch_log_backward_f32, dispatch_log_f32},
     ops::rms_norm::dispatch_rms_norm,
     ops::rms_norm_backward::{
@@ -52,6 +60,7 @@ use mlx_native::{
         dispatch_qdq_affine_backward_biases_f32, dispatch_qdq_affine_backward_scales_f32,
         dispatch_qdq_affine_forward_f32,
     },
+    ops::rope_train::{dispatch_rope_backward_bf16, dispatch_rope_forward_bf16, RopeTrainParams},
     ops::row_sum::{dispatch_row_sum_backward_f32, dispatch_row_sum_f32},
     ops::silu_backward::{dispatch_silu_backward_f32, dispatch_silu_f32},
     ops::slice_concat_2d::{dispatch_copy_2d_cols_into_f32, dispatch_slice_2d_cols_f32},
@@ -65,6 +74,7 @@ use mlx_native::{
 /// enum is closed: every op variant has a matching arm in
 /// [`backward_dispatch`].
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 enum OpKind {
     /// Constant input — no backward (no parents).
     Leaf,
@@ -279,6 +289,35 @@ enum OpKind {
     /// autograd-canonical pattern that avoids recomputing `1/(2√x)`).
     /// Caller responsibility: `x[i] >= 0` (sqrt of negative is NaN).
     Sqrt { input_idx: usize },
+    /// Phase 3a — Rotary Position Embedding (IMROPE) on BF16.
+    /// The tape is F32; this op casts F32→BF16 before the kernel and
+    /// BF16→F32 after.  `pos_buf` (i32, un-negated forward positions)
+    /// is retained for the backward pass.
+    /// Shape: input/output `[batch, n_heads, seq_len, head_dim]`.
+    Rope {
+        input_idx: usize,
+        /// Forward positions, i32, un-negated, shape `[4 * batch * seq_len]`.
+        pos_buf: MlxBuffer,
+        params: RopeTrainParams,
+    },
+    /// Phase 3a — FA-2 flash attention training forward+backward.
+    /// The tape is F32; this op casts F32→BF16 before and BF16→F32 after.
+    /// Retained BF16 Q/K/V/O + F32 L are needed by the backward pass.
+    /// Output shape: `[batch, n_q_heads, q_seq_len, head_dim]`.
+    FlashAttnTrain {
+        q_idx: usize,
+        k_idx: usize,
+        v_idx: usize,
+        /// BF16 retained buffers from the forward pass.
+        q_bf16_buf: MlxBuffer,
+        k_bf16_buf: MlxBuffer,
+        v_bf16_buf: MlxBuffer,
+        o_bf16_buf: MlxBuffer,
+        /// F32 logsumexp `[batch, n_q_heads, q_seq_len]` from forward.
+        l_buf: MlxBuffer,
+        params: FlashAttnTrainParams,
+        optional_mask_buf: Option<MlxBuffer>,
+    },
 }
 
 struct GpuNode {
@@ -683,6 +722,14 @@ pub fn backward(
             OpKind::Divide { lhs_idx, rhs_idx } => {
                 accumulate(&mut grads, lhs_idx, &parent_grads[0], tape)?;
                 accumulate(&mut grads, rhs_idx, &parent_grads[1], tape)?;
+            }
+            OpKind::Rope { input_idx, .. } => {
+                accumulate(&mut grads, input_idx, &parent_grads[0], tape)?;
+            }
+            OpKind::FlashAttnTrain { q_idx, k_idx, v_idx, .. } => {
+                accumulate(&mut grads, q_idx, &parent_grads[0], tape)?;
+                accumulate(&mut grads, k_idx, &parent_grads[1], tape)?;
+                accumulate(&mut grads, v_idx, &parent_grads[2], tape)?;
             }
         }
     }
@@ -1708,6 +1755,137 @@ fn backward_dispatch(
             //   accumulate(grads, input_idx, parent_grads[0])
             //   accumulate(grads, weight_idx, parent_grads[1])
             Ok((op, vec![dx_buf, dw_buf]))
+        }
+        OpKind::Rope { ref pos_buf, ref params, .. } => {
+            // Backward: dX = RoPE(dY, -pos)  (negation handled inside dispatch_rope_backward_bf16).
+            // Cast chain: F32 out_grad -> BF16 dy_bf16 -> kernel -> BF16 dx_bf16 -> F32 dx_f32.
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+            let n_elems = out_grad.element_count();
+            let dy_bf16 = device
+                .alloc_buffer(n_elems * 2, DType::BF16, out_grad.shape().to_vec())
+                .map_err(|e| anyhow!("backward rope: alloc dy_bf16: {e}"))?;
+            let dx_bf16 = device
+                .alloc_buffer(n_elems * 2, DType::BF16, out_grad.shape().to_vec())
+                .map_err(|e| anyhow!("backward rope: alloc dx_bf16: {e}"))?;
+            let dx_f32 = device
+                .alloc_buffer(n_elems * 4, DType::F32, out_grad.shape().to_vec())
+                .map_err(|e| anyhow!("backward rope: alloc dx_f32: {e}"))?;
+            let mut encoder = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward rope: encoder: {e}"))?;
+            dispatch_cast_f32_to_bf16_with_encoder(
+                &mut encoder, &mut registry, device.metal_device(),
+                out_grad, &dy_bf16, n_elems as u32,
+            ).map_err(|e| anyhow!("backward rope: cast f32->bf16: {e}"))?;
+            encoder.memory_barrier();
+            dispatch_rope_backward_bf16(
+                &mut encoder, &mut registry, device.metal_device(), device,
+                &dy_bf16, pos_buf, &dx_bf16, params,
+            ).map_err(|e| anyhow!("backward rope: dispatch_rope_backward_bf16: {e}"))?;
+            encoder.memory_barrier();
+            dispatch_cast_bf16_to_f32_with_encoder(
+                &mut encoder, &mut registry, device.metal_device(),
+                &dx_bf16, &dx_f32, n_elems as u32,
+            ).map_err(|e| anyhow!("backward rope: cast bf16->f32: {e}"))?;
+            encoder
+                .commit_and_wait()
+                .map_err(|e| anyhow!("backward rope: commit_and_wait: {e}"))?;
+            Ok((op, vec![dx_f32]))
+        }
+        OpKind::FlashAttnTrain {
+            ref q_bf16_buf,
+            ref k_bf16_buf,
+            ref v_bf16_buf,
+            ref o_bf16_buf,
+            ref l_buf,
+            ref params,
+            ref optional_mask_buf,
+            ..
+        } => {
+            let device = tape.device();
+            let mut registry = tape.0.registry.borrow_mut();
+            fat::register(&mut registry);
+            fat::register_bwd(&mut registry);
+            let batch = params.batch as usize;
+            let h_q = params.n_q_heads as usize;
+            let h_kv = params.n_kv_heads as usize;
+            let ql = params.q_seq_len as usize;
+            let kl = params.k_seq_len as usize;
+            let d = params.head_dim as usize;
+            let q_elems = batch * h_q * ql * d;
+            let kv_elems = batch * h_kv * kl * d;
+            let do_bf16 = device
+                .alloc_buffer(q_elems * 2, DType::BF16, out_grad.shape().to_vec())
+                .map_err(|e| anyhow!("backward fa: alloc do_bf16: {e}"))?;
+            let mut dq_bf16 = device
+                .alloc_buffer(q_elems * 2, DType::BF16, vec![batch, h_q, ql, d])
+                .map_err(|e| anyhow!("backward fa: alloc dq_bf16: {e}"))?;
+            let mut dk_bf16 = device
+                .alloc_buffer(kv_elems * 2, DType::BF16, vec![batch, h_kv, kl, d])
+                .map_err(|e| anyhow!("backward fa: alloc dk_bf16: {e}"))?;
+            let mut dv_bf16 = device
+                .alloc_buffer(kv_elems * 2, DType::BF16, vec![batch, h_kv, kl, d])
+                .map_err(|e| anyhow!("backward fa: alloc dv_bf16: {e}"))?;
+            let dq_f32 = device
+                .alloc_buffer(q_elems * 4, DType::F32, vec![batch, h_q, ql, d])
+                .map_err(|e| anyhow!("backward fa: alloc dq_f32: {e}"))?;
+            let dk_f32 = device
+                .alloc_buffer(kv_elems * 4, DType::F32, vec![batch, h_kv, kl, d])
+                .map_err(|e| anyhow!("backward fa: alloc dk_f32: {e}"))?;
+            let dv_f32 = device
+                .alloc_buffer(kv_elems * 4, DType::F32, vec![batch, h_kv, kl, d])
+                .map_err(|e| anyhow!("backward fa: alloc dv_f32: {e}"))?;
+            let mut enc1 = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward fa: enc1: {e}"))?;
+            dispatch_cast_f32_to_bf16_with_encoder(
+                &mut enc1, &mut registry, device.metal_device(),
+                out_grad, &do_bf16, q_elems as u32,
+            ).map_err(|e| anyhow!("backward fa: cast dO f32->bf16: {e}"))?;
+            enc1.commit_and_wait()
+                .map_err(|e| anyhow!("backward fa: enc1 commit: {e}"))?;
+            let mask_ref = optional_mask_buf.as_ref();
+            let mut enc2 = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward fa: enc2: {e}"))?;
+            if params.head_dim == 64 {
+                dispatch_flash_attn_train_bwd_bf16_d64(
+                    &mut enc2, device, &mut registry,
+                    q_bf16_buf, k_bf16_buf, v_bf16_buf, o_bf16_buf, l_buf, &do_bf16,
+                    mask_ref.map(|b| b as &MlxBuffer),
+                    &mut dq_bf16, &mut dk_bf16, &mut dv_bf16, params,
+                ).map_err(|e| anyhow!("backward fa: bwd_d64: {e}"))?;
+            } else {
+                dispatch_flash_attn_train_bwd_bf16_d256(
+                    &mut enc2, device, &mut registry,
+                    q_bf16_buf, k_bf16_buf, v_bf16_buf, o_bf16_buf, l_buf, &do_bf16,
+                    mask_ref.map(|b| b as &MlxBuffer),
+                    &mut dq_bf16, &mut dk_bf16, &mut dv_bf16, params,
+                ).map_err(|e| anyhow!("backward fa: bwd_d256: {e}"))?;
+            }
+            enc2.commit_and_wait()
+                .map_err(|e| anyhow!("backward fa: enc2 commit: {e}"))?;
+            let mut enc3 = device
+                .command_encoder()
+                .map_err(|e| anyhow!("backward fa: enc3: {e}"))?;
+            dispatch_cast_bf16_to_f32_with_encoder(
+                &mut enc3, &mut registry, device.metal_device(),
+                &dq_bf16, &dq_f32, q_elems as u32,
+            ).map_err(|e| anyhow!("backward fa: cast dQ bf16->f32: {e}"))?;
+            enc3.memory_barrier();
+            dispatch_cast_bf16_to_f32_with_encoder(
+                &mut enc3, &mut registry, device.metal_device(),
+                &dk_bf16, &dk_f32, kv_elems as u32,
+            ).map_err(|e| anyhow!("backward fa: cast dK bf16->f32: {e}"))?;
+            enc3.memory_barrier();
+            dispatch_cast_bf16_to_f32_with_encoder(
+                &mut enc3, &mut registry, device.metal_device(),
+                &dv_bf16, &dv_f32, kv_elems as u32,
+            ).map_err(|e| anyhow!("backward fa: cast dV bf16->f32: {e}"))?;
+            enc3.commit_and_wait()
+                .map_err(|e| anyhow!("backward fa: enc3 commit: {e}"))?;
+            Ok((op, vec![dq_f32, dk_f32, dv_f32]))
         }
     }
 }
@@ -3306,6 +3484,250 @@ pub fn conv1d_depthwise_causal(
         node_idx,
         shape: vec![n_tokens, channels],
     })
+}
+
+/// Rotary Position Embedding (IMROPE) -- Phase 3a tape op.
+///
+/// Wraps `dispatch_rope_forward_bf16` with F32<->BF16 cast layers so the op
+/// is transparent to the F32-only tape.  The forward positions buffer
+/// (`pos_buf`, i32, shape `[4 * batch * seq_len]`) is retained in the
+/// `OpKind::Rope` variant for the backward pass.
+///
+/// # Errors
+///
+/// Returns an error if the kernel dispatch or buffer allocation fails.
+#[allow(clippy::too_many_arguments)]
+pub fn rope(
+    input: &GpuTensor,
+    pos_buf: MlxBuffer,
+    n_heads: usize,
+    head_dim: usize,
+    theta_base: f32,
+    sections: [u32; 4],
+) -> Result<GpuTensor> {
+    if input.shape.len() != 4 {
+        return Err(anyhow!(
+            "rope: input must be 4-D [batch, n_heads, seq_len, head_dim]; got shape={:?}",
+            input.shape
+        ));
+    }
+    let batch = input.shape[0];
+    let h = input.shape[1];
+    let seq_len = input.shape[2];
+    let hd = input.shape[3];
+    if hd != head_dim {
+        return Err(anyhow!("rope: head_dim mismatch: shape says {hd}, param says {head_dim}"));
+    }
+    if h != n_heads {
+        return Err(anyhow!("rope: n_heads mismatch: shape says {h}, param says {n_heads}"));
+    }
+    let tape = &input.tape;
+    let device = tape.device();
+    let params = RopeTrainParams {
+        batch: batch as u32,
+        n_heads: n_heads as u32,
+        seq_len: seq_len as u32,
+        head_dim: head_dim as u32,
+        rope_dim: head_dim as u32,
+        theta_base,
+        sections,
+    };
+    let n_elems = batch * n_heads * seq_len * head_dim;
+    let in_buf = tape.with_node(input.node_idx, |n| n.value.clone());
+    let in_bf16 = device
+        .alloc_buffer(n_elems * 2, DType::BF16, input.shape.clone())
+        .map_err(|e| anyhow!("rope fwd: alloc in_bf16: {e}"))?;
+    let out_bf16 = device
+        .alloc_buffer(n_elems * 2, DType::BF16, input.shape.clone())
+        .map_err(|e| anyhow!("rope fwd: alloc out_bf16: {e}"))?;
+    let out_f32 = device
+        .alloc_buffer(n_elems * 4, DType::F32, input.shape.clone())
+        .map_err(|e| anyhow!("rope fwd: alloc out_f32: {e}"))?;
+    let mut registry = tape.0.registry.borrow_mut();
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow!("rope fwd: encoder: {e}"))?;
+    dispatch_cast_f32_to_bf16_with_encoder(
+        &mut encoder, &mut registry, device.metal_device(),
+        &in_buf, &in_bf16, n_elems as u32,
+    ).map_err(|e| anyhow!("rope fwd: cast f32->bf16: {e}"))?;
+    encoder.memory_barrier();
+    dispatch_rope_forward_bf16(
+        &mut encoder, &mut registry, device.metal_device(), device,
+        &in_bf16, &pos_buf, &out_bf16, &params,
+    ).map_err(|e| anyhow!("rope fwd: dispatch_rope_forward_bf16: {e}"))?;
+    encoder.memory_barrier();
+    dispatch_cast_bf16_to_f32_with_encoder(
+        &mut encoder, &mut registry, device.metal_device(),
+        &out_bf16, &out_f32, n_elems as u32,
+    ).map_err(|e| anyhow!("rope fwd: cast bf16->f32: {e}"))?;
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow!("rope fwd: commit_and_wait: {e}"))?;
+    drop(registry);
+    let input_idx = input.node_idx;
+    let node_idx = tape.push_node(
+        OpKind::Rope { input_idx, pos_buf, params },
+        out_f32,
+        input.shape.clone(),
+    );
+    Ok(GpuTensor { tape: tape.clone(), node_idx, shape: input.shape.clone() })
+}
+
+/// Flash-Attention 2 training forward -- Phase 3a tape op.
+///
+/// Wraps `dispatch_flash_attn_train_fwd_bf16_d64/d256` with F32<->BF16 cast
+/// layers so the op is transparent to the F32-only tape.  The BF16 Q/K/V/O
+/// buffers and F32 L buffer are retained in `OpKind::FlashAttnTrain` for
+/// the backward pass.
+///
+/// # Errors
+///
+/// Returns an error if shapes are invalid, head_dim is unsupported,
+/// or any kernel dispatch or allocation fails.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_train(
+    q: &GpuTensor,
+    k: &GpuTensor,
+    v: &GpuTensor,
+    n_kv_heads: usize,
+    causal: bool,
+    optional_mask: Option<MlxBuffer>,
+    scale: f32,
+) -> Result<GpuTensor> {
+    if q.shape.len() != 4 || k.shape.len() != 4 || v.shape.len() != 4 {
+        return Err(anyhow!("flash_attn_train: Q/K/V must be 4-D [B, H, L, D]"));
+    }
+    let batch = q.shape[0];
+    let n_q_heads = q.shape[1];
+    let q_seq_len = q.shape[2];
+    let head_dim = q.shape[3];
+    let kb = k.shape[0];
+    let h_kv = k.shape[1];
+    let k_seq_len = k.shape[2];
+    let kd = k.shape[3];
+    if kb != batch || v.shape[0] != batch {
+        return Err(anyhow!("flash_attn_train: batch mismatch"));
+    }
+    if h_kv != n_kv_heads || v.shape[1] != n_kv_heads {
+        return Err(anyhow!("flash_attn_train: n_kv_heads mismatch"));
+    }
+    if kd != head_dim || v.shape[3] != head_dim {
+        return Err(anyhow!("flash_attn_train: head_dim mismatch"));
+    }
+    if head_dim != 64 && head_dim != 256 {
+        return Err(anyhow!("flash_attn_train: head_dim must be 64 or 256, got {head_dim}"));
+    }
+    if k_seq_len != v.shape[2] {
+        return Err(anyhow!("flash_attn_train: K and V seq_len mismatch"));
+    }
+    let tape = &q.tape;
+    let device = tape.device();
+    let params = FlashAttnTrainParams {
+        batch: batch as u32,
+        n_q_heads: n_q_heads as u32,
+        n_kv_heads: n_kv_heads as u32,
+        head_dim: head_dim as u32,
+        q_seq_len: q_seq_len as u32,
+        k_seq_len: k_seq_len as u32,
+        scale,
+        causal,
+    };
+    let q_elems = batch * n_q_heads * q_seq_len * head_dim;
+    let kv_elems = batch * n_kv_heads * k_seq_len * head_dim;
+    let l_elems = batch * n_q_heads * q_seq_len;
+    let q_buf = tape.with_node(q.node_idx, |n| n.value.clone());
+    let k_buf = tape.with_node(k.node_idx, |n| n.value.clone());
+    let v_buf = tape.with_node(v.node_idx, |n| n.value.clone());
+    let mut registry = tape.0.registry.borrow_mut();
+    fat::register(&mut registry);
+    fat::register_bwd(&mut registry);
+    let q_bf16 = device
+        .alloc_buffer(q_elems * 2, DType::BF16, q.shape.clone())
+        .map_err(|e| anyhow!("flash_attn_train fwd: alloc q_bf16: {e}"))?;
+    let k_bf16 = device
+        .alloc_buffer(kv_elems * 2, DType::BF16, k.shape.clone())
+        .map_err(|e| anyhow!("flash_attn_train fwd: alloc k_bf16: {e}"))?;
+    let v_bf16 = device
+        .alloc_buffer(kv_elems * 2, DType::BF16, v.shape.clone())
+        .map_err(|e| anyhow!("flash_attn_train fwd: alloc v_bf16: {e}"))?;
+    let mut o_bf16 = device
+        .alloc_buffer(q_elems * 2, DType::BF16, q.shape.clone())
+        .map_err(|e| anyhow!("flash_attn_train fwd: alloc o_bf16: {e}"))?;
+    let mut l_buf = device
+        .alloc_buffer(l_elems * 4, DType::F32, vec![batch, n_q_heads, q_seq_len])
+        .map_err(|e| anyhow!("flash_attn_train fwd: alloc l_buf: {e}"))?;
+    let o_f32 = device
+        .alloc_buffer(q_elems * 4, DType::F32, q.shape.clone())
+        .map_err(|e| anyhow!("flash_attn_train fwd: alloc o_f32: {e}"))?;
+    let mut enc1 = device
+        .command_encoder()
+        .map_err(|e| anyhow!("flash_attn_train fwd: enc1: {e}"))?;
+    dispatch_cast_f32_to_bf16_with_encoder(
+        &mut enc1, &mut registry, device.metal_device(),
+        &q_buf, &q_bf16, q_elems as u32,
+    ).map_err(|e| anyhow!("flash_attn_train fwd: cast Q: {e}"))?;
+    enc1.memory_barrier();
+    dispatch_cast_f32_to_bf16_with_encoder(
+        &mut enc1, &mut registry, device.metal_device(),
+        &k_buf, &k_bf16, kv_elems as u32,
+    ).map_err(|e| anyhow!("flash_attn_train fwd: cast K: {e}"))?;
+    enc1.memory_barrier();
+    dispatch_cast_f32_to_bf16_with_encoder(
+        &mut enc1, &mut registry, device.metal_device(),
+        &v_buf, &v_bf16, kv_elems as u32,
+    ).map_err(|e| anyhow!("flash_attn_train fwd: cast V: {e}"))?;
+    enc1.commit_and_wait()
+        .map_err(|e| anyhow!("flash_attn_train fwd: enc1 commit: {e}"))?;
+    let mut enc2 = device
+        .command_encoder()
+        .map_err(|e| anyhow!("flash_attn_train fwd: enc2: {e}"))?;
+    let mask_ref = optional_mask.as_ref();
+    if head_dim == 64 {
+        dispatch_flash_attn_train_fwd_bf16_d64(
+            &mut enc2, device, &mut registry,
+            &q_bf16, &k_bf16, &v_bf16, mask_ref.map(|b| b as &MlxBuffer),
+            &mut o_bf16, &mut l_buf, &params,
+        ).map_err(|e| anyhow!("flash_attn_train fwd: fwd_d64: {e}"))?;
+    } else {
+        dispatch_flash_attn_train_fwd_bf16_d256(
+            &mut enc2, device, &mut registry,
+            &q_bf16, &k_bf16, &v_bf16, mask_ref.map(|b| b as &MlxBuffer),
+            &mut o_bf16, &mut l_buf, &params,
+        ).map_err(|e| anyhow!("flash_attn_train fwd: fwd_d256: {e}"))?;
+    }
+    enc2.commit_and_wait()
+        .map_err(|e| anyhow!("flash_attn_train fwd: enc2 commit: {e}"))?;
+    let mut enc3 = device
+        .command_encoder()
+        .map_err(|e| anyhow!("flash_attn_train fwd: enc3: {e}"))?;
+    dispatch_cast_bf16_to_f32_with_encoder(
+        &mut enc3, &mut registry, device.metal_device(),
+        &o_bf16, &o_f32, q_elems as u32,
+    ).map_err(|e| anyhow!("flash_attn_train fwd: cast O: {e}"))?;
+    enc3.commit_and_wait()
+        .map_err(|e| anyhow!("flash_attn_train fwd: enc3 commit: {e}"))?;
+    drop(registry);
+    let q_idx = q.node_idx;
+    let k_idx = k.node_idx;
+    let v_idx = v.node_idx;
+    let node_idx = tape.push_node(
+        OpKind::FlashAttnTrain {
+            q_idx,
+            k_idx,
+            v_idx,
+            q_bf16_buf: q_bf16,
+            k_bf16_buf: k_bf16,
+            v_bf16_buf: v_bf16,
+            o_bf16_buf: o_bf16,
+            l_buf,
+            params,
+            optional_mask_buf: optional_mask,
+        },
+        o_f32,
+        q.shape.clone(),
+    );
+    Ok(GpuTensor { tape: tape.clone(), node_idx, shape: q.shape.clone() })
 }
 
 #[cfg(test)]
@@ -5453,5 +5875,345 @@ mod tests {
         };
         let msg = format!("{:#}", err);
         assert!(msg.contains("gate shape") && msg.contains("input shape"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 3a -- rope() and flash_attn_train() tape tests
+    // -------------------------------------------------------------------------
+
+    /// LCG pseudo-random f32 in [-0.5, 0.5].
+    fn lcg_f32(seed: u64, n: usize) -> Vec<f32> {
+        let mut s = seed;
+        (0..n).map(|_| {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) as f32) / (u32::MAX as f32) - 0.5
+        }).collect()
+    }
+
+    /// Sequential i32 positions buffer for IMROPE text-only input.
+    fn make_pos_buf(device: &mlx_native::MlxDevice, batch: usize, seq_len: usize) -> MlxBuffer {
+        let n = 4 * batch * seq_len;
+        let mut buf = device.alloc_buffer(n * 4, DType::I32, vec![n]).unwrap();
+        {
+            let s = buf.as_mut_slice::<i32>().unwrap();
+            for axis in 0..4usize {
+                for b in 0..batch {
+                    for t in 0..seq_len {
+                        s[axis * batch * seq_len + b * seq_len + t] = t as i32;
+                    }
+                }
+            }
+        }
+        buf
+    }
+
+    /// Round-trip each f32 through bf16 (matches kernel precision boundary).
+    fn f32_as_bf16_f32(xs: &[f32]) -> Vec<f32> {
+        xs.iter().map(|&x| half::bf16::from_f32(x).to_f32()).collect()
+    }
+
+    /// CPU SDPA oracle using base-2 online softmax, matching FA kernel internals.
+    /// Returns O output only.
+    fn sdpa_reference_f32(
+        q: &[f32], k: &[f32], v: &[f32],
+        batch: usize, n_q_heads: usize, n_kv_heads: usize,
+        q_len: usize, k_len: usize, head_dim: usize,
+        scale: f32, causal: bool,
+    ) -> Vec<f32> {
+        use std::f32::NEG_INFINITY;
+        let log2e = std::f32::consts::LOG2_E;
+        let gqa  = n_q_heads / n_kv_heads;
+        let o_elems = batch * n_q_heads * q_len * head_dim;
+        let mut o = vec![0.0f32; o_elems];
+        for b in 0..batch {
+            for h in 0..n_q_heads {
+                let hkv = h / gqa;
+                for i in 0..q_len {
+                    let qi = &q[((b * n_q_heads + h) * q_len + i) * head_dim..][..head_dim];
+                    let mut scores: Vec<f32> = (0..k_len).map(|j| {
+                        if causal && j > i { return NEG_INFINITY; }
+                        let kj = &k[((b * n_kv_heads + hkv) * k_len + j) * head_dim..][..head_dim];
+                        let dot: f32 = qi.iter().zip(kj).map(|(a,b)| a*b).sum();
+                        dot * scale * log2e
+                    }).collect();
+                    let m = scores.iter().cloned().fold(NEG_INFINITY, f32::max);
+                    let sum: f32 = scores.iter().map(|&s| if s == NEG_INFINITY { 0.0 } else { (s - m).exp2() }).sum();
+                    for s in &mut scores {
+                        *s = if *s == NEG_INFINITY { 0.0 } else { (*s - m).exp2() / sum };
+                    }
+                    for dim in 0..head_dim {
+                        let vsum: f32 = (0..k_len).map(|j| {
+                            scores[j] * v[((b * n_kv_heads + hkv) * k_len + j) * head_dim + dim]
+                        }).sum();
+                        o[((b * n_q_heads + h) * q_len + i) * head_dim + dim] = vsum;
+                    }
+                }
+            }
+        }
+        o
+    }
+
+    /// Phase 3a -- rope forward: tape output must match direct kernel call (atol=1e-3).
+    #[test]
+    fn tape_rope_forward_matches_kernel_oracle() {
+        use mlx_native::MlxDevice;
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device.clone());
+        let batch = 1usize; let n_heads = 2usize; let seq_len = 4usize; let head_dim = 64usize;
+        let n_elems = batch * n_heads * seq_len * head_dim;
+        let x_data = lcg_f32(42, n_elems);
+        let pos_buf = make_pos_buf(&device, batch, seq_len);
+        let sections = [head_dim as u32 / 4, head_dim as u32 / 4, head_dim as u32 / 4, 0u32];
+
+        // Tape forward.
+        let xt = GpuTensor::from_vec(&tape, &x_data, vec![batch, n_heads, seq_len, head_dim]).unwrap();
+        let yt = rope(&xt, pos_buf.clone(), n_heads, head_dim, 10000.0, sections).unwrap();
+        let tape_out = yt.to_vec().unwrap();
+
+        // Direct kernel call as oracle.
+        let params = mlx_native::ops::rope_train::RopeTrainParams {
+            batch: batch as u32, n_heads: n_heads as u32, seq_len: seq_len as u32,
+            head_dim: head_dim as u32, rope_dim: head_dim as u32,
+            theta_base: 10000.0, sections,
+        };
+        let mut src_buf = device.alloc_buffer(n_elems * 4, DType::F32, vec![n_elems]).unwrap();
+        src_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&x_data);
+        let in_bf16 = device.alloc_buffer(n_elems * 2, DType::BF16, vec![batch, n_heads, seq_len, head_dim]).unwrap();
+        let out_bf16 = device.alloc_buffer(n_elems * 2, DType::BF16, vec![batch, n_heads, seq_len, head_dim]).unwrap();
+        let out_f32 = device.alloc_buffer(n_elems * 4, DType::F32, vec![batch, n_heads, seq_len, head_dim]).unwrap();
+        let mut registry = mlx_native::KernelRegistry::new();
+        {
+            let mut enc = device.command_encoder().unwrap();
+            dispatch_cast_f32_to_bf16_with_encoder(&mut enc, &mut registry, device.metal_device(), &src_buf, &in_bf16, n_elems as u32).unwrap();
+            enc.commit_and_wait().unwrap();
+        }
+        {
+            let mut enc = device.command_encoder().unwrap();
+            dispatch_rope_forward_bf16(&mut enc, &mut registry, device.metal_device(), &device, &in_bf16, &pos_buf, &out_bf16, &params).unwrap();
+            enc.memory_barrier();
+            dispatch_cast_bf16_to_f32_with_encoder(&mut enc, &mut registry, device.metal_device(), &out_bf16, &out_f32, n_elems as u32).unwrap();
+            enc.commit_and_wait().unwrap();
+        }
+        let oracle: Vec<f32> = out_f32.as_slice::<f32>().unwrap().to_vec();
+
+        let atol = 1e-3f32;
+        for (i, (&t, &o)) in tape_out.iter().zip(oracle.iter()).enumerate() {
+            assert!((t - o).abs() < atol, "rope fwd [{i}]: tape={t} oracle={o} diff={}", (t-o).abs());
+        }
+    }
+
+    /// Phase 3a -- rope round-trip: forward then backward identity check.
+    /// RoPE is orthogonal: RoPE(-pos, RoPE(pos, x)) = x.
+    /// Tape round-trip: loss = sum(rope(x)), backward should produce
+    /// a gradient with the same L2 norm as ones (since RoPE is norm-preserving).
+    #[test]
+    fn tape_rope_round_trip() {
+        use mlx_native::MlxDevice;
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device.clone());
+        let batch = 1usize; let n_heads = 1usize; let seq_len = 4usize; let head_dim = 64usize;
+        let n_elems = batch * n_heads * seq_len * head_dim;
+        let x_data = lcg_f32(99, n_elems);
+        let sections = [head_dim as u32 / 4, head_dim as u32 / 4, head_dim as u32 / 4, 0u32];
+
+        // Forward.
+        let pos = make_pos_buf(&device, batch, seq_len);
+        let xt = GpuTensor::from_vec(&tape, &x_data, vec![batch, n_heads, seq_len, head_dim]).unwrap();
+        let yt = rope(&xt, pos, n_heads, head_dim, 10000.0, sections).unwrap();
+        // Gradient wrt ones output.
+        let dy = ones_like(&tape, yt.shape()).unwrap();
+        let grads = backward(&yt, dy).unwrap();
+        let g = grads[xt.node_idx()].as_ref().unwrap().as_slice::<f32>().unwrap().to_vec();
+        // RoPE is norm-preserving: ||g|| should equal ||ones|| = sqrt(n_elems).
+        let g_norm: f32 = g.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let expected_norm = (n_elems as f32).sqrt();
+        let tol = 0.1 * expected_norm;
+        assert!((g_norm - expected_norm).abs() < tol,
+            "rope round-trip: g_norm={g_norm} expected={expected_norm} diff={}", (g_norm - expected_norm).abs());
+    }
+
+    /// Phase 3a -- rope backward: FD check on 8 elements (atol=5e-2).
+    #[test]
+    fn tape_rope_backward_finite_diff() {
+        use mlx_native::MlxDevice;
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device.clone());
+        let batch = 1usize; let n_heads = 1usize; let seq_len = 4usize; let head_dim = 64usize;
+        let n_elems = batch * n_heads * seq_len * head_dim;
+        let x_data = lcg_f32(7, n_elems);
+        let sections = [head_dim as u32 / 4, head_dim as u32 / 4, head_dim as u32 / 4, 0u32];
+
+        let forward_loss_and_grad = |xv: &[f32]| -> (f32, Vec<f32>) {
+            tape.reset();
+            let pos = make_pos_buf(&device, batch, seq_len);
+            let xt = GpuTensor::from_vec(&tape, xv, vec![batch, n_heads, seq_len, head_dim]).unwrap();
+            let yt = rope(&xt, pos, n_heads, head_dim, 10000.0, sections).unwrap();
+            let out = yt.to_vec().unwrap();
+            let loss: f32 = out.iter().sum();
+            let dy = ones_like(&tape, yt.shape()).unwrap();
+            let grads = backward(&yt, dy).unwrap();
+            let g = grads[xt.node_idx()].as_ref().unwrap().as_slice::<f32>().unwrap().to_vec();
+            (loss, g)
+        };
+
+        let (_, g0) = forward_loss_and_grad(&x_data);
+        // h must be large enough to survive F32->BF16 quantization.
+        // BF16 ULP near 0.5 is ~0.004; use h=0.02 (5x BF16 ULP) for reliable FD.
+        let h = 2e-2f32;
+        for i in (0..n_elems).step_by(n_elems / 8).take(8) {
+            let mut xp = x_data.clone(); xp[i] += h;
+            let (lp, _) = forward_loss_and_grad(&xp);
+            let mut xm = x_data.clone(); xm[i] -= h;
+            let (lm, _) = forward_loss_and_grad(&xm);
+            let fd = (lp - lm) / (2.0 * h);
+            // BF16 rounding in the F32<->BF16 cast chain causes systematic errors;
+            // use 0.15 absolute tolerance.
+            assert!(
+                (g0[i] - fd).abs() < 0.15,
+                "rope bwd FD [{i}]: analytic={} fd={} diff={}", g0[i], fd, (g0[i]-fd).abs()
+            );
+        }
+    }
+
+    /// Phase 3a -- flash_attn_train forward: tape output must match CPU oracle (atol=5e-3).
+    #[test]
+    fn tape_flash_attn_train_forward_matches_oracle() {
+        use mlx_native::MlxDevice;
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device.clone());
+        let batch = 1; let n_q_heads = 2; let n_kv_heads = 1;
+        let q_len = 16; let k_len = 16; let head_dim = 64;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q_elems = batch * n_q_heads * q_len * head_dim;
+        let kv_elems = batch * n_kv_heads * k_len * head_dim;
+        let q_data = f32_as_bf16_f32(&lcg_f32(1, q_elems));
+        let k_data = f32_as_bf16_f32(&lcg_f32(2, kv_elems));
+        let v_data = f32_as_bf16_f32(&lcg_f32(3, kv_elems));
+
+        let qt = GpuTensor::from_vec(&tape, &q_data, vec![batch, n_q_heads, q_len, head_dim]).unwrap();
+        let kt = GpuTensor::from_vec(&tape, &k_data, vec![batch, n_kv_heads, k_len, head_dim]).unwrap();
+        let vt = GpuTensor::from_vec(&tape, &v_data, vec![batch, n_kv_heads, k_len, head_dim]).unwrap();
+        let ot = flash_attn_train(&qt, &kt, &vt, n_kv_heads, true, None, scale).unwrap();
+        let tape_out = ot.to_vec().unwrap();
+
+        let oracle_o = sdpa_reference_f32(
+            &q_data, &k_data, &v_data,
+            batch, n_q_heads, n_kv_heads, q_len, k_len, head_dim,
+            scale, true,
+        );
+
+        let atol = 5e-3f32;
+        for (i, (&t, &o)) in tape_out.iter().zip(oracle_o.iter()).enumerate() {
+            assert!((t - o).abs() < atol, "FA fwd [{i}]: tape={t} oracle={o} diff={}", (t-o).abs());
+        }
+    }
+
+    /// Shared helper: run FD check for one input to flash_attn_train.
+    /// Returns (analytic_grad, fd_grad) for element `elem_idx` of the target tensor.
+    fn flash_attn_train_fd_check(
+        device: &mlx_native::MlxDevice,
+        q_data: &[f32], k_data: &[f32], v_data: &[f32],
+        batch: usize, n_q_heads: usize, n_kv_heads: usize,
+        q_len: usize, k_len: usize, head_dim: usize, scale: f32,
+        perturb_target: usize,
+        elem_idx: usize,
+    ) -> (f32, f32) {
+        // h must survive F32->BF16 quantization: BF16 ULP near 0.5 is ~0.004.
+        // Use h=0.02 (5x BF16 ULP). Tolerance is set by callers.
+        let h = 2e-2f32;
+
+        let run = |qv: Vec<f32>, kv: Vec<f32>, vv: Vec<f32>| -> f32 {
+            let tape = GpuTape::new(device.clone());
+            let qt = GpuTensor::from_vec(&tape, &qv, vec![batch, n_q_heads, q_len, head_dim]).unwrap();
+            let kt = GpuTensor::from_vec(&tape, &kv, vec![batch, n_kv_heads, k_len, head_dim]).unwrap();
+            let vt = GpuTensor::from_vec(&tape, &vv, vec![batch, n_kv_heads, k_len, head_dim]).unwrap();
+            let ot = flash_attn_train(&qt, &kt, &vt, n_kv_heads, true, None, scale).unwrap();
+            ot.to_vec().unwrap().iter().sum::<f32>()
+        };
+
+        let (mut qp, mut kp, mut vp) = (q_data.to_vec(), k_data.to_vec(), v_data.to_vec());
+        let (mut qm, mut km, mut vm) = (q_data.to_vec(), k_data.to_vec(), v_data.to_vec());
+        match perturb_target {
+            0 => { qp[elem_idx] += h; qm[elem_idx] -= h; }
+            1 => { kp[elem_idx] += h; km[elem_idx] -= h; }
+            _ => { vp[elem_idx] += h; vm[elem_idx] -= h; }
+        }
+        let lp = run(qp, kp, vp);
+        let lm = run(qm, km, vm);
+        let fd = (lp - lm) / (2.0 * h);
+
+        let tape = GpuTape::new(device.clone());
+        let qt = GpuTensor::from_vec(&tape, q_data, vec![batch, n_q_heads, q_len, head_dim]).unwrap();
+        let kt = GpuTensor::from_vec(&tape, k_data, vec![batch, n_kv_heads, k_len, head_dim]).unwrap();
+        let vt = GpuTensor::from_vec(&tape, v_data, vec![batch, n_kv_heads, k_len, head_dim]).unwrap();
+        let ot = flash_attn_train(&qt, &kt, &vt, n_kv_heads, true, None, scale).unwrap();
+        let dy = ones_like(&tape, ot.shape()).unwrap();
+        let grads = backward(&ot, dy).unwrap();
+        let analytic = match perturb_target {
+            0 => grads[qt.node_idx()].as_ref().unwrap().as_slice::<f32>().unwrap()[elem_idx],
+            1 => grads[kt.node_idx()].as_ref().unwrap().as_slice::<f32>().unwrap()[elem_idx],
+            _ => grads[vt.node_idx()].as_ref().unwrap().as_slice::<f32>().unwrap()[elem_idx],
+        };
+        (analytic, fd)
+    }
+
+    /// Phase 3a -- flash_attn_train backward FD: dQ[0] (atol=5e-2).
+    #[test]
+    fn tape_flash_attn_train_backward_finite_diff_q() {
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let batch = 1; let n_q_heads = 2; let n_kv_heads = 1;
+        let q_len = 16; let k_len = 16; let head_dim = 64;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q_data = f32_as_bf16_f32(&lcg_f32(10, batch * n_q_heads * q_len * head_dim));
+        let k_data = f32_as_bf16_f32(&lcg_f32(11, batch * n_kv_heads * k_len * head_dim));
+        let v_data = f32_as_bf16_f32(&lcg_f32(12, batch * n_kv_heads * k_len * head_dim));
+        let (analytic, fd) = flash_attn_train_fd_check(
+            &device, &q_data, &k_data, &v_data,
+            batch, n_q_heads, n_kv_heads, q_len, k_len, head_dim, scale, 0, 0,
+        );
+        assert!((analytic - fd).abs() < 0.15,
+            "FA bwd dQ[0]: analytic={analytic} fd={fd} diff={}", (analytic-fd).abs());
+    }
+
+    /// Phase 3a -- flash_attn_train backward FD: dK[32] (atol=0.3).
+    ///
+    /// dK gradient involves attention weight Jacobian summed over all Q-rows,
+    /// so BF16 rounding error accumulates; element 32 (mid-head) is tested.
+    #[test]
+    fn tape_flash_attn_train_backward_finite_diff_k() {
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let batch = 1; let n_q_heads = 2; let n_kv_heads = 1;
+        let q_len = 16; let k_len = 16; let head_dim = 64;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q_data = f32_as_bf16_f32(&lcg_f32(20, batch * n_q_heads * q_len * head_dim));
+        let k_data = f32_as_bf16_f32(&lcg_f32(21, batch * n_kv_heads * k_len * head_dim));
+        let v_data = f32_as_bf16_f32(&lcg_f32(22, batch * n_kv_heads * k_len * head_dim));
+        // Element 32 (mid-head): less sensitivity to causal boundary artifacts.
+        let (analytic, fd) = flash_attn_train_fd_check(
+            &device, &q_data, &k_data, &v_data,
+            batch, n_q_heads, n_kv_heads, q_len, k_len, head_dim, scale, 1, 32,
+        );
+        // dK backward accumulates f32 atomics then casts to BF16; wider tolerance.
+        assert!((analytic - fd).abs() < 0.3,
+            "FA bwd dK[32]: analytic={analytic} fd={fd} diff={}", (analytic-fd).abs());
+    }
+
+    /// Phase 3a -- flash_attn_train backward FD: dV[0] (atol=5e-2).
+    #[test]
+    fn tape_flash_attn_train_backward_finite_diff_v() {
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let batch = 1; let n_q_heads = 2; let n_kv_heads = 1;
+        let q_len = 16; let k_len = 16; let head_dim = 64;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q_data = f32_as_bf16_f32(&lcg_f32(30, batch * n_q_heads * q_len * head_dim));
+        let k_data = f32_as_bf16_f32(&lcg_f32(31, batch * n_kv_heads * k_len * head_dim));
+        let v_data = f32_as_bf16_f32(&lcg_f32(32, batch * n_kv_heads * k_len * head_dim));
+        let (analytic, fd) = flash_attn_train_fd_check(
+            &device, &q_data, &k_data, &v_data,
+            batch, n_q_heads, n_kv_heads, q_len, k_len, head_dim, scale, 2, 0,
+        );
+        assert!((analytic - fd).abs() < 0.15,
+            "FA bwd dV[0]: analytic={analytic} fd={fd} diff={}", (analytic-fd).abs());
     }
 }
