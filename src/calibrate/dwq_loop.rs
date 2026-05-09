@@ -2165,6 +2165,23 @@ pub enum InterLayerOp {
     /// (validated at dispatch time when the input tensor's last
     /// dim is known).
     RmsNorm { eps: f32, weight: Vec<f32> },
+    /// Residual add: `h_cur = h_cur + saved[skip_from]`.
+    ///
+    /// `saved[i]` holds `h_cur` at the ENTRY of layer `i`'s matmul
+    /// (i.e. the value of `h_cur` before the qdq_affine+matmul at
+    /// that layer index).  `skip_from` must be strictly less than
+    /// the current layer index `i`; otherwise the dispatch rejects
+    /// loudly naming both values.
+    ///
+    /// Shape compatibility: `saved[skip_from]` and the post-matmul
+    /// `pre_act` must share the same shape (rows × cols both equal).
+    /// Callers must construct fixtures so the output dim of the
+    /// current layer equals the input dim of the skip-from layer.
+    ///
+    /// Use-case: `RmsNorm { .. }` followed by a Linear followed by
+    /// `Residual { skip_from: i_pre_norm }` mirrors the standard
+    /// LLM transformer-block residual `x = x + sublayer(norm(x))`.
+    Residual { skip_from: usize },
 }
 
 /// ADR-020 AC#7 Option A — N-Linear chain with non-Linear ops
@@ -2207,7 +2224,7 @@ pub fn train_n_linear_with_inter_ops_dwq_step(
     temperature: f32,
 ) -> Result<f32> {
     use crate::calibrate::autograd_gpu_tape::{
-        backward, matmul, ones_like, qdq_affine, rms_norm, silu, transpose, view, GpuTape,
+        add, backward, matmul, ones_like, qdq_affine, rms_norm, silu, transpose, view, GpuTape,
         GpuTensor,
     };
 
@@ -2296,8 +2313,11 @@ pub fn train_n_linear_with_inter_ops_dwq_step(
         GpuTensor::from_vec(&tape, teacher_topk_logits, vec![n_rows, top_k]).context("t leaf")?;
 
     let mut sb_leaves: Vec<(GpuTensor, GpuTensor)> = Vec::with_capacity(layers.len());
+    // `saved[i]` = h_cur BEFORE layer i's matmul — used by Residual { skip_from }.
+    let mut saved: Vec<GpuTensor> = Vec::with_capacity(layers.len());
     let mut h_cur: GpuTensor = x_t;
     for (i, (_, pack)) in layers.iter().enumerate() {
+        saved.push(h_cur.clone());
         let (_s_name, _b_name, s_v, b_v) = &sb_init[i];
         let n_groups = s_v.len();
         let s_t = GpuTensor::from_vec(&tape, s_v, vec![n_groups])?;
@@ -2333,6 +2353,29 @@ pub fn train_n_linear_with_inter_ops_dwq_step(
                 })?;
                 rms_norm(&pre_act, &w_t, *eps).with_context(|| {
                     format!("train_n_linear_with_inter_ops_dwq_step: rms_norm after layer[{i}]")
+                })?
+            }
+            InterLayerOp::Residual { skip_from } => {
+                let skip = *skip_from;
+                if skip >= i {
+                    return Err(anyhow!(
+                        "train_n_linear_with_inter_ops_dwq_step: Residual skip_from ({skip}) >= \
+                         layer_index ({i}) — skip_from must be strictly less than the current layer index"
+                    ));
+                }
+                let skip_t = &saved[skip];
+                if skip_t.shape() != pre_act.shape() {
+                    return Err(anyhow!(
+                        "train_n_linear_with_inter_ops_dwq_step: Residual shape mismatch at layer[{i}]: \
+                         pre_act={:?} but saved[{skip}]={:?}",
+                        pre_act.shape(),
+                        skip_t.shape()
+                    ));
+                }
+                add(&pre_act, skip_t).with_context(|| {
+                    format!(
+                        "train_n_linear_with_inter_ops_dwq_step: residual add at layer[{i}] skip_from={skip}"
+                    )
                 })?
             }
         };
@@ -5818,6 +5861,344 @@ mod tests {
         };
         assert!(dist(&s1_before, &s1_after) + dist(&b1_before, &b1_after) > 0.0);
         assert!(dist(&s2_before, &s2_after) + dist(&b2_before, &b2_after) > 0.0);
+    }
+
+    /// ADR-020 AC#7 Option A — with RmsNorm between L1 and L2: gradient
+    /// must flow through the RmsNorm backward and reach L1's params.
+    ///
+    /// Pins teacher targets to the student's own forward at the optimum
+    /// (run x → L1 → rms_norm → L2 once with unperturbed scales/biases,
+    /// capture logits, then pick_top_k_per_position for indices+values).
+    /// Perturbs b1 by +0.5 so there is a gradient signal for Adam to follow.
+    /// After ONE step via train_n_linear_with_inter_ops_dwq_step with
+    /// inter_ops = [RmsNorm{eps, weight}, Identity]: loss must be finite;
+    /// BOTH pairs' params must have changed (sum-abs-distance > 0);
+    /// critically L1 must move — that proves the rms_norm backward routes
+    /// the gradient all the way back to the first layer.
+    #[test]
+    fn train_n_linear_with_inter_ops_rms_norm_routes_grads() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use crate::calibrate::autograd_gpu_tape::{
+            matmul, qdq_affine, rms_norm, transpose, view, GpuTape, GpuTensor,
+        };
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let dim = 32;
+        let group_size = 8;
+        let n_rows = 32;
+        let top_k = 4;
+        let eps = 1e-6_f32;
+
+        // Deterministic weight tensors (sin/cos spiral — mantra pattern).
+        let w1: Vec<f32> = (0..dim * dim)
+            .map(|i| ((i as f32) * 0.013 - 0.4).sin() * 1.5)
+            .collect();
+        let w2: Vec<f32> = (0..dim * dim)
+            .map(|i| ((i as f32) * 0.017 + 0.2).cos() * 1.2)
+            .collect();
+        // RmsNorm weight: all-ones (identity scale) so the norm is
+        // transparent at init but the backward still propagates gradients.
+        let rms_weight: Vec<f32> = vec![1.0_f32; dim];
+
+        let pack1 = super::quant_pack_for_dwq(&device, &w1, dim, dim, 4, group_size).unwrap();
+        let pack2 = super::quant_pack_for_dwq(&device, &w2, dim, dim, 4, group_size).unwrap();
+
+        // Calibration input (sin-spiral for determinism).
+        let x_batch: Vec<f32> = (0..n_rows * dim)
+            .map(|i| ((i as f32) * 0.05 - 0.1).cos() * 0.5)
+            .collect();
+
+        // Compute teacher targets at the unperturbed optimum forward:
+        // x → L1 → rms_norm → L2 → logits.
+        let teacher_full: Vec<f32> = {
+            let tape = GpuTape::new(device.clone());
+            let s1 = GpuTensor::from_vec(&tape, &pack1.scales, vec![pack1.scales.len()]).unwrap();
+            let b1 = GpuTensor::from_vec(&tape, &pack1.biases, vec![pack1.biases.len()]).unwrap();
+            let s2 = GpuTensor::from_vec(&tape, &pack2.scales, vec![pack2.scales.len()]).unwrap();
+            let b2 = GpuTensor::from_vec(&tape, &pack2.biases, vec![pack2.biases.len()]).unwrap();
+            let x_t = GpuTensor::from_vec(&tape, &x_batch, vec![n_rows, dim]).unwrap();
+            let w1_qdq = qdq_affine(&s1, &b1, &pack1.q_int_bytes, group_size).unwrap();
+            let w1_2d = view(&w1_qdq, vec![dim, dim]).unwrap();
+            let w1_t = transpose(&w1_2d).unwrap();
+            let layer1 = matmul(&x_t, &w1_t).unwrap();
+            let rms_w = GpuTensor::from_vec(&tape, &rms_weight, vec![dim]).unwrap();
+            let layer1_norm = rms_norm(&layer1, &rms_w, eps).unwrap();
+            let w2_qdq = qdq_affine(&s2, &b2, &pack2.q_int_bytes, group_size).unwrap();
+            let w2_2d = view(&w2_qdq, vec![dim, dim]).unwrap();
+            let w2_t = transpose(&w2_2d).unwrap();
+            let logits = matmul(&layer1_norm, &w2_t).unwrap();
+            logits.to_vec().unwrap()
+        };
+        let (teacher_topk, teacher_idx) =
+            super::pick_top_k_per_position(&teacher_full, n_rows, 1, dim, top_k).unwrap();
+
+        // Perturb b1 so Adam has a gradient to descend.
+        let b1_perturbed: Vec<f32> = pack1.biases.iter().map(|x| x + 0.5).collect();
+
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig { lr: 1e-3, beta1: 0.9, beta2: 0.999, eps: 1e-8 },
+        )
+        .unwrap();
+        super::register_affine_pair(&mut adam, &device, "L1", &pack1.scales, &b1_perturbed)
+            .unwrap();
+        super::register_affine_pair(&mut adam, &device, "L2", &pack2.scales, &pack2.biases)
+            .unwrap();
+
+        let s1_before = adam.read_param("L1.scales").unwrap();
+        let b1_before = adam.read_param("L1.biases").unwrap();
+        let s2_before = adam.read_param("L2.scales").unwrap();
+        let b2_before = adam.read_param("L2.biases").unwrap();
+
+        let layers: Vec<(&str, &super::DwqQuantPack)> = vec![("L1", &pack1), ("L2", &pack2)];
+        let loss = super::train_n_linear_with_inter_ops_dwq_step(
+            &mut adam, &device, &layers,
+            &[
+                super::InterLayerOp::RmsNorm { eps, weight: rms_weight.clone() },
+                super::InterLayerOp::Identity,
+            ],
+            &x_batch, &teacher_topk, &teacher_idx,
+            n_rows, top_k, 2.0,
+        )
+        .expect("step should succeed");
+
+        assert!(loss.is_finite(), "loss must be finite; got {loss}");
+        assert_eq!(adam.step_count(), 1);
+
+        let s1_after = adam.read_param("L1.scales").unwrap();
+        let b1_after = adam.read_param("L1.biases").unwrap();
+        let s2_after = adam.read_param("L2.scales").unwrap();
+        let b2_after = adam.read_param("L2.biases").unwrap();
+
+        let dist = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).sum()
+        };
+        // L1 MUST move — proves rms_norm backward routes gradient.
+        let l1_delta = dist(&s1_before, &s1_after) + dist(&b1_before, &b1_after);
+        assert!(l1_delta > 0.0, "L1 params did not change; rms_norm backward is not routing grads");
+        // L2 must also move.
+        let l2_delta = dist(&s2_before, &s2_after) + dist(&b2_before, &b2_after);
+        assert!(l2_delta > 0.0, "L2 params did not change");
+    }
+
+    /// ADR-020 AC#7 Option A — RmsNorm weight dim mismatch fails loud.
+    ///
+    /// Pass RmsNorm with weight.len()=16 to a 32-dim layer.  Assert
+    /// the error message contains both "RmsNorm weight.len (16)" and
+    /// "pre_act last dim (32)".
+    #[test]
+    fn train_n_linear_with_inter_ops_rms_norm_rejects_wrong_weight_dim() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let dim = 32;
+        let group_size = 8;
+        let pack = super::quant_pack_for_dwq(
+            &device, &vec![0.0_f32; dim * dim], dim, dim, 4, group_size,
+        )
+        .unwrap();
+
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig { lr: 1e-3, beta1: 0.9, beta2: 0.999, eps: 1e-8 },
+        )
+        .unwrap();
+        super::register_affine_pair(&mut adam, &device, "L1", &pack.scales, &pack.biases).unwrap();
+        super::register_affine_pair(&mut adam, &device, "L2", &pack.scales, &pack.biases).unwrap();
+
+        let layers: Vec<(&str, &super::DwqQuantPack)> = vec![("L1", &pack), ("L2", &pack)];
+        // wrong_weight has 16 elements but the layer output dim is 32.
+        let wrong_weight = vec![1.0_f32; 16];
+        let res = super::train_n_linear_with_inter_ops_dwq_step(
+            &mut adam, &device, &layers,
+            &[
+                super::InterLayerOp::RmsNorm { eps: 1e-6, weight: wrong_weight },
+                super::InterLayerOp::Identity,
+            ],
+            &vec![0.0_f32; 32 * 32],
+            &vec![0.0_f32; 32 * 4],
+            &vec![0u32; 32 * 4],
+            32, 4, 1.0,
+        );
+        let err = match res {
+            Ok(_) => panic!("expected RmsNorm weight-dim error"),
+            Err(e) => e,
+        };
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("RmsNorm weight.len (16)"),
+            "expected 'RmsNorm weight.len (16)' in error; got: {msg}"
+        );
+        assert!(
+            msg.contains("pre_act last dim (32)"),
+            "expected 'pre_act last dim (32)' in error; got: {msg}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — Residual skip adds saved[0] back after L2's
+    /// matmul, proving the backward routes gradient through the residual
+    /// connection to BOTH layers.
+    ///
+    /// Chain: x → L1 → Identity → L2 → Residual { skip_from: 0 }.
+    /// saved[0] = x (input before L1's matmul).
+    /// After L2's matmul, residual adds saved[0]=x back: h_cur = L2_out + x.
+    /// All dims pinned to 32 so output of L2 and x are shape-compatible.
+    /// Perturb b1 by +0.5 so Adam has signal. Assert both layers' params
+    /// change after one step + loss is finite.
+    #[test]
+    fn train_n_linear_with_inter_ops_residual_routes_grads() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use crate::calibrate::autograd_gpu_tape::{
+            add, matmul, qdq_affine, transpose, view, GpuTape, GpuTensor,
+        };
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let dim = 32;
+        let group_size = 8;
+        let n_rows = 32;
+        let top_k = 4;
+
+        let w1: Vec<f32> = (0..dim * dim)
+            .map(|i| ((i as f32) * 0.013 - 0.4).sin() * 1.5)
+            .collect();
+        let w2: Vec<f32> = (0..dim * dim)
+            .map(|i| ((i as f32) * 0.017 + 0.2).cos() * 1.2)
+            .collect();
+        let pack1 = super::quant_pack_for_dwq(&device, &w1, dim, dim, 4, group_size).unwrap();
+        let pack2 = super::quant_pack_for_dwq(&device, &w2, dim, dim, 4, group_size).unwrap();
+
+        let x_batch: Vec<f32> = (0..n_rows * dim)
+            .map(|i| ((i as f32) * 0.05 - 0.1).cos() * 0.5)
+            .collect();
+
+        // Teacher targets: x → L1 → Identity → L2 → residual add saved[0]=x.
+        let teacher_full: Vec<f32> = {
+            let tape = GpuTape::new(device.clone());
+            let s1 = GpuTensor::from_vec(&tape, &pack1.scales, vec![pack1.scales.len()]).unwrap();
+            let b1 = GpuTensor::from_vec(&tape, &pack1.biases, vec![pack1.biases.len()]).unwrap();
+            let s2 = GpuTensor::from_vec(&tape, &pack2.scales, vec![pack2.scales.len()]).unwrap();
+            let b2 = GpuTensor::from_vec(&tape, &pack2.biases, vec![pack2.biases.len()]).unwrap();
+            let x_t = GpuTensor::from_vec(&tape, &x_batch, vec![n_rows, dim]).unwrap();
+            let w1_qdq = qdq_affine(&s1, &b1, &pack1.q_int_bytes, group_size).unwrap();
+            let w1_2d = view(&w1_qdq, vec![dim, dim]).unwrap();
+            let w1_t = transpose(&w1_2d).unwrap();
+            let layer1_out = matmul(&x_t, &w1_t).unwrap();
+            let w2_qdq = qdq_affine(&s2, &b2, &pack2.q_int_bytes, group_size).unwrap();
+            let w2_2d = view(&w2_qdq, vec![dim, dim]).unwrap();
+            let w2_t = transpose(&w2_2d).unwrap();
+            let layer2_out = matmul(&layer1_out, &w2_t).unwrap();
+            // Residual: layer2_out + x (saved[0]).
+            let logits = add(&layer2_out, &x_t).unwrap();
+            logits.to_vec().unwrap()
+        };
+        let (teacher_topk, teacher_idx) =
+            super::pick_top_k_per_position(&teacher_full, n_rows, 1, dim, top_k).unwrap();
+
+        // Perturb b1 so Adam has a gradient to descend.
+        let b1_perturbed: Vec<f32> = pack1.biases.iter().map(|x| x + 0.5).collect();
+
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig { lr: 1e-3, beta1: 0.9, beta2: 0.999, eps: 1e-8 },
+        )
+        .unwrap();
+        super::register_affine_pair(&mut adam, &device, "L1", &pack1.scales, &b1_perturbed)
+            .unwrap();
+        super::register_affine_pair(&mut adam, &device, "L2", &pack2.scales, &pack2.biases)
+            .unwrap();
+
+        let s1_before = adam.read_param("L1.scales").unwrap();
+        let b1_before = adam.read_param("L1.biases").unwrap();
+        let s2_before = adam.read_param("L2.scales").unwrap();
+        let b2_before = adam.read_param("L2.biases").unwrap();
+
+        let layers: Vec<(&str, &super::DwqQuantPack)> = vec![("L1", &pack1), ("L2", &pack2)];
+        let loss = super::train_n_linear_with_inter_ops_dwq_step(
+            &mut adam, &device, &layers,
+            &[
+                super::InterLayerOp::Identity,
+                super::InterLayerOp::Residual { skip_from: 0 },
+            ],
+            &x_batch, &teacher_topk, &teacher_idx,
+            n_rows, top_k, 2.0,
+        )
+        .expect("step should succeed");
+
+        assert!(loss.is_finite(), "loss must be finite; got {loss}");
+        assert_eq!(adam.step_count(), 1);
+
+        let s1_after = adam.read_param("L1.scales").unwrap();
+        let b1_after = adam.read_param("L1.biases").unwrap();
+        let s2_after = adam.read_param("L2.scales").unwrap();
+        let b2_after = adam.read_param("L2.biases").unwrap();
+
+        let dist = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).sum()
+        };
+        let l1_delta = dist(&s1_before, &s1_after) + dist(&b1_before, &b1_after);
+        assert!(l1_delta > 0.0, "L1 params did not change after residual step");
+        let l2_delta = dist(&s2_before, &s2_after) + dist(&b2_before, &b2_after);
+        assert!(l2_delta > 0.0, "L2 params did not change after residual step");
+    }
+
+    /// ADR-020 AC#7 Option A — Residual with skip_from >= layer_index fails loud.
+    ///
+    /// In a 2-layer chain (layer indices 0, 1), passing
+    /// Residual { skip_from: 2 } at layer index 1 must error loudly
+    /// naming both values: "skip_from (2) >= layer_index (1)".
+    #[test]
+    fn train_n_linear_with_inter_ops_residual_rejects_skip_from_geq_layer_index() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let dim = 32;
+        let group_size = 8;
+        let pack = super::quant_pack_for_dwq(
+            &device, &vec![0.0_f32; dim * dim], dim, dim, 4, group_size,
+        )
+        .unwrap();
+
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig { lr: 1e-3, beta1: 0.9, beta2: 0.999, eps: 1e-8 },
+        )
+        .unwrap();
+        super::register_affine_pair(&mut adam, &device, "L1", &pack.scales, &pack.biases).unwrap();
+        super::register_affine_pair(&mut adam, &device, "L2", &pack.scales, &pack.biases).unwrap();
+
+        // Build minimal x + teacher so the loop reaches layer index 1.
+        let x_data = vec![0.1_f32; dim * 32];
+        let teacher_topk = vec![1.0_f32; 32 * 4];
+        let teacher_idx: Vec<u32> = (0..32_u32 * 4).map(|i| i % dim as u32).collect();
+
+        let layers: Vec<(&str, &super::DwqQuantPack)> = vec![("L1", &pack), ("L2", &pack)];
+        // skip_from=2 is >= layer_index=1 at the second layer — must reject.
+        let res = super::train_n_linear_with_inter_ops_dwq_step(
+            &mut adam, &device, &layers,
+            &[
+                super::InterLayerOp::Identity,
+                super::InterLayerOp::Residual { skip_from: 2 },
+            ],
+            &x_data, &teacher_topk, &teacher_idx,
+            32, 4, 1.0,
+        );
+        let err = match res {
+            Ok(_) => panic!("expected skip_from out-of-range error"),
+            Err(e) => e,
+        };
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("skip_from (2)"),
+            "expected 'skip_from (2)' in error; got: {msg}"
+        );
+        assert!(
+            msg.contains("layer_index (1)"),
+            "expected 'layer_index (1)' in error; got: {msg}"
+        );
     }
 
     /// ADR-020 AC#7 Option A — wrong inter_ops length fails loud.
