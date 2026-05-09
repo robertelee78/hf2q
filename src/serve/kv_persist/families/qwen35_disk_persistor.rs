@@ -49,52 +49,55 @@ use super::qwen35_hybrid_persistor::{
 
 /// Disk-backed cold-resume persistor for qwen35 hybrid snapshots.
 ///
-/// Constructed once per `(cache_dir, config)` at engine load; the
-/// `cache_dir` argument is sourced from `HF2Q_KV_PERSIST` env (iter-6).
-/// Multiple `Qwen35LoadedModel` instances using the same config share a
-/// fingerprint subdir (correct namespacing + zero overlap).
+/// Constructed once per `cache_dir` at engine load; the `cache_dir`
+/// argument is sourced from `HF2Q_KV_PERSIST` env (iter-6).
+/// `Qwen35HybridConfig` is passed PER-CALL on `write` / `read` /
+/// `hydrate_for_cfg` because cache shape (`max_seq_len`, `n_seqs`)
+/// is per-prefill, not load-time (kv_cache.rs:347+ — see ADR-027
+/// §4.7 iter-6a finding).
+///
+/// Multiple `Qwen35LoadedModel` instances using the same `cache_dir`
+/// can safely share one persistor; per-cfg isolation is enforced by
+/// the fingerprint subdir layout
+/// (`<cache_dir>/<cfg-fingerprint>/<lcp_key>.bin`) — cfg drift on
+/// any shape field re-routes to a different subdir, so re-quanting
+/// or different `max_seq_len` requests cannot collide.
 pub struct Qwen35DiskPersistor {
     /// Root cache directory (operator-controlled). Persisted files land
-    /// under `<cache_dir>/<fingerprint>/<lcp_key>.bin`.
+    /// under `<cache_dir>/<cfg-fingerprint>/<lcp_key>.bin`.
     cache_dir: PathBuf,
-    /// Shape config; any file written by this persistor is tagged with
-    /// the config's fingerprint and read-back validates against it.
-    cfg: Qwen35HybridConfig,
-    /// Cached fingerprint hex (16 chars). Computed once at construction
-    /// from `cfg`; never re-derived per-write.
-    fingerprint_hex: String,
 }
 
 impl Qwen35DiskPersistor {
-    /// Construct a persistor rooted at `cache_dir` for snapshots
-    /// matching `cfg`. Creates `<cache_dir>/<fingerprint>/` on disk if
-    /// absent; subsequent writes land directly there.
-    pub fn new(cache_dir: PathBuf, cfg: Qwen35HybridConfig) -> Result<Self> {
-        let fingerprint_hex = compute_config_fingerprint_hex(&cfg);
-        let dir = cache_dir.join(&fingerprint_hex);
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("Qwen35DiskPersistor: mkdir {}", dir.display()))?;
-        Ok(Self {
-            cache_dir,
-            cfg,
-            fingerprint_hex,
-        })
+    /// Construct a persistor rooted at `cache_dir`. Does NOT create
+    /// the directory yet — the per-cfg subdir is created lazily on
+    /// the first `write` for that cfg.
+    pub fn new(cache_dir: PathBuf) -> Result<Self> {
+        // Validate the parent dir is creatable; do not pre-create
+        // per-cfg subdirs (we don't know which cfgs will be used yet).
+        fs::create_dir_all(&cache_dir).with_context(|| {
+            format!("Qwen35DiskPersistor: mkdir {}", cache_dir.display())
+        })?;
+        Ok(Self { cache_dir })
     }
 
-    /// Path to the file that would back `lcp_key`, regardless of
-    /// whether the file currently exists on disk.
-    pub fn path_for_key(&self, lcp_key_hex: &str) -> PathBuf {
+    /// Path to the file that would back `(cfg, lcp_key)`, regardless
+    /// of whether the file currently exists on disk.
+    pub fn path_for_key(&self, cfg: &Qwen35HybridConfig, lcp_key_hex: &str) -> PathBuf {
+        let fingerprint_hex = compute_config_fingerprint_hex(cfg);
         self.cache_dir
-            .join(&self.fingerprint_hex)
+            .join(fingerprint_hex)
             .join(format!("{lcp_key_hex}.bin"))
     }
 
-    /// Serialize `snapshot` through the QH35 envelope and write the
-    /// bytes to `<cache_dir>/<fingerprint>/<lcp_key>.bin` atomically
-    /// (tempfile + rename). Overwrites any existing file at the same
-    /// key.
+    /// Serialize `snapshot` through the QH35 envelope (under `cfg`)
+    /// and write the bytes to
+    /// `<cache_dir>/<cfg-fingerprint>/<lcp_key>.bin` atomically
+    /// (tempfile + rename). Creates the per-cfg subdir on first use.
+    /// Overwrites any existing file at the same key.
     pub fn write(
         &self,
+        cfg: &Qwen35HybridConfig,
         lcp_key_hex: &str,
         snapshot: &HybridKvCacheSnapshot,
     ) -> Result<()> {
@@ -109,9 +112,18 @@ impl Qwen35DiskPersistor {
             "Qwen35DiskPersistor::write: lcp_key_hex must be alphanumeric/_/- only \
              (got {lcp_key_hex:?})"
         );
-        let bytes = serialize_hybrid_snapshot(snapshot, &self.cfg)
+        let bytes = serialize_hybrid_snapshot(snapshot, cfg)
             .context("Qwen35DiskPersistor::write: serialize_hybrid_snapshot")?;
-        let final_path = self.path_for_key(lcp_key_hex);
+        let final_path = self.path_for_key(cfg, lcp_key_hex);
+        let cfg_dir = final_path
+            .parent()
+            .ok_or_else(|| anyhow!("Qwen35DiskPersistor::write: path has no parent"))?;
+        fs::create_dir_all(cfg_dir).with_context(|| {
+            format!(
+                "Qwen35DiskPersistor::write: per-cfg mkdir {}",
+                cfg_dir.display()
+            )
+        })?;
         let tmp_path = final_path.with_extension("bin.tmp");
         {
             let mut tmp = fs::File::create(&tmp_path).with_context(|| {
@@ -134,17 +146,18 @@ impl Qwen35DiskPersistor {
         Ok(())
     }
 
-    /// Read the snapshot keyed by `lcp_key_hex` from disk; returns
-    /// `Ok(None)` when the file doesn't exist (clean cache miss).
-    /// Returns `Err` on file-present-but-corrupt (caller should treat
-    /// as a cache miss + delete + log; iter-6's wire-up implements that
-    /// recovery).
+    /// Read the snapshot keyed by `(cfg, lcp_key_hex)` from disk;
+    /// returns `Ok(None)` when the file doesn't exist (clean cache
+    /// miss). Returns `Err` on file-present-but-corrupt (caller
+    /// should treat as a cache miss + delete + log; iter-6b's
+    /// wire-up implements that recovery).
     pub fn read(
         &self,
+        cfg: &Qwen35HybridConfig,
         lcp_key_hex: &str,
         device: &MlxDevice,
     ) -> Result<Option<HybridKvCacheSnapshot>> {
-        let path = self.path_for_key(lcp_key_hex);
+        let path = self.path_for_key(cfg, lcp_key_hex);
         let bytes = match fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -155,40 +168,43 @@ impl Qwen35DiskPersistor {
                 ))
             }
         };
-        let snap = deserialize_hybrid_snapshot(&bytes, &self.cfg, device)
-            .with_context(|| {
-                format!(
-                    "Qwen35DiskPersistor::read: deserialize {} ({} bytes)",
-                    path.display(),
-                    bytes.len()
-                )
-            })?;
+        let snap = deserialize_hybrid_snapshot(&bytes, cfg, device).with_context(|| {
+            format!(
+                "Qwen35DiskPersistor::read: deserialize {} ({} bytes)",
+                path.display(),
+                bytes.len()
+            )
+        })?;
         Ok(Some(snap))
     }
 
-    /// Walk `<cache_dir>/<fingerprint>/` and return every (lcp_key,
-    /// snapshot) pair that successfully deserializes. Files that fail
-    /// to deserialize (corrupt / wrong-config / drift) are skipped with
-    /// a warning trace — they don't poison the hydrate.
+    /// Walk `<cache_dir>/<cfg-fingerprint>/` and return every
+    /// `(lcp_key, snapshot)` pair that successfully deserializes
+    /// against `cfg`. Files that fail to deserialize (corrupt /
+    /// wrong-config / drift) are skipped with a warning trace — they
+    /// don't poison the hydrate.
     ///
-    /// Iter-6 calls this at engine load to seed the in-memory
-    /// `LcpRegistry`; the caller drives the actual `LcpRegistry::insert`
-    /// loop so this fn stays decoupled from the registry's borrow
-    /// shape.
-    pub fn hydrate_all(
+    /// Iter-6b calls this at first prefill (when cfg is known) to
+    /// seed the in-memory `LcpRegistry` for that cfg. Earlier-cfg
+    /// snapshots (under different fingerprint subdirs) are NOT
+    /// hydrated — they live correctly under their own subdir until a
+    /// matching-cfg prefill arrives.
+    pub fn hydrate_for_cfg(
         &self,
+        cfg: &Qwen35HybridConfig,
         device: &MlxDevice,
     ) -> Result<Vec<(String, HybridKvCacheSnapshot)>> {
-        let dir = self.cache_dir.join(&self.fingerprint_hex);
+        let fingerprint_hex = compute_config_fingerprint_hex(cfg);
+        let dir = self.cache_dir.join(&fingerprint_hex);
         let entries = match fs::read_dir(&dir) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Empty cache dir is a clean cold start — return [].
+                // Empty cfg-subdir is a clean cold start — return [].
                 return Ok(Vec::new());
             }
             Err(e) => {
                 return Err(anyhow!(
-                    "Qwen35DiskPersistor::hydrate_all: read_dir {}: {e}",
+                    "Qwen35DiskPersistor::hydrate_for_cfg: read_dir {}: {e}",
                     dir.display()
                 ))
             }
@@ -197,12 +213,11 @@ impl Qwen35DiskPersistor {
         for entry in entries {
             let entry = entry.with_context(|| {
                 format!(
-                    "Qwen35DiskPersistor::hydrate_all: dir entry under {}",
+                    "Qwen35DiskPersistor::hydrate_for_cfg: dir entry under {}",
                     dir.display()
                 )
             })?;
             let path = entry.path();
-            // Skip tempfiles + non-.bin files.
             let name = match path.file_name().and_then(|s| s.to_str()) {
                 Some(n) => n,
                 None => continue,
@@ -211,7 +226,7 @@ impl Qwen35DiskPersistor {
                 continue;
             }
             let lcp_key_hex = name.trim_end_matches(".bin").to_string();
-            match self.read(&lcp_key_hex, device) {
+            match self.read(cfg, &lcp_key_hex, device) {
                 Ok(Some(snap)) => out.push((lcp_key_hex, snap)),
                 Ok(None) => {
                     // Race window: file vanished between read_dir and
@@ -221,7 +236,7 @@ impl Qwen35DiskPersistor {
                     tracing::warn!(
                         path = %path.display(),
                         error = %e,
-                        "Qwen35DiskPersistor::hydrate_all: skipping corrupt cache file"
+                        "Qwen35DiskPersistor::hydrate_for_cfg: skipping corrupt cache file"
                     );
                 }
             }
@@ -229,15 +244,17 @@ impl Qwen35DiskPersistor {
         Ok(out)
     }
 
-    /// `cache_dir` getter — used by iter-6 wire-up + tests.
+    /// `cache_dir` getter — used by iter-6b wire-up + tests.
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
     }
 
-    /// Hex fingerprint of the bound config — exposed so iter-6's wire-
-    /// up can log it at engine load.
-    pub fn fingerprint_hex(&self) -> &str {
-        &self.fingerprint_hex
+    /// Compute the cfg-fingerprint subdir name (16-hex chars) for an
+    /// arbitrary `cfg` — exposed for tests + log lines that want to
+    /// surface "which cfg-subdir is in use" without exposing the full
+    /// hashing details.
+    pub fn fingerprint_hex_for(cfg: &Qwen35HybridConfig) -> String {
+        compute_config_fingerprint_hex(cfg)
     }
 }
 
@@ -466,6 +483,19 @@ mod tests {
         }
     }
 
+    /// Make a unique tempdir per test so parallel test execution
+    /// doesn't collide.
+    fn unique_tempdir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "qh35-disk-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
     #[test]
     fn qh35_disk_round_trip_via_tempdir() {
         let device = match MlxDevice::new() {
@@ -476,20 +506,13 @@ mod tests {
             }
         };
         let cfg = synth_cfg();
-        let tempdir = std::env::temp_dir().join(format!(
-            "qh35-disk-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let tempdir = unique_tempdir("rt");
         let _ = fs::remove_dir_all(&tempdir);
-        let persistor = Qwen35DiskPersistor::new(tempdir.clone(), cfg.clone()).unwrap();
+        let persistor = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
         let snap = synth_snapshot(&device, &cfg);
-        persistor.write("deadbeef_cafebabe", &snap).unwrap();
+        persistor.write(&cfg, "deadbeef_cafebabe", &snap).unwrap();
         let restored = persistor
-            .read("deadbeef_cafebabe", &device)
+            .read(&cfg, "deadbeef_cafebabe", &device)
             .unwrap()
             .expect("write+read should round-trip");
         assert!(snapshots_byte_equal(&snap, &restored));
@@ -506,23 +529,16 @@ mod tests {
             }
         };
         let cfg = synth_cfg();
-        let tempdir = std::env::temp_dir().join(format!(
-            "qh35-disk-miss-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let tempdir = unique_tempdir("miss");
         let _ = fs::remove_dir_all(&tempdir);
-        let persistor = Qwen35DiskPersistor::new(tempdir.clone(), cfg).unwrap();
-        let result = persistor.read("nonexistent_key", &device).unwrap();
+        let persistor = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
+        let result = persistor.read(&cfg, "nonexistent_key", &device).unwrap();
         assert!(result.is_none());
         let _ = fs::remove_dir_all(&tempdir);
     }
 
     #[test]
-    fn qh35_disk_hydrate_all_collects_every_file() {
+    fn qh35_disk_hydrate_for_cfg_collects_every_file() {
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -531,22 +547,15 @@ mod tests {
             }
         };
         let cfg = synth_cfg();
-        let tempdir = std::env::temp_dir().join(format!(
-            "qh35-disk-hydrate-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let tempdir = unique_tempdir("hydrate");
         let _ = fs::remove_dir_all(&tempdir);
-        let persistor = Qwen35DiskPersistor::new(tempdir.clone(), cfg.clone()).unwrap();
+        let persistor = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
         let snap = synth_snapshot(&device, &cfg);
         let keys = ["key_a", "key_b", "key_c"];
         for k in &keys {
-            persistor.write(k, &snap).unwrap();
+            persistor.write(&cfg, k, &snap).unwrap();
         }
-        let mut hydrated = persistor.hydrate_all(&device).unwrap();
+        let mut hydrated = persistor.hydrate_for_cfg(&cfg, &device).unwrap();
         hydrated.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(hydrated.len(), keys.len());
         for (got, expected) in hydrated.iter().zip(keys.iter()) {
@@ -558,8 +567,9 @@ mod tests {
 
     #[test]
     fn qh35_disk_fingerprint_subdir_isolates_cfg_drift() {
-        // Two configs with different shapes get different fingerprint
-        // subdirs — a key written under cfg-A is invisible under cfg-B.
+        // Two configs with different shapes routed to different
+        // fingerprint subdirs by ONE shared persistor — a key written
+        // under cfg-A must NOT appear under cfg-B.
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -567,36 +577,25 @@ mod tests {
                 return;
             }
         };
-        let mut cfg_a = synth_cfg();
+        let cfg_a = synth_cfg();
         let mut cfg_b = synth_cfg();
         cfg_b.full_attn_shape = [1, 4, 8, 4]; // n_kv_heads=4 instead of 2
-        let tempdir = std::env::temp_dir().join(format!(
-            "qh35-disk-fp-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let tempdir = unique_tempdir("fp");
         let _ = fs::remove_dir_all(&tempdir);
-        // Make cfg_a + cfg_b structurally distinct (avoid any chance of
-        // false equality between random byte patterns at the same key).
-        cfg_a.n_seqs = 1;
-        cfg_b.n_seqs = 1;
-        let pa = Qwen35DiskPersistor::new(tempdir.clone(), cfg_a.clone()).unwrap();
-        let pb = Qwen35DiskPersistor::new(tempdir.clone(), cfg_b.clone()).unwrap();
+        let persistor = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
         assert_ne!(
-            pa.fingerprint_hex(),
-            pb.fingerprint_hex(),
+            Qwen35DiskPersistor::fingerprint_hex_for(&cfg_a),
+            Qwen35DiskPersistor::fingerprint_hex_for(&cfg_b),
             "differently-shaped configs MUST produce different fingerprints"
         );
         let snap_a = synth_snapshot(&device, &cfg_a);
-        pa.write("shared_key", &snap_a).unwrap();
-        // pb under cfg_b should NOT see pa's file (different subdir).
-        let result_b = pb.read("shared_key", &device).unwrap();
+        persistor.write(&cfg_a, "shared_key", &snap_a).unwrap();
+        // Reading the SAME key under cfg_b targets a different subdir
+        // → must miss.
+        let result_b = persistor.read(&cfg_b, "shared_key", &device).unwrap();
         assert!(
             result_b.is_none(),
-            "cfg_b persistor must not see cfg_a's snapshot under shared key"
+            "cfg_b read must not see cfg_a's snapshot under shared key"
         );
         let _ = fs::remove_dir_all(&tempdir);
     }
@@ -611,34 +610,62 @@ mod tests {
             }
         };
         let cfg = synth_cfg();
-        let tempdir = std::env::temp_dir().join(format!(
-            "qh35-disk-overwrite-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let tempdir = unique_tempdir("overwrite");
         let _ = fs::remove_dir_all(&tempdir);
-        let persistor = Qwen35DiskPersistor::new(tempdir.clone(), cfg.clone()).unwrap();
-        // Write snap-A, then overwrite with snap-B (different patterns).
+        let persistor = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
+        // Write snap-A, then overwrite with mutated snap-B.
         let snap_a = synth_snapshot(&device, &cfg);
-        persistor.write("the_key", &snap_a).unwrap();
-        // snap_b matches cfg (same persistor / same fingerprint subdir);
-        // we mutate its bytes after construction so the on-disk content
-        // demonstrably overwrites snap_a's content.
+        persistor.write(&cfg, "the_key", &snap_a).unwrap();
         let mut snap_b = synth_snapshot(&device, &cfg);
-        // Mutate snap_b's first full-attn K bytes so it byte-differs.
         {
             let dst = snap_b.full_attn_k[0].as_mut_slice::<u8>().unwrap();
             for b in dst.iter_mut() {
                 *b = b.wrapping_add(7);
             }
         }
-        persistor.write("the_key", &snap_b).unwrap();
-        let restored = persistor.read("the_key", &device).unwrap().unwrap();
+        persistor.write(&cfg, "the_key", &snap_b).unwrap();
+        let restored = persistor.read(&cfg, "the_key", &device).unwrap().unwrap();
         assert!(snapshots_byte_equal(&snap_b, &restored));
         assert!(!snapshots_byte_equal(&snap_a, &restored));
+        let _ = fs::remove_dir_all(&tempdir);
+    }
+
+    #[test]
+    fn qh35_disk_multi_cfg_cohabit_one_persistor() {
+        // Iter-6b API affordance: a single persistor handles multiple
+        // cfgs (e.g., two prefills with different max_seq_len). Each
+        // cfg lives in its own fingerprint subdir; reads + writes
+        // route correctly per cfg.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg_a = synth_cfg();
+        // cfg_b: distinct full_attn_shape (different max_seq_len would
+        // be the production drift; we use a different head count so
+        // synth_snapshot produces a structurally-different cache).
+        let mut cfg_b = synth_cfg();
+        cfg_b.full_attn_shape = [1, 4, 8, 4];
+        let tempdir = unique_tempdir("multi-cfg");
+        let _ = fs::remove_dir_all(&tempdir);
+        let persistor = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
+        let snap_a = synth_snapshot(&device, &cfg_a);
+        let snap_b = synth_snapshot(&device, &cfg_b);
+        persistor.write(&cfg_a, "key1", &snap_a).unwrap();
+        persistor.write(&cfg_b, "key1", &snap_b).unwrap();
+        // Each cfg sees ITS OWN snap at the same key.
+        let r_a = persistor.read(&cfg_a, "key1", &device).unwrap().unwrap();
+        let r_b = persistor.read(&cfg_b, "key1", &device).unwrap().unwrap();
+        assert!(snapshots_byte_equal(&snap_a, &r_a));
+        assert!(snapshots_byte_equal(&snap_b, &r_b));
+        // Hydrate-for-cfg returns ONLY that cfg's entries.
+        let h_a = persistor.hydrate_for_cfg(&cfg_a, &device).unwrap();
+        let h_b = persistor.hydrate_for_cfg(&cfg_b, &device).unwrap();
+        assert_eq!(h_a.len(), 1);
+        assert_eq!(h_b.len(), 1);
         let _ = fs::remove_dir_all(&tempdir);
     }
 }

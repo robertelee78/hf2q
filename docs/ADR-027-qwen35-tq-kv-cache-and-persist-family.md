@@ -331,4 +331,5 @@ Each iter ships a complete, mantra-clean deliverable. No iter is "enable later";
 | 4 | 2026-05-08 | A | LANDED | MTP slot codec. hf2q `9e98c18`. 9/9 PASS. |
 | 5 | 2026-05-08 | A | LANDED | `Qwen35DiskPersistor` disk back-end (write/read/hydrate, atomic, fingerprint-isolated). hf2q `bb6e9f0`. 14/14 PASS. |
 | 6a | 2026-05-08 | A | LANDED | Investigation: cache shape is per-prefill (kv_cache.rs:347+), not load-time. Iter-5's `Qwen35DiskPersistor::new(cache_dir, cfg)` over-specifies. Iter-6b operator decision: Candidate A (per-call cfg API refactor) vs Candidate B (worker-owned lazy construction). §4.7 expanded. |
-| 6b | (pending) | A | – | Operator chooses A or B; implement engine wire-up + write-through + cold-resume hydrate. |
+| 6b.1 | 2026-05-08 | A | LANDED | Operator picked Candidate A. `Qwen35DiskPersistor` refactored: drop `cfg` from struct; per-call cfg on `write` / `read` / `hydrate_for_cfg`. Construction needs only `cache_dir`. Per-cfg fingerprint subdir layout preserved. New test `qh35_disk_multi_cfg_cohabit_one_persistor` proves one persistor handles multiple cfgs simultaneously. 15/15 PASS. |
+| 6b.2 | (pending) | A | – | Engine wire-up: thread `kv_persist_dir` from LoadOptions into `Qwen35LoadedModel`; per-prefill hydrate-for-cfg seam; write-through on `lcp_registry.store`. |
