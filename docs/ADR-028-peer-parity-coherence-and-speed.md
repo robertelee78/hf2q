@@ -1,6 +1,6 @@
 # ADR-028: Peer-Class Inference — Coherence Parity + Speed Parity-or-Better
 
-- **Status**: proposed
+- **Status**: accepted (2026-05-09 iter-87 — body settled, open scope sized)
 - **Date**: 2026-05-09
 - **Deciders**: Robert (operator), Claude (this session)
 - **Tags**: performance, kernel-parity, gemma, qwen35, prefill, decode, lock-in
@@ -178,6 +178,71 @@ First decode token id=8409 byte-identical across runs.
 hf2q full unit-test suite: **3390 passed; 0 failed; 10 ignored** (peer
 WIP stashed). Lock-in chain (iter-76 single-command) PASSES at HEAD.
 
+### Iter-87 replicated measurements + thermal-discipline note (2026-05-09)
+
+Re-ran iter-86 measurement at HEAD (`dd84f01`) under controlled cooldown
+discipline (60s+ between runs, 5s between trials):
+
+| Measurement | iter-86 cited | iter-87 replication | Match? |
+|---|---:|---:|:---|
+| pp2455 batched prefill (GPU_TS bucket profile) | 1165 ms (2119 t/s) | **1149 ms (2147 t/s)** | ✅ within noise |
+| pp2455 unprofiled batched prefill (5-trial median, cooldown) | not cited | **1022 ms (2416 t/s)** | new |
+| pp1024 batched prefill (3-trial median, no cooldown) | 1942 t/s | **1996 t/s** | ✅ +3% |
+| MOE_GATE_UP / 30 layers | 209.7 ms (6.99 ms/call) | 197.7 ms (6.59 ms/call) | ✅ within noise |
+| MOE_DOWN / 30 layers | 186.3 ms (6.21 ms/call) | 174.5 ms (5.82 ms/call) | ✅ within noise |
+
+**Thermal-noise floor on M5 Max** is ~25% for pp2455 batched prefill. A
+3-trial measurement WITHOUT cooldown (e.g. immediately after pp1024
+trials) produces 1118-1319 t/s (median 1240 t/s) — vs 2402-2430 t/s
+under cool-state. **The lock-in chain's existing pp1024 step does not
+cooldown between trials**, so any new pp2455 floor must either (a)
+include a cooldown step, or (b) set a permissive floor (1500 t/s)
+that clears thermal noise. Iter-78 qwen35 step uses 3-trial no-cooldown
+methodology and lands at ~2254 t/s (floor 1800).
+
+**Honest peer-gap recompute (cool-state, unprofiled)**:
+- pp2455: 2416 t/s vs llama.cpp cited 3023 t/s = **0.80× peer** (was
+  0.70× per-iter-86 hot-state-affected reading; iter-86 cited 0.70×
+  matches the bucket-profile-overhead 2147 t/s)
+- pp1024: 1996 t/s vs llama.cpp 1884 t/s = **1.06× peer** (BEATS, was
+  1.03× per iter-68/74 measurement)
+- llama.cpp peer baseline cited from iter-68 era (`d05fe1d7d`/build 9010);
+  current llama.cpp HEAD (`5d6f18a63`) NOT YET re-benchmarked. Closing
+  this loop requires `cd /opt/llama.cpp && cmake -B build -DGGML_METAL=1
+  && cmake --build build -j --target llama-bench` ~2 min on M5.
+
+### Iter-87 kernel coverage gap analysis (kernel-fusion-sweep, ADR-028 #4)
+
+Direct comparison of `host_name` template instantiations between
+mlx-native and llama.cpp `ggml-metal.metal`:
+
+| Family | llama.cpp variants | mlx-native variants | Gap |
+|---|---:|---:|---|
+| `mul_mv_ext_*_r1_{2,3,4,5}` | 80+ | 28 | missing q1_0/q2_K/q3_K/q4_1/q5_0/mxfp4/f32_f32/f16_f32/bf16_f32 |
+| `mul_mv_id_*_f32` | 25+ | 7 K-quants + 1 fused (q4_0_swiglu) | missing IQ-quants, MXFP4, BF16/F16/F32 |
+| `mul_mm_id_*_f32` (tensor) | 18 | 7 (Q4_0,Q8_0,Q6_K,Q5_1,IQ4_NL,Q5_K,Q4_K) | matches the 7 hf2q-supports types |
+| `(rms_)?norm_(mul|mul_add)_f32` | 8 | 1 (`rms_norm_mul_f32`) | missing `rms_norm_mul_add`, `norm_mul`, `norm_mul_add` × {scalar,vec4} |
+| `flash_attn_ext_{f32,f16,bf16,q4_0,…}_dk*_dv*` | 60+ | hf2q-specific TQ + prefill family | different design — vec/prefill split, KV-quant kernels via tq_hb |
+
+**Hot-path coverage check** (gemma-4-26b APEX-Q5_K_M, qwen35-A3B):
+- mm/mm_id Q5_K/Q6_K tensor variants — **PRESENT, used post-iter-68**
+- mv_id_q5_K_f32, mv_id_q6_K_f32 — **PRESENT** (used at decode)
+- mv_id Q5_1, IQ4_NL, Q4_K, Q8_0 — **PRESENT** (qwen35moe variants)
+- mv_ext for K-quants r1=2..5 — **PRESENT** (small-batch decode)
+- norm_mul_add fused 3-op kernel — **MISSING**
+  - On gemma 26B 30-layer prefill, our profile shows 5 distinct norm-add
+    bucket sites (PRE_ATTN_NORM, POST_ATTN_NORM_ADD, TRIPLE_RMS_NORM,
+    MOE_WSUM_DNORM_ADD, END_LAYER_NORM_ADD_SCALAR) totalling ~50 ms /
+    1149 ms = ~4.4% of pp2455. Even 100% closure would buy ~4% gain;
+    candidate but not biggest fish.
+- mv_ext IQ-quants/MXFP4/BF16 — MISSING but **not on hot path** (we
+  don't load these formats today)
+
+**Conclusion**: kernel coverage on the hot path is at parity. The
+remaining ~20% pp2455 gap is **per-kernel-time** within the kernels we
+already share, not unported variants. Confirming iter-71's earlier
+finding ("dispatch count at parity; gap is per-kernel-time").
+
 ## Consequences
 
 ### Positive
@@ -206,9 +271,10 @@ WIP stashed). Lock-in chain (iter-76 single-command) PASSES at HEAD.
 - **Decode 0.62× peer remains**: iter-69..72/81 measured but did not
   close. Multi-day µbench infrastructure (Q6_K pack helper that doesn't
   exist) is required for kernel-level attack.
-- **Pp2455 prefill still 0.70× peer** (was 0.57×). Closing further
-  requires distributed work across MoE/QKV/MLP/FA kernels — no single
-  bottleneck.
+- **Pp2455 prefill still 0.80× peer cool-state, 0.71× profiled** (was
+  0.57×). Closing further requires distributed work across MoE/QKV/MLP/
+  FA kernels — no single bottleneck. Per iter-87 kernel-coverage sweep,
+  the gap is per-kernel-time, NOT unported variants.
 
 ### Neutral
 
@@ -230,10 +296,17 @@ WIP stashed). Lock-in chain (iter-76 single-command) PASSES at HEAD.
 3. **Decode µbench infrastructure** (multi-day) — needs Q6_K pack
    helper + per-kernel timing harness. Would close 0.62× → ~0.85×
    peer estimate.
-4. **Kernel fusion sweep for decode** — read llama.cpp's mv_id_q*_n_*
-   family for any unported fused variants.
+4. **Kernel fusion sweep for decode** — iter-87 done: hot-path coverage
+   at parity with llama.cpp; one candidate fusion (`rms_norm_mul_add`,
+   `norm_mul[_add]`) ~4% potential pp2455 gain, ~0% decode gain (decode
+   doesn't pay norm cost the same way). Not the biggest fish.
 5. **Pp2455 closer-to-peer attack** — distributed work across 4-5
-   kernel categories; estimated 30% remaining gap closure.
+   kernel categories; iter-87 honest measurement = 0.80× peer cool-state
+   = 20% gap, not 30%. Per-kernel-time level fixes only.
+6. **llama.cpp peer baseline at HEAD** — iter-87 found llama.cpp moved
+   from `d05fe1d7d` (build 9010, used as iter-68 baseline) to
+   `5d6f18a63` (current HEAD). Re-bench needed to validate 3023/1884 t/s
+   peer numbers still hold or have shifted under llama.cpp's own work.
 
 ## Links
 
