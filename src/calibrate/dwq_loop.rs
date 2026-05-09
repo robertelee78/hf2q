@@ -1600,6 +1600,108 @@ pub fn read_affine_pair(
     Ok((s, b))
 }
 
+/// ADR-020 AC#7 Option A — packed (s_init, b_init, q_int) artifacts
+/// for one Linear, ready to wire into the student's per-Linear
+/// training step:
+/// - `scales` + `biases` go to [`register_affine_pair`] (Adam
+///   trainable leaves)
+/// - `q_int_bytes` becomes the constant q_int input to
+///   [`crate::calibrate::autograd_gpu_tape::qdq_affine`] each forward
+///
+/// `n` (output dim) × `k` (input dim) match the original 2-D weight
+/// shape and are carried alongside the artifacts so downstream
+/// callers don't have to plumb shape independently.
+#[derive(Debug, Clone)]
+pub struct DwqQuantPack {
+    /// Per-element packed quant codes, length `n * k`.  U8 with
+    /// values in `[0, 2^bits)`.  Caller passes this through
+    /// `qdq_affine(s, b, &q_int_bytes, group_size)` each step —
+    /// q_int is treated as a constant input, NOT a trainable leaf.
+    pub q_int_bytes: Vec<u8>,
+    /// Per-group scale init, length `n * k / group_size`.  Min-max
+    /// projection optimum (see `qdq_affine.metal:85-103`).
+    pub scales: Vec<f32>,
+    /// Per-group bias init, same length as `scales`.
+    pub biases: Vec<f32>,
+    /// Output dim of the original Linear (rows of the weight slice).
+    pub n: usize,
+    /// Input dim (cols).
+    pub k: usize,
+    /// Group size used during init.  The same value MUST be passed
+    /// to every downstream `qdq_affine` call to recover the same
+    /// W → q_int mapping.
+    pub group_size: usize,
+}
+
+/// ADR-020 AC#7 Option A — single-call wrapper around
+/// [`init_affine_params_gpu`] that carries the n×k shape with the
+/// returned artifacts and opens a fresh
+/// [`mlx_native::KernelRegistry`] internally so call sites don't
+/// have to.
+///
+/// Inputs:
+/// - `device`: live MlxDevice (the GPU init kernel needs metal_device())
+/// - `w_f32`: dequantized 2-D weight slice, length `n * k`,
+///   row-major (matches GGUF's `[n, k]` weight convention)
+/// - `n`, `k`: weight dims (validated against `w_f32.len()`)
+/// - `n_bits`: `2..=8` (passed through to the kernel as `n_bins =
+///   1 << n_bits`)
+/// - `group_size`: power-of-two in `[2, 1024]`, MUST divide `k`
+///
+/// Returns a [`DwqQuantPack`] suitable for handing to
+/// [`register_affine_pair`] (`.scales` + `.biases`) and the per-step
+/// `qdq_affine(s, b, &.q_int_bytes, group_size)` forward.
+///
+/// # Errors
+/// - `w_f32.len() != n * k`
+/// - `n == 0` or `k == 0`
+/// - `k % group_size != 0` (caught by `init_affine_params_gpu`'s
+///   `n_total % group_size` check via `n_total = n*k`)
+/// - underlying `init_affine_params_gpu` fails (propagated)
+pub fn quant_pack_for_dwq(
+    device: &MlxDevice,
+    w_f32: &[f32],
+    n: usize,
+    k: usize,
+    n_bits: u32,
+    group_size: usize,
+) -> Result<DwqQuantPack> {
+    if n == 0 || k == 0 {
+        return Err(anyhow!(
+            "quant_pack_for_dwq: n ({n}) and k ({k}) must be > 0"
+        ));
+    }
+    let expected = n
+        .checked_mul(k)
+        .ok_or_else(|| anyhow!("quant_pack_for_dwq: n * k overflows"))?;
+    if w_f32.len() != expected {
+        return Err(anyhow!(
+            "quant_pack_for_dwq: w_f32.len ({}) != n * k ({})",
+            w_f32.len(),
+            expected
+        ));
+    }
+    if k % group_size != 0 {
+        return Err(anyhow!(
+            "quant_pack_for_dwq: k ({k}) must be divisible by group_size ({group_size})"
+        ));
+    }
+
+    let mut registry = KernelRegistry::new();
+    let (q_int_bytes, scales, biases) =
+        init_affine_params_gpu(device, &mut registry, w_f32, group_size, n_bits)
+            .context("quant_pack_for_dwq: init_affine_params_gpu")?;
+
+    Ok(DwqQuantPack {
+        q_int_bytes,
+        scales,
+        biases,
+        n,
+        k,
+        group_size,
+    })
+}
+
 /// ADR-020 iter-12d-2 — per-Linear training summary inside a model
 /// scan (one entry per successfully-trained tensor).
 #[derive(Debug, Clone)]
@@ -4457,6 +4559,171 @@ mod tests {
         assert_eq!(teacher.forward_calls, 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — `quant_pack_for_dwq` happy path:
+    /// shape + sizes match the inputs; scales/biases counts == n*k /
+    /// group_size; q_int_bytes count == n*k.  Compares against a
+    /// direct `init_affine_params_gpu` call to verify the wrapper
+    /// adds no semantic drift.
+    #[test]
+    fn quant_pack_for_dwq_matches_init_affine_directly() {
+        use mlx_native::{KernelRegistry, MlxDevice};
+
+        let device = MlxDevice::new().expect("device");
+        let n = 4;
+        let k = 32;
+        let group_size = 8;
+        let bits = 4u32;
+        let w: Vec<f32> = (0..n * k).map(|i| (i as f32) * 0.013 - 0.5).collect();
+
+        let pack = super::quant_pack_for_dwq(&device, &w, n, k, bits, group_size)
+            .expect("pack");
+        assert_eq!(pack.n, n);
+        assert_eq!(pack.k, k);
+        assert_eq!(pack.group_size, group_size);
+        assert_eq!(pack.q_int_bytes.len(), n * k);
+        let n_groups = (n * k) / group_size;
+        assert_eq!(pack.scales.len(), n_groups);
+        assert_eq!(pack.biases.len(), n_groups);
+
+        // Direct call as oracle.
+        let mut registry = KernelRegistry::new();
+        let (q_oracle, s_oracle, b_oracle) =
+            super::init_affine_params_gpu(&device, &mut registry, &w, group_size, bits)
+                .expect("direct");
+        assert_eq!(pack.q_int_bytes, q_oracle);
+        assert_eq!(pack.scales, s_oracle);
+        assert_eq!(pack.biases, b_oracle);
+    }
+
+    /// ADR-020 AC#7 Option A — `quant_pack_for_dwq` rejects shape
+    /// mismatch (w.len != n*k).
+    #[test]
+    fn quant_pack_for_dwq_rejects_shape_mismatch() {
+        use mlx_native::MlxDevice;
+        let device = MlxDevice::new().expect("device");
+        let w = vec![0.0_f32; 100]; // n*k=128 expected → fail
+        let err = super::quant_pack_for_dwq(&device, &w, 4, 32, 4, 8).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("w_f32.len (100)") && msg.contains("128"),
+            "got: {msg}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — k must divide group_size cleanly.
+    #[test]
+    fn quant_pack_for_dwq_rejects_group_size_not_dividing_k() {
+        use mlx_native::MlxDevice;
+        let device = MlxDevice::new().expect("device");
+        // k=30 not divisible by group_size=8 → 240 % 8 = 0 (oops, 30*4=120 is div by 8)
+        // Use k=12, group_size=8 → 4*12=48 div by 8 OK; need k%group_size != 0
+        // k=10, gs=8 → 10 % 8 = 2 → reject
+        let w = vec![0.0_f32; 4 * 10];
+        let err = super::quant_pack_for_dwq(&device, &w, 4, 10, 4, 8).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("k (10)") && msg.contains("group_size (8)"),
+            "got: {msg}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — n=0 or k=0 fail loud.
+    #[test]
+    fn quant_pack_for_dwq_rejects_zero_dims() {
+        use mlx_native::MlxDevice;
+        let device = MlxDevice::new().expect("device");
+        let err =
+            super::quant_pack_for_dwq(&device, &[], 0, 32, 4, 8).unwrap_err();
+        assert!(format!("{:#}", err).contains("must be > 0"));
+        let err =
+            super::quant_pack_for_dwq(&device, &[], 4, 0, 4, 8).unwrap_err();
+        assert!(format!("{:#}", err).contains("must be > 0"));
+    }
+
+    /// ADR-020 AC#7 Option A — full ladder handshake:
+    ///   quant_pack_for_dwq → register_affine_pair → read_affine_pair
+    /// the (s, b) registered with Adam round-trip the init values
+    /// from the pack — proving the pack output feeds register_affine_pair
+    /// without reshape or copy.
+    #[test]
+    fn quant_pack_for_dwq_handshake_with_register_affine_pair() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let n = 4;
+        let k = 32;
+        let w: Vec<f32> = (0..n * k).map(|i| (i as f32) * 0.011 + 0.2).collect();
+        let pack = super::quant_pack_for_dwq(&device, &w, n, k, 4, 8).expect("pack");
+
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-4,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .expect("Adam");
+        let (sn, bn) = super::register_affine_pair(
+            &mut adam,
+            &device,
+            "blk.0.test.weight",
+            &pack.scales,
+            &pack.biases,
+        )
+        .expect("register");
+        assert_eq!(sn, "blk.0.test.weight.scales");
+        assert_eq!(bn, "blk.0.test.weight.biases");
+
+        let (s_back, b_back) =
+            super::read_affine_pair(&adam, "blk.0.test.weight").unwrap();
+        assert_eq!(s_back, pack.scales);
+        assert_eq!(b_back, pack.biases);
+    }
+
+    /// ADR-020 AC#7 Option A — qdq(s_init, b_init, q_int) recovers
+    /// the original weights up to ~1 ULP per group (min-max init is
+    /// the projection optimum for symmetric quant — same property
+    /// the Option B falsifier test relied on, here verified through
+    /// the new pack wrapper).
+    #[test]
+    fn quant_pack_for_dwq_qdq_recovers_w_at_init() {
+        use crate::calibrate::autograd_gpu_tape::{qdq_affine, GpuTape, GpuTensor};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let n = 4;
+        let k = 32;
+        let group_size = 8;
+        let w: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.071 - 1.0).sin() * 2.5).collect();
+
+        let pack =
+            super::quant_pack_for_dwq(&device, &w, n, k, 4, group_size).expect("pack");
+        let tape = GpuTape::new(device);
+        let s = GpuTensor::from_vec(&tape, &pack.scales, vec![pack.scales.len()])
+            .expect("s");
+        let b = GpuTensor::from_vec(&tape, &pack.biases, vec![pack.biases.len()])
+            .expect("b");
+        let qdq =
+            qdq_affine(&s, &b, &pack.q_int_bytes, group_size).expect("qdq");
+        let w_recovered = qdq.to_vec().expect("readback");
+        assert_eq!(w_recovered.len(), w.len());
+        // Min-max projection: max-abs error per group ≤ scale/2 ≈
+        // (max-min) / (n_bins - 1) / 2.  For the fixture range ~5,
+        // n_bins=16 → bound ≈ 0.17 (loose but real); typically << 0.05.
+        let max_abs_err = w
+            .iter()
+            .zip(w_recovered.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_abs_err < 0.2,
+            "qdq init recovery error too high: {max_abs_err}"
+        );
     }
 
     /// ADR-020 AC#7 Option A — `affine_param_name` produces the
