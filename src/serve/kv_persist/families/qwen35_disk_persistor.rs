@@ -857,6 +857,202 @@ mod tests {
         let _ = fs::remove_dir_all(&tempdir);
     }
 
+    /// ADR-027 Phase B iter-44 — cross-process replay with TQ-populated
+    /// snapshot.
+    ///
+    /// Sibling of `qh35_disk_cross_process_replay_into_fresh_lcp_registry`
+    /// (which uses an F32-only synthetic snapshot). This test populates
+    /// the snapshot's TQ buffers (mirroring iter-34's production case
+    /// where slot.k=None, slot.tq=Some) and validates:
+    /// (a) v3 codec serializes TQ bytes to disk (iter-36 path)
+    /// (b) v3 codec deserializes TQ bytes back from disk in a fresh
+    ///     process (iter-36 reader)
+    /// (c) The hydrated `HybridKvCacheSnapshot.full_attn_tq` field
+    ///     contains the same bytes the writer put in.
+    ///
+    /// Closes the last validation gap for the iter-23 chain: end-to-end
+    /// disk persistence + cross-process replay in TQ-only mode is now
+    /// proven by code+test (not just unit-level codec tests). Future
+    /// production cold-start hydrate scenarios in TQ-only mode are
+    /// regression-protected.
+    #[test]
+    fn qh35_disk_cross_process_replay_with_tq_payload_byte_equal() {
+        use crate::inference::models::qwen35::kv_cache::TqKvSnapshot;
+        use crate::serve::kv_persist::lcp_registry::{LcpKey, LcpRegistry};
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        // Use a minimal cfg (no linear-attn, no MTP) to keep the test
+        // focused on the TQ codec round-trip path. The full
+        // synth_cfg with linear-attn + MTP is exercised by the
+        // sibling F32 cross-process test above.
+        let cfg = Qwen35HybridConfig {
+            n_full_attn: 2,
+            n_linear_attn: 0,
+            has_mtp: false,
+            n_seqs: 1,
+            full_attn_shape: [1, 2, 8, 4],
+            full_attn_codec: FullAttnCodec::F32Dense,
+            linear_conv_shape: [0, 0, 0],
+            linear_recurrent_shape: [0, 0, 0, 0],
+            mtp_shape: [0, 0, 0, 0],
+        };
+        let tempdir = unique_tempdir("xprocess-tq");
+        let _ = fs::remove_dir_all(&tempdir);
+
+        // Build a TQ-populated snapshot (slot.k=None, slot.tq=Some).
+        // We emit None for K/V (TQ-only mode) and Some for TQ.
+        let n_full_attn = cfg.n_full_attn as usize;
+        let mut full_attn_tq: Vec<Option<TqKvSnapshot>> = Vec::with_capacity(n_full_attn);
+        for slot in 0..n_full_attn {
+            // TQ packed: 8 bytes; norms: 2 elements f32 = 8 bytes.
+            let mut k_packed = device.alloc_buffer(8, DType::U8, vec![8]).unwrap();
+            let mut k_norms = device.alloc_buffer(8, DType::F32, vec![2]).unwrap();
+            let mut v_packed = device.alloc_buffer(8, DType::U8, vec![8]).unwrap();
+            let mut v_norms = device.alloc_buffer(8, DType::F32, vec![2]).unwrap();
+            for (i, b) in k_packed.as_mut_slice::<u8>().unwrap().iter_mut().enumerate() {
+                *b = ((slot * 41 + i * 13) % 251) as u8;
+            }
+            for (i, b) in v_packed.as_mut_slice::<u8>().unwrap().iter_mut().enumerate() {
+                *b = ((slot * 17 + i * 23) % 251) as u8;
+            }
+            for (i, f) in k_norms.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+                *f = (slot as f32) * 0.75 + (i as f32) * 0.25;
+            }
+            for (i, f) in v_norms.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+                *f = (slot as f32) * 0.5 + (i as f32) * 0.125;
+            }
+            full_attn_tq.push(Some(TqKvSnapshot {
+                k_packed, k_norms, v_packed, v_norms,
+                norms_per_pos: 1,
+            }));
+        }
+        let snap = HybridKvCacheSnapshot {
+            full_attn_k: (0..n_full_attn).map(|_| None).collect(),
+            full_attn_v: (0..n_full_attn).map(|_| None).collect(),
+            full_attn_current_len: (0..n_full_attn)
+                .map(|s| (0..cfg.n_seqs).map(|seq| s as u32 * 100 + seq).collect())
+                .collect(),
+            full_attn_tq,
+            mtp: None,
+            linear_conv: Vec::new(),
+            linear_recurrent: Vec::new(),
+        };
+
+        let original_prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let new_request_prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 999, 999, 999];
+
+        let mut fp = [0u8; 32];
+        for (i, b) in fp.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add(11);
+        }
+        let original_key = LcpKey {
+            model_fingerprint: ModelFingerprint(fp),
+            tenant_id: "qwen35:tq:test".to_string(),
+            params_hash: 0xCAFE_F00D_BEEF_DEAD,
+        };
+
+        // ── Process A: write TQ-populated snapshot+sidecar to disk ──
+        // Capture source TQ bytes BEFORE moving into write — needed for
+        // post-hydrate byte-equality assertions.
+        let mut src_k_packed: Vec<Vec<u8>> = Vec::with_capacity(n_full_attn);
+        let mut src_v_packed: Vec<Vec<u8>> = Vec::with_capacity(n_full_attn);
+        let mut src_k_norms: Vec<Vec<u8>> = Vec::with_capacity(n_full_attn);
+        let mut src_v_norms: Vec<Vec<u8>> = Vec::with_capacity(n_full_attn);
+        for tq in snap.full_attn_tq.iter() {
+            let tq = tq.as_ref().unwrap();
+            src_k_packed.push(tq.k_packed.as_slice::<u8>().unwrap().to_vec());
+            src_v_packed.push(tq.v_packed.as_slice::<u8>().unwrap().to_vec());
+            src_k_norms.push(tq.k_norms.as_slice::<u8>().unwrap().to_vec());
+            src_v_norms.push(tq.v_norms.as_slice::<u8>().unwrap().to_vec());
+        }
+        {
+            let persistor_a = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
+            let sidecar = LcpSidecarMetadata {
+                model_fingerprint: original_key.model_fingerprint.clone(),
+                tenant_id: original_key.tenant_id.clone(),
+                params_hash: original_key.params_hash,
+                prompt_tokens: original_prompt.clone(),
+                sliding_window: 4096,
+                linear_capacity: 2048,
+            };
+            persistor_a.write(&cfg, "tqkey0001", &snap, &sidecar).unwrap();
+        } // persistor_a + snap dropped — simulates process exit
+
+        // ── Process B: fresh persistor + fresh registry; hydrate ──
+        let mut registry: LcpRegistry<HybridKvCacheSnapshot> = LcpRegistry::new(8);
+        let persistor_b = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
+        let triples = persistor_b.hydrate_for_cfg(&cfg, &device).unwrap();
+        assert_eq!(triples.len(), 1, "hydrate must find the one TQ snapshot");
+
+        for (_key_hex, hydrated_snap, sidecar) in triples {
+            // Byte-equality check: every TQ buffer in the hydrated snapshot
+            // matches what process A wrote.
+            assert_eq!(
+                hydrated_snap.full_attn_tq.len(),
+                n_full_attn,
+                "hydrated snapshot must have {n_full_attn} full_attn_tq entries"
+            );
+            for (i, hyd_tq) in hydrated_snap.full_attn_tq.iter().enumerate() {
+                let hyd = hyd_tq.as_ref().unwrap_or_else(|| {
+                    panic!("hydrated full_attn_tq[{i}] must be Some — codec v3 should round-trip TQ payload")
+                });
+                assert_eq!(
+                    hyd.k_packed.as_slice::<u8>().unwrap(),
+                    src_k_packed[i].as_slice(),
+                    "slot[{i}].k_packed bytes diverge across cross-process round-trip"
+                );
+                assert_eq!(
+                    hyd.v_packed.as_slice::<u8>().unwrap(),
+                    src_v_packed[i].as_slice(),
+                    "slot[{i}].v_packed bytes diverge"
+                );
+                assert_eq!(
+                    hyd.k_norms.as_slice::<u8>().unwrap(),
+                    src_k_norms[i].as_slice(),
+                    "slot[{i}].k_norms bytes diverge"
+                );
+                assert_eq!(
+                    hyd.v_norms.as_slice::<u8>().unwrap(),
+                    src_v_norms[i].as_slice(),
+                    "slot[{i}].v_norms bytes diverge"
+                );
+                assert_eq!(hyd.norms_per_pos, 1, "norms_per_pos must round-trip");
+            }
+            // K/V remain None (TQ-only mode).
+            for i in 0..n_full_attn {
+                assert!(hydrated_snap.full_attn_k[i].is_none(),
+                    "K must remain None across round-trip for slot[{i}]");
+                assert!(hydrated_snap.full_attn_v[i].is_none(),
+                    "V must remain None across round-trip for slot[{i}]");
+            }
+            // Re-store into registry (mirror production hydrate path).
+            let key = LcpKey {
+                model_fingerprint: sidecar.model_fingerprint.clone(),
+                tenant_id: sidecar.tenant_id.clone(),
+                params_hash: sidecar.params_hash,
+            };
+            registry.store(
+                key,
+                sidecar.prompt_tokens.clone(),
+                vec![std::sync::Arc::new(hydrated_snap)],
+                sidecar.sliding_window as usize,
+                sidecar.linear_capacity as usize,
+            ).expect("registry stores hydrated TQ snapshot");
+        }
+
+        // Lookup with shared prefix (LCP=7) succeeds.
+        let prefix = registry.lookup(&original_key, &new_request_prompt)
+            .expect("post-hydrate lookup with original key must hit");
+        assert_eq!(prefix.k, 7, "LCP length must match shared prefix");
+
+        let _ = fs::remove_dir_all(&tempdir);
+    }
+
     /// Defensive: a registry hydrated from a disk persistor with an
     /// EMPTY cfg-subdir (clean cold start on a brand-new HF2Q_KV_PERSIST
     /// dir) stays empty and lookups miss cleanly. No I/O errors, no
