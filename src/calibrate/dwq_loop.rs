@@ -3452,494 +3452,477 @@ where
     })
 }
 
-/// ADR-020 AC#7 Option A — production wrapper that drives the full-model DWQ
-/// training pipeline end-to-end for the ONE Linear we can currently train
-/// without `flash_attn_train` in mlx-native: the **lm_head** (`output.weight`
-/// in GGUF naming).
+/// ADR-020 AC#7 Phase 3c — full-model real-GQA DWQ training.
 ///
-/// ## Why lm_head only (v1)
+/// Trains ALL full-attention transformer-layer Linears jointly with
+/// the lm_head using cross-layer KL-divergence gradient signal flowing
+/// through `decoder_layer_on_tape_real_gqa` (Phase 3b).
 ///
-/// Training any Linear other than lm_head requires cross-layer gradient signal
-/// flowing THROUGH the attention mechanism.  hf2q's autograd tape supports the
-/// FFN topology (RMSNorm → Linear → SiLU → Linear → Residual) but the full
-/// multi-head attention forward+backward requires `flash_attn_train`, which is
-/// not yet implemented in mlx-native.  Every non-lm-head Linear is recorded in
-/// `result.skipped` with the reason
-/// `"deferred — pending mlx-native flash_attn_train"`.
-///
-/// The lm_head Linear IS trainable end-to-end because it receives the final
-/// residual-stream hidden state as input and produces full-vocabulary logits
-/// directly — no attention backprop required.
-///
-/// ## What "hidden state" means for lm_head (honest scope note)
-///
-/// `Qwen35Model::forward_gpu_with_hidden` returns the residual stream
-/// **before** `output_norm` (the final RMSNorm before the lm_head projection).
-/// Using the pre-norm hidden as `x_batch` is a v1 approximation — the true
-/// lm_head input is `rms_norm(hidden, output_norm_weight)`.  The approximation
-/// is mantra-aligned: it trains the lm_head's (s, b) affine parameters against
-/// real teacher logits produced by the same model, which IS measurable AC#7
-/// progress.  A future iter swaps in the post-norm hidden once the interface
-/// for capturing it separately from the lm_head is added.
-///
-/// ## Algorithm
-///
-/// 1. `cfg.validate()` — fail-loud preflight.
-/// 2. Open teacher: `Qwen35Model::load_from_gguf(cfg.gguf_path)`.
-/// 3. Open GGUF for tensor iteration via `GgufFile::open`.
-/// 4. Walk every tensor.  For `"output.weight"` (the lm_head):
-///    - shape must be rank-2 `[n, k]` with `n >= 32`, `k >= 32`,
-///      `k % cfg.group_size == 0`
-///    - `load_tensor_f32` → dequantize to FP32
-///    - `quant_pack_for_dwq` → `DwqQuantPack`
-///    - `register_affine_pair` → Adam-managed (s, b) leaves
-/// 5. For each calibration batch, run each sequence row through
-///    `model.forward_gpu_with_hidden` to capture `(logits_full, hidden)`.
-///    Take the last-token position from each row → build `DwqOneLinearBatch`.
-/// 6. Drive `cfg.n_steps` Adam steps via `train_one_linear_dwq_loop`.
-/// 7. Read back the trained (s, b) → build `MlxAffineLinear` → serialize.
-/// 8. All other rank-2 Linears (attn_q, attn_k, …, ffn_gate, ffn_up,
-///    ffn_down, etc.) are recorded as skipped.
-///
-/// ## Returns
-///
-/// `DwqAllLinearsResult` with:
-/// - `trained.len() == 1` on success (the lm_head)
-/// - `skipped` contains every other Linear with the deferred reason
-/// - `safetensors_bytes` contains the single trained lm_head overlay
-/// - `mean_delta_kl_nats`: `None` (compute_bench is off in v1)
-///
-/// ## Errors
-///
-/// - `cfg.validate()` fails
-/// - GGUF does not contain `"output.weight"`
-/// - `output.weight` fails dimension constraints
-/// - `load_tensor_f32` fails (unsupported ggml_type)
-/// - any teacher forward pass fails
-/// - lm_head training loop fails (GPU op failure)
+/// DeltaNet (LinearAttention) layers are skipped; recorded in
+/// `result.skipped` with an explanatory reason.
 pub fn train_all_linears_full_model_dwq(
     cfg: &FullModelDwqConfig,
 ) -> Result<DwqAllLinearsResult> {
+    use crate::calibrate::autograd_gpu_tape::{
+        backward, matmul, ones_like, qdq_affine, rms_norm, transpose, view,
+        GpuTape, GpuTensor,
+    };
     use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
+    use crate::calibrate::qwen35_moe::{
+        decoder_layer_on_tape_real_gqa, make_pos_buf_for_real_gqa,
+        DecoderLayerWeightsRealGqa, Qwen35RealGqaConfig,
+    };
     use crate::inference::models::qwen35::kv_cache::HybridKvCache;
     use crate::inference::models::qwen35::model::Qwen35Model;
+    use crate::inference::models::qwen35::Qwen35LayerKind;
     use mlx_native::gguf::GgufFile;
     use safetensors::tensor::Dtype;
 
-    // Step 1 — validate before any I/O.
     cfg.validate().context("train_all_linears_full_model_dwq: cfg.validate")?;
 
-    // Step 2 — load teacher model.  Heavy: GPU upload of all weights.
     let gguf_file = GgufFile::open(&cfg.gguf_path).with_context(|| {
-        format!(
-            "train_all_linears_full_model_dwq: GgufFile::open {}",
-            cfg.gguf_path.display()
-        )
+        format!("GgufFile::open {}", cfg.gguf_path.display())
     })?;
-    let n_layers = {
-        let c = Qwen35Model::load_config_only(&gguf_file)
-            .context("train_all_linears_full_model_dwq: load_config_only")?;
-        c.num_hidden_layers as usize
-    };
-    let mut progress =
-        crate::serve::header::LoadProgress::new(false, 0, n_layers);
-    let model = Qwen35Model::load_from_gguf(&gguf_file, &mut progress)
-        .with_context(|| {
-            format!(
-                "train_all_linears_full_model_dwq: Qwen35Model::load_from_gguf {}",
-                cfg.gguf_path.display()
-            )
-        })?;
-    let vocab = model.cfg.vocab_size as usize;
+    let qcfg = Qwen35Model::load_config_only(&gguf_file)
+        .context("load_config_only")?;
+    let n_all_layers = qcfg.num_hidden_layers as usize;
+    let mut progress = crate::serve::header::LoadProgress::new(false, 0, n_all_layers);
+    let model = Qwen35Model::load_from_gguf(&gguf_file, &mut progress).with_context(|| {
+        format!("load_from_gguf {}", cfg.gguf_path.display())
+    })?;
+
+    let vocab       = model.cfg.vocab_size as usize;
     let hidden_size = model.cfg.hidden_size as usize;
-    let rms_eps = model.cfg.rms_norm_eps;
-    // Re-open GGUF to iterate tensor names (the model owns its buffers).
-    let gguf_iter = GgufFile::open(&cfg.gguf_path).with_context(|| {
-        format!(
-            "train_all_linears_full_model_dwq: GgufFile::open (iter) {}",
-            cfg.gguf_path.display()
-        )
-    })?;
-    let tensor_names: Vec<String> = gguf_iter
-        .tensor_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let rms_eps     = model.cfg.rms_norm_eps;
+    let n_q_heads   = model.cfg.num_attention_heads as usize;
+    let n_kv_heads  = model.cfg.num_key_value_heads as usize;
+    let head_dim    = model.cfg.head_dim as usize;
+    let layer_types = model.cfg.layer_types.clone();
+    let moe_cfg     = model.cfg.moe.clone();
+    let rope_theta  = model.cfg.rope_theta as f32;
+    let rope_sections = model.cfg.mrope_section;
 
-    let device =
-        mlx_native::MlxDevice::new().map_err(|e| {
-            anyhow!("train_all_linears_full_model_dwq: MlxDevice::new: {e}")
-        })?;
-
-    // Step 3 — optional RSS watchdog.
+    let device = mlx_native::MlxDevice::new()
+        .map_err(|e| anyhow!("MlxDevice::new: {e}"))?;
     let watchdog: Option<RssWatchdog> = cfg.rss_cap_bytes.map(|cap| {
         RssWatchdog::spawn(cap, std::time::Duration::from_secs(5))
     });
 
-    // The DEFERRED reason printed for every non-lm-head Linear.
-    const DEFERRED_REASON: &str =
-        "deferred — pending mlx-native flash_attn_train \
-         (cross-layer attention backprop not yet available; \
-         lm_head is the only end-to-end trainable Linear in v1)";
+    let load_f32 = |name: &str| -> Result<Vec<f32>> {
+        let buf = gguf_file.load_tensor_f32(name, &device)
+            .with_context(|| format!("load_tensor_f32 '{name}'"))?;
+        let s = buf.as_slice::<f32>()
+            .with_context(|| format!("as_slice '{name}'"))?;
+        Ok(s.to_vec())
+    };
 
-    // Step 4 — classify all rank-2 Linears.
-    // Find + quantize output.weight; record everything else as skipped.
-    let lm_head_gguf_name = "output.weight";
-    let mut lm_head_pack: Option<DwqQuantPack> = None;
-    let mut lm_head_n: usize = 0;
-    let mut lm_head_k: usize = 0;
+    // Stage A: pack every full-attention-layer Linear.
+    struct LayerPack {
+        layer_idx: usize,
+        tid_wq: String, pack_wq: DwqQuantPack,
+        tid_wk: String, pack_wk: DwqQuantPack,
+        tid_wv: String, pack_wv: DwqQuantPack,
+        tid_wo: String, pack_wo: DwqQuantPack,
+        w_in: Vec<f32>, w_post: Vec<f32>, q_norm: Vec<f32>, k_norm: Vec<f32>,
+        router_data: Vec<f32>,
+        expert_gate_tids: Vec<String>, expert_gate_packs: Vec<DwqQuantPack>,
+        expert_up_tids:   Vec<String>, expert_up_packs:   Vec<DwqQuantPack>,
+        expert_down_tids: Vec<String>, expert_down_packs: Vec<DwqQuantPack>,
+        moe_intermediate: usize,
+        moe_k: usize,
+    }
+
     let mut trained: Vec<DwqLinearTrained> = Vec::new();
     let mut skipped: Vec<DwqLinearSkipped> = Vec::new();
+    let mut layer_packs: Vec<LayerPack> = Vec::new();
 
-    for name in &tensor_names {
-        if let Some(w) = &watchdog {
-            if w.is_aborted() {
-                return Err(anyhow!(
-                    "train_all_linears_full_model_dwq: RSS watchdog aborted tensor scan"
-                ));
-            }
-        }
-        let info = match gguf_iter.tensor_info(name) {
-            Some(i) => i,
-            None => {
-                skipped.push(DwqLinearSkipped {
-                    name: name.clone(),
-                    reason: "tensor_info missing (gguf inconsistency)".to_string(),
-                });
-                continue;
-            }
-        };
-        if info.shape.len() != 2 {
-            // Skip rank-1/3+ tensors silently (they are norm weights, MoE
-            // expert stacks, etc., not Linears).
-            continue;
-        }
-        let n = info.shape[0];
-        let k = info.shape[1];
-        // Skip non-weight tensors (bias, norm scale, etc.).
-        if !name.ends_with(".weight") {
-            continue;
-        }
-        // Skip embedding + norm tensors.
-        if name.starts_with("token_embd")
-            || name.contains("_norm.weight")
-            || name.ends_with("_scale.weight")
-        {
-            continue;
-        }
-        // Dimension floor.
-        if n < 32 || k < 32 {
+    let mkpack = |data: &[f32], rows: usize, cols: usize, name: &str| {
+        quant_pack_for_dwq(&device, data, rows, cols, cfg.bits, cfg.group_size)
+            .with_context(|| format!("quant_pack '{name}'"))
+    };
+
+    for layer_idx in 0..n_all_layers {
+        if let Some(w) = &watchdog { if w.is_aborted() {
+            return Err(anyhow!("RSS watchdog aborted layer={layer_idx}"));
+        }}
+        let kind = layer_types.get(layer_idx).copied()
+            .unwrap_or(Qwen35LayerKind::LinearAttention);
+        if kind != Qwen35LayerKind::FullAttention {
             skipped.push(DwqLinearSkipped {
-                name: name.clone(),
-                reason: format!("dim too small (n={n} k={k} need >=32)"),
-            });
-            continue;
-        }
-        if k % cfg.group_size != 0 {
-            skipped.push(DwqLinearSkipped {
-                name: name.clone(),
-                reason: format!(
-                    "k={k} not divisible by group_size={}",
-                    cfg.group_size
-                ),
+                name: format!("blk.{layer_idx}.*"),
+                reason: format!("layer {layer_idx} is LinearAttention (DeltaNet)"),
             });
             continue;
         }
 
-        if name == lm_head_gguf_name {
-            // Load + quantize the lm_head.
-            let buf = match gguf_iter.load_tensor_f32(name, &device) {
-                Ok(b) => b,
-                Err(e) => {
-                    return Err(anyhow!(
-                        "train_all_linears_full_model_dwq: load_tensor_f32 \
-                         '{}' failed: {e}",
-                        name
-                    ));
-                }
+        let p = format!("blk.{layer_idx}");
+        let w_in   = load_f32(&format!("{p}.attn_norm.weight"))?;
+        let w_post = load_f32(&format!("{p}.post_attention_norm.weight"))?;
+        let q_norm = load_f32(&format!("{p}.attn_q_norm.weight"))?;
+        let k_norm = load_f32(&format!("{p}.attn_k_norm.weight"))?;
+
+        let q_fused = load_f32(&format!("{p}.attn_q.weight"))?;
+        let q_total = n_q_heads * head_dim;
+        if q_fused.len() != 2 * q_total * hidden_size {
+            return Err(anyhow!(
+                "layer {layer_idx} attn_q len={} != 2*{q_total}*{hidden_size}",
+                q_fused.len()
+            ));
+        }
+        let mut wq_data = vec![0.0f32; q_total * hidden_size];
+        for h in 0..n_q_heads {
+            let src = (h * 2 * head_dim) * hidden_size;
+            let dst = h * head_dim * hidden_size;
+            wq_data[dst..dst + head_dim * hidden_size]
+                .copy_from_slice(&q_fused[src..src + head_dim * hidden_size]);
+        }
+        let wk_data = load_f32(&format!("{p}.attn_k.weight"))?;
+        let wv_data = load_f32(&format!("{p}.attn_v.weight"))?;
+        let wo_data = load_f32(&format!("{p}.attn_output.weight"))?;
+        let kv_rows = n_kv_heads * head_dim;
+
+        let tid_wq = format!("{p}.attn_q.weight");
+        let tid_wk = format!("{p}.attn_k.weight");
+        let tid_wv = format!("{p}.attn_v.weight");
+        let tid_wo = format!("{p}.attn_output.weight");
+        let pack_wq = mkpack(&wq_data, q_total, hidden_size, &tid_wq)?;
+        let pack_wk = mkpack(&wk_data, kv_rows, hidden_size, &tid_wk)?;
+        let pack_wv = mkpack(&wv_data, kv_rows, hidden_size, &tid_wv)?;
+        let pack_wo = mkpack(&wo_data, hidden_size, q_total, &tid_wo)?;
+
+        let (router_data, g_tids, g_packs, u_tids, u_packs, d_tids, d_packs, inter, moe_k_val) =
+        if let Some(ref mc) = moe_cfg {
+            let n_exp   = mc.num_experts as usize;
+            let inter   = mc.moe_intermediate_size as usize;
+            let moe_k   = mc.num_experts_per_tok as usize;
+            let router  = load_f32(&format!("{p}.ffn_gate_inp.weight"))?;
+            let gate_st = load_f32(&format!("{p}.ffn_gate_exps.weight"))?;
+            let up_st   = load_f32(&format!("{p}.ffn_up_exps.weight"))?;
+            let down_st = load_f32(&format!("{p}.ffn_down_exps.weight"))?;
+            let per = inter * hidden_size;
+            let mut gt = Vec::with_capacity(n_exp); let mut gp = Vec::with_capacity(n_exp);
+            let mut ut = Vec::with_capacity(n_exp); let mut up = Vec::with_capacity(n_exp);
+            let mut dt = Vec::with_capacity(n_exp); let mut dp = Vec::with_capacity(n_exp);
+            // Helper: transpose [rows, cols] matrix in-place -> [cols, rows].
+            let transpose_f32 = |data: &[f32], rows: usize, cols: usize| -> Vec<f32> {
+                let mut out = vec![0.0f32; data.len()];
+                for i in 0..rows { for j in 0..cols { out[j * rows + i] = data[i * cols + j]; } }
+                out
             };
-            let w_f32: Vec<f32> = buf
-                .as_slice::<f32>()
-                .map_err(|e| {
-                    anyhow!(
-                        "train_all_linears_full_model_dwq: buffer slice '{}': {e}",
-                        name
-                    )
-                })?
-                .to_vec();
-            drop(buf);
-            let pack = quant_pack_for_dwq(&device, &w_f32, n, k, cfg.bits, cfg.group_size)
-                .with_context(|| {
-                    format!(
-                        "train_all_linears_full_model_dwq: quant_pack_for_dwq '{}'",
-                        name
-                    )
-                })?;
-            lm_head_n = n;
-            lm_head_k = k;
-            lm_head_pack = Some(pack);
+            for e in 0..n_exp {
+                // GGUF gate_exps: [experts, inter, hidden] => per-expert [I, H] => need [H, I] for tape
+                let gd_raw = gate_st[e * per..(e + 1) * per].to_vec();
+                let gd = transpose_f32(&gd_raw, inter, hidden_size);
+                // GGUF up_exps: same as gate => [I, H] => need [H, I]
+                let ud_raw = up_st[e * per..(e + 1) * per].to_vec();
+                let ud = transpose_f32(&ud_raw, inter, hidden_size);
+                // GGUF down_exps: [experts, hidden, inter] => per-expert [H, I] => need [I, H]
+                let dd_raw = down_st[e * per..(e + 1) * per].to_vec();
+                let dd = transpose_f32(&dd_raw, hidden_size, inter);
+                let gname = format!("{p}.ffn_gate_exps.{e}.weight");
+                let uname = format!("{p}.ffn_up_exps.{e}.weight");
+                let dname = format!("{p}.ffn_down_exps.{e}.weight");
+                // Pack in [H, I], [H, I], [I, H] order to match tape contract
+                gp.push(mkpack(&gd, hidden_size, inter, &gname)?);
+                up.push(mkpack(&ud, hidden_size, inter, &uname)?);
+                dp.push(mkpack(&dd, inter, hidden_size, &dname)?);
+                gt.push(gname); ut.push(uname); dt.push(dname);
+            }
+            (router, gt, gp, ut, up, dt, dp, inter, moe_k)
         } else {
-            // Every other trainable-shaped Linear is deferred.
-            skipped.push(DwqLinearSkipped {
-                name: name.clone(),
-                reason: DEFERRED_REASON.to_string(),
-            });
-        }
-    }
+            let inter_rows = gguf_file
+                .tensor_info(&format!("{p}.ffn_gate.weight"))
+                .ok_or_else(|| anyhow!("layer {layer_idx} ffn_gate not found"))?
+                .shape.first().copied().unwrap_or(0);
+            let gate_d = load_f32(&format!("{p}.ffn_gate.weight"))?;
+            let up_d   = load_f32(&format!("{p}.ffn_up.weight"))?;
+            let down_d = load_f32(&format!("{p}.ffn_down.weight"))?;
+            let gn = format!("{p}.ffn_gate.weight");
+            let un = format!("{p}.ffn_up.weight");
+            let dn = format!("{p}.ffn_down.weight");
+            let gp2 = mkpack(&gate_d, inter_rows, hidden_size, &gn)?;
+            let up2  = mkpack(&up_d, inter_rows, hidden_size, &un)?;
+            let dp2  = mkpack(&down_d, hidden_size, inter_rows, &dn)?;
+            // Dense FFN: router is identity [hidden, 1]
+            let router_dummy = vec![1.0f32; hidden_size];
+            (router_dummy, vec![gn], vec![gp2], vec![un], vec![up2], vec![dn], vec![dp2], inter_rows, 1usize)
+        };
 
-    // Fail if lm_head was not found — the GGUF is malformed or not a Qwen35
-    // variant.
-    let pack = lm_head_pack.ok_or_else(|| {
-        anyhow!(
-            "train_all_linears_full_model_dwq: '{}' not found in GGUF {} \
-             (expected Qwen35-family model with an output.weight tensor)",
-            lm_head_gguf_name,
-            cfg.gguf_path.display()
-        )
-    })?;
-
-    // Sanity-check that lm_head dims match the loaded model's vocab/hidden.
-    if lm_head_n != vocab {
-        return Err(anyhow!(
-            "train_all_linears_full_model_dwq: output.weight n={} != \
-             model.vocab={} — shape mismatch",
-            lm_head_n,
-            vocab
-        ));
-    }
-    if lm_head_k != hidden_size {
-        return Err(anyhow!(
-            "train_all_linears_full_model_dwq: output.weight k={} != \
-             model.hidden_size={} — shape mismatch",
-            lm_head_k,
-            hidden_size
-        ));
-    }
-
-    // Step 5 — register (s, b) with Adam.
-    let mut adam = crate::calibrate::adam::AdamOptimizer::new(
-        device.clone(),
-        crate::calibrate::adam::AdamConfig {
-            lr: cfg.lr,
-            beta1: 0.9,
-            beta2: 0.999,
-            eps: 1e-8,
-        },
-    )
-    .context("train_all_linears_full_model_dwq: AdamOptimizer::new")?;
-
-    register_affine_pair(
-        &mut adam,
-        &device,
-        lm_head_gguf_name,
-        &pack.scales,
-        &pack.biases,
-    )
-    .context("train_all_linears_full_model_dwq: register_affine_pair")?;
-
-    // Step 6 — build DwqOneLinearBatch for each calibration batch.
-    // Per batch: run each sequence row through forward_gpu_with_hidden,
-    // take the LAST token position, accumulate into x_batch / logits_full.
-    //
-    // n_rows per DwqOneLinearBatch = batch_size (one last-token row per
-    // sequence in the batch).
-    let top_k = cfg.top_k_teacher.min(vocab);
-    let mut all_batches: Vec<DwqOneLinearBatch> = Vec::with_capacity(
-        cfg.calibration_token_batches.len(),
-    );
-
-    let mut positions_buf: Vec<i32> = Vec::new();
-    crate::calibrate::gguf_teacher::fill_text_positions(
-        &mut positions_buf,
-        cfg.seq_len,
-    );
-
-    for (batch_idx, token_batch) in cfg.calibration_token_batches.iter().enumerate() {
-        if let Some(w) = &watchdog {
-            if w.is_aborted() {
-                return Err(anyhow!(
-                    "train_all_linears_full_model_dwq: RSS watchdog aborted during \
-                     batch capture (batch_idx={})",
-                    batch_idx
-                ));
-            }
-        }
-
-        let mut x_batch_rows: Vec<f32> =
-            Vec::with_capacity(cfg.batch_size * hidden_size);
-        let mut logits_rows: Vec<f32> = Vec::with_capacity(cfg.batch_size * vocab);
-
-        for row in 0..cfg.batch_size {
-            let row_tokens =
-                &token_batch[row * cfg.seq_len..(row + 1) * cfg.seq_len];
-
-            let mut kv = HybridKvCache::new(
-                &model.cfg,
-                &device,
-                cfg.seq_len.max(1) as u32,
-                1,
-            )
-            .with_context(|| {
-                format!(
-                    "train_all_linears_full_model_dwq: HybridKvCache::new \
-                     batch={batch_idx} row={row}"
-                )
-            })?;
-
-            let (logits_full, hidden_buf) = model
-                .forward_gpu_with_hidden(row_tokens, &positions_buf, &mut kv)
-                .with_context(|| {
-                    format!(
-                        "train_all_linears_full_model_dwq: forward_gpu_with_hidden \
-                         batch={batch_idx} row={row}"
-                    )
-                })?;
-
-            // `logits_full` is `[seq_len, vocab]` flat.
-            // Take the LAST token position for next-token training.
-            let last_tok = cfg.seq_len - 1;
-            let logit_lo = last_tok * vocab;
-            let logit_hi = logit_lo + vocab;
-            if logits_full.len() < logit_hi {
-                return Err(anyhow!(
-                    "train_all_linears_full_model_dwq: logits_full.len={} < \
-                     expected last-position offset {} (seq_len={} vocab={})",
-                    logits_full.len(),
-                    logit_hi,
-                    cfg.seq_len,
-                    vocab
-                ));
-            }
-            logits_rows.extend_from_slice(&logits_full[logit_lo..logit_hi]);
-
-            // `hidden_buf` is `[seq_len, hidden_size]` F32.
-            // NOTE (v1 scope): the hidden buffer is the residual stream
-            // BEFORE output_norm.  The true lm_head input is
-            // `rms_norm(hidden, output_norm_weight, eps)`.  Using pre-norm
-            // hidden as a proxy is a v1 approximation — it provides real
-            // gradient signal while avoiding the need for a separate
-            // post-norm capture API.  A future iter can apply rms_norm here.
-            let _ = rms_eps; // reserved for the post-norm path
-            let hidden_slice: &[f32] = hidden_buf.as_slice::<f32>().map_err(|e| {
-                anyhow!(
-                    "train_all_linears_full_model_dwq: hidden_buf.as_slice \
-                     batch={batch_idx} row={row}: {e}"
-                )
-            })?;
-            let expected_hidden_len = cfg.seq_len * hidden_size;
-            if hidden_slice.len() < expected_hidden_len {
-                return Err(anyhow!(
-                    "train_all_linears_full_model_dwq: hidden_slice.len={} < \
-                     seq_len*hidden_size={} batch={batch_idx} row={row}",
-                    hidden_slice.len(),
-                    expected_hidden_len
-                ));
-            }
-            let hidden_lo = last_tok * hidden_size;
-            let hidden_hi = hidden_lo + hidden_size;
-            x_batch_rows.extend_from_slice(&hidden_slice[hidden_lo..hidden_hi]);
-        }
-
-        all_batches.push(DwqOneLinearBatch {
-            x_batch: x_batch_rows,
-            teacher_logits_full: logits_rows,
-            n_rows: cfg.batch_size,
+        layer_packs.push(LayerPack {
+            layer_idx,
+            tid_wq, pack_wq, tid_wk, pack_wk, tid_wv, pack_wv, tid_wo, pack_wo,
+            w_in, w_post, q_norm, k_norm,
+            router_data,
+            expert_gate_tids: g_tids, expert_gate_packs: g_packs,
+            expert_up_tids:   u_tids, expert_up_packs:   u_packs,
+            expert_down_tids: d_tids, expert_down_packs: d_packs,
+            moe_intermediate: inter, moe_k: moe_k_val,
         });
     }
 
-    // Step 7 — train lm_head.
-    // Repeat all_batches for n_steps total Adam steps: cycle through
-    // the batches round-robin.  train_one_linear_dwq_loop runs one step
-    // per batch element, so n_steps_rounds = n_steps gives us n_steps
-    // total steps across all batches.
-    //
-    // Build a repeated-batch Vec so the loop runs exactly cfg.n_steps
-    // total passes.
-    let n_batches = all_batches.len();
-    let mut repeated: Vec<DwqOneLinearBatch> =
-        Vec::with_capacity(cfg.n_steps.max(n_batches));
-    for step in 0..cfg.n_steps {
-        repeated.push(all_batches[step % n_batches].clone());
+    // lm_head.
+    let lm_head_name = "output.weight";
+    let lm_head_data = load_f32(lm_head_name)?;
+    let pack_lm = quant_pack_for_dwq(&device, &lm_head_data, vocab, hidden_size, cfg.bits, cfg.group_size)
+        .context("quant_pack lm_head")?;
+    let output_norm_w = load_f32("output_norm.weight")?;
+
+    // Build Adam + register all (s, b) pairs.
+    let mut adam = crate::calibrate::adam::AdamOptimizer::new(
+        device.clone(),
+        crate::calibrate::adam::AdamConfig { lr: cfg.lr, beta1: 0.9, beta2: 0.999, eps: 1e-8 },
+    ).context("AdamOptimizer::new")?;
+
+    for lp in &layer_packs {
+        for (tid, pack) in [
+            (&lp.tid_wq, &lp.pack_wq), (&lp.tid_wk, &lp.pack_wk),
+            (&lp.tid_wv, &lp.pack_wv), (&lp.tid_wo, &lp.pack_wo),
+        ] {
+            register_affine_pair(&mut adam, &device, tid, &pack.scales, &pack.biases)
+                .with_context(|| format!("register {tid}"))?;
+        }
+        for (tid, pack) in lp.expert_gate_tids.iter().zip(&lp.expert_gate_packs)
+            .chain(lp.expert_up_tids.iter().zip(&lp.expert_up_packs))
+            .chain(lp.expert_down_tids.iter().zip(&lp.expert_down_packs))
+        {
+            register_affine_pair(&mut adam, &device, tid, &pack.scales, &pack.biases)
+                .with_context(|| format!("register expert {tid}"))?;
+        }
+    }
+    register_affine_pair(&mut adam, &device, lm_head_name, &pack_lm.scales, &pack_lm.biases)
+        .context("register lm_head")?;
+
+    // Stage B: capture teacher logits.
+    let top_k = cfg.top_k_teacher.min(vocab);
+    let mut positions_buf: Vec<i32> = Vec::new();
+    crate::calibrate::gguf_teacher::fill_text_positions(&mut positions_buf, cfg.seq_len);
+
+    struct TeacherBatch {
+        hidden_rows: Vec<f32>,   // [batch_size, hidden_size]
+        logits_rows: Vec<f32>,   // [batch_size, vocab]
     }
 
-    let loss_series = train_one_linear_dwq_loop(
-        &mut adam,
-        &device,
-        lm_head_gguf_name,
-        &pack,
-        &repeated,
-        top_k,
-        cfg.temperature,
-    )
-    .context("train_all_linears_full_model_dwq: train_one_linear_dwq_loop")?;
+    let n_batches = cfg.calibration_token_batches.len();
+    let mut teacher_batches: Vec<TeacherBatch> = Vec::with_capacity(n_batches);
 
-    let kl_initial = loss_series.first().copied().unwrap_or(f32::NAN);
-    let kl_min = loss_series.iter().copied().fold(f32::INFINITY, f32::min);
-    let steps_run = loss_series.len();
+    for (bi, token_batch) in cfg.calibration_token_batches.iter().enumerate() {
+        if let Some(w) = &watchdog { if w.is_aborted() {
+            return Err(anyhow!("RSS watchdog aborted Stage B batch={bi}"));
+        }}
+        let mut hidden_rows = Vec::with_capacity(cfg.batch_size * hidden_size);
+        let mut logits_rows = Vec::with_capacity(cfg.batch_size * vocab);
+        for row in 0..cfg.batch_size {
+            let row_tokens = &token_batch[row * cfg.seq_len..(row + 1) * cfg.seq_len];
+            let mut kv = HybridKvCache::new(&model.cfg, &device,
+                cfg.seq_len.max(1) as u32, 1)
+                .with_context(|| format!("HybridKvCache bi={bi} row={row}"))?;
+            let (logits_full, hidden_buf) = model
+                .forward_gpu_with_hidden(row_tokens, &positions_buf, &mut kv)
+                .with_context(|| format!("forward_gpu_with_hidden bi={bi} row={row}"))?;
+            let last_tok = cfg.seq_len - 1;
+            logits_rows.extend_from_slice(&logits_full[last_tok * vocab..(last_tok + 1) * vocab]);
+            let hidden_slice = hidden_buf.as_slice::<f32>()
+                .map_err(|e| anyhow!("hidden_buf: {e}"))?;
+            hidden_rows.extend_from_slice(
+                &hidden_slice[last_tok * hidden_size..(last_tok + 1) * hidden_size]);
+        }
+        teacher_batches.push(TeacherBatch { hidden_rows, logits_rows });
+    }
 
-    // Step 8 — read trained (s, b) and serialize.
-    let (scales_trained, biases_trained) = read_affine_pair(&adam, lm_head_gguf_name)
-        .context("train_all_linears_full_model_dwq: read_affine_pair")?;
-
-    let linear = MlxAffineLinear {
-        n: lm_head_n,
-        k: lm_head_k,
-        q_int: pack.q_int_bytes.clone(),
-        scales: scales_trained,
-        biases: biases_trained,
-        group_size: cfg.group_size,
-        bits: cfg.bits,
+    // Stage C: joint training loop.
+    let gqa_cfg = Qwen35RealGqaConfig {
+        n_q_heads, n_kv_heads, head_dim,
+        seq_len: 1, hidden: hidden_size,
+        rope_theta_base: rope_theta, rope_sections,
+        causal: false, sliding_window: None, rms_eps,
     };
 
-    let bytes_owned = linear
-        .to_safetensors_bytes(Dtype::BF16)
-        .context("train_all_linears_full_model_dwq: to_safetensors_bytes")?;
+    // Helper: qdq 2-D weight leaf.
+    let make_qdq_2d = |adam: &crate::calibrate::adam::AdamOptimizer,
+                        tid: &str,
+                        pack: &DwqQuantPack,
+                        tape: &GpuTape,
+                        grad_pairs: &mut Vec<(String, GpuTensor)>| -> Result<GpuTensor> {
+        let sname = affine_param_name(tid, AffineParamKind::Scale);
+        let bname = affine_param_name(tid, AffineParamKind::Bias);
+        let sv = adam.read_param(&sname)?;
+        let bv = adam.read_param(&bname)?;
+        let n_groups = sv.len();
+        let s_t = GpuTensor::from_vec(tape, &sv, vec![n_groups])?;
+        let b_t = GpuTensor::from_vec(tape, &bv, vec![n_groups])?;
+        let w_flat = qdq_affine(&s_t, &b_t, &pack.q_int_bytes, pack.group_size)?;
+        let w_2d = view(&w_flat, vec![pack.n, pack.k])?;
+        grad_pairs.push((sname, s_t));
+        grad_pairs.push((bname, b_t));
+        Ok(w_2d)
+    };
 
-    let stem = lm_head_gguf_name
-        .strip_suffix(".weight")
-        .unwrap_or(lm_head_gguf_name);
+    let mut first_step_kl = f32::NAN;
+    let mut last_step_kl  = f32::NAN;
 
-    let (w_view, s_view, b_view) = bytes_owned
-        .to_safetensors_views()
-        .context("train_all_linears_full_model_dwq: to_safetensors_views")?;
+    for step in 0..cfg.n_steps {
+        if let Some(w) = &watchdog { if w.is_aborted() {
+            return Err(anyhow!("RSS watchdog aborted Stage C step={step}"));
+        }}
 
-    let views: Vec<(String, _)> = vec![
-        (format!("{stem}.weight"), w_view),
-        (format!("{stem}.scales"), s_view),
-        (format!("{stem}.biases"), b_view),
-    ];
+        let tb = &teacher_batches[step % n_batches];
+        let (teacher_topk, teacher_indices) = pick_top_k_per_position(
+            &tb.logits_rows, cfg.batch_size, 1, vocab, top_k,
+        ).with_context(|| format!("pick_top_k step={step}"))?;
+
+        let tape = GpuTape::new(device.clone());
+        let mut grad_pairs: Vec<(String, GpuTensor)> = Vec::new();
+
+        let mut h = GpuTensor::from_vec(&tape, &tb.hidden_rows,
+            vec![cfg.batch_size, hidden_size]).context("h from teacher hidden")?;
+        let pos_buf = make_pos_buf_for_real_gqa(&device, 1)
+            .context("make_pos_buf_for_real_gqa")?;
+
+        for lp in &layer_packs {
+            let wq = make_qdq_2d(&adam, &lp.tid_wq, &lp.pack_wq, &tape, &mut grad_pairs)?;
+            let wk = make_qdq_2d(&adam, &lp.tid_wk, &lp.pack_wk, &tape, &mut grad_pairs)?;
+            let wv = make_qdq_2d(&adam, &lp.tid_wv, &lp.pack_wv, &tape, &mut grad_pairs)?;
+            let wo = make_qdq_2d(&adam, &lp.tid_wo, &lp.pack_wo, &tape, &mut grad_pairs)?;
+            let win_t   = GpuTensor::from_vec(&tape, &lp.w_in,   vec![hidden_size])?;
+            let wpost_t = GpuTensor::from_vec(&tape, &lp.w_post, vec![hidden_size])?;
+            let qn_t    = GpuTensor::from_vec(&tape, &lp.q_norm, vec![head_dim])?;
+            let kn_t    = GpuTensor::from_vec(&tape, &lp.k_norm, vec![head_dim])?;
+            let n_exp = lp.expert_gate_packs.len();
+            let mut gate_ts = Vec::with_capacity(n_exp);
+            let mut up_ts   = Vec::with_capacity(n_exp);
+            let mut down_ts = Vec::with_capacity(n_exp);
+            for e in 0..n_exp {
+                gate_ts.push(make_qdq_2d(&adam, &lp.expert_gate_tids[e],
+                    &lp.expert_gate_packs[e], &tape, &mut grad_pairs)?);
+                up_ts  .push(make_qdq_2d(&adam, &lp.expert_up_tids[e],
+                    &lp.expert_up_packs[e], &tape, &mut grad_pairs)?);
+                down_ts.push(make_qdq_2d(&adam, &lp.expert_down_tids[e],
+                    &lp.expert_down_packs[e], &tape, &mut grad_pairs)?);
+            }
+            // router: [hidden, n_experts]
+            let n_experts_out = n_exp;
+            let router_t = GpuTensor::from_vec(&tape, &lp.router_data,
+                vec![hidden_size, n_experts_out])?;
+            let lw = DecoderLayerWeightsRealGqa {
+                w_in: &win_t, w_post: &wpost_t,
+                w_q: &wq, w_k: &wk, w_v: &wv, w_o: &wo,
+                q_norm_w: &qn_t, k_norm_w: &kn_t,
+                w_gate: &router_t,
+                gate_projs: &gate_ts, up_projs: &up_ts, down_projs: &down_ts,
+            };
+            h = decoder_layer_on_tape_real_gqa(
+                &tape, &h, pos_buf.clone(), &lw, &gqa_cfg, lp.moe_k, 1e-9,
+            ).with_context(|| format!("decoder_layer step={step} layer={}", lp.layer_idx))?;
+        }
+
+        let onorm_t = GpuTensor::from_vec(&tape, &output_norm_w, vec![hidden_size])?;
+        let h_normed = rms_norm(&h, &onorm_t, rms_eps).context("output_norm")?;
+        let wlm = make_qdq_2d(&adam, lm_head_name, &pack_lm, &tape, &mut grad_pairs)?;
+        let wlm_t = transpose(&wlm).context("transpose lm_head")?;
+        let student_logits = matmul(&h_normed, &wlm_t).context("lm_head matmul")?;
+
+        let idx_buf = build_topk_indices_buffer(&device, &teacher_indices, cfg.batch_size, top_k)
+            .context("build_topk_indices_buffer")?;
+        let student_topk = gather_student_topk_via_tape(&student_logits, idx_buf, top_k)
+            .context("gather_student_topk_via_tape")?;
+        let teacher_topk_t = GpuTensor::from_vec(&tape, &teacher_topk,
+            vec![cfg.batch_size, top_k]).context("teacher_topk leaf")?;
+        let loss = kl_loss_topk_via_tape(&student_topk, &teacher_topk_t, cfg.temperature)
+            .context("kl_loss_topk_via_tape")?;
+
+        let loss_v = loss.to_vec().context("loss readback")?;
+        let loss_scalar = loss_v[0];
+        if step == 0 { first_step_kl = loss_scalar; }
+        last_step_kl = loss_scalar;
+
+        let dy = ones_like(&tape, loss.shape()).context("ones_like dy")?;
+        let grads = backward(&loss, dy).context("backward")?;
+        let pairs_ref: Vec<(&str, &GpuTensor)> =
+            grad_pairs.iter().map(|(n, t)| (n.as_str(), t)).collect();
+        let grad_map = collect_grads_for_adam(&grads, &pairs_ref)
+            .context("collect_grads_for_adam")?;
+        adam.step(&grad_map).context("adam.step")?;
+    }
+
+    // Stage D: serialize all trained tensors.
+    type LinBytes = crate::calibrate::mlx_safetensors_loader::MlxAffineLinearBytes;
+
+    let mut all_linears: Vec<(String, DwqQuantPack, usize, usize)> = Vec::new();
+    for lp in &layer_packs {
+        let q_total = n_q_heads * head_dim;
+        let kv_rows = n_kv_heads * head_dim;
+        let mut push = |tid: &str, pack: &DwqQuantPack, n: usize, k: usize| -> Result<()> {
+            let (s, b) = read_affine_pair(&adam, tid)?;
+            let mut p = pack.clone(); p.scales = s; p.biases = b;
+            all_linears.push((tid.to_string(), p, n, k));
+            Ok(())
+        };
+        push(&lp.tid_wq, &lp.pack_wq, q_total, hidden_size)?;
+        push(&lp.tid_wk, &lp.pack_wk, kv_rows, hidden_size)?;
+        push(&lp.tid_wv, &lp.pack_wv, kv_rows, hidden_size)?;
+        push(&lp.tid_wo, &lp.pack_wo, hidden_size, q_total)?;
+        let _inter = lp.moe_intermediate;  // used via pack.n/pack.k
+        for e in 0..lp.expert_gate_packs.len() {
+            // Use pack.n/pack.k which reflect the transposed shapes set during Stage A.
+            let gp = &lp.expert_gate_packs[e];
+            let up = &lp.expert_up_packs[e];
+            let dp = &lp.expert_down_packs[e];
+            push(&lp.expert_gate_tids[e], gp, gp.n, gp.k)?;
+            push(&lp.expert_up_tids[e],   up, up.n, up.k)?;
+            push(&lp.expert_down_tids[e], dp, dp.n, dp.k)?;
+        }
+    }
+    {
+        let (s, b) = read_affine_pair(&adam, lm_head_name)?;
+        let mut p = pack_lm.clone(); p.scales = s; p.biases = b;
+        all_linears.push((lm_head_name.to_string(), p, vocab, hidden_size));
+    }
+
+    let mut serialized: Vec<(String, LinBytes)> = Vec::new();
+    for (tid, pack, n, k) in &all_linears {
+        let stem = tid.strip_suffix(".weight").unwrap_or(tid.as_str());
+        let linear = MlxAffineLinear {
+            n: *n, k: *k,
+            q_int: pack.q_int_bytes.clone(),
+            scales: pack.scales.clone(), biases: pack.biases.clone(),
+            group_size: cfg.group_size, bits: cfg.bits,
+        };
+        let bytes = linear.to_safetensors_bytes(Dtype::BF16)
+            .with_context(|| format!("to_safetensors_bytes '{tid}'"))?;
+        serialized.push((stem.to_string(), bytes));
+    }
 
     let mut metadata = std::collections::HashMap::new();
     metadata.insert("format".to_string(), "mlx-affine-dwq-v1".to_string());
     metadata.insert("bits".to_string(), cfg.bits.to_string());
     metadata.insert("group_size".to_string(), cfg.group_size.to_string());
-    metadata.insert("trained_count".to_string(), "1".to_string());
-    metadata.insert(
-        "scope_note".to_string(),
-        "v1: lm_head only; cross-layer training pending mlx-native flash_attn_train".to_string(),
-    );
+    metadata.insert("trained_count".to_string(), all_linears.len().to_string());
+    metadata.insert("phase".to_string(), "3c-full-model-real-gqa".to_string());
 
-    let safetensors_bytes = safetensors::tensor::serialize(
-        views.iter().map(|(k, v)| (k.as_str(), v)),
-        Some(metadata),
-    )
-    .map_err(|e| anyhow!("train_all_linears_full_model_dwq: safetensors serialize: {e}"))?;
+    let safetensors_bytes = {
+        let mut pairs: Vec<(String, safetensors::tensor::TensorView<'_>)> = Vec::new();
+        for (stem, bytes) in &serialized {
+            let (wv, sv, bv) = bytes.to_safetensors_views()
+                .with_context(|| format!("to_safetensors_views '{stem}'"))?;
+            pairs.push((format!("{stem}.weight"), wv));
+            pairs.push((format!("{stem}.scales"), sv));
+            pairs.push((format!("{stem}.biases"), bv));
+        }
+        safetensors::tensor::serialize(pairs, Some(metadata))
+            .map_err(|e| anyhow!("safetensors serialize: {e}"))?
+    };
 
-    trained.push(DwqLinearTrained {
-        name: lm_head_gguf_name.to_string(),
-        n: lm_head_n,
-        k: lm_head_k,
-        kl_initial,
-        kl_min,
-        steps_run,
-        bench: None, // compute_bench off for v1
-    });
+    for (tid, pack, _n, _k) in &all_linears {
+        trained.push(DwqLinearTrained {
+            name: tid.clone(), n: pack.n, k: pack.k,
+            kl_initial: first_step_kl, kl_min: last_step_kl.min(first_step_kl),
+            steps_run: cfg.n_steps, bench: None,
+        });
+    }
 
     Ok(DwqAllLinearsResult {
-        trained,
-        skipped,
-        safetensors_bytes,
-        mean_delta_kl_nats: None, // compute_bench off for v1
+        trained, skipped, safetensors_bytes,
+        mean_delta_kl_nats: None,
     })
 }
 
@@ -10907,48 +10890,256 @@ mod tests {
             result.safetensors_bytes.len()
         );
 
-        assert_eq!(
-            result.trained.len(),
-            1,
-            "expected exactly 1 trained tensor (lm_head), got: {:?}",
-            result.trained.iter().map(|t| &t.name).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            result.trained[0].name,
-            "output.weight",
-            "trained tensor must be output.weight"
-        );
-        assert!(
-            !result.skipped.is_empty(),
-            "expected non-empty skipped list (all non-lm-head Linears deferred)"
-        );
-        // Every skipped entry must have a non-empty reason.
+        // Phase 3c trains ALL full-attention linears.
+        assert!(!result.trained.is_empty(), "expected at least 1 trained tensor");
+        let has_lm_head = result.trained.iter().any(|t| t.name == "output.weight");
+        assert!(has_lm_head, "output.weight must be in trained list");
         for s in &result.skipped {
-            assert!(
-                !s.reason.is_empty(),
-                "skipped tensor {} has empty reason",
-                s.name
-            );
+            assert!(!s.reason.is_empty(), "skipped tensor {} has empty reason", s.name);
         }
-        // safetensors must parse.
         let parsed = SafeTensors::deserialize(&result.safetensors_bytes)
             .expect("safetensors::deserialize");
         for suffix in [".weight", ".scales", ".biases"] {
             let key = format!("output{suffix}");
-            assert!(
-                parsed.names().contains(&key.as_str()),
-                "missing safetensors key '{key}'"
-            );
+            assert!(parsed.names().contains(&key.as_str()), "missing key '{key}'");
         }
-        // steps_run must equal n_steps.
-        assert_eq!(
-            result.trained[0].steps_run,
-            5,
-            "steps_run must equal cfg.n_steps"
-        );
+        for t in &result.trained {
+            assert_eq!(t.steps_run, 5, "steps_run must equal cfg.n_steps for {}", t.name);
+            assert!(t.kl_initial.is_finite(), "kl_initial must be finite for {}", t.name);
+        }
+    }
+
+    /// ADR-020 AC#7 closure — Phase 3c cross-layer convergence gate.
+    ///
+    /// 2-layer synthetic fixture (HIDDEN=64, HD=64, N_Q=1).
+    /// Layer-0 w_q biases perturbed +15%.  After 50 Adam steps,
+    /// tail/head loss ratio < 0.80 proves gradient flows cross-layer.
+    #[test]
+    fn phase3c_ac7_cross_layer_real_gqa_convergence() {
+        use crate::calibrate::autograd_gpu_tape::{
+            backward, matmul, ones_like, qdq_affine, rms_norm, transpose, view,
+            GpuTape, GpuTensor,
+        };
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use crate::calibrate::qwen35_moe::{
+            decoder_layer_on_tape_real_gqa, make_pos_buf_for_real_gqa,
+            DecoderLayerWeightsRealGqa, Qwen35RealGqaConfig,
+        };
+
+        const HIDDEN:    usize = 64;
+        const N_Q:       usize = 1;
+        const N_KV:      usize = 1;
+        const HD:        usize = 64;
+        const N_EXPERTS: usize = 2;
+        const INTER:     usize = 32;
+        const MOE_K:     usize = 2;  // all experts active — ensures full gradient coverage
+        const VOCAB:     usize = 64;
+        const GS:        usize = 32;
+        const BITS:      u32   = 4;
+        const N_LAYERS:  usize = 2;
+        const N_STEPS:   usize = 50;
+        const PERTURB:   f32   = 0.15;
+        const LR:        f32   = 1e-4;
+        const N_TOKENS:  usize = 32;  // matmul floor
+
+        let device = mlx_native::MlxDevice::new().expect("MlxDevice");
+
+        let make_w = |rows: usize, cols: usize, seed: f32| -> Vec<f32> {
+            (0..rows * cols).map(|i| ((i as f32 * 0.01 + seed) * 6.28).sin() * 0.1).collect()
+        };
+        let ones_v = |n: usize| vec![1.0f32; n];
+        let qp = |d: &[f32], r: usize, c: usize| {
+            quant_pack_for_dwq(&device, d, r, c, BITS, GS).expect("qpack")
+        };
+
+        struct SynPack {
+            tid_wq: String, pack_wq: DwqQuantPack,
+            tid_wk: String, pack_wk: DwqQuantPack,
+            tid_wv: String, pack_wv: DwqQuantPack,
+            tid_wo: String, pack_wo: DwqQuantPack,
+            w_in: Vec<f32>, w_post: Vec<f32>, q_norm: Vec<f32>, k_norm: Vec<f32>,
+            router: Vec<f32>,
+            g_tids: Vec<String>, g_packs: Vec<DwqQuantPack>,
+            u_tids: Vec<String>, u_packs: Vec<DwqQuantPack>,
+            d_tids: Vec<String>, d_packs: Vec<DwqQuantPack>,
+        }
+
+        let mut syn_packs: Vec<SynPack> = Vec::new();
+        for li in 0..N_LAYERS {
+            let p = format!("blk.{li}");
+            let wq = make_w(N_Q * HD, HIDDEN, li as f32 + 0.1);
+            let wk = make_w(N_KV * HD, HIDDEN, li as f32 + 0.2);
+            let wv = make_w(N_KV * HD, HIDDEN, li as f32 + 0.3);
+            let wo = make_w(HIDDEN, N_Q * HD, li as f32 + 0.4);
+            let mut g_tids = Vec::new(); let mut g_packs = Vec::new();
+            let mut u_tids = Vec::new(); let mut u_packs = Vec::new();
+            let mut d_tids = Vec::new(); let mut d_packs = Vec::new();
+            for e in 0..N_EXPERTS {
+                // gate/up: [hidden, inter] — matches tape's moe_ffn_block_on_tape contract
+                let gd = make_w(HIDDEN, INTER, li as f32 + e as f32 + 1.0);
+                let ud = make_w(HIDDEN, INTER, li as f32 + e as f32 + 1.1);
+                // down: [inter, hidden]
+                let dd = make_w(INTER, HIDDEN, li as f32 + e as f32 + 1.2);
+                let gt = format!("{p}.gate.{e}"); let ut = format!("{p}.up.{e}");
+                let dt = format!("{p}.down.{e}");
+                g_packs.push(qp(&gd, HIDDEN, INTER));
+                u_packs.push(qp(&ud, HIDDEN, INTER));
+                d_packs.push(qp(&dd, INTER, HIDDEN));
+                g_tids.push(gt); u_tids.push(ut); d_tids.push(dt);
+            }
+            // router: [hidden, n_experts] per moe_route contract
+            let router: Vec<f32> = (0..HIDDEN * N_EXPERTS).map(|i| {
+                ((i as f32 * 0.05) * 6.28).sin() * 0.1
+            }).collect();
+            let tid_wq = format!("{p}.wq"); let tid_wk = format!("{p}.wk");
+            let tid_wv = format!("{p}.wv"); let tid_wo = format!("{p}.wo");
+            syn_packs.push(SynPack {
+                pack_wq: qp(&wq, N_Q*HD, HIDDEN), tid_wq,
+                pack_wk: qp(&wk, N_KV*HD, HIDDEN), tid_wk,
+                pack_wv: qp(&wv, N_KV*HD, HIDDEN), tid_wv,
+                pack_wo: qp(&wo, HIDDEN, N_Q*HD), tid_wo,
+                w_in: ones_v(HIDDEN), w_post: ones_v(HIDDEN),
+                q_norm: ones_v(HD), k_norm: ones_v(HD),
+                router,
+                g_tids, g_packs, u_tids, u_packs, d_tids, d_packs,
+            });
+        }
+        let lm_data = make_w(VOCAB, HIDDEN, 9.9);
+        let pack_lm = qp(&lm_data, VOCAB, HIDDEN);
+
+        // Perturb layer-0 wq biases before registration.
+        for b in &mut syn_packs[0].pack_wq.biases { *b *= 1.0 + PERTURB; }
+
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig { lr: LR, beta1: 0.9, beta2: 0.999, eps: 1e-8 },
+        ).expect("AdamOptimizer");
+
+        for sp in &syn_packs {
+            for (tid, pack) in [(&sp.tid_wq, &sp.pack_wq), (&sp.tid_wk, &sp.pack_wk),
+                                 (&sp.tid_wv, &sp.pack_wv), (&sp.tid_wo, &sp.pack_wo)] {
+                register_affine_pair(&mut adam, &device, tid, &pack.scales, &pack.biases)
+                    .unwrap_or_else(|e| panic!("register {tid}: {e}"));
+            }
+            for (tid, pack) in sp.g_tids.iter().zip(&sp.g_packs)
+                .chain(sp.u_tids.iter().zip(&sp.u_packs))
+                .chain(sp.d_tids.iter().zip(&sp.d_packs))
+            {
+                register_affine_pair(&mut adam, &device, tid, &pack.scales, &pack.biases)
+                    .unwrap_or_else(|e| panic!("register {tid}: {e}"));
+            }
+        }
+        register_affine_pair(&mut adam, &device, "lm_head", &pack_lm.scales, &pack_lm.biases)
+            .expect("register lm_head");
+
+        // Teacher: fixed logits via lm_data @ embed^T
+        let embed = vec![0.1f32; N_TOKENS * HIDDEN];
+        let mut teacher_full = vec![0.0f32; N_TOKENS * VOCAB];
+        for t in 0..N_TOKENS {
+            for v in 0..VOCAB {
+                let acc: f32 = (0..HIDDEN)
+                    .map(|h| embed[t*HIDDEN+h] * lm_data[v*HIDDEN+h])
+                    .sum();
+                teacher_full[t * VOCAB + v] = acc;
+            }
+        }
+        let top_k = 8usize;
+        let (teacher_topk, teacher_indices) =
+            pick_top_k_per_position(&teacher_full, N_TOKENS, 1, VOCAB, top_k)
+                .expect("pick_top_k");
+
+        let gqa_cfg = Qwen35RealGqaConfig {
+            n_q_heads: N_Q, n_kv_heads: N_KV, head_dim: HD,
+            seq_len: N_TOKENS, hidden: HIDDEN,
+            rope_theta_base: 500_000.0,
+            rope_sections: [11, 11, 10, 0],
+            causal: false, sliding_window: None, rms_eps: 1e-6,
+        };
+
+        let make_qdq = |adam: &AdamOptimizer, tid: &str, pack: &DwqQuantPack,
+                         tape: &GpuTape,
+                         gp: &mut Vec<(String, GpuTensor)>| -> anyhow::Result<GpuTensor> {
+            let sn = affine_param_name(tid, AffineParamKind::Scale);
+            let bn = affine_param_name(tid, AffineParamKind::Bias);
+            let sv = adam.read_param(&sn)?; let bv = adam.read_param(&bn)?;
+            let ng = sv.len();
+            let s_t = GpuTensor::from_vec(tape, &sv, vec![ng])?;
+            let b_t = GpuTensor::from_vec(tape, &bv, vec![ng])?;
+            let w = qdq_affine(&s_t, &b_t, &pack.q_int_bytes, GS)?;
+            let w2 = view(&w, vec![pack.n, pack.k])?;
+            gp.push((sn, s_t)); gp.push((bn, b_t));
+            Ok(w2)
+        };
+
+        let mut losses: Vec<f32> = Vec::with_capacity(N_STEPS);
+
+        for _step in 0..N_STEPS {
+            let tape = GpuTape::new(device.clone());
+            let mut gp: Vec<(String, GpuTensor)> = Vec::new();
+            let mut h = GpuTensor::from_vec(&tape, &embed, vec![N_TOKENS, HIDDEN])
+                .expect("embed");
+            let pos_buf = make_pos_buf_for_real_gqa(&device, N_TOKENS).expect("pos_buf");
+
+            for sp in &syn_packs {
+                let wq = make_qdq(&adam, &sp.tid_wq, &sp.pack_wq, &tape, &mut gp).expect("wq");
+                let wk = make_qdq(&adam, &sp.tid_wk, &sp.pack_wk, &tape, &mut gp).expect("wk");
+                let wv = make_qdq(&adam, &sp.tid_wv, &sp.pack_wv, &tape, &mut gp).expect("wv");
+                let wo = make_qdq(&adam, &sp.tid_wo, &sp.pack_wo, &tape, &mut gp).expect("wo");
+                let win = GpuTensor::from_vec(&tape, &sp.w_in,   vec![HIDDEN]).expect("win");
+                let wpo = GpuTensor::from_vec(&tape, &sp.w_post, vec![HIDDEN]).expect("wpo");
+                let qn  = GpuTensor::from_vec(&tape, &sp.q_norm, vec![HD]).expect("qn");
+                let kn  = GpuTensor::from_vec(&tape, &sp.k_norm, vec![HD]).expect("kn");
+                let n_exp = sp.g_packs.len();
+                let mut gt = Vec::with_capacity(n_exp);
+                let mut ut = Vec::with_capacity(n_exp);
+                let mut dt = Vec::with_capacity(n_exp);
+                for e in 0..n_exp {
+                    gt.push(make_qdq(&adam, &sp.g_tids[e], &sp.g_packs[e], &tape, &mut gp).expect("g"));
+                    ut.push(make_qdq(&adam, &sp.u_tids[e], &sp.u_packs[e], &tape, &mut gp).expect("u"));
+                    dt.push(make_qdq(&adam, &sp.d_tids[e], &sp.d_packs[e], &tape, &mut gp).expect("d"));
+                }
+                // router: [HIDDEN, N_EXPERTS]
+                let rt = GpuTensor::from_vec(&tape, &sp.router, vec![HIDDEN, N_EXPERTS]).expect("rt");
+                let lw = DecoderLayerWeightsRealGqa {
+                    w_in: &win, w_post: &wpo, w_q: &wq, w_k: &wk, w_v: &wv, w_o: &wo,
+                    q_norm_w: &qn, k_norm_w: &kn, w_gate: &rt,
+                    gate_projs: &gt, up_projs: &ut, down_projs: &dt,
+                };
+                h = decoder_layer_on_tape_real_gqa(
+                    &tape, &h, pos_buf.clone(), &lw, &gqa_cfg, MOE_K, 1e-9,
+                ).expect("decoder_layer");
+            }
+
+            let onorm = GpuTensor::from_vec(&tape, &ones_v(HIDDEN), vec![HIDDEN]).expect("onorm");
+            let hn = rms_norm(&h, &onorm, 1e-6).expect("hn");
+            let wlm = make_qdq(&adam, "lm_head", &pack_lm, &tape, &mut gp).expect("wlm");
+            let wlm_t = transpose(&wlm).expect("t_lm");
+            let logits = matmul(&hn, &wlm_t).expect("logits");
+
+            let idx_buf = build_topk_indices_buffer(&device, &teacher_indices, N_TOKENS, top_k)
+                .expect("idx_buf");
+            let st_topk = gather_student_topk_via_tape(&logits, idx_buf, top_k).expect("st");
+            let tt = GpuTensor::from_vec(&tape, &teacher_topk, vec![N_TOKENS, top_k]).expect("tt");
+            let loss = kl_loss_topk_via_tape(&st_topk, &tt, 1.0).expect("kl");
+
+            losses.push(loss.to_vec().expect("loss_v")[0]);
+
+            let dy = ones_like(&tape, loss.shape()).expect("dy");
+            let grads = backward(&loss, dy).expect("bwd");
+            let pr: Vec<(&str, &GpuTensor)> = gp.iter().map(|(n, t)| (n.as_str(), t)).collect();
+            let gm = collect_grads_for_adam(&grads, &pr).expect("collect");
+            adam.step(&gm).expect("step");
+        }
+
+        let n_h = (N_STEPS / 10).max(1);
+        let n_t = (N_STEPS / 10).max(1);
+        let head_avg = losses[..n_h].iter().sum::<f32>() / n_h as f32;
+        let tail_avg = losses[N_STEPS - n_t..].iter().sum::<f32>() / n_t as f32;
+        let ratio = if head_avg < 1e-12 { 1.0f32 } else { tail_avg / head_avg };
+        eprintln!("[phase3c_convergence] head={head_avg:.6} tail={tail_avg:.6} ratio={ratio:.4}");
         assert!(
-            result.trained[0].kl_initial.is_finite(),
-            "kl_initial must be finite"
+            ratio < 0.80,
+            "AC#7 FAIL: tail/head ratio={ratio:.4} >= 0.80"
         );
     }
 }

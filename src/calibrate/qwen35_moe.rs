@@ -739,6 +739,30 @@ pub fn qwen35_moe_forward_on_tape(
     Ok(current)
 }
 
+/// Build a `[4 * seq_len]` I32 position buffer for IMROPE.
+///
+/// Fills `s[axis * seq_len + t] = t` for `axis ∈ {0, 1, 2, 3}`.
+/// Required by `decoder_layer_on_tape_real_gqa`.
+pub(crate) fn make_pos_buf_for_real_gqa(
+    device: &mlx_native::MlxDevice,
+    seq_len: usize,
+) -> Result<mlx_native::MlxBuffer> {
+    let n = 4 * seq_len;
+    let mut buf = device
+        .alloc_buffer(n * 4, mlx_native::DType::I32, vec![n])
+        .map_err(|e| anyhow!("make_pos_buf_for_real_gqa: alloc_buffer: {e}"))?;
+    {
+        let s = buf.as_mut_slice::<i32>()
+            .map_err(|e| anyhow!("make_pos_buf_for_real_gqa: as_mut_slice: {e}"))?;
+        for axis in 0..4usize {
+            for t in 0..seq_len {
+                s[axis * seq_len + t] = t as i32;
+            }
+        }
+    }
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
