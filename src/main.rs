@@ -182,7 +182,124 @@ fn run(cli: Cli) -> Result<(), AppError> {
         // exit-3 is the documented signal.
         Command::Cache(args) => serve::cmd_cache(args).map_err(AppError::Input),
         Command::DwqTrain(args) => cmd_dwq_train(args),
+        Command::DwqOverlayDrift(args) => cmd_dwq_overlay_drift(args),
     }
+}
+
+/// ADR-020 AC#7 foundation F2 — wire `MlxAffineLinear::q4_0_round_trip_drift`
+/// into the CLI surface.  CPU-only; reads the overlay safetensors,
+/// parses every (`<stem>.weight`, `.scales`, `.biases`) triplet, and
+/// prints a per-Linear `RoundTripDrift` line.
+fn cmd_dwq_overlay_drift(args: cli::DwqOverlayDriftArgs) -> Result<(), AppError> {
+    use anyhow::Context as _;
+    use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
+    use crate::serve::forward_mlx::parse_dwq_overlay_metadata;
+
+    if !args.overlay.exists() {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "overlay file does not exist: {}",
+            args.overlay.display()
+        )));
+    }
+
+    let bytes = std::fs::read(&args.overlay)
+        .with_context(|| format!("read overlay {}", args.overlay.display()))
+        .map_err(AppError::Input)?;
+    let (_n_meta, metadata_obj) = safetensors::SafeTensors::read_metadata(&bytes)
+        .map_err(|e| AppError::Conversion(anyhow::anyhow!(
+            "read_metadata: {e:?}"
+        )))?;
+    let (bits, group_size) =
+        parse_dwq_overlay_metadata(metadata_obj.metadata().as_ref())
+            .map_err(AppError::Conversion)?;
+    let st = safetensors::SafeTensors::deserialize(&bytes)
+        .map_err(|e| AppError::Conversion(anyhow::anyhow!(
+            "deserialize: {e:?}"
+        )))?;
+
+    let stem_filter: Option<regex::Regex> = match args.stem_filter.as_deref() {
+        Some(p) => Some(regex::Regex::new(p)
+            .map_err(|e| AppError::Input(anyhow::anyhow!(
+                "invalid --stem-filter regex {p:?}: {e}"
+            )))?),
+        None => None,
+    };
+
+    println!(
+        "[dwq-overlay-drift] overlay={} bits={} group_size={}",
+        args.overlay.display(), bits, group_size
+    );
+    println!(
+        "  {:60}  {:>8} {:>8}  {:>10} {:>10}  {:>10} {:>10}",
+        "stem", "n", "k",
+        "rms_drift", "max_drift",
+        "rel_rms", "bias_frac",
+    );
+
+    let mut linears: Vec<String> = Vec::new();
+    for name in st.names() {
+        let stem = match name.strip_suffix(".weight") {
+            Some(s) => s,
+            None => continue,
+        };
+        if st.tensor(&format!("{stem}.scales")).is_err()
+            || st.tensor(&format!("{stem}.biases")).is_err()
+        {
+            continue;
+        }
+        if let Some(re) = &stem_filter {
+            if !re.is_match(stem) {
+                continue;
+            }
+        }
+        linears.push(stem.to_string());
+    }
+    linears.sort();
+
+    if linears.is_empty() {
+        println!("[dwq-overlay-drift] no Linears matched filter");
+        return Ok(());
+    }
+
+    let mut count_under_0_1 = 0usize;
+    let mut count_over_0_5  = 0usize;
+    let mut sum_rel_rms     = 0.0f64;
+    let mut sum_bias_frac   = 0.0f64;
+
+    for stem in &linears {
+        let linear = MlxAffineLinear::from_safetensors(&st, stem, bits, group_size)
+            .with_context(|| format!("parse {stem}"))
+            .map_err(AppError::Conversion)?;
+        let d = linear.q4_0_round_trip_drift()
+            .with_context(|| format!("q4_0_round_trip_drift {stem}"))
+            .map_err(AppError::Conversion)?;
+        println!(
+            "  {stem:60}  {n:>8} {k:>8}  {rms:>10.4e} {max:>10.4e}  \
+             {rrms:>10.4} {bf:>10.4}",
+            n = d.n, k = d.k,
+            rms = d.rms_drift, max = d.max_abs_drift,
+            rrms = d.relative_rms, bf = d.bias_fraction,
+        );
+        if d.relative_rms.is_finite() {
+            sum_rel_rms += d.relative_rms as f64;
+            if d.relative_rms < 0.1 { count_under_0_1 += 1; }
+            if d.relative_rms > 0.5 { count_over_0_5  += 1; }
+        }
+        if d.bias_fraction.is_finite() {
+            sum_bias_frac += d.bias_fraction as f64;
+        }
+    }
+
+    let n_lin = linears.len();
+    let avg_rrms = (sum_rel_rms / n_lin as f64) as f32;
+    let avg_bf   = (sum_bias_frac / n_lin as f64) as f32;
+    println!(
+        "[dwq-overlay-drift] summary: n_linears={n_lin} avg_relative_rms={avg_rrms:.4} \
+         avg_bias_fraction={avg_bf:.4} \
+         under_0.1={count_under_0_1}/{n_lin} (codec preserves DWQ signal) \
+         over_0.5={count_over_0_5}/{n_lin} (codec destroys DWQ signal)"
+    );
+    Ok(())
 }
 
 /// ADR-020 iter-12d-3 — wire `train_all_linears_dwq` into the CLI.

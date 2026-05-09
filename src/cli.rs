@@ -114,6 +114,17 @@ pub enum Command {
     /// All skipped tensors are reported with reasons in the per-tensor
     /// disposition log.
     DwqTrain(DwqTrainArgs),
+
+    /// ADR-020 AC#7 foundation F2 — measure how much of a DWQ overlay's
+    /// signal would survive the lm_head Vec<f32>→Q4_0 round-trip the
+    /// iter-B1 `apply_dwq_overlay` path performs at serve-time.
+    ///
+    /// Reads the overlay safetensors, parses every `<stem>.weight`+
+    /// `<stem>.scales`+`<stem>.biases` triplet, and prints the
+    /// per-Linear `RoundTripDrift` (rms_drift, max_abs_drift,
+    /// relative_rms, bias_fraction).  CPU-only; no model load, no
+    /// serve.
+    DwqOverlayDrift(DwqOverlayDriftArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -334,6 +345,22 @@ pub struct DwqTrainArgs {
     /// Phase 1 scope: Qwen3 / Qwen3.5 MoE text models only.
     #[arg(long, value_name = "DIR")]
     pub safetensors_dir: Option<PathBuf>,
+}
+
+/// ADR-020 AC#7 foundation F2 — `hf2q dwq-overlay-drift` arguments.
+#[derive(clap::Args, Debug, Clone)]
+pub struct DwqOverlayDriftArgs {
+    /// Path to a DWQ overlay safetensors file (typically produced by
+    /// `hf2q dwq-train --full-model-teacher`).
+    #[arg(long)]
+    pub overlay: PathBuf,
+
+    /// Optional regex filter on stem names; only Linears whose stem
+    /// matches are reported.  Useful for narrowing to specific layers
+    /// (e.g. `^output$` for lm_head only, `^blk\.3\.attn` for one
+    /// layer's attention).  Default: report every triplet found.
+    #[arg(long)]
+    pub stem_filter: Option<String>,
 }
 
 /// `hf2q cache` subcommands. ADR-005 Phase 3 iter-205 (AC line 5351).
