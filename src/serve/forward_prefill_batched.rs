@@ -166,10 +166,23 @@ impl MlxModelWeights {
     /// True batched prefill with single-shot dense SDPA over the whole prompt.
     ///
     /// Returns the first decode token (greedy argmax of last-row logits).
+    ///
+    /// # ADR-028 iter-137 — append-mode parameter (Path A Phase 2 GPU step 2/7)
+    ///
+    /// `start_pos` lets the caller specify the absolute KV-cache position
+    /// where this batch begins. Default callers pass `0` (cold prefill,
+    /// matches pre-iter-137 behavior byte-for-byte). Future
+    /// `forward_decode_verify_batched` (iter-139) calls with `start_pos =
+    /// current_seq_pos` to append-mode the K/V writes.
+    ///
+    /// Internally this threads through `pf_positions[i] = start_pos + i`
+    /// and `kv_caches[i].write_pos = start_pos + seq_len`. At
+    /// `start_pos=0` both reduce to the original semantics.
     pub fn forward_prefill_batched(
         &mut self,
         prompt_tokens: &[u32],
         max_decode_tokens: usize,
+        start_pos: usize,
         gpu: &mut GpuContext,
     ) -> Result<u32> {
         let seq_len = prompt_tokens.len();
@@ -466,8 +479,11 @@ impl MlxModelWeights {
         {
             let p: &mut [u32] = pf_positions.as_mut_slice()
                 .map_err(|e| anyhow::anyhow!("positions write: {e}"))?;
+            // ADR-028 iter-137 Path A Phase 2 GPU step 2/7 — append-mode positions.
+            // start_pos=0 (production default callers): identical to pre-iter-137.
+            // start_pos>0 (future verify_batched callers): append at offset.
             for (i, slot) in p[..seq_len].iter_mut().enumerate() {
-                *slot = i as u32;
+                *slot = (start_pos + i) as u32;
             }
         }
         let mut pf_token_ids = alloc_u32(seq_len, "pf_token_ids")?;

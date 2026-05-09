@@ -1206,7 +1206,9 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                 .collect();
         mlx_w.forward_prefill_with_soft_tokens(&prompt_tokens, &borrowed, args.max_tokens, &mut ctx)?
     } else if use_batched {
-        mlx_w.forward_prefill_batched(&prompt_tokens, args.max_tokens, &mut ctx)?
+        // ADR-028 iter-137: cold prefill always starts at position 0.
+        // Future verify_batched (Phase 2 GPU iter-139) passes start_pos > 0.
+        mlx_w.forward_prefill_batched(&prompt_tokens, args.max_tokens, 0, &mut ctx)?
     } else {
         mlx_w.forward_prefill(&prompt_tokens, args.max_tokens, &mut ctx)?
     };
