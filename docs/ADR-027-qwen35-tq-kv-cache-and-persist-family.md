@@ -441,3 +441,91 @@ Each iter ships a complete, mantra-clean deliverable. No iter is "enable later";
 | 7 | 2026-05-08 | B | LANDED | **TQ-active full-attn KV buffer infra (additive).** New `TqFullAttnKvBuffers` struct (k_packed/k_norms/v_packed/v_norms + norms_per_pos), `tq_norms_per_pos_for(head_dim) -> u32` helper (mirrors mlx-native `forward_mlx.rs:2326` formula), `alloc_tq_full_attn_buffers(cfg, dev, max_seq_len, n_seqs)` standalone allocator, `full_attn_slot_f32_bytes(...)` parity helper. **NOT yet wired into `HybridKvCache::new`** — Chesterton's fence on the live serve path; iter-8 wires the dispatch when the SDPA branch is also ready. Empirical parity test `tq_full_attn_buffers_byte_count_3p94x_smaller_than_f32` proves 3.94× per-slot byte savings at qwen36 35B-A3B-APEX shape (n_kv_heads=2, head_dim=256, max_seq_len=8192, n_seqs=1: F32=33.55 MB → TQ=8.52 MB). 6 new tests PASS (alloc shape, byte counts, zero-init discipline, n_seqs=2 outer-axis correctness, max_seq_len/n_seqs preflight error paths). 3327/0/9 full-suite green (was 3320 pre-iter-7, +7 new). **Investigation finding (Chesterton):** Gemma's `MlxModelWeights` does NOT have a `tq_kv_active: bool` field — TQ-active mode is sourced at engine-spawn from `HF2Q_TQ_KV` env via `is_tq_active_mode()` (engine.rs:2328). The ADR §6 plan to put a field on `MlxModelWeights` (qwen35) was based on a wrong assumption; iter-8 will source `tq_kv_active` from env at `alloc_kv_cache_for_request` instead, mirroring Gemma's pattern. |
 | 6b.3 | 2026-05-08 | A | LANDED | **Cold-start hydrate seam + cross-process replay.** New `LcpSidecarMetadata` struct + sidecar codec (`QH3M` magic, version 1) appended to QH35 envelope tail — orthogonal to the snapshot codec, so adding/changing sidecar fields does NOT bump `QH35_CODEC_VERSION` (preserves Chesterton's fence around v1). Sidecar carries `(model_fingerprint, tenant_id, params_hash, prompt_tokens, sliding_window, linear_capacity)` so the cold-start path can replay the exact in-memory `LcpRegistry::store(...)` call. `Qwen35DiskPersistor::{write,read,hydrate_for_cfg}` thread sidecar through; `store_lcp_with_disk_writeback` constructs sidecar from the live (key, prompt_tokens, sliding_window, linear_capacity) on the disk-write arm. New `Qwen35LoadedModel::hydrate_lcp_registry_from_disk(&HybridKvCache, &MlxDevice)` is idempotent per cfg-fingerprint via `lcp_hydrated_for_cfg: HashSet<String>` (one HashSet check per request after first hydrate; one read_dir per cfg per process). Wired at all 4 prefill entrypoints in `engine_qwen35.rs` (`generate_qwen35_once`, `generate_qwen35_once_with_soft_tokens`, `generate_qwen35_once_with_soft_tokens_and_deepstack`, streaming) BEFORE the LCP probe so hydrated entries are visible. New tests: `qh3m_sidecar_codec_byte_round_trip`, `qh3m_sidecar_codec_rejects_bad_magic`, `qh3m_sidecar_codec_rejects_version_drift`, `qh3m_sidecar_empty_prompt_tokens_round_trip`, `qh35_with_sidecar_round_trip_byte_equal`, `qh35_with_sidecar_full_attn_only_round_trip`, `qh35_with_sidecar_rejects_truncated_envelope`, `qh35_disk_cross_process_replay_into_fresh_lcp_registry` (proves write→drop→fresh persistor→hydrate→`lcp_registry.lookup` hits with original key + reports correct LCP length k=12 against a divergent new prompt), `qh35_disk_clean_cold_start_yields_empty_hydrate`. 24 qh3 codec/disk tests + 516 qwen35 tests PASS = **540 tests**, zero regressions. SERVE end-to-end (live engine + 2-turn HTTP across process restart with TTFT speedup verified) deferred to operator validation gate. |
 | 6b.3 | (pending) | A | – | Hydrate auto-reinsertion: extend QH35 envelope (or add sidecar metadata file) to round-trip `LcpKey + prompt_tokens + sliding_window + linear_capacity` so `hydrate_for_cfg` can re-insert into in-memory `LcpRegistry` automatically; first-prefill hydrate seam on Qwen35LoadedModel; SERVE end-to-end validation: 2-turn chat across process restart with TTFT speedup verified. |
+
+---
+
+## 11. Post-LANDED extension plan — speculative-decoding integration (2026-05-09 iter-83-cron)
+
+### Scope (NEW post-iter-54 closure)
+
+ADR-027 phases A+B closed at iter-54. Operator surfaced 3 reddit context
+files at `/opt/hf2q/docs/reddit/` (added 2026-05-09 11:36-11:38) +
+2 new reference repos (`/opt/dflash`, `/opt/ds4`) that open a major
+follow-on direction: **speculative decoding via either MTP (Multi-Token
+Prediction) or DFlash (block-diffusion drafts).**
+
+This section is ADR-027 §11 (extension), not a new ADR — qwen35 inference
+remains the primary scope. MTP integration is conceptually a fast-path
+overlay on top of the iter-23 chain's KV-active cache infrastructure.
+
+### Reference repos (operator-supplied 2026-05-09)
+
+- **`/opt/dflash`** — DFlash by z-lab. Block-diffusion speculative drafts.
+  Pre-trained drafts on Hugging Face for: gemma-4-26B-A4B, gemma-4-31B,
+  Qwen3.6-27B, Qwen3.6-35B-A3B, Qwen3.5-{4B,9B,27B,35B-A3B,122B-A10B},
+  Qwen3-Coder-{Next,30B-A3B}, MiniMax-M2.5, Kimi-K2.5, gpt-oss-{20b,120b}.
+  Paper: arxiv 2602.06036. Distinct draft model approach (not built-in).
+- **`/opt/ds4`** — DeepSeek V4 Flash inference engine in C + Metal (.m
+  for ObjC/Metal). Closer architectural match to hf2q's mlx-native
+  pattern than llama.cpp. AGENT.md sets quality rules: small/readable C,
+  whole-model Metal graph, mmap loading, correctness-before-speed.
+
+### Reddit context (operator-supplied 2026-05-09 11:36-11:38)
+
+- **`reddit-mtp.txt`** (120 KB): Qwen3.6-27B with MTP draft = 2.5×
+  decode speedup → 28 tok/s on M2 Max 96GB. **Built-in MTP tensor
+  layers** (no separate draft model). llama.cpp PR 22673 brings
+  support. froggeric's converted GGUFs at HF (we already have
+  `/opt/hf2q/models/qwen3.6-27b-mtp-q4_0/qwen3.6-27b-mtp-q4_0.gguf`,
+  17.2 GB). 3 draft tokens optimal; q4_0 KV cache problematic >64k
+  context. Independent observation: "Qwen3.6-27B is hybrid — only 16
+  of 65 layers use KV cache; other 48 are linear attention (~898 MiB
+  recurrent state). KV memory ~4× less than standard dense" — matches
+  our ADR-027 3.94× savings observation independently.
+- **`reddit-atlas.txt`** (20 KB): GB10 Solution Atlas open-sourced.
+  Qwen3.6-35B-FP8 at 100+ tok/s. Likely useful as a peer benchmark
+  reference for speed targets.
+- **`reddit-heretic.txt`** (17 KB): Heretic 1.3 — reproducible models,
+  integrated benchmarking, reduced peak VRAM. Lower direct relevance
+  to iter-83-cron MTP but useful for the broader benchmarking gate.
+
+### iter-83-cron exploration plan (3-step, 1 step/iter)
+
+1. **iter-83a** — **Map MTP requirements**: read `reddit-mtp.txt` end-to-end
+   + scan llama.cpp PR 22673 graph build for MTP head dispatch + scan our
+   current `qwen3.6-27b-mtp-q4_0.gguf` GGUF tensor names to see what MTP
+   tensors are present in our existing on-disk file. Output: hypothesis
+   "what hf2q needs to add to consume the existing MTP GGUF" — testable
+   by inspecting tensor metadata.
+2. **iter-83b** — **Map DS4 inference loop**: read `/opt/ds4/ds4_cli.c`
+   + `ds4_metal.h/.m` to understand DeepSeek V4's Metal-native speculative
+   decoding loop pattern (if any). Identify reusable patterns vs hf2q.
+3. **iter-83c** — **Decision branch**:
+   - Path A (MTP, built-in): smaller scope, leverages existing GGUF;
+     requires graph build for MTP head + verify+reject loop.
+   - Path B (DFlash, separate draft): larger scope (separate model
+     load); more general (covers gemma-4 too); requires DFlash GGUF
+     conversion or porting from HF safetensors.
+   - Path C (parallel): both paths in parallel via /cfa swarm.
+
+### Constraints (operator-stated)
+
+- Mantra: "no fallback, no stub (todo later) code"
+- Mantra: "as coherent and as fast or faster than peers" — peer baseline
+  for this work = MTP gives 2.5× → if we ship MTP we should match or
+  exceed 2.5× decode speedup on Qwen3.6-27B-MTP
+- ADR-027 "TQ for all models we support, if possible" still binding —
+  MTP draft tokens must be TQ-compatible OR fall back to F32 cache for
+  draft positions (likely the latter; draft positions are short-lived)
+- ADR-028 mantra: "as coherent as peers, as fast or faster" — MTP gate
+  must include byte-identity vs non-MTP output for first decode token
+  per iter-65/74 pattern
+
+### Open questions for operator (gate iter-83a → iter-83b)
+
+1. Which path? A (MTP, narrower) / B (DFlash, broader) / C (parallel).
+2. Target model? qwen3.6-27b-MTP (already on disk) vs qwen3.6-35B-A3B-MTP
+   (would need conversion).
+3. Acceptance criterion? Direct copy of MTP reddit's 2.5× target, or
+   measure-then-set after iter-83b empirical baseline?
+
