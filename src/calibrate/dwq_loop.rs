@@ -11762,10 +11762,48 @@ mod tests {
         let head_avg = losses[..n_h].iter().sum::<f32>() / n_h as f32;
         let tail_avg = losses[N_STEPS - n_t..].iter().sum::<f32>() / n_t as f32;
         let ratio = if head_avg < 1e-12 { 1.0f32 } else { tail_avg / head_avg };
+        // ADR-020 AC#7 foundation F1 — print the same summary line the
+        // production wrapper prints, so this passing test serves as a
+        // KNOWN-GOOD reference trajectory operators can compare against
+        // empirical real-data runs.  When this fixture is healthy:
+        //   reduction_ratio < 1.0, worse_than_first low (loss
+        //   genuinely decreases through training), interior min near
+        //   the end.
+        let traj = TrajectorySummary::from_losses(&losses);
+        eprintln!(
+            "[phase3c_convergence] reference trajectory: \
+             n={n} first={first:.4e} last={last:.4e} \
+             min={min:.4e}@step{min_step} max={max:.4e}@step{max_step} \
+             reduction_ratio={ratio:.4} \
+             worse_than_first={worse}/{n}",
+            n = traj.n,
+            first = traj.first,
+            last = traj.last,
+            min = traj.min_value,
+            min_step = traj.min_step,
+            max = traj.max_value,
+            max_step = traj.max_step,
+            ratio = traj.reduction_ratio,
+            worse = traj.worse_than_first,
+        );
         eprintln!("[phase3c_convergence] head={head_avg:.6} tail={tail_avg:.6} ratio={ratio:.4}");
         assert!(
             ratio < 0.80,
             "AC#7 FAIL: tail/head ratio={ratio:.4} >= 0.80"
+        );
+        // F1 invariant: a healthy convergence run must satisfy the
+        // SAME invariants the production wrapper's TrajectorySummary
+        // exposes — guard them here so a regression in either the
+        // training math OR the trajectory plumbing trips the test.
+        assert!(
+            traj.reduction_ratio < 1.0,
+            "AC#7 FAIL: reduction_ratio={:.4} >= 1.0 — training never \
+             produced a lower loss than first step",
+            traj.reduction_ratio
+        );
+        assert!(
+            traj.min_step > 0,
+            "AC#7 FAIL: min_step=0 — training never improved past start"
         );
     }
 
@@ -12272,8 +12310,30 @@ mod tests {
         let head_avg = losses_gc[..n_h].iter().sum::<f32>() / n_h as f32;
         let tail_avg = losses_gc[n_steps - n_t..].iter().sum::<f32>() / n_t as f32;
         let ratio = if head_avg < 1e-12 { 1.0f32 } else { tail_avg / head_avg };
+        // F1: surface trajectory summary.  GC fixture is shorter
+        // (N_STEPS=20) so reduction_ratio threshold is more relaxed
+        // here than in the 50-step convergence test.
+        let traj = TrajectorySummary::from_losses(&losses_gc);
+        eprintln!(
+            "[gc_converges] reference trajectory: \
+             n={n} first={first:.4e} last={last:.4e} \
+             min={min:.4e}@step{min_step} reduction_ratio={ratio:.4} \
+             worse_than_first={worse}/{n}",
+            n = traj.n,
+            first = traj.first,
+            last = traj.last,
+            min = traj.min_value,
+            min_step = traj.min_step,
+            ratio = traj.reduction_ratio,
+            worse = traj.worse_than_first,
+        );
         eprintln!("[gc_converges] head={head_avg:.6} tail={tail_avg:.6} ratio={ratio:.4}");
         assert!(ratio < 0.80, "GC convergence FAIL: tail/head ratio={ratio:.4} >= 0.80");
+        assert!(
+            traj.reduction_ratio < 1.0,
+            "GC convergence FAIL: reduction_ratio={:.4} >= 1.0",
+            traj.reduction_ratio
+        );
     }
 
     // ── Test 4: GC=false preserves baseline convergence ─────────────────────
