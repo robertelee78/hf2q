@@ -316,6 +316,24 @@ pub struct DwqTrainArgs {
     /// pass per layer per Adam step.  Default false.
     #[arg(long, default_value_t = false)]
     pub gradient_checkpoint: bool,
+
+    /// Path to a HuggingFace model directory (safetensors format) to use
+    /// as the teacher for full-model DWQ training instead of the GGUF
+    /// specified by `--gguf`.
+    ///
+    /// When set, the HF directory's bf16/f32 weights are used as the
+    /// teacher reference, which avoids the quantization noise baked into
+    /// a GGUF teacher (Q5_K_M ≈ 5.5 bpw).  The directory must contain
+    /// a `config.json` and one or more `.safetensors` shard files.
+    ///
+    /// Mutually exclusive with using `--gguf` as the teacher in
+    /// `--full-model-teacher` mode.  `--gguf` is still required (it
+    /// specifies the student model architecture for Stage A weight
+    /// packing) but the teacher logits come from this directory instead.
+    ///
+    /// Phase 1 scope: Qwen3 / Qwen3.5 MoE text models only.
+    #[arg(long, value_name = "DIR")]
+    pub safetensors_dir: Option<PathBuf>,
 }
 
 /// `hf2q cache` subcommands. ADR-005 Phase 3 iter-205 (AC line 5351).

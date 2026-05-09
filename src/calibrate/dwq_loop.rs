@@ -458,6 +458,39 @@ impl Default for DwqTrainingConfig {
     }
 }
 
+/// ADR-020 AC#7 — source of full-precision teacher weights for
+/// `train_all_linears_full_model_dwq`.
+///
+/// `Gguf(path)` — existing GGUF-backed path (Q5_K_M teacher).
+/// `HfSafetensors(dir)` — HuggingFace model directory with full-precision
+///   bf16/f32 weights; produces a less-noisy teacher → tighter KL.
+#[derive(Debug, Clone)]
+pub enum DwqTeacherSource {
+    /// Path to a GGUF model file (any supported ggml_type).
+    Gguf(std::path::PathBuf),
+    /// Path to a HuggingFace model directory containing `config.json`
+    /// and `model.safetensors[.index.json]`.
+    HfSafetensors(std::path::PathBuf),
+}
+
+impl DwqTeacherSource {
+    /// Return a display string for logging.
+    pub fn display(&self) -> String {
+        match self {
+            DwqTeacherSource::Gguf(p) => format!("gguf:{}", p.display()),
+            DwqTeacherSource::HfSafetensors(p) => format!("hf:{}", p.display()),
+        }
+    }
+
+    /// Return `true` if the path / directory exists on disk.
+    pub fn exists(&self) -> bool {
+        match self {
+            DwqTeacherSource::Gguf(p) => p.exists(),
+            DwqTeacherSource::HfSafetensors(p) => p.exists(),
+        }
+    }
+}
+
 /// ADR-020 AC#7 Option A — configuration for the full-model DWQ
 /// training entry point (`train_all_linears_full_model_dwq`, step 2
 /// of the AC#7 implementation ladder per ADR-020 §8.3).
@@ -502,9 +535,12 @@ pub struct FullModelDwqConfig {
     pub batch_size: usize,
     /// Calibration sequence length per batch.
     pub seq_len: usize,
-    /// Path to the teacher GGUF (FP32-equivalent — typically the
-    /// same model variant the student is being quantized FROM).
-    pub gguf_path: std::path::PathBuf,
+    /// Source of full-precision teacher weights.
+    ///
+    /// `DwqTeacherSource::Gguf(path)` — existing GGUF-backed path.
+    /// `DwqTeacherSource::HfSafetensors(dir)` — HuggingFace model directory
+    ///   with bf16/f32 weights (less noisy → better KL).
+    pub teacher_source: DwqTeacherSource,
     /// Calibration corpus as token-id batches.  Each `Vec<u32>` is
     /// a batch of length `batch_size × seq_len` row-major.
     /// Length validated at runtime against `batch_size * seq_len`
@@ -536,11 +572,11 @@ pub struct FullModelDwqConfig {
 }
 
 impl Default for FullModelDwqConfig {
-    /// Production defaults.  Empty `gguf_path` and
-    /// `calibration_token_batches` MUST be supplied by the caller
-    /// before invoking the training fn — they default to "no-op
-    /// values" purely so the struct supports `..Default::default()`
-    /// initializer-shorthand in tests/fixtures.
+    /// Production defaults.  `teacher_source` defaults to an empty GGUF path
+    /// and `calibration_token_batches` to empty — MUST be supplied by the
+    /// caller before invoking the training fn.  Defaults exist purely so the
+    /// struct supports `..Default::default()` initializer-shorthand in
+    /// tests/fixtures.
     fn default() -> Self {
         Self {
             bits: 4,
@@ -550,7 +586,7 @@ impl Default for FullModelDwqConfig {
             temperature: 2.0,
             batch_size: 32,
             seq_len: 512,
-            gguf_path: std::path::PathBuf::new(),
+            teacher_source: DwqTeacherSource::Gguf(std::path::PathBuf::new()),
             calibration_token_batches: Vec::new(),
             top_k_teacher: 1024,
             seed: 0xDEAD_BEEF,
@@ -577,7 +613,7 @@ impl FullModelDwqConfig {
     /// - `temperature` finite and `> 0`
     /// - `batch_size >= 32` — matmul backward kernel floor
     /// - `seq_len >= 2` — next-token target requires ≥1 input + ≥1 target
-    /// - `gguf_path` non-empty (caller MUST supply)
+    /// - `teacher_source` path non-empty (caller MUST supply)
     /// - `calibration_token_batches` non-empty
     /// - Every batch's token count == `batch_size × seq_len`
     /// - `top_k_teacher > 0`
@@ -621,10 +657,17 @@ impl FullModelDwqConfig {
                 self.seq_len
             ));
         }
-        if self.gguf_path.as_os_str().is_empty() {
-            return Err(anyhow!(
-                "FullModelDwqConfig: gguf_path must be non-empty (caller must supply teacher GGUF path)"
-            ));
+        {
+            let source_path_empty = match &self.teacher_source {
+                DwqTeacherSource::Gguf(p) => p.as_os_str().is_empty(),
+                DwqTeacherSource::HfSafetensors(p) => p.as_os_str().is_empty(),
+            };
+            if source_path_empty {
+                return Err(anyhow!(
+                    "FullModelDwqConfig: teacher_source path must be non-empty \
+                     (caller must supply a GGUF path or HF safetensors directory)"
+                ));
+            }
         }
         if self.calibration_token_batches.is_empty() {
             return Err(anyhow!(
@@ -888,16 +931,24 @@ pub fn prepare_full_model_teacher_inputs(
         .context("prepare_full_model_teacher_inputs: cfg.validate")?;
 
     // Step 2 — open teacher.  This is the heavy step (model load +
-    // GPU upload).
-    let teacher = crate::calibrate::gguf_teacher::GgufTeacherProvider::from_gguf_path(
-        &cfg.gguf_path,
-    )
-    .with_context(|| {
-        format!(
-            "prepare_full_model_teacher_inputs: GgufTeacherProvider::from_gguf_path {}",
-            cfg.gguf_path.display()
-        )
-    })?;
+    // GPU upload).  Only GGUF-backed teacher is supported here; the
+    // HF-safetensors path goes through `train_all_linears_full_model_dwq`.
+    let gguf_path = match &cfg.teacher_source {
+        DwqTeacherSource::Gguf(p) => p,
+        DwqTeacherSource::HfSafetensors(_) => {
+            return Err(anyhow!(
+                "prepare_full_model_teacher_inputs: HfSafetensors teacher is not supported \
+                 via this entry point; use train_all_linears_full_model_dwq instead"
+            ));
+        }
+    };
+    let teacher = crate::calibrate::gguf_teacher::GgufTeacherProvider::from_gguf_path(gguf_path)
+        .with_context(|| {
+            format!(
+                "prepare_full_model_teacher_inputs: GgufTeacherProvider::from_gguf_path {}",
+                gguf_path.display()
+            )
+        })?;
 
     // Step 3 — derive vocab from the loaded model (authoritative).
     let vocab = teacher.vocab();
@@ -3489,40 +3540,178 @@ pub fn train_all_linears_full_model_dwq(
 
     cfg.validate().context("train_all_linears_full_model_dwq: cfg.validate")?;
 
-    let gguf_file = GgufFile::open(&cfg.gguf_path).with_context(|| {
-        format!("GgufFile::open {}", cfg.gguf_path.display())
-    })?;
-    let qcfg = Qwen35Model::load_config_only(&gguf_file)
-        .context("load_config_only")?;
-    let n_all_layers = qcfg.num_hidden_layers as usize;
-    let mut progress = crate::serve::header::LoadProgress::new(false, 0, n_all_layers);
-    let model = Qwen35Model::load_from_gguf(&gguf_file, &mut progress).with_context(|| {
-        format!("load_from_gguf {}", cfg.gguf_path.display())
-    })?;
-
-    let vocab       = model.cfg.vocab_size as usize;
-    let hidden_size = model.cfg.hidden_size as usize;
-    let rms_eps     = model.cfg.rms_norm_eps;
-    let n_q_heads   = model.cfg.num_attention_heads as usize;
-    let n_kv_heads  = model.cfg.num_key_value_heads as usize;
-    let head_dim    = model.cfg.head_dim as usize;
-    let layer_types = model.cfg.layer_types.clone();
-    let moe_cfg     = model.cfg.moe.clone();
-    let rope_theta  = model.cfg.rope_theta as f32;
-    let rope_sections = model.cfg.mrope_section;
-
     let device = mlx_native::MlxDevice::new()
         .map_err(|e| anyhow!("MlxDevice::new: {e}"))?;
+
+    // ── Branch on teacher_source: load arch config + weight accessor ──────────
+    // The HF-safetensors branch loads full-precision (bf16/f32) weights and
+    // uses a `dyn Fn(&str) -> Result<Vec<f32>>` accessor to decouple the
+    // Stage A packing loop from the weight source format.
+    //
+    // Common fields extracted from either source.
+    // `teacher_forward_fn` is a `FnMut(&[u32]) -> Result<(logits, hidden)>` closure
+    // built per teacher_source so Stage B can dispatch without knowing the source.
+    let (vocab, hidden_size, rms_eps, n_q_heads, n_kv_heads, head_dim,
+         layer_types, moe_cfg, rope_theta, rope_sections,
+         n_all_layers, load_f32_owned,
+         mut teacher_forward_fn): (
+        usize, usize, f32, usize, usize, usize,
+        Vec<crate::inference::models::qwen35::Qwen35LayerKind>,
+        Option<crate::inference::models::qwen35::Qwen35MoeConfig>,
+        f32, [u32; 4], usize,
+        Box<dyn Fn(&str) -> Result<Vec<f32>>>,
+        Box<dyn FnMut(&[u32]) -> Result<(Vec<f32>, Vec<f32>)>>,
+    ) = match &cfg.teacher_source {
+        DwqTeacherSource::Gguf(gguf_path) => {
+            let gguf_file = GgufFile::open(gguf_path)
+                .with_context(|| format!("GgufFile::open {}", gguf_path.display()))?;
+            let qcfg = Qwen35Model::load_config_only(&gguf_file)
+                .context("load_config_only")?;
+            let n_layers = qcfg.num_hidden_layers as usize;
+            let mut progress = crate::serve::header::LoadProgress::new(false, 0, n_layers);
+            let model = Qwen35Model::load_from_gguf(&gguf_file, &mut progress)
+                .with_context(|| format!("load_from_gguf {}", gguf_path.display()))?;
+            let vocab       = model.cfg.vocab_size as usize;
+            let hidden_size = model.cfg.hidden_size as usize;
+            let rms_eps     = model.cfg.rms_norm_eps;
+            let n_q_heads   = model.cfg.num_attention_heads as usize;
+            let n_kv_heads  = model.cfg.num_key_value_heads as usize;
+            let head_dim    = model.cfg.head_dim as usize;
+            let layer_types = model.cfg.layer_types.clone();
+            let moe_cfg     = model.cfg.moe.clone();
+            let rope_theta  = model.cfg.rope_theta as f32;
+            let rope_sections = model.cfg.mrope_section;
+            let dev_clone   = device.clone();
+            let load: Box<dyn Fn(&str) -> Result<Vec<f32>>> = Box::new(move |name| {
+                let buf = gguf_file.load_tensor_f32(name, &dev_clone)
+                    .with_context(|| format!("load_tensor_f32 '{name}'"))?;
+                let s = buf.as_slice::<f32>()
+                    .with_context(|| format!("as_slice '{name}'"))?;
+                Ok(s.to_vec())
+            });
+            // GGUF Stage B teacher forward: uses Qwen35Model::forward_gpu_with_hidden.
+            let mut positions_buf_gguf: Vec<i32> = Vec::new();
+            crate::calibrate::gguf_teacher::fill_text_positions(
+                &mut positions_buf_gguf, cfg.seq_len);
+            let seq_len_gguf = cfg.seq_len;
+            let vocab_gguf   = vocab;
+            let hidden_gguf  = hidden_size;
+            let dev_gguf     = device.clone();
+            let fwd: Box<dyn FnMut(&[u32]) -> Result<(Vec<f32>, Vec<f32>)>> =
+                Box::new(move |row_tokens: &[u32]| {
+                    let mut kv = HybridKvCache::new(&model.cfg, &dev_gguf,
+                        seq_len_gguf.max(1) as u32, 1)?;
+                    let (logits_full, hidden_buf) = model
+                        .forward_gpu_with_hidden(row_tokens, &positions_buf_gguf, &mut kv)
+                        .context("forward_gpu_with_hidden")?;
+                    let last_tok = seq_len_gguf - 1;
+                    let logits_row = logits_full[last_tok * vocab_gguf..(last_tok + 1) * vocab_gguf].to_vec();
+                    let hidden_slice = hidden_buf
+                        .as_slice::<f32>()
+                        .map_err(|e| anyhow!("hidden_buf as_slice: {e}"))?;
+                    let hidden_row = hidden_slice[last_tok * hidden_gguf..(last_tok + 1) * hidden_gguf].to_vec();
+                    Ok((logits_row, hidden_row))
+                });
+            (vocab, hidden_size, rms_eps, n_q_heads, n_kv_heads, head_dim,
+             layer_types, moe_cfg, rope_theta, rope_sections, n_layers, load, fwd)
+        }
+        DwqTeacherSource::HfSafetensors(hf_dir) => {
+            use crate::calibrate::hf_safetensors_teacher::{
+                HfSafetensorsConfig, HfSafetensorsTeacherProvider, HfSafetensorsWeights,
+            };
+            use crate::inference::models::qwen35::{
+                Qwen35LayerKind, Qwen35MoeConfig,
+            };
+            let hf_cfg = HfSafetensorsConfig::from_dir(hf_dir)
+                .with_context(|| format!("HfSafetensorsConfig::from_dir {}", hf_dir.display()))?;
+            let n_layers  = hf_cfg.num_hidden_layers;
+            let vocab     = hf_cfg.vocab_size;
+            let hidden    = hf_cfg.hidden_size;
+            let rms_eps   = hf_cfg.rms_norm_eps;
+            let n_q       = hf_cfg.num_attention_heads;
+            let n_kv      = hf_cfg.num_key_value_heads;
+            let hd        = hf_cfg.head_dim;
+            let rope_t    = hf_cfg.rope_theta;
+            let rope_sec  = hf_cfg.mrope_section;
+            let tensor_prefix = hf_cfg.tensor_prefix.clone();
+            // Build layer_types: detect full-attention by presence of q_proj.
+            let hf_weights = HfSafetensorsWeights::open(hf_dir)
+                .with_context(|| format!("HfSafetensorsWeights::open {}", hf_dir.display()))?;
+            let mut layer_types: Vec<Qwen35LayerKind> = Vec::with_capacity(n_layers);
+            for i in 0..n_layers {
+                let q_proj_name = format!(
+                    "{}model.layers.{i}.self_attn.q_proj.weight",
+                    tensor_prefix
+                );
+                if hf_weights.list_tensor_names().contains(&q_proj_name) {
+                    layer_types.push(Qwen35LayerKind::FullAttention);
+                } else {
+                    layer_types.push(Qwen35LayerKind::LinearAttention);
+                }
+            }
+            // Build moe_cfg for Stage A branching (same semantics as GGUF).
+            let moe_cfg: Option<Qwen35MoeConfig> = if let Some(n_exp) = hf_cfg.num_experts {
+                Some(Qwen35MoeConfig {
+                    num_experts: n_exp as u32,
+                    num_experts_per_tok: hf_cfg.num_experts_per_tok.unwrap_or(1) as u32,
+                    moe_intermediate_size: hf_cfg.intermediate_size as u32,
+                    // shared_expert fields: zero (not wired in HF DWQ path v1).
+                    shared_expert_intermediate_size: 0,
+                })
+            } else {
+                None
+            };
+            // Weight accessor: loads HF tensors, casts bf16/f16 → f32.
+            // Maps HF tensor names as-is (HF path already has canonical names).
+            let hf_dir_clone = hf_dir.clone();
+            let load: Box<dyn Fn(&str) -> Result<Vec<f32>>> = Box::new(move |name| {
+                // The load_f32 function opens / re-opens lazily via mmap.
+                // For the HF path we open a fresh WeightsHandle per call.
+                // This is acceptable because Stage A & B are single-threaded
+                // and each tensor is accessed once.
+                let w = HfSafetensorsWeights::open(&hf_dir_clone)
+                    .with_context(|| format!("HfSafetensorsWeights::open for '{name}'"))?;
+                w.load_f32(name)
+            });
+            // HF Stage B teacher forward: uses HfSafetensorsTeacherProvider::forward_with_hidden.
+            let hf_teacher = HfSafetensorsTeacherProvider::from_dir(hf_dir)
+                .with_context(|| format!("HfSafetensorsTeacherProvider::from_dir {}", hf_dir.display()))?;
+            let seq_len_hf = cfg.seq_len;
+            let vocab_hf   = vocab;
+            let hidden_hf  = hidden;
+            let fwd: Box<dyn FnMut(&[u32]) -> Result<(Vec<f32>, Vec<f32>)>> =
+                Box::new(move |row_tokens: &[u32]| {
+                    let (logits_full, hidden_full) = hf_teacher.forward_with_hidden(row_tokens)?;
+                    let last_tok = seq_len_hf - 1;
+                    let logits_row = logits_full[last_tok * vocab_hf..(last_tok + 1) * vocab_hf].to_vec();
+                    let hidden_row = hidden_full[last_tok * hidden_hf..(last_tok + 1) * hidden_hf].to_vec();
+                    Ok((logits_row, hidden_row))
+                });
+            (vocab, hidden, rms_eps, n_q, n_kv, hd,
+             layer_types, moe_cfg, rope_t, rope_sec, n_layers, load, fwd)
+        }
+    };
+
+    let load_f32 = load_f32_owned.as_ref();
+
     let watchdog: Option<RssWatchdog> = cfg.rss_cap_bytes.map(|cap| {
         RssWatchdog::spawn(cap, std::time::Duration::from_secs(5))
     });
 
-    let load_f32 = |name: &str| -> Result<Vec<f32>> {
-        let buf = gguf_file.load_tensor_f32(name, &device)
-            .with_context(|| format!("load_tensor_f32 '{name}'"))?;
-        let s = buf.as_slice::<f32>()
-            .with_context(|| format!("as_slice '{name}'"))?;
-        Ok(s.to_vec())
+    // ── Helper: translate a GGUF tensor name to the canonical name for the
+    //    active teacher_source.  For GGUF the name is used directly; for HF
+    //    we map blk.{i}.xxx → model.layers.{i}.yyy.
+    //    The `load_f32` closure already handles HF names (passed in by the
+    //    HF branch above), so Stage A just needs to call with the right name.
+    //    We expose a thin `gguf_name_to_hf` mapper here so Stage A can switch
+    //    tensor names without duplicating all the GGUF logic.
+    let is_hf = matches!(&cfg.teacher_source, DwqTeacherSource::HfSafetensors(_));
+    let hf_tensor_prefix: String = match &cfg.teacher_source {
+        DwqTeacherSource::HfSafetensors(d) => {
+            use crate::calibrate::hf_safetensors_teacher::HfSafetensorsConfig;
+            HfSafetensorsConfig::from_dir(d).map(|c| c.tensor_prefix).unwrap_or_default()
+        }
+        DwqTeacherSource::Gguf(_) => String::new(),
     };
 
     // Stage A: pack every full-attention-layer Linear.
@@ -3564,97 +3753,176 @@ pub fn train_all_linears_full_model_dwq(
             continue;
         }
 
-        let p = format!("blk.{layer_idx}");
-        let w_in   = load_f32(&format!("{p}.attn_norm.weight"))?;
-        let w_post = load_f32(&format!("{p}.post_attention_norm.weight"))?;
-        let q_norm = load_f32(&format!("{p}.attn_q_norm.weight"))?;
-        let k_norm = load_f32(&format!("{p}.attn_k_norm.weight"))?;
-
-        let q_fused = load_f32(&format!("{p}.attn_q.weight"))?;
         let q_total = n_q_heads * head_dim;
-        if q_fused.len() != 2 * q_total * hidden_size {
-            return Err(anyhow!(
-                "layer {layer_idx} attn_q len={} != 2*{q_total}*{hidden_size}",
-                q_fused.len()
-            ));
-        }
-        let mut wq_data = vec![0.0f32; q_total * hidden_size];
-        for h in 0..n_q_heads {
-            let src = (h * 2 * head_dim) * hidden_size;
-            let dst = h * head_dim * hidden_size;
-            wq_data[dst..dst + head_dim * hidden_size]
-                .copy_from_slice(&q_fused[src..src + head_dim * hidden_size]);
-        }
-        let wk_data = load_f32(&format!("{p}.attn_k.weight"))?;
-        let wv_data = load_f32(&format!("{p}.attn_v.weight"))?;
-        let wo_data = load_f32(&format!("{p}.attn_output.weight"))?;
         let kv_rows = n_kv_heads * head_dim;
 
-        let tid_wq = format!("{p}.attn_q.weight");
-        let tid_wk = format!("{p}.attn_k.weight");
-        let tid_wv = format!("{p}.attn_v.weight");
-        let tid_wo = format!("{p}.attn_output.weight");
+        // ── Stage A weight loading: branch on teacher_source ───────────────
+        // GGUF names (blk.{i}.xxx) vs HF names (model.layers.{i}.yyy).
+        // The `is_hf` flag selects the path; `hf_tensor_prefix` handles VL
+        // model wrappers (e.g. `language_model.model.layers.{i}.`).
+        let (w_in, w_post, q_norm, k_norm, wq_data, wk_data, wv_data, wo_data,
+             tid_wq, tid_wk, tid_wv, tid_wo) = if is_hf {
+            let lp = format!("{}model.layers.{layer_idx}", hf_tensor_prefix);
+            let w_in   = load_f32(&format!("{lp}.input_layernorm.weight"))?;
+            let w_post = load_f32(&format!("{lp}.post_attention_layernorm.weight"))?;
+            let q_norm = load_f32(&format!("{lp}.self_attn.q_norm.weight"))?;
+            let k_norm = load_f32(&format!("{lp}.self_attn.k_norm.weight"))?;
+            // HF q_proj: [q_total, hidden] — no interleaving.
+            let wq = load_f32(&format!("{lp}.self_attn.q_proj.weight"))?;
+            let wk = load_f32(&format!("{lp}.self_attn.k_proj.weight"))?;
+            let wv = load_f32(&format!("{lp}.self_attn.v_proj.weight"))?;
+            let wo = load_f32(&format!("{lp}.self_attn.o_proj.weight"))?;
+            if wq.len() != q_total * hidden_size {
+                return Err(anyhow!(
+                    "layer {layer_idx} HF q_proj len={} != q_total*hidden={q_total}*{hidden_size}",
+                    wq.len()
+                ));
+            }
+            let tid_wq = format!("{lp}.self_attn.q_proj.weight");
+            let tid_wk = format!("{lp}.self_attn.k_proj.weight");
+            let tid_wv = format!("{lp}.self_attn.v_proj.weight");
+            let tid_wo = format!("{lp}.self_attn.o_proj.weight");
+            (w_in, w_post, q_norm, k_norm, wq, wk, wv, wo, tid_wq, tid_wk, tid_wv, tid_wo)
+        } else {
+            let p = format!("blk.{layer_idx}");
+            let w_in   = load_f32(&format!("{p}.attn_norm.weight"))?;
+            let w_post = load_f32(&format!("{p}.post_attention_norm.weight"))?;
+            let q_norm = load_f32(&format!("{p}.attn_q_norm.weight"))?;
+            let k_norm = load_f32(&format!("{p}.attn_k_norm.weight"))?;
+            let q_fused = load_f32(&format!("{p}.attn_q.weight"))?;
+            if q_fused.len() != 2 * q_total * hidden_size {
+                return Err(anyhow!(
+                    "layer {layer_idx} attn_q len={} != 2*{q_total}*{hidden_size}",
+                    q_fused.len()
+                ));
+            }
+            let mut wq_data = vec![0.0f32; q_total * hidden_size];
+            for h in 0..n_q_heads {
+                let src = (h * 2 * head_dim) * hidden_size;
+                let dst = h * head_dim * hidden_size;
+                wq_data[dst..dst + head_dim * hidden_size]
+                    .copy_from_slice(&q_fused[src..src + head_dim * hidden_size]);
+            }
+            let wk = load_f32(&format!("{p}.attn_k.weight"))?;
+            let wv = load_f32(&format!("{p}.attn_v.weight"))?;
+            let wo = load_f32(&format!("{p}.attn_output.weight"))?;
+            let tid_wq = format!("{p}.attn_q.weight");
+            let tid_wk = format!("{p}.attn_k.weight");
+            let tid_wv = format!("{p}.attn_v.weight");
+            let tid_wo = format!("{p}.attn_output.weight");
+            (w_in, w_post, q_norm, k_norm, wq_data, wk, wv, wo, tid_wq, tid_wk, tid_wv, tid_wo)
+        };
+
         let pack_wq = mkpack(&wq_data, q_total, hidden_size, &tid_wq)?;
         let pack_wk = mkpack(&wk_data, kv_rows, hidden_size, &tid_wk)?;
         let pack_wv = mkpack(&wv_data, kv_rows, hidden_size, &tid_wv)?;
         let pack_wo = mkpack(&wo_data, hidden_size, q_total, &tid_wo)?;
+
+        // Helper: transpose [rows, cols] -> [cols, rows].
+        let transpose_f32 = |data: &[f32], rows: usize, cols: usize| -> Vec<f32> {
+            let mut out = vec![0.0f32; data.len()];
+            for i in 0..rows { for j in 0..cols { out[j * rows + i] = data[i * cols + j]; } }
+            out
+        };
 
         let (router_data, g_tids, g_packs, u_tids, u_packs, d_tids, d_packs, inter, moe_k_val) =
         if let Some(ref mc) = moe_cfg {
             let n_exp   = mc.num_experts as usize;
             let inter   = mc.moe_intermediate_size as usize;
             let moe_k   = mc.num_experts_per_tok as usize;
-            let router  = load_f32(&format!("{p}.ffn_gate_inp.weight"))?;
-            let gate_st = load_f32(&format!("{p}.ffn_gate_exps.weight"))?;
-            let up_st   = load_f32(&format!("{p}.ffn_up_exps.weight"))?;
-            let down_st = load_f32(&format!("{p}.ffn_down_exps.weight"))?;
-            let per = inter * hidden_size;
+            let per     = inter * hidden_size;
             let mut gt = Vec::with_capacity(n_exp); let mut gp = Vec::with_capacity(n_exp);
             let mut ut = Vec::with_capacity(n_exp); let mut up = Vec::with_capacity(n_exp);
             let mut dt = Vec::with_capacity(n_exp); let mut dp = Vec::with_capacity(n_exp);
-            // Helper: transpose [rows, cols] matrix in-place -> [cols, rows].
-            let transpose_f32 = |data: &[f32], rows: usize, cols: usize| -> Vec<f32> {
-                let mut out = vec![0.0f32; data.len()];
-                for i in 0..rows { for j in 0..cols { out[j * rows + i] = data[i * cols + j]; } }
-                out
-            };
-            for e in 0..n_exp {
-                // GGUF gate_exps: [experts, inter, hidden] => per-expert [I, H] => need [H, I] for tape
-                let gd_raw = gate_st[e * per..(e + 1) * per].to_vec();
-                let gd = transpose_f32(&gd_raw, inter, hidden_size);
-                // GGUF up_exps: same as gate => [I, H] => need [H, I]
-                let ud_raw = up_st[e * per..(e + 1) * per].to_vec();
-                let ud = transpose_f32(&ud_raw, inter, hidden_size);
-                // GGUF down_exps: [experts, hidden, inter] => per-expert [H, I] => need [I, H]
-                let dd_raw = down_st[e * per..(e + 1) * per].to_vec();
-                let dd = transpose_f32(&dd_raw, hidden_size, inter);
-                let gname = format!("{p}.ffn_gate_exps.{e}.weight");
-                let uname = format!("{p}.ffn_up_exps.{e}.weight");
-                let dname = format!("{p}.ffn_down_exps.{e}.weight");
-                // Pack in [H, I], [H, I], [I, H] order to match tape contract
-                gp.push(mkpack(&gd, hidden_size, inter, &gname)?);
-                up.push(mkpack(&ud, hidden_size, inter, &uname)?);
-                dp.push(mkpack(&dd, inter, hidden_size, &dname)?);
-                gt.push(gname); ut.push(uname); dt.push(dname);
+
+            if is_hf {
+                // HF path: per-expert tensors (not stacked as in GGUF).
+                let lp = format!("{}model.layers.{layer_idx}", hf_tensor_prefix);
+                // HF router: [n_experts, hidden] — transpose to [hidden, n_experts].
+                let router_raw = load_f32(&format!("{lp}.mlp.gate.weight"))
+                    .with_context(|| format!("layer {layer_idx} HF mlp.gate (router)"))?;
+                let router = transpose_f32(&router_raw, n_exp, hidden_size);
+                for e in 0..n_exp {
+                    // HF gate_proj: [inter, hidden] → [hidden, inter] for tape
+                    let g_raw = load_f32(&format!("{lp}.mlp.experts.{e}.gate_proj.weight"))
+                        .with_context(|| format!("layer {layer_idx} HF expert {e} gate_proj"))?;
+                    let u_raw = load_f32(&format!("{lp}.mlp.experts.{e}.up_proj.weight"))
+                        .with_context(|| format!("layer {layer_idx} HF expert {e} up_proj"))?;
+                    // HF down_proj: [hidden, inter] → [inter, hidden] for tape
+                    let d_raw = load_f32(&format!("{lp}.mlp.experts.{e}.down_proj.weight"))
+                        .with_context(|| format!("layer {layer_idx} HF expert {e} down_proj"))?;
+                    let gd = transpose_f32(&g_raw, inter, hidden_size);
+                    let ud = transpose_f32(&u_raw, inter, hidden_size);
+                    let dd = transpose_f32(&d_raw, hidden_size, inter);
+                    let gname = format!("{lp}.mlp.experts.{e}.gate_proj.weight");
+                    let uname = format!("{lp}.mlp.experts.{e}.up_proj.weight");
+                    let dname = format!("{lp}.mlp.experts.{e}.down_proj.weight");
+                    gp.push(mkpack(&gd, hidden_size, inter, &gname)?);
+                    up.push(mkpack(&ud, hidden_size, inter, &uname)?);
+                    dp.push(mkpack(&dd, inter, hidden_size, &dname)?);
+                    gt.push(gname); ut.push(uname); dt.push(dname);
+                }
+                (router, gt, gp, ut, up, dt, dp, inter, moe_k)
+            } else {
+                let p = format!("blk.{layer_idx}");
+                let router  = load_f32(&format!("{p}.ffn_gate_inp.weight"))?;
+                let gate_st = load_f32(&format!("{p}.ffn_gate_exps.weight"))?;
+                let up_st   = load_f32(&format!("{p}.ffn_up_exps.weight"))?;
+                let down_st = load_f32(&format!("{p}.ffn_down_exps.weight"))?;
+                for e in 0..n_exp {
+                    // GGUF gate_exps: [experts, inter, hidden] => per-expert [I, H] => need [H, I]
+                    let gd_raw = gate_st[e * per..(e + 1) * per].to_vec();
+                    let gd = transpose_f32(&gd_raw, inter, hidden_size);
+                    let ud_raw = up_st[e * per..(e + 1) * per].to_vec();
+                    let ud = transpose_f32(&ud_raw, inter, hidden_size);
+                    // GGUF down_exps: [experts, hidden, inter] => per-expert [H, I] => need [I, H]
+                    let dd_raw = down_st[e * per..(e + 1) * per].to_vec();
+                    let dd = transpose_f32(&dd_raw, hidden_size, inter);
+                    let gname = format!("{p}.ffn_gate_exps.{e}.weight");
+                    let uname = format!("{p}.ffn_up_exps.{e}.weight");
+                    let dname = format!("{p}.ffn_down_exps.{e}.weight");
+                    gp.push(mkpack(&gd, hidden_size, inter, &gname)?);
+                    up.push(mkpack(&ud, hidden_size, inter, &uname)?);
+                    dp.push(mkpack(&dd, inter, hidden_size, &dname)?);
+                    gt.push(gname); ut.push(uname); dt.push(dname);
+                }
+                (router, gt, gp, ut, up, dt, dp, inter, moe_k)
             }
-            (router, gt, gp, ut, up, dt, dp, inter, moe_k)
         } else {
-            let inter_rows = gguf_file
-                .tensor_info(&format!("{p}.ffn_gate.weight"))
-                .ok_or_else(|| anyhow!("layer {layer_idx} ffn_gate not found"))?
-                .shape.first().copied().unwrap_or(0);
-            let gate_d = load_f32(&format!("{p}.ffn_gate.weight"))?;
-            let up_d   = load_f32(&format!("{p}.ffn_up.weight"))?;
-            let down_d = load_f32(&format!("{p}.ffn_down.weight"))?;
-            let gn = format!("{p}.ffn_gate.weight");
-            let un = format!("{p}.ffn_up.weight");
-            let dn = format!("{p}.ffn_down.weight");
-            let gp2 = mkpack(&gate_d, inter_rows, hidden_size, &gn)?;
-            let up2  = mkpack(&up_d, inter_rows, hidden_size, &un)?;
-            let dp2  = mkpack(&down_d, hidden_size, inter_rows, &dn)?;
-            // Dense FFN: router is identity [hidden, 1]
-            let router_dummy = vec![1.0f32; hidden_size];
-            (router_dummy, vec![gn], vec![gp2], vec![un], vec![up2], vec![dn], vec![dp2], inter_rows, 1usize)
+            // Dense FFN.
+            if is_hf {
+                let lp = format!("{}model.layers.{layer_idx}", hf_tensor_prefix);
+                let gate_d = load_f32(&format!("{lp}.mlp.gate_proj.weight"))?;
+                let up_d   = load_f32(&format!("{lp}.mlp.up_proj.weight"))?;
+                let down_d = load_f32(&format!("{lp}.mlp.down_proj.weight"))?;
+                // HF gate_proj: [inter, hidden] → [hidden, inter]; shape derives inter.
+                let inter_rows = gate_d.len() / hidden_size;
+                let gd = transpose_f32(&gate_d, inter_rows, hidden_size);
+                let ud = transpose_f32(&up_d,   inter_rows, hidden_size);
+                let dd = transpose_f32(&down_d, hidden_size, inter_rows);
+                let gn = format!("{lp}.mlp.gate_proj.weight");
+                let un = format!("{lp}.mlp.up_proj.weight");
+                let dn = format!("{lp}.mlp.down_proj.weight");
+                let gp2 = mkpack(&gd, hidden_size, inter_rows, &gn)?;
+                let up2  = mkpack(&ud, hidden_size, inter_rows, &un)?;
+                let dp2  = mkpack(&dd, inter_rows, hidden_size, &dn)?;
+                let router_dummy = vec![1.0f32; hidden_size];
+                (router_dummy, vec![gn], vec![gp2], vec![un], vec![up2], vec![dn], vec![dp2], inter_rows, 1usize)
+            } else {
+                let p = format!("blk.{layer_idx}");
+                let gate_d = load_f32(&format!("{p}.ffn_gate.weight"))?;
+                let inter_rows = gate_d.len() / hidden_size;
+                let up_d   = load_f32(&format!("{p}.ffn_up.weight"))?;
+                let down_d = load_f32(&format!("{p}.ffn_down.weight"))?;
+                let gn = format!("{p}.ffn_gate.weight");
+                let un = format!("{p}.ffn_up.weight");
+                let dn = format!("{p}.ffn_down.weight");
+                let gp2 = mkpack(&gate_d, inter_rows, hidden_size, &gn)?;
+                let up2  = mkpack(&up_d, inter_rows, hidden_size, &un)?;
+                let dp2  = mkpack(&down_d, hidden_size, inter_rows, &dn)?;
+                let router_dummy = vec![1.0f32; hidden_size];
+                (router_dummy, vec![gn], vec![gp2], vec![un], vec![up2], vec![dn], vec![dp2], inter_rows, 1usize)
+            }
         };
 
         layer_packs.push(LayerPack {
@@ -3669,12 +3937,21 @@ pub fn train_all_linears_full_model_dwq(
         });
     }
 
-    // lm_head.
-    let lm_head_name = "output.weight";
-    let lm_head_data = load_f32(lm_head_name)?;
+    // lm_head + output_norm: use canonical name for the active teacher_source.
+    let (lm_head_name, output_norm_name) = if is_hf {
+        let tp = &hf_tensor_prefix;
+        // HF: lm_head.weight / model.norm.weight.
+        // VL models wrap under language_model.lm_head.weight / language_model.model.norm.weight.
+        (format!("{tp}lm_head.weight"), format!("{tp}model.norm.weight"))
+    } else {
+        ("output.weight".to_string(), "output_norm.weight".to_string())
+    };
+    let lm_head_data = load_f32(&lm_head_name)
+        .with_context(|| format!("load lm_head '{lm_head_name}'"))?;
     let pack_lm = quant_pack_for_dwq(&device, &lm_head_data, vocab, hidden_size, cfg.bits, cfg.group_size)
         .context("quant_pack lm_head")?;
-    let output_norm_w = load_f32("output_norm.weight")?;
+    let output_norm_w = load_f32(&output_norm_name)
+        .with_context(|| format!("load output_norm '{output_norm_name}'"))?;
 
     // Build Adam + register all (s, b) pairs.
     let mut adam = crate::calibrate::adam::AdamOptimizer::new(
@@ -3698,13 +3975,14 @@ pub fn train_all_linears_full_model_dwq(
                 .with_context(|| format!("register expert {tid}"))?;
         }
     }
-    register_affine_pair(&mut adam, &device, lm_head_name, &pack_lm.scales, &pack_lm.biases)
+    register_affine_pair(&mut adam, &device, &lm_head_name, &pack_lm.scales, &pack_lm.biases)
         .context("register lm_head")?;
 
-    // Stage B: capture teacher logits.
+    // Stage B: capture teacher logits + pre-output-norm hidden state.
+    // `teacher_forward_fn` dispatches to either the GGUF Qwen35Model or the
+    // HfSafetensorsTeacherProvider depending on cfg.teacher_source.
+    // It returns `(logits_last_tok [vocab], hidden_last_tok [hidden_size])`.
     let top_k = cfg.top_k_teacher.min(vocab);
-    let mut positions_buf: Vec<i32> = Vec::new();
-    crate::calibrate::gguf_teacher::fill_text_positions(&mut positions_buf, cfg.seq_len);
 
     struct TeacherBatch {
         hidden_rows: Vec<f32>,   // [batch_size, hidden_size]
@@ -3722,18 +4000,10 @@ pub fn train_all_linears_full_model_dwq(
         let mut logits_rows = Vec::with_capacity(cfg.batch_size * vocab);
         for row in 0..cfg.batch_size {
             let row_tokens = &token_batch[row * cfg.seq_len..(row + 1) * cfg.seq_len];
-            let mut kv = HybridKvCache::new(&model.cfg, &device,
-                cfg.seq_len.max(1) as u32, 1)
-                .with_context(|| format!("HybridKvCache bi={bi} row={row}"))?;
-            let (logits_full, hidden_buf) = model
-                .forward_gpu_with_hidden(row_tokens, &positions_buf, &mut kv)
-                .with_context(|| format!("forward_gpu_with_hidden bi={bi} row={row}"))?;
-            let last_tok = cfg.seq_len - 1;
-            logits_rows.extend_from_slice(&logits_full[last_tok * vocab..(last_tok + 1) * vocab]);
-            let hidden_slice = hidden_buf.as_slice::<f32>()
-                .map_err(|e| anyhow!("hidden_buf: {e}"))?;
-            hidden_rows.extend_from_slice(
-                &hidden_slice[last_tok * hidden_size..(last_tok + 1) * hidden_size]);
+            let (logits_row, hidden_row) = teacher_forward_fn(row_tokens)
+                .with_context(|| format!("teacher_forward_fn bi={bi} row={row}"))?;
+            logits_rows.extend_from_slice(&logits_row);
+            hidden_rows.extend_from_slice(&hidden_row);
         }
         teacher_batches.push(TeacherBatch { hidden_rows, logits_rows });
     }
@@ -3945,7 +4215,7 @@ pub fn train_all_linears_full_model_dwq(
 
         let onorm_t = GpuTensor::from_vec(&tape, &output_norm_w, vec![hidden_size])?;
         let h_normed = rms_norm(&h, &onorm_t, rms_eps).context("output_norm")?;
-        let wlm = make_qdq_2d(&adam, lm_head_name, &pack_lm, &tape, &mut grad_pairs)?;
+        let wlm = make_qdq_2d(&adam, &lm_head_name, &pack_lm, &tape, &mut grad_pairs)?;
         let wlm_t = transpose(&wlm).context("transpose lm_head")?;
         let student_logits = matmul(&h_normed, &wlm_t).context("lm_head matmul")?;
 
@@ -4001,7 +4271,7 @@ pub fn train_all_linears_full_model_dwq(
         }
     }
     {
-        let (s, b) = read_affine_pair(&adam, lm_head_name)?;
+        let (s, b) = read_affine_pair(&adam, &lm_head_name)?;
         let mut p = pack_lm.clone(); p.scales = s; p.biases = b;
         all_linears.push((lm_head_name.to_string(), p, vocab, hidden_size));
     }
@@ -5684,7 +5954,7 @@ mod tests {
         // per case to test the corresponding rejection.
         let valid = || -> super::FullModelDwqConfig {
             let cfg = super::FullModelDwqConfig {
-                gguf_path: std::path::PathBuf::from("/dummy/path/model.gguf"),
+                teacher_source: super::DwqTeacherSource::Gguf(std::path::PathBuf::from("/dummy/path/model.gguf")),
                 calibration_token_batches: vec![vec![0u32; 32 * 512]; 1],
                 ..super::FullModelDwqConfig::default()
             };
@@ -5748,11 +6018,11 @@ mod tests {
         let e = format!("{}", c.validate().err().unwrap());
         assert!(e.contains("seq_len must be >= 2"), "got: {e}");
 
-        // gguf_path empty (caller-required).
+        // teacher_source path empty (caller-required).
         let mut c = valid();
-        c.gguf_path = std::path::PathBuf::new();
+        c.teacher_source = super::DwqTeacherSource::Gguf(std::path::PathBuf::new());
         let e = format!("{}", c.validate().err().unwrap());
-        assert!(e.contains("gguf_path must be non-empty"), "got: {e}");
+        assert!(e.contains("teacher_source path must be non-empty"), "got: {e}");
 
         // calibration_token_batches empty.
         let mut c = valid();
@@ -5805,7 +6075,8 @@ mod tests {
         // Caller-required fields must be empty by default (so any
         // forgotten override surfaces as a fail-loud error in the
         // eventual training fn rather than silently using wrong data).
-        assert_eq!(cfg.gguf_path.as_os_str().len(), 0);
+        // Default teacher_source is Gguf("") — empty path triggers validate failure.
+        assert!(matches!(&cfg.teacher_source, super::DwqTeacherSource::Gguf(p) if p.as_os_str().is_empty()));
         assert!(cfg.calibration_token_batches.is_empty());
 
         // Update-syntax must work so test fixtures can override
@@ -6116,7 +6387,7 @@ mod tests {
         assert_eq!(batches.len(), 64 / batch_size);
 
         let cfg = super::FullModelDwqConfig {
-            gguf_path: std::path::PathBuf::from("/dev/null"),
+            teacher_source: super::DwqTeacherSource::Gguf(std::path::PathBuf::from("/dev/null")),
             calibration_token_batches: batches,
             batch_size,
             seq_len,
@@ -6133,7 +6404,7 @@ mod tests {
     #[test]
     fn build_dwq_targets_config_from_full_model_forwards_fields() {
         let cfg = super::FullModelDwqConfig {
-            gguf_path: std::path::PathBuf::from("/dev/null"),
+            teacher_source: super::DwqTeacherSource::Gguf(std::path::PathBuf::from("/dev/null")),
             calibration_token_batches: vec![vec![0u32; 32 * 512]],
             top_k_teacher: 1024,
             ..super::FullModelDwqConfig::default()
@@ -6153,7 +6424,7 @@ mod tests {
     #[test]
     fn build_dwq_targets_config_from_full_model_rejects_zero_vocab() {
         let cfg = super::FullModelDwqConfig {
-            gguf_path: std::path::PathBuf::from("/dev/null"),
+            teacher_source: super::DwqTeacherSource::Gguf(std::path::PathBuf::from("/dev/null")),
             calibration_token_batches: vec![vec![0u32; 32 * 512]],
             ..super::FullModelDwqConfig::default()
         };
@@ -6173,7 +6444,7 @@ mod tests {
     #[test]
     fn build_dwq_targets_config_from_full_model_rejects_top_k_above_vocab() {
         let cfg = super::FullModelDwqConfig {
-            gguf_path: std::path::PathBuf::from("/dev/null"),
+            teacher_source: super::DwqTeacherSource::Gguf(std::path::PathBuf::from("/dev/null")),
             calibration_token_batches: vec![vec![0u32; 32 * 512]],
             top_k_teacher: 5000,
             ..super::FullModelDwqConfig::default()
@@ -6198,7 +6469,7 @@ mod tests {
     #[test]
     fn build_calibration_split_from_full_model_borrows_and_forwards() {
         let cfg = super::FullModelDwqConfig {
-            gguf_path: std::path::PathBuf::from("/dev/null"),
+            teacher_source: super::DwqTeacherSource::Gguf(std::path::PathBuf::from("/dev/null")),
             calibration_token_batches: vec![
                 vec![1u32; 32 * 512],
                 vec![2u32; 32 * 512],
@@ -6277,7 +6548,7 @@ mod tests {
         let save_dir = dir.join("teacher-out");
 
         let cfg = super::FullModelDwqConfig {
-            gguf_path: std::path::PathBuf::from("/dev/null"),
+            teacher_source: super::DwqTeacherSource::Gguf(std::path::PathBuf::from("/dev/null")),
             calibration_token_batches: vec![
                 vec![0u32; 32 * 8],
                 vec![1u32; 32 * 8],
@@ -6346,7 +6617,7 @@ mod tests {
         let save_dir = dir.join("teacher-out");
 
         let cfg = super::FullModelDwqConfig {
-            gguf_path: std::path::PathBuf::from("/dev/null"),
+            teacher_source: super::DwqTeacherSource::Gguf(std::path::PathBuf::from("/dev/null")),
             calibration_token_batches: vec![vec![0u32; 32 * 4]],
             batch_size: 32,
             seq_len: 4,
@@ -6389,7 +6660,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let cfg = super::FullModelDwqConfig {
-            gguf_path: std::path::PathBuf::from("/dev/null"),
+            teacher_source: super::DwqTeacherSource::Gguf(std::path::PathBuf::from("/dev/null")),
             calibration_token_batches: vec![vec![0u32; 32 * 4]],
             batch_size: 32,
             seq_len: 4,
@@ -9780,7 +10051,7 @@ mod tests {
         let save_dir = dir.join("teacher-out");
 
         let cfg = super::FullModelDwqConfig {
-            gguf_path: std::path::PathBuf::from("/dev/null"),
+            teacher_source: super::DwqTeacherSource::Gguf(std::path::PathBuf::from("/dev/null")),
             calibration_token_batches: vec![vec![0u32; 4 * 2]], // batch=4, seq=2 (after trim → 1)
             batch_size: 4,
             seq_len: 2,
@@ -10018,7 +10289,7 @@ mod tests {
         let save_dir = dir.join("teacher-out");
 
         let cfg = super::FullModelDwqConfig {
-            gguf_path: std::path::PathBuf::from("/dev/null"),
+            teacher_source: super::DwqTeacherSource::Gguf(std::path::PathBuf::from("/dev/null")),
             calibration_token_batches: vec![vec![0u32; 32 * 4]],
             batch_size: 32,
             seq_len: 4,
@@ -10069,7 +10340,7 @@ mod tests {
         let save_dir = dir.join("teacher-out");
 
         let cfg = super::FullModelDwqConfig {
-            gguf_path: std::path::PathBuf::from("/dev/null"),
+            teacher_source: super::DwqTeacherSource::Gguf(std::path::PathBuf::from("/dev/null")),
             calibration_token_batches: vec![
                 vec![0u32; 32 * 8],
                 vec![1u32; 32 * 8],
@@ -10129,7 +10400,7 @@ mod tests {
         let save_dir = dir.join("teacher-out");
 
         let write_cfg = super::FullModelDwqConfig {
-            gguf_path: std::path::PathBuf::from("/dev/null"),
+            teacher_source: super::DwqTeacherSource::Gguf(std::path::PathBuf::from("/dev/null")),
             calibration_token_batches: vec![vec![0u32; 32 * 4]],
             batch_size: 32,
             seq_len: 4,
@@ -10177,7 +10448,7 @@ mod tests {
         let save_dir = dir.join("teacher-out");
 
         let write_cfg = super::FullModelDwqConfig {
-            gguf_path: std::path::PathBuf::from("/dev/null"),
+            teacher_source: super::DwqTeacherSource::Gguf(std::path::PathBuf::from("/dev/null")),
             calibration_token_batches: vec![vec![0u32; 32 * 8]],
             batch_size: 32,
             seq_len: 8,
@@ -10223,7 +10494,7 @@ mod tests {
         let save_dir = dir.join("teacher-out");
 
         let write_cfg = super::FullModelDwqConfig {
-            gguf_path: std::path::PathBuf::from("/dev/null"),
+            teacher_source: super::DwqTeacherSource::Gguf(std::path::PathBuf::from("/dev/null")),
             calibration_token_batches: vec![vec![0u32; 32 * 4]],
             batch_size: 32,
             seq_len: 4,
@@ -10300,7 +10571,8 @@ mod tests {
             calibration_token_batches: vec![vec![0u32; 32 * 512]],
             ..super::FullModelDwqConfig::default()
         };
-        assert!(cfg.gguf_path.as_os_str().is_empty(), "fixture invariant");
+        // Default teacher_source is Gguf("") — empty path triggers validate failure.
+        assert!(matches!(&cfg.teacher_source, super::DwqTeacherSource::Gguf(p) if p.as_os_str().is_empty()), "fixture invariant");
 
         let res = super::prepare_full_model_teacher_inputs(
             &cfg,
@@ -10312,7 +10584,7 @@ mod tests {
         };
         let msg = format!("{:#}", err);
         assert!(
-            msg.contains("cfg.validate") && msg.contains("gguf_path must be non-empty"),
+            msg.contains("cfg.validate") && msg.contains("teacher_source path must be non-empty"),
             "expected validate-first error, got: {msg}"
         );
     }
@@ -10334,7 +10606,7 @@ mod tests {
         // The path is non-empty (passes validate) but does not exist.
         let bogus = dir.join("does-not-exist.gguf");
         let cfg = super::FullModelDwqConfig {
-            gguf_path: bogus.clone(),
+            teacher_source: super::DwqTeacherSource::Gguf(bogus.clone()),
             calibration_token_batches: vec![vec![0u32; 32 * 512]],
             ..super::FullModelDwqConfig::default()
         };
@@ -10383,7 +10655,7 @@ mod tests {
         }
 
         let cfg = super::FullModelDwqConfig {
-            gguf_path: path,
+            teacher_source: super::DwqTeacherSource::Gguf(path),
             calibration_token_batches: vec![vec![0u32; 32 * 4]],
             batch_size: 32,
             seq_len: 4,
@@ -10436,7 +10708,7 @@ mod tests {
         assert_eq!(batches.len(), 1);
 
         let cfg = super::FullModelDwqConfig {
-            gguf_path: std::path::PathBuf::from("/dev/null"),
+            teacher_source: super::DwqTeacherSource::Gguf(std::path::PathBuf::from("/dev/null")),
             calibration_token_batches: batches,
             batch_size: 32,
             seq_len: 4,
@@ -10993,7 +11265,7 @@ mod tests {
         let seq_len = 4usize;
         let token_batch = vec![0u32; batch_size * seq_len];
         let cfg = super::FullModelDwqConfig {
-            gguf_path: path.clone(),
+            teacher_source: super::DwqTeacherSource::Gguf(path.clone()),
             calibration_token_batches: vec![token_batch],
             batch_size,
             seq_len,

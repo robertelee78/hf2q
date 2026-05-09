@@ -400,7 +400,8 @@ fn cmd_dwq_train(args: cli::DwqTrainArgs) -> Result<(), AppError> {
 fn cmd_dwq_train_full_model(args: cli::DwqTrainArgs) -> Result<(), AppError> {
     use anyhow::Context as _;
     use crate::calibrate::dwq_loop::{
-        load_calibration_corpus_jsonl, train_all_linears_full_model_dwq, FullModelDwqConfig,
+        load_calibration_corpus_jsonl, train_all_linears_full_model_dwq,
+        DwqTeacherSource, FullModelDwqConfig,
     };
 
     // --calibration-data is required for full-model mode.
@@ -417,17 +418,35 @@ fn cmd_dwq_train_full_model(args: cli::DwqTrainArgs) -> Result<(), AppError> {
         )));
     }
 
-    // Tokenizer must live next to the GGUF (same lookup pattern used
-    // in activation_capture at src/main.rs:1593).
-    let gguf_dir = args.gguf.parent().unwrap_or(std::path::Path::new("."));
-    let tokenizer_json = gguf_dir.join("tokenizer.json");
-    if !tokenizer_json.exists() {
-        return Err(AppError::Input(anyhow::anyhow!(
-            "--full-model-teacher requires tokenizer.json in the GGUF directory \
-             ({}); not found",
-            tokenizer_json.display()
-        )));
-    }
+    // Build the teacher source: HF safetensors takes priority when --safetensors-dir
+    // is supplied; otherwise the GGUF file specified by --gguf is the teacher.
+    let teacher_source = if let Some(ref hf_dir) = args.safetensors_dir {
+        DwqTeacherSource::HfSafetensors(hf_dir.clone())
+    } else {
+        DwqTeacherSource::Gguf(args.gguf.clone())
+    };
+
+    // Tokenizer lookup: prefer the HF dir (has tokenizer.json by convention);
+    // fall back to the GGUF's parent dir for the GGUF-teacher path.
+    let tokenizer_search_dirs: Vec<&std::path::Path> = {
+        let mut dirs: Vec<&std::path::Path> = Vec::new();
+        if let Some(ref hf_dir) = args.safetensors_dir {
+            dirs.push(hf_dir.as_path());
+        }
+        let gguf_dir = args.gguf.parent().unwrap_or(std::path::Path::new("."));
+        dirs.push(gguf_dir);
+        dirs
+    };
+    let tokenizer_json = tokenizer_search_dirs
+        .iter()
+        .map(|d| d.join("tokenizer.json"))
+        .find(|p| p.exists())
+        .ok_or_else(|| AppError::Input(anyhow::anyhow!(
+            "--full-model-teacher requires tokenizer.json; searched: {}",
+            tokenizer_search_dirs.iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>().join(", ")
+        )))?;
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_json).map_err(|e| {
         AppError::Conversion(anyhow::anyhow!(
             "failed to load tokenizer.json at {}: {e}",
@@ -485,7 +504,7 @@ fn cmd_dwq_train_full_model(args: cli::DwqTrainArgs) -> Result<(), AppError> {
         temperature: args.full_model_temperature,
         batch_size: args.full_model_batch_size,
         seq_len: args.full_model_seq_len,
-        gguf_path: args.gguf.clone(),
+        teacher_source,
         calibration_token_batches,
         top_k_teacher: args.full_model_top_k,
         seed: args.seed,
@@ -494,7 +513,8 @@ fn cmd_dwq_train_full_model(args: cli::DwqTrainArgs) -> Result<(), AppError> {
     };
 
     println!(
-        "[dwq-train full-model] gguf={}  output={}",
+        "[dwq-train full-model] teacher={}  gguf={}  output={}",
+        cfg.teacher_source.display(),
         args.gguf.display(),
         args.output.display()
     );
