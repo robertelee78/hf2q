@@ -285,6 +285,54 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-91 mv_id Q6_K kernel structural difference (concrete decode attack candidate)
+
+Direct code-read comparison of Q6_K mv_id kernel between hf2q
+(`/opt/mlx-native/src/shaders/quantized_matmul_id_ggml.metal:803`) and
+llama.cpp (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:7968`):
+
+**llama.cpp** `kernel_mul_mv_q6_K_f32_impl`:
+- Templated on `nr0` (rows per simdgroup); for Q6_K `N_R0_Q6_K = 2`
+- Outer loop `for (int i = ix; i < nb; i += 2)`:
+  - **Pre-loads `yl[16]` from device once**:
+    ```metal
+    for (short l = 0; l < 4; ++l) {
+        yl[4*l + 0] = y[l +  0]; yl[4*l + 1] = y[l + 32];
+        yl[4*l + 2] = y[l + 64]; yl[4*l + 3] = y[l + 96];
+    }
+    ```
+  - **Inner loop over rows** `for (short row = 0; row < nr0; ++row)`:
+    advances q1/q2/qh/sc/dh by `args.nb01` per row, REUSING `yl[]`
+    register-resident across both rows.
+
+**hf2q** `kernel_mul_mv_id_q6_K_f32`:
+- Hard-coded to **1 row per simdgroup** (sgitg picks row offset 0 or 1)
+- Re-loads `y[]` from device **for every row** inside `for (int l = 0;
+  l < n; ++l)` — no yl[] register reuse across rows.
+
+**Y-vector reuse savings**: per outer-loop iteration, llama.cpp does 1
+y-load + 2 row computations vs hf2q's 2 separate y-loads + 2 row
+computations. For a 2816-dim hidden (gemma-4-26b) Q6_K row with
+nb = 2816/256 = 11 blocks, this saves ~16 device-memory reads per
+block × 11 blocks = ~176 device reads per row, halved across 2 rows.
+
+**Refactor**: change kernel_mul_mv_id_q6_K_f32 to match llama.cpp's
+nr0=2 pattern. Adjust `dispatch_id_mv` in
+`/opt/mlx-native/src/ops/quantized_matmul_id_ggml.rs:540` to use
+threadgroup geometry `(div_ceil(n, NSG*nr0), m, 1)` instead of
+`(div_ceil(n, align), m, 1)`. Refactor scope: ~50 LOC mv_id_q6_K_f32
++ ~30 LOC dispatch geometry + tests. Iter-92 candidate.
+
+Hypothesis (testable): refactor saves ~5-10% on Q6_K mv_id calls.
+Falsifier: if decode time doesn't change, register-reuse savings were
+already captured by Apple's Metal compiler auto-coalescing y-loads.
+Standing rule per `feedback_metal_compiler_auto_optimizes_static_levers`
+(7+ confirmed kernel hypotheses falsified) — measure before claiming.
+
+Also affects Q4_K, Q5_K, Q3_K, Q2_K mv_id kernels (same structural
+pattern). Q5_K most relevant for Q5_K_M-format models (hf2q ships Q5_K
+as the dominant block format for many fixtures).
+
 ### Iter-90 dispatch-count BUG FIX + corrected per-dispatch breakdown
 
 **Bug discovered in iter-89's HF2Q_MLX_PROFILE reporting.** The `avg_dispatches`
