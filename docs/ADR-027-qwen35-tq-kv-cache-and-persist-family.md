@@ -1,6 +1,6 @@
 # ADR-027: Qwen3.5 / Qwen3.6 TurboQuant KV Cache + Persist Family Port
 
-- **Status:** Proposed (iter-1: design landed 2026-05-08; iter-2+ implementation)
+- **Status:** Proposed (iter-1a: design landed 2026-05-08; iter-1b: Chesterton's-fence revision 2026-05-08)
 - **Date:** 2026-05-08
 - **Deciders:** Operator + Claude
 - **Tags:** turboquant, kv-cache, qwen35, qwen36, kv-persist, tq-active, peer-parity
@@ -40,19 +40,45 @@ Peer floor (mantra: as fast/coherent/memory-efficient as peers): llama.cpp + vLL
 
 ## 2. Decision
 
-Land **TQ-active in-memory encoding + spill family** for qwen3.5/3.6 full-attn layers. DeltaNet linear-attn layers stay dense (already SSM-compressed; no KV-style cache to quantize).
+### 2.0 Chesterton's-fence finding (iter-1b revision, 2026-05-08)
+
+Original iter-1a plan called for a mechanical port of `Gemma4DenseSpill`'s `(layer_rank, range)` block-spiller contract onto `HybridKvCache`. Iter-1b investigation surfaced an existing architectural decision that forbids this:
+
+`src/serve/kv_persist/families/mod.rs:15-23` (committed 2026-05-05, ADR-017 Phase E.a B.2):
+> *"Qwen 3.5/3.6 hybrid (B-hybrid via Phase E.a B.2-B.5, 2026-05-05) — Qwen 3.5's interleaved full-attention + DeltaNet recurrent state. The hybrid family does NOT need a sibling `KvCacheSpill` impl; ADR-017 Phase E.a Phase B.2 ships the LCP partial-prefill resume substrate via `Qwen35LoadedModel::lcp_registry` directly (see `engine_qwen35.rs`), keying full-attn + DeltaNet snapshots under chunk-position-keyed `LcpKey`s. Phase D's spiller layer is side-stepped because hybrid-MoE ring-buffer slot accounting doesn't fit the `(layer_rank, range)` block contract."*
+
+In-place evidence at `src/serve/api/engine_qwen35.rs:127`:
+```rust
+pub lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry<
+    crate::inference::models::qwen35::kv_cache::HybridKvCacheSnapshot,
+>,
+```
+This already exists and stores full-cache snapshots in-memory keyed by LcpKey, via `HybridKvCache::snapshot()` / `restore_from()`. The whole-cache-snapshot semantics are incompatible with the spiller's per-(layer_rank, range) byte-block semantics: ring-buffer write_pos accounting + ping-pong scratch state cannot be byte-block-restored without breaking `RestoreOutcome::Restored` invariants the spiller asserts.
+
+Mantra-alignment: "Always understand current fully before changing it. Chesterton's fence." The fence is real and load-bearing.
+
+### 2.1 Revised decision
+
+Land **TQ-active in-memory encoding + cold-resume disk persistence** for qwen3.5/3.6 full-attn layers via the EXISTING `HybridKvCache::snapshot()` substrate, NOT a new `KvCacheSpill` impl. DeltaNet linear-attn layers stay dense (already SSM-compressed).
 
 Two phases, each with its own iter sequence + acceptance gates. Each iter ships a complete, mantra-clean deliverable; no stubs, no "phase X candidate" labels.
 
-### Phase A — Qwen35HybridSpill (KV-persist family)
+### Phase A — Qwen35HybridPersistor (snapshot-based, NOT KvCacheSpill)
 
-Mechanical port of `Gemma4DenseSpill` to `HybridKvCache` shape so qwen35 gains disk-persistence + LCP-resume of dense KV cache. Independent of TQ encoding (works on F32 cache as-is). Unblocks ADR-017 LCP-resume on qwen35.
+Build `src/serve/kv_persist/families/qwen35_hybrid_persistor.rs` exposing:
+- `serialize_hybrid_snapshot(&HybridKvCacheSnapshot, &Qwen35HybridConfig) -> Vec<u8>` — pack the full snapshot (full-attn K+V + linear-attn conv+recurrent + optional MTP, with per-seq current_len + swap-parity hint) into a single envelope.
+- `deserialize_hybrid_snapshot(&[u8], &Qwen35HybridConfig, &MlxDevice) -> Result<HybridKvCacheSnapshot>` — inverse, fully validating.
+- A `LcpRegistry`-backed disk-persistence wrapper that writes serialized snapshots under `~/.cache/hf2q/qwen35_kv/<repo>/<quant>/<lcp_key>.bin` and reads them on cold-process resume — same shape contract as `LcpRegistry`'s in-memory store, just with a disk back-end.
+
+This is genuinely DIFFERENT from Gemma's spiller path: snapshot is whole-cache (not per-block), keyed by LcpKey (not layer_rank+range), and lives in a parallel codec namespace from `tq_packed_v2`. Both paths coexist; neither replaces the other.
+
+Phase A unblocks LCP cross-process resume (today's `LcpRegistry` is in-process only — restart kills the cache).
 
 ### Phase B — TQ-active KV in qwen35 full-attn forward
 
-Allocate TQ-encoded K/V buffers for every full-attn layer; route SDPA through `flash_attn_vec_tq_hb` (ADR-007 kernel, parameterized for qwen35 head-dim 256 vs Gemma's 256/512 mix). Achieves peer-parity 3.2× KV memory savings + ADR-007 needle-haystack capability on qwen35.
+Allocate TQ-encoded K/V buffers for every full-attn layer; route SDPA through `flash_attn_vec_tq_hb` (ADR-007 kernel, parameterized for qwen35 head_dim 256 vs Gemma's 256/512 mix). Achieves peer-parity 3.2× KV memory savings + ADR-007 needle-haystack capability on qwen35.
 
-Phase B uses Phase A's spill seam to write TQ payloads (codec_version=2 frozen by ADR-007 §F-7.1) — single on-disk codec across Gemma + qwen35.
+Phase B writes TQ-encoded full-attn buffers in the snapshot's `full_attn_k`/`full_attn_v` slots; the snapshot envelope (Phase A's codec) is extended with a `full_attn_codec_tag: u8` (0 = F32 dense, 1 = TQ v2) field so the same on-disk serialization handles both modes. Linear-attn snapshot stays F32 always.
 
 ## 3. Non-Goals
 
@@ -144,34 +170,36 @@ If `cfg.has_mtp`, `n_layers()` returns `n_full_attn_layers + n_linear_attn_layer
 
 Falsifier: needle-haystack 12/12 at 4K-32K on Qwen 3.6 APEX-Q5_K_M with `HF2Q_TQ_KV=1`, matching ADR-007 iter-10's Gemma 4 result. NRMSE of TQ-vs-F32 SDPA output ≤ 0.15 (matches ADR-007 F-0 falsifier).
 
-### 4.7 Bind seam (cmd_generate_qwen35 + cmd_serve)
+### 4.7 Cold-resume seam (cmd_generate_qwen35 + on-disk LCP back-end)
 
-`cmd_generate_qwen35` (`src/serve/mod.rs:1915`) is the dedicated qwen35 dispatch path; it bypasses Gemma's `cmd_generate` flow including the spill registry call. Phase A iter-5 wires:
+`cmd_generate_qwen35` (`src/serve/mod.rs:1915`) is the dedicated qwen35 dispatch path. Phase A iter-5 wires:
 
-- New `Qwen35LoadedModel::kv_spill_descriptor()` returning `Some(KvSpillDescriptor::from_qwen35_loaded_model(...))` analogous to Gemma's existing one.
-- `cmd_serve` (`src/serve/mod.rs:3034-3168` Gemma block) gains a parallel qwen35 block that registers `Qwen35HybridSpillFactory` with the right (repo, quant) FamilyKey for qwen35 GGUFs.
-- `cmd_generate_qwen35` calls `loader_wrapper::try_substitute_on_load(repo, quant, engine_dyn)` post-load (mirror of Gemma path).
+- `Qwen35LoadedModel` (`src/serve/api/engine_qwen35.rs:127`) gains a `disk_persistor: Option<Qwen35DiskPersistor>` field — `None` when `HF2Q_KV_PERSIST` env is unset, `Some(persistor)` otherwise. The persistor reads `~/.cache/hf2q/qwen35_kv/<repo>/<quant>/<lcp_key>.bin` files into the in-memory `LcpRegistry` on construction (cold-resume hydrate), and writes back on insert.
+- The `LcpRegistry` insert path (already existing) gets a write-through hook to the persistor when present. The lookup path is unchanged: in-memory hits remain hot.
+- `cmd_serve` (qwen35 startup) constructs the persistor when `HF2Q_KV_PERSIST` is set and threads it through `LoadOptions` to `Qwen35LoadedModel::load`.
 
 ### 4.8 Ban list (Chesterton's fence-respected)
 
 Things that are tempting "simplifications" but break invariants — DO NOT do without explicit operator approval:
 
-- ❌ **Single payload codec for full+linear**: drops slot_kind discrimination, cannot restore correctly. Don't merge codecs.
+- ❌ **Force qwen35 onto the spiller's `(layer_rank, range)` block contract**: the existing architectural decision (families/mod.rs:15-23) explicitly forbids this. Ring-buffer + ping-pong state breaks per-block restore semantics.
+- ❌ **Single payload codec for full+linear at the snapshot level**: snapshot envelope MUST tag full vs linear vs MTP slots independently (different shapes, different codecs).
 - ❌ **Drop scratch buffer parity tracking**: ping-pong active state is real; restoring to wrong slot inverts decode by one step.
-- ❌ **Encode linear-attn with TQ**: SSM state isn't K/V — TQ's distribution assumption (post-FWHT N(0,1) per ADR-007 F-0.3) doesn't apply.
-- ❌ **Hardcode 10 full-attn layers**: full_attn_every interval is configurable; layer count varies by model variant.
-- ❌ **Skip mtp_slot when has_mtp=true**: MTP block is part of the model state; dropping it breaks MTP speculative decode.
+- ❌ **Encode linear-attn with TQ**: SSM state isn't K/V — TQ's distribution assumption (post-FWHT N(0,1) per ADR-007 F-0.3) doesn't apply. Linear stays F32.
+- ❌ **Hardcode 10 full-attn layers**: `full_attention_interval` is configurable; layer count varies by model variant. Read from `Qwen35Config`.
+- ❌ **Skip mtp_slot when present**: MTP block is part of the model state; dropping it breaks MTP speculative decode.
+- ❌ **Reuse Gemma's `tq_packed_v2` codec verbatim for qwen35 full-attn snapshot bytes**: while the inner TQ encoding bytes are the same (codec_version=2 frozen by ADR-007 §F-7.1), the OUTER envelope MUST be qwen35-specific so `slot_kind` + `swap_parity` + `current_len` ride along.
 
 ## 5. Acceptance Criteria
 
-### Phase A (qwen35 spill family port)
+### Phase A (qwen35 snapshot-based persistor)
 
-- **AC-A1**: `Qwen35HybridSpill::snapshot_block` + `restore_block` round-trip byte-equal on a synthetic 256-token full-attn slot. Test: `tests/adr_027_phase_a_full_attn_roundtrip.rs`.
-- **AC-A2**: Same byte-equal round-trip on a 256-token linear-attn slot, INCLUDING swap_parity. Test: `tests/adr_027_phase_a_linear_attn_roundtrip.rs`.
+- **AC-A1**: `serialize_hybrid_snapshot` + `deserialize_hybrid_snapshot` round-trip byte-equal on a synthetic full-attn-only HybridKvCacheSnapshot. Test: `tests/adr_027_phase_a_full_attn_roundtrip.rs`.
+- **AC-A2**: Round-trip including linear-attn slots (with swap_parity). Test: `tests/adr_027_phase_a_linear_attn_roundtrip.rs`.
 - **AC-A3**: MTP slot round-trip (when `has_mtp=true`). Test: `tests/adr_027_phase_a_mtp_roundtrip.rs`.
-- **AC-A4**: `kv_spill = active` shows in load banner for Qwen 3.6 35B-A3B-APEX-Q5_K_M with `HF2Q_KV_PERSIST=<dir>`.
-- **AC-A5**: ADR-017 LCP-resume engages on a 2-turn qwen35 conversation: trial-2 prefill TTFT ≤ 0.5× cold (matches ADR-017 R-P6 ≤0.5× stretch on Gemma).
-- **AC-A6**: No regression on existing Qwen 3.6 APEX coherent generation: "What is 2 plus 2?" → coherent answer at temp=0 with kv-persist enabled.
+- **AC-A4**: `Qwen35DiskPersistor` writes a cold snapshot to `~/.cache/hf2q/qwen35_kv/.../*.bin` on insert; subsequent process loads the file back into `LcpRegistry` on construction.
+- **AC-A5**: Cold-process LCP resume: 2-turn qwen35 conversation across a process restart with `HF2Q_KV_PERSIST=/tmp/cache`; trial-2 prefill TTFT ≤ 0.5× cold (mirror of ADR-017 R-P6 stretch on Gemma).
+- **AC-A6**: No regression on existing Qwen 3.6 APEX coherent generation across `HF2Q_KV_PERSIST` ∈ {unset, /tmp/cache}.
 
 ### Phase B (TQ-active in-memory KV on qwen35 full-attn)
 
@@ -194,17 +222,18 @@ Each iter ships a complete, mantra-clean deliverable. No iter is "enable later";
 
 | Iter | Phase | Scope | Acceptance |
 |------|-------|-------|------------|
-| 1 | – | This ADR | Operator review |
-| 2 | A | `src/serve/kv_persist/families/qwen35_hybrid.rs` skeleton: `Qwen35HybridConfig`, `Qwen35HybridSpill` struct + `KvCacheSpill::block_alignment` + `n_layers` + `snapshot_block`/`restore_block` for **full-attn slots only**. Synthetic-state round-trip test. | AC-A1 |
-| 3 | A | Linear-attn slot snapshot + restore including swap_parity. Synthetic round-trip test. | AC-A2 |
-| 4 | A | MTP slot snapshot + restore. | AC-A3 |
-| 5 | A | `Qwen35HybridSpillFactory` + `KvSpillDescriptor::from_qwen35_loaded_model` + `cmd_serve` registration block + `cmd_generate_qwen35` bind seam. | AC-A4, AC-A6 |
-| 6 | A | LCP-resume engagement on qwen35 (the ADR-017 path needs the spill family wired before LCP can be measured). | AC-A5 |
+| 1a | – | Original ADR | Operator review |
+| 1b | – | Chesterton's-fence revision (this iter) | Operator review |
+| 2 | A | `src/serve/kv_persist/families/qwen35_hybrid_persistor.rs`: `Qwen35HybridConfig`, full-attn-only `serialize`/`deserialize`, plus internal `tests` module exercising the round-trip on a synthetic `HybridKvCacheSnapshot`. Module declared in `families/mod.rs`. | AC-A1 |
+| 3 | A | Linear-attn slot serialize/deserialize including swap_parity hint. Round-trip test. | AC-A2 |
+| 4 | A | MTP slot serialize/deserialize. | AC-A3 |
+| 5 | A | `Qwen35DiskPersistor` (LcpRegistry write-through to disk) + `Qwen35LoadedModel.disk_persistor` field + `cmd_serve`/`cmd_generate_qwen35` env wire-up. | AC-A4 |
+| 6 | A | Cold-process LCP resume across restart on Qwen 3.6 APEX. | AC-A5, AC-A6 |
 | 7 | B | `MlxModelWeights` (qwen35) gains `tq_kv_active`; `HybridKvCache::full_attn` allocator branches; F32-vs-TQ allocation parity test. | – |
 | 8 | B | `gpu_full_attn::full_attn_layer_gpu` SDPA dispatch: TQ branch via `flash_attn_vec_tq_hb`; KV write branch via `hadamard_quantize_kv_hb`. NRMSE parity test. | AC-B3 |
 | 9 | B | End-to-end `HF2Q_TQ_KV=1` coherent generation; banner shows leg buffer allocation. | AC-B1, AC-B2 |
 | 10 | B | Needle-haystack harness on qwen35 (mirror of ADR-007 iter-10). | AC-B4 |
-| 11 | B | Phase A spill seam Phase-B integration: TQ payloads round-trip via codec_version=2. | AC-B7 |
+| 11 | B | Phase A persistor envelope extended with `full_attn_codec_tag`; TQ-encoded snapshot round-trips on disk. | AC-B7 |
 | 12 | B | Decode-perf bench at 8K (≤5% degradation). KV memory measurement at 32K. | AC-B5, AC-B6 |
 | 13 | both | Cross-axis sweep: HF2Q_TQ_KV ∈ {0, 1} × HF2Q_KV_PERSIST ∈ {unset, /tmp/cache}; coherent + LCP both ways. | AC-X2 |
 | 14 | both | LANDED memory + ADR header flip + memory index entry. | – |
@@ -240,5 +269,6 @@ Each iter ships a complete, mantra-clean deliverable. No iter is "enable later";
 
 | Iter | Date | Phase | Status | Commits / Detail |
 |------|------|-------|--------|------------------|
-| 1 | 2026-05-08 | – | LANDED | This ADR doc. Operator-reviewed. |
+| 1a | 2026-05-08 | – | LANDED | Original design doc. Mechanically mirrored Gemma4DenseSpill onto HybridKvCache. |
+| 1b | 2026-05-08 | – | LANDED | Chesterton's-fence revision: existing `families/mod.rs:15-23` documents that qwen35 hybrid deliberately doesn't fit the spiller's `(layer_rank, range)` block contract. Pivot to snapshot-based persistor wrapping the existing `HybridKvCache::snapshot()` substrate + `LcpRegistry`. |
 | 2 | (pending) | A | – | – |
