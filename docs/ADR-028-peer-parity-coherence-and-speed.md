@@ -285,6 +285,52 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-96 GPU/CPU split bench — encode overhead is 63% of μbench, MoE share is 35% (not 71%)
+
+Extended `bench_q6_k_mv_id_gemma_decode_gate_up` to capture both CPU
+wall-clock (encode + commit + wait) AND GPU pure-kernel time via
+`commit_wait_with_gpu_time` (`MTLCommandBuffer.GPUStartTime/GPUEndTime`):
+
+| Component | µs/call | % |
+|---|---:|---:|
+| CPU wall-clock (full per-call) | 255.71 | 100% |
+| **GPU pure-kernel time** | **93.75** | **37%** |
+| **Encode + commit overhead** | **161.96** | **63%** |
+
+**Iter-94 over-attributed 71% of decode to Q6_K mv_id** because the μbench
+measurement included encoder + commit_and_wait per call. In production
+single-session mode (one commit_and_wait per token, encode overhead
+amortized across 990 dispatches), the real per-call cost is ~95-100 µs.
+
+**Corrected MoE share of decode**:
+- 60 mv_id calls × 93.75 µs GPU = **5.63 ms / token (35% of 15.86 ms decode)**
+- Remaining 65% (10.23 ms): QKV mv + FA-vec-tq-hb + O mv + norms + KV
+  copy + swiglu + gelu_routing + end_layer + LM head + amortized encode
+
+**Where the 30% peer gap actually lives** (hf2q 15.86 ms vs llama.cpp
+11.11 ms = 4.75 ms gap):
+
+If hf2q & llama.cpp Q6_K mv_id GPU times are at parity (both ~95 µs),
+then the entire 4.75 ms gap lives in the OTHER 65% (10.23 ms us vs
+5.48 ms llama = **46% slower on non-MoE work**). Most likely culprits:
+1. **FA-vec-tq-hb** — TQ-HB SDPA path with FWHT + dequant sub-passes
+2. **Encoder overhead per dispatch** — at 990 dispatches × 5-10 µs CPU
+   encode = 5-10 ms, may differ between us and llama.cpp
+3. **Other matmuls (QKV, O, MLP)** — Q6_K mv at smaller shapes
+
+Iter-95's y-reuse refactor falsification is now CONSISTENT: y-reuse
+would save ~5% of 95 µs GPU = ~5 µs/call × 60 = 300 µs/token = 1.9%
+of decode. The static-evidence prediction was always small.
+
+**Iter-97 candidates**:
+1. Apply the GPU/CPU bench split to **FA-vec-tq-hb** at decode shape.
+   If GPU pure time is large, the kernel itself is slow → kernel
+   optimization. If small, then encode overhead per dispatch is
+   dominant → fewer dispatches via fusion.
+2. Measure llama.cpp's actual per-kernel GPU time via Metal capture.
+3. Strip TQ-HB at decode (operator-gated; conflicts with ADR-027
+   3.94× memory savings) to isolate KV-format-related overhead.
+
 ### Iter-95 Q6_K mv_id y-reuse refactor — FALSIFIED (8th compiler-auto-optim hypothesis)
 
 Implemented the y-vector register-reuse refactor identified in iter-91:
