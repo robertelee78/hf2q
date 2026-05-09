@@ -551,6 +551,104 @@ impl Default for FullModelDwqConfig {
     }
 }
 
+impl FullModelDwqConfig {
+    /// ADR-020 AC#7 Option A — fail-loud preflight validation.
+    ///
+    /// Called by `train_all_linears_full_model_dwq` (step 2 of the
+    /// AC#7 ladder) BEFORE any GPU allocation or model load to
+    /// surface bad knob combos as early as possible.  Mirrors the
+    /// validation pattern used by `train_linear_dwq_synthetic_teacher`
+    /// (line 970 onward).
+    ///
+    /// Validation rules:
+    /// - `bits` ∈ [2, 8] — `init_affine_params_gpu` reject outside this range
+    /// - `group_size` power-of-two in [2, 1024] — kernel constraint
+    /// - `n_steps > 0`
+    /// - `lr` finite and `> 0`
+    /// - `temperature` finite and `> 0`
+    /// - `batch_size >= 32` — matmul backward kernel floor
+    /// - `seq_len >= 2` — next-token target requires ≥1 input + ≥1 target
+    /// - `gguf_path` non-empty (caller MUST supply)
+    /// - `calibration_token_batches` non-empty
+    /// - Every batch's token count == `batch_size × seq_len`
+    /// - `top_k_teacher > 0`
+    pub fn validate(&self) -> Result<()> {
+        if !(2..=8).contains(&self.bits) {
+            return Err(anyhow!(
+                "FullModelDwqConfig: bits must be in [2, 8]; got {}",
+                self.bits
+            ));
+        }
+        if !self.group_size.is_power_of_two() || !(2..=1024).contains(&self.group_size) {
+            return Err(anyhow!(
+                "FullModelDwqConfig: group_size must be a power of two in [2, 1024]; got {}",
+                self.group_size
+            ));
+        }
+        if self.n_steps == 0 {
+            return Err(anyhow!("FullModelDwqConfig: n_steps must be > 0"));
+        }
+        if !self.lr.is_finite() || self.lr <= 0.0 {
+            return Err(anyhow!(
+                "FullModelDwqConfig: lr must be finite and > 0; got {}",
+                self.lr
+            ));
+        }
+        if !self.temperature.is_finite() || self.temperature <= 0.0 {
+            return Err(anyhow!(
+                "FullModelDwqConfig: temperature must be finite and > 0; got {}",
+                self.temperature
+            ));
+        }
+        if self.batch_size < 32 {
+            return Err(anyhow!(
+                "FullModelDwqConfig: batch_size must be >= 32 (matmul backward floor); got {}",
+                self.batch_size
+            ));
+        }
+        if self.seq_len < 2 {
+            return Err(anyhow!(
+                "FullModelDwqConfig: seq_len must be >= 2 (next-token target needs >= 1 input + 1 target); got {}",
+                self.seq_len
+            ));
+        }
+        if self.gguf_path.as_os_str().is_empty() {
+            return Err(anyhow!(
+                "FullModelDwqConfig: gguf_path must be non-empty (caller must supply teacher GGUF path)"
+            ));
+        }
+        if self.calibration_token_batches.is_empty() {
+            return Err(anyhow!(
+                "FullModelDwqConfig: calibration_token_batches must be non-empty"
+            ));
+        }
+        let expected_per_batch = self.batch_size.checked_mul(self.seq_len).ok_or_else(|| {
+            anyhow!(
+                "FullModelDwqConfig: batch_size * seq_len overflows usize (batch_size={}, seq_len={})",
+                self.batch_size,
+                self.seq_len
+            )
+        })?;
+        for (i, batch) in self.calibration_token_batches.iter().enumerate() {
+            if batch.len() != expected_per_batch {
+                return Err(anyhow!(
+                    "FullModelDwqConfig: calibration_token_batches[{i}] has {} tokens; expected batch_size * seq_len = {} * {} = {}",
+                    batch.len(),
+                    self.batch_size,
+                    self.seq_len,
+                    expected_per_batch
+                ));
+            }
+        }
+        if self.top_k_teacher == 0 {
+            return Err(anyhow!(
+                "FullModelDwqConfig: top_k_teacher must be > 0"
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// ADR-020 iter-12d-2 — per-Linear training summary inside a model
 /// scan (one entry per successfully-trained tensor).
 #[derive(Debug, Clone)]
@@ -2653,6 +2751,104 @@ mod tests {
             !cfg.compute_bench,
             "DwqTrainingConfig::default() must have compute_bench = false"
         );
+    }
+
+    /// ADR-020 AC#7 Option A — `FullModelDwqConfig::validate()` rejects
+    /// every bad knob combo with a descriptive error message.  Smoke
+    /// tests one rejection per invariant.  Happy path (a fully-filled
+    /// config with valid token batches) returns Ok.
+    #[test]
+    fn full_model_dwq_config_validate_rejects_bad_knobs() {
+        // Helper: build a baseline-VALID config, then mutate one field
+        // per case to test the corresponding rejection.
+        let valid = || -> super::FullModelDwqConfig {
+            let cfg = super::FullModelDwqConfig {
+                gguf_path: std::path::PathBuf::from("/dummy/path/model.gguf"),
+                calibration_token_batches: vec![vec![0u32; 32 * 512]; 1],
+                ..super::FullModelDwqConfig::default()
+            };
+            // Sanity: baseline is valid.
+            cfg.validate().unwrap_or_else(|e| panic!("baseline cfg invalid: {e}"));
+            cfg
+        };
+
+        // bits out of range.
+        let mut c = valid();
+        c.bits = 1;
+        let e = format!("{}", c.validate().err().unwrap());
+        assert!(e.contains("bits must be in [2, 8]"), "got: {e}");
+        let mut c = valid();
+        c.bits = 9;
+        assert!(c.validate().is_err());
+
+        // group_size not power-of-two.
+        let mut c = valid();
+        c.group_size = 33;
+        let e = format!("{}", c.validate().err().unwrap());
+        assert!(e.contains("group_size"), "got: {e}");
+        // group_size out of [2, 1024] range.
+        let mut c = valid();
+        c.group_size = 2048;
+        assert!(c.validate().is_err());
+
+        // n_steps == 0.
+        let mut c = valid();
+        c.n_steps = 0;
+        let e = format!("{}", c.validate().err().unwrap());
+        assert!(e.contains("n_steps"), "got: {e}");
+
+        // lr non-positive / non-finite.
+        let mut c = valid();
+        c.lr = 0.0;
+        assert!(c.validate().is_err());
+        let mut c = valid();
+        c.lr = -1e-4;
+        assert!(c.validate().is_err());
+        let mut c = valid();
+        c.lr = f32::NAN;
+        assert!(c.validate().is_err());
+
+        // temperature non-positive.
+        let mut c = valid();
+        c.temperature = 0.0;
+        assert!(c.validate().is_err());
+
+        // batch_size below 32 floor.
+        let mut c = valid();
+        c.batch_size = 16;
+        c.calibration_token_batches = vec![vec![0u32; 16 * 512]];
+        let e = format!("{}", c.validate().err().unwrap());
+        assert!(e.contains("batch_size must be >= 32"), "got: {e}");
+
+        // seq_len below 2.
+        let mut c = valid();
+        c.seq_len = 1;
+        c.calibration_token_batches = vec![vec![0u32; 32 * 1]];
+        let e = format!("{}", c.validate().err().unwrap());
+        assert!(e.contains("seq_len must be >= 2"), "got: {e}");
+
+        // gguf_path empty (caller-required).
+        let mut c = valid();
+        c.gguf_path = std::path::PathBuf::new();
+        let e = format!("{}", c.validate().err().unwrap());
+        assert!(e.contains("gguf_path must be non-empty"), "got: {e}");
+
+        // calibration_token_batches empty.
+        let mut c = valid();
+        c.calibration_token_batches.clear();
+        let e = format!("{}", c.validate().err().unwrap());
+        assert!(e.contains("calibration_token_batches must be non-empty"), "got: {e}");
+
+        // batch length mismatch (32 * 512 = 16384; we provide 100).
+        let mut c = valid();
+        c.calibration_token_batches = vec![vec![0u32; 100]];
+        let e = format!("{}", c.validate().err().unwrap());
+        assert!(e.contains("expected batch_size * seq_len"), "got: {e}");
+
+        // top_k_teacher == 0.
+        let mut c = valid();
+        c.top_k_teacher = 0;
+        assert!(c.validate().is_err());
     }
 
     /// ADR-020 AC#7 Option A — `FullModelDwqConfig::default()` carries
