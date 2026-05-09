@@ -366,7 +366,33 @@ For this project phase the sliding_wrap 752-byte batched-vs-batched ceiling is *
 
   ~10% decay from 32→1000 tokens. Cause: KV-cache-read overhead grows linearly with context (each decode step reads more K/V from cache for SDPA). Real, measurable, expected behavior; not a regression.
 
-  iter-80 decode floor of 50 t/s is conservative for both regimes (>24% margin from short-context 65 baseline; >15% margin from long-context 59 baseline). The decay rate is a structural property of the autoregressive decode path on the gemma sliding-window architecture (sliding_window=1024 means KV reads stay bounded after that point — would expect plateau, not further decay, beyond pp1024).
+  iter-80 decode floor of 50 t/s is conservative for both regimes (>24% margin from short-context 65 baseline; >15% margin from long-context 59 baseline). The decay rate is a structural property of the autoregressive decode path on the gemma sliding-window architecture (sliding_window=1024 means KV reads stay bounded after that point — would expect plateau, not further decay, beyond pp1024). **iter-82 falsified this plateau hypothesis** (decode at 2732 tok = 54.5 t/s, still dropping).
+
+- 2026-05-09 (iter-82 PLATEAU FALSIFIED + load-banner UX fix LANDED at hf2q `469725a`): Long-context decode test (max=2000, max=3000 — letting model write a story) showed continued decay past sliding_window=1024:
+
+  | Context tokens | Decode t/s |
+  |---------------:|-----------:|
+  |             32 |       65.7 |
+  |            128 |       63.6 |
+  |           1000 |       59.1 |
+  |           2000 |       56.2 |
+  |           2732 |       54.5 |
+
+  Direct config code-read (`config.rs:84-91`) revealed the cause: the gemma default places **Full-attention layers at every 6th index** — 5 of 30 layers in gemma4-26B. At decode position N, those 5 Full layers do SDPA over [0, N] regardless of sliding_window — KV reads grow linearly.
+
+  But ALL gemma load paths (engine.rs:850, engine.rs:2177, mod.rs:4951, header.rs:161) hardcoded `full_attention_interval: None` in LoadInfo → load banner reported `full_attn_every=none`, misleading operators about the actual model architecture.
+
+  Fix landed at hf2q `469725a` (50 LOC):
+  1. Added `Gemma4Config::full_attention_interval()` helper (config.rs:298) that detects "every Nth layer is Full" pattern from layer_types and returns `Some(N)` or `None` for irregular patterns.
+  2. Used at engine.rs:2177 production gemma LoadInfo builder.
+
+  Verification:
+    Pre-fix:  `hf2q load: features = sliding_window=1024, full_attn_every=none, moe=128 experts/8 active`
+    Post-fix: `hf2q load: features = sliding_window=1024, full_attn_every=6, moe=128 experts/8 active`
+
+  qwen35 was already correct (engine_qwen35.rs:697 populated from cfg). Only gemma had this bug.
+
+- 2026-05-09 (iter-83 ground-state validation): Full hf2q test suite at HEAD with iter-82 changes: **3390 passed; 0 failed; 10 ignored** (peer WIP stashed). Up from 3382 baseline (+8 tests landed across iter-64..82, 1 newly-ignored). Lock-in chain (iter-76 single-command runner) still PASS at HEAD: shader-compile + gemma coherence/perf/decode + qwen35 cross-model. Chain is at steady state.
 
 
 
