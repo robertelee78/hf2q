@@ -285,6 +285,62 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-93 correction to iter-92 ROI analysis (3-op norm fusion ALREADY PRESENT)
+
+Direct code-read of `/opt/mlx-native/src/shaders/fused_norm_add_f32.metal:231`
+confirms hf2q **already has the 3-op fusion**:
+
+```metal
+// Phase 2: normalize input, apply weight, add residual, store output.
+for (uint i = tid; i < dim; i += tg_size) {
+    const float normed = input[base + i] * rms_inv * weight[i];
+    output[base + i] = residual[base + i] + normed;
+}
+```
+
+That's `rms_norm + mul-by-weight + add-residual` in one kernel. Same
+fusion as llama.cpp's `kernel_rms_norm_mul_add_f32_4`. We dispatch it
+at 8+ sites in forward_mlx.rs (3 in forward_decode body alone — lines
+1417, 1689, 1705).
+
+**The actual gap is the `_4` suffix — vec4 vectorization.** Llama.cpp's
+kernel uses `float4` loads/stores (4 elements per memory op); ours is
+scalar (`for (uint i = tid; i < dim; i += tg_size)` with 1 element per
+iteration).
+
+**Revised ROI estimate** (vec4-only, not full fusion port):
+- Phase 2 memory ops: 4× fewer reads, ~30-50% kernel speedup
+- Phase 1 reduction barriers unchanged (~50% of kernel time)
+- Net per-call savings: ~5-6 µs at gemma hidden=2816
+- Per-token: ~3 norm calls × 30 layers = 90 calls × 5-6 µs ≈ 450-540 µs
+- Decode speedup: 450-540 µs / 15.86 ms ≈ **2.8-3.4%**
+
+This is much smaller than iter-92's "9%" estimate. Vec4 alone is not
+the biggest fish.
+
+**Iter-92's iter-91 demotion holds** — y-reuse on Q6_K mv_id is
+~5-10% (also small). Both fusion-style optimizations land in the
+same ~3-5% range.
+
+**Where the real ~30% gap lives** (per iter-90 measurement of 15.86
+µs/dispatch hf2q vs 11.22 µs llama.cpp): per-kernel GPU-time on the
+**dominant** kernels — mv_id Q6_K (MoE matmul), flash_attn_vec_tq_hb
+(SDPA decode), and the QKV mv kernels.
+
+**Iter-94 attack plan** (in order):
+1. Per-call timing instrumentation: add ENV-gated commit_and_wait
+   timer around dispatch_id_mv to get ground-truth Q6_K mv_id µs/call
+   at gemma decode shape (n_tokens=1, top_k=8). Compare to llama.cpp
+   `kernel_mul_mv_q6_K_f32_nsg=2` per-call cost.
+2. If our Q6_K mv_id is significantly slower per-call: do the y-reuse
+   refactor (iter-91 candidate) AND measure before/after.
+3. If FA-vec is slower per-call: investigate split-K (nwg=32) port.
+4. Vec4 norm-add: low priority.
+
+The `feedback_metal_compiler_auto_optimizes_static_levers` standing
+rule applies: 7 prior kernel hypotheses falsified. Measure first,
+optimize after.
+
 ### Iter-92 llama.cpp HEAD pipeline compile log → concrete fusion candidates
 
 Captured llama.cpp build-9078 actual decode-time pipeline compile log
