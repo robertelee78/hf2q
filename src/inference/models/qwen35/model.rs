@@ -464,18 +464,39 @@ impl Qwen35Model {
                         linear.n, linear.k, v, h,
                     );
                 }
-                let groups_per_row = linear.k / linear.group_size;
-                let mut dequant = vec![0f32; linear.n * linear.k];
-                for i in 0..linear.n {
-                    for j in 0..linear.k {
-                        let g = j / linear.group_size;
-                        let scale = linear.scales[i * groups_per_row + g];
-                        let bias  = linear.biases[i * groups_per_row + g];
-                        dequant[i * linear.k + j] =
-                            scale * (linear.q_int[i * linear.k + j] as f32) + bias;
+                // ADR-020 AC#7 foundation F2 — measure the Q4_0 round-trip
+                // drift the iter-B1 path will incur when
+                // `forward_gpu.rs::ensure_gpu_cache_primed::upload_q4_0_from_f32`
+                // re-quantizes our dequantized lm_head Vec<f32>.  This
+                // gives operators a deterministic readout of how much
+                // DWQ signal is being LOST to the codec round-trip on
+                // every overlay-load — independent of any training
+                // run's actual KL improvement.
+                match linear.q4_0_round_trip_drift() {
+                    Ok(d) => {
+                        eprintln!(
+                            "[qwen35 DWQ overlay] lm_head Q4_0 round-trip drift: \
+                             rms={rms:.4e} max={max:.4e} \
+                             relative_rms={rrms:.4} bias_fraction={bf:.4} \
+                             ({n}x{k}, gs={gs}, bits={bits}); \
+                             read: relative_rms<0.1 ⇒ codec preserves signal, \
+                             >0.5 ⇒ codec destroys it",
+                            rms = d.rms_drift, max = d.max_abs_drift,
+                            rrms = d.relative_rms, bf = d.bias_fraction,
+                            n = d.n, k = d.k, gs = d.group_size, bits = d.bits,
+                        );
+                    }
+                    Err(e) => {
+                        // Never fatal — drift measurement is purely a
+                        // diagnostic; alignment failure here would have
+                        // already tripped the from_safetensors load
+                        // earlier (Q4_0 alignment is a subset of DWQ's
+                        // group_size constraint at gs=32).
+                        tracing::warn!(error = %e,
+                            "qwen35 DWQ overlay: Q4_0 round-trip drift measurement skipped");
                     }
                 }
-                self.output_weight = dequant;
+                self.output_weight = linear.dequantize_to_f32();
                 lm_head_overridden = true;
                 continue;
             }
