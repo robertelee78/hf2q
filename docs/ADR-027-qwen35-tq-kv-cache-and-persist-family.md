@@ -1,6 +1,6 @@
 # ADR-027: Qwen3.5 / Qwen3.6 TurboQuant KV Cache + Persist Family Port
 
-- **Status:** Proposed (iter-1a: design landed 2026-05-08; iter-1b: Chesterton's-fence revision 2026-05-08)
+- **Status:** Proposed (Phase A iter-1a..6b.3 LANDED 2026-05-08; Phase B not yet started)
 - **Date:** 2026-05-08
 - **Deciders:** Operator + Claude
 - **Tags:** turboquant, kv-cache, qwen35, qwen36, kv-persist, tq-active, peer-parity
@@ -230,8 +230,48 @@ What changes is only how / where the persistor is instantiated.
   `Qwen35LoadedModel::load`.~~
 
 The struck-through plan assumed load-time cfg is sufficient; it
-isn't. iter-6a (this commit) documents the finding; iter-6b ships
-the chosen candidate.
+isn't. iter-6a documents the finding; iter-6b ships the chosen
+candidate.
+
+**Iter-6b.3 hydrate seam design (LANDED 2026-05-08):**
+
+The on-disk filename is a one-way SHA-256 hex of the `LcpKey`
+fields — the key cannot be reconstructed from the filename. To
+make hydrate auto-reinsertion work, the disk persistor must
+co-store the `LcpRegistry::store(...)` arguments alongside the
+snapshot bytes. Two options were considered:
+
+1. **Bump `QH35_CODEC_VERSION` to 2 with a new mandatory header
+   field for sidecar metadata.** Drawback: any future v1 reader
+   (in another tool, in archived test data) breaks; iter-2..iter-4
+   tests that probe codec_version drift would need rewriting.
+2. **Append a SIDECAR block to the v1 envelope's tail with its
+   own magic (`QH3M`).** Pros: orthogonal to the snapshot codec
+   (Chesterton's fence preserved); a v1 reader (`deserialize_
+   hybrid_snapshot`) ignores trailing bytes safely; sidecar
+   schema can evolve independently via its own `version` field.
+
+Iter-6b.3 ships option 2. The disk persistor's `write` /
+`read` / `hydrate_for_cfg` thread `&LcpSidecarMetadata` through;
+`store_lcp_with_disk_writeback` constructs the sidecar from the
+live request state (key, prompt_tokens, sliding_window,
+linear_capacity). On cold start, `Qwen35LoadedModel::hydrate_lcp_
+registry_from_disk(&HybridKvCache, &MlxDevice)` walks the
+persistor's per-cfg subdir, reads each (snapshot, sidecar) pair,
+and replays `lcp_registry.store(...)` with the sidecar fields.
+
+Idempotency: `lcp_hydrated_for_cfg: HashSet<String>` (cfg
+fingerprint hex) gates the I/O; first-prefill-per-cfg pays one
+`read_dir`, subsequent prefills are HashSet hits. The hydrate
+seam is wired BEFORE the LCP probe at all 4 prefill entrypoints
+(text-only, soft-token, deepstack, streaming) so hydrated
+entries are visible to the same-request probe.
+
+Failure modes are warn-logged + swallowed (mantra-aligned:
+persistence-layer failure must NOT break inference). Per-file
+deserialize failures are skipped silently (with a warn trace);
+the bad file persists on disk so the operator can inspect or
+delete it.
 
 ### 4.8 Ban list (Chesterton's fence-respected)
 
@@ -333,4 +373,5 @@ Each iter ships a complete, mantra-clean deliverable. No iter is "enable later";
 | 6a | 2026-05-08 | A | LANDED | Investigation: cache shape is per-prefill (kv_cache.rs:347+), not load-time. Iter-5's `Qwen35DiskPersistor::new(cache_dir, cfg)` over-specifies. Iter-6b operator decision: Candidate A (per-call cfg API refactor) vs Candidate B (worker-owned lazy construction). §4.7 expanded. |
 | 6b.1 | 2026-05-08 | A | LANDED | Operator picked Candidate A. `Qwen35DiskPersistor` refactored: drop `cfg` from struct; per-call cfg on `write` / `read` / `hydrate_for_cfg`. Construction needs only `cache_dir`. Per-cfg fingerprint subdir layout preserved. New test `qh35_disk_multi_cfg_cohabit_one_persistor` proves one persistor handles multiple cfgs simultaneously. 15/15 PASS. |
 | 6b.2 | 2026-05-08 | A | LANDED | Engine write-through wire-up. `LoadOptions.kv_persist_dir` plumbed across all 5 construction sites; `Qwen35LoadedModel.disk_persistor` field; `Qwen35DiskPersistor::new(cache_dir)` at engine load (graceful fallback to None on mkdir failure); `store_lcp_with_disk_writeback(&kv_cache, ...)` helper that derives cfg from live cache via `cfg_from_cache(&HybridKvCache, FullAttnCodec)` + writes through to disk on every successful in-memory store; ALL 4 `qwen.lcp_registry.store(...)` sites in `engine_qwen35.rs` refactored to use the helper. 507 qwen35 + 15 qh35 tests PASS. CLI smoke confirms no regression at `HF2Q_KV_PERSIST=/tmp/cache`. End-to-end SERVE validation deferred to iter-6b.3 (which also adds hydrate auto-reinsertion). |
+| 6b.3 | 2026-05-08 | A | LANDED | **Cold-start hydrate seam + cross-process replay.** New `LcpSidecarMetadata` struct + sidecar codec (`QH3M` magic, version 1) appended to QH35 envelope tail — orthogonal to the snapshot codec, so adding/changing sidecar fields does NOT bump `QH35_CODEC_VERSION` (preserves Chesterton's fence around v1). Sidecar carries `(model_fingerprint, tenant_id, params_hash, prompt_tokens, sliding_window, linear_capacity)` so the cold-start path can replay the exact in-memory `LcpRegistry::store(...)` call. `Qwen35DiskPersistor::{write,read,hydrate_for_cfg}` thread sidecar through; `store_lcp_with_disk_writeback` constructs sidecar from the live (key, prompt_tokens, sliding_window, linear_capacity) on the disk-write arm. New `Qwen35LoadedModel::hydrate_lcp_registry_from_disk(&HybridKvCache, &MlxDevice)` is idempotent per cfg-fingerprint via `lcp_hydrated_for_cfg: HashSet<String>` (one HashSet check per request after first hydrate; one read_dir per cfg per process). Wired at all 4 prefill entrypoints in `engine_qwen35.rs` (`generate_qwen35_once`, `generate_qwen35_once_with_soft_tokens`, `generate_qwen35_once_with_soft_tokens_and_deepstack`, streaming) BEFORE the LCP probe so hydrated entries are visible. New tests: `qh3m_sidecar_codec_byte_round_trip`, `qh3m_sidecar_codec_rejects_bad_magic`, `qh3m_sidecar_codec_rejects_version_drift`, `qh3m_sidecar_empty_prompt_tokens_round_trip`, `qh35_with_sidecar_round_trip_byte_equal`, `qh35_with_sidecar_full_attn_only_round_trip`, `qh35_with_sidecar_rejects_truncated_envelope`, `qh35_disk_cross_process_replay_into_fresh_lcp_registry` (proves write→drop→fresh persistor→hydrate→`lcp_registry.lookup` hits with original key + reports correct LCP length k=12 against a divergent new prompt), `qh35_disk_clean_cold_start_yields_empty_hydrate`. 24 qh3 codec/disk tests + 516 qwen35 tests PASS = **540 tests**, zero regressions. SERVE end-to-end (live engine + 2-turn HTTP across process restart with TTFT speedup verified) deferred to operator validation gate. |
 | 6b.3 | (pending) | A | – | Hydrate auto-reinsertion: extend QH35 envelope (or add sidecar metadata file) to round-trip `LcpKey + prompt_tokens + sliding_window + linear_capacity` so `hydrate_for_cfg` can re-insert into in-memory `LcpRegistry` automatically; first-prefill hydrate seam on Qwen35LoadedModel; SERVE end-to-end validation: 2-turn chat across process restart with TTFT speedup verified. |

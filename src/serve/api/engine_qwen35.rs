@@ -142,12 +142,22 @@ pub struct Qwen35LoadedModel {
     /// across process crashes / restarts. `None` keeps the legacy
     /// in-process-only behavior (no I/O cost).
     ///
-    /// Iter-6b.3 (separate commit) wires automatic re-insertion of
-    /// disk snapshots into the in-memory registry on cold start;
-    /// iter-6b.2 ships write-only durability.
+    /// Iter-6b.3 wires automatic re-insertion of disk snapshots into
+    /// the in-memory registry on cold start via
+    /// `hydrate_lcp_registry_from_disk`; iter-6b.2 shipped write-only
+    /// durability.
     pub disk_persistor: Option<std::sync::Arc<
         crate::serve::kv_persist::families::qwen35_disk_persistor::Qwen35DiskPersistor,
     >>,
+
+    /// ADR-027 Phase A iter-6b.3 — set of cfg-fingerprint hex strings
+    /// whose disk snapshots have already been hydrated into the
+    /// in-memory `lcp_registry` for this process lifetime.
+    /// `hydrate_lcp_registry_from_disk` checks this before any I/O and
+    /// is a no-op on hit, so the cost across N requests is one
+    /// `read_dir` per cfg per process. Cleared when the engine drops
+    /// (process exit).
+    pub lcp_hydrated_for_cfg: std::collections::HashSet<String>,
 }
 
 impl Qwen35LoadedModel {
@@ -386,6 +396,10 @@ impl Qwen35LoadedModel {
                     }
                 }
             }),
+            // ADR-027 iter-6b.3: empty set on construction; first prefill
+            // for each cfg-fingerprint inserts into this set after a
+            // successful hydrate so subsequent prefills skip the I/O.
+            lcp_hydrated_for_cfg: std::collections::HashSet::new(),
         })
     }
 
@@ -428,12 +442,27 @@ impl Qwen35LoadedModel {
             ) {
                 Ok(cfg) => {
                     let key_hex = lcp_key_to_filename_hex(&key);
-                    if let Err(e) = persistor.write(&cfg, &key_hex, &snapshot) {
+                    // ADR-027 iter-6b.3: construct sidecar metadata from
+                    // the live (key, prompt_tokens, sliding_window,
+                    // linear_capacity) so the cold-start hydrate path
+                    // can replay the in-memory `LcpRegistry::store(...)`
+                    // call exactly. Clones are O(N) on the disk-write
+                    // arm only — the in-memory arm still moves
+                    // `prompt_tokens`.
+                    let sidecar = crate::serve::kv_persist::families::qwen35_hybrid_persistor::LcpSidecarMetadata {
+                        model_fingerprint: key.model_fingerprint.clone(),
+                        tenant_id: key.tenant_id.clone(),
+                        params_hash: key.params_hash,
+                        prompt_tokens: prompt_tokens.clone(),
+                        sliding_window: sliding_window as u64,
+                        linear_capacity: linear_capacity as u64,
+                    };
+                    if let Err(e) = persistor.write(&cfg, &key_hex, &snapshot, &sidecar) {
                         tracing::warn!(
                             cache_dir = %persistor.cache_dir().display(),
                             key_hex = %key_hex,
                             error = %format!("{e:#}"),
-                            "ADR-027 iter-6b.2: disk persistor write failed; \
+                            "ADR-027 iter-6b.3: disk persistor write failed; \
                              in-memory store will still proceed"
                         );
                     }
@@ -442,7 +471,7 @@ impl Qwen35LoadedModel {
                     tracing::warn!(
                         cache_dir = %persistor.cache_dir().display(),
                         error = %format!("{e:#}"),
-                        "ADR-027 iter-6b.2: cfg_from_cache failed; disk \
+                        "ADR-027 iter-6b.3: cfg_from_cache failed; disk \
                          write-through skipped (in-memory store still proceeds)"
                     );
                 }
@@ -458,6 +487,109 @@ impl Qwen35LoadedModel {
         )
     }
 
+    /// ADR-027 Phase A iter-6b.3 — cold-start hydrate. Walks the disk
+    /// persistor's per-cfg subdir for the live cache shape and re-inserts
+    /// every successfully-deserialized snapshot+sidecar into the
+    /// in-memory `lcp_registry`. Idempotent across the process lifetime
+    /// via `self.lcp_hydrated_for_cfg`: each cfg is hydrated at most once.
+    ///
+    /// Called by the prefill entrypoints (text + soft-token) BEFORE the
+    /// LCP probe, so the registry is populated by the time chunked
+    /// prefill looks for stride-aligned matches.
+    ///
+    /// No-ops cleanly when:
+    /// - `disk_persistor` is None (HF2Q_KV_PERSIST not set)
+    /// - this cfg-fingerprint has already been hydrated this process
+    /// - the on-disk per-cfg subdir doesn't exist yet (clean cold start)
+    ///
+    /// Errors during cfg derivation, persistor read, or registry store
+    /// are logged via `tracing::warn!` and swallowed — hydrate failure
+    /// must NOT break the live request (mantra-aligned: persistence-
+    /// layer failure must not break inference).
+    pub fn hydrate_lcp_registry_from_disk(
+        &mut self,
+        kv_cache: &crate::inference::models::qwen35::kv_cache::HybridKvCache,
+        device: &mlx_native::MlxDevice,
+    ) {
+        let persistor = match &self.disk_persistor {
+            Some(p) => std::sync::Arc::clone(p),
+            None => return, // HF2Q_KV_PERSIST not set — nothing to hydrate
+        };
+        let cfg = match crate::serve::kv_persist::families::qwen35_hybrid_persistor::cfg_from_cache(
+            kv_cache,
+            crate::serve::kv_persist::families::qwen35_hybrid_persistor::FullAttnCodec::F32Dense,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "ADR-027 iter-6b.3: hydrate_lcp_registry: cfg_from_cache failed; skipping"
+                );
+                return;
+            }
+        };
+        let fingerprint_hex =
+            crate::serve::kv_persist::families::qwen35_disk_persistor::Qwen35DiskPersistor::fingerprint_hex_for(&cfg);
+        if self.lcp_hydrated_for_cfg.contains(&fingerprint_hex) {
+            return; // already hydrated this cfg — no-op
+        }
+        // Mark BEFORE the I/O so a partial-success hydrate doesn't loop
+        // (bad files were warn-logged in hydrate_for_cfg; we won't
+        // retry them — the operator must fix or delete corrupt files).
+        self.lcp_hydrated_for_cfg.insert(fingerprint_hex.clone());
+
+        let triples = match persistor.hydrate_for_cfg(&cfg, device) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    cache_dir = %persistor.cache_dir().display(),
+                    fingerprint = %fingerprint_hex,
+                    error = %format!("{e:#}"),
+                    "ADR-027 iter-6b.3: hydrate_lcp_registry: hydrate_for_cfg failed; \
+                     skipping (registry remains empty for this cfg)"
+                );
+                return;
+            }
+        };
+        let total = triples.len();
+        let mut inserted = 0usize;
+        for (key_hex, snap, sidecar) in triples {
+            let key = crate::serve::kv_persist::lcp_registry::LcpKey {
+                model_fingerprint: sidecar.model_fingerprint.clone(),
+                tenant_id: sidecar.tenant_id.clone(),
+                params_hash: sidecar.params_hash,
+            };
+            // Sliding-window / linear-capacity were stored as u64 over
+            // usize for portability; production values fit comfortably.
+            let sliding_window = sidecar.sliding_window as usize;
+            let linear_capacity = sidecar.linear_capacity as usize;
+            match self.lcp_registry.store(
+                key,
+                sidecar.prompt_tokens.clone(),
+                vec![std::sync::Arc::new(snap)],
+                sliding_window,
+                linear_capacity,
+            ) {
+                Ok(()) => inserted += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        key_hex = %key_hex,
+                        error = ?e,
+                        "ADR-027 iter-6b.3: lcp_registry.store rejected hydrated entry; \
+                         skipping (file may exceed byte budget or be empty)"
+                    );
+                }
+            }
+        }
+        tracing::info!(
+            cache_dir = %persistor.cache_dir().display(),
+            fingerprint = %fingerprint_hex,
+            files_on_disk = total,
+            entries_inserted = inserted,
+            registry_len = self.lcp_registry.len(),
+            "ADR-027 iter-6b.3: hydrate_lcp_registry_from_disk complete"
+        );
+    }
 }
 
 /// ADR-027 Phase A iter-6b.2 — derive the on-disk filename hex from a
@@ -969,6 +1101,13 @@ pub fn generate_qwen35_once(
     let device = MlxDevice::new()
         .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 generate): {e}"))?;
     let mut kv_cache = alloc_kv_cache_for_request(qwen, &device, prompt_len, max_tokens)?;
+
+    // ADR-027 iter-6b.3: cold-start hydrate of in-memory LcpRegistry
+    // from disk-persisted snapshots.  Idempotent + cheap on hot path
+    // (HashSet lookup) — no-op when HF2Q_KV_PERSIST is unset, when
+    // this cfg has already been hydrated this process, or when the
+    // cfg-subdir is empty.
+    qwen.hydrate_lcp_registry_from_disk(&kv_cache, &device);
 
     // ── Prompt-cache fast-path ────────────────────────────────────
     let prompt_cache_hit = qwen
@@ -1730,6 +1869,11 @@ pub fn generate_qwen35_once_with_soft_tokens(
         .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 generate w/ soft tokens): {e}"))?;
     let mut kv_cache = alloc_kv_cache_for_request(qwen, &device, prompt_len, max_tokens)?;
 
+    // ADR-027 iter-6b.3: cold-start hydrate (soft-token path). Same
+    // idempotent semantics as the text-only path; persistence-layer
+    // failures are warn-logged + swallowed.
+    qwen.hydrate_lcp_registry_from_disk(&kv_cache, &device);
+
     // Prompt-cache is intentionally NOT consulted on the vision path
     // (see docstring above for the cache-key safety rationale).
     let prefill_start = Instant::now();
@@ -1920,6 +2064,9 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
             anyhow::anyhow!("MlxDevice::new (qwen35 wedge-4d generate): {e}")
         })?;
     let mut kv_cache = alloc_kv_cache_for_request(qwen, &device, prompt_len, max_tokens)?;
+
+    // ADR-027 iter-6b.3: cold-start hydrate (wedge-4d deepstack path).
+    qwen.hydrate_lcp_registry_from_disk(&kv_cache, &device);
 
     let prefill_start = Instant::now();
     // Use supplied 3D positions if provided; otherwise fall back to
@@ -2270,6 +2417,11 @@ pub fn generate_stream_qwen35_once_extended(
             return;
         }
     };
+
+    // ADR-027 iter-6b.3: cold-start hydrate (streaming path).
+    // Idempotent + cheap on hot path; warn-logs + swallows persistence
+    // failures so the request still proceeds.
+    qwen.hydrate_lcp_registry_from_disk(&kv_cache, &device);
 
     let pre_dispatches = mlx_native::dispatch_count();
     let pre_syncs = mlx_native::sync_count();

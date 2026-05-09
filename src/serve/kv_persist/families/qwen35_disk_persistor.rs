@@ -43,8 +43,8 @@ use std::path::{Path, PathBuf};
 use crate::inference::models::qwen35::kv_cache::HybridKvCacheSnapshot;
 
 use super::qwen35_hybrid_persistor::{
-    deserialize_hybrid_snapshot, serialize_hybrid_snapshot, FullAttnCodec,
-    Qwen35HybridConfig,
+    deserialize_hybrid_with_sidecar, serialize_hybrid_with_sidecar, FullAttnCodec,
+    LcpSidecarMetadata, Qwen35HybridConfig,
 };
 
 /// Disk-backed cold-resume persistor for qwen35 hybrid snapshots.
@@ -90,16 +90,23 @@ impl Qwen35DiskPersistor {
             .join(format!("{lcp_key_hex}.bin"))
     }
 
-    /// Serialize `snapshot` through the QH35 envelope (under `cfg`)
-    /// and write the bytes to
+    /// Serialize `snapshot` + `sidecar` through the QH35 envelope (under
+    /// `cfg`) and write the bytes to
     /// `<cache_dir>/<cfg-fingerprint>/<lcp_key>.bin` atomically
     /// (tempfile + rename). Creates the per-cfg subdir on first use.
     /// Overwrites any existing file at the same key.
+    ///
+    /// `sidecar` carries the in-memory `LcpRegistry::store(...)` arguments
+    /// (key fields, prompt_tokens, sliding_window, linear_capacity) that
+    /// the cold-start hydrate path replays via
+    /// `Qwen35LoadedModel::hydrate_lcp_registry_from_disk`. The caller
+    /// constructs it from the live request state.
     pub fn write(
         &self,
         cfg: &Qwen35HybridConfig,
         lcp_key_hex: &str,
         snapshot: &HybridKvCacheSnapshot,
+        sidecar: &LcpSidecarMetadata,
     ) -> Result<()> {
         ensure!(
             !lcp_key_hex.is_empty(),
@@ -112,8 +119,8 @@ impl Qwen35DiskPersistor {
             "Qwen35DiskPersistor::write: lcp_key_hex must be alphanumeric/_/- only \
              (got {lcp_key_hex:?})"
         );
-        let bytes = serialize_hybrid_snapshot(snapshot, cfg)
-            .context("Qwen35DiskPersistor::write: serialize_hybrid_snapshot")?;
+        let bytes = serialize_hybrid_with_sidecar(snapshot, cfg, sidecar)
+            .context("Qwen35DiskPersistor::write: serialize_hybrid_with_sidecar")?;
         let final_path = self.path_for_key(cfg, lcp_key_hex);
         let cfg_dir = final_path
             .parent()
@@ -146,17 +153,21 @@ impl Qwen35DiskPersistor {
         Ok(())
     }
 
-    /// Read the snapshot keyed by `(cfg, lcp_key_hex)` from disk;
-    /// returns `Ok(None)` when the file doesn't exist (clean cache
-    /// miss). Returns `Err` on file-present-but-corrupt (caller
-    /// should treat as a cache miss + delete + log; iter-6b's
-    /// wire-up implements that recovery).
+    /// Read the snapshot + sidecar metadata keyed by `(cfg, lcp_key_hex)`
+    /// from disk; returns `Ok(None)` when the file doesn't exist (clean
+    /// cache miss). Returns `Err` on file-present-but-corrupt (caller
+    /// should treat as a cache miss + delete + log; iter-6b's wire-up
+    /// implements that recovery).
+    ///
+    /// The returned tuple is `(snapshot, sidecar)`; the sidecar carries
+    /// the original `LcpRegistry::store(...)` arguments needed for
+    /// hydrate-time re-insertion.
     pub fn read(
         &self,
         cfg: &Qwen35HybridConfig,
         lcp_key_hex: &str,
         device: &MlxDevice,
-    ) -> Result<Option<HybridKvCacheSnapshot>> {
+    ) -> Result<Option<(HybridKvCacheSnapshot, LcpSidecarMetadata)>> {
         let path = self.path_for_key(cfg, lcp_key_hex);
         let bytes = match fs::read(&path) {
             Ok(b) => b,
@@ -168,32 +179,35 @@ impl Qwen35DiskPersistor {
                 ))
             }
         };
-        let snap = deserialize_hybrid_snapshot(&bytes, cfg, device).with_context(|| {
-            format!(
-                "Qwen35DiskPersistor::read: deserialize {} ({} bytes)",
-                path.display(),
-                bytes.len()
-            )
-        })?;
-        Ok(Some(snap))
+        let pair = deserialize_hybrid_with_sidecar(&bytes, cfg, device)
+            .with_context(|| {
+                format!(
+                    "Qwen35DiskPersistor::read: deserialize {} ({} bytes)",
+                    path.display(),
+                    bytes.len()
+                )
+            })?;
+        Ok(Some(pair))
     }
 
     /// Walk `<cache_dir>/<cfg-fingerprint>/` and return every
-    /// `(lcp_key, snapshot)` pair that successfully deserializes
-    /// against `cfg`. Files that fail to deserialize (corrupt /
-    /// wrong-config / drift) are skipped with a warning trace — they
-    /// don't poison the hydrate.
+    /// `(lcp_key, snapshot, sidecar)` triple that successfully
+    /// deserializes against `cfg`. Files that fail to deserialize
+    /// (corrupt / wrong-config / drift) are skipped with a warning
+    /// trace — they don't poison the hydrate.
     ///
-    /// Iter-6b calls this at first prefill (when cfg is known) to
-    /// seed the in-memory `LcpRegistry` for that cfg. Earlier-cfg
-    /// snapshots (under different fingerprint subdirs) are NOT
-    /// hydrated — they live correctly under their own subdir until a
-    /// matching-cfg prefill arrives.
+    /// Iter-6b.3 calls this at first prefill (when cfg is known) to
+    /// seed the in-memory `LcpRegistry` for that cfg via the
+    /// sidecar's `(LcpKey, prompt_tokens, sliding_window,
+    /// linear_capacity)` fields. Earlier-cfg snapshots (under
+    /// different fingerprint subdirs) are NOT hydrated — they live
+    /// correctly under their own subdir until a matching-cfg prefill
+    /// arrives.
     pub fn hydrate_for_cfg(
         &self,
         cfg: &Qwen35HybridConfig,
         device: &MlxDevice,
-    ) -> Result<Vec<(String, HybridKvCacheSnapshot)>> {
+    ) -> Result<Vec<(String, HybridKvCacheSnapshot, LcpSidecarMetadata)>> {
         let fingerprint_hex = compute_config_fingerprint_hex(cfg);
         let dir = self.cache_dir.join(&fingerprint_hex);
         let entries = match fs::read_dir(&dir) {
@@ -227,7 +241,9 @@ impl Qwen35DiskPersistor {
             }
             let lcp_key_hex = name.trim_end_matches(".bin").to_string();
             match self.read(cfg, &lcp_key_hex, device) {
-                Ok(Some(snap)) => out.push((lcp_key_hex, snap)),
+                Ok(Some((snap, sidecar))) => {
+                    out.push((lcp_key_hex, snap, sidecar))
+                }
                 Ok(None) => {
                     // Race window: file vanished between read_dir and
                     // open. Skip silently.
@@ -304,7 +320,27 @@ fn full_attn_codec_byte(codec: FullAttnCodec) -> u8 {
 mod tests {
     use super::*;
     use crate::inference::models::qwen35::kv_cache::MtpKvSnapshot;
+    use crate::serve::kv_persist::format::ModelFingerprint;
     use mlx_native::DType;
+
+    /// Synth sidecar metadata for disk-persistor unit tests. The fields
+    /// are deterministic so failure modes (drift, truncation) surface
+    /// against expected bytes; production builds a sidecar from the
+    /// live `LcpKey` + cache state in `store_lcp_with_disk_writeback`.
+    fn synth_sidecar() -> LcpSidecarMetadata {
+        let mut fp = [0u8; 32];
+        for (i, b) in fp.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(11).wrapping_add(3);
+        }
+        LcpSidecarMetadata {
+            model_fingerprint: ModelFingerprint(fp),
+            tenant_id: "default".to_string(),
+            params_hash: 0xCAFE_BABE_DEAD_BEEF,
+            prompt_tokens: vec![10, 20, 30, 40, 50, 60, 70, 80],
+            sliding_window: 1024,
+            linear_capacity: 512,
+        }
+    }
 
     /// Standalone synth-snapshot helper for the disk-persistor tests
     /// (avoids cross-module test imports). Mirrors the pattern in
@@ -510,12 +546,16 @@ mod tests {
         let _ = fs::remove_dir_all(&tempdir);
         let persistor = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
         let snap = synth_snapshot(&device, &cfg);
-        persistor.write(&cfg, "deadbeef_cafebabe", &snap).unwrap();
-        let restored = persistor
+        let sidecar = synth_sidecar();
+        persistor
+            .write(&cfg, "deadbeef_cafebabe", &snap, &sidecar)
+            .unwrap();
+        let (restored_snap, restored_sidecar) = persistor
             .read(&cfg, "deadbeef_cafebabe", &device)
             .unwrap()
             .expect("write+read should round-trip");
-        assert!(snapshots_byte_equal(&snap, &restored));
+        assert!(snapshots_byte_equal(&snap, &restored_snap));
+        assert_eq!(restored_sidecar, sidecar);
         let _ = fs::remove_dir_all(&tempdir);
     }
 
@@ -551,9 +591,10 @@ mod tests {
         let _ = fs::remove_dir_all(&tempdir);
         let persistor = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
         let snap = synth_snapshot(&device, &cfg);
+        let sidecar = synth_sidecar();
         let keys = ["key_a", "key_b", "key_c"];
         for k in &keys {
-            persistor.write(&cfg, k, &snap).unwrap();
+            persistor.write(&cfg, k, &snap, &sidecar).unwrap();
         }
         let mut hydrated = persistor.hydrate_for_cfg(&cfg, &device).unwrap();
         hydrated.sort_by(|a, b| a.0.cmp(&b.0));
@@ -561,6 +602,7 @@ mod tests {
         for (got, expected) in hydrated.iter().zip(keys.iter()) {
             assert_eq!(&got.0, expected);
             assert!(snapshots_byte_equal(&snap, &got.1));
+            assert_eq!(got.2, sidecar);
         }
         let _ = fs::remove_dir_all(&tempdir);
     }
@@ -589,7 +631,10 @@ mod tests {
             "differently-shaped configs MUST produce different fingerprints"
         );
         let snap_a = synth_snapshot(&device, &cfg_a);
-        persistor.write(&cfg_a, "shared_key", &snap_a).unwrap();
+        let sidecar = synth_sidecar();
+        persistor
+            .write(&cfg_a, "shared_key", &snap_a, &sidecar)
+            .unwrap();
         // Reading the SAME key under cfg_b targets a different subdir
         // → must miss.
         let result_b = persistor.read(&cfg_b, "shared_key", &device).unwrap();
@@ -615,7 +660,8 @@ mod tests {
         let persistor = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
         // Write snap-A, then overwrite with mutated snap-B.
         let snap_a = synth_snapshot(&device, &cfg);
-        persistor.write(&cfg, "the_key", &snap_a).unwrap();
+        let sidecar = synth_sidecar();
+        persistor.write(&cfg, "the_key", &snap_a, &sidecar).unwrap();
         let mut snap_b = synth_snapshot(&device, &cfg);
         {
             let dst = snap_b.full_attn_k[0].as_mut_slice::<u8>().unwrap();
@@ -623,10 +669,13 @@ mod tests {
                 *b = b.wrapping_add(7);
             }
         }
-        persistor.write(&cfg, "the_key", &snap_b).unwrap();
-        let restored = persistor.read(&cfg, "the_key", &device).unwrap().unwrap();
-        assert!(snapshots_byte_equal(&snap_b, &restored));
-        assert!(!snapshots_byte_equal(&snap_a, &restored));
+        persistor.write(&cfg, "the_key", &snap_b, &sidecar).unwrap();
+        let (restored_snap, _) = persistor
+            .read(&cfg, "the_key", &device)
+            .unwrap()
+            .unwrap();
+        assert!(snapshots_byte_equal(&snap_b, &restored_snap));
+        assert!(!snapshots_byte_equal(&snap_a, &restored_snap));
         let _ = fs::remove_dir_all(&tempdir);
     }
 
@@ -654,11 +703,12 @@ mod tests {
         let persistor = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
         let snap_a = synth_snapshot(&device, &cfg_a);
         let snap_b = synth_snapshot(&device, &cfg_b);
-        persistor.write(&cfg_a, "key1", &snap_a).unwrap();
-        persistor.write(&cfg_b, "key1", &snap_b).unwrap();
+        let sidecar = synth_sidecar();
+        persistor.write(&cfg_a, "key1", &snap_a, &sidecar).unwrap();
+        persistor.write(&cfg_b, "key1", &snap_b, &sidecar).unwrap();
         // Each cfg sees ITS OWN snap at the same key.
-        let r_a = persistor.read(&cfg_a, "key1", &device).unwrap().unwrap();
-        let r_b = persistor.read(&cfg_b, "key1", &device).unwrap().unwrap();
+        let (r_a, _) = persistor.read(&cfg_a, "key1", &device).unwrap().unwrap();
+        let (r_b, _) = persistor.read(&cfg_b, "key1", &device).unwrap().unwrap();
         assert!(snapshots_byte_equal(&snap_a, &r_a));
         assert!(snapshots_byte_equal(&snap_b, &r_b));
         // Hydrate-for-cfg returns ONLY that cfg's entries.
@@ -666,6 +716,166 @@ mod tests {
         let h_b = persistor.hydrate_for_cfg(&cfg_b, &device).unwrap();
         assert_eq!(h_a.len(), 1);
         assert_eq!(h_b.len(), 1);
+        let _ = fs::remove_dir_all(&tempdir);
+    }
+
+    /// ADR-027 Phase A iter-6b.3 — cross-process replay. Proves the
+    /// full cold-start hydrate semantic at the disk-persistor +
+    /// LcpRegistry layer:
+    ///
+    /// 1. Persistor A writes a snapshot+sidecar at a real LcpKey.
+    /// 2. Persistor A is dropped (simulates process crash/exit).
+    /// 3. Persistor B opens the SAME cache_dir (fresh process state).
+    /// 4. A fresh, empty LcpRegistry is constructed.
+    /// 5. Persistor B's hydrate_for_cfg walks the dir + returns the
+    ///    snapshot+sidecar.
+    /// 6. The hydrate code-path replays `lcp_registry.store(key,
+    ///    prompt_tokens, vec![Arc::new(snap)], sliding_window,
+    ///    linear_capacity)` from the sidecar fields.
+    /// 7. lcp_registry.lookup(&original_key, &new_tokens) returns Some
+    ///    with the expected LCP length, proving the registry state was
+    ///    reconstructed identically.
+    ///
+    /// This exercises the FULL contract: write codec + read codec +
+    /// sidecar fidelity + LcpKey reconstruction + Arc-payload re-wrap
+    /// + LcpRegistry::store + LcpRegistry::lookup. SERVE end-to-end
+    /// (engine + GPU model + 2-turn HTTP) is gated on operator
+    /// validation in iter-6b.3g.
+    #[test]
+    fn qh35_disk_cross_process_replay_into_fresh_lcp_registry() {
+        use crate::serve::kv_persist::lcp_registry::{LcpKey, LcpRegistry};
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = synth_cfg();
+        let tempdir = unique_tempdir("xprocess");
+        let _ = fs::remove_dir_all(&tempdir);
+
+        // The original prompt — sidecar must round-trip every byte so
+        // the new-process lookup can compute LCP exactly.
+        let original_prompt: Vec<u32> =
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 100, 200, 300, 400, 500];
+        // The new request's prompt: shares an LCP of length 12 with the
+        // original (then diverges). Lookup should report k=12.
+        let new_request_prompt: Vec<u32> =
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 100, 200, 999, 999, 999];
+
+        let mut fp = [0u8; 32];
+        for (i, b) in fp.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(19).wrapping_add(7);
+        }
+        let original_key = LcpKey {
+            model_fingerprint: ModelFingerprint(fp),
+            tenant_id: "qwen35:lcp_chunk:64".to_string(),
+            params_hash: 0xABCD_EF01_2345_6789,
+        };
+        let original_sliding_window: u64 = 8192;
+        let original_linear_capacity: u64 = 4096;
+
+        // ── Process A: write snapshot+sidecar to disk ──
+        {
+            let persistor_a = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
+            let snap = synth_snapshot(&device, &cfg);
+            let sidecar = LcpSidecarMetadata {
+                model_fingerprint: original_key.model_fingerprint.clone(),
+                tenant_id: original_key.tenant_id.clone(),
+                params_hash: original_key.params_hash,
+                prompt_tokens: original_prompt.clone(),
+                sliding_window: original_sliding_window,
+                linear_capacity: original_linear_capacity,
+            };
+            persistor_a
+                .write(&cfg, "fixedkey0001", &snap, &sidecar)
+                .unwrap();
+        } // persistor_a dropped — simulates process exit
+
+        // ── Process B: fresh persistor + fresh registry; hydrate ──
+        let mut registry: LcpRegistry<HybridKvCacheSnapshot> =
+            LcpRegistry::new(8);
+        assert_eq!(registry.len(), 0, "fresh registry must be empty");
+
+        let persistor_b = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
+        let triples = persistor_b.hydrate_for_cfg(&cfg, &device).unwrap();
+        assert_eq!(
+            triples.len(),
+            1,
+            "hydrate_for_cfg should find the one snapshot persistor A wrote"
+        );
+
+        // Replay the same store-call shape that
+        // `Qwen35LoadedModel::hydrate_lcp_registry_from_disk` performs.
+        for (_key_hex, snap, sidecar) in triples {
+            let key = LcpKey {
+                model_fingerprint: sidecar.model_fingerprint.clone(),
+                tenant_id: sidecar.tenant_id.clone(),
+                params_hash: sidecar.params_hash,
+            };
+            registry
+                .store(
+                    key,
+                    sidecar.prompt_tokens.clone(),
+                    vec![std::sync::Arc::new(snap)],
+                    sidecar.sliding_window as usize,
+                    sidecar.linear_capacity as usize,
+                )
+                .expect("registry should accept the hydrated entry");
+        }
+
+        // ── The proof: lookup with the ORIGINAL key must hit, and the
+        // returned prefix must report the expected LCP length + the
+        // original sliding_window / linear_capacity ──
+        let prefix = registry
+            .lookup(&original_key, &new_request_prompt)
+            .expect("post-hydrate lookup with original key must hit");
+        assert_eq!(
+            prefix.k, 12,
+            "LCP length should match the shared prefix between original_prompt and new_request_prompt"
+        );
+        assert_eq!(prefix.sliding_window, original_sliding_window as usize);
+        assert_eq!(prefix.linear_capacity, original_linear_capacity as usize);
+        assert_eq!(prefix.cached_prompt_len, original_prompt.len());
+
+        let _ = fs::remove_dir_all(&tempdir);
+    }
+
+    /// Defensive: a registry hydrated from a disk persistor with an
+    /// EMPTY cfg-subdir (clean cold start on a brand-new HF2Q_KV_PERSIST
+    /// dir) stays empty and lookups miss cleanly. No I/O errors, no
+    /// partial state, no false-positive hits.
+    #[test]
+    fn qh35_disk_clean_cold_start_yields_empty_hydrate() {
+        use crate::serve::kv_persist::lcp_registry::{LcpKey, LcpRegistry};
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = synth_cfg();
+        let tempdir = unique_tempdir("clean-cold");
+        let _ = fs::remove_dir_all(&tempdir);
+
+        let persistor = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
+        let triples = persistor.hydrate_for_cfg(&cfg, &device).unwrap();
+        assert!(triples.is_empty(), "fresh cache_dir must hydrate to []");
+
+        let registry: LcpRegistry<HybridKvCacheSnapshot> = LcpRegistry::new(8);
+        assert_eq!(registry.len(), 0);
+
+        let key = LcpKey {
+            model_fingerprint: ModelFingerprint([0u8; 32]),
+            tenant_id: "default".to_string(),
+            params_hash: 0,
+        };
+        let mut reg = registry;
+        let lookup = reg.lookup(&key, &[1, 2, 3]);
+        assert!(lookup.is_none(), "empty registry must miss every lookup");
+
         let _ = fs::remove_dir_all(&tempdir);
     }
 }

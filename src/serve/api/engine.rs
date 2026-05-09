@@ -9169,6 +9169,7 @@ assistant:
                 crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
             kv_metrics_sink: None,
             disk_persistor: None,
+            lcp_hydrated_for_cfg: std::collections::HashSet::new(),
         };
         let qwen = LoadedModel::Qwen35(qwen_loaded);
 

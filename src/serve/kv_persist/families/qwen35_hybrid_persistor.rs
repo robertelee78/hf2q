@@ -60,6 +60,7 @@ use mlx_native::{DType, MlxBuffer, MlxDevice};
 use crate::inference::models::qwen35::kv_cache::{
     HybridKvCache, HybridKvCacheSnapshot, MtpKvSnapshot,
 };
+use crate::serve::kv_persist::format::ModelFingerprint;
 
 /// Magic bytes prefixing every QH35 (Qwen3.5 Hybrid) envelope. ASCII for
 /// "QH35" to make hex dumps trivial to spot-read.
@@ -644,7 +645,8 @@ pub fn serialize_hybrid_snapshot(
 }
 
 /// Deserialize a QH35 envelope back into a `HybridKvCacheSnapshot` against
-/// a freshly-allocated set of buffers via `device`.
+/// a freshly-allocated set of buffers via `device`. Cursor=0; the entire
+/// envelope is consumed.
 ///
 /// Iter-2 scope: full-attn slot bytes are copied back verbatim; linear-attn
 /// and MTP buffers are allocated freshly-zeroed (no payload bytes to read).
@@ -655,8 +657,26 @@ pub fn deserialize_hybrid_snapshot(
     device: &MlxDevice,
 ) -> Result<HybridKvCacheSnapshot> {
     let mut cursor = 0usize;
+    let snap = deserialize_hybrid_snapshot_at_cursor(bytes, &mut cursor, cfg, device)?;
+    Ok(snap)
+}
 
-    let magic = read_bytes(bytes, &mut cursor, 4)?;
+/// Iter-6b.3 — cursor-aware variant of `deserialize_hybrid_snapshot`. The
+/// caller controls the read position so a sidecar metadata block can be
+/// composed onto the tail of the envelope (see
+/// `deserialize_hybrid_with_sidecar`).
+///
+/// The cursor advances past the consumed snapshot bytes; the caller is
+/// responsible for either asserting end-of-buffer (no sidecar expected)
+/// or invoking `deserialize_lcp_sidecar(bytes, cursor)` to consume the
+/// sidecar block that immediately follows.
+pub fn deserialize_hybrid_snapshot_at_cursor(
+    bytes: &[u8],
+    cursor: &mut usize,
+    cfg: &Qwen35HybridConfig,
+    device: &MlxDevice,
+) -> Result<HybridKvCacheSnapshot> {
+    let magic = read_bytes(bytes, cursor, 4)?;
     ensure!(
         magic == QH35_MAGIC,
         "QH35 deserialize: bad magic {:?} (expected {:?})",
@@ -664,7 +684,7 @@ pub fn deserialize_hybrid_snapshot(
         QH35_MAGIC
     );
 
-    let codec_version = read_u32_le(bytes, &mut cursor)?;
+    let codec_version = read_u32_le(bytes, cursor)?;
     ensure!(
         codec_version == QH35_CODEC_VERSION,
         "QH35 deserialize: unsupported codec_version {} (expected {})",
@@ -673,11 +693,11 @@ pub fn deserialize_hybrid_snapshot(
     );
 
     let header_cfg = Qwen35HybridConfig {
-        n_full_attn: read_u32_le(bytes, &mut cursor)?,
-        n_linear_attn: read_u32_le(bytes, &mut cursor)?,
-        has_mtp: read_u8(bytes, &mut cursor)? != 0,
-        full_attn_codec: FullAttnCodec::from_u8(read_u8(bytes, &mut cursor)?)?,
-        n_seqs: read_u32_le(bytes, &mut cursor)?,
+        n_full_attn: read_u32_le(bytes, cursor)?,
+        n_linear_attn: read_u32_le(bytes, cursor)?,
+        has_mtp: read_u8(bytes, cursor)? != 0,
+        full_attn_codec: FullAttnCodec::from_u8(read_u8(bytes, cursor)?)?,
+        n_seqs: read_u32_le(bytes, cursor)?,
         // Shapes are per-(slot, family) and not in the header — copy from
         // runtime cfg so the assert_matches comparison treats them as
         // equal (per-slot shape is validated against cfg in the body
@@ -687,7 +707,7 @@ pub fn deserialize_hybrid_snapshot(
         linear_recurrent_shape: cfg.linear_recurrent_shape,
         mtp_shape: cfg.mtp_shape,
     };
-    let _reserved = read_u16_le(bytes, &mut cursor)?;
+    let _reserved = read_u16_le(bytes, cursor)?;
 
     // Validate header against expected config (shape is checked per-slot).
     {
@@ -702,7 +722,7 @@ pub fn deserialize_hybrid_snapshot(
     let mut full_attn_current_len: Vec<Vec<u32>> = Vec::with_capacity(cfg.n_full_attn as usize);
 
     for expected_slot in 0..cfg.n_full_attn as usize {
-        let slot_idx = read_u32_le(bytes, &mut cursor)? as usize;
+        let slot_idx = read_u32_le(bytes, cursor)? as usize;
         ensure!(
             slot_idx == expected_slot,
             "QH35 deserialize: full_attn slot order mismatch — got {} expected {}",
@@ -712,7 +732,7 @@ pub fn deserialize_hybrid_snapshot(
 
         let mut shape_arr = [0u64; 4];
         for dim in &mut shape_arr {
-            *dim = read_u64_le(bytes, &mut cursor)?;
+            *dim = read_u64_le(bytes, cursor)?;
         }
         ensure!(
             shape_arr == cfg.full_attn_shape,
@@ -720,16 +740,16 @@ pub fn deserialize_hybrid_snapshot(
             shape_arr,
             cfg.full_attn_shape
         );
-        let k_byte_len = read_u64_le(bytes, &mut cursor)? as usize;
-        let v_byte_len = read_u64_le(bytes, &mut cursor)? as usize;
+        let k_byte_len = read_u64_le(bytes, cursor)? as usize;
+        let v_byte_len = read_u64_le(bytes, cursor)? as usize;
 
         let mut current_len = Vec::with_capacity(cfg.n_seqs as usize);
         for _ in 0..cfg.n_seqs {
-            current_len.push(read_u32_le(bytes, &mut cursor)?);
+            current_len.push(read_u32_le(bytes, cursor)?);
         }
 
-        let k_src = read_bytes(bytes, &mut cursor, k_byte_len)?;
-        let v_src = read_bytes(bytes, &mut cursor, v_byte_len)?;
+        let k_src = read_bytes(bytes, cursor, k_byte_len)?;
+        let v_src = read_bytes(bytes, cursor, v_byte_len)?;
 
         let mlx_shape: Vec<usize> = shape_arr.iter().map(|d| *d as usize).collect();
         let dtype = full_attn_dtype_for_codec(header_cfg.full_attn_codec);
@@ -785,15 +805,15 @@ pub fn deserialize_hybrid_snapshot(
     let mut linear_recurrent: Vec<MlxBuffer> =
         Vec::with_capacity(cfg.n_linear_attn as usize);
     for expected_slot in 0..cfg.n_linear_attn as usize {
-        let slot_idx = read_u32_le(bytes, &mut cursor)? as usize;
+        let slot_idx = read_u32_le(bytes, cursor)? as usize;
         ensure!(
             slot_idx == expected_slot,
             "QH35 deserialize: linear_attn slot order mismatch — got {} expected {}",
             slot_idx,
             expected_slot
         );
-        let conv_byte_len = read_u64_le(bytes, &mut cursor)? as usize;
-        let rec_byte_len = read_u64_le(bytes, &mut cursor)? as usize;
+        let conv_byte_len = read_u64_le(bytes, cursor)? as usize;
+        let rec_byte_len = read_u64_le(bytes, cursor)? as usize;
         ensure!(
             conv_byte_len == expected_conv_bytes,
             "QH35 deserialize: linear_conv[{slot_idx}] on-disk byte_len = {} != \
@@ -808,8 +828,8 @@ pub fn deserialize_hybrid_snapshot(
             rec_byte_len,
             expected_recurrent_bytes
         );
-        let conv_src = read_bytes(bytes, &mut cursor, conv_byte_len)?;
-        let rec_src = read_bytes(bytes, &mut cursor, rec_byte_len)?;
+        let conv_src = read_bytes(bytes, cursor, conv_byte_len)?;
+        let rec_src = read_bytes(bytes, cursor, rec_byte_len)?;
         let mut conv_buf = device
             .alloc_buffer(conv_byte_len, DType::F32, conv_shape_usize.clone())
             .map_err(|e| {
@@ -840,7 +860,7 @@ pub fn deserialize_hybrid_snapshot(
     let mtp: Option<MtpKvSnapshot> = if cfg.has_mtp {
         let mut mk_shape_arr = [0u64; 4];
         for dim in &mut mk_shape_arr {
-            *dim = read_u64_le(bytes, &mut cursor)?;
+            *dim = read_u64_le(bytes, cursor)?;
         }
         ensure!(
             mk_shape_arr == cfg.mtp_shape,
@@ -848,14 +868,14 @@ pub fn deserialize_hybrid_snapshot(
             mk_shape_arr,
             cfg.mtp_shape
         );
-        let mk_byte_len = read_u64_le(bytes, &mut cursor)? as usize;
-        let mv_byte_len = read_u64_le(bytes, &mut cursor)? as usize;
+        let mk_byte_len = read_u64_le(bytes, cursor)? as usize;
+        let mv_byte_len = read_u64_le(bytes, cursor)? as usize;
         let mut mtp_current_len = Vec::with_capacity(cfg.n_seqs as usize);
         for _ in 0..cfg.n_seqs {
-            mtp_current_len.push(read_u32_le(bytes, &mut cursor)?);
+            mtp_current_len.push(read_u32_le(bytes, cursor)?);
         }
-        let mk_src = read_bytes(bytes, &mut cursor, mk_byte_len)?;
-        let mv_src = read_bytes(bytes, &mut cursor, mv_byte_len)?;
+        let mk_src = read_bytes(bytes, cursor, mk_byte_len)?;
+        let mv_src = read_bytes(bytes, cursor, mv_byte_len)?;
         let mtp_shape_usize: Vec<usize> =
             mk_shape_arr.iter().map(|d| *d as usize).collect();
         let dtype = full_attn_dtype_for_codec(header_cfg.full_attn_codec);
@@ -914,6 +934,182 @@ fn full_attn_dtype_for_codec(codec: FullAttnCodec) -> DType {
     match codec {
         FullAttnCodec::F32Dense => DType::F32,
     }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-027 Phase A iter-6b.3 — LCP sidecar metadata
+// ---------------------------------------------------------------------------
+//
+// The QH35 envelope (iter-2..iter-4) carries the snapshot bytes only.  The
+// in-memory `LcpRegistry::store` entry that produced a snapshot also needs
+// `(LcpKey, prompt_tokens, sliding_window, linear_capacity)` to be
+// reinserted on cold start — none of which are derivable from the snapshot
+// payload or the on-disk filename (the filename is a one-way SHA hex of
+// the LcpKey, not the key itself).
+//
+// Iter-6b.3 introduces a SIDECAR block that lives at the tail of the QH35
+// envelope, marked with its own magic so a v1 reader (just `deserialize_
+// hybrid_snapshot`) can ignore the trailing bytes safely.  The sidecar
+// codec is intentionally orthogonal to the snapshot codec — adding /
+// changing sidecar fields does not require bumping `QH35_CODEC_VERSION`,
+// preserving Chesterton's fence around the snapshot codec.
+//
+// On-disk sidecar layout:
+// ```text
+// [magic: 4 bytes "QH3M"]
+// [version: u32 LE = 1]
+// [model_fingerprint: 32 bytes]    # ModelFingerprint([u8; 32])
+// [tenant_id_len: u32 LE]
+// [tenant_id: tenant_id_len bytes]
+// [params_hash: u64 LE]
+// [prompt_tokens_count: u64 LE]
+// [prompt_tokens: u32 × prompt_tokens_count LE]
+// [sliding_window: u64 LE]
+// [linear_capacity: u64 LE]
+// ```
+
+/// Magic bytes prefixing every QH3M (Qwen3.5 Hybrid sidecar Metadata) block.
+/// ASCII for "QH3M" so hex dumps spot the boundary visually.
+pub const QH3M_SIDECAR_MAGIC: [u8; 4] = *b"QH3M";
+
+/// Sidecar codec version. v1 ships in iter-6b.3.
+pub const QH3M_SIDECAR_VERSION: u32 = 1;
+
+/// Sidecar metadata appended to a QH35 envelope so a cold-start hydrate
+/// path can reconstruct the full `LcpRegistry::store(...)` call without
+/// re-deriving any field from the live request.
+///
+/// Held + emitted by `Qwen35DiskPersistor::write` and consumed by
+/// `Qwen35DiskPersistor::read` / `hydrate_for_cfg`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LcpSidecarMetadata {
+    /// Same `ModelFingerprint` as the in-memory `LcpKey.model_fingerprint`.
+    pub model_fingerprint: ModelFingerprint,
+    /// Tenant identifier — same value passed at store-time.
+    pub tenant_id: String,
+    /// Sampling-params hash — same value passed at store-time.
+    pub params_hash: u64,
+    /// Full prompt token IDs (the SOURCE prompt that produced the snapshot).
+    /// Required so `LcpRegistry::lookup` can compute LCP against new prompts.
+    pub prompt_tokens: Vec<u32>,
+    /// Sliding-window size at store-time. Stored as u64 (over-aligned for
+    /// portability; production sliding_window fits in 32 bits).
+    pub sliding_window: u64,
+    /// Linear-attn capacity at store-time. Same u64 rationale.
+    pub linear_capacity: u64,
+}
+
+/// Serialize a sidecar metadata block (no QH35 envelope around it). The
+/// disk persistor calls this and APPENDS the bytes to the QH35 envelope's
+/// tail.
+pub fn serialize_lcp_sidecar(sidecar: &LcpSidecarMetadata) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        4 + 4 + 32 + 4 + sidecar.tenant_id.len() + 8 + 8
+            + sidecar.prompt_tokens.len() * 4 + 8 + 8,
+    );
+    out.extend_from_slice(&QH3M_SIDECAR_MAGIC);
+    write_u32_le(&mut out, QH3M_SIDECAR_VERSION);
+    out.extend_from_slice(&sidecar.model_fingerprint.0);
+    write_u32_le(&mut out, sidecar.tenant_id.len() as u32);
+    out.extend_from_slice(sidecar.tenant_id.as_bytes());
+    write_u64_le(&mut out, sidecar.params_hash);
+    write_u64_le(&mut out, sidecar.prompt_tokens.len() as u64);
+    for &tok in &sidecar.prompt_tokens {
+        write_u32_le(&mut out, tok);
+    }
+    write_u64_le(&mut out, sidecar.sliding_window);
+    write_u64_le(&mut out, sidecar.linear_capacity);
+    out
+}
+
+/// Deserialize a sidecar metadata block from `bytes` starting at `*cursor`.
+/// Advances `*cursor` past the consumed bytes.
+pub fn deserialize_lcp_sidecar(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<LcpSidecarMetadata> {
+    let magic = read_bytes(bytes, cursor, 4)?;
+    ensure!(
+        magic == QH3M_SIDECAR_MAGIC,
+        "QH3M sidecar deserialize: bad magic {:?} (expected {:?})",
+        magic,
+        QH3M_SIDECAR_MAGIC
+    );
+    let version = read_u32_le(bytes, cursor)?;
+    ensure!(
+        version == QH3M_SIDECAR_VERSION,
+        "QH3M sidecar deserialize: unsupported version {} (expected {})",
+        version,
+        QH3M_SIDECAR_VERSION
+    );
+    let mut fp_bytes = [0u8; 32];
+    fp_bytes.copy_from_slice(read_bytes(bytes, cursor, 32)?);
+    let model_fingerprint = ModelFingerprint(fp_bytes);
+    let tenant_len = read_u32_le(bytes, cursor)? as usize;
+    // Hard cap on tenant_id len to bound the alloc + reject obviously
+    // corrupt envelopes early. Production tenant_ids are short
+    // identifiers (e.g. "default", "qwen35:lcp_chunk:64").
+    ensure!(
+        tenant_len <= 64 * 1024,
+        "QH3M sidecar deserialize: tenant_id length {} exceeds 64 KiB cap",
+        tenant_len
+    );
+    let tenant_bytes = read_bytes(bytes, cursor, tenant_len)?;
+    let tenant_id = std::str::from_utf8(tenant_bytes)
+        .map_err(|e| anyhow!("QH3M sidecar deserialize: tenant_id not UTF-8: {e}"))?
+        .to_string();
+    let params_hash = read_u64_le(bytes, cursor)?;
+    let prompt_tokens_count = read_u64_le(bytes, cursor)? as usize;
+    // Prompt-token cap matches the largest reasonable single-prompt size
+    // (production prompts < 2 MiB tokens × 4 = 8 MiB).
+    ensure!(
+        prompt_tokens_count <= 16 * 1024 * 1024,
+        "QH3M sidecar deserialize: prompt_tokens count {} exceeds 16M cap",
+        prompt_tokens_count
+    );
+    let mut prompt_tokens = Vec::with_capacity(prompt_tokens_count);
+    for _ in 0..prompt_tokens_count {
+        prompt_tokens.push(read_u32_le(bytes, cursor)?);
+    }
+    let sliding_window = read_u64_le(bytes, cursor)?;
+    let linear_capacity = read_u64_le(bytes, cursor)?;
+    Ok(LcpSidecarMetadata {
+        model_fingerprint,
+        tenant_id,
+        params_hash,
+        prompt_tokens,
+        sliding_window,
+        linear_capacity,
+    })
+}
+
+/// Compose the snapshot envelope + sidecar block into a single Vec<u8>.
+/// The disk persistor uses this as its write codec; the sidecar tail
+/// allows the cold-start hydrate path to reinsert the snapshot back into
+/// `LcpRegistry` with the original key + prompt + capacity fields.
+pub fn serialize_hybrid_with_sidecar(
+    snapshot: &HybridKvCacheSnapshot,
+    cfg: &Qwen35HybridConfig,
+    sidecar: &LcpSidecarMetadata,
+) -> Result<Vec<u8>> {
+    let mut out = serialize_hybrid_snapshot(snapshot, cfg)?;
+    out.extend_from_slice(&serialize_lcp_sidecar(sidecar));
+    Ok(out)
+}
+
+/// Round-trip pair of `serialize_hybrid_with_sidecar`. Returns the
+/// reconstructed snapshot AND the sidecar metadata; the disk persistor
+/// uses the sidecar to re-insert into the in-memory LcpRegistry.
+pub fn deserialize_hybrid_with_sidecar(
+    bytes: &[u8],
+    cfg: &Qwen35HybridConfig,
+    device: &MlxDevice,
+) -> Result<(HybridKvCacheSnapshot, LcpSidecarMetadata)> {
+    let mut cursor = 0usize;
+    let snap = deserialize_hybrid_snapshot_at_cursor(bytes, &mut cursor, cfg, device)?;
+    let sidecar = deserialize_lcp_sidecar(bytes, &mut cursor)
+        .context("QH35-with-sidecar: sidecar block missing or invalid at envelope tail")?;
+    Ok((snap, sidecar))
 }
 
 // ---------------------------------------------------------------------------
@@ -1352,5 +1548,151 @@ mod tests {
             msg.contains("linear_conv") && msg.contains("byte_len"),
             "expected linear_conv byte_len error, got: {msg}"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-027 Phase A iter-6b.3 — sidecar codec round-trip tests
+    // ──────────────────────────────────────────────────────────────────
+
+    fn synth_sidecar() -> LcpSidecarMetadata {
+        // Deterministic byte pattern across the fingerprint so tests are
+        // reproducible.
+        let mut fp = [0u8; 32];
+        for (i, b) in fp.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(13).wrapping_add(17);
+        }
+        LcpSidecarMetadata {
+            model_fingerprint: ModelFingerprint(fp),
+            tenant_id: "qwen35:lcp_chunk:64".to_string(),
+            params_hash: 0xDEADBEEF_CAFEBABE,
+            prompt_tokens: vec![1, 2, 3, 4, 5, 100, 200, 300, 400, 500],
+            sliding_window: 8192,
+            linear_capacity: 4096,
+        }
+    }
+
+    #[test]
+    fn qh3m_sidecar_codec_byte_round_trip() {
+        let sidecar = synth_sidecar();
+        let bytes = serialize_lcp_sidecar(&sidecar);
+        let mut cursor = 0usize;
+        let restored = deserialize_lcp_sidecar(&bytes, &mut cursor)
+            .expect("deserialize_lcp_sidecar");
+        assert_eq!(cursor, bytes.len(), "sidecar codec must consume all bytes");
+        assert_eq!(restored, sidecar);
+    }
+
+    #[test]
+    fn qh3m_sidecar_codec_rejects_bad_magic() {
+        let sidecar = synth_sidecar();
+        let mut bytes = serialize_lcp_sidecar(&sidecar);
+        bytes[0] = b'Z';
+        let mut cursor = 0usize;
+        let err = deserialize_lcp_sidecar(&bytes, &mut cursor).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("bad magic"),
+            "expected bad-magic error"
+        );
+    }
+
+    #[test]
+    fn qh3m_sidecar_codec_rejects_version_drift() {
+        let sidecar = synth_sidecar();
+        let mut bytes = serialize_lcp_sidecar(&sidecar);
+        // version is at offset 4..8 (LE u32). Bump to 99.
+        bytes[4..8].copy_from_slice(&99u32.to_le_bytes());
+        let mut cursor = 0usize;
+        let err = deserialize_lcp_sidecar(&bytes, &mut cursor).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("version"),
+            "expected version-drift error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn qh35_with_sidecar_round_trip_byte_equal() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = synth_cfg_full(2, 3, true, 1);
+        let snap = synth_full_plus_linear_plus_mtp_snapshot(&device, &cfg);
+        let sidecar = synth_sidecar();
+        let bytes = serialize_hybrid_with_sidecar(&snap, &cfg, &sidecar)
+            .expect("serialize_hybrid_with_sidecar");
+        let (restored_snap, restored_sidecar) =
+            deserialize_hybrid_with_sidecar(&bytes, &cfg, &device)
+                .expect("deserialize_hybrid_with_sidecar");
+        assert!(snapshots_byte_equal(&snap, &restored_snap));
+        assert_eq!(restored_sidecar, sidecar);
+    }
+
+    #[test]
+    fn qh35_with_sidecar_full_attn_only_round_trip() {
+        // Edge case: the lightest snapshot (full-attn only, no linear, no
+        // MTP) still round-trips with sidecar appended.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = synth_cfg(1, 1);
+        let snap = synth_full_attn_only_snapshot(&device, &cfg);
+        let sidecar = synth_sidecar();
+        let bytes = serialize_hybrid_with_sidecar(&snap, &cfg, &sidecar)
+            .expect("serialize_hybrid_with_sidecar");
+        let (restored_snap, restored_sidecar) =
+            deserialize_hybrid_with_sidecar(&bytes, &cfg, &device)
+                .expect("deserialize_hybrid_with_sidecar");
+        assert!(snapshots_byte_equal(&snap, &restored_snap));
+        assert_eq!(restored_sidecar, sidecar);
+    }
+
+    #[test]
+    fn qh35_with_sidecar_rejects_truncated_envelope() {
+        // Truncate the bytes BEFORE the sidecar magic — deserialize must
+        // fail loudly rather than silently returning a default sidecar.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = synth_cfg(1, 1);
+        let snap = synth_full_attn_only_snapshot(&device, &cfg);
+        let sidecar = synth_sidecar();
+        let bytes = serialize_hybrid_with_sidecar(&snap, &cfg, &sidecar)
+            .expect("serialize");
+        // Drop the sidecar tail entirely — only the snapshot remains.
+        let truncated = &bytes[..bytes.len() - serialize_lcp_sidecar(&sidecar).len()];
+        let err = deserialize_hybrid_with_sidecar(truncated, &cfg, &device).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sidecar block missing")
+                || msg.contains("OOB")
+                || msg.contains("bad magic"),
+            "expected truncated-envelope error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn qh3m_sidecar_empty_prompt_tokens_round_trip() {
+        // Defensive: sidecar with empty prompt_tokens still round-trips.
+        // (LcpRegistry::store rejects empty prompts at insert-time, so
+        // production never writes such a sidecar — but the codec must
+        // handle it cleanly so a bad write doesn't poison the cache dir.)
+        let mut sidecar = synth_sidecar();
+        sidecar.prompt_tokens.clear();
+        let bytes = serialize_lcp_sidecar(&sidecar);
+        let mut cursor = 0usize;
+        let restored = deserialize_lcp_sidecar(&bytes, &mut cursor).expect("deserialize");
+        assert_eq!(cursor, bytes.len());
+        assert_eq!(restored, sidecar);
     }
 }
