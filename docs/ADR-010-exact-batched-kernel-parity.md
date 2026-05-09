@@ -330,6 +330,11 @@ For this project phase the sliding_wrap 752-byte batched-vs-batched ceiling is *
 
   Iter-73 default if no operator pick: pivot to ADR-010 L6 MoE sensitivity attack (router matmul exact alignment) since the prefill default-on flip is the next user-visible win after iter-64/68 made batched correct + fast.
 
+- 2026-05-09 (iter-73 SHADER-COMPILE REGRESSION GATE LANDED at mlx-native `91f174b`): Pivot from L6 MoE sensitivity (multi-week scope) to a small-but-real iter-68 follow-up: full `xcrun -sdk macosx metal -c` compile-sweep across all 106 mlx-native shader files reveals 0 hidden typos at HEAD. Added permanent gate `mlx-native/tests/test_all_shaders_compile.rs` (~86 LOC, Apple-only via `cfg(target_vendor = "apple")`) that compiles every `.metal` source at test time and FAILs loudly on any compile error. Warnings tolerated (don't affect pipeline registration); only `xcrun` non-zero exit fails. Verification: at HEAD = 106 shaders compile clean, PASS; manually reinserted iter-68 typo = FAIL; restored = PASS. Closes the original "no automated gate prevented iter-68's silent 3-week regression" gap.
+
+  Same logic as iter-65's batched-prefill coherence gate, but at the pipeline-registration layer. Both gates now lock in different aspects of the iter-64/68 work: iter-65 catches functional regression (batched output gibberish); iter-73 catches build-time shader-compile regression (silent runtime fallback to slow path).
+
+
 
 
 
