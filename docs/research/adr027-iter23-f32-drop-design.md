@@ -66,7 +66,66 @@ The refactor splits into 5 sub-iters. Each ships a complete deliverable + passes
 
 **Acceptance:** `HybridKvCache` knows its own TQ-active state; future iters branch on it.
 
-### iter-23c — `FullAttnKvSlot.k/v` Optional-ization (the big one)
+### iter-30 EMPIRICAL FINDING — iter-23c-β requires TQ-aware prefill SDPA
+
+**Discovered 2026-05-09 during iter-30 attempt:**
+
+iter-23c-β (drop F32 K/V alloc when `tq_kv_active=true`) is gated on a
+TQ-aware prefill SDPA path that does NOT exist in mlx-native. Today's
+qwen35 prefill pipeline is:
+
+1. `apply_sdpa_with_kv_cache` writes K/V into the cache via
+   `write_kv_with_optional_tq_encode` — F32 K/V buffers always written;
+   TQ encode runs additionally when `slot.tq.is_some()` (shadow-cache).
+2. Prefill SDPA reads from the F32 K/V buffers via either
+   `apply_flash_attn_prefill_seq_major_resume` (production fast path)
+   or `sdpa` (small-fixture fallback). Neither has a TQ-aware variant.
+3. Decode SDPA reads F32 OR TQ via `dispatch_decode_sdpa_with_optional_tq`
+   (iter-15) — has both paths.
+
+So in TQ mode today the F32 K/V buffer is REQUIRED for prefill SDPA
+reads. Dropping it at alloc time would break prefill. Architectural
+gap: qwen35 has TQ-decode but not TQ-prefill.
+
+Comparison to Gemma (precedent at `forward_mlx.rs:3135+`):
+- Gemma's `dense_kvs: Option<Vec<Arc<DenseKvBuffers>>>` CAN be None
+  because Gemma's prefill ALSO has a TQ-aware path that reads
+  `leg_hb_encoded` directly. qwen35 lacks the analogous prefill kernel.
+
+**Available scaffolding** (verified during iter-30):
+- `dispatch_tq_dequantize_hb_kv` (per-position): exists. mlx-native
+  `src/ops/tq_dequantize_kv.rs:166+`. Reads byte-packed 5/6/8-bit
+  indices at one cache position, writes [num_kv_heads, head_dim] F32
+  in FWHT-rotated domain.
+- iter-30 LANDED: `dispatch_tq_dequantize_hb_kv_seq` (sequence-batch).
+  Same kernel chassis but reads `[start_pos..start_pos+n_tokens)` in
+  one dispatch via `(num_kv_heads × n_tokens)` threadgroups. Output
+  layout `[num_kv_heads, n_tokens, head_dim]` matches hf2q's full-attn
+  KV cache layout. **Parity contract verified**: at `n_tokens=1` byte-
+  identical to per-position dispatcher.
+
+**Refined plan (post-iter-30 empirical correction):**
+
+Replace original iter-23c monolith with split sequence:
+
+| Sub-iter | Scope | LOC | Acceptance |
+|----------|-------|-----|------------|
+| 23c-α (LANDED iter-29) | `Option<MlxBuffer>` types + read-site expects | ~250 | sweep PASS |
+| 23c-β.1 (LANDED iter-30) | mlx-native `dispatch_tq_dequantize_hb_kv_seq` | ~310 | parity test PASS |
+| 23c-β.2 (NEXT iter-31+) | hf2q TQ-aware prefill: alloc temp F32 per-step → dequant_seq → SDPA reads temp → free temp | ~150 | sweep PASS, prefill TTFT regression < 5% |
+| 23c-β.3 | Drop persistent F32 K/V alloc when `tq_kv_active=true` | ~50 | regression-pin: `f32_k_v_bytes==0`; sweep PASS |
+
+iter-23d (codec already supports None via iter-27 codec v2) and 23e
+(LANDED memory + ADR header) follow as originally planned.
+
+**Total scope vs original projection:** the dossier projected ~150 LOC
+across 5 files for iter-23c. Empirical finding: ~760 LOC across 8 files
+(iter-29 250 + iter-30 310 + iter-31 150 + iter-32 50). The original
+dossier missed the prefill kernel gap entirely — iter-30's
+investigation is the load-bearing measurement.
+
+### iter-23c — `FullAttnKvSlot.k/v` Optional-ization (the big one) [SUPERSEDED]
+*Superseded by the iter-30-derived split above. Retained for context only.*
 
 **Scope (5 files, ~150 LOC):**
 - `kv_cache.rs`:
