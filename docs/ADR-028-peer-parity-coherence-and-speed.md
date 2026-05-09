@@ -2537,6 +2537,28 @@ Per operator's "no shortcuts, do it right" — Path A is the next
 investment. The infrastructure is now identified
 (`forward_prefill_batched`).
 
+### iter-133: gemma4 fixture clarification — no actionable regression
+
+iter-128 measured gemma4-26B-A4B-APEX-Q5_K_M at 0.71× peer. Historical
+ADR-015 iter51 standing matrix had "gemma 26B dwq | 1.0172× peer" —
+suggesting a regression. iter-133 verified:
+
+- ADR-015 iter51's gemma fixture was `gemma 26B dwq` (likely Q4 quant
+  from `gemma-4-26B-A4B-it-ara-abliterated-dwq` series).
+- Today's only available gemma fixture is the APEX-Q5_K_M variant
+  (`gemma4-ara-2pass-APEX-Q5_K_M.gguf`).
+- llama.cpp peer at APEX-Q5_K_M = 102 t/s; we're at 63 t/s long-context.
+- These are NOT directly comparable to iter51's dwq (different quant,
+  different bandwidth pressure).
+
+**No actionable regression identified.** The 0.71× peer ratio at
+gemma4-APEX-Q5_K_M is the genuine current-state perf for this fixture.
+
+Closure for gemma4 still requires structural levers per iter-128:
+- Path A spec-decode (Phase 2 GPU, ~200-300 LOC)
+- DS4-style fused MoE-FFN (~150-200 LOC if dispatch encode dominates)
+- Q5_K_M → Q4_K (operator decision, quality cost)
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
