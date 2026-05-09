@@ -478,6 +478,54 @@ pub struct HybridKvCacheSnapshot {
     pub linear_recurrent: Vec<MlxBuffer>,
 }
 
+/// ADR-027 Phase B iter-18 — full-attention KV byte breakdown.
+///
+/// Returned by [`HybridKvCache::full_attn_bytes_breakdown`]. Captures
+/// per-component byte counts so operators can quantify TQ memory cost
+/// vs F32 baseline empirically (and verify the iter-19 F32-drop savings
+/// land as projected).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FullAttnKvBytesBreakdown {
+    /// Sum of `slot.k.byte_len() + slot.v.byte_len()` across every
+    /// full-attn slot (regular + optional MTP). Always non-zero today;
+    /// iter-19 will make this zero in TQ mode.
+    pub f32_k_v_bytes: usize,
+    /// Sum of `slot.tq.k_packed.byte_len() + slot.tq.v_packed.byte_len()`
+    /// across every TQ-active slot. Zero when `tq_kv_active=false`.
+    pub tq_packed_bytes: usize,
+    /// Sum of `slot.tq.k_norms.byte_len() + slot.tq.v_norms.byte_len()`
+    /// across every TQ-active slot. Zero when `tq_kv_active=false`.
+    pub tq_norms_bytes: usize,
+    /// Number of full-attn slots in `full_attn` (does NOT include MTP).
+    pub n_full_attn_slots: usize,
+    /// `true` iff `mtp_slot` is `Some` (one extra slot's worth of bytes
+    /// is in the totals above).
+    pub has_mtp_slot: bool,
+}
+
+impl FullAttnKvBytesBreakdown {
+    /// Total bytes (F32 + TQ packed + TQ norms). Useful for `kv_alloc`
+    /// banner reporting + memory budget enforcement.
+    pub fn total_bytes(&self) -> usize {
+        self.f32_k_v_bytes + self.tq_packed_bytes + self.tq_norms_bytes
+    }
+
+    /// Total TQ bytes (packed + norms). Zero when not in TQ mode.
+    pub fn tq_total_bytes(&self) -> usize {
+        self.tq_packed_bytes + self.tq_norms_bytes
+    }
+
+    /// Projected savings ratio (`f32_bytes / tq_bytes`) once iter-19
+    /// drops the F32 backing. Returns `None` when `tq_total_bytes() == 0`
+    /// (legacy F32-only path; no TQ buffers to compare against).
+    pub fn projected_iter19_savings_ratio(&self) -> Option<f64> {
+        if self.tq_total_bytes() == 0 {
+            return None;
+        }
+        Some(self.f32_k_v_bytes as f64 / self.tq_total_bytes() as f64)
+    }
+}
+
 /// MTP slot snapshot — same shape as a `FullAttnKvSlot` snapshot but kept
 /// as a dedicated struct so `Option<MtpKvSnapshot>` is explicit rather
 /// than overloading `full_attn_k`/`full_attn_v` with a sentinel.
@@ -903,6 +951,51 @@ impl HybridKvCache {
     /// slot in this cache.
     pub fn slot_index_for_layer(&self, layer_idx: u32) -> Option<LayerSlot> {
         self.per_layer_slot.get(layer_idx as usize).copied()
+    }
+
+    /// ADR-027 Phase B iter-18 — full-attention KV memory breakdown.
+    ///
+    /// Sums byte counts across every full-attn slot (regular + optional
+    /// MTP) split into:
+    /// - F32 K/V backing buffers (legacy + shadow-cache mode)
+    /// - TQ packed indices (U8, present iff `tq_kv_active=true`)
+    /// - TQ per-position norms (F32, present iff `tq_kv_active=true`)
+    ///
+    /// **Operator-driven mantra**: "TQ for all models we support, as well
+    /// or better than peers." Peer KV-quant systems (KIVI, vLLM) ship
+    /// 3-4× memory savings vs F32. Iter-15 wired the TQ chain alongside
+    /// F32 (shadow cache) so output matches F32 byte-identically; iter-19
+    /// will drop the F32 backing in TQ mode for the full 3.94× savings
+    /// at qwen36 8K shape (33.55 MB F32 → 8.52 MB TQ per slot).
+    ///
+    /// This method gives operators the empirical numbers to size that
+    /// gap before iter-19 lands. Tests pin the breakdown at qwen36 8K
+    /// AND 32K shapes so any silent allocator drift surfaces immediately.
+    pub fn full_attn_bytes_breakdown(&self) -> FullAttnKvBytesBreakdown {
+        let mut f32_k_v_bytes: usize = 0;
+        let mut tq_packed_bytes: usize = 0;
+        let mut tq_norms_bytes: usize = 0;
+        for slot in &self.full_attn {
+            f32_k_v_bytes += slot.k.byte_len() + slot.v.byte_len();
+            if let Some(tq) = &slot.tq {
+                tq_packed_bytes += tq.k_packed.byte_len() + tq.v_packed.byte_len();
+                tq_norms_bytes += tq.k_norms.byte_len() + tq.v_norms.byte_len();
+            }
+        }
+        if let Some(slot) = self.mtp_slot.as_ref() {
+            f32_k_v_bytes += slot.k.byte_len() + slot.v.byte_len();
+            if let Some(tq) = &slot.tq {
+                tq_packed_bytes += tq.k_packed.byte_len() + tq.v_packed.byte_len();
+                tq_norms_bytes += tq.k_norms.byte_len() + tq.v_norms.byte_len();
+            }
+        }
+        FullAttnKvBytesBreakdown {
+            f32_k_v_bytes,
+            tq_packed_bytes,
+            tq_norms_bytes,
+            n_full_attn_slots: self.full_attn.len(),
+            has_mtp_slot: self.mtp_slot.is_some(),
+        }
     }
 
     /// Reset all per-seq write cursors and zero out the recurrent/conv state.
@@ -3575,6 +3668,161 @@ mod tests {
             slot_seq.tq.as_ref().unwrap().k_norms.as_slice::<f32>().unwrap(),
             "src_tok_offset semantics mismatch on k_norms"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-027 Phase B iter-18 — full-attn KV memory breakdown tests
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn full_attn_bytes_breakdown_tq_off_only_f32_at_qwen36_8k() {
+        // Default F32 path at qwen36 8K shape: every full-attn slot has
+        // F32 K + V (16 MB each at 1×2×8192×256×4 = 16,777,216 bytes per
+        // buffer). TQ counts must be zero (no shadow-cache when env=0).
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        // At default_layer_types(40, 4), every 4th layer is full-attn:
+        // layers [0, 4, 8, 12, 16, 20, 24, 28, 32, 36] = 10 full-attn slots.
+        let cache = HybridKvCache::new_with_options(&cfg, &device, 8192, 1, false)
+            .expect("kv tq-off");
+        let breakdown = cache.full_attn_bytes_breakdown();
+        assert_eq!(breakdown.n_full_attn_slots, 10);
+        assert!(!breakdown.has_mtp_slot, "moe_cfg_40layer has no MTP");
+        // Per-slot F32 K+V = 2 * 16_777_216 = 33_554_432 bytes.
+        // 10 slots × 33_554_432 = 335_544_320 bytes total.
+        assert_eq!(breakdown.f32_k_v_bytes, 10 * 33_554_432);
+        assert_eq!(breakdown.tq_packed_bytes, 0);
+        assert_eq!(breakdown.tq_norms_bytes, 0);
+        assert_eq!(breakdown.total_bytes(), 335_544_320);
+        assert_eq!(breakdown.projected_iter19_savings_ratio(), None);
+    }
+
+    #[test]
+    fn full_attn_bytes_breakdown_tq_on_shadow_at_qwen36_8k() {
+        // Shadow-cache mode (iter-15 design): F32 + TQ both alloc.
+        // Per slot: F32 K+V = 33_554_432 + TQ packed K+V = 8_388_608
+        // + TQ norms K+V = 131_072 = 42_074_112 bytes.
+        // 10 slots × 42_074_112 = 420_741_120 bytes total.
+        // Projected iter-19 savings ratio per slot:
+        //   f32_bytes / tq_bytes = 33_554_432 / 8_519_680 ≈ 3.94×
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache = HybridKvCache::new_with_options(&cfg, &device, 8192, 1, true)
+            .expect("kv tq-on");
+        let breakdown = cache.full_attn_bytes_breakdown();
+        assert_eq!(breakdown.n_full_attn_slots, 10);
+        assert!(!breakdown.has_mtp_slot);
+        // F32 backing unchanged from tq_off.
+        assert_eq!(breakdown.f32_k_v_bytes, 10 * 33_554_432);
+        // TQ packed: 1×2×8192×256 (U8) = 4_194_304 per K, ×2 (K+V) ×10 slots.
+        assert_eq!(breakdown.tq_packed_bytes, 10 * 2 * 4_194_304);
+        // TQ norms: 1×2×8192×1 (F32) = 65_536 per K, ×2 (K+V) ×10 slots.
+        assert_eq!(breakdown.tq_norms_bytes, 10 * 2 * 65_536);
+        // Total = 335_544_320 (F32) + 83_886_080 (TQ packed) + 1_310_720 (TQ norms).
+        assert_eq!(breakdown.total_bytes(), 420_741_120);
+        // Projected iter-19 savings — drop F32 leaves only TQ.
+        let ratio = breakdown.projected_iter19_savings_ratio().unwrap();
+        assert!(
+            (3.5..=4.5).contains(&ratio),
+            "projected_iter19_savings_ratio {ratio:.4} outside expected [3.5, 4.5] window"
+        );
+    }
+
+    #[test]
+    fn full_attn_bytes_breakdown_tq_on_shadow_at_qwen36_32k() {
+        // 32K context — verifies the §1 ADR claim at production-realistic
+        // scale (max_seq_len=32768). Per slot: F32 K+V = 4× 8K =
+        // 134_217_728; TQ packed K+V = 4× 8K = 33_554_432; TQ norms K+V
+        // = 4× 8K = 524_288. Per-slot total in shadow mode = 168_296_448.
+        // 10 slots × 168_296_448 = 1_682_964_480 bytes ≈ 1.57 GiB.
+        // Iter-19 target: 10 × 34_078_720 (TQ only) = 340_787_200 bytes ≈ 325 MiB.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache = HybridKvCache::new_with_options(&cfg, &device, 32768, 1, true)
+            .expect("kv tq-on at 32K");
+        let breakdown = cache.full_attn_bytes_breakdown();
+        assert_eq!(breakdown.n_full_attn_slots, 10);
+        assert_eq!(breakdown.f32_k_v_bytes, 10 * 134_217_728);
+        assert_eq!(breakdown.tq_packed_bytes, 10 * 33_554_432);
+        assert_eq!(breakdown.tq_norms_bytes, 10 * 524_288);
+        assert_eq!(breakdown.total_bytes(), 1_682_964_480);
+        // The §1 ADR table claim: post-iter-19 total = ~340 MiB at 32K
+        // (down from F32-only 1.34 GB). Verify the projection holds.
+        let projected_iter19_total =
+            breakdown.tq_total_bytes();
+        assert_eq!(projected_iter19_total, 340_787_200); // ~325 MiB
+        // §1 says "1.34 GB total" for F32 dense at 32K → matches our
+        // 1_342_177_280 = 10 × 134_217_728 byte count exactly.
+        assert_eq!(breakdown.f32_k_v_bytes, 1_342_177_280);
+        // Savings ratio at 32K should match 8K (shape-invariant).
+        let ratio = breakdown.projected_iter19_savings_ratio().unwrap();
+        assert!(
+            (3.5..=4.5).contains(&ratio),
+            "32K savings ratio {ratio:.4} outside [3.5, 4.5]"
+        );
+    }
+
+    #[test]
+    fn full_attn_bytes_breakdown_with_mtp_includes_mtp_slot() {
+        // MTP slot bytes count toward both F32 and TQ totals.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let mut cfg = moe_cfg_40layer();
+        cfg.mtp_num_hidden_layers = 1;
+        let cache = HybridKvCache::new_with_options(&cfg, &device, 1024, 1, true)
+            .expect("kv tq-on with mtp");
+        let breakdown = cache.full_attn_bytes_breakdown();
+        assert!(breakdown.has_mtp_slot);
+        // 10 regular full-attn + 1 MTP = 11 slots' worth.
+        let per_slot_f32 = 1 * 2 * 1024 * 256 * 4 * 2; // K + V
+        let per_slot_tq_packed = 1 * 2 * 1024 * 256 * 2;
+        let per_slot_tq_norms = 1 * 2 * 1024 * 1 * 4 * 2;
+        assert_eq!(breakdown.n_full_attn_slots, 10);
+        assert_eq!(breakdown.f32_k_v_bytes, 11 * per_slot_f32);
+        assert_eq!(breakdown.tq_packed_bytes, 11 * per_slot_tq_packed);
+        assert_eq!(breakdown.tq_norms_bytes, 11 * per_slot_tq_norms);
+    }
+
+    #[test]
+    fn full_attn_bytes_breakdown_tq_off_returns_no_savings_ratio() {
+        // F32-only mode: projected_iter19_savings_ratio() must return
+        // None (no TQ buffers to compare against).
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv legacy");
+        let breakdown = cache.full_attn_bytes_breakdown();
+        assert!(breakdown.tq_packed_bytes == 0);
+        assert!(breakdown.tq_norms_bytes == 0);
+        assert_eq!(breakdown.projected_iter19_savings_ratio(), None);
     }
 
     #[test]
