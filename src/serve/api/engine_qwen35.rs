@@ -158,6 +158,25 @@ pub struct Qwen35LoadedModel {
     /// `read_dir` per cfg per process. Cleared when the engine drops
     /// (process exit).
     pub lcp_hydrated_for_cfg: std::collections::HashSet<String>,
+
+    /// ADR-027 Phase B iter-12 — TQ-active KV cache flag (sourced from
+    /// `HF2Q_TQ_KV` env at engine load via
+    /// `tq_packed_descriptor::is_tq_active_mode()`). When `true`,
+    /// `alloc_kv_cache_for_request` calls
+    /// `HybridKvCache::new_with_options(... tq_kv_active=true)` so
+    /// every per-prefill cache allocates TQ-active full-attn buffers
+    /// alongside the F32 K/V (shadow-cache pattern; iter-N drops the
+    /// F32 backing for full 3.94× memory savings).
+    ///
+    /// **Iter-12 scope:** field + alloc plumbing only. The actual
+    /// per-token encode + SDPA dispatch in `gpu_full_attn::full_attn_
+    /// layer_gpu` is iter-13 scope. Setting this flag without iter-13
+    /// wiring increases per-request memory cost (40 MB extra/slot at
+    /// qwen36 8K shape) but does NOT change inference output —
+    /// the F32 read path stays exclusive until iter-13 swaps in TQ
+    /// SDPA. Mantra-aligned (no-stub): the flag IS load-bearing for
+    /// allocation; iter-13 makes it load-bearing for dispatch.
+    pub tq_kv_active: bool,
 }
 
 impl Qwen35LoadedModel {
@@ -400,6 +419,14 @@ impl Qwen35LoadedModel {
             // for each cfg-fingerprint inserts into this set after a
             // successful hydrate so subsequent prefills skip the I/O.
             lcp_hydrated_for_cfg: std::collections::HashSet::new(),
+            // ADR-027 Phase B iter-12: source HF2Q_TQ_KV env once at
+            // engine load via the same `is_tq_active_mode()` helper
+            // Gemma's tq_packed_descriptor wiring uses (engine.rs:2328).
+            // env unset / "0" / "false" → false (legacy F32 path);
+            // env "1" / "true" → true (TQ-active KV alloc path; iter-13
+            // wires the SDPA dispatch). Per-process flag, captured once
+            // here so the env can't toggle mid-process.
+            tq_kv_active: crate::serve::api::tq_packed_descriptor::is_tq_active_mode(),
         })
     }
 
@@ -915,8 +942,19 @@ fn alloc_kv_cache_for_request(
     let max_seq = (prompt_len + max_tokens + 64)
         .max(128)
         .min(qwen.model.cfg.max_position_embeddings as usize);
-    HybridKvCache::new(&qwen.model.cfg, device, max_seq as u32, 1)
-        .context("HybridKvCache::new")
+    // ADR-027 Phase B iter-12: branch on the engine-load-time
+    // `tq_kv_active` flag (sourced from HF2Q_TQ_KV env). When true,
+    // allocate TQ-active full-attn buffers alongside F32 K/V (shadow
+    // cache). iter-13 wires the per-token encode + SDPA dispatch that
+    // makes these buffers load-bearing in the forward path.
+    HybridKvCache::new_with_options(
+        &qwen.model.cfg,
+        device,
+        max_seq as u32,
+        1,
+        qwen.tq_kv_active,
+    )
+    .context("HybridKvCache::new_with_options")
 }
 
 /// Sample the next token from a `[vocab_size]` logits slice using
@@ -3860,5 +3898,102 @@ mod tests {
             "Wedge-4e: handler must call generate_stream_with_deepstack \
              so soft_tokens + deepstack + positions reach the worker"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-027 Phase B iter-12 — alloc_kv_cache_for_request TQ branching
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Build a synthetic Qwen35LoadedModel with the given `tq_kv_active`
+    /// flag — minimal fixture for testing alloc_kv_cache_for_request
+    /// branching. Mirrors the load_info.rs / engine.rs test fixture
+    /// shape but parameterized on `tq_kv_active`.
+    fn synth_loaded_model_for_alloc_test(
+        cfg: Qwen35Config,
+        tq_kv_active: bool,
+    ) -> Qwen35LoadedModel {
+        Qwen35LoadedModel {
+            model: super::Qwen35Model::empty_from_cfg(cfg),
+            tokenizer: tokenizers::Tokenizer::new(
+                tokenizers::models::bpe::BPE::default(),
+            ),
+            chat_template: "{{ messages }}".to_string(),
+            model_id: "iter-12-test".to_string(),
+            model_path: std::path::PathBuf::from("/tmp/iter-12-test.gguf"),
+            eos_token_ids: vec![151_645],
+            hidden_size: 64,
+            vocab_size: 256,
+            context_length: Some(1024),
+            quant_type: Some("Q4_K".to_string()),
+            load_duration: std::time::Duration::from_millis(1),
+            provenance: crate::serve::provenance::Provenance::External,
+            prompt_cache: HybridPromptCache::new(),
+            lcp_registry:
+                crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
+            kv_metrics_sink: None,
+            disk_persistor: None,
+            lcp_hydrated_for_cfg: std::collections::HashSet::new(),
+            tq_kv_active,
+        }
+    }
+
+    #[test]
+    fn alloc_kv_cache_for_request_tq_off_keeps_full_attn_tq_none() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer_for_cache_test();
+        let qwen = synth_loaded_model_for_alloc_test(cfg, false);
+        let cache = alloc_kv_cache_for_request(&qwen, &device, 32, 16)
+            .expect("alloc_kv_cache_for_request");
+        assert!(
+            !cache.full_attn.is_empty(),
+            "fixture has full-attn layers"
+        );
+        for (i, slot) in cache.full_attn.iter().enumerate() {
+            assert!(
+                slot.tq.is_none(),
+                "tq_kv_active=false: full_attn[{i}].tq must be None \
+                 (legacy F32 path preserved)"
+            );
+        }
+    }
+
+    #[test]
+    fn alloc_kv_cache_for_request_tq_on_populates_tq_per_full_attn_slot() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        // Note: head_dim must be 256 for the TQ kernel chain; the cache
+        // alloc itself succeeds at any head_dim, but iter-13's SDPA
+        // dispatch requires 256/512. Use a real qwen36-shape cfg to
+        // exercise the production allocation path.
+        let mut cfg = moe_cfg_40layer_for_cache_test();
+        cfg.head_dim = 256;
+        cfg.num_attention_heads = 8;
+        cfg.num_key_value_heads = 2;
+        let qwen = synth_loaded_model_for_alloc_test(cfg, true);
+        let cache = alloc_kv_cache_for_request(&qwen, &device, 32, 16)
+            .expect("alloc_kv_cache_for_request");
+        assert!(!cache.full_attn.is_empty());
+        for (i, slot) in cache.full_attn.iter().enumerate() {
+            assert!(
+                slot.tq.is_some(),
+                "tq_kv_active=true: full_attn[{i}].tq must be populated"
+            );
+            let tq = slot.tq.as_ref().unwrap();
+            assert_eq!(
+                tq.norms_per_pos, 1,
+                "head_dim=256 → norms_per_pos=1"
+            );
+        }
     }
 }

@@ -1342,6 +1342,7 @@ mod tests {
             kv_metrics_sink: None,
             disk_persistor: None,
             lcp_hydrated_for_cfg: std::collections::HashSet::new(),
+            tq_kv_active: false,
         };
         let info = loaded.build_load_info(
             &gguf,
