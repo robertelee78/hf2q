@@ -285,6 +285,48 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-113 ADR-029 Phase 1 LANDED — n-gram proposer (no production wire-up)
+
+Per ADR-029-DRAFT §Phasing, lowest-risk phase first. Bit-faithful Rust
+port of vLLM's `_find_longest_matched_ngram_and_propose_tokens` (KMP-
+style longest-prefix-suffix matcher) at `src/inference/spec_decode/
+ngram_proposer.rs`. Pure CPU, no model touch, no GPU, no production
+wire-up — module is publicly exposed but no caller exists.
+
+**Algorithm verbatim from vLLM** (commit-pinned 2026-05-09):
+1. Reverse tokens — suffix match becomes prefix match.
+2. KMP failure-function build computes `lps[i]` = longest prefix of
+   `reversed[..max_ngram]` that's also a suffix of `reversed[..=i]`.
+3. Track `(longest_ngram, position)` pair using `>=` (not `>`) for
+   ties so the EARLIEST occurrence in the original sequence wins —
+   matches vLLM line 253 verbatim.
+4. Map the winning position back to original tokens; return K tokens
+   that followed the matched n-gram.
+
+`NgramConfig::default_for_decode(max_model_len)` returns the
+literature-recommended `{min=1, max=3, k=3}` per iter-99 vLLM/dflash
+synthesis.
+
+**Tests**: 11 unit tests covering edge cases — empty sequences,
+no-match, max-n cap, K truncation, earliest-occurrence tie-break,
+max_model_len clamp, suffix-at-seq-end, zero-max-ngram, zero-K.
+All pass.
+
+**Full suite**: hf2q binary 3415 passed / 0 failed / 10 ignored.
+Zero regressions.
+
+**Risk profile**: code is harmless if operator picks Path B/C
+instead — just delete the module. Phase 2 + 3 remain pending
+operator approval before any production-touching work.
+
+**Iter-114+ blocked on operator approval** for:
+- Phase 2: `forward_decode_verify` (multi-token verify forward,
+  per-position logits, KV-cache rollback — MEDIUM risk)
+- Phase 3: generation-loop integration with sourdough byte-identity
+  gate at K=0
+
+Commit: hf2q `04d53cf`.
+
 ### Iter-112 ADR-029 DRAFT — n-gram speculative decode scope ready for operator
 
 Per iter-110/111 closure, the decode peer gap is structural within the
