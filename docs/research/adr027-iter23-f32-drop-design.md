@@ -1,10 +1,10 @@
 # ADR-027 iter-23: F32 KV Backing Drop — Multi-Iter Refactor Design
 
 - **Date:** 2026-05-09
-- **Status:** Planning (pre-execution)
+- **Status:** **🎯 EXECUTED 2026-05-09** — see [Execution closure](#execution-closure-2026-05-09) at end. Original "Planning (pre-execution)" status superseded by 8-iter chain (iter-29..36) + 13 closure iters (iter-37..49).
 - **Owner:** ADR-027 Phase B continuation
-- **Regression net:** `scripts/adr027-cross-axis-sweep.sh` (iter-21)
-- **Empirical pin:** iter-18 byte-breakdown tests at qwen36 32K shape
+- **Regression net:** `scripts/adr027-cross-axis-sweep.sh` (iter-21) + `scripts/adr027-long-context-sweep.sh` (iter-42) + `scripts/adr027-full-validation.sh` (iter-46) — three layers of operator-runnable validation.
+- **Empirical pin:** iter-18 byte-breakdown tests at qwen36 32K shape; iter-34 regression-pin `full_attn_bytes_breakdown_tq_on_drops_f32_at_qwen36_32k`.
 
 ## Why this dossier exists
 
@@ -281,3 +281,64 @@ Test fixtures:
 - ~8 sites that build synthetic FullAttnKvSlot directly
 
 Total ~30+ sites — tractable per-sub-iter, intractable in one iter.
+
+---
+
+## Execution closure (2026-05-09)
+
+**Status:** ✅ EXECUTED across 8 production iters (29..36) + 13 closure / validation / accuracy iters (37..49). The dossier-projected ~150 LOC scope was empirically corrected at iter-30 to ~760 LOC across 8 files (mlx-native dequant_seq kernel scaffolding had to be built before the F32 alloc could be dropped). Final shipped state matches the **Target state** above exactly.
+
+### Production iters (29..36)
+
+| Iter | Sub-iter | Deliverable | Commit |
+|------|----------|-------------|--------|
+| 29 | 23c-α | `FullAttnKvSlot.k/v: Option<MlxBuffer>` structural prep + 6 production read-site `.expect(...)` panic-pins | hf2q `afac0b9` |
+| 30 | 23c-β.1 | mlx-native `dispatch_tq_dequantize_hb_kv_seq` (sequence-batch dequant kernel) + 2 parity tests | mlx-native `6ddd74e` |
+| 31 | 23c-β.2 | hf2q `FullAttnKvSlot::dequant_seq_to_temp_f32` helper + shadow-cache parity test | hf2q `7334582` |
+| 32 | 23c-β.3 | `dequant_seq_to_temp_f32_unrotated` (NRMSE 0.008 round-trip) | hf2q `5f2748c` |
+| 33 | 23c-β.4 | `apply_flash_attn_prefill_seq_major_resume_via_tq_cache` (NRMSE 0.003 vs F32) | hf2q `f772da1` |
+| 34 | **🎯 23c-β.5** | **F32 K/V alloc dropped + production wire-up (3.94× memory savings LIVE)** | hf2q `fa8cc2b` |
+| 35 | 23d-α | In-memory TQ snapshot + restore | hf2q `c6c0355` |
+| 36 | 23d-β | QH35 codec v3 (`tq_present:u8` per slot) cross-process replay | hf2q `06d117a` |
+
+### Closure iters (37..49)
+
+| Iter | Type | Outcome |
+|------|------|---------|
+| 37 | docs (23e) | ADR §1 footnote + Phase B LANDED memory + MEMORY.md index |
+| 38 | tooling | `bench-needle-haystack.sh` model-agnostic + smoke |
+| 39 | validation | TQ===F32 parity at 9 cells (1024 + 4K + 8K × 3 positions) |
+| 40 | root-cause | Chat-template-induced early-EOS at 4K+ context (NOT TQ regression) |
+| 41 | validation | Direct byte-identity at 5747 / 11487 prefill |
+| 42 | regression net | `adr027-long-context-sweep.sh` (4K + 8K) |
+| 43 | validation | Byte-identity extended to 16K (22948 prefill) AND 32K (45876 prefill) |
+| 44 | validation | E2E cross-process replay with TQ payload byte-identical |
+| 45 | "no broken windows" | mlx-native `mul_mv_ext` peer test debt closed (269/0) |
+| 46 | tooling | `adr027-full-validation.sh` single-command entry point |
+| 47 | accuracy | iter-29 panic-pin messages reference actual landing iter (iter-34) |
+| 48 | UX | Load banner reports realized 3.94× savings + LoadInfo docstring updated |
+| 49 | accuracy | Source-comment cleanup (iter-30 → iter-34 references) |
+
+### Scope correction
+
+| | Original projection | Realized |
+|---|---|---|
+| LOC | ~150 across 5 files | ~760 across 8 files |
+| Iters | 5 (23a..e) | 8 (29..36) for production + 13 closure |
+| Architectural finding | None projected | iter-30 EMPIRICAL FINDING: qwen35 prefill SDPA has no TQ-aware variant; required new mlx-native `dispatch_tq_dequantize_hb_kv_seq` kernel to bridge |
+| Test count | "all existing tests pass + few new" | +21 net new tests across 4 layers (mlx-native kernel parity, hf2q dequant helper, prefill resume helper, E2E disk persistence) |
+
+### Validation matrix (final shipped state)
+
+| Validation layer | Coverage |
+|------------------|----------|
+| Cross-axis sweep (31-tok) | 4 cells BYTE-IDENTICAL |
+| Long-context sweep | 4K + 8K + 16K + 32K BYTE-IDENTICAL |
+| Needle-haystack | TQ===F32 across 9 cells |
+| Disk persistence + cross-process replay | TQ-only payload byte-identical |
+| Memory savings regression-pin | 3.94× at 32K shape (`f32_k_v_bytes==0`, total 340 MiB) |
+| Perf parity | Within 1% F32 baseline at 32K (1106 vs 1116 tok/s prefill) |
+
+### Operator mantra fulfilled
+
+"TQ for all models we support, as well or better than peers." qwen35/qwen36 now ships peer-parity 3.94× per-slot KV-memory savings live, byte-identical decode coherence preserved, cross-process LCP-resume in TQ-only mode correct end-to-end across 4 orders of magnitude of context length (31-tok decode-dominant up to 45876-tok production-realistic prefill).
