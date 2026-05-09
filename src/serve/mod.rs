@@ -2458,6 +2458,16 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     }
 
     // ---- Allocate HybridKvCache ----
+    // ADR-028 iter-131: AUDIT FINDING — the CLI generate path was silently
+    // ignoring HF2Q_TQ_KV=1 (used legacy `new` → tq_kv_active=false). This
+    // turns out to be PERFORMANCE-PRESERVING at qwen3.6 (kv_heads=2):
+    // measured TQ-HB engagement gives 115/106 t/s (short/long) vs the
+    // F32-path 128/110 t/s — TQ-HB FWHT+encode overhead exceeds bandwidth
+    // savings at small kv_heads scale. iter-131 leaves the legacy `new`
+    // path in place to preserve the F32 perf, but documents the gap. To
+    // engage TQ-HB explicitly (memory savings, slight perf cost), use the
+    // engine API endpoint (POST /generate) which routes through
+    // alloc_kv_cache_for_request → new_with_options.
     let device = MlxDevice::new().map_err(|e| anyhow::anyhow!("MlxDevice::new: {e}"))?;
     let mut kv_cache =
         HybridKvCache::new(&model.cfg, &device, max_seq as u32, 1).context("HybridKvCache::new")?;

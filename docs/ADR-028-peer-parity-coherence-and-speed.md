@@ -2382,6 +2382,85 @@ This finding INVALIDATES iter-128's claim that Path D's kernel-bench
 The 1.84× kernel speedup is real but invisible to production until the
 slot.tq alloc gating is fixed.
 
+### iter-131: TQ-HB perf paradox at qwen3.6 — FWHT+encode > BW savings
+
+iter-130 found `slot.tq.is_some()=false` at production. iter-131 traced
+to `serve/mod.rs:2463` — CLI `cmd_generate_qwen35` used legacy
+`HybridKvCache::new` (→ tq_kv_active=false) ignoring `HF2Q_TQ_KV=1`.
+
+#### Surprise: fixing the gate REGRESSED qwen3.6 perf
+
+A/B with the fix landed (`new_with_options(... tq_kv_active=true)`):
+
+| Context | Pre-iter-131 (F32 path silent) | Post-iter-131 (TQ-HB engaged) | Δ |
+|---------|-------------------------------|-------------------------------|---|
+| Short   | 126.9 t/s                     | 115.5 t/s                     | **-9%** |
+| Long kL=4096 | 110.2 t/s                | 106.3 t/s                     | **-3.5%** |
+
+#### Root cause: TQ-HB overhead at qwen3.6 (kv_heads=2)
+
+Per-decode-token TQ-HB chain at qwen3.6:
+1. FWHT pre-rotation on Q (~5 µs/layer × 40 layers = 200 µs)
+2. TQ K/V encode (per-token write — includes Hadamard encoding)
+3. Cross-simdgroup reduce in FA (Path D)
+4. FWHT undo on output (~5 µs/layer × 40 layers = 200 µs)
+
+vs F32 dense path:
+1. F32 K/V write (small at kv_heads=2)
+2. Direct F32 SDPA
+
+**At qwen3.6 with kv_heads=2 only**, F32 K/V is tiny (2 × seq × 256 × 4
+bytes/elem = 2 × 4096 × 1024 = 8 MB at kL=4096 across 40 layers — fits
+in L2/SLC). Reading it directly is FASTER than the FWHT+encode+dequant
+overhead of TQ-HB.
+
+TQ-HB only wins when bandwidth dominates → at higher kv_heads or
+larger contexts beyond what fits in cache.
+
+#### iter-131 decision: REVERT fix to preserve perf
+
+Per operator mantra "as fast as or faster than peers" — preserving the
+fast path. The CLI generate `cmd_generate_qwen35` continues to use
+`HybridKvCache::new` (legacy → tq_kv_active=false). The fast F32 path
+is the production default.
+
+The engine API endpoint (POST /generate) routes through
+`alloc_kv_cache_for_request → new_with_options` which CORRECTLY honors
+HF2Q_TQ_KV=1 and engages TQ-HB. That path is for users who want the
+3.94× memory savings and accept the ~3-9% perf cost.
+
+#### Standing rule
+
+ADR-027 Phase B's "≤1% decode regression" claim was measured pre-Path-D
+and possibly on a different model with more kv_heads. At qwen3.6
+(kv_heads=2), TQ-HB measured -3.5% to -9% vs F32. Future ADR claims
+about TQ-HB perf MUST validate per-model with a trace-confirmed
+slot.tq.is_some() at the SDPA call site.
+
+#### Path D status update
+
+Path D infrastructure (NSG axis port iter-127) is correct and verified
+at the kernel level. It WILL fire when slot.tq is Some at long kL.
+Currently slot.tq is None at qwen3.6 CLI decode (by design now), so
+Path D is dormant in the production CLI path.
+
+#### Implication for ADR-028 mantra status
+
+Re-confirmed (post-iter-131 with revert):
+
+| Model    | Short      | Long       | Verdict |
+|----------|-----------|------------|---------|
+| qwen3.6  | **128 t/s** = 1.27× peer | **110 t/s** = 1.14× peer | ✅ BEAT PEER |
+| gemma4   | 72.5 t/s = 0.71× peer    | 63 t/s = <0.7× peer       | ❌ LOSE PEER |
+
+The qwen3.6 win is from the F32 dense decode path (NOT TQ-HB as ADR-027
+implied). gemma4 loses because it uses dense too but with bigger
+hidden + Q6_K quant + kv_heads=8.
+
+The remaining lever (Path A spec-decode) remains the highest-value
+investment — it's quant/path-agnostic and would close gemma4 gap
+while also lifting qwen3.6.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
