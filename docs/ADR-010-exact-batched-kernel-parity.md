@@ -253,4 +253,19 @@ For this project phase the sliding_wrap 752-byte batched-vs-batched ceiling is *
 
   ADR-022 §5 mm_id row: this is precisely the "AC-5 mv_ext perf parity ≤5% gap" scope that was DEFERRED to ADR-013/015. Iter-67 reopens that deferral with operator-actionable targeting data.
 
+- 2026-05-09 (iter-68 ONE-CHARACTER FIX LANDED at mlx-native `b6b8e79` — tensor mm_id unlocked): While verifying iter-67's hypothesis, `MLX_LOG_TENSOR_PROBE=1` revealed `tensor_mm_id probe: FAILED (falling back to simdgroup MMA)`. Direct `xcrun -sdk macosx metal -c quantized_matmul_id_mm_tensor.metal` exposed: `error: unknown type name 'GgmlMatmulIdMm_TensorParams'; did you mean 'GgmlMatmulIdMmTensor_MmParams'?` at line 447 (Q5_K template instantiation). Per-source compile failure → ALL tensor mm_id pipelines (Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q5_1, IQ4_NL) failed to register → dispatcher fell back to simdgroup MMA for the entire mm_id family. iter-67's hypothesis (B-tile half-vs-float in simdgroup variant) was technically correct but the ROOT CAUSE was a typo upstream of that decision. Single character fix unlocks the M5 Max tensor cores via the all-half MPP::tensor_ops::matmul2d primitive (ADR-011 P3b-tensor design).
+
+  Validation on gemma4-ara-2pass-APEX-Q5_K_M.gguf:
+
+| pp   | iter-65 (simdgroup) | iter-68 (tensor) | speedup | vs llama.cpp |
+|------|--------------------:|-----------------:|--------:|-------------:|
+| 128  |    490 t/s          |    609 t/s       |  1.24×  |  0.36×       |
+| 512  |   1125 t/s          |   1477 t/s       |  1.31×  |  0.57×       |
+| 1024 |   1451 t/s          |   1942 t/s       |  1.34×  |  **1.03× BEATS** |
+| 2455 |   1737 t/s          |   2329 t/s       |  1.34×  |  0.77×       |
+
+  At pp1024 hf2q now exceeds llama.cpp on Gemma-4 batched prefill. mlx-native parity tests still PASS (9/9 + 2/2). hf2q ADR-010 iter-64 batched-prefill regression gate still PASS. Closes ADR-022 §5 mm_id "AC-5 perf parity" deferral on K-quants. The residual 0.77× at pp2455 is now smaller, separately diagnosable, and lower priority than the bit-rot it replaced.
+
+  Speedup over per-token DEFAULT (cumulative iter-64 + iter-68): pp1024 = **29×**, pp2455 = **35×**.
+
 
