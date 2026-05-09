@@ -178,15 +178,17 @@ mod tests {
             resident_weight_bytes: Some((16.42_f64 * 1024.0 * 1024.0 * 1024.0).round() as u64),
             kv_cache_budget_bytes: None,
             kv_spill_active: false,
+            tq_kv_active: false,
         };
         let mut buf = Vec::new();
         print_banner(&info, &mut buf, false).expect("print banner");
         let s = String::from_utf8(buf).expect("utf8");
-        // Per design-doc §5.1 the banner is exactly 13 lines.
+        // ADR-027 Phase B iter-17: banner gained `tq_kv = ...` line, so
+        // the count is now 14 (was 13 per design-doc §5.1).
         assert_eq!(
             s.lines().count(),
-            13,
-            "expected 13-line banner, got\n{s}"
+            14,
+            "expected 14-line banner (post-iter-17 tq_kv addition), got\n{s}"
         );
         // Per-line shape: every line begins with `hf2q load: `.
         for line in s.lines() {

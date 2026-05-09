@@ -862,6 +862,7 @@ fn synthetic_load_info(model_id: &str) -> Arc<LoadInfo> {
         resident_weight_bytes: None,
         kv_cache_budget_bytes: None,
         kv_spill_active: false,
+        tq_kv_active: false,
     })
 }
 
@@ -2196,6 +2197,11 @@ impl LoadInfoBuilder for GemmaLoadedModel {
             resident_weight_bytes: None,
             kv_cache_budget_bytes,
             kv_spill_active,
+            // ADR-027 Phase B iter-17: Gemma's TQ-on state lives in
+            // the engine-level `tq_packed_descriptor` (different
+            // mechanism); always false at the per-load level here.
+            // Future iter may unify Gemma + qwen35 surfacing.
+            tq_kv_active: false,
         }
     }
 }

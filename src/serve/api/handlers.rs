@@ -7406,6 +7406,7 @@ mod tests {
             resident_weight_bytes: Some(14_000_000_000),
             kv_cache_budget_bytes: Some(4 * 1024 * 1024 * 1024),
             kv_spill_active: false,
+            tq_kv_active: false,
         }
     }
 
@@ -7453,6 +7454,7 @@ mod tests {
             resident_weight_bytes: Some(17_000_000_000),
             kv_cache_budget_bytes: None,
             kv_spill_active: true,
+            tq_kv_active: false,
         }
     }
 

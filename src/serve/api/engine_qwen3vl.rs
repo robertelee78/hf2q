@@ -266,6 +266,10 @@ impl LoadInfoBuilder for Qwen3VlTextLoadedModel {
             resident_weight_bytes: None,
             kv_cache_budget_bytes,
             kv_spill_active,
+            // ADR-027 Phase B iter-17: Qwen3-VL has no TQ wiring yet
+            // (text path forward landed iter-228b without TQ). Always
+            // false until a future iter ports ADR-027 to qwen3vl_text.
+            tq_kv_active: false,
         }
     }
 }

@@ -4963,6 +4963,7 @@ mod tests {
             resident_weight_bytes: None,
             kv_cache_budget_bytes: None,
             kv_spill_active: false,
+            tq_kv_active: false,
         }
     }
 
@@ -4972,7 +4973,9 @@ mod tests {
         let mut buf = Vec::new();
         maybe_print_serve_banner(&info, &mut buf, true, false).expect("print serve banner");
         let got = String::from_utf8(buf).expect("utf8");
-        assert_eq!(got.lines().count(), 13);
+        // ADR-027 Phase B iter-17: banner gained `tq_kv = ...` line, so
+        // the line count is now 14 (was 13).
+        assert_eq!(got.lines().count(), 14);
         assert!(got.contains("hf2q load: model = serve-test-model"));
         assert!(got.contains("\x1b[2m"));
     }

@@ -683,6 +683,11 @@ impl LoadInfoBuilder for Qwen35LoadedModel {
             resident_weight_bytes: None,
             kv_cache_budget_bytes,
             kv_spill_active,
+            // ADR-027 Phase B iter-17: surface the engine-load
+            // `HF2Q_TQ_KV` state to operators via the load banner.
+            // `self.tq_kv_active` was sourced at engine load via
+            // `is_tq_active_mode()` (iter-12).
+            tq_kv_active: self.tq_kv_active,
         }
     }
 }

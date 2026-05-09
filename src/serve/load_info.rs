@@ -295,6 +295,21 @@ pub struct LoadInfo {
     /// Always `false` for Qwen35 today — see ADR-017 Phase B-hybrid
     /// fence.
     pub kv_spill_active: bool,
+
+    /// ADR-027 Phase B iter-17 — `true` iff this load will allocate
+    /// TQ-active full-attn KV buffers (sourced from `HF2Q_TQ_KV` env
+    /// at engine load via `is_tq_active_mode()`). When `true`, every
+    /// per-prefill cache allocates TQ-encoded buffers alongside F32
+    /// K/V (shadow-cache mode); the decode SDPA dispatch routes
+    /// through `flash_attn_vec_tq_hb`. iter-16 validated coherence on
+    /// real qwen36 35B-A3B-APEX-Q5_K_M (output BYTE-IDENTICAL to F32
+    /// baseline at 128 vs 128 tok/s).
+    ///
+    /// Currently surfaced only for `Qwen35` family; Gemma's TQ-on
+    /// state is reflected in `kv_spill_active` via the
+    /// `tq_packed_descriptor` engine binding (different mechanism;
+    /// future iter may unify).
+    pub tq_kv_active: bool,
 }
 
 /// Implemented by each loaded-model variant to produce the shared load
@@ -523,6 +538,19 @@ pub fn print_banner<W: std::io::Write>(
         "{d}hf2q load: kv_spill = {}{r}",
         if info.kv_spill_active {
             "active"
+        } else {
+            "inactive"
+        }
+    )?;
+    // ADR-027 Phase B iter-17 — surface TQ-on state to operators so
+    // HF2Q_TQ_KV=1 loads are visibly distinct from the F32 default at
+    // load time. Format mirrors `kv_spill = {active|inactive}` for
+    // grep symmetry.
+    writeln!(
+        w,
+        "{d}hf2q load: tq_kv = {}{r}",
+        if info.tq_kv_active {
+            "active (8-bit Lloyd-Max + D1 SRHT, ADR-027 Phase B)"
         } else {
             "inactive"
         }
@@ -1167,6 +1195,7 @@ mod tests {
             resident_weight_bytes: Some(16 * 1024 * 1024 * 1024),
             kv_cache_budget_bytes: Some(4 * 1024 * 1024 * 1024),
             kv_spill_active: false,
+            tq_kv_active: false,
         };
 
         let cloned = info.clone();
@@ -1215,6 +1244,7 @@ mod tests {
             resident_weight_bytes: Some((16.42_f64 * 1024.0 * 1024.0 * 1024.0).round() as u64),
             kv_cache_budget_bytes: Some(4 * 1024 * 1024 * 1024),
             kv_spill_active: false,
+            tq_kv_active: false,
         }
     }
 
@@ -1238,6 +1268,7 @@ mod tests {
              hf2q load: provenance = hf2q (producer hf2q 0.1.0, source_sha 7f3a…)\n\
              hf2q load: vision = n/a (text-only arch)\n\
              hf2q load: kv_spill = inactive\n\
+             hf2q load: tq_kv = inactive\n\
              hf2q load: ready in 6.84 s\n"
         );
     }
@@ -1445,6 +1476,7 @@ mod tests {
             resident_weight_bytes: None,
             kv_cache_budget_bytes: None,
             kv_spill_active: false,
+            tq_kv_active: false,
         };
         assert_eq!(info.arch_family, ArchFamily::Gemma4);
         assert_eq!(info.quant_label, Some("Q6_K".to_string()));
