@@ -778,6 +778,62 @@ pub fn load_calibration_corpus_jsonl(
     Ok(batches)
 }
 
+/// ADR-020 AC#7 Option A — translate a [`FullModelDwqConfig`] into the
+/// [`crate::calibrate::dwq_targets::ComputeTargetsConfig`] expected by
+/// [`crate::calibrate::dwq_targets::compute_dwq_targets`].
+///
+/// Pure adapter: takes the caller-supplied teacher save directory and
+/// the teacher's vocab size (extracted from the GGUF metadata at load
+/// time, NOT inferable from the cfg itself), produces a config that
+/// the teacher-capture pass consumes.  Validates that `vocab > 0` and
+/// `top_k_teacher <= vocab` so the teacher capture never trips its own
+/// internal asserts.
+pub fn build_dwq_targets_config_from_full_model(
+    cfg: &FullModelDwqConfig,
+    save_dir: std::path::PathBuf,
+    vocab: usize,
+) -> Result<crate::calibrate::dwq_targets::ComputeTargetsConfig> {
+    if vocab == 0 {
+        return Err(anyhow!(
+            "build_dwq_targets_config_from_full_model: vocab must be > 0"
+        ));
+    }
+    if cfg.top_k_teacher > vocab {
+        return Err(anyhow!(
+            "build_dwq_targets_config_from_full_model: top_k_teacher ({}) must be <= vocab ({})",
+            cfg.top_k_teacher,
+            vocab
+        ));
+    }
+    Ok(crate::calibrate::dwq_targets::ComputeTargetsConfig {
+        top_k: cfg.top_k_teacher,
+        save_dir,
+        vocab,
+    })
+}
+
+/// ADR-020 AC#7 Option A — borrow a [`FullModelDwqConfig`]'s
+/// pre-tokenized batches as a single
+/// [`crate::calibrate::dwq_targets::CalibrationSplit`].
+///
+/// hf2q's `compute_dwq_targets` always processes a *vector* of splits
+/// (mlx-lm uses both train + valid).  For Option A the caller provides
+/// one corpus and labels it with the supplied static `name` (typically
+/// `"train"`).  This helper exists to keep the borrow lifetimes
+/// explicit and avoid cfg.calibration_token_batches.as_slice() at every
+/// call site.
+pub fn build_calibration_split_from_full_model<'a>(
+    cfg: &'a FullModelDwqConfig,
+    name: &'static str,
+) -> crate::calibrate::dwq_targets::CalibrationSplit<'a> {
+    crate::calibrate::dwq_targets::CalibrationSplit {
+        name,
+        batches: cfg.calibration_token_batches.as_slice(),
+        batch_size: cfg.batch_size,
+        seq_len: cfg.seq_len,
+    }
+}
+
 /// ADR-020 iter-12d-2 — per-Linear training summary inside a model
 /// scan (one entry per successfully-trained tensor).
 #[derive(Debug, Clone)]
@@ -3332,6 +3388,155 @@ mod tests {
         };
         cfg.validate()
             .expect("loader output must satisfy validate() contract");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — `build_dwq_targets_config_from_full_model`
+    /// happy path: forwards top_k_teacher, save_dir, vocab unchanged.
+    #[test]
+    fn build_dwq_targets_config_from_full_model_forwards_fields() {
+        let cfg = super::FullModelDwqConfig {
+            gguf_path: std::path::PathBuf::from("/dev/null"),
+            calibration_token_batches: vec![vec![0u32; 32 * 512]],
+            top_k_teacher: 1024,
+            ..super::FullModelDwqConfig::default()
+        };
+        let out = super::build_dwq_targets_config_from_full_model(
+            &cfg,
+            std::path::PathBuf::from("/tmp/teacher-out"),
+            128_000,
+        )
+        .unwrap();
+        assert_eq!(out.top_k, 1024);
+        assert_eq!(out.vocab, 128_000);
+        assert_eq!(out.save_dir, std::path::PathBuf::from("/tmp/teacher-out"));
+    }
+
+    /// ADR-020 AC#7 Option A — vocab=0 must hard-fail.
+    #[test]
+    fn build_dwq_targets_config_from_full_model_rejects_zero_vocab() {
+        let cfg = super::FullModelDwqConfig {
+            gguf_path: std::path::PathBuf::from("/dev/null"),
+            calibration_token_batches: vec![vec![0u32; 32 * 512]],
+            ..super::FullModelDwqConfig::default()
+        };
+        let err = super::build_dwq_targets_config_from_full_model(
+            &cfg,
+            std::path::PathBuf::from("/tmp/x"),
+            0,
+        )
+        .unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("vocab must be > 0"), "got: {msg}");
+    }
+
+    /// ADR-020 AC#7 Option A — top_k_teacher > vocab must hard-fail
+    /// (mirrors `compute_dwq_targets`'s own check at `dwq_targets.rs:111`
+    /// but caught earlier, before any GGUF load).
+    #[test]
+    fn build_dwq_targets_config_from_full_model_rejects_top_k_above_vocab() {
+        let cfg = super::FullModelDwqConfig {
+            gguf_path: std::path::PathBuf::from("/dev/null"),
+            calibration_token_batches: vec![vec![0u32; 32 * 512]],
+            top_k_teacher: 5000,
+            ..super::FullModelDwqConfig::default()
+        };
+        let err = super::build_dwq_targets_config_from_full_model(
+            &cfg,
+            std::path::PathBuf::from("/tmp/x"),
+            1024,
+        )
+        .unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("top_k_teacher (5000)") && msg.contains("<= vocab (1024)"),
+            "got: {msg}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — `build_calibration_split_from_full_model`
+    /// borrows the cfg's batch slab and forwards batch_size + seq_len.
+    /// The borrow lifetime is tied to the cfg, so the split cannot
+    /// outlive the cfg (compile-time guarantee).
+    #[test]
+    fn build_calibration_split_from_full_model_borrows_and_forwards() {
+        let cfg = super::FullModelDwqConfig {
+            gguf_path: std::path::PathBuf::from("/dev/null"),
+            calibration_token_batches: vec![
+                vec![1u32; 32 * 512],
+                vec![2u32; 32 * 512],
+                vec![3u32; 32 * 512],
+            ],
+            batch_size: 32,
+            seq_len: 512,
+            ..super::FullModelDwqConfig::default()
+        };
+        let split = super::build_calibration_split_from_full_model(&cfg, "train");
+        assert_eq!(split.name, "train");
+        assert_eq!(split.batch_size, 32);
+        assert_eq!(split.seq_len, 512);
+        assert_eq!(split.batches.len(), 3);
+        // Borrow identity: split.batches must point at cfg's storage.
+        assert!(std::ptr::eq(
+            split.batches.as_ptr(),
+            cfg.calibration_token_batches.as_ptr()
+        ));
+        // First/last tokens of each batch carry the marker we wrote.
+        assert_eq!(split.batches[0][0], 1);
+        assert_eq!(split.batches[1][0], 2);
+        assert_eq!(split.batches[2][0], 3);
+    }
+
+    /// ADR-020 AC#7 Option A — adapter chain: JSONL loader output →
+    /// FullModelDwqConfig → `compute_dwq_targets` inputs (split + cfg).
+    /// Verifies the three helpers compose without reshape.
+    #[test]
+    fn full_model_adapter_chain_jsonl_to_compute_dwq_targets_inputs() {
+        let tok = fixture_wordlevel_tokenizer();
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-adapter-chain-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("corpus.jsonl");
+        let mut body = String::new();
+        for i in 0..32 {
+            body.push_str(&format!("{{\"text\": \"hello world {}\"}}\n", i % 3));
+        }
+        std::fs::write(&path, body).unwrap();
+
+        let batches = super::load_calibration_corpus_jsonl(&path, &tok, 32, 4).unwrap();
+        assert_eq!(batches.len(), 1);
+
+        let cfg = super::FullModelDwqConfig {
+            gguf_path: std::path::PathBuf::from("/dev/null"),
+            calibration_token_batches: batches,
+            batch_size: 32,
+            seq_len: 4,
+            top_k_teacher: 100,
+            ..super::FullModelDwqConfig::default()
+        };
+
+        // adapter #1: targets config
+        let tgt_cfg = super::build_dwq_targets_config_from_full_model(
+            &cfg,
+            dir.join("teacher-out"),
+            500,
+        )
+        .unwrap();
+        assert_eq!(tgt_cfg.top_k, 100);
+        assert_eq!(tgt_cfg.vocab, 500);
+
+        // adapter #2: split
+        let split = super::build_calibration_split_from_full_model(&cfg, "train");
+        assert_eq!(split.batch_size, 32);
+        assert_eq!(split.seq_len, 4);
+        assert_eq!(split.batches.len(), 1);
+        assert_eq!(split.batches[0].len(), 32 * 4);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
