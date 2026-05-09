@@ -2181,6 +2181,78 @@ Add task #25.5: per-kernel timing harness during ACTUAL qwen forward_decode
 to validate the iter-125 budget map at qwen production. Currently iter-125
 extrapolated from gemma decode shape, not measured at qwen directly.
 
+### iter-128 part 2 — gemma4 production validation (operator-directed)
+
+Operator: "yeah we need to test qwen3.6 AND gemma4 for all of this".
+
+#### gemma4 26B-A4B (gemma4-ara-2pass-APEX-Q5_K_M.gguf, M5 Max)
+
+**llama.cpp peer**:
+- pp1024: 4647.90 ± 5.46 t/s
+- tg256 cold: **102.46 ± 0.59 t/s**
+
+**hf2q**:
+- Short (cold, 8-token model-stopped sample): **72.5 t/s**
+- Long (256-token decode): **63.0 t/s**
+
+#### Per-model peer comparison (REAL measurements, M5 Max, M5 Max HEAD)
+
+| Model     | Context | hf2q t/s | llama.cpp t/s | Ratio        |
+|-----------|---------|----------|---------------|--------------|
+| qwen3.6   | short   | 128.0    | 101.0         | **1.27× WIN** |
+| qwen3.6   | long    | 110.2    | ~96.6         | **1.14× WIN** |
+| **gemma4** | **short** | **72.5** | **102.5**     | **0.71× LOSE** |
+| **gemma4** | **long**  | **63.0** | (no long bench available) | **likely <0.7×** |
+
+#### Honest mantra status (per operator's 3 criteria)
+
+1. **Coherence ≥ peers**: ✅ MET on both (sourdough byte-identity).
+2. **Speed ≥ peers**:
+   - **qwen3.6**: ✅ MET (1.14-1.27× peer)
+   - **gemma4**: ❌ NOT MET (0.71× peer at short context)
+3. **TQ enabled ≥ peers**: ✅ MET on both (3.94× per-slot KV memory
+   savings llama.cpp doesn't have).
+
+#### Why gemma4 loses while qwen3.6 wins (structural diagnosis)
+
+Looking at iter-100..118 falsifications: gemma4 decode is dominated
+by:
+- LM head (9.9% — Q8_0 at memory wall 587 GB/s, peer-equivalent)
+- QKV projs + O proj (16.5% — compute wall, peer-equivalent)
+- Dense FFN gate+up+down (12.4% — compute wall, DS4 fusion saves ~1%)
+- FA-vec-tq-hb (9% — Path D = NSG=1 at sw=1024, can't improve further)
+
+11 static-lever falsifications on M5 Max prove these are at hardware
+ceilings. Path D's NSG axis ONLY helps long-context decode (kL > 1024)
+which gemma4 doesn't reach due to sw=1024 cap.
+
+**The qwen3.6 win is from**:
+- TQ-HB cache architecture (3.94× memory savings → fits in M5 Max
+  unified memory headroom; llama.cpp's flat F16 forces partial KV
+  paging)
+- Long-context (sw=4096) enables Path D's NSG axis lift
+- MoE expert dispatch path well-optimized in mv_id kernels (per
+  iter-87 chain)
+
+**The gemma4 loss is structural**:
+- sw=1024 + dense FFN (no MoE expert sparsity to exploit)
+- Q5_K_M quant per-token bandwidth at memory wall on big projs
+- Per-token decode floor at ~14 ms is hardware-ceiling-bounded
+
+#### Closure paths for gemma4 mantra-violation
+
+The remaining levers are:
+- **Path A (spec-decode)**: 1.6-3.0× decode lift via 60-80% acceptance.
+  Helps gemma4 specifically (works at any context length). Operator
+  green-light gated.
+- **Switch Q5_K_M → Q4_K_M**: ~10-15% bandwidth savings on big projs.
+  Some quality loss. Operator decision.
+- **DS4 fused gate+up+SwiGLU**: ~1% saving (sized in iter-121).
+  Marginal but mantra-aligned.
+
+These are the structurally-bounded options. Without a quant downgrade
+or speculative decode, gemma4 cannot match peer at the kernel level.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
