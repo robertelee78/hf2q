@@ -82,10 +82,18 @@ WORK_DIR="$(mktemp -d -t hf2q-adr027-long-XXXXXX)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 # Null chat template — bypasses iter-40 chat-template-induced early-EOS.
-NULL_TEMPLATE="$WORK_DIR/null-template.j2"
-cat > "$NULL_TEMPLATE" <<'EOF'
-{{ messages[0].content }}
-EOF
+# Reuses the canonical 1-line passthrough template that
+# `scripts/qwen35_tokenizer_parity.sh` (predecessor: ADR-005 Phase 1)
+# already ships. Single source of truth for "tokenize the user's
+# prompt verbatim with no chat-template wrapping". iter-52 consolidated
+# this — earlier iter-42 inlined a duplicate copy in $WORK_DIR.
+NULL_TEMPLATE="${NULL_TEMPLATE:-/opt/hf2q/scripts/qwen35_raw_passthrough.jinja}"
+if [[ ! -f "$NULL_TEMPLATE" ]]; then
+    echo "ERROR: NULL_TEMPLATE file not found: $NULL_TEMPLATE"
+    echo "Hint: this script expects the canonical raw-passthrough Jinja at"
+    echo "      scripts/qwen35_raw_passthrough.jinja (1-line: {{ messages[0].content }})."
+    exit 2
+fi
 
 # Filler text for haystack-style prompts (mirrors bench-needle-haystack.sh).
 FILLER_LINES=(
