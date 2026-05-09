@@ -2052,6 +2052,73 @@ structural refactor, ~200 LOC) vs Shape B (prefill structural refactor,
 ~180 LOC). Path D's win is bigger AT LONG CONTEXT; Shape B's win is
 broader (any model when n-grams hit). Can land independently.
 
+### iter-127 Path D LANDED — NSG axis port + 1.84× FA at qwen long context
+
+Implementation: 4 substeps (a→d) over single session, each gated by
+NSG=1 byte-identity regression:
+
+- **iter-127a** (mlx-native `14316d9`, hf2q `d564ec1`): NSG axis scaffold.
+  FlashAttnVecTqHbParams.nsg field, validation, dispatch threadgroup_size
+  = (32, NSG, 1), GPU param struct extended to 60 bytes, compute_nsg()
+  helper returning 1 default. 8 unit tests: pow-2 + zero validation,
+  default-is-one property, env-override mutex-serialized.
+
+- **iter-127b** (mlx-native `52fd3d9`): Kernel K-loop stride
+  (`for ic0 = iwg*NSG + sgitg; ic0 += NWG*NSG`) + per-simdgroup shmem
+  banks (ss/so4 banks at sgitg-strided offsets). NSG=1 → byte-identical.
+
+- **iter-127c** (mlx-native `5aafd7a`): Cross-simdgroup online-softmax
+  reduce. Simdgroup 0 reads NSG banks of (S_j, M_j, so_j), computes
+  M_global, ms_j = exp(M_j - M_global), S_total, so_total, overwrites
+  own bank. 3 new equivalence tests (NSG=2/4 vs NSG=1 max_abs_diff <
+  5e-4) all pass.
+
+- **iter-127d** (mlx-native `6d43edd`): Adaptive compute_nsg from
+  measured bench data — kL > 1024 → NSG=4, else NSG=1.
+
+#### Real measured speedup (mlx-native HEAD `6d43edd`, M5 Max, NWG=32)
+
+| kL    | NSG=1 µs/call | NSG=4 µs/call | Speedup | Per-token Δ (30 layers) |
+|-------|---------------|---------------|---------|-------------------------|
+| 1024  | 44.21         | 53.59         | 0.83×   | +280 µs (slower — NSG=1 selected) |
+| 4096  | 208.71        | **113.32**    | **1.84×** | **−2.86 ms** |
+| 8192  | 423.79        | **231.10**    | **1.83×** | **−5.78 ms** |
+
+#### Production impact
+
+- **Gemma 4** (sw=1024): NSG=1 selected → no behavior change, byte-identical.
+- **Qwen 3.5/3.6** (sw=4096): NSG=4 selected at decode kL > 1024 → **~18%
+  decode speedup** at long context (2.86 ms/token saved out of 15.86 ms).
+
+iter-125 predicted 4× / 28% decode at qwen production. Actual 1.84× /
+18%. Gap explanations:
+1. Cross-simdgroup reduce has non-trivial overhead at the per-WG
+   workgroup level (one extra threadgroup_barrier + ms_arr + 4-way sum).
+2. Memory bandwidth partially saturates at NSG=4 (4 simdgroups reading
+   K/V byte-streams concurrently within one workgroup).
+3. K-iter saturation isn't perfectly 1× per simdgroup — load imbalance
+   when total_K_blocks doesn't divide NWG*NSG cleanly.
+
+Still: **largest single decode-perf landing of the session**, structural,
+mantra-aligned (no quality loss), no operator approval needed for the
+Gemma path (compute_nsg returns 1 → no change).
+
+#### Validation
+
+- 12/12 byte-identity tests pass at NSG=1 (incl. production-shape
+  gemma4-26b, all bit widths, sliding window)
+- 3/3 NSG=2/4 mathematical-equivalence tests pass at kL ∈ {64, 128, 1024}
+- 8/8 NSG validation unit tests pass (zero/non-pow2/cap/env override/adaptive)
+
+#### Standing rule for future kernel parallelism work
+
+llama.cpp uses BOTH nwg AND nsg as first-class axes. Apple Metal
+threadgroup_size is `(simdwidth=32, NSG, 1)` and threadgroup memory
+should bank per-simdgroup at sgitg-strided offsets. Any future FA-class
+kernel work where K-axis parallelism matters (e.g., extending to other
+quant types, dense-attention variants) MUST consider both nwg and nsg
+from day 1 — not implicit-1 in either dimension.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
