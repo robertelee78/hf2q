@@ -2049,6 +2049,73 @@ pub fn train_one_linear_dwq_step_with_full_teacher_logits(
     .context("train_one_linear_dwq_step_with_full_teacher_logits: inner step")
 }
 
+/// ADR-020 AC#7 Option A — one batch of single-Linear training data:
+/// pre-Linear hidden state + full-vocab teacher logits paired by row.
+///
+/// Caller pre-builds these per batch from a teacher forward pass
+/// (`forward_gpu_with_hidden(tokens, positions, kv) → (logits,
+/// hidden)`).  The training-loop driver consumes a slice of these.
+#[derive(Debug, Clone)]
+pub struct DwqOneLinearBatch {
+    /// Pre-Linear hidden state, `[n_rows, k]` row-major (k is the
+    /// Linear's input dim, matches `pack.k`).
+    pub x_batch: Vec<f32>,
+    /// Full-vocab teacher logits, `[n_rows, vocab]` row-major
+    /// (vocab matches `pack.n`).
+    pub teacher_logits_full: Vec<f32>,
+    /// Number of (token, position) rows in this batch.  Both
+    /// `x_batch` and `teacher_logits_full` are expected to have row
+    /// counts equal to this.
+    pub n_rows: usize,
+}
+
+/// ADR-020 AC#7 Option A — multi-step training driver: iterate over
+/// a sequence of [`DwqOneLinearBatch`]es and run
+/// [`train_one_linear_dwq_step_with_full_teacher_logits`] for each.
+///
+/// Returns the per-batch loss series, in batch order.  An empty
+/// `batches` slice yields an empty Vec without error (degenerate
+/// but valid — caller may want to early-exit before driving steps).
+///
+/// Per-batch shape validation happens at the inner step's input
+/// boundary (x_batch.len == n_rows*pack.k, teacher.len ==
+/// n_rows*pack.n); on the first batch that fails, the error is
+/// wrapped with the batch index so operators can identify which
+/// batch is malformed.
+///
+/// # Errors
+/// - `vocab` (or `pack.n`) mismatch with any batch's teacher logits
+///   shape → caught by the inner step
+/// - underlying GPU op fails (propagated)
+pub fn train_one_linear_dwq_loop(
+    adam: &mut crate::calibrate::adam::AdamOptimizer,
+    device: &MlxDevice,
+    tensor_id: &str,
+    pack: &DwqQuantPack,
+    batches: &[DwqOneLinearBatch],
+    top_k: usize,
+    temperature: f32,
+) -> Result<Vec<f32>> {
+    let mut losses: Vec<f32> = Vec::with_capacity(batches.len());
+    for (i, batch) in batches.iter().enumerate() {
+        let l = train_one_linear_dwq_step_with_full_teacher_logits(
+            adam,
+            device,
+            tensor_id,
+            pack,
+            &batch.x_batch,
+            &batch.teacher_logits_full,
+            batch.n_rows,
+            pack.n,
+            top_k,
+            temperature,
+        )
+        .with_context(|| format!("train_one_linear_dwq_loop: batch[{i}]"))?;
+        losses.push(l);
+    }
+    Ok(losses)
+}
+
 /// ADR-020 iter-12d-2 — per-Linear training summary inside a model
 /// scan (one entry per successfully-trained tensor).
 #[derive(Debug, Clone)]
@@ -5038,6 +5105,237 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — `train_one_linear_dwq_loop` happy
+    /// path: 5 batches → 5 losses, all finite, Adam.step_count == 5.
+    #[test]
+    fn train_one_linear_dwq_loop_happy_path() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let n = 32;
+        let k = 32;
+        let group_size = 8;
+        let n_rows = 32;
+        let top_k = 4;
+
+        let w: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.013 - 0.4).sin() * 1.5).collect();
+        let pack = super::quant_pack_for_dwq(&device, &w, n, k, 4, group_size).expect("pack");
+
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-3,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .expect("adam");
+        super::register_affine_pair(&mut adam, &device, "X", &pack.scales, &pack.biases)
+            .expect("reg");
+
+        // 5 deterministic batches.
+        let mut batches: Vec<super::DwqOneLinearBatch> = Vec::with_capacity(5);
+        for b in 0..5 {
+            let x: Vec<f32> = (0..n_rows * k)
+                .map(|i| ((i as f32 + b as f32 * 100.0) * 0.07).cos() * 0.5)
+                .collect();
+            let t: Vec<f32> = (0..n_rows * n)
+                .map(|i| ((i as f32 + b as f32 * 50.0) * 0.041).sin() * 2.0)
+                .collect();
+            batches.push(super::DwqOneLinearBatch {
+                x_batch: x,
+                teacher_logits_full: t,
+                n_rows,
+            });
+        }
+
+        let losses =
+            super::train_one_linear_dwq_loop(&mut adam, &device, "X", &pack, &batches, top_k, 2.0)
+                .expect("loop");
+        assert_eq!(losses.len(), 5);
+        for (i, l) in losses.iter().enumerate() {
+            assert!(l.is_finite(), "loss[{i}] not finite: {l}");
+        }
+        assert_eq!(adam.step_count(), 5);
+    }
+
+    /// ADR-020 AC#7 Option A — empty `batches` yields empty Vec
+    /// without error (degenerate but valid; caller may wish to
+    /// short-circuit before driving steps).
+    #[test]
+    fn train_one_linear_dwq_loop_empty_batches_returns_empty_vec() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let n = 32;
+        let k = 32;
+        let w: Vec<f32> = vec![0.0; n * k];
+        let pack = super::quant_pack_for_dwq(&device, &w, n, k, 4, 8).expect("pack");
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-3,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .expect("adam");
+        super::register_affine_pair(&mut adam, &device, "X", &pack.scales, &pack.biases)
+            .expect("reg");
+
+        let losses =
+            super::train_one_linear_dwq_loop(&mut adam, &device, "X", &pack, &[], 4, 1.0).unwrap();
+        assert!(losses.is_empty());
+        assert_eq!(adam.step_count(), 0);
+    }
+
+    /// ADR-020 AC#7 Option A — malformed batch (wrong x_batch
+    /// length) is reported with its batch INDEX so operators can
+    /// pinpoint which batch is bad.
+    #[test]
+    fn train_one_linear_dwq_loop_reports_batch_index_on_failure() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let n = 32;
+        let k = 32;
+        let n_rows = 32;
+        let top_k = 4;
+        let w: Vec<f32> = vec![0.0; n * k];
+        let pack = super::quant_pack_for_dwq(&device, &w, n, k, 4, 8).expect("pack");
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-3,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .expect("adam");
+        super::register_affine_pair(&mut adam, &device, "X", &pack.scales, &pack.biases)
+            .expect("reg");
+
+        let good_x: Vec<f32> = vec![0.0; n_rows * k];
+        let good_t: Vec<f32> = vec![0.0; n_rows * n];
+        let bad_x: Vec<f32> = vec![0.0; 7]; // wrong length
+
+        let batches = vec![
+            super::DwqOneLinearBatch {
+                x_batch: good_x.clone(),
+                teacher_logits_full: good_t.clone(),
+                n_rows,
+            },
+            super::DwqOneLinearBatch {
+                x_batch: bad_x,
+                teacher_logits_full: good_t.clone(),
+                n_rows,
+            },
+        ];
+
+        let res = super::train_one_linear_dwq_loop(
+            &mut adam, &device, "X", &pack, &batches, top_k, 1.0,
+        );
+        let err = match res {
+            Ok(_) => panic!("expected failure on batch[1]"),
+            Err(e) => e,
+        };
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("batch[1]"),
+            "error must name the failing batch index; got: {msg}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — convergence over a multi-step loop:
+    /// register Adam with PERTURBED biases (b + 0.5); pin teacher
+    /// targets to the projection optimum; drive 40 batches via
+    /// the loop driver; head-vs-tail-avg loss must decrease by ≥
+    /// 20%.  Same property as the single-step convergence test
+    /// landed last iter, but driven entirely through the new loop
+    /// fn — proves the multi-step path doesn't leak Adam state or
+    /// drop gradients.
+    #[test]
+    fn train_one_linear_dwq_loop_converges_under_perturbed_b() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use crate::calibrate::autograd_gpu_tape::{
+            matmul, qdq_affine, transpose, view, GpuTape, GpuTensor,
+        };
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let n = 32;
+        let k = 32;
+        let group_size = 8;
+        let n_rows = 32;
+        let top_k = 4;
+
+        let w: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.013 - 0.4).sin() * 1.5).collect();
+        let pack = super::quant_pack_for_dwq(&device, &w, n, k, 4, group_size).expect("pack");
+        let x_batch: Vec<f32> = (0..n_rows * k).map(|i| ((i as f32) * 0.05 - 0.1).cos() * 0.5).collect();
+
+        // Compute teacher_logits_full at the optimum (s, b).
+        let teacher_full_at_opt: Vec<f32> = {
+            let tape = GpuTape::new(device.clone());
+            let s_t = GpuTensor::from_vec(&tape, &pack.scales, vec![pack.scales.len()]).unwrap();
+            let b_t = GpuTensor::from_vec(&tape, &pack.biases, vec![pack.biases.len()]).unwrap();
+            let x_t = GpuTensor::from_vec(&tape, &x_batch, vec![n_rows, k]).unwrap();
+            let w_qdq = qdq_affine(&s_t, &b_t, &pack.q_int_bytes, group_size).unwrap();
+            let w_2d = view(&w_qdq, vec![n, k]).unwrap();
+            let w_t = transpose(&w_2d).unwrap();
+            let logits = matmul(&x_t, &w_t).unwrap();
+            logits.to_vec().unwrap()
+        };
+
+        // 40 identical batches → drives 40 Adam steps on the same
+        // objective (the gradient-descent dynamics here are what we
+        // care about, not data shuffling).
+        let n_steps = 40;
+        let batches: Vec<super::DwqOneLinearBatch> = (0..n_steps)
+            .map(|_| super::DwqOneLinearBatch {
+                x_batch: x_batch.clone(),
+                teacher_logits_full: teacher_full_at_opt.clone(),
+                n_rows,
+            })
+            .collect();
+
+        // Register Adam with PERTURBED biases (b + 0.5).
+        let b_perturbed: Vec<f32> = pack.biases.iter().map(|x| x + 0.5).collect();
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-3,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .expect("adam");
+        super::register_affine_pair(&mut adam, &device, "X", &pack.scales, &b_perturbed)
+            .expect("reg");
+
+        let losses = super::train_one_linear_dwq_loop(
+            &mut adam, &device, "X", &pack, &batches, top_k, 2.0,
+        )
+        .expect("loop");
+        assert_eq!(losses.len(), n_steps);
+
+        let avg = |s: &[f32]| s.iter().sum::<f32>() / s.len() as f32;
+        let head = avg(&losses[..5]);
+        let tail = avg(&losses[n_steps - 5..]);
+        assert!(head > 0.0, "head loss must be > 0; got {head}");
+        assert!(
+            tail < 0.8 * head,
+            "tail loss avg ({tail}) must be < 80% of head loss avg ({head}); \
+             losses={losses:?}"
+        );
     }
 
     /// ADR-020 AC#7 Option A — full-vocab variant equivalence:
