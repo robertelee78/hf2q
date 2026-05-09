@@ -285,6 +285,61 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-102 FWHT fusion ROI ceiling — 1.4% (not 6%) — reframes "saved-dispatch" math
+
+Bench `bench_fwht_sign_premult_gemma_decode` (gemma decode shape:
+num_heads=16, head_dim=256) using same iter-94/97/101 CPU/GPU split
+methodology. FA-vec-tq-hb call site at `forward_mlx.rs:3407-3472` shows
+4 dispatches per layer (FWHT-pre + FA main + FA reduce + FWHT-undo);
+fusing FWHTs eliminates 2/layer × 30 = 60 dispatches/token.
+
+| Mode | CPU wall p50 | GPU pure p50 | Per-call |
+|---|---:|---:|---:|
+| Per-call isolated | 177.79 µs | 10.13 µs | — |
+| Session-60 amortized | 223.08 µs | 42.87 µs | **0.71 µs/call GPU** |
+
+**Per-token FWHT contribution = 0.22 ms = 1.4% of 15.86 ms decode.**
+
+**Reframe of "saved-dispatch" math** (load-bearing for ALL fusion ROI):
+
+Iter-98's 6% projection (and iter-99 items B/D/I) used the "60 saved
+dispatches × 16 µs floor" model. The 16 µs/dispatch came from iter-90's
+average (15.86 ms total / 990 dispatches). But iter-101 + iter-102
+benches show this is an AVERAGE, not a per-dispatch lower bound:
+- Small kernels (FWHT, norm) actually run at <1 µs GPU pipelined
+  + ~3 µs encoder overhead = ~4 µs effective in session mode.
+- The 16 µs average reflects MIX of small dispatches + heavy kernels
+  (mv_id 187 µs/call from iter-94, FA-vec compute bound).
+
+**Realistic per-saved-dispatch cost in production**:
+- For dispatch-bound kernels: ~3-4 µs (encoder overhead + barriers)
+- For compute-bound kernels: ~kernel-time (unchanged)
+
+**Updated fusion ROI ceiling table** (corrects iter-99 #B/#I and iter-98
+#1/#2 over-estimates):
+
+| Item | Old ROI | New ROI ceiling | Source |
+|---|---:|---:|---|
+| #19 (FWHT-into-FA) | 6% | **1.4%** | iter-102 bench |
+| #14 (bin_fuse_4) | 6% | TBD — needs scoping | n/a |
+| #18 (Q5K/Q6K swiglu-fused-down) | 3% | TBD — scoped at iter-103 | n/a |
+| #B (DS4 gate+up+SwiGLU) | 5% | TBD | n/a |
+
+**Verdict**: item #19 (FWHT-fuse-into-FA) is **still a real lever
+(1.4% > thermal noise)**, but the scope (kernel surgery on the FA-vec-
+tq-hb shader prologue/epilogue) is substantial. Lower priority than
+benching the BIG kernels first to find where the actual 4.75 ms peer
+gap lives.
+
+**Iter-103 pivot**: bench mv_id (Q6_K MoE gate_up + down) and FA-vec-
+tq-hb at production decode shape to identify the dominant per-token
+GPU-time bucket. The peer gap likely lives in 1-2 hot kernels, not
+in dispatch-count overhead.
+
+Bench retained as regression-gate: `cargo test --release --test
+test_fused_ops bench_fwht_sign_premult_gemma_decode -- --ignored
+--nocapture`.
+
 ### Iter-101 vec4 norm fusion (item D) — FALSIFIED by GPU pure-time bench
 
 Iter-99 item D estimated 2.8-3.4% decode ROI from porting llama.cpp's
