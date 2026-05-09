@@ -285,6 +285,76 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-104 production timing-bisect — TQ-region barriers ARE 9% of decode, item #19 ROI is 10.5% (not 1.4%)
+
+Two complementary measurements at HEAD on gemma-4-26b APEX-Q5_K_M:
+
+**Measurement 1 — production HF2Q_MLX_PROFILE (single-session aggregate)**:
+- 96 tokens, 2 warmup skipped: total 15.83 ms/token, 990 dispatches
+- ALL work in S1 bucket (single-session mode) — 524 µs/layer × 30 = 15.71 ms
+- 99.3% of token-time is GPU sessions, 0.7% unaccounted
+
+**Measurement 2 — TQ-bisect via HF2Q_SKIP_TQ_SDPA=1**:
+| Mode | Decode | Per-token | Δ |
+|---|---:|---:|---:|
+| Default (TQ-HB ON) | 63.8 t/s | 15.83 ms | baseline |
+| TQ-HB skipped (garbage output, timing only) | **79.1 t/s** | 12.64 ms | **-3.19 ms (-20%)** |
+
+**Discrepancy reconciliation** vs iter-101/102/103 synthetic benches:
+- Synthetic FA-vec-tq-hb: 1.43 ms (9.0%)
+- Synthetic FWHT (60 calls): 0.22 ms (1.4%)
+- Synthetic subtotal: 1.65 ms
+- **Production TQ-region cost: 3.09 ms**
+- **Unaccounted gap: 1.44 ms**
+
+**Root cause of 1.44 ms gap — barrier_between() issues real memory_barrier()
+when buffer conflict exists**. From `mlx-native/src/graph.rs:1494`:
+
+```rust
+pub fn barrier_between(&mut self, reads: &[&MlxBuffer], writes: &[&MlxBuffer]) {
+    let reason = self.tracker.conflicts_reason(reads, writes);
+    if let Some(...) = reason {
+        self.encoder.memory_barrier();
+        ...
+    }
+}
+```
+
+In the FA-vec-tq-hb path (`forward_mlx.rs:3407+3429+3463`), 3 barrier_between
+calls per layer:
+1. `barrier_between([attn_q_normed], [attn_q_normed])` — WAR same buffer → BARRIER (FWHT-pre is in-place on Q)
+2. `barrier_between([q, k_packed, k_norms, v_packed, v_norms], [sdpa_out])` — may elide
+3. `barrier_between([sdpa_out], [sdpa_out])` — WAR same buffer → BARRIER (FWHT-undo is in-place on SDPA out)
+
+Synthetic benches dispatched calls back-to-back with NO barriers; production has 2 forced barriers per layer × 30 layers = **60 barriers × ~24 µs each = 1.44 ms = 9% of decode**.
+
+**Reframed item #19 ROI** (iter-99 #1 + iter-98 #1: fuse-FWHT-into-FA):
+
+| Component | Saving | % decode |
+|---|---:|---:|
+| FWHT compute (60 calls) | 0.22 ms | 1.4% |
+| 2 barriers/layer × 30 layers eliminated | 1.44 ms | 9.0% |
+| **Combined task #19 ROI** | **1.66 ms** | **10.5%** |
+
+Task #19 (fuse FWHTs into FA-vec-tq-hb kernel prologue/epilogue) is now
+the **highest-ROI single lever** measured. Eliminates the in-place
+write-after-read on attn_q_normed (FWHT-pre) and on sdpa_out (FWHT-
+undo) by moving both into the FA kernel's shared memory.
+
+**Mantra check**: closing this 10.5% lifts decode 63.8 → 71.3 t/s.
+llama.cpp HEAD peer = 88-97 t/s. Closes ~50% of the 4.72 ms peer gap.
+
+**Iter-105 plan**: design + implement FA-vec-tq-hb kernel with FWHT
+prologue + epilogue. Falsifier gates:
+1. Sourdough byte-identity (ADR-010 gate)
+2. iter-103 regression-gate bench shows GPU pure shouldn't grow >10%
+3. End-to-end decode ≥ 70 t/s (vs current 63.8)
+
+Note also: forward_mlx.rs:248-249 + the per-token printer "candle Phase 0
+baseline: ~105 dispatches/token" was retracted in iter-99 (candle does
+~400-1000) but the printer string still lives in code — fix in iter-105
+ADR-debt cleanup.
+
 ### Iter-103 hot-kernel inventory — FA-vec-tq-hb dominates at 9% (compute-bound)
 
 Goal: locate where the 4.75 ms peer-gap actually lives. Bench 4 kernels
