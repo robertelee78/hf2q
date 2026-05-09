@@ -80,7 +80,7 @@ echo "=== ADR-010 iter-64 batched-prefill coherence gate ==="
 echo "Model: $MODEL"
 echo
 
-echo "[1/4] Per-token prefill (reference truth)"
+echo "[1/5] Per-token prefill (reference truth)"
 PER_TOKEN_OUT=$(timeout 120 "$HF2Q" generate --model "$MODEL" --prompt-file "$PROMPT_FILE" --max-tokens 8 2>&1)
 PER_TOKEN_DECODED=$(echo "$PER_TOKEN_OUT" | extract_decoded)
 echo "  decoded: [$PER_TOKEN_DECODED]"
@@ -93,7 +93,7 @@ fi
 echo "  ✓ per-token reference OK"
 echo
 
-echo "[2/4] Batched prefill (gated HF2Q_BATCHED_PREFILL=1 + UNSAFE)"
+echo "[2/5] Batched prefill (gated HF2Q_BATCHED_PREFILL=1 + UNSAFE)"
 BATCHED_OUT=$(HF2Q_BATCHED_PREFILL=1 HF2Q_UNSAFE_EXPERIMENTS=1 \
     timeout 120 "$HF2Q" generate --model "$MODEL" --prompt-file "$PROMPT_FILE" --max-tokens 8 2>&1)
 BATCHED_DECODED=$(echo "$BATCHED_OUT" | extract_decoded)
@@ -148,7 +148,7 @@ echo
 # thermal throttle.
 PERF_FLOOR_TOK_S="${HF2Q_GATE_PERF_FLOOR:-1500}"
 if [[ "${HF2Q_GATE_SKIP_PERF:-0}" != "1" ]]; then
-    echo "[3/4] Perf sanity at pp1024 batched (floor: ${PERF_FLOOR_TOK_S} tok/s)"
+    echo "[3/5] Perf sanity at pp1024 batched (floor: ${PERF_FLOOR_TOK_S} tok/s)"
     PERF_PROMPT_FILE=$(mktemp -t adr010-iter64-pp1024.XXXXXX)
     trap "rm -f $PROMPT_FILE $PERF_PROMPT_FILE" EXIT
     python3 -c "
@@ -193,16 +193,55 @@ print(' '.join(out))
     echo "  ✓ perf sanity OK ($PERF_TOK_S t/s ≥ ${PERF_FLOOR_TOK_S} t/s floor)"
     echo
 else
-    echo "[3/4] Perf sanity SKIPPED (HF2Q_GATE_SKIP_PERF=1)"
+    echo "[3/5] Perf sanity SKIPPED (HF2Q_GATE_SKIP_PERF=1)"
     echo
 fi
 
-echo "[4/4] Verdict"
-echo "  per-token: [$PER_TOKEN_DECODED]"
-echo "  batched:   [$BATCHED_DECODED]"
+# Iter-80: decode-throughput floor. The iter-64/68 wins are prefill-side;
+# decode is independent (separate code path: forward_decode in forward_mlx.rs
+# vs forward_prefill_batched.rs). Iter-69 measured gemma decode at 64 t/s;
+# stable 65.4-65.7 across runs. Floor 50 catches >20% regression.
+# Skip with HF2Q_GATE_SKIP_DECODE=1.
+DECODE_FLOOR_TOK_S="${HF2Q_GATE_DECODE_FLOOR:-50}"
+if [[ "${HF2Q_GATE_SKIP_DECODE:-0}" != "1" ]]; then
+    echo "[4/5] Decode-throughput floor (gemma, 32 tokens, floor: ${DECODE_FLOOR_TOK_S} tok/s)"
+    DECODE_PROMPT_FILE=$(mktemp -t adr010-iter80-decode.XXXXXX)
+    trap "rm -f $PROMPT_FILE $PERF_PROMPT_FILE $DECODE_PROMPT_FILE" EXIT
+    echo "Hello!" > "$DECODE_PROMPT_FILE"
+    declare -a DECODE_TRIALS=()
+    for trial in 1 2 3; do
+        DECODE_LINE=$(timeout 120 "$HF2Q" generate --model "$MODEL" --prompt-file "$DECODE_PROMPT_FILE" --max-tokens 32 2>&1 \
+            | grep "tokens in.*tok/s" | tail -1)
+        DECODE_TRIAL_TOK_S=$(echo "$DECODE_LINE" | grep -oE "\(([0-9]+\.[0-9]+) tok/s\)" | grep -oE "[0-9]+\.[0-9]+" | head -1 | cut -d. -f1)
+        if [[ -z "$DECODE_TRIAL_TOK_S" ]]; then
+            echo "  ✗ FAIL: could not parse decode result on trial $trial." >&2
+            echo "  raw: $DECODE_LINE" >&2
+            exit 4
+        fi
+        echo "  trial $trial: $DECODE_LINE"
+        DECODE_TRIALS+=("$DECODE_TRIAL_TOK_S")
+    done
+    DECODE_MEDIAN=$(printf '%s\n' "${DECODE_TRIALS[@]}" | sort -n | sed -n '2p')
+    echo "  median: $DECODE_MEDIAN tok/s (over 3 trials)"
+    if (( DECODE_MEDIAN < DECODE_FLOOR_TOK_S )); then
+        echo "  ✗ FAIL: decode $DECODE_MEDIAN tok/s < ${DECODE_FLOOR_TOK_S} t/s floor."
+        echo "  iter-69 baseline 64 t/s (peer 0.62×); current suggests decode regression."
+        exit 4
+    fi
+    echo "  ✓ decode-throughput floor PASS ($DECODE_MEDIAN t/s ≥ ${DECODE_FLOOR_TOK_S} t/s)"
+    echo
+else
+    echo "[4/5] Decode-throughput floor SKIPPED (HF2Q_GATE_SKIP_DECODE=1)"
+    echo
+fi
+
+echo "[5/5] Verdict"
+echo "  per-token prefill: [$PER_TOKEN_DECODED]"
+echo "  batched prefill:   [$BATCHED_DECODED]"
 echo
-echo "✓ PASS — batched-prefill coherence + perf gate green at HEAD."
+echo "✓ PASS — batched-prefill coherence + perf + decode gate green at HEAD."
 echo "  iter-64 leg_hb_encoded fix is locked in for this fixture."
 echo "  iter-74 byte-identity strict gate passing."
-echo "  iter-75 pp1024 perf-sanity floor passing."
+echo "  iter-75 pp1024 prefill perf-sanity floor passing."
+echo "  iter-80 decode-throughput floor passing."
 exit 0
