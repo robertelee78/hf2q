@@ -1354,6 +1354,140 @@ pub fn kl_loss_topk_via_tape(
         .context("kl_loss_topk_via_tape: scalar_mul(sum, 1/N)")
 }
 
+/// ADR-020 AC#7 Option A — build an `MlxBuffer` of U32 indices on
+/// the supplied device, suitable for feeding
+/// [`crate::calibrate::autograd_gpu_tape::take_along_axis_topk`].
+///
+/// The output buffer has element count `n_rows * top_k`, dtype
+/// `U32`, and shape `[n_rows, top_k]` (matching the `take_along`
+/// kernel's expectation).
+///
+/// Validates `indices.len() == n_rows * top_k` and every entry's
+/// in-range bound is checked LATER by the kernel (we don't have
+/// `vocab` here).  Caller of `gather_student_topk_via_tape` will
+/// assert vocab-bound before launch.
+pub fn build_topk_indices_buffer(
+    device: &MlxDevice,
+    indices: &[u32],
+    n_rows: usize,
+    top_k: usize,
+) -> Result<MlxBuffer> {
+    if n_rows == 0 || top_k == 0 {
+        return Err(anyhow!(
+            "build_topk_indices_buffer: n_rows ({n_rows}) and top_k ({top_k}) must be > 0"
+        ));
+    }
+    let expected = n_rows
+        .checked_mul(top_k)
+        .ok_or_else(|| anyhow!("build_topk_indices_buffer: n_rows * top_k overflows"))?;
+    if indices.len() != expected {
+        return Err(anyhow!(
+            "build_topk_indices_buffer: indices.len ({}) != n_rows * top_k ({})",
+            indices.len(),
+            expected
+        ));
+    }
+    let mut buf = device
+        .alloc_buffer(expected * 4, DType::U32, vec![n_rows, top_k])
+        .map_err(|e| anyhow!("build_topk_indices_buffer: alloc: {e}"))?;
+    buf.as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("build_topk_indices_buffer: as_mut_slice: {e}"))?
+        .copy_from_slice(indices);
+    Ok(buf)
+}
+
+/// ADR-020 AC#7 Option A — GPU-tape mirror of [`take_along_topk_indices`].
+///
+/// Given the student's full-vocab logits as a 2-D `[N, vocab]` OR
+/// 3-D `[batch, seq, vocab]` GpuTensor, gather the K logits at the
+/// teacher-supplied vocab positions and return a 2-D `[N, top_k]`
+/// tensor ready to feed [`kl_loss_topk_via_tape`].
+///
+/// `indices_buf` must be U32 with element count `N * top_k` (caller
+/// builds it via [`build_topk_indices_buffer`] or hands an existing
+/// buffer back from [`TeacherBatchTargets`]).
+///
+/// Index validation: every entry MUST be `< vocab`.  Out-of-range
+/// hits are caught here BEFORE the launch so a stale teacher-targets
+/// file can't silently corrupt the GPU forward.  Validation happens
+/// against the in-CPU view of `indices_buf`.
+///
+/// # Errors
+/// - `student_full.shape().len() not in {2, 3}`
+/// - `indices_buf.dtype() != U32`
+/// - `indices_buf.element_count() != N * top_k`
+/// - any index `>= vocab`
+/// - underlying ops fail (propagated)
+pub fn gather_student_topk_via_tape(
+    student_full: &crate::calibrate::autograd_gpu_tape::GpuTensor,
+    indices_buf: MlxBuffer,
+    top_k: usize,
+) -> Result<crate::calibrate::autograd_gpu_tape::GpuTensor> {
+    use crate::calibrate::autograd_gpu_tape::{take_along_axis_topk, view};
+
+    let shape = student_full.shape();
+    if !(shape.len() == 2 || shape.len() == 3) {
+        return Err(anyhow!(
+            "gather_student_topk_via_tape: student_full must be 2-D [N, V] or 3-D [B, S, V]; got {:?}",
+            shape
+        ));
+    }
+    let (n, vocab) = match shape.len() {
+        2 => (shape[0], shape[1]),
+        3 => (shape[0] * shape[1], shape[2]),
+        _ => unreachable!(),
+    };
+    if top_k == 0 || top_k > vocab {
+        return Err(anyhow!(
+            "gather_student_topk_via_tape: top_k must be in (0, vocab={vocab}]; got {top_k}"
+        ));
+    }
+    if indices_buf.dtype() != DType::U32 {
+        return Err(anyhow!(
+            "gather_student_topk_via_tape: indices_buf.dtype must be U32; got {}",
+            indices_buf.dtype()
+        ));
+    }
+    let expected = n * top_k;
+    if indices_buf.element_count() != expected {
+        return Err(anyhow!(
+            "gather_student_topk_via_tape: indices_buf.element_count ({}) != N * top_k ({})",
+            indices_buf.element_count(),
+            expected
+        ));
+    }
+
+    // Vocab-range validation against the CPU-visible view.
+    {
+        let host_idx: &[u32] = indices_buf
+            .as_slice()
+            .map_err(|e| anyhow!("gather_student_topk_via_tape: as_slice (validate): {e}"))?;
+        for (i, &v) in host_idx.iter().enumerate() {
+            if (v as usize) >= vocab {
+                return Err(anyhow!(
+                    "gather_student_topk_via_tape: indices[{}] = {} >= vocab ({})",
+                    i,
+                    v,
+                    vocab
+                ));
+            }
+        }
+    }
+
+    // Reshape 3-D student_full to 2-D [N, vocab] if needed.
+    let student_2d_owner;
+    let student_2d: &crate::calibrate::autograd_gpu_tape::GpuTensor = if shape.len() == 3 {
+        student_2d_owner = view(student_full, vec![n, vocab])
+            .context("gather_student_topk_via_tape: view 3-D → 2-D")?;
+        &student_2d_owner
+    } else {
+        student_full
+    };
+
+    take_along_axis_topk(student_2d, indices_buf, top_k)
+        .context("gather_student_topk_via_tape: take_along_axis_topk")
+}
+
 /// ADR-020 iter-12d-2 — per-Linear training summary inside a model
 /// scan (one entry per successfully-trained tensor).
 #[derive(Debug, Clone)]
@@ -4211,6 +4345,276 @@ mod tests {
         assert_eq!(teacher.forward_calls, 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — `build_topk_indices_buffer` round-trips
+    /// the supplied indices into an MlxBuffer of the right
+    /// dtype + shape + element_count.
+    #[test]
+    fn build_topk_indices_buffer_roundtrips_indices() {
+        use mlx_native::{DType, MlxDevice};
+        let device = MlxDevice::new().expect("device");
+        let indices: Vec<u32> = (0..12).collect(); // 4 rows × 3 cols
+        let buf = super::build_topk_indices_buffer(&device, &indices, 4, 3).expect("buf");
+        assert_eq!(buf.dtype(), DType::U32);
+        assert_eq!(buf.element_count(), 12);
+        assert_eq!(buf.shape(), &[4, 3]);
+        let back: &[u32] = buf.as_slice().expect("read back");
+        assert_eq!(back, indices.as_slice());
+    }
+
+    /// ADR-020 AC#7 Option A — `build_topk_indices_buffer` rejects
+    /// length mismatch + zero dims.
+    #[test]
+    fn build_topk_indices_buffer_rejects_bad_inputs() {
+        use mlx_native::MlxDevice;
+        let device = MlxDevice::new().expect("device");
+        let bad_short = vec![0u32; 5];
+        let err =
+            super::build_topk_indices_buffer(&device, &bad_short, 4, 3).unwrap_err();
+        assert!(format!("{:#}", err).contains("indices.len (5)"));
+        let err = super::build_topk_indices_buffer(&device, &[], 0, 3).unwrap_err();
+        assert!(format!("{:#}", err).contains("must be > 0"));
+        let err = super::build_topk_indices_buffer(&device, &[], 3, 0).unwrap_err();
+        assert!(format!("{:#}", err).contains("must be > 0"));
+    }
+
+    /// ADR-020 AC#7 Option A — `gather_student_topk_via_tape` parity
+    /// with the CPU oracle [`take_along_topk_indices`] on the same
+    /// 3-D `[batch, seq, vocab]` slab + identical indices.
+    #[test]
+    fn gather_student_topk_via_tape_parity_with_cpu_oracle() {
+        use crate::calibrate::autograd_gpu_tape::{GpuTape, GpuTensor};
+        use mlx_native::MlxDevice;
+
+        let batch = 2;
+        let seq = 3;
+        let vocab = 32;
+        let top_k = 5;
+        let n = batch * seq;
+
+        let logits: Vec<f32> = (0..n * vocab)
+            .map(|i| ((i as f32) * 0.061 + 0.4).sin() * 4.0 - 0.2)
+            .collect();
+        // Deterministic indices: each row picks (k * 7 + r * 3) mod vocab
+        // for k in 0..top_k.  Distinct enough to exercise the gather.
+        let mut indices: Vec<u32> = Vec::with_capacity(n * top_k);
+        for r in 0..n {
+            for k in 0..top_k {
+                indices.push(((k * 7 + r * 3) % vocab) as u32);
+            }
+        }
+
+        // CPU oracle reference output.
+        let cpu = super::take_along_topk_indices(
+            &logits, &indices, batch, seq, vocab, top_k,
+        )
+        .expect("cpu");
+
+        // GPU tape path.
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let student =
+            GpuTensor::from_vec(&tape, &logits, vec![batch, seq, vocab]).expect("student");
+        let idx_buf =
+            super::build_topk_indices_buffer(tape.device(), &indices, n, top_k).expect("idx");
+        let gathered =
+            super::gather_student_topk_via_tape(&student, idx_buf, top_k).expect("gather");
+        assert_eq!(gathered.shape(), &[n, top_k]);
+        let gpu = gathered.to_vec().expect("readback");
+        assert_eq!(gpu.len(), cpu.len());
+        for i in 0..cpu.len() {
+            assert!(
+                (gpu[i] - cpu[i]).abs() < 1e-5,
+                "mismatch at {i}: gpu={} cpu={}",
+                gpu[i],
+                cpu[i]
+            );
+        }
+    }
+
+    /// ADR-020 AC#7 Option A — gather rejects out-of-range index
+    /// BEFORE launch.
+    #[test]
+    fn gather_student_topk_via_tape_rejects_out_of_range_index() {
+        use crate::calibrate::autograd_gpu_tape::{GpuTape, GpuTensor};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let student =
+            GpuTensor::from_vec(&tape, &vec![0.0_f32; 16], vec![4, 4]).expect("student");
+        // top_k=2; indices include 4 (>= vocab=4)
+        let idx = vec![0u32, 4, 1, 2, 3, 0, 2, 1];
+        let idx_buf =
+            super::build_topk_indices_buffer(tape.device(), &idx, 4, 2).expect("idx");
+        let res = super::gather_student_topk_via_tape(&student, idx_buf, 2);
+        let err = match res {
+            Ok(_) => panic!("expected out-of-range error"),
+            Err(e) => e,
+        };
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("indices[1] = 4") && msg.contains("vocab (4)"),
+            "got: {msg}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — backward path exists from a downstream
+    /// loss back through the gather: ∂loss/∂student picks up signal
+    /// only at the K gathered vocab positions; non-gathered slots
+    /// stay at 0.  Verified via a sum-loss `loss = sum(gathered)` so
+    /// `dL/dstudent[r, indices[r,k]] = 1` and 0 elsewhere.
+    #[test]
+    fn gather_student_topk_via_tape_backward_routes_grad_to_picked_indices() {
+        use crate::calibrate::autograd_gpu_tape::{
+            backward, ones_like, row_sum, scalar_mul, view, GpuTape, GpuTensor,
+        };
+        use mlx_native::MlxDevice;
+
+        let n = 4;
+        let vocab = 8;
+        let top_k = 3;
+
+        let logits: Vec<f32> = (0..n * vocab).map(|i| (i as f32) * 0.1 + 0.05).collect();
+        let indices: Vec<u32> = vec![
+            0, 3, 5, // row 0
+            1, 2, 7, // row 1
+            4, 6, 0, // row 2
+            2, 5, 3, // row 3
+        ];
+
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let student =
+            GpuTensor::from_vec(&tape, &logits, vec![n, vocab]).expect("student");
+        let idx_buf =
+            super::build_topk_indices_buffer(tape.device(), &indices, n, top_k).expect("idx");
+        let gathered =
+            super::gather_student_topk_via_tape(&student, idx_buf, top_k).expect("gather");
+        // loss = mean(gathered); backward expects grad on gathered to
+        // be 1 / (n * top_k) at every cell, propagated to student[r,
+        // indices[r,k]].
+        let s = row_sum(&gathered).expect("row_sum");
+        let s2 = view(&s, vec![1, n]).expect("view");
+        let total = row_sum(&s2).expect("row_sum total");
+        let loss = scalar_mul(&total, 1.0_f32 / (n * top_k) as f32).expect("scalar_mul");
+        let dy = ones_like(&tape, loss.shape()).expect("dy");
+        let grads = backward(&loss, dy).expect("backward");
+        let grad_buf: &[f32] = grads
+            .get(student.node_idx())
+            .and_then(|g| g.as_ref())
+            .expect("student grad")
+            .as_slice()
+            .expect("grad slice");
+
+        // Build expected grad: 1/(n*top_k) at gathered positions, 0 elsewhere.
+        let weight = 1.0_f32 / (n * top_k) as f32;
+        let mut expected = vec![0.0_f32; n * vocab];
+        for r in 0..n {
+            for k in 0..top_k {
+                let v = indices[r * top_k + k] as usize;
+                expected[r * vocab + v] += weight;
+            }
+        }
+        for i in 0..expected.len() {
+            assert!(
+                (grad_buf[i] - expected[i]).abs() < 1e-5,
+                "grad mismatch at {i}: got {} expected {}",
+                grad_buf[i],
+                expected[i]
+            );
+        }
+    }
+
+    /// ADR-020 AC#7 Option A — full pipeline:
+    ///   gather_student_topk_via_tape  →  kl_loss_topk_via_tape
+    ///   gives loss byte-equivalent to the CPU oracle pair
+    ///   take_along_topk_indices  →  kl_loss_topk_oracle.
+    #[test]
+    fn gather_then_kl_via_tape_matches_cpu_oracle_chain() {
+        use crate::calibrate::autograd_gpu_tape::{GpuTape, GpuTensor};
+        use mlx_native::MlxDevice;
+
+        let batch = 2;
+        let seq = 4;
+        let vocab = 16;
+        let top_k = 6;
+        let n = batch * seq;
+
+        let teacher_logits_full: Vec<f32> = (0..n * vocab)
+            .map(|i| ((i as f32) * 0.07 + 1.1).sin() * 5.0)
+            .collect();
+        let student_logits_full: Vec<f32> = (0..n * vocab)
+            .map(|i| ((i as f32) * 0.09 - 0.3).cos() * 3.5 + 0.4)
+            .collect();
+
+        // Indices = pick the teacher's top-K per row (here we just
+        // use a deterministic stride to keep the fixture bit-exact —
+        // no need for a real argpartition).
+        let mut indices: Vec<u32> = Vec::with_capacity(n * top_k);
+        for r in 0..n {
+            for k in 0..top_k {
+                indices.push(((k * 5 + r * 2) % vocab) as u32);
+            }
+        }
+
+        // CPU oracle chain.
+        let teacher_topk_cpu = super::take_along_topk_indices(
+            &teacher_logits_full,
+            &indices,
+            batch,
+            seq,
+            vocab,
+            top_k,
+        )
+        .expect("teacher cpu gather");
+        let student_topk_cpu = super::take_along_topk_indices(
+            &student_logits_full,
+            &indices,
+            batch,
+            seq,
+            vocab,
+            top_k,
+        )
+        .expect("student cpu gather");
+        let cpu_loss = super::kl_loss_topk_oracle(
+            &student_topk_cpu,
+            &teacher_topk_cpu,
+            n,
+            1,
+            top_k,
+            2.0,
+        )
+        .expect("cpu kl");
+
+        // GPU tape chain.
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let student_t =
+            GpuTensor::from_vec(&tape, &student_logits_full, vec![batch, seq, vocab])
+                .expect("st");
+        let teacher_t =
+            GpuTensor::from_vec(&tape, &teacher_logits_full, vec![batch, seq, vocab])
+                .expect("tt");
+        let s_idx = super::build_topk_indices_buffer(tape.device(), &indices, n, top_k)
+            .expect("s idx");
+        let t_idx = super::build_topk_indices_buffer(tape.device(), &indices, n, top_k)
+            .expect("t idx");
+        let s_topk =
+            super::gather_student_topk_via_tape(&student_t, s_idx, top_k).expect("s gather");
+        let t_topk =
+            super::gather_student_topk_via_tape(&teacher_t, t_idx, top_k).expect("t gather");
+        let loss = super::kl_loss_topk_via_tape(&s_topk, &t_topk, 2.0).expect("kl");
+        let gpu_loss = loss.to_vec().expect("readback")[0];
+
+        assert!(
+            (gpu_loss - cpu_loss).abs() < 1e-4,
+            "chain mismatch: gpu={} cpu={} (diff {})",
+            gpu_loss,
+            cpu_loss,
+            gpu_loss - cpu_loss
+        );
     }
 
     /// ADR-020 AC#7 Option A — `kl_loss_topk_via_tape` byte-equivalent
