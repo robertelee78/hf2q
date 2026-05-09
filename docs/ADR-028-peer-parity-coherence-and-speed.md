@@ -2461,6 +2461,82 @@ The remaining lever (Path A spec-decode) remains the highest-value
 investment — it's quant/path-agnostic and would close gemma4 gap
 while also lifting qwen3.6.
 
+### iter-132: session consolidation — clear status + Phase 2 GPU path
+
+#### Confirmed production state (iter-128 → iter-131 reverified)
+
+| Model    | Short context | Long context | Verdict |
+|----------|---------------|--------------|---------|
+| qwen3.6  | **128 t/s** = 1.27× peer | **110 t/s** = 1.14× peer | ✅ BEAT PEER |
+| gemma4   | 72.5 t/s = 0.71× peer | 63 t/s = <0.7× peer | ❌ LOSE PEER |
+
+Path D (NSG axis port iter-127) is correct kernel infrastructure but
+DORMANT in production CLI path because:
+1. CLI `cmd_generate_qwen35` uses `HybridKvCache::new` (legacy →
+   tq_kv_active=false) per iter-131 finding
+2. Even if engaged (engine API path), TQ-HB is slower than F32 dense at
+   qwen3.6 kv_heads=2 (-3.5% to -9% measured)
+
+The qwen3.6 1.14-1.27× peer wins are from the F32 dense path (NOT
+TQ-HB). Path D and ADR-027 Phase B are MEMORY-savings infrastructure
+(3.94× per-slot KV) that operators can opt into via the API endpoint;
+they are NOT speed wins at qwen3.6 scale.
+
+#### Path A Phase 2 GPU implementation — feasibility confirmed
+
+iter-132 traced `forward_prefill_batched` (`forward_prefill_batched.rs`,
+2324 LOC). It performs TRUE batched matmul — single forward pass with
+sequence dim = K tokens. This is the infrastructure for Shape B verify.
+
+To extend it for spec-decode verify:
+1. **Append mode**: parameter to skip "start from kv_write_pos=0" reset
+   so the K verify tokens append to existing decode state.
+2. **Per-position argmax**: capture argmax at each of the K positions
+   (currently only last-position argmax is returned).
+3. **KV rollback** on partial accept: already implemented (iter-123
+   `rollback_kv` on MlxModelWeights).
+
+Estimated scope: 200-300 LOC across forward_prefill_batched + a new
+`forward_decode_verify_batched` entrypoint + integration tests.
+
+This is multi-iter scope but no longer architecture-blocked. Path A
+Phase 2 GPU is feasible from current infrastructure.
+
+#### Standing rules added across iter-127..131
+
+1. **NSG axis as first-class kernel parallelism dimension** (iter-127)
+2. **Production TQ-HB perf claims must trace-confirm `slot.tq.is_some()=true`
+   at the SDPA call site, not just rely on `tq_kv = active` load banner**
+   (iter-130)
+3. **TQ-HB perf is per-model-per-fixture; ADR-027 "≤1% decode regression"
+   is NOT universal — re-validate per-shape for new fixtures** (iter-131)
+
+#### Closure status — explicit per the mantra
+
+| Criterion (operator-stated)        | qwen3.6 | gemma4 |
+|------------------------------------|---------|--------|
+| Coherence ≥ peers                  | ✅ MET   | ✅ MET  |
+| Speed ≥ peers                      | ✅ MET   | ❌ NOT MET (0.71× peer) |
+| TQ enabled ≥ peers                 | ✅ MET (3.94× memory savings, peer has none) | ✅ MET |
+
+ADR-028 is **partially CLOSED**:
+- qwen3.6: full mantra MET
+- gemma4: 2 of 3 met, speed gap remains structural
+
+The remaining gemma4 closure paths (all multi-iter):
+1. Path A spec-decode Phase 2 GPU (~200-300 LOC) — closes 38% gap if
+   acceptance ≥ 60%
+2. DS4 fused FFN port (~150-200 LOC) — saves dispatch encode overhead,
+   bounded ~10-20%
+3. Q5_K_M → Q4_K_M quant downgrade — operator decision, ~10-15%
+4. Port TQ-active KV from qwen35 to gemma4 (multi-iter) — would unlock
+   Path D's NSG=4 lever at gemma4 long-context, but TQ-HB overhead may
+   wipe the gain like at qwen3.6
+
+Per operator's "no shortcuts, do it right" — Path A is the next
+investment. The infrastructure is now identified
+(`forward_prefill_batched`).
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
