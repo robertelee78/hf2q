@@ -649,6 +649,135 @@ impl FullModelDwqConfig {
     }
 }
 
+/// ADR-020 AC#7 Option A — load a JSONL calibration corpus from disk
+/// and pack it into the row-major `Vec<Vec<u32>>` shape consumed by
+/// [`FullModelDwqConfig::calibration_token_batches`].
+///
+/// File format: one JSON object per line, each with a `"text"` string
+/// field (matches mlx-lm's `CompletionsDataset` convention at
+/// `mlx_lm/tuner/datasets.py:25-29`).  Lines that are pure whitespace
+/// are skipped; lines that fail to parse OR lack a string `"text"`
+/// field hard-fail (no silent skipping — mantra: fail loud).
+///
+/// Packing strategy: each prompt is independently tokenized via the
+/// supplied [`tokenizers::Tokenizer`] (with `add_special_tokens=true`,
+/// matching the production serve path at
+/// `src/serve/api/handlers.rs:6056`).  Each tokenized prompt
+/// occupies one row of the output batch:
+/// - if the prompt tokenizes to **more** than `seq_len` tokens, it is
+///   truncated to the first `seq_len` ids,
+/// - if **fewer**, the remaining slots are zero-padded.
+///
+/// Rows are accumulated `batch_size` at a time into a single flat
+/// `Vec<u32>` of length `batch_size * seq_len` (row-major: row 0 ids
+/// occupy indices `[0..seq_len)`, row 1 occupies `[seq_len..2*seq_len)`,
+/// etc.).  The trailing partial batch (`< batch_size` prompts) is
+/// **dropped** rather than padded — mlx-lm's `iterate_batches` does
+/// the same at `tuner/trainer.py:134-135` (it never yields a short
+/// batch).
+///
+/// Returns `Vec<Vec<u32>>` ready to assign to
+/// `FullModelDwqConfig::calibration_token_batches`.  Each element
+/// satisfies the `validate()` invariant `len() == batch_size *
+/// seq_len`.
+///
+/// # Errors
+/// - `path` does not exist or is not readable
+/// - `batch_size == 0` or `seq_len == 0` (multiplication would be 0)
+/// - any non-blank line is not valid JSON
+/// - any JSON object has no `"text"` field, or `"text"` is not a
+///   string
+/// - the file contains fewer than `batch_size` non-blank prompts
+///   (training would have zero batches)
+/// - the tokenizer rejects a prompt
+pub fn load_calibration_corpus_jsonl(
+    path: &std::path::Path,
+    tokenizer: &tokenizers::Tokenizer,
+    batch_size: usize,
+    seq_len: usize,
+) -> Result<Vec<Vec<u32>>> {
+    use std::io::BufRead;
+
+    if batch_size == 0 {
+        return Err(anyhow!(
+            "load_calibration_corpus_jsonl: batch_size must be > 0"
+        ));
+    }
+    if seq_len == 0 {
+        return Err(anyhow!(
+            "load_calibration_corpus_jsonl: seq_len must be > 0"
+        ));
+    }
+
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening calibration JSONL at {}", path.display()))?;
+    let reader = std::io::BufReader::new(file);
+
+    let mut tokenized_rows: Vec<Vec<u32>> = Vec::new();
+
+    for (idx, line_res) in reader.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = line_res
+            .with_context(|| format!("reading line {} of {}", line_no, path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "parsing JSONL line {} of {} as JSON",
+                line_no,
+                path.display()
+            )
+        })?;
+        let text = parsed.get("text").and_then(|v| v.as_str()).ok_or_else(|| {
+            anyhow!(
+                "JSONL line {} of {}: missing string field \"text\"",
+                line_no,
+                path.display()
+            )
+        })?;
+
+        let enc = tokenizer.encode(text, true).map_err(|e| {
+            anyhow!(
+                "tokenizing JSONL line {} of {}: {}",
+                line_no,
+                path.display(),
+                e
+            )
+        })?;
+        let ids = enc.get_ids();
+
+        let mut row: Vec<u32> = vec![0u32; seq_len];
+        let take = ids.len().min(seq_len);
+        row[..take].copy_from_slice(&ids[..take]);
+        tokenized_rows.push(row);
+    }
+
+    if tokenized_rows.len() < batch_size {
+        return Err(anyhow!(
+            "load_calibration_corpus_jsonl: file {} produced {} non-blank prompts, \
+             which is less than batch_size = {}; training would have zero batches",
+            path.display(),
+            tokenized_rows.len(),
+            batch_size,
+        ));
+    }
+
+    let n_full_batches = tokenized_rows.len() / batch_size;
+    let mut batches: Vec<Vec<u32>> = Vec::with_capacity(n_full_batches);
+    for chunk in tokenized_rows.chunks_exact(batch_size) {
+        let mut flat: Vec<u32> = Vec::with_capacity(batch_size * seq_len);
+        for row in chunk {
+            flat.extend_from_slice(row);
+        }
+        debug_assert_eq!(flat.len(), batch_size * seq_len);
+        batches.push(flat);
+    }
+
+    Ok(batches)
+}
+
 /// ADR-020 iter-12d-2 — per-Linear training summary inside a model
 /// scan (one entry per successfully-trained tensor).
 #[derive(Debug, Clone)]
@@ -2897,6 +3026,314 @@ mod tests {
         assert_eq!(custom.bits, 6);
         assert_eq!(custom.n_steps, 5);
         assert_eq!(custom.group_size, 32); // unchanged from default
+    }
+
+    /// ADR-020 AC#7 Option A — minimal WordLevel tokenizer fixture.
+    /// Each whitespace-separated word maps to a deterministic id; the
+    /// `<unk>` fallback covers any word not in vocab.  Sufficient to
+    /// exercise the JSONL loader's tokenize-truncate-pack-batch logic
+    /// without pulling a 28-MB tokenizer.json into the unit test.
+    fn fixture_wordlevel_tokenizer() -> tokenizers::Tokenizer {
+        let json = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {
+                    "<unk>": 0,
+                    "the": 1,
+                    "quick": 2,
+                    "brown": 3,
+                    "fox": 4,
+                    "jumps": 5,
+                    "over": 6,
+                    "lazy": 7,
+                    "dog": 8,
+                    "hello": 9,
+                    "world": 10,
+                    "foo": 11,
+                    "bar": 12,
+                    "baz": 13,
+                    "qux": 14
+                },
+                "unk_token": "<unk>"
+            }
+        }"#;
+        json.parse::<tokenizers::Tokenizer>()
+            .expect("fixture invariant: minimal WordLevel JSON must parse")
+    }
+
+    /// ADR-020 AC#7 Option A — happy path: 4 prompts × batch_size=2,
+    /// seq_len=8.  Expect 2 batches each of length 16, with row-major
+    /// packing where row 0 ids occupy `[0..8)` and row 1 ids occupy
+    /// `[8..16)`.  Short prompts must be zero-padded to seq_len.
+    #[test]
+    fn load_calibration_corpus_jsonl_packs_rows_correctly() {
+        let tok = fixture_wordlevel_tokenizer();
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-jsonl-pack-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("corpus.jsonl");
+        std::fs::write(
+            &path,
+            "{\"text\": \"the quick brown fox\"}\n\
+             {\"text\": \"jumps over the lazy dog\"}\n\
+             {\"text\": \"hello world\"}\n\
+             {\"text\": \"foo bar baz qux\"}\n",
+        )
+        .unwrap();
+
+        let batches = super::load_calibration_corpus_jsonl(&path, &tok, 2, 8).unwrap();
+        assert_eq!(batches.len(), 2, "4 prompts ÷ batch_size 2 = 2 batches");
+        for b in &batches {
+            assert_eq!(b.len(), 2 * 8, "each batch must be batch_size × seq_len");
+        }
+        // Batch 0 row 0 = "the quick brown fox" → [1, 2, 3, 4, 0, 0, 0, 0]
+        assert_eq!(&batches[0][0..8], &[1u32, 2, 3, 4, 0, 0, 0, 0]);
+        // Batch 0 row 1 = "jumps over the lazy dog" → [5, 6, 1, 7, 8, 0, 0, 0]
+        assert_eq!(&batches[0][8..16], &[5u32, 6, 1, 7, 8, 0, 0, 0]);
+        // Batch 1 row 0 = "hello world" → [9, 10, 0, 0, 0, 0, 0, 0]
+        assert_eq!(&batches[1][0..8], &[9u32, 10, 0, 0, 0, 0, 0, 0]);
+        // Batch 1 row 1 = "foo bar baz qux" → [11, 12, 13, 14, 0, 0, 0, 0]
+        assert_eq!(&batches[1][8..16], &[11u32, 12, 13, 14, 0, 0, 0, 0]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — truncation: a prompt longer than
+    /// `seq_len` must be truncated to its first `seq_len` ids; no
+    /// silent error.
+    #[test]
+    fn load_calibration_corpus_jsonl_truncates_long_prompts() {
+        let tok = fixture_wordlevel_tokenizer();
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-jsonl-trunc-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("corpus.jsonl");
+        // 9 tokens, seq_len=4 → first 4 only.
+        std::fs::write(
+            &path,
+            "{\"text\": \"the quick brown fox jumps over the lazy dog\"}\n\
+             {\"text\": \"hello world foo bar baz qux\"}\n",
+        )
+        .unwrap();
+
+        let batches = super::load_calibration_corpus_jsonl(&path, &tok, 2, 4).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 8);
+        assert_eq!(&batches[0][0..4], &[1u32, 2, 3, 4]); // "the quick brown fox"
+        assert_eq!(&batches[0][4..8], &[9u32, 10, 11, 12]); // "hello world foo bar"
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — drop trailing partial batch (mlx-lm
+    /// `iterate_batches` parity at `tuner/trainer.py:134-135`).  5
+    /// prompts ÷ batch_size=2 = 2 full batches; last prompt is dropped.
+    #[test]
+    fn load_calibration_corpus_jsonl_drops_partial_trailing_batch() {
+        let tok = fixture_wordlevel_tokenizer();
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-jsonl-partial-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("corpus.jsonl");
+        std::fs::write(
+            &path,
+            "{\"text\": \"the\"}\n\
+             {\"text\": \"quick\"}\n\
+             {\"text\": \"brown\"}\n\
+             {\"text\": \"fox\"}\n\
+             {\"text\": \"jumps\"}\n",
+        )
+        .unwrap();
+
+        let batches = super::load_calibration_corpus_jsonl(&path, &tok, 2, 4).unwrap();
+        assert_eq!(batches.len(), 2, "5 ÷ 2 = 2 full batches; trailing 1 dropped");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — blank lines must be skipped, not parsed.
+    #[test]
+    fn load_calibration_corpus_jsonl_skips_blank_lines() {
+        let tok = fixture_wordlevel_tokenizer();
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-jsonl-blank-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("corpus.jsonl");
+        std::fs::write(
+            &path,
+            "\n\
+             {\"text\": \"hello world\"}\n\
+             \n\
+             {\"text\": \"foo bar\"}\n\
+             \n",
+        )
+        .unwrap();
+
+        let batches = super::load_calibration_corpus_jsonl(&path, &tok, 2, 4).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 8);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — fail loud on malformed JSON line.
+    #[test]
+    fn load_calibration_corpus_jsonl_fails_on_malformed_json() {
+        let tok = fixture_wordlevel_tokenizer();
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-jsonl-malformed-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("corpus.jsonl");
+        std::fs::write(
+            &path,
+            "{\"text\": \"hello\"}\n\
+             this is not json\n\
+             {\"text\": \"world\"}\n",
+        )
+        .unwrap();
+
+        let err = super::load_calibration_corpus_jsonl(&path, &tok, 2, 4).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("line 2"),
+            "error must identify line number; got: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — fail loud when a JSON object lacks the
+    /// `"text"` field (mlx-lm CompletionsDataset convention).
+    #[test]
+    fn load_calibration_corpus_jsonl_fails_on_missing_text_field() {
+        let tok = fixture_wordlevel_tokenizer();
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-jsonl-notext-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("corpus.jsonl");
+        std::fs::write(
+            &path,
+            "{\"text\": \"ok\"}\n\
+             {\"prompt\": \"missing text key\"}\n",
+        )
+        .unwrap();
+
+        let err = super::load_calibration_corpus_jsonl(&path, &tok, 2, 4).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("\"text\"") && msg.contains("line 2"),
+            "error must call out missing text on line 2; got: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — fail loud when corpus has fewer prompts
+    /// than `batch_size` (training would have zero batches).
+    #[test]
+    fn load_calibration_corpus_jsonl_fails_when_corpus_smaller_than_batch_size() {
+        let tok = fixture_wordlevel_tokenizer();
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-jsonl-toosmall-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("corpus.jsonl");
+        std::fs::write(&path, "{\"text\": \"only one\"}\n").unwrap();
+
+        let err = super::load_calibration_corpus_jsonl(&path, &tok, 2, 4).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("less than batch_size") && msg.contains("1"),
+            "error must call out the count vs batch_size; got: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — output is consumable by
+    /// `FullModelDwqConfig::validate()` without further reshape.
+    /// End-to-end contract handshake.
+    #[test]
+    fn load_calibration_corpus_jsonl_output_satisfies_full_model_dwq_config_validate() {
+        let tok = fixture_wordlevel_tokenizer();
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-jsonl-handshake-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("corpus.jsonl");
+        // 64 prompts of varying length.
+        let mut body = String::new();
+        for i in 0..64 {
+            body.push_str(&format!(
+                "{{\"text\": \"hello world foo bar baz qux {}\"}}\n",
+                i % 5
+            ));
+        }
+        std::fs::write(&path, body).unwrap();
+
+        let batch_size = 32;
+        let seq_len = 16;
+        let batches =
+            super::load_calibration_corpus_jsonl(&path, &tok, batch_size, seq_len).unwrap();
+        assert_eq!(batches.len(), 64 / batch_size);
+
+        let cfg = super::FullModelDwqConfig {
+            gguf_path: std::path::PathBuf::from("/dev/null"),
+            calibration_token_batches: batches,
+            batch_size,
+            seq_len,
+            ..super::FullModelDwqConfig::default()
+        };
+        cfg.validate()
+            .expect("loader output must satisfy validate() contract");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ADR-020 iter-12d-2 — production driver test (real GGUF; gated
