@@ -1019,15 +1019,25 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
             k: Some(mk_buf),
             v: Some(mv_buf),
             current_len: mtp_current_len,
+            // iter-35 (sub-iter 23d-α): codec stays v2 here; TQ
+            // persistence is iter-36 = sub-iter 23d-β scope. Today
+            // the codec emits None for TQ; in-memory snapshot path
+            // (HybridKvCache::snapshot) captures TQ via Some(_).
+            tq: None,
         })
     } else {
         None
     };
 
+    // iter-35 (sub-iter 23d-α): codec stays v2 — TQ deserialize
+    // produces None per slot. iter-36 (sub-iter 23d-β) bumps the
+    // codec to v3 with `tq_present:u8` per slot to round-trip TQ.
+    let n_full_attn_slots = full_attn_k.len();
     Ok(HybridKvCacheSnapshot {
         full_attn_k,
         full_attn_v,
         full_attn_current_len,
+        full_attn_tq: (0..n_full_attn_slots).map(|_| None).collect(),
         mtp,
         linear_conv,
         linear_recurrent,
@@ -1274,10 +1284,13 @@ mod tests {
             full_attn_current_len.push(cl);
         }
 
+        let n_full_attn = full_attn_k.len();
         HybridKvCacheSnapshot {
             full_attn_k,
             full_attn_v,
             full_attn_current_len,
+            // iter-35 (sub-iter 23d-α): test fixture, no TQ.
+            full_attn_tq: (0..n_full_attn).map(|_| None).collect(),
             mtp: None,
             linear_conv: Vec::new(),
             linear_recurrent: Vec::new(),
@@ -1588,6 +1601,8 @@ mod tests {
                 k: Some(k),
                 v: Some(v),
                 current_len,
+                // iter-35 (sub-iter 23d-α): test fixture, no TQ.
+                tq: None,
             });
         }
         snap
@@ -1717,6 +1732,8 @@ mod tests {
                         .collect()
                 })
                 .collect(),
+            // iter-35 (sub-iter 23d-α): test fixture, no TQ.
+            full_attn_tq: (0..n_full_attn).map(|_| None).collect(),
             mtp: None,
             linear_conv: Vec::new(),
             linear_recurrent: Vec::new(),

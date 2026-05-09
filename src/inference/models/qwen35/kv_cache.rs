@@ -694,6 +694,18 @@ pub struct HybridKvCacheSnapshot {
     pub full_attn_v: Vec<Option<MlxBuffer>>,
     /// One per full-attn layer: per-seq write cursor at snapshot time.
     pub full_attn_current_len: Vec<Vec<u32>>,
+    /// **ADR-027 Phase B iter-35 (sub-iter 23d-α):** one per full-attn
+    /// layer — TQ-encoded K/V state at snapshot time. `Some(_)` when
+    /// the source slot had `slot.tq.is_some()` (i.e. `tq_kv_active=true`
+    /// at construction); `None` for legacy F32-only slots.
+    ///
+    /// Pairs with [`Self::full_attn_k`]: iter-34 (F32 alloc-drop) made
+    /// `full_attn_k`/`full_attn_v` `None` per slot when in TQ mode —
+    /// without this TQ snapshot field, restore would leave the new
+    /// cache's TQ buffers zero-initialized and decode would produce
+    /// garbage (LCP-resume in TQ-only mode would silently break).
+    /// iter-35 closes that gap by mirroring TQ state into the snapshot.
+    pub full_attn_tq: Vec<Option<TqKvSnapshot>>,
     /// MTP slot snapshot (present only when the source cache had one).
     pub mtp: Option<MtpKvSnapshot>,
     /// One per linear-attn (DeltaNet) layer: active conv-state bytes.
@@ -701,6 +713,42 @@ pub struct HybridKvCacheSnapshot {
     pub linear_conv: Vec<MlxBuffer>,
     /// One per linear-attn layer: active recurrent state bytes.
     pub linear_recurrent: Vec<MlxBuffer>,
+}
+
+/// **ADR-027 Phase B iter-35 (sub-iter 23d-α)** — deep-copy snapshot of
+/// one full-attn slot's TQ-encoded K/V buffers (mirrors
+/// [`TqFullAttnKvBuffers`]). Owned `MlxBuffer` allocations whose contents
+/// byte-equal the source `slot.tq.k_packed`/`k_norms`/`v_packed`/`v_norms`
+/// at snapshot time.
+///
+/// Why deep-copy and NOT Arc::clone: same rationale as the F32
+/// snapshot path (see [`HybridKvCacheSnapshot`] doc-comment) — the live
+/// cache's TQ buffers continue to be written by subsequent decode
+/// steps; aliasing would let the snapshot drift in lockstep, defeating
+/// the purpose of capturing pre-decode state.
+pub struct TqKvSnapshot {
+    /// Byte-packed K indices `[n_seqs, n_kv_heads, max_seq_len, head_dim]` U8.
+    pub k_packed: MlxBuffer,
+    /// K per-(seq, head, position) F32 norms.
+    pub k_norms: MlxBuffer,
+    /// Byte-packed V indices, same shape as `k_packed`.
+    pub v_packed: MlxBuffer,
+    /// V per-(seq, head, position) F32 norms, same shape as `k_norms`.
+    pub v_norms: MlxBuffer,
+    /// Mirrors [`TqFullAttnKvBuffers::norms_per_pos`] — captured so
+    /// restore can validate shape consistency without re-deriving from
+    /// `head_dim`.
+    pub norms_per_pos: u32,
+}
+
+impl TqKvSnapshot {
+    /// Total owned bytes — sum of all 4 buffer byte_lens.
+    pub fn total_bytes(&self) -> usize {
+        self.k_packed.byte_len()
+            + self.k_norms.byte_len()
+            + self.v_packed.byte_len()
+            + self.v_norms.byte_len()
+    }
 }
 
 /// ADR-027 Phase B iter-18 — full-attention KV byte breakdown.
@@ -767,6 +815,9 @@ pub struct MtpKvSnapshot {
     pub k: Option<MlxBuffer>,
     pub v: Option<MlxBuffer>,
     pub current_len: Vec<u32>,
+    /// **ADR-027 Phase B iter-35 (sub-iter 23d-α):** MTP slot's TQ
+    /// snapshot. Same Optional semantics as `HybridKvCacheSnapshot::full_attn_tq`.
+    pub tq: Option<TqKvSnapshot>,
 }
 
 impl HybridKvCacheSnapshot {
@@ -1353,12 +1404,17 @@ impl HybridKvCache {
         let mut full_attn_k = Vec::with_capacity(self.full_attn.len());
         let mut full_attn_v = Vec::with_capacity(self.full_attn.len());
         let mut full_attn_current_len = Vec::with_capacity(self.full_attn.len());
+        // ADR-027 Phase B iter-35 (sub-iter 23d-α): per-slot TQ snapshot
+        // mirrors slot.tq state so iter-34's TQ-only F32-drop survives
+        // LCP-resume (snapshot → restore would otherwise leave TQ
+        // buffers zero-initialized in the new request's cache → garbage
+        // decode).
+        let mut full_attn_tq = Vec::with_capacity(self.full_attn.len());
         for slot in &self.full_attn {
             // ADR-027 sub-sub-iter 23c-α: slot.k/v are Optional. None
             // marks iter-30 TQ-only state (no F32 backing); snapshot
-            // pushes None to mirror. Today the alloc path always emits
-            // Some so this is always the Some branch (zero behavior
-            // change).
+            // pushes None to mirror. iter-34 makes None the production
+            // norm under tq_kv_active=true.
             full_attn_k.push(match slot.k.as_ref() {
                 Some(buf) => Some(
                     deep_copy_buffer(device, buf).context("snapshot full_attn.k")?,
@@ -1369,6 +1425,23 @@ impl HybridKvCache {
                 Some(buf) => Some(
                     deep_copy_buffer(device, buf).context("snapshot full_attn.v")?,
                 ),
+                None => None,
+            });
+            // iter-35: capture slot.tq when present (deep-copy each of
+            // the 4 TQ buffers so the snapshot is detached from the
+            // live cache and stable across subsequent decode writes).
+            full_attn_tq.push(match slot.tq.as_ref() {
+                Some(tq) => Some(TqKvSnapshot {
+                    k_packed: deep_copy_buffer(device, &tq.k_packed)
+                        .context("snapshot full_attn.tq.k_packed")?,
+                    k_norms: deep_copy_buffer(device, &tq.k_norms)
+                        .context("snapshot full_attn.tq.k_norms")?,
+                    v_packed: deep_copy_buffer(device, &tq.v_packed)
+                        .context("snapshot full_attn.tq.v_packed")?,
+                    v_norms: deep_copy_buffer(device, &tq.v_norms)
+                        .context("snapshot full_attn.tq.v_norms")?,
+                    norms_per_pos: tq.norms_per_pos,
+                }),
                 None => None,
             });
             full_attn_current_len.push(slot.current_len.clone());
@@ -1389,6 +1462,22 @@ impl HybridKvCache {
                     None => None,
                 },
                 current_len: slot.current_len.clone(),
+                // iter-35: MTP slot's TQ snapshot (same shape as
+                // full-attn slots when present).
+                tq: match slot.tq.as_ref() {
+                    Some(tq) => Some(TqKvSnapshot {
+                        k_packed: deep_copy_buffer(device, &tq.k_packed)
+                            .context("snapshot mtp.tq.k_packed")?,
+                        k_norms: deep_copy_buffer(device, &tq.k_norms)
+                            .context("snapshot mtp.tq.k_norms")?,
+                        v_packed: deep_copy_buffer(device, &tq.v_packed)
+                            .context("snapshot mtp.tq.v_packed")?,
+                        v_norms: deep_copy_buffer(device, &tq.v_norms)
+                            .context("snapshot mtp.tq.v_norms")?,
+                        norms_per_pos: tq.norms_per_pos,
+                    }),
+                    None => None,
+                },
             }),
             None => None,
         };
@@ -1406,6 +1495,7 @@ impl HybridKvCache {
             full_attn_k,
             full_attn_v,
             full_attn_current_len,
+            full_attn_tq,
             mtp,
             linear_conv,
             linear_recurrent,
@@ -1441,11 +1531,26 @@ impl HybridKvCache {
             snapshot.linear_conv.len(),
             self.linear_attn.len()
         );
-        for (slot, (k_snap, (v_snap, len_snap))) in self.full_attn.iter_mut().zip(
+        // iter-35 (sub-iter 23d-α): full_attn_tq must align with full_attn_k
+        // count (snapshot producer iter-35 always pushes one entry per slot).
+        anyhow::ensure!(
+            snapshot.full_attn_tq.len() == snapshot.full_attn_k.len(),
+            "restore_from: snapshot full_attn_tq.len ({}) != full_attn_k.len ({})",
+            snapshot.full_attn_tq.len(),
+            snapshot.full_attn_k.len()
+        );
+        for (slot, (k_snap, (v_snap, (tq_snap, len_snap)))) in self.full_attn.iter_mut().zip(
             snapshot
                 .full_attn_k
                 .iter()
-                .zip(snapshot.full_attn_v.iter().zip(snapshot.full_attn_current_len.iter())),
+                .zip(
+                    snapshot.full_attn_v.iter().zip(
+                        snapshot
+                            .full_attn_tq
+                            .iter()
+                            .zip(snapshot.full_attn_current_len.iter()),
+                    ),
+                ),
         ) {
             // ADR-027 sub-sub-iter 23c-α: Optional full-attn K/V on
             // BOTH source (iter-23a-β) AND destination (iter-23c-α).
@@ -1457,6 +1562,20 @@ impl HybridKvCache {
             }
             if let (Some(v_buf), Some(dst_v)) = (v_snap, slot.v.as_mut()) {
                 copy_buffer_bytes(v_buf, dst_v).context("restore full_attn.v")?;
+            }
+            // iter-35 (sub-iter 23d-α): TQ restore. Mirrors F32 path's
+            // (Some,Some) source/destination guard. When source has TQ
+            // (iter-34 production case under tq_kv_active=true) AND
+            // destination slot has TQ buffers, copy all 4 byte payloads.
+            if let (Some(tq_src), Some(tq_dst)) = (tq_snap, slot.tq.as_mut()) {
+                copy_buffer_bytes(&tq_src.k_packed, &mut tq_dst.k_packed)
+                    .context("restore full_attn.tq.k_packed")?;
+                copy_buffer_bytes(&tq_src.k_norms, &mut tq_dst.k_norms)
+                    .context("restore full_attn.tq.k_norms")?;
+                copy_buffer_bytes(&tq_src.v_packed, &mut tq_dst.v_packed)
+                    .context("restore full_attn.tq.v_packed")?;
+                copy_buffer_bytes(&tq_src.v_norms, &mut tq_dst.v_norms)
+                    .context("restore full_attn.tq.v_norms")?;
             }
             anyhow::ensure!(
                 len_snap.len() == slot.current_len.len(),
@@ -1475,6 +1594,17 @@ impl HybridKvCache {
                 }
                 if let (Some(snap_v), Some(dst_v)) = (&snap.v, slot.v.as_mut()) {
                     copy_buffer_bytes(snap_v, dst_v).context("restore mtp.v")?;
+                }
+                // iter-35: MTP TQ restore.
+                if let (Some(tq_src), Some(tq_dst)) = (&snap.tq, slot.tq.as_mut()) {
+                    copy_buffer_bytes(&tq_src.k_packed, &mut tq_dst.k_packed)
+                        .context("restore mtp.tq.k_packed")?;
+                    copy_buffer_bytes(&tq_src.k_norms, &mut tq_dst.k_norms)
+                        .context("restore mtp.tq.k_norms")?;
+                    copy_buffer_bytes(&tq_src.v_packed, &mut tq_dst.v_packed)
+                        .context("restore mtp.tq.v_packed")?;
+                    copy_buffer_bytes(&tq_src.v_norms, &mut tq_dst.v_norms)
+                        .context("restore mtp.tq.v_norms")?;
                 }
                 anyhow::ensure!(
                     snap.current_len.len() == slot.current_len.len(),
@@ -2391,6 +2521,142 @@ mod tests {
                 "linear_attn[{i}].recurrent[0] not restored"
             );
         }
+    }
+
+    /// ADR-027 Phase B iter-35 (sub-iter 23d-α) — TQ snapshot round-trip
+    /// preserves byte-equal TQ-buffer state across snapshot → mutate →
+    /// restore_from cycles.
+    ///
+    /// **Load-bearing test for LCP-resume in TQ-only mode.** After
+    /// iter-34 dropped the F32 K/V backing in TQ-active mode, the
+    /// snapshot/restore path was the LAST place that still depended
+    /// on slot.k/v being Some — without this iter's TQ snapshot fields
+    /// + restore branch, an LCP-resume that hit a TQ-only cached
+    /// snapshot would copy nothing into the new request's slot.tq
+    /// buffers (zero-init), and decode would produce garbage.
+    ///
+    /// Sequence:
+    /// (1) Build TQ-active cache (post-iter-34: slot.k=None, slot.tq=Some).
+    /// (2) Plant canary bytes in slot.tq.k_packed[0..N] and v_norms.
+    /// (3) snapshot() — captures slot.tq via deep-copy.
+    /// (4) Mutate live slot.tq.k_packed[0..N] (set to different bytes).
+    /// (5) restore_from(snapshot) — copies canary bytes back.
+    /// (6) Assert slot.tq.k_packed bytes match original canary.
+    #[test]
+    fn hybrid_kv_cache_snapshot_round_trip_preserves_tq_bytes() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let mut cache = HybridKvCache::new_with_options(&cfg, &device, 16, 1, true)
+            .expect("kv tq-on");
+
+        // iter-34 invariant: slot.k/v are None, slot.tq is Some.
+        assert!(cache.full_attn[0].k.is_none(), "iter-34: slot.k must be None");
+        assert!(cache.full_attn[0].tq.is_some(), "tq alloc must be Some");
+
+        // Plant canary bytes in TQ buffers of slot 0.
+        const CANARY_K_BYTE: u8 = 0xA5;
+        const CANARY_V_BYTE: u8 = 0x5A;
+        let canary_k_norm: f32 = 1.234567;
+        let canary_v_norm: f32 = -2.345678;
+        {
+            let tq = cache.full_attn[0].tq.as_mut().expect("tq mut");
+            tq.k_packed.as_mut_slice::<u8>().expect("k_packed mut")[0] = CANARY_K_BYTE;
+            tq.v_packed.as_mut_slice::<u8>().expect("v_packed mut")[0] = CANARY_V_BYTE;
+            tq.k_norms.as_mut_slice::<f32>().expect("k_norms mut")[0] = canary_k_norm;
+            tq.v_norms.as_mut_slice::<f32>().expect("v_norms mut")[0] = canary_v_norm;
+        }
+
+        // Take snapshot.
+        let snap = cache.snapshot(&device).expect("snapshot");
+        // iter-35 contract: snapshot.full_attn_tq must have one entry per
+        // slot, all Some(_) when source had tq.
+        assert_eq!(snap.full_attn_tq.len(), cache.full_attn.len(),
+            "snapshot.full_attn_tq must align with cache.full_attn");
+        for (i, tq_snap) in snap.full_attn_tq.iter().enumerate() {
+            assert!(tq_snap.is_some(),
+                "snapshot.full_attn_tq[{i}] must be Some when slot.tq is Some");
+        }
+
+        // Mutate live cache: blow away the TQ canaries.
+        {
+            let tq = cache.full_attn[0].tq.as_mut().expect("tq mut");
+            tq.k_packed.as_mut_slice::<u8>().expect("k_packed mut")[0] = 0xFF;
+            tq.v_packed.as_mut_slice::<u8>().expect("v_packed mut")[0] = 0x00;
+            tq.k_norms.as_mut_slice::<f32>().expect("k_norms mut")[0] = -999.0;
+            tq.v_norms.as_mut_slice::<f32>().expect("v_norms mut")[0] = 999.0;
+        }
+
+        // Restore from snapshot.
+        cache.restore_from(&snap).expect("restore");
+
+        // Assert canary bytes recovered.
+        let tq_restored = cache.full_attn[0].tq.as_ref().expect("tq ref");
+        assert_eq!(
+            tq_restored.k_packed.as_slice::<u8>().expect("k_packed slice")[0],
+            CANARY_K_BYTE,
+            "tq.k_packed[0] not restored"
+        );
+        assert_eq!(
+            tq_restored.v_packed.as_slice::<u8>().expect("v_packed slice")[0],
+            CANARY_V_BYTE,
+            "tq.v_packed[0] not restored"
+        );
+        assert_eq!(
+            tq_restored.k_norms.as_slice::<f32>().expect("k_norms slice")[0],
+            canary_k_norm,
+            "tq.k_norms[0] not restored"
+        );
+        assert_eq!(
+            tq_restored.v_norms.as_slice::<f32>().expect("v_norms slice")[0],
+            canary_v_norm,
+            "tq.v_norms[0] not restored"
+        );
+    }
+
+    /// ADR-027 Phase B iter-35 — defensive: snapshot/restore in legacy
+    /// F32-only mode (no TQ) must continue to work bit-identically.
+    /// snapshot.full_attn_tq is all-None, restore_from is a no-op for
+    /// the TQ branch.
+    #[test]
+    fn hybrid_kv_cache_snapshot_restore_legacy_f32_unaffected_by_iter35() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        // Legacy F32-only mode (tq_kv_active=false).
+        let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("kv legacy");
+        assert!(cache.full_attn[0].k.is_some(), "legacy⇒Some(k)");
+        assert!(cache.full_attn[0].tq.is_none(), "legacy⇒tq None");
+
+        let snap = cache.snapshot(&device).expect("snapshot");
+        // iter-35 contract: snapshot.full_attn_tq is all-None when source
+        // has no TQ buffers.
+        for (i, tq_snap) in snap.full_attn_tq.iter().enumerate() {
+            assert!(tq_snap.is_none(),
+                "snapshot.full_attn_tq[{i}] must be None when slot.tq is None (legacy mode)");
+        }
+
+        // Plant + mutate + restore F32 K canary (legacy-style round-trip).
+        let canary_value: f32 = 7.5;
+        cache.full_attn[0].k.as_mut().unwrap().as_mut_slice::<f32>().unwrap()[0] = canary_value;
+        let snap2 = cache.snapshot(&device).expect("snapshot2");
+        cache.full_attn[0].k.as_mut().unwrap().as_mut_slice::<f32>().unwrap()[0] = -1.0;
+        cache.restore_from(&snap2).expect("restore");
+        assert_eq!(
+            cache.full_attn[0].k.as_ref().unwrap().as_slice::<f32>().unwrap()[0],
+            canary_value,
+            "legacy F32 round-trip MUST still work after iter-35 TQ field added"
+        );
     }
 
     /// Wedge-3 / iter-216 Phase B: snapshot does NOT alias the source
