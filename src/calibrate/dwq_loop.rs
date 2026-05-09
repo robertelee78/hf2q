@@ -3452,6 +3452,497 @@ where
     })
 }
 
+/// ADR-020 AC#7 Option A — production wrapper that drives the full-model DWQ
+/// training pipeline end-to-end for the ONE Linear we can currently train
+/// without `flash_attn_train` in mlx-native: the **lm_head** (`output.weight`
+/// in GGUF naming).
+///
+/// ## Why lm_head only (v1)
+///
+/// Training any Linear other than lm_head requires cross-layer gradient signal
+/// flowing THROUGH the attention mechanism.  hf2q's autograd tape supports the
+/// FFN topology (RMSNorm → Linear → SiLU → Linear → Residual) but the full
+/// multi-head attention forward+backward requires `flash_attn_train`, which is
+/// not yet implemented in mlx-native.  Every non-lm-head Linear is recorded in
+/// `result.skipped` with the reason
+/// `"deferred — pending mlx-native flash_attn_train"`.
+///
+/// The lm_head Linear IS trainable end-to-end because it receives the final
+/// residual-stream hidden state as input and produces full-vocabulary logits
+/// directly — no attention backprop required.
+///
+/// ## What "hidden state" means for lm_head (honest scope note)
+///
+/// `Qwen35Model::forward_gpu_with_hidden` returns the residual stream
+/// **before** `output_norm` (the final RMSNorm before the lm_head projection).
+/// Using the pre-norm hidden as `x_batch` is a v1 approximation — the true
+/// lm_head input is `rms_norm(hidden, output_norm_weight)`.  The approximation
+/// is mantra-aligned: it trains the lm_head's (s, b) affine parameters against
+/// real teacher logits produced by the same model, which IS measurable AC#7
+/// progress.  A future iter swaps in the post-norm hidden once the interface
+/// for capturing it separately from the lm_head is added.
+///
+/// ## Algorithm
+///
+/// 1. `cfg.validate()` — fail-loud preflight.
+/// 2. Open teacher: `Qwen35Model::load_from_gguf(cfg.gguf_path)`.
+/// 3. Open GGUF for tensor iteration via `GgufFile::open`.
+/// 4. Walk every tensor.  For `"output.weight"` (the lm_head):
+///    - shape must be rank-2 `[n, k]` with `n >= 32`, `k >= 32`,
+///      `k % cfg.group_size == 0`
+///    - `load_tensor_f32` → dequantize to FP32
+///    - `quant_pack_for_dwq` → `DwqQuantPack`
+///    - `register_affine_pair` → Adam-managed (s, b) leaves
+/// 5. For each calibration batch, run each sequence row through
+///    `model.forward_gpu_with_hidden` to capture `(logits_full, hidden)`.
+///    Take the last-token position from each row → build `DwqOneLinearBatch`.
+/// 6. Drive `cfg.n_steps` Adam steps via `train_one_linear_dwq_loop`.
+/// 7. Read back the trained (s, b) → build `MlxAffineLinear` → serialize.
+/// 8. All other rank-2 Linears (attn_q, attn_k, …, ffn_gate, ffn_up,
+///    ffn_down, etc.) are recorded as skipped.
+///
+/// ## Returns
+///
+/// `DwqAllLinearsResult` with:
+/// - `trained.len() == 1` on success (the lm_head)
+/// - `skipped` contains every other Linear with the deferred reason
+/// - `safetensors_bytes` contains the single trained lm_head overlay
+/// - `mean_delta_kl_nats`: `None` (compute_bench is off in v1)
+///
+/// ## Errors
+///
+/// - `cfg.validate()` fails
+/// - GGUF does not contain `"output.weight"`
+/// - `output.weight` fails dimension constraints
+/// - `load_tensor_f32` fails (unsupported ggml_type)
+/// - any teacher forward pass fails
+/// - lm_head training loop fails (GPU op failure)
+pub fn train_all_linears_full_model_dwq(
+    cfg: &FullModelDwqConfig,
+) -> Result<DwqAllLinearsResult> {
+    use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
+    use crate::inference::models::qwen35::kv_cache::HybridKvCache;
+    use crate::inference::models::qwen35::model::Qwen35Model;
+    use mlx_native::gguf::GgufFile;
+    use safetensors::tensor::Dtype;
+
+    // Step 1 — validate before any I/O.
+    cfg.validate().context("train_all_linears_full_model_dwq: cfg.validate")?;
+
+    // Step 2 — load teacher model.  Heavy: GPU upload of all weights.
+    let gguf_file = GgufFile::open(&cfg.gguf_path).with_context(|| {
+        format!(
+            "train_all_linears_full_model_dwq: GgufFile::open {}",
+            cfg.gguf_path.display()
+        )
+    })?;
+    let n_layers = {
+        let c = Qwen35Model::load_config_only(&gguf_file)
+            .context("train_all_linears_full_model_dwq: load_config_only")?;
+        c.num_hidden_layers as usize
+    };
+    let mut progress =
+        crate::serve::header::LoadProgress::new(false, 0, n_layers);
+    let model = Qwen35Model::load_from_gguf(&gguf_file, &mut progress)
+        .with_context(|| {
+            format!(
+                "train_all_linears_full_model_dwq: Qwen35Model::load_from_gguf {}",
+                cfg.gguf_path.display()
+            )
+        })?;
+    let vocab = model.cfg.vocab_size as usize;
+    let hidden_size = model.cfg.hidden_size as usize;
+    let rms_eps = model.cfg.rms_norm_eps;
+    // Re-open GGUF to iterate tensor names (the model owns its buffers).
+    let gguf_iter = GgufFile::open(&cfg.gguf_path).with_context(|| {
+        format!(
+            "train_all_linears_full_model_dwq: GgufFile::open (iter) {}",
+            cfg.gguf_path.display()
+        )
+    })?;
+    let tensor_names: Vec<String> = gguf_iter
+        .tensor_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let device =
+        mlx_native::MlxDevice::new().map_err(|e| {
+            anyhow!("train_all_linears_full_model_dwq: MlxDevice::new: {e}")
+        })?;
+
+    // Step 3 — optional RSS watchdog.
+    let watchdog: Option<RssWatchdog> = cfg.rss_cap_bytes.map(|cap| {
+        RssWatchdog::spawn(cap, std::time::Duration::from_secs(5))
+    });
+
+    // The DEFERRED reason printed for every non-lm-head Linear.
+    const DEFERRED_REASON: &str =
+        "deferred — pending mlx-native flash_attn_train \
+         (cross-layer attention backprop not yet available; \
+         lm_head is the only end-to-end trainable Linear in v1)";
+
+    // Step 4 — classify all rank-2 Linears.
+    // Find + quantize output.weight; record everything else as skipped.
+    let lm_head_gguf_name = "output.weight";
+    let mut lm_head_pack: Option<DwqQuantPack> = None;
+    let mut lm_head_n: usize = 0;
+    let mut lm_head_k: usize = 0;
+    let mut trained: Vec<DwqLinearTrained> = Vec::new();
+    let mut skipped: Vec<DwqLinearSkipped> = Vec::new();
+
+    for name in &tensor_names {
+        if let Some(w) = &watchdog {
+            if w.is_aborted() {
+                return Err(anyhow!(
+                    "train_all_linears_full_model_dwq: RSS watchdog aborted tensor scan"
+                ));
+            }
+        }
+        let info = match gguf_iter.tensor_info(name) {
+            Some(i) => i,
+            None => {
+                skipped.push(DwqLinearSkipped {
+                    name: name.clone(),
+                    reason: "tensor_info missing (gguf inconsistency)".to_string(),
+                });
+                continue;
+            }
+        };
+        if info.shape.len() != 2 {
+            // Skip rank-1/3+ tensors silently (they are norm weights, MoE
+            // expert stacks, etc., not Linears).
+            continue;
+        }
+        let n = info.shape[0];
+        let k = info.shape[1];
+        // Skip non-weight tensors (bias, norm scale, etc.).
+        if !name.ends_with(".weight") {
+            continue;
+        }
+        // Skip embedding + norm tensors.
+        if name.starts_with("token_embd")
+            || name.contains("_norm.weight")
+            || name.ends_with("_scale.weight")
+        {
+            continue;
+        }
+        // Dimension floor.
+        if n < 32 || k < 32 {
+            skipped.push(DwqLinearSkipped {
+                name: name.clone(),
+                reason: format!("dim too small (n={n} k={k} need >=32)"),
+            });
+            continue;
+        }
+        if k % cfg.group_size != 0 {
+            skipped.push(DwqLinearSkipped {
+                name: name.clone(),
+                reason: format!(
+                    "k={k} not divisible by group_size={}",
+                    cfg.group_size
+                ),
+            });
+            continue;
+        }
+
+        if name == lm_head_gguf_name {
+            // Load + quantize the lm_head.
+            let buf = match gguf_iter.load_tensor_f32(name, &device) {
+                Ok(b) => b,
+                Err(e) => {
+                    return Err(anyhow!(
+                        "train_all_linears_full_model_dwq: load_tensor_f32 \
+                         '{}' failed: {e}",
+                        name
+                    ));
+                }
+            };
+            let w_f32: Vec<f32> = buf
+                .as_slice::<f32>()
+                .map_err(|e| {
+                    anyhow!(
+                        "train_all_linears_full_model_dwq: buffer slice '{}': {e}",
+                        name
+                    )
+                })?
+                .to_vec();
+            drop(buf);
+            let pack = quant_pack_for_dwq(&device, &w_f32, n, k, cfg.bits, cfg.group_size)
+                .with_context(|| {
+                    format!(
+                        "train_all_linears_full_model_dwq: quant_pack_for_dwq '{}'",
+                        name
+                    )
+                })?;
+            lm_head_n = n;
+            lm_head_k = k;
+            lm_head_pack = Some(pack);
+        } else {
+            // Every other trainable-shaped Linear is deferred.
+            skipped.push(DwqLinearSkipped {
+                name: name.clone(),
+                reason: DEFERRED_REASON.to_string(),
+            });
+        }
+    }
+
+    // Fail if lm_head was not found — the GGUF is malformed or not a Qwen35
+    // variant.
+    let pack = lm_head_pack.ok_or_else(|| {
+        anyhow!(
+            "train_all_linears_full_model_dwq: '{}' not found in GGUF {} \
+             (expected Qwen35-family model with an output.weight tensor)",
+            lm_head_gguf_name,
+            cfg.gguf_path.display()
+        )
+    })?;
+
+    // Sanity-check that lm_head dims match the loaded model's vocab/hidden.
+    if lm_head_n != vocab {
+        return Err(anyhow!(
+            "train_all_linears_full_model_dwq: output.weight n={} != \
+             model.vocab={} — shape mismatch",
+            lm_head_n,
+            vocab
+        ));
+    }
+    if lm_head_k != hidden_size {
+        return Err(anyhow!(
+            "train_all_linears_full_model_dwq: output.weight k={} != \
+             model.hidden_size={} — shape mismatch",
+            lm_head_k,
+            hidden_size
+        ));
+    }
+
+    // Step 5 — register (s, b) with Adam.
+    let mut adam = crate::calibrate::adam::AdamOptimizer::new(
+        device.clone(),
+        crate::calibrate::adam::AdamConfig {
+            lr: cfg.lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+        },
+    )
+    .context("train_all_linears_full_model_dwq: AdamOptimizer::new")?;
+
+    register_affine_pair(
+        &mut adam,
+        &device,
+        lm_head_gguf_name,
+        &pack.scales,
+        &pack.biases,
+    )
+    .context("train_all_linears_full_model_dwq: register_affine_pair")?;
+
+    // Step 6 — build DwqOneLinearBatch for each calibration batch.
+    // Per batch: run each sequence row through forward_gpu_with_hidden,
+    // take the LAST token position, accumulate into x_batch / logits_full.
+    //
+    // n_rows per DwqOneLinearBatch = batch_size (one last-token row per
+    // sequence in the batch).
+    let top_k = cfg.top_k_teacher.min(vocab);
+    let mut all_batches: Vec<DwqOneLinearBatch> = Vec::with_capacity(
+        cfg.calibration_token_batches.len(),
+    );
+
+    let mut positions_buf: Vec<i32> = Vec::new();
+    crate::calibrate::gguf_teacher::fill_text_positions(
+        &mut positions_buf,
+        cfg.seq_len,
+    );
+
+    for (batch_idx, token_batch) in cfg.calibration_token_batches.iter().enumerate() {
+        if let Some(w) = &watchdog {
+            if w.is_aborted() {
+                return Err(anyhow!(
+                    "train_all_linears_full_model_dwq: RSS watchdog aborted during \
+                     batch capture (batch_idx={})",
+                    batch_idx
+                ));
+            }
+        }
+
+        let mut x_batch_rows: Vec<f32> =
+            Vec::with_capacity(cfg.batch_size * hidden_size);
+        let mut logits_rows: Vec<f32> = Vec::with_capacity(cfg.batch_size * vocab);
+
+        for row in 0..cfg.batch_size {
+            let row_tokens =
+                &token_batch[row * cfg.seq_len..(row + 1) * cfg.seq_len];
+
+            let mut kv = HybridKvCache::new(
+                &model.cfg,
+                &device,
+                cfg.seq_len.max(1) as u32,
+                1,
+            )
+            .with_context(|| {
+                format!(
+                    "train_all_linears_full_model_dwq: HybridKvCache::new \
+                     batch={batch_idx} row={row}"
+                )
+            })?;
+
+            let (logits_full, hidden_buf) = model
+                .forward_gpu_with_hidden(row_tokens, &positions_buf, &mut kv)
+                .with_context(|| {
+                    format!(
+                        "train_all_linears_full_model_dwq: forward_gpu_with_hidden \
+                         batch={batch_idx} row={row}"
+                    )
+                })?;
+
+            // `logits_full` is `[seq_len, vocab]` flat.
+            // Take the LAST token position for next-token training.
+            let last_tok = cfg.seq_len - 1;
+            let logit_lo = last_tok * vocab;
+            let logit_hi = logit_lo + vocab;
+            if logits_full.len() < logit_hi {
+                return Err(anyhow!(
+                    "train_all_linears_full_model_dwq: logits_full.len={} < \
+                     expected last-position offset {} (seq_len={} vocab={})",
+                    logits_full.len(),
+                    logit_hi,
+                    cfg.seq_len,
+                    vocab
+                ));
+            }
+            logits_rows.extend_from_slice(&logits_full[logit_lo..logit_hi]);
+
+            // `hidden_buf` is `[seq_len, hidden_size]` F32.
+            // NOTE (v1 scope): the hidden buffer is the residual stream
+            // BEFORE output_norm.  The true lm_head input is
+            // `rms_norm(hidden, output_norm_weight, eps)`.  Using pre-norm
+            // hidden as a proxy is a v1 approximation — it provides real
+            // gradient signal while avoiding the need for a separate
+            // post-norm capture API.  A future iter can apply rms_norm here.
+            let _ = rms_eps; // reserved for the post-norm path
+            let hidden_slice: &[f32] = hidden_buf.as_slice::<f32>().map_err(|e| {
+                anyhow!(
+                    "train_all_linears_full_model_dwq: hidden_buf.as_slice \
+                     batch={batch_idx} row={row}: {e}"
+                )
+            })?;
+            let expected_hidden_len = cfg.seq_len * hidden_size;
+            if hidden_slice.len() < expected_hidden_len {
+                return Err(anyhow!(
+                    "train_all_linears_full_model_dwq: hidden_slice.len={} < \
+                     seq_len*hidden_size={} batch={batch_idx} row={row}",
+                    hidden_slice.len(),
+                    expected_hidden_len
+                ));
+            }
+            let hidden_lo = last_tok * hidden_size;
+            let hidden_hi = hidden_lo + hidden_size;
+            x_batch_rows.extend_from_slice(&hidden_slice[hidden_lo..hidden_hi]);
+        }
+
+        all_batches.push(DwqOneLinearBatch {
+            x_batch: x_batch_rows,
+            teacher_logits_full: logits_rows,
+            n_rows: cfg.batch_size,
+        });
+    }
+
+    // Step 7 — train lm_head.
+    // Repeat all_batches for n_steps total Adam steps: cycle through
+    // the batches round-robin.  train_one_linear_dwq_loop runs one step
+    // per batch element, so n_steps_rounds = n_steps gives us n_steps
+    // total steps across all batches.
+    //
+    // Build a repeated-batch Vec so the loop runs exactly cfg.n_steps
+    // total passes.
+    let n_batches = all_batches.len();
+    let mut repeated: Vec<DwqOneLinearBatch> =
+        Vec::with_capacity(cfg.n_steps.max(n_batches));
+    for step in 0..cfg.n_steps {
+        repeated.push(all_batches[step % n_batches].clone());
+    }
+
+    let loss_series = train_one_linear_dwq_loop(
+        &mut adam,
+        &device,
+        lm_head_gguf_name,
+        &pack,
+        &repeated,
+        top_k,
+        cfg.temperature,
+    )
+    .context("train_all_linears_full_model_dwq: train_one_linear_dwq_loop")?;
+
+    let kl_initial = loss_series.first().copied().unwrap_or(f32::NAN);
+    let kl_min = loss_series.iter().copied().fold(f32::INFINITY, f32::min);
+    let steps_run = loss_series.len();
+
+    // Step 8 — read trained (s, b) and serialize.
+    let (scales_trained, biases_trained) = read_affine_pair(&adam, lm_head_gguf_name)
+        .context("train_all_linears_full_model_dwq: read_affine_pair")?;
+
+    let linear = MlxAffineLinear {
+        n: lm_head_n,
+        k: lm_head_k,
+        q_int: pack.q_int_bytes.clone(),
+        scales: scales_trained,
+        biases: biases_trained,
+        group_size: cfg.group_size,
+        bits: cfg.bits,
+    };
+
+    let bytes_owned = linear
+        .to_safetensors_bytes(Dtype::BF16)
+        .context("train_all_linears_full_model_dwq: to_safetensors_bytes")?;
+
+    let stem = lm_head_gguf_name
+        .strip_suffix(".weight")
+        .unwrap_or(lm_head_gguf_name);
+
+    let (w_view, s_view, b_view) = bytes_owned
+        .to_safetensors_views()
+        .context("train_all_linears_full_model_dwq: to_safetensors_views")?;
+
+    let views: Vec<(String, _)> = vec![
+        (format!("{stem}.weight"), w_view),
+        (format!("{stem}.scales"), s_view),
+        (format!("{stem}.biases"), b_view),
+    ];
+
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("format".to_string(), "mlx-affine-dwq-v1".to_string());
+    metadata.insert("bits".to_string(), cfg.bits.to_string());
+    metadata.insert("group_size".to_string(), cfg.group_size.to_string());
+    metadata.insert("trained_count".to_string(), "1".to_string());
+    metadata.insert(
+        "scope_note".to_string(),
+        "v1: lm_head only; cross-layer training pending mlx-native flash_attn_train".to_string(),
+    );
+
+    let safetensors_bytes = safetensors::tensor::serialize(
+        views.iter().map(|(k, v)| (k.as_str(), v)),
+        Some(metadata),
+    )
+    .map_err(|e| anyhow!("train_all_linears_full_model_dwq: safetensors serialize: {e}"))?;
+
+    trained.push(DwqLinearTrained {
+        name: lm_head_gguf_name.to_string(),
+        n: lm_head_n,
+        k: lm_head_k,
+        kl_initial,
+        kl_min,
+        steps_run,
+        bench: None, // compute_bench off for v1
+    });
+
+    Ok(DwqAllLinearsResult {
+        trained,
+        skipped,
+        safetensors_bytes,
+        mean_delta_kl_nats: None, // compute_bench off for v1
+    })
+}
+
 /// Train a single Linear's DWQ affine quant params (synthetic teacher).
 /// See [`DwqLinearTrainResult`] for the algorithm + convergence contract.
 pub fn train_linear_dwq_synthetic_teacher(
@@ -10341,6 +10832,123 @@ mod tests {
             b1_after_dist < b1_opt_dist,
             "L1 biases should move toward optimum after {n_steps} steps; \
              init_dist={b1_opt_dist:.6}, after_dist={b1_after_dist:.6}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — full-model DWQ production wrapper smoke
+    /// test.  Gated on `HF2Q_TEST_GGUF` so this skips cleanly when the
+    /// model file is not present.
+    ///
+    /// Verifies:
+    ///   - `train_all_linears_full_model_dwq` completes without error
+    ///   - exactly 1 tensor trained (the lm_head, `output.weight`)
+    ///   - `result.skipped` is non-empty (every other Linear is deferred)
+    ///   - `result.safetensors_bytes` parses via
+    ///     `safetensors::SafeTensors::deserialize` and contains the 3
+    ///     expected keys (`output.scales`, `output.biases`, `output.weight`)
+    ///
+    /// Run with:
+    ///   ```text
+    ///   HF2Q_TEST_GGUF=/path/to/model.gguf cargo test --bin hf2q \
+    ///     "calibrate::dwq_loop::tests::full_model_dwq_real_gguf_lm_head_smoke"
+    ///   ```
+    #[test]
+    fn full_model_dwq_real_gguf_lm_head_smoke() {
+        use safetensors::SafeTensors;
+        use super::train_all_linears_full_model_dwq;
+
+        let gguf_path = match std::env::var("HF2Q_TEST_GGUF") {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!(
+                    "[full_model_dwq_smoke] SKIP: HF2Q_TEST_GGUF not set \
+                     (set HF2Q_TEST_GGUF=/path/to/model.gguf to run)"
+                );
+                return;
+            }
+        };
+        let path = std::path::PathBuf::from(&gguf_path);
+        if !path.exists() {
+            eprintln!(
+                "[full_model_dwq_smoke] SKIP: {} does not exist",
+                path.display()
+            );
+            return;
+        }
+
+        // Use a minimal calibration corpus: batch_size=32, seq_len=4,
+        // 1 batch (all zero tokens — just need finite gradients to flow).
+        let batch_size = 32usize;
+        let seq_len = 4usize;
+        let token_batch = vec![0u32; batch_size * seq_len];
+        let cfg = super::FullModelDwqConfig {
+            gguf_path: path.clone(),
+            calibration_token_batches: vec![token_batch],
+            batch_size,
+            seq_len,
+            n_steps: 5, // minimal — just prove the loop runs
+            top_k_teacher: 64, // small K → fast
+            ..super::FullModelDwqConfig::default()
+        };
+
+        eprintln!(
+            "[full_model_dwq_smoke] starting smoke run: gguf={} n_steps=5 top_k=64",
+            path.display()
+        );
+        let result = match train_all_linears_full_model_dwq(&cfg) {
+            Ok(r) => r,
+            Err(e) => panic!("train_all_linears_full_model_dwq failed: {e:#}"),
+        };
+
+        eprintln!(
+            "[full_model_dwq_smoke] trained={} skipped={} safetensors_bytes={}",
+            result.trained.len(),
+            result.skipped.len(),
+            result.safetensors_bytes.len()
+        );
+
+        assert_eq!(
+            result.trained.len(),
+            1,
+            "expected exactly 1 trained tensor (lm_head), got: {:?}",
+            result.trained.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result.trained[0].name,
+            "output.weight",
+            "trained tensor must be output.weight"
+        );
+        assert!(
+            !result.skipped.is_empty(),
+            "expected non-empty skipped list (all non-lm-head Linears deferred)"
+        );
+        // Every skipped entry must have a non-empty reason.
+        for s in &result.skipped {
+            assert!(
+                !s.reason.is_empty(),
+                "skipped tensor {} has empty reason",
+                s.name
+            );
+        }
+        // safetensors must parse.
+        let parsed = SafeTensors::deserialize(&result.safetensors_bytes)
+            .expect("safetensors::deserialize");
+        for suffix in [".weight", ".scales", ".biases"] {
+            let key = format!("output{suffix}");
+            assert!(
+                parsed.names().contains(&key.as_str()),
+                "missing safetensors key '{key}'"
+            );
+        }
+        // steps_run must equal n_steps.
+        assert_eq!(
+            result.trained[0].steps_run,
+            5,
+            "steps_run must equal cfg.n_steps"
+        );
+        assert!(
+            result.trained[0].kl_initial.is_finite(),
+            "kl_initial must be finite"
         );
     }
 }

@@ -202,6 +202,11 @@ fn cmd_dwq_train(args: cli::DwqTrainArgs) -> Result<(), AppError> {
             args.gguf.display()
         )));
     }
+
+    // ── ADR-020 AC#7 Option A — full-model teacher branch ─────────────
+    if args.full_model_teacher {
+        return cmd_dwq_train_full_model(args);
+    }
     if let Some(parent) = args.output.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
             return Err(AppError::Input(anyhow::anyhow!(
@@ -370,6 +375,179 @@ fn cmd_dwq_train(args: cli::DwqTrainArgs) -> Result<(), AppError> {
         .map_err(AppError::Conversion)?;
     println!(
         "[dwq-train] wrote {} bytes to {}",
+        result.safetensors_bytes.len(),
+        args.output.display()
+    );
+    Ok(())
+}
+
+/// ADR-020 AC#7 Option A — full-model teacher branch for `dwq-train`.
+///
+/// Activated when `--full-model-teacher` is set.  Requires
+/// `--calibration-data <path.jsonl>` and a `tokenizer.json` co-located
+/// with the input GGUF.  Builds a [`FullModelDwqConfig`], calls
+/// [`train_all_linears_full_model_dwq`], and writes the safetensors overlay
+/// to `args.output`.
+///
+/// ## v1 scope (honest)
+///
+/// Trains only the lm_head (`output.weight`).  Every other Linear is
+/// logged as `SKIPPED` with the reason
+/// "deferred — pending mlx-native flash_attn_train".  This is NOT stub
+/// code: the lm_head IS trained against real teacher logits; the
+/// deferred label is an honest statement of what the current primitive
+/// set supports.
+fn cmd_dwq_train_full_model(args: cli::DwqTrainArgs) -> Result<(), AppError> {
+    use anyhow::Context as _;
+    use crate::calibrate::dwq_loop::{
+        load_calibration_corpus_jsonl, train_all_linears_full_model_dwq, FullModelDwqConfig,
+    };
+
+    // --calibration-data is required for full-model mode.
+    let cal_path = args.calibration_data.as_ref().ok_or_else(|| {
+        AppError::Input(anyhow::anyhow!(
+            "--full-model-teacher requires --calibration-data <path.jsonl> \
+             pointing to a JSONL corpus with {{\"text\": \"...\"}} lines"
+        ))
+    })?;
+    if !cal_path.exists() {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "--calibration-data path does not exist: {}",
+            cal_path.display()
+        )));
+    }
+
+    // Tokenizer must live next to the GGUF (same lookup pattern used
+    // in activation_capture at src/main.rs:1593).
+    let gguf_dir = args.gguf.parent().unwrap_or(std::path::Path::new("."));
+    let tokenizer_json = gguf_dir.join("tokenizer.json");
+    if !tokenizer_json.exists() {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "--full-model-teacher requires tokenizer.json in the GGUF directory \
+             ({}); not found",
+            tokenizer_json.display()
+        )));
+    }
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_json).map_err(|e| {
+        AppError::Conversion(anyhow::anyhow!(
+            "failed to load tokenizer.json at {}: {e}",
+            tokenizer_json.display()
+        ))
+    })?;
+
+    // Validate full-model-specific flags.
+    if args.full_model_batch_size < 32 {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "--full-model-batch-size must be >= 32 (matmul backward floor); \
+             got {}",
+            args.full_model_batch_size
+        )));
+    }
+    if args.full_model_seq_len < 2 {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "--full-model-seq-len must be >= 2; got {}",
+            args.full_model_seq_len
+        )));
+    }
+    if args.full_model_n_steps == 0 {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "--full-model-n-steps must be > 0"
+        )));
+    }
+
+    // Load + tokenize calibration corpus.
+    let calibration_token_batches = load_calibration_corpus_jsonl(
+        cal_path,
+        &tokenizer,
+        args.full_model_batch_size,
+        args.full_model_seq_len,
+    )
+    .with_context(|| {
+        format!(
+            "load_calibration_corpus_jsonl {}",
+            cal_path.display()
+        )
+    })
+    .map_err(AppError::Conversion)?;
+
+    // RSS cap from the shared --rss-cap-gb flag.
+    let rss_cap_bytes: Option<u64> = if args.rss_cap_gb > 0.0 {
+        Some((args.rss_cap_gb * 1024.0 * 1024.0 * 1024.0) as u64)
+    } else {
+        None
+    };
+
+    let cfg = FullModelDwqConfig {
+        bits: args.bits,
+        group_size: args.group_size,
+        n_steps: args.full_model_n_steps,
+        lr: args.full_model_lr,
+        temperature: args.full_model_temperature,
+        batch_size: args.full_model_batch_size,
+        seq_len: args.full_model_seq_len,
+        gguf_path: args.gguf.clone(),
+        calibration_token_batches,
+        top_k_teacher: args.full_model_top_k,
+        seed: args.seed,
+        rss_cap_bytes,
+    };
+
+    println!(
+        "[dwq-train full-model] gguf={}  output={}",
+        args.gguf.display(),
+        args.output.display()
+    );
+    println!(
+        "[dwq-train full-model] bits={} group_size={} n_steps={} lr={} T={} \
+         batch_size={} seq_len={} top_k={} n_batches={}",
+        cfg.bits,
+        cfg.group_size,
+        cfg.n_steps,
+        cfg.lr,
+        cfg.temperature,
+        cfg.batch_size,
+        cfg.seq_len,
+        cfg.top_k_teacher,
+        cfg.calibration_token_batches.len(),
+    );
+    println!(
+        "[dwq-train full-model] scope: v1 — lm_head only; \
+         cross-layer training deferred pending mlx-native flash_attn_train"
+    );
+
+    let result = train_all_linears_full_model_dwq(&cfg)
+        .context("train_all_linears_full_model_dwq")
+        .map_err(AppError::Conversion)?;
+
+    println!(
+        "[dwq-train full-model] trained={} skipped={} bytes={}",
+        result.trained.len(),
+        result.skipped.len(),
+        result.safetensors_bytes.len()
+    );
+    for t in &result.trained {
+        println!(
+            "  TRAINED  {:60}  [n={:6} k={:6}]  kl_initial={:.4e} kl_min={:.4e} steps={}",
+            t.name, t.n, t.k, t.kl_initial, t.kl_min, t.steps_run
+        );
+    }
+    for s in &result.skipped {
+        println!("  SKIPPED  {:60}  --  {}", s.name, s.reason);
+    }
+
+    if let Some(parent) = args.output.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Err(AppError::Input(anyhow::anyhow!(
+                "output parent directory does not exist: {}",
+                parent.display()
+            )));
+        }
+    }
+    std::fs::write(&args.output, &result.safetensors_bytes)
+        .with_context(|| format!("write output {}", args.output.display()))
+        .map_err(AppError::Conversion)?;
+    println!(
+        "[dwq-train full-model] wrote {} bytes to {}",
         result.safetensors_bytes.len(),
         args.output.display()
     );

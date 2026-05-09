@@ -253,6 +253,60 @@ pub struct DwqTrainArgs {
     /// at startup.
     #[arg(long)]
     pub tensor_filter: Option<String>,
+
+    // ── ADR-020 AC#7 Option A — full-model DWQ flags ──────────────────
+    // These flags activate the `train_all_linears_full_model_dwq` path
+    // that uses a real teacher forward pass instead of the synthetic
+    // Box-Muller proxy.  They are ignored when `--full-model-teacher`
+    // is false (the default).
+    //
+    // v1 scope: trains only the lm_head (`output.weight`); all other
+    // Linears are logged as deferred pending mlx-native `flash_attn_train`.
+
+    /// Switch to full-model teacher mode.  When set, `--calibration-data`
+    /// (JSONL corpus) is required and a tokenizer.json must be present
+    /// in the same directory as the input GGUF.
+    #[arg(long, default_value_t = false)]
+    pub full_model_teacher: bool,
+
+    /// Path to a JSONL calibration corpus for full-model teacher mode.
+    /// Each line must be a JSON object with a `"text"` string field
+    /// (matches mlx-lm's CompletionsDataset format).
+    /// Required when `--full-model-teacher` is set.
+    #[arg(long, value_name = "PATH")]
+    pub calibration_data: Option<PathBuf>,
+
+    /// Number of Adam steps for full-model teacher mode.  Default 200
+    /// (mlx-lm production default; use ≥200 for real training).
+    #[arg(long, default_value_t = 200)]
+    pub full_model_n_steps: usize,
+
+    /// Adam learning rate for full-model teacher mode.  Default 1e-4
+    /// (matches mlx-lm `dwq.py` default; lr=0.01 is known to explode
+    /// on the lm_head fixture — see ADR-020 AC#7 Adam test notes).
+    #[arg(long, default_value_t = 1e-4)]
+    pub full_model_lr: f32,
+
+    /// Distillation temperature for full-model teacher mode.
+    /// Default 2.0 (matches mlx-lm `dwq.py:106`).
+    #[arg(long, default_value_t = 2.0)]
+    pub full_model_temperature: f32,
+
+    /// Calibration batch size for full-model teacher mode.  Must be
+    /// >= 32 (matmul backward kernel floor).  Default 32.
+    #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(usize))]
+    pub full_model_batch_size: usize,
+
+    /// Calibration sequence length for full-model teacher mode.
+    /// Must be >= 2.  Default 512.
+    #[arg(long, default_value_t = 512)]
+    pub full_model_seq_len: usize,
+
+    /// Top-K teacher logits to retain per position in full-model mode.
+    /// Smaller K = smaller teacher footprint; default 1024 matches
+    /// mlx-lm's `compute_dwq_targets` default.
+    #[arg(long, default_value_t = 1024)]
+    pub full_model_top_k: usize,
 }
 
 /// `hf2q cache` subcommands. ADR-005 Phase 3 iter-205 (AC line 5351).
