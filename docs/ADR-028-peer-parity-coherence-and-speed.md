@@ -285,6 +285,73 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-92 llama.cpp HEAD pipeline compile log → concrete fusion candidates
+
+Captured llama.cpp build-9078 actual decode-time pipeline compile log
+via `llama-bench -v -p 0 -n 32 -fa 1 -r 1`. The pipelines llama.cpp
+loads at decode-time on gemma APEX-Q5_K_M, with their function-constant
+suffixes, are direct evidence of which kernels they ACTUALLY use:
+
+```
+kernel_mul_mv_q6_K_f32_nsg=2                       (Q6_K mv at decode)
+kernel_flash_attn_ext_vec_f16_dk256_dv256_...nsg=1_nwg=32  (FA-vec split-K!)
+kernel_flash_attn_ext_vec_reduce_dv=256_nwg=32             (FA-vec reduce)
+kernel_rms_norm_mul_add_f32_4                              (3-op fused norm)
+kernel_bin_fuse_f32_f32_f32_4_op=2_nf=1_rb=1_cb=0          (fused binary)
+kernel_rms_norm_f32_4                                      (rms-norm scalar)
+kernel_rope_neox_f32_imrope=0
+kernel_set_rows_f16_i64                                    (F16 KV writes)
+kernel_soft_max_f32_4
+kernel_cpy_f32_f16
+```
+
+**Fusion-gap quantification** (for hf2q decode-path attacks):
+
+1. **`kernel_rms_norm_mul_add_f32_4`** (3-op fused) — we have only
+   `rms_norm_mul_f32` (2-op). Per layer, gemma decode does ~3 norms
+   that include downstream mul+add (PRE_ATTN_NORM, POST_ATTN_NORM_ADD,
+   END_LAYER_NORM_ADD). Each unfused = 2 dispatches; fused = 1. Savings
+   per token: ~3 × 30 = 90 dispatches × 15.86 µs ≈ 1.4 ms = **9% decode
+   speedup**.
+
+2. **`kernel_bin_fuse_f32_f32_f32_4`** (fused elementwise multiply) —
+   used by llama.cpp's gate_silu × up flow for SwiGLU. We have
+   `mul_mv_id_q4_0_f32_swiglu` (kernel-fused gate+up+swiglu+matmul)
+   for Q4_0 ONLY. Gemma uses Q6_K experts → falls to the slow path.
+   Adding Q6_K and Q5_K swiglu-fused mv_id kernels could save ~2
+   dispatches per layer × 30 layers = 60 dispatches ≈ **6% decode
+   speedup**.
+
+3. **`kernel_flash_attn_ext_vec_..._nwg=32`** (split-K FA-vec) —
+   llama.cpp parallelizes the K dimension across 32 work-groups, then
+   does a separate reduce kernel. We do single-pass FA-vec without
+   split-K. For long-context decode (e.g. tg256), split-K can be 1.5-2×
+   faster on the FA-vec dispatch. Savings depend on context length.
+
+4. **`kernel_set_rows_f16_i64`** + **F16 KV cache** — llama.cpp uses F16
+   KV (not TQ-HB) at decode. We use TQ-HB (per ADR-027 for 3.94×
+   memory). The TQ-HB path adds 4-5 dispatches per layer (FWHT
+   premult + hadamard + quantize + dequant + FWHT undo). Skipping
+   TQ-HB at decode saves ~150 dispatches/token = 2.4 ms but TRADES
+   3.94× KV memory savings. Operator-gated tradeoff.
+
+**Iter-92 concrete attack ordering** (by ROI):
+- Highest: port `rms_norm_mul_add_f32_4` (existing rms_norm + mul +
+  fused_norm_add infra → merge into a 3-op kernel). Estimated 9%
+  decode speedup. ~150 LOC + tests + bench. Iter-93 candidate.
+- Next: port `bin_fuse_f32_f32_f32_4` for elementwise mul.
+- Next: Q6_K + Q5_K swiglu-fused mv_id (matches our Q4_0 swiglu
+  pattern from gpu_ffn.rs). ~80 LOC per quant. Iter-94 candidate.
+- Lower: FA-vec split-K (nwg=32) — biggest engineering effort.
+- Operator-gated: F16 KV at decode (conflicts with ADR-027 TQ-HB).
+
+The Q6_K mv_id y-reuse refactor (iter-91 candidate) is **lower
+priority** than these fusions: the static-evidence hypothesis is
+~5-10%, while these fusions have direct measurement support from
+llama.cpp's actual kernel inventory. Per standing rule
+`feedback_metal_compiler_auto_optimizes_static_levers`, prefer
+hypotheses with empirical support.
+
 ### Iter-91 mv_id Q6_K kernel structural difference (concrete decode attack candidate)
 
 Direct code-read comparison of Q6_K mv_id kernel between hf2q
