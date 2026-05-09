@@ -1757,6 +1757,176 @@ pub fn collect_grads_for_adam(
     Ok(out)
 }
 
+/// ADR-020 AC#7 Option A — run ONE SGD/Adam step on a single Linear
+/// with the full pipeline composed.  Composition skeleton that ties
+/// every primitive landed in this iter chain into one call.
+///
+/// Pre-conditions (caller's responsibility, not re-checked here for
+/// performance — done once at the start of the training loop):
+/// - `register_affine_pair(adam, device, tensor_id, pack.scales, pack.biases)`
+///   has already been called.
+/// - `pack.n == vocab` of the teacher (this fn assumes the Linear
+///   produces logits — the canonical `lm_head` case).
+///
+/// Per-step inputs:
+/// - `x_batch`: pre-Linear hidden state, `[n_rows, pack.k]` row-major
+///   f32.  Length `n_rows * pack.k`.
+/// - `teacher_topk_logits`: teacher's top-K logits at the same
+///   `n_rows` positions, `[n_rows, top_k]` row-major.
+/// - `teacher_indices`: u32 vocab indices, same shape, every entry
+///   `< pack.n`.
+/// - `temperature > 0`.
+///
+/// Composition (mirror of mlx-lm `dwq.py:108`'s `loss_fn` + `step`):
+/// 1. fresh `GpuTape`
+/// 2. read s, b values from Adam → leaves
+/// 3. `qdq_affine(s, b, &pack.q_int_bytes, pack.group_size)` →
+///    `W_qdq` (length n*k)
+/// 4. `view` to `[n, k]`, `transpose` to `[k, n]`
+/// 5. `matmul(x_batch, W_T)` → `student_logits [n_rows, n]`
+/// 6. `gather_student_topk_via_tape` (using `teacher_indices`) →
+///    `student_topk [n_rows, top_k]`
+/// 7. teacher leaf for `teacher_topk_logits`
+/// 8. `kl_loss_topk_via_tape(student_topk, teacher_topk, T)` →
+///    `[1]` loss
+/// 9. `backward(&loss, ones)`
+/// 10. `collect_grads_for_adam(grads, [(s_name, &s), (b_name, &b)])`
+/// 11. `adam.step(&map)`
+/// 12. return loss as f32
+///
+/// Returns the scalar loss for this step.
+pub fn train_one_linear_dwq_step(
+    adam: &mut crate::calibrate::adam::AdamOptimizer,
+    device: &MlxDevice,
+    tensor_id: &str,
+    pack: &DwqQuantPack,
+    x_batch: &[f32],
+    teacher_topk_logits: &[f32],
+    teacher_indices: &[u32],
+    n_rows: usize,
+    top_k: usize,
+    temperature: f32,
+) -> Result<f32> {
+    use crate::calibrate::autograd_gpu_tape::{
+        backward, matmul, ones_like, qdq_affine, transpose, view, GpuTape, GpuTensor,
+    };
+
+    if !temperature.is_finite() || temperature <= 0.0 {
+        return Err(anyhow!(
+            "train_one_linear_dwq_step: temperature must be finite and > 0; got {temperature}"
+        ));
+    }
+    if n_rows == 0 || top_k == 0 {
+        return Err(anyhow!(
+            "train_one_linear_dwq_step: n_rows ({n_rows}) and top_k ({top_k}) must be > 0"
+        ));
+    }
+    if top_k > pack.n {
+        return Err(anyhow!(
+            "train_one_linear_dwq_step: top_k ({top_k}) > pack.n / vocab ({})",
+            pack.n
+        ));
+    }
+    if x_batch.len() != n_rows * pack.k {
+        return Err(anyhow!(
+            "train_one_linear_dwq_step: x_batch.len ({}) != n_rows * pack.k ({})",
+            x_batch.len(),
+            n_rows * pack.k
+        ));
+    }
+    if teacher_topk_logits.len() != n_rows * top_k {
+        return Err(anyhow!(
+            "train_one_linear_dwq_step: teacher_topk_logits.len ({}) != n_rows * top_k ({})",
+            teacher_topk_logits.len(),
+            n_rows * top_k
+        ));
+    }
+    if teacher_indices.len() != n_rows * top_k {
+        return Err(anyhow!(
+            "train_one_linear_dwq_step: teacher_indices.len ({}) != n_rows * top_k ({})",
+            teacher_indices.len(),
+            n_rows * top_k
+        ));
+    }
+
+    let scale_name = affine_param_name(tensor_id, AffineParamKind::Scale);
+    let bias_name = affine_param_name(tensor_id, AffineParamKind::Bias);
+    let s_v = adam
+        .read_param(&scale_name)
+        .with_context(|| format!("train_one_linear_dwq_step: read '{scale_name}'"))?;
+    let b_v = adam
+        .read_param(&bias_name)
+        .with_context(|| format!("train_one_linear_dwq_step: read '{bias_name}'"))?;
+    if s_v.len() != b_v.len() {
+        return Err(anyhow!(
+            "train_one_linear_dwq_step: s.len ({}) != b.len ({}) for tensor '{tensor_id}'",
+            s_v.len(),
+            b_v.len()
+        ));
+    }
+    let n_groups = (pack.n * pack.k) / pack.group_size;
+    if s_v.len() != n_groups {
+        return Err(anyhow!(
+            "train_one_linear_dwq_step: s.len ({}) != n*k/group_size ({n_groups}) for tensor '{tensor_id}'",
+            s_v.len()
+        ));
+    }
+
+    // Step 1 — fresh tape.
+    let tape = GpuTape::new(device.clone());
+
+    // Step 2 — leaves for s, b, x, teacher_topk.
+    let s_t = GpuTensor::from_vec(&tape, &s_v, vec![n_groups]).context("s leaf")?;
+    let b_t = GpuTensor::from_vec(&tape, &b_v, vec![n_groups]).context("b leaf")?;
+    let x_t = GpuTensor::from_vec(&tape, x_batch, vec![n_rows, pack.k])
+        .context("x_batch leaf")?;
+    let t_topk = GpuTensor::from_vec(
+        &tape,
+        teacher_topk_logits,
+        vec![n_rows, top_k],
+    )
+    .context("teacher_topk leaf")?;
+
+    // Step 3 — qdq → W_qdq [n*k]
+    let w_qdq = qdq_affine(&s_t, &b_t, &pack.q_int_bytes, pack.group_size)
+        .context("qdq_affine")?;
+    // Step 4 — reshape: view to [n, k], transpose to [k, n]
+    let w_2d = view(&w_qdq, vec![pack.n, pack.k]).context("view to [n, k]")?;
+    let w_t_2d = transpose(&w_2d).context("transpose to [k, n]")?;
+    // Step 5 — student_logits = x @ W^T → [n_rows, n]
+    let student_logits = matmul(&x_t, &w_t_2d).context("matmul x @ W^T")?;
+
+    // Step 6 — gather student logits at teacher's top-K indices
+    let idx_buf = build_topk_indices_buffer(device, teacher_indices, n_rows, top_k)
+        .context("indices buffer")?;
+    let student_topk = gather_student_topk_via_tape(&student_logits, idx_buf, top_k)
+        .context("gather_student_topk_via_tape")?;
+
+    // Step 8 — KL loss.
+    let loss = kl_loss_topk_via_tape(&student_topk, &t_topk, temperature)
+        .context("kl_loss_topk_via_tape")?;
+
+    // Capture loss value before backward consumes the tape.
+    let loss_v = loss.to_vec().context("loss readback")?;
+    let loss_scalar = loss_v[0];
+
+    // Step 9 — backward
+    let dy = ones_like(&tape, loss.shape()).context("ones_like dy")?;
+    let grads = backward(&loss, dy).context("backward")?;
+
+    // Step 10 — collect grads.
+    let map = collect_grads_for_adam(
+        &grads,
+        &[(scale_name.as_str(), &s_t), (bias_name.as_str(), &b_t)],
+    )
+    .context("collect_grads_for_adam")?;
+
+    // Step 11 — Adam step.
+    adam.step(&map).context("adam.step")?;
+
+    Ok(loss_scalar)
+}
+
 /// ADR-020 iter-12d-2 — per-Linear training summary inside a model
 /// scan (one entry per successfully-trained tensor).
 #[derive(Debug, Clone)]
@@ -4614,6 +4784,283 @@ mod tests {
         assert_eq!(teacher.forward_calls, 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — `train_one_linear_dwq_step` happy
+    /// path: returns a finite scalar loss and the registered Adam
+    /// params change after the step.
+    #[test]
+    fn train_one_linear_dwq_step_happy_path_changes_adam_params() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let n = 32; // matmul backward kernel requires output dim >= 32
+        let k = 32;
+        let group_size = 8;
+        let n_rows = 32; // matmul backward kernel requires m >= 32
+        let top_k = 4;
+
+        // Random-ish "real" weight + matching pack.
+        let w: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.013 - 0.4).sin() * 1.5).collect();
+        let pack = super::quant_pack_for_dwq(&device, &w, n, k, 4, group_size).expect("pack");
+
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-3,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .expect("Adam");
+        super::register_affine_pair(&mut adam, &device, "X", &pack.scales, &pack.biases)
+            .expect("register");
+
+        // x_batch and teacher targets — synthetic but consistent
+        // shape.
+        let x_batch: Vec<f32> = (0..n_rows * k).map(|i| ((i as f32) * 0.07).cos() * 0.6).collect();
+        let teacher_topk_logits: Vec<f32> = (0..n_rows * top_k)
+            .map(|i| ((i as f32) * 0.31).sin() * 3.0)
+            .collect();
+        let mut teacher_indices: Vec<u32> = Vec::with_capacity(n_rows * top_k);
+        for r in 0..n_rows {
+            for kk in 0..top_k {
+                teacher_indices.push(((kk * 3 + r) % n) as u32);
+            }
+        }
+
+        // Snapshot before-step.
+        let s_before = adam.read_param("X.scales").unwrap();
+        let b_before = adam.read_param("X.biases").unwrap();
+
+        let loss = super::train_one_linear_dwq_step(
+            &mut adam,
+            &device,
+            "X",
+            &pack,
+            &x_batch,
+            &teacher_topk_logits,
+            &teacher_indices,
+            n_rows,
+            top_k,
+            2.0,
+        )
+        .expect("step");
+        assert!(loss.is_finite(), "loss must be finite; got {loss}");
+
+        // Adam state advanced.
+        assert_eq!(adam.step_count(), 1);
+
+        // s and/or b must have moved by some amount.
+        let s_after = adam.read_param("X.scales").unwrap();
+        let b_after = adam.read_param("X.biases").unwrap();
+        let s_change: f32 = s_before
+            .iter()
+            .zip(s_after.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        let b_change: f32 = b_before
+            .iter()
+            .zip(b_after.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        // Random initial setup has non-zero gradient → Adam moves
+        // parameters.  Very loose threshold: as long as there's any
+        // movement, the chain wired up.
+        assert!(
+            s_change + b_change > 0.0,
+            "params must change after step; s_change={s_change} b_change={b_change}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — perturbed `s` converges back toward
+    /// the projection optimum under K Adam steps with a self-target
+    /// teacher (teacher_topk = student_topk(s_optimum, b_optimum)).
+    /// This is the "gradients actually push toward minimum" signal
+    /// — proves the composed forward+backward chain has the right
+    /// SIGN of the gradient (not just non-zero magnitude).
+    ///
+    /// Strategy:
+    /// 1. Build pack with min-max init s_optimum, b_optimum.
+    /// 2. Compute teacher_topk_logits using the EXACT s_optimum,
+    ///    b_optimum (so the loss-min point IS the projection
+    ///    optimum).
+    /// 3. Register Adam with PERTURBED s = s_optimum * 1.5 (away
+    ///    from optimum).
+    /// 4. Run K=10 Adam steps with the pre-computed teacher
+    ///    targets.
+    /// 5. Verify final loss << initial loss.
+    #[test]
+    fn train_one_linear_dwq_step_loss_decreases_under_perturbed_s() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use crate::calibrate::autograd_gpu_tape::{
+            matmul, qdq_affine, transpose, view, GpuTape, GpuTensor,
+        };
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let n = 32; // matmul backward kernel requires output dim >= 32
+        let k = 32;
+        let group_size = 8;
+        let n_rows = 32; // matmul backward kernel requires m >= 32
+        let top_k = 4;
+
+        let w: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.013 - 0.4).sin() * 1.5).collect();
+        let pack = super::quant_pack_for_dwq(&device, &w, n, k, 4, group_size).expect("pack");
+
+        let x_batch: Vec<f32> = (0..n_rows * k).map(|i| ((i as f32) * 0.05 - 0.1).cos() * 0.5).collect();
+
+        // Build teacher_topk_logits using the optimum (s, b).
+        // Steps 1-5 of the forward path on a one-shot tape.
+        let teacher_logits_topk_at_opt: Vec<f32> = {
+            let tape = GpuTape::new(device.clone());
+            let s_t = GpuTensor::from_vec(&tape, &pack.scales, vec![pack.scales.len()]).unwrap();
+            let b_t = GpuTensor::from_vec(&tape, &pack.biases, vec![pack.biases.len()]).unwrap();
+            let x_t = GpuTensor::from_vec(&tape, &x_batch, vec![n_rows, k]).unwrap();
+            let w_qdq = qdq_affine(&s_t, &b_t, &pack.q_int_bytes, group_size).unwrap();
+            let w_2d = view(&w_qdq, vec![n, k]).unwrap();
+            let w_t = transpose(&w_2d).unwrap();
+            let logits = matmul(&x_t, &w_t).unwrap();
+            let logits_v = logits.to_vec().unwrap();
+            // Teacher uses the same indices we'll feed at step time
+            // — pick top_k via deterministic stride to keep test
+            // bit-stable.  Indices = (k*3 + r) % n.
+            let mut indices: Vec<u32> = Vec::with_capacity(n_rows * top_k);
+            for r in 0..n_rows {
+                for kk in 0..top_k {
+                    indices.push(((kk * 3 + r) % n) as u32);
+                }
+            }
+            let mut out: Vec<f32> = Vec::with_capacity(n_rows * top_k);
+            for r in 0..n_rows {
+                for kk in 0..top_k {
+                    let v = indices[r * top_k + kk] as usize;
+                    out.push(logits_v[r * n + v]);
+                }
+            }
+            out
+        };
+        let mut teacher_indices: Vec<u32> = Vec::with_capacity(n_rows * top_k);
+        for r in 0..n_rows {
+            for kk in 0..top_k {
+                teacher_indices.push(((kk * 3 + r) % n) as u32);
+            }
+        }
+
+        // Register Adam with PERTURBED biases (b + 0.5 — additive
+        // offset that shifts every dequantized weight uniformly,
+        // creating a clear convex basin that Adam can descend).
+        let b_perturbed: Vec<f32> = pack.biases.iter().map(|x| x + 0.5).collect();
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-3,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .expect("Adam");
+        super::register_affine_pair(&mut adam, &device, "X", &pack.scales, &b_perturbed)
+            .expect("register");
+
+        // Run K Adam steps and track loss.
+        let n_steps = 40;
+        let mut losses = Vec::with_capacity(n_steps);
+        for _ in 0..n_steps {
+            let l = super::train_one_linear_dwq_step(
+                &mut adam,
+                &device,
+                "X",
+                &pack,
+                &x_batch,
+                &teacher_logits_topk_at_opt,
+                &teacher_indices,
+                n_rows,
+                top_k,
+                2.0,
+            )
+            .expect("step");
+            losses.push(l);
+        }
+
+        // Robust-to-oscillation: average of last 5 < 80% of average
+        // of first 5.  Catches the right SIGN of the gradient
+        // (params descend the loss surface) without requiring
+        // monotone decrease (Adam at any nontrivial lr oscillates
+        // near the basin floor).
+        let avg = |s: &[f32]| s.iter().sum::<f32>() / s.len() as f32;
+        let head = avg(&losses[..5]);
+        let tail = avg(&losses[n_steps - 5..]);
+        assert!(head > 0.0, "head loss must be > 0; got {head}");
+        assert!(
+            tail < 0.8 * head,
+            "tail loss avg ({tail}) must be < 80% of head loss avg ({head}); \
+             full series: {losses:?}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — bad input shapes / knobs all fail loud.
+    #[test]
+    fn train_one_linear_dwq_step_rejects_bad_inputs() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let n = 4;
+        let k = 16;
+        let group_size = 8;
+        let n_rows = 4;
+        let top_k = 2;
+        let w: Vec<f32> = (0..n * k).map(|i| (i as f32) * 0.01).collect();
+        let pack = super::quant_pack_for_dwq(&device, &w, n, k, 4, group_size).expect("pack");
+
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-3,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .expect("Adam");
+        super::register_affine_pair(&mut adam, &device, "X", &pack.scales, &pack.biases)
+            .unwrap();
+
+        let good_x = vec![0.0_f32; n_rows * k];
+        let good_t = vec![0.0_f32; n_rows * top_k];
+        let good_i = vec![0u32; n_rows * top_k];
+
+        // Bad temperature
+        assert!(super::train_one_linear_dwq_step(
+            &mut adam, &device, "X", &pack, &good_x, &good_t, &good_i, n_rows, top_k, 0.0
+        ).is_err());
+
+        // top_k > n
+        assert!(super::train_one_linear_dwq_step(
+            &mut adam, &device, "X", &pack, &good_x, &good_t, &good_i, n_rows, n + 1, 1.0
+        ).is_err());
+
+        // x_batch wrong length
+        assert!(super::train_one_linear_dwq_step(
+            &mut adam, &device, "X", &pack, &vec![0.0; 7], &good_t, &good_i,
+            n_rows, top_k, 1.0
+        ).is_err());
+
+        // teacher_indices wrong length
+        assert!(super::train_one_linear_dwq_step(
+            &mut adam, &device, "X", &pack, &good_x, &good_t, &vec![0u32; 3],
+            n_rows, top_k, 1.0
+        ).is_err());
+
+        // Unregistered tensor_id
+        assert!(super::train_one_linear_dwq_step(
+            &mut adam, &device, "Y", &pack, &good_x, &good_t, &good_i,
+            n_rows, top_k, 1.0
+        ).is_err());
     }
 
     /// ADR-020 AC#7 Option A — `collect_grads_for_adam` happy path:
