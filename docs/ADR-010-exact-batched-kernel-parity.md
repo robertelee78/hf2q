@@ -230,3 +230,27 @@ For this project phase the sliding_wrap 752-byte batched-vs-batched ceiling is *
   | other small (<5%)   | ~245  | ~16  |     — |       — |
   | **TOTAL**           | **1573.7** | **100** | | |
 
+- 2026-05-09 (iter-67 KERNEL LOCALIZATION — half-vs-float MMA gap): `HF2Q_LOG_MM_ID_ROUTE=1` confirms mm_id IS engaging at pp2455 (30× Q6_K gate_up + 10× Q8_0 + 10× Q5_1 + 10× IQ4_NL down — APEX-Q5_K_M is layer-mix; the mm_id route engaged correctly per ADR-022). The 18 ms/call MOE_GATE_UP is `kernel_mul_mm_id_q6_K_f32` itself, not a fall-through to mv_id.
+
+  Direct file-comparison vs llama.cpp `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:10171`:
+
+  | Element | llama.cpp `kernel_mul_mm_id_q6_K_f32` | mlx-native `hf2q_mul_mm_id_impl<block_q6_K, ...>` (file:505-510) |
+  |---|---|---|
+  | A tile (weights) | `simdgroup_half8x8` | `simdgroup_half8x8` ✓ |
+  | **B tile (input)** | **`simdgroup_half8x8`** | **`simdgroup_float8x8`** ✗ |
+  | Accumulator | `simdgroup_float8x8` | `simdgroup_float8x8` ✓ |
+  | B threadgroup memory | half (2 bytes/elem) | float (4 bytes/elem) |
+  | MMA op | all-half × half→float | half × float→float |
+  | Input store at line 539 | half cast | `*(sb + ...) = *((device float *) y + i)` (F32 raw) |
+
+  Apple Silicon's fast simdgroup MMA path is the all-half × half→float variant (less register pressure, more throughput per cycle, half the threadgroup memory bandwidth on B). mlx-native's wider B tile costs throughput. Closing this gap is a single-kernel change scoped to:
+  1. Switch B tile + threadgroup memory to half precision in `hf2q_mul_mm_id_impl` (currently float).
+  2. Add F32→half cast at the input read site (file line 539: `(loop_k + iy + i < args.ne00) ? half(*((device float *) y + i)) : 0.h`).
+  3. Add parity test against current F32-B path (max abs diff ≤ 1e-3 expected for typical activations).
+  4. A/B perf bench at pp2455 to confirm.
+
+  Estimated gain: half-MMA throughput on M5 Max is ~2× vs mixed half/float per Apple's MMA tables; expect MOE_GATE_UP 18 → ~10-12 ms/call → save 180-240 ms / 30 layers, lifting hf2q from 1573 ms → ~1330-1390 ms (1740-1850 t/s) at pp2455 = 0.58-0.61× peer. Combined with similar fix on Q8_0/Q5_1/IQ4_NL down kernels (98 ms savings if proportional): ~0.65× peer. Closing toward 0.90× requires further investigation (tile geometry, dispatch overhead, shmem layout). This iter's finding is the FIRST concrete kernel-level gap localization on Gemma APEX-Q5_K_M; iter-68 implements + benches.
+
+  ADR-022 §5 mm_id row: this is precisely the "AC-5 mv_ext perf parity ≤5% gap" scope that was DEFERRED to ADR-013/015. Iter-67 reopens that deferral with operator-actionable targeting data.
+
+
