@@ -106,6 +106,59 @@ Before commit:
 - MTP K=3 self-spec (requires MTP-trained model; gemma-4 is NOT MTP-trained per iter-99 reddit-mtp synthesis)
 - Multi-batch decode (vLLM continuous batching — different CB scope)
 
+## Phase 2 implementation locked in (iter-116 design refinement)
+
+Per iter-116 reading of `forward_prefill_batched.rs:1965-2034` (the final
+norm + LM head + argmax tail), Phase 2's verify forward is much smaller
+scope than initially estimated:
+
+**Goldmine**: `pf_hidden` (allocated at the top of forward_prefill_batched)
+holds shape `[seq_len, hidden_size]` AND retains all per-position hidden
+states throughout the layer loop. The current tail discards everything
+except the last row via:
+
+```rust
+// Lines 1981-1988 — EXTRACTION POINT
+mlx_native::ops::copy::dispatch_copy_f32(
+    s.encoder_mut(), reg, metal_dev,
+    &pf_hidden,
+    &self.activations.hidden,
+    (seq_len - 1) * hs,  // <-- offset into the LAST row
+    0, hs,
+).map_err(...)?;
+// ... then 1 final_norm + 1 lm_head + 1 softcap + 1 argmax
+```
+
+**Phase 2 implementation**: REPLACE that 4-stage tail with a per-position
+loop that runs the same chain K+1 times (one per row of pf_hidden),
+capturing each argmax + optionally the full logits row. Estimated:
+
+- Tail-loop modification: ~50 LOC
+- New `forward_decode_verify` entrypoint that wraps forward_prefill_
+  batched with K+1 token input + capture: ~80 LOC
+- KV-cache rollback via tracking `valid_seq_len` (set after accept_count
+  decided): ~50 LOC
+- Total: **~180 LOC** (down from initial 200-400 estimate)
+
+**Risk profile downgrade**: medium → **medium-low**. The KV mutation is
+already correct (forward_prefill_batched writes K+1 positions); the
+tail-loop modification is mechanical; rollback is just clamping the
+attention's seq_len read.
+
+**Critical correctness invariant for KV rollback**:
+- forward_prefill_batched writes KV cache positions [seq_pos, seq_pos+K]
+- Attention at the next decode call uses kv_seq_len from cfg
+- Setting kv_seq_len = seq_pos + accept_count + 1 BEFORE the next call
+  makes positions [seq_pos+accept_count+1, seq_pos+K] invisible to
+  attention (mask out)
+- This is per-layer (sliding-window vs full-attn have different ring/
+  linear layouts) — must verify all 30 gemma layers
+
+**Falsifier gate**: at K=0 (proposer returns empty drafts always), the
+verify path is just forward_prefill_batched(1 token) which is
+equivalent to forward_decode of that token. Sourdough byte-identity
+confirms the tail-loop modification didn't break the K=1 path.
+
 ## Files to modify
 
 - New: `/opt/hf2q/src/inference/spec_decode/ngram_proposer.rs` (~100 LOC)
