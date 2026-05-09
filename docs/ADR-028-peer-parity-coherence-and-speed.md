@@ -285,6 +285,72 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-105 FWHT-into-FA fusion design (item #19 implementation plan)
+
+Designed the kernel surgery to capture the iter-104 10.5% lever.
+
+**Why barriers can't be elided without fusion**: the 2 in-place WAR
+barriers per layer (FWHT-pre on Q, FWHT-undo on SDPA-out) are forced by
+`barrier_between` (mlx-native/src/graph.rs:1494). Even if FWHT writes to
+a fresh buffer, FA must read it → still RAW → barrier. Per
+`feedback_metal_raw_barrier_per_dispatch`: every inter-dispatch RAW
+dependency in one CommandEncoder needs `memory_barrier()`. The ONLY
+way to eliminate the barriers is to merge the dispatches. Confirmed
+correct via direct read of graph.rs + the standing-rule memory.
+
+**Two-prong fusion** (both confirmed structurally feasible):
+
+**Prong A — FWHT-pre into `flash_attn_vec_tq_hb` main kernel**:
+- Current grid `(1, num_heads=16, nwg=16)` = 256 WGs/call. Each WG knows
+  its head_id (`tgpig.y`). Q for that head is 256 F32 (16 KB total).
+- Plan: load Q[head_id] into thread-private registers at kernel start,
+  apply FWHT-pre (sign-premult + simd-shuffle butterfly + normalize) in
+  shared memory PER WG, use rotated Q for the rest of the kernel.
+- Cost: 16× redundant FWHT compute (WGs share head but each rotates Q
+  independently). FWHT on 256 floats = ~2048 ops/WG × 16 = 32K ops/head
+  × 16 heads = 524K ops/call. At 10 TFLOPS Metal = ~50 ns. **Negligible**
+  vs the ~24 µs barrier saved.
+- File: `mlx-native/src/shaders/flash_attn_vec_tq_hb.metal` (kernel
+  prologue addition, ~30 LOC).
+
+**Prong B — FWHT-undo into `flash_attn_vec_reduce` kernel**:
+- Reduce kernel grid `(nrows=16, 1, 1)`, threadgroup `(32 * NWG=512, 1, 1)`
+  = 16 simdgroups/WG. Each WG handles one head's reduce + writes final
+  output.
+- Plan: after the existing reduce loop (line 389-398) writes `dst4[i]`,
+  insert `threadgroup_barrier(mem_flags::mem_device)` then have one
+  simdgroup (sgitg==0) do FWHT-undo on the just-written output.
+- File: `mlx-native/src/shaders/flash_attn_vec.metal:351-399` (epilogue
+  addition to reduce kernel, ~25 LOC).
+
+**Falsifier gates** (sourdough discipline per ADR-010):
+1. Sourdough byte-identity test (`scripts/sourdough_gate.sh`) on gemma-
+   4-26b decode 32-token output. PASS = byte-match vs current default.
+2. Iter-103 regression-gate bench (`bench_fa_vec_tq_hb_gemma_decode`).
+   GPU pure should grow ≤10% (FWHT in-prologue is small).
+3. Production end-to-end decode tg128 ≥ 70 t/s (vs current 63.8) on
+   gemma-4-26b APEX-Q5_K_M (`hf2q generate --benchmark`).
+
+If ALL 3 gates pass: ship as default. If sourdough fails: revert + log
+findings; if perf gate fails: investigate before shipping.
+
+**Iter-106 plan**: implement Prong A (FWHT-pre prologue in main FA-vec-
+tq-hb kernel). Start with sourdough gate + regression-gate, iterate.
+
+**Iter-107 plan**: implement Prong B (FWHT-undo epilogue in reduce
+kernel) IF Prong A passes all gates.
+
+**Risk**: if fused kernel exceeds Metal's per-WG register budget, falls
+back to memory spills (slow). FWHT-pre adds ~256 F32 of register
+pressure (one full Q-head). Apple GPU limit: ~2000 F32 registers per
+simdgroup, so 256 fits comfortably with margin for the rest of FA's
+state.
+
+**Stale ADR-debt** (iter-99 retraction not propagated to code): the
+"candle Phase 0 baseline ~105 dispatches/token" string lives at
+`forward_mlx.rs:248-249` + the printer. Per iter-99 candle research
+this was unsourced; needs cleanup. Bundle into iter-106 commit.
+
 ### Iter-104 production timing-bisect — TQ-region barriers ARE 9% of decode, item #19 ROI is 10.5% (not 1.4%)
 
 Two complementary measurements at HEAD on gemma-4-26b APEX-Q5_K_M:
