@@ -1488,6 +1488,118 @@ pub fn gather_student_topk_via_tape(
         .context("gather_student_topk_via_tape: take_along_axis_topk")
 }
 
+/// ADR-020 AC#7 Option A — canonical Adam param-name kind axis for
+/// affine quant parameters.  Keeps the suffix discipline in one
+/// place so the registration helper, the read helper, and any
+/// future serializer all agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AffineParamKind {
+    /// Per-group quant scale (matches mlx-affine's `.scales`
+    /// safetensors suffix at `mlx_safetensors_loader.rs`).
+    Scale,
+    /// Per-group quant bias (matches `.biases` suffix).
+    Bias,
+}
+
+impl AffineParamKind {
+    /// Suffix appended to the tensor identifier to form the Adam
+    /// param-name.  `.scales` / `.biases` mirrors the on-disk
+    /// safetensors layout — keeps train-time and serialize-time
+    /// vocabulary identical so a future `Adam → safetensors` flush
+    /// can iterate by suffix.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            AffineParamKind::Scale => ".scales",
+            AffineParamKind::Bias => ".biases",
+        }
+    }
+}
+
+/// ADR-020 AC#7 Option A — produce the canonical Adam param-name
+/// for an affine quant parameter associated with `tensor_id`.
+///
+/// Examples:
+/// ```ignore
+///   affine_param_name("blk.0.attn_q.weight", AffineParamKind::Scale)
+///       == "blk.0.attn_q.weight.scales"
+///   affine_param_name("L0_E2_gate", AffineParamKind::Bias)
+///       == "L0_E2_gate.biases"
+/// ```
+pub fn affine_param_name(tensor_id: &str, kind: AffineParamKind) -> String {
+    format!("{}{}", tensor_id, kind.suffix())
+}
+
+/// ADR-020 AC#7 Option A — register an (s, b) affine quant param
+/// PAIR with [`crate::calibrate::adam::AdamOptimizer`] under the
+/// canonical names produced by [`affine_param_name`].
+///
+/// Allocates fresh GPU buffers from the supplied f32 init slices,
+/// registers each under its name, and returns the two keys so the
+/// caller can later thread gradients back via the same names in
+/// [`crate::calibrate::adam::AdamOptimizer::step`].
+///
+/// # Errors
+/// - either init slice is empty
+/// - duplicate registration (Adam returns an error)
+/// - GPU buffer allocation failure
+pub fn register_affine_pair(
+    adam: &mut crate::calibrate::adam::AdamOptimizer,
+    device: &MlxDevice,
+    tensor_id: &str,
+    scale_init: &[f32],
+    bias_init: &[f32],
+) -> Result<(String, String)> {
+    if scale_init.is_empty() {
+        return Err(anyhow!(
+            "register_affine_pair: scale_init must be non-empty for tensor '{tensor_id}'"
+        ));
+    }
+    if bias_init.is_empty() {
+        return Err(anyhow!(
+            "register_affine_pair: bias_init must be non-empty for tensor '{tensor_id}'"
+        ));
+    }
+    let scale_name = affine_param_name(tensor_id, AffineParamKind::Scale);
+    let bias_name = affine_param_name(tensor_id, AffineParamKind::Bias);
+
+    let scale_buf = buffer_from_f32(device, scale_init)
+        .with_context(|| format!("register_affine_pair: alloc scale for '{tensor_id}'"))?;
+    let bias_buf = buffer_from_f32(device, bias_init)
+        .with_context(|| format!("register_affine_pair: alloc bias for '{tensor_id}'"))?;
+
+    adam.register_param(scale_name.clone(), scale_buf)
+        .with_context(|| format!("register_affine_pair: register scale '{scale_name}'"))?;
+    adam.register_param(bias_name.clone(), bias_buf)
+        .with_context(|| format!("register_affine_pair: register bias '{bias_name}'"))?;
+
+    Ok((scale_name, bias_name))
+}
+
+/// ADR-020 AC#7 Option A — read the trained (s, b) values back out
+/// of [`crate::calibrate::adam::AdamOptimizer`] using the canonical
+/// names produced by [`affine_param_name`].
+///
+/// Symmetric to [`register_affine_pair`].  Returns `(scales, biases)`
+/// as host-side `Vec<f32>` so the caller can serialize them into a
+/// DWQ-overlay safetensors blob.
+///
+/// # Errors
+/// - either name is not registered with `adam`
+pub fn read_affine_pair(
+    adam: &crate::calibrate::adam::AdamOptimizer,
+    tensor_id: &str,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let scale_name = affine_param_name(tensor_id, AffineParamKind::Scale);
+    let bias_name = affine_param_name(tensor_id, AffineParamKind::Bias);
+    let s = adam
+        .read_param(&scale_name)
+        .with_context(|| format!("read_affine_pair: read scale '{scale_name}'"))?;
+    let b = adam
+        .read_param(&bias_name)
+        .with_context(|| format!("read_affine_pair: read bias '{bias_name}'"))?;
+    Ok((s, b))
+}
+
 /// ADR-020 iter-12d-2 — per-Linear training summary inside a model
 /// scan (one entry per successfully-trained tensor).
 #[derive(Debug, Clone)]
@@ -4345,6 +4457,190 @@ mod tests {
         assert_eq!(teacher.forward_calls, 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — `affine_param_name` produces the
+    /// canonical `.scales` / `.biases` suffix that mirrors mlx-affine
+    /// safetensors keys.  Stable name format is load-bearing: any
+    /// downstream serializer that iterates by suffix relies on it.
+    #[test]
+    fn affine_param_name_canonical_suffixes() {
+        assert_eq!(
+            super::affine_param_name(
+                "blk.0.attn_q.weight",
+                super::AffineParamKind::Scale
+            ),
+            "blk.0.attn_q.weight.scales"
+        );
+        assert_eq!(
+            super::affine_param_name(
+                "blk.0.attn_q.weight",
+                super::AffineParamKind::Bias
+            ),
+            "blk.0.attn_q.weight.biases"
+        );
+        // Distinct kinds yield distinct names (must not collide).
+        assert_ne!(
+            super::affine_param_name("x", super::AffineParamKind::Scale),
+            super::affine_param_name("x", super::AffineParamKind::Bias)
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — `register_affine_pair` happy path:
+    /// returns the canonical (scale, bias) names; both end up
+    /// registered with Adam (n_params increments by 2 per call).
+    #[test]
+    fn register_affine_pair_registers_both_under_canonical_names() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-4,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .expect("Adam new");
+        assert_eq!(adam.n_params(), 0);
+
+        let s_init = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let b_init = vec![0.1_f32, 0.2, 0.3, 0.4];
+        let (s_name, b_name) =
+            super::register_affine_pair(&mut adam, &device, "blk.0.foo", &s_init, &b_init)
+                .expect("register");
+        assert_eq!(s_name, "blk.0.foo.scales");
+        assert_eq!(b_name, "blk.0.foo.biases");
+        assert_eq!(adam.n_params(), 2);
+
+        // Round-trip via read_affine_pair — values must come back unchanged.
+        let (s_read, b_read) =
+            super::read_affine_pair(&adam, "blk.0.foo").expect("read");
+        assert_eq!(s_read, s_init);
+        assert_eq!(b_read, b_init);
+    }
+
+    /// ADR-020 AC#7 Option A — registering MULTIPLE distinct
+    /// tensor_ids in the same Adam yields distinct, non-colliding
+    /// names.  Two tensors × 2 kinds = 4 params.
+    #[test]
+    fn register_affine_pair_distinct_tensor_ids_dont_collide() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-4,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .expect("Adam new");
+
+        let s = vec![1.0_f32; 8];
+        let b = vec![0.5_f32; 8];
+        super::register_affine_pair(&mut adam, &device, "blk.0.attn_q.weight", &s, &b)
+            .unwrap();
+        super::register_affine_pair(&mut adam, &device, "blk.0.attn_k.weight", &s, &b)
+            .unwrap();
+        assert_eq!(adam.n_params(), 4);
+
+        // Each tensor's pair is independently readable.
+        let (sq, bq) = super::read_affine_pair(&adam, "blk.0.attn_q.weight").unwrap();
+        let (sk, bk) = super::read_affine_pair(&adam, "blk.0.attn_k.weight").unwrap();
+        assert_eq!(sq, s);
+        assert_eq!(bq, b);
+        assert_eq!(sk, s);
+        assert_eq!(bk, b);
+    }
+
+    /// ADR-020 AC#7 Option A — duplicate registration (same
+    /// tensor_id) fails loud rather than silently overwriting.
+    #[test]
+    fn register_affine_pair_rejects_duplicate_tensor_id() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-4,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .expect("Adam new");
+
+        let s = vec![1.0_f32; 4];
+        let b = vec![0.0_f32; 4];
+        super::register_affine_pair(&mut adam, &device, "x", &s, &b).unwrap();
+        let err =
+            super::register_affine_pair(&mut adam, &device, "x", &s, &b).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("already registered") && msg.contains("x.scales"),
+            "got: {msg}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — empty init slice fails loud.
+    #[test]
+    fn register_affine_pair_rejects_empty_inits() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-4,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .expect("Adam new");
+        let err =
+            super::register_affine_pair(&mut adam, &device, "x", &[], &[1.0]).unwrap_err();
+        assert!(format!("{:#}", err).contains("scale_init must be non-empty"));
+        let err =
+            super::register_affine_pair(&mut adam, &device, "x", &[1.0], &[]).unwrap_err();
+        assert!(format!("{:#}", err).contains("bias_init must be non-empty"));
+    }
+
+    /// ADR-020 AC#7 Option A — `read_affine_pair` returns a clear
+    /// error when the names aren't registered.
+    #[test]
+    fn read_affine_pair_fails_for_unregistered_tensor() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let adam = AdamOptimizer::new(
+            device,
+            AdamConfig {
+                lr: 1e-4,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .expect("Adam new");
+
+        let err = super::read_affine_pair(&adam, "nope").unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("read scale") && msg.contains("nope.scales"),
+            "got: {msg}"
+        );
     }
 
     /// ADR-020 AC#7 Option A — `build_topk_indices_buffer` round-trips
