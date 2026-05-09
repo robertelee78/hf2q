@@ -2704,6 +2704,95 @@ Per operator's "no shortcuts" + "measure 3x cut once" — next iter
 (142+) starts task #23 with a measurement-first sizing of actual DS4
 fusion savings at gemma4 production scale, before any kernel port.
 
+### iter-142: walk-phase peer-port re-survey (research-only, no kernel changes)
+
+Per operator: "for walk we need to be in porting best from peers still"
++ "Code + test == truth. Comments in code or ADR can be starting points,
+but never trust them over code."
+
+#### Peer-kernel survey at gemma4 dense-FFN scope
+
+Read llama.cpp metal kernels for unported fused variants
+(`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal`):
+- `kernel_geglu_f32` line 1444 — gate*GELU(up). Equivalent to our
+  `fused_gelu_mul`. Already ported.
+- `kernel_swiglu_f32` line 1466 — gate*SiLU(up). Equivalent to our
+  `fused_gelu_mul` for silu variants. Already ported.
+- `kernel_swiglu_oai_f32`, `kernel_geglu_erf_f32`, `kernel_geglu_quick_f32`
+  — all single-buffer activation kernels (NO matmul fusion). Same shape
+  as our gate*activation(up) post-matmul ops.
+
+**Finding**: llama.cpp does NOT have a fused gate-projection +
+up-projection + activation kernel. All three projections are independent
+mat-vec dispatches; gate and up matmuls are SEPARATE in their build_ffn
+graph.
+
+DS4's `kernel_dsv4_shared_gate_up_swiglu_q8_0`
+(`/opt/ds4/metal/dense.metal:203`) IS a fused 2-projection + activation
+kernel. **DS4 is BEYOND llama.cpp here.** Porting DS4's fusion would put
+us ahead of peer.
+
+#### Re-checking gemma4 graph against peer at decode
+
+`llama.cpp/src/models/gemma4.cpp:139..` build_arch_graph per layer:
+1. `attn_norm` (1 dispatch — RMS)
+2. `Qcur = build_lora_mm(wq, cur)` (1 dispatch — Q matmul)
+3. `attn_q_norm` (1 dispatch — RMS over Q heads)
+4. `Q rope_ext` (1 dispatch)
+5. `Kcur = build_lora_mm(wk, cur)` (1 dispatch — K matmul)
+6. `Vcur = build_lora_mm(wv, cur)` (1 dispatch — V matmul)
+7. `attn_k_norm` (1 dispatch — RMS over K heads)
+8. `Vcur = ggml_rms_norm` (1 dispatch — V norm, Gemma4-specific)
+9. `K rope_ext` (1 dispatch)
+10. `build_attn` → flash-attention or vec-FA path (1 dispatch)
+11. `attn_post_norm` (1 dispatch — RMS)
+12. `attn_out = ggml_add(cur, inpL)` (1 dispatch — residual add)
+13. `ffn_norm` (1 dispatch — RMS)
+14. `build_ffn(LLM_FFN_GELU, LLM_FFN_PAR)` — gate + up + activation +
+    down (4 dispatches; PAR=parallel gate/up = 2 matmul + 1 GELU + 1 down)
+
+= **15 dispatches per dense layer in llama.cpp**
+
+hf2q gemma4 path at forward_mlx.rs:4807-4854 + earlier QKV/attn:
+- 1 fused_norm_add (post-attn norm + add) — 1 dispatch (FUSED 2 ops)
+- 1 rms_norm (pre-FF) — 1 dispatch
+- 1 gate_proj — 1 dispatch
+- 1 up_proj — 1 dispatch
+- 1 fused_gelu_mul — 1 dispatch (FUSED 2 ops)
+- 1 down_proj — 1 dispatch
+- (attn block: similar count but with extra post-attn-norm fused into add)
+
+**Compared to llama.cpp's 15 dispatches/layer, hf2q is at ~13** (the
+norm+add fusion saves 1, the fused_gelu_mul saves 1). Already AHEAD on
+fusion count.
+
+#### Implication for iter-142 walk-phase
+
+Two findings together:
+1. We already have FEWER dispatches per layer than llama.cpp.
+2. DS4's fusion would save ~1-2 more dispatches/layer (gate+up+activation
+   collapse from 3→1 vs our current 3-dispatch unfused).
+
+The 0.71× peer gap on gemma4 is NOT explained by dispatch count vs peer
+— we already win on count. The gap must come from per-kernel time, not
+per-kernel COUNT.
+
+**Hypothesis to test before any kernel port**:
+- H1: hf2q's per-Q5_K-mv kernel time > llama.cpp's at gemma4 shape
+  (hidden=2816, intermediate=2112). Measurable via xctrace
+  `Metal System Trace` with `scripts/profile-decode-mst.sh`.
+- H2: hf2q's encode-CPU per dispatch > llama.cpp's. Measurable via
+  `HF2Q_SPLIT_TIMING=1` (encode_ns vs gpu_ns body split) plus
+  llama.cpp counterpart.
+
+If H1 dominates → kernel-level port (DS4 won't help; need shader
+optimization on individual mv kernels).
+If H2 dominates → DS4 fusion port pays off proportional to encode-CPU
+saved per layer.
+
+iter-143 plan: run H1+H2 tests on gemma4 APEX-Q5_K_M production decode.
+**No kernel changes until measurements distinguish H1 vs H2.**
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
