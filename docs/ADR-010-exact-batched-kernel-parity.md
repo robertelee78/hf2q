@@ -334,8 +334,26 @@ For this project phase the sliding_wrap 752-byte batched-vs-batched ceiling is *
 
   Same logic as iter-65's batched-prefill coherence gate, but at the pipeline-registration layer. Both gates now lock in different aspects of the iter-64/68 work: iter-65 catches functional regression (batched output gibberish); iter-73 catches build-time shader-compile regression (silent runtime fallback to slow path).
 
+- 2026-05-09 (iter-74 STRICT BYTE-IDENTITY gate strengthening): Tightened `scripts/adr010_iter64_batched_coherence_gate.sh` from "contains '4' AND no 6+ digit run" to **strict byte-identity** between per-token and batched outputs. Catches subtle divergences that the loose gate would miss. Self-test PASS (per-token = `4<turn|>`, batched = `4<turn|>`).
 
+- 2026-05-09 (iter-75 PERF-SANITY FLOOR added): 4th step in the gate runs pp1024 batched, asserts ≥1500 t/s (iter-68 baseline 1942). Catches >25% perf regression that wouldn't trip correctness checks. Self-test PASS (1920 t/s).
 
+- 2026-05-09 (iter-76 SINGLE-COMMAND LOCK CHAIN): `scripts/adr010_iter64_iter68_full_lock.sh` chains shader-compile + coherence/perf gates into ~1-min operator command. Self-test PASS at HEAD; ground-state ratification: hf2q full unit-test suite 3382/0/9.
+
+- 2026-05-09 (iter-77 MEDIAN-OF-3 perf measurement): Reduced thermal-noise sensitivity in perf-sanity step. Single-shot variance was 1864-1941 t/s (4%); median-of-3 spread is 1931-1940 (0.5%).
+
+- 2026-05-09 (iter-78 CROSS-MODEL qwen35 LOCK at hf2q `3c77751`): qwen35moe uses its own code path but routes through the same shared `mm_id_pooled` dispatcher; iter-68's tensor mm_id unlock benefits qwen35 too. Measured: hf2q qwen35 pp512 = 2300 t/s vs llama.cpp 2921 t/s = **0.79× peer**. Added qwen35 perf-floor as gate [3/3] in full-lock chain. iter-64+iter-68 wins now protected across BOTH model families.
+
+- 2026-05-09 (iter-79 USER-VISIBLE E2E impact measurement): Real chat prompt (~52-token instruction, 80-token output) on gemma APEX-Q5_K_M, M5 Max:
+
+  | Path                      | Prefill TTFT | Decode  | Total turn   |
+  |---------------------------|-------------:|--------:|-------------:|
+  | Per-token (DEFAULT)       |     915 ms   | 1260 ms |    **2.18 s** |
+  | Batched (iter-64+68)      |     214 ms   | 1260 ms |    **1.47 s** |
+
+  **TTFT: 4.3× faster** (701 ms saved per turn). **Total chat turn: 33% faster**. First decode token byte-identical (id=8409 across both batched runs). Decode unchanged (separate iter-69 territory).
+
+  This is the realized user-facing impact of the iter-64+iter-68 wins, gated behind `HF2Q_BATCHED_PREFILL=1 + HF2Q_UNSAFE_EXPERIMENTS=1`. For a typical chat session (5-10 turns), cumulative savings are 3.5-7 seconds — material UX improvement.
 
 
 
