@@ -243,6 +243,48 @@ remaining ~20% pp2455 gap is **per-kernel-time** within the kernels we
 already share, not unported variants. Confirming iter-71's earlier
 finding ("dispatch count at parity; gap is per-kernel-time").
 
+### Iter-88 fresh peer baseline at llama.cpp HEAD (2026-05-09)
+
+Built `/opt/llama.cpp/build/bin/llama-bench` from llama.cpp HEAD
+`5d6f18a63` (build 9078), ran on identical fixture
+(`gemma4-ara-2pass-APEX-Q5_K_M.gguf`, M5 Max, 5-run median):
+
+| Test | hf2q (cool, 5-trial) | llama.cpp build 9078 FA=1 | llama.cpp build 9078 FA=0 | hf2q vs FA=1 peer | hf2q vs FA=0 peer |
+|---|---:|---:|---:|---:|---:|
+| pp1024 | 1996 t/s | 1759 ± 30 | 1398 ± 44 | **1.13× faster** | **1.43× faster** |
+| pp2455 | 2416 t/s | 1573 ± 39 | 1292 ± 58 | **1.54× faster** | **1.87× faster** |
+| tg32 | 63.4 t/s | 97.7 ± 5.4 | 27.8 ± 2.0 | 0.65× | **2.28× faster** |
+| tg128 | 61.4 t/s | 88.3 ± 1.0 | (n/a) | 0.70× | (n/a) |
+| tg256 | 62.5 t/s | 90.4 ± 0.5 | (n/a) | 0.69× | (n/a) |
+
+**Surprise**: at llama.cpp HEAD, prefill speed has REGRESSED relative
+to the iter-66/68 cited build-9010 numbers (1884 t/s pp1024 / 3023 t/s
+pp2455). Build 9078 is **6.6% slower at pp1024 and 48% slower at
+pp2455 with FA=1** vs cited build-9010 numbers. We did not measure
+the regression cause — could be intentional fault-tolerance/correctness
+tightening, kernel re-org, or unrelated work.
+
+**Mantra-status at iter-88 (real numbers)**:
+- ✅ **Coherence**: byte-identical to llama.cpp on sourdough fixture
+  (per ADR-010 sourdough_gate.sh; iter-65/74/79 byte-identity gate).
+- ✅ **Prefill speed**: hf2q is **1.13× to 1.87× FASTER** than llama.cpp
+  HEAD across pp1024 + pp2455 with both FA modes. Mantra MET for prefill.
+- ❌ **Decode speed**: hf2q is **0.65×-0.70× peer** vs FA=1, **2.28×
+  FASTER** vs FA=0 default. With FA=1 (apples-to-apples) we still trail
+  by 30-35%. Mantra NOT MET for decode at FA=1.
+
+The remaining mantra-violation is decode at FA=1. Per the "as fast as
+peer" reading of the mantra, llama.cpp's FA=1 mode is the relevant peer.
+ADR-028 #3 (decode µbench infrastructure) is the only remaining
+work-item to close mantra at FA=1.
+
+**llama-bench command (locked in for future re-bench)**:
+```bash
+/opt/llama.cpp/build/bin/llama-bench \
+  -m /opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf \
+  -p 1024,2455 -n 32,128,256 -fa 1 -r 5
+```
+
 ## Consequences
 
 ### Positive
@@ -271,10 +313,15 @@ finding ("dispatch count at parity; gap is per-kernel-time").
 - **Decode 0.62× peer remains**: iter-69..72/81 measured but did not
   close. Multi-day µbench infrastructure (Q6_K pack helper that doesn't
   exist) is required for kernel-level attack.
-- **Pp2455 prefill still 0.80× peer cool-state, 0.71× profiled** (was
-  0.57×). Closing further requires distributed work across MoE/QKV/MLP/
-  FA kernels — no single bottleneck. Per iter-87 kernel-coverage sweep,
-  the gap is per-kernel-time, NOT unported variants.
+- **Pp2455 prefill at llama.cpp HEAD = 1.54× FASTER** (iter-88
+  re-bench). The cited 0.80× / 0.71× was vs stale build-9010 peer; at
+  build 9078 hf2q is solidly ahead. Mantra MET for prefill at all sizes
+  measured.
+- **Decode at FA=1 still 0.65-0.70× peer at HEAD** (iter-88 re-bench).
+  The cited 0.62× was vs build-9010; at build 9078 the gap is slightly
+  smaller (0.65-0.70× across tg32/128/256) but still meaningful. With
+  FA=0 (llama.cpp default) hf2q is 2.28× FASTER. ADR-028 #3 (decode
+  µbench infrastructure) remains the path to close mantra at FA=1.
 
 ### Neutral
 
