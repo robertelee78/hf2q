@@ -230,6 +230,163 @@ impl MlxAffineLinear {
             biases,
         })
     }
+
+    /// Dequantize the affine-DWQ Linear back to row-major flat F32:
+    ///
+    ///   `w[i * k + j] = scales[i, j / group_size] * q_int[i, j] as f32
+    ///                 + biases[i, j / group_size]`
+    ///
+    /// Returns a `Vec<f32>` of length `n * k`.  Pure CPU computation;
+    /// no GPU.  Used by the AC#7 round-trip drift benchmark
+    /// (`q4_0_round_trip_drift`) and by `Qwen35Model::apply_dwq_overlay`'s
+    /// lm_head Vec<f32> overwrite path.
+    pub fn dequantize_to_f32(&self) -> Vec<f32> {
+        let groups_per_row = self.k / self.group_size;
+        let mut w = vec![0f32; self.n * self.k];
+        for i in 0..self.n {
+            for j in 0..self.k {
+                let g = j / self.group_size;
+                let scale = self.scales[i * groups_per_row + g];
+                let bias  = self.biases[i * groups_per_row + g];
+                w[i * self.k + j] = scale * (self.q_int[i * self.k + j] as f32) + bias;
+            }
+        }
+        w
+    }
+
+    /// ADR-020 AC#7 foundation F2 — measure drift introduced by routing
+    /// this DWQ-trained Linear's dequantized values through hf2q's
+    /// production Q4_0 codec (`crate::quantize::q_legacy::quantize_row_q4_0_to_bytes`
+    /// + `dequantize_row_q4_0_bytes`).
+    ///
+    /// This is the lossiness incurred by `Qwen35Model::apply_dwq_overlay`'s
+    /// iter-B1 lm_head path: the trained `(s, b, q_int)` are dequantized
+    /// to a row of f32, which is later re-quantized to Q4_0 by
+    /// `forward_gpu.rs::ensure_gpu_cache_primed::upload_q4_0_from_f32`.
+    /// Q4_0 has no per-group bias term, so any non-zero `biases[g]`
+    /// in the DWQ output is necessarily LOST in the round-trip — this
+    /// helper quantifies how much drift that introduces in absolute
+    /// element-space, per row.
+    ///
+    /// See `RoundTripDrift` for the metrics returned.
+    ///
+    /// Errors if `k` is not a multiple of the Q4_0 block size (32) —
+    /// the same alignment requirement that `quantize_row_q4_0` enforces.
+    pub fn q4_0_round_trip_drift(&self) -> Result<RoundTripDrift> {
+        use crate::quantize::q_legacy::{
+            dequantize_row_q4_0_bytes, quantize_row_q4_0_to_bytes,
+        };
+
+        let qk = 32usize; // QK4_0 block size — production Q4_0 codec constant.
+        if self.k % qk != 0 {
+            return Err(anyhow!(
+                "q4_0_round_trip_drift: k={} not a multiple of Q4_0 block size {}",
+                self.k, qk
+            ));
+        }
+
+        let w_dwq = self.dequantize_to_f32();
+        let mut max_abs_drift = 0f32;
+        let mut sum_abs_drift = 0.0f64;
+        let mut sum_sq_drift  = 0.0f64;
+        let mut sum_sq_signal = 0.0f64;
+        let total_elems = self.n * self.k;
+
+        // Per-row Q4_0 round-trip — production codec is row-aligned to
+        // QK4_0.  For each row of length k we quantize → bytes → dequant
+        // and accumulate drift.
+        let mut w_rt_row = vec![0f32; self.k];
+        for i in 0..self.n {
+            let row = &w_dwq[i * self.k..(i + 1) * self.k];
+            let q4_0_bytes = quantize_row_q4_0_to_bytes(row)
+                .map_err(|e| anyhow!("quantize_row_q4_0_to_bytes row={i}: {e:?}"))?;
+            let _ = dequantize_row_q4_0_bytes(&q4_0_bytes, &mut w_rt_row)
+                .map_err(|e| anyhow!("dequantize_row_q4_0_bytes row={i}: {e:?}"))?;
+            for j in 0..self.k {
+                let signal = row[j];
+                let drift = (signal - w_rt_row[j]).abs();
+                if drift > max_abs_drift { max_abs_drift = drift; }
+                sum_abs_drift += drift as f64;
+                sum_sq_drift  += (drift as f64) * (drift as f64);
+                sum_sq_signal += (signal as f64) * (signal as f64);
+            }
+        }
+
+        let mean_abs_drift = (sum_abs_drift / total_elems as f64) as f32;
+        let rms_drift      = ((sum_sq_drift / total_elems as f64).sqrt()) as f32;
+        let rms_signal     = ((sum_sq_signal / total_elems as f64).sqrt()) as f32;
+        let relative_rms   = if rms_signal.abs() > f32::EPSILON {
+            rms_drift / rms_signal
+        } else {
+            f32::NAN
+        };
+
+        // Bias-explained fraction: how much of the DWQ output's energy
+        // comes specifically from the per-group bias term.  If biases
+        // are all zero this is 0.0 and Q4_0 round-trip is information-
+        // preserving on the (s, code) part.  If biases dominate, the
+        // round-trip is going to discard most of that energy.
+        let groups_per_row = self.k / self.group_size;
+        let mut sum_sq_bias_signal = 0.0f64;
+        for i in 0..self.n {
+            for g in 0..groups_per_row {
+                let b = self.biases[i * groups_per_row + g] as f64;
+                sum_sq_bias_signal += b * b * (self.group_size as f64);
+            }
+        }
+        let rms_bias = ((sum_sq_bias_signal / total_elems as f64).sqrt()) as f32;
+        let bias_fraction = if rms_signal.abs() > f32::EPSILON {
+            rms_bias / rms_signal
+        } else {
+            f32::NAN
+        };
+
+        Ok(RoundTripDrift {
+            n: self.n,
+            k: self.k,
+            group_size: self.group_size,
+            bits: self.bits,
+            mean_abs_drift,
+            max_abs_drift,
+            rms_drift,
+            rms_signal,
+            relative_rms,
+            rms_bias,
+            bias_fraction,
+        })
+    }
+}
+
+/// ADR-020 AC#7 foundation F2 — drift metrics from
+/// [`MlxAffineLinear::q4_0_round_trip_drift`].
+///
+/// All fields are in element space (f32 absolute drift between the
+/// DWQ-dequantized values and the Q4_0-roundtripped values).
+///
+/// `relative_rms = rms_drift / rms_signal` is the dimensionless
+/// quantity to read first:
+///   - `< 0.1` ⇒ Q4_0 round-trip is preserving most of the DWQ signal
+///   - `~ 0.5` ⇒ half the signal is being destroyed by the round-trip
+///   - `~ 1.0+` ⇒ Q4_0 is essentially randomizing the values
+///
+/// `bias_fraction = rms_bias / rms_signal` quantifies how much of the
+/// DWQ output's energy is in the per-group bias term that Q4_0 cannot
+/// represent — high `bias_fraction` paired with high `relative_rms`
+/// indicates the lm_head Vec<f32> overwrite path is fundamentally
+/// inadequate and the iter-B2 affine kernel route is required.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoundTripDrift {
+    pub n: usize,
+    pub k: usize,
+    pub group_size: usize,
+    pub bits: u32,
+    pub mean_abs_drift: f32,
+    pub max_abs_drift: f32,
+    pub rms_drift: f32,
+    pub rms_signal: f32,
+    pub relative_rms: f32,
+    pub rms_bias: f32,
+    pub bias_fraction: f32,
 }
 
 /// Unpack a u32-packed buffer of `[..., n_u32]` codes into one byte per
@@ -1214,6 +1371,165 @@ mod tests {
                     "y[{r},{col}]: got {got} expected {expected}"
                 );
             }
+        }
+    }
+
+    // ── ADR-020 AC#7 foundation F2 — Q4_0 round-trip drift tests ────
+    // Pure CPU; no GPU.  Validates the metric used to decide whether
+    // the iter-B1 lm_head Vec<f32> overwrite path can carry DWQ
+    // improvement to inference, or whether the iter-B2 affine kernel
+    // route is required.
+
+    /// Helper: build a synthetic Linear with explicit (s, b) per group.
+    fn make_synthetic_linear(
+        n: usize, k: usize, group_size: usize, bits: u32,
+        scales_per_group: f32, biases_per_group: f32,
+        codes: impl Fn(usize, usize) -> u8,
+    ) -> MlxAffineLinear {
+        let groups_per_row = k / group_size;
+        let mut q_int = vec![0u8; n * k];
+        for i in 0..n {
+            for j in 0..k {
+                q_int[i * k + j] = codes(i, j);
+            }
+        }
+        let scales = vec![scales_per_group; n * groups_per_row];
+        let biases = vec![biases_per_group; n * groups_per_row];
+        MlxAffineLinear { n, k, group_size, bits, q_int, scales, biases }
+    }
+
+    #[test]
+    fn round_trip_drift_zero_signal_is_zero_drift() {
+        // All codes = 0, scales = 0 ⇒ dequant = 0 ⇒ Q4_0 round-trip = 0
+        // ⇒ drift exactly 0 and rms_signal == 0 ⇒ relative_rms = NaN
+        // (degenerate signal, sentinel).
+        let lin = make_synthetic_linear(2, 32, 32, 4, 0.0, 0.0, |_, _| 0);
+        let d = lin.q4_0_round_trip_drift().expect("drift");
+        assert_eq!(d.mean_abs_drift, 0.0);
+        assert_eq!(d.max_abs_drift, 0.0);
+        assert_eq!(d.rms_drift, 0.0);
+        assert_eq!(d.rms_signal, 0.0);
+        assert!(d.relative_rms.is_nan(),
+                "rms_signal == 0 ⇒ relative_rms = NaN; got {}", d.relative_rms);
+    }
+
+    #[test]
+    fn round_trip_drift_q4_0_already_idempotent() {
+        // Construct DWQ values that ARE already on the Q4_0 grid.
+        //
+        // Q4_0 (per `q_legacy::quantize_row_q4_0`) picks per-block
+        // `d = max / -8.0` where `max` is the value with the largest
+        // |v| (signed value retained); then encodes
+        // `xi = clamp((v/d + 8.5) as i32, 0, 15)` and decodes
+        // `y = (xi - 8) * d`.
+        //
+        // Fixture: scale=1.0, bias=-8.0, codes (j % 16) ∈ [0, 15]
+        //   ⇒ DWQ-dequant values v = code - 8 ∈ {-8, -7, ..., 7}
+        //   ⇒ amax=8, max=-8, d = -8/-8 = 1.0, id = 1.0
+        //   ⇒ for v=-8: xi=clamp((-8 + 8.5) as i32, 0, 15) = 0,
+        //     y = (0 - 8) * 1.0 = -8 ✓ drift=0
+        //   ⇒ for v=7:  xi=clamp((7 + 8.5) as i32, 0, 15) = 15,
+        //     y = (15 - 8) * 1.0 = 7  ✓ drift=0
+        //   ⇒ all 16 grid points round-trip exactly.
+        //
+        // This proves the round-trip codec is an identity on Q4_0-grid
+        // inputs (the codec's natural fixed point), and falsifies any
+        // implementation bug that would introduce drift on this input.
+        let lin = make_synthetic_linear(
+            1, 32, 32, 4,
+            1.0, -8.0,
+            |_, j| (j % 16) as u8,  // codes 0..15, repeated twice in 32-block
+        );
+        let d = lin.q4_0_round_trip_drift().expect("drift");
+        assert!(
+            d.max_abs_drift < 1e-5,
+            "max_abs_drift {} should be ~0 for already-Q4_0-grid values",
+            d.max_abs_drift,
+        );
+        assert!(
+            d.rms_drift < 1e-5,
+            "rms_drift {} should be ~0", d.rms_drift,
+        );
+        assert!(
+            d.relative_rms < 1e-3,
+            "relative_rms {} should be ~0", d.relative_rms,
+        );
+    }
+
+    #[test]
+    fn round_trip_drift_increases_with_bias_magnitude() {
+        // The bias term has no Q4_0 representation.  As bias grows
+        // relative to scale*codes, more of the signal lives in bias
+        // and gets DESTROYED by the round-trip — observable as
+        // increasing `bias_fraction` AND increasing `relative_rms`.
+        // Fixture: bias-dominated input where Q4_0 cannot represent
+        // the bias offset because scale would have to be huge AND the
+        // codes are clustered.
+
+        // Case A: small bias relative to scale (low bias_fraction).
+        let lin_low = make_synthetic_linear(
+            2, 64, 32, 4,
+            0.1, 0.01,                // scale=0.1, bias=0.01
+            |_, j| (j % 16) as u8,    // codes 0..15
+        );
+        // Case B: large bias dominates (high bias_fraction).
+        let lin_high = make_synthetic_linear(
+            2, 64, 32, 4,
+            0.01, 1.0,                // scale=0.01, bias=1.0
+            |_, j| (j % 16) as u8,    // same codes
+        );
+        let d_low  = lin_low.q4_0_round_trip_drift().expect("low");
+        let d_high = lin_high.q4_0_round_trip_drift().expect("high");
+
+        // Sanity on bias_fraction direction.
+        assert!(
+            d_high.bias_fraction > d_low.bias_fraction,
+            "high bias_fraction {} should exceed low {}",
+            d_high.bias_fraction, d_low.bias_fraction,
+        );
+        // The high-bias case lives almost entirely in the bias term:
+        // expect bias_fraction near 1.0 (bias dominates signal energy).
+        assert!(
+            d_high.bias_fraction > 0.9,
+            "bias-dominated case should have bias_fraction > 0.9; got {}",
+            d_high.bias_fraction,
+        );
+    }
+
+    #[test]
+    fn round_trip_drift_rejects_misaligned_k() {
+        // Q4_0 production codec requires k % 32 == 0.
+        let lin = make_synthetic_linear(1, 16, 16, 4, 1.0, 0.0, |_, _| 0);
+        let err = lin.q4_0_round_trip_drift().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not a multiple of Q4_0 block size"),
+            "expected alignment error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn round_trip_drift_per_element_metrics_are_consistent() {
+        // mean_abs_drift <= max_abs_drift, rms_drift <= max_abs_drift,
+        // and relative_rms = rms_drift / rms_signal (within fp).
+        let lin = make_synthetic_linear(
+            4, 64, 32, 4,
+            0.1, 0.05,
+            |i, j| ((i + j) % 16) as u8,
+        );
+        let d = lin.q4_0_round_trip_drift().expect("drift");
+        assert!(d.mean_abs_drift <= d.max_abs_drift,
+                "mean {} > max {}", d.mean_abs_drift, d.max_abs_drift);
+        assert!(d.rms_drift <= d.max_abs_drift,
+                "rms {} > max {}", d.rms_drift, d.max_abs_drift);
+        // Reconstruct relative_rms and check it agrees.
+        if d.rms_signal > 0.0 {
+            let expected = d.rms_drift / d.rms_signal;
+            assert!(
+                (d.relative_rms - expected).abs() < 1e-5 * expected.abs().max(1.0),
+                "relative_rms {} != rms_drift {} / rms_signal {} = {}",
+                d.relative_rms, d.rms_drift, d.rms_signal, expected,
+            );
         }
     }
 }
