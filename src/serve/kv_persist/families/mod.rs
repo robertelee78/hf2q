@@ -48,5 +48,6 @@
 //! registration across the engine's lifetime.
 
 pub mod gemma4_dense;
+pub mod qwen35_disk_persistor;
 pub mod qwen35_hybrid_persistor;
 pub mod tq_packed;
