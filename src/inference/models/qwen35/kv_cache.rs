@@ -375,6 +375,117 @@ impl FullAttnKvSlot {
         .map_err(|e| anyhow!("dispatch_tq_sdpa: flash_attn_vec_tq_hb: {e}"))?;
         Ok(())
     }
+
+    /// ADR-027 Phase B iter-31 (sub-sub-iter 23c-β.2) — dequantize a
+    /// sequence of TQ-encoded K (or V) positions back to F32 in the
+    /// FWHT-rotated domain, into a fresh GPU temp buffer. This is the
+    /// bridge that lets the existing dense F32 prefill SDPA kernel read
+    /// from a TQ-only KV cache (post-iter-32 F32-alloc-drop).
+    ///
+    /// **Output layout:** `[num_kv_heads, n_tokens, head_dim]` F32 — the
+    /// head-major layout the dense prefill SDPA already expects (matches
+    /// hf2q's full-attn KV cache shape `[n_seqs=1, n_kv_heads, max_seq,
+    /// head_dim]` minus the leading `n_seqs` axis).
+    ///
+    /// **Output domain:** FWHT-rotated. The caller of this helper is
+    /// expected to pre-rotate Q with the same FWHT before SDPA, then
+    /// post-rotate the SDPA output to undo. This is the same convention
+    /// the iter-15 decode-TQ chain (`dispatch_decode_sdpa_with_optional_tq`)
+    /// uses; the prefill wiring (iter-32) follows it.
+    ///
+    /// **Codebook bits:** sourced from
+    /// `crate::debug::INVESTIGATION_ENV.tq_codebook_bits` (matches the
+    /// production write-side default — Gemma at `forward_mlx.rs:2313`,
+    /// hf2q `gpu_full_attn::write_kv_with_optional_tq_encode`); falls
+    /// back to 8 if env contains an unexpected value.
+    ///
+    /// # Arguments
+    ///
+    /// * `is_k`           — `true` to dequant K, `false` to dequant V.
+    /// * `n_tokens`       — number of consecutive cache positions
+    ///   `[start_pos..start_pos+n_tokens)` to dequant.
+    /// * `start_pos`      — first cache position to read (inclusive).
+    /// * `cache_capacity` — must equal the slot's `max_seq_len` from
+    ///   construction time (the kernel uses it as the per-head stride).
+    ///
+    /// # Errors
+    ///
+    /// - `Err` if `self.tq.is_none()` (mantra: fail loud — caller must
+    ///   construct the slot via `HybridKvCache::new_with_options(..,
+    ///   tq_kv_active=true)`).
+    /// - `Err` if `start_pos + n_tokens > cache_capacity` (preflight
+    ///   inside `dispatch_tq_dequantize_hb_kv_seq`).
+    /// - Propagates GPU alloc / dispatch errors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dequant_seq_to_temp_f32(
+        &self,
+        is_k: bool,
+        n_tokens: u32,
+        start_pos: u32,
+        cache_capacity: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        encoder: &mut mlx_native::CommandEncoder,
+        registry: &mut mlx_native::KernelRegistry,
+        device: &MlxDevice,
+    ) -> Result<MlxBuffer> {
+        let tq = self.tq.as_ref().ok_or_else(|| {
+            anyhow!(
+                "FullAttnKvSlot::dequant_seq_to_temp_f32: slot.tq is None — slot \
+                 was not constructed in TQ-active mode (HybridKvCache::new_with_options \
+                 tq_kv_active=true required)"
+            )
+        })?;
+
+        // Codebook-bits source: same INVESTIGATION_ENV cache the
+        // write-side uses, with the same {5,6,8} validation + fallback to
+        // 8 (mirrors gpu_full_attn::write_kv_with_optional_tq_encode and
+        // dispatch_decode_sdpa_with_optional_tq). Reading via LazyLock
+        // avoids per-call env::var().
+        let cb_env = crate::debug::INVESTIGATION_ENV.tq_codebook_bits;
+        let codebook_bits: u32 = if matches!(cb_env, 5 | 6 | 8) { cb_env } else { 8 };
+
+        let n_elems = (n_kv_heads as usize)
+            * (n_tokens as usize)
+            * (head_dim as usize);
+        let dst = device
+            .alloc_buffer(
+                n_elems * 4,
+                DType::F32,
+                vec![n_kv_heads as usize, n_tokens as usize, head_dim as usize],
+            )
+            .map_err(|e| anyhow!(
+                "dequant_seq_to_temp_f32: alloc temp [{n_kv_heads},{n_tokens},{head_dim}] f32: {e}"
+            ))?;
+
+        let (packed, norms) = if is_k {
+            (&tq.k_packed, &tq.k_norms)
+        } else {
+            (&tq.v_packed, &tq.v_norms)
+        };
+
+        // scale_factor_d512=1.0: matches the "bare" per-block norm
+        // convention the iter-15 decode TQ chain uses (and the iter-13
+        // GPU litmus test PASS confirms is correct under NRMSE 0.008).
+        mlx_native::ops::tq_dequantize_kv::dispatch_tq_dequantize_hb_kv_seq(
+            encoder,
+            registry,
+            device.metal_device(),
+            packed,
+            norms,
+            &dst,
+            n_kv_heads,
+            head_dim,
+            cache_capacity,
+            start_pos,
+            n_tokens,
+            /*scale_factor_d512=*/ 1.0,
+            codebook_bits,
+        )
+        .map_err(|e| anyhow!("dequant_seq_to_temp_f32: dispatch_tq_dequantize_hb_kv_seq: {e}"))?;
+
+        Ok(dst)
+    }
 }
 
 /// ADR-027 Phase B iter-10 — parameters for the qwen35 TQ SDPA dispatch.
@@ -3802,6 +3913,201 @@ mod tests {
             tq_ref.v_norms.as_slice::<f32>().unwrap(),
             tq_seq.v_norms.as_slice::<f32>().unwrap(),
             "v_norms bytes diverge between per-token loop and _seq dispatch"
+        );
+    }
+
+    /// ADR-027 Phase B iter-31 (sub-sub-iter 23c-β.2) — `dequant_seq_to_temp_f32`
+    /// shadow-cache parity test.
+    ///
+    /// Threads the iter-30 mlx-native parity guarantee
+    /// (`tq_dequantize_hb_kv_seq_n1_byte_identical_to_per_position`)
+    /// through hf2q's actual TQ encode pipeline at production cache shape.
+    ///
+    /// Sequence:
+    /// (1) Synthesize N tokens of K, encode via `encode_seq_tokens_to_tq`
+    ///     into a TQ-active slot.
+    /// (2) Reference: per-position dispatch
+    ///     `dispatch_tq_dequantize_hb_kv` for each position individually
+    ///     into separate F32 buffers.
+    /// (3) Under test: `dequant_seq_to_temp_f32` for the entire range
+    ///     `[0..N)` in one call.
+    /// (4) Byte-equal compare: per-position outputs[h, :] vs
+    ///     seq output[h, t, :] for each (h, t) pair.
+    ///
+    /// Without this contract, iter-32's prefill SDPA wiring (which reads
+    /// `dequant_seq_to_temp_f32` output) would risk silent drift vs the
+    /// shadow-cache F32 baseline — the cross-axis sweep harness is too
+    /// coarse to catch a per-(h,t)-position dequant bug.
+    #[test]
+    fn dequant_seq_to_temp_f32_byte_equal_to_per_position_dispatch() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache_capacity: u32 = 32;
+        let n_tokens: u32 = 6;
+        let n_kv_heads = cfg.num_key_value_heads;
+        let head_dim = cfg.head_dim;
+        assert_eq!(head_dim, 256);
+
+        // Build a TQ-active cache + encode N tokens of K into slot 0
+        // via the production seq-encode path.
+        let mut cache =
+            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+                .expect("kv tq-on");
+        let slot = &mut cache.full_attn[0];
+
+        // Build a [n_tokens, n_kv_heads, head_dim] f32 source buffer
+        // with deterministic non-trivial values. Same shape the
+        // production path passes to encode_seq_tokens_to_tq.
+        let stride = (n_kv_heads as usize) * (head_dim as usize);
+        let total_elems = (n_tokens as usize) * stride;
+        let mut seq_k = device
+            .alloc_buffer(
+                total_elems * 4, DType::F32,
+                vec![n_tokens as usize, n_kv_heads as usize, head_dim as usize],
+            )
+            .expect("alloc seq_k");
+        {
+            let dst = seq_k.as_mut_slice::<f32>().expect("seq_k mut");
+            for t in 0..n_tokens as usize {
+                for h in 0..n_kv_heads as usize {
+                    for d in 0..head_dim as usize {
+                        // Deterministic pattern with non-trivial inter-
+                        // position variance so dequant correctness can
+                        // be observed per (t, h, d).
+                        let v = ((t * 31 + h * 17 + d) as f32 / 137.0).sin() * 0.4;
+                        dst[t * stride + h * head_dim as usize + d] = v;
+                    }
+                }
+            }
+        }
+
+        let mut registry = mlx_native::KernelRegistry::new();
+
+        // Encode K seq into TQ.
+        let mut enc = device.command_encoder().expect("encoder");
+        slot
+            .encode_seq_tokens_to_tq(
+                &seq_k, /*is_k=*/ true, n_tokens, n_kv_heads, head_dim,
+                cache_capacity, /*write_pos=*/ 0, /*src_tok_offset=*/ 0,
+                /*sliding=*/ false, /*scale_factor_d512=*/ 1.0,
+                /*codebook_bits=*/ 8,
+                &mut enc, &mut registry, &device,
+            )
+            .expect("encode K seq");
+        enc.commit_and_wait().expect("encode commit");
+
+        // Reference: per-position dispatch into separate buffers.
+        let mut ref_per_pos: Vec<MlxBuffer> = Vec::with_capacity(n_tokens as usize);
+        for _ in 0..n_tokens as usize {
+            ref_per_pos.push(
+                device
+                    .alloc_buffer(
+                        (n_kv_heads as usize) * (head_dim as usize) * 4,
+                        DType::F32,
+                        vec![n_kv_heads as usize, head_dim as usize],
+                    )
+                    .expect("alloc ref_per_pos"),
+            );
+        }
+        {
+            let mut enc = device.command_encoder().expect("encoder ref");
+            let tq = slot.tq.as_ref().unwrap();
+            for t in 0..n_tokens {
+                mlx_native::ops::tq_dequantize_kv::dispatch_tq_dequantize_hb_kv(
+                    &mut enc, &mut registry, device.metal_device(),
+                    &tq.k_packed, &tq.k_norms,
+                    &ref_per_pos[t as usize],
+                    n_kv_heads, head_dim, cache_capacity,
+                    /*read_pos=*/ t,
+                    /*scale_factor_d512=*/ 1.0,
+                    /*codebook_bits=*/ 8,
+                )
+                .expect("per-pos dispatch");
+            }
+            enc.commit_and_wait().expect("ref commit");
+        }
+
+        // Under test: dequant_seq_to_temp_f32 for the entire range
+        // [0..n_tokens). Output shape [n_kv_heads, n_tokens, head_dim].
+        let temp_f32 = {
+            let mut enc = device.command_encoder().expect("encoder seq");
+            let buf = slot
+                .dequant_seq_to_temp_f32(
+                    /*is_k=*/ true, n_tokens, /*start_pos=*/ 0,
+                    cache_capacity, n_kv_heads, head_dim,
+                    &mut enc, &mut registry, &device,
+                )
+                .expect("dequant_seq_to_temp_f32");
+            enc.commit_and_wait().expect("seq commit");
+            buf
+        };
+        assert_eq!(
+            temp_f32.element_count(),
+            (n_kv_heads as usize) * (n_tokens as usize) * (head_dim as usize),
+            "temp_f32 element count must equal nkv × n_tokens × head_dim"
+        );
+
+        // Byte-equal compare per (h, t) chunk.
+        let seq_slice = temp_f32.as_slice::<f32>().expect("temp_f32 slice");
+        for h in 0..n_kv_heads {
+            for t in 0..n_tokens {
+                // Reference layout: ref_per_pos[t][h, 0..hd].
+                let pp_slice = ref_per_pos[t as usize].as_slice::<f32>().expect("pp slice");
+                let pp_off = (h as usize) * (head_dim as usize);
+                let pp = &pp_slice[pp_off..pp_off + head_dim as usize];
+
+                // Seq output layout: temp_f32[h, t, 0..hd]
+                // = seq_slice[h * n_tokens * hd + t * hd + 0..hd].
+                let seq_off = (h as usize) * (n_tokens as usize) * (head_dim as usize)
+                    + (t as usize) * (head_dim as usize);
+                let s = &seq_slice[seq_off..seq_off + head_dim as usize];
+
+                assert_eq!(
+                    pp, s,
+                    "h={h} t={t}: dequant_seq output diverges from per-position \
+                     dispatch — iter-32 prefill wiring would silently drift."
+                );
+            }
+        }
+    }
+
+    /// ADR-027 Phase B iter-31 — defensive: helper errors loud when
+    /// caller passes a slot constructed without TQ buffers (mantra:
+    /// no fallback, no stub — Result::Err with clear context).
+    #[test]
+    fn dequant_seq_to_temp_f32_errors_when_slot_lacks_tq_buffers() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        // tq_kv_active=false: slot.tq is None.
+        let cache = HybridKvCache::new_with_options(&cfg, &device, 32, 1, false)
+            .expect("kv tq-off");
+        let slot = &cache.full_attn[0];
+        assert!(slot.tq.is_none(), "test precondition: slot.tq must be None");
+
+        let mut registry = mlx_native::KernelRegistry::new();
+        let mut enc = device.command_encoder().expect("encoder");
+        let res = slot.dequant_seq_to_temp_f32(
+            true, 1, 0, 32,
+            cfg.num_key_value_heads, cfg.head_dim,
+            &mut enc, &mut registry, &device,
+        );
+        assert!(res.is_err(), "must error when slot.tq is None");
+        let msg = format!("{:?}", res.err().unwrap());
+        assert!(
+            msg.contains("slot.tq is None"),
+            "error msg must mention slot.tq is None, got: {msg}"
         );
     }
 
