@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# ADR-007 Path C F-4.4: Needle-in-haystack retrieval at long context.
+# ADR-007 Path C F-4.4 / ADR-027 Phase B iter-38: Needle-in-haystack
+# retrieval at long context.
 #
 # Plants a unique fact ("the secret code is XXXXX") at a random position
 # in a long-context prompt and asks the model to retrieve it. Reports
@@ -8,6 +9,15 @@
 # Usage: scripts/bench-needle-haystack.sh [lengths] [trials_per_length]
 #   lengths: comma-separated target context-token counts. Default: 4096,8192,16384
 #   trials_per_length: int, default 3 (one per fractional position bucket)
+#
+# Env (ADR-027 iter-38 generalization):
+#   MODEL=...      path to GGUF (default: gemma-4-26B-A4B); set to a
+#                  qwen35/qwen36 GGUF for ADR-027 needle-haystack runs.
+#   OUT_ROOT=...   output root dir (default: /tmp/f04-needle)
+#   HF2Q=...       hf2q binary (default: /opt/hf2q/target/release/hf2q)
+#   HF2Q_TQ_KV=1   activate TQ-only KV mode (post-iter-34 production
+#                  configuration; the iter-23 chain's 3.94× memory savings
+#                  is LIVE under this flag for qwen35/qwen36 models).
 #
 # Position fractions: 0.1 (early), 0.5 (middle), 0.9 (late) — covers the
 # typical needle-in-haystack failure modes (early vs late attention).
@@ -18,11 +28,38 @@
 
 set -euo pipefail
 
-MODEL="/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf"
-HF2Q="/opt/hf2q/target/release/hf2q"
-OUT_ROOT="/tmp/f04-needle"
+MODEL="${MODEL:-/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf}"
+HF2Q="${HF2Q:-/opt/hf2q/target/release/hf2q}"
+OUT_ROOT="${OUT_ROOT:-/tmp/f04-needle}"
 LENGTHS="${1:-4096,8192,16384}"
 TRIALS="${2:-3}"
+# iter-38: max-tokens budget. Default 20 preserves gemma harness shape
+# (gemma typically answers directly with 5-char code + a few words).
+# Qwen3-thinking variants emit `<think>...` reasoning before the answer,
+# so MAX_TOKENS=256+ is required for the answer to appear in the
+# truncated output. Operator overrides via env when targeting qwen35/qwen36.
+MAX_TOKENS="${MAX_TOKENS:-20}"
+
+if [ ! -f "$MODEL" ]; then
+    echo "ERROR: MODEL not found: $MODEL"
+    echo "Hint: set MODEL=/path/to/model.gguf"
+    exit 1
+fi
+if [ ! -x "$HF2Q" ]; then
+    echo "ERROR: HF2Q binary not found or not executable: $HF2Q"
+    echo "Hint: cargo build --release --bin hf2q"
+    exit 1
+fi
+
+echo "=== bench-needle-haystack ==="
+echo "  MODEL    = $MODEL"
+echo "  HF2Q     = $HF2Q"
+echo "  OUT_ROOT = $OUT_ROOT"
+echo "  LENGTHS  = $LENGTHS"
+echo "  TRIALS/length = $TRIALS"
+echo "  HF2Q_TQ_KV   = ${HF2Q_TQ_KV:-unset (F32 KV cache)}"
+echo "  HF2Q_KV_PERSIST = ${HF2Q_KV_PERSIST:-unset}"
+echo
 
 mkdir -p "$OUT_ROOT"
 
@@ -85,7 +122,7 @@ run_one_trial() {
     timeout 1800 "$HF2Q" generate \
         --model "$MODEL" \
         --prompt-file "$prompt_file" \
-        --max-tokens 20 \
+        --max-tokens "$MAX_TOKENS" \
         > "$out_file" 2>&1 || { echo "  trial $trial_idx FAILED (exit $?)"; return 1; }
 
     # Output + needle check.
@@ -111,8 +148,12 @@ print(log.replace('\n','').replace(' ',''))
         pass="PASS"
     fi
 
-    # Stats from any prefill line
-    local prefill_tok=$(echo "$response" | grep -oE "prefill: [0-9]+ tok" | grep -oE "[0-9]+" | head -1 || echo "0")
+    # Stats from any prefill line.
+    # iter-38 fix: read from the actual output file ($out_file), not
+    # the never-set $response variable (pre-existing bug — the script's
+    # `set -u` would have caught it but the local declaration masks it).
+    local prefill_tok=$(grep -oE "prefill: [0-9]+ tok" "$out_file" 2>/dev/null | grep -oE "[0-9]+" | head -1 || echo "0")
+    [ -z "$prefill_tok" ] && prefill_tok=0
 
     echo "  trial $trial_idx (needle=$needle, pos=$pos_frac, prefill=${prefill_tok} tok): $pass"
 
