@@ -200,6 +200,91 @@ impl FullAttnKvSlot {
         Ok(())
     }
 
+    /// ADR-027 Phase B iter-14 — multi-token TQ encode for prefill.
+    ///
+    /// Loops mlx-native's `dispatch_hadamard_quantize_kv_hb_seq` (per-token
+    /// dispatch with successive `src_offset` values) to encode `n_tokens`
+    /// positions of the seq-major K or V buffer into this slot's TQ
+    /// buffers, starting at cache slot `cache_write_pos_start`.
+    ///
+    /// **Caller contract:**
+    /// - `self.tq` MUST be `Some` (TQ-active mode required).
+    /// - `kv_seq_major` is F32 with at least
+    ///   `n_tokens × num_kv_heads × head_dim` elements (seq-major layout
+    ///   `[n_tokens, num_kv_heads, head_dim]`); typical production
+    ///   passing the K or V projection output before it lands in the
+    ///   F32 cache.
+    /// - `is_k = true` selects the K-side TQ buffers; `false` selects V.
+    ///   This keeps the prefill encode loop in `gpu_full_attn` clean —
+    ///   one call per side per layer per chunk.
+    ///
+    /// Iter-15 wires this at all 4 KV write sites in
+    /// `gpu_full_attn::full_attn_layer_gpu` (decode, prefill, fused
+    /// stage_ab prefill, decode_into).
+    ///
+    /// # Errors
+    ///
+    /// - `Err` if `self.tq.is_none()`.
+    /// - Propagates errors from the GPU encode kernel (head_dim ∈
+    ///   {256, 512}, codebook_bits ∈ {5, 6, 8}, src_size validation,
+    ///   non-sliding overflow at `write_pos_start + n_tokens >
+    ///   cache_capacity`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_seq_tokens_to_tq(
+        &mut self,
+        kv_seq_major: &MlxBuffer,
+        is_k: bool,
+        n_tokens: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        cache_capacity: u32,
+        cache_write_pos_start: u32,
+        src_tok_offset: u32,
+        is_sliding: bool,
+        scale_factor_d512: f32,
+        codebook_bits: u32,
+        encoder: &mut mlx_native::CommandEncoder,
+        registry: &mut mlx_native::KernelRegistry,
+        device: &MlxDevice,
+    ) -> Result<()> {
+        let tq = self.tq.as_mut().ok_or_else(|| {
+            anyhow!(
+                "encode_seq_tokens_to_tq: slot.tq is None — slot was not \
+                 constructed in TQ-active mode"
+            )
+        })?;
+        let (packed, norms) = if is_k {
+            (&tq.k_packed, &tq.k_norms)
+        } else {
+            (&tq.v_packed, &tq.v_norms)
+        };
+        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq(
+            encoder,
+            registry,
+            device.metal_device(),
+            kv_seq_major,
+            packed,
+            norms,
+            n_kv_heads,
+            head_dim,
+            cache_capacity,
+            cache_write_pos_start,
+            n_tokens,
+            src_tok_offset,
+            is_sliding,
+            scale_factor_d512,
+            codebook_bits,
+        )
+        .map_err(|e| {
+            anyhow!(
+                "encode_seq_tokens_to_tq: dispatch_hadamard_quantize_kv_hb_seq \
+                 ({} side, n_tokens={n_tokens}, write_pos_start={cache_write_pos_start}): {e}",
+                if is_k { "K" } else { "V" }
+            )
+        })?;
+        Ok(())
+    }
+
     /// ADR-027 Phase B iter-10 — dispatch the TQ SDPA kernel
     /// (`flash_attn_vec_tq_hb`) consuming this slot's `tq` buffers.
     ///
@@ -3189,6 +3274,308 @@ mod tests {
     // ──────────────────────────────────────────────────────────────────
     // ADR-027 Phase B iter-13 — GPU end-to-end NRMSE litmus
     // ──────────────────────────────────────────────────────────────────
+
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-027 Phase B iter-14 — encode_seq_tokens_to_tq prefill encode
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Build a synthetic seq-major K (or V) buffer at qwen35 shape with
+    /// deterministic non-trivial values: shape `[seq_len, n_kv_heads,
+    /// head_dim]` F32. Used by both the multi-token encode test and
+    /// the per-token equivalence test below.
+    fn synth_seq_kv_buffer(
+        device: &MlxDevice,
+        seq_len: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        salt: u32,
+    ) -> MlxBuffer {
+        let elems = seq_len * n_kv_heads * head_dim;
+        let mut buf = device
+            .alloc_buffer(
+                elems * std::mem::size_of::<f32>(),
+                DType::F32,
+                vec![seq_len, n_kv_heads, head_dim],
+            )
+            .expect("alloc seq kv buf");
+        {
+            let s = buf.as_mut_slice::<f32>().expect("seq kv mut slice");
+            for t in 0..seq_len {
+                for h in 0..n_kv_heads {
+                    for d in 0..head_dim {
+                        let i = (t * n_kv_heads + h) * head_dim + d;
+                        let x = ((i as u32 + salt) % 1000) as f32 / 1000.0;
+                        s[i] = (x * 6.28318).sin() * 0.5;
+                    }
+                }
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn encode_seq_tokens_to_tq_errors_when_slot_lacks_tq_buffers() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let mut cache =
+            HybridKvCache::new_with_options(&cfg, &device, 64, 1, false)
+                .expect("kv tq-off");
+        let slot = &mut cache.full_attn[0];
+        assert!(slot.tq.is_none());
+        let seq_kv = synth_seq_kv_buffer(
+            &device, 4, cfg.num_key_value_heads as usize,
+            cfg.head_dim as usize, 17,
+        );
+        let mut registry = mlx_native::KernelRegistry::new();
+        let mut encoder = device.command_encoder().expect("encoder");
+        let err = slot
+            .encode_seq_tokens_to_tq(
+                &seq_kv, true, 4,
+                cfg.num_key_value_heads, cfg.head_dim, 64,
+                0, 0, false, 1.0, 8,
+                &mut encoder, &mut registry, &device,
+            )
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("slot.tq is None"),
+            "expected fail-loud None-tq error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn encode_seq_tokens_to_tq_byte_equal_to_per_token_loop() {
+        // **iter-14 equivalence test** — proves the multi-token
+        // dispatch (`dispatch_hadamard_quantize_kv_hb_seq`) produces
+        // byte-identical packed/norms output to a manual per-token
+        // loop calling `dispatch_hadamard_quantize_kv_hb` once per
+        // position. This pins the `_seq` variant's loop semantics +
+        // src_offset stride so production wiring (iter-15) can use
+        // the bulk dispatch with confidence.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache_capacity: u32 = 32;
+        let n_tokens: u32 = 5;
+        let n_kv_heads = cfg.num_key_value_heads;
+        let head_dim = cfg.head_dim;
+
+        // Reference path: 5 separate single-token tokens encoded via
+        // encode_token_to_tq into reference cache slot.
+        let mut cache_ref =
+            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+                .expect("kv ref tq-on");
+        let slot_ref = &mut cache_ref.full_attn[0];
+
+        // Build N single-token K and V buffers (each shape
+        // [n_kv_heads, head_dim]).
+        let mut single_k_bufs: Vec<MlxBuffer> = Vec::new();
+        let mut single_v_bufs: Vec<MlxBuffer> = Vec::new();
+        for t in 0..n_tokens as usize {
+            single_k_bufs.push(synth_token_buffer(
+                &device, n_kv_heads as usize, head_dim as usize,
+                100 + t as u32,
+            ));
+            single_v_bufs.push(synth_token_buffer(
+                &device, n_kv_heads as usize, head_dim as usize,
+                200 + t as u32,
+            ));
+        }
+
+        let mut registry = mlx_native::KernelRegistry::new();
+        let mut enc_ref = device.command_encoder().expect("encoder ref");
+        for (t, (k_buf, v_buf)) in
+            single_k_bufs.iter().zip(single_v_bufs.iter()).enumerate()
+        {
+            slot_ref
+                .encode_token_to_tq(
+                    k_buf, v_buf, n_kv_heads, head_dim, cache_capacity,
+                    t as u32, false, 1.0, 8, &mut enc_ref,
+                    &mut registry, &device,
+                )
+                .expect("encode_token_to_tq per-token");
+        }
+        enc_ref.commit_and_wait().expect("ref commit");
+
+        // Multi-token dispatch path: build a single seq-major K + V
+        // buffer carrying the SAME data laid out as
+        // [n_tokens, n_kv_heads, head_dim], then call
+        // encode_seq_tokens_to_tq once per side.
+        let mut seq_k = device
+            .alloc_buffer(
+                (n_tokens as usize) * (n_kv_heads as usize)
+                    * (head_dim as usize) * 4,
+                DType::F32,
+                vec![n_tokens as usize, n_kv_heads as usize, head_dim as usize],
+            )
+            .expect("alloc seq_k");
+        let mut seq_v = device
+            .alloc_buffer(
+                (n_tokens as usize) * (n_kv_heads as usize)
+                    * (head_dim as usize) * 4,
+                DType::F32,
+                vec![n_tokens as usize, n_kv_heads as usize, head_dim as usize],
+            )
+            .expect("alloc seq_v");
+        {
+            let dst_k = seq_k.as_mut_slice::<f32>().expect("seq_k mut");
+            let dst_v = seq_v.as_mut_slice::<f32>().expect("seq_v mut");
+            let stride = (n_kv_heads as usize) * (head_dim as usize);
+            for t in 0..n_tokens as usize {
+                let k_src = single_k_bufs[t].as_slice::<f32>().expect("k src");
+                let v_src = single_v_bufs[t].as_slice::<f32>().expect("v src");
+                dst_k[t * stride..(t + 1) * stride].copy_from_slice(k_src);
+                dst_v[t * stride..(t + 1) * stride].copy_from_slice(v_src);
+            }
+        }
+
+        let mut cache_seq =
+            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+                .expect("kv seq tq-on");
+        let slot_seq = &mut cache_seq.full_attn[0];
+        let mut enc_seq = device.command_encoder().expect("encoder seq");
+        slot_seq
+            .encode_seq_tokens_to_tq(
+                &seq_k, true, n_tokens, n_kv_heads, head_dim, cache_capacity,
+                0, 0, false, 1.0, 8, &mut enc_seq, &mut registry, &device,
+            )
+            .expect("encode K seq");
+        slot_seq
+            .encode_seq_tokens_to_tq(
+                &seq_v, false, n_tokens, n_kv_heads, head_dim, cache_capacity,
+                0, 0, false, 1.0, 8, &mut enc_seq, &mut registry, &device,
+            )
+            .expect("encode V seq");
+        enc_seq.commit_and_wait().expect("seq commit");
+
+        // Byte-equal comparison: per-token loop and bulk _seq must
+        // produce identical packed + norms bytes.
+        let tq_ref = slot_ref.tq.as_ref().unwrap();
+        let tq_seq = slot_seq.tq.as_ref().unwrap();
+        assert_eq!(
+            tq_ref.k_packed.as_slice::<u8>().unwrap(),
+            tq_seq.k_packed.as_slice::<u8>().unwrap(),
+            "k_packed bytes diverge between per-token loop and _seq dispatch"
+        );
+        assert_eq!(
+            tq_ref.k_norms.as_slice::<f32>().unwrap(),
+            tq_seq.k_norms.as_slice::<f32>().unwrap(),
+            "k_norms bytes diverge between per-token loop and _seq dispatch"
+        );
+        assert_eq!(
+            tq_ref.v_packed.as_slice::<u8>().unwrap(),
+            tq_seq.v_packed.as_slice::<u8>().unwrap(),
+            "v_packed bytes diverge between per-token loop and _seq dispatch"
+        );
+        assert_eq!(
+            tq_ref.v_norms.as_slice::<f32>().unwrap(),
+            tq_seq.v_norms.as_slice::<f32>().unwrap(),
+            "v_norms bytes diverge between per-token loop and _seq dispatch"
+        );
+    }
+
+    #[test]
+    fn encode_seq_tokens_to_tq_with_src_tok_offset_skips_leading_tokens() {
+        // Defensive: src_tok_offset > 0 must skip leading source tokens
+        // (matches dispatch_hadamard_quantize_kv_seq semantics for the
+        // 4-bit path). Encode tokens [2, 3] of a 5-token source into
+        // cache slots [0, 1] — slot[0,1] should match a per-token
+        // encode of source positions [2, 3].
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache_capacity: u32 = 16;
+        let n_kv_heads = cfg.num_key_value_heads;
+        let head_dim = cfg.head_dim;
+        let total_src_tokens: u32 = 5;
+        let n_tokens_to_encode: u32 = 2;
+        let src_tok_offset: u32 = 2;
+
+        // Build source seq buffer (5 tokens).
+        let seq_k = synth_seq_kv_buffer(
+            &device, total_src_tokens as usize,
+            n_kv_heads as usize, head_dim as usize, 333,
+        );
+
+        // Reference: encode tokens [2, 3] via per-token loop using
+        // single-token buffers extracted from positions 2 and 3.
+        let mut cache_ref =
+            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+                .expect("kv ref");
+        let slot_ref = &mut cache_ref.full_attn[0];
+        let mut registry = mlx_native::KernelRegistry::new();
+        let mut enc_ref = device.command_encoder().expect("encoder ref");
+        let stride = (n_kv_heads as usize) * (head_dim as usize);
+        for (cache_slot, src_pos) in
+            (src_tok_offset..src_tok_offset + n_tokens_to_encode).enumerate()
+        {
+            let mut tok_buf = device
+                .alloc_buffer(
+                    stride * 4, DType::F32,
+                    vec![n_kv_heads as usize, head_dim as usize],
+                )
+                .expect("alloc tok");
+            {
+                let dst = tok_buf.as_mut_slice::<f32>().expect("tok mut");
+                let src_slice =
+                    seq_k.as_slice::<f32>().expect("seq_k slice");
+                let src_offset = (src_pos as usize) * stride;
+                dst.copy_from_slice(&src_slice[src_offset..src_offset + stride]);
+            }
+            // Use the same buffer for K + V (test only cares about K side).
+            slot_ref
+                .encode_token_to_tq(
+                    &tok_buf, &tok_buf, n_kv_heads, head_dim, cache_capacity,
+                    cache_slot as u32, false, 1.0, 8, &mut enc_ref,
+                    &mut registry, &device,
+                )
+                .expect("encode token");
+        }
+        enc_ref.commit_and_wait().expect("ref commit");
+
+        // Test path: encode_seq_tokens_to_tq with src_tok_offset=2.
+        let mut cache_seq =
+            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+                .expect("kv seq");
+        let slot_seq = &mut cache_seq.full_attn[0];
+        let mut enc_seq = device.command_encoder().expect("encoder seq");
+        slot_seq
+            .encode_seq_tokens_to_tq(
+                &seq_k, true, n_tokens_to_encode, n_kv_heads, head_dim,
+                cache_capacity, 0, src_tok_offset, false, 1.0, 8,
+                &mut enc_seq, &mut registry, &device,
+            )
+            .expect("encode seq K");
+        enc_seq.commit_and_wait().expect("seq commit");
+
+        // K side bytes must match.
+        assert_eq!(
+            slot_ref.tq.as_ref().unwrap().k_packed.as_slice::<u8>().unwrap(),
+            slot_seq.tq.as_ref().unwrap().k_packed.as_slice::<u8>().unwrap(),
+            "src_tok_offset semantics mismatch on k_packed"
+        );
+        assert_eq!(
+            slot_ref.tq.as_ref().unwrap().k_norms.as_slice::<f32>().unwrap(),
+            slot_seq.tq.as_ref().unwrap().k_norms.as_slice::<f32>().unwrap(),
+            "src_tok_offset semantics mismatch on k_norms"
+        );
+    }
 
     #[test]
     fn dispatch_tq_sdpa_gpu_end_to_end_nrmse_vs_f32_baseline_under_threshold() {
