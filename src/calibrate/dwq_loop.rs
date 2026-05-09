@@ -903,6 +903,53 @@ pub fn prepare_full_model_teacher_inputs(
     })
 }
 
+/// ADR-020 AC#7 Option A — drive the teacher-capture pass over a
+/// single calibration split.  Generic over any
+/// [`crate::calibrate::dwq_targets::TeacherLogitsProvider`] so this
+/// function is unit-testable with a synthetic teacher (no real GGUF
+/// load).
+///
+/// Builds the split via [`build_calibration_split_from_full_model`]
+/// (labelling it `"train"` — the only split Option A consumes; mlx-lm
+/// supports a separate `"valid"` split for early-stopping but Option
+/// A's plain Adam loop has no early-stop hook yet, so a single train
+/// split is sufficient and matches `dwq.py:53` behaviour when invoked
+/// without a held-out set).
+///
+/// Returns the per-split count summary from
+/// [`crate::calibrate::dwq_targets::compute_dwq_targets`] —
+/// `Vec<(split_name, n_batches_written)>`.  For the single-split
+/// flow that's `vec![("train", N)]` where N == cfg.calibration_token_batches.len().
+pub fn drive_full_model_teacher_capture<T>(
+    teacher: &mut T,
+    cfg: &FullModelDwqConfig,
+    targets_cfg: &crate::calibrate::dwq_targets::ComputeTargetsConfig,
+) -> Result<Vec<(String, usize)>>
+where
+    T: crate::calibrate::dwq_targets::TeacherLogitsProvider,
+{
+    let split = build_calibration_split_from_full_model(cfg, "train");
+    crate::calibrate::dwq_targets::compute_dwq_targets(teacher, &[split], targets_cfg)
+        .context("drive_full_model_teacher_capture: compute_dwq_targets")
+}
+
+/// ADR-020 AC#7 Option A — ergonomic wrapper that drives
+/// [`drive_full_model_teacher_capture`] using an owned
+/// [`PreparedFullModelTeacherInputs`].
+///
+/// Equivalent to:
+/// ```ignore
+/// drive_full_model_teacher_capture(&mut prepared.teacher, cfg, &prepared.targets_cfg)
+/// ```
+/// but spelled out so call sites don't have to thread two fields out of
+/// the prepared bundle.
+pub fn drive_full_model_teacher_capture_prepared(
+    prepared: &mut PreparedFullModelTeacherInputs,
+    cfg: &FullModelDwqConfig,
+) -> Result<Vec<(String, usize)>> {
+    drive_full_model_teacher_capture(&mut prepared.teacher, cfg, &prepared.targets_cfg)
+}
+
 /// ADR-020 iter-12d-2 — per-Linear training summary inside a model
 /// scan (one entry per successfully-trained tensor).
 #[derive(Debug, Clone)]
@@ -3555,6 +3602,211 @@ mod tests {
         assert_eq!(split.batches[0][0], 1);
         assert_eq!(split.batches[1][0], 2);
         assert_eq!(split.batches[2][0], 3);
+    }
+
+    /// ADR-020 AC#7 Option A — minimal in-memory teacher used to
+    /// exercise the `drive_full_model_teacher_capture` driver without
+    /// loading a real GGUF.  Produces deterministic per-(row, t, v)
+    /// logits so `compute_dwq_targets` has non-degenerate work to do
+    /// (top-K is meaningful), and tracks how many forward passes it
+    /// has served so tests can assert call counts.
+    struct StubTeacher {
+        vocab: usize,
+        forward_calls: usize,
+    }
+    impl crate::calibrate::dwq_targets::TeacherLogitsProvider for StubTeacher {
+        fn forward_logits(
+            &mut self,
+            _tokens: &[u32],
+            batch_size: usize,
+            seq_len: usize,
+            vocab: usize,
+        ) -> anyhow::Result<Vec<f32>> {
+            assert_eq!(vocab, self.vocab, "fixture invariant: vocab agreement");
+            self.forward_calls += 1;
+            let mut out = Vec::with_capacity(batch_size * seq_len * vocab);
+            for r in 0..batch_size {
+                for t in 0..seq_len {
+                    for v in 0..vocab {
+                        let val = ((0.01 * v as f32) + 0.1 * r as f32).sin()
+                            + 0.7 * ((0.05 * v as f32) + 0.3 * t as f32).cos();
+                        out.push(val * 5.0);
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    /// ADR-020 AC#7 Option A — driver writes one safetensors file per
+    /// batch under `<save_dir>/train/<i:010d>.safetensors` and reports
+    /// the count back via the summary tuple.  Using a stub teacher
+    /// proves the wiring (split assembly, teacher invocation, file
+    /// emission) is correct without dragging a real GGUF load into a
+    /// 1-second unit test.
+    #[test]
+    fn drive_full_model_teacher_capture_writes_one_file_per_batch() {
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-drive-stub-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let save_dir = dir.join("teacher-out");
+
+        let cfg = super::FullModelDwqConfig {
+            gguf_path: std::path::PathBuf::from("/dev/null"),
+            calibration_token_batches: vec![
+                vec![0u32; 32 * 8],
+                vec![1u32; 32 * 8],
+                vec![2u32; 32 * 8],
+            ],
+            batch_size: 32,
+            seq_len: 8,
+            top_k_teacher: 32,
+            ..super::FullModelDwqConfig::default()
+        };
+        let targets_cfg =
+            super::build_dwq_targets_config_from_full_model(&cfg, save_dir.clone(), 256).unwrap();
+
+        let mut teacher = StubTeacher {
+            vocab: 256,
+            forward_calls: 0,
+        };
+        let summary =
+            super::drive_full_model_teacher_capture(&mut teacher, &cfg, &targets_cfg).unwrap();
+
+        assert_eq!(summary.len(), 1, "single split (\"train\")");
+        assert_eq!(summary[0].0, "train");
+        assert_eq!(summary[0].1, 3, "3 batches → 3 files");
+        assert_eq!(teacher.forward_calls, 3, "one teacher forward per batch");
+
+        // Every file must exist and have non-zero size.  File names
+        // are zero-padded 10-digit decimals per dwq_targets.rs:`{:010d}`.
+        for i in 0..3 {
+            let p = save_dir.join("train").join(format!("{:010}.safetensors", i));
+            let meta = std::fs::metadata(&p)
+                .unwrap_or_else(|e| panic!("missing teacher file {}: {e}", p.display()));
+            assert!(meta.len() > 0, "teacher file {} is empty", p.display());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — driver propagates teacher errors
+    /// (and identifies which batch failed) so operators get an
+    /// actionable diagnostic, not a silent corrupt-on-disk state.
+    #[test]
+    fn drive_full_model_teacher_capture_propagates_teacher_errors() {
+        struct FailingTeacher;
+        impl crate::calibrate::dwq_targets::TeacherLogitsProvider for FailingTeacher {
+            fn forward_logits(
+                &mut self,
+                _tokens: &[u32],
+                _batch_size: usize,
+                _seq_len: usize,
+                _vocab: usize,
+            ) -> anyhow::Result<Vec<f32>> {
+                Err(anyhow::anyhow!(
+                    "stub-teacher: deliberate forward failure"
+                ))
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-drive-failing-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let save_dir = dir.join("teacher-out");
+
+        let cfg = super::FullModelDwqConfig {
+            gguf_path: std::path::PathBuf::from("/dev/null"),
+            calibration_token_batches: vec![vec![0u32; 32 * 4]],
+            batch_size: 32,
+            seq_len: 4,
+            top_k_teacher: 16,
+            ..super::FullModelDwqConfig::default()
+        };
+        let targets_cfg =
+            super::build_dwq_targets_config_from_full_model(&cfg, save_dir, 64).unwrap();
+
+        let mut teacher = FailingTeacher;
+        let res = super::drive_full_model_teacher_capture(&mut teacher, &cfg, &targets_cfg);
+        let err = match res {
+            Ok(_) => panic!("expected teacher-failure to propagate"),
+            Err(e) => e,
+        };
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("compute_dwq_targets") && msg.contains("deliberate forward failure"),
+            "expected wrapped teacher error, got: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — driver respects vocab/top_k mismatch
+    /// at the targets-cfg level (caught by `compute_dwq_targets`'s
+    /// own check at `dwq_targets.rs:111`).  This test crosses through
+    /// the `build_dwq_targets_config_from_full_model` happy path and
+    /// then mutates targets_cfg — proving the driver isn't silently
+    /// ignoring downstream invariants.
+    #[test]
+    fn drive_full_model_teacher_capture_propagates_targets_cfg_invariants() {
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-drive-tgt-bad-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cfg = super::FullModelDwqConfig {
+            gguf_path: std::path::PathBuf::from("/dev/null"),
+            calibration_token_batches: vec![vec![0u32; 32 * 4]],
+            batch_size: 32,
+            seq_len: 4,
+            top_k_teacher: 16,
+            ..super::FullModelDwqConfig::default()
+        };
+        let mut targets_cfg = crate::calibrate::dwq_targets::ComputeTargetsConfig {
+            top_k: 0, // BAD — compute_dwq_targets:108 must reject
+            save_dir: dir.join("teacher-out"),
+            vocab: 256,
+        };
+        let mut teacher = StubTeacher {
+            vocab: 256,
+            forward_calls: 0,
+        };
+        let res = super::drive_full_model_teacher_capture(&mut teacher, &cfg, &targets_cfg);
+        let err = match res {
+            Ok(_) => panic!("expected top_k=0 to reject"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{:#}", err).contains("top_k must be > 0"),
+            "got: {err:#}"
+        );
+        assert_eq!(
+            teacher.forward_calls, 0,
+            "no teacher work should run when targets_cfg invariants fail"
+        );
+
+        // And: a valid targets_cfg passes through.
+        targets_cfg.top_k = 8;
+        let summary =
+            super::drive_full_model_teacher_capture(&mut teacher, &cfg, &targets_cfg).unwrap();
+        assert_eq!(summary[0].1, 1);
+        assert_eq!(teacher.forward_calls, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ADR-020 AC#7 Option A — `prepare_full_model_teacher_inputs`
