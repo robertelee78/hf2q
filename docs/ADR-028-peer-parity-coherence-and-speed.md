@@ -2598,6 +2598,61 @@ S serial verify (iter-123) are the production-ready spec-decode
 infrastructure. Phase 2 GPU's predicted 1.6-3.0× decode speedup (from
 60-80% n-gram acceptance) is gated on this sustained session.
 
+### iter-140 DFlash discovery — purpose-trained draft models for our fixtures
+
+Operator-asked: "did we learn anything from /opt/dflash?" — yes, big find.
+
+**DFlash** (z-lab, https://arxiv.org/abs/2602.06036) is a block-diffusion
+speculative decoder with **purpose-trained draft models for our exact
+production fixtures**:
+- `z-lab/gemma-4-26B-A4B-it-DFlash` (matches gemma4)
+- `z-lab/Qwen3.6-35B-A3B-DFlash` (matches qwen3.6)
+
+#### Architecture (from `/opt/dflash/dflash/model_mlx.py:132-198`)
+
+1. **Tiny draft** binds to target's `embed_tokens` + `lm_head` (memory
+   ~free). Adds only fc + small layer stack + norm.
+2. **Target-conditioned drafting**: draft takes `target_hidden` (states
+   from `target_layer_ids` of the big model) as context. Draft "sees"
+   the target's reasoning → higher acceptance than n-gram.
+3. **Block diffusion** for parallel drafting (vs sequential n-gram).
+4. **MLX support exists** (model_mlx.py) — runs on Apple Silicon.
+5. **Integrated into vLLM v0.20.1+** via `--speculative-config '{"method":
+   "dflash", "num_speculative_tokens": 15}'`.
+
+#### Comparison vs vLLM n-gram (Path A current scoping)
+
+| Approach | Acceptance | Decode speedup |
+|----------|------------|----------------|
+| vLLM n-gram | ~50% (diverse text) | 1.6-2× |
+| **DFlash draft** | **60-80%+ (target-tuned)** | **2-5×** |
+
+#### Implication for gemma4 closure
+
+DFlash would close gemma4's 0.71× peer gap definitively:
+- Current: 63 t/s long-context, 0.71× peer (102 t/s)
+- With DFlash 2-5× decode lift: 126-315 t/s, **easily beats peer**
+
+#### Standing rule for Path A Phase 2 GPU implementation
+
+The verify_batched API surface (iter-134..140) accommodates BOTH
+n-gram-source AND draft-model-source verify drafts. The kernel-level
+batched-forward + per-position argmax + KV rollback are the same
+regardless of how drafts are produced. When iter-141+ implements the
+Shape B body, plan for draft-model-conditioned variant (DFlash) as the
+eventual target — just swap the proposer source from n-gram to a draft
+model forward pass.
+
+#### Action item for sustained-session work
+
+Before iter-141 (Shape B body), download DFlash draft models locally:
+- `huggingface-cli download z-lab/gemma-4-26B-A4B-it-DFlash`
+- `huggingface-cli download z-lab/Qwen3.6-35B-A3B-DFlash`
+
+Then iter-141..145 implements verify_batched with DFlash as the proposer.
+Final benchmarking measures actual decode speedup vs both peer (llama.cpp)
+and existing Shape S serial baseline.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
