@@ -199,3 +199,18 @@ For this project phase the sliding_wrap 752-byte batched-vs-batched ceiling is *
     2. Per-layer HB encode block in the existing layer loop, IMMEDIATELY AFTER the dense KV copy at line ~1326. Call `mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq` for K (`pf_k_normed`) and V (`pf_v_normed`) over all `seq_len` positions, using the SAME `dst_seq_pos_start` / `n_copy` / `src_tok_offset` as the dense copy so the dense and HB caches stay in lockstep on sliding-window ring positions.
     3. `dispatch_hadamard_quantize_kv_hb_seq` already exists at `mlx-native/src/ops/hadamard_quantize_kv.rs:547`, signature compatible.
   - **Iter-64 will land the fix and validate** with the same `What is 2+2?` coherence test + pp128/pp512/pp1024 vs llama-bench peer comparison. Expected outcome (per Apr-20 `9091b8c` baseline): batched ≈ 0.90× of llama on Gemma-4, byte-identical to per-token output, restoring 25-38× speedup over per-token default once batched is shippable.
+
+- 2026-05-09 (iter-64 FIX LANDED at commit `133722d`): forward_prefill_batched.rs +91 LOC mirroring per-token forward_prefill.rs. Eager allocation of leg_hb_encoded near line 297 + per-layer HB encode block via `dispatch_hadamard_quantize_kv_hb_seq` after the dense KV copy at line 1327. **Coherence**: per-token = `4<turn|>`, batched = `4<turn|>` (identical, was `41211789...` gibberish). **Speed (gemma4-ara-2pass-APEX-Q5_K_M.gguf, M5 Max)**:
+
+| pp   | per-token  | batched FIXED | llama.cpp | speedup vs default | gap to peer |
+|------|-----------:|--------------:|----------:|-------------------:|------------:|
+| 128  |   65 t/s   |   490 t/s     | 1715 t/s  |   7.5×            | 0.29×       |
+| 512  |   67 t/s   |  1125 t/s     | 2576 t/s  |  16.8×            | 0.44×       |
+| 1024 |   67 t/s   |  1451 t/s     | 1884 t/s  |  21.7×            | 0.77×       |
+| 2455 |  ~67 t/s   |  1737 t/s     | 3023 t/s  | ~26×              | 0.57×       |
+
+  Default flag remains gated `HF2Q_BATCHED_PREFILL=1 + HF2Q_UNSAFE_EXPERIMENTS=1` until either the L6 MoE router top-K threshold sensitivity (long-sequence sliding_wrap, operator-signed deferral 2026-04-16) is also addressed or operator approves shipping at the Apr-20 sourdough byte-match level.
+
+  The 2026-05-09 pp2455 number (0.57× peer) is below the Apr-20 0.90× baseline; both hf2q AND llama.cpp regressed since Apr 20 (Apr-20 hf2q 3069 / llama 3411 → today hf2q 1737 / llama 3023), but llama regressed less. Likely a combination of (a) further hf2q-side drift in non-batched-prefill code paths the layer loop touches, and (b) macOS / thermal envelope differences. Closing the residual 0.57× → 0.90× gap is its own work item; the iter-64 fix is the biggest single jump.
+
+- 2026-05-09 (iter-65 REGRESSION GATE LANDED): `scripts/adr010_iter64_batched_coherence_gate.sh` runs both per-token and batched prefill on the canonical `What is 2+2?` prompt and asserts (a) per-token contains `4` (reference truth), (b) batched contains `4` (no first-decode-token regression in compute path), and (c) batched does NOT contain a 6+ consecutive-digit run (gibberish-pattern detector tuned to the pre-iter-64 `41211789...` failure mode). Fast (~30s), operator-runnable after any forward_prefill_batched.rs change. Self-tested at HEAD: PASS. Closes the original "no Rust regression test exists for batched-prefill correctness" gap that allowed 3+ weeks of bit-rot.
