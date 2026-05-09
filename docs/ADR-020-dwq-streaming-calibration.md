@@ -704,23 +704,100 @@ landed; Linear-only forward already landed).
          W^T == output dim).  Sub-32 dims fail at backward dispatch
          with a kernel-level error; test fixtures pinned to 32.
 
-       Remaining ladder for AC#7 closure event (per `project_adr020_ac7_option_a_primitives_landed_2026_05_08`
-       memory):
-       1. Multi-Linear case — interior Linears at depth d need a
-          full forward chain to logits before s/b can receive a
-          cross-layer gradient.  Production
-          `train_all_linears_full_model_dwq` calls full
-          `Qwen35Model::forward_gpu` with affine leaves substituted
-          (parallel to the qwen35_moe_forward_on_tape simplified arch
-          at qwen35_moe.rs:454).
-       2. CLI wiring: `--full-model-teacher` + `--calibration-data
-          <path>` flags in `DwqTrainArgs`.
-       3. AC#7 closure event: operator runs full DWQ training +
-          `scripts/adr020_ac7_boundary_validate.sh`, expects
-          `boundary_delta_nats > +0.05`.
+       **AC#7 ALGORITHMIC CLOSURE 2026-05-09** (commits 324f513,
+       f8abc38, 739cdec on mlx-native; bd16b40, 77038a1, a9db048 on
+       hf2q).  The "remaining ladder" listed in the prior version
+       of this section has all landed:
 
-     - The serve-side AC#5 infrastructure works correctly; AC#7
-       PASS verdict gates on the implementation ladder above.
+       1. **Real-attention training kernel** in mlx-native:
+          - `rope_train` — differentiable RoPE (forward = existing
+            rope_multi shader; backward = forward with negated pos)
+            at `mlx-native/src/ops/rope_train.rs` (commit `324f513`,
+            phase 1a).
+          - `flash_attn_train_fwd.metal` (1103 LOC) — FA-2 forward +
+            logsumexp `L [B, H_q, qL]` f32 output, bf16 D=64+D=256,
+            causal/SW masks, GQA via `gqa_factor` (commit `f8abc38`,
+            phase 1b).
+          - `flash_attn_train_bwd.metal` + `flash_attn_train_bwd_compute_d.metal`
+            — FA-2 Algorithm 4 backward (D pre-pass + Q-tile-outer
+            grid; dV/dK via atomic_fetch_add on f32 scratch; bf16
+            cast at write-out).  Finite-diff falsifier passes for Q,
+            K, V independently at `atol≤5e-2` (commit `739cdec`,
+            phase 2).
+
+       2. **Tape integration** in hf2q's autograd_gpu_tape.rs
+          (commit `bd16b40`, phase 3a):
+          - `OpKind::Rope` — single-parent backward dispatch.
+          - `OpKind::FlashAttnTrain` — 3-parent backward (dQ→q_idx,
+            dK→k_idx, dV→v_idx); retains O + L on the tape for
+            backward consumption.
+          - 7 tape-level tests, all 4 finite-diff falsifiers (Rope
+            + Q + K + V) PASS.  Tolerances honestly reflect the bf16
+            chain: rope FD `atol=0.15`, flash_attn FD `atol≤0.30`
+            (atomic-bf16 noise floor).
+
+       3. **Real-GQA decoder layer** at
+          `src/calibrate/qwen35_moe.rs::decoder_layer_on_tape_real_gqa`
+          (commit `77038a1`, phase 3b):
+          - Forward chain mirrors production:
+            `rms_norm(x) → q/k/v_proj matmuls → per-head Q/K rms_norm
+             → rope() Q & K → flash_attn_train → output_proj → +x
+             → post-attn rms_norm → MoE FFN → +residual`
+          - Reuses MoE FFN block via the new `pub(crate)
+            moe_ffn_block_on_tape` helper.  Old simplified-arch
+            `decoder_layer_on_tape` retained — AC#7 foundation
+            tests still validate gradient routing through it.
+          - 3 unit tests including FD-falsifier on W_q/W_k/W_v/W_o
+            and a 30-step convergence test on perturbed `w_q`
+            (head_vs_tail < 0.80).
+
+       4. **Production wrapper** at
+          `src/calibrate/dwq_loop.rs::train_all_linears_full_model_dwq`
+          (commit `a9db048`, phase 3c) — replaces the prior
+          lm_head-only stub with full model coverage:
+          - Stage A: walks teacher GGUF, packs every trainable
+            Linear (attn w_q/k/v/o + MoE gate/up/down per layer +
+            lm_head), registers all (s, b) pairs with Adam under
+            canonical names.
+          - Stage B: per-batch full-model real-GQA forward
+            (decoder_layer_on_tape_real_gqa chained N layers + final
+            RMSNorm + lm_head) → KL → backward → collect_grads_for_adam
+            → adam.step.
+          - Stage C: emits DWQ overlay safetensors.
+          - Stage D: per-tensor disposition logging.
+          - LOAD-BEARING TEST: `phase3c_ac7_cross_layer_real_gqa_convergence`
+            measures cross-layer convergence on a synthetic 2-layer
+            fixture with perturbed bias on Linear AT LAYER 0 (deeply
+            upstream).  After 30 Adam steps:
+            **head-vs-tail loss ratio = 0.0030 (>99.6% loss reduction)**
+            — proves cross-layer gradient signal flows correctly from
+            layer-0 perturbation through real attention back to the
+            loss.  This is the algorithmic-closure signal for AC#7.
+
+       5. **CLI** (commit `8b6e683`, hf2q):
+          `hf2q dwq-train --full-model-teacher --calibration-data <path>
+           --full-model-n-steps N --full-model-lr X --full-model-temperature T
+           --full-model-batch-size B --full-model-seq-len S --full-model-top-k K
+           --output overlay.safetensors`
+          is operator-runnable.
+
+       **Remaining for AC#7 boundary VERDICT** (operator-driven, not
+       algorithmic):
+       1. Operator runs `hf2q dwq-train --full-model-teacher` on a
+          real Qwen 3.6 35B-A3B + Gemma 4 26B GGUF (multi-hour M5
+          Max session per family).
+       2. Operator runs
+          `scripts/adr020_ac7_boundary_validate.sh <overlay.safetensors>`.
+       3. Expected verdict: `boundary_delta_nats > +0.05` (PASS).
+       The kernels + composer + wrapper are correctness-gated by the
+       finite-diff falsifiers and the cross-layer convergence test
+       above.  Achieving the +0.05 boundary is now a tuning question
+       (n_steps, lr, top_k_teacher, calibration corpus quality) NOT
+       an algorithmic question.
+
+     - The serve-side AC#5 infrastructure works correctly; the
+       trained DWQ overlay safetensors flows through it unchanged.
+       AC#7 PASS verdict is now an operator-runnable execution event.
 8. **Per-family pass:** all four combos {Qwen 3.6 35B-A3B-Abliterix-EGA,
    Gemma 4 26B-A4B-it-ara} × {dwq-4, dwq-6} satisfy criteria 6–7.
    **HARNESS READY** — iter-12d-4 (`a62e4ee`)
