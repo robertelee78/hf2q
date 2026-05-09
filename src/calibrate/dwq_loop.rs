@@ -1176,6 +1176,94 @@ pub fn kl_loss_topk_oracle(
     Ok((total_kl / n_positions as f64) as f32)
 }
 
+/// ADR-020 AC#7 Option A — gather student logits along the vocab
+/// axis using teacher-supplied top-K indices.  CPU oracle of MLX's
+/// `mx.take_along_axis(logits, ids, axis=-1)` at `dwq.py:111`.
+///
+/// Inputs:
+/// - `student_logits_full`: flat row-major `[batch, seq, vocab]`,
+///   length `batch * seq * vocab`
+/// - `indices`: flat row-major `[batch, seq, top_k]`, length
+///   `batch * seq * top_k`, each value `< vocab`
+///
+/// Output: flat row-major `[batch, seq, top_k]` where
+/// `out[r, t, k] = student_logits_full[r, t, indices[r, t, k]]`.
+///
+/// This is the second half of the indexed-distillation pipeline:
+/// the teacher's `TeacherBatchTargets.indices` tell us WHICH vocab
+/// positions to compare; this fn pulls the student's logits at
+/// exactly those positions, after which `kl_loss_topk_oracle` does
+/// the scaled-KL math on the matched K-vector pair.
+///
+/// Index validation: every entry of `indices` MUST be `< vocab`.
+/// Out-of-range hits are a hard error rather than silent wraparound
+/// — a stale teacher-targets file paired with a re-quantized student
+/// would otherwise corrupt training without any visible signal.
+///
+/// # Errors
+/// - `student_logits_full.len() != batch * seq * vocab`
+/// - `indices.len() != batch * seq * top_k`
+/// - any of `batch`, `seq`, `vocab`, `top_k` is `0` or
+///   `batch * seq * vocab` / `... * top_k` overflow
+/// - any `indices[i] >= vocab`
+pub fn take_along_topk_indices(
+    student_logits_full: &[f32],
+    indices: &[u32],
+    batch: usize,
+    seq: usize,
+    vocab: usize,
+    top_k: usize,
+) -> Result<Vec<f32>> {
+    if batch == 0 || seq == 0 || vocab == 0 || top_k == 0 {
+        return Err(anyhow!(
+            "take_along_topk_indices: batch ({batch}), seq ({seq}), vocab ({vocab}), top_k ({top_k}) must all be > 0"
+        ));
+    }
+    let bs = batch
+        .checked_mul(seq)
+        .ok_or_else(|| anyhow!("batch * seq overflows usize"))?;
+    let logits_len = bs
+        .checked_mul(vocab)
+        .ok_or_else(|| anyhow!("batch * seq * vocab overflows usize"))?;
+    let idx_len = bs
+        .checked_mul(top_k)
+        .ok_or_else(|| anyhow!("batch * seq * top_k overflows usize"))?;
+    if student_logits_full.len() != logits_len {
+        return Err(anyhow!(
+            "take_along_topk_indices: student_logits_full.len ({}) != batch*seq*vocab ({})",
+            student_logits_full.len(),
+            logits_len
+        ));
+    }
+    if indices.len() != idx_len {
+        return Err(anyhow!(
+            "take_along_topk_indices: indices.len ({}) != batch*seq*top_k ({})",
+            indices.len(),
+            idx_len
+        ));
+    }
+
+    let mut out: Vec<f32> = Vec::with_capacity(idx_len);
+    for pos in 0..bs {
+        let row_lo = pos * vocab;
+        let idx_lo = pos * top_k;
+        for k in 0..top_k {
+            let v = indices[idx_lo + k];
+            if (v as usize) >= vocab {
+                return Err(anyhow!(
+                    "take_along_topk_indices: indices[{}] = {} >= vocab ({})",
+                    idx_lo + k,
+                    v,
+                    vocab
+                ));
+            }
+            out.push(student_logits_full[row_lo + v as usize]);
+        }
+    }
+    debug_assert_eq!(out.len(), idx_len);
+    Ok(out)
+}
+
 /// ADR-020 iter-12d-2 — per-Linear training summary inside a model
 /// scan (one entry per successfully-trained tensor).
 #[derive(Debug, Clone)]
@@ -4033,6 +4121,213 @@ mod tests {
         assert_eq!(teacher.forward_calls, 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — `take_along_topk_indices` hand-computed
+    /// case: 1 batch × 2 seq × 5 vocab → top_k=3 picks at distinct
+    /// per-(r,t) indices.
+    ///   logits = [[10, 20, 30, 40, 50],   // (r=0, t=0)
+    ///             [11, 22, 33, 44, 55]]   // (r=0, t=1)
+    ///   indices = [[3, 1, 4],             // pick logits[0,0,3], [0,0,1], [0,0,4]
+    ///              [0, 2, 4]]             // pick logits[0,1,0], [0,1,2], [0,1,4]
+    ///   expected = [[40, 20, 50], [11, 33, 55]]
+    #[test]
+    fn take_along_topk_indices_hand_computed() {
+        let logits = vec![
+            10.0_f32, 20.0, 30.0, 40.0, 50.0, // pos 0
+            11.0, 22.0, 33.0, 44.0, 55.0, // pos 1
+        ];
+        let indices = vec![3u32, 1, 4, 0, 2, 4];
+        let got = super::take_along_topk_indices(&logits, &indices, 1, 2, 5, 3).unwrap();
+        assert_eq!(got, vec![40.0, 20.0, 50.0, 11.0, 33.0, 55.0]);
+    }
+
+    /// ADR-020 AC#7 Option A — when `top_k == vocab` and indices are
+    /// `[0, 1, …, vocab-1]` per row, the gather is the identity.
+    #[test]
+    fn take_along_topk_indices_identity_when_indices_are_arange() {
+        let batch = 2;
+        let seq = 3;
+        let vocab = 4;
+        let logits: Vec<f32> = (0..batch * seq * vocab).map(|i| i as f32).collect();
+        let mut indices: Vec<u32> = Vec::with_capacity(batch * seq * vocab);
+        for _ in 0..batch * seq {
+            for v in 0..vocab as u32 {
+                indices.push(v);
+            }
+        }
+        let got = super::take_along_topk_indices(&logits, &indices, batch, seq, vocab, vocab)
+            .unwrap();
+        assert_eq!(got, logits);
+    }
+
+    /// ADR-020 AC#7 Option A — out-of-range index fails loud, naming
+    /// the exact offset and value so operators can grep their teacher
+    /// dump.
+    #[test]
+    fn take_along_topk_indices_rejects_out_of_range_index() {
+        let logits = vec![0.0_f32; 1 * 1 * 4]; // vocab=4
+        let indices = vec![0u32, 1, 4, 2]; // index 4 >= vocab=4
+        let err = super::take_along_topk_indices(&logits, &indices, 1, 1, 4, 4).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("indices[2] = 4") && msg.contains("vocab (4)"),
+            "got: {msg}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — slice-length mismatch fails loud.
+    #[test]
+    fn take_along_topk_indices_rejects_slice_length_mismatch() {
+        let logits = vec![0.0_f32; 8]; // batch*seq*vocab = 1*2*4 = 8 OK
+        let indices = vec![0u32; 4]; // batch*seq*top_k = 1*2*3 = 6, slice = 4 → mismatch
+        let err = super::take_along_topk_indices(&logits, &indices, 1, 2, 4, 3).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("indices.len (4)") && msg.contains("6"),
+            "got: {msg}"
+        );
+
+        let logits2 = vec![0.0_f32; 7]; // wrong logits len
+        let indices2 = vec![0u32; 6];
+        let err = super::take_along_topk_indices(&logits2, &indices2, 1, 2, 4, 3).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("student_logits_full.len (7)") && msg.contains("8"),
+            "got: {msg}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — bad knobs fail loud.
+    #[test]
+    fn take_along_topk_indices_rejects_zero_dims() {
+        let logits = vec![0.0_f32; 16];
+        let indices = vec![0u32; 8];
+        for (b, s, v, k) in [(0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 0, 1), (1, 1, 1, 0)] {
+            let err =
+                super::take_along_topk_indices(&logits, &indices, b, s, v, k).unwrap_err();
+            assert!(
+                format!("{:#}", err).contains("must all be > 0"),
+                "case (b={b},s={s},v={v},k={k}) didn't reject: {err:#}"
+            );
+        }
+    }
+
+    /// ADR-020 AC#7 Option A — handshake with `TeacherBatchTargets`:
+    /// the indices written by drive_full_model_teacher_capture →
+    /// load_teacher_targets_for_batch must point at valid vocab
+    /// positions and yield the same logits the teacher emitted (when
+    /// the "student" is in fact the teacher itself, the gather over
+    /// the saved indices reproduces the saved top-K logits).
+    #[test]
+    fn take_along_topk_indices_handshake_reproduces_teacher_topk_logits() {
+        let dir = std::env::temp_dir().join(format!(
+            "hf2q-adr020-take-along-handshake-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let save_dir = dir.join("teacher-out");
+
+        let cfg = super::FullModelDwqConfig {
+            gguf_path: std::path::PathBuf::from("/dev/null"),
+            calibration_token_batches: vec![vec![0u32; 4 * 2]], // batch=4, seq=2 (after trim → 1)
+            batch_size: 4,
+            seq_len: 2,
+            top_k_teacher: 5,
+            ..super::FullModelDwqConfig::default()
+        };
+        let vocab = 32;
+        let targets_cfg =
+            super::build_dwq_targets_config_from_full_model(&cfg, save_dir.clone(), vocab)
+                .unwrap();
+        let mut teacher = StubTeacher {
+            vocab,
+            forward_calls: 0,
+        };
+        super::drive_full_model_teacher_capture(&mut teacher, &cfg, &targets_cfg).unwrap();
+
+        let t = super::load_teacher_targets_for_batch(&save_dir, "train", 0, &cfg).unwrap();
+
+        // Reconstruct the full-vocab teacher tensor for the same batch
+        // (StubTeacher is deterministic — replay the same call, then
+        // gather over t.indices).  Trimmed seq is cfg.seq_len - 1 = 1.
+        // StubTeacher.forward_logits([batch=4, seq=1, vocab=32]).
+        let trimmed_seq = cfg.seq_len - 1;
+        let mut replay_teacher = StubTeacher {
+            vocab,
+            forward_calls: 0,
+        };
+        let full_logits = <StubTeacher as crate::calibrate::dwq_targets::TeacherLogitsProvider>::forward_logits(
+            &mut replay_teacher,
+            &vec![0u32; cfg.batch_size * trimmed_seq],
+            cfg.batch_size,
+            trimmed_seq,
+            vocab,
+        )
+        .unwrap();
+
+        let gathered = super::take_along_topk_indices(
+            &full_logits,
+            &t.indices,
+            cfg.batch_size,
+            trimmed_seq,
+            vocab,
+            cfg.top_k_teacher,
+        )
+        .unwrap();
+
+        // Gathered logits must equal the saved top-K logits — that's
+        // the definition of "the teacher saved its own top-K".
+        assert_eq!(gathered.len(), t.logits.len());
+        for (i, (g, sv)) in gathered.iter().zip(t.logits.iter()).enumerate() {
+            assert!(
+                (g - sv).abs() < 1e-5,
+                "mismatch at {i}: gathered {g} vs saved {sv}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — full pipeline composition: gather the
+    /// student logits at teacher's top-K positions, feed both into the
+    /// KL oracle.  When student == teacher, the resulting KL is ≈ 0
+    /// — the same guarantee the standalone oracle provides, but
+    /// proven through the full-vocab → top-K reduction.
+    #[test]
+    fn take_along_topk_then_kl_oracle_is_zero_for_self() {
+        let batch = 2;
+        let seq = 3;
+        let vocab = 8;
+        let top_k = 4;
+
+        // Build a deterministic full-vocab logits tensor.
+        let full_logits: Vec<f32> = (0..batch * seq * vocab)
+            .map(|i| ((i as f32) * 0.13 + 0.7).sin() * 5.0)
+            .collect();
+
+        // For each row, take any 4 distinct indices (use the first 4
+        // — equivalent to "imagine top-K were the first K positions";
+        // doesn't matter for the KL=0 test as long as student and
+        // teacher use the same indices).
+        let mut indices: Vec<u32> = Vec::with_capacity(batch * seq * top_k);
+        for _ in 0..batch * seq {
+            for k in 0..top_k as u32 {
+                indices.push(k);
+            }
+        }
+
+        let teacher_topk =
+            super::take_along_topk_indices(&full_logits, &indices, batch, seq, vocab, top_k)
+                .unwrap();
+        let student_topk = teacher_topk.clone(); // student == teacher
+        let kl =
+            super::kl_loss_topk_oracle(&student_topk, &teacher_topk, batch, seq, top_k, 1.5)
+                .unwrap();
+        assert!(kl.abs() < 1e-5, "self-KL must be ≈ 0; got {kl}");
     }
 
     /// ADR-020 AC#7 Option A — KL oracle returns 0 (within 1 ULP)
