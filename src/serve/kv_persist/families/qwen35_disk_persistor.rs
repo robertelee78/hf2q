@@ -376,8 +376,9 @@ mod tests {
                     *b = ((slot * 37 + i) % 251) as u8;
                 }
             }
-            full_attn_k.push(k);
-            full_attn_v.push(v);
+            // ADR-027 sub-sub-iter 23a-β: test fixture wraps in Some.
+            full_attn_k.push(Some(k));
+            full_attn_v.push(Some(v));
             full_attn_current_len.push((0..cfg.n_seqs).map(|s| (slot as u32) + s).collect());
         }
 
@@ -483,13 +484,15 @@ mod tests {
             return false;
         }
         for i in 0..a.full_attn_k.len() {
-            if a.full_attn_k[i].as_slice::<u8>().unwrap()
-                != b.full_attn_k[i].as_slice::<u8>().unwrap()
+            // ADR-027 sub-sub-iter 23a-β: Optional full-attn K/V — compare
+            // Some-to-Some byte-equal.
+            if a.full_attn_k[i].as_ref().expect("a.k some").as_slice::<u8>().unwrap()
+                != b.full_attn_k[i].as_ref().expect("b.k some").as_slice::<u8>().unwrap()
             {
                 return false;
             }
-            if a.full_attn_v[i].as_slice::<u8>().unwrap()
-                != b.full_attn_v[i].as_slice::<u8>().unwrap()
+            if a.full_attn_v[i].as_ref().expect("a.v some").as_slice::<u8>().unwrap()
+                != b.full_attn_v[i].as_ref().expect("b.v some").as_slice::<u8>().unwrap()
             {
                 return false;
             }
@@ -670,7 +673,8 @@ mod tests {
         persistor.write(&cfg, "the_key", &snap_a, &sidecar).unwrap();
         let mut snap_b = synth_snapshot(&device, &cfg);
         {
-            let dst = snap_b.full_attn_k[0].as_mut_slice::<u8>().unwrap();
+            // ADR-027 sub-sub-iter 23a-β: Optional full-attn K/V.
+            let dst = snap_b.full_attn_k[0].as_mut().expect("snap_b.k[0] some").as_mut_slice::<u8>().unwrap();
             for b in dst.iter_mut() {
                 *b = b.wrapping_add(7);
             }

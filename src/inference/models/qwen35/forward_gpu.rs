@@ -6662,11 +6662,15 @@ mod tests {
                 );
                 any_divergence = true;
             }
-            // K bytes
+            // K bytes — ADR-027 sub-sub-iter 23a-β: Optional full-attn K/V.
             let a_k: &[u8] = snap_a.full_attn_k[i]
+                .as_ref()
+                .expect("snap_a.k some")
                 .as_slice::<u8>()
                 .expect("full_attn_k a slice");
             let b_k: &[u8] = snap_b.full_attn_k[i]
+                .as_ref()
+                .expect("snap_b.k some")
                 .as_slice::<u8>()
                 .expect("full_attn_k b slice");
             if a_k != b_k {
@@ -6678,9 +6682,9 @@ mod tests {
                 );
                 any_divergence = true;
             }
-            // V bytes
-            let a_v: &[u8] = snap_a.full_attn_v[i].as_slice::<u8>().expect("v a");
-            let b_v: &[u8] = snap_b.full_attn_v[i].as_slice::<u8>().expect("v b");
+            // V bytes — same Optional-aware extraction.
+            let a_v: &[u8] = snap_a.full_attn_v[i].as_ref().expect("a.v some").as_slice::<u8>().expect("v a");
+            let b_v: &[u8] = snap_b.full_attn_v[i].as_ref().expect("b.v some").as_slice::<u8>().expect("v b");
             if a_v != b_v {
                 let first_diff = a_v.iter().zip(b_v).position(|(a, b)| a != b).unwrap_or(0);
                 eprintln!(
@@ -6783,8 +6787,9 @@ mod tests {
                 );
                 sub_c_divergence = true;
             }
-            let c_k: &[u8] = snap_c.full_attn_k[i].as_slice::<u8>().expect("k c");
-            let d_k: &[u8] = snap_d.full_attn_k[i].as_slice::<u8>().expect("k d");
+            // ADR-027 sub-sub-iter 23a-β: Optional full-attn K/V.
+            let c_k: &[u8] = snap_c.full_attn_k[i].as_ref().expect("c.k some").as_slice::<u8>().expect("k c");
+            let d_k: &[u8] = snap_d.full_attn_k[i].as_ref().expect("d.k some").as_slice::<u8>().expect("k d");
             if c_k != d_k {
                 let first = c_k.iter().zip(d_k).position(|(a, b)| a != b).unwrap_or(0);
                 eprintln!(

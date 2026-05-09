@@ -462,11 +462,22 @@ impl std::fmt::Debug for HybridKvCacheSnapshot {
 /// (engine_qwen35.rs Phase C) to save post-prefill cache state for replay
 /// on the next equivalent prompt.  See [`HybridKvCache::snapshot`] for
 /// the deep-copy contract and the DeltaNet ping-pong note.
+///
+/// **ADR-027 Phase B sub-sub-iter 23a-β (Optional fields)**: full-attn
+/// K/V are Optional so iter-23c+ can drop the F32 backing in TQ mode
+/// without producing zero-byte garbage. iter-23a-β scope: producers and
+/// consumers always emit/expect `Some` (no behavior change today). The
+/// codec at `qwen35_hybrid_persistor.rs` extracts via
+/// `.as_ref().expect()` with explicit pinning for iter-23a-γ which
+/// extends the codec with a `kv_present: u8` per-slot flag.
 pub struct HybridKvCacheSnapshot {
-    /// One per full-attn layer (e.g. 16 for Qwen3.6 27B): K matrix bytes.
-    pub full_attn_k: Vec<MlxBuffer>,
-    /// One per full-attn layer: V matrix bytes.
-    pub full_attn_v: Vec<MlxBuffer>,
+    /// One per full-attn layer (e.g. 16 for Qwen3.6 27B): K matrix
+    /// bytes. `None` in TQ-only mode (iter-23c+); `Some(buf)` on F32
+    /// path. Producers in iter-23a-β always emit `Some`.
+    pub full_attn_k: Vec<Option<MlxBuffer>>,
+    /// One per full-attn layer: V matrix bytes. Same Optional
+    /// semantics as `full_attn_k`.
+    pub full_attn_v: Vec<Option<MlxBuffer>>,
     /// One per full-attn layer: per-seq write cursor at snapshot time.
     pub full_attn_current_len: Vec<Vec<u32>>,
     /// MTP slot snapshot (present only when the source cache had one).
@@ -549,11 +560,16 @@ impl HybridKvCacheSnapshot {
     /// for memory accounting + tracing the per-prompt cache footprint.
     pub fn total_bytes(&self) -> usize {
         let mut n = 0usize;
+        // ADR-027 sub-sub-iter 23a-β: Optional full-attn K/V — sum only Some.
         for k in &self.full_attn_k {
-            n += k.byte_len();
+            if let Some(buf) = k {
+                n += buf.byte_len();
+            }
         }
         for v in &self.full_attn_v {
-            n += v.byte_len();
+            if let Some(buf) = v {
+                n += buf.byte_len();
+            }
         }
         if let Some(s) = &self.mtp {
             // ADR-027 sub-sub-iter 23a-α: Optional MTP K/V — sum only Some.
@@ -1097,8 +1113,15 @@ impl HybridKvCache {
         let mut full_attn_v = Vec::with_capacity(self.full_attn.len());
         let mut full_attn_current_len = Vec::with_capacity(self.full_attn.len());
         for slot in &self.full_attn {
-            full_attn_k.push(deep_copy_buffer(device, &slot.k).context("snapshot full_attn.k")?);
-            full_attn_v.push(deep_copy_buffer(device, &slot.v).context("snapshot full_attn.v")?);
+            // ADR-027 sub-sub-iter 23a-β: producers always emit Some
+            // today. Iter-23c+ branches on slot's TQ-mode and pushes
+            // None when F32 backing is dropped.
+            full_attn_k.push(Some(
+                deep_copy_buffer(device, &slot.k).context("snapshot full_attn.k")?,
+            ));
+            full_attn_v.push(Some(
+                deep_copy_buffer(device, &slot.v).context("snapshot full_attn.v")?,
+            ));
             full_attn_current_len.push(slot.current_len.clone());
         }
         let mtp = match &self.mtp_slot {
@@ -1167,8 +1190,16 @@ impl HybridKvCache {
                 .iter()
                 .zip(snapshot.full_attn_v.iter().zip(snapshot.full_attn_current_len.iter())),
         ) {
-            copy_buffer_bytes(k_snap, &mut slot.k).context("restore full_attn.k")?;
-            copy_buffer_bytes(v_snap, &mut slot.v).context("restore full_attn.v")?;
+            // ADR-027 sub-sub-iter 23a-β: Optional full-attn K/V — copy
+            // only when source is Some (iter-23c+ may produce None in
+            // TQ mode; SDPA reads slot.tq directly so the F32 backing
+            // is unused).
+            if let Some(k_buf) = k_snap {
+                copy_buffer_bytes(k_buf, &mut slot.k).context("restore full_attn.k")?;
+            }
+            if let Some(v_buf) = v_snap {
+                copy_buffer_bytes(v_buf, &mut slot.v).context("restore full_attn.v")?;
+            }
             anyhow::ensure!(
                 len_snap.len() == slot.current_len.len(),
                 "restore_from: full_attn current_len shape mismatch"
@@ -1267,8 +1298,14 @@ impl HybridKvCache {
         for (slot, (k_snap, v_snap)) in self.full_attn.iter_mut().zip(
             snapshot.full_attn_k.iter().zip(snapshot.full_attn_v.iter()),
         ) {
-            partial_copy_slot(k_snap, &mut slot.k, n_tokens, "full_attn.k")?;
-            partial_copy_slot(v_snap, &mut slot.v, n_tokens, "full_attn.v")?;
+            // ADR-027 sub-sub-iter 23a-β: Optional full-attn K/V — copy
+            // only when source is Some.
+            if let Some(k_buf) = k_snap {
+                partial_copy_slot(k_buf, &mut slot.k, n_tokens, "full_attn.k")?;
+            }
+            if let Some(v_buf) = v_snap {
+                partial_copy_slot(v_buf, &mut slot.v, n_tokens, "full_attn.v")?;
+            }
             // current_len[0] = n_tokens (the LCP boundary the snapshot
             // was taken at; subsequent prefill chunks will write at
             // positions [n_tokens..]).
@@ -2043,7 +2080,7 @@ mod tests {
 
         let snap = cache.snapshot(&device).expect("snapshot");
         // Canary values inside the snapshot.
-        let snap_full_k0 = snap.full_attn_k[0].as_slice::<f32>().unwrap()[0];
+        let snap_full_k0 = snap.full_attn_k[0].as_ref().expect("snap.k[0] some").as_slice::<f32>().unwrap()[0];
         let snap_lin_rec0 = snap.linear_recurrent[0].as_slice::<f32>().unwrap()[0];
         assert_eq!(snap_full_k0, 7.5);
         assert_eq!(snap_lin_rec0, 3.25);
@@ -2054,7 +2091,7 @@ mod tests {
 
         // Snapshot still holds the original canaries (deep-copy, not Arc::clone).
         assert_eq!(
-            snap.full_attn_k[0].as_slice::<f32>().unwrap()[0],
+            snap.full_attn_k[0].as_ref().expect("snap.k[0] some").as_slice::<f32>().unwrap()[0],
             7.5,
             "snapshot aliased live cache (full_attn.k)"
         );

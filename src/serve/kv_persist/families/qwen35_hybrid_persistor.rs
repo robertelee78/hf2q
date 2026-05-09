@@ -463,8 +463,16 @@ pub fn serialize_hybrid_snapshot(
 
     // --- Per full-attn slot ---
     for slot_idx in 0..cfg.n_full_attn as usize {
-        let k = &snapshot.full_attn_k[slot_idx];
-        let v = &snapshot.full_attn_v[slot_idx];
+        // ADR-027 sub-sub-iter 23a-β: Optional full-attn K/V — codec
+        // rejects None today (iter-23d will extend with kv_present byte).
+        // Fail-loud if a producer pushed None without updating the
+        // codec.
+        let k = snapshot.full_attn_k[slot_idx]
+            .as_ref()
+            .expect("QH35 serialize: full_attn_k[i] is None (iter-23a-β producers always Some — see codec extension iter-23d)");
+        let v = snapshot.full_attn_v[slot_idx]
+            .as_ref()
+            .expect("QH35 serialize: full_attn_v[i] is None (iter-23a-β producers always Some — see codec extension iter-23d)");
         let current_len = &snapshot.full_attn_current_len[slot_idx];
 
         // Per-slot validation against config.
@@ -729,8 +737,8 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
             .context("QH35 deserialize: envelope header / runtime config mismatch")?;
     }
 
-    let mut full_attn_k: Vec<MlxBuffer> = Vec::with_capacity(cfg.n_full_attn as usize);
-    let mut full_attn_v: Vec<MlxBuffer> = Vec::with_capacity(cfg.n_full_attn as usize);
+    let mut full_attn_k: Vec<Option<MlxBuffer>> = Vec::with_capacity(cfg.n_full_attn as usize);
+    let mut full_attn_v: Vec<Option<MlxBuffer>> = Vec::with_capacity(cfg.n_full_attn as usize);
     let mut full_attn_current_len: Vec<Vec<u32>> = Vec::with_capacity(cfg.n_full_attn as usize);
 
     for expected_slot in 0..cfg.n_full_attn as usize {
@@ -795,8 +803,10 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
             );
             v_dst.copy_from_slice(v_src);
         }
-        full_attn_k.push(k_buf);
-        full_attn_v.push(v_buf);
+        // ADR-027 sub-sub-iter 23a-β: codec emits Some today (iter-23d
+        // will branch on a kv_present byte to support None for TQ-only).
+        full_attn_k.push(Some(k_buf));
+        full_attn_v.push(Some(v_buf));
         full_attn_current_len.push(current_len);
     }
 
@@ -1147,8 +1157,8 @@ mod tests {
         let shape_usize: Vec<usize> =
             cfg.full_attn_shape.iter().map(|d| *d as usize).collect();
 
-        let mut full_attn_k: Vec<MlxBuffer> = Vec::with_capacity(cfg.n_full_attn as usize);
-        let mut full_attn_v: Vec<MlxBuffer> = Vec::with_capacity(cfg.n_full_attn as usize);
+        let mut full_attn_k: Vec<Option<MlxBuffer>> = Vec::with_capacity(cfg.n_full_attn as usize);
+        let mut full_attn_v: Vec<Option<MlxBuffer>> = Vec::with_capacity(cfg.n_full_attn as usize);
         let mut full_attn_current_len: Vec<Vec<u32>> =
             Vec::with_capacity(cfg.n_full_attn as usize);
 
@@ -1173,8 +1183,9 @@ mod tests {
                     *b = ((slot * 11 + i) % 251) as u8;
                 }
             }
-            full_attn_k.push(k);
-            full_attn_v.push(v);
+            // ADR-027 sub-sub-iter 23a-β: test fixture wraps in Some.
+            full_attn_k.push(Some(k));
+            full_attn_v.push(Some(v));
             // current_len: per seq, deterministic.
             let cl: Vec<u32> = (0..cfg.n_seqs)
                 .map(|s| (slot as u32) * 100 + s)
@@ -1286,13 +1297,15 @@ mod tests {
             return false;
         }
         for i in 0..a.full_attn_k.len() {
-            let ak = a.full_attn_k[i].as_slice::<u8>().expect("ak slice");
-            let bk = b.full_attn_k[i].as_slice::<u8>().expect("bk slice");
+            // ADR-027 sub-sub-iter 23a-β: Optional full-attn K/V — compare
+            // Some-to-Some byte-equal (None-to-None test path lands iter-23c+).
+            let ak = a.full_attn_k[i].as_ref().expect("a.k some").as_slice::<u8>().expect("ak slice");
+            let bk = b.full_attn_k[i].as_ref().expect("b.k some").as_slice::<u8>().expect("bk slice");
             if ak != bk {
                 return false;
             }
-            let av = a.full_attn_v[i].as_slice::<u8>().expect("av slice");
-            let bv = b.full_attn_v[i].as_slice::<u8>().expect("bv slice");
+            let av = a.full_attn_v[i].as_ref().expect("a.v some").as_slice::<u8>().expect("av slice");
+            let bv = b.full_attn_v[i].as_ref().expect("b.v some").as_slice::<u8>().expect("bv slice");
             if av != bv {
                 return false;
             }
