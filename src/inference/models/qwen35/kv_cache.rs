@@ -98,6 +98,109 @@ pub struct LinearAttnStateSlot {
     pub recurrent_scratch: MlxBuffer,
 }
 
+impl FullAttnKvSlot {
+    /// ADR-027 Phase B iter-9 — encode one token's K and V into the
+    /// TQ-active byte-packed buffers via mlx-native's
+    /// `dispatch_hadamard_quantize_kv_hb`.
+    ///
+    /// The kernel applies in-place FWHT + Lloyd-Max quantization onto
+    /// `k_token` / `v_token` (both F32, shape `[n_kv_heads, head_dim]`)
+    /// and writes the resulting U8 indices + F32 norms into
+    /// `self.tq.k_packed` / `k_norms` / `v_packed` / `v_norms` at
+    /// `write_pos`.
+    ///
+    /// **Caller contract (matches the GPU kernel's invariant):**
+    /// - `self.tq` MUST be `Some` — the slot must have been constructed
+    ///   via [`HybridKvCache::new_with_options`] with `tq_kv_active = true`.
+    /// - `head_dim` must be 256 or 512 (kernel requirement).
+    /// - `codebook_bits` must be 5, 6, or 8.
+    /// - `cache_capacity` must equal the slot's `max_seq_len` from
+    ///   construction time (the kernel computes the linear offset
+    ///   `head*capacity*head_dim + write_pos*head_dim + dim`).
+    /// - `write_pos < cache_capacity` for the global path; the kernel
+    ///   wraps for the sliding path.
+    ///
+    /// **Production call site (iter-10):** the qwen35 forward path
+    /// (`gpu_full_attn::full_attn_layer_gpu`) calls this once per
+    /// (full-attn-layer × token) when `slot.tq.is_some()`. The decoded
+    /// SDPA dispatch via `flash_attn_vec_tq_hb` reads from the same
+    /// buffers without an F32 round-trip.
+    ///
+    /// **Iter-9 scope:** wrapper + GPU dispatch tests only. Iter-10
+    /// wires this into `full_attn_layer_gpu`; iter-11 ships the SDPA
+    /// dispatch + NRMSE-vs-F32 parity validation.
+    ///
+    /// # Errors
+    ///
+    /// - Returns `Err` if `self.tq.is_none()` (mantra: fail loud, no
+    ///   silent fallback to F32 path).
+    /// - Propagates errors from the GPU encode kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_token_to_tq(
+        &mut self,
+        k_token: &MlxBuffer,
+        v_token: &MlxBuffer,
+        n_kv_heads: u32,
+        head_dim: u32,
+        cache_capacity: u32,
+        write_pos: u32,
+        is_sliding: bool,
+        scale_factor_d512: f32,
+        codebook_bits: u32,
+        encoder: &mut mlx_native::CommandEncoder,
+        registry: &mut mlx_native::KernelRegistry,
+        device: &MlxDevice,
+    ) -> Result<()> {
+        let tq = self.tq.as_mut().ok_or_else(|| {
+            anyhow!(
+                "FullAttnKvSlot::encode_token_to_tq: slot.tq is None — slot was not \
+                 constructed in TQ-active mode (HybridKvCache::new_with_options \
+                 tq_kv_active=true required)"
+            )
+        })?;
+        let metal_dev = device.metal_device();
+        // K side.
+        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+            encoder,
+            registry,
+            metal_dev,
+            k_token,
+            &tq.k_packed,
+            &tq.k_norms,
+            n_kv_heads,
+            head_dim,
+            cache_capacity,
+            write_pos,
+            is_sliding,
+            scale_factor_d512,
+            codebook_bits,
+        )
+        .map_err(|e| {
+            anyhow!("encode_token_to_tq: dispatch_hadamard_quantize_kv_hb K: {e}")
+        })?;
+        // V side.
+        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+            encoder,
+            registry,
+            metal_dev,
+            v_token,
+            &tq.v_packed,
+            &tq.v_norms,
+            n_kv_heads,
+            head_dim,
+            cache_capacity,
+            write_pos,
+            is_sliding,
+            scale_factor_d512,
+            codebook_bits,
+        )
+        .map_err(|e| {
+            anyhow!("encode_token_to_tq: dispatch_hadamard_quantize_kv_hb V: {e}")
+        })?;
+        Ok(())
+    }
+}
+
 impl LinearAttnStateSlot {
     /// Swap the active and scratch conv state buffers (O(1) pointer swap).
     /// Call this after every decode step to make the just-written scratch the
@@ -2160,6 +2263,261 @@ mod tests {
             mtp.tq.is_some(),
             "MTP slot should ALSO have tq populated when tq_kv_active=true"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-027 Phase B iter-9 — encode_token_to_tq GPU dispatch tests
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Build a synthetic K/V token buffer of shape `[n_kv_heads, head_dim]`
+    /// F32 with deterministic non-trivial values. The kernel applies FWHT
+    /// + L2-norm + quant; non-zero input ensures non-zero norm + at least
+    /// one non-zero packed index.
+    fn synth_token_buffer(
+        device: &MlxDevice,
+        n_kv_heads: usize,
+        head_dim: usize,
+        salt: u32,
+    ) -> MlxBuffer {
+        let elems = n_kv_heads * head_dim;
+        let bytes = elems * std::mem::size_of::<f32>();
+        let mut buf = device
+            .alloc_buffer(bytes, DType::F32, vec![n_kv_heads, head_dim])
+            .expect("alloc token buf");
+        {
+            let s = buf.as_mut_slice::<f32>().expect("token mut slice");
+            for (i, v) in s.iter_mut().enumerate() {
+                // Non-trivial pattern: scaled sinusoid + salt offset.
+                let x = ((i as u32 + salt) % 1000) as f32 / 1000.0;
+                *v = (x * 6.28318).sin() * 0.5;
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn encode_token_to_tq_errors_when_slot_lacks_tq_buffers() {
+        // Mantra: fail loud, no silent fallback. Calling encode on a
+        // legacy F32-only slot must error explicitly.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let mut cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, false)
+            .expect("kv tq-off");
+        // Pick a real full-attn slot.
+        let slot = &mut cache.full_attn[0];
+        assert!(slot.tq.is_none());
+        let n_kv_heads = cfg.num_key_value_heads as u32;
+        let head_dim = cfg.head_dim;
+        let k_token = synth_token_buffer(&device, n_kv_heads as usize, head_dim as usize, 1);
+        let v_token = synth_token_buffer(&device, n_kv_heads as usize, head_dim as usize, 2);
+        let mut registry = mlx_native::KernelRegistry::new();
+        let mut encoder = device.command_encoder().expect("encoder");
+        let err = slot
+            .encode_token_to_tq(
+                &k_token, &v_token, n_kv_heads, head_dim, 64, 0, false, 1.0, 8,
+                &mut encoder, &mut registry, &device,
+            )
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("slot.tq is None"),
+            "expected fail-loud None-tq error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn encode_token_to_tq_writes_packed_at_write_pos_only() {
+        // Encode one token at write_pos=5 in a TQ-active slot. Verify:
+        // - k_packed bytes at position 5 are non-zero (post-quant indices)
+        // - k_packed bytes at OTHER positions (0..5, 6..) remain zero
+        // This pins the kernel's positional addressing.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache_capacity: u32 = 64;
+        let mut cache =
+            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+                .expect("kv tq-on");
+        let slot = &mut cache.full_attn[0];
+        assert!(slot.tq.is_some());
+        let n_kv_heads = cfg.num_key_value_heads as u32;
+        let head_dim = cfg.head_dim;
+        let k_token = synth_token_buffer(&device, n_kv_heads as usize, head_dim as usize, 1);
+        let v_token = synth_token_buffer(&device, n_kv_heads as usize, head_dim as usize, 2);
+
+        let mut registry = mlx_native::KernelRegistry::new();
+        let mut encoder = device.command_encoder().expect("encoder");
+        let write_pos: u32 = 5;
+        slot.encode_token_to_tq(
+            &k_token,
+            &v_token,
+            n_kv_heads,
+            head_dim,
+            cache_capacity,
+            write_pos,
+            false,
+            1.0,
+            8,
+            &mut encoder,
+            &mut registry,
+            &device,
+        )
+        .expect("encode_token_to_tq dispatch");
+        // commit + sync so the GPU writes are visible to as_slice.
+        encoder.commit_and_wait().expect("encoder commit_and_wait");
+
+        let tq = slot.tq.as_ref().unwrap();
+        let k_packed_bytes = tq.k_packed.as_slice::<u8>().expect("k_packed slice");
+        // Positional addressing: kernel writes at offset
+        // `head*capacity*head_dim + write_pos*head_dim + dim_idx`.
+        let head_dim_us = head_dim as usize;
+        let cap_us = cache_capacity as usize;
+        for head in 0..n_kv_heads as usize {
+            let base = head * cap_us * head_dim_us;
+            // At write_pos: at least one byte must be non-zero (post-quant
+            // index for the FWHT-rotated K).
+            let pos_offset = base + (write_pos as usize) * head_dim_us;
+            let pos_slice = &k_packed_bytes[pos_offset..pos_offset + head_dim_us];
+            let nonzero_at_pos = pos_slice.iter().any(|&b| b != 0);
+            assert!(
+                nonzero_at_pos,
+                "head={head} pos={write_pos}: expected non-zero packed bytes after encode"
+            );
+            // At other positions: bytes must remain zero (init-state).
+            for other_pos in 0..cap_us {
+                if other_pos as u32 == write_pos {
+                    continue;
+                }
+                let other_offset = base + other_pos * head_dim_us;
+                let other_slice = &k_packed_bytes[other_offset..other_offset + head_dim_us];
+                assert!(
+                    other_slice.iter().all(|&b| b == 0),
+                    "head={head} pos={other_pos}: kernel must NOT write outside write_pos"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encode_token_to_tq_writes_positive_norms() {
+        // After FWHT + L2-norm extraction, the stored norm scalar must
+        // be > 0 for any non-zero input. This pins the norm pipeline.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache_capacity: u32 = 16;
+        let mut cache =
+            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+                .expect("kv tq-on");
+        let slot = &mut cache.full_attn[0];
+        let n_kv_heads = cfg.num_key_value_heads as u32;
+        let head_dim = cfg.head_dim;
+        let k_token = synth_token_buffer(&device, n_kv_heads as usize, head_dim as usize, 11);
+        let v_token = synth_token_buffer(&device, n_kv_heads as usize, head_dim as usize, 13);
+
+        let mut registry = mlx_native::KernelRegistry::new();
+        let mut encoder = device.command_encoder().expect("encoder");
+        slot.encode_token_to_tq(
+            &k_token, &v_token, n_kv_heads, head_dim, cache_capacity,
+            3, false, 1.0, 8, &mut encoder, &mut registry, &device,
+        )
+        .expect("encode dispatch");
+        encoder.commit_and_wait().expect("encoder commit_and_wait");
+
+        let tq = slot.tq.as_ref().unwrap();
+        let k_norms = tq.k_norms.as_slice::<f32>().expect("k_norms slice");
+        let v_norms = tq.v_norms.as_slice::<f32>().expect("v_norms slice");
+        // norms layout: [n_kv_heads, cache_capacity, norms_per_pos=1].
+        // At write_pos=3 each head's norm must be > 0.
+        for head in 0..n_kv_heads as usize {
+            let idx = head * (cache_capacity as usize) * 1 + 3 * 1 + 0;
+            assert!(
+                k_norms[idx] > 0.0,
+                "head={head} pos=3: expected positive K norm, got {}",
+                k_norms[idx]
+            );
+            assert!(
+                v_norms[idx] > 0.0,
+                "head={head} pos=3: expected positive V norm, got {}",
+                v_norms[idx]
+            );
+        }
+    }
+
+    #[test]
+    fn encode_token_to_tq_at_two_positions_writes_both_independently() {
+        // Encode token A at pos=2 then token B at pos=7 — both positions
+        // must have populated bytes; positions 0,1,3,4,5,6,8+ stay zero.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache_capacity: u32 = 16;
+        let mut cache =
+            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+                .expect("kv tq-on");
+        let slot = &mut cache.full_attn[0];
+        let n_kv_heads = cfg.num_key_value_heads as u32;
+        let head_dim = cfg.head_dim;
+        let k_a = synth_token_buffer(&device, n_kv_heads as usize, head_dim as usize, 100);
+        let v_a = synth_token_buffer(&device, n_kv_heads as usize, head_dim as usize, 200);
+        let k_b = synth_token_buffer(&device, n_kv_heads as usize, head_dim as usize, 300);
+        let v_b = synth_token_buffer(&device, n_kv_heads as usize, head_dim as usize, 400);
+
+        let mut registry = mlx_native::KernelRegistry::new();
+        // Dispatch A then B in the SAME encoder (production pattern: one
+        // encoder per per-layer per-token write).
+        let mut encoder = device.command_encoder().expect("encoder");
+        slot.encode_token_to_tq(
+            &k_a, &v_a, n_kv_heads, head_dim, cache_capacity, 2, false, 1.0, 8,
+            &mut encoder, &mut registry, &device,
+        )
+        .expect("encode A");
+        slot.encode_token_to_tq(
+            &k_b, &v_b, n_kv_heads, head_dim, cache_capacity, 7, false, 1.0, 8,
+            &mut encoder, &mut registry, &device,
+        )
+        .expect("encode B");
+        encoder.commit_and_wait().expect("encoder commit_and_wait");
+
+        let tq = slot.tq.as_ref().unwrap();
+        let k_packed = tq.k_packed.as_slice::<u8>().expect("k_packed");
+        let head_dim_us = head_dim as usize;
+        let cap_us = cache_capacity as usize;
+        for head in 0..n_kv_heads as usize {
+            let base = head * cap_us * head_dim_us;
+            for pos in 0..cap_us {
+                let off = base + pos * head_dim_us;
+                let slice = &k_packed[off..off + head_dim_us];
+                let any_nonzero = slice.iter().any(|&b| b != 0);
+                let expected_nonzero = pos == 2 || pos == 7;
+                assert_eq!(
+                    any_nonzero, expected_nonzero,
+                    "head={head} pos={pos}: expected_nonzero={expected_nonzero}, \
+                     got any_nonzero={any_nonzero}"
+                );
+            }
+        }
     }
 
     #[test]
