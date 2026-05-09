@@ -1171,8 +1171,20 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // Uses dense F32 attention instead of TQ-packed attention during prompt
     // ingestion to eliminate compounding quantization noise.
     // ADR-009 Phase 3A: HF2Q_BATCHED_PREFILL=1 uses the new batched prefill
-    // path (matches llama.cpp default). Per-token remains default until
-    // parity is validated.
+    // path (matches llama.cpp default).
+    //
+    // Iter-85 status (2026-05-09): the original "per-token remains default
+    // until parity is validated" comment is now narrower in scope. Batched
+    // prefill at short-to-medium prompt scale (≤80 tokens) IS byte-
+    // identical to per-token per iter-65/74 (strict byte-equality of
+    // decoded outputs), iter-79 (4.3× TTFT speedup with first decode
+    // token id=8409 byte-identical), and protected by the iter-76 lock
+    // chain (`scripts/adr010_iter64_iter68_full_lock.sh`). The remaining
+    // gate-required deferral is for LONG-SEQUENCE sliding_wrap fixtures
+    // where ADR-010's L6 MoE router top-K threshold sensitivity manifests
+    // (operator-signed deferral 2026-04-16). Default-flip for short
+    // prompts is operator-gated; the unsafe-ack remains required across
+    // all prompt sizes to preserve a single uniform decision boundary.
     let use_batched = INVESTIGATION_ENV.batched_prefill;
     let prefill_start = std::time::Instant::now();
     let last_token = if !soft_tokens_owned.is_empty() {
