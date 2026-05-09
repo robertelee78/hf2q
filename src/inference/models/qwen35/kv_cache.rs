@@ -51,18 +51,22 @@ use super::{Qwen35Config, Qwen35LayerKind};
 pub struct FullAttnKvSlot {
     /// Keys buffer `[head_dim, n_kv_heads, max_seq_len, n_seqs]` f32.
     ///
-    /// **ADR-027 Phase B iter-29 (sub-sub-iter 23c-α):** wrapped in
-    /// `Option` so iter-30 (sub-sub-iter 23c-β) can skip the F32 K/V
+    /// **ADR-027 Phase B iter-29 (sub-sub-iter 23c-α) + iter-34
+    /// (sub-sub-iter 23c-β.5):** wrapped in `Option` so the
+    /// `alloc_full_attn_slot` constructor can skip the F32 K/V
     /// allocation entirely when the cache is constructed with
-    /// `tq_kv_active=true` — the actual 3.94× per-slot memory savings
-    /// deliverable. Today (iter-29 structural prep) the alloc path
-    /// always emits `Some(..)`; consumers handle Optional via
-    /// `.as_ref().expect("F32 K/V required — iter-23c-β alloc branch
-    /// dropped this; check tq_kv_active path")` at the per-call F32
-    /// path (already gated by `slot.tq.is_none()` in iter-15's
-    /// `dispatch_decode_sdpa_with_optional_tq`) and via `if let Some`
-    /// at reset / snapshot / persist sites where None becomes a real
-    /// possibility in iter-30.
+    /// `tq_kv_active=true`. iter-29 (this struct field) was the
+    /// structural prep; iter-34 actually flipped alloc to emit
+    /// `None` in TQ-active mode for the **realized 3.94× per-slot
+    /// memory savings** (regression-pin
+    /// `full_attn_bytes_breakdown_tq_on_drops_f32_at_qwen36_32k`).
+    /// Consumers handle Optional via `.as_ref().expect("...iter-34
+    /// alloc/SDPA gating invariant regressed...")` at F32 read sites
+    /// (gated by `slot.tq.is_none()` in iter-15's
+    /// `dispatch_decode_sdpa_with_optional_tq` for decode; routed to
+    /// iter-33's `apply_flash_attn_prefill_seq_major_resume_via_tq_cache`
+    /// for prefill resume) and via `if let Some` at reset / snapshot /
+    /// persist sites.
     pub k: Option<MlxBuffer>,
     /// Values buffer — same shape and dtype as `k`.
     pub v: Option<MlxBuffer>,
@@ -678,16 +682,18 @@ impl std::fmt::Debug for HybridKvCacheSnapshot {
 /// the deep-copy contract and the DeltaNet ping-pong note.
 ///
 /// **ADR-027 Phase B sub-sub-iter 23a-β (Optional fields)**: full-attn
-/// K/V are Optional so iter-23c+ can drop the F32 backing in TQ mode
-/// without producing zero-byte garbage. iter-23a-β scope: producers and
-/// consumers always emit/expect `Some` (no behavior change today). The
+/// K/V are Optional so iter-34 (sub-sub-iter 23c-β.5) can drop the F32
+/// backing in TQ mode without producing zero-byte garbage. iter-23a-β
+/// added the type; iter-34 flipped the alloc to actually emit `None` in
+/// TQ-active mode for the realized 3.94× per-slot memory savings. The
 /// codec at `qwen35_hybrid_persistor.rs` extracts via
-/// `.as_ref().expect()` with explicit pinning for iter-23a-γ which
-/// extends the codec with a `kv_present: u8` per-slot flag.
+/// `.as_ref().expect()` with explicit pinning; v3 codec (iter-36)
+/// adds `kv_present: u8` + `tq_present: u8` per-slot flags so the
+/// envelope round-trips both Optional K/V AND Optional TQ state.
 pub struct HybridKvCacheSnapshot {
     /// One per full-attn layer (e.g. 16 for Qwen3.6 27B): K matrix
-    /// bytes. `None` in TQ-only mode (iter-23c+); `Some(buf)` on F32
-    /// path. Producers in iter-23a-β always emit `Some`.
+    /// bytes. `None` in TQ-only mode (iter-34 alloc-drop production
+    /// path); `Some(buf)` on F32 path (legacy `tq_kv_active=false`).
     pub full_attn_k: Vec<Option<MlxBuffer>>,
     /// One per full-attn layer: V matrix bytes. Same Optional
     /// semantics as `full_attn_k`.
@@ -803,9 +809,10 @@ impl FullAttnKvBytesBreakdown {
 /// as a dedicated struct so `Option<MtpKvSnapshot>` is explicit rather
 /// than overloading `full_attn_k`/`full_attn_v` with a sentinel.
 ///
-/// **ADR-027 Phase B sub-sub-iter 23a-α (Optional fields)**: K/V are
-/// Optional so iter-23c+ can drop the F32 backing in TQ mode without
-/// producing zero-byte garbage. iter-23a-α scope: producers and
+/// **ADR-027 Phase B sub-sub-iter 23a-α (Optional fields) + iter-34
+/// (alloc-drop)**: K/V are Optional so iter-34 can drop the F32 backing
+/// in TQ mode without producing zero-byte garbage. iter-23a-α added the
+/// type; iter-34 flipped alloc to actually emit `None`. Producers and
 /// consumers always emit/expect `Some` (no behavior change today).
 /// `MtpKvSnapshot` itself stays `Option<MtpKvSnapshot>` at the
 /// `HybridKvCacheSnapshot.mtp` level — that signals "MTP slot present
@@ -1285,10 +1292,12 @@ impl HybridKvCache {
         let mut tq_packed_bytes: usize = 0;
         let mut tq_norms_bytes: usize = 0;
         for slot in &self.full_attn {
-            // iter-29 (sub-sub-iter 23c-α): None means TQ-only mode
-            // (iter-30 alloc branch); contributes 0 F32 bytes — exactly
-            // the load-bearing memory savings the iter-30 regression-pin
-            // test (full_attn_bytes_breakdown_tq_on_drops_f32_*) checks.
+            // iter-29 (sub-sub-iter 23c-α) + iter-34 (sub-sub-iter
+            // 23c-β.5): None means TQ-only mode (iter-34 alloc-drop
+            // production path); contributes 0 F32 bytes — exactly the
+            // load-bearing 3.94× memory savings the iter-34 regression-pin
+            // test `full_attn_bytes_breakdown_tq_on_drops_f32_at_qwen36_32k`
+            // checks (340 MiB total at 32K vs 1.34 GB F32-only baseline).
             if let Some(buf) = slot.k.as_ref() {
                 f32_k_v_bytes += buf.byte_len();
             }
