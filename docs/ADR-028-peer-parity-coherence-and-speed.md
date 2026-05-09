@@ -285,6 +285,49 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-94 ground-truth Q6_K mv_id per-call timing — DOMINANT kernel confirmed
+
+Added `bench_q6_k_mv_id_gemma_decode_gate_up` (#[ignore] + #[test]) at
+`/opt/mlx-native/tests/test_quantized_matmul_id_mm.rs:597`. Uses 200
+trials with 20-warmup, isolates one mv_id Q6_K dispatch per
+commit_and_wait (matching production single-session model where each
+dispatch incurs ~5-10 µs encoder overhead).
+
+Run:
+```bash
+cd /opt/mlx-native && RUSTC_WRAPPER= cargo test --release \
+  --test test_quantized_matmul_id_mm bench_q6_k_mv_id \
+  -- --ignored --nocapture
+```
+
+**Measurement at gemma decode shape** (n_tokens=1, top_k=8, n=704, k=2816,
+n_experts=128, Q6_K weights):
+
+| Percentile | µs/call |
+|---|---:|
+| p10 | 155.88 |
+| **p50** | **187.54** |
+| p90 | 292.58 |
+
+**Per-token aggregate** (gate_up only, ×60 layers): **11.25 ms = 71% of
+the 15.86 ms decode token time**. Q6_K mv_id is the dominant kernel.
+
+**Implied llama.cpp per-call** (assuming similar dispatch count): at
+11.11 ms/token total × 71% MoE share = 7.9 ms / 60 calls ≈ 132 µs/call
+→ **hf2q is ~42% slower per call** (187.5 vs 132 µs).
+
+This is the real per-kernel-time gap. Closing it closes most of the
+0.65-0.70× decode peer gap.
+
+**Down kernel skipped this iter**: gemma's down projection has K=704
+which doesn't divide Q6_K block size (256). Real gemma down_exps is
+stored as Q5_1/Q4_K with different block size or has padded K=768.
+Iter-95 candidate.
+
+**Iter-95 attack**: implement y-vector reuse refactor (iter-91
+candidate, demoted in iter-93 but now the right next-step). Re-run
+bench before/after. Ship if ≥10% win, document if null.
+
 ### Iter-93 correction to iter-92 ROI analysis (3-op norm fusion ALREADY PRESENT)
 
 Direct code-read of `/opt/mlx-native/src/shaders/fused_norm_add_f32.metal:231`
