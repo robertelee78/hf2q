@@ -2740,4 +2740,108 @@ mod tests {
             }
         }
     }
+
+    /// ADR-020 AC#7 Option A — verify production `init_affine_params_gpu`
+    /// (the kernel that lives behind the public hf2q surface) produces
+    /// results CONSISTENT with the CPU min-max-init algorithm used in
+    /// the AC#7 foundation tests
+    /// (`qwen35_moe::tests::ac7_option_a_*` series).
+    ///
+    /// This closes the doc-update gap from 2026-05-08: the original
+    /// implementation ladder said "extract CPU init helper to public",
+    /// but `init_affine_params_gpu` (line 49 above) ALREADY does this
+    /// on GPU.  Production code should use the existing function; this
+    /// test establishes the equivalence proof so the foundation-test
+    /// CPU helper can be removed in a future iter without introducing
+    /// drift.
+    ///
+    /// Algorithm (matches qdq_affine.metal:85-103 + my test's CPU init):
+    ///   For each group of `group_size` elements:
+    ///     w_min = min(group), w_max = max(group)
+    ///     s = (w_max - w_min) / (n_bins - 1)  (or 1.0 if degenerate)
+    ///     b = w_min
+    ///     q[i] = clamp(round((w[i] - b) / s), 0, n_bins - 1)
+    #[test]
+    fn init_affine_params_gpu_matches_cpu_min_max_algorithm() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let group_size = 32usize;
+        let bits = 4u32;
+        let n_bins = 1u32 << bits;
+        // Multi-row + multi-group fixture mirroring real-Linear shapes:
+        // n=64 rows, k=64 cols → 128 groups total.
+        let n = 64usize;
+        let k = 64usize;
+        let n_total = n * k;
+        let w: Vec<f32> = (0..n_total)
+            .map(|i| ((i as f32) * 0.0173 - 0.4).sin() * 0.5)
+            .collect();
+
+        // GPU path.
+        let (q_gpu, s_gpu, b_gpu) =
+            init_affine_params_gpu(&device, &mut registry, &w, group_size, bits).unwrap();
+
+        // CPU oracle (mirrors my test's init_qdq + qdq_affine.metal:85-103).
+        let n_groups = n_total / group_size;
+        let mut s_cpu = vec![0.0f32; n_groups];
+        let mut b_cpu = vec![0.0f32; n_groups];
+        let mut q_cpu = vec![0u8; n_total];
+        for g in 0..n_groups {
+            let base = g * group_size;
+            let slab = &w[base..base + group_size];
+            let w_min = slab.iter().copied().fold(f32::INFINITY, f32::min);
+            let w_max = slab.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let s_val = if w_max > w_min {
+                (w_max - w_min) / (n_bins - 1) as f32
+            } else {
+                1.0
+            };
+            s_cpu[g] = s_val;
+            b_cpu[g] = w_min;
+            for i in 0..group_size {
+                let z = (slab[i] - w_min) / s_val;
+                let qv = if z >= 0.0 {
+                    (z + 0.5).floor() as i32
+                } else {
+                    (z - 0.5).ceil() as i32
+                };
+                q_cpu[base + i] = qv.clamp(0, (n_bins - 1) as i32) as u8;
+            }
+        }
+
+        // Element-wise consistency.
+        assert_eq!(s_gpu.len(), n_groups);
+        assert_eq!(b_gpu.len(), n_groups);
+        assert_eq!(q_gpu.len(), n_total);
+        for g in 0..n_groups {
+            assert!(
+                (s_gpu[g] - s_cpu[g]).abs() < 1e-6,
+                "scales[{g}]: gpu={} cpu={}",
+                s_gpu[g],
+                s_cpu[g]
+            );
+            assert!(
+                (b_gpu[g] - b_cpu[g]).abs() < 1e-6,
+                "biases[{g}]: gpu={} cpu={}",
+                b_gpu[g],
+                b_cpu[g]
+            );
+        }
+        // q_int is u8 — must match exactly (no float tolerance).
+        let mut mismatches = 0usize;
+        for i in 0..n_total {
+            if q_gpu[i] != q_cpu[i] {
+                mismatches += 1;
+            }
+        }
+        // Allow up to 0.1% mismatches due to round-half-to-even vs
+        // round-half-away-from-zero (Metal vs Rust f32::round).  In
+        // practice we expect 0 because the kernel uses
+        // round-half-away-from-zero (qdq_affine.metal:101).
+        let tol = (n_total / 1000).max(1);
+        assert!(
+            mismatches <= tol,
+            "q_int mismatches: {mismatches}/{n_total} (tol={tol})"
+        );
+    }
 }

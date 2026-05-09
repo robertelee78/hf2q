@@ -634,9 +634,11 @@ landed; Linear-only forward already landed).
           combines:
           - Load student weights via
             `Qwen35Model::load_from_gguf` (model.rs:180), then for
-            each Linear extract W_real → init_qdq (CPU helper from
-            `ac7_option_a_foundation_qdq_wrapped_moe_layer` test;
-            extract to a public helper).
+            each Linear's W_real call the existing PUBLIC
+            `init_affine_params_gpu` (dwq_loop.rs:49) which returns
+            `(q_int, scales, biases)` via the canonical mlx-native
+            `qdq_affine_init_f32` kernel (verified consistent with
+            CPU init helper used in the AC#7 foundation tests).
           - Load teacher via
             `GgufTeacherProvider::from_gguf_path` (gguf_teacher.rs:64).
           - For each batch: invoke
