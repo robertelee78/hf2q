@@ -2653,6 +2653,57 @@ Then iter-141..145 implements verify_batched with DFlash as the proposer.
 Final benchmarking measures actual decode speedup vs both peer (llama.cpp)
 and existing Shape S serial baseline.
 
+### iter-141: walk-phase pivot — spec-decode is run-phase, refocus on peer kernel ports
+
+Operator clarification: ADR-028 is in WALK phase. Spec-decode (Path A
+Phase 2 GPU, iter-134..140) is RUN-PHASE infrastructure — premature
+to land before kernel-level peer-porting is exhausted.
+
+#### What stays vs what defers
+
+**STAY (walk phase, current focus)**:
+- Port best-from-peer KERNEL optimizations
+- Task #23: DS4 fused gate+up+SwiGLU mv_id (gemma4 dense FFN target)
+- Task #18: Q6_K + Q5_K fused-swiglu-down mv_id
+- Future kernel micro-optimizations from llama.cpp / ds4 / vllm
+
+**DEFER (run phase, after walk closes)**:
+- Path A spec-decode (n-gram source) — iter-134..140 scaffold preserved
+  as future scope, no further iter-141+ work on it now
+- DFlash drop-in integration (cheating per operator)
+- Other speculative-decode derivatives
+
+#### iter-134..140 preserved scaffold
+
+Path A Phase 2 GPU API surface remains landed in main:
+- `forward_decode_verify_batched` callable via Shape S delegation
+- start_pos parameter threaded through forward_prefill_batched (sites
+  A + B at lines 470 + 1839)
+- ArgmaxCapture enum in spec_decode/verifier.rs
+- ngram_proposer + Verifier trait + accept_prefix_argmax + rollback_kv_state
+
+When run-phase opens, these directly compose into Shape B body
+implementation. No work lost.
+
+#### Walk-phase priorities re-stated
+
+The remaining gemma4 0.71× peer gap is structural at the kernel level
+per iter-100..118 11 falsifications. Walk-phase closure paths:
+
+1. **DS4 fused gate+up+SwiGLU mv_id** (task #23) — saves dispatch
+   encode + per-expert silu_mul kernel launch. Sized at ~5-20% decode
+   win at gemma4 (re-verify with measurement-first per operator's
+   standing rule).
+2. **bin_fuse class** (task #14 obsolete, but other binary-fusion
+   chains may exist) — re-audit decode dispatch chain.
+3. **Q6_K/Q5_K fused-swiglu-down** (task #18) — bigger MoE expert
+   savings at qwen3.6 (we already beat peer there but extra headroom
+   doesn't hurt).
+
+Per operator's "no shortcuts" + "measure 3x cut once" — next iter
+(142+) starts task #23 with a measurement-first sizing of actual DS4
+fusion savings at gemma4 production scale, before any kernel port.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
