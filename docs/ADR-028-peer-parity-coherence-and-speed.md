@@ -285,6 +285,55 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-97 session-60 bench — GPU pipelining hides the per-call cost
+
+Added `bench_q6_k_mv_id_session60_gemma_decode` (#[ignore]) that
+dispatches 60 INDEPENDENT mv_id Q6_K calls into ONE encoder, then
+commit_wait_with_gpu_time once. Mirrors production single-session
+amortization with one critical caveat: in this bench all 60 dispatches
+write to different output buffers, so they have NO data dependencies.
+
+| Bench mode | per-call CPU | per-call GPU | overhead |
+|---|---:|---:|---:|
+| Isolated (1 dispatch/encoder, iter-96) | 255.71 µs | 93.75 µs | 161.96 µs (63%) |
+| **Session-60 (60 in 1 encoder, iter-97)** | **19.12 µs** | **16.04 µs** | **3.09 µs (16%)** |
+
+**Key insight**: when dispatches are independent, the Apple GPU can
+**pipeline/overlap** them, so wall-clock per call drops from 93.75 µs
+sequential to **16.04 µs effectively-parallel**.
+
+**Production decode at 15.86 ms / 990 dispatches = 16.0 µs/dispatch**
+— matches the session-60 average exactly. Production decode is
+**already at the parallel-pipelined GPU floor**.
+
+This re-frames the peer-gap analysis fundamentally:
+1. Per-kernel optimization (faster individual kernels) won't help
+   much — they're already amortized via GPU pipelining.
+2. **Reducing dispatch count via fusion is the dominant lever**.
+   Each kernel fusion saves ~16 µs (the amortized per-dispatch cost),
+   not 93 µs (the isolated kernel cost).
+
+**Closing 30% peer gap = remove ~300 dispatches from 990**.
+
+Iter-92's fusion candidates re-prioritized:
+- `bin_fuse_f32_f32_f32_4` for elementwise mul/add — fuses small
+  follow-on ops. Each fusion saves 1 dispatch.
+- Q5_K/Q6_K swiglu-fused mv_id (we have Q4_0 only) — fuses 2 ops
+  into 1, savings 30+ dispatches/token.
+- `kernel_set_rows_f16_i64` style KV cache — fuses cache write +
+  format conversion.
+
+Caveat: production has data DEPENDENCIES between dispatches (layer N+1
+input = layer N output). The session-60 bench overstates parallelism.
+Real production sits between isolated (93 µs) and pipelined (16 µs).
+But the empirical 990 × 16 µs = 15.86 ms total matches → barriers and
+dependencies in production ALREADY allow strong overlap. Apple Metal
+scheduler is doing serious work here.
+
+**Iter-98 attack**: count + categorize the 990 dispatches per token
+in production decode (already exists via HF2Q_MLX_PROFILE breakdown).
+Identify which categories have the most fusion potential.
+
 ### Iter-96 GPU/CPU split bench — encode overhead is 63% of μbench, MoE share is 35% (not 71%)
 
 Extended `bench_q6_k_mv_id_gemma_decode_gate_up` to capture both CPU
