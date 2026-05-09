@@ -2253,6 +2253,58 @@ The remaining levers are:
 These are the structurally-bounded options. Without a quant downgrade
 or speculative decode, gemma4 cannot match peer at the kernel level.
 
+### iter-129: gemma4 root-cause — TQ-KV is qwen35-family-only
+
+iter-128 revealed gemma4 is 0.71× peer. iter-129 traced the cause.
+
+#### gemma4 production load banner (with HF2Q_TQ_KV=1):
+
+```
+hf2q load: model = Gemma4 Ara 2pass Baseline (arch = gemma4, family = gemma4)
+hf2q load: features = sliding_window=1024, full_attn_every=6, moe=128 experts/8 active
+hf2q load: kv_spill = inactive
+hf2q load: tq_kv = inactive   ← still inactive even with HF2Q_TQ_KV=1
+```
+
+**Setting HF2Q_TQ_KV=1 doesn't activate TQ for gemma4.** Decode time
+unchanged (62.7 t/s vs 63.0 t/s).
+
+#### Root cause: TQ-active KV cache is qwen35-family-only
+
+`engine_qwen35.rs:179` has `pub tq_kv_active: bool`. No equivalent on
+gemma4's code path. `serve/mod.rs:3403` gates `tq_active_mode` on the
+factory which routes to qwen35-engine. Gemma4 unconditionally uses
+the dense (F32) K/V cache path.
+
+This means:
+1. gemma4 runs `flash_attn_vec` (dense F32 K/V), NOT `flash_attn_vec_tq_hb`
+2. **Path D doesn't apply to gemma4** — Path D adds NSG axis only to
+   the TQ-HB kernel
+3. ADR-027's 3.94× KV memory savings — gemma4 doesn't get them
+4. The kL=1024 sw cap means even if we PORTED TQ-HB to gemma4, Path D
+   wouldn't engage (NSG=1 selected at kL ≤ 1024)
+
+#### Implication
+
+gemma4's 0.71× peer ratio isn't a Path D problem or a kernel problem —
+it's that gemma4 runs through hf2q's LEGACY dense path while qwen3.6
+runs through the modern TQ-HB path with all its optimizations.
+
+#### Closure options for gemma4 specifically
+
+1. **Path A spec-decode (cross-cutting)**: Phase 2 GPU implementation
+   gives 1.6-3.0× decode lift to BOTH gemma4 and qwen3.6. Mantra-aligned,
+   no quality loss. THIS is the right next investment for gemma4.
+2. **Port TQ-active KV from qwen35 to gemma4**: brings 3.94× memory
+   savings + Path D infrastructure. Multi-iter scope (similar to
+   ADR-027 Phase B).
+3. **Q5_K_M → Q4_K_M quant downgrade**: ~10-15% bandwidth savings on
+   big kernels. Operator decision (quality cost).
+
+Per operator emphasis "no shortcuts, do it right, beat peers" —
+**Path A Phase 2 GPU implementation is the natural next investment**.
+Closes gemma4 gap AND improves qwen3.6 simultaneously.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
