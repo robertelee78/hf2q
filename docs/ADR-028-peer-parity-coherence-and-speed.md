@@ -285,6 +285,54 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-98 dispatch categorization per layer — fusion target ranking
+
+Read `forward_decode` body (forward_mlx.rs:238-1715) and counted
+`total_dispatches += N` sites per layer (45 sites with branch-dependent
+firing). Real per-layer hit count averages **33 dispatches** (990/30).
+
+**Per-layer dispatch breakdown** (gemma-4-26b decode, TQ-HB SDPA path):
+
+| Section | Dispatches | Lines | Fusion potential |
+|---|---:|---|---|
+| Pre-attn norm | 1 | 302 | already 2-op fused |
+| QKV mv (Q+K+V) | 3 | 313/320/327 | needs new fused_qkv kernel (deep refactor) |
+| Head norm + RoPE (Q+K) | 2 | 359/370 | already fused |
+| KV format conv | 2 | 393/409 | small |
+| KV TQ-HB encode | 4 | 555/566/600/613 | could fuse into FA-vec-tq-hb |
+| FA-vec-tq-hb path (FWHT pre + main + reduce + undo) | 4 | 1184/1228/1240/1257 | **fuse FWHTs into FA = save 2/layer = 60/token** |
+| O-proj mv | 1 | 1410 | small |
+| Fused post-attn norm+add | 1 | 1436 | already fused |
+| B8 triple norm | 3 | 1468/1478/1488 | already concurrent |
+| B9 gate + up + router mv | 3 | 1500/1503/1507 | already concurrent |
+| B10 gelu_mul + moe_routing | 2 | 1536/1545 | already fused |
+| B11 dense_down + gate_up_id | 2 | 1567/1592 | could fuse |
+| **B12 moe_swiglu (singleton)** | **1** | **1605** | **fuse into B13 down_id = save 1/layer = 30/token** |
+| B13 down_id + post-FF norm1 | 2 | 1633/1648 | already concurrent |
+| B14 moe_weighted_sum | 1 | 1662 | already fused |
+| Post-FF norm2 + combine | 1 | 1697 | already fused |
+| End-of-layer norm+add+scalar | 1 | 1715 | already fused |
+
+**Fusion ROI ranked**:
+
+1. **Fuse FWHTs into FA-vec-tq-hb** — Save 2/layer × 30 = **60 dispatches/token
+   = 960 µs = 6.1% decode speedup**. Highest impact. Risk: FWHT requires
+   power-of-2 length, must verify FA-vec-tq-hb input shapes work.
+2. **Port Q6_K + Q5_K swiglu-fused-down mv_id** (reference: existing
+   `mul_mv_id_q4_0_f32_swiglu`). Save 1 B12 dispatch/layer × 30 =
+   **30/token = 480 µs = 3% decode speedup**. Moderate scope, well-defined.
+3. **Fuse KV TQ-HB encode into KV-format conv** — Save 1-2/layer × 30 =
+   30-60/token = **2-4% speedup**. Moderate scope.
+
+**Iter-99 attack plan**: start with #2 (Q6_K swiglu-fused-down mv_id)
+because (a) reference Q4_0 implementation exists, (b) parity tests
+already cover Q6_K mv_id, (c) bench infrastructure landed in iter-94/96.
+Iter-100+ tackles #1 and #3.
+
+**Combined fusion potential**: 6% + 3% + 3% = ~12% decode speedup,
+moving from 63 t/s to ~71 t/s. Closes ~30% of the 4.75 ms peer gap.
+Remaining 18-20% gap may live in places not covered by simple fusion.
+
 ### Iter-97 session-60 bench — GPU pipelining hides the per-call cost
 
 Added `bench_q6_k_mv_id_session60_gemma_decode` (#[ignore]) that
