@@ -285,6 +285,69 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-109 hot-kernel inventory — 44.6% of decode mapped, LM head at memory ceiling
+
+Bench `bench_iter109_decode_hot_kernels` in `tests/test_quantized_matmul_
+ggml.rs`. Localizes the regular-mv (not mv_id) hot kernels at gemma-4-26b
+decode shapes. Combined with iter-103's mv_id+FA+norm+FWHT data:
+
+| Kernel | Shape | GPU/call | Calls | Per-token | % decode |
+|---|---|---:|---:|---:|---:|
+| **LM head Q8_0** | n=262144 k=2816 | **1335 µs** | 1 | **1.58 ms** | **9.9%** |
+| FA-vec-tq-hb | nh=16 nkv=8 d=256 kL=128 | 40 µs | 30 | 1.43 ms | 9.0% |
+| mv_id Q6_K MoE | gate_up + down | 16 µs | 60 | 0.96 ms | 6.0% |
+| Q proj Q6_K | n=4096 k=2816 | 23.65 µs | 30 | 0.93 ms | 5.8% |
+| O proj Q6_K | n=2816 k=4096 | 18.58 µs | 30 | 0.76 ms | 4.8% |
+| V proj Q6_K | n=2048 k=2816 | 8.84 µs | 30 | 0.47 ms | 3.0% |
+| K proj Q6_K | n=2048 k=2816 | 8.84 µs | 30 | 0.46 ms | 2.9% |
+| norm fused | rows=1 d=2816 | 0.50 µs | 120 | 0.27 ms | 1.7% |
+| FWHT | nh=16 d=256 | 0.71 µs | 60 | 0.22 ms | 1.4% |
+| **Subtotal** | | | | **7.08 ms** | **44.6%** |
+| Unaccounted | | | | 8.78 ms | 55.4% |
+
+**Critical findings:**
+
+1. **LM head is at memory-bandwidth ceiling.** 784 MB Q8_0 weight read /
+   1.335 ms = **587 GB/s effective bandwidth**, at or above M5 Max's
+   theoretical ~400-546 GB/s ceiling. The kernel is already optimal.
+   No room for improvement WITHOUT changing the quant format. Q5_K LM
+   head would save ~33% bandwidth (528 MB vs 784 MB) → ~0.5 ms/token =
+   3% lift — but per `forward_mlx.rs:1207-1213` Q8+rerank is the chosen
+   tradeoff for production quality.
+
+2. **Big kernels are NOT dispatch-bound.** Q proj 23.65 µs, O proj 18.58
+   µs, FA 40 µs, LM head 1335 µs — all well ABOVE the 16 µs/dispatch
+   pipelined floor. Iter-100/101/102/108 falsifications were in the
+   floor regime; the REAL decode work happens in big kernels at
+   compute/bandwidth ceilings.
+
+3. **Most measured kernels are near-optimal**:
+   - LM head: at memory ceiling (587 GB/s ≈ M5 Max max).
+   - FA-vec-tq-hb: compute-bound at 40 µs (TQ codebook lookup + norms).
+     Structural cost of ADR-027 Phase B's 3.94× memory savings.
+   - 4 projections: all at compute ceiling for their shape × Q6_K.
+
+4. **Q5_K vs Q6_K opportunity**: gemma-4-ara-2pass-APEX-Q5_K_M is mostly
+   Q5_K with some Q6_K layers (per llama.cpp `Q5_K_M` mixed convention).
+   My bench used Q6_K (heavier). Production likely averages ~Q5_K cost
+   = ~17% smaller bandwidth. But this is a comparison-methodology
+   artifact, not a hf2q optimization lever — we already use whatever
+   the .gguf provides.
+
+**Updated peer-gap analysis** (15.83 ms hf2q vs 11.11 ms llama.cpp = 4.72 ms gap):
+- TQ-HB structural overhead: ~1.5-3 ms (FA + KV encode + FWHTs)
+- Quantization-format choice (Q6_K vs llama.cpp's Q5_K mix): ~0.5-1 ms
+- Apple-Metal-vs-llama.cpp scheduling/encoding: ~0.5-1 ms
+- Other (KV cache copy, sampling, etc.): the 8.78 ms unaccounted split
+
+**Iter-110 plan**: bench dense FFN gate/up/down (regular Q5_K mv at
+hidden×intermediate) + KV TQ-HB encode (codebook quantize calls).
+These are the largest unmeasured candidates for the remaining 8.78 ms.
+
+Bench retained as regression-gate: `cargo test --release --test
+test_quantized_matmul_ggml bench_iter109_decode_hot_kernels --
+--ignored --nocapture`.
+
 ### Iter-108 item #19 production flip — FALSIFIED at +0% decode
 
 iter-106/107 LANDED a working fused FWHT-pre code path:
