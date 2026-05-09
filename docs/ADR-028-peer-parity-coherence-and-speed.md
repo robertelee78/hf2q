@@ -285,6 +285,79 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-95 Q6_K mv_id y-reuse refactor — FALSIFIED (8th compiler-auto-optim hypothesis)
+
+Implemented the y-vector register-reuse refactor identified in iter-91:
+- Each simdgroup now handles **NR0=2 weight rows** (was 1)
+- Pre-loads `yl[16]` once per outer-block, reuses across both rows
+- Mirrors llama.cpp's `kernel_mul_mv_q6_K_f32_impl` register-cache pattern
+- Adjusted dispatch geometry: Q6_K uses `align=4` (was 2) → threadgroups.x = ceil(N/4)
+
+Files changed (transient):
+- `mlx-native/src/shaders/quantized_matmul_id_ggml.metal:803` — kernel rewrite
+- `mlx-native/src/ops/quantized_matmul_id_ggml.rs:519` — Q6_K-specific dispatch geometry
+
+**Parity tests PASS** (`test_q6_k_mm_id_matches_mv_id_small` + `_prefill_shape`).
+Refactor is byte-equivalent to baseline within tolerance.
+
+**Bench A/B comparison** (200 trials, 20 warmup, decode shape):
+
+| Metric | Baseline | Refactor | Delta |
+|---|---:|---:|---:|
+| p10 | 155.88 µs | 152.79 µs | -2.0% |
+| **p50** | **187.54 µs** | **182.83 µs** | **-2.5%** |
+| p90 | 292.58 µs | 267.38 µs | -8.6% |
+| Per-token (60 calls × p50) | 11.25 ms | 10.97 ms | -2.5% |
+
+**End-to-end production decode** (gemma APEX-Q5_K_M, tg32, 5 trials):
+
+| Metric | Baseline | Refactor |
+|---|---:|---:|
+| Median | 63.4 t/s | 63.9 t/s (+0.8%) |
+| Range | 62-66 | 60.5-64.5 |
+
+**Production effect: null** — within thermal noise. Static-evidence
+hypothesis (yl[] register reuse should save y-load bandwidth) FALSIFIED.
+
+**Why this is the 8th confirmed `feedback_metal_compiler_auto_optimizes_static_levers` falsification**:
+
+The Metal compiler likely already coalesces y[] reads in the existing
+1-row-per-simdgroup variant (L1-cache + scalar load coalescing across
+the simdgroup). Explicit register-cache via `yl[16]` doesn't reduce
+total memory traffic — both simdgroups in the same threadgroup share
+L1, so y is fetched once for two rows in either layout.
+
+The 2.5% kernel-level improvement (μbench artifact) does not translate
+to end-to-end speedup because:
+1. The bench includes per-dispatch encoder + commit_and_wait overhead
+   (~5-10 µs) that's amortized in production single-session mode.
+2. Real per-kernel GPU time at this shape is ~165-175 µs; the 2.5%
+   delta on μbench p50 reflects encoder timing variance more than
+   actual GPU work change.
+
+**Decision**: REVERT refactor. Standing rule wins again. Document for
+future iterations to skip this attack vector.
+
+**Iter-96 attack pivot**: where IS the 30% per-call gap? Hypotheses:
+1. **L1 cache miss rate**: llama.cpp's `nsg=2` thread-grouping may
+   produce different L1 behavior than ours.
+2. **Pipeline cache**: llama.cpp's tag suffix `_nsg=2` suggests
+   function-constant-driven specialization — our kernel doesn't use
+   function constants.
+3. **Threadgroup→barrier scheduling**: llama.cpp's grid shape
+   `(ceil(N/(NSG*nr0)), m, 1)` produces fewer larger threadgroups
+   (4 rows each) vs our many small (2 rows each). Apple GPU scheduler
+   may favor fewer-larger.
+4. **Encoder dispatch overhead**: each Metal dispatch costs ~5-10 µs
+   of CPU encode + GPU schedule. We do 990 dispatches/token; if
+   encoder overhead is 5-10 µs each = 5-10 ms = **30-60% of decode
+   time**. This may be the actual gap.
+
+Iter-96 candidate: instrument encoder dispatch CPU vs GPU time
+(use `MTLCommandBuffer.GPUStartTime/GPUEndTime`) to separate encode
+overhead from kernel time. If encoder overhead is large, the fix is
+**fewer dispatches** (kernel fusion), NOT faster kernels.
+
 ### Iter-94 ground-truth Q6_K mv_id per-call timing — DOMINANT kernel confirmed
 
 Added `bench_q6_k_mv_id_gemma_decode_gate_up` (#[ignore] + #[test]) at
