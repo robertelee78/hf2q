@@ -223,15 +223,44 @@ mod tests {
         assert_eq!(tok, 0);
     }
 
-    /// Mock verifier — returns operator-supplied logits, simulating
-    /// the model's per-position predictions for an integration test.
+    /// Mock verifier — drives the spec-decode loop without a model.
+    /// Validates every `verify` call's input shape (`tokens.len() ==
+    /// expected_input_len`) so a buggy caller is caught immediately,
+    /// and records both the inputs it was called with and the
+    /// rollback positions it received. Multi-cycle tests can supply
+    /// a different `scripted` vector per cycle via `set_scripted`.
     struct MockVerifier {
         scripted: VerifyLogits,
+        /// If `Some(n)`, asserts that every verify call gets exactly
+        /// `n` input tokens. Catches "K+1 vs K" off-by-ones in callers.
+        expected_input_len: Option<usize>,
+        verify_inputs: Vec<Vec<u32>>,
         rollbacks: Vec<usize>,
     }
 
+    impl MockVerifier {
+        fn new(scripted: VerifyLogits) -> Self {
+            Self {
+                scripted,
+                expected_input_len: None,
+                verify_inputs: Vec::new(),
+                rollbacks: Vec::new(),
+            }
+        }
+        fn with_expected_input_len(mut self, n: usize) -> Self {
+            self.expected_input_len = Some(n);
+            self
+        }
+    }
+
     impl Verifier for MockVerifier {
-        fn verify(&mut self, _tokens: &[u32]) -> Result<VerifyLogits, VerifierError> {
+        fn verify(&mut self, tokens: &[u32]) -> Result<VerifyLogits, VerifierError> {
+            if tokens.is_empty() { return Err(VerifierError::EmptyInput); }
+            if let Some(n) = self.expected_input_len {
+                assert_eq!(tokens.len(), n,
+                    "MockVerifier: expected {n} input tokens, got {}", tokens.len());
+            }
+            self.verify_inputs.push(tokens.to_vec());
             Ok(self.scripted.clone())
         }
         fn rollback_kv_to(&mut self, seq_pos: usize) -> Result<(), VerifierError> {
@@ -240,23 +269,221 @@ mod tests {
         }
     }
 
-    #[test]
-    fn proposer_to_verifier_loop_byte_identity_at_k_zero() {
-        // ADR-029 Phase 2 falsifier gate: at K=0 the loop degrades to
-        // default decode. The proposer returns empty drafts; the verify
-        // pass produces 1 logits row (the model's next token).
-        let mut mock = MockVerifier { scripted: vec![one_hot(100, 7)], rollbacks: Vec::new() };
-        let drafts: Vec<u32> = Vec::new();
-        let logits = mock.verify(&[5u32]).unwrap();
-        let (accept, tok) = accept_prefix(&drafts, &logits);
-        assert_eq!(accept, 0);
-        assert_eq!(tok, 7, "K=0 reduces to single-token decode");
+    /// "Ground-truth" model: deterministic argmax-of-(token_seq) →
+    /// next_token, used to simulate what default decode WOULD produce
+    /// so spec-decode's output can be compared byte-for-byte.
+    /// Algorithm: next = (sum(seq) * 31 + seq.last()) % vocab — a
+    /// deterministic non-trivial function of the prefix.
+    fn ground_truth_next(seq: &[u32], vocab: u32) -> u32 {
+        let s: u64 = seq.iter().map(|&t| t as u64).sum();
+        let last = *seq.last().unwrap_or(&0) as u64;
+        ((s.wrapping_mul(31).wrapping_add(last)) % vocab as u64) as u32
+    }
+
+    /// Verifier that *consults the ground-truth model* for each
+    /// position. Simulates a perfect verify pass: at each position i
+    /// of `[T_t, draft_1..draft_K]`, returns one_hot(ground_truth_next(
+    /// prefix_up_to_position_i)). Used to prove byte-identity between
+    /// spec-decode and default decode.
+    struct GroundTruthVerifier {
+        vocab: u32,
+        prefix: Vec<u32>,
+        rollbacks: Vec<usize>,
+    }
+
+    impl GroundTruthVerifier {
+        fn new(vocab: u32, initial_prefix: Vec<u32>) -> Self {
+            Self { vocab, prefix: initial_prefix, rollbacks: Vec::new() }
+        }
+    }
+
+    impl Verifier for GroundTruthVerifier {
+        fn verify(&mut self, tokens: &[u32]) -> Result<VerifyLogits, VerifierError> {
+            // Simulate the model receiving `tokens` past `prefix` and
+            // emitting per-position predictions. Position i predicts
+            // the token AFTER processing tokens[0..=i].
+            let mut logits = Vec::with_capacity(tokens.len());
+            for i in 0..tokens.len() {
+                let mut seq = self.prefix.clone();
+                // tokens[0] is the current verified position (already
+                // in prefix conceptually for the first call); for i=0
+                // we predict what follows it. For i>0 we extend with
+                // the speculative drafts.
+                if i > 0 { seq.extend_from_slice(&tokens[1..=i]); }
+                let next = ground_truth_next(&seq, self.vocab);
+                logits.push(one_hot(self.vocab as usize, next));
+            }
+            Ok(logits)
+        }
+        fn rollback_kv_to(&mut self, seq_pos: usize) -> Result<(), VerifierError> {
+            // Truncate prefix to seq_pos.
+            self.prefix.truncate(seq_pos);
+            self.rollbacks.push(seq_pos);
+            Ok(())
+        }
+    }
+
+    /// Run the default (non-spec) decode loop using `ground_truth_next`
+    /// as the oracle. Returns the generated sequence after `n_tokens`
+    /// new tokens (excluding the prompt).
+    fn default_decode(prompt: &[u32], vocab: u32, n_tokens: usize) -> Vec<u32> {
+        let mut gen = prompt.to_vec();
+        for _ in 0..n_tokens {
+            let next = ground_truth_next(&gen, vocab);
+            gen.push(next);
+        }
+        gen
+    }
+
+    /// Run a simulated spec-decode loop using `GroundTruthVerifier`
+    /// and the n-gram proposer. Returns the generated sequence after
+    /// at least `n_tokens` new tokens.
+    fn spec_decode_loop(
+        prompt: &[u32],
+        vocab: u32,
+        n_tokens: usize,
+        cfg: &super::super::ngram_proposer::NgramConfig,
+    ) -> (Vec<u32>, GroundTruthVerifier) {
+        let mut gen = prompt.to_vec();
+        let mut verifier = GroundTruthVerifier::new(vocab, prompt.to_vec());
+        let target_len = prompt.len() + n_tokens;
+
+        while gen.len() < target_len {
+            let drafts = super::super::ngram_proposer::propose(&gen, cfg);
+            // Build verify input: [last verified token] ++ drafts.
+            let last = *gen.last().unwrap();
+            let mut input = vec![last];
+            input.extend_from_slice(&drafts);
+            let logits = verifier.verify(&input).unwrap();
+            let (accept, model_tok) = accept_prefix(&drafts, &logits);
+            gen.extend_from_slice(&drafts[..accept]);
+            gen.push(model_tok);
+            verifier.prefix = gen.clone();
+            verifier.rollback_kv_to(gen.len()).unwrap();
+            if gen.len() >= target_len + cfg.k {
+                break; // safety bound
+            }
+        }
+        (gen, verifier)
     }
 
     #[test]
-    fn proposer_to_verifier_loop_full_accept_advances_seq_pos_by_k_plus_1() {
+    fn spec_decode_byte_identity_vs_default_decode() {
+        // ADR-029 PHASE 2 ACCEPTANCE GATE: the spec-decode loop driven
+        // by the n-gram proposer + a ground-truth verifier MUST produce
+        // a byte-identical generated sequence to default decode. This
+        // is the fundamental correctness invariant of greedy spec
+        // decode (Leviathan et al. 2023): accepted prefix is exactly
+        // what default decode would produce; the K+1th model token is
+        // the next token default decode would emit.
+        let prompt = vec![1u32, 2, 3, 1, 2, 3, 4]; // has [1,2,3] repetition for proposer
+        let vocab = 256u32;
+        let n_tokens = 30;
+        let cfg = super::super::ngram_proposer::NgramConfig {
+            min_ngram: 1, max_ngram: 3, k: 3, max_model_len: 4096,
+        };
+
+        let default_out = default_decode(&prompt, vocab, n_tokens);
+        let (spec_out, _v) = spec_decode_loop(&prompt, vocab, n_tokens, &cfg);
+
+        // Spec output may overshoot by up to K, so compare prefixes.
+        let cmp_len = prompt.len() + n_tokens;
+        assert!(spec_out.len() >= cmp_len);
+        assert_eq!(
+            &spec_out[..cmp_len], &default_out[..cmp_len],
+            "spec-decode must be byte-identical to default decode under greedy"
+        );
+    }
+
+    #[test]
+    fn spec_decode_at_k_zero_calls_verifier_with_single_token() {
+        // K=0 forces drafts = []; verify input = [last] (length 1).
+        // Loop runs once per output token, exactly like default decode.
+        let prompt = vec![5u32, 6, 7];
+        let vocab = 100u32;
+        let cfg = super::super::ngram_proposer::NgramConfig {
+            min_ngram: 1, max_ngram: 3, k: 0, max_model_len: 4096,
+        };
+
+        let mut verifier = GroundTruthVerifier::new(vocab, prompt.clone());
+        let mut gen = prompt.clone();
+
+        for _ in 0..5 {
+            let drafts = super::super::ngram_proposer::propose(&gen, &cfg);
+            assert!(drafts.is_empty(), "K=0 must always return empty drafts");
+            let last = *gen.last().unwrap();
+            let logits = verifier.verify(&[last]).unwrap();
+            assert_eq!(logits.len(), 1, "K=0 verify produces 1 logits row");
+            let (accept, tok) = accept_prefix(&drafts, &logits);
+            assert_eq!(accept, 0);
+            gen.push(tok);
+            verifier.prefix = gen.clone();
+            verifier.rollback_kv_to(gen.len()).unwrap();
+        }
+
+        // Compare to default decode for byte-identity.
+        let default_out = default_decode(&prompt, vocab, 5);
+        assert_eq!(gen, default_out);
+    }
+
+    #[test]
+    fn accept_prefix_invariants_under_random_inputs() {
+        // Property test: for random drafts + logits, the returned
+        // (accept_count, model_token) MUST satisfy:
+        //   1. accept_count <= drafts.len()
+        //   2. accept_count <= logits.len()
+        //   3. for all i < accept_count: drafts[i] == argmax(logits[i])
+        //   4. if accept_count < drafts.len(): drafts[accept_count] !=
+        //      argmax(logits[accept_count])
+        //   5. model_token is some valid token id (< vocab)
+        let vocab = 50usize;
+        let mut state: u64 = 0xCAFE_BEEF;
+        let next_rand = |s: &mut u64| -> u64 {
+            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *s >> 33
+        };
+
+        for _ in 0..500 {
+            let n_drafts = (next_rand(&mut state) % 6) as usize;
+            let n_logits = (next_rand(&mut state) % 8) as usize;
+            let drafts: Vec<u32> = (0..n_drafts)
+                .map(|_| (next_rand(&mut state) % vocab as u64) as u32).collect();
+            let logits: VerifyLogits = (0..n_logits)
+                .map(|_| {
+                    let target = (next_rand(&mut state) % vocab as u64) as u32;
+                    one_hot(vocab, target)
+                }).collect();
+
+            let (accept, tok) = accept_prefix(&drafts, &logits);
+
+            // Invariant 1, 2.
+            assert!(accept <= drafts.len(), "accept_count > drafts.len()");
+            assert!(accept <= logits.len() || logits.is_empty(),
+                "accept_count > logits.len() (got {accept} vs {})", logits.len());
+
+            // Invariant 3.
+            for i in 0..accept {
+                assert_eq!(drafts[i], argmax_u32(&logits[i]),
+                    "accepted draft[{i}] = {} doesn't match argmax {} (logits len {}, drafts len {})",
+                    drafts[i], argmax_u32(&logits[i]), logits.len(), drafts.len());
+            }
+
+            // Invariant 4.
+            if accept < drafts.len() && accept < logits.len() {
+                assert_ne!(drafts[accept], argmax_u32(&logits[accept]),
+                    "first rejected draft equals model argmax — should have been accepted");
+            }
+
+            // Invariant 5.
+            assert!((tok as usize) < vocab,
+                "model_token {tok} out of vocab range {vocab}");
+        }
+    }
+
+    #[test]
+    fn spec_decode_loop_full_accept_advances_seq_pos_by_k_plus_1() {
         // Simulate one spec-decode cycle: drafts=[10,20,30], all match,
-        // model emits 40. seq_pos advances by 4 (K+1).
+        // model emits 40. seq_pos advances by K+1=4.
         let drafts = vec![10u32, 20, 30];
         let scripted = vec![
             one_hot(100, 10),
@@ -264,27 +491,28 @@ mod tests {
             one_hot(100, 30),
             one_hot(100, 40),
         ];
-        let mut mock = MockVerifier { scripted: scripted.clone(), rollbacks: Vec::new() };
+        let mut mock = MockVerifier::new(scripted)
+            .with_expected_input_len(4); // [last] ++ drafts = 1 + 3 = 4
 
         let seq_pos_before: usize = 7;
-        let logits = mock.verify(&[5u32, 10, 20, 30]).unwrap();
+        let last = 5u32;
+        let mut input = vec![last];
+        input.extend_from_slice(&drafts);
+        let logits = mock.verify(&input).unwrap();
         let (accept, tok) = accept_prefix(&drafts, &logits);
         let seq_pos_after = seq_pos_before + accept + 1;
 
         assert_eq!(accept, 3);
         assert_eq!(tok, 40);
-        assert_eq!(seq_pos_after, 11, "K=3 full-accept advances seq_pos by K+1=4");
-
-        // Verifier should be told to roll back to the new seq_pos —
-        // since accept_count == drafts.len() the rollback is a no-op
-        // (no rejected positions), but the integration calls it anyway
-        // to keep the contract simple.
+        assert_eq!(seq_pos_after, 11);
+        assert_eq!(mock.verify_inputs, vec![vec![5u32, 10, 20, 30]],
+            "verifier saw [last] ++ drafts in correct order");
         mock.rollback_kv_to(seq_pos_after).unwrap();
         assert_eq!(mock.rollbacks, vec![11]);
     }
 
     #[test]
-    fn proposer_to_verifier_loop_partial_accept_rolls_back_rejected() {
+    fn spec_decode_loop_partial_accept_rolls_back_rejected() {
         // drafts=[10,20,30], 2 accepted + model emits 99 instead of 30.
         // seq_pos advances by 3 (accept_count + 1 = 2 + 1 = 3).
         // Rollback truncates KV past the 3rd new position.
@@ -295,7 +523,8 @@ mod tests {
             one_hot(100, 99),
             one_hot(100, 40),
         ];
-        let mut mock = MockVerifier { scripted, rollbacks: Vec::new() };
+        let mut mock = MockVerifier::new(scripted)
+            .with_expected_input_len(4); // [last] ++ K=3 drafts
 
         let seq_pos_before: usize = 7;
         let logits = mock.verify(&[5u32, 10, 20, 30]).unwrap();
@@ -305,9 +534,49 @@ mod tests {
         assert_eq!(accept, 2);
         assert_eq!(tok, 99);
         assert_eq!(seq_pos_after, 10);
+        assert_eq!(mock.verify_inputs, vec![vec![5u32, 10, 20, 30]]);
 
         mock.rollback_kv_to(seq_pos_after).unwrap();
         assert_eq!(mock.rollbacks, vec![10],
                   "rollback to seq_pos_after = before + accept + 1");
+    }
+
+    #[test]
+    fn mock_verifier_rejects_empty_input_per_contract() {
+        // Verifier's contract requires at least 1 input token. Mock
+        // mirrors the real impl's constraint so callers are caught.
+        let mut mock = MockVerifier::new(vec![one_hot(100, 0)]);
+        let result = mock.verify(&[]);
+        assert!(matches!(result, Err(VerifierError::EmptyInput)));
+    }
+
+    #[test]
+    fn mock_verifier_input_len_validation_catches_caller_bug() {
+        // Set expected_input_len=4 (K=3 + last). Then call with wrong
+        // number of tokens — should panic, catching the caller bug.
+        let mut mock = MockVerifier::new(vec![one_hot(100, 0)])
+            .with_expected_input_len(4);
+        // Calling with 3 tokens (K=2 + last) violates the expectation.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = mock.verify(&[1u32, 2, 3]);
+        }));
+        assert!(result.is_err(),
+            "MockVerifier with expected_input_len=4 should panic on 3 tokens");
+    }
+
+    #[test]
+    fn ground_truth_decode_is_deterministic() {
+        // Sanity check: ground_truth_next gives same answer for same
+        // input across multiple calls (no internal state).
+        let seq = vec![1u32, 2, 3, 4, 5];
+        let a = ground_truth_next(&seq, 256);
+        let b = ground_truth_next(&seq, 256);
+        let c = ground_truth_next(&seq, 256);
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        // And different prefixes give different outputs (catches bugs
+        // where ground_truth_next ignores the input).
+        let d = ground_truth_next(&[1u32, 2, 3, 4, 6], 256);
+        assert_ne!(a, d, "ground_truth_next must be input-sensitive");
     }
 }
