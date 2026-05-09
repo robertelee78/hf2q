@@ -44,10 +44,23 @@ MAX_TOKENS="${MAX_TOKENS:-20}"
 # `<|im_end|>` as the first assistant token at ≥~4100 prefill tokens
 # under the GGUF-embedded chat template — see memory file
 # `project_iter40_qwen36_chat_template_long_context_eos_2026_05_09.md`.
-# Set CHAT_TEMPLATE_FILE to a null/passthrough template (e.g. one whose
-# body is just `{{ messages[0].content }}`) to bypass chat templating
-# for long-context needle-haystack runs. Empty string (default) uses
-# the GGUF embedded template.
+# Set CHAT_TEMPLATE_FILE to a null/passthrough template to bypass chat
+# templating for long-context needle-haystack runs. Empty string (default)
+# uses the GGUF embedded template.
+#
+# **Recommended canonical value** (iter-52 / iter-53 consolidation):
+#   CHAT_TEMPLATE_FILE=/opt/hf2q/scripts/qwen35_raw_passthrough.jinja
+# That file ships with the repo (1-line `{{ messages[0].content }}`,
+# ADR-005 Phase 1) and is also used by `scripts/qwen35_tokenizer_parity.sh`
+# + `scripts/adr027-long-context-sweep.sh`. Reuse rather than rolling
+# your own ad-hoc null template — single source of truth.
+#
+# Caveat: under null template the model treats the prompt as a text-
+# completion task rather than instruction-following, so middle-position
+# needles may PASS by chance while early/late positions FAIL with the
+# model echoing more haystack filler. See iter-51 in
+# `project_iter40_qwen36_chat_template_long_context_eos_2026_05_09.md`
+# for the falsified MAX_TOKENS-budget hypothesis.
 CHAT_TEMPLATE_FILE="${CHAT_TEMPLATE_FILE:-}"
 
 if [ ! -f "$MODEL" ]; then
