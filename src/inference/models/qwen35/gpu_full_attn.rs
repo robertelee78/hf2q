@@ -2050,6 +2050,109 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
     Ok(out_seq)
 }
 
+/// ADR-027 Phase B iter-33 (sub-sub-iter 23c-β.4) — TQ-cache-backed
+/// prefill resume.
+///
+/// **Purpose:** drop-in alternative to
+/// [`apply_flash_attn_prefill_seq_major_resume`] when the slot has been
+/// constructed in TQ-active mode (`HybridKvCache::new_with_options(..,
+/// tq_kv_active=true)`) — reads K and V from the TQ-encoded buffers via
+/// dequant + FWHT-undo + sign-undo (yielding K/V in the original
+/// unrotated F32 domain, head-major) and dispatches the SAME dense
+/// prefill resume kernel against the temp buffers. Output is bitwise
+/// equivalent to F32-shadow-cache prefill resume up to the TQ
+/// quant round-trip floor (iter-32 measured NRMSE 0.008 — same magnitude
+/// as iter-13's single-position GPU litmus).
+///
+/// **Why this exists** (iter-30 EMPIRICAL FINDING): qwen35's prefill
+/// SDPA has no TQ-aware variant in mlx-native; only the decode path
+/// has one (iter-15's `dispatch_decode_sdpa_with_optional_tq`). To
+/// support TQ-only KV (iter-34 `slot.k=None` alloc-drop, the actual
+/// 3.94× memory savings deliverable), prefill must dequant TQ → temp
+/// F32 → dense prefill kernel.
+///
+/// **Layout / stride contract:**
+/// - Dequant output: `[n_kv_heads, kv_seq_len, head_dim]` head-major F32
+///   (tight; no full-slot-capacity stride padding).
+/// - Resume kernel head stride: `kv_capacity * head_dim`. Passing
+///   `kv_capacity = kv_seq_len` makes the kernel's stride math match
+///   the tight buffer exactly.
+/// - The resume kernel asserts `cur_len + seq_len == kv_seq_len`; this
+///   wrapper passes them through unchanged.
+///
+/// **Wiring status (iter-33):** this helper is callable today via the
+/// iter-33 parity test in `kv_cache::tests`. The production call site
+/// in `apply_sdpa_with_kv_cache` still routes to the F32 path; iter-34
+/// flips that branch on `slot.k.is_none()` and lands the F32 alloc-drop.
+///
+/// # Errors
+///
+/// - `Err` when `slot.tq.is_none()` (mantra: fail loud).
+/// - Propagates from `dequant_seq_to_temp_f32_unrotated` and
+///   `apply_flash_attn_prefill_seq_major_resume`.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    slot: &super::kv_cache::FullAttnKvSlot,
+    q_seq_major: &MlxBuffer,
+    seq_len: u32,
+    cur_len: u32,
+    kv_seq_len: u32,
+    cache_capacity: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+) -> Result<MlxBuffer> {
+    if slot.tq.is_none() {
+        return Err(anyhow!(
+            "apply_flash_attn_prefill_seq_major_resume_via_tq_cache: slot.tq is None — \
+             slot was not constructed in TQ-active mode (HybridKvCache::new_with_options \
+             tq_kv_active=true required). Caller routing bug."
+        ));
+    }
+
+    // Dequant K and V over the full attended range [0..kv_seq_len) into
+    // tight head-major F32 temp buffers (unrotated domain — drops in as
+    // a slot.k/v F32 replacement).
+    let mut enc = device
+        .command_encoder()
+        .context("apply_flash_attn_prefill_seq_major_resume_via_tq_cache: dequant encoder")?;
+    let temp_k = slot
+        .dequant_seq_to_temp_f32_unrotated(
+            /*is_k=*/ true, kv_seq_len, /*start_pos=*/ 0,
+            cache_capacity, n_kv_heads, head_dim,
+            &mut enc, registry, device,
+        )
+        .context("dequant K seq → temp F32 unrotated")?;
+    let temp_v = slot
+        .dequant_seq_to_temp_f32_unrotated(
+            /*is_k=*/ false, kv_seq_len, /*start_pos=*/ 0,
+            cache_capacity, n_kv_heads, head_dim,
+            &mut enc, registry, device,
+        )
+        .context("dequant V seq → temp F32 unrotated")?;
+    // commit_and_wait so the temp buffers are populated before the
+    // resume kernel reads them. The resume kernel allocates its own
+    // encoder + commit_and_wait internally.
+    enc.commit_and_wait()
+        .context("apply_flash_attn_prefill_seq_major_resume_via_tq_cache: dequant commit")?;
+
+    // Dispatch the same dense resume kernel against the tight temp
+    // buffers. kv_capacity = kv_seq_len so the kernel's head-stride
+    // math (kv_capacity * head_dim) matches the tight head-major
+    // [n_kv_heads, kv_seq_len, head_dim] layout.
+    apply_flash_attn_prefill_seq_major_resume(
+        device, registry,
+        q_seq_major,
+        &temp_k, &temp_v,
+        seq_len, cur_len, kv_seq_len,
+        /*kv_capacity=*/ kv_seq_len,
+        n_heads, n_kv_heads, head_dim,
+    )
+    .context("apply_flash_attn_prefill_seq_major_resume (TQ-decoded path)")
+}
+
 // ================================================================
 // KV-cache-aware SDPA
 // ================================================================
@@ -5229,4 +5332,13 @@ mod tests {
             shape.hidden_size, nh, nkv, d,
         );
     }
+
+    // ADR-027 Phase B iter-33 (sub-sub-iter 23c-β.4) — parity tests
+    // for `apply_flash_attn_prefill_seq_major_resume_via_tq_cache`
+    // live in `kv_cache::tests` (where the `moe_cfg_40layer` test
+    // fixture is in scope). See:
+    // - `apply_flash_attn_prefill_seq_major_resume_via_tq_cache_nrmse_vs_f32`
+    // - `apply_flash_attn_prefill_seq_major_resume_via_tq_cache_errors_when_slot_lacks_tq`
+    #[allow(dead_code)]
+    fn _iter33_test_module_nav() {}
 }

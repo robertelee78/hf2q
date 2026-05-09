@@ -4288,6 +4288,246 @@ mod tests {
         );
     }
 
+    /// ADR-027 Phase B iter-33 (sub-sub-iter 23c-β.4) — TQ-cache-backed
+    /// prefill resume parity vs F32-shadow-cache prefill resume.
+    ///
+    /// **Load-bearing test for iter-34's F32 alloc-drop.** When iter-34
+    /// makes `slot.k = None` in TQ-active mode and the production call
+    /// site at `gpu_full_attn::apply_sdpa_with_kv_cache:2382+` routes
+    /// prefill resume through
+    /// `apply_flash_attn_prefill_seq_major_resume_via_tq_cache` (this
+    /// iter's helper, defined in `gpu_full_attn.rs`), the cross-axis
+    /// sweep harness depends on the resulting prefill output matching
+    /// F32 baseline within the quant round-trip floor. This test pins
+    /// that contract at production cache shape (cfg=moe_cfg_40layer,
+    /// head_dim=256, n_kv_heads=2, n_heads=16) BEFORE iter-34 lands.
+    ///
+    /// Sequence:
+    /// (1) Build TQ-active cache (both F32 K/V and TQ allocated in
+    ///     shadow-cache mode).
+    /// (2) Synthesize K, V seq-major source `[n_tokens=24, n_kv_heads,
+    ///     head_dim]`.
+    /// (3) Permute seq-major → head-major and write into slot.k /
+    ///     slot.v at positions [0..24) (manually populates the F32 path).
+    /// (4) `encode_seq_tokens_to_tq` writes K, V (seq-major source)
+    ///     into slot.tq for positions [0..24).
+    /// (5) Synthesize Q chunk `[seq_len=8, n_heads=16, head_dim=256]`.
+    /// (6) Path A (REFERENCE):
+    ///     `gpu_full_attn::apply_flash_attn_prefill_seq_major_resume`
+    ///     on (Q, slot.k, slot.v, ..) → out_a.
+    /// (7) Path B (UNDER TEST):
+    ///     `gpu_full_attn::apply_flash_attn_prefill_seq_major_resume_via_tq_cache`
+    ///     on (slot, Q, ..) → out_b.
+    /// (8) NRMSE(out_a, out_b) < 0.15 (ADR-007 §F-0.3 threshold).
+    #[test]
+    fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache_nrmse_vs_f32() {
+        use super::super::gpu_full_attn::{
+            apply_flash_attn_prefill_seq_major_resume,
+            apply_flash_attn_prefill_seq_major_resume_via_tq_cache,
+        };
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache_capacity: u32 = 64;
+        let n_tokens: u32 = 24;
+        let chunk2_seq_len: u32 = 8;
+        let cur_len: u32 = n_tokens - chunk2_seq_len;
+        let n_kv_heads = cfg.num_key_value_heads;
+        let n_heads = cfg.num_attention_heads;
+        let head_dim = cfg.head_dim;
+        assert_eq!(head_dim, 256);
+
+        let mut cache = HybridKvCache::new_with_options(
+            &cfg, &device, cache_capacity, 1, true,
+        )
+        .expect("kv tq-on");
+
+        // Synthesize K, V seq-major.
+        let stride_seq = (n_kv_heads as usize) * (head_dim as usize);
+        let kv_total_elems = (n_tokens as usize) * stride_seq;
+        let mut k_seq_major_cpu = vec![0f32; kv_total_elems];
+        let mut v_seq_major_cpu = vec![0f32; kv_total_elems];
+        for t in 0..n_tokens as usize {
+            for h in 0..n_kv_heads as usize {
+                for d in 0..head_dim as usize {
+                    let off = t * stride_seq + h * head_dim as usize + d;
+                    k_seq_major_cpu[off] =
+                        ((t * 31 + h * 17 + d * 7) as f32 / 137.0).sin() * 0.4;
+                    v_seq_major_cpu[off] =
+                        ((t * 13 + h * 23 + d * 5) as f32 / 211.0).cos() * 0.35;
+                }
+            }
+        }
+
+        // Populate F32 slot.k / slot.v (head-major).
+        let cap = cache_capacity as usize;
+        {
+            let slot = &mut cache.full_attn[0];
+            let kbuf = slot.k.as_mut().expect("legacy⇒Some(k)");
+            let dst_k = kbuf.as_mut_slice::<f32>().expect("k mut");
+            let vbuf = slot.v.as_mut().expect("legacy⇒Some(v)");
+            let dst_v = vbuf.as_mut_slice::<f32>().expect("v mut");
+            for h in 0..n_kv_heads as usize {
+                for t in 0..n_tokens as usize {
+                    for d in 0..head_dim as usize {
+                        let src_off = t * stride_seq + h * head_dim as usize + d;
+                        let dst_off = h * cap * head_dim as usize
+                            + t * head_dim as usize + d;
+                        dst_k[dst_off] = k_seq_major_cpu[src_off];
+                        dst_v[dst_off] = v_seq_major_cpu[src_off];
+                    }
+                }
+            }
+        }
+
+        // Encode K, V into slot.tq via the seq-batch encoder.
+        let mut seq_k = device
+            .alloc_buffer(
+                kv_total_elems * 4, DType::F32,
+                vec![n_tokens as usize, n_kv_heads as usize, head_dim as usize],
+            )
+            .expect("alloc seq_k");
+        let mut seq_v = device
+            .alloc_buffer(
+                kv_total_elems * 4, DType::F32,
+                vec![n_tokens as usize, n_kv_heads as usize, head_dim as usize],
+            )
+            .expect("alloc seq_v");
+        seq_k.as_mut_slice::<f32>().unwrap().copy_from_slice(&k_seq_major_cpu);
+        seq_v.as_mut_slice::<f32>().unwrap().copy_from_slice(&v_seq_major_cpu);
+
+        let mut registry = mlx_native::KernelRegistry::new();
+        // The flash-attn-prefill kernel entry points are registered
+        // separately from the default registry — match production
+        // (forward_gpu.rs:1874).
+        mlx_native::ops::flash_attn_prefill::register(&mut registry);
+        {
+            let slot = &mut cache.full_attn[0];
+            let mut enc = device.command_encoder().expect("encoder");
+            slot.encode_seq_tokens_to_tq(
+                &seq_k, true, n_tokens, n_kv_heads, head_dim,
+                cache_capacity, 0, 0, false, 1.0, 8,
+                &mut enc, &mut registry, &device,
+            )
+            .expect("encode K seq");
+            slot.encode_seq_tokens_to_tq(
+                &seq_v, false, n_tokens, n_kv_heads, head_dim,
+                cache_capacity, 0, 0, false, 1.0, 8,
+                &mut enc, &mut registry, &device,
+            )
+            .expect("encode V seq");
+            enc.commit_and_wait().expect("encode commit");
+        }
+
+        // Synthesize Q chunk.
+        let q_total_elems = (chunk2_seq_len as usize) * (n_heads as usize) * (head_dim as usize);
+        let mut q_cpu = vec![0f32; q_total_elems];
+        for t in 0..chunk2_seq_len as usize {
+            for h in 0..n_heads as usize {
+                for d in 0..head_dim as usize {
+                    let off = t * (n_heads as usize) * (head_dim as usize)
+                        + h * head_dim as usize + d;
+                    q_cpu[off] = ((t * 19 + h * 11 + d * 3) as f32 / 173.0).sin() * 0.3;
+                }
+            }
+        }
+        let mut q_gpu = device
+            .alloc_buffer(
+                q_total_elems * 4, DType::F32,
+                vec![chunk2_seq_len as usize, n_heads as usize, head_dim as usize],
+            )
+            .expect("alloc q");
+        q_gpu.as_mut_slice::<f32>().unwrap().copy_from_slice(&q_cpu);
+
+        // Path A (REFERENCE).
+        let slot_ref = &cache.full_attn[0];
+        let kbuf_ref = slot_ref.k.as_ref().expect("ref k");
+        let vbuf_ref = slot_ref.v.as_ref().expect("ref v");
+        let out_a = apply_flash_attn_prefill_seq_major_resume(
+            &device, &mut registry,
+            &q_gpu, kbuf_ref, vbuf_ref,
+            chunk2_seq_len, cur_len, n_tokens, cache_capacity,
+            n_heads, n_kv_heads, head_dim,
+        )
+        .expect("F32 prefill resume");
+
+        // Path B (UNDER TEST).
+        let out_b = apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
+            &device, &mut registry,
+            slot_ref, &q_gpu,
+            chunk2_seq_len, cur_len, n_tokens, cache_capacity,
+            n_heads, n_kv_heads, head_dim,
+        )
+        .expect("TQ-cache prefill resume");
+
+        // NRMSE.
+        let a = out_a.as_slice::<f32>().expect("out_a slice");
+        let b = out_b.as_slice::<f32>().expect("out_b slice");
+        assert_eq!(a.len(), b.len(), "out_a / out_b element count mismatch");
+        let mut sum_sq_diff = 0.0f64;
+        let mut sum_sq_ref = 0.0f64;
+        for (av, bv) in a.iter().zip(b.iter()) {
+            let diff = (*av - *bv) as f64;
+            sum_sq_diff += diff * diff;
+            sum_sq_ref += (*av as f64) * (*av as f64);
+        }
+        let nrmse_value = (sum_sq_diff / sum_sq_ref.max(1e-30)).sqrt() as f32;
+        assert!(
+            nrmse_value < 0.15,
+            "TQ-cache prefill resume NRMSE {nrmse_value:.6} >= 0.15 \
+             (ADR-007 §F-0.3 threshold)"
+        );
+        eprintln!(
+            "[iter-33 prefill resume NRMSE F32 vs TQ-cache] {nrmse_value:.6} \
+             (cur_len={cur_len}, kv_seq={n_tokens}, qL={chunk2_seq_len})"
+        );
+    }
+
+    /// ADR-027 Phase B iter-33 — defensive: TQ-cache helper errors loud
+    /// when caller passes a slot constructed without TQ buffers.
+    #[test]
+    fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache_errors_when_slot_lacks_tq() {
+        use super::super::gpu_full_attn::apply_flash_attn_prefill_seq_major_resume_via_tq_cache;
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, false)
+            .expect("kv tq-off");
+        let slot = &cache.full_attn[0];
+        assert!(slot.tq.is_none(), "test precondition: slot.tq must be None");
+
+        let q_gpu = device
+            .alloc_buffer(
+                8 * cfg.num_attention_heads as usize * cfg.head_dim as usize * 4,
+                DType::F32,
+                vec![8, cfg.num_attention_heads as usize, cfg.head_dim as usize],
+            )
+            .expect("alloc q");
+
+        let mut registry = mlx_native::KernelRegistry::new();
+        let res = apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
+            &device, &mut registry, slot, &q_gpu,
+            8, 16, 24, 64,
+            cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
+        );
+        assert!(res.is_err(), "must error when slot.tq is None");
+        let msg = format!("{:?}", res.err().unwrap());
+        assert!(
+            msg.contains("slot.tq is None"),
+            "error msg must mention slot.tq is None, got: {msg}"
+        );
+    }
+
     /// ADR-027 Phase B iter-31 — defensive: helper errors loud when
     /// caller passes a slot constructed without TQ buffers (mantra:
     /// no fallback, no stub — Result::Err with clear context).
