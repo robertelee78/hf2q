@@ -2305,6 +2305,83 @@ Per operator emphasis "no shortcuts, do it right, beat peers" —
 **Path A Phase 2 GPU implementation is the natural next investment**.
 Closes gemma4 gap AND improves qwen3.6 simultaneously.
 
+### iter-130: 🔴 CRITICAL — Path D never engages in qwen3.6 production decode
+
+iter-128 found Path D's predicted 18% production speedup didn't
+materialize (Δ +0.2%). iter-130 traced the cause:
+
+#### Direct trace via `HF2Q_TQ_NSG_TRACE=1` instrumentation
+
+Added eprintln to `dispatch_decode_sdpa_with_optional_tq`
+(`gpu_full_attn.rs:186`). At runtime during qwen3.6 decode (`tq_kv =
+active` per load banner):
+
+```
+[NSG-TRACE] slot.tq.is_some()=false head_dim=256 kv_seq_len=8
+[NSG-TRACE] slot.tq.is_some()=false head_dim=256 kv_seq_len=8
+... (all calls show slot.tq = None)
+```
+
+**slot.tq is None despite tq_kv_active=true in the load banner.** The
+`if slot.tq.is_some()` gate at `gpu_full_attn.rs:202` is never taken;
+production decode falls through to the F32 `flash_attn_vec` path
+(non-TQ).
+
+#### Implications
+
+1. **Path D landing is correct** — kernel bench shows 1.84× FA at
+   NSG=4 (verified by 3/3 NSG-equivalence tests + 12/12 byte-identity).
+2. **Path D never engages in qwen3.6 production decode** — slot.tq
+   stays None across all decode steps tested.
+3. The current 110 t/s qwen3.6 decode IS the F32 `flash_attn_vec` path
+   speed. NOT a TQ-HB measurement.
+4. iter-128's "qwen3.6 1.14× peer" still holds — but it's the F32 path
+   beating peer, not TQ-HB.
+
+#### Why slot.tq is None at decode (root cause hypothesis)
+
+`gpu_full_attn.rs:2308` references "iter-34 alloc/SDPA gating
+invariant" — TQ alloc may be deferred/skipped under conditions not
+fully understood. Possibilities:
+- TQ KV write (`write_kv_with_optional_tq_encode` at line 2240)
+  conditionally allocates slot.tq only on certain code paths.
+- Decode-fast-path may skip TQ altogether when slot.k is also present
+  (mixed-mode), per the iter-15 "fast path" comment block.
+- Somewhere between iter-15 and iter-34, an alloc gate broke.
+
+This is NOT a Path D regression — it's a pre-existing gating issue
+revealed by Path D investigation. Path D would have engaged correctly
+IF slot.tq were Some.
+
+#### Production speed implication
+
+ADR-027 Phase B (3.94× KV memory savings) is documented as LANDED but
+the SDPA path doesn't actually use TQ-HB at decode. So we're **paying
+the TQ-encode cost (write_kv_with_optional_tq_encode at line 2240)
+without getting the SDPA bandwidth savings**.
+
+If we fixed slot.tq alloc, Path D's 1.84× FA at kL=4096 would actually
+materialize → predicted ~18% qwen3.6 long-context decode speedup.
+
+#### Action items for next iter (operator priority needed)
+
+1. **Trace slot.tq alloc lifecycle** to find the gate that fails to set
+   slot.tq=Some. Likely in
+   `kv_cache.rs::write_kv_with_optional_tq_encode` or surrounding alloc
+   path.
+2. **Fix slot.tq alloc** so production decode actually runs through
+   the TQ-HB path.
+3. **Re-bench Path D** — should now show the predicted 18% gain.
+4. **Standing rule**: any production claim about TQ-HB performance MUST
+   be validated by trace-confirmed `slot.tq.is_some()=true` at the
+   actual SDPA call site, not just by "tq_kv = active" in the load
+   banner.
+
+This finding INVALIDATES iter-128's claim that Path D's kernel-bench
+1.84× would translate to production speedup at qwen long-context.
+The 1.84× kernel speedup is real but invisible to production until the
+slot.tq alloc gating is fixed.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
