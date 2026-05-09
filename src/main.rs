@@ -490,6 +490,7 @@ fn cmd_dwq_train_full_model(args: cli::DwqTrainArgs) -> Result<(), AppError> {
         top_k_teacher: args.full_model_top_k,
         seed: args.seed,
         rss_cap_bytes,
+        gradient_checkpoint: args.gradient_checkpoint,
     };
 
     println!(

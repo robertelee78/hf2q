@@ -307,6 +307,15 @@ pub struct DwqTrainArgs {
     /// mlx-lm's `compute_dwq_targets` default.
     #[arg(long, default_value_t = 1024)]
     pub full_model_top_k: usize,
+
+    /// Enable gradient checkpointing for full-model DWQ training.
+    ///
+    /// When set, each decoder layer's intermediate activations are freed
+    /// immediately after the forward pass and recomputed on demand during
+    /// backward.  Reduces peak GPU RSS at the cost of one extra forward
+    /// pass per layer per Adam step.  Default false.
+    #[arg(long, default_value_t = false)]
+    pub gradient_checkpoint: bool,
 }
 
 /// `hf2q cache` subcommands. ADR-005 Phase 3 iter-205 (AC line 5351).

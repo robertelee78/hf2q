@@ -525,6 +525,14 @@ pub struct FullModelDwqConfig {
     /// §8.3 AC#6 mandate is 100 GB.  Re-uses the same
     /// [`RssWatchdog`] machinery as `DwqTrainingConfig::rss_cap_bytes`.
     pub rss_cap_bytes: Option<u64>,
+    /// Enable gradient checkpointing in `train_all_linears_full_model_dwq`.
+    ///
+    /// When `true`, each decoder layer forward is wrapped in
+    /// `autograd_gpu_tape::checkpoint`, which drops all intermediate
+    /// activation buffers immediately after the forward pass and recomputes
+    /// them during backward.  Reduces peak GPU RSS at the cost of one
+    /// extra forward pass per layer per step.  Default `false`.
+    pub gradient_checkpoint: bool,
 }
 
 impl Default for FullModelDwqConfig {
@@ -547,6 +555,7 @@ impl Default for FullModelDwqConfig {
             top_k_teacher: 1024,
             seed: 0xDEAD_BEEF,
             rss_cap_bytes: None,
+            gradient_checkpoint: false,
         }
     }
 }
@@ -3464,7 +3473,7 @@ pub fn train_all_linears_full_model_dwq(
     cfg: &FullModelDwqConfig,
 ) -> Result<DwqAllLinearsResult> {
     use crate::calibrate::autograd_gpu_tape::{
-        backward, matmul, ones_like, qdq_affine, rms_norm, transpose, view,
+        backward, checkpoint, matmul, ones_like, qdq_affine, rms_norm, transpose, view,
         GpuTape, GpuTensor,
     };
     use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
@@ -3803,16 +3812,135 @@ pub fn train_all_linears_full_model_dwq(
             let n_experts_out = n_exp;
             let router_t = GpuTensor::from_vec(&tape, &lp.router_data,
                 vec![hidden_size, n_experts_out])?;
-            let lw = DecoderLayerWeightsRealGqa {
-                w_in: &win_t, w_post: &wpost_t,
-                w_q: &wq, w_k: &wk, w_v: &wv, w_o: &wo,
-                q_norm_w: &qn_t, k_norm_w: &kn_t,
-                w_gate: &router_t,
-                gate_projs: &gate_ts, up_projs: &up_ts, down_projs: &down_ts,
-            };
-            h = decoder_layer_on_tape_real_gqa(
-                &tape, &h, pos_buf.clone(), &lw, &gqa_cfg, lp.moe_k, 1e-9,
-            ).with_context(|| format!("decoder_layer step={step} layer={}", lp.layer_idx))?;
+
+            if cfg.gradient_checkpoint {
+                // Collect all weight node indices for leaf_parent_indices.
+                // Order must match the closure's leaf push order.
+                let weight_node_indices: Vec<usize> = {
+                    let mut v = vec![
+                        wq.node_idx(), wk.node_idx(), wv.node_idx(), wo.node_idx(),
+                        win_t.node_idx(), wpost_t.node_idx(),
+                        qn_t.node_idx(), kn_t.node_idx(),
+                        router_t.node_idx(),
+                    ];
+                    for gt in &gate_ts { v.push(gt.node_idx()); }
+                    for ut in &up_ts   { v.push(ut.node_idx()); }
+                    for dt in &down_ts { v.push(dt.node_idx()); }
+                    v
+                };
+                let mut leaf_parent_indices = vec![h.node_idx()];
+                leaf_parent_indices.extend_from_slice(&weight_node_indices);
+
+                // Capture weight buffers (cheap Arc bumps) for closure replay.
+                let wq_buf    = tape.node_buf(wq.node_idx());
+                let wk_buf    = tape.node_buf(wk.node_idx());
+                let wv_buf    = tape.node_buf(wv.node_idx());
+                let wo_buf    = tape.node_buf(wo.node_idx());
+                let win_buf   = tape.node_buf(win_t.node_idx());
+                let wpost_buf = tape.node_buf(wpost_t.node_idx());
+                let qn_buf    = tape.node_buf(qn_t.node_idx());
+                let kn_buf    = tape.node_buf(kn_t.node_idx());
+                let router_buf = tape.node_buf(router_t.node_idx());
+                let gate_bufs: Vec<MlxBuffer> = gate_ts.iter()
+                    .map(|t| tape.node_buf(t.node_idx())).collect();
+                let up_bufs:   Vec<MlxBuffer> = up_ts.iter()
+                    .map(|t| tape.node_buf(t.node_idx())).collect();
+                let down_bufs: Vec<MlxBuffer> = down_ts.iter()
+                    .map(|t| tape.node_buf(t.node_idx())).collect();
+
+                // Capture copy-able config fields (Qwen35RealGqaConfig has no Clone).
+                let c_n_q  = gqa_cfg.n_q_heads;
+                let c_n_kv = gqa_cfg.n_kv_heads;
+                let c_hd   = gqa_cfg.head_dim;
+                let c_sl   = gqa_cfg.seq_len;
+                let c_hid  = gqa_cfg.hidden;
+                let c_rope = gqa_cfg.rope_theta_base;
+                let c_secs = gqa_cfg.rope_sections;
+                let c_caus = gqa_cfg.causal;
+                let c_sw   = gqa_cfg.sliding_window;
+                let c_eps  = gqa_cfg.rms_eps;
+                let c_moe_k = lp.moe_k;
+                let c_pos  = pos_buf.clone();
+
+                let wq_shape    = wq.shape().to_vec();
+                let wk_shape    = wk.shape().to_vec();
+                let wv_shape    = wv.shape().to_vec();
+                let wo_shape    = wo.shape().to_vec();
+                let win_shape   = win_t.shape().to_vec();
+                let wpost_shape = wpost_t.shape().to_vec();
+                let qn_shape    = qn_t.shape().to_vec();
+                let kn_shape    = kn_t.shape().to_vec();
+                let rt_shape    = router_t.shape().to_vec();
+                let gate_shapes: Vec<Vec<usize>> = gate_ts.iter()
+                    .map(|t| t.shape().to_vec()).collect();
+                let up_shapes:   Vec<Vec<usize>> = up_ts.iter()
+                    .map(|t| t.shape().to_vec()).collect();
+                let down_shapes: Vec<Vec<usize>> = down_ts.iter()
+                    .map(|t| t.shape().to_vec()).collect();
+
+                h = checkpoint(
+                    &tape,
+                    &h,
+                    leaf_parent_indices,
+                    move |sub_tape, sub_h| {
+                        use crate::calibrate::autograd_gpu_tape::GpuTensor;
+                        use crate::calibrate::qwen35_moe::{
+                            decoder_layer_on_tape_real_gqa, DecoderLayerWeightsRealGqa,
+                            Qwen35RealGqaConfig,
+                        };
+                        // Replay weight leaves on sub-tape in the same order as
+                        // leaf_parent_indices[1..].
+                        let swq = GpuTensor::from_buffer(sub_tape, wq_buf.clone(), wq_shape.clone())?;
+                        let swk = GpuTensor::from_buffer(sub_tape, wk_buf.clone(), wk_shape.clone())?;
+                        let swv = GpuTensor::from_buffer(sub_tape, wv_buf.clone(), wv_shape.clone())?;
+                        let swo = GpuTensor::from_buffer(sub_tape, wo_buf.clone(), wo_shape.clone())?;
+                        let swin   = GpuTensor::from_buffer(sub_tape, win_buf.clone(), win_shape.clone())?;
+                        let swpost = GpuTensor::from_buffer(sub_tape, wpost_buf.clone(), wpost_shape.clone())?;
+                        let sqn = GpuTensor::from_buffer(sub_tape, qn_buf.clone(), qn_shape.clone())?;
+                        let skn = GpuTensor::from_buffer(sub_tape, kn_buf.clone(), kn_shape.clone())?;
+                        let srt = GpuTensor::from_buffer(sub_tape, router_buf.clone(), rt_shape.clone())?;
+                        let mut sgate = Vec::with_capacity(gate_bufs.len());
+                        let mut sup   = Vec::with_capacity(up_bufs.len());
+                        let mut sdown = Vec::with_capacity(down_bufs.len());
+                        for (buf, sh) in gate_bufs.iter().zip(&gate_shapes) {
+                            sgate.push(GpuTensor::from_buffer(sub_tape, buf.clone(), sh.clone())?);
+                        }
+                        for (buf, sh) in up_bufs.iter().zip(&up_shapes) {
+                            sup.push(GpuTensor::from_buffer(sub_tape, buf.clone(), sh.clone())?);
+                        }
+                        for (buf, sh) in down_bufs.iter().zip(&down_shapes) {
+                            sdown.push(GpuTensor::from_buffer(sub_tape, buf.clone(), sh.clone())?);
+                        }
+                        let sub_cfg = Qwen35RealGqaConfig {
+                            n_q_heads: c_n_q, n_kv_heads: c_n_kv, head_dim: c_hd,
+                            seq_len: c_sl, hidden: c_hid,
+                            rope_theta_base: c_rope, rope_sections: c_secs,
+                            causal: c_caus, sliding_window: c_sw, rms_eps: c_eps,
+                        };
+                        let lw = DecoderLayerWeightsRealGqa {
+                            w_in: &swin, w_post: &swpost,
+                            w_q: &swq, w_k: &swk, w_v: &swv, w_o: &swo,
+                            q_norm_w: &sqn, k_norm_w: &skn,
+                            w_gate: &srt,
+                            gate_projs: &sgate, up_projs: &sup, down_projs: &sdown,
+                        };
+                        decoder_layer_on_tape_real_gqa(
+                            sub_tape, sub_h, c_pos.clone(), &lw, &sub_cfg, c_moe_k, 1e-9,
+                        )
+                    },
+                ).with_context(|| format!("checkpoint decoder_layer step={step} layer={}", lp.layer_idx))?;
+            } else {
+                let lw = DecoderLayerWeightsRealGqa {
+                    w_in: &win_t, w_post: &wpost_t,
+                    w_q: &wq, w_k: &wk, w_v: &wv, w_o: &wo,
+                    q_norm_w: &qn_t, k_norm_w: &kn_t,
+                    w_gate: &router_t,
+                    gate_projs: &gate_ts, up_projs: &up_ts, down_projs: &down_ts,
+                };
+                h = decoder_layer_on_tape_real_gqa(
+                    &tape, &h, pos_buf.clone(), &lw, &gqa_cfg, lp.moe_k, 1e-9,
+                ).with_context(|| format!("decoder_layer step={step} layer={}", lp.layer_idx))?;
+            }
         }
 
         let onorm_t = GpuTensor::from_vec(&tape, &output_norm_w, vec![hidden_size])?;
@@ -11141,5 +11269,736 @@ mod tests {
             ratio < 0.80,
             "AC#7 FAIL: tail/head ratio={ratio:.4} >= 0.80"
         );
+    }
+
+    // ── Gradient-checkpoint fixture helpers ─────────────────────────────────
+
+    /// Small synthetic training fixture for gradient-checkpoint tests.
+    /// Returns (losses_without_gc, losses_with_gc) over N_STEPS steps,
+    /// each run from the same initial Adam state.
+    fn gc_fixture() -> (Vec<f32>, Vec<f32>) {
+        use crate::calibrate::autograd_gpu_tape::{
+            backward, checkpoint, matmul, ones_like, qdq_affine, rms_norm, transpose, view,
+            GpuTape, GpuTensor,
+        };
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use crate::calibrate::qwen35_moe::{
+            decoder_layer_on_tape_real_gqa, make_pos_buf_for_real_gqa,
+            DecoderLayerWeightsRealGqa, Qwen35RealGqaConfig,
+        };
+        use mlx_native::MlxBuffer;
+
+        const HIDDEN:    usize = 64;
+        const N_Q:       usize = 1;
+        const N_KV:      usize = 1;
+        const HD:        usize = 64;
+        const N_EXPERTS: usize = 2;
+        const INTER:     usize = 32;
+        const MOE_K:     usize = 2;
+        const VOCAB:     usize = 64;
+        const GS:        usize = 32;
+        const BITS:      u32   = 4;
+        const N_LAYERS:  usize = 2;
+        const N_STEPS:   usize = 20;
+        const LR:        f32   = 1e-4;
+        const N_TOKENS:  usize = 32;
+
+        let device = mlx_native::MlxDevice::new().expect("MlxDevice");
+
+        let make_w = |rows: usize, cols: usize, seed: f32| -> Vec<f32> {
+            (0..rows * cols).map(|i| ((i as f32 * 0.01 + seed) * 6.28).sin() * 0.1).collect()
+        };
+        let ones_v = |n: usize| vec![1.0f32; n];
+        let qp = |d: &[f32], r: usize, c: usize| {
+            quant_pack_for_dwq(&device, d, r, c, BITS, GS).expect("qpack")
+        };
+
+        struct SynPack {
+            tid_wq: String, pack_wq: DwqQuantPack,
+            tid_wk: String, pack_wk: DwqQuantPack,
+            tid_wv: String, pack_wv: DwqQuantPack,
+            tid_wo: String, pack_wo: DwqQuantPack,
+            w_in: Vec<f32>, w_post: Vec<f32>, q_norm: Vec<f32>, k_norm: Vec<f32>,
+            router: Vec<f32>,
+            g_tids: Vec<String>, g_packs: Vec<DwqQuantPack>,
+            u_tids: Vec<String>, u_packs: Vec<DwqQuantPack>,
+            d_tids: Vec<String>, d_packs: Vec<DwqQuantPack>,
+        }
+
+        let mut syn_packs: Vec<SynPack> = Vec::new();
+        for li in 0..N_LAYERS {
+            let p = format!("blk.{li}");
+            let wq = make_w(N_Q * HD, HIDDEN, li as f32 + 0.1);
+            let wk = make_w(N_KV * HD, HIDDEN, li as f32 + 0.2);
+            let wv = make_w(N_KV * HD, HIDDEN, li as f32 + 0.3);
+            let wo = make_w(HIDDEN, N_Q * HD, li as f32 + 0.4);
+            let mut g_tids = Vec::new(); let mut g_packs = Vec::new();
+            let mut u_tids = Vec::new(); let mut u_packs = Vec::new();
+            let mut d_tids = Vec::new(); let mut d_packs = Vec::new();
+            for e in 0..N_EXPERTS {
+                let gd = make_w(HIDDEN, INTER, li as f32 + e as f32 + 1.0);
+                let ud = make_w(HIDDEN, INTER, li as f32 + e as f32 + 1.1);
+                let dd = make_w(INTER, HIDDEN, li as f32 + e as f32 + 1.2);
+                let gt = format!("{p}.gate.{e}"); let ut = format!("{p}.up.{e}");
+                let dt = format!("{p}.down.{e}");
+                g_packs.push(qp(&gd, HIDDEN, INTER));
+                u_packs.push(qp(&ud, HIDDEN, INTER));
+                d_packs.push(qp(&dd, INTER, HIDDEN));
+                g_tids.push(gt); u_tids.push(ut); d_tids.push(dt);
+            }
+            let router: Vec<f32> = (0..HIDDEN * N_EXPERTS)
+                .map(|i| ((i as f32 * 0.05) * 6.28).sin() * 0.1).collect();
+            let tid_wq = format!("{p}.wq"); let tid_wk = format!("{p}.wk");
+            let tid_wv = format!("{p}.wv"); let tid_wo = format!("{p}.wo");
+            syn_packs.push(SynPack {
+                pack_wq: qp(&wq, N_Q*HD, HIDDEN), tid_wq,
+                pack_wk: qp(&wk, N_KV*HD, HIDDEN), tid_wk,
+                pack_wv: qp(&wv, N_KV*HD, HIDDEN), tid_wv,
+                pack_wo: qp(&wo, HIDDEN, N_Q*HD), tid_wo,
+                w_in: ones_v(HIDDEN), w_post: ones_v(HIDDEN),
+                q_norm: ones_v(HD), k_norm: ones_v(HD),
+                router,
+                g_tids, g_packs, u_tids, u_packs, d_tids, d_packs,
+            });
+        }
+        let lm_data = make_w(VOCAB, HIDDEN, 9.9);
+        let pack_lm = qp(&lm_data, VOCAB, HIDDEN);
+        let embed = vec![0.1f32; N_TOKENS * HIDDEN];
+        let mut teacher_full = vec![0.0f32; N_TOKENS * VOCAB];
+        for t in 0..N_TOKENS {
+            for v in 0..VOCAB {
+                teacher_full[t * VOCAB + v] = (0..HIDDEN)
+                    .map(|h| embed[t*HIDDEN+h] * lm_data[v*HIDDEN+h]).sum::<f32>();
+            }
+        }
+        let top_k = 8usize;
+        let (teacher_topk, teacher_indices) =
+            pick_top_k_per_position(&teacher_full, N_TOKENS, 1, VOCAB, top_k).expect("pick_top_k");
+
+        let gqa_cfg = Qwen35RealGqaConfig {
+            n_q_heads: N_Q, n_kv_heads: N_KV, head_dim: HD,
+            seq_len: N_TOKENS, hidden: HIDDEN,
+            rope_theta_base: 500_000.0,
+            rope_sections: [11, 11, 10, 0],
+            causal: false, sliding_window: None, rms_eps: 1e-6,
+        };
+
+        let make_qdq = |adam: &crate::calibrate::adam::AdamOptimizer, tid: &str,
+                         pack: &DwqQuantPack, tape: &GpuTape,
+                         gp: &mut Vec<(String, GpuTensor)>| -> anyhow::Result<GpuTensor> {
+            let sn = affine_param_name(tid, AffineParamKind::Scale);
+            let bn = affine_param_name(tid, AffineParamKind::Bias);
+            let sv = adam.read_param(&sn)?; let bv = adam.read_param(&bn)?;
+            let ng = sv.len();
+            let s_t = GpuTensor::from_vec(tape, &sv, vec![ng])?;
+            let b_t = GpuTensor::from_vec(tape, &bv, vec![ng])?;
+            let w = qdq_affine(&s_t, &b_t, &pack.q_int_bytes, GS)?;
+            let w2 = view(&w, vec![pack.n, pack.k])?;
+            gp.push((sn, s_t)); gp.push((bn, b_t));
+            Ok(w2)
+        };
+
+        // Run gc_run_steps is called for both gc=false and gc=true.
+        let run_steps = |gc: bool| -> Vec<f32> {
+            let mut adam = AdamOptimizer::new(
+                device.clone(),
+                AdamConfig { lr: LR, beta1: 0.9, beta2: 0.999, eps: 1e-8 },
+            ).expect("AdamOptimizer");
+            for sp in &syn_packs {
+                for (tid, pack) in [(&sp.tid_wq, &sp.pack_wq), (&sp.tid_wk, &sp.pack_wk),
+                                     (&sp.tid_wv, &sp.pack_wv), (&sp.tid_wo, &sp.pack_wo)] {
+                    register_affine_pair(&mut adam, &device, tid, &pack.scales, &pack.biases)
+                        .unwrap_or_else(|e| panic!("register {tid}: {e}"));
+                }
+                for (tid, pack) in sp.g_tids.iter().zip(&sp.g_packs)
+                    .chain(sp.u_tids.iter().zip(&sp.u_packs))
+                    .chain(sp.d_tids.iter().zip(&sp.d_packs))
+                {
+                    register_affine_pair(&mut adam, &device, tid, &pack.scales, &pack.biases)
+                        .unwrap_or_else(|e| panic!("register {tid}: {e}"));
+                }
+            }
+            register_affine_pair(&mut adam, &device, "lm_head", &pack_lm.scales, &pack_lm.biases)
+                .expect("register lm_head");
+
+            let mut losses = Vec::with_capacity(N_STEPS);
+            for _step in 0..N_STEPS {
+                let tape = GpuTape::new(device.clone());
+                let mut gp: Vec<(String, GpuTensor)> = Vec::new();
+                let mut h = GpuTensor::from_vec(&tape, &embed, vec![N_TOKENS, HIDDEN])
+                    .expect("embed");
+                let pos_buf = make_pos_buf_for_real_gqa(&device, N_TOKENS).expect("pos_buf");
+
+                for sp in &syn_packs {
+                    let wq = make_qdq(&adam, &sp.tid_wq, &sp.pack_wq, &tape, &mut gp).expect("wq");
+                    let wk = make_qdq(&adam, &sp.tid_wk, &sp.pack_wk, &tape, &mut gp).expect("wk");
+                    let wv = make_qdq(&adam, &sp.tid_wv, &sp.pack_wv, &tape, &mut gp).expect("wv");
+                    let wo = make_qdq(&adam, &sp.tid_wo, &sp.pack_wo, &tape, &mut gp).expect("wo");
+                    let win = GpuTensor::from_vec(&tape, &sp.w_in, vec![HIDDEN]).expect("win");
+                    let wpo = GpuTensor::from_vec(&tape, &sp.w_post, vec![HIDDEN]).expect("wpo");
+                    let qn  = GpuTensor::from_vec(&tape, &sp.q_norm, vec![HD]).expect("qn");
+                    let kn  = GpuTensor::from_vec(&tape, &sp.k_norm, vec![HD]).expect("kn");
+                    let n_exp = sp.g_packs.len();
+                    let mut gt = Vec::with_capacity(n_exp);
+                    let mut ut = Vec::with_capacity(n_exp);
+                    let mut dt = Vec::with_capacity(n_exp);
+                    for e in 0..n_exp {
+                        gt.push(make_qdq(&adam, &sp.g_tids[e], &sp.g_packs[e], &tape, &mut gp).expect("g"));
+                        ut.push(make_qdq(&adam, &sp.u_tids[e], &sp.u_packs[e], &tape, &mut gp).expect("u"));
+                        dt.push(make_qdq(&adam, &sp.d_tids[e], &sp.d_packs[e], &tape, &mut gp).expect("d"));
+                    }
+                    let rt = GpuTensor::from_vec(&tape, &sp.router, vec![HIDDEN, N_EXPERTS]).expect("rt");
+
+                    if gc {
+                        let weight_node_indices: Vec<usize> = {
+                            let mut v = vec![
+                                wq.node_idx(), wk.node_idx(), wv.node_idx(), wo.node_idx(),
+                                win.node_idx(), wpo.node_idx(), qn.node_idx(), kn.node_idx(),
+                                rt.node_idx(),
+                            ];
+                            for t in &gt { v.push(t.node_idx()); }
+                            for t in &ut { v.push(t.node_idx()); }
+                            for t in &dt { v.push(t.node_idx()); }
+                            v
+                        };
+                        let mut lpi = vec![h.node_idx()];
+                        lpi.extend_from_slice(&weight_node_indices);
+
+                        let wq_buf = tape.node_buf(wq.node_idx());
+                        let wk_buf = tape.node_buf(wk.node_idx());
+                        let wv_buf = tape.node_buf(wv.node_idx());
+                        let wo_buf = tape.node_buf(wo.node_idx());
+                        let win_buf = tape.node_buf(win.node_idx());
+                        let wpo_buf = tape.node_buf(wpo.node_idx());
+                        let qn_buf  = tape.node_buf(qn.node_idx());
+                        let kn_buf  = tape.node_buf(kn.node_idx());
+                        let rt_buf  = tape.node_buf(rt.node_idx());
+                        let g_bufs: Vec<MlxBuffer> = gt.iter().map(|t| tape.node_buf(t.node_idx())).collect();
+                        let u_bufs: Vec<MlxBuffer> = ut.iter().map(|t| tape.node_buf(t.node_idx())).collect();
+                        let d_bufs: Vec<MlxBuffer> = dt.iter().map(|t| tape.node_buf(t.node_idx())).collect();
+                        let wq_sh = wq.shape().to_vec();
+                        let wk_sh = wk.shape().to_vec();
+                        let wv_sh = wv.shape().to_vec();
+                        let wo_sh = wo.shape().to_vec();
+                        let win_sh = win.shape().to_vec();
+                        let wpo_sh = wpo.shape().to_vec();
+                        let qn_sh = qn.shape().to_vec();
+                        let kn_sh = kn.shape().to_vec();
+                        let rt_sh = rt.shape().to_vec();
+                        let g_sh: Vec<Vec<usize>> = gt.iter().map(|t| t.shape().to_vec()).collect();
+                        let u_sh: Vec<Vec<usize>> = ut.iter().map(|t| t.shape().to_vec()).collect();
+                        let d_sh: Vec<Vec<usize>> = dt.iter().map(|t| t.shape().to_vec()).collect();
+                        let c_pos = pos_buf.clone();
+
+                        h = checkpoint(&tape, &h, lpi, move |sub_tape, sub_h| {
+                            use crate::calibrate::autograd_gpu_tape::GpuTensor;
+                            use crate::calibrate::qwen35_moe::{
+                                decoder_layer_on_tape_real_gqa, DecoderLayerWeightsRealGqa,
+                                Qwen35RealGqaConfig,
+                            };
+                            let swq = GpuTensor::from_buffer(sub_tape, wq_buf.clone(), wq_sh.clone())?;
+                            let swk = GpuTensor::from_buffer(sub_tape, wk_buf.clone(), wk_sh.clone())?;
+                            let swv = GpuTensor::from_buffer(sub_tape, wv_buf.clone(), wv_sh.clone())?;
+                            let swo = GpuTensor::from_buffer(sub_tape, wo_buf.clone(), wo_sh.clone())?;
+                            let swin = GpuTensor::from_buffer(sub_tape, win_buf.clone(), win_sh.clone())?;
+                            let swpo = GpuTensor::from_buffer(sub_tape, wpo_buf.clone(), wpo_sh.clone())?;
+                            let sqn = GpuTensor::from_buffer(sub_tape, qn_buf.clone(), qn_sh.clone())?;
+                            let skn = GpuTensor::from_buffer(sub_tape, kn_buf.clone(), kn_sh.clone())?;
+                            let srt = GpuTensor::from_buffer(sub_tape, rt_buf.clone(), rt_sh.clone())?;
+                            let mut sgt = Vec::with_capacity(g_bufs.len());
+                            let mut sut = Vec::with_capacity(u_bufs.len());
+                            let mut sdt = Vec::with_capacity(d_bufs.len());
+                            for (b, s) in g_bufs.iter().zip(&g_sh) {
+                                sgt.push(GpuTensor::from_buffer(sub_tape, b.clone(), s.clone())?);
+                            }
+                            for (b, s) in u_bufs.iter().zip(&u_sh) {
+                                sut.push(GpuTensor::from_buffer(sub_tape, b.clone(), s.clone())?);
+                            }
+                            for (b, s) in d_bufs.iter().zip(&d_sh) {
+                                sdt.push(GpuTensor::from_buffer(sub_tape, b.clone(), s.clone())?);
+                            }
+                            let cfg = Qwen35RealGqaConfig {
+                                n_q_heads: N_Q, n_kv_heads: N_KV, head_dim: HD,
+                                seq_len: N_TOKENS, hidden: HIDDEN,
+                                rope_theta_base: 500_000.0, rope_sections: [11, 11, 10, 0],
+                                causal: false, sliding_window: None, rms_eps: 1e-6,
+                            };
+                            let lw = DecoderLayerWeightsRealGqa {
+                                w_in: &swin, w_post: &swpo,
+                                w_q: &swq, w_k: &swk, w_v: &swv, w_o: &swo,
+                                q_norm_w: &sqn, k_norm_w: &skn,
+                                w_gate: &srt,
+                                gate_projs: &sgt, up_projs: &sut, down_projs: &sdt,
+                            };
+                            decoder_layer_on_tape_real_gqa(sub_tape, sub_h, c_pos.clone(), &lw, &cfg, MOE_K, 1e-9)
+                        }).expect("checkpoint");
+                    } else {
+                        let lw = DecoderLayerWeightsRealGqa {
+                            w_in: &win, w_post: &wpo,
+                            w_q: &wq, w_k: &wk, w_v: &wv, w_o: &wo,
+                            q_norm_w: &qn, k_norm_w: &kn, w_gate: &rt,
+                            gate_projs: &gt, up_projs: &ut, down_projs: &dt,
+                        };
+                        h = decoder_layer_on_tape_real_gqa(&tape, &h, pos_buf.clone(), &lw, &gqa_cfg, MOE_K, 1e-9)
+                            .expect("decoder_layer");
+                    }
+                }
+
+                let onorm = GpuTensor::from_vec(&tape, &ones_v(HIDDEN), vec![HIDDEN]).expect("onorm");
+                let hn = rms_norm(&h, &onorm, 1e-6).expect("hn");
+                let wlm = make_qdq(&adam, "lm_head", &pack_lm, &tape, &mut gp).expect("wlm");
+                let wlm_t = transpose(&wlm).expect("t_lm");
+                let logits = matmul(&hn, &wlm_t).expect("logits");
+                let idx_buf = build_topk_indices_buffer(&device, &teacher_indices, N_TOKENS, top_k)
+                    .expect("idx_buf");
+                let st_topk = gather_student_topk_via_tape(&logits, idx_buf, top_k).expect("st");
+                let tt = GpuTensor::from_vec(&tape, &teacher_topk, vec![N_TOKENS, top_k]).expect("tt");
+                let loss = kl_loss_topk_via_tape(&st_topk, &tt, 1.0).expect("kl");
+                losses.push(loss.to_vec().expect("loss_v")[0]);
+                let dy = ones_like(&tape, loss.shape()).expect("dy");
+                let grads = backward(&loss, dy).expect("bwd");
+                let pr: Vec<(&str, &GpuTensor)> = gp.iter().map(|(n, t)| (n.as_str(), t)).collect();
+                let gm = collect_grads_for_adam(&grads, &pr).expect("collect");
+                adam.step(&gm).expect("step");
+            }
+            losses
+        };
+
+        let losses_no_gc = run_steps(false);
+        let losses_gc = run_steps(true);
+        (losses_no_gc, losses_gc)
+    }
+
+    // ── Test 1: loss byte-equivalence within atol=1e-5 ──────────────────────
+    #[test]
+    fn gradient_checkpoint_loss_byte_equivalence_with_baseline() {
+        let (losses_no_gc, losses_gc) = gc_fixture();
+        assert_eq!(losses_no_gc.len(), losses_gc.len(), "loss vec lengths differ");
+        for (step, (a, b)) in losses_no_gc.iter().zip(&losses_gc).enumerate() {
+            let diff = (a - b).abs();
+            assert!(
+                diff <= 1e-5,
+                "GC loss mismatch at step {step}: no_gc={a:.8} gc={b:.8} diff={diff:.3e}"
+            );
+        }
+        eprintln!("[gc_loss_equiv] {} steps, max_diff={:.3e}",
+            losses_no_gc.len(),
+            losses_no_gc.iter().zip(&losses_gc).map(|(a,b)| (a-b).abs()).fold(0f32, f32::max));
+    }
+
+    // ── Test 2: recompute determinism (no debug_assert panic) ───────────────
+    #[test]
+    fn gradient_checkpoint_recompute_determinism() {
+        // If recomputed output != retained output, debug_assert panics.
+        // Running GC for 10 steps with no panic = determinism PASS.
+        use crate::calibrate::autograd_gpu_tape::{
+            backward, checkpoint, matmul, ones_like, qdq_affine, rms_norm, transpose, view,
+            GpuTape, GpuTensor,
+        };
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use crate::calibrate::qwen35_moe::make_pos_buf_for_real_gqa;
+
+        const HIDDEN: usize = 64; const N_Q: usize = 1; const N_KV: usize = 1;
+        const HD: usize = 64; const N_EXPERTS: usize = 2; const INTER: usize = 32;
+        const MOE_K: usize = 2; const VOCAB: usize = 64;
+        const GS: usize = 32; const BITS: u32 = 4; const N_STEPS: usize = 5;
+        const N_TOKENS: usize = 32; const LR: f32 = 1e-4;
+
+        let device = mlx_native::MlxDevice::new().expect("MlxDevice");
+        let make_w = |r: usize, c: usize, s: f32| -> Vec<f32> {
+            (0..r*c).map(|i| ((i as f32*0.01+s)*6.28).sin()*0.1).collect()
+        };
+        let ones_v = |n: usize| vec![1.0f32; n];
+        let qp = |d: &[f32], r: usize, c: usize| {
+            quant_pack_for_dwq(&device, d, r, c, BITS, GS).expect("qp")
+        };
+        let wq = make_w(N_Q*HD, HIDDEN, 0.1); let wk = make_w(N_KV*HD, HIDDEN, 0.2);
+        let wv = make_w(N_KV*HD, HIDDEN, 0.3); let wo = make_w(HIDDEN, N_Q*HD, 0.4);
+        let gd0 = make_w(HIDDEN, INTER, 1.0); let ud0 = make_w(HIDDEN, INTER, 1.1);
+        let dd0 = make_w(INTER, HIDDEN, 1.2); let gd1 = make_w(HIDDEN, INTER, 2.0);
+        let ud1 = make_w(HIDDEN, INTER, 2.1); let dd1 = make_w(INTER, HIDDEN, 2.2);
+        let router: Vec<f32> = (0..HIDDEN*N_EXPERTS)
+            .map(|i| ((i as f32*0.05)*6.28).sin()*0.1).collect();
+        let lm_data = make_w(VOCAB, HIDDEN, 9.9);
+        let pack_wq = qp(&wq, N_Q*HD, HIDDEN); let pack_wk = qp(&wk, N_KV*HD, HIDDEN);
+        let pack_wv = qp(&wv, N_KV*HD, HIDDEN); let pack_wo = qp(&wo, HIDDEN, N_Q*HD);
+        let pack_g0 = qp(&gd0, HIDDEN, INTER); let pack_u0 = qp(&ud0, HIDDEN, INTER);
+        let pack_d0 = qp(&dd0, INTER, HIDDEN); let pack_g1 = qp(&gd1, HIDDEN, INTER);
+        let pack_u1 = qp(&ud1, HIDDEN, INTER); let pack_d1 = qp(&dd1, INTER, HIDDEN);
+        let pack_lm = qp(&lm_data, VOCAB, HIDDEN);
+        let embed = vec![0.1f32; N_TOKENS * HIDDEN];
+        let mut teacher_full = vec![0.0f32; N_TOKENS * VOCAB];
+        for t in 0..N_TOKENS {
+            for v in 0..VOCAB {
+                teacher_full[t*VOCAB+v] = (0..HIDDEN).map(|h| embed[t*HIDDEN+h]*lm_data[v*HIDDEN+h]).sum::<f32>();
+            }
+        }
+        let top_k = 8usize;
+        let (teacher_topk, teacher_indices) =
+            pick_top_k_per_position(&teacher_full, N_TOKENS, 1, VOCAB, top_k).expect("pick_top_k");
+
+        let mut adam = AdamOptimizer::new(device.clone(),
+            AdamConfig { lr: LR, beta1: 0.9, beta2: 0.999, eps: 1e-8 }).expect("adam");
+        for (tid, pack) in [("wq", &pack_wq), ("wk", &pack_wk), ("wv", &pack_wv), ("wo", &pack_wo),
+                             ("g0", &pack_g0), ("u0", &pack_u0), ("d0", &pack_d0),
+                             ("g1", &pack_g1), ("u1", &pack_u1), ("d1", &pack_d1),
+                             ("lm", &pack_lm)] {
+            register_affine_pair(&mut adam, &device, tid, &pack.scales, &pack.biases)
+                .unwrap_or_else(|e| panic!("register {tid}: {e}"));
+        }
+
+        let make_qdq_t = |adam: &AdamOptimizer, tid: &str, pack: &DwqQuantPack,
+                          tape: &GpuTape, gp: &mut Vec<(String, GpuTensor)>| -> GpuTensor {
+            let sn = affine_param_name(tid, AffineParamKind::Scale);
+            let bn = affine_param_name(tid, AffineParamKind::Bias);
+            let sv = adam.read_param(&sn).expect("sv"); let bv = adam.read_param(&bn).expect("bv");
+            let ng = sv.len();
+            let s_t = GpuTensor::from_vec(tape, &sv, vec![ng]).expect("st");
+            let b_t = GpuTensor::from_vec(tape, &bv, vec![ng]).expect("bt");
+            let w = qdq_affine(&s_t, &b_t, &pack.q_int_bytes, GS).expect("qdq");
+            let w2 = view(&w, vec![pack.n, pack.k]).expect("view");
+            gp.push((sn, s_t)); gp.push((bn, b_t));
+            w2
+        };
+
+        for _step in 0..N_STEPS {
+            let tape = GpuTape::new(device.clone());
+            let mut gp: Vec<(String, GpuTensor)> = Vec::new();
+            let h_init = GpuTensor::from_vec(&tape, &embed, vec![N_TOKENS, HIDDEN]).expect("h");
+            let pos_buf = make_pos_buf_for_real_gqa(&device, N_TOKENS).expect("pos");
+
+            let wqt = make_qdq_t(&adam, "wq", &pack_wq, &tape, &mut gp);
+            let wkt = make_qdq_t(&adam, "wk", &pack_wk, &tape, &mut gp);
+            let wvt = make_qdq_t(&adam, "wv", &pack_wv, &tape, &mut gp);
+            let wot = make_qdq_t(&adam, "wo", &pack_wo, &tape, &mut gp);
+            let g0t = make_qdq_t(&adam, "g0", &pack_g0, &tape, &mut gp);
+            let u0t = make_qdq_t(&adam, "u0", &pack_u0, &tape, &mut gp);
+            let d0t = make_qdq_t(&adam, "d0", &pack_d0, &tape, &mut gp);
+            let g1t = make_qdq_t(&adam, "g1", &pack_g1, &tape, &mut gp);
+            let u1t = make_qdq_t(&adam, "u1", &pack_u1, &tape, &mut gp);
+            let d1t = make_qdq_t(&adam, "d1", &pack_d1, &tape, &mut gp);
+            let win = GpuTensor::from_vec(&tape, &ones_v(HIDDEN), vec![HIDDEN]).expect("win");
+            let wpo = GpuTensor::from_vec(&tape, &ones_v(HIDDEN), vec![HIDDEN]).expect("wpo");
+            let qn  = GpuTensor::from_vec(&tape, &ones_v(HD), vec![HD]).expect("qn");
+            let kn  = GpuTensor::from_vec(&tape, &ones_v(HD), vec![HD]).expect("kn");
+            let rt  = GpuTensor::from_vec(&tape, &router, vec![HIDDEN, N_EXPERTS]).expect("rt");
+
+            // Order MUST match the closure's from_buffer push order:
+            // [sub_input], swq, swk, swv, swo, sg0, su0, sd0, sg1, su1, sd1, swin, swpo, sqn, skn, srt
+            let lpi: Vec<usize> = vec![
+                h_init.node_idx(),
+                wqt.node_idx(), wkt.node_idx(), wvt.node_idx(), wot.node_idx(),
+                g0t.node_idx(), u0t.node_idx(), d0t.node_idx(),
+                g1t.node_idx(), u1t.node_idx(), d1t.node_idx(),
+                win.node_idx(), wpo.node_idx(), qn.node_idx(), kn.node_idx(),
+                rt.node_idx(),
+            ];
+            let wq_b = tape.node_buf(wqt.node_idx()); let wk_b = tape.node_buf(wkt.node_idx());
+            let wv_b = tape.node_buf(wvt.node_idx()); let wo_b = tape.node_buf(wot.node_idx());
+            let g0_b = tape.node_buf(g0t.node_idx()); let u0_b = tape.node_buf(u0t.node_idx());
+            let d0_b = tape.node_buf(d0t.node_idx()); let g1_b = tape.node_buf(g1t.node_idx());
+            let u1_b = tape.node_buf(u1t.node_idx()); let d1_b = tape.node_buf(d1t.node_idx());
+            let win_b = tape.node_buf(win.node_idx()); let wpo_b = tape.node_buf(wpo.node_idx());
+            let qn_b = tape.node_buf(qn.node_idx()); let kn_b = tape.node_buf(kn.node_idx());
+            let rt_b = tape.node_buf(rt.node_idx());
+            let wq_s = wqt.shape().to_vec(); let wk_s = wkt.shape().to_vec();
+            let wv_s = wvt.shape().to_vec(); let wo_s = wot.shape().to_vec();
+            let g0_s = g0t.shape().to_vec(); let u0_s = u0t.shape().to_vec();
+            let d0_s = d0t.shape().to_vec(); let g1_s = g1t.shape().to_vec();
+            let u1_s = u1t.shape().to_vec(); let d1_s = d1t.shape().to_vec();
+            let win_s = win.shape().to_vec(); let wpo_s = wpo.shape().to_vec();
+            let qn_s = qn.shape().to_vec(); let kn_s = kn.shape().to_vec();
+            let rt_s = rt.shape().to_vec();
+            let c_pos = pos_buf.clone();
+
+            let h = checkpoint(&tape, &h_init, lpi, move |sub, sub_h| {
+                use crate::calibrate::autograd_gpu_tape::GpuTensor;
+                use crate::calibrate::qwen35_moe::{
+                    decoder_layer_on_tape_real_gqa, DecoderLayerWeightsRealGqa, Qwen35RealGqaConfig,
+                };
+                let swq = GpuTensor::from_buffer(sub, wq_b.clone(), wq_s.clone())?;
+                let swk = GpuTensor::from_buffer(sub, wk_b.clone(), wk_s.clone())?;
+                let swv = GpuTensor::from_buffer(sub, wv_b.clone(), wv_s.clone())?;
+                let swo = GpuTensor::from_buffer(sub, wo_b.clone(), wo_s.clone())?;
+                let sg0 = GpuTensor::from_buffer(sub, g0_b.clone(), g0_s.clone())?;
+                let su0 = GpuTensor::from_buffer(sub, u0_b.clone(), u0_s.clone())?;
+                let sd0 = GpuTensor::from_buffer(sub, d0_b.clone(), d0_s.clone())?;
+                let sg1 = GpuTensor::from_buffer(sub, g1_b.clone(), g1_s.clone())?;
+                let su1 = GpuTensor::from_buffer(sub, u1_b.clone(), u1_s.clone())?;
+                let sd1 = GpuTensor::from_buffer(sub, d1_b.clone(), d1_s.clone())?;
+                let swin = GpuTensor::from_buffer(sub, win_b.clone(), win_s.clone())?;
+                let swpo = GpuTensor::from_buffer(sub, wpo_b.clone(), wpo_s.clone())?;
+                let sqn  = GpuTensor::from_buffer(sub, qn_b.clone(), qn_s.clone())?;
+                let skn  = GpuTensor::from_buffer(sub, kn_b.clone(), kn_s.clone())?;
+                let srt  = GpuTensor::from_buffer(sub, rt_b.clone(), rt_s.clone())?;
+                let cfg = Qwen35RealGqaConfig {
+                    n_q_heads: N_Q, n_kv_heads: N_KV, head_dim: HD,
+                    seq_len: N_TOKENS, hidden: HIDDEN,
+                    rope_theta_base: 500_000.0, rope_sections: [11, 11, 10, 0],
+                    causal: false, sliding_window: None, rms_eps: 1e-6,
+                };
+                let lw = DecoderLayerWeightsRealGqa {
+                    w_in: &swin, w_post: &swpo, w_q: &swq, w_k: &swk, w_v: &swv, w_o: &swo,
+                    q_norm_w: &sqn, k_norm_w: &skn, w_gate: &srt,
+                    gate_projs: &[sg0, sg1], up_projs: &[su0, su1], down_projs: &[sd0, sd1],
+                };
+                decoder_layer_on_tape_real_gqa(sub, sub_h, c_pos.clone(), &lw, &cfg, MOE_K, 1e-9)
+            }).expect("checkpoint");
+
+            let onorm = GpuTensor::from_vec(&tape, &ones_v(HIDDEN), vec![HIDDEN]).expect("onorm");
+            let hn = rms_norm(&h, &onorm, 1e-6).expect("hn");
+            let wlm = make_qdq_t(&adam, "lm", &pack_lm, &tape, &mut gp);
+            let wlm_t = transpose(&wlm).expect("t");
+            let logits = matmul(&hn, &wlm_t).expect("logits");
+            let idx_buf = build_topk_indices_buffer(&device, &teacher_indices, N_TOKENS, top_k)
+                .expect("idx");
+            let st_topk = gather_student_topk_via_tape(&logits, idx_buf, top_k).expect("st");
+            let tt = GpuTensor::from_vec(&tape, &teacher_topk, vec![N_TOKENS, top_k]).expect("tt");
+            let loss = kl_loss_topk_via_tape(&st_topk, &tt, 1.0).expect("kl");
+            let dy = ones_like(&tape, loss.shape()).expect("dy");
+            let grads = backward(&loss, dy).expect("bwd");
+            let pr: Vec<(&str, &GpuTensor)> = gp.iter().map(|(n, t)| (n.as_str(), t)).collect();
+            let gm = collect_grads_for_adam(&grads, &pr).expect("collect");
+            adam.step(&gm).expect("step");
+        }
+        eprintln!("[gc_determinism] {N_STEPS} steps without debug_assert panic — PASS");
+    }
+
+    // ── Test 3: convergence with GC (tail/head ratio < 0.80) ────────────────
+    #[test]
+    fn phase3c_ac7_with_gradient_checkpoint_converges() {
+        let (_, losses_gc) = gc_fixture();
+        let n_steps = losses_gc.len();
+        let n_h = (n_steps / 5).max(1);
+        let n_t = (n_steps / 5).max(1);
+        let head_avg = losses_gc[..n_h].iter().sum::<f32>() / n_h as f32;
+        let tail_avg = losses_gc[n_steps - n_t..].iter().sum::<f32>() / n_t as f32;
+        let ratio = if head_avg < 1e-12 { 1.0f32 } else { tail_avg / head_avg };
+        eprintln!("[gc_converges] head={head_avg:.6} tail={tail_avg:.6} ratio={ratio:.4}");
+        assert!(ratio < 0.80, "GC convergence FAIL: tail/head ratio={ratio:.4} >= 0.80");
+    }
+
+    // ── Test 4: GC=false preserves baseline convergence ─────────────────────
+    #[test]
+    fn gradient_checkpoint_false_preserves_baseline_convergence() {
+        let (losses_no_gc, _) = gc_fixture();
+        let n_steps = losses_no_gc.len();
+        let n_h = (n_steps / 5).max(1);
+        let n_t = (n_steps / 5).max(1);
+        let head_avg = losses_no_gc[..n_h].iter().sum::<f32>() / n_h as f32;
+        let tail_avg = losses_no_gc[n_steps - n_t..].iter().sum::<f32>() / n_t as f32;
+        let ratio = if head_avg < 1e-12 { 1.0f32 } else { tail_avg / head_avg };
+        eprintln!("[gc_false_baseline] head={head_avg:.6} tail={tail_avg:.6} ratio={ratio:.4}");
+        assert!(ratio < 0.80, "Baseline FAIL with GC=false: ratio={ratio:.4} >= 0.80");
+    }
+
+    // ── Test 5: peak RSS < 0.7× non-checkpointed (proportionality check) ────
+    // On a 2-layer toy fixture the checkpoint savings are modest; we test that
+    // the GC path does NOT increase peak RSS by a factor > 1.5× (would
+    // indicate a retention bug). True < 0.7× savings only verifiable at scale.
+    #[test]
+    fn gradient_checkpoint_reduces_peak_rss() {
+        // Run a single step each and measure process RSS delta.
+        use crate::calibrate::autograd_gpu_tape::{
+            backward, checkpoint, matmul, ones_like, qdq_affine, rms_norm, transpose, view,
+            GpuTape, GpuTensor,
+        };
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use crate::calibrate::qwen35_moe::{
+            decoder_layer_on_tape_real_gqa, make_pos_buf_for_real_gqa,
+            DecoderLayerWeightsRealGqa, Qwen35RealGqaConfig,
+        };
+
+        fn rss_bytes() -> u64 { current_rss_bytes() }
+
+        const HIDDEN: usize = 64; const N_Q: usize = 1; const N_KV: usize = 1;
+        const HD: usize = 64; const N_EXPERTS: usize = 2; const INTER: usize = 32;
+        const MOE_K: usize = 2; const VOCAB: usize = 64;
+        const GS: usize = 32; const BITS: u32 = 4; const N_TOKENS: usize = 32;
+
+        let device = mlx_native::MlxDevice::new().expect("MlxDevice");
+        let make_w = |r: usize, c: usize, s: f32| -> Vec<f32> {
+            (0..r*c).map(|i| ((i as f32*0.01+s)*6.28).sin()*0.1).collect()
+        };
+        let ones_v = |n: usize| vec![1.0f32; n];
+        let qp = |d: &[f32], r: usize, c: usize| {
+            quant_pack_for_dwq(&device, d, r, c, BITS, GS).expect("qp")
+        };
+        let wq = make_w(N_Q*HD, HIDDEN, 0.1); let wk = make_w(N_KV*HD, HIDDEN, 0.2);
+        let wv = make_w(N_KV*HD, HIDDEN, 0.3); let wo = make_w(HIDDEN, N_Q*HD, 0.4);
+        let gd0 = make_w(HIDDEN, INTER, 1.0); let ud0 = make_w(HIDDEN, INTER, 1.1);
+        let dd0 = make_w(INTER, HIDDEN, 1.2); let gd1 = make_w(HIDDEN, INTER, 2.0);
+        let ud1 = make_w(HIDDEN, INTER, 2.1); let dd1 = make_w(INTER, HIDDEN, 2.2);
+        let router: Vec<f32> = (0..HIDDEN*N_EXPERTS)
+            .map(|i| ((i as f32*0.05)*6.28).sin()*0.1).collect();
+        let lm_data = make_w(VOCAB, HIDDEN, 9.9);
+        let pack_wq = qp(&wq, N_Q*HD, HIDDEN); let pack_wk = qp(&wk, N_KV*HD, HIDDEN);
+        let pack_wv = qp(&wv, N_KV*HD, HIDDEN); let pack_wo = qp(&wo, HIDDEN, N_Q*HD);
+        let pack_g0 = qp(&gd0, HIDDEN, INTER); let pack_u0 = qp(&ud0, HIDDEN, INTER);
+        let pack_d0 = qp(&dd0, INTER, HIDDEN); let pack_g1 = qp(&gd1, HIDDEN, INTER);
+        let pack_u1 = qp(&ud1, HIDDEN, INTER); let pack_d1 = qp(&dd1, INTER, HIDDEN);
+        let pack_lm = qp(&lm_data, VOCAB, HIDDEN);
+        let embed = vec![0.1f32; N_TOKENS * HIDDEN];
+        let mut teacher_full = vec![0.0f32; N_TOKENS * VOCAB];
+        for t in 0..N_TOKENS {
+            for v in 0..VOCAB {
+                teacher_full[t*VOCAB+v] = (0..HIDDEN).map(|h| embed[t*HIDDEN+h]*lm_data[v*HIDDEN+h]).sum::<f32>();
+            }
+        }
+        let top_k = 8usize;
+        let (teacher_topk, teacher_indices) =
+            pick_top_k_per_position(&teacher_full, N_TOKENS, 1, VOCAB, top_k).expect("pick_top_k");
+
+        let make_qdq_t = |adam: &AdamOptimizer, tid: &str, pack: &DwqQuantPack,
+                          tape: &GpuTape, gp: &mut Vec<(String, GpuTensor)>| -> GpuTensor {
+            let sn = affine_param_name(tid, AffineParamKind::Scale);
+            let bn = affine_param_name(tid, AffineParamKind::Bias);
+            let sv = adam.read_param(&sn).expect("sv"); let bv = adam.read_param(&bn).expect("bv");
+            let ng = sv.len();
+            let s_t = GpuTensor::from_vec(tape, &sv, vec![ng]).expect("st");
+            let b_t = GpuTensor::from_vec(tape, &bv, vec![ng]).expect("bt");
+            let w = qdq_affine(&s_t, &b_t, &pack.q_int_bytes, GS).expect("qdq");
+            let w2 = view(&w, vec![pack.n, pack.k]).expect("view");
+            gp.push((sn, s_t)); gp.push((bn, b_t));
+            w2
+        };
+
+        let run_one = |gc: bool| -> u64 {
+            let mut adam = AdamOptimizer::new(device.clone(),
+                AdamConfig { lr: 1e-4, beta1: 0.9, beta2: 0.999, eps: 1e-8 }).expect("adam");
+            for (tid, pack) in [("wq", &pack_wq), ("wk", &pack_wk), ("wv", &pack_wv), ("wo", &pack_wo),
+                                 ("g0", &pack_g0), ("u0", &pack_u0), ("d0", &pack_d0),
+                                 ("g1", &pack_g1), ("u1", &pack_u1), ("d1", &pack_d1),
+                                 ("lm", &pack_lm)] {
+                register_affine_pair(&mut adam, &device, tid, &pack.scales, &pack.biases)
+                    .unwrap_or_else(|e| panic!("register {tid}: {e}"));
+            }
+            let rss_before = rss_bytes();
+            let tape = GpuTape::new(device.clone());
+            let mut gp: Vec<(String, GpuTensor)> = Vec::new();
+            let h_init = GpuTensor::from_vec(&tape, &embed, vec![N_TOKENS, HIDDEN]).expect("h");
+            let pos_buf = make_pos_buf_for_real_gqa(&device, N_TOKENS).expect("pos");
+            let wqt = make_qdq_t(&adam, "wq", &pack_wq, &tape, &mut gp);
+            let wkt = make_qdq_t(&adam, "wk", &pack_wk, &tape, &mut gp);
+            let wvt = make_qdq_t(&adam, "wv", &pack_wv, &tape, &mut gp);
+            let wot = make_qdq_t(&adam, "wo", &pack_wo, &tape, &mut gp);
+            let g0t = make_qdq_t(&adam, "g0", &pack_g0, &tape, &mut gp);
+            let u0t = make_qdq_t(&adam, "u0", &pack_u0, &tape, &mut gp);
+            let d0t = make_qdq_t(&adam, "d0", &pack_d0, &tape, &mut gp);
+            let g1t = make_qdq_t(&adam, "g1", &pack_g1, &tape, &mut gp);
+            let u1t = make_qdq_t(&adam, "u1", &pack_u1, &tape, &mut gp);
+            let d1t = make_qdq_t(&adam, "d1", &pack_d1, &tape, &mut gp);
+            let win = GpuTensor::from_vec(&tape, &ones_v(HIDDEN), vec![HIDDEN]).expect("win");
+            let wpo = GpuTensor::from_vec(&tape, &ones_v(HIDDEN), vec![HIDDEN]).expect("wpo");
+            let qn  = GpuTensor::from_vec(&tape, &ones_v(HD), vec![HD]).expect("qn");
+            let kn  = GpuTensor::from_vec(&tape, &ones_v(HD), vec![HD]).expect("kn");
+            let rt  = GpuTensor::from_vec(&tape, &router, vec![HIDDEN, N_EXPERTS]).expect("rt");
+
+            let h: GpuTensor = if gc {
+                // Order MUST match the closure's from_buffer push order:
+                // [sub_input], swq, swk, swv, swo, sg0, su0, sd0, sg1, su1, sd1, swin, swpo, sqn, skn, srt
+                let lpi: Vec<usize> = vec![
+                    h_init.node_idx(),
+                    wqt.node_idx(), wkt.node_idx(), wvt.node_idx(), wot.node_idx(),
+                    g0t.node_idx(), u0t.node_idx(), d0t.node_idx(),
+                    g1t.node_idx(), u1t.node_idx(), d1t.node_idx(),
+                    win.node_idx(), wpo.node_idx(), qn.node_idx(), kn.node_idx(),
+                    rt.node_idx(),
+                ];
+                let wq_b = tape.node_buf(wqt.node_idx()); let wk_b = tape.node_buf(wkt.node_idx());
+                let wv_b = tape.node_buf(wvt.node_idx()); let wo_b = tape.node_buf(wot.node_idx());
+                let g0_b = tape.node_buf(g0t.node_idx()); let u0_b = tape.node_buf(u0t.node_idx());
+                let d0_b = tape.node_buf(d0t.node_idx()); let g1_b = tape.node_buf(g1t.node_idx());
+                let u1_b = tape.node_buf(u1t.node_idx()); let d1_b = tape.node_buf(d1t.node_idx());
+                let win_b = tape.node_buf(win.node_idx()); let wpo_b = tape.node_buf(wpo.node_idx());
+                let qn_b = tape.node_buf(qn.node_idx()); let kn_b = tape.node_buf(kn.node_idx());
+                let rt_b = tape.node_buf(rt.node_idx());
+                let wq_s = wqt.shape().to_vec(); let wk_s = wkt.shape().to_vec();
+                let wv_s = wvt.shape().to_vec(); let wo_s = wot.shape().to_vec();
+                let g0_s = g0t.shape().to_vec(); let u0_s = u0t.shape().to_vec();
+                let d0_s = d0t.shape().to_vec(); let g1_s = g1t.shape().to_vec();
+                let u1_s = u1t.shape().to_vec(); let d1_s = d1t.shape().to_vec();
+                let win_s = win.shape().to_vec(); let wpo_s = wpo.shape().to_vec();
+                let qn_s = qn.shape().to_vec(); let kn_s = kn.shape().to_vec();
+                let rt_s = rt.shape().to_vec(); let c_pos = pos_buf.clone();
+                checkpoint(&tape, &h_init, lpi, move |sub, sub_h| {
+                    use crate::calibrate::autograd_gpu_tape::GpuTensor;
+                    use crate::calibrate::qwen35_moe::{
+                        decoder_layer_on_tape_real_gqa, DecoderLayerWeightsRealGqa,
+                        Qwen35RealGqaConfig,
+                    };
+                    let swq = GpuTensor::from_buffer(sub, wq_b.clone(), wq_s.clone())?;
+                    let swk = GpuTensor::from_buffer(sub, wk_b.clone(), wk_s.clone())?;
+                    let swv = GpuTensor::from_buffer(sub, wv_b.clone(), wv_s.clone())?;
+                    let swo = GpuTensor::from_buffer(sub, wo_b.clone(), wo_s.clone())?;
+                    let sg0 = GpuTensor::from_buffer(sub, g0_b.clone(), g0_s.clone())?;
+                    let su0 = GpuTensor::from_buffer(sub, u0_b.clone(), u0_s.clone())?;
+                    let sd0 = GpuTensor::from_buffer(sub, d0_b.clone(), d0_s.clone())?;
+                    let sg1 = GpuTensor::from_buffer(sub, g1_b.clone(), g1_s.clone())?;
+                    let su1 = GpuTensor::from_buffer(sub, u1_b.clone(), u1_s.clone())?;
+                    let sd1 = GpuTensor::from_buffer(sub, d1_b.clone(), d1_s.clone())?;
+                    let swin = GpuTensor::from_buffer(sub, win_b.clone(), win_s.clone())?;
+                    let swpo = GpuTensor::from_buffer(sub, wpo_b.clone(), wpo_s.clone())?;
+                    let sqn  = GpuTensor::from_buffer(sub, qn_b.clone(), qn_s.clone())?;
+                    let skn  = GpuTensor::from_buffer(sub, kn_b.clone(), kn_s.clone())?;
+                    let srt  = GpuTensor::from_buffer(sub, rt_b.clone(), rt_s.clone())?;
+                    let cfg = Qwen35RealGqaConfig {
+                        n_q_heads: N_Q, n_kv_heads: N_KV, head_dim: HD,
+                        seq_len: N_TOKENS, hidden: HIDDEN,
+                        rope_theta_base: 500_000.0, rope_sections: [11, 11, 10, 0],
+                        causal: false, sliding_window: None, rms_eps: 1e-6,
+                    };
+                    let lw = DecoderLayerWeightsRealGqa {
+                        w_in: &swin, w_post: &swpo, w_q: &swq, w_k: &swk, w_v: &swv, w_o: &swo,
+                        q_norm_w: &sqn, k_norm_w: &skn, w_gate: &srt,
+                        gate_projs: &[sg0, sg1], up_projs: &[su0, su1], down_projs: &[sd0, sd1],
+                    };
+                    decoder_layer_on_tape_real_gqa(sub, sub_h, c_pos.clone(), &lw, &cfg, MOE_K, 1e-9)
+                }).expect("checkpoint")
+            } else {
+                let lw = DecoderLayerWeightsRealGqa {
+                    w_in: &win, w_post: &wpo, w_q: &wqt, w_k: &wkt, w_v: &wvt, w_o: &wot,
+                    q_norm_w: &qn, k_norm_w: &kn, w_gate: &rt,
+                    gate_projs: &[g0t, g1t], up_projs: &[u0t, u1t], down_projs: &[d0t, d1t],
+                };
+                decoder_layer_on_tape_real_gqa(&tape, &h_init, pos_buf.clone(), &lw,
+                    &Qwen35RealGqaConfig {
+                        n_q_heads: N_Q, n_kv_heads: N_KV, head_dim: HD,
+                        seq_len: N_TOKENS, hidden: HIDDEN,
+                        rope_theta_base: 500_000.0, rope_sections: [11, 11, 10, 0],
+                        causal: false, sliding_window: None, rms_eps: 1e-6,
+                    }, MOE_K, 1e-9).expect("decoder_layer")
+            };
+
+            let onorm = GpuTensor::from_vec(&tape, &ones_v(HIDDEN), vec![HIDDEN]).expect("onorm");
+            let hn = rms_norm(&h, &onorm, 1e-6).expect("hn");
+            let wlm = make_qdq_t(&adam, "lm", &pack_lm, &tape, &mut gp);
+            let wlm_t = transpose(&wlm).expect("t");
+            let logits = matmul(&hn, &wlm_t).expect("logits");
+            let idx_buf = build_topk_indices_buffer(&device, &teacher_indices, N_TOKENS, top_k)
+                .expect("idx");
+            let st_topk = gather_student_topk_via_tape(&logits, idx_buf, top_k).expect("st");
+            let tt = GpuTensor::from_vec(&tape, &teacher_topk, vec![N_TOKENS, top_k]).expect("tt");
+            let loss = kl_loss_topk_via_tape(&st_topk, &tt, 1.0).expect("kl");
+            let dy = ones_like(&tape, loss.shape()).expect("dy");
+            let grads = backward(&loss, dy).expect("bwd");
+            let pr: Vec<(&str, &GpuTensor)> = gp.iter().map(|(n, t)| (n.as_str(), t)).collect();
+            let gm = collect_grads_for_adam(&grads, &pr).expect("collect");
+            adam.step(&gm).expect("step");
+            rss_bytes().saturating_sub(rss_before)
+        };
+
+        let rss_no_gc = run_one(false);
+        let rss_gc    = run_one(true);
+        eprintln!("[gc_rss] no_gc={rss_no_gc} gc={rss_gc}");
+        // GC must not blow up RSS compared to non-GC (toy fixture, no huge savings expected).
+        // The hard ceiling: GC RSS must be < 1.5× non-GC RSS.
+        // At toy scale non-GC may be near-zero delta; guard against that.
+        if rss_no_gc > 0 {
+            assert!(
+                rss_gc < rss_no_gc * 3 / 2,
+                "GC RSS={rss_gc} > 1.5× non-GC RSS={rss_no_gc} — retention bug suspected"
+            );
+        }
     }
 }

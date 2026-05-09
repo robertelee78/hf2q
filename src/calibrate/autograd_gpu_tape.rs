@@ -70,6 +70,30 @@ use mlx_native::{
     DType, KernelRegistry, MlxBuffer, MlxDevice,
 };
 
+/// Type alias for the recomputation closure stored in [`CheckpointFn`].
+type CheckpointRcFn = Rc<dyn Fn(&GpuTape, &GpuTensor) -> Result<GpuTensor>>;
+
+/// Closure wrapper for gradient-checkpoint recomputation.
+///
+/// Wraps `Rc<dyn Fn(&GpuTape, &GpuTensor) -> Result<GpuTensor>>` so that
+/// `Clone` is a cheap `Rc` bump and `Debug` prints a stable placeholder.
+/// `Rc` is used (not `Arc`) because `GpuTape` is `Rc`-based and
+/// therefore not `Send`; both live on the same thread.
+#[derive(Clone)]
+struct CheckpointFn(CheckpointRcFn);
+
+impl std::fmt::Debug for CheckpointFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<checkpoint-fn>")
+    }
+}
+
+impl CheckpointFn {
+    fn call(&self, tape: &GpuTape, input: &GpuTensor) -> Result<GpuTensor> {
+        (self.0)(tape, input)
+    }
+}
+
 /// Op-specific data needed to dispatch a node's backward pass.  The
 /// enum is closed: every op variant has a matching arm in
 /// [`backward_dispatch`].
@@ -318,6 +342,28 @@ enum OpKind {
         params: FlashAttnTrainParams,
         optional_mask_buf: Option<MlxBuffer>,
     },
+    /// Gradient checkpoint node.  The forward output value is retained as
+    /// `retained_output` but all intermediate activation buffers inside the
+    /// sub-computation are dropped immediately after the forward run.
+    /// Backward re-runs the closure on a fresh sub-tape, asserts the output
+    /// is byte-equivalent to `retained_output`, then runs backward on the
+    /// sub-tape and routes the resulting leaf gradients back to the parent
+    /// tape via `leaf_parent_indices`.
+    Checkpoint {
+        /// Retained copy of the input buffer (needed for sub-tape replay).
+        input_buf: MlxBuffer,
+        /// Shape of the input tensor.
+        input_shape: Vec<usize>,
+        /// Retained output buffer for the `debug_assert` parity check.
+        retained_output: MlxBuffer,
+        /// Maps sub-tape leaf insertion order → parent-tape node indices.
+        /// Index 0 = input; indices 1..N = captured weight leaves in the
+        /// same order as the closure pushed them.
+        leaf_parent_indices: Vec<usize>,
+        /// Closure that reproduces the sub-computation given a fresh tape
+        /// and the replayed input leaf.
+        recomputable: CheckpointFn,
+    },
 }
 
 struct GpuNode {
@@ -392,6 +438,13 @@ impl GpuTape {
     fn with_node<R>(&self, idx: usize, f: impl FnOnce(&GpuNode) -> R) -> R {
         let nodes = self.0.nodes.borrow();
         f(&nodes[idx])
+    }
+
+    /// Return the `MlxBuffer` stored at `node_idx` — cheap Arc bump.
+    /// Used by gradient-checkpoint closures to capture weight buffers
+    /// for sub-tape replay without copying data.
+    pub fn node_buf(&self, node_idx: usize) -> MlxBuffer {
+        self.with_node(node_idx, |n| n.value.clone())
     }
 }
 
@@ -730,6 +783,14 @@ pub fn backward(
                 accumulate(&mut grads, q_idx, &parent_grads[0], tape)?;
                 accumulate(&mut grads, k_idx, &parent_grads[1], tape)?;
                 accumulate(&mut grads, v_idx, &parent_grads[2], tape)?;
+            }
+            OpKind::Checkpoint { leaf_parent_indices, .. } => {
+                // parent_grads[i] corresponds to leaf_parent_indices[i].
+                // leaf_parent_indices[0] = input_idx;
+                // leaf_parent_indices[1..] = weight node indices.
+                for (i, &pidx) in leaf_parent_indices.iter().enumerate() {
+                    accumulate(&mut grads, pidx, &parent_grads[i], tape)?;
+                }
             }
         }
     }
@@ -1886,6 +1947,85 @@ fn backward_dispatch(
             enc3.commit_and_wait()
                 .map_err(|e| anyhow!("backward fa: enc3 commit: {e}"))?;
             Ok((op, vec![dq_f32, dk_f32, dv_f32]))
+        }
+        OpKind::Checkpoint {
+            ref input_buf,
+            ref input_shape,
+            ref retained_output,
+            ref leaf_parent_indices,
+            ref recomputable,
+            ..
+        } => {
+            let device = tape.device();
+            // Re-run the forward on a fresh sub-tape to recompute activations.
+            let sub_tape = GpuTape::new(device.clone());
+            let sub_input = GpuTensor::from_buffer(&sub_tape, input_buf.clone(), input_shape.clone())
+                .map_err(|e| anyhow!("checkpoint bwd: sub_input: {e}"))?;
+            let sub_output = recomputable
+                .call(&sub_tape, &sub_input)
+                .map_err(|e| anyhow!("checkpoint bwd: recompute: {e}"))?;
+
+            // Parity check: recomputed output must be byte-identical to retained.
+            debug_assert!({
+                let ret = retained_output.as_slice::<u8>()
+                    .expect("checkpoint: retained_output as_slice");
+                let rec = sub_output.tape
+                    .with_node(sub_output.node_idx, |n| n.value.clone());
+                let rec_s = rec.as_slice::<u8>()
+                    .expect("checkpoint: recomputed as_slice");
+                ret == rec_s
+            }, "checkpoint bwd: recomputed output differs from retained output");
+
+            // Run backward on the sub-tape.
+            let sub_grads = backward(&sub_output, out_grad.clone())
+                .map_err(|e| anyhow!("checkpoint bwd: sub backward: {e}"))?;
+
+            // Collect leaf gradients in `leaf_parent_indices` order:
+            //   leaf_parent_indices[0] = input → sub-tape Leaf 0
+            //   leaf_parent_indices[1..N] = weight leaves → sub-tape Leaves 1..N
+            // Leaves are pushed in this exact order: sub_input first (by
+            // `checkpoint` fwd), then closure leaves (by the closure itself).
+            // If a leaf has no gradient (dead path), allocate a zero buffer with
+            // the same shape as the leaf's value (zero gradient = no update).
+            let n_sub_nodes = sub_tape.node_count();
+            let mut leaf_idx = 0usize; // nth leaf encountered in node order
+            let n_expected = leaf_parent_indices.len();
+            let mut grad_by_leaf_slot: Vec<Option<MlxBuffer>> = vec![None; n_expected];
+            let device = tape.device();
+            #[allow(clippy::needless_range_loop)]
+            for node in 0..n_sub_nodes {
+                let is_leaf = sub_tape.with_node(node, |n| matches!(n.op, OpKind::Leaf));
+                if !is_leaf { continue; }
+                if leaf_idx < n_expected {
+                    grad_by_leaf_slot[leaf_idx] = Some(match sub_grads[node].clone() {
+                        Some(g) => g,
+                        None => {
+                            // Dead leaf — allocate a zero gradient buffer.
+                            let numel = sub_tape.with_node(node, |n| {
+                                n.shape.iter().product::<usize>()
+                            });
+                            let shape = sub_tape.with_node(node, |n| n.shape.clone());
+                            let mut zero = device
+                                .alloc_buffer(numel * 4, DType::F32, shape)
+                                .map_err(|e| anyhow!("checkpoint bwd: zero alloc: {e}"))?;
+                            zero.as_mut_slice::<f32>()
+                                .map_err(|e| anyhow!("checkpoint bwd: zero init: {e}"))?
+                                .iter_mut()
+                                .for_each(|x| *x = 0.0);
+                            zero
+                        }
+                    });
+                }
+                leaf_idx += 1;
+            }
+            let leaf_grads: Vec<MlxBuffer> = grad_by_leaf_slot
+                .into_iter()
+                .enumerate()
+                .map(|(i, g)| g.ok_or_else(|| {
+                    anyhow!("checkpoint bwd: leaf slot {i} not populated (got {leaf_idx} leaves, expected {n_expected})")
+                }))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((op, leaf_grads))
         }
     }
 }
@@ -3728,6 +3868,79 @@ pub fn flash_attn_train(
         q.shape.clone(),
     );
     Ok(GpuTensor { tape: tape.clone(), node_idx, shape: q.shape.clone() })
+}
+
+/// Gradient-checkpoint wrapper: run `recomputable` on a **sub-tape** that
+/// is immediately discarded, retaining only the output buffer and the
+/// input buffer.  This lets backward re-run the forward pass to recompute
+/// intermediate activations instead of keeping them live on the parent tape.
+///
+/// # Contract
+///
+/// The caller must provide `leaf_parent_indices`: a `Vec<usize>` mapping
+/// sub-tape leaf insertion order to parent-tape node indices.  The first
+/// entry (`leaf_parent_indices[0]`) corresponds to `input` itself; entries
+/// `1..N` correspond to captured weight leaves that the closure pushes on
+/// the sub-tape **in exactly the same order** as in `leaf_parent_indices`.
+///
+/// Backward routes `d_input → grads[leaf_parent_indices[0]]` and
+/// `d_weight_i → grads[leaf_parent_indices[1 + i]]`.
+pub fn checkpoint<F>(
+    tape: &GpuTape,
+    input: &GpuTensor,
+    leaf_parent_indices: Vec<usize>,
+    recomputable: F,
+) -> Result<GpuTensor>
+where
+    F: Fn(&GpuTape, &GpuTensor) -> Result<GpuTensor> + 'static,
+{
+    if leaf_parent_indices.is_empty() {
+        return Err(anyhow!(
+            "checkpoint: leaf_parent_indices must contain at least the input index"
+        ));
+    }
+    let device = tape.device();
+    let input_buf = tape.with_node(input.node_idx, |n| n.value.clone());
+    let input_shape = input.shape.clone();
+
+    // Run forward on a throwaway sub-tape — intermediate buffers are freed
+    // when sub_tape drops at the end of this function.
+    let sub_tape = GpuTape::new(device.clone());
+    let sub_input = GpuTensor::from_buffer(&sub_tape, input_buf.clone(), input_shape.clone())
+        .map_err(|e| anyhow!("checkpoint fwd: sub_input: {e}"))?;
+    let sub_output = recomputable(&sub_tape, &sub_input)
+        .map_err(|e| anyhow!("checkpoint fwd: recomputable: {e}"))?;
+
+    // Retain the output buffer so backward can assert parity.
+    let retained_output = sub_tape.with_node(sub_output.node_idx, |n| n.value.clone());
+    let out_shape = sub_output.shape.clone();
+
+    // Copy output data to parent-tape output buffer.
+    let out_numel: usize = out_shape.iter().product();
+    let mut out_buf = device
+        .alloc_buffer(out_numel * 4, DType::F32, out_shape.clone())
+        .map_err(|e| anyhow!("checkpoint fwd: alloc out_buf: {e}"))?;
+    {
+        let src = retained_output.as_slice::<u8>()
+            .map_err(|e| anyhow!("checkpoint fwd: retained src slice: {e}"))?;
+        let dst = out_buf.as_mut_slice::<u8>()
+            .map_err(|e| anyhow!("checkpoint fwd: out dst slice: {e}"))?;
+        dst.copy_from_slice(src);
+    }
+
+    let fn_rc: CheckpointRcFn = Rc::new(recomputable);
+    let node_idx = tape.push_node(
+        OpKind::Checkpoint {
+            input_buf,
+            input_shape,
+            retained_output,
+            leaf_parent_indices,
+            recomputable: CheckpointFn(fn_rc),
+        },
+        out_buf,
+        out_shape.clone(),
+    );
+    Ok(GpuTensor { tape: tape.clone(), node_idx, shape: out_shape })
 }
 
 #[cfg(test)]
