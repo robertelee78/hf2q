@@ -258,4 +258,66 @@ mod tests {
         assert_eq!(cfg.max_ngram, 3);
         assert_eq!(cfg.max_model_len, 4096);
     }
+
+    /// Pseudo-random token generator for the bench fixtures.
+    fn rand_tokens(seed: u64, n: usize, vocab: u32) -> Vec<u32> {
+        let mut state = seed;
+        (0..n).map(|_| {
+            state = state.wrapping_mul(6364136223846793005)
+                          .wrapping_add(1442695040888963407);
+            ((state >> 33) as u32) % vocab
+        }).collect()
+    }
+
+    /// Microbench: confirm proposer CPU cost is sub-µs at realistic
+    /// decode-state lengths so spec-decode overhead doesn't eat into
+    /// the speedup. Per ADR-029 Phase 4 scope: every decode token
+    /// runs one propose() call. At hf2q's 16 µs/dispatch GPU floor,
+    /// proposer cost ≥ 100 µs would erase any spec-decode benefit at
+    /// low acceptance rates.
+    ///
+    /// Run:
+    ///   cargo test --release --bin hf2q --no-default-features \
+    ///     bench_ngram_proposer -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_ngram_proposer_at_realistic_decode_lengths() {
+        use std::time::Instant;
+
+        // max_model_len comfortably above the longest tested length so
+        // KMP actually runs (vs early-returning when tokens.len() ==
+        // max_model_len triggers k_room == 0).
+        let cfg = NgramConfig {
+            min_ngram: 1, max_ngram: 3, k: 3, max_model_len: 16_384,
+        };
+        let lengths = [128usize, 512, 1024, 2048, 4096, 8192];
+
+        for &n in &lengths {
+            let tokens = rand_tokens(0xCAFE_BEEF, n, 256);
+            // Warmup — primes branch predictor + cache.
+            for _ in 0..100 { let _ = propose(&tokens, &cfg); }
+
+            // Time 1000 iterations to get stable nanosecond p50.
+            let mut samples: Vec<u128> = Vec::with_capacity(1000);
+            for _ in 0..1000 {
+                let t0 = Instant::now();
+                let _ = propose(&tokens, &cfg);
+                samples.push(t0.elapsed().as_nanos());
+            }
+            samples.sort();
+            let p50 = samples[500];
+            let p99 = samples[990];
+
+            eprintln!("[BENCH iter-115] propose len={:5} p50={:6} ns p99={:6} ns",
+                      n, p50, p99);
+
+            // Falsifier: at any reasonable length, propose must be
+            // <100 µs (= 100,000 ns). At 16 µs/dispatch, even one
+            // propose call < 6% of one decode dispatch.
+            assert!(
+                (p50 as usize) < 100_000,
+                "propose at len={n} took {p50} ns p50 — too slow for hot path (target <100 µs)"
+            );
+        }
+    }
 }
