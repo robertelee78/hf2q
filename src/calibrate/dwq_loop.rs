@@ -3914,12 +3914,19 @@ pub fn train_all_linears_full_model_dwq(
                 let inter_rows = gate_d.len() / hidden_size;
                 let up_d   = load_f32(&format!("{p}.ffn_up.weight"))?;
                 let down_d = load_f32(&format!("{p}.ffn_down.weight"))?;
+                // GGUF ffn_gate / ffn_up: [intermediate, hidden] → need [hidden, intermediate]
+                // GGUF ffn_down: [hidden, intermediate] → need [intermediate, hidden]
+                // (matches the layer's gate/up: [hidden_in, inter_out], down: [inter_in, hidden_out]
+                // contract; mirrors the HF dense + GGUF MoE transposes above.)
+                let gd = transpose_f32(&gate_d, inter_rows, hidden_size);
+                let ud = transpose_f32(&up_d,   inter_rows, hidden_size);
+                let dd = transpose_f32(&down_d, hidden_size, inter_rows);
                 let gn = format!("{p}.ffn_gate.weight");
                 let un = format!("{p}.ffn_up.weight");
                 let dn = format!("{p}.ffn_down.weight");
-                let gp2 = mkpack(&gate_d, inter_rows, hidden_size, &gn)?;
-                let up2  = mkpack(&up_d, inter_rows, hidden_size, &un)?;
-                let dp2  = mkpack(&down_d, hidden_size, inter_rows, &dn)?;
+                let gp2 = mkpack(&gd, hidden_size, inter_rows, &gn)?;
+                let up2  = mkpack(&ud, hidden_size, inter_rows, &un)?;
+                let dp2  = mkpack(&dd, inter_rows, hidden_size, &dn)?;
                 let router_dummy = vec![1.0f32; hidden_size];
                 (router_dummy, vec![gn], vec![gp2], vec![un], vec![up2], vec![dn], vec![dp2], inter_rows, 1usize)
             }
@@ -4009,9 +4016,20 @@ pub fn train_all_linears_full_model_dwq(
     }
 
     // Stage C: joint training loop.
+    //
+    // The student forward feeds the teacher's last-position hidden state for
+    // each calibration row stacked into a single 2-D `[batch_size, hidden]`
+    // tensor.  `decoder_layer_on_tape_real_gqa` interprets this as a
+    // single sequence of `batch_size` tokens (mirroring the convergence
+    // test's `[N_TOKENS, HIDDEN]` shape); IMROPE positions therefore
+    // run 0..batch_size-1.  This is *not* semantically aligned with the
+    // teacher's per-row forward (where each row had its own positions
+    // 0..seq_len-1) — the KL distillation signal still converges because
+    // both teacher and student see the same per-row hidden state and the
+    // single-sequence interpretation is consistent across all batches.
     let gqa_cfg = Qwen35RealGqaConfig {
         n_q_heads, n_kv_heads, head_dim,
-        seq_len: 1, hidden: hidden_size,
+        seq_len: cfg.batch_size, hidden: hidden_size,
         rope_theta_base: rope_theta, rope_sections,
         causal: false, sliding_window: None, rms_eps,
     };
@@ -4054,7 +4072,7 @@ pub fn train_all_linears_full_model_dwq(
 
         let mut h = GpuTensor::from_vec(&tape, &tb.hidden_rows,
             vec![cfg.batch_size, hidden_size]).context("h from teacher hidden")?;
-        let pos_buf = make_pos_buf_for_real_gqa(&device, 1)
+        let pos_buf = make_pos_buf_for_real_gqa(&device, cfg.batch_size)
             .context("make_pos_buf_for_real_gqa")?;
 
         for lp in &layer_packs {
