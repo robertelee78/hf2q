@@ -2415,16 +2415,27 @@ impl MlxModelWeights {
     /// - iter-141+: production wire-up + acceptance-rate measurement.
     pub fn forward_decode_verify_batched(
         &mut self,
-        _tokens: &[u32],
-        _start_seq_pos: usize,
-        _gpu: &mut GpuContext,
+        tokens: &[u32],
+        start_seq_pos: usize,
+        gpu: &mut GpuContext,
     ) -> Result<Vec<u32>> {
-        anyhow::bail!(
-            "forward_decode_verify_batched: ADR-028 iter-134 scaffold only — \
-             implementation lands in iter-135+ once append-mode + per-position \
-             argmax wiring is approved by operator. Use \
-             forward_decode_verify_serial (iter-123 Shape S) for correctness \
-             gates in the meantime."
-        )
+        // ADR-028 iter-139 — TEMPORARY DELEGATION to Shape S serial.
+        //
+        // The Shape B body (single-GraphSession batched matmul over k
+        // tokens, leveraging the iter-137 + iter-138 append-mode wiring
+        // in forward_prefill_batched) lands in iter-140+ once the LM
+        // head/argmax site is parameterized for per-position emission.
+        //
+        // Until then, this API is functionally CORRECT (output matches
+        // serial forward_decode K+1 times via Shape S) but runs at
+        // Shape S serial speed (k × forward_decode latency) — no
+        // batched speedup yet. Downstream callers can wire to this API
+        // and the speedup materializes when the body is replaced.
+        //
+        // At greedy temperature, this is byte-identical to calling
+        // forward_decode K+1 times serially — same numerics either way.
+        // The eventual Shape B body will be byte-identical too (just
+        // batched dispatch).
+        self.forward_decode_verify_serial(tokens, start_seq_pos, gpu)
     }
 }
