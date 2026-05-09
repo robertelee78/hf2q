@@ -117,7 +117,26 @@ if [[ "$BATCHED_DECODED" =~ [0-9]{6,} ]]; then
     exit 1
 fi
 
-echo "  ✓ batched coherence OK"
+# Iter-74 strengthening: STRICT byte-identity check between per-token and
+# batched decoded outputs. The Apr-20 9091b8c baseline had 3656/3658 byte
+# match between hf2q batched and llama.cpp batched on sourdough; the
+# stronger invariant for THIS gate is byte-identity vs hf2q per-token,
+# which exercises the same compute and KV-cache state ABI. ADR-010 L6 MoE
+# router top-K sensitivity may legitimately diverge per-token vs batched
+# on long sliding_wrap fixtures (operator-signed in 2026-04-16 §Status Log)
+# — but at this short-prompt scale (27 prefill tokens), L6 sensitivity
+# has no headroom. Any divergence here is a NEW regression worth catching.
+if [[ "$PER_TOKEN_DECODED" != "$BATCHED_DECODED" ]]; then
+    echo "  ✗ FAIL: per-token and batched decoded outputs DIVERGE."
+    echo "    per-token: [$PER_TOKEN_DECODED]"
+    echo "    batched:   [$BATCHED_DECODED]"
+    echo "  At short-prompt scale, ADR-010 L6 MoE sensitivity has no headroom"
+    echo "  to manifest — divergence here is a new regression in the batched"
+    echo "  compute path (KV cache, attention math, MoE routing, or LM head)."
+    exit 1
+fi
+
+echo "  ✓ batched coherence OK (byte-identical to per-token reference)"
 echo
 
 echo "[3/3] Verdict"
@@ -126,4 +145,5 @@ echo "  batched:   [$BATCHED_DECODED]"
 echo
 echo "✓ PASS — batched-prefill coherence gate green at HEAD."
 echo "  iter-64 leg_hb_encoded fix is locked in for this fixture."
+echo "  iter-74 byte-identity strict gate also passing."
 exit 0
