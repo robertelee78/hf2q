@@ -365,6 +365,10 @@ impl FullAttnKvSlot {
             // ADR-028 iter-106: caller pre-rotates Q (qwen35 path keeps
             // current FWHT-pre dispatch).
             fuse_fwht_pre: 0,
+            // ADR-028 iter-127a Path D: NSG axis. iter-127a scaffolds with
+            // NSG=1 default (byte-identical). Adaptive policy lands once
+            // cross-simdgroup reduce is verified at NSG=2,4.
+            nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(params.kv_seq_len),
         };
         mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb(
             encoder,

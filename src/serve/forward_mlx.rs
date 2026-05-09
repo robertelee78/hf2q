@@ -3458,6 +3458,10 @@ impl MlxModelWeights {
                             scale_factor_d512: tq_scale_factor_d512,
                             codebook_bits: tq_codebook_bits,
                             fuse_fwht_pre: if fuse_fwht_pre_env { 1 } else { 0 },
+                            // ADR-028 iter-127a Path D: NSG axis. Default 1 in
+                            // iter-127a (byte-identical scaffold); compute_nsg
+                            // lifts based on kL once kernel logic supports NSG > 1.
+                            nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(hb_kv_seq_len),
                         };
                         mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb(
                             s.encoder_mut(), reg, dev,
