@@ -145,15 +145,22 @@ The on-disk payload header MUST encode the `LayerSlot` kind so `restore_block` c
 - Outer envelope adds `slot_kind = FULL` to disambiguate from linear payloads in the same block-store.
 - Linear payloads still use Phase A's F32 path (no TQ on linear-attn).
 
-### 4.4 Linear-attn payload (mandatory; ping-pong active-state semantics)
+### 4.4 Linear-attn payload (no swap_parity — Chesterton's-fence revision)
 
-`LinearAttnStateSlot` holds ACTIVE conv-state + recurrent + their SCRATCH counterparts. `swap_recurrent` toggles which is active mid-decode. Snapshot must:
+**Iter-3 investigation finding (2026-05-08, before code):** the existing `HybridKvCache::snapshot()` (kv_cache.rs:624-659) and `HybridKvCache::restore_from()` (kv_cache.rs:677-735) capture ONLY the ACTIVE `conv_state` + `recurrent` buffers; SCRATCH buffers are intentionally NOT serialized. The `HybridKvCacheSnapshot` shape (kv_cache.rs:152-166) reflects this: `linear_conv` + `linear_recurrent` are single per-slot vectors, no parity field, no scratch counterpart.
 
-1. Capture ACTIVE buffer bytes + a `swap_parity: u8` field reflecting which slot is active at snapshot time.
-2. Restore writes ACTIVE; scratch is left zeroed (Mantra-clean: scratch is genuinely transient working memory, not persistent state).
+Mantra: "Always understand current fully before changing it." The existing semantics treat the ACTIVE buffer as the canonical state. Restore writes saved bytes into `conv_state` + `recurrent` (the active slots); scratch is left as-is. There's no swap_parity to capture because there's no ambiguity — "the active buffer" IS the persistent state.
 
-Header: `[layer_rank u32][slot_kind u8 = LINEAR][slot_idx u32][swap_parity u8][d_k u16][d_v u16][num_v_heads u16][n_seqs u16]`
-Body: `conv_state bytes` + `recurrent bytes` (both F32, lengths derived from header).
+Iter-3 codec consequence:
+
+Per linear-attn slot (in serialize order, slot 0..n_linear_attn):
+- `slot_idx: u32 LE` (sanity check; must equal iteration index).
+- `conv_byte_len: u64 LE`
+- `recurrent_byte_len: u64 LE`
+- `conv_bytes`: `conv_byte_len` bytes (active conv_state, F32).
+- `recurrent_bytes`: `recurrent_byte_len` bytes (active recurrent, F32).
+
+No swap_parity field. Shape is derived from `Qwen35HybridConfig`'s `linear_conv_shape` + `linear_recurrent_shape` (added to the config struct in iter-3).
 
 ### 4.5 MTP slot (optional, mandatory if present)
 
@@ -195,7 +202,7 @@ Things that are tempting "simplifications" but break invariants — DO NOT do wi
 ### Phase A (qwen35 snapshot-based persistor)
 
 - **AC-A1**: `serialize_hybrid_snapshot` + `deserialize_hybrid_snapshot` round-trip byte-equal on a synthetic full-attn-only HybridKvCacheSnapshot. Test: `tests/adr_027_phase_a_full_attn_roundtrip.rs`.
-- **AC-A2**: Round-trip including linear-attn slots (with swap_parity). Test: `tests/adr_027_phase_a_linear_attn_roundtrip.rs`.
+- **AC-A2**: Round-trip including linear-attn slots (active conv + recurrent only; scratch is correctly NOT in payload per §4.4). Test: `qh35_round_trip_with_linear_attn` in `qwen35_hybrid_persistor.rs::tests`.
 - **AC-A3**: MTP slot round-trip (when `has_mtp=true`). Test: `tests/adr_027_phase_a_mtp_roundtrip.rs`.
 - **AC-A4**: `Qwen35DiskPersistor` writes a cold snapshot to `~/.cache/hf2q/qwen35_kv/.../*.bin` on insert; subsequent process loads the file back into `LcpRegistry` on construction.
 - **AC-A5**: Cold-process LCP resume: 2-turn qwen35 conversation across a process restart with `HF2Q_KV_PERSIST=/tmp/cache`; trial-2 prefill TTFT ≤ 0.5× cold (mirror of ADR-017 R-P6 stretch on Gemma).
@@ -225,7 +232,7 @@ Each iter ships a complete, mantra-clean deliverable. No iter is "enable later";
 | 1a | – | Original ADR | Operator review |
 | 1b | – | Chesterton's-fence revision (this iter) | Operator review |
 | 2 | A | `src/serve/kv_persist/families/qwen35_hybrid_persistor.rs`: `Qwen35HybridConfig`, full-attn-only `serialize`/`deserialize`, plus internal `tests` module exercising the round-trip on a synthetic `HybridKvCacheSnapshot`. Module declared in `families/mod.rs`. | AC-A1 |
-| 3 | A | Linear-attn slot serialize/deserialize including swap_parity hint. Round-trip test. | AC-A2 |
+| 3 | A | Linear-attn slot serialize/deserialize (active conv + recurrent only; no swap_parity per Chesterton's-fence revision §4.4). Round-trip test. | AC-A2 |
 | 4 | A | MTP slot serialize/deserialize. | AC-A3 |
 | 5 | A | `Qwen35DiskPersistor` (LcpRegistry write-through to disk) + `Qwen35LoadedModel.disk_persistor` field + `cmd_serve`/`cmd_generate_qwen35` env wire-up. | AC-A4 |
 | 6 | A | Cold-process LCP resume across restart on Qwen 3.6 APEX. | AC-A5, AC-A6 |

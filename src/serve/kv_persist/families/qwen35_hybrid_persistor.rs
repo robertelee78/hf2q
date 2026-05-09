@@ -110,6 +110,13 @@ pub struct Qwen35HybridConfig {
     pub full_attn_shape: [u64; 4],
     /// Encoder's choice of full-attn codec. Iter 2 always uses F32Dense.
     pub full_attn_codec: FullAttnCodec,
+    /// Per-linear-attn-slot conv-state shape `[conv_channels, K-1, n_seqs]`
+    /// (matches `LinearAttnStateSlot::conv_state`'s allocation in
+    /// kv_cache.rs's `HybridKvCache::new`). Iter-3 scope.
+    pub linear_conv_shape: [u64; 3],
+    /// Per-linear-attn-slot recurrent-state shape
+    /// `[D_k, D_v, num_v_heads, n_seqs]`. Iter-3 scope.
+    pub linear_recurrent_shape: [u64; 4],
 }
 
 impl Qwen35HybridConfig {
@@ -152,6 +159,18 @@ impl Qwen35HybridConfig {
             "QH35 config drift: full_attn_codec = {:?} vs {:?}",
             self.full_attn_codec,
             other.full_attn_codec
+        );
+        ensure!(
+            self.linear_conv_shape == other.linear_conv_shape,
+            "QH35 config drift: linear_conv_shape = {:?} vs {:?}",
+            self.linear_conv_shape,
+            other.linear_conv_shape
+        );
+        ensure!(
+            self.linear_recurrent_shape == other.linear_recurrent_shape,
+            "QH35 config drift: linear_recurrent_shape = {:?} vs {:?}",
+            self.linear_recurrent_shape,
+            other.linear_recurrent_shape
         );
         Ok(())
     }
@@ -403,13 +422,45 @@ pub fn serialize_hybrid_snapshot(
         out.extend_from_slice(v_bytes);
     }
 
-    // Linear-attn slot bytes: ITER-3 SCOPE. The envelope's
-    // `n_linear_attn` field already says how many slots exist; readers
-    // built before iter-3 reach EOF after the last full-attn slot and
-    // synthesize zeroed linear/mtp buffers (deserialize_hybrid_snapshot
-    // below handles this honestly — see its iter-2 note).
+    // --- Per linear-attn slot (iter-3) ---
+    // Active conv_state + recurrent only; scratch is intentionally NOT
+    // serialized per the existing HybridKvCache::snapshot semantics
+    // (kv_cache.rs:624-659). See ADR-027 §4.4 for the Chesterton's-
+    // fence rationale (no swap_parity field; "active" IS the canonical
+    // state).
+    let conv_elems: u64 = cfg.linear_conv_shape.iter().product();
+    let recurrent_elems: u64 = cfg.linear_recurrent_shape.iter().product();
+    let expected_conv_bytes = (conv_elems as usize) * std::mem::size_of::<f32>();
+    let expected_recurrent_bytes = (recurrent_elems as usize) * std::mem::size_of::<f32>();
+    for slot_idx in 0..cfg.n_linear_attn as usize {
+        let conv = &snapshot.linear_conv[slot_idx];
+        let rec = &snapshot.linear_recurrent[slot_idx];
+        let conv_bytes: &[u8] = conv.as_slice::<u8>().map_err(|e| {
+            anyhow!("QH35 serialize: linear_conv[{slot_idx}] as_slice: {e}")
+        })?;
+        let rec_bytes: &[u8] = rec.as_slice::<u8>().map_err(|e| {
+            anyhow!("QH35 serialize: linear_recurrent[{slot_idx}] as_slice: {e}")
+        })?;
+        ensure!(
+            conv_bytes.len() == expected_conv_bytes,
+            "QH35 serialize: linear_conv[{slot_idx}].byte_len = {} != expected {}",
+            conv_bytes.len(),
+            expected_conv_bytes
+        );
+        ensure!(
+            rec_bytes.len() == expected_recurrent_bytes,
+            "QH35 serialize: linear_recurrent[{slot_idx}].byte_len = {} != expected {}",
+            rec_bytes.len(),
+            expected_recurrent_bytes
+        );
+        write_u32_le(&mut out, slot_idx as u32);
+        write_u64_le(&mut out, conv_bytes.len() as u64);
+        write_u64_le(&mut out, rec_bytes.len() as u64);
+        out.extend_from_slice(conv_bytes);
+        out.extend_from_slice(rec_bytes);
+    }
 
-    // MTP: same — ITER-4 SCOPE.
+    // MTP: ITER-4 SCOPE — deserialize still bails when cfg.has_mtp = true.
 
     Ok(out)
 }
@@ -449,7 +500,13 @@ pub fn deserialize_hybrid_snapshot(
         has_mtp: read_u8(bytes, &mut cursor)? != 0,
         full_attn_codec: FullAttnCodec::from_u8(read_u8(bytes, &mut cursor)?)?,
         n_seqs: read_u32_le(bytes, &mut cursor)?,
-        full_attn_shape: cfg.full_attn_shape, // shape is per-slot in body; populated below
+        // Shapes are per-(slot, family) and not in the header — copy from
+        // runtime cfg so the assert_matches comparison treats them as
+        // equal (per-slot shape is validated against cfg in the body
+        // loops below).
+        full_attn_shape: cfg.full_attn_shape,
+        linear_conv_shape: cfg.linear_conv_shape,
+        linear_recurrent_shape: cfg.linear_recurrent_shape,
     };
     let _reserved = read_u16_le(bytes, &mut cursor)?;
 
@@ -532,32 +589,76 @@ pub fn deserialize_hybrid_snapshot(
         full_attn_current_len.push(current_len);
     }
 
-    // Linear-attn slots: iter-2 reads NO bytes; allocates fresh-zeroed
-    // buffers matching the config. Iter-3 fills in the per-slot read
-    // path. Until then this is the honest, mantra-aligned behavior:
-    // the envelope says how many slots exist, but iter-2 cannot
-    // restore their values — we emit empty placeholders rather than
-    // pretend we have them.
-    let linear_conv: Vec<MlxBuffer> = Vec::new(); // iter-2: empty;  iter-3 populates
-    let linear_recurrent: Vec<MlxBuffer> = Vec::new();
-
-    // MTP: same — iter-4 scope.
-    let mtp: Option<MtpKvSnapshot> = None;
-
-    // If iter-3 / iter-4 have NOT shipped yet but this envelope was
-    // produced with non-zero linear / mtp counts, the snapshot we
-    // return is inconsistent with `cfg`. iter-2 deliberately surfaces
-    // this rather than silently returning an empty snapshot — callers
-    // get a hard error so they don't ship broken cache state to the
-    // worker thread.
-    if cfg.n_linear_attn > 0 {
-        return Err(anyhow!(
-            "QH35 deserialize: cfg.n_linear_attn = {} but linear-attn read \
-             path is iter-3 scope (not yet implemented). Until iter-3 ships, \
-             do not call this function with linear-attn slots present.",
-            cfg.n_linear_attn
-        ));
+    // --- Per linear-attn slot (iter-3) ---
+    let conv_shape_usize: Vec<usize> =
+        cfg.linear_conv_shape.iter().map(|d| *d as usize).collect();
+    let recurrent_shape_usize: Vec<usize> = cfg
+        .linear_recurrent_shape
+        .iter()
+        .map(|d| *d as usize)
+        .collect();
+    let expected_conv_bytes = (cfg.linear_conv_shape.iter().product::<u64>() as usize)
+        * std::mem::size_of::<f32>();
+    let expected_recurrent_bytes =
+        (cfg.linear_recurrent_shape.iter().product::<u64>() as usize)
+            * std::mem::size_of::<f32>();
+    let mut linear_conv: Vec<MlxBuffer> = Vec::with_capacity(cfg.n_linear_attn as usize);
+    let mut linear_recurrent: Vec<MlxBuffer> =
+        Vec::with_capacity(cfg.n_linear_attn as usize);
+    for expected_slot in 0..cfg.n_linear_attn as usize {
+        let slot_idx = read_u32_le(bytes, &mut cursor)? as usize;
+        ensure!(
+            slot_idx == expected_slot,
+            "QH35 deserialize: linear_attn slot order mismatch — got {} expected {}",
+            slot_idx,
+            expected_slot
+        );
+        let conv_byte_len = read_u64_le(bytes, &mut cursor)? as usize;
+        let rec_byte_len = read_u64_le(bytes, &mut cursor)? as usize;
+        ensure!(
+            conv_byte_len == expected_conv_bytes,
+            "QH35 deserialize: linear_conv[{slot_idx}] on-disk byte_len = {} != \
+             cfg-derived {}",
+            conv_byte_len,
+            expected_conv_bytes
+        );
+        ensure!(
+            rec_byte_len == expected_recurrent_bytes,
+            "QH35 deserialize: linear_recurrent[{slot_idx}] on-disk byte_len = {} \
+             != cfg-derived {}",
+            rec_byte_len,
+            expected_recurrent_bytes
+        );
+        let conv_src = read_bytes(bytes, &mut cursor, conv_byte_len)?;
+        let rec_src = read_bytes(bytes, &mut cursor, rec_byte_len)?;
+        let mut conv_buf = device
+            .alloc_buffer(conv_byte_len, DType::F32, conv_shape_usize.clone())
+            .map_err(|e| {
+                anyhow!("QH35 deserialize: alloc linear_conv[{slot_idx}]: {e}")
+            })?;
+        let mut rec_buf = device
+            .alloc_buffer(rec_byte_len, DType::F32, recurrent_shape_usize.clone())
+            .map_err(|e| {
+                anyhow!("QH35 deserialize: alloc linear_recurrent[{slot_idx}]: {e}")
+            })?;
+        {
+            let conv_dst = conv_buf.as_mut_slice::<u8>().map_err(|e| {
+                anyhow!("QH35 deserialize: linear_conv[{slot_idx}] mut_slice: {e}")
+            })?;
+            conv_dst.copy_from_slice(conv_src);
+        }
+        {
+            let rec_dst = rec_buf.as_mut_slice::<u8>().map_err(|e| {
+                anyhow!("QH35 deserialize: linear_recurrent[{slot_idx}] mut_slice: {e}")
+            })?;
+            rec_dst.copy_from_slice(rec_src);
+        }
+        linear_conv.push(conv_buf);
+        linear_recurrent.push(rec_buf);
     }
+
+    // MTP: ITER-4 SCOPE — still bails when cfg.has_mtp = true.
+    let mtp: Option<MtpKvSnapshot> = None;
     if cfg.has_mtp {
         return Err(anyhow!(
             "QH35 deserialize: cfg.has_mtp = true but MTP read path is iter-4 \
@@ -650,16 +751,73 @@ mod tests {
     }
 
     fn synth_cfg(n_full_attn: u32, n_seqs: u32) -> Qwen35HybridConfig {
-        // Tiny shape: [n_seqs, n_kv_heads=2, max_seq_len=8, head_dim=4]
-        // → 2 * 8 * 4 = 64 elems/seq; 64 * n_seqs total per K (or V).
+        synth_cfg_with_linear(n_full_attn, 0, n_seqs)
+    }
+
+    /// Same as `synth_cfg` but allows `n_linear_attn > 0` for iter-3
+    /// round-trip tests. Linear conv shape `[conv_channels=4, K-1=3, n_seqs]`
+    /// (DELTA_NET_CONV_K = 4 → K-1 = 3); recurrent `[D_k=4, D_v=8, num_v_heads=2, n_seqs]`.
+    fn synth_cfg_with_linear(
+        n_full_attn: u32,
+        n_linear_attn: u32,
+        n_seqs: u32,
+    ) -> Qwen35HybridConfig {
+        // Tiny shapes — keep the test bytes small + auditable.
         Qwen35HybridConfig {
             n_full_attn,
-            n_linear_attn: 0,
+            n_linear_attn,
             has_mtp: false,
             n_seqs,
             full_attn_shape: [n_seqs as u64, 2, 8, 4],
             full_attn_codec: FullAttnCodec::F32Dense,
+            linear_conv_shape: [4, 3, n_seqs as u64],
+            linear_recurrent_shape: [4, 8, 2, n_seqs as u64],
         }
+    }
+
+    /// Build a snapshot containing both full-attn AND linear-attn slots
+    /// with deterministic byte patterns for round-trip verification.
+    fn synth_full_plus_linear_snapshot(
+        device: &MlxDevice,
+        cfg: &Qwen35HybridConfig,
+    ) -> HybridKvCacheSnapshot {
+        let mut snap = synth_full_attn_only_snapshot(device, cfg);
+        let conv_elems: usize = cfg.linear_conv_shape.iter().product::<u64>() as usize;
+        let conv_bytes_len = conv_elems * std::mem::size_of::<f32>();
+        let conv_shape_usize: Vec<usize> =
+            cfg.linear_conv_shape.iter().map(|d| *d as usize).collect();
+        let rec_elems: usize =
+            cfg.linear_recurrent_shape.iter().product::<u64>() as usize;
+        let rec_bytes_len = rec_elems * std::mem::size_of::<f32>();
+        let rec_shape_usize: Vec<usize> = cfg
+            .linear_recurrent_shape
+            .iter()
+            .map(|d| *d as usize)
+            .collect();
+        for slot in 0..cfg.n_linear_attn as usize {
+            let mut conv = device
+                .alloc_buffer(conv_bytes_len, DType::F32, conv_shape_usize.clone())
+                .expect("alloc conv");
+            {
+                let dst = conv.as_mut_slice::<u8>().expect("conv mut_slice");
+                for (i, b) in dst.iter_mut().enumerate() {
+                    *b = ((slot * 13 + i) % 251) as u8;
+                }
+            }
+            snap.linear_conv.push(conv);
+
+            let mut rec = device
+                .alloc_buffer(rec_bytes_len, DType::F32, rec_shape_usize.clone())
+                .expect("alloc rec");
+            {
+                let dst = rec.as_mut_slice::<u8>().expect("rec mut_slice");
+                for (i, b) in dst.iter_mut().enumerate() {
+                    *b = ((slot * 17 + i) % 251) as u8;
+                }
+            }
+            snap.linear_recurrent.push(rec);
+        }
+        snap
     }
 
     fn snapshots_byte_equal(a: &HybridKvCacheSnapshot, b: &HybridKvCacheSnapshot) -> bool {
@@ -692,6 +850,18 @@ mod tests {
         }
         if a.linear_recurrent.len() != b.linear_recurrent.len() {
             return false;
+        }
+        for i in 0..a.linear_conv.len() {
+            let ac = a.linear_conv[i].as_slice::<u8>().expect("ac slice");
+            let bc = b.linear_conv[i].as_slice::<u8>().expect("bc slice");
+            if ac != bc {
+                return false;
+            }
+            let ar = a.linear_recurrent[i].as_slice::<u8>().expect("ar slice");
+            let br = b.linear_recurrent[i].as_slice::<u8>().expect("br slice");
+            if ar != br {
+                return false;
+            }
         }
         true
     }
@@ -806,7 +976,8 @@ mod tests {
     }
 
     #[test]
-    fn qh35_deserialize_rejects_iter3_scope_linear_attn() {
+    fn qh35_round_trip_with_linear_attn_byte_equal() {
+        // ADR-027 Phase A iter-3: linear-attn slot round-trip.
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -814,21 +985,40 @@ mod tests {
                 return;
             }
         };
-        // Build a config that claims linear-attn slots but pass an empty
-        // snapshot (which serialize will reject — so we hand-craft bytes
-        // by using a config that says n_linear_attn=2 with no slots, then
-        // patch the count after-the-fact for a deserialize-only test).
-        let mut cfg = synth_cfg(0, 1);
-        let snap = synth_full_attn_only_snapshot(&device, &cfg);
-        let mut bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize");
-        // n_linear_attn at offset 12..16 — bump to 2.
-        bytes[12..16].copy_from_slice(&2u32.to_le_bytes());
-        cfg.n_linear_attn = 2;
-        let err = deserialize_hybrid_snapshot(&bytes, &cfg, &device).unwrap_err();
+        let cfg = synth_cfg_with_linear(2, 3, 1);
+        let snap = synth_full_plus_linear_snapshot(&device, &cfg);
+        let bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize");
+        let restored =
+            deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
+        assert!(snapshots_byte_equal(&snap, &restored));
+        // Per-linear-slot overhead = slot_idx(4) + conv_len(8) + rec_len(8) = 20.
+        // Per-linear-slot body = conv(4*3*1*4) + rec(4*8*2*1*4) = 48 + 256 = 304.
+        // Per-slot total = 324. With 3 linear slots = 972 bytes.
+        // Plus header(24) + 2 full-attn slots @ 568 each = 24 + 1136 = 1160.
+        // Total = 1160 + 972 = 2132 bytes.
+        assert_eq!(bytes.len(), 24 + 2 * 568 + 3 * 324);
+    }
+
+    #[test]
+    fn qh35_serialize_rejects_linear_conv_shape_mismatch() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = synth_cfg_with_linear(0, 2, 1);
+        let snap = synth_full_plus_linear_snapshot(&device, &cfg);
+        // Claim a different conv_channels count than the snapshot's
+        // buffers actually carry — serialize should error.
+        let mut bad_cfg = cfg.clone();
+        bad_cfg.linear_conv_shape = [8, 3, 1]; // conv_channels=8 instead of 4
+        let err = serialize_hybrid_snapshot(&snap, &bad_cfg).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("iter-3 scope"),
-            "expected iter-3 scope error, got: {msg}"
+            msg.contains("linear_conv") && msg.contains("byte_len"),
+            "expected linear_conv byte_len error, got: {msg}"
         );
     }
 }
