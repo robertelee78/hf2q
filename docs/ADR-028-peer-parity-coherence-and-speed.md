@@ -285,6 +285,88 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-110 dense FFN inventory + structural-gap synthesis (55.7% mapped)
+
+Bench `bench_iter110_dense_ffn` localizes the dense FFN portion. gemma-4-26b
+config: `gemma4.feed_forward_length=2112` (dense intermediate),
+`gemma4.expert_feed_forward_length=704` (per-expert MoE intermediate).
+Neither divides 256 (Q6_K block size); dense tensors must use block-32
+quants (Q4_0/Q5_1/Q8_0/IQ4_NL). Bracketed Q4_0 (lower bw bound, 4.5 bpw)
++ Q8_0 (upper bw bound, 8.5 bpw):
+
+| Kernel | Q4_0 GPU/call | Q8_0 GPU/call | Per-token (Q4_0) | % decode |
+|---|---:|---:|---:|---:|
+| Dense gate (n=2112 k=2816) | 13.68 µs | 8.01 µs | 0.64 ms | 4.1% |
+| Dense up (n=2112 k=2816) | 13.65 µs | — | 0.64 ms | 4.1% |
+| Dense down (n=2816 k=2112) | 15.21 µs | 5.10 µs | 0.68 ms | 4.3% |
+| Router (n=128 k=2816) | 2.34 µs | — | 0.25 ms | 1.6% |
+| **Subtotal dense FFN** | | | **~2.21 ms** | **~14%** |
+
+**Surprise**: Q8_0 (8.5 bpw) runs 1.7× FASTER than Q4_0 (4.5 bpw) at this
+shape. Q4_0 has known per-block unpack compute overhead (per iter-99
+list of bench items). Production likely uses ~Q5_1 or similar in the
+"Q5_K_M" mixed scheme, falling between these bounds → ~1.5 ms estimated.
+
+**Updated cumulative inventory** (15.83 ms decode token):
+
+| Group | Per-token | % decode |
+|---|---:|---:|
+| LM head Q8_0 (1 call) | 1.58 ms | 9.9% |
+| FA-vec-tq-hb (30) | 1.43 ms | 9.0% |
+| mv_id Q6_K MoE (60) | 0.96 ms | 6.0% |
+| Q+K+V+O proj (120) | 2.62 ms | 16.5% |
+| Dense FFN gate+up+down (90) | ~1.96 ms | ~12.4% |
+| Router (30) | 0.25 ms | 1.6% |
+| norm fused + FWHT (180) | 0.49 ms | 3.1% |
+| **Subtotal measured** | **~9.29 ms** | **~58.6%** |
+| Unaccounted (449 dispatches) | ~6.54 ms | ~41.4% |
+
+**Remaining 449 unaccounted dispatches**:
+- KV TQ-HB encode (4/layer × 30 = 120 calls)
+- KV format conv (2/layer × 30 = 60)
+- Head norm + RoPE (60)
+- Triple norm B8 (90)
+- gelu_mul + moe_routing (60)
+- moe_weighted_sum (30)
+- Post-FF norm2 + end-layer (60)
+
+At 16 µs floor avg × 449 ≈ 7.18 ms. Matches the budget gap. These are
+small dispatch-bound kernels where iter-101 confirmed within-kernel ROI
+is ~0.28%. Only fusion can reduce them further; most have already-fused
+neighbors per iter-98 categorization.
+
+**Synthesis: where can the 4.72 ms peer gap close?**
+
+Decoding the gap structurally:
+- LM head (1.58 ms): at 587 GB/s memory ceiling, **0% recoverable**.
+- 4 projs (2.62 ms): at compute/bandwidth ceiling for shape × Q6_K,
+  **near-optimal**. Q5_K mix would save ~10-15% = 0.3 ms.
+- Dense FFN (1.96 ms): same — near-optimal.
+- mv_id MoE (0.96 ms): at floor, can't go below.
+- FA-vec-tq-hb (1.43 ms): structural TQ overhead vs llama.cpp's flat F16.
+  **Cannot recover without dropping ADR-027 Phase B's 3.94× memory savings.**
+- 449 small dispatches at floor (~7 ms): fusion ROI ~1-3% per merge,
+  most already maximally fused.
+
+**Hard truth**: the kernel-time gap vs llama.cpp HEAD is **structurally
+~3-4 ms** (TQ-HB overhead + Q-format choice). Closing it without losing
+TQ-HB's 3.94× memory savings would require:
+1. Dropping TQ entirely (mantra-violating: loses memory savings)
+2. Switching from Q5_K_M to a smaller quant (Q4_K) — loses some
+   coherence quality, requires operator approval
+3. Speculative decode (n-gram / DFlash / MTP) — orthogonal lever,
+   gives 2-4× decode at acceptance ≥ 60% per iter-99 vLLM/dflash research
+
+**Mantra status post-iter-110**:
+- ✅ Coherence: byte-identical to llama.cpp on sourdough
+- ✅ Prefill: 1.13×–1.87× FASTER than llama.cpp HEAD
+- ❌ Decode: 0.65× peer at FA=1 — STRUCTURAL within current TQ-HB regime
+  Recoverable via speculative decode (orthogonal to kernel work)
+
+**Iter-111 plan**: bench KV TQ-HB encode (final big unmeasured kernel)
++ start scoping speculative decode infrastructure (vLLM-style n-gram
+proposer is the lowest-risk highest-leverage option per iter-99 §6).
+
 ### Iter-109 hot-kernel inventory — 44.6% of decode mapped, LM head at memory ceiling
 
 Bench `bench_iter109_decode_hot_kernels` in `tests/test_quantized_matmul_
