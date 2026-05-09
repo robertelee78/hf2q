@@ -268,4 +268,17 @@ For this project phase the sliding_wrap 752-byte batched-vs-batched ceiling is *
 
   Speedup over per-token DEFAULT (cumulative iter-64 + iter-68): pp1024 = **29×**, pp2455 = **35×**.
 
+- 2026-05-09 (iter-69 DECODE gap measured — separate from prefill work above): Operator flagged decode-side speed (`--- mlx-native: 885 tokens in 14.91s (59.3 tok/s) ---` from a chat run). Direct measurement on gemma4-ara-2pass-APEX-Q5_K_M.gguf: hf2q decode = 64 t/s, llama.cpp `tg128` peer = 103.1 t/s = **0.62× peer** (~38% slower, ~6.5 ms/token gap, ~210 µs/layer gap × 30 layers).
+
+  Decode profile via `HF2Q_MLX_PROFILE=1` (32-token run, 2 warmup skipped):
+  - Single-session mode active (all 30 layers fused into S1)
+  - S1 (QKV+attn+MLP+MoE) = 538.8 µs/layer × 30 = 16.16 ms/token
+  - 15310 dispatches across 29 measured tokens = ~528 dispatches/token (= 30 layers × ~17.6 dispatches/layer)
+  - Bucket-level decode profile NOT available (HF2Q_PROFILE_BUCKETS / HF2Q_PROFILE_GPU_TS are prefill-only)
+
+  Hypothesis: at decode m=1 the MoE FFN routes to `mv_id` (mat-vec) variant rather than `mm_id` (mat-mat). The mv_id kernels for K-quants (Q4_K, Q5_K, Q6_K) are llama.cpp ports (per ADR-013/ADR-022) — possibly with the same kind of suboptimal precision/layout choices that the iter-68 typo fix unlocked for mm_id. Next iter: dedicated xcrun metal capture OR per-mv-kernel µbench to localize the dominant cost.
+
+  Note: iter-69 is a DECODE-side investigation — independent of the iter-64/iter-68 PREFILL fixes. The prefill work delivered 29× / 35× speedup vs per-token default and is shipping (gated). Decode gap is the next operator-facing perf hill.
+
+
 
