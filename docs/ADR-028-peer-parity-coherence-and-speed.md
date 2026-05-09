@@ -1644,6 +1644,98 @@ forward_decode (mirroring forward_prefill_batched.rs's 20+ buckets).
 - **No new public API**: all changes are internal (forward_prefill_
   batched.rs body + Metal shader text + LoadInfo computation).
 
+## Synthesis (iter-99..118 — narrowed work-items for operator)
+
+The investigation in iters 99-118 mapped 99% of the decode budget and
+ran 11 static-lever falsifications. Original `docs/research/adr-029-
+DRAFT-spec-decode-2026-05-09.md` proposed a separate ADR; per operator
+direction the findings are consolidated into this section instead, to
+narrow the work scope.
+
+### Decode budget map (per-token, 15.86 ms total)
+
+| Group | Per-token | % decode | Status |
+|---|---:|---:|---|
+| LM head Q8_0 (1 call) | 1.58 ms | 9.9% | At memory ceiling (587 GB/s ≈ M5 Max max). **No room.** |
+| FA-vec-tq-hb (30) at kL≤512 | 1.43 ms | 9.0% | At GPU saturation. **Flat.** |
+| FA-vec-tq-hb (30) at kL=1024 | 2.53 ms | 16.0% | **Linear past 512.** |
+| FA-vec-tq-hb (30) at kL=1536 | 3.60 ms | 22.7% | **Linear past 512.** |
+| Q+K+V+O proj (120) | 2.62 ms | 16.5% | At compute ceiling for shape × Q6_K |
+| Dense FFN gate+up+down (90) | 1.96 ms | 12.4% | At compute ceiling |
+| mv_id Q6_K MoE (60) | 0.96 ms | 6.0% | At 16 µs/dispatch floor |
+| Router (30) | 0.25 ms | 1.6% | At floor |
+| KV TQ-HB encode (120) | 0.29 ms | 1.8% | At floor |
+| norm + FWHT (180) | 0.49 ms | 3.1% | At floor |
+| Subtotal measured (711 dispatches) | 9.58 ms | 60.4% | |
+| Unaccounted (~279 dispatches × 16 µs floor) | ~6.25 ms | ~39.6% | Small kernels at floor — fusion ROI ≤0.28%/kernel |
+
+### Standing rules from the 11 falsifications
+
+- **At decode row=1 on M5 Max, kernels at the 16 µs/dispatch GPU
+  floor cannot be improved by vectorization or ILP.** Only dispatch-
+  count reduction (true fusion 2→1) is a real lever for those.
+- **HF2Q_SKIP_*-style env flags are timing bisects, not surgical
+  isolations.** The "saved" time includes everything in the gated
+  branch. Microbench the SPECIFIC dispatch + barrier instead.
+- **llama.cpp constants do not necessarily port to hf2q wins on M5
+  Max.** Apple's compiler/scheduler hoists what llama.cpp hand-tunes.
+  Verify every port empirically.
+- **HF2Q_SKIP_TQ_SDPA=1 → 79.1 t/s** (vs 63.6 default) measures the
+  total TQ regime cost = 3.19 ms = 20% of decode. Garbage output, but
+  proves TQ-HB is the dominant structural overhead.
+
+### Iter-118 NEW finding: long-context lever exists
+
+iter-100 falsified `HF2Q_TQ_NWG=32` at kL ≤ 170 (FA already saturated).
+**iter-118 re-tested at long kL with concrete production result:**
+
+| Config | Decode tg800 (~860 kL) | Δ |
+|---|---:|---:|
+| Default `nwg=16` | **59.6 t/s** | baseline |
+| `HF2Q_TQ_NWG=32` | **62.4 t/s** | **+4.7%** |
+
+This is the FIRST positive lever after 11 static-lever falsifications.
+Threshold: nwg=32 wins at kL > 512 where FA scales linearly with K-dim
+work. nwg=16 stays optimal at kL ≤ 512 (saturated GPU). A
+**kL-adaptive nwg** in `compute_nwg()` would lift long-context decode
+without touching short-context perf — surgical 5-LOC change in
+`/opt/mlx-native/src/ops/flash_attn_vec_tq_hb.rs:113`.
+
+### Three closure paths to the decode mantra-violation
+
+The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
+is structurally bounded within the current TQ-HB + Q5_K_M regime.
+Closure requires operator decision on:
+
+**A. Speculative decode** (orthogonal lever, no quality loss):
+- Phase 1 LANDED (hf2q `04d53cf`): n-gram proposer KMP port, 11 unit
+  tests, sub-µs CPU cost (1 ns/token amortized)
+- Phase 2 contract LANDED (`1e33a28`+`31edbeb`): Verifier trait +
+  accept_prefix + 13 tests + byte-identity gate proven in CPU
+  simulation
+- Phase 2 GPU implementation: ~180 LOC (multi-token forward + KV
+  rollback) — pf_hidden already retains per-position state per iter-
+  116 design read
+- Expected: 60-80% acceptance → 1.6-3.0× decode lift = 100-190 t/s
+  (mantra MET)
+
+**B. Drop TQ-HB**: recovers ~3 ms (FA + KV encode + FWHTs structural).
+Loses ADR-027 Phase B's 3.94× memory savings. **Mantra-violating.**
+
+**C. Switch Q5_K_M → Q4_K**: saves ~10-15% bandwidth on big kernels =
+~0.5-1 ms/token. Loses some coherence quality. Requires operator
+approval.
+
+### Narrowed action list (priority ordered)
+
+1. **iter-119 (this work): land kL-adaptive nwg in `compute_nwg()`** —
+   surgical 5-LOC change, **measured +4.7% at kL=860** with no
+   trade-offs. NO operator approval needed.
+2. **Path A Phase 2 GPU implementation** — operator approval needed for
+   multi-iter scope. Currently sequenced across iters 119-125+ per the
+   plan in `docs/research/adr-029-DRAFT-spec-decode-2026-05-09.md`.
+3. Path B/C — operator decision required.
+
 ## Open scope (gated on operator pick)
 
 1. **Default-flip on batched prefill** — operator UX call. Validated for
