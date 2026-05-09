@@ -442,6 +442,12 @@ impl Qwen35Model {
         // path as lm_head; F2 round-trip drift was measured under 0.10 for
         // every attn Linear in the empirical 27B 20-step overlay.
         let mut overridden_dense_attn: usize = 0;
+        // ADR-020 AC#7 iter B2.B — count of dense FFN projections overlaid
+        // (Gate/Up/Down across all FullAttn layers with DenseQ variant).
+        // Path: dequant DWQ → transpose to GGUF native → Q4_0 re-encode →
+        // replace MlxBuffer in DenseFfnWeightsQ.  MoE FFN layers are NOT
+        // counted here (they go through the existing MoE bucket path).
+        let mut overridden_dense_ffn: usize = 0;
 
         for name in st.names() {
             let stem = match name.strip_suffix(".weight") {
@@ -585,6 +591,62 @@ impl Qwen35Model {
                         tracing::warn!(error = %e,
                             "qwen35 DWQ overlay: {} layer {} skipped",
                             layer_kind_label, layer_idx);
+                        unknown_skipped += 1;
+                    }
+                }
+                continue;
+            }
+
+            // ── ADR-020 AC#7 iter B2.B — dense FFN gate/up/down ───────────────
+            // The Phase 3c trainer trained these 3 Linears per FullAttn layer
+            // (jointly with attn + lm_head).  Without this branch dense FFN
+            // training would be silently dropped at serve, defeating the
+            // cross-layer KL signal.  Routes only when ffn variant is DenseQ;
+            // MoE per-expert stems (`ffn_gate.{e}` etc.) take the bucket
+            // path below.
+            //
+            // Native storage is GGML Q4_0 blocks (MlxBuffer), not Vec<f32>,
+            // so the helper does a full DWQ→native-shape→Q4_0-re-encode→
+            // new MlxBuffer dance.  F2 round-trip measurement on the
+            // empirical 27B 20-step overlay found relative_rms < 0.10 on
+            // every dense FFN role (codec preserves >90% of DWQ signal).
+            let dense_ffn_role: Option<DenseFfnRole> = match role {
+                "ffn_gate" => Some(DenseFfnRole::Gate),
+                "ffn_up"   => Some(DenseFfnRole::Up),
+                "ffn_down" => Some(DenseFfnRole::Down),
+                _ => None,
+            };
+            if let Some(ffn_role) = dense_ffn_role {
+                let linear = MlxAffineLinear::from_safetensors(&st, stem, bits, group_size)
+                    .with_context(|| format!("qwen35 apply_dwq_overlay: parse {stem}"))?;
+                let role_label = format!("{ffn_role:?}");
+                match overwrite_dense_ffn_q4_0_linear(
+                    &mut self.layers[layer_idx], ffn_role, &linear, layer_idx, stem, device,
+                ) {
+                    Ok(()) => {
+                        match linear.q4_0_round_trip_drift() {
+                            Ok(d) => eprintln!(
+                                "[qwen35 DWQ overlay] {role_label} \
+                                 (layer {layer_idx}) Q4_0 round-trip drift: \
+                                 rms={rms:.4e} max={max:.4e} \
+                                 relative_rms={rrms:.4} bias_fraction={bf:.4}",
+                                rms = d.rms_drift, max = d.max_abs_drift,
+                                rrms = d.relative_rms, bf = d.bias_fraction,
+                            ),
+                            Err(e) => tracing::warn!(error = %e,
+                                "qwen35 DWQ overlay: {} layer {} drift skipped",
+                                role_label, layer_idx),
+                        }
+                        overridden_dense_ffn += 1;
+                    }
+                    Err(e) => {
+                        // MoE FFN: the bucket path will pick it up under
+                        // the per-expert stem pattern (ffn_gate.{e}); not a
+                        // failure for that variant.  Errors from native-
+                        // type / shape mismatch ARE surfaced.
+                        tracing::warn!(error = %e,
+                            "qwen35 DWQ overlay: {} layer {} skipped",
+                            role_label, layer_idx);
                         unknown_skipped += 1;
                     }
                 }
@@ -742,16 +804,19 @@ impl Qwen35Model {
         tracing::info!(
             moe_stacked,
             overridden_dense_attn,
+            overridden_dense_ffn,
             lm_head_overridden,
             unknown_skipped,
             bits,
             group_size,
             "qwen35 DWQ overlay applied: {moe_stacked} MoE expert stacks + \
-             {overridden_dense_attn} dense attn Linears{}",
+             {overridden_dense_attn} dense attn Linears + \
+             {overridden_dense_ffn} dense FFN Linears{}",
             if lm_head_overridden { " + lm_head" } else { "" }
         );
         Ok(moe_stacked
             + overridden_dense_attn
+            + overridden_dense_ffn
             + if lm_head_overridden { 1 } else { 0 })
     }
 }
@@ -765,6 +830,167 @@ enum AttnRole {
     K,
     V,
     Output,
+}
+
+/// ADR-020 AC#7 iter B2.B — internal role tag for the dense-FFN overlay
+/// path.  Decouples stem-string parsing (`"ffn_gate"` / `"ffn_up"` /
+/// `"ffn_down"`) from the Q4_0-rebuild logic in
+/// [`overwrite_dense_ffn_q4_0_linear`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DenseFfnRole {
+    Gate,
+    Up,
+    Down,
+}
+
+/// ADR-020 AC#7 iter B2.B — pure CPU helper: dequantize a DWQ-trained
+/// dense FFN Linear into the GGUF-native row-major F32 layout that
+/// [`upload_q4_0_from_f32`] expects.
+///
+/// Shape contract (the trainer wrapper at
+/// `dwq_loop.rs::3911-3925` / our iter-A transpose fix):
+///   - `Gate`/`Up`: DWQ stores `[n=hidden, k=intermediate]`; GGUF native
+///     is `[intermediate, hidden]` row-major.  Transpose direction:
+///     `(hidden, intermediate)` → `(intermediate, hidden)`.
+///   - `Down`: DWQ stores `[n=intermediate, k=hidden]`; GGUF native is
+///     `[hidden, intermediate]` row-major.  Transpose direction:
+///     `(intermediate, hidden)` → `(hidden, intermediate)`.
+///
+/// In every case the output's row length is `hidden` for gate/up and
+/// `intermediate` for down — both multiples of `QK4_0=32` for the
+/// Qwen3.6-27B-MTP fixture validated by F2 (`hidden=5120`,
+/// `intermediate=17408`).  The downstream Q4_0 codec
+/// (`quantize_row_q4_0_to_bytes`) row-quantizes one matrix row at a
+/// time, so the transposed layout matches what the GGML Q4_0 matmul
+/// kernel reads at serve.
+fn dwq_to_native_q4_0_f32(
+    linear: &crate::calibrate::mlx_safetensors_loader::MlxAffineLinear,
+    role: DenseFfnRole,
+    intermediate: usize,
+    hidden: usize,
+) -> anyhow::Result<Vec<f32>> {
+    // Validate DWQ shape against role-expected (n, k).  These must hold
+    // because the trainer wrapper packs every dense FFN Linear with
+    // these exact dimensions; a mismatch here means the overlay was
+    // produced for a different model.
+    let (expect_n, expect_k) = match role {
+        DenseFfnRole::Gate | DenseFfnRole::Up => (hidden, intermediate),
+        DenseFfnRole::Down => (intermediate, hidden),
+    };
+    if linear.n != expect_n || linear.k != expect_k {
+        anyhow::bail!(
+            "dwq_to_native_q4_0_f32: {role:?} shape ({}, {}) != expected ({}, {})",
+            linear.n, linear.k, expect_n, expect_k,
+        );
+    }
+
+    let dwq_flat = linear.dequantize_to_f32();   // [n, k] row-major
+    debug_assert_eq!(dwq_flat.len(), expect_n * expect_k);
+
+    // Transpose into GGUF native layout (rows = output dim).
+    // src/dst sizes are role-specific; src_cols is what we index into
+    // dwq_flat with (it equals dst's row dim, by construction of transpose).
+    let (out_rows, out_cols, src_cols) = match role {
+        DenseFfnRole::Gate | DenseFfnRole::Up => {
+            // src: [hidden rows, intermediate cols] → dst: [intermediate rows, hidden cols]
+            (intermediate, hidden, intermediate)
+        }
+        DenseFfnRole::Down => {
+            // src: [intermediate rows, hidden cols] → dst: [hidden rows, intermediate cols]
+            (hidden, intermediate, hidden)
+        }
+    };
+    let mut out = vec![0f32; out_rows * out_cols];
+    for r in 0..out_rows {
+        for c in 0..out_cols {
+            // dst[r, c] = src[c, r]  (transpose)
+            out[r * out_cols + c] = dwq_flat[c * src_cols + r];
+        }
+    }
+    Ok(out)
+}
+
+/// ADR-020 AC#7 iter B2.B — overwrite a single dense FFN projection
+/// (Gate, Up, or Down) on a [`Qwen35LayerWeights::FullAttn`] layer
+/// whose FFN variant is [`Qwen35FfnWeights::DenseQ`] (the production
+/// path for non-MoE Qwen3.5/3.6 models).
+///
+/// Unlike the iter-B2.A attn path (which overwrites a `Vec<f32>` and
+/// lets the next forward's `upload_q4_0_from_f32` handle the GPU
+/// upload), DenseFfnWeightsQ stores raw GGML blocks directly as
+/// `MlxBuffer`.  This helper:
+///   1. Dequantizes the DWQ-trained values via `dwq_to_native_q4_0_f32`
+///      (transpose-included)
+///   2. Re-quantizes to Q4_0 bytes via `upload_q4_0_from_f32`
+///   3. Replaces the target buffer slot (gate_q / up_q / down_q)
+///
+/// Errors:
+///   - Layer is `LinearAttention`: DeltaNet doesn't have dense FFN
+///     overrideable via this stem; trainer never emits FFN stems for
+///     LinearAttn layers anyway.
+///   - FFN variant is not DenseQ (Dense/Moe/MoeQ): MoeQ goes through
+///     the existing MoE bucket path; Dense/Moe wouldn't appear in a
+///     production GGUF-loaded model.
+///   - Native ggml type is not Q4_0: the trainer was validated against
+///     Qwen3.6-27B-MTP (all-Q4_0 dense FFN, confirmed by gguf-dump).
+///     Q8_0 / Q6_K paths are deferred until operator validates a
+///     fixture that uses them.
+fn overwrite_dense_ffn_q4_0_linear(
+    layer: &mut Qwen35LayerWeights,
+    role: DenseFfnRole,
+    linear: &crate::calibrate::mlx_safetensors_loader::MlxAffineLinear,
+    layer_idx: usize,
+    stem: &str,
+    device: &mlx_native::MlxDevice,
+) -> anyhow::Result<()> {
+    use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+
+    let ffn = match layer {
+        Qwen35LayerWeights::FullAttn { ffn, .. } => ffn,
+        Qwen35LayerWeights::LinearAttn { .. } => {
+            anyhow::bail!(
+                "qwen35 DWQ overlay: layer {layer_idx} is LinearAttention; \
+                 FFN-role stem '{stem}' not applicable"
+            );
+        }
+    };
+    let dq = match ffn {
+        Qwen35FfnWeights::DenseQ(d) => d,
+        other => {
+            anyhow::bail!(
+                "qwen35 DWQ overlay: layer {layer_idx} ffn variant is {} \
+                 (expected DenseQ); MoeQ goes through the MoE bucket path",
+                other.variant()
+            );
+        }
+    };
+    // Native ggml type gate: trainer validated against Q4_0 only.
+    let native_t = match role {
+        DenseFfnRole::Gate | DenseFfnRole::Up => dq.ggml_type_gate_up,
+        DenseFfnRole::Down => dq.ggml_type_down,
+    };
+    if native_t != GgmlType::Q4_0 {
+        anyhow::bail!(
+            "qwen35 DWQ overlay: layer {layer_idx} {role:?} native ggml type \
+             is {native_t:?}; only Q4_0 is supported by iter-B2.B (Q8_0 / \
+             Q6_K paths deferred pending operator-validated fixture)"
+        );
+    }
+
+    let intermediate = dq.intermediate_size as usize;
+    let hidden = dq.hidden_size as usize;
+    let native_f32 = dwq_to_native_q4_0_f32(linear, role, intermediate, hidden)?;
+    let new_buf =
+        crate::inference::models::qwen35::gpu_full_attn::upload_q4_0_from_f32(
+            &native_f32, device,
+        )
+        .with_context(|| format!("qwen35 DWQ overlay: re-Q4_0 upload {stem}"))?;
+    match role {
+        DenseFfnRole::Gate => dq.gate_q = new_buf,
+        DenseFfnRole::Up   => dq.up_q   = new_buf,
+        DenseFfnRole::Down => dq.down_q = new_buf,
+    }
+    Ok(())
 }
 
 /// ADR-020 AC#7 iter B2.A — overwrite a single dense attention F32
@@ -1211,6 +1437,116 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("shape mismatch"),
             "error must name shape mismatch; got: {msg}");
+    }
+
+    // ── ADR-020 AC#7 iter B2.B — dwq_to_native_q4_0_f32 transpose tests ──
+    // Pure CPU; no GPU.  Validates the shape contract + transpose math
+    // for the dense-FFN overlay path (gate/up: hidden×inter → inter×hidden;
+    // down: inter×hidden → hidden×inter).
+
+    /// Build a tiny synthetic MlxAffineLinear with codes such that
+    /// dequantize_to_f32 returns a deterministic, easy-to-check vector.
+    fn synth_ffn_linear(n: usize, k: usize) -> MlxAffineLinear {
+        // scales=1, biases=0, codes = (i*k + j) — encodes the flat index
+        // directly so transpose math is verifiable element-by-element.
+        // Code values must fit in 4 bits ([0,15]) so we mod 16.
+        let group_size = 32usize;
+        let groups_per_row = k / group_size;
+        let q_int: Vec<u8> = (0..n)
+            .flat_map(|i| (0..k).map(move |j| ((i * k + j) % 16) as u8))
+            .collect();
+        let scales = vec![1.0f32; n * groups_per_row];
+        let biases = vec![0.0f32; n * groups_per_row];
+        MlxAffineLinear { n, k, group_size, bits: 4, q_int, scales, biases }
+    }
+
+    #[test]
+    fn dwq_to_native_q4_0_f32_gate_transposes_hidden_to_intermediate_rows() {
+        // Gate: DWQ shape (n=hidden=64, k=inter=128) → native (inter, hidden)
+        // = (128 rows, 64 cols).
+        let hidden = 64usize;
+        let inter = 128usize;
+        let lin = synth_ffn_linear(hidden, inter);
+        // Sanity: dwq_flat[i*inter + j] = ((i*inter + j) % 16) as f32.
+        let dwq_flat = lin.dequantize_to_f32();
+        assert_eq!(dwq_flat.len(), hidden * inter);
+        // Native should be transposed: native[r=inter_row, c=hidden_col]
+        // = dwq_flat[c=hidden_row, r=inter_col]. Re-index check:
+        //   native[r * hidden + c] = dwq_flat[c * inter + r]
+        let native = dwq_to_native_q4_0_f32(
+            &lin, DenseFfnRole::Gate, inter, hidden,
+        ).expect("must succeed on shape match");
+        assert_eq!(native.len(), inter * hidden);
+        for r in 0..inter {
+            for c in 0..hidden {
+                let want = ((c * inter + r) % 16) as f32;
+                let got = native[r * hidden + c];
+                assert_eq!(got, want,
+                    "gate transpose [r={r}, c={c}]: got {got} want {want}");
+            }
+        }
+    }
+
+    #[test]
+    fn dwq_to_native_q4_0_f32_down_transposes_intermediate_to_hidden_rows() {
+        // Down: DWQ shape (n=inter=128, k=hidden=64) → native (hidden, inter)
+        // = (64 rows, 128 cols).
+        let hidden = 64usize;
+        let inter = 128usize;
+        let lin = synth_ffn_linear(inter, hidden);
+        let native = dwq_to_native_q4_0_f32(
+            &lin, DenseFfnRole::Down, inter, hidden,
+        ).expect("must succeed on shape match");
+        assert_eq!(native.len(), hidden * inter);
+        // native[r=hidden_row, c=inter_col] = dwq_flat[c=inter_row, r=hidden_col]
+        for r in 0..hidden {
+            for c in 0..inter {
+                let want = ((c * hidden + r) % 16) as f32;
+                let got = native[r * inter + c];
+                assert_eq!(got, want,
+                    "down transpose [r={r}, c={c}]: got {got} want {want}");
+            }
+        }
+    }
+
+    #[test]
+    fn dwq_to_native_q4_0_f32_role_validates_shape() {
+        // Gate expects (n=hidden, k=inter); supplying (n=inter, k=hidden)
+        // must error rather than silently transposing wrong data.
+        let hidden = 64usize;
+        let inter = 128usize;
+        let bad = synth_ffn_linear(inter, hidden);  // wrong order for Gate
+        let err = dwq_to_native_q4_0_f32(
+            &bad, DenseFfnRole::Gate, inter, hidden,
+        ).expect_err("wrong-shape MlxAffineLinear must error for Gate role");
+        let msg = format!("{err}");
+        assert!(msg.contains("shape"),
+            "error message must mention shape; got: {msg}");
+    }
+
+    #[test]
+    fn dwq_to_native_q4_0_f32_round_trip_dimensions() {
+        // Sanity: total element count is preserved across the transpose
+        // and the output shape's row length is what Q4_0 will see.
+        let hidden = 64usize;
+        let inter = 128usize;
+        let cases: &[(DenseFfnRole, usize, usize, usize)] = &[
+            (DenseFfnRole::Gate, hidden, inter, hidden), // row_len = hidden
+            (DenseFfnRole::Up,   hidden, inter, hidden),
+            (DenseFfnRole::Down, inter,  hidden, inter), // row_len = inter
+        ];
+        for (role, dwq_n, dwq_k, expected_row_len) in cases.iter().copied() {
+            let lin = synth_ffn_linear(dwq_n, dwq_k);
+            let native = dwq_to_native_q4_0_f32(
+                &lin, role, inter, hidden,
+            ).expect("must succeed");
+            assert_eq!(native.len(), hidden * inter,
+                "{role:?}: total element count must be hidden*inter");
+            // Row length determines Q4_0 quantize_row block alignment;
+            // both 64 and 128 are multiples of QK4_0=32.
+            assert_eq!(expected_row_len % 32, 0,
+                "{role:?}: row_len {expected_row_len} must align to QK4_0=32");
+        }
     }
 
     /// Integration smoke: load_from_gguf on the real apex returns a fully-
