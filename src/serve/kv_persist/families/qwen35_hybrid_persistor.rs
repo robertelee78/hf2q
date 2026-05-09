@@ -319,8 +319,19 @@ pub fn cfg_from_cache(
 
     // full_attn_shape: prefer a real full_attn slot; fall back to mtp
     // (same rank/role) when full_attn is empty.
+    //
+    // iter-29 (ADR-027 sub-sub-iter 23c-α): `slot.k` is `Option<MlxBuffer>`.
+    // Today (with codec=F32Dense) the producer always emits Some.
+    // iter-23d will derive shape from `slot.tq` when k is None (TQ-only
+    // codec); for now an explicit `expect` pins iter-23d's TODO and
+    // surfaces any unexpected None routing as a clear panic.
     let full_attn_shape: [u64; 4] = if let Some(slot) = cache.full_attn.first() {
-        let s = slot.k.shape();
+        let buf = slot.k.as_ref().expect(
+            "cfg_from_cache: full_attn[0].k is None — F32 backing dropped \
+             (TQ-only mode). iter-23d adds TQ-shape derivation; today \
+             only the F32 codec path is reachable.",
+        );
+        let s = buf.shape();
         ensure!(
             s.len() == 4,
             "cfg_from_cache: full_attn[0].k shape rank {} != 4",
@@ -328,7 +339,11 @@ pub fn cfg_from_cache(
         );
         [s[0] as u64, s[1] as u64, s[2] as u64, s[3] as u64]
     } else if let Some(slot) = cache.mtp_slot.as_ref() {
-        let s = slot.k.shape();
+        let buf = slot.k.as_ref().expect(
+            "cfg_from_cache: mtp_slot.k is None — F32 backing dropped \
+             (TQ-only mode). iter-23d adds TQ-shape derivation.",
+        );
+        let s = buf.shape();
         ensure!(
             s.len() == 4,
             "cfg_from_cache: mtp_slot.k shape rank {} != 4",
@@ -345,7 +360,11 @@ pub fn cfg_from_cache(
     // MTP shape: prefer mtp_slot; otherwise use full_attn_shape (same
     // rank/role; ignored at write/read time when has_mtp = false).
     let mtp_shape: [u64; 4] = if let Some(slot) = cache.mtp_slot.as_ref() {
-        let s = slot.k.shape();
+        let buf = slot.k.as_ref().expect(
+            "cfg_from_cache: mtp_slot.k is None — F32 backing dropped \
+             (TQ-only mode). iter-23d adds TQ-shape derivation.",
+        );
+        let s = buf.shape();
         ensure!(
             s.len() == 4,
             "cfg_from_cache: mtp_slot.k shape rank {} != 4",

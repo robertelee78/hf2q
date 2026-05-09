@@ -50,9 +50,22 @@ use super::{Qwen35Config, Qwen35LayerKind};
 /// Per-full-attention-layer KV slot.
 pub struct FullAttnKvSlot {
     /// Keys buffer `[head_dim, n_kv_heads, max_seq_len, n_seqs]` f32.
-    pub k: MlxBuffer,
+    ///
+    /// **ADR-027 Phase B iter-29 (sub-sub-iter 23c-α):** wrapped in
+    /// `Option` so iter-30 (sub-sub-iter 23c-β) can skip the F32 K/V
+    /// allocation entirely when the cache is constructed with
+    /// `tq_kv_active=true` — the actual 3.94× per-slot memory savings
+    /// deliverable. Today (iter-29 structural prep) the alloc path
+    /// always emits `Some(..)`; consumers handle Optional via
+    /// `.as_ref().expect("F32 K/V required — iter-23c-β alloc branch
+    /// dropped this; check tq_kv_active path")` at the per-call F32
+    /// path (already gated by `slot.tq.is_none()` in iter-15's
+    /// `dispatch_decode_sdpa_with_optional_tq`) and via `if let Some`
+    /// at reset / snapshot / persist sites where None becomes a real
+    /// possibility in iter-30.
+    pub k: Option<MlxBuffer>,
     /// Values buffer — same shape and dtype as `k`.
-    pub v: MlxBuffer,
+    pub v: Option<MlxBuffer>,
     /// Per-seq write cursor. `current_len[s]` = number of tokens already
     /// stored for sequence s.
     pub current_len: Vec<u32>,
@@ -938,14 +951,22 @@ impl HybridKvCache {
             }
             // Zero K/V buffers.  Float zero == bit zero, so writing
             // through `as_mut_slice::<f32>` is well-defined.
-            if let Ok(s) = slot.k.as_mut_slice::<f32>() {
-                for v in s.iter_mut() {
-                    *v = 0.0;
+            // iter-29 (sub-sub-iter 23c-α): slot.k/v are Optional. None
+            // is the iter-30 TQ-active state (no F32 backing); skip
+            // cleanly. Today the alloc path always emits Some (no
+            // observable change).
+            if let Some(buf) = slot.k.as_mut() {
+                if let Ok(s) = buf.as_mut_slice::<f32>() {
+                    for v in s.iter_mut() {
+                        *v = 0.0;
+                    }
                 }
             }
-            if let Ok(s) = slot.v.as_mut_slice::<f32>() {
-                for v in s.iter_mut() {
-                    *v = 0.0;
+            if let Some(buf) = slot.v.as_mut() {
+                if let Ok(s) = buf.as_mut_slice::<f32>() {
+                    for v in s.iter_mut() {
+                        *v = 0.0;
+                    }
                 }
             }
         }
@@ -953,14 +974,18 @@ impl HybridKvCache {
             for c in slot.current_len.iter_mut() {
                 *c = 0;
             }
-            if let Ok(s) = slot.k.as_mut_slice::<f32>() {
-                for v in s.iter_mut() {
-                    *v = 0.0;
+            if let Some(buf) = slot.k.as_mut() {
+                if let Ok(s) = buf.as_mut_slice::<f32>() {
+                    for v in s.iter_mut() {
+                        *v = 0.0;
+                    }
                 }
             }
-            if let Ok(s) = slot.v.as_mut_slice::<f32>() {
-                for v in s.iter_mut() {
-                    *v = 0.0;
+            if let Some(buf) = slot.v.as_mut() {
+                if let Ok(s) = buf.as_mut_slice::<f32>() {
+                    for v in s.iter_mut() {
+                        *v = 0.0;
+                    }
                 }
             }
         }
@@ -1017,14 +1042,28 @@ impl HybridKvCache {
         let mut tq_packed_bytes: usize = 0;
         let mut tq_norms_bytes: usize = 0;
         for slot in &self.full_attn {
-            f32_k_v_bytes += slot.k.byte_len() + slot.v.byte_len();
+            // iter-29 (sub-sub-iter 23c-α): None means TQ-only mode
+            // (iter-30 alloc branch); contributes 0 F32 bytes — exactly
+            // the load-bearing memory savings the iter-30 regression-pin
+            // test (full_attn_bytes_breakdown_tq_on_drops_f32_*) checks.
+            if let Some(buf) = slot.k.as_ref() {
+                f32_k_v_bytes += buf.byte_len();
+            }
+            if let Some(buf) = slot.v.as_ref() {
+                f32_k_v_bytes += buf.byte_len();
+            }
             if let Some(tq) = &slot.tq {
                 tq_packed_bytes += tq.k_packed.byte_len() + tq.v_packed.byte_len();
                 tq_norms_bytes += tq.k_norms.byte_len() + tq.v_norms.byte_len();
             }
         }
         if let Some(slot) = self.mtp_slot.as_ref() {
-            f32_k_v_bytes += slot.k.byte_len() + slot.v.byte_len();
+            if let Some(buf) = slot.k.as_ref() {
+                f32_k_v_bytes += buf.byte_len();
+            }
+            if let Some(buf) = slot.v.as_ref() {
+                f32_k_v_bytes += buf.byte_len();
+            }
             if let Some(tq) = &slot.tq {
                 tq_packed_bytes += tq.k_packed.byte_len() + tq.v_packed.byte_len();
                 tq_norms_bytes += tq.k_norms.byte_len() + tq.v_norms.byte_len();
@@ -1123,24 +1162,40 @@ impl HybridKvCache {
         let mut full_attn_v = Vec::with_capacity(self.full_attn.len());
         let mut full_attn_current_len = Vec::with_capacity(self.full_attn.len());
         for slot in &self.full_attn {
-            // ADR-027 sub-sub-iter 23a-β: producers always emit Some
-            // today. Iter-23c+ branches on slot's TQ-mode and pushes
-            // None when F32 backing is dropped.
-            full_attn_k.push(Some(
-                deep_copy_buffer(device, &slot.k).context("snapshot full_attn.k")?,
-            ));
-            full_attn_v.push(Some(
-                deep_copy_buffer(device, &slot.v).context("snapshot full_attn.v")?,
-            ));
+            // ADR-027 sub-sub-iter 23c-α: slot.k/v are Optional. None
+            // marks iter-30 TQ-only state (no F32 backing); snapshot
+            // pushes None to mirror. Today the alloc path always emits
+            // Some so this is always the Some branch (zero behavior
+            // change).
+            full_attn_k.push(match slot.k.as_ref() {
+                Some(buf) => Some(
+                    deep_copy_buffer(device, buf).context("snapshot full_attn.k")?,
+                ),
+                None => None,
+            });
+            full_attn_v.push(match slot.v.as_ref() {
+                Some(buf) => Some(
+                    deep_copy_buffer(device, buf).context("snapshot full_attn.v")?,
+                ),
+                None => None,
+            });
             full_attn_current_len.push(slot.current_len.clone());
         }
         let mtp = match &self.mtp_slot {
             Some(slot) => Some(MtpKvSnapshot {
-                // ADR-027 sub-sub-iter 23a-α: producers always emit
-                // Some today. iter-23c+ branches on slot's TQ-mode and
-                // pushes None when F32 backing is dropped.
-                k: Some(deep_copy_buffer(device, &slot.k).context("snapshot mtp.k")?),
-                v: Some(deep_copy_buffer(device, &slot.v).context("snapshot mtp.v")?),
+                // iter-23c-α: same Optional bridge as full_attn above.
+                k: match slot.k.as_ref() {
+                    Some(buf) => Some(
+                        deep_copy_buffer(device, buf).context("snapshot mtp.k")?,
+                    ),
+                    None => None,
+                },
+                v: match slot.v.as_ref() {
+                    Some(buf) => Some(
+                        deep_copy_buffer(device, buf).context("snapshot mtp.v")?,
+                    ),
+                    None => None,
+                },
                 current_len: slot.current_len.clone(),
             }),
             None => None,
@@ -1200,15 +1255,16 @@ impl HybridKvCache {
                 .iter()
                 .zip(snapshot.full_attn_v.iter().zip(snapshot.full_attn_current_len.iter())),
         ) {
-            // ADR-027 sub-sub-iter 23a-β: Optional full-attn K/V — copy
-            // only when source is Some (iter-23c+ may produce None in
-            // TQ mode; SDPA reads slot.tq directly so the F32 backing
-            // is unused).
-            if let Some(k_buf) = k_snap {
-                copy_buffer_bytes(k_buf, &mut slot.k).context("restore full_attn.k")?;
+            // ADR-027 sub-sub-iter 23c-α: Optional full-attn K/V on
+            // BOTH source (iter-23a-β) AND destination (iter-23c-α).
+            // Restore is a no-op when either side is None — matches
+            // iter-30 TQ-only mode where SDPA reads slot.tq directly
+            // and F32 backing is absent on both sides.
+            if let (Some(k_buf), Some(dst_k)) = (k_snap, slot.k.as_mut()) {
+                copy_buffer_bytes(k_buf, dst_k).context("restore full_attn.k")?;
             }
-            if let Some(v_buf) = v_snap {
-                copy_buffer_bytes(v_buf, &mut slot.v).context("restore full_attn.v")?;
+            if let (Some(v_buf), Some(dst_v)) = (v_snap, slot.v.as_mut()) {
+                copy_buffer_bytes(v_buf, dst_v).context("restore full_attn.v")?;
             }
             anyhow::ensure!(
                 len_snap.len() == slot.current_len.len(),
@@ -1218,15 +1274,15 @@ impl HybridKvCache {
         }
         match (&snapshot.mtp, self.mtp_slot.as_mut()) {
             (Some(snap), Some(slot)) => {
-                // ADR-027 sub-sub-iter 23a-α: Optional MTP K/V — copy
-                // only when source is Some (iter-23c+ may produce None
-                // in TQ mode, in which case we skip the F32 restore;
-                // slot.tq carries the actual decode-state).
-                if let Some(snap_k) = &snap.k {
-                    copy_buffer_bytes(snap_k, &mut slot.k).context("restore mtp.k")?;
+                // ADR-027 sub-sub-iter 23c-α: Optional MTP K/V on
+                // BOTH source (iter-23a-α) AND destination
+                // (iter-23c-α). Restore is a no-op when either side is
+                // None — matches iter-30 TQ-only mode.
+                if let (Some(snap_k), Some(dst_k)) = (&snap.k, slot.k.as_mut()) {
+                    copy_buffer_bytes(snap_k, dst_k).context("restore mtp.k")?;
                 }
-                if let Some(snap_v) = &snap.v {
-                    copy_buffer_bytes(snap_v, &mut slot.v).context("restore mtp.v")?;
+                if let (Some(snap_v), Some(dst_v)) = (&snap.v, slot.v.as_mut()) {
+                    copy_buffer_bytes(snap_v, dst_v).context("restore mtp.v")?;
                 }
                 anyhow::ensure!(
                     snap.current_len.len() == slot.current_len.len(),
@@ -1308,13 +1364,14 @@ impl HybridKvCache {
         for (slot, (k_snap, v_snap)) in self.full_attn.iter_mut().zip(
             snapshot.full_attn_k.iter().zip(snapshot.full_attn_v.iter()),
         ) {
-            // ADR-027 sub-sub-iter 23a-β: Optional full-attn K/V — copy
-            // only when source is Some.
-            if let Some(k_buf) = k_snap {
-                partial_copy_slot(k_buf, &mut slot.k, n_tokens, "full_attn.k")?;
+            // ADR-027 sub-sub-iter 23c-α: Optional full-attn K/V on
+            // BOTH source AND destination. Restore is a no-op when
+            // either side is None.
+            if let (Some(k_buf), Some(dst_k)) = (k_snap, slot.k.as_mut()) {
+                partial_copy_slot(k_buf, dst_k, n_tokens, "full_attn.k")?;
             }
-            if let Some(v_buf) = v_snap {
-                partial_copy_slot(v_buf, &mut slot.v, n_tokens, "full_attn.v")?;
+            if let (Some(v_buf), Some(dst_v)) = (v_snap, slot.v.as_mut()) {
+                partial_copy_slot(v_buf, dst_v, n_tokens, "full_attn.v")?;
             }
             // current_len[0] = n_tokens (the LCP boundary the snapshot
             // was taken at; subsequent prefill chunks will write at
@@ -1332,13 +1389,13 @@ impl HybridKvCache {
         // MTP slot (when present).
         match (&snapshot.mtp, self.mtp_slot.as_mut()) {
             (Some(snap), Some(slot)) => {
-                // ADR-027 sub-sub-iter 23a-α: Optional MTP K/V — copy
-                // only when source is Some.
-                if let Some(snap_k) = &snap.k {
-                    partial_copy_slot(snap_k, &mut slot.k, n_tokens, "mtp.k")?;
+                // ADR-027 sub-sub-iter 23c-α: Optional MTP K/V on BOTH
+                // source AND destination.
+                if let (Some(snap_k), Some(dst_k)) = (&snap.k, slot.k.as_mut()) {
+                    partial_copy_slot(snap_k, dst_k, n_tokens, "mtp.k")?;
                 }
-                if let Some(snap_v) = &snap.v {
-                    partial_copy_slot(snap_v, &mut slot.v, n_tokens, "mtp.v")?;
+                if let (Some(snap_v), Some(dst_v)) = (&snap.v, slot.v.as_mut()) {
+                    partial_copy_slot(snap_v, dst_v, n_tokens, "mtp.v")?;
                 }
                 anyhow::ensure!(
                     !slot.current_len.is_empty(),
@@ -1378,10 +1435,22 @@ impl HybridKvCache {
     pub fn total_bytes(&self) -> usize {
         let mut n = 0usize;
         for s in &self.full_attn {
-            n += s.k.element_count() * 4 + s.v.element_count() * 4;
+            // iter-29 (sub-sub-iter 23c-α): Optional K/V — 0 bytes when
+            // None (iter-30 TQ-only mode); element_count×4 when Some.
+            if let Some(b) = s.k.as_ref() {
+                n += b.element_count() * 4;
+            }
+            if let Some(b) = s.v.as_ref() {
+                n += b.element_count() * 4;
+            }
         }
         if let Some(s) = &self.mtp_slot {
-            n += s.k.element_count() * 4 + s.v.element_count() * 4;
+            if let Some(b) = s.k.as_ref() {
+                n += b.element_count() * 4;
+            }
+            if let Some(b) = s.v.as_ref() {
+                n += b.element_count() * 4;
+            }
         }
         for s in &self.linear_attn {
             n += s.conv_state.element_count() * 4
@@ -1432,8 +1501,11 @@ fn alloc_full_attn_slot(
         .map_err(|e| anyhow!("alloc full-attn V: {e}"))?;
 
     Ok(FullAttnKvSlot {
-        k,
-        v,
+        // iter-29 (sub-sub-iter 23c-α): wrap in Some today; iter-30
+        // (sub-sub-iter 23c-β) adds a tq_kv_active branch here that
+        // skips the alloc and emits None for the 3.94× memory win.
+        k: Some(k),
+        v: Some(v),
         current_len: vec![0; n_seqs as usize],
         // ADR-027 Phase B iter-8: tq is None on the legacy F32 path.
         // Set by `HybridKvCache::new_with_options` when tq_kv_active=true.
@@ -1835,12 +1907,17 @@ mod tests {
         let device = MlxDevice::new().expect("device");
         let cache = HybridKvCache::new(&cfg, &device, 64, 2).expect("alloc");
         let s = &cache.full_attn[0];
-        assert_eq!(s.k.dtype(), DType::F32);
-        assert_eq!(s.v.dtype(), DType::F32);
+        // iter-29 (sub-sub-iter 23c-α): legacy `new()` always emits
+        // Some K/V; iter-30's tq_kv_active=true alloc branch is the
+        // None case.
+        let sk = s.k.as_ref().expect("legacy new()⇒Some(k)");
+        let sv = s.v.as_ref().expect("legacy new()⇒Some(v)");
+        assert_eq!(sk.dtype(), DType::F32);
+        assert_eq!(sv.dtype(), DType::F32);
         // Expected element count: n_seqs * n_kv * max_seq_len * head_dim
         // = 2 * 2 * 64 * 256 = 65536.  Layout is SDPA-native [n_seqs, n_kv, max_seq, head_dim].
-        assert_eq!(s.k.element_count(), 2 * 2 * 64 * 256);
-        assert_eq!(s.v.element_count(), 2 * 2 * 64 * 256);
+        assert_eq!(sk.element_count(), 2 * 2 * 64 * 256);
+        assert_eq!(sv.element_count(), 2 * 2 * 64 * 256);
         assert_eq!(s.current_len.len(), 2);
         assert!(s.current_len.iter().all(|&c| c == 0));
     }
@@ -1871,14 +1948,19 @@ mod tests {
         let cache = HybridKvCache::new(&cfg, &device, 64, 2).expect("alloc");
 
         // Every full-attn K/V byte must be zero.
+        // iter-29 (sub-sub-iter 23c-α): Optional-aware. legacy new()
+        // always emits Some today; iter-30 TQ-only is the None branch
+        // (no F32 backing → trivially zero F32 contribution).
         for (idx, slot) in cache.full_attn.iter().enumerate() {
-            let k = slot.k.as_slice::<f32>().expect("k slice");
+            let sk = slot.k.as_ref().expect("legacy new()⇒Some(k)");
+            let sv = slot.v.as_ref().expect("legacy new()⇒Some(v)");
+            let k = sk.as_slice::<f32>().expect("k slice");
             assert!(
                 k.iter().all(|v| v.to_bits() == 0),
                 "full_attn[{}].k has non-zero bytes after new()",
                 idx
             );
-            let v = slot.v.as_slice::<f32>().expect("v slice");
+            let v = sv.as_slice::<f32>().expect("v slice");
             assert!(
                 v.iter().all(|x| x.to_bits() == 0),
                 "full_attn[{}].v has non-zero bytes after new()",
@@ -1998,11 +2080,16 @@ mod tests {
 
         // Plant non-zero canary values so the snapshot has something
         // unique to compare against zero / mutated bytes.
+        // iter-29 (sub-sub-iter 23c-α): legacy `new()` always emits
+        // Some K/V; tests `.expect("legacy new()⇒Some(_)")` to surface
+        // any regression toward None on the F32 path.
         for (i, slot) in cache.full_attn.iter_mut().enumerate() {
-            let s = slot.k.as_mut_slice::<f32>().expect("k mut");
+            let kbuf = slot.k.as_mut().expect("legacy new()⇒Some(k)");
+            let s = kbuf.as_mut_slice::<f32>().expect("k mut");
             s[0] = (i as f32) + 0.25;
             s[7] = (i as f32) + 0.5;
-            let s = slot.v.as_mut_slice::<f32>().expect("v mut");
+            let vbuf = slot.v.as_mut().expect("legacy new()⇒Some(v)");
+            let s = vbuf.as_mut_slice::<f32>().expect("v mut");
             s[0] = -(i as f32) - 0.125;
             slot.current_len[0] = (i as u32) + 1;
         }
@@ -2020,8 +2107,10 @@ mod tests {
         let mut expect_full_v0: Vec<f32> = Vec::new();
         let mut expect_full_lens: Vec<u32> = Vec::new();
         for slot in &cache.full_attn {
-            expect_full_k0.push(slot.k.as_slice::<f32>().unwrap()[0]);
-            expect_full_v0.push(slot.v.as_slice::<f32>().unwrap()[0]);
+            let kbuf = slot.k.as_ref().expect("legacy new()⇒Some(k)");
+            let vbuf = slot.v.as_ref().expect("legacy new()⇒Some(v)");
+            expect_full_k0.push(kbuf.as_slice::<f32>().unwrap()[0]);
+            expect_full_v0.push(vbuf.as_slice::<f32>().unwrap()[0]);
             expect_full_lens.push(slot.current_len[0]);
         }
         let mut expect_lin_conv0: Vec<f32> = Vec::new();
@@ -2034,10 +2123,12 @@ mod tests {
         // Mutate the live cache: zero out everything + change cursors.
         cache.reset();
         for slot in cache.full_attn.iter_mut() {
-            for v in slot.k.as_mut_slice::<f32>().unwrap().iter_mut() {
+            let kbuf = slot.k.as_mut().expect("legacy new()⇒Some(k)");
+            for v in kbuf.as_mut_slice::<f32>().unwrap().iter_mut() {
                 *v = 999.0;
             }
-            for v in slot.v.as_mut_slice::<f32>().unwrap().iter_mut() {
+            let vbuf = slot.v.as_mut().expect("legacy new()⇒Some(v)");
+            for v in vbuf.as_mut_slice::<f32>().unwrap().iter_mut() {
                 *v = -999.0;
             }
             slot.current_len[0] = 42;
@@ -2046,13 +2137,15 @@ mod tests {
         // Restore — byte-equality across all canary positions.
         cache.restore_from(&snap).expect("restore");
         for (i, slot) in cache.full_attn.iter().enumerate() {
+            let kbuf = slot.k.as_ref().expect("legacy new()⇒Some(k)");
+            let vbuf = slot.v.as_ref().expect("legacy new()⇒Some(v)");
             assert_eq!(
-                slot.k.as_slice::<f32>().unwrap()[0],
+                kbuf.as_slice::<f32>().unwrap()[0],
                 expect_full_k0[i],
                 "full_attn[{i}].k[0] not restored"
             );
             assert_eq!(
-                slot.v.as_slice::<f32>().unwrap()[0],
+                vbuf.as_slice::<f32>().unwrap()[0],
                 expect_full_v0[i],
                 "full_attn[{i}].v[0] not restored"
             );
@@ -2085,7 +2178,8 @@ mod tests {
         let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("alloc");
 
         // Plant a canary in slot 0.
-        cache.full_attn[0].k.as_mut_slice::<f32>().unwrap()[0] = 7.5;
+        // iter-29 (sub-sub-iter 23c-α): legacy new()⇒Some K/V.
+        cache.full_attn[0].k.as_mut().expect("legacy new()⇒Some(k)").as_mut_slice::<f32>().unwrap()[0] = 7.5;
         cache.linear_attn[0].recurrent.as_mut_slice::<f32>().unwrap()[0] = 3.25;
 
         let snap = cache.snapshot(&device).expect("snapshot");
@@ -2096,7 +2190,7 @@ mod tests {
         assert_eq!(snap_lin_rec0, 3.25);
 
         // Mutate the live cache — snapshot must NOT see this.
-        cache.full_attn[0].k.as_mut_slice::<f32>().unwrap()[0] = -123.0;
+        cache.full_attn[0].k.as_mut().expect("legacy new()⇒Some(k)").as_mut_slice::<f32>().unwrap()[0] = -123.0;
         cache.linear_attn[0].recurrent.as_mut_slice::<f32>().unwrap()[0] = -456.0;
 
         // Snapshot still holds the original canaries (deep-copy, not Arc::clone).
@@ -2124,10 +2218,14 @@ mod tests {
         // i.e. excludes the live cache's scratch/ping-pong buffers (which the
         // snapshot doesn't own).  So snap.total_bytes <= cache.total_bytes.
         // Equality holds for the active-only subset.
+        // iter-29 (sub-sub-iter 23c-α): legacy new()⇒Some on every slot.
         let cache_active_only: usize = cache
             .full_attn
             .iter()
-            .map(|s| s.k.element_count() * 4 + s.v.element_count() * 4)
+            .map(|s| {
+                s.k.as_ref().expect("legacy new()⇒Some(k)").element_count() * 4
+                    + s.v.as_ref().expect("legacy new()⇒Some(v)").element_count() * 4
+            })
             .sum::<usize>()
             + cache
                 .linear_attn
@@ -2548,8 +2646,11 @@ mod tests {
             let tq = slot.tq.as_ref().unwrap();
             assert_eq!(tq.norms_per_pos, 1, "head_dim=256 → norms_per_pos=1");
             // K/V F32 buffers also remain allocated (shadow cache).
-            assert!(slot.k.byte_len() > 0);
-            assert!(slot.v.byte_len() > 0);
+            // iter-29 (sub-sub-iter 23c-α): iter-30 will drop these to
+            // None for the actual 3.94× memory savings; this assertion
+            // pins the iter-29 shadow-cache invariant.
+            assert!(slot.k.as_ref().expect("iter-29 shadow K still Some").byte_len() > 0);
+            assert!(slot.v.as_ref().expect("iter-29 shadow V still Some").byte_len() > 0);
         }
         // MTP slot: tq present iff cfg has MTP. moe_cfg_40layer() sets
         // mtp_num_hidden_layers=0 → mtp_slot is None entirely.
@@ -2590,9 +2691,10 @@ mod tests {
         assert!(slot.tq.is_some());
         let tq = slot.tq.as_ref().unwrap();
         // F32 K and V each 16 MB at this shape (1×2×8192×256×4).
+        // iter-29 (sub-sub-iter 23c-α): iter-30 drops these to None.
         let f32_each = 1 * 2 * 8192 * 256 * 4;
-        assert_eq!(slot.k.byte_len(), f32_each);
-        assert_eq!(slot.v.byte_len(), f32_each);
+        assert_eq!(slot.k.as_ref().expect("iter-29 shadow K Some").byte_len(), f32_each);
+        assert_eq!(slot.v.as_ref().expect("iter-29 shadow V Some").byte_len(), f32_each);
         // TQ K_packed + V_packed: 1×2×8192×256 each (U8) = 4 MB each.
         assert_eq!(tq.k_packed.byte_len(), 1 * 2 * 8192 * 256);
         assert_eq!(tq.v_packed.byte_len(), 1 * 2 * 8192 * 256);

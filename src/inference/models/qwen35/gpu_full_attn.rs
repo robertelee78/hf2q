@@ -107,10 +107,19 @@ fn write_kv_with_optional_tq_encode(
     n_tokens: u32,
 ) -> Result<()> {
     // (1) Existing F32 KV cache write — byte-identical to pre-iter-15.
+    // iter-29 (sub-sub-iter 23c-α): slot.k/v are Optional. Today the
+    // alloc path always emits Some; iter-30 will skip this F32 write
+    // entirely when tq_kv_active=true (slot.k/v=None) for the actual
+    // memory savings.
+    let dst_k = slot.k.as_ref().expect(
+        "F32 KV write target slot.k is None — iter-30 alloc branch \
+         needs to also skip this write site (caller bug today).",
+    );
+    let dst_v = slot.v.as_ref().expect("F32 KV write target slot.v is None (see slot.k)");
     dispatch_kv_cache_copy_seq_f32_dual(
         enc, registry, device.metal_device(),
         k_seq_major, v_seq_major,
-        &slot.k, &slot.v,
+        dst_k, dst_v,
         n_kv_heads, head_dim, max_seq_len,
         cur_len, n_tokens, 0,
     )
@@ -257,9 +266,20 @@ fn dispatch_decode_sdpa_with_optional_tq(
             sliding_window: 0,
             softcap: 0.0,
         };
+        // iter-29 (sub-sub-iter 23c-α): F32 fallback path. Only
+        // reachable when slot.tq is None OR head_dim ∉ {256, 512}.
+        // Today the alloc path always emits Some; iter-30 must
+        // guarantee this branch is unreachable when alloc returns None
+        // (i.e., tq_kv_active=true ⇒ head_dim ∈ {256, 512} ⇒ TQ branch
+        // taken above ⇒ this expect never fires).
+        let kbuf = slot.k.as_ref().expect(
+            "flash_attn_vec F32 fallback: slot.k is None but TQ branch \
+             not taken — iter-30 alloc/SDPA gating bug.",
+        );
+        let vbuf = slot.v.as_ref().expect("flash_attn_vec F32: slot.v is None (see slot.k)");
         flash_attn_vec(
             enc, registry, device,
-            q_seq_major, &slot.k, &slot.v, out_buf, fa_tmp,
+            q_seq_major, kbuf, vbuf, out_buf, fa_tmp,
             &fa_params,
         )
         .context("flash_attn_vec (legacy F32 decode)")?;
@@ -2163,9 +2183,19 @@ pub fn apply_sdpa_with_kv_cache(
                 kv_seq_len, max_seq_len,
             ).context("flash_attn_vec kv-cache (FA-layer decode iter-15)")?;
         } else {
+            // iter-29 (sub-sub-iter 23c-α): F32 head_dim-fallback path,
+            // taken when head_dim ∉ {256, 512}. Production qwen35 has
+            // head_dim=256 — this branch is small-fixture-only. iter-30
+            // alloc preserves Some on the F32 path; expect on the
+            // unreachable None case.
+            let kbuf = slot.k.as_ref().expect(
+                "dispatch_sdpa_decode F32 head_dim fallback: slot.k is None — \
+                 iter-30 alloc/SDPA gating bug (TQ requires head_dim ∈ {256,512}).",
+            );
+            let vbuf = slot.v.as_ref().expect("dispatch_sdpa_decode F32: slot.v is None");
             dispatch_sdpa_decode(
                 &mut enc, registry, device,
-                q_seq_major, &slot.k, &slot.v, &out_buf,
+                q_seq_major, kbuf, vbuf, &out_buf,
                 n_heads, n_kv_heads, head_dim,
                 kv_seq_len, max_seq_len,
                 1.0 / (d as f32).sqrt(),
@@ -2353,10 +2383,19 @@ pub fn apply_sdpa_with_kv_cache(
             let _w5b10_kernel_resume = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FaSdpaKernel,
             );
+            // iter-29 (sub-sub-iter 23c-α): F32 prefill resume path.
+            // Today alloc always emits Some; iter-30 must keep this
+            // path Some-only (TQ prefill goes through encode_seq_tokens_to_tq
+            // in write_kv_with_optional_tq_encode, not this resume).
+            let kbuf = slot.k.as_ref().expect(
+                "apply_flash_attn_prefill_seq_major_resume: slot.k is None — \
+                 iter-30 must NOT drop F32 backing on the F32 prefill path.",
+            );
+            let vbuf = slot.v.as_ref().expect("prefill resume F32: slot.v is None");
             let out_uploaded = apply_flash_attn_prefill_seq_major_resume(
                 device, registry,
                 q_seq_major,
-                &slot.k, &slot.v,
+                kbuf, vbuf,
                 seq_len,
                 cur_len as u32,
                 kv_seq_len,
@@ -2398,7 +2437,13 @@ pub fn apply_sdpa_with_kv_cache(
                 kv_capacity: max_seq_len,
             };
             let mut enc = device.command_encoder().context("enc sdpa kv-cache prefill")?;
-            sdpa(&mut enc, registry, device, &q_gpu, &slot.k, &slot.v, &out_buf, &params, 1)
+            // iter-29 (sub-sub-iter 23c-α): F32 head_dim-fallback prefill.
+            let kbuf = slot.k.as_ref().expect(
+                "sdpa F32 head_dim fallback prefill: slot.k is None — \
+                 iter-30 must keep F32 backing for the head_dim fallback.",
+            );
+            let vbuf = slot.v.as_ref().expect("sdpa F32 prefill: slot.v is None");
+            sdpa(&mut enc, registry, device, &q_gpu, kbuf, vbuf, &out_buf, &params, 1)
                 .context("sdpa with kv cache prefill")?;
             enc.commit_and_wait_labeled("layer.full_attn.sdpa_legacy_prefill").context("commit sdpa kv-cache prefill")?;
         }
@@ -3363,9 +3408,15 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
             kv_seq_len, max_seq_len,
         ).context("flash_attn_vec kv-cache decode_into (FA-layer decode iter-15)")?;
     } else {
+        // iter-29 (sub-sub-iter 23c-α): F32 head_dim-fallback decode_into.
+        let kbuf = slot.k.as_ref().expect(
+            "dispatch_sdpa_decode F32 head_dim fallback (decode_into): \
+             slot.k is None — iter-30 alloc/SDPA gating bug.",
+        );
+        let vbuf = slot.v.as_ref().expect("dispatch_sdpa_decode F32 decode_into: slot.v is None");
         dispatch_sdpa_decode(
             enc, registry, device,
-            q_seq_major, &slot.k, &slot.v, &out_buf,
+            q_seq_major, kbuf, vbuf, &out_buf,
             n_heads, n_kv_heads, head_dim,
             kv_seq_len, max_seq_len,
             1.0 / (d as f32).sqrt(),
