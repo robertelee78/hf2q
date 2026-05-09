@@ -453,6 +453,14 @@ pub struct InvestigationEnv {
     /// `test_kv_cache_copy_batch_f32_to_f16_kv_dual_byte_identity`).
     pub kv_dual_legacy: bool,
 
+    /// `HF2Q_HB_DUAL_LEGACY=1` — force the legacy 2-dispatch
+    /// `dispatch_hadamard_quantize_kv_hb` path (one for K, one for V)
+    /// instead of the iter-148 fused
+    /// `dispatch_hadamard_quantize_kv_hb_dual`. ADR-028 forensic A/B
+    /// switch; both paths byte-identical by mlx-native unit test
+    /// (`test_hadamard_quantize_kv_hb_dual_byte_identity_d256`).
+    pub hb_dual_legacy: bool,
+
     /// `HF2Q_MLX_KERNEL_PROFILE=1` — per-kernel profile mode.
     /// Original parse: `map_or(false, |v| v == "1")`.
     pub mlx_kernel_profile: bool,
@@ -623,6 +631,7 @@ impl InvestigationEnv {
             mlx_timing: env::var("HF2Q_MLX_TIMING").is_ok(),
             split_timing: env_eq_one("HF2Q_SPLIT_TIMING"),
             kv_dual_legacy: env_eq_one("HF2Q_KV_DUAL_LEGACY"),
+            hb_dual_legacy: env_eq_one("HF2Q_HB_DUAL_LEGACY"),
             mlx_kernel_profile: env_eq_one("HF2Q_MLX_KERNEL_PROFILE"),
             mlx_profile: env_eq_one("HF2Q_MLX_PROFILE"),
 

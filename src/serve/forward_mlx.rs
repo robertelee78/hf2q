@@ -2817,32 +2817,53 @@ impl MlxModelWeights {
                             &[&leg_hb_enc[layer_idx].k_packed, &leg_hb_enc[layer_idx].k_norms,
                               &leg_hb_enc[layer_idx].v_packed, &leg_hb_enc[layer_idx].v_norms],
                         );
-                        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
-                            s.encoder_mut(), reg, metal_dev,
-                            &self.activations.attn_k_normed,
-                            &leg_hb_enc[layer_idx].k_packed,
-                            &leg_hb_enc[layer_idx].k_norms,
-                            nkv as u32, hd as u32,
-                            leg_hb_enc[layer_idx].capacity as u32,
-                            cache_pos_val,
-                            leg_hb_enc[layer_idx].is_sliding,
-                            tq_scale_factor_d512,
-                            tq_codebook_bits,
-                        ).map_err(|e| anyhow::anyhow!("hb_quantize K L{layer_idx}: {e}"))?;
-                        total_dispatches += 1;
-                        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
-                            s.encoder_mut(), reg, metal_dev,
-                            v_src,
-                            &leg_hb_enc[layer_idx].v_packed,
-                            &leg_hb_enc[layer_idx].v_norms,
-                            nkv as u32, hd as u32,
-                            leg_hb_enc[layer_idx].capacity as u32,
-                            cache_pos_val,
-                            leg_hb_enc[layer_idx].is_sliding,
-                            tq_scale_factor_d512,
-                            tq_codebook_bits,
-                        ).map_err(|e| anyhow::anyhow!("hb_quantize V L{layer_idx}: {e}"))?;
-                        total_dispatches += 1;
+                        // ADR-028 iter-149: fused K+V HB encoder (default-on).
+                        // HF2Q_HB_DUAL_LEGACY=1 forces 2-dispatch reference path
+                        // for forensic A/B parity audit. Both paths byte-identical
+                        // by mlx-native unit test
+                        // (`test_hadamard_quantize_kv_hb_dual_byte_identity_d256`).
+                        if INVESTIGATION_ENV.hb_dual_legacy {
+                            mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+                                s.encoder_mut(), reg, metal_dev,
+                                &self.activations.attn_k_normed,
+                                &leg_hb_enc[layer_idx].k_packed,
+                                &leg_hb_enc[layer_idx].k_norms,
+                                nkv as u32, hd as u32,
+                                leg_hb_enc[layer_idx].capacity as u32,
+                                cache_pos_val,
+                                leg_hb_enc[layer_idx].is_sliding,
+                                tq_scale_factor_d512,
+                                tq_codebook_bits,
+                            ).map_err(|e| anyhow::anyhow!("hb_quantize K L{layer_idx}: {e}"))?;
+                            total_dispatches += 1;
+                            mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+                                s.encoder_mut(), reg, metal_dev,
+                                v_src,
+                                &leg_hb_enc[layer_idx].v_packed,
+                                &leg_hb_enc[layer_idx].v_norms,
+                                nkv as u32, hd as u32,
+                                leg_hb_enc[layer_idx].capacity as u32,
+                                cache_pos_val,
+                                leg_hb_enc[layer_idx].is_sliding,
+                                tq_scale_factor_d512,
+                                tq_codebook_bits,
+                            ).map_err(|e| anyhow::anyhow!("hb_quantize V L{layer_idx}: {e}"))?;
+                            total_dispatches += 1;
+                        } else {
+                            mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_dual(
+                                s.encoder_mut(), reg, metal_dev,
+                                &self.activations.attn_k_normed, v_src,
+                                &leg_hb_enc[layer_idx].k_packed, &leg_hb_enc[layer_idx].v_packed,
+                                &leg_hb_enc[layer_idx].k_norms,  &leg_hb_enc[layer_idx].v_norms,
+                                nkv as u32, hd as u32,
+                                leg_hb_enc[layer_idx].capacity as u32,
+                                cache_pos_val,
+                                leg_hb_enc[layer_idx].is_sliding,
+                                tq_scale_factor_d512,
+                                tq_codebook_bits,
+                            ).map_err(|e| anyhow::anyhow!("hb_quantize KV dual L{layer_idx}: {e}"))?;
+                            total_dispatches += 1;
+                        }
                     }
                 }
 

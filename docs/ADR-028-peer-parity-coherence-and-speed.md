@@ -3045,6 +3045,63 @@ For the bigger 1.4 ms SDPA gap, options gated on operator decision:
 - **Path F**: USE_DENSE=1 + smaller F16 KV (still F-precision but
   half memory)
 
+### iter-148+149: fused HB encoder LANDED — byte-identical, zero perf impact
+
+#### iter-148 mlx-native (commit `635c8f5`)
+
+`hadamard_quantize_kv_hb_dual<HEAD_DIM>` MSL template — grid Z=2 selects
+K (z=0) or V (z=1); each threadgroup is 1 simdgroup, same FWHT+SRHT+
+quantize logic, 6 buffers in. d256 + d512 instantiations.
+
+`test_hadamard_quantize_kv_hb_dual_byte_identity_d256` PASS — packed
+bytes + norms byte-identical to 2-dispatch reference at gemma4 prod
+shape (n_heads=8, head_dim=256, sliding=true, capacity=1024, cb_bits=8).
+
+#### iter-149 hf2q wire-up + A/B test
+
+Wired at `forward_mlx.rs:2820+`, behind `HF2Q_HB_DUAL_LEGACY=1` env.
+
+A/B steady-state on gemma4 APEX-Q5_K_M (post-warmup, 10 tokens):
+
+| Mode | dispatches | encode med | gpu med | post-warmup tok/s |
+|------|---:|---:|---:|---:|
+| NEW fused | 956 | 0.40 ms | 13.6 ms | 72.9 |
+| LEGACY 2x | 986 | 0.42 ms | 13.6 ms | 73.5 |
+| Δ NEW | -30 | -0.02 | 0 | -0.6 (noise ±1%) |
+
+#### Honest finding
+
+Wire-up confirmed correct (-30 dispatches/token = exactly the
+predicted savings). **But measurable throughput impact = zero** on
+gemma4 production decode. Apple GPU pipelines 30 small kernel
+launches efficiently inside one command buffer; the per-launch floor
+is overlapped, not paid serially.
+
+This contradicts iter-147's "skip-tq-encode saves 0.4ms" finding. The
+explanation: SKIP_TQ_ENCODE drops 120 dispatches AND eliminates all
+the encode kernel WORK (writing zeros to packed buffer instead of
+running FWHT+quantize). Fusion drops 30 dispatches but keeps the
+work — the work is the cost, not the launches.
+
+iter-148+149 is a CLEAN ARCHITECTURAL WIN (byte-identical, simpler
+dispatch chain) with NO performance benefit on this workload. Lesson:
+**dispatch-count optimization only pays when launches are
+serialized, not when the GPU pipeline absorbs them.**
+
+#### Walk-phase pivot
+
+The 4.65 ms gap to peer is NOT in dispatch counts (we already win
+there per iter-142) and NOT in encode-CPU (per iter-143). It's in
+GPU kernel TIME inside hot shaders.
+
+Real next-iter targets (operator pick required):
+1. **Path D refinement**: shader-level optimization on FA-vec-tq-hb
+   for kL≤1024 (sliding window). Currently NSG=1 there; could try
+   different threadgroup geometry / fused FWHT-pre.
+2. **Path E (USE_DENSE default-flip)**: present operator with the
+   precision/speed tradeoff — 17.6% speedup, token-divergent on
+   long contexts but coherent. Operator decision gate.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
