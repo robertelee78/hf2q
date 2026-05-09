@@ -2920,6 +2920,272 @@ mod tests {
         );
     }
 
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-027 Phase B iter-11 — NRMSE-vs-F32 baseline parity (the litmus)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// **D1 SRHT sign table for D=256.** Verbatim from
+    /// `mlx-native/src/shaders/hadamard_quantize_kv_fast.metal:21-26` and
+    /// `fwht_standalone.metal:21-26`.  Bit `j` of the byte at
+    /// `table[j>>3]` is the sign bit for element `j`: bit=1 → -1, bit=0 → +1.
+    /// Both encode and Q pre-rotation use the SAME table, so attention
+    /// scores after sign×FWHT round-trip equal the F32 baseline modulo
+    /// quantization (sign[i]^2 = 1 cancels under Q@K^T).
+    const TBQ_SIGNS_256: [u8; 32] = [
+        0xa7, 0x3b, 0x91, 0xf4, 0x6d, 0xc2, 0x58, 0x0e,
+        0xb3, 0x7f, 0x24, 0xd6, 0x89, 0x45, 0xea, 0x1c,
+        0x63, 0xaf, 0xd8, 0x52, 0x97, 0x0b, 0xe1, 0x3d,
+        0x76, 0xc4, 0x19, 0xfe, 0x4a, 0x85, 0x2c, 0xdb,
+    ];
+
+    /// Apply the D1 sign pattern in-place (TBQ_SIGNS_256). Self-inverse.
+    fn apply_d1_sign_d256(x: &mut [f32]) {
+        assert_eq!(x.len(), 256, "D1 sign d256 requires len=256");
+        for (j, v) in x.iter_mut().enumerate() {
+            let sign_byte = TBQ_SIGNS_256[j >> 3];
+            let bit = (sign_byte >> (j & 7)) & 1;
+            if bit != 0 {
+                *v = -*v;
+            }
+        }
+    }
+
+    /// Sign × FWHT pre-rotation (mirrors GPU `fwht_sign_premult_f32_d256`).
+    /// Used to rotate Q into the same basis as the encoded K, V.
+    fn sign_premult_fwht_d256(x: &mut [f32]) {
+        apply_d1_sign_d256(x);
+        mlx_native::turboquant::fwht_inplace(x).expect("FWHT");
+    }
+
+    /// FWHT × sign undo (mirrors GPU `fwht_sign_undo_f32_d256`).  Used
+    /// to inverse-rotate the SDPA output back into the standard basis.
+    fn fwht_sign_undo_d256(x: &mut [f32]) {
+        mlx_native::turboquant::fwht_inplace(x).expect("FWHT undo");
+        apply_d1_sign_d256(x);
+    }
+
+    /// Compute NRMSE = sqrt(sum((a-b)^2) / sum(b^2)) — relative error
+    /// vs the reference signal. Mirrors `mlx_native::turboquant::tests::nrmse`.
+    fn nrmse(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len(), "NRMSE requires equal-length slices");
+        let mut sum_sq_diff = 0.0_f32;
+        let mut sum_sq_ref = 0.0_f32;
+        for (av, bv) in a.iter().zip(b.iter()) {
+            let d = av - bv;
+            sum_sq_diff += d * d;
+            sum_sq_ref += bv * bv;
+        }
+        if sum_sq_ref == 0.0 {
+            return 0.0;
+        }
+        (sum_sq_diff / sum_sq_ref).sqrt()
+    }
+
+    /// Build a synthetic single-token K, V at qwen35 shape with non-trivial
+    /// values, return (cpu_floats, gpu_buffer) so we can both upload to GPU
+    /// for encoding AND compute the F32 reference SDPA on CPU.
+    fn synth_token_with_cpu_mirror(
+        device: &MlxDevice,
+        n_kv_heads: usize,
+        head_dim: usize,
+        salt: u32,
+    ) -> (Vec<Vec<f32>>, MlxBuffer) {
+        let mut cpu: Vec<Vec<f32>> = Vec::with_capacity(n_kv_heads);
+        for h in 0..n_kv_heads {
+            let mut head: Vec<f32> = Vec::with_capacity(head_dim);
+            for i in 0..head_dim {
+                let x = ((i as u32 + h as u32 * 31 + salt) % 1000) as f32 / 1000.0;
+                head.push((x * 6.28318).sin() * 0.5);
+            }
+            cpu.push(head);
+        }
+        let elems = n_kv_heads * head_dim;
+        let mut buf = device
+            .alloc_buffer(
+                elems * std::mem::size_of::<f32>(),
+                DType::F32,
+                vec![n_kv_heads, head_dim],
+            )
+            .expect("alloc token buf");
+        {
+            let s = buf.as_mut_slice::<f32>().expect("token mut slice");
+            for h in 0..n_kv_heads {
+                for d in 0..head_dim {
+                    s[h * head_dim + d] = cpu[h][d];
+                }
+            }
+        }
+        (cpu, buf)
+    }
+
+    #[test]
+    fn dispatch_tq_sdpa_nrmse_vs_f32_baseline_under_threshold() {
+        // **ITER-11 LITMUS TEST** — does the qwen35 TQ encode + GPU SDPA
+        // pipeline produce numerically-correct outputs vs an F32 baseline?
+        //
+        // Method (kv_seq_len=1 closed-form simplification):
+        // 1. Generate synthetic F32 K, V, Q at qwen35 shape.
+        // 2. Upload K, V to GPU + encode via dispatch_hadamard_quantize_kv_hb
+        //    (in-place FWHT + Lloyd-Max 8-bit quant). Read back packed/norms.
+        // 3. Apply CPU FWHT to Q (mirrors the GPU pre-rotation that the
+        //    forward path will do via dispatch_fwht_f32 in iter-12).
+        // 4. Call flash_attn_vec_tq_hb_oracle (CPU F32 mirror of the GPU
+        //    SDPA kernel). Output is in FWHT basis.
+        // 5. Apply inverse CPU FWHT to oracle output → output_tq in
+        //    standard basis.
+        // 6. F32 reference at kv_seq_len=1: softmax over 1 score = 1.0 →
+        //    output_ref[h] = V[kv_head(h)] (broadcast across query
+        //    heads via GQA: kv_head(h) = h / heads_per_kv).
+        // 7. NRMSE(output_tq, output_ref) — measures the cumulative
+        //    quantization error end-to-end.
+        //
+        // Threshold: NRMSE < 0.15 per ADR-007 §F-0.3 (Gemma path's
+        // empirically-validated TQ-vs-F32 ceiling). Failure indicates
+        // a fundamental kernel-level mismatch and would falsify Phase B.
+        //
+        // Why kv_seq_len=1: at single-position KV, the F32 reference
+        // simplifies to the cached V vector itself (softmax(scalar) = 1.0).
+        // This gives a closed-form baseline without writing a full SDPA
+        // CPU oracle. iter-12 extends to multi-token KV with a fuller
+        // CPU SDPA reference.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache_capacity: u32 = 64;
+        let mut cache =
+            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+                .expect("kv tq-on");
+        let slot = &mut cache.full_attn[0];
+        let n_kv_heads = cfg.num_key_value_heads;
+        let num_heads = cfg.num_attention_heads;
+        let head_dim = cfg.head_dim;
+        assert_eq!(head_dim, 256, "qwen35 production head_dim");
+
+        // Step 1: synthetic K, V with both CPU mirrors (for reference) and
+        // GPU buffers (for encoding).
+        let (k_cpu, k_buf) = synth_token_with_cpu_mirror(
+            &device, n_kv_heads as usize, head_dim as usize, 7,
+        );
+        let (v_cpu, v_buf) = synth_token_with_cpu_mirror(
+            &device, n_kv_heads as usize, head_dim as usize, 11,
+        );
+
+        // Step 2: GPU encode at write_pos=0.
+        let mut registry = mlx_native::KernelRegistry::new();
+        let mut encoder = device.command_encoder().expect("encoder");
+        slot.encode_token_to_tq(
+            &k_buf, &v_buf, n_kv_heads, head_dim, cache_capacity,
+            0, false, 1.0, 8, &mut encoder, &mut registry, &device,
+        )
+        .expect("encode");
+        encoder.commit_and_wait().expect("encode commit");
+
+        // Step 2b: read back packed/norms to CPU.
+        let tq = slot.tq.as_ref().unwrap();
+        let k_packed_bytes: Vec<u8> = tq.k_packed.as_slice::<u8>().unwrap().to_vec();
+        let k_norms_floats: Vec<f32> = tq.k_norms.as_slice::<f32>().unwrap().to_vec();
+        let v_packed_bytes: Vec<u8> = tq.v_packed.as_slice::<u8>().unwrap().to_vec();
+        let v_norms_floats: Vec<f32> = tq.v_norms.as_slice::<f32>().unwrap().to_vec();
+
+        // Step 3: synthetic Q (n_heads × head_dim) — non-trivial values.
+        let mut q_orig: Vec<Vec<f32>> = Vec::with_capacity(num_heads as usize);
+        for h in 0..num_heads as usize {
+            let mut head = Vec::with_capacity(head_dim as usize);
+            for i in 0..head_dim as usize {
+                let x = ((i + h * 17) % 1000) as f32 / 1000.0;
+                head.push((x * 3.14159).cos() * 0.4);
+            }
+            q_orig.push(head);
+        }
+        // Apply D1 sign × FWHT to each head of Q (mirrors GPU
+        // dispatch_fwht_sign_premult_f32 — the Q pre-rotation Gemma's
+        // production path uses; iter-12 will dispatch this on GPU).
+        let mut q_fwht: Vec<f32> =
+            Vec::with_capacity((num_heads as usize) * (head_dim as usize));
+        for head in &q_orig {
+            let mut buf = head.clone();
+            sign_premult_fwht_d256(&mut buf);
+            q_fwht.extend(buf);
+        }
+
+        // Step 4: call CPU oracle.
+        let oracle_params = mlx_native::tq_oracle::TqHbOracleParams {
+            num_heads,
+            num_kv_heads: n_kv_heads,
+            head_dim,
+            kv_seq_len: 1,
+            kv_capacity: cache_capacity,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            mask_type: 0,
+            sliding_window: 0,
+            softcap: 0.0,
+            ring_start: 0,
+            scale_factor_d512: 1.0,
+            codebook_bits: 8,
+        };
+        let mut oracle_output =
+            vec![0.0_f32; (num_heads as usize) * (head_dim as usize)];
+        mlx_native::tq_oracle::flash_attn_vec_tq_hb_oracle(
+            &q_fwht,
+            &k_packed_bytes,
+            &k_norms_floats,
+            &v_packed_bytes,
+            &v_norms_floats,
+            &mut oracle_output,
+            &oracle_params,
+        )
+        .expect("oracle");
+
+        // Step 5: inverse rotation on oracle output (FWHT × sign undo).
+        // Mirrors GPU dispatch_fwht_sign_undo_f32.
+        let mut output_tq_flat = oracle_output.clone();
+        for h in 0..num_heads as usize {
+            let off = h * head_dim as usize;
+            fwht_sign_undo_d256(&mut output_tq_flat[off..off + head_dim as usize]);
+        }
+
+        // Step 6: F32 reference at kv_seq_len=1 (closed form).
+        // softmax over a single score = 1.0; output = V[kv_head(h)].
+        let heads_per_kv = (num_heads / n_kv_heads) as usize;
+        let mut output_ref_flat: Vec<f32> =
+            Vec::with_capacity((num_heads as usize) * (head_dim as usize));
+        for h in 0..num_heads as usize {
+            let kv_head = h / heads_per_kv;
+            output_ref_flat.extend_from_slice(&v_cpu[kv_head]);
+        }
+
+        // Step 7: NRMSE.
+        let nrmse_value = nrmse(&output_tq_flat, &output_ref_flat);
+
+        // ADR-007 §F-0.3 threshold: TQ-vs-F32 NRMSE ≤ 0.15.
+        // qwen35 / qwen36 KV distribution post-FWHT must approximate
+        // N(0,1) for 8-bit Lloyd-Max codebook to be accurate; threshold
+        // failure = falsifies Phase B (would require per-(layer, head)
+        // calibration per ADR-007 F-2 path).
+        eprintln!(
+            "[iter-11 NRMSE litmus] qwen35 TQ-vs-F32 NRMSE = {nrmse_value:.6} \
+             (threshold 0.15)"
+        );
+        assert!(
+            nrmse_value < 0.15,
+            "iter-11 NRMSE litmus FAILED: {nrmse_value:.6} >= 0.15. \
+             qwen35 TQ-on path is NOT shippable at 8-bit codebook with \
+             standard FWHT. Investigate per-(layer, head) calibration \
+             (ADR-007 F-2 path) before proceeding."
+        );
+
+        // Held to silence unused warnings — k_cpu retained for completeness
+        // but not used (V dominates the kv_seq_len=1 closed form; iter-12
+        // multi-position test uses k_cpu in the full CPU SDPA reference).
+        let _ = k_cpu;
+        let _ = q_orig;
+    }
+
     #[test]
     fn hybrid_kv_cache_new_with_options_tq_off_with_mtp_keeps_mtp_tq_none() {
         // Same MTP cfg but tq_kv_active=false: MTP slot has tq=None.
