@@ -285,6 +285,63 @@ work-item to close mantra at FA=1.
   -p 1024,2455 -n 32,128,256 -fa 1 -r 5
 ```
 
+### Iter-108 item #19 production flip — FALSIFIED at +0% decode
+
+iter-106/107 LANDED a working fused FWHT-pre code path:
+- mlx-native bc6537d: kernel surgery + struct field
+- mlx-native abbb474: byte-parity test confirms BIT-IDENTITY
+  (max_abs_diff=0.0, NRMSE=0.0)
+
+iter-108 wired the production env-gate `HF2Q_TQ_FUSE_FWHT_PRE=1` (skip
+dispatch_fwht_sign_premult_f32 + skip its WAR barrier + set fuse_fwht_pre=1).
+
+**3-trial A/B with 60s cooldowns on gemma-4-26b APEX-Q5_K_M tg96**:
+
+| Trial | Default | Fused | Δ |
+|---:|---:|---:|---:|
+| 1 | 63.6 | 63.5 | -0.16% |
+| 2 | 63.5 | 63.4 | -0.16% |
+| 3 | 63.6 | 63.4 | -0.31% |
+| **Median** | **63.6** | **63.4** | **-0.31% (thermal noise)** |
+
+**Verdict (TESTABLE → FALSIFIED)**: skipping the dispatch + barrier
+yields ZERO measurable t/s improvement. Iter-104's "TQ barriers are 9%
+of decode" reframe was an artifact of HF2Q_SKIP_TQ_SDPA skipping MUCH
+more than just barriers (it skipped FA, FWHTs, and ALL surrounding
+work). The 1.44 ms attributed to barriers was actually FA-vec-tq-hb
+compute + reduce that the SKIP path also bypassed.
+
+**Likely root cause**: Apple Metal scheduler overlaps FWHT-pre dispatch
+with concurrent work (e.g., KV TQ-HB encode in same encoder) even when
+`barrier_between` emits memory_barrier. The barrier serializes Q-buffer
+access but doesn't block the rest of the GPU. Saved-encoder-CPU is also
+trivial (~3 µs/dispatch in iter-101 benches). Net t/s wash.
+
+**11th hypothesis falsification** on M5 Max where a llama.cpp-style or
+peer-derived kernel-fusion lever did NOT port to a measurable hf2q
+decode speedup. Per `feedback_metal_compiler_auto_optimizes_static_levers`.
+
+**Disposition**:
+- Code path KEPT (env-gated default OFF): scientifically valuable
+  control + regression-gate test passes byte-identity. Zero blast
+  radius if accidentally enabled.
+- Iter-99 item #19 (and iter-104 reframe) closed.
+- ROI inventory updated: TQ-region barrier elimination → 0%, NOT 9%.
+
+**The 4.72 ms decode peer gap**:
+- Already confirmed: ~3.19 ms is "TQ regime" (FA + FWHTs + barriers).
+- Iter-103 measured FA-vec-tq-hb compute alone = 1.43 ms (compute-bound).
+- TQ overhead minus FA-compute = 1.76 ms — likely **per-token-per-head
+  F32 norm multiply** + **8-bit codebook table lookup** intrinsic to TQ-HB
+  (vs llama.cpp's flat F16 K/V).
+- Structural cost of ADR-027 Phase B's 3.94× memory savings.
+- Closing this gap requires either dropping TQ-HB (loses memory savings,
+  violates mantra of HOLD coherence) or reducing the codebook-lookup cost.
+
+**Iter-109 pivot**: bench the 13 ms unaccounted bucket — QKV proj +
+O-proj + LM head + dense_down + KV encode. Per Pareto, the big peer-gap
+contributor likely lives there, not in TQ scaffolding.
+
 ### Iter-105 FWHT-into-FA fusion design (item #19 implementation plan)
 
 Designed the kernel surgery to capture the iter-104 10.5% lever.

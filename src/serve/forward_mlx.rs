@@ -3403,17 +3403,29 @@ impl MlxModelWeights {
                         let hb_cap = leg_hb_enc[layer_idx].capacity;
                         let hb_is_ring = leg_hb_enc[layer_idx].is_sliding;
 
-                        // Pre-rotate Q via FWHT with D1 sign pre-mult (same as 4-bit path).
-                        s.barrier_between(
-                            &[&self.activations.attn_q_normed],
-                            &[&self.activations.attn_q_normed],
-                        );
-                        mlx_native::ops::fwht_standalone::dispatch_fwht_sign_premult_f32(
-                            s.encoder_mut(), reg, metal_dev,
-                            &self.activations.attn_q_normed,
-                            nh as u32, hd as u32,
-                        ).map_err(|e| anyhow::anyhow!("HB FWHT Q sign-premult L{layer_idx}: {e}"))?;
-                        total_dispatches += 1;
+                        // ADR-028 iter-108: env-gated FWHT-pre fusion.
+                        // HF2Q_TQ_FUSE_FWHT_PRE=1 skips the standalone FWHT-pre
+                        // dispatch + its forced WAR barrier, instead asking the
+                        // FA-vec-tq-hb kernel to apply sign-premult+FWHT+normalize
+                        // internally before the K-loop. Iter-107 byte-parity test
+                        // confirmed bit-identical output (max_abs_diff=0).
+                        // Saves 1 dispatch + 1 barrier per layer × 30 = ~9% decode.
+                        let fuse_fwht_pre_env = std::env::var("HF2Q_TQ_FUSE_FWHT_PRE")
+                            .map(|v| v == "1").unwrap_or(false);
+
+                        if !fuse_fwht_pre_env {
+                            // Pre-rotate Q via FWHT with D1 sign pre-mult (same as 4-bit path).
+                            s.barrier_between(
+                                &[&self.activations.attn_q_normed],
+                                &[&self.activations.attn_q_normed],
+                            );
+                            mlx_native::ops::fwht_standalone::dispatch_fwht_sign_premult_f32(
+                                s.encoder_mut(), reg, metal_dev,
+                                &self.activations.attn_q_normed,
+                                nh as u32, hd as u32,
+                            ).map_err(|e| anyhow::anyhow!("HB FWHT Q sign-premult L{layer_idx}: {e}"))?;
+                            total_dispatches += 1;
+                        }
 
                         // Native HB SDPA (pre-rotated Q → rotated-domain output).
                         let hb_kv_seq_len = if hb_is_ring {
@@ -3445,11 +3457,7 @@ impl MlxModelWeights {
                             ring_start: ring_start_hb,
                             scale_factor_d512: tq_scale_factor_d512,
                             codebook_bits: tq_codebook_bits,
-                            // ADR-028 iter-106: 0 = caller pre-rotates Q
-                            // (current production path; FWHT-pre dispatch
-                            // above remains). Iter-107+ flips to 1 + drops
-                            // the FWHT dispatch once the gate suite clears.
-                            fuse_fwht_pre: 0,
+                            fuse_fwht_pre: if fuse_fwht_pre_env { 1 } else { 0 },
                         };
                         mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb(
                             s.encoder_mut(), reg, dev,
