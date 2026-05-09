@@ -355,6 +355,20 @@ For this project phase the sliding_wrap 752-byte batched-vs-batched ceiling is *
 
   This is the realized user-facing impact of the iter-64+iter-68 wins, gated behind `HF2Q_BATCHED_PREFILL=1 + HF2Q_UNSAFE_EXPERIMENTS=1`. For a typical chat session (5-10 turns), cumulative savings are 3.5-7 seconds — material UX improvement.
 
+- 2026-05-09 (iter-81 DECODE-vs-CONTEXT decay measured): Operator observed `mlx-native: 885 tokens in 14.94s (59.2 tok/s)` at long context — slower than the 65 t/s the iter-80 gate measures at short context. Hypothesis test: decode throughput vs context length on gemma APEX:
+
+  | Context tokens | Decode t/s |
+  |---------------:|-----------:|
+  |             32 |       65.7 |
+  |            128 |       63.6 |
+  |            154 (EOS) |  63.5 |
+  |           1000 |       **59.1** ← matches operator's 59.2 at 885 |
+
+  ~10% decay from 32→1000 tokens. Cause: KV-cache-read overhead grows linearly with context (each decode step reads more K/V from cache for SDPA). Real, measurable, expected behavior; not a regression.
+
+  iter-80 decode floor of 50 t/s is conservative for both regimes (>24% margin from short-context 65 baseline; >15% margin from long-context 59 baseline). The decay rate is a structural property of the autoregressive decode path on the gemma sliding-window architecture (sliding_window=1024 means KV reads stay bounded after that point — would expect plateau, not further decay, beyond pp1024).
+
+
 
 
 
