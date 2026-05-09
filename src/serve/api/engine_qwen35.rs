@@ -361,7 +361,7 @@ impl Qwen35LoadedModel {
         // `n_layers`, `max_context_length`, `quant_label` fields. The
         // free-text format here was incompatible with `journalctl -u hf2q | jq`.
 
-        Ok(Self {
+        let loaded = Self {
             model,
             tokenizer,
             chat_template,
@@ -427,7 +427,40 @@ impl Qwen35LoadedModel {
             // wires the SDPA dispatch). Per-process flag, captured once
             // here so the env can't toggle mid-process.
             tq_kv_active: crate::serve::api::tq_packed_descriptor::is_tq_active_mode(),
-        })
+        };
+
+        // ADR-027 Phase B iter-22 — surface the iter-23+ design constraint:
+        // when TQ-on is combined with KV-persist, snapshot/restore today
+        // serialize the F32 K/V buffers (which are byte-identical to F32
+        // baseline under iter-15's shadow-cache pattern, so persist works
+        // correctly TODAY). When iter-23+ drops the F32 backing in TQ
+        // mode, snapshot/restore must learn to encode TQ buffers OR
+        // gracefully bail. Surfaces the future constraint NOW so operators
+        // who run TQ + persist combos know to re-run scripts/adr027-cross-
+        // axis-sweep.sh after iter-23 lands.
+        if loaded.tq_kv_active && opts.kv_persist_dir.is_some() {
+            tracing::info!(
+                "ADR-027 iter-22 + Phase B: HF2Q_TQ_KV=1 + HF2Q_KV_PERSIST both active. \
+                 Persist snapshots currently store F32 K/V (byte-identical to F32 \
+                 baseline under iter-15 shadow-cache pattern). Iter-23+ F32-drop will \
+                 require TQ-aware snapshot codec; re-run scripts/adr027-cross-axis-sweep.sh \
+                 after that change to verify the cross-axis combination still produces \
+                 byte-identical output."
+            );
+        }
+        if loaded.tq_kv_active {
+            // Iter-22: also surface that the LCP probe still engages
+            // under TQ-on (slot.k/v are populated by the iter-15 shadow
+            // write so probes work). Iter-23+ that drops F32 will need
+            // an LCP-on-TQ guard (either disable LCP store/probe in TQ
+            // mode OR extend LcpRegistry payload to carry TQ buffers).
+            tracing::info!(
+                "ADR-027 iter-22 + Phase B: HF2Q_TQ_KV=1; LCP probe engages off the F32 \
+                 shadow cache today. Iter-23+ F32-drop will require an LCP-on-TQ guard."
+            );
+        }
+
+        Ok(loaded)
     }
 
     /// ADR-027 Phase A iter-6b.2 — write-through helper that stores a
