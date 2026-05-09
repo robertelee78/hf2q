@@ -1,0 +1,244 @@
+# ADR-027: Qwen3.5 / Qwen3.6 TurboQuant KV Cache + Persist Family Port
+
+- **Status:** Proposed (iter-1: design landed 2026-05-08; iter-2+ implementation)
+- **Date:** 2026-05-08
+- **Deciders:** Operator + Claude
+- **Tags:** turboquant, kv-cache, qwen35, qwen36, kv-persist, tq-active, peer-parity
+- **Related ADRs:** ADR-007 (TurboQuant KV cache — Gemma4), ADR-013 (qwen35 inference), ADR-017 (KV-persist + LCP), ADR-022 (kernel coverage parity)
+
+## Engineering Mantra (load-bearing — read before every iter)
+
+> *DO NOT BE LAZY. We have plenty of time to do it right. No short cuts. Never make assumptions. Always dive deep and ensure you know the problem you're solving. Make use of search as needed. Measure 3x, cut once. No fallback. No stub (todo later) code. Just pure excellence, done the right way the entire time. Also recall Chesterton's fence; always understand current fully before changing it.*
+>
+> Operator amplifications standing for this ADR (2026-05-08):
+> - "TQ for all models we support, if possible — best possible outcome, always"
+> - "as coherent and as fast or faster than our peers"
+> - "implement TQ as well (or better) than our peers"
+> - "no deferrals without explicit operator approval"
+
+## 1. Context
+
+ADR-007 landed TurboQuant 8-bit Lloyd-Max HB SDPA on Gemma 4 (hf2q's first arch). ADR-007 Path C (re-opened 2026-05-05) closed F-0/F-2/F-3/F-4 with measured needle-haystack 12/12 PASS at 4K-32K, sub-linear KV growth, and an empirically-grounded 8-bit codebook (`empirical KV distribution N(0,1) at every (layer, head) cell`). Net Gemma 4 wins:
+
+- 4× KV memory savings vs F16 dense (1 byte/elem + per-block norms vs 2 bytes/elem).
+- Cosine 0.9998 / argmax 0.8% / PPL 1.24% — beats published peers' ship gates.
+- 32K coherent at production decode rates; 64K coherent at 14.4 t/s.
+- Disk persistence via `TqPackedSpill` (codec_version=2, frozen contract per ADR-007 §F-7.1).
+
+**Qwen3.5 / Qwen3.6 has none of the above today.** `kv_spill = inactive` is reported in the load banner regardless of `HF2Q_TQ_KV=1`. The qwen35 forward path (`src/inference/models/qwen35/forward_gpu.rs` + `gpu_full_attn.rs`) allocates F32 K + V buffers in `HybridKvCache::full_attn` and runs dense SDPA via `flash_attn_vec` (post ADR-022 kernel-swap). DeltaNet linear-attn layers don't have a traditional KV cache — they're already SSM-compressed via `linear_attn` slots (conv-state + recurrent state).
+
+Concretely for Qwen 3.6 35B-A3B-APEX-Q5_K_M (40 layers, full-attn-every-4 = 10 full-attn layers):
+
+| Layer kind | Count | Per-layer KV memory at 32K | Aggregate at 32K |
+|------------|-------|---------------------------:|-----------------:|
+| Linear-attn (DeltaNet) | 30 | conv 64KB + recurrent 4MB | ~120 MB total |
+| Full-attn | 10 | 2 (K+V) × 32768 × 2 (kv-heads) × 256 (head-dim) × 4 (F32) | ≈ **134 MB per layer** = **1.34 GB total** |
+| **Aggregate F32 dense** | | | **≈ 1.46 GB** |
+| **Aggregate after TQ on full-attn** | | full-attn drops to ~33 MB/layer (1 byte/elem) | **≈ 0.45 GB** (3.2× total cache reduction) |
+
+Peer floor (mantra: as fast/coherent/memory-efficient as peers): llama.cpp + vLLM + KIVI all ship KV-cache quantization. Without TQ on qwen35 full-attn, hf2q ships **3.2× more KV memory than peers** at 32K and proportionally less context per fixed budget. The fix is the qwen35 TQ port.
+
+## 2. Decision
+
+Land **TQ-active in-memory encoding + spill family** for qwen3.5/3.6 full-attn layers. DeltaNet linear-attn layers stay dense (already SSM-compressed; no KV-style cache to quantize).
+
+Two phases, each with its own iter sequence + acceptance gates. Each iter ships a complete, mantra-clean deliverable; no stubs, no "phase X candidate" labels.
+
+### Phase A — Qwen35HybridSpill (KV-persist family)
+
+Mechanical port of `Gemma4DenseSpill` to `HybridKvCache` shape so qwen35 gains disk-persistence + LCP-resume of dense KV cache. Independent of TQ encoding (works on F32 cache as-is). Unblocks ADR-017 LCP-resume on qwen35.
+
+### Phase B — TQ-active KV in qwen35 full-attn forward
+
+Allocate TQ-encoded K/V buffers for every full-attn layer; route SDPA through `flash_attn_vec_tq_hb` (ADR-007 kernel, parameterized for qwen35 head-dim 256 vs Gemma's 256/512 mix). Achieves peer-parity 3.2× KV memory savings + ADR-007 needle-haystack capability on qwen35.
+
+Phase B uses Phase A's spill seam to write TQ payloads (codec_version=2 frozen by ADR-007 §F-7.1) — single on-disk codec across Gemma + qwen35.
+
+## 3. Non-Goals
+
+- **TQ on linear-attn DeltaNet state.** Already SSM-compressed; further quantization is out of scope for ADR-027.
+- **Continuous batching / paged KV.** ADR-005 territory; this ADR is single-request scope.
+- **TQ on Qwen3-VL text LM.** Qwen3VlText forward path lives behind iter-228b (`cmd_generate_qwen35` returns `qwen3vl_text_forward_pending` 501 today); will inherit ADR-027 once iter-228b lands.
+- **HF2Q_F16_KV qwen35 path.** Gemma 4 has it as a low-cost middle option; qwen35's path goes straight from F32 dense → TQ 8-bit (no intermediate F16 step). Operator-approved scope simplification.
+
+## 4. Architecture Decisions
+
+### 4.1 Cache-shape duality (mandatory; falsifies single-vector assumptions)
+
+Gemma 4 bakes `Vec<DenseKvBuffer>` indexed by model layer rank with uniform per-LayerType shape. Qwen35 has TWO state families per `HybridKvCache`:
+
+- `full_attn: Vec<FullAttnKvSlot>` — standard K/V at `[max_seq_len × n_kv_heads × head_dim]`.
+- `linear_attn: Vec<LinearAttnStateSlot>` — DeltaNet conv state `[K-1 × n_seqs]` + recurrent state `[D_k × D_v × num_v_heads × n_seqs]`, with ping-pong scratch.
+- `mtp_slot: Option<FullAttnKvSlot>` — optional appended slot for nextn-predict GGUFs.
+- Layer-rank → slot resolution via `per_layer_slot: Vec<LayerSlot>` (Full(u32) | Linear(u32)).
+
+`Qwen35HybridSpillConfig` MUST capture both shapes:
+
+```rust
+pub struct Qwen35HybridConfig {
+    pub layer_slots: Arc<Vec<LayerSlot>>,        // model layer → slot kind+rank
+    pub n_full_attn_layers: usize,
+    pub n_linear_attn_layers: usize,
+    pub has_mtp: bool,
+    // Full-attn per-slot shape (uniform across full-attn slots within a model)
+    pub full_attn_n_kv_heads: usize,             // qwen35: 2; qwen36: 2
+    pub full_attn_head_dim: usize,               // 256 for qwen35/qwen36
+    pub full_attn_max_seq_len: u32,              // ring capacity; mirrors Gemma's max_decode_tokens
+    pub full_attn_kv_dtype: DType,               // F32 (Phase A) or TQ-packed (Phase B)
+    // Linear-attn per-slot shape
+    pub linear_attn_d_k: usize,
+    pub linear_attn_d_v: usize,
+    pub linear_attn_num_v_heads: usize,
+    pub linear_attn_conv_kernel: usize,          // K, conv state has K-1 lookback
+    pub n_seqs: u32,
+}
+```
+
+### 4.2 Layer-rank → block-payload routing (mandatory)
+
+`KvCacheSpill::snapshot_block` is called with a `layer_rank: usize` (0..n_layers). For Gemma all layers have the same payload shape; for qwen35 the payload shape depends on `LayerSlot`:
+
+```rust
+match self.cfg.layer_slots[layer_rank] {
+    LayerSlot::Full(slot_idx)   => snapshot_full_attn_block(slot_idx, range),
+    LayerSlot::Linear(slot_idx) => snapshot_linear_attn_block(slot_idx, range),
+}
+```
+
+The on-disk payload header MUST encode the `LayerSlot` kind so `restore_block` can route correctly without external metadata. Proposal: extend `EnvelopeHeader` (codec_version=3 reserved for this, OR a new payload_kind tag `kv-qwen35-hybrid-v1`). Phase A iter-2 finalizes the choice with falsifier (3-iter codec parity test).
+
+### 4.3 Full-attn payload codec (Phase A: F32 dense; Phase B: TQ v2)
+
+**Phase A (F32 dense):**
+- Header: `[layer_rank u32][slot_kind u8 = FULL][slot_idx u32][token_start u32][token_end u32][n_kv_heads u16][head_dim u16][dtype_tag u16]`
+- Body: `K bytes [(token_end - token_start) × n_kv_heads × head_dim × 4]` followed by `V bytes` of the same length.
+- `current_len` carried in header for restore-time write-position recovery.
+
+**Phase B (TQ v2):**
+- Reuses `payload_kind = "kv-tq-packed"` codec_version=2 (frozen by ADR-007 §F-7.1) — bytes are layer-rank-agnostic.
+- Outer envelope adds `slot_kind = FULL` to disambiguate from linear payloads in the same block-store.
+- Linear payloads still use Phase A's F32 path (no TQ on linear-attn).
+
+### 4.4 Linear-attn payload (mandatory; ping-pong active-state semantics)
+
+`LinearAttnStateSlot` holds ACTIVE conv-state + recurrent + their SCRATCH counterparts. `swap_recurrent` toggles which is active mid-decode. Snapshot must:
+
+1. Capture ACTIVE buffer bytes + a `swap_parity: u8` field reflecting which slot is active at snapshot time.
+2. Restore writes ACTIVE; scratch is left zeroed (Mantra-clean: scratch is genuinely transient working memory, not persistent state).
+
+Header: `[layer_rank u32][slot_kind u8 = LINEAR][slot_idx u32][swap_parity u8][d_k u16][d_v u16][num_v_heads u16][n_seqs u16]`
+Body: `conv_state bytes` + `recurrent bytes` (both F32, lengths derived from header).
+
+### 4.5 MTP slot (optional, mandatory if present)
+
+If `cfg.has_mtp`, `n_layers()` returns `n_full_attn_layers + n_linear_attn_layers + 1` and the +1 layer rank routes through `snapshot_mtp_block` / `restore_mtp_block`. Same payload shape as full-attn.
+
+### 4.6 TQ-active dispatch in qwen35 forward (Phase B mandatory)
+
+`flash_attn_vec_tq_hb` (mlx-native, ADR-007 kernel) is parameterized on head_dim ∈ {256, 512}. Qwen35 full-attn uses head_dim=256 — already supported (no new kernel work). Required wiring:
+
+1. `MlxModelWeights` (qwen35 path) gains `tq_kv_active: bool` field set from `INVESTIGATION_ENV.tq_kv` at load.
+2. `HybridKvCache::full_attn` slot allocation branches on `tq_kv_active`: when true, allocate TQ-encoded leg buffers (`leg_hb_encoded` × n_full_attn_layers) instead of F32 K/V pair.
+3. `gpu_full_attn::full_attn_layer_gpu` SDPA dispatch branches: `tq_kv_active` → `flash_attn_vec_tq_hb(q, leg_hb_encoded[layer], …)`; else → existing `flash_attn_vec(q, k, v, …)`.
+4. KV write path (post-attention) branches: `tq_kv_active` → `hadamard_quantize_kv_hb` to encode → write into leg buffer; else → existing F32 K/V append.
+
+Falsifier: needle-haystack 12/12 at 4K-32K on Qwen 3.6 APEX-Q5_K_M with `HF2Q_TQ_KV=1`, matching ADR-007 iter-10's Gemma 4 result. NRMSE of TQ-vs-F32 SDPA output ≤ 0.15 (matches ADR-007 F-0 falsifier).
+
+### 4.7 Bind seam (cmd_generate_qwen35 + cmd_serve)
+
+`cmd_generate_qwen35` (`src/serve/mod.rs:1915`) is the dedicated qwen35 dispatch path; it bypasses Gemma's `cmd_generate` flow including the spill registry call. Phase A iter-5 wires:
+
+- New `Qwen35LoadedModel::kv_spill_descriptor()` returning `Some(KvSpillDescriptor::from_qwen35_loaded_model(...))` analogous to Gemma's existing one.
+- `cmd_serve` (`src/serve/mod.rs:3034-3168` Gemma block) gains a parallel qwen35 block that registers `Qwen35HybridSpillFactory` with the right (repo, quant) FamilyKey for qwen35 GGUFs.
+- `cmd_generate_qwen35` calls `loader_wrapper::try_substitute_on_load(repo, quant, engine_dyn)` post-load (mirror of Gemma path).
+
+### 4.8 Ban list (Chesterton's fence-respected)
+
+Things that are tempting "simplifications" but break invariants — DO NOT do without explicit operator approval:
+
+- ❌ **Single payload codec for full+linear**: drops slot_kind discrimination, cannot restore correctly. Don't merge codecs.
+- ❌ **Drop scratch buffer parity tracking**: ping-pong active state is real; restoring to wrong slot inverts decode by one step.
+- ❌ **Encode linear-attn with TQ**: SSM state isn't K/V — TQ's distribution assumption (post-FWHT N(0,1) per ADR-007 F-0.3) doesn't apply.
+- ❌ **Hardcode 10 full-attn layers**: full_attn_every interval is configurable; layer count varies by model variant.
+- ❌ **Skip mtp_slot when has_mtp=true**: MTP block is part of the model state; dropping it breaks MTP speculative decode.
+
+## 5. Acceptance Criteria
+
+### Phase A (qwen35 spill family port)
+
+- **AC-A1**: `Qwen35HybridSpill::snapshot_block` + `restore_block` round-trip byte-equal on a synthetic 256-token full-attn slot. Test: `tests/adr_027_phase_a_full_attn_roundtrip.rs`.
+- **AC-A2**: Same byte-equal round-trip on a 256-token linear-attn slot, INCLUDING swap_parity. Test: `tests/adr_027_phase_a_linear_attn_roundtrip.rs`.
+- **AC-A3**: MTP slot round-trip (when `has_mtp=true`). Test: `tests/adr_027_phase_a_mtp_roundtrip.rs`.
+- **AC-A4**: `kv_spill = active` shows in load banner for Qwen 3.6 35B-A3B-APEX-Q5_K_M with `HF2Q_KV_PERSIST=<dir>`.
+- **AC-A5**: ADR-017 LCP-resume engages on a 2-turn qwen35 conversation: trial-2 prefill TTFT ≤ 0.5× cold (matches ADR-017 R-P6 ≤0.5× stretch on Gemma).
+- **AC-A6**: No regression on existing Qwen 3.6 APEX coherent generation: "What is 2 plus 2?" → coherent answer at temp=0 with kv-persist enabled.
+
+### Phase B (TQ-active in-memory KV on qwen35 full-attn)
+
+- **AC-B1**: `HF2Q_TQ_KV=1` on Qwen 3.6 APEX-Q5_K_M shows `[iter-21 Track B] Allocating leg_hb_encoded (8-bit, 10 layers)` (10 = full-attn count). Banner reports actual KV memory savings.
+- **AC-B2**: Coherent generation at `HF2Q_TQ_KV=1`: "What is 2 plus 2?" → coherent answer at temp=0; "Capital of France" → "Paris" at temp=0.
+- **AC-B3**: NRMSE(TQ-active SDPA vs F32 dense SDPA) ≤ 0.15 on synthetic Gaussian K/V at production shape (10 full-attn layers, head_dim=256, n_kv_heads=2, sliding none, full ring=8192). Mirror of ADR-007 F-0.2 at qwen35 shape.
+- **AC-B4**: Needle-haystack 12/12 PASS at {4K, 8K, 16K, 32K} × {pos 0.1, 0.5, 0.9} on Qwen 3.6 APEX-Q5_K_M with `HF2Q_TQ_KV=1`. Mirror of ADR-007 iter-10 Gemma result.
+- **AC-B5**: Decode tok/s degradation ≤ 5% vs F32 dense at 8K context (TQ encode/decode per-step overhead must not eat the SDPA bandwidth win at this length).
+- **AC-B6**: KV memory @ 32K measurably ≤ 0.5 GB (3.2× compression vs F32 dense's 1.34 GB). Reported via `mlx-native resident <X> GiB` in banner.
+- **AC-B7**: Phase A spill seam writes TQ payloads correctly: snapshot+restore round-trip with `HF2Q_TQ_KV=1` on a real Qwen 3.6 conversation; bytes are layer-rank-agnostic codec_version=2 per ADR-007 §F-7.1.
+
+### Cross-phase
+
+- **AC-X1**: 3185+ unit tests still pass on every iter commit (pre-port baseline + new tests).
+- **AC-X2**: Operator-driven smoke: `hf2q generate --model <qwen36-apex>.gguf --prompt "<prompt>"` produces coherent output across `HF2Q_TQ_KV={0,1}` × `HF2Q_KV_PERSIST={unset, /tmp/cache}`. No regression at any combo.
+
+## 6. Iter Sequence
+
+Each iter ships a complete, mantra-clean deliverable. No iter is "enable later"; no commit lands with `// TODO` markers in new code.
+
+| Iter | Phase | Scope | Acceptance |
+|------|-------|-------|------------|
+| 1 | – | This ADR | Operator review |
+| 2 | A | `src/serve/kv_persist/families/qwen35_hybrid.rs` skeleton: `Qwen35HybridConfig`, `Qwen35HybridSpill` struct + `KvCacheSpill::block_alignment` + `n_layers` + `snapshot_block`/`restore_block` for **full-attn slots only**. Synthetic-state round-trip test. | AC-A1 |
+| 3 | A | Linear-attn slot snapshot + restore including swap_parity. Synthetic round-trip test. | AC-A2 |
+| 4 | A | MTP slot snapshot + restore. | AC-A3 |
+| 5 | A | `Qwen35HybridSpillFactory` + `KvSpillDescriptor::from_qwen35_loaded_model` + `cmd_serve` registration block + `cmd_generate_qwen35` bind seam. | AC-A4, AC-A6 |
+| 6 | A | LCP-resume engagement on qwen35 (the ADR-017 path needs the spill family wired before LCP can be measured). | AC-A5 |
+| 7 | B | `MlxModelWeights` (qwen35) gains `tq_kv_active`; `HybridKvCache::full_attn` allocator branches; F32-vs-TQ allocation parity test. | – |
+| 8 | B | `gpu_full_attn::full_attn_layer_gpu` SDPA dispatch: TQ branch via `flash_attn_vec_tq_hb`; KV write branch via `hadamard_quantize_kv_hb`. NRMSE parity test. | AC-B3 |
+| 9 | B | End-to-end `HF2Q_TQ_KV=1` coherent generation; banner shows leg buffer allocation. | AC-B1, AC-B2 |
+| 10 | B | Needle-haystack harness on qwen35 (mirror of ADR-007 iter-10). | AC-B4 |
+| 11 | B | Phase A spill seam Phase-B integration: TQ payloads round-trip via codec_version=2. | AC-B7 |
+| 12 | B | Decode-perf bench at 8K (≤5% degradation). KV memory measurement at 32K. | AC-B5, AC-B6 |
+| 13 | both | Cross-axis sweep: HF2Q_TQ_KV ∈ {0, 1} × HF2Q_KV_PERSIST ∈ {unset, /tmp/cache}; coherent + LCP both ways. | AC-X2 |
+| 14 | both | LANDED memory + ADR header flip + memory index entry. | – |
+
+## 7. Risks + Mitigations
+
+| Risk | Mitigation |
+|------|------------|
+| Codec_version=2 frozen by ADR-007 §F-7.1; can a qwen35 wrapper extend it? | Yes — outer envelope wraps codec_version=2 payload bytes; the on-disk frozen contract is the inner payload bytes. No ADR-007 codec change. |
+| Linear-attn ping-pong scratch capture: which buffer is "active" mid-decode? | `swap_parity` byte in linear payload header; restore tested via 3-decode-step replay (`tests/adr_027_phase_a_linear_attn_swap_replay.rs` in iter-3). |
+| Qwen35 forward path uses `flash_attn_vec` (ADR-022 kernel) — TQ kernel `flash_attn_vec_tq_hb` is a different mlx-native entry. | Both kernels exist in mlx-native at HEAD; iter-8 swap is hf2q-side dispatch table change only. |
+| `cmd_generate_qwen35` path bypasses much of Gemma's serve flow. Is the bind seam isomorphic? | Iter-5 uses `loader_wrapper::try_substitute_on_load` directly (not the auto-LoaderWrapper-bind which is Gemma-specific). Same atomic substitution semantics. |
+| TQ NRMSE on qwen35 K/V distribution: ADR-007 F-0.3 measured Gemma's empirical post-FWHT N(0,1); does qwen35 match? | Iter-8 falsifier rerun on qwen35 fixtures BEFORE wiring SDPA. If NRMSE > 0.15 on qwen35, fall back to per-(layer, head) calibration design (ADR-007 F-2 path) before continuing. Operator approval required for any deviation from N(0,1) assumption. |
+
+## 8. Open Questions
+
+- (Q-1, iter-2) Codec discrimination: extend `EnvelopeHeader.codec_version` to 3 with kv-qwen35-hybrid-v1 payload, OR add a `slot_kind: u8` byte to the existing v2 envelope as a non-breaking extension? Decide in iter-2 with falsifier (cross-version reject test).
+- (Q-2, iter-7) `tq_kv_active` env-toggle vs descriptor field: env-toggle simplifies CLI but couples runtime to env state. Descriptor field is cleaner but requires KvSpillDescriptor extension. Decide in iter-7.
+- (Q-3, iter-12) If decode degradation > 5% (AC-B5 fail), is the gate softened or do we add a kernel-level optimization iter (mirror of ADR-007 iter-21 Track B)? Operator decision.
+
+## 9. Receipts (current state at iter-1)
+
+- `/opt/hf2q/src/serve/kv_persist/families/gemma4_dense.rs` (3312 LOC) — port reference.
+- `/opt/hf2q/src/serve/kv_persist/families/tq_packed.rs` (2680 LOC) — TQ payload codec reference.
+- `/opt/hf2q/src/serve/kv_persist/spiller.rs:91-196` — `KvCacheSpill` trait contract.
+- `/opt/hf2q/src/inference/models/qwen35/kv_cache.rs:107-198` — `HybridKvCache` + `HybridKvCacheSnapshot` shape.
+- `/opt/hf2q/src/serve/api/kv_spill_descriptor.rs:76-239` — `KvSpillDescriptor::from_gemma_loaded_model` reference.
+- `/opt/hf2q/src/serve/mod.rs:3034-3168` — Gemma4 spill registration block (parallel qwen35 block lands iter-5).
+- `/opt/hf2q/docs/ADR-007-turboquant-kv-cache.md:1167-1442` — Path C Progress Log + frozen codec contract.
+- mlx-native `flash_attn_vec_tq_hb` — kernel exists at HEAD (used by Gemma path); reuse as-is for qwen35 head_dim=256.
+
+## 10. Iter Log
+
+| Iter | Date | Phase | Status | Commits / Detail |
+|------|------|-------|--------|------------------|
+| 1 | 2026-05-08 | – | LANDED | This ADR doc. Operator-reviewed. |
+| 2 | (pending) | A | – | – |
