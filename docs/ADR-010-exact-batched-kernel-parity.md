@@ -394,6 +394,28 @@ For this project phase the sliding_wrap 752-byte batched-vs-batched ceiling is *
 
 - 2026-05-09 (iter-83 ground-state validation): Full hf2q test suite at HEAD with iter-82 changes: **3390 passed; 0 failed; 10 ignored** (peer WIP stashed). Up from 3382 baseline (+8 tests landed across iter-64..82, 1 newly-ignored). Lock-in chain (iter-76 single-command runner) still PASS at HEAD: shader-compile + gemma coherence/perf/decode + qwen35 cross-model. Chain is at steady state.
 
+- 2026-05-09 (iter-86 POST-iter-68 profile re-measurement): Re-ran `HF2Q_PROFILE_BUCKETS=1` on pp2455 batched at HEAD to measure the new bottleneck distribution after iter-68's tensor mm_id unlock:
+
+  | Bucket            | iter-66 (pre-fix)        | iter-86 (post-fix)        | Δ |
+  |-------------------|-------------------------:|--------------------------:|--:|
+  | MOE_GATE_UP       | 542.6 ms (34.5%)         | **209.7 ms (18.0%)**      | **-61%** |
+  | MOE_DOWN          | 297.9 ms (18.9%)         | **186.3 ms (16.0%)**      | **-37%** |
+  | MoE total         | 840.5 ms (53.4%)         | 396.0 ms (34.0%)          | -53% |
+  | STARTUP           | 125.5 ms (8.0%)          | 128.9 ms (11.1%)          | unchanged |
+  | QKV_MM            | 126.2 ms (8.0%)          | 128.2 ms (11.0%)          | unchanged |
+  | FA_SW (D=256)     |  92.8 ms (5.9%)          | 101.5 ms (8.7%)           | unchanged |
+  | FA_GL (D=512)     |  63.1 ms (4.0%)          |  63.2 ms (5.4%)           | unchanged |
+  | O_MM              |  68.7 ms (4.4%)          |  73.6 ms (6.3%)           | unchanged |
+  | MLP_GUR_MM        |  67.1 ms (4.3%)          |  72.0 ms (6.2%)           | unchanged |
+  | **TOTAL**         | **1573.7 ms** (1737 t/s) | **1164.7 ms (2119 t/s)** | **-26% time, +22% throughput** |
+  | vs llama.cpp      | 0.57× peer               | **0.70× peer**            | +13pp |
+
+  iter-68's tensor mm_id unlock saved 444 ms total (mostly MoE matmul). MoE dropped from 53.4% → 34.0% of prefill time. Throughput: pp2455 1737 → 2119 t/s = +22%.
+
+  STARTUP breakdown shows mask_sliding=124.9 ms, but this is **first-dispatch cold-start cost** attributed to the first kernel in the per-prefill graph (mask_sliding fires before mask_global which only takes 1.4 ms for the same kernel + same shape). NOT a real kernel-perf issue; just measurement attribution. iter-66 lumped this into STARTUP=125ms; iter-86 breaks it out — same total, just attributed differently to the first per-prefill kernel.
+
+  Remaining gap to llama.cpp (0.70× → 1.0× = ~30%): MoE matmul is still the largest (34%); QKV+O+MLP matmuls together are another ~24%; FA is ~14%. No single dominant bottleneck. Closing further requires either kernel-level work across multiple kernels OR algorithmic change (e.g., kernel fusion).
+
 
 
 
