@@ -3186,6 +3186,169 @@ mod tests {
         let _ = q_orig;
     }
 
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-027 Phase B iter-13 — GPU end-to-end NRMSE litmus
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_tq_sdpa_gpu_end_to_end_nrmse_vs_f32_baseline_under_threshold() {
+        // **ITER-13 GPU LITMUS** — validates the FULL GPU chain:
+        // (a) GPU encode (dispatch_hadamard_quantize_kv_hb)
+        // (b) GPU Q pre-rotation (dispatch_fwht_sign_premult_f32_d256)
+        // (c) GPU TQ SDPA (flash_attn_vec_tq_hb via dispatch_tq_sdpa)
+        // (d) GPU output inverse-rotation (dispatch_fwht_sign_undo_f32_d256)
+        //
+        // Compares against the F32 closed-form reference at kv_seq_len=1
+        // (output[h] = V[kv_head(h)] since softmax over a single score = 1.0).
+        //
+        // iter-11 proved (a)+CPU oracle correctness (NRMSE 0.008). iter-13
+        // re-runs the same test using the actual GPU SDPA kernel so the
+        // production wiring (iter-14) has a parity-validated path.
+        //
+        // Threshold: NRMSE < 0.15 per ADR-007 §F-0.3. iter-11 measured
+        // 0.008 on the CPU oracle path; the GPU path SHOULD match within
+        // small numerical drift (different FP rounding order).
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache_capacity: u32 = 64;
+        let mut cache =
+            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+                .expect("kv tq-on");
+        let slot = &mut cache.full_attn[0];
+        let n_kv_heads = cfg.num_key_value_heads;
+        let num_heads = cfg.num_attention_heads;
+        let head_dim = cfg.head_dim;
+        assert_eq!(head_dim, 256);
+
+        // Synthesize K, V tokens with both CPU mirrors + GPU buffers.
+        let (_k_cpu, k_buf) = synth_token_with_cpu_mirror(
+            &device, n_kv_heads as usize, head_dim as usize, 7,
+        );
+        let (v_cpu, v_buf) = synth_token_with_cpu_mirror(
+            &device, n_kv_heads as usize, head_dim as usize, 11,
+        );
+
+        // Synthesize Q with both CPU mirror (for closed-form ref) AND
+        // GPU buffer (for the GPU FWHT pre-rotation + SDPA).
+        let mut q_orig: Vec<Vec<f32>> = Vec::with_capacity(num_heads as usize);
+        for h in 0..num_heads as usize {
+            let mut head = Vec::with_capacity(head_dim as usize);
+            for i in 0..head_dim as usize {
+                let x = ((i + h * 17) % 1000) as f32 / 1000.0;
+                head.push((x * 3.14159).cos() * 0.4);
+            }
+            q_orig.push(head);
+        }
+        let mut q_gpu = device
+            .alloc_buffer(
+                (num_heads as usize) * (head_dim as usize) * 4,
+                DType::F32,
+                vec![num_heads as usize, head_dim as usize],
+            )
+            .expect("alloc q");
+        {
+            let s = q_gpu.as_mut_slice::<f32>().expect("q mut");
+            for h in 0..num_heads as usize {
+                for d in 0..head_dim as usize {
+                    s[h * head_dim as usize + d] = q_orig[h][d];
+                }
+            }
+        }
+
+        // Output + scratch.
+        let output = device
+            .alloc_buffer(
+                (num_heads as usize) * (head_dim as usize) * 4,
+                DType::F32,
+                vec![num_heads as usize, head_dim as usize],
+            )
+            .expect("alloc output");
+        let tmp_bytes = mlx_native::ops::flash_attn_vec_tq_hb::tmp_buffer_bytes(
+            num_heads, head_dim,
+        );
+        let tmp = device
+            .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
+            .expect("alloc tmp");
+
+        let mut registry = mlx_native::KernelRegistry::new();
+        let mut encoder = device.command_encoder().expect("encoder");
+
+        // (a) GPU encode K, V at write_pos=0.
+        slot.encode_token_to_tq(
+            &k_buf, &v_buf, n_kv_heads, head_dim, cache_capacity,
+            0, false, 1.0, 8, &mut encoder, &mut registry, &device,
+        )
+        .expect("encode_token_to_tq");
+        encoder.memory_barrier();
+
+        // (b) GPU Q pre-rotation: sign × FWHT (in-place on q_gpu).
+        mlx_native::ops::fwht_standalone::dispatch_fwht_sign_premult_f32(
+            &mut encoder, &mut registry, device.metal_device(),
+            &q_gpu, num_heads, head_dim,
+        )
+        .expect("fwht sign-premult Q");
+        encoder.memory_barrier();
+
+        // (c) GPU TQ SDPA dispatch.
+        let params = Qwen35TqSdpaParams {
+            num_heads,
+            num_kv_heads: n_kv_heads,
+            head_dim,
+            kv_seq_len: 1,
+            kv_capacity: cache_capacity,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            mask_type: 0,
+            sliding_window: 0,
+            softcap: 0.0,
+            ring_start: 0,
+            scale_factor_d512: 1.0,
+            codebook_bits: 8,
+        };
+        slot.dispatch_tq_sdpa(
+            &q_gpu, &output, &tmp, &params, &mut encoder, &mut registry, &device,
+        )
+        .expect("dispatch_tq_sdpa");
+        encoder.memory_barrier();
+
+        // (d) GPU output inverse-rotation: FWHT × sign-undo (in-place on output).
+        mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
+            &mut encoder, &mut registry, device.metal_device(),
+            &output, num_heads, head_dim,
+        )
+        .expect("fwht sign-undo output");
+
+        encoder.commit_and_wait().expect("commit chain");
+
+        // Read GPU output to CPU + compare to F32 closed-form reference.
+        let output_gpu_flat: Vec<f32> =
+            output.as_slice::<f32>().expect("output slice").to_vec();
+        let heads_per_kv = (num_heads / n_kv_heads) as usize;
+        let mut output_ref_flat: Vec<f32> =
+            Vec::with_capacity((num_heads as usize) * (head_dim as usize));
+        for h in 0..num_heads as usize {
+            let kv_head = h / heads_per_kv;
+            output_ref_flat.extend_from_slice(&v_cpu[kv_head]);
+        }
+
+        let nrmse_value = nrmse(&output_gpu_flat, &output_ref_flat);
+        eprintln!(
+            "[iter-13 GPU NRMSE litmus] qwen35 GPU TQ-vs-F32 NRMSE = {nrmse_value:.6} \
+             (threshold 0.15; iter-11 CPU oracle measured 0.008)"
+        );
+        assert!(
+            nrmse_value < 0.15,
+            "iter-13 GPU NRMSE litmus FAILED: {nrmse_value:.6} >= 0.15. \
+             GPU TQ chain produces incorrect output even though CPU oracle path \
+             passed at iter-11. Investigate kernel/host shape mismatch."
+        );
+    }
+
     #[test]
     fn hybrid_kv_cache_new_with_options_tq_off_with_mtp_keeps_mtp_tq_none() {
         // Same MTP cfg but tq_kv_active=false: MTP slot has tq=None.
