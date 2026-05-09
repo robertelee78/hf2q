@@ -1019,6 +1019,26 @@ fn sample_logits_qwen35(
     sampler_pure::sample_token(logits, &sp, generated)
 }
 
+/// ADR-020 AC#7 — variant of [`sample_logits_qwen35`] that also returns
+/// the log-probability of the chosen token under the *raw* (pre-rep-penalty,
+/// pre-temperature) distribution.  Routed when `params.logprobs == true`
+/// so the chat handler can populate `ChoiceLogprobs.content[]`.
+fn sample_logits_qwen35_with_logprob(
+    logits: &mut [f32],
+    params: &SamplingParams,
+    generated: &[u32],
+) -> (u32, f32) {
+    let sp = SamplerPureParams {
+        temperature: params.temperature as f64,
+        top_p: params.top_p as f64,
+        top_k: params.top_k,
+        min_p: 0.0,
+        repetition_penalty: params.repetition_penalty as f64,
+        max_tokens: params.max_tokens,
+    };
+    sampler_pure::sample_token_with_logprob(logits, &sp, generated)
+}
+
 /// ADR-017 Phase B-hybrid.1 — build the LcpKey for a Qwen35 request.
 ///
 /// Mirrors `engine::build_lcp_key_for_request` (the Gemma version)
@@ -1173,6 +1193,17 @@ pub fn generate_qwen35_once(
     // the decode-step `forward_gpu_greedy` vs `forward_gpu_last_logits`
     // dispatch.
     let is_greedy = is_greedy_eligible(params);
+
+    // ADR-020 AC#7 — populate per-token logprobs when the request opted
+    // in.  When set, the greedy fast-path is bypassed (need full logits
+    // to compute log_softmax) but token selection is identical (T=0
+    // with sample_token_with_logprob ⇒ argmax).
+    let want_logprobs = params.logprobs;
+    let mut logprobs_vec: Option<Vec<f32>> = if want_logprobs {
+        Some(Vec::with_capacity(max_tokens))
+    } else {
+        None
+    };
 
     let device = MlxDevice::new()
         .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 generate): {e}"))?;
@@ -1663,7 +1694,14 @@ pub fn generate_qwen35_once(
         // sampling-mode we apply the sampler to the prefill logits so
         // user temperature affects the very first generated token (same
         // contract as Gemma's `generate_once`).
-        if is_greedy {
+        if want_logprobs {
+            // ADR-020 AC#7 — bypass greedy fast-path; need full logits
+            // for log_softmax.  Token selection identical at T=0.
+            let mut logits = prefill_logits.clone();
+            let (tok, lp) = sample_logits_qwen35_with_logprob(&mut logits, params, &[]);
+            next_token = tok;
+            if let Some(v) = logprobs_vec.as_mut() { v.push(lp); }
+        } else if is_greedy {
             next_token = greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32);
         } else {
             let mut logits = prefill_logits.clone();
@@ -1805,7 +1843,17 @@ pub fn generate_qwen35_once(
             }
             let decode_positions = vec![pos; 4];
 
-            next_token = if is_greedy {
+            next_token = if want_logprobs {
+                // ADR-020 AC#7 — bypass greedy fast-path; need full logits.
+                let logits_full = qwen
+                    .model
+                    .forward_gpu_last_logits(&[next_token], &decode_positions, &mut kv_cache)
+                    .with_context(|| format!("forward_gpu_last_logits decode step {step} (logprobs)"))?;
+                let mut logits = logits_full;
+                let (tok, lp) = sample_logits_qwen35_with_logprob(&mut logits, params, &generated_tokens);
+                if let Some(v) = logprobs_vec.as_mut() { v.push(lp); }
+                tok
+            } else if is_greedy {
                 qwen.model
                     .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache)
                     .with_context(|| format!("forward_gpu_greedy decode step {step}"))?
@@ -1883,7 +1931,7 @@ pub fn generate_qwen35_once(
         prefill_duration,
         decode_duration,
         cached_tokens: if prompt_cache_hit { prompt_len } else { 0 },
-            logprobs: None,
+        logprobs: logprobs_vec,
     })
 }
 
@@ -1941,6 +1989,14 @@ pub fn generate_qwen35_once_with_soft_tokens(
     let max_tokens = params.max_tokens.max(1);
     let is_greedy = is_greedy_eligible(params);
 
+    // ADR-020 AC#7 — see generate_qwen35_once.
+    let want_logprobs = params.logprobs;
+    let mut logprobs_vec: Option<Vec<f32>> = if want_logprobs {
+        Some(Vec::with_capacity(max_tokens))
+    } else {
+        None
+    };
+
     let device = MlxDevice::new()
         .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 generate w/ soft tokens): {e}"))?;
     let mut kv_cache = alloc_kv_cache_for_request(qwen, &device, prompt_len, max_tokens)?;
@@ -1969,7 +2025,13 @@ pub fn generate_qwen35_once_with_soft_tokens(
         prefill_logits.len(),
         qwen.vocab_size
     );
-    let mut next_token: u32 = if is_greedy {
+    let mut next_token: u32 = if want_logprobs {
+        // ADR-020 AC#7 — bypass greedy fast-path; need full logits.
+        let mut logits = prefill_logits.clone();
+        let (tok, lp) = sample_logits_qwen35_with_logprob(&mut logits, params, &[]);
+        if let Some(v) = logprobs_vec.as_mut() { v.push(lp); }
+        tok
+    } else if is_greedy {
         greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32)
     } else {
         let mut logits = prefill_logits.clone();
@@ -2011,7 +2073,19 @@ pub fn generate_qwen35_once_with_soft_tokens(
             }
             let decode_positions = vec![pos; 4];
 
-            next_token = if is_greedy {
+            next_token = if want_logprobs {
+                // ADR-020 AC#7 — bypass greedy fast-path; need full logits.
+                let logits_full = qwen
+                    .model
+                    .forward_gpu_last_logits(&[next_token], &decode_positions, &mut kv_cache)
+                    .with_context(|| {
+                        format!("forward_gpu_last_logits decode step {step} (soft tokens, logprobs)")
+                    })?;
+                let mut logits = logits_full;
+                let (tok, lp) = sample_logits_qwen35_with_logprob(&mut logits, params, &generated_tokens);
+                if let Some(v) = logprobs_vec.as_mut() { v.push(lp); }
+                tok
+            } else if is_greedy {
                 qwen.model
                     .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache)
                     .with_context(|| {
@@ -2087,7 +2161,7 @@ pub fn generate_qwen35_once_with_soft_tokens(
         // No prompt-cache fast-path on the soft-tokens path; cached
         // tokens count is always 0 for vision-augmented requests.
         cached_tokens: 0,
-            logprobs: None,
+        logprobs: logprobs_vec,
     })
 }
 
@@ -2134,6 +2208,14 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
     let prompt_len = prompt_tokens.len();
     let max_tokens = params.max_tokens.max(1);
     let is_greedy = is_greedy_eligible(params);
+
+    // ADR-020 AC#7 — see generate_qwen35_once.
+    let want_logprobs = params.logprobs;
+    let mut logprobs_vec: Option<Vec<f32>> = if want_logprobs {
+        Some(Vec::with_capacity(max_tokens))
+    } else {
+        None
+    };
 
     let device = MlxDevice::new()
         .map_err(|e| {
@@ -2184,7 +2266,13 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
         prefill_logits.len(),
         qwen.vocab_size
     );
-    let mut next_token: u32 = if is_greedy {
+    let mut next_token: u32 = if want_logprobs {
+        // ADR-020 AC#7 — bypass greedy fast-path; need full logits.
+        let mut logits = prefill_logits.clone();
+        let (tok, lp) = sample_logits_qwen35_with_logprob(&mut logits, params, &[]);
+        if let Some(v) = logprobs_vec.as_mut() { v.push(lp); }
+        tok
+    } else if is_greedy {
         greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32)
     } else {
         let mut logits = prefill_logits.clone();
@@ -2253,7 +2341,19 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
             }
             let decode_positions = vec![pos; 4];
 
-            next_token = if is_greedy {
+            next_token = if want_logprobs {
+                // ADR-020 AC#7 — bypass greedy fast-path; need full logits.
+                let logits_full = qwen
+                    .model
+                    .forward_gpu_last_logits(&[next_token], &decode_positions, &mut kv_cache)
+                    .with_context(|| {
+                        format!("forward_gpu_last_logits decode step {step} (wedge-4d, logprobs)")
+                    })?;
+                let mut logits = logits_full;
+                let (tok, lp) = sample_logits_qwen35_with_logprob(&mut logits, params, &generated_tokens);
+                if let Some(v) = logprobs_vec.as_mut() { v.push(lp); }
+                tok
+            } else if is_greedy {
                 qwen.model
                     .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache)
                     .with_context(|| {
@@ -2326,7 +2426,7 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
         prefill_duration,
         decode_duration,
         cached_tokens: 0,
-            logprobs: None,
+        logprobs: logprobs_vec,
     })
 }
 

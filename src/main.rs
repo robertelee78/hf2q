@@ -532,8 +532,8 @@ fn cmd_dwq_train_full_model(args: cli::DwqTrainArgs) -> Result<(), AppError> {
         cfg.calibration_token_batches.len(),
     );
     println!(
-        "[dwq-train full-model] scope: v1 — lm_head only; \
-         cross-layer training deferred pending mlx-native flash_attn_train"
+        "[dwq-train full-model] scope: full-model real-GQA training \
+         (Phase 3c+ — flash_attn_train fwd+bwd + cross-layer KL gradient flow live)"
     );
 
     let result = train_all_linears_full_model_dwq(&cfg)
