@@ -2142,6 +2142,191 @@ pub fn train_two_linear_dwq_step(
     Ok(loss_scalar)
 }
 
+/// ADR-020 AC#7 Option A — non-Linear op inserted between
+/// consecutive Linears in the N-chain.  Extension axis for the
+/// realistic-topology training step.
+///
+/// Add new variants here as more pieces of the production model
+/// (RMSNorm, residual add, attention-output matmul) are needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterLayerOp {
+    /// No-op pass-through — produces the chain semantics of
+    /// [`train_n_linear_dwq_step`] when used uniformly.
+    Identity,
+    /// Apply `silu(x)` element-wise.  Mirror of LLM FFN's gate
+    /// activation pattern (e.g. Qwen35-MoE's
+    /// `silu(gate(x)) * up(x)` — the partial pattern here covers
+    /// just the silu path).
+    SiLU,
+}
+
+/// ADR-020 AC#7 Option A — N-Linear chain with non-Linear ops
+/// inserted between consecutive Linears.  Strict superset of
+/// [`train_n_linear_dwq_step`]: the all-`Identity` case reduces
+/// EXACTLY to the plain N-Linear chain (verified by an equivalence
+/// test).
+///
+/// Forward chain (with `inter_ops[i]` applied AFTER layer i's
+/// matmul, BEFORE layer i+1's matmul):
+/// ```text
+///   h_0 = x                                                        # [N, k_0]
+///   for i in 0..layers.len():
+///       h_i+1 = inter_ops[i](h_i @ qdq(s_i, b_i, q_int_i)^T)
+///   logits = h_N
+/// ```
+///
+/// `inter_ops` must have length `layers.len()` (one op after every
+/// layer; the LAST op is applied between the last Linear's output
+/// and the gather/KL step).
+///
+/// Pre-conditions (validated up-front, fail-loud BEFORE any GPU
+/// dispatch):
+/// - `layers` non-empty
+/// - `inter_ops.len() == layers.len()`
+/// - consecutive interior shape match (same as the N-Linear path)
+/// - `top_k`, `x_batch`, teacher arrays per the existing rules
+///
+/// Returns the scalar loss for this step.
+pub fn train_n_linear_with_inter_ops_dwq_step(
+    adam: &mut crate::calibrate::adam::AdamOptimizer,
+    device: &MlxDevice,
+    layers: &[(&str, &DwqQuantPack)],
+    inter_ops: &[InterLayerOp],
+    x_batch: &[f32],
+    teacher_topk_logits: &[f32],
+    teacher_indices: &[u32],
+    n_rows: usize,
+    top_k: usize,
+    temperature: f32,
+) -> Result<f32> {
+    use crate::calibrate::autograd_gpu_tape::{
+        backward, matmul, ones_like, qdq_affine, silu, transpose, view, GpuTape, GpuTensor,
+    };
+
+    if layers.is_empty() {
+        return Err(anyhow!(
+            "train_n_linear_with_inter_ops_dwq_step: layers must be non-empty"
+        ));
+    }
+    if inter_ops.len() != layers.len() {
+        return Err(anyhow!(
+            "train_n_linear_with_inter_ops_dwq_step: inter_ops.len ({}) != layers.len ({}) — \
+             one op AFTER every layer (use Identity for layers without a non-linear)",
+            inter_ops.len(),
+            layers.len()
+        ));
+    }
+    if !temperature.is_finite() || temperature <= 0.0 {
+        return Err(anyhow!(
+            "train_n_linear_with_inter_ops_dwq_step: temperature must be finite and > 0; got {temperature}"
+        ));
+    }
+    for i in 0..layers.len().saturating_sub(1) {
+        let (id_a, pa) = layers[i];
+        let (id_b, pb) = layers[i + 1];
+        if pa.n != pb.k {
+            return Err(anyhow!(
+                "train_n_linear_with_inter_ops_dwq_step: interior shape mismatch at boundary {i}→{} \
+                 ('{id_a}'.n = {} but '{id_b}'.k = {})",
+                i + 1,
+                pa.n,
+                pb.k
+            ));
+        }
+    }
+    let (last_id, last_pack) = *layers.last().unwrap();
+    if top_k == 0 || top_k > last_pack.n {
+        return Err(anyhow!(
+            "train_n_linear_with_inter_ops_dwq_step: top_k ({top_k}) must be in (0, vocab='{last_id}'.n={}]",
+            last_pack.n
+        ));
+    }
+    let (first_id, first_pack) = layers[0];
+    let expected_x = n_rows
+        .checked_mul(first_pack.k)
+        .ok_or_else(|| anyhow!("n_rows * first_pack.k overflows"))?;
+    if x_batch.len() != expected_x {
+        return Err(anyhow!(
+            "train_n_linear_with_inter_ops_dwq_step: x_batch.len ({}) != n_rows * '{first_id}'.k ({expected_x})",
+            x_batch.len()
+        ));
+    }
+    let expected_t = n_rows
+        .checked_mul(top_k)
+        .ok_or_else(|| anyhow!("n_rows * top_k overflows"))?;
+    if teacher_topk_logits.len() != expected_t || teacher_indices.len() != expected_t {
+        return Err(anyhow!(
+            "train_n_linear_with_inter_ops_dwq_step: teacher arrays must be length n_rows*top_k = {expected_t}"
+        ));
+    }
+
+    // Read all (s, b) values from Adam.
+    let mut sb_init: Vec<(String, String, Vec<f32>, Vec<f32>)> = Vec::with_capacity(layers.len());
+    for (i, (tid, pack)) in layers.iter().enumerate() {
+        let s_name = affine_param_name(tid, AffineParamKind::Scale);
+        let b_name = affine_param_name(tid, AffineParamKind::Bias);
+        let s_v = adam
+            .read_param(&s_name)
+            .with_context(|| format!("read s for layer[{i}] '{tid}'"))?;
+        let b_v = adam
+            .read_param(&b_name)
+            .with_context(|| format!("read b for layer[{i}] '{tid}'"))?;
+        let n_groups = (pack.n * pack.k) / pack.group_size;
+        if s_v.len() != n_groups || b_v.len() != n_groups {
+            return Err(anyhow!(
+                "layer[{i}] '{tid}' s/b len != n*k/group_size = {n_groups}"
+            ));
+        }
+        sb_init.push((s_name, b_name, s_v, b_v));
+    }
+
+    // Tape + leaves.
+    let tape = GpuTape::new(device.clone());
+    let x_t =
+        GpuTensor::from_vec(&tape, x_batch, vec![n_rows, first_pack.k]).context("x leaf")?;
+    let t_topk_t =
+        GpuTensor::from_vec(&tape, teacher_topk_logits, vec![n_rows, top_k]).context("t leaf")?;
+
+    let mut sb_leaves: Vec<(GpuTensor, GpuTensor)> = Vec::with_capacity(layers.len());
+    let mut h_cur: GpuTensor = x_t;
+    for (i, (_, pack)) in layers.iter().enumerate() {
+        let (_s_name, _b_name, s_v, b_v) = &sb_init[i];
+        let n_groups = s_v.len();
+        let s_t = GpuTensor::from_vec(&tape, s_v, vec![n_groups])?;
+        let b_t = GpuTensor::from_vec(&tape, b_v, vec![n_groups])?;
+        let w_qdq = qdq_affine(&s_t, &b_t, &pack.q_int_bytes, pack.group_size)?;
+        let w_2d = view(&w_qdq, vec![pack.n, pack.k])?;
+        let w_t_2d = transpose(&w_2d)?;
+        let pre_act = matmul(&h_cur, &w_t_2d)?;
+        // Apply the inter-layer op AFTER the matmul.
+        h_cur = match inter_ops[i] {
+            InterLayerOp::Identity => pre_act,
+            InterLayerOp::SiLU => silu(&pre_act).with_context(|| {
+                format!("train_n_linear_with_inter_ops_dwq_step: silu after layer[{i}]")
+            })?,
+        };
+        sb_leaves.push((s_t, b_t));
+    }
+
+    // Gather + KL.
+    let idx_buf = build_topk_indices_buffer(device, teacher_indices, n_rows, top_k)?;
+    let s_topk = gather_student_topk_via_tape(&h_cur, idx_buf, top_k)?;
+    let loss = kl_loss_topk_via_tape(&s_topk, &t_topk_t, temperature)?;
+    let loss_scalar = loss.to_vec()?[0];
+
+    let dy = ones_like(&tape, loss.shape())?;
+    let grads = backward(&loss, dy)?;
+
+    let mut pairs: Vec<(&str, &GpuTensor)> = Vec::with_capacity(2 * layers.len());
+    for i in 0..layers.len() {
+        pairs.push((sb_init[i].0.as_str(), &sb_leaves[i].0));
+        pairs.push((sb_init[i].1.as_str(), &sb_leaves[i].1));
+    }
+    let map = collect_grads_for_adam(&grads, &pairs)?;
+    adam.step(&map)?;
+    Ok(loss_scalar)
+}
+
 /// ADR-020 AC#7 Option A — generalize [`train_two_linear_dwq_step`]
 /// to a chain of N Linears.  Caller passes a slice of
 /// `(tensor_id, &DwqQuantPack)` pairs in forward order.
@@ -5424,6 +5609,223 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — all-Identity equivalence: with
+    /// `inter_ops = [Identity; N]`, the with-inter-ops variant
+    /// produces byte-equivalent loss + post-step Adam params as the
+    /// plain `train_n_linear_dwq_step`.  Proves the generalization
+    /// is a strict superset (no semantic drift on the existing
+    /// path).
+    #[test]
+    fn train_n_linear_with_inter_ops_all_identity_equivalent_to_plain_n_chain() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let dim = 32;
+        let group_size = 8;
+        let n_rows = 32;
+        let top_k = 4;
+        let w1: Vec<f32> = (0..dim * dim).map(|i| ((i as f32) * 0.013 - 0.4).sin() * 1.5).collect();
+        let w2: Vec<f32> = (0..dim * dim).map(|i| ((i as f32) * 0.017 + 0.2).cos() * 1.2).collect();
+        let pack1 = super::quant_pack_for_dwq(&device, &w1, dim, dim, 4, group_size).unwrap();
+        let pack2 = super::quant_pack_for_dwq(&device, &w2, dim, dim, 4, group_size).unwrap();
+
+        let x_batch: Vec<f32> = (0..n_rows * dim).map(|i| ((i as f32) * 0.07).cos() * 0.6).collect();
+        let teacher_topk: Vec<f32> = (0..n_rows * top_k).map(|i| (i as f32 * 0.31).sin() * 3.0).collect();
+        let teacher_idx: Vec<u32> = (0..n_rows)
+            .flat_map(|r| (0..top_k).map(move |kk| ((kk * 3 + r) % dim) as u32))
+            .collect();
+
+        let make_adam = || {
+            let mut a = AdamOptimizer::new(
+                device.clone(),
+                AdamConfig {
+                    lr: 1e-3,
+                    beta1: 0.9,
+                    beta2: 0.999,
+                    eps: 1e-8,
+                },
+            )
+            .unwrap();
+            super::register_affine_pair(&mut a, &device, "L1", &pack1.scales, &pack1.biases)
+                .unwrap();
+            super::register_affine_pair(&mut a, &device, "L2", &pack2.scales, &pack2.biases)
+                .unwrap();
+            a
+        };
+
+        let layers: Vec<(&str, &super::DwqQuantPack)> = vec![("L1", &pack1), ("L2", &pack2)];
+
+        let mut adam_a = make_adam();
+        let loss_a = super::train_n_linear_dwq_step(
+            &mut adam_a, &device, &layers,
+            &x_batch, &teacher_topk, &teacher_idx,
+            n_rows, top_k, 2.0,
+        )
+        .unwrap();
+        let s1_a = adam_a.read_param("L1.scales").unwrap();
+        let b1_a = adam_a.read_param("L1.biases").unwrap();
+
+        let mut adam_b = make_adam();
+        let loss_b = super::train_n_linear_with_inter_ops_dwq_step(
+            &mut adam_b, &device, &layers,
+            &[super::InterLayerOp::Identity, super::InterLayerOp::Identity],
+            &x_batch, &teacher_topk, &teacher_idx,
+            n_rows, top_k, 2.0,
+        )
+        .unwrap();
+        let s1_b = adam_b.read_param("L1.scales").unwrap();
+        let b1_b = adam_b.read_param("L1.biases").unwrap();
+
+        assert!(
+            (loss_a - loss_b).abs() < 1e-6,
+            "all-Identity must equal plain N-chain; loss A={loss_a} B={loss_b}"
+        );
+        for i in 0..s1_a.len() {
+            assert!((s1_a[i] - s1_b[i]).abs() < 1e-6);
+            assert!((b1_a[i] - b1_b[i]).abs() < 1e-6);
+        }
+    }
+
+    /// ADR-020 AC#7 Option A — with SiLU between L1 and L2: 4 params
+    /// register, both pairs change after one step, loss finite.
+    /// Proves the SiLU op participates in BOTH the forward chain
+    /// AND the backward gradient chain (otherwise L1's params would
+    /// not move because SiLU's gradient is what couples them to the
+    /// loss).
+    ///
+    /// Pin teacher targets to the student's own init forward (with
+    /// b1 perturbed) so KL starts at a finite, computable value
+    /// rather than wandering off to inf when synthetic teacher
+    /// logits collide with extreme student logits post-SiLU.
+    #[test]
+    fn train_n_linear_with_inter_ops_silu_between_layers_routes_grads() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use crate::calibrate::autograd_gpu_tape::{
+            matmul, qdq_affine, silu, transpose, view, GpuTape, GpuTensor,
+        };
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let dim = 32;
+        let group_size = 8;
+        let n_rows = 32;
+        let top_k = 4;
+        let w1: Vec<f32> = (0..dim * dim).map(|i| ((i as f32) * 0.013 - 0.4).sin() * 1.5).collect();
+        let w2: Vec<f32> = (0..dim * dim).map(|i| ((i as f32) * 0.017 + 0.2).cos() * 1.2).collect();
+        let pack1 = super::quant_pack_for_dwq(&device, &w1, dim, dim, 4, group_size).unwrap();
+        let pack2 = super::quant_pack_for_dwq(&device, &w2, dim, dim, 4, group_size).unwrap();
+
+        let x_batch: Vec<f32> = (0..n_rows * dim).map(|i| ((i as f32) * 0.05 - 0.1).cos() * 0.5).collect();
+
+        // Compute teacher_logits at the optimum forward: x → L1 →
+        // SiLU → L2.  Using the student's own forward at the
+        // projection optimum keeps logit magnitudes bounded and KL
+        // finite at init.
+        let teacher_full: Vec<f32> = {
+            let tape = GpuTape::new(device.clone());
+            let s1 = GpuTensor::from_vec(&tape, &pack1.scales, vec![pack1.scales.len()]).unwrap();
+            let b1 = GpuTensor::from_vec(&tape, &pack1.biases, vec![pack1.biases.len()]).unwrap();
+            let s2 = GpuTensor::from_vec(&tape, &pack2.scales, vec![pack2.scales.len()]).unwrap();
+            let b2 = GpuTensor::from_vec(&tape, &pack2.biases, vec![pack2.biases.len()]).unwrap();
+            let x_t = GpuTensor::from_vec(&tape, &x_batch, vec![n_rows, dim]).unwrap();
+            let w1_qdq = qdq_affine(&s1, &b1, &pack1.q_int_bytes, group_size).unwrap();
+            let w1_2d = view(&w1_qdq, vec![dim, dim]).unwrap();
+            let w1_t = transpose(&w1_2d).unwrap();
+            let layer1 = matmul(&x_t, &w1_t).unwrap();
+            let layer1_act = silu(&layer1).unwrap();
+            let w2_qdq = qdq_affine(&s2, &b2, &pack2.q_int_bytes, group_size).unwrap();
+            let w2_2d = view(&w2_qdq, vec![dim, dim]).unwrap();
+            let w2_t = transpose(&w2_2d).unwrap();
+            let logits = matmul(&layer1_act, &w2_t).unwrap();
+            logits.to_vec().unwrap()
+        };
+        let (teacher_topk, teacher_idx) =
+            super::pick_top_k_per_position(&teacher_full, n_rows, 1, dim, top_k).unwrap();
+
+        // Perturb b1 so there's something to descend.
+        let b1_perturbed: Vec<f32> = pack1.biases.iter().map(|x| x + 0.5).collect();
+
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-3,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .unwrap();
+        super::register_affine_pair(&mut adam, &device, "L1", &pack1.scales, &b1_perturbed)
+            .unwrap();
+        super::register_affine_pair(&mut adam, &device, "L2", &pack2.scales, &pack2.biases)
+            .unwrap();
+        let s1_before = adam.read_param("L1.scales").unwrap();
+        let b1_before = adam.read_param("L1.biases").unwrap();
+        let s2_before = adam.read_param("L2.scales").unwrap();
+        let b2_before = adam.read_param("L2.biases").unwrap();
+
+        let layers: Vec<(&str, &super::DwqQuantPack)> = vec![("L1", &pack1), ("L2", &pack2)];
+        let loss = super::train_n_linear_with_inter_ops_dwq_step(
+            &mut adam, &device, &layers,
+            &[super::InterLayerOp::SiLU, super::InterLayerOp::Identity],
+            &x_batch, &teacher_topk, &teacher_idx,
+            n_rows, top_k, 2.0,
+        )
+        .expect("step");
+        assert!(loss.is_finite(), "loss must be finite; got {loss}");
+        assert_eq!(adam.step_count(), 1);
+
+        let s1_after = adam.read_param("L1.scales").unwrap();
+        let b1_after = adam.read_param("L1.biases").unwrap();
+        let s2_after = adam.read_param("L2.scales").unwrap();
+        let b2_after = adam.read_param("L2.biases").unwrap();
+        let dist = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).sum()
+        };
+        assert!(dist(&s1_before, &s1_after) + dist(&b1_before, &b1_after) > 0.0);
+        assert!(dist(&s2_before, &s2_after) + dist(&b2_before, &b2_after) > 0.0);
+    }
+
+    /// ADR-020 AC#7 Option A — wrong inter_ops length fails loud.
+    #[test]
+    fn train_n_linear_with_inter_ops_rejects_inter_ops_length_mismatch() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let pack = super::quant_pack_for_dwq(&device, &vec![0.0; 32 * 32], 32, 32, 4, 8).unwrap();
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 1e-3,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .unwrap();
+        super::register_affine_pair(&mut adam, &device, "L1", &pack.scales, &pack.biases).unwrap();
+        super::register_affine_pair(&mut adam, &device, "L2", &pack.scales, &pack.biases).unwrap();
+
+        let layers: Vec<(&str, &super::DwqQuantPack)> = vec![("L1", &pack), ("L2", &pack)];
+        let res = super::train_n_linear_with_inter_ops_dwq_step(
+            &mut adam, &device, &layers,
+            &[super::InterLayerOp::Identity],
+            &vec![0.0; 32 * 32], &vec![0.0; 32 * 4], &vec![0u32; 32 * 4],
+            32, 4, 1.0,
+        );
+        let err = match res {
+            Ok(_) => panic!("expected length-mismatch error"),
+            Err(e) => e,
+        };
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("inter_ops.len (1)") && msg.contains("layers.len (2)"),
+            "got: {msg}"
+        );
     }
 
     /// ADR-020 AC#7 Option A — `train_n_linear_dwq_step` with N=3:
