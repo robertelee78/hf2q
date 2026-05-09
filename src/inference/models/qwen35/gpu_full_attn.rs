@@ -72,6 +72,201 @@ use super::encoder_stage::LayerEncoder;
 use super::full_attn::FullAttnLayerWeights;
 use super::kv_cache::FullAttnKvSlot;
 
+// ──────────────────────────────────────────────────────────────────────
+// ADR-027 Phase B iter-15 — TQ-active KV write + decode SDPA helpers.
+// ──────────────────────────────────────────────────────────────────────
+
+/// ADR-027 Phase B iter-15 — write K/V to `slot.k`/`slot.v` (F32) AND
+/// optionally encode into `slot.tq` when present. Wraps the existing
+/// `dispatch_kv_cache_copy_seq_f32_dual` + the new
+/// `slot.encode_seq_tokens_to_tq` (iter-14) so the 4 KV write sites in
+/// this file change from one function call to another.
+///
+/// **Codebook bits** are read from `INVESTIGATION_ENV.tq_codebook_bits`
+/// once at process start (matches Gemma's wiring at
+/// `forward_mlx.rs:2313`). Default 8-bit; 5/6/8 supported.
+///
+/// When `slot.tq.is_none()` (legacy F32-only path, default): byte-
+/// identical to the pre-iter-15 single `dispatch_kv_cache_copy_seq_f32_dual`
+/// call. When `slot.tq.is_some()`: F32 write happens FIRST (preserves
+/// shadow cache for snapshot/persist/LCP), then TQ encode for K + V via
+/// the bulk `_seq` dispatch with one memory_barrier between (RAW: encode
+/// reads the source buffers F32 write didn't write to, but ordering
+/// discipline is the same as the existing slot.k/slot.v read by SDPA).
+fn write_kv_with_optional_tq_encode(
+    enc: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    k_seq_major: &MlxBuffer,
+    v_seq_major: &MlxBuffer,
+    slot: &mut FullAttnKvSlot,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_seq_len: u32,
+    cur_len: u32,
+    n_tokens: u32,
+) -> Result<()> {
+    // (1) Existing F32 KV cache write — byte-identical to pre-iter-15.
+    dispatch_kv_cache_copy_seq_f32_dual(
+        enc, registry, device.metal_device(),
+        k_seq_major, v_seq_major,
+        &slot.k, &slot.v,
+        n_kv_heads, head_dim, max_seq_len,
+        cur_len, n_tokens, 0,
+    )
+    .context("kv_cache_copy_seq_f32_dual (write_kv_with_optional_tq_encode)")?;
+
+    // (2) TQ encode shadow path. Skip cleanly when:
+    //     - slot.tq is None (legacy F32-only mode)
+    //     - n_tokens == 0 (no work)
+    //     - head_dim not in {256, 512} (kernel preflight rejects;
+    //       silently skipping here matches the legacy SDPA fallback at
+    //       lines 1968-1981 where dispatch_sdpa_decode handles non-
+    //       256/512 head_dims via F32). Note: production qwen35 head_dim
+    //       is always 256 — non-256 here means a small-fixture test.
+    if slot.tq.is_some() && n_tokens > 0 && (head_dim == 256 || head_dim == 512) {
+        // RAW barrier between F32 write and TQ encode source reads.
+        // Both read k_seq_major/v_seq_major (independent of slot.k/v
+        // writes from step 1, but Metal's MTLDispatchTypeConcurrent can
+        // reorder within a CB without an explicit barrier).
+        enc.memory_barrier();
+
+        // Codebook bits sourced from env (matches Gemma at
+        // forward_mlx.rs:2313). Read via INVESTIGATION_ENV LazyLock.
+        let codebook_bits = crate::debug::INVESTIGATION_ENV.tq_codebook_bits;
+        // Validate to one of {5, 6, 8}; fall back to 8 with a one-time
+        // warn if env contains unexpected value (matches
+        // forward_mlx.rs:2429 fallback semantics).
+        let cb_bits = if matches!(codebook_bits, 5 | 6 | 8) {
+            codebook_bits
+        } else {
+            8
+        };
+
+        slot.encode_seq_tokens_to_tq(
+            k_seq_major, true, n_tokens, n_kv_heads, head_dim, max_seq_len,
+            cur_len, 0, false, 1.0, cb_bits, enc, registry, device,
+        )
+        .context("TQ encode K (write_kv_with_optional_tq_encode)")?;
+        slot.encode_seq_tokens_to_tq(
+            v_seq_major, false, n_tokens, n_kv_heads, head_dim, max_seq_len,
+            cur_len, 0, false, 1.0, cb_bits, enc, registry, device,
+        )
+        .context("TQ encode V (write_kv_with_optional_tq_encode)")?;
+    }
+    Ok(())
+}
+
+/// ADR-027 Phase B iter-15 — decode SDPA dispatch with optional TQ
+/// branch. When `slot.tq.is_some()` AND `head_dim ∈ {256, 512}`,
+/// dispatches the TQ chain (FWHT × sign-premult on Q in-place →
+/// `dispatch_tq_sdpa` → FWHT × sign-undo on output in-place). Otherwise
+/// dispatches `flash_attn_vec` (legacy F32 path).
+///
+/// **Iter-13 GPU litmus PASS at NRMSE 0.008 validates this chain
+/// matches F32 output to 18.5× headroom under the 0.15 ADR-007 §F-0.3
+/// threshold.** Production wiring path is the same kernels exercised
+/// in `dispatch_tq_sdpa_gpu_end_to_end_nrmse_vs_f32_baseline_under_threshold`.
+///
+/// **Q is mutated in-place** (FWHT pre-rotation overwrites the buffer).
+/// This matches Gemma's production pattern at `forward_mlx.rs:3394+3450`.
+/// Output is also mutated in-place (FWHT-undo overwrites the SDPA
+/// output buffer). Caller must not reuse Q after this returns.
+fn dispatch_decode_sdpa_with_optional_tq(
+    enc: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q_seq_major: &MlxBuffer,
+    slot: &FullAttnKvSlot,
+    out_buf: &MlxBuffer,
+    fa_tmp: &MlxBuffer,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    kv_seq_len: u32,
+    max_seq_len: u32,
+) -> Result<()> {
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    if slot.tq.is_some() && (head_dim == 256 || head_dim == 512) {
+        // ── TQ decode chain ──
+        //
+        // Iter-13 GPU litmus parity-validated. Structure:
+        //   (a) FWHT × sign-premult on Q in-place
+        //   (b) memory_barrier (RAW: SDPA reads Q + slot.tq)
+        //   (c) dispatch_tq_sdpa via flash_attn_vec_tq_hb
+        //   (d) memory_barrier (RAW: FWHT-undo reads SDPA output)
+        //   (e) FWHT × sign-undo on output in-place
+        let codebook_bits = crate::debug::INVESTIGATION_ENV.tq_codebook_bits;
+        let cb_bits = if matches!(codebook_bits, 5 | 6 | 8) {
+            codebook_bits
+        } else {
+            8
+        };
+
+        // (a) Q pre-rotation in-place.
+        mlx_native::ops::fwht_standalone::dispatch_fwht_sign_premult_f32(
+            enc, registry, device.metal_device(),
+            q_seq_major, n_heads, head_dim,
+        )
+        .context("dispatch_fwht_sign_premult_f32 (TQ decode pre-rotation)")?;
+
+        // (b) RAW barrier before SDPA reads Q.
+        enc.memory_barrier();
+
+        // (c) TQ SDPA dispatch.
+        let tq_params = super::kv_cache::Qwen35TqSdpaParams {
+            num_heads: n_heads,
+            num_kv_heads: n_kv_heads,
+            head_dim,
+            kv_seq_len,
+            kv_capacity: max_seq_len,
+            scale,
+            mask_type: 0, // single-token decode; causal mask implicit
+            sliding_window: 0,
+            softcap: 0.0,
+            ring_start: 0,
+            scale_factor_d512: 1.0,
+            codebook_bits: cb_bits,
+        };
+        slot.dispatch_tq_sdpa(
+            q_seq_major, out_buf, fa_tmp,
+            &tq_params, enc, registry, device,
+        )
+        .context("dispatch_tq_sdpa (TQ decode SDPA)")?;
+
+        // (d) RAW barrier before FWHT-undo reads output.
+        enc.memory_barrier();
+
+        // (e) Output inverse-rotation in-place.
+        mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
+            enc, registry, device.metal_device(),
+            out_buf, n_heads, head_dim,
+        )
+        .context("dispatch_fwht_sign_undo_f32 (TQ decode post-rotation)")?;
+    } else {
+        // ── Legacy F32 decode path ──
+        let fa_params = FlashAttnVecParams {
+            num_heads: n_heads,
+            num_kv_heads: n_kv_heads,
+            head_dim,
+            kv_seq_len,
+            kv_capacity: max_seq_len,
+            scale,
+            mask_type: 0,
+            sliding_window: 0,
+            softcap: 0.0,
+        };
+        flash_attn_vec(
+            enc, registry, device,
+            q_seq_major, &slot.k, &slot.v, out_buf, fa_tmp,
+            &fa_params,
+        )
+        .context("flash_attn_vec (legacy F32 decode)")?;
+    }
+    Ok(())
+}
+
 /// GPU-side weight handles for a single Qwen3.5 full-attention layer.
 ///
 /// Uploaded from [`FullAttnLayerWeights`] once per layer at load time;
@@ -1910,13 +2105,16 @@ pub fn apply_sdpa_with_kv_cache(
         //   which kv_cache_copy_seq_f32_dual treats as [n_tokens=1, n_heads, head_dim].
         let mut enc = device.command_encoder().context("enc kv-cache+sdpa decode")?;
         if kv_write_tokens > 0 {
-            dispatch_kv_cache_copy_seq_f32_dual(
-                &mut enc, registry, device.metal_device(),
+            // ADR-027 Phase B iter-15: F32 write + optional TQ encode.
+            // Helper handles slot.tq.is_some() branching internally;
+            // legacy F32-only path is byte-identical to pre-iter-15.
+            write_kv_with_optional_tq_encode(
+                &mut enc, registry, device,
                 k_seq_major, v_seq_major,
-                &slot.k, &slot.v,
+                slot,
                 n_kv_heads, head_dim, max_seq_len,
-                cur_len as u32, kv_write_tokens as u32, 0,
-            ).context("kv_cache_copy kv-cache decode")?;
+                cur_len as u32, kv_write_tokens as u32,
+            ).context("kv_cache_copy kv-cache decode (iter-15 helper)")?;
             // Barrier: sdpa_decode reads slot.k/slot.v written above.
             enc.memory_barrier();
         }
@@ -1942,6 +2140,10 @@ pub fn apply_sdpa_with_kv_cache(
         // head_dims (e.g. MTP test fixtures with head_dim=32) fall back
         // to sdpa_decode which handles arbitrary head_dim % 32 == 0.
         if head_dim == 256 || head_dim == 512 {
+            // ADR-027 Phase B iter-15: tmp buffer sized via the F32
+            // helper — same shape (nrows * 32 * (dv + 2) * 4) as the
+            // TQ helper at flash_attn_vec_tq_hb::tmp_buffer_bytes;
+            // verified at iter-15 via grep + comparison.
             let fa_tmp = super::decode_pool::pooled_alloc_buffer(
                 device,
                 flash_attn_vec_tmp_bytes(n_heads, head_dim),
@@ -1949,22 +2151,17 @@ pub fn apply_sdpa_with_kv_cache(
                 vec![flash_attn_vec_tmp_bytes(n_heads, head_dim) / 4],
             )
             .map_err(|e| anyhow!("alloc flash_attn_vec tmp: {e}"))?;
-            let fa_params = FlashAttnVecParams {
-                num_heads: n_heads,
-                num_kv_heads: n_kv_heads,
-                head_dim,
-                kv_seq_len,
-                kv_capacity: max_seq_len,
-                scale: 1.0 / (d as f32).sqrt(),
-                mask_type: 0, // single-token decode; causal mask is implicit
-                sliding_window: 0,
-                softcap: 0.0,
-            };
-            flash_attn_vec(
+            // Helper branches on slot.tq.is_some(): TQ chain (FWHT(Q) +
+            // dispatch_tq_sdpa + FWHT-undo) when set, legacy
+            // flash_attn_vec when None. Iter-13 GPU litmus PASS at NRMSE
+            // 0.008 validates the TQ chain matches F32 to 18.5×
+            // headroom.
+            dispatch_decode_sdpa_with_optional_tq(
                 &mut enc, registry, device,
-                q_seq_major, &slot.k, &slot.v, &out_buf, &fa_tmp,
-                &fa_params,
-            ).context("flash_attn_vec kv-cache (FA-layer decode)")?;
+                q_seq_major, slot, &out_buf, &fa_tmp,
+                n_heads, n_kv_heads, head_dim,
+                kv_seq_len, max_seq_len,
+            ).context("flash_attn_vec kv-cache (FA-layer decode iter-15)")?;
         } else {
             dispatch_sdpa_decode(
                 &mut enc, registry, device,
@@ -2014,13 +2211,15 @@ pub fn apply_sdpa_with_kv_cache(
             );
             let mut enc = device.command_encoder()
                 .context("enc kv_cache_copy_seq_dual prefill")?;
-            mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual(
-                &mut enc, registry, device.metal_device(),
+            // ADR-027 Phase B iter-15: F32 write + optional TQ encode
+            // for prefill (multi-token via _seq dispatch).
+            write_kv_with_optional_tq_encode(
+                &mut enc, registry, device,
                 k_seq_major, v_seq_major,
-                &slot.k, &slot.v,
+                slot,
                 n_kv_heads, head_dim, max_seq_len,
-                cur_len as u32, kv_write_tokens as u32, 0,
-            ).context("kv_cache_copy_seq_f32_dual prefill")?;
+                cur_len as u32, kv_write_tokens as u32,
+            ).context("kv_cache_copy_seq_f32_dual prefill (iter-15 helper)")?;
             // commit_labeled (no host wait) — out_buf for the FA dispatch below
             // is a separate buffer; the new_path_eligible branch reads
             // k_seq_major/v_seq_major directly (not slot.k/slot.v) so this
@@ -2575,13 +2774,17 @@ pub fn build_gated_attn_layer(
                 let _w5b9_kv = super::wave5b8_profile::Section::start(
                     super::wave5b8_profile::SectionKind::FaSdpaKvDownloadCopy,
                 );
-                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual(
-                    enc.encoder(), registry, device.metal_device(),
+                // ADR-027 Phase B iter-15: F32 write + optional TQ
+                // encode (fused stage_ab prefill path).
+                write_kv_with_optional_tq_encode(
+                    enc.encoder(), registry, device,
                     &arena.k_rope_buf, &arena.v_proj_buf,
-                    &slot.k, &slot.v,
+                    slot,
                     n_kv_heads, head_dim, max_seq_len,
-                    cur_len_u32, kv_write_tokens as u32, 0,
-                ).context("kv_cache_copy_seq_f32_dual prefill (fused stage_ab)")?;
+                    cur_len_u32, kv_write_tokens as u32,
+                ).context(
+                    "kv_cache_copy_seq_f32_dual prefill (fused stage_ab iter-15)",
+                )?;
             }
 
             // RAW barrier: fa.prefill_bridge reads arena.q_rope_buf /
@@ -3127,19 +3330,23 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
         .map_err(|e| anyhow!("alloc sdpa kv-cache output (decode_into): {e}"))?;
 
     if kv_write_tokens > 0 {
-        dispatch_kv_cache_copy_seq_f32_dual(
-            enc, registry, device.metal_device(),
+        // ADR-027 Phase B iter-15: F32 write + optional TQ encode
+        // (decode_into path; sister site at gpu_full_attn.rs:1646).
+        write_kv_with_optional_tq_encode(
+            enc, registry, device,
             k_seq_major, v_seq_major,
-            &slot.k, &slot.v,
+            slot,
             n_kv_heads, head_dim, max_seq_len,
-            cur_len as u32, kv_write_tokens as u32, 0,
-        ).context("kv_cache_copy kv-cache decode_into")?;
+            cur_len as u32, kv_write_tokens as u32,
+        ).context("kv_cache_copy kv-cache decode_into (iter-15 helper)")?;
         // Barrier: sdpa_decode reads slot.k/slot.v written above.  Same
         // RAW barrier position as the legacy gpu_full_attn.rs:1231.
         enc.memory_barrier();
     }
     // 2026-05-03 — see sister site at gpu_full_attn.rs:1646 for rationale.
     if head_dim == 256 || head_dim == 512 {
+        // ADR-027 Phase B iter-15: tmp buffer sized via F32 helper
+        // (same shape as TQ helper; verified at iter-15).
         let fa_tmp = super::decode_pool::pooled_alloc_buffer(
             device,
             flash_attn_vec_tmp_bytes(n_heads, head_dim),
@@ -3147,22 +3354,14 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
             vec![flash_attn_vec_tmp_bytes(n_heads, head_dim) / 4],
         )
         .map_err(|e| anyhow!("alloc flash_attn_vec tmp (decode_into): {e}"))?;
-        let fa_params = FlashAttnVecParams {
-            num_heads: n_heads,
-            num_kv_heads: n_kv_heads,
-            head_dim,
-            kv_seq_len,
-            kv_capacity: max_seq_len,
-            scale: 1.0 / (d as f32).sqrt(),
-            mask_type: 0,
-            sliding_window: 0,
-            softcap: 0.0,
-        };
-        flash_attn_vec(
+        // Helper branches on slot.tq.is_some(): TQ chain when set,
+        // legacy flash_attn_vec when None. Iter-13 GPU litmus PASS.
+        dispatch_decode_sdpa_with_optional_tq(
             enc, registry, device,
-            q_seq_major, &slot.k, &slot.v, &out_buf, &fa_tmp,
-            &fa_params,
-        ).context("flash_attn_vec kv-cache decode_into (FA-layer decode)")?;
+            q_seq_major, slot, &out_buf, &fa_tmp,
+            n_heads, n_kv_heads, head_dim,
+            kv_seq_len, max_seq_len,
+        ).context("flash_attn_vec kv-cache decode_into (FA-layer decode iter-15)")?;
     } else {
         dispatch_sdpa_decode(
             enc, registry, device,
