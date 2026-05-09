@@ -1702,6 +1702,61 @@ pub fn quant_pack_for_dwq(
     })
 }
 
+/// ADR-020 AC#7 Option A — adapter from
+/// [`crate::calibrate::autograd_gpu_tape::backward`]'s node-indexed
+/// gradient vector to the name-keyed map that
+/// [`crate::calibrate::adam::AdamOptimizer::step`] expects.
+///
+/// For each `(adam_param_name, leaf_tensor)` pair in `pairs`, looks
+/// up `grads[leaf.node_idx()]`.  Missing-gradient entries hard-fail
+/// (means the autograd graph didn't reach the leaf — usually a sign
+/// the forward pass forgot to wire it in, which would silently
+/// freeze the parameter).  Duplicate `adam_param_name`s in the
+/// input slice also hard-fail (can't put two grads under one Adam
+/// key without losing one).
+///
+/// Output is a `BTreeMap<String, MlxBuffer>` ready to pass to
+/// `Adam.step(&grads_map)`.
+///
+/// # Errors
+/// - any leaf's `node_idx >= grads.len()` (indicates a tape mismatch)
+/// - any leaf has no gradient in `grads`
+/// - `adam_param_name` collision in the input slice
+pub fn collect_grads_for_adam(
+    grads: &[Option<MlxBuffer>],
+    pairs: &[(&str, &crate::calibrate::autograd_gpu_tape::GpuTensor)],
+) -> Result<std::collections::BTreeMap<String, MlxBuffer>> {
+    let mut out: std::collections::BTreeMap<String, MlxBuffer> =
+        std::collections::BTreeMap::new();
+    for (i, (name, leaf)) in pairs.iter().enumerate() {
+        let node_idx = leaf.node_idx();
+        if node_idx >= grads.len() {
+            return Err(anyhow!(
+                "collect_grads_for_adam: pair[{i}] '{name}' has node_idx {} >= grads.len() {} \
+                 (tape mismatch?)",
+                node_idx,
+                grads.len()
+            ));
+        }
+        let g = grads[node_idx]
+            .clone()
+            .ok_or_else(|| {
+                anyhow!(
+                    "collect_grads_for_adam: pair[{i}] '{name}' (node {}) has no gradient — \
+                     autograd graph did not reach this leaf",
+                    node_idx
+                )
+            })?;
+        if out.contains_key(*name) {
+            return Err(anyhow!(
+                "collect_grads_for_adam: duplicate adam_param_name '{name}' at pair[{i}]"
+            ));
+        }
+        out.insert((*name).to_string(), g);
+    }
+    Ok(out)
+}
+
 /// ADR-020 iter-12d-2 — per-Linear training summary inside a model
 /// scan (one entry per successfully-trained tensor).
 #[derive(Debug, Clone)]
@@ -4559,6 +4614,233 @@ mod tests {
         assert_eq!(teacher.forward_calls, 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-020 AC#7 Option A — `collect_grads_for_adam` happy path:
+    /// 2 leaves → 2-entry BTreeMap with the right keys.  Bytes
+    /// round-trip from the input grads vec into the output map.
+    #[test]
+    fn collect_grads_for_adam_happy_path() {
+        use crate::calibrate::autograd_gpu_tape::{GpuTape, GpuTensor};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let s = GpuTensor::from_vec(&tape, &vec![1.0_f32; 4], vec![4]).expect("s");
+        let b = GpuTensor::from_vec(&tape, &vec![0.5_f32; 4], vec![4]).expect("b");
+
+        // Build a fake grads vec that mimics what backward() would
+        // return — None for every node EXCEPT s and b (we don't
+        // actually need to run a real backward to test the adapter).
+        let n_nodes = s.node_idx().max(b.node_idx()) + 1;
+        let mut grads: Vec<Option<MlxBuffer>> = (0..n_nodes).map(|_| None).collect();
+        let g_s = super::buffer_from_f32(tape.device(), &[0.1, 0.2, 0.3, 0.4]).unwrap();
+        let g_b = super::buffer_from_f32(tape.device(), &[1.1, 1.2, 1.3, 1.4]).unwrap();
+        grads[s.node_idx()] = Some(g_s);
+        grads[b.node_idx()] = Some(g_b);
+
+        let map = super::collect_grads_for_adam(
+            &grads,
+            &[("foo.scales", &s), ("foo.biases", &b)],
+        )
+        .expect("collect");
+        assert_eq!(map.len(), 2);
+        let s_back: &[f32] = map.get("foo.scales").unwrap().as_slice().unwrap();
+        let b_back: &[f32] = map.get("foo.biases").unwrap().as_slice().unwrap();
+        assert_eq!(s_back, &[0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(b_back, &[1.1, 1.2, 1.3, 1.4]);
+    }
+
+    /// ADR-020 AC#7 Option A — leaf with no gradient (autograd graph
+    /// did not reach it) FAILS LOUD with the leaf's name + node idx.
+    /// This catches the silent-freeze bug where a forgotten op in
+    /// the forward pass would leave a registered parameter inert.
+    #[test]
+    fn collect_grads_for_adam_fails_loud_when_leaf_has_no_grad() {
+        use crate::calibrate::autograd_gpu_tape::{GpuTape, GpuTensor};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let s = GpuTensor::from_vec(&tape, &vec![1.0_f32; 4], vec![4]).expect("s");
+
+        let n_nodes = s.node_idx() + 1;
+        let grads: Vec<Option<MlxBuffer>> = (0..n_nodes).map(|_| None).collect();
+
+        let res = super::collect_grads_for_adam(&grads, &[("orphan.scales", &s)]);
+        let err = match res {
+            Ok(_) => panic!("expected fail-loud"),
+            Err(e) => e,
+        };
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("orphan.scales") && msg.contains("no gradient"),
+            "got: {msg}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — node_idx out of range → tape-mismatch
+    /// error.
+    #[test]
+    fn collect_grads_for_adam_fails_loud_on_node_idx_out_of_range() {
+        use crate::calibrate::autograd_gpu_tape::{GpuTape, GpuTensor};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let s = GpuTensor::from_vec(&tape, &vec![1.0_f32; 4], vec![4]).expect("s");
+
+        // Empty grads vec ⇒ s.node_idx() (which is >= 0) is out of range.
+        let grads: Vec<Option<MlxBuffer>> = Vec::new();
+        let res = super::collect_grads_for_adam(&grads, &[("a.scales", &s)]);
+        let err = match res {
+            Ok(_) => panic!("expected fail-loud"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{:#}", err).contains("tape mismatch"),
+            "got: {err:#}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — duplicate adam_param_name in pairs
+    /// FAILS LOUD (lossy collision would silently drop one grad).
+    #[test]
+    fn collect_grads_for_adam_rejects_duplicate_names() {
+        use crate::calibrate::autograd_gpu_tape::{GpuTape, GpuTensor};
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+        let tape = GpuTape::new(device);
+        let s = GpuTensor::from_vec(&tape, &vec![1.0_f32; 4], vec![4]).expect("s");
+        let b = GpuTensor::from_vec(&tape, &vec![1.0_f32; 4], vec![4]).expect("b");
+        let n_nodes = s.node_idx().max(b.node_idx()) + 1;
+        let mut grads: Vec<Option<MlxBuffer>> = (0..n_nodes).map(|_| None).collect();
+        grads[s.node_idx()] = Some(super::buffer_from_f32(tape.device(), &[0.1; 4]).unwrap());
+        grads[b.node_idx()] = Some(super::buffer_from_f32(tape.device(), &[0.2; 4]).unwrap());
+
+        let res = super::collect_grads_for_adam(
+            &grads,
+            &[("dup", &s), ("dup", &b)],
+        );
+        let err = match res {
+            Ok(_) => panic!("expected duplicate-name reject"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{:#}", err).contains("duplicate adam_param_name 'dup'"),
+            "got: {err:#}"
+        );
+    }
+
+    /// ADR-020 AC#7 Option A — empty `pairs` ⇒ empty map (no error).
+    #[test]
+    fn collect_grads_for_adam_empty_pairs_returns_empty_map() {
+        let grads: Vec<Option<MlxBuffer>> = Vec::new();
+        let map = super::collect_grads_for_adam(&grads, &[]).expect("collect");
+        assert!(map.is_empty());
+    }
+
+    /// ADR-020 AC#7 Option A — END-TO-END round trip:
+    ///   build leaves → forward (loss = sum(s) + sum(b)) → backward
+    ///   → collect_grads_for_adam → Adam.step.  After one step, the
+    ///   stored param values must move by `−lr * sign(grad) ≈ −lr`
+    ///   (Adam at step=1 scales each grad component to magnitude
+    ///   `lr * grad / (|grad| + eps) ≈ lr`).  Confirms the entire
+    ///   forward→backward→adam loop wires together correctly through
+    ///   our register_affine_pair + collect_grads_for_adam helpers.
+    #[test]
+    fn collect_grads_for_adam_end_to_end_through_adam_step() {
+        use crate::calibrate::adam::{AdamConfig, AdamOptimizer};
+        use crate::calibrate::autograd_gpu_tape::{
+            add, backward, ones_like, row_sum, view, GpuTape, GpuTensor,
+        };
+        use mlx_native::MlxDevice;
+
+        let device = MlxDevice::new().expect("device");
+
+        // Register two pairs with Adam.
+        let mut adam = AdamOptimizer::new(
+            device.clone(),
+            AdamConfig {
+                lr: 0.01,
+                beta1: 0.9,
+                beta2: 0.999,
+                eps: 1e-8,
+            },
+        )
+        .expect("Adam");
+        let s_init = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let b_init = vec![0.5_f32, 1.5, 2.5, 3.5];
+        let (s_name, b_name) =
+            super::register_affine_pair(&mut adam, &device, "tensor.A", &s_init, &b_init)
+                .expect("register");
+
+        // Build leaves on a fresh tape from Adam's storage.
+        let s_v = adam.read_param(&s_name).unwrap();
+        let b_v = adam.read_param(&b_name).unwrap();
+        let tape = GpuTape::new(device.clone());
+        let s_t = GpuTensor::from_vec(&tape, &s_v, vec![4]).expect("s_t");
+        let b_t = GpuTensor::from_vec(&tape, &b_v, vec![4]).expect("b_t");
+
+        // loss = sum(s) + sum(b); both leaves get a unit grad.
+        let s_2d = view(&s_t, vec![1, 4]).expect("s 2D");
+        let b_2d = view(&b_t, vec![1, 4]).expect("b 2D");
+        let s_sum = row_sum(&s_2d).expect("s sum");
+        let b_sum = row_sum(&b_2d).expect("b sum");
+        let loss = add(&s_sum, &b_sum).expect("loss");
+        let dy = ones_like(&tape, loss.shape()).expect("dy");
+        let grads = backward(&loss, dy).expect("backward");
+
+        // The grad on s_t and b_t should be all-ones (∂Σx/∂x = 1).
+        let g_s_check: &[f32] = grads[s_t.node_idx()]
+            .as_ref()
+            .unwrap()
+            .as_slice()
+            .unwrap();
+        let g_b_check: &[f32] = grads[b_t.node_idx()]
+            .as_ref()
+            .unwrap()
+            .as_slice()
+            .unwrap();
+        for &v in g_s_check {
+            assert!((v - 1.0).abs() < 1e-5, "s grad should be 1: {v}");
+        }
+        for &v in g_b_check {
+            assert!((v - 1.0).abs() < 1e-5, "b grad should be 1: {v}");
+        }
+
+        // Collect → Adam.step.
+        let map = super::collect_grads_for_adam(
+            &grads,
+            &[(s_name.as_str(), &s_t), (b_name.as_str(), &b_t)],
+        )
+        .expect("collect");
+        adam.step(&map).expect("step");
+
+        // After step 1 with positive grad ≈ 1, Adam's effective step
+        // is ≈ −lr (`m̂ / sqrt(v̂ + eps) ≈ 1`).  Each value should
+        // decrease by ≈ lr = 0.01.
+        let s_new = adam.read_param(&s_name).unwrap();
+        let b_new = adam.read_param(&b_name).unwrap();
+        for (i, (a, b)) in s_init.iter().zip(s_new.iter()).enumerate() {
+            assert!(
+                ((a - b) - 0.01).abs() < 1e-4,
+                "s[{i}] step expected ≈ 0.01; got {} → {} (delta {})",
+                a,
+                b,
+                a - b
+            );
+        }
+        for (i, (a, b)) in b_init.iter().zip(b_new.iter()).enumerate() {
+            assert!(
+                ((a - b) - 0.01).abs() < 1e-4,
+                "b[{i}] step expected ≈ 0.01; got {} → {} (delta {})",
+                a,
+                b,
+                a - b
+            );
+        }
     }
 
     /// ADR-020 AC#7 Option A — `quant_pack_for_dwq` happy path:
