@@ -458,6 +458,99 @@ impl Default for DwqTrainingConfig {
     }
 }
 
+/// ADR-020 AC#7 Option A — configuration for the full-model DWQ
+/// training entry point (`train_all_linears_full_model_dwq`, step 2
+/// of the AC#7 implementation ladder per ADR-020 §8.3).
+///
+/// Sibling of [`DwqTrainingConfig`] (which drives the synthetic
+/// per-Linear-teacher path that's mathematically a no-op at
+/// `perturb_factor=1.0` per the
+/// `project_adr020_dwq_perturb1_noop_finding` memory).  The
+/// full-model variant uses an FP32 GGUF teacher + per-Linear
+/// `qdq_affine`-wrapped student, optimizing all per-Linear (s, b)
+/// jointly via cross-layer KL gradients.
+///
+/// Foundation tests proving the autograd chain at iter-N+0 of the
+/// ladder (commits `28bedfd`, `220a5e1`, `8d5bef6`, `59bcb6d`,
+/// `5e86314`):
+///   - `qwen35_moe::tests::ac7_option_a_*` series — gradient flow,
+///     plateau breakage, SGD convergence, Adam convergence,
+///     init-equivalence proof.
+#[derive(Debug, Clone)]
+pub struct FullModelDwqConfig {
+    /// Quant bit-width (typically 4 for production).  Range [2, 8].
+    pub bits: u32,
+    /// Per-group axis length.  Power-of-two in [2, 1024].  Must
+    /// divide every Linear's `k`.
+    pub group_size: usize,
+    /// Number of Adam steps to take.  iter-12d-1 default = 50;
+    /// full-model needs more steps because cross-layer signal
+    /// propagates over more layers per step (typical 200-500 in
+    /// mlx-lm).
+    pub n_steps: usize,
+    /// Adam learning rate.  Note from Option A Adam test
+    /// (`qwen35_moe::tests::ac7_option_a_full_model_two_layer_adam_*`):
+    /// lr=0.01 EXPLODES on this fixture; lr=1e-5 converges.  mlx-lm
+    /// uses lr=1e-4 against full-vocab logits (larger losses).
+    /// Production tuning is operator territory.
+    pub lr: f32,
+    /// Distillation temperature.  T=2.0 matches mlx-lm's default
+    /// in `mlx_lm/quant/dwq.py:106`.
+    pub temperature: f32,
+    /// Calibration batch size (n_tokens per forward pass).  Must
+    /// be ≥ 32 (matmul backward kernel floor).
+    pub batch_size: usize,
+    /// Calibration sequence length per batch.
+    pub seq_len: usize,
+    /// Path to the teacher GGUF (FP32-equivalent — typically the
+    /// same model variant the student is being quantized FROM).
+    pub gguf_path: std::path::PathBuf,
+    /// Calibration corpus as token-id batches.  Each `Vec<u32>` is
+    /// a batch of length `batch_size × seq_len` row-major.
+    /// Length validated at runtime against `batch_size * seq_len`
+    /// per element.
+    pub calibration_token_batches: Vec<Vec<u32>>,
+    /// Top-K subset of teacher logits to retain per position
+    /// (mirrors mlx-lm's `compute_dwq_targets` at
+    /// `dwq.py:59` `argpartition kth=-1024`).  Smaller K → smaller
+    /// teacher footprint at the cost of distillation fidelity.
+    /// 1024 is the production default.
+    pub top_k_teacher: usize,
+    /// PRNG seed for any auxiliary randomization (reserved for
+    /// future calibration sampling — currently unused by the
+    /// deterministic forward path).
+    pub seed: u64,
+    /// RSS watchdog cap (bytes).  When `Some(cap)`, the training
+    /// loop polls process RSS and aborts if it exceeds the cap.
+    /// §8.3 AC#6 mandate is 100 GB.  Re-uses the same
+    /// [`RssWatchdog`] machinery as `DwqTrainingConfig::rss_cap_bytes`.
+    pub rss_cap_bytes: Option<u64>,
+}
+
+impl Default for FullModelDwqConfig {
+    /// Production defaults.  Empty `gguf_path` and
+    /// `calibration_token_batches` MUST be supplied by the caller
+    /// before invoking the training fn — they default to "no-op
+    /// values" purely so the struct supports `..Default::default()`
+    /// initializer-shorthand in tests/fixtures.
+    fn default() -> Self {
+        Self {
+            bits: 4,
+            group_size: 32,
+            n_steps: 200,
+            lr: 1e-4,
+            temperature: 2.0,
+            batch_size: 32,
+            seq_len: 512,
+            gguf_path: std::path::PathBuf::new(),
+            calibration_token_batches: Vec::new(),
+            top_k_teacher: 1024,
+            seed: 0xDEAD_BEEF,
+            rss_cap_bytes: None,
+        }
+    }
+}
+
 /// ADR-020 iter-12d-2 — per-Linear training summary inside a model
 /// scan (one entry per successfully-trained tensor).
 #[derive(Debug, Clone)]
@@ -2560,6 +2653,54 @@ mod tests {
             !cfg.compute_bench,
             "DwqTrainingConfig::default() must have compute_bench = false"
         );
+    }
+
+    /// ADR-020 AC#7 Option A — `FullModelDwqConfig::default()` carries
+    /// the production-canonical knobs but explicitly leaves the
+    /// caller-required fields (`gguf_path`, `calibration_token_batches`)
+    /// in their no-op state.  This test pins the contract:
+    ///
+    /// - bits=4, group_size=32, top_k_teacher=1024, T=2.0 — match
+    ///   mlx-lm's dwq.py defaults
+    /// - n_steps=200, lr=1e-4 — production starting point (operator
+    ///   tunes per family)
+    /// - gguf_path is empty + calibration_token_batches is empty,
+    ///   so the eventual training fn must validate caller has
+    ///   filled them (fail-loud) before invoking forward
+    /// - rss_cap_bytes=None — preserved with §8.3 AC#6 deferred to
+    ///   caller (mirrors DwqTrainingConfig)
+    ///
+    /// Step 1 of the AC#7 implementation ladder per ADR-020 §8.3.
+    #[test]
+    fn full_model_dwq_config_default_pins_production_canon() {
+        let cfg = super::FullModelDwqConfig::default();
+        assert_eq!(cfg.bits, 4);
+        assert_eq!(cfg.group_size, 32);
+        assert_eq!(cfg.top_k_teacher, 1024);
+        assert!((cfg.temperature - 2.0).abs() < 1e-9);
+        assert_eq!(cfg.n_steps, 200);
+        assert!((cfg.lr - 1e-4).abs() < 1e-12);
+        assert_eq!(cfg.batch_size, 32);
+        assert_eq!(cfg.seq_len, 512);
+        assert_eq!(cfg.seed, 0xDEAD_BEEF);
+        assert!(cfg.rss_cap_bytes.is_none());
+
+        // Caller-required fields must be empty by default (so any
+        // forgotten override surfaces as a fail-loud error in the
+        // eventual training fn rather than silently using wrong data).
+        assert_eq!(cfg.gguf_path.as_os_str().len(), 0);
+        assert!(cfg.calibration_token_batches.is_empty());
+
+        // Update-syntax must work so test fixtures can override
+        // sparingly.
+        let custom = super::FullModelDwqConfig {
+            bits: 6,
+            n_steps: 5,
+            ..super::FullModelDwqConfig::default()
+        };
+        assert_eq!(custom.bits, 6);
+        assert_eq!(custom.n_steps, 5);
+        assert_eq!(custom.group_size, 32); // unchanged from default
     }
 
     /// ADR-020 iter-12d-2 — production driver test (real GGUF; gated
