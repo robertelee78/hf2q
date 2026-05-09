@@ -1757,6 +1757,63 @@ Adding nwg-axis levers MUST be data-justified by per-kL K-block model
 produce noise (e.g., nwg=24 ≈ nwg=16 at kL=1024 because both give
 2-iter bottleneck despite 50% more parallelism).
 
+### iter-121: DS4 fused gate+up+SwiGLU savings sized — marginal for gemma
+
+Per operator emphasis on "reference repos, white papers", investigated
+DS4's `kernel_dsv4_shared_gate_up_swiglu_q8_0`
+(`/opt/ds4/metal/dense.metal:203`). DS4 fuses gate-proj + up-proj into a
+single kernel via shared X-vector reads, then computes SwiGLU inline.
+
+#### Bench-derived sizing (gemma-4 26B dense FFN)
+
+Dimensions confirmed from GGUF metadata (`bench_iter110_dense_ffn`
+comment block): `gemma4.feed_forward_length=2112`, hidden=2816.
+
+| Quant | gate µs | up µs | down µs | per-layer | per-token (30 layers) | % of 15.86ms |
+|-------|---------|-------|---------|-----------|------------------------|--------------|
+| Q4_0  | 13.65   | 13.40 | 6.48    | 33.53     | 1.01 ms                | 6.4%         |
+| Q8_0  | 3.76    | 3.76* | 3.47    | 10.99     | 0.33 ms                | 2.1%         |
+| Q5_K** | ~10    | ~10   | ~5      | ~25       | ~0.75 ms               | ~4.7%        |
+
+*Q8_0 up extrapolated from gate (same shape).
+**Q5_K interpolated linearly by bpw (5.5 vs 4.5/8.5).
+
+#### DS4 fusion savings model
+
+What DS4's fusion saves PER LAYER:
+- 1 silu_mul kernel dispatch: ~5 µs (kernel launch + n=2112 floats)
+- 1 redundant X-vector read (k=2816 F32 = 11.25 KB): ~0.15 µs at
+  M5 Max effective BW
+
+Per-layer saving: **~5 µs**. Over 30 layers: **~0.15 ms/token** = **~1%
+of 15.86 ms decode**.
+
+#### Implication for ADR-028 #2 (speed)
+
+Kernel-level levers approaching exhaustion:
+- LM head (9.9% budget): at M5 Max memory wall (587 GB/s) — no savings
+- FA-vec-tq-hb (9.0% budget): iter-119 nwg=32 already optimal for sw=1024
+- Dense FFN (4-5% budget at Q5_K): DS4 fusion saves ~1% — multi-iter
+  port cost vs marginal win
+- Projs/O-proj/etc: at compute wall per iter-100..118 falsifications
+
+The decode peer gap (15.83ms hf2q vs 11.11ms llama.cpp = 0.70× peer at
+Gemma 4 26B-Q5_K_M) is **structurally bounded** within current TQ-HB
++ Q5_K_M. Closure paths confirmed:
+
+- **Path A (spec-decode)**: 1.6-3.0× decode lift via 60-80% acceptance.
+  Phase 1+contract LANDED. Phase 2 GPU = ~180 LOC, multi-iter scope.
+  Mantra-aligned (no quality loss).
+- **Path B (drop TQ-HB)**: recovers ~3 ms but loses 3.94× KV memory
+  savings. Mantra-violating.
+- **Path C (Q5_K → Q4_K)**: ~10-15% bandwidth savings = ~0.5-1 ms.
+  Operator decision needed.
+- **Path D (FA reduce-kernel rewrite for nwg > 32)**: ~4× FA at Qwen
+  long-context (kL=4096). Multi-iter scope. Helps Qwen3.5/3.6 only.
+
+**iter-121 verdict: more kernel sniping won't close the gap. Path A is
+the right next investment.**
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
