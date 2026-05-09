@@ -199,6 +199,117 @@ impl FullAttnKvSlot {
         })?;
         Ok(())
     }
+
+    /// ADR-027 Phase B iter-10 — dispatch the TQ SDPA kernel
+    /// (`flash_attn_vec_tq_hb`) consuming this slot's `tq` buffers.
+    ///
+    /// **Caller contract (mirrors the GPU kernel):**
+    /// - `self.tq` MUST be `Some` (constructed via
+    ///   [`HybridKvCache::new_with_options`] with `tq_kv_active=true`).
+    /// - `q` MUST be FWHT-rotated by the caller before this call (see
+    ///   `mlx_native::ops::fwht_standalone::dispatch_fwht_f32`).
+    ///   Shape: `[num_heads, head_dim]` F32.
+    /// - `output` is the F32 destination buffer; the caller MUST apply
+    ///   inverse FWHT to it after this call returns.
+    ///   Shape: `[num_heads, head_dim]` F32.
+    /// - `tmp` scratch buffer sized via
+    ///   `mlx_native::ops::flash_attn_vec_tq_hb::tmp_buffer_bytes(...)`
+    ///   (only used when NWG > 1; the kernel writes directly to
+    ///   `output` when NWG == 1).
+    ///
+    /// **Iter-10 scope (this method):** dispatch wrapper + GPU sanity
+    /// tests (output is finite + non-zero on real Metal). The full
+    /// F32-baseline NRMSE-vs-TQ parity test is iter-11; the
+    /// production-decode integration in `gpu_full_attn::full_attn_
+    /// layer_gpu` is also iter-11.
+    ///
+    /// # Errors
+    ///
+    /// - Returns `Err` if `self.tq.is_none()` (mantra: fail loud).
+    /// - Propagates errors from the GPU SDPA kernel (head_dim ∈
+    ///   {256, 512}, codebook_bits ∈ {5, 6, 8}, kv_seq_len > 0,
+    ///   kv_capacity ≥ kv_seq_len, …).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_tq_sdpa(
+        &self,
+        q: &MlxBuffer,
+        output: &MlxBuffer,
+        tmp: &MlxBuffer,
+        params: &Qwen35TqSdpaParams,
+        encoder: &mut mlx_native::CommandEncoder,
+        registry: &mut mlx_native::KernelRegistry,
+        device: &MlxDevice,
+    ) -> Result<()> {
+        let tq = self.tq.as_ref().ok_or_else(|| {
+            anyhow!(
+                "FullAttnKvSlot::dispatch_tq_sdpa: slot.tq is None — slot was \
+                 not constructed in TQ-active mode (HybridKvCache::new_with_options \
+                 tq_kv_active=true required)"
+            )
+        })?;
+        let kernel_params = mlx_native::ops::flash_attn_vec_tq_hb::FlashAttnVecTqHbParams {
+            num_heads: params.num_heads,
+            num_kv_heads: params.num_kv_heads,
+            head_dim: params.head_dim,
+            kv_seq_len: params.kv_seq_len,
+            kv_capacity: params.kv_capacity,
+            scale: params.scale,
+            mask_type: params.mask_type,
+            sliding_window: params.sliding_window,
+            softcap: params.softcap,
+            ring_start: params.ring_start,
+            scale_factor_d512: params.scale_factor_d512,
+            codebook_bits: params.codebook_bits,
+        };
+        mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb(
+            encoder,
+            registry,
+            device,
+            q,
+            &tq.k_packed,
+            &tq.k_norms,
+            &tq.v_packed,
+            &tq.v_norms,
+            output,
+            tmp,
+            &kernel_params,
+        )
+        .map_err(|e| anyhow!("dispatch_tq_sdpa: flash_attn_vec_tq_hb: {e}"))?;
+        Ok(())
+    }
+}
+
+/// ADR-027 Phase B iter-10 — parameters for the qwen35 TQ SDPA dispatch.
+/// Mirrors `mlx_native::ops::flash_attn_vec_tq_hb::FlashAttnVecTqHbParams`
+/// but lives in the qwen35 namespace so the engine call site doesn't need
+/// to import mlx-native types directly. Iter-11 wires this into
+/// `gpu_full_attn::full_attn_layer_gpu`'s decode dispatch.
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen35TqSdpaParams {
+    /// Q heads (e.g. 16 for qwen36 35B-A3B-APEX).
+    pub num_heads: u32,
+    /// K/V heads (e.g. 2 for qwen36).
+    pub num_kv_heads: u32,
+    /// head_dim (must be 256 or 512; production qwen35 = 256).
+    pub head_dim: u32,
+    /// Number of KV positions populated (cur_len at dispatch time).
+    pub kv_seq_len: u32,
+    /// Cache capacity (max_seq_len from `HybridKvCache` construction).
+    pub kv_capacity: u32,
+    /// Scale (typically `1 / sqrt(head_dim)`).
+    pub scale: f32,
+    /// Mask type: 0 = none, 1 = causal, 2 = sliding-window.
+    pub mask_type: u32,
+    /// Sliding window length (mask_type=2 only).
+    pub sliding_window: u32,
+    /// Softcap value (0 = disabled).
+    pub softcap: f32,
+    /// Ring buffer start slot for sliding-window cache (0 for global).
+    pub ring_start: u32,
+    /// D=512 per-block scale divisor (1.0 for d=256 = qwen35 production).
+    pub scale_factor_d512: f32,
+    /// Codebook bit-width (5, 6, or 8 — qwen35 default = 8).
+    pub codebook_bits: u32,
 }
 
 impl LinearAttnStateSlot {
@@ -2518,6 +2629,295 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-027 Phase B iter-10 — dispatch_tq_sdpa GPU dispatch tests
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Helper: alloc the F32 destination/scratch buffers for the SDPA
+    /// dispatch at qwen35 shape.  Returns (q, output, tmp).
+    fn alloc_sdpa_buffers(
+        device: &MlxDevice,
+        num_heads: u32,
+        head_dim: u32,
+    ) -> (MlxBuffer, MlxBuffer, MlxBuffer) {
+        let q_elems = (num_heads as usize) * (head_dim as usize);
+        let q = device
+            .alloc_buffer(
+                q_elems * std::mem::size_of::<f32>(),
+                DType::F32,
+                vec![num_heads as usize, head_dim as usize],
+            )
+            .expect("alloc q");
+        let output = device
+            .alloc_buffer(
+                q_elems * std::mem::size_of::<f32>(),
+                DType::F32,
+                vec![num_heads as usize, head_dim as usize],
+            )
+            .expect("alloc output");
+        let tmp_bytes = mlx_native::ops::flash_attn_vec_tq_hb::tmp_buffer_bytes(
+            num_heads, head_dim,
+        );
+        let tmp = device
+            .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
+            .expect("alloc tmp");
+        (q, output, tmp)
+    }
+
+    #[test]
+    fn dispatch_tq_sdpa_errors_when_slot_lacks_tq_buffers() {
+        // Mantra: fail loud, no silent fallback. Calling SDPA on a
+        // legacy F32-only slot must error explicitly.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, false)
+            .expect("kv tq-off");
+        let slot = &cache.full_attn[0];
+        assert!(slot.tq.is_none());
+        let num_heads = cfg.num_attention_heads;
+        let head_dim = cfg.head_dim;
+        let (q, output, tmp) = alloc_sdpa_buffers(&device, num_heads, head_dim);
+        let params = Qwen35TqSdpaParams {
+            num_heads,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim,
+            kv_seq_len: 1,
+            kv_capacity: 64,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            mask_type: 0,
+            sliding_window: 0,
+            softcap: 0.0,
+            ring_start: 0,
+            scale_factor_d512: 1.0,
+            codebook_bits: 8,
+        };
+        let mut registry = mlx_native::KernelRegistry::new();
+        let mut encoder = device.command_encoder().expect("encoder");
+        let err = slot
+            .dispatch_tq_sdpa(&q, &output, &tmp, &params, &mut encoder, &mut registry, &device)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("slot.tq is None"),
+            "expected fail-loud None-tq error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn dispatch_tq_sdpa_produces_finite_nonzero_output_at_qwen35_shape() {
+        // Encode a single token's K, V via encode_token_to_tq, then
+        // dispatch SDPA with kv_seq_len=1. Output must be:
+        //   - finite (no NaN / no Inf)
+        //   - non-zero (the kernel actually wrote something)
+        // This is the iter-10 sanity check — full F32-baseline NRMSE
+        // parity is iter-11.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache_capacity: u32 = 64;
+        let mut cache =
+            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+                .expect("kv tq-on");
+        let slot = &mut cache.full_attn[0];
+        let n_kv_heads = cfg.num_key_value_heads;
+        let num_heads = cfg.num_attention_heads;
+        let head_dim = cfg.head_dim;
+
+        // Allocate K, V tokens with deterministic non-trivial values.
+        let k_token = synth_token_buffer(&device, n_kv_heads as usize, head_dim as usize, 11);
+        let v_token = synth_token_buffer(&device, n_kv_heads as usize, head_dim as usize, 13);
+
+        let mut registry = mlx_native::KernelRegistry::new();
+        let mut encoder = device.command_encoder().expect("encoder");
+        // Encode the single KV token at write_pos=0.
+        slot.encode_token_to_tq(
+            &k_token, &v_token, n_kv_heads, head_dim, cache_capacity,
+            0, false, 1.0, 8, &mut encoder, &mut registry, &device,
+        )
+        .expect("encode");
+
+        // Build Q (FWHT-rotation skipped — sanity test only checks
+        // finite/non-zero output, not numerical correctness).
+        let (mut q_buf, output, tmp) = alloc_sdpa_buffers(&device, num_heads, head_dim);
+        {
+            let s = q_buf.as_mut_slice::<f32>().expect("q mut");
+            for (i, v) in s.iter_mut().enumerate() {
+                *v = ((i as f32) * 0.001).cos() * 0.5;
+            }
+        }
+        let params = Qwen35TqSdpaParams {
+            num_heads,
+            num_kv_heads: n_kv_heads,
+            head_dim,
+            kv_seq_len: 1,
+            kv_capacity: cache_capacity,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            mask_type: 0,
+            sliding_window: 0,
+            softcap: 0.0,
+            ring_start: 0,
+            scale_factor_d512: 1.0,
+            codebook_bits: 8,
+        };
+
+        // Dispatch SDPA on the SAME encoder (production pattern: encode
+        // → dispatch in one CB).
+        slot.dispatch_tq_sdpa(
+            &q_buf, &output, &tmp, &params, &mut encoder, &mut registry, &device,
+        )
+        .expect("dispatch_tq_sdpa");
+        encoder.commit_and_wait().expect("commit_and_wait");
+
+        let out = output.as_slice::<f32>().expect("output slice");
+        let mut any_nonzero = false;
+        for &v in out.iter() {
+            assert!(v.is_finite(), "SDPA output must be finite; got {v}");
+            if v != 0.0 {
+                any_nonzero = true;
+            }
+        }
+        assert!(
+            any_nonzero,
+            "SDPA output must be non-zero (kernel produced no writes)"
+        );
+    }
+
+    #[test]
+    fn dispatch_tq_sdpa_two_position_kv_finite_output() {
+        // Encode TWO KV positions then dispatch SDPA with kv_seq_len=2.
+        // Output must remain finite + non-zero at qwen35 shape.
+        // Pins regression that the kernel correctly handles
+        // multi-position KV cache reads.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache_capacity: u32 = 16;
+        let mut cache =
+            HybridKvCache::new_with_options(&cfg, &device, cache_capacity, 1, true)
+                .expect("kv tq-on");
+        let slot = &mut cache.full_attn[0];
+        let n_kv_heads = cfg.num_key_value_heads;
+        let num_heads = cfg.num_attention_heads;
+        let head_dim = cfg.head_dim;
+
+        let k0 = synth_token_buffer(&device, n_kv_heads as usize, head_dim as usize, 100);
+        let v0 = synth_token_buffer(&device, n_kv_heads as usize, head_dim as usize, 200);
+        let k1 = synth_token_buffer(&device, n_kv_heads as usize, head_dim as usize, 300);
+        let v1 = synth_token_buffer(&device, n_kv_heads as usize, head_dim as usize, 400);
+
+        let mut registry = mlx_native::KernelRegistry::new();
+        let mut encoder = device.command_encoder().expect("encoder");
+        slot.encode_token_to_tq(
+            &k0, &v0, n_kv_heads, head_dim, cache_capacity, 0, false, 1.0, 8,
+            &mut encoder, &mut registry, &device,
+        )
+        .expect("encode pos 0");
+        slot.encode_token_to_tq(
+            &k1, &v1, n_kv_heads, head_dim, cache_capacity, 1, false, 1.0, 8,
+            &mut encoder, &mut registry, &device,
+        )
+        .expect("encode pos 1");
+
+        let (mut q_buf, output, tmp) = alloc_sdpa_buffers(&device, num_heads, head_dim);
+        {
+            let s = q_buf.as_mut_slice::<f32>().expect("q mut");
+            for (i, v) in s.iter_mut().enumerate() {
+                *v = ((i as f32) * 0.0017).sin() * 0.5;
+            }
+        }
+        let params = Qwen35TqSdpaParams {
+            num_heads,
+            num_kv_heads: n_kv_heads,
+            head_dim,
+            kv_seq_len: 2,
+            kv_capacity: cache_capacity,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            mask_type: 0,
+            sliding_window: 0,
+            softcap: 0.0,
+            ring_start: 0,
+            scale_factor_d512: 1.0,
+            codebook_bits: 8,
+        };
+
+        slot.dispatch_tq_sdpa(
+            &q_buf, &output, &tmp, &params, &mut encoder, &mut registry, &device,
+        )
+        .expect("dispatch_tq_sdpa");
+        encoder.commit_and_wait().expect("commit_and_wait");
+
+        let out = output.as_slice::<f32>().expect("output slice");
+        let mut any_nonzero = false;
+        for &v in out.iter() {
+            assert!(v.is_finite(), "SDPA output must be finite at kv_seq_len=2; got {v}");
+            if v != 0.0 {
+                any_nonzero = true;
+            }
+        }
+        assert!(any_nonzero, "kv_seq_len=2 SDPA output must be non-zero");
+    }
+
+    #[test]
+    fn dispatch_tq_sdpa_rejects_kv_seq_len_zero() {
+        // Defensive: kernel param validation propagates through the
+        // wrapper.  kv_seq_len=0 must fail loud (kernel
+        // validate_params rejects).
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = moe_cfg_40layer();
+        let cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, true)
+            .expect("kv tq-on");
+        let slot = &cache.full_attn[0];
+        let num_heads = cfg.num_attention_heads;
+        let head_dim = cfg.head_dim;
+        let (q, output, tmp) = alloc_sdpa_buffers(&device, num_heads, head_dim);
+        let params = Qwen35TqSdpaParams {
+            num_heads,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim,
+            kv_seq_len: 0, // invalid
+            kv_capacity: 64,
+            scale: 1.0,
+            mask_type: 0,
+            sliding_window: 0,
+            softcap: 0.0,
+            ring_start: 0,
+            scale_factor_d512: 1.0,
+            codebook_bits: 8,
+        };
+        let mut registry = mlx_native::KernelRegistry::new();
+        let mut encoder = device.command_encoder().expect("encoder");
+        let err = slot
+            .dispatch_tq_sdpa(&q, &output, &tmp, &params, &mut encoder, &mut registry, &device)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("kv_seq_len must be > 0"),
+            "expected kv_seq_len-zero validation error, got: {msg}"
+        );
     }
 
     #[test]
