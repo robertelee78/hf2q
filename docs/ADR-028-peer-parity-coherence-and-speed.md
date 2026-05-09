@@ -1879,6 +1879,42 @@ Sliding-window layers need ring-wrap. TQ-HB cache's per-token-per-head
 norms occupy slots in same write_pos space → rollback handles them
 implicitly.
 
+### iter-124: task #14 (bin_fuse) obsolete after #13 — TaskList cleanup
+
+Task #14 ("Port bin_fuse_f32_f32_f32_4 — decode 6% candidate") was
+sized BEFORE task #13 (rms_norm_mul_add_f32_4) landed. Re-checked the
+decode path:
+
+- All residual adds are absorbed into `dispatch_fused_norm_add_f32`
+  (post-attention norm+residual at `forward_mlx.rs:3657`, post-FF
+  norm+residual at `forward_mlx.rs:3934`).
+- Searched for standalone `add_f32`/`elementwise_add`/`dispatch_add` in
+  `forward_mlx.rs`: zero matches.
+
+llama.cpp's `bin_fuse_f32_f32_f32_4` exists for chains of unfused
+binary ops (e.g., `out = a + b + c + d`). hf2q's decode pattern is
+`hidden = norm(hidden + attn_out)` and `hidden = norm(hidden +
+ffn_out)` — the residual+norm pair is already a single kernel. **Task
+#14 is OBSOLETE.**
+
+### iter-123 LANDED: Path A Phase 2 Shape S — serial verify + rollback
+
+Commit `311c6e3`:
+- Pure helpers in `verifier.rs` (testable, 12 new tests):
+  - `accept_prefix_argmax(drafts, model_argmaxes)` — argmax-based
+    variant of `accept_prefix`, skips `O(K × vocab)` one-hot allocation.
+  - `rollback_kv_state(write_pos, seq_len, capacity, is_sliding, trim)`
+    — pure math for sliding-wrap and full-attention rollback.
+- Engine glue on `MlxModelWeights` (forward_mlx.rs):
+  - `forward_decode_verify_serial(tokens, seq_pos, gpu) -> Vec<u32>` —
+    K × forward_decode loop. Correct but K× latency. Byte-identity
+    gate to validate `accept_prefix_argmax` + rollback wiring.
+  - `rollback_kv(trim)` — per-layer iteration applying the helper.
+- 26 verifier tests pass; full bin suite intact.
+
+Shape B (batched single-pass for real speedup) remains gated on
+operator green-light per iter-122 sequencing.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
