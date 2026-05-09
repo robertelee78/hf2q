@@ -214,3 +214,19 @@ For this project phase the sliding_wrap 752-byte batched-vs-batched ceiling is *
   The 2026-05-09 pp2455 number (0.57× peer) is below the Apr-20 0.90× baseline; both hf2q AND llama.cpp regressed since Apr 20 (Apr-20 hf2q 3069 / llama 3411 → today hf2q 1737 / llama 3023), but llama regressed less. Likely a combination of (a) further hf2q-side drift in non-batched-prefill code paths the layer loop touches, and (b) macOS / thermal envelope differences. Closing the residual 0.57× → 0.90× gap is its own work item; the iter-64 fix is the biggest single jump.
 
 - 2026-05-09 (iter-65 REGRESSION GATE LANDED): `scripts/adr010_iter64_batched_coherence_gate.sh` runs both per-token and batched prefill on the canonical `What is 2+2?` prompt and asserts (a) per-token contains `4` (reference truth), (b) batched contains `4` (no first-decode-token regression in compute path), and (c) batched does NOT contain a 6+ consecutive-digit run (gibberish-pattern detector tuned to the pre-iter-64 `41211789...` failure mode). Fast (~30s), operator-runnable after any forward_prefill_batched.rs change. Self-tested at HEAD: PASS. Closes the original "no Rust regression test exists for batched-prefill correctness" gap that allowed 3+ weeks of bit-rot.
+
+- 2026-05-09 (iter-66 PROFILE — MoE matmul localized as residual-gap dominant): `HF2Q_PROFILE_BUCKETS=1` on pp2455 batched prefill at HEAD shows MOE_GATE_UP **542.6 ms (34.5%)** + MOE_DOWN **297.9 ms (18.9%)** = **53.4% of total prefill time**. Per-call breakdown: MOE_GATE_UP @ 18.087 ms × 30 layers, MOE_DOWN @ 9.930 ms × 30 layers. All other buckets (QKV_MM, FA, O_MM, MLP) are <10% each; the residual ~16% is small overhead (KV_COPY, norms, embed, head). Routing today: `quantized_matmul_id_ggml_pooled` (legacy GGML id-mm path) since APEX-Q5_K_M has no DWQ overlay applied. **Highest-leverage attack on the residual 0.57× → 0.90× peer gap: kernel-level alignment of `kernel_mul_mm_id_q6_K_f32` against llama.cpp's equivalent.** Bringing MoE matmul to llama.cpp parity (per ratio of total times, llama spends ~250 ms on MoE matmul vs our ~840 ms) would save ~500-590 ms → hf2q would land at ~830-920 ms total = ~2680 t/s = 0.89× peer. That is the explicit path back to the Apr-20 baseline. Profile log: `/tmp/iter66-profile.log` (this session). ADR-022 §5 mm_id row scope; cross-references the qwen35 prefill-pipeline gap memory.
+
+  | Bucket               |    ms |    % | calls | ms/call |
+  |---------------------|------:|-----:|------:|--------:|
+  | MOE_GATE_UP         | 542.6 | 34.5 |    30 |  18.087 |
+  | MOE_DOWN            | 297.9 | 18.9 |    30 |   9.930 |
+  | QKV_MM              | 126.2 |  8.0 |    85 |   1.485 |
+  | STARTUP             | 125.5 |  8.0 |     — |       — |
+  | FA_SW (D=256)       |  92.8 |  5.9 |    25 |   3.711 |
+  | O_MM                |  68.7 |  4.4 |    30 |   2.289 |
+  | MLP_GUR_MM          |  67.1 |  4.3 |    90 |   0.745 |
+  | FA_GL (D=512)       |  63.1 |  4.0 |     5 |  12.615 |
+  | other small (<5%)   | ~245  | ~16  |     — |       — |
+  | **TOTAL**           | **1573.7** | **100** | | |
+
