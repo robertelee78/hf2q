@@ -285,6 +285,50 @@ impl Gemma4Config {
         self.layer_types.get(idx).copied() == Some(LayerType::Full)
     }
 
+    /// Compute the full-attention interval from `layer_types` if the
+    /// pattern is "every Nth layer is Full". Returns `None` if the
+    /// pattern is irregular OR if there are no Full layers.
+    ///
+    /// Iter-82: load banner reported `full_attn_every=none` for gemma
+    /// even though the default config places Full layers at every 6th
+    /// index (`(i+1) % 6 == 0`). The misleading banner suggested gemma
+    /// is purely sliding when it actually has 5 of 30 Full-attention
+    /// layers — confirmed by decode-throughput decay past sliding_window=1024
+    /// (KV reads on Full layers grow linearly with context).
+    pub fn full_attention_interval(&self) -> Option<u32> {
+        let full_indices: Vec<usize> = self
+            .layer_types
+            .iter()
+            .enumerate()
+            .filter(|(_, lt)| matches!(lt, LayerType::Full))
+            .map(|(i, _)| i)
+            .collect();
+        if full_indices.is_empty() {
+            return None;
+        }
+        // Check that all spacings between consecutive Full layers are equal.
+        let mut spacings = Vec::with_capacity(full_indices.len());
+        let mut prev = None::<usize>;
+        for &i in &full_indices {
+            if let Some(p) = prev {
+                spacings.push(i - p);
+            }
+            prev = Some(i);
+        }
+        if spacings.is_empty() {
+            // Only one Full layer; interval reportable as its 1-based index
+            // (e.g., layers [F, S, S, S] → only F at idx 0 → interval=1
+            // doesn't quite fit the "every Nth" semantics, so return None).
+            return None;
+        }
+        let first_spacing = spacings[0];
+        if spacings.iter().all(|s| *s == first_spacing) {
+            Some(first_spacing as u32)
+        } else {
+            None
+        }
+    }
+
     /// Head dim for the given layer.
     pub fn head_dim_for_layer(&self, idx: usize) -> usize {
         if self.is_full_attention(idx) { self.global_head_dim } else { self.head_dim }

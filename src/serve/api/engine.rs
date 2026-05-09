@@ -2174,7 +2174,12 @@ impl LoadInfoBuilder for GemmaLoadedModel {
             n_key_value_heads: self.config.num_key_value_heads as u32,
             head_dim: self.config.head_dim as u32,
             sliding_window: Some(self.config.sliding_window as u32),
-            full_attention_interval: None,
+            // Iter-82 fix: report the actual full-attention interval
+            // computed from layer_types (default for gemma is every 6th
+            // layer = Full). Pre-iter-82 this was hardcoded `None`,
+            // misleading the load banner to say "full_attn_every=none"
+            // when gemma actually has 5 of 30 Full-attention layers.
+            full_attention_interval: self.config.full_attention_interval(),
             max_context_length: self.context_length.map(|v| v as u32),
             moe,
             quant_label: self.quant_type.clone(),
