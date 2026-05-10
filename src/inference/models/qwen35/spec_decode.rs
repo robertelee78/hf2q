@@ -282,6 +282,22 @@ impl<'a> SpecDecode<'a> {
                 let logits_row0 = &verify_logits[0..vsz];
                 let logits_row1 = &verify_logits[vsz..2 * vsz];
                 let verified_at_n1 = greedy_argmax_slice(logits_row0);
+                if std::env::var("HF2Q_SPEC_DECODE_K1_TRACE").as_deref() == Ok("1") {
+                    let h_count = verify_hidden.element_count();
+                    let next_iter_tn_dbg = greedy_argmax_slice(logits_row1);
+                    eprintln!(
+                        "[K1_TRACE] iter={} pos={} tn={} prop={} v_at_n1={} (match={}) nitn={} verify_hidden_elems={} (expected 2*h={})",
+                        self.stats.proposed,
+                        next_pos,
+                        token_next,
+                        proposed,
+                        verified_at_n1,
+                        verified_at_n1 == proposed,
+                        next_iter_tn_dbg,
+                        h_count,
+                        2 * hidden_size_u32 as usize,
+                    );
+                }
 
                 if verified_at_n1 == proposed {
                     // ACCEPT: draft_1 was correct.
@@ -290,14 +306,32 @@ impl<'a> SpecDecode<'a> {
                     // verifier processed pos N+1 with the correct token).
                     // This is the Leviathan amortization: per-iter output =
                     // 1 (verifier's own next prediction) + 1 (draft accepted).
+                    //
+                    // HF2Q_SPEC_DECODE_K1_NO_AMORT=1 disables the "free
+                    // token" push for bisect: keeps the 2-token verifier
+                    // forward but emits only proposed (so K=1 should
+                    // produce the same trajectory as K=0). If output is
+                    // STILL wrong with NO_AMORT, the bug is in the 2-token
+                    // verifier state propagation. If output is CORRECT
+                    // with NO_AMORT, the bug is in the speculative push.
+                    let no_amort = std::env::var("HF2Q_SPEC_DECODE_K1_NO_AMORT")
+                        .as_deref() == Ok("1");
                     let next_iter_token_next = greedy_argmax_slice(logits_row1);
                     generated.push(proposed);
-                    if generated.len() < max_new && !self.is_eos(proposed) {
+                    if !no_amort
+                        && generated.len() < max_new
+                        && !self.is_eos(proposed)
+                    {
                         generated.push(next_iter_token_next);
                     }
-                    preemitted_argmax = true;
+                    // preemitted=true if we pushed next_iter_token_next.
+                    // In no_amort mode we DIDN'T push it, so next iter SHOULD
+                    // push token_next at start (= the same N+2 prediction).
+                    preemitted_argmax = !no_amort;
                     self.stats.accepted += 1;
-                    if self.is_eos(proposed) || self.is_eos(next_iter_token_next) {
+                    if self.is_eos(proposed)
+                        || (!no_amort && self.is_eos(next_iter_token_next))
+                    {
                         break;
                     }
                     if generated.len() >= max_new {
