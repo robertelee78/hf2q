@@ -13082,3 +13082,65 @@ intact (no FA-path touched), 3.94× memory savings preserved.
   table to reflect iter-318 + iter-319 measurements
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`:
   this section
+
+
+---
+
+## iter-320 — V2 helps qwen3.6 APEX too (+2.3% beyond 1.34× peer)
+
+iter-318/319 found G+FUSED+V2+NR2 = +4.6% on gemma4 APEX.  iter-320
+opportunistically tested V2 on qwen3.6 APEX (which was already at
+1.342× peer per memory `feedback_apex_focus_not_dev_ggufs_2026_05_10.md`):
+
+### qwen3.6 APEX-Q5_K_M, 5-run lock-in (200 tok)
+
+```
+baseline:    126.8, 126.9, 126.7, 127.1, 127.0   median 126.9 tok/s (σ ~0.16)
+V2 enabled:  129.8, 130.0, 129.8, 129.8, 129.9   median 129.8 tok/s (σ ~0.10)
+Delta: +2.3% reliable
+```
+
+Peer reference: qwen3.6 tg1024 = 94.55 tok/s (per APEX-focus memory).
+- baseline: 126.9 / 94.55 = **1.342× peer**
+- V2 enabled: 129.8 / 94.55 = **1.373× peer**
+
+Mantra was already crossed; this strengthens it.
+
+### Coherence parity
+
+`"What is 2+2?"` on both baseline and V2 → byte-identical thinking
+prelude.
+
+### Note: NR2 untested on qwen3.6
+
+qwen3.6 weights are mixed quants (per HEAD bucket analysis includes
+Q6_K, Q8_0, IQ4_NL, Q5_1).  The NR2 variant only routes through Q6_K
+mat-vec calls; if qwen3.6's hot path uses less Q6_K, NR2 won't help
+or hurt.  Future iter could add `HF2Q_Q6K_MV_NR2=1` to qwen3.6 bench
+and verify no regression — but with V2 alone already at +2.3%, low
+ROI to investigate further.
+
+### Status update
+
+| Model | × peer (default) | × peer (V2 stack) | Mantra |
+|---|---|---|---|
+| gemma4 APEX | 0.679 | **0.711** (G+FUSED+V2+NR2) | ✗ → less bad |
+| qwen3.6 APEX | 1.342 ★ | **1.373** ★★ (V2 only) | ✓ EXCEEDS |
+
+### Operator-actionable recommendation
+
+For qwen3.6 APEX, `HF2Q_RMS_NORM_V2=1` is a clean +2.3% safe-flip
+(parity-proven by iter-310 tests, coherence verified).
+
+For gemma4 APEX, the prior iter-318 recommendation
+(`HF2Q_LMHEAD_Q6K=1 HF2Q_FUSED_END_OF_LAYER=1 HF2Q_RMS_NORM_V2=1
+HF2Q_Q6K_MV_NR2=1`) stands.
+
+Both env-gated, awaiting operator approval for default flips.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes.  V2 kernel already shipped iter-310; iter-320 is
+discovery + lock-in of cross-model benefit.
