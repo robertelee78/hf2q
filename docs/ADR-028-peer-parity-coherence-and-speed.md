@@ -7789,6 +7789,65 @@ gate requires Metal + the production GGUF files.
 **Audit/defensive phase formally concluded**.  Strategic options A/B/C
 from iter-240 remain operator-decision-gated.
 
+### iter-244 — Chesterton's-fence audit: per-layer asymmetry
+
+iter-238 surfaced gemma4 GGUF metadata showing TWO axes of per-layer
+asymmetry:
+- `head_count_kv = [8, 8, 8, 8, 8, 2, ...]` (sliding=8, global=2)
+- `key_length = 512` global, `key_length_swa = 256` sliding
+
+**Mantra check** ("always understand current fully before changing"):
+verified hf2q correctly handles both axes end-to-end.  Code-walk
+results:
+
+**Layer 1 — Config parser** (`/opt/hf2q/src/serve/config.rs`):
+- `:188-202` parses `head_count_kv` as a **list**, asserts length ==
+  block_count
+- `:173-174` reads BOTH `key_length` (head_dim_full=512) AND
+  `key_length_swa` (head_dim_swa=256) from GGUF
+- `:234-245` uses pattern.zip(head_count_kv).filter() to compute
+  per-role num_kv_heads (sliding vs global)
+- `:338` exposes `num_kv_heads_for_layer(idx)` getter
+
+**Layer 2 — Weight allocator** (`/opt/hf2q/src/serve/forward_mlx.rs`):
+- `:1685+1737` per-layer `nkv = cfg.num_kv_heads_for_layer(i)` used at
+  KV cache allocation (each layer sized correctly)
+- `:714` activation buffer comment "sized for the largest layer —
+  global with num_kv_heads=2, head_dim=512" — explicitly tracks the
+  max-shape requirement
+
+**Layer 3 — SDPA kernel template**
+(`/opt/mlx-native/src/shaders/flash_attn_vec_tq_hb.metal`):
+- `:329` kernel templated on `<short DK, short DV>`
+- `:391` per-DK EPT: "EPT = DK / 32; // 8 for D=256, 16 for D=512"
+- `:400` DK-conditional sign-byte tables:
+  `(DK == 256) ? TBQ_SIGNS_256_FA[j>>3] : TBQ_SIGNS_512_FA[j>>3]`
+- `:15-16` per-D scale-norm logic:
+  D=256 → `norm * inv_sqrt(256)`, D=512 → `norm / scale_factor_d512`
+- `:720+723` two host_name'd instantiations:
+  `flash_attn_vec_tq_hb_dk256` for `<256,256>`,
+  `flash_attn_vec_tq_hb_dk512` for `<512,512>`
+
+**Layer 4 — Runtime GQA ratio**:
+- `:365` `heads_per_kv = params.n_heads / params.n_kv_heads` computed
+  at DISPATCH TIME — supports any positive ratio
+- gemma4 sliding: 16 / 8 = 2 heads/kv  ✓
+- gemma4 global:  16 / 2 = 8 heads/kv  ✓
+- Same kernel binary handles both via runtime division
+
+**Verdict**: hf2q's per-layer gemma4 asymmetry handling is **complete
+and correct** end-to-end.  iter-238 raised the question; iter-244
+verifies the answer in code via Chesterton's fence methodology.
+**No bug, no missing path.**
+
+This closes the architectural-correctness branch of the audit phase.
+The 28.7% gap is now confirmed attributable solely to:
+- ~12% TQ-HB structural cost (codebook + per-pos norm + FWHT-undo)
+- ~12% theoretical reclaim via H1 F16-KV-decode-only
+- ~5% iter-215 hardware/launch-overhead floor
+
+No remaining unaccounted cost in the gap.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
