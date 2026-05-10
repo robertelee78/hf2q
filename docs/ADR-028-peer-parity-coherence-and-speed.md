@@ -12564,3 +12564,113 @@ of all barriers in one swoop.
   `dump_group_stats()` call after BODY split.
 
 No production code change — measurement instrumentation only.
+
+
+---
+
+## iter-313 — concurrency-ceiling reality-check + per-dispatch gap reconfirmed
+
+iter-312 hypothesized that disjoint-offset writes are seen as
+overlap by `ConflictTracker`.  iter-313 falsifies that hypothesis:
+
+### QKV site is correctly annotated (no false-positives)
+
+`/opt/hf2q/src/serve/forward_mlx.rs:2640-2670`:
+
+```rust
+// QKV projections (CONCURRENT: all read norm_out, write separate buffers)
+s.barrier_between(
+    &[&self.activations.norm_out],
+    &[&self.activations.attn_q, &self.activations.attn_k, &self.activations.attn_v],
+);
+dispatch_qmatmul(... &mut self.activations.attn_q, 1)?;
+dispatch_qmatmul(... &mut self.activations.attn_k, 1)?;
+s.track_dispatch(&[&self.activations.norm_out], &[&self.activations.attn_k]);
+dispatch_qmatmul(... &mut self.activations.attn_v, 1)?;
+s.track_dispatch(&[&self.activations.norm_out], &[&self.activations.attn_v]);
+```
+
+Q, K, V are SEPARATE MlxBuffers (`activations.attn_q`,
+`activations.attn_k`, `activations.attn_v` — lines 712, 715, 781).
+The tracker correctly sees 3 disjoint writes → 1 group of 3.
+
+Same pattern at QKnorm+RoPE site (line 2687-2690): one group of 2.
+
+### Architectural reality
+
+Gemma4's decode graph at our op-granularity IS mostly sequential.
+Per layer, the typical chain:
+- norm → matmul (RAW) → ...
+- KV-cache write → attention (RAW) → ...
+- O-proj → post-attn-norm-add (RAW) → ...
+- MoE: norm → router → gate_up → swiglu → down → weighted_sum
+
+Independent concurrent groups in our graph:
+- QKV projections (3 ops)
+- Q-norm + K-norm + RoPE (2 ops)
+- (potentially) gate + up MLP matmuls (2 ops if annotated)
+- KV-cache K + V copies (2 ops if annotated)
+
+Best case ~8 dispatches/layer in concurrent groups out of ~32.
+**Theoretical ratio ceiling ≈ 1.5** for gemma4 graph.
+
+We measured ratio = 1.29 (current).  Even infinite concurrency
+within current graph structure → ~1.5 → another ~5-10% headroom
+beyond what serial→concurrent already gave us.
+
+### Where the real gap lives
+
+Re-checking per-dispatch math at refined peer counts:
+- peer: `tg200 - tg1` slope = 1389 disp/decode-tok
+- peer: 102 tok/s = 9.8 ms/tok ÷ 1389 disp = **7.1 µs/disp**
+- hf2q: 951 disp/tok @ 67 tok/s = 14.9 ms/tok ÷ 951 = **15.7 µs/disp**
+
+**hf2q is 2.2× slower PER DISPATCH** despite issuing 32% fewer
+dispatches.
+
+iter-309/iter-310 falsified that this slowdown is in kernel internals
+of q6_K mat-vec or rms_norm.  Production wins were ≤2% each despite
+peer-source-equivalent ports.
+
+### Where else might 2× per-dispatch slowness live?
+
+Audit candidates:
+1. **TQ-HB scaffolding** — 150 extra dispatches/tok of
+   hadamard_quantize_kv_*, fwht_sign_*, flash_attn_vec_tq_hb at
+   ~10 µs each = ~1.5 ms/tok structural cost (operator-mandated to
+   keep for 3.94× memory savings).
+2. **Argument-encoding overhead per dispatch** — set_pipeline +
+   set_buffer×N + set_bytes + dispatch_threadgroups.  iter-254
+   measured 0.36 µs CPU encode, but GPU-side argument-binding
+   latency is opaque.
+3. **GPU-side launch latency on Apple Silicon** — fixed per-dispatch
+   cost that doesn't appear in CPU timing.
+
+### Strategic conclusion
+
+After 6 iters (308→313) of measure-and-port work, the picture is:
+- gemma4 decode at HEAD: **0.66× peer (67/102 tok/s)**
+- Concurrency lever: +7% headroom (mostly captured)
+- Per-kernel structural ports: +1-2% each
+- TQ-HB structural cost (operator-mandated): ~1.5 ms/tok floor
+- **Remaining ~1.5× per-dispatch cost is opaque to current
+  measurement tooling** — likely in Metal pipeline-binding or GPU-
+  side launch overhead we can't profile from Rust
+
+Realistic ceiling with TQ-HB intact: ~75-80 tok/s = 0.75-0.78× peer.
+**Achieving full parity with TQ-HB requires either**:
+- Eliminating TQ-HB scaffolding's per-dispatch overhead (kernel
+  fusion / merging the multiple hadamard_* + fwht_* + flash_attn_tq
+  into fewer combined ops)
+- OR identifying and closing the opaque per-dispatch overhead
+
+iter-314 candidate: profile via Apple Instruments (Metal System Trace
+or GPU Counters) to localize the per-dispatch latency.  Outside the
+scope of CPU-side instrumentation we've been using.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`:
+  this section.
+
+No code changes in iter-313 — analysis + decision-frame iter.
