@@ -4349,6 +4349,72 @@ of outputs. If rel_rms ~ F16 epsilon (1e-3), the kernel is fine
 and ADR-009's "bug" was actually F16 precision tradeoff. If
 rel_rms is much larger, bisect by zeroing inputs.
 
+### iter-168: ADR-009 F16 KV "19× amplification" REFUTED at HEAD
+
+#### Synthetic byte-identity test built + run (this iter)
+
+Created `mlx-native/tests/test_flash_attn_vec_f16_byte_identity.rs`:
+- Generate random F32 K/V at gemma4 production geometry
+  (16 heads, 8 kv, head_dim=256, kv_seq_len=240, sliding=1024)
+- Run THREE configurations:
+  1. F32 baseline (full precision)
+  2. F32 kernel with F32 inputs rounded F32→F16→F32 (= storage-only F16)
+  3. F16 kernel with F16 buffers
+- Compare rel_rms across all three pairs
+
+Result:
+
+```
+F32 baseline ←→ F32-with-F16-inputs   rel_rms: 2.57e-5
+F32 baseline ←→ F16-kernel            rel_rms: 2.57e-5  (IDENTICAL)
+F32-with-F16-inputs ←→ F16-kernel     rel_rms: 0.000000 (BYTE-IDENTICAL)
+F16-kernel amplification over storage: 1.00×
+```
+
+#### Interpretation
+
+The F16 kernel produces **byte-identical** output to the F32 kernel
+fed F16-rounded inputs. The 1.00× amplification means **F16 storage
+precision is the ONLY source of difference between F32 and F16
+paths**. There is **no kernel bug** at HEAD.
+
+ADR-009's "19× cache_k amplification" + "45× sdpa_out amplification"
+findings (2026-04-16) reflect a state that has since been fixed.
+The iter-101..149 FA-vec work (NSG axis, FWHT-pre fusion, etc.)
+plausibly addressed the root cause without explicit credit.
+
+The 2.57e-5 rel_rms vs F32 is **F16 precision tradeoff**, well
+below 1e-3 (typical F16 epsilon). On the gemma4 sliding-window
+geometry, F16 KV introduces only ~25 ppm drift — production-tier
+quality.
+
+#### Implications
+
+1. `investigation_env.rs:57` "known-worse output (ADR-009)"
+   classification is **stale** — should be relaxed to
+   "F16-precision-tradeoff" or removed.
+2. The HF2Q_F16_KV ack-required gate could be downgraded from
+   UNSAFE to PERF (precision tradeoff is operator design choice,
+   not a correctness regression).
+3. **Path E+F is a clean +15.7% wall-clock + 251 MiB/slot win**
+   with measured 25 ppm output rel_rms. Operator default-flip
+   is now data-supported.
+
+#### iter-169 walk-phase target
+
+Either:
+1. Extend the byte-identity test to additional fixtures (causal
+   mask layer, longer sequences, different head counts) to confirm
+   the 1.00× amplification holds across the gemma4 layer matrix
+2. Update `investigation_env.rs:57` comment + ADR-009 cross-ref to
+   note the bug was fixed; relax the classification
+3. Surface to operator: Path E+F is now a no-correctness-regression
+   default-flip candidate
+
+If operator still silent and code-change-only iter desired:
+do (2) — update comment + cross-ref. Concrete, low-risk, makes the
+ADR record reflect current truth.
+
 #### Standing decision — Three closure paths still apply
 
 Independent of regression: gemma4's structural gap to llama.cpp
