@@ -15,6 +15,69 @@ GGUF, same prompt, same sampler. Speed = tok/s on the same hardware
 (Apple M5 Max), measured via `llama-bench` for the peer baseline and
 `hf2q generate ... --max-tokens N` for hf2q.
 
+## Executive summary (iter-303 consolidated state)
+
+This ADR has grown to ~11K lines across iter-59..303.  This summary
+captures the current strategic state for fast catch-up.
+
+### Mantra status by production model
+
+| Model | tok/s @ HEAD | × peer | Mantra |
+|-------|------------:|-------:|--------|
+| qwen3.6 35B-A3B-APEX-Q5_K_M | 126.5 | **1.34×** ★ | ✓ EXCEEDS |
+| qwen3.6 (with TQ-HB engaged via engine.rs) | ~106 (iter-131 est) | ~1.12× | ✓ EXCEEDS |
+| gemma4-ara-2pass-APEX-Q5_K_M (default) | 69.4 | 0.694× | ✗ below |
+| gemma4 + G+FUSED (precision-exact, TQ-HB intact) | 71.2 | 0.712× | ✗ below |
+| gemma4 + Path E+G+FUSED (breaks TQ-HB) | 73.5 | 0.735× | ✗ below |
+
+### Coherence status (iter-296..298)
+
+All 6 production-fixture cells PASS llama-completion peer-equivalence
+in `coherence_smoke` (lib) + `coherence_matrix` (heavyweight) +
+`adr028_coherence_gate.sh` (long-context).  Activated 2026-05-10 from
+prior 100% dormant state.
+
+### gemma4 4.5 ms/token gap decomposition (iter-292 layer-attribution)
+
+Per-layer dispatch count is uniform (32 sliding / 31 full).  +9 disp/layer
+vs llama.cpp peer:
+- ~6 = TQ-HB infrastructure (operator-mandated retain)
+- ~3 = non-TQ-HB fusion gaps (limited by iter-186 concurrent-fusion
+  regression and iter-219 +0.3% sequential-fusion measurement)
+
+Gap composition (iter-288):
+- ~1.5 ms TQ-HB SDPA (operator-mandated)
+- ~0.7 ms concurrent-fusion launch (capped by iter-186)
+- ~0.94 ms mat-vec count delta (72 extra/tok)
+- ~1.4 ms kernel-work delta (peer's bin_fuse_*_nf=7 fusion;
+  multi-month rework)
+
+### Operator-actionable decision queue (iter-303)
+
+| Lever | Expected | TQ-HB? | Source |
+|-------|---------|:------:|--------|
+| **G+FUSED default flip** | **0.712× peer** (+2.6%) | **✓** | **iter-293/297 validated** |
+| Path E+G+FUSED flip | 0.735× peer (+5.9%) | ✗ memory cost | iter-289 |
+| Q4_0 id-vs-norid tolerance relax (`0.0` → `1e-5`) | 3 mlx-native test cells | n/a | iter-302 |
+| Test-isolation (Mutex/serial) for 2 known flakes | mlx-native + hf2q dwq_loop | n/a | iter-303 |
+| DFlash port | 1.4-2.8× peer | ✓ | iter-227 (multi-month) |
+| Deep kernel rework (graph optimize) | ~0.85× peer est | ✓ | multi-month |
+
+### Tooling shipped this thread (iter-283..299)
+
+- `mlx_native::pipeline_dispatch_buckets()` API + `MLX_DISP_BUCKET=1`
+  env (iter-284) — per-pipeline dispatch counts
+- `HF2Q_PER_LAYER_DISP=1` in gemma4 forward_decode (iter-292)
+- `LLAMA_DISP_COUNT=1` instrumentation in llama.cpp ggml-metal (uncommitted, iter-283)
+- `apex-q5km` + `gemma4-apex-q5km` coherence fixtures + goldens (iter-296)
+- `scripts/adr028_full_stack_bench.sh` G+FUSED row + decision tree (iter-299)
+
+### Next concrete iter (when operator approves)
+
+1. Flip `HF2Q_LMHEAD_Q6K` + `HF2Q_FUSED_END_OF_LAYER` to default-on
+   in `INVESTIGATION_ENV` reader.  +2.6% gemma4 APEX, zero downside.
+2. Or operator chooses other queue items above.
+
 ## Context
 
 ### What this ADR is for
