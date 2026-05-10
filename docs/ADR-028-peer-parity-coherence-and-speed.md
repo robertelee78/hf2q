@@ -11719,3 +11719,48 @@ real correctness regression).  Q8_0 0.0 should remain unchanged
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
 
 No code changes — finding documented, decision deferred to operator.
+
+---
+
+## iter-303 — flaky-test catalog at HEAD (operator-decision territory)
+
+### Two flaky tests cataloged
+
+After iter-294/295/298/302 fixes, the remaining test instabilities are
+flakes (parallel-execution global state), NOT real regressions:
+
+**1. `mlx-native::per_dispatch_sampling_records_nonzero_ns`**
+- Global `kernel_profile` state polluted by parallel test execution
+- Passes in isolation 100% of runs
+- Fix would require Mutex around profile globals OR --test-threads=1
+
+**2. `hf2q::calibrate::dwq_loop::tests::gradient_checkpoint_reduces_peak_rss`**
+- RSS measurement under parallel-test memory pressure
+- Passes in isolation 100% of runs
+- Fix would require `#[serial]` annotation OR baseline-RSS adjustment
+
+### Decision
+
+Per "no deferrals without operator approval" rule, both stay as
+documented flakes.  Standard mitigation when investigating: run in
+isolation via `--test test_name`.
+
+### Reproducibility check
+
+Tested in isolation:
+```
+cargo test --release --bin hf2q --lib gradient_checkpoint
+  → 5/5 PASS
+
+cd /opt/mlx-native && cargo test --release --test dispatch_profile
+  → 4/4 PASS
+```
+
+Both consistent.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes — flakes documented, operator-decision-gated.
+
