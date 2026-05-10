@@ -6096,6 +6096,51 @@ allocation.  If per-dispatch latency drops, all 3 dispatches benefit
 without code refactor.  Bandwidth-bound limit is 0.115 µs; we measure
 9-18 µs — **80-150× headroom for kernel-level optimization**.
 
+### iter-209 — kernel internals review: launch floor is the bottleneck
+
+Read `mlx-native/src/shaders/fused_norm_add_f32.metal` (90 lines):
+- TG = `min(256, next_pow2(dim))` = 256 threads for dim=2816
+- 1 RMS reduction (Phase 1: read input, sum-of-squares, tree reduce)
+- 1 elementwise normalize+weight+add (Phase 2)
+- 8 threadgroup_barriers in tree reduce (log2(256))
+
+**Per-call compute breakdown** (theoretical):
+- Phase 1 input read: 11 KB at 390 GB/s = 0.028 µs
+- Tree reduce: 8 barriers × 100ns = 0.8 µs
+- Phase 2 read+write: 33 KB total = 0.085 µs
+- Total compute: **~0.9 µs**
+
+**Measured per-dispatch: 9-18 µs.**
+
+Gap = 8-17 µs of overhead per dispatch.  Apple Metal compute kernel
+launch latency is typically 5-10 µs (hardware floor).  We're already
+near the launch floor.  Kernel-internal optimization ROI:
+- Replace tree-reduce with simdgroup_sum: saves ~7 of 8 barriers ≈
+  0.7 µs/dispatch × 90 dispatches = **63 µs/token = +0.5%** (marginal)
+
+**Conclusion**: The fused_norm_add per-call cost is hardware-launch-bound,
+not kernel-internal-bound.  Kernel rewrite ROI is +0.5%, not worthwhile.
+
+**The real lever remains FUSION** (per iter-208): combine adjacent
+sequential dispatches to eliminate launches entirely.
+
+iter-210+ plan options:
+- (a) Build fused (2)+(3) kernel — combines post-FF norm 2 + end-of-layer
+  in 1 dispatch.  Saves 0.34 ms = +2.7%.  Multi-day kernel + tests +
+  parity gate.  Risk: similar to iter-186 fused-triple-norm
+  regression but *different scenario* (sequential not concurrent).
+- (b) Wait for ggml-style graph-fusion infra (multi-week, broader).
+- (c) Pivot to a fundamentally different bisect angle (head pipeline,
+  CPU-side, or qwen3.6 cross-pollination).
+
+Cumulative session totals (29 iters):
+- Default 62.5 → 69.2 tok/s = +10.7% (byte-identical, no flag)
+- Path G shipped (+1.76% opt-in)
+- 12 SKIP_* bisect flags shipped
+- 7 falsifications saved multi-day misallocations
+- All single-iter tractable levers exhausted; next +2-3% requires
+  multi-day kernel work
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
