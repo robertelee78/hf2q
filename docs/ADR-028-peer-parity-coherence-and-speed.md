@@ -9412,6 +9412,70 @@ trajectory divergence first, THEN re-measure perf — the +7.5%
 measured in iter-264 may need re-evaluation since the trajectory
 isn't byte-identical to greedy.
 
+### iter-268 — NO_AMORT bisect: amortization NOT the bug
+
+3-way bisect at greedy temp=0, 30 tokens, qwen3.6-27B-MTP-Q4_0,
+prompt "What is 2+2?":
+
+| Stack | Tokens | Accept | Output (truncated) |
+|-------|-------:|-------:|--------------------|
+| A: MTP off (ground truth) | **13 (stops)** | n/a | "\n\n4\n\n" |
+| B: K1=1 NO_AMORT=1 | 30 (max) | 52.6% | "</think>\n4<\|im_end\|>\n\nThe result is 4..." |
+| C: K1=1 default (AMORT) | 30 (max) | 52.6% | "</think>\n4<\|im_end\|>\n\nThe result is 4..." |
+
+**B and C produce IDENTICAL output**.  Same tokens, same accept rate,
+same content.
+
+**Conclusion**: NO_AMORT vs default doesn't bisect the bug.  Both
+paths emit the same tokens (just staggered across iterations: AMORT
+emits 2/iter, NO_AMORT emits 1/iter but token_next at next iter
+= what AMORT emitted last iter).  Output is identical when total
+token count matches.
+
+**Real bug location candidates** (iter-269 to bisect):
+1. **2-token verifier forward** — `forward_gpu_with_hidden(&[
+   token_next, proposed], &[next_pos, next_pos+1], ...)` may produce
+   logits at pos N+1 that differ from what 1-token MTP-off produces
+   at the same position (e.g., due to qwen35moe's hybrid arch — the
+   linear-attn DeltaNet layers may not handle multi-token mid-stream
+   forwards correctly).
+2. **Reject path KV state** — line 461-465 says "K[N+1] is stale,
+   next iter overwrites".  The overwrite mechanism may be incorrect.
+3. **MTP draft itself** — proposed token might be wrong if MTP's
+   internal state isn't properly synced between iters.
+
+**Critical reframing of iter-263 numbers**:
+
+| Earlier claim | Reality |
+|---------------|---------|
+| iter-263 "MTP regresses 13%" | Both MTP-default AND MTP-K1=1 ran to max_tokens (1000) on divergent trajectories.  +13% delta was between two BUGGY trajectories. |
+| iter-264 "K1=1 +7.5% over MTP-off" | Real perf number on a non-byte-identical-to-greedy trajectory.  Cannot claim as "win" until trajectory bug is fixed. |
+
+**Standing rule re-emphasized**: per `verifier.rs:119`, "spec-decode
+is byte-identical to default at greedy".  Any K1 perf claim must
+satisfy this rule first.
+
+**iter-268 outcome**:
+- ✓ Amortization (free-token push) ruled out as bug source
+- ✓ NO_AMORT and AMORT empirically equivalent in output
+- ✗ Bug is deeper — 2-token verifier or reject-path state
+- ✓ iter-263 "+22.6%" and iter-264 "+7.5%" perf claims FLAGGED for
+  re-evaluation post-correctness-fix
+
+**iter-269 plan**: token-by-token comparison of MTP-off vs K1=1 to
+find the FIRST divergence point.  If divergence happens at iter 1
+(pos 34, after greedy "</think>"), the 2-token verifier produces
+wrong logits at pos N+1.  If divergence happens later, the
+reject-path KV handling is the bug.  Add a HF2Q_K1_DUMP_TOKENS env
+flag if needed for token-by-token capture.
+
+**Pragmatic alternative for iter-269**: since K1 perf gain is
+suspect, consider falsifying the entire MTP optimization domain
+on this GGUF.  If the 27B-MTP-Q4_0 file has structural issues
+(missing metadata, etc.), a properly-converted Q5_K_M-MTP file
+might behave differently.  Per reddit-mtp.txt the recommended
+quant is q8_0-mtp not q4_0-mtp.
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
