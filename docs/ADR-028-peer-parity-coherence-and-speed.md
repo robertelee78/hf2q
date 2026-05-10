@@ -6049,6 +6049,53 @@ iter-208 plan: design and ship `fused_layer_combined_f32` kernel that
 subsumes all 3 fused_norm_add per layer.  Multi-day work but
 bisect-confirmed +6-7% target.
 
+### iter-208 — SUB-BISECT: fusion lever revised down to +2.7%
+
+Added HF2Q_SKIP_END_OF_LAYER_FINAL.  Skips ONLY the last
+fused_norm_add at end-of-layer (residual + mlp_down → hidden), keeps
+post-FF norm 2.
+
+| Config | BODY GPU | dispatches |
+|--------|---------:|-----------:|
+| Default | 12.52 ms | 956 |
+| SKIP_END_OF_LAYER_FINAL | 12.18 ms | 926 (-30) |
+| **Δ** | **0.34 ms** | -30 |
+
+**Inferred per-dispatch fused_norm_add costs** (iter-205+207+208):
+
+| Op | Cost | Buffer dependencies |
+|----|-----:|---------------------|
+| post-attn fused_norm_add | 0.55 ms | sequential after O-proj |
+| post-FF norm 2 + combine | 0.20 ms (= 0.54 − 0.34) | after MoE accum |
+| end-of-layer FINAL | 0.34 ms | after post-FF norm 2 |
+| **Total** | **1.09 ms** | |
+
+**REALISTIC FUSION LEVER** (revised down from iter-207's optimistic
++6-7%):
+
+- post-attn (1) is **separated** from (2) and (3) by FFN + MoE work →
+  CANNOT fuse with them
+- post-FF norm 2 (2) and end-of-layer FINAL (3) are **adjacent
+  sequential** — fusing them saves the inner dispatch ≈ 0.34 ms
+- **Net realistic ROI: +2.7%** (not +6-7%)
+
+Multi-day kernel work for ~2.7% — borderline ROI.  Sub-bisect just
+saved another mis-direction (iter-207's estimate would have led to
+overcommitted multi-day fusion build).
+
+**Lesson reinforced**: bisect at the FINEST granularity before
+committing to fusion work.  iter-207 measured 0.54 ms TOTAL but the
+realistic SAVABLE chunk is 0.34 ms — the difference is that (2) still
+needs to run (computes mlp_down) even after fusion (its OUTPUT just
+feeds directly into the fused (3) without a separate dispatch).
+
+iter-209 plan: examine `fused_norm_add_f32` kernel itself for
+per-dispatch optimization.  80-90× launch overhead vs bandwidth
+suggests sub-optimal threadgroup config, sync pattern, or shared-mem
+allocation.  If per-dispatch latency drops, all 3 dispatches benefit
+without code refactor.  Bandwidth-bound limit is 0.115 µs; we measure
+9-18 µs — **80-150× headroom for kernel-level optimization**.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
