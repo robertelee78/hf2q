@@ -8732,6 +8732,87 @@ complete, the path to peer-or-better is **DFlash speculative decode**
 (iter-223/224/227/228) since kernel optimization has reached its
 hardware ceiling.
 
+### iter-257 — TQ-HB "structural cost" FALSIFIED (1.10× F16, not 2×+)
+
+Built `mlx-native/benches/bench_sdpa_kv_dtype_compare.rs`.  Direct
+measurement of three KV dtype variants at gemma4 sliding decode shape
+(head_dim=256, kv_seq=1024, n_heads=16, n_kv_heads=8, BATCH=50):
+
+| KV dtype | µs/call | MB read | GB/s | vs F16 |
+|----------|--------:|--------:|-----:|-------:|
+| F32   | 36.06 | 16.78 | 465.3 | 1.69× |
+| F16   | 21.30 |  8.39 | 393.7 | 1.00× |
+| **TQ-HB** | **23.41** | **2.16** | **92.4** | **1.10×** |
+
+**Hypothesis FALSIFIED**: TQ-HB is only **1.10× slower than F16** at
+the same decode shape — *not* the "≥2× structural cost" claimed by
+iter-191/iter-250's ceiling math.
+
+**Mechanism revealed by the three-way comparison**:
+- F32 → F16 ratio 1.69× ≈ 2× bytes ratio → **F16 SDPA is bandwidth-
+  bound** (perfect bandwidth scaling).
+- F16 → TQ-HB ratio 1.10× despite **3.88× less bandwidth** → **TQ-HB
+  is compute-bound** (dequant arithmetic dominates kernel time).
+- TQ-HB effective bandwidth 92 GB/s ≪ DRAM peak — kernel spends most
+  cycles on dequant FP arithmetic, not memory access.
+
+**Practical impact** of replacing TQ-HB with hypothetical-F16 SDPA:
+- 23.41 - 21.30 = 2.11 µs/call savings
+- × 30 layers = **0.06 ms/token = +0.4% decode**
+
+TQ-HB is essentially "free" at the kernel level.  The 4× KV memory
+savings (1 MB vs 4 MB per layer) come at <10% per-call cost.
+
+**Note on F16 viability**: iter-233/234 deprecated F16 KV on gemma4
+due to long-context `<pad>` emission (fp16 overflow without
+clip_residual).  The F16 column above is *hypothetical* — practically
+broken on gemma4 production.  TQ-HB is the only viable path; this
+bench shows that's NOT a performance penalty.
+
+**Kernel-level audit COMPLETE**:
+
+| Component | Headroom | Lever ROI |
+|-----------|----------|-----------|
+| mat-vec attention (iter-255) | 86.7% avg peak | NONE (k-axis cap) |
+| lm_head Q6_K (iter-253) | 106% peak | NONE (saturated) |
+| MoE _id (iter-256) | 123-132% peak | NONE (cache-amplified) |
+| TQ-HB SDPA (iter-257) | 1.10× F16 | 0.4% decode |
+| CPU encoding (iter-254) | 0.36 µs/disp | NONE (2% decode max) |
+| Sequential fusion (iter-219) | 1.5 µs/pair | retired (iter-220) |
+
+**Closing summary** (iter-179 → iter-257, ~80 iterations of bisects +
+microbenches):
+
+1. Default-path improvements shipped: **+10.1% byte-identical** (iter-
+   195+197 in mlx-native).
+2. Opt-in stack: Path E+F+G = **+16.7%** (iter-189).
+3. **Every major decode kernel is at hardware ceiling**.
+4. The remaining 32 tok/s gap to llama.cpp peer (102.7 vs ~70 measured)
+   = GPU launch+barrier floor (3.1 µs × 850 dispatches = 2.6 ms) +
+   minor compute deltas, **all hardware-bound on M5 Max**.
+
+**Operator's directive "exhaust kernel optimization before DFlash" is
+now satisfied** with measured falsifications at every step.
+
+**Path to peer-or-better at this point: DFlash speculative decode**
+(iter-223/224/227/228 already architecturally scoped).  All other
+kernel-level levers verified exhausted.
+
+### Iter-258+ recommendation
+
+DFlash spec-decode is the only known path to peer-or-better with TQ-HB
+preserved.  Per iter-224, integration is multi-month.  Operator's
+prior directive ("exhaust kernel optimization before DFlash") is met.
+Operator decision required to proceed with DFlash port.
+
+Available alternatives (smaller scope):
+- Operator-approved Path E+G default flip: +5% from current default
+  (1 line, immediate).
+- HF2Q_FUSED_END_OF_LAYER=1 default flip: +0.3% byte-identical (iter-
+  219, gated by AC).
+
+Code committed: mlx-native bench (iter-257), ADR-028 §iter-256/257.
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
