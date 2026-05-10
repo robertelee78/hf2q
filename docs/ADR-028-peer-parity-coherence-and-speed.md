@@ -4025,6 +4025,81 @@ Operator pick:
   (no precision impact below sliding cap), off for long — adds
   decision cost per request
 
+### iter-164: walk-phase research — fused gate+up confirmed already-done; F16 KV is non-falsified
+
+#### Fused gate+up matmul: ALREADY landed at gemma4
+
+Read `src/serve/forward_mlx.rs:3846+` — hf2q checks
+`stacked_gate_up.is_some() && stacked_down.is_some()` and uses the
+fused `quantized_matmul_id_ggml` with combined gate+up weights via
+`stacked_gate_up`. Same as peer's `ffn_gate_up_exps` path.
+
+Per-layer MoE FFN dispatch sequence (B11..B13):
+- B11: dense_down (shared MLP) + gate_up_id [2 concurrent]
+- B12: swiglu (singleton)
+- B13: down_id (MoE down) + post-FF norm1 [2 concurrent]
+
+Matches peer's `build_moe_ffn` graph. **No structural fusion gain
+available here.**
+
+#### F16 KV (Path F) — peer has F16 variants we don't
+
+`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:7186`:
+```
+template [[host_name("kernel_flash_attn_ext_vec_f16_dk256_dv256")]]
+  kernel ... <FA_TYPES, half4, 1, dequantize_f16_t4,
+              half4, 1, dequantize_f16_t4, 256, 256, 1>;
+```
+
+Peer compiles BOTH F32 and F16 variants for DK256 (gemma4's
+head_dim). F16 KV halves bandwidth on attention reads. Our
+`flash_attn_vec.metal` only has F32 + TQ-HB. **Path F scope:**
+
+1. Add `kernel_flash_attn_ext_vec_f16_d256` to mlx-native shaders
+   (port from peer; ~150 LOC)
+2. Add F16 KV alloc path in DenseKvBuffers (alternative dtype field;
+   ~50 LOC)
+3. Add `HF2Q_KV_F16=1` env gate (gated rollout; ~30 LOC)
+4. Wire write-side: convert F32 K/V to F16 at KV-store dispatch
+5. Wire read-side: dispatch F16 FA-vec when `dtype == F16`
+6. Byte-identity gate: F32 vs F16 NRMSE < 1e-3 (industry-standard
+   F16 KV tolerance)
+
+Estimated decode gain: **2× bandwidth reduction on KV reads**.
+At gemma4 USE_DENSE=1 (FA-vec dominates ~10% decode budget), F16
+saves ~5% decode = +3.5 tok/s = 70.9 → 74.4 = 0.722× peer.
+
+Quality cost: F16 KV is well-studied — typical NRMSE 1e-4 to 1e-3
+vs F32. Long-context coherence preserved. **No precision divergence
+on short context** (< sliding=1024).
+
+#### Combined Path E + Path F potential
+
+USE_DENSE=1 + F16 KV:
+- 70.9 × 1.05 ≈ 74.4 tok/s = 0.722× peer
+- vs USE_DENSE=1 alone 70.9 / 0.687×
+- 2× memory savings on KV (F16 vs F32) recovers 250 MiB/slot
+
+Net at gemma4 26B-A4B sliding=1024 with USE_DENSE=1+F16:
+- KV memory: 251 MiB/slot (vs 502 MiB at F32 / 191 MiB at TQ-HB)
+- Tok/s: 74 / 0.72× peer
+- Coherence: F16-precision (long-studied tolerable degradation)
+
+Operator-acceptable mid-tier — preserves more memory than F32-dense
+without requiring TQ-HB's ALU overhead. Needed: operator pick on
+Path E + F sequence vs continued multi-kernel walk.
+
+#### iter-165 walk-phase target — scaffold F16 KV kernel
+
+1. Port `kernel_flash_attn_ext_vec_f16_dk256_dv256` from
+   `ggml-metal.metal:7186` to
+   `mlx-native/src/shaders/flash_attn_vec_f16.metal` (new file)
+2. Add register + dispatch in mlx-native ops
+3. Byte-identity test in `tests/test_flash_attn_vec_f16.rs`
+4. NRMSE-tolerance gate vs F32 reference
+
+This is multi-iter (~3-5 iters). Iter-165 starts the kernel skeleton.
+
 #### Standing decision — Three closure paths still apply
 
 Independent of regression: gemma4's structural gap to llama.cpp
