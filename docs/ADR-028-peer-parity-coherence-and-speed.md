@@ -12282,3 +12282,124 @@ decode win.
 - `/opt/mlx-native/tests/adr_028_iter309_q6k_mv_nr2_parity.rs`:
   parity test (4 cases, all PASS)
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section
+
+
+---
+
+## iter-310 — H2 (rms_norm float4 + simd_sum) IMPLEMENTED + MARGINAL in production
+
+iter-308's smoking gun pointed at `rms_norm_f32` (15.46% of our
+dispatches, peer uses fused/float4 variant at same count).  iter-310
+implements + tests + benches the change.
+
+### Structural differences found (peer-source diff)
+
+| Aspect | hf2q rms_norm_f32 (baseline) | peer kernel_rms_norm_f32_4 |
+|---|---|---|
+| Load granularity | scalar (4 B/op) | `float4` (16 B/op) |
+| In-SG reduction | per-thread shared buffer + tree | `simd_sum()` (1 HW op) |
+| Inter-SG reduction | tree with log2(tg) barriers | `simd_sum` over SG sums |
+| Shared memory | `tg_size × 4 B` (1024 B max) | `n_sg × 4 B` (≤ 128 B) |
+| Barriers | `log2(tg_size)` (~8) | 2 |
+
+### Implementation
+
+Added `rms_norm_f32_v2` + `rms_norm_no_scale_f32_v2` to
+`/opt/mlx-native/src/shaders/rms_norm.metal` — ports of peer's
+`kernel_rms_norm_fuse_impl<float4, 1>`.  Threadgroup-size clamp
+to ≥32 (one full simdgroup) for tg_size < 32 edge cases.
+
+Env-gated via `HF2Q_RMS_NORM_V2=1` in `dispatch_rms_norm` +
+`dispatch_rms_norm_no_scale_f32`.  Same threadgroup geometry;
+shared memory shrunk to `(tg_size/32) × 4 B`.
+
+### Parity verification (FALSIFIER)
+
+`/opt/mlx-native/tests/adr_028_iter310_rms_norm_v2_parity.rs` — 6
+shapes including production gemma4 (dim=3584) and head-dim (256):
+
+```
+test rms_norm_v2_parity_tiny ... ok
+test rms_norm_v2_parity_qwen35_hidden ... ok
+test rms_norm_v2_parity_gemma4_hidden ... ok       (max_abs ~3e-5)
+test rms_norm_v2_parity_head_dim ... ok
+test rms_norm_v2_no_scale_parity_gemma4 ... ok
+test rms_norm_v2_no_scale_parity_head_dim ... ok
+test result: ok. 6 passed; 0 failed
+```
+
+Bug found + fixed during testing: tg_size<32 broke inter-SG
+reduction (n_sg=0, shared[0] never written).  Clamp to ≥32 fixed it
+(would silently break in production for tiny dims — caught by tiny
+parity case).
+
+### Production decode bench
+
+200-tok 3 runs:
+```
+Baseline:  69.1, 69.3, 68.1 tok/s   (mean 68.83)
+v2:        68.6, 70.9, 70.2 tok/s   (mean 69.90)
+Delta:     +1.6% median, +1.6% mean
+```
+
+1000-tok 5 runs (longer = more thermal noise):
+```
+Baseline:  66.3, 67.1, 65.8, 66.5, 67.0   (mean 66.54)
+v2:        68.3, 69.3, 67.0, 64.9, 65.8   (mean 67.06)
+Delta:     +0.8% mean (1 outlier at 64.9 pulled down)
+```
+
+Coherence visual: `"What is 2+2?"` → `"2 + 2 = 4<turn|>"` byte-
+identical between baseline and v2.
+
+### Verdict: H2 PARTIAL
+
+Kernel is correct and at-least-as-fast-as baseline; signal is
+real but well below the ~3-5% the structural analysis predicted.
+
+**Why H2 underperformed prediction (working hypothesis):**
+
+The peer kernel reads ~5586 calls/tok of rms_norm work.  If peer's
+per-call time were 2× ours, replacing with peer's kernel pattern
+should yield ~6 ms/tok savings ≈ 7-8% of decode budget.  We see
+~1%.  Therefore peer's per-call advantage is NOT principally in
+the kernel internals — it's in something else.
+
+Candidate: **concurrent kernel execution / GPU scheduler latency**.
+Apple Metal can overlap dispatches with no RAW dependency.  Peer's
+graph layout may produce more parallel-issuable sequences than
+ours.  iter-311 should explore GPU command-buffer batching +
+dispatch concurrency.
+
+### Decision
+
+Leave v2 kernels registered + env-gated (default OFF).  No
+functional change.  Both kernels are correct, with structural
+improvements (fewer barriers, less shared memory) that may stack
+with future levers.
+
+### Files modified
+
+- `/opt/mlx-native/src/shaders/rms_norm.metal`: new
+  `rms_norm_f32_v2` + `rms_norm_no_scale_f32_v2` (130 LOC)
+- `/opt/mlx-native/src/kernel_registry.rs`: register both
+- `/opt/mlx-native/src/ops/rms_norm.rs`: env-gated routing in
+  `dispatch_rms_norm` + `dispatch_rms_norm_no_scale_f32`
+- `/opt/mlx-native/tests/adr_028_iter310_rms_norm_v2_parity.rs`:
+  6-shape parity test (all PASS)
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section
+
+### iter-311 plan
+
+Drop the "per-kernel structural improvement" hypothesis class —
+iter-309 + iter-310 both showed kernels with peer's pattern give
+≤2% wins.  Next angles:
+
+1. **GPU command-buffer batching:** measure if we're committing
+   command-buffers too frequently.  Peer may pack many tokens of
+   dispatches per buffer.
+2. **Concurrent kernel scheduling:** check if we have
+   `memory_barrier()` calls between concurrent-eligible dispatches.
+3. **CPU-side encode overhead:** profile dispatch_qmatmul +
+   set_pipeline + set_bytes calls.  Even 1µs × 1000 disp/tok =
+   1ms/tok = 7% gap if reducible.
