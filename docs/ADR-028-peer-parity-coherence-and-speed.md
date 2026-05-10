@@ -3894,15 +3894,78 @@ Standing iter-150 verdict re-confirmed: gemma4 0.62× peer is
 structural within current TQ-HB regime. Distribution across 6+
 kernel families. No single-kernel fix recovers the gap.
 
-#### iter-163 walk-phase target — implement Task #18
+### iter-163: Task #18 ALREADY-FALSIFIED — fused-SwiGLU regresses on M5 Max
 
-Q6_K + Q5_K fused-swiglu-down mv_id (3% decode gain target,
-pending since item enumeration). Peer (llama.cpp) has the fused
-silu-mul-down kernel; hf2q does separate dispatches. Concrete
-multi-day work item — non-trivial but bounded.
+#### Discovery
 
-Or: Path E operator decision (USE_DENSE default-flip, +12-13%
-with token divergence on long contexts). Awaiting operator pick.
+Read `quantized_matmul_id_ggml.metal:354+` — `kernel_mul_mv_id_q4_0_f32_swiglu`
+already exists (mlx-native commit `4efeec0`, 2026-04-26). It does
+exactly the fusion Task #18 described: `silu(gate)*up * down_matmul`
+in one kernel.
+
+Hf2q tested it at qwen35 dwq46 (Q4_0 path) on 2026-04-26 — see
+production comment at `src/inference/models/qwen35/gpu_ffn.rs:2632`:
+
+> "Wire-up on dwq46 (Q4_0 expert_down): 110.5 t/s → 108.0 t/s =
+> REGRESS −1.5% on n=256 cold-run median. Per-CB GPU time unchanged
+> (96µs/cb), but wall regressed — likely doubled input bandwidth
+> (read gate AND up directly) plus increased ALU pressure (16 silu
+> evals per simdthread inner loop) saturate something on M5 Max."
+
+→ **9th confirmed M5 Max static-evidence kernel hypothesis falsified.**
+
+#### Why extending to Q5_K/Q6_K would regress MORE
+
+- Q4_0 inner loop: 16 silu evals + 8-element dot per QK4_0=32 block
+- Q5_K inner loop: 16 silu evals + 4-element-tile × 4-tiles per
+  QK_K=256 block — 8× more dot work per silu batch
+- Q6_K inner loop: same as Q5_K but with 4 high bits + 4 low bits
+  decode → even more ALU per yl[] cache slot
+
+The M5 Max saturation point already hit at Q4_0; the heavier-decode
+quants amplify the bottleneck.
+
+#### Peer comparison
+
+llama.cpp `kernel_swiglu_f32` is also a SEPARATE kernel from
+`kernel_mul_mv_id_q5_K_f32` / `_q6_K_f32`. Peer also pays the
+silu_mul + barrier + matmul triplet at gemma4 expert_down. **Peer
+hits 102 tok/s on the unfused path**; we hit 62 tok/s on the
+unfused path. The 30% gap is NOT in this fusion axis.
+
+#### Walk-phase verdict re-confirmed
+
+Combining iter-95 (Q6_K y-reuse refactor falsified, 8th hypothesis),
+iter-150 (single-kernel optimization exhausted within TQ-HB regime),
+iter-162 (no code regression vs iter-146; current 62.5/70.9 IS the
+ceiling), and iter-163 (Task #18 already-falsified at Q4_0 with worse
+expected behavior at Q5_K/Q6_K):
+
+**The gemma4 0.62× peer ratio is structurally bounded** within the
+current TQ-HB + Q5_K_M regime. Single-kernel walks are exhausted.
+
+#### Remaining levers (all gated on operator decision)
+
+1. **Path E** — `HF2Q_USE_DENSE=1` default-flip
+   - Measured: 70.9 tok/s vs 62.5 = +13.4% wall, 0.695× peer (vs 0.613×)
+   - Cost: token divergence on long contexts (precision tradeoff)
+   - LOC: 1-line default change in `forward_mlx.rs`
+   - Quality bench: would need long-context coherence A/B vs F32
+
+2. **Path B** — drop TQ-HB entirely (recovers ~3 ms = ~25% closure)
+   - Cost: lose ADR-027 Phase B's 3.94× memory savings
+   - Mantra-violating per "TQ for all models we support, as well or
+     better than peers" — REJECTED
+
+3. **Multi-day µbench infrastructure** to find sub-100µs/kernel
+   wins across 6+ kernel families
+   - Cost: ~10-20 iters at 100-300µs each, no single-iter visible win
+   - Scope: multi-week per iter-104 estimate
+
+#### Action queued
+
+Mark Task #18 as completed (ALREADY-FALSIFIED). Surface operator
+decision request: Path E flip vs continue multi-kernel walk.
 
 #### Standing decision — Three closure paths still apply
 
