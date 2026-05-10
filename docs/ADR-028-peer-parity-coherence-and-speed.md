@@ -12842,3 +12842,53 @@ production bench are unreliable.
   this section.
 
 No code changes.
+
+
+---
+
+## iter-316 — thermal probe + regression-gate sanity (housekeeping)
+
+/loop fired again post-iter-315.  No new code lever identified in the
+gemma4 APEX thread.  This iter does housekeeping:
+
+### Thermal probe (gemma4 APEX-Q5_K_M, varying decode lengths)
+
+```
+ 50 tok: 70.5, 70.3, 70.7  median 70.5 tok/s
+100 tok: 69.9, 69.7, 69.5  median 69.7 tok/s
+500 tok: 69.0, 68.9, 68.9  median 68.9 tok/s
+```
+
+Thermal drift = -2.3% from 50→500 tok (~1.6 tok/s).  Peer
+llama-bench tg50→tg200 drift is -0.2% (102.13→101.89).  Peer thermal
+floor is ~higher than ours — at sustained 500-tok regime, peer holds
+102 tok/s where we drop to 69.
+
+Gap at warm matched regime (200-tok): peer 101.89 / hf2q 69.2 = **0.679× peer**.
+
+### Regression-gate sanity
+
+- iter-309 q6_K nr2 parity:       4/4 PASS (max_abs ~3e-5)
+- iter-310 rms_norm_v2 parity:    6/6 PASS (max_abs ~5e-5)
+- baseline q6_K mm tests:         3/3 PASS
+- baseline mm dispatcher tests:   11/11 PASS
+
+Coherence smoke: `"What is 2+2?"` → `"2 + 2 = 4<turn|>"` byte-
+identical to historical golden.  Default path unchanged.
+
+### Standing operator decision queue (carried forward)
+
+1. Approve TQ-HB kernel-fusion redesign (multi-week, preserves 3.94× memory)
+2. Apple Instruments Metal System Trace (manual, localizes opaque per-dispatch cost)
+3. Accept current 0.66-0.68× peer ratio (coherence + TQ-HB mantras satisfied)
+
+No /loop iter can break past 0.66-0.68× peer ceiling without one of
+the three.  Continuing to /loop without operator direction produces
+zero new code-grounded findings (iter-315 falsified one more
+historical claim; iter-316 is sanity-only).
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes.  All prior parity + coherence gates green.
