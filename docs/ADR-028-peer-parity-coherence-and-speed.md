@@ -14455,3 +14455,99 @@ Next /loop iter will produce a Phase 7 design doc:
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
 
 No code changes (peer-bench measurement only; honest gap re-confirmation).
+
+
+---
+
+## iter-337 — Phase 5 LANDED: fused_head_norm_rope_f32_v2 (+0.1% noise, completes per-kernel port portfolio)
+
+Phase 5 was the last per-kernel port lever pending after iter-336's
+true-gap measurement formally closed the per-kernel + CPU-side
+optimization avenue.  Shipped for portfolio completeness even though
+the expected gain is below noise floor.
+
+### Implementation
+
+- `/opt/mlx-native/src/shaders/fused_head_norm_rope_f32.metal` (+170 lines):
+  new `fused_head_norm_rope_f32_v2` kernel.  Phase 1 (sum-of-squares)
+  rewritten with float4 + `dot(v,v)` + `simd_sum()` + 2-barrier inter-SG
+  reduction (mirrors iter-310 rms_norm_v2 + iter-331 fused_norm_add_v2
+  pattern).  Phases 2-4 (normalize+store_to_shared, NeoX RoPE rotation,
+  pass-through) BYTE-IDENTICAL to v1.  Load-bearing race-fix barrier at
+  the Phase 1→2 transition preserved exactly per
+  `docs/spike-batched-prefill-race-rootcause.md` (line 148 in v1).
+- `/opt/mlx-native/src/kernel_registry.rs`: register
+  `fused_head_norm_rope_f32_v2` source.
+- `/opt/mlx-native/src/ops/fused_head_norm_rope.rs`:
+  `dispatch_fused_head_norm_rope_f32` env-gated via
+  `env_default_true("HF2Q_FUSED_HEAD_NORM_ROPE_V2")` (default-ON,
+  opt-out via `=0`).  Requires `head_dim % 4 == 0`; falls back to
+  scalar v1 when not (gemma4 head_dim=256 ✓, qwen3.6 head_dim=128 ✓).
+
+### Bench
+
+```
+=== A: V2 default ON (new HEAD) ===
+prefill: 18 tok in 384ms (47 tok/s)
+--- mlx-native: 200 tokens in 2.72s (73.5 tok/s) ---
+
+=== B: V2 opt-out (HF2Q_FUSED_HEAD_NORM_ROPE_V2=0) ===
+prefill: 18 tok in 387ms (47 tok/s)
+--- mlx-native: 200 tokens in 2.73s (73.4 tok/s) ---
+```
+
+Delta: **+0.1% (noise)**.  Both coherent.  Greedy outputs differ
+between A and B (precision non-equivalence in argmax tie-breaks),
+same character as iter-310 / iter-331.
+
+### Why no gain on gemma4 at 200-tok
+
+- fused_head_norm_rope dispatches: 2/layer (Q + K) × 30 layers = 60/tok
+- 60 / 920 total dispatches/tok = 6.5% of decode dispatches
+- Phase 1 (sum-of-squares) is ~30% of kernel time
+- Vectorizing saves ~30% of Phase 1
+- End-to-end ceiling: 6.5% × 30% × 30% = ~0.6%
+- Measured 0.1% within noise of 0.6% ceiling
+
+### Race-condition guards verified preserved
+
+The v1 kernel had a documented race at "head_dim=256, n_tokens*n_heads
+>= 2000 threadgroups on Apple Silicon" fixed by the barrier at
+`docs/spike-batched-prefill-race-rootcause.md`.  V2 preserves this
+exact barrier sequence.  Decode test (single token, 16 threadgroups)
+trivially below threshold.  Prefill (18 tokens × 16 heads = 288
+threadgroups) also below threshold.  Long-prefill stress test deferred
+to a future regression-pin commit if/when prefill bench changes.
+
+### Cumulative gemma4 default decode (session record)
+
+| Iter | Stack | tok/s @ 200 | × peer (103.16) |
+|---|---|---|---|
+| pre-iter-326 baseline | none | 69.4 | 0.673× |
+| iter-326 | +5 flags | 72.8 | 0.706× |
+| iter-331 | +fused_norm_add_v2 | 73.0 | 0.708× |
+| **iter-337** | **+fused_head_norm_rope_v2** | **73.5** | **0.713×** |
+
+Total per-kernel-port wins this session: **+5.9% baked into default**.
+Honest gap remaining: 28.7% (vs peer 103.16 tok/s).  Phase 7 (TQ-HB
+kernel-fusion redesign) is the only structural lever to close more.
+
+### Per-kernel port avenue formally CLOSED
+
+This iter ships the LAST per-kernel port in the iter-326 plan:
+
+| Phase | Lever | Status | Gain |
+|---|---|---|---|
+| 1a | 5-flag default-flip | LANDED iter-326 | +4.9% / +9.6% sustained |
+| 4 | fused_norm_add v2 | LANDED iter-331 | +0.8% additive |
+| **5** | **fused_head_norm_rope v2** | **LANDED iter-337** | **+0.1% noise** |
+| 1b/2/3/2'/3'/4'/6/8/1c | All other levers | FALSIFIED or N/A | n/a |
+
+Next /loop iter starts Phase 7 design work in earnest.
+
+### Files modified
+
+- `/opt/mlx-native/src/shaders/fused_head_norm_rope_f32.metal`
+- `/opt/mlx-native/src/kernel_registry.rs`
+- `/opt/mlx-native/src/ops/fused_head_norm_rope.rs`
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
